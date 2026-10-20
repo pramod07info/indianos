@@ -23,4 +23,6 @@ struct indianos_syscall_request {
 bool indianos_syscall_validate(const struct indianos_program_plan *plan,
                               struct indianos_syscall_request request);
 
+bool indianos_syscall_self_test(void);
+
 #endif
