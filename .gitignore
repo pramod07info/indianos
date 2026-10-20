@@ -1,0 +1,23 @@
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# Compiled kernels and images
+build/
+out/
+dist/
+*.o
+*.a
+*.elf
+*.iso
+*.img
+*.qcow2
+*.map
+
+# Local toolchain / third-party downloads
+.cache/
+.deps/
+vendor/
