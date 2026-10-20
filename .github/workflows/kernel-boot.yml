@@ -10,6 +10,7 @@ on:
       - "Makefile"
       - "tools/smoke_boot.py"
       - "tests/test_smoke_boot.py"
+      - "tests/test_pmm.c"
       - ".github/workflows/kernel-boot.yml"
   workflow_dispatch:
 
@@ -29,8 +30,8 @@ jobs:
           sudo apt-get install -y clang lld binutils xorriso qemu-system-x86 ovmf curl
       - name: Check cross compiler
         run: make toolchain-check
-      - name: Host unit tests
-        run: python3 -m unittest discover -s tests -v
+      - name: Host tests (PMM and QEMU transcript parser)
+        run: make test-host
       - name: Compile freestanding kernel and package ISO
         run: make image
       - name: Inspect x86-64 ELF load segments
@@ -50,3 +51,8 @@ jobs:
           name: indianos-m001-qemu-only
           path: build/indianos.iso
           retention-days: 7
+      - name: Verify an intentional invalid opcode reaches our IDT
+        run: |
+          OVMF_PATH="$(find /usr/share/OVMF /usr/share/edk2 -name 'OVMF_CODE*.fd' -type f 2>/dev/null | head -n 1)"
+          test -n "$OVMF_PATH"
+          make test-exception OVMF_CODE="$OVMF_PATH"
