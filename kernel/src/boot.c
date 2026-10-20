@@ -22,6 +22,11 @@ static volatile struct limine_framebuffer_request framebuffer_request = {
     .id = LIMINE_FRAMEBUFFER_REQUEST_ID, .revision = 0
 };
 
+__attribute__((used, section(".limine_requests")))
+static volatile struct limine_hhdm_request hhdm_request = {
+    .id = LIMINE_HHDM_REQUEST_ID, .revision = 0
+};
+
 __attribute__((used, section(".limine_requests_end")))
 static volatile uint64_t requests_end[] = LIMINE_REQUESTS_END_MARKER;
 
@@ -54,6 +59,15 @@ bool boot_validate(void) {
         serial_write("IndianOS: no usable RAM in memory map\n");
         return false;
     }
+    return true;
+}
+
+bool boot_hhdm_offset(uint64_t *offset) {
+    const volatile struct limine_hhdm_response *response = hhdm_request.response;
+    if (offset == NULL || response == NULL) {
+        return false;
+    }
+    *offset = response->offset;
     return true;
 }
 
