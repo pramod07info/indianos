@@ -8,6 +8,8 @@
 /* Boot protocols are private to this module, not kernel-wide interfaces. */
 bool boot_validate(void);
 void boot_draw_status(void);
+/* Optional direct map of physical memory; check before any dereference. */
+bool boot_hhdm_offset(uint64_t *offset);
 
 /* Adapter keeps Limine structures out of the memory manager. */
 uint64_t boot_memory_region_count(void);
