@@ -19,7 +19,7 @@ LIMINE_TARBALL := $(BUILD)/third_party/limine-binary.tar.gz
 LIMINE_URL := https://github.com/Limine-Bootloader/Limine/releases/download/v12.9.3/limine-binary.tar.gz
 LIMINE_SHA256 := 9f42fe9ea2e84d71056529969b1d5c24ba9a2287ffcc01bcce58b0ef8aa98b1d
 
-SOURCES := kernel/src/main.c kernel/src/serial.c kernel/src/boot.c kernel/src/pmm.c kernel/src/vmm.c kernel/src/vmm_boot.c kernel/src/paging_clone.c kernel/src/paging_policy.c kernel/src/program.c kernel/src/syscall_abi.c kernel/src/memory_runtime.c
+SOURCES := kernel/src/main.c kernel/src/serial.c kernel/src/boot.c kernel/src/pmm.c kernel/src/vmm.c kernel/src/vmm_boot.c kernel/src/paging_clone.c kernel/src/paging_policy.c kernel/src/program.c kernel/src/syscall_abi.c kernel/src/memory_runtime.c kernel/src/initramfs.c kernel/src/user_image.c
 OBJECTS := $(patsubst kernel/src/%.c,$(BUILD)/obj/%.o,$(SOURCES))
 OBJECTS += $(BUILD)/obj/interrupts.o $(BUILD)/obj/interrupt_entry.o $(BUILD)/obj/paging.o
 HEADERS := $(wildcard kernel/include/indianos/*.h) third_party/limine/limine.h
@@ -43,7 +43,7 @@ LDFLAGS := -target x86_64-unknown-none-elf -fuse-ld=lld -nostdlib -static \
            -Wl,-z,max-page-size=0x1000 -Wl,-z,noexecstack \
            -Wl,--gc-sections -Wl,--build-id=none -Wl,-T,kernel/linker.ld
 
-.PHONY: all kernel user-elf test-user-elf image run run-bios test-boot test-exception test-pagefault test-shadow test-host toolchain-check clean
+.PHONY: all kernel user-elf test-user-elf initramfs test-initramfs image run run-bios test-boot test-exception test-pagefault test-shadow test-host toolchain-check clean
 all: image
 kernel: $(KERNEL_ELF)
 
@@ -71,6 +71,7 @@ $(KERNEL_ELF): $(OBJECTS) kernel/linker.ld Makefile
 
 USER_ELF := $(BUILD)/userland/demo.elf
 USER_OBJ := $(BUILD)/userland/entry.o
+INITRAMFS := $(BUILD)/initramfs.img
 
 $(USER_OBJ): userland/demo/entry.c Makefile
 	@mkdir -p $(@D)
@@ -94,6 +95,19 @@ $(BUILD)/inspect_elf: tests/inspect_elf.c kernel/src/program.c kernel/include/in
 test-user-elf: $(USER_ELF) $(BUILD)/inspect_elf
 	$(BUILD)/inspect_elf $(USER_ELF)
 
+$(INITRAMFS): $(USER_ELF) tools/build_initramfs.py Makefile
+	python3 tools/build_initramfs.py --elf $(USER_ELF) --name /bin/init --output $@
+
+initramfs: $(INITRAMFS)
+
+$(BUILD)/inspect_archive: tests/inspect_archive.c kernel/src/initramfs.c kernel/src/program.c $(HEADERS) Makefile
+	@mkdir -p $(@D)
+	$(CC) -std=c11 -O2 -g -Wall -Wextra -Werror -I kernel/include \
+	    tests/inspect_archive.c kernel/src/initramfs.c kernel/src/program.c -o $@
+
+test-initramfs: $(INITRAMFS) $(BUILD)/inspect_archive
+	$(BUILD)/inspect_archive $(INITRAMFS)
+
 toolchain-check:
 	@command -v $(CC) && command -v ld.lld && command -v readelf
 	@echo 'Compiler, linker, and ELF reader available.'
@@ -113,11 +127,12 @@ $(LIMINE_BINARY)/limine.c: $(LIMINE_TARBALL)
 $(LIMINE_BINARY)/limine: $(LIMINE_BINARY)/limine.c
 	$(MAKE) -C $(LIMINE_BINARY) limine
 
-$(ISO): $(KERNEL_ELF) $(LIMINE_BINARY)/limine boot/limine.conf
+$(ISO): $(KERNEL_ELF) $(INITRAMFS) $(LIMINE_BINARY)/limine boot/limine.conf
 	@command -v xorriso >/dev/null || (echo 'Missing xorriso: install package xorriso' >&2; exit 1)
 	@rm -rf $(ISO_ROOT)
 	@mkdir -p $(ISO_ROOT)/boot/limine $(ISO_ROOT)/EFI/BOOT
 	@cp $(KERNEL_ELF) $(ISO_ROOT)/boot/indianos.elf
+	@cp $(INITRAMFS) $(ISO_ROOT)/boot/initramfs.img
 	@cp boot/limine.conf $(ISO_ROOT)/boot/limine/limine.conf
 	@cp $(LIMINE_BINARY)/limine-bios.sys $(LIMINE_BINARY)/limine-bios-cd.bin \
 	    $(LIMINE_BINARY)/limine-uefi-cd.bin $(ISO_ROOT)/boot/limine/
@@ -168,6 +183,10 @@ test-host:
 	$(CC) -std=c11 -O2 -g -Wall -Wextra -Werror -I kernel/include \
 	    tests/test_program.c kernel/src/program.c kernel/src/syscall_abi.c -o $(BUILD)/program_test
 	$(BUILD)/program_test
+	$(CC) -std=c11 -O2 -g -Wall -Wextra -Werror -I kernel/include \
+	    tests/test_user_image.c kernel/src/program.c kernel/src/initramfs.c \
+	    kernel/src/user_image.c kernel/src/vmm.c -o $(BUILD)/user_image_test
+	$(BUILD)/user_image_test
 	python3 -m unittest discover -s tests -v
 
 clean:
