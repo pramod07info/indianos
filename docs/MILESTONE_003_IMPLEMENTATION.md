@@ -68,3 +68,7 @@ make test-exception
 - Extend exception tables to report CR2 on page faults, build TSS/IST for double faults, and add a deliberate missing-page test.
 - Design process memory ownership, guarded stack mappings, address-space copy and `copyin/copyout` before implementing ring 3.
 - Continue never testing early kernels on real boot disks.
+
+## Subsequent work
+
+Milestone 004 adds CPU paging feature inspection, a TSS/IST emergency stack, CR2 page-fault logging and an opt-in shadow CR3 smoke switch. See [M004](MILESTONE_004_IMPLEMENTATION.md). It does **not** yet provide user-mode process isolation.
