@@ -25,6 +25,9 @@ MILESTONES = (
     "IndianOS: milestone 003 complete",
     "IndianOS: paging capabilities inspected",
     "IndianOS: milestone 004 complete",
+    "IndianOS: ELF64 user-image validation ready",
+    "IndianOS: syscall ABI metadata validation ready",
+    "IndianOS: milestone 005 foundation complete",
 )
 
 
