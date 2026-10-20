@@ -2,6 +2,7 @@
 #include <indianos/serial.h>
 #include <indianos/interrupts.h>
 #include <indianos/pmm.h>
+#include <indianos/vmm.h>
 
 __attribute__((noreturn)) static void halt_forever(void) {
     for (;;) {
@@ -46,5 +47,13 @@ __attribute__((noreturn)) void kmain(void) {
     __asm__ volatile ("ud2");
 #endif
     serial_write("IndianOS: milestone 002 complete\n");
+
+    /* Builds and validates an UNUSED address-space tree, not active CR3. */
+    if (!vmm_boot_self_test()) {
+        serial_write("IndianOS: FATAL virtual memory self-test failed\n");
+        halt_forever();
+    }
+    serial_write("IndianOS: detached virtual memory manager ready\n");
+    serial_write("IndianOS: milestone 003 complete\n");
     halt_forever();
 }
