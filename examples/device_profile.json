@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "description": "Design-time illustration of IndianOS x86_64 target; NO providers are implemented yet.",
+  "cpu_arch": "x86_64",
+  "authorized_mac": false,
+  "routes": {
+    "native": "planned",
+    "web": "planned",
+    "linux_compat": "planned",
+    "windows_compat": "planned",
+    "windows_vm": "planned",
+    "android_runtime": "planned",
+    "remote_mac": "planned"
+  }
+}
