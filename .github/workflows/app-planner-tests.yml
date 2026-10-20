@@ -1,0 +1,38 @@
+name: Offline app planner checks
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "tools/app_resolution.py"
+      - "examples/**"
+      - "tests/**"
+      - ".github/workflows/app-planner-tests.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  reference-planner:
+    name: Static manifests and unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out IndianOS source
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Validate sample JSON
+        run: |
+          python -m json.tool examples/app_catalog.json > /dev/null
+          python -m json.tool examples/device_profile.json > /dev/null
+      - name: Compile offline planner
+        run: python -m py_compile tools/app_resolution.py
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
+      - name: Smoke check planned app route
+        run: |
+          python tools/app_resolution.py --catalog examples/app_catalog.json --device examples/device_profile.json --app "Sample Notes"
