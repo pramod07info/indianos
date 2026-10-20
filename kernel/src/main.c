@@ -81,8 +81,9 @@ __attribute__((noreturn)) void kmain(void) {
 #endif
     serial_write("IndianOS: milestone 004 complete\n");
 
-    /* M005 foundation only: parse a built-in synthetic user ELF. No
-     * page mappings, ring-3 switch or SYSCALL entry are performed. */
+    /* Validate a synthetic ELF first; below, a real /bin/init is temporarily
+     * mapped into DETACHED page tables. No ring-3 entry, live CR3 switch
+     * or SYSCALL dispatch is performed in a normal boot. */
     if (!indianos_program_self_test() || !indianos_syscall_self_test()) {
         serial_write("IndianOS: FATAL user image contract self-test failed\n");
         halt_forever();
