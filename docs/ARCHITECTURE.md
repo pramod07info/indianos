@@ -79,3 +79,9 @@ The desktop is **not** part of the kernel. A user-space compositor gets graphics
 ## Deferred decisions
 
 A custom bootloader, ARM64, Wi-Fi on physical laptops, GPU acceleration, Windows ABI compatibility, full-disk encryption, secure boot chain, package signing and installers are separate projects. Track them by ADR and gate them behind tested kernel milestones.
+
+## Planned cross-platform application and AI layer
+
+The independent kernel exposes IndianOS process, memory, file, device and syscall primitives. These are **not** identical to Linux, Windows or macOS ABIs. A future user-space Interoperability Manager chooses a verified execution route for each app: native package, browser/PWA, implemented Linux ABI, Windows-API translation, authorized guest VM, Android runtime, or authorized remote Mac host. Each route requires separate engineering, licensing and testing.
+
+An optional assistant helps a user express intent and understand choices; a deterministic package planner and signed, least-privilege installer implement the action after explicit approval. The language model cannot run privileged commands. See [COMPATIBILITY.md](COMPATIBILITY.md) and [AI_APP_ASSISTANT.md](AI_APP_ASSISTANT.md).
