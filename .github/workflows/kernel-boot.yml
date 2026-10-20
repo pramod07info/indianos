@@ -13,6 +13,7 @@ on:
       - "tests/test_pmm.c"
       - "tests/test_vmm.c"
       - "tests/test_paging.c"
+      - "tests/test_program.c"
       - ".github/workflows/kernel-boot.yml"
   workflow_dispatch:
     inputs:
@@ -38,8 +39,15 @@ jobs:
           sudo apt-get install -y clang lld binutils xorriso qemu-system-x86 ovmf curl
       - name: Check cross compiler
         run: make toolchain-check
-      - name: Host tests (PMM, VMM, paging clone and serial transcript parser)
+      - name: Host tests (PMM, VMM, ELF64 image and serial transcript parser)
         run: make test-host
+      - name: Sanitize M005 executable planning and syscall ABI
+        run: |
+          clang -std=c11 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
+            -Wall -Wextra -Werror -I kernel/include \
+            tests/test_program.c kernel/src/program.c kernel/src/syscall_abi.c \
+            -o build/m005_program_sanitized
+          ./build/m005_program_sanitized
       - name: Compile freestanding kernel and package ISO
         run: make image
       - name: Inspect x86-64 ELF load segments
