@@ -2,7 +2,7 @@
 
 **IndianOS** is an experimental, independent desktop operating system for x86-64 PCs, designed for approachable everyday use in India. The goal is a familiar desktop workflow, Indian-language accessibility, and a native kernel—not a Linux distribution or a copy of Microsoft Windows.
 
-> **Status: M001 + M002 source implemented.** The freestanding x86-64 kernel, Limine ISO packaging, x86-64 exception tables, and boot-time frame allocator compile locally. QEMU firmware-to-kernel runtime verification is still pending CI. This is **not** a production OS or a real-PC installer. Do not flash it to physical storage.
+> **Status: M001–M003 source implemented.** The freestanding x86-64 kernel, Limine ISO packaging, x86-64 exception tables, boot-time frame allocator, and detached four-level virtual memory manager compile locally. QEMU firmware-to-kernel runtime verification is still pending CI. This is **not** a production OS or a real-PC installer. Do not flash it to physical storage.
 
 ## Initial technical decisions
 
@@ -24,11 +24,12 @@
 5. [Driver bring-up and hardware strategy](docs/DRIVER_STRATEGY.md)
 6. [Desktop and India-first UX plan](docs/DESKTOP.md)
 7. [Milestone 001: first kernel boot](docs/MILESTONE_001.md)
-8. [Milestone 002: exceptions and physical memory](docs/MILESTONE_002_IMPLEMENTATION.md) and [implementation guide](docs/BOOT_M001_IMPLEMENTATION.md)
-8. [Cross-platform app compatibility plan](docs/COMPATIBILITY.md)
-9. [AI app assistant and secure install architecture](docs/AI_APP_ASSISTANT.md)
-10. [ADR: compatibility and AI](docs/ADR-0002-interoperability-ai.md)
-11. [Performance and portability targets](docs/PERFORMANCE_GOALS.md)
+8. [Milestone 002: exceptions and physical memory](docs/MILESTONE_002_IMPLEMENTATION.md) and [M001 boot guide](docs/BOOT_M001_IMPLEMENTATION.md)
+9. [Milestone 003: detached virtual memory](docs/MILESTONE_003_IMPLEMENTATION.md)
+10. [Cross-platform app compatibility plan](docs/COMPATIBILITY.md)
+11. [AI app assistant and secure install architecture](docs/AI_APP_ASSISTANT.md)
+12. [ADR: compatibility and AI](docs/ADR-0002-interoperability-ai.md)
+13. [Performance and portability targets](docs/PERFORMANCE_GOALS.md)
 
 ## Directory plan
 
@@ -82,6 +83,22 @@ make test-exception  # separate deliberate-fault QEMU test
 ```
 
 The normal and exception variants compile locally, and host unit tests pass. Their actual execution in QEMU remains to be verified. See [M002 implementation and limitations](docs/MILESTONE_002_IMPLEMENTATION.md).
+
+## Virtual memory foundations (M003)
+
+Added a software-controlled x86-64, four-level page-table manager with mapping,
+query, unmapping, permission validation, failure rollback and page-table-frame
+reclamation. Its kernel smoke check uses the Limine HHDM to access PMM-backed
+page-table frames and validates a **detached** mapping. It deliberately does
+**not** switch the active CR3 root or implement usable user processes.
+
+```sh
+make kernel
+make test-host       # includes VMM C tests and 8 serial parser tests
+make test-boot       # requires QEMU/OVMF/xorriso, not run locally
+```
+
+See [M003 implementation and security boundaries](docs/MILESTONE_003_IMPLEMENTATION.md).
 
 ## Safety and legal
 
