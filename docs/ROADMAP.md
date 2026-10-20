@@ -87,3 +87,14 @@ See [M004 implementation](MILESTONE_004_IMPLEMENTATION.md). M005 should qualify 
 - **Not implemented:** privileged SYSRET/IRET entry, protected user mappings, page-fault-safe copy_from_user, runnable ring-3 code, initramfs, task scheduling or compatibility runtime for third-party operating systems.
 
 The next bounded engineering slice should add a read-only initramfs and real per-process mapping plan under QEMU, then a deliberate ring-3 transition behind a test flag. Do not call an ELF parser a functioning application loader.
+
+## Milestone 005 continuation checkpoint — initramfs/user staging (2026-10-20)
+
+- Read-only initramfs packer and strict kernel parser implemented.
+- Build now includes a real /bin/init ELF in the QEMU-only ISO and advertises it through Limine.
+- Kernel receives the module, validates /bin/init and stage-loads its data/text/stack in detached PMM-backed VMM mappings, then releases all transient frames.
+- Host sanitizer and GCC tests exercise zero filling, BSS, guard pages, page permissions and out-of-memory cleanup.
+- Full QEMU/OVMF execution remains unverified; no active CR3 replacement, ring-3 process, scheduler, filesystem service or syscall trap exists.
+- Next phase: verify firmware/boot handoff, then build a supervisor-protected process root and the first user-mode transition under a QEMU-only feature gate.
+
+See [M005 initramfs implementation](MILESTONE_005_INITRAMFS.md).
