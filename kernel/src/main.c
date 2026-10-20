@@ -4,6 +4,8 @@
 #include <indianos/pmm.h>
 #include <indianos/vmm.h>
 #include <indianos/paging.h>
+#include <indianos/program.h>
+#include <indianos/syscall_abi.h>
 
 __attribute__((noreturn)) static void halt_forever(void) {
     for (;;) {
@@ -77,6 +79,16 @@ __attribute__((noreturn)) void kmain(void) {
     serial_write("IndianOS: shadow CR3 switched and restored\n");
 #endif
     serial_write("IndianOS: milestone 004 complete\n");
+
+    /* M005 foundation only: parse a built-in synthetic user ELF. No
+     * page mappings, ring-3 switch or SYSCALL entry are performed. */
+    if (!indianos_program_self_test() || !indianos_syscall_self_test()) {
+        serial_write("IndianOS: FATAL user image contract self-test failed\n");
+        halt_forever();
+    }
+    serial_write("IndianOS: ELF64 user-image validation ready\n");
+    serial_write("IndianOS: syscall ABI metadata validation ready\n");
+    serial_write("IndianOS: milestone 005 foundation complete\n");
 #ifdef INDIANOS_TEST_PAGEFAULT
     serial_write("IndianOS: triggering intentional page fault\n");
     __asm__ volatile ("movabs $0x00007fff00000000, %%rax; movq (%%rax), %%rax"
