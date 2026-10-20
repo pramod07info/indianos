@@ -1,0 +1,94 @@
+{
+  "schema_version": 1,
+  "notice": "Fictional demo entries only. No application or compatibility route is verified or installable.",
+  "apps": [
+    {
+      "id": "sample-notes",
+      "name": "Sample Notes",
+      "aliases": [
+        "notes"
+      ],
+      "options": [
+        {
+          "route": "native",
+          "architectures": [
+            "x86_64"
+          ],
+          "verified_on_indianos": false
+        },
+        {
+          "route": "web",
+          "architectures": [
+            "x86_64",
+            "aarch64"
+          ],
+          "verified_on_indianos": false
+        }
+      ]
+    },
+    {
+      "id": "sample-linux-tool",
+      "name": "Sample Linux Tool",
+      "options": [
+        {
+          "route": "linux_compat",
+          "architectures": [
+            "x86_64"
+          ],
+          "verified_on_indianos": false
+        }
+      ]
+    },
+    {
+      "id": "sample-windows-tool",
+      "name": "Sample Windows Tool",
+      "aliases": [
+        "win demo"
+      ],
+      "options": [
+        {
+          "route": "windows_compat",
+          "architectures": [
+            "x86_64"
+          ],
+          "verified_on_indianos": false
+        },
+        {
+          "route": "windows_vm",
+          "architectures": [
+            "x86_64"
+          ],
+          "verified_on_indianos": false
+        }
+      ]
+    },
+    {
+      "id": "sample-mac-tool",
+      "name": "Sample Mac Tool",
+      "options": [
+        {
+          "route": "remote_mac",
+          "architectures": [
+            "x86_64",
+            "aarch64"
+          ],
+          "verified_on_indianos": false
+        }
+      ]
+    },
+    {
+      "id": "sample-android-tool",
+      "name": "Sample Android Tool",
+      "options": [
+        {
+          "route": "android_runtime",
+          "architectures": [
+            "x86_64",
+            "aarch64"
+          ],
+          "verified_on_indianos": false
+        }
+      ]
+    }
+  ]
+}
