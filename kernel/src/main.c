@@ -3,6 +3,7 @@
 #include <indianos/interrupts.h>
 #include <indianos/pmm.h>
 #include <indianos/vmm.h>
+#include <indianos/paging.h>
 
 __attribute__((noreturn)) static void halt_forever(void) {
     for (;;) {
@@ -55,5 +56,31 @@ __attribute__((noreturn)) void kmain(void) {
     }
     serial_write("IndianOS: detached virtual memory manager ready\n");
     serial_write("IndianOS: milestone 003 complete\n");
+
+    struct paging_cpu_state paging_state = {0};
+    if (!x86_64_paging_detect(&paging_state)) {
+        serial_write("IndianOS: FATAL paging capability discovery failed\n");
+        halt_forever();
+    }
+    serial_write("IndianOS: paging capabilities inspected\n");
+    if (paging_preflight(&paging_state)) {
+        serial_write("IndianOS: shadow paging preflight passed\n");
+    } else {
+        /* Basic kernel remains usable; no unsafe change to live CR3. */
+        serial_write("IndianOS: shadow paging switch not permitted\n");
+    }
+#ifdef INDIANOS_TEST_CR3_SWITCH
+    if (!x86_64_paging_shadow_switch_test()) {
+        serial_write("IndianOS: FATAL shadow CR3 switch failed\n");
+        halt_forever();
+    }
+    serial_write("IndianOS: shadow CR3 switched and restored\n");
+#endif
+    serial_write("IndianOS: milestone 004 complete\n");
+#ifdef INDIANOS_TEST_PAGEFAULT
+    serial_write("IndianOS: triggering intentional page fault\n");
+    __asm__ volatile ("movabs $0x00007fff00000000, %%rax; movq (%%rax), %%rax"
+                      : : : "rax", "memory");
+#endif
     halt_forever();
 }
