@@ -32,4 +32,7 @@ bool indianos_user_image_load(struct indianos_user_image *image,
  * unmap pages from the current CPU's active address space or flush the TLB. */
 bool indianos_user_image_destroy(struct indianos_user_image *image);
 
+/* Temporary PMM+HHDM staging check; never installs the tables in CR3. */
+bool user_image_boot_stage_test(const uint8_t *image, size_t image_bytes);
+
 #endif
