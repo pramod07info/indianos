@@ -1,5 +1,6 @@
 #include <indianos/boot.h>
 #include <indianos/serial.h>
+#include <indianos/initramfs.h>
 #include <limine.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -25,6 +26,11 @@ static volatile struct limine_framebuffer_request framebuffer_request = {
 __attribute__((used, section(".limine_requests")))
 static volatile struct limine_hhdm_request hhdm_request = {
     .id = LIMINE_HHDM_REQUEST_ID, .revision = 0
+};
+
+__attribute__((used, section(".limine_requests")))
+static volatile struct limine_module_request module_request = {
+    .id = LIMINE_MODULE_REQUEST_ID, .revision = 0
 };
 
 __attribute__((used, section(".limine_requests_end")))
@@ -59,6 +65,24 @@ bool boot_validate(void) {
         serial_write("IndianOS: no usable RAM in memory map\n");
         return false;
     }
+    return true;
+}
+
+bool boot_initramfs_file(const char *path, const uint8_t **data, size_t *size) {
+    const volatile struct limine_module_response *response = module_request.response;
+    if (path == NULL || data == NULL || size == NULL || response == NULL ||
+        response->module_count != 1 || response->modules == NULL ||
+        response->modules[0] == NULL) {
+        return false;
+    }
+    const struct limine_file *module = response->modules[0];
+    if (module->address == NULL || module->size < 16 ||
+        module->size > INDIANOS_INITRAMFS_MAX_BYTES) return false;
+    struct indianos_ramfile file = {0};
+    if (!indianos_initramfs_lookup((const uint8_t *)module->address,
+                                  (size_t)module->size, path, &file)) return false;
+    *data = file.bytes;
+    *size = file.length;
     return true;
 }
 
