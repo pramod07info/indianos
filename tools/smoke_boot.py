@@ -18,6 +18,9 @@ MILESTONES = (
     "IndianOS: kernel entered",
     "IndianOS: boot information validated",
     "IndianOS: milestone 001 complete",
+    "IndianOS: exception handlers ready",
+    "IndianOS: physical memory manager ready",
+    "IndianOS: milestone 002 complete",
 )
 
 
@@ -32,14 +35,33 @@ def assert_milestones(text: str) -> None:
             raise AssertionError(f"missing or out-of-order milestone: {marker}")
         offset = position + len(marker)
 
+def assert_expected_exception(text: str) -> None:
+    """A deliberate invalid-opcode trap must be caught by our own IDT."""
+    offset = 0
+    expected = (*MILESTONES[:3], "IndianOS: exception handlers ready",
+                "IndianOS: physical memory manager ready",
+                "IndianOS: triggering intentional UD2",
+                "IndianOS: FATAL CPU exception vector=0x0000000000000006")
+    for marker in expected:
+        position = text.find(marker, offset)
+        if position == -1:
+            raise AssertionError(f"missing or out-of-order exception marker: {marker}")
+        offset = position + len(marker)
+    if "IndianOS: milestone 002 complete" in text:
+        raise AssertionError("exception build should not return from #UD")
 
-def run_smoke(iso: Path, ovmf: Path, qemu: str, timeout: float) -> str:
+
+def run_smoke(iso: Path, ovmf: Path, qemu: str, timeout: float,
+              mode: str = "normal") -> str:
     if not iso.is_file():
         raise ValueError(f"ISO not found: {iso}")
     if not ovmf.is_file():
         raise ValueError(f"OVMF firmware missing: {ovmf} (install ovmf or set OVMF_CODE)")
     if timeout <= 0 or timeout > 180:
         raise ValueError("timeout must be between 0 and 180 seconds")
+    if mode not in {"normal", "exception"}:
+        raise ValueError("invalid smoke-test mode")
+    verify = assert_expected_exception if mode == "exception" else assert_milestones
     argv = [
         qemu, "-machine", "q35", "-m", "512M",
         "-drive", f"if=pflash,unit=0,format=raw,file={ovmf},readonly=on",
@@ -67,14 +89,14 @@ def run_smoke(iso: Path, ovmf: Path, qemu: str, timeout: float) -> str:
                     if len(output) > 1024 * 1024:
                         raise AssertionError("QEMU emitted too much output")
                     try:
-                        assert_milestones(output.decode("utf-8", errors="replace"))
+                        verify(output.decode("utf-8", errors="replace"))
                         return output.decode("utf-8", errors="replace")
                     except AssertionError:
                         pass
                 if process.poll() is not None:
                     break
         text = output.decode("utf-8", errors="replace")
-        assert_milestones(text)
+        verify(text)
         return text
     finally:
         if process.poll() is None:
@@ -92,9 +114,10 @@ def main() -> int:
     parser.add_argument("--ovmf", type=Path, required=True)
     parser.add_argument("--qemu", default="qemu-system-x86_64")
     parser.add_argument("--timeout", type=float, default=25)
+    parser.add_argument("--mode", choices=("normal", "exception"), default="normal")
     args = parser.parse_args()
     try:
-        output = run_smoke(args.iso, args.ovmf, args.qemu, args.timeout)
+        output = run_smoke(args.iso, args.ovmf, args.qemu, args.timeout, args.mode)
     except (AssertionError, ValueError, RuntimeError, OSError) as exc:
         print(f"IndianOS QEMU smoke test FAILED: {exc}", file=sys.stderr)
         return 1
