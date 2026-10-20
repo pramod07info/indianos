@@ -32,12 +32,18 @@ class SmokeBootTests(unittest.TestCase):
             assert_expected_pagefault(transcript)
 
     def test_accepts_shadow_switch_with_restoration(self):
-        assert_expected_shadow("\n".join([*MILESTONES[:-1],
-            "IndianOS: shadow CR3 switched and restored", MILESTONES[-1]]))
+        split = MILESTONES.index("IndianOS: milestone 004 complete")
+        assert_expected_shadow("\n".join([*MILESTONES[:split],
+            "IndianOS: shadow CR3 switched and restored",
+            *MILESTONES[split:]]))
 
     def test_rejects_missing_shadow_restore(self):
         with self.assertRaises(AssertionError):
             assert_expected_shadow("\n".join(MILESTONES))
+
+    def test_rejects_missing_m005_markers(self):
+        with self.assertRaises(AssertionError):
+            assert_milestones("\n".join(MILESTONES[:-3]))
 
     def test_rejects_out_of_order(self):
         with self.assertRaises(AssertionError):
