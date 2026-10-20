@@ -1,0 +1,45 @@
+name: IndianOS kernel boot (x86-64)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "kernel/**"
+      - "boot/**"
+      - "third_party/limine/**"
+      - "Makefile"
+      - "tools/smoke_boot.py"
+      - "tests/test_smoke_boot.py"
+      - ".github/workflows/kernel-boot.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  qemu-uefi:
+    name: Build ELF + ISO and verify serial boot
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install emulator and image-building dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld binutils xorriso qemu-system-x86 ovmf curl
+      - name: Check cross compiler
+        run: make toolchain-check
+      - name: Host unit tests
+        run: python3 -m unittest discover -s tests -v
+      - name: Compile freestanding kernel and package ISO
+        run: make image
+      - name: Inspect x86-64 ELF load segments
+        run: |
+          readelf -h build/indianos.elf
+          readelf -l build/indianos.elf
+          readelf -h build/indianos.elf | grep -q 'Machine:.*Advanced Micro Devices X86-64'
+      - name: Boot IndianOS in QEMU/OVMF
+        run: |
+          OVMF_PATH="$(find /usr/share/OVMF /usr/share/edk2 -name 'OVMF_CODE*.fd' -type f 2>/dev/null | head -n 1)"
+          test -n "$OVMF_PATH"
+          make test-boot OVMF_CODE="$OVMF_PATH"
