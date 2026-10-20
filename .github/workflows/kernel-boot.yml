@@ -14,6 +14,10 @@ on:
       - "tests/test_vmm.c"
       - "tests/test_paging.c"
       - "tests/test_program.c"
+      - "tests/test_user_image.c"
+      - "tests/inspect_archive.c"
+      - "tests/test_initramfs_tool.py"
+      - "tools/build_initramfs.py"
       - "tests/inspect_elf.c"
       - "userland/**"
       - ".github/workflows/kernel-boot.yml"
@@ -52,6 +56,15 @@ jobs:
           ./build/m005_program_sanitized
       - name: Compile and inspect freestanding user ELF fixture
         run: make test-user-elf
+      - name: Build and verify packaged read-only initramfs
+        run: make test-initramfs
+      - name: Sanitize physical user-image staging and initramfs parser
+        run: |
+          clang -std=c11 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
+            -Wall -Wextra -Werror -I kernel/include \
+            tests/test_user_image.c kernel/src/program.c kernel/src/initramfs.c \
+            kernel/src/user_image.c kernel/src/vmm.c -o build/user_image_sanitized
+          ./build/user_image_sanitized
       - name: Compile freestanding kernel and package ISO
         run: make image
       - name: Inspect x86-64 ELF load segments
