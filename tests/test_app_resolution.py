@@ -56,11 +56,11 @@ class AppResolutionTests(unittest.TestCase):
         self.assertEqual(result["choices"][0]["status"], "candidate")
         self.assertFalse(result["installable"])
 
-    def test_verified_requires_explicit_test_evidence_flag(self):
+    def test_untrusted_catalog_flag_cannot_certify_compatibility(self):
         self.device["routes"]["native"] = "ready"
         self.catalog["apps"][0]["options"][1]["verified_on_indianos"] = True
         result = plan_app(self.catalog, self.device, "Editor")
-        self.assertEqual(result["choices"][0]["status"], "verified")
+        self.assertEqual(result["choices"][0]["status"], "candidate")
         self.assertFalse(result["installable"])  # still never installs
 
     def test_invalid_runtime_state_is_rejected(self):
