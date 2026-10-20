@@ -69,3 +69,12 @@ See [COMPATIBILITY.md](COMPATIBILITY.md), [AI_APP_ASSISTANT.md](AI_APP_ASSISTANT
 - **Not implemented:** activation of kernel-owned page tables, NXE enablement, processes, app loader, TSS/IST, virtual user isolation or any cross-platform application execution.
 
 See [M003 engineering notes](MILESTONE_003_IMPLEMENTATION.md). The next milestone is an active-paging transition design with architecture-feature checks, robust exception-stack setup and test-only protected mappings, **not** a consumer desktop.
+
+## Implementation checkpoint: Milestone 004 (2026-10-20)
+
+- **Implemented in source:** CPU paging capability probe and fail-closed switch preflight (NXE, WP, LA57, PAE, address width), GDT Task State Segment with double-fault IST1 emergency stack, CR2 page-fault reporting, bounded four-level page-table shadow clone and an opt-in CR3 switch/restore smoke path.
+- **Host verified:** freestanding ELF builds of normal, deliberate #PF and shadow-switch variants; C paging clone/preflight tests; 12 Python transcript tests; ASan/UBSan paging tests.
+- **Not verified:** actual QEMU/OVMF firmware boot or optional CR3 switch and restoration. Normal kernel does **not** load the cloned CR3. Shadow switching must remain opt-in and QEMU-only.
+- **Not implemented:** production-owned CR3 kernel address space, process isolation, TSS RSP0 user transition, runnable native apps, drivers beyond the existing prototypes or AI app installation.
+
+See [M004 implementation](MILESTONE_004_IMPLEMENTATION.md). M005 should qualify kernel memory protection and prepare a limited ring-3 process loader.
