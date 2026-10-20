@@ -18,7 +18,7 @@ static void good_elf(unsigned char *elf, size_t size) {
 #define REJECT(change) do {good_elf(binary, sizeof binary); change; assert(!indianos_program_plan_elf64(binary,sizeof binary,&plan));} while (0)
 int main(void) {
     unsigned char binary[0x200]; struct indianos_program_plan plan={0};
-    assert(indianos_program_self_test()); good_elf(binary,sizeof binary);
+    assert(indianos_program_self_test()); assert(indianos_syscall_self_test()); good_elf(binary,sizeof binary);
     assert(indianos_program_plan_elf64(binary,sizeof binary,&plan));
     assert(plan.segment_count==1 && plan.entry==0x400100);
     assert(plan.segments[0].page_begin==0x400000 && plan.segments[0].page_end==0x402000);
