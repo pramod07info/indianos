@@ -2,7 +2,7 @@
 
 **IndianOS** is an experimental, independent desktop operating system for x86-64 PCs, designed for approachable everyday use in India. The goal is a familiar desktop workflow, Indian-language accessibility, and a native kernel—not a Linux distribution or a copy of Microsoft Windows.
 
-> **Status: M001–M004 source implemented; M005 first user-program foundation slice implemented.** The freestanding x86-64 kernel, Limine ISO packaging, x86-64 exception tables, boot-time frame allocator, detached virtual memory manager, M004 paging/exception foundations, and a new static x86-64 ELF64 image validator compile locally. QEMU firmware-to-kernel runtime verification is still pending CI. This is **not** a production OS or a real-PC installer. Do not flash it to physical storage.
+> **Status: M001–M004 source implemented; M005 ELF validation, initramfs and detached user-image staging implemented.** The freestanding x86-64 kernel, Limine ISO packaging, x86-64 exception tables, boot-time frame allocator, detached virtual memory manager, M004 paging/exception foundations, and a new static x86-64 ELF64 image validator compile locally. QEMU firmware-to-kernel runtime verification is still pending CI. This is **not** a production OS or a real-PC installer. Do not flash it to physical storage.
 
 ## Initial technical decisions
 
@@ -133,6 +133,25 @@ make test-boot    # requires QEMU/OVMF/xorriso for runtime smoke checks
 ```
 
 See [Milestone 005 implementation and remaining isolation requirements](docs/MILESTONE_005_IMPLEMENTATION.md).
+
+## Read-only initramfs and user-page staging (M005 continuation)
+
+The QEMU ISO now packages a deterministic read-only archive containing a freestanding
+`/bin/init` ELF. Limine advertises the archive as a module. During kernel startup,
+IndianOS validates the archive, allocates and zero-fills physical pages, copies
+program bytes and builds an isolated-looking **detached page-table tree**, with
+a writable non-executable stack and unmapped guard page. **It does not load
+this tree into CR3 or execute the program in ring 3.** All transient physical
+frames and tables are reclaimed after the boot self-test.
+
+```sh
+make test-host       # archive parser, user image mapping and failure rollback
+make test-initramfs  # compile /bin/init, pack archive, validate binary
+make image           # QEMU-only ISO with Limine initramfs module
+make test-boot       # QEMU/OVMF required, not yet verified locally
+```
+
+See [M005 initramfs and user-image staging](docs/MILESTONE_005_INITRAMFS.md).
 
 ## Safety and legal
 
