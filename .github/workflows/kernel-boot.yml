@@ -43,3 +43,10 @@ jobs:
           OVMF_PATH="$(find /usr/share/OVMF /usr/share/edk2 -name 'OVMF_CODE*.fd' -type f 2>/dev/null | head -n 1)"
           test -n "$OVMF_PATH"
           make test-boot OVMF_CODE="$OVMF_PATH"
+      - name: Upload experimental ISO for emulator debugging
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: indianos-m001-qemu-only
+          path: build/indianos.iso
+          retention-days: 7
