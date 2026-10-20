@@ -21,6 +21,8 @@ MILESTONES = (
     "IndianOS: exception handlers ready",
     "IndianOS: physical memory manager ready",
     "IndianOS: milestone 002 complete",
+    "IndianOS: detached virtual memory manager ready",
+    "IndianOS: milestone 003 complete",
 )
 
 
