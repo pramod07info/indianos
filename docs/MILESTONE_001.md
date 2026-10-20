@@ -1,6 +1,6 @@
 # Milestone 001 — boot a minimal IndianOS kernel in QEMU
 
-**Status:** planned, not implemented. This is the first coding milestone after Phase 0.
+**Status:** early kernel source and ELF compile implemented; runtime ISO/QEMU acceptance remains unverified until CI completes. See [implementation details](BOOT_M001_IMPLEMENTATION.md).
 
 ## Scope (keep bounded)
 
@@ -23,7 +23,7 @@ IndianOS: milestone 001 complete
 
 Do not print success before all the checked operations have completed.
 
-## Proposed commands (not yet available)
+## Implemented build and test targets
 
 ```sh
 make toolchain-check
@@ -34,15 +34,17 @@ make test-boot
 
 ## Acceptance checklist
 
-- [ ] Version-pinned dependencies with source/license details
-- [ ] `make image` succeeds on a documented Linux/WSL environment
+- [x] Version-pinned dependencies with source/license details
+- [ ] `make image` succeeds on a documented Linux/WSL environment (pending CI)
 - [ ] QEMU with OVMF boots without a host-disk dependency
 - [ ] Serial output contains the exact three lines above
 - [ ] Missing required boot info results in safe halt
 - [ ] Framebuffer absence handled without null dereference
 - [ ] Kernel tests do not write to physical storage
 - [ ] CI builds and runs a timed QEMU smoke test
-- [ ] README updated with real, tested commands
+- [x] README updated with available commands and their verification status
+
+Kernel source was compiled successfully with Clang/LLD into a higher-half x86-64 ELF during implementation, using an ABI-matching local header stub. The repository contains the pinned official protocol header; a successful emulator boot has **not** yet been independently observed.
 
 ## Out of scope
 
