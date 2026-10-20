@@ -120,12 +120,15 @@ See [Milestone 004 implementation and limitations](docs/MILESTONE_004_IMPLEMENTA
 Added a bounded, strict ELF64/x86-64 static executable layout validator,
 a **planned** 64 KiB user stack with an **unmapped guard-page reservation**,
 and a provisional syscall ABI validator for ABI_QUERY, WRITE and EXIT.
+The repository additionally builds a real, freestanding ELF64 demo fixture
+and validates it from a host program. It does not execute the demo.
 The kernel's boot-time self-test uses a synthetic ELF image: **it does not
 load, map, enter ring 3 or execute any application**.
 
 ```sh
 make kernel       # freestanding kernel compile
 make test-host    # includes ELF64 and syscall ABI host tests
+make test-user-elf # build a real freestanding ELF and validate its layout
 make test-boot    # requires QEMU/OVMF/xorriso for runtime smoke checks
 ```
 
