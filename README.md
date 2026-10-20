@@ -2,7 +2,7 @@
 
 **IndianOS** is an experimental, independent desktop operating system for x86-64 PCs, designed for approachable everyday use in India. The goal is a familiar desktop workflow, Indian-language accessibility, and a native kernel—not a Linux distribution or a copy of Microsoft Windows.
 
-> **Status: Phase 1 — an initial freestanding x86-64 kernel is implemented in source and compiles as an ELF.** Limine ISO packaging and QEMU/OVMF smoke tests have been added; runtime boot verification is pending CI. This is **not** a production OS or a real-PC installer. Do not flash it to physical storage.
+> **Status: M001 + M002 source implemented.** The freestanding x86-64 kernel, Limine ISO packaging, x86-64 exception tables, and boot-time frame allocator compile locally. QEMU firmware-to-kernel runtime verification is still pending CI. This is **not** a production OS or a real-PC installer. Do not flash it to physical storage.
 
 ## Initial technical decisions
 
@@ -23,7 +23,8 @@
 4. [Boot contract and error handling](docs/BOOT_CONTRACT.md)
 5. [Driver bring-up and hardware strategy](docs/DRIVER_STRATEGY.md)
 6. [Desktop and India-first UX plan](docs/DESKTOP.md)
-7. [Milestone 001: first kernel boot](docs/MILESTONE_001.md) and [implementation guide](docs/BOOT_M001_IMPLEMENTATION.md)
+7. [Milestone 001: first kernel boot](docs/MILESTONE_001.md)
+8. [Milestone 002: exceptions and physical memory](docs/MILESTONE_002_IMPLEMENTATION.md) and [implementation guide](docs/BOOT_M001_IMPLEMENTATION.md)
 8. [Cross-platform app compatibility plan](docs/COMPATIBILITY.md)
 9. [AI app assistant and secure install architecture](docs/AI_APP_ASSISTANT.md)
 10. [ADR: compatibility and AI](docs/ADR-0002-interoperability-ai.md)
@@ -68,6 +69,19 @@ python3 -m unittest discover -s tests -v
 ```
 
 The test harness detects ordered serial markers and terminates QEMU after success; the kernel itself halts rather than exiting. Pass `OVMF_CODE=/path/to/OVMF_CODE_4M.fd` if firmware is installed elsewhere. All generated files are beneath `build/`. See [implementation details](docs/BOOT_M001_IMPLEMENTATION.md).
+
+## Kernel foundations (M002)
+
+The x86-64 kernel now has a minimal own GDT and IDT, error-aware assembly exception stubs, and a conservative bitmap allocator for usable physical memory frames. An intentional `UD2` test build exercises exception vector 6. Physical frames are **not** automatically mapped or used.
+
+```sh
+make kernel          # native x86-64 ELF compile
+make test-host       # PMM C harness + Python serial transcript tests
+make test-boot       # normal Limine/QEMU/OVMF boot (requires emulator)
+make test-exception  # separate deliberate-fault QEMU test
+```
+
+The normal and exception variants compile locally, and host unit tests pass. Their actual execution in QEMU remains to be verified. See [M002 implementation and limitations](docs/MILESTONE_002_IMPLEMENTATION.md).
 
 ## Safety and legal
 
