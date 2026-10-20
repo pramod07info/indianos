@@ -28,6 +28,8 @@ MILESTONES = (
     "IndianOS: ELF64 user-image validation ready",
     "IndianOS: syscall ABI metadata validation ready",
     "IndianOS: milestone 005 foundation complete",
+    "IndianOS: read-only initramfs /bin/init validated",
+    "IndianOS: initramfs /bin/init staged and released safely",
 )
 
 
