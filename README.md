@@ -2,7 +2,7 @@
 
 **IndianOS** is an experimental, independent desktop operating system for x86-64 PCs, designed for approachable everyday use in India. The goal is a familiar desktop workflow, Indian-language accessibility, and a native kernel—not a Linux distribution or a copy of Microsoft Windows.
 
-> **Status: Phase 0 — architecture, planning and an offline host-side compatibility planner prototype.** This repository does **not** yet contain a bootable kernel, installer, or production-ready operating system. Do not try to install it on a real PC.
+> **Status: Phase 1 — an initial freestanding x86-64 kernel is implemented in source and compiles as an ELF.** Limine ISO packaging and QEMU/OVMF smoke tests have been added; runtime boot verification is pending CI. This is **not** a production OS or a real-PC installer. Do not flash it to physical storage.
 
 ## Initial technical decisions
 
@@ -23,7 +23,7 @@
 4. [Boot contract and error handling](docs/BOOT_CONTRACT.md)
 5. [Driver bring-up and hardware strategy](docs/DRIVER_STRATEGY.md)
 6. [Desktop and India-first UX plan](docs/DESKTOP.md)
-7. [Milestone 001: first kernel boot](docs/MILESTONE_001.md)
+7. [Milestone 001: first kernel boot](docs/MILESTONE_001.md) and [implementation guide](docs/BOOT_M001_IMPLEMENTATION.md)
 8. [Cross-platform app compatibility plan](docs/COMPATIBILITY.md)
 9. [AI app assistant and secure install architecture](docs/AI_APP_ASSISTANT.md)
 10. [ADR: compatibility and AI](docs/ADR-0002-interoperability-ai.md)
@@ -41,7 +41,7 @@ tools/         Emulator, image-building and test utilities
 docs/          Decisions, interfaces, roadmap, acceptance criteria
 ```
 
-Directory READMEs are placeholders, not working OS implementations.
+The boot and kernel directories now include the early kernel code; the desktop, drivers and userspace directories remain conceptual placeholders.
 
 ## Offline app compatibility planner (development prototype)
 
@@ -52,9 +52,22 @@ The sample manifest contains fictional applications and planned provider routes.
 
 All execution paths are informational; no apps are downloaded or installed. The companion design and security model are documented in [AI_APP_ASSISTANT.md](docs/AI_APP_ASSISTANT.md).
 
-## First objective
+## First kernel implementation (M001)
 
-In QEMU, boot an x86-64 ELF kernel using Limine, emit `IndianOS: kernel entered` on COM1 serial, validate the boot information, paint a solid-color framebuffer when available, and halt safely. See [Milestone 001](docs/MILESTONE_001.md).
+The code now contains a standalone x86-64 kernel entry, COM1 serial diagnostics, Limine protocol base revision and memory-map validation, an optional bounded tricolour framebuffer display, and safe halt behaviour. **A compiled ELF is not proof of a completed QEMU boot.**
+
+For development on Linux/WSL2, install `clang`, `lld`, `binutils`, `make`, `curl`, `xorriso`, `qemu-system-x86`, `ovmf` and Python 3:
+
+```sh
+make toolchain-check     # verify compiler toolchain
+make kernel              # compile freestanding ELF (offline)
+make image               # fetch SHA256-pinned Limine binary and build ISO
+make test-boot           # run UEFI QEMU smoke test against serial milestones
+make run                 # interactive UEFI QEMU boot
+python3 -m unittest discover -s tests -v
+```
+
+The test harness detects ordered serial markers and terminates QEMU after success; the kernel itself halts rather than exiting. Pass `OVMF_CODE=/path/to/OVMF_CODE_4M.fd` if firmware is installed elsewhere. All generated files are beneath `build/`. See [implementation details](docs/BOOT_M001_IMPLEMENTATION.md).
 
 ## Safety and legal
 
