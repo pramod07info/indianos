@@ -74,9 +74,10 @@ def assert_expected_pagefault(text: str) -> None:
 
 def assert_expected_shadow(text: str) -> None:
     """Shadow CR3 must switch and restore before milestone completion."""
-    expected = (*MILESTONES[:-1],
+    index = MILESTONES.index("IndianOS: milestone 004 complete")
+    expected = (*MILESTONES[:index],
                 "IndianOS: shadow CR3 switched and restored",
-                MILESTONES[-1])
+                *MILESTONES[index:])
     offset = 0
     for marker in expected:
         position = text.find(marker, offset)
