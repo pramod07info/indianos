@@ -89,6 +89,19 @@ __attribute__((noreturn)) void kmain(void) {
     serial_write("IndianOS: ELF64 user-image validation ready\n");
     serial_write("IndianOS: syscall ABI metadata validation ready\n");
     serial_write("IndianOS: milestone 005 foundation complete\n");
+
+    const uint8_t *init_elf = 0;
+    size_t init_elf_size = 0;
+    if (!boot_initramfs_file("/bin/init", &init_elf, &init_elf_size)) {
+        serial_write("IndianOS: FATAL initramfs /bin/init is unavailable or invalid\n");
+        halt_forever();
+    }
+    serial_write("IndianOS: read-only initramfs /bin/init validated\n");
+    if (!user_image_boot_stage_test(init_elf, init_elf_size)) {
+        serial_write("IndianOS: FATAL detached user-image staging failed\n");
+        halt_forever();
+    }
+    serial_write("IndianOS: initramfs /bin/init staged and released safely\n");
 #ifdef INDIANOS_TEST_PAGEFAULT
     serial_write("IndianOS: triggering intentional page fault\n");
     __asm__ volatile ("movabs $0x00007fff00000000, %%rax; movq (%%rax), %%rax"
