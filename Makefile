@@ -19,7 +19,7 @@ LIMINE_TARBALL := $(BUILD)/third_party/limine-binary.tar.gz
 LIMINE_URL := https://github.com/Limine-Bootloader/Limine/releases/download/v12.9.3/limine-binary.tar.gz
 LIMINE_SHA256 := 9f42fe9ea2e84d71056529969b1d5c24ba9a2287ffcc01bcce58b0ef8aa98b1d
 
-SOURCES := kernel/src/main.c kernel/src/serial.c kernel/src/boot.c kernel/src/pmm.c
+SOURCES := kernel/src/main.c kernel/src/serial.c kernel/src/boot.c kernel/src/pmm.c kernel/src/vmm.c kernel/src/vmm_boot.c
 OBJECTS := $(patsubst kernel/src/%.c,$(BUILD)/obj/%.o,$(SOURCES))
 OBJECTS += $(BUILD)/obj/interrupts.o $(BUILD)/obj/interrupt_entry.o
 HEADERS := $(wildcard kernel/include/indianos/*.h) third_party/limine/limine.h
@@ -116,6 +116,9 @@ test-host:
 	$(CC) -std=c11 -O2 -g -Wall -Wextra -Werror -I kernel/include \
 	    tests/test_pmm.c kernel/src/pmm.c -o $(BUILD)/pmm_test
 	$(BUILD)/pmm_test
+	$(CC) -std=c11 -O2 -g -Wall -Wextra -Werror -I kernel/include \
+	    tests/test_vmm.c kernel/src/vmm.c -o $(BUILD)/vmm_test
+	$(BUILD)/vmm_test
 	python3 -m unittest discover -s tests -v
 
 clean:
