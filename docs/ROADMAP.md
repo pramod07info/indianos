@@ -78,3 +78,12 @@ See [M003 engineering notes](MILESTONE_003_IMPLEMENTATION.md). The next mileston
 - **Not implemented:** production-owned CR3 kernel address space, process isolation, TSS RSP0 user transition, runnable native apps, drivers beyond the existing prototypes or AI app installation.
 
 See [M004 implementation](MILESTONE_004_IMPLEMENTATION.md). M005 should qualify kernel memory protection and prepare a limited ring-3 process loader.
+
+## Implementation checkpoint: M005 user-program foundation, first slice (2026-10-20)
+
+- **Implemented:** strict non-executing x86-64 ELF64 ET_EXEC parser, bounded user mapping layout plan, reserved 64 KiB user stack and 4 KiB guard, provisional ABI_QUERY/WRITE/EXIT syscall argument validator, boot-time self-tests, kernel-owned freestanding memcpy/memset/memmove and a real freestanding ELF fixture with a host checker.
+- **Validated locally:** malformed ELF rejection, user-address boundaries, syscall validation, ASan/UBSan for the ELF parser and ABI, freestanding object compilation and relocation link with no unresolved M005 object symbols; generated fixture parsed successfully.
+- **Not confirmed:** actual firmware/UEFI QEMU boot of the updated full kernel. CI is configured to test, but an actual success result has not been independently verified here.
+- **Not implemented:** privileged SYSRET/IRET entry, protected user mappings, page-fault-safe copy_from_user, runnable ring-3 code, initramfs, task scheduling or compatibility runtime for third-party operating systems.
+
+The next bounded engineering slice should add a read-only initramfs and real per-process mapping plan under QEMU, then a deliberate ring-3 transition behind a test flag. Do not call an ELF parser a functioning application loader.
