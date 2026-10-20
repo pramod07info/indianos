@@ -19,9 +19,9 @@ LIMINE_TARBALL := $(BUILD)/third_party/limine-binary.tar.gz
 LIMINE_URL := https://github.com/Limine-Bootloader/Limine/releases/download/v12.9.3/limine-binary.tar.gz
 LIMINE_SHA256 := 9f42fe9ea2e84d71056529969b1d5c24ba9a2287ffcc01bcce58b0ef8aa98b1d
 
-SOURCES := kernel/src/main.c kernel/src/serial.c kernel/src/boot.c kernel/src/pmm.c kernel/src/vmm.c kernel/src/vmm_boot.c
+SOURCES := kernel/src/main.c kernel/src/serial.c kernel/src/boot.c kernel/src/pmm.c kernel/src/vmm.c kernel/src/vmm_boot.c kernel/src/paging_clone.c kernel/src/paging_policy.c
 OBJECTS := $(patsubst kernel/src/%.c,$(BUILD)/obj/%.o,$(SOURCES))
-OBJECTS += $(BUILD)/obj/interrupts.o $(BUILD)/obj/interrupt_entry.o
+OBJECTS += $(BUILD)/obj/interrupts.o $(BUILD)/obj/interrupt_entry.o $(BUILD)/obj/paging.o
 HEADERS := $(wildcard kernel/include/indianos/*.h) third_party/limine/limine.h
 
 CFLAGS := -target x86_64-unknown-none-elf -std=c11 -O2 -g -Wall -Wextra -Werror \
@@ -33,15 +33,25 @@ CFLAGS := -target x86_64-unknown-none-elf -std=c11 -O2 -g -Wall -Wextra -Werror 
 ifeq ($(EXCEPTION_SELFTEST),1)
 CFLAGS += -DINDIANOS_TEST_UD2
 endif
+ifeq ($(PAGEFAULT_SELFTEST),1)
+CFLAGS += -DINDIANOS_TEST_PAGEFAULT
+endif
+ifeq ($(PAGING_SWITCH_SELFTEST),1)
+CFLAGS += -DINDIANOS_TEST_CR3_SWITCH
+endif
 LDFLAGS := -target x86_64-unknown-none-elf -fuse-ld=lld -nostdlib -static \
            -Wl,-z,max-page-size=0x1000 -Wl,-z,noexecstack \
            -Wl,--gc-sections -Wl,--build-id=none -Wl,-T,kernel/linker.ld
 
-.PHONY: all kernel image run run-bios test-boot test-exception test-host toolchain-check clean
+.PHONY: all kernel image run run-bios test-boot test-exception test-pagefault test-shadow test-host toolchain-check clean
 all: image
 kernel: $(KERNEL_ELF)
 
 $(BUILD)/obj/%.o: kernel/src/%.c $(HEADERS) Makefile
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD)/obj/paging.o: kernel/arch/x86_64/paging.c $(HEADERS) Makefile
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -111,6 +121,14 @@ test-exception:
 	$(MAKE) image BUILD=build/ud2 EXCEPTION_SELFTEST=1
 	python3 tools/smoke_boot.py --iso build/ud2/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)" --mode exception
 
+test-pagefault:
+	$(MAKE) image BUILD=build/pagefault PAGEFAULT_SELFTEST=1
+	python3 tools/smoke_boot.py --iso build/pagefault/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)" --mode pagefault
+
+test-shadow:
+	$(MAKE) image BUILD=build/shadow PAGING_SWITCH_SELFTEST=1
+	python3 tools/smoke_boot.py --iso build/shadow/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)" --mode shadow
+
 test-host:
 	@mkdir -p $(BUILD)
 	$(CC) -std=c11 -O2 -g -Wall -Wextra -Werror -I kernel/include \
@@ -119,6 +137,9 @@ test-host:
 	$(CC) -std=c11 -O2 -g -Wall -Wextra -Werror -I kernel/include \
 	    tests/test_vmm.c kernel/src/vmm.c -o $(BUILD)/vmm_test
 	$(BUILD)/vmm_test
+	$(CC) -std=c11 -O2 -g -Wall -Wextra -Werror -I kernel/include \
+	    tests/test_paging.c kernel/src/paging_policy.c kernel/src/paging_clone.c -o $(BUILD)/paging_test
+	$(BUILD)/paging_test
 	python3 -m unittest discover -s tests -v
 
 clean:
