@@ -24,11 +24,10 @@ ROUTE_PREFERENCE = (
 ROUTES = frozenset(ROUTE_PREFERENCE)
 ROUTE_STATES = frozenset(("ready", "planned", "disabled"))
 STATUS_ORDER = {
-    "verified": 0,
-    "candidate": 1,
-    "planned": 2,
-    "unavailable": 3,
-    "blocked": 4,
+    "candidate": 0,
+    "planned": 1,
+    "unavailable": 2,
+    "blocked": 3,
 }
 
 
@@ -44,8 +43,8 @@ def plan_app(catalog: dict[str, Any], device: dict[str, Any],
              app_name: str) -> dict[str, Any]:
     """Provide explanations, never an executable installation decision.
 
-    'verified' requires an app-option flag from real compatibility testing
-    AND an available runtime. Sample data contains no verified options.
+    This prototype never certifies an app as verified. Certification needs
+    independent signed compatibility-test attestations, which do not exist yet.
     """
     if not isinstance(app_name, str) or not app_name.strip():
         raise ValueError("app_name must be nonempty text")
@@ -107,10 +106,8 @@ def plan_app(catalog: dict[str, Any], device: dict[str, Any],
             status, reason = "unavailable", "Runtime provider is unavailable"
         elif routes[route] == "planned":
             status, reason = "planned", "Runtime provider has not been implemented"
-        elif option.get("verified_on_indianos") is True:
-            status, reason = "verified", "Route and app verified on a defined test profile"
         else:
-            status, reason = "candidate", "Runtime exists but this app needs verification"
+            status, reason = "candidate", "Runtime exists but this app needs independent verification"
 
         choices.append({
             "route": route,
