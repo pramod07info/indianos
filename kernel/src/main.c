@@ -6,6 +6,7 @@
 #include <indianos/paging.h>
 #include <indianos/program.h>
 #include <indianos/syscall_abi.h>
+#include <indianos/user_image.h>
 
 __attribute__((noreturn)) static void halt_forever(void) {
     for (;;) {
