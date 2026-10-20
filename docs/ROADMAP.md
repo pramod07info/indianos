@@ -59,3 +59,13 @@ These tracks depend on a working isolated userspace; they are not replacements f
 Tracking metrics: number of **verified** supported applications, compatibility regressions, cold-boot time, app launch time, crash rates, idle resource use and install recovery. The 100% universal compatibility aspiration cannot be promised or treated as an acceptance criterion.
 
 See [COMPATIBILITY.md](COMPATIBILITY.md), [AI_APP_ASSISTANT.md](AI_APP_ASSISTANT.md) and [PERFORMANCE_GOALS.md](PERFORMANCE_GOALS.md).
+
+## Implementation checkpoint: Milestone 003 (2026-10-20)
+
+- **Implemented in source:** x86-64 four-level detached PML4/PDP/PD/PT page-table builder, map/query/unmap, rollback on failed intermediate allocation, W^X/NX encoding, user/kernel canonical-half policy, and reclamation of empty table frames.
+- **Boot integration:** Limine HHDM access, one temporary PMM-backed data page, metadata verification and complete cleanup without touching live CR3.
+- **Validated locally:** freestanding ELF kernel and UD2 variant compile, Clang/GCC native C VMM tests pass, sanitizer run passes, Python serial tests pass.
+- **Unverified:** QEMU/OVMF boot execution. GitHub CI is configured; boot results were not independently inspected in this session.
+- **Not implemented:** activation of kernel-owned page tables, NXE enablement, processes, app loader, TSS/IST, virtual user isolation or any cross-platform application execution.
+
+See [M003 engineering notes](MILESTONE_003_IMPLEMENTATION.md). The next milestone is an active-paging transition design with architecture-feature checks, robust exception-stack setup and test-only protected mappings, **not** a consumer desktop.
