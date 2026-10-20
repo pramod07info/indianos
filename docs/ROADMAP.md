@@ -43,3 +43,19 @@ The phases overlap only after team capacity and automated tests permit it. Numbe
 - Phase 3: a ring-3 process cannot read/write kernel memory.
 - Phase 6: graphical windows are managed by a user process, not a kernel task.
 - Beta: qualified hardware, security review, installer/recovery and update rollback.
+
+## Cross-platform and AI app delivery tracks (future)
+
+These tracks depend on a working isolated userspace; they are not replacements for the kernel milestones above:
+
+- **Native/web:** real package management, signed app manifests, browser/PWA runtime, app-store UX and rollback.
+- **Linux apps:** choose a bounded syscall/ABI target, ELF loader, POSIX compatibility test suite, sandbox policy and verified sample apps.
+- **Windows apps:** evaluate a portable Windows user-space API layer and separately licensed Windows VM sessions; verify each app and driver requirement.
+- **Android apps:** validate kernel/graphics requirements for an Android runtime or isolated guest.
+- **macOS-only apps:** prioritize native ports, web versions and approved remote Mac execution. Do not promise generic non-Apple hardware virtualization.
+- **AI app assistant:** natural-language request -> trusted catalog -> deterministic compatibility decision -> user approval -> signed transactional package service -> verification/rollback.
+- **Hardware portability:** an ARM64 port is a separate platform workstream, requiring its own CPU, MMU, interrupt and device support.
+
+Tracking metrics: number of **verified** supported applications, compatibility regressions, cold-boot time, app launch time, crash rates, idle resource use and install recovery. The 100% universal compatibility aspiration cannot be promised or treated as an acceptance criterion.
+
+See [COMPATIBILITY.md](COMPATIBILITY.md), [AI_APP_ASSISTANT.md](AI_APP_ASSISTANT.md) and [PERFORMANCE_GOALS.md](PERFORMANCE_GOALS.md).
