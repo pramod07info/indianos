@@ -12,8 +12,15 @@ on:
       - "tests/test_smoke_boot.py"
       - "tests/test_pmm.c"
       - "tests/test_vmm.c"
+      - "tests/test_paging.c"
       - ".github/workflows/kernel-boot.yml"
   workflow_dispatch:
+    inputs:
+      run_shadow_switch:
+        description: "Run experimental QEMU-only CR3 switch smoke test"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -31,7 +38,7 @@ jobs:
           sudo apt-get install -y clang lld binutils xorriso qemu-system-x86 ovmf curl
       - name: Check cross compiler
         run: make toolchain-check
-      - name: Host tests (PMM, VMM and QEMU transcript parser)
+      - name: Host tests (PMM, VMM, paging clone and serial transcript parser)
         run: make test-host
       - name: Compile freestanding kernel and package ISO
         run: make image
@@ -57,3 +64,14 @@ jobs:
           OVMF_PATH="$(find /usr/share/OVMF /usr/share/edk2 -name 'OVMF_CODE*.fd' -type f 2>/dev/null | head -n 1)"
           test -n "$OVMF_PATH"
           make test-exception OVMF_CODE="$OVMF_PATH"
+      - name: Verify page-fault address via CR2 in a separate test image
+        run: |
+          OVMF_PATH="$(find /usr/share/OVMF /usr/share/edk2 -name 'OVMF_CODE*.fd' -type f 2>/dev/null | head -n 1)"
+          test -n "$OVMF_PATH"
+          make test-pagefault OVMF_CODE="$OVMF_PATH"
+      - name: Opt-in guarded shadow CR3 switch (QEMU-only)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_shadow_switch == true }}
+        run: |
+          OVMF_PATH="$(find /usr/share/OVMF /usr/share/edk2 -name 'OVMF_CODE*.fd' -type f 2>/dev/null | head -n 1)"
+          test -n "$OVMF_PATH"
+          make test-shadow OVMF_CODE="$OVMF_PATH"
