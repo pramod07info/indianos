@@ -2,7 +2,7 @@
 
 **IndianOS** is an experimental, independent desktop operating system for x86-64 PCs, designed for approachable everyday use in India. The goal is a familiar desktop workflow, Indian-language accessibility, and a native kernel—not a Linux distribution or a copy of Microsoft Windows.
 
-> **Status: M001–M003 source implemented.** The freestanding x86-64 kernel, Limine ISO packaging, x86-64 exception tables, boot-time frame allocator, and detached four-level virtual memory manager compile locally. QEMU firmware-to-kernel runtime verification is still pending CI. This is **not** a production OS or a real-PC installer. Do not flash it to physical storage.
+> **Status: M001–M004 source implemented.** The freestanding x86-64 kernel, Limine ISO packaging, x86-64 exception tables, boot-time frame allocator, detached virtual memory manager, and M004 paging/exception foundations compile locally. QEMU firmware-to-kernel runtime verification is still pending CI. This is **not** a production OS or a real-PC installer. Do not flash it to physical storage.
 
 ## Initial technical decisions
 
@@ -26,10 +26,11 @@
 7. [Milestone 001: first kernel boot](docs/MILESTONE_001.md)
 8. [Milestone 002: exceptions and physical memory](docs/MILESTONE_002_IMPLEMENTATION.md) and [M001 boot guide](docs/BOOT_M001_IMPLEMENTATION.md)
 9. [Milestone 003: detached virtual memory](docs/MILESTONE_003_IMPLEMENTATION.md)
-10. [Cross-platform app compatibility plan](docs/COMPATIBILITY.md)
-11. [AI app assistant and secure install architecture](docs/AI_APP_ASSISTANT.md)
-12. [ADR: compatibility and AI](docs/ADR-0002-interoperability-ai.md)
-13. [Performance and portability targets](docs/PERFORMANCE_GOALS.md)
+10. [Milestone 004: paging preflight, TSS/IST and page faults](docs/MILESTONE_004_IMPLEMENTATION.md)
+11. [Cross-platform app compatibility plan](docs/COMPATIBILITY.md)
+12. [AI app assistant and secure install architecture](docs/AI_APP_ASSISTANT.md)
+13. [ADR: compatibility and AI](docs/ADR-0002-interoperability-ai.md)
+14. [Performance and portability targets](docs/PERFORMANCE_GOALS.md)
 
 ## Directory plan
 
@@ -99,6 +100,19 @@ make test-boot       # requires QEMU/OVMF/xorriso, not run locally
 ```
 
 See [M003 implementation and security boundaries](docs/MILESTONE_003_IMPLEMENTATION.md).
+
+## CPU paging protections and exception diagnostics (M004)
+
+Added CPU paging capability discovery and strict switching preflight (NX/NXE, WP, PAE and four-level checks), a dedicated TSS/IST1 double-fault emergency stack, and detailed page-fault reporting with CR2. A bounded page-table-cloning engine has host tests. **The default kernel never changes CR3**; an opt-in QEMU-only variant can attempt a guarded clone/switch/restore round trip, pending runtime verification.
+
+On Linux/WSL:
+
+    make kernel
+    make test-host
+    make test-pagefault   # needs QEMU, OVMF and xorriso
+    make test-shadow      # experimental, manual QEMU-only test
+
+See [Milestone 004 implementation and limitations](docs/MILESTONE_004_IMPLEMENTATION.md). This is not yet a process-isolated or installable OS.
 
 ## Safety and legal
 
