@@ -57,6 +57,26 @@ bool boot_validate(void) {
     return true;
 }
 
+uint64_t boot_memory_region_count(void) {
+    const volatile struct limine_memmap_response *map = memory_map_request.response;
+    return map == NULL ? 0 : map->entry_count;
+}
+
+bool boot_memory_region_at(uint64_t index,
+                           struct indianos_memory_region *out, void *context) {
+    (void)context;
+    const volatile struct limine_memmap_response *map = memory_map_request.response;
+    if (out == NULL || map == NULL || map->entries == NULL ||
+        index >= map->entry_count || map->entries[index] == NULL) {
+        return false;
+    }
+    const struct limine_memmap_entry *region = map->entries[index];
+    *out = (struct indianos_memory_region) {
+        .base = region->base, .length = region->length, .type = region->type,
+    };
+    return true;
+}
+
 static bool framebuffer_valid(const struct limine_framebuffer *fb) {
     if (fb == NULL || fb->address == NULL || fb->width == 0 || fb->height == 0 ||
         fb->memory_model != LIMINE_FRAMEBUFFER_RGB || fb->bpp != 32 ||
