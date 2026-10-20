@@ -11,6 +11,10 @@ class SmokeBootTests(unittest.TestCase):
     def test_accepts_expected_order_with_additional_messages(self):
         assert_milestones("\nextra\n" + "\r\nother\r\n".join(MILESTONES) + "\r\n")
 
+    def test_rejects_old_m002_only_transcript(self):
+        with self.assertRaises(AssertionError):
+            assert_milestones("\n".join(MILESTONES[:-2]))
+
     def test_rejects_out_of_order(self):
         with self.assertRaises(AssertionError):
             assert_milestones("\n".join(reversed(MILESTONES)))
@@ -40,7 +44,7 @@ class SmokeBootTests(unittest.TestCase):
         output = "\n".join([*MILESTONES[:5],
                            "IndianOS: triggering intentional UD2",
                            "IndianOS: FATAL CPU exception vector=0x0000000000000006",
-                           MILESTONES[-1]])
+                           "IndianOS: milestone 002 complete"])
         with self.assertRaises(AssertionError):
             assert_expected_exception(output)
 
