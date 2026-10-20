@@ -23,6 +23,8 @@ MILESTONES = (
     "IndianOS: milestone 002 complete",
     "IndianOS: detached virtual memory manager ready",
     "IndianOS: milestone 003 complete",
+    "IndianOS: paging capabilities inspected",
+    "IndianOS: milestone 004 complete",
 )
 
 
@@ -53,6 +55,35 @@ def assert_expected_exception(text: str) -> None:
         raise AssertionError("exception build should not return from #UD")
 
 
+def assert_expected_pagefault(text: str) -> None:
+    """Verify intentional missing-page trap records the faulting CR2."""
+    expected = (*MILESTONES,
+                "IndianOS: triggering intentional page fault",
+                "IndianOS: FATAL CPU exception vector=0x000000000000000e",
+                "IndianOS: page fault cr2=0x00007fff00000000")
+    offset = 0
+    for marker in expected:
+        position = text.find(marker, offset)
+        if position == -1:
+            raise AssertionError(f"missing or out-of-order page-fault marker: {marker}")
+        offset = position + len(marker)
+
+
+def assert_expected_shadow(text: str) -> None:
+    """Shadow CR3 must switch and restore before milestone completion."""
+    expected = (*MILESTONES[:-1],
+                "IndianOS: shadow CR3 switched and restored",
+                MILESTONES[-1])
+    offset = 0
+    for marker in expected:
+        position = text.find(marker, offset)
+        if position == -1:
+            raise AssertionError(f"missing or out-of-order shadow marker: {marker}")
+        offset = position + len(marker)
+    if "IndianOS: FATAL" in text:
+        raise AssertionError("shadow-switch kernel reported fatal error")
+
+
 def run_smoke(iso: Path, ovmf: Path, qemu: str, timeout: float,
               mode: str = "normal") -> str:
     if not iso.is_file():
@@ -61,9 +92,15 @@ def run_smoke(iso: Path, ovmf: Path, qemu: str, timeout: float,
         raise ValueError(f"OVMF firmware missing: {ovmf} (install ovmf or set OVMF_CODE)")
     if timeout <= 0 or timeout > 180:
         raise ValueError("timeout must be between 0 and 180 seconds")
-    if mode not in {"normal", "exception"}:
+    if mode not in {"normal", "exception", "pagefault", "shadow"}:
         raise ValueError("invalid smoke-test mode")
-    verify = assert_expected_exception if mode == "exception" else assert_milestones
+    verifiers = {
+        "normal": assert_milestones,
+        "exception": assert_expected_exception,
+        "pagefault": assert_expected_pagefault,
+        "shadow": assert_expected_shadow,
+    }
+    verify = verifiers[mode]
     argv = [
         qemu, "-machine", "q35", "-m", "512M",
         "-drive", f"if=pflash,unit=0,format=raw,file={ovmf},readonly=on",
@@ -116,7 +153,7 @@ def main() -> int:
     parser.add_argument("--ovmf", type=Path, required=True)
     parser.add_argument("--qemu", default="qemu-system-x86_64")
     parser.add_argument("--timeout", type=float, default=25)
-    parser.add_argument("--mode", choices=("normal", "exception"), default="normal")
+    parser.add_argument("--mode", choices=("normal", "exception", "pagefault", "shadow"), default="normal")
     args = parser.parse_args()
     try:
         output = run_smoke(args.iso, args.ovmf, args.qemu, args.timeout, args.mode)
