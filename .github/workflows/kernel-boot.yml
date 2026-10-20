@@ -14,6 +14,8 @@ on:
       - "tests/test_vmm.c"
       - "tests/test_paging.c"
       - "tests/test_program.c"
+      - "tests/inspect_elf.c"
+      - "userland/**"
       - ".github/workflows/kernel-boot.yml"
   workflow_dispatch:
     inputs:
@@ -48,6 +50,8 @@ jobs:
             tests/test_program.c kernel/src/program.c kernel/src/syscall_abi.c \
             -o build/m005_program_sanitized
           ./build/m005_program_sanitized
+      - name: Compile and inspect freestanding user ELF fixture
+        run: make test-user-elf
       - name: Compile freestanding kernel and package ISO
         run: make image
       - name: Inspect x86-64 ELF load segments
