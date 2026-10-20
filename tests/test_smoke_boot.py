@@ -45,6 +45,15 @@ class SmokeBootTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             assert_milestones("\n".join(MILESTONES[:-3]))
 
+    def test_rejects_no_archive_module(self):
+        with self.assertRaises(AssertionError):
+            assert_milestones("\n".join(MILESTONES[:-2]))
+
+    def test_rejects_missing_staging_success(self):
+        with self.assertRaises(AssertionError):
+            assert_milestones("\n".join([*MILESTONES[:-1],
+                "IndianOS: FATAL detached user-image staging failed"]))
+
     def test_rejects_out_of_order(self):
         with self.assertRaises(AssertionError):
             assert_milestones("\n".join(reversed(MILESTONES)))
