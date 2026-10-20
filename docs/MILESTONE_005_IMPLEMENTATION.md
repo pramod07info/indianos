@@ -92,3 +92,19 @@ GitHub Actions now includes the M005 host program test and sanitizer invocation.
 6. Only declare first-user-program execution complete when the **QEMU serial log** shows a ring-3 program running and exiting without bypassing the privilege boundary.
 
 No user confirmation or PR is needed for the repository's established direct-to-`main` development workflow.
+
+## Additional reproducible ELF fixture and kernel memory routines
+
+- `userland/demo/entry.c` is a simple freestanding x86-64 program that loops with `pause`. It exists **only** as an ELF validation fixture; IndianOS does not launch it.
+- `userland/demo/linker.ld` links at user virtual address `0x400000` into an ELF64 `ET_EXEC` image containing a read+execute load segment.
+- `tests/inspect_elf.c` is a host-only executable that reads the produced ELF and invokes the same kernel ELF parser against real program bytes. It does not execute the file.
+- `kernel/src/memory_runtime.c` provides small freestanding implementations of compiler-required `memset`, `memcpy` and `memmove`. These functions do **not** perform privileged/user-boundary copying; a separate fault-safe user-copy implementation is mandatory before running processes.
+- Host compilation/verification:
+
+```sh
+make user-elf
+make test-user-elf
+make test-host
+```
+
+In local checks, the generated demo ELF was accepted (entry `0x400000`, one load segment), and a normal Linux dynamically linked executable was rejected. The M005 freestanding objects plus kernel-owned memory routines linked as a combined relocatable object **without unresolved symbols**. These results are not a claim that the full kernel successfully booted or ran the demo.
