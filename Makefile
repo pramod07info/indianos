@@ -43,7 +43,7 @@ LDFLAGS := -target x86_64-unknown-none-elf -fuse-ld=lld -nostdlib -static \
            -Wl,-z,max-page-size=0x1000 -Wl,-z,noexecstack \
            -Wl,--gc-sections -Wl,--build-id=none -Wl,-T,kernel/linker.ld
 
-.PHONY: all kernel image run run-bios test-boot test-exception test-pagefault test-shadow test-host toolchain-check clean
+.PHONY: all kernel user-elf test-user-elf image run run-bios test-boot test-exception test-pagefault test-shadow test-host toolchain-check clean
 all: image
 kernel: $(KERNEL_ELF)
 
@@ -68,6 +68,31 @@ $(KERNEL_ELF): $(OBJECTS) kernel/linker.ld Makefile
 	$(CC) $(LDFLAGS) $(OBJECTS) -o $@
 	@readelf -h $@ | grep -q 'Machine:.*Advanced Micro Devices X86-64'
 	@echo 'IndianOS: x86-64 ELF kernel compiled.'
+
+USER_ELF := $(BUILD)/userland/demo.elf
+USER_OBJ := $(BUILD)/userland/entry.o
+
+$(USER_OBJ): userland/demo/entry.c Makefile
+	@mkdir -p $(@D)
+	$(CC) -target x86_64-unknown-none-elf -std=c11 -O2 -ffreestanding \
+	    -fno-builtin -fno-pie -fno-pic -fno-stack-protector -mno-red-zone \
+	    -c $< -o $@
+
+$(USER_ELF): $(USER_OBJ) userland/demo/linker.ld Makefile
+	$(CC) -target x86_64-unknown-none-elf -fuse-ld=lld -nostdlib -static \
+	    -Wl,-z,max-page-size=0x1000 -Wl,-z,noexecstack \
+	    -Wl,-T,userland/demo/linker.ld $(USER_OBJ) -o $@
+	@readelf -h $@ | grep -q 'Type:.*EXEC'
+
+user-elf: $(USER_ELF)
+
+$(BUILD)/inspect_elf: tests/inspect_elf.c kernel/src/program.c kernel/include/indianos/program.h Makefile
+	@mkdir -p $(@D)
+	$(CC) -std=c11 -O2 -g -Wall -Wextra -Werror -I kernel/include \
+	    tests/inspect_elf.c kernel/src/program.c -o $@
+
+test-user-elf: $(USER_ELF) $(BUILD)/inspect_elf
+	$(BUILD)/inspect_elf $(USER_ELF)
 
 toolchain-check:
 	@command -v $(CC) && command -v ld.lld && command -v readelf
