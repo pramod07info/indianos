@@ -147,11 +147,23 @@ pub(crate) fn enable_irq1()->bool{
         let apic_hi:u32;
         unsafe{asm!("rdmsr",in("ecx")0x1bu32,
             out("eax")apic_lo,out("edx")apic_hi,options(nostack,preserves_flags));}
-        if apic_lo&(1<<10)!=0{return false;}
+        if apic_lo&(1<<10)!=0{return false;} // x2APIC requires separate routing
+        // OVMF leaves the local APIC active. The 8259 output is wired
+        // to LINT0 (ExtINT), not directly to CPU INTR. Disabling the
+        // APIC breaks firmware on some QEMU CPU profiles; configure the
+        // architectural virtual-wire route instead.
         if apic_lo&(1<<11)!=0{
-            apic_lo&=!(1<<11);
-            unsafe{asm!("wrmsr",in("ecx")0x1bu32,
-                in("eax")apic_lo,in("edx")apic_hi,options(nostack,preserves_flags));}
+            let mut hhdm=0u64;
+            if !unsafe{crate::boot::boot_hhdm_offset(&mut hhdm)}{return false;}
+            let base=((apic_hi as u64)<<32)|((apic_lo as u64)&0xffff_f000);
+            let Some(virt)=base.checked_add(hhdm)else{return false;};
+            let apic=virt as *mut u32;
+            unsafe{
+                let svr=core::ptr::read_volatile(apic.add(0xf0/4));
+                core::ptr::write_volatile(apic.add(0xf0/4),svr|0x100);
+                // LINT0 ExtINT, physical destination, unmasked.
+                core::ptr::write_volatile(apic.add(0x350/4),0x700);
+            }
         }
     }
     unsafe{

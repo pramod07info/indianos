@@ -297,11 +297,7 @@ pub fn run(args:&[String])->Result<String,String>{
                   "-boot","d","-display","none","-serial","stdio",
                   "-no-reboot","-no-shutdown"]);
     if mode=="preempt"{command.arg("-no-hpet");}
-    if mode=="keyboard"{
-        // Isolate the legacy 8259 INTR path from the OVMF APIC virtual wire.
-        // APIC and IOAPIC support are separate milestones.
-        command.args(["-cpu","qemu64,-apic"]);
-    }
+
     let mut tmp:Option<TempVars>=None;
     if let Some(template)=matching_vars(&ovmf){
         let nanos=SystemTime::now().duration_since(UNIX_EPOCH)
