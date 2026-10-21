@@ -392,6 +392,50 @@ jobs:
           path: build-rust-boot-staging.log
           if-no-files-found: ignore
           retention-days: 7
+      - name: Rust Limine boot and framebuffer QEMU parity (candidate)
+        id: rust_boot_qemu
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          OVMF_PATH=""
+          for candidate in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/edk2/ovmf/OVMF_CODE_4M.fd /usr/share/edk2/ovmf/OVMF_CODE.fd; do
+            if test -f "$candidate"; then OVMF_PATH="$candidate"; break; fi
+          done
+          test -n "$OVMF_PATH"
+          make test-rust-boot-qemu OVMF_CODE="$OVMF_PATH" 2>&1 | tee build-rust-boot-qemu.log
+      - name: Publish Rust boot/QEMU parity status
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BOOT_OUTCOME: ${{ steps.rust_boot_qemu.outcome }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from urllib.request import Request, urlopen
+          outcome = os.getenv("BOOT_OUTCOME", "skipped")
+          repo = os.environ["GITHUB_REPOSITORY"]
+          payload = json.dumps({
+              "state": "success" if outcome == "success" else "failure",
+              "context": "indianos/rust-boot-qemu",
+              "description": f"Rust boot/FB with normal, processes and fault QEMU: {outcome}",
+              "target_url": f"{os.environ['GITHUB_SERVER_URL']}/{repo}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
+          }).encode()
+          request = Request(f"https://api.github.com/repos/{repo}/statuses/{os.environ['GITHUB_SHA']}",
+                            data=payload, method="POST",
+                            headers={"Authorization": "Bearer " + os.environ["GH_TOKEN"],
+                                     "Accept": "application/vnd.github+json",
+                                     "Content-Type": "application/json"})
+          with urlopen(request, timeout=20) as response:
+              print("Rust boot/QEMU result:", outcome, response.status)
+          PY
+      - name: Preserve Rust boot diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: indianos-rust-boot-qemu
+          path: build-rust-boot-qemu.log
+          if-no-files-found: ignore
+          retention-days: 7
       - name: Host tests (PMM, VMM, ELF64 image and serial transcript parser)
         run: make test-host
       - name: Sanitize M005 executable planning and syscall ABI
