@@ -36,6 +36,27 @@ static volatile struct limine_module_request module_request = {
 __attribute__((used, section(".limine_requests_end")))
 static volatile uint64_t requests_end[] = LIMINE_REQUESTS_END_MARKER;
 
+/* The Limine requests must stay in .limine_requests and remain live.
+ * These narrow accessors keep bootloader-owned response pointers behind
+ * the original C protocol header. All validation and drawing can now be
+ * implemented by no_std Rust (BOOT_RUST=1). */
+bool boot_limine_revision_supported(void) {
+    return LIMINE_BASE_REVISION_SUPPORTED(base_revision);
+}
+const struct limine_memmap_response *boot_limine_memmap(void) {
+    return memory_map_request.response;
+}
+const struct limine_hhdm_response *boot_limine_hhdm(void) {
+    return hhdm_request.response;
+}
+const struct limine_module_response *boot_limine_modules(void) {
+    return module_request.response;
+}
+const struct limine_framebuffer_response *boot_limine_framebuffers(void) {
+    return framebuffer_request.response;
+}
+
+#ifndef INDIANOS_RUST_BOOT
 /* Milestone 001 only validates metadata; it does not allocate or reclaim RAM. */
 bool boot_validate(void) {
     if (!LIMINE_BASE_REVISION_SUPPORTED(base_revision)) {
@@ -190,3 +211,5 @@ void boot_draw_status(void) {
     }
     serial_write("IndianOS: framebuffer status rendered\n");
 }
+
+#endif /* !INDIANOS_RUST_BOOT -- boot logic owned by Rust */
