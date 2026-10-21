@@ -33,6 +33,8 @@ mod interrupts;
 mod timer;
 #[cfg(feature = "kernel-main")]
 mod kernel_main;
+#[cfg(feature = "limine-requests")]
+mod limine_requests;
 
 pub const MAX_PROCESSES: usize = 4;
 pub const MAX_DISPATCHES: u32 = if cfg!(feature = "preempt") { 2048 } else { 32 };
