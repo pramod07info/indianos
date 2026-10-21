@@ -120,3 +120,13 @@ See [M006 implementation](MILESTONE_006_USERMODE.md).
 - **Next:** add a bounded process state machine and process IDs, validate sequential launch/release of two independently mapped user images, then add timer-driven scheduling and a trap-safe kernel stack policy.
 
 This still does not provide process scheduling, SMP, third-party application compatibility, recoverable kernel faults or a production-grade sandbox.
+
+## M008 — Sequential PCB lifecycle and two native ELF programs (2026-10-21)
+
+- Added a bounded freestanding Process Control Block table, unique PIDs, monotonic lifecycle transitions `NEW → READY → RUNNING → EXITED/FAULTED` and explicit resource-reclamation bookkeeping.
+- Added two distinct freestanding ELF64 executables into the deterministic M008 initramfs. PID 1 runs `/bin/init`, prints a greeting, exits and reclaims all frames; PID 2 starts only afterward, runs `/bin/worker`, prints a second distinct message, exits and frees its own page tables and frames.
+- **Verified in QEMU/OVMF:** [run 39532527694](https://github.com/pramod07info/indianos/actions/runs/39532527694) passes exact per-PID serial ordering, two user entries, two restored PMM counts, two successful reaps and the earlier ring-3 and user-fault tests. See [M008 implementation](MILESTONE_008_PROCESSES.md).
+- CI now has a mandatory M008 process regression gate in addition to prior kernel and user-fault checks.
+- **Not implemented:** concurrent processes, preemptive timer, scheduler queue, independent simultaneous process CR3 roots, IPC, parent-child process APIs or physical-hardware security.
+
+Next bounded work: interrupt-safe trap frames and per-process kernel stacks followed by a timer/round-robin scheduler with deterministic QEMU fairness and per-process fault containment tests.
