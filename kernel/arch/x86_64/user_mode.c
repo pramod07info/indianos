@@ -8,6 +8,7 @@
 #include <indianos/syscall_abi.h>
 #include <indianos/user_fault.h>
 #include <indianos/process.h>
+#include <indianos/scheduler.h>
 #include <indianos/serial.h>
 #include <stdint.h>
 #include <stddef.h>
@@ -18,6 +19,7 @@
 extern void x86_64_user_interrupt(void);
 extern uint64_t x86_64_enter_user(uint64_t entry, uint64_t user_sp,
                                    uint64_t process_cr3);
+extern uint64_t x86_64_resume_user(const uint64_t *frame, uint64_t process_cr3);
 extern __attribute__((noreturn)) void x86_64_user_exit_to_kernel(uint64_t status);
 
 struct direct_memory { uint64_t offset; };
@@ -41,6 +43,23 @@ static void log_pid(uint32_t pid, const char *event) {
     serial_write("\n");
 }
 static struct indianos_user_image *current_user;
+
+/* One active user process at a time. Independent roots, ring-0 stacks and
+ * saved IRET contexts survive cooperative yields. No timer IRQ/SMP here. */
+#define M009_CONTEXT_WORDS 20u
+#define M009_YIELD_STATUS 0x200ull
+#define M009_TASK_COUNT 2u
+struct m009_task {
+    struct indianos_user_image image;
+    struct paging_clone_result root;
+    struct indianos_process *pcb;
+    uint64_t frame[M009_CONTEXT_WORDS] __attribute__((aligned(16)));
+    bool saved;
+    bool attached;
+};
+static struct m009_task m009_tasks[M009_TASK_COUNT];
+static struct m009_task *m009_active;
+
 static uint64_t last_user_fault_vector;
 static uint64_t last_user_fault_error;
 static uint64_t last_user_fault_address;
@@ -114,6 +133,22 @@ uint64_t x86_64_user_syscall_dispatch(const uint64_t *regs) {
     };
     if (!indianos_syscall_validate(&current_user->plan, request))
         return UINT64_MAX;
+    if (request.number == INDIANOS_SYS_YIELD) {
+        if (m009_active == NULL || m009_active->pcb == NULL ||
+            m009_active->pcb->state != INDIANOS_PROCESS_RUNNING ||
+            regs[16] != 0x2bull || regs[19] != 0x33ull ||
+            (regs[17] & (0x200ull | 0x3000ull)) != 0) {
+            return UINT64_MAX;
+        }
+        /* Frame order is identical to the 15 GPR pushes and hardware
+         * RIP:CS:RFLAGS:RSP:SS on the software interrupt stack. */
+        for (unsigned i = 0; i < M009_CONTEXT_WORDS; ++i) {
+            m009_active->frame[i] = regs[i];
+        }
+        m009_active->frame[14] = 0; /* return SYS_YIELD=success to user */
+        m009_active->saved = true;
+        x86_64_user_exit_to_kernel(M009_YIELD_STATUS);
+    }
     if (request.number == INDIANOS_SYS_ABI_QUERY)
         return INDIANOS_SYSCALL_ABI;
     if (request.number == INDIANOS_SYS_EXIT)
