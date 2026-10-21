@@ -7,7 +7,11 @@
 
 /* M009 single-CPU, bounded round-robin policy. No hardware IRQ assumption.
  * Run queue consists of READY PCB slots, not heap pointers. */
-#define INDIANOS_SCHEDULER_MAX_DISPATCHES 32u
+#ifdef INDIANOS_TEST_PREEMPT
+#define INDIANOS_SCHEDULER_MAX_DISPATCHES 2048u /* 100 Hz, bounded <=20 s */
+#else
+#define INDIANOS_SCHEDULER_MAX_DISPATCHES 32u  /* deterministic yields */
+#endif
 struct indianos_scheduler {
     struct indianos_process_table *table;
     uint32_t cursor;
