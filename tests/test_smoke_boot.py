@@ -1,12 +1,13 @@
 """Host-side unit tests for strictly ordered serial milestone recognition."""
 import sys
+import tempfile
 from pathlib import Path
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 from smoke_boot import (assert_milestones, assert_expected_exception,
                         assert_expected_pagefault, assert_expected_shadow,
-                        assert_expected_usermode, MILESTONES)  # noqa: E402
+                        assert_expected_usermode, matching_ovmf_vars, MILESTONES)  # noqa: E402
 
 
 class SmokeBootTests(unittest.TestCase):
@@ -54,6 +55,20 @@ class SmokeBootTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             assert_milestones("\n".join([*MILESTONES[:-1],
                 "IndianOS: FATAL detached user-image staging failed"]))
+
+    def test_ovmf_vars_template_must_match_code_and_not_be_modified(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            code = root / "OVMF_CODE_4M.fd"
+            vars_template = root / "OVMF_VARS_4M.fd"
+            code.write_bytes(b"firmware-code")
+            self.assertIsNone(matching_ovmf_vars(code))
+            vars_template.write_bytes(b"unmodified-template")
+            self.assertEqual(matching_ovmf_vars(code), vars_template)
+            self.assertEqual(vars_template.read_bytes(), b"unmodified-template")
+            other = root / "not-ovmf.bin"
+            other.write_bytes(b"stub")
+            self.assertIsNone(matching_ovmf_vars(other))
 
     def test_usermode_transcript_must_show_syscall_and_exit(self):
         output = "\n".join([*MILESTONES,
