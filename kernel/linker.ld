@@ -20,11 +20,18 @@ SECTIONS {
 
   . = ALIGN(CONSTANT(MAXPAGESIZE));
   .rodata : { *(.rodata .rodata.*) } :rodata
+  /* The no_std Rust staticlib can emit statically resolved GOTPCREL
+   * references (e.g., compiler-generated memcpy). The old linker discarded
+   * .got, leaving a call target at physical address 0 and causing #PF.
+   * Map the link-time resolved GOT in supervisor read-only memory. NO
+   * dynamic relocation or runtime ELF loader is permitted. */
+  . = ALIGN(8);
+  .got : { *(.got .got.*) } :rodata
   .note.gnu.build-id : { *(.note.gnu.build-id) } :rodata
 
   . = ALIGN(CONSTANT(MAXPAGESIZE));
   .data : { *(.data .data.*) } :data
   .bss : { *(.bss .bss.*) *(COMMON) } :data
 
-  /DISCARD/ : { *(.eh_frame*) *(.note .note.*) *(.got .got.*) }
+  /DISCARD/ : { *(.eh_frame*) *(.note .note.*) }
 }
