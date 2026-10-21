@@ -7,6 +7,7 @@
 #include <indianos/user_image.h>
 #include <indianos/syscall_abi.h>
 #include <indianos/user_fault.h>
+#include <indianos/process.h>
 #include <indianos/serial.h>
 #include <stdint.h>
 #include <stddef.h>
@@ -20,6 +21,25 @@ extern uint64_t x86_64_enter_user(uint64_t entry, uint64_t user_sp,
 extern __attribute__((noreturn)) void x86_64_user_exit_to_kernel(uint64_t status);
 
 struct direct_memory { uint64_t offset; };
+
+/* Serial logs are intentionally small and allocation-free at early boot. */
+static void log_pid(uint32_t pid, const char *event) {
+    char number[12];
+    unsigned i = 0;
+    do {
+        number[i++] = (char)('0' + pid % 10u);
+        pid /= 10u;
+    } while (pid != 0 && i < sizeof(number) - 1);
+    char decimal[12];
+    unsigned j = 0;
+    while (i != 0) decimal[j++] = number[--i];
+    decimal[j] = '\0';
+    serial_write("IndianOS: PID ");
+    serial_write(decimal);
+    serial_write(" ");
+    serial_write(event);
+    serial_write("\n");
+}
 static struct indianos_user_image *current_user;
 static uint64_t last_user_fault_vector;
 static uint64_t last_user_fault_error;
@@ -128,7 +148,12 @@ static bool valid_kernel_access(const struct paging_clone_backend *b,
            a == bpa && (af & 1ull) && (bf & 1ull);
 }
 
-bool x86_64_user_demo_run(const uint8_t *elf, size_t size) {
+bool x86_64_user_process_run(struct indianos_process *process,
+                             const uint8_t *elf, size_t size) {
+    if (process == NULL || process->pid == 0 ||
+        process->state != INDIANOS_PROCESS_NEW || current_user != NULL) {
+        return false;
+    }
     struct paging_cpu_state cpu = {0};
     uint64_t offset = 0;
     if (!x86_64_paging_detect(&cpu)) {
@@ -173,6 +198,11 @@ bool x86_64_user_demo_run(const uint8_t *elf, size_t size) {
         return false;
     }
     serial_write("IndianOS: ring-3 user image staged\n");
+    if (!indianos_process_ready(process)) {
+        (void)indianos_user_image_destroy(&staged);
+        return false;
+    }
+    log_pid(process->pid, "READY");
 
     const bool cloned = paging_clone_kernel_half(&clone_backend, original, &clone);
     if (!cloned) {
@@ -221,7 +251,12 @@ bool x86_64_user_demo_run(const uint8_t *elf, size_t size) {
         if (!safe) {
             serial_write("IndianOS: ring-3 mapping preflight rejected unsafe address space\n");
         }
+        if (safe && !indianos_process_start(process, clone.root)) {
+            serial_write("IndianOS: ring-3 failed: PCB state transition\n");
+            safe = false;
+        }
         if (safe) {
+            log_pid(process->pid, "RUNNING");
             last_user_fault_vector = 0;
             last_user_fault_error = 0;
             last_user_fault_address = 0;
@@ -232,6 +267,15 @@ bool x86_64_user_demo_run(const uint8_t *elf, size_t size) {
             const uint64_t status = x86_64_enter_user(
                 staged.plan.entry, staged.plan.stack_end - 16, clone.root);
             current_user = NULL;
+            const bool completed = last_user_fault_vector == 0
+                ? indianos_process_exit(process, status)
+                : indianos_process_fault(process, status, last_user_fault_vector,
+                                        last_user_fault_error, last_user_fault_address);
+            if (!completed) {
+                serial_write("IndianOS: FATAL PCB terminal state rejected\n");
+                return false;
+            }
+            log_pid(process->pid, last_user_fault_vector ? "FAULTED" : "EXITED");
 #if defined(INDIANOS_TEST_USERFAULT_GUARD)
             const uint64_t expected_address =
                 INDIANOS_USER_TOP - INDIANOS_USER_STACK_BYTES - INDIANOS_USER_PAGE_BYTES;
@@ -282,5 +326,18 @@ bool x86_64_user_demo_run(const uint8_t *elf, size_t size) {
         return false;
     }
     serial_write("IndianOS: ring-3 PMM frame count restored\n");
+    if (!indianos_process_reap(process)) {
+        serial_write("IndianOS: ring-3 failed: PCB reap transition\n");
+        return false;
+    }
+    log_pid(process->pid, "REAPED");
     return success;
+}
+
+/* Historical QEMU smoke-test API remains a one-task process table. */
+bool x86_64_user_demo_run(const uint8_t *elf, size_t size) {
+    struct indianos_process_table table = {0};
+    if (!indianos_process_table_init(&table)) return false;
+    struct indianos_process *task = indianos_process_create(&table);
+    return task != NULL && x86_64_user_process_run(task, elf, size);
 }
