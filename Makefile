@@ -21,7 +21,7 @@ LIMINE_SHA256 := 9f42fe9ea2e84d71056529969b1d5c24ba9a2287ffcc01bcce58b0ef8aa98b1
 
 SOURCES := kernel/src/main.c kernel/src/serial.c kernel/src/boot.c kernel/src/pmm.c kernel/src/vmm.c kernel/src/vmm_boot.c kernel/src/paging_clone.c kernel/src/paging_policy.c kernel/src/program.c kernel/src/syscall_abi.c kernel/src/memory_runtime.c kernel/src/initramfs.c kernel/src/user_image.c kernel/src/user_image_boot.c kernel/src/user_copy.c kernel/src/user_fault_policy.c kernel/src/process.c kernel/src/scheduler.c
 OBJECTS := $(patsubst kernel/src/%.c,$(BUILD)/obj/%.o,$(SOURCES))
-OBJECTS += $(BUILD)/obj/interrupts.o $(BUILD)/obj/interrupt_entry.o $(BUILD)/obj/paging.o $(BUILD)/obj/user_mode.o $(BUILD)/obj/user_entry.o
+OBJECTS += $(BUILD)/obj/interrupts.o $(BUILD)/obj/interrupt_entry.o $(BUILD)/obj/paging.o $(BUILD)/obj/user_mode.o $(BUILD)/obj/user_entry.o $(BUILD)/obj/timer.o
 HEADERS := $(wildcard kernel/include/indianos/*.h) third_party/limine/limine.h
 
 CFLAGS := -target x86_64-unknown-none-elf -std=c11 -O2 -g -Wall -Wextra -Werror \
@@ -45,6 +45,9 @@ endif
 ifeq ($(SCHEDULER_SELFTEST),1)
 CFLAGS += -DINDIANOS_TEST_SCHEDULER
 endif
+ifeq ($(PREEMPT_SELFTEST),1)
+CFLAGS += -DINDIANOS_TEST_PREEMPT
+endif
 ifeq ($(PROCESS_SELFTEST),1)
 CFLAGS += -DINDIANOS_TEST_PROCESSES
 endif
@@ -62,7 +65,7 @@ LDFLAGS := -target x86_64-unknown-none-elf -fuse-ld=lld -nostdlib -static \
            -Wl,-z,max-page-size=0x1000 -Wl,-z,noexecstack \
            -Wl,--gc-sections -Wl,--build-id=none -Wl,-T,kernel/linker.ld
 
-.PHONY: all kernel user-elf test-user-elf test-ring3-elf initramfs test-initramfs image run run-bios test-boot test-exception test-pagefault test-shadow test-usermode test-userfault-supervisor test-userfault-guard test-processes test-scheduler test-host toolchain-check clean
+.PHONY: all kernel user-elf test-user-elf test-ring3-elf initramfs test-initramfs image run run-bios test-boot test-exception test-pagefault test-shadow test-usermode test-userfault-supervisor test-userfault-guard test-processes test-scheduler test-preempt test-host toolchain-check clean
 all: image
 kernel: $(KERNEL_ELF)
 
@@ -74,13 +77,18 @@ $(BUILD)/obj/paging.o: kernel/arch/x86_64/paging.c $(HEADERS) Makefile
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -c $< -o $@
 
+$(BUILD)/obj/timer.o: kernel/arch/x86_64/timer.c $(HEADERS) Makefile
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) -c $< -o $@
+
 $(BUILD)/obj/user_mode.o: kernel/arch/x86_64/user_mode.c $(HEADERS) Makefile
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD)/obj/user_entry.o: kernel/arch/x86_64/user_entry.S Makefile
 	@mkdir -p $(@D)
-	$(CC) -target x86_64-unknown-none-elf -mno-red-zone -c $< -o $@
+	$(CC) -target x86_64-unknown-none-elf -mno-red-zone \
+	    $(if $(filter 1,$(PREEMPT_SELFTEST)),-DINDIANOS_TEST_PREEMPT,) -c $< -o $@
 
 $(BUILD)/obj/interrupts.o: kernel/arch/x86_64/interrupts.c $(HEADERS) Makefile
 	@mkdir -p $(@D)
@@ -114,6 +122,10 @@ $(USER_OBJ): userland/demo/fault_entry.S Makefile
 	$(CC) -target x86_64-unknown-none-elf -mno-red-zone \
 	    $(if $(filter guard,$(USERFAULT_KIND)),-DINDIANOS_TEST_FAULT_GUARD,) \
 	    -c $< -o $@
+else ifeq ($(PREEMPT_SELFTEST),1)
+$(USER_OBJ): userland/demo/preempt_a.S Makefile
+	@mkdir -p $(@D)
+	$(CC) -target x86_64-unknown-none-elf -mno-red-zone -c $< -o $@
 else ifeq ($(SCHEDULER_SELFTEST),1)
 $(USER_OBJ): userland/demo/scheduler_a.S Makefile
 	@mkdir -p $(@D)
@@ -140,7 +152,11 @@ $(USER_ELF): $(USER_OBJ) userland/demo/linker.ld Makefile
 	    -Wl,-T,userland/demo/linker.ld $(USER_OBJ) -o $@
 	@readelf -h $@ | grep -q 'Type:.*EXEC'
 
-ifeq ($(SCHEDULER_SELFTEST),1)
+ifeq ($(PREEMPT_SELFTEST),1)
+$(WORKER_OBJ): userland/demo/preempt_b.S Makefile
+	@mkdir -p $(@D)
+	$(CC) -target x86_64-unknown-none-elf -mno-red-zone -c $< -o $@
+else ifeq ($(SCHEDULER_SELFTEST),1)
 $(WORKER_OBJ): userland/demo/scheduler_b.S Makefile
 	@mkdir -p $(@D)
 	$(CC) -target x86_64-unknown-none-elf -mno-red-zone -c $< -o $@
@@ -267,6 +283,11 @@ test-scheduler:
 	$(MAKE) test-initramfs BUILD=build/scheduler SCHEDULER_SELFTEST=1
 	$(MAKE) image BUILD=build/scheduler SCHEDULER_SELFTEST=1
 	python3 tools/smoke_boot.py --iso build/scheduler/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)" --mode scheduler
+
+test-preempt:
+	$(MAKE) test-initramfs BUILD=build/preempt SCHEDULER_SELFTEST=1 PREEMPT_SELFTEST=1
+	$(MAKE) image BUILD=build/preempt SCHEDULER_SELFTEST=1 PREEMPT_SELFTEST=1
+	python3 tools/smoke_boot.py --iso build/preempt/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)" --mode preempt --timeout 35
 
 test-host:
 	@mkdir -p $(BUILD)
