@@ -63,7 +63,7 @@ static bool discard_tree(const struct paging_clone_backend *b,
 
 static bool clone_level(const struct paging_clone_backend *b, uint64_t source,
                         unsigned int level, uint32_t *allocated,
-                        uint64_t *destination) {
+                        uint64_t *destination, bool kernel_only) {
     if (!valid_table_physical(source) || level < 1 || level > 4 ||
         *allocated >= PAGING_CLONE_MAX_TABLES) {
         return false;
@@ -90,6 +90,7 @@ static bool clone_level(const struct paging_clone_backend *b, uint64_t source,
     }
     ++(*allocated);
     for (unsigned int i = 0; i < ENTRY_COUNT; ++i) {
+        if (kernel_only && level == 4 && i < 256u) continue;
         const uint64_t entry = src[i];
         if (level == 4 && (entry & PAGE_PRESENT) != 0 &&
             (entry & PAGE_HUGE) != 0) {
@@ -99,13 +100,15 @@ static bool clone_level(const struct paging_clone_backend *b, uint64_t source,
         if (is_child(entry, level)) {
             uint64_t new_child = 0;
             if (!clone_level(b, entry & PHYS_MASK, level - 1,
-                             allocated, &new_child)) {
+                             allocated, &new_child, kernel_only)) {
                 (void)discard_tree(b, physical, level);
                 return false;
             }
             dst[i] = (entry & ~PHYS_MASK) | new_child;
+            if (kernel_only && level == 4) dst[i] &= ~0x4ull;
         } else {
             dst[i] = entry; /* Preserve original huge / leaf / nonpresent bits. */
+            if (kernel_only && level == 4) dst[i] &= ~0x4ull;
         }
     }
     *destination = physical;
@@ -120,12 +123,64 @@ bool paging_clone_root(const struct paging_clone_backend *backend,
     }
     uint64_t clone = 0;
     uint32_t allocated = 0;
-    if (!clone_level(backend, source_root, 4, &allocated, &clone)) {
+    if (!clone_level(backend, source_root, 4, &allocated, &clone, false)) {
         return false;
     }
     result->root = clone;
     result->table_count = allocated;
     return true;
+}
+
+
+bool paging_clone_kernel_half(const struct paging_clone_backend *backend,
+                              uint64_t source_root, struct paging_clone_result *result) {
+    if (!valid_backend(backend) || result == NULL ||
+        !valid_table_physical(source_root) || result->root != 0) {
+        return false;
+    }
+    uint64_t clone = 0;
+    uint32_t allocated = 0;
+    if (!clone_level(backend, source_root, 4, &allocated, &clone, true)) {
+        return false;
+    }
+    result->root = clone;
+    result->table_count = allocated;
+    return true;
+}
+
+static bool user_pml4_graft(const struct paging_clone_backend *backend,
+                            uint64_t kernel_root, uint64_t user_root,
+                            bool attach) {
+    if (!valid_backend(backend) || !valid_table_physical(kernel_root) ||
+        !valid_table_physical(user_root) || kernel_root == user_root) return false;
+    uint64_t *kernel = backend->access(kernel_root, backend->context);
+    const uint64_t *user = backend->access(user_root, backend->context);
+    if (kernel == NULL || user == NULL) return false;
+    for (unsigned i = 0; i < 256; ++i) {
+        const uint64_t entry = user[i];
+        if (attach) {
+            if (kernel[i] != 0 || (entry != 0 &&
+                ((entry & (PAGE_PRESENT | 0x4ull)) != (PAGE_PRESENT | 0x4ull) ||
+                 (entry & PAGE_HUGE) != 0))) return false;
+        } else if (kernel[i] != entry) {
+            return false;
+        }
+    }
+    /* Validate ALL entries before mutating, so failures are atomic. */
+    for (unsigned i = 0; i < 256; ++i) {
+        kernel[i] = attach ? user[i] : 0;
+    }
+    return true;
+}
+
+bool paging_attach_user_half(const struct paging_clone_backend *backend,
+                             uint64_t kernel_root, uint64_t user_root) {
+    return user_pml4_graft(backend, kernel_root, user_root, true);
+}
+
+bool paging_detach_user_half(const struct paging_clone_backend *backend,
+                             uint64_t kernel_root, uint64_t user_root) {
+    return user_pml4_graft(backend, kernel_root, user_root, false);
 }
 
 bool paging_clone_release(const struct paging_clone_backend *backend,
