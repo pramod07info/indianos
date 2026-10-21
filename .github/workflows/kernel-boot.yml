@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - "kernel/**"
+      - "rust/**"
       - "boot/**"
       - "third_party/limine/**"
       - "Makefile"
@@ -64,8 +65,24 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y clang lld binutils xorriso qemu-system-x86 ovmf curl
+      - name: Install Rust toolchain for no_std kernel build
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
       - name: Check cross compiler
         run: make toolchain-check
+      - name: Rust unit tests and original C ABI regression (migration R001)
+        id: rust_host
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          make test-rust-host-abi 2>&1 | tee build-rust-host.log
+      - name: Compile Rust-backed kernel ELF (migration R001)
+        id: rust_kernel
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          make kernel BUILD=build/rust-compile RUST_CORE=1 2>&1 | tee build-rust-kernel.log
       - name: Host tests (PMM, VMM, ELF64 image and serial transcript parser)
         run: make test-host
       - name: Sanitize M005 executable planning and syscall ABI
@@ -195,6 +212,61 @@ jobs:
         with:
           name: indianos-m008-processes-qemu-log
           path: build/processes-smoke.log
+          if-no-files-found: ignore
+          retention-days: 7
+      - name: Rust-backed PCB/scheduler kernel QEMU parity tests
+        id: rust_qemu
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          OVMF_PATH=""
+          for candidate in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/edk2/ovmf/OVMF_CODE_4M.fd /usr/share/edk2/ovmf/OVMF_CODE.fd; do
+            if test -f "$candidate"; then OVMF_PATH="$candidate"; break; fi
+          done
+          test -n "$OVMF_PATH"
+          make test-rust-processes OVMF_CODE="$OVMF_PATH" 2>&1 | tee build/rust-processes-smoke.log
+          make test-rust-scheduler OVMF_CODE="$OVMF_PATH" 2>&1 | tee build/rust-scheduler-smoke.log
+      - name: Publish exact Rust migration CI status
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUST_HOST: ${{ steps.rust_host.outcome }}
+          RUST_KERNEL: ${{ steps.rust_kernel.outcome }}
+          RUST_QEMU: ${{ steps.rust_qemu.outcome }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from urllib.request import Request, urlopen
+          host = os.environ.get("RUST_HOST", "skipped")
+          kernel = os.environ.get("RUST_KERNEL", "skipped")
+          qemu = os.environ.get("RUST_QEMU", "skipped")
+          state = "success" if host == kernel == qemu == "success" else "failure"
+          repo = os.environ["GITHUB_REPOSITORY"]
+          message = f"no_std Rust core: host={host}, kernel={kernel}, QEMU={qemu}"
+          payload = json.dumps({
+              "state": state, "context": "indianos/rust-core-qemu",
+              "description": message[:140],
+              "target_url": (f"{os.environ['GITHUB_SERVER_URL']}/{repo}/actions/runs/"
+                             f"{os.environ['GITHUB_RUN_ID']}")
+          }).encode()
+          req = Request(f"https://api.github.com/repos/{repo}/statuses/{os.environ['GITHUB_SHA']}",
+                        data=payload, method="POST",
+                        headers={"Authorization": "Bearer " + os.environ["GH_TOKEN"],
+                                 "Accept": "application/vnd.github+json",
+                                 "Content-Type": "application/json"})
+          with urlopen(req, timeout=20) as response:
+              print(message, state, response.status)
+          PY
+      - name: Preserve Rust compilation and QEMU transcripts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: indianos-rust-core-migration-logs
+          path: |
+            build-rust-host.log
+            build-rust-kernel.log
+            build/rust-processes-smoke.log
+            build/rust-scheduler-smoke.log
           if-no-files-found: ignore
           retention-days: 7
       - name: M009 cooperative round-robin QEMU test (experimental)
