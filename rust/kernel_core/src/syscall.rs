@@ -89,6 +89,8 @@ pub unsafe extern "C" fn indianos_syscall_validate(
         4 => request.arg0 == 0 && request.arg1 == 0, // GETPID
         #[cfg(feature = "test-shell")]
         5 => request.arg0 == 1 && request.arg1 == 0, // request /bin/worker
+        #[cfg(feature="test-interactive")]
+        6 => request.arg1 == 1 && user_range(plan,request.arg0,1,true),
         _ => false,
     }
 }
@@ -190,6 +192,26 @@ mod tests {
         assert!(valid(5,1,0));
         assert!(!valid(5,2,0));
         assert!(!valid(5,1,1));
+    }
+    #[cfg(feature="test-interactive")]
+    #[test]
+    fn read_syscall_rejects_nonwritable_ranges(){
+        let mut plan=ProgramPlan{
+            entry:USER_MIN,stack_begin:USER_TOP-STACK_BYTES,
+            stack_end:USER_TOP,guard_begin:USER_TOP-STACK_BYTES-PAGE_BYTES,
+            segment_count:1,segments:[ProgramSegment::empty();MAX_SEGMENTS]
+        };
+        plan.segments[0]=ProgramSegment{
+            page_begin:USER_MIN,page_end:USER_MIN+PAGE_BYTES,
+            writable:false,executable:true,..ProgramSegment::empty()
+        };
+        let check=|addr,len|unsafe{indianos_syscall_validate(&plan,
+            SyscallRequest{number:6,arg0:addr,arg1:len})};
+        assert!(check(plan.stack_end-1,1));
+        assert!(!check(plan.stack_end,1));
+        assert!(!check(plan.guard_begin,1));
+        assert!(!check(USER_MIN,1));
+        assert!(!check(plan.stack_end-1,2));
     }
     #[test]
     fn trap_frame_blocks_supervisor_selectors_and_guard_stack() {

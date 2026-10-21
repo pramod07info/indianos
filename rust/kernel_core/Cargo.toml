@@ -39,6 +39,7 @@ test-scheduler = []
 test-fault-guard = []
 test-fault-supervisor = []
 test-shell = []
+test-interactive = ["test-shell", "user-runtime"]
 
 [profile.release]
 panic = "abort"

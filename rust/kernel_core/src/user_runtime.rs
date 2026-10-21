@@ -19,6 +19,10 @@ use crate::user_image::{UserImage,indianos_user_image_load,
 use crate::syscall::{SyscallRequest,indianos_syscall_validate,ring3_frame_valid,USER_TOP,STACK_BYTES,PAGE_BYTES};
 use crate::program::indianos_program_user_range;
 use crate::boot::Region;
+#[cfg(feature="test-interactive")]
+use crate::user_image::{indianos_user_can_write,indianos_user_copy_writable};
+#[cfg(feature="test-interactive")]
+use crate::input;
 const PHYS:u64=0x000f_ffff_ffff_f000;
 const PAGE:u64=4096;
 const YIELD:u64=0x200;
@@ -140,6 +144,17 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
  if !unsafe{indianos_syscall_validate(ptr::addr_of!((*img).plan),request)}{return BAD;}
  match request.number{
   0=>1,
+  #[cfg(feature="test-interactive")]
+  6=>{
+   if unsafe{ACTIVE_PID}!=1 ||
+       !unsafe{indianos_user_can_write(&*img,request.arg0,1)}{return BAD;}
+   let Some(byte)=input::poll_byte()else{return 0;};
+   if !unsafe{indianos_user_copy_writable(&*img,request.arg0,&byte,1)}{
+       return BAD;
+   }
+   input::echo(byte);
+   1
+  },
   #[cfg(feature="test-shell")]
   4=>unsafe{ACTIVE_PID as u64},
   #[cfg(feature="test-shell")]

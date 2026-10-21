@@ -25,6 +25,8 @@ mod paging;
 mod paging_cpu;
 #[cfg(feature = "user-runtime")]
 mod user_runtime;
+#[cfg(feature = "test-interactive")]
+mod input;
 #[cfg(feature = "runtime")]
 mod runtime;
 #[cfg(feature = "boot-staging")]
