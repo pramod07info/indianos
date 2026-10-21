@@ -129,19 +129,34 @@ __attribute__((noreturn)) void kmain(void) {
     /* Two separate ELF images: both undergo fresh frame allocations and
      * independent CR3 clones; the second starts only AFTER the first is
      * completely reaped. No scheduler, preemption or parallel execution. */
+#ifdef INDIANOS_RUST_CORE
+    serial_write("IndianOS Rust: M008 starting worker lookup\n");
+#endif
     const uint8_t *worker_elf = 0;
     size_t worker_elf_size = 0;
     if (!boot_initramfs_file("/bin/worker", &worker_elf, &worker_elf_size)) {
         serial_write("IndianOS: FATAL second user executable missing\n");
         halt_forever();
     }
+#ifdef INDIANOS_RUST_CORE
+    serial_write("IndianOS Rust: M008 worker lookup succeeded; initializing PCB table\n");
+#endif
     struct indianos_process_table processes = {0};
     if (!indianos_process_table_init(&processes)) {
         serial_write("IndianOS: FATAL process table initialization failed\n");
         halt_forever();
     }
+#ifdef INDIANOS_RUST_CORE
+    serial_write("IndianOS Rust: M008 PCB table initialized; creating PIDs\n");
+#endif
     struct indianos_process *first = indianos_process_create(&processes);
+#ifdef INDIANOS_RUST_CORE
+    serial_write("IndianOS Rust: M008 first PID returned\n");
+#endif
     struct indianos_process *second = indianos_process_create(&processes);
+#ifdef INDIANOS_RUST_CORE
+    serial_write("IndianOS Rust: M008 second PID returned\n");
+#endif
     if (first == 0 || second == 0 || first->pid != 1 || second->pid != 2) {
         serial_write("IndianOS: FATAL process ID assignment failed\n");
         halt_forever();
