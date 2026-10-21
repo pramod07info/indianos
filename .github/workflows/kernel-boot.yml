@@ -191,6 +191,16 @@ jobs:
           done
           test -n "$OVMF_PATH"
           make test-usermode OVMF_CODE="$OVMF_PATH"
+      - name: Enforce first native user program QEMU regression
+        if: always()
+        env:
+          RING3_OUTCOME: ${{ steps.ring3_test.outcome }}
+        run: |
+          if [ "$RING3_OUTCOME" != "success" ]; then
+            echo "::error title=IndianOS ring-3 regression::Expected the QEMU ring-3 test to pass, got: $RING3_OUTCOME"
+            exit 1
+          fi
+          echo "IndianOS: ring-3 QEMU regression gate PASSED"
       - name: Opt-in guarded shadow CR3 switch (QEMU-only)
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_shadow_switch == true }}
         run: |
