@@ -9,6 +9,7 @@ from smoke_boot import (assert_milestones, assert_expected_exception,
                         assert_expected_pagefault, assert_expected_shadow,
                         assert_expected_usermode, assert_expected_userfault,
                         assert_expected_processes, assert_expected_scheduler,
+                        assert_expected_preempt,
                         matching_ovmf_vars, MILESTONES)  # noqa: E402
 
 
@@ -200,6 +201,42 @@ class SmokeBootTests(unittest.TestCase):
             "IndianOS: PID 2 DISPATCHED"]
         with self.assertRaises(AssertionError):
             assert_expected_scheduler("\n".join(names))
+
+    def test_hardware_timer_preempts_two_cpu_bound_users(self):
+        output = "\n".join([*MILESTONES,
+            "IndianOS: M009 cooperative scheduler experiment begin",
+            "IndianOS: PID 1 READY", "IndianOS: PID 2 READY",
+            "IndianOS: M009 two simultaneous user address spaces ready",
+            "IndianOS: M009 hardware PIT IRQ0 enabled at 100 Hz",
+            "IndianOS: PID 1 DISPATCHED",
+            "IndianOS user: M009 timer task A started",
+            "IndianOS: PID 1 TIMER_PREEMPTED", "IndianOS: PID 1 YIELDED",
+            "IndianOS: PID 2 DISPATCHED",
+            "IndianOS user: M009 timer task B started",
+            "IndianOS: PID 2 TIMER_PREEMPTED", "IndianOS: PID 2 YIELDED",
+            "IndianOS: PID 1 DISPATCHED",
+            "IndianOS user: M009 timer task A finished",
+            "IndianOS: PID 1 EXITED", "IndianOS: PID 1 REAPED",
+            "IndianOS: PID 2 DISPATCHED",
+            "IndianOS user: M009 timer task B finished",
+            "IndianOS: PID 2 EXITED", "IndianOS: PID 2 REAPED",
+            "IndianOS: M009 timer-preemptive round-robin PASSED",
+            "IndianOS: M009 scheduler experiment complete"])
+        assert_expected_preempt(output)
+
+    def test_hardware_timer_rejects_no_preemption(self):
+        output = "\n".join([*MILESTONES,
+            "IndianOS: M009 cooperative scheduler experiment begin",
+            "IndianOS: M009 two simultaneous user address spaces ready",
+            "IndianOS: M009 hardware PIT IRQ0 enabled at 100 Hz",
+            "IndianOS user: M009 timer task A started",
+            "IndianOS user: M009 timer task B started",
+            "IndianOS user: M009 timer task A finished",
+            "IndianOS user: M009 timer task B finished",
+            "IndianOS: M009 timer-preemptive round-robin PASSED",
+            "IndianOS: M009 scheduler experiment complete"])
+        with self.assertRaises(AssertionError):
+            assert_expected_preempt(output)
 
     def test_rejects_out_of_order(self):
         with self.assertRaises(AssertionError):
