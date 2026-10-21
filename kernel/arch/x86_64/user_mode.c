@@ -104,9 +104,27 @@ static bool valid_kernel_access(const struct paging_clone_backend *b,
 bool x86_64_user_demo_run(const uint8_t *elf, size_t size) {
     struct paging_cpu_state cpu = {0};
     uint64_t offset = 0;
-    if (!x86_64_paging_detect(&cpu) || !paging_preflight(&cpu) ||
-        cpu.pcid_enabled || !boot_hhdm_offset(&offset) || offset == 0 ||
-        !x86_64_user_interrupt_stack_enable()) return false;
+    if (!x86_64_paging_detect(&cpu)) {
+        serial_write("IndianOS: ring-3 preflight failed: CPU paging probe\n");
+        return false;
+    }
+    if (!paging_preflight(&cpu)) {
+        serial_write("IndianOS: ring-3 preflight failed: NXE/WP/PAE/LA57 or CR3\n");
+        return false;
+    }
+    if (cpu.pcid_enabled) {
+        serial_write("IndianOS: ring-3 preflight failed: unsupported PCID mode\n");
+        return false;
+    }
+    if (!boot_hhdm_offset(&offset) || offset == 0) {
+        serial_write("IndianOS: ring-3 preflight failed: missing HHDM\n");
+        return false;
+    }
+    if (!x86_64_user_interrupt_stack_enable()) {
+        serial_write("IndianOS: ring-3 preflight failed: TSS RSP0\n");
+        return false;
+    }
+    serial_write("IndianOS: ring-3 paging prerequisites verified\n");
 
     struct direct_memory memory = {.offset = offset};
     struct vmm_backend vmm = {
@@ -123,10 +141,19 @@ bool x86_64_user_demo_run(const uint8_t *elf, size_t size) {
     struct paging_clone_result clone = {0};
     bool grafted = false;
     bool success = false;
-    if (!indianos_user_image_load(&staged, &vmm, elf, size)) return false;
+    if (!indianos_user_image_load(&staged, &vmm, elf, size)) {
+        serial_write("IndianOS: ring-3 failed: ELF segment staging\n");
+        return false;
+    }
+    serial_write("IndianOS: ring-3 user image staged\n");
 
-    if (paging_clone_kernel_half(&clone_backend, original, &clone) &&
-        paging_attach_user_half(&clone_backend, clone.root, staged.tables.root_physical)) {
+    const bool cloned = paging_clone_kernel_half(&clone_backend, original, &clone);
+    if (!cloned) {
+        serial_write("IndianOS: ring-3 failed: supervisor mapping clone\n");
+    }
+    if (cloned && paging_attach_user_half(
+            &clone_backend, clone.root, staged.tables.root_physical)) {
+        serial_write("IndianOS: ring-3 user page tables attached\n");
         grafted = true;
         uint64_t stack = 0;
         __asm__ volatile ("mov %%rsp, %0" : "=r"(stack));
