@@ -419,7 +419,7 @@ test-rust-keyboard-host:
 test-rust-keyboard-qemu:
 	$(MAKE) image BUILD=build/r0142-keyboard R014_IRQ_TEST=1 RUST_CORE=1
 	$(MAKE) $(RUST_TOOLS_BIN)
-	$(RUST_TOOLS_BIN) smoke --iso build/r0142-keyboard/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)" --mode keyboard --timeout 65
+	$(RUST_TOOLS_BIN) smoke --iso build/r0142-keyboard/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)" --mode keyboard --machine pc --timeout 65
 
 test-rust-default-qemu:
 	$(MAKE) image BUILD=build/rust-default-normal RUST_CORE=1

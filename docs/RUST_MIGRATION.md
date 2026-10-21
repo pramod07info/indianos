@@ -344,3 +344,7 @@ injects keypresses through the QEMU HMP virtual keyboard, checks shell
 command output, and requires an IRQ1 delivery event plus process reaping.
 This tests a legacy QEMU PS/2 keyboard, **not** modern USB HID or hardware
 keyboard support, and does not make application spawning asynchronous.
+
+The R014.2 legacy IRQ acceptance check uses QEMU `--machine pc`,
+matching the existing PIC/PIT IRQ0 regression. `q35`/I/O APIC keyboard
+routing is not yet claimed as supported.
