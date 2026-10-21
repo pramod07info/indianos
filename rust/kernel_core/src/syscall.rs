@@ -4,27 +4,27 @@
 //! preventing a raw user pointer from being dereferenced in the validator.
 //! Actual copy_from_user and privileged CPU transitions remain separate.
 
-const USER_MIN: u64 = 0x0000_0000_0040_0000;
-const USER_TOP: u64 = 0x0000_7fff_f000_0000;
-const STACK_BYTES: u64 = 64 * 1024;
-const PAGE_BYTES: u64 = 4096;
+pub(crate) const USER_MIN: u64 = 0x0000_0000_0040_0000;
+pub(crate) const USER_TOP: u64 = 0x0000_7fff_f000_0000;
+pub(crate) const STACK_BYTES: u64 = 64 * 1024;
+pub(crate) const PAGE_BYTES: u64 = 4096;
 const MAX_WRITE: u64 = 256;
-const MAX_SEGMENTS: usize = 8;
+pub(crate) const MAX_SEGMENTS: usize = 8;
 
 #[repr(C)]
 #[derive(Copy, Clone)]
-pub struct ProgramSegment {
-    virtual_address: u64,
-    file_offset: u64,
-    file_size: u64,
-    memory_size: u64,
-    page_begin: u64,
-    page_end: u64,
-    writable: bool,
-    executable: bool,
+pub(crate) struct ProgramSegment {
+    pub(crate) virtual_address: u64,
+    pub(crate) file_offset: u64,
+    pub(crate) file_size: u64,
+    pub(crate) memory_size: u64,
+    pub(crate) page_begin: u64,
+    pub(crate) page_end: u64,
+    pub(crate) writable: bool,
+    pub(crate) executable: bool,
 }
 impl ProgramSegment {
-    const fn empty() -> Self {
+    pub(crate) const fn empty() -> Self {
         Self {
             virtual_address: 0, file_offset: 0,
             file_size: 0, memory_size: 0, page_begin: 0, page_end: 0,
@@ -33,13 +33,14 @@ impl ProgramSegment {
     }
 }
 #[repr(C)]
-pub struct ProgramPlan {
-    entry: u64,
-    stack_begin: u64,
-    stack_end: u64,
-    guard_begin: u64,
-    segment_count: u32,
-    segments: [ProgramSegment; MAX_SEGMENTS],
+#[derive(Copy, Clone)]
+pub(crate) struct ProgramPlan {
+    pub(crate) entry: u64,
+    pub(crate) stack_begin: u64,
+    pub(crate) stack_end: u64,
+    pub(crate) guard_begin: u64,
+    pub(crate) segment_count: u32,
+    pub(crate) segments: [ProgramSegment; MAX_SEGMENTS],
 }
 
 #[repr(C)]
@@ -50,7 +51,7 @@ pub struct SyscallRequest {
     arg1: u64,
 }
 
-fn user_range(plan: &ProgramPlan, address: u64, length: u64, write: bool) -> bool {
+pub(crate) fn user_range(plan: &ProgramPlan, address: u64, length: u64, write: bool) -> bool {
     if length == 0 || address < USER_MIN || address >= USER_TOP ||
         length > USER_TOP - address {
         return false;
