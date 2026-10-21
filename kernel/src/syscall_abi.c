@@ -11,6 +11,8 @@ bool indianos_syscall_validate(const struct indianos_program_plan *plan,
                    indianos_program_user_range(plan, request.arg0, request.arg1, false);
         case INDIANOS_SYS_EXIT:
             return request.arg1 == 0;
+        case INDIANOS_SYS_YIELD:
+            return request.arg0 == 0 && request.arg1 == 0;
         default:
             return false;
     }
@@ -30,6 +32,10 @@ bool indianos_syscall_self_test(void) {
                (struct indianos_syscall_request){INDIANOS_SYS_WRITE, plan.guard_begin, 1}) &&
            indianos_syscall_validate(&plan,
                (struct indianos_syscall_request){INDIANOS_SYS_EXIT, 0, 0}) &&
+           indianos_syscall_validate(&plan,
+               (struct indianos_syscall_request){INDIANOS_SYS_YIELD, 0, 0}) &&
+           !indianos_syscall_validate(&plan,
+               (struct indianos_syscall_request){INDIANOS_SYS_YIELD, 1, 0}) &&
            !indianos_syscall_validate(&plan,
                (struct indianos_syscall_request){999, 0, 0});
 }
