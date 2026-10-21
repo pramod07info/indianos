@@ -221,6 +221,46 @@ def assert_expected_scheduler(text: str) -> None:
         raise AssertionError("M009 task faulted")
 
 
+def assert_expected_preempt(text: str) -> None:
+    """CPU-bound user tasks must be interrupted by hardware IRQ0, not yield."""
+    if "IndianOS: FATAL" in text:
+        raise AssertionError("kernel reported fatal timer/scheduler error")
+    for marker in (
+        *MILESTONES,
+        "IndianOS: M009 cooperative scheduler experiment begin",
+        "IndianOS: M009 two simultaneous user address spaces ready",
+        "IndianOS: M009 hardware PIT IRQ0 enabled at 100 Hz",
+        "IndianOS: M009 timer-preemptive round-robin PASSED",
+        "IndianOS: M009 scheduler experiment complete",
+    ):
+        if marker not in text:
+            raise AssertionError(f"missing M009 timer-preemptive marker: {marker}")
+    for pid, label in ((1, "A"), (2, "B")):
+        for marker in (
+            f"IndianOS: PID {pid} READY",
+            f"IndianOS: PID {pid} DISPATCHED",
+            f"IndianOS: PID {pid} TIMER_PREEMPTED",
+            f"IndianOS user: M009 timer task {label} started",
+            f"IndianOS user: M009 timer task {label} finished",
+            f"IndianOS: PID {pid} EXITED",
+            f"IndianOS: PID {pid} REAPED",
+        ):
+            if marker not in text:
+                raise AssertionError(f"missing timer task {pid} marker: {marker}")
+    if text.count("IndianOS: PID 1 TIMER_PREEMPTED") < 1 or \
+       text.count("IndianOS: PID 2 TIMER_PREEMPTED") < 1:
+        raise AssertionError("timer did not preempt both tasks")
+    if text.find("IndianOS: PID 2 DISPATCHED") > text.find("IndianOS: PID 1 EXITED"):
+        raise AssertionError("task 2 was not scheduled until after task 1 exited")
+    if "IndianOS: PID 1 FAULTED" in text or "IndianOS: PID 2 FAULTED" in text:
+        raise AssertionError("CPU-bound user program faulted")
+    if "IndianOS: PID 1 YIELDED" not in text or "IndianOS: PID 2 YIELDED" not in text:
+        raise AssertionError("timer dispatch was not requeued")
+    if text.count("IndianOS: PID 1 REAPED") != 1 or \
+       text.count("IndianOS: PID 2 REAPED") != 1:
+        raise AssertionError("tasks were not reaped exactly once")
+
+
 def matching_ovmf_vars(code: Path) -> Path | None:
     """Find the matching OVMF_VARS template without altering that template."""
     if not code.name.startswith("OVMF_CODE"):
@@ -240,7 +280,7 @@ def run_smoke(iso: Path, ovmf: Path, qemu: str, timeout: float,
     if timeout <= 0 or timeout > 180:
         raise ValueError("timeout must be between 0 and 180 seconds")
     if mode not in {"normal", "exception", "pagefault", "shadow", "usermode",
-                    "fault-guard", "fault-supervisor", "processes", "scheduler"}:
+                    "fault-guard", "fault-supervisor", "processes", "scheduler", "preempt"}:
         raise ValueError("invalid smoke-test mode")
     verifiers = {
         "normal": assert_milestones,
@@ -252,6 +292,7 @@ def run_smoke(iso: Path, ovmf: Path, qemu: str, timeout: float,
         "fault-supervisor": lambda log: assert_expected_userfault(log, "fault-supervisor"),
         "processes": assert_expected_processes,
         "scheduler": assert_expected_scheduler,
+        "preempt": assert_expected_preempt,
     }
     verify = verifiers[mode]
     argv = [
@@ -328,7 +369,7 @@ def main() -> int:
     parser.add_argument("--ovmf", type=Path, required=True)
     parser.add_argument("--qemu", default="qemu-system-x86_64")
     parser.add_argument("--timeout", type=float, default=25)
-    parser.add_argument("--mode", choices=("normal", "exception", "pagefault", "shadow", "usermode", "fault-guard", "fault-supervisor", "processes", "scheduler"), default="normal")
+    parser.add_argument("--mode", choices=("normal", "exception", "pagefault", "shadow", "usermode", "fault-guard", "fault-supervisor", "processes", "scheduler", "preempt"), default="normal")
     args = parser.parse_args()
     try:
         output = run_smoke(args.iso, args.ovmf, args.qemu, args.timeout, args.mode)
