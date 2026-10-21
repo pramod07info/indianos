@@ -267,6 +267,8 @@ make test-rust-source-audit
 make kernel
 make test-rust-host-abi
 make test-rust-default-qemu
+make test-rust-link-audit # R010 actual ELF input audit
+make test-rust-source-audit-negative # R010 require C rollback rejection
 make test-rust-ring3-runtime-qemu
 make test-rust-paging-cpu-qemu
 make test-exception test-pagefault test-userfault-guard

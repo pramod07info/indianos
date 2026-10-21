@@ -648,7 +648,7 @@ $(WORKER_ELF): $(WORKER_OBJ) userland/demo/linker.ld Makefile
 
 endif # RUST_USERLAND
 
-$(RUST_TOOLS_BIN): tools/rust/src/main.rs tools/rust/Cargo.toml tools/rust/Cargo.lock Makefile
+$(RUST_TOOLS_BIN): $(wildcard tools/rust/src/*.rs) tools/rust/Cargo.toml tools/rust/Cargo.lock Makefile
 	CARGO_TARGET_DIR=$(BUILD)/rust-tools-target $(CARGO) build \
 	    --manifest-path $(RUST_TOOLS_MANIFEST) --release --offline
 	@test -f $@

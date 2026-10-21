@@ -191,3 +191,29 @@ before compiling the kernel. The active Rust port (prior to this audit gate)
 passed [CI 39561858663](https://github.com/pramod07info/indianos/actions/runs/39561858663).
 Retaining C references, host C tests, third-party Limine and essential
 assembly does not violate this narrower active-kernel source goal.
+
+## R010 — audited ELF provenance and negative tests
+
+The initial `make test-rust-source-audit` checks Make's selected sources and
+objects. The additional R010 gate writes an ld.lld linker input map
+(`$(BUILD)/kernel-link.map`) for the compiled kernel and verifies the
+**actual linked input objects** using the dependency-free Rust command
+`indianos-tools audit-kernel`.
+
+Exactly one Rust static archive and two permitted native x86-64 assembly
+entry objects (`interrupt_entry.o`, `user_entry.o`) may contribute
+objects to the default linked kernel. Extra linked C objects or archives
+fail the audit. The CLI checks ELF64 x86-64 file type, archive magic and
+required inputs. Rust unit tests inject forbidden C object names and
+additional archives to prove rejection.
+
+CI executes `make test-rust-link-audit BUILD=build/rust-compile` and
+`make test-rust-source-audit-negative`. The latter deliberately switches
+on the original C core, C main, C user runtime and C interrupt handler,
+and requires all four configurations to be rejected by the Rust audit.
+
+This verifies the active kernel link only, not third-party Limine, the
+retained reference C tests, or the compiler's underlying archive
+provenance. The two low-level assembly CPU transition objects remain.
+Real-hardware boot and general cross-platform application compatibility
+remain outside R010's scope.
