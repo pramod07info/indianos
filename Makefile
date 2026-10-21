@@ -288,8 +288,10 @@ test-rust-hardening:
 
 # R013: run native Rust shell grammar and syscall allowlist unit tests.
 test-rust-shell-host:
-	CARGO_TARGET_DIR=build/r013-shell-host $(CARGO) test \
-	    --manifest-path userland/rust/Cargo.toml --offline --test shell_commands
+	@mkdir -p build/r013-shell-host
+	rustc --edition=2021 --test userland/rust/tests/shell_commands.rs \
+	    -o build/r013-shell-host/command_tests
+	build/r013-shell-host/command_tests
 	CARGO_TARGET_DIR=build/r013-kernel-host $(CARGO) test \
 	    --manifest-path $(RUST_MANIFEST) --offline --features test-shell
 
