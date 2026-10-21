@@ -632,6 +632,10 @@ bool x86_64_m009_schedule_run(const uint8_t *first_elf, size_t first_bytes,
                pmm_free_frames() != starting_free))
         ok = false;
 #ifdef INDIANOS_TEST_PREEMPT
+    if (x86_64_timer_irq_count() == 0)
+        serial_write("IndianOS: M009 PIC/PIT delivered zero timer IRQs\n");
+    else
+        serial_write("IndianOS: M009 PIC/PIT hardware timer interrupts observed\n");
     if (scheduler.yield_count < 2 || scheduler.tick_count < 2 ||
         m009_tasks[0].timer_preemptions == 0 ||
         m009_tasks[1].timer_preemptions == 0 ||
