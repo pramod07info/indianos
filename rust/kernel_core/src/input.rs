@@ -3,6 +3,8 @@
 //! is a best-effort secondary source. No keyboard IRQs or SMP yet.
 //! No untrusted byte is interpreted as an escape sequence.
 use core::arch::asm;
+#[cfg(feature="test-irq-keyboard")]
+use core::sync::atomic::{AtomicU64,Ordering};
 
 #[inline(always)]
 unsafe fn inb(port:u16)->u8 {
@@ -78,12 +80,125 @@ pub(crate) fn filter(b:u8)->Option<u8>{
 static mut SCAN:ScanDecoder=ScanDecoder{
     shift_left:false,shift_right:false,caps:false,extended:false
 };
+#[cfg(feature="test-irq-keyboard")]
+const QUEUE_SIZE:usize=128;
+#[cfg(feature="test-irq-keyboard")]
+static mut QUEUE:[u8;QUEUE_SIZE]=[0;QUEUE_SIZE];
+#[cfg(feature="test-irq-keyboard")]
+static mut READ_INDEX:usize=0;
+#[cfg(feature="test-irq-keyboard")]
+static mut WRITE_INDEX:usize=0;
+#[cfg(feature="test-irq-keyboard")]
+static IRQ_EVENTS:AtomicU64=AtomicU64::new(0);
+#[cfg(feature="test-irq-keyboard")]
+static mut IRQ_ACTIVE:bool=false;
+
+/// Caller runs with IF=0 (IDT interrupt gate, single BSP). Queue producer
+/// is IRQ1, queue consumer is the READ syscall's synchronous trap handler.
+#[cfg(feature="test-irq-keyboard")]
+fn enqueue(ch:u8) {
+    unsafe{
+        let next=(WRITE_INDEX+1)%QUEUE_SIZE;
+        if next!=READ_INDEX{
+            QUEUE[WRITE_INDEX]=ch;
+            WRITE_INDEX=next;
+        }
+    }
+}
+#[cfg(feature="test-irq-keyboard")]
+fn dequeue()->Option<u8>{
+    unsafe{
+        if READ_INDEX==WRITE_INDEX{return None;}
+        let byte=QUEUE[READ_INDEX];
+        READ_INDEX=(READ_INDEX+1)%QUEUE_SIZE;
+        Some(byte)
+    }
+}
+#[cfg(feature="test-irq-keyboard")]
+fn io_wait(){unsafe{outb(0x80,0)}}
+#[cfg(feature="test-irq-keyboard")]
+fn wait_input()->bool{
+    for _ in 0..100_000{
+        if unsafe{inb(PS2_STATUS)}&2==0{return true;}
+    }
+    false
+}
+#[cfg(feature="test-irq-keyboard")]
+fn wait_output()->Option<u8>{
+    for _ in 0..100_000{
+        if unsafe{inb(PS2_STATUS)}&1!=0{
+            return Some(unsafe{inb(PS2_DATA)});
+        }
+    }
+    None
+}
+/// Legacy PIC/PS2 initialization is opt-in, uniprocessor and must occur
+/// after IDT 0x21 is ready, with IF masked. Other PIC IRQs stay masked.
+#[cfg(feature="test-irq-keyboard")]
+pub(crate) fn enable_irq1()->bool{
+    let mut apic_lo:u32;
+    let apic_hi:u32;
+    unsafe{asm!("rdmsr",in("ecx")0x1bu32,
+        out("eax")apic_lo,out("edx")apic_hi,options(nostack,preserves_flags));}
+    if apic_lo&(1<<10)!=0{return false;}
+    if apic_lo&(1<<11)!=0{
+        apic_lo&=!(1<<11);
+        unsafe{asm!("wrmsr",in("ecx")0x1bu32,
+            in("eax")apic_lo,in("edx")apic_hi,options(nostack,preserves_flags));}
+    }
+    unsafe{
+        outb(0x20,0x11);io_wait();outb(0xa0,0x11);io_wait();
+        outb(0x21,0x20);io_wait();outb(0xa1,0x28);io_wait();
+        outb(0x21,0x04);io_wait();outb(0xa1,0x02);io_wait();
+        outb(0x21,0x01);io_wait();outb(0xa1,0x01);io_wait();
+        outb(0x21,0xfd);outb(0xa1,0xff);
+        outb(0x22,0x70);io_wait();outb(0x23,0);io_wait();
+    }
+    // Enable the PS/2 first port's clock and its IRQ1 config bit.
+    if !wait_input(){return false;}
+    unsafe{outb(PS2_STATUS,0xae);}
+    if !wait_input(){return false;}
+    unsafe{outb(PS2_STATUS,0x20);}
+    let Some(conf)=wait_output()else{return false;};
+    if !wait_input(){return false;}
+    unsafe{outb(PS2_STATUS,0x60);}
+    if !wait_input(){return false;}
+    unsafe{outb(PS2_DATA,(conf|0x41)&!0x10);}
+    // Scan codes arriving through the PS/2 controller must be read by IRQ1.
+    unsafe{READ_INDEX=0;WRITE_INDEX=0;IRQ_ACTIVE=true;}
+    IRQ_EVENTS.store(0,Ordering::Relaxed);
+    true
+}
+#[cfg(feature="test-irq-keyboard")]
+pub(crate) fn irq_count()->u64{IRQ_EVENTS.load(Ordering::Relaxed)}
+#[cfg(feature="test-irq-keyboard")]
+#[no_mangle]
+pub extern "C" fn x86_64_keyboard_irq_dispatch(){
+    let _=IRQ_EVENTS.fetch_update(Ordering::Relaxed,Ordering::Relaxed,|n|{
+        Some(n.saturating_add(1))
+    });
+    let status=unsafe{inb(PS2_STATUS)};
+    if status&1!=0 {
+        let code=unsafe{inb(PS2_DATA)};
+        if status&0x20==0 {
+            if let Some(ch)=unsafe{(&mut *core::ptr::addr_of_mut!(SCAN)).feed(code)}{
+                enqueue(ch);
+            }
+        }
+    }
+    unsafe{outb(0x20,0x20);} // specific master PIC EOI
+}
 pub(crate) fn poll_byte()->Option<u8>{
+    #[cfg(feature="test-irq-keyboard")]
+    if let Some(byte)=dequeue(){return Some(byte);}
+
     // Bounded non-blocking UART polling; the shell performs its own wait.
     if unsafe{inb(COM1+5)}&1!=0{
         let b=unsafe{inb(COM1)};
         return filter(b);
     }
+    #[cfg(feature="test-irq-keyboard")]
+    if unsafe{IRQ_ACTIVE}{return None;} // IRQ1 owns PS/2 reads
     let status=unsafe{inb(PS2_STATUS)};
     // Avoid accidentally consuming auxiliary PS/2 mouse packets.
     if status&1!=0&&status&0x20==0{
@@ -93,6 +208,8 @@ pub(crate) fn poll_byte()->Option<u8>{
     None
 }
 pub(crate) fn echo(byte:u8){
+    #[cfg(feature="test-irq-keyboard")]
+    crate::console::echo(byte);
     fn send(ch:u8){
         for _ in 0..100_000 {
             if unsafe{inb(COM1+5)}&0x20!=0 {
@@ -123,6 +240,19 @@ mod tests{
         assert_eq!(keys.feed(0x1e),Some(b'A'));
         assert_eq!(keys.feed(0x2a),None);
         assert_eq!(keys.feed(0x1e),Some(b'a'));
+    }
+    #[cfg(feature="test-irq-keyboard")]
+    #[test]
+    fn irq_fifo_wraps_and_never_overwrites(){
+        unsafe{READ_INDEX=0;WRITE_INDEX=0;}
+        for ch in 0..128u8{enqueue(ch);}
+        let mut result=std::vec::Vec::new();
+        while let Some(ch)=dequeue(){result.push(ch);}
+        assert_eq!(result.len(),127);
+        assert_eq!(result[0],0);
+        assert_eq!(result[126],126);
+        assert_eq!(dequeue(),None);
+        enqueue(b'Z');assert_eq!(dequeue(),Some(b'Z'));
     }
     #[test]
     fn terminal_input_filters_controls(){

@@ -131,7 +131,7 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
  let img=active_image();
  if img.is_null()||regs.is_null(){return BAD;}
  let r=unsafe{&*(regs as *const [u64; WORDS])};
- if !ring3_frame_valid(r,unsafe{&(*img).plan},cfg!(feature="preempt")){return BAD;}
+ if !ring3_frame_valid(r,unsafe{&(*img).plan},cfg!(any(feature="preempt",feature="test-irq-keyboard"))){return BAD;}
  // SYS_EXIT and SYS_WRITE must originate from a mapped user executable
  // instruction, not a writable or supervisor-only page.
  let mut source=Mapping{
@@ -189,7 +189,10 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
    copied[request.arg1 as usize]=0;
    log(b"IndianOS user: \0");
    unsafe{serial_write(copied.as_ptr().cast())};
-   log(b"\n\0");request.arg1
+   log(b"\n\0");
+   #[cfg(feature="test-irq-keyboard")]
+   crate::console::write(&copied[..request.arg1 as usize]);
+   request.arg1
   }
   _=>BAD
  }

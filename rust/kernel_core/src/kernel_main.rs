@@ -58,6 +58,12 @@ pub extern "C" fn kmain()->!{
     need(unsafe{boot_validate()},b"IndianOS: FATAL boot information invalid\n\0");
     log(b"IndianOS: boot information validated\n\0");
     unsafe{boot_draw_status();}
+    #[cfg(feature="test-irq-keyboard")]
+    {
+        need(crate::console::init(),
+             b"IndianOS: FATAL R014.2 framebuffer text console unavailable\n\0");
+        log(b"IndianOS: R014.2 framebuffer text console ready\n\0");
+    }
     log(b"IndianOS: milestone 001 complete\n\0");
 
     need(unsafe{x86_64_exceptions_init()},
@@ -115,6 +121,12 @@ pub extern "C" fn kmain()->!{
     {
         // Scripted ring-3 init -> validated spawn -> distinct worker lifetime.
         log(b"IndianOS: R013 init shell begin\n\0");
+        #[cfg(feature="test-irq-keyboard")]
+        {
+            need(crate::input::enable_irq1(),
+                 b"IndianOS: FATAL R014.2 PS/2 IRQ1 initialization failed\n\0");
+            log(b"IndianOS: R014.2 IRQ1 keyboard controller armed\n\0");
+        }
         let mut table=ProcessTable::empty();
         need(unsafe{indianos_process_table_init(&mut table)},
              b"IndianOS: FATAL R013 process table init\n\0");
@@ -124,6 +136,12 @@ pub extern "C" fn kmain()->!{
         need(unsafe{x86_64_user_process_run(init_pcb,init,init_size) &&
                     indianos_process_success(init_pcb)},
              b"IndianOS: FATAL R013 init shell failed\n\0");
+        #[cfg(feature="test-irq-keyboard")]
+        {
+            need(crate::input::irq_count()>0,
+                 b"IndianOS: FATAL R014.2 no physical PS/2 IRQ1 delivered\n\0");
+            log(b"IndianOS: R014.2 PS/2 IRQ1 delivery verified\n\0");
+        }
         need(unsafe{indianos_r013_take_worker_request()},
              b"IndianOS: FATAL R013 no worker spawn request\n\0");
         log(b"IndianOS: R013 launching /bin/worker\n\0");

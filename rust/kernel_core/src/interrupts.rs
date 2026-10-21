@@ -78,6 +78,8 @@ unsafe extern "C" {
     fn x86_64_unexpected_interrupt();
     fn x86_64_user_interrupt();
     fn x86_64_timer_interrupt();
+    #[cfg(feature="test-irq-keyboard")]
+    fn x86_64_keyboard_interrupt();
     fn x86_64_user_fault_handle(vector:u64,cs:u64,error:u64,cr2:u64);
     fn serial_write(message:*const c_char);
 }
@@ -123,6 +125,8 @@ pub unsafe extern "C" fn x86_64_exceptions_init()->bool{
             install_gate(i,handler,if i==8 {1} else {0},INTERRUPT_GATE);
         }
         install_gate(0x80,x86_64_user_interrupt as usize,0,USER_GATE);
+        #[cfg(feature="test-irq-keyboard")]
+        install_gate(0x21,x86_64_keyboard_interrupt as usize,0,INTERRUPT_GATE);
         #[cfg(feature="preempt")]
         install_gate(0x20,x86_64_timer_interrupt as usize,0,INTERRUPT_GATE);
         let idtr=DescriptorPtr{
