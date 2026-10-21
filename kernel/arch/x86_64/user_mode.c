@@ -179,6 +179,15 @@ uint64_t x86_64_user_syscall_dispatch(const uint64_t *regs) {
     if (request.number == INDIANOS_SYS_EXIT)
         x86_64_user_exit_to_kernel(request.arg0);
     if (request.number == INDIANOS_SYS_WRITE) {
+#ifdef INDIANOS_TEST_PREEMPT
+        static bool reported_user_interrupt_flag;
+        if (!reported_user_interrupt_flag) {
+            serial_write((regs[17] & 0x200ull) != 0
+                ? "IndianOS: M009 user IF=1 (hardware IRQs permitted)\n"
+                : "IndianOS: M009 user IF=0 (hardware IRQs masked)\n");
+            reported_user_interrupt_flag = true;
+        }
+#endif
         char copied[INDIANOS_MAX_SYSCALL_WRITE + 1];
         if (!indianos_user_copy_readonly(current_user, request.arg0,
                                          copied, (size_t)request.arg1))
