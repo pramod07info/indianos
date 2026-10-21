@@ -173,6 +173,54 @@ def assert_expected_processes(text: str) -> None:
         raise AssertionError("M008 successful task unexpectedly faulted")
 
 
+def assert_expected_scheduler(text: str) -> None:
+    """Two real user contexts must alternate, not merely run-to-completion."""
+    if "IndianOS: FATAL" in text:
+        raise AssertionError("scheduler kernel reported fatal error")
+    ordered = (
+        *MILESTONES,
+        "IndianOS: M009 cooperative scheduler experiment begin",
+        "IndianOS: PID 1 READY",
+        "IndianOS: PID 2 READY",
+        "IndianOS: M009 two simultaneous user address spaces ready",
+        "IndianOS: PID 1 DISPATCHED",
+        "IndianOS user: M009 task A step 1",
+        "IndianOS: PID 1 YIELDED",
+        "IndianOS: PID 2 DISPATCHED",
+        "IndianOS user: M009 task B step 1",
+        "IndianOS: PID 2 YIELDED",
+        "IndianOS: PID 1 DISPATCHED",
+        "IndianOS user: M009 task A step 2",
+        "IndianOS: PID 1 YIELDED",
+        "IndianOS: PID 2 DISPATCHED",
+        "IndianOS user: M009 task B step 2",
+        "IndianOS: PID 2 YIELDED",
+        "IndianOS: PID 1 DISPATCHED",
+        "IndianOS user: M009 task A step 3",
+        "IndianOS: PID 1 EXITED",
+        "IndianOS: PID 1 REAPED",
+        "IndianOS: PID 2 DISPATCHED",
+        "IndianOS user: M009 task B step 3",
+        "IndianOS: PID 2 EXITED",
+        "IndianOS: PID 2 REAPED",
+        "IndianOS: M009 round-robin cooperative switching PASSED",
+        "IndianOS: M009 scheduler experiment complete",
+    )
+    offset = 0
+    for marker in ordered:
+        pos = text.find(marker, offset)
+        if pos < 0:
+            raise AssertionError(f"M009 missing or out-of-order marker: {marker}")
+        offset = pos + len(marker)
+    for pid in (1, 2):
+        if text.count(f"IndianOS: PID {pid} DISPATCHED") != 3:
+            raise AssertionError(f"M009 PID {pid} did not receive three turns")
+        if text.count(f"IndianOS: PID {pid} YIELDED") != 2:
+            raise AssertionError(f"M009 PID {pid} did not yield twice")
+    if "IndianOS: PID 1 FAULTED" in text or "IndianOS: PID 2 FAULTED" in text:
+        raise AssertionError("M009 task faulted")
+
+
 def matching_ovmf_vars(code: Path) -> Path | None:
     """Find the matching OVMF_VARS template without altering that template."""
     if not code.name.startswith("OVMF_CODE"):
@@ -192,7 +240,7 @@ def run_smoke(iso: Path, ovmf: Path, qemu: str, timeout: float,
     if timeout <= 0 or timeout > 180:
         raise ValueError("timeout must be between 0 and 180 seconds")
     if mode not in {"normal", "exception", "pagefault", "shadow", "usermode",
-                    "fault-guard", "fault-supervisor", "processes"}:
+                    "fault-guard", "fault-supervisor", "processes", "scheduler"}:
         raise ValueError("invalid smoke-test mode")
     verifiers = {
         "normal": assert_milestones,
@@ -203,6 +251,7 @@ def run_smoke(iso: Path, ovmf: Path, qemu: str, timeout: float,
         "fault-guard": lambda log: assert_expected_userfault(log, "fault-guard"),
         "fault-supervisor": lambda log: assert_expected_userfault(log, "fault-supervisor"),
         "processes": assert_expected_processes,
+        "scheduler": assert_expected_scheduler,
     }
     verify = verifiers[mode]
     argv = [
@@ -279,7 +328,7 @@ def main() -> int:
     parser.add_argument("--ovmf", type=Path, required=True)
     parser.add_argument("--qemu", default="qemu-system-x86_64")
     parser.add_argument("--timeout", type=float, default=25)
-    parser.add_argument("--mode", choices=("normal", "exception", "pagefault", "shadow", "usermode", "fault-guard", "fault-supervisor", "processes"), default="normal")
+    parser.add_argument("--mode", choices=("normal", "exception", "pagefault", "shadow", "usermode", "fault-guard", "fault-supervisor", "processes", "scheduler"), default="normal")
     args = parser.parse_args()
     try:
         output = run_smoke(args.iso, args.ovmf, args.qemu, args.timeout, args.mode)
