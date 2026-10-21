@@ -214,7 +214,7 @@ fn page_owned(image: &UserImage, va: u64, physical: u64) -> bool {
 
 /// Check the entire requested range before copying its first byte. A valid
 /// PTE does not establish ownership of the underlying physical frame.
-unsafe fn copy_preflight(image: &UserImage, address: u64, len: usize) -> bool {
+unsafe fn copy_preflight(image: &UserImage, address: u64, len: usize, write: bool) -> bool {
     let mut done = 0usize;
     while done < len {
         let Some(at) = address.checked_add(done as u64) else { return false; };
@@ -226,7 +226,7 @@ unsafe fn copy_preflight(image: &UserImage, address: u64, len: usize) -> bool {
             },
         };
         if !unsafe { vmm_query_page(&image.tables, va, &mut mapped) } ||
-            !mapped.permissions.user ||
+            !mapped.permissions.user || (write && !mapped.permissions.writable) ||
             (mapped.permissions.writable && mapped.permissions.executable) ||
             !page_owned(image, va, mapped.physical) {
             return false;
@@ -244,7 +244,7 @@ pub unsafe extern "C" fn indianos_user_copy_readonly(
     let Some(img) = (unsafe { image.as_ref() }) else { return false; };
     if !img.ready || destination.is_null() || !(1..=MAX_WRITE).contains(&length) ||
         !unsafe { indianos_program_user_range(&img.plan, address, length as u64, false) } ||
-        !unsafe { copy_preflight(img, address, length) } {
+        !unsafe { copy_preflight(img, address, length, false) } {
         return false;
     }
     let mut done = 0usize;
@@ -270,6 +270,51 @@ pub unsafe extern "C" fn indianos_user_copy_readonly(
             unsafe { ptr::write(destination.cast::<u8>().add(done + i), byte); }
         }
         done += count;
+    }
+    true
+}
+
+
+#[cfg(feature="test-interactive")]
+pub(crate) unsafe fn indianos_user_can_write(
+    img:&UserImage,address:u64,length:usize,
+)->bool{
+    img.ready && (1..=64).contains(&length) &&
+        crate::syscall::user_range(&img.plan,address,length as u64,true) &&
+        unsafe{copy_preflight(img,address,length,true)}
+}
+
+/// # Safety
+/// Image and kernel source remain live; user addresses are translated using
+/// owned page tables, not directly dereferenced.
+#[cfg(feature="test-interactive")]
+pub(crate) unsafe fn indianos_user_copy_writable(
+    img:&UserImage,address:u64,source:*const u8,length:usize,
+)->bool{
+    if source.is_null() || !unsafe{indianos_user_can_write(img,address,length)}{
+        return false;
+    }
+    let mut done=0usize;
+    while done<length{
+        let Some(at)=address.checked_add(done as u64)else{return false;};
+        let va=at&!(PAGE as u64-1);
+        let offset=(at&(PAGE as u64-1)) as usize;
+        let mut mapping=Mapping{
+            physical:0,permissions:Permissions{writable:false,executable:false,user:false}
+        };
+        if !unsafe{vmm_query_page(&img.tables,va,&mut mapping)} ||
+            !mapping.permissions.user||!mapping.permissions.writable||
+            mapping.permissions.executable||!page_owned(img,va,mapping.physical){
+            return false;
+        }
+        let dest=unsafe{access(img,mapping.physical)};
+        if dest.is_null(){return false;}
+        let count=(PAGE-offset).min(length-done);
+        for j in 0..count{
+            let byte=unsafe{ptr::read(source.add(done+j))};
+            unsafe{ptr::write(dest.add(offset+j),byte);}
+        }
+        done+=count;
     }
     true
 }
