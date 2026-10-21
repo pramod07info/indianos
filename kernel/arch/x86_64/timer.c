@@ -22,8 +22,24 @@ static inline uint8_t inb(uint16_t port) {
     return byte;
 }
 
+/* The UEFI boot environment may leave the LAPIC enabled but its LINT0
+ * virtual-wire input masked. For this QEMU-only legacy 8259 experiment,
+ * disable xAPIC before expecting PIC->INTR delivery. A firmware-enabled
+ * x2APIC configuration is not changed: fail closed instead. */
+static bool select_legacy_pic_delivery(void) {
+    const uint32_t msr = 0x1bu; /* IA32_APIC_BASE */
+    uint32_t lo = 0, hi = 0;
+    __asm__ volatile ("rdmsr" : "=a"(lo), "=d"(hi) : "c"(msr));
+    if ((lo & (1u << 10)) != 0) return false; /* x2APIC unsupported */
+    if ((lo & (1u << 11)) != 0) {
+        lo &= ~(1u << 11);
+        __asm__ volatile ("wrmsr" : : "a"(lo), "d"(hi), "c"(msr) : "memory");
+    }
+    return true;
+}
+
 bool x86_64_timer_start_100hz(void) {
-    if (configured) return false;
+    if (configured || !select_legacy_pic_delivery()) return false;
     /* PICs are remapped because exception vectors 0x00..0x1f cannot host
      * hardware interrupts. Mask all except IRQ0 on master, all on slave. */
     outb(PIC1_CMD, 0x11); io_wait();
