@@ -1,6 +1,6 @@
 # IndianOS Rust-first migration — staged replacement (R001 onward)
 
-**2026-10-21: IN PROGRESS. This is not a fully rewritten Rust operating system.**
+**2026-10-21: RUST-FIRST DEFAULT, PARTIAL MIGRATION. Not yet a fully rewritten Rust operating system.**
 
 The owner requested that all IndianOS-owned code be converted to Rust before
 moving to another feature milestone. Converting a booting x86-64 kernel
@@ -47,10 +47,40 @@ Implemented sources:
 - A GitHub Actions status `indianos/rust-core-qemu` records **three
   independent results**: host ABI, kernel ELF, QEMU process/scheduler parity.
 
-**Acceptance:** this step is complete only when the status is `success`
-for a commit, all required kernel checks pass, and the first successful
-Rust-backed QEMU serial traces show two processes reaped and six round-robin
-dispatches. Until then, normal builds use C as the default.
+**R001 verified:** GitHub Actions [run 39543410497](https://github.com/pramod07info/indianos/actions/runs/39543410497)
+reported `indianos/rust-core-qemu = success`: four initial Rust unit tests,
+the original C process/scheduler/fault ABI tests, an actual ELF linked from
+Rust staticlib, and both native-user-mode QEMU process/scheduler tests passed.
+Default `make kernel` now uses `RUST_CORE=1`; the legacy C fallback is
+available explicitly with `make kernel RUST_CORE=0`. CI requires the Rust ABI
+and QEMU checks to succeed. This does not imply all kernel modules use Rust.
+
+## R002 — Rust syscall, ELF64, and initramfs metadata
+
+The second slice now ports three more C units, compiled by default into
+the same `no_std` kernel staticlib:
+
+- `kernel/src/syscall_abi.c` → `rust/kernel_core/src/syscall.rs`, with
+  `#[repr(C)]` 24-byte syscall request and checked metadata/user-range
+  validation for ABI_QUERY, WRITE, EXIT and YIELD.
+- `kernel/src/program.c` → `rust/kernel_core/src/program.rs`, with a strict
+  little-endian x86-64 ET_EXEC ELF64 parser; it rejects malformed headers,
+  W+X segments, overlapping pages, dynamic interpreter, TLS and invalid
+  entry points. A failed plan does not mutate the output.
+- `kernel/src/initramfs.c` → `rust/kernel_core/src/initramfs.rs`, with
+  bounded read-only archive validation and lookup, rejection of duplicates,
+  malformed paths, truncated entries and trailing bytes.
+
+These modules maintain the original C ABI, use no allocator and are tested
+with Rust unit tests and the unchanged C program/user-image fixtures.
+Success must also be demonstrated under QEMU, including a real boot,
+ring-3 user application, guard/supervisor fault isolation, process cleanup
+and the cooperative scheduler. The results are collected under the
+`indianos/rust-core-qemu` status.
+
+**Only C translation units removed from the active default kernel link** are
+the six listed above. The original files remain in the repository as
+reference/fallback code and still support `RUST_CORE=0`.
 
 ## Remaining migration work — NOT YET CONVERTED
 
@@ -81,6 +111,8 @@ make test-rust-processes
 make test-rust-scheduler
 ```
 
-The default `make kernel` will only switch to Rust-backed code once those
-checks pass. Follow-ups must not interpret this R001 implementation as a
-completed all-Rust rewrite.
+The default `make kernel` already links the verified Rust-backed modules
+and validates their behavior through CI. A complete Rust-only kernel is still
+far away; the remaining C/assembly, owned Python tools and programs must be
+replaced under the same strict QEMU test criteria before removing the
+compatibility build path.
