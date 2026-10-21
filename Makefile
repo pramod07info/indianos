@@ -19,7 +19,7 @@ LIMINE_TARBALL := $(BUILD)/third_party/limine-binary.tar.gz
 LIMINE_URL := https://github.com/Limine-Bootloader/Limine/releases/download/v12.9.3/limine-binary.tar.gz
 LIMINE_SHA256 := 9f42fe9ea2e84d71056529969b1d5c24ba9a2287ffcc01bcce58b0ef8aa98b1d
 
-SOURCES := kernel/src/main.c kernel/src/serial.c kernel/src/boot.c kernel/src/pmm.c kernel/src/vmm.c kernel/src/vmm_boot.c kernel/src/paging_clone.c kernel/src/paging_policy.c kernel/src/program.c kernel/src/syscall_abi.c kernel/src/memory_runtime.c kernel/src/initramfs.c kernel/src/user_image.c kernel/src/user_image_boot.c
+SOURCES := kernel/src/main.c kernel/src/serial.c kernel/src/boot.c kernel/src/pmm.c kernel/src/vmm.c kernel/src/vmm_boot.c kernel/src/paging_clone.c kernel/src/paging_policy.c kernel/src/program.c kernel/src/syscall_abi.c kernel/src/memory_runtime.c kernel/src/initramfs.c kernel/src/user_image.c kernel/src/user_image_boot.c kernel/src/user_copy.c
 OBJECTS := $(patsubst kernel/src/%.c,$(BUILD)/obj/%.o,$(SOURCES))
 OBJECTS += $(BUILD)/obj/interrupts.o $(BUILD)/obj/interrupt_entry.o $(BUILD)/obj/paging.o $(BUILD)/obj/user_mode.o $(BUILD)/obj/user_entry.o
 HEADERS := $(wildcard kernel/include/indianos/*.h) third_party/limine/limine.h
@@ -200,7 +200,7 @@ test-host:
 	$(BUILD)/program_test
 	$(CC) -std=c11 -O2 -g -Wall -Wextra -Werror -I kernel/include \
 	    tests/test_user_image.c kernel/src/program.c kernel/src/initramfs.c \
-	    kernel/src/user_image.c kernel/src/vmm.c -o $(BUILD)/user_image_test
+	    kernel/src/user_image.c kernel/src/user_copy.c kernel/src/vmm.c -o $(BUILD)/user_image_test
 	$(BUILD)/user_image_test
 	python3 -m unittest discover -s tests -v
 
