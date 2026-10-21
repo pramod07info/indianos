@@ -158,16 +158,31 @@ pub(crate) fn enable_irq1()->bool{
         outb(0x21,0xfd);outb(0xa1,0xff);
         outb(0x22,0x70);io_wait();outb(0x23,0);io_wait();
     }
-    // Enable the PS/2 first port's clock and its IRQ1 config bit.
+    // Firmware may leave an unread scan code. If a stale byte holds OBF
+    // high, later QEMU sendkey events cannot assert a new IRQ1 edge.
+    // Disable port 1 before reading the controller configuration.
     if !wait_input(){return false;}
-    unsafe{outb(PS2_STATUS,0xae);}
+    unsafe{outb(PS2_STATUS,0xad);}
+    for _ in 0..32 {
+        if unsafe{inb(PS2_STATUS)}&1==0{break;}
+        let _=unsafe{inb(PS2_DATA)};
+    }
     if !wait_input(){return false;}
     unsafe{outb(PS2_STATUS,0x20);}
     let Some(conf)=wait_output()else{return false;};
     if !wait_input(){return false;}
     unsafe{outb(PS2_STATUS,0x60);}
     if !wait_input(){return false;}
+    // IRQ1 on, translation to set-1 on, PS/2 port 1 clock enabled.
     unsafe{outb(PS2_DATA,(conf|0x41)&!0x10);}
+    if !wait_input(){return false;}
+    unsafe{outb(PS2_STATUS,0xae);}
+    if !wait_input(){return false;}
+    // Drop any controller responses from firmware/programming.
+    for _ in 0..32{
+        if unsafe{inb(PS2_STATUS)}&1==0{break;}
+        let _=unsafe{inb(PS2_DATA)};
+    }
     // Scan codes arriving through the PS/2 controller must be read by IRQ1.
     unsafe{READ_INDEX=0;WRITE_INDEX=0;IRQ_ACTIVE=true;}
     IRQ_EVENTS.store(0,Ordering::Relaxed);
@@ -209,6 +224,22 @@ pub(crate) fn poll_byte()->Option<u8>{
             unsafe{
                 REPORTED_PS2_PENDING=true;
                 serial_write(b"IndianOS: R014.2 PS/2 data pending without IRQ1\n\0".as_ptr().cast());
+                let mask=inb(0x21);
+                outb(0x20,0x0a);let irr=inb(0x20);
+                outb(0x20,0x0b);let isr=inb(0x20);
+                if mask&0x02!=0{
+                    serial_write(b"IndianOS: R014.2 PIC IRQ1 masked\n\0".as_ptr().cast());
+                }else{
+                    serial_write(b"IndianOS: R014.2 PIC IRQ1 unmasked\n\0".as_ptr().cast());
+                }
+                if irr&0x02!=0{
+                    serial_write(b"IndianOS: R014.2 PIC IRR IRQ1 pending\n\0".as_ptr().cast());
+                }else{
+                    serial_write(b"IndianOS: R014.2 PIC IRR IRQ1 absent\n\0".as_ptr().cast());
+                }
+                if isr&0x02!=0{
+                    serial_write(b"IndianOS: R014.2 PIC ISR IRQ1 active\n\0".as_ptr().cast());
+                }
             }
         }
         return None; // only IRQ1 may drain the keyboard data register
