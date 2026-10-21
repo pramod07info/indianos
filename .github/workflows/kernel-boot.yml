@@ -15,6 +15,9 @@ on:
       - "tests/test_paging.c"
       - "tests/test_program.c"
       - "tests/test_user_image.c"
+      - "tests/test_user_fault.c"
+      - "kernel/include/indianos/user_fault.h"
+      - "userland/demo/fault_entry.S"
       - "tests/inspect_archive.c"
       - "tests/test_initramfs_tool.py"
       - "tools/build_initramfs.py"
@@ -139,6 +142,56 @@ jobs:
           with urlopen(req, timeout=20) as result:
               print(f"Published ring-3 commit status: {state} (HTTP {result.status})")
           PY
+      - name: QEMU user fault isolation (experimental until validated)
+        id: userfault_test
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          OVMF_PATH=""
+          for candidate in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/edk2/ovmf/OVMF_CODE_4M.fd /usr/share/edk2/ovmf/OVMF_CODE.fd; do
+            if test -f "$candidate"; then OVMF_PATH="$candidate"; break; fi
+          done
+          test -n "$OVMF_PATH"
+          make test-userfault-supervisor OVMF_CODE="$OVMF_PATH" 2>&1 | tee build/fault-containment.log
+          make test-userfault-guard OVMF_CODE="$OVMF_PATH" 2>&1 | tee -a build/fault-containment.log
+      - name: Publish user fault containment CI status
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          USERFAULT_OUTCOME: ${{ steps.userfault_test.outcome }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from urllib.request import Request, urlopen
+          outcome = os.getenv("USERFAULT_OUTCOME", "skipped")
+          state = "success" if outcome == "success" else ("failure" if outcome == "failure" else "error")
+          repo = os.environ["GITHUB_REPOSITORY"]
+          payload = json.dumps({
+              "state": state,
+              "context": "indianos/userfault-qemu",
+              "description": f"QEMU ring-3 guard+supervisor fault tests: {outcome}",
+              "target_url": (f"{os.environ['GITHUB_SERVER_URL']}/{repo}/actions/runs/"
+                             f"{os.environ['GITHUB_RUN_ID']}"),
+          }).encode()
+          request = Request(
+              f"https://api.github.com/repos/{repo}/statuses/{os.environ['GITHUB_SHA']}",
+              data=payload, method="POST",
+              headers={"Authorization": "Bearer " + os.environ["GH_TOKEN"],
+                       "Accept": "application/vnd.github+json",
+                       "Content-Type": "application/json"},
+          )
+          with urlopen(request, timeout=20) as response:
+              print("User fault status:", state, response.status)
+          PY
+      - name: Upload user-fault QEMU transcript
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: indianos-userfault-qemu-log
+          path: build/fault-containment.log
+          if-no-files-found: ignore
+          retention-days: 7
       - name: Upload ring-3 smoke transcript for debugging
         if: always()
         uses: actions/upload-artifact@v4
