@@ -26,6 +26,10 @@ RUST_BOOT ?= 0
 RUST_INTERRUPTS ?= 0
 # App fixtures can be compiled to independent native Rust ET_EXEC images.
 RUST_USERLAND ?= 0
+# Rust host-side archive/ELF tooling can replace Python after parity checks.
+RUST_TOOLS ?= 0
+RUST_TOOLS_MANIFEST := tools/rust/Cargo.toml
+RUST_TOOLS_BIN := $(BUILD)/rust-tools-target/release/indianos-tools
 ifeq ($(RUST_BOOT_STAGING),1)
 ifneq ($(RUST_USER_IMAGE),1)
 $(error RUST_BOOT_STAGING=1 requires RUST_USER_IMAGE=1)
@@ -135,7 +139,7 @@ LDFLAGS := -target x86_64-unknown-none-elf -fuse-ld=lld -nostdlib -static \
            -Wl,-z,max-page-size=0x1000 -Wl,-z,noexecstack \
            -Wl,--gc-sections -Wl,--build-id=none -Wl,-T,kernel/linker.ld
 
-.PHONY: test-rust-userland-qemu test-rust-interrupts-qemu test-rust-boot-qemu test-rust-vmm-host test-rust-vmm-qemu test-rust-pmm-host test-rust-pmm-qemu test-rust-user-image-host test-rust-user-image-qemu test-rust-paging-host test-rust-paging-qemu test-rust-runtime-host test-rust-runtime-qemu test-rust-boot-staging-qemu test-rust-host-abi test-rust-processes test-rust-scheduler rust-core all kernel user-elf test-user-elf test-ring3-elf initramfs test-initramfs image run run-bios test-boot test-exception test-pagefault test-shadow test-usermode test-userfault-supervisor test-userfault-guard test-processes test-scheduler test-preempt test-host toolchain-check clean
+.PHONY: test-rust-tools test-rust-userland-qemu test-rust-interrupts-qemu test-rust-boot-qemu test-rust-vmm-host test-rust-vmm-qemu test-rust-pmm-host test-rust-pmm-qemu test-rust-user-image-host test-rust-user-image-qemu test-rust-paging-host test-rust-paging-qemu test-rust-runtime-host test-rust-runtime-qemu test-rust-boot-staging-qemu test-rust-host-abi test-rust-processes test-rust-scheduler rust-core all kernel user-elf test-user-elf test-ring3-elf initramfs test-initramfs image run run-bios test-boot test-exception test-pagefault test-shadow test-usermode test-userfault-supervisor test-userfault-guard test-processes test-scheduler test-preempt test-host toolchain-check clean
 all: image
 kernel: $(KERNEL_ELF)
 
@@ -183,6 +187,19 @@ test-rust-host-abi:
 	    build/rust-tests/host/release/libindianos_kernel_core.a \
 	    -o build/rust-tests/user_image_test
 	build/rust-tests/user_image_test
+
+test-rust-tools:
+	$(CARGO) test --manifest-path $(RUST_TOOLS_MANIFEST) --offline
+	$(MAKE) test-initramfs BUILD=build/rust-tools-archive PROCESS_SELFTEST=1 RUST_TOOLS=1
+	python3 tools/build_initramfs.py \
+	    --elf build/rust-tools-archive/userland/init.elf --name /bin/init \
+	    --extra-elf build/rust-tools-archive/userland/worker.elf \
+	    --extra-name /bin/worker \
+	    --output build/rust-tools-archive/python-reference.img
+	cmp build/rust-tools-archive/initramfs.img build/rust-tools-archive/python-reference.img
+	$(MAKE) test-ring3-elf BUILD=build/rust-tools-elf USERMODE_SELFTEST=1
+	$(MAKE) $(RUST_TOOLS_BIN)
+	$(RUST_TOOLS_BIN) check-elf build/rust-tools-elf/userland/init.elf
 
 test-rust-userland-qemu:
 	$(MAKE) test-ring3-elf BUILD=build/rust-user-demo USERMODE_SELFTEST=1 RUST_USERLAND=1
@@ -467,6 +484,11 @@ $(WORKER_ELF): $(WORKER_OBJ) userland/demo/linker.ld Makefile
 
 endif # RUST_USERLAND
 
+$(RUST_TOOLS_BIN): tools/rust/src/main.rs tools/rust/Cargo.toml tools/rust/Cargo.lock Makefile
+	CARGO_TARGET_DIR=$(BUILD)/rust-tools-target $(CARGO) build \
+	    --manifest-path $(RUST_TOOLS_MANIFEST) --release --offline
+	@test -f $@
+
 user-elf: $(USER_ELF)
 
 $(BUILD)/inspect_elf: tests/inspect_elf.c kernel/src/program.c kernel/include/indianos/program.h Makefile
@@ -477,9 +499,15 @@ $(BUILD)/inspect_elf: tests/inspect_elf.c kernel/src/program.c kernel/include/in
 test-user-elf: $(USER_ELF) $(BUILD)/inspect_elf
 	$(BUILD)/inspect_elf $(USER_ELF)
 
+ifeq ($(RUST_TOOLS),1)
+$(INITRAMFS): $(USER_ELF) $(INITRAMFS_EXTRA_DEPS) $(RUST_TOOLS_BIN) Makefile
+	$(RUST_TOOLS_BIN) pack --elf $(USER_ELF) --name /bin/init \
+	    $(INITRAMFS_EXTRA_ARGS) --output $@
+else
 $(INITRAMFS): $(USER_ELF) $(INITRAMFS_EXTRA_DEPS) tools/build_initramfs.py Makefile
 	python3 tools/build_initramfs.py --elf $(USER_ELF) --name /bin/init \
 	    $(INITRAMFS_EXTRA_ARGS) --output $@
+endif
 
 initramfs: $(INITRAMFS)
 
