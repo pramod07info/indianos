@@ -10,6 +10,7 @@
 #define INDIANOS_SYS_ABI_QUERY 0ull
 #define INDIANOS_SYS_WRITE 1ull
 #define INDIANOS_SYS_EXIT 2ull
+#define INDIANOS_SYS_YIELD 3ull /* M009: opt-in cooperative scheduler */
 #define INDIANOS_MAX_SYSCALL_WRITE 256ull
 
 struct indianos_syscall_request {
