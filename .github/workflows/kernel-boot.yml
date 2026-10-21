@@ -16,6 +16,9 @@ on:
       - "tests/test_program.c"
       - "tests/test_user_image.c"
       - "tests/test_user_fault.c"
+      - "tests/test_process.c"
+      - "kernel/include/indianos/process.h"
+      - "userland/demo/worker_entry.S"
       - "kernel/include/indianos/user_fault.h"
       - "userland/demo/fault_entry.S"
       - "tests/inspect_archive.c"
@@ -142,6 +145,51 @@ jobs:
           with urlopen(req, timeout=20) as result:
               print(f"Published ring-3 commit status: {state} (HTTP {result.status})")
           PY
+      - name: M008 sequential process execution (experimental QEMU)
+        id: process_test
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          OVMF_PATH=""
+          for candidate in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/edk2/ovmf/OVMF_CODE_4M.fd /usr/share/edk2/ovmf/OVMF_CODE.fd; do
+            if test -f "$candidate"; then OVMF_PATH="$candidate"; break; fi
+          done
+          test -n "$OVMF_PATH"
+          make test-processes OVMF_CODE="$OVMF_PATH" 2>&1 | tee build/processes-smoke.log
+      - name: Publish M008 process lifecycle CI status
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PROCESS_OUTCOME: ${{ steps.process_test.outcome }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from urllib.request import Request, urlopen
+          outcome = os.environ.get("PROCESS_OUTCOME", "skipped")
+          state = "success" if outcome == "success" else ("failure" if outcome == "failure" else "error")
+          repo = os.environ["GITHUB_REPOSITORY"]
+          payload = json.dumps({
+              "state": state, "context": "indianos/processes-qemu",
+              "description": f"Two sequential user processes and PMM reclamation: {outcome}",
+              "target_url": (f"{os.environ['GITHUB_SERVER_URL']}/{repo}/actions/runs/"
+                             f"{os.environ['GITHUB_RUN_ID']}")
+          }).encode()
+          req = Request(f"https://api.github.com/repos/{repo}/statuses/{os.environ['GITHUB_SHA']}",
+                        data=payload, method="POST",
+                        headers={"Authorization": "Bearer " + os.environ["GH_TOKEN"],
+                                 "Accept": "application/vnd.github+json",
+                                 "Content-Type": "application/json"})
+          with urlopen(req, timeout=20) as response:
+              print(f"Published M008 process CI status: {state} (HTTP {response.status})")
+          PY
+      - name: Upload M008 QEMU process transcript
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: indianos-m008-processes-qemu-log
+          path: build/processes-smoke.log
+          if-no-files-found: ignore
+          retention-days: 7
       - name: QEMU user fault isolation (guard + supervisor)
         id: userfault_test
         continue-on-error: true
