@@ -18,6 +18,7 @@ std = []
 preempt = []
 vmm = []
 pmm = []
+user-image = ["vmm"]
 
 [profile.release]
 panic = "abort"
