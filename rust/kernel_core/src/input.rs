@@ -94,6 +94,8 @@ static mut WRITE_INDEX:usize=0;
 static IRQ_EVENTS:AtomicU64=AtomicU64::new(0);
 #[cfg(feature="test-irq-keyboard")]
 static mut IRQ_ACTIVE:bool=false;
+#[cfg(feature="test-irq-keyboard")]
+static mut REPORTED_PS2_PENDING:bool=false;
 
 /// Caller runs with IF=0 (IDT interrupt gate, single BSP). Queue producer
 /// is IRQ1, queue consumer is the READ syscall's synchronous trap handler.
@@ -201,7 +203,16 @@ pub(crate) fn poll_byte()->Option<u8>{
         return filter(b);
     }
     #[cfg(feature="test-irq-keyboard")]
-    if unsafe{IRQ_ACTIVE}{return None;} // IRQ1 owns PS/2 reads
+    if unsafe{IRQ_ACTIVE}{
+        let status=unsafe{inb(PS2_STATUS)};
+        if status&1!=0&&status&0x20==0&&unsafe{!REPORTED_PS2_PENDING}{
+            unsafe{
+                REPORTED_PS2_PENDING=true;
+                serial_write(b"IndianOS: R014.2 PS/2 data pending without IRQ1\n\0".as_ptr().cast());
+            }
+        }
+        return None; // only IRQ1 may drain the keyboard data register
+    }
     let status=unsafe{inb(PS2_STATUS)};
     // Avoid accidentally consuming auxiliary PS/2 mouse packets.
     if status&1!=0&&status&0x20==0{

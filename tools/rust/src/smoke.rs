@@ -336,6 +336,10 @@ pub fn run(args:&[String])->Result<String,String>{
         }
         Some(found.ok_or("unable to connect to QEMU HMP monitor")?)
     }else{None};
+    #[cfg(unix)]
+    if let Some(ref hmp)=monitor{
+        hmp.set_nonblocking(true).map_err(|e|format!("HMP nonblocking: {e}"))?;
+    }
     #[cfg(not(unix))]
     let mut monitor:Option<std::io::Sink>={
         if monitor_path.is_some(){return Err("keyboard mode requires Unix".into());}
@@ -392,6 +396,17 @@ pub fn run(args:&[String])->Result<String,String>{
                                 hmp.write_all(format!("sendkey {name} 30\n").as_bytes())
                                     .map_err(|e|format!("QEMU HMP key: {e}"))?;
                                 thread::sleep(Duration::from_millis(55));
+                            }
+                        }
+                        if mode=="keyboard"{
+                            let hmp=monitor.as_mut().ok_or("missing HMP connection")?;
+                            let mut reply=[0u8;2048];
+                            match hmp.read(&mut reply){
+                                Ok(n) if n>0=>eprintln!("R014.2 HMP after command {sent}: {}",
+                                    String::from_utf8_lossy(&reply[..n])),
+                                Ok(_)=>{},
+                                Err(e) if e.kind()==std::io::ErrorKind::WouldBlock=>{},
+                                Err(e)=>return Err(format!("HMP monitor read failed: {e}")),
                             }
                         }
                         sent+=1;
