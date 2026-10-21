@@ -64,6 +64,34 @@ pub extern "C" fn kmain()->!{
              b"IndianOS: FATAL R014.2 framebuffer text console unavailable\n\0");
         log(b"IndianOS: R014.2 framebuffer text console ready\n\0");
     }
+    #[cfg(feature="test-ata-disk")]
+    {
+        use crate::block::{BlockDevice, BlockError, SECTOR_BYTES};
+        log(b"IndianOS: R015 ATA disk validation begin\n\0");
+        // Only enabled for an isolated QEMU guest with a disposable test disk.
+        let mut disk=unsafe{crate::ata_pio::AtaPio::probe()}.unwrap_or_else(|_|{
+            log(b"IndianOS: FATAL R015 ATA probe failed\n\0");halt()
+        });
+        need(disk.sector_count()>=16,b"IndianOS: FATAL R015 ATA capacity\n\0");
+        log(b"IndianOS: R015 ATA disk detected\n\0");
+        let mut original=[0u8;SECTOR_BYTES];
+        need(disk.read_sector(8,&mut original).is_ok(),
+             b"IndianOS: FATAL R015 ATA initial read\n\0");
+        let mut pattern=[0u8;SECTOR_BYTES];
+        for (i,byte) in pattern.iter_mut().enumerate(){
+            *byte=(i as u8).wrapping_mul(37).wrapping_add(0x5a);
+        }
+        need(disk.write_sector(8,&pattern).is_ok(),
+             b"IndianOS: FATAL R015 ATA write\n\0");
+        let mut actual=[0u8;SECTOR_BYTES];
+        need(disk.read_sector(8,&mut actual).is_ok() && actual==pattern,
+             b"IndianOS: FATAL R015 ATA readback mismatch\n\0");
+        need(disk.read_sector(disk.sector_count(),&mut actual)==Err(BlockError::OutOfRange),
+             b"IndianOS: FATAL R015 ATA bounds check\n\0");
+        need(disk.write_sector(8,&original).is_ok(),
+             b"IndianOS: FATAL R015 ATA restore\n\0");
+        log(b"IndianOS: R015 ATA disk read write restore PASSED\n\0");
+    }
     log(b"IndianOS: milestone 001 complete\n\0");
 
     need(unsafe{x86_64_exceptions_init()},

@@ -116,6 +116,14 @@ jobs:
           done
           test -n "$OVMF_PATH"
           make test-rust-interactive-qemu OVMF_CODE="$OVMF_PATH"
+      - name: R015 ATA PIO disposable QEMU disk validation
+        run: |
+          OVMF_PATH=""
+          for candidate in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/edk2/ovmf/OVMF_CODE_4M.fd /usr/share/edk2/ovmf/OVMF_CODE.fd; do
+            if test -f "$candidate"; then OVMF_PATH="$candidate"; break; fi
+          done
+          test -n "$OVMF_PATH"
+          make test-rust-ata-qemu OVMF_CODE="$OVMF_PATH"
       - name: R014.2 PS/2 IRQ and framebuffer console host tests
         run: make test-rust-keyboard-host
       - name: R014.2 physical PS/2 keyboard in QEMU

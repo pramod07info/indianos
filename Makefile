@@ -17,6 +17,7 @@ RUST_CORE ?= 1
 R013_SHELL_TEST ?= 0
 R014_INTERACTIVE_TEST ?= 0
 R014_IRQ_TEST ?= 0
+R015_ATA_TEST ?= 0
 ifeq ($(R014_IRQ_TEST),1)
 R014_INTERACTIVE_TEST := 1
 endif
@@ -106,7 +107,7 @@ RUST_FEATURES += $(if $(filter 1,$(EXCEPTION_SELFTEST)),--features test-ud2,) \
  $(if $(filter 1,$(PAGING_SWITCH_SELFTEST)),--features test-shadow,) \
  $(if $(filter 1,$(USERMODE_SELFTEST)),--features test-ring3,) \
  $(if $(filter 1,$(PROCESS_SELFTEST)),--features test-processes,) \
- $(if $(filter 1,$(SCHEDULER_SELFTEST)),--features test-scheduler,) $(if $(filter 1,$(R013_SHELL_TEST)),--features test-shell,) $(if $(filter 1,$(R014_INTERACTIVE_TEST)),--features test-interactive,) $(if $(filter 1,$(R014_IRQ_TEST)),--features test-irq-keyboard,)
+ $(if $(filter 1,$(SCHEDULER_SELFTEST)),--features test-scheduler,) $(if $(filter 1,$(R013_SHELL_TEST)),--features test-shell,) $(if $(filter 1,$(R014_INTERACTIVE_TEST)),--features test-interactive,) $(if $(filter 1,$(R014_IRQ_TEST)),--features test-irq-keyboard,) $(if $(filter 1,$(R015_ATA_TEST)),--features test-ata-disk,)
 ifeq ($(USERFAULT_SELFTEST),1)
 RUST_FEATURES += $(if $(filter guard,$(USERFAULT_KIND)),--features test-fault-guard,--features test-fault-supervisor)
 endif
@@ -893,3 +894,9 @@ test-host:
 
 clean:
 	rm -rf $(BUILD)
+
+# R015: only a disposable temporary disk; never attach a host block device.
+.PHONY: test-rust-ata-qemu
+test-rust-ata-qemu:
+	$(MAKE) image BUILD=build/r015-ata RUST_CORE=1 R015_ATA_TEST=1
+	python3 tools/test_ata_qemu.py --iso build/r015-ata/indianos.iso --qemu "$(QEMU)" --ovmf "$(OVMF_CODE)"
