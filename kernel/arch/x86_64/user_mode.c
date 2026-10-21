@@ -73,7 +73,8 @@ static bool m009_capture_frame(const uint64_t *regs, bool via_timer) {
         ((regs[17] & 0x200ull) != 0) != via_timer) return false;
     for (unsigned i = 0; i < M009_CONTEXT_WORDS; ++i)
         m009_active->frame[i] = regs[i];
-    m009_active->frame[14] = 0; /* SYS_YIELD return value on resume */
+    if (!via_timer)
+        m009_active->frame[14] = 0; /* only SYS_YIELD changes RAX to success */
     m009_active->saved = true;
     return true;
 }
