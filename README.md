@@ -7,7 +7,7 @@
 ## Initial technical decisions
 
 - **Target:** x86-64, UEFI-first; QEMU is the only supported test platform initially.
-- **Kernel:** independently developed, modular monolithic design in freestanding C11 and small amounts of x86-64 assembly.
+- **Kernel:** **Rust-first**, using a stable Rust `no_std` static library for process scheduling, fault policy, syscall metadata, ELF64 and initramfs parsing. Boot, paging and some drivers still use freestanding C11 and x86-64 assembly pending migration.
 - **Early boot:** use the open-source **Limine bootloader** and its published protocol as a temporary, well-defined handoff layer. The bootloader is *not* the kernel.
 - **Graphics:** first draw pixels to the firmware-provided framebuffer; build a user-space compositor and desktop later.
 - **Drivers:** bring up serial, framebuffer and timer first; then PCI, storage, keyboard and network devices.
@@ -35,6 +35,7 @@
 16. [Milestone 007: QEMU-verified recoverable user faults](docs/MILESTONE_007_USER_FAULTS.md)
 17. [Milestone 008: PCB lifecycle and two independent user ELF processes](docs/MILESTONE_008_PROCESSES.md)
 18. [Milestone 009: round-robin contexts and timer experiment](docs/MILESTONE_009_SCHEDULER.md)
+19. [Rust-first kernel rewrite (tracked migration)](docs/RUST_MIGRATION.md)
 
 ## Directory plan
 
@@ -241,6 +242,36 @@ and [M009 implementation](docs/MILESTONE_009_SCHEDULER.md) record the
 successful context switches. **Cooperative multitasking is verified.**
 Legacy IRQ0 **timer-driven preemption remains experimental**; ordinary boots
 still keep hardware interrupts off, and CI does not claim IRQ0 success.
+
+## Rust-first migration (partial, verified)
+
+IndianOS now links a **`no_std` Rust kernel core by default**. The verified
+Rust replacements provide the process table, round-robin scheduling, user
+fault policy, syscall ABI validation, strict static ELF64 planning and
+read-only initramfs validation. The original C versions are retained for
+rollback, but are excluded from the default freestanding ELF.
+
+Requirements: stable `rustup`, `cargo`, `x86_64-unknown-none` target,
+Clang/LLD and the existing QEMU/OVMF test dependencies.
+
+```sh
+rustup target add x86_64-unknown-none
+make test-rust-host-abi   # Rust tests + unchanged C ABI/process/image tests
+make kernel              # now Rust-backed by default
+make test-rust-processes  # real user execution against Rust-backed kernel
+make test-rust-scheduler  # real saved-context round-robin under QEMU
+make test-boot           # existing normal ISO boots in QEMU
+# Emergency reference implementation while migrating:
+make kernel BUILD=build/c-reference RUST_CORE=0
+```
+
+This is an **incremental rewrite, not yet a kernel written entirely in Rust**.
+Boot handling, physical/virtual memory management, x86 interrupt paths and
+owned development tools still contain C/assembly/Python. Only a small amount
+of architecture assembly should remain when Rust ownership is complete.
+The migration is gated by original C API compatibility and actual QEMU
+serial transcripts; see [Rust migration inventory and acceptance
+criteria](docs/RUST_MIGRATION.md).
 
 ## Safety and legal
 
