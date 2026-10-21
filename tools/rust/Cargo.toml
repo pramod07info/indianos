@@ -1,0 +1,11 @@
+[package]
+name = "indianos-tools"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "indianos-tools"
+path = "src/main.rs"
+
+[dependencies]
