@@ -14,6 +14,8 @@ mod syscall;
 mod program;
 mod initramfs;
 pub mod block;
+#[cfg(target_arch = "x86_64")]
+pub mod ata_pio;
 #[cfg(feature = "vmm")]
 mod vmm;
 #[cfg(feature = "pmm")]
