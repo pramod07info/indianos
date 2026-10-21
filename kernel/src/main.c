@@ -7,6 +7,7 @@
 #include <indianos/program.h>
 #include <indianos/syscall_abi.h>
 #include <indianos/user_image.h>
+#include <indianos/user_mode.h>
 
 __attribute__((noreturn)) static void halt_forever(void) {
     for (;;) {
@@ -104,6 +105,13 @@ __attribute__((noreturn)) void kmain(void) {
         halt_forever();
     }
     serial_write("IndianOS: initramfs /bin/init staged and released safely\n");
+#ifdef INDIANOS_TEST_RING3
+    if (!x86_64_user_demo_run(init_elf, init_elf_size)) {
+        serial_write("IndianOS: FATAL ring-3 user program experiment failed\n");
+        halt_forever();
+    }
+    serial_write("IndianOS: ring-3 user program experiment complete\n");
+#endif
 #ifdef INDIANOS_TEST_PAGEFAULT
     serial_write("IndianOS: triggering intentional page fault\n");
     __asm__ volatile ("movabs $0x00007fff00000000, %%rax; movq (%%rax), %%rax"
