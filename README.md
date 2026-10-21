@@ -153,6 +153,23 @@ make test-boot       # QEMU/OVMF required, not yet verified locally
 
 See [M005 initramfs and user-image staging](docs/MILESTONE_005_INITRAMFS.md).
 
+## Experimental user-mode infrastructure (M006, incomplete)
+
+Source now contains **opt-in** x86-64 ring-3 entry and return trampolines,
+a DPL3 software interrupt gate for `int 0x80`, and a supervisor-only
+page-table clone with temporary user PML4 attachment and tested user-buffer
+copying primitives. **Normal boots do not run user applications.**
+
+```sh
+make test-host       # host tests for page-table ownership and user buffer copying
+make test-usermode   # experimental QEMU target: currently blocked by /bin/init fixture
+```
+
+The existing `/bin/init` test ELF remains an infinite loop without syscall
+instructions. The experimental target detects this and fails fast rather than
+pretending a user program has executed. See
+[M006 user-mode implementation and outstanding verification](docs/MILESTONE_006_USERMODE.md).
+
 ## Safety and legal
 
 Never test early kernels on a primary machine or disk. Use QEMU disk images and snapshots. Do not copy proprietary Windows binaries, artwork, trademarks or source code. Third-party firmware, bootloader and toolchain components must retain their respective licenses. The IndianOS license has **not** yet been selected.
