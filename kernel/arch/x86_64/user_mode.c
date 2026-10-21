@@ -208,9 +208,26 @@ bool x86_64_user_demo_run(const uint8_t *elf, size_t size) {
     /* The x86-64 exit trampoline has already restored the original CR3.
      * Detach borrowed user children before releasing cloned kernel tables. */
     if (grafted && !paging_detach_user_half(&clone_backend, clone.root,
-                                            staged.tables.root_physical))
+                                            staged.tables.root_physical)) {
+        serial_write("IndianOS: ring-3 cleanup failed: user PML4 detach\n");
         return false; /* Do not risk a double-free if invariants are broken. */
-    if (clone.root != 0 && !paging_clone_release(&clone_backend, &clone)) return false;
-    if (!indianos_user_image_destroy(&staged)) return false;
-    return success && pmm_free_frames() == starting_free;
+    }
+    serial_write("IndianOS: ring-3 borrowed user tables detached\n");
+    if (clone.root != 0 && !paging_clone_release(&clone_backend, &clone)) {
+        serial_write("IndianOS: ring-3 cleanup failed: kernel clone release\n");
+        return false;
+    }
+    serial_write("IndianOS: ring-3 supervisor clone released\n");
+    if (!indianos_user_image_destroy(&staged)) {
+        serial_write("IndianOS: ring-3 cleanup failed: user image destroy\n");
+        return false;
+    }
+    serial_write("IndianOS: ring-3 user image released\n");
+    const uint64_t after = pmm_free_frames();
+    if (after != starting_free) {
+        serial_write("IndianOS: ring-3 cleanup failed: PMM frame count mismatch\n");
+        return false;
+    }
+    serial_write("IndianOS: ring-3 PMM frame count restored\n");
+    return success;
 }
