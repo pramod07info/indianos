@@ -119,6 +119,8 @@ jobs:
           readelf -h build/indianos.elf
           readelf -l build/indianos.elf
           readelf -h build/indianos.elf | grep -q 'Machine:.*Advanced Micro Devices X86-64'
+          # Static relocation means the Limine-loaded kernel needs no dynamic loader.
+          readelf -r build/indianos.elf | grep -q "There are no relocations"
       - name: Experimental ring-3 syscall execution (non-blocking; QEMU)
         id: ring3_test
         continue-on-error: true
@@ -473,6 +475,20 @@ jobs:
           done
           test -n "$OVMF_PATH"
           make test-usermode OVMF_CODE="$OVMF_PATH"
+      - name: Require Rust-native kernel ABI and QEMU parity
+        if: always()
+        env:
+          RUST_HOST: ${{ steps.rust_host.outcome }}
+          RUST_KERNEL: ${{ steps.rust_kernel.outcome }}
+          RUST_QEMU: ${{ steps.rust_qemu.outcome }}
+        run: |
+          if [ "$RUST_HOST" != "success" ] ||
+             [ "$RUST_KERNEL" != "success" ] ||
+             [ "$RUST_QEMU" != "success" ]; then
+            echo "::error title=IndianOS Rust migration regression::Rust host=$RUST_HOST ELF=$RUST_KERNEL QEMU=$RUST_QEMU"
+            exit 1
+          fi
+          echo "IndianOS: Rust-owned kernel core and QEMU regression gate PASSED"
       - name: Enforce M009 cooperative scheduler QEMU regression
         if: always()
         env:
