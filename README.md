@@ -267,7 +267,8 @@ make test-rust-source-audit
 make kernel
 make test-rust-host-abi
 make test-rust-default-qemu
-make test-rust-link-audit # R010 actual ELF input audit
+make test-rust-entry-abi # R011 one-archive link plus exported x86 CPU ABI
+make test-rust-link-audit # R010/R011 actual ELF input audit
 make test-rust-source-audit-negative # R010 require C rollback rejection
 make test-rust-ring3-runtime-qemu
 make test-rust-paging-cpu-qemu
@@ -279,8 +280,8 @@ make kernel BUILD=build/c-reference RUST_CORE=0
 
 **Limitations:** The repository retains C/Python test and reference sources
 for compatibility/rollback; they are not the default active kernel.
-Third-party Limine remains external. The two assembly objects are still
-required for x86-64 trap/IRETQ, and Rust `unsafe` in paging, MMIO and
+Third-party Limine remains external. The CPU trap/IRETQ assembly is embedded inside the Rust static library via
+`global_asm!`, rather than linked as separate assembler objects; and Rust `unsafe` in paging, MMIO and
 interrupt code is not automatically memory-safe. This remains an
 experimental QEMU-first OS, not a production installer, desktop, AI
 assistant, or a broadly hardware-compatible replacement for Windows/Linux/macOS.

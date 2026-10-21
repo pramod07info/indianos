@@ -39,6 +39,8 @@ mod timer;
 mod kernel_main;
 #[cfg(feature = "limine-requests")]
 mod limine_requests;
+#[cfg(all(target_arch = "x86_64", feature = "cpu-entry", not(any(test, feature = "std"))))]
+mod cpu_entry;
 
 pub const MAX_PROCESSES: usize = 4;
 pub const MAX_DISPATCHES: u32 = if cfg!(feature = "preempt") { 2048 } else { 32 };

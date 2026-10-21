@@ -217,3 +217,25 @@ retained reference C tests, or the compiler's underlying archive
 provenance. The two low-level assembly CPU transition objects remain.
 Real-hardware boot and general cross-platform application compatibility
 remain outside R010's scope.
+
+## R011 — Rust-managed x86-64 assembly CPU entries
+
+The active kernel ships the exact privileged interrupt, GDT, IRQ0,
+SYS_YIELD/EXIT and IRETQ entry routines through
+`rust/kernel_core/src/cpu_entry.rs` and two `include_str!`-backed
+`global_asm!` source files under `rust/kernel_core/src/arch/x86_64`.
+The cooperative user return frame keeps IF clear; only the `preempt`
+Cargo feature selects IF=1 (0x202). GPR save order, all 32 error-code
+exception stubs and the 14 exported ABI symbols remain unchanged.
+
+`RUST_CPU_ENTRY=1` is the default and omits the two separately compiled
+`.S` entry objects entirely. The kernel link is therefore **one Rust
+static library input** (whose members still include low-level assembly).
+The former reference `.S` files stay in `kernel/arch/x86_64/` for
+`RUST_CORE=0` or `RUST_CPU_ENTRY=0` rollback builds.
+`make test-rust-entry-abi` verifies symbol preservation and the R010
+linker provenance gate now rejects every standalone assembly object.
+Host-only `cargo test` omits privileged assembly using `cfg`.
+QEMU CI boot/exception/IRQ0/ring-3/PCB/fault tests are required before
+marking R011 complete; `global_asm!` does not imply those x86 instructions
+were rewritten into safe Rust.

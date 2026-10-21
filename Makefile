@@ -23,6 +23,8 @@ RUST_USER_IMAGE ?= $(RUST_CORE)
 RUST_PAGING ?= $(RUST_CORE)
 RUST_PAGING_CPU ?= $(RUST_CORE)
 RUST_USER_RUNTIME ?= $(RUST_CORE)
+# R011: inline x86 trap/IRET assembly now belongs to the Rust static archive.
+RUST_CPU_ENTRY ?= $(RUST_CORE)
 RUST_RUNTIME ?= $(RUST_CORE)
 RUST_BOOT_STAGING ?= $(RUST_CORE)
 RUST_BOOT ?= $(RUST_CORE)
@@ -33,6 +35,11 @@ RUST_MAIN ?= $(RUST_CORE)
 ifeq ($(RUST_MAIN),1)
 ifneq ($(RUST_CORE),1)
 $(error RUST_MAIN requires RUST_CORE=1)
+endif
+endif
+ifeq ($(RUST_CPU_ENTRY),1)
+ifneq ($(RUST_CORE),1)
+$(error RUST_CPU_ENTRY requires RUST_CORE=1)
 endif
 endif
 ifeq ($(RUST_USER_RUNTIME),1)
@@ -85,7 +92,7 @@ CARGO ?= cargo
 RUST_MANIFEST := rust/kernel_core/Cargo.toml
 RUST_SOURCE := $(wildcard rust/kernel_core/src/*.rs)
 RUST_LIB := $(BUILD)/libindianos_kernel_core.a
-RUST_FEATURES := $(if $(filter 1,$(PREEMPT_SELFTEST)),--features preempt,) $(if $(filter 1,$(RUST_VMM)),--features vmm,) $(if $(filter 1,$(RUST_PMM)),--features pmm,) $(if $(filter 1,$(RUST_USER_IMAGE)),--features user-image,) $(if $(filter 1,$(RUST_PAGING)),--features paging,) $(if $(filter 1,$(RUST_PAGING_CPU)),--features paging-cpu,) $(if $(filter 1,$(RUST_USER_RUNTIME)),--features user-runtime,) $(if $(filter 1,$(RUST_RUNTIME)),--features runtime,) $(if $(filter 1,$(RUST_BOOT_STAGING)),--features boot-staging,) $(if $(filter 1,$(RUST_BOOT)),--features boot,) $(if $(filter 1,$(RUST_BOOT_PROTOCOL)),--features limine-requests,) $(if $(filter 1,$(RUST_INTERRUPTS)),--features interrupts,) $(if $(filter 1,$(RUST_TIMER)),--features timer,) $(if $(filter 1,$(RUST_MAIN)),--features kernel-main,)
+RUST_FEATURES := $(if $(filter 1,$(PREEMPT_SELFTEST)),--features preempt,) $(if $(filter 1,$(RUST_VMM)),--features vmm,) $(if $(filter 1,$(RUST_PMM)),--features pmm,) $(if $(filter 1,$(RUST_USER_IMAGE)),--features user-image,) $(if $(filter 1,$(RUST_PAGING)),--features paging,) $(if $(filter 1,$(RUST_PAGING_CPU)),--features paging-cpu,) $(if $(filter 1,$(RUST_USER_RUNTIME)),--features user-runtime,) $(if $(filter 1,$(RUST_CPU_ENTRY)),--features cpu-entry,) $(if $(filter 1,$(RUST_RUNTIME)),--features runtime,) $(if $(filter 1,$(RUST_BOOT_STAGING)),--features boot-staging,) $(if $(filter 1,$(RUST_BOOT)),--features boot,) $(if $(filter 1,$(RUST_BOOT_PROTOCOL)),--features limine-requests,) $(if $(filter 1,$(RUST_INTERRUPTS)),--features interrupts,) $(if $(filter 1,$(RUST_TIMER)),--features timer,) $(if $(filter 1,$(RUST_MAIN)),--features kernel-main,)
 ifeq ($(RUST_MAIN),1)
 RUST_FEATURES += $(if $(filter 1,$(EXCEPTION_SELFTEST)),--features test-ud2,) \
  $(if $(filter 1,$(PAGEFAULT_SELFTEST)),--features test-pagefault,) \
@@ -139,7 +146,10 @@ ifeq ($(RUST_MAIN),1)
 SOURCES := $(filter-out kernel/src/main.c,$(SOURCES))
 endif
 OBJECTS := $(patsubst kernel/src/%.c,$(BUILD)/obj/%.o,$(SOURCES))
+# The standalone assembly objects exist only for the reference/rollback build.
+ifneq ($(RUST_CPU_ENTRY),1)
 OBJECTS += $(BUILD)/obj/interrupt_entry.o $(BUILD)/obj/user_entry.o
+endif
 ifneq ($(RUST_USER_RUNTIME),1)
 OBJECTS += $(BUILD)/obj/user_mode.o
 endif
@@ -207,13 +217,14 @@ LDFLAGS := -target x86_64-unknown-none-elf -fuse-ld=lld -nostdlib -static \
            -Wl,--gc-sections -Wl,--build-id=none -Wl,-T,kernel/linker.ld \
            -Wl,-Map,$(BUILD)/kernel-link.map
 
-.PHONY: test-rust-link-audit test-rust-source-audit-negative test-rust-source-audit test-rust-default-qemu test-rust-tools test-rust-userland-qemu test-rust-interrupts-qemu test-rust-boot-qemu test-rust-vmm-host test-rust-vmm-qemu test-rust-pmm-host test-rust-pmm-qemu test-rust-user-image-host test-rust-user-image-qemu test-rust-paging-host test-rust-paging-qemu test-rust-runtime-host test-rust-runtime-qemu test-rust-boot-staging-qemu test-rust-host-abi test-rust-processes test-rust-scheduler rust-core all kernel user-elf test-user-elf test-ring3-elf initramfs test-initramfs image run run-bios test-boot test-exception test-pagefault test-shadow test-usermode test-userfault-supervisor test-userfault-guard test-processes test-scheduler test-preempt test-host toolchain-check clean
+.PHONY: test-rust-entry-abi test-rust-link-audit test-rust-source-audit-negative test-rust-source-audit test-rust-default-qemu test-rust-tools test-rust-userland-qemu test-rust-interrupts-qemu test-rust-boot-qemu test-rust-vmm-host test-rust-vmm-qemu test-rust-pmm-host test-rust-pmm-qemu test-rust-user-image-host test-rust-user-image-qemu test-rust-paging-host test-rust-paging-qemu test-rust-runtime-host test-rust-runtime-qemu test-rust-boot-staging-qemu test-rust-host-abi test-rust-processes test-rust-scheduler rust-core all kernel user-elf test-user-elf test-ring3-elf initramfs test-initramfs image run run-bios test-boot test-exception test-pagefault test-shadow test-usermode test-userfault-supervisor test-userfault-guard test-processes test-scheduler test-preempt test-host toolchain-check clean
 all: image
 kernel: $(KERNEL_ELF)
 
 # Freestanding Rust: no_std, no allocator and no crates.io dependencies.
 # A separate Cargo output root is used per build variant. RUST_LIB is last
-# in the kernel link order, after C and CPU entry stubs that reference it.
+# in link order. On the default path this single archive also supplies CPU
+# exception, GDT, IRETQ and IRQ0 stubs via Rust-managed global_asm.
 $(RUST_LIB): $(RUST_MANIFEST) $(RUST_SOURCE) Makefile
 	@mkdir -p $(@D)
 	CARGO_TARGET_DIR=$(BUILD)/rust-target \
@@ -224,15 +235,15 @@ $(RUST_LIB): $(RUST_MANIFEST) $(RUST_SOURCE) Makefile
 
 rust-core: $(RUST_LIB)
 
-# Ensure the active default kernel is Rust-owned; two assembly entry units
-# preserve the exact hardware trap and user IRETQ ABI. Old C is reference only.
+# Ensure the default linked kernel consists entirely of Rust archive members.
+# The hardware instructions remain low-level assembly, embedded by global_asm.
+# Original .S reference objects may only be linked in explicit rollback builds.
 test-rust-source-audit:
 	@test "$(RUST_CORE)" = "1" || (echo "Rust kernel is disabled" >&2; exit 1)
-	@test "$(RUST_PAGING_CPU)" = "1" && test "$(RUST_USER_RUNTIME)" = "1" || (echo "Rust CPU/runtime migration is disabled" >&2; exit 1)
+	@test "$(RUST_PAGING_CPU)" = "1" && test "$(RUST_USER_RUNTIME)" = "1" && test "$(RUST_CPU_ENTRY)" = "1" || (echo "Rust CPU/runtime/entry migration is disabled" >&2; exit 1)
 	@test -z "$(strip $(SOURCES))" || (echo "Unexpected active kernel C: $(SOURCES)" >&2; exit 1)
-	@test "$(words $(OBJECTS))" -eq 3 || (echo "Unexpected kernel objects: $(OBJECTS)" >&2; exit 1)
-	@test -z "$(strip $(filter-out $(BUILD)/obj/interrupt_entry.o $(BUILD)/obj/user_entry.o $(RUST_LIB),$(OBJECTS)))" || (echo "Unexpected non-Rust kernel object: $(OBJECTS)" >&2; exit 1)
-	@echo "IndianOS: kernel is Rust-owned, with minimal architecture assembly."
+	@test "$(words $(OBJECTS))" -eq 1 && test "$(strip $(OBJECTS))" = "$(RUST_LIB)" || (echo "Unexpected standalone objects: $(OBJECTS)" >&2; exit 1)
+	@echo "IndianOS R011: default kernel links only the Rust static archive."
 
 # Refuse any C translation units on the Rust-default path. This negative
 # test intentionally turns on legacy flags; the child audit MUST fail.
@@ -245,12 +256,28 @@ test-rust-source-audit-negative:
 	    echo "R010 FAIL: old C runtime passed Rust source audit" >&2; exit 1; fi
 	@if $(MAKE) --no-print-directory -s test-rust-source-audit RUST_INTERRUPTS=0 >/dev/null 2>&1; then \
 	    echo "R010 FAIL: old C interrupt handler passed Rust source audit" >&2; exit 1; fi
-	@echo "IndianOS R010: negative source audit PASSED"
+	@if $(MAKE) --no-print-directory -s test-rust-source-audit RUST_CPU_ENTRY=0 >/dev/null 2>&1; then \
+	    echo "R011 FAIL: standalone assembly entry objects passed Rust audit" >&2; exit 1; fi
+	@echo "IndianOS R011: negative C/assembly source audit PASSED"
 
-# Audit final ELF link provenance, not only Make variable expansion.
+# Verify actual ELF link origin: no standalone assembly or C objects.
 test-rust-link-audit: test-rust-source-audit $(KERNEL_ELF) $(RUST_TOOLS_BIN)
-	$(RUST_TOOLS_BIN) audit-kernel $(BUILD)/kernel-link.map $(KERNEL_ELF) \
-	    $(RUST_LIB) $(BUILD)/obj/interrupt_entry.o $(BUILD)/obj/user_entry.o
+	$(RUST_TOOLS_BIN) audit-kernel $(BUILD)/kernel-link.map $(KERNEL_ELF) $(RUST_LIB)
+
+# Verify all stable CPU ABI symbols still exist in the Rust-archive-backed
+# kernel. nm is included with the binutils installed by kernel CI.
+test-rust-entry-abi: test-rust-link-audit
+	@nm -g --defined-only $(KERNEL_ELF) > $(BUILD)/kernel-symbols.txt
+	@for sym in x86_64_load_gdt x86_64_exception_stubs \
+	    x86_64_isr_0 x86_64_isr_8 x86_64_isr_14 x86_64_isr_31 \
+	    x86_64_unexpected_interrupt x86_64_enter_user x86_64_resume_user \
+	    x86_64_user_interrupt x86_64_user_exit_to_kernel \
+	    x86_64_timer_interrupt indianos_user_return_rsp indianos_user_return_cr3; do \
+	    awk -v name="$sym" '$3==name {ok=1} END {exit !ok}' \
+	        $(BUILD)/kernel-symbols.txt || \
+	        { echo "R011 missing CPU ABI symbol: $sym" >&2; exit 1; }; \
+	done
+	@echo "IndianOS R011: all exported CPU ABI symbols preserved."
 
 test-rust-host-abi:
 	@mkdir -p build/rust-tests
