@@ -5,7 +5,7 @@
 //! \`repr(C)\` ABI. All exported raw-pointer entry points are unsafe because
 //! the kernel caller must supply valid, properly aligned, exclusively
 //! accessible pointers. This module is NOT a generic userspace FFI surface.
-#![cfg_attr(not(test), no_std)]
+#![cfg_attr(not(any(test, feature = "std")), no_std)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use core::ptr;
@@ -308,7 +308,7 @@ pub extern "C" fn indianos_user_fault_eligible(
     }
 }
 
-#[cfg(not(test))]
+#[cfg(all(not(test), not(feature = "std")))]
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {
     loop { core::hint::spin_loop(); }
