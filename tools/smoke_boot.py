@@ -111,7 +111,7 @@ def assert_expected_usermode(text: str) -> None:
 
 def assert_expected_userfault(text: str, mode: str) -> None:
     """The user must fault and be reaped; ring-0 must stay alive."""
-    if mode not in ("fault-guard", "fault-supervisor", "processes"):
+    if mode not in ("fault-guard", "fault-supervisor"):
         raise ValueError("invalid fault-isolation mode")
     if "IndianOS: FATAL" in text:
         raise AssertionError("fatal kernel error instead of user fault isolation")
@@ -279,7 +279,7 @@ def main() -> int:
     parser.add_argument("--ovmf", type=Path, required=True)
     parser.add_argument("--qemu", default="qemu-system-x86_64")
     parser.add_argument("--timeout", type=float, default=25)
-    parser.add_argument("--mode", choices=("normal", "exception", "pagefault", "shadow", "usermode", "fault-guard", "fault-supervisor"), default="normal")
+    parser.add_argument("--mode", choices=("normal", "exception", "pagefault", "shadow", "usermode", "fault-guard", "fault-supervisor", "processes"), default="normal")
     args = parser.parse_args()
     try:
         output = run_smoke(args.iso, args.ovmf, args.qemu, args.timeout, args.mode)
