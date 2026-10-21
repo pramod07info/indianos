@@ -6,6 +6,7 @@
 #include <indianos/pmm.h>
 #include <indianos/user_image.h>
 #include <indianos/syscall_abi.h>
+#include <indianos/user_fault.h>
 #include <indianos/serial.h>
 #include <stdint.h>
 #include <stddef.h>
@@ -20,6 +21,32 @@ extern __attribute__((noreturn)) void x86_64_user_exit_to_kernel(uint64_t status
 
 struct direct_memory { uint64_t offset; };
 static struct indianos_user_image *current_user;
+static uint64_t last_user_fault_vector;
+static uint64_t last_user_fault_error;
+static uint64_t last_user_fault_address;
+
+/* Called by the CPU exception dispatcher. No caller may access stale user
+ * memory after this: the x86 trampoline restores kernel CR3 and original
+ * caller stack before returning from x86_64_enter_user. */
+void x86_64_user_fault_handle(uint64_t vector, uint64_t cs,
+                              uint64_t error_code, uint64_t cr2) {
+    if (!indianos_user_fault_eligible(vector, cs, error_code,
+                                      current_user != NULL)) {
+        return; /* Kernel faults must continue into terminal fault handler. */
+    }
+    last_user_fault_vector = vector;
+    last_user_fault_error = error_code;
+    last_user_fault_address = cr2;
+    if (vector == INDIANOS_USER_VECTOR_PF) {
+        serial_write("IndianOS: isolated ring-3 page fault\n");
+    } else if (vector == INDIANOS_USER_VECTOR_GP) {
+        serial_write("IndianOS: isolated ring-3 general protection fault\n");
+    } else {
+        serial_write("IndianOS: isolated ring-3 invalid opcode\n");
+    }
+    x86_64_user_exit_to_kernel(INDIANOS_USER_FAULT_EXIT_BASE + vector);
+}
+
 
 static bool physical_in_boot_map(uint64_t frame) {
     if (frame == 0 || (frame & (PAGE - 1)) || frame > UINT64_MAX - PAGE) return false;
@@ -195,14 +222,40 @@ bool x86_64_user_demo_run(const uint8_t *elf, size_t size) {
             serial_write("IndianOS: ring-3 mapping preflight rejected unsafe address space\n");
         }
         if (safe) {
+            last_user_fault_vector = 0;
+            last_user_fault_error = 0;
+            last_user_fault_address = 0;
             current_user = &staged;
             serial_write("IndianOS: entering ring-3 /bin/init (QEMU experimental)\n");
-            /* Restore CR3 on SYS_EXIT before touching/freeing borrowed roots. */
+            /* SYS_EXIT or eligible user fault restores CR3 and caller RSP.
+             * Never free borrowed page tables before that return. */
             const uint64_t status = x86_64_enter_user(
                 staged.plan.entry, staged.plan.stack_end - 16, clone.root);
             current_user = NULL;
-            success = (status == 0);
+#if defined(INDIANOS_TEST_USERFAULT_GUARD)
+            const uint64_t expected_address =
+                INDIANOS_USER_TOP - INDIANOS_USER_STACK_BYTES - INDIANOS_USER_PAGE_BYTES;
+            const bool expected_present = false;
+#elif defined(INDIANOS_TEST_USERFAULT_SUPERVISOR)
+            const uint64_t expected_address = 0xffffffff80000000ull;
+            const bool expected_present = true;
+#endif
+#if defined(INDIANOS_TEST_USERFAULT_GUARD) || defined(INDIANOS_TEST_USERFAULT_SUPERVISOR)
+            success = (status == INDIANOS_USER_FAULT_EXIT_BASE + INDIANOS_USER_VECTOR_PF) &&
+                      (last_user_fault_vector == INDIANOS_USER_VECTOR_PF) &&
+                      (last_user_fault_address == expected_address) &&
+                      ((last_user_fault_error & 0x4ull) != 0) &&
+                      (((last_user_fault_error & 0x1ull) != 0) == expected_present) &&
+                      ((last_user_fault_error & 0x8ull) == 0);
+            if (success) {
+                serial_write("IndianOS: user page fault contained; kernel resumed\n");
+            } else {
+                serial_write("IndianOS: user page fault validation failed\n");
+            }
+#else
+            success = (status == 0 && last_user_fault_vector == 0);
             if (success) serial_write("IndianOS: /bin/init exited through int 0x80\n");
+#endif
         }
     }
     /* The x86-64 exit trampoline has already restored the original CR3.
