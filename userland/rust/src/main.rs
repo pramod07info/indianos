@@ -92,6 +92,7 @@ fn interactive_shell()->!{
                     write(b"R014 shell: worker queued for after exit");
                 }
             },
+            Some(shell::Command::Version)=>write(b"R015 IndianOS Rust userland shell v0.15"),
             Some(shell::Command::Exit)=>{
                 write(b"R014 shell: exit");
                 exit(0);
@@ -125,6 +126,7 @@ pub extern "C" fn _start()->!{
                     if call(5,1,0)!=0 {exit(31);}
                     write(b"R013 shell: run /bin/worker accepted");
                 }
+                Some(shell::Command::Version) => write(b"R015 IndianOS Rust userland shell v0.15"),
                 Some(shell::Command::Exit) => {
                     write(b"R013 shell: exit");
                     exit(0);
