@@ -192,14 +192,14 @@ test-rust-tools:
 	$(CARGO) test --manifest-path $(RUST_TOOLS_MANIFEST) --offline
 	$(MAKE) test-initramfs BUILD=build/rust-tools-archive PROCESS_SELFTEST=1 RUST_TOOLS=1
 	python3 tools/build_initramfs.py \
-	    --elf build/rust-tools-archive/userland/init.elf --name /bin/init \
+	    --elf build/rust-tools-archive/userland/demo.elf --name /bin/init \
 	    --extra-elf build/rust-tools-archive/userland/worker.elf \
 	    --extra-name /bin/worker \
 	    --output build/rust-tools-archive/python-reference.img
 	cmp build/rust-tools-archive/initramfs.img build/rust-tools-archive/python-reference.img
 	$(MAKE) test-ring3-elf BUILD=build/rust-tools-elf USERMODE_SELFTEST=1
 	$(MAKE) $(RUST_TOOLS_BIN)
-	$(RUST_TOOLS_BIN) check-elf build/rust-tools-elf/userland/init.elf
+	$(RUST_TOOLS_BIN) check-elf build/rust-tools-elf/userland/demo.elf
 
 test-rust-userland-qemu:
 	$(MAKE) test-ring3-elf BUILD=build/rust-user-demo USERMODE_SELFTEST=1 RUST_USERLAND=1
