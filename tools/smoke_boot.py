@@ -111,7 +111,7 @@ def assert_expected_usermode(text: str) -> None:
 
 def assert_expected_userfault(text: str, mode: str) -> None:
     """The user must fault and be reaped; ring-0 must stay alive."""
-    if mode not in ("fault-guard", "fault-supervisor"):
+    if mode not in ("fault-guard", "fault-supervisor", "processes"):
         raise ValueError("invalid fault-isolation mode")
     if "IndianOS: FATAL" in text:
         raise AssertionError("fatal kernel error instead of user fault isolation")
@@ -136,6 +136,43 @@ def assert_expected_userfault(text: str, mode: str) -> None:
         raise AssertionError("faulting process unexpectedly exited via syscall")
 
 
+def assert_expected_processes(text: str) -> None:
+    """Two unique PIDs, two different ELF messages, reaping before reuse."""
+    if "IndianOS: FATAL" in text:
+        raise AssertionError("kernel fatal during sequential process execution")
+    expected = (
+        *MILESTONES,
+        "IndianOS: M008 sequential process launch begin",
+        "IndianOS: PID 1 READY",
+        "IndianOS: PID 1 RUNNING",
+        "IndianOS: entering ring-3 /bin/init (QEMU experimental)",
+        "IndianOS user: Namaste from IndianOS user mode!",
+        "IndianOS: PID 1 EXITED",
+        "IndianOS: ring-3 PMM frame count restored",
+        "IndianOS: PID 1 REAPED",
+        "IndianOS: PID 2 READY",
+        "IndianOS: PID 2 RUNNING",
+        "IndianOS: entering ring-3 /bin/init (QEMU experimental)",
+        "IndianOS user: IndianOS worker process 2 completed",
+        "IndianOS: PID 2 EXITED",
+        "IndianOS: ring-3 PMM frame count restored",
+        "IndianOS: PID 2 REAPED",
+        "IndianOS: M008 two independent processes exited and reaped",
+    )
+    offset = 0
+    for marker in expected:
+        position = text.find(marker, offset)
+        if position < 0:
+            raise AssertionError(f"missing or out-of-order M008 event: {marker}")
+        offset = position + len(marker)
+    if text.count("IndianOS: entering ring-3 /bin/init (QEMU experimental)") != 2:
+        raise AssertionError("M008 requires exactly two user-mode entries")
+    if text.count("IndianOS: ring-3 PMM frame count restored") != 2:
+        raise AssertionError("M008 requires physical memory reclamation after each task")
+    if "IndianOS: PID 1 FAULTED" in text or "IndianOS: PID 2 FAULTED" in text:
+        raise AssertionError("M008 successful task unexpectedly faulted")
+
+
 def matching_ovmf_vars(code: Path) -> Path | None:
     """Find the matching OVMF_VARS template without altering that template."""
     if not code.name.startswith("OVMF_CODE"):
@@ -155,7 +192,7 @@ def run_smoke(iso: Path, ovmf: Path, qemu: str, timeout: float,
     if timeout <= 0 or timeout > 180:
         raise ValueError("timeout must be between 0 and 180 seconds")
     if mode not in {"normal", "exception", "pagefault", "shadow", "usermode",
-                    "fault-guard", "fault-supervisor"}:
+                    "fault-guard", "fault-supervisor", "processes"}:
         raise ValueError("invalid smoke-test mode")
     verifiers = {
         "normal": assert_milestones,
@@ -165,6 +202,7 @@ def run_smoke(iso: Path, ovmf: Path, qemu: str, timeout: float,
         "usermode": assert_expected_usermode,
         "fault-guard": lambda log: assert_expected_userfault(log, "fault-guard"),
         "fault-supervisor": lambda log: assert_expected_userfault(log, "fault-supervisor"),
+        "processes": assert_expected_processes,
     }
     verify = verifiers[mode]
     argv = [
