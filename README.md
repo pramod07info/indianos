@@ -7,7 +7,7 @@
 ## Initial technical decisions
 
 - **Target:** x86-64, UEFI-first; QEMU is the only supported test platform initially.
-- **Kernel:** **Rust-first** `no_std` static library, with Rust-owned boot handoff, framebuffer, GDT/IDT/TSS, timer, main entry, memory management and scheduler selected by default. Some ring-3 CPU dispatcher and architecture paths still use freestanding C11/assembly. The Rust-default migration passed QEMU/OVMF CI on 2026-10-21.
+- **Kernel:** **Rust-first** `no_std` static library, with Rust-owned boot handoff, framebuffer, GDT/IDT/TSS, timer, main entry, memory management and scheduler selected by default. The active kernel now uses Rust plus two minimal x86-64 assembly entry units, with no linked C translation units. Its QEMU/OVMF regression passed on 2026-10-21.
 - **Early boot:** use the open-source **Limine bootloader** and its published protocol as a temporary, well-defined handoff layer. The bootloader is *not* the kernel.
 - **Graphics:** first draw pixels to the firmware-provided framebuffer; build a user-space compositor and desktop later.
 - **Drivers:** bring up serial, framebuffer and timer first; then PCI, storage, keyboard and network devices.
@@ -243,38 +243,47 @@ successful context switches. **Cooperative multitasking is verified.**
 Legacy IRQ0 **timer-driven preemption remains experimental**; ordinary boots
 still keep hardware interrupts off, and CI does not claim IRQ0 success.
 
-## Rust-first migration (partial, verified)
+## Rust-owned default kernel — QEMU verified (2026-10-21)
 
-IndianOS links a **`no_std` Rust kernel core by default**. Earlier Rust
-process, scheduling, fault, ELF, memory and syscall paths have QEMU evidence;
-the newer Rust boot protocol, framebuffer, descriptor tables, timer link,
-kernel entry, userland demo binaries and native host tooling are now selected
-by default and passed [integrated QEMU/OVMF run 39558378245](https://github.com/pramod07info/indianos/actions/runs/39558378245)
-on [code commit fc25814](https://github.com/pramod07info/indianos/commit/fc25814bcd42837c30eeb633c927b3f343be0267). The original C versions are retained for
-rollback, but are excluded from the default freestanding ELF.
+The current default freestanding kernel uses a `no_std` Rust static library
+for all active IndianOS kernel components. Its two remaining link-time
+assembly objects handle privileged x86-64 trap, GDT and IRETQ/register
+transitions. **No C translation unit is linked in the default kernel.**
 
-Requirements: stable `rustup`, `cargo`, `x86_64-unknown-none` target,
-Clang/LLD and the existing QEMU/OVMF test dependencies.
+QEMU/OVMF verification: [successful 95-step CI run 39561858663](https://github.com/pramod07info/indianos/actions/runs/39561858663)
+on [code commit 0fc6036](https://github.com/pramod07info/indianos/commit/0fc60361920e7e74dbb478377bc7b2a0acfac170).
+This covers real ring-3 ELF execution, two user processes, context saving,
+round-robin scheduling, CPU faults, physical-memory cleanup, and normal boot.
+
+Active Rust kernel ownership includes Limine boot protocol requests,
+framebuffer, GDT/IDT/TSS, timer, CPU paging detection, guarded CR3 cloning,
+physical/virtual memory, syscall/fault dispatcher, user-mode lifecycle,
+ELF64/initramfs, process table, scheduler, and kernel entry. Native Rust
+userland demos and Rust host-side image/ELF/QEMU tooling are default.
 
 ```sh
 rustup target add x86_64-unknown-none
-make test-rust-host-abi   # Rust tests + unchanged C ABI/process/image tests
-make kernel              # now Rust-backed by default
-make test-rust-processes  # real user execution against Rust-backed kernel
-make test-rust-scheduler  # real saved-context round-robin under QEMU
-make test-rust-default-qemu # Rust-native Limine, IDT, kmain, apps and tools
-make test-boot           # Rust-default normal ISO smoke under QEMU
-# Emergency reference implementation while migrating:
+make test-rust-source-audit
+make kernel
+make test-rust-host-abi
+make test-rust-default-qemu
+make test-rust-ring3-runtime-qemu
+make test-rust-paging-cpu-qemu
+make test-exception test-pagefault test-userfault-guard
+make test-userfault-supervisor test-processes test-scheduler
+# Reference/fallback build:
 make kernel BUILD=build/c-reference RUST_CORE=0
 ```
 
-This is an **incremental rewrite, not yet a kernel written entirely in Rust**.
-The remaining ring-3 execution machinery, some architecture-specific code and
-reference test tooling still contain C/assembly/Python. Only a small amount
-of architecture assembly should remain when Rust ownership is complete.
-The migration is gated by original C API compatibility and actual QEMU
-serial transcripts; see [Rust migration inventory and acceptance
-criteria](docs/RUST_MIGRATION.md).
+**Limitations:** The repository retains C/Python test and reference sources
+for compatibility/rollback; they are not the default active kernel.
+Third-party Limine remains external. The two assembly objects are still
+required for x86-64 trap/IRETQ, and Rust `unsafe` in paging, MMIO and
+interrupt code is not automatically memory-safe. This remains an
+experimental QEMU-first OS, not a production installer, desktop, AI
+assistant, or a broadly hardware-compatible replacement for Windows/Linux/macOS.
+
+Details: [Rust migration inventory](docs/RUST_MIGRATION.md).
 
 ## Safety and legal
 

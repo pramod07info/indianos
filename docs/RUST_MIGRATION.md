@@ -89,9 +89,9 @@ reference/fallback code and still support `RUST_CORE=0`.
 | R001–R002 | Rust PCB, scheduler, fault policy, syscall metadata, ELF64 and initramfs validation selected by default | Original C ABI and QEMU regressions |
 | R002–R003 | Rust PMM, VMM, user-image staging, guarded copy, paging policy and clone selected by default | Rust/C ABI and QEMU tests in verified CI |
 | R004 | Rust Limine handoff, framebuffer, serial, GDT/IDT/TSS, exception dispatcher, PIT driver and kmain selected by default | Normal boot, ring-3, deliberate faults and integrated QEMU passed |
-| R005 | Ring-3 machinery remains partially in `kernel/arch/x86_64/user_mode.c`; some paging internals remain in `paging.c` | Port remaining C execution and paging code; preserve process fault handling |
+| R005, R008–R009 | Rust `paging_cpu.rs` and `user_runtime.rs` now own privileged CPU paging, ring-3 syscall/fault handling, process launches, M009 scheduling and cleanup | 95-step QEMU/OVMF regression suite passed on `0fc6036` |
 | R006 | Native Rust user ELF demos and Rust archive/ELF/QEMU tools selected by default | C/Python reference tests remain; general-purpose userland/desktop apps are not yet implemented |
-| R007 | C reference paths and essential architecture assembly retained | Complete Rust-owned-source audit and safe retirement of obsolete C code |
+| R007/R010 | Default kernel links Rust and only two essential x86-64 assembly units; C and Python reference sources remain in the repository | Source audit now enforced in GitHub Actions; retain rollback code until independently proven safe to delete |
 
 Limine itself is a third-party bootloader, not IndianOS-owned code to port.
 Small architecture-specific exception, `iretq` and context-switching assembly
@@ -116,10 +116,9 @@ make test-rust-scheduler
 ```
 
 The default `make kernel` already links the verified Rust-backed modules
-and validates their behavior through CI. A complete Rust-only kernel is still
-far away; the remaining C/assembly, owned Python tools and programs must be
-replaced under the same strict QEMU test criteria before removing the
-compatibility build path.
+and validates their behavior through CI. The default kernel no longer links C translation units. Architecture-specific
+assembly remains, as do excluded C/Python reference tests and compatibility
+sources, until they can be safely retired without weakening coverage.
 
 ## R004–R006 activation — Rust-first default switch (2026-10-21)
 
@@ -167,8 +166,10 @@ Consequently, **this is not a 100% Rust-only operating system**.
 detection and the gated shadow-root switch. The default Rust kernel excludes
 `kernel/arch/x86_64/paging.c`; the reference remains available with
 `RUST_PAGING_CPU=0`. The CR3 switch is QEMU-test-only and refuses PCID.
-Acceptance: `make test-rust-paging-cpu-qemu`, full QEMU scheduler/fault parity
-and opt-in `make test-shadow`. A passing build alone is not runtime proof.
+Normal boot and ring-3 CPU paging paths passed QEMU regression on
+[run 39561858663](https://github.com/pramod07info/indianos/actions/runs/39561858663).
+The dedicated CR3 shadow-switch roundtrip remains opt-in and is not claimed
+verified by the normal regression.
 
 ## R009 — ring-3 ownership
 
@@ -177,5 +178,16 @@ translation unit in the default kernel. It owns syscall/fault dispatch, user
 PCB lifecycle, M009 cooperative scheduling, and page-table cleanup. The
 minimal `user_entry.S` trampoline remains for IRETQ/CPU register transitions.
 `RUST_USER_RUNTIME=0` retains the original C runner for comparison. Verify
-with `make test-rust-ring3-runtime-qemu`, full QEMU fault/scheduler tests,
-and a complete CI gate before treating this migration as established.
+with `make test-rust-ring3-runtime-qemu` and the full QEMU fault/scheduler
+suite. Those paths passed [CI run 39561858663](https://github.com/pramod07info/indianos/actions/runs/39561858663).
+
+## R010 — Rust-only active kernel source audit
+
+`make test-rust-source-audit` now verifies the default freestanding kernel
+build's source/object set contains no C translation units. The only native
+objects in the link are `interrupt_entry.o`, `user_entry.o`, and the Rust
+`libindianos_kernel_core.a`. The GitHub Actions workflow runs this audit
+before compiling the kernel. The active Rust port (prior to this audit gate)
+passed [CI 39561858663](https://github.com/pramod07info/indianos/actions/runs/39561858663).
+Retaining C references, host C tests, third-party Limine and essential
+assembly does not violate this narrower active-kernel source goal.
