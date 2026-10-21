@@ -48,7 +48,7 @@ extern void x86_64_load_gdt(const struct descriptor_ptr *descriptor);
 extern void (*const x86_64_exception_stubs[32])(void);
 extern void x86_64_unexpected_interrupt(void);
 extern void x86_64_user_interrupt(void);
-static uint8_t user_kernel_stack[32768] __attribute__((aligned(16)));
+static uint8_t user_kernel_stacks[INDIANOS_USER_KERNEL_STACK_COUNT][32768] __attribute__((aligned(16)));
 
 /* Four contiguous 64-bit descriptor slots plus null; the TSS occupies 2. */
 static uint64_t gdt[7] __attribute__((aligned(16))) = {
@@ -118,10 +118,16 @@ bool x86_64_exceptions_init(void) {
     return true;
 }
 
-bool x86_64_user_interrupt_stack_enable(void) {
-    if (tss.ist1 == 0) return false;
-    tss.rsp0 = (uint64_t)(uintptr_t)(user_kernel_stack + sizeof(user_kernel_stack));
+bool x86_64_user_interrupt_stack_select(unsigned int slot) {
+    if (tss.ist1 == 0 || slot >= INDIANOS_USER_KERNEL_STACK_COUNT)
+        return false;
+    tss.rsp0 = (uint64_t)(uintptr_t)(
+        user_kernel_stacks[slot] + sizeof(user_kernel_stacks[slot]));
     return tss.rsp0 != 0;
+}
+
+bool x86_64_user_interrupt_stack_enable(void) {
+    return x86_64_user_interrupt_stack_select(0);
 }
 
 bool x86_64_user_trap_mapping_addresses(
