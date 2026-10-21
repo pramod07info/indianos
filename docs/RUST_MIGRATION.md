@@ -287,3 +287,35 @@ and that both PID1 and PID2 were reaped with PMM frame counts restored.
 Legacy demo/scheduler/fault QEMU regression tests must also stay green.
 Interactive input, device drivers, job control and a general app loader
 are separate future milestones.
+
+## R014 — serial-backed interactive console and PS/2 polling groundwork
+
+R014 introduces a **real input-driven** Rust userspace shell rather than a
+predefined command script. With `R014_INTERACTIVE_TEST=1`, the kernel
+includes a bounded, nonblocking console input driver that polls COM1 UART
+(the QEMU `-serial stdio` keyboard/terminal transport) and legacy PS/2
+set-1 scan codes when available. The decoder handles simple US keyboard
+keys, shift, caps lock, Enter and Backspace, and discards unsupported
+control bytes; it does not enable keyboard IRQ1 or provide a graphical
+terminal on the framebuffer.
+
+Syscall 6 reads one sanitized byte into a checked, **writable and owned**
+user frame; no user virtual address is directly dereferenced in the
+supervisor. The ring-3 shell maintains a 64-byte command buffer, echoes
+characters and backspace via the serial console, and runs `help`, `ps`,
+`run /bin/worker`, and `exit` only when Enter is pressed. Unknown and
+oversized input is bounded. The worker request remains queued until
+the shell exits, when the existing R013 kernel launch/reap path runs PID2;
+there is not yet asynchronous process launch while the shell runs.
+
+`make test-rust-interactive-host` tests PS/2 scan decoding, invalid
+characters and writable read syscall permissions.
+`make test-rust-interactive-qemu` starts QEMU/OVMF, sends four
+independent real serial input lines (including a backspace correction)
+through the emulator's stdin, validates shell output and verifies
+that both processes exited with their PMM frames restored.
+The normal boot mode and R013 scripted shell continue to be available.
+
+This is a serial terminal and polled keyboard groundwork, not yet a
+framebuffer text console, IRQ-driven keyboard driver, USB HID stack,
+live fork/exec or PCI/storage implementation.

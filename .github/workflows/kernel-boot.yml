@@ -105,6 +105,16 @@ jobs:
           done
           test -n "$OVMF_PATH"
           make test-rust-shell-qemu OVMF_CODE="$OVMF_PATH"
+      - name: R014 console driver and writable user-buffer tests
+        run: make test-rust-interactive-host
+      - name: R014 interactive console QEMU regression
+        run: |
+          OVMF_PATH=""
+          for candidate in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/edk2/ovmf/OVMF_CODE_4M.fd /usr/share/edk2/ovmf/OVMF_CODE.fd; do
+            if test -f "$candidate"; then OVMF_PATH="$candidate"; break; fi
+          done
+          test -n "$OVMF_PATH"
+          make test-rust-interactive-qemu OVMF_CODE="$OVMF_PATH"
       - name: Rust VMM original C ABI tests (candidate)
         id: rust_vmm_host
         continue-on-error: true
