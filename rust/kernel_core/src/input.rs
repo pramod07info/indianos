@@ -136,6 +136,50 @@ fn wait_output()->Option<u8>{
     }
     None
 }
+// Reserve one supervisor-only virtual page for local-APIC MMIO. Limine's
+// HHDM need not map reserved device memory (0xFEE00000), so directly
+// dereferencing APIC_BASE + HHDM can fault. Page-table frames themselves
+// are ordinary PMM RAM and are reachable through the HHDM.
+#[cfg(feature="test-irq-keyboard")]
+unsafe fn map_local_apic(physical:u64)->Option<*mut u32>{
+    const MASK:u64=0x000f_ffff_ffff_f000;
+    const VA:u64=0xffff_fe00_0000_0000;
+    const PRESENT_WRITE:u64=0x003;
+    unsafe extern "C" {fn pmm_allocate_frame(out:*mut u64)->bool;}
+    if physical&0xfff!=0{return None;}
+    let mut offset=0u64;
+    if !unsafe{crate::boot::boot_hhdm_offset(&mut offset)}{return None;}
+    let cr3:u64;
+    unsafe{asm!("mov {}, cr3",out(reg)cr3,options(nostack,nomem,preserves_flags));}
+    let mut table=cr3&MASK;
+    // Walk PML4, PDPT, PD, creating only missing intermediate tables.
+    // VA lies in the kernel half and is inherited by user CR3 clones.
+    for shift in [39u64,30,21]{
+        let idx=((VA>>shift)&511) as usize;
+        let entry=unsafe{((table+offset) as *mut u64).add(idx)};
+        let value=unsafe{core::ptr::read_volatile(entry)};
+        if value&1!=0{
+            if value&(1<<7)!=0{return None;} // huge page: cannot descend
+            table=value&MASK;
+        }else{
+            let mut frame=0u64;
+            if !unsafe{pmm_allocate_frame(&mut frame)}||frame==0||frame&0xfff!=0{return None;}
+            let page=frame.checked_add(offset)? as *mut u64;
+            for i in 0..512{unsafe{core::ptr::write_volatile(page.add(i),0);}}
+            unsafe{core::ptr::write_volatile(entry,frame|PRESENT_WRITE);}
+            table=frame;
+        }
+    }
+    let pte=unsafe{((table+offset) as *mut u64).add(((VA>>12)&511) as usize)};
+    let old=unsafe{core::ptr::read_volatile(pte)};
+    if old&1!=0 && old&MASK!=physical{return None;}
+    // PCD + PWT for uncached device access; never user-accessible.
+    unsafe{
+        core::ptr::write_volatile(pte,physical|PRESENT_WRITE|0x18);
+        asm!("invlpg [{}]",in(reg)VA,options(nostack,preserves_flags));
+    }
+    Some(VA as *mut u32)
+}
 /// Legacy PIC/PS2 initialization is opt-in, uniprocessor and must occur
 /// after IDT 0x21 is ready, with IF masked. Other PIC IRQs stay masked.
 #[cfg(feature="test-irq-keyboard")]
@@ -153,11 +197,8 @@ pub(crate) fn enable_irq1()->bool{
         // APIC breaks firmware on some QEMU CPU profiles; configure the
         // architectural virtual-wire route instead.
         if apic_lo&(1<<11)!=0{
-            let mut hhdm=0u64;
-            if !unsafe{crate::boot::boot_hhdm_offset(&mut hhdm)}{return false;}
             let base=((apic_hi as u64)<<32)|((apic_lo as u64)&0xffff_f000);
-            let Some(virt)=base.checked_add(hhdm)else{return false;};
-            let apic=virt as *mut u32;
+            let Some(apic)=(unsafe{map_local_apic(base)})else{return false;};
             unsafe{
                 let svr=core::ptr::read_volatile(apic.add(0xf0/4));
                 core::ptr::write_volatile(apic.add(0xf0/4),svr|0x100);
