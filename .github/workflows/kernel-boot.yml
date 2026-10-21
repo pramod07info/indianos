@@ -257,6 +257,14 @@ jobs:
           with urlopen(req, timeout=20) as response:
               print(message, state, response.status)
           PY
+      - name: Capture Rust-backed kernel exception symbol map
+        if: always()
+        run: |
+          if test -f build/rust-processes/indianos.elf; then
+            nm -n build/rust-processes/indianos.elf > build/rust-kernel-symbols.log
+            objdump -d --start-address=0xffffffff80007500 --stop-address=0xffffffff8000a000 \
+              build/rust-processes/indianos.elf > build/rust-kernel-disassembly.log
+          fi
       - name: Preserve Rust compilation and QEMU transcripts
         if: always()
         uses: actions/upload-artifact@v4
@@ -267,6 +275,9 @@ jobs:
             build-rust-kernel.log
             build/rust-processes-smoke.log
             build/rust-scheduler-smoke.log
+            build/rust-kernel-symbols.log
+            build/rust-kernel-disassembly.log
+            build/rust-processes/indianos.elf
           if-no-files-found: ignore
           retention-days: 7
       - name: M009 cooperative round-robin QEMU test (experimental)
