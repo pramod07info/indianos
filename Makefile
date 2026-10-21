@@ -24,6 +24,8 @@ RUST_RUNTIME ?= 1
 RUST_BOOT_STAGING ?= 1
 RUST_BOOT ?= 0
 RUST_INTERRUPTS ?= 0
+# App fixtures can be compiled to independent native Rust ET_EXEC images.
+RUST_USERLAND ?= 0
 ifeq ($(RUST_BOOT_STAGING),1)
 ifneq ($(RUST_USER_IMAGE),1)
 $(error RUST_BOOT_STAGING=1 requires RUST_USER_IMAGE=1)
@@ -133,7 +135,7 @@ LDFLAGS := -target x86_64-unknown-none-elf -fuse-ld=lld -nostdlib -static \
            -Wl,-z,max-page-size=0x1000 -Wl,-z,noexecstack \
            -Wl,--gc-sections -Wl,--build-id=none -Wl,-T,kernel/linker.ld
 
-.PHONY: test-rust-interrupts-qemu test-rust-boot-qemu test-rust-vmm-host test-rust-vmm-qemu test-rust-pmm-host test-rust-pmm-qemu test-rust-user-image-host test-rust-user-image-qemu test-rust-paging-host test-rust-paging-qemu test-rust-runtime-host test-rust-runtime-qemu test-rust-boot-staging-qemu test-rust-host-abi test-rust-processes test-rust-scheduler rust-core all kernel user-elf test-user-elf test-ring3-elf initramfs test-initramfs image run run-bios test-boot test-exception test-pagefault test-shadow test-usermode test-userfault-supervisor test-userfault-guard test-processes test-scheduler test-preempt test-host toolchain-check clean
+.PHONY: test-rust-userland-qemu test-rust-interrupts-qemu test-rust-boot-qemu test-rust-vmm-host test-rust-vmm-qemu test-rust-pmm-host test-rust-pmm-qemu test-rust-user-image-host test-rust-user-image-qemu test-rust-paging-host test-rust-paging-qemu test-rust-runtime-host test-rust-runtime-qemu test-rust-boot-staging-qemu test-rust-host-abi test-rust-processes test-rust-scheduler rust-core all kernel user-elf test-user-elf test-ring3-elf initramfs test-initramfs image run run-bios test-boot test-exception test-pagefault test-shadow test-usermode test-userfault-supervisor test-userfault-guard test-processes test-scheduler test-preempt test-host toolchain-check clean
 all: image
 kernel: $(KERNEL_ELF)
 
@@ -181,6 +183,20 @@ test-rust-host-abi:
 	    build/rust-tests/host/release/libindianos_kernel_core.a \
 	    -o build/rust-tests/user_image_test
 	build/rust-tests/user_image_test
+
+test-rust-userland-qemu:
+	$(MAKE) test-ring3-elf BUILD=build/rust-user-demo USERMODE_SELFTEST=1 RUST_USERLAND=1
+	$(MAKE) image BUILD=build/rust-user-demo USERMODE_SELFTEST=1 RUST_USERLAND=1
+	python3 tools/smoke_boot.py --iso build/rust-user-demo/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)" --mode usermode
+	$(MAKE) test-initramfs BUILD=build/rust-user-dual PROCESS_SELFTEST=1 RUST_USERLAND=1
+	$(MAKE) image BUILD=build/rust-user-dual PROCESS_SELFTEST=1 RUST_USERLAND=1
+	python3 tools/smoke_boot.py --iso build/rust-user-dual/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)" --mode processes
+	$(MAKE) image BUILD=build/rust-user-sched SCHEDULER_SELFTEST=1 RUST_USERLAND=1
+	python3 tools/smoke_boot.py --iso build/rust-user-sched/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)" --mode scheduler
+	$(MAKE) image BUILD=build/rust-user-guard USERFAULT_SELFTEST=1 USERFAULT_KIND=guard RUST_USERLAND=1
+	python3 tools/smoke_boot.py --iso build/rust-user-guard/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)" --mode fault-guard
+	$(MAKE) image BUILD=build/rust-user-supervisor USERFAULT_SELFTEST=1 USERFAULT_KIND=supervisor RUST_USERLAND=1
+	python3 tools/smoke_boot.py --iso build/rust-user-supervisor/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)" --mode fault-supervisor
 
 test-rust-interrupts-qemu:
 	$(MAKE) image BUILD=build/rust-idt-normal RUST_INTERRUPTS=1
@@ -350,6 +366,47 @@ INITRAMFS_EXTRA_DEPS := $(WORKER_ELF)
 INITRAMFS_EXTRA_ARGS := --extra-elf $(WORKER_ELF) --extra-name /bin/worker
 endif
 
+ifeq ($(RUST_USERLAND),1)
+# Identical expected serial messages and syscall ABI; no C/assembly
+# objects are linked into the Rust native user executable.
+ifeq ($(USERFAULT_SELFTEST),1)
+RUST_INIT_FEATURE := fault-$(USERFAULT_KIND)
+else ifeq ($(PREEMPT_SELFTEST),1)
+RUST_INIT_FEATURE := preempt-a
+RUST_WORKER_FEATURE := preempt-b
+else ifeq ($(SCHEDULER_SELFTEST),1)
+RUST_INIT_FEATURE := sched-a
+RUST_WORKER_FEATURE := sched-b
+else ifeq ($(PROCESS_SELFTEST),1)
+RUST_INIT_FEATURE := demo
+RUST_WORKER_FEATURE := worker
+else ifeq ($(USERMODE_SELFTEST),1)
+RUST_INIT_FEATURE := demo
+else
+RUST_INIT_FEATURE :=
+endif
+RUST_APP_FLAGS := -C relocation-model=static -C link-arg=-T$(CURDIR)/userland/demo/linker.ld -C link-arg=--no-pie -C link-arg=-z -C link-arg=max-page-size=0x1000
+$(USER_ELF): userland/rust/src/main.rs userland/rust/Cargo.toml userland/rust/Cargo.lock userland/demo/linker.ld Makefile
+	@mkdir -p $(@D)
+	CARGO_TARGET_DIR=$(BUILD)/rust-user-init-target \
+	    RUSTFLAGS="$(RUST_APP_FLAGS)" \
+	    $(CARGO) build --manifest-path userland/rust/Cargo.toml \
+	    --target x86_64-unknown-none --release --offline --no-default-features \
+	    $(if $(RUST_INIT_FEATURE),--features $(RUST_INIT_FEATURE),)
+	cp $(BUILD)/rust-user-init-target/x86_64-unknown-none/release/indianos-user $@
+	@readelf -h $@ | grep -q 'Type:.*EXEC'
+
+$(WORKER_ELF): userland/rust/src/main.rs userland/rust/Cargo.toml userland/rust/Cargo.lock userland/demo/linker.ld Makefile
+	@mkdir -p $(@D)
+	CARGO_TARGET_DIR=$(BUILD)/rust-user-worker-target \
+	    RUSTFLAGS="$(RUST_APP_FLAGS)" \
+	    $(CARGO) build --manifest-path userland/rust/Cargo.toml \
+	    --target x86_64-unknown-none --release --offline --no-default-features \
+	    --features $(RUST_WORKER_FEATURE)
+	cp $(BUILD)/rust-user-worker-target/x86_64-unknown-none/release/indianos-user $@
+	@readelf -h $@ | grep -q 'Type:.*EXEC'
+
+else
 # The normal ISO retains the inert fixture; only test-usermode replaces it
 # with a separate app that uses the draft IndianOS software interrupt ABI.
 ifeq ($(USERFAULT_SELFTEST),1)
@@ -407,6 +464,8 @@ $(WORKER_ELF): $(WORKER_OBJ) userland/demo/linker.ld Makefile
 	    -Wl,-z,max-page-size=0x1000 -Wl,-z,noexecstack \
 	    -Wl,-T,userland/demo/linker.ld $(WORKER_OBJ) -o $@
 	@readelf -h $@ | grep -q 'Type:.*EXEC'
+
+endif # RUST_USERLAND
 
 user-elf: $(USER_ELF)
 
