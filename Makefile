@@ -192,6 +192,16 @@ test-rust-host-abi:
 	    -o build/rust-tests/user_image_test
 	build/rust-tests/user_image_test
 
+test-rust-smoke:
+	$(CARGO) test --manifest-path $(RUST_TOOLS_MANIFEST) --offline
+	$(MAKE) image BUILD=build/rust-smoke-normal
+	$(MAKE) $(RUST_TOOLS_BIN)
+	$(RUST_TOOLS_BIN) smoke --iso build/rust-smoke-normal/indianos.iso \
+	    --qemu $(QEMU) --ovmf "$(OVMF_CODE)" --mode normal
+	$(MAKE) image BUILD=build/rust-smoke-process PROCESS_SELFTEST=1
+	$(RUST_TOOLS_BIN) smoke --iso build/rust-smoke-process/indianos.iso \
+	    --qemu $(QEMU) --ovmf "$(OVMF_CODE)" --mode processes
+
 test-rust-tools:
 	$(CARGO) test --manifest-path $(RUST_TOOLS_MANIFEST) --offline
 	$(MAKE) test-initramfs BUILD=build/rust-tools-archive PROCESS_SELFTEST=1 RUST_TOOLS=1
