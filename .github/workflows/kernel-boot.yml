@@ -145,7 +145,7 @@ jobs:
           with urlopen(req, timeout=20) as result:
               print(f"Published ring-3 commit status: {state} (HTTP {result.status})")
           PY
-      - name: M008 sequential process execution (experimental QEMU)
+      - name: M008 sequential process execution (required QEMU)
         id: process_test
         continue-on-error: true
         run: |
@@ -292,6 +292,16 @@ jobs:
           done
           test -n "$OVMF_PATH"
           make test-usermode OVMF_CODE="$OVMF_PATH"
+      - name: Enforce M008 sequential processes QEMU regression
+        if: always()
+        env:
+          PROCESS_OUTCOME: ${{ steps.process_test.outcome }}
+        run: |
+          if [ "$PROCESS_OUTCOME" != "success" ]; then
+            echo "::error title=IndianOS M008 process regression::Expected two successful user processes, got: $PROCESS_OUTCOME"
+            exit 1
+          fi
+          echo "IndianOS: two-process QEMU regression gate PASSED"
       - name: Enforce ring-3 user fault isolation regression
         if: always()
         env:
