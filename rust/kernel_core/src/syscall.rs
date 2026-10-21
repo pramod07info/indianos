@@ -89,6 +89,29 @@ pub unsafe extern "C" fn indianos_syscall_validate(
     }
 }
 
+/// Validate the CPU-generated ring-3 IRET frame before honoring syscalls or
+/// saving user context. 15 saved GPRs are followed by RIP, CS, RFLAGS, RSP, SS.
+/// This is a numeric policy check: it never dereferences user addresses.
+pub(crate) fn ring3_frame_valid(
+    frame: &[u64; 20], plan: &ProgramPlan, irq_enabled: bool,
+) -> bool {
+    const FIXED: u64 = 1 << 1;
+    const IF: u64 = 1 << 9;
+    const IOPL: u64 = 3 << 12;
+    const NT: u64 = 1 << 14;
+    const VM: u64 = 1 << 17;
+    let (rip, cs, flags, rsp, ss) =
+        (frame[15], frame[16], frame[17], frame[18], frame[19]);
+    cs == 0x2b && ss == 0x33 &&
+        flags & FIXED != 0 &&
+        flags & (IOPL | NT | VM) == 0 &&
+        (flags & IF != 0) == irq_enabled &&
+        (USER_MIN..USER_TOP).contains(&rip) &&
+        plan.stack_begin >= USER_MIN && plan.stack_end <= USER_TOP &&
+        plan.stack_begin < plan.stack_end &&
+        rsp >= plan.stack_begin && rsp <= plan.stack_end
+}
+
 #[no_mangle]
 pub extern "C" fn indianos_syscall_self_test() -> bool {
     let plan = ProgramPlan {
@@ -145,5 +168,40 @@ mod tests {
         assert!(!check(SyscallRequest { number: 1, arg0: u64::MAX - 1, arg1: 64 }));
         assert!(!check(SyscallRequest { number: 1, arg0: USER_MIN + PAGE_BYTES - 1, arg1: 2 }));
         assert!(!check(SyscallRequest { number: 3, arg0: 1, arg1: 0 }));
+    }
+
+    #[test]
+    fn trap_frame_blocks_supervisor_selectors_and_guard_stack() {
+        let plan = ProgramPlan {
+            entry: USER_MIN, stack_begin: USER_TOP - STACK_BYTES,
+            stack_end: USER_TOP, guard_begin: USER_TOP - STACK_BYTES - PAGE_BYTES,
+            segment_count: 0, segments: [ProgramSegment::empty(); MAX_SEGMENTS],
+        };
+        let mut regs = [0u64; 20];
+        regs[15] = USER_MIN;
+        regs[16] = 0x2b;
+        regs[17] = 0x02;
+        regs[18] = plan.stack_end - 16;
+        regs[19] = 0x33;
+        assert!(ring3_frame_valid(&regs, &plan, false));
+        regs[16] = 0x08;
+        assert!(!ring3_frame_valid(&regs, &plan, false));
+        regs[16] = 0x2b;
+        regs[19] = 0x10;
+        assert!(!ring3_frame_valid(&regs, &plan, false));
+        regs[19] = 0x33;
+        regs[18] = plan.guard_begin;
+        assert!(!ring3_frame_valid(&regs, &plan, false));
+        regs[18] = plan.stack_end - 16;
+        regs[17] |= 3<<12;
+        assert!(!ring3_frame_valid(&regs, &plan, false));
+        regs[17] = 0x202;
+        assert!(!ring3_frame_valid(&regs, &plan, false));
+        assert!(ring3_frame_valid(&regs, &plan, true));
+        regs[15] = 0xffff_ffff_8000_0000;
+        assert!(!ring3_frame_valid(&regs, &plan, true));
+        regs[15] = USER_MIN;
+        regs[17] &= !2;
+        assert!(!ring3_frame_valid(&regs, &plan, true));
     }
 }
