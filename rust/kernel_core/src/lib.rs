@@ -29,6 +29,8 @@ mod boot_staging;
 mod boot;
 #[cfg(feature = "interrupts")]
 mod interrupts;
+#[cfg(feature = "timer")]
+mod timer;
 
 pub const MAX_PROCESSES: usize = 4;
 pub const MAX_DISPATCHES: u32 = if cfg!(feature = "preempt") { 2048 } else { 32 };
