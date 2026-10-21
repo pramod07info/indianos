@@ -2,7 +2,7 @@
 
 **IndianOS** is an experimental, independent desktop operating system for x86-64 PCs, designed for approachable everyday use in India. The goal is a familiar desktop workflow, Indian-language accessibility, and a native kernel—not a Linux distribution or a copy of Microsoft Windows.
 
-> **Status (2026-10-21): M008 two native processes verified in QEMU.** IndianOS independently boots under QEMU/OVMF, executes two distinct ring-3 ELF64 programs sequentially through its own `int 0x80` interface, tracks PID/state transitions and reclaims each process's memory. Previous supervisor/guard fault-containment tests also pass. This is **not** a preemptive scheduler, production OS, security-audited sandbox or real-PC installer. Do not flash it to physical storage.
+> **Status (2026-10-21): M009 cooperative round-robin multitasking verified in QEMU.** IndianOS independently boots under QEMU/OVMF, executes two distinct ring-3 ELF64 programs sequentially through its own `int 0x80` interface, tracks PID/state transitions and reclaims each process's memory. Previous supervisor/guard fault-containment tests also pass. This is **not** a preemptive scheduler, production OS, security-audited sandbox or real-PC installer. Do not flash it to physical storage.
 
 ## Initial technical decisions
 
@@ -34,6 +34,7 @@
 15. [Performance and portability targets](docs/PERFORMANCE_GOALS.md)
 16. [Milestone 007: QEMU-verified recoverable user faults](docs/MILESTONE_007_USER_FAULTS.md)
 17. [Milestone 008: PCB lifecycle and two independent user ELF processes](docs/MILESTONE_008_PROCESSES.md)
+18. [Milestone 009: round-robin contexts and timer experiment](docs/MILESTONE_009_SCHEDULER.md)
 
 ## Directory plan
 
@@ -220,6 +221,26 @@ and [M008 technical notes](docs/MILESTONE_008_PROCESSES.md) document the
 success trace. The normal ISO still does not automatically run user programs;
 the dual-process execution is an explicit QEMU-only test variant.
 **This is sequential launching, not multitasking or CPU scheduling.**
+
+## M009 — Cooperative round-robin multitasking verified in QEMU
+
+Two independently mapped ring-3 applications now **alternate execution** in
+IndianOS. Each has a distinct CR3 root, process control block, privileged
+kernel interrupt stack, saved GPR/IRET frame and syscall-yield return state.
+The test interleaves `A1, B1, A2, B2, A3, B3` with frame ownership retained
+between yields and fully reclaimed after the final exit.
+
+```sh
+make test-host        # process/scheduler policy and invalid-transition tests
+make test-scheduler   # verified CPU-context preservation across real yields
+make test-preempt     # separate PIC/PIT hardware IRQ experiment, NOT verified
+```
+
+[QEMU evidence](https://github.com/pramod07info/indianos/actions/runs/39537052726)
+and [M009 implementation](docs/MILESTONE_009_SCHEDULER.md) record the
+successful context switches. **Cooperative multitasking is verified.**
+Legacy IRQ0 **timer-driven preemption remains experimental**; ordinary boots
+still keep hardware interrupts off, and CI does not claim IRQ0 success.
 
 ## Safety and legal
 
