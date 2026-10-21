@@ -69,7 +69,7 @@ fn walk(bytes: &[u8], wanted: Option<&[u8]>) -> Option<Option<Ramfile>> {
     let mut seen = [(0usize, 0usize); MAX_FILES];
     let mut cursor = HEADER;
     let mut found: Option<Ramfile> = None;
-    for (index, slot) in seen.iter_mut().take(count).enumerate() {
+    for index in 0..count {
         let header = bytes.get(cursor..cursor.checked_add(ENTRY_HEADER)?)?;
         let name_len = le16(header, 0)? as usize;
         let flags = le16(header, 2)?;
@@ -84,7 +84,7 @@ fn walk(bytes: &[u8], wanted: Option<&[u8]>) -> Option<Option<Ramfile>> {
                 return None; // full archive is invalid, not merely this entry
             }
         }
-        *slot = (cursor, name_len);
+        seen[index] = (cursor, name_len);
         cursor += name_len;
         let start = cursor;
         cursor = cursor.checked_add(content_len as usize)?;
@@ -185,7 +185,7 @@ mod tests {
         assert!(walk(&extra, None).is_none());
         let duplicate = make_archive(&[(b"/bin/init", b"first"), (b"/bin/init", b"second")]);
         assert!(walk(&duplicate, None).is_none());
-        for bad in [b"/bin/../oops".as_slice(), b"/bin//init", b"/", b"/bin/./init", b"/bin/space here"] {
+        for bad in [&b"/bin/../oops"[..], &b"/bin//init"[..], &b"/"[..], &b"/bin/./init"[..], &b"/bin/space here"[..]] {
             assert!(walk(&make_archive(&[(bad, b"x")]), None).is_none());
         }
         assert!(walk(&valid, Some(b"../../secret")).is_none());
