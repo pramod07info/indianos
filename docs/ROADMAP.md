@@ -130,3 +130,13 @@ This still does not provide process scheduling, SMP, third-party application com
 - **Not implemented:** concurrent processes, preemptive timer, scheduler queue, independent simultaneous process CR3 roots, IPC, parent-child process APIs or physical-hardware security.
 
 Next bounded work: interrupt-safe trap frames and per-process kernel stacks followed by a timer/round-robin scheduler with deterministic QEMU fairness and per-process fault containment tests.
+
+## M009 — Live round-robin ring-3 user contexts (2026-10-21)
+
+- **Verified cooperative scheduling:** two distinct freestanding ELF programs are mapped simultaneously into independent PMM-backed user CR3 roots. A new bounded round-robin scheduler alternates execution across two privileged TSS.RSP0 syscall stacks using a saved CPU register/IRET context and `SYS_YIELD (3)` to resume where each task stopped.
+- The QEMU execution trace proves `A1 → B1 → A2 → B2 → A3 → B3`; each PID has three DISPATCHED events and two YIELDED events, both exit, and the PMM/PCB root ownership is reclaimed. [Passing CI run](https://github.com/pramod07info/indianos/actions/runs/39537052726), status `indianos/scheduler-qemu = success`. A required regression gate protects this working mode.
+- **Still experimental:** hardware PIT/PIC IRQ0 preemption is implemented in an isolated `PREEMPT_SELFTEST=1` variant with CPU-bound applications, but zero timer IRQs were observed in early QEMU runs. A legacy-PC/IMCR/HPET routing fix is being tested. Do not claim preemptive scheduling until the separate `indianos/preempt-qemu` status passes.
+- The regular kernel still does not start user tasks or enable hardware interrupts by default. This remains single-CPU, research-only, without a production-grade scheduler, SMP, IPC or full system-call security.
+- **Next milestone after hardware timer validation:** per-task guarded privileged stacks, robust asynchronous IRQ paths, safe preemption recovery after user faults, timer fairness under CPU-bound workloads, and a minimal user-to-user IPC mechanism.
+
+See [M009 implementation, QEMU evidence, and limitations](MILESTONE_009_SCHEDULER.md).
