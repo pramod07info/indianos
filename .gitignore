@@ -21,3 +21,9 @@ dist/
 .cache/
 .deps/
 vendor/
+
+# Rust build and editor output (cargo-generated, not kernel sources)
+target/
+**/target/
+*.rlib
+*.rmeta
