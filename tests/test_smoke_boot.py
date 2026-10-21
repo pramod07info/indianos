@@ -5,7 +5,8 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 from smoke_boot import (assert_milestones, assert_expected_exception,
-                        assert_expected_pagefault, assert_expected_shadow, MILESTONES)  # noqa: E402
+                        assert_expected_pagefault, assert_expected_shadow,
+                        assert_expected_usermode, MILESTONES)  # noqa: E402
 
 
 class SmokeBootTests(unittest.TestCase):
@@ -53,6 +54,21 @@ class SmokeBootTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             assert_milestones("\n".join([*MILESTONES[:-1],
                 "IndianOS: FATAL detached user-image staging failed"]))
+
+    def test_usermode_transcript_must_show_syscall_and_exit(self):
+        output = "\n".join([*MILESTONES,
+            "IndianOS: entering ring-3 /bin/init (QEMU experimental)",
+            "IndianOS user: Namaste from IndianOS user mode!",
+            "IndianOS: /bin/init exited through int 0x80",
+            "IndianOS: ring-3 user program experiment complete"])
+        assert_expected_usermode(output)
+
+    def test_usermode_rejects_missing_exit(self):
+        output = "\n".join([*MILESTONES,
+            "IndianOS: entering ring-3 /bin/init (QEMU experimental)",
+            "IndianOS user: Namaste from IndianOS user mode!"])
+        with self.assertRaises(AssertionError):
+            assert_expected_usermode(output)
 
     def test_rejects_out_of_order(self):
         with self.assertRaises(AssertionError):
