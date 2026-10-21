@@ -110,3 +110,13 @@ See [M005 initramfs implementation](MILESTONE_005_INITRAMFS.md).
 - **Next:** reject attempted ring-3 accesses to supervisor memory and stack guard, recover safely from user exceptions, then add process lifecycle/scheduling. See [verification details](RING3_VERIFIED.md).
 
 See [M006 implementation](MILESTONE_006_USERMODE.md).
+
+## M007 — Recoverable user-origin exceptions (verified 2026-10-21)
+
+- Ring-3-origin #PF, #GP and #UD from the active user code selector can be isolated; kernel-origin faults, double faults and reserved-bit page faults remain fatal. The user fault path saves vector/error/CR2, restores the original kernel CR3/RSP through the existing trampoline and reclaims borrowed page tables and physical pages.
+- Two separate malicious user ELF fixtures were **verified in QEMU/OVMF**: one tried reading supervisor-only kernel text and one accessed the unmapped stack guard. Both faulted in CPL3 with the expected CR2 and page-fault error bits, and both returned to a functioning kernel with the PMM frame count restored.
+- Evidence: [CI run 39531137405](https://github.com/pramod07info/indianos/actions/runs/39531137405), `indianos/userfault-qemu = success`; the existing ring-3 greeting and kernel fatal-fault tests also passed.
+- A mandatory GitHub Actions gate now rejects user fault isolation regressions. See [M007 implementation](MILESTONE_007_USER_FAULTS.md).
+- **Next:** add a bounded process state machine and process IDs, validate sequential launch/release of two independently mapped user images, then add timer-driven scheduling and a trap-safe kernel stack policy.
+
+This still does not provide process scheduling, SMP, third-party application compatibility, recoverable kernel faults or a production-grade sandbox.
