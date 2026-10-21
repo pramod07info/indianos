@@ -109,6 +109,33 @@ def assert_expected_usermode(text: str) -> None:
         offset = position + len(marker)
 
 
+def assert_expected_userfault(text: str, mode: str) -> None:
+    """The user must fault and be reaped; ring-0 must stay alive."""
+    if mode not in ("fault-guard", "fault-supervisor"):
+        raise ValueError("invalid fault-isolation mode")
+    if "IndianOS: FATAL" in text:
+        raise AssertionError("fatal kernel error instead of user fault isolation")
+    expected = (
+        *MILESTONES,
+        "IndianOS: entering ring-3 /bin/init (QEMU experimental)",
+        "IndianOS: isolated ring-3 page fault",
+        "IndianOS: user page fault contained; kernel resumed",
+        "IndianOS: ring-3 borrowed user tables detached",
+        "IndianOS: ring-3 supervisor clone released",
+        "IndianOS: ring-3 user image released",
+        "IndianOS: ring-3 PMM frame count restored",
+        "IndianOS: user fault isolation experiment complete",
+    )
+    offset = 0
+    for marker in expected:
+        position = text.find(marker, offset)
+        if position < 0:
+            raise AssertionError(f"missing or out-of-order {mode} marker: {marker}")
+        offset = position + len(marker)
+    if "IndianOS: /bin/init exited through int 0x80" in text:
+        raise AssertionError("faulting process unexpectedly exited via syscall")
+
+
 def matching_ovmf_vars(code: Path) -> Path | None:
     """Find the matching OVMF_VARS template without altering that template."""
     if not code.name.startswith("OVMF_CODE"):
@@ -127,7 +154,8 @@ def run_smoke(iso: Path, ovmf: Path, qemu: str, timeout: float,
         raise ValueError(f"OVMF firmware missing: {ovmf} (install ovmf or set OVMF_CODE)")
     if timeout <= 0 or timeout > 180:
         raise ValueError("timeout must be between 0 and 180 seconds")
-    if mode not in {"normal", "exception", "pagefault", "shadow", "usermode"}:
+    if mode not in {"normal", "exception", "pagefault", "shadow", "usermode",
+                    "fault-guard", "fault-supervisor"}:
         raise ValueError("invalid smoke-test mode")
     verifiers = {
         "normal": assert_milestones,
@@ -135,6 +163,8 @@ def run_smoke(iso: Path, ovmf: Path, qemu: str, timeout: float,
         "pagefault": assert_expected_pagefault,
         "shadow": assert_expected_shadow,
         "usermode": assert_expected_usermode,
+        "fault-guard": lambda log: assert_expected_userfault(log, "fault-guard"),
+        "fault-supervisor": lambda log: assert_expected_userfault(log, "fault-supervisor"),
     }
     verify = verifiers[mode]
     argv = [
@@ -211,7 +241,7 @@ def main() -> int:
     parser.add_argument("--ovmf", type=Path, required=True)
     parser.add_argument("--qemu", default="qemu-system-x86_64")
     parser.add_argument("--timeout", type=float, default=25)
-    parser.add_argument("--mode", choices=("normal", "exception", "pagefault", "shadow", "usermode"), default="normal")
+    parser.add_argument("--mode", choices=("normal", "exception", "pagefault", "shadow", "usermode", "fault-guard", "fault-supervisor"), default="normal")
     args = parser.parse_args()
     try:
         output = run_smoke(args.iso, args.ovmf, args.qemu, args.timeout, args.mode)
