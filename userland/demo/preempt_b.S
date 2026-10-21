@@ -11,7 +11,7 @@ _start:
     int $0x80
     cmpq $started_end-started, %rax
     jne failed
-    movq $12000000, %rcx
+    movq $400000000, %rcx
 spin:
     decq %rcx
     jnz spin
