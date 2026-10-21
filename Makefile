@@ -10,8 +10,9 @@ QEMU ?= qemu-system-x86_64
 OVMF_CODE ?= $(firstword $(wildcard /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/edk2/ovmf/OVMF_CODE.fd))
 
 BUILD := build
-# Rust migration is explicitly opt-in until QEMU/ABI regression verifies it.
-RUST_CORE ?= 0
+# Rust-native process/scheduler/fault policy is the verified default.
+# RUST_CORE=0 retains the original C implementation as an emergency fallback.
+RUST_CORE ?= 1
 CARGO ?= cargo
 RUST_MANIFEST := rust/kernel_core/Cargo.toml
 RUST_SOURCE := rust/kernel_core/src/lib.rs
