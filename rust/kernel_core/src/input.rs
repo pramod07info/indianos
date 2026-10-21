@@ -51,7 +51,10 @@ pub(crate) struct ScanDecoder{shift_left:bool,shift_right:bool,caps:bool,extende
 impl ScanDecoder{
     pub(crate) fn feed(&mut self, code:u8)->Option<u8>{
         if code==0xe0||code==0xe1{self.extended=true;return None;}
-        if self.extended{self.extended=false;return None;}
+        if self.extended{
+            self.extended=false;
+            return match code{0x48=>Some(0x10),0x50=>Some(0x0e),_=>None};
+        }
         let up=code&0x80!=0;
         let key=(code&0x7f) as usize;
         match key{
@@ -75,6 +78,7 @@ pub(crate) fn filter(b:u8)->Option<u8>{
     match b {
         b'\r'|b'\n'=>Some(b'\n'),
         8|127=>Some(8),
+        0x10|0x0e=>Some(b), // R015 history navigation
         32..=126=>Some(b),
         _=>None,
     }
@@ -373,7 +377,9 @@ mod tests{
         assert_eq!(filter(b'/'),Some(b'/'));
         let mut keys=ScanDecoder::default();
         assert_eq!(keys.feed(0xe0),None);
-        assert_eq!(keys.feed(0x48),None);
+        assert_eq!(keys.feed(0x48),Some(0x10));
+        assert_eq!(keys.feed(0xe0),None);
+        assert_eq!(keys.feed(0x50),Some(0x0e));
         assert_eq!(keys.feed(0x1c),Some(b'\n'));
         assert_eq!(keys.feed(0x0e),Some(8));
     }

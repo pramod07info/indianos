@@ -54,6 +54,10 @@ fn spin_cpu_bound(){
 
 
 #[cfg(feature="interactive")]
+static mut LAST_COMMAND:[u8;64]=[0;64];
+#[cfg(feature="interactive")]
+static mut LAST_LEN:usize=0;
+#[cfg(feature="interactive")]
 fn read_line(buffer:&mut [u8;64])->usize{
     let mut used=0usize;
     loop{
@@ -63,6 +67,15 @@ fn read_line(buffer:&mut [u8;64])->usize{
         if count!=1 {exit(40);}
         match byte[0] {
             b'\n'=>return used,
+            0x10=>{
+                // Recall the last complete command into the bounded buffer.
+                let len=unsafe{LAST_LEN};
+                if len<=buffer.len(){
+                    buffer[..len].copy_from_slice(unsafe{&LAST_COMMAND[..len]});
+                    used=len;
+                }
+            },
+            0x0e=>{buffer.fill(0);used=0;},
             8=>{used=used.saturating_sub(1);},
             32..=126=> {
                 if used<buffer.len(){buffer[used]=byte[0];used+=1;}
@@ -78,6 +91,12 @@ fn interactive_shell()->!{
         write(b"indianos> ");
         let mut line=[0u8;64];
         let count=read_line(&mut line);
+        if count>0{
+            unsafe{
+                LAST_COMMAND[..count].copy_from_slice(&line[..count]);
+                LAST_LEN=count;
+            }
+        }
         match shell::parse(&line[..count]){
             Some(shell::Command::Help)=>
                 write(b"R014 shell: commands help ps run /bin/worker exit"),
@@ -93,6 +112,9 @@ fn interactive_shell()->!{
                 }
             },
             Some(shell::Command::Version)=>write(b"R015 IndianOS Rust userland shell v0.15"),
+            Some(shell::Command::History)=>{
+                write(b"R015 shell: history (one-entry recall with Up arrow)");
+            },
             Some(shell::Command::Exit)=>{
                 write(b"R014 shell: exit");
                 exit(0);
@@ -127,6 +149,7 @@ pub extern "C" fn _start()->!{
                     write(b"R013 shell: run /bin/worker accepted");
                 }
                 Some(shell::Command::Version) => write(b"R015 IndianOS Rust userland shell v0.15"),
+                Some(shell::Command::History) => write(b"R015 shell: history"),
                 Some(shell::Command::Exit) => {
                     write(b"R013 shell: exit");
                     exit(0);

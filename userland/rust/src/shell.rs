@@ -2,7 +2,7 @@
 //! The command language is intentionally bounded: no pipelines, quoting,
 //! filesystem traversal or arbitrary executable loading.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum Command { Help, Ps, RunWorker, Version, Exit }
+pub enum Command { Help, Ps, RunWorker, Version, History, Exit }
 
 pub const BOOT_SCRIPT: &[&[u8]] = &[
     b"help", b"ps", b"run /bin/worker", b"exit",
@@ -19,6 +19,7 @@ pub fn parse(input:&[u8])->Option<Command>{
         b"help"=>Some(Command::Help),
         b"ps"=>Some(Command::Ps),
         b"version"=>Some(Command::Version),
+        b"history"=>Some(Command::History),
         b"exit"=>Some(Command::Exit),
         _=>{
             // Permit bounded whitespace between the two tokens, but no
