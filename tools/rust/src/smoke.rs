@@ -5,13 +5,15 @@
 use std::{
     fs,
     io::{Read,Write},
-    #[cfg(unix)] os::unix::net::UnixStream,
     path::{Path,PathBuf},
     process::{Command,Stdio},
     sync::mpsc,
     thread,
     time::{Duration,Instant,SystemTime,UNIX_EPOCH},
 };
+
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
 
 const MILESTONES:[&str;15]=[
     "IndianOS: kernel entered",
