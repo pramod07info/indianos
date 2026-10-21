@@ -237,6 +237,8 @@ test-rust-tools:
 	$(RUST_TOOLS_BIN) check-elf build/ring3/userland/demo.elf
 
 test-rust-userland-qemu:
+	$(MAKE) image BUILD=build/rust-user-inert RUST_USERLAND=1
+	python3 tools/smoke_boot.py --iso build/rust-user-inert/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)" --mode normal
 	$(MAKE) test-ring3-elf BUILD=build/rust-user-demo USERMODE_SELFTEST=1 RUST_USERLAND=1
 	$(MAKE) image BUILD=build/rust-user-demo USERMODE_SELFTEST=1 RUST_USERLAND=1
 	python3 tools/smoke_boot.py --iso build/rust-user-demo/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)" --mode usermode
