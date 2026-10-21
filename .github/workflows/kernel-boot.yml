@@ -142,7 +142,7 @@ jobs:
           with urlopen(req, timeout=20) as result:
               print(f"Published ring-3 commit status: {state} (HTTP {result.status})")
           PY
-      - name: QEMU user fault isolation (experimental until validated)
+      - name: QEMU user fault isolation (guard + supervisor)
         id: userfault_test
         continue-on-error: true
         run: |
@@ -244,6 +244,16 @@ jobs:
           done
           test -n "$OVMF_PATH"
           make test-usermode OVMF_CODE="$OVMF_PATH"
+      - name: Enforce ring-3 user fault isolation regression
+        if: always()
+        env:
+          USERFAULT_OUTCOME: ${{ steps.userfault_test.outcome }}
+        run: |
+          if [ "$USERFAULT_OUTCOME" != "success" ]; then
+            echo "::error title=IndianOS user fault isolation::QEMU guard/supervisor tests failed or were skipped: $USERFAULT_OUTCOME"
+            exit 1
+          fi
+          echo "IndianOS: user fault isolation QEMU regression gate PASSED"
       - name: Enforce first native user program QEMU regression
         if: always()
         env:
