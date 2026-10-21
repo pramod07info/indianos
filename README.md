@@ -153,22 +153,25 @@ make test-boot       # QEMU/OVMF required, not yet verified locally
 
 See [M005 initramfs and user-image staging](docs/MILESTONE_005_INITRAMFS.md).
 
-## Experimental user-mode infrastructure (M006, incomplete)
+## Experimental user-mode infrastructure (M006, unverified)
 
-Source now contains **opt-in** x86-64 ring-3 entry and return trampolines,
-a DPL3 software interrupt gate for `int 0x80`, and a supervisor-only
-page-table clone with temporary user PML4 attachment and tested user-buffer
-copying primitives. **Normal boots do not run user applications.**
+The opt-in x86-64 ring-3 experiment now includes privilege-level selectors,
+a DPL3 software-interrupt gate, a supervisor-only page-table clone, checked
+user-buffer copying, and an assembly `/bin/init` that requests `WRITE` and
+`EXIT` through the IndianOS syscall ABI.
 
 ```sh
-make test-host       # host tests for page-table ownership and user buffer copying
-make test-usermode   # experimental QEMU target: currently blocked by /bin/init fixture
+make test-host       # user memory isolation and host-side unit tests
+make test-ring3-elf  # build and validate the syscall-enabled freestanding ELF
+make test-usermode   # opt-in QEMU/OVMF execution, NOT yet confirmed working
 ```
 
-The existing `/bin/init` test ELF remains an infinite loop without syscall
-instructions. The experimental target detects this and fails fast rather than
-pretending a user program has executed. See
-[M006 user-mode implementation and outstanding verification](docs/MILESTONE_006_USERMODE.md).
+Normal boots still use the inert `userland/demo/entry.c`. Only
+`USERMODE_SELFTEST=1` selects `userland/demo/ring3_entry.S`.
+The experimental ELF compiles and contains the expected syscall instructions,
+but **successful ring-3 execution, output and return have not yet been observed
+in a complete QEMU/OVMF boot**. See
+[M006 user-mode implementation and verification](docs/MILESTONE_006_USERMODE.md).
 
 ## Safety and legal
 
