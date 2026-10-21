@@ -16,11 +16,17 @@ RUST_CORE ?= 1
 # Opt in to the Rust VMM while QEMU parity is being established.
 RUST_VMM ?= 0
 RUST_PMM ?= 0
+RUST_USER_IMAGE ?= 0
+ifeq ($(RUST_USER_IMAGE),1)
+ifneq ($(RUST_VMM),1)
+$(error RUST_USER_IMAGE=1 requires RUST_VMM=1)
+endif
+endif
 CARGO ?= cargo
 RUST_MANIFEST := rust/kernel_core/Cargo.toml
 RUST_SOURCE := $(wildcard rust/kernel_core/src/*.rs)
 RUST_LIB := $(BUILD)/libindianos_kernel_core.a
-RUST_FEATURES := $(if $(filter 1,$(PREEMPT_SELFTEST)),--features preempt,) $(if $(filter 1,$(RUST_VMM)),--features vmm,) $(if $(filter 1,$(RUST_PMM)),--features pmm,)
+RUST_FEATURES := $(if $(filter 1,$(PREEMPT_SELFTEST)),--features preempt,) $(if $(filter 1,$(RUST_VMM)),--features vmm,) $(if $(filter 1,$(RUST_PMM)),--features pmm,) $(if $(filter 1,$(RUST_USER_IMAGE)),--features user-image,)
 KERNEL_ELF := $(BUILD)/indianos.elf
 ISO := $(BUILD)/indianos.iso
 ISO_ROOT := $(BUILD)/iso_root
@@ -40,6 +46,9 @@ SOURCES := $(filter-out kernel/src/vmm.c,$(SOURCES))
 endif
 ifeq ($(RUST_PMM),1)
 SOURCES := $(filter-out kernel/src/pmm.c,$(SOURCES))
+endif
+ifeq ($(RUST_USER_IMAGE),1)
+SOURCES := $(filter-out kernel/src/user_image.c kernel/src/user_copy.c,$(SOURCES))
 endif
 endif
 OBJECTS := $(patsubst kernel/src/%.c,$(BUILD)/obj/%.o,$(SOURCES))
@@ -93,7 +102,7 @@ LDFLAGS := -target x86_64-unknown-none-elf -fuse-ld=lld -nostdlib -static \
            -Wl,-z,max-page-size=0x1000 -Wl,-z,noexecstack \
            -Wl,--gc-sections -Wl,--build-id=none -Wl,-T,kernel/linker.ld
 
-.PHONY: test-rust-vmm-host test-rust-vmm-qemu test-rust-pmm-host test-rust-pmm-qemu test-rust-host-abi test-rust-processes test-rust-scheduler rust-core all kernel user-elf test-user-elf test-ring3-elf initramfs test-initramfs image run run-bios test-boot test-exception test-pagefault test-shadow test-usermode test-userfault-supervisor test-userfault-guard test-processes test-scheduler test-preempt test-host toolchain-check clean
+.PHONY: test-rust-vmm-host test-rust-vmm-qemu test-rust-pmm-host test-rust-pmm-qemu test-rust-user-image-host test-rust-user-image-qemu test-rust-host-abi test-rust-processes test-rust-scheduler rust-core all kernel user-elf test-user-elf test-ring3-elf initramfs test-initramfs image run run-bios test-boot test-exception test-pagefault test-shadow test-usermode test-userfault-supervisor test-userfault-guard test-processes test-scheduler test-preempt test-host toolchain-check clean
 all: image
 kernel: $(KERNEL_ELF)
 
@@ -141,6 +150,23 @@ test-rust-host-abi:
 	    build/rust-tests/host/release/libindianos_kernel_core.a \
 	    -o build/rust-tests/user_image_test
 	build/rust-tests/user_image_test
+
+test-rust-user-image-host:
+	@mkdir -p build/rust-user-image-host
+	CARGO_TARGET_DIR=build/rust-user-image-host/target $(CARGO) build \
+	    --manifest-path $(RUST_MANIFEST) --release --offline \
+	    --no-default-features --features user-image
+	$(CC) -std=c11 -O2 -g -Wall -Wextra -Werror -I kernel/include \
+	    tests/test_user_image.c tests/rust_host_personality.c \
+	    build/rust-user-image-host/target/release/libindianos_kernel_core.a \
+	    -o build/rust-user-image-host/user_image_test
+	build/rust-user-image-host/user_image_test
+
+test-rust-user-image-qemu:
+	$(MAKE) image BUILD=build/rust-image-processes PROCESS_SELFTEST=1 RUST_CORE=1 RUST_VMM=1 RUST_USER_IMAGE=1
+	python3 tools/smoke_boot.py --iso build/rust-image-processes/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)" --mode processes
+	$(MAKE) image BUILD=build/rust-image-scheduler SCHEDULER_SELFTEST=1 RUST_CORE=1 RUST_VMM=1 RUST_USER_IMAGE=1
+	python3 tools/smoke_boot.py --iso build/rust-image-scheduler/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)" --mode scheduler
 
 test-rust-pmm-host:
 	@mkdir -p build/rust-pmm-host
