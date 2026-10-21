@@ -94,7 +94,11 @@ jobs:
         continue-on-error: true
         run: |
           set -o pipefail
-          OVMF_PATH="$(find /usr/share/OVMF /usr/share/edk2 -name 'OVMF_CODE*.fd' -type f 2>/dev/null | head -n 1)"
+          OVMF_PATH=""
+          # Prefer unsigned, non-Secure-Boot OVMF and avoid find|head SIGPIPE under pipefail.
+          for candidate in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/edk2/ovmf/OVMF_CODE_4M.fd /usr/share/edk2/ovmf/OVMF_CODE.fd; do
+            if test -f "$candidate"; then OVMF_PATH="$candidate"; break; fi
+          done
           test -n "$OVMF_PATH"
           make test-usermode OVMF_CODE="$OVMF_PATH" 2>&1 | tee build/ring3-smoke.log
       - name: Publish exact ring-3 QEMU commit status
@@ -145,7 +149,11 @@ jobs:
           retention-days: 7
       - name: Boot IndianOS in QEMU/OVMF
         run: |
-          OVMF_PATH="$(find /usr/share/OVMF /usr/share/edk2 -name 'OVMF_CODE*.fd' -type f 2>/dev/null | head -n 1)"
+          OVMF_PATH=""
+          # Prefer unsigned, non-Secure-Boot OVMF and avoid find|head SIGPIPE under pipefail.
+          for candidate in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/edk2/ovmf/OVMF_CODE_4M.fd /usr/share/edk2/ovmf/OVMF_CODE.fd; do
+            if test -f "$candidate"; then OVMF_PATH="$candidate"; break; fi
+          done
           test -n "$OVMF_PATH"
           make test-boot OVMF_CODE="$OVMF_PATH"
       - name: Upload experimental ISO for emulator debugging
@@ -157,23 +165,39 @@ jobs:
           retention-days: 7
       - name: Verify an intentional invalid opcode reaches our IDT
         run: |
-          OVMF_PATH="$(find /usr/share/OVMF /usr/share/edk2 -name 'OVMF_CODE*.fd' -type f 2>/dev/null | head -n 1)"
+          OVMF_PATH=""
+          # Prefer unsigned, non-Secure-Boot OVMF and avoid find|head SIGPIPE under pipefail.
+          for candidate in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/edk2/ovmf/OVMF_CODE_4M.fd /usr/share/edk2/ovmf/OVMF_CODE.fd; do
+            if test -f "$candidate"; then OVMF_PATH="$candidate"; break; fi
+          done
           test -n "$OVMF_PATH"
           make test-exception OVMF_CODE="$OVMF_PATH"
       - name: Verify page-fault address via CR2 in a separate test image
         run: |
-          OVMF_PATH="$(find /usr/share/OVMF /usr/share/edk2 -name 'OVMF_CODE*.fd' -type f 2>/dev/null | head -n 1)"
+          OVMF_PATH=""
+          # Prefer unsigned, non-Secure-Boot OVMF and avoid find|head SIGPIPE under pipefail.
+          for candidate in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/edk2/ovmf/OVMF_CODE_4M.fd /usr/share/edk2/ovmf/OVMF_CODE.fd; do
+            if test -f "$candidate"; then OVMF_PATH="$candidate"; break; fi
+          done
           test -n "$OVMF_PATH"
           make test-pagefault OVMF_CODE="$OVMF_PATH"
       - name: Opt-in first ring-3 user program execution (QEMU-only)
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_usermode == true }}
         run: |
-          OVMF_PATH="$(find /usr/share/OVMF /usr/share/edk2 -name 'OVMF_CODE*.fd' -type f 2>/dev/null | head -n 1)"
+          OVMF_PATH=""
+          # Prefer unsigned, non-Secure-Boot OVMF and avoid find|head SIGPIPE under pipefail.
+          for candidate in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/edk2/ovmf/OVMF_CODE_4M.fd /usr/share/edk2/ovmf/OVMF_CODE.fd; do
+            if test -f "$candidate"; then OVMF_PATH="$candidate"; break; fi
+          done
           test -n "$OVMF_PATH"
           make test-usermode OVMF_CODE="$OVMF_PATH"
       - name: Opt-in guarded shadow CR3 switch (QEMU-only)
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_shadow_switch == true }}
         run: |
-          OVMF_PATH="$(find /usr/share/OVMF /usr/share/edk2 -name 'OVMF_CODE*.fd' -type f 2>/dev/null | head -n 1)"
+          OVMF_PATH=""
+          # Prefer unsigned, non-Secure-Boot OVMF and avoid find|head SIGPIPE under pipefail.
+          for candidate in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/edk2/ovmf/OVMF_CODE_4M.fd /usr/share/edk2/ovmf/OVMF_CODE.fd; do
+            if test -f "$candidate"; then OVMF_PATH="$candidate"; break; fi
+          done
           test -n "$OVMF_PATH"
           make test-shadow OVMF_CODE="$OVMF_PATH"
