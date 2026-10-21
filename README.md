@@ -2,7 +2,7 @@
 
 **IndianOS** is an experimental, independent desktop operating system for x86-64 PCs, designed for approachable everyday use in India. The goal is a familiar desktop workflow, Indian-language accessibility, and a native kernel—not a Linux distribution or a copy of Microsoft Windows.
 
-> **Status (2026-10-21): M009 cooperative round-robin multitasking verified in QEMU.** IndianOS independently boots under QEMU/OVMF, executes two distinct ring-3 ELF64 programs sequentially through its own `int 0x80` interface, tracks PID/state transitions and reclaims each process's memory. Previous supervisor/guard fault-containment tests also pass. This is **not** a preemptive scheduler, production OS, security-audited sandbox or real-PC installer. Do not flash it to physical storage.
+> **Status (2026-10-21): M009 cooperative round-robin multitasking verified in QEMU.** IndianOS boots under QEMU/OVMF and now interleaves execution of two distinct ring-3 ELF64 applications using a new `SYS_YIELD` syscall. It saves and restores their CPU registers, stacks and distinct CR3 roots, retaining memory until each task exits. The earlier supervisor/guard fault-containment checks also pass. **Timer preemption is not yet verified**; this is not a production OS, audited sandbox or real-PC installer. Do not flash it to physical storage.
 
 ## Initial technical decisions
 
