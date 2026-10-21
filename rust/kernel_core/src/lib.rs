@@ -31,6 +31,8 @@ mod boot;
 mod interrupts;
 #[cfg(feature = "timer")]
 mod timer;
+#[cfg(feature = "kernel-main")]
+mod kernel_main;
 
 pub const MAX_PROCESSES: usize = 4;
 pub const MAX_DISPATCHES: u32 = if cfg!(feature = "preempt") { 2048 } else { 32 };
