@@ -7,7 +7,8 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 from smoke_boot import (assert_milestones, assert_expected_exception,
                         assert_expected_pagefault, assert_expected_shadow,
-                        assert_expected_usermode, matching_ovmf_vars, MILESTONES)  # noqa: E402
+                        assert_expected_usermode, assert_expected_userfault,
+                        matching_ovmf_vars, MILESTONES)  # noqa: E402
 
 
 class SmokeBootTests(unittest.TestCase):
@@ -84,6 +85,43 @@ class SmokeBootTests(unittest.TestCase):
             "IndianOS user: Namaste from IndianOS user mode!"])
         with self.assertRaises(AssertionError):
             assert_expected_usermode(output)
+
+    def test_user_guard_fault_contained_and_cleaned(self):
+        output = "\n".join([*MILESTONES,
+            "IndianOS: entering ring-3 /bin/init (QEMU experimental)",
+            "IndianOS: isolated ring-3 page fault",
+            "IndianOS: user page fault contained; kernel resumed",
+            "IndianOS: ring-3 borrowed user tables detached",
+            "IndianOS: ring-3 supervisor clone released",
+            "IndianOS: ring-3 user image released",
+            "IndianOS: ring-3 PMM frame count restored",
+            "IndianOS: user fault isolation experiment complete"])
+        assert_expected_userfault(output, "fault-guard")
+        assert_expected_userfault(output, "fault-supervisor")
+
+    def test_user_fault_requires_memory_cleanup(self):
+        output = "\n".join([*MILESTONES,
+            "IndianOS: entering ring-3 /bin/init (QEMU experimental)",
+            "IndianOS: isolated ring-3 page fault",
+            "IndianOS: user page fault contained; kernel resumed"])
+        with self.assertRaises(AssertionError):
+            assert_expected_userfault(output, "fault-guard")
+
+    def test_user_fault_rejects_kernel_panic_and_successful_sys_exit(self):
+        output = "\n".join([*MILESTONES,
+            "IndianOS: entering ring-3 /bin/init (QEMU experimental)",
+            "IndianOS: isolated ring-3 page fault",
+            "IndianOS: user page fault contained; kernel resumed",
+            "IndianOS: ring-3 borrowed user tables detached",
+            "IndianOS: ring-3 supervisor clone released",
+            "IndianOS: ring-3 user image released",
+            "IndianOS: ring-3 PMM frame count restored",
+            "IndianOS: user fault isolation experiment complete"])
+        with self.assertRaises(AssertionError):
+            assert_expected_userfault(output + "\nIndianOS: FATAL CPU exception", "fault-guard")
+        with self.assertRaises(AssertionError):
+            assert_expected_userfault(output +
+                "\nIndianOS: /bin/init exited through int 0x80", "fault-supervisor")
 
     def test_rejects_out_of_order(self):
         with self.assertRaises(AssertionError):
