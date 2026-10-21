@@ -105,12 +105,19 @@ __attribute__((noreturn)) void kmain(void) {
         halt_forever();
     }
     serial_write("IndianOS: initramfs /bin/init staged and released safely\n");
-#ifdef INDIANOS_TEST_RING3
+#if defined(INDIANOS_TEST_RING3) || \
+    defined(INDIANOS_TEST_USERFAULT_GUARD) || \
+    defined(INDIANOS_TEST_USERFAULT_SUPERVISOR)
     if (!x86_64_user_demo_run(init_elf, init_elf_size)) {
         serial_write("IndianOS: FATAL ring-3 user program experiment failed\n");
         halt_forever();
     }
+#if defined(INDIANOS_TEST_USERFAULT_GUARD) || \
+    defined(INDIANOS_TEST_USERFAULT_SUPERVISOR)
+    serial_write("IndianOS: user fault isolation experiment complete\n");
+#else
     serial_write("IndianOS: ring-3 user program experiment complete\n");
+#endif
 #endif
 #ifdef INDIANOS_TEST_PAGEFAULT
     serial_write("IndianOS: triggering intentional page fault\n");
