@@ -6,8 +6,8 @@
 #define PAGE_PRESENT 0x001ull
 #define PAGE_HUGE 0x080ull
 #define PAGE_ACCESSED 0x020ull
-#define PAGE_DIRTY 0x040ull
-#define PAGE_HW_MUTABLE (PAGE_ACCESSED | PAGE_DIRTY)
+/* Only the Accessed bit is hardware-updated at the PML4 nonleaf level. */
+#define PAGE_HW_MUTABLE PAGE_ACCESSED
 #define ENTRY_COUNT 512u
 
 static bool valid_table_physical(uint64_t physical) {
@@ -167,7 +167,7 @@ static bool user_pml4_graft(const struct paging_clone_backend *backend,
                  (entry & PAGE_HUGE) != 0))) return false;
         } else if ((kernel[i] & ~PAGE_HW_MUTABLE) !=
                    (entry & ~PAGE_HW_MUTABLE)) {
-            /* The CPU can set A (and architecture-defined D) in live
+            /* The CPU can set A in live
              * page-table entries after user code executes. Compare
              * frame ownership and protection flags, not HW status bits. */
             return false;
