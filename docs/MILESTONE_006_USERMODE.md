@@ -61,3 +61,26 @@ The GitHub workflow builds `test-ring3-elf` on pushes and also attempts `make te
 Run the syscall-enabled `/bin/init` QEMU ring-3 image, verify it cannot read/write protected supervisor mappings or the unmapped guard page, and independently inspect the exact CI transcript. Only after successful runtime testing should we call the first native IndianOS application **executed**.
 
 The repository owner's workflow preference remains direct-to-`main` commits; no PR was created.
+
+## Ring-3 hardening and emulator diagnostics (2026-10-21)
+
+The latest direct-to-main updates strengthen the QEMU-only experiment and its observability:
+
+- The process-root preflight now verifies unchanged supervisor mappings for the kernel's GDT, IDT, TSS, ring-0 syscall stack, double-fault stack, trampoline entry and exit, kernel dispatcher, current task metadata and caller stack. It rejects any high-half PML4 entry that is user-accessible.
+- The loaded application's ELF entry must have a present, user, **read-only executable** page; its stack must be present, user, **writable and NX**; the guard page must remain unmapped.
+- Before switching CR3, the kernel logs meaningful early failures such as unsupported PCID, missing HHDM, paging preflight refusal, missing TSS.RSP0, ELF staging failures or page-table clone failures. This prevents ambiguous timeout-only reports.
+- The QEMU smoke-test runner now preserves a bounded tail of the serial transcript when a boot marker is missing or out of order.
+- QEMU uses a temporary copy of matching `OVMF_VARS*.fd` whenever the template is next to `OVMF_CODE*.fd`, leaving machine firmware templates untouched.
+- The GitHub Actions workflow now attempts the ring-3 demo on pushes and publishes a narrowly scoped commit status `indianos/ring3-qemu` with `success`, `failure` or `error`. Failure of this **experimental** step does not suppress the normal boot checks. The status links to the workflow execution and uploaded transcript.
+
+### Commands (Linux/WSL)
+
+```sh
+make test-host
+make test-ring3-elf
+make test-usermode  # requires QEMU, OVMF, xorriso, Limine binary release
+```
+
+The `test-usermode` run is considered successful only after the QEMU serial transcript includes, in order: kernel readiness, ring-3 entry, `IndianOS user: Namaste from IndianOS user mode!`, successful syscall exit, and post-exit cleanup completion.
+
+**Verification boundary:** The locally compiled x86-64 assembly user executable contains the correct syscall instructions; however QEMU, OVMF and ISO build dependencies are not installed in the current execution environment, and no green `indianos/ring3-qemu` commit status has been obtained yet. Do **not** interpret these source or workflow changes as verified ring-3 execution.
