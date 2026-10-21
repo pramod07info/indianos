@@ -23,6 +23,7 @@ paging = []
 runtime = []
 boot-staging = ["pmm", "user-image"]
 boot = []
+interrupts = []
 
 [profile.release]
 panic = "abort"
