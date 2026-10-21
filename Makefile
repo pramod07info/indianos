@@ -258,6 +258,16 @@ test-rust-timer-link-qemu:
 	$(MAKE) image BUILD=build/rust-timer-user RUST_TIMER=1 USERMODE_SELFTEST=1
 	python3 tools/smoke_boot.py --iso build/rust-timer-user/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)" --mode usermode
 
+test-rust-integration-qemu:
+	$(MAKE) image BUILD=build/rust-all-normal RUST_BOOT=1 RUST_INTERRUPTS=1 RUST_TIMER=1 RUST_USERLAND=1 RUST_TOOLS=1
+	$(RUST_TOOLS_BIN) smoke --iso build/rust-all-normal/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)" --mode normal
+	$(MAKE) image BUILD=build/rust-all-ring3 USERMODE_SELFTEST=1 RUST_BOOT=1 RUST_INTERRUPTS=1 RUST_TIMER=1 RUST_USERLAND=1 RUST_TOOLS=1
+	$(RUST_TOOLS_BIN) smoke --iso build/rust-all-ring3/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)" --mode usermode
+	$(MAKE) image BUILD=build/rust-all-guard USERFAULT_SELFTEST=1 USERFAULT_KIND=guard RUST_BOOT=1 RUST_INTERRUPTS=1 RUST_TIMER=1 RUST_USERLAND=1 RUST_TOOLS=1
+	$(RUST_TOOLS_BIN) smoke --iso build/rust-all-guard/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)" --mode fault-guard
+	$(MAKE) image BUILD=build/rust-all-sched SCHEDULER_SELFTEST=1 RUST_BOOT=1 RUST_INTERRUPTS=1 RUST_TIMER=1 RUST_USERLAND=1 RUST_TOOLS=1
+	$(RUST_TOOLS_BIN) smoke --iso build/rust-all-sched/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)" --mode scheduler
+
 test-rust-main-qemu:
 	$(MAKE) image BUILD=build/rust-main-normal RUST_MAIN=1 RUST_BOOT=1 RUST_INTERRUPTS=1
 	python3 tools/smoke_boot.py --iso build/rust-main-normal/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)" --mode normal
