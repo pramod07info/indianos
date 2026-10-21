@@ -17,6 +17,7 @@ RUST_CORE ?= 1
 RUST_VMM ?= 0
 RUST_PMM ?= 0
 RUST_USER_IMAGE ?= 0
+RUST_PAGING ?= 0
 ifeq ($(RUST_USER_IMAGE),1)
 ifneq ($(RUST_VMM),1)
 $(error RUST_USER_IMAGE=1 requires RUST_VMM=1)
@@ -26,7 +27,7 @@ CARGO ?= cargo
 RUST_MANIFEST := rust/kernel_core/Cargo.toml
 RUST_SOURCE := $(wildcard rust/kernel_core/src/*.rs)
 RUST_LIB := $(BUILD)/libindianos_kernel_core.a
-RUST_FEATURES := $(if $(filter 1,$(PREEMPT_SELFTEST)),--features preempt,) $(if $(filter 1,$(RUST_VMM)),--features vmm,) $(if $(filter 1,$(RUST_PMM)),--features pmm,) $(if $(filter 1,$(RUST_USER_IMAGE)),--features user-image,)
+RUST_FEATURES := $(if $(filter 1,$(PREEMPT_SELFTEST)),--features preempt,) $(if $(filter 1,$(RUST_VMM)),--features vmm,) $(if $(filter 1,$(RUST_PMM)),--features pmm,) $(if $(filter 1,$(RUST_USER_IMAGE)),--features user-image,) $(if $(filter 1,$(RUST_PAGING)),--features paging,)
 KERNEL_ELF := $(BUILD)/indianos.elf
 ISO := $(BUILD)/indianos.iso
 ISO_ROOT := $(BUILD)/iso_root
@@ -49,6 +50,9 @@ SOURCES := $(filter-out kernel/src/pmm.c,$(SOURCES))
 endif
 ifeq ($(RUST_USER_IMAGE),1)
 SOURCES := $(filter-out kernel/src/user_image.c kernel/src/user_copy.c,$(SOURCES))
+endif
+ifeq ($(RUST_PAGING),1)
+SOURCES := $(filter-out kernel/src/paging_policy.c kernel/src/paging_clone.c,$(SOURCES))
 endif
 endif
 OBJECTS := $(patsubst kernel/src/%.c,$(BUILD)/obj/%.o,$(SOURCES))
@@ -102,7 +106,7 @@ LDFLAGS := -target x86_64-unknown-none-elf -fuse-ld=lld -nostdlib -static \
            -Wl,-z,max-page-size=0x1000 -Wl,-z,noexecstack \
            -Wl,--gc-sections -Wl,--build-id=none -Wl,-T,kernel/linker.ld
 
-.PHONY: test-rust-vmm-host test-rust-vmm-qemu test-rust-pmm-host test-rust-pmm-qemu test-rust-user-image-host test-rust-user-image-qemu test-rust-host-abi test-rust-processes test-rust-scheduler rust-core all kernel user-elf test-user-elf test-ring3-elf initramfs test-initramfs image run run-bios test-boot test-exception test-pagefault test-shadow test-usermode test-userfault-supervisor test-userfault-guard test-processes test-scheduler test-preempt test-host toolchain-check clean
+.PHONY: test-rust-vmm-host test-rust-vmm-qemu test-rust-pmm-host test-rust-pmm-qemu test-rust-user-image-host test-rust-user-image-qemu test-rust-paging-host test-rust-paging-qemu test-rust-host-abi test-rust-processes test-rust-scheduler rust-core all kernel user-elf test-user-elf test-ring3-elf initramfs test-initramfs image run run-bios test-boot test-exception test-pagefault test-shadow test-usermode test-userfault-supervisor test-userfault-guard test-processes test-scheduler test-preempt test-host toolchain-check clean
 all: image
 kernel: $(KERNEL_ELF)
 
@@ -150,6 +154,23 @@ test-rust-host-abi:
 	    build/rust-tests/host/release/libindianos_kernel_core.a \
 	    -o build/rust-tests/user_image_test
 	build/rust-tests/user_image_test
+
+test-rust-paging-host:
+	@mkdir -p build/rust-paging-host
+	CARGO_TARGET_DIR=build/rust-paging-host/target $(CARGO) build \
+	    --manifest-path $(RUST_MANIFEST) --release --offline \
+	    --no-default-features --features paging
+	$(CC) -std=c11 -O2 -g -Wall -Wextra -Werror -I kernel/include \
+	    tests/test_paging.c tests/rust_host_personality.c \
+	    build/rust-paging-host/target/release/libindianos_kernel_core.a \
+	    -o build/rust-paging-host/paging_test
+	build/rust-paging-host/paging_test
+
+test-rust-paging-qemu:
+	$(MAKE) image BUILD=build/rust-paging-processes PROCESS_SELFTEST=1 RUST_CORE=1 RUST_PAGING=1
+	python3 tools/smoke_boot.py --iso build/rust-paging-processes/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)" --mode processes
+	$(MAKE) image BUILD=build/rust-paging-fault USERFAULT_SELFTEST=1 USERFAULT_KIND=supervisor RUST_CORE=1 RUST_PAGING=1
+	python3 tools/smoke_boot.py --iso build/rust-paging-fault/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)" --mode fault-supervisor
 
 test-rust-user-image-host:
 	@mkdir -p build/rust-user-image-host
