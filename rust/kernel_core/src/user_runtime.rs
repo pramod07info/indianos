@@ -85,6 +85,17 @@ fn pid_log(pid:u32,event:&'static [u8]){
 }
 fn active_image()->*mut UserImage{unsafe{ptr::read(ptr::addr_of!(ACTIVE_USER))}}
 fn active_task()->*mut Task{unsafe{ptr::read(ptr::addr_of!(ACTIVE_TASK))}}
+fn fault_hex(label:&'static [u8],value:u64){
+ log(label);
+ let mut digits=[0u8;17];
+ for i in 0..16{
+  let nibble=((value>>((15-i)*4))&15) as u8;
+  digits[i]=if nibble<10{b'0'+nibble}else{b'a'+nibble-10};
+ }
+ digits[16]=0;
+ unsafe{serial_write(digits.as_ptr().cast());}
+ log(b"\\n\\0");
+}
 fn clear_faults(){unsafe{LAST_VECTOR=0;LAST_ERROR=0;LAST_ADDRESS=0}}
 fn last_fault()->(u64,u64,u64){unsafe{(LAST_VECTOR,LAST_ERROR,LAST_ADDRESS)}}
 fn capture(regs:*const u64,via_timer:bool)->bool{
@@ -119,6 +130,9 @@ pub unsafe extern "C" fn x86_64_scheduler_timer_dispatch(regs:*const u64){
 pub extern "C" fn x86_64_user_fault_handle(vector:u64,cs:u64,error:u64,cr2:u64){
  if !indianos_user_fault_eligible(vector,cs,error,!active_image().is_null()){return;}
  unsafe{LAST_VECTOR=vector;LAST_ERROR=error;LAST_ADDRESS=cr2;}
+ fault_hex(b"IndianOS: fault vector=0x\\0",vector);
+ fault_hex(b"IndianOS: fault error=0x\\0",error);
+ fault_hex(b"IndianOS: fault CR2=0x\\0",cr2);
  match vector{
   14=>log(b"IndianOS: isolated ring-3 page fault\n\0"),
   13=>log(b"IndianOS: isolated ring-3 general protection fault\n\0"),
