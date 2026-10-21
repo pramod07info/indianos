@@ -272,11 +272,13 @@ def matching_ovmf_vars(code: Path) -> Path | None:
 
 
 def run_smoke(iso: Path, ovmf: Path, qemu: str, timeout: float,
-              mode: str = "normal") -> str:
+              mode: str = "normal", machine: str = "q35") -> str:
     if not iso.is_file():
         raise ValueError(f"ISO not found: {iso}")
     if not ovmf.is_file():
         raise ValueError(f"OVMF firmware missing: {ovmf} (install ovmf or set OVMF_CODE)")
+    if machine not in {"q35", "pc"}:
+        raise ValueError("QEMU machine must be q35 or pc")
     if timeout <= 0 or timeout > 180:
         raise ValueError("timeout must be between 0 and 180 seconds")
     if mode not in {"normal", "exception", "pagefault", "shadow", "usermode",
@@ -296,7 +298,7 @@ def run_smoke(iso: Path, ovmf: Path, qemu: str, timeout: float,
     }
     verify = verifiers[mode]
     argv = [
-        qemu, "-machine", "q35", "-m", "512M",
+        qemu, "-machine", machine, "-m", "512M",
         "-drive", f"if=pflash,unit=0,format=raw,file={ovmf},readonly=on",
         "-cdrom", str(iso), "-boot", "d", "-display", "none",
         "-serial", "stdio", "-monitor", "none", "-no-reboot", "-no-shutdown",
@@ -368,11 +370,12 @@ def main() -> int:
     parser.add_argument("--iso", type=Path, required=True)
     parser.add_argument("--ovmf", type=Path, required=True)
     parser.add_argument("--qemu", default="qemu-system-x86_64")
+    parser.add_argument("--machine", choices=("q35", "pc"), default="q35")
     parser.add_argument("--timeout", type=float, default=25)
     parser.add_argument("--mode", choices=("normal", "exception", "pagefault", "shadow", "usermode", "fault-guard", "fault-supervisor", "processes", "scheduler", "preempt"), default="normal")
     args = parser.parse_args()
     try:
-        output = run_smoke(args.iso, args.ovmf, args.qemu, args.timeout, args.mode)
+        output = run_smoke(args.iso, args.ovmf, args.qemu, args.timeout, args.mode, args.machine)
     except (AssertionError, ValueError, RuntimeError, OSError) as exc:
         print(f"IndianOS QEMU smoke test FAILED: {exc}", file=sys.stderr)
         return 1
