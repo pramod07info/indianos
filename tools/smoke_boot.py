@@ -303,6 +303,10 @@ def run_smoke(iso: Path, ovmf: Path, qemu: str, timeout: float,
         "-cdrom", str(iso), "-boot", "d", "-display", "none",
         "-serial", "stdio", "-monitor", "none", "-no-reboot", "-no-shutdown",
     ]
+    if mode == "preempt":
+        # HPET legacy replacement can suppress PIT IRQ0 on some firmware.
+        # Keep this emulator-only override out of all ordinary boot paths.
+        argv.append("-no-hpet")
     tempvars = None
     vars_template = matching_ovmf_vars(ovmf)
     if vars_template is not None:
