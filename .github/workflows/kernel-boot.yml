@@ -88,6 +88,21 @@ jobs:
           readelf -h build/indianos.elf
           readelf -l build/indianos.elf
           readelf -h build/indianos.elf | grep -q 'Machine:.*Advanced Micro Devices X86-64'
+      - name: Experimental ring-3 syscall execution (non-blocking; QEMU)
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          OVMF_PATH="$(find /usr/share/OVMF /usr/share/edk2 -name 'OVMF_CODE*.fd' -type f 2>/dev/null | head -n 1)"
+          test -n "$OVMF_PATH"
+          make test-usermode OVMF_CODE="$OVMF_PATH" 2>&1 | tee build/ring3-smoke.log
+      - name: Upload ring-3 smoke transcript for debugging
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: indianos-ring3-experimental-log
+          path: build/ring3-smoke.log
+          if-no-files-found: ignore
+          retention-days: 7
       - name: Boot IndianOS in QEMU/OVMF
         run: |
           OVMF_PATH="$(find /usr/share/OVMF /usr/share/edk2 -name 'OVMF_CODE*.fd' -type f 2>/dev/null | head -n 1)"
