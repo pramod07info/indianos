@@ -2,7 +2,7 @@
 
 **IndianOS** is an experimental, independent desktop operating system for x86-64 PCs, designed for approachable everyday use in India. The goal is a familiar desktop workflow, Indian-language accessibility, and a native kernel—not a Linux distribution or a copy of Microsoft Windows.
 
-> **Status: M001–M004 source implemented; M005 ELF validation, initramfs and detached user-image staging implemented.** The freestanding x86-64 kernel, Limine ISO packaging, x86-64 exception tables, boot-time frame allocator, detached virtual memory manager, M004 paging/exception foundations, and a new static x86-64 ELF64 image validator compile locally. QEMU firmware-to-kernel runtime verification is still pending CI. This is **not** a production OS or a real-PC installer. Do not flash it to physical storage.
+> **Status (2026-10-21): M007 user-fault recovery verified in QEMU.** IndianOS is an independent x86-64 experimental kernel that now boots in QEMU/OVMF, runs one isolated native ring-3 demo using `int 0x80`, and contains test-user attempts to read supervisor-only pages or an unmapped stack guard, with successful memory cleanup. This is **not** a production OS, scheduler, complete user-process security boundary or a real-PC installer. Do not flash it to physical storage.
 
 ## Initial technical decisions
 
@@ -32,6 +32,7 @@
 13. [AI app assistant and secure install architecture](docs/AI_APP_ASSISTANT.md)
 14. [ADR: compatibility and AI](docs/ADR-0002-interoperability-ai.md)
 15. [Performance and portability targets](docs/PERFORMANCE_GOALS.md)
+16. [Milestone 007: QEMU-verified recoverable user faults](docs/MILESTONE_007_USER_FAULTS.md)
 
 ## Directory plan
 
@@ -176,6 +177,29 @@ production-ready operating system.
 
 See [verified serial output and debugging history](docs/RING3_VERIFIED.md)
 and [M006 architecture](docs/MILESTONE_006_USERMODE.md).
+
+## Ring-3 fault isolation — verified in QEMU (M007)
+
+IndianOS now terminates the active experimental user task instead of halting
+the entire kernel when it attempts to read supervisor-only text or an unmapped
+user-stack guard page. QEMU verifies #PF origin and CR2, restoration of
+the original CR3, safe user table detachment and no leaked PMM frames.
+The normal and deliberately fatal **kernel-origin** exception tests remain
+fatal and continue passing.
+
+```sh
+make test-host
+make test-usermode
+make test-userfault-supervisor
+make test-userfault-guard
+```
+
+[Passing QEMU run 39531137405](https://github.com/pramod07info/indianos/actions/runs/39531137405)
+covers the first two user fault probes and the original `int 0x80` user app.
+See [M007 recovery tests and limitations](docs/MILESTONE_007_USER_FAULTS.md).
+
+This is one sequential test process with hardware interrupts off; timers,
+multi-process scheduling and release-grade application isolation do not exist.
 
 ## Safety and legal
 
