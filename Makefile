@@ -22,6 +22,7 @@ RUST_USER_IMAGE ?= 1
 RUST_PAGING ?= 1
 RUST_RUNTIME ?= 1
 RUST_BOOT_STAGING ?= 1
+RUST_BOOT ?= 0
 ifeq ($(RUST_BOOT_STAGING),1)
 ifneq ($(RUST_USER_IMAGE),1)
 $(error RUST_BOOT_STAGING=1 requires RUST_USER_IMAGE=1)
@@ -39,7 +40,7 @@ CARGO ?= cargo
 RUST_MANIFEST := rust/kernel_core/Cargo.toml
 RUST_SOURCE := $(wildcard rust/kernel_core/src/*.rs)
 RUST_LIB := $(BUILD)/libindianos_kernel_core.a
-RUST_FEATURES := $(if $(filter 1,$(PREEMPT_SELFTEST)),--features preempt,) $(if $(filter 1,$(RUST_VMM)),--features vmm,) $(if $(filter 1,$(RUST_PMM)),--features pmm,) $(if $(filter 1,$(RUST_USER_IMAGE)),--features user-image,) $(if $(filter 1,$(RUST_PAGING)),--features paging,) $(if $(filter 1,$(RUST_RUNTIME)),--features runtime,) $(if $(filter 1,$(RUST_BOOT_STAGING)),--features boot-staging,)
+RUST_FEATURES := $(if $(filter 1,$(PREEMPT_SELFTEST)),--features preempt,) $(if $(filter 1,$(RUST_VMM)),--features vmm,) $(if $(filter 1,$(RUST_PMM)),--features pmm,) $(if $(filter 1,$(RUST_USER_IMAGE)),--features user-image,) $(if $(filter 1,$(RUST_PAGING)),--features paging,) $(if $(filter 1,$(RUST_RUNTIME)),--features runtime,) $(if $(filter 1,$(RUST_BOOT_STAGING)),--features boot-staging,) $(if $(filter 1,$(RUST_BOOT)),--features boot,)
 KERNEL_ELF := $(BUILD)/indianos.elf
 ISO := $(BUILD)/indianos.iso
 ISO_ROOT := $(BUILD)/iso_root
@@ -89,6 +90,9 @@ CFLAGS := -target x86_64-unknown-none-elf -std=c11 -O2 -g -Wall -Wextra -Werror 
 ifeq ($(RUST_CORE),1)
 CFLAGS += -DINDIANOS_RUST_CORE
 endif
+ifeq ($(RUST_BOOT),1)
+CFLAGS += -DINDIANOS_RUST_BOOT
+endif
 ifeq ($(EXCEPTION_SELFTEST),1)
 CFLAGS += -DINDIANOS_TEST_UD2
 endif
@@ -124,7 +128,7 @@ LDFLAGS := -target x86_64-unknown-none-elf -fuse-ld=lld -nostdlib -static \
            -Wl,-z,max-page-size=0x1000 -Wl,-z,noexecstack \
            -Wl,--gc-sections -Wl,--build-id=none -Wl,-T,kernel/linker.ld
 
-.PHONY: test-rust-vmm-host test-rust-vmm-qemu test-rust-pmm-host test-rust-pmm-qemu test-rust-user-image-host test-rust-user-image-qemu test-rust-paging-host test-rust-paging-qemu test-rust-runtime-host test-rust-runtime-qemu test-rust-boot-staging-qemu test-rust-host-abi test-rust-processes test-rust-scheduler rust-core all kernel user-elf test-user-elf test-ring3-elf initramfs test-initramfs image run run-bios test-boot test-exception test-pagefault test-shadow test-usermode test-userfault-supervisor test-userfault-guard test-processes test-scheduler test-preempt test-host toolchain-check clean
+.PHONY: test-rust-boot-qemu test-rust-vmm-host test-rust-vmm-qemu test-rust-pmm-host test-rust-pmm-qemu test-rust-user-image-host test-rust-user-image-qemu test-rust-paging-host test-rust-paging-qemu test-rust-runtime-host test-rust-runtime-qemu test-rust-boot-staging-qemu test-rust-host-abi test-rust-processes test-rust-scheduler rust-core all kernel user-elf test-user-elf test-ring3-elf initramfs test-initramfs image run run-bios test-boot test-exception test-pagefault test-shadow test-usermode test-userfault-supervisor test-userfault-guard test-processes test-scheduler test-preempt test-host toolchain-check clean
 all: image
 kernel: $(KERNEL_ELF)
 
@@ -172,6 +176,14 @@ test-rust-host-abi:
 	    build/rust-tests/host/release/libindianos_kernel_core.a \
 	    -o build/rust-tests/user_image_test
 	build/rust-tests/user_image_test
+
+test-rust-boot-qemu:
+	$(MAKE) image BUILD=build/rust-boot-image RUST_BOOT=1
+	python3 tools/smoke_boot.py --iso build/rust-boot-image/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)" --mode normal
+	$(MAKE) image BUILD=build/rust-boot-process PROCESS_SELFTEST=1 RUST_BOOT=1
+	python3 tools/smoke_boot.py --iso build/rust-boot-process/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)" --mode processes
+	$(MAKE) image BUILD=build/rust-boot-fault USERFAULT_SELFTEST=1 USERFAULT_KIND=guard RUST_BOOT=1
+	python3 tools/smoke_boot.py --iso build/rust-boot-fault/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)" --mode fault-guard
 
 test-rust-boot-staging-qemu:
 	$(MAKE) image BUILD=build/rust-boot-staging RUST_CORE=1 RUST_PMM=1 RUST_VMM=1 RUST_USER_IMAGE=1 RUST_BOOT_STAGING=1
