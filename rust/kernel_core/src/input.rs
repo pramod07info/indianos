@@ -156,6 +156,9 @@ pub(crate) fn enable_irq1()->bool{
         outb(0x21,0x04);io_wait();outb(0xa1,0x02);io_wait();
         outb(0x21,0x01);io_wait();outb(0xa1,0x01);io_wait();
         outb(0x21,0xfd);outb(0xa1,0xff);
+        // Complete any stale in-service state carried across firmware boot.
+        // During single-core setup IF is disabled; no handler is active.
+        for _ in 0..8{outb(0x20,0x20);io_wait();}
         outb(0x22,0x70);io_wait();outb(0x23,0);io_wait();
     }
     // Firmware may leave an unread scan code. If a stale byte holds OBF
@@ -239,6 +242,11 @@ pub(crate) fn poll_byte()->Option<u8>{
                 }
                 if isr&0x02!=0{
                     serial_write(b"IndianOS: R014.2 PIC ISR IRQ1 active\n\0".as_ptr().cast());
+                }
+                if isr&0x01!=0{
+                    serial_write(b"IndianOS: R014.2 PIC ISR IRQ0 blocking\n\0".as_ptr().cast());
+                }else{
+                    serial_write(b"IndianOS: R014.2 PIC ISR IRQ0 clear\n\0".as_ptr().cast());
                 }
             }
         }
