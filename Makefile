@@ -181,6 +181,8 @@ test-shadow:
 	python3 tools/smoke_boot.py --iso build/shadow/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)" --mode shadow
 
 test-usermode:
+	$(MAKE) user-elf BUILD=build/ring3
+	python3 tools/check_usermode_fixture.py build/ring3/userland/demo.elf
 	$(MAKE) image BUILD=build/ring3 USERMODE_SELFTEST=1
 	python3 tools/smoke_boot.py --iso build/ring3/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)" --mode usermode
 
