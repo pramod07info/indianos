@@ -12,7 +12,9 @@ crate-type = ["staticlib", "rlib"]
 [dependencies]
 
 [features]
-default = []
+# Unit tests use std; the actual bare-metal build explicitly disables it.
+default = ["std"]
+std = []
 preempt = []
 
 [profile.release]
