@@ -46,7 +46,7 @@ LDFLAGS := -target x86_64-unknown-none-elf -fuse-ld=lld -nostdlib -static \
            -Wl,-z,max-page-size=0x1000 -Wl,-z,noexecstack \
            -Wl,--gc-sections -Wl,--build-id=none -Wl,-T,kernel/linker.ld
 
-.PHONY: all kernel user-elf test-user-elf initramfs test-initramfs image run run-bios test-boot test-exception test-pagefault test-shadow test-usermode test-host toolchain-check clean
+.PHONY: all kernel user-elf test-user-elf test-ring3-elf initramfs test-initramfs image run run-bios test-boot test-exception test-pagefault test-shadow test-usermode test-host toolchain-check clean
 all: image
 kernel: $(KERNEL_ELF)
 
@@ -84,11 +84,19 @@ USER_ELF := $(BUILD)/userland/demo.elf
 USER_OBJ := $(BUILD)/userland/entry.o
 INITRAMFS := $(BUILD)/initramfs.img
 
+# The normal ISO retains the inert fixture; only test-usermode replaces it
+# with a separate app that uses the draft IndianOS software interrupt ABI.
+ifeq ($(USERMODE_SELFTEST),1)
+$(USER_OBJ): userland/demo/ring3_entry.S Makefile
+	@mkdir -p $(@D)
+	$(CC) -target x86_64-unknown-none-elf -mno-red-zone -c $< -o $@
+else
 $(USER_OBJ): userland/demo/entry.c Makefile
 	@mkdir -p $(@D)
 	$(CC) -target x86_64-unknown-none-elf -std=c11 -O2 -ffreestanding \
 	    -fno-builtin -fno-pie -fno-pic -fno-stack-protector -mno-red-zone \
 	    -c $< -o $@
+endif
 
 $(USER_ELF): $(USER_OBJ) userland/demo/linker.ld Makefile
 	$(CC) -target x86_64-unknown-none-elf -fuse-ld=lld -nostdlib -static \
@@ -180,9 +188,12 @@ test-shadow:
 	$(MAKE) image BUILD=build/shadow PAGING_SWITCH_SELFTEST=1
 	python3 tools/smoke_boot.py --iso build/shadow/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)" --mode shadow
 
-test-usermode:
-	$(MAKE) user-elf BUILD=build/ring3
+test-ring3-elf:
+	$(MAKE) user-elf BUILD=build/ring3 USERMODE_SELFTEST=1
 	python3 tools/check_usermode_fixture.py build/ring3/userland/demo.elf
+	$(MAKE) test-initramfs BUILD=build/ring3 USERMODE_SELFTEST=1
+
+test-usermode: test-ring3-elf
 	$(MAKE) image BUILD=build/ring3 USERMODE_SELFTEST=1
 	python3 tools/smoke_boot.py --iso build/ring3/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)" --mode usermode
 
