@@ -58,7 +58,7 @@ jobs:
   qemu-uefi:
     name: Build ELF + ISO and verify serial boot
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Install emulator and image-building dependencies
@@ -478,6 +478,49 @@ jobs:
         with:
           name: indianos-rust-interrupts-qemu
           path: build-rust-interrupts-qemu.log
+          if-no-files-found: ignore
+          retention-days: 7
+      - name: Native Rust userland QEMU parity (candidate)
+        id: rust_userland
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          OVMF_PATH=""
+          for candidate in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/edk2/ovmf/OVMF_CODE_4M.fd /usr/share/edk2/ovmf/OVMF_CODE.fd; do
+            if test -f "$candidate"; then OVMF_PATH="$candidate"; break; fi
+          done
+          test -n "$OVMF_PATH"
+          make test-rust-userland-qemu OVMF_CODE="$OVMF_PATH" 2>&1 | tee build-rust-userland.log
+      - name: Publish Rust native userland QEMU status
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          USERLAND: ${{ steps.rust_userland.outcome }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from urllib.request import Request, urlopen
+          state = "success" if os.getenv("USERLAND") == "success" else "failure"
+          repo = os.environ["GITHUB_REPOSITORY"]
+          payload = json.dumps({
+              "state": state, "context": "indianos/rust-userland-qemu",
+              "description": f"Rust-native syscall demos, worker, scheduler and fault probes: {os.getenv('USERLAND')}",
+              "target_url": f"{os.environ['GITHUB_SERVER_URL']}/{repo}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
+          }).encode()
+          req = Request(f"https://api.github.com/repos/{repo}/statuses/{os.environ['GITHUB_SHA']}",
+                        data=payload, method="POST",
+                        headers={"Authorization": "Bearer " + os.environ["GH_TOKEN"],
+                                 "Accept": "application/vnd.github+json",
+                                 "Content-Type": "application/json"})
+          with urlopen(req, timeout=20) as response:
+              print("Rust userland CI:",state,response.status)
+          PY
+      - name: Preserve native Rust userland transcript
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: indianos-rust-userland-qemu
+          path: build-rust-userland.log
           if-no-files-found: ignore
           retention-days: 7
       - name: Host tests (PMM, VMM, ELF64 image and serial transcript parser)
