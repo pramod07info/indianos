@@ -157,9 +157,9 @@ int main(void) {
     assert(paging_attach_user_half(&b, supervisor.root, temporary_user_root));
     assert(kernel_root[1] == user_root[1]);
     assert(!paging_attach_user_half(&b, supervisor.root, temporary_user_root));
-    /* Actual CPU hardware can set A/D flags in the ATTACHED PML4 while
-     * the detached source PML4 retains its original bit pattern. */
-    kernel_root[1] |= 0x20ull | 0x40ull;
+    /* The CPU sets Accessed in the ATTACHED PML4, while the detached
+     * source PML4 retains its original non-accessed entry. */
+    kernel_root[1] |= 0x20ull;
     assert(paging_detach_user_half(&b, supervisor.root, temporary_user_root));
     assert(kernel_root[1] == 0);
     assert(!paging_detach_user_half(&b, supervisor.root, temporary_user_root));
