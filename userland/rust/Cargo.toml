@@ -10,12 +10,17 @@ path = "src/main.rs"
 test = false
 bench = false
 
+[[test]]
+name = "shell_commands"
+path = "tests/shell_commands.rs"
+
 [dependencies]
 
 [features]
 default = []
 demo = []
 worker = []
+shell = []
 sched-a = []
 sched-b = []
 fault-guard = []

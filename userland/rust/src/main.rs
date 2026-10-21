@@ -9,6 +9,8 @@
 
 use core::arch::asm;
 use core::panic::PanicInfo;
+#[cfg(feature="shell")]
+mod shell;
 
 #[panic_handler]
 fn panic(_info: &PanicInfo<'_>) -> ! { exit(125) }
@@ -56,6 +58,30 @@ pub extern "C" fn _start()->!{
     {
         write(b"Namaste from IndianOS user mode!");
         exit(0);
+    }
+    #[cfg(feature="shell")]
+    {
+        write(b"R013 shell: IndianOS init started");
+        for &line in shell::BOOT_SCRIPT {
+            match shell::parse(line) {
+                Some(shell::Command::Help) =>
+                    write(b"R013 shell: commands: help ps run /bin/worker exit"),
+                Some(shell::Command::Ps) => {
+                    if call(4,0,0)!=1 {exit(30);}
+                    write(b"R013 shell: ps PID 1 RUNNING");
+                }
+                Some(shell::Command::RunWorker) => {
+                    if call(5,1,0)!=0 {exit(31);}
+                    write(b"R013 shell: run /bin/worker accepted");
+                }
+                Some(shell::Command::Exit) => {
+                    write(b"R013 shell: exit");
+                    exit(0);
+                }
+                None => exit(32),
+            }
+        }
+        exit(33);
     }
     #[cfg(feature="worker")]
     {
@@ -112,7 +138,7 @@ pub extern "C" fn _start()->!{
     // A harmless, valid ET_EXEC fixture for regular kernel boots.
     // It must never be launched outside the opt-in test variants.
     #[cfg(not(any(
-        feature="demo",feature="worker",feature="sched-a",
+        feature="demo",feature="worker",feature="shell",feature="sched-a",
         feature="sched-b",feature="fault-guard",feature="fault-supervisor",
         feature="preempt-a",feature="preempt-b"
     )))]
