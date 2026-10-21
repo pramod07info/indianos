@@ -10,5 +10,7 @@
 bool x86_64_timer_start_100hz(void);
 void x86_64_timer_ack_irq0(void);
 uint64_t x86_64_timer_irq_count(void);
+uint8_t x86_64_timer_pic_pending(void);
+uint8_t x86_64_timer_pic_mask(void);
 
 #endif
