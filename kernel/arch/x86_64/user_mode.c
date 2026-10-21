@@ -376,3 +376,227 @@ bool x86_64_user_demo_run(const uint8_t *elf, size_t size) {
     struct indianos_process *task = indianos_process_create(&table);
     return task != NULL && x86_64_user_process_run(task, elf, size);
 }
+
+/* M009 cooperative context runner.
+ * Two ELF mappings and cloned supervisor roots coexist. Each syscall-based
+ * yield saves the complete 64-bit user IRET context and restores kernel CR3,
+ * then the next READY task is selected fairly. Never run in normal boots. */
+static bool m009_prepare_task(struct m009_task *task,
+                              struct indianos_process *pcb,
+                              const uint8_t *elf, size_t image_size,
+                              uint64_t original,
+                              const struct vmm_backend *vmm,
+                              const struct paging_clone_backend *backend,
+                              unsigned int stack_slot) {
+    if (task == NULL || pcb == NULL ||
+        !x86_64_user_interrupt_stack_select(stack_slot) ||
+        !indianos_user_image_load(&task->image, vmm, elf, image_size))
+        return false;
+    task->pcb = pcb;
+    if (!paging_clone_kernel_half(backend, original, &task->root) ||
+        !paging_attach_user_half(backend, task->root.root,
+                                task->image.tables.root_physical))
+        return false;
+    task->attached = true;
+    uint64_t trap[INDIANOS_TRAP_MAPPING_COUNT] = {0};
+    bool safe = x86_64_user_trap_mapping_addresses(trap);
+    const uint64_t supervisor_addresses[] = {
+        (uint64_t)(uintptr_t)&x86_64_enter_user,
+        (uint64_t)(uintptr_t)&x86_64_resume_user,
+        (uint64_t)(uintptr_t)&x86_64_user_exit_to_kernel,
+        (uint64_t)(uintptr_t)&x86_64_user_interrupt,
+        (uint64_t)(uintptr_t)&x86_64_user_syscall_dispatch,
+        (uint64_t)(uintptr_t)&m009_tasks[0],
+        (uint64_t)(uintptr_t)&m009_active,
+    };
+    for (unsigned i = 0; i < INDIANOS_TRAP_MAPPING_COUNT; ++i) {
+        if (!valid_kernel_access(backend, original, task->root.root, trap[i]))
+            safe = false;
+    }
+    for (unsigned i = 0;
+         i < sizeof(supervisor_addresses)/sizeof(supervisor_addresses[0]); ++i) {
+        if (!valid_kernel_access(backend, original, task->root.root,
+                                 supervisor_addresses[i])) safe = false;
+    }
+    uint64_t phys = 0, flags = 0;
+    if (!paging_lookup(backend, task->root.root, task->image.plan.entry,
+                       &phys, &flags) || (flags & 0x7ull) != 0x5ull ||
+        (flags & (1ull << 63)) != 0) safe = false;
+    if (!paging_lookup(backend, task->root.root,
+                       task->image.plan.stack_end - 16, &phys, &flags) ||
+        (flags & 0x7ull) != 0x7ull ||
+        (flags & (1ull << 63)) == 0) safe = false;
+    if (paging_lookup(backend, task->root.root,
+                      task->image.plan.guard_begin, &phys, &flags)) safe = false;
+    if (!safe || !indianos_process_ready(pcb) ||
+        !indianos_process_bind(pcb, task->root.root)) return false;
+    log_pid(pcb->pid, "READY");
+    return true;
+}
+
+static bool m009_saved_frame_valid(const struct m009_task *task) {
+    if (task == NULL || !task->saved ||
+        task->frame[16] != 0x2bull || task->frame[19] != 0x33ull ||
+        (task->frame[17] & (0x200ull | 0x3000ull)) != 0 ||
+        (task->frame[17] & 0x2ull) == 0) return false;
+    const uint64_t rip = task->frame[15];
+    const uint64_t rsp = task->frame[18];
+    struct vmm_mapping mapping = {0};
+    return indianos_program_user_range(&task->image.plan, rip, 1, false) &&
+           rsp >= task->image.plan.stack_begin &&
+           rsp <= task->image.plan.stack_end &&
+           vmm_query_page(&task->image.tables, rip & ~(PAGE - 1), &mapping) &&
+           mapping.permissions.user && mapping.permissions.executable &&
+           !mapping.permissions.writable;
+}
+
+static bool m009_discard_task(struct m009_task *task,
+                              const struct paging_clone_backend *backend,
+                              bool terminal) {
+    if (task == NULL || backend == NULL) return false;
+    if (task->attached) {
+        if (!paging_detach_user_half(backend, task->root.root,
+                                     task->image.tables.root_physical))
+            return false;
+        task->attached = false;
+    }
+    if (task->root.root != 0 &&
+        !paging_clone_release(backend, &task->root)) return false;
+    if (task->image.tables.initialized &&
+        !indianos_user_image_destroy(&task->image)) return false;
+    if (terminal && (task->pcb == NULL ||
+                     !indianos_process_reap(task->pcb))) return false;
+    if (terminal) log_pid(task->pcb->pid, "REAPED");
+    return true;
+}
+
+bool x86_64_m009_schedule_run(const uint8_t *first_elf, size_t first_bytes,
+                              const uint8_t *second_elf, size_t second_bytes) {
+    if (first_elf == NULL || second_elf == NULL || current_user != NULL ||
+        m009_active != NULL) return false;
+    struct paging_cpu_state cpu = {0};
+    uint64_t offset = 0;
+    if (!x86_64_paging_detect(&cpu) || !paging_preflight(&cpu) ||
+        cpu.pcid_enabled || !boot_hhdm_offset(&offset) || offset == 0)
+        return false;
+    struct direct_memory physical = {.offset = offset};
+    const struct vmm_backend vmm = {
+        .allocate = frame_allocate, .release = frame_release,
+        .access = frame_access, .context = &physical,
+    };
+    const struct paging_clone_backend backend = {
+        .allocate = frame_allocate, .release = frame_release,
+        .access = table_access, .context = &physical,
+    };
+    struct indianos_process_table table = {0};
+    struct indianos_scheduler scheduler = {0};
+    if (!indianos_process_table_init(&table)) return false;
+    struct indianos_process *first = indianos_process_create(&table);
+    struct indianos_process *second = indianos_process_create(&table);
+    if (first == NULL || second == NULL ||
+        first->pid != 1 || second->pid != 2)
+        return false;
+    const uint64_t starting_free = pmm_free_frames();
+    for (unsigned i = 0; i < M009_TASK_COUNT; ++i)
+        m009_tasks[i] = (struct m009_task){0};
+
+    bool prepared = m009_prepare_task(&m009_tasks[0], first,
+                                       first_elf, first_bytes,
+                                       cpu.cr3 & PHYS_MASK,
+                                       &vmm, &backend, 0);
+    if (prepared) {
+        prepared = m009_prepare_task(&m009_tasks[1], second,
+                                      second_elf, second_bytes,
+                                      cpu.cr3 & PHYS_MASK,
+                                      &vmm, &backend, 1);
+    }
+    if (!prepared || !indianos_scheduler_init(&scheduler, &table)) {
+        serial_write("IndianOS: M009 FATAL cannot prepare two user contexts\n");
+        (void)m009_discard_task(&m009_tasks[1], &backend, false);
+        (void)m009_discard_task(&m009_tasks[0], &backend, false);
+        return false;
+    }
+    serial_write("IndianOS: M009 two simultaneous user address spaces ready\n");
+    bool ok = true;
+    while (ok && !indianos_scheduler_all_terminal(&scheduler)) {
+        struct indianos_process *pcb = indianos_scheduler_next(&scheduler);
+        if (pcb == NULL || pcb->pid < 1 || pcb->pid > M009_TASK_COUNT) {
+            ok = false;
+            break;
+        }
+        const unsigned slot = pcb->pid - 1u;
+        struct m009_task *task = &m009_tasks[slot];
+        if (task->pcb != pcb ||
+            !x86_64_user_interrupt_stack_select(slot)) {
+            ok = false;
+            break;
+        }
+        if (task->saved) {
+            if (!m009_saved_frame_valid(task) ||
+                !indianos_process_resume(pcb)) {
+                ok = false;
+                break;
+            }
+        } else if (!indianos_process_start(pcb, task->root.root)) {
+            ok = false;
+            break;
+        }
+        log_pid(pcb->pid, "DISPATCHED");
+        last_user_fault_vector = 0;
+        last_user_fault_error = 0;
+        last_user_fault_address = 0;
+        current_user = &task->image;
+        m009_active = task;
+        uint64_t status = task->saved
+            ? x86_64_resume_user(task->frame, task->root.root)
+            : x86_64_enter_user(task->image.plan.entry,
+                                 task->image.plan.stack_end - 16, task->root.root);
+        m009_active = NULL;
+        current_user = NULL;
+        uint64_t active_cr3 = 0;
+        __asm__ volatile ("mov %%cr3, %0" : "=r"(active_cr3));
+        if ((active_cr3 & PHYS_MASK) != (cpu.cr3 & PHYS_MASK)) {
+            serial_write("IndianOS: M009 FATAL CR3 was not restored\n");
+            return false; /* Never free frames under an active user root. */
+        }
+        if (status == M009_YIELD_STATUS && task->saved &&
+            last_user_fault_vector == 0) {
+            if (!indianos_scheduler_yield(&scheduler, pcb)) {
+                ok = false;
+                break;
+            }
+            log_pid(pcb->pid, "YIELDED");
+            indianos_scheduler_account_tick(&scheduler);
+        } else {
+            if (status == M009_YIELD_STATUS) {
+                ok = false;
+                break;
+            }
+            const bool finished = last_user_fault_vector != 0
+                ? indianos_process_fault(pcb, status,
+                                        last_user_fault_vector,
+                                        last_user_fault_error,
+                                        last_user_fault_address)
+                : indianos_process_exit(pcb, status);
+            if (!finished) {
+                ok = false;
+                break;
+            }
+            log_pid(pcb->pid, last_user_fault_vector ? "FAULTED" : "EXITED");
+            if (!m009_discard_task(task, &backend, true)) {
+                ok = false;
+                break;
+            }
+        }
+    }
+    if (ok && (!indianos_scheduler_all_terminal(&scheduler) ||
+               !indianos_process_success(first) ||
+               !indianos_process_success(second) ||
+               scheduler.dispatch_count != 6 || scheduler.yield_count != 4 ||
+               scheduler.tick_count != 4 ||
+               pmm_free_frames() != starting_free))
+        ok = false;
+    if (ok) serial_write("IndianOS: M009 round-robin cooperative switching PASSED\n");
+    else serial_write("IndianOS: M009 FATAL scheduler or memory ownership verification\n");
+    return ok;
+}
