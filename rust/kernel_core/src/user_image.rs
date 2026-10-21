@@ -88,6 +88,8 @@ pub unsafe extern "C" fn indianos_user_image_destroy(
 ) -> bool {
     let Some(img) = (unsafe { image.as_mut() }) else { return false; };
     if !img.tables.initialized { return false; }
+    // Revoke user-copy access before any frame is freed or unmapped.
+    img.ready = false;
     let mut ok = true;
     for i in (0..img.page_count as usize).rev() {
         let page = img.pages[i];
@@ -203,6 +205,37 @@ pub unsafe extern "C" fn indianos_user_image_load(
 /// \`image\` is a valid live user image and \`destination\` a separate
 /// writable kernel buffer of at least \`length\` bytes. User virtual
 /// addresses are checked numerically, never dereferenced as raw pointers.
+fn page_owned(image: &UserImage, va: u64, physical: u64) -> bool {
+    if image.page_count as usize > MAX_IMAGE_PAGES { return false; }
+    image.pages[..image.page_count as usize].iter().any(|page| {
+        page.virtual_address == va && page.physical_address == physical
+    })
+}
+
+/// Check the entire requested range before copying its first byte. A valid
+/// PTE does not establish ownership of the underlying physical frame.
+unsafe fn copy_preflight(image: &UserImage, address: u64, len: usize) -> bool {
+    let mut done = 0usize;
+    while done < len {
+        let Some(at) = address.checked_add(done as u64) else { return false; };
+        let va = at & !(PAGE as u64 - 1);
+        let offset = (at & (PAGE as u64 - 1)) as usize;
+        let mut mapped = Mapping {
+            physical: 0, permissions: Permissions {
+                writable: false, executable: false, user: false,
+            },
+        };
+        if !unsafe { vmm_query_page(&image.tables, va, &mut mapped) } ||
+            !mapped.permissions.user ||
+            (mapped.permissions.writable && mapped.permissions.executable) ||
+            !page_owned(image, va, mapped.physical) {
+            return false;
+        }
+        done += (PAGE - offset).min(len - done);
+    }
+    true
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn indianos_user_copy_readonly(
     image: *const UserImage, address: u64,
@@ -210,7 +243,8 @@ pub unsafe extern "C" fn indianos_user_copy_readonly(
 ) -> bool {
     let Some(img) = (unsafe { image.as_ref() }) else { return false; };
     if !img.ready || destination.is_null() || !(1..=MAX_WRITE).contains(&length) ||
-        !unsafe { indianos_program_user_range(&img.plan, address, length as u64, false) } {
+        !unsafe { indianos_program_user_range(&img.plan, address, length as u64, false) } ||
+        !unsafe { copy_preflight(img, address, length) } {
         return false;
     }
     let mut done = 0usize;
@@ -223,8 +257,11 @@ pub unsafe extern "C" fn indianos_user_copy_readonly(
                 writable: false, executable: false, user: false,
             },
         };
+        // Recheck in the copy pass; trap-gate syscall execution masks IRQs.
         if !unsafe { vmm_query_page(&img.tables, va, &mut mapping) } ||
-            !mapping.permissions.user { return false; }
+            !mapping.permissions.user ||
+            (mapping.permissions.writable && mapping.permissions.executable) ||
+            !page_owned(img, va, mapping.physical) { return false; }
         let source = unsafe { access(img, mapping.physical) };
         if source.is_null() { return false; }
         let count = (PAGE - offset).min(length - done);
@@ -249,5 +286,20 @@ mod tests {
         assert_eq!(offset_of!(UserImage, page_count), 2584);
         assert_eq!(size_of::<UserImage>(), 2592);
         assert_eq!(MAX_WRITE, 256);
+    }
+
+    #[test]
+    fn user_copy_rejects_foreign_frames_and_invalid_counts() {
+        let mut img: UserImage = unsafe { core::mem::zeroed() };
+        img.page_count = 2;
+        img.pages[0] = UserPage { virtual_address: 0x400000, physical_address: 0x1000 };
+        img.pages[1] = UserPage { virtual_address: 0x401000, physical_address: 0x2000 };
+        assert!(page_owned(&img, 0x400000, 0x1000));
+        assert!(page_owned(&img, 0x401000, 0x2000));
+        assert!(!page_owned(&img, 0x400000, 0x2000));
+        assert!(!page_owned(&img, 0x402000, 0x1000));
+        assert!(!page_owned(&img, 0x401000, 0xffff_8000_0000_0000));
+        img.page_count = 129;
+        assert!(!page_owned(&img, 0x400000, 0x1000));
     }
 }
