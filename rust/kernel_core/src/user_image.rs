@@ -5,7 +5,7 @@
 //! frames. These C ABI functions never activate CR3. The page-table clone
 //! must be detached and kernel CR3 restored BEFORE destroying the image.
 
-use core::{ptr, slice, ffi::c_void};
+use core::{ptr, ffi::c_void};
 use crate::program::{indianos_program_plan_elf64, indianos_program_user_range};
 use crate::syscall::{ProgramPlan, ProgramSegment, MAX_SEGMENTS};
 use crate::vmm::{
@@ -32,21 +32,21 @@ pub struct UserImage {
     pub ready: bool,
 }
 
-unsafe fn allocate(image: *mut UserImage) -> Option<u64> {
-    let backend = unsafe { &(*image).tables.backend };
+unsafe fn allocate(image: &UserImage) -> Option<u64> {
+    let backend = &image.tables.backend;
     let mut frame = 0u64;
     if !unsafe { (backend.allocate?)(&mut frame, backend.context) } {
         return None;
     }
     Some(frame)
 }
-unsafe fn release(image: *mut UserImage, physical: u64) -> bool {
-    let b = unsafe { &(*image).tables.backend };
+unsafe fn release(image: &UserImage, physical: u64) -> bool {
+    let b = &image.tables.backend;
     let Some(release) = b.release else { return false; };
     unsafe { release(physical, b.context) }
 }
-unsafe fn access(image: *const UserImage, physical: u64) -> *mut u8 {
-    let b = unsafe { &(*image).tables.backend };
+unsafe fn access(image: &UserImage, physical: u64) -> *mut u8 {
+    let b = &image.tables.backend;
     let Some(access) = b.access else { return ptr::null_mut(); };
     unsafe { access(physical, b.context).cast::<u8>() }
 }
@@ -54,9 +54,9 @@ unsafe fn access(image: *const UserImage, physical: u64) -> *mut u8 {
 /// Allocate a data frame, initialize bytes through HHDM, map it into a
 /// detached root and record ownership; page tables are managed by VMM.
 unsafe fn stage(
-    image: *mut UserImage, va: u64, perms: Permissions,
+    image: &mut UserImage, va: u64, perms: Permissions,
 ) -> Option<u64> {
-    if unsafe { (*image).page_count } as usize >= MAX_IMAGE_PAGES {
+    if image.page_count as usize >= MAX_IMAGE_PAGES {
         return None;
     }
     let phys = unsafe { allocate(image) }?;
@@ -69,17 +69,13 @@ unsafe fn stage(
     for i in 0..PAGE {
         unsafe { ptr::write_volatile(frame.add(i), 0); }
     }
-    if !unsafe { vmm_map_page(&mut (*image).tables, va, phys, perms) } {
+    if !unsafe { vmm_map_page(&mut image.tables, va, phys, perms) } {
         let _ = unsafe { release(image, phys) };
         return None;
     }
-    let index = unsafe { (*image).page_count } as usize;
-    unsafe {
-        (*image).pages[index] = UserPage {
-            virtual_address: va, physical_address: phys,
-        };
-        (*image).page_count += 1;
-    }
+    let index = image.page_count as usize;
+    image.pages[index] = UserPage { virtual_address: va, physical_address: phys };
+    image.page_count += 1;
     Some(phys)
 }
 
@@ -99,7 +95,7 @@ pub unsafe extern "C" fn indianos_user_image_destroy(
             ok = false;
             continue;
         }
-        if !unsafe { release(image, page.physical_address) } { ok = false; }
+        if !unsafe { release(img, page.physical_address) } { ok = false; }
     }
     if !ok { return false; } // preserve root metadata on partial failure
     if !unsafe { vmm_destroy_empty(&mut img.tables) } { return false; }
@@ -152,7 +148,7 @@ pub unsafe extern "C" fn indianos_user_image_load(
         };
         let mut va = segment.page_begin;
         while va < segment.page_end {
-            let Some(physical) = (unsafe { stage(image, va, perm) }) else {
+            let Some(physical) = (unsafe { stage(img, va, perm) }) else {
                 ok = false;
                 break;
             };
@@ -160,7 +156,7 @@ pub unsafe extern "C" fn indianos_user_image_load(
             let file_end = segment.virtual_address + segment.file_size;
             let end = file_end.min(va + PAGE as u64);
             if start < end {
-                let frame = unsafe { access(image, physical) };
+                let frame = unsafe { access(img, physical) };
                 if frame.is_null() { ok = false; break; }
                 let dest_offset = (start - va) as usize;
                 let source_offset =
@@ -179,7 +175,7 @@ pub unsafe extern "C" fn indianos_user_image_load(
     };
     let mut va = plan.stack_begin;
     while va < plan.stack_end && ok {
-        ok = unsafe { stage(image, va, stack_perm) }.is_some();
+        ok = unsafe { stage(img, va, stack_perm) }.is_some();
         va += PAGE as u64;
     }
     if ok {
@@ -229,7 +225,7 @@ pub unsafe extern "C" fn indianos_user_copy_readonly(
         };
         if !unsafe { vmm_query_page(&img.tables, va, &mut mapping) } ||
             !mapping.permissions.user { return false; }
-        let source = unsafe { access(image, mapping.physical) };
+        let source = unsafe { access(img, mapping.physical) };
         if source.is_null() { return false; }
         let count = (PAGE - offset).min(length - done);
         for i in 0..count {
