@@ -27,11 +27,34 @@ bool indianos_process_ready(struct indianos_process *p) {
     return true;
 }
 
+bool indianos_process_bind(struct indianos_process *p, uint64_t root) {
+    if (p == NULL || p->pid == 0 || p->state != INDIANOS_PROCESS_READY ||
+        p->address_space_root != 0 || p->resources_reclaimed ||
+        root == 0 || (root & 4095ull) != 0) return false;
+    p->address_space_root = root;
+    return true;
+}
+
 bool indianos_process_start(struct indianos_process *p, uint64_t root) {
     if (p == NULL || p->pid == 0 || p->state != INDIANOS_PROCESS_READY ||
-        root == 0 || (root & 4095ull) != 0) return false;
+        root == 0 || (root & 4095ull) != 0 || p->resources_reclaimed ||
+        (p->address_space_root != 0 && p->address_space_root != root)) return false;
     p->state = INDIANOS_PROCESS_RUNNING;
     p->address_space_root = root;
+    return true;
+}
+
+bool indianos_process_pause(struct indianos_process *p) {
+    if (p == NULL || p->pid == 0 || p->state != INDIANOS_PROCESS_RUNNING ||
+        p->address_space_root == 0 || p->resources_reclaimed) return false;
+    p->state = INDIANOS_PROCESS_READY;
+    return true;
+}
+
+bool indianos_process_resume(struct indianos_process *p) {
+    if (p == NULL || p->pid == 0 || p->state != INDIANOS_PROCESS_READY ||
+        p->address_space_root == 0 || p->resources_reclaimed) return false;
+    p->state = INDIANOS_PROCESS_RUNNING;
     return true;
 }
 
