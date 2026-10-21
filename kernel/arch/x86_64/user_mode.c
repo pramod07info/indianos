@@ -9,6 +9,7 @@
 #include <indianos/user_fault.h>
 #include <indianos/process.h>
 #include <indianos/scheduler.h>
+#include <indianos/timer.h>
 #include <indianos/serial.h>
 #include <stdint.h>
 #include <stddef.h>
@@ -56,9 +57,44 @@ struct m009_task {
     uint64_t frame[M009_CONTEXT_WORDS] __attribute__((aligned(16)));
     bool saved;
     bool attached;
+    uint32_t timer_preemptions;
 };
 static struct m009_task m009_tasks[M009_TASK_COUNT];
 static struct m009_task *m009_active;
+
+/* Every saved context is built from the CPU's own 15 GPR + user IRET
+ * frame, not an untrusted user pointer. Timer IRQs require user IF=1;
+ * cooperative syscalls require user IF=0. IOPL must always be zero. */
+static bool m009_capture_frame(const uint64_t *regs, bool via_timer) {
+    if (m009_active == NULL || m009_active->pcb == NULL || regs == NULL ||
+        m009_active->pcb->state != INDIANOS_PROCESS_RUNNING ||
+        regs[16] != 0x2bull || regs[19] != 0x33ull ||
+        (regs[17] & 0x3000ull) != 0 ||
+        ((regs[17] & 0x200ull) != 0) != via_timer) return false;
+    for (unsigned i = 0; i < M009_CONTEXT_WORDS; ++i)
+        m009_active->frame[i] = regs[i];
+    m009_active->frame[14] = 0; /* SYS_YIELD return value on resume */
+    m009_active->saved = true;
+    return true;
+}
+
+/* ACK the PIC even if unexpected. Only user-mode IRQ frames from this
+ * bounded active task can cause a context switch. Hardware IRQs are not
+ * enabled by the cooperative path or any ordinary IndianOS boot. */
+void x86_64_scheduler_timer_dispatch(const uint64_t *regs) {
+    x86_64_timer_ack_irq0();
+#ifdef INDIANOS_TEST_PREEMPT
+    if (m009_capture_frame(regs, true)) {
+        if (m009_active->timer_preemptions != UINT32_MAX)
+            ++m009_active->timer_preemptions;
+        log_pid(m009_active->pcb->pid, "TIMER_PREEMPTED");
+        x86_64_user_exit_to_kernel(M009_YIELD_STATUS);
+    }
+#else
+    (void)regs;
+#endif
+}
+
 
 static uint64_t last_user_fault_vector;
 static uint64_t last_user_fault_error;
@@ -134,19 +170,7 @@ uint64_t x86_64_user_syscall_dispatch(const uint64_t *regs) {
     if (!indianos_syscall_validate(&current_user->plan, request))
         return UINT64_MAX;
     if (request.number == INDIANOS_SYS_YIELD) {
-        if (m009_active == NULL || m009_active->pcb == NULL ||
-            m009_active->pcb->state != INDIANOS_PROCESS_RUNNING ||
-            regs[16] != 0x2bull || regs[19] != 0x33ull ||
-            (regs[17] & (0x200ull | 0x3000ull)) != 0) {
-            return UINT64_MAX;
-        }
-        /* Frame order is identical to the 15 GPR pushes and hardware
-         * RIP:CS:RFLAGS:RSP:SS on the software interrupt stack. */
-        for (unsigned i = 0; i < M009_CONTEXT_WORDS; ++i) {
-            m009_active->frame[i] = regs[i];
-        }
-        m009_active->frame[14] = 0; /* return SYS_YIELD=success to user */
-        m009_active->saved = true;
+        if (!m009_capture_frame(regs, false)) return UINT64_MAX;
         x86_64_user_exit_to_kernel(M009_YIELD_STATUS);
     }
     if (request.number == INDIANOS_SYS_ABI_QUERY)
@@ -437,8 +461,13 @@ static bool m009_prepare_task(struct m009_task *task,
 static bool m009_saved_frame_valid(const struct m009_task *task) {
     if (task == NULL || !task->saved ||
         task->frame[16] != 0x2bull || task->frame[19] != 0x33ull ||
-        (task->frame[17] & (0x200ull | 0x3000ull)) != 0 ||
+        (task->frame[17] & 0x3000ull) != 0 ||
         (task->frame[17] & 0x2ull) == 0) return false;
+#ifdef INDIANOS_TEST_PREEMPT
+    if ((task->frame[17] & 0x200ull) == 0) return false;
+#else
+    if ((task->frame[17] & 0x200ull) != 0) return false;
+#endif
     const uint64_t rip = task->frame[15];
     const uint64_t rsp = task->frame[18];
     struct vmm_mapping mapping = {0};
@@ -517,6 +546,13 @@ bool x86_64_m009_schedule_run(const uint8_t *first_elf, size_t first_bytes,
         return false;
     }
     serial_write("IndianOS: M009 two simultaneous user address spaces ready\n");
+#ifdef INDIANOS_TEST_PREEMPT
+    if (!x86_64_timer_start_100hz()) {
+        serial_write("IndianOS: M009 FATAL cannot configure PIC/PIT timer\n");
+        return false;
+    }
+    serial_write("IndianOS: M009 hardware PIT IRQ0 enabled at 100 Hz\n");
+#endif
     bool ok = true;
     while (ok && !indianos_scheduler_all_terminal(&scheduler)) {
         struct indianos_process *pcb = indianos_scheduler_next(&scheduler);
@@ -592,11 +628,20 @@ bool x86_64_m009_schedule_run(const uint8_t *first_elf, size_t first_bytes,
     if (ok && (!indianos_scheduler_all_terminal(&scheduler) ||
                !indianos_process_success(first) ||
                !indianos_process_success(second) ||
-               scheduler.dispatch_count != 6 || scheduler.yield_count != 4 ||
-               scheduler.tick_count != 4 ||
                pmm_free_frames() != starting_free))
         ok = false;
+#ifdef INDIANOS_TEST_PREEMPT
+    if (scheduler.yield_count < 2 || scheduler.tick_count < 2 ||
+        m009_tasks[0].timer_preemptions == 0 ||
+        m009_tasks[1].timer_preemptions == 0 ||
+        x86_64_timer_irq_count() < 2)
+        ok = false;
+    if (ok) serial_write("IndianOS: M009 timer-preemptive round-robin PASSED\n");
+#else
+    if (scheduler.dispatch_count != 6 || scheduler.yield_count != 4 ||
+        scheduler.tick_count != 4) ok = false;
     if (ok) serial_write("IndianOS: M009 round-robin cooperative switching PASSED\n");
-    else serial_write("IndianOS: M009 FATAL scheduler or memory ownership verification\n");
+#endif
+    if (!ok) serial_write("IndianOS: M009 FATAL scheduler or memory ownership verification\n");
     return ok;
 }
