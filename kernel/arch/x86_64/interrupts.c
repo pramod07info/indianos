@@ -7,6 +7,8 @@
 #define KERNEL_CODE_SELECTOR 0x08u
 #define TSS_SELECTOR 0x18u
 #define DOUBLE_FAULT_IST_INDEX 1u
+#define USER_SYSCALL_VECTOR 0x80u
+#define USER_INTERRUPT_GATE 0xeeu
 
 struct __attribute__((packed)) descriptor_ptr {
     uint16_t limit;
@@ -44,26 +46,30 @@ struct exception_context {
 extern void x86_64_load_gdt(const struct descriptor_ptr *descriptor);
 extern void (*const x86_64_exception_stubs[32])(void);
 extern void x86_64_unexpected_interrupt(void);
+extern void x86_64_user_interrupt(void);
+static uint8_t user_kernel_stack[32768] __attribute__((aligned(16)));
 
 /* Four contiguous 64-bit descriptor slots plus null; the TSS occupies 2. */
-static uint64_t gdt[5] __attribute__((aligned(16))) = {
+static uint64_t gdt[7] __attribute__((aligned(16))) = {
     0x0000000000000000ull,
     0x00af9a000000ffffull, /* Ring-0, 64-bit executable segment. */
     0x00cf92000000ffffull, /* Ring-0 data segment. */
     0, 0,                /* 16-byte TSS descriptor, filled at runtime. */
+    0x00affa000000ffffull, /* Ring-3, 64-bit executable segment, selector 0x2b. */
+    0x00cff2000000ffffull, /* Ring-3 data, selector 0x33. */
 };
 static struct idt_entry idt[256] __attribute__((aligned(16)));
 static struct tss64 tss __attribute__((aligned(16)));
 /* A dedicated stack for #DF, separate from a possibly corrupted RSP. */
 static uint8_t double_fault_stack[16384] __attribute__((aligned(16)));
 
-static void set_gate(uint8_t vector, void (*handler)(void), uint8_t ist) {
+static void set_gate(uint8_t vector, void (*handler)(void), uint8_t ist, uint8_t attr) {
     uint64_t address = (uint64_t)(uintptr_t)handler;
     idt[vector] = (struct idt_entry) {
         .offset_low = (uint16_t)address,
         .selector = KERNEL_CODE_SELECTOR,
         .ist = ist,
-        .attributes = INTERRUPT_GATE,
+        .attributes = attr,
         .offset_mid = (uint16_t)(address >> 16),
         .offset_high = (uint32_t)(address >> 32),
         .reserved = 0,
@@ -94,19 +100,27 @@ bool x86_64_exceptions_init(void) {
     const uint16_t selector = TSS_SELECTOR;
     __asm__ volatile ("ltr %0" : : "rm"(selector) : "memory");
     for (unsigned int i = 0; i < 256; ++i) {
-        set_gate((uint8_t)i, x86_64_unexpected_interrupt, 0);
+        set_gate((uint8_t)i, x86_64_unexpected_interrupt, 0, INTERRUPT_GATE);
     }
     for (unsigned int i = 0; i < 32; ++i) {
         const uint8_t ist = i == 8 ? DOUBLE_FAULT_IST_INDEX : 0;
-        set_gate((uint8_t)i, x86_64_exception_stubs[i], ist);
+        set_gate((uint8_t)i, x86_64_exception_stubs[i], ist, INTERRUPT_GATE);
     }
+    /* DPL 3 allows software INT 0x80, but no other user-callable gate. */
+    set_gate(USER_SYSCALL_VECTOR, x86_64_user_interrupt, 0, USER_INTERRUPT_GATE);
     const struct descriptor_ptr idtr = {
         .limit = sizeof(idt) - 1,
         .address = (uint64_t)(uintptr_t)idt,
     };
     __asm__ volatile ("lidt %0" : : "m"(idtr) : "memory");
-    /* No PIC/APIC setup or interrupt enabling; user-mode RSP0 not configured. */
+    /* Hardware interrupts remain off. RSP0 is enabled only for opt-in test. */
     return true;
+}
+
+bool x86_64_user_interrupt_stack_enable(void) {
+    if (tss.ist1 == 0) return false;
+    tss.rsp0 = (uint64_t)(uintptr_t)(user_kernel_stack + sizeof(user_kernel_stack));
+    return tss.rsp0 != 0;
 }
 
 static void serial_write_hex(uint64_t value) {
