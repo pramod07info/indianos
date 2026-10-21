@@ -13,7 +13,8 @@ const TABLE_ENTRIES: usize = 512;
 const CLONE_LIMIT: u32 = 8192;
 
 #[repr(C)]
-pub struct CpuState {
+#[derive(Default)]
+pub(crate) struct CpuState {
     long_mode: bool, nx: bool, msr: bool, pae: bool,
     paging_enabled: bool, pae_enabled: bool, la57_enabled: bool,
     nxe_enabled: bool, write_protect_enabled: bool, pcid_enabled: bool,
