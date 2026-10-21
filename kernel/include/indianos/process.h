@@ -19,7 +19,7 @@ enum indianos_process_state {
 struct indianos_process {
     uint32_t pid;
     enum indianos_process_state state;
-    uint64_t address_space_root; /* page-table root only while RUNNING */
+    uint64_t address_space_root; /* page-table root when READY (bound) or RUNNING */
     uint64_t exit_status;
     uint64_t fault_vector;
     uint64_t fault_error;
@@ -38,7 +38,13 @@ struct indianos_process_table {
 bool indianos_process_table_init(struct indianos_process_table *table);
 struct indianos_process *indianos_process_create(struct indianos_process_table *table);
 bool indianos_process_ready(struct indianos_process *process);
+/* Bind a prepared CR3 before first dispatch; a paused task retains it.
+ * No completed process can be rebound. */
+bool indianos_process_bind(struct indianos_process *process, uint64_t root);
 bool indianos_process_start(struct indianos_process *process, uint64_t root);
+/* Voluntary yield preserves the owned root and returns to READY. */
+bool indianos_process_pause(struct indianos_process *process);
+bool indianos_process_resume(struct indianos_process *process);
 bool indianos_process_exit(struct indianos_process *process, uint64_t status);
 bool indianos_process_fault(struct indianos_process *process,
                            uint64_t status, uint64_t vector,
