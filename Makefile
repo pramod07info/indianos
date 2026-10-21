@@ -19,7 +19,7 @@ LIMINE_TARBALL := $(BUILD)/third_party/limine-binary.tar.gz
 LIMINE_URL := https://github.com/Limine-Bootloader/Limine/releases/download/v12.9.3/limine-binary.tar.gz
 LIMINE_SHA256 := 9f42fe9ea2e84d71056529969b1d5c24ba9a2287ffcc01bcce58b0ef8aa98b1d
 
-SOURCES := kernel/src/main.c kernel/src/serial.c kernel/src/boot.c kernel/src/pmm.c kernel/src/vmm.c kernel/src/vmm_boot.c kernel/src/paging_clone.c kernel/src/paging_policy.c kernel/src/program.c kernel/src/syscall_abi.c kernel/src/memory_runtime.c kernel/src/initramfs.c kernel/src/user_image.c kernel/src/user_image_boot.c kernel/src/user_copy.c kernel/src/user_fault_policy.c kernel/src/process.c
+SOURCES := kernel/src/main.c kernel/src/serial.c kernel/src/boot.c kernel/src/pmm.c kernel/src/vmm.c kernel/src/vmm_boot.c kernel/src/paging_clone.c kernel/src/paging_policy.c kernel/src/program.c kernel/src/syscall_abi.c kernel/src/memory_runtime.c kernel/src/initramfs.c kernel/src/user_image.c kernel/src/user_image_boot.c kernel/src/user_copy.c kernel/src/user_fault_policy.c kernel/src/process.c kernel/src/scheduler.c
 OBJECTS := $(patsubst kernel/src/%.c,$(BUILD)/obj/%.o,$(SOURCES))
 OBJECTS += $(BUILD)/obj/interrupts.o $(BUILD)/obj/interrupt_entry.o $(BUILD)/obj/paging.o $(BUILD)/obj/user_mode.o $(BUILD)/obj/user_entry.o
 HEADERS := $(wildcard kernel/include/indianos/*.h) third_party/limine/limine.h
@@ -42,6 +42,9 @@ endif
 ifeq ($(USERMODE_SELFTEST),1)
 CFLAGS += -DINDIANOS_TEST_RING3
 endif
+ifeq ($(SCHEDULER_SELFTEST),1)
+CFLAGS += -DINDIANOS_TEST_SCHEDULER
+endif
 ifeq ($(PROCESS_SELFTEST),1)
 CFLAGS += -DINDIANOS_TEST_PROCESSES
 endif
@@ -59,7 +62,7 @@ LDFLAGS := -target x86_64-unknown-none-elf -fuse-ld=lld -nostdlib -static \
            -Wl,-z,max-page-size=0x1000 -Wl,-z,noexecstack \
            -Wl,--gc-sections -Wl,--build-id=none -Wl,-T,kernel/linker.ld
 
-.PHONY: all kernel user-elf test-user-elf test-ring3-elf initramfs test-initramfs image run run-bios test-boot test-exception test-pagefault test-shadow test-usermode test-userfault-supervisor test-userfault-guard test-processes test-host toolchain-check clean
+.PHONY: all kernel user-elf test-user-elf test-ring3-elf initramfs test-initramfs image run run-bios test-boot test-exception test-pagefault test-shadow test-usermode test-userfault-supervisor test-userfault-guard test-processes test-scheduler test-host toolchain-check clean
 all: image
 kernel: $(KERNEL_ELF)
 
@@ -98,7 +101,7 @@ USER_OBJ := $(BUILD)/userland/entry.o
 WORKER_OBJ := $(BUILD)/userland/worker.o
 WORKER_ELF := $(BUILD)/userland/worker.elf
 INITRAMFS := $(BUILD)/initramfs.img
-ifeq ($(PROCESS_SELFTEST),1)
+ifneq ($(filter 1,$(PROCESS_SELFTEST) $(SCHEDULER_SELFTEST)),)
 INITRAMFS_EXTRA_DEPS := $(WORKER_ELF)
 INITRAMFS_EXTRA_ARGS := --extra-elf $(WORKER_ELF) --extra-name /bin/worker
 endif
@@ -111,6 +114,10 @@ $(USER_OBJ): userland/demo/fault_entry.S Makefile
 	$(CC) -target x86_64-unknown-none-elf -mno-red-zone \
 	    $(if $(filter guard,$(USERFAULT_KIND)),-DINDIANOS_TEST_FAULT_GUARD,) \
 	    -c $< -o $@
+else ifeq ($(SCHEDULER_SELFTEST),1)
+$(USER_OBJ): userland/demo/scheduler_a.S Makefile
+	@mkdir -p $(@D)
+	$(CC) -target x86_64-unknown-none-elf -mno-red-zone -c $< -o $@
 else ifeq ($(PROCESS_SELFTEST),1)
 $(USER_OBJ): userland/demo/ring3_entry.S Makefile
 	@mkdir -p $(@D)
@@ -133,9 +140,15 @@ $(USER_ELF): $(USER_OBJ) userland/demo/linker.ld Makefile
 	    -Wl,-T,userland/demo/linker.ld $(USER_OBJ) -o $@
 	@readelf -h $@ | grep -q 'Type:.*EXEC'
 
+ifeq ($(SCHEDULER_SELFTEST),1)
+$(WORKER_OBJ): userland/demo/scheduler_b.S Makefile
+	@mkdir -p $(@D)
+	$(CC) -target x86_64-unknown-none-elf -mno-red-zone -c $< -o $@
+else
 $(WORKER_OBJ): userland/demo/worker_entry.S Makefile
 	@mkdir -p $(@D)
 	$(CC) -target x86_64-unknown-none-elf -mno-red-zone -c $< -o $@
+endif
 
 $(WORKER_ELF): $(WORKER_OBJ) userland/demo/linker.ld Makefile
 	$(CC) -target x86_64-unknown-none-elf -fuse-ld=lld -nostdlib -static \
@@ -165,7 +178,7 @@ $(BUILD)/inspect_archive: tests/inspect_archive.c kernel/src/initramfs.c kernel/
 	    tests/inspect_archive.c kernel/src/initramfs.c kernel/src/program.c -o $@
 
 test-initramfs: $(INITRAMFS) $(BUILD)/inspect_archive
-	$(BUILD)/inspect_archive $(INITRAMFS) $(if $(filter 1,$(PROCESS_SELFTEST)),/bin/worker,)
+	$(BUILD)/inspect_archive $(INITRAMFS) $(if $(filter 1,$(PROCESS_SELFTEST) $(SCHEDULER_SELFTEST)),/bin/worker,)
 
 toolchain-check:
 	@command -v $(CC) && command -v ld.lld && command -v readelf
@@ -250,6 +263,11 @@ test-processes:
 	$(MAKE) image BUILD=build/processes PROCESS_SELFTEST=1
 	python3 tools/smoke_boot.py --iso build/processes/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)" --mode processes
 
+test-scheduler:
+	$(MAKE) test-initramfs BUILD=build/scheduler SCHEDULER_SELFTEST=1
+	$(MAKE) image BUILD=build/scheduler SCHEDULER_SELFTEST=1
+	python3 tools/smoke_boot.py --iso build/scheduler/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)" --mode scheduler
+
 test-host:
 	@mkdir -p $(BUILD)
 	$(CC) -std=c11 -O2 -g -Wall -Wextra -Werror -I kernel/include \
@@ -274,6 +292,10 @@ test-host:
 	$(CC) -std=c11 -O2 -g -Wall -Wextra -Werror -I kernel/include \
 	    tests/test_process.c kernel/src/process.c -o $(BUILD)/process_test
 	$(BUILD)/process_test
+	$(CC) -std=c11 -O2 -g -Wall -Wextra -Werror -I kernel/include \
+	    tests/test_scheduler.c kernel/src/scheduler.c kernel/src/process.c \
+	    -o $(BUILD)/scheduler_test
+	$(BUILD)/scheduler_test
 	python3 -m unittest discover -s tests -v
 
 clean:
