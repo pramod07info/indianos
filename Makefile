@@ -19,7 +19,7 @@ LIMINE_TARBALL := $(BUILD)/third_party/limine-binary.tar.gz
 LIMINE_URL := https://github.com/Limine-Bootloader/Limine/releases/download/v12.9.3/limine-binary.tar.gz
 LIMINE_SHA256 := 9f42fe9ea2e84d71056529969b1d5c24ba9a2287ffcc01bcce58b0ef8aa98b1d
 
-SOURCES := kernel/src/main.c kernel/src/serial.c kernel/src/boot.c kernel/src/pmm.c kernel/src/vmm.c kernel/src/vmm_boot.c kernel/src/paging_clone.c kernel/src/paging_policy.c kernel/src/program.c kernel/src/syscall_abi.c kernel/src/memory_runtime.c kernel/src/initramfs.c kernel/src/user_image.c kernel/src/user_image_boot.c kernel/src/user_copy.c kernel/src/user_fault_policy.c
+SOURCES := kernel/src/main.c kernel/src/serial.c kernel/src/boot.c kernel/src/pmm.c kernel/src/vmm.c kernel/src/vmm_boot.c kernel/src/paging_clone.c kernel/src/paging_policy.c kernel/src/program.c kernel/src/syscall_abi.c kernel/src/memory_runtime.c kernel/src/initramfs.c kernel/src/user_image.c kernel/src/user_image_boot.c kernel/src/user_copy.c kernel/src/user_fault_policy.c kernel/src/process.c
 OBJECTS := $(patsubst kernel/src/%.c,$(BUILD)/obj/%.o,$(SOURCES))
 OBJECTS += $(BUILD)/obj/interrupts.o $(BUILD)/obj/interrupt_entry.o $(BUILD)/obj/paging.o $(BUILD)/obj/user_mode.o $(BUILD)/obj/user_entry.o
 HEADERS := $(wildcard kernel/include/indianos/*.h) third_party/limine/limine.h
@@ -42,6 +42,9 @@ endif
 ifeq ($(USERMODE_SELFTEST),1)
 CFLAGS += -DINDIANOS_TEST_RING3
 endif
+ifeq ($(PROCESS_SELFTEST),1)
+CFLAGS += -DINDIANOS_TEST_PROCESSES
+endif
 USERFAULT_KIND ?= supervisor
 ifeq ($(USERFAULT_SELFTEST),1)
 ifeq ($(USERFAULT_KIND),guard)
@@ -56,7 +59,7 @@ LDFLAGS := -target x86_64-unknown-none-elf -fuse-ld=lld -nostdlib -static \
            -Wl,-z,max-page-size=0x1000 -Wl,-z,noexecstack \
            -Wl,--gc-sections -Wl,--build-id=none -Wl,-T,kernel/linker.ld
 
-.PHONY: all kernel user-elf test-user-elf test-ring3-elf initramfs test-initramfs image run run-bios test-boot test-exception test-pagefault test-shadow test-usermode test-userfault-supervisor test-userfault-guard test-host toolchain-check clean
+.PHONY: all kernel user-elf test-user-elf test-ring3-elf initramfs test-initramfs image run run-bios test-boot test-exception test-pagefault test-shadow test-usermode test-userfault-supervisor test-userfault-guard test-processes test-host toolchain-check clean
 all: image
 kernel: $(KERNEL_ELF)
 
@@ -92,7 +95,13 @@ $(KERNEL_ELF): $(OBJECTS) kernel/linker.ld Makefile
 
 USER_ELF := $(BUILD)/userland/demo.elf
 USER_OBJ := $(BUILD)/userland/entry.o
+WORKER_OBJ := $(BUILD)/userland/worker.o
+WORKER_ELF := $(BUILD)/userland/worker.elf
 INITRAMFS := $(BUILD)/initramfs.img
+ifeq ($(PROCESS_SELFTEST),1)
+INITRAMFS_EXTRA_DEPS := $(WORKER_ELF)
+INITRAMFS_EXTRA_ARGS := --extra-elf $(WORKER_ELF) --extra-name /bin/worker
+endif
 
 # The normal ISO retains the inert fixture; only test-usermode replaces it
 # with a separate app that uses the draft IndianOS software interrupt ABI.
@@ -102,6 +111,10 @@ $(USER_OBJ): userland/demo/fault_entry.S Makefile
 	$(CC) -target x86_64-unknown-none-elf -mno-red-zone \
 	    $(if $(filter guard,$(USERFAULT_KIND)),-DINDIANOS_TEST_FAULT_GUARD,) \
 	    -c $< -o $@
+else ifeq ($(PROCESS_SELFTEST),1)
+$(USER_OBJ): userland/demo/ring3_entry.S Makefile
+	@mkdir -p $(@D)
+	$(CC) -target x86_64-unknown-none-elf -mno-red-zone -c $< -o $@
 else ifeq ($(USERMODE_SELFTEST),1)
 $(USER_OBJ): userland/demo/ring3_entry.S Makefile
 	@mkdir -p $(@D)
@@ -120,6 +133,16 @@ $(USER_ELF): $(USER_OBJ) userland/demo/linker.ld Makefile
 	    -Wl,-T,userland/demo/linker.ld $(USER_OBJ) -o $@
 	@readelf -h $@ | grep -q 'Type:.*EXEC'
 
+$(WORKER_OBJ): userland/demo/worker_entry.S Makefile
+	@mkdir -p $(@D)
+	$(CC) -target x86_64-unknown-none-elf -mno-red-zone -c $< -o $@
+
+$(WORKER_ELF): $(WORKER_OBJ) userland/demo/linker.ld Makefile
+	$(CC) -target x86_64-unknown-none-elf -fuse-ld=lld -nostdlib -static \
+	    -Wl,-z,max-page-size=0x1000 -Wl,-z,noexecstack \
+	    -Wl,-T,userland/demo/linker.ld $(WORKER_OBJ) -o $@
+	@readelf -h $@ | grep -q 'Type:.*EXEC'
+
 user-elf: $(USER_ELF)
 
 $(BUILD)/inspect_elf: tests/inspect_elf.c kernel/src/program.c kernel/include/indianos/program.h Makefile
@@ -130,8 +153,9 @@ $(BUILD)/inspect_elf: tests/inspect_elf.c kernel/src/program.c kernel/include/in
 test-user-elf: $(USER_ELF) $(BUILD)/inspect_elf
 	$(BUILD)/inspect_elf $(USER_ELF)
 
-$(INITRAMFS): $(USER_ELF) tools/build_initramfs.py Makefile
-	python3 tools/build_initramfs.py --elf $(USER_ELF) --name /bin/init --output $@
+$(INITRAMFS): $(USER_ELF) $(INITRAMFS_EXTRA_DEPS) tools/build_initramfs.py Makefile
+	python3 tools/build_initramfs.py --elf $(USER_ELF) --name /bin/init \
+	    $(INITRAMFS_EXTRA_ARGS) --output $@
 
 initramfs: $(INITRAMFS)
 
@@ -221,6 +245,10 @@ test-userfault-guard:
 	$(MAKE) image BUILD=build/fault-guard USERFAULT_SELFTEST=1 USERFAULT_KIND=guard
 	python3 tools/smoke_boot.py --iso build/fault-guard/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)" --mode fault-guard
 
+test-processes:
+	$(MAKE) image BUILD=build/processes PROCESS_SELFTEST=1
+	python3 tools/smoke_boot.py --iso build/processes/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)" --mode processes
+
 test-host:
 	@mkdir -p $(BUILD)
 	$(CC) -std=c11 -O2 -g -Wall -Wextra -Werror -I kernel/include \
@@ -242,6 +270,9 @@ test-host:
 	$(CC) -std=c11 -O2 -g -Wall -Wextra -Werror -I kernel/include \
 	    tests/test_user_fault.c kernel/src/user_fault_policy.c -o $(BUILD)/user_fault_test
 	$(BUILD)/user_fault_test
+	$(CC) -std=c11 -O2 -g -Wall -Wextra -Werror -I kernel/include \
+	    tests/test_process.c kernel/src/process.c -o $(BUILD)/process_test
+	$(BUILD)/process_test
 	python3 -m unittest discover -s tests -v
 
 clean:
