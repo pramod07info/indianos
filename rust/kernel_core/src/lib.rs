@@ -27,6 +27,8 @@ mod paging_cpu;
 mod user_runtime;
 #[cfg(feature = "test-interactive")]
 mod input;
+#[cfg(feature = "test-irq-keyboard")]
+mod console;
 #[cfg(feature = "runtime")]
 mod runtime;
 #[cfg(feature = "boot-staging")]

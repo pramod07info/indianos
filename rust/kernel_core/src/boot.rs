@@ -190,6 +190,31 @@ pub unsafe extern "C" fn boot_draw_status(){
     }
     log(b"IndianOS: framebuffer status rendered\n\0");
 }
+/// An optional and bounded framebuffer view for the R014.2 VGA console.
+/// This view borrows Limine framebuffer mappings for the lifetime of boot.
+#[cfg(feature="test-irq-keyboard")]
+pub(crate) struct ConsoleFramebuffer {
+    pub address:*mut u8,
+    pub width:usize,
+    pub height:usize,
+    pub pitch:usize,
+    pub fg:u32,
+    pub bg:u32,
+}
+#[cfg(feature="test-irq-keyboard")]
+pub(crate) fn console_framebuffer()->Option<ConsoleFramebuffer>{
+    let resp=unsafe{boot_limine_framebuffers().as_ref()}?;
+    if resp.count==0||resp.framebuffers.is_null(){return None;}
+    let first=unsafe{ptr::read_volatile(resp.framebuffers)};
+    let f=unsafe{first.as_ref()}?;
+    if !framebuffer_ok(f){return None;}
+    Some(ConsoleFramebuffer{
+        address:f.address,
+        width:f.width as usize,height:f.height as usize,pitch:f.pitch as usize,
+        fg:pixel(f,235,242,255),bg:pixel(f,10,18,35),
+    })
+}
+
 #[cfg(test)]
 mod tests{
     use super::*;

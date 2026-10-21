@@ -40,6 +40,7 @@ test-fault-guard = []
 test-fault-supervisor = []
 test-shell = []
 test-interactive = ["test-shell", "user-runtime"]
+test-irq-keyboard = ["test-interactive", "boot", "interrupts", "cpu-entry"]
 
 [profile.release]
 panic = "abort"

@@ -16,14 +16,14 @@ global_asm!(
     options(att_syntax),
 );
 
-#[cfg(feature = "preempt")]
+#[cfg(any(feature = "preempt", feature = "test-irq-keyboard"))]
 global_asm!(
     include_str!("arch/x86_64/user_entry.S"),
     rflags = const 0x202,
     options(att_syntax),
 );
 
-#[cfg(not(feature = "preempt"))]
+#[cfg(not(any(feature = "preempt", feature = "test-irq-keyboard")))]
 global_asm!(
     include_str!("arch/x86_64/user_entry.S"),
     rflags = const 0x02,
