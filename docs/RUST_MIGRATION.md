@@ -86,7 +86,7 @@ reference/fallback code and still support `RUST_CORE=0`.
 
 | Slice | Owned implementation to port | Core acceptance |
 | --- | --- | --- |
-| R002 | ELF parser, syscall ABI, initramfs parser and user image staging | malformed ELF and access tests + QEMU user app |
+| R002 continuation | PMM-backed user image staging, guarded user-memory copying | ELF staging failure rollback, mapping permissions and QEMU user app |
 | R003 | Physical frame allocator, memory map adapter, VMM page tables, paging clone | frame ownership, protection and failure rollback |
 | R004 | Kernel entry/Limine handoff, framebuffer, serial, IDT/TSS/timer | firmware boot and deliberate CPU exception QEMU |
 | R005 | Ring-3 ABI dispatcher, user-copy, process recovery, CPU-context integration | supervisor/guard fault containment, live scheduler |
