@@ -10,7 +10,9 @@ import argparse
 import os
 from pathlib import Path
 import selectors
+import shutil
 import subprocess
+import tempfile
 import sys
 import time
 
@@ -107,6 +109,16 @@ def assert_expected_usermode(text: str) -> None:
         offset = position + len(marker)
 
 
+def matching_ovmf_vars(code: Path) -> Path | None:
+    """Find the matching OVMF_VARS template without altering that template."""
+    if not code.name.startswith("OVMF_CODE"):
+        return None
+    template = code.with_name("OVMF_VARS" + code.name[len("OVMF_CODE"):])
+    if template.is_file():
+        return template
+    return None
+
+
 def run_smoke(iso: Path, ovmf: Path, qemu: str, timeout: float,
               mode: str = "normal") -> str:
     if not iso.is_file():
@@ -131,10 +143,23 @@ def run_smoke(iso: Path, ovmf: Path, qemu: str, timeout: float,
         "-cdrom", str(iso), "-boot", "d", "-display", "none",
         "-serial", "stdio", "-monitor", "none", "-no-reboot", "-no-shutdown",
     ]
+    tempvars = None
+    vars_template = matching_ovmf_vars(ovmf)
+    if vars_template is not None:
+        tempvars = tempfile.TemporaryDirectory(prefix="indianos-ovmf-")
+        vars_copy = Path(tempvars.name) / vars_template.name
+        try:
+            shutil.copyfile(vars_template, vars_copy)
+        except OSError as exc:
+            tempvars.cleanup()
+            raise RuntimeError(f"cannot copy OVMF variable template: {exc}") from exc
+        argv.extend(["-drive", f"if=pflash,unit=1,format=raw,file={vars_copy}"])
     try:
         process = subprocess.Popen(argv, stdout=subprocess.PIPE,
                                    stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
     except OSError as exc:
+        if tempvars is not None:
+            tempvars.cleanup()
         raise RuntimeError(f"unable to start QEMU: {exc}") from exc
     output = bytearray()
     try:
@@ -176,6 +201,8 @@ def run_smoke(iso: Path, ovmf: Path, qemu: str, timeout: float,
         except subprocess.TimeoutExpired:
             process.kill()
             process.communicate(timeout=3)
+        if tempvars is not None:
+            tempvars.cleanup()
 
 
 def main() -> int:
