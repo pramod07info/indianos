@@ -4,7 +4,7 @@
 
 use std::{
     fs,
-    io::Read,
+    io::{Read,Write},
     path::{Path,PathBuf},
     process::{Command,Stdio},
     sync::mpsc,
@@ -122,6 +122,30 @@ pub fn verify(mode:&str,text:&str)->Result<(),String>{
                 "IndianOS: R013 shell session complete",
             ]);
         }
+        "interactive"=>{
+            checks.extend(MILESTONES);
+            checks.extend([
+                "IndianOS: R013 init shell begin",
+                "IndianOS: PID 1 READY",
+                "IndianOS: PID 1 RUNNING",
+                "IndianOS user: R014 interactive shell ready",
+                "IndianOS user: indianos> ",
+                "IndianOS user: R014 shell: commands help ps run /bin/worker exit",
+                "IndianOS user: R014 shell: ps PID 1 RUNNING",
+                "IndianOS: R013 PID 1 requested /bin/worker",
+                "IndianOS user: R014 shell: worker queued for after exit",
+                "IndianOS user: R014 shell: exit",
+                "IndianOS: PID 1 EXITED",
+                "IndianOS: PID 1 REAPED",
+                "IndianOS: R013 launching /bin/worker",
+                "IndianOS: PID 2 READY",
+                "IndianOS: PID 2 RUNNING",
+                "IndianOS user: IndianOS worker process 2 completed",
+                "IndianOS: PID 2 EXITED",
+                "IndianOS: PID 2 REAPED",
+                "IndianOS: R013 shell session complete",
+            ]);
+        }
         "scheduler"=>{
             checks.extend(MILESTONES);
             checks.extend(["IndianOS: M009 cooperative scheduler experiment begin",
@@ -177,6 +201,12 @@ pub fn verify(mode:&str,text:&str)->Result<(),String>{
         "fault-guard"|"fault-supervisor"
             if text.contains("IndianOS: /bin/init exited through int 0x80")=>
             Err("faulting user unexpectedly exited normally".into()),
+        "interactive" if occurrences(text,"IndianOS user: indianos> ")!=4 ||
+            occurrences(text,"IndianOS: ring-3 PMM frame count restored")!=2 ||
+            occurrences(text,"IndianOS: PID 1 REAPED")!=1 ||
+            occurrences(text,"IndianOS: PID 2 REAPED")!=1 ||
+            text.contains("R014 shell: unknown command") =>
+            Err("R014 interactive I/O or two-process lifecycle mismatch".into()),
         "shell" if occurrences(text,"IndianOS: ring-3 PMM frame count restored")!=2 ||
             occurrences(text,"IndianOS: PID 1 REAPED")!=1 ||
             occurrences(text,"IndianOS: PID 2 REAPED")!=1 =>
@@ -228,7 +258,7 @@ pub fn run(args:&[String])->Result<String,String>{
     }
     // Reject unknown modes before starting QEMU.
     if !["normal","exception","pagefault","shadow","usermode",
-         "fault-guard","fault-supervisor","processes","scheduler","preempt","shell"].contains(&mode.as_str()){
+         "fault-guard","fault-supervisor","processes","scheduler","preempt","shell","interactive"].contains(&mode.as_str()){
         return Err("invalid QEMU smoke mode".into())
     }
 
@@ -251,9 +281,18 @@ pub fn run(args:&[String])->Result<String,String>{
         command.args(["-drive",&format!("if=pflash,unit=1,format=raw,file={}",to.display())]);
     }
     let _cleanup=tmp;
-    let mut child=command.stdin(Stdio::null()).stdout(Stdio::piped())
+    let mut child=command.stdin(if mode=="interactive"{Stdio::piped()}else{Stdio::null()}).stdout(Stdio::piped())
         .stderr(Stdio::null()).spawn().map_err(|e|format!("cannot start QEMU: {e}"))?;
     let stdout=child.stdout.take().ok_or("no QEMU stdout")?;
+    let mut stdin=if mode=="interactive"{child.stdin.take()}else{None};
+    // Each QEMU UART RX FIFO has a finite depth: send one short command
+    // only after the previous reply causes another visible shell prompt.
+    let script:[&[u8];4]=[b"helpx
+",b"ps
+",b"run /bin/worker
+",b"exit
+"];
+    let mut sent=0usize;
     let (tx,rx)=mpsc::channel::<Vec<u8>>();
     let reader=thread::spawn(move || {
         let mut stdout=stdout;
@@ -270,6 +309,16 @@ pub fn run(args:&[String])->Result<String,String>{
             Ok(part)=>{
                 output.extend(part);
                 if output.len()>1024*1024 {break}
+                if mode=="interactive"{
+                    let prompts=occurrences(&String::from_utf8_lossy(&output),
+                                            "IndianOS user: indianos> ");
+                    while sent<prompts && sent<script.len(){
+                        let Some(pipe)=stdin.as_mut()else{return Err("QEMU console stdin missing".into());};
+                        pipe.write_all(script[sent]).map_err(|e|format!("QEMU console send: {e}"))?;
+                        pipe.flush().map_err(|e|format!("QEMU console flush: {e}"))?;
+                        sent+=1;
+                    }
+                }
                 if verify(&mode,&String::from_utf8_lossy(&output)).is_ok(){
                     passed=true;break;
                 }
