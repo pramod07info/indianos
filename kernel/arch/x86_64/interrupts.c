@@ -123,6 +123,17 @@ bool x86_64_user_interrupt_stack_enable(void) {
     return tss.rsp0 != 0;
 }
 
+bool x86_64_user_trap_mapping_addresses(
+        uint64_t result[INDIANOS_TRAP_MAPPING_COUNT]) {
+    if (result == NULL || tss.ist1 == 0 || tss.rsp0 == 0) return false;
+    result[0] = (uint64_t)(uintptr_t)&gdt[0];
+    result[1] = (uint64_t)(uintptr_t)&idt[0];
+    result[2] = (uint64_t)(uintptr_t)&tss;
+    result[3] = tss.rsp0 - 8; /* final mapped byte on kernel syscall stack */
+    result[4] = tss.ist1 - 8; /* emergency double-fault stack */
+    return true;
+}
+
 static void serial_write_hex(uint64_t value) {
     static const char hex[] = "0123456789abcdef";
     char buffer[19];
