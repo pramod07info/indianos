@@ -1,0 +1,22 @@
+[package]
+name = "indianos-kernel-core"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "indianos_kernel_core"
+crate-type = ["staticlib", "rlib"]
+
+# No dependency registry, allocator, async runtime, or host OS services.
+[dependencies]
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+codegen-units = 1
+lto = false
+overflow-checks = true
+
+[profile.dev]
+panic = "abort"
