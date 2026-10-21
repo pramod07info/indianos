@@ -692,6 +692,49 @@ jobs:
           path: build-rust-kmain.log
           if-no-files-found: ignore
           retention-days: 7
+      - name: Integrated Rust boot/IDT/timer/userland/host tools QEMU
+        id: rust_integration
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          OVMF_PATH=""
+          for candidate in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/edk2/ovmf/OVMF_CODE_4M.fd /usr/share/edk2/ovmf/OVMF_CODE.fd; do
+            if test -f "$candidate"; then OVMF_PATH="$candidate"; break; fi
+          done
+          test -n "$OVMF_PATH"
+          make test-rust-integration-qemu OVMF_CODE="$OVMF_PATH" 2>&1 | tee build-rust-integrated.log
+      - name: Publish combined Rust integration QEMU status
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUST_INTEGRATION: ${{ steps.rust_integration.outcome }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from urllib.request import Request, urlopen
+          outcome=os.getenv("RUST_INTEGRATION","skipped")
+          repo=os.environ["GITHUB_REPOSITORY"]
+          payload=json.dumps({
+              "state":"success" if outcome=="success" else "failure",
+              "context":"indianos/rust-integrated-qemu",
+              "description":f"Rust boot+IDT+timer+apps+tools, 4 QEMU modes: {outcome}",
+              "target_url":f"{os.environ['GITHUB_SERVER_URL']}/{repo}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
+          }).encode()
+          req=Request(f"https://api.github.com/repos/{repo}/statuses/{os.environ['GITHUB_SHA']}",
+              data=payload,method="POST",
+              headers={"Authorization":"Bearer "+os.environ["GH_TOKEN"],
+                       "Accept":"application/vnd.github+json",
+                       "Content-Type":"application/json"})
+          with urlopen(req,timeout=20) as response:print("Rust integration:",outcome,response.status)
+          PY
+      - name: Preserve Rust combined QEMU log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: indianos-rust-integrated-qemu
+          path: build-rust-integrated.log
+          if-no-files-found: ignore
+          retention-days: 7
       - name: Host tests (PMM, VMM, ELF64 image and serial transcript parser)
         run: make test-host
       - name: Sanitize M005 executable planning and syscall ABI
