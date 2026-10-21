@@ -19,6 +19,7 @@ preempt = []
 vmm = []
 pmm = []
 user-image = ["vmm"]
+paging = []
 
 [profile.release]
 panic = "abort"
