@@ -105,7 +105,8 @@ See [M005 initramfs implementation](MILESTONE_005_INITRAMFS.md).
 - Committed a cloned supervisor-only upper canonical page-table root, checked user PML4 grafting, and page-by-page user memory copy through physical mappings.
 - Added host regression coverage and a fail-fast check for a missing syscall-enabled user ELF.
 - **Now implemented:** a distinct `ring3_entry.S` for the opt-in test image makes `WRITE` and `EXIT` requests through the syscall ABI; its x86-64 ET_EXEC output was inspected locally and contains three `int 0x80` instructions. Normal boot's inert fixture is unchanged.
-- **Verification pending:** complete QEMU/OVMF ring-3 entry, console output and safe return; full firmware boot has not been independently verified.
-- Next: establish a passing QEMU serial trace, test user access denial to supervisor memory, and validate page-table cleanup before adding any scheduler or second app.
+- **Verified (2026-10-21):** QEMU/OVMF boots the independent IndianOS kernel, `/bin/init` enters ring 3, prints `Namaste from IndianOS user mode!` using `int 0x80`, exits successfully, and restores every staged user/cloned kernel frame. Verified [GitHub Actions run 39529700739](https://github.com/pramod07info/indianos/actions/runs/39529700739); a subsequent [required regression gate](https://github.com/pramod07info/indianos/actions/runs/39529953398) also passed.
+- **Root cause resolved:** strict borrowed PML4 equality rejected the CPU-updated Accessed bit on detach. Ignore only that hardware-set bit, never different child frames or permission flags.
+- **Next:** reject attempted ring-3 accesses to supervisor memory and stack guard, recover safely from user exceptions, then add process lifecycle/scheduling. See [verification details](RING3_VERIFIED.md).
 
 See [M006 implementation](MILESTONE_006_USERMODE.md).
