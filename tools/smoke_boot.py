@@ -90,6 +90,23 @@ def assert_expected_shadow(text: str) -> None:
         raise AssertionError("shadow-switch kernel reported fatal error")
 
 
+def assert_expected_usermode(text: str) -> None:
+    """Success requires proof of entering user syscall AND returning via exit."""
+    if "IndianOS: FATAL" in text:
+        raise AssertionError("user-mode kernel reported fatal error")
+    expected = (*MILESTONES,
+                "IndianOS: entering ring-3 /bin/init (QEMU experimental)",
+                "IndianOS user: Namaste from IndianOS user mode!",
+                "IndianOS: /bin/init exited through int 0x80",
+                "IndianOS: ring-3 user program experiment complete")
+    offset = 0
+    for marker in expected:
+        position = text.find(marker, offset)
+        if position < 0:
+            raise AssertionError(f"missing or out-of-order user-mode event: {marker}")
+        offset = position + len(marker)
+
+
 def run_smoke(iso: Path, ovmf: Path, qemu: str, timeout: float,
               mode: str = "normal") -> str:
     if not iso.is_file():
@@ -98,13 +115,14 @@ def run_smoke(iso: Path, ovmf: Path, qemu: str, timeout: float,
         raise ValueError(f"OVMF firmware missing: {ovmf} (install ovmf or set OVMF_CODE)")
     if timeout <= 0 or timeout > 180:
         raise ValueError("timeout must be between 0 and 180 seconds")
-    if mode not in {"normal", "exception", "pagefault", "shadow"}:
+    if mode not in {"normal", "exception", "pagefault", "shadow", "usermode"}:
         raise ValueError("invalid smoke-test mode")
     verifiers = {
         "normal": assert_milestones,
         "exception": assert_expected_exception,
         "pagefault": assert_expected_pagefault,
         "shadow": assert_expected_shadow,
+        "usermode": assert_expected_usermode,
     }
     verify = verifiers[mode]
     argv = [
@@ -159,7 +177,7 @@ def main() -> int:
     parser.add_argument("--ovmf", type=Path, required=True)
     parser.add_argument("--qemu", default="qemu-system-x86_64")
     parser.add_argument("--timeout", type=float, default=25)
-    parser.add_argument("--mode", choices=("normal", "exception", "pagefault", "shadow"), default="normal")
+    parser.add_argument("--mode", choices=("normal", "exception", "pagefault", "shadow", "usermode"), default="normal")
     args = parser.parse_args()
     try:
         output = run_smoke(args.iso, args.ovmf, args.qemu, args.timeout, args.mode)
