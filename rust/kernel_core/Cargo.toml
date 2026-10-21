@@ -20,6 +20,7 @@ vmm = []
 pmm = []
 user-image = ["vmm"]
 paging = []
+runtime = []
 
 [profile.release]
 panic = "abort"
