@@ -99,8 +99,8 @@ fn tss_descriptor(base:u64,limit:u64)->u64{
 /// user-mode code. Cannot be used for live IDT replacement or SMP.
 #[no_mangle]
 pub unsafe extern "C" fn x86_64_exceptions_init()->bool{
-    let tss=ptr::addr_of_mut!(TSS.0);
-    let df_top=(ptr::addr_of!(DF_STACK.0) as usize)+DF_STACK_BYTES;
+    let tss=unsafe {ptr::addr_of_mut!(TSS.0)};
+    let df_top=(unsafe {ptr::addr_of!(DF_STACK.0)} as usize)+DF_STACK_BYTES;
     unsafe{
         ptr::write_unaligned(ptr::addr_of_mut!((*tss).ist1),df_top as u64);
         ptr::write_unaligned(ptr::addr_of_mut!((*tss).iomap_base),size_of::<Tss>() as u16);
@@ -110,7 +110,7 @@ pub unsafe extern "C" fn x86_64_exceptions_init()->bool{
         ptr::write_volatile(ptr::addr_of_mut!(GDT.0).cast::<u64>().add(4),base>>32);
         let gdtr=DescriptorPtr{
             limit:size_of::<AlignedGdt>() as u16-1,
-            address:ptr::addr_of!(GDT.0) as usize as u64,
+            address:unsafe {ptr::addr_of!(GDT.0)} as usize as u64,
         };
         x86_64_load_gdt(&gdtr);
         let sel:u16=TSS_SEL;
@@ -140,10 +140,10 @@ pub unsafe extern "C" fn x86_64_exceptions_init()->bool{
 #[no_mangle]
 pub unsafe extern "C" fn x86_64_user_interrupt_stack_select(slot:u32)->bool{
     if slot as usize>=USER_STACK_COUNT {return false}
-    let tss=ptr::addr_of_mut!(TSS.0);
+    let tss=unsafe {ptr::addr_of_mut!(TSS.0)};
     let ist=unsafe{ptr::read_unaligned(ptr::addr_of!((*tss).ist1))};
     if ist==0{return false}
-    let bottom=ptr::addr_of!(USER_STACKS).cast::<AlignedStack<STACK_BYTES>>();
+    let bottom=unsafe {ptr::addr_of!(USER_STACKS)}.cast::<AlignedStack<STACK_BYTES>>();
     let top=unsafe{bottom.add(slot as usize)} as usize+size_of::<AlignedStack<STACK_BYTES>>();
     unsafe{ptr::write_unaligned(ptr::addr_of_mut!((*tss).rsp0),top as u64);}
     top!=0
@@ -158,13 +158,13 @@ pub unsafe extern "C" fn x86_64_user_interrupt_stack_enable()->bool{
 #[no_mangle]
 pub unsafe extern "C" fn x86_64_user_trap_mapping_addresses(result:*mut u64)->bool{
     if result.is_null(){return false}
-    let tss=ptr::addr_of!(TSS.0);
+    let tss=unsafe {ptr::addr_of!(TSS.0)};
     let ist=unsafe{ptr::read_unaligned(ptr::addr_of!((*tss).ist1))};
     let rsp=unsafe{ptr::read_unaligned(ptr::addr_of!((*tss).rsp0))};
     if ist==0 || rsp==0 {return false}
     let values=[
-        ptr::addr_of!(GDT.0) as usize as u64,
-        ptr::addr_of!(IDT.0) as usize as u64,
+        unsafe {ptr::addr_of!(GDT.0)} as usize as u64,
+        unsafe {ptr::addr_of!(IDT.0)} as usize as u64,
         tss as usize as u64,rsp-8,ist-8
     ];
     for (i,value) in values.iter().enumerate(){
