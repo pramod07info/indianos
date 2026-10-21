@@ -1,7 +1,7 @@
 //! Limine revision-6 boot *consumer* and framebuffer status driver.
 //!
-//! The tiny C translation unit owns mandatory Limine request markers and
-//! hands out opaque response pointers. Rust checks every boot response
+//! Rust-owned request markers and opaque response getters replace the C
+//! boot protocol shim in the default build. Rust checks every boot response
 //! before it is used. Limine still owns the response storage and module.
 //! Call before changing the bootloader's memory map or reclaiming frames.
 

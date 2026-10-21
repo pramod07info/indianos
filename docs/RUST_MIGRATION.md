@@ -116,3 +116,40 @@ and validates their behavior through CI. A complete Rust-only kernel is still
 far away; the remaining C/assembly, owned Python tools and programs must be
 replaced under the same strict QEMU test criteria before removing the
 compatibility build path.
+
+## R004–R006 activation — Rust-first default switch (2026-10-21)
+
+The six requested subsystems now have Rust-owned sources and are selected
+by default in `Makefile` (with `RUST_CORE=1`):
+
+- Limine revision-6 request markers, memory map/module parsing and the
+  framebuffer status painter (`limine_requests.rs`, `boot.rs`).
+- GDT/IDT/TSS, IST1 double-fault stack and exception diagnostics
+  (`interrupts.rs`), retaining minimal assembly trap entry stubs.
+- 8259 PIC / 8254 PIT driver (`timer.rs`), linked but **not enabled for
+  ordinary boot**; IRQ0 preemption is still an unverified experiment.
+- Kernel boot and milestone orchestration (`kernel_main.rs`).
+- Native `no_std` ET_EXEC demo, worker, scheduling and fault-test programs
+  (`userland/rust`), not a general desktop application suite.
+- Deterministic host archive/ELF and QEMU smoke tooling (`tools/rust`);
+  Python/C reference utilities remain for comparative regression testing.
+
+`RUST_BOOT_PROTOCOL=1` omits `kernel/src/boot.c` from the linked kernel;
+the `limine-requests` feature emits the protocol requests from Rust.
+Default QEMU smoke tests now use the native Rust smoke CLI. Execute:
+
+```sh
+make test-rust-default-qemu
+make test-exception test-pagefault test-userfault-guard
+make test-userfault-supervisor test-processes test-scheduler
+make test-rust-tools
+# Full C reference fallback:
+make kernel BUILD=build/c-reference RUST_CORE=0
+```
+
+**Verification caution:** Default selection and integration are committed,
+but passing a freestanding link and all QEMU smoke transcripts remains the
+acceptance gate. A source rewrite alone does not prove boot correctness.
+Original `user_mode.c` and `paging.c`, architecture trap assembly, C ABI
+reference test harnesses and Python reference tools are still present.
+Consequently, **this is not a 100% Rust-only operating system**.
