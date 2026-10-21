@@ -11,6 +11,11 @@ struct indianos_process;
 bool x86_64_user_process_run(struct indianos_process *process,
                              const uint8_t *elf, size_t size);
 bool x86_64_user_demo_run(const uint8_t *elf, size_t size);
+/* QEMU-only M009: independently loaded user images are kept alive across
+ * multiple SYS_YIELD traps, with separate roots and ring-0 interrupt stacks.
+ * Cooperative only: interrupts disabled, no timer/preemption yet. */
+bool x86_64_m009_schedule_run(const uint8_t *first_elf, size_t first_bytes,
+                              const uint8_t *second_elf, size_t second_bytes);
 
 /* Pure framing policy: host-testable syscall request and user buffer copy.
  * This is NOT an arbitrary kernel/user memcpy function. */
