@@ -287,11 +287,7 @@ pub fn run(args:&[String])->Result<String,String>{
     let mut stdin=if mode=="interactive"{child.stdin.take()}else{None};
     // Each QEMU UART RX FIFO has a finite depth: send one short command
     // only after the previous reply causes another visible shell prompt.
-    let script:[&[u8];4]=[b"helpx
-",b"ps
-",b"run /bin/worker
-",b"exit
-"];
+    let script:[&[u8];4]=[b"helpx\x7f\n",b"ps\n",b"run /bin/worker\n",b"exit\n"];
     let mut sent=0usize;
     let (tx,rx)=mpsc::channel::<Vec<u8>>();
     let reader=thread::spawn(move || {
