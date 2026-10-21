@@ -9,7 +9,7 @@
 
 use core::arch::asm;
 use core::panic::PanicInfo;
-#[cfg(feature="shell")]
+#[cfg(any(feature="shell",feature="interactive"))]
 mod shell;
 
 #[panic_handler]
@@ -52,6 +52,55 @@ fn spin_cpu_bound(){
     let _=counter;
 }
 
+
+#[cfg(feature="interactive")]
+fn read_line(buffer:&mut [u8;64])->usize{
+    let mut used=0usize;
+    loop{
+        let mut byte=[0u8;1];
+        let count=call(6,byte.as_mut_ptr() as u64,1);
+        if count==0 {core::hint::spin_loop();continue;}
+        if count!=1 {exit(40);}
+        match byte[0] {
+            b'\n'=>return used,
+            8=>{used=used.saturating_sub(1);},
+            32..=126=> {
+                if used<buffer.len(){buffer[used]=byte[0];used+=1;}
+            }
+            _=>{}
+        }
+    }
+}
+#[cfg(feature="interactive")]
+fn interactive_shell()->!{
+    write(b"R014 interactive shell ready");
+    loop {
+        write(b"indianos> ");
+        let mut line=[0u8;64];
+        let count=read_line(&mut line);
+        match shell::parse(&line[..count]){
+            Some(shell::Command::Help)=>
+                write(b"R014 shell: commands help ps run /bin/worker exit"),
+            Some(shell::Command::Ps)=>{
+                if call(4,0,0)!=1 {exit(41);}
+                write(b"R014 shell: ps PID 1 RUNNING");
+            },
+            Some(shell::Command::RunWorker)=>{
+                if call(5,1,0)!=0 {
+                    write(b"R014 shell: worker request rejected");
+                }else{
+                    write(b"R014 shell: worker queued for after exit");
+                }
+            },
+            Some(shell::Command::Exit)=>{
+                write(b"R014 shell: exit");
+                exit(0);
+            },
+            None=>write(b"R014 shell: unknown command"),
+        }
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn _start()->!{
     #[cfg(feature="demo")]
@@ -59,6 +108,8 @@ pub extern "C" fn _start()->!{
         write(b"Namaste from IndianOS user mode!");
         exit(0);
     }
+    #[cfg(feature="interactive")]
+    interactive_shell();
     #[cfg(feature="shell")]
     {
         write(b"R013 shell: IndianOS init started");
@@ -138,7 +189,7 @@ pub extern "C" fn _start()->!{
     // A harmless, valid ET_EXEC fixture for regular kernel boots.
     // It must never be launched outside the opt-in test variants.
     #[cfg(not(any(
-        feature="demo",feature="worker",feature="shell",feature="sched-a",
+        feature="demo",feature="worker",feature="shell",feature="interactive",feature="sched-a",
         feature="sched-b",feature="fault-guard",feature="fault-supervisor",
         feature="preempt-a",feature="preempt-b"
     )))]
