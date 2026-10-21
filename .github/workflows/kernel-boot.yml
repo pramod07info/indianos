@@ -63,7 +63,7 @@ jobs:
           clang -std=c11 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
             -Wall -Wextra -Werror -I kernel/include \
             tests/test_user_image.c kernel/src/program.c kernel/src/initramfs.c \
-            kernel/src/user_image.c kernel/src/vmm.c -o build/user_image_sanitized
+            kernel/src/user_image.c kernel/src/user_copy.c kernel/src/vmm.c -o build/user_image_sanitized
           ./build/user_image_sanitized
       - name: Compile freestanding kernel and package ISO
         run: make image
@@ -81,7 +81,7 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: indianos-m003-qemu-only
+          name: indianos-experimental-qemu-only
           path: build/indianos.iso
           retention-days: 7
       - name: Verify an intentional invalid opcode reaches our IDT
