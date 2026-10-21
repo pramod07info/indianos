@@ -13,6 +13,7 @@
 #define PHYS_MASK 0x000ffffffffff000ull
 #define PAGE 4096ull
 
+extern void x86_64_user_interrupt(void);
 extern uint64_t x86_64_enter_user(uint64_t entry, uint64_t user_sp,
                                    uint64_t process_cr3);
 extern __attribute__((noreturn)) void x86_64_user_exit_to_kernel(uint64_t status);
@@ -88,6 +89,13 @@ static bool valid_kernel_access(const struct paging_clone_backend *b,
                                 uint64_t source, uint64_t clone, uint64_t address) {
     uint64_t a = 0, bpa = 0, af = 0, bf = 0;
     if ((address & (1ull << 47)) == 0) return false;
+    const uint64_t *root = b->access(clone, b->context);
+    const unsigned int top_index = (unsigned int)((address >> 39) & 511ull);
+    if (root == NULL || top_index < 256 ||
+        (root[top_index] & 0x5ull) != 0x1ull) {
+        /* Present supervisor PML4 is required for all kernel structures. */
+        return false;
+    }
     return paging_lookup(b, source, address, &a, &af) &&
            paging_lookup(b, clone, address, &bpa, &bf) &&
            a == bpa && (af & 1ull) && (bf & 1ull);
@@ -122,25 +130,43 @@ bool x86_64_user_demo_run(const uint8_t *elf, size_t size) {
         grafted = true;
         uint64_t stack = 0;
         __asm__ volatile ("mov %%rsp, %0" : "=r"(stack));
+        uint64_t trap_addresses[INDIANOS_TRAP_MAPPING_COUNT] = {0};
+        bool safe = x86_64_user_trap_mapping_addresses(trap_addresses);
         const uint64_t test_addresses[] = {
             (uint64_t)(uintptr_t)&x86_64_user_demo_run,
-            (uint64_t)(uintptr_t)&current_user,
+            (uint64_t)(uintptr_t)&x86_64_enter_user,
+            (uint64_t)(uintptr_t)&x86_64_user_interrupt,
+            (uint64_t)(uintptr_t)&x86_64_user_exit_to_kernel,
             (uint64_t)(uintptr_t)&x86_64_user_syscall_dispatch,
+            (uint64_t)(uintptr_t)&current_user,
             stack,
         };
-        bool safe = true;
+        for (unsigned i = 0; i < INDIANOS_TRAP_MAPPING_COUNT; ++i) {
+            if (!valid_kernel_access(&clone_backend, original, clone.root,
+                                     trap_addresses[i])) safe = false;
+        }
         for (unsigned i = 0; i < sizeof(test_addresses)/sizeof(test_addresses[0]); ++i) {
             if (!valid_kernel_access(&clone_backend, original, clone.root,
                                      test_addresses[i])) safe = false;
         }
         uint64_t entry_pa = 0, entry_flags = 0;
+        uint64_t stack_pa = 0, stack_flags = 0;
         uint64_t guard_pa = 0, guard_flags = 0;
         if (!paging_lookup(&clone_backend, clone.root, staged.plan.entry,
                            &entry_pa, &entry_flags) ||
             !paging_lookup(&clone_backend, clone.root, staged.plan.stack_end - 16,
-                           &guard_pa, &guard_flags) ||
+                           &stack_pa, &stack_flags) ||
             paging_lookup(&clone_backend, clone.root, staged.plan.guard_begin,
-                          &guard_pa, &guard_flags)) safe = false;
+                          &guard_pa, &guard_flags) ||
+            (entry_flags & 0x7ull) != 0x5ull ||
+            (entry_flags & (1ull << 63)) != 0 ||
+            (stack_flags & 0x7ull) != 0x7ull ||
+            (stack_flags & (1ull << 63)) == 0) {
+            safe = false;
+        }
+        if (!safe) {
+            serial_write("IndianOS: ring-3 mapping preflight rejected unsafe address space\n");
+        }
         if (safe) {
             current_user = &staged;
             serial_write("IndianOS: entering ring-3 /bin/init (QEMU experimental)\n");
