@@ -24,6 +24,7 @@ runtime = []
 boot-staging = ["pmm", "user-image"]
 boot = []
 interrupts = []
+timer = []
 
 [profile.release]
 panic = "abort"
