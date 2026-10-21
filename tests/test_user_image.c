@@ -1,6 +1,7 @@
 /* Production initramfs and user image algorithms, host-side mock PMM. */
 #include <indianos/initramfs.h>
 #include <indianos/user_image.h>
+#include <indianos/user_mode.h>
 #include <assert.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -123,6 +124,16 @@ int main(void) {
            !mapping.permissions.executable);
     assert(!vmm_query_page(&image.tables, image.plan.guard_begin, &mapping));
     assert(!vmm_query_page(&image.tables, 0, &mapping));
+    uint8_t copied[8] = {0};
+    assert(indianos_user_copy_readonly(&image, 0x400100, copied, 4));
+    assert(copied[0] == 1 && copied[1] == 2 &&
+           copied[2] == 3 && copied[3] == 4);
+    assert(indianos_user_copy_readonly(&image, 0x400ffe, copied, 8));
+    for (unsigned i = 0; i < 8; ++i) assert(copied[i] == 0);
+    assert(!indianos_user_copy_readonly(&image, image.plan.guard_begin, copied, 1));
+    assert(!indianos_user_copy_readonly(&image, 0x1000, copied, 1));
+    assert(!indianos_user_copy_readonly(&image, 0x400100, copied, 257));
+    assert(!indianos_user_copy_readonly(&image, 0x400100, NULL, 1));
     assert(!indianos_user_image_load(&image, &backend, file.bytes, file.length));
     assert(indianos_user_image_destroy(&image));
     assert(r.used_count == 0);
