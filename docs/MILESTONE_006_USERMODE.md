@@ -1,6 +1,6 @@
 # Milestone 006 (experimental): first x86-64 ring-3 execution infrastructure
 
-**Status:** experimental ring-3 kernel path and a separate syscall-enabled `/bin/init` test fixture are committed to `main`. The freestanding test ELF was independently compiled and inspected locally, but **successful QEMU/OVMF ring-3 execution remains unverified**. Normal boots still use the inert fixture. Do not boot IndianOS on physical machines.
+**Status: QEMU-verified on 2026-10-21.** The first native `/bin/init` enters CPU ring 3, prints through `int 0x80`, exits successfully, and releases both cloned kernel and user page tables with a restored PMM frame count. See [passing CI run 39529700739](https://github.com/pramod07info/indianos/actions/runs/39529700739) and [verification report](RING3_VERIFIED.md). Normal boots still use the inert fixture. **Never boot this research kernel on physical disks.**
 
 ## Implemented (gated)
 
@@ -54,11 +54,11 @@ The GitHub workflow builds `test-ring3-elf` on pushes and also attempts `make te
 - Actual ring-3 entry, interrupt transition, kernel-only memory isolation, SYS_WRITE pointer handling, exit recovery and safe cleanup require a real, fully working QEMU trace. A C host test or ELF compilation alone is not sufficient proof.
 - The implementation does not handle a crashing user process: unexpected CPU exceptions halt the entire kernel. This is **not** a secure user-process scheduler.
 - No per-process address-space lifecycle, timer/scheduler, APIC, SMP, ASLR, user process kill, application permissions, signal handling or standard libc.
-- The kernel is experimental C/assembly and has not been audited for release safety; no consumer OS security guarantee is implied.
+- The kernel is experimental C/assembly and has not been audited for release safety; the QEMU pass does not imply consumer-grade sandbox security.
 
 ## Next bounded action
 
-Run the syscall-enabled `/bin/init` QEMU ring-3 image, verify it cannot read/write protected supervisor mappings or the unmapped guard page, and independently inspect the exact CI transcript. Only after successful runtime testing should we call the first native IndianOS application **executed**.
+Now that the QEMU user-process entry/exit sequence is verified, add deliberate negative access tests (supervisor memory, guard page), per-process fault handling and lifecycle management. Schedule or launch a second user process only after those safeguards have their own passing emulator tests.
 
 The repository owner's workflow preference remains direct-to-`main` commits; no PR was created.
 
@@ -83,4 +83,4 @@ make test-usermode  # requires QEMU, OVMF, xorriso, Limine binary release
 
 The `test-usermode` run is considered successful only after the QEMU serial transcript includes, in order: kernel readiness, ring-3 entry, `IndianOS user: Namaste from IndianOS user mode!`, successful syscall exit, and post-exit cleanup completion.
 
-**Verification boundary:** The locally compiled x86-64 assembly user executable contains the correct syscall instructions; however QEMU, OVMF and ISO build dependencies are not installed in the current execution environment, and no green `indianos/ring3-qemu` commit status has been obtained yet. Do **not** interpret these source or workflow changes as verified ring-3 execution.
+**Verification update (supersedes earlier pending notes):** GitHub Actions installed QEMU/OVMF, executed the complete program successfully, and published `indianos/ring3-qemu: success`. The job passed all tests on verified code commit `4fac1ad4d2e50ea5d837b1d9968ec33648066fd2`; see [the recorded serial log](RING3_VERIFIED.md). This is an emulator-only, single-process achievement, not proof of production security.
