@@ -1,5 +1,6 @@
 #include <indianos/interrupts.h>
 #include <indianos/serial.h>
+#include <indianos/user_fault.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -148,6 +149,14 @@ static void serial_write_hex(uint64_t value) {
 
 __attribute__((noreturn)) void x86_64_exception_dispatch(
         const struct exception_context *context) {
+    /* A user-origin fault belongs to the active test task, not to the
+     * kernel. Kernel-origin faults, #DF and reserved-bit PF remain fatal. */
+    uint64_t fault_address = 0;
+    if (context->vector == INDIANOS_USER_VECTOR_PF) {
+        __asm__ volatile ("mov %%cr2, %0" : "=r"(fault_address));
+    }
+    x86_64_user_fault_handle(context->vector, context->cs,
+                             context->error_code, fault_address);
     serial_write("IndianOS: FATAL CPU exception vector=");
     serial_write_hex(context->vector);
     serial_write(" error=");
