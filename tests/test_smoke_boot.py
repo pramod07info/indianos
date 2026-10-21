@@ -8,6 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 from smoke_boot import (assert_milestones, assert_expected_exception,
                         assert_expected_pagefault, assert_expected_shadow,
                         assert_expected_usermode, assert_expected_userfault,
+                        assert_expected_processes,
                         matching_ovmf_vars, MILESTONES)  # noqa: E402
 
 
@@ -122,6 +123,54 @@ class SmokeBootTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             assert_expected_userfault(output +
                 "\nIndianOS: /bin/init exited through int 0x80", "fault-supervisor")
+
+    def test_two_unique_processes_are_reaped_before_next_launch(self):
+        output = "\n".join([*MILESTONES,
+            "IndianOS: M008 sequential process launch begin",
+            "IndianOS: PID 1 READY",
+            "IndianOS: PID 1 RUNNING",
+            "IndianOS: entering ring-3 /bin/init (QEMU experimental)",
+            "IndianOS user: Namaste from IndianOS user mode!",
+            "IndianOS: PID 1 EXITED",
+            "IndianOS: ring-3 PMM frame count restored",
+            "IndianOS: PID 1 REAPED",
+            "IndianOS: PID 2 READY",
+            "IndianOS: PID 2 RUNNING",
+            "IndianOS: entering ring-3 /bin/init (QEMU experimental)",
+            "IndianOS user: IndianOS worker process 2 completed",
+            "IndianOS: PID 2 EXITED",
+            "IndianOS: ring-3 PMM frame count restored",
+            "IndianOS: PID 2 REAPED",
+            "IndianOS: M008 two independent processes exited and reaped"])
+        assert_expected_processes(output)
+
+    def test_rejects_process_two_starting_before_process_one_cleanup(self):
+        output = "\n".join([*MILESTONES,
+            "IndianOS: M008 sequential process launch begin",
+            "IndianOS: PID 1 READY",
+            "IndianOS: PID 1 RUNNING",
+            "IndianOS: entering ring-3 /bin/init (QEMU experimental)",
+            "IndianOS user: Namaste from IndianOS user mode!",
+            "IndianOS: PID 2 READY",
+            "IndianOS: PID 1 EXITED",
+            "IndianOS: ring-3 PMM frame count restored",
+            "IndianOS: PID 1 REAPED"])
+        with self.assertRaises(AssertionError):
+            assert_expected_processes(output)
+
+    def test_rejects_skipped_process_or_single_reclamation(self):
+        output = "\n".join([*MILESTONES,
+            "IndianOS: M008 sequential process launch begin",
+            "IndianOS: PID 1 READY",
+            "IndianOS: PID 1 RUNNING",
+            "IndianOS: entering ring-3 /bin/init (QEMU experimental)",
+            "IndianOS user: Namaste from IndianOS user mode!",
+            "IndianOS: PID 1 EXITED",
+            "IndianOS: ring-3 PMM frame count restored",
+            "IndianOS: PID 1 REAPED",
+            "IndianOS: M008 two independent processes exited and reaped"])
+        with self.assertRaises(AssertionError):
+            assert_expected_processes(output)
 
     def test_rejects_out_of_order(self):
         with self.assertRaises(AssertionError):
