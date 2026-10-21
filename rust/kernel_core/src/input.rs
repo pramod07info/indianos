@@ -59,9 +59,10 @@ impl ScanDecoder{
         if up{return None;}
         let shift=self.shift_left||self.shift_right;
         let mut byte=if shift{SHIFTED[key]}else{KEYMAP[key]};
-        if byte.is_ascii_alphabetic()&&self.caps{
-            byte=if byte.is_ascii_uppercase(){byte.to_ascii_lowercase()}
-                 else{byte.to_ascii_uppercase()};
+        // Shift and CapsLock combine using XOR for alphabetic keys.
+        // SHIFTED maps punctuation; letters remain lowercase in both maps.
+        if byte.is_ascii_alphabetic() && (shift!=self.caps) {
+            byte=byte.to_ascii_uppercase();
         }
         filter(byte)
     }
