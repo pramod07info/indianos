@@ -83,6 +83,59 @@ jobs:
         run: |
           set -o pipefail
           make kernel BUILD=build/rust-compile RUST_CORE=1 2>&1 | tee build-rust-kernel.log
+      - name: Rust VMM original C ABI tests (candidate)
+        id: rust_vmm_host
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          make test-rust-vmm-host 2>&1 | tee build-rust-vmm-host.log
+      - name: Rust VMM two-process and scheduler QEMU parity (candidate)
+        id: rust_vmm_qemu
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          OVMF_PATH=""
+          for candidate in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/edk2/ovmf/OVMF_CODE_4M.fd /usr/share/edk2/ovmf/OVMF_CODE.fd; do
+            if test -f "$candidate"; then OVMF_PATH="$candidate"; break; fi
+          done
+          test -n "$OVMF_PATH"
+          make test-rust-vmm-qemu OVMF_CODE="$OVMF_PATH" 2>&1 | tee build-rust-vmm-qemu.log
+      - name: Publish Rust VMM parity status
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VMM_HOST: ${{ steps.rust_vmm_host.outcome }}
+          VMM_QEMU: ${{ steps.rust_vmm_qemu.outcome }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from urllib.request import Request, urlopen
+          h, q = os.getenv("VMM_HOST", "skipped"), os.getenv("VMM_QEMU", "skipped")
+          repo = os.environ["GITHUB_REPOSITORY"]
+          payload = json.dumps({
+              "state": "success" if h == "success" and q == "success" else "failure",
+              "context": "indianos/rust-vmm-qemu",
+              "description": f"Rust VMM: original C tests={h}, user processes and scheduler QEMU={q}",
+              "target_url": f"{os.environ['GITHUB_SERVER_URL']}/{repo}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
+          }).encode()
+          request = Request(f"https://api.github.com/repos/{repo}/statuses/{os.environ['GITHUB_SHA']}",
+                            data=payload, method="POST",
+                            headers={"Authorization": "Bearer " + os.environ["GH_TOKEN"],
+                                     "Accept": "application/vnd.github+json",
+                                     "Content-Type": "application/json"})
+          with urlopen(request, timeout=20) as response:
+              print("Rust VMM results:", h, q, response.status)
+          PY
+      - name: Upload Rust VMM diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: indianos-rust-vmm-parity
+          path: |
+            build-rust-vmm-host.log
+            build-rust-vmm-qemu.log
+          if-no-files-found: ignore
+          retention-days: 7
       - name: Host tests (PMM, VMM, ELF64 image and serial transcript parser)
         run: make test-host
       - name: Sanitize M005 executable planning and syscall ABI
