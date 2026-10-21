@@ -205,7 +205,7 @@ LDFLAGS := -target x86_64-unknown-none-elf -fuse-ld=lld -nostdlib -static \
            -Wl,-z,max-page-size=0x1000 -Wl,-z,noexecstack \
            -Wl,--gc-sections -Wl,--build-id=none -Wl,-T,kernel/linker.ld
 
-.PHONY: test-rust-default-qemu test-rust-tools test-rust-userland-qemu test-rust-interrupts-qemu test-rust-boot-qemu test-rust-vmm-host test-rust-vmm-qemu test-rust-pmm-host test-rust-pmm-qemu test-rust-user-image-host test-rust-user-image-qemu test-rust-paging-host test-rust-paging-qemu test-rust-runtime-host test-rust-runtime-qemu test-rust-boot-staging-qemu test-rust-host-abi test-rust-processes test-rust-scheduler rust-core all kernel user-elf test-user-elf test-ring3-elf initramfs test-initramfs image run run-bios test-boot test-exception test-pagefault test-shadow test-usermode test-userfault-supervisor test-userfault-guard test-processes test-scheduler test-preempt test-host toolchain-check clean
+.PHONY: test-rust-source-audit test-rust-default-qemu test-rust-tools test-rust-userland-qemu test-rust-interrupts-qemu test-rust-boot-qemu test-rust-vmm-host test-rust-vmm-qemu test-rust-pmm-host test-rust-pmm-qemu test-rust-user-image-host test-rust-user-image-qemu test-rust-paging-host test-rust-paging-qemu test-rust-runtime-host test-rust-runtime-qemu test-rust-boot-staging-qemu test-rust-host-abi test-rust-processes test-rust-scheduler rust-core all kernel user-elf test-user-elf test-ring3-elf initramfs test-initramfs image run run-bios test-boot test-exception test-pagefault test-shadow test-usermode test-userfault-supervisor test-userfault-guard test-processes test-scheduler test-preempt test-host toolchain-check clean
 all: image
 kernel: $(KERNEL_ELF)
 
@@ -221,6 +221,17 @@ $(RUST_LIB): $(RUST_MANIFEST) $(RUST_SOURCE) Makefile
 	cp $(BUILD)/rust-target/x86_64-unknown-none/release/libindianos_kernel_core.a $@
 
 rust-core: $(RUST_LIB)
+
+# Ensure the active default kernel is Rust-owned; two assembly entry units
+# preserve the exact hardware trap and user IRETQ ABI. Old C is reference only.
+test-rust-source-audit:
+	@test "$(RUST_CORE)" = "1" || (echo "Rust kernel is disabled" >&2; exit 1)
+	@test "$(RUST_PAGING_CPU)" = "1" && test "$(RUST_USER_RUNTIME)" = "1" || (echo "Rust CPU/runtime migration is disabled" >&2; exit 1)
+	@test -z "$(strip $(SOURCES))" || (echo "Unexpected active kernel C: $(SOURCES)" >&2; exit 1)
+	@test "$(words $(OBJECTS))" -eq 3 || (echo "Unexpected kernel objects: $(OBJECTS)" >&2; exit 1)
+	@test -z "$(strip $(filter-out $(BUILD)/obj/interrupt_entry.o $(BUILD)/obj/user_entry.o $(RUST_LIB),$(OBJECTS)))" || (echo "Unexpected non-Rust kernel object: $(OBJECTS)" >&2; exit 1)
+	@echo "IndianOS: kernel is Rust-owned, with minimal architecture assembly."
+
 
 test-rust-host-abi:
 	@mkdir -p build/rust-tests
