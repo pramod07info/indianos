@@ -433,7 +433,15 @@ pub fn run(args:&[String])->Result<String,String>{
         // logs contain non-ASCII data.
         let tail: String = text.chars().rev().take(8192).collect::<Vec<_>>()
             .into_iter().rev().collect();
-        return Err(format!("{reason}\n--- QEMU serial output ---\n{tail}"))
+        let diagnostics=if mode=="keyboard"{
+            format!("R014.2 keyboard diagnostics: commands_sent={sent}/{}; prompts_seen={}; irq1_seen={}; ps2_pending={}; shell_exited={}\\n",
+                script.len(),
+                occurrences(&text,"IndianOS user: indianos> "),
+                text.contains("IndianOS: R014.2 IRQ1 first interrupt delivered"),
+                text.contains("IndianOS: R014.2 PS/2 data pending without IRQ1"),
+                text.contains("IndianOS user: R014 shell: exit"))
+        }else{String::new()};
+        return Err(format!("{reason}\\n{diagnostics}--- QEMU serial output ---\\n{tail}"))
     }
     Ok(text)
 }
@@ -445,6 +453,14 @@ mod tests{
         assert!(verify("normal","").is_err());
         assert!(verify("processes","IndianOS: PID 1 REAPED").is_err());
         assert!(verify("scheduler","IndianOS: PID 2 DISPATCHED").is_err());
+    }
+    #[test]
+    fn keyboard_mode_requires_real_irq_delivery_and_lifecycle(){
+        // A shell transcript alone must never pass the hardware IRQ gate.
+        let shell_only=MILESTONES.join("\\n");
+        assert!(verify("keyboard",&shell_only).is_err());
+        let with_fake_marker=format!("{shell_only}\\nIndianOS: R014.2 PS/2 IRQ1 delivery verified");
+        assert!(verify("keyboard",&with_fake_marker).is_err());
     }
     #[test]
     fn milestones_order_and_fatal_detection(){
