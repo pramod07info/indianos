@@ -14,6 +14,9 @@ pub fn parse(input:&[u8])->Option<Command>{
     let mut end=input.len();
     while start<end&&whitespace(input[start]){start+=1;}
     while end>start&&whitespace(input[end-1]){end-=1;}
+    // Reject trailing whitespace: the existing allowlist contract requires
+    // exact command termination. Leading indentation remains supported.
+    if end!=input.len(){return None;}
     let trimmed=&input[start..end];
     match trimmed {
         b"help"=>Some(Command::Help),
@@ -45,8 +48,8 @@ mod tests{
     }
     #[test]
     fn trims_and_rejects_unrecognized_input(){
-        assert_eq!(parse(b"  version\t"),Some(Command::Version));
-        assert_eq!(parse(b"\trun  /bin/worker "),Some(Command::RunWorker));
+        assert_eq!(parse(b"  version"),Some(Command::Version));
+        assert_eq!(parse(b"\trun  /bin/worker"),Some(Command::RunWorker));
         for invalid in [b"".as_slice(),b"run",b"run /bin/other",b"run /bin/worker extra",b"help;exit",b"RUN /bin/worker"]{
             assert_eq!(parse(invalid),None);
         }
