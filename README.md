@@ -2,7 +2,7 @@
 
 **IndianOS** is an experimental, independent desktop operating system for x86-64 PCs, designed for approachable everyday use in India. The goal is a familiar desktop workflow, Indian-language accessibility, and a native kernel—not a Linux distribution or a copy of Microsoft Windows.
 
-> **Status (2026-10-21): M007 user-fault recovery verified in QEMU.** IndianOS is an independent x86-64 experimental kernel that now boots in QEMU/OVMF, runs one isolated native ring-3 demo using `int 0x80`, and contains test-user attempts to read supervisor-only pages or an unmapped stack guard, with successful memory cleanup. This is **not** a production OS, scheduler, complete user-process security boundary or a real-PC installer. Do not flash it to physical storage.
+> **Status (2026-10-21): M008 two native processes verified in QEMU.** IndianOS independently boots under QEMU/OVMF, executes two distinct ring-3 ELF64 programs sequentially through its own `int 0x80` interface, tracks PID/state transitions and reclaims each process's memory. Previous supervisor/guard fault-containment tests also pass. This is **not** a preemptive scheduler, production OS, security-audited sandbox or real-PC installer. Do not flash it to physical storage.
 
 ## Initial technical decisions
 
@@ -33,6 +33,7 @@
 14. [ADR: compatibility and AI](docs/ADR-0002-interoperability-ai.md)
 15. [Performance and portability targets](docs/PERFORMANCE_GOALS.md)
 16. [Milestone 007: QEMU-verified recoverable user faults](docs/MILESTONE_007_USER_FAULTS.md)
+17. [Milestone 008: PCB lifecycle and two independent user ELF processes](docs/MILESTONE_008_PROCESSES.md)
 
 ## Directory plan
 
@@ -200,6 +201,25 @@ See [M007 recovery tests and limitations](docs/MILESTONE_007_USER_FAULTS.md).
 
 This is one sequential test process with hardware interrupts off; timers,
 multi-process scheduling and release-grade application isolation do not exist.
+
+## M008 — Two sequential native processes in QEMU
+
+IndianOS now has a bounded PID/PCB table and explicit user task lifecycle.
+The process test packs two **different** ELF images (`/bin/init` and
+`/bin/worker`) into its read-only initramfs and runs them in CPU ring 3
+one after the other. Each process prints through the IndianOS syscall gate,
+exits and releases its page tables and data frames before the next starts.
+
+```sh
+make test-host       # includes PCB state/invalid-transition tests
+make test-processes  # two separate QEMU user programs, PID and PMM assertions
+```
+
+[Verified dual-process CI run](https://github.com/pramod07info/indianos/actions/runs/39532527694)
+and [M008 technical notes](docs/MILESTONE_008_PROCESSES.md) document the
+success trace. The normal ISO still does not automatically run user programs;
+the dual-process execution is an explicit QEMU-only test variant.
+**This is sequential launching, not multitasking or CPU scheduling.**
 
 ## Safety and legal
 
