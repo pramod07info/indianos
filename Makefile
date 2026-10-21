@@ -287,7 +287,7 @@ test-scheduler:
 test-preempt:
 	$(MAKE) test-initramfs BUILD=build/preempt SCHEDULER_SELFTEST=1 PREEMPT_SELFTEST=1
 	$(MAKE) image BUILD=build/preempt SCHEDULER_SELFTEST=1 PREEMPT_SELFTEST=1
-	python3 tools/smoke_boot.py --iso build/preempt/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)" --mode preempt --timeout 35
+	python3 tools/smoke_boot.py --iso build/preempt/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)" --mode preempt --machine pc --timeout 35
 
 test-host:
 	@mkdir -p $(BUILD)
