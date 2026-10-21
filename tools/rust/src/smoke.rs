@@ -258,7 +258,10 @@ pub fn run(args:&[String])->Result<String,String>{
     let text=String::from_utf8_lossy(&output).into_owned();
     if !passed {
         let reason=verify(&mode,&text).err().unwrap_or_else(||"QEMU timed out".into());
-        let tail=if text.len()>8192{&text[text.len()-8192..]}else{&text};
+        // Never slice at an arbitrary UTF-8 byte boundary when firmware
+        // logs contain non-ASCII data.
+        let tail: String = text.chars().rev().take(8192).collect::<Vec<_>>()
+            .into_iter().rev().collect();
         return Err(format!("{reason}\n--- QEMU serial output ---\n{tail}"))
     }
     Ok(text)
