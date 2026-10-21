@@ -211,6 +211,9 @@ pub unsafe extern "C" fn vmm_query_page(
     let Some(s) = (unsafe { space.as_ref() }) else { return false; };
     if mapping.is_null() || !ready(s) || !valid_va(va) { return false; }
     let mut next = s.root_physical;
+    // Effective permissions are the intersection of the entire page-table
+    // path. A supervisor-only/read-only/NX ancestor constrains its leaf.
+    let (mut can_write, mut can_execute, mut can_user) = (true, true, true);
     for level in 0..4 {
         let table = unsafe { at(s, next) };
         if table.is_null() { return false; }
@@ -220,13 +223,16 @@ pub unsafe extern "C" fn vmm_query_page(
             !physical_page(value & ADDRESS) {
             return false;
         }
+        can_write &= value & WRITE != 0;
+        can_execute &= value & NX == 0;
+        can_user &= value & USER != 0;
         if level == 3 {
             unsafe { ptr::write(mapping, Mapping {
                 physical: value & ADDRESS,
                 permissions: Permissions {
-                    writable: value & WRITE != 0,
-                    executable: value & NX == 0,
-                    user: value & USER != 0,
+                    writable: can_write,
+                    executable: can_execute,
+                    user: can_user,
                 },
             }); }
             return true;
@@ -298,5 +304,53 @@ mod tests {
         assert!(!valid_va(0x0000_8000_0000_0000));
         assert!(!physical_page(0));
         assert!(!physical_page(0x1234));
+    }
+
+    // An intentionally inconsistent ancestor cannot grant leaf privileges.
+    struct MockTables { pages: [[u64;512];4] }
+    unsafe extern "C" fn deny_alloc(_: *mut u64, _: *mut c_void) -> bool { false }
+    unsafe extern "C" fn deny_free(_: u64, _: *mut c_void) -> bool { false }
+    unsafe extern "C" fn mock_access(pa: u64, ctx: *mut c_void) -> *mut c_void {
+        if pa < 0x1000 || pa > 0x4000 || pa & 4095 != 0 { return ptr::null_mut(); }
+        let t = unsafe { &mut *(ctx as *mut MockTables) };
+        t.pages[(pa as usize / 4096) - 1].as_mut_ptr().cast()
+    }
+    #[test]
+    fn effective_permissions_respect_ancestors() {
+        let mut t = MockTables { pages: [[0u64;512];4] };
+        t.pages[0][0] = 0x2000 | 7;
+        t.pages[1][0] = 0x3000 | 7;
+        t.pages[2][2] = 0x4000 | 7;
+        t.pages[3][0] = 0x5000 | 7 | NX;
+        let space = Space {
+            root_physical: 0x1000,
+            backend: Backend {
+                allocate: Some(deny_alloc), release: Some(deny_free),
+                access: Some(mock_access),
+                context: (&mut t as *mut MockTables).cast(),
+            },
+            initialized: true,
+        };
+        let mut output = Mapping {
+            physical: 0,
+            permissions: Permissions { writable: false, executable: true, user: false },
+        };
+        unsafe {
+            assert!(vmm_query_page(&space, 0x400000, &mut output));
+            assert!(output.permissions.user && output.permissions.writable);
+            assert!(!output.permissions.executable);
+            t.pages[0][0] &= !USER;
+            assert!(vmm_query_page(&space, 0x400000, &mut output));
+            assert!(!output.permissions.user);
+            t.pages[0][0] |= USER;
+            t.pages[1][0] &= !WRITE;
+            assert!(vmm_query_page(&space, 0x400000, &mut output));
+            assert!(!output.permissions.writable);
+            t.pages[1][0] |= WRITE;
+            t.pages[3][0] &= !NX;
+            t.pages[2][2] |= NX;
+            assert!(vmm_query_page(&space, 0x400000, &mut output));
+            assert!(!output.permissions.executable);
+        }
     }
 }
