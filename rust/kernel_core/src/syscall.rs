@@ -85,6 +85,10 @@ pub unsafe extern "C" fn indianos_syscall_validate(
             user_range(plan, request.arg0, request.arg1, false), // WRITE
         2 => request.arg1 == 0, // EXIT
         3 => request.arg0 == 0 && request.arg1 == 0, // YIELD
+        #[cfg(feature = "test-shell")]
+        4 => request.arg0 == 0 && request.arg1 == 0, // GETPID
+        #[cfg(feature = "test-shell")]
+        5 => request.arg0 == 1 && request.arg1 == 0, // request /bin/worker
         _ => false,
     }
 }
@@ -170,6 +174,23 @@ mod tests {
         assert!(!check(SyscallRequest { number: 3, arg0: 1, arg1: 0 }));
     }
 
+    #[cfg(feature = "test-shell")]
+    #[test]
+    fn shell_abi_rejects_invalid_program_ids_and_arguments() {
+        let plan = ProgramPlan {
+            entry: USER_MIN, stack_begin: USER_TOP-STACK_BYTES,
+            stack_end: USER_TOP, guard_begin: USER_TOP-STACK_BYTES-PAGE_BYTES,
+            segment_count: 0, segments: [ProgramSegment::empty();MAX_SEGMENTS],
+        };
+        let valid=|number,arg0,arg1| unsafe {
+            indianos_syscall_validate(&plan,SyscallRequest{number,arg0,arg1})
+        };
+        assert!(valid(4,0,0));
+        assert!(!valid(4,1,0));
+        assert!(valid(5,1,0));
+        assert!(!valid(5,2,0));
+        assert!(!valid(5,1,1));
+    }
     #[test]
     fn trap_frame_blocks_supervisor_selectors_and_guard_stack() {
         let plan = ProgramPlan {

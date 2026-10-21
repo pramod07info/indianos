@@ -33,6 +33,16 @@ struct Task{
  frame:[u64;WORDS],saved:bool,attached:bool,timer_preemptions:u32,
 }
 static mut ACTIVE_USER:*mut UserImage=ptr::null_mut();
+// R013: tightly gated and single-core. Only PID 1 can request worker 1.
+#[cfg(feature="test-shell")]
+static mut ACTIVE_PID:u32=0;
+#[cfg(feature="test-shell")]
+static mut PENDING_WORKER:bool=false;
+#[cfg(feature="test-shell")]
+#[no_mangle]
+pub extern "C" fn indianos_r013_take_worker_request()->bool {
+ unsafe {let requested=PENDING_WORKER;PENDING_WORKER=false;requested}
+}
 static mut ACTIVE_TASK:*mut Task=ptr::null_mut();
 static mut M009_TASKS:[MaybeUninit<Task>;TASKS]=[const{MaybeUninit::uninit()};TASKS];
 static mut LAST_VECTOR:u64=0;
@@ -130,6 +140,17 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
  if !unsafe{indianos_syscall_validate(ptr::addr_of!((*img).plan),request)}{return BAD;}
  match request.number{
   0=>1,
+  #[cfg(feature="test-shell")]
+  4=>unsafe{ACTIVE_PID as u64},
+  #[cfg(feature="test-shell")]
+  5=>{
+   unsafe{
+    if ACTIVE_PID!=1||PENDING_WORKER{return BAD;}
+    PENDING_WORKER=true;
+   }
+   log(b"IndianOS: R013 PID 1 requested /bin/worker\n\0");
+   0
+  },
   2=>unsafe{x86_64_user_exit_to_kernel(request.arg0)},
   3=>{
    if !capture(regs,false){return BAD;}
@@ -261,6 +282,11 @@ pub unsafe extern "C" fn x86_64_user_process_run(
  let Some(p)=(unsafe{process.as_ref()})else{return false};
  let pid=p.pid;
  if pid==0||p.state!=1||!active_image().is_null(){return false;}
+ #[cfg(feature="test-shell")]
+ unsafe{
+  if ACTIVE_PID!=0{return false;}
+  if pid==1{PENDING_WORKER=false;}
+ }
  let Some((cpu,offset))=preflight()else{return false};
  if !unsafe{x86_64_user_interrupt_stack_enable()}{
   log(b"IndianOS: ring-3 preflight failed: TSS RSP0\n\0");return false;
@@ -307,9 +333,13 @@ pub unsafe extern "C" fn x86_64_user_process_run(
   if safe{
    pid_log(pid,b"RUNNING\0");clear_faults();
    unsafe{ACTIVE_USER=&mut staged;}
+   #[cfg(feature="test-shell")]
+   unsafe{ACTIVE_PID=pid;}
    log(b"IndianOS: entering ring-3 /bin/init (QEMU experimental)\n\0");
    let status=unsafe{x86_64_enter_user(staged.plan.entry,staged.plan.stack_end-16,clone.root)};
    unsafe{ACTIVE_USER=ptr::null_mut()};
+   #[cfg(feature="test-shell")]
+   unsafe{ACTIVE_PID=0;}
    let (v,e,a)=last_fault();
    let completed=if v==0{unsafe{indianos_process_exit(process,status)}}
    else{unsafe{indianos_process_fault(process,status,v,e,a)}};

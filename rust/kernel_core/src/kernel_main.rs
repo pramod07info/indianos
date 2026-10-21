@@ -29,6 +29,8 @@ unsafe extern "C" {
     fn x86_64_user_demo_run(elf:*const u8,size:usize)->bool;
     fn x86_64_user_process_run(process:*mut Process,elf:*const u8,size:usize)->bool;
     fn x86_64_m009_schedule_run(a:*const u8,asize:usize,b:*const u8,bsize:usize)->bool;
+    #[cfg(feature="test-shell")]
+    fn indianos_r013_take_worker_request()->bool;
 }
 fn log(msg:&'static [u8]){
     unsafe{serial_write(msg.as_ptr().cast())};
@@ -108,6 +110,36 @@ pub extern "C" fn kmain()->!{
     need(unsafe{user_image_boot_stage_test(init,init_size)},
          b"IndianOS: FATAL detached user-image staging failed\n\0");
     log(b"IndianOS: initramfs /bin/init staged and released safely\n\0");
+
+    #[cfg(feature="test-shell")]
+    {
+        // Scripted ring-3 init -> validated spawn -> distinct worker lifetime.
+        log(b"IndianOS: R013 init shell begin\n\0");
+        let mut table=ProcessTable::empty();
+        need(unsafe{indianos_process_table_init(&mut table)},
+             b"IndianOS: FATAL R013 process table init\n\0");
+        let init_pcb=unsafe{indianos_process_create(&mut table)};
+        need(!init_pcb.is_null() && unsafe{(*init_pcb).pid}==1,
+             b"IndianOS: FATAL R013 PID1 allocation\n\0");
+        need(unsafe{x86_64_user_process_run(init_pcb,init,init_size) &&
+                    indianos_process_success(init_pcb)},
+             b"IndianOS: FATAL R013 init shell failed\n\0");
+        need(unsafe{indianos_r013_take_worker_request()},
+             b"IndianOS: FATAL R013 no worker spawn request\n\0");
+        log(b"IndianOS: R013 launching /bin/worker\n\0");
+        let (worker,worker_size)=module(b"/bin/worker\0").unwrap_or_else(||{
+            log(b"IndianOS: FATAL R013 worker missing in initramfs\n\0");
+            halt()
+        });
+        let child=unsafe{indianos_process_create(&mut table)};
+        need(!child.is_null() && unsafe{(*child).pid}==2,
+             b"IndianOS: FATAL R013 PID2 allocation\n\0");
+        need(unsafe{x86_64_user_process_run(child,worker,worker_size) &&
+                    indianos_process_success(child)},
+             b"IndianOS: FATAL R013 worker failed or leaked frames\n\0");
+        log(b"IndianOS: R013 worker exited and reaped\n\0");
+        log(b"IndianOS: R013 shell session complete\n\0");
+    }
 
     #[cfg(feature="test-scheduler")]
     {

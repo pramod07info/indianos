@@ -38,6 +38,7 @@ test-processes = []
 test-scheduler = []
 test-fault-guard = []
 test-fault-supervisor = []
+test-shell = []
 
 [profile.release]
 panic = "abort"
