@@ -135,6 +135,34 @@ int main(void) {
     mem.tables[0][256] = 0x100000ull | ENTRY_PRESENT | ENTRY_WRITE;
     assert(!paging_clone_root(&b, 0x1000, &clone));
     assert(mem.outstanding == 4);
+    /* Protect kernel mappings by cloning only the high canonical half. */
+    mem.tables[0][256] = 0x2000 | ENTRY_PRESENT | ENTRY_WRITE;
+    mem.tables[0][1] = 0x2000 | ENTRY_PRESENT | ENTRY_WRITE | 0x4ull;
+    struct paging_clone_result supervisor = {0};
+    assert(paging_clone_kernel_half(&b, 0x1000, &supervisor));
+    assert(supervisor.table_count == 4);
+    assert(mem.outstanding == 8);
+    assert(!paging_lookup(&b, supervisor.root, 0x8000000000ull,
+                          &physical, &flags));
+    assert(paging_lookup(&b, supervisor.root, high + 0x1123,
+                         &physical, &flags));
+    uint64_t *kernel_root = get_frame(supervisor.root, &mem);
+    assert(kernel_root != NULL && (kernel_root[256] & 0x4ull) == 0);
+    uint64_t temporary_user_root = 0;
+    assert(alloc_frame(&temporary_user_root, &mem));
+    uint64_t *user_root = get_frame(temporary_user_root, &mem);
+    assert(user_root != NULL);
+    memset(user_root, 0, PAGE);
+    user_root[1] = 0x3000 | ENTRY_PRESENT | ENTRY_WRITE | 0x4ull;
+    assert(paging_attach_user_half(&b, supervisor.root, temporary_user_root));
+    assert(kernel_root[1] == user_root[1]);
+    assert(!paging_attach_user_half(&b, supervisor.root, temporary_user_root));
+    assert(paging_detach_user_half(&b, supervisor.root, temporary_user_root));
+    assert(kernel_root[1] == 0);
+    assert(!paging_detach_user_half(&b, supervisor.root, temporary_user_root));
+    assert(free_frame(temporary_user_root, &mem));
+    assert(paging_clone_release(&b, &supervisor));
+    assert(mem.outstanding == 4);
     puts("IndianOS paging clone and preflight host tests passed");
     return 0;
 }
