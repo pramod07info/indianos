@@ -89,6 +89,10 @@ jobs:
         run: |
           make test-rust-source-audit-negative
           make test-rust-link-audit BUILD=build/rust-compile
+      - name: R011 enforce CPU ABI and C/assembly fallback
+        run: |
+          make test-rust-entry-abi BUILD=build/rust-compile
+          make kernel BUILD=build/r011-c-reference RUST_CORE=0
       - name: Rust VMM original C ABI tests (candidate)
         id: rust_vmm_host
         continue-on-error: true
