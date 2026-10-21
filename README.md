@@ -7,7 +7,7 @@
 ## Initial technical decisions
 
 - **Target:** x86-64, UEFI-first; QEMU is the only supported test platform initially.
-- **Kernel:** **Rust-first** `no_std` static library, with Rust-owned boot handoff, framebuffer, GDT/IDT/TSS, timer, main entry, memory management and scheduler selected by default. Some ring-3 CPU dispatcher and architecture paths still use freestanding C11/assembly; verification of the latest default switch is pending.
+- **Kernel:** **Rust-first** `no_std` static library, with Rust-owned boot handoff, framebuffer, GDT/IDT/TSS, timer, main entry, memory management and scheduler selected by default. Some ring-3 CPU dispatcher and architecture paths still use freestanding C11/assembly. The Rust-default migration passed QEMU/OVMF CI on 2026-10-21.
 - **Early boot:** use the open-source **Limine bootloader** and its published protocol as a temporary, well-defined handoff layer. The bootloader is *not* the kernel.
 - **Graphics:** first draw pixels to the firmware-provided framebuffer; build a user-space compositor and desktop later.
 - **Drivers:** bring up serial, framebuffer and timer first; then PCI, storage, keyboard and network devices.
@@ -249,7 +249,8 @@ IndianOS links a **`no_std` Rust kernel core by default**. Earlier Rust
 process, scheduling, fault, ELF, memory and syscall paths have QEMU evidence;
 the newer Rust boot protocol, framebuffer, descriptor tables, timer link,
 kernel entry, userland demo binaries and native host tooling are now selected
-by default but require renewed integrated QEMU verification. The original C versions are retained for
+by default and passed [integrated QEMU/OVMF run 39558378245](https://github.com/pramod07info/indianos/actions/runs/39558378245)
+on [code commit fc25814](https://github.com/pramod07info/indianos/commit/fc25814bcd42837c30eeb633c927b3f343be0267). The original C versions are retained for
 rollback, but are excluded from the default freestanding ELF.
 
 Requirements: stable `rustup`, `cargo`, `x86_64-unknown-none` target,

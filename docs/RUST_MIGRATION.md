@@ -82,16 +82,20 @@ and the cooperative scheduler. The results are collected under the
 the six listed above. The original files remain in the repository as
 reference/fallback code and still support `RUST_CORE=0`.
 
-## Remaining migration work — NOT YET CONVERTED
+## Current migration inventory (2026-10-21)
 
-| Slice | Owned implementation to port | Core acceptance |
+| Slice | Implementation status | Acceptance evidence or remaining condition |
 | --- | --- | --- |
-| R002 continuation | PMM-backed user image staging, guarded user-memory copying | ELF staging failure rollback, mapping permissions and QEMU user app |
-| R003 | Physical frame allocator, memory map adapter, VMM page tables, paging clone | frame ownership, protection and failure rollback |
-| R004 | Kernel entry/Limine handoff, framebuffer, serial, IDT/TSS/timer | firmware boot and deliberate CPU exception QEMU |
-| R005 | Ring-3 ABI dispatcher, user-copy, process recovery, CPU-context integration | supervisor/guard fault containment, live scheduler |
-| R006 | Native userland tools and applications: replace owned C entry apps with `no_std` Rust, and migrate owned Python tooling/tests to native Rust CLI/test harnesses where parity is available | deterministic ISO/initramfs + equivalent UX and test logs |
-| R007 | Remove unused original C implementations and toolchain dependencies only after *every* migrated path is proven; update developer docs and guard firmware boot | full Rust-owned-source audit and QEMU regression suite |
+| R001–R002 | Rust PCB, scheduler, fault policy, syscall metadata, ELF64 and initramfs validation selected by default | Original C ABI and QEMU regressions |
+| R002–R003 | Rust PMM, VMM, user-image staging, guarded copy, paging policy and clone selected by default | Rust/C ABI and QEMU tests in verified CI |
+| R004 | Rust Limine handoff, framebuffer, serial, GDT/IDT/TSS, exception dispatcher, PIT driver and kmain selected by default | Normal boot, ring-3, deliberate faults and integrated QEMU passed |
+| R005 | Ring-3 machinery remains partially in `kernel/arch/x86_64/user_mode.c`; some paging internals remain in `paging.c` | Port remaining C execution and paging code; preserve process fault handling |
+| R006 | Native Rust user ELF demos and Rust archive/ELF/QEMU tools selected by default | C/Python reference tests remain; general-purpose userland/desktop apps are not yet implemented |
+| R007 | C reference paths and essential architecture assembly retained | Complete Rust-owned-source audit and safe retirement of obsolete C code |
+
+Limine itself is a third-party bootloader, not IndianOS-owned code to port.
+Small architecture-specific exception, `iretq` and context-switching assembly
+may remain in an otherwise Rust kernel.
 
 Small architecture-specific **assembly instructions or `global_asm!`** are
 legitimate parts of a Rust kernel (e.g., `iretq`, `inb/outb`, and trap entry).
@@ -147,9 +151,12 @@ make test-rust-tools
 make kernel BUILD=build/c-reference RUST_CORE=0
 ```
 
-**Verification caution:** Default selection and integration are committed,
-but passing a freestanding link and all QEMU smoke transcripts remains the
-acceptance gate. A source rewrite alone does not prove boot correctness.
+**Verification:** [GitHub Actions run 39558378245](https://github.com/pramod07info/indianos/actions/runs/39558378245)
+completed successfully for [code commit fc25814](https://github.com/pramod07info/indianos/commit/fc25814bcd42837c30eeb633c927b3f343be0267).
+Rust kernel compilation, original C ABI regression tests, native Rust
+tools/userland, GDT/IDT/TSS exception checks, Rust kmain and integrated QEMU
+boot, faults and cooperative scheduler tests passed. This validates the
+tested QEMU/OVMF configuration, not every physical computer.
 Original `user_mode.c` and `paging.c`, architecture trap assembly, C ABI
 reference test harnesses and Python reference tools are still present.
 Consequently, **this is not a 100% Rust-only operating system**.
