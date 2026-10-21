@@ -3,6 +3,8 @@
 
 use std::{collections::BTreeSet, env, fs, path::Path};
 
+mod smoke;
+
 const MAX_FILES:usize=16;
 const MAX_NAME:usize=128;
 const MAX_ARCHIVE:usize=32*1024*1024;
@@ -134,6 +136,12 @@ fn command(args:&[String])->Result<(),String>{
             if let Some(dir)=dest.parent(){fs::create_dir_all(dir).map_err(|e|e.to_string())?}
             fs::write(dest,&archive).map_err(|e|e.to_string())?;
             println!("IndianOS read-only initramfs: {} bytes",archive.len());
+            Ok(())
+        }
+        "smoke"=>{
+            let log=smoke::run(&args[1..])?;
+            println!("{log}");
+            println!("IndianOS QEMU boot smoke test PASSED");
             Ok(())
         }
         "check-elf"=>{
