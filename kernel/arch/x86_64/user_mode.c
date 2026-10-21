@@ -57,8 +57,10 @@ static uint64_t *table_access(uint64_t frame, void *context) {
 
 /* Register save frame emitted by user_entry.S; indexes are fixed to ASM. */
 uint64_t x86_64_user_syscall_dispatch(const uint64_t *regs) {
+    /* No active user process means no initialized return state. Never
+     * attempt to restore a zero/stale saved CR3 in this situation. */
     if (current_user == NULL || regs == NULL)
-        x86_64_user_exit_to_kernel(127);
+        return UINT64_MAX;
     const struct indianos_syscall_request request = {
         .number = regs[14], .arg0 = regs[9], .arg1 = regs[10],
     };
