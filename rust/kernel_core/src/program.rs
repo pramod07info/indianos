@@ -198,7 +198,7 @@ mod tests {
         assert!(plan_elf64(&invalid).is_none());
         invalid = elf; invalid[56] = 33; // excessive phnum
         assert!(plan_elf64(&invalid).is_none());
-        invalid = elf; invalid[96] = 2; // initialized length exceeds file memory
+        invalid = elf; invalid[96] = 0xff; // initialized bytes exceed ELF file bounds
         assert!(plan_elf64(&invalid).is_none());
     }
 }
