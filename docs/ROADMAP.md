@@ -98,3 +98,13 @@ The next bounded engineering slice should add a read-only initramfs and real per
 - Next phase: verify firmware/boot handoff, then build a supervisor-protected process root and the first user-mode transition under a QEMU-only feature gate.
 
 See [M005 initramfs implementation](MILESTONE_005_INITRAMFS.md).
+
+## M006 experimental ring-3 substrate — 2026-10-21
+
+- Committed x86-64 user-mode GDT selectors, TSS.RSP0, interrupt 0x80 gate, IRETQ entry, syscall dispatch and privileged kernel return path behind an explicit QEMU-only build flag.
+- Committed a cloned supervisor-only upper canonical page-table root, checked user PML4 grafting, and page-by-page user memory copy through physical mappings.
+- Added host regression coverage and a fail-fast check for a missing syscall-enabled user ELF.
+- **Blocked/not proven:** repository /bin/init still loops instead of making a syscall. A repository safety write restriction prevented its update, so first user execution has not been demonstrated. Full QEMU execution also remains unverified.
+- Next: finish syscall-enabled /bin/init, verify page-table transition with protected-memory negative tests, and obtain passing QEMU logs before moving to scheduling.
+
+See [M006 implementation](MILESTONE_006_USERMODE.md).
