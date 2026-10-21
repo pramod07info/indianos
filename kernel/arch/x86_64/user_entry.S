@@ -30,7 +30,11 @@ x86_64_enter_user:
     movw %ax, %es
     pushq $0x33              /* ring-3 SS */
     pushq %rsi               /* ring-3 RSP */
-    pushq $0x02              /* IF=0, bit 1 fixed; IRQs remain masked */
+#ifdef INDIANOS_TEST_PREEMPT
+    pushq $0x202             /* IF=1 only in the gated timer test */
+#else
+    pushq $0x02              /* IF=0, cooperative task or normal test */
+#endif
     pushq $0x2b              /* ring-3 CS */
     pushq %rdi               /* ring-3 RIP */
     iretq
@@ -140,4 +144,46 @@ x86_64_user_exit_to_kernel:
     popq %rbx
     retq
 .size x86_64_user_exit_to_kernel, .-x86_64_user_exit_to_kernel
+/* M009 optional hardware IRQ0. The same register-save format as INT 0x80
+ * allows preemption via x86_64_scheduler_timer_dispatch(), but IRQ0 has
+ * kernel-only DPL=0 and is acknowledged before returning or scheduling. */
+.global x86_64_timer_interrupt
+.type x86_64_timer_interrupt,@function
+x86_64_timer_interrupt:
+    cld
+    pushq %rax
+    pushq %rbx
+    pushq %rcx
+    pushq %rdx
+    pushq %rsi
+    pushq %rdi
+    pushq %rbp
+    pushq %r8
+    pushq %r9
+    pushq %r10
+    pushq %r11
+    pushq %r12
+    pushq %r13
+    pushq %r14
+    pushq %r15
+    movq %rsp, %rdi
+    call x86_64_scheduler_timer_dispatch
+    popq %r15
+    popq %r14
+    popq %r13
+    popq %r12
+    popq %r11
+    popq %r10
+    popq %r9
+    popq %r8
+    popq %rbp
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    popq %rcx
+    popq %rbx
+    popq %rax
+    iretq
+.size x86_64_timer_interrupt, .-x86_64_timer_interrupt
+
 .section .note.GNU-stack,"",@progbits
