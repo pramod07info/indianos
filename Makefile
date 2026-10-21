@@ -31,7 +31,7 @@ SOURCES := kernel/src/main.c kernel/src/serial.c kernel/src/boot.c kernel/src/pm
 ifeq ($(RUST_CORE),1)
 # The three original C translation units remain for comparison / rollback,
 # but are never linked alongside duplicate Rust C-ABI symbols.
-SOURCES := $(filter-out kernel/src/process.c kernel/src/scheduler.c kernel/src/user_fault_policy.c kernel/src/syscall_abi.c kernel/src/program.c,$(SOURCES))
+SOURCES := $(filter-out kernel/src/process.c kernel/src/scheduler.c kernel/src/user_fault_policy.c kernel/src/syscall_abi.c kernel/src/program.c kernel/src/initramfs.c,$(SOURCES))
 endif
 OBJECTS := $(patsubst kernel/src/%.c,$(BUILD)/obj/%.o,$(SOURCES))
 OBJECTS += $(BUILD)/obj/interrupts.o $(BUILD)/obj/interrupt_entry.o $(BUILD)/obj/paging.o $(BUILD)/obj/user_mode.o $(BUILD)/obj/user_entry.o $(BUILD)/obj/timer.o
@@ -126,6 +126,12 @@ test-rust-host-abi:
 	    build/rust-tests/host/release/libindianos_kernel_core.a \
 	    -o build/rust-tests/program_test
 	build/rust-tests/program_test
+	$(CC) -std=c11 -O2 -g -Wall -Wextra -Werror -I kernel/include \
+	    tests/test_user_image.c kernel/src/user_image.c kernel/src/user_copy.c \
+	    kernel/src/vmm.c tests/rust_host_personality.c \
+	    build/rust-tests/host/release/libindianos_kernel_core.a \
+	    -o build/rust-tests/user_image_test
+	build/rust-tests/user_image_test
 
 test-rust-processes:
 	$(MAKE) test-initramfs BUILD=build/rust-processes PROCESS_SELFTEST=1 RUST_CORE=1
