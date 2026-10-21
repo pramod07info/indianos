@@ -269,6 +269,8 @@ make test-rust-host-abi
 make test-rust-default-qemu
 make test-rust-entry-abi # R011 one-archive link plus exported x86 CPU ABI
 make test-rust-hardening # R012 adverse user-space boundary tests
+make test-rust-shell-host # R013 scripted shell/parser unit tests
+make test-rust-shell-qemu # R013 PID1 shell and worker process in QEMU
 make test-rust-link-audit # R010/R011 actual ELF input audit
 make test-rust-source-audit-negative # R010 require C rollback rejection
 make test-rust-ring3-runtime-qemu

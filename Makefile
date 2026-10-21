@@ -13,6 +13,8 @@ BUILD := build
 # Rust-native process/scheduler/fault policy is the verified default.
 # RUST_CORE=0 retains the original C implementation as an emergency fallback.
 RUST_CORE ?= 1
+# R013 opt-in scripted userland boot. No keyboard or arbitrary exec yet.
+R013_SHELL_TEST ?= 0
 # Rust owns the normal kernel link, including Limine handoff, framebuffer,
 # descriptor tables, timer, kmain, user ELF fixtures and image tools.
 # RUST_CORE=0 selects the complete C/assembly reference configuration.
@@ -99,7 +101,7 @@ RUST_FEATURES += $(if $(filter 1,$(EXCEPTION_SELFTEST)),--features test-ud2,) \
  $(if $(filter 1,$(PAGING_SWITCH_SELFTEST)),--features test-shadow,) \
  $(if $(filter 1,$(USERMODE_SELFTEST)),--features test-ring3,) \
  $(if $(filter 1,$(PROCESS_SELFTEST)),--features test-processes,) \
- $(if $(filter 1,$(SCHEDULER_SELFTEST)),--features test-scheduler,)
+ $(if $(filter 1,$(SCHEDULER_SELFTEST)),--features test-scheduler,) $(if $(filter 1,$(R013_SHELL_TEST)),--features test-shell,)
 ifeq ($(USERFAULT_SELFTEST),1)
 RUST_FEATURES += $(if $(filter guard,$(USERFAULT_KIND)),--features test-fault-guard,--features test-fault-supervisor)
 endif
@@ -217,7 +219,7 @@ LDFLAGS := -target x86_64-unknown-none-elf -fuse-ld=lld -nostdlib -static \
            -Wl,--gc-sections -Wl,--build-id=none -Wl,-T,kernel/linker.ld \
            -Wl,-Map,$(BUILD)/kernel-link.map
 
-.PHONY: test-rust-hardening test-rust-entry-abi test-rust-link-audit test-rust-source-audit-negative test-rust-source-audit test-rust-default-qemu test-rust-tools test-rust-userland-qemu test-rust-interrupts-qemu test-rust-boot-qemu test-rust-vmm-host test-rust-vmm-qemu test-rust-pmm-host test-rust-pmm-qemu test-rust-user-image-host test-rust-user-image-qemu test-rust-paging-host test-rust-paging-qemu test-rust-runtime-host test-rust-runtime-qemu test-rust-boot-staging-qemu test-rust-host-abi test-rust-processes test-rust-scheduler rust-core all kernel user-elf test-user-elf test-ring3-elf initramfs test-initramfs image run run-bios test-boot test-exception test-pagefault test-shadow test-usermode test-userfault-supervisor test-userfault-guard test-processes test-scheduler test-preempt test-host toolchain-check clean
+.PHONY: test-rust-shell-host test-rust-shell-qemu test-rust-hardening test-rust-entry-abi test-rust-link-audit test-rust-source-audit-negative test-rust-source-audit test-rust-default-qemu test-rust-tools test-rust-userland-qemu test-rust-interrupts-qemu test-rust-boot-qemu test-rust-vmm-host test-rust-vmm-qemu test-rust-pmm-host test-rust-pmm-qemu test-rust-user-image-host test-rust-user-image-qemu test-rust-paging-host test-rust-paging-qemu test-rust-runtime-host test-rust-runtime-qemu test-rust-boot-staging-qemu test-rust-host-abi test-rust-processes test-rust-scheduler rust-core all kernel user-elf test-user-elf test-ring3-elf initramfs test-initramfs image run run-bios test-boot test-exception test-pagefault test-shadow test-usermode test-userfault-supervisor test-userfault-guard test-processes test-scheduler test-preempt test-host toolchain-check clean
 all: image
 kernel: $(KERNEL_ELF)
 
@@ -283,6 +285,13 @@ test-rust-entry-abi: test-rust-link-audit
 test-rust-hardening:
 	CARGO_TARGET_DIR=build/rust-hardening-target $(CARGO) test \
 	    --manifest-path $(RUST_MANIFEST) --offline --features user-image
+
+# R013: run native Rust shell grammar and syscall allowlist unit tests.
+test-rust-shell-host:
+	CARGO_TARGET_DIR=build/r013-shell-host $(CARGO) test \
+	    --manifest-path userland/rust/Cargo.toml --offline --test shell_commands
+	CARGO_TARGET_DIR=build/r013-kernel-host $(CARGO) test \
+	    --manifest-path $(RUST_MANIFEST) --offline --features test-shell
 
 test-rust-host-abi:
 	@mkdir -p build/rust-tests
@@ -378,6 +387,12 @@ test-rust-paging-cpu-qemu:
 	$(RUST_TOOLS_BIN) smoke --iso build/rust-paging-cpu/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)" --mode normal
 	$(MAKE) image BUILD=build/rust-paging-user RUST_CORE=1 RUST_PAGING_CPU=1 USERMODE_SELFTEST=1
 	$(RUST_TOOLS_BIN) smoke --iso build/rust-paging-user/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)" --mode usermode
+
+# Boot the scripted shell at CPL3, authorize one known worker and reap both.
+test-rust-shell-qemu:
+	$(MAKE) image BUILD=build/r013-shell R013_SHELL_TEST=1 RUST_CORE=1
+	$(MAKE) $(RUST_TOOLS_BIN)
+	$(RUST_TOOLS_BIN) smoke --iso build/r013-shell/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)" --mode shell
 
 test-rust-default-qemu:
 	$(MAKE) image BUILD=build/rust-default-normal RUST_CORE=1
@@ -574,7 +589,7 @@ USER_OBJ := $(BUILD)/userland/entry.o
 WORKER_OBJ := $(BUILD)/userland/worker.o
 WORKER_ELF := $(BUILD)/userland/worker.elf
 INITRAMFS := $(BUILD)/initramfs.img
-ifneq ($(filter 1,$(PROCESS_SELFTEST) $(SCHEDULER_SELFTEST)),)
+ifneq ($(filter 1,$(PROCESS_SELFTEST) $(SCHEDULER_SELFTEST) $(R013_SHELL_TEST)),)
 INITRAMFS_EXTRA_DEPS := $(WORKER_ELF)
 INITRAMFS_EXTRA_ARGS := --extra-elf $(WORKER_ELF) --extra-name /bin/worker
 endif
@@ -582,7 +597,10 @@ endif
 ifeq ($(RUST_USERLAND),1)
 # Identical expected serial messages and syscall ABI; no C/assembly
 # objects are linked into the Rust native user executable.
-ifeq ($(USERFAULT_SELFTEST),1)
+ifeq ($(R013_SHELL_TEST),1)
+RUST_INIT_FEATURE := shell
+RUST_WORKER_FEATURE := worker
+else ifeq ($(USERFAULT_SELFTEST),1)
 RUST_INIT_FEATURE := fault-$(USERFAULT_KIND)
 else ifeq ($(PREEMPT_SELFTEST),1)
 RUST_INIT_FEATURE := preempt-a
@@ -599,7 +617,7 @@ else
 RUST_INIT_FEATURE :=
 endif
 RUST_APP_FLAGS := -C relocation-model=static -C link-arg=-T$(CURDIR)/userland/demo/linker.ld -C link-arg=--no-pie -C link-arg=-z -C link-arg=max-page-size=0x1000
-$(USER_ELF): userland/rust/src/main.rs userland/rust/Cargo.toml userland/rust/Cargo.lock userland/demo/linker.ld Makefile
+$(USER_ELF): $(wildcard userland/rust/src/*.rs) userland/rust/Cargo.toml userland/rust/Cargo.lock userland/demo/linker.ld Makefile
 	@mkdir -p $(@D)
 	CARGO_TARGET_DIR=$(BUILD)/rust-user-init-target \
 	    RUSTFLAGS="$(RUST_APP_FLAGS)" \
@@ -609,7 +627,7 @@ $(USER_ELF): userland/rust/src/main.rs userland/rust/Cargo.toml userland/rust/Ca
 	cp $(BUILD)/rust-user-init-target/x86_64-unknown-none/release/indianos-user $@
 	@readelf -h $@ | grep -q 'Type:.*EXEC'
 
-$(WORKER_ELF): userland/rust/src/main.rs userland/rust/Cargo.toml userland/rust/Cargo.lock userland/demo/linker.ld Makefile
+$(WORKER_ELF): $(wildcard userland/rust/src/*.rs) userland/rust/Cargo.toml userland/rust/Cargo.lock userland/demo/linker.ld Makefile
 	@mkdir -p $(@D)
 	CARGO_TARGET_DIR=$(BUILD)/rust-user-worker-target \
 	    RUSTFLAGS="$(RUST_APP_FLAGS)" \

@@ -98,6 +98,30 @@ pub fn verify(mode:&str,text:&str)->Result<(),String>{
                 "IndianOS: PID 2 REAPED",
                 "IndianOS: M008 two independent processes exited and reaped"]);
         }
+        "shell"=>{
+            checks.extend(MILESTONES);
+            checks.extend([
+                "IndianOS: R013 init shell begin",
+                "IndianOS: PID 1 READY",
+                "IndianOS: PID 1 RUNNING",
+                "IndianOS user: R013 shell: IndianOS init started",
+                "IndianOS user: R013 shell: commands: help ps run /bin/worker exit",
+                "IndianOS user: R013 shell: ps PID 1 RUNNING",
+                "IndianOS: R013 PID 1 requested /bin/worker",
+                "IndianOS user: R013 shell: run /bin/worker accepted",
+                "IndianOS user: R013 shell: exit",
+                "IndianOS: PID 1 EXITED",
+                "IndianOS: PID 1 REAPED",
+                "IndianOS: R013 launching /bin/worker",
+                "IndianOS: PID 2 READY",
+                "IndianOS: PID 2 RUNNING",
+                "IndianOS user: IndianOS worker process 2 completed",
+                "IndianOS: PID 2 EXITED",
+                "IndianOS: PID 2 REAPED",
+                "IndianOS: R013 worker exited and reaped",
+                "IndianOS: R013 shell session complete",
+            ]);
+        }
         "scheduler"=>{
             checks.extend(MILESTONES);
             checks.extend(["IndianOS: M009 cooperative scheduler experiment begin",
@@ -153,6 +177,10 @@ pub fn verify(mode:&str,text:&str)->Result<(),String>{
         "fault-guard"|"fault-supervisor"
             if text.contains("IndianOS: /bin/init exited through int 0x80")=>
             Err("faulting user unexpectedly exited normally".into()),
+        "shell" if occurrences(text,"IndianOS: ring-3 PMM frame count restored")!=2 ||
+            occurrences(text,"IndianOS: PID 1 REAPED")!=1 ||
+            occurrences(text,"IndianOS: PID 2 REAPED")!=1 =>
+            Err("R013 must launch and reclaim exactly two lifetimes".into()),
         "processes" if occurrences(text,"IndianOS: entering ring-3 /bin/init (QEMU experimental)")!=2 ||
             occurrences(text,"IndianOS: ring-3 PMM frame count restored")!=2=>
             Err("two distinct complete user lifetimes were not observed".into()),
@@ -200,7 +228,7 @@ pub fn run(args:&[String])->Result<String,String>{
     }
     // Reject unknown modes before starting QEMU.
     if !["normal","exception","pagefault","shadow","usermode",
-         "fault-guard","fault-supervisor","processes","scheduler","preempt"].contains(&mode.as_str()){
+         "fault-guard","fault-supervisor","processes","scheduler","preempt","shell"].contains(&mode.as_str()){
         return Err("invalid QEMU smoke mode".into())
     }
 

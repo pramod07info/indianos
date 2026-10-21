@@ -262,3 +262,28 @@ CI also enforces existing no_std linker/ABI, normal boot, ring-3 execution,
 fault isolation and scheduler QEMU regressions. This does not imply
 SMP hardening, mature hardware interrupt preemption, real-hardware support
 or production-quality process isolation.
+
+## R013 — scoped init and scripted Rust userland shell
+
+`R013_SHELL_TEST=1` builds a freestanding Rust `/bin/init` shell and
+includes a separate `/bin/worker` in the bounded read-only initramfs.
+The shell's four allowlisted commands (`help`, `ps`, `run /bin/worker`,
+`exit`) are executed as a deterministic **boot script**, not an interactive
+shell. The single-core R013 syscall ABI adds strictly validated commands
+4 (GETPID) and 5 (enqueue only known worker id 1); both are disabled
+outside the `test-shell` kernel feature and cannot accept arbitrary
+userspace strings or paths. Only PID1 may enqueue one worker launch.
+
+After PID1 exits and is reaped, the kernel consumes that request, looks up
+`/bin/worker` in the validated initramfs, runs PID2 in an independently
+mapped ring-3 address space, and verifies successful exit, resource
+reclamation, and process state transitions. This is **sequential
+launch**, not a generalized asynchronous fork/exec API.
+
+`make test-rust-shell-host` checks the parser against injection, traversal,
+unallowlisted programs and invalid syscall arguments.
+`make test-rust-shell-qemu` checks real QEMU serial lifecycle markers
+and that both PID1 and PID2 were reaped with PMM frame counts restored.
+Legacy demo/scheduler/fault QEMU regression tests must also stay green.
+Interactive input, device drivers, job control and a general app loader
+are separate future milestones.
