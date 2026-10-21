@@ -159,7 +159,14 @@ def run_smoke(iso: Path, ovmf: Path, qemu: str, timeout: float,
                 if process.poll() is not None:
                     break
         text = output.decode("utf-8", errors="replace")
-        verify(text)
+        try:
+            verify(text)
+        except AssertionError as exc:
+            # CI previously hid the useful serial transcript on an incomplete
+            # boot; append a bounded diagnostic tail without dumping firmware
+            # megabytes or requiring successful milestone verification.
+            tail = text[-8192:] if text else "<no serial data>"
+            raise AssertionError(f"{exc}\\n--- QEMU serial output (last 8192 characters) ---\\n{tail}") from exc
         return text
     finally:
         if process.poll() is None:
