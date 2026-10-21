@@ -30,6 +30,11 @@ on:
         required: false
         default: false
         type: boolean
+      run_usermode:
+        description: "Run experimental ring-3 /bin/init QEMU syscall smoke test"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -74,6 +79,8 @@ jobs:
             tests/test_paging.c kernel/src/paging_clone.c kernel/src/paging_policy.c \
             -o build/paging_user_sanitized
           ./build/paging_user_sanitized
+      - name: Build and verify syscall-enabled ring-3 ELF fixture
+        run: make test-ring3-elf
       - name: Compile freestanding kernel and package ISO
         run: make image
       - name: Inspect x86-64 ELF load segments
@@ -103,6 +110,12 @@ jobs:
           OVMF_PATH="$(find /usr/share/OVMF /usr/share/edk2 -name 'OVMF_CODE*.fd' -type f 2>/dev/null | head -n 1)"
           test -n "$OVMF_PATH"
           make test-pagefault OVMF_CODE="$OVMF_PATH"
+      - name: Opt-in first ring-3 user program execution (QEMU-only)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_usermode == true }}
+        run: |
+          OVMF_PATH="$(find /usr/share/OVMF /usr/share/edk2 -name 'OVMF_CODE*.fd' -type f 2>/dev/null | head -n 1)"
+          test -n "$OVMF_PATH"
+          make test-usermode OVMF_CODE="$OVMF_PATH"
       - name: Opt-in guarded shadow CR3 switch (QEMU-only)
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_shadow_switch == true }}
         run: |
