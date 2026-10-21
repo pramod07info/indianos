@@ -13,6 +13,7 @@ use core::ptr;
 mod syscall;
 mod program;
 mod initramfs;
+pub mod block;
 #[cfg(feature = "vmm")]
 mod vmm;
 #[cfg(feature = "pmm")]
