@@ -273,9 +273,9 @@ test-rust-entry-abi: test-rust-link-audit
 	    x86_64_unexpected_interrupt x86_64_enter_user x86_64_resume_user \
 	    x86_64_user_interrupt x86_64_user_exit_to_kernel \
 	    x86_64_timer_interrupt indianos_user_return_rsp indianos_user_return_cr3; do \
-	    awk -v name="$sym" '$3==name {ok=1} END {exit !ok}' \
+	    awk -v name="$$sym" '$$3==name {ok=1} END {exit !ok}' \
 	        $(BUILD)/kernel-symbols.txt || \
-	        { echo "R011 missing CPU ABI symbol: $sym" >&2; exit 1; }; \
+	        { echo "R011 missing CPU ABI symbol: $$sym" >&2; exit 1; }; \
 	done
 	@echo "IndianOS R011: all exported CPU ABI symbols preserved."
 
