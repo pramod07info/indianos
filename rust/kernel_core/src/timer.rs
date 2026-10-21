@@ -1,0 +1,94 @@
+//! Research-only legacy PIT/PIC 100 Hz driver in no_std Rust.
+//!
+//! IRQ0 delivery under OVMF was previously not observed, including when
+//! IF=1 and PIC IRR indicated a pending timer. This is a direct ABI port,
+//! NOT evidence that hardware preemption works. Disabled in normal boots.
+use core::{arch::asm, sync::atomic::{AtomicBool,AtomicU64,Ordering}};
+const PIC1_CMD:u16=0x20;
+const PIC1_DATA:u16=0x21;
+const PIC2_CMD:u16=0xa0;
+const PIC2_DATA:u16=0xa1;
+const PIT_CMD:u16=0x43;
+const PIT_DATA:u16=0x40;
+static TICKS:AtomicU64=AtomicU64::new(0);
+static CONFIGURED:AtomicBool=AtomicBool::new(false);
+#[inline(always)]
+fn outb(port:u16,byte:u8){unsafe{
+    asm!("out dx, al",in("dx")port,in("al")byte,options(nostack,nomem,preserves_flags));
+}}
+#[inline(always)]
+fn inb(port:u16)->u8 {
+    let value:u8;
+    unsafe{asm!("in al, dx",in("dx")port,out("al")value,
+                options(nostack,nomem,preserves_flags));}
+    value
+}
+fn io_wait(){outb(0x80,0)}
+fn select_legacy_pic()->bool{
+    let mut lo:u32;
+    let hi:u32;
+    unsafe{asm!("rdmsr",
+        in("ecx")0x1bu32,out("eax")lo,out("edx")hi,
+        options(nostack,preserves_flags));}
+    if lo&(1<<10)!=0{return false} // don't alter x2APIC
+    if lo&(1<<11)!=0{
+        lo &= !(1<<11);
+        unsafe{asm!("wrmsr",
+            in("ecx")0x1bu32,in("eax")lo,in("edx")hi,
+            options(nostack,preserves_flags));}
+    }
+    true
+}
+#[no_mangle]
+pub extern "C" fn x86_64_timer_start_100hz()->bool{
+    if CONFIGURED.load(Ordering::Relaxed)||!select_legacy_pic(){return false}
+    outb(PIC1_CMD,0x11);io_wait();
+    outb(PIC2_CMD,0x11);io_wait();
+    outb(PIC1_DATA,0x20);io_wait();
+    outb(PIC2_DATA,0x28);io_wait();
+    outb(PIC1_DATA,0x04);io_wait();
+    outb(PIC2_DATA,0x02);io_wait();
+    outb(PIC1_DATA,0x01);io_wait();
+    outb(PIC2_DATA,0x01);io_wait();
+    outb(PIC1_DATA,0xfe); // only IRQ0
+    outb(PIC2_DATA,0xff);
+    outb(0x22,0x70);io_wait();
+    outb(0x23,0);io_wait();
+    outb(PIT_CMD,0x36);
+    const DIVISOR:u16=11932;
+    outb(PIT_DATA,(DIVISOR&0xff) as u8);
+    outb(PIT_DATA,(DIVISOR>>8) as u8);
+    TICKS.store(0,Ordering::Relaxed);
+    CONFIGURED.store(true,Ordering::Relaxed);
+    true
+}
+#[no_mangle]
+pub extern "C" fn x86_64_timer_ack_irq0(){
+    if !CONFIGURED.load(Ordering::Relaxed){return}
+    let _=TICKS.fetch_update(Ordering::Relaxed,Ordering::Relaxed,|v|{
+        (v!=u64::MAX).then_some(v+1)
+    });
+    outb(PIC1_CMD,0x20);
+}
+#[no_mangle]
+pub extern "C" fn x86_64_timer_irq_count()->u64 {
+    TICKS.load(Ordering::Relaxed)
+}
+#[no_mangle]
+pub extern "C" fn x86_64_timer_pic_pending()->u8{
+    if !CONFIGURED.load(Ordering::Relaxed){return 0}
+    outb(PIC1_CMD,0x0a);inb(PIC1_CMD)
+}
+#[no_mangle]
+pub extern "C" fn x86_64_timer_pic_mask()->u8{
+    if CONFIGURED.load(Ordering::Relaxed){inb(PIC1_DATA)}else{0xff}
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn counter_is_bounded(){
+        assert_eq!(TICKS.load(Ordering::Relaxed),0);
+        assert!(!CONFIGURED.load(Ordering::Relaxed));
+    }
+}
