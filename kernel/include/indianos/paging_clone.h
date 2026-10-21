@@ -23,6 +23,19 @@ struct paging_clone_result {
 
 bool paging_clone_root(const struct paging_clone_backend *backend,
                        uint64_t source_root, struct paging_clone_result *result);
+/* Copy only upper canonical mappings, clear PML4 user privilege, leave
+ * all lower PML4 entries absent. The copy owns its own table frames. */
+bool paging_clone_kernel_half(const struct paging_clone_backend *backend,
+                              uint64_t source_root, struct paging_clone_result *result);
+
+/* Temporarily graft detached VMM user PML4 children into a supervisor-only
+ * clone. The user VMM still OWNS those children. Detach before releasing
+ * clone or destroying user VMM, and only while the CR3 root is inactive. */
+bool paging_attach_user_half(const struct paging_clone_backend *backend,
+                             uint64_t kernel_root, uint64_t user_root);
+bool paging_detach_user_half(const struct paging_clone_backend *backend,
+                             uint64_t kernel_root, uint64_t user_root);
+
 bool paging_clone_release(const struct paging_clone_backend *backend,
                           struct paging_clone_result *result);
 /* Resolve VA to PA and PTE flags; works with 4 KiB, 2 MiB, 1 GiB pages. */
