@@ -29,3 +29,9 @@ global_asm!(
     rflags = const 0x02,
     options(att_syntax),
 );
+
+#[cfg(feature="test-irq-keyboard")]
+global_asm!(
+    include_str!("arch/x86_64/keyboard_entry.S"),
+    options(att_syntax),
+);
