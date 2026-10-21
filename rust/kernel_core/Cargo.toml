@@ -11,6 +11,10 @@ crate-type = ["staticlib", "rlib"]
 # No dependency registry, allocator, async runtime, or host OS services.
 [dependencies]
 
+[features]
+default = []
+preempt = []
+
 [profile.release]
 panic = "abort"
 opt-level = "s"
