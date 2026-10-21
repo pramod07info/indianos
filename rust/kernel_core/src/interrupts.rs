@@ -222,6 +222,7 @@ mod tests{
     #[test]
     fn gdt_tss_flags(){
         assert_eq!((tss_descriptor(0x123456789000,103)>>40)&0xff,0x89);
-        assert_eq!(IdtGate::new(0x1234,1,0x8e).low,0x1234);
+        let low=IdtGate::new(0x1234,1,0x8e).low;
+        assert_eq!(low,0x1234);
     }
 }
