@@ -16,7 +16,7 @@ use crate::paging_cpu::x86_64_paging_detect;
 use crate::vmm::{Backend as VmmBackend,Mapping,Permissions,vmm_query_page};
 use crate::user_image::{UserImage,indianos_user_image_load,
  indianos_user_image_destroy,indianos_user_copy_readonly};
-use crate::syscall::{SyscallRequest,indianos_syscall_validate,USER_TOP,STACK_BYTES,PAGE_BYTES};
+use crate::syscall::{SyscallRequest,indianos_syscall_validate,ring3_frame_valid,USER_TOP,STACK_BYTES,PAGE_BYTES};
 use crate::program::indianos_program_user_range;
 use crate::boot::Region;
 const PHYS:u64=0x000f_ffff_ffff_f000;
@@ -79,9 +79,8 @@ fn capture(regs:*const u64,via_timer:bool)->bool{
  let Some(pcb)=(unsafe{task.pcb.as_ref()})else{return false};
  if pcb.state!=3{return false;}
  // CPU-supplied kernel stack contains 15 registers followed by 5 QWORDs.
- let src=unsafe{core::slice::from_raw_parts(regs,WORDS)};
- if src[16]!=0x2b||src[19]!=0x33||(src[17]&0x3000)!=0||
-    ((src[17]&0x200)!=0)!=via_timer{return false;}
+ let src=unsafe{&*(regs as *const [u64; WORDS])};
+ if !ring3_frame_valid(src,&task.image.plan,via_timer){return false;}
  task.frame.copy_from_slice(src);
  if !via_timer{task.frame[14]=0;}
  task.saved=true;
@@ -117,7 +116,16 @@ pub extern "C" fn x86_64_user_fault_handle(vector:u64,cs:u64,error:u64,cr2:u64){
 pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
  let img=active_image();
  if img.is_null()||regs.is_null(){return BAD;}
- let r=unsafe{core::slice::from_raw_parts(regs,WORDS)};
+ let r=unsafe{&*(regs as *const [u64; WORDS])};
+ if !ring3_frame_valid(r,unsafe{&(*img).plan},cfg!(feature="preempt")){return BAD;}
+ // SYS_EXIT and SYS_WRITE must originate from a mapped user executable
+ // instruction, not a writable or supervisor-only page.
+ let mut source=Mapping{
+  physical:0,permissions:Permissions{writable:false,executable:false,user:false}
+ };
+ if !unsafe{vmm_query_page(&(*img).tables,r[15]&!(PAGE-1),&mut source)} ||
+    !source.permissions.user||!source.permissions.executable||
+    source.permissions.writable{return BAD;}
  let request=SyscallRequest{number:r[14],arg0:r[9],arg1:r[10]};
  if !unsafe{indianos_syscall_validate(ptr::addr_of!((*img).plan),request)}{return BAD;}
  match request.number{
@@ -205,11 +213,31 @@ fn trap_mapped(b:&CloneBackend,original:u64,clone:u64)->bool{
  trap.iter().all(|&p|kernel_mapped(b,original,clone,p))
 }
 fn image_mapped(b:&CloneBackend,root:u64,img:&UserImage)->bool{
- let Some((_,code))=lookup(b,root,img.plan.entry)else{return false};
- let Some((_,stack))=lookup(b,root,img.plan.stack_end-16)else{return false};
- lookup(b,root,img.plan.guard_begin).is_none()&&
- (code&7)==5&&(code&(1u64<<63))==0&&
- (stack&7)==7&&(stack&(1u64<<63))!=0
+ if !img.ready||img.page_count==0||img.page_count as usize>img.pages.len()||
+    lookup(b,root,img.plan.guard_begin).is_some(){return false;}
+ // Every staged user frame must appear in the cloned CR3 with its exact
+ // owned physical address and expected W^X/NX rights, not just entry/stack.
+ for page in img.pages.iter().take(img.page_count as usize){
+  let va=page.virtual_address;
+  let stack=va>=img.plan.stack_begin&&va<img.plan.stack_end;
+  let segment=img.plan.segments.iter()
+    .take(img.plan.segment_count as usize)
+    .find(|s|va>=s.page_begin&&va<s.page_end);
+  let (write,execute)=if stack{(true,false)}
+  else if let Some(s)=segment{(s.writable,s.executable)}
+  else{return false;};
+  if write&&execute{return false;}
+  let Some((pa,flags))=lookup(b,root,va)else{return false};
+  if pa!=page.physical_address||flags&1==0||flags&4==0||
+     (flags&2!=0)!=write||(flags&(1u64<<63)==0)!=execute{return false;}
+  let mut mapping=Mapping{physical:0,permissions:Permissions{
+   writable:false,executable:false,user:false}};
+  if !unsafe{vmm_query_page(&img.tables,va,&mut mapping)}||
+     mapping.physical!=pa||!mapping.permissions.user||
+     mapping.permissions.writable!=write||
+     mapping.permissions.executable!=execute{return false;}
+ }
+ true
 }
 fn preflight()->Option<(CpuState,u64)>{
  let mut cpu=CpuState::default();let mut offset=0;
