@@ -390,6 +390,16 @@ jobs:
           done
           test -n "$OVMF_PATH"
           make test-usermode OVMF_CODE="$OVMF_PATH"
+      - name: Enforce M009 cooperative scheduler QEMU regression
+        if: always()
+        env:
+          M009_OUTCOME: ${{ steps.scheduler_test.outcome }}
+        run: |
+          if [ "$M009_OUTCOME" != "success" ]; then
+            echo "::error title=IndianOS M009 scheduler regression::Expected two live user contexts to switch fairly, got: $M009_OUTCOME"
+            exit 1
+          fi
+          echo "IndianOS: M009 cooperative scheduler QEMU regression gate PASSED"
       - name: Enforce M008 sequential processes QEMU regression
         if: always()
         env:
