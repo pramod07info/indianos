@@ -4,8 +4,12 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* QEMU-only gated experiment; refuses if paging preflight fails.
- * No scheduling, kill/recovery of faulted tasks, SMP or general app support. */
+/* QEMU-only user runner; no timer/preemption/SMP. The caller owns the PCB,
+ * the runner owns transient mappings and restores the bootloader CR3 before
+ * destroying or reaping the user image. */
+struct indianos_process;
+bool x86_64_user_process_run(struct indianos_process *process,
+                             const uint8_t *elf, size_t size);
 bool x86_64_user_demo_run(const uint8_t *elf, size_t size);
 
 /* Pure framing policy: host-testable syscall request and user buffer copy.
