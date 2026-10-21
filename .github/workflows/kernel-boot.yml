@@ -242,6 +242,59 @@ jobs:
             build-rust-image-qemu.log
           if-no-files-found: ignore
           retention-days: 7
+      - name: Rust paging clone and CPU policy original C ABI tests (candidate)
+        id: rust_paging_host
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          make test-rust-paging-host 2>&1 | tee build-rust-paging-host.log
+      - name: Rust paging clone QEMU process and fault isolation (candidate)
+        id: rust_paging_qemu
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          OVMF_PATH=""
+          for candidate in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/edk2/ovmf/OVMF_CODE_4M.fd /usr/share/edk2/ovmf/OVMF_CODE.fd; do
+            if test -f "$candidate"; then OVMF_PATH="$candidate"; break; fi
+          done
+          test -n "$OVMF_PATH"
+          make test-rust-paging-qemu OVMF_CODE="$OVMF_PATH" 2>&1 | tee build-rust-paging-qemu.log
+      - name: Publish Rust paging clone parity status
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PAGING_HOST: ${{ steps.rust_paging_host.outcome }}
+          PAGING_QEMU: ${{ steps.rust_paging_qemu.outcome }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from urllib.request import Request, urlopen
+          h, q = os.getenv("PAGING_HOST", "skipped"), os.getenv("PAGING_QEMU", "skipped")
+          repo = os.environ["GITHUB_REPOSITORY"]
+          payload = json.dumps({
+              "state": "success" if h == "success" and q == "success" else "failure",
+              "context": "indianos/rust-paging-qemu",
+              "description": f"Rust paging clone and preflight C ABI={h}; QEMU user/fault={q}",
+              "target_url": f"{os.environ['GITHUB_SERVER_URL']}/{repo}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
+          }).encode()
+          request = Request(f"https://api.github.com/repos/{repo}/statuses/{os.environ['GITHUB_SHA']}",
+                            data=payload, method="POST",
+                            headers={"Authorization": "Bearer " + os.environ["GH_TOKEN"],
+                                     "Accept": "application/vnd.github+json",
+                                     "Content-Type": "application/json"})
+          with urlopen(request, timeout=20) as response:
+              print("Rust paging results:", h, q, response.status)
+          PY
+      - name: Upload Rust paging diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: indianos-rust-paging-parity
+          path: |
+            build-rust-paging-host.log
+            build-rust-paging-qemu.log
+          if-no-files-found: ignore
+          retention-days: 7
       - name: Host tests (PMM, VMM, ELF64 image and serial transcript parser)
         run: make test-host
       - name: Sanitize M005 executable planning and syscall ABI
