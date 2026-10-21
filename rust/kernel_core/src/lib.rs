@@ -12,6 +12,7 @@ use core::ptr;
 
 mod syscall;
 mod program;
+mod initramfs;
 
 pub const MAX_PROCESSES: usize = 4;
 pub const MAX_DISPATCHES: u32 = if cfg!(feature = "preempt") { 2048 } else { 32 };
