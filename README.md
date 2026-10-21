@@ -153,25 +153,29 @@ make test-boot       # QEMU/OVMF required, not yet verified locally
 
 See [M005 initramfs and user-image staging](docs/MILESTONE_005_INITRAMFS.md).
 
-## Experimental user-mode infrastructure (M006, unverified)
+## First native IndianOS user application — verified in QEMU (M006)
 
-The opt-in x86-64 ring-3 experiment now includes privilege-level selectors,
-a DPL3 software-interrupt gate, a supervisor-only page-table clone, checked
-user-buffer copying, and an assembly `/bin/init` that requests `WRITE` and
-`EXIT` through the IndianOS syscall ABI.
+**Verified 2026-10-21:** the syscall-enabled `/bin/init` executed in CPU
+ring 3 under QEMU/OVMF, printed **Namaste from IndianOS user mode!** through
+`int 0x80`, exited successfully, returned to the kernel, released its
+supervisor clone and user memory, and restored the PMM free-frame count.
+The complete GitHub Actions job passed on
+[verified code commit `4fac1ad`](https://github.com/pramod07info/indianos/commit/4fac1ad4d2e50ea5d837b1d9968ec33648066fd2).
 
 ```sh
-make test-host       # user memory isolation and host-side unit tests
-make test-ring3-elf  # build and validate the syscall-enabled freestanding ELF
-make test-usermode   # opt-in QEMU/OVMF execution, NOT yet confirmed working
+make test-host
+make test-ring3-elf
+make test-usermode     # QEMU + OVMF + xorriso + pinned Limine required
 ```
 
-Normal boots still use the inert `userland/demo/entry.c`. Only
-`USERMODE_SELFTEST=1` selects `userland/demo/ring3_entry.S`.
-The experimental ELF compiles and contains the expected syscall instructions,
-but **successful ring-3 execution, output and return have not yet been observed
-in a complete QEMU/OVMF boot**. See
-[M006 user-mode implementation and verification](docs/MILESTONE_006_USERMODE.md).
+The regular boot ISO still uses the inert demo; `USERMODE_SELFTEST=1` is
+required to execute the test-only `userland/demo/ring3_entry.S`. The normal
+hardware and security limitations remain: this is **one experimental user
+process**, not a scheduler, general application runtime, desktop, or a
+production-ready operating system.
+
+See [verified serial output and debugging history](docs/RING3_VERIFIED.md)
+and [M006 architecture](docs/MILESTONE_006_USERMODE.md).
 
 ## Safety and legal
 
