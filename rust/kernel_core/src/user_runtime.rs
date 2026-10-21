@@ -94,7 +94,7 @@ fn fault_hex(label:&'static [u8],value:u64){
  }
  digits[16]=0;
  unsafe{serial_write(digits.as_ptr().cast());}
- log(b"\\n\\0");
+ log(b"\n\0");
 }
 fn clear_faults(){unsafe{LAST_VECTOR=0;LAST_ERROR=0;LAST_ADDRESS=0}}
 fn last_fault()->(u64,u64,u64){unsafe{(LAST_VECTOR,LAST_ERROR,LAST_ADDRESS)}}
