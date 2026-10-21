@@ -17,6 +17,7 @@ default = ["std"]
 std = []
 preempt = []
 vmm = []
+pmm = []
 
 [profile.release]
 panic = "abort"
