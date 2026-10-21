@@ -36,6 +36,45 @@ x86_64_enter_user:
     iretq
 .size x86_64_enter_user, .-x86_64_enter_user
 
+/* M009: restart a voluntarily yielded task from its saved 15-GPR +
+ * five-QWORD user IRET frame. Saved frame is supervisor-owned and lives
+ * on a kernel-mapped static stack; ring-3 code cannot modify it. */
+.global x86_64_resume_user
+.type x86_64_resume_user,@function
+/* uint64_t x86_64_resume_user(const uint64_t *frame, uint64_t cr3) */
+x86_64_resume_user:
+    pushq %rbx
+    pushq %rbp
+    pushq %r12
+    pushq %r13
+    pushq %r14
+    pushq %r15
+    movq %rsp, indianos_user_return_rsp(%rip)
+    movq %cr3, %rax
+    movq %rax, indianos_user_return_cr3(%rip)
+    movq %rsi, %cr3
+    movw $0x33, %ax
+    movw %ax, %ds
+    movw %ax, %es
+    movq %rdi, %rsp
+    popq %r15
+    popq %r14
+    popq %r13
+    popq %r12
+    popq %r11
+    popq %r10
+    popq %r9
+    popq %r8
+    popq %rbp
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    popq %rcx
+    popq %rbx
+    popq %rax
+    iretq
+.size x86_64_resume_user, .-x86_64_resume_user
+
 .global x86_64_user_interrupt
 .type x86_64_user_interrupt,@function
 x86_64_user_interrupt:
