@@ -90,7 +90,7 @@ kernel: $(KERNEL_ELF)
 $(RUST_LIB): $(RUST_MANIFEST) $(RUST_SOURCE) Makefile
 	@mkdir -p $(@D)
 	CARGO_TARGET_DIR=$(BUILD)/rust-target $(CARGO) build --manifest-path $(RUST_MANIFEST) \
-	    --target x86_64-unknown-none --release --offline $(RUST_FEATURES)
+	    --target x86_64-unknown-none --release --offline --no-default-features $(RUST_FEATURES)
 	cp $(BUILD)/rust-target/x86_64-unknown-none/release/libindianos_kernel_core.a $@
 
 rust-core: $(RUST_LIB)
@@ -99,7 +99,7 @@ test-rust-host-abi:
 	@mkdir -p build/rust-tests
 	$(CARGO) test --manifest-path $(RUST_MANIFEST) --offline
 	CARGO_TARGET_DIR=build/rust-tests/host $(CARGO) build --manifest-path $(RUST_MANIFEST) \
-	    --release --offline
+	    --release --offline --no-default-features
 	$(CC) -std=c11 -O2 -g -Wall -Wextra -Werror -I kernel/include \
 	    tests/test_process.c build/rust-tests/host/release/libindianos_kernel_core.a \
 	    -o build/rust-tests/process_test
