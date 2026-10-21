@@ -563,6 +563,49 @@ jobs:
           path: build-rust-tools.log
           if-no-files-found: ignore
           retention-days: 7
+      - name: Rust legacy timer driver link and QEMU boot parity
+        id: rust_timer_link
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          OVMF_PATH=""
+          for candidate in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/edk2/ovmf/OVMF_CODE_4M.fd /usr/share/edk2/ovmf/OVMF_CODE.fd; do
+            if test -f "$candidate"; then OVMF_PATH="$candidate"; break; fi
+          done
+          test -n "$OVMF_PATH"
+          make test-rust-timer-link-qemu OVMF_CODE="$OVMF_PATH" 2>&1 | tee build-rust-timer-link.log
+      - name: Publish Rust timer driver *link* status (not IRQ preemption)
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TIMER_LINK: ${{ steps.rust_timer_link.outcome }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from urllib.request import Request, urlopen
+          outcome=os.getenv("TIMER_LINK", "skipped")
+          repo=os.environ["GITHUB_REPOSITORY"]
+          payload=json.dumps({
+              "state": "success" if outcome=="success" else "failure",
+              "context": "indianos/rust-timer-link",
+              "description": f"Rust PIT driver normal/ring3 boot only; not preemption: {outcome}",
+              "target_url": f"{os.environ['GITHUB_SERVER_URL']}/{repo}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
+          }).encode()
+          req=Request(f"https://api.github.com/repos/{repo}/statuses/{os.environ['GITHUB_SHA']}",
+              data=payload,method="POST",
+              headers={"Authorization":"Bearer "+os.environ["GH_TOKEN"],
+                       "Accept":"application/vnd.github+json",
+                       "Content-Type":"application/json"})
+          with urlopen(req,timeout=20) as response: print("Rust timer linked:",outcome,response.status)
+          PY
+      - name: Preserve Rust timer driver link logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: indianos-rust-timer-link
+          path: build-rust-timer-link.log
+          if-no-files-found: ignore
+          retention-days: 7
       - name: Host tests (PMM, VMM, ELF64 image and serial transcript parser)
         run: make test-host
       - name: Sanitize M005 executable planning and syscall ABI
