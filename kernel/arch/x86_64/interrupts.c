@@ -48,6 +48,7 @@ extern void x86_64_load_gdt(const struct descriptor_ptr *descriptor);
 extern void (*const x86_64_exception_stubs[32])(void);
 extern void x86_64_unexpected_interrupt(void);
 extern void x86_64_user_interrupt(void);
+extern void x86_64_timer_interrupt(void);
 static uint8_t user_kernel_stacks[INDIANOS_USER_KERNEL_STACK_COUNT][32768] __attribute__((aligned(16)));
 
 /* Four contiguous 64-bit descriptor slots plus null; the TSS occupies 2. */
@@ -109,6 +110,10 @@ bool x86_64_exceptions_init(void) {
     }
     /* DPL 3 allows software INT 0x80, but no other user-callable gate. */
     set_gate(USER_SYSCALL_VECTOR, x86_64_user_interrupt, 0, USER_INTERRUPT_GATE);
+#ifdef INDIANOS_TEST_PREEMPT
+    /* PIC remaps IRQ0 to 0x20; gate is DPL0, never callable by ring 3. */
+    set_gate(0x20u, x86_64_timer_interrupt, 0, INTERRUPT_GATE);
+#endif
     const struct descriptor_ptr idtr = {
         .limit = sizeof(idt) - 1,
         .address = (uint64_t)(uintptr_t)idt,
