@@ -15,10 +15,10 @@ const CLONE_LIMIT: u32 = 8192;
 #[repr(C)]
 #[derive(Default)]
 pub(crate) struct CpuState {
-    long_mode: bool, nx: bool, msr: bool, pae: bool,
-    paging_enabled: bool, pae_enabled: bool, la57_enabled: bool,
-    nxe_enabled: bool, write_protect_enabled: bool, pcid_enabled: bool,
-    physical_bits: u8, cr3: u64,
+    pub(crate) long_mode: bool, pub(crate) nx: bool, pub(crate) msr: bool, pub(crate) pae: bool,
+    pub(crate) paging_enabled: bool, pub(crate) pae_enabled: bool, pub(crate) la57_enabled: bool,
+    pub(crate) nxe_enabled: bool, pub(crate) write_protect_enabled: bool, pub(crate) pcid_enabled: bool,
+    pub(crate) physical_bits: u8, pub(crate) cr3: u64,
 }
 #[no_mangle]
 pub unsafe extern "C" fn paging_preflight(state: *const CpuState) -> bool {
@@ -35,13 +35,13 @@ pub unsafe extern "C" fn paging_preflight(state: *const CpuState) -> bool {
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Backend {
-    allocate: Option<unsafe extern "C" fn(*mut u64, *mut c_void) -> bool>,
-    release: Option<unsafe extern "C" fn(u64, *mut c_void) -> bool>,
-    access: Option<unsafe extern "C" fn(u64, *mut c_void) -> *mut u64>,
-    context: *mut c_void,
+    pub(crate) allocate: Option<unsafe extern "C" fn(*mut u64, *mut c_void) -> bool>,
+    pub(crate) release: Option<unsafe extern "C" fn(u64, *mut c_void) -> bool>,
+    pub(crate) access: Option<unsafe extern "C" fn(u64, *mut c_void) -> *mut u64>,
+    pub(crate) context: *mut c_void,
 }
 #[repr(C)]
-pub struct CloneResult { root: u64, table_count: u32 }
+pub struct CloneResult { pub(crate) root: u64, pub(crate) table_count: u32 }
 fn valid_frame(frame: u64) -> bool {
     frame != 0 && frame & 4095 == 0 && frame & !PHYS == 0
 }

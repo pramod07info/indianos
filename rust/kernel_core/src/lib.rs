@@ -21,6 +21,8 @@ mod pmm;
 mod user_image;
 #[cfg(feature = "paging")]
 mod paging;
+#[cfg(feature = "paging-cpu")]
+mod paging_cpu;
 #[cfg(feature = "runtime")]
 mod runtime;
 #[cfg(feature = "boot-staging")]

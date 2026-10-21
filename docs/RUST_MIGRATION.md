@@ -160,3 +160,12 @@ tested QEMU/OVMF configuration, not every physical computer.
 Original `user_mode.c` and `paging.c`, architecture trap assembly, C ABI
 reference test harnesses and Python reference tools are still present.
 Consequently, **this is not a 100% Rust-only operating system**.
+
+## R008 — privileged paging migration (2026-10-21)
+
+`rust/kernel_core/src/paging_cpu.rs` now owns CPUID/EFER/CR0/CR3/CR4
+detection and the gated shadow-root switch. The default Rust kernel excludes
+`kernel/arch/x86_64/paging.c`; the reference remains available with
+`RUST_PAGING_CPU=0`. The CR3 switch is QEMU-test-only and refuses PCID.
+Acceptance: `make test-rust-paging-cpu-qemu`, full QEMU scheduler/fault parity
+and opt-in `make test-shadow`. A passing build alone is not runtime proof.
