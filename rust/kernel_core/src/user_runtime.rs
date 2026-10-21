@@ -371,9 +371,9 @@ fn saved_valid(t:&Task)->bool{
  let rip=t.frame[15];let rsp=t.frame[18];
  let mut map=Mapping{physical:0,permissions:Permissions{
   writable:false,executable:false,user:false}};
- unsafe{indianos_program_user_range(&t.image.plan,rip,1,false)} &&
+ (unsafe{indianos_program_user_range(&t.image.plan,rip,1,false)}) &&
  rsp>=t.image.plan.stack_begin&&rsp<=t.image.plan.stack_end&&
- unsafe{vmm_query_page(&t.image.tables,rip&!(PAGE-1),&mut map)} &&
+ (unsafe{vmm_query_page(&t.image.tables,rip&!(PAGE-1),&mut map)}) &&
  map.permissions.user&&map.permissions.executable&&!map.permissions.writable
 }
 fn discard(t:*mut Task,b:&CloneBackend,terminal:bool)->bool{

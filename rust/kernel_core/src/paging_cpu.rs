@@ -115,7 +115,7 @@ pub unsafe extern "C" fn x86_64_paging_shadow_switch_test()->bool{
   asm!("cli; mov cr3, {}",in(reg)new_cr3,options(nostack));
   asm!("mov cr3, {}",in(reg)(cpu.cr3&!(1u64<<63)),options(nostack));
  }
- unsafe{paging_clone_release(&backend,&mut copy)} && unsafe{pmm_free_frames()}==before
+ (unsafe{paging_clone_release(&backend,&mut copy)}) && (unsafe{pmm_free_frames()}==before)
 }
 #[cfg(test)]mod tests{
  use super::*;
