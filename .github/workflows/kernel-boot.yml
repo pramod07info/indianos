@@ -18,6 +18,8 @@ on:
       - "tests/inspect_archive.c"
       - "tests/test_initramfs_tool.py"
       - "tools/build_initramfs.py"
+      - "tools/check_usermode_fixture.py"
+      - "tests/test_usermode_fixture.py"
       - "tests/inspect_elf.c"
       - "userland/**"
       - ".github/workflows/kernel-boot.yml"
@@ -65,6 +67,13 @@ jobs:
             tests/test_user_image.c kernel/src/program.c kernel/src/initramfs.c \
             kernel/src/user_image.c kernel/src/user_copy.c kernel/src/vmm.c -o build/user_image_sanitized
           ./build/user_image_sanitized
+      - name: Sanitize kernel-only page-table clone and attachment logic
+        run: |
+          clang -std=c11 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
+            -Wall -Wextra -Werror -I kernel/include \
+            tests/test_paging.c kernel/src/paging_clone.c kernel/src/paging_policy.c \
+            -o build/paging_user_sanitized
+          ./build/paging_user_sanitized
       - name: Compile freestanding kernel and package ISO
         run: make image
       - name: Inspect x86-64 ELF load segments
