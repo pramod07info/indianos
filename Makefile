@@ -16,6 +16,10 @@ RUST_CORE ?= 1
 # R013 opt-in scripted userland boot. No keyboard or arbitrary exec yet.
 R013_SHELL_TEST ?= 0
 R014_INTERACTIVE_TEST ?= 0
+R014_IRQ_TEST ?= 0
+ifeq ($(R014_IRQ_TEST),1)
+R014_INTERACTIVE_TEST := 1
+endif
 # Rust owns the normal kernel link, including Limine handoff, framebuffer,
 # descriptor tables, timer, kmain, user ELF fixtures and image tools.
 # RUST_CORE=0 selects the complete C/assembly reference configuration.
@@ -102,7 +106,7 @@ RUST_FEATURES += $(if $(filter 1,$(EXCEPTION_SELFTEST)),--features test-ud2,) \
  $(if $(filter 1,$(PAGING_SWITCH_SELFTEST)),--features test-shadow,) \
  $(if $(filter 1,$(USERMODE_SELFTEST)),--features test-ring3,) \
  $(if $(filter 1,$(PROCESS_SELFTEST)),--features test-processes,) \
- $(if $(filter 1,$(SCHEDULER_SELFTEST)),--features test-scheduler,) $(if $(filter 1,$(R013_SHELL_TEST)),--features test-shell,) $(if $(filter 1,$(R014_INTERACTIVE_TEST)),--features test-interactive,)
+ $(if $(filter 1,$(SCHEDULER_SELFTEST)),--features test-scheduler,) $(if $(filter 1,$(R013_SHELL_TEST)),--features test-shell,) $(if $(filter 1,$(R014_INTERACTIVE_TEST)),--features test-interactive,) $(if $(filter 1,$(R014_IRQ_TEST)),--features test-irq-keyboard,)
 ifeq ($(USERFAULT_SELFTEST),1)
 RUST_FEATURES += $(if $(filter guard,$(USERFAULT_KIND)),--features test-fault-guard,--features test-fault-supervisor)
 endif
@@ -220,7 +224,7 @@ LDFLAGS := -target x86_64-unknown-none-elf -fuse-ld=lld -nostdlib -static \
            -Wl,--gc-sections -Wl,--build-id=none -Wl,-T,kernel/linker.ld \
            -Wl,-Map,$(BUILD)/kernel-link.map
 
-.PHONY: test-rust-interactive-host test-rust-interactive-qemu test-rust-shell-host test-rust-shell-qemu test-rust-hardening test-rust-entry-abi test-rust-link-audit test-rust-source-audit-negative test-rust-source-audit test-rust-default-qemu test-rust-tools test-rust-userland-qemu test-rust-interrupts-qemu test-rust-boot-qemu test-rust-vmm-host test-rust-vmm-qemu test-rust-pmm-host test-rust-pmm-qemu test-rust-user-image-host test-rust-user-image-qemu test-rust-paging-host test-rust-paging-qemu test-rust-runtime-host test-rust-runtime-qemu test-rust-boot-staging-qemu test-rust-host-abi test-rust-processes test-rust-scheduler rust-core all kernel user-elf test-user-elf test-ring3-elf initramfs test-initramfs image run run-bios test-boot test-exception test-pagefault test-shadow test-usermode test-userfault-supervisor test-userfault-guard test-processes test-scheduler test-preempt test-host toolchain-check clean
+.PHONY: test-rust-keyboard-host test-rust-keyboard-qemu test-rust-interactive-host test-rust-interactive-qemu test-rust-shell-host test-rust-shell-qemu test-rust-hardening test-rust-entry-abi test-rust-link-audit test-rust-source-audit-negative test-rust-source-audit test-rust-default-qemu test-rust-tools test-rust-userland-qemu test-rust-interrupts-qemu test-rust-boot-qemu test-rust-vmm-host test-rust-vmm-qemu test-rust-pmm-host test-rust-pmm-qemu test-rust-user-image-host test-rust-user-image-qemu test-rust-paging-host test-rust-paging-qemu test-rust-runtime-host test-rust-runtime-qemu test-rust-boot-staging-qemu test-rust-host-abi test-rust-processes test-rust-scheduler rust-core all kernel user-elf test-user-elf test-ring3-elf initramfs test-initramfs image run run-bios test-boot test-exception test-pagefault test-shadow test-usermode test-userfault-supervisor test-userfault-guard test-processes test-scheduler test-preempt test-host toolchain-check clean
 all: image
 kernel: $(KERNEL_ELF)
 
@@ -406,6 +410,16 @@ test-rust-interactive-qemu:
 	$(MAKE) image BUILD=build/r014-interactive R014_INTERACTIVE_TEST=1 RUST_CORE=1
 	$(MAKE) $(RUST_TOOLS_BIN)
 	$(RUST_TOOLS_BIN) smoke --iso build/r014-interactive/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)" --mode interactive --timeout 45
+
+# R014.2 PS/2 IRQ1, ring-3 IF=1, and Limine framebuffer terminal.
+test-rust-keyboard-host:
+	CARGO_TARGET_DIR=build/r0142-host $(CARGO) test \
+	    --manifest-path $(RUST_MANIFEST) --offline --features test-irq-keyboard
+
+test-rust-keyboard-qemu:
+	$(MAKE) image BUILD=build/r0142-keyboard R014_IRQ_TEST=1 RUST_CORE=1
+	$(MAKE) $(RUST_TOOLS_BIN)
+	$(RUST_TOOLS_BIN) smoke --iso build/r0142-keyboard/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)" --mode keyboard --timeout 65
 
 test-rust-default-qemu:
 	$(MAKE) image BUILD=build/rust-default-normal RUST_CORE=1

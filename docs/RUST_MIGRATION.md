@@ -319,3 +319,28 @@ The normal boot mode and R013 scripted shell continue to be available.
 This is a serial terminal and polled keyboard groundwork, not yet a
 framebuffer text console, IRQ-driven keyboard driver, USB HID stack,
 live fork/exec or PCI/storage implementation.
+
+## R014.2 — PS/2 IRQ1 and framebuffer shell text
+
+In the opt-in `R014_IRQ_TEST=1` variant (implies
+`R014_INTERACTIVE_TEST=1`), IndianOS installs an IDT gate for vector
+0x21, remaps the legacy 8259 PIC, unmasks only IRQ1, enables the first
+PS/2 controller channel and accepts user-mode hardware interrupts (IF=1).
+The minimal Rust-archive assembly stub saves/restores all GPRs, while the
+Rust interrupt dispatcher decodes set-1 scan codes and queues printable
+bytes in a bounded 127-character ring. IRQ1 acknowledges its PIC EOI,
+and the existing syscall 6 drains the queue under its interrupt gate.
+
+A text console renders a bounded 5x7 bitmap glyph set onto the validated
+32-bpp Limine framebuffer, supporting a prompt, newlines, backspace and
+scrolling. Serial logging remains available, as does the R014.1 polling
+mode, with no IRQ1 setup on ordinary boots. On the experimental
+IRQ1 mode, the first process cannot pass its QEMU acceptance check unless
+the kernel records at least one physical PS/2 keyboard interrupt.
+
+`make test-rust-keyboard-host` checks glyphs, FIFO bounds, PS/2 decoding
+and user-space syscall permissions. `make test-rust-keyboard-qemu`
+injects keypresses through the QEMU HMP virtual keyboard, checks shell
+command output, and requires an IRQ1 delivery event plus process reaping.
+This tests a legacy QEMU PS/2 keyboard, **not** modern USB HID or hardware
+keyboard support, and does not make application spawning asynchronous.

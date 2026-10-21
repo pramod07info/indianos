@@ -273,6 +273,8 @@ make test-rust-shell-host # R013 scripted shell/parser unit tests
 make test-rust-shell-qemu # R013 PID1 shell and worker process in QEMU
 make test-rust-interactive-host # R014 PS/2 decoder, input and syscall host tests
 make test-rust-interactive-qemu # R014 interactive QEMU serial command input
+make test-rust-keyboard-host # R014.2 scan code FIFO, framebuffer glyphs and IRQ policy
+make test-rust-keyboard-qemu # R014.2 virtual PS/2 IRQ1 and framebuffer text console
 make test-rust-link-audit # R010/R011 actual ELF input audit
 make test-rust-source-audit-negative # R010 require C rollback rejection
 make test-rust-ring3-runtime-qemu

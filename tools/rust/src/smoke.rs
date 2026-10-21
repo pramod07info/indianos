@@ -5,6 +5,7 @@
 use std::{
     fs,
     io::{Read,Write},
+    #[cfg(unix)] os::unix::net::UnixStream,
     path::{Path,PathBuf},
     process::{Command,Stdio},
     sync::mpsc,
@@ -122,6 +123,26 @@ pub fn verify(mode:&str,text:&str)->Result<(),String>{
                 "IndianOS: R013 shell session complete",
             ]);
         }
+        "keyboard"=>{
+            checks.extend(MILESTONES);
+            checks.extend([
+                "IndianOS: R014.2 framebuffer text console ready",
+                "IndianOS: R013 init shell begin",
+                "IndianOS: R014.2 IRQ1 keyboard controller armed",
+                "IndianOS: PID 1 RUNNING",
+                "IndianOS user: R014 interactive shell ready",
+                "IndianOS user: R014 shell: commands help ps run /bin/worker exit",
+                "IndianOS user: R014 shell: ps PID 1 RUNNING",
+                "IndianOS: R013 PID 1 requested /bin/worker",
+                "IndianOS user: R014 shell: worker queued for after exit",
+                "IndianOS user: R014 shell: exit",
+                "IndianOS: PID 1 REAPED",
+                "IndianOS: R014.2 PS/2 IRQ1 delivery verified",
+                "IndianOS: R013 launching /bin/worker",
+                "IndianOS: PID 2 REAPED",
+                "IndianOS: R013 shell session complete",
+            ]);
+        }
         "interactive"=>{
             checks.extend(MILESTONES);
             checks.extend([
@@ -201,6 +222,10 @@ pub fn verify(mode:&str,text:&str)->Result<(),String>{
         "fault-guard"|"fault-supervisor"
             if text.contains("IndianOS: /bin/init exited through int 0x80")=>
             Err("faulting user unexpectedly exited normally".into()),
+        "keyboard" if occurrences(text,"IndianOS user: indianos> ")!=4 ||
+            occurrences(text,"IndianOS: ring-3 PMM frame count restored")!=2 ||
+            text.contains("R014 shell: unknown command") =>
+            Err("R014.2 physical keyboard IRQ1 or process lifecycle failed".into()),
         "interactive" if occurrences(text,"IndianOS user: indianos> ")!=4 ||
             occurrences(text,"IndianOS: ring-3 PMM frame count restored")!=2 ||
             occurrences(text,"IndianOS: PID 1 REAPED")!=1 ||
@@ -258,7 +283,7 @@ pub fn run(args:&[String])->Result<String,String>{
     }
     // Reject unknown modes before starting QEMU.
     if !["normal","exception","pagefault","shadow","usermode",
-         "fault-guard","fault-supervisor","processes","scheduler","preempt","shell","interactive"].contains(&mode.as_str()){
+         "fault-guard","fault-supervisor","processes","scheduler","preempt","shell","interactive","keyboard"].contains(&mode.as_str()){
         return Err("invalid QEMU smoke mode".into())
     }
 
@@ -267,7 +292,7 @@ pub fn run(args:&[String])->Result<String,String>{
     command.args(["-drive",&format!("if=pflash,unit=0,format=raw,file={},readonly=on",ovmf.display())]);
     command.args(["-cdrom",iso.to_str().ok_or("non-UTF8 ISO path")?,
                   "-boot","d","-display","none","-serial","stdio",
-                  "-monitor","none","-no-reboot","-no-shutdown"]);
+                  "-no-reboot","-no-shutdown"]);
     if mode=="preempt"{command.arg("-no-hpet");}
     let mut tmp:Option<TempVars>=None;
     if let Some(template)=matching_vars(&ovmf){
@@ -280,11 +305,39 @@ pub fn run(args:&[String])->Result<String,String>{
         fs::copy(template,to.clone()).map_err(|e|e.to_string())?;
         command.args(["-drive",&format!("if=pflash,unit=1,format=raw,file={}",to.display())]);
     }
+    if mode=="keyboard" && tmp.is_none(){
+        let stamp=SystemTime::now().duration_since(UNIX_EPOCH)
+            .map_err(|e|e.to_string())?.as_nanos();
+        let dir=std::env::temp_dir().join(format!("indianos-r0142-{}-{stamp}",std::process::id()));
+        fs::create_dir(&dir).map_err(|e|e.to_string())?;
+        tmp=Some(TempVars{dir});
+    }
+    let monitor_path=if mode=="keyboard"{
+        let path=tmp.as_ref().ok_or("missing QEMU monitor workspace")?.dir.join("monitor.sock");
+        command.args(["-monitor",&format!("unix:{},server,nowait",path.display())]);
+        Some(path)
+    }else{
+        command.args(["-monitor","none"]);None
+    };
     let _cleanup=tmp;
     let mut child=command.stdin(if mode=="interactive"{Stdio::piped()}else{Stdio::null()}).stdout(Stdio::piped())
         .stderr(Stdio::null()).spawn().map_err(|e|format!("cannot start QEMU: {e}"))?;
     let stdout=child.stdout.take().ok_or("no QEMU stdout")?;
     let mut stdin=if mode=="interactive"{child.stdin.take()}else{None};
+    #[cfg(unix)]
+    let mut monitor=if let Some(path)=monitor_path.as_ref(){
+        let mut found=None;
+        for _ in 0..60 {
+            if let Ok(stream)=UnixStream::connect(path){found=Some(stream);break;}
+            thread::sleep(Duration::from_millis(50));
+        }
+        Some(found.ok_or("unable to connect to QEMU HMP monitor")?)
+    }else{None};
+    #[cfg(not(unix))]
+    let mut monitor:Option<std::io::Sink>={
+        if monitor_path.is_some(){return Err("keyboard mode requires Unix".into());}
+        None
+    };
     // Each QEMU UART RX FIFO has a finite depth: send one short command
     // only after the previous reply causes another visible shell prompt.
     let script:[&[u8];4]=[b"helpx\x7f\n",b"ps\n",b"run /bin/worker\n",b"exit\n"];
@@ -305,13 +358,39 @@ pub fn run(args:&[String])->Result<String,String>{
             Ok(part)=>{
                 output.extend(part);
                 if output.len()>1024*1024 {break}
-                if mode=="interactive"{
+                if mode=="interactive" || mode=="keyboard"{
                     let prompts=occurrences(&String::from_utf8_lossy(&output),
                                             "IndianOS user: indianos> ");
                     while sent<prompts && sent<script.len(){
-                        let Some(pipe)=stdin.as_mut()else{return Err("QEMU console stdin missing".into());};
-                        pipe.write_all(script[sent]).map_err(|e|format!("QEMU console send: {e}"))?;
-                        pipe.flush().map_err(|e|format!("QEMU console flush: {e}"))?;
+                        if mode=="interactive"{
+                            let pipe=stdin.as_mut().ok_or("QEMU console stdin missing")?;
+                            pipe.write_all(script[sent]).map_err(|e|format!("QEMU console send: {e}"))?;
+                            pipe.flush().map_err(|e|format!("QEMU console flush: {e}"))?;
+                        }else{
+                            let hmp=monitor.as_mut().ok_or("QEMU monitor missing")?;
+                            for &key in script[sent]{
+                                let name=match key{
+                                    b' '=>"spc",
+                                    b'/'=>"slash",
+                                    0x7f=>"backspace",
+                                    b'\n'=>"ret",
+                                    b'a'..=b'z'=>{
+                                        // Only ASCII script keys; derived keys require
+                                        // no spaces or shell metacharacters.
+                                        let key_text=[key];
+                                        let txt=core::str::from_utf8(&key_text).map_err(|e|e.to_string())?;
+                                        hmp.write_all(format!("sendkey {txt} 30\n").as_bytes())
+                                            .map_err(|e|format!("QEMU HMP key: {e}"))?;
+                                        thread::sleep(Duration::from_millis(55));
+                                        continue
+                                    }
+                                    _=>return Err("unsupported keyboard test key".into()),
+                                };
+                                hmp.write_all(format!("sendkey {name} 30\n").as_bytes())
+                                    .map_err(|e|format!("QEMU HMP key: {e}"))?;
+                                thread::sleep(Duration::from_millis(55));
+                            }
+                        }
                         sent+=1;
                     }
                 }
