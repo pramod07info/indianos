@@ -45,6 +45,9 @@ CFLAGS := -target x86_64-unknown-none-elf -std=c11 -O2 -g -Wall -Wextra -Werror 
           -fno-asynchronous-unwind-tables -fno-unwind-tables \
           -m64 -march=x86-64 -mno-mmx -mno-sse -mno-red-zone -mcmodel=kernel \
           -I kernel/include -I third_party/limine
+ifeq ($(RUST_CORE),1)
+CFLAGS += -DINDIANOS_RUST_CORE
+endif
 ifeq ($(EXCEPTION_SELFTEST),1)
 CFLAGS += -DINDIANOS_TEST_UD2
 endif
