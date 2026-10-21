@@ -21,6 +21,7 @@ pmm = []
 user-image = ["vmm"]
 paging = []
 runtime = []
+boot-staging = ["pmm", "user-image"]
 
 [profile.release]
 panic = "abort"
