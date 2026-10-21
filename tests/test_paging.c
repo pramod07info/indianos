@@ -157,9 +157,17 @@ int main(void) {
     assert(paging_attach_user_half(&b, supervisor.root, temporary_user_root));
     assert(kernel_root[1] == user_root[1]);
     assert(!paging_attach_user_half(&b, supervisor.root, temporary_user_root));
+    /* Actual CPU hardware can set A/D flags in the ATTACHED PML4 while
+     * the detached source PML4 retains its original bit pattern. */
+    kernel_root[1] |= 0x20ull | 0x40ull;
     assert(paging_detach_user_half(&b, supervisor.root, temporary_user_root));
     assert(kernel_root[1] == 0);
     assert(!paging_detach_user_half(&b, supervisor.root, temporary_user_root));
+    assert(paging_attach_user_half(&b, supervisor.root, temporary_user_root));
+    kernel_root[1] ^= 0x1000ull; /* But changing the physical child is unsafe. */
+    assert(!paging_detach_user_half(&b, supervisor.root, temporary_user_root));
+    kernel_root[1] = user_root[1];
+    assert(paging_detach_user_half(&b, supervisor.root, temporary_user_root));
     assert(free_frame(temporary_user_root, &mem));
     assert(paging_clone_release(&b, &supervisor));
     assert(mem.outstanding == 4);
