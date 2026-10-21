@@ -85,6 +85,10 @@ jobs:
         run: |
           set -o pipefail
           make kernel BUILD=build/rust-compile RUST_CORE=1 2>&1 | tee build-rust-kernel.log
+      - name: R010 enforce real ELF link provenance and negative controls
+        run: |
+          make test-rust-source-audit-negative
+          make test-rust-link-audit BUILD=build/rust-compile
       - name: Rust VMM original C ABI tests (candidate)
         id: rust_vmm_host
         continue-on-error: true

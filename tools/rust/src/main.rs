@@ -4,6 +4,7 @@
 use std::{collections::BTreeSet, env, fs, path::Path};
 
 mod smoke;
+mod kernel_audit;
 
 const MAX_FILES:usize=16;
 const MAX_NAME:usize=128;
@@ -114,7 +115,7 @@ fn option(args:&[String],name:&str)->Option<String>{
 }
 fn command(args:&[String])->Result<(),String>{
     let Some(cmd)=args.first().map(String::as_str) else{
-        return Err("usage: indianos-tools pack|check-elf ...".into())
+        return Err("usage: indianos-tools pack|check-elf|smoke|audit-kernel ...".into())
     };
     match cmd{
         "pack"=>{
@@ -142,6 +143,10 @@ fn command(args:&[String])->Result<(),String>{
             let log=smoke::run(&args[1..])?;
             println!("{log}");
             println!("IndianOS QEMU boot smoke test PASSED");
+            Ok(())
+        }
+        "audit-kernel"=>{
+            println!("{}",kernel_audit::run(&args[1..])?);
             Ok(())
         }
         "check-elf"=>{

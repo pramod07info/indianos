@@ -201,11 +201,13 @@ else
 $(error USERFAULT_KIND must be guard or supervisor)
 endif
 endif
+# Export all actual link inputs as ld.lld map provenance for R010 audit.
 LDFLAGS := -target x86_64-unknown-none-elf -fuse-ld=lld -nostdlib -static \
            -Wl,-z,max-page-size=0x1000 -Wl,-z,noexecstack \
-           -Wl,--gc-sections -Wl,--build-id=none -Wl,-T,kernel/linker.ld
+           -Wl,--gc-sections -Wl,--build-id=none -Wl,-T,kernel/linker.ld \
+           -Wl,-Map,$(BUILD)/kernel-link.map
 
-.PHONY: test-rust-source-audit test-rust-default-qemu test-rust-tools test-rust-userland-qemu test-rust-interrupts-qemu test-rust-boot-qemu test-rust-vmm-host test-rust-vmm-qemu test-rust-pmm-host test-rust-pmm-qemu test-rust-user-image-host test-rust-user-image-qemu test-rust-paging-host test-rust-paging-qemu test-rust-runtime-host test-rust-runtime-qemu test-rust-boot-staging-qemu test-rust-host-abi test-rust-processes test-rust-scheduler rust-core all kernel user-elf test-user-elf test-ring3-elf initramfs test-initramfs image run run-bios test-boot test-exception test-pagefault test-shadow test-usermode test-userfault-supervisor test-userfault-guard test-processes test-scheduler test-preempt test-host toolchain-check clean
+.PHONY: test-rust-link-audit test-rust-source-audit-negative test-rust-source-audit test-rust-default-qemu test-rust-tools test-rust-userland-qemu test-rust-interrupts-qemu test-rust-boot-qemu test-rust-vmm-host test-rust-vmm-qemu test-rust-pmm-host test-rust-pmm-qemu test-rust-user-image-host test-rust-user-image-qemu test-rust-paging-host test-rust-paging-qemu test-rust-runtime-host test-rust-runtime-qemu test-rust-boot-staging-qemu test-rust-host-abi test-rust-processes test-rust-scheduler rust-core all kernel user-elf test-user-elf test-ring3-elf initramfs test-initramfs image run run-bios test-boot test-exception test-pagefault test-shadow test-usermode test-userfault-supervisor test-userfault-guard test-processes test-scheduler test-preempt test-host toolchain-check clean
 all: image
 kernel: $(KERNEL_ELF)
 
@@ -232,6 +234,23 @@ test-rust-source-audit:
 	@test -z "$(strip $(filter-out $(BUILD)/obj/interrupt_entry.o $(BUILD)/obj/user_entry.o $(RUST_LIB),$(OBJECTS)))" || (echo "Unexpected non-Rust kernel object: $(OBJECTS)" >&2; exit 1)
 	@echo "IndianOS: kernel is Rust-owned, with minimal architecture assembly."
 
+# Refuse any C translation units on the Rust-default path. This negative
+# test intentionally turns on legacy flags; the child audit MUST fail.
+test-rust-source-audit-negative:
+	@if $(MAKE) --no-print-directory -s test-rust-source-audit RUST_CORE=0 >/dev/null 2>&1; then \
+	    echo "R010 FAIL: old C kernel passed Rust source audit" >&2; exit 1; fi
+	@if $(MAKE) --no-print-directory -s test-rust-source-audit RUST_MAIN=0 >/dev/null 2>&1; then \
+	    echo "R010 FAIL: old C main passed Rust source audit" >&2; exit 1; fi
+	@if $(MAKE) --no-print-directory -s test-rust-source-audit RUST_USER_RUNTIME=0 >/dev/null 2>&1; then \
+	    echo "R010 FAIL: old C runtime passed Rust source audit" >&2; exit 1; fi
+	@if $(MAKE) --no-print-directory -s test-rust-source-audit RUST_INTERRUPTS=0 >/dev/null 2>&1; then \
+	    echo "R010 FAIL: old C interrupt handler passed Rust source audit" >&2; exit 1; fi
+	@echo "IndianOS R010: negative source audit PASSED"
+
+# Audit final ELF link provenance, not only Make variable expansion.
+test-rust-link-audit: test-rust-source-audit $(KERNEL_ELF) $(RUST_TOOLS_BIN)
+	$(RUST_TOOLS_BIN) audit-kernel $(BUILD)/kernel-link.map $(KERNEL_ELF) \
+	    $(RUST_LIB) $(BUILD)/obj/interrupt_entry.o $(BUILD)/obj/user_entry.o
 
 test-rust-host-abi:
 	@mkdir -p build/rust-tests
