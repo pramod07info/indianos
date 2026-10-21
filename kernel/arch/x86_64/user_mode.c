@@ -641,10 +641,17 @@ bool x86_64_m009_schedule_run(const uint8_t *first_elf, size_t first_bytes,
                pmm_free_frames() != starting_free))
         ok = false;
 #ifdef INDIANOS_TEST_PREEMPT
-    if (x86_64_timer_irq_count() == 0)
+    if (x86_64_timer_irq_count() == 0) {
         serial_write("IndianOS: M009 PIC/PIT delivered zero timer IRQs\n");
-    else
+        if ((x86_64_timer_pic_mask() & 1u) != 0)
+            serial_write("IndianOS: M009 PIC IRQ0 unexpectedly masked\n");
+        else if ((x86_64_timer_pic_pending() & 1u) != 0)
+            serial_write("IndianOS: M009 PIC IRQ0 pending without CPU delivery\n");
+        else
+            serial_write("IndianOS: M009 PIC IRQ0 request register empty\n");
+    } else {
         serial_write("IndianOS: M009 PIC/PIT hardware timer interrupts observed\n");
+    }
     if (scheduler.yield_count < 2 || scheduler.tick_count < 2 ||
         m009_tasks[0].timer_preemptions == 0 ||
         m009_tasks[1].timer_preemptions == 0 ||
