@@ -59,9 +59,15 @@ def main() -> None:
     parser.add_argument("--elf", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--name", default="/bin/init")
+    parser.add_argument("--extra-elf", type=Path,
+                        help="Optional second ELF (M008 sequential process test)")
+    parser.add_argument("--extra-name", default="/bin/worker")
     args = parser.parse_args()
     content = args.elf.read_bytes()
-    archive = pack([(args.name, content)])
+    entries = [(args.name, content)]
+    if args.extra_elf is not None:
+        entries.append((args.extra_name, args.extra_elf.read_bytes()))
+    archive = pack(entries)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_bytes(archive)
     print(f"IndianOS read-only initramfs: {len(archive)} bytes")
