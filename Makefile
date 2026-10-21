@@ -92,7 +92,9 @@ kernel: $(KERNEL_ELF)
 # in the kernel link order, after C and CPU entry stubs that reference it.
 $(RUST_LIB): $(RUST_MANIFEST) $(RUST_SOURCE) Makefile
 	@mkdir -p $(@D)
-	CARGO_TARGET_DIR=$(BUILD)/rust-target $(CARGO) build --manifest-path $(RUST_MANIFEST) \
+	CARGO_TARGET_DIR=$(BUILD)/rust-target \
+	RUSTFLAGS="-C relocation-model=static -C code-model=kernel" \
+	    $(CARGO) build --manifest-path $(RUST_MANIFEST) \
 	    --target x86_64-unknown-none --release --offline --no-default-features $(RUST_FEATURES)
 	cp $(BUILD)/rust-target/x86_64-unknown-none/release/libindianos_kernel_core.a $@
 
@@ -104,15 +106,18 @@ test-rust-host-abi:
 	CARGO_TARGET_DIR=build/rust-tests/host $(CARGO) build --manifest-path $(RUST_MANIFEST) \
 	    --release --offline --no-default-features
 	$(CC) -std=c11 -O2 -g -Wall -Wextra -Werror -I kernel/include \
-	    tests/test_process.c build/rust-tests/host/release/libindianos_kernel_core.a \
+	    tests/test_process.c tests/rust_host_personality.c \
+	    build/rust-tests/host/release/libindianos_kernel_core.a \
 	    -o build/rust-tests/process_test
 	build/rust-tests/process_test
 	$(CC) -std=c11 -O2 -g -Wall -Wextra -Werror -I kernel/include \
-	    tests/test_scheduler.c build/rust-tests/host/release/libindianos_kernel_core.a \
+	    tests/test_scheduler.c tests/rust_host_personality.c \
+	    build/rust-tests/host/release/libindianos_kernel_core.a \
 	    -o build/rust-tests/scheduler_test
 	build/rust-tests/scheduler_test
 	$(CC) -std=c11 -O2 -g -Wall -Wextra -Werror -I kernel/include \
-	    tests/test_user_fault.c build/rust-tests/host/release/libindianos_kernel_core.a \
+	    tests/test_user_fault.c tests/rust_host_personality.c \
+	    build/rust-tests/host/release/libindianos_kernel_core.a \
 	    -o build/rust-tests/user_fault_test
 	build/rust-tests/user_fault_test
 
