@@ -239,3 +239,26 @@ Host-only `cargo test` omits privileged assembly using `cfg`.
 QEMU CI boot/exception/IRQ0/ring-3/PCB/fault tests are required before
 marking R011 complete; `global_asm!` does not imply those x86 instructions
 were rewritten into safe Rust.
+
+## R012 — kernel user-space boundary hardening
+
+Effective VMM permissions are now the intersection of all four table
+levels: supervisor-only, read-only, or NX ancestors cannot be overridden
+by a permissive leaf PTE. User-buffer copying checks the complete range
+before reading, validates each physical page against the process UserImage
+ownership ledger, and rejects W+X mappings. The user-copy-ready capability
+is revoked before beginning cleanup, even on a partial release error.
+
+The ring-3 syscall/scheduler path verifies hardware-pushed CS, SS, fixed
+RFLAGS and IOPL/NT/VM/IF policy, RIP and owned stack range. SYS_WRITE,
+SYS_EXIT and other syscalls must originate from user-executable, nonwritable
+memory. Process-launch preflight checks **all** staged pages against planned
+physical frames and expected write/execute/stack rights in the detached and
+cloned tables, plus the stack guard.
+
+`make test-rust-hardening` runs adversarial unit tests for malformed
+trap frames, restrictive page-table ancestors, and foreign user frames.
+CI also enforces existing no_std linker/ABI, normal boot, ring-3 execution,
+fault isolation and scheduler QEMU regressions. This does not imply
+SMP hardening, mature hardware interrupt preemption, real-hardware support
+or production-quality process isolation.

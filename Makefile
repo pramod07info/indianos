@@ -217,7 +217,7 @@ LDFLAGS := -target x86_64-unknown-none-elf -fuse-ld=lld -nostdlib -static \
            -Wl,--gc-sections -Wl,--build-id=none -Wl,-T,kernel/linker.ld \
            -Wl,-Map,$(BUILD)/kernel-link.map
 
-.PHONY: test-rust-entry-abi test-rust-link-audit test-rust-source-audit-negative test-rust-source-audit test-rust-default-qemu test-rust-tools test-rust-userland-qemu test-rust-interrupts-qemu test-rust-boot-qemu test-rust-vmm-host test-rust-vmm-qemu test-rust-pmm-host test-rust-pmm-qemu test-rust-user-image-host test-rust-user-image-qemu test-rust-paging-host test-rust-paging-qemu test-rust-runtime-host test-rust-runtime-qemu test-rust-boot-staging-qemu test-rust-host-abi test-rust-processes test-rust-scheduler rust-core all kernel user-elf test-user-elf test-ring3-elf initramfs test-initramfs image run run-bios test-boot test-exception test-pagefault test-shadow test-usermode test-userfault-supervisor test-userfault-guard test-processes test-scheduler test-preempt test-host toolchain-check clean
+.PHONY: test-rust-hardening test-rust-entry-abi test-rust-link-audit test-rust-source-audit-negative test-rust-source-audit test-rust-default-qemu test-rust-tools test-rust-userland-qemu test-rust-interrupts-qemu test-rust-boot-qemu test-rust-vmm-host test-rust-vmm-qemu test-rust-pmm-host test-rust-pmm-qemu test-rust-user-image-host test-rust-user-image-qemu test-rust-paging-host test-rust-paging-qemu test-rust-runtime-host test-rust-runtime-qemu test-rust-boot-staging-qemu test-rust-host-abi test-rust-processes test-rust-scheduler rust-core all kernel user-elf test-user-elf test-ring3-elf initramfs test-initramfs image run run-bios test-boot test-exception test-pagefault test-shadow test-usermode test-userfault-supervisor test-userfault-guard test-processes test-scheduler test-preempt test-host toolchain-check clean
 all: image
 kernel: $(KERNEL_ELF)
 
@@ -278,6 +278,11 @@ test-rust-entry-abi: test-rust-link-audit
 	        { echo "R011 missing CPU ABI symbol: $$sym" >&2; exit 1; }; \
 	done
 	@echo "IndianOS R011: all exported CPU ABI symbols preserved."
+
+# R012 host-only hostile CPU-frame, page-permission and copy-ownership tests.
+test-rust-hardening:
+	CARGO_TARGET_DIR=build/rust-hardening-target $(CARGO) test \
+	    --manifest-path $(RUST_MANIFEST) --offline --features user-image
 
 test-rust-host-abi:
 	@mkdir -p build/rust-tests

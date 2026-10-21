@@ -93,6 +93,8 @@ jobs:
         run: |
           make test-rust-entry-abi BUILD=build/rust-compile
           make kernel BUILD=build/r011-c-reference RUST_CORE=0
+      - name: R012 adversarial syscall, VMM permission and user-copy tests
+        run: make test-rust-hardening
       - name: Rust VMM original C ABI tests (candidate)
         id: rust_vmm_host
         continue-on-error: true
