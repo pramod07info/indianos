@@ -23,6 +23,8 @@ mod user_image;
 mod paging;
 #[cfg(feature = "paging-cpu")]
 mod paging_cpu;
+#[cfg(feature = "user-runtime")]
+mod user_runtime;
 #[cfg(feature = "runtime")]
 mod runtime;
 #[cfg(feature = "boot-staging")]

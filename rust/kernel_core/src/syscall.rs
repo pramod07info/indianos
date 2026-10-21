@@ -46,9 +46,9 @@ pub(crate) struct ProgramPlan {
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct SyscallRequest {
-    number: u64,
-    arg0: u64,
-    arg1: u64,
+    pub(crate) number: u64,
+    pub(crate) arg0: u64,
+    pub(crate) arg1: u64,
 }
 
 pub(crate) fn user_range(plan: &ProgramPlan, address: u64, length: u64, write: bool) -> bool {

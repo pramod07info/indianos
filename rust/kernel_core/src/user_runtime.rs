@@ -222,7 +222,7 @@ fn preflight()->Option<(CpuState,u64)>{
  if cpu.pcid_enabled {
   log(b"IndianOS: ring-3 preflight failed: unsupported PCID mode\n\0");return None;
  }
- if !unsafe{boot_hhdm_offset(&mut offset)}||offset==0{
+ if !unsafe{boot_hhdm_offset(&mut offset)} ||offset==0{
   log(b"IndianOS: ring-3 preflight failed: missing HHDM\n\0");return None;
  }
  Some((cpu,offset))
@@ -231,7 +231,8 @@ fn preflight()->Option<(CpuState,u64)>{
 pub unsafe extern "C" fn x86_64_user_process_run(
  process:*mut Process,elf:*const u8,size:usize)->bool{
  let Some(p)=(unsafe{process.as_ref()})else{return false};
- if p.pid==0||p.state!=1||!active_image().is_null(){return false;}
+ let pid=p.pid;
+ if pid==0||p.state!=1||!active_image().is_null(){return false;}
  let Some((cpu,offset))=preflight()else{return false};
  if !unsafe{x86_64_user_interrupt_stack_enable()}{
   log(b"IndianOS: ring-3 preflight failed: TSS RSP0\n\0");return false;
@@ -250,7 +251,7 @@ pub unsafe extern "C" fn x86_64_user_process_run(
  if !unsafe{indianos_process_ready(process)}{
   let _=unsafe{indianos_user_image_destroy(&mut staged)};return false;
  }
- pid_log(p.pid,b"READY\0");
+ pid_log(pid,b"READY\0");
  let original=cpu.cr3&PHYS;
  let cloned=unsafe{paging_clone_kernel_half(&backend,original,&mut clone)};
  if !cloned{log(b"IndianOS: ring-3 failed: supervisor mapping clone\n\0");}
@@ -276,7 +277,7 @@ pub unsafe extern "C" fn x86_64_user_process_run(
    log(b"IndianOS: ring-3 failed: PCB state transition\n\0");safe=false;
   }
   if safe{
-   pid_log(p.pid,b"RUNNING\0");clear_faults();
+   pid_log(pid,b"RUNNING\0");clear_faults();
    unsafe{ACTIVE_USER=&mut staged;}
    log(b"IndianOS: entering ring-3 /bin/init (QEMU experimental)\n\0");
    let status=unsafe{x86_64_enter_user(staged.plan.entry,staged.plan.stack_end-16,clone.root)};
@@ -287,7 +288,7 @@ pub unsafe extern "C" fn x86_64_user_process_run(
    if !completed{
     log(b"IndianOS: FATAL PCB terminal state rejected\n\0");return false;
    }
-   pid_log(p.pid,if v==0{b"EXITED\0"}else{b"FAULTED\0"});
+   pid_log(pid,if v==0{&b"EXITED\0"[..]}else{&b"FAULTED\0"[..]});
    #[cfg(any(feature="test-fault-guard",feature="test-fault-supervisor"))]
    {
     #[cfg(feature="test-fault-guard")]
@@ -325,7 +326,7 @@ pub unsafe extern "C" fn x86_64_user_process_run(
  if !unsafe{indianos_process_reap(process)}{
   log(b"IndianOS: ring-3 failed: PCB reap transition\n\0");return false;
  }
- pid_log(p.pid,b"REAPED\0");
+ pid_log(pid,b"REAPED\0");
  success
 }
 #[no_mangle]
@@ -341,10 +342,10 @@ fn task_ptr(i:usize)->*mut Task{
 fn prepare(t:*mut Task,p:*mut Process,elf:*const u8,size:usize,original:u64,
  vmm:&VmmBackend,b:&CloneBackend,slot:usize)->bool{
  let task=unsafe{&mut *t};
- if p.is_null()||!unsafe{x86_64_user_interrupt_stack_select(slot as u32)}||
+ if p.is_null()||!unsafe{x86_64_user_interrupt_stack_select(slot as u32)} ||
     !unsafe{indianos_user_image_load(&mut task.image,vmm,elf,size)}{return false;}
  task.pcb=p;
- if !unsafe{paging_clone_kernel_half(b,original,&mut task.root)}||
+ if !unsafe{paging_clone_kernel_half(b,original,&mut task.root)} ||
     !unsafe{paging_attach_user_half(b,task.root.root,task.image.tables.root_physical)}{return false;}
  task.attached=true;
  let addresses=[
@@ -359,7 +360,7 @@ fn prepare(t:*mut Task,p:*mut Process,elf:*const u8,size:usize,original:u64,
  let safe=trap_mapped(b,original,task.root.root)&&
   addresses.iter().all(|&a|kernel_mapped(b,original,task.root.root,a))&&
   image_mapped(b,task.root.root,&task.image);
- if !safe||!unsafe{indianos_process_ready(p)}||
+ if !safe||!unsafe{indianos_process_ready(p)} ||
     !unsafe{indianos_process_bind(p,task.root.root)}{return false;}
  pid_log(unsafe{(*p).pid},b"READY\0");true
 }
@@ -370,9 +371,9 @@ fn saved_valid(t:&Task)->bool{
  let rip=t.frame[15];let rsp=t.frame[18];
  let mut map=Mapping{physical:0,permissions:Permissions{
   writable:false,executable:false,user:false}};
- unsafe{indianos_program_user_range(&t.image.plan,rip,1,false)}&&
+ unsafe{indianos_program_user_range(&t.image.plan,rip,1,false)} &&
  rsp>=t.image.plan.stack_begin&&rsp<=t.image.plan.stack_end&&
- unsafe{vmm_query_page(&t.image.tables,rip&!(PAGE-1),&mut map)}&&
+ unsafe{vmm_query_page(&t.image.tables,rip&!(PAGE-1),&mut map)} &&
  map.permissions.user&&map.permissions.executable&&!map.permissions.writable
 }
 fn discard(t:*mut Task,b:&CloneBackend,terminal:bool)->bool{
@@ -465,13 +466,13 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
     unsafe{indianos_process_fault(pcb,status,v,e,a)}
    }else{unsafe{indianos_process_exit(pcb,status)}};
    if !finished{ok=false;break;}
-   pid_log(pid,if v==0{b"EXITED\0"}else{b"FAULTED\0"});
+   pid_log(pid,if v==0{&b"EXITED\0"[..]}else{&b"FAULTED\0"[..]});
    if !discard(task as *mut Task,&backend,true){ok=false;break;}
   }
  }
- if ok&&(!unsafe{indianos_scheduler_all_terminal(&scheduler)}||
-         !unsafe{indianos_process_success(p)}||
-         !unsafe{indianos_process_success(q)}||
+ if ok&&(!unsafe{indianos_scheduler_all_terminal(&scheduler)} ||
+         !unsafe{indianos_process_success(p)} ||
+         !unsafe{indianos_process_success(q)} ||
          unsafe{pmm_free_frames()}!=before){ok=false;}
  #[cfg(feature="preempt")]
  {

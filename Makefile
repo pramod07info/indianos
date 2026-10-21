@@ -22,6 +22,7 @@ RUST_PMM ?= $(RUST_CORE)
 RUST_USER_IMAGE ?= $(RUST_CORE)
 RUST_PAGING ?= $(RUST_CORE)
 RUST_PAGING_CPU ?= $(RUST_CORE)
+RUST_USER_RUNTIME ?= $(RUST_CORE)
 RUST_RUNTIME ?= $(RUST_CORE)
 RUST_BOOT_STAGING ?= $(RUST_CORE)
 RUST_BOOT ?= $(RUST_CORE)
@@ -32,6 +33,14 @@ RUST_MAIN ?= $(RUST_CORE)
 ifeq ($(RUST_MAIN),1)
 ifneq ($(RUST_CORE),1)
 $(error RUST_MAIN requires RUST_CORE=1)
+endif
+endif
+ifeq ($(RUST_USER_RUNTIME),1)
+ifneq ($(RUST_CORE),1)
+$(error RUST_USER_RUNTIME requires RUST_CORE=1)
+endif
+ifneq ($(RUST_PAGING_CPU),1)
+$(error RUST_USER_RUNTIME requires RUST_PAGING_CPU=1)
 endif
 endif
 ifeq ($(RUST_PAGING_CPU),1)
@@ -76,7 +85,7 @@ CARGO ?= cargo
 RUST_MANIFEST := rust/kernel_core/Cargo.toml
 RUST_SOURCE := $(wildcard rust/kernel_core/src/*.rs)
 RUST_LIB := $(BUILD)/libindianos_kernel_core.a
-RUST_FEATURES := $(if $(filter 1,$(PREEMPT_SELFTEST)),--features preempt,) $(if $(filter 1,$(RUST_VMM)),--features vmm,) $(if $(filter 1,$(RUST_PMM)),--features pmm,) $(if $(filter 1,$(RUST_USER_IMAGE)),--features user-image,) $(if $(filter 1,$(RUST_PAGING)),--features paging,) $(if $(filter 1,$(RUST_PAGING_CPU)),--features paging-cpu,) $(if $(filter 1,$(RUST_RUNTIME)),--features runtime,) $(if $(filter 1,$(RUST_BOOT_STAGING)),--features boot-staging,) $(if $(filter 1,$(RUST_BOOT)),--features boot,) $(if $(filter 1,$(RUST_BOOT_PROTOCOL)),--features limine-requests,) $(if $(filter 1,$(RUST_INTERRUPTS)),--features interrupts,) $(if $(filter 1,$(RUST_TIMER)),--features timer,) $(if $(filter 1,$(RUST_MAIN)),--features kernel-main,)
+RUST_FEATURES := $(if $(filter 1,$(PREEMPT_SELFTEST)),--features preempt,) $(if $(filter 1,$(RUST_VMM)),--features vmm,) $(if $(filter 1,$(RUST_PMM)),--features pmm,) $(if $(filter 1,$(RUST_USER_IMAGE)),--features user-image,) $(if $(filter 1,$(RUST_PAGING)),--features paging,) $(if $(filter 1,$(RUST_PAGING_CPU)),--features paging-cpu,) $(if $(filter 1,$(RUST_USER_RUNTIME)),--features user-runtime,) $(if $(filter 1,$(RUST_RUNTIME)),--features runtime,) $(if $(filter 1,$(RUST_BOOT_STAGING)),--features boot-staging,) $(if $(filter 1,$(RUST_BOOT)),--features boot,) $(if $(filter 1,$(RUST_BOOT_PROTOCOL)),--features limine-requests,) $(if $(filter 1,$(RUST_INTERRUPTS)),--features interrupts,) $(if $(filter 1,$(RUST_TIMER)),--features timer,) $(if $(filter 1,$(RUST_MAIN)),--features kernel-main,)
 ifeq ($(RUST_MAIN),1)
 RUST_FEATURES += $(if $(filter 1,$(EXCEPTION_SELFTEST)),--features test-ud2,) \
  $(if $(filter 1,$(PAGEFAULT_SELFTEST)),--features test-pagefault,) \
@@ -130,7 +139,10 @@ ifeq ($(RUST_MAIN),1)
 SOURCES := $(filter-out kernel/src/main.c,$(SOURCES))
 endif
 OBJECTS := $(patsubst kernel/src/%.c,$(BUILD)/obj/%.o,$(SOURCES))
-OBJECTS += $(BUILD)/obj/interrupt_entry.o $(BUILD)/obj/user_mode.o $(BUILD)/obj/user_entry.o
+OBJECTS += $(BUILD)/obj/interrupt_entry.o $(BUILD)/obj/user_entry.o
+ifneq ($(RUST_USER_RUNTIME),1)
+OBJECTS += $(BUILD)/obj/user_mode.o
+endif
 ifneq ($(RUST_PAGING_CPU),1)
 OBJECTS += $(BUILD)/obj/paging.o
 endif
@@ -289,6 +301,15 @@ test-rust-timer-link-qemu:
 
 # Explicit acceptance check for the integrated default (no opt-in flags).
 # Both cases exercise Rust Limine requests + kmain + IDT/TSS + timer link.
+test-rust-ring3-runtime-qemu:
+	$(MAKE) image BUILD=build/rust-runtime-normal RUST_USER_RUNTIME=1
+	$(MAKE) $(RUST_TOOLS_BIN)
+	$(RUST_TOOLS_BIN) smoke --iso build/rust-runtime-normal/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)" --mode normal
+	$(MAKE) image BUILD=build/rust-runtime-processes RUST_USER_RUNTIME=1 PROCESS_SELFTEST=1
+	$(RUST_TOOLS_BIN) smoke --iso build/rust-runtime-processes/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)" --mode processes
+	$(MAKE) image BUILD=build/rust-runtime-scheduler RUST_USER_RUNTIME=1 SCHEDULER_SELFTEST=1
+	$(RUST_TOOLS_BIN) smoke --iso build/rust-runtime-scheduler/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)" --mode scheduler
+
 test-rust-paging-cpu-qemu:
 	$(MAKE) image BUILD=build/rust-paging-cpu RUST_CORE=1 RUST_PAGING_CPU=1
 	$(MAKE) $(RUST_TOOLS_BIN)

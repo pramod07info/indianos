@@ -169,3 +169,13 @@ detection and the gated shadow-root switch. The default Rust kernel excludes
 `RUST_PAGING_CPU=0`. The CR3 switch is QEMU-test-only and refuses PCID.
 Acceptance: `make test-rust-paging-cpu-qemu`, full QEMU scheduler/fault parity
 and opt-in `make test-shadow`. A passing build alone is not runtime proof.
+
+## R009 — ring-3 ownership
+
+`rust/kernel_core/src/user_runtime.rs` replaces the active C `user_mode.c`
+translation unit in the default kernel. It owns syscall/fault dispatch, user
+PCB lifecycle, M009 cooperative scheduling, and page-table cleanup. The
+minimal `user_entry.S` trampoline remains for IRETQ/CPU register transitions.
+`RUST_USER_RUNTIME=0` retains the original C runner for comparison. Verify
+with `make test-rust-ring3-runtime-qemu`, full QEMU fault/scheduler tests,
+and a complete CI gate before treating this migration as established.
