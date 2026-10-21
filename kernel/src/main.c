@@ -106,6 +106,25 @@ __attribute__((noreturn)) void kmain(void) {
         halt_forever();
     }
     serial_write("IndianOS: initramfs /bin/init staged and released safely\n");
+#ifdef INDIANOS_TEST_SCHEDULER
+    /* Different ELF images share a virtual entry address, but never physical
+     * user frames or cloned CR3 roots. Four cooperative yields produce six
+     * round-robin dispatches; every resource is reaped before success. */
+    const uint8_t *sched_worker_elf = 0;
+    size_t sched_worker_bytes = 0;
+    if (!boot_initramfs_file("/bin/worker",
+                            &sched_worker_elf, &sched_worker_bytes)) {
+        serial_write("IndianOS: FATAL M009 worker executable not found\n");
+        halt_forever();
+    }
+    serial_write("IndianOS: M009 cooperative scheduler experiment begin\n");
+    if (!x86_64_m009_schedule_run(init_elf, init_elf_size,
+                                   sched_worker_elf, sched_worker_bytes)) {
+        serial_write("IndianOS: FATAL M009 cooperative context test failed\n");
+        halt_forever();
+    }
+    serial_write("IndianOS: M009 scheduler experiment complete\n");
+#endif
 #ifdef INDIANOS_TEST_PROCESSES
     /* Two separate ELF images: both undergo fresh frame allocations and
      * independent CR3 clones; the second starts only AFTER the first is
