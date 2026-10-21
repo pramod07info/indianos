@@ -165,7 +165,7 @@ $(BUILD)/inspect_archive: tests/inspect_archive.c kernel/src/initramfs.c kernel/
 	    tests/inspect_archive.c kernel/src/initramfs.c kernel/src/program.c -o $@
 
 test-initramfs: $(INITRAMFS) $(BUILD)/inspect_archive
-	$(BUILD)/inspect_archive $(INITRAMFS)
+	$(BUILD)/inspect_archive $(INITRAMFS) $(if $(filter 1,$(PROCESS_SELFTEST)),/bin/worker,)
 
 toolchain-check:
 	@command -v $(CC) && command -v ld.lld && command -v readelf
@@ -246,6 +246,7 @@ test-userfault-guard:
 	python3 tools/smoke_boot.py --iso build/fault-guard/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)" --mode fault-guard
 
 test-processes:
+	$(MAKE) test-initramfs BUILD=build/processes PROCESS_SELFTEST=1
 	$(MAKE) image BUILD=build/processes PROCESS_SELFTEST=1
 	python3 tools/smoke_boot.py --iso build/processes/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)" --mode processes
 
