@@ -19,6 +19,8 @@ mod vmm;
 mod pmm;
 #[cfg(feature = "user-image")]
 mod user_image;
+#[cfg(feature = "paging")]
+mod paging;
 
 pub const MAX_PROCESSES: usize = 4;
 pub const MAX_DISPATCHES: u32 = if cfg!(feature = "preempt") { 2048 } else { 32 };
