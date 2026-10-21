@@ -13,11 +13,13 @@ BUILD := build
 # Rust-native process/scheduler/fault policy is the verified default.
 # RUST_CORE=0 retains the original C implementation as an emergency fallback.
 RUST_CORE ?= 1
-# Opt in to the Rust VMM while QEMU parity is being established.
-RUST_VMM ?= 0
-RUST_PMM ?= 0
-RUST_USER_IMAGE ?= 0
-RUST_PAGING ?= 0
+# Proven Rust-owned memory and paging modules now replace the original C
+# implementations in the default freestanding kernel. Pass RUST_*=0 for
+# controlled reference builds; user-image Rust requires Rust VMM.
+RUST_VMM ?= 1
+RUST_PMM ?= 1
+RUST_USER_IMAGE ?= 1
+RUST_PAGING ?= 1
 RUST_RUNTIME ?= 0
 ifeq ($(RUST_USER_IMAGE),1)
 ifneq ($(RUST_VMM),1)
