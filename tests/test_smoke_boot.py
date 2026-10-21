@@ -8,7 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 from smoke_boot import (assert_milestones, assert_expected_exception,
                         assert_expected_pagefault, assert_expected_shadow,
                         assert_expected_usermode, assert_expected_userfault,
-                        assert_expected_processes,
+                        assert_expected_processes, assert_expected_scheduler,
                         matching_ovmf_vars, MILESTONES)  # noqa: E402
 
 
@@ -171,6 +171,35 @@ class SmokeBootTests(unittest.TestCase):
             "IndianOS: M008 two independent processes exited and reaped"])
         with self.assertRaises(AssertionError):
             assert_expected_processes(output)
+
+    def test_scheduler_requires_interleaved_user_contexts(self):
+        names = [*MILESTONES,
+            "IndianOS: M009 cooperative scheduler experiment begin",
+            "IndianOS: PID 1 READY", "IndianOS: PID 2 READY",
+            "IndianOS: M009 two simultaneous user address spaces ready"]
+        for step in (1, 2, 3):
+            for pid, label in ((1, "A"), (2, "B")):
+                names += [f"IndianOS: PID {pid} DISPATCHED",
+                          f"IndianOS user: M009 task {label} step {step}"]
+                if step < 3:
+                    names.append(f"IndianOS: PID {pid} YIELDED")
+                else:
+                    names += [f"IndianOS: PID {pid} EXITED",
+                              f"IndianOS: PID {pid} REAPED"]
+        names += ["IndianOS: M009 round-robin cooperative switching PASSED",
+                  "IndianOS: M009 scheduler experiment complete"]
+        assert_expected_scheduler("\n".join(names))
+
+    def test_scheduler_rejects_missing_task_yield(self):
+        names = [*MILESTONES,
+            "IndianOS: M009 cooperative scheduler experiment begin",
+            "IndianOS: PID 1 READY", "IndianOS: PID 2 READY",
+            "IndianOS: M009 two simultaneous user address spaces ready",
+            "IndianOS: PID 1 DISPATCHED",
+            "IndianOS user: M009 task A step 1",
+            "IndianOS: PID 2 DISPATCHED"]
+        with self.assertRaises(AssertionError):
+            assert_expected_scheduler("\n".join(names))
 
     def test_rejects_out_of_order(self):
         with self.assertRaises(AssertionError):
