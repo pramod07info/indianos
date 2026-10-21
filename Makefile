@@ -259,6 +259,7 @@ test-rust-timer-link-qemu:
 	python3 tools/smoke_boot.py --iso build/rust-timer-user/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)" --mode usermode
 
 test-rust-integration-qemu:
+	$(MAKE) $(RUST_TOOLS_BIN)
 	$(MAKE) image BUILD=build/rust-all-normal RUST_BOOT=1 RUST_INTERRUPTS=1 RUST_TIMER=1 RUST_USERLAND=1 RUST_TOOLS=1
 	$(RUST_TOOLS_BIN) smoke --iso build/rust-all-normal/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)" --mode normal
 	$(MAKE) image BUILD=build/rust-all-ring3 USERMODE_SELFTEST=1 RUST_BOOT=1 RUST_INTERRUPTS=1 RUST_TIMER=1 RUST_USERLAND=1 RUST_TOOLS=1
