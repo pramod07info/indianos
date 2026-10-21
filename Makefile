@@ -25,6 +25,12 @@ RUST_BOOT_STAGING ?= 1
 RUST_BOOT ?= 0
 RUST_INTERRUPTS ?= 0
 RUST_TIMER ?= 0
+RUST_MAIN ?= 0
+ifeq ($(RUST_MAIN),1)
+ifneq ($(RUST_CORE),1)
+$(error RUST_MAIN requires RUST_CORE=1)
+endif
+endif
 # App fixtures can be compiled to independent native Rust ET_EXEC images.
 RUST_USERLAND ?= 0
 # Rust host-side archive/ELF tooling can replace Python after parity checks.
@@ -48,7 +54,19 @@ CARGO ?= cargo
 RUST_MANIFEST := rust/kernel_core/Cargo.toml
 RUST_SOURCE := $(wildcard rust/kernel_core/src/*.rs)
 RUST_LIB := $(BUILD)/libindianos_kernel_core.a
-RUST_FEATURES := $(if $(filter 1,$(PREEMPT_SELFTEST)),--features preempt,) $(if $(filter 1,$(RUST_VMM)),--features vmm,) $(if $(filter 1,$(RUST_PMM)),--features pmm,) $(if $(filter 1,$(RUST_USER_IMAGE)),--features user-image,) $(if $(filter 1,$(RUST_PAGING)),--features paging,) $(if $(filter 1,$(RUST_RUNTIME)),--features runtime,) $(if $(filter 1,$(RUST_BOOT_STAGING)),--features boot-staging,) $(if $(filter 1,$(RUST_BOOT)),--features boot,) $(if $(filter 1,$(RUST_INTERRUPTS)),--features interrupts,) $(if $(filter 1,$(RUST_TIMER)),--features timer,)
+RUST_FEATURES := $(if $(filter 1,$(PREEMPT_SELFTEST)),--features preempt,) $(if $(filter 1,$(RUST_VMM)),--features vmm,) $(if $(filter 1,$(RUST_PMM)),--features pmm,) $(if $(filter 1,$(RUST_USER_IMAGE)),--features user-image,) $(if $(filter 1,$(RUST_PAGING)),--features paging,) $(if $(filter 1,$(RUST_RUNTIME)),--features runtime,) $(if $(filter 1,$(RUST_BOOT_STAGING)),--features boot-staging,) $(if $(filter 1,$(RUST_BOOT)),--features boot,) $(if $(filter 1,$(RUST_INTERRUPTS)),--features interrupts,) $(if $(filter 1,$(RUST_TIMER)),--features timer,) $(if $(filter 1,$(RUST_MAIN)),--features kernel-main,)
+ifeq ($(RUST_MAIN),1)
+RUST_FEATURES += $(if $(filter 1,$(EXCEPTION_SELFTEST)),--features test-ud2,) \
+ $(if $(filter 1,$(PAGEFAULT_SELFTEST)),--features test-pagefault,) \
+ $(if $(filter 1,$(PAGING_SWITCH_SELFTEST)),--features test-shadow,) \
+ $(if $(filter 1,$(USERMODE_SELFTEST)),--features test-ring3,) \
+ $(if $(filter 1,$(PROCESS_SELFTEST)),--features test-processes,) \
+ $(if $(filter 1,$(SCHEDULER_SELFTEST)),--features test-scheduler,)
+ifeq ($(USERFAULT_SELFTEST),1)
+RUST_FEATURES += $(if $(filter guard,$(USERFAULT_KIND)),--features test-fault-guard,--features test-fault-supervisor)
+endif
+endif
+
 KERNEL_ELF := $(BUILD)/indianos.elf
 ISO := $(BUILD)/indianos.iso
 ISO_ROOT := $(BUILD)/iso_root
@@ -81,6 +99,9 @@ endif
 ifeq ($(RUST_BOOT_STAGING),1)
 SOURCES := $(filter-out kernel/src/vmm_boot.c kernel/src/user_image_boot.c,$(SOURCES))
 endif
+endif
+ifeq ($(RUST_MAIN),1)
+SOURCES := $(filter-out kernel/src/main.c,$(SOURCES))
 endif
 OBJECTS := $(patsubst kernel/src/%.c,$(BUILD)/obj/%.o,$(SOURCES))
 OBJECTS += $(BUILD)/obj/interrupt_entry.o $(BUILD)/obj/paging.o $(BUILD)/obj/user_mode.o $(BUILD)/obj/user_entry.o
@@ -234,6 +255,20 @@ test-rust-timer-link-qemu:
 	python3 tools/smoke_boot.py --iso build/rust-timer-normal/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)" --mode normal
 	$(MAKE) image BUILD=build/rust-timer-user RUST_TIMER=1 USERMODE_SELFTEST=1
 	python3 tools/smoke_boot.py --iso build/rust-timer-user/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)" --mode usermode
+
+test-rust-main-qemu:
+	$(MAKE) image BUILD=build/rust-main-normal RUST_MAIN=1 RUST_BOOT=1 RUST_INTERRUPTS=1
+	python3 tools/smoke_boot.py --iso build/rust-main-normal/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)" --mode normal
+	$(MAKE) image BUILD=build/rust-main-ud2 RUST_MAIN=1 RUST_BOOT=1 RUST_INTERRUPTS=1 EXCEPTION_SELFTEST=1
+	python3 tools/smoke_boot.py --iso build/rust-main-ud2/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)" --mode exception
+	$(MAKE) image BUILD=build/rust-main-pf RUST_MAIN=1 RUST_BOOT=1 RUST_INTERRUPTS=1 PAGEFAULT_SELFTEST=1
+	python3 tools/smoke_boot.py --iso build/rust-main-pf/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)" --mode pagefault
+	$(MAKE) image BUILD=build/rust-main-process RUST_MAIN=1 RUST_BOOT=1 RUST_INTERRUPTS=1 PROCESS_SELFTEST=1
+	python3 tools/smoke_boot.py --iso build/rust-main-process/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)" --mode processes
+	$(MAKE) image BUILD=build/rust-main-sched RUST_MAIN=1 RUST_BOOT=1 RUST_INTERRUPTS=1 SCHEDULER_SELFTEST=1
+	python3 tools/smoke_boot.py --iso build/rust-main-sched/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)" --mode scheduler
+	$(MAKE) image BUILD=build/rust-main-guard RUST_MAIN=1 RUST_BOOT=1 RUST_INTERRUPTS=1 USERFAULT_SELFTEST=1 USERFAULT_KIND=guard
+	python3 tools/smoke_boot.py --iso build/rust-main-guard/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)" --mode fault-guard
 
 test-rust-interrupts-qemu:
 	$(MAKE) image BUILD=build/rust-idt-normal RUST_INTERRUPTS=1
