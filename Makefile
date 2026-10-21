@@ -15,6 +15,7 @@ BUILD := build
 RUST_CORE ?= 1
 # R013 opt-in scripted userland boot. No keyboard or arbitrary exec yet.
 R013_SHELL_TEST ?= 0
+R014_INTERACTIVE_TEST ?= 0
 # Rust owns the normal kernel link, including Limine handoff, framebuffer,
 # descriptor tables, timer, kmain, user ELF fixtures and image tools.
 # RUST_CORE=0 selects the complete C/assembly reference configuration.
@@ -101,7 +102,7 @@ RUST_FEATURES += $(if $(filter 1,$(EXCEPTION_SELFTEST)),--features test-ud2,) \
  $(if $(filter 1,$(PAGING_SWITCH_SELFTEST)),--features test-shadow,) \
  $(if $(filter 1,$(USERMODE_SELFTEST)),--features test-ring3,) \
  $(if $(filter 1,$(PROCESS_SELFTEST)),--features test-processes,) \
- $(if $(filter 1,$(SCHEDULER_SELFTEST)),--features test-scheduler,) $(if $(filter 1,$(R013_SHELL_TEST)),--features test-shell,)
+ $(if $(filter 1,$(SCHEDULER_SELFTEST)),--features test-scheduler,) $(if $(filter 1,$(R013_SHELL_TEST)),--features test-shell,) $(if $(filter 1,$(R014_INTERACTIVE_TEST)),--features test-interactive,)
 ifeq ($(USERFAULT_SELFTEST),1)
 RUST_FEATURES += $(if $(filter guard,$(USERFAULT_KIND)),--features test-fault-guard,--features test-fault-supervisor)
 endif
@@ -219,7 +220,7 @@ LDFLAGS := -target x86_64-unknown-none-elf -fuse-ld=lld -nostdlib -static \
            -Wl,--gc-sections -Wl,--build-id=none -Wl,-T,kernel/linker.ld \
            -Wl,-Map,$(BUILD)/kernel-link.map
 
-.PHONY: test-rust-shell-host test-rust-shell-qemu test-rust-hardening test-rust-entry-abi test-rust-link-audit test-rust-source-audit-negative test-rust-source-audit test-rust-default-qemu test-rust-tools test-rust-userland-qemu test-rust-interrupts-qemu test-rust-boot-qemu test-rust-vmm-host test-rust-vmm-qemu test-rust-pmm-host test-rust-pmm-qemu test-rust-user-image-host test-rust-user-image-qemu test-rust-paging-host test-rust-paging-qemu test-rust-runtime-host test-rust-runtime-qemu test-rust-boot-staging-qemu test-rust-host-abi test-rust-processes test-rust-scheduler rust-core all kernel user-elf test-user-elf test-ring3-elf initramfs test-initramfs image run run-bios test-boot test-exception test-pagefault test-shadow test-usermode test-userfault-supervisor test-userfault-guard test-processes test-scheduler test-preempt test-host toolchain-check clean
+.PHONY: test-rust-interactive-host test-rust-interactive-qemu test-rust-shell-host test-rust-shell-qemu test-rust-hardening test-rust-entry-abi test-rust-link-audit test-rust-source-audit-negative test-rust-source-audit test-rust-default-qemu test-rust-tools test-rust-userland-qemu test-rust-interrupts-qemu test-rust-boot-qemu test-rust-vmm-host test-rust-vmm-qemu test-rust-pmm-host test-rust-pmm-qemu test-rust-user-image-host test-rust-user-image-qemu test-rust-paging-host test-rust-paging-qemu test-rust-runtime-host test-rust-runtime-qemu test-rust-boot-staging-qemu test-rust-host-abi test-rust-processes test-rust-scheduler rust-core all kernel user-elf test-user-elf test-ring3-elf initramfs test-initramfs image run run-bios test-boot test-exception test-pagefault test-shadow test-usermode test-userfault-supervisor test-userfault-guard test-processes test-scheduler test-preempt test-host toolchain-check clean
 all: image
 kernel: $(KERNEL_ELF)
 
@@ -395,6 +396,16 @@ test-rust-shell-qemu:
 	$(MAKE) image BUILD=build/r013-shell R013_SHELL_TEST=1 RUST_CORE=1
 	$(MAKE) $(RUST_TOOLS_BIN)
 	$(RUST_TOOLS_BIN) smoke --iso build/r013-shell/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)" --mode shell
+
+# Real input in COM1 and optional PS/2, via QEMU injected serial commands.
+test-rust-interactive-host:
+	CARGO_TARGET_DIR=build/r014-input-host $(CARGO) test \
+	    --manifest-path $(RUST_MANIFEST) --offline --features test-interactive
+
+test-rust-interactive-qemu:
+	$(MAKE) image BUILD=build/r014-interactive R014_INTERACTIVE_TEST=1 RUST_CORE=1
+	$(MAKE) $(RUST_TOOLS_BIN)
+	$(RUST_TOOLS_BIN) smoke --iso build/r014-interactive/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)" --mode interactive --timeout 45
 
 test-rust-default-qemu:
 	$(MAKE) image BUILD=build/rust-default-normal RUST_CORE=1
@@ -591,7 +602,7 @@ USER_OBJ := $(BUILD)/userland/entry.o
 WORKER_OBJ := $(BUILD)/userland/worker.o
 WORKER_ELF := $(BUILD)/userland/worker.elf
 INITRAMFS := $(BUILD)/initramfs.img
-ifneq ($(filter 1,$(PROCESS_SELFTEST) $(SCHEDULER_SELFTEST) $(R013_SHELL_TEST)),)
+ifneq ($(filter 1,$(PROCESS_SELFTEST) $(SCHEDULER_SELFTEST) $(R013_SHELL_TEST) $(R014_INTERACTIVE_TEST)),)
 INITRAMFS_EXTRA_DEPS := $(WORKER_ELF)
 INITRAMFS_EXTRA_ARGS := --extra-elf $(WORKER_ELF) --extra-name /bin/worker
 endif
@@ -599,7 +610,10 @@ endif
 ifeq ($(RUST_USERLAND),1)
 # Identical expected serial messages and syscall ABI; no C/assembly
 # objects are linked into the Rust native user executable.
-ifeq ($(R013_SHELL_TEST),1)
+ifeq ($(R014_INTERACTIVE_TEST),1)
+RUST_INIT_FEATURE := interactive
+RUST_WORKER_FEATURE := worker
+else ifeq ($(R013_SHELL_TEST),1)
 RUST_INIT_FEATURE := shell
 RUST_WORKER_FEATURE := worker
 else ifeq ($(USERFAULT_SELFTEST),1)
