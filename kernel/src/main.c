@@ -8,6 +8,7 @@
 #include <indianos/syscall_abi.h>
 #include <indianos/user_image.h>
 #include <indianos/user_mode.h>
+#include <indianos/process.h>
 
 __attribute__((noreturn)) static void halt_forever(void) {
     for (;;) {
@@ -105,6 +106,40 @@ __attribute__((noreturn)) void kmain(void) {
         halt_forever();
     }
     serial_write("IndianOS: initramfs /bin/init staged and released safely\n");
+#ifdef INDIANOS_TEST_PROCESSES
+    /* Two separate ELF images: both undergo fresh frame allocations and
+     * independent CR3 clones; the second starts only AFTER the first is
+     * completely reaped. No scheduler, preemption or parallel execution. */
+    const uint8_t *worker_elf = 0;
+    size_t worker_elf_size = 0;
+    if (!boot_initramfs_file("/bin/worker", &worker_elf, &worker_elf_size)) {
+        serial_write("IndianOS: FATAL second user executable missing\n");
+        halt_forever();
+    }
+    struct indianos_process_table processes = {0};
+    if (!indianos_process_table_init(&processes)) {
+        serial_write("IndianOS: FATAL process table initialization failed\n");
+        halt_forever();
+    }
+    struct indianos_process *first = indianos_process_create(&processes);
+    struct indianos_process *second = indianos_process_create(&processes);
+    if (first == 0 || second == 0 || first->pid != 1 || second->pid != 2) {
+        serial_write("IndianOS: FATAL process ID assignment failed\n");
+        halt_forever();
+    }
+    serial_write("IndianOS: M008 sequential process launch begin\n");
+    if (!x86_64_user_process_run(first, init_elf, init_elf_size) ||
+        !indianos_process_success(first)) {
+        serial_write("IndianOS: FATAL first process did not exit and reap\n");
+        halt_forever();
+    }
+    if (!x86_64_user_process_run(second, worker_elf, worker_elf_size) ||
+        !indianos_process_success(second)) {
+        serial_write("IndianOS: FATAL second process did not exit and reap\n");
+        halt_forever();
+    }
+    serial_write("IndianOS: M008 two independent processes exited and reaped\n");
+#endif
 #if defined(INDIANOS_TEST_RING3) || \
     defined(INDIANOS_TEST_USERFAULT_GUARD) || \
     defined(INDIANOS_TEST_USERFAULT_SUPERVISOR)
