@@ -1,6 +1,6 @@
 # Milestone 006 (experimental): first x86-64 ring-3 execution infrastructure
 
-**Status:** kernel-side source and host-test scaffolding committed directly to main. NOT a proven working user-mode process. The existing `userland/demo/entry.c` is still an infinite-loop ELF, and the syscall-enabled fixture update is blocked; QEMU runtime verification is outstanding. Normal boots are unchanged. Do not boot IndianOS on physical machines.
+**Status:** experimental ring-3 kernel path and a separate syscall-enabled `/bin/init` test fixture are committed to `main`. The freestanding test ELF was independently compiled and inspected locally, but **successful QEMU/OVMF ring-3 execution remains unverified**. Normal boots still use the inert fixture. Do not boot IndianOS on physical machines.
 
 ## Implemented (gated)
 
@@ -36,7 +36,17 @@ The experimental target is:
 make test-usermode
 ```
 
-**Important blocker:** This target currently fails fast during `tools/check_usermode_fixture.py`: the repository's existing `/bin/init` fixture does not contain the software-interrupt syscall instruction and loops indefinitely. A repository write restriction prevented updating that program during this implementation. The guard prevents misleading QEMU hangs and does not establish a working user application. A test-binary opcode precheck only guards an obvious omission; the eventual QEMU transcript must also show a message and a successful exit.
+The **normal** `userland/demo/entry.c` remains an inert loop intentionally. The separate `userland/demo/ring3_entry.S` is selected exclusively when `USERMODE_SELFTEST=1`. It uses three software interrupts: write the greeting, exit successfully on the expected return length, otherwise exit with status 1.
+
+The experimental target builds and validates this ELF before constructing the QEMU image. The opcode precheck is only a preflight—not proof that user code ran. The QEMU transcript must demonstrate entry, greeting and successful exit.
+
+```sh
+make test-host
+make test-ring3-elf   # builds & inspects syscall-enabled ET_EXEC without QEMU
+make test-usermode    # QEMU/OVMF/Limine required; not yet confirmed green
+```
+
+The GitHub workflow builds `test-ring3-elf` on pushes, with full ring-3 execution available as an opt-in `workflow_dispatch` input `run_usermode=true`.
 
 ## Verification gaps
 
@@ -48,6 +58,6 @@ make test-usermode
 
 ## Next bounded action
 
-Finish a real freestanding `/bin/init` that uses the draft `int 0x80` syscall numbers to print a message and exit. Then run the QEMU ring-3 image, verify it cannot read/write protected supervisor mappings or the unmapped guard page, and independently inspect the exact CI transcript. Only after successful runtime testing should we call the first native IndianOS application **executed**.
+Run the syscall-enabled `/bin/init` QEMU ring-3 image, verify it cannot read/write protected supervisor mappings or the unmapped guard page, and independently inspect the exact CI transcript. Only after successful runtime testing should we call the first native IndianOS application **executed**.
 
 The repository owner's workflow preference remains direct-to-`main` commits; no PR was created.
