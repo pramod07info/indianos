@@ -104,7 +104,8 @@ See [M005 initramfs implementation](MILESTONE_005_INITRAMFS.md).
 - Committed x86-64 user-mode GDT selectors, TSS.RSP0, interrupt 0x80 gate, IRETQ entry, syscall dispatch and privileged kernel return path behind an explicit QEMU-only build flag.
 - Committed a cloned supervisor-only upper canonical page-table root, checked user PML4 grafting, and page-by-page user memory copy through physical mappings.
 - Added host regression coverage and a fail-fast check for a missing syscall-enabled user ELF.
-- **Blocked/not proven:** repository /bin/init still loops instead of making a syscall. A repository safety write restriction prevented its update, so first user execution has not been demonstrated. Full QEMU execution also remains unverified.
-- Next: finish syscall-enabled /bin/init, verify page-table transition with protected-memory negative tests, and obtain passing QEMU logs before moving to scheduling.
+- **Now implemented:** a distinct `ring3_entry.S` for the opt-in test image makes `WRITE` and `EXIT` requests through the syscall ABI; its x86-64 ET_EXEC output was inspected locally and contains three `int 0x80` instructions. Normal boot's inert fixture is unchanged.
+- **Verification pending:** complete QEMU/OVMF ring-3 entry, console output and safe return; full firmware boot has not been independently verified.
+- Next: establish a passing QEMU serial trace, test user access denial to supervisor memory, and validate page-table cleanup before adding any scheduler or second app.
 
 See [M006 implementation](MILESTONE_006_USERMODE.md).
