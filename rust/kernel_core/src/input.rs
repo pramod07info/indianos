@@ -140,15 +140,19 @@ fn wait_output()->Option<u8>{
 /// after IDT 0x21 is ready, with IF masked. Other PIC IRQs stay masked.
 #[cfg(feature="test-irq-keyboard")]
 pub(crate) fn enable_irq1()->bool{
-    let mut apic_lo:u32;
-    let apic_hi:u32;
-    unsafe{asm!("rdmsr",in("ecx")0x1bu32,
-        out("eax")apic_lo,out("edx")apic_hi,options(nostack,preserves_flags));}
-    if apic_lo&(1<<10)!=0{return false;}
-    if apic_lo&(1<<11)!=0{
-        apic_lo&=!(1<<11);
-        unsafe{asm!("wrmsr",in("ecx")0x1bu32,
-            in("eax")apic_lo,in("edx")apic_hi,options(nostack,preserves_flags));}
+    // The PIC-only QEMU CPU profile has no IA32_APIC_BASE MSR; probing
+    // the APIC CPUID bit avoids #GP from unconditional RDMSR.
+    if unsafe{core::arch::x86_64::__cpuid(1)}.edx&(1<<9)!=0{
+        let mut apic_lo:u32;
+        let apic_hi:u32;
+        unsafe{asm!("rdmsr",in("ecx")0x1bu32,
+            out("eax")apic_lo,out("edx")apic_hi,options(nostack,preserves_flags));}
+        if apic_lo&(1<<10)!=0{return false;}
+        if apic_lo&(1<<11)!=0{
+            apic_lo&=!(1<<11);
+            unsafe{asm!("wrmsr",in("ecx")0x1bu32,
+                in("eax")apic_lo,in("edx")apic_hi,options(nostack,preserves_flags));}
+        }
     }
     unsafe{
         outb(0x20,0x11);io_wait();outb(0xa0,0x11);io_wait();

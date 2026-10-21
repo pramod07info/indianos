@@ -348,3 +348,9 @@ keyboard support, and does not make application spawning asynchronous.
 The R014.2 legacy IRQ acceptance check uses QEMU `--machine pc`,
 matching the existing PIC/PIT IRQ0 regression. `q35`/I/O APIC keyboard
 routing is not yet claimed as supported.
+
+For the PIC-only R014.2 QEMU target, the harness also disables the
+emulated local APIC (`-cpu qemu64,-apic`) to exercise direct legacy PIC
+INTR routing without depending on firmware APIC virtual-wire setup.
+The IRQ driver guards IA32_APIC_BASE accesses using CPUID so no-APIC
+guest CPUs do not fault when configuring the legacy controller.
