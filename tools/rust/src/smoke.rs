@@ -126,9 +126,10 @@ pub fn verify(mode:&str,text:&str)->Result<(),String>{
             ]);
         }
         "keyboard"=>{
-            checks.extend(MILESTONES);
+            checks.extend(&MILESTONES[..2]);
+            checks.push("IndianOS: R014.2 framebuffer text console ready");
+            checks.extend(&MILESTONES[2..]);
             checks.extend([
-                "IndianOS: R014.2 framebuffer text console ready",
                 "IndianOS: R013 init shell begin",
                 "IndianOS: R014.2 IRQ1 keyboard controller armed",
                 "IndianOS: PID 1 RUNNING",

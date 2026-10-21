@@ -5,6 +5,8 @@
 use core::arch::asm;
 #[cfg(feature="test-irq-keyboard")]
 use core::sync::atomic::{AtomicU64,Ordering};
+#[cfg(feature="test-irq-keyboard")]
+unsafe extern "C" {fn serial_write(message:*const core::ffi::c_char);}
 
 #[inline(always)]
 unsafe fn inb(port:u16)->u8 {
@@ -174,9 +176,10 @@ pub(crate) fn irq_count()->u64{IRQ_EVENTS.load(Ordering::Relaxed)}
 #[cfg(feature="test-irq-keyboard")]
 #[no_mangle]
 pub extern "C" fn x86_64_keyboard_irq_dispatch(){
-    let _=IRQ_EVENTS.fetch_update(Ordering::Relaxed,Ordering::Relaxed,|n|{
-        Some(n.saturating_add(1))
-    });
+    let before=IRQ_EVENTS.fetch_add(1,Ordering::Relaxed);
+    if before==0 {
+        unsafe {serial_write(b"IndianOS: R014.2 IRQ1 first interrupt delivered\n\0".as_ptr().cast());}
+    }
     let status=unsafe{inb(PS2_STATUS)};
     if status&1!=0 {
         let code=unsafe{inb(PS2_DATA)};
