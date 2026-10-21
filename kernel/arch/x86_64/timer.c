@@ -16,6 +16,11 @@ static inline void outb(uint16_t port, uint8_t byte) {
     __asm__ volatile ("outb %0,%1" : : "a"(byte), "Nd"(port));
 }
 static inline void io_wait(void) { outb(0x80u, 0); }
+static inline uint8_t inb(uint16_t port) {
+    uint8_t byte;
+    __asm__ volatile ("inb %1,%0" : "=a"(byte) : "Nd"(port));
+    return byte;
+}
 
 bool x86_64_timer_start_100hz(void) {
     if (configured) return false;
@@ -31,6 +36,11 @@ bool x86_64_timer_start_100hz(void) {
     outb(PIC2_DATA, 0x01); io_wait();
     outb(PIC1_DATA, 0xfe); /* only IRQ0 (PIT) unmasked */
     outb(PIC2_DATA, 0xff);
+    /* QEMU/PC firmware can route 8259 INTR through the APIC IMCR.
+     * Explicitly select PIC-to-CPU virtual-wire routing for this 8259 test.
+     * This opt-in experimental routine is never called in normal boots. */
+    outb(0x22u, 0x70u); io_wait();
+    outb(0x23u, 0x00u); io_wait();
     /* PIT 1193182 / 11932 ~100 Hz, channel 0, square wave. */
     const uint16_t divisor = 11932;
     outb(PIT_CMD, 0x36);
@@ -47,3 +57,11 @@ void x86_64_timer_ack_irq0(void) {
     outb(PIC1_CMD, 0x20); /* End of interrupt for master IRQ0. */
 }
 uint64_t x86_64_timer_irq_count(void) { return irq_count; }
+uint8_t x86_64_timer_pic_pending(void) {
+    if (!configured) return 0;
+    outb(PIC1_CMD, 0x0au); /* OCW3: return interrupt request register. */
+    return inb(PIC1_CMD);
+}
+uint8_t x86_64_timer_pic_mask(void) {
+    return configured ? inb(PIC1_DATA) : 0xffu;
+}
