@@ -9,6 +9,7 @@ on:
       - "boot/**"
       - "third_party/limine/**"
       - "Makefile"
+      - "tools/rust/**"
       - "tools/smoke_boot.py"
       - "tests/test_smoke_boot.py"
       - "tests/test_pmm.c"
