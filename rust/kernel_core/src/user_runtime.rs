@@ -314,8 +314,8 @@ pub unsafe extern "C" fn x86_64_user_process_run(
    let completed=if v==0{unsafe{indianos_process_exit(process,status)}}
    else{unsafe{indianos_process_fault(process,status,v,e,a)}};
    if !completed{
-    log(b"IndianOS: FATAL PCB terminal state rejected\n\0");return false;
-   }
+    log(b"IndianOS: FATAL PCB terminal state rejected\n\0");
+    }else{
    pid_log(pid,if v==0{&b"EXITED\0"[..]}else{&b"FAULTED\0"[..]});
    #[cfg(any(feature="test-fault-guard",feature="test-fault-supervisor"))]
    {
@@ -333,6 +333,7 @@ pub unsafe extern "C" fn x86_64_user_process_run(
     success=status==0&&v==0;
     if success{log(b"IndianOS: /bin/init exited through int 0x80\n\0");}
    }
+    }
   }
  }
  if grafted&&!unsafe{paging_detach_user_half(&backend,clone.root,staged.tables.root_physical)}{
@@ -524,7 +525,16 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
      scheduler.tick_count!=4{ok=false;}
   if ok{log(b"IndianOS: M009 round-robin cooperative switching PASSED\n\0");}
  }
- if !ok{log(b"IndianOS: M009 FATAL scheduler or memory ownership verification\n\0");}
+ if !ok{
+  log(b"IndianOS: M009 FATAL scheduler or memory ownership verification\n\0");
+  // On normal dispatch failure CR3 has been restored to the kernel.
+  // Reclaim both remaining images, even if their PCB state was rejected.
+  let first=discard(task_ptr(0),&backend,false);
+  let second=discard(task_ptr(1),&backend,false);
+  if !first||!second||unsafe{pmm_free_frames()}!=before{
+   log(b"IndianOS: M009 FATAL partial rollback: memory not fully reclaimed\n\0");
+  }
+ }
  ok
 }
 #[cfg(test)]mod tests{
