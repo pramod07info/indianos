@@ -115,3 +115,29 @@ only after safe timer and context-switch behavior is independently proven.
 
 This is a research OS kernel, not a production-ready, installable, secure
 desktop OS. Do not test it on physical computers or real disks.
+
+## Verified hardware timer blocker — follow-up diagnostic
+
+The QEMU-only PIT regression [run 39539209818](https://github.com/pramod07info/indianos/actions/runs/39539209818) **failed**, even though `indianos/scheduler-qemu`,
+`indianos/ring3-qemu` and the existing process tests passed. The collected
+serial log showed:
+
+```text
+IndianOS: M009 hardware PIT IRQ0 enabled at 100 Hz
+IndianOS: M009 user IF=1 (hardware IRQs permitted)
+IndianOS: M009 PIC/PIT delivered zero timer IRQs
+IndianOS: M009 PIC IRQ0 pending without CPU delivery
+IndianOS: M009 FATAL scheduler or memory ownership verification
+```
+
+This isolates the problem to **legacy PIC delivery / interrupt-controller
+routing**, not the cooperative resume path or absent user IF flag. Attempts
+included longer CPU workloads, legacy QEMU PC machine mode, suppressing
+HPET legacy replacement, explicit IMCR virtual-wire routing and an opt-in
+xAPIC-disable fallback. The IRQ0 still did not arrive. **Do not enable this
+experimental timer code in regular IndianOS boots.** A future, independently
+tested APIC/IOAPIC or LAPIC timer path is needed before claiming preemption.
+
+The M009 **cooperative** test continues to pass and is protected by a
+separate required CI regression gate. An overall green GitHub Actions job
+does NOT imply that optional `indianos/preempt-qemu` is successful.
