@@ -23,6 +23,8 @@ mod user_image;
 mod paging;
 #[cfg(feature = "runtime")]
 mod runtime;
+#[cfg(feature = "boot-staging")]
+mod boot_staging;
 
 pub const MAX_PROCESSES: usize = 4;
 pub const MAX_DISPATCHES: u32 = if cfg!(feature = "preempt") { 2048 } else { 32 };
