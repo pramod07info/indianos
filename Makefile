@@ -203,7 +203,7 @@ test-rust-tools:
 	cmp build/rust-tools-archive/initramfs.img build/rust-tools-archive/python-reference.img
 	$(MAKE) test-ring3-elf BUILD=build/rust-tools-elf USERMODE_SELFTEST=1
 	$(MAKE) $(RUST_TOOLS_BIN)
-	$(RUST_TOOLS_BIN) check-elf build/rust-tools-elf/userland/demo.elf
+	$(RUST_TOOLS_BIN) check-elf build/ring3/userland/demo.elf
 
 test-rust-userland-qemu:
 	$(MAKE) test-ring3-elf BUILD=build/rust-user-demo USERMODE_SELFTEST=1 RUST_USERLAND=1
