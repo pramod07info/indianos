@@ -46,7 +46,7 @@ make test-ring3-elf   # builds & inspects syscall-enabled ET_EXEC without QEMU
 make test-usermode    # QEMU/OVMF/Limine required; not yet confirmed green
 ```
 
-The GitHub workflow builds `test-ring3-elf` on pushes, with full ring-3 execution available as an opt-in `workflow_dispatch` input `run_usermode=true`.
+The GitHub workflow builds `test-ring3-elf` on pushes and also attempts `make test-usermode` in QEMU as a **non-blocking experimental CI step**. Its transcript is uploaded as `indianos-ring3-experimental-log` for inspection. `workflow_dispatch` retains an explicit `run_usermode=true` option. An artifact or successful compilation is not a substitute for verifying the transcript shows entry, greeting, and successful exit. No such successful transcript has been independently confirmed yet.
 
 ## Verification gaps
 
