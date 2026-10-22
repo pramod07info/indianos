@@ -85,6 +85,7 @@ unsafe extern "C"{
  #[cfg(feature="preempt")] fn x86_64_timer_pic_mask()->u8;
  #[cfg(feature="preempt")] fn x86_64_timer_pic_pending()->u8;
  #[cfg(feature="preempt")] fn x86_64_timer_irq0_state()->u8;
+ #[cfg(feature="preempt")] fn x86_64_timer_irq0_blockers()->u8;
  #[cfg(feature="preempt")] fn x86_64_timer_apic_mode_flags()->u8;
  #[cfg(feature="preempt")] fn x86_64_timer_initial_apic_mode()->u8;
 }
@@ -649,6 +650,12 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
    }else{
     log(b"IndianOS: M010 local APIC disabled\n\0")
    }
+   let blockers=unsafe{x86_64_timer_irq0_blockers()};
+   if blockers&1!=0{log(b"IndianOS: R019 IRQ0 masked at PIC\\n\\0");}
+   if blockers&2!=0{log(b"IndianOS: R019 IRQ0 pending but not in service\\n\\0");}
+   if blockers&4!=0{log(b"IndianOS: R019 IRQ0 in PIC service\\n\\0");}
+   if blockers&8!=0{log(b"IndianOS: R019 local APIC still enabled\\n\\0");}
+   if blockers&16!=0{log(b"IndianOS: R019 firmware initially used x2APIC\\n\\0");}
    let irq0=unsafe{x86_64_timer_irq0_state()};
    if irq0&4!=0{
     log(b"IndianOS: M010 PIC IRQ0 unexpectedly masked\n\0")
