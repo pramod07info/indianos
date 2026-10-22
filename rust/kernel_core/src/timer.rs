@@ -352,6 +352,30 @@ pub unsafe extern "C" fn x86_64_xapic_timer_start_calibrated(
     }
     true
 }
+/// R019.8: begin a bounded masked one-shot measurement.
+/// A separate reference clock must measure the interval; the timer remains
+/// masked throughout, so this cannot cause an unhandled APIC interrupt.
+/// # Safety
+/// BSP ring0 only with interrupts disabled, valid UC xAPIC mapping,
+/// and no concurrent timer user. Caller must stop sampling before wrap.
+#[no_mangle]
+pub unsafe extern "C" fn x86_64_xapic_calibration_begin(initial_count:u32)->bool{
+    if initial_count==0 || !XAPIC_TIMER_ARMED.load(Ordering::Acquire){return false;}
+    let (Some(lvt),Some(divide),Some(initial))=(
+        xapic_reg(XAPIC_LVT_TIMER_OFFSET),
+        xapic_reg(XAPIC_TIMER_DIVIDE_OFFSET),
+        xapic_reg(XAPIC_TIMER_INITIAL_OFFSET)
+    )else{return false;};
+    let Some(lvt_value)=xapic_timer_lvt(0x40,false,true)else{return false;};
+    let Some(divide_value)=xapic_timer_divide(16)else{return false;};
+    unsafe{
+        core::ptr::write_volatile(lvt,lvt_value);
+        core::ptr::write_volatile(initial,0);
+        core::ptr::write_volatile(divide,divide_value);
+        core::ptr::write_volatile(initial,initial_count);
+    }
+    true
+}
 /// R019.7: sample the current count of a prepared, masked xAPIC timer.
 /// Returns zero when unbound, unprepared, or unmasked; a zero count is not
 /// usable for calibration. Does not start or acknowledge any interrupt.
