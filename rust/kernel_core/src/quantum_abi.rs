@@ -74,3 +74,62 @@ mod tests{
         assert_eq!(QuantumRequest::parse(3,0,1,5),Err(QuantumAbiError::InvalidLength));
     }
 }
+
+/// Validate the requested user buffer against the process's actual mapped
+/// segments and stack permissions. This is metadata-only validation: a
+/// privileged copy_from_user/copy_to_user is still required before execution.
+pub(crate) fn validate_user_request(
+    plan:&crate::syscall::ProgramPlan,
+    request:QuantumRequest,
+)->Result<(),QuantumAbiError>{
+    use crate::syscall::user_range;
+    match request.operation{
+        QuantumOperation::Submit=>{
+            if !user_range(plan,request.user_address,request.length as u64,false){
+                return Err(QuantumAbiError::InvalidAddress);
+            }
+        }
+        QuantumOperation::Result=>{
+            if !user_range(plan,request.user_address,request.length as u64,true){
+                return Err(QuantumAbiError::InvalidAddress);
+            }
+        }
+        QuantumOperation::Status|QuantumOperation::Release=>{}
+    }
+    Ok(())
+}
+#[cfg(test)]
+mod user_mapping_tests{
+    use super::*;
+    use crate::syscall::{ProgramPlan,ProgramSegment,MAX_SEGMENTS,USER_MIN,USER_TOP,STACK_BYTES,PAGE_BYTES};
+    fn plan()->ProgramPlan{
+        let mut p=ProgramPlan{
+            entry:USER_MIN,stack_begin:USER_TOP-STACK_BYTES,
+            stack_end:USER_TOP,guard_begin:USER_TOP-STACK_BYTES-PAGE_BYTES,
+            segment_count:1,segments:[ProgramSegment::empty();MAX_SEGMENTS],
+        };
+        p.segments[0]=ProgramSegment{
+            page_begin:USER_MIN,page_end:USER_MIN+PAGE_BYTES,
+            writable:false,executable:true,..ProgramSegment::empty()
+        };
+        p
+    }
+    #[test] fn submit_reads_code_but_result_needs_writable_memory(){
+        let p=plan();
+        let submit=QuantumRequest::parse(0,USER_MIN,4,0).unwrap();
+        assert_eq!(validate_user_request(&p,submit),Ok(()));
+        let result=QuantumRequest::parse(2,USER_MIN,RESULT_BYTES as u64,1).unwrap();
+        assert_eq!(validate_user_request(&p,result),Err(QuantumAbiError::InvalidAddress));
+        let writable=QuantumRequest::parse(2,p.stack_end-RESULT_BYTES as u64,RESULT_BYTES as u64,1).unwrap();
+        assert_eq!(validate_user_request(&p,writable),Ok(()));
+    }
+    #[test] fn reject_guard_crossing_and_unmapped_requests(){
+        let p=plan();
+        let guard=QuantumRequest::parse(0,p.guard_begin,4,0).unwrap();
+        assert_eq!(validate_user_request(&p,guard),Err(QuantumAbiError::InvalidAddress));
+        let crossing=QuantumRequest::parse(0,USER_MIN+PAGE_BYTES-2,4,0).unwrap();
+        assert_eq!(validate_user_request(&p,crossing),Err(QuantumAbiError::InvalidAddress));
+        let unmapped=QuantumRequest::parse(0,USER_MIN+2*PAGE_BYTES,4,0).unwrap();
+        assert_eq!(validate_user_request(&p,unmapped),Err(QuantumAbiError::InvalidAddress));
+    }
+}
