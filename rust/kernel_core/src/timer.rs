@@ -3,7 +3,7 @@
 //! IRQ0 delivery under OVMF was previously not observed, including when
 //! IF=1 and PIC IRR indicated a pending timer. This is a direct ABI port,
 //! NOT evidence that hardware preemption works. Disabled in normal boots.
-use core::{arch::asm, sync::atomic::{AtomicBool,AtomicU64,Ordering}};
+use core::{arch::asm, sync::atomic::{AtomicBool,AtomicU64,AtomicU8,Ordering}};
 const PIC1_CMD:u16=0x20;
 const PIC1_DATA:u16=0x21;
 const PIC2_CMD:u16=0xa0;
@@ -12,6 +12,8 @@ const PIT_CMD:u16=0x43;
 const PIT_DATA:u16=0x40;
 static TICKS:AtomicU64=AtomicU64::new(0);
 static CONFIGURED:AtomicBool=AtomicBool::new(false);
+// Capture firmware APIC mode before the experimental PIC routing change.
+static INITIAL_APIC_MODE:AtomicU8=AtomicU8::new(0xff);
 #[inline(always)]
 fn outb(port:u16,byte:u8){unsafe{
     asm!("out dx, al",in("dx")port,in("al")byte,options(nostack,nomem,preserves_flags));
@@ -41,7 +43,9 @@ fn select_legacy_pic()->bool{
 }
 #[no_mangle]
 pub extern "C" fn x86_64_timer_start_100hz()->bool{
-    if CONFIGURED.load(Ordering::Relaxed)||!select_legacy_pic(){return false}
+    if CONFIGURED.load(Ordering::Relaxed){return false}
+    INITIAL_APIC_MODE.store(x86_64_timer_apic_mode_flags(),Ordering::Relaxed);
+    if !select_legacy_pic(){return false}
     outb(PIC1_CMD,0x11);io_wait();
     outb(PIC2_CMD,0x11);io_wait();
     outb(PIC1_DATA,0x20);io_wait();
@@ -111,6 +115,12 @@ pub const fn apic_mode_flags(msr_low:u32)->u8{
     (((msr_low>>11)&1) as u8) |
     ((((msr_low>>10)&1) as u8)<<1) |
     ((((msr_low>>8)&1) as u8)<<2)
+}
+/// Returns firmware APIC mode captured immediately before PIC initialization.
+/// 0xff means the experimental timer has not attempted initialization.
+#[no_mangle]
+pub extern "C" fn x86_64_timer_initial_apic_mode()->u8{
+    INITIAL_APIC_MODE.load(Ordering::Relaxed)
 }
 #[no_mangle]
 pub extern "C" fn x86_64_timer_apic_mode_flags()->u8{
