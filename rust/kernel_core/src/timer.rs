@@ -116,6 +116,24 @@ pub const fn apic_mode_flags(msr_low:u32)->u8{
     ((((msr_low>>10)&1) as u8)<<1) |
     ((((msr_low>>8)&1) as u8)<<2)
 }
+/// Physical xAPIC register window from IA32_APIC_BASE (bits 12..35).
+/// This is a discovery-only value: it MUST be mapped as uncacheable MMIO
+/// before any dereference. x2APIC instead uses MSRs, not this window.
+pub const fn xapic_physical_base(msr:u64)->Option<u64>{
+    if msr&(1<<11)==0 || msr&(1<<10)!=0{return None;}
+    let base=msr&0x0000_000f_ffff_f000;
+    if base==0{return None;}
+    Some(base)
+}
+/// Read the complete IA32_APIC_BASE MSR without changing APIC routing.
+#[no_mangle]
+pub extern "C" fn x86_64_timer_xapic_physical_base()->u64{
+    let lo:u32;
+    let hi:u32;
+    unsafe{asm!("rdmsr",in("ecx")0x1bu32,out("eax")lo,out("edx")hi,
+                options(nostack,preserves_flags));}
+    xapic_physical_base(((hi as u64)<<32)|(lo as u64)).unwrap_or(0)
+}
 /// Returns firmware APIC mode captured immediately before PIC initialization.
 /// 0xff means the experimental timer has not attempted initialization.
 #[no_mangle]
@@ -153,6 +171,14 @@ mod tests {
         assert_eq!(apic_mode_flags(1<<10),2);
         assert_eq!(apic_mode_flags(1<<8),4);
         assert_eq!(apic_mode_flags((1<<11)|(1<<10)|(1<<8)),7);
+    }
+    #[test]
+    fn xapic_base_requires_enabled_xapic_mode(){
+        assert_eq!(xapic_physical_base(0xfee0_0000),None);
+        assert_eq!(xapic_physical_base(0xfee0_0000|(1<<11)),Some(0xfee0_0000));
+        assert_eq!(xapic_physical_base(0xfee0_0000|(1<<11)|(1<<10)),None);
+        assert_eq!(xapic_physical_base(1<<11),None);
+        assert_eq!(xapic_physical_base(0x1_fee0_0000|(1<<11)),Some(0x1_fee0_0000));
     }
     #[test]
     fn counter_is_bounded(){
