@@ -44,8 +44,15 @@ jobs:
           gh api "repos/$REPO/actions/runs/$RUN_ID" > /tmp/ci-run.json
           [[ "$(jq -r .head_branch /tmp/ci-run.json)" == "main" ]] || exit 1
           [[ "$(jq -r .status /tmp/ci-run.json)" == "completed" ]] || exit 1
-          gh api --paginate "repos/$REPO/actions/runs/$RUN_ID/jobs?per_page=100" > /tmp/ci-jobs.json
-          python3 tools/agent_x_ci_context.py /tmp/ci-run.json /tmp/ci-jobs.json > /tmp/agent-prompt.txt
+          gh api "repos/$REPO/actions/runs/$RUN_ID/jobs?per_page=100" > /tmp/ci-jobs.json
+          : > /tmp/ci-failure-logs.txt
+          if [[ "$(jq -r '.conclusion' /tmp/ci-run.json)" != "success" ]]; then
+            jq -r '.jobs[] | select(.conclusion == "failure") | .id' /tmp/ci-jobs.json | head -5 | while read -r JOB_ID; do
+              echo "=== Failed job $JOB_ID ===" >> /tmp/ci-failure-logs.txt
+              gh api "repos/$REPO/actions/jobs/$JOB_ID/logs" 2>/dev/null | tail -c 12000 >> /tmp/ci-failure-logs.txt || echo "Job logs unavailable" >> /tmp/ci-failure-logs.txt
+            done
+          fi
+          python3 tools/agent_x_ci_context.py /tmp/ci-run.json /tmp/ci-jobs.json /tmp/ci-failure-logs.txt > /tmp/agent-prompt.txt
       - name: Build CPU-only llama.cpp
         run: |
           set -euo pipefail
