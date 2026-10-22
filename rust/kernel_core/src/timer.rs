@@ -69,9 +69,9 @@ pub extern "C" fn x86_64_timer_start_100hz()->bool{
 #[no_mangle]
 pub extern "C" fn x86_64_timer_ack_irq0(){
     if !CONFIGURED.load(Ordering::Relaxed){return}
-    let _=TICKS.fetch_update(Ordering::Relaxed,Ordering::Relaxed,|v|{
-        (v!=u64::MAX).then_some(v+1)
-    });
+    TICKS.fetch_update(Ordering::Relaxed,Ordering::Relaxed,|v|{
+        v.checked_add(1)
+    }).ok();
     outb(PIC1_CMD,0x20);
 }
 #[no_mangle]
@@ -333,6 +333,11 @@ mod tests {
         assert!(xapic_reg(XAPIC_EOI_OFFSET).is_none());
         assert!(xapic_reg(0x401).is_none());
         assert!(xapic_reg(0x321).is_none());
+    }
+    #[test]
+    fn timer_counter_overflow_is_rejected(){
+        assert_eq!(u64::MAX.checked_add(1),None);
+        assert_eq!((u64::MAX-1).checked_add(1),Some(u64::MAX));
     }
     #[test]
     fn counter_is_bounded(){
