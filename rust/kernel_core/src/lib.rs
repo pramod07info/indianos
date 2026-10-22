@@ -15,6 +15,7 @@ mod program;
 mod initramfs;
 pub mod block;
 pub mod tinyfs;
+pub mod quantum;
 #[cfg(target_arch = "x86_64")]
 pub mod ata_pio;
 #[cfg(feature = "vmm")]
