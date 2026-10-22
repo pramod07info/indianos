@@ -183,44 +183,4 @@ x86_64_timer_interrupt:
     iretq
 .size x86_64_timer_interrupt, .-x86_64_timer_interrupt
 
-/* R019.9: separate APIC IRQ vector; no legacy PIC EOI. */
-.global x86_64_apic_timer_interrupt
-.type x86_64_apic_timer_interrupt,@function
-x86_64_apic_timer_interrupt:
-    cld
-    pushq %rax
-    pushq %rbx
-    pushq %rcx
-    pushq %rdx
-    pushq %rsi
-    pushq %rdi
-    pushq %rbp
-    pushq %r8
-    pushq %r9
-    pushq %r10
-    pushq %r11
-    pushq %r12
-    pushq %r13
-    pushq %r14
-    pushq %r15
-    movq %rsp, %rdi
-    call x86_64_scheduler_apic_timer_dispatch
-    popq %r15
-    popq %r14
-    popq %r13
-    popq %r12
-    popq %r11
-    popq %r10
-    popq %r9
-    popq %r8
-    popq %rbp
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    popq %rcx
-    popq %rbx
-    popq %rax
-    iretq
-.size x86_64_apic_timer_interrupt, .-x86_64_apic_timer_interrupt
-
 .section .note.GNU-stack,"",@progbits
