@@ -209,6 +209,23 @@ pub const fn xapic_periodic_config(
     let Some(divide)=xapic_timer_divide(divisor)else{return None;};
     Some(XapicPeriodicConfig{lvt,divide,initial_count:calibrated_count})
 }
+/// R019.4: derive APIC initial count from a measured reference interval.
+/// elapsed_apic_ticks is measured with the selected APIC divisor already
+/// configured; reference_hz is the trusted reference clock frequency.
+/// Avoid integer truncation, zero periods, and u32 timer register overflow.
+pub const fn xapic_calibrated_count(
+    elapsed_apic_ticks:u64,elapsed_reference_ticks:u64,
+    reference_hz:u64,target_hz:u32,
+)->Option<u32>{
+    if elapsed_apic_ticks==0 || elapsed_reference_ticks==0 ||
+       reference_hz==0 || target_hz==0{return None;}
+    let numerator=(elapsed_apic_ticks as u128).checked_mul(reference_hz as u128)?;
+    let denominator=(elapsed_reference_ticks as u128).checked_mul(target_hz as u128)?;
+    if denominator==0{return None;}
+    let count=numerator/denominator;
+    if count==0 || count>u32::MAX as u128{return None;}
+    Some(count as u32)
+}
 /// Verify a pre-existing supervisor-only, uncacheable 4 KiB xAPIC
 /// mapping. The caller must first resolve the virtual page through the
 /// current page tables and supply the translated physical base and leaf PTE
@@ -406,6 +423,18 @@ mod tests {
         assert_eq!(xapic_periodic_config(0xff,16,100),None);
         assert_eq!(xapic_periodic_config(0x40,16,0),None);
         assert_eq!(xapic_periodic_config(0x40,3,100),None);
+    }
+    #[test]
+    fn calibration_from_reference_ticks_rejects_invalid_measurements(){
+        // 1,000,000 APIC ticks measured over 10 ms at 1 MHz reference,
+        // gives 1,000,000 ticks per 100 Hz interval.
+        assert_eq!(xapic_calibrated_count(1_000_000,10_000,1_000_000,100),Some(1_000_000));
+        assert_eq!(xapic_calibrated_count(0,10_000,1_000_000,100),None);
+        assert_eq!(xapic_calibrated_count(1,0,1_000_000,100),None);
+        assert_eq!(xapic_calibrated_count(1,1,0,100),None);
+        assert_eq!(xapic_calibrated_count(1,1,1,0),None);
+        assert_eq!(xapic_calibrated_count(1,1,1,100),None);
+        assert_eq!(xapic_calibrated_count(u64::MAX,1,u64::MAX,1),None);
     }
     #[test]
     fn xapic_mapping_requires_supervisor_uc_leaf(){
