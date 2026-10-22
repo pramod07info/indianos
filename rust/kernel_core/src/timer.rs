@@ -204,7 +204,7 @@ pub struct XapicPeriodicConfig {
 pub const fn xapic_periodic_config(
     vector:u8,divisor:u32,calibrated_count:u32,
 )->Option<XapicPeriodicConfig>{
-    if vector<=0x20 || vector==0xff || calibrated_count==0{return None;}
+    if vector!=0x40 || calibrated_count==0{return None;}
     let Some(lvt)=xapic_timer_lvt(vector,true,false)else{return None;};
     let Some(divide)=xapic_timer_divide(divisor)else{return None;};
     Some(XapicPeriodicConfig{lvt,divide,initial_count:calibrated_count})
@@ -310,7 +310,7 @@ fn xapic_reg(offset:usize)->Option<*mut u32>{
 /// is implemented. Never guesses a 100 Hz initial count.
 #[no_mangle]
 pub unsafe extern "C" fn x86_64_xapic_timer_prepare_masked(vector:u8)->bool{
-    if XAPIC_TIMER_ARMED.load(Ordering::Acquire){return false;}
+    if vector!=0x40 || XAPIC_TIMER_ARMED.load(Ordering::Acquire){return false;}
     let Some(lvt)=xapic_timer_lvt(vector,true,true)else{return false;};
     let (Some(divide),Some(initial),Some(lvt_reg))=(
         xapic_reg(XAPIC_TIMER_DIVIDE_OFFSET),
@@ -502,6 +502,8 @@ mod tests {
         assert_eq!(cfg.divide,3);
         assert_eq!(cfg.initial_count,12_345);
         assert_eq!(xapic_periodic_config(0x20,16,100),None);
+        assert_eq!(xapic_periodic_config(0x41,16,100),None);
+        assert_eq!(xapic_periodic_config(0x80,16,100),None);
         assert_eq!(xapic_periodic_config(0xff,16,100),None);
         assert_eq!(xapic_periodic_config(0x40,16,0),None);
         assert_eq!(xapic_periodic_config(0x40,3,100),None);
