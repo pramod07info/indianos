@@ -95,6 +95,17 @@ mod tests{
         assert_eq!(service.release_owner(202),Ok(1));
         assert_eq!(service.run_next(),None);
     }
+    #[test] fn termination_only_cleans_up_owner_jobs(){
+        let mut service=QuantumService::new();
+        let first=service.submit(11,BELL).unwrap();
+        let second=service.submit(22,BELL).unwrap();
+        assert_eq!(service.process_terminated(11),Ok(1));
+        assert_eq!(service.status(11,first),Err(ServiceError::NotOwner));
+        assert_eq!(service.status(22,second),Ok(JobStatus::Queued));
+        assert_eq!(service.run_next(),Some(second));
+        assert_eq!(service.process_terminated(22),Ok(1));
+        assert_eq!(service.run_next(),None);
+    }
     #[test] fn cancellation_and_slot_reuse(){
         let mut service=QuantumService::new();
         let a=service.submit(1,BELL).unwrap();
