@@ -219,8 +219,14 @@ pub const fn xapic_calibrated_count(
 )->Option<u32>{
     if elapsed_apic_ticks==0 || elapsed_reference_ticks==0 ||
        reference_hz==0 || target_hz==0{return None;}
-    let numerator=(elapsed_apic_ticks as u128).checked_mul(reference_hz as u128)?;
-    let denominator=(elapsed_reference_ticks as u128).checked_mul(target_hz as u128)?;
+    let numerator=match (elapsed_apic_ticks as u128).checked_mul(reference_hz as u128){
+        Some(value)=>value,
+        None=>return None,
+    };
+    let denominator=match (elapsed_reference_ticks as u128).checked_mul(target_hz as u128){
+        Some(value)=>value,
+        None=>return None,
+    };
     if denominator==0{return None;}
     let count=numerator/denominator;
     if count==0 || count>u32::MAX as u128{return None;}
