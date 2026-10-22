@@ -2,7 +2,7 @@ name: IndianOS Agent X - Free Local Model Prototype
 
 on:
   workflow_run:
-    workflows: ["IndianOS kernel boot (x86-64)"]
+    workflows: ["IndianOS Agent Y CI Handoff"]
     types: [completed]
     branches: [main]
   workflow_dispatch:
