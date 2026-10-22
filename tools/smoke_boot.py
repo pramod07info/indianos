@@ -252,6 +252,19 @@ def assert_expected_preempt(text: str) -> None:
         raise AssertionError("timer did not preempt both tasks")
     if text.find("IndianOS: PID 2 DISPATCHED") > text.find("IndianOS: PID 1 EXITED"):
         raise AssertionError("task 2 was not scheduled until after task 1 exited")
+    # Require observable timer-driven progress while both CPU-bound tasks
+    # remain alive. Merely emitting a preemption marker after task exit is
+    # insufficient evidence of concurrent scheduling.
+    first_a = text.find("IndianOS: PID 1 TIMER_PREEMPTED")
+    first_b = text.find("IndianOS: PID 2 TIMER_PREEMPTED")
+    exit_a = text.find("IndianOS: PID 1 EXITED")
+    exit_b = text.find("IndianOS: PID 2 EXITED")
+    dispatch_b = text.find("IndianOS: PID 2 DISPATCHED")
+    if not (first_a < dispatch_b < exit_a and first_b < exit_a and
+            first_a < exit_b and first_b < exit_b):
+        raise AssertionError(
+            "hardware timer must preempt both live tasks before either exits"
+        )
     if "IndianOS: PID 1 FAULTED" in text or "IndianOS: PID 2 FAULTED" in text:
         raise AssertionError("CPU-bound user program faulted")
     if "IndianOS: PID 1 YIELDED" not in text or "IndianOS: PID 2 YIELDED" not in text:
