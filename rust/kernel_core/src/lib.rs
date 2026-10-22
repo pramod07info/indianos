@@ -20,6 +20,7 @@ pub mod quantum_circuit;
 pub mod quantum_protocol;
 pub mod quantum_queue;
 pub mod quantum_service;
+pub mod quantum_abi;
 #[cfg(target_arch = "x86_64")]
 pub mod ata_pio;
 #[cfg(feature = "vmm")]
