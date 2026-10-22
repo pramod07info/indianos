@@ -104,6 +104,23 @@ pub extern "C" fn x86_64_timer_irq0_state()->u8{
                x86_64_timer_pic_in_service(),
                x86_64_timer_pic_mask())
 }
+/// IA32_APIC_BASE state used to diagnose legacy PIC routing under QEMU.
+/// Bit 0: xAPIC enabled; bit 1: x2APIC enabled; bit 2: BSP.
+/// This read-only probe does not modify interrupt-controller configuration.
+pub const fn apic_mode_flags(msr_low:u32)->u8{
+    (((msr_low>>11)&1) as u8) |
+    ((((msr_low>>10)&1) as u8)<<1) |
+    ((((msr_low>>8)&1) as u8)<<2)
+}
+#[no_mangle]
+pub extern "C" fn x86_64_timer_apic_mode_flags()->u8{
+    let low:u32;
+    let high:u32;
+    unsafe{asm!("rdmsr",in("ecx")0x1bu32,out("eax")low,out("edx")high,
+                options(nostack,preserves_flags));}
+    let _=high;
+    apic_mode_flags(low)
+}
 #[no_mangle]
 pub extern "C" fn x86_64_timer_pic_mask()->u8{
     if CONFIGURED.load(Ordering::Relaxed){inb(PIC1_DATA)}else{0xff}
@@ -118,6 +135,14 @@ mod tests {
         assert_eq!(irq0_state(0,1,0),2);
         assert_eq!(irq0_state(1,1,1),7);
         assert_eq!(irq0_state(2,2,2),0);
+    }
+    #[test]
+    fn apic_mode_decoding(){
+        assert_eq!(apic_mode_flags(0),0);
+        assert_eq!(apic_mode_flags(1<<11),1);
+        assert_eq!(apic_mode_flags(1<<10),2);
+        assert_eq!(apic_mode_flags(1<<8),4);
+        assert_eq!(apic_mode_flags((1<<11)|(1<<10)|(1<<8)),7);
     }
     #[test]
     fn counter_is_bounded(){
