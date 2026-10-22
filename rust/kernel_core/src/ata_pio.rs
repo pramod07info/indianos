@@ -56,6 +56,21 @@ fn ready(require_data:bool)->Result<(),BlockError>{
     }
     Err(BlockError::Io)
 }
+/// Wait for a PIO transfer or FLUSH CACHE command to finish. Unlike
+/// ready(false), completion also requires DRQ to clear: a controller can
+/// briefly expose BSY=0 while still requesting data.
+fn complete()->Result<(),BlockError>{
+    for _ in 0..TIMEOUT {
+        let status=unsafe{inb(STATUS)};
+        if status==0 || status==0xff{return Err(BlockError::Io);}
+        if status&BSY==0 {
+            if status&(ERR|DF)!=0{return Err(BlockError::Io);}
+            if status&DRQ==0{return Ok(());}
+        }
+        core::hint::spin_loop();
+    }
+    Err(BlockError::Io)
+}
 fn capacity(words:&[u16;256])->Option<u64>{
     // IDENTIFY bit 0 of word 49 indicates LBA support.
     if words[49]&(1<<9)==0{return None;}
@@ -119,9 +134,10 @@ impl BlockDevice for AtaPio {
         for pair in data.chunks_exact(2){
             unsafe{outw(DATA,u16::from_le_bytes([pair[0],pair[1]]));}
         }
-        ready(false)?;
-        unsafe{outb(STATUS,0xe7);} // FLUSH CACHE: wait for completion
-        ready(false)
+        // Do not issue FLUSH while the drive still has DRQ asserted.
+        complete()?;
+        unsafe{outb(STATUS,0xe7);} // FLUSH CACHE (ATA command)
+        complete()
     }
 }
 #[cfg(test)]
