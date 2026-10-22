@@ -281,6 +281,33 @@ pub unsafe extern "C" fn x86_64_xapic_timer_prepare_masked(vector:u8)->bool{
     XAPIC_TIMER_ARMED.store(true,Ordering::Release);
     true
 }
+/// R019.3: install a calibrated periodic timer while interrupts are disabled.
+/// This does not configure an IDT gate or prove interrupt delivery.
+/// # Safety
+/// BSP ring0 only, interrupts disabled; caller has validated the UC xAPIC
+/// mapping, installed a dedicated IDT vector, and independently calibrated
+/// the initial count. No PIC IRQ may use this vector.
+#[no_mangle]
+pub unsafe extern "C" fn x86_64_xapic_timer_start_calibrated(
+    vector:u8,divisor:u32,calibrated_count:u32,
+)->bool{
+    let Some(cfg)=xapic_periodic_config(vector,divisor,calibrated_count)else{return false;};
+    if !XAPIC_TIMER_ARMED.load(Ordering::Acquire){return false;}
+    let (Some(lvt),Some(divide),Some(initial))=(
+        xapic_reg(XAPIC_LVT_TIMER_OFFSET),
+        xapic_reg(XAPIC_TIMER_DIVIDE_OFFSET),
+        xapic_reg(XAPIC_TIMER_INITIAL_OFFSET),
+    )else{return false;};
+    unsafe{
+        // Mask before reprogramming, then start only with a validated count.
+        core::ptr::write_volatile(lvt,cfg.lvt|(1<<16));
+        core::ptr::write_volatile(initial,0);
+        core::ptr::write_volatile(divide,cfg.divide);
+        core::ptr::write_volatile(lvt,cfg.lvt);
+        core::ptr::write_volatile(initial,cfg.initial_count);
+    }
+    true
+}
 /// # Safety
 /// Call only from a genuine local APIC interrupt handler, after a validated
 /// UC binding; sending EOI for a PIC IRQ is incorrect.
