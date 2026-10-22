@@ -188,6 +188,62 @@ pub const fn xapic_mapping_preflight(
     let required=PRESENT|WRITABLE|PWT|PCD;
     leaf_flags&required==required && leaf_flags&(USER|PAT_4K)==0
 }
+// Experimental xAPIC register access. No physical address is dereferenced:
+// the caller must first establish a dedicated supervisor UC 4 KiB mapping.
+static XAPIC_VIRTUAL:AtomicU64=AtomicU64::new(0);
+static XAPIC_TIMER_ARMED:AtomicBool=AtomicBool::new(false);
+/// # Safety
+/// BSP ring0 only, interrupts disabled. Caller proves that virtual_base
+/// maps exactly the reported xAPIC physical page as supervisor-only UC
+/// memory with a 4K PTE and reset PAT layout. Mapping must remain alive
+/// across all IRQ handlers. Never pass an ordinary cached HHDM alias.
+#[no_mangle]
+pub unsafe extern "C" fn x86_64_xapic_bind_uc_page(
+    virtual_base:u64,physical_base:u64,leaf_flags:u64,pat_reset_layout:bool,
+)->bool{
+    if XAPIC_VIRTUAL.load(Ordering::Acquire)!=0 ||
+       !xapic_mapping_preflight(virtual_base,physical_base,
+                                x86_64_timer_xapic_physical_base(),
+                                leaf_flags,pat_reset_layout){return false;}
+    XAPIC_VIRTUAL.store(virtual_base,Ordering::Release);
+    true
+}
+fn xapic_reg(offset:usize)->Option<*mut u32>{
+    if offset&0xf!=0 || offset>=0x400{return None;}
+    let base=XAPIC_VIRTUAL.load(Ordering::Acquire);
+    if base==0{return None;}
+    Some((base as usize+offset) as *mut u32)
+}
+/// # Safety
+/// The registered UC page must remain mapped, on the BSP, with interrupts
+/// disabled. Leaves the timer masked until a separate calibrated IRQ path
+/// is implemented. Never guesses a 100 Hz initial count.
+#[no_mangle]
+pub unsafe extern "C" fn x86_64_xapic_timer_prepare_masked(vector:u8)->bool{
+    if XAPIC_TIMER_ARMED.load(Ordering::Acquire){return false;}
+    let Some(lvt)=xapic_timer_lvt(vector,true,true)else{return false;};
+    let (Some(divide),Some(initial),Some(lvt_reg))=(
+        xapic_reg(XAPIC_TIMER_DIVIDE_OFFSET),
+        xapic_reg(XAPIC_TIMER_INITIAL_OFFSET),
+        xapic_reg(XAPIC_LVT_TIMER_OFFSET)
+    )else{return false;};
+    unsafe{
+        core::ptr::write_volatile(lvt_reg,lvt);
+        core::ptr::write_volatile(initial,0);
+        core::ptr::write_volatile(divide,xapic_timer_divide(16).unwrap());
+    }
+    XAPIC_TIMER_ARMED.store(true,Ordering::Release);
+    true
+}
+/// # Safety
+/// Call only from a genuine local APIC interrupt handler, after a validated
+/// UC binding; sending EOI for a PIC IRQ is incorrect.
+#[no_mangle]
+pub unsafe extern "C" fn x86_64_xapic_eoi()->bool{
+    let Some(eoi)=xapic_reg(XAPIC_EOI_OFFSET)else{return false;};
+    unsafe{core::ptr::write_volatile(eoi,0);}
+    true
+}
 /// Returns firmware APIC mode captured immediately before PIC initialization.
 /// 0xff means the experimental timer has not attempted initialization.
 #[no_mangle]
@@ -271,6 +327,12 @@ mod tests {
         assert!(!xapic_mapping_preflight(va+1,pa,pa,flags,true));
         assert!(!xapic_mapping_preflight(va,pa+4096,pa,flags,true));
         assert!(!xapic_mapping_preflight(0xfee0_0000,pa,pa,flags,true));
+    }
+    #[test]
+    fn xapic_mmio_register_access_rejects_unbound_and_unaligned(){
+        assert!(xapic_reg(XAPIC_EOI_OFFSET).is_none());
+        assert!(xapic_reg(0x401).is_none());
+        assert!(xapic_reg(0x321).is_none());
     }
     #[test]
     fn counter_is_bounded(){
