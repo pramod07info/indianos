@@ -74,6 +74,7 @@ unsafe extern "C"{
  #[cfg(feature="preempt")] fn x86_64_timer_irq_count()->u64;
  #[cfg(feature="preempt")] fn x86_64_timer_pic_mask()->u8;
  #[cfg(feature="preempt")] fn x86_64_timer_pic_pending()->u8;
+ #[cfg(feature="preempt")] fn x86_64_timer_irq0_state()->u8;
 }
 fn log(b:&'static [u8]){unsafe{serial_write(b.as_ptr().cast())}}
 fn pid_log(pid:u32,event:&'static [u8]){
@@ -569,11 +570,20 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
  {
   if unsafe{x86_64_timer_irq_count()}==0{
    log(b"IndianOS: M009 PIC/PIT delivered zero timer IRQs\n\0");
-   if unsafe{x86_64_timer_pic_mask()}&1!=0{
-    log(b"IndianOS: M009 PIC IRQ0 unexpectedly masked\n\0")
-   }else if unsafe{x86_64_timer_pic_pending()}&1!=0{
-    log(b"IndianOS: M009 PIC IRQ0 pending without CPU delivery\n\0")
-   }else{log(b"IndianOS: M009 PIC IRQ0 request register empty\n\0")}
+   let irq0=unsafe{x86_64_timer_irq0_state()};
+   if irq0&4!=0{
+    log(b"IndianOS: M010 PIC IRQ0 unexpectedly masked\n\0")
+   }
+   if irq0&1!=0{
+    log(b"IndianOS: M010 PIC IRQ0 pending (IRR=1)\n\0")
+   }else{
+    log(b"IndianOS: M010 PIC IRQ0 not pending (IRR=0)\n\0")
+   }
+   if irq0&2!=0{
+    log(b"IndianOS: M010 PIC IRQ0 in service (ISR=1)\n\0")
+   }else{
+    log(b"IndianOS: M010 PIC IRQ0 not in service (ISR=0)\n\0")
+   }
   }else{log(b"IndianOS: M009 PIC/PIT hardware timer interrupts observed\n\0")}
   if scheduler.yield_count<2||scheduler.tick_count<2||
      unsafe{(*task_ptr(0)).timer_preemptions}==0||
