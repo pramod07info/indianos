@@ -386,6 +386,7 @@ pub unsafe extern "C" fn x86_64_user_process_run(
    #[cfg(feature="test-shell")]
    unsafe{ACTIVE_PID=0;}
    let (v,e,a)=last_fault();
+   cleanup_quantum_jobs(pid);
    let completed=if v==0{unsafe{indianos_process_exit(process,status)}}
    else{unsafe{indianos_process_fault(process,status,v,e,a)}};
    if !completed{
@@ -566,6 +567,7 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
    unsafe{indianos_scheduler_account_tick(&mut scheduler)};
   }else{
    if status==YIELD{ok=false;break;}
+   cleanup_quantum_jobs(pid);
    let finished=if v!=0{
     unsafe{indianos_process_fault(pcb,status,v,e,a)}
    }else{unsafe{indianos_process_exit(pcb,status)}};
