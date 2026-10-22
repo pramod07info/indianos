@@ -134,6 +134,35 @@ pub extern "C" fn x86_64_timer_xapic_physical_base()->u64{
                 options(nostack,preserves_flags));}
     xapic_physical_base(((hi as u64)<<32)|(lo as u64)).unwrap_or(0)
 }
+/// xAPIC timer MMIO offsets, relative to a separately mapped UC page.
+/// This module deliberately does not dereference physical addresses.
+pub const XAPIC_EOI_OFFSET:usize=0x0b0;
+pub const XAPIC_SPURIOUS_OFFSET:usize=0x0f0;
+pub const XAPIC_LVT_TIMER_OFFSET:usize=0x320;
+pub const XAPIC_TIMER_INITIAL_OFFSET:usize=0x380;
+pub const XAPIC_TIMER_CURRENT_OFFSET:usize=0x390;
+pub const XAPIC_TIMER_DIVIDE_OFFSET:usize=0x3e0;
+/// Validate the kernel-supplied mapping before any future volatile MMIO.
+/// The caller must additionally establish page-table UC/PAT attributes,
+/// supervisor-only permissions, and a physical mapping to IA32_APIC_BASE.
+pub const fn xapic_register_page_valid(base:usize)->bool{
+    base!=0 && base&0xfff==0 && base.checked_add(0x400).is_some()
+}
+/// Local APIC timer LVT: vector 0x20..0xfe, periodic bit 17, mask bit 16.
+/// Reject vectors reserved for exceptions, spurious interrupts or invalid
+/// configurations. The returned value is a configuration word, not an MMIO write.
+pub const fn xapic_timer_lvt(vector:u8,periodic:bool,masked:bool)->Option<u32>{
+    if vector<0x20 || vector==0xff{return None;}
+    Some((vector as u32)|((periodic as u32)<<17)|((masked as u32)<<16))
+}
+/// Divide configuration encoding from Intel SDM: 1,2,4,8,16,32,64,128.
+pub const fn xapic_timer_divide(divisor:u32)->Option<u32>{
+    match divisor{
+        1=>Some(0x0b),2=>Some(0),4=>Some(1),8=>Some(2),
+        16=>Some(3),32=>Some(8),64=>Some(9),128=>Some(0x0a),
+        _=>None,
+    }
+}
 /// Returns firmware APIC mode captured immediately before PIC initialization.
 /// 0xff means the experimental timer has not attempted initialization.
 #[no_mangle]
@@ -179,6 +208,30 @@ mod tests {
         assert_eq!(xapic_physical_base(0xfee0_0000|(1<<11)|(1<<10)),None);
         assert_eq!(xapic_physical_base(1<<11),None);
         assert_eq!(xapic_physical_base(0x1_fee0_0000|(1<<11)),Some(0x1_fee0_0000));
+    }
+    #[test]
+    fn xapic_register_layout_and_mapping_preflight(){
+        assert_eq!(XAPIC_EOI_OFFSET,0xb0);
+        assert_eq!(XAPIC_LVT_TIMER_OFFSET,0x320);
+        assert_eq!(XAPIC_TIMER_INITIAL_OFFSET,0x380);
+        assert_eq!(XAPIC_TIMER_CURRENT_OFFSET,0x390);
+        assert_eq!(XAPIC_TIMER_DIVIDE_OFFSET,0x3e0);
+        assert!(xapic_register_page_valid(0xffff_8000_0000_0000));
+        assert!(!xapic_register_page_valid(0));
+        assert!(!xapic_register_page_valid(0x1234));
+        assert!(!xapic_register_page_valid(usize::MAX-0xff));
+    }
+    #[test]
+    fn xapic_timer_configuration_validation(){
+        assert_eq!(xapic_timer_lvt(0x20,true,false),Some(0x20020));
+        assert_eq!(xapic_timer_lvt(0x40,false,true),Some(0x10040));
+        assert_eq!(xapic_timer_lvt(0x1f,true,false),None);
+        assert_eq!(xapic_timer_lvt(0xff,true,false),None);
+        for (d,v) in [(1,0xb),(2,0),(4,1),(8,2),(16,3),(32,8),(64,9),(128,0xa)]{
+            assert_eq!(xapic_timer_divide(d),Some(v));
+        }
+        assert_eq!(xapic_timer_divide(0),None);
+        assert_eq!(xapic_timer_divide(3),None);
     }
     #[test]
     fn counter_is_bounded(){
