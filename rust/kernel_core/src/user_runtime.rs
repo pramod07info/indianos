@@ -76,6 +76,7 @@ unsafe extern "C"{
  #[cfg(feature="preempt")] fn x86_64_timer_pic_pending()->u8;
  #[cfg(feature="preempt")] fn x86_64_timer_irq0_state()->u8;
  #[cfg(feature="preempt")] fn x86_64_timer_apic_mode_flags()->u8;
+ #[cfg(feature="preempt")] fn x86_64_timer_initial_apic_mode()->u8;
 }
 fn log(b:&'static [u8]){unsafe{serial_write(b.as_ptr().cast())}}
 fn pid_log(pid:u32,event:&'static [u8]){
@@ -571,6 +572,14 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
  {
   if unsafe{x86_64_timer_irq_count()}==0{
    log(b"IndianOS: M009 PIC/PIT delivered zero timer IRQs\n\0");
+   let initial_apic=unsafe{x86_64_timer_initial_apic_mode()};
+   if initial_apic&2!=0{
+    log(b"IndianOS: M010 firmware x2APIC mode active\n\0")
+   }else if initial_apic&1!=0{
+    log(b"IndianOS: M010 firmware xAPIC mode active\n\0")
+   }else{
+    log(b"IndianOS: M010 firmware local APIC disabled\n\0")
+   }
    let apic=unsafe{x86_64_timer_apic_mode_flags()};
    if apic&2!=0{
     log(b"IndianOS: M010 x2APIC mode active\n\0")
