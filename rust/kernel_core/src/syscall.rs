@@ -83,6 +83,8 @@ pub unsafe extern "C" fn indianos_syscall_validate(
         0 => request.arg0 == 0 && request.arg1 == 0, // ABI_QUERY
         1 => (1..=MAX_WRITE).contains(&request.arg1) &&
             user_range(plan, request.arg0, request.arg1, false), // WRITE
+        7 => request.arg1 == 0 &&
+            user_range(plan, request.arg0, 32, false), // QUANTUM descriptor
         2 => request.arg1 == 0, // EXIT
         3 => request.arg0 == 0 && request.arg1 == 0, // YIELD
         #[cfg(feature = "test-shell")]
