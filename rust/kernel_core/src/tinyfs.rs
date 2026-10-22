@@ -32,7 +32,7 @@ impl<D:BlockDevice> TinyFs<D> {
     }
     fn name(name:&str)->Result<&[u8],FsError>{
         let bytes=name.as_bytes();
-        if bytes.is_empty() || bytes.len()>NAME_BYTES ||
+        if bytes.is_empty() || bytes.len()>=NAME_BYTES ||
            bytes.iter().any(|&b|b==0 || b==b'/' || b==b'\\' || b<0x20) {
             return Err(FsError::InvalidName);
         }
