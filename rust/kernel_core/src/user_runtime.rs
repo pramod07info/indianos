@@ -19,7 +19,6 @@ use crate::user_image::{UserImage,indianos_user_image_load,
 use crate::syscall::{SyscallRequest,indianos_syscall_validate,ring3_frame_valid,USER_TOP,STACK_BYTES,PAGE_BYTES};
 use crate::program::indianos_program_user_range;
 use crate::boot::Region;
-#[cfg(feature="test-interactive")]
 use crate::user_image::{indianos_user_can_write,indianos_user_copy_writable};
 #[cfg(feature="test-interactive")]
 use crate::input;
@@ -48,6 +47,7 @@ pub extern "C" fn indianos_r013_take_worker_request()->bool {
  unsafe {let requested=PENDING_WORKER;PENDING_WORKER=false;requested}
 }
 static mut ACTIVE_TASK:*mut Task=ptr::null_mut();
+static mut ACTIVE_PROCESS:*mut Process=ptr::null_mut();
 // Quantum jobs belong to kernel-verified process IDs, not user-provided IDs.
 // Single-core runtime only; do not access this from interrupt context.
 static mut QUANTUM_JOBS:crate::quantum_service::QuantumService=
@@ -170,6 +170,53 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
  let request=SyscallRequest{number:r[14],arg0:r[9],arg1:r[10]};
  if !unsafe{indianos_syscall_validate(ptr::addr_of!((*img).plan),request)}{return BAD;}
  match request.number{
+  7=>{
+   // Four little-endian u64 words: operation, buffer, length, job ID.
+   // Descriptor and payload are copied from verified user-owned pages.
+   let pcb=unsafe{ptr::read(ptr::addr_of!(ACTIVE_PROCESS))};
+   let Some(process)=(unsafe{pcb.as_ref()})else{return BAD;};
+   if process.pid==0 || process.state!=3{return BAD;}
+   let mut descriptor=[0u8;32];
+   if !unsafe{indianos_user_copy_readonly(img,request.arg0,
+       descriptor.as_mut_ptr().cast(),descriptor.len())}{return BAD;}
+   let word=|n:usize|u64::from_le_bytes(
+       descriptor[n*8..n*8+8].try_into().unwrap());
+   let Ok(q)=crate::quantum_abi::QuantumRequest::parse(
+       word(0),word(1),word(2),word(3))else{return BAD;};
+   if crate::quantum_abi::validate_user_request(unsafe{&(*img).plan},q).is_err(){
+       return BAD;
+   }
+   use crate::quantum_abi::QuantumOperation;
+   use crate::quantum_dispatch::{dispatch,Reply};
+   use crate::quantum_queue::RESULT_BYTES;
+   let jobs=unsafe{&mut *ptr::addr_of_mut!(QUANTUM_JOBS)};
+   let reply=match q.operation{
+    QuantumOperation::Submit=>{
+     let mut bytes=[0u8;crate::quantum_protocol::MAX_REQUEST_BYTES];
+     if !unsafe{indianos_user_copy_readonly(img,q.user_address,
+         bytes.as_mut_ptr().cast(),q.length)}{return BAD;}
+     dispatch(jobs,process.pid,q,Some(&bytes[..q.length]),None)
+    }
+    QuantumOperation::Result=>{
+     if !unsafe{indianos_user_can_write(&*img,q.user_address,RESULT_BYTES)}{
+         return BAD;
+     }
+     let mut out=[0u8;RESULT_BYTES];
+     let result=dispatch(jobs,process.pid,q,None,Some(&mut out));
+     if result.is_err(){return BAD;}
+     if !unsafe{indianos_user_copy_writable(&*img,q.user_address,
+         out.as_ptr(),out.len())}{return BAD;}
+     result
+    }
+    _=>dispatch(jobs,process.pid,q,None,None),
+   };
+   match reply{
+    Ok(Reply::Submitted(id))=>id,
+    Ok(Reply::Status(state))=>state as u64,
+    Ok(Reply::Result|Reply::Released)=>0,
+    Err(_)=>BAD,
+   }
+  },
   0=>1,
   #[cfg(feature="test-interactive")]
   6=>{
@@ -377,12 +424,12 @@ pub unsafe extern "C" fn x86_64_user_process_run(
   }
   if safe{
    pid_log(pid,b"RUNNING\0");clear_faults();
-   unsafe{ACTIVE_USER=&mut staged;}
+   unsafe{ACTIVE_USER=&mut staged;ACTIVE_PROCESS=process;}
    #[cfg(feature="test-shell")]
    unsafe{ACTIVE_PID=pid;}
    log(b"IndianOS: entering ring-3 /bin/init (QEMU experimental)\n\0");
    let status=unsafe{x86_64_enter_user(staged.plan.entry,staged.plan.stack_end-16,clone.root)};
-   unsafe{ACTIVE_USER=ptr::null_mut()};
+   unsafe{ACTIVE_USER=ptr::null_mut();ACTIVE_PROCESS=ptr::null_mut();}
    #[cfg(feature="test-shell")]
    unsafe{ACTIVE_PID=0;}
    let (v,e,a)=last_fault();
@@ -546,7 +593,7 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
    if !saved_valid(task)||!unsafe{indianos_process_resume(pcb)}{ok=false;break;}
   }else if !unsafe{indianos_process_start(pcb,task.root.root)}{ok=false;break;}
   pid_log(pid,b"DISPATCHED\0");clear_faults();
-  unsafe{ACTIVE_USER=&mut task.image;ACTIVE_TASK=task as *mut Task;}
+  unsafe{ACTIVE_USER=&mut task.image;ACTIVE_TASK=task as *mut Task;ACTIVE_PROCESS=pcb;}
   let status=if task.saved{
    unsafe{x86_64_resume_user(task.frame.as_ptr(),task.root.root)}
   }else{
