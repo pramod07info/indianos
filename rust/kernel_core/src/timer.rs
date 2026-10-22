@@ -163,6 +163,31 @@ pub const fn xapic_timer_divide(divisor:u32)->Option<u32>{
         _=>None,
     }
 }
+/// Verify a pre-existing supervisor-only, uncacheable 4 KiB xAPIC
+/// mapping. The caller must first resolve the virtual page through the
+/// current page tables and supply the translated physical base and leaf PTE
+/// flags. PCD+PWT is the conservative UC encoding only when PAT is in its
+/// architectural reset configuration; a future mapper must inspect PAT MSR.
+pub const fn xapic_mapping_preflight(
+    virtual_base:u64,translated_physical:u64,expected_physical:u64,
+    leaf_flags:u64,pat_reset_layout:bool,
+)->bool{
+    const PRESENT:u64=1;
+    const WRITABLE:u64=1<<1;
+    const USER:u64=1<<2;
+    const PWT:u64=1<<3;
+    const PCD:u64=1<<4;
+    const HUGE:u64=1<<7;
+    const PAT_4K:u64=1<<7;
+    if !pat_reset_layout || virtual_base==0 || virtual_base&0xfff!=0 ||
+       virtual_base>>48!=0xffff || virtual_base&(1<<47)==0 ||
+       expected_physical==0 || expected_physical&0xfff!=0 ||
+       translated_physical!=expected_physical{return false;}
+    // This preflight accepts a 4K leaf only, never a large-page mapping.
+    // At PTE level bit 7 is PAT, which must be clear for UC index 3.
+    let required=PRESENT|WRITABLE|PWT|PCD;
+    leaf_flags&required==required && leaf_flags&(USER|PAT_4K)==0
+}
 /// Returns firmware APIC mode captured immediately before PIC initialization.
 /// 0xff means the experimental timer has not attempted initialization.
 #[no_mangle]
@@ -232,6 +257,20 @@ mod tests {
         }
         assert_eq!(xapic_timer_divide(0),None);
         assert_eq!(xapic_timer_divide(3),None);
+    }
+    #[test]
+    fn xapic_mapping_requires_supervisor_uc_leaf(){
+        let va=0xffff_8000_fee0_0000u64;
+        let pa=0xfee0_0000u64;
+        let flags=1|2|8|16;
+        assert!(xapic_mapping_preflight(va,pa,pa,flags,true));
+        assert!(!xapic_mapping_preflight(va,pa,pa,flags,false));
+        assert!(!xapic_mapping_preflight(va,pa,pa,flags|4,true));
+        assert!(!xapic_mapping_preflight(va,pa,pa,flags|128,true));
+        assert!(!xapic_mapping_preflight(va,pa,pa,flags&!16,true));
+        assert!(!xapic_mapping_preflight(va+1,pa,pa,flags,true));
+        assert!(!xapic_mapping_preflight(va,pa+4096,pa,flags,true));
+        assert!(!xapic_mapping_preflight(0xfee0_0000,pa,pa,flags,true));
     }
     #[test]
     fn counter_is_bounded(){
