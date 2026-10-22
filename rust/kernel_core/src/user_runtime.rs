@@ -153,6 +153,7 @@ pub unsafe extern "C" fn x86_64_scheduler_apic_timer_dispatch(regs:*const u64){
         if !t.is_null(){
             let task=unsafe{&mut *t};
             task.timer_preemptions=task.timer_preemptions.saturating_add(1);
+            crate::timer::xapic_record_preemption();
             pid_log(unsafe{(*task.pcb).pid},b"APIC_TIMER_PREEMPTED\0");
             unsafe{x86_64_user_exit_to_kernel(YIELD)}
         }

@@ -13,6 +13,8 @@ const PIT_DATA:u16=0x40;
 static TICKS:AtomicU64=AtomicU64::new(0);
 // Counts successfully acknowledged local APIC interrupts separately from PIC IRQ0.
 static XAPIC_IRQ_TICKS:AtomicU64=AtomicU64::new(0);
+// Counts actual valid ring-3 context captures, not merely APIC EOI writes.
+static XAPIC_PREEMPTIONS:AtomicU64=AtomicU64::new(0);
 static CONFIGURED:AtomicBool=AtomicBool::new(false);
 // Capture firmware APIC mode before the experimental PIC routing change.
 static INITIAL_APIC_MODE:AtomicU8=AtomicU8::new(0xff);
@@ -438,7 +440,6 @@ pub unsafe extern "C" fn x86_64_xapic_timer_sample_masked()->u32{
 /// still mapped. This is an explicit quiesce operation, not a scheduler.
 #[no_mangle]
 pub unsafe extern "C" fn x86_64_xapic_timer_stop()->bool{
-    XAPIC_TIMER_RUNNING.store(false,Ordering::Release);
     if !XAPIC_TIMER_ARMED.load(Ordering::Acquire){return false;}
     let (Some(lvt),Some(initial))=(
         xapic_reg(XAPIC_LVT_TIMER_OFFSET),
@@ -449,6 +450,7 @@ pub unsafe extern "C" fn x86_64_xapic_timer_stop()->bool{
         core::ptr::write_volatile(lvt,old|(1<<16));
         core::ptr::write_volatile(initial,0);
     }
+    XAPIC_TIMER_RUNNING.store(false,Ordering::Release);
     true
 }
 /// # Safety
@@ -465,6 +467,20 @@ pub unsafe extern "C" fn x86_64_xapic_eoi()->bool{
 #[no_mangle]
 pub extern "C" fn x86_64_xapic_timer_irq_count()->u64{
     XAPIC_IRQ_TICKS.load(Ordering::Relaxed)
+}
+/// Count successful ring-3 APIC preemptions independently of delivered IRQs.
+/// Called only after a validated user frame has been captured.
+pub fn xapic_record_preemption(){
+    XAPIC_PREEMPTIONS.fetch_update(Ordering::Relaxed,Ordering::Relaxed,|v|v.checked_add(1)).ok();
+}
+#[no_mangle]
+pub extern "C" fn x86_64_xapic_timer_preemption_count()->u64{
+    XAPIC_PREEMPTIONS.load(Ordering::Relaxed)
+}
+/// Snapshot whether IRQ delivery has produced actual user preemption.
+/// This is diagnostic evidence only; it does not certify fair scheduling.
+pub fn xapic_preemption_progress()->bool{
+    x86_64_xapic_timer_irq_count()>0 && x86_64_xapic_timer_preemption_count()>0
 }
 /// An APIC timer interrupt may preempt only while the timer is armed.
 #[no_mangle]
