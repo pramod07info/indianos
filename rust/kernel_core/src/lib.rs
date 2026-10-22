@@ -17,6 +17,7 @@ pub mod block;
 pub mod tinyfs;
 pub mod quantum;
 pub mod quantum_circuit;
+pub mod quantum_protocol;
 #[cfg(target_arch = "x86_64")]
 pub mod ata_pio;
 #[cfg(feature = "vmm")]
