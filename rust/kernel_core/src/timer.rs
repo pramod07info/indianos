@@ -352,6 +352,24 @@ pub unsafe extern "C" fn x86_64_xapic_timer_start_calibrated(
     }
     true
 }
+/// R019.6: stop the experimental APIC timer without touching PIC IRQ0.
+/// # Safety
+/// BSP ring0 only, interrupts disabled, with the validated UC APIC page
+/// still mapped. This is an explicit quiesce operation, not a scheduler.
+#[no_mangle]
+pub unsafe extern "C" fn x86_64_xapic_timer_stop()->bool{
+    if !XAPIC_TIMER_ARMED.load(Ordering::Acquire){return false;}
+    let (Some(lvt),Some(initial))=(
+        xapic_reg(XAPIC_LVT_TIMER_OFFSET),
+        xapic_reg(XAPIC_TIMER_INITIAL_OFFSET),
+    )else{return false;};
+    unsafe{
+        let old=core::ptr::read_volatile(lvt);
+        core::ptr::write_volatile(lvt,old|(1<<16));
+        core::ptr::write_volatile(initial,0);
+    }
+    true
+}
 /// # Safety
 /// Call only from a genuine local APIC interrupt handler, after a validated
 /// UC binding; sending EOI for a PIC IRQ is incorrect.
