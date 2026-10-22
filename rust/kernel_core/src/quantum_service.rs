@@ -51,6 +51,11 @@ impl QuantumService{
         *entry=Ownership::empty();
         Ok(())
     }
+    /// Called by a trusted process lifecycle owner on exit or fault.
+    /// Jobs belonging to other process identities remain available.
+    pub fn process_terminated(&mut self, owner:u32)->Result<usize,ServiceError>{
+        self.release_owner(owner)
+    }
     /// Kernel worker explicitly drives execution. No background execution.
     pub fn run_next(&mut self)->Option<u64>{self.queue.run_next()}
     /// Reclaim all jobs owned by an exiting process, including queued jobs.
