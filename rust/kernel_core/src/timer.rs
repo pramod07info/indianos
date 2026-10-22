@@ -521,6 +521,22 @@ mod tests {
         assert_eq!(xapic_calibrated_count(u64::MAX,1,u64::MAX,1),None);
     }
     #[test]
+    fn apic_calibration_boundary_and_vector_regressions(){
+        // A mathematically valid u32 maximum is accepted, but any
+        // count beyond the hardware register width must be rejected.
+        assert_eq!(xapic_calibrated_count(u32::MAX as u64,1,1,1),Some(u32::MAX));
+        assert_eq!(xapic_calibrated_count(u32::MAX as u64+1,1,1,1),None);
+        // Division must not round a sub-tick period up to one tick.
+        assert_eq!(xapic_calibrated_count(1,2,1,1),None);
+        // The installed APIC gate is 0x40; other vectors are forbidden
+        // even when calibration and divider are otherwise valid.
+        for vector in [0x20,0x21,0x3f,0x41,0x80,0xfe,0xff]{
+            assert_eq!(xapic_config_from_samples(
+                vector,16,1000,500,10,100,100
+            ),None);
+        }
+    }
+    #[test]
     fn oneshot_samples_are_bounded(){
         assert_eq!(xapic_oneshot_elapsed(1000,750),Some(250));
         assert_eq!(xapic_oneshot_elapsed(1000,1000),None);
