@@ -79,6 +79,31 @@ pub extern "C" fn x86_64_timer_pic_pending()->u8{
     if !CONFIGURED.load(Ordering::Relaxed){return 0}
     outb(PIC1_CMD,0x0a);inb(PIC1_CMD)
 }
+/// Read the PIC in-service register (ISR), not the interrupt request register
+/// (IRR). A pending IRQ0 with ISR bit 0 clear indicates that the PIC has
+/// not acknowledged delivery to the CPU. This is diagnostic only: reading
+/// the command port does not acknowledge, unmask, or enable interrupts.
+#[no_mangle]
+pub extern "C" fn x86_64_timer_pic_in_service()->u8{
+    if !CONFIGURED.load(Ordering::Relaxed){return 0}
+    outb(PIC1_CMD,0x0b);
+    let isr=inb(PIC1_CMD);
+    // Restore IRR selection so existing pending-IRQ probes remain stable.
+    outb(PIC1_CMD,0x0a);
+    isr
+}
+/// Decode the master PIC's IRQ0 state without conflating pending and
+/// in-service interrupts. This does not establish CPU IRQ delivery.
+pub const fn irq0_state(irr:u8,isr:u8,mask:u8)->u8{
+    ((irr&1)!=0) as u8 | ((((isr&1)!=0) as u8)<<1) |
+    ((((mask&1)!=0) as u8)<<2)
+}
+#[no_mangle]
+pub extern "C" fn x86_64_timer_irq0_state()->u8{
+    irq0_state(x86_64_timer_pic_pending(),
+               x86_64_timer_pic_in_service(),
+               x86_64_timer_pic_mask())
+}
 #[no_mangle]
 pub extern "C" fn x86_64_timer_pic_mask()->u8{
     if CONFIGURED.load(Ordering::Relaxed){inb(PIC1_DATA)}else{0xff}
@@ -86,6 +111,14 @@ pub extern "C" fn x86_64_timer_pic_mask()->u8{
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn irq0_diagnostics_distinguish_pending_in_service_and_masked(){
+        assert_eq!(irq0_state(0,0,0),0);
+        assert_eq!(irq0_state(1,0,0),1);
+        assert_eq!(irq0_state(0,1,0),2);
+        assert_eq!(irq0_state(1,1,1),7);
+        assert_eq!(irq0_state(2,2,2),0);
+    }
     #[test]
     fn counter_is_bounded(){
         assert_eq!(TICKS.load(Ordering::Relaxed),0);
