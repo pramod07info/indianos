@@ -275,11 +275,10 @@ pub unsafe extern "C" fn indianos_user_copy_readonly(
 }
 
 
-#[cfg(feature="test-interactive")]
 pub(crate) unsafe fn indianos_user_can_write(
     img:&UserImage,address:u64,length:usize,
 )->bool{
-    img.ready && (1..=64).contains(&length) &&
+    img.ready && (1..=crate::quantum_queue::RESULT_BYTES).contains(&length) &&
         crate::syscall::user_range(&img.plan,address,length as u64,true) &&
         unsafe{copy_preflight(img,address,length,true)}
 }
@@ -287,7 +286,6 @@ pub(crate) unsafe fn indianos_user_can_write(
 /// # Safety
 /// Image and kernel source remain live; user addresses are translated using
 /// owned page tables, not directly dereferenced.
-#[cfg(feature="test-interactive")]
 pub(crate) unsafe fn indianos_user_copy_writable(
     img:&UserImage,address:u64,source:*const u8,length:usize,
 )->bool{
