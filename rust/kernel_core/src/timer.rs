@@ -11,6 +11,8 @@ const PIC2_DATA:u16=0xa1;
 const PIT_CMD:u16=0x43;
 const PIT_DATA:u16=0x40;
 static TICKS:AtomicU64=AtomicU64::new(0);
+// Counts successfully acknowledged local APIC interrupts separately from PIC IRQ0.
+static XAPIC_IRQ_TICKS:AtomicU64=AtomicU64::new(0);
 static CONFIGURED:AtomicBool=AtomicBool::new(false);
 // Capture firmware APIC mode before the experimental PIC routing change.
 static INITIAL_APIC_MODE:AtomicU8=AtomicU8::new(0xff);
@@ -450,7 +452,18 @@ pub unsafe extern "C" fn x86_64_xapic_timer_stop()->bool{
 pub unsafe extern "C" fn x86_64_xapic_eoi()->bool{
     let Some(eoi)=xapic_reg(XAPIC_EOI_OFFSET)else{return false;};
     unsafe{core::ptr::write_volatile(eoi,0);}
+    XAPIC_IRQ_TICKS.fetch_update(Ordering::Relaxed,Ordering::Relaxed,|v|v.checked_add(1)).ok();
     true
+}
+/// Read-only APIC IRQ delivery evidence, separate from legacy PIC IRQ0.
+#[no_mangle]
+pub extern "C" fn x86_64_xapic_timer_irq_count()->u64{
+    XAPIC_IRQ_TICKS.load(Ordering::Relaxed)
+}
+/// An APIC timer interrupt may preempt only while the timer is armed.
+#[no_mangle]
+pub extern "C" fn x86_64_xapic_timer_preemption_ready()->bool{
+    XAPIC_TIMER_ARMED.load(Ordering::Acquire)
 }
 /// Returns firmware APIC mode captured immediately before PIC initialization.
 /// 0xff means the experimental timer has not attempted initialization.

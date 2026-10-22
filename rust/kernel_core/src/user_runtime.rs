@@ -146,6 +146,7 @@ pub unsafe extern "C" fn x86_64_scheduler_timer_dispatch(regs:*const u64){
 pub unsafe extern "C" fn x86_64_scheduler_apic_timer_dispatch(regs:*const u64){
     let acknowledged=unsafe{crate::timer::x86_64_xapic_eoi()};
     if !acknowledged{return;}
+    if !crate::timer::x86_64_xapic_timer_preemption_ready(){return;}
     #[cfg(feature="preempt")]
     if capture(regs,true){
         let t=active_task();
