@@ -140,6 +140,24 @@ pub unsafe extern "C" fn x86_64_scheduler_timer_dispatch(regs:*const u64){
  }
  #[cfg(not(feature="preempt"))]{let _=regs;}
 }
+/// R019.9: dedicated local APIC timer dispatch, distinct from PIC IRQ0.
+/// The APIC EOI must be sent before any non-returning scheduler transfer.
+#[no_mangle]
+pub unsafe extern "C" fn x86_64_scheduler_apic_timer_dispatch(regs:*const u64){
+    let acknowledged=unsafe{crate::timer::x86_64_xapic_eoi()};
+    if !acknowledged{return;}
+    #[cfg(feature="preempt")]
+    if capture(regs,true){
+        let t=active_task();
+        if !t.is_null(){
+            let task=unsafe{&mut *t};
+            task.timer_preemptions=task.timer_preemptions.saturating_add(1);
+            pid_log(unsafe{(*task.pcb).pid},b"APIC_TIMER_PREEMPTED\0");
+            unsafe{x86_64_user_exit_to_kernel(YIELD)}
+        }
+    }
+    #[cfg(not(feature="preempt"))]{let _=regs;}
+}
 #[no_mangle]
 pub extern "C" fn x86_64_user_fault_handle(vector:u64,cs:u64,error:u64,cr2:u64){
  if !indianos_user_fault_eligible(vector,cs,error,!active_image().is_null()){return;}
