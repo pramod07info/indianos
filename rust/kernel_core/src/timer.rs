@@ -189,6 +189,26 @@ pub const fn xapic_timer_divide(divisor:u32)->Option<u32>{
         _=>None,
     }
 }
+/// R019.3: construct a calibrated local APIC periodic timer configuration.
+/// The caller must measure APIC ticks against an independent reference clock;
+/// a raw PIT divisor is NOT an APIC initial-count calibration.
+#[derive(Clone,Copy,Debug,Eq,PartialEq)]
+pub struct XapicPeriodicConfig {
+    pub lvt:u32,
+    pub divide:u32,
+    pub initial_count:u32,
+}
+/// Accept only a nonzero, calibrated APIC count and a valid interrupt vector.
+/// Vector 0x20 is reserved for the existing experimental PIC IRQ0 path;
+/// the APIC timer uses a distinct vector to avoid ambiguous EOI handling.
+pub const fn xapic_periodic_config(
+    vector:u8,divisor:u32,calibrated_count:u32,
+)->Option<XapicPeriodicConfig>{
+    if vector<=0x20 || vector==0xff || calibrated_count==0{return None;}
+    let Some(lvt)=xapic_timer_lvt(vector,true,false)else{return None;};
+    let Some(divide)=xapic_timer_divide(divisor)else{return None;};
+    Some(XapicPeriodicConfig{lvt,divide,initial_count:calibrated_count})
+}
 /// Verify a pre-existing supervisor-only, uncacheable 4 KiB xAPIC
 /// mapping. The caller must first resolve the virtual page through the
 /// current page tables and supply the translated physical base and leaf PTE
@@ -348,6 +368,17 @@ mod tests {
         }
         assert_eq!(xapic_timer_divide(0),None);
         assert_eq!(xapic_timer_divide(3),None);
+    }
+    #[test]
+    fn periodic_apic_configuration_requires_calibration_and_dedicated_vector(){
+        let cfg=xapic_periodic_config(0x40,16,12_345).unwrap();
+        assert_eq!(cfg.lvt,0x20040);
+        assert_eq!(cfg.divide,3);
+        assert_eq!(cfg.initial_count,12_345);
+        assert_eq!(xapic_periodic_config(0x20,16,100),None);
+        assert_eq!(xapic_periodic_config(0xff,16,100),None);
+        assert_eq!(xapic_periodic_config(0x40,16,0),None);
+        assert_eq!(xapic_periodic_config(0x40,3,100),None);
     }
     #[test]
     fn xapic_mapping_requires_supervisor_uc_leaf(){
