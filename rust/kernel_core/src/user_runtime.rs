@@ -212,7 +212,9 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
    };
    match reply{
     Ok(Reply::Submitted(id))=>id,
-    Ok(Reply::Status(state))=>state as u64,
+    Ok(Reply::Status(crate::quantum_queue::JobStatus::Queued))=>0,
+    Ok(Reply::Status(crate::quantum_queue::JobStatus::Completed))=>1,
+    Ok(Reply::Status(crate::quantum_queue::JobStatus::Failed(_)))=>2,
     Ok(Reply::Result|Reply::Released)=>0,
     Err(_)=>BAD,
    }
