@@ -320,6 +320,9 @@ pub const fn xapic_mapping_preflight(
 // the caller must first establish a dedicated supervisor UC 4 KiB mapping.
 static XAPIC_VIRTUAL:AtomicU64=AtomicU64::new(0);
 static XAPIC_TIMER_ARMED:AtomicBool=AtomicBool::new(false);
+// Unlike ARMED (UC binding/initialization), RUNNING denotes an unmasked
+// periodic timer. A calibration one-shot must never trigger preemption.
+static XAPIC_TIMER_RUNNING:AtomicBool=AtomicBool::new(false);
 /// # Safety
 /// BSP ring0 only, interrupts disabled. Caller proves that virtual_base
 /// maps exactly the reported xAPIC physical page as supervisor-only UC
@@ -388,6 +391,7 @@ pub unsafe extern "C" fn x86_64_xapic_timer_start_calibrated(
         core::ptr::write_volatile(lvt,cfg.lvt);
         core::ptr::write_volatile(initial,cfg.initial_count);
     }
+    XAPIC_TIMER_RUNNING.store(true,Ordering::Release);
     true
 }
 /// R019.8: begin a bounded masked one-shot measurement.
@@ -398,6 +402,7 @@ pub unsafe extern "C" fn x86_64_xapic_timer_start_calibrated(
 /// and no concurrent timer user. Caller must stop sampling before wrap.
 #[no_mangle]
 pub unsafe extern "C" fn x86_64_xapic_calibration_begin(initial_count:u32)->bool{
+    if XAPIC_TIMER_RUNNING.load(Ordering::Acquire){return false;}
     if initial_count==0 || !XAPIC_TIMER_ARMED.load(Ordering::Acquire){return false;}
     let (Some(lvt),Some(divide),Some(initial))=(
         xapic_reg(XAPIC_LVT_TIMER_OFFSET),
@@ -433,6 +438,7 @@ pub unsafe extern "C" fn x86_64_xapic_timer_sample_masked()->u32{
 /// still mapped. This is an explicit quiesce operation, not a scheduler.
 #[no_mangle]
 pub unsafe extern "C" fn x86_64_xapic_timer_stop()->bool{
+    XAPIC_TIMER_RUNNING.store(false,Ordering::Release);
     if !XAPIC_TIMER_ARMED.load(Ordering::Acquire){return false;}
     let (Some(lvt),Some(initial))=(
         xapic_reg(XAPIC_LVT_TIMER_OFFSET),
@@ -463,7 +469,7 @@ pub extern "C" fn x86_64_xapic_timer_irq_count()->u64{
 /// An APIC timer interrupt may preempt only while the timer is armed.
 #[no_mangle]
 pub extern "C" fn x86_64_xapic_timer_preemption_ready()->bool{
-    XAPIC_TIMER_ARMED.load(Ordering::Acquire)
+    XAPIC_TIMER_RUNNING.load(Ordering::Acquire)
 }
 /// Returns firmware APIC mode captured immediately before PIC initialization.
 /// 0xff means the experimental timer has not attempted initialization.
