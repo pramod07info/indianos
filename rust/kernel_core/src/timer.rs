@@ -232,6 +232,15 @@ pub const fn xapic_calibrated_count(
     if count==0 || count>u32::MAX as u128{return None;}
     Some(count as u32)
 }
+/// R019.12: bound a prospective APIC timer calibration window before
+/// programming hardware. A 32-bit down-counter must not wrap during the
+/// measurement, and a reference interval must be strictly positive.
+pub const fn xapic_calibration_window_valid(
+    initial_count:u32, current_count:u32, reference_ticks:u64,
+)->bool{
+    initial_count>0 && current_count>0 &&
+    current_count<initial_count && reference_ticks>0
+}
 /// R019.5: interpret a masked APIC one-shot down-counter sample.
 /// Reject expired, stationary, and inconsistent measurements rather than
 /// accidentally treating counter wraparound as valid calibration.
@@ -535,6 +544,16 @@ mod tests {
                 vector,16,1000,500,10,100,100
             ),None);
         }
+    }
+    #[test]
+    fn calibration_window_requires_bounded_nonzero_progress(){
+        assert!(xapic_calibration_window_valid(1000,999,1));
+        assert!(xapic_calibration_window_valid(u32::MAX,1,u64::MAX));
+        assert!(!xapic_calibration_window_valid(0,0,1));
+        assert!(!xapic_calibration_window_valid(1000,1000,1));
+        assert!(!xapic_calibration_window_valid(1000,1001,1));
+        assert!(!xapic_calibration_window_valid(1000,0,1));
+        assert!(!xapic_calibration_window_valid(1000,500,0));
     }
     #[test]
     fn oneshot_samples_are_bounded(){
