@@ -1,0 +1,73 @@
+name: IndianOS Agent X - Free Local Model Prototype
+
+on:
+  workflow_run:
+    workflows: ["IndianOS kernel boot (x86-64)"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "Completed kernel workflow run ID"
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: indianos-local-agent
+  cancel-in-progress: false
+
+jobs:
+  agent-x:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.head_repository.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Fetch completed CI context
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_RUN_ID: ${{ github.event.workflow_run.id }}
+          MANUAL_RUN_ID: ${{ inputs.run_id }}
+        run: |
+          set -euo pipefail
+          RUN_ID="$EVENT_RUN_ID"
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then RUN_ID="$MANUAL_RUN_ID"; fi
+          [[ "$RUN_ID" =~ ^[0-9]+$ ]] || exit 1
+          gh api "repos/$REPO/actions/runs/$RUN_ID" > /tmp/ci-run.json
+          [[ "$(jq -r .head_branch /tmp/ci-run.json)" == "main" ]] || exit 1
+          [[ "$(jq -r .status /tmp/ci-run.json)" == "completed" ]] || exit 1
+          gh api --paginate "repos/$REPO/actions/runs/$RUN_ID/jobs?per_page=100" > /tmp/ci-jobs.json
+          python3 tools/agent_x_ci_context.py /tmp/ci-run.json /tmp/ci-jobs.json > /tmp/agent-prompt.txt
+      - name: Build CPU-only llama.cpp
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/ggml-org/llama.cpp.git /tmp/llama.cpp
+          cmake -S /tmp/llama.cpp -B /tmp/llama-build -DGGML_NATIVE=OFF -DLLAMA_CURL=ON -DCMAKE_BUILD_TYPE=Release
+          cmake --build /tmp/llama-build --target llama-cli -j 4
+      - name: Analyze CI with free coding model (no credentials)
+        run: |
+          set -euo pipefail
+          timeout 600 /tmp/llama-build/bin/llama-cli \
+            -hf bartowski/Qwen2.5-Coder-1.5B-Instruct-GGUF:Q4_K_M \
+            -f /tmp/agent-prompt.txt -n 600 -c 4096 --temp 0.1 \
+            --no-display-prompt > agent-x-report.txt
+          cat agent-x-report.txt >> "$GITHUB_STEP_SUMMARY"
+      - name: Preserve Agent X diagnosis
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-x-ci-diagnosis
+          path: agent-x-report.txt
+          if-no-files-found: ignore
+          retention-days: 7
+
+# Deliberately read-only until model reliability, test gates, and safe
+# bounded patch application are demonstrated. Never execute model output.
