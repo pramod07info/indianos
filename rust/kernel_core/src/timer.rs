@@ -352,6 +352,19 @@ pub unsafe extern "C" fn x86_64_xapic_timer_start_calibrated(
     }
     true
 }
+/// R019.7: sample the current count of a prepared, masked xAPIC timer.
+/// Returns zero when unbound, unprepared, or unmasked; a zero count is not
+/// usable for calibration. Does not start or acknowledge any interrupt.
+/// # Safety
+/// Ring0 BSP only, with interrupts disabled and the UC mapping alive.
+#[no_mangle]
+pub unsafe extern "C" fn x86_64_xapic_timer_sample_masked()->u32{
+    if !XAPIC_TIMER_ARMED.load(Ordering::Acquire){return 0;}
+    let Some(lvt)=xapic_reg(XAPIC_LVT_TIMER_OFFSET)else{return 0;};
+    let Some(current)=xapic_reg(XAPIC_TIMER_CURRENT_OFFSET)else{return 0;};
+    if unsafe{core::ptr::read_volatile(lvt)}&(1<<16)==0{return 0;}
+    unsafe{core::ptr::read_volatile(current)}
+}
 /// R019.6: stop the experimental APIC timer without touching PIC IRQ0.
 /// # Safety
 /// BSP ring0 only, interrupts disabled, with the validated UC APIC page
