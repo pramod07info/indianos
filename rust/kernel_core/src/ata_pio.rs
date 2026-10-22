@@ -103,7 +103,9 @@ impl AtaPio {
     fn select(&self,lba:u64,command:u8)->Result<(),BlockError>{
         check_range(self.sectors,lba,1)?;
         if lba>=MAX_LBA28{return Err(BlockError::OutOfRange);}
-        ready(false)?;
+        // A preceding PIO read may have deasserted BSY before its final
+        // DRQ transition. Never program a new command until DRQ clears.
+        complete()?;
         unsafe{
             outb(DRIVE,0xe0|((lba>>24) as u8&0x0f));
         }
@@ -127,7 +129,9 @@ impl BlockDevice for AtaPio {
             let value=unsafe{inw(DATA)}.to_le_bytes();
             pair.copy_from_slice(&value);
         }
-        ready(false)
+        // All 256 words must be consumed and DRQ deasserted before
+        // issuing the next command (especially WRITE SECTORS).
+        complete()
     }
     fn write_sector(&mut self,lba:u64,data:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
         self.select(lba,0x30)?;
