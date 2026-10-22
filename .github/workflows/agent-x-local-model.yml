@@ -41,6 +41,12 @@ jobs:
           RUN_ID="$EVENT_RUN_ID"
           if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then RUN_ID="$MANUAL_RUN_ID"; fi
           [[ "$RUN_ID" =~ ^[0-9]+$ ]] || exit 1
+          if [[ "$EVENT_NAME" == "workflow_run" ]]; then
+            # Agent Y run completed: resolve the matching kernel CI run by SHA.
+            Y_SHA="$(jq -r .workflow_run.head_sha "$GITHUB_EVENT_PATH")"
+            RUN_ID="$(gh api "repos/$REPO/actions/workflows/kernel-boot.yml/runs?branch=main&per_page=30" --jq '.workflow_runs[] | select(.status == "completed") | [.id, .head_sha] | @tsv' | awk -v sha="$Y_SHA" '$2 == sha { print $1; exit }')"
+            [[ "$RUN_ID" =~ ^[0-9]+$ ]] || { echo "No completed kernel CI run for Agent Y commit $Y_SHA"; exit 1; }
+          fi
           gh api "repos/$REPO/actions/runs/$RUN_ID" > /tmp/ci-run.json
           [[ "$(jq -r .head_branch /tmp/ci-run.json)" == "main" ]] || exit 1
           [[ "$(jq -r .status /tmp/ci-run.json)" == "completed" ]] || exit 1
