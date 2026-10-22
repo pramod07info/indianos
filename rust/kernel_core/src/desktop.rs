@@ -81,7 +81,7 @@ impl Desktop{
         Ok(())
     }
     pub fn focused(&self)->Option<u32>{self.focused}
-    pub fn windows(&self)->impl Iterator<Item=&Window>{
+    pub fn windows(&self)->impl DoubleEndedIterator<Item=&Window> + ExactSizeIterator + '_{
         self.windows[..self.count].iter().filter_map(Option::as_ref)
     }
     pub fn hit_test(&self,x:i32,y:i32)->Option<u32>{
