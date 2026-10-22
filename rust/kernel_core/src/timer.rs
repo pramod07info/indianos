@@ -96,6 +96,32 @@ pub extern "C" fn x86_64_timer_pic_in_service()->u8{
     outb(PIC1_CMD,0x0a);
     isr
 }
+/// R019.2: classify why a legacy IRQ0 may not reach the CPU.
+/// This is a read-only diagnostic; it does not enable, acknowledge or reroute IRQs.
+/// Bit 0: IRQ0 masked, bit 1: pending without PIC acknowledgement,
+/// bit 2: PIC servicing IRQ0, bit 3: local APIC still enabled,
+/// bit 4: firmware started in x2APIC mode.
+pub const fn legacy_irq0_blockers(
+    irr:u8,isr:u8,mask:u8,current_apic:u8,initial_apic:u8,
+)->u8{
+    let mut result=0u8;
+    if mask&1!=0{result|=1;}
+    if irr&1!=0 && isr&1==0{result|=2;}
+    if isr&1!=0{result|=4;}
+    if current_apic&3!=0{result|=8;}
+    if initial_apic&2!=0{result|=16;}
+    result
+}
+/// Read-only snapshot for the optional QEMU preemption experiment.
+#[no_mangle]
+pub extern "C" fn x86_64_timer_irq0_blockers()->u8{
+    if !CONFIGURED.load(Ordering::Relaxed){return 0;}
+    legacy_irq0_blockers(
+        x86_64_timer_pic_pending(),x86_64_timer_pic_in_service(),
+        x86_64_timer_pic_mask(),x86_64_timer_apic_mode_flags(),
+        x86_64_timer_initial_apic_mode()
+    )
+}
 /// Decode the master PIC's IRQ0 state without conflating pending and
 /// in-service interrupts. This does not establish CPU IRQ delivery.
 pub const fn irq0_state(irr:u8,isr:u8,mask:u8)->u8{
@@ -266,6 +292,15 @@ pub extern "C" fn x86_64_timer_pic_mask()->u8{
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn legacy_irq0_blockers_are_independent_and_read_only(){
+        assert_eq!(legacy_irq0_blockers(0,0,0,0,0),0);
+        assert_eq!(legacy_irq0_blockers(1,0,0,0,0),2);
+        assert_eq!(legacy_irq0_blockers(1,1,0,0,0),4);
+        assert_eq!(legacy_irq0_blockers(0,0,1,0,0),1);
+        assert_eq!(legacy_irq0_blockers(1,0,1,1,2),27);
+        assert_eq!(legacy_irq0_blockers(2,2,2,0,0),0);
+    }
     #[test]
     fn irq0_diagnostics_distinguish_pending_in_service_and_masked(){
         assert_eq!(irq0_state(0,0,0),0);
