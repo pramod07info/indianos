@@ -75,6 +75,7 @@ unsafe extern "C"{
  #[cfg(feature="preempt")] fn x86_64_timer_pic_mask()->u8;
  #[cfg(feature="preempt")] fn x86_64_timer_pic_pending()->u8;
  #[cfg(feature="preempt")] fn x86_64_timer_irq0_state()->u8;
+ #[cfg(feature="preempt")] fn x86_64_timer_apic_mode_flags()->u8;
 }
 fn log(b:&'static [u8]){unsafe{serial_write(b.as_ptr().cast())}}
 fn pid_log(pid:u32,event:&'static [u8]){
@@ -570,6 +571,14 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
  {
   if unsafe{x86_64_timer_irq_count()}==0{
    log(b"IndianOS: M009 PIC/PIT delivered zero timer IRQs\n\0");
+   let apic=unsafe{x86_64_timer_apic_mode_flags()};
+   if apic&2!=0{
+    log(b"IndianOS: M010 x2APIC mode active\n\0")
+   }else if apic&1!=0{
+    log(b"IndianOS: M010 xAPIC mode active\n\0")
+   }else{
+    log(b"IndianOS: M010 local APIC disabled\n\0")
+   }
    let irq0=unsafe{x86_64_timer_irq0_state()};
    if irq0&4!=0{
     log(b"IndianOS: M010 PIC IRQ0 unexpectedly masked\n\0")
