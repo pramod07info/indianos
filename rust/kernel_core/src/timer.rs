@@ -232,6 +232,27 @@ pub const fn xapic_calibrated_count(
     if count==0 || count>u32::MAX as u128{return None;}
     Some(count as u32)
 }
+/// R019.5: interpret a masked APIC one-shot down-counter sample.
+/// Reject expired, stationary, and inconsistent measurements rather than
+/// accidentally treating counter wraparound as valid calibration.
+pub const fn xapic_oneshot_elapsed(initial:u32,current:u32)->Option<u64>{
+    if initial==0 || current==0 || current>=initial{return None;}
+    Some((initial-current) as u64)
+}
+/// Construct a periodic configuration from measured APIC and reference ticks.
+/// This is pure validation; the caller is responsible for safe hardware reads.
+pub const fn xapic_config_from_samples(
+    vector:u8,divisor:u32,initial:u32,current:u32,
+    reference_ticks:u64,reference_hz:u64,target_hz:u32,
+)->Option<XapicPeriodicConfig>{
+    let elapsed=match xapic_oneshot_elapsed(initial,current){
+        Some(value)=>value,None=>return None,
+    };
+    let count=match xapic_calibrated_count(
+        elapsed,reference_ticks,reference_hz,target_hz
+    ){Some(value)=>value,None=>return None};
+    xapic_periodic_config(vector,divisor,count)
+}
 /// Verify a pre-existing supervisor-only, uncacheable 4 KiB xAPIC
 /// mapping. The caller must first resolve the virtual page through the
 /// current page tables and supply the translated physical base and leaf PTE
@@ -441,6 +462,22 @@ mod tests {
         assert_eq!(xapic_calibrated_count(1,1,1,0),None);
         assert_eq!(xapic_calibrated_count(1,1,1,100),None);
         assert_eq!(xapic_calibrated_count(u64::MAX,1,u64::MAX,1),None);
+    }
+    #[test]
+    fn oneshot_samples_are_bounded(){
+        assert_eq!(xapic_oneshot_elapsed(1000,750),Some(250));
+        assert_eq!(xapic_oneshot_elapsed(1000,1000),None);
+        assert_eq!(xapic_oneshot_elapsed(1000,0),None);
+        assert_eq!(xapic_oneshot_elapsed(0,0),None);
+        assert_eq!(xapic_oneshot_elapsed(1000,1001),None);
+        let cfg=xapic_config_from_samples(
+            0x40,16,1_000_000,500_000,10_000,1_000_000,100
+        ).unwrap();
+        assert_eq!(cfg.initial_count,500_000);
+        assert_eq!(cfg.lvt,0x20040);
+        assert_eq!(xapic_config_from_samples(
+            0x40,16,1_000_000,0,10_000,1_000_000,100
+        ),None);
     }
     #[test]
     fn xapic_mapping_requires_supervisor_uc_leaf(){
