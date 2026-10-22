@@ -48,6 +48,16 @@ pub extern "C" fn indianos_r013_take_worker_request()->bool {
  unsafe {let requested=PENDING_WORKER;PENDING_WORKER=false;requested}
 }
 static mut ACTIVE_TASK:*mut Task=ptr::null_mut();
+// Quantum jobs belong to kernel-verified process IDs, not user-provided IDs.
+// Single-core runtime only; do not access this from interrupt context.
+static mut QUANTUM_JOBS:crate::quantum_service::QuantumService=
+    crate::quantum_service::QuantumService::new();
+fn cleanup_quantum_jobs(pid:u32){
+ if pid==0{return;}
+ let jobs=unsafe{&mut *ptr::addr_of_mut!(QUANTUM_JOBS)};
+ let _=jobs.process_terminated(pid);
+}
+
 static mut M009_TASKS:[MaybeUninit<Task>;TASKS]=[const{MaybeUninit::uninit()};TASKS];
 static mut LAST_VECTOR:u64=0;
 static mut LAST_ERROR:u64=0;
