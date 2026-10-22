@@ -1,0 +1,83 @@
+name: IndianOS Agent Y CI Handoff
+
+on:
+  workflow_run:
+    workflows:
+      - "IndianOS kernel boot (x86-64)"
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "Kernel CI run ID to inspect"
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+  issues: write
+
+concurrency:
+  group: indianos-agent-handoff
+  cancel-in-progress: false
+
+jobs:
+  inspect:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.head_repository.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Inspect kernel CI and publish Agent X handoff
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_RUN_ID: ${{ github.event.workflow_run.id }}
+          MANUAL_RUN_ID: ${{ inputs.run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          RUN_ID="$EVENT_RUN_ID"
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then RUN_ID="$MANUAL_RUN_ID"; fi
+          [[ "$RUN_ID" =~ ^[0-9]+$ ]] || { echo "Invalid run ID"; exit 1; }
+          gh api "repos/$REPO/actions/runs/$RUN_ID" > run.json
+          HEAD_BRANCH="$(jq -r '.head_branch' run.json)"
+          STATUS="$(jq -r '.status' run.json)"
+          CONCLUSION="$(jq -r '.conclusion // "unknown"' run.json)"
+          SHA="$(jq -r '.head_sha' run.json)"
+          URL="$(jq -r '.html_url' run.json)"
+          [[ "$HEAD_BRANCH" == "main" && "$STATUS" == "completed" ]] || { echo "Not a completed main run"; exit 0; }
+          gh api --paginate "repos/$REPO/actions/runs/$RUN_ID/jobs?per_page=100" --jq '.jobs[] | {name,conclusion,html_url,steps}' > jobs.jsonl
+          {
+            echo "## Agent Y: IndianOS kernel CI result"
+            echo
+            echo "- Commit: \`$SHA\`"
+            echo "- Result: **$CONCLUSION**"
+            echo "- Run: $URL"
+            echo
+            echo "### Jobs"
+            jq -r '"- " + .name + ": " + (.conclusion // "unknown") + " (" + .html_url + ")"' jobs.jsonl
+            echo
+            echo "### Next action for Agent X"
+            if [[ "$CONCLUSION" == "success" ]]; then
+              echo "CI passed. Select the next bounded milestone from docs/ROADMAP.md, implement tests, and commit only after review."
+            else
+              echo "CI did not pass. Inspect the failed job logs at the linked run, diagnose the cause, and fix before starting new development."
+              echo
+              echo "#### Failed steps"
+              jq -r 'select(.conclusion == "failure") | .name as $job | .steps[]? | select(.conclusion == "failure") | "- " + $job + " / " + .name' jobs.jsonl
+            fi
+            echo
+            echo "_This handoff is event-driven. Automatic code changes require a separately configured and authorized coding-agent runner._"
+          } > handoff.md
+          cat handoff.md >> "$GITHUB_STEP_SUMMARY"
+          # Keep one canonical issue for the latest result; do not create an
+          # issue for every successful push or create a self-triggering loop.
+          TITLE="IndianOS Agent X/Y CI handoff"
+          ISSUE="$(gh issue list --repo "$REPO" --state open --search "$TITLE in:title" --json number,title --jq '.[] | select(.title == "IndianOS Agent X/Y CI handoff") | .number' | head -1)"
+          if [[ -n "$ISSUE" ]]; then
+            gh issue edit "$ISSUE" --repo "$REPO" --body-file handoff.md
+          else
+            gh issue create --repo "$REPO" --title "$TITLE" --body-file handoff.md
+          fi
