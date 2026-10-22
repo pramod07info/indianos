@@ -96,7 +96,7 @@ mod tests {
             assert!(out.iter().all(|&v|v==0x55));
         }
         assert_eq!(execute_probabilities(&[VERSION,2,0,0],&mut [0;7]),Err(ProtocolError::OutputTooSmall));
-        assert_eq!(decode(&[VERSION,2,65,0]),Err(ProtocolError::TooManyGates));
+        assert_eq!(decode(&[VERSION,2,65,0]).err(),Some(ProtocolError::TooManyGates));
         assert_eq!(decode(&[VERSION,MAX_QUBITS as u8+1,0,0]).err(),Some(ProtocolError::InvalidQubit));
     }
 }
