@@ -241,6 +241,33 @@ pub const fn xapic_calibration_window_valid(
     initial_count>0 && current_count>0 &&
     current_count<initial_count && reference_ticks>0
 }
+/// R019.13: validate a hardware calibration sample and derive the periodic
+/// configuration as one fail-closed operation. The APIC counter is 32-bit,
+/// so a stopped/wrapped sample must never arm the timer.
+pub const fn xapic_checked_calibration(
+    initial:u32,current:u32,reference_ticks:u64,reference_hz:u64,
+    target_hz:u32,
+)->Option<XapicPeriodicConfig>{
+    if !xapic_calibration_window_valid(initial,current,reference_ticks){
+        return None;
+    }
+    xapic_config_from_samples(
+        0x40,16,initial,current,reference_ticks,reference_hz,target_hz
+    )
+}
+/// R019.13: ensure the periodic count cannot exceed the measured initial
+/// one-shot count when the requested period is no longer than the sample
+/// interval. This check is for test/diagnostic use, not hardware setup.
+pub const fn xapic_periodic_sample_consistent(
+    cfg:XapicPeriodicConfig,initial:u32,current:u32,
+    reference_ticks:u64,reference_hz:u64,target_hz:u32,
+)->bool{
+    let Some(expected)=xapic_checked_calibration(
+        initial,current,reference_ticks,reference_hz,target_hz
+    )else{return false;};
+    cfg.initial_count==expected.initial_count &&
+    cfg.divide==expected.divide && cfg.lvt==expected.lvt
+}
 /// R019.5: interpret a masked APIC one-shot down-counter sample.
 /// Reject expired, stationary, and inconsistent measurements rather than
 /// accidentally treating counter wraparound as valid calibration.
@@ -554,6 +581,25 @@ mod tests {
         assert!(!xapic_calibration_window_valid(1000,1001,1));
         assert!(!xapic_calibration_window_valid(1000,0,1));
         assert!(!xapic_calibration_window_valid(1000,500,0));
+    }
+    #[test]
+    fn checked_calibration_rejects_expired_and_stationary_counters(){
+        assert!(xapic_checked_calibration(1000,500,10,100,100).is_some());
+        assert!(xapic_checked_calibration(1000,0,10,100,100).is_none());
+        assert!(xapic_checked_calibration(1000,1000,10,100,100).is_none());
+        assert!(xapic_checked_calibration(1000,1001,10,100,100).is_none());
+        assert!(xapic_checked_calibration(1000,500,0,100,100).is_none());
+        assert!(xapic_checked_calibration(1000,500,10,0,100).is_none());
+        assert!(xapic_checked_calibration(1000,500,10,100,0).is_none());
+    }
+    #[test]
+    fn periodic_config_matches_calibration_sample(){
+        let cfg=xapic_checked_calibration(1000,500,10,100,100).unwrap();
+        assert_eq!(cfg.initial_count,50);
+        assert!(xapic_periodic_sample_consistent(cfg,1000,500,10,100,100));
+        assert!(!xapic_periodic_sample_consistent(cfg,1000,600,10,100,100));
+        assert!(!xapic_periodic_sample_consistent(cfg,1000,0,10,100,100));
+        assert!(!xapic_periodic_sample_consistent(cfg,1000,500,10,100,50));
     }
     #[test]
     fn oneshot_samples_are_bounded(){
