@@ -13,9 +13,15 @@ const HEIGHT_MIN:usize=480;
 const LIMIT:usize=1600;
 const GUI_ITERATIONS:u64=300_000_000;
 
+#[cfg(not(test))]
 fn log(message:&'static [u8]) {
     unsafe extern "C" {fn serial_write(message:*const core::ffi::c_char);}
     unsafe{serial_write(message.as_ptr().cast());}
+}
+#[cfg(test)]
+fn log(_message:&'static [u8]) {
+    // The host unit-test binary does not link the QEMU UART personality.
+    // Only the real kernel uses the serial_write boot symbol.
 }
 #[derive(Clone,Copy)]
 struct Palette{
