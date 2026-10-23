@@ -20,6 +20,8 @@ establish working interrupts, a desktop, or third-party application support.
 - [x] R029 actual 1280×800 QEMU framebuffer two-window composition, PS/2 mouse focus and keyboard move/minimize/restore/close with screenshot proof ([passing QEMU test](https://github.com/pramod07info/indianos/actions/runs/39941297124))
 - [x] R029 verified ring-3 ELF drawing Files/Terminal content via bounded, copied and identity-checked surface commands ([passing QEMU screenshots](https://github.com/pramod07info/indianos/actions/runs/39949896007))
 - [ ] R029 complete isolated user-space compositor, per-app surface ownership and event-driven application protocol (rendering and input broker remain kernel-owned)
+- [x] R030 developer SDK staged signed packages with Ed25519 verification, semver update, rollback and QEMU execution of exported ELF (see [R030 package acceptance](R030_SIGNED_NATIVE_PACKAGES.md))
+- [ ] On-device package database, runtime app launcher, per-user permissions and persistent device-backed installer
 - [ ] Normal boot launching interactive userland by default and general service management
 
 ## Implementation sequence and exit conditions
@@ -34,7 +36,7 @@ establish working interrupts, a desktop, or third-party application support.
 | R027 | P1 | **QEMU-verified** ATA LBA28 identification and durable multi-sector volume | **Verified:** five QEMU boots, file overwrites, mirrored checksummed metadata, torn-copy recovery, strict partition bounds; generic PCI/AHCI/NVMe and production storage remain unsupported |
 | R028 | P1 | **QEMU-verified** virtio-net PCI, ARP/IPv4/ICMP/UDP/DNS and bounded TCP demo | **Verified:** real QEMU guest Ethernet packets, host-validated checksums, ARP resolution, ICMP ping, UDP exchange, DNS A response, TCP handshake and reply; general sockets/routing remain pending |
 | R029 | P1 | **QEMU graphics acceptance verified; user-space compositor pending** | **Verified:** actual 1280×800 VGA framebuffer pixels, two independent windows, QEMU PS/2 mouse clicks, keyboard focus/move/minimize/restore/close and screenshot differences. Ring-3 bounded draw-command API is now QEMU-verified; independent per-app surfaces and full user-space compositor remain unfinished |
-| R030 | P1 | Native toolchain SDK, apps and verified package manager | Repeatable signed install, update, remove and rollback of native packages |
+| R030 | P1 | **Developer-host native signed package SDK** (QEMU-verification pending) | Build two real static ELF64 apps, sign with Ed25519, reject tampering/downgrades, install/update/rollback/remove in isolated staging and boot the verified versions in QEMU; no on-device installer yet |
 | R031 | P2 | Security model, authentication, updater, recovery installer | Isolation review, controlled permission tests, signed rollback and virtual-disk install |
 | R032 | P2 | Physical PC/ARM64 hardware-portability program | Published test matrix, qualified devices, measured boot/install performance |
 | R033 | P2 | Policy-gated AI app assistant | AI chooses catalog item but package verifier enforces approval, signatures, compatibility and rollback |
