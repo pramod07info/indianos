@@ -1,0 +1,158 @@
+name: IndianOS Agent X - Autonomous Kernel Development
+
+on:
+  workflow_run:
+    workflows: ["IndianOS kernel boot (x86-64)"]
+    types: [completed]
+    branches: [main]
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/agent-x-autodev.yml"
+  schedule:
+    # Recovery sweep if the chain stopped after a transient model/runner failure.
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+# Model-generated changes are confined to a new, preapproved Rust module.
+# No arbitrary LLM output is executed as a shell command.
+permissions:
+  actions: write
+  contents: write
+  issues: write
+
+concurrency:
+  group: indianos-autodev-main
+  cancel-in-progress: false
+
+jobs:
+  develop:
+    if: ${{ github.event_name != 'workflow_run' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_repository.full_name == github.repository) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Confirm latest main and prevent stale autonomous writes
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+          SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE_SHA="$(git rev-parse HEAD)"
+          REMOTE_SHA="$(gh api "repos/$REPO/branches/main" --jq .commit.sha)"
+          if [[ "$BASE_SHA" != "$REMOTE_SHA" ]]; then
+            echo "Main advanced during checkout; leaving next event to handle it."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          elif [[ "$EVENT" == "workflow_run" && "$SOURCE_SHA" != "$BASE_SHA" ]]; then
+            echo "Stale kernel CI completion; newer main commit exists."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Select next preapproved kernel milestone
+        if: steps.gate.outputs.ready == 'true'
+        id: task
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/agent_x_autodev.py prepare --prompt /tmp/agent-x-dev-prompt.txt
+
+      - name: Install Rust for validation
+        if: steps.task.outputs.selected == 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
+
+      - name: Generate Rust module using free local model
+        if: steps.task.outputs.selected == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/ggml-org/llama.cpp.git /tmp/llama.cpp
+          cmake -S /tmp/llama.cpp -B /tmp/llama-build \
+            -DGGML_NATIVE=OFF -DLLAMA_CURL=ON -DCMAKE_BUILD_TYPE=Release
+          cmake --build /tmp/llama-build --target llama-completion -j 4
+          timeout 900 /tmp/llama-build/bin/llama-completion \
+            -hf bartowski/Qwen2.5-Coder-1.5B-Instruct-GGUF:Q4_K_M \
+            -f /tmp/agent-x-dev-prompt.txt \
+            -n 2200 -c 8192 --temp 0.1 --no-display-prompt \
+            > /tmp/agent-x-raw.txt
+          python3 tools/agent_x_autodev.py apply \
+            --name "${{ steps.task.outputs.name }}" \
+            --generated /tmp/agent-x-raw.txt
+
+      - name: Validate generated Rust, kernel source ownership and kernel link
+        if: steps.task.outputs.selected == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --offline --manifest-path rust/kernel_core/Cargo.toml
+          make test-rust-source-audit
+          make kernel BUILD=build/agent-x-autodev RUST_CORE=1
+          git diff --check
+          echo "Rust tests, source audit, and freestanding kernel ELF build passed."
+
+      - name: Commit validated source to main and dispatch full kernel CI
+        if: steps.task.outputs.selected == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TASK: ${{ steps.task.outputs.name }}
+        run: |
+          set -euo pipefail
+          # Recheck the branch lease immediately before writing. Concurrent
+          # human or agent commits must not be silently overwritten.
+          [[ "$(gh api "repos/$REPO/branches/main" --jq .commit.sha)" == "$(git rev-parse HEAD)" ]] || {
+            echo "::error::Main has advanced; refusing stale autonomous commit"
+            exit 1
+          }
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "rust/kernel_core/src/$TASK.rs" rust/kernel_core/src/lib.rs
+          git diff --cached --check
+          git commit -m "Agent X: implement bounded Rust $TASK kernel milestone"
+          # The checkout has no persisted credentials during model execution.
+          BASIC="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $BASIC" \
+            push origin HEAD:refs/heads/main
+          # GITHUB_TOKEN push does not initiate regular on:push workflows.
+          # workflow_dispatch is a GitHub-supported exception: start full
+          # QEMU/kernel CI so Agent Y and Agent X receive a new completion.
+          gh workflow run kernel-boot.yml --repo "$REPO" --ref main
+          echo "Committed $TASK and dispatched mandatory kernel CI." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish failure diagnostics without committing an unverified patch
+        if: failure() && steps.task.outputs.selected == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TASK: ${{ steps.task.outputs.name }}
+        shell: bash
+        run: |
+          {
+            echo "Agent X did NOT commit the candidate for `$TASK`."
+            echo "Generation, validation, or dispatch failed; see the Actions job log."
+            echo "Source: $GITHUB_SERVER_URL/$REPO/actions/runs/$GITHUB_RUN_ID"
+          } > /tmp/agent-x-failure.md
+          gh issue create --repo "$REPO" \
+            --title "Agent X autodev blocked: $TASK (run $GITHUB_RUN_ID)" \
+            --body-file /tmp/agent-x-failure.md || true
+
+      - name: Archive limited generated output for troubleshooting
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-x-autodev-candidate
+          path: /tmp/agent-x-raw.txt
+          if-no-files-found: ignore
+          retention-days: 3
