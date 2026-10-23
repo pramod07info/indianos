@@ -37,7 +37,8 @@
 18. [Milestone 009: round-robin contexts and timer experiment](docs/MILESTONE_009_SCHEDULER.md)
 19. [Rust-first kernel rewrite (tracked migration)](docs/RUST_MIGRATION.md)
 20. [R024 xAPIC timer-driven process preemption](docs/R024_APIC_PREEMPTION.md)
-20. [Prioritized pending implementation backlog and acceptance checks](docs/IMPLEMENTATION_BACKLOG.md)
+21. [R025 authenticated ring-3 IPC](docs/R025_SECURE_IPC_SYSCALLS.md)
+22. [Prioritized pending implementation backlog and acceptance checks](docs/IMPLEMENTATION_BACKLOG.md)
 
 ## Directory plan
 
