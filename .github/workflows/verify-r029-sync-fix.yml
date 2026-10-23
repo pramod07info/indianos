@@ -1,0 +1,43 @@
+name: Verify R029 repeated-input QEMU regression
+on:
+  push:
+    branches: [fix-r029-repeated-input-sync-20261023]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify-r029:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install kernel and QEMU VGA prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld binutils xorriso qemu-system-x86 ovmf curl
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
+      - name: Unit regressions for stale repeated focus event
+        run: python3 -m unittest discover -s tools -p 'test_r029_serial_checkpoints.py' -v
+      - name: Build and test real R029 VGA keyboard and PS2 interactions twice
+        shell: bash
+        run: |
+          set -euo pipefail
+          OVMF_PATH=""
+          for f in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/edk2/ovmf/OVMF_CODE_4M.fd /usr/share/edk2/ovmf/OVMF_CODE.fd; do
+            if test -f "$f"; then OVMF_PATH="$f"; break; fi
+          done
+          test -n "$OVMF_PATH"
+          make test-r029-desktop-qemu OVMF_CODE="$OVMF_PATH"
+          make test-r029-desktop-qemu OVMF_CODE="$OVMF_PATH"
+      - name: Confirm R029 ring-3 graphics QEMU remains functional
+        shell: bash
+        run: |
+          set -euo pipefail
+          OVMF_PATH=""
+          for f in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/edk2/ovmf/OVMF_CODE_4M.fd /usr/share/edk2/ovmf/OVMF_CODE.fd; do
+            if test -f "$f"; then OVMF_PATH="$f"; break; fi
+          done
+          test -n "$OVMF_PATH"
+          make test-r029-user-surfaces-qemu OVMF_CODE="$OVMF_PATH"
