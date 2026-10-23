@@ -80,6 +80,13 @@ x86_64_apic_timer_interrupt:
     popq %rax
     iretq
 .size x86_64_apic_timer_interrupt, .-x86_64_apic_timer_interrupt
+
+/* Spurious local APIC vector: never send EOI. No GPRs are modified. */
+.global x86_64_apic_spurious_interrupt
+.type x86_64_apic_spurious_interrupt,@function
+x86_64_apic_spurious_interrupt:
+    iretq
+.size x86_64_apic_spurious_interrupt, .-x86_64_apic_spurious_interrupt
 "#,
     options(att_syntax),
 );

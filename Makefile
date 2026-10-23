@@ -857,7 +857,7 @@ test-scheduler:
 	$(MAKE) image BUILD=build/scheduler SCHEDULER_SELFTEST=1
 	$(SMOKE) --iso build/scheduler/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)" --mode scheduler
 
-test-preempt:
+test-preempt: $(SMOKE_DEPS)
 	$(MAKE) test-initramfs BUILD=build/preempt SCHEDULER_SELFTEST=1 PREEMPT_SELFTEST=1
 	$(MAKE) image BUILD=build/preempt SCHEDULER_SELFTEST=1 PREEMPT_SELFTEST=1
 	$(SMOKE) --iso build/preempt/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)" --mode preempt --machine pc --timeout 35

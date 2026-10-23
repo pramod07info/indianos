@@ -222,15 +222,16 @@ def assert_expected_scheduler(text: str) -> None:
 
 
 def assert_expected_preempt(text: str) -> None:
-    """CPU-bound user tasks must be interrupted by hardware IRQ0, not yield."""
+    """CPU-bound user tasks must be interrupted by real hardware xAPIC timer, not yield."""
     if "IndianOS: FATAL" in text:
         raise AssertionError("kernel reported fatal timer/scheduler error")
     for marker in (
         *MILESTONES,
-        "IndianOS: M009 cooperative scheduler experiment begin",
+        "IndianOS: R024 APIC preemptive scheduler experiment begin",
+        "IndianOS: R024 xAPIC supervisor UC mapping installed",
         "IndianOS: M009 two simultaneous user address spaces ready",
-        "IndianOS: M009 hardware PIT IRQ0 enabled at 100 Hz",
-        "IndianOS: M009 timer-preemptive round-robin PASSED",
+        "IndianOS: R024 calibrated periodic xAPIC IRQ at 100 Hz",
+        "IndianOS: R024 APIC timer-preemptive round-robin PASSED",
         "IndianOS: M009 scheduler experiment complete",
     ):
         if marker not in text:
@@ -239,7 +240,7 @@ def assert_expected_preempt(text: str) -> None:
         for marker in (
             f"IndianOS: PID {pid} READY",
             f"IndianOS: PID {pid} DISPATCHED",
-            f"IndianOS: PID {pid} TIMER_PREEMPTED",
+            f"IndianOS: PID {pid} APIC_TIMER_PREEMPTED",
             f"IndianOS user: M009 timer task {label} started",
             f"IndianOS user: M009 timer task {label} finished",
             f"IndianOS: PID {pid} EXITED",
@@ -247,16 +248,16 @@ def assert_expected_preempt(text: str) -> None:
         ):
             if marker not in text:
                 raise AssertionError(f"missing timer task {pid} marker: {marker}")
-    if text.count("IndianOS: PID 1 TIMER_PREEMPTED") < 1 or \
-       text.count("IndianOS: PID 2 TIMER_PREEMPTED") < 1:
+    if text.count("IndianOS: PID 1 APIC_TIMER_PREEMPTED") < 1 or \
+       text.count("IndianOS: PID 2 APIC_TIMER_PREEMPTED") < 1:
         raise AssertionError("timer did not preempt both tasks")
     if text.find("IndianOS: PID 2 DISPATCHED") > text.find("IndianOS: PID 1 EXITED"):
         raise AssertionError("task 2 was not scheduled until after task 1 exited")
     # Require observable timer-driven progress while both CPU-bound tasks
     # remain alive. Merely emitting a preemption marker after task exit is
     # insufficient evidence of concurrent scheduling.
-    first_a = text.find("IndianOS: PID 1 TIMER_PREEMPTED")
-    first_b = text.find("IndianOS: PID 2 TIMER_PREEMPTED")
+    first_a = text.find("IndianOS: PID 1 APIC_TIMER_PREEMPTED")
+    first_b = text.find("IndianOS: PID 2 APIC_TIMER_PREEMPTED")
     exit_a = text.find("IndianOS: PID 1 EXITED")
     exit_b = text.find("IndianOS: PID 2 EXITED")
     dispatch_b = text.find("IndianOS: PID 2 DISPATCHED")

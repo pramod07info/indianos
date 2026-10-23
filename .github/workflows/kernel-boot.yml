@@ -1041,9 +1041,8 @@ jobs:
           path: build/scheduler-smoke.log
           if-no-files-found: ignore
           retention-days: 7
-      - name: M009 PIT IRQ0 preemptive context switching (experimental QEMU)
+      - name: R024 required xAPIC ring-3 timer preemption (QEMU)
         id: preempt_test
-        continue-on-error: true
         run: |
           set -o pipefail
           OVMF_PATH=""
@@ -1052,7 +1051,7 @@ jobs:
           done
           test -n "$OVMF_PATH"
           make test-preempt OVMF_CODE="$OVMF_PATH" 2>&1 | tee build/preempt-smoke.log
-      - name: Publish M009 PIT preemption CI status
+      - name: Publish R024 xAPIC preemption CI status
         if: always()
         env:
           GH_TOKEN: ${{ github.token }}
@@ -1066,7 +1065,7 @@ jobs:
           repo = os.environ["GITHUB_REPOSITORY"]
           payload = json.dumps({
               "state": state, "context": "indianos/preempt-qemu",
-              "description": f"Hardware PIT IRQ0 preemption: {outcome}",
+              "description": f"R024 verified xAPIC hardware timer preemption: {outcome}",
               "target_url": (f"{os.environ['GITHUB_SERVER_URL']}/{repo}/actions/runs/"
                              f"{os.environ['GITHUB_RUN_ID']}")
           }).encode()
@@ -1076,13 +1075,13 @@ jobs:
                                      "Accept": "application/vnd.github+json",
                                      "Content-Type": "application/json"})
           with urlopen(request, timeout=20) as response:
-              print(f"M009 PIT preemption status: {state} ({response.status})")
+              print(f"R024 xAPIC preemption status: {state} ({response.status})")
           PY
-      - name: Upload M009 hardware preemption QEMU transcript
+      - name: Upload R024 APIC preemption QEMU transcript
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: indianos-m009-preempt-qemu-log
+          name: indianos-r024-apic-preempt-qemu-log
           path: build/preempt-smoke.log
           if-no-files-found: ignore
           retention-days: 7

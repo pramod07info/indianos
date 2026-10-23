@@ -251,6 +251,9 @@ pub extern "C" fn kmain()->!{
             log(b"IndianOS: FATAL M009 worker executable not found\n\0");
             halt()
         });
+        #[cfg(feature="preempt")]
+        log(b"IndianOS: R024 APIC preemptive scheduler experiment begin\n\0");
+        #[cfg(not(feature="preempt"))]
         log(b"IndianOS: M009 cooperative scheduler experiment begin\n\0");
         need(unsafe{x86_64_m009_schedule_run(init,init_size,worker,worker_size)},
              b"IndianOS: FATAL M009 cooperative context test failed\n\0");

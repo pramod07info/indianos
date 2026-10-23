@@ -13,7 +13,7 @@ establish working interrupts, a desktop, or third-party application support.
 - [x] Limited fixed-capacity IPC, capability, block, filesystem and
   interactive-console primitives with regression tests
 - [x] Absolute VFS path normalization (R021)
-- [ ] Hardware APIC timer preemption with genuine IRQ-to-context-switch proof
+- [x] R024 xAPIC timer preemption with genuine IRQ-to-context-switch proof in QEMU ([passing verification](https://github.com/pramod07info/indianos/actions/runs/39913743740))
 - [ ] Normal boot launching a persistent interactive userland service
 
 ## Implementation sequence and exit conditions
@@ -55,3 +55,18 @@ execution. Those integrations belong to R025 and require new QEMU tests.
 
 A 100% Windows/Linux/macOS/Android binary-compatibility target is not
 technically guaranteed; support must be measured app-by-app.
+
+## R024 acceptance — Verified 2026-10-23
+
+The R024 xAPIC verification job passed QEMU/OVMF and observed
+`APIC_TIMER_PREEMPTED` for both CPU-bound ring-3 PIDs before either process
+exited, scheduler resumption of both PIDs, eventual successful exits and
+memory-frame reaping. Hardware APIC vector 0x40, supervisor UC MMIO,
+PIT channel 2 timer calibration, and the spurious-vector handler are
+isolated behind the opt-in preemption test. Legacy PIC IRQ0 no longer supplies
+R024 scheduling. The main full kernel CI now treats the QEMU preemption
+step as required, not a non-blocking experiment.
+
+This verified test is specific to x86-64 QEMU/OVMF; SMP, real hardware,
+secure interrupt-controller initialization for diverse firmware and
+production-grade scheduler fairness remain unqualified.
