@@ -1,0 +1,24 @@
+name: Verify R022 filesystem and R023 process events
+on:
+  push:
+    branches: [agentx-verify-r022-r023-20261023]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  rust-kernel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
+      - name: Rust host regression suite
+        run: cargo test --offline --manifest-path rust/kernel_core/Cargo.toml
+      - name: Freestanding kernel-core compile
+        run: cargo build --offline --manifest-path rust/kernel_core/Cargo.toml --no-default-features --target x86_64-unknown-none
+      - name: Agent X contract tests
+        run: python3 -m unittest discover -s tests -p 'test_agent_x_autodev.py' -v
+      - name: Enforce Rust-owned kernel source audit
+        run: make test-rust-source-audit

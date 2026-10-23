@@ -36,6 +36,7 @@
 17. [Milestone 008: PCB lifecycle and two independent user ELF processes](docs/MILESTONE_008_PROCESSES.md)
 18. [Milestone 009: round-robin contexts and timer experiment](docs/MILESTONE_009_SCHEDULER.md)
 19. [Rust-first kernel rewrite (tracked migration)](docs/RUST_MIGRATION.md)
+20. [Prioritized pending implementation backlog and acceptance checks](docs/IMPLEMENTATION_BACKLOG.md)
 
 ## Directory plan
 
