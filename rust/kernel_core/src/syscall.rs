@@ -252,11 +252,22 @@ mod tests {
         };
         assert!(check(4,0,0));
         assert!(!check(4,1,0));
-        assert!(check(8,plan.stack_begin,4));
-        assert!(check(8,USER_MIN,68));
-        assert!(!check(8,plan.stack_begin,3));
-        assert!(!check(8,plan.stack_begin,69));
-        assert!(!check(8,plan.guard_begin,4));
+        #[cfg(not(feature="test-r025"))]
+        {
+            assert!(check(8,plan.stack_begin,4));
+            assert!(check(8,USER_MIN,68));
+            assert!(!check(8,plan.stack_begin,3));
+            assert!(!check(8,plan.stack_begin,69));
+            assert!(!check(8,plan.guard_begin,4));
+        }
+        #[cfg(feature="test-r025")]
+        {
+            assert!(!check(8,plan.stack_begin,4));
+            assert!(check(8,USER_MIN,76));
+            assert!(!check(8,plan.stack_begin,11));
+            assert!(!check(8,plan.stack_begin,77));
+            assert!(!check(8,plan.guard_begin,12));
+        }
         assert!(!check(8,u64::MAX-4,8));
         assert!(check(9,plan.stack_begin,72));
         assert!(!check(9,USER_MIN,72));
