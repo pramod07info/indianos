@@ -15,6 +15,7 @@ on:
 permissions:
   actions: read
   contents: read
+  issues: write
 
 concurrency:
   group: indianos-local-agent
@@ -74,6 +75,26 @@ jobs:
             -f /tmp/agent-prompt.txt -n 600 -c 4096 --temp 0.1 \
             --no-display-prompt > agent-x-report.txt
           cat agent-x-report.txt >> "$GITHUB_STEP_SUMMARY"
+      - name: Publish actionable Agent X report
+        if: ${{ success() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## IndianOS Agent X diagnosis"
+            echo
+            echo "Source kernel CI: $(jq -r .html_url /tmp/ci-run.json)"
+            echo "Result: $(jq -r .conclusion /tmp/ci-run.json)"
+            echo
+            echo '### Agent X analysis'
+            cat agent-x-report.txt
+            echo
+            echo "This is a proposed plan, not an applied patch."
+          } > /tmp/agent-x-issue.md
+          gh issue create --repo "$REPO" --title "Agent X: CI analysis for run $(jq -r .id /tmp/ci-run.json)" --body-file /tmp/agent-x-issue.md
+
       - name: Preserve Agent X diagnosis
         if: always()
         uses: actions/upload-artifact@v4
