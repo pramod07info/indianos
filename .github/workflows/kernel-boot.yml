@@ -11,6 +11,10 @@ on:
       - "Makefile"
       - "tools/rust/**"
       - "tools/smoke_boot.py"
+      # All QEMU Python acceptance tests and regression tests must trigger
+      # the full kernel build when their assertions or inputs change.
+      - "tools/test_*.py"
+      - "tests/test_*.py"
       - "tests/test_smoke_boot.py"
       - "tests/test_pmm.c"
       - "tests/test_vmm.c"
@@ -1173,6 +1177,8 @@ jobs:
           path: build/r028-network-qemu.log
           if-no-files-found: ignore
           retention-days: 7
+      - name: R029 serial marker event-ordering unit regression
+        run: python3 -m unittest discover -s tests -p 'test_r029_serial_markers.py' -v
       - name: R029 required real VGA two-window compositor and PS2 mouse interactions (QEMU)
         run: |
           set -o pipefail
