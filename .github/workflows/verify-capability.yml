@@ -1,0 +1,22 @@
+name: Verify capability registry
+on:
+  push:
+    branches: [agentx-verify-capability-20261023]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  rust-capability:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
+      - name: Validate Agent X guard tests
+        run: python3 -m unittest discover -s tests -p "test_agent_x_autodev.py" -v
+      - name: Test kernel Rust core
+        run: cargo test --offline --manifest-path rust/kernel_core/Cargo.toml
+      - name: Check freestanding no_std build
+        run: cargo build --offline --manifest-path rust/kernel_core/Cargo.toml --no-default-features --target x86_64-unknown-none
