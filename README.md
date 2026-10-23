@@ -2,14 +2,14 @@
 
 **IndianOS** is an experimental, independent desktop operating system for x86-64 PCs, designed for approachable everyday use in India. The goal is a familiar desktop workflow, Indian-language accessibility, and a native kernel—not a Linux distribution or a copy of Microsoft Windows.
 
-> **Status (2026-10-23): R024–R028 kernel milestones verified; R029 real graphical QEMU demonstration verified.** IndianOS now has a live QEMU 1280×800 framebuffer desktop drawing two separately focused and movable windows. Physical emulated PS/2 mouse clicks and COM1 keyboard commands change actual on-screen pixels, verified by independent QEMU screenshots. R029's compositor currently executes in the privileged kernel test path, **not as an isolated userspace window server**. All graphical and networking demos are opt-in and single-CPU; IndianOS is not a production internet-enabled desktop, POSIX system, audited sandbox or hardware installer. Never flash to a physical disk.
+> **Status (2026-10-23): R024–R028 kernel milestones verified; R029 real graphical QEMU demonstration verified.** IndianOS now has a live QEMU 1280×800 framebuffer desktop drawing two separately focused and movable windows. Physical emulated PS/2 mouse clicks and COM1 keyboard commands change actual on-screen pixels, verified by independent QEMU screenshots. R029's compositor currently executes in the privileged kernel test path, **with a separate verified ring-3 surface-drawing client through bounded graphics syscalls, but not yet as a complete userspace window server**. All graphical and networking demos are opt-in and single-CPU; IndianOS is not a production internet-enabled desktop, POSIX system, audited sandbox or hardware installer. Never flash to a physical disk.
 
 ## Initial technical decisions
 
 - **Target:** x86-64, UEFI-first; QEMU is the only supported test platform initially.
 - **Kernel:** **Rust-first** `no_std` static library, with Rust-owned boot handoff, framebuffer, GDT/IDT/TSS, timer, main entry, memory management and scheduler selected by default. The active kernel now uses Rust plus two minimal x86-64 assembly entry units, with no linked C translation units. Its QEMU/OVMF regression passed on 2026-10-21.
 - **Early boot:** use the open-source **Limine bootloader** and its published protocol as a temporary, well-defined handoff layer. The bootloader is *not* the kernel.
-- **Graphics:** real pixel-composited two-window GUI with PS/2 mouse/keyboard verified in QEMU (opt-in R029 experiment). Moving the compositor to an isolated user-space window server remains required before any production desktop.
+- **Graphics:** real pixel-composited two-window GUI with PS/2 mouse/keyboard verified in QEMU (opt-in R029 experiment). A ring-3 ELF now controls limited Files/Terminal content via validated 64-byte draw commands (real QEMU pixel and memory-ownership tests); moving the full compositor, input handling, and lifecycle to a standalone user-space window server remains required before production use.
 - **Drivers:** bring up serial, framebuffer and timer first; then PCI, storage, keyboard and network devices.
 - **Compatibility:** long-term native, web, Linux, Windows, Android and authorized remote-Mac routes; **none runs on IndianOS today**. Our independent kernel does not automatically run other platforms' binaries.
 - **AI:** planned assistant-driven app discovery and secure installation via deterministic, policy-gated package services. No AI installer exists yet.
@@ -42,7 +42,8 @@
 23. [R027 durable ATA-backed filesystem and five-boot QEMU recovery](docs/R027_DURABLE_FILESYSTEM.md)
 24. [R028 verified virtio-net and packet protocol QEMU demo](docs/R028_NETWORK_QEMU.md)
 25. [R029 two-window interactive graphical framebuffer in QEMU](docs/R029_GRAPHICAL_DESKTOP.md)
-26. [Prioritized pending implementation backlog and acceptance checks](docs/IMPLEMENTATION_BACKLOG.md)
+26. [R029 user-space two-window rendering command ABI](docs/R029_RING3_SURFACES.md)
+27. [Prioritized pending implementation backlog and acceptance checks](docs/IMPLEMENTATION_BACKLOG.md)
 
 ## Directory plan
 

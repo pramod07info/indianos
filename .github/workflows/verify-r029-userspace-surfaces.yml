@@ -1,0 +1,48 @@
+name: Verify R029 real usermode graphics surfaces
+on:
+  push:
+    branches: [agentx-r029-userspace-surfaces-20261023]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  user-surfaces:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install actual QEMU and freestanding kernel toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld binutils xorriso qemu-system-x86 ovmf curl
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
+      - name: Verify all Rust unit tests and bounds protocol
+        run: cargo test --offline --manifest-path rust/kernel_core/Cargo.toml --features test-r029-userspace
+      - name: Verify host C ABI regression unchanged
+        run: make test-rust-host-abi
+      - name: Compile freestanding R029 ring-3 surface gateway
+        run: cargo build --offline --manifest-path rust/kernel_core/Cargo.toml --target x86_64-unknown-none --no-default-features --features cpu-entry,vmm,pmm,user-image,paging,paging-cpu,user-runtime,runtime,boot-staging,boot,interrupts,timer,kernel-main,limine-requests,test-r029-userspace
+      - name: Rust ownership source audit
+        run: make test-rust-source-audit
+      - name: Run actual two-window QEMU VGA with ring-3 isolated graphics client
+        shell: bash
+        env:
+          R029_USER_SCREENSHOT_DIR: build/r029-user-surface-screenshots
+        run: |
+          set -euo pipefail
+          OVMF_PATH=""
+          for f in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/edk2/ovmf/OVMF_CODE_4M.fd /usr/share/edk2/ovmf/OVMF_CODE.fd; do
+            if test -f "$f"; then OVMF_PATH="$f"; break; fi
+          done
+          test -n "$OVMF_PATH"
+          make test-r029-user-surfaces-qemu OVMF_CODE="$OVMF_PATH"
+      - name: Upload true QEMU VGA screenshots from user-mode surface client
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: indianos-r029-ring3-real-vga-screenshots
+          path: build/r029-user-surface-screenshots/*.ppm
+          if-no-files-found: ignore
+          retention-days: 7

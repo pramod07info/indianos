@@ -35,6 +35,8 @@ test-r027-durable = []
 test-r028-network = []
 # QEMU-exclusive mapped framebuffer GUI + polling PS/2 mouse and serial keyboard.
 test-r029-desktop = ["test-interactive","kernel-main"]
+# Ring-3 window-command client; framebuffer remains kernel-owned.
+test-r029-userspace = ["test-r029-desktop","test-ring3"]
 test-ud2 = []
 test-pagefault = []
 test-shadow = []

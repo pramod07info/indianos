@@ -91,6 +91,12 @@ pub unsafe extern "C" fn indianos_syscall_validate(
         4 => request.arg0 == 0 && request.arg1 == 0, // GETPID
         #[cfg(feature = "test-shell")]
         5 => request.arg0 == 1 && request.arg1 == 0, // allowlisted /bin/worker
+        #[cfg(feature="test-r029-userspace")]
+        18 => request.arg1==64 && user_range(plan,request.arg0,64,false),
+        #[cfg(feature="test-r029-userspace")]
+        19 => (1..=2).contains(&request.arg0) && request.arg1==0,
+        #[cfg(feature="test-r029-userspace")]
+        20 => request.arg0==0 && request.arg1==0,
         #[cfg(feature = "test-r026")]
         16 | 17 => request.arg0 == 2 && request.arg1 == 0, // worker status/reap query
         #[cfg(feature="test-interactive")]
@@ -198,6 +204,31 @@ mod tests {
         assert!(!check(SyscallRequest { number: 3, arg0: 1, arg1: 0 }));
     }
 
+    #[cfg(feature="test-r029-userspace")]
+    #[test]
+    fn ring3_graphics_syscall_rejects_bad_identity_buffer_and_lengths(){
+        let plan=ProgramPlan{
+            entry:USER_MIN,stack_begin:USER_TOP-STACK_BYTES,
+            stack_end:USER_TOP,guard_begin:USER_TOP-STACK_BYTES-PAGE_BYTES,
+            segment_count:0,segments:[ProgramSegment::empty();MAX_SEGMENTS]
+        };
+        let check=|number,arg0,arg1|unsafe{
+            indianos_syscall_validate(&plan,SyscallRequest{number,arg0,arg1})
+        };
+        assert!(check(18,plan.stack_begin,64));
+        assert!(!check(18,plan.stack_begin,63));
+        assert!(!check(18,plan.stack_begin,65));
+        assert!(!check(18,plan.guard_begin,64));
+        assert!(!check(18,USER_TOP-63,64));
+        assert!(!check(18,u64::MAX-10,64));
+        assert!(check(19,1,0));
+        assert!(check(19,2,0));
+        assert!(!check(19,3,0));
+        assert!(!check(19,1,1));
+        assert!(check(20,0,0));
+        assert!(!check(20,1,0));
+        assert!(!check(20,0,1));
+    }
     #[cfg(feature = "test-shell")]
     #[test]
     fn shell_abi_rejects_invalid_program_ids_and_arguments() {

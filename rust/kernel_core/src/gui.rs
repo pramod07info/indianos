@@ -139,6 +139,127 @@ impl Surface{
         self.fill(mouse_x-1,mouse_y-1,3,3,p.white);
     }
 }
+// R029 second acceptance: independently mapped ring-3 /bin/init owns surface
+// *commands*, never the framebuffer mapping. The kernel alone clips, paints,
+// validates privilege, and keeps a replayable eight-command backing store.
+#[cfg(feature="test-r029-userspace")]
+use crate::gui_protocol::{Command as UserCommand,FILL,TEXT,COMMAND_LIMIT};
+#[cfg(feature="test-r029-userspace")]
+struct UserSurfaceService{
+    session:Session,
+    commands:[[UserCommand;COMMAND_LIMIT];2],
+    counts:[usize;2],
+    focused:u32,
+}
+#[cfg(feature="test-r029-userspace")]
+static mut USER_SURFACE_SERVICE:Option<UserSurfaceService>=None;
+#[cfg(feature="test-r029-userspace")]
+impl UserSurfaceService{
+    fn new(w:u32,h:u32)->Option<Self>{
+        let session=Session::new(w,h)?;
+        if session.files!=1||session.terminal!=2{return None;}
+        Some(Self{session,
+            commands:[[UserCommand::EMPTY;COMMAND_LIMIT];2],
+            counts:[0,0],focused:0})
+    }
+    fn window(&self,id:u32)->Option<crate::desktop::Window>{
+        self.session.desktop.windows().find(|w|w.id==id).copied()
+    }
+    fn client_bounds(&self,id:u32)->Option<(i32,i32,u32,u32)>{
+        let w=self.window(id)?;
+        let inner_w=w.bounds.width.checked_sub(18)?;
+        let inner_h=w.bounds.height.checked_sub(54)?;
+        Some((w.bounds.x+9,w.bounds.y+44,inner_w,inner_h))
+    }
+    fn redraw(&self)->bool{
+        let Some(mut out)=Surface::from_boot()else{return false;};
+        let palette=out.palette;
+        // Paint desktop chrome, then each window AND its user commands in
+        // the same z-order. A rear window can never paint over front chrome.
+        out.fill(0,0,out.width as u32,out.height as u32,palette.bg);
+        out.fill(0,0,out.width as u32,48,palette.top);
+        out.text(20,18,b"INDIANOS DESKTOP",palette.white);
+        out.fill(0,(out.height-42) as i32,out.width as u32,42,palette.bar);
+        out.fill(20,(out.height-34) as i32,90,25,palette.title);
+        out.text(30,(out.height-29) as i32,b"APPS",palette.white);
+        for window in self.session.desktop.windows(){
+            out.draw_window(*window,self.session.desktop.focused()==Some(window.id));
+            let Some((origin_x,origin_y,_,_))=self.client_bounds(window.id)
+                else{return false;};
+            let slot=window.id as usize-1;
+            for command in &self.commands[slot][..self.counts[slot]]{
+                let rgb=command.rgb;
+                let Some(color)=boot::desktop_rgb(
+                    ((rgb>>16)&0xff) as u8,((rgb>>8)&0xff) as u8,(rgb&0xff) as u8
+                )else{return false;};
+                let x=origin_x+command.x as i32;
+                let y=origin_y+command.y as i32;
+                match command.operation{
+                    FILL=>out.fill(x,y,command.width as u32,command.height as u32,color),
+                    TEXT=>out.text(x,y,&command.text[..command.text_len as usize],color),
+                    _=>return false,
+                }
+            }
+        }
+        out.fill(self.session.mouse_x-1,self.session.mouse_y-10,3,21,palette.accent);
+        out.fill(self.session.mouse_x-10,self.session.mouse_y-1,21,3,palette.accent);
+        out.fill(self.session.mouse_x-1,self.session.mouse_y-1,3,3,palette.white);
+        true
+    }
+    fn submit(&mut self,bytes:&[u8;64])->bool{
+        let Ok(cmd)=UserCommand::parse(bytes)else{return false;};
+        let slot=cmd.window as usize-1;
+        let Some((_,_,width,height))=self.client_bounds(cmd.window)else{return false;};
+        if !cmd.within_client(width,height) || self.counts[slot]>=COMMAND_LIMIT{
+            return false;
+        }
+        self.commands[slot][self.counts[slot]]=cmd;
+        self.counts[slot]+=1;
+        if self.redraw(){true}else{self.counts[slot]-=1;false}
+    }
+    fn focus(&mut self,id:u32)->bool{
+        if self.session.focus(id)==false{return false;}
+        if !self.redraw(){return false;}
+        self.focused+=1;true
+    }
+}
+#[cfg(feature="test-r029-userspace")]
+fn user_service()->Option<&'static mut UserSurfaceService>{
+    // Single BSP, interrupt masked, and no recursive caller permitted.
+    unsafe{(&mut *ptr::addr_of_mut!(USER_SURFACE_SERVICE)).as_mut()}
+}
+#[cfg(feature="test-r029-userspace")]
+pub(crate) fn user_surface_start()->bool{
+    let Some(f)=Surface::from_boot()else{return false;};
+    let Some(svc)=UserSurfaceService::new(f.width as u32,f.height as u32)else{return false;};
+    if !svc.redraw(){return false;}
+    unsafe{USER_SURFACE_SERVICE=Some(svc);}
+    log(b"IndianOS: R029 ring3 surface server shows two framebuffer windows\n\0");
+    true
+}
+#[cfg(feature="test-r029-userspace")]
+pub(crate) fn user_surface_submit(bytes:&[u8;64])->bool{
+    user_service().is_some_and(|svc|svc.submit(bytes))
+}
+#[cfg(feature="test-r029-userspace")]
+pub(crate) fn user_surface_focus(id:u32)->bool{
+    user_service().is_some_and(|svc|svc.focus(id))
+}
+#[cfg(feature="test-r029-userspace")]
+pub(crate) fn user_surface_status()->Option<u64>{
+    let svc=user_service()?;
+    Some((svc.counts[0] as u64) |
+         ((svc.counts[1] as u64)<<8) |
+         ((svc.focused as u64)<<16) |
+         ((svc.session.desktop.focused()? as u64)<<24))
+}
+#[cfg(feature="test-r029-userspace")]
+pub(crate) fn user_surface_verified()->bool{
+    user_service().is_some_and(|svc|{
+        svc.counts==[2,2] && svc.focused>=1 &&
+        svc.session.desktop.focused()==Some(svc.session.files)
+    })
+}
 pub(crate) struct Session{
     desktop:Desktop,files:u32,terminal:u32,active:u32,
     mouse_x:i32,mouse_y:i32,was_down:bool,

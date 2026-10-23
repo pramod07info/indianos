@@ -42,6 +42,8 @@ pub mod quantum_service;
 pub mod quantum_abi;
 pub mod quantum_dispatch;
 pub mod desktop;
+#[cfg(feature="test-r029-userspace")]
+pub mod gui_protocol;
 #[cfg(feature="test-r029-desktop")]
 mod gui;
 #[cfg(feature="test-r029-desktop")]
