@@ -146,6 +146,41 @@ pub fn verify(mode:&str,text:&str)->Result<(),String>{
                 "IndianOS: R013 shell session complete",
             ]);
         }
+        "r026"=>{
+            checks.extend(MILESTONES);
+            checks.extend([
+                "IndianOS: R026 persistent init shell and on-demand worker begin",
+                "IndianOS: PID 1 READY", "IndianOS: PID 2 READY",
+                "IndianOS: R026 worker prepared but not yet runnable",
+                "IndianOS: PID 1 DISPATCHED",
+                "IndianOS user: R026 persistent interactive shell ready",
+                "IndianOS user: indianos> ",
+                "IndianOS user: R014 shell: commands help ps run /bin/worker exit",
+                "IndianOS user: indianos> ",
+                "IndianOS user: R026 shell: ps PID1 RUNNING PID2 NOT_STARTED",
+                "IndianOS user: indianos> ",
+                "IndianOS: R026 /bin/worker launch granted to PID1",
+                "IndianOS user: R026 shell: worker started; yielding to scheduler",
+                "IndianOS: PID 1 YIELDED",
+                "IndianOS: PID 2 DISPATCHED",
+                "IndianOS user: R026 /bin/worker ran in isolated ring-3 process",
+                "IndianOS: PID 2 EXITED", "IndianOS: PID 2 REAPED",
+                "IndianOS: R026 worker exited and reaped while shell remains alive",
+                "IndianOS: PID 1 DISPATCHED",
+                "IndianOS user: R026 shell: resumed after worker completion",
+                "IndianOS user: indianos> ",
+                "IndianOS user: R026 shell: ps PID1 RUNNING PID2 REAPED",
+                "IndianOS user: indianos> ",
+                "IndianOS user: R026 shell: wait /bin/worker completed",
+                "IndianOS user: indianos> ",
+                "IndianOS user: R026 shell: duplicate worker launch rejected",
+                "IndianOS user: indianos> ",
+                "IndianOS user: R026 shell: user requested shutdown",
+                "IndianOS: PID 1 EXITED", "IndianOS: PID 1 REAPED",
+                "IndianOS: R026 persistent interactive worker lifecycle PASSED",
+                "IndianOS: R026 persistent interactive shell session complete"
+            ]);
+        }
         "interactive"=>{
             checks.extend(MILESTONES);
             checks.extend([
@@ -324,6 +359,12 @@ pub fn verify(mode:&str,text:&str)->Result<(),String>{
             occurrences(text,&format!("IndianOS: PID {pid} CAPABILITIES_REVOKED"))!=1 ||
             occurrences(text,&format!("IndianOS: PID {pid} REAPED"))!=1
         })=>Err("R025 rights teardown or process lifecycle incomplete".into()),
+        "r026" if occurrences(text,"IndianOS: PID 1 REAPED")!=1 ||
+            occurrences(text,"IndianOS: PID 2 REAPED")!=1 ||
+            occurrences(text,"IndianOS: R026 /bin/worker launch granted to PID1")!=1 ||
+            occurrences(text,"IndianOS user: indianos> ")!=7 ||
+            text.find("IndianOS: PID 2 REAPED")>text.find("IndianOS: PID 1 EXITED")=>
+            Err("R026 process launch/reap or persistent console lifecycle invalid".into()),
         "ipc" if (1..=2).any(|pid|{
             occurrences(text,&format!("IndianOS: PID {pid} DISPATCHED"))!=3 ||
             occurrences(text,&format!("IndianOS: PID {pid} YIELDED"))!=2 ||
@@ -345,7 +386,7 @@ pub fn verify(mode:&str,text:&str)->Result<(),String>{
                 _=>true
             }
         }=>Err("both CPU-bound tasks must be preempted before either exits".into()),
-        "processes"|"scheduler"|"preempt"|"ipc"|"r025" if text.contains("IndianOS: PID 1 FAULTED") ||
+        "processes"|"scheduler"|"preempt"|"ipc"|"r025"|"r026" if text.contains("IndianOS: PID 1 FAULTED") ||
               text.contains("IndianOS: PID 2 FAULTED")=>
             Err("successful task unexpectedly faulted".into()),
         _=>Ok(())
@@ -381,7 +422,7 @@ pub fn run(args:&[String])->Result<String,String>{
     }
     // Reject unknown modes before starting QEMU.
     if !["normal","exception","pagefault","shadow","usermode",
-         "fault-guard","fault-supervisor","processes","scheduler","preempt","ipc","r025","shell","interactive","keyboard"].contains(&mode.as_str()){
+         "fault-guard","fault-supervisor","processes","scheduler","preempt","ipc","r025","shell","interactive","keyboard","r026"].contains(&mode.as_str()){
         return Err("invalid QEMU smoke mode".into())
     }
 
@@ -419,10 +460,10 @@ pub fn run(args:&[String])->Result<String,String>{
         command.args(["-monitor","none"]);None
     };
     let _cleanup=tmp;
-    let mut child=command.stdin(if mode=="interactive"{Stdio::piped()}else{Stdio::null()}).stdout(Stdio::piped())
+    let mut child=command.stdin(if mode=="interactive"||mode=="r026"{Stdio::piped()}else{Stdio::null()}).stdout(Stdio::piped())
         .stderr(Stdio::null()).spawn().map_err(|e|format!("cannot start QEMU: {e}"))?;
     let stdout=child.stdout.take().ok_or("no QEMU stdout")?;
-    let mut stdin=if mode=="interactive"{child.stdin.take()}else{None};
+    let mut stdin=if mode=="interactive"||mode=="r026"{child.stdin.take()}else{None};
     #[cfg(unix)]
     let mut monitor=if let Some(path)=monitor_path.as_ref(){
         let mut found=None;
@@ -443,7 +484,9 @@ pub fn run(args:&[String])->Result<String,String>{
     };
     // Each QEMU UART RX FIFO has a finite depth: send one short command
     // only after the previous reply causes another visible shell prompt.
-    let script:[&[u8];4]=[b"helpx\x7f\n",b"ps\n",b"run /bin/worker\n",b"exit\n"];
+    let legacy_script:[&[u8];4]=[b"helpx\x7f\n",b"ps\n",b"run /bin/worker\n",b"exit\n"];
+    let r026_script:[&[u8];7]=[b"help\n",b"ps\n",b"run /bin/worker\n",b"ps\n",b"wait /bin/worker\n",b"run /bin/worker\n",b"exit\n"];
+    let script:&[&[u8]]=if mode=="r026"{&r026_script}else{&legacy_script};
     let mut sent=0usize;
     let (tx,rx)=mpsc::channel::<Vec<u8>>();
     let reader=thread::spawn(move || {
@@ -461,11 +504,11 @@ pub fn run(args:&[String])->Result<String,String>{
             Ok(part)=>{
                 output.extend(part);
                 if output.len()>1024*1024 {break}
-                if mode=="interactive" || mode=="keyboard"{
+                if mode=="interactive" || mode=="keyboard" || mode=="r026"{
                     let prompts=occurrences(&String::from_utf8_lossy(&output),
                                             "IndianOS user: indianos> ");
                     while sent<prompts && sent<script.len(){
-                        if mode=="interactive"{
+                        if mode=="interactive"||mode=="r026"{
                             let pipe=stdin.as_mut().ok_or("QEMU console stdin missing")?;
                             pipe.write_all(script[sent]).map_err(|e|format!("QEMU console send: {e}"))?;
                             pipe.flush().map_err(|e|format!("QEMU console flush: {e}"))?;
