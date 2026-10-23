@@ -145,11 +145,14 @@ impl Surface{
 #[cfg(feature="test-r029-userspace")]
 use crate::gui_protocol::{Command as UserCommand,FILL,TEXT,COMMAND_LIMIT};
 #[cfg(feature="test-r029-userspace")]
+use crate::gui_broker::{Broker,Event as GuiEvent};
+#[cfg(feature="test-r029-userspace")]
 struct UserSurfaceService{
     session:Session,
     commands:[[UserCommand;COMMAND_LIMIT];2],
     counts:[usize;2],
     focused:u32,
+    broker:Broker<2,8>,
 }
 #[cfg(feature="test-r029-userspace")]
 static mut USER_SURFACE_SERVICE:Option<UserSurfaceService>=None;
@@ -158,9 +161,12 @@ impl UserSurfaceService{
     fn new(w:u32,h:u32)->Option<Self>{
         let session=Session::new(w,h)?;
         if session.files!=1||session.terminal!=2{return None;}
+        let mut broker=Broker::new();
+        broker.grant(1,session.files).ok()?;
+        broker.grant(1,session.terminal).ok()?;
         Some(Self{session,
             commands:[[UserCommand::EMPTY;COMMAND_LIMIT];2],
-            counts:[0,0],focused:0})
+            counts:[0,0],focused:0,broker})
     }
     fn window(&self,id:u32)->Option<crate::desktop::Window>{
         self.session.desktop.windows().find(|w|w.id==id).copied()
@@ -206,8 +212,9 @@ impl UserSurfaceService{
         out.fill(self.session.mouse_x-1,self.session.mouse_y-1,3,3,palette.white);
         true
     }
-    fn submit(&mut self,bytes:&[u8;64])->bool{
+    fn submit(&mut self,pid:u32,bytes:&[u8;64])->bool{
         let Ok(cmd)=UserCommand::parse(bytes)else{return false;};
+        if !self.broker.owns(pid,cmd.window){return false;}
         let slot=cmd.window as usize-1;
         let Some((_,_,width,height))=self.client_bounds(cmd.window)else{return false;};
         if !cmd.within_client(width,height) || self.counts[slot]>=COMMAND_LIMIT{
@@ -217,9 +224,11 @@ impl UserSurfaceService{
         self.counts[slot]+=1;
         if self.redraw(){true}else{self.counts[slot]-=1;false}
     }
-    fn focus(&mut self,id:u32)->bool{
-        if self.session.focus(id)==false{return false;}
+    fn focus(&mut self,pid:u32,id:u32)->bool{
+        if !self.broker.can_post(pid,id){return false;}
+        if !self.session.focus(id){return false;}
         if !self.redraw(){return false;}
+        if self.broker.post_focus(pid,id).is_err(){return false;}
         self.focused+=1;true
     }
 }
@@ -238,20 +247,29 @@ pub(crate) fn user_surface_start()->bool{
     true
 }
 #[cfg(feature="test-r029-userspace")]
-pub(crate) fn user_surface_submit(bytes:&[u8;64])->bool{
-    user_service().is_some_and(|svc|svc.submit(bytes))
+pub(crate) fn user_surface_submit(pid:u32,bytes:&[u8;64])->bool{
+    user_service().is_some_and(|svc|svc.submit(pid,bytes))
 }
 #[cfg(feature="test-r029-userspace")]
-pub(crate) fn user_surface_focus(id:u32)->bool{
-    user_service().is_some_and(|svc|svc.focus(id))
+pub(crate) fn user_surface_focus(pid:u32,id:u32)->bool{
+    user_service().is_some_and(|svc|svc.focus(pid,id))
 }
 #[cfg(feature="test-r029-userspace")]
-pub(crate) fn user_surface_status()->Option<u64>{
+pub(crate) fn user_surface_status(pid:u32)->Option<u64>{
     let svc=user_service()?;
+    if !svc.broker.known(pid){return None;}
     Some((svc.counts[0] as u64) |
          ((svc.counts[1] as u64)<<8) |
          ((svc.focused as u64)<<16) |
          ((svc.session.desktop.focused()? as u64)<<24))
+}
+#[cfg(feature="test-r029-userspace")]
+pub(crate) fn user_surface_peek(pid:u32)->Option<GuiEvent>{
+    user_service()?.broker.peek(pid).ok()
+}
+#[cfg(feature="test-r029-userspace")]
+pub(crate) fn user_surface_ack(pid:u32,sequence:u32)->bool{
+    user_service().is_some_and(|svc|svc.broker.ack(pid,sequence).is_ok())
 }
 #[cfg(feature="test-r029-userspace")]
 pub(crate) fn user_surface_verified()->bool{

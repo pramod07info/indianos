@@ -1,0 +1,46 @@
+name: Verify R029.1 process-owned GUI and events
+on:
+  push:
+    branches: [agentx-r029-owned-events-20261023]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  gui-owned-events:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install QEMU and cross-build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld binutils xorriso qemu-system-x86 ovmf curl
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
+      - name: Run authenticated window and bounded mailbox unit tests
+        run: cargo test --offline --manifest-path rust/kernel_core/Cargo.toml --features test-r029-userspace
+      - name: Verify C ABI, Rust source audit and freestanding target
+        run: |
+          make test-rust-host-abi
+          make test-rust-source-audit
+          cargo build --offline --manifest-path rust/kernel_core/Cargo.toml --target x86_64-unknown-none --no-default-features --features cpu-entry,vmm,pmm,user-image,paging,paging-cpu,user-runtime,runtime,boot-staging,boot,interrupts,timer,kernel-main,limine-requests,test-r029-userspace
+      - name: Verify ring-3 owned focus events with true VGA QEMU screenshots
+        shell: bash
+        env:
+          R029_USER_SCREENSHOT_DIR: build/r029-user-surface-screenshots
+        run: |
+          set -euo pipefail
+          OVMF_PATH=""
+          for f in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/edk2/ovmf/OVMF_CODE_4M.fd /usr/share/edk2/ovmf/OVMF_CODE.fd; do
+            if test -f "$f"; then OVMF_PATH="$f"; break; fi
+          done
+          test -n "$OVMF_PATH"
+          make test-r029-user-surfaces-qemu OVMF_CODE="$OVMF_PATH"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: r029-1-real-qemu-vga
+          path: build/r029-user-surface-screenshots/*.ppm
+          if-no-files-found: ignore
+          retention-days: 7

@@ -97,6 +97,8 @@ pub unsafe extern "C" fn indianos_syscall_validate(
         19 => (1..=2).contains(&request.arg0) && request.arg1==0,
         #[cfg(feature="test-r029-userspace")]
         20 => request.arg0==0 && request.arg1==0,
+        #[cfg(feature="test-r029-userspace")]
+        21 => request.arg1==16 && user_range(plan,request.arg0,16,true),
         #[cfg(feature = "test-r026")]
         16 | 17 => request.arg0 == 2 && request.arg1 == 0, // worker status/reap query
         #[cfg(feature="test-interactive")]

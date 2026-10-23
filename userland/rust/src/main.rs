@@ -273,8 +273,17 @@ fn r029_demo()->!{
     r029_draw(&r029_command(2,2,24,181,240,14,0x00ffffff,b"RING3 TERMINAL READY"));
     write(b"R029 ring3: Terminal content rendered by usermode syscall");
     r029_wait_for_host();
+    let mut ev=[0xa5u8;16];
+    if call(21,ev.as_mut_ptr() as u64,16)!=0 ||
+       ev!=[0xa5u8;16] || call(21,0,16)!=u64::MAX {exit(98);}
     if call(19,1,0)!=0 || call(19,3,0)!=u64::MAX ||
        call(20,0,0)!=(1u64<<24|1u64<<16|2u64<<8|2u64) {exit(95);}
+    if call(21,ev.as_mut_ptr() as u64,15)!=u64::MAX ||
+       call(21,ev.as_mut_ptr() as u64,16)!=16 ||
+       &ev[..12]!=&[1,0,0,0,1,0,0,0,1,0,0,0] ||
+       &ev[12..]!=&[0,0,0,0] ||
+       call(21,ev.as_mut_ptr() as u64,16)!=0 {exit(99);}
+    write(b"R029 ring3: authenticated window focus event delivered");
     let mut invalid=r029_command(1,1,1200,900,400,300,0x00445566,&[]);
     if call(18,invalid.as_ptr() as u64,64)!=u64::MAX ||
        call(18,0,64)!=u64::MAX ||
