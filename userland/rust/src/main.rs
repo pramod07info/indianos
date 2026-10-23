@@ -236,7 +236,11 @@ pub extern "C" fn _start()->!{
         if call(10,FILE_BASE+2,0)!=u64::MAX{exit(77);}
         r025_create(file,b"/p1-note",b"owned-by-one");
         r025_read(file,b"/p1-note",b"owned-by-one");
-        if r025_file(12,file,b"/p2-note",0,0)!=u64::MAX{exit(78);}
+        let mut foreign=[0xeeu8;64];
+        if r025_file(12,file,b"/p2-note",foreign.as_mut_ptr() as u64,64)!=u64::MAX ||
+           r025_file(12,file,b"/p1-note",0,64)!=u64::MAX ||
+           r025_file(11,file,b"/p1-note/../p2-note",b"x".as_ptr() as u64,1)!=u64::MAX ||
+           foreign.iter().any(|&b|b!=0xee){exit(78);}
         write(b"R025 PID1 isolated filesystem create/read verified");
         r025_send(2,send,b"cap-ping");
         write(b"R025 PID1 capability IPC ping sent");
