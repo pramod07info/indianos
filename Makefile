@@ -26,6 +26,8 @@ R028_NETWORK_TEST ?= 0
 R029_DESKTOP_TEST ?= 0
 # QEMU ring-3 surface command test; no user framebuffer mappings.
 R029_USERSPACE_TEST ?= 0
+# Native Rust SDK application packaged and verified through R030 CI.
+R030_NATIVE_TEST ?= 0
 ifeq ($(R029_USERSPACE_TEST),1)
 USERMODE_SELFTEST := 1
 endif
@@ -650,7 +652,9 @@ endif
 ifeq ($(RUST_USERLAND),1)
 # Identical expected serial messages and syscall ABI; no C/assembly
 # objects are linked into the Rust native user executable.
-ifeq ($(R029_USERSPACE_TEST),1)
+ifeq ($(R030_NATIVE_TEST),1)
+RUST_INIT_FEATURE := r030-demo
+else ifeq ($(R029_USERSPACE_TEST),1)
 RUST_INIT_FEATURE := r029-client
 else ifeq ($(R026_INTERACTIVE_TEST),1)
 RUST_INIT_FEATURE := r026-shell
