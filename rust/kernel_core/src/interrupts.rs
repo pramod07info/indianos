@@ -80,6 +80,8 @@ unsafe extern "C" {
     fn x86_64_timer_interrupt();
     #[cfg(all(feature="preempt",feature="user-runtime",feature="timer"))]
     fn x86_64_apic_timer_interrupt();
+    #[cfg(all(feature="preempt",feature="user-runtime",feature="timer"))]
+    fn x86_64_apic_spurious_interrupt();
     #[cfg(feature="test-irq-keyboard")]
     fn x86_64_keyboard_interrupt();
     fn x86_64_user_fault_handle(vector:u64,cs:u64,error:u64,cr2:u64);
@@ -133,6 +135,8 @@ pub unsafe extern "C" fn x86_64_exceptions_init()->bool{
         install_gate(0x20,x86_64_timer_interrupt as usize,0,INTERRUPT_GATE);
         #[cfg(all(feature="preempt",feature="user-runtime",feature="timer"))]
         install_gate(0x40,x86_64_apic_timer_interrupt as usize,0,INTERRUPT_GATE);
+        #[cfg(all(feature="preempt",feature="user-runtime",feature="timer"))]
+        install_gate(0xff,x86_64_apic_spurious_interrupt as usize,0,INTERRUPT_GATE);
         let idtr=DescriptorPtr{
             limit:(size_of::<IdtGate>()*256-1) as u16,
             address:ptr::addr_of!(IDT.0) as usize as u64

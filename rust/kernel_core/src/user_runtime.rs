@@ -80,14 +80,6 @@ unsafe extern "C"{
  fn x86_64_user_exit_to_kernel(status:u64)->!;
  fn x86_64_user_interrupt();
  fn x86_64_timer_ack_irq0();
- #[cfg(feature="preempt")] fn x86_64_timer_start_100hz()->bool;
- #[cfg(feature="preempt")] fn x86_64_timer_irq_count()->u64;
- #[cfg(feature="preempt")] fn x86_64_timer_pic_mask()->u8;
- #[cfg(feature="preempt")] fn x86_64_timer_pic_pending()->u8;
- #[cfg(feature="preempt")] fn x86_64_timer_irq0_state()->u8;
- #[cfg(feature="preempt")] fn x86_64_timer_irq0_blockers()->u8;
- #[cfg(feature="preempt")] fn x86_64_timer_apic_mode_flags()->u8;
- #[cfg(feature="preempt")] fn x86_64_timer_initial_apic_mode()->u8;
 }
 fn log(b:&'static [u8]){unsafe{serial_write(b.as_ptr().cast())}}
 fn pid_log(pid:u32,event:&'static [u8]){
@@ -580,6 +572,16 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
  let p=unsafe{indianos_process_create(&mut table)};
  let q=unsafe{indianos_process_create(&mut table)};
  if p.is_null()||q.is_null()||unsafe{(*p).pid}!=1||unsafe{(*q).pid}!=2{return false;}
+ #[cfg(feature="preempt")]
+ {
+  // Install UC xAPIC mapping before cloning any user CR3, otherwise
+  // the interrupt handler would access an unmapped MMIO alias.
+  if !unsafe{crate::timer::x86_64_xapic_install_uc_mapping()}{
+   log(b"IndianOS: R024 FATAL xAPIC UC mapping failed\n\0");
+   return false;
+  }
+  log(b"IndianOS: R024 xAPIC supervisor UC mapping installed\n\0");
+ }
  let before=unsafe{pmm_free_frames()};
  for i in 0..TASKS{
   unsafe{ptr::write(task_ptr(i),core::mem::zeroed())};
@@ -595,11 +597,13 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
  log(b"IndianOS: M009 two simultaneous user address spaces ready\n\0");
  #[cfg(feature="preempt")]
  {
-  if !unsafe{x86_64_timer_start_100hz()}{
-   log(b"IndianOS: M009 FATAL cannot configure PIC/PIT timer\n\0");
+  if !unsafe{crate::timer::x86_64_xapic_start_qemu_100hz()}{
+   log(b"IndianOS: R024 FATAL xAPIC/PIT2 calibration failed\n\0");
+   let _=discard(task_ptr(1),&backend,false);
+   let _=discard(task_ptr(0),&backend,false);
    return false;
   }
-  log(b"IndianOS: M009 hardware PIT IRQ0 enabled at 100 Hz\n\0");
+  log(b"IndianOS: R024 calibrated periodic xAPIC IRQ at 100 Hz\n\0");
  }
  let mut ok=true;
  while ok&&!unsafe{indianos_scheduler_all_terminal(&scheduler)}{
@@ -652,50 +656,17 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
          unsafe{pmm_free_frames()}!=before){ok=false;}
  #[cfg(feature="preempt")]
  {
-  if unsafe{x86_64_timer_irq_count()}==0{
-   log(b"IndianOS: M009 PIC/PIT delivered zero timer IRQs\n\0");
-   let initial_apic=unsafe{x86_64_timer_initial_apic_mode()};
-   if initial_apic&2!=0{
-    log(b"IndianOS: M010 firmware x2APIC mode active\n\0")
-   }else if initial_apic&1!=0{
-    log(b"IndianOS: M010 firmware xAPIC mode active\n\0")
-   }else{
-    log(b"IndianOS: M010 firmware local APIC disabled\n\0")
-   }
-   let apic=unsafe{x86_64_timer_apic_mode_flags()};
-   if apic&2!=0{
-    log(b"IndianOS: M010 x2APIC mode active\n\0")
-   }else if apic&1!=0{
-    log(b"IndianOS: M010 xAPIC mode active\n\0")
-   }else{
-    log(b"IndianOS: M010 local APIC disabled\n\0")
-   }
-   let blockers=unsafe{x86_64_timer_irq0_blockers()};
-   if blockers&1!=0{log(b"IndianOS: R019 IRQ0 masked at PIC\n\0");}
-   if blockers&2!=0{log(b"IndianOS: R019 IRQ0 pending but not in service\n\0");}
-   if blockers&4!=0{log(b"IndianOS: R019 IRQ0 in PIC service\n\0");}
-   if blockers&8!=0{log(b"IndianOS: R019 local APIC still enabled\n\0");}
-   if blockers&16!=0{log(b"IndianOS: R019 firmware initially used x2APIC\n\0");}
-   let irq0=unsafe{x86_64_timer_irq0_state()};
-   if irq0&4!=0{
-    log(b"IndianOS: M010 PIC IRQ0 unexpectedly masked\n\0")
-   }
-   if irq0&1!=0{
-    log(b"IndianOS: M010 PIC IRQ0 pending (IRR=1)\n\0")
-   }else{
-    log(b"IndianOS: M010 PIC IRQ0 not pending (IRR=0)\n\0")
-   }
-   if irq0&2!=0{
-    log(b"IndianOS: M010 PIC IRQ0 in service (ISR=1)\n\0")
-   }else{
-    log(b"IndianOS: M010 PIC IRQ0 not in service (ISR=0)\n\0")
-   }
-  }else{log(b"IndianOS: M009 PIC/PIT hardware timer interrupts observed\n\0")}
-  if scheduler.yield_count<2||scheduler.tick_count<2||
-     unsafe{(*task_ptr(0)).timer_preemptions}==0||
-     unsafe{(*task_ptr(1)).timer_preemptions}==0||
-     unsafe{x86_64_timer_irq_count()}<2{ok=false;}
-  if ok{log(b"IndianOS: M009 timer-preemptive round-robin PASSED\n\0");}
+  // Mask the local timer before reading counters and reclaiming memory.
+  if !unsafe{crate::timer::x86_64_xapic_timer_stop()}{ok=false;}
+  let irqs=crate::timer::x86_64_xapic_timer_irq_count();
+  let captures=crate::timer::x86_64_xapic_timer_preemption_count();
+  if irqs==0{log(b"IndianOS: R024 FATAL no xAPIC IRQs delivered\n\0");}
+  if captures==0{log(b"IndianOS: R024 FATAL no ring-3 APIC captures\n\0");}
+  if scheduler.yield_count<2 || scheduler.tick_count<2 ||
+     unsafe{(*task_ptr(0)).timer_preemptions}==0 ||
+     unsafe{(*task_ptr(1)).timer_preemptions}==0 ||
+     !crate::timer::xapic_preemption_evidence(irqs,captures){ok=false;}
+  if ok{log(b"IndianOS: R024 APIC timer-preemptive round-robin PASSED\n\0");}
  }
  #[cfg(not(feature="preempt"))]
  {

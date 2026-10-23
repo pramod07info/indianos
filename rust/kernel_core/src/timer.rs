@@ -501,6 +501,142 @@ pub fn xapic_preemption_progress()->bool{
 pub extern "C" fn x86_64_xapic_timer_preemption_ready()->bool{
     XAPIC_TIMER_RUNNING.load(Ordering::Acquire)
 }
+
+// R024: One dedicated, supervisor-only UC alias for the local xAPIC MMIO.
+// This research-only map is constructed with IRQs masked before user address
+// spaces are cloned. Never dereference a physical or cacheable HHDM alias.
+const XAPIC_MMIO_VA:u64=0xffff_fe00_0000_0000;
+const XAPIC_PAGE:u64=4096;
+const XAPIC_PHYS_MASK:u64=0x000f_ffff_ffff_f000;
+const XAPIC_PIT_REFERENCE:u32=11932; // about 10 ms, from the 1.193182 MHz PIT
+const XAPIC_PIT_HZ:u64=1_193_182;
+static XAPIC_UC_OWNED:AtomicBool=AtomicBool::new(false);
+unsafe extern "C" {
+    fn boot_hhdm_offset(out:*mut u64)->bool;
+    fn pmm_allocate_frame(frame:*mut u64)->bool;
+    fn pmm_release_frame(frame:u64)->bool;
+}
+fn canonical_kernel(value:u64)->bool{
+    value>>48==0xffff && value&(1u64<<47)!=0
+}
+/// Firmware may customize PAT. PCD+PWT means UC only when PAT entry 3 is
+/// UC (memory type 0); do not assume firmware kept the reset layout.
+pub const fn xapic_pat_index_three_is_uc(pat:u64)->bool{
+    (pat>>24)&0xff==0
+}
+fn xapic_pat_uc()->bool{
+    let lo:u32;let hi:u32;
+    unsafe{asm!("rdmsr",in("ecx")0x277u32,out("eax")lo,out("edx")hi,
+                options(nostack,preserves_flags));}
+    xapic_pat_index_three_is_uc(((hi as u64)<<32)|(lo as u64))
+}
+unsafe fn xapic_frame_address(offset:u64,physical:u64)->Option<*mut u64>{
+    if physical==0 || physical&0xfff!=0 ||
+       physical&!XAPIC_PHYS_MASK!=0{return None;}
+    let va=offset.checked_add(physical)?;
+    if !canonical_kernel(va){return None;}
+    Some(va as *mut u64)
+}
+/// # Safety
+/// Single BSP, IRQ disabled, PMM and Limine HHDM initialized, four-level
+/// paging with PCID disabled. The caller must retain all three allocated
+/// page-table frames and the mapping for the entire kernel lifetime.
+pub unsafe extern "C" fn x86_64_xapic_install_uc_mapping()->bool{
+    if XAPIC_UC_OWNED.load(Ordering::Acquire) || !xapic_pat_uc(){return false;}
+    let physical=x86_64_timer_xapic_physical_base();
+    if physical==0 || !xapic_register_page_valid(XAPIC_MMIO_VA as usize){return false;}
+    let mut offset=0u64;
+    if !unsafe{boot_hhdm_offset(&mut offset)} || !canonical_kernel(offset){return false;}
+    let cr3:u64;
+    unsafe{asm!("mov {}, cr3",out(reg)cr3,options(nostack,nomem,preserves_flags));}
+    if cr3&0xfff!=0{return false;} // no PCID or borrowed low CR3 bits
+    let Some(root)=(unsafe{xapic_frame_address(offset,cr3&XAPIC_PHYS_MASK)})else{return false;};
+    let index=((XAPIC_MMIO_VA>>39)&511) as usize;
+    if unsafe{core::ptr::read_volatile(root.add(index))}!=0{return false;}
+    let mut pages=[0u64;3];
+    let mut count=0usize;
+    for i in 0..3{
+        if !unsafe{pmm_allocate_frame(&mut pages[i])}{
+            for p in pages.iter().take(count){let _=unsafe{pmm_release_frame(*p)};}
+            return false;
+        }
+        let Some(ptr)=(unsafe{xapic_frame_address(offset,pages[i])})else{
+            let _=unsafe{pmm_release_frame(pages[i])};
+            for p in pages.iter().take(count){let _=unsafe{pmm_release_frame(*p)};}
+            return false;
+        };
+        unsafe{core::ptr::write_bytes(ptr,0,512);}
+        count+=1;
+    }
+    let pdpt=unsafe{xapic_frame_address(offset,pages[0]).unwrap()};
+    let pd=unsafe{xapic_frame_address(offset,pages[1]).unwrap()};
+    let pt=unsafe{xapic_frame_address(offset,pages[2]).unwrap()};
+    // The xAPIC is mapped supervisor-only, writable, and explicitly UC.
+    // PWT=PCD=1 chooses PAT index 3, which we verified is UC above.
+    unsafe{
+        core::ptr::write_volatile(pt,physical|0x1b);
+        core::ptr::write_volatile(pd,pages[2]|3);
+        core::ptr::write_volatile(pdpt,pages[1]|3);
+        core::ptr::write_volatile(root.add(index),pages[0]|3);
+        asm!("invlpg [{}]",in(reg)XAPIC_MMIO_VA,options(nostack,preserves_flags));
+    }
+    if !unsafe{x86_64_xapic_bind_uc_page(XAPIC_MMIO_VA,physical,0x1b,true)}{
+        // On failed binding don't reclaim page tables while a published PML4
+        // entry references them; fail closed without enabling any IRQ.
+        return false;
+    }
+    XAPIC_UC_OWNED.store(true,Ordering::Release);
+    true
+}
+/// The QEMU test clocks APIC countdown against PIT channel 2 (speaker off),
+/// not a guessed APIC clock rate. Channel 2 does NOT deliver PIC IRQ0.
+fn xapic_pit_reference_wait()->bool{
+    let previous=inb(0x61);
+    outb(0x61,(previous|1)&!2);
+    outb(PIT_CMD,0xb0); // channel 2, low/high bytes, mode 0
+    outb(0x42,(XAPIC_PIT_REFERENCE&0xff) as u8);
+    outb(0x42,(XAPIC_PIT_REFERENCE>>8) as u8);
+    // Wait for channel output to become low, then terminal-count high.
+    let mut observed_low=false;
+    for _ in 0..20_000_000 {
+        if inb(0x61)&0x20==0 {observed_low=true;break;}
+        core::hint::spin_loop();
+    }
+    let mut completed=false;
+    if observed_low {
+        for _ in 0..20_000_000{
+            if inb(0x61)&0x20!=0 {completed=true;break;}
+            core::hint::spin_loop();
+        }
+    }
+    outb(0x61,previous);
+    completed
+}
+/// # Safety
+/// BSP ring0, IRQ disabled, UC mapping already installed, calibrated test
+/// environment. Installs spurious vector 0xff and APIC vector 0x40 gates
+/// must have happened before this call (exceptions_init).
+pub unsafe extern "C" fn x86_64_xapic_start_qemu_100hz()->bool{
+    if !XAPIC_UC_OWNED.load(Ordering::Acquire) || 
+       !unsafe{x86_64_xapic_timer_prepare_masked(0x40)} {return false;}
+    let (Some(spurious),Some(tpr))=(
+        xapic_reg(XAPIC_SPURIOUS_OFFSET),xapic_reg(0x80)
+    )else{return false;};
+    unsafe{
+        let previous=core::ptr::read_volatile(spurious);
+        core::ptr::write_volatile(spurious,(previous&!0xff)|0x1ff);
+        core::ptr::write_volatile(tpr,0);
+    }
+    let initial=u32::MAX;
+    if !unsafe{x86_64_xapic_calibration_begin(initial)}{return false;}
+    if !xapic_pit_reference_wait(){return false;}
+    let current=unsafe{x86_64_xapic_timer_sample_masked()};
+    let Some(cfg)=xapic_checked_calibration(
+        initial,current,XAPIC_PIT_REFERENCE as u64,XAPIC_PIT_HZ,100
+    )else{return false;};
+    unsafe{x86_64_xapic_timer_start_calibrated(0x40,16,cfg.initial_count)}
+}
+
 /// Returns firmware APIC mode captured immediately before PIC initialization.
 /// 0xff means the experimental timer has not attempted initialization.
 #[no_mangle]
@@ -707,6 +843,19 @@ mod tests {
         let before=x86_64_xapic_timer_preemption_count();
         xapic_record_preemption();
         assert_eq!(x86_64_xapic_timer_preemption_count(),before);
+    }
+    #[test]
+    fn pat_index_three_requires_uncacheable_type(){
+        assert!(xapic_pat_index_three_is_uc(0x0007_0406_0007_0406));
+        assert!(!xapic_pat_index_three_is_uc(0x0007_0406_0607_0406));
+        assert!(!xapic_pat_index_three_is_uc(0x0007_0406_0407_0406));
+    }
+    #[test]
+    fn canonical_apic_mapping_is_high_half_and_aligned(){
+        assert!(canonical_kernel(XAPIC_MMIO_VA));
+        assert!(xapic_register_page_valid(XAPIC_MMIO_VA as usize));
+        assert!(!canonical_kernel(0x0000_0000_fee0_0000));
+        assert!(!canonical_kernel(0x0000_8000_0000_0000));
     }
     #[test]
     fn counter_is_bounded(){
