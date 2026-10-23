@@ -27,7 +27,10 @@ pub mod tinyfs;
 pub mod durablefs;
 /// R028 strict allocator-free Ethernet/IPv4 and protocol demo.
 pub mod network;
-#[cfg(target_arch="x86_64")]
+// Legacy virtio PCI DMA depends on PMM, Limine HHDM and a real x86 ring-0
+// kernel. Keep it OUT of host-side C ABI archives: those link without any
+// kernel boot/PMM externs. R028 QEMU enables it explicitly.
+#[cfg(all(target_arch="x86_64", feature="test-r028-network"))]
 pub mod virtio_net;
 /// Authenticated process IPC and bounded RAM filesystem service (R025).
 pub mod r025_services;
