@@ -232,6 +232,34 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
  let request=SyscallRequest{number:r[14],arg0:r[9],arg1:r[10]};
  if !unsafe{indianos_syscall_validate(ptr::addr_of!((*img).plan),request)}{return BAD;}
  match request.number{
+  #[cfg(feature="test-r029-userspace")]
+  18=>{
+   // Actual running PID1 only: a user buffer cannot forge renderer identity.
+   let pcb=unsafe{ptr::read(ptr::addr_of!(ACTIVE_PROCESS))};
+   let Some(p)=(unsafe{pcb.as_ref()})else{return BAD;};
+   if p.pid!=1 || p.state!=3 || unsafe{ACTIVE_PID}!=1 ||
+      !active_task().is_null(){return BAD;}
+   let mut command=[0u8;64];
+   if !unsafe{indianos_user_copy_readonly(img,request.arg0,
+       command.as_mut_ptr().cast(),command.len())}{return BAD;}
+   if crate::gui::user_surface_submit(&command){0}else{BAD}
+  },
+  #[cfg(feature="test-r029-userspace")]
+  19=>{
+   let pcb=unsafe{ptr::read(ptr::addr_of!(ACTIVE_PROCESS))};
+   let Some(p)=(unsafe{pcb.as_ref()})else{return BAD;};
+   if p.pid!=1 || p.state!=3 || unsafe{ACTIVE_PID}!=1 ||
+      !active_task().is_null(){return BAD;}
+   if crate::gui::user_surface_focus(request.arg0 as u32){0}else{BAD}
+  },
+  #[cfg(feature="test-r029-userspace")]
+  20=>{
+   let pcb=unsafe{ptr::read(ptr::addr_of!(ACTIVE_PROCESS))};
+   let Some(p)=(unsafe{pcb.as_ref()})else{return BAD;};
+   if p.pid!=1 || p.state!=3 || unsafe{ACTIVE_PID}!=1 ||
+      !active_task().is_null(){return BAD;}
+   crate::gui::user_surface_status().unwrap_or(BAD)
+  },
   #[cfg(feature="test-r025")]
   10=>{
    let Some(pid)=authenticated_ipc_pid()else{return BAD;};
