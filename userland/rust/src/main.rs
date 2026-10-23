@@ -292,6 +292,14 @@ fn r029_demo()->!{
 
 #[no_mangle]
 pub extern "C" fn _start()->!{
+    #[cfg(feature="r030-demo")]
+    {
+        use indianos_native_sdk as sdk;
+        if !sdk::abi_supported(){sdk::exit(114);}
+        if !sdk::write(b"Namaste from IndianOS user mode!"){sdk::exit(115);}
+        if !sdk::write(b"R030 native SDK signed application started"){sdk::exit(116);}
+        sdk::exit(0);
+    }
     #[cfg(feature="r029-client")]
     r029_demo();
     #[cfg(feature="demo")]
@@ -498,7 +506,7 @@ pub extern "C" fn _start()->!{
     #[cfg(not(any(
         feature="demo",feature="worker",feature="shell",feature="interactive",feature="sched-a",
         feature="sched-b",feature="ipc-a",feature="ipc-b",feature="r026-shell",feature="r026-worker",feature="r025-a",feature="r025-b",feature="fault-guard",feature="fault-supervisor",
-        feature="preempt-a",feature="preempt-b"
+        feature="preempt-a",feature="preempt-b",feature="r030-demo"
     )))]
     loop {unsafe{asm!("pause",options(nomem,nostack,preserves_flags))}}
 }
