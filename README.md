@@ -2,7 +2,7 @@
 
 **IndianOS** is an experimental, independent desktop operating system for x86-64 PCs, designed for approachable everyday use in India. The goal is a familiar desktop workflow, Indian-language accessibility, and a native kernel—not a Linux distribution or a copy of Microsoft Windows.
 
-> **Status (2026-10-23): R024 APIC preemption, R025 syscall services and R026 interactive init with worker lifecycle verified in QEMU.** An opt-in Rust userland shell accepts serial commands while remaining alive across a kernel-authorized worker launch and reap. The tested commands include `help`, `ps`, `run /bin/worker`, `wait /bin/worker` and `exit`. Normal boot remains conservative; these are not installed production desktop services. This is not an installer, POSIX-compatible OS, audited sandbox or real-PC release. Do not flash it to physical storage.
+> **Status (2026-10-23): R024 preemption, R025 secure syscalls, R026 interactive shell and R027 QEMU persistent storage verified.** Alongside the experimental Rust ring-3 processes and persistent interactive shell, a separate opt-in ATA-backed R027 filesystem now supports checksummed multi-sector files, copy-on-write metadata and reboot-recovery on disposable QEMU disks. These features are not enabled as a production desktop or real-PC installer. Never flash the experimental OS to physical storage.
 
 ## Initial technical decisions
 
@@ -39,7 +39,8 @@
 20. [R024 xAPIC timer-driven process preemption](docs/R024_APIC_PREEMPTION.md)
 21. [R025 complete QEMU capability IPC, filesystem and process syscalls](docs/R025_SECURE_IPC_SYSCALLS.md)
 22. [R026 persistent QEMU shell and worker service](docs/R026_INTERACTIVE_SHELL.md)
-23. [Prioritized pending implementation backlog and acceptance checks](docs/IMPLEMENTATION_BACKLOG.md)
+23. [R027 durable ATA-backed filesystem and five-boot QEMU recovery](docs/R027_DURABLE_FILESYSTEM.md)
+24. [Prioritized pending implementation backlog and acceptance checks](docs/IMPLEMENTATION_BACKLOG.md)
 
 ## Directory plan
 
