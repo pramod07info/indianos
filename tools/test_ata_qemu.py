@@ -33,12 +33,13 @@ def main():
         required = [
             "IndianOS: R015 ATA disk detected",
             "IndianOS: R015 ATA disk read write restore PASSED",
+            "IndianOS: R027 TinyFs ATA QEMU create remount delete restore PASSED",
         ]
         if any(marker not in output for marker in required) or "FATAL" in output:
             raise SystemExit("R015 ATA QEMU smoke FAILED:\n" + output[-6000:])
         if disk.read_bytes() != bytes(512 * 32):
             raise SystemExit("R015 ATA smoke FAILED: temporary disk was not restored")
-        print("R015 ATA QEMU read/write/readback/bounds/restore PASSED")
+        print("R015/R027 ATA + TinyFs QEMU CRUD/remount/restore PASSED")
 
 if __name__ == "__main__":
     main()

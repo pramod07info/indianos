@@ -1,0 +1,36 @@
+name: Verify R027 TinyFs on disposable QEMU disk
+on:
+  push:
+    branches: [agentx-verify-r027-vfs-qemu-20261023]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  qemu-vfs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install QEMU and build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld binutils xorriso qemu-system-x86 ovmf curl
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
+      - name: Test kernel Rust modules
+        run: cargo test --offline --manifest-path rust/kernel_core/Cargo.toml
+      - name: Check bare metal compilation
+        run: cargo build --offline --manifest-path rust/kernel_core/Cargo.toml --no-default-features --target x86_64-unknown-none
+      - name: Check source ownership
+        run: make test-rust-source-audit
+      - name: Real QEMU ATA TinyFs create remount delete and disk restore
+        shell: bash
+        run: |
+          set -euo pipefail
+          OVMF_PATH=""
+          for p in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/edk2/ovmf/OVMF_CODE_4M.fd /usr/share/edk2/ovmf/OVMF_CODE.fd; do
+            if test -f "$p"; then OVMF_PATH="$p"; break; fi
+          done
+          test -n "$OVMF_PATH"
+          make test-rust-ata-qemu OVMF_CODE="$OVMF_PATH"
