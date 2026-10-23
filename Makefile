@@ -815,6 +815,7 @@ $(LIMINE_BINARY)/limine.c: $(LIMINE_TARBALL)
 	@rm -rf $(LIMINE_BINARY)
 	@tar -xzf $(LIMINE_TARBALL) -C $(BUILD)/third_party
 	@test -f $@
+	@touch $@ # Archived C source mtime can predate tarball: avoid re-extracting and deleting a built limine on the next ISO build.
 
 $(LIMINE_BINARY)/limine: $(LIMINE_BINARY)/limine.c
 	$(MAKE) -C $(LIMINE_BINARY) limine
