@@ -16,7 +16,7 @@ static mut SCREEN:Option<Screen>=None;
 
 // 5-bit rows for the supported US-ASCII shell alphabet. Lowercase renders
 // using the corresponding uppercase glyph; unsupported bytes become '?'.
-fn glyph(ch:u8)->[u8;7] {
+pub(crate) fn glyph(ch:u8)->[u8;7] {
     match ch.to_ascii_uppercase(){
         b'A'=>[14,17,17,31,17,17,17],
         b'B'=>[30,17,17,30,17,17,30],

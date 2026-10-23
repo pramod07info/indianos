@@ -58,6 +58,18 @@ impl Desktop{
         for j in idx..self.count-1{self.windows[j]=self.windows[j+1];}
         self.windows[self.count-1]=Some(window);self.focused=Some(id);Ok(())
     }
+    /// Move an existing window within the display; do not change z order.
+    pub fn move_window(&mut self,id:u32,x:i32,y:i32)->Result<(),DesktopError>{
+        let index=self.windows[..self.count].iter()
+            .position(|slot|slot.is_some_and(|window|window.id==id))
+            .ok_or(DesktopError::NotFound)?;
+        let mut window=self.windows[index].unwrap();
+        let proposed=Rect::new(x,y,window.bounds.width,window.bounds.height);
+        if !self.valid(proposed){return Err(DesktopError::InvalidBounds);}
+        window.bounds=proposed;
+        self.windows[index]=Some(window);
+        Ok(())
+    }
     pub fn minimize(&mut self,id:u32)->Result<(),DesktopError>{
         let window=self.windows[..self.count].iter_mut()
             .find_map(|w|w.as_mut().filter(|w|w.id==id))
@@ -106,6 +118,18 @@ mod tests{
         assert_eq!(d.focused(),None);
         d.focus(a).unwrap();
         assert_eq!(d.focused(),Some(a));
+    }
+    #[test]fn bounded_drag_preserves_window_identity_and_z_order(){
+        let mut desktop=Desktop::new(800,600).unwrap();
+        let files=desktop.open(App::Files,Rect::new(32,40,320,220)).unwrap();
+        let term=desktop.open(App::Terminal,Rect::new(180,180,320,220)).unwrap();
+        assert_eq!(desktop.move_window(files,80,90),Ok(()));
+        assert_eq!(desktop.hit_test(100,120),Some(files));
+        assert_eq!(desktop.hit_test(190,190),Some(term));
+        assert_eq!(desktop.move_window(files,-1,10),Err(DesktopError::InvalidBounds));
+        assert_eq!(desktop.move_window(files,600,10),Err(DesktopError::InvalidBounds));
+        assert_eq!(desktop.move_window(999,1,1),Err(DesktopError::NotFound));
+        assert_eq!(desktop.windows().find(|w|w.id==files).unwrap().bounds.x,80);
     }
     #[test]fn bounds_and_capacity(){
         assert!(matches!(Desktop::new(100,100),Err(DesktopError::InvalidDisplay)));

@@ -42,6 +42,10 @@ pub mod quantum_service;
 pub mod quantum_abi;
 pub mod quantum_dispatch;
 pub mod desktop;
+#[cfg(feature="test-r029-desktop")]
+mod gui;
+#[cfg(feature="test-r029-desktop")]
+mod ps2_mouse;
 #[cfg(target_arch = "x86_64")]
 pub mod ata_pio;
 #[cfg(feature = "vmm")]
@@ -58,7 +62,7 @@ mod paging_cpu;
 mod user_runtime;
 #[cfg(feature = "test-interactive")]
 mod input;
-#[cfg(feature = "test-irq-keyboard")]
+#[cfg(any(feature = "test-irq-keyboard", feature="test-r029-desktop"))]
 mod console;
 #[cfg(feature = "runtime")]
 mod runtime;

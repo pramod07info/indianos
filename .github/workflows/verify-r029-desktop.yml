@@ -1,0 +1,38 @@
+name: Verify R029 real QEMU framebuffer and PS2 interactive desktop
+on:
+  push:
+    branches: [agentx-r029-graphical-desktop-20261023]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  graphical-desktop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install QEMU VGA and bare-metal kernel build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld binutils xorriso qemu-system-x86 ovmf curl
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
+      - name: Host ABI compatibility regression required
+        run: make test-rust-host-abi
+      - name: Rust GUI window model, compositor clipping and mouse packet unit tests
+        run: cargo test --offline --manifest-path rust/kernel_core/Cargo.toml --features test-r029-desktop
+      - name: Build R029 freestanding kernel with real display driver
+        run: cargo build --offline --manifest-path rust/kernel_core/Cargo.toml --target x86_64-unknown-none --no-default-features --features cpu-entry,vmm,pmm,user-image,paging,paging-cpu,user-runtime,runtime,boot-staging,boot,interrupts,timer,kernel-main,limine-requests,test-r029-desktop
+      - name: Kernel source ownership audit
+        run: make test-rust-source-audit
+      - name: QEMU real VGA screenshots and PS2 mouse interactive windows
+        shell: bash
+        run: |
+          set -euo pipefail
+          OVMF_PATH=""
+          for f in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/edk2/ovmf/OVMF_CODE_4M.fd /usr/share/edk2/ovmf/OVMF_CODE.fd; do
+            if test -f "$f"; then OVMF_PATH="$f"; break; fi
+          done
+          test -n "$OVMF_PATH"
+          make test-r029-desktop-qemu OVMF_CODE="$OVMF_PATH"
