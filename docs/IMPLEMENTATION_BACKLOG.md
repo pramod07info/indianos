@@ -70,3 +70,18 @@ step as required, not a non-blocking experiment.
 This verified test is specific to x86-64 QEMU/OVMF; SMP, real hardware,
 secure interrupt-controller initialization for diverse firmware and
 production-grade scheduler fairness remain unqualified.
+
+## R025.1 — QEMU-verified secure IPC (2026-10-23)
+
+The [R025 verification run](https://github.com/pramod07info/indianos/actions/runs/39916988928)
+passed host policy tests, freestanding Rust compilation, source auditing,
+and a real two-process QEMU ring-3 ping/reply. The sender ID came from
+the active PCB and matching scheduler task. It rejected invalid recipient
+PIDs and user pointers, preserved user output on empty queues, removed
+mailboxes at process exit, and reaped both processes exactly once.
+
+R025 **is not complete**: capability-mediated authorization, secure file
+syscalls, process-service APIs and general blocking IPC still require
+implementation and QEMU regression testing. The ordinary kernel boot
+continues to keep this test-only IPC ABI disabled. R025.1 is now required
+in full kernel CI, not merely a one-off branch verification.

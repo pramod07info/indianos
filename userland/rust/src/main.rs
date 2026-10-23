@@ -53,6 +53,25 @@ fn spin_cpu_bound(){
 }
 
 
+#[cfg(any(feature="ipc-a",feature="ipc-b"))]
+fn ipc_send(receiver:u32, data:&[u8]){
+    if data.len()>64 {exit(60);}
+    let mut packet=[0u8;68];
+    packet[..4].copy_from_slice(&receiver.to_le_bytes());
+    packet[4..4+data.len()].copy_from_slice(data);
+    if call(8,packet.as_ptr() as u64,(4+data.len()) as u64)!=0 {exit(61);}
+}
+#[cfg(any(feature="ipc-a",feature="ipc-b"))]
+fn ipc_receive(expected_sender:u32,expected_data:&[u8]){
+    let mut packet=[0xa5u8;72];
+    let n=call(9,packet.as_mut_ptr() as u64,packet.len() as u64);
+    if n!=(8+expected_data.len()) as u64 {exit(62);}
+    if u32::from_le_bytes(packet[..4].try_into().unwrap())!=expected_sender ||
+       u32::from_le_bytes(packet[4..8].try_into().unwrap())!=expected_data.len() as u32 ||
+       &packet[8..8+expected_data.len()]!=expected_data ||
+       packet[8+expected_data.len()..].iter().any(|&b|b!=0) {exit(63);}
+}
+
 #[cfg(feature="interactive")]
 static mut LAST_COMMAND:[u8;64]=[0;64];
 #[cfg(feature="interactive")]
@@ -164,6 +183,45 @@ pub extern "C" fn _start()->!{
         write(b"IndianOS worker process 2 completed");
         exit(0);
     }
+    #[cfg(feature="ipc-a")]
+    {
+        if call(4,0,0)!=1 {exit(64);}
+        let mut empty=[0xaau8;72];
+        // Receiving an empty mailbox must not overwrite user memory.
+        if call(9,empty.as_mut_ptr() as u64,72)!=0 ||
+           empty.iter().any(|b|*b!=0xaa){exit(65);}
+        ipc_send(2,b"ping-identity");
+        write(b"R025 PID1 sent authenticated ping");
+        yield_now();
+        ipc_receive(2,b"pong-identity");
+        write(b"R025 PID1 received authenticated reply");
+        // Reject unknown destination and forbidden ring-3 pointers.
+        let mut invalid=[0u8;8];
+        invalid[..4].copy_from_slice(&99u32.to_le_bytes());
+        if call(8,invalid.as_ptr() as u64,8)!=u64::MAX ||
+           call(8,0,8)!=u64::MAX ||
+           call(9,0,72)!=u64::MAX {exit(66);}
+        write(b"R025 PID1 invalid destination and pointers denied");
+        yield_now();
+        write(b"R025 PID1 exited cleanly");
+        exit(0);
+    }
+    #[cfg(feature="ipc-b")]
+    {
+        if call(4,0,0)!=2 {exit(67);}
+        ipc_receive(1,b"ping-identity");
+        write(b"R025 PID2 received authenticated ping");
+        ipc_send(1,b"pong-identity");
+        write(b"R025 PID2 sent authenticated reply");
+        yield_now();
+        let mut output=[0xccu8;72];
+        if call(9,output.as_mut_ptr() as u64,72)!=0 ||
+           output.iter().any(|b|*b!=0xcc){exit(68);}
+        write(b"R025 PID2 empty queue is isolated");
+        yield_now();
+        write(b"R025 PID2 exited cleanly");
+        exit(0);
+    }
     #[cfg(feature="sched-a")]
     {
         write(b"M009 task A step 1");
@@ -215,7 +273,7 @@ pub extern "C" fn _start()->!{
     // It must never be launched outside the opt-in test variants.
     #[cfg(not(any(
         feature="demo",feature="worker",feature="shell",feature="interactive",feature="sched-a",
-        feature="sched-b",feature="fault-guard",feature="fault-supervisor",
+        feature="sched-b",feature="ipc-a",feature="ipc-b",feature="fault-guard",feature="fault-supervisor",
         feature="preempt-a",feature="preempt-b"
     )))]
     loop {unsafe{asm!("pause",options(nomem,nostack,preserves_flags))}}

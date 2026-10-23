@@ -22,6 +22,8 @@ use crate::boot::Region;
 use crate::user_image::{indianos_user_can_write,indianos_user_copy_writable};
 #[cfg(feature="test-interactive")]
 use crate::input;
+#[cfg(feature="test-ipc")]
+use crate::ipc::{IpcRouter,IpcError};
 const PHYS:u64=0x000f_ffff_ffff_f000;
 const PAGE:u64=4096;
 const YIELD:u64=0x200;
@@ -52,6 +54,29 @@ static mut ACTIVE_PROCESS:*mut Process=ptr::null_mut();
 // Single-core runtime only; do not access this from interrupt context.
 static mut QUANTUM_JOBS:crate::quantum_service::QuantumService=
     crate::quantum_service::QuantumService::new();
+// Two scheduler-authenticated process mailboxes, off in normal boots.
+#[cfg(feature="test-ipc")]
+static mut IPC_ROUTER:Option<IpcRouter<2,4>>=None;
+#[cfg(feature="test-ipc")]
+fn router()->Option<&'static mut IpcRouter<2,4>>{
+    // Single BSP; INT 0x80 interrupt gate masks CPU interrupts.
+    // No SMP or nested use of this non-atomic router is permitted.
+    unsafe{(&mut *ptr::addr_of_mut!(IPC_ROUTER)).as_mut()}
+}
+#[cfg(feature="test-ipc")]
+fn authenticated_ipc_pid()->Option<u32>{
+    let process=unsafe{ptr::read(ptr::addr_of!(ACTIVE_PROCESS))};
+    let task=active_task();
+    let image=active_image();
+    if process.is_null()||task.is_null()||image.is_null(){return None;}
+    let p=unsafe{&*process};
+    let t=unsafe{&*task};
+    if p.pid==0 || p.state!=3 || t.pcb!=process ||
+       !ptr::eq(&t.image as *const UserImage,image as *const UserImage){
+       return None;
+    }
+    Some(p.pid)
+}
 fn cleanup_quantum_jobs(pid:u32){
  if pid==0{return;}
  let jobs=unsafe{&mut *ptr::addr_of_mut!(QUANTUM_JOBS)};
@@ -183,6 +208,42 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
  let request=SyscallRequest{number:r[14],arg0:r[9],arg1:r[10]};
  if !unsafe{indianos_syscall_validate(ptr::addr_of!((*img).plan),request)}{return BAD;}
  match request.number{
+  #[cfg(feature="test-ipc")]
+  8=>{
+   // Wire packet: destination u32 little-endian, then 0..64 payload bytes.
+   // User cannot specify sender; we authenticate against the active PCB.
+   let Some(sender)=authenticated_ipc_pid()else{return BAD;};
+   let mut packet=[0u8;68];
+   let length=request.arg1 as usize;
+   if !unsafe{indianos_user_copy_readonly(img,request.arg0,
+        packet.as_mut_ptr().cast(),length)}{return BAD;}
+   let target=u32::from_le_bytes(packet[..4].try_into().unwrap());
+   let Some(boxes)=router()else{return BAD;};
+   match boxes.send(sender,target,&packet[4..length]){
+    Ok(())=>0, Err(_)=>BAD,
+   }
+  },
+  #[cfg(feature="test-ipc")]
+  9=>{
+   // Out: sender u32 + payload length u32 + 64 zero-padded bytes.
+   // Check *entire* writable buffer BEFORE removing any queued message.
+   let Some(receiver)=authenticated_ipc_pid()else{return BAD;};
+   if !unsafe{indianos_user_can_write(&*img,request.arg0,72)}{
+       return BAD;
+   }
+   let Some(boxes)=router()else{return BAD;};
+   let msg=match boxes.receive(receiver){
+      Ok(m)=>m,Err(IpcError::Empty)=>return 0,Err(_)=>return BAD,
+   };
+   let mut response=[0u8;72];
+   response[..4].copy_from_slice(&msg.sender().to_le_bytes());
+   response[4..8].copy_from_slice(&(msg.payload().len() as u32).to_le_bytes());
+   let len=msg.payload().len();
+   response[8..8+len].copy_from_slice(msg.payload());
+   if !unsafe{indianos_user_copy_writable(&*img,request.arg0,
+       response.as_ptr(),response.len())}{return BAD;}
+   (8+len) as u64
+  },
   7=>{
    // Four little-endian u64 words: operation, buffer, length, job ID.
    // Descriptor and payload are copied from verified user-owned pages.
@@ -246,6 +307,8 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
   },
   #[cfg(feature="test-shell")]
   4=>unsafe{ACTIVE_PID as u64},
+  #[cfg(all(feature="test-ipc",not(feature="test-shell")))]
+  4=>authenticated_ipc_pid().map_or(BAD,u64::from),
   #[cfg(feature="test-shell")]
   5=>{
    unsafe{
@@ -594,6 +657,15 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
   let _=discard(task_ptr(0),&backend,false);
   return false;
  }
+ #[cfg(feature="test-ipc")]
+ {
+  let Some(mut mailboxes)=IpcRouter::<2,4>::new().ok()else{return false;};
+  if mailboxes.register(1).is_err()||mailboxes.register(2).is_err(){
+   return false;
+  }
+  unsafe{IPC_ROUTER=Some(mailboxes);}
+  log(b"IndianOS: R025 authenticated IPC mailboxes ready\n\0");
+ }
  log(b"IndianOS: M009 two simultaneous user address spaces ready\n\0");
  #[cfg(feature="preempt")]
  {
@@ -627,7 +699,7 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
    unsafe{x86_64_enter_user(task.image.plan.entry,
                              task.image.plan.stack_end-16,task.root.root)}
   };
-  unsafe{ACTIVE_TASK=ptr::null_mut();ACTIVE_USER=ptr::null_mut();}
+  unsafe{ACTIVE_TASK=ptr::null_mut();ACTIVE_USER=ptr::null_mut();ACTIVE_PROCESS=ptr::null_mut();}
   let cr3:u64;
   unsafe{asm!("mov {}, cr3",out(reg)cr3,options(nostack,nomem,preserves_flags));}
   if cr3&PHYS!=cpu.cr3&PHYS{
@@ -642,6 +714,13 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
   }else{
    if status==YIELD{ok=false;break;}
    cleanup_quantum_jobs(pid);
+   #[cfg(feature="test-ipc")]
+   {
+    // On process exit or fault all queued messages for that PID are gone.
+    if router().is_none_or(|boxes|boxes.unregister(pid).is_err()){
+     ok=false;break;
+    }
+   }
    let finished=if v!=0{
     unsafe{indianos_process_fault(pcb,status,v,e,a)}
    }else{unsafe{indianos_process_exit(pcb,status)}};
@@ -673,6 +752,15 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
   if scheduler.dispatch_count!=6||scheduler.yield_count!=4||
      scheduler.tick_count!=4{ok=false;}
   if ok{log(b"IndianOS: M009 round-robin cooperative switching PASSED\n\0");}
+ }
+ #[cfg(feature="test-ipc")]
+ {
+  if let Some(boxes)=router(){
+   if boxes.pending(1)!=Err(IpcError::UnknownReceiver)||
+      boxes.pending(2)!=Err(IpcError::UnknownReceiver){ok=false;}
+  }else{ok=false;}
+  unsafe{IPC_ROUTER=None;}
+  if ok{log(b"IndianOS: R025 secure IPC two-process handshake PASSED\n\0");}
  }
  if !ok{
   log(b"IndianOS: M009 FATAL scheduler or memory ownership verification\n\0");

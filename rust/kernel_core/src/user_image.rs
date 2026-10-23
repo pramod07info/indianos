@@ -278,7 +278,9 @@ pub unsafe extern "C" fn indianos_user_copy_readonly(
 pub(crate) unsafe fn indianos_user_can_write(
     img:&UserImage,address:u64,length:usize,
 )->bool{
-    img.ready && (1..=crate::quantum_queue::RESULT_BYTES).contains(&length) &&
+    // R025 IPC wire reply is 72 bytes; the dedicated syscall still validates
+    // the complete writable range before consuming the queue.
+    img.ready && (1..=72).contains(&length) &&
         crate::syscall::user_range(&img.plan,address,length as u64,true) &&
         unsafe{copy_preflight(img,address,length,true)}
 }

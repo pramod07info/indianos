@@ -253,7 +253,9 @@ pub extern "C" fn kmain()->!{
         });
         #[cfg(feature="preempt")]
         log(b"IndianOS: R024 APIC preemptive scheduler experiment begin\n\0");
-        #[cfg(not(feature="preempt"))]
+        #[cfg(all(not(feature="preempt"),feature="test-ipc"))]
+        log(b"IndianOS: R025 secure syscall IPC test begin\n\0");
+        #[cfg(all(not(feature="preempt"),not(feature="test-ipc")))]
         log(b"IndianOS: M009 cooperative scheduler experiment begin\n\0");
         need(unsafe{x86_64_m009_schedule_run(init,init_size,worker,worker_size)},
              b"IndianOS: FATAL M009 cooperative context test failed\n\0");
