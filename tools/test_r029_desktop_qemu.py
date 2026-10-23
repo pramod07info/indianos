@@ -19,6 +19,9 @@ import time
 READY="IndianOS: R029 PS2 mouse and serial keyboard ready"
 SUCCESS="IndianOS: R029 QEMU real framebuffer two interactive windows PASSED"
 STEPS=(
+    # Mouse already selected Files. First keyboard-focus Terminal so the
+    # compositor must actually change visible titlebar pixels on each step.
+    (b"2", "IndianOS: R029 keyboard focused Terminal window"),
     (b"1", "IndianOS: R029 keyboard focused Files window"),
     (b"2", "IndianOS: R029 keyboard focused Terminal window"),
     (b"h", "IndianOS: R029 window moved on framebuffer"),
