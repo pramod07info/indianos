@@ -120,9 +120,22 @@ def main() -> None:
             call(["make", "image", f"BUILD={builddir}", "R030_PACKAGE_V1=1"], 360)
             call(["python3", "tools/build_initramfs.py", "--elf", str(verified),
                   "--output", str(builddir/"initramfs.img")])
+            # The base ISO has been built once using the verified kernel.
+            # Rebuild its disposable UEFI media directly so the test never
+            # invokes Limine's BIOS installer on a second image invocation.
+            # This replaces ONLY the initramfs with a signature-verified ELF.
+            iso_root = builddir / "iso_root"
+            image_payload = iso_root / "boot" / "initramfs.img"
+            image_payload.write_bytes((builddir / "initramfs.img").read_bytes())
             iso = builddir / "indianos.iso"
             iso.unlink(missing_ok=True)
-            call(["make", "image", f"BUILD={builddir}", "R030_PACKAGE_V1=1"], 360)
+            call(["xorriso", "-as", "mkisofs", "-R", "-r", "-J",
+                  "-b", "boot/limine/limine-bios-cd.bin",
+                  "-no-emul-boot", "-boot-load-size", "4",
+                  "-boot-info-table", "--efi-boot",
+                  "boot/limine/limine-uefi-cd.bin", "-efi-boot-part",
+                  "--efi-boot-image", "--protective-msdos-label",
+                  str(iso_root), "-o", str(iso)], 180)
             boot(args.qemu, iso, args.ovmf, serial)
             print(f"R030 QEMU signed {action}: {serial} PASSED")
         # Tampering must not replace a previously verified installation.
