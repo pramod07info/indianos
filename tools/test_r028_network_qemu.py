@@ -75,6 +75,11 @@ class Protocol:
         assert len(frame)>=14, "truncated Ethernet frame"
         dst,src,kind=frame[:6],frame[6:12],u16(frame[12:14])
         assert src==GUEST_MAC, f"unexpected guest MAC {src.hex()}"
+        # OVMF UEFI network firmware may send unsolicited IPv6 NDP before
+        # our Rust kernel initializes the legacy virtio-net device. Ignore
+        # only these pre-kernel IPv6 multicasts; none counts as test traffic.
+        if self.phase==0 and kind==0x86dd and dst[:2]==b"\x33\x33":
+            return None
         assert dst in (PEER_MAC,b"\xff"*6), (f"invalid Ethernet destination: dst={dst.hex()} src={src.hex()} "+f"ethertype={kind:04x} phase={self.phase} raw={frame[:64].hex()}")
         if kind==0x0806:
             assert self.phase==0,"unexpected ARP request order"
