@@ -44,8 +44,16 @@ jobs:
           if [[ "$EVENT_NAME" == "workflow_run" ]]; then
             # Agent Y run completed: resolve the matching kernel CI run by SHA.
             Y_SHA="$(jq -r .workflow_run.head_sha "$GITHUB_EVENT_PATH")"
-            RUN_ID="$(gh api "repos/$REPO/actions/workflows/kernel-boot.yml/runs?branch=main&per_page=30" --jq '.workflow_runs[] | select(.status == "completed") | [.id, .head_sha] | @tsv' | awk -v sha="$Y_SHA" '$2 == sha { print $1; exit }')"
-            [[ "$RUN_ID" =~ ^[0-9]+$ ]] || { echo "No completed kernel CI run for Agent Y commit $Y_SHA"; exit 1; }
+            # Poll for the kernel run for this exact SHA. Agent Y may finish first.
+            RUN_ID=""
+            for attempt in {1..20}; do
+              RUN_ID="$(gh api "repos/$REPO/actions/workflows/kernel-boot.yml/runs?branch=main&per_page=100" \
+                --jq '.workflow_runs | map(select(.head_sha == "'"$Y_SHA"'" and .status == "completed")) | sort_by(.run_number, .run_attempt) | last | .id // empty')"
+              if [[ "$RUN_ID" =~ ^[0-9]+$ ]]; then break; fi
+              echo "Waiting for completed kernel CI at $Y_SHA ($attempt/20)"
+              sleep 15
+            done
+            [[ "$RUN_ID" =~ ^[0-9]+$ ]] || { echo "::error::No completed kernel CI run for Agent Y commit $Y_SHA after 5 minutes"; exit 1; }
           fi
           gh api "repos/$REPO/actions/runs/$RUN_ID" > /tmp/ci-run.json
           [[ "$(jq -r .head_branch /tmp/ci-run.json)" == "main" ]] || exit 1
@@ -53,9 +61,13 @@ jobs:
           gh api "repos/$REPO/actions/runs/$RUN_ID/jobs?per_page=100" > /tmp/ci-jobs.json
           : > /tmp/ci-failure-logs.txt
           if [[ "$(jq -r '.conclusion' /tmp/ci-run.json)" != "success" ]]; then
-            jq -r '.jobs[] | select(.conclusion == "failure") | .id' /tmp/ci-jobs.json | head -5 | while read -r JOB_ID; do
+            jq -r '[.jobs[] | select(.conclusion == "failure") | .id][:5][]' /tmp/ci-jobs.json | while read -r JOB_ID; do
               echo "=== Failed job $JOB_ID ===" >> /tmp/ci-failure-logs.txt
-              gh api "repos/$REPO/actions/jobs/$JOB_ID/logs" 2>/dev/null | tail -c 12000 >> /tmp/ci-failure-logs.txt || echo "Job logs unavailable" >> /tmp/ci-failure-logs.txt
+              if gh api "repos/$REPO/actions/jobs/$JOB_ID/logs" > /tmp/agent-x-job.log 2>/dev/null; then
+                tail -c 12000 /tmp/agent-x-job.log >> /tmp/ci-failure-logs.txt
+              else
+                echo "Job logs unavailable" >> /tmp/ci-failure-logs.txt
+              fi
             done
           fi
           python3 tools/agent_x_ci_context.py /tmp/ci-run.json /tmp/ci-jobs.json /tmp/ci-failure-logs.txt > /tmp/agent-prompt.txt
