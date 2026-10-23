@@ -446,6 +446,16 @@ pub extern "C" fn _start()->!{
         write(b"R025 PID2 exited cleanly");
         exit(0);
     }
+    #[cfg(feature="r030-demo-v1")]
+    {
+        write(b"R030 signed native package version 1 executed in ring-3");
+        exit(0);
+    }
+    #[cfg(feature="r030-demo-v2")]
+    {
+        write(b"R030 signed native package version 2 executed in ring-3");
+        exit(0);
+    }
     #[cfg(feature="sched-a")]
     {
         write(b"M009 task A step 1");
@@ -498,7 +508,7 @@ pub extern "C" fn _start()->!{
     #[cfg(not(any(
         feature="demo",feature="worker",feature="shell",feature="interactive",feature="sched-a",
         feature="sched-b",feature="ipc-a",feature="ipc-b",feature="r026-shell",feature="r026-worker",feature="r025-a",feature="r025-b",feature="fault-guard",feature="fault-supervisor",
-        feature="preempt-a",feature="preempt-b"
+        feature="preempt-a",feature="preempt-b",feature="r030-demo-v1",feature="r030-demo-v2"
     )))]
     loop {unsafe{asm!("pause",options(nomem,nostack,preserves_flags))}}
 }
