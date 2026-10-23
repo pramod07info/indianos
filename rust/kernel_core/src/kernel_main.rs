@@ -58,7 +58,12 @@ pub extern "C" fn kmain()->!{
     need(unsafe{boot_validate()},b"IndianOS: FATAL boot information invalid\n\0");
     log(b"IndianOS: boot information validated\n\0");
     unsafe{boot_draw_status();}
-    #[cfg(feature="test-r029-desktop")]
+    #[cfg(feature="test-r029-userspace")]
+    {
+        need(crate::gui::user_surface_start(),
+             b"IndianOS: FATAL R029 ring3 surface server unavailable\n\0");
+    }
+    #[cfg(all(feature="test-r029-desktop",not(feature="test-r029-userspace")))]
     {
         log(b"IndianOS: R029 QEMU graphical desktop start\n\0");
         need(crate::gui::run(),
@@ -320,7 +325,7 @@ pub extern "C" fn kmain()->!{
          b"IndianOS: FATAL detached user-image staging failed\n\0");
     log(b"IndianOS: initramfs /bin/init staged and released safely\n\0");
 
-    #[cfg(all(feature="test-shell",not(feature="test-r026")))]
+    #[cfg(all(feature="test-shell",not(feature="test-r026"),not(feature="test-r029-userspace")))]
     {
         // Scripted ring-3 init -> validated spawn -> distinct worker lifetime.
         log(b"IndianOS: R013 init shell begin\n\0");
@@ -425,6 +430,12 @@ pub extern "C" fn kmain()->!{
         log(b"IndianOS: user fault isolation experiment complete\n\0");
         #[cfg(not(any(feature="test-fault-guard",feature="test-fault-supervisor")))]
         log(b"IndianOS: ring-3 user program experiment complete\n\0");
+        #[cfg(feature="test-r029-userspace")]
+        {
+            need(crate::gui::user_surface_verified(),
+                b"IndianOS: FATAL R029 ring3 surface lifecycle incomplete\n\0");
+            log(b"IndianOS: R029 ring3 command-owned two-window surfaces PASSED\n\0");
+        }
     }
     #[cfg(feature="test-pagefault")]
     {
