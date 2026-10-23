@@ -937,6 +937,8 @@ clean:
 
 # R015: only a disposable temporary disk; never attach a host block device.
 .PHONY: test-rust-ata-qemu
+.PHONY: test-r027-durable-qemu
+
 test-r027-durable-qemu:
 	$(MAKE) image BUILD=build/r027-durable RUST_CORE=1 R027_DURABLE_TEST=1
 	python3 tools/test_r027_reboot_qemu.py --iso build/r027-durable/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)"
