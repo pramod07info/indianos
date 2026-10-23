@@ -24,6 +24,8 @@ use crate::user_image::{indianos_user_can_write,indianos_user_copy_writable};
 use crate::input;
 #[cfg(feature="test-ipc")]
 use crate::ipc::{IpcRouter,IpcError};
+#[cfg(feature="test-r025")]
+use crate::r025_services::{R025Services,FILE_BASE,MAX_FILE_TRANSFER};
 const PHYS:u64=0x000f_ffff_ffff_f000;
 const PAGE:u64=4096;
 const YIELD:u64=0x200;
@@ -62,6 +64,13 @@ fn router()->Option<&'static mut IpcRouter<2,4>>{
     // Single BSP; INT 0x80 interrupt gate masks CPU interrupts.
     // No SMP or nested use of this non-atomic router is permitted.
     unsafe{(&mut *ptr::addr_of_mut!(IPC_ROUTER)).as_mut()}
+}
+#[cfg(feature="test-r025")]
+static mut R025_SERVICES:Option<R025Services>=None;
+#[cfg(feature="test-r025")]
+fn services()->Option<&'static mut R025Services>{
+    // Single-BSP INT 0x80 interrupt gate. No IRQ/SMP caller.
+    unsafe{(&mut *ptr::addr_of_mut!(R025_SERVICES)).as_mut()}
 }
 #[cfg(feature="test-ipc")]
 fn authenticated_ipc_pid()->Option<u32>{
@@ -208,18 +217,94 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
  let request=SyscallRequest{number:r[14],arg0:r[9],arg1:r[10]};
  if !unsafe{indianos_syscall_validate(ptr::addr_of!((*img).plan),request)}{return BAD;}
  match request.number{
+  #[cfg(feature="test-r025")]
+  10=>{
+   let Some(pid)=authenticated_ipc_pid()else{return BAD;};
+   services().and_then(|svc|svc.token(pid,request.arg0).ok()).unwrap_or(BAD)
+  },
+  #[cfg(feature="test-r025")]
+  14=>{
+   let Some(pid)=authenticated_ipc_pid()else{return BAD;};
+   if services().is_some_and(|svc|svc.revoke(pid,request.arg0).is_ok()){
+     0
+   }else{BAD}
+  },
+  #[cfg(feature="test-r025")]
+  15=>{
+   let Some(_caller)=authenticated_ipc_pid()else{return BAD;};
+   let index=(request.arg0-1) as usize; // numeric syscall validator bounds 1..=2
+   let task=unsafe{&*task_ptr(index)};
+   let Some(pcb)=(unsafe{task.pcb.as_ref()})else{return BAD;};
+   if pcb.pid as u64!=request.arg0{return BAD;}
+   pcb.state as u64
+  },
+  #[cfg(feature="test-r025")]
+  11..=13=>{
+   let Some(pid)=authenticated_ipc_pid()else{return BAD;};
+   let mut desc=[0u8;48];
+   if !unsafe{indianos_user_copy_readonly(img,request.arg0,
+       desc.as_mut_ptr().cast(),desc.len())}{return BAD;}
+   let token=u64::from_le_bytes(desc[0..8].try_into().unwrap());
+   // Fixed-size, NUL-terminated pathname in the syscall descriptor.
+   let Some(path_len)=desc[8..32].iter().position(|&x|x==0)else{return BAD;};
+   if path_len==0 || desc[8+path_len+1..32].iter().any(|&x|x!=0){
+       return BAD;
+   }
+   let Ok(path)=core::str::from_utf8(&desc[8..8+path_len])else{return BAD;};
+   let address=u64::from_le_bytes(desc[32..40].try_into().unwrap());
+   let length=u64::from_le_bytes(desc[40..48].try_into().unwrap());
+   let Some(svc)=services()else{return BAD;};
+   match request.number {
+    11=>{
+     if length==0 || length>MAX_FILE_TRANSFER as u64{return BAD;}
+     let mut data=[0u8;MAX_FILE_TRANSFER];
+     if !unsafe{indianos_user_copy_readonly(img,address,
+          data.as_mut_ptr().cast(),length as usize)}{return BAD;}
+     if svc.create(pid,token,path,&data[..length as usize]).is_ok(){0}else{BAD}
+    }
+    12=>{
+     if length==0 || length>MAX_FILE_TRANSFER as u64 ||
+        !unsafe{indianos_user_can_write(&*img,address,length as usize)}{
+        return BAD;
+     }
+     let mut output=[0u8;MAX_FILE_TRANSFER];
+     let Ok(len)=svc.read(pid,token,path,&mut output[..length as usize])
+       else{return BAD;};
+     if !unsafe{indianos_user_copy_writable(&*img,address,
+          output.as_ptr(),len)}{return BAD;}
+     len as u64
+    }
+    13=>{
+     if address!=0 || length!=0{return BAD;}
+     if svc.delete(pid,token,path).is_ok(){0}else{BAD}
+    }
+    _=>BAD,
+   }
+  },
   #[cfg(feature="test-ipc")]
   8=>{
    // Wire packet: destination u32 little-endian, then 0..64 payload bytes.
    // User cannot specify sender; we authenticate against the active PCB.
    let Some(sender)=authenticated_ipc_pid()else{return BAD;};
-   let mut packet=[0u8;68];
+   let mut packet=[0u8;76];
    let length=request.arg1 as usize;
    if !unsafe{indianos_user_copy_readonly(img,request.arg0,
         packet.as_mut_ptr().cast(),length)}{return BAD;}
    let target=u32::from_le_bytes(packet[..4].try_into().unwrap());
+   #[cfg(feature="test-r025")]
+   {
+    let token=u64::from_le_bytes(packet[4..12].try_into().unwrap());
+    if services().is_none_or(|svc|
+        svc.authorize_send(sender,token,target).is_err()){
+        return BAD;
+    }
+   }
    let Some(boxes)=router()else{return BAD;};
-   match boxes.send(sender,target,&packet[4..length]){
+   #[cfg(feature="test-r025")]
+   let payload=&packet[12..length];
+   #[cfg(not(feature="test-r025"))]
+   let payload=&packet[4..length];
+   match boxes.send(sender,target,payload){
     Ok(())=>0, Err(_)=>BAD,
    }
   },
@@ -666,6 +751,12 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
   unsafe{IPC_ROUTER=Some(mailboxes);}
   log(b"IndianOS: R025 authenticated IPC mailboxes ready\n\0");
  }
+ #[cfg(feature="test-r025")]
+ {
+  let Some(svc)=R025Services::new()else{return false;};
+  unsafe{R025_SERVICES=Some(svc);}
+  log(b"IndianOS: R025 capability and isolated file services ready\n\0");
+ }
  log(b"IndianOS: M009 two simultaneous user address spaces ready\n\0");
  #[cfg(feature="preempt")]
  {
@@ -721,6 +812,13 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
      ok=false;break;
     }
    }
+   #[cfg(feature="test-r025")]
+   {
+    if services().is_none_or(|svc|svc.terminate(pid)==0){
+      ok=false;break;
+    }
+    pid_log(pid,b"CAPABILITIES_REVOKED\0");
+   }
    let finished=if v!=0{
     unsafe{indianos_process_fault(pcb,status,v,e,a)}
    }else{unsafe{indianos_process_exit(pcb,status)}};
@@ -761,6 +859,18 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
   }else{ok=false;}
   unsafe{IPC_ROUTER=None;}
   if ok{log(b"IndianOS: R025 secure IPC two-process handshake PASSED\n\0");}
+ }
+ #[cfg(feature="test-r025")]
+ {
+  if let Some(svc)=services(){
+   if svc.token(1,2).is_ok() || svc.token(2,1).is_ok() ||
+      svc.token(1,FILE_BASE+1).is_ok() ||
+      svc.token(2,FILE_BASE+2).is_ok(){ok=false;}
+  }else{ok=false;}
+  unsafe{R025_SERVICES=None;}
+  if ok {
+   log(b"IndianOS: R025 capability IPC filesystem process services PASSED\n\0");
+  }
  }
  if !ok{
   log(b"IndianOS: M009 FATAL scheduler or memory ownership verification\n\0");

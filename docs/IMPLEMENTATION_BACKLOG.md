@@ -23,7 +23,7 @@ establish working interrupts, a desktop, or third-party application support.
 | R022 | P0 | Connect absolute VFS paths to TinyFs flat-root create/read/delete | Reject traversal and nested paths; preserve existing data; remount CRUD regression and no_std build |
 | R023 | P0 | Bounded process-event FIFO with per-PID teardown | Zero/one-capacity, wraparound, overflow and ordering tests; no_std build |
 | R024 | P0 | Calibrated local APIC preemption wired to scheduler | QEMU observes IRQs, capture, two CPU-bound tasks alternating without yield; memory/scheduler cleanup |
-| R025 | P0 | Authentication-gated process, IPC and file syscalls | Ring-3 QEMU tests enforce identity, capability rights, bad pointers, cleanup |
+| R025 | P0 | **QEMU-verified** capability-gated process, IPC and flat-root file syscalls | **Verified:** ring-3 identity, rights, user-copy bounds, cross-PID denial, revocation and teardown; production service integration remains R026/R027 |
 | R026 | P1 | Persistent interactive init, shell and process services | User can type commands and launch/reap programs via a live QEMU console |
 | R027 | P1 | Device enumeration and reliable block/VFS stack | QEMU block tests, atomic metadata recovery, multi-block files, reboot durability |
 | R028 | P1 | Virtio network driver, ARP/IP/ICMP/UDP/TCP/DNS | QEMU guest network integration, ping and bounded network-client demo |
@@ -85,3 +85,18 @@ syscalls, process-service APIs and general blocking IPC still require
 implementation and QEMU regression testing. The ordinary kernel boot
 continues to keep this test-only IPC ABI disabled. R025.1 is now required
 in full kernel CI, not merely a one-off branch verification.
+
+## R025 completion acceptance (2026-10-23)
+
+The end-to-end `test-r025-complete-qemu` verifies two independent
+ring-3 processes, kernel-derived identities, constrained capability
+grants, IPC message permissions and responses, process status queries,
+per-process TinyFs namespaces, file create/read/delete syscalls,
+foreign-object rejection, safe bounded user buffers, explicit token
+revocation, and automatic capabilities/mailbox cleanup during process
+exit. R025.1's original non-capability test continues to run separately.
+
+The R025 full QEMU execution is mandatory in the kernel CI workflow.
+Only the bounded experimental QEMU service is complete: multiuser,
+persistent and crash-recoverable file services, blocking multiprocess
+IPC, SMP and real-hardware security are outside this acceptance.

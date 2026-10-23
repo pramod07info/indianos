@@ -1102,6 +1102,23 @@ jobs:
           path: build/r025-ipc-smoke.log
           if-no-files-found: ignore
           retention-days: 7
+      - name: R025 required capability IPC and secure file/process syscalls (QEMU)
+        run: |
+          set -o pipefail
+          OVMF_PATH=""
+          for candidate in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/edk2/ovmf/OVMF_CODE_4M.fd /usr/share/edk2/ovmf/OVMF_CODE.fd; do
+            if test -f "$candidate"; then OVMF_PATH="$candidate"; break; fi
+          done
+          test -n "$OVMF_PATH"
+          make test-r025-complete-qemu OVMF_CODE="$OVMF_PATH" 2>&1 | tee build/r025-complete-smoke.log
+      - name: Preserve R025 full QEMU capability IPC and filesystem transcript
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: indianos-r025-complete-qemu-log
+          path: build/r025-complete-smoke.log
+          if-no-files-found: ignore
+          retention-days: 7
       - name: QEMU user fault isolation (guard + supervisor)
         id: userfault_test
         continue-on-error: true

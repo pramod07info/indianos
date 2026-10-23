@@ -39,3 +39,41 @@ Capability-mediated per-service authorization, file handle syscalls,
 a general blocking IPC interface, multi-CPU locking and persistent
 service management remain future milestones. This test does not prove
 a production-grade service or filesystem syscall implementation.
+
+## R025 completion — capability-enforced IPC, file and process syscalls
+
+The opt-in `test-r025` feature extends the previous R025.1 QEMU ABI.
+This remains single-core and explicitly disabled in ordinary boots.
+
+- **8 IPC_SEND:** packet is destination PID `u32`, capability token `u64`,
+  then up to 64 bytes. Kernel validates the owner PID, target, rights and
+  token against a monotonic capability registry before queueing.
+- **10 CAP_LOOKUP:** `arg0=resource_id, arg1=0`. Only existing grants owned by
+  the active PCB are returned; user processes cannot mint permissions.
+- **11 FILE_CREATE**, **12 FILE_READ**, **13 FILE_DELETE:** a 48-byte user
+  descriptor containing `token:u64`, 24-byte NUL-terminated absolute path,
+  user data pointer `u64`, and length `u64`. Permissions are validated
+  against process-specific flat-root paths (`/p1-*` or `/p2-*`). Payloads
+  are bounded to 64 bytes; the memory-backed TinyFs volume is freshly
+  formatted only for this opt-in QEMU test. Reads and writes use full user
+  page ownership/copy checks rather than trusting raw pointers.
+- **14 CAP_REVOKE:** a process can revoke only its own capability.
+- **15 PROCESS_STATUS:** validated target PID 1 or 2 returns trusted PCB
+  lifecycle state; arbitrary PID and invalid arguments are rejected.
+
+The kernel issues the initial grants only for PID1-to-PID2 and
+PID2-to-PID1 messages and for each PID's own namespace. Mailboxes and
+remaining grants are removed on exit or fault. The QEMU proof uses two
+independent ring-3 apps and rejects foreign paths, foreign/revoked
+tokens, invalid pointers, and cross-process file operations. It
+requires two yields and one reap per process, and preserves the
+original R025.1 IPC regression in CI.
+
+`make test-r025-complete-qemu` exercises the full test on QEMU/OVMF.
+The main kernel CI runs this test as a required step.
+
+**Scope:** R025 is complete against its bounded two-process *QEMU*
+acceptance criteria. This is not a multiuser persistent filesystem,
+POSIX API, SMP-safe IPC, general service manager, or a production
+security audit. Long-running services and persistent file handles
+remain under R026/R027/R031.

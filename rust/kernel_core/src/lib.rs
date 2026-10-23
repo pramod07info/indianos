@@ -23,6 +23,8 @@ pub mod vfs_path;
 /// Allocation-free process event FIFO and teardown cleanup.
 pub mod process_events;
 pub mod tinyfs;
+/// Authenticated process IPC and bounded RAM filesystem service (R025).
+pub mod r025_services;
 pub mod quantum;
 pub mod quantum_circuit;
 pub mod quantum_protocol;
