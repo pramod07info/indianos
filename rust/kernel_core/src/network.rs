@@ -306,6 +306,12 @@ mod tests{
         let n=icmp_request(&mut frame,mac);
         frame[..6].copy_from_slice(&mac);
         frame[6..12].copy_from_slice(&PEER_MAC);
+        // Convert outgoing fixture to an incoming peer frame.
+        frame[26..30].copy_from_slice(&PEER_IP);
+        frame[30..34].copy_from_slice(&LOCAL_IP);
+        frame[24..26].fill(0);
+        let header_checksum=checksum(&frame[14..34]);
+        put16(&mut frame,24,header_checksum);
         assert!(validate_ipv4(&frame[..n],mac).is_ok());
         frame[24]^=0x40;
         assert!(matches!(validate_ipv4(&frame[..n],mac),Err(Error::Checksum)));
