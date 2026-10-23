@@ -976,6 +976,7 @@ test-r030-package-qemu:
 .PHONY: test-r029-desktop-qemu
 
 test-r029-desktop-qemu:
+	python3 -m unittest discover -s tools -p 'test_r029_serial_checkpoints.py' -v
 	$(MAKE) image BUILD=build/r029-desktop RUST_CORE=1 R029_DESKTOP_TEST=1
 	python3 tools/test_r029_desktop_qemu.py --iso build/r029-desktop/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)"
 
