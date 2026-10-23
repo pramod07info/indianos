@@ -1,0 +1,44 @@
+name: Verify R027 durable storage QEMU reboot and recovery
+on:
+  push:
+    branches: [agentx-r027-complete-20261023]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  r027:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install bare-metal QEMU and firmware prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld binutils xorriso qemu-system-x86 ovmf curl
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
+      - name: Unit test all durable multi-sector and power-failure transactions
+        run: cargo test --offline --manifest-path rust/kernel_core/Cargo.toml
+      - name: Freestanding no_std kernel for R027 ATA persistence
+        run: cargo build --offline --manifest-path rust/kernel_core/Cargo.toml --target x86_64-unknown-none --no-default-features --features cpu-entry,vmm,pmm,user-image,paging,paging-cpu,user-runtime,runtime,boot-staging,boot,interrupts,timer,kernel-main,limine-requests,test-r027-durable
+      - name: Rust source ownership audit
+        run: make test-rust-source-audit
+      - name: Existing R015 R027 TinyFs ATA QEMU non-regression
+        run: |
+          set -euo pipefail
+          OVMF_PATH=""
+          for f in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/edk2/ovmf/OVMF_CODE_4M.fd /usr/share/edk2/ovmf/OVMF_CODE.fd; do
+            if test -f "$f"; then OVMF_PATH="$f"; break; fi
+          done
+          test -n "$OVMF_PATH"
+          make test-rust-ata-qemu OVMF_CODE="$OVMF_PATH"
+      - name: R027 QEMU real disk multi-boot persistence and metadata repair
+        run: |
+          set -euo pipefail
+          OVMF_PATH=""
+          for f in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/edk2/ovmf/OVMF_CODE_4M.fd /usr/share/edk2/ovmf/OVMF_CODE.fd; do
+            if test -f "$f"; then OVMF_PATH="$f"; break; fi
+          done
+          test -n "$OVMF_PATH"
+          make test-r027-durable-qemu OVMF_CODE="$OVMF_PATH"
