@@ -345,7 +345,7 @@ def run_smoke(iso: Path, ovmf: Path, qemu: str, timeout: float,
     if timeout <= 0 or timeout > 180:
         raise ValueError("timeout must be between 0 and 180 seconds")
     if mode not in {"normal", "exception", "pagefault", "shadow", "usermode",
-                    "fault-guard", "fault-supervisor", "processes", "scheduler", "preempt", "ipc"}:
+                    "r030", "fault-guard", "fault-supervisor", "processes", "scheduler", "preempt", "ipc"}:
         raise ValueError("invalid smoke-test mode")
     verifiers = {
         "normal": assert_milestones,
