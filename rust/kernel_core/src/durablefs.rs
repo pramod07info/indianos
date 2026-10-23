@@ -158,7 +158,10 @@ impl<D:BlockDevice> DurableFs<D>{
         if disk.sector_count()<MIN_SECTORS || disk.sector_count()>u32::MAX as u64 {
             return Err(FsError::InvalidVolume);
         }
-        for lba in 0..2{
+        // Formatting must not erase a disk whose two metadata sectors
+        // happen to be zero while another sector contains existing data.
+        // The selected window must be EXPLICITLY empty in its entirety.
+        for lba in 0..disk.sector_count(){
             let mut sector=[0u8;SECTOR_BYTES];
             disk.read_sector(lba,&mut sector)?;
             if sector.iter().any(|&b|b!=0){return Err(FsError::InvalidVolume);}
@@ -375,6 +378,9 @@ mod tests{
         let mut invalid=blank();
         invalid.sectors[0][0]=1;
         assert!(matches!(DurableFs::format_blank(invalid),Err(FsError::InvalidVolume)));
+        let mut hidden_data=blank();
+        hidden_data.sectors[MIN_SECTORS as usize-1][123]=0x77;
+        assert!(matches!(DurableFs::format_blank(hidden_data),Err(FsError::InvalidVolume)));
         assert!(matches!(DurableFs::mount(blank()),Err(FsError::InvalidVolume)));
         let mut fs=DurableFs::format_blank(blank()).unwrap();
         for p in ["","a","/","/../escape","/a/../b","/a/b","/back\\slash"]{
