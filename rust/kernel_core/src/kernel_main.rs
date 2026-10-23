@@ -253,7 +253,9 @@ pub extern "C" fn kmain()->!{
         });
         #[cfg(feature="preempt")]
         log(b"IndianOS: R024 APIC preemptive scheduler experiment begin\n\0");
-        #[cfg(all(not(feature="preempt"),feature="test-ipc"))]
+        #[cfg(all(not(feature="preempt"),feature="test-r025"))]
+        log(b"IndianOS: R025 complete syscall services test begin\n\0");
+        #[cfg(all(not(feature="preempt"),feature="test-ipc",not(feature="test-r025")))]
         log(b"IndianOS: R025 secure syscall IPC test begin\n\0");
         #[cfg(all(not(feature="preempt"),not(feature="test-ipc")))]
         log(b"IndianOS: M009 cooperative scheduler experiment begin\n\0");
