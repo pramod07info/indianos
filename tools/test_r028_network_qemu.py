@@ -75,7 +75,7 @@ class Protocol:
         assert len(frame)>=14, "truncated Ethernet frame"
         dst,src,kind=frame[:6],frame[6:12],u16(frame[12:14])
         assert src==GUEST_MAC, f"unexpected guest MAC {src.hex()}"
-        assert dst in (PEER_MAC,b"\xff"*6), "invalid Ethernet destination"
+        assert dst in (PEER_MAC,b"\xff"*6), (f"invalid Ethernet destination: dst={dst.hex()} src={src.hex()} "+f"ethertype={kind:04x} phase={self.phase} raw={frame[:64].hex()}")
         if kind==0x0806:
             assert self.phase==0,"unexpected ARP request order"
             arp=frame[14:]
