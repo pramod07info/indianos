@@ -75,7 +75,7 @@ jobs:
           # Keep one canonical issue for the latest result; do not create an
           # issue for every successful push or create a self-triggering loop.
           TITLE="IndianOS Agent X/Y CI handoff"
-          ISSUE="$(gh issue list --repo "$REPO" --state open --search "$TITLE in:title" --json number,title --jq '.[] | select(.title == "IndianOS Agent X/Y CI handoff") | .number' | head -1)"
+          ISSUE="$(gh issue list --repo "$REPO" --state open --search "$TITLE in:title" --json number,title --jq '[.[] | select(.title == "IndianOS Agent X/Y CI handoff") | .number] | first // empty')"
           if [[ -n "$ISSUE" ]]; then
             gh issue edit "$ISSUE" --repo "$REPO" --body-file handoff.md
           else
