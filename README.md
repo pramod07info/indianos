@@ -2,7 +2,7 @@
 
 **IndianOS** is an experimental, independent desktop operating system for x86-64 PCs, designed for approachable everyday use in India. The goal is a familiar desktop workflow, Indian-language accessibility, and a native kernel—not a Linux distribution or a copy of Microsoft Windows.
 
-> **Status (2026-10-21): M009 cooperative round-robin multitasking verified in QEMU.** IndianOS boots under QEMU/OVMF and now interleaves execution of two distinct ring-3 ELF64 applications using a new `SYS_YIELD` syscall. It saves and restores their CPU registers, stacks and distinct CR3 roots, retaining memory until each task exits. The earlier supervisor/guard fault-containment checks also pass. **Timer preemption is not yet verified**; this is not a production OS, audited sandbox or real-PC installer. Do not flash it to physical storage.
+> **Status (2026-10-23): R024 xAPIC timer-driven preemption verified in QEMU.** IndianOS boots under QEMU/OVMF and now interleaves execution of two distinct ring-3 ELF64 applications using a new `SYS_YIELD` syscall. It saves and restores their CPU registers, stacks and distinct CR3 roots, retaining memory until each task exits. The earlier supervisor/guard fault-containment checks also pass. **APIC timer preemption is QEMU-verified**; this is not a production OS, audited sandbox or real-PC installer. Do not flash it to physical storage.
 
 ## Initial technical decisions
 
@@ -36,6 +36,7 @@
 17. [Milestone 008: PCB lifecycle and two independent user ELF processes](docs/MILESTONE_008_PROCESSES.md)
 18. [Milestone 009: round-robin contexts and timer experiment](docs/MILESTONE_009_SCHEDULER.md)
 19. [Rust-first kernel rewrite (tracked migration)](docs/RUST_MIGRATION.md)
+20. [R024 xAPIC timer-driven process preemption](docs/R024_APIC_PREEMPTION.md)
 20. [Prioritized pending implementation backlog and acceptance checks](docs/IMPLEMENTATION_BACKLOG.md)
 
 ## Directory plan

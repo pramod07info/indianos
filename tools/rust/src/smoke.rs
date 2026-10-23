@@ -247,10 +247,18 @@ pub fn verify(mode:&str,text:&str)->Result<(),String>{
             occurrences(text,&format!("IndianOS: PID {pid} DISPATCHED"))!=3 ||
             occurrences(text,&format!("IndianOS: PID {pid} YIELDED"))!=2
         })=>Err("round robin did not dispatch/yield each task 3/2 times".into()),
-        "preempt" if occurrences(text,"IndianOS: PID 1 APIC_TIMER_PREEMPTED")==0 ||
-            occurrences(text,"IndianOS: PID 2 APIC_TIMER_PREEMPTED")==0 ||
-            text.find("IndianOS: PID 2 DISPATCHED")>text.find("IndianOS: PID 1 EXITED")=>
-            Err("CPU-bound tasks were not preempted".into()),
+        "preempt" if {
+            let pa=text.find("IndianOS: PID 1 APIC_TIMER_PREEMPTED");
+            let pb=text.find("IndianOS: PID 2 APIC_TIMER_PREEMPTED");
+            let b=text.find("IndianOS: PID 2 DISPATCHED");
+            let ea=text.find("IndianOS: PID 1 EXITED");
+            let eb=text.find("IndianOS: PID 2 EXITED");
+            match (pa,pb,b,ea,eb){
+                (Some(pa),Some(pb),Some(b),Some(ea),Some(eb))=>
+                    !(pa<b && b<ea && pb<ea && pa<eb && pb<eb),
+                _=>true
+            }
+        }=>Err("both CPU-bound tasks must be preempted before either exits".into()),
         "processes"|"scheduler"|"preempt" if text.contains("IndianOS: PID 1 FAULTED") ||
               text.contains("IndianOS: PID 2 FAULTED")=>
             Err("successful task unexpectedly faulted".into()),

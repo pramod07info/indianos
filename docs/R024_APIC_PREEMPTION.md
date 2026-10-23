@@ -29,3 +29,14 @@ without initiating hardware scheduling.
 The QEMU runner must reject failures, zero IRQs, missing captures, and
 missing task alternation. Only after this confirmation may R024 be
 consolidated into one verified commit on main.
+
+## Verification evidence (2026-10-23)
+
+The [QEMU verification workflow](https://github.com/pramod07info/indianos/actions/runs/39913743740)
+**passed** its Rust host regressions, bare-metal APIC/IRQ compilation, and
+real ring-3 QEMU preemptive scheduling check. Serial output included
+alternating PID 1 and PID 2 `APIC_TIMER_PREEMPTED` events followed by
+successful exits and the `R024 APIC timer-preemptive round-robin PASSED`
+marker. No voluntary `SYS_YIELD` is in either CPU-bound test application.
+
+Do not generalize this result to physical machines or SMP processors.
