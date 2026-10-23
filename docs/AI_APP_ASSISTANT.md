@@ -1,6 +1,6 @@
 # AI-native app discovery and installation
 
-**Status:** architecture design. IndianOS has no running AI service, app store or installer yet.
+**Status:** AI app assistant, system app store and on-device installer are still designs. R030 separately provides an offline developer-host Ed25519 verifier, native Rust SDK and transactional staging CLI tested with QEMU; it is not an IndianOS kernel package service.
 
 ## Product promise
 

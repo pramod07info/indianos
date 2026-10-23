@@ -19,6 +19,8 @@ establish working interrupts, a desktop, or third-party application support.
 - [x] R028 QEMU legacy virtio-net PCI and strict ARP/IPv4 ping, UDP echo, DNS A answer and TCP request/reply ([passing QEMU network test](https://github.com/pramod07info/indianos/actions/runs/39933935521))
 - [x] R029 actual 1280×800 QEMU framebuffer two-window composition, PS/2 mouse focus and keyboard move/minimize/restore/close with screenshot proof ([passing QEMU test](https://github.com/pramod07info/indianos/actions/runs/39941297124))
 - [x] R029 verified ring-3 ELF drawing Files/Terminal content via bounded, copied and identity-checked surface commands ([passing QEMU screenshots](https://github.com/pramod07info/indianos/actions/runs/39949896007))
+- [x] R030 host-only signed native SDK bundle verification and transactional install/update/rollback/removal, plus three QEMU launches of the signed installed native ELF ([verification](https://github.com/pramod07info/indianos/actions/runs/39956129843))
+- [ ] R030 protected on-device package daemon, OS-managed trust roots, persistent native app launcher, and in-OS install/update/rollback
 - [ ] R029 complete isolated user-space compositor, per-app surface ownership and event-driven application protocol (rendering and input broker remain kernel-owned)
 - [ ] Normal boot launching interactive userland by default and general service management
 
@@ -34,7 +36,7 @@ establish working interrupts, a desktop, or third-party application support.
 | R027 | P1 | **QEMU-verified** ATA LBA28 identification and durable multi-sector volume | **Verified:** five QEMU boots, file overwrites, mirrored checksummed metadata, torn-copy recovery, strict partition bounds; generic PCI/AHCI/NVMe and production storage remain unsupported |
 | R028 | P1 | **QEMU-verified** virtio-net PCI, ARP/IPv4/ICMP/UDP/DNS and bounded TCP demo | **Verified:** real QEMU guest Ethernet packets, host-validated checksums, ARP resolution, ICMP ping, UDP exchange, DNS A response, TCP handshake and reply; general sockets/routing remain pending |
 | R029 | P1 | **QEMU graphics acceptance verified; user-space compositor pending** | **Verified:** actual 1280×800 VGA framebuffer pixels, two independent windows, QEMU PS/2 mouse clicks, keyboard focus/move/minimize/restore/close and screenshot differences. Ring-3 bounded draw-command API is now QEMU-verified; independent per-app surfaces and full user-space compositor remain unfinished |
-| R030 | P1 | Native toolchain SDK, apps and verified package manager | Repeatable signed install, update, remove and rollback of native packages |
+| R030 | P1 | **QEMU-verified developer native SDK and signed host package manager; in-OS service pending** | **Verified:** 15 Ed25519, ELF, tampering and transaction tests; host install/update/rollback/remove; actual SDK ELF booting from signed installed bytes in QEMU three times. OS-managed trust store and on-disk app installer remain pending |
 | R031 | P2 | Security model, authentication, updater, recovery installer | Isolation review, controlled permission tests, signed rollback and virtual-disk install |
 | R032 | P2 | Physical PC/ARM64 hardware-portability program | Published test matrix, qualified devices, measured boot/install performance |
 | R033 | P2 | Policy-gated AI app assistant | AI chooses catalog item but package verifier enforces approval, signatures, compatibility and rollback |
@@ -215,3 +217,9 @@ trusted PID1 drawing client controls both sample windows. A complete
 ring-3 window server with independent application surface ownership
 and event delivery is not yet implemented; this is a bounded,
 verified transition toward that architecture.
+
+## R030 acceptance — Native app packaging in QEMU (2026-10-23)
+
+[Run #39956129843](https://github.com/pramod07info/indianos/actions/runs/39956129843) passed 15 Ed25519 package and transaction tests, Rust host ABI, source audit, and three independent real QEMU ring-3 boots. A no-std SDK-dependent ELF was signed, verified, installed into an explicit disposable developer-host root, injected byte-for-byte from the installed record into initramfs, and executed on QEMU. An updated signed version and then a rollback also booted successfully. Removal disabled activation. The test never installed system packages outside its temporary root. See [R030 signed native package boundaries](R030_SIGNED_NATIVE_PACKAGES.md).
+
+This milestone does **not** provide a kernel-side signed package manager, protected trust root, app store UI, real filesystem installation, application lifecycle services, or arbitrary third-party app support. Those remain R030 work.

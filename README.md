@@ -2,7 +2,7 @@
 
 **IndianOS** is an experimental, independent desktop operating system for x86-64 PCs, designed for approachable everyday use in India. The goal is a familiar desktop workflow, Indian-language accessibility, and a native kernel—not a Linux distribution or a copy of Microsoft Windows.
 
-> **Status (2026-10-23): R024–R028 kernel milestones verified; R029 real graphical QEMU demonstration verified.** IndianOS now has a live QEMU 1280×800 framebuffer desktop drawing two separately focused and movable windows. Physical emulated PS/2 mouse clicks and COM1 keyboard commands change actual on-screen pixels, verified by independent QEMU screenshots. R029's compositor currently executes in the privileged kernel test path, **with a separate verified ring-3 surface-drawing client through bounded graphics syscalls, but not yet as a complete userspace window server**. All graphical and networking demos are opt-in and single-CPU; IndianOS is not a production internet-enabled desktop, POSIX system, audited sandbox or hardware installer. Never flash to a physical disk.
+> **Status (2026-10-23): R024–R030 experimental QEMU and developer-host milestones.** Real kernel tests include timer preemption, secure ring-3 IPC, isolated file services, storage recovery, virtio networking, GUI windows and validated ring-3 rendering. R030 adds a minimal no-std native Rust SDK and a host-only Ed25519 package verifier with signed install/update/rollback tested through three real QEMU native app launches. **There is no on-device package manager, general OS app store or full user-space window server yet.** IndianOS is not a production installer or compatible with arbitrary Linux, Windows or macOS binaries. Never flash it to a physical disk.
 
 ## Initial technical decisions
 
@@ -43,7 +43,8 @@
 24. [R028 verified virtio-net and packet protocol QEMU demo](docs/R028_NETWORK_QEMU.md)
 25. [R029 two-window interactive graphical framebuffer in QEMU](docs/R029_GRAPHICAL_DESKTOP.md)
 26. [R029 user-space two-window rendering command ABI](docs/R029_RING3_SURFACES.md)
-27. [Prioritized pending implementation backlog and acceptance checks](docs/IMPLEMENTATION_BACKLOG.md)
+27. [R030 signed native package manager SDK and real QEMU ELF launches](docs/R030_SIGNED_NATIVE_PACKAGES.md)
+28. [Prioritized pending implementation backlog and acceptance checks](docs/IMPLEMENTATION_BACKLOG.md)
 
 ## Directory plan
 
@@ -67,6 +68,15 @@ The sample manifest contains fictional applications and planned provider routes.
     python3 -m unittest discover -s tests -v
 
 All execution paths are informational; no apps are downloaded or installed. The companion design and security model are documented in [AI_APP_ASSISTANT.md](docs/AI_APP_ASSISTANT.md).
+
+## R030 native SDK and signed offline packages
+
+The [native Rust SDK](sdk/rust/README.md) now supports the experimental IndianOS ring-3 syscall ABI. The [offline package manager](docs/R030_SIGNED_NATIVE_PACKAGES.md) signs and validates native ELF bundles, installs to an explicit disposable host root, and supports update, rollback and removal. Three real QEMU boots verify the exact installed signed app before/after update and rollback. No signing private key is checked into the repository. **This is not yet an installed package service running inside IndianOS.**
+
+~~~sh
+python3 -m unittest discover -s tests -p 'test_r030_packages.py' -v
+make test-r030-native-qemu OVMF_CODE=/usr/share/OVMF/OVMF_CODE_4M.fd
+~~~
 
 ## First kernel implementation (M001)
 
