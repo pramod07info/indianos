@@ -28,7 +28,7 @@ def qemu_boot(root: Path, app: str, build: Path, ovmf: Path, qemu: str, phase: s
     initramfs = build / "initramfs.img"
     initramfs.write_bytes(pack([("/bin/init", payload)]))
     # ISO rebuilt with the newly installed package payload, not source ELF.
-    run("make", "image", f"BUILD={build}", "RUST_CORE=1", "USERMODE_SELFTEST=1")
+    run("make", "image", f"BUILD={build}", "RUST_CORE=1", "USERMODE_SELFTEST=1", "R030_NATIVE_TEST=1")
     iso = build / "indianos.iso"
     with tempfile.TemporaryDirectory(prefix="indianos-r030-iso-") as directory:
         dumped = Path(directory) / "actual-initramfs.img"
@@ -37,7 +37,7 @@ def qemu_boot(root: Path, app: str, build: Path, ovmf: Path, qemu: str, phase: s
         if dumped.read_bytes() != pack([("/bin/init", payload)]):
             raise AssertionError("QEMU ISO does not contain installed signed native ELF")
     run(sys.executable, "tools/smoke_boot.py", "--iso", str(iso),
-        "--qemu", qemu, "--ovmf", str(ovmf), "--mode", "usermode",
+        "--qemu", qemu, "--ovmf", str(ovmf), "--mode", "r030",
         "--timeout", "50", timeout=80)
     if hashlib.sha256(verified.read_bytes()).hexdigest() != original:
         raise AssertionError("host package bytes unexpectedly mutated during launch")
@@ -52,7 +52,7 @@ def main() -> None:
     if not args.ovmf.is_file():
         p.error("OVMF code missing")
     build = Path("build/r030-native")
-    run("make", "image", f"BUILD={build}", "RUST_CORE=1", "USERMODE_SELFTEST=1")
+    run("make", "image", f"BUILD={build}", "RUST_CORE=1", "USERMODE_SELFTEST=1", "R030_NATIVE_TEST=1")
     original = (build / "userland/demo.elf").read_bytes()
     with tempfile.TemporaryDirectory(prefix="indianos-r030-test-root-") as tmp:
         directory = Path(tmp)
