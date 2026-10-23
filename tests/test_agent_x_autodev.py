@@ -76,6 +76,40 @@ class GuardedCodegenTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unsafe"):
             agent.parse_generated(valid_example().replace("pub struct", "std:: pub struct"), task)
 
+    def test_capability_prompt_explicitly_requires_public_type(self) -> None:
+        prompt = agent.prompt_for(agent.TASKS[0])
+        self.assertIn("pub struct Registry", prompt)
+        self.assertIn("pub struct, grant, revoke, #[cfg(test)]", prompt)
+        self.assertIn("revoke_all", prompt)
+        self.assertIn(agent.END, prompt)
+
+    def test_other_task_prompt_does_not_include_capability_requirements(self) -> None:
+        for task in agent.TASKS[1:]:
+            prompt = agent.prompt_for(task)
+            self.assertNotIn("pub struct Registry", prompt)
+            for required in task["required"]:
+                self.assertIn(required, prompt)
+
+    def test_rejected_private_type_cannot_be_applied(self) -> None:
+        candidate = self.root / "private.txt"
+        candidate.write_text(valid_example().replace("pub struct Registry", "struct Registry"), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "missing required task API/test: pub struct"):
+            agent.apply(self.root, "capability", candidate)
+        self.assertFalse((self.root / agent.MODULE_ROOT / "capability.rs").exists())
+        self.assertNotIn("pub mod capability;", (self.root / agent.LIB).read_text())
+
+    def test_retry_prompt_is_bounded_to_allowlisted_task(self) -> None:
+        prompt = self.root / "retry.txt"
+        agent.write_retry_prompt("capability", prompt)
+        content = prompt.read_text(encoding="utf-8")
+        self.assertIn("FINAL RETRY", content)
+        self.assertIn("pub struct Registry", content)
+        self.assertIn(agent.START, content)
+        self.assertIn(agent.END, content)
+        with self.assertRaisesRegex(ValueError, "unknown or unapproved"):
+            agent.write_retry_prompt("../../etc/passwd", prompt)
+        self.assertEqual(prompt.read_text(encoding="utf-8"), content)
+
     def test_no_source_change_on_rejected_candidate(self) -> None:
         candidate = self.root / "bad.txt"
         candidate.write_text(agent.START + "\n" + "short" + "\n" + agent.END)

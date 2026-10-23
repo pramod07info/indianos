@@ -82,14 +82,37 @@ jobs:
           cmake -S /tmp/llama.cpp -B /tmp/llama-build \
             -DGGML_NATIVE=OFF -DLLAMA_CURL=ON -DCMAKE_BUILD_TYPE=Release
           cmake --build /tmp/llama-build --target llama-completion -j 4
-          timeout 900 /tmp/llama-build/bin/llama-completion \
-            -hf bartowski/Qwen2.5-Coder-1.5B-Instruct-GGUF:Q4_K_M \
-            -f /tmp/agent-x-dev-prompt.txt \
-            -n 2200 -c 8192 --temp 0.1 --no-display-prompt \
-            > /tmp/agent-x-raw.txt
-          python3 tools/agent_x_autodev.py apply \
-            --name "${{ steps.task.outputs.name }}" \
-            --generated /tmp/agent-x-raw.txt
+          # A rejected parser or Rust compiler candidate gets exactly one
+          # fresh generation attempt. Never relax the safety or build gates.
+          generated=false
+          for attempt in 1 2; do
+            if [[ "$attempt" -eq 2 ]]; then
+              python3 tools/agent_x_autodev.py retry-prompt \
+                --name "${{ steps.task.outputs.name }}" \
+                --prompt /tmp/agent-x-dev-prompt.txt
+            fi
+            timeout 900 /tmp/llama-build/bin/llama-completion \
+              -hf bartowski/Qwen2.5-Coder-1.5B-Instruct-GGUF:Q4_K_M \
+              -f /tmp/agent-x-dev-prompt.txt \
+              -n 3000 -c 8192 --temp 0.1 --no-display-prompt \
+              > /tmp/agent-x-raw.txt
+            if python3 tools/agent_x_autodev.py apply \
+                --name "${{ steps.task.outputs.name }}" \
+                --generated /tmp/agent-x-raw.txt; then
+              if cargo test --offline --manifest-path rust/kernel_core/Cargo.toml; then
+                generated=true
+                break
+              fi
+              # Only the two allowlisted candidate files are rolled back.
+              git restore -- rust/kernel_core/src/lib.rs
+              rm -- "rust/kernel_core/src/${{ steps.task.outputs.name }}.rs"
+            fi
+            echo "::warning::Rejected model candidate (attempt $attempt of 2)."
+          done
+          if [[ "$generated" != true ]]; then
+            echo "::error::Two rejected model candidates; no source was committed."
+            exit 1
+          fi
 
       - name: Validate generated Rust, kernel source ownership and kernel link
         if: steps.task.outputs.selected == 'true'
@@ -142,7 +165,7 @@ jobs:
         shell: bash
         run: |
           {
-            echo "Agent X did NOT commit the candidate for `$TASK`."
+            echo "Agent X did NOT commit the candidate for '$TASK'."
             echo "Generation, validation, or dispatch failed; see the Actions job log."
             echo "Source: $GITHUB_SERVER_URL/$REPO/actions/runs/$GITHUB_RUN_ID"
           } > /tmp/agent-x-failure.md

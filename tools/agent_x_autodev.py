@@ -91,8 +91,40 @@ def prompt_for(task: dict[str, object]) -> str:
         "file access, privileged hardware access, or side effects.\n"
         "Task " + str(task["name"]) + ": " + str(task["purpose"]) + "\n"
         "All exported types/functions should have clear public APIs.\n"
+        "Your Rust output MUST contain these literal API/test fragments: "
+        + ", ".join(str(item) for item in task["required"]) + ".\n"
+        + (
+            "For capability, declare `pub struct Registry` with public grant, "
+            "lookup, authorize, revoke and revoke_all methods. Prefer simple "
+            "fixed arrays and a u64 token counter; do not use atomics, raw "
+            "pointers, or undefined names. Do not mix Option and Result with ?.\n"
+            if task["name"] == "capability" else ""
+        )
+        + "Keep the implementation concise enough to complete every test "
+        "and the required END marker.\n"
         "Begin your answer now:\n"
     )
+
+
+def retry_prompt_for(task: dict[str, object]) -> str:
+    """Provide stricter guidance on the single permitted regeneration attempt."""
+    reminder = (
+        "FINAL RETRY: The preceding model output was rejected.\n"
+        "Produce new, compilable safe Rust; do not repeat the failed draft.\n"
+        "Required literal fragments: "
+        + ", ".join(str(item) for item in task["required"]) + ".\n"
+        "Check all imports and identifiers, publicly expose required types, "
+        "include at least two #[test] tests, and output both delimiters.\n"
+        "No markdown, explanation, or shell commands.\n"
+    )
+    return prompt_for(task).replace("Begin your answer now:\n", reminder + "Begin your answer now:\n")
+
+
+def write_retry_prompt(name: str, output: Path) -> None:
+    task = next((item for item in TASKS if item["name"] == name), None)
+    if task is None:
+        raise ValueError("unknown or unapproved kernel milestone")
+    output.write_text(retry_prompt_for(task), encoding="utf-8")
 
 
 def parse_generated(raw: str, task: dict[str, object]) -> str:
@@ -155,7 +187,7 @@ def apply(root: Path, name: str, raw_path: Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=["prepare", "apply"])
+    parser.add_argument("command", choices=["prepare", "apply", "retry-prompt"])
     parser.add_argument("--root", type=Path, default=Path("."))
     parser.add_argument("--prompt", type=Path)
     parser.add_argument("--generated", type=Path)
@@ -167,6 +199,10 @@ def main() -> None:
                 parser.error("prepare requires --prompt")
             prepare(args.root, args.prompt,
                     Path(os.environ["GITHUB_OUTPUT"]) if "GITHUB_OUTPUT" in os.environ else None)
+        elif args.command == "retry-prompt":
+            if args.name is None or args.prompt is None:
+                parser.error("retry-prompt requires --name and --prompt")
+            write_retry_prompt(args.name, args.prompt)
         else:
             if args.name is None or args.generated is None:
                 parser.error("apply requires --name and --generated")
