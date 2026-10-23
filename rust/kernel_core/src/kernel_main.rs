@@ -91,6 +91,64 @@ pub extern "C" fn kmain()->!{
         need(disk.write_sector(8,&original).is_ok(),
              b"IndianOS: FATAL R015 ATA restore\n\0");
         log(b"IndianOS: R015 ATA disk read write restore PASSED\n\0");
+        // R027: QEMU disposable IDE disk ONLY. The test runner creates
+        // a 32-sector temporary file and checks every byte after this test.
+        // No normal boot or physical drive can enter this feature path.
+        use crate::block::BlockWindow;
+        use crate::tinyfs::{TinyFs, FsError};
+        const VFS_START: u64 = 16;
+        const VFS_SIZE: usize = 5;
+        need(disk.sector_count() >= VFS_START + VFS_SIZE as u64,
+             b"IndianOS: FATAL R027 disk too small\n\0");
+        let mut saved = [[0u8; SECTOR_BYTES]; VFS_SIZE];
+        for i in 0..VFS_SIZE {
+            need(disk.read_sector(VFS_START + i as u64, &mut saved[i]).is_ok(),
+                 b"IndianOS: FATAL R027 snapshot read failed\n\0");
+        }
+        let mut neighbor = [0u8; SECTOR_BYTES];
+        need(disk.read_sector(VFS_START - 1, &mut neighbor).is_ok(),
+             b"IndianOS: FATAL R027 neighbor read failed\n\0");
+        {
+            let window = BlockWindow::new(&mut disk, VFS_START, VFS_SIZE as u64)
+                .unwrap_or_else(|_| { log(b"IndianOS: FATAL R027 window\n\0"); halt() });
+            let mut fs = TinyFs::format(window)
+                .unwrap_or_else(|_| { log(b"IndianOS: FATAL R027 format\n\0"); halt() });
+            need(fs.create_path("//kernel/./", b"IndianOS persistent QEMU file").is_ok(),
+                 b"IndianOS: FATAL R027 create\n\0");
+            need(fs.create_path("/second", b"separate file").is_ok(),
+                 b"IndianOS: FATAL R027 second create\n\0");
+            need(fs.create_path("/../escape", b"bad") == Err(FsError::InvalidName),
+                 b"IndianOS: FATAL R027 traversal\n\0");
+            let mut readback = [0u8; SECTOR_BYTES];
+            need(fs.read_path("/kernel", &mut readback) == Ok(29) &&
+                 &readback[..29] == &b"IndianOS persistent QEMU file"[..],
+                 b"IndianOS: FATAL R027 readback\n\0");
+            let mut fs = TinyFs::mount(fs.into_device())
+                .unwrap_or_else(|_| { log(b"IndianOS: FATAL R027 remount\n\0"); halt() });
+            readback.fill(0);
+            need(fs.read_path("/./second", &mut readback) == Ok(13) &&
+                 &readback[..13] == &b"separate file"[..],
+                 b"IndianOS: FATAL R027 remount readback\n\0");
+            need(fs.delete_path("/kernel").is_ok() &&
+                 fs.read_path("/kernel", &mut readback) == Err(FsError::NotFound),
+                 b"IndianOS: FATAL R027 delete\n\0");
+            need(fs.create_path("/replacement", b"reused").is_ok(),
+                 b"IndianOS: FATAL R027 reuse\n\0");
+        }
+        for i in 0..VFS_SIZE {
+            need(disk.write_sector(VFS_START + i as u64, &saved[i]).is_ok(),
+                 b"IndianOS: FATAL R027 snapshot restore\n\0");
+        }
+        let mut after = [0u8; SECTOR_BYTES];
+        need(disk.read_sector(VFS_START - 1, &mut after).is_ok() && after == neighbor,
+             b"IndianOS: FATAL R027 neighbor corruption\n\0");
+        for i in 0..VFS_SIZE {
+            need(disk.read_sector(VFS_START + i as u64, &mut after).is_ok() &&
+                 after == saved[i],
+                 b"IndianOS: FATAL R027 restore mismatch\n\0");
+        }
+        log(b"IndianOS: R027 TinyFs ATA QEMU create remount delete restore PASSED\n\0");
+
     }
     log(b"IndianOS: milestone 001 complete\n\0");
 
