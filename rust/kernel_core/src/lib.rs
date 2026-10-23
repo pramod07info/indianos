@@ -14,6 +14,8 @@ mod syscall;
 mod program;
 mod initramfs;
 pub mod block;
+/// Bounded, no-allocation, scheduler-owned IPC primitive (not yet a syscall).
+pub mod ipc;
 pub mod tinyfs;
 pub mod quantum;
 pub mod quantum_circuit;
