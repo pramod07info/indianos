@@ -15,6 +15,7 @@ name = "shell_commands"
 path = "tests/shell_commands.rs"
 
 [dependencies]
+indianos-native-sdk = { path = "../../sdk/rust" }
 
 [features]
 default = []
@@ -29,6 +30,7 @@ ipc-b = []
 r026-shell = []
 r026-worker = []
 r029-client = []
+r030-demo = []
 r025-a = []
 r025-b = []
 fault-guard = []
