@@ -93,12 +93,24 @@ pub unsafe extern "C" fn indianos_syscall_validate(
         5 => request.arg0 == 1 && request.arg1 == 0, // request /bin/worker
         #[cfg(feature="test-interactive")]
         6 => request.arg1 == 1 && user_range(plan,request.arg0,1,true),
-        #[cfg(feature="test-ipc")]
+        #[cfg(all(feature="test-ipc",not(feature="test-r025")))]
         8 => (4..=68).contains(&request.arg1) &&
-            user_range(plan,request.arg0,request.arg1,false), // IPC_SEND
+            user_range(plan,request.arg0,request.arg1,false), // IPC_SEND (R025.1)
+        #[cfg(feature="test-r025")]
+        8 => (12..=76).contains(&request.arg1) &&
+            user_range(plan,request.arg0,request.arg1,false), // Cap-authorized SEND
         #[cfg(feature="test-ipc")]
         9 => request.arg1 == 72 &&
             user_range(plan,request.arg0,72,true), // IPC_RECEIVE
+        #[cfg(feature="test-r025")]
+        10 => request.arg0>0 && request.arg1==0, // request own capability
+        #[cfg(feature="test-r025")]
+        11..=13 => request.arg1==48 &&
+            user_range(plan,request.arg0,48,false), // FILE create/read/delete
+        #[cfg(feature="test-r025")]
+        14 => request.arg0>0 && request.arg1==0, // CAP_REVOKE
+        #[cfg(feature="test-r025")]
+        15 => (1..=2).contains(&request.arg0) && request.arg1==0, // PROCESS_STATUS
         _ => false,
     }
 }
@@ -251,6 +263,44 @@ mod tests {
         assert!(!check(9,plan.stack_end-71,72));
         assert!(!check(9,plan.stack_begin,71));
         assert!(!check(9,plan.guard_begin,72));
+    }
+    #[cfg(feature="test-r025")]
+    #[test]
+    fn r025_syscalls_fail_closed_for_missing_invalid_and_oversized_buffers() {
+        let mut plan=ProgramPlan{
+            entry:USER_MIN, stack_begin:USER_TOP-STACK_BYTES,
+            stack_end:USER_TOP, guard_begin:USER_TOP-STACK_BYTES-PAGE_BYTES,
+            segment_count:1,segments:[ProgramSegment::empty();MAX_SEGMENTS],
+        };
+        plan.segments[0]=ProgramSegment {
+            page_begin:USER_MIN,page_end:USER_MIN+PAGE_BYTES,
+            writable:false,executable:true,..ProgramSegment::empty()
+        };
+        let check=|num,addr,length|unsafe{
+            indianos_syscall_validate(&plan,SyscallRequest {
+                number:num,arg0:addr,arg1:length,
+            })
+        };
+        assert!(check(8,plan.stack_begin,12));
+        assert!(check(8,plan.stack_begin,76));
+        assert!(!check(8,plan.stack_begin,11));
+        assert!(!check(8,plan.stack_begin,77));
+        assert!(check(10,2,0));
+        assert!(!check(10,0,0));
+        for operation in 11..=13 {
+            assert!(check(operation,plan.stack_begin,48));
+            assert!(check(operation,USER_MIN,48));
+            assert!(!check(operation,plan.guard_begin,48));
+            assert!(!check(operation,USER_TOP-47,48));
+            assert!(!check(operation,plan.stack_begin,47));
+            assert!(!check(operation,plan.stack_begin,49));
+        }
+        assert!(check(14,1,0));
+        assert!(!check(14,0,0));
+        assert!(!check(14,1,1));
+        assert!(check(15,1,0));
+        assert!(check(15,2,0));
+        assert!(!check(15,3,0));
     }
     #[test]
     fn trap_frame_blocks_supervisor_selectors_and_guard_stack() {
