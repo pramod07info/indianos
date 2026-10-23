@@ -58,6 +58,13 @@ pub extern "C" fn kmain()->!{
     need(unsafe{boot_validate()},b"IndianOS: FATAL boot information invalid\n\0");
     log(b"IndianOS: boot information validated\n\0");
     unsafe{boot_draw_status();}
+    #[cfg(feature="test-r029-desktop")]
+    {
+        log(b"IndianOS: R029 QEMU graphical desktop start\n\0");
+        need(crate::gui::run(),
+            b"IndianOS: FATAL R029 compositor or interactive input failed\n\0");
+        log(b"IndianOS: R029 desktop shutdown completed\n\0");
+    }
     #[cfg(feature="test-irq-keyboard")]
     {
         need(crate::console::init(),
