@@ -16,6 +16,8 @@ mod initramfs;
 pub mod block;
 /// Bounded, no-allocation, scheduler-owned IPC primitive (not yet a syscall).
 pub mod ipc;
+/// Bounded per-process resource capability grants.
+pub mod capability;
 pub mod tinyfs;
 pub mod quantum;
 pub mod quantum_circuit;
