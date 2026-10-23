@@ -17,6 +17,8 @@ establish working interrupts, a desktop, or third-party application support.
 - [x] Opt-in persistent QEMU serial shell with live worker launch, status, wait and cleanup ([passing verification](https://github.com/pramod07info/indianos/actions/runs/39924988234))
 - [x] Dedicated QEMU IDE device identification and copy-on-write multi-sector storage with reboot and metadata-recovery proof ([verification](https://github.com/pramod07info/indianos/actions/runs/39929748026))
 - [x] R028 QEMU legacy virtio-net PCI and strict ARP/IPv4 ping, UDP echo, DNS A answer and TCP request/reply ([passing QEMU network test](https://github.com/pramod07info/indianos/actions/runs/39933935521))
+- [x] R029 actual 1280×800 QEMU framebuffer two-window composition, PS/2 mouse focus and keyboard move/minimize/restore/close with screenshot proof ([passing QEMU test](https://github.com/pramod07info/indianos/actions/runs/39941297124))
+- [ ] R029 general isolated user-space compositor and application-surface protocol (current graphical demo is privileged kernel-only)
 - [ ] Normal boot launching interactive userland by default and general service management
 
 ## Implementation sequence and exit conditions
@@ -30,7 +32,7 @@ establish working interrupts, a desktop, or third-party application support.
 | R026 | P1 | **QEMU-verified** interactive init, restricted worker launch and lifecycle | **Verified:** serial QEMU commands, shell survives worker start/exit, process status/wait and cleanup. General service management remains future work |
 | R027 | P1 | **QEMU-verified** ATA LBA28 identification and durable multi-sector volume | **Verified:** five QEMU boots, file overwrites, mirrored checksummed metadata, torn-copy recovery, strict partition bounds; generic PCI/AHCI/NVMe and production storage remain unsupported |
 | R028 | P1 | **QEMU-verified** virtio-net PCI, ARP/IPv4/ICMP/UDP/DNS and bounded TCP demo | **Verified:** real QEMU guest Ethernet packets, host-validated checksums, ARP resolution, ICMP ping, UDP exchange, DNS A response, TCP handshake and reply; general sockets/routing remain pending |
-| R029 | P1 | User-space compositor, mouse, windows and graphics | Two independent graphical windows interact in QEMU, not only headless models |
+| R029 | P1 | **QEMU graphics acceptance verified; user-space compositor pending** | **Verified:** actual 1280×800 VGA framebuffer pixels, two independent windows, QEMU PS/2 mouse clicks, keyboard focus/move/minimize/restore/close and screenshot differences. Privilege-separated user-space compositor/window API remains unfinished |
 | R030 | P1 | Native toolchain SDK, apps and verified package manager | Repeatable signed install, update, remove and rollback of native packages |
 | R031 | P2 | Security model, authentication, updater, recovery installer | Isolation review, controlled permission tests, signed rollback and virtual-disk install |
 | R032 | P2 | Physical PC/ARM64 hardware-portability program | Published test matrix, qualified devices, measured boot/install performance |
@@ -172,3 +174,23 @@ demonstration: DHCP, configurable IP, generic TCP sockets, retransmission,
 multiple flows, inbound listening, fragmented IP, network security,
 firewall, modern virtio, SMP and real-NIC hardware are not implemented.
 The full `main` CI requires the R028 real QEMU networking test.
+
+## R029 visual acceptance (2026-10-23)
+
+The [R029 live QEMU verification](https://github.com/pramod07info/indianos/actions/runs/39941297124)
+passed host Rust ABI linkage, GUI model/bounds tests, freestanding Rust
+compilation and a **real 1280×800 QEMU VGA display**, screenshot-verified
+through the QEMU monitor's `screendump` command. The opt-in compositor paints
+two distinct window bodies/titlebars over a software-rendered desktop and
+receives an actual PS/2 auxiliary mouse click selecting Files. The test then
+sends seven COM1 keyboard actions, observing changed framebuffer pixels on
+each focus, move, minimize, restore and close; the quit command exits with
+one remaining window and correct input-event accounting.
+
+The current compositor runs in the **trusted ring-0 kernel** under a dedicated
+feature, not in an unprivileged ring-3 process. The original R029 intention
+of a user-space compositor and message-based application surface isolation
+remains outstanding; this graphical achievement is deliberately **not**
+proof of general desktop readiness. It is disabled in ordinary boot.
+
+The full main kernel CI requires the QEMU framebuffer/mouse acceptance test.
