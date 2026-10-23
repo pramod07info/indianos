@@ -9,7 +9,7 @@
 
 use core::arch::asm;
 use core::panic::PanicInfo;
-#[cfg(any(feature="shell",feature="interactive"))]
+#[cfg(any(feature="shell",feature="interactive",feature="r026-shell"))]
 mod shell;
 
 #[panic_handler]
@@ -116,11 +116,11 @@ fn r025_delete(token:u64,path:&[u8]){
     if r025_file(13,token,path,0,0)!=0{exit(75);}
 }
 
-#[cfg(feature="interactive")]
+#[cfg(any(feature="interactive",feature="r026-shell"))]
 static mut LAST_COMMAND:[u8;64]=[0;64];
-#[cfg(feature="interactive")]
+#[cfg(any(feature="interactive",feature="r026-shell"))]
 static mut LAST_LEN:usize=0;
-#[cfg(feature="interactive")]
+#[cfg(any(feature="interactive",feature="r026-shell"))]
 fn read_line(buffer:&mut [u8;64])->usize{
     let mut used=0usize;
     loop{
@@ -147,8 +147,11 @@ fn read_line(buffer:&mut [u8;64])->usize{
         }
     }
 }
-#[cfg(feature="interactive")]
+#[cfg(any(feature="interactive",feature="r026-shell"))]
 fn interactive_shell()->!{
+    #[cfg(feature="r026-shell")]
+    write(b"R026 persistent interactive shell ready");
+    #[cfg(not(feature="r026-shell"))]
     write(b"R014 interactive shell ready");
     loop {
         write(b"indianos> ");
@@ -165,20 +168,55 @@ fn interactive_shell()->!{
                 write(b"R014 shell: commands help ps run /bin/worker exit"),
             Some(shell::Command::Ps)=>{
                 if call(4,0,0)!=1 {exit(41);}
+                #[cfg(feature="r026-shell")]
+                {
+                    let state=call(16,2,0);
+                    match state {
+                        1=>write(b"R026 shell: ps PID1 RUNNING PID2 NOT_STARTED"),
+                        4=>write(b"R026 shell: ps PID1 RUNNING PID2 REAPED"),
+                        _=>exit(42),
+                    }
+                }
+                #[cfg(not(feature="r026-shell"))]
                 write(b"R014 shell: ps PID 1 RUNNING");
             },
             Some(shell::Command::RunWorker)=>{
-                if call(5,1,0)!=0 {
-                    write(b"R014 shell: worker request rejected");
-                }else{
-                    write(b"R014 shell: worker queued for after exit");
+                #[cfg(feature="r026-shell")]
+                {
+                    if call(5,1,0)!=0{
+                        write(b"R026 shell: duplicate worker launch rejected");
+                    }else{
+                        write(b"R026 shell: worker started; yielding to scheduler");
+                        yield_now();
+                        if call(17,2,0)!=1{exit(43);}
+                        write(b"R026 shell: resumed after worker completion");
+                    }
                 }
+                #[cfg(not(feature="r026-shell"))]
+                {
+                    if call(5,1,0)!=0 {
+                        write(b"R014 shell: worker request rejected");
+                    }else{
+                        write(b"R014 shell: worker queued for after exit");
+                    }
+                }
+            },
+            Some(shell::Command::WaitWorker)=>{
+                #[cfg(feature="r026-shell")]
+                if call(17,2,0)==1{
+                    write(b"R026 shell: wait /bin/worker completed");
+                }else{exit(44);}
+                #[cfg(not(feature="r026-shell"))]
+                write(b"R014 shell: unknown command");
             },
             Some(shell::Command::Version)=>write(b"R015 IndianOS Rust userland shell v0.15"),
             Some(shell::Command::History)=>{
                 write(b"R015 shell: history (one-entry recall with Up arrow)");
             },
             Some(shell::Command::Exit)=>{
+                #[cfg(feature="r026-shell")]
+                write(b"R026 shell: user requested shutdown");
+                #[cfg(not(feature="r026-shell"))]
                 write(b"R014 shell: exit");
                 exit(0);
             },
@@ -194,7 +232,7 @@ pub extern "C" fn _start()->!{
         write(b"Namaste from IndianOS user mode!");
         exit(0);
     }
-    #[cfg(feature="interactive")]
+    #[cfg(any(feature="interactive",feature="r026-shell"))]
     interactive_shell();
     #[cfg(feature="shell")]
     {
@@ -211,6 +249,7 @@ pub extern "C" fn _start()->!{
                     if call(5,1,0)!=0 {exit(31);}
                     write(b"R013 shell: run /bin/worker accepted");
                 }
+                Some(shell::Command::WaitWorker)=>exit(34),
                 Some(shell::Command::Version) => write(b"R015 IndianOS Rust userland shell v0.15"),
                 Some(shell::Command::History) => write(b"R015 shell: history"),
                 Some(shell::Command::Exit) => {
@@ -221,6 +260,13 @@ pub extern "C" fn _start()->!{
             }
         }
         exit(33);
+    }
+    #[cfg(feature="r026-worker")]
+    {
+        if call(4,0,0)!=2 || call(5,1,0)!=u64::MAX ||
+           call(16,2,0)!=u64::MAX || call(17,2,0)!=u64::MAX{exit(56);}
+        write(b"R026 /bin/worker ran in isolated ring-3 process");
+        exit(0);
     }
     #[cfg(feature="worker")]
     {
@@ -384,7 +430,7 @@ pub extern "C" fn _start()->!{
     // It must never be launched outside the opt-in test variants.
     #[cfg(not(any(
         feature="demo",feature="worker",feature="shell",feature="interactive",feature="sched-a",
-        feature="sched-b",feature="ipc-a",feature="ipc-b",feature="r025-a",feature="r025-b",feature="fault-guard",feature="fault-supervisor",
+        feature="sched-b",feature="ipc-a",feature="ipc-b",feature="r026-shell",feature="r026-worker",feature="r025-a",feature="r025-b",feature="fault-guard",feature="fault-supervisor",
         feature="preempt-a",feature="preempt-b"
     )))]
     loop {unsafe{asm!("pause",options(nomem,nostack,preserves_flags))}}

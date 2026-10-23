@@ -2,7 +2,7 @@
 
 **IndianOS** is an experimental, independent desktop operating system for x86-64 PCs, designed for approachable everyday use in India. The goal is a familiar desktop workflow, Indian-language accessibility, and a native kernel—not a Linux distribution or a copy of Microsoft Windows.
 
-> **Status (2026-10-23): R024 APIC preemption and bounded R025 syscall services QEMU-verified.** IndianOS boots under QEMU/OVMF, performs APIC-timer context switching between two CPU-bound ring-3 programs, and implements a QEMU-only authenticated capability/IPC/file/process syscall integration. Normal boot does not enable the experimental file service; it is memory-backed rather than persistent. This is not an installer, POSIX-compatible desktop, audited sandbox or real-PC OS. Do not flash it to physical storage.
+> **Status (2026-10-23): R024 APIC preemption, R025 syscall services and R026 interactive init with worker lifecycle verified in QEMU.** An opt-in Rust userland shell accepts serial commands while remaining alive across a kernel-authorized worker launch and reap. The tested commands include `help`, `ps`, `run /bin/worker`, `wait /bin/worker` and `exit`. Normal boot remains conservative; these are not installed production desktop services. This is not an installer, POSIX-compatible OS, audited sandbox or real-PC release. Do not flash it to physical storage.
 
 ## Initial technical decisions
 
@@ -38,7 +38,8 @@
 19. [Rust-first kernel rewrite (tracked migration)](docs/RUST_MIGRATION.md)
 20. [R024 xAPIC timer-driven process preemption](docs/R024_APIC_PREEMPTION.md)
 21. [R025 complete QEMU capability IPC, filesystem and process syscalls](docs/R025_SECURE_IPC_SYSCALLS.md)
-22. [Prioritized pending implementation backlog and acceptance checks](docs/IMPLEMENTATION_BACKLOG.md)
+22. [R026 persistent QEMU shell and worker service](docs/R026_INTERACTIVE_SHELL.md)
+23. [Prioritized pending implementation backlog and acceptance checks](docs/IMPLEMENTATION_BACKLOG.md)
 
 ## Directory plan
 

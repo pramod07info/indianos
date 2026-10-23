@@ -52,6 +52,10 @@ pub extern "C" fn indianos_r013_take_worker_request()->bool {
 }
 static mut ACTIVE_TASK:*mut Task=ptr::null_mut();
 static mut ACTIVE_PROCESS:*mut Process=ptr::null_mut();
+#[cfg(feature="test-r026")]
+static mut R026_WORKER_REQUESTED:bool=false;
+#[cfg(feature="test-r026")]
+static mut R026_WORKER_REAPED:bool=false;
 // Quantum jobs belong to kernel-verified process IDs, not user-provided IDs.
 // Single-core runtime only; do not access this from interrupt context.
 static mut QUANTUM_JOBS:crate::quantum_service::QuantumService=
@@ -85,6 +89,17 @@ fn authenticated_ipc_pid()->Option<u32>{
        return None;
     }
     Some(p.pid)
+}
+#[cfg(feature="test-r026")]
+fn authenticated_r026_init()->bool{
+    let pcb=unsafe{ptr::read(ptr::addr_of!(ACTIVE_PROCESS))};
+    let task=active_task();
+    let img=active_image();
+    if pcb.is_null()||task.is_null()||img.is_null(){return false;}
+    let p=unsafe{&*pcb};
+    let t=unsafe{&*task};
+    p.pid==1 && p.state==3 && t.pcb==pcb &&
+        ptr::eq(&t.image as *const UserImage,img as *const UserImage)
 }
 fn cleanup_quantum_jobs(pid:u32){
  if pid==0{return;}
@@ -394,7 +409,22 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
   4=>unsafe{ACTIVE_PID as u64},
   #[cfg(all(feature="test-ipc",not(feature="test-shell")))]
   4=>authenticated_ipc_pid().map_or(BAD,u64::from),
-  #[cfg(feature="test-shell")]
+  #[cfg(all(feature="test-shell",feature="test-r026"))]
+  5=>{
+   // PID1 is the only service manager. Grant exactly one worker lifetime.
+   if unsafe{ACTIVE_PID}!=1 || !authenticated_r026_init(){return BAD;}
+   let worker=unsafe{&mut *task_ptr(1)};
+   let Some(p)=(unsafe{worker.pcb.as_mut()})else{return BAD;};
+   if unsafe{R026_WORKER_REQUESTED} || p.pid!=2 ||
+      p.state!=1 || worker.root.root==0 || worker.saved{return BAD;}
+   // Prepared image/table ownership exists but kernel held PID2 in NEW
+   // until an authenticated command requested the allowlisted executable.
+   p.state=2; // READY
+   unsafe{R026_WORKER_REQUESTED=true;}
+   log(b"IndianOS: R026 /bin/worker launch granted to PID1\n\0");
+   0
+  },
+  #[cfg(all(feature="test-shell",not(feature="test-r026")))]
   5=>{
    unsafe{
     if ACTIVE_PID!=1||PENDING_WORKER{return BAD;}
@@ -402,6 +432,20 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
    }
    log(b"IndianOS: R013 PID 1 requested /bin/worker\n\0");
    0
+  },
+  #[cfg(feature="test-r026")]
+  16=>{
+   if !authenticated_r026_init(){return BAD;}
+   let worker=unsafe{&*task_ptr(1)};
+   let Some(p)=(unsafe{worker.pcb.as_ref()})else{return BAD;};
+   if p.pid!=2{return BAD;}
+   p.state as u64
+  },
+  #[cfg(feature="test-r026")]
+  17=>{
+   // Non-blocking wait: 0 if not reaped yet; 1 after exit and cleanup.
+   if !authenticated_r026_init(){return BAD;}
+   if unsafe{R026_WORKER_REAPED}{1}else{0}
   },
   2=>unsafe{x86_64_user_exit_to_kernel(request.arg0)},
   3=>{
@@ -734,6 +778,8 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
  for i in 0..TASKS{
   unsafe{ptr::write(task_ptr(i),core::mem::zeroed())};
  }
+ #[cfg(feature="test-r026")]
+ unsafe{R026_WORKER_REQUESTED=false;R026_WORKER_REAPED=false;}
  let prepared=prepare(task_ptr(0),p,first,first_len,cpu.cr3&PHYS,&vmm,&backend,0)&&
   prepare(task_ptr(1),q,second,second_len,cpu.cr3&PHYS,&vmm,&backend,1);
  if !prepared||!unsafe{indianos_scheduler_init(&mut scheduler,&mut table)}{
@@ -756,6 +802,14 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
   let Some(svc)=R025Services::new()else{return false;};
   unsafe{R025_SERVICES=Some(svc);}
   log(b"IndianOS: R025 capability and isolated file services ready\n\0");
+ }
+ #[cfg(feature="test-r026")]
+ {
+  // Both ELF images have isolated mappings, but PID2 is not eligible
+  // for dispatch until the init shell authorizes its launch.
+  if unsafe{(*q).state}!=2{return false;}
+  unsafe{(*q).state=1;}
+  log(b"IndianOS: R026 worker prepared but not yet runnable\n\0");
  }
  log(b"IndianOS: M009 two simultaneous user address spaces ready\n\0");
  #[cfg(feature="preempt")]
@@ -784,6 +838,8 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
   }else if !unsafe{indianos_process_start(pcb,task.root.root)}{ok=false;break;}
   pid_log(pid,b"DISPATCHED\0");clear_faults();
   unsafe{ACTIVE_USER=&mut task.image;ACTIVE_TASK=task as *mut Task;ACTIVE_PROCESS=pcb;}
+  #[cfg(feature="test-r026")]
+  unsafe{ACTIVE_PID=pid;}
   let status=if task.saved{
    unsafe{x86_64_resume_user(task.frame.as_ptr(),task.root.root)}
   }else{
@@ -791,6 +847,8 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
                              task.image.plan.stack_end-16,task.root.root)}
   };
   unsafe{ACTIVE_TASK=ptr::null_mut();ACTIVE_USER=ptr::null_mut();ACTIVE_PROCESS=ptr::null_mut();}
+  #[cfg(feature="test-r026")]
+  unsafe{ACTIVE_PID=0;}
   let cr3:u64;
   unsafe{asm!("mov {}, cr3",out(reg)cr3,options(nostack,nomem,preserves_flags));}
   if cr3&PHYS!=cpu.cr3&PHYS{
@@ -825,6 +883,11 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
    if !finished{ok=false;break;}
    pid_log(pid,if v==0{&b"EXITED\0"[..]}else{&b"FAULTED\0"[..]});
    if !discard(task as *mut Task,&backend,true){ok=false;break;}
+   #[cfg(feature="test-r026")]
+   if pid==2{
+     unsafe{R026_WORKER_REAPED=true;}
+     log(b"IndianOS: R026 worker exited and reaped while shell remains alive\n\0");
+   }
   }
  }
  if ok&&(!unsafe{indianos_scheduler_all_terminal(&scheduler)} ||
@@ -845,11 +908,18 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
      !crate::timer::xapic_preemption_evidence(irqs,captures){ok=false;}
   if ok{log(b"IndianOS: R024 APIC timer-preemptive round-robin PASSED\n\0");}
  }
- #[cfg(not(feature="preempt"))]
+ #[cfg(all(not(feature="preempt"),not(feature="test-r026")))]
  {
   if scheduler.dispatch_count!=6||scheduler.yield_count!=4||
      scheduler.tick_count!=4{ok=false;}
   if ok{log(b"IndianOS: M009 round-robin cooperative switching PASSED\n\0");}
+ }
+ #[cfg(feature="test-r026")]
+ {
+  if !unsafe{R026_WORKER_REQUESTED && R026_WORKER_REAPED} ||
+     scheduler.dispatch_count<3 || scheduler.yield_count<1 ||
+     scheduler.tick_count<1 {ok=false;}
+  if ok{log(b"IndianOS: R026 persistent interactive worker lifecycle PASSED\n\0");}
  }
  #[cfg(feature="test-ipc")]
  {

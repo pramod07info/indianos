@@ -90,7 +90,9 @@ pub unsafe extern "C" fn indianos_syscall_validate(
         #[cfg(any(feature = "test-shell", feature = "test-ipc"))]
         4 => request.arg0 == 0 && request.arg1 == 0, // GETPID
         #[cfg(feature = "test-shell")]
-        5 => request.arg0 == 1 && request.arg1 == 0, // request /bin/worker
+        5 => request.arg0 == 1 && request.arg1 == 0, // allowlisted /bin/worker
+        #[cfg(feature = "test-r026")]
+        16 | 17 => request.arg0 == 2 && request.arg1 == 0, // worker status/reap query
         #[cfg(feature="test-interactive")]
         6 => request.arg1 == 1 && user_range(plan,request.arg0,1,true),
         #[cfg(all(feature="test-ipc",not(feature="test-r025")))]
@@ -312,6 +314,27 @@ mod tests {
         assert!(check(15,1,0));
         assert!(check(15,2,0));
         assert!(!check(15,3,0));
+    }
+    #[cfg(feature="test-r026")]
+    #[test]
+    fn r026_worker_queries_reject_arbitrary_pid_and_arguments() {
+        let plan=ProgramPlan{
+            entry:USER_MIN,stack_begin:USER_TOP-STACK_BYTES,
+            stack_end:USER_TOP,guard_begin:USER_TOP-STACK_BYTES-PAGE_BYTES,
+            segment_count:0,segments:[ProgramSegment::empty();MAX_SEGMENTS],
+        };
+        let valid=|number,arg0,arg1|unsafe{
+            indianos_syscall_validate(&plan,SyscallRequest{number,arg0,arg1})
+        };
+        assert!(valid(5,1,0));
+        assert!(!valid(5,2,0));
+        for syscall in [16,17]{
+            assert!(valid(syscall,2,0));
+            for pid in [0,1,3,u64::MAX]{
+                assert!(!valid(syscall,pid,0));
+            }
+            assert!(!valid(syscall,2,1));
+        }
     }
     #[test]
     fn trap_frame_blocks_supervisor_selectors_and_guard_stack() {

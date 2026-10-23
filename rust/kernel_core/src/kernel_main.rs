@@ -203,7 +203,7 @@ pub extern "C" fn kmain()->!{
          b"IndianOS: FATAL detached user-image staging failed\n\0");
     log(b"IndianOS: initramfs /bin/init staged and released safely\n\0");
 
-    #[cfg(feature="test-shell")]
+    #[cfg(all(feature="test-shell",not(feature="test-r026")))]
     {
         // Scripted ring-3 init -> validated spawn -> distinct worker lifetime.
         log(b"IndianOS: R013 init shell begin\n\0");
@@ -253,14 +253,19 @@ pub extern "C" fn kmain()->!{
         });
         #[cfg(feature="preempt")]
         log(b"IndianOS: R024 APIC preemptive scheduler experiment begin\n\0");
+        #[cfg(feature="test-r026")]
+        log(b"IndianOS: R026 persistent init shell and on-demand worker begin\n\0");
         #[cfg(all(not(feature="preempt"),feature="test-r025"))]
         log(b"IndianOS: R025 complete syscall services test begin\n\0");
         #[cfg(all(not(feature="preempt"),feature="test-ipc",not(feature="test-r025")))]
         log(b"IndianOS: R025 secure syscall IPC test begin\n\0");
-        #[cfg(all(not(feature="preempt"),not(feature="test-ipc")))]
+        #[cfg(all(not(feature="preempt"),not(feature="test-ipc"),not(feature="test-r026")))]
         log(b"IndianOS: M009 cooperative scheduler experiment begin\n\0");
         need(unsafe{x86_64_m009_schedule_run(init,init_size,worker,worker_size)},
              b"IndianOS: FATAL M009 cooperative context test failed\n\0");
+        #[cfg(feature="test-r026")]
+        log(b"IndianOS: R026 persistent interactive shell session complete\n\0");
+        #[cfg(not(feature="test-r026"))]
         log(b"IndianOS: M009 scheduler experiment complete\n\0");
     }
 

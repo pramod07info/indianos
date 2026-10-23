@@ -14,7 +14,8 @@ establish working interrupts, a desktop, or third-party application support.
   interactive-console primitives with regression tests
 - [x] Absolute VFS path normalization (R021)
 - [x] R024 xAPIC timer preemption with genuine IRQ-to-context-switch proof in QEMU ([passing verification](https://github.com/pramod07info/indianos/actions/runs/39913743740))
-- [ ] Normal boot launching a persistent interactive userland service
+- [x] Opt-in persistent QEMU serial shell with live worker launch, status, wait and cleanup ([passing verification](https://github.com/pramod07info/indianos/actions/runs/39924988234))
+- [ ] Normal boot launching interactive userland by default and general service management
 
 ## Implementation sequence and exit conditions
 
@@ -24,7 +25,7 @@ establish working interrupts, a desktop, or third-party application support.
 | R023 | P0 | Bounded process-event FIFO with per-PID teardown | Zero/one-capacity, wraparound, overflow and ordering tests; no_std build |
 | R024 | P0 | Calibrated local APIC preemption wired to scheduler | QEMU observes IRQs, capture, two CPU-bound tasks alternating without yield; memory/scheduler cleanup |
 | R025 | P0 | **QEMU-verified** capability-gated process, IPC and flat-root file syscalls | **Verified:** ring-3 identity, rights, user-copy bounds, cross-PID denial, revocation and teardown; production service integration remains R026/R027 |
-| R026 | P1 | Persistent interactive init, shell and process services | User can type commands and launch/reap programs via a live QEMU console |
+| R026 | P1 | **QEMU-verified** interactive init, restricted worker launch and lifecycle | **Verified:** serial QEMU commands, shell survives worker start/exit, process status/wait and cleanup. General service management remains future work |
 | R027 | P1 | Device enumeration and reliable block/VFS stack | QEMU block tests, atomic metadata recovery, multi-block files, reboot durability |
 | R028 | P1 | Virtio network driver, ARP/IP/ICMP/UDP/TCP/DNS | QEMU guest network integration, ping and bounded network-client demo |
 | R029 | P1 | User-space compositor, mouse, windows and graphics | Two independent graphical windows interact in QEMU, not only headless models |
@@ -100,3 +101,24 @@ The R025 full QEMU execution is mandatory in the kernel CI workflow.
 Only the bounded experimental QEMU service is complete: multiuser,
 persistent and crash-recoverable file services, blocking multiprocess
 IPC, SMP and real-hardware security are outside this acceptance.
+
+## R026 acceptance — Live interactive init (2026-10-23)
+
+The [R026 QEMU verification](https://github.com/pramod07info/indianos/actions/runs/39924988234)
+passed kernel process/syscall tests, Rust command-parser regressions,
+freestanding no_std compilation, source audit and live QEMU serial scripting.
+The shell remained alive through the exact sequence `help`, `ps`,
+`run /bin/worker`, `ps`, `wait /bin/worker`, duplicate `run`,
+and `exit`. The worker was not runnable before the authenticated launch.
+After the command, the worker ran in its distinct ring-3 image, exited
+and was reaped before PID1 resumed and accepted more commands.
+The shell confirmed the child's state, rejected relaunch and shut down
+only at the user's request. Both PIDs were reaped exactly once.
+
+The ordinary default kernel does **not** start this experimental shell.
+The service supports one allowlisted worker launch per boot; arbitrary
+ELF execution, repeated process creation, persistent filesystem, job
+control, background services and multiuser sessions remain outside
+R026's *bounded QEMU* acceptance and must be developed later.
+
+Full `main` kernel CI requires the R026 serial-interactive QEMU test.
