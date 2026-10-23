@@ -61,7 +61,7 @@ fn ipc_send(receiver:u32, data:&[u8]){
     packet[4..4+data.len()].copy_from_slice(data);
     if call(8,packet.as_ptr() as u64,(4+data.len()) as u64)!=0 {exit(61);}
 }
-#[cfg(any(feature="ipc-a",feature="ipc-b"))]
+#[cfg(any(feature="ipc-a",feature="ipc-b",feature="r025-a",feature="r025-b"))]
 fn ipc_receive(expected_sender:u32,expected_data:&[u8]){
     let mut packet=[0xa5u8;72];
     let n=call(9,packet.as_mut_ptr() as u64,packet.len() as u64);
@@ -70,6 +70,50 @@ fn ipc_receive(expected_sender:u32,expected_data:&[u8]){
        u32::from_le_bytes(packet[4..8].try_into().unwrap())!=expected_data.len() as u32 ||
        &packet[8..8+expected_data.len()]!=expected_data ||
        packet[8+expected_data.len()..].iter().any(|&b|b!=0) {exit(63);}
+}
+
+// R025 full integration: users obtain only their own kernel-issued tokens.
+// No application can mint a token or choose its authenticated sender identity.
+#[cfg(any(feature="r025-a",feature="r025-b"))]
+const FILE_BASE:u64=0x10000;
+#[cfg(any(feature="r025-a",feature="r025-b"))]
+fn r025_token(resource:u64)->u64{
+    let token=call(10,resource,0);
+    if token==u64::MAX||token==0{exit(69)}
+    token
+}
+#[cfg(any(feature="r025-a",feature="r025-b"))]
+fn r025_send(receiver:u32,token:u64,data:&[u8]){
+    if data.len()>64{exit(70);}
+    let mut packet=[0u8;76];
+    packet[..4].copy_from_slice(&receiver.to_le_bytes());
+    packet[4..12].copy_from_slice(&token.to_le_bytes());
+    packet[12..12+data.len()].copy_from_slice(data);
+    if call(8,packet.as_ptr() as u64,(12+data.len()) as u64)!=0{exit(71);}
+}
+#[cfg(any(feature="r025-a",feature="r025-b"))]
+fn r025_file(operation:u64,token:u64,path:&[u8],address:u64,length:u64)->u64{
+    if path.is_empty()||path.len()>=24{exit(72);}
+    let mut descriptor=[0u8;48];
+    descriptor[..8].copy_from_slice(&token.to_le_bytes());
+    descriptor[8..8+path.len()].copy_from_slice(path);
+    descriptor[32..40].copy_from_slice(&address.to_le_bytes());
+    descriptor[40..48].copy_from_slice(&length.to_le_bytes());
+    call(operation,descriptor.as_ptr() as u64,48)
+}
+#[cfg(any(feature="r025-a",feature="r025-b"))]
+fn r025_create(token:u64,path:&[u8],data:&[u8]){
+    if r025_file(11,token,path,data.as_ptr() as u64,data.len() as u64)!=0{exit(73);}
+}
+#[cfg(any(feature="r025-a",feature="r025-b"))]
+fn r025_read(token:u64,path:&[u8],expected:&[u8]){
+    let mut output=[0xccu8;64];
+    let n=r025_file(12,token,path,output.as_mut_ptr() as u64,output.len() as u64);
+    if n!=expected.len() as u64||&output[..expected.len()]!=expected{exit(74);}
+}
+#[cfg(any(feature="r025-a",feature="r025-b"))]
+fn r025_delete(token:u64,path:&[u8]){
+    if r025_file(13,token,path,0,0)!=0{exit(75);}
 }
 
 #[cfg(feature="interactive")]
@@ -183,6 +227,69 @@ pub extern "C" fn _start()->!{
         write(b"IndianOS worker process 2 completed");
         exit(0);
     }
+    #[cfg(feature="r025-a")]
+    {
+        if call(4,0,0)!=1 || call(15,2,0)!=2 || call(15,3,0)!=u64::MAX{exit(76);}
+        write(b"R025 PID1 process service validated");
+        let send=r025_token(2);
+        let file=r025_token(FILE_BASE+1);
+        if call(10,FILE_BASE+2,0)!=u64::MAX{exit(77);}
+        r025_create(file,b"/p1-note",b"owned-by-one");
+        r025_read(file,b"/p1-note",b"owned-by-one");
+        if r025_file(12,file,b"/p2-note",0,0)!=u64::MAX{exit(78);}
+        write(b"R025 PID1 isolated filesystem create/read verified");
+        r025_send(2,send,b"cap-ping");
+        write(b"R025 PID1 capability IPC ping sent");
+        yield_now();
+        ipc_receive(2,b"cap-pong");
+        write(b"R025 PID1 authenticated IPC reply received");
+        let mut forged=[0u8;13];
+        forged[..4].copy_from_slice(&2u32.to_le_bytes());
+        forged[4..12].copy_from_slice(&file.to_le_bytes());
+        forged[12]=b'x';
+        if call(8,forged.as_ptr() as u64,forged.len() as u64)!=u64::MAX ||
+           call(10,FILE_BASE+2,0)!=u64::MAX ||
+           call(8,0,12)!=u64::MAX{exit(79);}
+        write(b"R025 PID1 invalid token and foreign resource rejected");
+        r025_delete(file,b"/p1-note");
+        if call(14,file,0)!=0 ||
+           r025_file(11,file,b"/p1-new",b"x".as_ptr() as u64,1)!=u64::MAX {
+           exit(80);
+        }
+        write(b"R025 PID1 file deletion and capability revocation verified");
+        yield_now();
+        write(b"R025 PID1 exited cleanly");
+        exit(0);
+    }
+    #[cfg(feature="r025-b")]
+    {
+        if call(4,0,0)!=2 || call(15,1,0)!=2{exit(81);}
+        write(b"R025 PID2 process service validated");
+        let send=r025_token(1);
+        let file=r025_token(FILE_BASE+2);
+        ipc_receive(1,b"cap-ping");
+        write(b"R025 PID2 authenticated IPC ping received");
+        r025_create(file,b"/p2-note",b"owned-by-two");
+        r025_read(file,b"/p2-note",b"owned-by-two");
+        let mut denied=[0u8;64];
+        if r025_file(12,file,b"/p1-note",denied.as_mut_ptr() as u64,64)!=u64::MAX ||
+           r025_file(13,file,b"/p1-note",0,0)!=u64::MAX ||
+           call(14,1,0)!=u64::MAX {exit(82);}
+        write(b"R025 PID2 foreign filesystem and token access denied");
+        r025_send(1,send,b"cap-pong");
+        write(b"R025 PID2 capability IPC reply sent");
+        yield_now();
+        r025_read(file,b"/p2-note",b"owned-by-two");
+        r025_delete(file,b"/p2-note");
+        if call(14,file,0)!=0 ||
+           r025_file(12,file,b"/p2-note",denied.as_mut_ptr() as u64,64)!=u64::MAX{
+           exit(83);
+        }
+        write(b"R025 PID2 file deletion and rights teardown verified");
+        yield_now();
+        write(b"R025 PID2 exited cleanly");
+        exit(0);
+    }
     #[cfg(feature="ipc-a")]
     {
         if call(4,0,0)!=1 {exit(64);}
@@ -273,7 +380,7 @@ pub extern "C" fn _start()->!{
     // It must never be launched outside the opt-in test variants.
     #[cfg(not(any(
         feature="demo",feature="worker",feature="shell",feature="interactive",feature="sched-a",
-        feature="sched-b",feature="ipc-a",feature="ipc-b",feature="fault-guard",feature="fault-supervisor",
+        feature="sched-b",feature="ipc-a",feature="ipc-b",feature="r025-a",feature="r025-b",feature="fault-guard",feature="fault-supervisor",
         feature="preempt-a",feature="preempt-b"
     )))]
     loop {unsafe{asm!("pause",options(nomem,nostack,preserves_flags))}}
