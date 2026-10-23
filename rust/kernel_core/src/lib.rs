@@ -18,6 +18,8 @@ pub mod block;
 pub mod ipc;
 /// Bounded per-process resource capability grants.
 pub mod capability;
+/// Allocation-free VFS path validation and canonicalization.
+pub mod vfs_path;
 pub mod tinyfs;
 pub mod quantum;
 pub mod quantum_circuit;
