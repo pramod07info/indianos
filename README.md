@@ -2,7 +2,7 @@
 
 **IndianOS** is an experimental, independent desktop operating system for x86-64 PCs, designed for approachable everyday use in India. The goal is a familiar desktop workflow, Indian-language accessibility, and a native kernel—not a Linux distribution or a copy of Microsoft Windows.
 
-> **Status (2026-10-23): R024 preemption, R025 secure syscalls, R026 interactive shell and R027 QEMU persistent storage verified.** Alongside the experimental Rust ring-3 processes and persistent interactive shell, a separate opt-in ATA-backed R027 filesystem now supports checksummed multi-sector files, copy-on-write metadata and reboot-recovery on disposable QEMU disks. These features are not enabled as a production desktop or real-PC installer. Never flash the experimental OS to physical storage.
+> **Status (2026-10-23): R024–R028 experimental QEMU milestones verified.** IndianOS now has timer-driven ring-3 preemption, capability-gated IPC/file syscalls, a persistent interactive serial shell, an ATA-backed durable QEMU filesystem, and **opt-in virtio-net PCI networking**. The network demo exchanges real Ethernet frames for ARP, IPv4 ping, UDP, DNS and a bounded TCP client request/reply with an isolated host peer. These are experimental single-core, QEMU-specific features; this is not a production internet-enabled desktop, POSIX system, audited sandbox or hardware installer. Never flash to a physical disk.
 
 ## Initial technical decisions
 
@@ -40,7 +40,8 @@
 21. [R025 complete QEMU capability IPC, filesystem and process syscalls](docs/R025_SECURE_IPC_SYSCALLS.md)
 22. [R026 persistent QEMU shell and worker service](docs/R026_INTERACTIVE_SHELL.md)
 23. [R027 durable ATA-backed filesystem and five-boot QEMU recovery](docs/R027_DURABLE_FILESYSTEM.md)
-24. [Prioritized pending implementation backlog and acceptance checks](docs/IMPLEMENTATION_BACKLOG.md)
+24. [R028 verified virtio-net and packet protocol QEMU demo](docs/R028_NETWORK_QEMU.md)
+25. [Prioritized pending implementation backlog and acceptance checks](docs/IMPLEMENTATION_BACKLOG.md)
 
 ## Directory plan
 
