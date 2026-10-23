@@ -1,0 +1,40 @@
+name: R029 genuine QEMU VGA screenshot capture
+on:
+  push:
+    branches: [r029-real-screenshot-capture-20261023]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  screenshots:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install QEMU and kernel build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld binutils xorriso qemu-system-x86 ovmf curl
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
+      - name: Capture real VGA screen throughout interactive QEMU desktop verification
+        shell: bash
+        env:
+          R029_SCREENSHOT_DIR: build/r029-ui-screenshots
+        run: |
+          set -euo pipefail
+          OVMF_PATH=""
+          for f in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/edk2/ovmf/OVMF_CODE_4M.fd /usr/share/edk2/ovmf/OVMF_CODE.fd; do
+            if test -f "$f"; then OVMF_PATH="$f"; break; fi
+          done
+          test -n "$OVMF_PATH"
+          make test-r029-desktop-qemu OVMF_CODE="$OVMF_PATH"
+      - name: Upload true QEMU framebuffer screenshots as image artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: indianos-r029-real-vga-desktop-screenshots
+          path: build/r029-ui-screenshots/*.ppm
+          if-no-files-found: error
+          retention-days: 7
