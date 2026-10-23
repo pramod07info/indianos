@@ -95,11 +95,18 @@ class QemuSession:
             if self.proc.poll() is not None:
                 raise AssertionError("QEMU terminated unexpectedly\n"+
                                      self.output[-5000:].decode("utf8","replace"))
-    def until(self,marker:str,deadline:float=22)->None:
+    def until(self,marker:str,deadline:float=22,from_offset:int=0)->None:
+        # Events may repeat (e.g. keyboard 2, 1, 2). Only accept a marker
+        # emitted AFTER that specific input, never an old log from boot or
+        # an earlier keypress. This also waits for the framebuffer repaint
+        # before HMP screendump can capture the next visual state.
+        if from_offset<0 or from_offset>len(self.output):
+            raise ValueError("invalid serial output checkpoint")
         timeout=time.monotonic()+deadline
-        while marker.encode() not in self.output:
+        expected=marker.encode()
+        while expected not in self.output[from_offset:]:
             if time.monotonic()>timeout:
-                raise AssertionError("missing serial marker "+marker+"\n"+
+                raise AssertionError("missing NEW serial marker "+marker+"\n"+
                     self.output[-8000:].decode("utf8","replace"))
             self.drain_serial(0.1)
     def recv_monitor(self,timeout:float=4)->str:
@@ -186,8 +193,11 @@ def run(qemu:str,iso:pathlib.Path,ovmf:pathlib.Path)->None:
             print("R029 PS2 mouse physically selected Files and changed display pixels")
             previous=after_mouse
             for index,(key,marker) in enumerate(STEPS,2):
+                # Capture the existing log boundary before sending input:
+                # repeated focus markers must wait for their NEW occurrence.
+                checkpoint=len(session.output)
                 session.serial(key)
-                session.until(marker,10)
+                session.until(marker,10,from_offset=checkpoint)
                 changed=session.shot(directory/f"{index:02d}-step.ppm")
                 if differences(previous,changed)<24:
                     raise AssertionError(
