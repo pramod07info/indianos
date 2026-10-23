@@ -173,10 +173,20 @@ impl UserSurfaceService{
     }
     fn redraw(&self)->bool{
         let Some(mut out)=Surface::from_boot()else{return false;};
-        out.render(&self.session.desktop,self.session.mouse_x,self.session.mouse_y);
-        for id in [1u32,2u32]{
-            let Some((origin_x,origin_y,_,_))=self.client_bounds(id)else{return false;};
-            let slot=id as usize-1;
+        let palette=out.palette;
+        // Paint desktop chrome, then each window AND its user commands in
+        // the same z-order. A rear window can never paint over front chrome.
+        out.fill(0,0,out.width as u32,out.height as u32,palette.bg);
+        out.fill(0,0,out.width as u32,48,palette.top);
+        out.text(20,18,b"INDIANOS DESKTOP",palette.white);
+        out.fill(0,(out.height-42) as i32,out.width as u32,42,palette.bar);
+        out.fill(20,(out.height-34) as i32,90,25,palette.title);
+        out.text(30,(out.height-29) as i32,b"APPS",palette.white);
+        for window in self.session.desktop.windows(){
+            out.draw_window(*window,self.session.desktop.focused()==Some(window.id));
+            let Some((origin_x,origin_y,_,_))=self.client_bounds(window.id)
+                else{return false;};
+            let slot=window.id as usize-1;
             for command in &self.commands[slot][..self.counts[slot]]{
                 let rgb=command.rgb;
                 let Some(color)=boot::desktop_rgb(
@@ -191,6 +201,9 @@ impl UserSurfaceService{
                 }
             }
         }
+        out.fill(self.session.mouse_x-1,self.session.mouse_y-10,3,21,palette.accent);
+        out.fill(self.session.mouse_x-10,self.session.mouse_y-1,21,3,palette.accent);
+        out.fill(self.session.mouse_x-1,self.session.mouse_y-1,3,3,palette.white);
         true
     }
     fn submit(&mut self,bytes:&[u8;64])->bool{
