@@ -257,6 +257,20 @@ pub extern "C" fn kmain()->!{
     need(unsafe{pmm_self_test()},
          b"IndianOS: FATAL physical memory self-test failed\n\0");
     log(b"IndianOS: physical memory manager ready\n\0");
+    #[cfg(feature="test-r028-network")]
+    {
+        log(b"IndianOS: R028 legacy virtio-net PCI probe begin\n\0");
+        let mut nic=unsafe{crate::virtio_net::VirtioNet::probe()}
+            .unwrap_or_else(|_|{
+                log(b"IndianOS: FATAL R028 PCI virtio-net probe or DMA setup\n\0");
+                halt()
+            });
+        log(b"IndianOS: R028 legacy virtio-net DMA queues initialized\n\0");
+        let result=crate::network::run_demo(&mut nic,log);
+        nic.close();
+        need(result.is_ok(),b"IndianOS: FATAL R028 ARP ICMP UDP DNS or TCP exchange\n\0");
+        log(b"IndianOS: R028 QEMU virtio-net end-to-end network client PASSED\n\0");
+    }
 
     #[cfg(feature="test-ud2")]
     {

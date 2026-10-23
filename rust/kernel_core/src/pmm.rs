@@ -165,6 +165,33 @@ pub unsafe extern "C" fn pmm_allocate_frame(physical: *mut u64) -> bool {
     false
 }
 
+/// Acquire N physically contiguous 4 KiB frames from ONE usable RAM span.
+/// Required for legacy virtio vrings which do not support scattered ring pages.
+/// # Safety
+/// Single BSP with interrupts disabled; out is exclusive, aligned and writable.
+#[no_mangle]
+pub unsafe extern "C" fn pmm_allocate_contiguous_frames(count:u32,out:*mut u64)->bool{
+    if out.is_null() || count==0 || count>16{return false;}
+    let s=unsafe{state()};
+    let want=count as u64;
+    if !s.initialized || want>s.total-s.used{return false;}
+    for span_index in 0..s.count{
+        let span=s.spans[span_index];
+        if span.count<want{continue;}
+        for offset in 0..=span.count-want{
+            let first_bit=span.bit_offset+offset;
+            if (0..want).any(|i|s.allocated(first_bit+i)){continue;}
+            let Some(first)=span.base.checked_add(offset*PAGE)else{continue;};
+            for i in 0..want{s.set_bit(first_bit+i,true);}
+            s.used+=want;
+            s.cursor=(first_bit+want)%s.total;
+            unsafe{ptr::write(out,first);}
+            return true;
+        }
+    }
+    false
+}
+
 /// # Safety
 /// Caller passes a previously allocated physical frame and uses PMM only on
 /// one CPU. Duplicate frees, unaligned frames and reserved RAM are rejected.
@@ -214,6 +241,13 @@ pub extern "C" fn pmm_self_test() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn contiguous_allocator_contract_rejects_invalid_requests(){
+        let mut frame=0u64;
+        assert!(!unsafe{pmm_allocate_contiguous_frames(0,&mut frame)});
+        assert!(!unsafe{pmm_allocate_contiguous_frames(17,&mut frame)});
+        assert!(!unsafe{pmm_allocate_contiguous_frames(2,ptr::null_mut())});
+    }
     #[test]
     fn bounds_and_layout() {
         assert_eq!(core::mem::size_of::<Region>(), 24);

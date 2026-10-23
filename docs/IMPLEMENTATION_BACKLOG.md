@@ -16,6 +16,7 @@ establish working interrupts, a desktop, or third-party application support.
 - [x] R024 xAPIC timer preemption with genuine IRQ-to-context-switch proof in QEMU ([passing verification](https://github.com/pramod07info/indianos/actions/runs/39913743740))
 - [x] Opt-in persistent QEMU serial shell with live worker launch, status, wait and cleanup ([passing verification](https://github.com/pramod07info/indianos/actions/runs/39924988234))
 - [x] Dedicated QEMU IDE device identification and copy-on-write multi-sector storage with reboot and metadata-recovery proof ([verification](https://github.com/pramod07info/indianos/actions/runs/39929748026))
+- [x] R028 QEMU legacy virtio-net PCI and strict ARP/IPv4 ping, UDP echo, DNS A answer and TCP request/reply ([passing QEMU network test](https://github.com/pramod07info/indianos/actions/runs/39933935521))
 - [ ] Normal boot launching interactive userland by default and general service management
 
 ## Implementation sequence and exit conditions
@@ -28,7 +29,7 @@ establish working interrupts, a desktop, or third-party application support.
 | R025 | P0 | **QEMU-verified** capability-gated process, IPC and flat-root file syscalls | **Verified:** ring-3 identity, rights, user-copy bounds, cross-PID denial, revocation and teardown; production service integration remains R026/R027 |
 | R026 | P1 | **QEMU-verified** interactive init, restricted worker launch and lifecycle | **Verified:** serial QEMU commands, shell survives worker start/exit, process status/wait and cleanup. General service management remains future work |
 | R027 | P1 | **QEMU-verified** ATA LBA28 identification and durable multi-sector volume | **Verified:** five QEMU boots, file overwrites, mirrored checksummed metadata, torn-copy recovery, strict partition bounds; generic PCI/AHCI/NVMe and production storage remain unsupported |
-| R028 | P1 | Virtio network driver, ARP/IP/ICMP/UDP/TCP/DNS | QEMU guest network integration, ping and bounded network-client demo |
+| R028 | P1 | **QEMU-verified** virtio-net PCI, ARP/IPv4/ICMP/UDP/DNS and bounded TCP demo | **Verified:** real QEMU guest Ethernet packets, host-validated checksums, ARP resolution, ICMP ping, UDP exchange, DNS A response, TCP handshake and reply; general sockets/routing remain pending |
 | R029 | P1 | User-space compositor, mouse, windows and graphics | Two independent graphical windows interact in QEMU, not only headless models |
 | R030 | P1 | Native toolchain SDK, apps and verified package manager | Repeatable signed install, update, remove and rollback of native packages |
 | R031 | P2 | Security model, authentication, updater, recovery installer | Isolation review, controlled permission tests, signed rollback and virtual-disk install |
@@ -148,3 +149,26 @@ arbitrary nested directories, production-grade POSIX VFS, cross-process
 locking, encryption, or verified physical power-loss guarantees. The
 separate ATA driver only discovers one legacy IDE primary-master in QEMU;
 physical disk writes and default autoformat remain forbidden.
+
+## R028 acceptance — Real QEMU Ethernet packets (2026-10-23)
+
+The [passing R028 verification run](https://github.com/pramod07info/indianos/actions/runs/39933935521)
+built the freestanding kernel, passed **71 Rust unit tests**, audited source
+ownership and booted QEMU/OVMF with a real emulated legacy virtio-net PCI
+device. On the isolated host-side QEMU socket network backend, the kernel
+performed strict Ethernet ARP resolution, IPv4 ICMP ping, a UDP
+request/response, an A-record DNS query for `indianos.test`, and one TCP
+SYN/SYN-ACK/ACK handshake with validated request/response payloads.
+The host verified every required Ethernet frame (including checksum,
+address, port, length and sequence checks); the guest emitted ordered
+success markers. OVMF's unsolicited pre-boot IPv6 neighbor solicitation
+is ignored only while the R028 protocol demo has not begun.
+
+The driver uses two bounded physically contiguous legacy virtqueues, PCI
+I/O bar discovery, DMA bounce buffers, and one-CPU polling. Networking is
+**off in ordinary boot** and uses an isolated loopback socket peer rather
+than public internet connectivity. TCP is a single stop-and-wait
+demonstration: DHCP, configurable IP, generic TCP sockets, retransmission,
+multiple flows, inbound listening, fragmented IP, network security,
+firewall, modern virtio, SMP and real-NIC hardware are not implemented.
+The full `main` CI requires the R028 real QEMU networking test.

@@ -20,6 +20,8 @@ R014_IRQ_TEST ?= 0
 R015_ATA_TEST ?= 0
 # Isolated QEMU-only, explicitly disposable persistent-drive test.
 R027_DURABLE_TEST ?= 0
+# Explicit single-core QEMU virtio-net network smoke; disabled ordinarily.
+R028_NETWORK_TEST ?= 0
 R025_IPC_TEST ?= 0
 R025_COMPLETE_TEST ?= 0
 R026_INTERACTIVE_TEST ?= 0
@@ -123,7 +125,7 @@ RUST_FEATURES += $(if $(filter 1,$(EXCEPTION_SELFTEST)),--features test-ud2,) \
  $(if $(filter 1,$(PAGING_SWITCH_SELFTEST)),--features test-shadow,) \
  $(if $(filter 1,$(USERMODE_SELFTEST)),--features test-ring3,) \
  $(if $(filter 1,$(PROCESS_SELFTEST)),--features test-processes,) \
- $(if $(filter 1,$(SCHEDULER_SELFTEST)),--features test-scheduler,) $(if $(filter 1,$(R013_SHELL_TEST)),--features test-shell,) $(if $(filter 1,$(R014_INTERACTIVE_TEST)),--features test-interactive,) $(if $(filter 1,$(R014_IRQ_TEST)),--features test-irq-keyboard,) $(if $(filter 1,$(R015_ATA_TEST)),--features test-ata-disk,) $(if $(filter 1,$(R027_DURABLE_TEST)),--features test-r027-durable,) $(if $(filter 1,$(R026_INTERACTIVE_TEST)),--features test-r026,) $(if $(filter 1,$(R025_COMPLETE_TEST)),--features test-r025,) $(if $(filter 1,$(R025_IPC_TEST)),--features test-ipc,)
+ $(if $(filter 1,$(SCHEDULER_SELFTEST)),--features test-scheduler,) $(if $(filter 1,$(R013_SHELL_TEST)),--features test-shell,) $(if $(filter 1,$(R014_INTERACTIVE_TEST)),--features test-interactive,) $(if $(filter 1,$(R014_IRQ_TEST)),--features test-irq-keyboard,) $(if $(filter 1,$(R015_ATA_TEST)),--features test-ata-disk,) $(if $(filter 1,$(R027_DURABLE_TEST)),--features test-r027-durable,) $(if $(filter 1,$(R028_NETWORK_TEST)),--features test-r028-network,) $(if $(filter 1,$(R026_INTERACTIVE_TEST)),--features test-r026,) $(if $(filter 1,$(R025_COMPLETE_TEST)),--features test-r025,) $(if $(filter 1,$(R025_IPC_TEST)),--features test-ipc,)
 ifeq ($(USERFAULT_SELFTEST),1)
 RUST_FEATURES += $(if $(filter guard,$(USERFAULT_KIND)),--features test-fault-guard,--features test-fault-supervisor)
 endif
@@ -937,6 +939,12 @@ clean:
 
 # R015: only a disposable temporary disk; never attach a host block device.
 .PHONY: test-rust-ata-qemu
+.PHONY: test-r028-network-qemu
+
+test-r028-network-qemu:
+	$(MAKE) image BUILD=build/r028-network RUST_CORE=1 R028_NETWORK_TEST=1
+	python3 tools/test_r028_network_qemu.py --iso build/r028-network/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)"
+
 .PHONY: test-r027-durable-qemu
 
 test-r027-durable-qemu:
