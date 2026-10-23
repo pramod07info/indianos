@@ -92,6 +92,11 @@ def assert_expected_shadow(text: str) -> None:
         raise AssertionError("shadow-switch kernel reported fatal error")
 
 
+def assert_expected_r030(text: str) -> None:
+    assert_expected_usermode(text)
+    if "IndianOS user: R030 native SDK signed application started" not in text:
+        raise AssertionError("R030 native SDK application did not actually run")
+
 def assert_expected_usermode(text: str) -> None:
     """Success requires proof of entering user syscall AND returning via exit."""
     if "IndianOS: FATAL" in text:
@@ -348,6 +353,7 @@ def run_smoke(iso: Path, ovmf: Path, qemu: str, timeout: float,
         "pagefault": assert_expected_pagefault,
         "shadow": assert_expected_shadow,
         "usermode": assert_expected_usermode,
+        "r030": assert_expected_r030,
         "fault-guard": lambda log: assert_expected_userfault(log, "fault-guard"),
         "fault-supervisor": lambda log: assert_expected_userfault(log, "fault-supervisor"),
         "processes": assert_expected_processes,
@@ -435,7 +441,7 @@ def main() -> int:
     parser.add_argument("--qemu", default="qemu-system-x86_64")
     parser.add_argument("--machine", choices=("q35", "pc"), default="q35")
     parser.add_argument("--timeout", type=float, default=25)
-    parser.add_argument("--mode", choices=("normal", "exception", "pagefault", "shadow", "usermode", "fault-guard", "fault-supervisor", "processes", "scheduler", "preempt"), default="normal")
+    parser.add_argument("--mode", choices=("normal", "exception", "pagefault", "shadow", "usermode", "r030", "fault-guard", "fault-supervisor", "processes", "scheduler", "preempt"), default="normal")
     args = parser.parse_args()
     try:
         output = run_smoke(args.iso, args.ovmf, args.qemu, args.timeout, args.mode, args.machine)
