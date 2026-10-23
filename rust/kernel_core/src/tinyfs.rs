@@ -3,6 +3,7 @@
 //! Sector 0 is a superblock, sector 1 a directory, sectors 2.. are file data.
 //! This is NOT crash-safe; it has no journal, locking or multi-sector files.
 use crate::block::{BlockDevice, BlockError, SECTOR_BYTES};
+use crate::vfs_path::normalize_absolute;
 const MAGIC: &[u8;8] = b"INDR016!";
 const ENTRIES: usize = 16;
 const ENTRY_BYTES: usize = 32;
@@ -90,6 +91,31 @@ impl<D:BlockDevice> TinyFs<D> {
         self.disk.write_sector(1,&dir)?;
         Ok(())
     }
+    /// Convert an absolute VFS pathname to the only layout this tiny
+    /// filesystem currently supports: one filename directly under /.
+    /// No nested directory is silently flattened or auto-created.
+    fn root_name<'a>(path:&str, scratch:&'a mut [u8;NAME_BYTES]) -> Result<&'a str,FsError>{
+        let n=normalize_absolute(path,scratch).map_err(|_|FsError::InvalidName)?;
+        if n<=1 || scratch[1..n].contains(&b'/'){return Err(FsError::InvalidName);}
+        core::str::from_utf8(&scratch[1..n]).map_err(|_|FsError::InvalidName)
+    }
+    /// Read/write APIs accept absolute VFS paths and reject nested directories.
+    /// Validation is finished before touching any disk sectors.
+    pub fn create_path(&mut self,path:&str,data:&[u8])->Result<(),FsError>{
+        let mut normalized=[0u8;NAME_BYTES];
+        let filename=Self::root_name(path,&mut normalized)?;
+        self.create(filename,data)
+    }
+    pub fn read_path(&mut self,path:&str,out:&mut [u8])->Result<usize,FsError>{
+        let mut normalized=[0u8;NAME_BYTES];
+        let filename=Self::root_name(path,&mut normalized)?;
+        self.read(filename,out)
+    }
+    pub fn delete_path(&mut self,path:&str)->Result<(),FsError>{
+        let mut normalized=[0u8;NAME_BYTES];
+        let filename=Self::root_name(path,&mut normalized)?;
+        self.delete(filename)
+    }
     pub fn into_device(self)->D{self.disk}
 }
 #[cfg(test)]
@@ -120,6 +146,54 @@ mod tests {
         assert_eq!(fs.read("hello",&mut out),Ok(8));
         fs.delete("hello").unwrap();
         assert_eq!(fs.read("hello",&mut out),Err(FsError::NotFound));
+    }
+    #[test] fn absolute_paths_round_trip_and_survive_remount(){
+        let mut fs=TinyFs::format(disk()).unwrap();
+        fs.create_path("//notes///./",b"persisted").unwrap();
+        let mut out=[0;SECTOR_BYTES];
+        assert_eq!(fs.read_path("/notes",&mut out),Ok(9));
+        assert_eq!(&out[..9],b"persisted");
+        assert_eq!(fs.create_path("/./notes",b"duplicate"),Err(FsError::Exists));
+        let mut remounted=TinyFs::mount(fs.into_device()).unwrap();
+        assert_eq!(remounted.read_path("///notes",&mut out),Ok(9));
+        assert_eq!(&out[..9],b"persisted");
+        remounted.delete_path("/./notes/").unwrap();
+        assert_eq!(remounted.read_path("/notes",&mut out),Err(FsError::NotFound));
+        // Slot is reclaimed and a different file can be stored.
+        remounted.create_path("/again",b"new").unwrap();
+        assert_eq!(remounted.read_path("/again",&mut out),Ok(3));
+    }
+    #[test] fn invalid_paths_fail_before_any_disk_mutation(){
+        let mut fs=TinyFs::format(disk()).unwrap();
+        fs.create_path("/existing",b"important").unwrap();
+        let snapshot=fs.disk.sectors;
+        let invalid=[
+            "", "name", "/", "/./", "/a/b", "//a/./b",
+            "/a/../existing", "/../existing", "/a\0b",
+            "/abcdefghijklmnopqrstuvwx", // 24 bytes, capacity is 23
+            "/back\\slash",
+        ];
+        let mut out=[0xaau8;SECTOR_BYTES];
+        for path in invalid{
+            assert_eq!(fs.create_path(path,b"oops"),Err(FsError::InvalidName),"{path:?}");
+            assert_eq!(fs.read_path(path,&mut out),Err(FsError::InvalidName),"{path:?}");
+            assert_eq!(fs.delete_path(path),Err(FsError::InvalidName),"{path:?}");
+            assert_eq!(fs.disk.sectors,snapshot,"disk mutated for {path:?}");
+        }
+        assert!(out.iter().all(|b|*b==0xaa));
+        assert_eq!(fs.read_path("/existing",&mut out),Ok(9));
+        assert_eq!(&out[..9],b"important");
+    }
+    #[test] fn path_name_boundary_and_payload_capacity(){
+        let mut fs=TinyFs::format(disk()).unwrap();
+        let name=format!("/{}", "a".repeat(NAME_BYTES-1));
+        fs.create_path(&name,&[7;SECTOR_BYTES]).unwrap();
+        let mut data=[0u8;SECTOR_BYTES];
+        assert_eq!(fs.read_path(&name,&mut data),Ok(SECTOR_BYTES));
+        assert!(data.iter().all(|b|*b==7));
+        assert_eq!(fs.create_path("/short",&[8;SECTOR_BYTES+1]),Err(FsError::TooLarge));
+        assert_eq!(fs.read_path(&name,&mut [0u8;2]),Err(FsError::TooLarge));
+        assert_eq!(fs.create_path(&name,b"x"),Err(FsError::Exists));
     }
     #[test] fn rejects_bad_inputs_and_capacity(){
         let mut fs=TinyFs::format(disk()).unwrap();
