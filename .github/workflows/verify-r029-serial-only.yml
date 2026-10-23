@@ -1,0 +1,17 @@
+name: Verify R029 serial synchronization without QEMU dependencies
+on:
+  push:
+    branches: [fix-r029-repeated-input-sync-20261023]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  focus-serial:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reject reused serial markers for repeated focus commands
+        run: python3 -m unittest discover -s tools -p 'test_r029_serial_checkpoints.py' -v
+      - name: Python syntax-check real QEMU test script
+        run: python3 -m py_compile tools/test_r029_desktop_qemu.py
