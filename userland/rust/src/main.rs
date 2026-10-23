@@ -266,7 +266,7 @@ fn r029_demo()->!{
     write(b"R029 ring3: user compositor client ready");
     r029_wait_for_host();
     r029_draw(&r029_command(1,1,15,102,220,32,0x0045967c,&[]));
-    r029_draw(&r029_command(1,2,20,109,192,14,0x00ffffff,b"RING3 FILES CONTENT"));
+    r029_draw(&r029_command(1,2,20,109,252,14,0x00ffffff,b"RING3 FILES CONTENT"));
     write(b"R029 ring3: Files content rendered by usermode syscall");
     r029_wait_for_host();
     r029_draw(&r029_command(2,1,20,175,270,32,0x003e589f,&[]));
