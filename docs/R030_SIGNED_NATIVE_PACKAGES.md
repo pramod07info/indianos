@@ -94,3 +94,11 @@ the AI installation assistant are **not implemented here**.
 Independent Windows, Linux and macOS application binaries are not
 compatible with this format. R030 is a verified SDK foundation, not
 general OS application compatibility.
+
+### GitHub Actions verification
+
+[Passing R030 live QEMU SDK verification #39959376254](https://github.com/pramod07info/indianos/actions/runs/39959376254)
+confirmed six host security/lifecycle tests, Rust host ABI regression,
+QEMU ring-3 execution of native signed v1 and signed v2 after update,
+QEMU execution of signed v1 again after rollback, plus tamper denial and
+removal. This does not turn host staging into a guest package daemon.
