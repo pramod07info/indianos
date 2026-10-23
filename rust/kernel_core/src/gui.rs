@@ -191,7 +191,8 @@ impl Session{
         if !p.left{self.dragging=None;}
         if p.left{
             if let Some((id,offset_x,offset_y))=self.dragging{
-                if let Some(w)=self.desktop.windows().find(|w|w.id==id){
+                let moving_window=self.desktop.windows().find(|w|w.id==id).copied();
+                if let Some(w)=moving_window{
                     let x=(self.mouse_x-offset_x).clamp(0,
                         self.desktop.width as i32-w.bounds.width as i32);
                     let y=(self.mouse_y-offset_y).clamp(48,
@@ -216,7 +217,9 @@ impl Session{
                 log(b"IndianOS: R029 keyboard focused Terminal window\n\0");
             }}
             b'h'=>{
-                if let Some(window)=self.desktop.windows().find(|w|w.id==self.active){
+                let moving_window=self.desktop.windows()
+                    .find(|w|w.id==self.active).copied();
+                if let Some(window)=moving_window{
                     let max=self.desktop.width as i32-window.bounds.width as i32;
                     let x=(window.bounds.x+36).min(max);
                     if self.desktop.move_window(self.active,x,window.bounds.y).is_ok(){
