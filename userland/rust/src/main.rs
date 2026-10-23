@@ -225,8 +225,75 @@ fn interactive_shell()->!{
     }
 }
 
+// Separate ring-3 application: owns *commands* for Files and Terminal,
+// not a physical framebuffer pointer or a kernel window-data structure.
+#[cfg(feature="r029-client")]
+fn r029_command(window:u32,kind:u32,x:u16,y:u16,width:u16,height:u16,
+    rgb:u32,text:&[u8])->[u8;64]
+{
+    let mut wire=[0u8;64];
+    wire[..4].copy_from_slice(b"R29U");
+    wire[4..8].copy_from_slice(&1u32.to_le_bytes());
+    wire[8..12].copy_from_slice(&window.to_le_bytes());
+    wire[12..16].copy_from_slice(&kind.to_le_bytes());
+    wire[16..18].copy_from_slice(&x.to_le_bytes());
+    wire[18..20].copy_from_slice(&y.to_le_bytes());
+    wire[20..22].copy_from_slice(&width.to_le_bytes());
+    wire[22..24].copy_from_slice(&height.to_le_bytes());
+    wire[24..28].copy_from_slice(&rgb.to_le_bytes());
+    wire[32..32+text.len()].copy_from_slice(text);
+    wire
+}
+#[cfg(feature="r029-client")]
+fn r029_draw(cmd:&[u8;64]){
+    if call(18,cmd.as_ptr() as u64,64)!=0{exit(91);}
+}
+#[cfg(feature="r029-client")]
+fn r029_wait_for_host(){
+    let mut byte=[0u8;1];
+    for _ in 0..80_000_000 {
+        if call(6,byte.as_mut_ptr() as u64,1)==1{
+            if byte[0]==b'g'{return;}
+            exit(92);
+        }
+        core::hint::spin_loop();
+    }
+    exit(93)
+}
+#[cfg(feature="r029-client")]
+fn r029_demo()->!{
+    if call(4,0,0)!=1 || call(20,0,0)!=(2u64<<24){exit(94);}
+    write(b"R029 ring3: user compositor client ready");
+    r029_wait_for_host();
+    r029_draw(&r029_command(1,1,15,102,220,32,0x0045967c,&[]));
+    r029_draw(&r029_command(1,2,20,109,192,14,0x00ffffff,b"RING3 FILES CONTENT"));
+    write(b"R029 ring3: Files content rendered by usermode syscall");
+    r029_wait_for_host();
+    r029_draw(&r029_command(2,1,20,175,270,32,0x003e589f,&[]));
+    r029_draw(&r029_command(2,2,24,181,240,14,0x00ffffff,b"RING3 TERMINAL READY"));
+    write(b"R029 ring3: Terminal content rendered by usermode syscall");
+    r029_wait_for_host();
+    if call(19,1,0)!=0 || call(19,3,0)!=u64::MAX ||
+       call(20,0,0)!=(1u64<<24|1u64<<16|2u64<<8|2u64) {exit(95);}
+    let mut invalid=r029_command(1,1,1200,900,400,300,0x00445566,&[]);
+    if call(18,invalid.as_ptr() as u64,64)!=u64::MAX ||
+       call(18,0,64)!=u64::MAX ||
+       call(18,0xffff_ffff_8000_0000,64)!=u64::MAX ||
+       call(18,invalid.as_ptr() as u64,63)!=u64::MAX {exit(96);}
+    invalid[0]=0;
+    if call(18,invalid.as_ptr() as u64,64)!=u64::MAX ||
+       call(20,1,0)!=u64::MAX ||
+       call(20,0,0)!=(1u64<<24|1u64<<16|2u64<<8|2u64) {exit(97);}
+    write(b"R029 ring3: isolated drawing bounds and forged pointers rejected");
+    r029_wait_for_host();
+    write(b"R029 ring3: user surface client exited cleanly");
+    exit(0)
+}
+
 #[no_mangle]
 pub extern "C" fn _start()->!{
+    #[cfg(feature="r029-client")]
+    r029_demo();
     #[cfg(feature="demo")]
     {
         write(b"Namaste from IndianOS user mode!");
