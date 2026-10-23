@@ -25,6 +25,10 @@ pub mod process_events;
 pub mod tinyfs;
 /// R027 opt-in checksummed copy-on-write persistent sector filesystem.
 pub mod durablefs;
+/// R028 strict allocator-free Ethernet/IPv4 and protocol demo.
+pub mod network;
+#[cfg(target_arch="x86_64")]
+pub mod virtio_net;
 /// Authenticated process IPC and bounded RAM filesystem service (R025).
 pub mod r025_services;
 pub mod quantum;
