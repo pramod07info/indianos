@@ -275,6 +275,50 @@ def assert_expected_preempt(text: str) -> None:
         raise AssertionError("tasks were not reaped exactly once")
 
 
+
+def assert_expected_ipc(text: str) -> None:
+    assert_milestones(text)
+    if "IndianOS: FATAL" in text:
+        raise AssertionError("R025 kernel failure")
+    markers = (
+        "IndianOS: R025 secure syscall IPC test begin",
+        "IndianOS: PID 1 READY", "IndianOS: PID 2 READY",
+        "IndianOS: R025 authenticated IPC mailboxes ready",
+        "IndianOS: PID 1 DISPATCHED",
+        "IndianOS user: R025 PID1 sent authenticated ping",
+        "IndianOS: PID 1 YIELDED",
+        "IndianOS: PID 2 DISPATCHED",
+        "IndianOS user: R025 PID2 received authenticated ping",
+        "IndianOS user: R025 PID2 sent authenticated reply",
+        "IndianOS: PID 2 YIELDED",
+        "IndianOS: PID 1 DISPATCHED",
+        "IndianOS user: R025 PID1 received authenticated reply",
+        "IndianOS user: R025 PID1 invalid destination and pointers denied",
+        "IndianOS: PID 1 YIELDED",
+        "IndianOS: PID 2 DISPATCHED",
+        "IndianOS user: R025 PID2 empty queue is isolated",
+        "IndianOS: PID 2 YIELDED",
+        "IndianOS: PID 1 DISPATCHED",
+        "IndianOS user: R025 PID1 exited cleanly",
+        "IndianOS: PID 1 EXITED", "IndianOS: PID 1 REAPED",
+        "IndianOS: PID 2 DISPATCHED",
+        "IndianOS user: R025 PID2 exited cleanly",
+        "IndianOS: PID 2 EXITED", "IndianOS: PID 2 REAPED",
+        "IndianOS: M009 round-robin cooperative switching PASSED",
+        "IndianOS: R025 secure IPC two-process handshake PASSED",
+    )
+    position = 0
+    for marker in markers:
+        at = text.find(marker, position)
+        if at < 0:
+            raise AssertionError(f"R025 missing or out-of-order marker: {marker}")
+        position = at + len(marker)
+    for pid in (1, 2):
+        if (text.count(f"IndianOS: PID {pid} DISPATCHED") != 3 or
+            text.count(f"IndianOS: PID {pid} REAPED") != 1 or
+            text.count(f"IndianOS: PID {pid} YIELDED") != 2):
+            raise AssertionError(f"R025 PID {pid} lifecycle mismatch")
+
 def matching_ovmf_vars(code: Path) -> Path | None:
     """Find the matching OVMF_VARS template without altering that template."""
     if not code.name.startswith("OVMF_CODE"):
@@ -296,7 +340,7 @@ def run_smoke(iso: Path, ovmf: Path, qemu: str, timeout: float,
     if timeout <= 0 or timeout > 180:
         raise ValueError("timeout must be between 0 and 180 seconds")
     if mode not in {"normal", "exception", "pagefault", "shadow", "usermode",
-                    "fault-guard", "fault-supervisor", "processes", "scheduler", "preempt"}:
+                    "fault-guard", "fault-supervisor", "processes", "scheduler", "preempt", "ipc"}:
         raise ValueError("invalid smoke-test mode")
     verifiers = {
         "normal": assert_milestones,
@@ -309,6 +353,7 @@ def run_smoke(iso: Path, ovmf: Path, qemu: str, timeout: float,
         "processes": assert_expected_processes,
         "scheduler": assert_expected_scheduler,
         "preempt": assert_expected_preempt,
+        "ipc": assert_expected_ipc,
     }
     verify = verifiers[mode]
     argv = [
