@@ -161,6 +161,15 @@ impl Queue {
         }
     }
 }
+fn configure_queue(port:u16,queue:u16,q:&Queue)->bool{
+    unsafe{outw(port+0x0e,queue);}
+    if unsafe{inw(port+0x0c)}!=QSIZE ||
+       q.ring_phys/PAGE as u64>u32::MAX as u64{
+        return false;
+    }
+    unsafe{outl(port+0x08,(q.ring_phys/PAGE as u64) as u32);}
+    true
+}
 pub struct VirtioNet{
     port:u16,
     mac:[u8;6],
@@ -197,17 +206,13 @@ impl VirtioNet{
             Ok(v)=>v,
             Err(e)=>{rx.release();return Err(e);}
         };
-        for (index,q) in [(QUEUE_RX,&mut rx),(QUEUE_TX,&mut tx)]{
-            unsafe{outw(port+0x0e,index);}
-            if unsafe{inw(port+0x0c)}!=QSIZE {
-                unsafe{outb(port+0x12,0);}
-                rx.release();tx.release();return Err(Error::Device);
-            }
-            if q.ring_phys/PAGE as u64>u32::MAX as u64{
-                unsafe{outb(port+0x12,0);}
-                rx.release();tx.release();return Err(Error::Device);
-            }
-            unsafe{outl(port+0x08,(q.ring_phys/PAGE as u64) as u32);}
+        let rings_ready=
+            configure_queue(port,QUEUE_RX,&rx) &&
+            configure_queue(port,QUEUE_TX,&tx);
+        if !rings_ready {
+            unsafe{outb(port+0x12,0);}
+            rx.release();tx.release();
+            return Err(Error::Device);
         }
         rx.descriptor(FRAME_CAP as u32,true);
         rx.offer();
