@@ -306,6 +306,24 @@ impl UserSurfaceService{
             let _=changed;
         }
     }
+    #[cfg(feature="test-r031-boot-desktop")]
+    fn pump_desktop(&mut self,pid:u32)->Option<u64>{
+        if pid!=1 || self.frame_state(pid).is_none(){return None;}
+        #[cfg(feature="test-r029-physical-events")]
+        {
+            let before=(self.session.mouse_x,self.session.mouse_y,
+                        self.session.desktop.focused());
+            self.pump_mouse();
+            let after=(self.session.mouse_x,self.session.mouse_y,
+                       self.session.desktop.focused());
+            let focus=self.session.desktop.focused()?;
+            // Updated state is represented as a changed bit plus focused
+            // window. No raw kernel pointers or forged mouse packets.
+            return Some((focus as u64)|if before!=after{0x100}else{0});
+        }
+        #[cfg(not(feature="test-r029-physical-events"))]
+        {Some(self.session.desktop.focused()? as u64)}
+    }
     #[cfg(feature="test-r029-desktop-suite")]
     fn desktop_action(&mut self,pid:u32,action:u32)->bool{
         if pid!=1||self.frame_state(pid).is_none(){return false;}
@@ -341,7 +359,8 @@ impl UserSurfaceService{
     }
     #[cfg(feature="test-r029-frame-server")]
     fn present_frame(&mut self,pid:u32,front:u32)->bool{
-        let limit=if cfg!(feature="test-r029-desktop-suite"){5}else{2};
+        let limit=if cfg!(feature="test-r031-boot-desktop"){64}
+                  else if cfg!(feature="test-r029-desktop-suite"){5}else{2};
         if self.frame_state(pid).is_none() ||
            !matches!(front,1|2) ||
            self.counts!=[2,2] ||
@@ -409,6 +428,10 @@ pub(crate) fn user_surface_terminate(pid:u32){
 pub(crate) fn user_surface_ack(pid:u32,sequence:u32)->bool{
     user_service().is_some_and(|svc|svc.broker.ack(pid,sequence).is_ok())
 }
+#[cfg(feature="test-r031-boot-desktop")]
+pub(crate) fn user_desktop_pump(pid:u32)->Option<u64>{
+    user_service()?.pump_desktop(pid)
+}
 #[cfg(feature="test-r029-desktop-suite")]
 pub(crate) fn user_desktop_action(pid:u32,action:u32)->bool{
     user_service().is_some_and(|svc|svc.desktop_action(pid,action))
@@ -424,7 +447,11 @@ pub(crate) fn user_frame_present(pid:u32,front:u32)->bool{
 #[cfg(feature="test-r029-userspace")]
 pub(crate) fn user_surface_verified()->bool{
     user_service().is_some_and(|svc|{
-        #[cfg(feature="test-r029-desktop-suite")]
+        #[cfg(feature="test-r031-boot-desktop")]
+        let frames_ok=svc.frames_presented>=5 && svc.frames_presented<=64 &&
+           svc.desktop_actions>=5 && !svc.launcher_visible &&
+           !svc.broker.known(3);
+        #[cfg(all(feature="test-r029-desktop-suite",not(feature="test-r031-boot-desktop")))]
         let frames_ok=svc.frames_presented==5 && svc.desktop_actions==6 &&
            !svc.launcher_visible && !svc.broker.known(3);
         #[cfg(all(feature="test-r029-frame-server",not(feature="test-r029-desktop-suite")))]

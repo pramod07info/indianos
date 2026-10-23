@@ -44,6 +44,8 @@ test-r029-multiprocess = ["test-r029-physical-events","test-scheduler"]
 # The kernel stays a privileged, clipped pixel backend (not yet full user compositor).
 test-r029-frame-server = ["test-r029-multiprocess"]
 test-r029-desktop-suite = ["test-r029-frame-server","test-ipc"]
+# R031.1: automatic QEMU desktop startup, privileged session manager and input.
+test-r031-boot-desktop = ["test-r029-desktop-suite"]
 # Opt-in QEMU-only R030.1 storage + R030.2 allowlisted native install / launch.
 test-r030-ondevice = ["test-r026"]
 test-ud2 = []

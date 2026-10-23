@@ -1,0 +1,37 @@
+name: Verify R031.1 automatic GUI boot and system session
+on:
+  push:
+    branches: [agentx-r0311-boot-desktop-20261023]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  automatic-gui-session:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install emulator, OVMF and linker
+        run: |
+          sudo timeout 120s apt-get update -o Acquire::Retries=0 -o Acquire::http::Timeout=30
+          sudo timeout 120s apt-get install -y clang lld binutils xorriso qemu-system-x86 ovmf curl
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
+      - name: Rust kernel GUI and IPC unit regressions
+        run: |
+          cargo test --offline --manifest-path rust/kernel_core/Cargo.toml --features test-r031-boot-desktop
+          cargo test --offline --manifest-path tools/rust/Cargo.toml
+          make test-rust-host-abi
+          make test-rust-source-audit
+      - name: Freestanding x86-64 kernel build
+        run: cargo build --offline --manifest-path rust/kernel_core/Cargo.toml --target x86_64-unknown-none --no-default-features --features cpu-entry,vmm,pmm,user-image,paging,paging-cpu,user-runtime,runtime,boot-staging,boot,interrupts,timer,kernel-main,limine-requests,test-r031-boot-desktop
+      - name: QEMU automatic boot, real VGA, interactive shell and PS2 mouse
+        run: |
+          set -euo pipefail
+          OVMF_PATH=""
+          for f in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/edk2/ovmf/OVMF_CODE_4M.fd /usr/share/edk2/ovmf/OVMF_CODE.fd; do
+            if test -f "$f"; then OVMF_PATH="$f"; break; fi
+          done
+          test -n "$OVMF_PATH"
+          make test-r031-boot-desktop-qemu OVMF_CODE="$OVMF_PATH"

@@ -278,6 +278,11 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
    let Some(pid)=authenticated_gui_pid()else{return BAD;};
    crate::gui::user_surface_status(pid).unwrap_or(BAD)
   },
+  #[cfg(feature="test-r031-boot-desktop")]
+  25=>{
+   let Some(pid)=authenticated_gui_pid()else{return BAD;};
+   crate::gui::user_desktop_pump(pid).unwrap_or(BAD)
+  },
   #[cfg(feature="test-r029-desktop-suite")]
   24=>{
    let Some(pid)=authenticated_gui_pid()else{return BAD;};
@@ -1040,6 +1045,8 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
    if !finished{ok=false;break;}
    #[cfg(feature="test-r030-ondevice")]
    fault_hex(b"IndianOS: R030 scheduler exit status=0x\0",status);
+   #[cfg(feature="test-r031-boot-desktop")]
+   fault_hex(b"IndianOS: R031 scheduler process exit=0x\0",status);
    pid_log(pid,if v==0{&b"EXITED\0"[..]}else{&b"FAULTED\0"[..]});
    if !discard(task as *mut Task,&backend,true){ok=false;break;}
    #[cfg(feature="test-r026")]

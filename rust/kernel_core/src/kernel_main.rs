@@ -388,6 +388,8 @@ pub extern "C" fn kmain()->!{
         log(b"IndianOS: R025 complete syscall services test begin\n\0");
         #[cfg(all(not(feature="preempt"),feature="test-ipc",not(feature="test-r025")))]
         log(b"IndianOS: R025 secure syscall IPC test begin\n\0");
+        #[cfg(feature="test-r031-boot-desktop")]
+        log(b"IndianOS: R031.1 boot service starting graphical session automatically\n\0");
         #[cfg(feature="test-r029-multiprocess")]
         log(b"IndianOS: R029.3 two isolated graphical processes begin\n\0");
         #[cfg(all(not(feature="preempt"),not(feature="test-ipc"),not(feature="test-r026"),not(feature="test-r029-multiprocess")))]
@@ -411,7 +413,9 @@ pub extern "C" fn kmain()->!{
         {
             need(crate::gui::user_surface_verified(),
                  b"IndianOS: FATAL R029.3 window ownership or teardown\n\0");
-            #[cfg(feature="test-r029-desktop-suite")]
+            #[cfg(feature="test-r031-boot-desktop")]
+            log(b"IndianOS: R031.1 automatic boot-to-desktop services and shutdown PASSED\n\0");
+            #[cfg(all(feature="test-r029-desktop-suite",not(feature="test-r031-boot-desktop")))]
             log(b"IndianOS: R029.5-7 integrated three-process GUI, IPC and launcher PASSED\n\0");
             #[cfg(not(feature="test-r029-desktop-suite"))]
             log(b"IndianOS: R029.3 independent PID1 Files and PID2 Terminal GUI PASSED\n\0");

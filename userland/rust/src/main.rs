@@ -229,7 +229,8 @@ fn interactive_shell()->!{
 // not a physical framebuffer pointer or a kernel window-data structure.
 #[cfg(any(feature="r029-client",feature="r029-files",feature="r029-terminal",
           feature="r029-frame-server",feature="r029-frame-client",
-          feature="r029-suite-shell",feature="r029-suite-files",feature="r029-suite-terminal"))]
+          feature="r029-suite-shell",feature="r029-suite-files",feature="r029-suite-terminal",
+          feature="r031-shell",feature="r031-files",feature="r031-terminal"))]
 fn r029_command(window:u32,kind:u32,x:u16,y:u16,width:u16,height:u16,
     rgb:u32,text:&[u8])->[u8;64]
 {
@@ -248,13 +249,15 @@ fn r029_command(window:u32,kind:u32,x:u16,y:u16,width:u16,height:u16,
 }
 #[cfg(any(feature="r029-client",feature="r029-files",feature="r029-terminal",
           feature="r029-frame-server",feature="r029-frame-client",
-          feature="r029-suite-shell",feature="r029-suite-files",feature="r029-suite-terminal"))]
+          feature="r029-suite-shell",feature="r029-suite-files",feature="r029-suite-terminal",
+          feature="r031-shell",feature="r031-files",feature="r031-terminal"))]
 fn r029_draw(cmd:&[u8;64]){
     if call(18,cmd.as_ptr() as u64,64)!=0{exit(91);}
 }
 #[cfg(any(feature="r029-client",feature="r029-files",feature="r029-terminal",
           feature="r029-frame-server",feature="r029-frame-client",
-          feature="r029-suite-shell",feature="r029-suite-files",feature="r029-suite-terminal"))]
+          feature="r029-suite-shell",feature="r029-suite-files",feature="r029-suite-terminal",
+          feature="r031-shell",feature="r031-files",feature="r031-terminal"))]
 fn r029_wait_for_host(){
     let mut byte=[0u8;1];
     for _ in 0..80_000_000 {
@@ -474,7 +477,8 @@ fn r029_frame_client()->!{
 }
 // Integrated R029.5-7: PID1 desktop controller, PID2 Files, PID3 Terminal.
 // All clients are distinct protected x86-64 ELF64 images.
-#[cfg(any(feature="r029-suite-shell",feature="r029-suite-files",feature="r029-suite-terminal"))]
+#[cfg(any(feature="r029-suite-shell",feature="r029-suite-files",feature="r029-suite-terminal",
+          feature="r031-shell",feature="r031-files",feature="r031-terminal"))]
 fn suite_send(dst:u32,bytes:&[u8]){
     if bytes.len()>64{exit(140);}
     let mut packet=[0u8;68];
@@ -482,7 +486,8 @@ fn suite_send(dst:u32,bytes:&[u8]){
     packet[4..4+bytes.len()].copy_from_slice(bytes);
     if call(8,packet.as_ptr() as u64,(bytes.len()+4) as u64)!=0{exit(141);}
 }
-#[cfg(any(feature="r029-suite-shell",feature="r029-suite-files",feature="r029-suite-terminal"))]
+#[cfg(any(feature="r029-suite-shell",feature="r029-suite-files",feature="r029-suite-terminal",
+          feature="r031-shell",feature="r031-files",feature="r031-terminal"))]
 fn suite_receive(sender:u32,payload:&[u8]){
     let mut response=[0u8;72];
     let len=call(9,response.as_mut_ptr() as u64,72);
@@ -637,8 +642,139 @@ fn r030_exec()->!{
     write(b"R030.1-2 ring3 lifecycle clean on persistent QEMU volume");
     exit(0);
 }
+// R031.1: automatic boot-to-desktop QEMU session, real ring-3 PID1
+// system-service policy. PID2 Files and PID3 Terminal are independent ELF
+// images, never framebuffer-mapped; all chrome changes are capability checked.
+#[cfg(feature="r031-shell")]
+fn r031_shell()->!{
+    if call(4,0,0)!=1 ||call(22,0,0)!=0||
+       call(25,0,1)!=u64::MAX ||call(24,0,0)!=u64::MAX{exit(171);}
+    write(b"R031.1 init launching GUI services without test-driver keystrokes");
+    yield_now();
+    suite_receive(2,b"FILES");
+    suite_receive(3,b"TERMINAL");
+    if call(22,0,0)!=(2|(2<<8))||call(23,1,0)!=0{exit(172);}
+    write(b"R031.1 AUTOMATIC DESKTOP READY: PID1 shell PID2 Files PID3 Terminal");
+    let mut front=1u32;
+    let mut launcher=false;
+    let mut saw_pointer=false;
+    let mut count=0u32;
+    for _ in 0..300_000_000u32{
+        let pointer=call(25,0,0);
+        if pointer==u64::MAX{exit(173);}
+        if pointer&0x100!=0{
+            let focused=(pointer&0xff) as u32;
+            if focused==1||focused==2{
+                front=focused;
+                if call(23,front as u64,0)!=0{exit(174);}
+            }
+            if !saw_pointer{
+                write(b"R031.1 physical PS2 mouse event reached desktop service");
+                saw_pointer=true;
+            }
+        }
+        let mut byte=[0u8;1];
+        match call(6,byte.as_mut_ptr() as u64,1){
+            0=>{core::hint::spin_loop();continue;}
+            1=>{},
+            _=>exit(175),
+        }
+        match byte[0]{
+            b'a'=>{
+                if call(24,6,0)!=0{exit(176);}
+                launcher=!launcher;
+                write(if launcher{b"R031.1 application launcher OPEN"}
+                      else{b"R031.1 application launcher CLOSED"});
+            }
+            b'1'=>{
+                if call(24,1,0)!=0{exit(177);}
+                front=1;
+                write(b"R031.1 user switched to Files app");
+            }
+            b'2'=>{
+                if call(24,2,0)!=0{exit(178);}
+                front=2;
+                write(b"R031.1 user switched to Terminal app");
+            }
+            b'h'=>{
+                if call(24,3,0)!=0{exit(179);}
+                write(b"R031.1 Files window moved");
+            }
+            b'm'=>{
+                if call(24,4,0)!=0{exit(180);}
+                front=1;
+                write(b"R031.1 Terminal minimized");
+            }
+            b'r'=>{
+                if call(24,5,0)!=0{exit(181);}
+                front=2;
+                write(b"R031.1 Terminal restored");
+            }
+            b'q'=>{
+                if !saw_pointer ||count<6{exit(182);}
+                if launcher{
+                    if call(24,6,0)!=0{exit(183);}
+                    launcher=false;
+                }
+                if call(24,2,0)!=0||call(23,2,0)!=0{exit(184);}
+                suite_send(2,b"EXIT");
+                suite_send(3,b"EXIT");
+                write(b"R031.1 shutdown requested: notifying Files and Terminal");
+                yield_now();
+                write(b"R031.1 session manager exiting after app services");
+                exit(0);
+            }
+            _=>continue,
+        }
+        if call(23,front as u64,0)!=0{exit(185);}
+        count+=1;
+    }
+    exit(186);
+}
+#[cfg(feature="r031-files")]
+fn r031_files()->!{
+    if call(4,0,0)!=2||call(22,0,0)!=u64::MAX||
+       call(24,6,0)!=u64::MAX||call(25,0,0)!=u64::MAX{exit(187);}
+    let foreign=r029_command(2,1,20,80,200,32,0x00ff0000,&[]);
+    if call(18,foreign.as_ptr() as u64,64)!=u64::MAX{exit(188);}
+    r029_draw(&r029_command(1,1,15,102,264,32,0x0045967c,&[]));
+    r029_draw(&r029_command(1,2,18,109,240,14,0x00ffffff,b"FILES SERVICE PID2"));
+    suite_send(1,b"FILES");
+    write(b"R031.1 Files service registered and running");
+    yield_now();
+    suite_receive(1,b"EXIT");
+    if call(18,foreign.as_ptr() as u64,64)!=u64::MAX{exit(189);}
+    write(b"R031.1 Files service stopped and capabilities revoked");
+    exit(0);
+}
+#[cfg(feature="r031-terminal")]
+fn r031_terminal()->!{
+    if call(4,0,0)!=3||call(22,0,0)!=u64::MAX||
+       call(24,6,0)!=u64::MAX||call(25,0,0)!=u64::MAX{exit(190);}
+    let foreign=r029_command(1,1,20,80,200,32,0x00ff0000,&[]);
+    if call(18,foreign.as_ptr() as u64,64)!=u64::MAX{exit(191);}
+    r029_draw(&r029_command(2,1,20,175,270,32,0x003e589f,&[]));
+    r029_draw(&r029_command(2,2,24,181,270,14,0x00ffffff,b"TERMINAL SERVICE PID3"));
+    suite_send(1,b"TERMINAL");
+    write(b"R031.1 Terminal service registered and running");
+    yield_now();
+    suite_receive(1,b"EXIT");
+    let mut event=[0u8;16];
+    let n=call(21,event.as_mut_ptr() as u64,16);
+    if n!=16 ||
+       u32::from_le_bytes(event[4..8].try_into().unwrap())!=2||
+       u32::from_le_bytes(event[8..12].try_into().unwrap())!=2{exit(192);}
+    write(b"R031.1 Terminal received owned physical focus notification");
+    exit(0);
+}
 #[no_mangle]
 pub extern "C" fn _start()->!{
+    #[cfg(feature="r031-shell")]
+    r031_shell();
+    #[cfg(feature="r031-files")]
+    r031_files();
+    #[cfg(feature="r031-terminal")]
+    r031_terminal();
     #[cfg(feature="r030-ondevice-init")]
     r030_exec();
     #[cfg(feature="r030-ondevice-app")]
