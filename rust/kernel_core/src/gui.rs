@@ -153,6 +153,8 @@ struct UserSurfaceService{
     counts:[usize;2],
     focused:u32,
     broker:Broker<2,8>,
+    #[cfg(feature="test-r029-frame-server")]
+    frames_presented:u32,
     #[cfg(feature="test-r029-physical-events")]
     mouse:Mouse,
 }
@@ -174,6 +176,8 @@ impl UserSurfaceService{
         Some(Self{session,
             commands:[[UserCommand::EMPTY;COMMAND_LIMIT];2],
             counts:[0,0],focused:0,broker,
+            #[cfg(feature="test-r029-frame-server")]
+            frames_presented:0,
             #[cfg(feature="test-r029-physical-events")]
             mouse})
     }
@@ -231,11 +235,17 @@ impl UserSurfaceService{
         }
         self.commands[slot][self.counts[slot]]=cmd;
         self.counts[slot]+=1;
+        // A client may submit commands but cannot cause a frame to be
+        // displayed. Only the authenticated ring-3 frame server can.
+        #[cfg(feature="test-r029-frame-server")]
+        {return true;}
+        #[cfg(not(feature="test-r029-frame-server"))]
         if self.redraw(){true}else{self.counts[slot]-=1;false}
     }
     fn focus(&mut self,pid:u32,id:u32)->bool{
         if !self.broker.can_post(pid,id){return false;}
         if !self.session.focus(id){return false;}
+        #[cfg(not(feature="test-r029-frame-server"))]
         if !self.redraw(){return false;}
         if self.broker.post_focus(pid,id).is_err(){return false;}
         self.focused+=1;true
@@ -265,8 +275,36 @@ impl UserSurfaceService{
                     log(b"IndianOS: R029.2 physical mouse focus event queued\n\0");
                 }
             }
+            #[cfg(not(feature="test-r029-frame-server"))]
             if changed{let _=self.redraw();}
+            #[cfg(feature="test-r029-frame-server")]
+            let _=changed;
         }
+    }
+    #[cfg(feature="test-r029-frame-server")]
+    fn frame_state(&self,pid:u32)->Option<u64>{
+        // The frame server is an explicit kernel-granted identity. PID2
+        // cannot read or present the combined display even though it owns
+        // its own drawing stream.
+        if pid!=1 || !self.broker.owns(pid,self.session.files){return None;}
+        Some(self.counts[0] as u64 |
+             ((self.counts[1] as u64)<<8) |
+             ((self.frames_presented as u64)<<16))
+    }
+    #[cfg(feature="test-r029-frame-server")]
+    fn present_frame(&mut self,pid:u32,front:u32)->bool{
+        if self.frame_state(pid).is_none() ||
+           !matches!(front,1|2) ||
+           self.counts!=[2,2] ||
+           self.frames_presented>=2{return false;}
+        // Window stacking order is selected by the ring-3 compositor
+        // policy. The privileged kernel remains only a clipped raster
+        // backend in this opt-in implementation.
+        if !self.session.focus(front){return false;}
+        if !self.redraw(){return false;}
+        self.frames_presented+=1;
+        log(b"IndianOS: R029.4 user-controlled framebuffer frame presented\n\0");
+        true
     }
 }
 #[cfg(feature="test-r029-userspace")]
@@ -321,10 +359,22 @@ pub(crate) fn user_surface_terminate(pid:u32){
 pub(crate) fn user_surface_ack(pid:u32,sequence:u32)->bool{
     user_service().is_some_and(|svc|svc.broker.ack(pid,sequence).is_ok())
 }
+#[cfg(feature="test-r029-frame-server")]
+pub(crate) fn user_frame_state(pid:u32)->Option<u64>{
+    user_service()?.frame_state(pid)
+}
+#[cfg(feature="test-r029-frame-server")]
+pub(crate) fn user_frame_present(pid:u32,front:u32)->bool{
+    user_service().is_some_and(|svc|svc.present_frame(pid,front))
+}
 #[cfg(feature="test-r029-userspace")]
 pub(crate) fn user_surface_verified()->bool{
     user_service().is_some_and(|svc|{
-        svc.counts==[2,2] && svc.focused>=1 &&
+        #[cfg(feature="test-r029-frame-server")]
+        let frames_ok=svc.frames_presented==2;
+        #[cfg(not(feature="test-r029-frame-server"))]
+        let frames_ok=svc.focused>=1;
+        svc.counts==[2,2] && frames_ok &&
         !svc.broker.known(1) && !svc.broker.known(2) &&
         svc.session.desktop.focused()==Some(
             if cfg!(feature="test-r029-physical-events") {

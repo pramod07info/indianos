@@ -32,6 +32,8 @@ r029-client = []
 r029-physical = ["r029-client"]
 r029-files = []
 r029-terminal = []
+r029-frame-server = []
+r029-frame-client = []
 # Signed R030 native SDK sample application, two independently versioned ELFs.
 r030-demo-v1 = []
 r030-demo-v2 = []

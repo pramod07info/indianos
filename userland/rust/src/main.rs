@@ -227,7 +227,8 @@ fn interactive_shell()->!{
 
 // Separate ring-3 application: owns *commands* for Files and Terminal,
 // not a physical framebuffer pointer or a kernel window-data structure.
-#[cfg(any(feature="r029-client",feature="r029-files",feature="r029-terminal"))]
+#[cfg(any(feature="r029-client",feature="r029-files",feature="r029-terminal",
+          feature="r029-frame-server",feature="r029-frame-client"))]
 fn r029_command(window:u32,kind:u32,x:u16,y:u16,width:u16,height:u16,
     rgb:u32,text:&[u8])->[u8;64]
 {
@@ -244,11 +245,13 @@ fn r029_command(window:u32,kind:u32,x:u16,y:u16,width:u16,height:u16,
     wire[32..32+text.len()].copy_from_slice(text);
     wire
 }
-#[cfg(any(feature="r029-client",feature="r029-files",feature="r029-terminal"))]
+#[cfg(any(feature="r029-client",feature="r029-files",feature="r029-terminal",
+          feature="r029-frame-server",feature="r029-frame-client"))]
 fn r029_draw(cmd:&[u8;64]){
     if call(18,cmd.as_ptr() as u64,64)!=0{exit(91);}
 }
-#[cfg(any(feature="r029-client",feature="r029-files",feature="r029-terminal"))]
+#[cfg(any(feature="r029-client",feature="r029-files",feature="r029-terminal",
+          feature="r029-frame-server",feature="r029-frame-client"))]
 fn r029_wait_for_host(){
     let mut byte=[0u8;1];
     for _ in 0..80_000_000 {
@@ -395,8 +398,83 @@ fn r029_app()->!{
         exit(0);
     }
 }
+// R029.4: separate frame-server and client ELF images, each with its own
+// virtual address space. PID2 publishes commands but cannot present pixels.
+#[cfg(feature="r029-frame-server")]
+fn r029_frame_server()->!{
+    if call(4,0,0)!=1 || call(22,0,0)!=0 || call(23,1,0)!=u64::MAX{
+        exit(130);
+    }
+    let forbidden=r029_command(2,1,15,120,100,20,0x00bb2211,&[]);
+    if call(18,forbidden.as_ptr() as u64,64)!=u64::MAX{exit(131);}
+    write(b"R029.4 frame server PID1 ready");
+    r029_wait_for_host();
+    r029_draw(&r029_command(1,1,15,102,264,32,0x0045967c,&[]));
+    r029_draw(&r029_command(1,2,18,109,240,14,0x00ffffff,b"USER FRAME SERVER"));
+    write(b"R029.4 Files surface queued, not presented");
+    yield_now();
+    write(b"R029.4 frame server ready for first present");
+    r029_wait_for_host();
+    if call(22,0,0)!=(2|(2<<8)) ||
+       call(23,0,0)!=u64::MAX || call(23,1,0)!=0 ||
+       call(22,0,0)!=(2|(2<<8)|(1<<16)){exit(132);}
+    write(b"R029.4 first user-scheduled frame presented");
+    yield_now();
+    write(b"R029.4 frame server ready for second present");
+    r029_wait_for_host();
+    if call(22,0,0)!=(2|(2<<8)|(1<<16)) ||
+       call(23,2,0)!=0 ||
+       call(22,0,0)!=(2|(2<<8)|(2<<16)) ||
+       call(23,1,0)!=u64::MAX {exit(133);}
+    write(b"R029.4 second user-scheduled frame presented");
+    exit(0);
+}
+#[cfg(feature="r029-frame-client")]
+fn r029_frame_client()->!{
+    if call(4,0,0)!=2 || call(22,0,0)!=u64::MAX ||
+       call(23,2,0)!=u64::MAX{exit(134);}
+    let foreign=r029_command(1,1,16,102,120,20,0x00ff0000,&[]);
+    if call(18,foreign.as_ptr() as u64,64)!=u64::MAX ||
+       call(19,1,0)!=u64::MAX {exit(135);}
+    write(b"R029.4 client PID2 ready");
+    r029_wait_for_host();
+    r029_draw(&r029_command(2,1,20,175,264,32,0x003e589f,&[]));
+    r029_draw(&r029_command(2,2,24,181,240,14,0x00ffffff,b"FRAME CLIENT PID2"));
+    write(b"R029.4 Terminal queued, no framebuffer draw");
+    yield_now();
+    write(b"R029.4 client waiting for real PS2 event");
+    let mut event=[0u8;16];
+    let mut arrived=false;
+    for _ in 0..18_000_000 {
+        match call(21,event.as_mut_ptr() as u64,16) {
+            0=>core::hint::spin_loop(),
+            16=>{
+                let seq=u32::from_le_bytes(event[..4].try_into().unwrap());
+                let window=u32::from_le_bytes(event[4..8].try_into().unwrap());
+                let kind=u32::from_le_bytes(event[8..12].try_into().unwrap());
+                if seq!=1||window!=2||kind!=2||event[12..]!=[0;4]{
+                    exit(136);
+                }
+                arrived=true;break;
+            },
+            _=>exit(137),
+        }
+    }
+    if !arrived||(call(20,0,0)>>24)!=2 {exit(138);}
+    write(b"R029.4 physical PS2 event queued without kernel present");
+    yield_now();
+    if call(22,0,0)!=u64::MAX || call(23,2,0)!=u64::MAX ||
+       call(18,foreign.as_ptr() as u64,64)!=u64::MAX ||
+       call(20,0,0)==u64::MAX {exit(139);}
+    write(b"R029.4 client survived independent compositor teardown");
+    exit(0);
+}
 #[no_mangle]
 pub extern "C" fn _start()->!{
+    #[cfg(feature="r029-frame-server")]
+    r029_frame_server();
+    #[cfg(feature="r029-frame-client")]
+    r029_frame_client();
     #[cfg(any(feature="r029-files",feature="r029-terminal"))]
     r029_app();
     #[cfg(feature="r029-client")]

@@ -1,0 +1,38 @@
+name: R029.4 verify isolated userspace frame scheduling
+on:
+  push:
+    branches: [agentx-r029-frame-server-20261023]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  two-elf-frame-server:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install freestanding QEMU toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld binutils xorriso qemu-system-x86 ovmf curl
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
+      - name: Rust kernel, syscall and window broker unit regression
+        run: cargo test --offline --manifest-path rust/kernel_core/Cargo.toml --features test-r029-frame-server
+      - name: C ABI and kernel source policy
+        run: |
+          make test-rust-host-abi
+          make test-rust-source-audit
+      - name: Bare metal freestanding compositor syscall compile
+        run: cargo build --offline --manifest-path rust/kernel_core/Cargo.toml --target x86_64-unknown-none --no-default-features --features cpu-entry,vmm,pmm,user-image,paging,paging-cpu,user-runtime,runtime,boot-staging,boot,interrupts,timer,kernel-main,limine-requests,test-r029-frame-server
+      - name: QEMU prove actual pixels are gated by ring3 compositor present
+        shell: bash
+        run: |
+          set -euo pipefail
+          OVMF_PATH=""
+          for f in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/edk2/ovmf/OVMF_CODE_4M.fd /usr/share/edk2/ovmf/OVMF_CODE.fd; do
+            if test -f "$f"; then OVMF_PATH="$f"; break; fi
+          done
+          test -n "$OVMF_PATH"
+          make test-r029-frame-server-qemu OVMF_CODE="$OVMF_PATH"

@@ -272,6 +272,16 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
    let Some(pid)=authenticated_gui_pid()else{return BAD;};
    crate::gui::user_surface_status(pid).unwrap_or(BAD)
   },
+  #[cfg(feature="test-r029-frame-server")]
+  22=>{
+   let Some(pid)=authenticated_gui_pid()else{return BAD;};
+   crate::gui::user_frame_state(pid).unwrap_or(BAD)
+  },
+  #[cfg(feature="test-r029-frame-server")]
+  23=>{
+   let Some(pid)=authenticated_gui_pid()else{return BAD;};
+   if crate::gui::user_frame_present(pid,request.arg0 as u32){0}else{BAD}
+  },
   #[cfg(feature="test-r029-userspace")]
   21=>{
    let Some(pid)=authenticated_gui_pid()else{return BAD;};
