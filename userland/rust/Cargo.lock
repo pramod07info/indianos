@@ -3,5 +3,12 @@
 version = 4
 
 [[package]]
+name = "indianos-native-sdk"
+version = "0.1.0"
+
+[[package]]
 name = "indianos-user"
 version = "0.1.0"
+dependencies = [
+ "indianos-native-sdk",
+]
