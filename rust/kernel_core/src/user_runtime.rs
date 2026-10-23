@@ -751,6 +751,12 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
   unsafe{IPC_ROUTER=Some(mailboxes);}
   log(b"IndianOS: R025 authenticated IPC mailboxes ready\n\0");
  }
+ #[cfg(feature="test-r025")]
+ {
+  let Some(svc)=R025Services::new()else{return false;};
+  unsafe{R025_SERVICES=Some(svc);}
+  log(b"IndianOS: R025 capability and isolated file services ready\n\0");
+ }
  log(b"IndianOS: M009 two simultaneous user address spaces ready\n\0");
  #[cfg(feature="preempt")]
  {
@@ -806,6 +812,13 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
      ok=false;break;
     }
    }
+   #[cfg(feature="test-r025")]
+   {
+    if services().is_none_or(|svc|svc.terminate(pid)==0){
+      ok=false;break;
+    }
+    pid_log(pid,b"CAPABILITIES_REVOKED\0");
+   }
    let finished=if v!=0{
     unsafe{indianos_process_fault(pcb,status,v,e,a)}
    }else{unsafe{indianos_process_exit(pcb,status)}};
@@ -846,6 +859,18 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
   }else{ok=false;}
   unsafe{IPC_ROUTER=None;}
   if ok{log(b"IndianOS: R025 secure IPC two-process handshake PASSED\n\0");}
+ }
+ #[cfg(feature="test-r025")]
+ {
+  if let Some(svc)=services(){
+   if svc.token(1,2).is_ok() || svc.token(2,1).is_ok() ||
+      svc.token(1,FILE_BASE+1).is_ok() ||
+      svc.token(2,FILE_BASE+2).is_ok(){ok=false;}
+  }else{ok=false;}
+  unsafe{R025_SERVICES=None;}
+  if ok {
+   log(b"IndianOS: R025 capability IPC filesystem process services PASSED\n\0");
+  }
  }
  if !ok{
   log(b"IndianOS: M009 FATAL scheduler or memory ownership verification\n\0");
