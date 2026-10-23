@@ -153,6 +153,8 @@ struct UserSurfaceService{
     counts:[usize;2],
     focused:u32,
     broker:Broker<2,8>,
+    #[cfg(feature="test-r029-physical-events")]
+    mouse:Mouse,
 }
 #[cfg(feature="test-r029-userspace")]
 static mut USER_SURFACE_SERVICE:Option<UserSurfaceService>=None;
@@ -164,9 +166,13 @@ impl UserSurfaceService{
         let mut broker=Broker::new();
         broker.grant(1,session.files).ok()?;
         broker.grant(1,session.terminal).ok()?;
+        #[cfg(feature="test-r029-physical-events")]
+        let mouse=Mouse::init()?;
         Some(Self{session,
             commands:[[UserCommand::EMPTY;COMMAND_LIMIT];2],
-            counts:[0,0],focused:0,broker})
+            counts:[0,0],focused:0,broker,
+            #[cfg(feature="test-r029-physical-events")]
+            mouse})
     }
     fn window(&self,id:u32)->Option<crate::desktop::Window>{
         self.session.desktop.windows().find(|w|w.id==id).copied()
@@ -231,6 +237,34 @@ impl UserSurfaceService{
         if self.broker.post_focus(pid,id).is_err(){return false;}
         self.focused+=1;true
     }
+    #[cfg(feature="test-r029-physical-events")]
+    fn pump_mouse(&mut self){
+        // Read physical emulated 8042 packets only in a serialized ring-0
+        // syscall; never trust a client-supplied event owner.
+        for _ in 0..4 {
+            let Some(packet)=self.mouse.poll()else{break;};
+            let click=packet.left&&!self.session.was_down;
+            let hit=if click {
+                let x=(self.session.mouse_x+packet.dx as i32)
+                    .clamp(0,self.session.desktop.width as i32-1);
+                let y=(self.session.mouse_y-packet.dy as i32)
+                    .clamp(0,self.session.desktop.height as i32-1);
+                self.session.desktop.hit_test(x,y)
+            }else{None};
+            let target=hit.and_then(|w|self.broker.owner(w).map(|p|(p,w)));
+            if let Some((pid,window))=target{
+                if !self.broker.can_post(pid,window){continue;}
+            }
+            let changed=self.session.on_mouse(packet);
+            if let Some((pid,window))=target{
+                if self.session.desktop.focused()==Some(window) &&
+                    self.broker.post_pointer_focus(pid,window).is_ok(){
+                    log(b"IndianOS: R029.2 physical mouse focus event queued\n\0");
+                }
+            }
+            if changed{let _=self.redraw();}
+        }
+    }
 }
 #[cfg(feature="test-r029-userspace")]
 fn user_service()->Option<&'static mut UserSurfaceService>{
@@ -265,7 +299,18 @@ pub(crate) fn user_surface_status(pid:u32)->Option<u64>{
 }
 #[cfg(feature="test-r029-userspace")]
 pub(crate) fn user_surface_peek(pid:u32)->Option<GuiEvent>{
-    user_service()?.broker.peek(pid).ok()
+    let svc=user_service()?;
+    #[cfg(feature="test-r029-physical-events")]
+    svc.pump_mouse();
+    svc.broker.peek(pid).ok()
+}
+#[cfg(feature="test-r029-userspace")]
+pub(crate) fn user_surface_terminate(pid:u32){
+    if let Some(svc)=user_service(){
+        svc.broker.revoke(pid);
+        #[cfg(feature="test-r029-physical-events")]
+        svc.mouse.disable();
+    }
 }
 #[cfg(feature="test-r029-userspace")]
 pub(crate) fn user_surface_ack(pid:u32,sequence:u32)->bool{
@@ -275,7 +320,12 @@ pub(crate) fn user_surface_ack(pid:u32,sequence:u32)->bool{
 pub(crate) fn user_surface_verified()->bool{
     user_service().is_some_and(|svc|{
         svc.counts==[2,2] && svc.focused>=1 &&
-        svc.session.desktop.focused()==Some(svc.session.files)
+        !svc.broker.known(1) &&
+        svc.session.desktop.focused()==Some(
+            if cfg!(feature="test-r029-physical-events") {
+                svc.session.terminal
+            }else{svc.session.files}
+        )
     })
 }
 pub(crate) struct Session{

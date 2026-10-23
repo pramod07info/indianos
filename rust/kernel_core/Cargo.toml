@@ -37,6 +37,7 @@ test-r028-network = []
 test-r029-desktop = ["test-interactive","kernel-main"]
 # Ring-3 window-command client; framebuffer remains kernel-owned.
 test-r029-userspace = ["test-r029-desktop","test-ring3"]
+test-r029-physical-events = ["test-r029-userspace"]
 test-ud2 = []
 test-pagefault = []
 test-shadow = []

@@ -1,0 +1,47 @@
+name: R029.2 verify physical PS2 input to ring3
+on:
+  push:
+    branches: [agentx-r029-physical-events-20261023]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  physical-mouse:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install QEMU toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld binutils xorriso qemu-system-x86 ovmf curl
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
+      - name: Rust host tests and ownership regression
+        run: cargo test --offline --manifest-path rust/kernel_core/Cargo.toml --features test-r029-physical-events
+      - name: C ABI and Rust source audit
+        run: |
+          make test-rust-host-abi
+          make test-rust-source-audit
+      - name: Bare-metal kernel compile
+        run: cargo build --offline --manifest-path rust/kernel_core/Cargo.toml --target x86_64-unknown-none --no-default-features --features cpu-entry,vmm,pmm,user-image,paging,paging-cpu,user-runtime,runtime,boot-staging,boot,interrupts,timer,kernel-main,limine-requests,test-r029-physical-events
+      - name: QEMU PS2 physical input and ring3 screendump proof
+        shell: bash
+        env:
+          R029_USER_SCREENSHOT_DIR: build/r029-physical-screenshots
+        run: |
+          set -euo pipefail
+          OVMF_PATH=""
+          for f in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/edk2/ovmf/OVMF_CODE_4M.fd /usr/share/edk2/ovmf/OVMF_CODE.fd; do
+            if test -f "$f"; then OVMF_PATH="$f"; break; fi
+          done
+          test -n "$OVMF_PATH"
+          make test-r029-physical-qemu OVMF_CODE="$OVMF_PATH"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: indianos-r029-physical-vga
+          path: build/r029-physical-screenshots/*.ppm
+          if-no-files-found: ignore
+          retention-days: 7

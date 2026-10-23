@@ -294,6 +294,28 @@ fn r029_demo()->!{
        call(20,1,0)!=u64::MAX ||
        call(20,0,0)!=(1u64<<24|1u64<<16|2u64<<8|2u64) {exit(97);}
     write(b"R029 ring3: isolated drawing bounds and forged pointers rejected");
+    #[cfg(feature="r029-physical")]
+    {
+        let mut physical=[0u8;16];
+        let mut received=false;
+        for _ in 0..8_000_000 {
+            match call(21,physical.as_mut_ptr() as u64,16){
+                0=>core::hint::spin_loop(),
+                16=>{
+                    let seq=u32::from_le_bytes(physical[..4].try_into().unwrap());
+                    let window=u32::from_le_bytes(physical[4..8].try_into().unwrap());
+                    let kind=u32::from_le_bytes(physical[8..12].try_into().unwrap());
+                    if seq!=2||window!=2||kind!=2||physical[12..]!=[0;4] {
+                        exit(100);
+                    }
+                    received=true;break;
+                }
+                _=>exit(101),
+            }
+        }
+        if !received||call(20,0,0)>>24!=2 {exit(102);}
+        write(b"R029 ring3: physical PS2 mouse focus event delivered");
+    }
     r029_wait_for_host();
     write(b"R029 ring3: user surface client exited cleanly");
     exit(0)

@@ -29,6 +29,7 @@ ipc-b = []
 r026-shell = []
 r026-worker = []
 r029-client = []
+r029-physical = ["r029-client"]
 # Signed R030 native SDK sample application, two independently versioned ELFs.
 r030-demo-v1 = []
 r030-demo-v2 = []

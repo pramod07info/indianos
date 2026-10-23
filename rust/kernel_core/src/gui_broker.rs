@@ -2,6 +2,7 @@
 //! The kernel supplies each PID after validating the running process. Neither
 //! a window ID nor a userspace buffer is an authority to choose an owner.
 pub const FOCUS:u32=1;
+pub const POINTER_FOCUS:u32=2;
 #[derive(Clone,Copy,Debug,Eq,PartialEq)]
 pub enum Error{Invalid,Duplicate,Full,Unauthorized,Empty,Exhausted}
 #[derive(Clone,Copy,Debug,Eq,PartialEq)]
@@ -38,19 +39,29 @@ impl<const W:usize,const Q:usize> Broker<W,Q>{
         owner!=0&&window!=0&&self.windows.iter().flatten()
             .any(|b|b.owner==owner&&b.window==window)
     }
+    pub fn owner(&self,window:u32)->Option<u32>{
+        if window==0{return None;}
+        self.windows.iter().flatten().find(|b|b.window==window).map(|b|b.owner)
+    }
     pub fn known(&self,owner:u32)->bool{
         owner!=0&&self.windows.iter().flatten().any(|b|b.owner==owner)
     }
     pub fn can_post(&self,owner:u32,window:u32)->bool{
         self.owns(owner,window)&&self.len<Q&&self.sequence!=u32::MAX
     }
-    pub fn post_focus(&mut self,owner:u32,window:u32)->Result<Event,Error>{
+    fn post(&mut self,owner:u32,window:u32,kind:u32)->Result<Event,Error>{
         if !self.owns(owner,window){return Err(Error::Unauthorized);}
         if self.len>=Q{return Err(Error::Full);}
         let sequence=self.sequence.checked_add(1).ok_or(Error::Exhausted)?;
-        let event=Event{owner,window,kind:FOCUS,sequence};
+        let event=Event{owner,window,kind,sequence};
         self.events[self.len]=Some(event);self.len+=1;self.sequence=sequence;
         Ok(event)
+    }
+    pub fn post_focus(&mut self,owner:u32,window:u32)->Result<Event,Error>{
+        self.post(owner,window,FOCUS)
+    }
+    pub fn post_pointer_focus(&mut self,owner:u32,window:u32)->Result<Event,Error>{
+        self.post(owner,window,POINTER_FOCUS)
     }
     pub fn peek(&self,owner:u32)->Result<Event,Error>{
         if !self.known(owner){return Err(Error::Unauthorized);}
@@ -119,6 +130,19 @@ mod tests{
         assert_eq!(b.peek(2),Ok(survivor));b.ack(2,survivor.sequence).unwrap();
         b.grant(2,1).unwrap();
         assert_eq!(b.peek(2),Err(Error::Empty));
+    }
+    #[test]fn physical_input_resolves_authenticated_owner_and_reaps(){
+        let mut b=Broker::<2,4>::new();
+        b.grant(1,1).unwrap();b.grant(2,2).unwrap();
+        assert_eq!(b.owner(2),Some(2));
+        assert_eq!(b.owner(0),None);
+        assert_eq!(b.post_pointer_focus(1,2),Err(Error::Unauthorized));
+        let ev=b.post_pointer_focus(2,2).unwrap();
+        assert_eq!(ev.kind,POINTER_FOCUS);
+        assert_eq!(ev.wire()[8..12],[2,0,0,0]);
+        b.revoke(2);
+        assert_eq!(b.owner(2),None);
+        assert_eq!(b.peek(2),Err(Error::Unauthorized));
     }
     #[test]fn wire_empty_queue_zero_capacity_and_overflow(){
         let mut b=Broker::<1,1>::new();b.grant(1,2).unwrap();

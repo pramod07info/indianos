@@ -678,6 +678,8 @@ pub unsafe extern "C" fn x86_64_user_process_run(
    unsafe{ACTIVE_PID=0;}
    let (v,e,a)=last_fault();
    cleanup_quantum_jobs(pid);
+   #[cfg(feature="test-r029-userspace")]
+   crate::gui::user_surface_terminate(pid);
    let completed=if v==0{unsafe{indianos_process_exit(process,status)}}
    else{unsafe{indianos_process_fault(process,status,v,e,a)}};
    if !completed{
