@@ -2,7 +2,7 @@ name: IndianOS kernel boot (x86-64)
 
 on:
   push:
-    branches: [main]
+    branches: [main, fix-r028-rust-host-abi-20261023]
     paths:
       - "kernel/**"
       - "rust/**"
