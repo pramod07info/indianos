@@ -13,6 +13,36 @@ pub trait BlockDevice {
     fn write_sector(&mut self, lba: u64, data: &[u8; SECTOR_BYTES]) -> Result<(), BlockError>;
 }
 
+/// Restrict access to a validated block-device window; no I/O occurs on construction.
+/// Destructive formatting is still an explicit responsibility of the caller.
+pub struct BlockWindow<'a, D: BlockDevice> {
+    device: &'a mut D,
+    start: u64,
+    count: u64,
+}
+impl<'a, D: BlockDevice> BlockWindow<'a, D> {
+    pub fn new(device: &'a mut D, start: u64, count: u64) -> Result<Self, BlockError> {
+        check_range(device.sector_count(), start, count)?;
+        Ok(Self { device, start, count })
+    }
+    pub fn sector_start(&self) -> u64 { self.start }
+}
+impl<D: BlockDevice> BlockDevice for BlockWindow<'_, D> {
+    fn sector_count(&self) -> u64 { self.count }
+    fn read_sector(&mut self, lba: u64, out: &mut [u8; SECTOR_BYTES])
+        -> Result<(), BlockError>
+    {
+        check_range(self.count, lba, 1)?;
+        self.device.read_sector(self.start + lba, out)
+    }
+    fn write_sector(&mut self, lba: u64, data: &[u8; SECTOR_BYTES])
+        -> Result<(), BlockError>
+    {
+        check_range(self.count, lba, 1)?;
+        self.device.write_sector(self.start + lba, data)
+    }
+}
+
 /// Preflight the full transfer before any sector is touched. This prevents
 /// partial writes caused solely by a request crossing the device boundary.
 /// Device I/O failures may still cause partial transfers.
@@ -94,6 +124,37 @@ mod tests {
         assert_eq!(check_range(4, 0, 0), Err(BlockError::OutOfRange));
         assert_eq!(write_sectors(&mut disk, 0, &[0; 1]), Err(BlockError::OutOfRange));
     }
+    #[test]
+    fn bounded_partition_enforces_range_and_preserves_neighbors() {
+        let mut disk = RamDisk { bytes: [0; SECTOR_BYTES * 4], readonly: false };
+        {
+            let mut win = BlockWindow::new(&mut disk, 1, 2).unwrap();
+            assert_eq!(win.sector_count(), 2);
+            assert_eq!(win.sector_start(), 1);
+            win.write_sector(0, &[0x41; SECTOR_BYTES]).unwrap();
+            win.write_sector(1, &[0x42; SECTOR_BYTES]).unwrap();
+            let mut out = [0; SECTOR_BYTES];
+            win.read_sector(1, &mut out).unwrap();
+            assert_eq!(out, [0x42; SECTOR_BYTES]);
+            assert_eq!(win.read_sector(2, &mut out), Err(BlockError::OutOfRange));
+            assert_eq!(win.write_sector(u64::MAX, &[3; SECTOR_BYTES]),
+                       Err(BlockError::OutOfRange));
+        }
+        assert_eq!(&disk.bytes[..SECTOR_BYTES], &[0; SECTOR_BYTES]);
+        assert_eq!(&disk.bytes[SECTOR_BYTES..2*SECTOR_BYTES], &[0x41; SECTOR_BYTES]);
+        assert_eq!(&disk.bytes[2*SECTOR_BYTES..3*SECTOR_BYTES], &[0x42; SECTOR_BYTES]);
+        assert_eq!(&disk.bytes[3*SECTOR_BYTES..], &[0; SECTOR_BYTES]);
+    }
+
+    #[test]
+    fn invalid_window_never_touches_disk() {
+        let mut disk = RamDisk { bytes: [0x33; SECTOR_BYTES * 4], readonly: false };
+        assert!(matches!(BlockWindow::new(&mut disk, 3, 2), Err(BlockError::OutOfRange)));
+        assert!(matches!(BlockWindow::new(&mut disk, 0, 0), Err(BlockError::OutOfRange)));
+        assert!(matches!(BlockWindow::new(&mut disk, u64::MAX, 1), Err(BlockError::OutOfRange)));
+        assert!(disk.bytes.iter().all(|&v| v == 0x33));
+    }
+
     #[test]
     fn read_only_device_rejects_writes() {
         let mut disk = RamDisk { bytes: [0; SECTOR_BYTES * 4], readonly: true };
