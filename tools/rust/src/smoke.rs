@@ -189,6 +189,37 @@ pub fn verify(mode:&str,text:&str)->Result<(),String>{
                 "IndianOS: M009 round-robin cooperative switching PASSED",
                 "IndianOS: M009 scheduler experiment complete"]);
         }
+        "ipc"=>{
+            checks.extend(MILESTONES);
+            checks.extend([
+                "IndianOS: R025 secure syscall IPC test begin",
+                "IndianOS: PID 1 READY", "IndianOS: PID 2 READY",
+                "IndianOS: R025 authenticated IPC mailboxes ready",
+                "IndianOS: PID 1 DISPATCHED",
+                "IndianOS user: R025 PID1 sent authenticated ping",
+                "IndianOS: PID 1 YIELDED",
+                "IndianOS: PID 2 DISPATCHED",
+                "IndianOS user: R025 PID2 received authenticated ping",
+                "IndianOS user: R025 PID2 sent authenticated reply",
+                "IndianOS: PID 2 YIELDED",
+                "IndianOS: PID 1 DISPATCHED",
+                "IndianOS user: R025 PID1 received authenticated reply",
+                "IndianOS user: R025 PID1 invalid destination and pointers denied",
+                "IndianOS: PID 1 YIELDED",
+                "IndianOS: PID 2 DISPATCHED",
+                "IndianOS user: R025 PID2 empty queue is isolated",
+                "IndianOS: PID 2 YIELDED",
+                "IndianOS: PID 1 DISPATCHED",
+                "IndianOS user: R025 PID1 exited cleanly",
+                "IndianOS: PID 1 EXITED", "IndianOS: PID 1 REAPED",
+                "IndianOS: PID 2 DISPATCHED",
+                "IndianOS user: R025 PID2 exited cleanly",
+                "IndianOS: PID 2 EXITED", "IndianOS: PID 2 REAPED",
+                "IndianOS: M009 round-robin cooperative switching PASSED",
+                "IndianOS: R025 secure IPC two-process handshake PASSED",
+                "IndianOS: M009 scheduler experiment complete",
+            ]);
+        }
         "preempt"=>{
             checks.extend(MILESTONES);
             checks.extend(["IndianOS: R024 APIC preemptive scheduler experiment begin",
@@ -243,6 +274,11 @@ pub fn verify(mode:&str,text:&str)->Result<(),String>{
         "processes" if occurrences(text,"IndianOS: entering ring-3 /bin/init (QEMU experimental)")!=2 ||
             occurrences(text,"IndianOS: ring-3 PMM frame count restored")!=2=>
             Err("two distinct complete user lifetimes were not observed".into()),
+        "ipc" if (1..=2).any(|pid|{
+            occurrences(text,&format!("IndianOS: PID {pid} DISPATCHED"))!=3 ||
+            occurrences(text,&format!("IndianOS: PID {pid} YIELDED"))!=2 ||
+            occurrences(text,&format!("IndianOS: PID {pid} REAPED"))!=1
+        })=>Err("R025 two-process IPC did not preserve lifecycle".into()),
         "scheduler" if (1..=2).any(|pid|{
             occurrences(text,&format!("IndianOS: PID {pid} DISPATCHED"))!=3 ||
             occurrences(text,&format!("IndianOS: PID {pid} YIELDED"))!=2
@@ -259,7 +295,7 @@ pub fn verify(mode:&str,text:&str)->Result<(),String>{
                 _=>true
             }
         }=>Err("both CPU-bound tasks must be preempted before either exits".into()),
-        "processes"|"scheduler"|"preempt" if text.contains("IndianOS: PID 1 FAULTED") ||
+        "processes"|"scheduler"|"preempt"|"ipc" if text.contains("IndianOS: PID 1 FAULTED") ||
               text.contains("IndianOS: PID 2 FAULTED")=>
             Err("successful task unexpectedly faulted".into()),
         _=>Ok(())
@@ -295,7 +331,7 @@ pub fn run(args:&[String])->Result<String,String>{
     }
     // Reject unknown modes before starting QEMU.
     if !["normal","exception","pagefault","shadow","usermode",
-         "fault-guard","fault-supervisor","processes","scheduler","preempt","shell","interactive","keyboard"].contains(&mode.as_str()){
+         "fault-guard","fault-supervisor","processes","scheduler","preempt","ipc","shell","interactive","keyboard"].contains(&mode.as_str()){
         return Err("invalid QEMU smoke mode".into())
     }
 
