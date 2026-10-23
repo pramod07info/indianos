@@ -14,7 +14,7 @@ A guard check verifies sector 15 was not modified.
 Reproduce: `make test-rust-ata-qemu` with QEMU, OVMF, clang,
 LLD, xorriso and Rust `x86_64-unknown-none` installed.
 
-This is not an installer, crash-safe filesystem, or a user-mode file
-service. R024 hardware timer-driven preemption remains unverified:
-the prior QEMU run observed PIC IRR bit 0 pending with no in-service
-IRQ and failed `indianos/preempt-qemu`.
+This historical R027.1 TinyFs smoke is not itself crash-safe. R024
+xAPIC timer preemption has since been verified separately in QEMU.
+The follow-up R027 durable on-disk format and reboot recovery is documented
+in [R027 durable filesystem](R027_DURABLE_FILESYSTEM.md).

@@ -150,6 +150,102 @@ pub extern "C" fn kmain()->!{
         log(b"IndianOS: R027 TinyFs ATA QEMU create remount delete restore PASSED\n\0");
 
     }
+    #[cfg(feature="test-r027-durable")]
+    {
+        use crate::block::{BlockDevice,BlockWindow,SECTOR_BYTES};
+        use crate::durablefs::{DurableFs,FsError,MAX_FILE_BYTES,MIN_SECTORS};
+        // The host test creates an EXCLUSIVE 128-sector disposable raw disk.
+        // There is no automatic filesystem mounting in ordinary boots.
+        const FIRST:u64=24;
+        const COUNT:u64=100;
+        log(b"IndianOS: R027 persistent QEMU ATA disk probe begin\n\0");
+        let mut disk=unsafe{crate::ata_pio::AtaPio::probe()}.unwrap_or_else(|_|{
+            log(b"IndianOS: FATAL R027 ATA IDENTIFY failed\n\0");halt()
+        });
+        need(disk.sector_count()==128 && COUNT>=MIN_SECTORS,
+             b"IndianOS: FATAL R027 unexpected disposable disk capacity\n\0");
+        log(b"IndianOS: R027 ATA LBA28 primary-master discovered, 128 sectors\n\0");
+        let mut left=[0u8;SECTOR_BYTES];
+        let mut right=[0u8;SECTOR_BYTES];
+        need(disk.read_sector(FIRST-1,&mut left).is_ok() &&
+             disk.read_sector(FIRST+COUNT,&mut right).is_ok(),
+             b"IndianOS: FATAL R027 neighbor snapshot failed\n\0");
+        let mut meta_a=[0u8;SECTOR_BYTES];
+        let mut meta_b=[0u8;SECTOR_BYTES];
+        need(disk.read_sector(FIRST,&mut meta_a).is_ok() &&
+             disk.read_sector(FIRST+1,&mut meta_b).is_ok(),
+             b"IndianOS: FATAL R027 initial superblock read failed\n\0");
+        let is_blank=meta_a.iter().all(|&b|b==0) && meta_b.iter().all(|&b|b==0);
+        {
+            let window=BlockWindow::new(&mut disk,FIRST,COUNT).unwrap_or_else(|_|{
+                log(b"IndianOS: FATAL R027 invalid block partition\n\0");halt()
+            });
+            let mut fs=if is_blank {
+                DurableFs::format_blank(window).unwrap_or_else(|_|{
+                    log(b"IndianOS: FATAL R027 format of blank test disk failed\n\0");halt()
+                })
+            }else{
+                DurableFs::mount(window).unwrap_or_else(|_|{
+                    // Important: never format if an existing disk is corrupt.
+                    log(b"IndianOS: FATAL R027 existing filesystem invalid; no reformat\n\0");halt()
+                })
+            };
+            let mut large=[0u8;MAX_FILE_BYTES];
+            let original_len=1701usize;
+            let updated_len=1923usize;
+            if is_blank {
+                for (i,b) in large[..original_len].iter_mut().enumerate(){
+                    *b=(i%251) as u8;
+                }
+                need(fs.create_path("/large",&large[..original_len]).is_ok() &&
+                     fs.create_path("/note",b"keep across boots").is_ok() &&
+                     fs.create_path("/phase",b"phase1").is_ok(),
+                     b"IndianOS: FATAL R027 first boot create failed\n\0");
+                log(b"IndianOS: R027 disk phase1 formatted and multi-sector file committed\n\0");
+            }else{
+                let mut phase=[0u8;16];
+                let phase_len=fs.read_path("/phase",&mut phase).unwrap_or_else(|_|{
+                    log(b"IndianOS: FATAL R027 phase marker unreadable\n\0");halt()
+                });
+                let read_len=fs.read_path("/large",&mut large).unwrap_or_else(|_|{
+                    log(b"IndianOS: FATAL R027 multi-sector file unreadable\n\0");halt()
+                });
+                let mut note=[0u8;32];
+                need(fs.read_path("/note",&mut note)==Ok(17) &&
+                     &note[..17]==b"keep across boots",
+                     b"IndianOS: FATAL R027 unrelated file changed\n\0");
+                let original=read_len==original_len &&
+                    large[..read_len].iter().enumerate().all(|(i,&b)|b==(i%251) as u8);
+                let updated=read_len==updated_len &&
+                    large[..read_len].iter().enumerate().all(|(i,&b)|b==((i*7)%253) as u8);
+                if phase_len==6 && &phase[..6]==b"phase1" && original{
+                    // Boot 2: checksum-verified data survived a genuine reboot.
+                    for (i,b) in large[..updated_len].iter_mut().enumerate(){
+                        *b=((i*7)%253) as u8;
+                    }
+                    need(fs.overwrite_path("/large",&large[..updated_len]).is_ok() &&
+                         fs.overwrite_path("/phase",b"phase2").is_ok(),
+                         b"IndianOS: FATAL R027 boot2 overwrite failed\n\0");
+                    log(b"IndianOS: R027 disk phase2 reboot persistence and multi-sector overwrite PASSED\n\0");
+                }else if phase_len==6 && &phase[..6]==b"phase1" && updated {
+                    // A deliberately torn newest metadata copy exposes the
+                    // previous complete commit; never silently format.
+                    need(fs.overwrite_path("/phase",b"phase2").is_ok(),
+                         b"IndianOS: FATAL R027 metadata recovery commit failed\n\0");
+                    log(b"IndianOS: R027 disk torn metadata fallback recovered in QEMU\n\0");
+                }else if phase_len==6 && &phase[..6]==b"phase2" && updated{
+                    log(b"IndianOS: R027 disk phase3 reboot-verified durable overwrite PASSED\n\0");
+                }else{
+                    log(b"IndianOS: FATAL R027 inconsistent metadata and payload phase\n\0");halt()
+                }
+            }
+        }
+        let mut after=[0u8;SECTOR_BYTES];
+        need(disk.read_sector(FIRST-1,&mut after).is_ok() && after==left &&
+             disk.read_sector(FIRST+COUNT,&mut after).is_ok() && after==right,
+             b"IndianOS: FATAL R027 wrote outside isolated disk window\n\0");
+        log(b"IndianOS: R027 isolated ATA block window boundaries PASSED\n\0");
+    }
     log(b"IndianOS: milestone 001 complete\n\0");
 
     need(unsafe{x86_64_exceptions_init()},

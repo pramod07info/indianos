@@ -15,6 +15,7 @@ establish working interrupts, a desktop, or third-party application support.
 - [x] Absolute VFS path normalization (R021)
 - [x] R024 xAPIC timer preemption with genuine IRQ-to-context-switch proof in QEMU ([passing verification](https://github.com/pramod07info/indianos/actions/runs/39913743740))
 - [x] Opt-in persistent QEMU serial shell with live worker launch, status, wait and cleanup ([passing verification](https://github.com/pramod07info/indianos/actions/runs/39924988234))
+- [x] Dedicated QEMU IDE device identification and copy-on-write multi-sector storage with reboot and metadata-recovery proof ([verification](https://github.com/pramod07info/indianos/actions/runs/39929748026))
 - [ ] Normal boot launching interactive userland by default and general service management
 
 ## Implementation sequence and exit conditions
@@ -26,7 +27,7 @@ establish working interrupts, a desktop, or third-party application support.
 | R024 | P0 | Calibrated local APIC preemption wired to scheduler | QEMU observes IRQs, capture, two CPU-bound tasks alternating without yield; memory/scheduler cleanup |
 | R025 | P0 | **QEMU-verified** capability-gated process, IPC and flat-root file syscalls | **Verified:** ring-3 identity, rights, user-copy bounds, cross-PID denial, revocation and teardown; production service integration remains R026/R027 |
 | R026 | P1 | **QEMU-verified** interactive init, restricted worker launch and lifecycle | **Verified:** serial QEMU commands, shell survives worker start/exit, process status/wait and cleanup. General service management remains future work |
-| R027 | P1 | Device enumeration and reliable block/VFS stack | QEMU block tests, atomic metadata recovery, multi-block files, reboot durability |
+| R027 | P1 | **QEMU-verified** ATA LBA28 identification and durable multi-sector volume | **Verified:** five QEMU boots, file overwrites, mirrored checksummed metadata, torn-copy recovery, strict partition bounds; generic PCI/AHCI/NVMe and production storage remain unsupported |
 | R028 | P1 | Virtio network driver, ARP/IP/ICMP/UDP/TCP/DNS | QEMU guest network integration, ping and bounded network-client demo |
 | R029 | P1 | User-space compositor, mouse, windows and graphics | Two independent graphical windows interact in QEMU, not only headless models |
 | R030 | P1 | Native toolchain SDK, apps and verified package manager | Repeatable signed install, update, remove and rollback of native packages |
@@ -122,3 +123,28 @@ control, background services and multiuser sessions remain outside
 R026's *bounded QEMU* acceptance and must be developed later.
 
 Full `main` kernel CI requires the R026 serial-interactive QEMU test.
+
+## R027 acceptance — Persistent QEMU disk and metadata recovery (2026-10-23)
+
+The [R027 QEMU verification run](https://github.com/pramod07info/indianos/actions/runs/39929748026)
+passed Rust power-failure tests, freestanding compilation, the prior TinyFs
+ATA regression and a five-boot test on the **same temporary 128-sector disk**.
+The emulator identified its primary-master IDE disk through ATA IDENTIFY;
+the kernel used a bounded volume inside it, committed a multi-sector file,
+rebooted to read it, overwrote it, rebooted to read the newer data, then
+recovered after the host deliberately damaged the newest metadata copy.
+Another reboot verified the recovered data. All sectors outside the selected
+volume remained untouched.
+
+The new R027 format is distinct from legacy R016 TinyFs. It has eight
+fixed-size root-directory file slots, up to 2048 bytes per file, a pair of
+checksummed superblocks and three copy-on-write banks per slot. ATA writes
+are flushed before metadata publication. The formatter rejects a nonblank
+selected volume. Normal kernel boots never run the experimental disk test.
+
+**Boundaries:** This provides no generalized PCI device enumeration,
+virtio-blk, AHCI, NVMe, partitions/GPT parsing, free-space allocator,
+arbitrary nested directories, production-grade POSIX VFS, cross-process
+locking, encryption, or verified physical power-loss guarantees. The
+separate ATA driver only discovers one legacy IDE primary-master in QEMU;
+physical disk writes and default autoformat remain forbidden.
