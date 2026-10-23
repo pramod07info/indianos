@@ -967,6 +967,12 @@ test-r029-user-surfaces-qemu:
 	$(MAKE) image BUILD=build/r029-user-surfaces RUST_CORE=1 R029_USERSPACE_TEST=1
 	python3 tools/test_r029_user_surfaces_qemu.py --iso build/r029-user-surfaces/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)"
 
+.PHONY: test-r030-package-qemu
+
+test-r030-package-qemu:
+	python3 -m unittest discover -s tests -p 'test_r030_pkg.py' -v
+	python3 tools/test_r030_package_qemu.py --qemu $(QEMU) --ovmf "$(OVMF_CODE)"
+
 .PHONY: test-r029-desktop-qemu
 
 test-r029-desktop-qemu:
