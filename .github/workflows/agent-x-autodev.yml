@@ -10,8 +10,9 @@ on:
     paths:
       - ".github/workflows/agent-x-autodev.yml"
   schedule:
-    # Recovery sweep if the chain stopped after a transient model/runner failure.
-    - cron: "17 2 * * *"
+    # Recovery sweep every 15 minutes if the development chain stops.
+    # GitHub scheduled jobs can be delayed by runner availability.
+    - cron: "*/15 * * * *"
   workflow_dispatch:
 
 # Model-generated changes are confined to a new, preapproved Rust module.
