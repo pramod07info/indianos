@@ -36,7 +36,7 @@ establish working interrupts, a desktop, or third-party application support.
 | R027 | P1 | **QEMU-verified** ATA LBA28 identification and durable multi-sector volume | **Verified:** five QEMU boots, file overwrites, mirrored checksummed metadata, torn-copy recovery, strict partition bounds; generic PCI/AHCI/NVMe and production storage remain unsupported |
 | R028 | P1 | **QEMU-verified** virtio-net PCI, ARP/IPv4/ICMP/UDP/DNS and bounded TCP demo | **Verified:** real QEMU guest Ethernet packets, host-validated checksums, ARP resolution, ICMP ping, UDP exchange, DNS A response, TCP handshake and reply; general sockets/routing remain pending |
 | R029 | P1 | **QEMU graphics acceptance verified; user-space compositor pending** | **Verified:** actual 1280×800 VGA framebuffer pixels, two independent windows, QEMU PS/2 mouse clicks, keyboard focus/move/minimize/restore/close and screenshot differences. Ring-3 bounded draw-command API is now QEMU-verified; independent per-app surfaces and full user-space compositor remain unfinished |
-| R030 | P1 | **Developer-host native signed package SDK** (QEMU-verification pending) | Build two real static ELF64 apps, sign with Ed25519, reject tampering/downgrades, install/update/rollback/remove in isolated staging and boot the verified versions in QEMU; no on-device installer yet |
+| R030 | P1 | **QEMU-verified developer-host native signed package SDK** | Build two real static ELF64 apps, sign with Ed25519, reject tampering/downgrades, install/update/rollback/remove in isolated staging and boot the verified versions in QEMU; no on-device installer yet |
 | R031 | P2 | Security model, authentication, updater, recovery installer | Isolation review, controlled permission tests, signed rollback and virtual-disk install |
 | R032 | P2 | Physical PC/ARM64 hardware-portability program | Published test matrix, qualified devices, measured boot/install performance |
 | R033 | P2 | Policy-gated AI app assistant | AI chooses catalog item but package verifier enforces approval, signatures, compatibility and rollback |
@@ -217,3 +217,14 @@ trusted PID1 drawing client controls both sample windows. A complete
 ring-3 window server with independent application surface ownership
 and event delivery is not yet implemented; this is a bounded,
 verified transition toward that architecture.
+
+## R030 verified signed app SDK (2026-10-23)
+
+[Full R030 verification #39959376254](https://github.com/pramod07info/indianos/actions/runs/39959376254)
+passed six Ed25519 crypto and package lifecycle tests, the existing kernel
+host ABI regression and a live QEMU chain that booted signed native ELF v1,
+then v2 following a verified update, then v1 after rollback. The host
+rejected a damaged archive before modifying the installed application and
+verified remove. This is a **developer-host SDK**: the live guest's native
+on-device package database/installer, persistent app store and dynamic
+runtime launcher remain outside the present implementation.
