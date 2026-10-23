@@ -1,0 +1,46 @@
+name: Verify R030 offline signed native applications end-to-end
+on:
+  push:
+    branches: [agentx-r030-signed-native-packages-20261023]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  package-native:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install QEMU and signing prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld binutils xorriso qemu-system-x86 ovmf curl openssl
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
+      - name: R030 Ed25519 package, tamper, isolation and rollback tests
+        run: |
+          python3 -m py_compile tools/r030_package_tool.py tools/test_r030_native_qemu.py
+          python3 -m unittest discover -s tests -p 'test_r030_packages.py' -v
+      - name: Rust host C ABI linkage gate
+        run: make test-rust-host-abi
+      - name: Rust-only kernel ownership audit
+        run: make test-rust-source-audit
+      - name: R030 three real QEMU boots from signed installed ELF versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          OVMF_PATH=""
+          for f in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/edk2/ovmf/OVMF_CODE_4M.fd /usr/share/edk2/ovmf/OVMF_CODE.fd; do
+            if test -f "$f"; then OVMF_PATH="$f"; break; fi
+          done
+          test -n "$OVMF_PATH"
+          make test-r030-native-qemu OVMF_CODE="$OVMF_PATH" 2>&1 | tee build/r030-native-qemu.log
+      - name: Upload R030 signed transaction and QEMU boot evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: indianos-r030-signed-native-qemu-log
+          path: build/r030-native-qemu.log
+          if-no-files-found: ignore
+          retention-days: 7
