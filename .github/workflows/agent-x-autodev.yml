@@ -64,6 +64,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          python3 -m unittest discover -s tests -p 'test_agent_x_autodev.py' -v
           python3 tools/agent_x_autodev.py prepare --prompt /tmp/agent-x-dev-prompt.txt
 
       - name: Install Rust for validation
@@ -95,6 +96,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          python3 -m unittest discover -s tests -p 'test_agent_x_autodev.py' -v
           cargo test --offline --manifest-path rust/kernel_core/Cargo.toml
           make test-rust-source-audit
           make kernel BUILD=build/agent-x-autodev RUST_CORE=1
