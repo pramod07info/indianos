@@ -657,6 +657,15 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
   let _=discard(task_ptr(0),&backend,false);
   return false;
  }
+ #[cfg(feature="test-ipc")]
+ {
+  let Some(mut mailboxes)=IpcRouter::<2,4>::new().ok()else{return false;};
+  if mailboxes.register(1).is_err()||mailboxes.register(2).is_err(){
+   return false;
+  }
+  unsafe{IPC_ROUTER=Some(mailboxes);}
+  log(b"IndianOS: R025 authenticated IPC mailboxes ready\n\0");
+ }
  log(b"IndianOS: M009 two simultaneous user address spaces ready\n\0");
  #[cfg(feature="preempt")]
  {
@@ -690,7 +699,7 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
    unsafe{x86_64_enter_user(task.image.plan.entry,
                              task.image.plan.stack_end-16,task.root.root)}
   };
-  unsafe{ACTIVE_TASK=ptr::null_mut();ACTIVE_USER=ptr::null_mut();}
+  unsafe{ACTIVE_TASK=ptr::null_mut();ACTIVE_USER=ptr::null_mut();ACTIVE_PROCESS=ptr::null_mut();}
   let cr3:u64;
   unsafe{asm!("mov {}, cr3",out(reg)cr3,options(nostack,nomem,preserves_flags));}
   if cr3&PHYS!=cpu.cr3&PHYS{
@@ -705,6 +714,13 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
   }else{
    if status==YIELD{ok=false;break;}
    cleanup_quantum_jobs(pid);
+   #[cfg(feature="test-ipc")]
+   {
+    // On process exit or fault all queued messages for that PID are gone.
+    if router().is_none_or(|boxes|boxes.unregister(pid).is_err()){
+     ok=false;break;
+    }
+   }
    let finished=if v!=0{
     unsafe{indianos_process_fault(pcb,status,v,e,a)}
    }else{unsafe{indianos_process_exit(pcb,status)}};
@@ -736,6 +752,15 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
   if scheduler.dispatch_count!=6||scheduler.yield_count!=4||
      scheduler.tick_count!=4{ok=false;}
   if ok{log(b"IndianOS: M009 round-robin cooperative switching PASSED\n\0");}
+ }
+ #[cfg(feature="test-ipc")]
+ {
+  if let Some(boxes)=router(){
+   if boxes.pending(1)!=Err(IpcError::UnknownReceiver)||
+      boxes.pending(2)!=Err(IpcError::UnknownReceiver){ok=false;}
+  }else{ok=false;}
+  unsafe{IPC_ROUTER=None;}
+  if ok{log(b"IndianOS: R025 secure IPC two-process handshake PASSED\n\0");}
  }
  if !ok{
   log(b"IndianOS: M009 FATAL scheduler or memory ownership verification\n\0");
