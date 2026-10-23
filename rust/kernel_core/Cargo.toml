@@ -33,6 +33,8 @@ limine-requests = ["boot"]
 test-ata-disk = []
 test-r027-durable = []
 test-r028-network = []
+# QEMU-exclusive mapped framebuffer GUI + polling PS/2 mouse and serial keyboard.
+test-r029-desktop = ["test-interactive","kernel-main"]
 test-ud2 = []
 test-pagefault = []
 test-shadow = []
