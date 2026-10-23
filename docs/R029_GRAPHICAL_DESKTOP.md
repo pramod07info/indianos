@@ -77,3 +77,40 @@ resizable windows, drag/drop, overlapping child surfaces and accessibility
 remain unfinished. R029's original user-space isolation ambition is
 not satisfied by this real-pixel demonstration alone. No Windows/Linux/
 macOS application compatibility is implied.
+
+## Subsequent R029 ring-3 window command bridge
+
+The first real QEMU graphical demo rendered two windows in ring 0. An
+additional opt-in `test-r029-userspace` mode now launches a separately
+mapped ELF64 client in **ring 3**, rendering two distinct client-area
+overlays through kernel-authorized `SYS_GUI_DRAW=18`, `SYS_GUI_FOCUS=19`
+and `SYS_GUI_STATUS=20`. This is a strict first step toward a
+userspace window server:
+
+- Only the actual running PCB PID1 with a verified executable
+  syscall origin can submit graphics commands. Sender PID is not
+  supplied in the message.
+- Commands use a fixed 64-byte versioned wire record; the kernel
+  verifies a complete mapped user buffer then copies it before
+  parsing. No physical framebuffer pointer or kernel address
+  is accepted.
+- Window identifiers are limited to 1 and 2, the Files and Terminal
+  demo. At most eight paint operations per window can be replayed.
+- Colors, text bytes, rectangle geometry and client-area clipping
+  are all validated before rendering. The compositor respects
+  z-order and preserves desktop chrome.
+- Rejected malformed user buffers cannot mutate the prior scene.
+- The original ring-3 process cleanup returns page ownership
+  without leaks.
+
+[Passing ring-3 QEMU visual isolation verification](https://github.com/pramod07info/indianos/actions/runs/39949896007)
+captures the actual VGA desktop before any ring-3 drawing, after
+each user-mode window update and after a user-mode focus change.
+An independent host assertion checks pixel changes and verifies
+protected top and bottom bars remain unchanged.
+
+**Still missing:** a separate compositor running in userspace,
+independent per-app authorization, a shared-memory surface
+allocator, keyboard/mouse event delivery to apps, and a real
+Files/Terminal application protocol. The framebuffer and the
+authoritative window manager remain trusted kernel services.
