@@ -41,6 +41,9 @@ on:
       - ".github/workflows/agent-x-local-model.yml"
       - ".github/workflows/agent-ci-handoff.yml"
       - "tools/agent_x_ci_context.py"
+      - ".github/workflows/agent-x-autodev.yml"
+      - "tools/agent_x_autodev.py"
+      - "tests/test_agent_x_autodev.py"
   workflow_dispatch:
     inputs:
       run_shadow_switch:
@@ -73,6 +76,10 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-none
+      - name: R020 mandatory Rust IPC and Agent X policy regressions
+        run: |
+          cargo test --manifest-path rust/kernel_core/Cargo.toml --offline
+          python3 -m unittest discover -s tests -p "test_agent_x_autodev.py" -v
       - name: Check cross compiler
         run: make toolchain-check
       - name: Enforce Rust-owned default kernel source audit
