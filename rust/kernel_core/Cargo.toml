@@ -42,6 +42,7 @@ test-fault-supervisor = []
 test-shell = []
 test-interactive = ["test-shell", "user-runtime"]
 test-ipc = ["user-runtime"]
+test-r025 = ["test-ipc"]
 test-irq-keyboard = ["test-interactive", "boot", "interrupts", "cpu-entry"]
 
 [profile.release]
