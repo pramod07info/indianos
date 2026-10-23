@@ -65,7 +65,10 @@ jobs:
   qemu-uefi:
     name: Build ELF + ISO and verify serial boot
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Full Rust migration + R024-R029 QEMU checks exceeded the previous
+    # 30-minute job limit on 2026-10-23 (run 39942078879), despite all
+    # mandatory test steps passing. Allow the complete suite to finish.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - name: Install emulator and image-building dependencies
