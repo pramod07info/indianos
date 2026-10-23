@@ -379,7 +379,10 @@ pub unsafe extern "C" fn x86_64_xapic_timer_start_calibrated(
     vector:u8,divisor:u32,calibrated_count:u32,
 )->bool{
     let Some(cfg)=xapic_periodic_config(vector,divisor,calibrated_count)else{return false;};
-    if !XAPIC_TIMER_ARMED.load(Ordering::Acquire){return false;}
+    // Never reprogram a live periodic timer. Stop/mask it first so stale
+    // IRQs cannot be counted as progress for the next calibration session.
+    if !XAPIC_TIMER_ARMED.load(Ordering::Acquire) ||
+       XAPIC_TIMER_RUNNING.load(Ordering::Acquire){return false;}
     let (Some(lvt),Some(divide),Some(initial))=(
         xapic_reg(XAPIC_LVT_TIMER_OFFSET),
         xapic_reg(XAPIC_TIMER_DIVIDE_OFFSET),
@@ -390,6 +393,10 @@ pub unsafe extern "C" fn x86_64_xapic_timer_start_calibrated(
         core::ptr::write_volatile(lvt,cfg.lvt|(1<<16));
         core::ptr::write_volatile(initial,0);
         core::ptr::write_volatile(divide,cfg.divide);
+        // A fresh timer session must not inherit old IRQ/preemption evidence.
+        // BSP interrupts are disabled throughout this critical section.
+        XAPIC_IRQ_TICKS.store(0,Ordering::Release);
+        XAPIC_PREEMPTIONS.store(0,Ordering::Release);
         core::ptr::write_volatile(lvt,cfg.lvt);
         core::ptr::write_volatile(initial,cfg.initial_count);
     }
@@ -471,6 +478,8 @@ pub extern "C" fn x86_64_xapic_timer_irq_count()->u64{
 /// Count successful ring-3 APIC preemptions independently of delivered IRQs.
 /// Called only after a validated user frame has been captured.
 pub fn xapic_record_preemption(){
+    // Ignore late captures after a timer has been stopped or masked.
+    if !XAPIC_TIMER_RUNNING.load(Ordering::Acquire){return;}
     XAPIC_PREEMPTIONS.fetch_update(Ordering::Relaxed,Ordering::Relaxed,|v|v.checked_add(1)).ok();
 }
 #[no_mangle]
@@ -479,8 +488,13 @@ pub extern "C" fn x86_64_xapic_timer_preemption_count()->u64{
 }
 /// Snapshot whether IRQ delivery has produced actual user preemption.
 /// This is diagnostic evidence only; it does not certify fair scheduling.
+pub const fn xapic_preemption_evidence(irq:u64,preemptions:u64)->bool{
+    irq>0 && preemptions>0 && preemptions<=irq
+}
 pub fn xapic_preemption_progress()->bool{
-    x86_64_xapic_timer_irq_count()>0 && x86_64_xapic_timer_preemption_count()>0
+    xapic_preemption_evidence(
+        x86_64_xapic_timer_irq_count(),x86_64_xapic_timer_preemption_count()
+    )
 }
 /// An APIC timer interrupt may preempt only while the timer is armed.
 #[no_mangle]
@@ -676,6 +690,23 @@ mod tests {
     fn timer_counter_overflow_is_rejected(){
         assert_eq!(u64::MAX.checked_add(1),None);
         assert_eq!((u64::MAX-1).checked_add(1),Some(u64::MAX));
+    }
+    #[test]
+    fn apic_preemption_evidence_requires_real_irq_and_capture(){
+        assert!(!xapic_preemption_evidence(0,0));
+        assert!(!xapic_preemption_evidence(3,0));
+        assert!(!xapic_preemption_evidence(0,1));
+        assert!(!xapic_preemption_evidence(1,2));
+        assert!(xapic_preemption_evidence(1,1));
+        assert!(xapic_preemption_evidence(12,2));
+        assert!(xapic_preemption_evidence(u64::MAX,u64::MAX));
+    }
+    #[test]
+    fn stopped_timer_cannot_record_preemption(){
+        assert!(!XAPIC_TIMER_RUNNING.load(Ordering::Acquire));
+        let before=x86_64_xapic_timer_preemption_count();
+        xapic_record_preemption();
+        assert_eq!(x86_64_xapic_timer_preemption_count(),before);
     }
     #[test]
     fn counter_is_bounded(){
