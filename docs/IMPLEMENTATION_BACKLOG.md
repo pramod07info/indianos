@@ -18,7 +18,8 @@ establish working interrupts, a desktop, or third-party application support.
 - [x] Dedicated QEMU IDE device identification and copy-on-write multi-sector storage with reboot and metadata-recovery proof ([verification](https://github.com/pramod07info/indianos/actions/runs/39929748026))
 - [x] R028 QEMU legacy virtio-net PCI and strict ARP/IPv4 ping, UDP echo, DNS A answer and TCP request/reply ([passing QEMU network test](https://github.com/pramod07info/indianos/actions/runs/39933935521))
 - [x] R029 actual 1280×800 QEMU framebuffer two-window composition, PS/2 mouse focus and keyboard move/minimize/restore/close with screenshot proof ([passing QEMU test](https://github.com/pramod07info/indianos/actions/runs/39941297124))
-- [ ] R029 general isolated user-space compositor and application-surface protocol (current graphical demo is privileged kernel-only)
+- [x] R029 verified ring-3 ELF drawing Files/Terminal content via bounded, copied and identity-checked surface commands ([passing QEMU screenshots](https://github.com/pramod07info/indianos/actions/runs/39949896007))
+- [ ] R029 complete isolated user-space compositor, per-app surface ownership and event-driven application protocol (rendering and input broker remain kernel-owned)
 - [ ] Normal boot launching interactive userland by default and general service management
 
 ## Implementation sequence and exit conditions
@@ -32,7 +33,7 @@ establish working interrupts, a desktop, or third-party application support.
 | R026 | P1 | **QEMU-verified** interactive init, restricted worker launch and lifecycle | **Verified:** serial QEMU commands, shell survives worker start/exit, process status/wait and cleanup. General service management remains future work |
 | R027 | P1 | **QEMU-verified** ATA LBA28 identification and durable multi-sector volume | **Verified:** five QEMU boots, file overwrites, mirrored checksummed metadata, torn-copy recovery, strict partition bounds; generic PCI/AHCI/NVMe and production storage remain unsupported |
 | R028 | P1 | **QEMU-verified** virtio-net PCI, ARP/IPv4/ICMP/UDP/DNS and bounded TCP demo | **Verified:** real QEMU guest Ethernet packets, host-validated checksums, ARP resolution, ICMP ping, UDP exchange, DNS A response, TCP handshake and reply; general sockets/routing remain pending |
-| R029 | P1 | **QEMU graphics acceptance verified; user-space compositor pending** | **Verified:** actual 1280×800 VGA framebuffer pixels, two independent windows, QEMU PS/2 mouse clicks, keyboard focus/move/minimize/restore/close and screenshot differences. Privilege-separated user-space compositor/window API remains unfinished |
+| R029 | P1 | **QEMU graphics acceptance verified; user-space compositor pending** | **Verified:** actual 1280×800 VGA framebuffer pixels, two independent windows, QEMU PS/2 mouse clicks, keyboard focus/move/minimize/restore/close and screenshot differences. Ring-3 bounded draw-command API is now QEMU-verified; independent per-app surfaces and full user-space compositor remain unfinished |
 | R030 | P1 | Native toolchain SDK, apps and verified package manager | Repeatable signed install, update, remove and rollback of native packages |
 | R031 | P2 | Security model, authentication, updater, recovery installer | Isolation review, controlled permission tests, signed rollback and virtual-disk install |
 | R032 | P2 | Physical PC/ARM64 hardware-portability program | Published test matrix, qualified devices, measured boot/install performance |
@@ -194,3 +195,23 @@ remains outstanding; this graphical achievement is deliberately **not**
 proof of general desktop readiness. It is disabled in ordinary boot.
 
 The full main kernel CI requires the QEMU framebuffer/mouse acceptance test.
+
+## R029 ring-3 surface commands — QEMU acceptance (2026-10-23)
+
+The [passing verification run #39949896007](https://github.com/pramod07info/indianos/actions/runs/39949896007)
+passed **117** kernel Rust unit tests, the C-ABI host regression, a freestanding
+Rust kernel compile, source audit, and real 1280×800 QEMU VGA screenshot
+comparisons. An independently mapped ring-3 ELF performed a host-stepped
+userland draw of Files and Terminal content via syscalls; framebuffer mapping
+was never delegated to user pages. The kernel authenticated PID1,
+copied and validated each full descriptor, rejected forged pointers and
+out-of-bounds rectangles and kept chrome unchanged. Original ring-3 runtime
+reaped the process and restored all allocated frames. QEMU screenshots
+confirmed 229, 279 and 1,532 sampled pixel differences at the three
+render/focus phases.
+
+The **full kernel compositor still runs in ring 0** and the single
+trusted PID1 drawing client controls both sample windows. A complete
+ring-3 window server with independent application surface ownership
+and event delivery is not yet implemented; this is a bounded,
+verified transition toward that architecture.
