@@ -44,3 +44,17 @@ A marketing mockup is not implementation evidence. Each real UI screen needs fun
 ## Windows compatibility
 
 Native IndianOS applications are the primary target. The Windows ABI/driver ecosystem is proprietary and complex; ordinary .exe files **will not run by default**. Investigate source-level ports, web apps, virtual machines or a future compatibility layer only after a stable userspace ABI exists.
+
+## R029 actual graphical test (2026-10-23)
+
+Unlike the earlier R018 headless window model, a limited opt-in graphics
+integration now paints two actual independent windows and a cursor into
+the mapped Limine 32-bit framebuffer. A real QEMU PS/2 emulated mouse packet
+changes window focus, and serial keyboard commands alter z-order, position,
+visibility and close state. The host validates changing **QEMU VGA pixels**
+via captured binary PPM framebuffer screenshots. Follow-on work must provide
+an isolated ring-3 compositor process, IPC surface buffer ownership, input
+multiplexing, text shaping, accessibility and app integration.
+
+See [R029 acceptance](R029_GRAPHICAL_DESKTOP.md) and reproduce using
+`make test-r029-desktop-qemu`.
