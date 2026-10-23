@@ -87,12 +87,18 @@ pub unsafe extern "C" fn indianos_syscall_validate(
             user_range(plan, request.arg0, 32, false), // QUANTUM descriptor
         2 => request.arg1 == 0, // EXIT
         3 => request.arg0 == 0 && request.arg1 == 0, // YIELD
-        #[cfg(feature = "test-shell")]
+        #[cfg(any(feature = "test-shell", feature = "test-ipc"))]
         4 => request.arg0 == 0 && request.arg1 == 0, // GETPID
         #[cfg(feature = "test-shell")]
         5 => request.arg0 == 1 && request.arg1 == 0, // request /bin/worker
         #[cfg(feature="test-interactive")]
         6 => request.arg1 == 1 && user_range(plan,request.arg0,1,true),
+        #[cfg(feature="test-ipc")]
+        8 => (4..=68).contains(&request.arg1) &&
+            user_range(plan,request.arg0,request.arg1,false), // IPC_SEND
+        #[cfg(feature="test-ipc")]
+        9 => request.arg1 == 72 &&
+            user_range(plan,request.arg0,72,true), // IPC_RECEIVE
         _ => false,
     }
 }
@@ -214,6 +220,37 @@ mod tests {
         assert!(!check(plan.guard_begin,1));
         assert!(!check(USER_MIN,1));
         assert!(!check(plan.stack_end-1,2));
+    }
+    #[cfg(feature="test-ipc")]
+    #[test]
+    fn ipc_abi_checks_exact_lengths_memory_and_readonly_pages() {
+        let mut plan=ProgramPlan{
+            entry:USER_MIN, stack_begin:USER_TOP-STACK_BYTES,
+            stack_end:USER_TOP, guard_begin:USER_TOP-STACK_BYTES-PAGE_BYTES,
+            segment_count:1, segments:[ProgramSegment::empty();MAX_SEGMENTS],
+        };
+        plan.segments[0]=ProgramSegment{
+            page_begin:USER_MIN,page_end:USER_MIN+PAGE_BYTES,
+            writable:false,executable:true,..ProgramSegment::empty()
+        };
+        let check=|number,address,length|unsafe{
+            indianos_syscall_validate(&plan,SyscallRequest{
+                number,arg0:address,arg1:length,
+            })
+        };
+        assert!(check(4,0,0));
+        assert!(!check(4,1,0));
+        assert!(check(8,plan.stack_begin,4));
+        assert!(check(8,USER_MIN,68));
+        assert!(!check(8,plan.stack_begin,3));
+        assert!(!check(8,plan.stack_begin,69));
+        assert!(!check(8,plan.guard_begin,4));
+        assert!(!check(8,u64::MAX-4,8));
+        assert!(check(9,plan.stack_begin,72));
+        assert!(!check(9,USER_MIN,72));
+        assert!(!check(9,plan.stack_end-71,72));
+        assert!(!check(9,plan.stack_begin,71));
+        assert!(!check(9,plan.guard_begin,72));
     }
     #[test]
     fn trap_frame_blocks_supervisor_selectors_and_guard_stack() {
