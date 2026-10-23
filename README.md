@@ -2,7 +2,7 @@
 
 **IndianOS** is an experimental, independent desktop operating system for x86-64 PCs, designed for approachable everyday use in India. The goal is a familiar desktop workflow, Indian-language accessibility, and a native kernel—not a Linux distribution or a copy of Microsoft Windows.
 
-> **Status (2026-10-23): R024–R028 kernel milestones verified; R029 real graphical QEMU demonstration verified.** IndianOS now has a live QEMU 1280×800 framebuffer desktop drawing two separately focused and movable windows. Physical emulated PS/2 mouse clicks and COM1 keyboard commands change actual on-screen pixels, verified by independent QEMU screenshots. R029's compositor currently executes in the privileged kernel test path, **with a separate verified ring-3 surface-drawing client through bounded graphics syscalls, but not yet as a complete userspace window server**. All graphical and networking demos are opt-in and single-CPU; IndianOS is not a production internet-enabled desktop, POSIX system, audited sandbox or hardware installer. Never flash to a physical disk.
+> **Status (2026-10-23): R024–R029 QEMU kernel/graphics milestones and R030 native signed-package SDK verified.** IndianOS now has a live QEMU 1280×800 framebuffer desktop drawing two separately focused and movable windows. Physical emulated PS/2 mouse clicks and COM1 keyboard commands change actual on-screen pixels, verified by independent QEMU screenshots. R029's compositor currently executes in the privileged kernel test path, **with a separate verified ring-3 surface-drawing client through bounded graphics syscalls, but not yet as a complete userspace window server**. All graphical and networking demos are opt-in and single-CPU; IndianOS is not a production internet-enabled desktop, POSIX system, audited sandbox or hardware installer. Never flash to a physical disk.
 
 ## Initial technical decisions
 
@@ -12,7 +12,8 @@
 - **Graphics:** real pixel-composited two-window GUI with PS/2 mouse/keyboard verified in QEMU (opt-in R029 experiment). A ring-3 ELF now controls limited Files/Terminal content via validated 64-byte draw commands (real QEMU pixel and memory-ownership tests); moving the full compositor, input handling, and lifecycle to a standalone user-space window server remains required before production use.
 - **Drivers:** bring up serial, framebuffer and timer first; then PCI, storage, keyboard and network devices.
 - **Compatibility:** long-term native, web, Linux, Windows, Android and authorized remote-Mac routes; **none runs on IndianOS today**. Our independent kernel does not automatically run other platforms' binaries.
-- **AI:** planned assistant-driven app discovery and secure installation via deterministic, policy-gated package services. No AI installer exists yet.
+- **Native app packages:** an opt-in developer-host SDK now builds/verifies Ed25519-signed static x86-64 ELF64 packages, stages atomic installs and updates, supports rollback and removal, and boots signature-verified samples in QEMU. The on-device package daemon/store and AI installer remain unimplemented.
+- **AI:** planned assistant-driven app discovery with deterministic, policy-gated package services. No AI installer exists yet.
 - **Portability:** x86-64 first; ARM64 requires a separate kernel/driver port. We cannot guarantee 100% compatibility or superiority to other operating systems.
 
 ## Read the design
@@ -43,7 +44,8 @@
 24. [R028 verified virtio-net and packet protocol QEMU demo](docs/R028_NETWORK_QEMU.md)
 25. [R029 two-window interactive graphical framebuffer in QEMU](docs/R029_GRAPHICAL_DESKTOP.md)
 26. [R029 user-space two-window rendering command ABI](docs/R029_RING3_SURFACES.md)
-27. [Prioritized pending implementation backlog and acceptance checks](docs/IMPLEMENTATION_BACKLOG.md)
+27. [R030 Ed25519-signed native application SDK and QEMU install/update/rollback](docs/R030_SIGNED_NATIVE_PACKAGES.md)
+28. [Prioritized pending implementation backlog and acceptance checks](docs/IMPLEMENTATION_BACKLOG.md)
 
 ## Directory plan
 

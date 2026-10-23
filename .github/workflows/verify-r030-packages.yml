@@ -1,0 +1,34 @@
+name: Verify R030 Ed25519 signed application package SDK and QEMU lifecycle
+on:
+  push:
+    branches: [agentx-r030-signed-app-packages-20261023]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  r030:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install kernel QEMU and crypto SDK prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld binutils xorriso qemu-system-x86 ovmf curl openssl
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
+      - name: Security and lifecycle tests for signed application packages
+        run: python3 -m unittest discover -s tests -p 'test_r030_pkg.py' -v
+      - name: Check existing kernel host ABI linkage
+        run: make test-rust-host-abi
+      - name: R030 real QEMU signed package install update rollback and removal
+        shell: bash
+        run: |
+          set -euo pipefail
+          OVMF_PATH=""
+          for f in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/edk2/ovmf/OVMF_CODE_4M.fd /usr/share/edk2/ovmf/OVMF_CODE.fd; do
+            if test -f "$f"; then OVMF_PATH="$f"; break; fi
+          done
+          test -n "$OVMF_PATH"
+          make test-r030-package-qemu OVMF_CODE="$OVMF_PATH"

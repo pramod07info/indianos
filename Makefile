@@ -26,6 +26,15 @@ R028_NETWORK_TEST ?= 0
 R029_DESKTOP_TEST ?= 0
 # QEMU ring-3 surface command test; no user framebuffer mappings.
 R029_USERSPACE_TEST ?= 0
+# Build native ring-3 signed package SDK fixtures; off by default.
+R030_PACKAGE_V1 ?= 0
+R030_PACKAGE_V2 ?= 0
+ifeq ($(R030_PACKAGE_V1),1)
+USERMODE_SELFTEST := 1
+endif
+ifeq ($(R030_PACKAGE_V2),1)
+USERMODE_SELFTEST := 1
+endif
 ifeq ($(R029_USERSPACE_TEST),1)
 USERMODE_SELFTEST := 1
 endif
@@ -650,7 +659,11 @@ endif
 ifeq ($(RUST_USERLAND),1)
 # Identical expected serial messages and syscall ABI; no C/assembly
 # objects are linked into the Rust native user executable.
-ifeq ($(R029_USERSPACE_TEST),1)
+ifeq ($(R030_PACKAGE_V1),1)
+RUST_INIT_FEATURE := r030-demo-v1
+else ifeq ($(R030_PACKAGE_V2),1)
+RUST_INIT_FEATURE := r030-demo-v2
+else ifeq ($(R029_USERSPACE_TEST),1)
 RUST_INIT_FEATURE := r029-client
 else ifeq ($(R026_INTERACTIVE_TEST),1)
 RUST_INIT_FEATURE := r026-shell
@@ -953,6 +966,12 @@ clean:
 test-r029-user-surfaces-qemu:
 	$(MAKE) image BUILD=build/r029-user-surfaces RUST_CORE=1 R029_USERSPACE_TEST=1
 	python3 tools/test_r029_user_surfaces_qemu.py --iso build/r029-user-surfaces/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)"
+
+.PHONY: test-r030-package-qemu
+
+test-r030-package-qemu:
+	python3 -m unittest discover -s tests -p 'test_r030_pkg.py' -v
+	python3 tools/test_r030_package_qemu.py --qemu $(QEMU) --ovmf "$(OVMF_CODE)"
 
 .PHONY: test-r029-desktop-qemu
 

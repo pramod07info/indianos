@@ -1207,6 +1207,23 @@ jobs:
           path: build/r029-ring3-gui.log
           if-no-files-found: ignore
           retention-days: 7
+      - name: R030 signed native packages, Ed25519 trust, upgrade and rollback (real QEMU)
+        run: |
+          set -o pipefail
+          OVMF_PATH=""
+          for candidate in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/edk2/ovmf/OVMF_CODE_4M.fd /usr/share/edk2/ovmf/OVMF_CODE.fd; do
+            if test -f "$candidate"; then OVMF_PATH="$candidate"; break; fi
+          done
+          test -n "$OVMF_PATH"
+          make test-r030-package-qemu OVMF_CODE="$OVMF_PATH" 2>&1 | tee build/r030-signed-packages-qemu.log
+      - name: Preserve R030 signed native app QEMU lifecycle evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: indianos-r030-signed-packages-qemu-log
+          path: build/r030-signed-packages-qemu.log
+          if-no-files-found: ignore
+          retention-days: 7
       - name: QEMU user fault isolation (guard + supervisor)
         id: userfault_test
         continue-on-error: true
