@@ -91,6 +91,12 @@ pub unsafe extern "C" fn indianos_syscall_validate(
         4 => request.arg0 == 0 && request.arg1 == 0, // GETPID
         #[cfg(feature = "test-shell")]
         5 => request.arg0 == 1 && request.arg1 == 0, // allowlisted /bin/worker
+        #[cfg(feature="test-r029-userspace")]
+        18 => request.arg1==64 && user_range(plan,request.arg0,64,false),
+        #[cfg(feature="test-r029-userspace")]
+        19 => (1..=2).contains(&request.arg0) && request.arg1==0,
+        #[cfg(feature="test-r029-userspace")]
+        20 => request.arg0==0 && request.arg1==0,
         #[cfg(feature = "test-r026")]
         16 | 17 => request.arg0 == 2 && request.arg1 == 0, // worker status/reap query
         #[cfg(feature="test-interactive")]
