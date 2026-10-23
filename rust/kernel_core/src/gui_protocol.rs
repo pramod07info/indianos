@@ -47,7 +47,7 @@ impl Command{
                text[..len].iter().any(|&b|!(0x20..=0x7e).contains(&b)){
                 return Err(Error::Text);
             }
-            if width as usize<(len*12)||height<14{return Err(Error::Bounds);}
+            if (width as usize)<(len*12)||height<14{return Err(Error::Bounds);}
             len as u8
         };
         Ok(Self{window,operation,x,y,width,height,rgb,text,text_len})
