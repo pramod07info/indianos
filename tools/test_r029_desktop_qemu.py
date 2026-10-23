@@ -128,6 +128,14 @@ class QemuSession:
             if time.monotonic()>deadline:
                 raise AssertionError("QEMU did not create framebuffer screenshot "+str(path))
             self.drain_serial(0.1)
+        # Preserve genuine QEMU HMP screendump pixels for the user instead
+        # of deleting them with the temporary working directory.
+        destination=os.environ.get("R029_SCREENSHOT_DIR")
+        if destination:
+            import shutil
+            target=pathlib.Path(destination)
+            target.mkdir(parents=True,exist_ok=True)
+            shutil.copyfile(path,target/path.name)
         return parse_ppm(path)
     def serial(self,bytes_:bytes)->None:
         if self.proc.stdin is None:raise AssertionError("COM1 stdin missing")
