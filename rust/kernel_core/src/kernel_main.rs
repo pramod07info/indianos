@@ -29,6 +29,8 @@ unsafe extern "C" {
     fn x86_64_user_demo_run(elf:*const u8,size:usize)->bool;
     fn x86_64_user_process_run(process:*mut Process,elf:*const u8,size:usize)->bool;
     fn x86_64_m009_schedule_run(a:*const u8,asize:usize,b:*const u8,bsize:usize)->bool;
+    #[cfg(feature="test-r029-desktop-suite")]
+    fn x86_64_r029_desktop_suite_run(a:*const u8,al:usize,b:*const u8,bl:usize,c:*const u8,cl:usize)->bool;
     #[cfg(feature="test-shell")]
     fn indianos_r013_take_worker_request()->bool;
 }
@@ -385,6 +387,15 @@ pub extern "C" fn kmain()->!{
         log(b"IndianOS: R029.3 two isolated graphical processes begin\n\0");
         #[cfg(all(not(feature="preempt"),not(feature="test-ipc"),not(feature="test-r026"),not(feature="test-r029-multiprocess")))]
         log(b"IndianOS: M009 cooperative scheduler experiment begin\n\0");
+        #[cfg(feature="test-r029-desktop-suite")]
+        {
+            let (terminal,terminal_size)=module(b"/bin/terminal\0").unwrap_or_else(||{
+                log(b"IndianOS: FATAL /bin/terminal missing\n\0");halt()
+            });
+            need(unsafe{x86_64_r029_desktop_suite_run(init,init_size,worker,worker_size,terminal,terminal_size)},
+                 b"IndianOS: FATAL R029.5-7 desktop integration failed\n\0");
+        }
+        #[cfg(not(feature="test-r029-desktop-suite"))]
         need(unsafe{x86_64_m009_schedule_run(init,init_size,worker,worker_size)},
              b"IndianOS: FATAL M009 cooperative context test failed\n\0");
         #[cfg(feature="test-r026")]
@@ -393,6 +404,9 @@ pub extern "C" fn kmain()->!{
         {
             need(crate::gui::user_surface_verified(),
                  b"IndianOS: FATAL R029.3 window ownership or teardown\n\0");
+            #[cfg(feature="test-r029-desktop-suite")]
+            log(b"IndianOS: R029.5-7 integrated three-process GUI, IPC and launcher PASSED\n\0");
+            #[cfg(not(feature="test-r029-desktop-suite"))]
             log(b"IndianOS: R029.3 independent PID1 Files and PID2 Terminal GUI PASSED\n\0");
         }
         #[cfg(all(not(feature="test-r026"),not(feature="test-r029-multiprocess")))]

@@ -125,13 +125,15 @@ fn command(args:&[String])->Result<(),String>{
             let data=fs::read(elf).map_err(|e|e.to_string())?;
             let extra=option(args,"--extra-elf").map(|path|
                 fs::read(path).map_err(|e|e.to_string())).transpose()?;
-            let archive=match extra.as_ref(){
-                Some(bytes)=>{
-                    let other=option(args,"--extra-name")
-                        .unwrap_or_else(||"/bin/worker".into());
-                    pack(&[(&name,&data),(&other,bytes)])?
-                }
-                None=>pack(&[(&name,&data)])?
+            let third=option(args,"--extra2-elf").map(|p|
+                fs::read(p).map_err(|e|e.to_string())).transpose()?;
+            let n2=option(args,"--extra-name").unwrap_or_else(||"/bin/worker".into());
+            let n3=option(args,"--extra2-name").unwrap_or_else(||"/bin/terminal".into());
+            let archive=match(extra.as_ref(),third.as_ref()){
+                (Some(a),Some(b))=>pack(&[(&name,&data),(&n2,a),(&n3,b)])?,
+                (Some(a),None)=>pack(&[(&name,&data),(&n2,a)])?,
+                (None,None)=>pack(&[(&name,&data)])?,
+                (None,Some(_))=>return Err("third ELF requires second ELF".into())
             };
             let dest=Path::new(&output);
             if let Some(dir)=dest.parent(){fs::create_dir_all(dir).map_err(|e|e.to_string())?}

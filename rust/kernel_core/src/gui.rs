@@ -155,6 +155,10 @@ struct UserSurfaceService{
     broker:Broker<2,8>,
     #[cfg(feature="test-r029-frame-server")]
     frames_presented:u32,
+    #[cfg(feature="test-r029-desktop-suite")]
+    launcher_visible:bool,
+    #[cfg(feature="test-r029-desktop-suite")]
+    desktop_actions:u32,
     #[cfg(feature="test-r029-physical-events")]
     mouse:Mouse,
 }
@@ -166,11 +170,19 @@ impl UserSurfaceService{
         let session=Session::new(w,h)?;
         if session.files!=1||session.terminal!=2{return None;}
         let mut broker=Broker::new();
-        broker.grant(1,session.files).ok()?;
-        #[cfg(feature="test-r029-multiprocess")]
-        broker.grant(2,session.terminal).ok()?;
-        #[cfg(not(feature="test-r029-multiprocess"))]
-        broker.grant(1,session.terminal).ok()?;
+        #[cfg(feature="test-r029-desktop-suite")]
+        {
+            broker.grant(2,session.files).ok()?;
+            broker.grant(3,session.terminal).ok()?;
+        }
+        #[cfg(not(feature="test-r029-desktop-suite"))]
+        {
+            broker.grant(1,session.files).ok()?;
+            #[cfg(feature="test-r029-multiprocess")]
+            broker.grant(2,session.terminal).ok()?;
+            #[cfg(not(feature="test-r029-multiprocess"))]
+            broker.grant(1,session.terminal).ok()?;
+        }
         #[cfg(feature="test-r029-physical-events")]
         let mouse=Mouse::init()?;
         Some(Self{session,
@@ -178,6 +190,10 @@ impl UserSurfaceService{
             counts:[0,0],focused:0,broker,
             #[cfg(feature="test-r029-frame-server")]
             frames_presented:0,
+            #[cfg(feature="test-r029-desktop-suite")]
+            launcher_visible:false,
+            #[cfg(feature="test-r029-desktop-suite")]
+            desktop_actions:0,
             #[cfg(feature="test-r029-physical-events")]
             mouse})
     }
@@ -219,6 +235,15 @@ impl UserSurfaceService{
                     _=>return false,
                 }
             }
+        }
+        #[cfg(feature="test-r029-desktop-suite")]
+        if self.launcher_visible{
+            out.fill(20,(out.height-225) as i32,340,183,palette.top);
+            out.fill(26,(out.height-215) as i32,328,30,palette.title);
+            out.text(36,(out.height-207) as i32,b"APPLICATIONS",palette.white);
+            out.text(42,(out.height-168) as i32,b"1  FILE MANAGER",palette.white);
+            out.text(42,(out.height-132) as i32,b"2  TERMINAL",palette.white);
+            out.text(42,(out.height-95) as i32,b"FOCUS  MOVE  MINIMIZE",palette.white);
         }
         out.fill(self.session.mouse_x-1,self.session.mouse_y-10,3,21,palette.accent);
         out.fill(self.session.mouse_x-10,self.session.mouse_y-1,21,3,palette.accent);
@@ -281,11 +306,34 @@ impl UserSurfaceService{
             let _=changed;
         }
     }
+    #[cfg(feature="test-r029-desktop-suite")]
+    fn desktop_action(&mut self,pid:u32,action:u32)->bool{
+        if pid!=1||self.frame_state(pid).is_none(){return false;}
+        let result=match action{
+            1=>self.session.focus(self.session.files),
+            2=>self.session.focus(self.session.terminal),
+            3=>{
+                let id=self.session.files;
+                let window=self.session.desktop.windows().find(|w|w.id==id).copied();
+                window.is_some_and(|w|
+                    self.session.desktop.move_window(id,w.bounds.x+36,w.bounds.y).is_ok())
+            },
+            4=>self.session.desktop.minimize(self.session.terminal).is_ok(),
+            5=>self.session.focus(self.session.terminal),
+            6=>{self.launcher_visible=!self.launcher_visible;true},
+            _=>false
+        };
+        if result{self.desktop_actions+=1;}
+        result
+    }
     #[cfg(feature="test-r029-frame-server")]
     fn frame_state(&self,pid:u32)->Option<u64>{
         // The frame server is an explicit kernel-granted identity. PID2
         // cannot read or present the combined display even though it owns
         // its own drawing stream.
+        #[cfg(feature="test-r029-desktop-suite")]
+        if pid!=1{return None;}
+        #[cfg(not(feature="test-r029-desktop-suite"))]
         if pid!=1 || !self.broker.owns(pid,self.session.files){return None;}
         Some(self.counts[0] as u64 |
              ((self.counts[1] as u64)<<8) |
@@ -293,10 +341,11 @@ impl UserSurfaceService{
     }
     #[cfg(feature="test-r029-frame-server")]
     fn present_frame(&mut self,pid:u32,front:u32)->bool{
+        let limit=if cfg!(feature="test-r029-desktop-suite"){5}else{2};
         if self.frame_state(pid).is_none() ||
            !matches!(front,1|2) ||
            self.counts!=[2,2] ||
-           self.frames_presented>=2{return false;}
+           self.frames_presented>=limit{return false;}
         // Window stacking order is selected by the ring-3 compositor
         // policy. The privileged kernel remains only a clipped raster
         // backend in this opt-in implementation.
@@ -350,7 +399,8 @@ pub(crate) fn user_surface_terminate(pid:u32){
     if let Some(svc)=user_service(){
         svc.broker.revoke(pid);
         #[cfg(feature="test-r029-physical-events")]
-        if !svc.broker.known(1) && !svc.broker.known(2){
+        if !svc.broker.known(1) && !svc.broker.known(2)
+            && !svc.broker.known(3){
             svc.mouse.disable();
         }
     }
@@ -358,6 +408,10 @@ pub(crate) fn user_surface_terminate(pid:u32){
 #[cfg(feature="test-r029-userspace")]
 pub(crate) fn user_surface_ack(pid:u32,sequence:u32)->bool{
     user_service().is_some_and(|svc|svc.broker.ack(pid,sequence).is_ok())
+}
+#[cfg(feature="test-r029-desktop-suite")]
+pub(crate) fn user_desktop_action(pid:u32,action:u32)->bool{
+    user_service().is_some_and(|svc|svc.desktop_action(pid,action))
 }
 #[cfg(feature="test-r029-frame-server")]
 pub(crate) fn user_frame_state(pid:u32)->Option<u64>{
@@ -370,7 +424,10 @@ pub(crate) fn user_frame_present(pid:u32,front:u32)->bool{
 #[cfg(feature="test-r029-userspace")]
 pub(crate) fn user_surface_verified()->bool{
     user_service().is_some_and(|svc|{
-        #[cfg(feature="test-r029-frame-server")]
+        #[cfg(feature="test-r029-desktop-suite")]
+        let frames_ok=svc.frames_presented==5 && svc.desktop_actions==6 &&
+           !svc.launcher_visible && !svc.broker.known(3);
+        #[cfg(all(feature="test-r029-frame-server",not(feature="test-r029-desktop-suite")))]
         let frames_ok=svc.frames_presented==2;
         #[cfg(not(feature="test-r029-frame-server"))]
         let frames_ok=svc.focused>=1;

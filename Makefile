@@ -32,6 +32,10 @@ R029_PHYSICAL_TEST ?= 0
 R029_MULTIPROCESS_TEST ?= 0
 # R029.4 dedicated PID1 userspace frame scheduler and PID2 GUI client.
 R029_FRAME_SERVER_TEST ?= 0
+R029_DESKTOP_SUITE_TEST ?= 0
+ifeq ($(R029_DESKTOP_SUITE_TEST),1)
+R029_FRAME_SERVER_TEST := 1
+endif
 ifeq ($(R029_FRAME_SERVER_TEST),1)
 R029_MULTIPROCESS_TEST := 1
 endif
@@ -157,7 +161,7 @@ RUST_FEATURES += $(if $(filter 1,$(EXCEPTION_SELFTEST)),--features test-ud2,) \
  $(if $(filter 1,$(PAGING_SWITCH_SELFTEST)),--features test-shadow,) \
  $(if $(filter 1,$(USERMODE_SELFTEST)),--features test-ring3,) \
  $(if $(filter 1,$(PROCESS_SELFTEST)),--features test-processes,) \
- $(if $(filter 1,$(SCHEDULER_SELFTEST)),--features test-scheduler,) $(if $(filter 1,$(R013_SHELL_TEST)),--features test-shell,) $(if $(filter 1,$(R014_INTERACTIVE_TEST)),--features test-interactive,) $(if $(filter 1,$(R014_IRQ_TEST)),--features test-irq-keyboard,) $(if $(filter 1,$(R015_ATA_TEST)),--features test-ata-disk,) $(if $(filter 1,$(R027_DURABLE_TEST)),--features test-r027-durable,) $(if $(filter 1,$(R028_NETWORK_TEST)),--features test-r028-network,) $(if $(filter 1,$(R029_DESKTOP_TEST)),--features test-r029-desktop,) $(if $(filter 1,$(R029_USERSPACE_TEST)),--features test-r029-userspace,) $(if $(filter 1,$(R029_PHYSICAL_TEST)),--features test-r029-physical-events,) $(if $(filter 1,$(R029_MULTIPROCESS_TEST)),--features test-r029-multiprocess,) $(if $(filter 1,$(R029_FRAME_SERVER_TEST)),--features test-r029-frame-server,) $(if $(filter 1,$(R026_INTERACTIVE_TEST)),--features test-r026,) $(if $(filter 1,$(R025_COMPLETE_TEST)),--features test-r025,) $(if $(filter 1,$(R025_IPC_TEST)),--features test-ipc,)
+ $(if $(filter 1,$(SCHEDULER_SELFTEST)),--features test-scheduler,) $(if $(filter 1,$(R013_SHELL_TEST)),--features test-shell,) $(if $(filter 1,$(R014_INTERACTIVE_TEST)),--features test-interactive,) $(if $(filter 1,$(R014_IRQ_TEST)),--features test-irq-keyboard,) $(if $(filter 1,$(R015_ATA_TEST)),--features test-ata-disk,) $(if $(filter 1,$(R027_DURABLE_TEST)),--features test-r027-durable,) $(if $(filter 1,$(R028_NETWORK_TEST)),--features test-r028-network,) $(if $(filter 1,$(R029_DESKTOP_TEST)),--features test-r029-desktop,) $(if $(filter 1,$(R029_USERSPACE_TEST)),--features test-r029-userspace,) $(if $(filter 1,$(R029_PHYSICAL_TEST)),--features test-r029-physical-events,) $(if $(filter 1,$(R029_MULTIPROCESS_TEST)),--features test-r029-multiprocess,) $(if $(filter 1,$(R029_FRAME_SERVER_TEST)),--features test-r029-frame-server,) $(if $(filter 1,$(R029_DESKTOP_SUITE_TEST)),--features test-r029-desktop-suite,) $(if $(filter 1,$(R026_INTERACTIVE_TEST)),--features test-r026,) $(if $(filter 1,$(R025_COMPLETE_TEST)),--features test-r025,) $(if $(filter 1,$(R025_IPC_TEST)),--features test-ipc,)
 ifeq ($(USERFAULT_SELFTEST),1)
 RUST_FEATURES += $(if $(filter guard,$(USERFAULT_KIND)),--features test-fault-guard,--features test-fault-supervisor)
 endif
@@ -671,6 +675,11 @@ ifneq ($(filter 1,$(PROCESS_SELFTEST) $(SCHEDULER_SELFTEST) $(R013_SHELL_TEST) $
 INITRAMFS_EXTRA_DEPS := $(WORKER_ELF)
 INITRAMFS_EXTRA_ARGS := --extra-elf $(WORKER_ELF) --extra-name /bin/worker
 endif
+ifeq ($(R029_DESKTOP_SUITE_TEST),1)
+THIRD_ELF := $(BUILD)/userland/terminal.elf
+INITRAMFS_EXTRA_DEPS += $(THIRD_ELF)
+INITRAMFS_EXTRA_ARGS += --extra2-elf $(THIRD_ELF) --extra2-name /bin/terminal
+endif
 
 ifeq ($(RUST_USERLAND),1)
 # Identical expected serial messages and syscall ABI; no C/assembly
@@ -679,6 +688,10 @@ ifeq ($(R030_PACKAGE_V1),1)
 RUST_INIT_FEATURE := r030-demo-v1
 else ifeq ($(R030_PACKAGE_V2),1)
 RUST_INIT_FEATURE := r030-demo-v2
+else ifeq ($(R029_DESKTOP_SUITE_TEST),1)
+RUST_INIT_FEATURE := r029-suite-shell
+RUST_WORKER_FEATURE := r029-suite-files
+RUST_THIRD_FEATURE := r029-suite-terminal
 else ifeq ($(R029_FRAME_SERVER_TEST),1)
 RUST_INIT_FEATURE := r029-frame-server
 RUST_WORKER_FEATURE := r029-frame-client
@@ -730,6 +743,18 @@ $(USER_ELF): $(wildcard userland/rust/src/*.rs) userland/rust/Cargo.toml userlan
 	    $(if $(RUST_INIT_FEATURE),--features $(RUST_INIT_FEATURE),)
 	cp $(BUILD)/rust-user-init-target/x86_64-unknown-none/release/indianos-user $@
 	@readelf -h $@ | grep -q 'Type:.*EXEC'
+
+ifeq ($(R029_DESKTOP_SUITE_TEST),1)
+$(THIRD_ELF): $(wildcard userland/rust/src/*.rs) userland/rust/Cargo.toml userland/rust/Cargo.lock userland/demo/linker.ld Makefile
+	@mkdir -p $(@D)
+	CARGO_TARGET_DIR=$(BUILD)/rust-user-third-target \
+	    RUSTFLAGS="$(RUST_APP_FLAGS)" \
+	    $(CARGO) build --manifest-path userland/rust/Cargo.toml \
+	    --target x86_64-unknown-none --release --offline --no-default-features \
+	    --features $(RUST_THIRD_FEATURE)
+	cp $(BUILD)/rust-user-third-target/x86_64-unknown-none/release/indianos-user $@
+	@readelf -h $@ | grep -q 'Type:.*EXEC'
+endif
 
 $(WORKER_ELF): $(wildcard userland/rust/src/*.rs) userland/rust/Cargo.toml userland/rust/Cargo.lock userland/demo/linker.ld Makefile
 	@mkdir -p $(@D)
@@ -1005,6 +1030,11 @@ test-r029-multiprocess-qemu:
 test-r029-frame-server-qemu:
 	$(MAKE) image BUILD=build/r029-frame-server RUST_CORE=1 R029_FRAME_SERVER_TEST=1
 	python3 tools/test_r029_frame_server_qemu.py --iso build/r029-frame-server/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)"
+
+.PHONY: test-r029-desktop-suite-qemu
+test-r029-desktop-suite-qemu:
+	$(MAKE) image BUILD=build/r029-desktop-suite RUST_CORE=1 R029_DESKTOP_SUITE_TEST=1
+	python3 tools/test_r029_desktop_suite_qemu.py --iso build/r029-desktop-suite/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)"
 
 .PHONY: test-r030-package-qemu
 

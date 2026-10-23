@@ -1,0 +1,38 @@
+name: Verify integrated R029.5-7 desktop and three ring3 applications
+on:
+  push:
+    branches: [agentx-r0295-r0297-integrated-20261023]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  three-process-gui:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install QEMU/OVMF and bare-metal toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld binutils xorriso qemu-system-x86 ovmf curl
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
+      - name: Host kernel Rust, IPC and GUI unit tests
+        run: cargo test --offline --manifest-path rust/kernel_core/Cargo.toml --features test-r029-desktop-suite
+      - name: Rust initramfs packer and kernel ABI
+        run: |
+          cargo test --offline --manifest-path tools/rust/Cargo.toml
+          make test-rust-host-abi
+          make test-rust-source-audit
+      - name: Bare-metal kernel compile with three-process desktop enabled
+        run: cargo build --offline --manifest-path rust/kernel_core/Cargo.toml --target x86_64-unknown-none --no-default-features --features cpu-entry,vmm,pmm,user-image,paging,paging-cpu,user-runtime,runtime,boot-staging,boot,interrupts,timer,kernel-main,limine-requests,test-r029-desktop-suite
+      - name: Complete QEMU mouse, IPC, launcher and pixel acceptance
+        run: |
+          set -euo pipefail
+          OVMF_PATH=""
+          for f in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/edk2/ovmf/OVMF_CODE_4M.fd /usr/share/edk2/ovmf/OVMF_CODE.fd; do
+            if test -f "$f"; then OVMF_PATH="$f"; break; fi
+          done
+          test -n "$OVMF_PATH"
+          make test-r029-desktop-suite-qemu OVMF_CODE="$OVMF_PATH"

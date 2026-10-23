@@ -99,6 +99,8 @@ pub unsafe extern "C" fn indianos_syscall_validate(
         20 => request.arg0==0 && request.arg1==0,
         #[cfg(feature="test-r029-userspace")]
         21 => request.arg1==16 && user_range(plan,request.arg0,16,true),
+        #[cfg(feature="test-r029-desktop-suite")]
+        24 => (1..=6).contains(&request.arg0) && request.arg1==0,
         #[cfg(feature="test-r029-frame-server")]
         22 => request.arg0==0 && request.arg1==0, // FRAME_QUERY
         #[cfg(feature="test-r029-frame-server")]

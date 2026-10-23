@@ -43,6 +43,7 @@ test-r029-multiprocess = ["test-r029-physical-events","test-scheduler"]
 # Two ring-3 processes; PID1 schedules framebuffer frames and stacking.
 # The kernel stays a privileged, clipped pixel backend (not yet full user compositor).
 test-r029-frame-server = ["test-r029-multiprocess"]
+test-r029-desktop-suite = ["test-r029-frame-server","test-ipc"]
 test-ud2 = []
 test-pagefault = []
 test-shadow = []

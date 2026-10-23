@@ -30,6 +30,9 @@ const PHYS:u64=0x000f_ffff_ffff_f000;
 const PAGE:u64=4096;
 const YIELD:u64=0x200;
 const WORDS:usize=20;
+#[cfg(feature="test-r029-desktop-suite")]
+const TASKS:usize=3;
+#[cfg(not(feature="test-r029-desktop-suite"))]
 const TASKS:usize=2;
 const BAD:u64=u64::MAX;
 #[repr(C)]
@@ -39,6 +42,8 @@ struct Task{
  image:UserImage,root:CloneResult,pcb:*mut Process,
  frame:[u64;WORDS],saved:bool,attached:bool,timer_preemptions:u32,
 }
+#[cfg(feature="test-r029-desktop-suite")]
+static mut THIRD_ELF:(*const u8,usize)=(ptr::null(),0);
 static mut ACTIVE_USER:*mut UserImage=ptr::null_mut();
 // R013: tightly gated and single-core. Only PID 1 can request worker 1.
 #[cfg(feature="test-shell")]
@@ -62,9 +67,9 @@ static mut QUANTUM_JOBS:crate::quantum_service::QuantumService=
     crate::quantum_service::QuantumService::new();
 // Two scheduler-authenticated process mailboxes, off in normal boots.
 #[cfg(feature="test-ipc")]
-static mut IPC_ROUTER:Option<IpcRouter<2,4>>=None;
+static mut IPC_ROUTER:Option<IpcRouter<3,8>>=None;
 #[cfg(feature="test-ipc")]
-fn router()->Option<&'static mut IpcRouter<2,4>>{
+fn router()->Option<&'static mut IpcRouter<3,8>>{
     // Single BSP; INT 0x80 interrupt gate masks CPU interrupts.
     // No SMP or nested use of this non-atomic router is permitted.
     unsafe{(&mut *ptr::addr_of_mut!(IPC_ROUTER)).as_mut()}
@@ -85,7 +90,8 @@ fn authenticated_gui_pid()->Option<u32>{
     {
         let task=active_task();
         let image=active_image();
-        if !(1..=2).contains(&p.pid)||task.is_null()||image.is_null(){
+        if !(1..=if cfg!(feature="test-r029-desktop-suite"){3}else{2})
+            .contains(&p.pid)||task.is_null()||image.is_null(){
             return None;
         }
         let task=unsafe{&*task};
@@ -271,6 +277,11 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
   20=>{
    let Some(pid)=authenticated_gui_pid()else{return BAD;};
    crate::gui::user_surface_status(pid).unwrap_or(BAD)
+  },
+  #[cfg(feature="test-r029-desktop-suite")]
+  24=>{
+   let Some(pid)=authenticated_gui_pid()else{return BAD;};
+   if crate::gui::user_desktop_action(pid,request.arg0 as u32){0}else{BAD}
   },
   #[cfg(feature="test-r029-frame-server")]
   22=>{
@@ -815,6 +826,16 @@ fn discard(t:*mut Task,b:&CloneBackend,terminal:bool)->bool{
  }
  true
 }
+#[cfg(feature="test-r029-desktop-suite")]
+#[no_mangle]
+pub unsafe extern "C" fn x86_64_r029_desktop_suite_run(
+ a:*const u8,al:usize,b:*const u8,bl:usize,c:*const u8,cl:usize)->bool{
+ if c.is_null()||cl==0{return false;}
+ unsafe{THIRD_ELF=(c,cl);}
+ let result=unsafe{x86_64_m009_schedule_run(a,al,b,bl)};
+ unsafe{THIRD_ELF=(ptr::null(),0);}
+ result
+}
 #[no_mangle]
 pub unsafe extern "C" fn x86_64_m009_schedule_run(
  first:*const u8,first_len:usize,second:*const u8,second_len:usize)->bool{
@@ -830,6 +851,10 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
  let p=unsafe{indianos_process_create(&mut table)};
  let q=unsafe{indianos_process_create(&mut table)};
  if p.is_null()||q.is_null()||unsafe{(*p).pid}!=1||unsafe{(*q).pid}!=2{return false;}
+ #[cfg(feature="test-r029-desktop-suite")]
+ let third=unsafe{indianos_process_create(&mut table)};
+ #[cfg(feature="test-r029-desktop-suite")]
+ if third.is_null()||unsafe{(*third).pid}!=3{return false;}
  #[cfg(feature="preempt")]
  {
   // Install UC xAPIC mapping before cloning any user CR3, otherwise
@@ -846,18 +871,30 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
  }
  #[cfg(feature="test-r026")]
  unsafe{R026_WORKER_REQUESTED=false;R026_WORKER_REAPED=false;}
- let prepared=prepare(task_ptr(0),p,first,first_len,cpu.cr3&PHYS,&vmm,&backend,0)&&
+ let prepared_two=prepare(task_ptr(0),p,first,first_len,cpu.cr3&PHYS,&vmm,&backend,0)&&
   prepare(task_ptr(1),q,second,second_len,cpu.cr3&PHYS,&vmm,&backend,1);
+ #[cfg(feature="test-r029-desktop-suite")]
+ let prepared=prepared_two && {
+  let (elf,len)=unsafe{THIRD_ELF};
+  prepare(task_ptr(2),third,elf,len,cpu.cr3&PHYS,&vmm,&backend,2)
+ };
+ #[cfg(not(feature="test-r029-desktop-suite"))]
+ let prepared=prepared_two;
  if !prepared||!unsafe{indianos_scheduler_init(&mut scheduler,&mut table)}{
   log(b"IndianOS: M009 FATAL cannot prepare two user contexts\n\0");
+  #[cfg(feature="test-r029-desktop-suite")]
+  let _=discard(task_ptr(2),&backend,false);
   let _=discard(task_ptr(1),&backend,false);
   let _=discard(task_ptr(0),&backend,false);
   return false;
  }
  #[cfg(feature="test-ipc")]
  {
-  let Some(mut mailboxes)=IpcRouter::<2,4>::new().ok()else{return false;};
-  if mailboxes.register(1).is_err()||mailboxes.register(2).is_err(){
+  let Some(mut mailboxes)=IpcRouter::<3,8>::new().ok()else{return false;};
+  let registered=mailboxes.register(1).is_ok()&&mailboxes.register(2).is_ok();
+  #[cfg(feature="test-r029-desktop-suite")]
+  let registered=registered&&mailboxes.register(3).is_ok();
+  if !registered{
    return false;
   }
   unsafe{IPC_ROUTER=Some(mailboxes);}
@@ -877,7 +914,10 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
   unsafe{(*q).state=1;}
   log(b"IndianOS: R026 worker prepared but not yet runnable\n\0");
  }
+ #[cfg(not(feature="test-r029-desktop-suite"))]
  log(b"IndianOS: M009 two simultaneous user address spaces ready\n\0");
+ #[cfg(feature="test-r029-desktop-suite")]
+ log(b"IndianOS: R029.5 three protected ring3 address spaces READY\n\0");
  #[cfg(feature="preempt")]
  {
   if !unsafe{crate::timer::x86_64_xapic_start_qemu_100hz()}{
@@ -893,7 +933,7 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
   let pcb=unsafe{indianos_scheduler_next(&mut scheduler)};
   if pcb.is_null(){ok=false;break;}
   let pid=unsafe{(*pcb).pid};
-  if pid<1||pid>2{ok=false;break;}
+  if pid<1||pid>TASKS as u32{ok=false;break;}
   let slot=(pid-1) as usize;
   let task=unsafe{&mut *task_ptr(slot)};
   if task.pcb!=pcb||!unsafe{x86_64_user_interrupt_stack_select(slot as u32)}{
@@ -958,9 +998,13 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
    }
   }
  }
+ #[cfg(feature="test-r029-desktop-suite")]
+ let third_ok=unsafe{indianos_process_success(third)};
+ #[cfg(not(feature="test-r029-desktop-suite"))]
+ let third_ok=true;
  if ok&&(!unsafe{indianos_scheduler_all_terminal(&scheduler)} ||
          !unsafe{indianos_process_success(p)} ||
-         !unsafe{indianos_process_success(q)} ||
+         !unsafe{indianos_process_success(q)} ||!third_ok||
          unsafe{pmm_free_frames()}!=before){ok=false;}
  #[cfg(feature="preempt")]
  {
@@ -976,7 +1020,7 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
      !crate::timer::xapic_preemption_evidence(irqs,captures){ok=false;}
   if ok{log(b"IndianOS: R024 APIC timer-preemptive round-robin PASSED\n\0");}
  }
- #[cfg(all(not(feature="preempt"),not(feature="test-r026")))]
+ #[cfg(all(not(feature="preempt"),not(feature="test-r026"),not(feature="test-r029-desktop-suite")))]
  {
   if scheduler.dispatch_count!=6||scheduler.yield_count!=4||
      scheduler.tick_count!=4{ok=false;}
@@ -989,11 +1033,20 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
      scheduler.tick_count<1 {ok=false;}
   if ok{log(b"IndianOS: R026 persistent interactive worker lifecycle PASSED\n\0");}
  }
+ #[cfg(feature="test-r029-desktop-suite")]
+ {
+  if scheduler.dispatch_count<5||scheduler.yield_count<2{ok=false;}
+  if ok{log(b"IndianOS: R029.5 three process lifecycle PASSED\n\0");}
+ }
  #[cfg(feature="test-ipc")]
  {
   if let Some(boxes)=router(){
+   #[cfg(feature="test-r029-desktop-suite")]
+   let third_closed=boxes.pending(3)==Err(IpcError::UnknownReceiver);
+   #[cfg(not(feature="test-r029-desktop-suite"))]
+   let third_closed=true;
    if boxes.pending(1)!=Err(IpcError::UnknownReceiver)||
-      boxes.pending(2)!=Err(IpcError::UnknownReceiver){ok=false;}
+      boxes.pending(2)!=Err(IpcError::UnknownReceiver)||!third_closed{ok=false;}
   }else{ok=false;}
   unsafe{IPC_ROUTER=None;}
   if ok{log(b"IndianOS: R025 secure IPC two-process handshake PASSED\n\0");}
@@ -1016,7 +1069,11 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
   // Reclaim both remaining images, even if their PCB state was rejected.
   let first=discard(task_ptr(0),&backend,false);
   let second=discard(task_ptr(1),&backend,false);
-  if !first||!second||unsafe{pmm_free_frames()}!=before{
+  #[cfg(feature="test-r029-desktop-suite")]
+  let third_discard=discard(task_ptr(2),&backend,false);
+  #[cfg(not(feature="test-r029-desktop-suite"))]
+  let third_discard=true;
+  if !first||!second||!third_discard||unsafe{pmm_free_frames()}!=before{
    log(b"IndianOS: M009 FATAL partial rollback: memory not fully reclaimed\n\0");
   }
  }
@@ -1025,7 +1082,7 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
 #[cfg(test)]mod tests{
  use super::*;
  #[test]fn saved_frame_requires_correct_privileges(){
-  assert_eq!(WORDS,20);assert_eq!(TASKS,2);
+  assert_eq!(WORDS,20);assert_eq!(TASKS,if cfg!(feature="test-r029-desktop-suite"){3}else{2});
   assert_eq!(core::mem::align_of::<Task>(),16);
   let mut t:Task=unsafe{core::mem::zeroed()};
   t.saved=true;t.frame[16]=0x2b;t.frame[19]=0x33;

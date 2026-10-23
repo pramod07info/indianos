@@ -228,7 +228,8 @@ fn interactive_shell()->!{
 // Separate ring-3 application: owns *commands* for Files and Terminal,
 // not a physical framebuffer pointer or a kernel window-data structure.
 #[cfg(any(feature="r029-client",feature="r029-files",feature="r029-terminal",
-          feature="r029-frame-server",feature="r029-frame-client"))]
+          feature="r029-frame-server",feature="r029-frame-client",
+          feature="r029-suite-shell",feature="r029-suite-files",feature="r029-suite-terminal"))]
 fn r029_command(window:u32,kind:u32,x:u16,y:u16,width:u16,height:u16,
     rgb:u32,text:&[u8])->[u8;64]
 {
@@ -246,12 +247,14 @@ fn r029_command(window:u32,kind:u32,x:u16,y:u16,width:u16,height:u16,
     wire
 }
 #[cfg(any(feature="r029-client",feature="r029-files",feature="r029-terminal",
-          feature="r029-frame-server",feature="r029-frame-client"))]
+          feature="r029-frame-server",feature="r029-frame-client",
+          feature="r029-suite-shell",feature="r029-suite-files",feature="r029-suite-terminal"))]
 fn r029_draw(cmd:&[u8;64]){
     if call(18,cmd.as_ptr() as u64,64)!=0{exit(91);}
 }
 #[cfg(any(feature="r029-client",feature="r029-files",feature="r029-terminal",
-          feature="r029-frame-server",feature="r029-frame-client"))]
+          feature="r029-frame-server",feature="r029-frame-client",
+          feature="r029-suite-shell",feature="r029-suite-files",feature="r029-suite-terminal"))]
 fn r029_wait_for_host(){
     let mut byte=[0u8;1];
     for _ in 0..80_000_000 {
@@ -469,8 +472,106 @@ fn r029_frame_client()->!{
     write(b"R029.4 client survived independent compositor teardown");
     exit(0);
 }
+// Integrated R029.5-7: PID1 desktop controller, PID2 Files, PID3 Terminal.
+// All clients are distinct protected x86-64 ELF64 images.
+#[cfg(any(feature="r029-suite-shell",feature="r029-suite-files",feature="r029-suite-terminal"))]
+fn suite_send(dst:u32,bytes:&[u8]){
+    if bytes.len()>64{exit(140);}
+    let mut packet=[0u8;68];
+    packet[..4].copy_from_slice(&dst.to_le_bytes());
+    packet[4..4+bytes.len()].copy_from_slice(bytes);
+    if call(8,packet.as_ptr() as u64,(bytes.len()+4) as u64)!=0{exit(141);}
+}
+#[cfg(any(feature="r029-suite-shell",feature="r029-suite-files",feature="r029-suite-terminal"))]
+fn suite_receive(sender:u32,payload:&[u8]){
+    let mut response=[0u8;72];
+    let len=call(9,response.as_mut_ptr() as u64,72);
+    if len!=(payload.len()+8) as u64||
+       u32::from_le_bytes(response[..4].try_into().unwrap())!=sender||
+       u32::from_le_bytes(response[4..8].try_into().unwrap())!=payload.len() as u32||
+       &response[8..8+payload.len()]!=payload {exit(142);}
+}
+#[cfg(feature="r029-suite-shell")]
+fn suite_shell()->!{
+    if call(4,0,0)!=1 ||call(22,0,0)!=0||call(24,7,0)!=u64::MAX{exit(143);}
+    write(b"R029.5 PID1 desktop shell ready");
+    r029_wait_for_host();
+    yield_now();
+    suite_receive(2,b"FILES");
+    suite_receive(3,b"TERMINAL");
+    if call(22,0,0)!=(2|(2<<8))||call(23,1,0)!=0{exit(144);}
+    write(b"R029.5 IPC joined apps and first frame rendered");
+    r029_wait_for_host();
+    if call(24,6,0)!=0||call(23,1,0)!=0{exit(145);}
+    write(b"R029.7 launcher opened");
+    r029_wait_for_host();
+    if call(24,6,0)!=0||call(24,2,0)!=0||call(23,2,0)!=0{exit(146);}
+    write(b"R029.7 launcher closed and Terminal focused");
+    r029_wait_for_host();
+    if call(24,3,0)!=0||call(24,4,0)!=0||call(23,1,0)!=0{exit(147);}
+    write(b"R029.7 Files moved, Terminal minimized");
+    r029_wait_for_host();
+    if call(24,5,0)!=0||call(23,2,0)!=0||call(23,2,0)!=u64::MAX{exit(148);}
+    write(b"R029.7 Terminal restored, fifth frame committed");
+    suite_send(2,b"EXIT");
+    write(b"R029.5 three-process suite awaiting physical pointer");
+    yield_now();
+    write(b"R029.7 desktop shell exit");
+    exit(0);
+}
+#[cfg(feature="r029-suite-files")]
+fn suite_files()->!{
+    if call(4,0,0)!=2||call(22,0,0)!=u64::MAX||
+       call(23,1,0)!=u64::MAX||call(24,6,0)!=u64::MAX{exit(149);}
+    let foreign=r029_command(2,1,16,100,100,30,0x00ff0000,&[]);
+    if call(18,foreign.as_ptr() as u64,64)!=u64::MAX{exit(150);}
+    r029_draw(&r029_command(1,1,15,102,264,32,0x0045967c,&[]));
+    r029_draw(&r029_command(1,2,18,109,180,14,0x00ffffff,b"FILES PID2"));
+    suite_send(1,b"FILES");
+    write(b"R029.5 PID2 Files surface staged");
+    yield_now();
+    suite_receive(1,b"EXIT");
+    if call(18,foreign.as_ptr() as u64,64)!=u64::MAX{exit(151);}
+    write(b"R029.5 PID2 Files exited and grants revoked");
+    exit(0);
+}
+#[cfg(feature="r029-suite-terminal")]
+fn suite_terminal()->!{
+    if call(4,0,0)!=3||call(22,0,0)!=u64::MAX||
+       call(23,2,0)!=u64::MAX||call(24,6,0)!=u64::MAX{exit(152);}
+    let foreign=r029_command(1,1,16,100,100,30,0x00ff0000,&[]);
+    if call(18,foreign.as_ptr() as u64,64)!=u64::MAX{exit(153);}
+    r029_draw(&r029_command(2,1,20,175,270,32,0x003e589f,&[]));
+    r029_draw(&r029_command(2,2,24,181,180,14,0x00ffffff,b"TERMINAL PID3"));
+    suite_send(1,b"TERMINAL");
+    write(b"R029.5 PID3 Terminal surface staged");
+    yield_now();
+    write(b"R029.6 PID3 waiting for physical PS2 focus");
+    let mut ev=[0u8;16];let mut received=false;
+    for _ in 0..18_000_000 {
+        match call(21,ev.as_mut_ptr() as u64,16){
+            0=>core::hint::spin_loop(),
+            16=>{
+                let target=u32::from_le_bytes(ev[4..8].try_into().unwrap());
+                let kind=u32::from_le_bytes(ev[8..12].try_into().unwrap());
+                if target!=2||kind!=2 {exit(154);}
+                received=true;break;
+            }
+            _=>exit(155),
+        }
+    }
+    if !received{exit(156);}
+    write(b"R029.6 PID3 authenticated physical input delivered");
+    exit(0);
+}
 #[no_mangle]
 pub extern "C" fn _start()->!{
+    #[cfg(feature="r029-suite-shell")]
+    suite_shell();
+    #[cfg(feature="r029-suite-files")]
+    suite_files();
+    #[cfg(feature="r029-suite-terminal")]
+    suite_terminal();
     #[cfg(feature="r029-frame-server")]
     r029_frame_server();
     #[cfg(feature="r029-frame-client")]
