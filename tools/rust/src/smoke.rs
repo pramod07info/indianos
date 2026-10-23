@@ -191,9 +191,10 @@ pub fn verify(mode:&str,text:&str)->Result<(),String>{
         }
         "preempt"=>{
             checks.extend(MILESTONES);
-            checks.extend(["IndianOS: M009 cooperative scheduler experiment begin",
+            checks.extend(["IndianOS: R024 APIC preemptive scheduler experiment begin",
+                "IndianOS: R024 xAPIC supervisor UC mapping installed",
                 "IndianOS: M009 two simultaneous user address spaces ready",
-                "IndianOS: M009 hardware PIT IRQ0 enabled at 100 Hz"]);
+                "IndianOS: R024 calibrated periodic xAPIC IRQ at 100 Hz"]);
             // Preemption events are asynchronous; the original harness
             // checks presence of markers for both tasks rather than a
             // specific ordering.
@@ -201,7 +202,7 @@ pub fn verify(mode:&str,text:&str)->Result<(),String>{
                 for marker in [
                     format!("IndianOS: PID {pid} READY"),
                     format!("IndianOS: PID {pid} DISPATCHED"),
-                    format!("IndianOS: PID {pid} TIMER_PREEMPTED"),
+                    format!("IndianOS: PID {pid} APIC_TIMER_PREEMPTED"),
                     format!("IndianOS user: M009 timer task {name} started"),
                     format!("IndianOS user: M009 timer task {name} finished"),
                     format!("IndianOS: PID {pid} EXITED"),
@@ -211,7 +212,7 @@ pub fn verify(mode:&str,text:&str)->Result<(),String>{
                     if !text.contains(&marker){return Err(format!("missing {marker}"))}
                 }
             }
-            for marker in ["IndianOS: M009 timer-preemptive round-robin PASSED",
+            for marker in ["IndianOS: R024 APIC timer-preemptive round-robin PASSED",
                             "IndianOS: M009 scheduler experiment complete"] {
                 if !text.contains(marker){return Err(format!("missing {marker}"))}
             }
@@ -246,8 +247,8 @@ pub fn verify(mode:&str,text:&str)->Result<(),String>{
             occurrences(text,&format!("IndianOS: PID {pid} DISPATCHED"))!=3 ||
             occurrences(text,&format!("IndianOS: PID {pid} YIELDED"))!=2
         })=>Err("round robin did not dispatch/yield each task 3/2 times".into()),
-        "preempt" if occurrences(text,"IndianOS: PID 1 TIMER_PREEMPTED")==0 ||
-            occurrences(text,"IndianOS: PID 2 TIMER_PREEMPTED")==0 ||
+        "preempt" if occurrences(text,"IndianOS: PID 1 APIC_TIMER_PREEMPTED")==0 ||
+            occurrences(text,"IndianOS: PID 2 APIC_TIMER_PREEMPTED")==0 ||
             text.find("IndianOS: PID 2 DISPATCHED")>text.find("IndianOS: PID 1 EXITED")=>
             Err("CPU-bound tasks were not preempted".into()),
         "processes"|"scheduler"|"preempt" if text.contains("IndianOS: PID 1 FAULTED") ||

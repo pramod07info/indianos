@@ -31,4 +31,6 @@ jobs:
             if test -f "$f"; then OVMF_PATH="$f"; break; fi
           done
           test -n "$OVMF_PATH"
+          make build/rust-tools-target/release/indianos-tools
+          python3 -m unittest discover -s tests -p test_smoke_boot.py -v
           make test-preempt OVMF_CODE="$OVMF_PATH"

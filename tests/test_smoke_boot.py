@@ -204,36 +204,38 @@ class SmokeBootTests(unittest.TestCase):
 
     def test_hardware_timer_preempts_two_cpu_bound_users(self):
         output = "\n".join([*MILESTONES,
-            "IndianOS: M009 cooperative scheduler experiment begin",
+            "IndianOS: R024 APIC preemptive scheduler experiment begin",
             "IndianOS: PID 1 READY", "IndianOS: PID 2 READY",
+            "IndianOS: R024 xAPIC supervisor UC mapping installed",
             "IndianOS: M009 two simultaneous user address spaces ready",
-            "IndianOS: M009 hardware PIT IRQ0 enabled at 100 Hz",
+            "IndianOS: R024 calibrated periodic xAPIC IRQ at 100 Hz",
             "IndianOS: PID 1 DISPATCHED",
             "IndianOS user: M009 timer task A started",
-            "IndianOS: PID 1 TIMER_PREEMPTED", "IndianOS: PID 1 YIELDED",
+            "IndianOS: PID 1 APIC_TIMER_PREEMPTED", "IndianOS: PID 1 YIELDED",
             "IndianOS: PID 2 DISPATCHED",
             "IndianOS user: M009 timer task B started",
-            "IndianOS: PID 2 TIMER_PREEMPTED", "IndianOS: PID 2 YIELDED",
+            "IndianOS: PID 2 APIC_TIMER_PREEMPTED", "IndianOS: PID 2 YIELDED",
             "IndianOS: PID 1 DISPATCHED",
             "IndianOS user: M009 timer task A finished",
             "IndianOS: PID 1 EXITED", "IndianOS: PID 1 REAPED",
             "IndianOS: PID 2 DISPATCHED",
             "IndianOS user: M009 timer task B finished",
             "IndianOS: PID 2 EXITED", "IndianOS: PID 2 REAPED",
-            "IndianOS: M009 timer-preemptive round-robin PASSED",
+            "IndianOS: R024 APIC timer-preemptive round-robin PASSED",
             "IndianOS: M009 scheduler experiment complete"])
         assert_expected_preempt(output)
 
     def test_hardware_timer_rejects_no_preemption(self):
         output = "\n".join([*MILESTONES,
-            "IndianOS: M009 cooperative scheduler experiment begin",
+            "IndianOS: R024 APIC preemptive scheduler experiment begin",
+            "IndianOS: R024 xAPIC supervisor UC mapping installed",
             "IndianOS: M009 two simultaneous user address spaces ready",
-            "IndianOS: M009 hardware PIT IRQ0 enabled at 100 Hz",
+            "IndianOS: R024 calibrated periodic xAPIC IRQ at 100 Hz",
             "IndianOS user: M009 timer task A started",
             "IndianOS user: M009 timer task B started",
             "IndianOS user: M009 timer task A finished",
             "IndianOS user: M009 timer task B finished",
-            "IndianOS: M009 timer-preemptive round-robin PASSED",
+            "IndianOS: R024 APIC timer-preemptive round-robin PASSED",
             "IndianOS: M009 scheduler experiment complete"])
         with self.assertRaises(AssertionError):
             assert_expected_preempt(output)
