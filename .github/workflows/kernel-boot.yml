@@ -38,6 +38,9 @@ on:
       - "tests/inspect_elf.c"
       - "userland/**"
       - ".github/workflows/kernel-boot.yml"
+      - ".github/workflows/agent-x-local-model.yml"
+      - ".github/workflows/agent-ci-handoff.yml"
+      - "tools/agent_x_ci_context.py"
   workflow_dispatch:
     inputs:
       run_shadow_switch:
