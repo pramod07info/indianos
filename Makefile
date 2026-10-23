@@ -20,6 +20,11 @@ R014_IRQ_TEST ?= 0
 R015_ATA_TEST ?= 0
 R025_IPC_TEST ?= 0
 R025_COMPLETE_TEST ?= 0
+R026_INTERACTIVE_TEST ?= 0
+ifeq ($(R026_INTERACTIVE_TEST),1)
+R014_INTERACTIVE_TEST := 1
+SCHEDULER_SELFTEST := 1
+endif
 ifeq ($(R025_COMPLETE_TEST),1)
 SCHEDULER_SELFTEST := 1
 R025_IPC_TEST := 1
@@ -116,7 +121,7 @@ RUST_FEATURES += $(if $(filter 1,$(EXCEPTION_SELFTEST)),--features test-ud2,) \
  $(if $(filter 1,$(PAGING_SWITCH_SELFTEST)),--features test-shadow,) \
  $(if $(filter 1,$(USERMODE_SELFTEST)),--features test-ring3,) \
  $(if $(filter 1,$(PROCESS_SELFTEST)),--features test-processes,) \
- $(if $(filter 1,$(SCHEDULER_SELFTEST)),--features test-scheduler,) $(if $(filter 1,$(R013_SHELL_TEST)),--features test-shell,) $(if $(filter 1,$(R014_INTERACTIVE_TEST)),--features test-interactive,) $(if $(filter 1,$(R014_IRQ_TEST)),--features test-irq-keyboard,) $(if $(filter 1,$(R015_ATA_TEST)),--features test-ata-disk,) $(if $(filter 1,$(R025_COMPLETE_TEST)),--features test-r025,) $(if $(filter 1,$(R025_IPC_TEST)),--features test-ipc,)
+ $(if $(filter 1,$(SCHEDULER_SELFTEST)),--features test-scheduler,) $(if $(filter 1,$(R013_SHELL_TEST)),--features test-shell,) $(if $(filter 1,$(R014_INTERACTIVE_TEST)),--features test-interactive,) $(if $(filter 1,$(R014_IRQ_TEST)),--features test-irq-keyboard,) $(if $(filter 1,$(R015_ATA_TEST)),--features test-ata-disk,) $(if $(filter 1,$(R026_INTERACTIVE_TEST)),--features test-r026,) $(if $(filter 1,$(R025_COMPLETE_TEST)),--features test-r025,) $(if $(filter 1,$(R025_IPC_TEST)),--features test-ipc,)
 ifeq ($(USERFAULT_SELFTEST),1)
 RUST_FEATURES += $(if $(filter guard,$(USERFAULT_KIND)),--features test-fault-guard,--features test-fault-supervisor)
 endif
@@ -234,7 +239,7 @@ LDFLAGS := -target x86_64-unknown-none-elf -fuse-ld=lld -nostdlib -static \
            -Wl,--gc-sections -Wl,--build-id=none -Wl,-T,kernel/linker.ld \
            -Wl,-Map,$(BUILD)/kernel-link.map
 
-.PHONY: test-r025-complete-qemu test-rust-ipc-qemu test-rust-keyboard-host test-rust-keyboard-qemu test-rust-interactive-host test-rust-interactive-qemu test-rust-shell-host test-rust-shell-qemu test-rust-hardening test-rust-entry-abi test-rust-link-audit test-rust-source-audit-negative test-rust-source-audit test-rust-default-qemu test-rust-tools test-rust-userland-qemu test-rust-interrupts-qemu test-rust-boot-qemu test-rust-vmm-host test-rust-vmm-qemu test-rust-pmm-host test-rust-pmm-qemu test-rust-user-image-host test-rust-user-image-qemu test-rust-paging-host test-rust-paging-qemu test-rust-runtime-host test-rust-runtime-qemu test-rust-boot-staging-qemu test-rust-host-abi test-rust-processes test-rust-scheduler rust-core all kernel user-elf test-user-elf test-ring3-elf initramfs test-initramfs image run run-bios test-boot test-exception test-pagefault test-shadow test-usermode test-userfault-supervisor test-userfault-guard test-processes test-scheduler test-preempt test-host toolchain-check clean
+.PHONY: test-r026-interactive-qemu test-r025-complete-qemu test-rust-ipc-qemu test-rust-keyboard-host test-rust-keyboard-qemu test-rust-interactive-host test-rust-interactive-qemu test-rust-shell-host test-rust-shell-qemu test-rust-hardening test-rust-entry-abi test-rust-link-audit test-rust-source-audit-negative test-rust-source-audit test-rust-default-qemu test-rust-tools test-rust-userland-qemu test-rust-interrupts-qemu test-rust-boot-qemu test-rust-vmm-host test-rust-vmm-qemu test-rust-pmm-host test-rust-pmm-qemu test-rust-user-image-host test-rust-user-image-qemu test-rust-paging-host test-rust-paging-qemu test-rust-runtime-host test-rust-runtime-qemu test-rust-boot-staging-qemu test-rust-host-abi test-rust-processes test-rust-scheduler rust-core all kernel user-elf test-user-elf test-ring3-elf initramfs test-initramfs image run run-bios test-boot test-exception test-pagefault test-shadow test-usermode test-userfault-supervisor test-userfault-guard test-processes test-scheduler test-preempt test-host toolchain-check clean
 all: image
 kernel: $(KERNEL_ELF)
 
@@ -634,7 +639,10 @@ endif
 ifeq ($(RUST_USERLAND),1)
 # Identical expected serial messages and syscall ABI; no C/assembly
 # objects are linked into the Rust native user executable.
-ifeq ($(R025_COMPLETE_TEST),1)
+ifeq ($(R026_INTERACTIVE_TEST),1)
+RUST_INIT_FEATURE := r026-shell
+RUST_WORKER_FEATURE := r026-worker
+else ifeq ($(R025_COMPLETE_TEST),1)
 RUST_INIT_FEATURE := r025-a
 RUST_WORKER_FEATURE := r025-b
 else ifeq ($(R025_IPC_TEST),1)
@@ -871,6 +879,11 @@ test-scheduler:
 	$(MAKE) test-initramfs BUILD=build/scheduler SCHEDULER_SELFTEST=1
 	$(MAKE) image BUILD=build/scheduler SCHEDULER_SELFTEST=1
 	$(SMOKE) --iso build/scheduler/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)" --mode scheduler
+
+test-r026-interactive-qemu: $(SMOKE_DEPS)
+	$(MAKE) test-initramfs BUILD=build/r026-interactive R026_INTERACTIVE_TEST=1
+	$(MAKE) image BUILD=build/r026-interactive R026_INTERACTIVE_TEST=1
+	$(SMOKE) --iso build/r026-interactive/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)" --mode r026 --timeout 60
 
 test-r025-complete-qemu: $(SMOKE_DEPS)
 	$(MAKE) test-initramfs BUILD=build/r025-complete R025_COMPLETE_TEST=1
