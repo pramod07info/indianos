@@ -2,7 +2,7 @@ name: IndianOS Agent X - Free Local Model Prototype
 
 on:
   workflow_run:
-    workflows: ["IndianOS Agent Y CI Handoff"]
+    workflows: ["IndianOS kernel boot (x86-64)"]
     types: [completed]
     branches: [main]
   workflow_dispatch:
@@ -40,24 +40,13 @@ jobs:
           set -euo pipefail
           RUN_ID="$EVENT_RUN_ID"
           if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then RUN_ID="$MANUAL_RUN_ID"; fi
-          [[ "$RUN_ID" =~ ^[0-9]+$ ]] || exit 1
-          if [[ "$EVENT_NAME" == "workflow_run" ]]; then
-            # Agent Y run completed: resolve the matching kernel CI run by SHA.
-            Y_SHA="$(jq -r .workflow_run.head_sha "$GITHUB_EVENT_PATH")"
-            # Poll for the kernel run for this exact SHA. Agent Y may finish first.
-            RUN_ID=""
-            for attempt in {1..20}; do
-              RUN_ID="$(gh api "repos/$REPO/actions/workflows/kernel-boot.yml/runs?branch=main&per_page=100" \
-                --jq '.workflow_runs | map(select(.head_sha == "'"$Y_SHA"'" and .status == "completed")) | sort_by(.run_number, .run_attempt) | last | .id // empty')"
-              if [[ "$RUN_ID" =~ ^[0-9]+$ ]]; then break; fi
-              echo "Waiting for completed kernel CI at $Y_SHA ($attempt/20)"
-              sleep 15
-            done
-            [[ "$RUN_ID" =~ ^[0-9]+$ ]] || { echo "::error::No completed kernel CI run for Agent Y commit $Y_SHA after 5 minutes"; exit 1; }
-          fi
+          [[ "$RUN_ID" =~ ^[0-9]+$ ]] || { echo "::error::Invalid kernel run ID"; exit 1; }
+          # workflow_run now points directly to the completed kernel run.
+          # No SHA matching, polling, or dependence on Agent Y timing.
           gh api "repos/$REPO/actions/runs/$RUN_ID" > /tmp/ci-run.json
           [[ "$(jq -r .head_branch /tmp/ci-run.json)" == "main" ]] || exit 1
           [[ "$(jq -r .status /tmp/ci-run.json)" == "completed" ]] || exit 1
+          [[ "$(jq -r .path /tmp/ci-run.json)" == ".github/workflows/kernel-boot.yml" ]] || { echo "::error::Not a kernel CI run"; exit 1; }
           gh api "repos/$REPO/actions/runs/$RUN_ID/jobs?per_page=100" > /tmp/ci-jobs.json
           : > /tmp/ci-failure-logs.txt
           if [[ "$(jq -r '.conclusion' /tmp/ci-run.json)" != "success" ]]; then
