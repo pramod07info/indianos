@@ -189,6 +189,50 @@ pub fn verify(mode:&str,text:&str)->Result<(),String>{
                 "IndianOS: M009 round-robin cooperative switching PASSED",
                 "IndianOS: M009 scheduler experiment complete"]);
         }
+        "r025"=>{
+            checks.extend(MILESTONES);
+            checks.extend([
+                "IndianOS: R025 complete syscall services test begin",
+                "IndianOS: PID 1 READY",
+                "IndianOS: PID 2 READY",
+                "IndianOS: R025 authenticated IPC mailboxes ready",
+                "IndianOS: R025 capability and isolated file services ready",
+                "IndianOS: M009 two simultaneous user address spaces ready",
+                "IndianOS: PID 1 DISPATCHED",
+                "IndianOS user: R025 PID1 process service validated",
+                "IndianOS user: R025 PID1 isolated filesystem create/read verified",
+                "IndianOS user: R025 PID1 capability IPC ping sent",
+                "IndianOS: PID 1 YIELDED",
+                "IndianOS: PID 2 DISPATCHED",
+                "IndianOS user: R025 PID2 process service validated",
+                "IndianOS user: R025 PID2 authenticated IPC ping received",
+                "IndianOS user: R025 PID2 foreign filesystem and token access denied",
+                "IndianOS user: R025 PID2 capability IPC reply sent",
+                "IndianOS: PID 2 YIELDED",
+                "IndianOS: PID 1 DISPATCHED",
+                "IndianOS user: R025 PID1 authenticated IPC reply received",
+                "IndianOS user: R025 PID1 invalid token and foreign resource rejected",
+                "IndianOS user: R025 PID1 file deletion and capability revocation verified",
+                "IndianOS: PID 1 YIELDED",
+                "IndianOS: PID 2 DISPATCHED",
+                "IndianOS user: R025 PID2 file deletion and rights teardown verified",
+                "IndianOS: PID 2 YIELDED",
+                "IndianOS: PID 1 DISPATCHED",
+                "IndianOS user: R025 PID1 exited cleanly",
+                "IndianOS: PID 1 CAPABILITIES_REVOKED",
+                "IndianOS: PID 1 EXITED",
+                "IndianOS: PID 1 REAPED",
+                "IndianOS: PID 2 DISPATCHED",
+                "IndianOS user: R025 PID2 exited cleanly",
+                "IndianOS: PID 2 CAPABILITIES_REVOKED",
+                "IndianOS: PID 2 EXITED",
+                "IndianOS: PID 2 REAPED",
+                "IndianOS: M009 round-robin cooperative switching PASSED",
+                "IndianOS: R025 secure IPC two-process handshake PASSED",
+                "IndianOS: R025 capability IPC filesystem process services PASSED",
+                "IndianOS: M009 scheduler experiment complete",
+            ]);
+        }
         "ipc"=>{
             checks.extend(MILESTONES);
             checks.extend([
@@ -274,6 +318,12 @@ pub fn verify(mode:&str,text:&str)->Result<(),String>{
         "processes" if occurrences(text,"IndianOS: entering ring-3 /bin/init (QEMU experimental)")!=2 ||
             occurrences(text,"IndianOS: ring-3 PMM frame count restored")!=2=>
             Err("two distinct complete user lifetimes were not observed".into()),
+        "r025" if (1..=2).any(|pid|{
+            occurrences(text,&format!("IndianOS: PID {pid} DISPATCHED"))!=3 ||
+            occurrences(text,&format!("IndianOS: PID {pid} YIELDED"))!=2 ||
+            occurrences(text,&format!("IndianOS: PID {pid} CAPABILITIES_REVOKED"))!=1 ||
+            occurrences(text,&format!("IndianOS: PID {pid} REAPED"))!=1
+        })=>Err("R025 rights teardown or process lifecycle incomplete".into()),
         "ipc" if (1..=2).any(|pid|{
             occurrences(text,&format!("IndianOS: PID {pid} DISPATCHED"))!=3 ||
             occurrences(text,&format!("IndianOS: PID {pid} YIELDED"))!=2 ||
@@ -295,7 +345,7 @@ pub fn verify(mode:&str,text:&str)->Result<(),String>{
                 _=>true
             }
         }=>Err("both CPU-bound tasks must be preempted before either exits".into()),
-        "processes"|"scheduler"|"preempt"|"ipc" if text.contains("IndianOS: PID 1 FAULTED") ||
+        "processes"|"scheduler"|"preempt"|"ipc"|"r025" if text.contains("IndianOS: PID 1 FAULTED") ||
               text.contains("IndianOS: PID 2 FAULTED")=>
             Err("successful task unexpectedly faulted".into()),
         _=>Ok(())
@@ -331,7 +381,7 @@ pub fn run(args:&[String])->Result<String,String>{
     }
     // Reject unknown modes before starting QEMU.
     if !["normal","exception","pagefault","shadow","usermode",
-         "fault-guard","fault-supervisor","processes","scheduler","preempt","ipc","shell","interactive","keyboard"].contains(&mode.as_str()){
+         "fault-guard","fault-supervisor","processes","scheduler","preempt","ipc","r025","shell","interactive","keyboard"].contains(&mode.as_str()){
         return Err("invalid QEMU smoke mode".into())
     }
 
