@@ -80,8 +80,22 @@ fn services()->Option<&'static mut R025Services>{
 fn authenticated_gui_pid()->Option<u32>{
     let process=unsafe{ptr::read(ptr::addr_of!(ACTIVE_PROCESS))};
     let p=unsafe{process.as_ref()}?;
-    if p.pid!=1||p.state!=3||unsafe{ACTIVE_PID}!=p.pid||
-       !active_task().is_null(){return None;}
+    if p.state!=3||unsafe{ACTIVE_PID}!=p.pid{return None;}
+    #[cfg(feature="test-r029-multiprocess")]
+    {
+        let task=active_task();
+        let image=active_image();
+        if !(1..=2).contains(&p.pid)||task.is_null()||image.is_null(){
+            return None;
+        }
+        let task=unsafe{&*task};
+        if task.pcb!=process ||
+           !core::ptr::eq(&task.image as *const UserImage,image as *const UserImage){
+            return None;
+        }
+    }
+    #[cfg(not(feature="test-r029-multiprocess"))]
+    if p.pid!=1||!active_task().is_null(){return None;}
     Some(p.pid)
 }
 #[cfg(feature="test-ipc")]
@@ -433,8 +447,11 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
   0=>1,
   #[cfg(feature="test-interactive")]
   6=>{
-   if unsafe{ACTIVE_PID}!=1 ||
-       !unsafe{indianos_user_can_write(&*img,request.arg0,1)}{return BAD;}
+   #[cfg(feature="test-r029-multiprocess")]
+   if authenticated_gui_pid().is_none(){return BAD;}
+   #[cfg(not(feature="test-r029-multiprocess"))]
+   if unsafe{ACTIVE_PID}!=1{return BAD;}
+   if !unsafe{indianos_user_can_write(&*img,request.arg0,1)}{return BAD;}
    let Some(byte)=input::poll_byte()else{return 0;};
    if !unsafe{indianos_user_copy_writable(&*img,request.arg0,&byte,1)}{
        return BAD;
@@ -877,7 +894,7 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
   }else if !unsafe{indianos_process_start(pcb,task.root.root)}{ok=false;break;}
   pid_log(pid,b"DISPATCHED\0");clear_faults();
   unsafe{ACTIVE_USER=&mut task.image;ACTIVE_TASK=task as *mut Task;ACTIVE_PROCESS=pcb;}
-  #[cfg(feature="test-r026")]
+  #[cfg(any(feature="test-r026",feature="test-r029-multiprocess"))]
   unsafe{ACTIVE_PID=pid;}
   let status=if task.saved{
    unsafe{x86_64_resume_user(task.frame.as_ptr(),task.root.root)}
@@ -886,7 +903,7 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
                              task.image.plan.stack_end-16,task.root.root)}
   };
   unsafe{ACTIVE_TASK=ptr::null_mut();ACTIVE_USER=ptr::null_mut();ACTIVE_PROCESS=ptr::null_mut();}
-  #[cfg(feature="test-r026")]
+  #[cfg(any(feature="test-r026",feature="test-r029-multiprocess"))]
   unsafe{ACTIVE_PID=0;}
   let cr3:u64;
   unsafe{asm!("mov {}, cr3",out(reg)cr3,options(nostack,nomem,preserves_flags));}
@@ -902,6 +919,8 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
   }else{
    if status==YIELD{ok=false;break;}
    cleanup_quantum_jobs(pid);
+   #[cfg(feature="test-r029-multiprocess")]
+   crate::gui::user_surface_terminate(pid);
    #[cfg(feature="test-ipc")]
    {
     // On process exit or fault all queued messages for that PID are gone.

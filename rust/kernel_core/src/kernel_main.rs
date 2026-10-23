@@ -381,13 +381,21 @@ pub extern "C" fn kmain()->!{
         log(b"IndianOS: R025 complete syscall services test begin\n\0");
         #[cfg(all(not(feature="preempt"),feature="test-ipc",not(feature="test-r025")))]
         log(b"IndianOS: R025 secure syscall IPC test begin\n\0");
-        #[cfg(all(not(feature="preempt"),not(feature="test-ipc"),not(feature="test-r026")))]
+        #[cfg(feature="test-r029-multiprocess")]
+        log(b"IndianOS: R029.3 two isolated graphical processes begin\n\0");
+        #[cfg(all(not(feature="preempt"),not(feature="test-ipc"),not(feature="test-r026"),not(feature="test-r029-multiprocess")))]
         log(b"IndianOS: M009 cooperative scheduler experiment begin\n\0");
         need(unsafe{x86_64_m009_schedule_run(init,init_size,worker,worker_size)},
              b"IndianOS: FATAL M009 cooperative context test failed\n\0");
         #[cfg(feature="test-r026")]
         log(b"IndianOS: R026 persistent interactive shell session complete\n\0");
-        #[cfg(not(feature="test-r026"))]
+        #[cfg(feature="test-r029-multiprocess")]
+        {
+            need(crate::gui::user_surface_verified(),
+                 b"IndianOS: FATAL R029.3 window ownership or teardown\n\0");
+            log(b"IndianOS: R029.3 independent PID1 Files and PID2 Terminal GUI PASSED\n\0");
+        }
+        #[cfg(all(not(feature="test-r026"),not(feature="test-r029-multiprocess")))]
         log(b"IndianOS: M009 scheduler experiment complete\n\0");
     }
 
@@ -421,8 +429,9 @@ pub extern "C" fn kmain()->!{
         log(b"IndianOS: M008 two independent processes exited and reaped\n\0");
     }
 
-    #[cfg(any(feature="test-ring3",feature="test-fault-guard",
-              feature="test-fault-supervisor"))]
+    #[cfg(all(not(feature="test-r029-multiprocess"),
+              any(feature="test-ring3",feature="test-fault-guard",
+                  feature="test-fault-supervisor")))]
     {
         need(unsafe{x86_64_user_demo_run(init,init_size)},
              b"IndianOS: FATAL ring-3 user program experiment failed\n\0");

@@ -165,6 +165,9 @@ impl UserSurfaceService{
         if session.files!=1||session.terminal!=2{return None;}
         let mut broker=Broker::new();
         broker.grant(1,session.files).ok()?;
+        #[cfg(feature="test-r029-multiprocess")]
+        broker.grant(2,session.terminal).ok()?;
+        #[cfg(not(feature="test-r029-multiprocess"))]
         broker.grant(1,session.terminal).ok()?;
         #[cfg(feature="test-r029-physical-events")]
         let mouse=Mouse::init()?;
@@ -309,7 +312,9 @@ pub(crate) fn user_surface_terminate(pid:u32){
     if let Some(svc)=user_service(){
         svc.broker.revoke(pid);
         #[cfg(feature="test-r029-physical-events")]
-        svc.mouse.disable();
+        if !svc.broker.known(1) && !svc.broker.known(2){
+            svc.mouse.disable();
+        }
     }
 }
 #[cfg(feature="test-r029-userspace")]
@@ -320,7 +325,7 @@ pub(crate) fn user_surface_ack(pid:u32,sequence:u32)->bool{
 pub(crate) fn user_surface_verified()->bool{
     user_service().is_some_and(|svc|{
         svc.counts==[2,2] && svc.focused>=1 &&
-        !svc.broker.known(1) &&
+        !svc.broker.known(1) && !svc.broker.known(2) &&
         svc.session.desktop.focused()==Some(
             if cfg!(feature="test-r029-physical-events") {
                 svc.session.terminal

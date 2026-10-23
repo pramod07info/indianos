@@ -38,6 +38,8 @@ test-r029-desktop = ["test-interactive","kernel-main"]
 # Ring-3 window-command client; framebuffer remains kernel-owned.
 test-r029-userspace = ["test-r029-desktop","test-ring3"]
 test-r029-physical-events = ["test-r029-userspace"]
+# Two isolated ELF64 GUI programs, real PS2 input and verified PID grants.
+test-r029-multiprocess = ["test-r029-physical-events","test-scheduler"]
 test-ud2 = []
 test-pagefault = []
 test-shadow = []

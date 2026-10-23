@@ -28,6 +28,12 @@ R029_DESKTOP_TEST ?= 0
 R029_USERSPACE_TEST ?= 0
 # Extra opt-in PS2 pointer-to-ring3 experiment.
 R029_PHYSICAL_TEST ?= 0
+# Single QEMU-only two-process graphical acceptance, off by default.
+R029_MULTIPROCESS_TEST ?= 0
+ifeq ($(R029_MULTIPROCESS_TEST),1)
+R029_PHYSICAL_TEST := 1
+SCHEDULER_SELFTEST := 1
+endif
 ifeq ($(R029_PHYSICAL_TEST),1)
 R029_USERSPACE_TEST := 1
 endif
@@ -146,7 +152,7 @@ RUST_FEATURES += $(if $(filter 1,$(EXCEPTION_SELFTEST)),--features test-ud2,) \
  $(if $(filter 1,$(PAGING_SWITCH_SELFTEST)),--features test-shadow,) \
  $(if $(filter 1,$(USERMODE_SELFTEST)),--features test-ring3,) \
  $(if $(filter 1,$(PROCESS_SELFTEST)),--features test-processes,) \
- $(if $(filter 1,$(SCHEDULER_SELFTEST)),--features test-scheduler,) $(if $(filter 1,$(R013_SHELL_TEST)),--features test-shell,) $(if $(filter 1,$(R014_INTERACTIVE_TEST)),--features test-interactive,) $(if $(filter 1,$(R014_IRQ_TEST)),--features test-irq-keyboard,) $(if $(filter 1,$(R015_ATA_TEST)),--features test-ata-disk,) $(if $(filter 1,$(R027_DURABLE_TEST)),--features test-r027-durable,) $(if $(filter 1,$(R028_NETWORK_TEST)),--features test-r028-network,) $(if $(filter 1,$(R029_DESKTOP_TEST)),--features test-r029-desktop,) $(if $(filter 1,$(R029_USERSPACE_TEST)),--features test-r029-userspace,) $(if $(filter 1,$(R029_PHYSICAL_TEST)),--features test-r029-physical-events,) $(if $(filter 1,$(R026_INTERACTIVE_TEST)),--features test-r026,) $(if $(filter 1,$(R025_COMPLETE_TEST)),--features test-r025,) $(if $(filter 1,$(R025_IPC_TEST)),--features test-ipc,)
+ $(if $(filter 1,$(SCHEDULER_SELFTEST)),--features test-scheduler,) $(if $(filter 1,$(R013_SHELL_TEST)),--features test-shell,) $(if $(filter 1,$(R014_INTERACTIVE_TEST)),--features test-interactive,) $(if $(filter 1,$(R014_IRQ_TEST)),--features test-irq-keyboard,) $(if $(filter 1,$(R015_ATA_TEST)),--features test-ata-disk,) $(if $(filter 1,$(R027_DURABLE_TEST)),--features test-r027-durable,) $(if $(filter 1,$(R028_NETWORK_TEST)),--features test-r028-network,) $(if $(filter 1,$(R029_DESKTOP_TEST)),--features test-r029-desktop,) $(if $(filter 1,$(R029_USERSPACE_TEST)),--features test-r029-userspace,) $(if $(filter 1,$(R029_PHYSICAL_TEST)),--features test-r029-physical-events,) $(if $(filter 1,$(R029_MULTIPROCESS_TEST)),--features test-r029-multiprocess,) $(if $(filter 1,$(R026_INTERACTIVE_TEST)),--features test-r026,) $(if $(filter 1,$(R025_COMPLETE_TEST)),--features test-r025,) $(if $(filter 1,$(R025_IPC_TEST)),--features test-ipc,)
 ifeq ($(USERFAULT_SELFTEST),1)
 RUST_FEATURES += $(if $(filter guard,$(USERFAULT_KIND)),--features test-fault-guard,--features test-fault-supervisor)
 endif
@@ -668,6 +674,9 @@ ifeq ($(R030_PACKAGE_V1),1)
 RUST_INIT_FEATURE := r030-demo-v1
 else ifeq ($(R030_PACKAGE_V2),1)
 RUST_INIT_FEATURE := r030-demo-v2
+else ifeq ($(R029_MULTIPROCESS_TEST),1)
+RUST_INIT_FEATURE := r029-files
+RUST_WORKER_FEATURE := r029-terminal
 else ifeq ($(R029_PHYSICAL_TEST),1)
 RUST_INIT_FEATURE := r029-physical
 else ifeq ($(R029_USERSPACE_TEST),1)
@@ -978,6 +987,11 @@ test-r029-user-surfaces-qemu:
 test-r029-physical-qemu:
 	$(MAKE) image BUILD=build/r029-physical RUST_CORE=1 R029_PHYSICAL_TEST=1
 	python3 tools/test_r029_physical_qemu.py --iso build/r029-physical/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)"
+
+.PHONY: test-r029-multiprocess-qemu
+test-r029-multiprocess-qemu:
+	$(MAKE) image BUILD=build/r029-multiprocess RUST_CORE=1 R029_MULTIPROCESS_TEST=1
+	python3 tools/test_r029_multiprocess_qemu.py --iso build/r029-multiprocess/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)"
 
 .PHONY: test-r030-package-qemu
 

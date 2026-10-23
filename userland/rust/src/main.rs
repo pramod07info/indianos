@@ -227,7 +227,7 @@ fn interactive_shell()->!{
 
 // Separate ring-3 application: owns *commands* for Files and Terminal,
 // not a physical framebuffer pointer or a kernel window-data structure.
-#[cfg(feature="r029-client")]
+#[cfg(any(feature="r029-client",feature="r029-files",feature="r029-terminal"))]
 fn r029_command(window:u32,kind:u32,x:u16,y:u16,width:u16,height:u16,
     rgb:u32,text:&[u8])->[u8;64]
 {
@@ -244,11 +244,11 @@ fn r029_command(window:u32,kind:u32,x:u16,y:u16,width:u16,height:u16,
     wire[32..32+text.len()].copy_from_slice(text);
     wire
 }
-#[cfg(feature="r029-client")]
+#[cfg(any(feature="r029-client",feature="r029-files",feature="r029-terminal"))]
 fn r029_draw(cmd:&[u8;64]){
     if call(18,cmd.as_ptr() as u64,64)!=0{exit(91);}
 }
-#[cfg(feature="r029-client")]
+#[cfg(any(feature="r029-client",feature="r029-files",feature="r029-terminal"))]
 fn r029_wait_for_host(){
     let mut byte=[0u8;1];
     for _ in 0..80_000_000 {
@@ -321,8 +321,84 @@ fn r029_demo()->!{
     exit(0)
 }
 
+// R029.3: distinct freestanding ELF images; neither program may draw the
+// other process's surface. The kernel never accepts an asserted PID from wire.
+#[cfg(any(feature="r029-files",feature="r029-terminal"))]
+fn r029_app()->!{
+    #[cfg(feature="r029-files")]
+    let (pid,owned,foreign,color,title)=(1u64,1u32,2u32,0x0045967cu32,&b"FILES PID1"[..]);
+    #[cfg(feature="r029-terminal")]
+    let (pid,owned,foreign,color,title)=(2u64,2u32,1u32,0x003e589fu32,&b"TERMINAL PID2"[..]);
+    if call(4,0,0)!=pid||call(20,1,0)!=u64::MAX{exit(110);}
+    let invalid=r029_command(foreign,1,12,110,180,30,color,&[]);
+    if call(18,invalid.as_ptr() as u64,64)!=u64::MAX||
+       call(19,foreign as u64,0)!=u64::MAX||
+       call(18,0,64)!=u64::MAX{exit(111);}
+    #[cfg(feature="r029-files")]
+    write(b"R029.3 PID1 Files ready");
+    #[cfg(feature="r029-terminal")]
+    write(b"R029.3 PID2 Terminal ready");
+    r029_wait_for_host();
+    let y=if owned==1{102u16}else{175u16};
+    r029_draw(&r029_command(owned,1,15,y,264,32,color,&[]));
+    r029_draw(&r029_command(owned,2,18,y+6,240,14,0x00ffffff,title));
+    #[cfg(feature="r029-files")]
+    write(b"R029.3 PID1 Files rendered own surface");
+    #[cfg(feature="r029-terminal")]
+    write(b"R029.3 PID2 Terminal rendered own surface");
+    yield_now();
+    #[cfg(feature="r029-files")]
+    write(b"R029.3 PID1 ready for focus");
+    #[cfg(feature="r029-terminal")]
+    write(b"R029.3 PID2 ready for focus");
+    r029_wait_for_host();
+    if call(19,owned as u64,0)!=0||
+       call(19,foreign as u64,0)!=u64::MAX{exit(112);}
+    let mut event=[0u8;16];
+    if call(21,0,16)!=u64::MAX||
+       call(21,event.as_mut_ptr() as u64,15)!=u64::MAX||
+       call(21,event.as_mut_ptr() as u64,16)!=16{exit(113);}
+    let sequence=u32::from_le_bytes(event[..4].try_into().unwrap());
+    let window=u32::from_le_bytes(event[4..8].try_into().unwrap());
+    let kind=u32::from_le_bytes(event[8..12].try_into().unwrap());
+    if sequence!=owned||window!=owned||kind!=1||event[12..]!=[0;4]||
+       call(21,event.as_mut_ptr() as u64,16)!=0{exit(114);}
+    #[cfg(feature="r029-files")]
+    {
+        write(b"R029.3 PID1 isolated focus event");
+        yield_now();
+        write(b"R029.3 PID1 closed its own GUI service");
+        exit(0);
+    }
+    #[cfg(feature="r029-terminal")]
+    {
+        write(b"R029.3 PID2 awaiting actual PS2 input");
+        let mut received=false;
+        for _ in 0..15_000_000{
+            match call(21,event.as_mut_ptr() as u64,16){
+                0=>core::hint::spin_loop(),
+                16=>{
+                    let seq=u32::from_le_bytes(event[..4].try_into().unwrap());
+                    let win=u32::from_le_bytes(event[4..8].try_into().unwrap());
+                    let kind=u32::from_le_bytes(event[8..12].try_into().unwrap());
+                    if seq!=3||win!=2||kind!=2||event[12..]!=[0;4]{exit(115);}
+                    received=true;break;
+                },
+                _=>exit(116),
+            }
+        }
+        if !received||(call(20,0,0)>>24)!=2{exit(117);}
+        write(b"R029.3 PID2 received real PS2 mouse event");
+        yield_now();
+        if call(19,1,0)!=u64::MAX||call(20,0,0)==u64::MAX{exit(118);}
+        write(b"R029.3 PID2 retained its independent GUI surface");
+        exit(0);
+    }
+}
 #[no_mangle]
 pub extern "C" fn _start()->!{
+    #[cfg(any(feature="r029-files",feature="r029-terminal"))]
+    r029_app();
     #[cfg(feature="r029-client")]
     r029_demo();
     #[cfg(feature="demo")]
