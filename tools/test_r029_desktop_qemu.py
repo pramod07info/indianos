@@ -95,9 +95,11 @@ class QemuSession:
             if self.proc.poll() is not None:
                 raise AssertionError("QEMU terminated unexpectedly\n"+
                                      self.output[-5000:].decode("utf8","replace"))
-    def until(self,marker:str,deadline:float=22)->None:
+    def until(self,marker:str,deadline:float=22,since:int=0)->None:
+        # A repeated acknowledgement must be received *after* its input event.
+        # Earlier matching text in the cumulative serial transcript is stale.
         timeout=time.monotonic()+deadline
-        while marker.encode() not in self.output:
+        while marker.encode() not in self.output[since:]:
             if time.monotonic()>timeout:
                 raise AssertionError("missing serial marker "+marker+"\n"+
                     self.output[-8000:].decode("utf8","replace"))
@@ -186,8 +188,11 @@ def run(qemu:str,iso:pathlib.Path,ovmf:pathlib.Path)->None:
             print("R029 PS2 mouse physically selected Files and changed display pixels")
             previous=after_mouse
             for index,(key,marker) in enumerate(STEPS,2):
+                # The focus sequence contains '2' twice with the same marker.
+                # Do not let the earlier response satisfy this new input.
+                before_input=len(session.output)
                 session.serial(key)
-                session.until(marker,10)
+                session.until(marker,10,since=before_input)
                 changed=session.shot(directory/f"{index:02d}-step.ppm")
                 if differences(previous,changed)<24:
                     raise AssertionError(
