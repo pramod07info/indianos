@@ -272,7 +272,7 @@ mod tests{
     #[test]fn dma_allocation_counts_and_ring_layout(){
         assert_eq!(QSIZE,256);
         assert_eq!(RING_FRAMES as usize*PAGE,12288);
-        assert_eq!(PAGE+4+2*(QSIZE as usize-1)+2,4614);
+        assert_eq!(PAGE+4+2*(QSIZE as usize-1)+2,4612);
         assert!(PAGE+4+2*(QSIZE as usize-1)<PAGE*2);
         assert!(PAGE*2+4+8*(QSIZE as usize-1)+8<3*PAGE);
     }
