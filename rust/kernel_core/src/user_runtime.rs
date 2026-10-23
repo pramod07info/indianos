@@ -490,6 +490,8 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
    if unsafe{ACTIVE_PID}!=1 || !authenticated_r026_init(){return BAD;}
    let worker=unsafe{&mut *task_ptr(1)};
    let Some(p)=(unsafe{worker.pcb.as_mut()})else{return BAD;};
+   #[cfg(feature="test-r030-ondevice")]
+   if !crate::r030_ondevice::installed(){return BAD;}
    if unsafe{R026_WORKER_REQUESTED} || p.pid!=2 ||
       p.state!=1 || worker.root.root==0 || worker.saved{return BAD;}
    // Prepared image/table ownership exists but kernel held PID2 in NEW
@@ -507,6 +509,51 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
    }
    log(b"IndianOS: R013 PID 1 requested /bin/worker\n\0");
    0
+  },
+  #[cfg(feature="test-r030-ondevice")]
+  30=>{
+   if !authenticated_r026_init(){return BAD;}
+   // The path/buffer descriptor is not trusted merely because its *pointer*
+   // is valid. Make private copies and validate every referenced user page.
+   let mut descriptor=[0u8;48];
+   if !unsafe{indianos_user_copy_readonly(img,request.arg1,
+        descriptor.as_mut_ptr().cast(),descriptor.len())}{return BAD;}
+   if descriptor[40..].iter().any(|&b|b!=0){return BAD;}
+   let Some(nul)=descriptor[..24].iter().position(|&b|b==0)else{return BAD;};
+   if nul<2||descriptor[nul..24].iter().any(|&b|b!=0){return BAD;}
+   let Ok(path)=core::str::from_utf8(&descriptor[..nul])else{return BAD;};
+   let addr=u64::from_le_bytes(descriptor[24..32].try_into().unwrap());
+   let len=u64::from_le_bytes(descriptor[32..40].try_into().unwrap());
+   let mut copy=[0u8;crate::r030_ondevice::MAX_TRANSFER];
+   match request.arg0{
+    1|3=>{
+     if len==0||len>copy.len() as u64||
+        !unsafe{indianos_user_copy_readonly(img,addr,copy.as_mut_ptr().cast(),len as usize)}{
+        return BAD;
+     }
+     crate::r030_ondevice::operation(request.arg0,path,&mut copy,len as usize)
+       .map(|_|0).unwrap_or(BAD)
+    }
+    2=>{
+     if len==0||len>copy.len() as u64||
+        !unsafe{indianos_user_can_write(&*img,addr,len as usize)}{return BAD;}
+     let Ok(read)=crate::r030_ondevice::operation(2,path,&mut copy,0)else{return BAD;};
+     if read>len as usize || !unsafe{indianos_user_copy_writable(
+         &*img,addr,copy.as_ptr(),read)}{return BAD;}
+     read as u64
+    }
+    4=>{
+     if addr!=0||len!=0{return BAD;}
+     crate::r030_ondevice::operation(4,path,&mut copy,0)
+       .map(|_|0).unwrap_or(BAD)
+    }
+    _=>BAD
+   }
+  },
+  #[cfg(feature="test-r030-ondevice")]
+  31=>{
+   if !authenticated_r026_init(){return BAD;}
+   crate::r030_ondevice::package(request.arg0).unwrap_or(BAD)
   },
   #[cfg(feature="test-r026")]
   16=>{
@@ -723,6 +770,8 @@ pub unsafe extern "C" fn x86_64_user_process_run(
    if !completed{
     log(b"IndianOS: FATAL PCB terminal state rejected\n\0");
     }else{
+   #[cfg(feature="test-r030-ondevice")]
+   fault_hex(b"IndianOS: R030 ring3 exit code=0x\0",status);
    pid_log(pid,if v==0{&b"EXITED\0"[..]}else{&b"FAULTED\0"[..]});
    #[cfg(any(feature="test-fault-guard",feature="test-fault-supervisor"))]
    {
@@ -989,6 +1038,8 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
     unsafe{indianos_process_fault(pcb,status,v,e,a)}
    }else{unsafe{indianos_process_exit(pcb,status)}};
    if !finished{ok=false;break;}
+   #[cfg(feature="test-r030-ondevice")]
+   fault_hex(b"IndianOS: R030 scheduler exit status=0x\0",status);
    pid_log(pid,if v==0{&b"EXITED\0"[..]}else{&b"FAULTED\0"[..]});
    if !discard(task as *mut Task,&backend,true){ok=false;break;}
    #[cfg(feature="test-r026")]

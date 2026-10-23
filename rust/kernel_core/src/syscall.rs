@@ -105,6 +105,11 @@ pub unsafe extern "C" fn indianos_syscall_validate(
         22 => request.arg0==0 && request.arg1==0, // FRAME_QUERY
         #[cfg(feature="test-r029-frame-server")]
         23 => (1..=2).contains(&request.arg0) && request.arg1==0, // FRAME_PRESENT
+        #[cfg(feature="test-r030-ondevice")]
+        30 => (1..=4).contains(&request.arg0) &&
+              user_range(plan,request.arg1,48,false), // filesystem descriptor
+        #[cfg(feature="test-r030-ondevice")]
+        31 => request.arg0<=4 && request.arg1==0, // installed native app
         #[cfg(feature = "test-r026")]
         16 | 17 => request.arg0 == 2 && request.arg1 == 0, // worker status/reap query
         #[cfg(feature="test-interactive")]

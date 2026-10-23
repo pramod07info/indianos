@@ -25,6 +25,8 @@ pub mod process_events;
 pub mod tinyfs;
 /// R027 opt-in checksummed copy-on-write persistent sector filesystem.
 pub mod durablefs;
+#[cfg(feature="test-r030-ondevice")]
+pub mod r030_ondevice;
 /// R028 strict allocator-free Ethernet/IPv4 and protocol demo.
 pub mod network;
 // Legacy virtio PCI DMA depends on PMM, Limine HHDM and a real x86 ring-0

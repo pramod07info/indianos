@@ -1,0 +1,38 @@
+name: Verify R030.1 persistent VFS and R030.2 allowlisted app install
+on:
+  push:
+    branches: [agentx-r0301-r0302-ondevice-20261023]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native-storage-installer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install QEMU and rust tools
+        run: |
+          # Bound network mirror stalls; retries are handled by CI reruns.
+          sudo timeout 120s apt-get update -o Acquire::Retries=0 -o Acquire::http::Timeout=30
+          sudo timeout 120s apt-get install -y clang lld binutils xorriso qemu-system-x86 ovmf curl openssl
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
+      - name: Unit tests for crash-safe filesystem, on-device lifecycle, signed packages
+        run: |
+          cargo test --offline --manifest-path rust/kernel_core/Cargo.toml --features test-r030-ondevice
+          python3 -m unittest discover -s tests -p 'test_r030_pkg.py' -v
+          make test-rust-host-abi
+          make test-rust-source-audit
+      - name: Freestanding Rust kernel cross compile
+        run: cargo build --offline --manifest-path rust/kernel_core/Cargo.toml --target x86_64-unknown-none --no-default-features --features cpu-entry,vmm,pmm,user-image,paging,paging-cpu,user-runtime,runtime,boot-staging,boot,interrupts,timer,kernel-main,limine-requests,test-r030-ondevice
+      - name: Four QEMU reboots, isolated disk, native ELF install and rollback
+        run: |
+          set -euo pipefail
+          OVMF_PATH=""
+          for f in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/edk2/ovmf/OVMF_CODE_4M.fd /usr/share/edk2/ovmf/OVMF_CODE.fd; do
+            if test -f "$f"; then OVMF_PATH="$f"; break; fi
+          done
+          test -n "$OVMF_PATH"
+          make test-r030-ondevice-qemu OVMF_CODE="$OVMF_PATH"

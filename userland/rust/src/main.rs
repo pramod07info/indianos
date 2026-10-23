@@ -564,8 +564,90 @@ fn suite_terminal()->!{
     write(b"R029.6 PID3 authenticated physical input delivered");
     exit(0);
 }
+// R030.1/30.2 on-device QEMU-only bounded persistent file ABI.
+// The syscall carries a validated 48-byte descriptor; no app can pass a
+// forged kernel process ID or a host filesystem path to the disk driver.
+#[cfg(feature="r030-ondevice-init")]
+fn r030_file(op:u64,path:&[u8],data:&mut [u8],used:usize)->u64{
+    if path.len()<2||path.len()>=24||data.len()>256||used>data.len(){
+        exit(201);
+    }
+    let mut desc=[0u8;48];
+    desc[..path.len()].copy_from_slice(path);
+    if matches!(op,1|2|3){
+        desc[24..32].copy_from_slice(&(data.as_ptr() as u64).to_le_bytes());
+        desc[32..40].copy_from_slice(&(if op==2{data.len()}else{used} as u64).to_le_bytes());
+    }
+    call(30,op,desc.as_ptr() as u64)
+}
+#[cfg(feature="r030-ondevice-init")]
+fn r030_exec()->!{
+    if call(4,0,0)!=1 ||call(31,9,0)!=u64::MAX{exit(202);}
+    let mut phase=[0u8;4];
+    let size=r030_file(2,b"/phase",&mut phase,0);
+    let stage=if size==u64::MAX{0}else if size==1 && (b'1'..=b'3').contains(&phase[0]){
+        phase[0]-b'0'
+    }else{exit(203)};
+    let mut note=[0u8;32];
+    match stage{
+        0=>{
+            if call(31,0,0)!=0 ||call(5,1,0)!=u64::MAX{exit(204);}
+            note[..5].copy_from_slice(b"HELLO");
+            if r030_file(1,b"/note",&mut note,5)!=0{exit(205);}
+            if call(31,1,0)!=1 ||call(31,1,0)!=u64::MAX{exit(206);}
+            phase[0]=b'1';
+            if r030_file(1,b"/phase",&mut phase,1)!=0{exit(207);}
+            write(b"R030.1 first boot persistent note created; R030.2 app v1 installed");
+        }
+        1=>{
+            if call(31,0,0)!=1 || r030_file(2,b"/note",&mut note,0)!=5||
+               &note[..5]!=b"HELLO"{exit(208);}
+            if call(31,2,0)!=2||call(31,2,0)!=u64::MAX{exit(209);}
+            phase[0]=b'2';
+            if r030_file(3,b"/phase",&mut phase,1)!=0{exit(210);}
+            write(b"R030.1 reboot persisted user file; R030.2 upgraded installed app to v2");
+        }
+        2=>{
+            if call(31,0,0)!=2 || call(31,3,0)!=1 ||
+               call(31,3,0)!=u64::MAX{exit(211);}
+            phase[0]=b'3';
+            if r030_file(3,b"/phase",&mut phase,1)!=0{exit(212);}
+            write(b"R030.2 previously installed app rollback to v1 persisted");
+        }
+        3=>{
+            if call(31,0,0)!=1 ||r030_file(2,b"/note",&mut note,0)!=5||
+               &note[..5]!=b"HELLO"{exit(213);}
+            write(b"R030.1 disk note survived fourth QEMU reboot");
+        }
+        _=>exit(214)
+    }
+    if call(5,1,0)!=0 {exit(215);}
+    write(b"R030.2 verified allowlisted native ELF scheduled by PID1");
+    yield_now();
+    if call(17,2,0)!=1{exit(216);}
+    if stage==3{
+        if call(31,4,0)!=0 ||call(31,0,0)!=0 ||call(5,1,0)!=u64::MAX{
+            exit(217);
+        }
+        // File ACL denies writes into internal app records.
+        if r030_file(1,b"/app",&mut note,5)!=u64::MAX{exit(218);}
+        if r030_file(4,b"/note",&mut note,0)!=0{exit(219);}
+        write(b"R030.2 native app removed; launch denied; user file deleted");
+    }else if call(31,0,0)!=(if stage==1{2}else{1}){exit(220);}
+    write(b"R030.1-2 ring3 lifecycle clean on persistent QEMU volume");
+    exit(0);
+}
 #[no_mangle]
 pub extern "C" fn _start()->!{
+    #[cfg(feature="r030-ondevice-init")]
+    r030_exec();
+    #[cfg(feature="r030-ondevice-app")]
+    {
+        if call(4,0,0)!=2 || call(30,1,0)!=u64::MAX ||
+           call(31,0,0)!=u64::MAX ||call(5,1,0)!=u64::MAX {exit(221);}
+        write(b"R030.2 installed native ELF ran in isolated PID2 ring3");
+        exit(0);
+    }
     #[cfg(feature="r029-suite-shell")]
     suite_shell();
     #[cfg(feature="r029-suite-files")]

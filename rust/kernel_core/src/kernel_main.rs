@@ -377,6 +377,11 @@ pub extern "C" fn kmain()->!{
         });
         #[cfg(feature="preempt")]
         log(b"IndianOS: R024 APIC preemptive scheduler experiment begin\n\0");
+        #[cfg(feature="test-r030-ondevice")]
+        need(crate::r030_ondevice::bootstrap(),
+             b"IndianOS: FATAL R030.1 blank or existing bounded drive failed\n\0");
+        #[cfg(feature="test-r030-ondevice")]
+        log(b"IndianOS: R030.1 verified durable filesystem mounted in QEMU\n\0");
         #[cfg(feature="test-r026")]
         log(b"IndianOS: R026 persistent init shell and on-demand worker begin\n\0");
         #[cfg(all(not(feature="preempt"),feature="test-r025"))]
@@ -398,6 +403,8 @@ pub extern "C" fn kmain()->!{
         #[cfg(not(feature="test-r029-desktop-suite"))]
         need(unsafe{x86_64_m009_schedule_run(init,init_size,worker,worker_size)},
              b"IndianOS: FATAL M009 cooperative context test failed\n\0");
+        #[cfg(feature="test-r030-ondevice")]
+        log(b"IndianOS: R030.1-2 persistent files and native app lifecycle PASSED\n\0");
         #[cfg(feature="test-r026")]
         log(b"IndianOS: R026 persistent interactive shell session complete\n\0");
         #[cfg(feature="test-r029-multiprocess")]
