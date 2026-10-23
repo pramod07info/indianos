@@ -948,6 +948,10 @@ clean:
 
 # R015: only a disposable temporary disk; never attach a host block device.
 .PHONY: test-rust-ata-qemu
+.PHONY: test-r030-native-qemu
+test-r030-native-qemu:
+	python3 tools/test_r030_native_qemu.py --qemu $(QEMU) --ovmf "$(OVMF_CODE)"
+
 .PHONY: test-r029-user-surfaces-qemu
 
 test-r029-user-surfaces-qemu:
