@@ -99,6 +99,8 @@ pub unsafe extern "C" fn indianos_syscall_validate(
         20 => request.arg0==0 && request.arg1==0,
         #[cfg(feature="test-r029-userspace")]
         21 => request.arg1==16 && user_range(plan,request.arg0,16,true),
+        #[cfg(feature="test-r031-supervisor")]
+        26 => request.arg0==0 && request.arg1==0, // supervisor state PID1 only
         #[cfg(feature="test-r031-boot-desktop")]
         25 => request.arg0==0 && request.arg1==0, // PID1 physical mouse pump
         #[cfg(feature="test-r029-desktop-suite")]

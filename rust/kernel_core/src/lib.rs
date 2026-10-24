@@ -48,6 +48,8 @@ pub mod desktop;
 pub mod gui_protocol;
 /// R029.1 authenticated per-process window grants and bounded event queue.
 pub mod gui_broker;
+#[cfg(feature="test-r031-supervisor")]
+pub mod service_supervisor;
 #[cfg(feature="test-r029-desktop")]
 mod gui;
 #[cfg(feature="test-r029-desktop")]

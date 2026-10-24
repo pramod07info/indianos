@@ -30,7 +30,9 @@ const PHYS:u64=0x000f_ffff_ffff_f000;
 const PAGE:u64=4096;
 const YIELD:u64=0x200;
 const WORDS:usize=20;
-#[cfg(feature="test-r029-desktop-suite")]
+#[cfg(feature="test-r031-supervisor")]
+const TASKS:usize=4;
+#[cfg(all(feature="test-r029-desktop-suite",not(feature="test-r031-supervisor")))]
 const TASKS:usize=3;
 #[cfg(not(feature="test-r029-desktop-suite"))]
 const TASKS:usize=2;
@@ -67,9 +69,9 @@ static mut QUANTUM_JOBS:crate::quantum_service::QuantumService=
     crate::quantum_service::QuantumService::new();
 // Two scheduler-authenticated process mailboxes, off in normal boots.
 #[cfg(feature="test-ipc")]
-static mut IPC_ROUTER:Option<IpcRouter<3,8>>=None;
+static mut IPC_ROUTER:Option<IpcRouter<4,8>>=None;
 #[cfg(feature="test-ipc")]
-fn router()->Option<&'static mut IpcRouter<3,8>>{
+fn router()->Option<&'static mut IpcRouter<4,8>>{
     // Single BSP; INT 0x80 interrupt gate masks CPU interrupts.
     // No SMP or nested use of this non-atomic router is permitted.
     unsafe{(&mut *ptr::addr_of_mut!(IPC_ROUTER)).as_mut()}
@@ -90,7 +92,8 @@ fn authenticated_gui_pid()->Option<u32>{
     {
         let task=active_task();
         let image=active_image();
-        if !(1..=if cfg!(feature="test-r029-desktop-suite"){3}else{2})
+        if !(1..=if cfg!(feature="test-r031-supervisor"){4}
+                  else if cfg!(feature="test-r029-desktop-suite"){3}else{2})
             .contains(&p.pid)||task.is_null()||image.is_null(){
             return None;
         }
@@ -136,6 +139,9 @@ fn cleanup_quantum_jobs(pid:u32){
 }
 
 static mut M009_TASKS:[MaybeUninit<Task>;TASKS]=[const{MaybeUninit::uninit()};TASKS];
+#[cfg(feature="test-r031-supervisor")]
+static mut SUPERVISED_TERMINAL:crate::service_supervisor::TerminalSupervisor=
+    crate::service_supervisor::TerminalSupervisor::new();
 static mut LAST_VECTOR:u64=0;
 static mut LAST_ERROR:u64=0;
 static mut LAST_ADDRESS:u64=0;
@@ -277,6 +283,13 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
   20=>{
    let Some(pid)=authenticated_gui_pid()else{return BAD;};
    crate::gui::user_surface_status(pid).unwrap_or(BAD)
+  },
+  #[cfg(feature="test-r031-supervisor")]
+  26=>{
+   let Some(pid)=authenticated_gui_pid()else{return BAD;};
+   if pid!=1{return BAD;}
+   let state=unsafe{SUPERVISED_TERMINAL.active_pid()};
+   state.unwrap_or(0) as u64
   },
   #[cfg(feature="test-r031-boot-desktop")]
   25=>{
@@ -923,6 +936,8 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
  for i in 0..TASKS{
   unsafe{ptr::write(task_ptr(i),core::mem::zeroed())};
  }
+ #[cfg(feature="test-r031-supervisor")]
+ unsafe{SUPERVISED_TERMINAL=crate::service_supervisor::TerminalSupervisor::new();}
  #[cfg(feature="test-r026")]
  unsafe{R026_WORKER_REQUESTED=false;R026_WORKER_REAPED=false;}
  let prepared_two=prepare(task_ptr(0),p,first,first_len,cpu.cr3&PHYS,&vmm,&backend,0)&&
@@ -944,7 +959,7 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
  }
  #[cfg(feature="test-ipc")]
  {
-  let Some(mut mailboxes)=IpcRouter::<3,8>::new().ok()else{return false;};
+  let Some(mut mailboxes)=IpcRouter::<4,8>::new().ok()else{return false;};
   let registered=mailboxes.register(1).is_ok()&&mailboxes.register(2).is_ok();
   #[cfg(feature="test-r029-desktop-suite")]
   let registered=registered&&mailboxes.register(3).is_ok();
@@ -1049,6 +1064,40 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
    fault_hex(b"IndianOS: R031 scheduler process exit=0x\0",status);
    pid_log(pid,if v==0{&b"EXITED\0"[..]}else{&b"FAULTED\0"[..]});
    if !discard(task as *mut Task,&backend,true){ok=false;break;}
+   #[cfg(feature="test-r031-supervisor")]
+   if pid==3{
+     use crate::service_supervisor::Decision;
+     if unsafe{SUPERVISED_TERMINAL.crashed(pid,v)}!=
+       (Decision::Restart{new_pid:4}){
+       log(b"IndianOS: R031.2 FATAL unexpected Terminal failure\n\0");
+       ok=false;break;
+     }
+     // The failed process has already lost its GUI grants, input events,
+     // IPC mailbox, owned page tables, image frames and CR3. Do not reuse
+     // PID3 or the old trap stack; PID4 is a new process generation.
+     let replacement=unsafe{indianos_process_create(&mut table)};
+     if replacement.is_null()||unsafe{(*replacement).pid}!=4{
+       ok=false;break;
+     }
+     let (replacement_elf,replacement_len)=unsafe{THIRD_ELF};
+     if !prepare(task_ptr(3),replacement,replacement_elf,replacement_len,
+          cpu.cr3&PHYS,&vmm,&backend,3){
+       ok=false;break;
+     }
+     if router().is_none_or(|boxes|boxes.register(4).is_err()){
+       ok=false;break;
+     }
+     if !crate::gui::user_surface_restart_terminal(4) ||
+        !unsafe{SUPERVISED_TERMINAL.prepared(4)}{
+       ok=false;break;
+     }
+     log(b"IndianOS: R031.2 faulted Terminal PID3 was isolated and PID4 RESTARTED\n\0");
+   }
+   #[cfg(feature="test-r031-supervisor")]
+   if pid==4 && (v!=0||status!=0){
+     log(b"IndianOS: R031.2 FATAL replacement process failed (no second restart)\n\0");
+     ok=false;break;
+   }
    #[cfg(feature="test-r026")]
    if pid==2{
      unsafe{R026_WORKER_REAPED=true;}
@@ -1056,7 +1105,12 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
    }
   }
  }
- #[cfg(feature="test-r029-desktop-suite")]
+ #[cfg(feature="test-r031-supervisor")]
+ let third_ok=unsafe{(*third).fault_vector==6 &&
+      (*third).state==5 && (*third).resources_reclaimed &&
+      indianos_process_success((*task_ptr(3)).pcb) &&
+      SUPERVISED_TERMINAL.ready()};
+ #[cfg(all(feature="test-r029-desktop-suite",not(feature="test-r031-supervisor")))]
  let third_ok=unsafe{indianos_process_success(third)};
  #[cfg(not(feature="test-r029-desktop-suite"))]
  let third_ok=true;
@@ -1096,15 +1150,25 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
   if scheduler.dispatch_count<5||scheduler.yield_count<2{ok=false;}
   if ok{log(b"IndianOS: R029.5 three process lifecycle PASSED\n\0");}
  }
+ #[cfg(feature="test-r031-supervisor")]
+ {
+  if scheduler.dispatch_count<8 || scheduler.yield_count<3{ok=false;}
+  if ok{log(b"IndianOS: R031.2 bounded Terminal supervision and privileged isolation PASSED\n\0");}
+ }
  #[cfg(feature="test-ipc")]
  {
   if let Some(boxes)=router(){
+   #[cfg(feature="test-r031-supervisor")]
+   let fourth_closed=boxes.pending(4)==Err(IpcError::UnknownReceiver);
+   #[cfg(not(feature="test-r031-supervisor"))]
+   let fourth_closed=true;
    #[cfg(feature="test-r029-desktop-suite")]
    let third_closed=boxes.pending(3)==Err(IpcError::UnknownReceiver);
    #[cfg(not(feature="test-r029-desktop-suite"))]
    let third_closed=true;
    if boxes.pending(1)!=Err(IpcError::UnknownReceiver)||
-      boxes.pending(2)!=Err(IpcError::UnknownReceiver)||!third_closed{ok=false;}
+      boxes.pending(2)!=Err(IpcError::UnknownReceiver)||
+      !third_closed||!fourth_closed{ok=false;}
   }else{ok=false;}
   unsafe{IPC_ROUTER=None;}
   if ok{log(b"IndianOS: R025 secure IPC two-process handshake PASSED\n\0");}
@@ -1131,7 +1195,12 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
   let third_discard=discard(task_ptr(2),&backend,false);
   #[cfg(not(feature="test-r029-desktop-suite"))]
   let third_discard=true;
-  if !first||!second||!third_discard||unsafe{pmm_free_frames()}!=before{
+  #[cfg(feature="test-r031-supervisor")]
+  let fourth_discard=discard(task_ptr(3),&backend,false);
+  #[cfg(not(feature="test-r031-supervisor"))]
+  let fourth_discard=true;
+  if !first||!second||!third_discard||!fourth_discard||
+     unsafe{pmm_free_frames()}!=before{
    log(b"IndianOS: M009 FATAL partial rollback: memory not fully reclaimed\n\0");
   }
  }
@@ -1140,7 +1209,9 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
 #[cfg(test)]mod tests{
  use super::*;
  #[test]fn saved_frame_requires_correct_privileges(){
-  assert_eq!(WORDS,20);assert_eq!(TASKS,if cfg!(feature="test-r029-desktop-suite"){3}else{2});
+  assert_eq!(WORDS,20);
+  assert_eq!(TASKS,if cfg!(feature="test-r031-supervisor"){4}
+      else if cfg!(feature="test-r029-desktop-suite"){3}else{2});
   assert_eq!(core::mem::align_of::<Task>(),16);
   let mut t:Task=unsafe{core::mem::zeroed()};
   t.saved=true;t.frame[16]=0x2b;t.frame[19]=0x33;

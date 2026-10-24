@@ -413,7 +413,9 @@ pub extern "C" fn kmain()->!{
         {
             need(crate::gui::user_surface_verified(),
                  b"IndianOS: FATAL R029.3 window ownership or teardown\n\0");
-            #[cfg(feature="test-r031-boot-desktop")]
+            #[cfg(feature="test-r031-supervisor")]
+            log(b"IndianOS: R031.2 SERVICE RESTART AND CAPABILITY REVOCATION PASSED\n\0");
+            #[cfg(all(feature="test-r031-boot-desktop",not(feature="test-r031-supervisor")))]
             log(b"IndianOS: R031.1 automatic boot-to-desktop services and shutdown PASSED\n\0");
             #[cfg(all(feature="test-r029-desktop-suite",not(feature="test-r031-boot-desktop")))]
             log(b"IndianOS: R029.5-7 integrated three-process GUI, IPC and launcher PASSED\n\0");

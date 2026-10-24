@@ -7,7 +7,9 @@
 use core::{arch::asm, ffi::c_char, mem::{size_of}, ptr};
 
 const TRAP_COUNT:usize=5;
-#[cfg(feature="test-r029-desktop-suite")]
+#[cfg(feature="test-r031-supervisor")]
+const USER_STACK_COUNT:usize=4;
+#[cfg(all(feature="test-r029-desktop-suite",not(feature="test-r031-supervisor")))]
 const USER_STACK_COUNT:usize=3;
 #[cfg(not(feature="test-r029-desktop-suite"))]
 const USER_STACK_COUNT:usize=2;
@@ -75,10 +77,15 @@ static mut DF_STACK:AlignedStack<DF_STACK_BYTES>=AlignedStack([0;DF_STACK_BYTES]
 static mut USER_STACKS:[AlignedStack<STACK_BYTES>;USER_STACK_COUNT]=[
     AlignedStack([0;STACK_BYTES]),AlignedStack([0;STACK_BYTES])
 ];
-#[cfg(feature="test-r029-desktop-suite")]
+#[cfg(all(feature="test-r029-desktop-suite",not(feature="test-r031-supervisor")))]
 static mut USER_STACKS:[AlignedStack<STACK_BYTES>;USER_STACK_COUNT]=[
     AlignedStack([0;STACK_BYTES]),AlignedStack([0;STACK_BYTES]),
     AlignedStack([0;STACK_BYTES])
+];
+#[cfg(feature="test-r031-supervisor")]
+static mut USER_STACKS:[AlignedStack<STACK_BYTES>;USER_STACK_COUNT]=[
+    AlignedStack([0;STACK_BYTES]),AlignedStack([0;STACK_BYTES]),
+    AlignedStack([0;STACK_BYTES]),AlignedStack([0;STACK_BYTES])
 ];
 
 unsafe extern "C" {

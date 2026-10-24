@@ -1,0 +1,37 @@
+name: R031.2 supervised native service restart and capability isolation
+on:
+  push:
+    branches: [agentx-r0312-supervised-recovery-20261024]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  recover-faulted-desktop-service:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install QEMU UEFI and Rust kernel linker
+        run: |
+          sudo timeout 120s apt-get update -o Acquire::Retries=0 -o Acquire::http::Timeout=30
+          sudo timeout 120s apt-get install -y clang lld binutils xorriso qemu-system-x86 ovmf curl
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
+      - name: Unit tests including policy for strict one-shot service restart
+        run: |
+          cargo test --offline --manifest-path rust/kernel_core/Cargo.toml --features test-r031-supervisor
+          make test-rust-host-abi
+          make test-rust-source-audit
+          cargo test --offline --manifest-path tools/rust/Cargo.toml
+      - name: Bare-metal freestanding compiler and kernel symbol audit
+        run: cargo build --offline --manifest-path rust/kernel_core/Cargo.toml --target x86_64-unknown-none --no-default-features --features cpu-entry,vmm,pmm,user-image,paging,paging-cpu,user-runtime,runtime,boot-staging,boot,interrupts,timer,kernel-main,limine-requests,test-r031-supervisor
+      - name: QEMU ring3 UD fault, PID4 recovery, GUI IPC and PS2 mouse
+        run: |
+          set -euo pipefail
+          OVMF_PATH=""
+          for f in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/edk2/ovmf/OVMF_CODE_4M.fd /usr/share/edk2/ovmf/OVMF_CODE.fd; do
+            if test -f "$f"; then OVMF_PATH="$f"; break; fi
+          done
+          test -n "$OVMF_PATH"
+          make test-r031-supervisor-qemu OVMF_CODE="$OVMF_PATH"

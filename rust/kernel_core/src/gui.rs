@@ -159,6 +159,8 @@ struct UserSurfaceService{
     launcher_visible:bool,
     #[cfg(feature="test-r029-desktop-suite")]
     desktop_actions:u32,
+    #[cfg(feature="test-r031-supervisor")]
+    restart_count:u32,
     #[cfg(feature="test-r029-physical-events")]
     mouse:Mouse,
 }
@@ -194,6 +196,8 @@ impl UserSurfaceService{
             launcher_visible:false,
             #[cfg(feature="test-r029-desktop-suite")]
             desktop_actions:0,
+            #[cfg(feature="test-r031-supervisor")]
+            restart_count:0,
             #[cfg(feature="test-r029-physical-events")]
             mouse})
     }
@@ -305,6 +309,19 @@ impl UserSurfaceService{
             #[cfg(feature="test-r029-frame-server")]
             let _=changed;
         }
+    }
+    #[cfg(feature="test-r031-supervisor")]
+    fn rotate_terminal(&mut self,pid:u32)->bool{
+        if pid!=4||self.restart_count!=0||
+           self.broker.owner(self.session.terminal).is_some()||
+           self.broker.known(3){return false;}
+        // Process3 was reaped, including its queued input. Old commands
+        // must not survive into a new process generation.
+        if self.broker.grant(4,self.session.terminal).is_err(){return false;}
+        self.commands[1].fill(UserCommand::EMPTY);
+        self.counts[1]=0;
+        self.restart_count=1;
+        true
     }
     #[cfg(feature="test-r031-boot-desktop")]
     fn pump_desktop(&mut self,pid:u32)->Option<u64>{
@@ -419,7 +436,8 @@ pub(crate) fn user_surface_terminate(pid:u32){
         svc.broker.revoke(pid);
         #[cfg(feature="test-r029-physical-events")]
         if !svc.broker.known(1) && !svc.broker.known(2)
-            && !svc.broker.known(3){
+            && !svc.broker.known(3)
+            && !(cfg!(feature="test-r031-supervisor") && svc.broker.known(4)){
             svc.mouse.disable();
         }
     }
@@ -427,6 +445,10 @@ pub(crate) fn user_surface_terminate(pid:u32){
 #[cfg(feature="test-r029-userspace")]
 pub(crate) fn user_surface_ack(pid:u32,sequence:u32)->bool{
     user_service().is_some_and(|svc|svc.broker.ack(pid,sequence).is_ok())
+}
+#[cfg(feature="test-r031-supervisor")]
+pub(crate) fn user_surface_restart_terminal(pid:u32)->bool{
+    user_service().is_some_and(|svc|svc.rotate_terminal(pid))
 }
 #[cfg(feature="test-r031-boot-desktop")]
 pub(crate) fn user_desktop_pump(pid:u32)->Option<u64>{
@@ -451,6 +473,9 @@ pub(crate) fn user_surface_verified()->bool{
         let frames_ok=svc.frames_presented>=5 && svc.frames_presented<=64 &&
            svc.desktop_actions>=5 && !svc.launcher_visible &&
            !svc.broker.known(3);
+        #[cfg(feature="test-r031-supervisor")]
+        let frames_ok=frames_ok && svc.restart_count==1 &&
+            !svc.broker.known(4);
         #[cfg(all(feature="test-r029-desktop-suite",not(feature="test-r031-boot-desktop")))]
         let frames_ok=svc.frames_presented==5 && svc.desktop_actions==6 &&
            !svc.launcher_visible && !svc.broker.known(3);

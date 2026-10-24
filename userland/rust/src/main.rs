@@ -230,7 +230,8 @@ fn interactive_shell()->!{
 #[cfg(any(feature="r029-client",feature="r029-files",feature="r029-terminal",
           feature="r029-frame-server",feature="r029-frame-client",
           feature="r029-suite-shell",feature="r029-suite-files",feature="r029-suite-terminal",
-          feature="r031-shell",feature="r031-files",feature="r031-terminal"))]
+          feature="r031-shell",feature="r031-files",feature="r031-terminal",
+          feature="r031-supervisor-shell",feature="r031-supervisor-files",feature="r031-supervisor-terminal"))]
 fn r029_command(window:u32,kind:u32,x:u16,y:u16,width:u16,height:u16,
     rgb:u32,text:&[u8])->[u8;64]
 {
@@ -250,14 +251,16 @@ fn r029_command(window:u32,kind:u32,x:u16,y:u16,width:u16,height:u16,
 #[cfg(any(feature="r029-client",feature="r029-files",feature="r029-terminal",
           feature="r029-frame-server",feature="r029-frame-client",
           feature="r029-suite-shell",feature="r029-suite-files",feature="r029-suite-terminal",
-          feature="r031-shell",feature="r031-files",feature="r031-terminal"))]
+          feature="r031-shell",feature="r031-files",feature="r031-terminal",
+          feature="r031-supervisor-shell",feature="r031-supervisor-files",feature="r031-supervisor-terminal"))]
 fn r029_draw(cmd:&[u8;64]){
     if call(18,cmd.as_ptr() as u64,64)!=0{exit(91);}
 }
 #[cfg(any(feature="r029-client",feature="r029-files",feature="r029-terminal",
           feature="r029-frame-server",feature="r029-frame-client",
           feature="r029-suite-shell",feature="r029-suite-files",feature="r029-suite-terminal",
-          feature="r031-shell",feature="r031-files",feature="r031-terminal"))]
+          feature="r031-shell",feature="r031-files",feature="r031-terminal",
+          feature="r031-supervisor-shell",feature="r031-supervisor-files",feature="r031-supervisor-terminal"))]
 fn r029_wait_for_host(){
     let mut byte=[0u8;1];
     for _ in 0..80_000_000 {
@@ -478,7 +481,8 @@ fn r029_frame_client()->!{
 // Integrated R029.5-7: PID1 desktop controller, PID2 Files, PID3 Terminal.
 // All clients are distinct protected x86-64 ELF64 images.
 #[cfg(any(feature="r029-suite-shell",feature="r029-suite-files",feature="r029-suite-terminal",
-          feature="r031-shell",feature="r031-files",feature="r031-terminal"))]
+          feature="r031-shell",feature="r031-files",feature="r031-terminal",
+          feature="r031-supervisor-shell",feature="r031-supervisor-files",feature="r031-supervisor-terminal"))]
 fn suite_send(dst:u32,bytes:&[u8]){
     if bytes.len()>64{exit(140);}
     let mut packet=[0u8;68];
@@ -487,7 +491,8 @@ fn suite_send(dst:u32,bytes:&[u8]){
     if call(8,packet.as_ptr() as u64,(bytes.len()+4) as u64)!=0{exit(141);}
 }
 #[cfg(any(feature="r029-suite-shell",feature="r029-suite-files",feature="r029-suite-terminal",
-          feature="r031-shell",feature="r031-files",feature="r031-terminal"))]
+          feature="r031-shell",feature="r031-files",feature="r031-terminal",
+          feature="r031-supervisor-shell",feature="r031-supervisor-files",feature="r031-supervisor-terminal"))]
 fn suite_receive(sender:u32,payload:&[u8]){
     let mut response=[0u8;72];
     let len=call(9,response.as_mut_ptr() as u64,72);
@@ -645,15 +650,28 @@ fn r030_exec()->!{
 // R031.1: automatic boot-to-desktop QEMU session, real ring-3 PID1
 // system-service policy. PID2 Files and PID3 Terminal are independent ELF
 // images, never framebuffer-mapped; all chrome changes are capability checked.
-#[cfg(feature="r031-shell")]
+#[cfg(any(feature="r031-shell",feature="r031-supervisor-shell"))]
 fn r031_shell()->!{
     if call(4,0,0)!=1 ||call(22,0,0)!=0||
        call(25,0,1)!=u64::MAX ||call(24,0,0)!=u64::MAX{exit(171);}
+    #[cfg(feature="r031-supervisor-shell")]
+    if call(26,0,0)!=0{exit(193);}
     write(b"R031.1 init launching GUI services without test-driver keystrokes");
     yield_now();
     suite_receive(2,b"FILES");
+    #[cfg(feature="r031-supervisor-shell")]
+    {
+        if call(26,0,0)!=4{exit(194);}
+        write(b"R031.2 PID1 supervisor detected restarted Terminal PID4");
+        yield_now();
+        suite_receive(4,b"TERMINAL");
+    }
+    #[cfg(not(feature="r031-supervisor-shell"))]
     suite_receive(3,b"TERMINAL");
     if call(22,0,0)!=(2|(2<<8))||call(23,1,0)!=0{exit(172);}
+    #[cfg(feature="r031-supervisor-shell")]
+    write(b"R031.2 RESTORED DESKTOP READY: PID1 PID2 Files PID4 Terminal");
+    #[cfg(not(feature="r031-supervisor-shell"))]
     write(b"R031.1 AUTOMATIC DESKTOP READY: PID1 shell PID2 Files PID3 Terminal");
     let mut front=1u32;
     let mut launcher=false;
@@ -718,6 +736,9 @@ fn r031_shell()->!{
                 }
                 if call(24,2,0)!=0||call(23,2,0)!=0{exit(184);}
                 suite_send(2,b"EXIT");
+                #[cfg(feature="r031-supervisor-shell")]
+                suite_send(4,b"EXIT");
+                #[cfg(not(feature="r031-supervisor-shell"))]
                 suite_send(3,b"EXIT");
                 write(b"R031.1 shutdown requested: notifying Files and Terminal");
                 yield_now();
@@ -731,7 +752,7 @@ fn r031_shell()->!{
     }
     exit(186);
 }
-#[cfg(feature="r031-files")]
+#[cfg(any(feature="r031-files",feature="r031-supervisor-files"))]
 fn r031_files()->!{
     if call(4,0,0)!=2||call(22,0,0)!=u64::MAX||
        call(24,6,0)!=u64::MAX||call(25,0,0)!=u64::MAX{exit(187);}
@@ -742,20 +763,55 @@ fn r031_files()->!{
     suite_send(1,b"FILES");
     write(b"R031.1 Files service registered and running");
     yield_now();
+    #[cfg(not(feature="r031-supervisor-files"))]
     suite_receive(1,b"EXIT");
+    #[cfg(feature="r031-supervisor-files")]
+    {
+        let mut reply=[0u8;72];let mut delivered=false;
+        for _ in 0..8{
+            let n=call(9,reply.as_mut_ptr() as u64,72);
+            if n==0{yield_now();continue;}
+            if n!=12||u32::from_le_bytes(reply[..4].try_into().unwrap())!=1||
+               u32::from_le_bytes(reply[4..8].try_into().unwrap())!=4||
+               &reply[8..12]!=b"EXIT"{exit(195);}
+            delivered=true;break;
+        }
+        if !delivered{exit(196);}
+    }
     if call(18,foreign.as_ptr() as u64,64)!=u64::MAX{exit(189);}
     write(b"R031.1 Files service stopped and capabilities revoked");
     exit(0);
 }
-#[cfg(feature="r031-terminal")]
+#[cfg(any(feature="r031-terminal",feature="r031-supervisor-terminal"))]
 fn r031_terminal()->!{
-    if call(4,0,0)!=3||call(22,0,0)!=u64::MAX||
+    let pid=call(4,0,0);
+    #[cfg(feature="r031-supervisor-terminal")]
+    if pid!=3&&pid!=4{exit(197);}
+    #[cfg(not(feature="r031-supervisor-terminal"))]
+    if pid!=3{exit(197);}
+    if call(22,0,0)!=u64::MAX||
        call(24,6,0)!=u64::MAX||call(25,0,0)!=u64::MAX{exit(190);}
     let foreign=r029_command(1,1,20,80,200,32,0x00ff0000,&[]);
     if call(18,foreign.as_ptr() as u64,64)!=u64::MAX{exit(191);}
+    #[cfg(feature="r031-supervisor-terminal")]
+    if pid==3{
+        r029_draw(&r029_command(2,1,20,175,270,32,0x003e589f,&[]));
+        write(b"R031.2 Terminal PID3 raising real UD exception");
+        unsafe{core::arch::asm!("ud2",options(noreturn));}
+    }
+    #[cfg(feature="r031-supervisor-terminal")]
+    {
+        if call(26,0,0)!=u64::MAX{exit(198);}
+        let foreign=r029_command(1,1,20,80,200,20,0x00ff0000,&[]);
+        if call(18,foreign.as_ptr() as u64,64)!=u64::MAX{exit(199);}
+        write(b"R031.2 Terminal PID4 denied cross-process access");
+    }
     r029_draw(&r029_command(2,1,20,175,270,32,0x003e589f,&[]));
     r029_draw(&r029_command(2,2,24,181,270,14,0x00ffffff,b"TERMINAL SERVICE PID3"));
     suite_send(1,b"TERMINAL");
+    #[cfg(feature="r031-supervisor-terminal")]
+    write(b"R031.2 replacement PID4 registered IPC and window after crash");
+    #[cfg(not(feature="r031-supervisor-terminal"))]
     write(b"R031.1 Terminal service registered and running");
     yield_now();
     suite_receive(1,b"EXIT");
@@ -764,16 +820,19 @@ fn r031_terminal()->!{
     if n!=16 ||
        u32::from_le_bytes(event[4..8].try_into().unwrap())!=2||
        u32::from_le_bytes(event[8..12].try_into().unwrap())!=2{exit(192);}
+    #[cfg(feature="r031-supervisor-terminal")]
+    write(b"R031.2 replacement PID4 received owned PS2 focus");
+    #[cfg(not(feature="r031-supervisor-terminal"))]
     write(b"R031.1 Terminal received owned physical focus notification");
     exit(0);
 }
 #[no_mangle]
 pub extern "C" fn _start()->!{
-    #[cfg(feature="r031-shell")]
+    #[cfg(any(feature="r031-shell",feature="r031-supervisor-shell"))]
     r031_shell();
-    #[cfg(feature="r031-files")]
+    #[cfg(any(feature="r031-files",feature="r031-supervisor-files"))]
     r031_files();
-    #[cfg(feature="r031-terminal")]
+    #[cfg(any(feature="r031-terminal",feature="r031-supervisor-terminal"))]
     r031_terminal();
     #[cfg(feature="r030-ondevice-init")]
     r030_exec();
