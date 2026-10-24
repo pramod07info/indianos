@@ -52,3 +52,44 @@ mod tests {
             Err(InstallError::PermissionDenied));
     }
 }
+
+/// Evaluate the root application and every declared dependency as a unit.
+/// Only a caller-held consent bit and permission mask can authorize the plan.
+pub fn approve_plan(candidates: &[Candidate], host: Architecture,
+    granted: u32, consent: bool) -> Result<u32, InstallError>
+{
+    if candidates.is_empty() { return Err(InstallError::PermissionDenied); }
+    let mut requested = 0u32;
+    for &candidate in candidates {
+        approve(candidate, host, granted, consent)?;
+        requested |= candidate.requested_permissions;
+    }
+    Ok(requested)
+}
+#[cfg(test)]
+mod dependency_tests {
+    use super::*;
+    fn candidate(permissions: u32) -> Candidate {
+        Candidate { catalog_trusted: true, manifest_signed: true,
+            architecture: Architecture::X86_64, requested_permissions: permissions }
+    }
+    #[test]
+    fn returns_complete_preapproved_permission_union() {
+        assert_eq!(approve_plan(&[candidate(1), candidate(2)],
+            Architecture::X86_64, 3, true), Ok(3));
+    }
+    #[test]
+    fn unapproved_dependency_blocks_entire_plan() {
+        assert_eq!(approve_plan(&[candidate(1), candidate(4)],
+            Architecture::X86_64, 3, true), Err(InstallError::PermissionDenied));
+    }
+    #[test]
+    fn unsigned_or_empty_plan_does_not_install() {
+        let mut unverified = candidate(1);
+        unverified.manifest_signed = false;
+        assert_eq!(approve_plan(&[candidate(1),unverified],Architecture::X86_64,1,true),
+            Err(InstallError::Unsigned));
+        assert_eq!(approve_plan(&[],Architecture::X86_64,0,true),
+            Err(InstallError::PermissionDenied));
+    }
+}
