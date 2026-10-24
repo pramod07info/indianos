@@ -57,3 +57,45 @@ mod tests {
         assert_eq!(authorize(g, r), Err(CapabilityError::Stale));
     }
 }
+
+/// Derive a strictly attenuated grant for the same principal and resource.
+/// No caller-supplied identity or epoch can widen rights or revive revocation.
+pub fn attenuate_grant(grant: Grant, request: Request, rights: u32)
+    -> Result<Grant, CapabilityError>
+{
+    let mut check = request;
+    check.required_rights = rights;
+    authorize(grant, check)?;
+    Ok(Grant { rights, ..grant })
+}
+#[cfg(test)]
+mod attenuation_tests {
+    use super::*;
+    fn pair() -> (Grant, Request) {
+        (Grant { owner: 5, resource: 20, rights: 0b111, epoch: 9,
+            generation: 2, revoked: false },
+         Request { caller: 5, resource: 20, required_rights: 1,
+            current_epoch: 9, current_generation: 2 })
+    }
+    #[test]
+    fn safely_restricts_rights_without_identity_change() {
+        let (g, r) = pair();
+        let less = attenuate_grant(g, r, 0b001).unwrap();
+        assert_eq!(less.rights, 1);
+        assert_eq!((less.owner, less.resource, less.epoch), (5,20,9));
+    }
+    #[test]
+    fn denies_escalation_and_empty_rights() {
+        let (g,r) = pair();
+        assert_eq!(attenuate_grant(g, r, 0b1000), Err(CapabilityError::Rights));
+        assert_eq!(attenuate_grant(g, r, 0), Err(CapabilityError::Rights));
+    }
+    #[test]
+    fn revocation_or_pid_mismatch_blocks_delegation() {
+        let (mut g,mut r) = pair();
+        r.caller = 6;
+        assert_eq!(attenuate_grant(g, r, 1), Err(CapabilityError::Owner));
+        r.caller = 5; g.revoked = true;
+        assert_eq!(attenuate_grant(g, r, 1), Err(CapabilityError::Revoked));
+    }
+}
