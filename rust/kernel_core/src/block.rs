@@ -161,3 +161,108 @@ mod tests {
         assert_eq!(write_sectors(&mut disk, 0, &[1; SECTOR_BYTES]), Err(BlockError::ReadOnly));
     }
 }
+
+
+/// Read-only filesystem extent view over a device. This adapter is suitable
+/// for mounting *validated* on-disk extent lists; it never formats or writes.
+pub struct ExtentReader<'a, D: BlockDevice> {
+    device: &'a mut D,
+    extents: &'a [crate::agent_01_fs_extents::Extent],
+    logical_sectors: u64,
+}
+impl<'a, D: BlockDevice> ExtentReader<'a, D> {
+    pub fn new(device: &'a mut D, extents: &'a [crate::agent_01_fs_extents::Extent])
+        -> Result<Self, BlockError>
+    {
+        let count = crate::agent_01_fs_extents::validate_extents(
+            extents, device.sector_count()
+        ).map_err(|_| BlockError::OutOfRange)?;
+        if count == 0 { return Err(BlockError::OutOfRange); }
+        Ok(Self { device, extents, logical_sectors: count })
+    }
+
+    fn physical_lba(&self, logical_lba: u64) -> Result<u64, BlockError> {
+        crate::agent_01_fs_extents::logical_to_physical(
+            self.extents, self.device.sector_count(), logical_lba
+        ).map_err(|_| BlockError::OutOfRange)?
+            .ok_or(BlockError::OutOfRange)
+    }
+}
+impl<D: BlockDevice> BlockDevice for ExtentReader<'_, D> {
+    fn sector_count(&self) -> u64 { self.logical_sectors }
+
+    fn read_sector(&mut self, lba: u64, out: &mut [u8; SECTOR_BYTES])
+        -> Result<(), BlockError>
+    {
+        let mapped = self.physical_lba(lba)?;
+        self.device.read_sector(mapped, out)
+    }
+
+    fn write_sector(&mut self, _lba: u64, _data: &[u8; SECTOR_BYTES])
+        -> Result<(), BlockError>
+    {
+        Err(BlockError::ReadOnly)
+    }
+}
+
+#[cfg(test)]
+mod extent_reader_tests {
+    use super::*;
+    use crate::agent_01_fs_extents::Extent;
+
+    struct Device { bytes: [[u8; SECTOR_BYTES]; 8], writes: u32 }
+    impl BlockDevice for Device {
+        fn sector_count(&self) -> u64 { 8 }
+        fn read_sector(&mut self, lba: u64, out: &mut [u8; SECTOR_BYTES])
+            -> Result<(), BlockError>
+        {
+            check_range(8, lba, 1)?;
+            *out = self.bytes[lba as usize];
+            Ok(())
+        }
+        fn write_sector(&mut self, lba: u64, data: &[u8; SECTOR_BYTES])
+            -> Result<(), BlockError>
+        {
+            check_range(8, lba, 1)?;
+            self.writes += 1;
+            self.bytes[lba as usize] = *data;
+            Ok(())
+        }
+    }
+    fn device() -> Device {
+        let mut disk = Device { bytes: [[0; SECTOR_BYTES]; 8], writes: 0 };
+        for (i, sector) in disk.bytes.iter_mut().enumerate() { sector[0] = i as u8; }
+        disk
+    }
+    #[test]
+    fn discontiguous_extent_mapping_reads_correct_sectors() {
+        let mut disk = device();
+        let extents = [Extent { start: 1, blocks: 2 }, Extent { start: 5, blocks: 2 }];
+        let mut view = ExtentReader::new(&mut disk, &extents).unwrap();
+        assert_eq!(view.sector_count(), 4);
+        let mut sector = [0; SECTOR_BYTES];
+        for (i, expected) in [1, 2, 5, 6].iter().enumerate() {
+            view.read_sector(i as u64, &mut sector).unwrap();
+            assert_eq!(sector[0], *expected);
+        }
+        assert_eq!(view.read_sector(4, &mut sector), Err(BlockError::OutOfRange));
+    }
+    #[test]
+    fn metadata_corruption_is_rejected_before_first_read() {
+        let mut disk = device();
+        let bad = [Extent { start: 2, blocks: 3 }, Extent { start: 4, blocks: 2 }];
+        assert!(matches!(ExtentReader::new(&mut disk, &bad), Err(BlockError::OutOfRange)));
+        let overflow = [Extent { start: u64::MAX, blocks: 2 }];
+        assert!(matches!(ExtentReader::new(&mut disk, &overflow), Err(BlockError::OutOfRange)));
+        assert_eq!(disk.writes, 0);
+    }
+    #[test]
+    fn extent_view_is_strictly_read_only() {
+        let mut disk = device();
+        let extents = [Extent { start: 1, blocks: 2 }];
+        let mut view = ExtentReader::new(&mut disk, &extents).unwrap();
+        assert_eq!(view.write_sector(0, &[1; SECTOR_BYTES]), Err(BlockError::ReadOnly));
+        drop(view);
+        assert_eq!(disk.writes, 0);
+    }
+}
