@@ -78,6 +78,12 @@ def parse(raw, agent):
     if a < 0 or b < 0:
         raise ValueError("Missing markers")
     code = raw[a + len(START):b].strip()
+    # Local models may wrap marked Rust in a markdown fence.
+    # Only unwrap a complete outer Rust fence; reject stray/nested fences.
+    if code.startswith("```rust\n") and code.endswith("\n```"):
+        code = code[len("```rust\n"):-len("\n```")].strip()
+    if "```" in code:
+        raise ValueError("Malformed or nested markdown fences")
     if not 300 <= len(code.encode("utf8")) <= 15000:
         raise ValueError("Source size outside safety bounds")
     if BANNED.search(code) or "\x00" in code:

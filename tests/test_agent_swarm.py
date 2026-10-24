@@ -54,6 +54,28 @@ class SwarmRepairTests(unittest.TestCase):
         self.assertIn("UNTRUSTED", txt)
         self.assertLess(len(m.summarize_feedback(bad)), 2600)
 
+    def test_markdown_fenced_rust_is_unwrapped_without_weakened_policy(self):
+        source = (
+            "#[derive(Debug, PartialEq, Eq)]\n"
+            "pub enum Status { Good, Bad }\n"
+            "pub fn check(n: u32) -> Status { if n < 3 { Status::Good } else { Status::Bad } }\n"
+            "#[cfg(test)] mod tests {\n"
+            "use super::*;\n"
+            "#[test] fn a() { assert_eq!(check(0), Status::Good); }\n"
+            "#[test] fn b() { assert_eq!(check(3), Status::Bad); }\n"
+            "#[test] fn c() { assert_eq!(check(2), Status::Good); }\n"
+            "}\n"
+            + ("// bounded, safe helper test fixture\n" * 4)
+        )
+        wrapped = m.START + "\n```rust\n" + source + "\n```\n" + m.END
+        parsed = m.parse(wrapped, "03")
+        self.assertIn("pub fn check", parsed)
+        self.assertNotIn("```", parsed)
+        with self.assertRaisesRegex(ValueError, "fences"):
+            m.parse(m.START + "\n```rust\n" + source + m.END, "03")
+        with self.assertRaisesRegex(ValueError, "Unsafe"):
+            m.parse(wrapped.replace("pub fn check", "unsafe pub fn check"), "03")
+
     def test_parser_rejects_wrong_marker_or_privileged_module(self):
         good = m.START + "\n" + (
             "pub fn value()->u8{0}\n#[cfg(test)] mod tests {\n" +
