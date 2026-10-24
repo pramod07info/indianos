@@ -1,0 +1,62 @@
+name: IndianOS Swarm Probe - 3B Agent Candidate
+
+on:
+  push:
+    branches: ["agents/swarm-probe"]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
+      - name: Native linker prerequisites
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y clang lld binutils
+          command -v ld
+      - name: Local 3B model runner
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/ggml-org/llama.cpp.git /tmp/llama.cpp
+          cmake -S /tmp/llama.cpp -B /tmp/llama-build -DGGML_NATIVE=OFF -DLLAMA_CURL=ON -DCMAKE_BUILD_TYPE=Release
+          cmake --build /tmp/llama-build --target llama-completion -j 4
+      - name: Agent 02 full generation validation, no writes
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/agent_swarm.py prepare --agent 02 --file /tmp/swarm-prompt.txt
+          for attempt in 1 2 3; do
+            if [[ "$attempt" -gt 1 ]]; then
+              python3 tools/agent_swarm.py retry --agent 02 --file /tmp/swarm-prompt.txt --feedback /tmp/feedback.txt
+            fi
+            timeout 900 /tmp/llama-build/bin/llama-completion \
+              -hf bartowski/Qwen2.5-Coder-3B-Instruct-GGUF:Q4_K_M \
+              -f /tmp/swarm-prompt.txt -n 3600 -c 8192 --temp 0.1 -no-cnv --no-display-prompt > /tmp/generated.txt
+            if python3 tools/agent_swarm.py apply --agent 02 --file /tmp/generated.txt > /tmp/parse.log 2>&1; then
+              if cargo test --offline --manifest-path rust/kernel_core/Cargo.toml > /tmp/cargo.log 2>&1; then
+                cargo build --offline --manifest-path rust/kernel_core/Cargo.toml --no-default-features --target x86_64-unknown-none
+                make test-rust-source-audit
+                make kernel BUILD=build/swarm-probe RUST_CORE=1
+                echo "Agent 02 probe accepted and linked kernel successfully."
+                exit 0
+              fi
+              cp /tmp/cargo.log /tmp/feedback.txt
+              tail -n 35 /tmp/cargo.log
+            else
+              cp /tmp/parse.log /tmp/feedback.txt
+              cat /tmp/parse.log
+            fi
+            git restore -- rust/kernel_core/src/agent_02_pkg_gate.rs
+            echo "Probe rejected candidate $attempt"
+          done
+          echo "Three candidates rejected. No writes to main."
+          exit 1
