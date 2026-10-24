@@ -1,0 +1,35 @@
+name: IndianOS Phase 1 - Ten Coding Workers
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: indianos-phase1-coding
+  cancel-in-progress: false
+jobs:
+  worker:
+    strategy:
+      fail-fast: false
+      max-parallel: 10
+      matrix:
+        agent: ["01","02","03","04","05","06","07","08","09","10"]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: integration/roadmap-phase-1
+          persist-credentials: false
+      - name: Require configured coding model
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        shell: bash
+        run: |
+          if [ -z "$OPENAI_API_KEY" ]; then
+            echo "::error::OPENAI_API_KEY is not configured; no coding agent has started"
+            exit 1
+          fi
+      - name: Explain execution boundary
+        run: |
+          echo "::error::Agent ${{ matrix.agent }} has no configured coding-runtime adapter. Refusing to mark a worker successful."
+          exit 1
