@@ -320,3 +320,124 @@ mod tests{
         assert!(matches!(validate_ipv4(&frame[..n],mac),Err(Error::Invalid)));
     }
 }
+
+
+/// Deterministic, fixed-size UDP endpoint and receive queue. A trusted network
+/// parser must validate IPv4/UDP lengths and checksums before calling enqueue;
+/// this layer adds process and port ownership, not packet authentication.
+pub const R033_UDP_BYTES: usize = 64;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SocketError { Invalid, Duplicate, Full, Denied, Empty, TooShort }
+#[derive(Clone, Copy)]
+struct PortOwner { pid: u32, port: u16 }
+#[derive(Clone, Copy)]
+struct QueuedUdp {
+    destination_pid: u32, destination_port: u16, len: usize,
+    bytes: [u8; R033_UDP_BYTES],
+}
+pub struct UdpEndpoints<const PORTS: usize, const QUEUE: usize> {
+    ports: [Option<PortOwner>; PORTS],
+    queue: [Option<QueuedUdp>; QUEUE],
+    len: usize,
+}
+impl<const PORTS: usize, const QUEUE: usize> UdpEndpoints<PORTS, QUEUE> {
+    pub const fn new() -> Self {
+        Self { ports: [None; PORTS], queue: [None; QUEUE], len: 0 }
+    }
+    pub fn bind(&mut self, pid: u32, port: u16) -> Result<(), SocketError> {
+        if pid == 0 || port == 0 { return Err(SocketError::Invalid); }
+        if self.ports.iter().flatten().any(|p| p.port == port) {
+            return Err(SocketError::Duplicate);
+        }
+        let slot = self.ports.iter_mut().find(|x| x.is_none()).ok_or(SocketError::Full)?;
+        *slot = Some(PortOwner { pid, port });
+        Ok(())
+    }
+    pub fn owns(&self, pid: u32, port: u16) -> bool {
+        self.ports.iter().flatten().any(|p| p.pid == pid && p.port == port)
+    }
+    /// Called only after successful packet checksum/port validation.
+    pub(crate) fn enqueue(&mut self, dest_port: u16, data: &[u8])
+        -> Result<(), SocketError>
+    {
+        if data.is_empty() || data.len() > R033_UDP_BYTES { return Err(SocketError::Invalid); }
+        let pid = self.ports.iter().flatten().find(|p| p.port == dest_port)
+            .map(|p| p.pid).ok_or(SocketError::Denied)?;
+        if self.len == QUEUE { return Err(SocketError::Full); }
+        let mut bytes = [0; R033_UDP_BYTES];
+        bytes[..data.len()].copy_from_slice(data);
+        self.queue[self.len] = Some(QueuedUdp {
+            destination_pid: pid, destination_port: dest_port, len: data.len(), bytes,
+        });
+        self.len += 1;
+        Ok(())
+    }
+    pub fn receive(&mut self, pid: u32, port: u16, out: &mut [u8])
+        -> Result<usize, SocketError>
+    {
+        if !self.owns(pid, port) { return Err(SocketError::Denied); }
+        let index = self.queue[..self.len].iter().position(|q|
+            q.is_some_and(|d| d.destination_pid == pid && d.destination_port == port)
+        ).ok_or(SocketError::Empty)?;
+        let item = self.queue[index].ok_or(SocketError::Empty)?;
+        if out.len() < item.len { return Err(SocketError::TooShort); }
+        out[..item.len].copy_from_slice(&item.bytes[..item.len]);
+        for n in index..self.len - 1 { self.queue[n] = self.queue[n + 1]; }
+        self.len -= 1;
+        self.queue[self.len] = None;
+        Ok(item.len)
+    }
+    pub fn close_all(&mut self, pid: u32) {
+        if pid == 0 { return; }
+        for p in &mut self.ports {
+            if p.is_some_and(|entry| entry.pid == pid) { *p = None; }
+        }
+        let mut i = 0;
+        while i < self.len {
+            if self.queue[i].is_some_and(|entry| entry.destination_pid == pid) {
+                for n in i..self.len - 1 { self.queue[n] = self.queue[n + 1]; }
+                self.len -= 1;
+                self.queue[self.len] = None;
+            } else { i += 1; }
+        }
+    }
+}
+#[cfg(test)]
+mod r033_udp_tests {
+    use super::*;
+    #[test]
+    fn delivery_is_isolated_by_authenticated_pid_and_port() {
+        let mut t = UdpEndpoints::<2, 4>::new();
+        assert_eq!(t.bind(1, 4050), Ok(()));
+        assert_eq!(t.bind(2, 4051), Ok(()));
+        assert_eq!(t.bind(3, 4050), Err(SocketError::Duplicate));
+        assert_eq!(t.enqueue(4050, b"data"), Ok(()));
+        let mut buf = [0; 8];
+        assert_eq!(t.receive(2, 4050, &mut buf), Err(SocketError::Denied));
+        assert_eq!(t.receive(1, 4050, &mut buf), Ok(4));
+        assert_eq!(&buf[..4], b"data");
+    }
+    #[test]
+    fn too_short_read_preserves_queued_message() {
+        let mut t = UdpEndpoints::<1, 1>::new();
+        t.bind(5, 6000).unwrap();
+        t.enqueue(6000, b"payload").unwrap();
+        assert_eq!(t.receive(5, 6000, &mut [0; 2]), Err(SocketError::TooShort));
+        let mut buf = [0; 8];
+        assert_eq!(t.receive(5, 6000, &mut buf), Ok(7));
+        assert_eq!(t.receive(5, 6000, &mut buf), Err(SocketError::Empty));
+    }
+    #[test]
+    fn full_queue_invalid_lengths_and_fault_teardown() {
+        let mut t = UdpEndpoints::<2, 1>::new();
+        t.bind(5, 6000).unwrap();
+        t.bind(6, 6001).unwrap();
+        assert_eq!(t.enqueue(6000, &[]), Err(SocketError::Invalid));
+        t.enqueue(6000, b"x").unwrap();
+        assert_eq!(t.enqueue(6001, b"y"), Err(SocketError::Full));
+        t.close_all(5);
+        assert!(!t.owns(5, 6000));
+        assert_eq!(t.enqueue(6000, b"y"), Err(SocketError::Denied));
+        assert_eq!(t.enqueue(6001, b"y"), Ok(()));
+    }
+}
