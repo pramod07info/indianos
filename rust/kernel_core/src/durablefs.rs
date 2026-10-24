@@ -213,6 +213,50 @@ impl<D:BlockDevice> DurableFs<D>{
         next.entries[slot].name=new;
         self.publish(next)
     }
+    /// Move the full directory subtree in ONE checksummed metadata generation.
+    /// No data banks are copied: R027 can recover the prior entire tree on a
+    /// torn metadata sector, never a mixture of old and new directory names.
+    pub fn rename_directory_tree(&mut self,from:&str,to:&str)->Result<(),FsError>{
+        let old=canonical_path(from)?;
+        let new=canonical_path(to)?;
+        let old_len=old.iter().position(|&b|b==0).unwrap_or(NAME_BYTES);
+        let new_len=new.iter().position(|&b|b==0).unwrap_or(NAME_BYTES);
+        if old_len<=2||new_len<=2||old[0]!=b'~'||old[1]!=b'd'||
+           new[0]!=b'~'||new[1]!=b'd'||old==new{
+            return Err(FsError::InvalidName);
+        }
+        if self.find(old).is_none(){return Err(FsError::NotFound);}
+        let old_stem=&old[2..old_len];
+        let new_stem=&new[2..new_len];
+        let mut next=self.meta;
+        for (i,entry) in self.meta.entries.iter().enumerate(){
+            if !entry.used{continue;}
+            let len=entry.name.iter().position(|&b|b==0).unwrap_or(NAME_BYTES);
+            if len<=2||entry.name[0]!=b'~'||
+               !matches!(entry.name[1],b'd'|b'f'){continue;}
+            let rest=&entry.name[2..len];
+            if rest!=old_stem && !(rest.starts_with(old_stem) &&
+                                   rest.get(old_stem.len())==Some(&b'~')){continue;}
+            let suffix=&rest[old_stem.len()..];
+            let new_size=2+new_stem.len()+suffix.len();
+            if new_size>=NAME_BYTES{return Err(FsError::InvalidName);}
+            let mut changed=[0u8;NAME_BYTES];
+            changed[..2].copy_from_slice(&entry.name[..2]);
+            changed[2..2+new_stem.len()].copy_from_slice(new_stem);
+            changed[2+new_stem.len()..new_size].copy_from_slice(suffix);
+            next.entries[i].name=changed;
+        }
+        // Check collisions before publishing, including orphan backing keys.
+        for i in 0..ENTRIES{
+            if !next.entries[i].used{continue;}
+            for j in 0..i{
+                if next.entries[j].used && next.entries[i].name==next.entries[j].name{
+                    return Err(FsError::Exists);
+                }
+            }
+        }
+        self.publish(next)
+    }
     pub fn into_device(self)->D{self.disk}
     fn find(&self,name:[u8;NAME_BYTES])->Option<usize>{
         self.meta.entries.iter().position(|e|e.used && e.name==name)

@@ -909,6 +909,12 @@ fn vfs_guest()->!{
             if vfs_call(6,b"/home/docs/phase",b"",&mut data,0)!=0 ||
                vfs_call(2,b"/home/docs",b"",&mut data,0)!=0 ||
                vfs_call(6,b"/home/memo",b"",&mut data,0)!=0{exit(252);}
+            // R031.4: this is a real PID1 ring3 directory-tree move.
+            if vfs_call(9,b"/home",b"/etc/archive",&mut data,0)!=0 ||
+               vfs_call(8,b"/home",b"",&mut data,0)!=u64::MAX ||
+               vfs_call(8,b"/etc",b"",&mut data,0)!=10 ||
+               &data[..10]!=b"d:archive\n"{exit(228);}
+            write(b"R031.4 ring3 atomic directory move and child enumeration verified");
             write(b"R031.3 boot4 recovered torn metadata and deleted empty directory");
         }
         _=>exit(253)

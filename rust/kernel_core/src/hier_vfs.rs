@@ -133,6 +133,24 @@ impl<D:BlockDevice> HierVfs<D>{
   if self.conflicting(to.path(),Kind::File)?{return Err(FsError::Exists);}
   self.fs.rename_path(from.name(),to.name())
  }
+ pub fn rename_dir(&mut self,source:&str,target:&str)->Result<(),FsError>{
+  let from=checked(source,Kind::Directory)?;
+  let to=checked(target,Kind::Directory)?;
+  if from.path()==to.path(){return Err(FsError::Exists);}
+  // Refuse self-parenting and moves under any current descendant.
+  if let Some(rest)=to.path().strip_prefix(from.path()){
+   if rest.starts_with('/'){return Err(FsError::InvalidName);}
+  }
+  self.directory(from.path())?;
+  self.parents(&to)?;
+  if self.conflicting(to.path(),Kind::Directory)?{return Err(FsError::Exists);}
+  let mut marker=[0u8;8];
+  match self.fs.read_path(to.name(),&mut marker){
+   Ok(_)=>Err(FsError::Exists),
+   Err(FsError::NotFound)=>self.fs.rename_directory_tree(from.name(),to.name()),
+   Err(e)=>Err(e),
+  }
+ }
  pub fn list_dir(&mut self,path:&str,out:&mut [u8])->Result<usize,FsError>{
   if path!="/"{self.directory(path)?;}
   let stem=if path=="/"{None}else{Some(checked(path,Kind::Directory)?)};
@@ -174,6 +192,7 @@ impl<D:BlockDevice> HierVfs<D>{
    6=>{self.unlink(path)?;Ok(0)},
    7=>{self.rename_file(path,second)?;Ok(0)},
    8=>self.list_dir(path,data),
+   9=>{self.rename_dir(path,second)?;Ok(0)},
    _=>Err(FsError::InvalidName)
   }
  }
@@ -265,6 +284,63 @@ mod tests{
   assert_eq!(recovered.read("/home/note",&mut data),Ok(7));
   assert_eq!(&data[..7],b"persist");
   assert_eq!(recovered.read("/home/after",&mut data),Err(FsError::NotFound));
+ }
+ #[test]fn rename_directory_moves_nested_tree_and_survives_remount(){
+  let mut v=fresh();
+  v.mkdir("/a").unwrap();v.mkdir("/a/b").unwrap();v.mkdir("/dst").unwrap();
+  v.create("/a/b/note",b"nested").unwrap();
+  v.create("/a/leaf",b"direct").unwrap();
+  let before=v.generation();
+  v.rename_dir("/a","/dst/z").unwrap();
+  assert_eq!(v.generation(),before+1);
+  let mut output=[0u8;MAX_TRANSFER];
+  assert_eq!(v.list_dir("/a",&mut output),Err(FsError::NotFound));
+  assert_eq!(v.read("/dst/z/b/note",&mut output),Ok(6));
+  assert_eq!(&output[..6],b"nested");
+  assert_eq!(v.read("/dst/z/leaf",&mut output),Ok(6));
+  assert_eq!(&output[..6],b"direct");
+  let mut v=HierVfs::mount(v.into_device()).unwrap();
+  let n=v.list_dir("/dst/z",&mut output).unwrap();
+  assert_eq!(&output[..n],b"d:b\nf:leaf\n");
+  let n=v.list_dir("/dst/z/b",&mut output).unwrap();
+  assert_eq!(&output[..n],b"f:note\n");
+ }
+ #[test]fn rename_directory_rejects_cycles_collisions_and_long_descendants(){
+  let mut v=fresh();
+  v.mkdir("/a").unwrap();v.mkdir("/a/b").unwrap();
+  v.mkdir("/dst").unwrap();v.mkdir("/dst/used").unwrap();
+  v.create("/a/b/c",b"stay").unwrap();
+  v.create("/dst/file",b"safe").unwrap();
+  let before=v.generation();
+  assert_eq!(v.rename_dir("/a","/a/b/c"),Err(FsError::InvalidName));
+  assert_eq!(v.rename_dir("/a","/a"),Err(FsError::Exists));
+  assert_eq!(v.rename_dir("/a","/dst/used"),Err(FsError::Exists));
+  assert_eq!(v.rename_dir("/a","/dst/file"),Err(FsError::Exists));
+  assert_eq!(v.rename_dir("/a","/missing/new"),Err(FsError::NotFound));
+  assert_eq!(v.rename_dir("/a","/dst/longlonglonglong"),Err(FsError::InvalidName));
+  assert_eq!(v.generation(),before);
+  let mut output=[0u8;MAX_TRANSFER];
+  assert_eq!(v.read("/a/b/c",&mut output),Ok(4));
+  assert_eq!(&output[..4],b"stay");
+  // Even an orphaned backing entry cannot be overwritten by tree rename.
+  v.fs.create_path("/~fdst~z~b~c",b"orphan").unwrap();
+  let before=v.generation();
+  assert_eq!(v.rename_dir("/a","/dst/z"),Err(FsError::Exists));
+  assert_eq!(v.generation(),before);
+ }
+ #[test]fn torn_rename_metadata_recovers_entire_original_directory_tree(){
+  let mut v=fresh();
+  v.mkdir("/a").unwrap();v.mkdir("/a/b").unwrap();
+  v.create("/a/b/note",b"persistent").unwrap();
+  let mut disk=v.into_device();disk.writes=0;disk.tear=Some(0);
+  let mut v=HierVfs::mount(disk).unwrap();
+  assert_eq!(v.rename_dir("/a","/moved"),Err(FsError::Io));
+  let mut disk=v.into_device();disk.tear=None;
+  let mut v=HierVfs::mount(disk).unwrap();
+  let mut output=[0u8;MAX_TRANSFER];
+  assert_eq!(v.read("/a/b/note",&mut output),Ok(10));
+  assert_eq!(&output[..10],b"persistent");
+  assert_eq!(v.list_dir("/moved",&mut output),Err(FsError::NotFound));
  }
  #[test]fn latest_metadata_corruption_falls_back_to_previous_cow_copy(){
   let mut v=fresh();v.mkdir("/etc").unwrap();
