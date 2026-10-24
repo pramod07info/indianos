@@ -71,3 +71,31 @@ filesystem and security. Service manager and compositor agree on capability
 IPC and lifecycle. Networking/TLS uses verified entropy and clock contracts.
 AI planner never executes privilege-bearing commands; it requests a
 deterministic policy decision and explicit user approval.
+
+
+## Ten parallel coding runners and controlled automatic review
+
+The GitHub Actions workflow agent-swarm.yml uses a matrix of ten distinct
+runners. Each runner uses a separate agents/NN-* branch, a narrowly defined
+coding-model prompt, a preapproved Rust source slot, compilation, unit tests,
+kernel source audits, and a freestanding kernel build before opening a PR.
+The model never receives a GitHub write token. Failed candidates never reach
+the main branch.
+
+Each first task produces a bounded helper with unit tests, not a complete
+production feature. Tasks #46-#55 remain open until full integration with
+independent kernel and QEMU acceptance evidence.
+
+The Coordinator auto-reviews only a single changed preapproved agent module,
+runs structural checks and requires successful full QEMU CI on the exact PR
+SHA. It merges one safe PR, dispatches main CI, and waits for green status
+before integrating another. Other changes require explicit reviewer approval.
+Structural validation is not a substitute for human code or security review.
+
+When a safe PR is stale, the Coordinator attempts to update its branch and
+rerun exact-head CI without force pushing. Any conflicts stop that PR.
+
+Runners can execute on workflow updates, successful kernel CI on main,
+a GitHub-scheduled six-hour cadence, or manual workflow dispatch.
+GitHub Actions repository settings may block bots from opening PRs;
+branch protection must still be configured by a repository administrator.

@@ -16,6 +16,17 @@ mod initramfs;
 pub mod block;
 /// Bounded, no-allocation, scheduler-owned IPC primitive (not yet a syscall).
 pub mod ipc;
+/// Preapproved isolated agent module slots.
+pub mod agent_01_fs_extents;
+pub mod agent_02_pkg_gate;
+pub mod agent_03_cap_epoch;
+pub mod agent_04_service_restart;
+pub mod agent_05_surface_rect;
+pub mod agent_06_ipv4_route;
+pub mod agent_07_pci_aperture;
+pub mod agent_08_boot_slot;
+pub mod agent_09_ci_policy;
+pub mod agent_10_app_policy;
 /// Bounded per-process resource capability grants.
 pub mod capability;
 /// Allocation-free VFS path validation and canonicalization.
