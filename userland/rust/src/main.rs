@@ -231,6 +231,7 @@ fn interactive_shell()->!{
           feature="r029-frame-server",feature="r029-frame-client",
           feature="r029-suite-shell",feature="r029-suite-files",feature="r029-suite-terminal",
           feature="r031-shell",feature="r031-files",feature="r031-terminal",
+          feature="r031-files-shell",feature="r031-files-app",feature="r031-files-terminal",
           feature="r031-supervisor-shell",feature="r031-supervisor-files",feature="r031-supervisor-terminal"))]
 fn r029_command(window:u32,kind:u32,x:u16,y:u16,width:u16,height:u16,
     rgb:u32,text:&[u8])->[u8;64]
@@ -252,6 +253,7 @@ fn r029_command(window:u32,kind:u32,x:u16,y:u16,width:u16,height:u16,
           feature="r029-frame-server",feature="r029-frame-client",
           feature="r029-suite-shell",feature="r029-suite-files",feature="r029-suite-terminal",
           feature="r031-shell",feature="r031-files",feature="r031-terminal",
+          feature="r031-files-shell",feature="r031-files-app",feature="r031-files-terminal",
           feature="r031-supervisor-shell",feature="r031-supervisor-files",feature="r031-supervisor-terminal"))]
 fn r029_draw(cmd:&[u8;64]){
     if call(18,cmd.as_ptr() as u64,64)!=0{exit(91);}
@@ -260,6 +262,7 @@ fn r029_draw(cmd:&[u8;64]){
           feature="r029-frame-server",feature="r029-frame-client",
           feature="r029-suite-shell",feature="r029-suite-files",feature="r029-suite-terminal",
           feature="r031-shell",feature="r031-files",feature="r031-terminal",
+          feature="r031-files-shell",feature="r031-files-app",feature="r031-files-terminal",
           feature="r031-supervisor-shell",feature="r031-supervisor-files",feature="r031-supervisor-terminal"))]
 fn r029_wait_for_host(){
     let mut byte=[0u8;1];
@@ -482,6 +485,7 @@ fn r029_frame_client()->!{
 // All clients are distinct protected x86-64 ELF64 images.
 #[cfg(any(feature="r029-suite-shell",feature="r029-suite-files",feature="r029-suite-terminal",
           feature="r031-shell",feature="r031-files",feature="r031-terminal",
+          feature="r031-files-shell",feature="r031-files-app",feature="r031-files-terminal",
           feature="r031-supervisor-shell",feature="r031-supervisor-files",feature="r031-supervisor-terminal"))]
 fn suite_send(dst:u32,bytes:&[u8]){
     if bytes.len()>64{exit(140);}
@@ -492,6 +496,7 @@ fn suite_send(dst:u32,bytes:&[u8]){
 }
 #[cfg(any(feature="r029-suite-shell",feature="r029-suite-files",feature="r029-suite-terminal",
           feature="r031-shell",feature="r031-files",feature="r031-terminal",
+          feature="r031-files-shell",feature="r031-files-app",feature="r031-files-terminal",
           feature="r031-supervisor-shell",feature="r031-supervisor-files",feature="r031-supervisor-terminal"))]
 fn suite_receive(sender:u32,payload:&[u8]){
     let mut response=[0u8;72];
@@ -647,15 +652,87 @@ fn r030_exec()->!{
     write(b"R030.1-2 ring3 lifecycle clean on persistent QEMU volume");
     exit(0);
 }
+// R031.9 Files runs in its own PID2; it cannot enumerate /etc or
+// access raw storage. A narrow read-only syscall lists /shared; file
+// data is read using the existing process-owned file capability ABI.
+#[cfg(feature="r031-files-app")]
+fn files_shared_listing(data:&mut [u8;256])->usize{
+    let mut desc=[0u8;64];
+    desc[..7].copy_from_slice(b"/shared");
+    desc[48..56].copy_from_slice(&(data.as_mut_ptr() as u64).to_le_bytes());
+    desc[56..64].copy_from_slice(&72u64.to_le_bytes());
+    let count=call(34,1,desc.as_ptr() as u64);
+    if count!=9||&data[..9]!=b"f:readme\n"{exit(200);}
+    // PID2 cannot enumerate any private location.
+    desc[..8].copy_from_slice(b"/etc\0\0\0\0");
+    if call(34,1,desc.as_ptr() as u64)!=u64::MAX{exit(201);}
+    9
+}
+#[cfg(feature="r031-files-app")]
+fn files_shared_content(data:&mut [u8;256])->usize{
+    let token=file_handle_call(1,b"/shared/readme",0,1,data,0);
+    if token==u64::MAX||token==0{exit(202);}
+    let count=file_handle_call(2,b"",token,0,data,72);
+    if file_handle_call(5,b"",token,0,data,0)!=0{exit(203);}
+    if count==0||count>20{exit(204);}
+    let bytes=&data[..count as usize];
+    if bytes.iter().any(|b|!(b'A'..=b'Z').contains(b) && *b!=b' '){exit(205);}
+    write(if bytes==b"HELLO INDIANOS"{
+        b"R031.9 Files displayed HELLO INDIANOS from persistent volume"
+    }else if bytes==b"FILE UPDATED"{
+        b"R031.9 Files displayed FILE UPDATED from persistent volume"
+    }else{exit(206)});
+    count as usize
+}
+#[cfg(feature="r031-files-app")]
+fn files_gui_initial(){
+    let mut data=[0u8;256];
+    files_shared_listing(&mut data);
+    r029_draw(&r029_command(1,2,18,140,204,14,0x00ffffff,b"/shared"));
+    r029_draw(&r029_command(1,2,18,163,156,14,0x00ffffff,b"f:readme"));
+    let len=files_shared_content(&mut data);
+    r029_draw(&r029_command(1,2,18,190,(len*12) as u16,14,0x00ffffff,&data[..len]));
+    write(b"R031.9 real file and directory contents rendered into Files window");
+}
+#[cfg(feature="r031-files-app")]
+fn files_gui_refresh(){
+    let mut data=[0u8;256];
+    files_shared_listing(&mut data);
+    let len=files_shared_content(&mut data);
+    // Two additional bounded commands replace only the preview area.
+    r029_draw(&r029_command(1,1,18,190,240,16,0x0045967c,&[]));
+    r029_draw(&r029_command(1,2,18,190,(len*12) as u16,14,0x00ffffff,&data[..len]));
+    write(b"R031.9 Files refreshed on-disk content after desktop IPC");
+}
+#[cfg(feature="r031-files-shell")]
+fn shell_prepare_shared_data(){
+    let mut data=[0u8;256];
+    let count=vfs_call(4,b"/shared/readme",b"",&mut data,0);
+    if count==u64::MAX{
+        if vfs_call(8,b"/shared",b"",&mut data,0)==u64::MAX &&
+           vfs_call(1,b"/shared",b"",&mut data,0)!=0{exit(207);}
+        data[..14].copy_from_slice(b"HELLO INDIANOS");
+        if vfs_call(3,b"/shared/readme",b"",&mut data,14)!=0{exit(208);}
+        write(b"R031.9 PID1 provisioned persistent /shared/readme for GUI");
+    }else if (count==14&&&data[..14]==b"HELLO INDIANOS") ||
+             (count==12&&&data[..12]==b"FILE UPDATED"){
+        write(b"R031.9 PID1 mounted existing persistent /shared/readme");
+    }else{exit(209);}
+    // PID1 can use the root VFS, but PID2 cannot read private files.
+    if vfs_call(8,b"/shared",b"",&mut data,0)!=9||
+       &data[..9]!=b"f:readme\n"{exit(210);}
+}
 // R031.1: automatic boot-to-desktop QEMU session, real ring-3 PID1
 // system-service policy. PID2 Files and PID3 Terminal are independent ELF
 // images, never framebuffer-mapped; all chrome changes are capability checked.
-#[cfg(any(feature="r031-shell",feature="r031-supervisor-shell"))]
+#[cfg(any(feature="r031-shell",feature="r031-supervisor-shell",feature="r031-files-shell"))]
 fn r031_shell()->!{
     if call(4,0,0)!=1 ||call(22,0,0)!=0||
        call(25,0,1)!=u64::MAX ||call(24,0,0)!=u64::MAX{exit(171);}
     #[cfg(feature="r031-supervisor-shell")]
     if call(26,0,0)!=0{exit(193);}
+    #[cfg(feature="r031-files-shell")]
+    shell_prepare_shared_data();
     write(b"R031.1 init launching GUI services without test-driver keystrokes");
     yield_now();
     suite_receive(2,b"FILES");
@@ -668,7 +745,9 @@ fn r031_shell()->!{
     }
     #[cfg(not(feature="r031-supervisor-shell"))]
     suite_receive(3,b"TERMINAL");
-    if call(22,0,0)!=(2|(2<<8))||call(23,1,0)!=0{exit(172);}
+    let expected_commands=if cfg!(feature="r031-files-shell"){5|(2<<8)}
+                          else{2|(2<<8)};
+    if call(22,0,0)!=expected_commands||call(23,1,0)!=0{exit(172);}
     #[cfg(feature="r031-supervisor-shell")]
     write(b"R031.2 RESTORED DESKTOP READY: PID1 PID2 Files PID4 Terminal");
     #[cfg(not(feature="r031-supervisor-shell"))]
@@ -728,7 +807,18 @@ fn r031_shell()->!{
                 front=2;
                 write(b"R031.1 Terminal restored");
             }
-            b'q'=>{
+            #[cfg(feature="r031-files-shell")]
+            b'f'=>{
+                let mut data=[0u8;256];
+                data[..12].copy_from_slice(b"FILE UPDATED");
+                if vfs_call(5,b"/shared/readme",b"",&mut data,12)!=0{exit(211);}
+                suite_send(2,b"REFRESH");
+                yield_now();
+                suite_receive(2,b"UPDATED");
+                write(b"R031.9 desktop requested Files reload from persistent volume");
+                if call(23,1,0)!=0{exit(212);}
+            }
+            b'q'=> {
                 if !saw_pointer ||count<6{exit(182);}
                 if launcher{
                     if call(24,6,0)!=0{exit(183);}
@@ -752,7 +842,7 @@ fn r031_shell()->!{
     }
     exit(186);
 }
-#[cfg(any(feature="r031-files",feature="r031-supervisor-files"))]
+#[cfg(any(feature="r031-files",feature="r031-supervisor-files",feature="r031-files-app"))]
 fn r031_files()->!{
     if call(4,0,0)!=2||call(22,0,0)!=u64::MAX||
        call(24,6,0)!=u64::MAX||call(25,0,0)!=u64::MAX{exit(187);}
@@ -760,11 +850,37 @@ fn r031_files()->!{
     if call(18,foreign.as_ptr() as u64,64)!=u64::MAX{exit(188);}
     r029_draw(&r029_command(1,1,15,102,264,32,0x0045967c,&[]));
     r029_draw(&r029_command(1,2,18,109,240,14,0x00ffffff,b"FILES SERVICE PID2"));
+    #[cfg(feature="r031-files-app")]
+    files_gui_initial();
     suite_send(1,b"FILES");
     write(b"R031.1 Files service registered and running");
     yield_now();
-    #[cfg(not(feature="r031-supervisor-files"))]
+    #[cfg(all(not(feature="r031-supervisor-files"),
+              not(feature="r031-files-app")))]
     suite_receive(1,b"EXIT");
+    #[cfg(feature="r031-files-app")]
+    {
+        let mut already_refreshed=false;
+        loop {
+            let mut response=[0u8;72];
+            let n=call(9,response.as_mut_ptr() as u64,72);
+            if n==0{yield_now();continue;}
+            if n<8 ||u32::from_le_bytes(response[..4].try_into().unwrap())!=1 {
+                exit(213);
+            }
+            let len=u32::from_le_bytes(response[4..8].try_into().unwrap()) as usize;
+            if n!=len as u64+8 {exit(214);}
+            match &response[8..8+len]{
+                b"REFRESH" if !already_refreshed=>{
+                    already_refreshed=true;
+                    files_gui_refresh();
+                    suite_send(1,b"UPDATED");
+                }
+                b"EXIT"=>break,
+                _=>exit(215),
+            }
+        }
+    }
     #[cfg(feature="r031-supervisor-files")]
     {
         let mut reply=[0u8;72];let mut delivered=false;
@@ -782,7 +898,7 @@ fn r031_files()->!{
     write(b"R031.1 Files service stopped and capabilities revoked");
     exit(0);
 }
-#[cfg(any(feature="r031-terminal",feature="r031-supervisor-terminal"))]
+#[cfg(any(feature="r031-terminal",feature="r031-supervisor-terminal",feature="r031-files-terminal"))]
 fn r031_terminal()->!{
     let pid=call(4,0,0);
     #[cfg(feature="r031-supervisor-terminal")]
@@ -814,6 +930,19 @@ fn r031_terminal()->!{
     #[cfg(not(feature="r031-supervisor-terminal"))]
     write(b"R031.1 Terminal service registered and running");
     yield_now();
+    #[cfg(feature="r031-files-terminal")]
+    {
+        let mut reply=[0u8;72];
+        loop{
+            let n=call(9,reply.as_mut_ptr() as u64,72);
+            if n==0{yield_now();continue;}
+            if n!=12||u32::from_le_bytes(reply[..4].try_into().unwrap())!=1||
+               u32::from_le_bytes(reply[4..8].try_into().unwrap())!=4||
+               &reply[8..12]!=b"EXIT"{exit(142);}
+            break;
+        }
+    }
+    #[cfg(not(feature="r031-files-terminal"))]
     suite_receive(1,b"EXIT");
     let mut event=[0u8;16];
     let n=call(21,event.as_mut_ptr() as u64,16);
@@ -829,7 +958,7 @@ fn r031_terminal()->!{
 // R031.3-R031.5: bounded VFS, five real QEMU boots and persistent range I/O.
 // reuse the exact same scratch disk; step 3 deliberately corrupts its newest
 // metadata copy, and step 4 verifies recovery from the older valid generation.
-#[cfg(feature="r031-vfs-init")]
+#[cfg(any(feature="r031-vfs-init",feature="r031-files-shell"))]
 fn vfs_call(action:u64,path:&[u8],target:&[u8],data:&mut [u8;256],used:usize)->u64{
     if path.is_empty()||path.len()>23||target.len()>23||used>data.len(){exit(230);}
     let mut descriptor=[0u8;64];
@@ -857,7 +986,7 @@ fn vfs_call_at(action:u64,path:&[u8],offset:u64,
     call(32,action,desc.as_ptr() as u64)
 }
 // R031.6-8: 64-byte descriptor-based native file manager API.
-#[cfg(feature="r031-vfs-init")]
+#[cfg(any(feature="r031-vfs-init",feature="r031-files-app"))]
 fn file_handle_call(action:u64,path:&[u8],handle:u64,argument:u64,
                     data:&mut [u8;256],size:usize)->u64{
     if path.len()>23 || size>256{exit(205);}
@@ -1044,11 +1173,11 @@ fn vfs_guest()->!{
 pub extern "C" fn _start()->!{
     #[cfg(feature="r031-vfs-init")]
     vfs_guest();
-    #[cfg(any(feature="r031-shell",feature="r031-supervisor-shell"))]
+    #[cfg(any(feature="r031-shell",feature="r031-supervisor-shell",feature="r031-files-shell"))]
     r031_shell();
-    #[cfg(any(feature="r031-files",feature="r031-supervisor-files"))]
+    #[cfg(any(feature="r031-files",feature="r031-supervisor-files",feature="r031-files-app"))]
     r031_files();
-    #[cfg(any(feature="r031-terminal",feature="r031-supervisor-terminal"))]
+    #[cfg(any(feature="r031-terminal",feature="r031-supervisor-terminal",feature="r031-files-terminal"))]
     r031_terminal();
     #[cfg(feature="r030-ondevice-init")]
     r030_exec();

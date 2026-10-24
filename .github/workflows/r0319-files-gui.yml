@@ -1,0 +1,45 @@
+name: R031.9 persistent graphical Files integration
+on:
+  push:
+    branches: [main, agentx-r0319-files-gui-20261024]
+    paths:
+      - 'rust/kernel_core/Cargo.toml'
+      - 'rust/kernel_core/src/gui.rs'
+      - 'rust/kernel_core/src/syscall.rs'
+      - 'rust/kernel_core/src/user_runtime.rs'
+      - 'userland/rust/Cargo.toml'
+      - 'userland/rust/src/main.rs'
+      - 'Makefile'
+      - 'tools/test_r031_files_gui_qemu.py'
+      - '.github/workflows/r0319-files-gui.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  persistent-files-gui:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install QEMU and UEFI development dependencies
+        run: |
+          sudo timeout 120s apt-get update -o Acquire::Retries=0 -o Acquire::http::Timeout=30
+          sudo timeout 120s apt-get install -y clang lld binutils xorriso qemu-system-x86 ovmf curl openssl
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
+      - name: Rust userspace and kernel security regression
+        run: |
+          cargo test --offline --manifest-path rust/kernel_core/Cargo.toml --features test-r031-files-gui
+          # Freestanding userland is validated via the real x86_64-none build below.
+          make test-rust-host-abi
+          python3 -m py_compile tools/test_r031_files_gui_qemu.py
+      - name: Two actual GUI QEMU boots with disk persistence and framebuffer checks
+        run: |
+          set -euo pipefail
+          OVMF_PATH=""
+          for path in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/edk2/ovmf/OVMF_CODE_4M.fd /usr/share/edk2/ovmf/OVMF_CODE.fd; do
+            if test -f "$path"; then OVMF_PATH="$path"; break; fi
+          done
+          test -n "$OVMF_PATH"
+          make test-r031-files-gui-qemu OVMF_CODE="$OVMF_PATH"

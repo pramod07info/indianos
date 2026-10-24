@@ -37,6 +37,12 @@ R031_SUPERVISOR_TEST ?= 0
 ifeq ($(R031_SUPERVISOR_TEST),1)
 R031_BOOT_DESKTOP_TEST := 1
 endif
+# R031.9 opt-in on-disk Files GUI, restricted PID2 listing and IPC refresh.
+R031_FILES_GUI_TEST ?= 0
+ifeq ($(R031_FILES_GUI_TEST),1)
+R031_BOOT_DESKTOP_TEST := 1
+R031_VFS_TEST := 1
+endif
 # R031.1 automatic opt-in QEMU GUI session.
 R031_BOOT_DESKTOP_TEST ?= 0
 ifeq ($(R031_BOOT_DESKTOP_TEST),1)
@@ -181,7 +187,7 @@ RUST_FEATURES += $(if $(filter 1,$(EXCEPTION_SELFTEST)),--features test-ud2,) \
  $(if $(filter 1,$(PAGING_SWITCH_SELFTEST)),--features test-shadow,) \
  $(if $(filter 1,$(USERMODE_SELFTEST)),--features test-ring3,) \
  $(if $(filter 1,$(PROCESS_SELFTEST)),--features test-processes,) \
- $(if $(filter 1,$(SCHEDULER_SELFTEST)),--features test-scheduler,) $(if $(filter 1,$(R013_SHELL_TEST)),--features test-shell,) $(if $(filter 1,$(R014_INTERACTIVE_TEST)),--features test-interactive,) $(if $(filter 1,$(R014_IRQ_TEST)),--features test-irq-keyboard,) $(if $(filter 1,$(R015_ATA_TEST)),--features test-ata-disk,) $(if $(filter 1,$(R027_DURABLE_TEST)),--features test-r027-durable,) $(if $(filter 1,$(R028_NETWORK_TEST)),--features test-r028-network,) $(if $(filter 1,$(R029_DESKTOP_TEST)),--features test-r029-desktop,) $(if $(filter 1,$(R029_USERSPACE_TEST)),--features test-r029-userspace,) $(if $(filter 1,$(R029_PHYSICAL_TEST)),--features test-r029-physical-events,) $(if $(filter 1,$(R029_MULTIPROCESS_TEST)),--features test-r029-multiprocess,) $(if $(filter 1,$(R029_FRAME_SERVER_TEST)),--features test-r029-frame-server,) $(if $(filter 1,$(R029_DESKTOP_SUITE_TEST)),--features test-r029-desktop-suite,) $(if $(filter 1,$(R031_BOOT_DESKTOP_TEST)),--features test-r031-boot-desktop,) $(if $(filter 1,$(R031_SUPERVISOR_TEST)),--features test-r031-supervisor,) $(if $(filter 1,$(R030_ONDEVICE_TEST)),--features test-r030-ondevice,) $(if $(filter 1,$(R031_VFS_TEST)),--features test-r031-vfs,) $(if $(filter 1,$(R026_INTERACTIVE_TEST)),--features test-r026,) $(if $(filter 1,$(R025_COMPLETE_TEST)),--features test-r025,) $(if $(filter 1,$(R025_IPC_TEST)),--features test-ipc,)
+ $(if $(filter 1,$(SCHEDULER_SELFTEST)),--features test-scheduler,) $(if $(filter 1,$(R013_SHELL_TEST)),--features test-shell,) $(if $(filter 1,$(R014_INTERACTIVE_TEST)),--features test-interactive,) $(if $(filter 1,$(R014_IRQ_TEST)),--features test-irq-keyboard,) $(if $(filter 1,$(R015_ATA_TEST)),--features test-ata-disk,) $(if $(filter 1,$(R027_DURABLE_TEST)),--features test-r027-durable,) $(if $(filter 1,$(R028_NETWORK_TEST)),--features test-r028-network,) $(if $(filter 1,$(R029_DESKTOP_TEST)),--features test-r029-desktop,) $(if $(filter 1,$(R029_USERSPACE_TEST)),--features test-r029-userspace,) $(if $(filter 1,$(R029_PHYSICAL_TEST)),--features test-r029-physical-events,) $(if $(filter 1,$(R029_MULTIPROCESS_TEST)),--features test-r029-multiprocess,) $(if $(filter 1,$(R029_FRAME_SERVER_TEST)),--features test-r029-frame-server,) $(if $(filter 1,$(R029_DESKTOP_SUITE_TEST)),--features test-r029-desktop-suite,) $(if $(filter 1,$(R031_BOOT_DESKTOP_TEST)),--features test-r031-boot-desktop,) $(if $(filter 1,$(R031_SUPERVISOR_TEST)),--features test-r031-supervisor,) $(if $(filter 1,$(R031_FILES_GUI_TEST)),--features test-r031-files-gui,) $(if $(filter 1,$(R030_ONDEVICE_TEST)),--features test-r030-ondevice,) $(if $(filter 1,$(R031_VFS_TEST)),--features test-r031-vfs,) $(if $(filter 1,$(R026_INTERACTIVE_TEST)),--features test-r026,) $(if $(filter 1,$(R025_COMPLETE_TEST)),--features test-r025,) $(if $(filter 1,$(R025_IPC_TEST)),--features test-ipc,)
 ifeq ($(USERFAULT_SELFTEST),1)
 RUST_FEATURES += $(if $(filter guard,$(USERFAULT_KIND)),--features test-fault-guard,--features test-fault-supervisor)
 endif
@@ -712,6 +718,10 @@ else ifeq ($(R031_SUPERVISOR_TEST),1)
 RUST_INIT_FEATURE := r031-supervisor-shell
 RUST_WORKER_FEATURE := r031-supervisor-files
 RUST_THIRD_FEATURE := r031-supervisor-terminal
+else ifeq ($(R031_FILES_GUI_TEST),1)
+RUST_INIT_FEATURE := r031-files-shell
+RUST_WORKER_FEATURE := r031-files-app
+RUST_THIRD_FEATURE := r031-files-terminal
 else ifeq ($(R031_BOOT_DESKTOP_TEST),1)
 RUST_INIT_FEATURE := r031-shell
 RUST_WORKER_FEATURE := r031-files
@@ -1090,6 +1100,11 @@ test-r030-package-qemu:
 test-r030-ondevice-qemu:
 	$(MAKE) image BUILD=build/r030-ondevice RUST_CORE=1 R030_ONDEVICE_TEST=1
 	python3 tools/test_r030_ondevice_qemu.py --iso build/r030-ondevice/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)" --worker build/r030-ondevice/userland/worker.elf
+
+.PHONY: test-r031-files-gui-qemu
+test-r031-files-gui-qemu:
+	$(MAKE) image BUILD=build/r031-files-gui RUST_CORE=1 R031_FILES_GUI_TEST=1
+	python3 tools/test_r031_files_gui_qemu.py --iso build/r031-files-gui/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)"
 
 .PHONY: test-r031-vfs-qemu
 test-r031-vfs-qemu:
