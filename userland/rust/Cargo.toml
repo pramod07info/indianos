@@ -43,6 +43,7 @@ r031-terminal = []
 r031-supervisor-shell = []
 r031-supervisor-files = []
 r031-supervisor-terminal = []
+r031-vfs-init = []
 # Signed R030 native SDK sample application, two independently versioned ELFs.
 r030-demo-v1 = []
 r030-demo-v2 = []

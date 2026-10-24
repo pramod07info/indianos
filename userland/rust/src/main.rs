@@ -826,8 +826,108 @@ fn r031_terminal()->!{
     write(b"R031.1 Terminal received owned physical focus notification");
     exit(0);
 }
+// R031.3: boot-dependent bounded hierarchical VFS. Four complete QEMU boots
+// reuse the exact same scratch disk; step 3 deliberately corrupts its newest
+// metadata copy, and step 4 verifies recovery from the older valid generation.
+#[cfg(feature="r031-vfs-init")]
+fn vfs_call(action:u64,path:&[u8],target:&[u8],data:&mut [u8;256],used:usize)->u64{
+    if path.is_empty()||path.len()>23||target.len()>23||used>data.len(){exit(230);}
+    let mut descriptor=[0u8;64];
+    descriptor[..path.len()].copy_from_slice(path);
+    descriptor[24..24+target.len()].copy_from_slice(target);
+    if matches!(action,3|4|5|8){
+        descriptor[48..56].copy_from_slice(&(data.as_mut_ptr() as u64).to_le_bytes());
+        descriptor[56..64].copy_from_slice(&((if action==8{64}
+               else if action==4{data.len()}else{used}) as u64).to_le_bytes());
+    }
+    call(32,action,descriptor.as_ptr() as u64)
+}
+#[cfg(feature="r031-vfs-init")]
+fn vfs_guest()->!{
+    if call(4,0,0)!=1||call(32,0,0)!=u64::MAX{exit(231);}
+    let mut data=[0u8;256];
+    let n=vfs_call(4,b"/home/docs/phase",b"",&mut data,0);
+    let stage=if n==u64::MAX{0}else if n==1 &&(b'1'..=b'3').contains(&data[0]){
+        data[0]-b'0'
+    }else{exit(232)};
+    match stage{
+        0=>{
+            if call(31,0,0)!=0 ||call(31,1,0)!=1{exit(233);}
+            if vfs_call(1,b"/etc",b"",&mut data,0)!=0 ||
+               vfs_call(1,b"/home",b"",&mut data,0)!=0 ||
+               vfs_call(1,b"/home/docs",b"",&mut data,0)!=0{exit(234);}
+            if vfs_call(3,b"/absent/note",b"",&mut data,1)!=u64::MAX{
+                exit(235);
+            }
+            data[..5].copy_from_slice(b"alpha");
+            if vfs_call(3,b"/etc/config",b"",&mut data,5)!=0{exit(236);}
+            data[..5].copy_from_slice(b"hello");
+            if vfs_call(3,b"/home/docs/note",b"",&mut data,5)!=0{exit(237);}
+            data[0]=b'1';
+            if vfs_call(3,b"/home/docs/phase",b"",&mut data,1)!=0{exit(238);}
+            let listing=vfs_call(8,b"/",b"",&mut data,0);
+            if listing!=13||&data[..13]!=b"d:etc\nd:home\n"{exit(239);}
+            write(b"R031.3 boot1 created directories, VFS files and persistent phase");
+        }
+        1=>{
+            if call(31,0,0)!=1 ||
+               vfs_call(4,b"/etc/config",b"",&mut data,0)!=5 ||
+               &data[..5]!=b"alpha"{exit(240);}
+            if vfs_call(7,b"/home/docs/note",b"/home/docs/memo",&mut data,0)!=0{
+                exit(241);
+            }
+            data[..4].copy_from_slice(b"beta");
+            if vfs_call(5,b"/etc/config",b"",&mut data,4)!=0{exit(242);}
+            data[0]=b'2';
+            if vfs_call(5,b"/home/docs/phase",b"",&mut data,1)!=0{exit(243);}
+            write(b"R031.3 boot2 persisted atomic rename and overwritten file");
+        }
+        2=>{
+            if call(31,0,0)!=1 ||
+               vfs_call(4,b"/home/docs/memo",b"",&mut data,0)!=5 ||
+               &data[..5]!=b"hello"{exit(244);}
+            if vfs_call(7,b"/home/docs/memo",b"/home/memo",&mut data,0)!=0{
+                exit(245);
+            }
+            data[0]=b'3';
+            if vfs_call(5,b"/home/docs/phase",b"",&mut data,1)!=0{exit(246);}
+            data[..4].copy_from_slice(b"beta");
+            if vfs_call(5,b"/etc/config",b"",&mut data,4)!=0{exit(247);}
+            write(b"R031.3 boot3 committed redundant data for tear-recovery injection");
+        }
+        3=>{
+            if call(31,0,0)!=1 ||
+               vfs_call(4,b"/etc/config",b"",&mut data,0)!=4 ||
+               &data[..4]!=b"beta"{exit(248);}
+            if vfs_call(4,b"/home/memo",b"",&mut data,0)!=5 ||
+               &data[..5]!=b"hello"{exit(249);}
+            if vfs_call(2,b"/home/docs",b"",&mut data,0)!=u64::MAX{
+                exit(250); // cannot remove nonempty directory
+            }
+            if vfs_call(8,b"/home",b"",&mut data,0)!=14 ||
+               &data[..14]!=b"d:docs\nf:memo\n"{exit(251);}
+            if vfs_call(6,b"/home/docs/phase",b"",&mut data,0)!=0 ||
+               vfs_call(2,b"/home/docs",b"",&mut data,0)!=0 ||
+               vfs_call(6,b"/home/memo",b"",&mut data,0)!=0{exit(252);}
+            write(b"R031.3 boot4 recovered torn metadata and deleted empty directory");
+        }
+        _=>exit(253)
+    }
+    if call(5,1,0)!=0{exit(254);}
+    write(b"R031.3 allowlisted worker started without VFS privileges");
+    yield_now();
+    if call(17,2,0)!=1{exit(255);}
+    if stage==3{
+        if call(31,4,0)!=0{exit(227);}
+        write(b"R031.3 VFS recovery complete; pre-staged worker uninstalled");
+    }
+    write(b"R031.3 verified persistent hierarchical storage and ring3 isolation");
+    exit(0);
+}
 #[no_mangle]
 pub extern "C" fn _start()->!{
+    #[cfg(feature="r031-vfs-init")]
+    vfs_guest();
     #[cfg(any(feature="r031-shell",feature="r031-supervisor-shell"))]
     r031_shell();
     #[cfg(any(feature="r031-files",feature="r031-supervisor-files"))]

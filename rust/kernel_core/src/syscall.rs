@@ -113,7 +113,10 @@ pub unsafe extern "C" fn indianos_syscall_validate(
         30 => (1..=4).contains(&request.arg0) &&
               user_range(plan,request.arg1,48,false), // filesystem descriptor
         #[cfg(feature="test-r030-ondevice")]
-        31 => request.arg0<=4 && request.arg1==0, // installed native app
+        31 => request.arg0<=4 && request.arg1==0,
+        #[cfg(feature="test-r031-vfs")]
+        32 => (1..=8).contains(&request.arg0) &&
+              user_range(plan,request.arg1,64,false), // installed native app
         #[cfg(feature = "test-r026")]
         16 | 17 => request.arg0 == 2 && request.arg1 == 0, // worker status/reap query
         #[cfg(feature="test-interactive")]

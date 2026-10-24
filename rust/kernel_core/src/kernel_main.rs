@@ -407,6 +407,8 @@ pub extern "C" fn kmain()->!{
              b"IndianOS: FATAL M009 cooperative context test failed\n\0");
         #[cfg(feature="test-r030-ondevice")]
         log(b"IndianOS: R030.1-2 persistent files and native app lifecycle PASSED\n\0");
+        #[cfg(feature="test-r031-vfs")]
+        log(b"IndianOS: R031.3 HIERARCHICAL VFS, ATOMIC RENAME AND REBOOT RECOVERY PASSED\n\0");
         #[cfg(feature="test-r026")]
         log(b"IndianOS: R026 persistent interactive shell session complete\n\0");
         #[cfg(feature="test-r029-multiprocess")]

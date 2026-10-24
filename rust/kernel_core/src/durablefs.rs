@@ -194,6 +194,25 @@ impl<D:BlockDevice> DurableFs<D>{
         Ok(Self{disk,meta,active,previous})
     }
     pub fn generation(&self)->u64{self.meta.generation}
+    /// Expose verified metadata names only, without mutable disk state.
+    /// Used by the constrained R031 VFS for directory membership/listing.
+    pub fn visit_names(&self,mut visit:impl FnMut(&str)){
+        for entry in self.meta.entries.iter().filter(|e|e.used){
+            let len=entry.name.iter().position(|&b|b==0).unwrap_or(NAME_BYTES);
+            if let Ok(name)=core::str::from_utf8(&entry.name[..len]){visit(name);}
+        }
+    }
+    /// Rename a single file by atomically publishing ONE metadata generation.
+    /// Its data extents remain untouched, preserving both checkpoint copies.
+    pub fn rename_path(&mut self,source:&str,target:&str)->Result<(),FsError>{
+        let old=canonical_path(source)?;
+        let new=canonical_path(target)?;
+        let slot=self.find(old).ok_or(FsError::NotFound)?;
+        if self.find(new).is_some(){return Err(FsError::Exists);}
+        let mut next=self.meta;
+        next.entries[slot].name=new;
+        self.publish(next)
+    }
     pub fn into_device(self)->D{self.disk}
     fn find(&self,name:[u8;NAME_BYTES])->Option<usize>{
         self.meta.entries.iter().position(|e|e.used && e.name==name)

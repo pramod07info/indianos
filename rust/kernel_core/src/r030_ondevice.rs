@@ -16,7 +16,13 @@ impl From<FsError> for Error {
   if e==FsError::NotFound{Self::NotFound}else{Self::Io}
  }
 }
-fn reserved(path:&str)->bool{matches!(path,"/app"|"/previous")}
+fn reserved(path:&str)->bool{
+ let mut canonical=[0u8;64];
+ if let Ok(n)=crate::vfs_path::normalize_absolute(path,&mut canonical){
+  let p=&canonical[..n];
+  p==b"/app"||p==b"/previous"||p.starts_with(b"/~")
+ }else{false}
+}
 pub struct Service<D:BlockDevice>{fs:DurableFs<D>}
 impl<D:BlockDevice> Service<D>{
  pub fn mount(disk:D)->Result<Self,Error>{

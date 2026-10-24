@@ -1,0 +1,37 @@
+name: Verify R031.3 hierarchical VFS and crash-consistent recovery
+on:
+  push:
+    branches: [agentx-r0313-hierarchical-vfs-20261024]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  hierarchical-filesystem-recovery:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install x86 QEMU, OVMF and native linker
+        run: |
+          sudo timeout 120s apt-get update -o Acquire::Retries=0 -o Acquire::http::Timeout=30
+          sudo timeout 120s apt-get install -y clang lld binutils xorriso qemu-system-x86 ovmf curl openssl
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
+      - name: Unit tests, atomic rename, directory bounds and torn metadata
+        run: |
+          cargo test --offline --manifest-path rust/kernel_core/Cargo.toml --features test-r031-vfs
+          make test-rust-host-abi
+          make test-rust-source-audit
+          python3 -m unittest discover -s tests -p 'test_r030_pkg.py' -v
+      - name: Freestanding kernel build with VFS syscall descriptor
+        run: cargo build --offline --manifest-path rust/kernel_core/Cargo.toml --target x86_64-unknown-none --no-default-features --features cpu-entry,vmm,pmm,user-image,paging,paging-cpu,user-runtime,runtime,boot-staging,boot,interrupts,timer,kernel-main,limine-requests,test-r031-vfs
+      - name: Four QEMU reboots and deliberate newest metadata corruption
+        run: |
+          set -euo pipefail
+          OVMF_PATH=""
+          for f in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/edk2/ovmf/OVMF_CODE_4M.fd /usr/share/edk2/ovmf/OVMF_CODE.fd; do
+            if test -f "$f"; then OVMF_PATH="$f"; break; fi
+          done
+          test -n "$OVMF_PATH"
+          make test-r031-vfs-qemu OVMF_CODE="$OVMF_PATH"
