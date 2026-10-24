@@ -732,7 +732,7 @@ else ifeq ($(R029_USERSPACE_TEST),1)
 RUST_INIT_FEATURE := r029-client
 else ifeq ($(R031_VFS_TEST),1)
 RUST_INIT_FEATURE := r031-vfs-init
-RUST_WORKER_FEATURE := r030-ondevice-app
+RUST_WORKER_FEATURE := r031-vfs-worker
 else ifeq ($(R030_ONDEVICE_TEST),1)
 RUST_INIT_FEATURE := r030-ondevice-init
 RUST_WORKER_FEATURE := r030-ondevice-app

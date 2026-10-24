@@ -59,6 +59,24 @@ pub extern "C" fn indianos_r013_take_worker_request()->bool {
 }
 static mut ACTIVE_TASK:*mut Task=ptr::null_mut();
 static mut ACTIVE_PROCESS:*mut Process=ptr::null_mut();
+#[cfg(feature="test-r031-vfs")]
+static mut R031_HANDLES:crate::fs_handles::FileHandles=
+    crate::fs_handles::FileHandles::new();
+#[cfg(feature="test-r031-vfs")]
+fn authenticated_file_pid()->Option<u32>{
+    let process=unsafe{ptr::read(ptr::addr_of!(ACTIVE_PROCESS))};
+    let task=active_task();
+    let image=active_image();
+    if process.is_null()||task.is_null()||image.is_null(){return None;}
+    let p=unsafe{&*process};
+    let t=unsafe{&*task};
+    if !(1..=2).contains(&p.pid)||p.state!=3||t.pcb!=process||
+       unsafe{ACTIVE_PID}!=p.pid||
+       !ptr::eq(&t.image as *const UserImage,image as *const UserImage){
+        return None;
+    }
+    Some(p.pid)
+}
 #[cfg(feature="test-r026")]
 static mut R026_WORKER_REQUESTED:bool=false;
 #[cfg(feature="test-r026")]
@@ -136,6 +154,8 @@ fn cleanup_quantum_jobs(pid:u32){
  if pid==0{return;}
  let jobs=unsafe{&mut *ptr::addr_of_mut!(QUANTUM_JOBS)};
  let _=jobs.process_terminated(pid);
+ #[cfg(feature="test-r031-vfs")]
+ unsafe{(&mut *ptr::addr_of_mut!(R031_HANDLES)).terminate(pid);}
 }
 
 static mut M009_TASKS:[MaybeUninit<Task>;TASKS]=[const{MaybeUninit::uninit()};TASKS];
@@ -638,6 +658,61 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
     }
     _=>BAD
    }
+  },
+  #[cfg(feature="test-r031-vfs")]
+  33=>{
+   let Some(pid)=authenticated_file_pid()else{return BAD;};
+   // Descriptor: path[24], opaque handle u64, argument u64,
+   // pointer u64, length u64, reserved u64. Never dereference an
+   // untrusted ring3 pointer outside validated copy helpers.
+   let mut desc=[0u8;64];
+   if !unsafe{indianos_user_copy_readonly(img,request.arg1,
+                desc.as_mut_ptr().cast(),desc.len())}{return BAD;}
+   if desc[56..64].iter().any(|&b|b!=0){return BAD;}
+   let handle=u64::from_le_bytes(desc[24..32].try_into().unwrap());
+   let argument=u64::from_le_bytes(desc[32..40].try_into().unwrap());
+   let address=u64::from_le_bytes(desc[40..48].try_into().unwrap());
+   let length=u64::from_le_bytes(desc[48..56].try_into().unwrap());
+   let path=if request.arg0==1{
+    let Some(end)=desc[..24].iter().position(|&b|b==0)else{return BAD;};
+    if end<2||desc[end..24].iter().any(|&b|b!=0) ||
+       handle!=0||address!=0||length!=0{return BAD;}
+    let Ok(s)=core::str::from_utf8(&desc[..end])else{return BAD;};
+    s
+   }else{
+    if desc[..24].iter().any(|&b|b!=0){return BAD;}
+    ""
+   };
+   // Validate every byte of requested writable destination before
+   // changing cursor state; cannot expose kernel contents on bad pages.
+   let mut data=[0u8;256];
+   let size=if matches!(request.arg0,2|3){
+    if length==0||length>if request.arg0==2{72}else{256} {
+     return BAD;
+    }
+    let n=length as usize;
+    if request.arg0==2{
+     if !unsafe{indianos_user_can_write(&*img,address,n)}{return BAD;}
+    }else if !unsafe{indianos_user_copy_readonly(
+                    img,address,data.as_mut_ptr().cast(),n)}{return BAD;}
+    n
+   }else{
+    if address!=0||length!=0{return BAD;}
+    0
+   };
+   if matches!(request.arg0,2|3|5) && argument!=0{return BAD;}
+   if request.arg0==4 && argument>crate::durablefs::MAX_FILE_BYTES as u64{
+    return BAD;
+   }
+   let handles=unsafe{&mut *ptr::addr_of_mut!(R031_HANDLES)};
+   let res=crate::fs_handles::operation(handles,request.arg0,pid,
+           handle,argument,path,&mut data[..size]);
+   let Ok(n)=res else{return BAD;};
+   if request.arg0==2 && n>0{
+    if n>size as u64|| !unsafe{indianos_user_copy_writable(
+          &*img,address,data.as_ptr(),n as usize)}{return BAD;}
+   }
+   n
   },
   #[cfg(feature="test-r030-ondevice")]
   31=>{

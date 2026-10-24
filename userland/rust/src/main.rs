@@ -856,6 +856,48 @@ fn vfs_call_at(action:u64,path:&[u8],offset:u64,
     desc[56..64].copy_from_slice(&(size as u64).to_le_bytes());
     call(32,action,desc.as_ptr() as u64)
 }
+// R031.6-8: 64-byte descriptor-based native file manager API.
+#[cfg(feature="r031-vfs-init")]
+fn file_handle_call(action:u64,path:&[u8],handle:u64,argument:u64,
+                    data:&mut [u8;256],size:usize)->u64{
+    if path.len()>23 || size>256{exit(205);}
+    let mut desc=[0u8;64];
+    desc[..path.len()].copy_from_slice(path);
+    desc[24..32].copy_from_slice(&handle.to_le_bytes());
+    desc[32..40].copy_from_slice(&argument.to_le_bytes());
+    if matches!(action,2|3){
+        desc[40..48].copy_from_slice(&(data.as_mut_ptr() as u64).to_le_bytes());
+        desc[48..56].copy_from_slice(&(size as u64).to_le_bytes());
+    }
+    call(33,action,desc.as_ptr() as u64)
+}
+#[cfg(feature="r031-vfs-init")]
+fn files_app_smoke(data:&mut [u8;256]){
+    // R031.8: native application-style open/read/seek/write/close workflow.
+    let fd=file_handle_call(1,b"/etc/big",0,3,data,0);
+    if fd==u64::MAX||fd==0{exit(206);}
+    if file_handle_call(2,b"",fd,0,data,16)!=16{exit(207);}
+    for (i,b) in data[..16].iter().enumerate(){
+        if *b!=(i as u8).wrapping_mul(17).wrapping_add(3){exit(208);}
+    }
+    if file_handle_call(4,b"",fd,512,data,0)!=512{exit(209);}
+    if file_handle_call(2,b"",fd,0,data,4)!=4 ||
+       &data[..4]!=b"PCH!"{exit(210);}
+    if file_handle_call(4,b"",fd,512,data,0)!=512{exit(211);}
+    data[..4].copy_from_slice(b"FILE");
+    if file_handle_call(3,b"",fd,0,data,4)!=4{exit(212);}
+    if file_handle_call(5,b"",fd,0,data,0)!=0{exit(213);}
+    // A closed capability cannot be used or escalated.
+    if file_handle_call(2,b"",fd,0,data,4)!=u64::MAX{exit(214);}
+    let rd=file_handle_call(1,b"/etc/big",0,1,data,0);
+    if rd==u64::MAX||rd==0||rd==fd{exit(215);}
+    if file_handle_call(3,b"",rd,0,data,4)!=u64::MAX{exit(216);}
+    if file_handle_call(4,b"",rd,512,data,0)!=512 ||
+       file_handle_call(2,b"",rd,0,data,4)!=4 ||
+       &data[..4]!=b"FILE"{exit(217);}
+    if file_handle_call(5,b"",rd,0,data,0)!=0{exit(218);}
+    write(b"R031.6-8 PID1 native filesystem handles, rights and close verified");
+}
 #[cfg(feature="r031-vfs-init")]
 fn vfs_guest()->!{
     if call(4,0,0)!=1||call(32,0,0)!=u64::MAX{exit(231);}
@@ -983,6 +1025,7 @@ fn vfs_guest()->!{
             // Non-ranged reads of 2048-byte files still reject small buffers.
             if vfs_call(4,b"/etc/big",b"",&mut data,0)!=u64::MAX{exit(214);}
             write(b"R031.5 boot5 verified durable two-kibibyte ranged read and patch");
+            files_app_smoke(&mut data);
         }
         _=>exit(253)
     }
@@ -1009,10 +1052,19 @@ pub extern "C" fn _start()->!{
     r031_terminal();
     #[cfg(feature="r030-ondevice-init")]
     r030_exec();
-    #[cfg(feature="r030-ondevice-app")]
+    #[cfg(any(feature="r030-ondevice-app",feature="r031-vfs-worker"))]
     {
         if call(4,0,0)!=2 || call(30,1,0)!=u64::MAX ||
            call(31,0,0)!=u64::MAX ||call(5,1,0)!=u64::MAX {exit(221);}
+        // Even a valid descriptor cannot grant worker access to /etc.
+        #[cfg(feature="r031-vfs-worker")]
+        {
+            let mut d=[0u8;64];
+            d[..8].copy_from_slice(b"/etc/big");
+            d[32..40].copy_from_slice(&1u64.to_le_bytes());
+            if call(33,1,d.as_ptr() as u64)!=u64::MAX{exit(219);}
+            write(b"R031.7 PID2 denied private VFS file via handle syscall");
+        }
         write(b"R030.2 installed native ELF ran in isolated PID2 ring3");
         exit(0);
     }

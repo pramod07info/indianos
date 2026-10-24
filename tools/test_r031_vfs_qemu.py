@@ -43,6 +43,9 @@ def boot(qemu,iso,ovmf,disk,marker):
               "R030.2 installed native ELF ran in isolated PID2 ring3",
               "R031.3 verified persistent hierarchical storage and ring3 isolation",
               PASSED]
+            if marker.startswith("R031.5 boot5"):
+                requirements.insert(1,"R031.6-8 PID1 native filesystem handles, rights and close verified")
+                requirements.insert(2,"R031.7 PID2 denied private VFS file via handle syscall")
             if all(x in output for x in requirements):
                 if not all(output.index(x)<output.index(y) for x,y in zip(requirements,requirements[1:])):
                     raise AssertionError("invalid guest milestones\n"+output[-7000:])

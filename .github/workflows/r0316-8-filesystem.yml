@@ -1,0 +1,45 @@
+name: R031.6-8 integrated native filesystem
+on:
+  push:
+    branches: [main, agentx-r0316-8-bundle-20261024]
+    paths:
+      - 'rust/kernel_core/src/fs_handles.rs'
+      - 'rust/kernel_core/src/lib.rs'
+      - 'rust/kernel_core/src/syscall.rs'
+      - 'rust/kernel_core/src/user_runtime.rs'
+      - 'userland/rust/src/main.rs'
+      - 'userland/rust/Cargo.toml'
+      - 'Makefile'
+      - 'tools/test_r031_vfs_qemu.py'
+      - '.github/workflows/r0316-8-filesystem.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native-file-handles:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install QEMU, UEFI and linker dependencies
+        run: |
+          sudo timeout 120s apt-get update -o Acquire::Retries=0 -o Acquire::http::Timeout=30
+          sudo timeout 120s apt-get install -y clang lld binutils xorriso qemu-system-x86 ovmf curl openssl
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
+      - name: Rust host ABI, handle ownership and rights regression
+        run: |
+          cargo test --offline --manifest-path rust/kernel_core/Cargo.toml --features test-r031-vfs
+          make test-rust-host-abi
+          make test-rust-source-audit
+          python3 -m py_compile tools/test_r031_vfs_qemu.py
+      - name: Ring3 native file handle integration, worker denial and five QEMU boots
+        run: |
+          set -euo pipefail
+          OVMF_PATH=""
+          for path in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/edk2/ovmf/OVMF_CODE_4M.fd /usr/share/edk2/ovmf/OVMF_CODE.fd; do
+            if test -f "$path"; then OVMF_PATH="$path"; break; fi
+          done
+          test -n "$OVMF_PATH"
+          make test-r031-vfs-qemu OVMF_CODE="$OVMF_PATH"

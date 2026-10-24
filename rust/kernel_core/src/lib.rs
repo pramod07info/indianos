@@ -29,6 +29,8 @@ pub mod durablefs;
 pub mod r030_ondevice;
 #[cfg(feature="test-r031-vfs")]
 pub mod hier_vfs;
+#[cfg(feature="test-r031-vfs")]
+pub mod fs_handles;
 /// R028 strict allocator-free Ethernet/IPv4 and protocol demo.
 pub mod network;
 // Legacy virtio PCI DMA depends on PMM, Limine HHDM and a real x86 ring-0
