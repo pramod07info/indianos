@@ -63,3 +63,44 @@ mod tests {
         assert_eq!(transition(s, Event::Stop).unwrap().state, State::Stopped);
     }
 }
+
+/// Calculate the earliest retry time with linear backoff. A running/stopped
+/// service cannot allocate a restart timer; overflow denies scheduling.
+pub fn retry_deadline(service: Service, now_ticks: u64, interval_ticks: u64)
+    -> Result<u64, ServiceError>
+{
+    if service.state != State::WaitingRestart || interval_ticks == 0 {
+        return Err(ServiceError::InvalidTransition);
+    }
+    if service.retries >= service.retry_budget {
+        return Err(ServiceError::InvalidTransition);
+    }
+    let next = u64::from(service.retries) + 1;
+    let delay = interval_ticks.checked_mul(next).ok_or(ServiceError::CounterOverflow)?;
+    now_ticks.checked_add(delay).ok_or(ServiceError::CounterOverflow)
+}
+#[cfg(test)]
+mod backoff_tests {
+    use super::*;
+    fn ready() -> Service {
+        Service { state: State::WaitingRestart, retries: 1, retry_budget: 3, generation: 4 }
+    }
+    #[test]
+    fn backoff_grows_with_retry_count() {
+        assert_eq!(retry_deadline(ready(), 100, 5), Ok(110));
+        let mut s = ready(); s.retries = 2;
+        assert_eq!(retry_deadline(s, 100, 5), Ok(115));
+    }
+    #[test]
+    fn cannot_retry_stopped_or_exhausted_service() {
+        let mut s = ready(); s.state = State::Stopped;
+        assert_eq!(retry_deadline(s, 100, 5), Err(ServiceError::InvalidTransition));
+        s.state = State::WaitingRestart; s.retries = 3;
+        assert_eq!(retry_deadline(s, 100, 5), Err(ServiceError::InvalidTransition));
+    }
+    #[test]
+    fn prevents_timestamp_wraparound() {
+        assert_eq!(retry_deadline(ready(), u64::MAX, 1), Err(ServiceError::CounterOverflow));
+        assert_eq!(retry_deadline(ready(), 100, 0), Err(ServiceError::InvalidTransition));
+    }
+}
