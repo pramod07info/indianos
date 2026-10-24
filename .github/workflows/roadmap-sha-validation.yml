@@ -1,0 +1,23 @@
+name: Roadmap SHA Validation
+on:
+  pull_request:
+    paths:
+      - 'tools/verify_ci_sha.py'
+      - 'tests/test_verify_ci_sha.py'
+      - '.github/workflows/roadmap-sha-validation.yml'
+  workflow_dispatch:
+jobs:
+  verify-sha:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run SHA verification regression tests
+        run: python3 -m unittest discover -s tests -p test_verify_ci_sha.py -v
+      - name: Verify checked-out commit identity
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          OBSERVED_SHA="$(git rev-parse HEAD)"
+          python3 tools/verify_ci_sha.py --expected "$EXPECTED_SHA" --observed "$OBSERVED_SHA"
