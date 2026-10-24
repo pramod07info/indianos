@@ -79,3 +79,82 @@ mod trust_store_tests {
         assert_eq!(permit_from_trust_store(pkg(), &[42], 10), Err(PackageError::Downgrade));
     }
 }
+
+
+/// Guest-owned trust root. The public key comes from immutable trusted
+/// configuration, never an app-provided self-signed manifest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TrustAnchor { pub id: u32, pub ed25519_public_key: [u8; 32] }
+
+/// An independent cryptographic verifier must implement this interface.
+/// No implementation is shipped in this helper: it must fail closed when a
+/// real Ed25519 implementation is unavailable on the target.
+pub trait GuestSignatureVerifier {
+    fn verify(&self, public_key: &[u8; 32], signed_bytes: &[u8],
+              signature: &[u8; 64]) -> bool;
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GuestPackageError { UntrustedKey, Unsigned, Downgrade, WrongArchitecture, Malformed }
+
+/// Verified preflight for a single small staged manifest. Returns no runnable
+/// ELF handle; a separate privileged loader must validate the real payload.
+pub fn verify_guest_manifest<V: GuestSignatureVerifier>(
+    verifier: &V,
+    anchors: &[TrustAnchor], key_id: u32,
+    manifest: &[u8], signature: &[u8; 64], version: u64,
+    target_arch: u16, host_arch: u16, min_version: u64,
+) -> Result<(), GuestPackageError> {
+    if manifest.is_empty() || manifest.len() > 4096 || version == 0 {
+        return Err(GuestPackageError::Malformed);
+    }
+    if target_arch != host_arch { return Err(GuestPackageError::WrongArchitecture); }
+    if version < min_version { return Err(GuestPackageError::Downgrade); }
+    let anchor = anchors.iter().find(|key| key.id != 0 && key.id == key_id)
+        .ok_or(GuestPackageError::UntrustedKey)?;
+    if !verifier.verify(&anchor.ed25519_public_key, manifest, signature) {
+        return Err(GuestPackageError::Unsigned);
+    }
+    Ok(())
+}
+#[cfg(test)]
+mod guest_verifier_tests {
+    use super::*;
+    struct FakeVerifier;
+    impl GuestSignatureVerifier for FakeVerifier {
+        fn verify(&self, pubkey: &[u8; 32], msg: &[u8], signature: &[u8; 64]) -> bool {
+            // Test-only stand-in, deliberately NOT an Ed25519 implementation.
+            pubkey[0] == 42 && msg == b"valid-test-manifest" && signature[0] == 0xab
+        }
+    }
+    fn anchors() -> [TrustAnchor; 1] {
+        [TrustAnchor { id: 7, ed25519_public_key: [42; 32] }]
+    }
+    #[test]
+    fn accepts_only_explicit_trusted_test_verification() {
+        let mut sig = [0u8; 64]; sig[0] = 0xab;
+        assert_eq!(verify_guest_manifest(&FakeVerifier, &anchors(), 7,
+            b"valid-test-manifest", &sig, 2, 0x8664, 0x8664, 1), Ok(()));
+    }
+    #[test]
+    fn unknown_signer_and_tampering_are_rejected() {
+        let mut sig = [0u8; 64]; sig[0] = 0xab;
+        assert_eq!(verify_guest_manifest(&FakeVerifier, &anchors(), 8,
+            b"valid-test-manifest", &sig, 2, 1, 1, 1), Err(GuestPackageError::UntrustedKey));
+        assert_eq!(verify_guest_manifest(&FakeVerifier, &anchors(), 7,
+            b"tampered-manifest", &sig, 2, 1, 1, 1), Err(GuestPackageError::Unsigned));
+        sig[0] = 0;
+        assert_eq!(verify_guest_manifest(&FakeVerifier, &anchors(), 7,
+            b"valid-test-manifest", &sig, 2, 1, 1, 1), Err(GuestPackageError::Unsigned));
+    }
+    #[test]
+    fn architecture_downgrade_and_empty_input_fail_closed() {
+        assert_eq!(verify_guest_manifest(&FakeVerifier, &anchors(), 7,
+            b"valid-test-manifest", &[0; 64], 2, 1, 2, 1),
+            Err(GuestPackageError::WrongArchitecture));
+        assert_eq!(verify_guest_manifest(&FakeVerifier, &anchors(), 7,
+            b"valid-test-manifest", &[0; 64], 2, 1, 1, 3),
+            Err(GuestPackageError::Downgrade));
+        assert_eq!(verify_guest_manifest(&FakeVerifier, &anchors(), 7,
+            b"", &[0; 64], 2, 1, 1, 1), Err(GuestPackageError::Malformed));
+    }
+}
