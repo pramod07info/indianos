@@ -13,6 +13,8 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - name: Run SHA verification regression tests
         run: python3 -m unittest discover -s tests -p test_verify_ci_sha.py -v
       - name: Verify checked-out commit identity
