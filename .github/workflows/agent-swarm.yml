@@ -1,9 +1,8 @@
 name: IndianOS Swarm - 10 Parallel Coding Agents
 
 on:
-  push:
-    branches: [main]
-    paths: [".github/workflows/agent-swarm.yml", "tools/agent_swarm.py"]
+  # Wait for the full kernel CI to pass on main before generating more code.
+  # A push trigger here causes duplicate runs for the same commit.
   workflow_run:
     workflows: ["IndianOS kernel boot (x86-64)"]
     types: [completed]
@@ -17,6 +16,12 @@ permissions:
   contents: write
   pull-requests: write
   actions: write
+
+# Exactly one swarm batch may be active at a time; its ten matrix jobs
+# still run concurrently. New triggers wait rather than interrupt workers.
+concurrency:
+  group: indianos-swarm-global
+  cancel-in-progress: false
 
 jobs:
   develop:
@@ -58,9 +63,6 @@ jobs:
           - agent: "10"
             branch: "agents/10-app-ai-planner"
             issue: 55
-    concurrency:
-      group: indianos-agent-${{ matrix.agent }}
-      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
         with:
