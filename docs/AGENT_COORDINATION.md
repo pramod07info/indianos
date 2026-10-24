@@ -1,8 +1,8 @@
 # IndianOS 10+1 multi-agent development workflow
 
-Baseline: main commit 5ada1fe (R031.6-R031.8), 2026-10-24.
-Latest existing R031.9 graphical Files integration is a separate WIP branch,
-so it must be assessed before allocating new overlapping work.
+Baseline: main commit 255e95c (R031.9 graphical Files integration), 2026-10-24.
+R031.9 has reached main, but complete main full-kernel CI may still be running.
+Avoid assigning R031.9 as a new unfinished task.
 
 ## Ten queued specialized workstreams
 
@@ -36,7 +36,7 @@ manual dispatch or every 30 minutes (GitHub schedules are best-effort).
   untrusted PR content using coordinator write privileges.
 - Require at least one changed file, size bounds, non-draft PR, successful
   exact-head full kernel QEMU CI, non-stale current main and a clean merge.
-- Require the coordinator-approved label AND an approving review by someone
+- Require the coordinator-approved label AND an approving review of the exact PR head SHA by someone
   other than the PR author. Automated policy is not a semantic security review.
 - Squash merge ONE approved PR at a time, then dispatch mandatory QEMU
   kernel CI for the new main SHA; do not merge further work until main green.

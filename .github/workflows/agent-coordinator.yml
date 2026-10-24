@@ -73,9 +73,10 @@ jobs:
                   owner,repo,pull_number:pr.number,per_page:100
                 });
                 const latest = new Map();
-                for (const r of reviews) latest.set(r.user.login, r.state);
-                const independentApproval = [...latest].some(([login,state]) =>
-                  login !== pr.user.login && state === 'APPROVED');
+                for (const r of reviews) latest.set(r.user.login, r);
+                const independentApproval = [...latest].some(([login,r]) =>
+                  login !== pr.user.login && r.state === 'APPROVED' &&
+                  r.commit_id === pr.head.sha);
                 if (!independentApproval) {
                   core.info('#' + pr.number + ': awaiting independent approving code review');
                   continue;
