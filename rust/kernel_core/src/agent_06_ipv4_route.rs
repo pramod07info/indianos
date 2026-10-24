@@ -48,3 +48,39 @@ mod tests {
         assert_eq!(lookup(&many, 0), Err(RouteError::TooMany));
     }
 }
+
+/// Validate an entire route table before it can be used by a network service.
+/// Duplicate prefix/network entries would otherwise depend on insertion order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RouteTableError { InvalidRoute(RouteError), Duplicate }
+pub fn validate_table(routes: &[Route]) -> Result<(), RouteTableError> {
+    lookup(routes, 0).map_err(RouteTableError::InvalidRoute)?;
+    for (i, route) in routes.iter().enumerate() {
+        for earlier in &routes[..i] {
+            if earlier.network == route.network && earlier.prefix == route.prefix {
+                return Err(RouteTableError::Duplicate);
+            }
+        }
+    }
+    Ok(())
+}
+#[cfg(test)]
+mod table_tests {
+    use super::*;
+    #[test]
+    fn accepts_overlapping_but_distinct_prefixes() {
+        let routes = [Route { network: 0, prefix: 0, next_hop: 1 },
+            Route { network: 0x0a00_0000, prefix: 8, next_hop: 2 }];
+        assert_eq!(validate_table(&routes), Ok(()));
+    }
+    #[test]
+    fn duplicate_route_is_rejected() {
+        let route = Route { network: 0, prefix: 0, next_hop: 1 };
+        assert_eq!(validate_table(&[route, route]), Err(RouteTableError::Duplicate));
+    }
+    #[test]
+    fn malformed_entries_are_rejected_before_lookup() {
+        assert_eq!(validate_table(&[Route { network: 2, prefix: 24, next_hop: 1 }]),
+            Err(RouteTableError::InvalidRoute(RouteError::UnalignedNetwork)));
+    }
+}
