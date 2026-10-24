@@ -1,0 +1,17 @@
+name: Temporary swarm workflow syntax validation
+on:
+  push:
+    branches: ["agents/swarm-bootstrap"]
+  workflow_dispatch:
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate new swarm YAML with actionlint
+        run: |
+          go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7 .github/workflows/agent-swarm.yml
+      - name: Validate swarm Python syntax and tests
+        run: |
+          python3 -m py_compile tools/agent_swarm.py
+          python3 -m unittest discover -s tests -p 'test_agent_swarm.py' -v
