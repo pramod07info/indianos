@@ -79,13 +79,13 @@ jobs:
         run: |
           set -euo pipefail
           OPEN="$(gh pr list --repo "$REPO" --head "$BRANCH" --state open --json number --jq 'length')"
-          if ${{ "$OPEN" != "0" }}; then
+          if [[ "$OPEN" != "0" ]]; then
             echo "Branch already has a PR; wait for coordinator."
             echo "ready=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           REMOTE="$(git ls-remote origin "refs/heads/$BRANCH" | awk '{print $1}')"
-          if ${{ -n "$REMOTE" }}; then
+          if [[ -n "$REMOTE" ]]; then
             git fetch origin "refs/heads/$BRANCH:refs/remotes/origin/swarm-target"
             if ! git merge-base --is-ancestor "$REMOTE" HEAD; then
               echo "::warning::Agent branch not safely fast-forwardable from main."
@@ -127,7 +127,7 @@ jobs:
           MODULE="$(python3 -c 'import sys;sys.path.insert(0,"tools");from agent_swarm import AGENTS;print(AGENTS[sys.argv[1]]["module"])' "$AGENT")"
           accepted=false
           for attempt in 1 2; do
-            if ${{ "$attempt" == 2 }}; then
+            if [[ "$attempt" == 2 ]]; then
               python3 tools/agent_swarm.py retry --agent "$AGENT" --file /tmp/swarm-prompt.txt
             fi
             timeout 900 /tmp/llama-build/bin/llama-completion \
@@ -142,7 +142,7 @@ jobs:
             git restore -- "rust/kernel_core/src/$MODULE.rs"
             echo "::warning::Agent $AGENT candidate rejected, attempt $attempt"
           done
-          if ${{ "$accepted" != true }}; then
+          if [[ "$accepted" != true ]]; then
             echo "::error::No valid code candidate. Do not publish."
             exit 1
           fi
@@ -176,7 +176,7 @@ jobs:
           git diff --cached --check
           git commit -m "Agent $AGENT: validated $MODULE helper (refs #$ISSUE)"
           CURRENT="$(gh api "repos/$REPO/branches/main" --jq .commit.sha)"
-          ${{ "$CURRENT" == "$(git rev-parse HEAD^)" }} || {
+          [[ "$CURRENT" == "$(git rev-parse HEAD^)" ]] || {
             echo "::error::main advanced; regenerate on fresh base rather than merge stale changes"
             exit 1
           }
