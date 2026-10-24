@@ -49,3 +49,41 @@ mod tests {
         assert_eq!(clip_owned(r(1279,0,2,1),r(0,0,1,1),1,1), Err(RectError::OutsideScreen));
     }
 }
+
+/// Move an already valid surface within the screen. A caller cannot move a
+/// foreign surface or overflow signed/unsigned coordinates.
+pub fn move_owned(surface: Rectangle, dx: i32, dy: i32, owner: u32, caller: u32)
+    -> Result<Rectangle, RectError>
+{
+    if owner == 0 || owner != caller { return Err(RectError::InvalidOwner); }
+    edges(surface)?;
+    let x = i64::from(surface.x) + i64::from(dx);
+    let y = i64::from(surface.y) + i64::from(dy);
+    if x < 0 || y < 0 || x > i64::from(SCREEN_WIDTH) || y > i64::from(SCREEN_HEIGHT) {
+        return Err(RectError::OutsideScreen);
+    }
+    let moved = Rectangle { x: x as u32, y: y as u32, ..surface };
+    edges(moved)?;
+    Ok(moved)
+}
+#[cfg(test)]
+mod motion_tests {
+    use super::*;
+    fn window() -> Rectangle {
+        Rectangle { x: 50, y: 25, width: 100, height: 50 }
+    }
+    #[test]
+    fn moves_window_only_within_screen() {
+        assert_eq!(move_owned(window(), 10, -5, 1, 1).unwrap().x, 60);
+        assert_eq!(move_owned(window(), 10, -5, 1, 1).unwrap().y, 20);
+    }
+    #[test]
+    fn rejects_outside_or_overflow_attempts() {
+        assert_eq!(move_owned(window(), -51, 0, 1, 1), Err(RectError::OutsideScreen));
+        assert_eq!(move_owned(window(), i32::MAX, 0, 1, 1), Err(RectError::OutsideScreen));
+    }
+    #[test]
+    fn foreign_pid_cannot_move_surface() {
+        assert_eq!(move_owned(window(), 1, 1, 4, 5), Err(RectError::InvalidOwner));
+    }
+}
