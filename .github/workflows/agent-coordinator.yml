@@ -1,0 +1,122 @@
+name: IndianOS Coordinator - Agent PR Review and Merge
+
+on:
+  pull_request_target:
+    branches: [main]
+    types: [opened, reopened, synchronize, ready_for_review, labeled]
+  workflow_run:
+    workflows: ["IndianOS kernel boot (x86-64)"]
+    types: [completed]
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+# Trusted base-branch workflow only. NEVER check out or execute PR code here.
+# Approval label + independent review + green full CI + fresh main gate.
+permissions:
+  actions: write
+  contents: write
+  pull-requests: write
+  issues: read
+
+concurrency:
+  group: indianos-coordinator-main
+  cancel-in-progress: false
+
+jobs:
+  coordinate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Inspect queued agent PRs and merge only fully reviewed changes
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const { owner, repo } = context.repo;
+            const owned = ref => /^agents\/(?:0[1-9]|10)-[a-z0-9-]+$/.test(ref) ||
+                                   /^agents\/legacy-x-[a-z0-9_-]+$/.test(ref);
+            const prs = await github.paginate(github.rest.pulls.list, {
+              owner, repo, state: 'open', base: 'main', per_page: 100
+            });
+            const branch = await github.rest.repos.getBranch({owner, repo, branch: 'main'});
+            const mainSHA = branch.data.commit.sha;
+            const allRuns = await github.paginate(github.rest.actions.listWorkflowRunsForRepo, {
+              owner, repo, head_sha: mainSHA, per_page: 100
+            });
+            const mainGreen = allRuns.some(run =>
+              run.name === 'IndianOS kernel boot (x86-64)' && run.conclusion === 'success');
+            if (!mainGreen) {
+              core.warning('Current main has no verified full-kernel green run. Block all merges.');
+              return;
+            }
+            for (const pr of prs) {
+              const ref = pr.head.ref;
+              if (!owned(ref) || pr.head.repo?.full_name !== context.repo.owner + '/' + repo) continue;
+              if (pr.draft) { core.info('#' + pr.number + ': draft'); continue; }
+              try {
+                const files = await github.paginate(github.rest.pulls.listFiles, {
+                  owner, repo, pull_number: pr.number, per_page: 100
+                });
+                const privileged = files.some(f => f.filename.startsWith('.github/') ||
+                  f.filename.startsWith('boot/') || f.filename.includes('.env'));
+                // Workflow, boot and credential changes always require an explicitly reviewed approval.
+                const changeSafe = files.length > 0 && files.length <= 50 &&
+                  files.every(f => (f.changes ?? 0) <= 3000 && f.status !== 'removed');
+                if (!changeSafe) {
+                  core.warning('#' + pr.number + ': change size or deletion policy review required');
+                  continue;
+                }
+                const approvalLabel = pr.labels.some(l => l.name === 'coordinator-approved');
+                if (!approvalLabel) {core.info('#' + pr.number + ': needs coordinator approval label');continue;}
+                const reviews = await github.paginate(github.rest.pulls.listReviews,{
+                  owner,repo,pull_number:pr.number,per_page:100
+                });
+                const latest = new Map();
+                for (const r of reviews) latest.set(r.user.login, r.state);
+                const independentApproval = [...latest].some(([login,state]) =>
+                  login !== pr.user.login && state === 'APPROVED');
+                if (!independentApproval) {
+                  core.info('#' + pr.number + ': awaiting independent approving code review');
+                  continue;
+                }
+                if (privileged) core.notice('#' + pr.number + ': privileged files included, independently approved');
+                const checks = await github.paginate(github.rest.actions.listWorkflowRunsForRepo,{
+                  owner,repo,head_sha:pr.head.sha,per_page:100
+                });
+                const ciPassed = checks.some(run =>
+                  run.name === 'IndianOS kernel boot (x86-64)' &&
+                  ['pull_request','workflow_dispatch'].includes(run.event) &&
+                  run.conclusion === 'success' && run.head_sha === pr.head.sha);
+                if (!ciPassed) {
+                  core.info('#' + pr.number + ': full-kernel QEMU CI not green for exact head SHA');
+                  continue;
+                }
+                const livePR = (await github.rest.pulls.get({
+                  owner,repo,pull_number:pr.number
+                })).data;
+                if (livePR.head.sha !== pr.head.sha || livePR.base.sha !== mainSHA ||
+                    livePR.mergeable !== true) {
+                  core.info('#' + pr.number + ': PR stale, conflicting or mergeability pending');
+                  continue;
+                }
+                const cmp = (await github.rest.repos.compareCommits({
+                  owner,repo,base:'main',head:pr.head.sha
+                })).data;
+                if (cmp.merge_base_commit.sha !== mainSHA) {
+                  core.info('#' + pr.number + ': rebase onto current main and rerun CI first');
+                  continue;
+                }
+                await github.rest.pulls.merge({
+                  owner,repo,pull_number:pr.number,sha:pr.head.sha,merge_method:'squash',
+                  commit_title:'Coordinator: merge verified agent PR #' + pr.number
+                });
+                core.notice('Merged verified agent PR #' + pr.number + '; run complete CI on new main');
+                await github.rest.actions.createWorkflowDispatch({
+                  owner,repo,workflow_id:'kernel-boot.yml',ref:'main'
+                });
+                break; // One change at a time; wait for main full CI before next merge.
+              } catch (err) {
+                core.warning('#' + pr.number + ': gate failed: ' + err.message);
+              }
+            }
