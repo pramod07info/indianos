@@ -48,6 +48,8 @@ on:
       - ".github/workflows/agent-x-autodev.yml"
       - "tools/agent_x_autodev.py"
       - "tests/test_agent_x_autodev.py"
+  pull_request:
+    branches: [main]
   workflow_dispatch:
     inputs:
       run_shadow_switch:
