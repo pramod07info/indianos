@@ -1,0 +1,34 @@
+name: IndianOS Swarm - Workflow and Generator Checks
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/agent-swarm.yml"
+      - ".github/workflows/agent-swarm-checks.yml"
+      - "tools/agent_swarm.py"
+      - "tests/test_agent_swarm.py"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/agent-swarm.yml"
+      - ".github/workflows/agent-swarm-checks.yml"
+      - "tools/agent_swarm.py"
+      - "tests/test_agent_swarm.py"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - name: Lint coding-runner GitHub Actions workflow
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7 .github/workflows/agent-swarm.yml .github/workflows/agent-swarm-checks.yml
+      - name: Check bounded model-output validator syntax
+        run: python3 -m py_compile tools/agent_swarm.py
+      - name: Run focused prompt, retry and source-policy tests
+        run: python3 -m unittest discover -s tests -p 'test_agent_swarm.py' -v
