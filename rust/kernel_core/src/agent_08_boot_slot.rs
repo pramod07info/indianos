@@ -86,3 +86,74 @@ mod attempt_tests {
         assert_eq!(slots[0].attempts_remaining, 2);
     }
 }
+
+
+/// Versioned, corruption-detecting A/B slot metadata record. The caller must
+/// write and flush it transactionally on a disposable image; this codec never
+/// writes firmware or physical storage. CRC32 detects damage, not forgery.
+pub const SLOT_RECORD_BYTES: usize = 32;
+fn crc32(data: &[u8]) -> u32 {
+    let mut state = !0u32;
+    for &byte in data {
+        state ^= byte as u32;
+        for _ in 0..8 {
+            state = (state >> 1) ^ (if state & 1 != 0 { 0xedb8_8320 } else { 0 });
+        }
+    }
+    !state
+}
+pub fn encode_slot(slot: Slot) -> Option<[u8; SLOT_RECORD_BYTES]> {
+    if !slot.valid_metadata || slot.version == 0 { return None; }
+    let mut data = [0u8; SLOT_RECORD_BYTES];
+    data[..4].copy_from_slice(b"IAB1");
+    data[4..12].copy_from_slice(&slot.version.to_le_bytes());
+    data[12] = slot.attempts_remaining;
+    data[13] = u8::from(slot.committed);
+    let checksum = crc32(&data[..28]);
+    data[28..32].copy_from_slice(&checksum.to_le_bytes());
+    Some(data)
+}
+pub fn decode_slot(data: &[u8; SLOT_RECORD_BYTES]) -> Option<Slot> {
+    if &data[..4] != b"IAB1" || data[13] > 1 ||
+        data[14..28].iter().any(|&byte| byte != 0) {
+        return None;
+    }
+    let stored = u32::from_le_bytes(data[28..32].try_into().ok()?);
+    if crc32(&data[..28]) != stored { return None; }
+    let version = u64::from_le_bytes(data[4..12].try_into().ok()?);
+    if version == 0 { return None; }
+    Some(Slot {
+        valid_metadata: true, committed: data[13] == 1,
+        version, attempts_remaining: data[12],
+    })
+}
+#[cfg(test)]
+mod slot_codec_tests {
+    use super::*;
+    fn slot(version: u64, attempts: u8) -> Slot {
+        Slot { valid_metadata: true, committed: true, version, attempts_remaining: attempts }
+    }
+    #[test]
+    fn committed_slot_survives_serialization_without_writes() {
+        let raw = encode_slot(slot(101, 2)).unwrap();
+        assert_eq!(decode_slot(&raw), Some(slot(101, 2)));
+    }
+    #[test]
+    fn torn_metadata_and_reserved_bit_corruption_are_rejected() {
+        let mut raw = encode_slot(slot(101, 2)).unwrap();
+        raw[12] ^= 1;
+        assert_eq!(decode_slot(&raw), None);
+        let mut raw = encode_slot(slot(101, 2)).unwrap();
+        raw[18] = 1;
+        assert_eq!(decode_slot(&raw), None);
+    }
+    #[test]
+    fn interrupted_update_falls_back_to_previous_slot() {
+        let old = decode_slot(&encode_slot(slot(10, 2)).unwrap()).unwrap();
+        let mut candidate = slot(11, 1);
+        candidate.committed = false;
+        let new = decode_slot(&encode_slot(candidate).unwrap()).unwrap();
+        assert_eq!(select_slot(&[old, new], 10), Ok(0));
+        assert_eq!(select_slot(&[old, new], 12), Err(BootError::NoBootableSlot));
+    }
+}

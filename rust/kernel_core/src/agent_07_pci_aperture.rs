@@ -89,3 +89,70 @@ mod set_tests {
             Err(SetError::Invalid(ApertureError::Empty)));
     }
 }
+
+
+/// Decode read-only PCI configuration bytes supplied by a trusted enumerator.
+/// This routine never performs IN/OUT instructions, maps BARs or enables DMA.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeviceInfo {
+    pub vendor: u16, pub device: u16, pub class: u8,
+    pub subclass: u8, pub programming_interface: u8, pub header_type: u8,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfigError { TooShort, Absent, InvalidHeader, NotStorage }
+
+pub fn decode_config(header: &[u8]) -> Result<DeviceInfo, ConfigError> {
+    if header.len() < 16 { return Err(ConfigError::TooShort); }
+    let vendor = u16::from_le_bytes([header[0], header[1]]);
+    let device = u16::from_le_bytes([header[2], header[3]]);
+    if vendor == 0xffff || vendor == 0 || device == 0xffff { return Err(ConfigError::Absent); }
+    let header_type = header[14] & 0x7f;
+    if header_type > 1 { return Err(ConfigError::InvalidHeader); }
+    Ok(DeviceInfo {
+        vendor, device, programming_interface: header[9],
+        subclass: header[10], class: header[11], header_type,
+    })
+}
+
+/// Restrict experimental disk drivers to recognized controller classes.
+/// AHCI/NVMe require separate audited drivers; reporting is not activation.
+pub fn storage_controller(header: &[u8]) -> Result<DeviceInfo, ConfigError> {
+    let info = decode_config(header)?;
+    if info.class != 0x01 || !matches!(info.subclass, 0x01 | 0x06 | 0x08) {
+        return Err(ConfigError::NotStorage);
+    }
+    Ok(info)
+}
+#[cfg(test)]
+mod pci_discovery_tests {
+    use super::*;
+    fn header(class: u8, subclass: u8) -> [u8; 16] {
+        let mut h = [0; 16];
+        h[0..2].copy_from_slice(&0x8086u16.to_le_bytes());
+        h[2..4].copy_from_slice(&0x2922u16.to_le_bytes());
+        h[11] = class; h[10] = subclass; h
+    }
+    #[test]
+    fn recognizes_storage_class_without_enabling_hardware() {
+        let ide = storage_controller(&header(1, 1)).unwrap();
+        assert_eq!((ide.vendor, ide.class, ide.subclass), (0x8086, 1, 1));
+        assert_eq!(storage_controller(&header(1, 6)).unwrap().subclass, 6);
+        assert_eq!(storage_controller(&header(1, 8)).unwrap().subclass, 8);
+    }
+    #[test]
+    fn rejects_network_devices_missing_and_truncated_headers() {
+        assert_eq!(storage_controller(&header(2, 0)), Err(ConfigError::NotStorage));
+        assert_eq!(decode_config(&[0; 4]), Err(ConfigError::TooShort));
+        assert_eq!(decode_config(&[0xff; 16]), Err(ConfigError::Absent));
+    }
+    #[test]
+    fn rejects_invalid_header_and_no_device() {
+        let mut h = header(1, 1);
+        h[14] = 0x82; // multifunction bit is legal; type 2 is not
+        assert_eq!(decode_config(&h), Err(ConfigError::InvalidHeader));
+        h[14] = 0x80;
+        assert_eq!(decode_config(&h).unwrap().header_type, 0);
+        h[0..2].copy_from_slice(&0u16.to_le_bytes());
+        assert_eq!(decode_config(&h), Err(ConfigError::Absent));
+    }
+}

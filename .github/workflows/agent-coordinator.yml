@@ -45,7 +45,11 @@ jobs:
               owner, repo, head_sha: mainSHA, per_page: 100
             });
             const mainGreen = allRuns.some(run =>
-              run.name === 'IndianOS kernel boot (x86-64)' && run.conclusion === 'success');
+              run.name === 'IndianOS kernel boot (x86-64)' &&
+              run.head_sha === mainSHA &&
+              run.head_branch === 'main' &&
+              ['push','workflow_dispatch'].includes(run.event) &&
+              run.status === 'completed' && run.conclusion === 'success');
             if (!mainGreen) {
               core.warning('Current main has no verified full-kernel green run. Block all merges.');
               return;
@@ -107,10 +111,18 @@ jobs:
                 const checks = await github.paginate(github.rest.actions.listWorkflowRunsForRepo,{
                   owner,repo,head_sha:pr.head.sha,per_page:100
                 });
-                const ciPassed = checks.some(run =>
+                // Evaluate the newest exact-head kernel run, not an earlier
+                // success that may have been superseded by a failed rerun.
+                // Ignore unrelated workflows, stale SHAs and untrusted repos.
+                const relevant = checks.filter(run =>
                   run.name === 'IndianOS kernel boot (x86-64)' &&
                   ['pull_request','workflow_dispatch'].includes(run.event) &&
-                  run.conclusion === 'success' && run.head_sha === pr.head.sha);
+                  run.head_sha === pr.head.sha &&
+                  run.head_repository?.full_name === owner + '/' + repo
+                ).sort((a,b) => new Date(b.created_at) - new Date(a.created_at));
+                const newest = relevant[0];
+                const ciPassed = newest?.status === 'completed' &&
+                  newest.conclusion === 'success';
                 if (!ciPassed) {
                   core.info('#' + pr.number + ': full-kernel QEMU CI not green for exact head SHA');
                   continue;
