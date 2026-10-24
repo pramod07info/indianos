@@ -1,0 +1,40 @@
+name: R031.4 atomic directory rename integration
+on:
+  push:
+    branches: [main, agentx-r0314-directory-rename-20261024, agentx-r0314-verified-20261024]
+    paths:
+      - 'rust/kernel_core/src/durablefs.rs'
+      - 'rust/kernel_core/src/hier_vfs.rs'
+      - 'rust/kernel_core/src/syscall.rs'
+      - 'rust/kernel_core/src/user_runtime.rs'
+      - 'userland/rust/src/main.rs'
+      - '.github/workflows/r0314-directory-tree.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  r0314-directory-tree:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install QEMU, UEFI and linker dependencies
+        run: |
+          sudo timeout 120s apt-get update -o Acquire::Retries=0 -o Acquire::http::Timeout=30
+          sudo timeout 120s apt-get install -y clang lld binutils xorriso qemu-system-x86 ovmf curl openssl
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
+      - name: Rust directory-rename regression and source audit
+        run: |
+          cargo test --offline --manifest-path rust/kernel_core/Cargo.toml --features test-r031-vfs
+          make test-rust-host-abi
+          make test-rust-source-audit
+      - name: Four QEMU boots, torn metadata and real ring3 directory move
+        run: |
+          OVMF_PATH=""
+          for path in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/edk2/ovmf/OVMF_CODE_4M.fd /usr/share/edk2/ovmf/OVMF_CODE.fd; do
+            if test -f "$path"; then OVMF_PATH="$path"; break; fi
+          done
+          test -n "$OVMF_PATH"
+          make test-r031-vfs-qemu OVMF_CODE="$OVMF_PATH"

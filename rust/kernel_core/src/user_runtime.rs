@@ -581,7 +581,7 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
    if (n1<2 && !(request.arg0==8 && n1==1 && desc[0]==b'/')) ||
       desc[n1..24].iter().any(|&b|b!=0){return BAD;}
    let Ok(path)=core::str::from_utf8(&desc[..n1])else{return BAD;};
-   let target=if request.arg0==7{
+   let target=if matches!(request.arg0,7|9){
     let Some(n2)=desc[24..48].iter().position(|&b|b==0)else{return BAD;};
     if n2<2||desc[24+n2..48].iter().any(|&b|b!=0){return BAD;}
     let Ok(name)=core::str::from_utf8(&desc[24..24+n2])else{return BAD;};
@@ -615,7 +615,7 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
      }
      n as u64
     }
-    1|2|6|7=>{
+    1|2|6|7|9=>{
      if address!=0||length!=0{return BAD;}
      crate::hier_vfs::operation(request.arg0,path,target,&mut data,0)
          .map(|_|0).unwrap_or(BAD)
