@@ -46,5 +46,25 @@ mod tests {
     def test_preapproved_slots_are_ten(self):
         self.assertEqual(set(m.AGENTS), {f"{i:02d}" for i in range(1, 11)})
 
+class SwarmRepairTests(unittest.TestCase):
+    def test_retry_includes_bounded_diagnostics(self):
+        bad = "error: wrong type\nFAILED unexpected assertion\n" + ("noise\n" * 2000)
+        txt = m.prompt("01", retry=True, feedback=bad)
+        self.assertIn("error: wrong type", txt)
+        self.assertIn("UNTRUSTED", txt)
+        self.assertLess(len(m.summarize_feedback(bad)), 2600)
+
+    def test_parser_rejects_wrong_marker_or_privileged_module(self):
+        good = m.START + "\n" + (
+            "pub fn value()->u8{0}\n#[cfg(test)] mod tests {\n" +
+            "#[test] fn a() {}\n#[test] fn b() {}\n#[test] fn c() {}\n"
+            "}"
+        ) + "\n" + m.END
+        with self.assertRaises(ValueError):
+            m.parse(good.replace("pub fn", "unsafe pub fn"), "02")
+        with self.assertRaises(ValueError):
+            m.parse(good.replace(m.END, ""), "02")
+
+
 if __name__ == "__main__":
     unittest.main()

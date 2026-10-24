@@ -107,6 +107,16 @@ jobs:
         with:
           targets: x86_64-unknown-none
 
+      - name: Install native kernel linker tools
+        if: steps.gate.outputs.ready == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y clang lld binutils
+          command -v ld
+          command -v ld.lld
+
       - name: Build offline coding-model runner
         if: steps.gate.outputs.ready == 'true'
         shell: bash
@@ -126,18 +136,33 @@ jobs:
           set -euo pipefail
           MODULE="$(python3 -c 'import sys;sys.path.insert(0,"tools");from agent_swarm import AGENTS;print(AGENTS[sys.argv[1]]["module"])' "$AGENT")"
           accepted=false
-          for attempt in 1 2; do
-            if [[ "$attempt" == 2 ]]; then
-              python3 tools/agent_swarm.py retry --agent "$AGENT" --file /tmp/swarm-prompt.txt
+          printf 'First generation: follow the strict Rust contract.\n' > /tmp/swarm-feedback.txt
+          for attempt in 1 2 3; do
+            if [[ "$attempt" -gt 1 ]]; then
+              python3 tools/agent_swarm.py retry --agent "$AGENT" \
+                --file /tmp/swarm-prompt.txt --feedback /tmp/swarm-feedback.txt
             fi
+            # Disable auto-chat/interactive prompt conversion; emit only
+            # one marked Rust source response. The stronger 3B local model
+            # remains isolated from all credentials and write permissions.
             timeout 900 /tmp/llama-build/bin/llama-completion \
-              -hf bartowski/Qwen2.5-Coder-1.5B-Instruct-GGUF:Q4_K_M \
-              -f /tmp/swarm-prompt.txt -n 2800 -c 8192 --temp 0.1 \
-              --no-display-prompt > /tmp/swarm-generated.txt
-            if python3 tools/agent_swarm.py apply --agent "$AGENT" --file /tmp/swarm-generated.txt && \
-               cargo test --offline --manifest-path rust/kernel_core/Cargo.toml; then
-              accepted=true
-              break
+              -hf bartowski/Qwen2.5-Coder-3B-Instruct-GGUF:Q4_K_M \
+              -f /tmp/swarm-prompt.txt -n 3600 -c 8192 --temp 0.1 \
+              -no-cnv --no-display-prompt > /tmp/swarm-generated.txt
+            if python3 tools/agent_swarm.py apply --agent "$AGENT" \
+                --file /tmp/swarm-generated.txt > /tmp/swarm-parser.log 2>&1; then
+              if cargo test --offline --manifest-path rust/kernel_core/Cargo.toml \
+                  > /tmp/swarm-tests.log 2>&1; then
+                cat /tmp/swarm-parser.log
+                tail -n 6 /tmp/swarm-tests.log
+                accepted=true
+                break
+              fi
+              tail -n 70 /tmp/swarm-tests.log
+              cp /tmp/swarm-tests.log /tmp/swarm-feedback.txt
+            else
+              cat /tmp/swarm-parser.log
+              cp /tmp/swarm-parser.log /tmp/swarm-feedback.txt
             fi
             git restore -- "rust/kernel_core/src/$MODULE.rs"
             echo "::warning::Agent $AGENT candidate rejected, attempt $attempt"
