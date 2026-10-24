@@ -189,3 +189,125 @@ mod tests {
         assert_eq!(registry.grant(1, 1, 1), Err(CapabilityError::TokenExhausted));
     }
 }
+
+
+/// Generation-bound capability ticket for a single authenticated process
+/// incarnation. This prepares IPC restart checks; the scheduler must provide
+/// actual PID/generation, not syscall arguments from userspace.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EpochTicket { pub token: u64, pub pid: u32, pub generation: u64 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EpochError {
+    InvalidPid, AlreadyActive, NotActive, Full, Exhausted, Denied, Registry(CapabilityError),
+}
+#[derive(Clone, Copy)]
+struct ProcessEpoch { pid: u32, generation: u64, active: bool }
+
+pub struct EpochRegistry<const N: usize> {
+    epochs: [Option<ProcessEpoch>; N],
+    grants: Registry<N>,
+}
+impl<const N: usize> EpochRegistry<N> {
+    pub const fn new() -> Self {
+        Self { epochs: [None; N], grants: Registry::new() }
+    }
+    fn process(&self, pid: u32) -> Option<ProcessEpoch> {
+        self.epochs.iter().flatten().copied().find(|entry| entry.pid == pid)
+    }
+    pub fn start(&mut self, pid: u32) -> Result<u64, EpochError> {
+        if pid == 0 { return Err(EpochError::InvalidPid); }
+        if let Some(entry) = self.epochs.iter_mut().flatten().find(|e| e.pid == pid) {
+            if entry.active { return Err(EpochError::AlreadyActive); }
+            entry.generation = entry.generation.checked_add(1).ok_or(EpochError::Exhausted)?;
+            entry.active = true;
+            return Ok(entry.generation);
+        }
+        let slot = self.epochs.iter_mut().find(|e| e.is_none()).ok_or(EpochError::Full)?;
+        *slot = Some(ProcessEpoch { pid, generation: 1, active: true });
+        Ok(1)
+    }
+
+    pub fn grant(&mut self, pid: u32, resource: u64, rights: u32)
+        -> Result<EpochTicket, EpochError>
+    {
+        let epoch = self.process(pid).filter(|e| e.active).ok_or(EpochError::NotActive)?;
+        let token = self.grants.grant(pid, resource, rights).map_err(EpochError::Registry)?;
+        Ok(EpochTicket { token, pid, generation: epoch.generation })
+    }
+
+    pub fn authorize(&self, authenticated_pid: u32, authenticated_generation: u64,
+                     ticket: EpochTicket, resource: u64, rights: u32)
+        -> Result<(), EpochError>
+    {
+        let epoch = self.process(authenticated_pid).ok_or(EpochError::NotActive)?;
+        if !epoch.active || epoch.generation != authenticated_generation {
+            return Err(EpochError::NotActive);
+        }
+        if ticket.pid != authenticated_pid || ticket.generation != epoch.generation {
+            return Err(EpochError::Denied);
+        }
+        self.grants.authorize(authenticated_pid, ticket.token, resource, rights)
+            .map_err(EpochError::Registry)
+    }
+
+    /// Process fault/exit: revoke all tickets *before* any PID can restart.
+    pub fn retire(&mut self, authenticated_pid: u32, authenticated_generation: u64)
+        -> Result<usize, EpochError>
+    {
+        let entry = self.epochs.iter_mut().flatten()
+            .find(|e| e.pid == authenticated_pid && e.active &&
+                e.generation == authenticated_generation)
+            .ok_or(EpochError::NotActive)?;
+        entry.active = false;
+        Ok(self.grants.revoke_all(authenticated_pid))
+    }
+}
+#[cfg(test)]
+mod generation_tests {
+    use super::*;
+    #[test]
+    fn pid_reuse_invalidates_original_grants() {
+        let mut r = EpochRegistry::<4>::new();
+        let gen1 = r.start(10).unwrap();
+        let old = r.grant(10, 500, 3).unwrap();
+        assert_eq!(r.authorize(10, gen1, old, 500, 1), Ok(()));
+        assert_eq!(r.retire(10, gen1), Ok(1));
+        let gen2 = r.start(10).unwrap();
+        assert_ne!(gen1, gen2);
+        assert_eq!(r.authorize(10, gen2, old, 500, 1), Err(EpochError::Denied));
+        let fresh = r.grant(10, 500, 1).unwrap();
+        assert_ne!(old.token, fresh.token);
+        assert_eq!(r.authorize(10, gen2, fresh, 500, 1), Ok(()));
+    }
+    #[test]
+    fn wrong_pid_or_generation_cannot_spoof_owner() {
+        let mut r = EpochRegistry::<3>::new();
+        r.start(4).unwrap(); r.start(5).unwrap();
+        let token = r.grant(4, 90, 1).unwrap();
+        assert_eq!(r.authorize(5, 1, token, 90, 1), Err(EpochError::Denied));
+        assert_eq!(r.authorize(4, 99, token, 90, 1), Err(EpochError::NotActive));
+        assert_eq!(r.authorize(4, 1, token, 91, 1),
+            Err(EpochError::Registry(CapabilityError::Denied)));
+    }
+    #[test]
+    fn retirement_is_exact_and_does_not_clear_peer_grants() {
+        let mut r = EpochRegistry::<4>::new();
+        r.start(1).unwrap(); r.start(2).unwrap();
+        let a = r.grant(1, 1, 1).unwrap();
+        let b = r.grant(2, 2, 1).unwrap();
+        assert_eq!(r.retire(1, 99), Err(EpochError::NotActive));
+        assert_eq!(r.retire(1, 1), Ok(1));
+        assert_eq!(r.retire(1, 1), Err(EpochError::NotActive));
+        assert_eq!(r.authorize(1, 1, a, 1, 1), Err(EpochError::NotActive));
+        assert_eq!(r.authorize(2, 1, b, 2, 1), Ok(()));
+    }
+    #[test]
+    fn zero_pid_duplicate_and_capacity_are_denied() {
+        let mut r = EpochRegistry::<1>::new();
+        assert_eq!(r.start(0), Err(EpochError::InvalidPid));
+        assert_eq!(r.start(1), Ok(1));
+        assert_eq!(r.start(1), Err(EpochError::AlreadyActive));
+        assert_eq!(r.start(2), Err(EpochError::Full));
+    }
+}

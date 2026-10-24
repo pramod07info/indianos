@@ -1,6 +1,13 @@
 name: Offline app planner checks
 
 on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "tools/app_resolution.py"
+      - "examples/**"
+      - "tests/**"
+      - ".github/workflows/app-planner-tests.yml"
   push:
     branches: [main]
     paths:

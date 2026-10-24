@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
-from app_resolution import plan_app  # noqa: E402
+from app_resolution import plan_app, plan_dependencies  # noqa: E402
 
 
 class AppResolutionTests(unittest.TestCase):
@@ -72,6 +72,68 @@ class AppResolutionTests(unittest.TestCase):
         result = plan_app(self.catalog, self.device, "Editor")
         self.assertNotIn("command", str(result).lower())
         self.assertTrue(all(c["user_approval_required"] for c in result["choices"]))
+
+
+class DependencyPlanTests(unittest.TestCase):
+    def setUp(self):
+        self.device = {"cpu_arch": "x86_64"}
+        self.apps = [
+            {"name": "App", "catalog_trusted": True, "manifest_signed": True,
+             "architectures": ["x86_64"], "dependencies": ["Codec", "Library"],
+             "permissions": ["screen"]},
+            {"name": "Codec", "catalog_trusted": True, "manifest_signed": True,
+             "dependencies": ["Library"], "permissions": ["audio"]},
+            {"name": "Library", "catalog_trusted": True, "manifest_signed": True,
+             "permissions": []},
+        ]
+
+    def plan(self, permissions=("audio", "screen")):
+        return plan_dependencies({"apps": self.apps}, self.device, "App", permissions)
+
+    def test_deterministic_topological_plan_without_duplicate_dependency(self):
+        result = self.plan()
+        self.assertEqual(result["status"], "plan_only")
+        self.assertEqual(result["packages"], ["Library", "Codec", "App"])
+        self.assertEqual(result["permissions"], ["audio", "screen"])
+        self.assertFalse(result["installable"])
+        self.assertNotIn("command", str(result).lower())
+
+    def test_dependency_cycle_denied_without_partial_plan(self):
+        self.apps[2]["dependencies"] = ["App"]
+        result = self.plan()
+        self.assertEqual(result["status"], "blocked")
+        self.assertIn("cycle", result["reason"])
+        self.assertEqual(result["packages"], [])
+
+    def test_unknown_and_unsigned_dependency_denied(self):
+        self.apps[1]["dependencies"] = ["Missing"]
+        self.assertIn("unknown dependency", self.plan()["reason"])
+        self.apps[1]["dependencies"] = ["Library"]
+        self.apps[2]["manifest_signed"] = False
+        self.assertIn("unsigned", self.plan()["reason"])
+
+    def test_transitive_permission_requires_approval(self):
+        result = self.plan(("screen",))
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["permissions"], ["audio", "screen"])
+        self.assertFalse(result["installable"])
+
+    def test_architecture_mismatch_is_blocked(self):
+        self.apps[2]["architectures"] = ["aarch64"]
+        self.assertIn("architecture mismatch", self.plan()["reason"])
+
+    def test_duplicate_catalog_identity_and_invalid_limits_fail_closed(self):
+        self.apps.append({"name": "app"})
+        with self.assertRaises(ValueError):
+            self.plan()
+        self.apps.pop()
+        with self.assertRaises(ValueError):
+            plan_dependencies({"apps": self.apps * 12}, self.device, "App")
+
+    def test_sorted_dependency_order_is_independent_of_catalog_order(self):
+        original = self.plan()
+        self.apps.reverse()
+        self.assertEqual(original["packages"], self.plan()["packages"])
 
 
 if __name__ == "__main__":
