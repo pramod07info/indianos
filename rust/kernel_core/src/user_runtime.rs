@@ -714,6 +714,30 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
    }
    n
   },
+  #[cfg(feature="test-r031-files-gui")]
+  34=>{
+   if request.arg0!=1||authenticated_file_pid()!=Some(2){return BAD;}
+   // READ-ONLY directory enumeration is limited to /shared.
+   // PID2 never gains general traversal, mutation or a private path.
+   let mut desc=[0u8;64];
+   if !unsafe{indianos_user_copy_readonly(img,request.arg1,
+             desc.as_mut_ptr().cast(),desc.len())}{return BAD;}
+   if &desc[..8]!=b"/shared\0" ||
+      desc[8..48].iter().any(|&b|b!=0){return BAD;}
+   let address=u64::from_le_bytes(desc[48..56].try_into().unwrap());
+   let requested=u64::from_le_bytes(desc[56..64].try_into().unwrap());
+   if requested==0||requested>72 ||
+      !unsafe{indianos_user_can_write(&*img,address,requested as usize)}{
+    return BAD;
+   }
+   let mut data=[0u8;72];
+   let Ok(n)=crate::hier_vfs::operation(8,"/shared","",&mut data,0)
+     else{return BAD;};
+   if n>requested as usize{return BAD;}
+   if n>0 && !unsafe{indianos_user_copy_writable(
+                &*img,address,data.as_ptr(),n)}{return BAD;}
+   n as u64
+  },
   #[cfg(feature="test-r030-ondevice")]
   31=>{
    if !authenticated_r026_init(){return BAD;}
@@ -1121,7 +1145,7 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
   unsafe{R025_SERVICES=Some(svc);}
   log(b"IndianOS: R025 capability and isolated file services ready\n\0");
  }
- #[cfg(feature="test-r026")]
+ #[cfg(all(feature="test-r026",not(feature="test-r031-files-gui")))]
  {
   // Both ELF images have isolated mappings, but PID2 is not eligible
   // for dispatch until the init shell authorizes its launch.
@@ -1284,7 +1308,7 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
      scheduler.tick_count!=4{ok=false;}
   if ok{log(b"IndianOS: M009 round-robin cooperative switching PASSED\n\0");}
  }
- #[cfg(feature="test-r026")]
+ #[cfg(all(feature="test-r026",not(feature="test-r031-files-gui")))]
  {
   if !unsafe{R026_WORKER_REQUESTED && R026_WORKER_REAPED} ||
      scheduler.dispatch_count<3 || scheduler.yield_count<1 ||

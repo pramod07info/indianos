@@ -380,7 +380,12 @@ impl UserSurfaceService{
                   else if cfg!(feature="test-r029-desktop-suite"){5}else{2};
         if self.frame_state(pid).is_none() ||
            !matches!(front,1|2) ||
-           self.counts!=[2,2] ||
+           !(if cfg!(feature="test-r031-files-gui"){
+               // PID2's protected Files client may submit 3 initial
+               // entries and 2 refresh operations, but never exceed the
+               // same bounded command backing store.
+               (5..=7).contains(&self.counts[0])&&self.counts[1]==2
+           }else{self.counts==[2,2]}) ||
            self.frames_presented>=limit{return false;}
         // Window stacking order is selected by the ring-3 compositor
         // policy. The privileged kernel remains only a clipped raster
@@ -483,7 +488,11 @@ pub(crate) fn user_surface_verified()->bool{
         let frames_ok=svc.frames_presented==2;
         #[cfg(not(feature="test-r029-frame-server"))]
         let frames_ok=svc.focused>=1;
-        svc.counts==[2,2] && frames_ok &&
+        (if cfg!(feature="test-r031-files-gui"){
+            // Initial persistent directory/file view is 5 commands;
+            // the single IPC refresh adds 2 more before shutdown.
+            matches!(svc.counts,[5,2]|[7,2])
+        }else{svc.counts==[2,2]}) && frames_ok &&
         !svc.broker.known(1) && !svc.broker.known(2) &&
         svc.session.desktop.focused()==Some(
             if cfg!(feature="test-r029-physical-events") {

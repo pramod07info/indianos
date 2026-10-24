@@ -120,6 +120,9 @@ pub unsafe extern "C" fn indianos_syscall_validate(
         #[cfg(feature="test-r031-vfs")]
         33 => (1..=5).contains(&request.arg0) &&
               user_range(plan,request.arg1,64,false), // R031.6 handles
+        #[cfg(feature="test-r031-files-gui")]
+        34 => request.arg0==1 &&
+              user_range(plan,request.arg1,64,false), // PID2 shared dir listing
         #[cfg(feature = "test-r026")]
         16 | 17 => request.arg0 == 2 && request.arg1 == 0, // worker status/reap query
         #[cfg(feature="test-interactive")]
