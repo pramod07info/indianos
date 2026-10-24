@@ -195,7 +195,7 @@ fn parse_tcp<'a>(frame:&'a [u8],mac:[u8;6])->Result<TcpSegment<'a>,Error>{
         flags:tcp[13],data:&tcp[hlen..]})
 }
 fn wait_for<D:EthernetDevice>(dev:&mut D,
-    matcher:impl Fn(&[u8],[u8;6])->bool)->Result<(),Error>
+    mut matcher:impl FnMut(&[u8],[u8;6])->bool)->Result<(),Error>
 {
     let mut buffer=[0u8;FRAME_CAP];
     let mac=dev.mac();
@@ -228,11 +228,20 @@ pub fn run_demo<D:EthernetDevice>(
     transmit(dev,icmp_request)?;
     wait_for(dev,valid_icmp)?;
     stage(b"IndianOS: R028 IPv4 ICMP echo ping PASSED\n\0");
+    // R034: deliver the actual NIC UDP reply to the PID-owned queue.
+    // This QEMU demo uses an explicitly trusted, synthetic PID 1.
+    let mut udp_endpoints = UdpEndpoints::<1, 2>::new();
+    udp_endpoints.bind(1, CLIENT_PORT).map_err(|_| Error::Unexpected)?;
     transmit(dev,|b,mac|udp_frame(b,mac,PEER_UDP_PORT,UDP_REQ,0x2803))?;
     wait_for(dev,|frame,mac|{
-        parse_udp(frame,mac,PEER_UDP_PORT)
-            .is_ok_and(|data|data==UDP_RESP)
+        parse_udp(frame,mac,PEER_UDP_PORT).is_ok_and(|data|data==UDP_RESP)
+            && udp_endpoints.ingest_ethernet_frame(frame,mac).is_ok()
     })?;
+    let mut udp_reply = [0u8; R033_UDP_BYTES];
+    let bytes = udp_endpoints.receive(1, CLIENT_PORT, &mut udp_reply)
+        .map_err(|_| Error::Unexpected)?;
+    if &udp_reply[..bytes] != UDP_RESP { return Err(Error::Unexpected); }
+    udp_endpoints.close_all(1);
     stage(b"IndianOS: R028 IPv4 UDP echo PASSED\n\0");
     transmit(dev,dns_query)?;
     wait_for(dev,valid_dns)?;
@@ -439,5 +448,152 @@ mod r033_udp_tests {
         assert!(!t.owns(5, 6000));
         assert_eq!(t.enqueue(6000, b"y"), Err(SocketError::Denied));
         assert_eq!(t.enqueue(6001, b"y"), Ok(()));
+    }
+}
+
+
+/// R034: validate network input before it can enter a process-owned UDP queue.
+/// The caller must supply a NIC-received frame and the actual NIC local MAC.
+/// Neither this API nor a PID may be exposed as unverified userspace input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IngressError { Malformed, BadChecksum, Endpoint(SocketError) }
+
+impl<const PORTS: usize, const QUEUE: usize> UdpEndpoints<PORTS, QUEUE> {
+    /// Single-peer QEMU ingress, not a general-purpose UDP socket service.
+    /// The queue is not modified if any framing or checksum check fails.
+    pub fn ingest_ethernet_frame(
+        &mut self, frame: &[u8], local_mac: [u8; 6],
+    ) -> Result<(), IngressError> {
+        let ip = validate_ipv4(frame, local_mac).map_err(|e| match e {
+            Error::Checksum => IngressError::BadChecksum,
+            _ => IngressError::Malformed,
+        })?;
+        if ip.proto != 17 || ip.body.len() < 8 {
+            return Err(IngressError::Malformed);
+        }
+        let udp = ip.body;
+        let source_port = be16(&udp[0..2]);
+        let destination_port = be16(&udp[2..4]);
+        let length = be16(&udp[4..6]) as usize;
+        if source_port == 0 || destination_port == 0 ||
+            length != udp.len() || be16(&udp[6..8]) == 0 {
+            return Err(IngressError::Malformed);
+        }
+        if transport_sum(&PEER_IP, &LOCAL_IP, 17, udp) != 0 {
+            return Err(IngressError::BadChecksum);
+        }
+        self.enqueue(destination_port, &udp[8..])
+            .map_err(IngressError::Endpoint)
+    }
+}
+
+#[cfg(test)]
+mod r034_ingress_tests {
+    use super::*;
+    const LOCAL_MAC: [u8; 6] = [0x52, 0x54, 0, 0x12, 0x34, 0x56];
+
+    fn peer_frame(port: u16, data: &[u8]) -> ([u8; FRAME_CAP], usize) {
+        let mut frame = [0u8; FRAME_CAP];
+        let udp_length = 8 + data.len();
+        ethernet_header(&mut frame, LOCAL_MAC, PEER_MAC, 0x0800);
+        ipv4_header(&mut frame[14..34], 17, udp_length, 0x3401);
+        frame[26..30].copy_from_slice(&PEER_IP);
+        frame[30..34].copy_from_slice(&LOCAL_IP);
+        frame[24..26].fill(0);
+        let ip_sum = checksum(&frame[14..34]);
+        put16(&mut frame, 24, ip_sum);
+        let udp = &mut frame[34..34 + udp_length];
+        put16(udp, 0, PEER_UDP_PORT);
+        put16(udp, 2, port);
+        put16(udp, 4, udp_length as u16);
+        udp[8..].copy_from_slice(data);
+        let sum = transport_sum(&PEER_IP, &LOCAL_IP, 17, udp);
+        put16(udp, 6, if sum == 0 { 0xffff } else { sum });
+        (frame, 34 + udp_length)
+    }
+
+    #[test]
+    fn validated_wire_payload_is_delivered_to_right_pid_in_fifo_order() {
+        let mut endpoints = UdpEndpoints::<2, 3>::new();
+        endpoints.bind(10, 6000).unwrap();
+        endpoints.bind(20, 7000).unwrap();
+        let (a, an) = peer_frame(6000, b"first");
+        let (b, bn) = peer_frame(7000, b"peer");
+        let (c, cn) = peer_frame(6000, b"last");
+        assert_eq!(endpoints.ingest_ethernet_frame(&a[..an], LOCAL_MAC), Ok(()));
+        assert_eq!(endpoints.ingest_ethernet_frame(&b[..bn], LOCAL_MAC), Ok(()));
+        assert_eq!(endpoints.ingest_ethernet_frame(&c[..cn], LOCAL_MAC), Ok(()));
+        let mut out = [0u8; R033_UDP_BYTES];
+        assert_eq!(endpoints.receive(20, 6000, &mut out), Err(SocketError::Denied));
+        assert_eq!(endpoints.receive(10, 6000, &mut out), Ok(5));
+        assert_eq!(&out[..5], b"first");
+        assert_eq!(endpoints.receive(20, 7000, &mut out), Ok(4));
+        assert_eq!(&out[..4], b"peer");
+        assert_eq!(endpoints.receive(10, 6000, &mut out), Ok(4));
+        assert_eq!(&out[..4], b"last");
+    }
+
+    #[test]
+    fn corrupted_mac_ip_udp_and_short_frames_are_rejected_without_delivery() {
+        let mut endpoints = UdpEndpoints::<1, 1>::new();
+        endpoints.bind(7, 6000).unwrap();
+        let (valid, len) = peer_frame(6000, b"payload");
+        let mut invalid = valid;
+        invalid[0] ^= 1;
+        assert_eq!(endpoints.ingest_ethernet_frame(&invalid[..len], LOCAL_MAC),
+            Err(IngressError::Malformed));
+        invalid = valid;
+        invalid[24] ^= 1;
+        assert_eq!(endpoints.ingest_ethernet_frame(&invalid[..len], LOCAL_MAC),
+            Err(IngressError::BadChecksum));
+        invalid = valid;
+        invalid[42] ^= 1;
+        assert_eq!(endpoints.ingest_ethernet_frame(&invalid[..len], LOCAL_MAC),
+            Err(IngressError::BadChecksum));
+        invalid = valid;
+        put16(&mut invalid, 38, (len - 35) as u16);
+        assert_eq!(endpoints.ingest_ethernet_frame(&invalid[..len], LOCAL_MAC),
+            Err(IngressError::Malformed));
+        assert_eq!(endpoints.ingest_ethernet_frame(&valid[..30], LOCAL_MAC),
+            Err(IngressError::Malformed));
+        assert_eq!(endpoints.receive(7, 6000, &mut [0u8; 16]),
+            Err(SocketError::Empty));
+    }
+
+    #[test]
+    fn unknown_port_overflow_full_queue_and_short_read_are_fail_closed() {
+        let mut endpoints = UdpEndpoints::<1, 1>::new();
+        endpoints.bind(3, 6000).unwrap();
+        let (other, on) = peer_frame(9000, b"x");
+        assert_eq!(endpoints.ingest_ethernet_frame(&other[..on], LOCAL_MAC),
+            Err(IngressError::Endpoint(SocketError::Denied)));
+        let (huge, hn) = peer_frame(6000, &[42u8; R033_UDP_BYTES + 1]);
+        assert_eq!(endpoints.ingest_ethernet_frame(&huge[..hn], LOCAL_MAC),
+            Err(IngressError::Endpoint(SocketError::Invalid)));
+        let (valid, vn) = peer_frame(6000, b"ok");
+        assert_eq!(endpoints.ingest_ethernet_frame(&valid[..vn], LOCAL_MAC), Ok(()));
+        assert_eq!(endpoints.ingest_ethernet_frame(&valid[..vn], LOCAL_MAC),
+            Err(IngressError::Endpoint(SocketError::Full)));
+        assert_eq!(endpoints.receive(3, 6000, &mut [0u8; 1]), Err(SocketError::TooShort));
+        let mut out = [0u8; 2];
+        assert_eq!(endpoints.receive(3, 6000, &mut out), Ok(2));
+        assert_eq!(out, *b"ok");
+    }
+
+    #[test]
+    fn fault_reaps_queued_messages_without_disturbing_other_processes() {
+        let mut endpoints = UdpEndpoints::<2, 2>::new();
+        endpoints.bind(4, 6000).unwrap();
+        endpoints.bind(5, 7000).unwrap();
+        let (old, old_len) = peer_frame(6000, b"old");
+        let (peer, peer_len) = peer_frame(7000, b"live");
+        endpoints.ingest_ethernet_frame(&old[..old_len], LOCAL_MAC).unwrap();
+        endpoints.ingest_ethernet_frame(&peer[..peer_len], LOCAL_MAC).unwrap();
+        endpoints.close_all(4);
+        endpoints.bind(6, 6000).unwrap();
+        let mut out = [0u8; 8];
+        assert_eq!(endpoints.receive(6, 6000, &mut out), Err(SocketError::Empty));
+        assert_eq!(endpoints.receive(5, 7000, &mut out), Ok(4));
+        assert_eq!(&out[..4], b"live");
     }
 }
