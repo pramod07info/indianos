@@ -42,3 +42,40 @@ mod tests {
             7, u64::MAX), Ok(()));
     }
 }
+
+/// Require a signature result from a trusted verifier and a signer contained
+/// in an explicit local allowlist; package-provided trust keys are ignored.
+pub fn permit_from_trust_store(pkg: Package, allowed_signers: &[u32],
+    minimum_version: u64) -> Result<(), PackageError>
+{
+    if !pkg.signature_verified { return Err(PackageError::Unverified); }
+    if pkg.signer_id == 0 || !allowed_signers.contains(&pkg.signer_id) {
+        return Err(PackageError::UntrustedSigner);
+    }
+    permit(pkg, pkg.signer_id, minimum_version)
+}
+#[cfg(test)]
+mod trust_store_tests {
+    use super::*;
+    fn pkg() -> Package {
+        Package { signature_verified: true, signer_id: 42, version: 9 }
+    }
+    #[test]
+    fn allows_only_local_trusted_signers() {
+        assert_eq!(permit_from_trust_store(pkg(), &[7,42], 9), Ok(()));
+        assert_eq!(permit_from_trust_store(pkg(), &[], 0), Err(PackageError::UntrustedSigner));
+    }
+    #[test]
+    fn rejects_unsigned_even_when_signer_exists() {
+        let mut item = pkg();
+        item.signature_verified = false;
+        assert_eq!(permit_from_trust_store(item, &[42], 0), Err(PackageError::Unverified));
+        item.signature_verified = true;
+        item.signer_id = 0;
+        assert_eq!(permit_from_trust_store(item, &[0], 0), Err(PackageError::UntrustedSigner));
+    }
+    #[test]
+    fn minimum_version_enforces_downgrade_prevention() {
+        assert_eq!(permit_from_trust_store(pkg(), &[42], 10), Err(PackageError::Downgrade));
+    }
+}

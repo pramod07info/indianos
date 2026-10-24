@@ -48,3 +48,43 @@ mod tests {
             Err(ExtentError::OutsideDevice));
     }
 }
+
+/// Map a logical file block to its physical device block, after validating every
+/// extent. Out-of-range file offsets are distinguishable from corrupt metadata.
+pub fn logical_to_physical(extents: &[Extent], device_blocks: u64, logical: u64)
+    -> Result<Option<u64>, ExtentError>
+{
+    let total = validate_extents(extents, device_blocks)?;
+    if logical >= total { return Ok(None); }
+    let mut cursor = 0u64;
+    for extent in extents {
+        let end = cursor.checked_add(extent.blocks).ok_or(ExtentError::Overflow)?;
+        if logical < end {
+            return Ok(Some(extent.start + (logical - cursor)));
+        }
+        cursor = end;
+    }
+    Ok(None)
+}
+#[cfg(test)]
+mod mapping_tests {
+    use super::*;
+    #[test]
+    fn maps_discontiguous_file_blocks() {
+        let exts = [Extent { start: 2, blocks: 2 }, Extent { start: 10, blocks: 3 }];
+        assert_eq!(logical_to_physical(&exts, 20, 0), Ok(Some(2)));
+        assert_eq!(logical_to_physical(&exts, 20, 1), Ok(Some(3)));
+        assert_eq!(logical_to_physical(&exts, 20, 2), Ok(Some(10)));
+        assert_eq!(logical_to_physical(&exts, 20, 4), Ok(Some(12)));
+    }
+    #[test]
+    fn rejects_past_end_without_touching_disk() {
+        assert_eq!(logical_to_physical(&[Extent { start: 9, blocks: 1 }], 10, 1), Ok(None));
+        assert_eq!(logical_to_physical(&[], 10, 0), Ok(None));
+    }
+    #[test]
+    fn validates_all_extents_before_returning_mapping() {
+        let corrupt = [Extent { start: 0, blocks: 1 }, Extent { start: 8, blocks: 9 }];
+        assert_eq!(logical_to_physical(&corrupt, 10, 0), Err(ExtentError::OutsideDevice));
+    }
+}

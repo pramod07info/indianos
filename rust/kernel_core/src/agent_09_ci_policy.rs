@@ -43,3 +43,59 @@ mod tests {
         assert_eq!(require_all(&[Status::Success], "", ""), Err(GateError::StaleCommit));
     }
 }
+
+/// A merged change must have every named mandatory check on exactly the
+/// target commit, with no duplicate or unexpected check names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NamedCheck<'a> { pub name: &'a str, pub sha: &'a str, pub status: Status }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NamedGateError { Missing, Duplicate, Unexpected, Stale, Incomplete }
+pub fn require_named_checks(checks: &[NamedCheck<'_>], required: &[&str],
+    target_sha: &str) -> Result<(), NamedGateError>
+{
+    if target_sha.is_empty() || required.is_empty() { return Err(NamedGateError::Missing); }
+    for (i, name) in required.iter().enumerate() {
+        if name.is_empty() { return Err(NamedGateError::Missing); }
+        if required[..i].contains(name) { return Err(NamedGateError::Duplicate); }
+    }
+    for (i, check) in checks.iter().enumerate() {
+        if check.name.is_empty() || !required.contains(&check.name) {
+            return Err(NamedGateError::Unexpected);
+        }
+        if checks[..i].iter().any(|old| old.name == check.name) {
+            return Err(NamedGateError::Duplicate);
+        }
+        if check.sha != target_sha { return Err(NamedGateError::Stale); }
+        if check.status != Status::Success { return Err(NamedGateError::Incomplete); }
+    }
+    if checks.len() != required.len() { return Err(NamedGateError::Missing); }
+    Ok(())
+}
+#[cfg(test)]
+mod named_gate_tests {
+    use super::*;
+    fn check<'a>(name: &'a str, sha: &'a str, status: Status) -> NamedCheck<'a> {
+        NamedCheck { name, sha, status }
+    }
+    #[test]
+    fn exact_required_checks_are_accepted() {
+        assert_eq!(require_named_checks(&[check("kernel","a",Status::Success),
+            check("source","a",Status::Success)], &["kernel","source"], "a"), Ok(()));
+    }
+    #[test]
+    fn missing_skipped_and_stale_reject_merge() {
+        assert_eq!(require_named_checks(&[], &["kernel"], "a"), Err(NamedGateError::Missing));
+        assert_eq!(require_named_checks(&[check("kernel","a",Status::Skipped)],
+            &["kernel"],"a"), Err(NamedGateError::Incomplete));
+        assert_eq!(require_named_checks(&[check("kernel","old",Status::Success)],
+            &["kernel"],"a"), Err(NamedGateError::Stale));
+    }
+    #[test]
+    fn duplicate_and_unknown_checks_cannot_replace_required() {
+        assert_eq!(require_named_checks(&[check("kernel","a",Status::Success),
+            check("kernel","a",Status::Success)], &["kernel","source"],"a"),
+            Err(NamedGateError::Duplicate));
+        assert_eq!(require_named_checks(&[check("other","a",Status::Success)],
+            &["kernel"],"a"), Err(NamedGateError::Unexpected));
+    }
+}
