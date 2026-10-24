@@ -109,7 +109,8 @@ pub fn encode_slot(slot: Slot) -> Option<[u8; SLOT_RECORD_BYTES]> {
     data[4..12].copy_from_slice(&slot.version.to_le_bytes());
     data[12] = slot.attempts_remaining;
     data[13] = u8::from(slot.committed);
-    data[28..32].copy_from_slice(&crc32(&data[..28]).to_le_bytes());
+    let checksum = crc32(&data[..28]);
+    data[28..32].copy_from_slice(&checksum.to_le_bytes());
     Some(data)
 }
 pub fn decode_slot(data: &[u8; SLOT_RECORD_BYTES]) -> Option<Slot> {
