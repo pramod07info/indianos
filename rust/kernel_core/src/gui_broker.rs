@@ -157,3 +157,68 @@ mod tests{
         assert_eq!(z.grant(1,1),Err(Error::Full));
     }
 }
+
+
+/// R033: route physical pointer focus using the kernel's window-owner map,
+/// never an untrusted caller-supplied PID. This remains a broker primitive;
+/// a full ring-3 compositor and QEMU input wiring are separate acceptance.
+impl<const W: usize, const Q: usize> Broker<W, Q> {
+    pub fn route_physical_focus(&mut self, trusted_window: u32)
+        -> Result<Event, Error>
+    {
+        let owner = self.owner(trusted_window).ok_or(Error::Unauthorized)?;
+        self.post_pointer_focus(owner, trusted_window)
+    }
+
+    /// Check focus permissions against the process authenticated by syscall
+    /// dispatch. Never infer identity from the window or event payload.
+    pub fn route_client_focus(&mut self, authenticated_pid: u32, window: u32)
+        -> Result<Event, Error>
+    {
+        if !self.owns(authenticated_pid, window) { return Err(Error::Unauthorized); }
+        self.post_focus(authenticated_pid, window)
+    }
+
+    /// A faulted user's grants and stale events are dropped while peer events
+    /// continue to be accessible; no new window state is synthesized here.
+    pub fn faulted(&mut self, authenticated_pid: u32) {
+        self.revoke(authenticated_pid);
+    }
+}
+#[cfg(test)]
+mod r033_focus_tests {
+    use super::*;
+    #[test]
+    fn physical_window_target_uses_trusted_owner_not_supplied_pid() {
+        let mut b = Broker::<2, 4>::new();
+        b.grant(10, 100).unwrap();
+        b.grant(20, 200).unwrap();
+        let ev = b.route_physical_focus(200).unwrap();
+        assert_eq!((ev.owner, ev.window, ev.kind), (20, 200, POINTER_FOCUS));
+        assert_eq!(b.peek(10), Err(Error::Empty));
+        assert_eq!(b.peek(20), Ok(ev));
+        assert_eq!(b.route_physical_focus(999), Err(Error::Unauthorized));
+    }
+    #[test]
+    fn untrusted_client_cannot_move_focus_to_foreign_window() {
+        let mut b = Broker::<2, 4>::new();
+        b.grant(10, 1).unwrap();
+        b.grant(20, 2).unwrap();
+        assert_eq!(b.route_client_focus(10, 2), Err(Error::Unauthorized));
+        let ev = b.route_client_focus(10, 1).unwrap();
+        assert_eq!(ev.owner, 10);
+    }
+    #[test]
+    fn fault_disposes_grants_and_events_without_affecting_peer() {
+        let mut b = Broker::<2, 4>::new();
+        b.grant(10, 1).unwrap();
+        b.grant(20, 2).unwrap();
+        b.route_physical_focus(1).unwrap();
+        let other = b.route_physical_focus(2).unwrap();
+        b.faulted(10);
+        assert_eq!(b.route_physical_focus(1), Err(Error::Unauthorized));
+        assert_eq!(b.peek(10), Err(Error::Unauthorized));
+        assert_eq!(b.peek(20), Ok(other));
+        assert_eq!(b.route_physical_focus(2).unwrap().sequence, 3);
+    }
+}
