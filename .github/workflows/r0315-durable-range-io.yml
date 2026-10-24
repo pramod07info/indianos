@@ -1,0 +1,43 @@
+name: R031.5 durable ranged filesystem
+on:
+  push:
+    branches: [main, agentx-r0315-range-20261024]
+    paths:
+      - 'rust/kernel_core/src/durablefs.rs'
+      - 'rust/kernel_core/src/hier_vfs.rs'
+      - 'rust/kernel_core/src/syscall.rs'
+      - 'rust/kernel_core/src/user_runtime.rs'
+      - 'userland/rust/src/main.rs'
+      - 'tools/test_r031_vfs_qemu.py'
+      - '.github/workflows/r0315-durable-range-io.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  r0315-range-io:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install isolated QEMU and linker dependencies
+        run: |
+          sudo timeout 120s apt-get update -o Acquire::Retries=0 -o Acquire::http::Timeout=30
+          sudo timeout 120s apt-get install -y clang lld binutils xorriso qemu-system-x86 ovmf curl openssl
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
+      - name: Rust range I/O and existing metadata recovery regressions
+        run: |
+          cargo test --offline --manifest-path rust/kernel_core/Cargo.toml --features test-r031-vfs
+          make test-rust-host-abi
+          make test-rust-source-audit
+          python3 -m py_compile tools/test_r031_vfs_qemu.py
+      - name: Five durable QEMU boots with ring3 2 KiB ranged I/O
+        run: |
+          set -euo pipefail
+          OVMF_PATH=""
+          for path in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/edk2/ovmf/OVMF_CODE_4M.fd /usr/share/edk2/ovmf/OVMF_CODE.fd; do
+            if test -f "$path"; then OVMF_PATH="$path"; break; fi
+          done
+          test -n "$OVMF_PATH"
+          make test-r031-vfs-qemu OVMF_CODE="$OVMF_PATH"

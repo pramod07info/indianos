@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""R031.3 four isolated QEMU boots, hierarchical disk and corrupt CRC recovery."""
+"""R031.5 five QEMU boots, durable 2 KiB range I/O and CRC recovery."""
 import argparse
 import os
 import selectors
@@ -13,6 +13,7 @@ MARKERS=[
  "R031.3 boot2 persisted atomic rename and overwritten file",
  "R031.3 boot3 committed redundant data for tear-recovery injection",
  "R031.3 boot4 recovered torn metadata and deleted empty directory",
+ "R031.5 boot5 verified durable two-kibibyte ranged read and patch",
 ]
 PASSED="IndianOS: R031.3 HIERARCHICAL VFS, ATOMIC RENAME AND REBOOT RECOVERY PASSED"
 START=24
@@ -92,8 +93,8 @@ def main():
         for idx,marker in enumerate(MARKERS):
             boot(a.qemu,a.iso.resolve(),a.ovmf.resolve(),disk,marker)
             check_disk(disk)
-            print(f"R031.3 stage {idx+1}/4 passed")
+            print(f"R031.5 stage {idx+1}/{len(MARKERS)} passed")
             if idx==2:corrupt_latest(disk)
-    print("R031.3 PASS: hierarchical tree, atomic rename, reboot persistence, "
+    print("R031.5 PASS: 2 KiB range reads/writes, hierarchical tree, reboot persistence, "
           "corrupt metadata fallback, sector guard and ring3 worker")
 if __name__=="__main__":main()

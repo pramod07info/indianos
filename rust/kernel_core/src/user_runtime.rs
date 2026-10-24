@@ -581,33 +581,49 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
    if (n1<2 && !(request.arg0==8 && n1==1 && desc[0]==b'/')) ||
       desc[n1..24].iter().any(|&b|b!=0){return BAD;}
    let Ok(path)=core::str::from_utf8(&desc[..n1])else{return BAD;};
-   let target=if matches!(request.arg0,7|9){
+   let (target,offset)=if matches!(request.arg0,7|9){
     let Some(n2)=desc[24..48].iter().position(|&b|b==0)else{return BAD;};
     if n2<2||desc[24+n2..48].iter().any(|&b|b!=0){return BAD;}
     let Ok(name)=core::str::from_utf8(&desc[24..24+n2])else{return BAD;};
-    name
+    (name,0u64)
+   }else if matches!(request.arg0,10|11){
+    // Range ABI: new_path[0..8] is LE byte offset; remaining 16 bytes
+    // MUST be zero. Reject offsets outside R027 fixed 2048-byte extent.
+    if desc[32..48].iter().any(|&b|b!=0){return BAD;}
+    let offset=u64::from_le_bytes(desc[24..32].try_into().unwrap());
+    if offset>crate::durablefs::MAX_FILE_BYTES as u64{return BAD;}
+    ("",offset)
    }else{
     if desc[24..48].iter().any(|&b|b!=0){return BAD;}
-    ""
+    ("",0u64)
    };
    let address=u64::from_le_bytes(desc[48..56].try_into().unwrap());
    let length=u64::from_le_bytes(desc[56..64].try_into().unwrap());
    let mut data=[0u8;crate::hier_vfs::MAX_TRANSFER];
    match request.arg0{
-    3|5=>{
+    3|5|11=>{
      if length==0||length>data.len() as u64||
         !unsafe{indianos_user_copy_readonly(img,address,
                 data.as_mut_ptr().cast(),length as usize)}{return BAD;}
-     crate::hier_vfs::operation(request.arg0,path,target,&mut data,length as usize)
-          .map(|_|0).unwrap_or(BAD)
+     if request.arg0==11{
+      crate::hier_vfs::range_operation(request.arg0,path,offset,&mut data,
+                                      length as usize).map(|n|n as u64).unwrap_or(BAD)
+     }else{
+      crate::hier_vfs::operation(request.arg0,path,target,&mut data,length as usize)
+           .map(|_|0).unwrap_or(BAD)
+     }
     }
-    4|8=>{
-     if length==0||length>data.len() as u64{return BAD;}
+    4|8|10=>{
+     if length==0||length>data.len() as u64||
+        (request.arg0==10 && length>72){return BAD;}
      // Read/list has no side effects. Stage all bytes privately first,
      // then preflight the ACTUAL copy size. The preexisting ring3 copy-out
      // ABI is currently limited to 72 bytes per syscall.
-     let Ok(n)=crate::hier_vfs::operation(request.arg0,path,target,&mut data,0)
-           else{return BAD;};
+     let result=if request.arg0==10{
+      crate::hier_vfs::range_operation(request.arg0,path,offset,
+                                      &mut data[..length as usize],0)
+     }else{crate::hier_vfs::operation(request.arg0,path,target,&mut data,0)};
+     let Ok(n)=result else{return BAD;};
      if n>length as usize || n>72{return BAD;}
      if n>0 && (!unsafe{indianos_user_can_write(&*img,address,n)} ||
         !unsafe{indianos_user_copy_writable(&*img,address,data.as_ptr(),n)}){

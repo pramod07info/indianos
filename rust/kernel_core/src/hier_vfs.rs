@@ -3,7 +3,7 @@
 //! Existing root /app and /note remain separate from reserved /~[df]* keys.
 //! 8 total storage objects (directories count); max 21 bytes of logical path.
 use crate::block::{BlockDevice,BlockWindow};
-use crate::durablefs::{DurableFs,FsError,MIN_SECTORS};
+use crate::durablefs::{DurableFs,FsError,MIN_SECTORS,MAX_FILE_BYTES};
 use crate::vfs_path::normalize_absolute;
 use crate::ata_pio::AtaPio;
 pub const MAX_TRANSFER:usize=256;
@@ -121,6 +121,23 @@ impl<D:BlockDevice> HierVfs<D>{
   self.parents(&p)?;
   self.fs.overwrite_path(p.name(),data)
  }
+ /// Offset-based read of existing files. A large on-disk file can be read
+ /// through many small ring3 transfers without weakening CRC verification.
+ pub fn read_at(&mut self,path:&str,offset:u64,
+                out:&mut [u8])->Result<usize,FsError>{
+  if out.len()>MAX_TRANSFER{return Err(FsError::TooLarge);}
+  let p=checked(path,Kind::File)?;
+  self.parents(&p)?;
+  self.fs.read_range_path(p.name(),offset,out)
+ }
+ /// Offset-based append or in-place overwrite. Do not allow sparse holes.
+ pub fn write_at(&mut self,path:&str,offset:u64,
+                 data:&[u8])->Result<usize,FsError>{
+  if data.is_empty()||data.len()>MAX_TRANSFER{return Err(FsError::TooLarge);}
+  let p=checked(path,Kind::File)?;
+  self.parents(&p)?;
+  self.fs.write_range_path(p.name(),offset,data)
+ }
  pub fn unlink(&mut self,path:&str)->Result<(),FsError>{
   let p=checked(path,Kind::File)?;
   self.parents(&p)?;
@@ -207,6 +224,26 @@ pub fn operation(action:u64,path:&str,second:&str,
                            crate::r030_ondevice::COUNT)?;
  let mut vfs=HierVfs::mount(window)?;
  vfs.dispatch(action,path,second,data,used)
+}
+/// Separate read/write operation for range I/O while preserving the existing
+/// pathname ABI for R031.3 and R031.4. Caller authorizes PID1 and copies buffers.
+pub fn range_operation(action:u64,path:&str,offset:u64,
+                       data:&mut [u8],used:usize)->Result<usize,FsError>{
+ if data.len()>MAX_TRANSFER||used>data.len()||offset>MAX_FILE_BYTES as u64{
+  return Err(FsError::TooLarge);
+ }
+ let mut disk=unsafe{AtaPio::probe()}.map_err(|_|FsError::Io)?;
+ if disk.sector_count()!=128||crate::r030_ondevice::COUNT<MIN_SECTORS{
+  return Err(FsError::InvalidVolume);
+ }
+ let window=BlockWindow::new(&mut disk,crate::r030_ondevice::START,
+                            crate::r030_ondevice::COUNT)?;
+ let mut vfs=HierVfs::mount(window)?;
+ match action{
+  10=>vfs.read_at(path,offset,data),
+  11=>vfs.write_at(path,offset,&data[..used]),
+  _=>Err(FsError::InvalidName)
+ }
 }
 #[cfg(test)]
 mod tests{
@@ -341,6 +378,59 @@ mod tests{
   assert_eq!(v.read("/a/b/note",&mut output),Ok(10));
   assert_eq!(&output[..10],b"persistent");
   assert_eq!(v.list_dir("/moved",&mut output),Err(FsError::NotFound));
+ }
+ #[test]fn range_io_two_kib_multisector_reboot_and_legacy_bounds(){
+  let mut v=fresh();
+  v.mkdir("/etc").unwrap();v.create("/etc/big",b"x").unwrap();
+  for chunk in 0..32usize{
+   let mut bytes=[0u8;64];
+   for (j,b) in bytes.iter_mut().enumerate(){
+    *b=((chunk*64+j) as u8).wrapping_mul(17).wrapping_add(3);
+   }
+   assert_eq!(v.write_at("/etc/big",(chunk*64) as u64,&bytes),Ok(64));
+  }
+  let mut output=[0xabu8;256];
+  assert_eq!(v.read("/etc/big",&mut output),Err(FsError::TooLarge));
+  assert_eq!(v.read_at("/etc/big",500,&mut output[..64]),Ok(64));
+  for i in 0..64{assert_eq!(output[i],((500+i) as u8).wrapping_mul(17).wrapping_add(3));}
+  assert_eq!(v.read_at("/etc/big",2048,&mut output[..64]),Ok(0));
+  assert_eq!(v.write_at("/etc/big",512,b"PCH!"),Ok(4));
+  let mut v=HierVfs::mount(v.into_device()).unwrap();
+  assert_eq!(v.read_at("/etc/big",510,&mut output[..10]),Ok(10));
+  assert_eq!(&output[2..6],b"PCH!");
+  assert_eq!(v.read_at("/etc/big",1984,&mut output[..64]),Ok(64));
+  for i in 0..64{assert_eq!(output[i],((1984+i) as u8).wrapping_mul(17).wrapping_add(3));}
+  assert_eq!(v.read_at("/etc/big",2049,&mut output[..4]),Err(FsError::TooLarge));
+ }
+ #[test]fn range_io_rejects_holes_overflow_and_keeps_original_file(){
+  let mut v=fresh();
+  v.mkdir("/etc").unwrap();v.create("/etc/note",b"abc").unwrap();
+  let before=v.generation();
+  assert_eq!(v.write_at("/etc/note",4,b"X"),Err(FsError::TooLarge));
+  assert_eq!(v.write_at("/etc/note",2048,b"X"),Err(FsError::TooLarge));
+  assert_eq!(v.write_at("/etc/note",u64::MAX,b"X"),Err(FsError::TooLarge));
+  assert_eq!(v.write_at("/etc/note",0,b""),Err(FsError::TooLarge));
+  assert_eq!(v.read_at("/etc/note",u64::MAX,&mut [0u8;8]),Err(FsError::TooLarge));
+  assert_eq!(v.write_at("/etc/missing",0,b"X"),Err(FsError::NotFound));
+  assert_eq!(v.generation(),before);
+  let mut out=[0u8;8];
+  assert_eq!(v.read_at("/etc/note",0,&mut out),Ok(3));
+  assert_eq!(&out[..3],b"abc");
+  assert_eq!(v.write_at("/etc/note",3,b"def"),Ok(3));
+  assert_eq!(v.read_at("/etc/note",1,&mut out),Ok(5));
+  assert_eq!(&out[..5],b"bcdef");
+ }
+ #[test]fn failed_range_write_recovers_whole_old_content_after_reboot(){
+  let mut v=fresh();
+  v.mkdir("/etc").unwrap();v.create("/etc/note",b"original").unwrap();
+  let mut disk=v.into_device();disk.writes=0;disk.tear=Some(2);
+  let mut v=HierVfs::mount(disk).unwrap();
+  assert_eq!(v.write_at("/etc/note",2,b"damaged"),Err(FsError::Io));
+  let mut disk=v.into_device();disk.tear=None;
+  let mut v=HierVfs::mount(disk).unwrap();
+  let mut out=[0u8;32];
+  assert_eq!(v.read_at("/etc/note",0,&mut out),Ok(8));
+  assert_eq!(&out[..8],b"original");
  }
  #[test]fn latest_metadata_corruption_falls_back_to_previous_cow_copy(){
   let mut v=fresh();v.mkdir("/etc").unwrap();

@@ -826,7 +826,7 @@ fn r031_terminal()->!{
     write(b"R031.1 Terminal received owned physical focus notification");
     exit(0);
 }
-// R031.3: boot-dependent bounded hierarchical VFS. Four complete QEMU boots
+// R031.3-R031.5: bounded VFS, five real QEMU boots and persistent range I/O.
 // reuse the exact same scratch disk; step 3 deliberately corrupts its newest
 // metadata copy, and step 4 verifies recovery from the older valid generation.
 #[cfg(feature="r031-vfs-init")]
@@ -842,12 +842,33 @@ fn vfs_call(action:u64,path:&[u8],target:&[u8],data:&mut [u8;256],used:usize)->u
     }
     call(32,action,descriptor.as_ptr() as u64)
 }
+// R031.5 offsets use the previously reserved descriptor bytes [24..32].
+// The copy-out ABI currently permits at most 72 user bytes per call.
+#[cfg(feature="r031-vfs-init")]
+fn vfs_call_at(action:u64,path:&[u8],offset:u64,
+               data:&mut [u8;256],size:usize)->u64{
+    if !matches!(action,10|11)||path.is_empty()||path.len()>23||
+       size==0||size>72{exit(215);}
+    let mut desc=[0u8;64];
+    desc[..path.len()].copy_from_slice(path);
+    desc[24..32].copy_from_slice(&offset.to_le_bytes());
+    desc[48..56].copy_from_slice(&(data.as_mut_ptr() as u64).to_le_bytes());
+    desc[56..64].copy_from_slice(&(size as u64).to_le_bytes());
+    call(32,action,desc.as_ptr() as u64)
+}
 #[cfg(feature="r031-vfs-init")]
 fn vfs_guest()->!{
     if call(4,0,0)!=1||call(32,0,0)!=u64::MAX{exit(231);}
     let mut data=[0u8;256];
     let n=vfs_call(4,b"/home/docs/phase",b"",&mut data,0);
-    let stage=if n==u64::MAX{0}else if n==1 &&(b'1'..=b'3').contains(&data[0]){
+    let stage=if n==u64::MAX{
+        // The directory was deliberately removed in boot4. A durable
+        // checkpoint inside its moved parent distinguishes boot5 from boot1.
+        let checkpoint=vfs_call(4,b"/etc/archive/state",b"",&mut data,0);
+        if checkpoint==u64::MAX{0}
+        else if checkpoint==1&&data[0]==b'4'{4}
+        else{exit(232)}
+    }else if n==1 &&(b'1'..=b'3').contains(&data[0]){
         data[0]-b'0'
     }else{exit(232)};
     match stage{
@@ -916,7 +937,52 @@ fn vfs_guest()->!{
             if vfs_call(8,b"/etc",b"",&mut data,0)!=19 ||
                &data[..19]!=b"d:archive\nf:config\n"{exit(225);}
             write(b"R031.4 ring3 atomic directory move and child enumeration verified");
+            // Fill the same 2048-byte file via 32 bounded 64-byte writes.
+            // Each write is a whole-image copy-on-write generation on disk.
+            data[0]=0;
+            if vfs_call(3,b"/etc/big",b"",&mut data,1)!=0{exit(216);}
+            for chunk in 0..32usize{
+                for j in 0..64usize{
+                    data[j]=((chunk*64+j) as u8).wrapping_mul(17).wrapping_add(3);
+                }
+                if vfs_call_at(11,b"/etc/big",(chunk*64) as u64,&mut data,64)!=64{
+                    exit(217);
+                }
+            }
+            // An invalid overflow must not modify any existing file data.
+            if vfs_call_at(11,b"/etc/big",2048,&mut data,64)!=u64::MAX{exit(218);}
+            if vfs_call_at(10,b"/etc/big",500,&mut data,64)!=64{exit(219);}
+            for j in 0..64usize{
+                if data[j]!=((500+j) as u8).wrapping_mul(17).wrapping_add(3){exit(220);}
+            }
+            data[..4].copy_from_slice(b"PCH!");
+            if vfs_call_at(11,b"/etc/big",512,&mut data,4)!=4{exit(222);}
+            data[0]=b'4';
+            if vfs_call(3,b"/etc/archive/state",b"",&mut data,1)!=0{exit(223);}
+            write(b"R031.5 boot4 wrote two-kibibyte file using bounded range syscalls");
             write(b"R031.3 boot4 recovered torn metadata and deleted empty directory");
+        }
+        4=>{
+            if call(31,0,0)!=1{exit(224);}
+            // No formatting; read the same physical disk after a fifth boot.
+            for chunk in 0..32usize{
+                if vfs_call_at(10,b"/etc/big",(chunk*64) as u64,&mut data,64)!=64{
+                    exit(226);
+                }
+                for j in 0..64usize{
+                    let pos=chunk*64+j;
+                    let expected=if (512..516).contains(&pos){b"PCH!"[pos-512]}
+                        else{(pos as u8).wrapping_mul(17).wrapping_add(3)};
+                    if data[j]!=expected{exit(227);}
+                }
+            }
+            if vfs_call_at(10,b"/etc/big",2048,&mut data,64)!=0{exit(230);}
+            if vfs_call_at(11,b"/etc/big",2047,&mut data,64)!=u64::MAX{
+                exit(229);
+            }
+            // Non-ranged reads of 2048-byte files still reject small buffers.
+            if vfs_call(4,b"/etc/big",b"",&mut data,0)!=u64::MAX{exit(214);}
+            write(b"R031.5 boot5 verified durable two-kibibyte ranged read and patch");
         }
         _=>exit(253)
     }
@@ -924,8 +990,8 @@ fn vfs_guest()->!{
     write(b"R031.3 allowlisted worker started without VFS privileges");
     yield_now();
     if call(17,2,0)!=1{exit(255);}
-    if stage==3{
-        if call(31,4,0)!=0{exit(227);}
+    if stage==4{
+        if call(31,4,0)!=0{exit(213);}
         write(b"R031.3 VFS recovery complete; pre-staged worker uninstalled");
     }
     write(b"R031.3 verified persistent hierarchical storage and ring3 isolation");

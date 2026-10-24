@@ -337,6 +337,38 @@ impl<D:BlockDevice> DurableFs<D>{
         out[..len].copy_from_slice(&scratch[..len]);
         Ok(len)
     }
+    /// Read a bounded segment. Verify the ENTIRE stored payload/checksum before
+    /// copying anything to caller memory, including a read across sectors.
+    /// offset==EOF returns 0; offsets above the volume maximum are rejected.
+    pub fn read_range_path(&mut self,path:&str,offset:u64,
+                           out:&mut [u8])->Result<usize,FsError>{
+        if offset>MAX_FILE_BYTES as u64{return Err(FsError::TooLarge);}
+        let mut snapshot=[0u8;MAX_FILE_BYTES];
+        let len=self.read_path(path,&mut snapshot)?;
+        let start=offset as usize;
+        if start>=len{return Ok(0);}
+        let n=(len-start).min(out.len());
+        out[..n].copy_from_slice(&snapshot[start..start+n]);
+        Ok(n)
+    }
+    /// Transactional append/overwrite at an existing byte offset; no holes.
+    /// Check bounds and verify the old file BEFORE any disk writes. A complete
+    /// new image is staged in an unused COW bank and atomically published once.
+    pub fn write_range_path(&mut self,path:&str,offset:u64,
+                            bytes:&[u8])->Result<usize,FsError>{
+        if bytes.is_empty()||offset>MAX_FILE_BYTES as u64{
+            return Err(FsError::TooLarge);
+        }
+        let start=offset as usize;
+        let end=start.checked_add(bytes.len()).ok_or(FsError::TooLarge)?;
+        if end>MAX_FILE_BYTES{return Err(FsError::TooLarge);}
+        let mut snapshot=[0u8;MAX_FILE_BYTES];
+        let len=self.read_path(path,&mut snapshot)?;
+        if start>len{return Err(FsError::TooLarge);}
+        snapshot[start..end].copy_from_slice(bytes);
+        self.overwrite_path(path,&snapshot[..len.max(end)])?;
+        Ok(bytes.len())
+    }
     pub fn delete_path(&mut self,path:&str)->Result<(),FsError>{
         let name=canonical_path(path)?;
         let slot=self.find(name).ok_or(FsError::NotFound)?;
