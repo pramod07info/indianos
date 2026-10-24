@@ -1,0 +1,191 @@
+name: IndianOS Swarm - 10 Parallel Coding Agents
+
+on:
+  push:
+    branches: [main]
+    paths: [".github/workflows/agent-swarm.yml", "tools/agent_swarm.py"]
+  workflow_run:
+    workflows: ["IndianOS kernel boot (x86-64)"]
+    types: [completed]
+    branches: [main]
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+# All generated code must pass local and main kernel tests before integration.
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+
+jobs:
+  develop:
+    if: ${{ github.event_name != 'workflow_run' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_repository.full_name == github.repository) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    strategy:
+      fail-fast: false
+      max-parallel: 10
+      matrix:
+        include:
+          - agent: "01"
+            branch: "agents/01-filesystem-scale"
+            issue: 46
+          - agent: "02"
+            branch: "agents/02-signed-apps"
+            issue: 47
+          - agent: "03"
+            branch: "agents/03-security-identity"
+            issue: 48
+          - agent: "04"
+            branch: "agents/04-service-manager"
+            issue: 49
+          - agent: "05"
+            branch: "agents/05-userspace-compositor"
+            issue: 50
+          - agent: "06"
+            branch: "agents/06-network-stack"
+            issue: 51
+          - agent: "07"
+            branch: "agents/07-hardware-drivers"
+            issue: 52
+          - agent: "08"
+            branch: "agents/08-updates-recovery"
+            issue: 53
+          - agent: "09"
+            branch: "agents/09-ci-hardening"
+            issue: 54
+          - agent: "10"
+            branch: "agents/10-app-ai-planner"
+            issue: 55
+    concurrency:
+      group: indianos-agent-${{ matrix.agent }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check assigned branch and select candidate
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ matrix.branch }}
+          AGENT: ${{ matrix.agent }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          OPEN="$(gh pr list --repo "$REPO" --head "$BRANCH" --state open --json number --jq 'length')"
+          if ${{ "$OPEN" != "0" }}; then
+            echo "Branch already has a PR; wait for coordinator."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          REMOTE="$(git ls-remote origin "refs/heads/$BRANCH" | awk '{print $1}')"
+          if ${{ -n "$REMOTE" }}; then
+            git fetch origin "refs/heads/$BRANCH:refs/remotes/origin/swarm-target"
+            if ! git merge-base --is-ancestor "$REMOTE" HEAD; then
+              echo "::warning::Agent branch not safely fast-forwardable from main."
+              echo "ready=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+          python3 tools/agent_swarm.py prepare --agent "$AGENT" --file /tmp/swarm-prompt.txt
+          if grep -q '^selected=true$' "$GITHUB_OUTPUT"; then
+            git switch -c "$BRANCH"
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install Rust for freestanding validation
+        if: steps.gate.outputs.ready == 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
+
+      - name: Build offline coding-model runner
+        if: steps.gate.outputs.ready == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/ggml-org/llama.cpp.git /tmp/llama.cpp
+          cmake -S /tmp/llama.cpp -B /tmp/llama-build \
+            -DGGML_NATIVE=OFF -DLLAMA_CURL=ON -DCMAKE_BUILD_TYPE=Release
+          cmake --build /tmp/llama-build --target llama-completion -j 4
+
+      - name: Generate and compile bounded code
+        if: steps.gate.outputs.ready == 'true'
+        env:
+          AGENT: ${{ matrix.agent }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          MODULE="$(python3 -c 'import sys;sys.path.insert(0,"tools");from agent_swarm import AGENTS;print(AGENTS[sys.argv[1]]["module"])' "$AGENT")"
+          accepted=false
+          for attempt in 1 2; do
+            if ${{ "$attempt" == 2 }}; then
+              python3 tools/agent_swarm.py retry --agent "$AGENT" --file /tmp/swarm-prompt.txt
+            fi
+            timeout 900 /tmp/llama-build/bin/llama-completion \
+              -hf bartowski/Qwen2.5-Coder-1.5B-Instruct-GGUF:Q4_K_M \
+              -f /tmp/swarm-prompt.txt -n 2800 -c 8192 --temp 0.1 \
+              --no-display-prompt > /tmp/swarm-generated.txt
+            if python3 tools/agent_swarm.py apply --agent "$AGENT" --file /tmp/swarm-generated.txt && \
+               cargo test --offline --manifest-path rust/kernel_core/Cargo.toml; then
+              accepted=true
+              break
+            fi
+            git restore -- "rust/kernel_core/src/$MODULE.rs"
+            echo "::warning::Agent $AGENT candidate rejected, attempt $attempt"
+          done
+          if ${{ "$accepted" != true }}; then
+            echo "::error::No valid code candidate. Do not publish."
+            exit 1
+          fi
+
+      - name: Validate kernel source and ELF
+        if: steps.gate.outputs.ready == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --offline --manifest-path rust/kernel_core/Cargo.toml \
+            --no-default-features --target x86_64-unknown-none
+          make test-rust-source-audit
+          make kernel BUILD=build/swarm-${{ matrix.agent }} RUST_CORE=1
+          git diff --check
+
+      - name: Commit isolated changes and open PR
+        if: steps.gate.outputs.ready == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ matrix.branch }}
+          AGENT: ${{ matrix.agent }}
+          ISSUE: ${{ matrix.issue }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          MODULE="$(python3 -c 'import sys;sys.path.insert(0,"tools");from agent_swarm import AGENTS;print(AGENTS[sys.argv[1]]["module"])' "$AGENT")"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "rust/kernel_core/src/$MODULE.rs"
+          git diff --cached --check
+          git commit -m "Agent $AGENT: validated $MODULE helper (refs #$ISSUE)"
+          CURRENT="$(gh api "repos/$REPO/branches/main" --jq .commit.sha)"
+          ${{ "$CURRENT" == "$(git rev-parse HEAD^)" }} || {
+            echo "::error::main advanced; regenerate on fresh base rather than merge stale changes"
+            exit 1
+          }
+          BASIC="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $BASIC" \
+            push origin "HEAD:refs/heads/$BRANCH"
+          gh pr create --repo "$REPO" --head "$BRANCH" --base main \
+            --title "[Agent $AGENT] Bounded $MODULE kernel helper" \
+            --body "Refs #$ISSUE. Safe Rust helper and unit tests; not yet a finished production feature. Offline cargo tests, source audit and freestanding kernel build passed. Coordinator must verify full QEMU CI, review and merge. Rollback via squash revert."
+          # Dispatch is an allowed action event even for GITHUB_TOKEN pushes.
+          gh workflow run kernel-boot.yml --repo "$REPO" --ref "$BRANCH"
+          echo "Submitted Agent $AGENT branch and PR for Coordinator." >> "$GITHUB_STEP_SUMMARY"
