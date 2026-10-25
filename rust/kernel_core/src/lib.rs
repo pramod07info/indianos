@@ -33,6 +33,19 @@ pub mod capability;
 pub mod vfs_path;
 /// Allocation-free process event FIFO and teardown cleanup.
 pub mod process_events;
+// R038 bounded AI catalog, software-compatibility and release safety.
+pub mod batch4_ai_catalog;
+pub mod batch4_approval;
+pub mod batch4_signature;
+pub mod batch4_rollback;
+pub mod batch4_linux_abi;
+pub mod batch4_windows_pe;
+pub mod batch4_android;
+pub mod batch4_macos_policy;
+pub mod batch4_performance;
+pub mod batch4_release;
+#[cfg(test)]
+mod batch4_acceptance;
 // R037 bounded hardware, networking and security validation scaffolding.
 pub mod batch3_driver_isolation;
 pub mod batch3_ahci;
