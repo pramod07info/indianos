@@ -33,6 +33,19 @@ pub mod capability;
 pub mod vfs_path;
 /// Allocation-free process event FIFO and teardown cleanup.
 pub mod process_events;
+// R037 bounded hardware, networking and security validation scaffolding.
+pub mod batch3_driver_isolation;
+pub mod batch3_ahci;
+pub mod batch3_nvme;
+pub mod batch3_virtio;
+pub mod batch3_acpi;
+pub mod batch3_network_security;
+pub mod batch3_updates;
+pub mod batch3_crashlog;
+pub mod batch3_hardware_matrix;
+pub mod batch3_security_audit;
+#[cfg(test)]
+mod batch3_acceptance;
 // R036 Batch 2: bounded user-facing desktop and init foundations.
 // Exported policy APIs; live ring-3 service integration is a later milestone.
 pub mod batch2_init;
