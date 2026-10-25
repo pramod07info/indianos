@@ -311,3 +311,57 @@ mod generation_tests {
         assert_eq!(r.start(2), Err(EpochError::Full));
     }
 }
+
+
+/// Batch 1: authenticated resource-scoped revocation, never by bare token
+/// provided by another process. Preserves other resources and peer grants.
+impl<const N: usize> EpochRegistry<N> {
+    pub fn revoke_resource(&mut self, authenticated_pid: u32,
+        authenticated_generation: u64, resource: u64) -> Result<usize, EpochError> {
+        let active = self.process(authenticated_pid)
+            .filter(|e| e.active && e.generation == authenticated_generation)
+            .ok_or(EpochError::NotActive)?;
+        if active.pid == 0 { return Err(EpochError::InvalidPid); }
+        let mut count = 0;
+        for index in 0..N {
+            let token = self.grants.entries[index]
+                .filter(|entry| entry.owner == authenticated_pid &&
+                        entry.resource == resource)
+                .map(|entry| entry.token);
+            if let Some(token) = token {
+                self.grants.revoke(authenticated_pid, token)
+                    .map_err(EpochError::Registry)?;
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+}
+#[cfg(test)]
+mod batch1_resource_revocation_tests {
+    use super::*;
+    #[test]
+    fn targeted_revocation_keeps_peer_and_other_resources() {
+        let mut registry = EpochRegistry::<5>::new();
+        let a = registry.start(10).unwrap();
+        let b = registry.start(20).unwrap();
+        let erased = registry.grant(10, 100, 1).unwrap();
+        let other = registry.grant(10, 200, 1).unwrap();
+        let peer = registry.grant(20, 100, 1).unwrap();
+        assert_eq!(registry.revoke_resource(10, a, 100), Ok(1));
+        assert!(registry.authorize(10, a, erased, 100, 1).is_err());
+        assert_eq!(registry.authorize(10, a, other, 200, 1), Ok(()));
+        assert_eq!(registry.authorize(20, b, peer, 100, 1), Ok(()));
+    }
+    #[test]
+    fn stale_generation_cannot_revoke_reused_pid() {
+        let mut registry = EpochRegistry::<3>::new();
+        let generation = registry.start(10).unwrap();
+        registry.retire(10, generation).unwrap();
+        let current = registry.start(10).unwrap();
+        let token = registry.grant(10, 100, 1).unwrap();
+        assert_eq!(registry.revoke_resource(10, generation, 100), Err(EpochError::NotActive));
+        assert_eq!(registry.authorize(10, current, token, 100, 1), Ok(()));
+    }
+}
+

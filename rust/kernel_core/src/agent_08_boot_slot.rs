@@ -157,3 +157,124 @@ mod slot_codec_tests {
         assert_eq!(select_slot(&[old, new], 12), Err(BootError::NoBootableSlot));
     }
 }
+
+
+/// Batch 1: two-copy, checked A/B metadata on an explicitly selected
+/// BlockDevice window. This NEVER formats, discovers or selects a physical
+/// disk: caller must supply a disposable, preinitialized dedicated volume.
+/// The driver must flush each written sector before returning success.
+use crate::block::{BlockDevice,SECTOR_BYTES};
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum JournalError { Invalid, Io, NoBoot, Exhausted }
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct Journal { pub generation:u64, pub slots:[Slot;2] }
+fn encode_journal(value:Journal)->Option<[u8;SECTOR_BYTES]> {
+    if value.generation == 0 { return None; }
+    let a=encode_slot(value.slots[0])?;
+    let b=encode_slot(value.slots[1])?;
+    let mut data=[0u8;SECTOR_BYTES];
+    data[..8].copy_from_slice(b"IABJ0001");
+    data[8..16].copy_from_slice(&value.generation.to_le_bytes());
+    data[16..48].copy_from_slice(&a);
+    data[48..80].copy_from_slice(&b);
+    let checksum=crc32(&data[..SECTOR_BYTES-4]);
+    data[SECTOR_BYTES-4..].copy_from_slice(&checksum.to_le_bytes());
+    Some(data)
+}
+fn decode_journal(data:&[u8;SECTOR_BYTES])->Option<Journal>{
+    if &data[..8]!=b"IABJ0001" ||
+        data[80..SECTOR_BYTES-4].iter().any(|&b|b!=0) {return None;}
+    let recorded=u32::from_le_bytes(data[SECTOR_BYTES-4..].try_into().ok()?);
+    if crc32(&data[..SECTOR_BYTES-4])!=recorded {return None;}
+    let generation=u64::from_le_bytes(data[8..16].try_into().ok()?);
+    if generation==0 {return None;}
+    let a=decode_slot(data[16..48].try_into().ok()?)?;
+    let b=decode_slot(data[48..80].try_into().ok()?)?;
+    Some(Journal{generation,slots:[a,b]})
+}
+pub fn recover_journal<D:BlockDevice>(disk:&mut D)
+    -> Result<(Journal,u64),JournalError> {
+    if disk.sector_count()<2{return Err(JournalError::Invalid);}
+    let mut latest:Option<(Journal,u64)>=None;
+    for lba in 0..2u64 {
+        let mut sector=[0u8;SECTOR_BYTES];
+        disk.read_sector(lba,&mut sector).map_err(|_|JournalError::Io)?;
+        if let Some(record)=decode_journal(&sector) {
+            if latest.as_ref().is_none_or(|(old,_)| record.generation>old.generation){
+                latest=Some((record,lba));
+            }
+        }
+    }
+    latest.ok_or(JournalError::Invalid)
+}
+/// Two-phase journal update: first recover the last complete record, then
+/// write one NEW copy to the inactive metadata sector. On torn writes, the
+/// previous checked generation remains recoverable.
+pub fn commit_boot_attempt<D:BlockDevice>(disk:&mut D,min_version:u64)
+    -> Result<usize,JournalError>{
+    let (mut latest,active)=recover_journal(disk)?;
+    let selected=consume_boot_attempt(&mut latest.slots,min_version)
+        .map_err(|_|JournalError::NoBoot)?;
+    latest.generation=latest.generation.checked_add(1)
+        .ok_or(JournalError::Exhausted)?;
+    let encoded=encode_journal(latest).ok_or(JournalError::Invalid)?;
+    disk.write_sector(1-active,&encoded).map_err(|_|JournalError::Io)?;
+    Ok(selected)
+}
+#[cfg(test)]
+mod batch1_disk_journal_tests {
+    use super::*;
+    use crate::block::{BlockError,check_range};
+    struct Disk{sectors:[[u8;SECTOR_BYTES];2],fail:bool}
+    impl BlockDevice for Disk{
+        fn sector_count(&self)->u64{2}
+        fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+            ->Result<(),BlockError>{
+            check_range(2,lba,1)?;*out=self.sectors[lba as usize];Ok(())
+        }
+        fn write_sector(&mut self,lba:u64,data:&[u8;SECTOR_BYTES])
+            ->Result<(),BlockError>{
+            check_range(2,lba,1)?;
+            if self.fail{return Err(BlockError::Io);}
+            self.sectors[lba as usize]=*data;Ok(())
+        }
+    }
+    fn base()->Journal{
+        Journal{generation:10,slots:[
+            Slot{valid_metadata:true,committed:true,version:2,attempts_remaining:2},
+            Slot{valid_metadata:true,committed:true,version:3,attempts_remaining:1},
+        ]}
+    }
+    fn disk()->Disk{
+        let encoded=encode_journal(base()).unwrap();
+        Disk{sectors:[encoded,encoded],fail:false}
+    }
+    #[test]
+    fn persisted_attempt_and_reboot_fallback() {
+        let mut d=disk();
+        assert_eq!(commit_boot_attempt(&mut d,1),Ok(1));
+        let (new,active)=recover_journal(&mut d).unwrap();
+        assert_eq!(new.generation,11);
+        assert_eq!(new.slots[1].attempts_remaining,0);
+        assert_eq!(active,1);
+        assert_eq!(commit_boot_attempt(&mut d,1),Ok(0));
+    }
+    #[test]
+    fn corrupt_inactive_copy_does_not_destroy_last_good_record(){
+        let mut d=disk();
+        commit_boot_attempt(&mut d,1).unwrap();
+        d.sectors[1][8]^=1;
+        let (old,active)=recover_journal(&mut d).unwrap();
+        assert_eq!(old.generation,10);
+        assert_eq!(active,0);
+    }
+    #[test]
+    fn failed_io_and_invalid_journal_never_forge_success(){
+        let mut d=disk();d.fail=true;
+        assert_eq!(commit_boot_attempt(&mut d,1),Err(JournalError::Io));
+        assert_eq!(recover_journal(&mut d).unwrap().0.generation,10);
+        let mut blank=Disk{sectors:[[0;SECTOR_BYTES];2],fail:false};
+        assert_eq!(commit_boot_attempt(&mut blank,1),Err(JournalError::Invalid));
+    }
+}
+

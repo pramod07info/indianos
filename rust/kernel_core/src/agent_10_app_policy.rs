@@ -93,3 +93,109 @@ mod dependency_tests {
             Err(InstallError::PermissionDenied));
     }
 }
+
+
+/// Batch 1: bounded dependency graph over a trusted, immutable catalog.
+/// This produces an atomic dry-run install order, not a package installer.
+pub const MAX_DEPENDENCY_NODES:usize=32;
+#[derive(Clone,Copy)]
+pub struct Dependency<'a>{
+    pub id:u16, pub dependencies:&'a[u16], pub candidate:Candidate,
+}
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum PlanError{Empty,TooMany,Duplicate,Unknown,Cycle,OutputFull,Policy(InstallError)}
+fn visit_dependency(index:usize,items:&[Dependency<'_>],
+    state:&mut[u8;MAX_DEPENDENCY_NODES],order:&mut[u16;MAX_DEPENDENCY_NODES],
+    count:&mut usize,host:Architecture,permissions:u32,consent:bool)
+    ->Result<(),PlanError> {
+    if state[index]==1{return Err(PlanError::Cycle);}
+    if state[index]==2{return Ok(());}
+    state[index]=1;
+    let entry=items[index];
+    approve(entry.candidate,host,permissions,consent).map_err(PlanError::Policy)?;
+    for dependency in entry.dependencies {
+        let next=items.iter().position(|d|d.id==*dependency)
+            .ok_or(PlanError::Unknown)?;
+        visit_dependency(next,items,state,order,count,host,permissions,consent)?;
+    }
+    state[index]=2;
+    order[*count]=entry.id;
+    *count+=1;
+    Ok(())
+}
+pub fn plan_dependencies(items:&[Dependency<'_>],root:u16,host:Architecture,
+    granted_permissions:u32,consent:bool,out:&mut[u16])->Result<usize,PlanError>{
+    if items.is_empty()||root==0{return Err(PlanError::Empty);}
+    if items.len()>MAX_DEPENDENCY_NODES{return Err(PlanError::TooMany);}
+    for (index,item) in items.iter().enumerate(){
+        if item.id==0{return Err(PlanError::Empty);}
+        if items[..index].iter().any(|prev|prev.id==item.id){
+            return Err(PlanError::Duplicate);
+        }
+    }
+    let index=items.iter().position(|d|d.id==root).ok_or(PlanError::Unknown)?;
+    let mut state=[0u8;MAX_DEPENDENCY_NODES];
+    let mut order=[0u16;MAX_DEPENDENCY_NODES];
+    let mut count=0;
+    visit_dependency(index,items,&mut state,&mut order,&mut count,
+        host,granted_permissions,consent)?;
+    if count>out.len(){return Err(PlanError::OutputFull);}
+    out[..count].copy_from_slice(&order[..count]);
+    Ok(count)
+}
+#[cfg(test)]
+mod batch1_dependency_graph_tests{
+    use super::*;
+    fn c(mask:u32)->Candidate{
+        Candidate{catalog_trusted:true,manifest_signed:true,
+            architecture:Architecture::X86_64,requested_permissions:mask}
+    }
+    #[test]
+    fn sorts_dependencies_before_root_and_checks_permissions(){
+        let items=[
+            Dependency{id:1,dependencies:&[2,3],candidate:c(1)},
+            Dependency{id:2,dependencies:&[3],candidate:c(2)},
+            Dependency{id:3,dependencies:&[],candidate:c(4)},
+        ];
+        let mut out=[0;3];
+        assert_eq!(plan_dependencies(&items,1,Architecture::X86_64,7,true,&mut out),Ok(3));
+        assert_eq!(out,[3,2,1]);
+        assert_eq!(plan_dependencies(&items,1,Architecture::X86_64,3,true,&mut out),
+            Err(PlanError::Policy(InstallError::PermissionDenied)));
+    }
+    #[test]
+    fn cycles_unknown_and_duplicate_ids_are_rejected(){
+        let cycle=[
+            Dependency{id:1,dependencies:&[2],candidate:c(0)},
+            Dependency{id:2,dependencies:&[1],candidate:c(0)},
+        ];
+        assert_eq!(plan_dependencies(&cycle,1,Architecture::X86_64,0,true,&mut[0;2]),
+            Err(PlanError::Cycle));
+        let unknown=[Dependency{id:1,dependencies:&[9],candidate:c(0)}];
+        assert_eq!(plan_dependencies(&unknown,1,Architecture::X86_64,0,true,&mut[0;2]),
+            Err(PlanError::Unknown));
+        let duplicate=[
+            Dependency{id:1,dependencies:&[],candidate:c(0)},
+            Dependency{id:1,dependencies:&[],candidate:c(0)},
+        ];
+        assert_eq!(plan_dependencies(&duplicate,1,Architecture::X86_64,0,true,&mut[0;2]),
+            Err(PlanError::Duplicate));
+    }
+    #[test]
+    fn insufficient_buffer_and_untrusted_dependency_preserve_output(){
+        let items=[
+            Dependency{id:1,dependencies:&[2],candidate:c(0)},
+            Dependency{id:2,dependencies:&[],candidate:c(0)}
+        ];
+        let mut out=[77u16;1];
+        assert_eq!(plan_dependencies(&items,1,Architecture::X86_64,0,true,&mut out),
+            Err(PlanError::OutputFull));
+        assert_eq!(out,[77]);
+        let mut untrusted=c(0);untrusted.catalog_trusted=false;
+        let bad=[Dependency{id:1,dependencies:&[],candidate:untrusted}];
+        assert_eq!(plan_dependencies(&bad,1,Architecture::X86_64,0,true,&mut out),
+            Err(PlanError::Policy(InstallError::UntrustedCatalog)));
+        assert_eq!(out,[77]);
+    }
+}
+
