@@ -54,6 +54,8 @@ test-r030-ondevice = ["test-r026"]
 test-r031-vfs = ["test-r030-ondevice"]
 # R031.9: opt-in persistent graphical Files + bounded PID2 read-only VFS.
 test-r031-files-gui = ["test-r031-boot-desktop", "test-r031-vfs"]
+# R041 opt-in QEMU guest smoke; bounded workspace only, not ring3 desktop.
+test-r041-workspace = ["kernel-main"]
 test-ud2 = []
 test-pagefault = []
 test-shadow = []

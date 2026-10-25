@@ -59,6 +59,12 @@ pub extern "C" fn kmain()->!{
     log(b"IndianOS: kernel entered\n\0");
     need(unsafe{boot_validate()},b"IndianOS: FATAL boot information invalid\n\0");
     log(b"IndianOS: boot information validated\n\0");
+    #[cfg(feature="test-r041-workspace")]
+    {
+        need(crate::batch7_workspace::bounded_workspace_smoke(),
+             b"IndianOS: FATAL R041 workspace read/write/revocation smoke\n\0");
+        log(b"IndianOS: R041 RAM workspace terminal write/read/revocation PASSED\n\0");
+    }
     unsafe{boot_draw_status();}
     #[cfg(feature="test-r029-userspace")]
     {
