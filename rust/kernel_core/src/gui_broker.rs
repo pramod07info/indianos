@@ -222,3 +222,81 @@ mod r033_focus_tests {
         assert_eq!(b.route_physical_focus(2).unwrap().sequence, 3);
     }
 }
+
+
+/// Batch 1: geometry belongs to an authenticated process and is never
+/// moved by a peer. Coordinates are checked before a move is committed.
+/// A separate userspace compositor still needs to consume these grants.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OwnedSurface {
+    pub owner: u32, pub window: u32,
+    pub rectangle: crate::agent_05_surface_rect::Rectangle,
+}
+pub struct SurfaceLayout<const N: usize> {
+    surfaces: [Option<OwnedSurface>; N],
+}
+impl<const N: usize> SurfaceLayout<N> {
+    pub const fn new() -> Self { Self { surfaces: [None; N] } }
+    pub fn grant(&mut self, owner: u32, window: u32,
+        rectangle: crate::agent_05_surface_rect::Rectangle) -> Result<(), Error> {
+        if owner == 0 || window == 0 { return Err(Error::Invalid); }
+        if self.surfaces.iter().flatten().any(|s|s.window == window) {
+            return Err(Error::Duplicate);
+        }
+        crate::agent_05_surface_rect::clip_owned(rectangle,rectangle,owner,owner)
+            .map_err(|_| Error::Invalid)?;
+        let free = self.surfaces.iter_mut().find(|slot| slot.is_none())
+            .ok_or(Error::Full)?;
+        *free=Some(OwnedSurface{owner,window,rectangle});
+        Ok(())
+    }
+    pub fn geometry(&self, owner: u32, window: u32)
+        -> Result<crate::agent_05_surface_rect::Rectangle, Error> {
+        self.surfaces.iter().flatten().find(|s|s.owner == owner &&
+            s.window == window && owner != 0)
+            .map(|s|s.rectangle).ok_or(Error::Unauthorized)
+    }
+    pub fn move_owned(&mut self, owner: u32, window: u32, dx: i32, dy: i32)
+        -> Result<crate::agent_05_surface_rect::Rectangle, Error> {
+        let slot = self.surfaces.iter_mut().flatten()
+            .find(|s|s.owner == owner && s.window == window && owner != 0)
+            .ok_or(Error::Unauthorized)?;
+        let moved=crate::agent_05_surface_rect::move_owned(
+            slot.rectangle, dx, dy, owner, owner).map_err(|_|Error::Invalid)?;
+        slot.rectangle=moved;
+        Ok(moved)
+    }
+    pub fn revoke(&mut self, owner: u32) {
+        if owner == 0 { return; }
+        for slot in &mut self.surfaces {
+            if slot.is_some_and(|s|s.owner == owner){*slot=None;}
+        }
+    }
+}
+#[cfg(test)]
+mod batch1_surface_layout_tests {
+    use super::*;
+    use crate::agent_05_surface_rect::Rectangle;
+    #[test]
+    fn only_owner_moves_surface_and_invalid_move_keeps_state() {
+        let mut layout=SurfaceLayout::<2>::new();
+        let original=Rectangle{x:20,y:30,width:100,height:50};
+        layout.grant(10,100,original).unwrap();
+        assert_eq!(layout.move_owned(20,100,1,1),Err(Error::Unauthorized));
+        assert_eq!(layout.move_owned(10,100,-21,0),Err(Error::Invalid));
+        assert_eq!(layout.geometry(10,100),Ok(original));
+        assert_eq!(layout.move_owned(10,100,5,-5).unwrap().x,25);
+    }
+    #[test]
+    fn teardown_prevents_reused_window_from_inheriting_geometry() {
+        let mut layout=SurfaceLayout::<2>::new();
+        let r=Rectangle{x:0,y:0,width:10,height:10};
+        layout.grant(1,100,r).unwrap();
+        assert_eq!(layout.grant(2,100,r),Err(Error::Duplicate));
+        layout.revoke(1);
+        assert_eq!(layout.geometry(1,100),Err(Error::Unauthorized));
+        layout.grant(2,100,r).unwrap();
+        assert_eq!(layout.geometry(2,100),Ok(r));
+    }
+}
+

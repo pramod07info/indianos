@@ -156,3 +156,63 @@ mod pci_discovery_tests {
         assert_eq!(decode_config(&h), Err(ConfigError::Absent));
     }
 }
+
+
+/// Batch 1: consume immutable config-space header snapshots from a trusted
+/// PCI enumerator. No bus I/O, BAR mapping or storage-controller activation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiscoveryError { TooMany, InsufficientOutput, Config(ConfigError) }
+pub const MAX_PCI_HEADERS: usize = 256;
+pub fn discover_storage_headers(headers: &[[u8;16]],
+    output: &mut [Option<DeviceInfo>]) -> Result<usize,DiscoveryError> {
+    if headers.len()>MAX_PCI_HEADERS { return Err(DiscoveryError::TooMany); }
+    let mut count=0;
+    // Preflight the entire input before writing the first output slot.
+    for h in headers {
+        match storage_controller(h) {
+            Ok(_) => count+=1,
+            Err(ConfigError::Absent | ConfigError::NotStorage) => {},
+            Err(e) => return Err(DiscoveryError::Config(e)),
+        }
+    }
+    if count > output.len(){return Err(DiscoveryError::InsufficientOutput);}
+    let mut n=0;
+    for h in headers {
+        if let Ok(device)=storage_controller(h){
+            output[n]=Some(device);
+            n+=1;
+        }
+    }
+    Ok(n)
+}
+#[cfg(test)]
+mod batch1_pci_snapshot_tests {
+    use super::*;
+    fn header(class:u8,subclass:u8)->[u8;16]{
+        let mut h=[0u8;16];
+        h[..2].copy_from_slice(&0x8086u16.to_le_bytes());
+        h[2..4].copy_from_slice(&0x2922u16.to_le_bytes());
+        h[11]=class;h[10]=subclass;h
+    }
+    #[test]
+    fn filters_storage_classes_from_trusted_config_snapshots() {
+        let headers=[header(2,0),header(1,6),header(1,8),[0xff;16]];
+        let mut output=[None;2];
+        assert_eq!(discover_storage_headers(&headers,&mut output),Ok(2));
+        assert_eq!(output[0].unwrap().subclass,6);
+        assert_eq!(output[1].unwrap().subclass,8);
+    }
+    #[test]
+    fn invalid_header_and_capacity_fail_before_writing() {
+        let mut bad=header(1,6);bad[14]=2;
+        let sentinel=Some(storage_controller(&header(1,1)).unwrap());
+        let mut output=[sentinel;1];
+        assert_eq!(discover_storage_headers(&[header(1,6),bad],&mut output),
+            Err(DiscoveryError::Config(ConfigError::InvalidHeader)));
+        assert_eq!(output,[sentinel]);
+        assert_eq!(discover_storage_headers(&[header(1,6),header(1,8)],&mut output),
+            Err(DiscoveryError::InsufficientOutput));
+        assert_eq!(output,[sentinel]);
+    }
+}
+

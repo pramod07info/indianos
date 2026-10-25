@@ -158,3 +158,66 @@ mod guest_verifier_tests {
             b"", &[0; 64], 2, 1, 1, 1), Err(GuestPackageError::Malformed));
     }
 }
+
+
+/// Batch 1: a separate trusted implementation must compute the actual
+/// payload digest; the expected hash MUST come from the verified manifest.
+pub trait GuestPayloadVerifier {
+    fn digest_matches(&self, payload: &[u8], verified_manifest_digest: &[u8; 32]) -> bool;
+}
+
+/// Fail-closed manifest AND executable-payload preflight. A positive result is
+/// not a launch: privileged loader, on-device Ed25519 and durable trust roots
+/// remain separate requirements.
+pub fn verify_launch_material<V: GuestSignatureVerifier, P: GuestPayloadVerifier>(
+    verifier: &V, payload_verifier: &P, anchors: &[TrustAnchor], key_id: u32,
+    manifest: &[u8], signature: &[u8;64], payload: &[u8],
+    digest_from_verified_manifest: &[u8;32], version: u64,
+    target_arch: u16, host_arch: u16, minimum: u64,
+) -> Result<(), GuestPackageError> {
+    if payload.is_empty() || payload.len() > 1024 * 1024 {
+        return Err(GuestPackageError::Malformed);
+    }
+    verify_guest_manifest(verifier, anchors, key_id, manifest, signature,
+        version, target_arch, host_arch, minimum)?;
+    if !payload_verifier.digest_matches(payload, digest_from_verified_manifest) {
+        return Err(GuestPackageError::Unsigned);
+    }
+    Ok(())
+}
+#[cfg(test)]
+mod batch1_payload_tests {
+    use super::*;
+    struct TestVerifier;
+    impl GuestSignatureVerifier for TestVerifier {
+        fn verify(&self, key: &[u8;32], manifest: &[u8], sig: &[u8;64]) -> bool {
+            key[0] == 5 && manifest == b"trusted" && sig[0] == 9
+        }
+    }
+    struct TestDigest;
+    impl GuestPayloadVerifier for TestDigest {
+        fn digest_matches(&self, payload: &[u8], digest: &[u8;32]) -> bool {
+            payload == b"expected-elf" && digest[0] == 7
+        }
+    }
+    fn check(payload: &[u8], digest: [u8;32], signature: [u8;64])
+        -> Result<(), GuestPackageError> {
+        verify_launch_material(&TestVerifier, &TestDigest,
+            &[TrustAnchor{id:1, ed25519_public_key:[5;32]}],1,
+            b"trusted", &signature, payload, &digest, 2, 62, 62, 1)
+    }
+    #[test]
+    fn validates_both_signed_manifest_and_bound_payload() {
+        let mut sig=[0;64];sig[0]=9;
+        let mut digest=[0;32];digest[0]=7;
+        assert_eq!(check(b"expected-elf",digest,sig),Ok(()));
+        assert_eq!(check(b"altered-elf",digest,sig),Err(GuestPackageError::Unsigned));
+    }
+    #[test]
+    fn rejects_unsigned_manifest_or_empty_payload() {
+        let mut digest=[0;32];digest[0]=7;
+        assert_eq!(check(b"expected-elf",digest,[0;64]),Err(GuestPackageError::Unsigned));
+        assert_eq!(check(b"",digest,[0;64]),Err(GuestPackageError::Malformed));
+    }
+}
+

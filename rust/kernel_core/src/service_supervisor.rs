@@ -187,3 +187,50 @@ mod r033_service_tests {
         assert_eq!(t.snapshot(1).unwrap().restarts, 0);
     }
 }
+
+
+/// Batch 1: stop an active service only for the exact authenticated process
+/// generation. Stale PID reuse and supervisor identity confusion fail closed.
+impl<const N: usize> ServiceTable<N> {
+    pub fn stop_exact(&mut self, service_id: u32, authenticated_pid: u32,
+        generation: u32) -> bool {
+        if service_id == 0 || authenticated_pid == 0 || generation == 0 {
+            return false;
+        }
+        let Some(slot) = self.slots.iter_mut().flatten().find(|s|
+            s.service_id == service_id && s.pid == authenticated_pid &&
+            s.generation == generation && s.active) else { return false; };
+        slot.active = false;
+        true
+    }
+}
+#[cfg(test)]
+mod batch1_supervisor_generation_tests {
+    use super::*;
+    #[test]
+    fn stale_generation_cannot_stop_replacement_service() {
+        let mut services = ServiceTable::<2>::new();
+        assert!(services.configure(1, 7, 2));
+        assert!(services.configure(2, 8, 1));
+        assert_eq!(services.start(1), ServiceAction::Start{pid:7,generation:1});
+        assert_eq!(services.start(2), ServiceAction::Start{pid:8,generation:1});
+        assert_eq!(services.crash(7,9),ServiceAction::Restart{pid:9,generation:2});
+        assert!(services.prepared(1,9,2));
+        assert!(!services.stop_exact(1,9,1));
+        assert!(!services.stop_exact(1,7,2));
+        assert!(services.snapshot(1).unwrap().active);
+        assert!(services.stop_exact(1,9,2));
+        assert!(services.snapshot(2).unwrap().active);
+    }
+    #[test]
+    fn zero_and_mismatched_service_identity_is_rejected() {
+        let mut services=ServiceTable::<1>::new();
+        services.configure(1, 10, 1);
+        services.start(1);
+        assert!(!services.stop_exact(1, 10, 0));
+        assert!(!services.stop_exact(2, 10, 1));
+        assert!(services.stop_exact(1, 10, 1));
+        assert!(!services.stop_exact(1, 10, 1));
+    }
+}
+
