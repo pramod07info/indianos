@@ -33,6 +33,20 @@ pub mod capability;
 pub mod vfs_path;
 /// Allocation-free process event FIFO and teardown cleanup.
 pub mod process_events;
+// R036 Batch 2: bounded user-facing desktop and init foundations.
+// Exported policy APIs; live ring-3 service integration is a later milestone.
+pub mod batch2_init;
+pub mod batch2_launcher;
+pub mod batch2_events;
+pub mod batch2_windows;
+pub mod batch2_keyboard;
+pub mod batch2_terminal;
+pub mod batch2_files;
+pub mod batch2_installer;
+pub mod batch2_settings;
+pub mod batch2_gui_qa;
+#[cfg(test)]
+mod batch2_acceptance;
 pub mod tinyfs;
 /// R027 opt-in checksummed copy-on-write persistent sector filesystem.
 pub mod durablefs;
