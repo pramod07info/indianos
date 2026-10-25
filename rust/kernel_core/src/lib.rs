@@ -33,6 +33,18 @@ pub mod capability;
 pub mod vfs_path;
 /// Allocation-free process event FIFO and teardown cleanup.
 pub mod process_events;
+// R039 Batch 5: authenticated integration adapters across tasks 2–25.
+// Kernel/driver/UI backends and actual cross-platform runtimes remain separate.
+pub mod batch5_session;
+pub mod batch5_vfs;
+pub mod batch5_installer;
+pub mod batch5_network;
+pub mod batch5_devices;
+pub mod batch5_compat;
+pub mod batch5_release;
+pub mod batch5_accessibility;
+#[cfg(test)]
+mod batch5_acceptance;
 // R038 bounded AI catalog, software-compatibility and release safety.
 pub mod batch4_ai_catalog;
 pub mod batch4_approval;
