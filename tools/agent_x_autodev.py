@@ -59,6 +59,21 @@ TASKS = (
         ),
         "required": ("pub struct", "pub enum", "#[cfg(test)]"),
     },
+    {
+        "name": "udp_owner_epoch",
+        "purpose": (
+            "Implement a no_std, fixed-capacity generation-bound UDP owner registry "
+            "for a future kernel service integration. Associate a nonzero PID, "
+            "nonzero process generation and nonzero UDP port with each grant. "
+            "Reject zero values, duplicate ports across processes, stale process "
+            "generations, and full capacity. Provide bind, authorize and "
+            "revoke_owner(pid, generation) with explicit, fail-closed errors. "
+            "Ensure a PID reuse with a new generation never inherits old ports. "
+            "Use fixed arrays only; no heap, unsafe, syscalls or global mutable state."
+        ),
+        "required": ("pub struct", "pub enum", "bind", "authorize",
+                     "revoke_owner", "#[cfg(test)]"),
+    },
 )
 
 START = "BEGIN_INDIANOS_RUST"

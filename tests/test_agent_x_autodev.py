@@ -119,6 +119,16 @@ class GuardedCodegenTests(unittest.TestCase):
         self.assertEqual((self.root / agent.LIB).read_text(), original)
         self.assertFalse((self.root / agent.MODULE_ROOT / "capability.rs").exists())
 
+    def test_next_approved_task_after_completed_legacy_modules(self) -> None:
+        for name in ("capability", "vfs_path", "process_events"):
+            (self.root / agent.MODULE_ROOT / (name + ".rs")).write_text("// implemented\n")
+        selected = agent.select_task(self.root)
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected["name"], "udp_owner_epoch")
+        prompt = self.root / "next_prompt.txt"
+        agent.prepare(self.root, prompt, None)
+        self.assertIn("process generation", prompt.read_text())
+
     def test_empty_backlog_is_non_destructive(self) -> None:
         for task in agent.TASKS:
             (self.root / agent.MODULE_ROOT / (task["name"] + ".rs")).write_text("// existing\n")
