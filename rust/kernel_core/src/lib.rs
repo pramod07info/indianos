@@ -33,6 +33,17 @@ pub mod capability;
 pub mod vfs_path;
 /// Allocation-free process event FIFO and teardown cleanup.
 pub mod process_events;
+// M1: authenticated ring3-service policy using the already implemented
+// checksummed, sector-backed HierVfs; host remount integration acceptance.
+// Does not enable formatting or physical-device access in ordinary boot.
+#[cfg(feature="test-r031-vfs")]
+pub mod m1_input;
+#[cfg(feature="test-r031-vfs")]
+pub mod m1_partition;
+#[cfg(feature="test-r031-vfs")]
+pub mod m1_persistent_terminal;
+#[cfg(feature="test-r031-vfs")]
+pub mod m1_persistent_desktop;
 // R041 Batch 7: real allocation-free RAM file data and an interactive
 // authenticated Files/Terminal workspace. Persistent media and a full
 // ring3 compositor require separate QEMU/hardware acceptance.
