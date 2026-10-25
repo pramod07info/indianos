@@ -1,0 +1,39 @@
+name: Roadmap SHA Validation
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  verify-sha:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Run fail-closed SHA identity regressions
+        run: python3 -m unittest discover -s tests -p test_verify_ci_sha.py -v
+      - name: Check checkout matches the full expected Git commit
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          OBSERVED_SHA="$(git rev-parse HEAD)"
+          python3 tools/verify_ci_sha.py --expected "$EXPECTED_SHA" --observed "$OBSERVED_SHA"
+      - name: Reject stale pull request heads
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          NUMBER: ${{ github.event.pull_request.number }}
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          LIVE_SHA="$(gh api "repos/$REPO/pulls/$NUMBER" --jq '.head.sha')"
+          python3 tools/verify_ci_sha.py --expected "$EXPECTED_SHA" --observed "$LIVE_SHA"

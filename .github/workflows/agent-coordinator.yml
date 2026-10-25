@@ -127,6 +127,20 @@ jobs:
                   core.info('#' + pr.number + ': full-kernel QEMU CI not green for exact head SHA');
                   continue;
                 }
+                // Require a separate fail-closed checkout-identity check on
+                // the exact current PR head, not only the large kernel QEMU job.
+                const shaRuns = checks.filter(run =>
+                  run.name === 'Roadmap SHA Validation' &&
+                  ['pull_request', 'workflow_dispatch'].includes(run.event) &&
+                  run.head_sha === pr.head.sha &&
+                  run.head_repository?.full_name === owner + '/' + repo
+                ).sort((a,b) => new Date(b.created_at) - new Date(a.created_at));
+                const latestSha = shaRuns[0];
+                if (!latestSha || latestSha.status !== 'completed' ||
+                    latestSha.conclusion !== 'success') {
+                  core.info('#' + pr.number + ': exact-head SHA validation missing or failed');
+                  continue;
+                }
                 const livePR = (await github.rest.pulls.get({
                   owner,repo,pull_number:pr.number
                 })).data;
