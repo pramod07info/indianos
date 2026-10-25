@@ -33,6 +33,20 @@ pub mod capability;
 pub mod vfs_path;
 /// Allocation-free process event FIFO and teardown cleanup.
 pub mod process_events;
+// R040 Batch 6: stronger integrated policies for tasks 2 through 25.
+// Full drivers, live compositor/syscalls, hardware boot and compatibility
+// runtimes are explicitly NOT implemented by these host-tested adapters.
+pub mod batch6_boot;
+pub mod batch6_surface;
+pub mod batch6_security;
+pub mod batch6_storage;
+pub mod batch6_network;
+pub mod batch6_recovery;
+pub mod batch6_devices;
+pub mod batch6_apps;
+pub mod batch6_release;
+#[cfg(test)]
+mod batch6_acceptance;
 // R039 Batch 5: authenticated integration adapters across tasks 2–25.
 // Kernel/driver/UI backends and actual cross-platform runtimes remain separate.
 pub mod batch5_session;
