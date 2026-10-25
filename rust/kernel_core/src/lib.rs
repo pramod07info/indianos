@@ -33,6 +33,14 @@ pub mod capability;
 pub mod vfs_path;
 /// Allocation-free process event FIFO and teardown cleanup.
 pub mod process_events;
+// R041 Batch 7: real allocation-free RAM file data and an interactive
+// authenticated Files/Terminal workspace. Persistent media and a full
+// ring3 compositor require separate QEMU/hardware acceptance.
+pub mod batch7_ramfs;
+pub mod batch7_terminal;
+pub mod batch7_workspace;
+#[cfg(test)]
+mod batch7_acceptance;
 // R040 Batch 6: stronger integrated policies for tasks 2 through 25.
 // Full drivers, live compositor/syscalls, hardware boot and compatibility
 // runtimes are explicitly NOT implemented by these host-tested adapters.
