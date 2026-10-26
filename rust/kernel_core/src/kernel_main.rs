@@ -329,6 +329,7 @@ pub extern "C" fn kmain()->!{
         let stage=crate::m2_guest_qemu::run().unwrap_or_else(|_|{
             log(b"IndianOS: FATAL M2 disk native ring3 lifecycle\n\0");halt()
         });
+        log(b"IndianOS: M2 Phase 4D QEMU simulated monotonic boot gate VERIFIED\n\0");
         log(b"IndianOS: M2 real Ed25519 boot policy and package signature VERIFIED\n\0");
         match stage{
           1=>log(b"IndianOS: M2 disk boot1 installed ELF v1 executed\n\0"),

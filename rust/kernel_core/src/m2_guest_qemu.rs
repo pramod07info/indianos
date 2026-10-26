@@ -9,8 +9,11 @@ use crate::m2_inventory::{Inventory,Error as PackageError,Record,MAX_IMAGE_BYTES
 use crate::m2_sdk::{Package,ABI};
 use crate::batch4_signature::{Envelope,Root,Verify};
 use crate::m2_ed25519::Ed25519Backend;
-use crate::m2_trust::{Anchor,Registry,Trusted};
-use crate::m2_trust_policy::{SignedSnapshot,MAX_PUBLISHERS,Error as BootError};
+use crate::m2_trust::{Anchor,Trusted};
+use crate::m2_boot_trust::{BootTrust,HardwareTrust,PolicySlots,
+ Error as TrustBootError};
+use crate::m2_trust_policy::SNAPSHOT_BYTES;
+use crate::m2_trust_policy::SignedSnapshot;
 use crate::batch5_session::Identity;
 use crate::batch6_security::{Access,INSTALL};
 use crate::{ProcessTable,indianos_process_create,indianos_process_success};
@@ -28,23 +31,75 @@ const TEST_BOOT_ROOT:[u8;32]=[32,18,203,144,202,96,232,229,216,218,246,110,34,11
 const TEST_BOOT_SIG:[u8;64]=[119,72,45,124,7,155,22,101,144,76,124,204,209,87,120,49,147,230,213,149,252,255,79,198,234,73,239,233,97,36,149,99,34,40,70,94,244,213,101,150,27,204,8,204,212,144,228,34,26,95,59,112,156,232,160,211,65,178,125,176,175,60,242,11];
 const TEST_APP_SIG_1:[u8;64]=[63,81,43,0,190,178,223,51,88,189,167,181,91,103,50,139,190,90,11,13,224,164,90,78,55,131,33,51,12,27,158,212,136,7,135,17,212,55,183,170,27,95,27,70,70,158,14,123,37,245,126,11,234,8,37,236,34,83,247,131,173,57,39,5];
 const TEST_APP_SIG_2:[u8;64]=[21,236,129,187,72,77,222,161,99,201,245,2,139,214,135,125,24,110,124,254,153,118,44,22,17,145,129,61,228,174,80,94,86,142,37,227,47,112,113,194,96,221,32,250,34,169,175,160,229,72,132,162,249,106,31,196,76,46,231,53,103,225,171,13];
-fn trusted_boot_registry()->Result<Registry<MAX_PUBLISHERS>,()>{
- let mut snapshot=SignedSnapshot::empty();
- snapshot.sequence=3;
- snapshot.count=1;
- snapshot.publishers[0]=Anchor{signer:7,epoch:2,
+/// QEMU ONLY: mimics two hardware trust operations with plain RAM.
+/// This is NOT a production UEFI Secure Boot or TPM implementation.
+#[derive(Clone,Copy)]
+struct QemuFakePlatform{floor:u64,root:[u8;32],fails_advance:bool}
+impl HardwareTrust for QemuFakePlatform{
+ fn read_authenticated_boot_root(&self)->Result<[u8;32],()>{
+  Ok(self.root) // QEMU test fixture, NOT authenticated physical firmware
+ }
+ fn read_protected_sequence(&self)->Result<u64,()>{Ok(self.floor)}
+ fn advance_protected_sequence(&mut self,seq:u64)->Result<(),()>{
+  if self.fails_advance||seq<self.floor{return Err(());}
+  self.floor=seq;Ok(())
+ }
+}
+#[derive(Clone,Copy)]
+struct QemuFakePolicySlots{data:[Option<[u8;SNAPSHOT_BYTES]>;2]}
+impl PolicySlots for QemuFakePolicySlots{
+ fn read(&mut self,index:usize,out:&mut[u8;SNAPSHOT_BYTES])
+   ->Result<bool,()>{
+  if let Some(bytes)=self.data[index]{*out=bytes;Ok(true)}
+  else{Ok(false)}
+ }
+ fn replace_durably(&mut self,index:usize,b:&[u8;SNAPSHOT_BYTES])
+   ->Result<(),()>{
+  self.data[index]=Some(*b);Ok(())
+ }
+}
+type TestBoot=BootTrust<QemuFakePlatform,QemuFakePolicySlots>;
+fn test_signed_policy()->SignedSnapshot{
+ let mut policy=SignedSnapshot::empty();
+ policy.sequence=3;
+ policy.count=1;
+ policy.publishers[0]=Anchor{signer:7,epoch:2,
   public_key:TEST_PUBLISHER,enabled:true};
- snapshot.signature=TEST_BOOT_SIG;
- let mut registry=Registry::<MAX_PUBLISHERS>::new();
- snapshot.verify_and_install(&mut registry,
-  &TEST_BOOT_ROOT,0,&access(),ADMIN,1).map_err(|_|())?;
- if registry.public_key(7,2)!=Ok(TEST_PUBLISHER){return Err(());}
- snapshot.signature[0]^=1;
- if snapshot.verify_and_install(&mut registry,
-  &TEST_BOOT_ROOT,0,&access(),ADMIN,1)
-  !=Err(BootError::InvalidSignature){return Err(());}
- if registry.public_key(7,2)!=Ok(TEST_PUBLISHER){return Err(());}
- Ok(registry)
+ policy.signature=TEST_BOOT_SIG;
+ policy
+}
+fn trusted_boot_session()->Result<TestBoot,()>{
+ let snapshot=test_signed_policy();
+ let memory=QemuFakePolicySlots{data:[Some(snapshot.to_bytes()),None]};
+ let hardware=QemuFakePlatform{floor:0,root:TEST_BOOT_ROOT,
+     fails_advance:false};
+ let mut boot=BootTrust::new(hardware,memory);
+ if boot.registry().is_some(){return Err(());}
+ if boot.boot_recover(&access(),ADMIN,1)!=Ok(3){return Err(());}
+ if boot.platform().floor!=3||
+  boot.registry().ok_or(())?.public_key(7,2)!=Ok(TEST_PUBLISHER){
+  return Err(());
+ }
+ // A one-bit-changed but structurally valid Ed25519 signature CANNOT
+ // introduce a new boot root, even with a clean untrusted disk.
+ let mut corrupt=snapshot;
+ corrupt.signature[0]^=1;
+ let bad=QemuFakePolicySlots{data:[Some(corrupt.to_bytes()),None]};
+ let mut rejected=BootTrust::new(hardware,bad);
+ if rejected.boot_recover(&access(),ADMIN,1)!=Err(TrustBootError::NoValidPolicy)||
+   rejected.registry().is_some(){return Err(());}
+ // A perfectly valid OLD signed policy is insufficient when the
+ // protected monotonic counter is newer. This floor is SIMULATED.
+ let mut replay=BootTrust::new(
+  QemuFakePlatform{floor:4,..hardware},memory);
+ if replay.boot_recover(&access(),ADMIN,1)!=Err(TrustBootError::NoValidPolicy)||
+   replay.registry().is_some(){return Err(());}
+ let mut unavailable=BootTrust::new(
+  QemuFakePlatform{fails_advance:true,..hardware},memory);
+ if unavailable.boot_recover(&access(),ADMIN,1)
+    !=Err(TrustBootError::PlatformUnavailable)||
+   unavailable.registry().is_some(){return Err(());}
+ Ok(boot)
 }
 fn elf(v:u8)->[u8;IMAGE_LEN]{
  let mut b=[0u8;IMAGE_LEN];
@@ -150,9 +205,9 @@ pub fn run()->Result<u8,()>{
  inv.init_directory().map_err(|_|())?;
  // Each reboot verifies a signed boot policy with real Ed25519 BEFORE
  // trusting any publisher key from it.
- let trusted=trusted_boot_registry()?;
+ let trusted=trusted_boot_session()?;
  let backend=Ed25519Backend;
- let verifier=Trusted{registry:&trusted,backend:&backend};
+ let verifier=Trusted{registry:trusted.registry().ok_or(())?,backend:&backend};
  match stage{
   0=>{
    if inv.installed(APP).map_err(|_|())?.is_some(){return Err(());}
