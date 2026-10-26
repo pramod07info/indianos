@@ -57,6 +57,8 @@ pub mod m2_blob_store;
 #[cfg(feature="test-m2-developer-alpha")]
 pub mod m2_bundle_manifest;
 #[cfg(feature="test-m2-developer-alpha")]
+pub mod m2_large_launch;
+#[cfg(feature="test-m2-developer-alpha")]
 pub mod m2_manifest;
 #[cfg(feature="test-m2-developer-alpha")]
 pub mod m2_consent;
