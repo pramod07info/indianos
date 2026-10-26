@@ -527,3 +527,56 @@ This layer gives only bounded storage and authenticated staging, not
 additional executable privileges. All physical disk formatting or
 partition selection must be separately authorized. The existing QEMU
 four-boot signed 2,400-byte ELF acceptance remains active and unchanged.
+
+
+## M2 Phase 5B — 64KiB cryptographically approved ELF -> guarded user memory
+
+Phase 5B bridges the Phase 5A signed 64KiB package-data store into the
+existing native ELF mapper and supervised ring3 execution API, without
+expanding any untrusted app privileges or rewriting the old M2P5/6 store.
+
+1. `m2_large_launch::verified_large_approved` accepts a caller-owned,
+   exclusively borrowed **65,536-byte kernel-addressable scratch buffer**.
+   It requires an INSTALL-authorized supervisor, checks the actual
+   authenticated Ed25519 publisher signature against the full canonical
+   bundle manifest (version, ELF digest, rights, dependency minima, signer
+   epoch, length and app ID), verifies the active durable storage bank
+   matches the signed identity **exactly**, and checks explicit consent
+   for the exact process PID/generation, rights, app version and hash.
+   It rereads and SHA-256 checks the whole blob before accepting a
+   program. Any failed step clears scratch before returning.
+2. The `stage_large_verified` entry uses the existing strict x86-64 ELF
+   planner and PMM-backed detached `UserImage` mapper for files up to
+   64KiB. It never allocates kernel-page mappings before passing the
+   trust and authorization preflight. The established mapper preserves
+   W^X and NX permissions, owned-page accounting and guard pages.
+   Scratch is erased after successful page mapping and on failed loads.
+3. `prepare_large_registered` further checks a new kernel-created PCB,
+   attaches the prepared image to the READY process only after successful
+   secure page mapping, and preserves the established kernel scheduler
+   and resource ownership state machine. Failure leaves the invalid
+   process unrunnable.
+4. For a privileged **single-BSP**, `execute_large_approved` rechecks
+   signed bytes, approval and PCB state, arms the existing per-syscall
+   permission gate and calls the same native ring3 IRETQ/CR3 CPU runtime
+   used by the earlier small-package launcher. It disarms permissions
+   and clears scratch after synchronous return/fault. Caller-owned
+   scratch is mandatory to avoid a 64KiB kernel stack allocation.
+5. Host tests exercise actual Ed25519 signatures for 64KiB and
+   45KiB ELF images, version/rights tampering, stale PID generations,
+   revoked signers, storage identity mismatch, disk corruption and
+   invalid W+X headers. Real mock-backed PMM/VMM tests check native
+   executable segment bytes, proper PCB READY transitions and complete
+   page reclamation. Kernel `no_std` and the previous four-boot
+   2,400-byte QEMU integration remain mandatory.
+
+**Scope:** This connects authenticated 64KiB ELF loading to *code paths*
+and host PMM/VMM acceptance, but the standalone four-boot QEMU flow
+still uses the original small-file native image and its existing
+128-sector disposable disk. A **separate 258-sector partition** plus
+real-QEMU 64KiB ring3 boot acceptance remains a further step.
+Signed manifests must be available from an independently authenticated
+durable catalog after reboot. Hardware TPM anti-rollback, dynamically
+linked executables, relocations, third-party installers, graphical
+consent, multiple independent simultaneously installed packages and
+general networking/TLS are still release blockers. This is not M2 100%.
