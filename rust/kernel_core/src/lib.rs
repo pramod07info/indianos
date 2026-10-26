@@ -53,6 +53,8 @@ pub mod m2_elf;
 #[cfg(feature="test-m2-developer-alpha")]
 pub mod m2_sha256;
 #[cfg(feature="test-m2-developer-alpha")]
+pub mod m2_manifest;
+#[cfg(feature="test-m2-developer-alpha")]
 pub mod m2_consent;
 #[cfg(feature="test-m2-developer-alpha")]
 pub mod m2_trust;

@@ -29,7 +29,7 @@ pub struct Record{
 }
 #[derive(Debug,PartialEq,Eq)]
 pub enum Error{Denied,Invalid,NotFound,Downgrade,RollbackPending,MissingDependency,
- InUse,ImageMissing,DigestMismatch,Trust(batch4_signature::Error),Fs(FsError)}
+ InUse,ImageMissing,UnsignedManifest,DigestMismatch,Trust(batch4_signature::Error),Fs(FsError)}
 /// Must be implemented by a trusted kernel process-supervisor/ELF loader.
  /// Passing a simple caller-controlled bool is NOT proof of healthy execution.
 pub trait RuntimeHealth{
@@ -53,8 +53,10 @@ fn encode(p:Record)->[u8;LEN]{
 fn decode(b:&[u8])->Result<Record,Error>{
  let legacy=b.len()==LEGACY_LEN&&&b[..4]==b"M2PK";
  let current=b.len()==LEN&&&b[..4]==b"M2P2";
- let image=b.len()>=IMAGE_HEADER&&&b[..4]==b"M2P3";
- let extended=b.len()>=EXT_HEADER&&&b[..4]==b"M2P4";
+ let image=b.len()>=IMAGE_HEADER&&
+   (&b[..4]==b"M2P3"||&b[..4]==b"M2P5");
+ let extended=b.len()>=EXT_HEADER&&
+   (&b[..4]==b"M2P4"||&b[..4]==b"M2P6");
  if !legacy&&!current&&!image&&!extended{return Err(Error::Invalid);}
  if image||extended{
   let size=u16::from_le_bytes([b[176],b[177]]) as usize;
@@ -116,7 +118,8 @@ fn extent_name(id:u32,slot:u8)->Result<[u8;8],Error>{
  Ok(p)
 }
 fn extent_slot(manifest:&[u8])->Option<u8>{
- if manifest.len()>=EXT_HEADER&&&manifest[..4]==b"M2P4"&&manifest[180]<=1{
+ if manifest.len()>=EXT_HEADER&&
+   (&manifest[..4]==b"M2P4"||&manifest[..4]==b"M2P6")&&manifest[180]<=1{
   Some(manifest[180])
  }else{None}
 }
@@ -152,6 +155,16 @@ impl<D:BlockDevice> Inventory<D>{
   Ok(self.read_raw(id,old,&mut bytes)?.map(|x|x.0))
  }
  pub fn installed(&mut self,id:u32)->Result<Option<Record>,Error>{self.read(id,false)}
+ /// M2P5/6 attest the mutable permissions, versions, dependencies and
+ /// executable content digest. Older image formats are not secure to run.
+ pub fn require_signed_manifest(&mut self,id:u32)->Result<(),Error>{
+  let mut raw=[0u8;MAX_FILE_BYTES];
+  let (_,n)=self.read_raw(id,false,&mut raw)?.ok_or(Error::NotFound)?;
+  if n<IMAGE_HEADER||(&raw[..4]!=b"M2P5"&&&raw[..4]!=b"M2P6"){
+   return Err(Error::UnsignedManifest);
+  }
+  Ok(())
+ }
  /// Read-only checkpoint status for trusted App Store previews.
  pub fn rollback_pending(&mut self,id:u32)->Result<bool,Error>{
   Ok(self.read(id,true)?.is_some())
@@ -190,15 +203,21 @@ impl<D:BlockDevice> Inventory<D>{
   auth.require(owner,INSTALL,now).map_err(|_|Error::Denied)?;
   let mut raw=[0u8;MAX_FILE_BYTES];
   let (record,n)=self.read_raw(id,false,&mut raw)?.ok_or(Error::NotFound)?;
-  if n<IMAGE_HEADER||(&raw[..4]!=b"M2P3"&&&raw[..4]!=b"M2P4"){
+  if n<IMAGE_HEADER||(&raw[..4]!=b"M2P3"&&
+     &raw[..4]!=b"M2P4"&&&raw[..4]!=b"M2P5"&&
+     &raw[..4]!=b"M2P6"){
    return Err(Error::ImageMissing);
   }
   let signer=u32::from_le_bytes(raw[100..104].try_into().unwrap());
   let epoch=u64::from_le_bytes(raw[104..112].try_into().unwrap());
   let mut signature=[0u8;64];signature.copy_from_slice(&raw[112..176]);
-  let envelope=Envelope{signer,epoch,digest:record.digest,signature};
+  let metadata_signed=&raw[..4]==b"M2P5"||&raw[..4]==b"M2P6";
+  let binding=if metadata_signed{
+   crate::m2_manifest::digest(record,signer,epoch)
+  }else{record.digest};
+  let envelope=Envelope{signer,epoch,digest:binding,signature};
   let mut scratch=[0u8;MAX_IMAGE_BYTES];
-  let length=if &raw[..4]==b"M2P4"{
+  let length=if &raw[..4]==b"M2P4"||&raw[..4]==b"M2P6"{
    let inline=u16::from_le_bytes(raw[176..178].try_into().unwrap()) as usize;
    let extra=u16::from_le_bytes(raw[178..180].try_into().unwrap()) as usize;
    if inline!=INLINE_IMAGE_BYTES||extra==0||extra>MAX_FILE_BYTES||
@@ -221,7 +240,13 @@ impl<D:BlockDevice> Inventory<D>{
    return Err(Error::DigestMismatch);
   }
   self.require_runtime_dependencies(record)?;
-  batch4_signature::check(roots,verifier,&envelope,image).map_err(Error::Trust)?;
+  if metadata_signed{
+   crate::m2_manifest::check(roots,verifier,&envelope,record)
+    .map_err(Error::Trust)?;
+  }else{
+   batch4_signature::check(roots,verifier,&envelope,image)
+    .map_err(Error::Trust)?;
+  }
   if out.len()<length{return Err(Error::Fs(FsError::TooLarge));}
   out[..length].copy_from_slice(image);
   Ok((record,length))
@@ -233,7 +258,7 @@ impl<D:BlockDevice> Inventory<D>{
   owner:Identity,now:u64,roots:&[Root],verifier:&V,
   signed:&Envelope,payload:&[u8],item:Package)->Result<Record,Error>{
   if item.deps.iter().any(|&id|id!=0){return Err(Error::MissingDependency);}
-  self.install_validated(auth,owner,now,roots,verifier,signed,payload,item,[0;MAX_DEPS],false)
+  self.install_validated(auth,owner,now,roots,verifier,signed,payload,item,[0;MAX_DEPS],false,false)
  }
  /// Validate the entire trusted package dependency closure before updating
  /// any inventory entry. Catalog contents must have been independently
@@ -255,7 +280,7 @@ impl<D:BlockDevice> Inventory<D>{
   for (n,&dep) in item.deps.iter().enumerate(){
    if dep!=0{minimums[n]=catalog.get(dep).ok_or(Error::MissingDependency)?.version;}
   }
-  self.install_validated(auth,owner,now,roots,verifier,signed,payload,item,minimums,false)
+  self.install_validated(auth,owner,now,roots,verifier,signed,payload,item,minimums,false,false)
  }
  /// Opt-in executable storage: writes exact signed ELF bytes and its
  /// signature together in one durable metadata file, never a detached flag.
@@ -263,7 +288,7 @@ impl<D:BlockDevice> Inventory<D>{
   owner:Identity,now:u64,roots:&[Root],verifier:&V,
   signed:&Envelope,payload:&[u8],item:Package)->Result<Record,Error>{
   if item.deps.iter().any(|&id|id!=0){return Err(Error::MissingDependency);}
-  self.install_validated(auth,owner,now,roots,verifier,signed,payload,item,[0;MAX_DEPS],true)
+  self.install_validated(auth,owner,now,roots,verifier,signed,payload,item,[0;MAX_DEPS],true,false)
  }
  /// Same trusted dependency checks as metadata-only catalog installs.
  pub fn install_image_from_catalog<V:Verify,const N:usize,const C:usize>(
@@ -283,15 +308,47 @@ impl<D:BlockDevice> Inventory<D>{
   for (n,&dep) in item.deps.iter().enumerate(){
    if dep!=0{minimums[n]=catalog.get(dep).ok_or(Error::MissingDependency)?.version;}
   }
-  self.install_validated(auth,owner,now,roots,verifier,signed,payload,item,minimums,true)
+  self.install_validated(auth,owner,now,roots,verifier,signed,payload,item,minimums,true,false)
+ }
+ /// New M2P5/P6: sign the full metadata and ELF hash rather than only
+ /// the executable content, preserving old formats for migration.
+ pub fn install_manifest_image<V:Verify,const N:usize>(
+  &mut self,auth:&Access<N>,owner:Identity,now:u64,
+  roots:&[Root],verifier:&V,signed:&Envelope,
+  image:&[u8],item:Package)->Result<Record,Error>{
+  if item.deps.iter().any(|&dep|dep!=0){return Err(Error::MissingDependency);}
+  self.install_validated(auth,owner,now,roots,verifier,signed,image,
+   item,[0;MAX_DEPS],true,true)
+ }
+ /// Signed catalog and exact min-version package installation.
+ pub fn install_manifest_image_from_catalog<V:Verify,const N:usize,const C:usize>(
+  &mut self,auth:&Access<N>,owner:Identity,now:u64,
+  roots:&[Root],verifier:&V,signed:&Envelope,
+  image:&[u8],catalog:&Catalog<C>,id:u32)->Result<Record,Error>{
+  auth.require(owner,INSTALL,now).map_err(|_|Error::Denied)?;
+  let item=catalog.get(id).ok_or(Error::MissingDependency)?;
+  let mut order=[0u32;C];
+  let n=catalog.resolve(id,&mut order).map_err(|_|Error::MissingDependency)?;
+  for dep in order[..n].iter().copied().filter(|&dep|dep!=id){
+   let required=catalog.get(dep).ok_or(Error::MissingDependency)?;
+   let installed=self.read(dep,false)?.ok_or(Error::MissingDependency)?;
+   if installed.version<required.version{return Err(Error::MissingDependency);}
+  }
+  let mut minimums=[0u64;MAX_DEPS];
+  for (n,dep) in item.deps.iter().copied().enumerate(){
+   if dep!=0{minimums[n]=catalog.get(dep).ok_or(Error::MissingDependency)?.version;}
+  }
+  self.install_validated(auth,owner,now,roots,verifier,signed,image,
+   item,minimums,true,true)
  }
  fn install_validated<V:Verify,const N:usize>(&mut self,auth:&Access<N>,
   owner:Identity,now:u64,roots:&[Root],verifier:&V,
   signed:&Envelope,payload:&[u8],item:Package,
-  minimums:[u64;MAX_DEPS],persist_image:bool)->Result<Record,Error>{
+  minimums:[u64;MAX_DEPS],persist_image:bool,signed_manifest:bool)
+ ->Result<Record,Error>{
   auth.require(owner,INSTALL,now).map_err(|_|Error::Denied)?;
   if item.id==0||item.id>99||item.version==0||
-   item.abi!=crate::m2_sdk::ABI||item.payload_digest!=signed.digest||
+   item.abi!=crate::m2_sdk::ABI||(!signed_manifest&&item.payload_digest!=signed.digest)||
    item.rights&!crate::batch6_security::ALL!=0{
    return Err(Error::Invalid);
   }
@@ -306,20 +363,30 @@ impl<D:BlockDevice> Inventory<D>{
   if persist_image{
    if payload.len()>MAX_IMAGE_BYTES{return Err(Error::Fs(FsError::TooLarge));}
    crate::m2_elf::validate_static(payload).map_err(|_|Error::Invalid)?;
-   if !crate::m2_sha256::matches(payload,&signed.digest){
+   if !crate::m2_sha256::matches(payload,&item.payload_digest){
     return Err(Error::DigestMismatch);
    }
   }
   // Real verifier MUST verify the actual digest and digital signature;
   // NEVER accept a user-supplied "verified" boolean.
-  batch4_signature::check(roots,verifier,signed,payload).map_err(Error::Trust)?;
+  let next=Record{id:item.id,version:item.version,
+   rights:item.rights,digest:item.payload_digest,deps:item.deps,minimums};
+  if signed_manifest{
+   if !persist_image||signed.digest!=crate::m2_manifest::digest(
+      next,signed.signer,signed.epoch){
+    return Err(Error::DigestMismatch);
+   }
+   crate::m2_manifest::check(roots,verifier,signed,next)
+    .map_err(Error::Trust)?;
+  }else{
+   batch4_signature::check(roots,verifier,signed,payload)
+    .map_err(Error::Trust)?;
+  }
   if self.read(item.id,true)?.is_some(){return Err(Error::RollbackPending);}
   let previous=self.read(item.id,false)?;
   if previous.is_some_and(|old|item.version<=old.version){
    return Err(Error::Downgrade);
   }
-  let next=Record{id:item.id,version:item.version,
-   rights:item.rights,digest:signed.digest,deps:item.deps,minimums};
   let p=name(item.id,false)?;
   let mut data=[0u8;MAX_FILE_BYTES];
   data[..LEN].copy_from_slice(&encode(next));
@@ -340,7 +407,7 @@ impl<D:BlockDevice> Inventory<D>{
     let inline=INLINE_IMAGE_BYTES;
     let extra=payload.len()-inline;
     if extra==0||extra>MAX_FILE_BYTES{return Err(Error::Fs(FsError::TooLarge));}
-    data[..4].copy_from_slice(b"M2P4");
+    data[..4].copy_from_slice(if signed_manifest{b"M2P6"}else{b"M2P4"});
     data[176..178].copy_from_slice(&(inline as u16).to_le_bytes());
     data[178..180].copy_from_slice(&(extra as u16).to_le_bytes());
     data[180]=slot;data[181]=0;
@@ -355,7 +422,7 @@ impl<D:BlockDevice> Inventory<D>{
     }
     EXT_HEADER+inline
    }else{
-    data[..4].copy_from_slice(b"M2P3");
+    data[..4].copy_from_slice(if signed_manifest{b"M2P5"}else{b"M2P3"});
     data[176..178].copy_from_slice(&(payload.len() as u16).to_le_bytes());
     data[IMAGE_HEADER..IMAGE_HEADER+payload.len()].copy_from_slice(payload);
     IMAGE_HEADER+payload.len()
@@ -952,6 +1019,164 @@ impl<D:BlockDevice> Inventory<D>{
     &image_envelope(&update),&update,image_pkg(2,&update)).unwrap();
   let (_,n)=i.verified_image(&auth(),actor(),1,&roots(),&ImageVerifier,7,&mut out).unwrap();
   assert_eq!(&out[..n],&update);
+ }
+
+ fn signed_metadata_record(v:u8,image:&[u8])->Record{
+  let item=image_pkg(v as u64,image);
+  Record{id:item.id,version:item.version,rights:item.rights,
+   digest:item.payload_digest,deps:item.deps,minimums:[0;4]}
+ }
+ fn signed_metadata_envelope(v:u8,image:&[u8])->Envelope{
+  Envelope{signer:1,epoch:1,
+   digest:crate::m2_manifest::digest(signed_metadata_record(v,image),1,1),
+   signature:[19;64]}
+ }
+ struct SignedMetadataVerifier;
+ impl Verify for SignedMetadataVerifier{
+  fn verify_digest_and_signature(&self,e:&Envelope,metadata:&[u8])->bool{
+   // Test-only exact allowlist, NOT a signature implementation. A real
+   // Ed25519 provider must authenticate ALL canonical fields.
+   if e.signer!=1||e.epoch!=1||e.signature!=[19;64]{
+    return false;
+   }
+   let inline=crate::m2_elf::tests::sample();
+   let v1=m2_large_image(2600,41);
+   let v2=m2_large_image(2800,42);
+   let matched=[(1u8,&inline[..]),(1u8,&v1[..]),(2u8,&v2[..])]
+    .into_iter().any(|(v,data)|{
+     let record=signed_metadata_record(v,data);
+     e.digest==crate::m2_manifest::digest(record,1,1)&&
+      metadata==crate::m2_manifest::canonical(record,1,1).as_slice()
+    });
+   matched
+  }
+ }
+ #[test]fn m2_signed_manifest_inline_verified_then_mutable_rights_tamper_denied(){
+  let mut inv=fresh();
+  let image=crate::m2_elf::tests::sample();
+  let envelope=signed_metadata_envelope(1,&image);
+  let before=inv.volume.generation();
+  let mut bad=Envelope{signer:envelope.signer,epoch:envelope.epoch,
+   digest:envelope.digest,signature:envelope.signature};
+  bad.digest[0]^=1;
+  assert_eq!(inv.install_manifest_image(&auth(),actor(),1,&roots(),
+    &SignedMetadataVerifier,&bad,&image,image_pkg(1,&image)),
+    Err(Error::DigestMismatch));
+  assert_eq!(inv.volume.generation(),before);
+  inv.install_manifest_image(&auth(),actor(),1,&roots(),
+   &SignedMetadataVerifier,&envelope,&image,image_pkg(1,&image)).unwrap();
+  assert_eq!(inv.require_signed_manifest(7),Ok(()));
+  let mut inv=Inventory::mount(inv.into_device()).unwrap();
+  let mut out=[0u8;MAX_IMAGE_BYTES];
+  assert_eq!(inv.verified_image(&auth(),actor(),1,&roots(),
+   &SignedMetadataVerifier,7,&mut out).unwrap().1,image.len());
+  let mut raw=[0u8;MAX_FILE_BYTES];
+  let (_,size)=inv.read_raw(7,false,&mut raw).unwrap().unwrap();
+  assert_eq!(&raw[..4],b"M2P5");
+  raw[16..20].copy_from_slice(
+   &(crate::batch6_security::FILE_READ|crate::batch6_security::FILE_WRITE).to_le_bytes());
+  inv.volume.overwrite("/pkg/p07",&raw[..size]).unwrap();
+  let mut inv=Inventory::mount(inv.into_device()).unwrap();
+  assert_eq!(inv.verified_image(&auth(),actor(),1,&roots(),
+   &SignedMetadataVerifier,7,&mut out),
+   Err(Error::Trust(batch4_signature::Error::InvalidSignature)));
+ }
+ #[test]fn m2_signed_manifest_extended_two_rollback_banks_survive_remount(){
+  let mut inv=fresh();
+  let v1=m2_large_image(2600,41);
+  let v2=m2_large_image(2800,42);
+  inv.install_manifest_image(&auth(),actor(),1,&roots(),&SignedMetadataVerifier,
+   &signed_metadata_envelope(1,&v1),&v1,image_pkg(1,&v1)).unwrap();
+  let mut inv=Inventory::mount(inv.into_device()).unwrap();
+  let mut buffer=[0u8;MAX_IMAGE_BYTES];
+  assert_eq!(inv.require_signed_manifest(7),Ok(()));
+  assert_eq!(inv.verified_image(&auth(),actor(),1,&roots(),
+   &SignedMetadataVerifier,7,&mut buffer).unwrap().1,v1.len());
+  inv.install_manifest_image(&auth(),actor(),1,&roots(),&SignedMetadataVerifier,
+   &signed_metadata_envelope(2,&v2),&v2,image_pkg(2,&v2)).unwrap();
+  let mut inv=Inventory::mount(inv.into_device()).unwrap();
+  let mut raw=[0u8;MAX_FILE_BYTES];
+  let (_,size)=inv.read_raw(7,false,&mut raw).unwrap().unwrap();
+  assert_eq!(&raw[..4],b"M2P6");
+  assert_eq!(inv.verified_image(&auth(),actor(),1,&roots(),
+   &SignedMetadataVerifier,7,&mut buffer).unwrap().1,v2.len());
+  assert_eq!(&buffer[..v2.len()],&v2);
+  inv.rollback(&auth(),actor(),1,7).unwrap();
+  let mut inv=Inventory::mount(inv.into_device()).unwrap();
+  assert_eq!(inv.verified_image(&auth(),actor(),1,&roots(),
+   &SignedMetadataVerifier,7,&mut buffer).unwrap().1,v1.len());
+  assert_eq!(&buffer[..v1.len()],&v1);
+  assert_eq!(inv.rollback_pending(7),Ok(false));
+  // The metadata-only and older unbound image formats must never satisfy
+  // the approved-native-execution format gate after migration.
+  inv.remove(&auth(),actor(),1,7).unwrap();
+  inv.install_image(&auth(),actor(),1,&roots(),&ImageVerifier,
+   &image_envelope(&v1),&v1,image_pkg(1,&v1)).unwrap();
+  assert_eq!(inv.require_signed_manifest(7),Err(Error::UnsignedManifest));
+ }
+ #[test]fn m2_signed_manifest_version_or_dependency_tamper_denied(){
+  let mut inv=fresh();
+  let image=crate::m2_elf::tests::sample();
+  inv.install_manifest_image(&auth(),actor(),1,&roots(),&SignedMetadataVerifier,
+   &signed_metadata_envelope(1,&image),&image,image_pkg(1,&image)).unwrap();
+  let mut bytes=[0u8;MAX_FILE_BYTES];
+  let (_,size)=inv.read_raw(7,false,&mut bytes).unwrap().unwrap();
+  bytes[8..16].copy_from_slice(&2u64.to_le_bytes());
+  inv.volume.overwrite("/pkg/p07",&bytes[..size]).unwrap();
+  let mut inv=Inventory::mount(inv.into_device()).unwrap();
+  let mut out=[0u8;MAX_IMAGE_BYTES];
+  assert_eq!(inv.verified_image(&auth(),actor(),1,&roots(),
+   &SignedMetadataVerifier,7,&mut out),
+   Err(Error::Trust(batch4_signature::Error::InvalidSignature)));
+ }
+
+ struct CatalogOnlyVerifier;
+ impl Verify for CatalogOnlyVerifier{
+  fn verify_digest_and_signature(&self,e:&Envelope,metadata:&[u8])->bool{
+   let image=crate::m2_elf::tests::sample();
+   let wanted=Record{id:7,version:1,rights:crate::batch6_security::FILE_READ,
+    digest:crate::m2_sha256::digest(&image),
+    deps:[8,0,0,0],minimums:[2,0,0,0]};
+   e.signer==1&&e.epoch==1&&e.signature==[27;64]&&
+    e.digest==crate::m2_manifest::digest(wanted,1,1)&&
+    metadata==crate::m2_manifest::canonical(wanted,1,1).as_slice()
+  }
+ }
+ #[test]fn m2_signed_manifest_dependency_minimum_and_identity_tamper_denied(){
+  let mut i=fresh();
+  let dependency=Package{id:8,version:2,abi:crate::m2_sdk::ABI,rights:0,
+   deps:[0;4],payload_digest:[2;32]};
+  i.install(&auth(),actor(),1,&roots(),&TestVerifier,&envelope(2),
+   b"candidate-elf",dependency).unwrap();
+  let image=crate::m2_elf::tests::sample();
+  let root=Package{id:7,version:1,abi:crate::m2_sdk::ABI,
+   rights:crate::batch6_security::FILE_READ,deps:[8,0,0,0],
+   payload_digest:crate::m2_sha256::digest(&image)};
+  let mut catalog=Catalog::<3>::new();
+  catalog.add(dependency).unwrap();
+  catalog.add(root).unwrap();
+  let signed_record=Record{id:7,version:1,rights:root.rights,
+   digest:root.payload_digest,deps:root.deps,minimums:[2,0,0,0]};
+  let signed=Envelope{signer:1,epoch:1,
+   digest:crate::m2_manifest::digest(signed_record,1,1),
+   signature:[27;64]};
+  i.install_manifest_image_from_catalog(&auth(),actor(),1,&roots(),
+   &CatalogOnlyVerifier,&signed,&image,&catalog,7).unwrap();
+  let mut i=Inventory::mount(i.into_device()).unwrap();
+  let mut out=[0u8;MAX_IMAGE_BYTES];
+  assert!(i.verified_image(&auth(),actor(),1,&roots(),
+   &CatalogOnlyVerifier,7,&mut out).is_ok());
+  let mut raw=[0u8;MAX_FILE_BYTES];
+  let (_,count)=i.read_raw(7,false,&mut raw).unwrap().unwrap();
+  // A CRC-valid edit lowers the dependency minimum while preserving the
+  // same ELF image and signature bytes. The graph still resolves, but
+  // the canonical metadata signature MUST now fail.
+  raw[68..76].copy_from_slice(&1u64.to_le_bytes());
+  i.volume.overwrite("/pkg/p07",&raw[..count]).unwrap();
+  let mut i=Inventory::mount(i.into_device()).unwrap();
+  assert_eq!(i.verified_image(&auth(),actor(),1,&roots(),
+   &CatalogOnlyVerifier,7,&mut out),
+   Err(Error::Trust(batch4_signature::Error::InvalidSignature)));
  }
 
 }

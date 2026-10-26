@@ -193,6 +193,9 @@ pub fn execute_installed_approved<
     generation:u64,consent:&Ledger<C>,
 )->Result<Record,Error>{
     if generation==0{return Err(Error::ConsentDenied);}
+    // A legacy M2P3/P4 record signs the ELF but NOT the permission/version
+    // metadata. Reject it before staging or executing a new installed app.
+    inventory.require_signed_manifest(id).map_err(Error::Stored)?;
     let mut bytes=[0u8;MAX_IMAGE_BYTES];
     let (record,size)=verified_for_execution(
         inventory,auth,owner,now,roots,verifier,id,process,&mut bytes
