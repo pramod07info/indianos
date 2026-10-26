@@ -284,6 +284,20 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
     !source.permissions.user||!source.permissions.executable||
     source.permissions.writable{return BAD;}
  let request=SyscallRequest{number:r[14],arg0:r[9],arg1:r[10]};
+ // The installed-app permission mask applies in the REAL INT 0x80 trap.
+ // Authenticate the PID from ACTIVE_PROCESS, never from syscall registers.
+ // Normal system tasks remain unchanged when no installed app is armed.
+ #[cfg(feature="test-m2-developer-alpha")]
+ {
+  let pcb=unsafe{ptr::read(ptr::addr_of!(ACTIVE_PROCESS))};
+  let caller=unsafe{pcb.as_ref()}.filter(|p|p.state==3).map_or(0,|p|p.pid);
+  if !crate::m2_syscall_guard::allow_active(
+      caller,request.number,request.arg0){
+   #[cfg(feature="test-m2-disk-exec")]
+   log(b"IndianOS: M2 installed app privileged syscall DENIED\n\0");
+   return BAD;
+  }
+ }
  if !unsafe{indianos_syscall_validate(ptr::addr_of!((*img).plan),request)}{return BAD;}
  match request.number{
   #[cfg(feature="test-r029-userspace")]

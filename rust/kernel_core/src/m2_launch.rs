@@ -197,8 +197,15 @@ pub fn execute_installed_approved<
     let (record,size)=verified_for_execution(
         inventory,auth,owner,now,roots,verifier,id,process,&mut bytes
     )?;
-    consent.require(Identity{pid:process.pid,generation},record,now)
+    let process_identity=Identity{pid:process.pid,generation};
+    consent.require(process_identity,record,now)
         .map_err(|_|Error::ConsentDenied)?;
+    // Scope the live syscall gate to the currently verified, approved NEW
+    // PCB and remove it on either normal exit or guest failure.
+    let policy=crate::m2_syscall_guard::Policy::new(
+        process_identity,record.rights
+    ).ok_or(Error::ConsentDenied)?;
+    let armed=crate::m2_syscall_guard::arm(policy).ok_or(Error::Busy)?;
     // SAFETY: The single-core trusted supervisor exclusively owns a NEW
     // PCB; bytes are in kernel memory and live until the synchronous runner
     // restores kernel CR3 and finishes EXIT/FAULT/REAP cleanup.
@@ -207,6 +214,7 @@ pub fn execute_installed_approved<
             process as *mut Process,bytes.as_ptr(),size
         )
     };
+    drop(armed); // released after synchronous ring3 exit/fault in kernel CR3
     if completed{Ok(record)}else{Err(Error::GuestExecutionFailed)}
 }
 
