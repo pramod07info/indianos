@@ -235,3 +235,46 @@ and syscall enforcement of per-app approved rights, larger native ELF
 storage than 1,870 bytes, robust general-purpose sockets/TLS/DHCP, and
 independently authored third-party app acceptance. None of these claims
 is inferred from passing a test-only signature fixture.
+
+
+## M2 Phase 3: two-extent durable ELF storage, A/B rollback and QEMU proof
+
+The previous M2P3 layout could store only 1,870 executable bytes. New
+**M2P4** records preserve the existing metadata/signature/dependency envelope
+and store up to **3,914 bytes** of one static x86-64 ELF:
+
+- **1,866 bytes inline** in the 2,048-byte durable metadata file, with
+  signer ID, trust epoch, 64-byte signature, SHA-256, capability rights,
+  version and persisted minimum dependency versions.
+- **Up to 2,048 bytes** of trailing executable data in exactly one
+  independently CRC-checked overflow bank (/pkg/xNN or /pkg/yNN).
+  A persisted M2P4 manifest includes checked lengths, a slot selector
+  and a zero reserved byte; M2P3 and M2P2 remain backward compatible.
+- **Crash-safe publication order:** write the new, unreferenced extent
+  bank first; preserve the old manifest as a rollback checkpoint; then
+  publish the new manifest using the filesystem COW metadata. A failed
+  extent write does not alter the active manifest. A remount never trusts
+  detached bytes unless the referencing M2P4 manifest, CRC, strict ELF
+  parser, SHA-256 and injected publisher verifier all pass.
+- **Lifecycle-aware bank reclamation:** confirmation, rollback and
+  removal reclaim only banks no longer referenced by either the active
+  or backup manifest. Orphan cleanup is separately retryable with a
+  PID-generation-scoped INSTALL capability.
+- **Four actual QEMU boots:** the signed-fixture guest runs a
+  **2,400-byte** stored ELF in ring-3 (above the former limit),
+  then upgrades and executes it, rolls back to the old overflow bank
+  after reboot, and removes it while denying relaunch. The host checks
+  disk boundary guards and requires an M2P4 manifest on disk.
+
+Host regression tests also cover the 3,914-byte bound,
+out-of-bounds rejection before mutation, interrupted overflow writes,
+CRC-valid tampering, absent extents, remount reconstruction, protected
+A/B checkpoints, and confirmed-update cleanup.
+
+**Boundaries and remaining M2 work:** R027 provides eight durable file
+slots total. M2P4 consumes one additional bank per active extended
+package (and two banks during upgrade), not general-purpose large app
+storage. QEMU still uses a non-Ed25519 signature verifier. Deployable
+on-guest Ed25519, secure trust-root provisioning, approved-rights syscall
+enforcement, GUI consent, and truly large streaming/journaled executable
+extents remain pending.

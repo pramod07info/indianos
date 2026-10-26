@@ -14,7 +14,8 @@ use crate::{ProcessTable,indianos_process_create,indianos_process_success};
 const START:u64=24;
 const COUNT:u64=100;
 const APP:u32=9;
-const IMAGE_LEN:usize=136;
+// Deliberately larger than the old 1870-byte M2P3 maximum.
+const IMAGE_LEN:usize=2400;
 const ADMIN:Identity=Identity{pid:44,generation:1};
 const ROOTS:[Root;1]=[Root{signer:7,epoch:2,enabled:true}];
 fn elf(v:u8)->[u8;IMAGE_LEN]{
@@ -36,8 +37,10 @@ fn elf(v:u8)->[u8;IMAGE_LEN]{
  b[104..112].copy_from_slice(&(IMAGE_LEN as u64).to_le_bytes());
  b[112..120].copy_from_slice(&4096u64.to_le_bytes());
  // mov eax,2 ; xor edi,edi ; xor esi,esi ; int80 ; hlt ; nop,nop,nop
- b[120..].copy_from_slice(&[0xB8,2,0,0,0,0x31,0xFF,0x31,0xF6,0xCD,0x80,
+ b[120..136].copy_from_slice(&[0xB8,2,0,0,0,0x31,0xFF,0x31,0xF6,0xCD,0x80,
   0xF4,0x90,0x90,0x90,v]);
+ // Zero-filled tail is deliberately file-backed: the runtime must map
+ // and execute the larger persisted M2P4 package, not initramfs data.
  b
 }
 fn envelope(v:u8)->Envelope{

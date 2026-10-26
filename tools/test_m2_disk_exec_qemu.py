@@ -10,12 +10,14 @@ STAGES=[
  "IndianOS: M2 disk boot3 rolled-back ELF v1 executed",
  "IndianOS: M2 disk boot4 removed app and rejected exec"]
 DONE="IndianOS: M2 persisted ring3 package lifecycle PASSED"
-def check_disk(path:Path)->None:
+def check_disk(path:Path, phase:int)->None:
  data=path.read_bytes()
  if len(data)!=TOTAL*512 or any(data[:START*512]) or any(data[(START+COUNT)*512:]):
   raise AssertionError("QEMU wrote outside disposable M2 partition")
  if data[START*512:START*512+8]!=b"INDR027!":
   raise AssertionError("M2 durablefs metadata missing")
+ if phase<=3 and b"M2P4" not in data[START*512:(START+COUNT)*512]:
+  raise AssertionError("large ELF M2P4 manifest was not persisted")
 def boot(qemu:str,ovmf:Path,iso:Path,disk:Path,stage:str)->None:
  cmd=[qemu,"-machine","pc","-m","256M","-smp","1",
       "-display","none","-monitor","none","-serial","stdio",
@@ -69,7 +71,7 @@ def main()->None:
   disk.write_bytes(bytes(TOTAL*512))
   for n,stage in enumerate(STAGES,1):
    boot(args.qemu,args.ovmf.resolve(),args.iso.resolve(),disk,stage)
-   check_disk(disk)
+   check_disk(disk,n)
    print(f"M2 native ring3 disk boot {n}/4 PASS")
   print("M2 TEST-ONLY QEMU ring3 stored-image lifecycle passed")
 if __name__=="__main__":main()

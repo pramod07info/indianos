@@ -39,6 +39,9 @@ jobs:
           cargo test --offline --manifest-path rust/kernel_core/Cargo.toml --features test-m2-developer-alpha m2_consent_
           cargo test --offline --manifest-path rust/kernel_core/Cargo.toml --features test-m2-developer-alpha m2_saved_transitive_dependency
           cargo test --offline --manifest-path rust/kernel_core/Cargo.toml --features test-m2-developer-alpha m2_app_store_previews
+      - name: M2P4 two-file executable upgrade rollback corruption and power-loss regressions
+        run: |
+          cargo test --offline --manifest-path rust/kernel_core/Cargo.toml --features test-m2-developer-alpha m2_extended_image
       - name: M2 no_std compilation of integrated guest modules
         run: |
           cargo check --offline --manifest-path rust/kernel_core/Cargo.toml --no-default-features --features test-m2-developer-alpha --target x86_64-unknown-none
@@ -69,7 +72,7 @@ jobs:
           done
           test -n "$OVMF_PATH"
           make test-r030-package-qemu OVMF_CODE="$OVMF_PATH"
-      - name: M2 guest persisted executable ring3 across four disposable QEMU boots
+      - name: M2P4 large persistent ELF ring3 install upgrade rollback remove in four QEMU boots
         run: |
           set -euo pipefail
           OVMF_PATH=""
