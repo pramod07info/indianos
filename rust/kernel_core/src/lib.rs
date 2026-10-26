@@ -40,6 +40,9 @@ pub mod hardware_driver_stage;
 /// Issue #124 HD3B.1: bounded virtio-gpu modern PCI capability discovery
 /// and 2D command protocol. Real DMA virtqueues remain separately gated.
 pub mod hardware_virtio_gpu;
+/// HD3B.2: numeric split virtqueue ownership, IOMMU-domain and geometry gates.
+/// Staging only: never enables hardware, DMA or BAR mapping.
+pub mod hardware_virtio_queue;
 pub mod agent_08_boot_slot;
 pub mod agent_09_ci_policy;
 pub mod agent_10_app_policy;
