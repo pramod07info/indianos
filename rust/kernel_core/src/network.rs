@@ -597,3 +597,90 @@ mod r034_ingress_tests {
         assert_eq!(&out[..4], b"live");
     }
 }
+
+
+/// Batch 1: generation-bound process endpoint adapter around the actual R034
+/// validated-ingress queue. Scheduler supplies trusted (PID,generation).
+/// A recycled PID must retire its old bindings before registering new ones.
+pub struct EpochUdpEndpoints<const PORTS: usize, const QUEUE: usize> {
+    endpoints: UdpEndpoints<PORTS, QUEUE>,
+    owners: [Option<(u32,u64)>; PORTS],
+}
+impl<const PORTS: usize, const QUEUE: usize> EpochUdpEndpoints<PORTS, QUEUE> {
+    pub const fn new() -> Self {
+        Self { endpoints: UdpEndpoints::new(), owners: [None; PORTS] }
+    }
+    fn authenticated(&self, pid: u32, generation: u64) -> bool {
+        pid != 0 && generation != 0 && self.owners.iter().flatten()
+            .any(|&(owner, epoch)| owner == pid && epoch == generation)
+    }
+    pub fn bind(&mut self, pid: u32, generation: u64, port: u16)
+        -> Result<(), SocketError> {
+        if pid == 0 || generation == 0 || port == 0 {
+            return Err(SocketError::Invalid);
+        }
+        if self.owners.iter().flatten().any(|&(owner,epoch)|
+            owner == pid && epoch != generation) {
+            return Err(SocketError::Denied);
+        }
+        let known = self.authenticated(pid,generation);
+        if !known && self.owners.iter().all(Option::is_some) {
+            return Err(SocketError::Full);
+        }
+        self.endpoints.bind(pid,port)?;
+        if !known {
+            let free = self.owners.iter_mut().find(|o|o.is_none())
+                .ok_or(SocketError::Full)?;
+            *free = Some((pid,generation));
+        }
+        Ok(())
+    }
+    pub fn receive(&mut self, pid: u32, generation: u64,
+        port: u16, out: &mut [u8]) -> Result<usize,SocketError> {
+        if !self.authenticated(pid,generation) { return Err(SocketError::Denied); }
+        self.endpoints.receive(pid,port,out)
+    }
+    pub fn ingest_ethernet_frame(&mut self, frame: &[u8], mac: [u8;6])
+        -> Result<(),IngressError> {
+        self.endpoints.ingest_ethernet_frame(frame,mac)
+    }
+    /// Only a matching live generation may retire an endpoint.
+    pub fn retire(&mut self, pid: u32, generation: u64)
+        -> Result<(),SocketError> {
+        if !self.authenticated(pid,generation) { return Err(SocketError::Denied); }
+        self.endpoints.close_all(pid);
+        for slot in &mut self.owners {
+            if slot.is_some_and(|pair|pair == (pid,generation)){*slot=None;}
+        }
+        Ok(())
+    }
+}
+#[cfg(test)]
+mod batch1_epoch_udp_tests {
+    use super::*;
+    #[test]
+    fn pid_reuse_never_inherits_queued_udp() {
+        let mut e=EpochUdpEndpoints::<2,3>::new();
+        e.bind(11,1,6000).unwrap();
+        e.endpoints.enqueue(6000,b"old").unwrap();
+        assert_eq!(e.receive(11,2,6000,&mut[0u8;8]),Err(SocketError::Denied));
+        assert_eq!(e.bind(11,2,6001),Err(SocketError::Denied));
+        assert_eq!(e.retire(11,2),Err(SocketError::Denied));
+        e.retire(11,1).unwrap();
+        e.bind(11,2,6000).unwrap();
+        assert_eq!(e.receive(11,2,6000,&mut[0u8;8]),Err(SocketError::Empty));
+    }
+    #[test]
+    fn retirement_preserves_peer_messages() {
+        let mut e=EpochUdpEndpoints::<2,3>::new();
+        e.bind(11,1,6000).unwrap();
+        e.bind(12,1,6001).unwrap();
+        e.endpoints.enqueue(6000,b"retired").unwrap();
+        e.endpoints.enqueue(6001,b"live").unwrap();
+        e.retire(11,1).unwrap();
+        let mut out=[0u8;8];
+        assert_eq!(e.receive(12,1,6001,&mut out),Ok(4));
+        assert_eq!(&out[..4],b"live");
+    }
+}
+

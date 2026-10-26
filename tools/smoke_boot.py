@@ -46,6 +46,35 @@ def assert_milestones(text: str) -> None:
             raise AssertionError(f"missing or out-of-order milestone: {marker}")
         offset = position + len(marker)
 
+def assert_hardware_inventory(text: str) -> None:
+    """A real freestanding QEMU boot must probe CPU and report honest fallback."""
+    if "IndianOS HD0 CPU" not in text:
+        raise AssertionError("missing automatic boot-time CPU profile")
+    if "QPU=unavailable" not in text or "CPU fallback=enabled" not in text:
+        raise AssertionError("missing honest quantum/CPU fallback status")
+    if "GPU=unknown" not in text and "detected(no driver)" not in text:
+        raise AssertionError("CPU/PCI inventory failed to report driver status")
+    if ("IndianOS HD1 PCI buses=" not in text and
+            "IndianOS HD1 PCI topology unavailable" not in text):
+        raise AssertionError("HD1 bridge discovery/fallback status is missing")
+    if "driver=not activated" not in text and "no optional accelerator driver activated" not in text:
+        raise AssertionError("HD1 must not report a detected GPU as an active driver")
+    if ("IndianOS HD2 driver catalog=unavailable" not in text or
+        "signed candidates=0" not in text or
+        "GPU/NPU drivers=not activated" not in text):
+        raise AssertionError("HD2 must fail closed without authenticated signed driver catalog")
+    if ("IndianOS HD3 driver image=not installed" not in text or
+        "MMIO=not mapped" not in text or
+        "DMA=disabled" not in text or
+        "IOMMU=not attested" not in text or
+        "GPU/NPU=CPU fallback" not in text):
+        raise AssertionError("HD3 must not autoactivate GPU, DMA or untrusted drivers")
+    if ("IndianOS HD3B virtio-gpu " not in text or
+        "queue=disabled" not in text or
+        "GPU acceleration=not active" not in text):
+        raise AssertionError("HD3B must probe safely without activating DMA/GPU")
+
+
 def assert_expected_exception(text: str) -> None:
     """A deliberate invalid-opcode trap must be caught by our own IDT."""
     offset = 0
@@ -330,7 +359,8 @@ def matching_ovmf_vars(code: Path) -> Path | None:
 
 
 def run_smoke(iso: Path, ovmf: Path, qemu: str, timeout: float,
-              mode: str = "normal", machine: str = "q35") -> str:
+              mode: str = "normal", machine: str = "q35",
+              extra_devices: tuple[str, ...] = ()) -> str:
     if not iso.is_file():
         raise ValueError(f"ISO not found: {iso}")
     if not ovmf.is_file():
@@ -362,6 +392,7 @@ def run_smoke(iso: Path, ovmf: Path, qemu: str, timeout: float,
         "-cdrom", str(iso), "-boot", "d", "-display", "none",
         "-serial", "stdio", "-monitor", "none", "-no-reboot", "-no-shutdown",
     ]
+    argv.extend(extra_devices)
     if mode == "preempt":
         # HPET legacy replacement can suppress PIT IRQ0 on some firmware.
         # Keep this emulator-only override out of all ordinary boot paths.
@@ -400,8 +431,10 @@ def run_smoke(iso: Path, ovmf: Path, qemu: str, timeout: float,
                     if len(output) > 1024 * 1024:
                         raise AssertionError("QEMU emitted too much output")
                     try:
-                        verify(output.decode("utf-8", errors="replace"))
-                        return output.decode("utf-8", errors="replace")
+                        observed=output.decode("utf-8", errors="replace")
+                        verify(observed)
+                        assert_hardware_inventory(observed)
+                        return observed
                     except AssertionError:
                         pass
                 if process.poll() is not None:
@@ -409,6 +442,7 @@ def run_smoke(iso: Path, ovmf: Path, qemu: str, timeout: float,
         text = output.decode("utf-8", errors="replace")
         try:
             verify(text)
+            assert_hardware_inventory(text)
         except AssertionError as exc:
             # CI previously hid the useful serial transcript on an incomplete
             # boot; append a bounded diagnostic tail without dumping firmware

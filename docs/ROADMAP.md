@@ -1,5 +1,10 @@
 # IndianOS development roadmap
 
+**Five delivery milestones (M1–M5) are now authoritative.** See
+[the master milestone acceptance document](DELIVERY_MILESTONES.md).
+The earlier numbered phases in this file remain useful engineering detail;
+they do not supersede the M1–M5 outcome/exit gates.
+
 > Planning estimates assume an experienced engineer and a small open-source team; they are not delivery commitments. **An everyday Windows alternative is a multi-year, multi-person effort.**
 
 | Phase | Suggested horizon | Objective | Exit condition |

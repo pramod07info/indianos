@@ -1,0 +1,48 @@
+name: M1 persistent desktop and durable VFS integration
+on:
+  push:
+    branches: [main, milestone/m1-desktop-storage]
+    paths:
+      - 'rust/kernel_core/src/m1_*.rs'
+      - 'rust/kernel_core/src/lib.rs'
+      - 'rust/kernel_core/Cargo.toml'
+      - '.github/workflows/m1-persistent-desktop.yml'
+  pull_request:
+    paths:
+      - 'rust/kernel_core/src/m1_*.rs'
+      - 'rust/kernel_core/src/lib.rs'
+      - 'rust/kernel_core/Cargo.toml'
+      - '.github/workflows/m1-persistent-desktop.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  durable-files-desktop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Execute M1 MBR/GPT partition parser, remount and Terminal tests
+        run: |
+          cargo test --offline --manifest-path rust/kernel_core/Cargo.toml --features test-r031-vfs m1_
+      - name: Build M1 durable VFS service interfaces in no_std mode
+        run: |
+          cargo check --offline --manifest-path rust/kernel_core/Cargo.toml --no-default-features --features test-r031-vfs
+      - name: Install emulator and UEFI dependencies for real graphical Files disk test
+        run: |
+          # Github-hosted mirrors can download QEMU slowly. Preserve the
+          # mandatory emulator test; avoid optional GUI packages and retry.
+          sudo timeout 300s apt-get update -o Acquire::Retries=3 -o Acquire::http::Timeout=40
+          sudo timeout 600s apt-get install -y --no-install-recommends -o Acquire::Retries=3 -o Acquire::http::Timeout=40 clang lld binutils xorriso qemu-system-x86 ovmf curl openssl
+      - name: Install freestanding target for guest verification
+        run: rustup target add x86_64-unknown-none
+      - name: Real QEMU ring-3 graphical Files plus persistent scratch disk after reboot
+        run: |
+          set -euo pipefail
+          OVMF_PATH=""
+          for path in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/edk2/ovmf/OVMF_CODE_4M.fd /usr/share/edk2/ovmf/OVMF_CODE.fd; do
+            if test -f "$path"; then OVMF_PATH="$path"; break; fi
+          done
+          test -n "$OVMF_PATH"
+          make test-r031-files-gui-qemu OVMF_CODE="$OVMF_PATH"

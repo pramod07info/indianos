@@ -23,8 +23,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install QEMU and UEFI development dependencies
         run: |
-          sudo timeout 120s apt-get update -o Acquire::Retries=0 -o Acquire::http::Timeout=30
-          sudo timeout 120s apt-get install -y clang lld binutils xorriso qemu-system-x86 ovmf curl openssl
+          sudo timeout 300s apt-get update -o Acquire::Retries=3 -o Acquire::http::Timeout=40
+          sudo timeout 600s apt-get install -y --no-install-recommends -o Acquire::Retries=3 -o Acquire::http::Timeout=40 clang lld binutils xorriso qemu-system-x86 ovmf curl openssl
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-none

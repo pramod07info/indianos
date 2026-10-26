@@ -59,6 +59,56 @@ pub extern "C" fn kmain()->!{
     log(b"IndianOS: kernel entered\n\0");
     need(unsafe{boot_validate()},b"IndianOS: FATAL boot information invalid\n\0");
     log(b"IndianOS: boot information validated\n\0");
+    // Issue #124 HD1: each x86-64 boot enumerates CPU and PCI-PCI bridge
+    // topology before optional device drivers. No PCI command writes,
+    // BAR mapping, device init or implicit quantum/cloud connection.
+    #[cfg(all(target_arch="x86_64",target_os="none"))]
+    {
+        use crate::{hardware_inventory as hw,hardware_pcie as topo};
+        need(hw::inspect_cpu(&hw::native::BootCpu).is_ok(),
+            b"IndianOS: FATAL unsupported x86-64 CPU capabilities\n\0");
+        match topo::native::detect_boot(){
+            Ok(profile)=>{
+                let mut report=[0u8;320];
+                need(topo::format_report(&profile,&mut report).is_ok(),
+                    b"IndianOS: FATAL HD1 hardware report buffer\n\0");
+                unsafe{serial_write(report.as_ptr().cast())};
+                // HD2 re-probes immutable PCI identity fields, WITHOUT
+                // loading unsigned drivers or enabling MMIO/bus mastering.
+                let mut ids=crate::hardware_driver_policy::native::ReadOnlyIds;
+                let preflight=crate::hardware_driver_policy::preflight(
+                    &profile.inventory,&mut ids);
+                let mut hd2=[0u8;160];
+                need(crate::hardware_driver_policy::format_report(
+                    &preflight,&mut hd2).is_ok(),
+                    b"IndianOS: FATAL HD2 driver preflight report\n\0");
+                unsafe{serial_write(hd2.as_ptr().cast())};
+                // HD3B.1: real PCI capability headers are enumerated
+                // on every boot. The virtio-gpu queue is NOT enabled:
+                // DMA requires a trusted IOMMU and signed driver.
+                let has_gpu=crate::hardware_virtio_gpu::native::probe(
+                    &profile).is_ok();
+                log(crate::hardware_virtio_gpu::status_line(has_gpu));
+            },
+            Err(_)=>{
+                // CPU-only boot continues when an optional PCI bridge is
+                // absent, malformed or cannot be probed safely.
+                log(b"IndianOS HD0 CPU supported; GPU=unknown; NPU=unknown; QPU=unavailable; CPU fallback=enabled\n\0");
+                log(b"IndianOS HD1 PCI topology unavailable; no optional accelerator driver activated\n\0");
+                log(b"IndianOS HD2 driver catalog=unavailable; signed candidates=0; GPU/NPU drivers=not activated; QPU=unavailable; CPU fallback=enabled\n\0");
+                log(crate::hardware_virtio_gpu::status_line(false));
+            }
+        }
+    }
+    // HD3A: no driver activation without authenticated firmware roots,
+    // real IOMMU isolation, and a tested user-mode driver runtime.
+    log(crate::hardware_driver_stage::boot_driver_status());
+    #[cfg(feature="test-r041-workspace")]
+    {
+        need(crate::batch7_workspace::bounded_workspace_smoke(),
+             b"IndianOS: FATAL R041 workspace read/write/revocation smoke\n\0");
+        log(b"IndianOS: R041 RAM workspace terminal write/read/revocation PASSED\n\0");
+    }
     unsafe{boot_draw_status();}
     #[cfg(feature="test-r029-userspace")]
     {
@@ -318,6 +368,23 @@ pub extern "C" fn kmain()->!{
     log(b"IndianOS: ELF64 user-image validation ready\n\0");
     log(b"IndianOS: syscall ABI metadata validation ready\n\0");
     log(b"IndianOS: milestone 005 foundation complete\n\0");
+    #[cfg(all(feature="test-m2-disk-exec",target_arch="x86_64",target_os="none"))]
+    {
+        let stage=crate::m2_guest_qemu::run().unwrap_or_else(|_|{
+            log(b"IndianOS: FATAL M2 disk native ring3 lifecycle\n\0");halt()
+        });
+        log(b"IndianOS: M2 Phase 4D QEMU simulated monotonic boot gate VERIFIED\n\0");
+        log(b"IndianOS: M2 real Ed25519 boot policy and package signature VERIFIED\n\0");
+        match stage{
+          1=>log(b"IndianOS: M2 disk boot1 installed ELF v1 executed\n\0"),
+          2=>log(b"IndianOS: M2 disk boot2 upgraded ELF v2 executed\n\0"),
+          3=>log(b"IndianOS: M2 disk boot3 rolled-back ELF v1 executed\n\0"),
+          4=>log(b"IndianOS: M2 disk boot4 removed app and rejected exec\n\0"),
+          _=>{log(b"IndianOS: FATAL M2 unexpected boot phase\n\0");halt()}
+        }
+        log(b"IndianOS: M2 persisted ring3 package lifecycle PASSED\n\0");
+        halt()
+    }
     let (init,init_size)=module(b"/bin/init\0").unwrap_or_else(||{
         log(b"IndianOS: FATAL initramfs /bin/init is unavailable or invalid\n\0");
         halt()

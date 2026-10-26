@@ -24,6 +24,22 @@ pub mod agent_04_service_restart;
 pub mod agent_05_surface_rect;
 pub mod agent_06_ipv4_route;
 pub mod agent_07_pci_aperture;
+/// Issue #124 HD0: no_std CPU/PCI hardware inventory for installer and boot.
+pub mod hardware_inventory;
+/// Issue #124 HD1: bounded read-only PCI-to-PCI bridge topology.
+pub mod hardware_pcie;
+/// ACPI MCFG checksum and bounded PCIe ECAM address parser (no MMIO).
+pub mod hardware_mcfg;
+/// Issue #124 HD2: fail-closed signed GPU/NPU driver-catalog compatibility.
+/// Boot reports candidates only; it never binds drivers without IOMMU/DMA
+/// isolation, capabilities, installed binaries and authenticated firmware.
+pub mod hardware_driver_policy;
+/// Issue #124 HD3A: verified driver-image quarantine and numeric-only
+/// resource plans. No DMA/MMIO activation occurs here.
+pub mod hardware_driver_stage;
+/// Issue #124 HD3B.1: bounded virtio-gpu modern PCI capability discovery
+/// and 2D command protocol. Real DMA virtqueues remain separately gated.
+pub mod hardware_virtio_gpu;
 pub mod agent_08_boot_slot;
 pub mod agent_09_ci_policy;
 pub mod agent_10_app_policy;
@@ -33,6 +49,131 @@ pub mod capability;
 pub mod vfs_path;
 /// Allocation-free process event FIFO and teardown cleanup.
 pub mod process_events;
+// M1: authenticated ring3-service policy using the already implemented
+// checksummed, sector-backed HierVfs; host remount integration acceptance.
+// Does not enable formatting or physical-device access in ordinary boot.
+#[cfg(feature="test-r031-vfs")]
+pub mod m1_input;
+#[cfg(feature="test-r031-vfs")]
+pub mod m1_partition;
+#[cfg(feature="test-r031-vfs")]
+pub mod m1_persistent_terminal;
+#[cfg(feature="test-r031-vfs")]
+pub mod m1_persistent_desktop;
+// M2 Developer Alpha integrated host-testable foundations. The guest must
+// wire actual network, signature-verifier, ELF loader and UI services later.
+#[cfg(feature="test-m2-developer-alpha")]
+pub mod m2_sdk;
+#[cfg(feature="test-m2-developer-alpha")]
+pub mod m2_elf;
+#[cfg(feature="test-m2-developer-alpha")]
+pub mod m2_sha256;
+#[cfg(feature="test-m2-developer-alpha")]
+pub mod m2_blob_store;
+#[cfg(feature="test-m2-developer-alpha")]
+pub mod m2_bundle_manifest;
+#[cfg(feature="test-m2-developer-alpha")]
+pub mod m2_large_launch;
+#[cfg(feature="test-m2-developer-alpha")]
+pub mod m2_manifest;
+#[cfg(feature="test-m2-developer-alpha")]
+pub mod m2_consent;
+#[cfg(feature="test-m2-developer-alpha")]
+pub mod m2_trust;
+#[cfg(feature="test-m2-developer-alpha")]
+pub mod m2_ed25519;
+#[cfg(feature="test-m2-developer-alpha")]
+pub mod m2_trust_policy;
+#[cfg(feature="test-m2-developer-alpha")]
+pub mod m2_boot_trust;
+#[cfg(feature="test-m2-developer-alpha")]
+pub mod m2_syscall_guard;
+#[cfg(feature="test-m2-developer-alpha")]
+pub mod m2_inventory;
+#[cfg(feature="test-m2-developer-alpha")]
+pub mod m2_network;
+#[cfg(feature="test-m2-developer-alpha")]
+pub mod m2_store;
+// Ring-3 image staging uses the existing PMM/VMM user-image loader,
+// and is deliberately compiled only when that real loader is enabled.
+#[cfg(all(feature="test-m2-developer-alpha",feature="user-image"))]
+pub mod m2_launch;
+#[cfg(all(feature="test-m2-disk-exec",target_arch="x86_64",target_os="none"))]
+pub mod m2_guest_qemu;
+// R041 Batch 7: real allocation-free RAM file data and an interactive
+// authenticated Files/Terminal workspace. Persistent media and a full
+// ring3 compositor require separate QEMU/hardware acceptance.
+pub mod batch7_ramfs;
+pub mod batch7_terminal;
+pub mod batch7_workspace;
+#[cfg(test)]
+mod batch7_acceptance;
+// R040 Batch 6: stronger integrated policies for tasks 2 through 25.
+// Full drivers, live compositor/syscalls, hardware boot and compatibility
+// runtimes are explicitly NOT implemented by these host-tested adapters.
+pub mod batch6_boot;
+pub mod batch6_surface;
+pub mod batch6_security;
+pub mod batch6_storage;
+pub mod batch6_network;
+pub mod batch6_recovery;
+pub mod batch6_devices;
+pub mod batch6_apps;
+pub mod batch6_release;
+#[cfg(test)]
+mod batch6_acceptance;
+// R039 Batch 5: authenticated integration adapters across tasks 2–25.
+// Kernel/driver/UI backends and actual cross-platform runtimes remain separate.
+pub mod batch5_session;
+pub mod batch5_vfs;
+pub mod batch5_installer;
+pub mod batch5_network;
+pub mod batch5_devices;
+pub mod batch5_compat;
+pub mod batch5_release;
+pub mod batch5_accessibility;
+#[cfg(test)]
+mod batch5_acceptance;
+// R038 bounded AI catalog, software-compatibility and release safety.
+pub mod batch4_ai_catalog;
+pub mod batch4_approval;
+pub mod batch4_signature;
+pub mod batch4_rollback;
+pub mod batch4_linux_abi;
+pub mod batch4_windows_pe;
+pub mod batch4_android;
+pub mod batch4_macos_policy;
+pub mod batch4_performance;
+pub mod batch4_release;
+#[cfg(test)]
+mod batch4_acceptance;
+// R037 bounded hardware, networking and security validation scaffolding.
+pub mod batch3_driver_isolation;
+pub mod batch3_ahci;
+pub mod batch3_nvme;
+pub mod batch3_virtio;
+pub mod batch3_acpi;
+pub mod batch3_network_security;
+pub mod batch3_updates;
+pub mod batch3_crashlog;
+pub mod batch3_hardware_matrix;
+pub mod batch3_security_audit;
+#[cfg(test)]
+mod batch3_acceptance;
+// R036 Batch 2: bounded user-facing desktop and init foundations.
+// Exported policy APIs; live ring-3 service integration is a later milestone.
+pub mod batch2_init;
+pub mod batch2_launcher;
+pub mod batch2_events;
+pub mod batch2_windows;
+pub mod batch2_keyboard;
+pub mod batch2_terminal;
+pub mod batch2_files;
+pub mod batch2_installer;
+pub mod batch2_settings;
+pub mod batch2_gui_qa;
+#[cfg(test)]
+mod batch2_acceptance;
 pub mod tinyfs;
 /// R027 opt-in checksummed copy-on-write persistent sector filesystem.
 pub mod durablefs;
@@ -42,6 +183,9 @@ pub mod r030_ondevice;
 pub mod hier_vfs;
 #[cfg(feature="test-r031-vfs")]
 pub mod fs_handles;
+/// Security milestone S0: immutable system namespaces and bounded
+/// write bursts for the existing process file-handle ABI.
+pub mod fs_write_guard;
 /// R028 strict allocator-free Ethernet/IPv4 and protocol demo.
 pub mod network;
 // Legacy virtio PCI DMA depends on PMM, Limine HHDM and a real x86 ring-0

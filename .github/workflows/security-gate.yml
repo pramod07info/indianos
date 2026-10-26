@@ -1,0 +1,46 @@
+name: IndianOS Security Gate (S0)
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  filesystem-security:
+    name: Adversarial FS, signatures and no_std security regression
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout exact revision
+        uses: actions/checkout@v4
+      - name: Install Rust with bare-metal target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
+      - name: Verify security implementation wiring cannot be bypassed
+        run: |
+          set -euo pipefail
+          python3 tools/test_security_contract.py
+          python3 -m py_compile tools/test_security_contract.py
+      - name: Execute adversarial filesystem guard tests
+        run: |
+          set -euo pipefail
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml security_
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --features test-r031-vfs security_
+      - name: Verify cryptographic package and signer security regressions
+        run: |
+          set -euo pipefail
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --features test-m2-developer-alpha m2_trust_
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --features test-m2-developer-alpha m2_syscall_
+      - name: Verify native no_std kernel compiles with S0 policy
+        run: |
+          set -euo pipefail
+          cargo check --locked --offline --manifest-path rust/kernel_core/Cargo.toml --no-default-features --target x86_64-unknown-none
+
+# NOTE: This check does not configure GitHub branch protection itself.
+# Repository settings must REQUIRE this job and independent review before merge.

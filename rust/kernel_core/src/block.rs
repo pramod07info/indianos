@@ -266,3 +266,70 @@ mod extent_reader_tests {
         assert_eq!(disk.writes, 0);
     }
 }
+
+
+/// Batch 1: read a byte range through a validated multi-extent block view.
+/// All bounds are checked before the first device read or output mutation.
+/// A device I/O error may leave an earlier output prefix filled.
+pub fn read_extent_bytes<D: BlockDevice>(
+    device: &mut D, extents: &[crate::agent_01_fs_extents::Extent],
+    offset: u64, out: &mut [u8],
+) -> Result<(), BlockError> {
+    let mut reader = ExtentReader::new(device, extents)?;
+    let total = reader.sector_count().checked_mul(SECTOR_BYTES as u64)
+        .ok_or(BlockError::OutOfRange)?;
+    let length = u64::try_from(out.len()).map_err(|_| BlockError::OutOfRange)?;
+    if out.is_empty() || offset > total || length > total - offset {
+        return Err(BlockError::OutOfRange);
+    }
+    let mut cursor = offset;
+    let mut remaining = out;
+    let mut sector = [0u8; SECTOR_BYTES];
+    while !remaining.is_empty() {
+        reader.read_sector(cursor / SECTOR_BYTES as u64, &mut sector)?;
+        let position = (cursor % SECTOR_BYTES as u64) as usize;
+        let count = remaining.len().min(SECTOR_BYTES - position);
+        let (head, tail) = remaining.split_at_mut(count);
+        head.copy_from_slice(&sector[position..position + count]);
+        cursor += count as u64; // prior range preflight proves no overflow
+        remaining = tail;
+    }
+    Ok(())
+}
+#[cfg(test)]
+mod batch1_extent_byte_tests {
+    use super::*;
+    use crate::agent_01_fs_extents::Extent;
+    struct Disk([[u8; SECTOR_BYTES]; 6]);
+    impl BlockDevice for Disk {
+        fn sector_count(&self) -> u64 { 6 }
+        fn read_sector(&mut self, lba: u64, out: &mut [u8; SECTOR_BYTES])
+            -> Result<(), BlockError> {
+            check_range(6, lba, 1)?;
+            *out = self.0[lba as usize];
+            Ok(())
+        }
+        fn write_sector(&mut self, _lba: u64, _data: &[u8; SECTOR_BYTES])
+            -> Result<(), BlockError> { Err(BlockError::ReadOnly) }
+    }
+    #[test]
+    fn crosses_disjoint_physical_extents_at_byte_boundary() {
+        let mut disk = Disk([[0; SECTOR_BYTES]; 6]);
+        disk.0[1].fill(b'a');
+        disk.0[4].fill(b'b');
+        let mut out = [0; 5];
+        read_extent_bytes(&mut disk, &[Extent{start:1,blocks:1},
+            Extent{start:4,blocks:1}], 510, &mut out).unwrap();
+        assert_eq!(&out, b"aabbb");
+    }
+    #[test]
+    fn preflight_rejects_overrun_without_mutating_caller_buffer() {
+        let mut disk = Disk([[0; SECTOR_BYTES]; 6]);
+        let mut out = [0xa5; 4];
+        assert_eq!(read_extent_bytes(&mut disk,
+            &[Extent{start:4,blocks:1}], 510, &mut out),
+            Err(BlockError::OutOfRange));
+        assert_eq!(out, [0xa5;4]);
+    }
+}
+

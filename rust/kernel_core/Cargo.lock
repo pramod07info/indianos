@@ -3,5 +3,12 @@
 version = 4
 
 [[package]]
+name = "ed25519-compact"
+version = "2.6.0"
+
+[[package]]
 name = "indianos-kernel-core"
 version = "0.1.0"
+dependencies = [
+ "ed25519-compact",
+]
