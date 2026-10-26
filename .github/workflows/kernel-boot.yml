@@ -101,6 +101,11 @@ jobs:
           set -euo pipefail
           cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml hd1_
           python3 -m unittest discover -s tests -p "test_smoke_boot.py" -v
+      - name: Issue 124 HD2 signed driver catalog and default-deny matching
+        run: |
+          set -euo pipefail
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml hd2_
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --features test-m2-developer-alpha hd2_
       - name: Check cross compiler
         run: make toolchain-check
       - name: Enforce Rust-owned default kernel source audit

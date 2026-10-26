@@ -21,12 +21,16 @@ class SmokeBootTests(unittest.TestCase):
             "GPU=1 detected(no driver); NPU=0 detected(no driver); "
             "QPU=unavailable; CPU fallback=enabled\n"
             "IndianOS HD1 PCI buses=2 bridges=1 secondary_GPU=1 read-only; "
-            "ECAM=not mapped; GPU/NPU driver=not activated\n")
+            "ECAM=not mapped; GPU/NPU driver=not activated\n"
+            "IndianOS HD2 driver catalog=unavailable; signed candidates=0; "
+            "GPU/NPU drivers=not activated; QPU=unavailable; CPU fallback=enabled\n")
         assert_hardware_inventory(
             "IndianOS HD0 CPU supported; GPU=unknown; NPU=unknown; "
             "QPU=unavailable; CPU fallback=enabled\n"
             "IndianOS HD1 PCI topology unavailable; "
-            "no optional accelerator driver activated\n")
+            "no optional accelerator driver activated\n"
+            "IndianOS HD2 driver catalog=unavailable; signed candidates=0; "
+            "GPU/NPU drivers=not activated; QPU=unavailable; CPU fallback=enabled\n")
         with self.assertRaises(AssertionError):
             assert_hardware_inventory("IndianOS HD0 CPU=GenuineIntel")
         with self.assertRaises(AssertionError):

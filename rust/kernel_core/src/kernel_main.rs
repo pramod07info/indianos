@@ -73,12 +73,23 @@ pub extern "C" fn kmain()->!{
                 need(topo::format_report(&profile,&mut report).is_ok(),
                     b"IndianOS: FATAL HD1 hardware report buffer\n\0");
                 unsafe{serial_write(report.as_ptr().cast())};
+                // HD2 re-probes immutable PCI identity fields, WITHOUT
+                // loading unsigned drivers or enabling MMIO/bus mastering.
+                let mut ids=crate::hardware_driver_policy::native::ReadOnlyIds;
+                let preflight=crate::hardware_driver_policy::preflight(
+                    &profile.inventory,&mut ids);
+                let mut hd2=[0u8;160];
+                need(crate::hardware_driver_policy::format_report(
+                    &preflight,&mut hd2).is_ok(),
+                    b"IndianOS: FATAL HD2 driver preflight report\n\0");
+                unsafe{serial_write(hd2.as_ptr().cast())};
             },
             Err(_)=>{
                 // CPU-only boot continues when an optional PCI bridge is
                 // absent, malformed or cannot be probed safely.
                 log(b"IndianOS HD0 CPU supported; GPU=unknown; NPU=unknown; QPU=unavailable; CPU fallback=enabled\n\0");
                 log(b"IndianOS HD1 PCI topology unavailable; no optional accelerator driver activated\n\0");
+                log(b"IndianOS HD2 driver catalog=unavailable; signed candidates=0; GPU/NPU drivers=not activated; QPU=unavailable; CPU fallback=enabled\n\0");
             }
         }
     }

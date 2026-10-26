@@ -30,6 +30,10 @@ pub mod hardware_inventory;
 pub mod hardware_pcie;
 /// ACPI MCFG checksum and bounded PCIe ECAM address parser (no MMIO).
 pub mod hardware_mcfg;
+/// Issue #124 HD2: fail-closed signed GPU/NPU driver-catalog compatibility.
+/// Boot reports candidates only; it never binds drivers without IOMMU/DMA
+/// isolation, capabilities, installed binaries and authenticated firmware.
+pub mod hardware_driver_policy;
 pub mod agent_08_boot_slot;
 pub mod agent_09_ci_policy;
 pub mod agent_10_app_policy;

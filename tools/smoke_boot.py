@@ -59,6 +59,10 @@ def assert_hardware_inventory(text: str) -> None:
         raise AssertionError("HD1 bridge discovery/fallback status is missing")
     if "driver=not activated" not in text and "no optional accelerator driver activated" not in text:
         raise AssertionError("HD1 must not report a detected GPU as an active driver")
+    if ("IndianOS HD2 driver catalog=unavailable" not in text or
+        "signed candidates=0" not in text or
+        "GPU/NPU drivers=not activated" not in text):
+        raise AssertionError("HD2 must fail closed without authenticated signed driver catalog")
 
 
 def assert_expected_exception(text: str) -> None:

@@ -104,6 +104,56 @@ simulator is not physical QPU hardware. Neither QEMU virtual
 GPU enumeration nor a future-oriented design proves physical
 Intel/AMD/NVIDIA graphics driver support.
 
+## Issue #124 HD2: signed GPU/NPU driver eligibility, **NOT** auto-activation
+
+Every x86-64 boot re-reads read-only PCI revision and subsystem IDs for
+hardware discovered by the HD1 bridge topology scan. The ordinary kernel
+ALWAYS has an empty/default-deny driver catalog until an independently
+authenticated platform trust service supplies a signed driver catalog.
+Boot emits an auditable line:
+`IndianOS HD2 driver catalog=unavailable; signed candidates=0;
+GPU/NPU drivers=not activated; QPU=unavailable; CPU fallback=enabled`.
+This is a real boot-time policy decision, not an installed GPU driver.
+
+The no-allocator `hardware_driver_policy` module defines a fixed-capacity,
+versioned catalog for eight driver manifests. Each entry binds GPU/NPU
+type, exact PCI vendor/device and optional subsystem IDs, revision range,
+kernel driver ABI, driver release/version and SHA256 digest, required CPU
+features and requested MMIO/DMA capability bits. Invalid/ambiguous
+entries, unrecognized driver privileges, noncanonical unused slots,
+unsupported CPU features, wrong PCI type and absent catalog fail closed.
+The most-specific applicable subsystem entry wins over a generic
+vendor/device match, but every match is only `SignedCandidate` metadata:
+**not** permission to execute a driver, DMA into guest memory or access a
+PCI BAR.
+
+With the existing opt-in M2 crypto feature, signed catalogs undergo
+**real Ed25519 validation** against a caller-supplied, independently
+authenticated publisher registry at its exact signer key epoch. The entire
+canonical binary transcript is SHA256-bound to the Ed25519 signature,
+including every identity, requested capability and unused slot. A trusted
+monotonic minimum catalog generation rejects replay; revoked signing
+keys, signature tampering and signer-epoch changes are denied. The
+signed fixture private key exists **only in host tests**. There is NO
+embedded hardware trust root or accepted catalog on production boot.
+
+The kernel's read-only `preflight` is reusable by the future installer.
+HD2 host tests check:
+- no catalog = no candidate or driver activation, even when a GPU is present;
+- exact signed PCI IDs/subsystem specificity and deterministic selection;
+- tampered driver rights/hash/version, stale signer/epoch, revoked publisher;
+- malformed metadata, duplicate IDs, ambiguous revisions and unknown
+  accelerator classes are all rejected; and
+- QEMU's normal and bridged-virtio GPU boot reporters refuse missing
+  HD2 fail-closed status.
+
+**Not yet implemented:** actual signed driver binary download/installation,
+a persistent authenticated driver catalog, hardware-rooted secure boot key
+provisioning, safe MMIO mappings, IOMMU/DMA isolation, GPU command-buffer
+validation, NPU inference, physical QPU providers, ARM64/RISC-V drivers,
+full PCIe ECAM platform mapping, installer graphical UI, and real physical
+GPU hardware support. Those remain Issue #124 work.
+
 ## Boot sequence
 
 ```text
