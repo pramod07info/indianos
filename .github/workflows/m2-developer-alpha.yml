@@ -62,6 +62,10 @@ jobs:
           test -f rust/kernel_core/vendor/ed25519-compact/LICENSE
           cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --features test-m2-developer-alpha m2_ed25519_
           cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --features test-m2-developer-alpha m2_signed_roots_
+      - name: M2 Phase 4D secure boot roots, journal and monotonic rollback regressions
+        run: |
+          set -euo pipefail
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --features test-m2-developer-alpha m2_boottrust_
       - name: M2 no_std compilation of integrated guest modules
         run: |
           cargo check --offline --manifest-path rust/kernel_core/Cargo.toml --no-default-features --features test-m2-developer-alpha --target x86_64-unknown-none
@@ -95,7 +99,7 @@ jobs:
           done
           test -n "$OVMF_PATH"
           make test-r030-package-qemu OVMF_CODE="$OVMF_PATH"
-      - name: M2P6 real Ed25519 verified boot policy and ELF ring3 across four QEMU boots
+      - name: M2 Phase 4D real Ed25519 A/B boot policy and rollback rejection across four QEMU boots
         run: |
           set -euo pipefail
           OVMF_PATH=""

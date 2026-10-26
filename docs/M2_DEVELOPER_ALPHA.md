@@ -424,3 +424,45 @@ To reproduce crypto tests without downloading libraries:
 `cargo test --locked --offline --manifest-path
 rust/kernel_core/Cargo.toml --features test-m2-developer-alpha m2_ed25519_`
 and `python3 tools/test_m2_phase4c_vectors.py`.
+
+
+## M2 Phase 4D — verified-boot trust boundary and crash-consistent root recovery
+
+This PR implements the kernel-side hardware trust *contract*, signed
+publisher-policy A/B recovery and rollback checks. It does **not** implement
+physical TPM 2.0 or UEFI Secure Boot.
+
+1. `HardwareTrust` requires an independently authenticated boot-root
+   public key, a protected monotonic policy counter and a durably committed,
+   strictly increasing counter update. Missing/unreliable hardware fails
+   closed. QEMU supplies an explicitly untrusted simulation.
+2. `PolicySlots` provides two isolated durable policy snapshots. Updates
+   stage only to the inactive slot, reread and verify exact bytes, and
+   are not made active before subsequent `boot_recover`.
+3. On boot, both slots are untrusted and must pass canonical parsing and
+   actual Ed25519 validation against the authenticated root. The highest
+   valid sequence at least as new as the protected counter is selected.
+   Conflicting same-sequence signed snapshots fail closed.
+4. Hardware monotonic counter advancement occurs *only after* durable
+   policy storage and before exposing its keys. If power is lost after
+   the counter update, the same signed snapshot recovers at equality.
+   Losing the only current snapshot fails closed rather than loading an
+   older signed policy.
+5. Malformed signatures, epoch downgrades, same-epoch signer-key swaps,
+   revoked-key reactivation, unauthenticated administrator identities,
+   disk tearing, fake durability and hardware faults are denied.
+6. Host regressions verify A/B commit, reboot, crash recovery, revoked
+   publisher, monotonic counter failures and missing roots. The four-boot
+   QEMU acceptance now exercises signed publisher trust via the new boot
+   gate, including negative forged signature and replay checks, then
+   continues to real ring3 native ELF execution, upgrade, rollback, remove.
+
+**Unfinished security requirement:** No physical UEFI Secure Boot
+verification, TPM2 command transport, authenticated TPM NV monotonic
+counter storage, or hardware-backed key rotation is yet implemented.
+QEMU's provider is named `QemuFakePlatform`, RAM-only, and does not
+establish real device trust. Protection against real reboot rollback
+depends on an audited and securely provisioned platform provider.
+Production anti-rollback cannot be claimed from these tests. True third-
+party release security also needs audited key management and signed
+catalog distribution. This remains a bounded milestone, not all M2.
