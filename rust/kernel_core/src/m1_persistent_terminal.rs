@@ -10,6 +10,7 @@ use crate::durablefs::FsError;
 use crate::batch5_session::Identity;
 use crate::batch6_security::{Access,FILE_READ,FILE_WRITE};
 use crate::vfs_path::normalize_absolute;
+use crate::fs_write_guard::{WriteGuard,Error as GuardError};
 
 pub const MAX_COMMAND:usize=192;
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
@@ -18,6 +19,17 @@ fn path<'a>(input:&str,buffer:&'a mut [u8;64])->Result<&'a str,Error>{
  let n=normalize_absolute(input,buffer).map_err(|_|Error::Invalid)?;
  if n<2{return Err(Error::Invalid);}
  core::str::from_utf8(&buffer[..n]).map_err(|_|Error::Invalid)
+}
+/// S1.1: protect reserved system namespaces at the M1 Terminal mutation
+/// boundary too. This entrypoint bypasses the S0 FileHandles table, so it
+/// must independently validate both source and destination before writes.
+/// This is not yet a universal VFS/raw-block authorization layer.
+fn writable_path(p:&str)->Result<(),Error>{
+ match WriteGuard::allow_path(p){
+  Ok(())=>Ok(()),
+  Err(GuardError::InvalidPath)=>Err(Error::Invalid),
+  Err(GuardError::Protected|GuardError::RateLimited)=>Err(Error::Denied),
+ }
 }
 fn publish(data:&[u8],out:&mut[u8])->Result<usize,Error>{
  if data.len()>out.len(){return Err(Error::OutputTooSmall);}
@@ -53,6 +65,7 @@ pub fn command<D:BlockDevice,const N:usize>(
    auth.require(caller,FILE_WRITE,now).map_err(|_|Error::Denied)?;
    if out.len()<7{return Err(Error::OutputTooSmall);}
    let p=path(raw,&mut name)?;
+   writable_path(p)?;
    fs.mkdir(p).map_err(Error::Io)?;
    publish(b"created",out)
   }
@@ -62,6 +75,7 @@ pub fn command<D:BlockDevice,const N:usize>(
    let (raw_path,data)=raw.split_once(' ').ok_or(Error::Invalid)?;
    if data.is_empty()||data.len()>MAX_TRANSFER{return Err(Error::Invalid);}
    let p=path(raw_path,&mut name)?;
+   writable_path(p)?;
    // Existing files are COW-overwritten; absent files are created. DurableFs
    // atomically publishes metadata; BlockDevice must flush each write.
    match fs.overwrite(p,data.as_bytes()){
@@ -78,6 +92,8 @@ pub fn command<D:BlockDevice,const N:usize>(
    let from=path(left,&mut name)?;
    let mut target=[0u8;64];
    let to=path(right,&mut target)?;
+   writable_path(from)?;
+   writable_path(to)?;
    fs.rename_file(from,to).map_err(Error::Io)?;
    publish(b"moved",out)
   }
@@ -158,4 +174,49 @@ mod tests{
    Err(Error::OutputTooSmall));
   assert_eq!(small,[0xcc;2]);
  }
+ #[test]fn security_m1_terminal_protects_namespaces_across_all_mutators(){
+  let mut fs=HierVfs::format_blank(blank()).unwrap();
+  fs.mkdir("/system").unwrap();
+  fs.create("/system/config",b"trusted").unwrap();
+  fs.mkdir("/home").unwrap();
+  fs.create("/home/note",b"personal").unwrap();
+  let access=grants();
+  let before=fs.generation();
+  for cmd in [
+   b"write /system/config corrupted".as_slice(),
+   b"write //system/./config corrupt".as_slice(),
+   b"mkdir /system/evil".as_slice(),
+   b"mkdir /boot".as_slice(),
+   b"mkdir /recovery".as_slice(),
+   b"mv /system/config /home/stolen".as_slice(),
+   b"mv /home/note /system/config".as_slice(),
+   b"mv /home/note /recovery/file".as_slice(),
+  ]{
+   assert_eq!(run(&mut fs,&access,user(),cmd),Err(Error::Denied),
+              "{:?}",cmd);
+   assert_eq!(fs.generation(),before,"denied command mutated the volume");
+  }
+  assert_eq!(run(&mut fs,&access,user(),
+              b"write /system/../home/note corrupt"),
+             Err(Error::Invalid));
+  let (n,buf)=run(&mut fs,&access,user(),b"cat /system/config").unwrap();
+  assert_eq!(&buf[..n],b"trusted"); // read-only inspection remains allowed
+  let (n,buf)=run(&mut fs,&access,user(),b"cat /home/note").unwrap();
+  assert_eq!(&buf[..n],b"personal");
+  let mut fs=HierVfs::mount(fs.into_device()).unwrap();
+  let (n,buf)=run(&mut fs,&access,user(),b"cat /system/config").unwrap();
+  assert_eq!(&buf[..n],b"trusted");
+  let (n,buf)=run(&mut fs,&access,user(),b"cat /home/note").unwrap();
+  assert_eq!(&buf[..n],b"personal");
+ }
+ #[test]fn security_m1_namespace_guard_does_not_block_unrelated_names(){
+  let mut fs=HierVfs::format_blank(blank()).unwrap();
+  let access=grants();
+  assert_eq!(run(&mut fs,&access,user(),b"mkdir /systematic").unwrap().0,7);
+  assert_eq!(run(&mut fs,&access,user(),
+                b"write /systematic/log okay").unwrap().0,5);
+  let (n,b)=run(&mut fs,&access,user(),b"cat /systematic/log").unwrap();
+  assert_eq!(&b[..n],b"okay");
+ }
+
 }

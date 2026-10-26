@@ -74,6 +74,27 @@ the **only mutation surface hardened by this specific patch**. Kernel-owned
   after S1 per-app tokens and provide explicit trusted updater exceptions
   that cannot be controlled by arbitrary applications.
 
+## S1.1 — M1 graphical Terminal filesystem ingress (current slice)
+
+The feature-gated authenticated M1 Terminal/desktop command handler accesses
+`HierVfs` directly rather than using S0 `FileHandles`. S1.1 applies the
+shared normalized protected-namespace policy **before** all Terminal
+`write` (overwrite/create), `mkdir`, and `mv` (both source and destination)
+operations, returning denial without calling the persistent mutator.
+It does not impose the experimental S0 service-wide write count on Terminal.
+Read-only `cat` inspection is still possible where process rights allow it.
+
+The security test suite validates forbidden system/recovery paths, duplicate
+slash/dot aliases, parent traversal denial, rename source/destination checks,
+unchanged filesystem generations, persistence after remount, and false-positive
+safety for similarly named non-system directories. The S0 contract checker
+now asserts the M1 command handler retains these mandatory checks.
+
+This is **only one S1 ingress migration**, not universal path enforcement,
+process-generation-bound ACLs, trusted update exceptions, protected raw ATA
+writes, immutable snapshots, or malware immunity. More filesystem APIs and
+privileged paths require dedicated mediation and independent testing.
+
 ## Security acceptance roadmap
 
 **S1:** identity-bound capability checks for all VFS and block routes,

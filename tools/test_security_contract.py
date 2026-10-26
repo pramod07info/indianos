@@ -51,6 +51,24 @@ def check() -> None:
             "security regression workflow must not tolerate failures")
     require("Security Milestone S0" in roadmap,
             "required milestone missing from roadmap")
+    terminal=(ROOT/"rust/kernel_core/src/m1_persistent_terminal.rs").read_text()
+    require("WriteGuard::allow_path(p)" in terminal,
+            "M1 terminal no longer uses protected namespace guard")
+    mkdir=terminal.split('  "mkdir"=>{',1)[1].split('  "write"=>{',1)[0]
+    write=terminal.split('  "write"=>{',1)[1].split('  "mv"=>{',1)[0]
+    rename=terminal.split('  "mv"=>{',1)[1].split('  _=>',1)[0]
+    require("writable_path(p)?" in mkdir and
+            mkdir.index("writable_path(p)?") < mkdir.index("fs.mkdir(p)"),
+            "M1 mkdir bypasses protected namespace check")
+    require("writable_path(p)?" in write and
+            write.index("writable_path(p)?") < write.index("fs.overwrite(p"),
+            "M1 write/create bypasses protected namespace check")
+    require("writable_path(from)?" in rename and
+            "writable_path(to)?" in rename and
+            rename.index("writable_path(to)?") < rename.index("fs.rename_file("),
+            "M1 rename bypasses source/destination protection")
+    require("security_m1_terminal_protects_namespaces" in terminal,
+            "S1.1 terminal mutation regressions are missing")
     print("S0 integration audit PASS: open/write guarded, protected paths, "
           "CI and roadmap present")
 
