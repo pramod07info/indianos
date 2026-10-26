@@ -72,6 +72,12 @@ jobs:
           python3 -m unittest discover -s tests -p 'test_agent_x_autodev.py' -v
           python3 tools/agent_x_autodev.py prepare --prompt /tmp/agent-x-dev-prompt.txt
 
+      - name: Report exhausted preapproved task queue
+        if: steps.gate.outputs.ready == 'true' && steps.task.outputs.selected != 'true'
+        run: |
+          echo "::notice::No allowlisted Agent X implementation tasks remain; no code was generated."
+          echo "Agent X idle: task allowlist exhausted. A reviewed task definition is required." >> "$GITHUB_STEP_SUMMARY"
+
       - name: Install Rust for validation
         if: steps.task.outputs.selected == 'true'
         uses: dtolnay/rust-toolchain@stable
@@ -86,7 +92,7 @@ jobs:
           git clone --depth 1 https://github.com/ggml-org/llama.cpp.git /tmp/llama.cpp
           cmake -S /tmp/llama.cpp -B /tmp/llama-build \
             -DGGML_NATIVE=OFF -DLLAMA_CURL=ON -DCMAKE_BUILD_TYPE=Release
-          cmake --build /tmp/llama-build --target llama-completion -j 4
+          cmake --build /tmp/llama-build --target llama-cli -j 4
           # A rejected parser or Rust compiler candidate gets exactly one
           # fresh generation attempt. Never relax the safety or build gates.
           generated=false
@@ -96,7 +102,7 @@ jobs:
                 --name "${{ steps.task.outputs.name }}" \
                 --prompt /tmp/agent-x-dev-prompt.txt
             fi
-            timeout 900 /tmp/llama-build/bin/llama-completion \
+            timeout 900 /tmp/llama-build/bin/llama-cli \
               -hf bartowski/Qwen2.5-Coder-1.5B-Instruct-GGUF:Q4_K_M \
               -f /tmp/agent-x-dev-prompt.txt \
               -n 3000 -c 8192 --temp 0.1 --no-display-prompt \
