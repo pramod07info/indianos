@@ -154,6 +154,82 @@ validation, NPU inference, physical QPU providers, ARM64/RISC-V drivers,
 full PCIe ECAM platform mapping, installer graphical UI, and real physical
 GPU hardware support. Those remain Issue #124 work.
 
+## Issue #124 HD3A: verified driver-image staging and hardware-resource planning
+
+HD3A extends the HD2 cryptographically signed GPU/NPU catalog with an
+**independent SHA-256 check of actual driver bytes**. A caller with both
+`INSTALL` and `DRIVER` privileges, bound to an exact PID and generation,
+may stage up to 65,536 bytes in a caller-owned, preallocated RAM
+quarantine. Staging validates that PCI bus/slot/function and hardware
+class match the read-only enumerated function, the Ed25519-signed driver
+catalog's signer epoch is current and its externally supplied monotonic
+sequence floor is met, and actual source bytes match the manifest digest.
+Rejected updates erase quarantine. Revocation, PID reuse, bad signatures,
+hardware replacement and stale releases fail closed.
+
+A **resource-planning** layer validates requested MMIO/DMA apertures
+against trusted platform-provided allowed memory windows, 4-KiB
+alignment, size limits and nonoverlap. DMA proposals additionally
+require a nonzero IOMMU domain and a stated isolation-ready state. A
+strict entry point revalidates the catalog signature and quarantined
+bytes again before proposing a plan. Returned
+`ResourcePlan.activated=false`: it is **NOT** a live hardware
+capability. An arbitrary supplied readiness flag is not independent
+proof of IOMMU enforcement. This code never configures an IOMMU, maps a
+BAR, enables bus mastering or executes the driver.
+
+Every ordinary kernel boot prints the HD3 fail-closed serial status:
+`IndianOS HD3 driver image=not installed; MMIO=not mapped;
+DMA=disabled; IOMMU=not attested; GPU/NPU=CPU fallback;
+QPU=unavailable`. Both normal and bridged-virtio GPU QEMU smoke
+tests enforce that real-boot message. Dedicated Rust host regressions
+(with/without M2 Ed25519) cover staging, byte/image tampering, wrong PCI
+hardware, revocation, resource bounds, PID generations, permission
+expiration, absent IOMMU evidence, and quarantine erasure.
+
+**HD3A limits:** No persistent signed driver repository, real TPM-backed
+platform root, trusted hardware memory-map attestation, functional
+IOMMU page tables, GPU command ring/queues, display mode setting or
+actual framebuffer acceleration are implemented. The next slice
+should bring up an isolated virtio-gpu resource/queue prototype in
+QEMU and validate actual device command completion with CPU software
+fallback. This HD3A change does NOT make generic physical GPU/NPU
+drivers or real QPUs operational.
+
+## Issue #124 HD3B.1: virtio-gpu PCI protocol groundwork (QEMU)
+
+IndianOS now recognizes the **actual QEMU modern virtio-gpu PCI
+device** (`1af4:1050`) on the validated HD1 bridge topology. The
+no-allocation PCI configuration reader traverses bounded vendor
+capability lists to require uniquely identified, non-overlapping
+COMMON, NOTIFY, ISR and DEVICE configuration ranges, valid BAR
+indices and notification multipliers, and rejects malformed pointers,
+cycles, duplicates, I/O-BAR pretending to be MMIO and wrong device
+identities. All these operations are read-only PCI configuration
+accesses; they do **not** map BARs, negotiate virtio features, allocate
+DMA buffers, program queues or issue hardware GPU commands.
+
+The `hardware_virtio_gpu::Protocol` implements the proper bounded
+virtio-gpu 2D wire commands: GET_DISPLAY_INFO, RESOURCE_CREATE_2D,
+RESOURCE_ATTACH_BACKING, SET_SCANOUT, TRANSFER_TO_HOST_2D and
+RESOURCE_FLUSH. It validates response types/lengths, framebuffer
+dimensions, physical-buffer alignment and allocation bounds. Host
+tests use an explicitly **mocked** queue transport to exercise the
+command sequence, malformed device replies, rogue PCI capabilities
+and geometry/descriptor rejections. A separate real QEMU/OVMF
+acceptance boots with and without a virtio-gpu device behind a PCIe
+root port to verify the native PCI capability probe and CPU fallback.
+
+**HD3B IS NOT COMPLETED:** A working QEMU virtqueue backend must still
+be implemented with a trusted physical memory map, actual MMIO mappings,
+verified DMA ownership/IOMMU isolation, negotiated device features,
+error recovery, and GPU control-queue completion. Only then may the
+project claim a real QEMU-rendered pixel buffer, and separate hardware
+driver qualification is required for physical GPUs. The serial message
+`HD3B ... queue=disabled; GPU acceleration=not active` is deliberate.
+The new PCI probe does not weaken HD3A's signed-driver and CPU fallback
+requirements. Existing OS framebuffer drawing remains CPU-owned.
+
 ## Boot sequence
 
 ```text

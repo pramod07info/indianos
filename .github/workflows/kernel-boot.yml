@@ -106,6 +106,15 @@ jobs:
           set -euo pipefail
           cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml hd2_
           cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --features test-m2-developer-alpha hd2_
+      - name: Issue 124 HD3 signed image staging and resource isolation
+        run: |
+          set -euo pipefail
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml hd3_
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --features test-m2-developer-alpha hd3_
+      - name: Issue 124 HD3B.1 virtio-gpu PCI and 2D command validation
+        run: |
+          set -euo pipefail
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml hd3b_
       - name: S0 mandatory filesystem malware containment regressions
         run: |
           set -euo pipefail
@@ -1331,6 +1340,15 @@ jobs:
           done
           test -n "$OVMF_PATH"
           python3 tools/test_hd1_topology_qemu.py --iso build/indianos.iso --ovmf "$OVMF_PATH"
+      - name: Issue 124 HD3B.1 real QEMU virtio-gpu PCI capability discovery
+        run: |
+          set -euo pipefail
+          OVMF_PATH=""
+          for candidate in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/edk2/ovmf/OVMF_CODE_4M.fd /usr/share/edk2/ovmf/OVMF_CODE.fd; do
+            if test -f "$candidate"; then OVMF_PATH="$candidate"; break; fi
+          done
+          test -n "$OVMF_PATH"
+          python3 tools/test_hd3b_gpu_qemu.py --iso build/indianos.iso --ovmf "$OVMF_PATH"
       - name: Upload experimental ISO for emulator debugging
         if: success()
         uses: actions/upload-artifact@v4
