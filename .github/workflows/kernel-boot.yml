@@ -121,6 +121,12 @@ jobs:
           cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml hd3b2_
           cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --features test-m2-developer-alpha hd3b2_
           cargo check --locked --offline --manifest-path rust/kernel_core/Cargo.toml --no-default-features --target x86_64-unknown-none
+      - name: Issue 124 HD3B.3 split virtqueue wire encoding and completion validation
+        run: |
+          set -euo pipefail
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml hd3b3_
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --features test-m2-developer-alpha hd3b3_
+          cargo check --locked --offline --manifest-path rust/kernel_core/Cargo.toml --no-default-features --target x86_64-unknown-none
       - name: S0 mandatory filesystem malware containment regressions
         run: |
           set -euo pipefail

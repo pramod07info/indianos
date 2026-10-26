@@ -43,6 +43,9 @@ pub mod hardware_virtio_gpu;
 /// HD3B.2: numeric split virtqueue ownership, IOMMU-domain and geometry gates.
 /// Staging only: never enables hardware, DMA or BAR mapping.
 pub mod hardware_virtio_queue;
+/// HD3B.3: mock split-virtqueue wire serialization and validated completions.
+/// No hardware transport or memory mapping is enabled.
+pub mod hardware_virtio_split;
 pub mod agent_08_boot_slot;
 pub mod agent_09_ci_policy;
 pub mod agent_10_app_policy;
