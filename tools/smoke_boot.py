@@ -46,6 +46,16 @@ def assert_milestones(text: str) -> None:
             raise AssertionError(f"missing or out-of-order milestone: {marker}")
         offset = position + len(marker)
 
+def assert_hardware_inventory(text: str) -> None:
+    """A real freestanding QEMU boot must probe CPU and report honest fallback."""
+    if "IndianOS HD0 CPU" not in text:
+        raise AssertionError("missing automatic boot-time CPU profile")
+    if "QPU=unavailable" not in text or "CPU fallback=enabled" not in text:
+        raise AssertionError("missing honest quantum/CPU fallback status")
+    if "GPU=unknown" not in text and "detected(no driver)" not in text:
+        raise AssertionError("CPU/PCI inventory failed to report driver status")
+
+
 def assert_expected_exception(text: str) -> None:
     """A deliberate invalid-opcode trap must be caught by our own IDT."""
     offset = 0
@@ -400,8 +410,10 @@ def run_smoke(iso: Path, ovmf: Path, qemu: str, timeout: float,
                     if len(output) > 1024 * 1024:
                         raise AssertionError("QEMU emitted too much output")
                     try:
-                        verify(output.decode("utf-8", errors="replace"))
-                        return output.decode("utf-8", errors="replace")
+                        observed=output.decode("utf-8", errors="replace")
+                        verify(observed)
+                        assert_hardware_inventory(observed)
+                        return observed
                     except AssertionError:
                         pass
                 if process.poll() is not None:
@@ -409,6 +421,7 @@ def run_smoke(iso: Path, ovmf: Path, qemu: str, timeout: float,
         text = output.decode("utf-8", errors="replace")
         try:
             verify(text)
+            assert_hardware_inventory(text)
         except AssertionError as exc:
             # CI previously hid the useful serial transcript on an incomplete
             # boot; append a bounded diagnostic tail without dumping firmware

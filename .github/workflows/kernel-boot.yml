@@ -93,6 +93,9 @@ jobs:
         run: |
           cargo test --manifest-path rust/kernel_core/Cargo.toml --offline
           python3 -m unittest discover -s tests -p "test_agent_x_autodev.py" -v
+      - name: Issue 124 HD0 installer and boot hardware profile regressions
+        run: |
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml hd0_
       - name: Check cross compiler
         run: make toolchain-check
       - name: Enforce Rust-owned default kernel source audit

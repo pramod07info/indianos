@@ -30,6 +30,38 @@
   +---------------------------------------------------------+
 ```
 
+## Automatic processor detection, issue #124 (HD0 foundation)
+
+Every supported x86-64 kernel boot now probes the boot CPU using
+**read-only CPUID**, rejects missing mandatory long-mode/NX/SSE2 flags, and
+reads **only** the 16-byte PCI configuration headers on legacy bus 0
+through the read-only 0xCFC data port (with 0xCF8 address selection).
+The output is a versioned, no-heap `hardware_inventory::Inventory`
+that can also be consumed by a future installer via
+`installer_preflight`. The serial report distinguishes CPU vendor,
+family/model, discovered GPU/NPU **hardware** counts, unsupported
+drivers, missing physical QPU, and always-available CPU fallback.
+
+This discovery NEVER enables DMA, maps GPU BARs, loads proprietary
+drivers, formats disks, downloads packages or automatically connects
+to remote quantum services. A GPU or NPU PCI class is *detected*, not
+*usable*. Physical QPU detection remains unavailable until an
+authenticated hardware/provider backend is implemented; the existing
+local quantum simulator must not be represented as QPU hardware.
+If PCI probing fails, boot logs a safe fallback and continues
+without enabling drivers. QEMU boot acceptance validates the report,
+and host tests validate CPU/PCI parsing, unsupported CPUs and fallbacks.
+
+**Limits:** This is HD0, **not a finished graphical installer** or full
+boot-time device manager. No installation UI is wired yet, only a reusable
+read-only preflight API. PCI enumeration is intentionally scoped to legacy
+x86 bus 0; ACPI MCFG multi-segment PCIe, bridge traversal, USB and
+hotplug are HD1/HD2 backlog items. ARM64 and RISC-V need separate
+ports; the present kernel still targets x86-64. Hardware features
+such as AVX are reported but NEVER activated without full OS XSAVE/XCR0
+and context-switch support. Production signed GPU/NPU drivers and
+remote/real QPU discovery remain future work.
+
 ## Boot sequence
 
 ```text
