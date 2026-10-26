@@ -44,6 +44,22 @@ pub mod m1_partition;
 pub mod m1_persistent_terminal;
 #[cfg(feature="test-r031-vfs")]
 pub mod m1_persistent_desktop;
+// M2 Developer Alpha integrated host-testable foundations. The guest must
+// wire actual network, signature-verifier, ELF loader and UI services later.
+#[cfg(feature="test-m2-developer-alpha")]
+pub mod m2_sdk;
+#[cfg(feature="test-m2-developer-alpha")]
+pub mod m2_elf;
+#[cfg(feature="test-m2-developer-alpha")]
+pub mod m2_inventory;
+#[cfg(feature="test-m2-developer-alpha")]
+pub mod m2_network;
+#[cfg(feature="test-m2-developer-alpha")]
+pub mod m2_store;
+// Ring-3 image staging uses the existing PMM/VMM user-image loader,
+// and is deliberately compiled only when that real loader is enabled.
+#[cfg(all(feature="test-m2-developer-alpha",feature="user-image"))]
+pub mod m2_launch;
 // R041 Batch 7: real allocation-free RAM file data and an interactive
 // authenticated Files/Terminal workspace. Persistent media and a full
 // ring3 compositor require separate QEMU/hardware acceptance.

@@ -51,6 +51,11 @@ filesystem corruption and recovery acceptance all pass at exact commit SHA.
 
 ## M2 — Developer Alpha
 
+**Current M2 integrated workstream:** [M2 developer-alpha engineering
+acceptance](M2_DEVELOPER_ALPHA.md). One feature commit for this workstream;
+production M2 exit requirements stay open until fully verified.
+
+
 - [ ] Reliable network sockets, DNS, DHCP, TCP/IP and TLS on supported NICs.
 - [ ] Native app ABI, SDK, developer toolchain, examples and debugging.
 - [ ] Signed package installer/updater and persistent on-device package DB.

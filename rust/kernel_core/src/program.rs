@@ -36,7 +36,8 @@ fn disjoint(a0: u64, a1: u64, b0: u64, b1: u64) -> bool {
     a1 <= b0 || b1 <= a0
 }
 
-fn plan_elf64(bytes: &[u8]) -> Option<ProgramPlan> {
+/// Shared by the existing user-image mapper and the M2 signed-image loader.
+pub(crate) fn plan_elf64(bytes: &[u8]) -> Option<ProgramPlan> {
     if bytes.len() < ELF_HEADER || bytes.len() > MAX_ELF_BYTES ||
         bytes.get(..4)? != b"\x7fELF" ||
         bytes[4] != 2 || bytes[5] != 1 || bytes[6] != 1 || bytes[7] != 0 ||
