@@ -6,6 +6,7 @@ use crate::block::{BlockDevice,BlockWindow};
 use crate::durablefs::{FsError,MAX_FILE_BYTES,MIN_SECTORS};
 use crate::hier_vfs::HierVfs;
 use crate::ata_pio::AtaPio;
+use crate::fs_write_guard::{WriteGuard,Statistics};
 
 pub const READ:u64=1;
 pub const WRITE:u64=2;
@@ -21,10 +22,19 @@ impl Handle{
         core::str::from_utf8(&self.path[..self.len]).unwrap()
     }
 }
-pub struct FileHandles{entries:[Handle;SLOTS],next:u64}
+pub struct FileHandles{
+    entries:[Handle;SLOTS],next:u64,
+    // Kernel-owned service-wide budget: closing/opening handles must NOT
+    // reset it. Actual per-user/per-app epochs remain S1 work.
+    write_guard:WriteGuard,
+}
 impl FileHandles{
     pub const fn new()->Self{
-        Self{entries:[Handle::EMPTY;SLOTS],next:1}
+        Self{entries:[Handle::EMPTY;SLOTS],next:1,
+            write_guard:WriteGuard::new()}
+    }
+    pub fn security_statistics(&self)->Statistics{
+        self.write_guard.statistics()
     }
     fn index(&self,pid:u32,token:u64)->Result<usize,FsError>{
         if token==0{return Err(FsError::InvalidName);}
@@ -45,6 +55,13 @@ impl FileHandles{
                                fs:&mut HierVfs<D>)->Result<u64,FsError>{
         if !Self::policy(pid,path,mode)||path.len()>23||
            !path.starts_with('/')||path.as_bytes().contains(&0){
+            return Err(FsError::InvalidName);
+        }
+        // S0: even trusted PID1's ordinary application handle cannot
+        // write protected OS/boot/recovery paths. Existing read-only
+        // access remains available for recovery and inspection.
+        if mode&WRITE!=0&&WriteGuard::allow_path(path).is_err(){
+            self.write_guard.deny();
             return Err(FsError::InvalidName);
         }
         let slot=self.entries.iter().position(|e|e.token==0)
@@ -79,7 +96,14 @@ impl FileHandles{
         let slot=self.index(pid,token)?;
         let h=self.entries[slot];
         if h.mode&WRITE==0{return Err(FsError::InvalidName);}
+        // Authorize immediately before mutation, not only on open.
+        // The budget is shared by all handles and survives close/reopen.
+        if self.write_guard.preflight(h.pathname(),input.len()).is_err(){
+            return Err(FsError::InvalidName);
+        }
+        // Charge *only* after a successful bounded, durable write.
         let n=fs.write_at(h.pathname(),h.offset,input)?;
+        self.write_guard.completed(n);
         self.entries[slot].offset=h.offset.checked_add(n as u64)
             .ok_or(FsError::TooLarge)?;
         Ok(n)
@@ -209,4 +233,75 @@ mod tests{
         assert_eq!(fs.read_at("/shared/note",0,&mut data),Ok(6));
         assert_eq!(&data[..6],b"stored");
     }
+    #[test] fn security_protected_boot_recovery_and_system_files_never_change(){
+        let mut fs=fresh();
+        fs.mkdir("/boot").unwrap();fs.mkdir("/system").unwrap();
+        fs.mkdir("/recovery").unwrap();
+        fs.create("/boot/init",b"trusted").unwrap();
+        fs.create("/system/config",b"kernel").unwrap();
+        fs.create("/recovery/state",b"backup").unwrap();
+        let mut handles=FileHandles::new();
+        for path in ["/boot/init","/system/config","/recovery/state",
+                     "//boot/./init"]{
+            assert_eq!(handles.open(1,path,WRITE,&mut fs),
+                Err(FsError::InvalidName),"{path}");
+            assert_eq!(handles.open(1,path,READ|WRITE,&mut fs),
+                Err(FsError::InvalidName),"{path}");
+        }
+        let read=handles.open(1,"/boot/init",READ,&mut fs).unwrap();
+        let mut data=[0u8;24];
+        assert_eq!(handles.read(1,read,&mut data,&mut fs),Ok(7));
+        assert_eq!(&data[..7],b"trusted");
+        handles.close(1,read).unwrap();
+        for (path,expected) in [("/boot/init",b"trusted".as_slice()),
+            ("/system/config",b"kernel".as_slice()),
+            ("/recovery/state",b"backup".as_slice())]{
+            let mut output=[0u8;24];
+            let n=fs.read_at(path,0,&mut output).unwrap();
+            assert_eq!(&output[..n],expected);
+        }
+        assert_eq!(handles.security_statistics().denials,8);
+    }
+    #[test] fn security_burst_write_limit_applies_across_handle_reopen_and_pid(){
+        let mut fs=fresh();
+        fs.mkdir("/shared").unwrap();
+        fs.create("/shared/note",b"original").unwrap();
+        let mut handles=FileHandles::new();
+        let mut h=handles.open(1,"/shared/note",WRITE,&mut fs).unwrap();
+        for index in 0..crate::fs_write_guard::MAX_WRITE_OPERATIONS{
+            if index%7==0&&index!=0{
+                handles.close(1,h).unwrap();
+                h=handles.open(1,"/shared/note",WRITE,&mut fs).unwrap();
+            }
+            handles.seek(1,h,0).unwrap();
+            assert_eq!(handles.write(1,h,b"X",&mut fs),Ok(1));
+        }
+        handles.close(1,h).unwrap();
+        let another=handles.open(1,"/shared/note",WRITE,&mut fs).unwrap();
+        assert_eq!(handles.write(1,another,b"Y",&mut fs),
+            Err(FsError::InvalidName));
+        assert_eq!(handles.security_statistics().completed_writes,
+            crate::fs_write_guard::MAX_WRITE_OPERATIONS);
+        assert_eq!(handles.security_statistics().denials,1);
+        let mut output=[0u8;24];
+        let n=fs.read_at("/shared/note",0,&mut output).unwrap();
+        assert_eq!(&output[..n],b"Xriginal");
+        assert_eq!(handles.write(2,another,b"Z",&mut fs),
+            Err(FsError::InvalidName));
+    }
+    #[test] fn security_failed_mutation_does_not_consume_write_budget(){
+        let mut fs=fresh();
+        fs.mkdir("/etc").unwrap();fs.create("/etc/a",b"one").unwrap();
+        let mut handles=FileHandles::new();
+        let fd=handles.open(1,"/etc/a",WRITE,&mut fs).unwrap();
+        handles.seek(1,fd,99).unwrap();
+        assert_eq!(handles.write(1,fd,b"X",&mut fs),Err(FsError::TooLarge));
+        assert_eq!(handles.security_statistics().completed_writes,0);
+        assert_eq!(handles.security_statistics().changed_bytes,0);
+        handles.seek(1,fd,0).unwrap();
+        assert_eq!(handles.write(1,fd,b"T",&mut fs),Ok(1));
+        assert_eq!(handles.security_statistics().completed_writes,1);
+        assert_eq!(handles.security_statistics().changed_bytes,1);
+    }
+
 }
