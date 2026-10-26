@@ -1,11 +1,10 @@
-//! M2.4 signer-root POLICY, not a cryptography implementation.
+//! M2 signer-key epoch, revocation and public-key authorization policy.
 //!
-//! A kernel-owned public-key registry prevents stale key epochs, unauthorized
-//! rotation, signer replay and revoked signers from reaching a caller-supplied
-//! Ed25519 backend. It MUST be populated only from verified/protected boot
-//! provenance. No backend is supplied by this module; test backend is fake.
-//! Actual on-guest Ed25519, signature binding to all manifest metadata,
-//! and tamper-resistant persistence remain release blockers.
+//! True Ed25519 is supplied by m2_ed25519 using a pinned no_std library.
+//! M2P5/P6 sign the canonical manifest, including version, rights and
+//! dependencies; the digest passed here binds the complete transcript.
+//! The authenticated platform boot root MUST be supplied separately.
+//! RAM registry state alone cannot ensure hardware-backed rollback protection.
 use crate::batch4_signature::{Envelope,Root,Verify};
 use crate::batch5_session::Identity;
 use crate::batch6_security::{Access,INSTALL};
@@ -76,17 +75,18 @@ impl<const K:usize> Registry<K>{
   })
  }
 }
-/// Caller MUST provide actual constant-time Ed25519 verification over an
-/// authenticated envelope. The current M2 envelope only exposes the payload
-/// digest, so metadata (version, rights, dependencies) is NOT yet signed.
+/// Caller MUST supply a real Ed25519 signature verification backend.
+/// The signature signs the SHA-256 digest of its caller-supplied payload.
+/// M2P5/P6 pass the domain-separated canonical manifest as this payload.
 pub trait SignatureBackend{
  fn verify_ed25519(
   &self,public_key:&[u8;32],digest:&[u8;32],signature:&[u8;64]
  )->bool;
 }
 /// Connect a boot-provisioned key registry to the existing signed installer.
-/// Both the kernel digest and the exact key epoch must match before invoking
-/// the backend. Without a real backend, no production trust is established.
+/// Both the kernel digest and the exact signer epoch must match before
+/// invoking the real Ed25519 backend. Trust in the boot-root provenance and
+/// platform monotonic sequence is a distinct production requirement.
 pub struct Trusted<'a,const K:usize,B:SignatureBackend>{
  pub registry:&'a Registry<K>,
  pub backend:&'a B,

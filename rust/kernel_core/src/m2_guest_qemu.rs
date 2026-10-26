@@ -1,6 +1,6 @@
-//! M2 QEMU-only four-boot acceptance: installed ELF bytes execute in real
-//! ring3 CPU mode from the CRC-backed M2P3 filesystem. NOT production crypto.
-//! This feature can only be enabled explicitly on disposable QEMU 128-sector IDE.
+//! M2 Phase 4C QEMU-only four-boot acceptance with REAL Ed25519.
+//! Authenticated test boot policy, signed M2P6 ELF and actual CPU ring3.
+//! Test-only publisher/boot public keys are NEVER production trust roots.
 use crate::ata_pio::AtaPio;
 use crate::block::{BlockDevice,BlockWindow,SECTOR_BYTES};
 use crate::hier_vfs::HierVfs;
@@ -8,6 +8,9 @@ use crate::durablefs::FsError;
 use crate::m2_inventory::{Inventory,Error as PackageError,Record,MAX_IMAGE_BYTES};
 use crate::m2_sdk::{Package,ABI};
 use crate::batch4_signature::{Envelope,Root,Verify};
+use crate::m2_ed25519::Ed25519Backend;
+use crate::m2_trust::{Anchor,Registry,Trusted};
+use crate::m2_trust_policy::{SignedSnapshot,MAX_PUBLISHERS,Error as BootError};
 use crate::batch5_session::Identity;
 use crate::batch6_security::{Access,INSTALL};
 use crate::{ProcessTable,indianos_process_create,indianos_process_success};
@@ -18,6 +21,31 @@ const APP:u32=9;
 const IMAGE_LEN:usize=2400;
 const ADMIN:Identity=Identity{pid:44,generation:1};
 const ROOTS:[Root;1]=[Root{signer:7,epoch:2,enabled:true}];
+// These public test vectors and signatures are compiled only for disposable
+// QEMU acceptance. No private signing key is embedded anywhere.
+const TEST_PUBLISHER:[u8;32]=[72,7,90,89,126,114,26,21,110,46,7,153,222,92,192,197,50,77,198,231,234,241,205,212,98,80,134,142,197,50,21,221];
+const TEST_BOOT_ROOT:[u8;32]=[32,18,203,144,202,96,232,229,216,218,246,110,34,114,210,35,62,4,134,213,87,232,198,97,65,237,137,32,23,125,126,183];
+const TEST_BOOT_SIG:[u8;64]=[119,72,45,124,7,155,22,101,144,76,124,204,209,87,120,49,147,230,213,149,252,255,79,198,234,73,239,233,97,36,149,99,34,40,70,94,244,213,101,150,27,204,8,204,212,144,228,34,26,95,59,112,156,232,160,211,65,178,125,176,175,60,242,11];
+const TEST_APP_SIG_1:[u8;64]=[63,81,43,0,190,178,223,51,88,189,167,181,91,103,50,139,190,90,11,13,224,164,90,78,55,131,33,51,12,27,158,212,136,7,135,17,212,55,183,170,27,95,27,70,70,158,14,123,37,245,126,11,234,8,37,236,34,83,247,131,173,57,39,5];
+const TEST_APP_SIG_2:[u8;64]=[21,236,129,187,72,77,222,161,99,201,245,2,139,214,135,125,24,110,124,254,153,118,44,22,17,145,129,61,228,174,80,94,86,142,37,227,47,112,113,194,96,221,32,250,34,169,175,160,229,72,132,162,249,106,31,196,76,46,231,53,103,225,171,13];
+fn trusted_boot_registry()->Result<Registry<MAX_PUBLISHERS>,()>{
+ let mut snapshot=SignedSnapshot::empty();
+ snapshot.sequence=3;
+ snapshot.count=1;
+ snapshot.publishers[0]=Anchor{signer:7,epoch:2,
+  public_key:TEST_PUBLISHER,enabled:true};
+ snapshot.signature=TEST_BOOT_SIG;
+ let mut registry=Registry::<MAX_PUBLISHERS>::new();
+ snapshot.verify_and_install(&mut registry,
+  &TEST_BOOT_ROOT,0,&access(),ADMIN,1).map_err(|_|())?;
+ if registry.public_key(7,2)!=Ok(TEST_PUBLISHER){return Err(());}
+ snapshot.signature[0]^=1;
+ if snapshot.verify_and_install(&mut registry,
+  &TEST_BOOT_ROOT,0,&access(),ADMIN,1)
+  !=Err(BootError::InvalidSignature){return Err(());}
+ if registry.public_key(7,2)!=Ok(TEST_PUBLISHER){return Err(());}
+ Ok(registry)
+}
 fn elf(v:u8)->[u8;IMAGE_LEN]{
  let mut b=[0u8;IMAGE_LEN];
  b[..4].copy_from_slice(b"\x7fELF");
@@ -55,7 +83,7 @@ fn signed_record(v:u8)->Record{
 fn envelope(v:u8)->Envelope{
  Envelope{signer:7,epoch:2,
   digest:crate::m2_manifest::digest(signed_record(v),7,2),
-  signature:[40+v;64]}
+  signature:if v==1{TEST_APP_SIG_1}else{TEST_APP_SIG_2}}
 }
 fn package(v:u8)->Package{
  Package{id:APP,version:v as u64,abi:ABI,rights:0,deps:[0;4],payload_digest:crate::m2_sha256::digest(&elf(v))}
@@ -63,31 +91,21 @@ fn package(v:u8)->Package{
 fn access()->Access<1>{
  let mut a=Access::new();a.grant(ADMIN,INSTALL,100).unwrap();a
 }
-struct FixtureVerifier;
-impl Verify for FixtureVerifier{
- fn verify_digest_and_signature(&self,e:&Envelope,data:&[u8])->bool{
-  // TEST-ONLY PINNED BYTES. This does NOT implement Ed25519 or hash signing.
-  (1u8..=2).any(|v|e.signer==7&&e.epoch==2&&
-    e.signature==[40+v;64]&&e.digest==
-      crate::m2_manifest::digest(signed_record(v),7,2)&&
-    data==crate::m2_manifest::canonical(signed_record(v),7,2))
- }
-}
-fn check<D:BlockDevice>(inv:&mut Inventory<D>,v:u8)->Result<(),()>{
+fn check<D:BlockDevice,V:Verify>(inv:&mut Inventory<D>,v:u8,verifier:&V)->Result<(),()>{
  let mut b=[0u8;MAX_IMAGE_BYTES];
- let (r,n)=inv.verified_image(&access(),ADMIN,1,&ROOTS,&FixtureVerifier,
+ let (r,n)=inv.verified_image(&access(),ADMIN,1,&ROOTS,verifier,
      APP,&mut b).map_err(|_|())?;
  if r.version!=v as u64||n!=IMAGE_LEN||b[..n]!=elf(v){return Err(());}
  Ok(())
 }
-fn run_cpu<D:BlockDevice>(inv:&mut Inventory<D>)->Result<(),()>{
+fn run_cpu<D:BlockDevice,V:Verify>(inv:&mut Inventory<D>,verifier:&V)->Result<(),()>{
  let mut table=ProcessTable::empty();
  let pcb=unsafe{indianos_process_create(&mut table)};
  if pcb.is_null(){return Err(());}
  // Revoke signer root and prove trusted storage refuses this exact image.
  let disabled=[Root{signer:7,epoch:2,enabled:false}];
  let mut scratch=[0u8;MAX_IMAGE_BYTES];
- if inv.verified_image(&access(),ADMIN,1,&disabled,&FixtureVerifier,
+ if inv.verified_image(&access(),ADMIN,1,&disabled,verifier,
        APP,&mut scratch)!=Err(PackageError::Trust(
          crate::batch4_signature::Error::Untrusted)){return Err(());}
  let saved=inv.installed(APP).map_err(|_|())?.ok_or(())?;
@@ -95,16 +113,16 @@ fn run_cpu<D:BlockDevice>(inv:&mut Inventory<D>)->Result<(),()>{
  let mut consent=crate::m2_consent::Ledger::<1>::new();
  // Refuse unapproved execution before a single ring-3 instruction.
  if crate::m2_launch::execute_installed_approved(inv,&access(),ADMIN,1,
-   &ROOTS,&FixtureVerifier,APP,unsafe{&mut*pcb},1,&consent)
+   &ROOTS,verifier,APP,unsafe{&mut*pcb},1,&consent)
      !=Err(crate::m2_launch::Error::ConsentDenied){return Err(());}
  consent.approve(&access(),ADMIN,1,process,saved,saved.rights,90)
    .map_err(|_|())?;
  if crate::m2_launch::execute_installed_approved(
-  inv,&access(),ADMIN,1,&ROOTS,&FixtureVerifier,APP,
+  inv,&access(),ADMIN,1,&ROOTS,verifier,APP,
   unsafe{&mut*pcb},2,&consent)
     !=Err(crate::m2_launch::Error::ConsentDenied){return Err(());}
  let receipt=crate::m2_launch::execute_installed_approved(
-  inv,&access(),ADMIN,1,&ROOTS,&FixtureVerifier,APP,
+  inv,&access(),ADMIN,1,&ROOTS,verifier,APP,
   unsafe{&mut*pcb},process.generation,&consent).map_err(|_|())?;
  consent.retire(process);
  if receipt.id!=APP||!unsafe{indianos_process_success(pcb)}{return Err(());}
@@ -130,36 +148,47 @@ pub fn run()->Result<u8,()>{
  if stage>3{return Err(());}
  let mut inv=Inventory::from_mounted(fs);
  inv.init_directory().map_err(|_|())?;
+ // Each reboot verifies a signed boot policy with real Ed25519 BEFORE
+ // trusting any publisher key from it.
+ let trusted=trusted_boot_registry()?;
+ let backend=Ed25519Backend;
+ let verifier=Trusted{registry:&trusted,backend:&backend};
  match stage{
   0=>{
    if inv.installed(APP).map_err(|_|())?.is_some(){return Err(());}
-   inv.install_manifest_image(&access(),ADMIN,1,&ROOTS,&FixtureVerifier,
+   let mut invalid=envelope(1);
+   invalid.signature[0]^=1;
+   if inv.install_manifest_image(&access(),ADMIN,1,&ROOTS,&verifier,
+      &invalid,&elf(1),package(1))!=Err(PackageError::Trust(
+        crate::batch4_signature::Error::InvalidSignature)){return Err(());}
+   if inv.installed(APP).map_err(|_|())?.is_some(){return Err(());}
+   inv.install_manifest_image(&access(),ADMIN,1,&ROOTS,&verifier,
        &envelope(1),&elf(1),package(1)).map_err(|_|())?;
-   check(&mut inv,1)?;run_cpu(&mut inv)?;
+   check(&mut inv,1,&verifier)?;run_cpu(&mut inv,&verifier)?;
   },
   1=>{
-   check(&mut inv,1)?;
-   inv.install_manifest_image(&access(),ADMIN,1,&ROOTS,&FixtureVerifier,
+   check(&mut inv,1,&verifier)?;
+   inv.install_manifest_image(&access(),ADMIN,1,&ROOTS,&verifier,
        &envelope(2),&elf(2),package(2)).map_err(|_|())?;
-   check(&mut inv,2)?;run_cpu(&mut inv)?;
+   check(&mut inv,2,&verifier)?;run_cpu(&mut inv,&verifier)?;
   },
   2=>{
-   check(&mut inv,2)?;
+   check(&mut inv,2,&verifier)?;
    let prior=inv.rollback(&access(),ADMIN,1,APP).map_err(|_|())?;
    if prior.version!=1{return Err(());}
-   check(&mut inv,1)?;run_cpu(&mut inv)?;
+   check(&mut inv,1,&verifier)?;run_cpu(&mut inv,&verifier)?;
   },
   3=>{
-   check(&mut inv,1)?;
+   check(&mut inv,1,&verifier)?;
    inv.remove(&access(),ADMIN,1,APP).map_err(|_|())?;
    if inv.installed(APP).map_err(|_|())?.is_some(){return Err(());}
    let mut buf=[0u8;MAX_IMAGE_BYTES];
-   if inv.verified_image(&access(),ADMIN,1,&ROOTS,&FixtureVerifier,
+   if inv.verified_image(&access(),ADMIN,1,&ROOTS,&verifier,
        APP,&mut buf)!=Err(PackageError::NotFound){return Err(());}
    let mut table=ProcessTable::empty();
    let pcb=unsafe{indianos_process_create(&mut table)};
    if pcb.is_null()||crate::m2_launch::execute_installed_approved(
-       &mut inv,&access(),ADMIN,1,&ROOTS,&FixtureVerifier,APP,
+       &mut inv,&access(),ADMIN,1,&ROOTS,&verifier,APP,
        unsafe{&mut*pcb},1,&crate::m2_consent::Ledger::<1>::new())!=Err(crate::m2_launch::Error::Stored(PackageError::NotFound)){
        return Err(());
    }

@@ -59,6 +59,10 @@ pub mod m2_consent;
 #[cfg(feature="test-m2-developer-alpha")]
 pub mod m2_trust;
 #[cfg(feature="test-m2-developer-alpha")]
+pub mod m2_ed25519;
+#[cfg(feature="test-m2-developer-alpha")]
+pub mod m2_trust_policy;
+#[cfg(feature="test-m2-developer-alpha")]
 pub mod m2_syscall_guard;
 #[cfg(feature="test-m2-developer-alpha")]
 pub mod m2_inventory;
