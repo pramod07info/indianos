@@ -6,6 +6,8 @@ on:
       - 'rust/kernel_core/src/m2_*.rs'
       - 'rust/kernel_core/src/lib.rs'
       - 'rust/kernel_core/Cargo.toml'
+      - 'Makefile'
+      - 'tools/test_m2_disk_exec_qemu.py'
       - '.github/workflows/m2-developer-alpha.yml'
   pull_request:
     branches: [main]
@@ -13,6 +15,8 @@ on:
       - 'rust/kernel_core/src/m2_*.rs'
       - 'rust/kernel_core/src/lib.rs'
       - 'rust/kernel_core/Cargo.toml'
+      - 'Makefile'
+      - 'tools/test_m2_disk_exec_qemu.py'
       - '.github/workflows/m2-developer-alpha.yml'
   workflow_dispatch:
 permissions:
@@ -59,6 +63,15 @@ jobs:
           done
           test -n "$OVMF_PATH"
           make test-r030-package-qemu OVMF_CODE="$OVMF_PATH"
+      - name: M2 guest persisted executable ring3 across four disposable QEMU boots
+        run: |
+          set -euo pipefail
+          OVMF_PATH=""
+          for path in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/edk2/ovmf/OVMF_CODE_4M.fd /usr/share/edk2/ovmf/OVMF_CODE.fd; do
+            if test -f "$path"; then OVMF_PATH="$path"; break; fi
+          done
+          test -n "$OVMF_PATH"
+          make test-m2-disk-exec-qemu OVMF_CODE="$OVMF_PATH"
       - name: Real QEMU virtio-net Ethernet UDP DNS and TCP sample protocol exchange
         run: |
           set -euo pipefail

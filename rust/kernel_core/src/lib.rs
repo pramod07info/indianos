@@ -60,6 +60,8 @@ pub mod m2_store;
 // and is deliberately compiled only when that real loader is enabled.
 #[cfg(all(feature="test-m2-developer-alpha",feature="user-image"))]
 pub mod m2_launch;
+#[cfg(all(feature="test-m2-disk-exec",target_arch="x86_64",target_os="none"))]
+pub mod m2_guest_qemu;
 // R041 Batch 7: real allocation-free RAM file data and an interactive
 // authenticated Files/Terminal workspace. Persistent media and a full
 // ring3 compositor require separate QEMU/hardware acceptance.
