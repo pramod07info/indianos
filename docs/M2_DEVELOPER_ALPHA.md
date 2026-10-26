@@ -278,3 +278,37 @@ storage. QEMU still uses a non-Ed25519 signature verifier. Deployable
 on-guest Ed25519, secure trust-root provisioning, approved-rights syscall
 enforcement, GUI consent, and truly large streaming/journaled executable
 extents remain pending.
+
+
+## M2 Phase 4, slice A: kernel trust registry and live app syscall rights
+
+This combines multiple bounded security features into one PR, but is NOT
+a production cryptographic signing milestone:
+
+1. A fixed-capacity default-deny publisher key registry (m2_trust)
+   requires a valid process-generation INSTALL grant for provisioning,
+   key rotation or revocation. Reused signer epochs and revoked anchors
+   fail closed. The registry provides an adapter to a REQUIRED injected
+   Ed25519 backend with kernel-checked SHA-256. No Ed25519 backend or
+   authenticated boot-time key provisioning is implemented by this PR.
+2. The new m2_syscall_guard maintains a strict syscall permission matrix:
+   base ABI/write/exit/yield are available; file read/write and GUI
+   operations require FILE_READ, FILE_WRITE and VIEW as appropriate.
+   Installed apps cannot call unreviewed package-admin, quantum, IPC,
+   raw-driver or generic handle syscalls even when granted INSTALL.
+3. The actual x86-64 INT 0x80 trap dispatch now checks the installed-app
+   rights against the *kernel active PCB PID*. The signed-app launch
+   path arms the gate only after matching explicit consent, then disarms
+   on clean exit or fault. Existing system applications remain unchanged.
+4. The four-boot real QEMU test ELF calls a forbidden syscall before exit
+   and asserts the trap returns BAD, exactly one blocked syscall was
+   recorded and all existing rollback, remount and cleanup checks pass.
+   Host tests additionally verify rights, stale PID/generation, signer
+   revocation, rotation and bad signature backend output.
+
+Important outstanding work: a true guest Ed25519 implementation with
+trusted public-key provenance; signing the complete mutable package
+manifest including version, requested rights and dependency metadata;
+production multi-process/SMP supervisor; trusted monotonic expiry,
+resource-level socket/file isolation, and graphical consent dialogs.
+The QEMU verifier and signature-backend unit tests remain fake.

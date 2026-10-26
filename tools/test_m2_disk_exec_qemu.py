@@ -44,7 +44,8 @@ def boot(qemu:str,ovmf:Path,iso:Path,disk:Path,stage:str)->None:
     if output.index(stage)>output.index(DONE):
      raise AssertionError("M2 serial sequence mismatch")
     if stage!=STAGES[-1]:
-     required=["IndianOS: ring-3 user image staged",
+     required=["IndianOS: M2 installed app privileged syscall DENIED",
+       "IndianOS: ring-3 user image staged",
        "IndianOS: ring-3 PMM frame count restored",
        "IndianOS: /bin/init exited through int 0x80"]
      if not all(x in output for x in required):

@@ -55,6 +55,10 @@ pub mod m2_sha256;
 #[cfg(feature="test-m2-developer-alpha")]
 pub mod m2_consent;
 #[cfg(feature="test-m2-developer-alpha")]
+pub mod m2_trust;
+#[cfg(feature="test-m2-developer-alpha")]
+pub mod m2_syscall_guard;
+#[cfg(feature="test-m2-developer-alpha")]
 pub mod m2_inventory;
 #[cfg(feature="test-m2-developer-alpha")]
 pub mod m2_network;

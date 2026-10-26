@@ -37,10 +37,14 @@ fn elf(v:u8)->[u8;IMAGE_LEN]{
  b[104..112].copy_from_slice(&(IMAGE_LEN as u64).to_le_bytes());
  b[112..120].copy_from_slice(&4096u64.to_le_bytes());
  // mov eax,2 ; xor edi,edi ; xor esi,esi ; int80 ; hlt ; nop,nop,nop
- b[120..136].copy_from_slice(&[0xB8,2,0,0,0,0x31,0xFF,0x31,0xF6,0xCD,0x80,
-  0xF4,0x90,0x90,0x90,v]);
- // Zero-filled tail is deliberately file-backed: the runtime must map
- // and execute the larger persisted M2P4 package, not initramfs data.
+ // A forbidden syscall 7 must return BAD (-1) from the REAL trap gate.
+ // Otherwise branch to UD2; only the successful rejection may exit(0).
+ b[120..147].copy_from_slice(&[
+  0xB8,7,0,0,0,0x31,0xFF,0x31,0xF6,0xCD,0x80,
+  0x48,0x83,0xF8,0xFF,0x75,0x08,
+  0xB8,2,0,0,0,0xCD,0x80,0xF4,0x0F,0x0B
+ ]);
+ b[IMAGE_LEN-1]=v;
  b
 }
 fn envelope(v:u8)->Envelope{
@@ -96,6 +100,7 @@ fn run_cpu<D:BlockDevice>(inv:&mut Inventory<D>)->Result<(),()>{
   unsafe{&mut*pcb},process.generation,&consent).map_err(|_|())?;
  consent.retire(process);
  if receipt.id!=APP||!unsafe{indianos_process_success(pcb)}{return Err(());}
+ if crate::m2_syscall_guard::last_denied_calls()!=1{return Err(());}
  Ok(())
 }
 pub fn run()->Result<u8,()>{
