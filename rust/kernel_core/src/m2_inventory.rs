@@ -1,8 +1,9 @@
-//! M2 on-device persisted INSTALL INVENTORY with cryptographic verifier
-//! dependency, explicit PID-generation capability and one-level rollback.
-//! IMPORTANT: the record is not an installed executable: binary ingestion,
-//! live ELF loading, trust-key provisioning and App Store UI are not here.
-//! Verifier implementation must be a real trusted crypto provider in guest.
+//! M2 on-device executable installer using versioned COW manifests,
+//! SHA-256 checks and an injected cryptographic signer verifier.
+//! M2P3 saves a small ELF in one file; M2P4 stores a bounded overflow
+//! extent in an independent checksummed A/B bank for safe rollback.
+//! Trust-root provisioning and a REAL guest Ed25519 verifier remain TODO.
+//! All calls here must be made by the trusted kernel supervisor.
 use crate::block::BlockDevice;
 use crate::hier_vfs::HierVfs;
 use crate::durablefs::{FsError,MAX_FILE_BYTES};
@@ -13,8 +14,12 @@ use crate::m2_sdk::{Package,Catalog,MAX_DEPS};
 const LEN:usize=100;
 const LEGACY_LEN:usize=52;
 const IMAGE_HEADER:usize=178;
-/// Current R027 VFS file bank permits at most 1870 signed image bytes.
-pub const MAX_IMAGE_BYTES:usize=MAX_FILE_BYTES-IMAGE_HEADER;
+/// M2P4 stores the first bytes with metadata and one independently
+/// checksummed overflow file. Two slots preserve both upgrade versions.
+const EXT_HEADER:usize=182;
+pub const INLINE_IMAGE_BYTES:usize=MAX_FILE_BYTES-EXT_HEADER;
+pub const MAX_IMAGE_BYTES:usize=INLINE_IMAGE_BYTES+MAX_FILE_BYTES;
+const LEGACY_IMAGE_LIMIT:usize=MAX_FILE_BYTES-IMAGE_HEADER;
 /// Earlier records had no dependency provenance. Never assume they had none.
 const UNKNOWN_DEP:u32=u32::MAX;
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
@@ -49,14 +54,23 @@ fn decode(b:&[u8])->Result<Record,Error>{
  let legacy=b.len()==LEGACY_LEN&&&b[..4]==b"M2PK";
  let current=b.len()==LEN&&&b[..4]==b"M2P2";
  let image=b.len()>=IMAGE_HEADER&&&b[..4]==b"M2P3";
- if !legacy&&!current&&!image{return Err(Error::Invalid);}
- if image{
+ let extended=b.len()>=EXT_HEADER&&&b[..4]==b"M2P4";
+ if !legacy&&!current&&!image&&!extended{return Err(Error::Invalid);}
+ if image||extended{
   let size=u16::from_le_bytes([b[176],b[177]]) as usize;
   let signer=u32::from_le_bytes(b[100..104].try_into().unwrap());
   let epoch=u64::from_le_bytes(b[104..112].try_into().unwrap());
-  if size==0||IMAGE_HEADER.checked_add(size)!=Some(b.len())||
-     signer==0||epoch==0||b[112..176].iter().all(|&x|x==0){
-   return Err(Error::Invalid);
+  if size==0||signer==0||epoch==0||
+     b[112..176].iter().all(|&x|x==0){return Err(Error::Invalid);}
+  if image{
+   if IMAGE_HEADER.checked_add(size)!=Some(b.len())||
+      size>LEGACY_IMAGE_LIMIT{return Err(Error::Invalid);}
+  }else{
+   let rest=u16::from_le_bytes([b[178],b[179]]) as usize;
+   if size!=INLINE_IMAGE_BYTES||rest==0||rest>MAX_FILE_BYTES||
+      b[180]>1||b[181]!=0||EXT_HEADER+size!=b.len(){
+    return Err(Error::Invalid);
+   }
   }
  }
  let id=u32::from_le_bytes(b[4..8].try_into().unwrap());
@@ -92,6 +106,19 @@ fn name(id:u32,old:bool)->Result<[u8;8],Error>{
  p[6]=b'0'+(id/10) as u8;p[7]=b'0'+(id%10) as u8;
  // Exact 8-byte ASCII path; no NUL byte reaches the VFS.
  Ok(p)
+}
+/// A/B overflow files are never reused while referenced by active or backup.
+/// The immutable manifest commits a version by naming exactly one slot.
+fn extent_name(id:u32,slot:u8)->Result<[u8;8],Error>{
+ if slot>1{return Err(Error::Invalid);}
+ let mut p=name(id,false)?;
+ p[5]=if slot==0{b'x'}else{b'y'};
+ Ok(p)
+}
+fn extent_slot(manifest:&[u8])->Option<u8>{
+ if manifest.len()>=EXT_HEADER&&&manifest[..4]==b"M2P4"&&manifest[180]<=1{
+  Some(manifest[180])
+ }else{None}
 }
 fn path(p:&[u8;8])->&str{core::str::from_utf8(&p[..8]).unwrap()}
 impl<D:BlockDevice> Inventory<D>{
@@ -163,21 +190,41 @@ impl<D:BlockDevice> Inventory<D>{
   auth.require(owner,INSTALL,now).map_err(|_|Error::Denied)?;
   let mut raw=[0u8;MAX_FILE_BYTES];
   let (record,n)=self.read_raw(id,false,&mut raw)?.ok_or(Error::NotFound)?;
-  if n<IMAGE_HEADER||&raw[..4]!=b"M2P3"{return Err(Error::ImageMissing);}
+  if n<IMAGE_HEADER||(&raw[..4]!=b"M2P3"&&&raw[..4]!=b"M2P4"){
+   return Err(Error::ImageMissing);
+  }
   let signer=u32::from_le_bytes(raw[100..104].try_into().unwrap());
   let epoch=u64::from_le_bytes(raw[104..112].try_into().unwrap());
   let mut signature=[0u8;64];signature.copy_from_slice(&raw[112..176]);
   let envelope=Envelope{signer,epoch,digest:record.digest,signature};
-  let image=&raw[IMAGE_HEADER..n];
+  let mut scratch=[0u8;MAX_IMAGE_BYTES];
+  let length=if &raw[..4]==b"M2P4"{
+   let inline=u16::from_le_bytes(raw[176..178].try_into().unwrap()) as usize;
+   let extra=u16::from_le_bytes(raw[178..180].try_into().unwrap()) as usize;
+   if inline!=INLINE_IMAGE_BYTES||extra==0||extra>MAX_FILE_BYTES||
+      inline+extra>scratch.len(){return Err(Error::Invalid);}
+   scratch[..inline].copy_from_slice(&raw[EXT_HEADER..n]);
+   let slot=raw[180];
+   let file=extent_name(id,slot)?;
+   let read=self.volume.read(path(&file),&mut scratch[inline..inline+extra])
+      .map_err(Error::Fs)?;
+   if read!=extra{return Err(Error::Invalid);}
+   inline+extra
+  }else{
+   let len=n-IMAGE_HEADER;
+   scratch[..len].copy_from_slice(&raw[IMAGE_HEADER..n]);
+   len
+  };
+  let image=&scratch[..length];
   crate::m2_elf::validate_static(image).map_err(|_|Error::Invalid)?;
   if !crate::m2_sha256::matches(image,&record.digest){
    return Err(Error::DigestMismatch);
   }
   self.require_runtime_dependencies(record)?;
   batch4_signature::check(roots,verifier,&envelope,image).map_err(Error::Trust)?;
-  if out.len()<image.len(){return Err(Error::Fs(FsError::TooLarge));}
-  out[..image.len()].copy_from_slice(image);
-  Ok((record,image.len()))
+  if out.len()<length{return Err(Error::Fs(FsError::TooLarge));}
+  out[..length].copy_from_slice(image);
+  Ok((record,length))
  }
  /// Single-package installs may NOT silently ignore dependencies.
  /// For packages with dependencies use install_from_catalog, which checks every
@@ -276,14 +323,43 @@ impl<D:BlockDevice> Inventory<D>{
   let p=name(item.id,false)?;
   let mut data=[0u8;MAX_FILE_BYTES];
   data[..LEN].copy_from_slice(&encode(next));
+  let overflow=persist_image&&payload.len()>LEGACY_IMAGE_LIMIT;
   let size=if persist_image{
-   data[..4].copy_from_slice(b"M2P3");
    data[100..104].copy_from_slice(&signed.signer.to_le_bytes());
    data[104..112].copy_from_slice(&signed.epoch.to_le_bytes());
    data[112..176].copy_from_slice(&signed.signature);
-   data[176..178].copy_from_slice(&(payload.len() as u16).to_le_bytes());
-   data[IMAGE_HEADER..IMAGE_HEADER+payload.len()].copy_from_slice(payload);
-   IMAGE_HEADER+payload.len()
+   if overflow{
+    // The old M2P4 slot stays intact during upgrades/rollback. Commit
+    // the new overflow bank BEFORE its referencing manifest is published.
+    let mut original=[0u8;MAX_FILE_BYTES];
+    let former_slot=if self.read_raw(item.id,false,&mut original)?.is_some(){
+     extent_slot(&original)
+    }else{None};
+    let slot=former_slot.map_or(0,|n|1-n);
+    let file=extent_name(item.id,slot)?;
+    let inline=INLINE_IMAGE_BYTES;
+    let extra=payload.len()-inline;
+    if extra==0||extra>MAX_FILE_BYTES{return Err(Error::Fs(FsError::TooLarge));}
+    data[..4].copy_from_slice(b"M2P4");
+    data[176..178].copy_from_slice(&(inline as u16).to_le_bytes());
+    data[178..180].copy_from_slice(&(extra as u16).to_le_bytes());
+    data[180]=slot;data[181]=0;
+    data[EXT_HEADER..EXT_HEADER+inline].copy_from_slice(&payload[..inline]);
+    // Reusing an unreferenced slot after crash/reboot is safe: old active
+    // and rollback manifests never point at this bank.
+    match self.volume.create(path(&file),&payload[inline..]){
+     Ok(())=>{},
+     Err(FsError::Exists)=>self.volume.overwrite(path(&file),&payload[inline..])
+        .map_err(Error::Fs)?,
+     Err(e)=>return Err(Error::Fs(e)),
+    }
+    EXT_HEADER+inline
+   }else{
+    data[..4].copy_from_slice(b"M2P3");
+    data[176..178].copy_from_slice(&(payload.len() as u16).to_le_bytes());
+    data[IMAGE_HEADER..IMAGE_HEADER+payload.len()].copy_from_slice(payload);
+    IMAGE_HEADER+payload.len()
+   }
   }else{LEN};
   if previous.is_some(){
    let backup=name(item.id,true)?;
@@ -296,6 +372,37 @@ impl<D:BlockDevice> Inventory<D>{
    self.volume.create(path(&p),&data[..size]).map_err(Error::Fs)?;
   }
   Ok(next)
+ }
+ /// Reclaim only overflow banks no longer referenced by an active OR
+ /// rollback manifest. Safe to retry after power loss.
+ fn clean_unused_extents(&mut self,id:u32)->Result<usize,Error>{
+  let mut live=[false;2];
+  for old in [false,true]{
+   let mut manifest=[0u8;MAX_FILE_BYTES];
+   if let Some((_,size))=self.read_raw(id,old,&mut manifest)?{
+    if let Some(slot)=extent_slot(&manifest[..size]){
+     live[slot as usize]=true;
+    }
+   }
+  }
+  let mut removed=0;
+  for slot in 0..2{
+   if live[slot]{continue;}
+   let file=extent_name(id,slot as u8)?;
+   match self.volume.unlink(path(&file)){
+    Ok(())=>removed+=1,
+    Err(FsError::NotFound)=>{},
+    Err(e)=>return Err(Error::Fs(e)),
+   }
+  }
+  Ok(removed)
+ }
+ /// Authorized retry for interrupted removal or checkpoint cleanup.
+ /// Reference checks protect both active and rollback extents.
+ pub fn reclaim_unused_extents<const N:usize>(&mut self,auth:&Access<N>,
+  owner:Identity,now:u64,id:u32)->Result<usize,Error>{
+  auth.require(owner,INSTALL,now).map_err(|_|Error::Denied)?;
+  self.clean_unused_extents(id)
  }
  /// After successful upgrade, retain one rollback checkpoint until the
  /// trusted runtime confirms the new image is genuinely running and healthy.
@@ -311,6 +418,7 @@ impl<D:BlockDevice> Inventory<D>{
   }
   let backup=name(id,true)?;
   self.volume.unlink(path(&backup)).map_err(Error::Fs)?;
+  self.clean_unused_extents(id)?;
   Ok(active)
  }
  /// Resolve an interrupted upgrade where backup was committed, but the
@@ -324,6 +432,7 @@ impl<D:BlockDevice> Inventory<D>{
   if active!=previous{return Err(Error::RollbackPending);}
   let backup=name(id,true)?;
   self.volume.unlink(path(&backup)).map_err(Error::Fs)?;
+  self.clean_unused_extents(id)?;
   Ok(true)
  }
  /// Check all installed package metadata rather than relying on an
@@ -355,6 +464,7 @@ impl<D:BlockDevice> Inventory<D>{
   self.volume.overwrite(path(&p),&backup_bytes[..oldsize]).map_err(Error::Fs)?;
   let old=name(id,true)?;
   self.volume.unlink(path(&old)).map_err(Error::Fs)?;
+  self.clean_unused_extents(id)?;
   Ok(older)
  }
  pub fn remove<const N:usize>(&mut self,auth:&Access<N>,
@@ -363,7 +473,11 @@ impl<D:BlockDevice> Inventory<D>{
   // An interrupted remove may leave only the backup; retry must clean it.
   let installed=self.read(id,false)?;
   let backup=self.read(id,true)?;
-  if installed.is_none()&&backup.is_none(){return Err(Error::NotFound);}
+  if installed.is_none()&&backup.is_none(){
+   // Retried after an interrupted removal: detached banks may remain.
+   return if self.clean_unused_extents(id)? > 0{Ok(())}
+       else{Err(Error::NotFound)};
+  }
   self.require_dependents_safe(id,None)?;
   if installed.is_some(){
    let p=name(id,false)?;self.volume.unlink(path(&p)).map_err(Error::Fs)?;
@@ -371,6 +485,7 @@ impl<D:BlockDevice> Inventory<D>{
   if backup.is_some(){
    let b=name(id,true)?;self.volume.unlink(path(&b)).map_err(Error::Fs)?;
   }
+  self.clean_unused_extents(id)?;
   Ok(())
  }
 }
@@ -577,7 +692,7 @@ impl<D:BlockDevice> Inventory<D>{
  struct ImageVerifier;
  impl Verify for ImageVerifier{
   fn verify_digest_and_signature(&self,e:&Envelope,payload:&[u8])->bool{
-   payload.len()==124&&payload[120]==7&&e.signature[0]==9&&
+   payload.len()>=124&&payload[120]==7&&e.signature[0]==9&&
     crate::m2_sha256::matches(payload,&e.digest)
   }
  }
@@ -701,6 +816,142 @@ impl<D:BlockDevice> Inventory<D>{
   let revoked=[Root{signer:1,epoch:1,enabled:false}];
   assert_eq!(inv.verified_image(&auth(),actor(),1,&revoked,&ImageVerifier,
     7,&mut out),Err(Error::Trust(batch4_signature::Error::Untrusted)));
+ }
+
+ fn m2_large_image(size:usize,seed:u8)->std::vec::Vec<u8>{
+  let mut image=std::vec![0u8;size];
+  image[..124].copy_from_slice(&crate::m2_elf::tests::sample());
+  image[96..104].copy_from_slice(&(size as u64).to_le_bytes());
+  // ELF filesz must never exceed memsz. The original 124-byte fixture
+  // declared memsz=124; extended samples require a full mapped page.
+  image[104..112].copy_from_slice(&4096u64.to_le_bytes());
+  for (n,b) in image[124..].iter_mut().enumerate(){
+   *b=seed.wrapping_add(n as u8);
+  }
+  image
+ }
+ #[test]fn m2_extended_image_reboot_upgrade_and_rollback_keeps_both_slots(){
+  let mut i=fresh();
+  let old=m2_large_image(2800,11);
+  let new=m2_large_image(3500,12);
+  i.install_image(&auth(),actor(),1,&roots(),&ImageVerifier,
+   &image_envelope(&old),&old,image_pkg(1,&old)).unwrap();
+  let mut i=Inventory::mount(i.into_device()).unwrap();
+  let mut out=[0u8;MAX_IMAGE_BYTES];
+  let (_,n)=i.verified_image(&auth(),actor(),1,&roots(),&ImageVerifier,7,&mut out).unwrap();
+  assert_eq!(&out[..n],&old);
+  let mut chunk=[0u8;MAX_FILE_BYTES];
+  assert_eq!(i.volume.read("/pkg/x07",&mut chunk),Ok(old.len()-INLINE_IMAGE_BYTES));
+  i.install_image(&auth(),actor(),1,&roots(),&ImageVerifier,
+   &image_envelope(&new),&new,image_pkg(2,&new)).unwrap();
+  let mut i=Inventory::mount(i.into_device()).unwrap();
+  assert_eq!(i.rollback_pending(7),Ok(true));
+  assert_eq!(i.reclaim_unused_extents(&auth(),actor(),1,7),Ok(0));
+  assert_eq!(i.volume.read("/pkg/y07",&mut chunk),Ok(new.len()-INLINE_IMAGE_BYTES));
+  let (_,n)=i.verified_image(&auth(),actor(),1,&roots(),&ImageVerifier,7,&mut out).unwrap();
+  assert_eq!(&out[..n],&new);
+  i.rollback(&auth(),actor(),1,7).unwrap();
+  assert_eq!(i.volume.read("/pkg/y07",&mut chunk),Err(FsError::NotFound));
+  let mut i=Inventory::mount(i.into_device()).unwrap();
+  let (_,n)=i.verified_image(&auth(),actor(),1,&roots(),&ImageVerifier,7,&mut out).unwrap();
+  assert_eq!(&out[..n],&old);
+  i.remove(&auth(),actor(),1,7).unwrap();
+  assert_eq!(i.volume.read("/pkg/x07",&mut chunk),Err(FsError::NotFound));
+  assert_eq!(i.installed(7),Ok(None));
+ }
+ #[test]fn m2_extended_image_crc_valid_corruption_or_missing_extent_denied(){
+  let mut i=fresh();
+  let image=m2_large_image(2500,22);
+  i.install_image(&auth(),actor(),1,&roots(),&ImageVerifier,
+   &image_envelope(&image),&image,image_pkg(1,&image)).unwrap();
+  let mut chunk=[0u8;MAX_FILE_BYTES];
+  let count=i.volume.read("/pkg/x07",&mut chunk).unwrap();
+  chunk[0]^=7;
+  i.volume.overwrite("/pkg/x07",&chunk[..count]).unwrap();
+  let mut i=Inventory::mount(i.into_device()).unwrap();
+  let mut out=[0u8;MAX_IMAGE_BYTES];
+  assert_eq!(i.verified_image(&auth(),actor(),1,&roots(),&ImageVerifier,7,&mut out),
+   Err(Error::DigestMismatch));
+  i.volume.unlink("/pkg/x07").unwrap();
+  assert_eq!(i.verified_image(&auth(),actor(),1,&roots(),&ImageVerifier,7,&mut out),
+   Err(Error::Fs(FsError::NotFound)));
+ }
+ #[test]fn m2_extended_image_failed_new_bank_does_not_change_active(){
+  let mut i=fresh();
+  let old=m2_large_image(2600,13);
+  let update=m2_large_image(2700,14);
+  i.install_image(&auth(),actor(),1,&roots(),&ImageVerifier,
+   &image_envelope(&old),&old,image_pkg(1,&old)).unwrap();
+  let mut disk=i.into_device();disk.fail_at=Some(disk.writes);
+  let mut i=Inventory::mount(disk).unwrap();
+  assert_eq!(i.install_image(&auth(),actor(),1,&roots(),&ImageVerifier,
+   &image_envelope(&update),&update,image_pkg(2,&update)),Err(Error::Fs(FsError::Io)));
+  let mut disk=i.into_device();disk.fail_at=None;
+  let mut i=Inventory::mount(disk).unwrap();
+  assert_eq!(i.installed(7).unwrap().unwrap().version,1);
+  assert_eq!(i.rollback_pending(7),Ok(false));
+  let mut out=[0u8;MAX_IMAGE_BYTES];
+  let (_,n)=i.verified_image(&auth(),actor(),1,&roots(),&ImageVerifier,7,&mut out).unwrap();
+  assert_eq!(&out[..n],&old);
+ }
+ #[test]fn m2_extended_image_max_bytes_and_confirm_update_reclaim(){
+  let mut i=fresh();
+  let oversize=std::vec![0u8;MAX_IMAGE_BYTES+1];
+  let generation=i.volume.generation();
+  assert_eq!(i.install_image(&auth(),actor(),1,&roots(),&ImageVerifier,
+   &image_envelope(&oversize),&oversize,image_pkg(1,&oversize)),
+   Err(Error::Fs(FsError::TooLarge)));
+  assert_eq!(i.volume.generation(),generation);
+  let old=m2_large_image(2500,3);
+  let new=m2_large_image(3100,4);
+  i.install_image(&auth(),actor(),1,&roots(),&ImageVerifier,
+   &image_envelope(&old),&old,image_pkg(1,&old)).unwrap();
+  i.install_image(&auth(),actor(),1,&roots(),&ImageVerifier,
+   &image_envelope(&new),&new,image_pkg(2,&new)).unwrap();
+  struct Good;
+  impl RuntimeHealth for Good{
+   fn healthy_running_image(&self,id:u32,version:u64,_:&[u8;32])->bool{id==7&&version==2}
+  }
+  assert_eq!(i.confirm_update(&auth(),actor(),1,7,&Good).unwrap().version,2);
+  let mut buf=[0u8;MAX_FILE_BYTES];
+  assert_eq!(i.volume.read("/pkg/x07",&mut buf),Err(FsError::NotFound));
+  assert_eq!(i.volume.read("/pkg/y07",&mut buf),Ok(new.len()-INLINE_IMAGE_BYTES));
+  let mut i=Inventory::mount(i.into_device()).unwrap();
+  let mut out=[0u8;MAX_IMAGE_BYTES];
+  let (_,n)=i.verified_image(&auth(),actor(),1,&roots(),&ImageVerifier,7,&mut out).unwrap();
+  assert_eq!(&out[..n],&new);
+ }
+
+ #[test]fn m2_extended_image_interrupted_manifest_write_recovers_and_reclaims(){
+  let mut i=fresh();
+  let old=m2_large_image(2750,31);
+  let update=m2_large_image(2830,32);
+  i.install_image(&auth(),actor(),1,&roots(),&ImageVerifier,
+   &image_envelope(&old),&old,image_pkg(1,&old)).unwrap();
+  let mut disk=i.into_device();
+  // COW creates an overflow bank in 5 sector writes, then a backup
+  // manifest in 5 writes; fail exactly at active-manifest publication.
+  disk.fail_at=Some(disk.writes+10);
+  let mut i=Inventory::mount(disk).unwrap();
+  assert_eq!(i.install_image(&auth(),actor(),1,&roots(),&ImageVerifier,
+    &image_envelope(&update),&update,image_pkg(2,&update)),
+    Err(Error::Fs(FsError::Io)));
+  let mut disk=i.into_device();disk.fail_at=None;
+  let mut i=Inventory::mount(disk).unwrap();
+  assert_eq!(i.installed(7).unwrap().unwrap().version,1);
+  assert_eq!(i.rollback_pending(7),Ok(true));
+  assert_eq!(i.recover_staged_backup(&auth(),actor(),1,7),Ok(true));
+  assert_eq!(i.rollback_pending(7),Ok(false));
+  let mut scratch=[0u8;MAX_FILE_BYTES];
+  assert_eq!(i.volume.read("/pkg/y07",&mut scratch),Err(FsError::NotFound));
+  let mut out=[0u8;MAX_IMAGE_BYTES];
+  let (_,n)=i.verified_image(&auth(),actor(),1,&roots(),&ImageVerifier,7,&mut out).unwrap();
+  assert_eq!(&out[..n],&old);
+  // Safe retried upgrade now reuses the freed inactive bank.
+  i.install_image(&auth(),actor(),1,&roots(),&ImageVerifier,
+    &image_envelope(&update),&update,image_pkg(2,&update)).unwrap();
+  let (_,n)=i.verified_image(&auth(),actor(),1,&roots(),&ImageVerifier,7,&mut out).unwrap();
+  assert_eq!(&out[..n],&update);
  }
 
 }

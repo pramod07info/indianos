@@ -1,7 +1,7 @@
 //! M2 dependency-free SHA-256, usable in bare-metal no_std kernels.
 //! This provides content integrity ONLY. SHA-256 is not Ed25519 and cannot
 //! independently authenticate a publisher or replace trusted public keys.
-//! Input sizes are bounded by the package loader to < 2 KiB at present.
+//! The current M2P4 package loader bounds native ELF inputs to 3,914 bytes.
 const INITIAL:[u32;8]=[
  0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,
  0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19
