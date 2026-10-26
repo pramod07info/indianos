@@ -9,11 +9,12 @@ use crate::batch6_security::Access;
 use crate::m2_inventory::{Inventory,Record,Error as InventoryError,MAX_IMAGE_BYTES};
 use crate::user_image::{UserImage,indianos_user_image_load};
 use crate::vmm::Backend;
+use crate::m2_consent::Ledger;
 use crate::{Process,indianos_process_ready,indianos_process_bind};
 
 #[derive(Debug,PartialEq,Eq)]
 pub enum Error{Busy,Stored(InventoryError),InvalidElf,MappingFailed,InvalidProcess,
- GuestExecutionFailed}
+ GuestExecutionFailed,ConsentDenied}
 
 /// The caller is a trusted supervisor and owns an uninitialized detached
 /// UserImage. The backend must allocate/access/release real kernel-managed
@@ -154,7 +155,7 @@ fn verified_for_execution<D:BlockDevice,V:Verify,const N:usize>(
 /// exported as a generic user syscall or enabled for regular boot.
 /// Only the trusted kernel supervisor may invoke it, on its single BSP.
 #[cfg(all(feature="user-runtime",target_arch="x86_64",target_os="none"))]
-pub fn execute_installed<D:BlockDevice,V:Verify,const N:usize>(
+pub(crate) fn execute_installed<D:BlockDevice,V:Verify,const N:usize>(
     inventory:&mut Inventory<D>,auth:&Access<N>,owner:Identity,now:u64,
     roots:&[Root],verifier:&V,id:u32,process:&mut Process,
 )->Result<Record,Error>{
@@ -172,6 +173,41 @@ pub fn execute_installed<D:BlockDevice,V:Verify,const N:usize>(
         )
     };
     if completed{Ok(app)}else{Err(Error::GuestExecutionFailed)}
+}
+
+/// Production-facing gate for an installed native process: re-verify on-disk
+/// signed bytes + SHA-256 + dependency closure, require explicit administrator
+/// approval of exactly THIS process identity and package digest/rights,
+/// and only then enter the existing protected ring-3 runtime.
+///
+/// This is *not* a user syscall. Caller must be the privileged single-BSP
+/// supervisor with exclusive NEW PCB ownership. It must retire a process's
+/// approval during reaping and enforce actual rights on subsequent syscalls.
+/// The signature provider MUST be a real cryptographic provider in releases.
+#[cfg(all(feature="user-runtime",target_arch="x86_64",target_os="none"))]
+pub fn execute_installed_approved<
+    D:BlockDevice,V:Verify,const N:usize,const C:usize
+>(
+    inventory:&mut Inventory<D>,auth:&Access<N>,owner:Identity,now:u64,
+    roots:&[Root],verifier:&V,id:u32,process:&mut Process,
+    generation:u64,consent:&Ledger<C>,
+)->Result<Record,Error>{
+    if generation==0{return Err(Error::ConsentDenied);}
+    let mut bytes=[0u8;MAX_IMAGE_BYTES];
+    let (record,size)=verified_for_execution(
+        inventory,auth,owner,now,roots,verifier,id,process,&mut bytes
+    )?;
+    consent.require(Identity{pid:process.pid,generation},record,now)
+        .map_err(|_|Error::ConsentDenied)?;
+    // SAFETY: The single-core trusted supervisor exclusively owns a NEW
+    // PCB; bytes are in kernel memory and live until the synchronous runner
+    // restores kernel CR3 and finishes EXIT/FAULT/REAP cleanup.
+    let completed=unsafe{
+        crate::user_runtime::x86_64_user_process_run(
+            process as *mut Process,bytes.as_ptr(),size
+        )
+    };
+    if completed{Ok(record)}else{Err(Error::GuestExecutionFailed)}
 }
 
 #[cfg(test)]
@@ -206,7 +242,7 @@ mod tests {
     impl Verify for OnlySample{
         fn verify_digest_and_signature(&self,e:&Envelope,bytes:&[u8])->bool{
             // Explicit unit-test fake. Guest crypto and key trust still absent.
-            e.signature[0]==42&&e.digest==[5;32]&&
+            e.signature[0]==42&&e.digest==crate::m2_sha256::digest(bytes)&&
             bytes==crate::m2_elf::tests::sample()
         }
     }
@@ -221,9 +257,11 @@ mod tests {
         a
     }
     fn roots()->[Root;1]{[Root{signer:7,epoch:2,enabled:true}]}
-    fn envelope()->Envelope{Envelope{signer:7,epoch:2,digest:[5;32],signature:[42;64]}}
+    fn envelope()->Envelope{Envelope{signer:7,epoch:2,
+     digest:crate::m2_sha256::digest(&crate::m2_elf::tests::sample()),signature:[42;64]}}
     fn package()->Package{
-        Package{id:9,version:1,abi:ABI,rights:0,deps:[0;4],payload_digest:[5;32]}
+        Package{id:9,version:1,abi:ABI,rights:0,deps:[0;4],
+         payload_digest:crate::m2_sha256::digest(&crate::m2_elf::tests::sample())}
     }
     fn installed()->Inventory<Disk>{
         let disk=Disk{sectors:[[0;SECTOR_BYTES];SECTORS]};

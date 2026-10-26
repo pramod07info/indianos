@@ -41,10 +41,10 @@ fn elf(v:u8)->[u8;IMAGE_LEN]{
  b
 }
 fn envelope(v:u8)->Envelope{
- Envelope{signer:7,epoch:2,digest:[v;32],signature:[40+v;64]}
+ Envelope{signer:7,epoch:2,digest:crate::m2_sha256::digest(&elf(v)),signature:[40+v;64]}
 }
 fn package(v:u8)->Package{
- Package{id:APP,version:v as u64,abi:ABI,rights:0,deps:[0;4],payload_digest:[v;32]}
+ Package{id:APP,version:v as u64,abi:ABI,rights:0,deps:[0;4],payload_digest:crate::m2_sha256::digest(&elf(v))}
 }
 fn access()->Access<1>{
  let mut a=Access::new();a.grant(ADMIN,INSTALL,100).unwrap();a
@@ -53,8 +53,9 @@ struct FixtureVerifier;
 impl Verify for FixtureVerifier{
  fn verify_digest_and_signature(&self,e:&Envelope,data:&[u8])->bool{
   // TEST-ONLY PINNED BYTES. This does NOT implement Ed25519 or hash signing.
-  (1u8..=2).any(|v|e.signer==7&&e.epoch==2&&e.digest==[v;32]&&
-    e.signature==[40+v;64]&&data==elf(v))
+  (1u8..=2).any(|v|e.signer==7&&e.epoch==2&&
+    e.signature==[40+v;64]&&e.digest==crate::m2_sha256::digest(data)&&
+    data==elf(v))
  }
 }
 fn check<D:BlockDevice>(inv:&mut Inventory<D>,v:u8)->Result<(),()>{
@@ -68,9 +69,29 @@ fn run_cpu<D:BlockDevice>(inv:&mut Inventory<D>)->Result<(),()>{
  let mut table=ProcessTable::empty();
  let pcb=unsafe{indianos_process_create(&mut table)};
  if pcb.is_null(){return Err(());}
- let receipt=crate::m2_launch::execute_installed(
-  inv,&access(),ADMIN,1,&ROOTS,&FixtureVerifier,APP,unsafe{&mut*pcb})
-  .map_err(|_|())?;
+ // Revoke signer root and prove trusted storage refuses this exact image.
+ let disabled=[Root{signer:7,epoch:2,enabled:false}];
+ let mut scratch=[0u8;MAX_IMAGE_BYTES];
+ if inv.verified_image(&access(),ADMIN,1,&disabled,&FixtureVerifier,
+       APP,&mut scratch)!=Err(PackageError::Trust(
+         crate::batch4_signature::Error::Untrusted)){return Err(());}
+ let saved=inv.installed(APP).map_err(|_|())?.ok_or(())?;
+ let process=Identity{pid:unsafe{(*pcb).pid},generation:1};
+ let mut consent=crate::m2_consent::Ledger::<1>::new();
+ // Refuse unapproved execution before a single ring-3 instruction.
+ if crate::m2_launch::execute_installed_approved(inv,&access(),ADMIN,1,
+   &ROOTS,&FixtureVerifier,APP,unsafe{&mut*pcb},1,&consent)
+     !=Err(crate::m2_launch::Error::ConsentDenied){return Err(());}
+ consent.approve(&access(),ADMIN,1,process,saved,saved.rights,90)
+   .map_err(|_|())?;
+ if crate::m2_launch::execute_installed_approved(
+  inv,&access(),ADMIN,1,&ROOTS,&FixtureVerifier,APP,
+  unsafe{&mut*pcb},2,&consent)
+    !=Err(crate::m2_launch::Error::ConsentDenied){return Err(());}
+ let receipt=crate::m2_launch::execute_installed_approved(
+  inv,&access(),ADMIN,1,&ROOTS,&FixtureVerifier,APP,
+  unsafe{&mut*pcb},process.generation,&consent).map_err(|_|())?;
+ consent.retire(process);
  if receipt.id!=APP||!unsafe{indianos_process_success(pcb)}{return Err(());}
  Ok(())
 }
@@ -121,9 +142,9 @@ pub fn run()->Result<u8,()>{
        APP,&mut buf)!=Err(PackageError::NotFound){return Err(());}
    let mut table=ProcessTable::empty();
    let pcb=unsafe{indianos_process_create(&mut table)};
-   if pcb.is_null()||crate::m2_launch::execute_installed(
+   if pcb.is_null()||crate::m2_launch::execute_installed_approved(
        &mut inv,&access(),ADMIN,1,&ROOTS,&FixtureVerifier,APP,
-       unsafe{&mut*pcb})!=Err(crate::m2_launch::Error::Stored(PackageError::NotFound)){
+       unsafe{&mut*pcb},1,&crate::m2_consent::Ledger::<1>::new())!=Err(crate::m2_launch::Error::Stored(PackageError::NotFound)){
        return Err(());
    }
   },
@@ -134,6 +155,7 @@ pub fn run()->Result<u8,()>{
  volume.overwrite("/phase",&[stage+1]).map_err(|_|())?;
  drop(volume);
  // Check every byte outside the bounded 100-sector partition.
+ // The installer never needs or accesses a network connection.
  for lba in (0..START).chain(START+COUNT..128){
   let mut sector=[0u8;SECTOR_BYTES];
   disk.read_sector(lba,&mut sector).map_err(|_|())?;

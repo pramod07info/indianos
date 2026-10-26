@@ -186,3 +186,52 @@ R030 SDK's real OpenSSL Ed25519 validation is a separate check. Real guest
 Ed25519 verification, protected signer keys and real third-party signed
 packages remain required before any release/production claims.
 `make test-m2-disk-exec-qemu` runs the opt-in QEMU smoke.
+
+## M2 Phase 2: multi-function package integrity and explicit execution approvals
+
+This is the next combined PR after the four-boot QEMU M2P3 stored-executable
+acceptance merged to main. It intentionally contains multiple related
+functional improvements under one feature commit, not independent tiny commits.
+
+1. **Real SHA-256 digest binding for stored native executables.**
+   `m2_sha256` implements allocation-free SHA-256 for the freestanding guest,
+   with NIST vectors for empty input, `abc` and one million `a` bytes. Signed
+   ELF install and every privileged load now recompute and compare all 32
+   digest bytes before calling the separate signature-provider interface.
+   Metadata-only legacy inventory remains backward compatible; M2P3 app
+   writers must provide actual SHA-256, not fabricated test digests.
+2. **Persisted dependency enforcement at launch time.**
+   `m2_inventory` checks the entire bounded, on-disk transitive prerequisite
+   graph before any signed ELF is returned to the native kernel runner.
+   Missing dependencies, CRC-valid on-disk downgrades, legacy unknown
+   dependency records and cyclic graphs cannot start an executable.
+3. **Explicit, revocable process-scoped user permission approvals.**
+   `m2_consent` provides fixed-capacity kernel policy records bound to the
+   exact process PID+generation, installed app ID/version/SHA-256 digest,
+   complete requested capability rights, and an expiry. Only a trusted
+   INSTALL administrator may issue approval. Approval revokes on retirement,
+   cannot be transferred through PID reuse, and expires independently of
+   the installation signature.
+4. **Protected CPU launch integration.**
+   `m2_launch::execute_installed_approved` is the public execution path:
+   signed bytes, hash, dependency closure and explicit matching consent must
+   pass BEFORE the real ring-3 IRETQ transition. Earlier `execute_installed`
+   is now crate-private for internal compatibility only.
+5. **App Store permission-change and checkpoint preview.**
+   A read-only `m2_store::preview` reports newly requested rights,
+   whether a human consent decision is required, and if an outstanding
+   rollback checkpoint currently blocks further upgrades. It does not
+   grant rights, download packages or render a GUI.
+6. **Real QEMU acceptance now rejects absent consent, reused/stale PID
+   generation, and a revoked signer root before granting CPU control** on
+   every runnable boot. Existing four-boot install/upgrade/rollback/remove,
+   persistent disk guard checks and scheduler/PMM cleanup remain mandatory.
+
+**Security boundary:** The guest QEMU fixture still uses test-only pinned
+signature bytes, NOT real Ed25519. SHA-256 verifies content integrity but
+does not authenticate a publisher. A deployable M2 still requires guest
+Ed25519 with protected trust roots, real graphical permission-consent UX
+and syscall enforcement of per-app approved rights, larger native ELF
+storage than 1,870 bytes, robust general-purpose sockets/TLS/DHCP, and
+independently authored third-party app acceptance. None of these claims
+is inferred from passing a test-only signature fixture.

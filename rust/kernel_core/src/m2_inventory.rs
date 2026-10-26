@@ -24,7 +24,7 @@ pub struct Record{
 }
 #[derive(Debug,PartialEq,Eq)]
 pub enum Error{Denied,Invalid,NotFound,Downgrade,RollbackPending,MissingDependency,
- InUse,ImageMissing,Trust(batch4_signature::Error),Fs(FsError)}
+ InUse,ImageMissing,DigestMismatch,Trust(batch4_signature::Error),Fs(FsError)}
 /// Must be implemented by a trusted kernel process-supervisor/ELF loader.
  /// Passing a simple caller-controlled bool is NOT proof of healthy execution.
 pub trait RuntimeHealth{
@@ -125,6 +125,33 @@ impl<D:BlockDevice> Inventory<D>{
   Ok(self.read_raw(id,old,&mut bytes)?.map(|x|x.0))
  }
  pub fn installed(&mut self,id:u32)->Result<Option<Record>,Error>{self.read(id,false)}
+ /// Read-only checkpoint status for trusted App Store previews.
+ pub fn rollback_pending(&mut self,id:u32)->Result<bool,Error>{
+  Ok(self.read(id,true)?.is_some())
+ }
+ /// Bounded recursive graph check; fail closed on cycles, legacy unknown
+ /// edges, missing installed packages or version-regressed prerequisites.
+ fn require_runtime_dependencies(&mut self,root:Record)->Result<(),Error>{
+  let mut color=[0u8;100];
+  self.walk_runtime_dependencies(root,&mut color,0)
+ }
+ fn walk_runtime_dependencies(&mut self,record:Record,color:&mut[u8;100],
+  depth:usize)->Result<(),Error>{
+  if record.id==0||record.id>99||depth>16||
+    record.deps==[UNKNOWN_DEP;MAX_DEPS]{return Err(Error::MissingDependency);}
+  let id=record.id as usize;
+  if color[id]==1{return Err(Error::MissingDependency);}
+  if color[id]==2{return Ok(());}
+  color[id]=1;
+  for n in 0..MAX_DEPS{
+   let dep=record.deps[n];
+   if dep==0{continue;}
+   let saved=self.read(dep,false)?.ok_or(Error::MissingDependency)?;
+   if saved.version<record.minimums[n]{return Err(Error::MissingDependency);}
+   self.walk_runtime_dependencies(saved,color,depth+1)?;
+  }
+  color[id]=2;Ok(())
+ }
  /// Re-validate the saved signature and image *after* remount before copying
  /// bytes to a privileged native loader. INSTALL is deliberately required:
  /// this API is not an unprivileged application binary read syscall.
@@ -143,6 +170,10 @@ impl<D:BlockDevice> Inventory<D>{
   let envelope=Envelope{signer,epoch,digest:record.digest,signature};
   let image=&raw[IMAGE_HEADER..n];
   crate::m2_elf::validate_static(image).map_err(|_|Error::Invalid)?;
+  if !crate::m2_sha256::matches(image,&record.digest){
+   return Err(Error::DigestMismatch);
+  }
+  self.require_runtime_dependencies(record)?;
   batch4_signature::check(roots,verifier,&envelope,image).map_err(Error::Trust)?;
   if out.len()<image.len(){return Err(Error::Fs(FsError::TooLarge));}
   out[..image.len()].copy_from_slice(image);
@@ -228,6 +259,9 @@ impl<D:BlockDevice> Inventory<D>{
   if persist_image{
    if payload.len()>MAX_IMAGE_BYTES{return Err(Error::Fs(FsError::TooLarge));}
    crate::m2_elf::validate_static(payload).map_err(|_|Error::Invalid)?;
+   if !crate::m2_sha256::matches(payload,&signed.digest){
+    return Err(Error::DigestMismatch);
+   }
   }
   // Real verifier MUST verify the actual digest and digital signature;
   // NEVER accept a user-supplied "verified" boolean.
@@ -543,9 +577,18 @@ impl<D:BlockDevice> Inventory<D>{
  struct ImageVerifier;
  impl Verify for ImageVerifier{
   fn verify_digest_and_signature(&self,e:&Envelope,payload:&[u8])->bool{
-   // TEST ONLY: neither this toy verifier nor the constant digest is crypto.
-   payload.len()==124&&payload[120]==7&&e.digest[0]!=0&&e.signature[0]==9
+   payload.len()==124&&payload[120]==7&&e.signature[0]==9&&
+    crate::m2_sha256::matches(payload,&e.digest)
   }
+ }
+ fn image_envelope(payload:&[u8])->Envelope{
+  Envelope{signer:1,epoch:1,digest:crate::m2_sha256::digest(payload),
+    signature:[9;64]}
+ }
+ fn image_pkg(version:u64,payload:&[u8])->Package{
+  let mut p=pkg(version);
+  p.payload_digest=crate::m2_sha256::digest(payload);
+  p
  }
  struct AlwaysDeny;
  impl Verify for AlwaysDeny{
@@ -556,7 +599,7 @@ impl<D:BlockDevice> Inventory<D>{
   let first=crate::m2_elf::tests::sample();
   let mut second=first;second[121]=99;
   i.install_image(&auth(),actor(),1,&roots(),&ImageVerifier,
-    &envelope(1),&first,pkg(1)).unwrap();
+    &image_envelope(&first),&first,image_pkg(1,&first)).unwrap();
   let mut i=Inventory::mount(i.into_device()).unwrap();
   let mut out=[0u8;128];
   let (record,n)=i.verified_image(&auth(),actor(),1,&roots(),
@@ -566,7 +609,7 @@ impl<D:BlockDevice> Inventory<D>{
   assert_eq!(i.verified_image(&auth(),actor(),1,&roots(),
    &AlwaysDeny,7,&mut out),Err(Error::Trust(batch4_signature::Error::InvalidSignature)));
   i.install_image(&auth(),actor(),1,&roots(),&ImageVerifier,
-    &envelope(2),&second,pkg(2)).unwrap();
+    &image_envelope(&second),&second,image_pkg(2,&second)).unwrap();
   let mut i=Inventory::mount(i.into_device()).unwrap();
   assert_eq!(i.verified_image(&auth(),actor(),1,&roots(),
    &ImageVerifier,7,&mut out).unwrap().0.version,2);
@@ -586,10 +629,10 @@ impl<D:BlockDevice> Inventory<D>{
   let mut invalid=valid;invalid[68]=7;
   let before=i.volume.generation();
   assert_eq!(i.install_image(&auth(),actor(),1,&roots(),
-   &ImageVerifier,&envelope(1),&invalid,pkg(1)),Err(Error::Invalid));
+   &ImageVerifier,&image_envelope(&invalid),&invalid,image_pkg(1,&invalid)),Err(Error::Invalid));
   assert_eq!(i.volume.generation(),before);
   assert_eq!(i.install_image(&auth(),Identity{generation:2,..actor()},1,
-   &roots(),&ImageVerifier,&envelope(1),&valid,pkg(1)),Err(Error::Denied));
+   &roots(),&ImageVerifier,&image_envelope(&valid),&valid,image_pkg(1,&valid)),Err(Error::Denied));
   assert_eq!(i.volume.generation(),before);
   let mut out=[0u8;128];
   put(&mut i,actor(),1).unwrap();
@@ -602,7 +645,7 @@ impl<D:BlockDevice> Inventory<D>{
   let mut i=fresh();
   let first=crate::m2_elf::tests::sample();
   i.install_image(&auth(),actor(),1,&roots(),&ImageVerifier,
-    &envelope(1),&first,pkg(1)).unwrap();
+    &image_envelope(&first),&first,image_pkg(1,&first)).unwrap();
   // Simulate malicious use of an otherwise checksummed storage backend:
   // writing a new, CRC-valid image with a corrupted signed payload.
   let mut raw=[0u8;MAX_FILE_BYTES];
@@ -612,7 +655,52 @@ impl<D:BlockDevice> Inventory<D>{
   let mut i=Inventory::mount(i.into_device()).unwrap();
   let mut out=[0u8;128];
   assert_eq!(i.verified_image(&auth(),actor(),1,&roots(),
-   &ImageVerifier,7,&mut out),Err(Error::Trust(batch4_signature::Error::InvalidSignature)));
+   &ImageVerifier,7,&mut out),Err(Error::DigestMismatch));
+ }
+
+ #[test]fn m2_real_sha256_digest_gate_prevents_invalid_install_writes(){
+  let mut inv=fresh();
+  let image=crate::m2_elf::tests::sample();
+  let before=inv.volume.generation();
+  assert_eq!(inv.install_image(&auth(),actor(),1,&roots(),&ImageVerifier,
+    &envelope(1),&image,pkg(1)),Err(Error::DigestMismatch));
+  assert_eq!(inv.volume.generation(),before);
+  assert_eq!(inv.installed(7),Ok(None));
+ }
+ #[test]fn m2_saved_transitive_dependency_downgrade_blocks_execution(){
+  let mut inv=fresh();
+  let dep=Package{id:8,version:2,abi:crate::m2_sdk::ABI,rights:0,
+   deps:[0;4],payload_digest:[2;32]};
+  let image=crate::m2_elf::tests::sample();
+  let root=Package{id:7,version:1,abi:crate::m2_sdk::ABI,rights:0,
+   deps:[8,0,0,0],payload_digest:crate::m2_sha256::digest(&image)};
+  let mut catalog=Catalog::<3>::new();
+  catalog.add(dep).unwrap();catalog.add(root).unwrap();
+  inv.install(&auth(),actor(),1,&roots(),&TestVerifier,&envelope(2),
+    b"candidate-elf",dep).unwrap();
+  inv.install_image_from_catalog(&auth(),actor(),1,&roots(),&ImageVerifier,
+    &image_envelope(&image),&image,&catalog,7).unwrap();
+  let mut out=[0u8;MAX_IMAGE_BYTES];
+  assert!(inv.verified_image(&auth(),actor(),1,&roots(),
+    &ImageVerifier,7,&mut out).is_ok());
+  // Simulated CRC-valid downgrade of an installed dependency.
+  let mut raw=[0u8;MAX_FILE_BYTES];
+  let (_,length)=inv.read_raw(8,false,&mut raw).unwrap().unwrap();
+  raw[8..16].copy_from_slice(&1u64.to_le_bytes());
+  inv.volume.overwrite("/pkg/p08",&raw[..length]).unwrap();
+  let mut inv=Inventory::mount(inv.into_device()).unwrap();
+  assert_eq!(inv.verified_image(&auth(),actor(),1,&roots(),
+    &ImageVerifier,7,&mut out),Err(Error::MissingDependency));
+ }
+ #[test]fn m2_revoked_root_cannot_launch_persisted_image(){
+  let mut inv=fresh();
+  let image=crate::m2_elf::tests::sample();
+  inv.install_image(&auth(),actor(),1,&roots(),&ImageVerifier,
+   &image_envelope(&image),&image,image_pkg(1,&image)).unwrap();
+  let mut out=[0u8;MAX_IMAGE_BYTES];
+  let revoked=[Root{signer:1,epoch:1,enabled:false}];
+  assert_eq!(inv.verified_image(&auth(),actor(),1,&revoked,&ImageVerifier,
+    7,&mut out),Err(Error::Trust(batch4_signature::Error::Untrusted)));
  }
 
 }
