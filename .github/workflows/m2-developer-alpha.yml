@@ -9,6 +9,7 @@ on:
       - 'rust/kernel_core/Cargo.lock'
       - 'rust/kernel_core/vendor/ed25519-compact/**'
       - 'tools/test_m2_phase4c_vectors.py'
+      - 'tools/test_m2_phase5c_vectors.py'
       - 'Makefile'
       - 'tools/test_m2_disk_exec_qemu.py'
       - '.github/workflows/m2-developer-alpha.yml'
@@ -21,6 +22,7 @@ on:
       - 'rust/kernel_core/Cargo.lock'
       - 'rust/kernel_core/vendor/ed25519-compact/**'
       - 'tools/test_m2_phase4c_vectors.py'
+      - 'tools/test_m2_phase5c_vectors.py'
       - 'Makefile'
       - 'tools/test_m2_disk_exec_qemu.py'
       - '.github/workflows/m2-developer-alpha.yml'
@@ -100,6 +102,9 @@ jobs:
       - name: Independently verify three QEMU Ed25519 signature vectors with OpenSSL
         run: |
           python3 tools/test_m2_phase4c_vectors.py
+      - name: Phase 5C OpenSSL cross-checks for 32/64KiB signed ELFs
+        run: |
+          python3 tools/test_m2_phase5c_vectors.py
       - name: Verified native ELF signed-install update and rollback in QEMU
         run: |
           set -euo pipefail
@@ -109,7 +114,7 @@ jobs:
           done
           test -n "$OVMF_PATH"
           make test-r030-package-qemu OVMF_CODE="$OVMF_PATH"
-      - name: M2 Phase 4D real Ed25519 A/B boot policy and rollback rejection across four QEMU boots
+      - name: M2 Phase 5C real 32KiB and 64KiB ring3 signed A/B install upgrade rollback in QEMU
         run: |
           set -euo pipefail
           OVMF_PATH=""

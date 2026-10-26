@@ -16,9 +16,31 @@ use crate::m2_trust_policy::SNAPSHOT_BYTES;
 use crate::m2_trust_policy::SignedSnapshot;
 use crate::batch5_session::Identity;
 use crate::batch6_security::{Access,INSTALL};
+use crate::m2_blob_store::{BlobStore,BundleSource,Error as BlobError,
+ CAPACITY,REQUIRED_SECTORS};
+use crate::m2_bundle_manifest::{SignedBundle,BundleManifest,
+ stage_verified,Error as BundleError};
+use crate::m2_sha256::Stream;
+use crate::m2_large_launch;
+use core::{ptr,ffi::c_char};
 use crate::{ProcessTable,indianos_process_create,indianos_process_success};
 const START:u64=24;
 const COUNT:u64=100;
+const TOTAL:u64=512; // Disposable QEMU-only disk, not user-owned storage.
+const BLOB_START:u64=144; // Dedicated second partition, disjoint from /pkg.
+const LARGE_V1:usize=32768;
+const LARGE_V2:usize=CAPACITY;
+const TEST_LARGE_DIGEST_1:[u8;32]=[66,170,89,241,188,5,94,242,150,19,139,86,242,119,252,171,28,229,138,227,42,164,108,132,146,72,213,59,66,125,183,12];
+const TEST_LARGE_DIGEST_2:[u8;32]=[229,24,119,15,52,112,4,6,226,151,238,50,108,247,143,127,23,214,162,69,68,169,110,14,57,241,38,126,200,192,192,8];
+const TEST_LARGE_SIG_1:[u8;64]=[174,196,218,61,18,135,140,174,79,5,242,209,29,21,112,100,136,131,129,36,37,94,40,191,108,141,87,219,105,88,22,252,68,151,76,138,85,77,62,64,74,209,163,255,9,193,161,106,18,87,4,2,160,186,101,9,197,246,67,213,116,197,118,1];
+const TEST_LARGE_SIG_2:[u8;64]=[167,235,41,35,142,158,140,93,154,144,232,64,140,159,123,152,164,253,0,85,36,36,178,181,149,3,152,120,134,208,47,102,0,48,236,93,15,48,219,171,177,43,52,232,192,69,74,235,253,202,44,29,65,130,51,3,229,37,25,18,92,10,30,4];
+#[repr(align(4096))]
+struct TestLargeScratch([u8;CAPACITY]);
+// One CPU, one synchronous test execution. No references persist across
+// guest invocations; scratch cleared after every attempted launch.
+static mut LARGE_SCRATCH:TestLargeScratch=TestLargeScratch([0;CAPACITY]);
+unsafe extern "C"{fn serial_write(message:*const c_char);}
+fn large_log(s:&'static[u8]){unsafe{serial_write(s.as_ptr().cast())};}
 const APP:u32=9;
 // Deliberately larger than the old 1870-byte M2P3 maximum.
 const IMAGE_LEN:usize=2400;
@@ -184,9 +206,159 @@ fn run_cpu<D:BlockDevice,V:Verify>(inv:&mut Inventory<D>,verifier:&V)->Result<()
  if crate::m2_syscall_guard::last_denied_calls()!=1{return Err(());}
  Ok(())
 }
+
+fn large_len(v:u8)->usize{if v==1{LARGE_V1}else{LARGE_V2}}
+struct QemuLargeSource{v:u8}
+impl BundleSource for QemuLargeSource{
+ fn read_exact(&mut self,offset:u32,out:&mut[u8])->Result<(),()>{
+  let start=offset as usize;
+  let end=start.checked_add(out.len()).ok_or(())?;
+  let len=large_len(self.v);
+  if !(1..=2).contains(&self.v)||end>len{return Err(());}
+  // Stream from a deterministic generator; NEVER allocate 64KiB on
+  // the small freestanding kernel stack. The old 2.4KiB ELF header,
+  // trap probe and exit sequence remain identical.
+  let old=elf(self.v);
+  let size=(len as u64).to_le_bytes();
+  for (i,byte) in out.iter_mut().enumerate(){
+   let at=start+i;
+   *byte=(at as u8).wrapping_mul(31)^0xa7^self.v;
+   if at<147{*byte=old[at];}
+   if (96..112).contains(&at){*byte=size[(at-96)%8];}
+   if at==len-1{*byte=self.v;}
+  }
+  Ok(())
+ }
+}
+fn bundle(v:u8)->SignedBundle{
+ SignedBundle{
+  manifest:BundleManifest{
+   app:APP,version:v as u64,length:large_len(v) as u32,
+   digest:if v==1{TEST_LARGE_DIGEST_1}else{TEST_LARGE_DIGEST_2},
+   rights:0,deps:[0;4],minimums:[0;4],signer:7,epoch:2,
+  },
+  signature:if v==1{TEST_LARGE_SIG_1}else{TEST_LARGE_SIG_2},
+ }
+}
+fn verified_generator_digest(v:u8)->Result<[u8;32],()>{
+ let mut h=Stream::new();
+ let mut src=QemuLargeSource{v};
+ let mut chunk=[0u8;SECTOR_BYTES];
+ for offset in (0..large_len(v)).step_by(SECTOR_BYTES){
+  let length=(large_len(v)-offset).min(SECTOR_BYTES);
+  src.read_exact(offset as u32,&mut chunk[..length])?;
+  h.update(&chunk[..length]).map_err(|_|())?;
+ }
+ Ok(h.finish())
+}
+fn run_large_cpu<D:BlockDevice,V:Verify>(
+ store:&mut BlobStore<D>,signed:&SignedBundle,verifier:&V
+)->Result<(),()>{
+ let mut table=ProcessTable::empty();
+ let pcb=unsafe{indianos_process_create(&mut table)};
+ if pcb.is_null(){return Err(());}
+ let id=Identity{pid:unsafe{(*pcb).pid},generation:1};
+ let mut approval=crate::m2_consent::Ledger::<1>::new();
+ // Exclusively access the test-only static buffer. The code never
+ // permits concurrent guest processes or asynchronous borrowing.
+ let scratch=unsafe{&mut (*ptr::addr_of_mut!(LARGE_SCRATCH)).0};
+ if m2_large_launch::execute_large_approved(store,signed,
+   &access(),ADMIN,1,&ROOTS,verifier,unsafe{&mut*pcb},1,
+   &approval,scratch)!=Err(m2_large_launch::Error::ConsentDenied){
+  return Err(());
+ }
+ approval.approve(&access(),ADMIN,1,id,
+   m2_large_launch::record(signed),0,90).map_err(|_|())?;
+ if m2_large_launch::execute_large_approved(store,signed,
+   &access(),ADMIN,1,&ROOTS,verifier,unsafe{&mut*pcb},2,
+   &approval,scratch)!=Err(m2_large_launch::Error::ConsentDenied){
+  return Err(());
+ }
+ let app=m2_large_launch::execute_large_approved(store,signed,
+   &access(),ADMIN,1,&ROOTS,verifier,unsafe{&mut*pcb},1,
+   &approval,scratch).map_err(|_|())?;
+ approval.retire(id);
+ if app.id!=APP||app.version!=signed.manifest.version||
+    !unsafe{indianos_process_success(pcb)}||
+    crate::m2_syscall_guard::last_denied_calls()!=1||
+    scratch.iter().any(|byte|*byte!=0){
+  return Err(());
+ }
+ large_log(b"IndianOS: M2 Phase 5C real 64KiB signed ELF executed in ring3\n\0");
+ Ok(())
+}
+fn run_large<D:BlockDevice,V:Verify>(
+ store:&mut BlobStore<D>,stage:u8,verifier:&V
+)->Result<(),()>{
+ // The embedded manifests are signed by the test publisher key, NOT
+ // the untrusted disk's metadata hash. Validate source generation too.
+ for v in 1..=2{
+  if verified_generator_digest(v)?!=bundle(v).manifest.digest{
+   return Err(());
+  }
+ }
+ match stage{
+  0=>{
+   if store.active().is_some(){return Err(());}
+   let mut tampered=bundle(1);
+   tampered.signature[0]^=1;
+   let original=store.active();
+   if !matches!(stage_verified(store,&tampered,&ROOTS,verifier,
+       &mut QemuLargeSource{v:1}),Err(BundleError::Signature(_)))||
+       store.active()!=original{return Err(());}
+   stage_verified(store,&bundle(1),&ROOTS,verifier,
+     &mut QemuLargeSource{v:1}).map_err(|_|())?;
+   run_large_cpu(store,&bundle(1),verifier)?;
+  },
+  1=>{
+   if store.active().is_none_or(|item|
+      item.version!=1||item.length as usize!=LARGE_V1){
+    return Err(());
+   }
+   stage_verified(store,&bundle(2),&ROOTS,verifier,
+      &mut QemuLargeSource{v:2}).map_err(|_|())?;
+   if store.backup().is_none_or(|item|item.version!=1){
+    return Err(());
+   }
+   run_large_cpu(store,&bundle(2),verifier)?;
+  },
+  2=>{
+   if store.active().is_none_or(|item|
+      item.version!=2||item.length as usize!=LARGE_V2){
+    return Err(());
+   }
+   if store.rollback().map_err(|_|())?.version!=1{return Err(());}
+   run_large_cpu(store,&bundle(1),verifier)?;
+  },
+  3=>{
+   if store.active().is_none_or(|item|
+     item.version!=1||item.length as usize!=LARGE_V1){return Err(());}
+   // A once-valid, signed BUT no-longer-current v2 cannot bypass the
+   // A/B active version binding. This does not uninstall the package.
+   let mut table=ProcessTable::empty();
+   let pcb=unsafe{indianos_process_create(&mut table)};
+   if pcb.is_null(){return Err(());}
+   let mut approval=crate::m2_consent::Ledger::<1>::new();
+   let owner=Identity{pid:unsafe{(*pcb).pid},generation:1};
+   approval.approve(&access(),ADMIN,1,owner,
+      m2_large_launch::record(&bundle(2)),0,90).map_err(|_|())?;
+   let scratch=unsafe{&mut (*ptr::addr_of_mut!(LARGE_SCRATCH)).0};
+   if m2_large_launch::execute_large_approved(store,&bundle(2),
+      &access(),ADMIN,1,&ROOTS,verifier,unsafe{&mut*pcb},1,
+      &approval,scratch)!=Err(m2_large_launch::Error::StaleBundle){
+    return Err(());
+   }
+   run_large_cpu(store,&bundle(1),verifier)?;
+  },
+  _=>return Err(())
+ }
+ large_log(b"IndianOS: M2 Phase 5C dedicated A/B blob partition verified\n\0");
+ Ok(())
+}
+
 pub fn run()->Result<u8,()>{
  let mut disk=unsafe{AtaPio::probe()}.map_err(|_|())?;
- if disk.sector_count()!=128{return Err(());}
+ if disk.sector_count()!=TOTAL{return Err(());}
  let mut left=[0u8;SECTOR_BYTES];let mut right=[0u8;SECTOR_BYTES];
  disk.read_sector(START,&mut left).map_err(|_|())?;
  disk.read_sector(START+1,&mut right).map_err(|_|())?;
@@ -254,9 +426,19 @@ pub fn run()->Result<u8,()>{
  let mut volume=HierVfs::mount(device).map_err(|_|())?;
  volume.overwrite("/phase",&[stage+1]).map_err(|_|())?;
  drop(volume);
- // Check every byte outside the bounded 100-sector partition.
- // The installer never needs or accesses a network connection.
- for lba in (0..START).chain(START+COUNT..128){
+ // A second, separate, explicitly reserved 258-sector partition is
+ // used for larger packages; the first /pkg filesystem cannot see it.
+ {
+  let window=BlockWindow::new(&mut disk,BLOB_START,REQUIRED_SECTORS)
+   .map_err(|_|())?;
+  let mut large=BlobStore::mount(window).map_err(|_|())?;
+  run_large(&mut large,stage,&verifier)?;
+ }
+ // Byte-for-byte untouched disk canaries beyond BOTH package windows.
+ // The only writeable regions are [24,124) and [144,402).
+ for lba in (0..START)
+   .chain(START+COUNT..BLOB_START)
+   .chain(BLOB_START+REQUIRED_SECTORS..TOTAL){
   let mut sector=[0u8;SECTOR_BYTES];
   disk.read_sector(lba,&mut sector).map_err(|_|())?;
   if sector.iter().any(|&x|x!=0){return Err(());}

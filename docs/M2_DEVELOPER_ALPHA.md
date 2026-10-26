@@ -580,3 +580,57 @@ durable catalog after reboot. Hardware TPM anti-rollback, dynamically
 linked executables, relocations, third-party installers, graphical
 consent, multiple independent simultaneously installed packages and
 general networking/TLS are still release blockers. This is not M2 100%.
+
+
+## M2 Phase 5C — real QEMU 32/64KiB signed ELF boot integration
+
+Phase 5C closes the previous Phase 5B gap between host-only large-ELF
+PMM/VMM staging and **real CPU ring3 execution from a 258-sector A/B
+package partition**. It extends the existing mandatory four-reboot QEMU
+disposable-disk acceptance without weakening the original 2,400-byte
+M2P6 installation, rollback, crash-recovery, and syscall denial checks.
+
+- The QEMU-only ATA test disk is expanded from 128 to **512 sectors**.
+  Both partitions are explicit, nonoverlapping BlockWindow ranges:
+  original durable M2 filesystem `[24,124)`; NEW independent signed
+  large-blob store `[144,402)`. QEMU checks every sector outside the
+  two ranges remains byte-for-byte zero across all four reboots. There
+  is NO formatting or writing to host/user disks.
+- A deterministic, bounded `BundleSource` generates native static
+  x86-64 ELFs directly in 512-byte sectors; it cannot store the
+  full 64KiB ELF on the kernel stack or use a heap. Its 32KiB v1 and
+  **exact 65,536-byte v2** are signed offline with real Ed25519 by the
+  existing QEMU-only test publisher; the guest includes public keys
+  and precomputed signatures, NEVER private signing keys.
+- The guest first independently hashes streamed source chunks,
+  verifies an authenticated QEMU TEST publisher policy, and checks
+  a tampered manifest signature is rejected BEFORE any block I/O
+  installs a package. It then stores each image in the dedicated
+  A/B bank, and executes through `m2_large_launch::execute_large_approved`:
+  privileged install check, real signed canonical bundle verification,
+  full sector-by-sector SHA256 recheck, exact version/digest/length
+  binding, per-PID/generation consent, W^X/NX ELF validation, strict
+  per-syscall gate, actual `IRETQ` to ring3, guest EXIT and full
+  PMM page reclamation. The 65,536-byte scratch is a *static test-only*
+  exclusive kernel memory region, NOT a kernel stack buffer.
+- Four reboots (same disk): boot1 install/execute 32KiB v1; boot2
+  upgrade/execute full 64KiB v2 while retaining v1 bank; boot3
+  rollback/execute v1; boot4 reject re-execution of now-stale signed
+  v2, and execute currently trusted v1. The earlier M2P6 small app
+  still completes install/upgrade/rollback/uninstall in parallel.
+- The Python host runner parses BOTH stored A/B headers on each boot,
+  validates SHA256 of each data bank and header, and verifies the exact
+  expected active generation/version/length/bank. It also verifies
+  serial output from actual ring3 execution, forbidden syscall denial,
+  kernel process reaper, cryptography and boot trust checks. An
+  independent OpenSSL script recomputes both entire ELF byte streams,
+  SHA256 content hashes, canonical signing digests and Ed25519
+  signatures from a publicly documented **TEST-ONLY deterministic seed**.
+
+**Important scope:** Embedded signed bundle metadata is a deliberately
+QEMU-only test fixture. Production requires authenticated, durable signed
+catalog lookup on every reboot, a multi-app allocator, network installer,
+user consent GUI and actual hardware TPM/UEFI trust roots. A 64KiB QEMU
+test proves the native loading path under emulation, NOT that arbitrary
+third-party applications or real GPUs/QPUs can execute. The CPU-only
+fallback must remain functional for future accelerators.
