@@ -93,6 +93,9 @@ pub extern "C" fn kmain()->!{
             }
         }
     }
+    // HD3A: no driver activation without authenticated firmware roots,
+    // real IOMMU isolation, and a tested user-mode driver runtime.
+    log(crate::hardware_driver_stage::boot_driver_status());
     #[cfg(feature="test-r041-workspace")]
     {
         need(crate::batch7_workspace::bounded_workspace_smoke(),

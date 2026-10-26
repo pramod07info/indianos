@@ -154,6 +154,48 @@ validation, NPU inference, physical QPU providers, ARM64/RISC-V drivers,
 full PCIe ECAM platform mapping, installer graphical UI, and real physical
 GPU hardware support. Those remain Issue #124 work.
 
+## Issue #124 HD3A: verified driver-image staging and hardware-resource planning
+
+HD3A extends the HD2 cryptographically signed GPU/NPU catalog with an
+**independent SHA-256 check of actual driver bytes**. A caller with both
+`INSTALL` and `DRIVER` privileges, bound to an exact PID and generation,
+may stage up to 65,536 bytes in a caller-owned, preallocated RAM
+quarantine. Staging validates that PCI bus/slot/function and hardware
+class match the read-only enumerated function, the Ed25519-signed driver
+catalog's signer epoch is current and its externally supplied monotonic
+sequence floor is met, and actual source bytes match the manifest digest.
+Rejected updates erase quarantine. Revocation, PID reuse, bad signatures,
+hardware replacement and stale releases fail closed.
+
+A **resource-planning** layer validates requested MMIO/DMA apertures
+against trusted platform-provided allowed memory windows, 4-KiB
+alignment, size limits and nonoverlap. DMA proposals additionally
+require a nonzero IOMMU domain and a stated isolation-ready state. A
+strict entry point revalidates the catalog signature and quarantined
+bytes again before proposing a plan. Returned
+`ResourcePlan.activated=false`: it is **NOT** a live hardware
+capability. An arbitrary supplied readiness flag is not independent
+proof of IOMMU enforcement. This code never configures an IOMMU, maps a
+BAR, enables bus mastering or executes the driver.
+
+Every ordinary kernel boot prints the HD3 fail-closed serial status:
+`IndianOS HD3 driver image=not installed; MMIO=not mapped;
+DMA=disabled; IOMMU=not attested; GPU/NPU=CPU fallback;
+QPU=unavailable`. Both normal and bridged-virtio GPU QEMU smoke
+tests enforce that real-boot message. Dedicated Rust host regressions
+(with/without M2 Ed25519) cover staging, byte/image tampering, wrong PCI
+hardware, revocation, resource bounds, PID generations, permission
+expiration, absent IOMMU evidence, and quarantine erasure.
+
+**HD3A limits:** No persistent signed driver repository, real TPM-backed
+platform root, trusted hardware memory-map attestation, functional
+IOMMU page tables, GPU command ring/queues, display mode setting or
+actual framebuffer acceleration are implemented. The next slice
+should bring up an isolated virtio-gpu resource/queue prototype in
+QEMU and validate actual device command completion with CPU software
+fallback. This HD3A change does NOT make generic physical GPU/NPU
+drivers or real QPUs operational.
+
 ## Boot sequence
 
 ```text

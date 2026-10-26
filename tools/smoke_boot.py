@@ -63,6 +63,12 @@ def assert_hardware_inventory(text: str) -> None:
         "signed candidates=0" not in text or
         "GPU/NPU drivers=not activated" not in text):
         raise AssertionError("HD2 must fail closed without authenticated signed driver catalog")
+    if ("IndianOS HD3 driver image=not installed" not in text or
+        "MMIO=not mapped" not in text or
+        "DMA=disabled" not in text or
+        "IOMMU=not attested" not in text or
+        "GPU/NPU=CPU fallback" not in text):
+        raise AssertionError("HD3 must not autoactivate GPU, DMA or untrusted drivers")
 
 
 def assert_expected_exception(text: str) -> None:
