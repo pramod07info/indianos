@@ -34,6 +34,9 @@ pub mod hardware_mcfg;
 /// Boot reports candidates only; it never binds drivers without IOMMU/DMA
 /// isolation, capabilities, installed binaries and authenticated firmware.
 pub mod hardware_driver_policy;
+/// Issue #124 HD3A: verified driver-image quarantine and numeric-only
+/// resource plans. No DMA/MMIO activation occurs here.
+pub mod hardware_driver_stage;
 pub mod agent_08_boot_slot;
 pub mod agent_09_ci_policy;
 pub mod agent_10_app_policy;
