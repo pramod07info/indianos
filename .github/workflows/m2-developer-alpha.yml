@@ -1,0 +1,70 @@
+name: M2 developer alpha integrated package + network acceptance
+on:
+  push:
+    branches: [main, milestone/m2-developer-alpha]
+    paths:
+      - 'rust/kernel_core/src/m2_*.rs'
+      - 'rust/kernel_core/src/lib.rs'
+      - 'rust/kernel_core/Cargo.toml'
+      - '.github/workflows/m2-developer-alpha.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'rust/kernel_core/src/m2_*.rs'
+      - 'rust/kernel_core/src/lib.rs'
+      - 'rust/kernel_core/Cargo.toml'
+      - '.github/workflows/m2-developer-alpha.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  m2-native-and-guest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
+      - name: M2 native SDK package inventory app-store and network tests
+        run: |
+          cargo test --offline --manifest-path rust/kernel_core/Cargo.toml --features test-m2-developer-alpha m2_
+      - name: M2 no_std compilation of integrated guest modules
+        run: |
+          cargo check --offline --manifest-path rust/kernel_core/Cargo.toml --no-default-features --features test-m2-developer-alpha --target x86_64-unknown-none
+      - name: M2 verified disk-to-user-image loader host regressions
+        run: |
+          cargo test --offline --manifest-path rust/kernel_core/Cargo.toml --features test-m2-developer-alpha,user-image m2_
+      - name: M2 native PMM and VMM image-loader no_std compatibility
+        run: |
+          cargo check --offline --manifest-path rust/kernel_core/Cargo.toml --no-default-features --features test-m2-developer-alpha,user-image --target x86_64-unknown-none
+      - name: M2 true guest ring3 runtime entry compiles with real CPU feature set
+        run: |
+          cargo check --offline --manifest-path rust/kernel_core/Cargo.toml --no-default-features --features test-m2-developer-alpha,user-runtime --target x86_64-unknown-none
+      - name: Real Ed25519 developer SDK validation on host
+        run: |
+          python3 -m unittest discover -s tests -p 'test_r030_pkg.py' -v
+      - name: Install QEMU OVMF clang and native package prerequisites
+        run: |
+          # Github-hosted mirrors can download QEMU slowly. Preserve the
+          # mandatory emulator test; avoid optional GUI packages and retry.
+          sudo timeout 300s apt-get update -o Acquire::Retries=3 -o Acquire::http::Timeout=40
+          sudo timeout 600s apt-get install -y --no-install-recommends -o Acquire::Retries=3 -o Acquire::http::Timeout=40 clang lld binutils xorriso qemu-system-x86 ovmf curl openssl
+      - name: Verified native ELF signed-install update and rollback in QEMU
+        run: |
+          set -euo pipefail
+          OVMF_PATH=""
+          for path in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/edk2/ovmf/OVMF_CODE_4M.fd /usr/share/edk2/ovmf/OVMF_CODE.fd; do
+            if test -f "$path"; then OVMF_PATH="$path"; break; fi
+          done
+          test -n "$OVMF_PATH"
+          make test-r030-package-qemu OVMF_CODE="$OVMF_PATH"
+      - name: Real QEMU virtio-net Ethernet UDP DNS and TCP sample protocol exchange
+        run: |
+          set -euo pipefail
+          OVMF_PATH=""
+          for path in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/edk2/ovmf/OVMF_CODE_4M.fd /usr/share/edk2/ovmf/OVMF_CODE.fd; do
+            if test -f "$path"; then OVMF_PATH="$path"; break; fi
+          done
+          test -n "$OVMF_PATH"
+          make test-r028-network-qemu OVMF_CODE="$OVMF_PATH"

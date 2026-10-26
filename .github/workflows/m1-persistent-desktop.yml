@@ -31,8 +31,10 @@ jobs:
           cargo check --offline --manifest-path rust/kernel_core/Cargo.toml --no-default-features --features test-r031-vfs
       - name: Install emulator and UEFI dependencies for real graphical Files disk test
         run: |
-          sudo timeout 120s apt-get update -o Acquire::Retries=0 -o Acquire::http::Timeout=30
-          sudo timeout 120s apt-get install -y clang lld binutils xorriso qemu-system-x86 ovmf curl openssl
+          # Github-hosted mirrors can download QEMU slowly. Preserve the
+          # mandatory emulator test; avoid optional GUI packages and retry.
+          sudo timeout 300s apt-get update -o Acquire::Retries=3 -o Acquire::http::Timeout=40
+          sudo timeout 600s apt-get install -y --no-install-recommends -o Acquire::Retries=3 -o Acquire::http::Timeout=40 clang lld binutils xorriso qemu-system-x86 ovmf curl openssl
       - name: Install freestanding target for guest verification
         run: rustup target add x86_64-unknown-none
       - name: Real QEMU ring-3 graphical Files plus persistent scratch disk after reboot
