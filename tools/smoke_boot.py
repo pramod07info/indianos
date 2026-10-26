@@ -69,6 +69,10 @@ def assert_hardware_inventory(text: str) -> None:
         "IOMMU=not attested" not in text or
         "GPU/NPU=CPU fallback" not in text):
         raise AssertionError("HD3 must not autoactivate GPU, DMA or untrusted drivers")
+    if ("IndianOS HD3B virtio-gpu " not in text or
+        "queue=disabled" not in text or
+        "GPU acceleration=not active" not in text):
+        raise AssertionError("HD3B must probe safely without activating DMA/GPU")
 
 
 def assert_expected_exception(text: str) -> None:
