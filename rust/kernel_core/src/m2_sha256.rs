@@ -53,6 +53,53 @@ fn compress(h:&mut[u32;8],data:&[u8]){
   *dst=dst.wrapping_add(delta);
  }
 }
+/// Bounded-memory incremental SHA-256 for multi-sector packages.
+/// The same NIST padding and compression as digest(), without heap allocation.
+pub struct Stream{
+ h:[u32;8],pending:[u8;64],used:usize,length:u64,
+}
+impl Stream{
+ pub const fn new()->Self{
+  Self{h:INITIAL,pending:[0;64],used:0,length:0}
+ }
+ pub fn update(&mut self,mut data:&[u8])->Result<(),()>{
+  self.length=self.length.checked_add(data.len() as u64).ok_or(())?;
+  if self.length>u64::MAX/8{return Err(());}
+  if self.used!=0{
+   let n=(64-self.used).min(data.len());
+   self.pending[self.used..self.used+n].copy_from_slice(&data[..n]);
+   self.used+=n;
+   data=&data[n..];
+   if self.used==64{
+    compress(&mut self.h,&self.pending);
+    self.used=0;
+   }
+  }
+  while data.len()>=64{
+   compress(&mut self.h,&data[..64]);
+   data=&data[64..];
+  }
+  if !data.is_empty(){
+   self.pending[..data.len()].copy_from_slice(data);
+   self.used=data.len();
+  }
+  Ok(())
+ }
+ pub fn finish(mut self)->[u8;32]{
+  let mut pad=[0u8;128];
+  pad[..self.used].copy_from_slice(&self.pending[..self.used]);
+  pad[self.used]=0x80;
+  let size=if self.used<56{64}else{128};
+  pad[size-8..size].copy_from_slice(&(self.length*8).to_be_bytes());
+  for block in pad[..size].chunks_exact(64){compress(&mut self.h,block);}
+  let mut out=[0u8;32];
+  for (i,word) in self.h.iter().enumerate(){
+   out[4*i..4*i+4].copy_from_slice(&word.to_be_bytes());
+  }
+  out
+ }
+}
+
 pub fn digest(bytes:&[u8])->[u8;32]{
  let mut h=INITIAL;
  let mut index=0usize;
@@ -102,5 +149,25 @@ mod m2_tests{
   assert!(matches(b"trusted",&digest));
   assert!(!matches(b"trusteD",&digest));
   assert!(!matches(b"trusted!",&digest));
+ } #[test]fn m2_sha256_stream_chunks_match_one_shot_at_block_and_sector_boundaries(){
+  for len in [0usize,1,7,55,56,63,64,65,127,128,129,511,512,
+   513,2048,3914,16384,65536]{
+   let values:std::vec::Vec<u8>=(0..len).map(|i|(i.wrapping_mul(113)%251) as u8)
+     .collect();
+   let expected=digest(&values);
+   for step in [1usize,7,63,64,65,511,512,4096]{
+    let mut h=Stream::new();
+    for piece in values.chunks(step){h.update(piece).unwrap();}
+    assert_eq!(h.finish(),expected,"len={len} step={step}");
+   }
+  }
  }
+ #[test]fn m2_sha256_stream_nist_vectors(){
+  let mut h=Stream::new();
+  h.update(b"a").unwrap();h.update(b"b").unwrap();h.update(b"c").unwrap();
+  assert_eq!(h.finish(),digest(b"abc"));
+  let h=Stream::new();
+  assert_eq!(h.finish(),digest(b""));
+ }
+
 }

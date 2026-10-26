@@ -476,3 +476,54 @@ authorization, secure recovery after loss of NVRAM, verified boot key
 rotation, and an independent security audit remain top-priority work.
 Untrusted files and a kernel constant MUST NOT be treated as hardware
 trust or as a production monotonic counter.
+
+
+## M2 Phase 5A — streaming and bounded signed package storage foundation
+
+A new **dedicated-package partition** abstraction eliminates the 3,914-byte
+artifact storage bottleneck for staged package *bytes* without rewriting the
+previously accepted R027/R031 filesystem. It is **not yet a replacement
+for the 3,914-byte ELF launcher**.
+
+- `m2_sha256::Stream` hashes arbitrarily split source chunks without
+  allocating. Unit tests compare with SHA-256 one-shot results at 55/56/63/64,
+  511/512/513, 3,914, 16,384 and 65,536-byte boundaries.
+- `m2_blob_store::BlobStore` uses its OWN device/BlockWindow with at
+  least 258 sectors (132,096 bytes), reserved separately from user files.
+  It streams a maximum **65,536-byte bundle** into two 128-sector A/B data
+  banks, each with its own one-sector checksummed header.
+- **Transactional upgrade order:** the active bank is untouched; write
+  inactive sectors; hash while streaming; reread from the disk to
+  validate data; finally publish the new generation header; read back
+  and validate its exact bytes. A failed transfer, digest mismatch,
+  corrupted header or short source never makes unverified bytes active.
+  Reboot scans both checksummed headers and verifies the full SHA-256
+  of each referenced bank before selecting the highest valid generation.
+- Rollback rewrites only the prior bank's header with the next monotonic
+  **local** generation, retaining both physically durable payload banks.
+  The storage generation is **not** TPM-backed and must NOT be mistaken
+  for cryptographic anti-rollback authority over application versions.
+  A corrupt active bank can fall back to a previous *data* bank, but
+  execution still requires trusted publisher signature, permissions,
+  independently protected release policy and explicit consent.
+- `m2_bundle_manifest` defines a domain-separated signed package
+  transcript over ABI, app ID, version, content SHA-256, byte length,
+  rights, dependency identities/minimums, publisher key and epoch.
+  Its `stage_verified` API authenticates the manifest against the
+  existing trusted `Verify` verifier **BEFORE** invoking streaming
+  storage. Mere CRC/SHA256 equality is never app authorization.
+- CI exercises real Ed25519 signature checks and tampered manifests,
+  full 65,536-byte streaming, A/B upgrades and rollback across reboot,
+  interrupted sector writes, corrupt metadata/data, short source,
+  oversized packages and the partition boundary guard. All storage
+  code compiles in `no_std` and uses 512-byte scratch buffers.
+
+**Important deliberate limits:** The current native ELF execution
+module still expects the older M2P5/M2P6 image formats and at most 3,914
+bytes. Full 65,536-byte *execution*, multiple apps/partitions,
+general-purpose installed package trees, authenticated package catalog
+downloads and multi-app transaction journaling are **future phases**.
+This layer gives only bounded storage and authenticated staging, not
+additional executable privileges. All physical disk formatting or
+partition selection must be separately authorized. The existing QEMU
+four-boot signed 2,400-byte ELF acceptance remains active and unchanged.
