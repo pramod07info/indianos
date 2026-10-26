@@ -24,6 +24,8 @@ pub mod agent_04_service_restart;
 pub mod agent_05_surface_rect;
 pub mod agent_06_ipv4_route;
 pub mod agent_07_pci_aperture;
+/// Issue #124 HD0: no_std CPU/PCI hardware inventory for installer and boot.
+pub mod hardware_inventory;
 pub mod agent_08_boot_slot;
 pub mod agent_09_ci_policy;
 pub mod agent_10_app_policy;

@@ -5,7 +5,8 @@ from pathlib import Path
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
-from smoke_boot import (assert_milestones, assert_expected_exception,
+from smoke_boot import (assert_milestones, assert_hardware_inventory,
+                        assert_expected_exception,
                         assert_expected_pagefault, assert_expected_shadow,
                         assert_expected_usermode, assert_expected_userfault,
                         assert_expected_processes, assert_expected_scheduler,
@@ -14,6 +15,16 @@ from smoke_boot import (assert_milestones, assert_expected_exception,
 
 
 class SmokeBootTests(unittest.TestCase):
+    def test_hd0_boot_detects_cpu_and_reports_no_fake_qpu(self):
+        assert_hardware_inventory(
+            "IndianOS HD0 CPU=GenuineIntel x86-64 family=6 model=58; "
+            "GPU=1 detected(no driver); NPU=0 detected(no driver); "
+            "QPU=unavailable; CPU fallback=enabled")
+        with self.assertRaises(AssertionError):
+            assert_hardware_inventory("IndianOS HD0 CPU=GenuineIntel")
+        with self.assertRaises(AssertionError):
+            assert_hardware_inventory("IndianOS: kernel entered")
+
     def test_accepts_expected_order_with_additional_messages(self):
         assert_milestones("\nextra\n" + "\r\nother\r\n".join(MILESTONES) + "\r\n")
 

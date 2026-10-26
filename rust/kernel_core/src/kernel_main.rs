@@ -59,6 +59,29 @@ pub extern "C" fn kmain()->!{
     log(b"IndianOS: kernel entered\n\0");
     need(unsafe{boot_validate()},b"IndianOS: FATAL boot information invalid\n\0");
     log(b"IndianOS: boot information validated\n\0");
+    // Issue #124 HD0: detect actual CPU and bus-0 PCI accelerators on
+    // EVERY kernel boot, before optional device drivers are initialized.
+    // Read-only CPUID and PCI config space, no BAR or DMA activation.
+    // A missing optional accelerator must never prevent CPU-only boot.
+    #[cfg(all(target_arch="x86_64",target_os="none"))]
+    {
+        use crate::hardware_inventory as hw;
+        need(hw::inspect_cpu(&hw::native::BootCpu).is_ok(),
+            b"IndianOS: FATAL unsupported x86-64 CPU capabilities\n\0");
+        match hw::native::detect_boot(){
+            Ok(profile)=>{
+                let mut report=[0u8;192];
+                need(hw::format_report(&profile,&mut report).is_ok(),
+                    b"IndianOS: FATAL HD0 hardware report buffer\n\0");
+                unsafe{serial_write(report.as_ptr().cast())};
+            },
+            Err(_)=>{
+                // Physical PCI discovery failure is not a reason to
+                // lose working CPU-only boot; no PCI driver is enabled.
+                log(b"IndianOS HD0 CPU supported; PCI probe unavailable; GPU=unknown; NPU=unknown; QPU=unavailable; CPU fallback=enabled\n\0");
+            }
+        }
+    }
     #[cfg(feature="test-r041-workspace")]
     {
         need(crate::batch7_workspace::bounded_workspace_smoke(),
