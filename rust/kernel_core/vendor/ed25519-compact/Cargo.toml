@@ -1,0 +1,26 @@
+# Pinned upstream rust-ed25519-compact 2.6.0 at
+# github.com/jedisct1/rust-ed25519-compact
+# commit 05254f6f6b6a7f0ac55485e8288acbf1d9097db8, MIT licensed.
+# Default RNG/std/PEM/X25519 features disabled: verification-only and no_std.
+# The seven src/ files and LICENSE are exact unchanged upstream content.
+[package]
+name = "ed25519-compact"
+version = "2.6.0"
+edition = "2018"
+license = "MIT"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = []
+std = []
+random = []
+pem = []
+traits = []
+self-verify = []
+blind-keys = []
+opt_size = []
+disable-signatures = []
+x25519 = []

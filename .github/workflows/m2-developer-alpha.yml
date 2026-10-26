@@ -6,6 +6,9 @@ on:
       - 'rust/kernel_core/src/m2_*.rs'
       - 'rust/kernel_core/src/lib.rs'
       - 'rust/kernel_core/Cargo.toml'
+      - 'rust/kernel_core/Cargo.lock'
+      - 'rust/kernel_core/vendor/ed25519-compact/**'
+      - 'tools/test_m2_phase4c_vectors.py'
       - 'Makefile'
       - 'tools/test_m2_disk_exec_qemu.py'
       - '.github/workflows/m2-developer-alpha.yml'
@@ -15,6 +18,9 @@ on:
       - 'rust/kernel_core/src/m2_*.rs'
       - 'rust/kernel_core/src/lib.rs'
       - 'rust/kernel_core/Cargo.toml'
+      - 'rust/kernel_core/Cargo.lock'
+      - 'rust/kernel_core/vendor/ed25519-compact/**'
+      - 'tools/test_m2_phase4c_vectors.py'
       - 'Makefile'
       - 'tools/test_m2_disk_exec_qemu.py'
       - '.github/workflows/m2-developer-alpha.yml'
@@ -50,6 +56,12 @@ jobs:
         run: |
           cargo test --offline --manifest-path rust/kernel_core/Cargo.toml --features test-m2-developer-alpha m2_manifest_
           cargo test --offline --manifest-path rust/kernel_core/Cargo.toml --features test-m2-developer-alpha m2_signed_manifest_
+      - name: M2 Phase 4C real no_std Ed25519 and signed publisher policies
+        run: |
+          set -euo pipefail
+          test -f rust/kernel_core/vendor/ed25519-compact/LICENSE
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --features test-m2-developer-alpha m2_ed25519_
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --features test-m2-developer-alpha m2_signed_roots_
       - name: M2 no_std compilation of integrated guest modules
         run: |
           cargo check --offline --manifest-path rust/kernel_core/Cargo.toml --no-default-features --features test-m2-developer-alpha --target x86_64-unknown-none
@@ -71,6 +83,9 @@ jobs:
           # mandatory emulator test; avoid optional GUI packages and retry.
           sudo timeout 300s apt-get update -o Acquire::Retries=3 -o Acquire::http::Timeout=40
           sudo timeout 600s apt-get install -y --no-install-recommends -o Acquire::Retries=3 -o Acquire::http::Timeout=40 clang lld binutils xorriso qemu-system-x86 ovmf curl openssl
+      - name: Independently verify three QEMU Ed25519 signature vectors with OpenSSL
+        run: |
+          python3 tools/test_m2_phase4c_vectors.py
       - name: Verified native ELF signed-install update and rollback in QEMU
         run: |
           set -euo pipefail
@@ -80,7 +95,7 @@ jobs:
           done
           test -n "$OVMF_PATH"
           make test-r030-package-qemu OVMF_CODE="$OVMF_PATH"
-      - name: M2P6 full metadata-signed ELF ring3 install upgrade rollback remove in four QEMU boots
+      - name: M2P6 real Ed25519 verified boot policy and ELF ring3 across four QEMU boots
         run: |
           set -euo pipefail
           OVMF_PATH=""

@@ -41,6 +41,8 @@ def boot(qemu:str,ovmf:Path,iso:Path,disk:Path,stage:str)->None:
    if "IndianOS: FATAL" in output:
     raise AssertionError("M2 kernel fatal:\n"+output[-6000:])
    if stage in output and DONE in output:
+    if "IndianOS: M2 real Ed25519 boot policy and package signature VERIFIED" not in output:
+     raise AssertionError("M2 Phase 4C Ed25519 boot or package verification missing")
     if output.index(stage)>output.index(DONE):
      raise AssertionError("M2 serial sequence mismatch")
     if stage!=STAGES[-1]:

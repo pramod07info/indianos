@@ -356,3 +356,71 @@ consent. The host/QEMU test verifier is intentionally noncryptographic;
 a real implementation of the `Verify` backend is mandatory before
 claiming secure signed third-party installation. The signature format
 supports metadata-binding but does not itself supply cryptography.
+
+
+## M2 Phase 4C: actual no_std Ed25519 + signed publisher-root policy
+
+This phase replaces the previous fake QEMU signature verifier with REAL
+Ed25519 verification in the freestanding kernel, in one integrated PR.
+
+- **Cryptographic implementation:** Vendored, pinned, upstream-unmodified
+  MIT-licensed `rust-ed25519-compact` v2.6.0 from commit
+  `05254f6f6b6a7f0ac55485e8288acbf1d9097db8`. Library cargo manifest
+  has optional RNG/std/PEM dependencies removed, leaving the original
+  seven Rust source files and unchanged upstream license. Build is fully
+  offline and no_std without allocations or host OpenSSL.
+- **Real Ed25519 verifier:** `m2_ed25519::Ed25519Backend` verifies strict
+  signature and public key encodings over SHA-256 of the domain-separated
+  canonical M2P5/M2P6 transcript. Existing `Trusted` checks signer/epoch
+  against the authenticated publisher registry, recomputes the transcript
+  digest and calls the real Ed25519 verifier. Host tests include RFC8032,
+  malformed/weak keys, non-canonical signatures, corrupt signatures,
+  tampered rights, and stale/revoked signer epochs.
+- **Authenticated publisher-root snapshots:** `m2_trust_policy` provides
+  a fixed-size, parseable 286-byte key-set snapshot with up to four
+  publisher entries, signer epochs, enabled/revoked state, monotonic
+  policy sequence and offline root's Ed25519 signature. A snapshot
+  must pass canonical encoding and actual Ed25519 verification against
+  a supplied **trusted boot public key**, then it is atomically published
+  to a kernel-owned registry. A caller-supplied authenticated minimum
+  sequence rejects rollback, and untrusted input never partially
+  changes current trusted keys.
+- **Actual QEMU proof:** the pre-existing four-reboot test now verifies
+  the entire publisher policy's Ed25519 signature and two independently
+  signed M2P6 2,400-byte native ELF application versions before each real
+  IRETQ/ring-3 launch. QEMU also fails closed on a bit-flipped boot
+  policy signature or app signature; existing revoked-epoch, absent-consent,
+  stale-generation, forbidden syscall, update, rollback, removal and disk
+  isolation checks remain mandatory.
+- **Independent crypto fixture checking:** a Python stdlib harness runs
+  the separate OpenSSL Ed25519 implementation to reproduce and verify
+  all three QEMU signatures from deterministic **public test-only seeds**.
+  Neither an Ed25519 private key nor a boot private key is embedded
+  in the guest OS. The source contains only public test roots, precomputed
+  signatures and no deployable private signing material.
+
+**Important remaining production security boundaries:**
+
+1. QEMU's embedded boot public key is test-only and NOT a hardware-enforced
+   trusted root. Real PCs require authenticated UEFI/Secure Boot provisioning
+   or equivalent verified firmware chain, plus separate OS trust-root
+   validation and rotation/recovery. Simply mounting a disk file, loading
+   an embedded development key, or passing an attacker-controlled boot key
+   does NOT establish trust.
+2. The minimum accepted policy sequence MUST come from independently
+   protected monotonic/anti-rollback state (e.g. platform TPM NV index);
+   comparing against the untrusted disk's own sequence is insufficient.
+   Production TPM integration, persistence, recovery and transactional
+   trust-store commit across unexpected power loss remain pending.
+3. The 3,914-byte package limit, multi-app concurrent sandbox isolation,
+   graphical permission consent, general-purpose networking and signed
+   third-party download catalogs remain M2 exit blockers.
+4. Digital signatures give publisher authenticity only when the signing
+   private keys and platform trust root are maintained securely. Test
+   signatures are intentionally reproducible and MUST never be installed
+   as trusted production publisher keys.
+
+To reproduce crypto tests without downloading libraries:
+`cargo test --locked --offline --manifest-path
+rust/kernel_core/Cargo.toml --features test-m2-developer-alpha m2_ed25519_`
+and `python3 tools/test_m2_phase4c_vectors.py`.

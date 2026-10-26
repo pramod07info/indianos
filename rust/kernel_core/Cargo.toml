@@ -10,6 +10,7 @@ crate-type = ["staticlib", "rlib"]
 
 # No dependency registry, allocator, async runtime, or host OS services.
 [dependencies]
+ed25519-compact = { path = "vendor/ed25519-compact", default-features = false, optional = true }
 
 [features]
 # Unit tests use std; the actual bare-metal build explicitly disables it.
@@ -56,7 +57,7 @@ test-r031-vfs = ["test-r030-ondevice"]
 test-r031-files-gui = ["test-r031-boot-desktop", "test-r031-vfs"]
 # M2 native ABI/catalog, persistent signed-record inventory, app store model,
 # and owner-gated network ingress tests; not a full live app-store/kernel.
-test-m2-developer-alpha = ["test-r031-vfs"]
+test-m2-developer-alpha = ["test-r031-vfs", "dep:ed25519-compact"]
 # Test-only disk-installed native process runtime on disposable QEMU IDE media.
 test-m2-disk-exec = ["test-m2-developer-alpha","user-runtime"]
 # R041 opt-in QEMU guest smoke; bounded workspace only, not ring3 desktop.
