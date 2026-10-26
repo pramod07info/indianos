@@ -46,6 +46,10 @@ jobs:
         run: |
           cargo test --offline --manifest-path rust/kernel_core/Cargo.toml --features test-m2-developer-alpha m2_trust_
           cargo test --offline --manifest-path rust/kernel_core/Cargo.toml --features test-m2-developer-alpha m2_syscall_
+      - name: M2 Phase 4B signed canonical manifest and tampering regression
+        run: |
+          cargo test --offline --manifest-path rust/kernel_core/Cargo.toml --features test-m2-developer-alpha m2_manifest_
+          cargo test --offline --manifest-path rust/kernel_core/Cargo.toml --features test-m2-developer-alpha m2_signed_manifest_
       - name: M2 no_std compilation of integrated guest modules
         run: |
           cargo check --offline --manifest-path rust/kernel_core/Cargo.toml --no-default-features --features test-m2-developer-alpha --target x86_64-unknown-none
@@ -76,7 +80,7 @@ jobs:
           done
           test -n "$OVMF_PATH"
           make test-r030-package-qemu OVMF_CODE="$OVMF_PATH"
-      - name: M2P4 large persistent ELF ring3 install upgrade rollback remove in four QEMU boots
+      - name: M2P6 full metadata-signed ELF ring3 install upgrade rollback remove in four QEMU boots
         run: |
           set -euo pipefail
           OVMF_PATH=""

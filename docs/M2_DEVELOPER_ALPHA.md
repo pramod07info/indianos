@@ -312,3 +312,47 @@ manifest including version, requested rights and dependency metadata;
 production multi-process/SMP supervisor; trusted monotonic expiry,
 resource-level socket/file isolation, and graphical consent dialogs.
 The QEMU verifier and signature-backend unit tests remain fake.
+
+
+## M2 Phase 4B: immutable package manifest signing and safe format transition
+
+This phase fixes the M2P3/M2P4 vulnerability in which signatures verified
+only executable bytes: a compromised but CRC-valid record could change app
+version, requested permissions, dependency identities or minimum versions
+without changing the signed ELF digest. The change adds two on-disk formats:
+
+- **M2P5** for native images stored in the existing single-file format.
+- **M2P6** for the existing 3,914-byte A/B overflow format.
+
+New installs use `install_manifest_image` (or
+`install_manifest_image_from_catalog`) and sign a domain-separated,
+fixed-length deterministic canonical transcript containing the ABI,
+signer and epoch, app ID, version, rights, ELF SHA-256 hash and every
+dependency ID/minimum-version pair. The signed `Envelope.digest` is the
+SHA-256 of this transcript; the persisted `Record.digest` remains the
+independently verified ELF payload SHA-256. The verifier receives the
+canonical bytes, not just an untrusted caller-defined success flag.
+
+On every reboot/remount, `verified_image` recognizes both old and new
+formats; M2P5/M2P6 always reconstruct and reverify metadata-signing
+input before allowing image bytes through. The approved **native ring-3
+execution entrypoint** now requires a modern M2P5/M2P6 manifest,
+explicitly refusing M2P3/M2P4 as `UnsignedManifest`. Legacy records
+remain readable for explicit supervisor-controlled migration but cannot
+run through the approved execution API. A/B extents, storage size limits
+and rollback behavior are unchanged. The QEMU four-boot test now
+installs M2P6 packages whose *full manifests* are verified before
+execution, and checks that the new on-disk format was persisted.
+
+Host regressions cover canonical transcript changes in ID, ABI, signer
+epoch, version, requested rights, content hash, dependencies and minimum
+versions, plus CRC-valid tampering of installed metadata after remount,
+signature failure before disk mutation, and M2P6 upgrade/rollback.
+
+**Release blockers not addressed:** The kernel still lacks a **real
+Ed25519 implementation**, authenticated boot-provisioned public keys,
+signed catalog distribution, hardware-backed anti-rollback and graphical
+consent. The host/QEMU test verifier is intentionally noncryptographic;
+a real implementation of the `Verify` backend is mandatory before
+claiming secure signed third-party installation. The signature format
+supports metadata-binding but does not itself supply cryptography.

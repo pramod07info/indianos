@@ -16,8 +16,8 @@ def check_disk(path:Path, phase:int)->None:
   raise AssertionError("QEMU wrote outside disposable M2 partition")
  if data[START*512:START*512+8]!=b"INDR027!":
   raise AssertionError("M2 durablefs metadata missing")
- if phase<=3 and b"M2P4" not in data[START*512:(START+COUNT)*512]:
-  raise AssertionError("large ELF M2P4 manifest was not persisted")
+ if phase<=3 and b"M2P6" not in data[START*512:(START+COUNT)*512]:
+  raise AssertionError("fully signed M2P6 manifest was not persisted")
 def boot(qemu:str,ovmf:Path,iso:Path,disk:Path,stage:str)->None:
  cmd=[qemu,"-machine","pc","-m","256M","-smp","1",
       "-display","none","-monitor","none","-serial","stdio",

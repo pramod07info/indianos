@@ -5,7 +5,7 @@ use crate::ata_pio::AtaPio;
 use crate::block::{BlockDevice,BlockWindow,SECTOR_BYTES};
 use crate::hier_vfs::HierVfs;
 use crate::durablefs::FsError;
-use crate::m2_inventory::{Inventory,Error as PackageError,MAX_IMAGE_BYTES};
+use crate::m2_inventory::{Inventory,Error as PackageError,Record,MAX_IMAGE_BYTES};
 use crate::m2_sdk::{Package,ABI};
 use crate::batch4_signature::{Envelope,Root,Verify};
 use crate::batch5_session::Identity;
@@ -47,8 +47,15 @@ fn elf(v:u8)->[u8;IMAGE_LEN]{
  b[IMAGE_LEN-1]=v;
  b
 }
+fn signed_record(v:u8)->Record{
+ let p=package(v);
+ Record{id:p.id,version:p.version,rights:p.rights,digest:p.payload_digest,
+  deps:p.deps,minimums:[0;4]}
+}
 fn envelope(v:u8)->Envelope{
- Envelope{signer:7,epoch:2,digest:crate::m2_sha256::digest(&elf(v)),signature:[40+v;64]}
+ Envelope{signer:7,epoch:2,
+  digest:crate::m2_manifest::digest(signed_record(v),7,2),
+  signature:[40+v;64]}
 }
 fn package(v:u8)->Package{
  Package{id:APP,version:v as u64,abi:ABI,rights:0,deps:[0;4],payload_digest:crate::m2_sha256::digest(&elf(v))}
@@ -61,8 +68,9 @@ impl Verify for FixtureVerifier{
  fn verify_digest_and_signature(&self,e:&Envelope,data:&[u8])->bool{
   // TEST-ONLY PINNED BYTES. This does NOT implement Ed25519 or hash signing.
   (1u8..=2).any(|v|e.signer==7&&e.epoch==2&&
-    e.signature==[40+v;64]&&e.digest==crate::m2_sha256::digest(data)&&
-    data==elf(v))
+    e.signature==[40+v;64]&&e.digest==
+      crate::m2_manifest::digest(signed_record(v),7,2)&&
+    data==crate::m2_manifest::canonical(signed_record(v),7,2))
  }
 }
 fn check<D:BlockDevice>(inv:&mut Inventory<D>,v:u8)->Result<(),()>{
@@ -125,13 +133,13 @@ pub fn run()->Result<u8,()>{
  match stage{
   0=>{
    if inv.installed(APP).map_err(|_|())?.is_some(){return Err(());}
-   inv.install_image(&access(),ADMIN,1,&ROOTS,&FixtureVerifier,
+   inv.install_manifest_image(&access(),ADMIN,1,&ROOTS,&FixtureVerifier,
        &envelope(1),&elf(1),package(1)).map_err(|_|())?;
    check(&mut inv,1)?;run_cpu(&mut inv)?;
   },
   1=>{
    check(&mut inv,1)?;
-   inv.install_image(&access(),ADMIN,1,&ROOTS,&FixtureVerifier,
+   inv.install_manifest_image(&access(),ADMIN,1,&ROOTS,&FixtureVerifier,
        &envelope(2),&elf(2),package(2)).map_err(|_|())?;
    check(&mut inv,2)?;run_cpu(&mut inv)?;
   },
