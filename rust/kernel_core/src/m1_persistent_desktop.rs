@@ -28,6 +28,9 @@ pub struct Desktop<D:BlockDevice,const P:usize,const E:usize,
  pub input:InputLine,
  owner:Option<Identity>,
  window:u32,
+ // Exactly one pending full-window damage is sufficient; more keystrokes
+ // mutate the input model and the eventual draw observes the latest state.
+ redraw_pending:bool,
 }
 impl<D:BlockDevice,const P:usize,const E:usize,const W:usize,
  const K:usize,const G:usize,const Q:usize> Desktop<D,P,E,W,K,G,Q>{
@@ -35,7 +38,8 @@ impl<D:BlockDevice,const P:usize,const E:usize,const W:usize,
  /// format/probe host or guest disks as a side effect.
  pub fn from_mounted(volume:HierVfs<D>)->Self{
   Self{boot:Bootstrap::new(),rights:Access::new(),volume,
-   surface:Surfaces::new(),input:InputLine::new(),owner:None,window:0}
+   surface:Surfaces::new(),input:InputLine::new(),owner:None,
+   window:0,redraw_pending:false}
  }
  pub fn start(&mut self,init:Identity,init_image:Launch,
   user:Identity,user_image:Launch,settings:Settings,
@@ -54,7 +58,18 @@ impl<D:BlockDevice,const P:usize,const E:usize,const W:usize,
    .map_err(Error::Auth)?;
   self.boot.session.focus(user,window)
    .map_err(|e|Error::Boot(BootError::Session(e)))?;
-  self.owner=Some(user);self.window=window;Ok(())
+  self.owner=Some(user);self.window=window;self.redraw_pending=false;Ok(())
+ }
+ /// Coalesce full-window updates until the compositor drains the pending
+ /// event. Input remains bounded by InputLine; pending damage is owned by
+ /// the authenticated desktop process and never grants framebuffer access.
+ fn request_redraw(&mut self,caller:Identity)->Result<(),Error>{
+  if !self.redraw_pending{
+   self.surface.submit(&self.boot.session.windows,caller,self.window,
+    Rect{x:0,y:0,w:640,h:480}).map_err(Error::Graphics)?;
+   self.redraw_pending=true;
+  }
+  Ok(())
  }
  /// All methods require the kernel to bind caller to actual running PCB.
  pub fn execute(&mut self,caller:Identity,now:u64,
@@ -65,8 +80,7 @@ impl<D:BlockDevice,const P:usize,const E:usize,const W:usize,
   // Persistence happens at block-backed VFS, not Batch 7's ephemeral RAMFs.
   let n=m1_persistent_terminal::command(&mut self.volume,&self.rights,
     caller,now,input,output).map_err(Error::Terminal)?;
-  self.surface.submit(&self.boot.session.windows,caller,self.window,
-   Rect{x:0,y:0,w:640,h:480}).map_err(Error::Graphics)?;
+  self.request_redraw(caller)?;
   Ok(n)
  }
  /// Trusted kernel input broker must supply ASCII after scancode mapping
@@ -80,18 +94,27 @@ impl<D:BlockDevice,const P:usize,const E:usize,const W:usize,
   let mut line=[0u8;MAX_LINE];
   match self.input.feed(key,&mut line).map_err(Error::Keyboard)?{
    KeyEvent::Submitted(n)=>self.execute(caller,now,&line[..n],out).map(Some),
-   KeyEvent::Typed|KeyEvent::Erased|KeyEvent::Empty=>Ok(None),
+   KeyEvent::Typed|KeyEvent::Erased=>{
+    self.request_redraw(caller)?;
+    Ok(None)
+   },
+   KeyEvent::Empty=>Ok(None),
   }
  }
  pub fn next_draw(&mut self)->Result<Damage,Error>{
-  self.surface.next().map_err(Error::Graphics)
+  let damage=self.surface.next().map_err(Error::Graphics)?;
+  if self.owner==Some(damage.owner)&&damage.window==self.window{
+   self.redraw_pending=false;
+  }
+  Ok(damage)
  }
  pub fn exit(&mut self,caller:Identity)->Result<(),Error>{
   if self.owner!=Some(caller){return Err(Error::State);}
   self.surface.retire(caller);
   self.rights.revoke(caller).map_err(Error::Auth)?;
   self.boot.process_exited(caller).map_err(Error::Boot)?;
-  self.input.reset();self.owner=None;self.window=0;Ok(())
+  self.input.reset();self.owner=None;self.window=0;
+  self.redraw_pending=false;Ok(())
  }
  /// Only use this after quiescing the desktop and device: the returned
  /// device retains its committed file data for remount after reboot.
@@ -142,7 +165,8 @@ mod tests{
   assert_eq!(gui.execute(user(2),1,b"write /home/note IndianOS",&mut out),Ok(5));
   assert_eq!(gui.execute(user(2),1,b"cat /home/note",&mut out),Ok(8));
   assert_eq!(&out[..8],b"IndianOS");
-  for _ in 0..3{assert_eq!(gui.next_draw().unwrap().owner,user(2));}
+  assert_eq!(gui.next_draw().unwrap().owner,user(2));
+  assert_eq!(gui.next_draw(),Err(Error::Graphics(SurfaceError::Empty)));
   assert!(gui.execute(user(3),1,b"cat /home/note",&mut out).is_err());
   gui.exit(user(2)).unwrap();
   assert!(gui.execute(user(2),1,b"ls /home",&mut out).is_err());
@@ -174,6 +198,30 @@ mod tests{
   let mut bytes=[0u8;32];
   assert_eq!(fs.read("/home/plan",&mut bytes),Ok(5));
   assert_eq!(&bytes[..5],b"hello");
+ }
+ #[test]fn m1_terminal_keystrokes_redraw_without_queue_overflow(){
+  let disk=Disk{data:[[0u8;SECTOR_BYTES];SECTORS]};
+  let mut gui=TestDesk::from_mounted(HierVfs::format_blank(disk).unwrap());
+  gui.start(user(1),load(1),user(2),load(2),settings(),8,99).unwrap();
+  let mut out=[0u8;256];
+  // Far more than Q=5 events: only one redraw remains queued.
+  for &key in b"mkdir /docs"{
+   assert_eq!(gui.key(user(2),1,key,&mut out),Ok(None));
+  }
+  assert_eq!(gui.next_draw().unwrap().window,8);
+  assert_eq!(gui.next_draw(),Err(Error::Graphics(SurfaceError::Empty)));
+  assert_eq!(gui.key(user(2),1,b'\n',&mut out),Ok(Some(7)));
+  assert_eq!(gui.next_draw().unwrap().window,8);
+  for &key in b"write /docs/note wrongx"{
+   assert_eq!(gui.key(user(2),1,key,&mut out),Ok(None));
+  }
+  assert_eq!(gui.key(user(2),1,8,&mut out),Ok(None));
+  assert_eq!(gui.key(user(2),1,b'\n',&mut out),Ok(Some(5)));
+  assert_eq!(gui.next_draw().unwrap().window,8);
+  assert_eq!(gui.next_draw(),Err(Error::Graphics(SurfaceError::Empty)));
+  let mut bytes=[0u8;32];
+  assert_eq!(gui.volume.read("/docs/note",&mut bytes),Ok(5));
+  assert_eq!(&bytes[..5],b"wrong");
  }
  #[test]fn m1_desktop_mounts_explicit_partition_without_touching_neighbors(){
   const N:usize=160;
