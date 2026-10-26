@@ -106,6 +106,12 @@ jobs:
           set -euo pipefail
           cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml hd2_
           cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --features test-m2-developer-alpha hd2_
+      - name: S0 mandatory filesystem malware containment regressions
+        run: |
+          set -euo pipefail
+          python3 tools/test_security_contract.py
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml security_
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --features test-r031-vfs security_
       - name: Check cross compiler
         run: make toolchain-check
       - name: Enforce Rust-owned default kernel source audit

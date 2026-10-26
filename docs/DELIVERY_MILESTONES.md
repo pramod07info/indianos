@@ -65,6 +65,19 @@ production M2 exit requirements stay open until fully verified.
 **M2 exit:** Networked, supported native apps built by outsiders can be
 installed, run, updated and removed without privileged developer workarounds.
 
+## Cross-cutting Security Milestone S0–S4 (mandatory release gate)
+
+**Security scope and actionable task register:** [GitHub Issue #136](https://github.com/pramod07info/indianos/issues/136). No OS can honestly promise "100% hacker/virus free"; only claim concrete defenses verified by reproducible tests, real hardware when relevant, and independent review.
+
+- [ ] **S0 first slice:** protect `FileHandles` writes to OS/boot/recovery/keys/snapshots paths and apply a finite per-service write budget; adversarial tests and a dedicated always-running security CI workflow. This is a restricted syscall entrypoint, not global VFS policy.
+- [ ] **S1:** proper user/app filesystem capabilities bound to scheduler PID+generation, and enforce on all create/write/unlink/rename/overwrite/mmap/storage entrypoints (not just handles); W^X, sandboxing, isolation and audit events.
+- [ ] **S2:** protected authenticated snapshots, immutable retention, backup/restore tested after simulated ransomware and device failure, with monitoring that minimizes false positives.
+- [ ] **S3:** independently rooted secure boot, TPM anti-rollback on actual hardware, signed packages/drivers and supply-chain verification, parser fuzzing, cryptographic agility and hardening of network/USB/storage attack surfaces.
+- [ ] **S4:** independently reviewed threat model, security audit/penetration testing, physical-machine qualification, release/patch and vulnerability-response process.
+- [ ] GitHub branch protection must explicitly require successful security CI and review. Adding a workflow file does **not** automatically enforce merge protection. Never mark S0–S4 finished merely from successful functional tests.
+
+**Release principle:** security claims are revision- and threat-specific; successful QEMU unit tests are not evidence of universal malware resistance.
+
 ## M3 — Secure Hardware Beta
 
 - [ ] Qualified UEFI PC/laptop model matrix with storage, display, input,

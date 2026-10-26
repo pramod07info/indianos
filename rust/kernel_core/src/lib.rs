@@ -177,6 +177,9 @@ pub mod r030_ondevice;
 pub mod hier_vfs;
 #[cfg(feature="test-r031-vfs")]
 pub mod fs_handles;
+/// Security milestone S0: immutable system namespaces and bounded
+/// write bursts for the existing process file-handle ABI.
+pub mod fs_write_guard;
 /// R028 strict allocator-free Ethernet/IPv4 and protocol demo.
 pub mod network;
 // Legacy virtio PCI DMA depends on PMM, Limine HHDM and a real x86 ring-0
