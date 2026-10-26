@@ -62,6 +62,48 @@ such as AVX are reported but NEVER activated without full OS XSAVE/XCR0
 and context-switch support. Production signed GPU/NPU drivers and
 remote/real QPU discovery remain future work.
 
+## Issue #124 HD1: real PCI bridge topology and bounded PCIe MCFG decoder
+
+The next hardware detection slice improves on HD0's bus-0 scan. A
+no-heap, read-only PCI-to-PCI bridge enumerator now follows the
+**validated secondary bus numbers** of header-type-1 class-06/04
+bridges, with a capped 32-bus work queue, a 256-bus visit bitmap,
+and a maximum of 16 discovered GPU/NPU devices. Primary,
+secondary and subordinate ranges are checked before visiting
+children. Unconfigured bridges are safely skipped. Duplicate
+bus routes, malformed headers, overflow and probe failure cause
+a safe CPU-only fallback, not unconditional driver activation.
+
+Every x86-64 boot writes the original HD0 CPU/GPU/NPU profile and
+a second `HD1 PCI buses=... bridges=... secondary_GPU=...` report.
+The latter allows a **real QEMU PCIe root-port + downstream virtio
+GPU** acceptance test to prove discovery across an actual bus
+bridge. The QEMU test checks at least one downstream GPU, that
+the physical QPU remains unclaimed, that CPU software fallback
+remains available and that **no GPU driver has been activated**.
+These are PCI config-space reads only, not graphics acceleration.
+
+`hardware_mcfg::decode` separately validates checksum-protected
+ACPI **MCFG PCIe memory configuration descriptors**, including
+bounded table size, reserved bytes, nonoverlapping physical
+apertures, segment/bus range uniqueness, ECAM 1-MiB alignment
+and safe 4-KiB function offsets. It deliberately only calculates
+numeric ECAM addresses: actual ACPI boot-pointer validation,
+MMIO mapping, IOMMU policy, PCIe segment scanning and bridge
+hotplug are **not implemented**. Native discovery still uses
+the legacy x86 CF8/CFC mechanism for reachable segment-0
+buses. No firmware tables are dereferenced by the new parser.
+
+**HD1 is not full installer support.** The installer shares the
+versioned read-only CPU/device profile API, but the interactive
+installer workflow and automatic signed-driver selection remain
+pending. CPU-only boot must still work if an optional GPU/NPU
+is missing. A QPU requires separately verified real hardware
+or explicitly authorized remote provider access; the quantum
+simulator is not physical QPU hardware. Neither QEMU virtual
+GPU enumeration nor a future-oriented design proves physical
+Intel/AMD/NVIDIA graphics driver support.
+
 ## Boot sequence
 
 ```text

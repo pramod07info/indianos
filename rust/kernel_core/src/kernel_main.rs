@@ -59,26 +59,26 @@ pub extern "C" fn kmain()->!{
     log(b"IndianOS: kernel entered\n\0");
     need(unsafe{boot_validate()},b"IndianOS: FATAL boot information invalid\n\0");
     log(b"IndianOS: boot information validated\n\0");
-    // Issue #124 HD0: detect actual CPU and bus-0 PCI accelerators on
-    // EVERY kernel boot, before optional device drivers are initialized.
-    // Read-only CPUID and PCI config space, no BAR or DMA activation.
-    // A missing optional accelerator must never prevent CPU-only boot.
+    // Issue #124 HD1: each x86-64 boot enumerates CPU and PCI-PCI bridge
+    // topology before optional device drivers. No PCI command writes,
+    // BAR mapping, device init or implicit quantum/cloud connection.
     #[cfg(all(target_arch="x86_64",target_os="none"))]
     {
-        use crate::hardware_inventory as hw;
+        use crate::{hardware_inventory as hw,hardware_pcie as topo};
         need(hw::inspect_cpu(&hw::native::BootCpu).is_ok(),
             b"IndianOS: FATAL unsupported x86-64 CPU capabilities\n\0");
-        match hw::native::detect_boot(){
+        match topo::native::detect_boot(){
             Ok(profile)=>{
-                let mut report=[0u8;192];
-                need(hw::format_report(&profile,&mut report).is_ok(),
-                    b"IndianOS: FATAL HD0 hardware report buffer\n\0");
+                let mut report=[0u8;320];
+                need(topo::format_report(&profile,&mut report).is_ok(),
+                    b"IndianOS: FATAL HD1 hardware report buffer\n\0");
                 unsafe{serial_write(report.as_ptr().cast())};
             },
             Err(_)=>{
-                // Physical PCI discovery failure is not a reason to
-                // lose working CPU-only boot; no PCI driver is enabled.
-                log(b"IndianOS HD0 CPU supported; PCI probe unavailable; GPU=unknown; NPU=unknown; QPU=unavailable; CPU fallback=enabled\n\0");
+                // CPU-only boot continues when an optional PCI bridge is
+                // absent, malformed or cannot be probed safely.
+                log(b"IndianOS HD0 CPU supported; GPU=unknown; NPU=unknown; QPU=unavailable; CPU fallback=enabled\n\0");
+                log(b"IndianOS HD1 PCI topology unavailable; no optional accelerator driver activated\n\0");
             }
         }
     }
