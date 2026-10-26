@@ -324,6 +324,21 @@ pub extern "C" fn kmain()->!{
     log(b"IndianOS: ELF64 user-image validation ready\n\0");
     log(b"IndianOS: syscall ABI metadata validation ready\n\0");
     log(b"IndianOS: milestone 005 foundation complete\n\0");
+    #[cfg(all(feature="test-m2-disk-exec",target_arch="x86_64",target_os="none"))]
+    {
+        let stage=crate::m2_guest_qemu::run().unwrap_or_else(|_|{
+            log(b"IndianOS: FATAL M2 disk native ring3 lifecycle\n\0");halt()
+        });
+        match stage{
+          1=>log(b"IndianOS: M2 disk boot1 installed ELF v1 executed\n\0"),
+          2=>log(b"IndianOS: M2 disk boot2 upgraded ELF v2 executed\n\0"),
+          3=>log(b"IndianOS: M2 disk boot3 rolled-back ELF v1 executed\n\0"),
+          4=>log(b"IndianOS: M2 disk boot4 removed app and rejected exec\n\0"),
+          _=>{log(b"IndianOS: FATAL M2 unexpected boot phase\n\0");halt()}
+        }
+        log(b"IndianOS: M2 persisted ring3 package lifecycle PASSED\n\0");
+        halt()
+    }
     let (init,init_size)=module(b"/bin/init\0").unwrap_or_else(||{
         log(b"IndianOS: FATAL initramfs /bin/init is unavailable or invalid\n\0");
         halt()

@@ -168,3 +168,21 @@ trust keys, opt-in on-disk M2P3 seed/boot harness, full QEMU execution and
 rollback acceptance, larger ELF payloads, graphical App Store and general
 DHCP/TCP/TLS remain pending. This implementation is a bounded **runtime
 entry point**, not a completed M2 milestone.
+
+## New M2 QEMU stored-image execution test (NOT production crypto)
+
+With `M2_DISK_EXEC_TEST=1`, a QEMU-only kernel mounts a new disposable
+128-sector IDE volume and runs a tiny native ELF through the existing M2P3
+inventory, real `x86_64_user_process_run` CR3/IRETQ transition, EXIT
+syscall, PMM frame cleanup and reaping. Four distinct boots on the same raw
+test disk exercise install/execute v1, remount/upgrade/execute v2,
+rollback/execute v1, and removal plus denied re-execution.
+The Python harness checks every out-of-partition sector stays zero.
+Normal installations never enable this mode.
+
+The guest's pinned exact-byte fixture verifier is **NOT ED25519** and the
+fixture's digest/signature bytes are **NOT cryptographic evidence**. The host
+R030 SDK's real OpenSSL Ed25519 validation is a separate check. Real guest
+Ed25519 verification, protected signer keys and real third-party signed
+packages remain required before any release/production claims.
+`make test-m2-disk-exec-qemu` runs the opt-in QEMU smoke.
