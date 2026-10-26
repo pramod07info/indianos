@@ -33,6 +33,12 @@ jobs:
       - name: M2 native SDK package inventory app-store and network tests
         run: |
           cargo test --offline --manifest-path rust/kernel_core/Cargo.toml --features test-m2-developer-alpha m2_
+      - name: M2 SHA-256, consent, dependency and privilege regression checks
+        run: |
+          cargo test --offline --manifest-path rust/kernel_core/Cargo.toml --features test-m2-developer-alpha m2_sha256_
+          cargo test --offline --manifest-path rust/kernel_core/Cargo.toml --features test-m2-developer-alpha m2_consent_
+          cargo test --offline --manifest-path rust/kernel_core/Cargo.toml --features test-m2-developer-alpha m2_saved_transitive_dependency
+          cargo test --offline --manifest-path rust/kernel_core/Cargo.toml --features test-m2-developer-alpha m2_app_store_previews
       - name: M2 no_std compilation of integrated guest modules
         run: |
           cargo check --offline --manifest-path rust/kernel_core/Cargo.toml --no-default-features --features test-m2-developer-alpha --target x86_64-unknown-none
