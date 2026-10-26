@@ -238,7 +238,7 @@ pub mod native{
   /// Only the PCI configuration-address selection register (0xCF8) is
   /// written; 0xCFC and all device registers are READ ONLY.
   /// No MMIO, BAR sizing writes, DMA setup or driver activation.
-  unsafe fn read_config(bus:u8,slot:u8,function:u8,offset:u8)->u32{
+  pub(crate) unsafe fn read_config(bus:u8,slot:u8,function:u8,offset:u8)->u32{
    let previous:u32;
    unsafe{asm!("in eax, dx",in("dx")0xcf8u16,out("eax")previous,
     options(nomem,nostack,preserves_flags))};

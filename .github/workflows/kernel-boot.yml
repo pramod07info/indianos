@@ -96,6 +96,11 @@ jobs:
       - name: Issue 124 HD0 installer and boot hardware profile regressions
         run: |
           cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml hd0_
+      - name: Issue 124 HD1 bridge and PCIe MCFG host tests
+        run: |
+          set -euo pipefail
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml hd1_
+          python3 -m unittest discover -s tests -p "test_smoke_boot.py" -v
       - name: Check cross compiler
         run: make toolchain-check
       - name: Enforce Rust-owned default kernel source audit
@@ -1306,6 +1311,15 @@ jobs:
           done
           test -n "$OVMF_PATH"
           make test-boot OVMF_CODE="$OVMF_PATH"
+      - name: Issue 124 HD1 real QEMU PCIe root-port virtio GPU discovery
+        run: |
+          set -euo pipefail
+          OVMF_PATH=""
+          for candidate in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/edk2/ovmf/OVMF_CODE_4M.fd /usr/share/edk2/ovmf/OVMF_CODE.fd; do
+            if test -f "$candidate"; then OVMF_PATH="$candidate"; break; fi
+          done
+          test -n "$OVMF_PATH"
+          python3 tools/test_hd1_topology_qemu.py --iso build/indianos.iso --ovmf "$OVMF_PATH"
       - name: Upload experimental ISO for emulator debugging
         if: success()
         uses: actions/upload-artifact@v4

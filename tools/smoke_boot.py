@@ -54,6 +54,11 @@ def assert_hardware_inventory(text: str) -> None:
         raise AssertionError("missing honest quantum/CPU fallback status")
     if "GPU=unknown" not in text and "detected(no driver)" not in text:
         raise AssertionError("CPU/PCI inventory failed to report driver status")
+    if ("IndianOS HD1 PCI buses=" not in text and
+            "IndianOS HD1 PCI topology unavailable" not in text):
+        raise AssertionError("HD1 bridge discovery/fallback status is missing")
+    if "driver=not activated" not in text and "no optional accelerator driver activated" not in text:
+        raise AssertionError("HD1 must not report a detected GPU as an active driver")
 
 
 def assert_expected_exception(text: str) -> None:
@@ -340,7 +345,8 @@ def matching_ovmf_vars(code: Path) -> Path | None:
 
 
 def run_smoke(iso: Path, ovmf: Path, qemu: str, timeout: float,
-              mode: str = "normal", machine: str = "q35") -> str:
+              mode: str = "normal", machine: str = "q35",
+              extra_devices: tuple[str, ...] = ()) -> str:
     if not iso.is_file():
         raise ValueError(f"ISO not found: {iso}")
     if not ovmf.is_file():
@@ -372,6 +378,7 @@ def run_smoke(iso: Path, ovmf: Path, qemu: str, timeout: float,
         "-cdrom", str(iso), "-boot", "d", "-display", "none",
         "-serial", "stdio", "-monitor", "none", "-no-reboot", "-no-shutdown",
     ]
+    argv.extend(extra_devices)
     if mode == "preempt":
         # HPET legacy replacement can suppress PIT IRQ0 on some firmware.
         # Keep this emulator-only override out of all ordinary boot paths.
