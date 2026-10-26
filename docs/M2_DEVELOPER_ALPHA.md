@@ -424,3 +424,55 @@ To reproduce crypto tests without downloading libraries:
 `cargo test --locked --offline --manifest-path
 rust/kernel_core/Cargo.toml --features test-m2-developer-alpha m2_ed25519_`
 and `python3 tools/test_m2_phase4c_vectors.py`.
+
+
+## M2 Phase 4D — verified-boot trust boundary and crash-consistent root recovery
+
+This is one combined PR that adds the kernel-side *hardware trust integration
+contract*, signed publisher-policy A/B recovery and strict rollback checks.
+It is NOT an implementation of physical TPM 2.0 or UEFI Secure Boot.
+
+1. `m2_boot_trust::HardwareTrust` defines three privileged operations:
+   an authenticated firmware/ROM boot-root public key, a protected monotonic
+   policy sequence, and a durable, strictly increasing hardware sequence
+   advance. **A real platform implementation is intentionally absent**.
+   QEMU substitutes explicitly named `QemuFakePlatform` for validation.
+2. `PolicySlots` defines two independently durable snapshots. Staging writes
+   only the inactive slot, rereads the exact bytes, and NEVER publishes new
+   publisher authority before the next `boot_recover` pass. If the staged
+   slot fails, the active validated policy remains intact.
+3. On reboot `boot_recover` treats **both** slots as untrusted, rejects
+   malformed, wrong-root, revoked, wrongly signed or outdated candidates,
+   and uses actual Ed25519 against the independently authenticated key.
+   It selects the highest valid sequence that is at least the hardware
+   floor. Any two different signed policies with the same sequence cause
+   fail-closed denial. A policy above the floor is made durable in the
+   monotonic hardware device *before* its keys are exposed to the kernel.
+4. Crash consistency: if power fails just after the protected counter
+   advance, a valid signed policy with **equal** sequence is accepted on
+   the next reboot. If the new policy or its only disk copy is missing,
+   the boot gate denies access instead of accepting an old signed policy.
+   Failure to update or reread the platform counter also denies access.
+5. Revocation and privilege boundaries: users cannot stage policies
+   without an ADMIN INSTALL capability. A new policy cannot downgrade an
+   existing signer's epoch, silently re-enable a revoked signer at the same
+   epoch, or replace the key bytes at the same signer epoch.
+6. New host tests exercise A/B rotation across reboot, equal-sequence
+   crash recovery, revoked keys, stale PID-generations, missing/untrusted
+   firmware roots, protected-counter read/write faults, torn policy writes,
+   tampered signatures and rollback-disk attacks. The existing 4-boot
+   QEMU installed ELF fixture now calls the policy-gate API and checks
+   negative signatures, emulated stale policy floors and emulated hardware
+   counter failures before executing a signed native image in real ring3.
+   QEMU displays an explicit **simulated monotonic gate** serial marker.
+
+**Not production-complete:** Neither UEFI Secure Boot/TCG event log
+authentication nor a physical TPM NV index read/write driver is provided.
+The QEMU platform mock is RAM-only, resets between emulator invocations,
+and can be bypassed by a modified QEMU guest. This milestone proves the
+trust-boundary behavior and tests failure handling, **not real hardware
+anti-rollback**. Physical device provisioning, TPM command transport and
+authorization, secure recovery after loss of NVRAM, verified boot key
+rotation, and an independent security audit remain top-priority work.
+Untrusted files and a kernel constant MUST NOT be treated as hardware
+trust or as a production monotonic counter.
