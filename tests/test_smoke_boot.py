@@ -25,7 +25,9 @@ class SmokeBootTests(unittest.TestCase):
             "IndianOS HD2 driver catalog=unavailable; signed candidates=0; "
             "GPU/NPU drivers=not activated; QPU=unavailable; CPU fallback=enabled\n"
             "IndianOS HD3 driver image=not installed; MMIO=not mapped; "
-            "DMA=disabled; IOMMU=not attested; GPU/NPU=CPU fallback; QPU=unavailable\n")
+            "DMA=disabled; IOMMU=not attested; GPU/NPU=CPU fallback; QPU=unavailable\n"
+            "IndianOS HD3B virtio-gpu unavailable/unsupported; queue=disabled; "
+            "GPU acceleration=not active; CPU fallback=enabled\n")
         assert_hardware_inventory(
             "IndianOS HD0 CPU supported; GPU=unknown; NPU=unknown; "
             "QPU=unavailable; CPU fallback=enabled\n"
@@ -34,7 +36,9 @@ class SmokeBootTests(unittest.TestCase):
             "IndianOS HD2 driver catalog=unavailable; signed candidates=0; "
             "GPU/NPU drivers=not activated; QPU=unavailable; CPU fallback=enabled\n"
             "IndianOS HD3 driver image=not installed; MMIO=not mapped; "
-            "DMA=disabled; IOMMU=not attested; GPU/NPU=CPU fallback; QPU=unavailable\n")
+            "DMA=disabled; IOMMU=not attested; GPU/NPU=CPU fallback; QPU=unavailable\n"
+            "IndianOS HD3B virtio-gpu unavailable/unsupported; queue=disabled; "
+            "GPU acceleration=not active; CPU fallback=enabled\n")
         with self.assertRaises(AssertionError):
             assert_hardware_inventory("IndianOS HD0 CPU=GenuineIntel")
         with self.assertRaises(AssertionError):

@@ -83,6 +83,12 @@ pub extern "C" fn kmain()->!{
                     &preflight,&mut hd2).is_ok(),
                     b"IndianOS: FATAL HD2 driver preflight report\n\0");
                 unsafe{serial_write(hd2.as_ptr().cast())};
+                // HD3B.1: real PCI capability headers are enumerated
+                // on every boot. The virtio-gpu queue is NOT enabled:
+                // DMA requires a trusted IOMMU and signed driver.
+                let has_gpu=crate::hardware_virtio_gpu::native::probe(
+                    &profile).is_ok();
+                log(crate::hardware_virtio_gpu::status_line(has_gpu));
             },
             Err(_)=>{
                 // CPU-only boot continues when an optional PCI bridge is
@@ -90,6 +96,7 @@ pub extern "C" fn kmain()->!{
                 log(b"IndianOS HD0 CPU supported; GPU=unknown; NPU=unknown; QPU=unavailable; CPU fallback=enabled\n\0");
                 log(b"IndianOS HD1 PCI topology unavailable; no optional accelerator driver activated\n\0");
                 log(b"IndianOS HD2 driver catalog=unavailable; signed candidates=0; GPU/NPU drivers=not activated; QPU=unavailable; CPU fallback=enabled\n\0");
+                log(crate::hardware_virtio_gpu::status_line(false));
             }
         }
     }

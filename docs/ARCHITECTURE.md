@@ -196,6 +196,40 @@ QEMU and validate actual device command completion with CPU software
 fallback. This HD3A change does NOT make generic physical GPU/NPU
 drivers or real QPUs operational.
 
+## Issue #124 HD3B.1: virtio-gpu PCI protocol groundwork (QEMU)
+
+IndianOS now recognizes the **actual QEMU modern virtio-gpu PCI
+device** (`1af4:1050`) on the validated HD1 bridge topology. The
+no-allocation PCI configuration reader traverses bounded vendor
+capability lists to require uniquely identified, non-overlapping
+COMMON, NOTIFY, ISR and DEVICE configuration ranges, valid BAR
+indices and notification multipliers, and rejects malformed pointers,
+cycles, duplicates, I/O-BAR pretending to be MMIO and wrong device
+identities. All these operations are read-only PCI configuration
+accesses; they do **not** map BARs, negotiate virtio features, allocate
+DMA buffers, program queues or issue hardware GPU commands.
+
+The `hardware_virtio_gpu::Protocol` implements the proper bounded
+virtio-gpu 2D wire commands: GET_DISPLAY_INFO, RESOURCE_CREATE_2D,
+RESOURCE_ATTACH_BACKING, SET_SCANOUT, TRANSFER_TO_HOST_2D and
+RESOURCE_FLUSH. It validates response types/lengths, framebuffer
+dimensions, physical-buffer alignment and allocation bounds. Host
+tests use an explicitly **mocked** queue transport to exercise the
+command sequence, malformed device replies, rogue PCI capabilities
+and geometry/descriptor rejections. A separate real QEMU/OVMF
+acceptance boots with and without a virtio-gpu device behind a PCIe
+root port to verify the native PCI capability probe and CPU fallback.
+
+**HD3B IS NOT COMPLETED:** A working QEMU virtqueue backend must still
+be implemented with a trusted physical memory map, actual MMIO mappings,
+verified DMA ownership/IOMMU isolation, negotiated device features,
+error recovery, and GPU control-queue completion. Only then may the
+project claim a real QEMU-rendered pixel buffer, and separate hardware
+driver qualification is required for physical GPUs. The serial message
+`HD3B ... queue=disabled; GPU acceleration=not active` is deliberate.
+The new PCI probe does not weaken HD3A's signed-driver and CPU fallback
+requirements. Existing OS framebuffer drawing remains CPU-owned.
+
 ## Boot sequence
 
 ```text
