@@ -285,3 +285,37 @@ A custom bootloader, ARM64, Wi-Fi on physical laptops, GPU acceleration, Windows
 The independent kernel exposes IndianOS process, memory, file, device and syscall primitives. These are **not** identical to Linux, Windows or macOS ABIs. A future user-space Interoperability Manager chooses a verified execution route for each app: native package, browser/PWA, implemented Linux ABI, Windows-API translation, authorized guest VM, Android runtime, or authorized remote Mac host. Each route requires separate engineering, licensing and testing.
 
 An optional assistant helps a user express intent and understand choices; a deterministic package planner and signed, least-privilege installer implement the action after explicit approval. The language model cannot run privileged commands. See [COMPATIBILITY.md](COMPATIBILITY.md) and [AI_APP_ASSISTANT.md](AI_APP_ASSISTANT.md).
+
+## Issue #124 HD3B.2: isolated virtio-GPU control-queue staging (not a driver)
+
+The `hardware_virtio_queue` module is a **pure Rust no_std planning and
+descriptor-accounting layer** for a future modern virtio-GPU control queue.
+It is deliberately NOT wired into the early boot path. It consumes an HD3A
+`ResourcePlan` (which is numeric data only) and a PCI capability snapshot,
+checks the requesting process generation and PCI bus/device/function, and
+rejects missing proposed IOMMU domains, MMIO or DMA apertures. It requires
+virtio `VERSION_1` and `ACCESS_PLATFORM` features for *potential* isolation;
+merely offering these bits is never proof of actual isolation.
+
+Split-ring descriptor, available, and used buffers occupy separately
+page-aligned, nonoverlapping checked DMA windows. Queue size must be a
+power of two in 2..=256 and each ring has enough space for the virtio
+split-ring structures. Notification offsets are range checked against
+the discovered modern PCI notify capability. The fixed-capacity queue
+model rejects overlapping request/response buffers, buffer reuse,
+wrong PID-generation, unknown/oversized completion, and exhaustion;
+driver or service teardown retires its pending numeric commands.
+
+**No physical queue has been created or enabled.** No memory pages have
+been pinned, mapped into IOMMU tables or exposed to a device. No PCI MMIO
+or configuration registers are written, no virtqueue used-ring bytes are
+read from real hardware, and no GPU-rendered pixels exist. The model's
+`complete` operation validates caller-provided metadata only; it does not
+authenticate a real GPU completion. Real transport integration remains
+blocked on IOMMU driver evidence, signed driver execution, bounded pinned
+page ownership, queue memory ordering and tests against live QEMU and
+qualified physical hardware. CPU software rendering stays the fallback.
+
+CI runs `hd3b2_` host tests both with/without the M2 feature and a
+bare-metal `no_std` compile, in addition to existing full kernel and
+QEMU acceptance. This is engineering groundwork, not HD3B final acceptance.
