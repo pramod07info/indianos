@@ -182,3 +182,86 @@ impl<const N:usize> Access<N>{
  }
 
 }
+
+/// Orbit R005 kernel policy extensions. The real syscall dispatcher must
+/// supply identities from its PCB and invoke these checks at the boundary.
+impl<const N:usize> Access<N>{
+ /// Issue a tightly bounded temporary grant; no deadline arithmetic wrap,
+ /// zero duration, or time window exceeding supervisor policy.
+ pub fn grant_temporary(&mut self,owner:Identity,rights:u32,
+  now:u64,duration:u64,max_duration:u64)->Result<u64,Error>{
+  if duration==0||max_duration==0||duration>max_duration{
+   return Err(Error::Invalid);
+  }
+  let deadline=now.checked_add(duration).ok_or(Error::Invalid)?;
+  self.grant(owner,rights,deadline)?;
+  Ok(deadline)
+ }
+ /// Preflight several syscall privileges before making any state change.
+ /// Caller must still commit operations transactionally after this check.
+ pub fn authorize_many(&self,requirements:&[(Identity,u32)],
+  now:u64)->Result<usize,Error>{
+  if requirements.is_empty()||requirements.len()>N{return Err(Error::Invalid);}
+  for &(owner,rights) in requirements{
+   self.require(owner,rights,now)?;
+  }
+  Ok(requirements.len())
+ }
+ /// Security incident lockdown: trusted supervisor strips mutation,
+ /// installer and hardware-driver rights from all existing grants.
+ /// Read-only session access and network grants may remain.
+ pub fn lockdown_mutations(&mut self)->usize{
+  let blocked=FILE_WRITE|INSTALL|DRIVER;
+  let mut affected=0;
+  for slot in &mut self.grants{
+   if let Some(mut grant)=*slot{
+    if grant.rights&blocked!=0{
+     affected+=1;
+     grant.rights&=!blocked;
+     *slot=if grant.rights==0{None}else{Some(grant)};
+    }
+   }
+  }
+  affected
+ }
+ /// Exact caller-identity introspection for a permission review dialog.
+ /// Does not enumerate other users' capabilities.
+ pub fn has_permission(&self,owner:Identity,required:u32,now:u64)->bool{
+  self.require(owner,required,now).is_ok()
+ }
+}
+#[cfg(test)]
+mod orbit_r005_kernel_access_tests{
+ use super::*;
+ fn user()->Identity{Identity{pid:101,generation:3}}
+ #[test]fn bounded_grants_never_overflow_or_silently_escalate(){
+  let mut a=Access::<1>::new();
+  assert_eq!(a.grant_temporary(user(),FILE_READ,10,0,30),Err(Error::Invalid));
+  assert_eq!(a.grant_temporary(user(),FILE_READ,u64::MAX,2,30),Err(Error::Invalid));
+  assert_eq!(a.grant_temporary(user(),FILE_READ,10,40,30),Err(Error::Invalid));
+  assert_eq!(a.grant_temporary(user(),FILE_READ,10,15,30),Ok(25));
+  assert!(a.has_permission(user(),FILE_READ,24));
+  assert!(!a.has_permission(user(),FILE_READ,25));
+ }
+ #[test]fn incident_lockdown_revokes_every_mutating_scope(){
+  let mut a=Access::<3>::new();
+  a.grant(user(),VIEW|FILE_READ|FILE_WRITE|INSTALL,100).unwrap();
+  let second=Identity{pid:102,generation:1};
+  a.grant(second,DRIVER,100).unwrap();
+  assert_eq!(a.lockdown_mutations(),2);
+  assert_eq!(a.require(user(),FILE_READ,1),Ok(()));
+  assert_eq!(a.require(user(),FILE_WRITE,1),Err(Error::Denied));
+  assert_eq!(a.require(second,DRIVER,1),Err(Error::NotFound));
+  assert_eq!(a.lockdown_mutations(),0);
+ }
+ #[test]fn authorizing_multiple_calls_rejects_stale_or_missing_rights(){
+  let mut a=Access::<2>::new();
+  a.grant(user(),VIEW|FILE_READ,100).unwrap();
+  let recycled=Identity{generation:4,..user()};
+  assert_eq!(a.authorize_many(&[(user(),VIEW),(recycled,FILE_READ)],1),
+   Err(Error::Denied));
+  assert_eq!(a.authorize_many(&[(user(),VIEW),(user(),FILE_WRITE)],1),
+   Err(Error::Denied));
+  assert_eq!(a.authorize_many(&[(user(),VIEW),(user(),FILE_READ)],1),Ok(2));
+ }
+}
