@@ -255,6 +255,28 @@ impl<T:ControlTransport> Protocol<T>{
   self.command(RESOURCE_FLUSH,&extra[..24],RESP_OK_NODATA,&mut response)?;
   Ok(())
  }
+ /// Preflight the COMPLETE compositor damage batch before sending any
+ /// command to the authenticated virtio-gpu transport. If the transport
+ /// fails after submission, callers must reset/recover the device separately.
+ pub fn refresh_batch(&mut self,display:Scanout,resource:u32,
+   dirty:&[Rect])->Result<usize,Error>{
+  if dirty.is_empty()||dirty.len()>8{return Err(Error::Dimensions);}
+  if !self.ready||resource==0||display.width==0||display.height==0||
+    display.width>MAX_WIDTH||display.height>MAX_HEIGHT{
+   return Err(Error::Unisolated);
+  }
+  for r in dirty{
+   if r.width==0||r.height==0||
+      r.x.checked_add(r.width).is_none_or(|v|v>display.width)||
+      r.y.checked_add(r.height).is_none_or(|v|v>display.height){
+    return Err(Error::Dimensions);
+   }
+  }
+  for &r in dirty{
+   self.refresh_subrect(display,resource,r)?;
+  }
+  Ok(dirty.len())
+ }
  /// Update an already allocated and attached scanout resource using
  /// strict bounds and actual virtio-gpu transfer/flush command encoding.
  /// Native transport, page-pinning and IOMMU ownership remain separate.
@@ -466,6 +488,27 @@ mod hd3b_tests{
   assert_eq!(gpu.refresh_subrect(display,0,Rect{
    x:0,y:0,width:10,height:2}),Err(Error::Unisolated));
   assert_eq!(gpu.transport.index,1);
+ }
+
+
+ #[test]fn valid_gpu_damage_batch_sends_transfer_flush_per_rectangle(){
+  let mut gpu=Protocol::new(transport(0));
+  let scanout=gpu.discover_display().unwrap();
+  let dirty=[Rect{x:1,y:2,width:4,height:3},
+             Rect{x:10,y:6,width:5,height:6}];
+  assert_eq!(gpu.refresh_batch(scanout,1,&dirty),Ok(2));
+  assert_eq!(&gpu.transport.types[..5],&[
+    GET_DISPLAY_INFO,TRANSFER_TO_HOST_2D,RESOURCE_FLUSH,
+    TRANSFER_TO_HOST_2D,RESOURCE_FLUSH]);
+ }
+ #[test]fn invalid_gpu_batch_makes_no_partial_commands(){
+  let mut gpu=Protocol::new(transport(0));
+  let scanout=gpu.discover_display().unwrap();
+  let dirty=[Rect{x:1,y:2,width:4,height:3},
+             Rect{x:60,y:6,width:100,height:6}];
+  assert_eq!(gpu.refresh_batch(scanout,1,&dirty),Err(Error::Dimensions));
+  assert_eq!(gpu.transport.index,1);
+  assert_eq!(gpu.refresh_batch(scanout,1,&[]),Err(Error::Dimensions));
  }
 
 }
