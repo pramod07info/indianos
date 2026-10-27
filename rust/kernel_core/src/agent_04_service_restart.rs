@@ -104,3 +104,48 @@ mod backoff_tests {
         assert_eq!(retry_deadline(ready(), 100, 0), Err(ServiceError::InvalidTransition));
     }
 }
+
+
+/// Permit one bounded service restart only after an explicit scheduler
+/// deadline and exact generation match; no real process is launched.
+pub fn retry_if_due(service:Service,observed_generation:u32,
+    now_ticks:u64,deadline_ticks:u64)->Result<Service,ServiceError>{
+    if service.state!=State::WaitingRestart||
+       service.generation==0||
+       observed_generation!=service.generation||
+       now_ticks<deadline_ticks||
+       service.retries>=service.retry_budget{
+        return Err(ServiceError::InvalidTransition)
+    }
+    transition(service,Event::Retry)
+}
+#[cfg(test)]
+mod retry_gate_tests{
+    use super::*;
+    fn waiting()->Service{
+        Service{state:State::WaitingRestart,retries:0,
+                retry_budget:2,generation:11}
+    }
+    #[test]fn exact_deadline_rotates_generation(){
+        let restarted=retry_if_due(waiting(),11,150,150).unwrap();
+        assert_eq!(restarted.state,State::Running);
+        assert_eq!(restarted.generation,12);
+        assert_eq!(restarted.retries,1);
+    }
+    #[test]fn early_or_stale_restart_is_blocked(){
+        assert_eq!(retry_if_due(waiting(),11,149,150),
+                   Err(ServiceError::InvalidTransition));
+        assert_eq!(retry_if_due(waiting(),10,150,150),
+                   Err(ServiceError::InvalidTransition));
+        assert_eq!(retry_if_due(waiting(),0,150,150),
+                   Err(ServiceError::InvalidTransition));
+    }
+    #[test]fn exhausted_and_generation_wrap_are_rejected(){
+        let mut s=waiting();s.retries=2;
+        assert_eq!(retry_if_due(s,11,150,150),Err(ServiceError::InvalidTransition));
+        s.retries=0;s.state=State::Exhausted;
+        assert_eq!(retry_if_due(s,11,150,150),Err(ServiceError::InvalidTransition));
+        s.state=State::WaitingRestart;s.generation=u32::MAX;
+        assert_eq!(retry_if_due(s,u32::MAX,150,150),Err(ServiceError::CounterOverflow));
+    }
+}
