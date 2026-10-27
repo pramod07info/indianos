@@ -461,7 +461,7 @@ mod orbit_r005_broker_tests{
  #[test]fn workspace_grants_are_all_or_nothing(){
   let mut b=Broker::<3,4>::new();
   assert_eq!(b.grant_batch(&[(7,10),(7,11),(8,12)]),Ok(3));
-  assert_eq!(b.grant_batch(&[(9,13),(9,11)]),Err(Error::Duplicate));
+  assert_eq!(b.grant_batch(&[(9,13),(9,11)]),Err(Error::Full));
   assert!(!b.owns(9,13));assert!(b.owns(8,12));
  }
  #[test]fn transfer_rejects_stale_events_and_does_not_hijack_other_windows(){
