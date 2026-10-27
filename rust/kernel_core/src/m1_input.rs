@@ -58,6 +58,57 @@ impl LineEditor{
     pub fn caret(&self)->usize{self.caret}
     pub fn bytes(&self)->&[u8]{&self.line[..self.len]}
     pub fn clear(&mut self){self.line.fill(0);self.len=0;self.caret=0;}
+    /// Replace all edited text in one bounded transaction, preserving
+    /// old content and caret on invalid input/overflow.
+    pub fn replace_line(&mut self,next:&[u8])->Result<(),Error>{
+        if next.len()>MAX_LINE{return Err(Error::Full);}
+        if next.iter().any(|&c|!(b' '..=b'~').contains(&c)){
+            return Err(Error::Invalid);
+        }
+        self.clear();self.line[..next.len()].copy_from_slice(next);
+        self.len=next.len();self.caret=self.len;Ok(())
+    }
+    /// Paste multiple ASCII characters atomically into the current caret.
+    /// Source may contain no newlines, controls or NUL bytes.
+    pub fn paste(&mut self,source:&[u8])->Result<(),Error>{
+        let available=MAX_LINE-self.len;
+        if source.len()>available{return Err(Error::Full);}
+        if source.iter().any(|&b|!(b' '..=b'~').contains(&b)){
+            return Err(Error::Invalid);
+        }
+        self.line.copy_within(self.caret..self.len,self.caret+source.len());
+        self.line[self.caret..self.caret+source.len()].copy_from_slice(source);
+        self.len+=source.len();self.caret+=source.len();Ok(())
+    }
+    /// Navigate ASCII words without assuming the cursor points to a glyph.
+    pub fn previous_word(&mut self)->usize{
+        while self.caret>0&&self.line[self.caret-1]==b' '{self.caret-=1;}
+        while self.caret>0&&self.line[self.caret-1]!=b' '{self.caret-=1;}
+        self.caret
+    }
+    pub fn next_word(&mut self)->usize{
+        while self.caret<self.len&&self.line[self.caret]!=b' '{self.caret+=1;}
+        while self.caret<self.len&&self.line[self.caret]==b' '{self.caret+=1;}
+        self.caret
+    }
+    /// Delete the word immediately before the caret, including separation,
+    /// and scrub vacated tail bytes.
+    pub fn erase_previous_word(&mut self)->Event{
+        let end=self.caret;let start=self.previous_word();
+        if end==start{return Event::Empty;}
+        self.line.copy_within(end..self.len,start);
+        self.len-=end-start;self.line[self.len..].fill(0);
+        Event::Erased
+    }
+    /// Copy a selection only after destination preflight.
+    pub fn copy_range(&self,start:usize,end:usize,out:&mut[u8])
+        ->Result<usize,Error>{
+        if start>end||end>self.len{return Err(Error::Invalid);}
+        let size=end-start;
+        if out.len()<size{return Err(Error::TooSmall);}
+        out[..size].copy_from_slice(&self.line[start..end]);
+        Ok(size)
+    }
     pub fn edit(&mut self,key:EditKey,out:&mut[u8])->Result<Event,Error>{
         match key{
             // E1: move cursor without causing side effects or underflow.
@@ -178,6 +229,39 @@ impl LineEditor{
   assert_eq!(e.edit(EditKey::Insert(b'y'),&mut[]),Err(Error::Full));
   assert_eq!(e.edit(EditKey::Insert(0),&mut[]),Err(Error::Invalid));
   assert_eq!(e.bytes().len(),MAX_LINE);assert_eq!(e.caret(),MAX_LINE);
+ }
+
+ #[test]fn orbit_large_editor_paste_replace_and_selection(){
+  let mut e=LineEditor::new();
+  e.replace_line(b"deploy service").unwrap();
+  e.edit(EditKey::Home,&mut[]).unwrap();
+  e.paste(b"safe ").unwrap();
+  assert_eq!(e.bytes(),b"safe deploy service");
+  let mut buf=[0u8;7];
+  assert_eq!(e.copy_range(5,11,&mut buf),Ok(6));
+  assert_eq!(&buf[..6],b"deploy");
+  assert_eq!(e.copy_range(0,12,&mut buf),Err(Error::TooSmall));
+  assert_eq!(e.replace_line(b"bad\nline"),Err(Error::Invalid));
+  assert_eq!(e.bytes(),b"safe deploy service");
+ }
+ #[test]fn orbit_editor_word_nav_and_delete_multiple_words(){
+  let mut e=LineEditor::new();e.replace_line(b"one two   three").unwrap();
+  assert_eq!(e.previous_word(),10);
+  assert_eq!(e.erase_previous_word(),Event::Erased);
+  assert_eq!(e.bytes(),b"one three");
+  e.edit(EditKey::End,&mut[]).unwrap();
+  assert_eq!(e.previous_word(),4);
+  e.edit(EditKey::Home,&mut[]).unwrap();
+  assert_eq!(e.next_word(),4);
+ }
+ #[test]fn orbit_editor_full_buffer_paste_is_fail_closed(){
+  let mut e=LineEditor::new();e.replace_line(&[b'x';MAX_LINE-1]).unwrap();
+  let original=e.caret();
+  assert_eq!(e.paste(b"ab"),Err(Error::Full));
+  assert_eq!(e.paste(b"\n"),Err(Error::Invalid));
+  assert_eq!(e.caret(),original);assert_eq!(e.bytes().len(),MAX_LINE-1);
+  assert_eq!(e.paste(b"z"),Ok(()));
+  assert_eq!(e.bytes().len(),MAX_LINE);
  }
 
 }
