@@ -1,0 +1,40 @@
+name: Capture R031.9 current functional IndianOS desktop UI
+on:
+  push:
+    branches: [capture-r0319-functional-ui-20261027]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  qemu-desktop-evidence:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install QEMU, OVMF, and kernel build dependencies
+        run: |
+          sudo timeout 300s apt-get update -o Acquire::Retries=3 -o Acquire::http::Timeout=40
+          sudo timeout 600s apt-get install -y --no-install-recommends -o Acquire::Retries=3 -o Acquire::http::Timeout=40 clang lld binutils xorriso qemu-system-x86 ovmf curl openssl
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
+      - name: Boot current R031.9 Files and Terminal twice and capture real display
+        env:
+          R031_GUI_SCREENSHOT_DIR: build/current-functional-ui
+        run: |
+          set -euo pipefail
+          OVMF_PATH=""
+          for f in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/edk2/ovmf/OVMF_CODE_4M.fd /usr/share/edk2/ovmf/OVMF_CODE.fd; do
+            if test -f "$f"; then OVMF_PATH="$f"; break; fi
+          done
+          test -n "$OVMF_PATH"
+          make test-r031-files-gui-qemu OVMF_CODE="$OVMF_PATH"
+          printf '%s\n' "Base main: 1c6dd5451266567aed76a2407c005fdfd81f8726" > build/current-functional-ui/SOURCE_COMMIT.txt
+      - name: Upload current Files and Terminal QEMU screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: indianos-r0319-latest-functional-gui
+          path: build/current-functional-ui/
+          if-no-files-found: warn
+          retention-days: 14
