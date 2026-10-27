@@ -558,20 +558,17 @@ pub(crate) struct Session{
 impl Session{
     fn new(w:u32,h:u32)->Option<Self>{
         let mut desktop=Desktop::new(w,h).ok()?;
-        let (fw,fh,tw,th,lx,ty,rx,ry)=
-            if cfg!(feature="orbit-ui-preview") && w>=1120&&h>=720{
-                let area=w-202-264-32;
-                let files_w=area*56/100;
-                let terminal_w=area-files_w-14;
-                (files_w,(h-246).min(482),terminal_w,(h-246).min(482),
-                  204,143,(204+files_w+14) as i32,143)
+        let (files_rect,terminal_rect)=
+            if cfg!(feature="orbit-ui-preview"){
+                crate::orbit_ui::Layout::new(w,h).windows()?
             }else{
                 let ww=(w*49/100).max(320).min(w-80);
                 let wh=(h*50/100).max(240).min(h-110);
-                (ww,wh,ww,wh,45,75,(w-ww-36) as i32,(h-wh-65) as i32)
+                (Rect::new(45,75,ww,wh),
+                 Rect::new((w-ww-36) as i32,(h-wh-65) as i32,ww,wh))
             };
-        let files=desktop.open(App::Files,Rect::new(lx,ty,fw,fh)).ok()?;
-        let terminal=desktop.open(App::Terminal,Rect::new(rx,ry,tw,th)).ok()?;
+        let files=desktop.open(App::Files,files_rect).ok()?;
+        let terminal=desktop.open(App::Terminal,terminal_rect).ok()?;
         Some(Self{desktop,files,terminal,active:terminal,orbit:0,
             mouse_x:(w/2) as i32,mouse_y:(h/2) as i32,
             was_down:false,dragging:None,focused_mouse:0,focused_keyboard:0,
