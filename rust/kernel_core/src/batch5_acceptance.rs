@@ -76,8 +76,17 @@
   assert!(io.guard_mmio(1,2,0x1000,4).is_err());
  }
  #[test]fn third_party_formats_are_not_declared_native(){
-  let mut elf=[0u8;64];elf[..4].copy_from_slice(b"\x7fELF");
-  elf[4]=2;elf[5]=1;elf[18..20].copy_from_slice(&62u16.to_le_bytes());
+  let mut elf=[0u8;120];elf[..4].copy_from_slice(b"\x7fELF");
+  elf[4]=2;elf[5]=1;elf[6]=1;
+  elf[16..18].copy_from_slice(&2u16.to_le_bytes());
+  elf[18..20].copy_from_slice(&62u16.to_le_bytes());
+  elf[20..24].copy_from_slice(&1u32.to_le_bytes());
+  elf[32..40].copy_from_slice(&64u64.to_le_bytes());
+  elf[52..54].copy_from_slice(&64u16.to_le_bytes());
+  elf[54..56].copy_from_slice(&56u16.to_le_bytes());
+  elf[56..58].copy_from_slice(&1u16.to_le_bytes());
+  elf[64..68].copy_from_slice(&1u32.to_le_bytes());
+  elf[68..72].copy_from_slice(&5u32.to_le_bytes());
   assert_eq!(batch5_compat::linux_x86_64_elf(true,&elf),
    Ok(Route::NeedsLinuxRuntime));
   assert!(batch5_compat::windows_x86_64(false,b"MZ").is_err());

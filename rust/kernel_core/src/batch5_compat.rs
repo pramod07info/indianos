@@ -15,9 +15,46 @@ pub fn native(signed:bool,arch:u16,host:u16)->Result<Route,Error>{
 }
 pub fn linux_x86_64_elf(signed:bool,data:&[u8])->Result<Route,Error>{
  if !signed{return Err(Error::Unverified);}
+ // An ELF magic+machine match alone is not a trustworthy runtime route.
+ // Validate the entire executable header and bounded program table before
+ // advertising Linux compatibility; this does not execute foreign binaries.
  if data.len()<64||data[..4]!=[0x7f,b'E',b'L',b'F']||
-  data[4]!=2||data[5]!=1{return Err(Error::Malformed);}
- if data[18..20]!=62u16.to_le_bytes(){return Err(Error::Unsupported);}
+    data[4]!=2||data[5]!=1||data[6]!=1{
+  return Err(Error::Malformed);
+ }
+ let machine=u16::from_le_bytes([data[18],data[19]]);
+ let kind=u16::from_le_bytes([data[16],data[17]]);
+ if machine!=62||!matches!(kind,2|3){return Err(Error::Unsupported);}
+ if data[20..24]!=1u32.to_le_bytes()||
+    data[52..54]!=64u16.to_le_bytes()||
+    data[54..56]!=56u16.to_le_bytes(){
+  return Err(Error::Malformed);
+ }
+ let offset=u64::from_le_bytes(data[32..40].try_into()
+    .map_err(|_|Error::Malformed)?);
+ let count=u16::from_le_bytes([data[56],data[57]]) as usize;
+ if count==0||count>64{return Err(Error::Malformed);}
+ let table_bytes=count.checked_mul(56).ok_or(Error::Malformed)?;
+ let start=usize::try_from(offset).map_err(|_|Error::Malformed)?;
+ let end=start.checked_add(table_bytes).ok_or(Error::Malformed)?;
+ if start<64||end>data.len(){return Err(Error::Malformed);}
+ let mut executable=false;
+ for index in 0..count{
+  let base=start+index*56;
+  let segment=&data[base..base+56];
+  let kind=u32::from_le_bytes(segment[0..4].try_into().unwrap());
+  if kind!=1{continue;}
+  let flags=u32::from_le_bytes(segment[4..8].try_into().unwrap());
+  let fileoff=u64::from_le_bytes(segment[8..16].try_into().unwrap());
+  let filelen=u64::from_le_bytes(segment[32..40].try_into().unwrap());
+  let memlen=u64::from_le_bytes(segment[40..48].try_into().unwrap());
+  if filelen>memlen||memlen>128*1024*1024||fileoff.checked_add(filelen)
+     .is_none_or(|end|end>data.len() as u64){
+   return Err(Error::Malformed);
+  }
+  if flags&1!=0{executable=true;}
+ }
+ if !executable{return Err(Error::Malformed);}
  Ok(Route::NeedsLinuxRuntime)
 }
 pub fn windows_x86_64(signed:bool,data:&[u8])->Result<Route,Error>{
@@ -42,8 +79,17 @@ pub fn macos(app:batch4_macos_policy::App)->Result<Route,Error>{
 #[cfg(test)]mod tests{
  use super::*;
  #[test]fn linux_binary_is_not_mistaken_for_running_program(){
-  let mut elf=[0u8;64];elf[..4].copy_from_slice(b"\x7fELF");
-  elf[4]=2;elf[5]=1;elf[18..20].copy_from_slice(&62u16.to_le_bytes());
+  let mut elf=[0u8;120];elf[..4].copy_from_slice(b"\x7fELF");
+  elf[4]=2;elf[5]=1;elf[6]=1;
+  elf[16..18].copy_from_slice(&2u16.to_le_bytes());
+  elf[18..20].copy_from_slice(&62u16.to_le_bytes());
+  elf[20..24].copy_from_slice(&1u32.to_le_bytes());
+  elf[32..40].copy_from_slice(&64u64.to_le_bytes());
+  elf[52..54].copy_from_slice(&64u16.to_le_bytes());
+  elf[54..56].copy_from_slice(&56u16.to_le_bytes());
+  elf[56..58].copy_from_slice(&1u16.to_le_bytes());
+  elf[64..68].copy_from_slice(&1u32.to_le_bytes());
+  elf[68..72].copy_from_slice(&5u32.to_le_bytes());
   assert_eq!(linux_x86_64_elf(true,&elf),Ok(Route::NeedsLinuxRuntime));
   assert_eq!(linux_x86_64_elf(false,&elf),Err(Error::Unverified));
  }
@@ -134,5 +180,49 @@ mod guarded_runtime_tests{
       principal(),2,&a,all()),Err(RuntimeError::NoGrant));
   assert_eq!(authorize_runtime(Route::NeedsLinuxRuntime,true,true,
       principal(),2,&a,all()),Ok(Route::NeedsLinuxRuntime));
+ }
+}
+
+
+#[cfg(test)]
+mod strict_linux_elf_tests{
+ use super::*;
+ fn executable()->[u8;120]{
+  let mut elf=[0u8;120];elf[..4].copy_from_slice(b"\x7fELF");
+  elf[4]=2;elf[5]=1;elf[6]=1;
+  elf[16..18].copy_from_slice(&2u16.to_le_bytes());
+  elf[18..20].copy_from_slice(&62u16.to_le_bytes());
+  elf[20..24].copy_from_slice(&1u32.to_le_bytes());
+  elf[32..40].copy_from_slice(&64u64.to_le_bytes());
+  elf[52..54].copy_from_slice(&64u16.to_le_bytes());
+  elf[54..56].copy_from_slice(&56u16.to_le_bytes());
+  elf[56..58].copy_from_slice(&1u16.to_le_bytes());
+  elf[64..68].copy_from_slice(&1u32.to_le_bytes());
+  elf[68..72].copy_from_slice(&5u32.to_le_bytes());
+  elf
+ }
+ #[test]fn accepts_only_checked_executable_program_headers(){
+  let b=executable();
+  assert_eq!(linux_x86_64_elf(true,&b),Ok(Route::NeedsLinuxRuntime));
+  assert_eq!(linux_x86_64_elf(false,&b),Err(Error::Unverified));
+ }
+ #[test]fn rejects_truncated_overflowing_and_non_executable_segments(){
+  let mut b=executable();
+  b[32..40].copy_from_slice(&u64::MAX.to_le_bytes());
+  assert_eq!(linux_x86_64_elf(true,&b),Err(Error::Malformed));
+  let mut b=executable();b[68..72].copy_from_slice(&0u32.to_le_bytes());
+  assert_eq!(linux_x86_64_elf(true,&b),Err(Error::Malformed));
+  let mut b=executable();b[96..104].copy_from_slice(&1u64.to_le_bytes());
+  assert_eq!(linux_x86_64_elf(true,&b),Err(Error::Malformed));
+ }
+ #[test]fn rejects_wrong_arch_class_kind_and_bad_table_size(){
+  let mut b=executable();b[18..20].copy_from_slice(&0xb7u16.to_le_bytes());
+  assert_eq!(linux_x86_64_elf(true,&b),Err(Error::Unsupported));
+  let mut b=executable();b[16..18].copy_from_slice(&1u16.to_le_bytes());
+  assert_eq!(linux_x86_64_elf(true,&b),Err(Error::Unsupported));
+  let mut b=executable();b[54..56].copy_from_slice(&0u16.to_le_bytes());
+  assert_eq!(linux_x86_64_elf(true,&b),Err(Error::Malformed));
+  let mut b=executable();b[56..58].copy_from_slice(&65u16.to_le_bytes());
+  assert_eq!(linux_x86_64_elf(true,&b),Err(Error::Malformed));
  }
 }

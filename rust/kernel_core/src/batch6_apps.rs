@@ -44,8 +44,17 @@ pub fn classify(request:Requested<'_>,host_arch:u16)->Result<Availability,Error>
    App{id:2,arch:62,trusted:true,permissions:1,risk:0,score:60}];
   assert_eq!(suggest(&apps,62,1,2),Ok(2));
   assert_eq!(suggest(&apps,62,0,2),Err(Error::NoSuggestion));
-  let mut elf=[0u8;64];elf[..4].copy_from_slice(b"\x7fELF");
-  elf[4]=2;elf[5]=1;elf[18..20].copy_from_slice(&62u16.to_le_bytes());
+  let mut elf=[0u8;120];elf[..4].copy_from_slice(b"\x7fELF");
+  elf[4]=2;elf[5]=1;elf[6]=1;
+  elf[16..18].copy_from_slice(&2u16.to_le_bytes());
+  elf[18..20].copy_from_slice(&62u16.to_le_bytes());
+  elf[20..24].copy_from_slice(&1u32.to_le_bytes());
+  elf[32..40].copy_from_slice(&64u64.to_le_bytes());
+  elf[52..54].copy_from_slice(&64u16.to_le_bytes());
+  elf[54..56].copy_from_slice(&56u16.to_le_bytes());
+  elf[56..58].copy_from_slice(&1u16.to_le_bytes());
+  elf[64..68].copy_from_slice(&1u32.to_le_bytes());
+  elf[68..72].copy_from_slice(&5u32.to_le_bytes());
   assert_eq!(classify(Requested{format:Format::ElfLinux,verified:true,
    bytes:&elf,mac:None},62),Ok(Availability::RuntimeMissing));
   assert_eq!(classify(Requested{format:Format::ElfLinux,verified:false,
