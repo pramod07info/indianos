@@ -147,7 +147,6 @@ mod m2_tests{
  }
  #[test]fn m2_consent_file_access_requires_signed_image_and_exact_live_pid(){
   let app=Record{rights:FILE_READ|FILE_WRITE,..app()};
-  let mut guard=crate::fs_write_guard::WriteGuard::new();
   let mut ledger=Ledger::<1>::new();
   ledger.approve(&auth(),actor(),1,process(),app,
     FILE_READ|FILE_WRITE,30).unwrap();
@@ -209,6 +208,7 @@ mod m2_tests{
   fs.mkdir("/home").unwrap();fs.mkdir("/system").unwrap();
   fs.create("/system/config",b"trusted").unwrap();
   let app=Record{rights:FILE_READ|FILE_WRITE,..app()};
+  let mut guard=crate::fs_write_guard::WriteGuard::new();
   let mut ledger=Ledger::<1>::new();
   ledger.approve(&auth(),actor(),1,process(),app,
     FILE_READ|FILE_WRITE,30).unwrap();
