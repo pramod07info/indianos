@@ -146,6 +146,95 @@ impl<const MAILBOXES: usize, const DEPTH: usize> IpcRouter<MAILBOXES, DEPTH> {
     }
 }
 
+/// Exact-process-identity IPC routing. The prior PID-only router is kept
+/// for legacy callers; new services must use this generation-aware variant.
+/// All methods require scheduler-authenticated identities and serialized
+/// kernel access (not yet an SMP-safe live syscall implementation).
+use crate::batch5_session::Identity;
+#[derive(Clone,Copy)]
+pub struct TaggedMessage{
+ sender:Identity,length:u8,bytes:[u8;MAX_PAYLOAD],
+}
+impl TaggedMessage{
+ pub fn sender(&self)->Identity{self.sender}
+ pub fn payload(&self)->&[u8]{&self.bytes[..self.length as usize]}
+}
+struct ScopedMailbox<const D:usize>{
+ owner:Identity,queue:[Option<TaggedMessage>;D],count:usize,
+}
+pub struct ScopedRouter<const M:usize,const D:usize>{
+ boxes:[Option<ScopedMailbox<D>>;M],
+}
+impl<const M:usize,const D:usize> ScopedRouter<M,D>{
+ pub fn new()->Result<Self,IpcError>{
+  if M==0||D==0||D>MAX_MAILBOX_DEPTH{
+   return Err(IpcError::InvalidConfiguration);
+  }
+  Ok(Self{boxes:core::array::from_fn(|_|None)})
+ }
+ pub fn register(&mut self,owner:Identity)->Result<(),IpcError>{
+  if owner.pid==0||owner.generation==0{return Err(IpcError::InvalidPid);}
+  if self.boxes.iter().flatten().any(|b|b.owner.pid==owner.pid){
+   return Err(IpcError::DuplicateReceiver);
+  }
+  let slot=self.boxes.iter_mut().find(|x|x.is_none())
+    .ok_or(IpcError::NoFreeMailbox)?;
+  *slot=Some(ScopedMailbox{owner,queue:[None;D],count:0});
+  Ok(())
+ }
+ /// Drop both received and not-yet-read messages sent by the exiting
+ /// process: a recycled PID must never inherit or impersonate old traffic.
+ pub fn reap(&mut self,owner:Identity)->Result<(),IpcError>{
+  let found=self.boxes.iter().any(|b|b.as_ref().is_some_and(|x|x.owner==owner));
+  if !found{return Err(IpcError::UnknownReceiver);}
+  for slot in &mut self.boxes{
+   if slot.as_ref().is_some_and(|b|b.owner==owner){*slot=None;continue;}
+   if let Some(b)=slot{
+    let mut write=0;
+    for i in 0..b.count{
+     let msg=b.queue[i];
+     if !msg.is_some_and(|m|m.sender==owner){
+      b.queue[write]=msg;write+=1;
+     }
+    }
+    for i in write..b.count{b.queue[i]=None;}
+    b.count=write;
+   }
+  }
+  Ok(())
+ }
+ pub fn send(&mut self,sender:Identity,receiver:Identity,
+  payload:&[u8])->Result<(),IpcError>{
+  if sender.pid==0||sender.generation==0||receiver.pid==0||
+     receiver.generation==0{return Err(IpcError::InvalidPid);}
+  if payload.len()>MAX_PAYLOAD{return Err(IpcError::PayloadTooLarge);}
+  if !self.boxes.iter().flatten().any(|b|b.owner==sender){
+   return Err(IpcError::UnknownSender);
+  }
+  let target=self.boxes.iter_mut().flatten().find(|b|b.owner==receiver)
+   .ok_or(IpcError::UnknownReceiver)?;
+  if target.count==D{return Err(IpcError::Full);}
+  let mut bytes=[0u8;MAX_PAYLOAD];
+  bytes[..payload.len()].copy_from_slice(payload);
+  target.queue[target.count]=Some(TaggedMessage{
+   sender,length:payload.len() as u8,bytes,
+  });
+  target.count+=1;Ok(())
+ }
+ pub fn receive(&mut self,receiver:Identity)->Result<TaggedMessage,IpcError>{
+  let b=self.boxes.iter_mut().flatten().find(|b|b.owner==receiver)
+    .ok_or(IpcError::UnknownReceiver)?;
+  if b.count==0{return Err(IpcError::Empty);}
+  let value=b.queue[0].take().ok_or(IpcError::Empty)?;
+  for i in 1..b.count{b.queue[i-1]=b.queue[i];}
+  b.count-=1;b.queue[b.count]=None;Ok(value)
+ }
+ pub fn pending(&self,receiver:Identity)->Result<usize,IpcError>{
+  self.boxes.iter().flatten().find(|b|b.owner==receiver)
+   .map(|b|b.count).ok_or(IpcError::UnknownReceiver)
+ }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,4 +298,36 @@ mod tests {
         assert_eq!(message.payload(), &[7, 8, 9]);
         assert!(message.bytes[3..].iter().all(|&byte| byte == 0));
     }
+
+ #[test]fn scoped_ipc_reaps_old_sender_and_disallows_pid_reuse(){
+  let mut router=ScopedRouter::<3,3>::new().unwrap();
+  let a=Identity{pid:2,generation:1};
+  let b=Identity{pid:3,generation:1};
+  router.register(a).unwrap();router.register(b).unwrap();
+  router.send(a,b,b"old").unwrap();
+  router.reap(a).unwrap();
+  assert_eq!(router.pending(b),Ok(0));
+  let reuse=Identity{pid:2,generation:2};
+  router.register(reuse).unwrap();
+  assert_eq!(router.send(a,b,b"spoof"),Err(IpcError::UnknownSender));
+  router.send(reuse,b,b"fresh").unwrap();
+  let m=router.receive(b).unwrap();
+  assert_eq!(m.sender(),reuse);
+  assert_eq!(m.payload(),b"fresh");
+ }
+ #[test]fn scoped_ipc_receiver_generation_and_fifo_cannot_be_bypassed(){
+  let mut router=ScopedRouter::<2,2>::new().unwrap();
+  let a=Identity{pid:2,generation:1};let b=Identity{pid:3,generation:4};
+  router.register(a).unwrap();router.register(b).unwrap();
+  router.send(a,b,b"one").unwrap();
+  router.send(a,b,b"two").unwrap();
+  assert_eq!(router.send(a,b,b"full"),Err(IpcError::Full));
+  assert_eq!(router.receive(Identity{generation:5,..b}),
+    Err(IpcError::UnknownReceiver));
+  assert_eq!(router.receive(b).unwrap().payload(),b"one");
+  assert_eq!(router.receive(b).unwrap().payload(),b"two");
+  router.reap(b).unwrap();
+  assert_eq!(router.receive(b),Err(IpcError::UnknownReceiver));
+ }
+
 }
