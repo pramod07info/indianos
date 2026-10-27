@@ -58,9 +58,27 @@ impl TcpHandshake{
 pub trait TlsCertificateVerifier{
     fn verify_chain_and_name(&self,hostname:&[u8],peer_certificate:&[u8])->bool;
 }
+/// Strict ASCII DNS hostname preflight. The verifier must independently
+/// validate the SAN, certificate chain, trust root and expiry; a well-formed
+/// string alone is never peer authentication.
+fn valid_dns_hostname(hostname:&[u8])->bool{
+    if hostname.is_empty()||hostname.len()>253{return false;}
+    let mut start=0usize;
+    for (i,&byte) in hostname.iter().enumerate(){
+        if byte==b'.'{
+            if i==start||i-start>63||hostname[start]==b'-'||
+                hostname[i-1]==b'-'{return false;}
+            start=i+1;
+        }else if !(byte.is_ascii_alphanumeric()||byte==b'-'){
+            return false;
+        }
+    }
+    let n=hostname.len()-start;
+    n>0&&n<=63&&hostname[start]!=b'-'&&hostname[hostname.len()-1]!=b'-'
+}
 pub fn tls_peer_gate<V:TlsCertificateVerifier>(verifier:&V,
     hostname:&[u8],certificate:&[u8])->Result<(),NetworkError>{
-    if hostname.is_empty()||hostname.len()>253||certificate.is_empty()||
+    if !valid_dns_hostname(hostname)||certificate.is_empty()||
         certificate.len()>16*1024{return Err(NetworkError::Malformed);}
     if !verifier.verify_chain_and_name(hostname,certificate){
         return Err(NetworkError::Unverified);
@@ -89,6 +107,24 @@ mod tests{
     struct Deny;
     impl TlsCertificateVerifier for Deny{
         fn verify_chain_and_name(&self,_:&[u8],_:&[u8])->bool{false}
+    }
+    struct AllowForTests;
+    impl TlsCertificateVerifier for AllowForTests{
+        fn verify_chain_and_name(&self,_:&[u8],_:&[u8])->bool{true}
+    }
+    #[test]fn tls_rejects_malformed_sni_before_trusting_verifier(){
+        let verifier=AllowForTests;
+        for name in [
+          b"".as_slice(),b".example.org",b"example..org",b"example.org.",
+          b"-example.org",b"example-.org",b"example.org\0.evil",
+          b"example.org/path",b"*.example.org",
+        ]{
+          assert_eq!(tls_peer_gate(&verifier,name,b"cert"),
+            Err(NetworkError::Malformed),"{name:?}");
+        }
+        assert_eq!(tls_peer_gate(&verifier,b"example.org",b"cert"),Ok(()));
+        assert_eq!(tls_peer_gate(&verifier,b"example.org",&[]),
+          Err(NetworkError::Malformed));
     }
     #[test]fn tls_fails_closed_without_verified_certificate(){
         assert_eq!(tls_peer_gate(&Deny,b"example.org",b"cert"),
