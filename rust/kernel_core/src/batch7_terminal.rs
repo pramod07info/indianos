@@ -82,6 +82,39 @@ pub fn execute<const F:usize,const G:usize>(
    .map_err(|_|Error::Denied)?;
   return publish(b"saved",out);
  }
+
+ // R005: bounded file inspection and editing commands, never a shell exec.
+ if let Some(path)=line.strip_prefix("head ").or_else(||line.strip_prefix("tail ")){
+  auth.require(caller,FILE_READ,now).map_err(|_|Error::Denied)?;
+  let mut canonical=[0u8;PATH_MAX];
+  let n=crate::vfs_path::normalize_absolute(path,&mut canonical)
+   .map_err(|_|Error::Invalid)?;
+  if n<=1{return Err(Error::Invalid);}
+  let mut source=[0u8;crate::batch7_ramfs::CONTENT_MAX];
+  let size=fs.read_all(&canonical[..n],&mut source).map_err(|_|Error::Io)?;
+  let shown=size.min(OUTPUT_MAX);
+  let from=if line.starts_with("tail "){size-shown}else{0};
+  return publish(&source[from..from+shown],out);
+ }
+ if let Some(rest)=line.strip_prefix("append "){
+  let (path,fragment)=rest.split_once(' ').ok_or(Error::Invalid)?;
+  if path.is_empty()||fragment.is_empty()||out.len()<5{
+   return Err(Error::Invalid);
+  }
+  auth.require(caller,FILE_READ|FILE_WRITE,now).map_err(|_|Error::Denied)?;
+  let mut canonical=[0u8;PATH_MAX];
+  let n=crate::vfs_path::normalize_absolute(path,&mut canonical)
+   .map_err(|_|Error::Invalid)?;
+  if n<=1{return Err(Error::Invalid);}
+  let mut data=[0u8;crate::batch7_ramfs::CONTENT_MAX];
+  let original=fs.read_all(&canonical[..n],&mut data).map_err(|_|Error::Io)?;
+  let final_len=original.checked_add(fragment.len()).ok_or(Error::Overflow)?;
+  if final_len>data.len(){return Err(Error::Overflow);}
+  data[original..final_len].copy_from_slice(fragment.as_bytes());
+  replace_verified(auth,caller,now,path,&data[..final_len],fs)
+   .map_err(|_|Error::Denied)?;
+  return publish(b"saved",out);
+ }
  Err(Error::Unsupported)
 }
 #[cfg(test)]mod tests{
@@ -118,5 +151,42 @@ pub fn execute<const F:usize,const G:usize>(
   assert_eq!(execute(&grants(),user(),1,&mut fs,b"cat ../x",&mut out),
     Err(Error::Invalid));
   assert_eq!(out,[0xaa;OUTPUT_MAX]);
+ }
+}
+
+#[cfg(test)]
+mod orbit_r005_terminal_tests{
+ use super::*;
+ fn identity()->Identity{Identity{pid:42,generation:8}}
+ fn rights()->Access<1>{
+  let mut a=Access::new();a.grant(identity(),FILE_READ|FILE_WRITE,100).unwrap();a
+ }
+ #[test]fn append_head_and_tail_operate_on_real_ram_file(){
+  let mut fs=RamFs::<1>::new();fs.replace(b"/note",b"first").unwrap();
+  let mut output=[0u8;OUTPUT_MAX];
+  assert_eq!(execute(&rights(),identity(),1,&mut fs,b"append /note second",&mut output),Ok(5));
+  assert_eq!(execute(&rights(),identity(),1,&mut fs,b"head /note",&mut output),Ok(11));
+  assert_eq!(&output[..11],b"firstsecond");
+  assert_eq!(execute(&rights(),identity(),1,&mut fs,b"tail /note",&mut output),Ok(11));
+  assert_eq!(&output[..11],b"firstsecond");
+ }
+ #[test]fn denied_or_malformed_edits_do_not_modify_data(){
+  let mut fs=RamFs::<1>::new();fs.replace(b"/note",b"safe").unwrap();
+  let mut out=[0xaau8;OUTPUT_MAX];
+  assert_eq!(execute(&rights(),Identity{generation:9,..identity()},1,
+    &mut fs,b"append /note fail",&mut out),Err(Error::Denied));
+  assert_eq!(execute(&rights(),identity(),1,
+    &mut fs,b"append /../escape fail",&mut out),Err(Error::Invalid));
+  assert_eq!(out,[0xaa;OUTPUT_MAX]);
+  let mut data=[0u8;4];fs.read(b"/note",0,&mut data).unwrap();
+  assert_eq!(&data,b"safe");
+ }
+ #[test]fn missing_file_and_expired_grants_block_inspection(){
+  let mut fs=RamFs::<1>::new();let mut out=[0u8;OUTPUT_MAX];
+  assert_eq!(execute(&rights(),identity(),1,&mut fs,b"head /missing",&mut out),
+    Err(Error::Io));
+  fs.replace(b"/note",b"hello").unwrap();
+  assert_eq!(execute(&rights(),identity(),100,&mut fs,b"tail /note",&mut out),
+    Err(Error::Denied));
  }
 }
