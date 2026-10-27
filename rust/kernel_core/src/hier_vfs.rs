@@ -152,6 +152,22 @@ impl<D:BlockDevice> HierVfs<D>{
   let count=self.fs.read_path(from.name(),&mut data)?;
   self.fs.create_path(to.name(),&data[..count])
  }
+ /// Update an existing destination atomically with the verified full
+ /// source file, preserving the previous destination metadata on torn writes.
+ /// Cannot cross the current fixed-bank volume's per-file size limit.
+ pub fn copy_replace(&mut self,source:&str,destination:&str)->Result<(),FsError>{
+  let from=checked(source,Kind::File)?;
+  let to=checked(destination,Kind::File)?;
+  if from.path()==to.path(){return Err(FsError::Exists);}
+  self.parents(&from)?;self.parents(&to)?;
+  if self.conflicting(to.path(),Kind::File)?{return Err(FsError::Exists);}
+  // Validate both existing files completely before any write transaction.
+  let mut buffer=[0u8;MAX_FILE_BYTES];
+  let count=self.fs.read_path(from.name(),&mut buffer)?;
+  let mut prior=[0u8;MAX_FILE_BYTES];
+  self.fs.read_path(to.name(),&mut prior)?;
+  self.fs.overwrite_path(to.name(),&buffer[..count])
+ }
  pub fn unlink(&mut self,path:&str)->Result<(),FsError>{
   let p=checked(path,Kind::File)?;
   self.parents(&p)?;
@@ -487,6 +503,28 @@ mod tests{
   let mut output=[0u8;16];
   assert_eq!(fs.read("/original",&mut output),Ok(6));
   assert_eq!(&output[..6],b"stable");
+ }
+
+
+ #[test]fn full_file_replace_survives_reboot_without_truncating_source(){
+  let mut fs=fresh();fs.create("/dst",b"old").unwrap();
+  let mut payload=[0u8;600];
+  for (i,p) in payload.iter_mut().enumerate(){*p=(i%200) as u8;}
+  fs.create("/src",&payload).unwrap();
+  fs.copy_replace("/src","/dst").unwrap();
+  let mut fs=HierVfs::mount(fs.into_device()).unwrap();
+  let mut output=[0u8;600];
+  assert_eq!(fs.read("/dst",&mut output),Ok(600));
+  assert_eq!(output,payload);
+  assert_eq!(fs.read("/src",&mut output),Ok(600));
+  assert_eq!(output,payload);
+ }
+ #[test]fn absent_copy_replacement_does_not_create_file_or_mutate_generation(){
+  let mut fs=fresh();fs.create("/src",b"data").unwrap();
+  let before=fs.generation();
+  assert_eq!(fs.copy_replace("/src","/missing"),Err(FsError::NotFound));
+  assert_eq!(fs.copy_replace("/src","/src"),Err(FsError::Exists));
+  assert_eq!(fs.generation(),before);
  }
 
 }
