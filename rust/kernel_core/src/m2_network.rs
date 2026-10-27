@@ -87,10 +87,10 @@ pub fn parse_dns_a(id:u16,domain:&[u8],wire:&[u8])->Result<[u8;4],Error>{
 /// An authenticated ingress layer must verify source/destination address,
 /// ports, checksums and ACK plausibility BEFORE passing an ACK here.
 pub const MAX_TCP_RETRIES:u8=3;
-#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+#[derive(Debug,PartialEq,Eq)]
 pub struct TcpFlight{
  owner:Identity,local_port:u16,expected_ack:u32,
- retry_deadline:u64,timeout:u64,retries:u8,acknowledged:bool,
+ retry_deadline:u64,timeout:u64,retries:u8,acknowledged:bool,failed:bool,
 }
 impl TcpFlight{
  pub fn retries(&self)->u8{self.retries}
@@ -106,7 +106,7 @@ impl<const P:usize> Endpoint<P>{
   let ack=sequence.checked_add(payload_bytes as u32).ok_or(Error::Invalid)?;
   let deadline=now.checked_add(timeout).ok_or(Error::Invalid)?;
   Ok(TcpFlight{owner,local_port,expected_ack:ack,retry_deadline:deadline,
-    timeout,retries:0,acknowledged:false})
+    timeout,retries:0,acknowledged:false,failed:false})
  }
  /// 'verified_ack' MUST come from a trusted, parsed and peer-authenticated
  /// transport ingress, never directly from untrusted user parameters.
@@ -114,7 +114,7 @@ impl<const P:usize> Endpoint<P>{
   flight:&mut TcpFlight,verified_ack:u32)->Result<(),Error>{
   self.ports.require(owner,local_port,now).map_err(|_|Error::Denied)?;
   if flight.owner!=owner||flight.local_port!=local_port||
-     flight.acknowledged||verified_ack!=flight.expected_ack{
+     flight.acknowledged||flight.failed||verified_ack!=flight.expected_ack{
    return Err(Error::Denied);
   }
   flight.acknowledged=true;
@@ -126,8 +126,12 @@ impl<const P:usize> Endpoint<P>{
   now:u64,flight:&mut TcpFlight)->Result<bool,Error>{
   self.ports.require(owner,local_port,now).map_err(|_|Error::Denied)?;
   if flight.owner!=owner||flight.local_port!=local_port{return Err(Error::Denied);}
+  if flight.failed{return Err(Error::RetryExhausted);}
   if flight.acknowledged||now<flight.retry_deadline{return Ok(false);}
-  if flight.retries==MAX_TCP_RETRIES{return Err(Error::RetryExhausted);}
+  if flight.retries==MAX_TCP_RETRIES{
+   flight.failed=true;
+   return Err(Error::RetryExhausted);
+  }
   let deadline=now.checked_add(flight.timeout).ok_or(Error::Invalid)?;
   flight.retries+=1;flight.retry_deadline=deadline;
   Ok(true)
@@ -181,9 +185,11 @@ mod m2_tests{
   }
   assert_eq!(sock.retry_tcp_segment(owner,6040,21,&mut flight),
     Err(Error::RetryExhausted));
-  assert_eq!(sock.accept_tcp_ack(owner,6040,21,&mut flight,108),Ok(()));
-  assert!(flight.complete());
-  assert_eq!(sock.retry_tcp_segment(owner,6040,22,&mut flight),Ok(false));
+  assert_eq!(sock.accept_tcp_ack(owner,6040,21,&mut flight,108),Err(Error::Denied));
+  let mut received=sock.track_tcp_segment(owner,6040,22,200,4,5).unwrap();
+  assert_eq!(sock.accept_tcp_ack(owner,6040,23,&mut received,204),Ok(()));
+  assert!(received.complete());
+  assert_eq!(sock.retry_tcp_segment(owner,6040,28,&mut received),Ok(false));
  }
  #[test]fn m2_tcp_rejects_invalid_range_and_expired_socket(){
   let owner=Identity{pid:7,generation:2};
