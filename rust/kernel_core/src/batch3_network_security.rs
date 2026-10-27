@@ -102,6 +102,21 @@ pub fn tls13_peer_preflight<V:TlsCertificateVerifier>(
  }
  tls_peer_gate(verifier,hostname,certificate)
 }
+/// Application-bound TLS policy: reject a peer that negotiated a
+/// different application protocol even when its certificate is trusted.
+/// The trusted TLS engine must supply *authenticated* negotiated ALPN
+/// from its handshake transcript, not untrusted network packet bytes.
+pub fn tls13_expected_alpn<V:TlsCertificateVerifier>(
+ verifier:&V,hostname:&[u8],certificate:&[u8],
+ negotiated_version:u16,negotiated_alpn:&[u8],expected_alpn:&[u8]
+)->Result<(),NetworkError>{
+ if expected_alpn.is_empty()||expected_alpn.len()>32||
+    expected_alpn!=negotiated_alpn{
+  return Err(NetworkError::Unverified);
+ }
+ tls13_peer_preflight(verifier,hostname,certificate,
+  negotiated_version,negotiated_alpn)
+}
 #[cfg(test)]
 mod tests{
     use super::*;
@@ -128,6 +143,19 @@ mod tests{
     struct AllowForTests;
     impl TlsCertificateVerifier for AllowForTests{
         fn verify_chain_and_name(&self,_:&[u8],_:&[u8])->bool{true}
+    }
+    #[test]fn tls13_application_protocol_is_bound_to_authenticated_peer(){
+        let v=AllowForTests;
+        assert_eq!(tls13_expected_alpn(&v,b"example.org",b"cert",
+          0x0304,b"h2",b"h2"),Ok(()));
+        assert_eq!(tls13_expected_alpn(&v,b"example.org",b"cert",
+          0x0304,b"http/1.1",b"h2"),Err(NetworkError::Unverified));
+        assert_eq!(tls13_expected_alpn(&v,b"example.org",b"cert",
+          0x0304,b"h2",b""),Err(NetworkError::Unverified));
+        assert_eq!(tls13_expected_alpn(&v,b"example.org",b"cert",
+          0x0303,b"h2",b"h2"),Err(NetworkError::Unverified));
+        assert_eq!(tls13_expected_alpn(&Deny,b"example.org",b"cert",
+          0x0304,b"h2",b"h2"),Err(NetworkError::Unverified));
     }
     #[test]fn tls_rejects_malformed_sni_before_trusting_verifier(){
         let verifier=AllowForTests;
