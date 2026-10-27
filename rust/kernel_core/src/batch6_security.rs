@@ -32,6 +32,25 @@ impl<const N:usize> Access<N>{
   if g.rights&needed!=needed{return Err(Error::Denied);}
   Ok(())
  }
+ /// Reduce an existing grant's capabilities and lifetime without
+ /// extending authority. Exact scheduler-provided PID generation required.
+ /// Invalid attempts leave the original grant byte-for-byte unchanged.
+ pub fn attenuate(&mut self,owner:Identity,now:u64,
+   rights:u32,expires:u64)->Result<(),Error>{
+  if owner.pid==0||owner.generation==0||rights==0||
+     rights&!ALL!=0||expires<=now{return Err(Error::Invalid);}
+  let slot=self.grants.iter_mut().find(|slot|
+     slot.is_some_and(|g|g.owner.pid==owner.pid))
+     .ok_or(Error::NotFound)?;
+  let grant=slot.as_mut().ok_or(Error::NotFound)?;
+  if grant.owner!=owner||grant.revoked{return Err(Error::Denied);}
+  if now>=grant.expires{return Err(Error::Expired);}
+  if rights&grant.rights!=rights||expires>grant.expires{
+   return Err(Error::Denied);
+  }
+  grant.rights=rights;grant.expires=expires;
+  Ok(())
+ }
  pub fn revoke(&mut self,owner:Identity)->Result<(),Error>{
   let slot=self.grants.iter_mut().find(|s|s.is_some_and(|g|g.owner==owner))
    .ok_or(Error::NotFound)?;
@@ -49,4 +68,31 @@ impl<const N:usize> Access<N>{
   assert_eq!(c.require(Identity{pid:1,generation:6},VIEW,0),Err(Error::Denied));
   c.revoke(a).unwrap();assert_eq!(c.require(a,VIEW,0),Err(Error::NotFound));
  }
+
+ #[test]fn attenuation_can_only_reduce_process_capabilities_and_deadline(){
+  let owner=Identity{pid:4,generation:1};
+  let mut grants=Access::<1>::new();
+  grants.grant(owner,VIEW|FILE_READ|FILE_WRITE,100).unwrap();
+  assert_eq!(grants.attenuate(owner,10,VIEW|FILE_READ,90),Ok(()));
+  assert_eq!(grants.require(owner,FILE_READ,12),Ok(()));
+  assert_eq!(grants.require(owner,FILE_WRITE,12),Err(Error::Denied));
+  assert_eq!(grants.attenuate(owner,20,VIEW|FILE_WRITE,80),Err(Error::Denied));
+  assert_eq!(grants.attenuate(owner,20,VIEW,120),Err(Error::Denied));
+  assert_eq!(grants.require(owner,FILE_READ,80),Ok(()));
+  assert_eq!(grants.attenuate(owner,20,VIEW,35),Ok(()));
+  assert_eq!(grants.require(owner,VIEW,35),Err(Error::Expired));
+ }
+ #[test]fn expired_recycled_and_invalid_attenuation_cannot_regrant_rights(){
+  let owner=Identity{pid:9,generation:3};
+  let mut grants=Access::<1>::new();
+  grants.grant(owner,VIEW|SOCKET,50).unwrap();
+  assert_eq!(grants.attenuate(Identity{generation:4,..owner},3,VIEW,30),
+    Err(Error::Denied));
+  assert_eq!(grants.attenuate(owner,3,0,30),Err(Error::Invalid));
+  assert_eq!(grants.attenuate(owner,3,VIEW,3),Err(Error::Invalid));
+  assert_eq!(grants.require(owner,SOCKET,4),Ok(()));
+  assert_eq!(grants.attenuate(owner,50,VIEW,60),Err(Error::Expired));
+  assert_eq!(grants.require(owner,SOCKET,50),Err(Error::Expired));
+ }
+
 }
