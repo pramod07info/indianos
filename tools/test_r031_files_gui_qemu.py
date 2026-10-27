@@ -105,6 +105,16 @@ def main():
         for index in range(2):
             boot(a.qemu,a.iso.resolve(),a.ovmf.resolve(),disk,folder,index)
             guard(disk)
+        # Optional visual evidence for real QEMU session, never a mock/render.
+        # The normal test remains unchanged unless the capture env is set.
+        import os
+        import shutil
+        target = os.environ.get("R031_GUI_SCREENSHOT_DIR")
+        if target:
+            output = Path(target)
+            output.mkdir(parents=True, exist_ok=True)
+            for frame in sorted(folder.glob("*.ppm")):
+                shutil.copyfile(frame, output / frame.name)
     print("R031.9 PASS: real GUI file content, IPC refresh, persistent reboot, "
           "strict PID2 directory policy, isolated graphics and bounded disk")
 if __name__=="__main__":main()
