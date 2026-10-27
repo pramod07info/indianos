@@ -51,6 +51,65 @@ impl<const N:usize> Access<N>{
   grant.rights=rights;grant.expires=expires;
   Ok(())
  }
+ /// Stage a complete set of least-privilege grants atomically. Required
+ /// caller approvals and signer verification must occur outside this table.
+ pub fn grant_batch(&mut self,requests:&[(Identity,u32,u64)])
+  ->Result<usize,Error>{
+  if requests.is_empty()||requests.len()>N{return Err(Error::Full);}
+  let mut staged=Self{grants:self.grants};
+  for &(owner,rights,deadline) in requests{
+   staged.grant(owner,rights,deadline)?;
+  }
+  self.grants=staged.grants;Ok(requests.len())
+ }
+ /// Apply multiple restricted scopes in one transaction, disallowing
+ /// expired calls, cross-incarnation PID reuse and right escalations.
+ pub fn attenuate_batch(&mut self,now:u64,
+  changes:&[(Identity,u32,u64)])->Result<usize,Error>{
+  if changes.is_empty()||changes.len()>N{return Err(Error::Invalid);}
+  let mut staged=Self{grants:self.grants};
+  for &(owner,rights,deadline) in changes{
+   staged.attenuate(owner,now,rights,deadline)?;
+  }
+  self.grants=staged.grants;Ok(changes.len())
+ }
+ /// Remove all expired temporary permissions with a deterministic
+ /// deadline. This does not renew anything or synthesize implicit grants.
+ pub fn reap_expired(&mut self,now:u64)->usize{
+  let mut count=0;
+  for entry in &mut self.grants{
+   if entry.is_some_and(|g|now>=g.expires){
+    *entry=None;count+=1;
+   }
+  }
+  count
+ }
+ /// Read-only preflight for an exact scheduler identity. Returning rights
+ /// does not grant the caller any new privilege.
+ pub fn active_rights(&self,owner:Identity,now:u64)->Result<u32,Error>{
+  self.require(owner,VIEW,now).or_else(|_|{
+   // VIEW is not mandatory for a minimal socket-only app, but its
+   // exact identity and expiry still must be checked.
+   let entry=self.grants.iter().flatten().find(|x|x.owner.pid==owner.pid)
+    .ok_or(Error::NotFound)?;
+   if entry.owner!=owner||entry.revoked{return Err(Error::Denied);}
+   if now>=entry.expires{return Err(Error::Expired);}
+   Ok(())
+  })?;
+  let entry=self.grants.iter().flatten().find(|x|x.owner==owner)
+   .ok_or(Error::NotFound)?;
+  Ok(entry.rights)
+ }
+ /// Revocation of multiple exact process incarnations is all-or-nothing.
+ pub fn revoke_batch(&mut self,owners:&[Identity])->Result<usize,Error>{
+  if owners.is_empty()||owners.len()>N{return Err(Error::Invalid);}
+  let mut staged=Self{grants:self.grants};
+  for (i,&owner) in owners.iter().enumerate(){
+   if owners[..i].contains(&owner){return Err(Error::Duplicate);}
+   staged.revoke(owner)?;
+  }
+  self.grants=staged.grants;Ok(owners.len())
+ }
  pub fn revoke(&mut self,owner:Identity)->Result<(),Error>{
   let slot=self.grants.iter_mut().find(|s|s.is_some_and(|g|g.owner==owner))
    .ok_or(Error::NotFound)?;
@@ -93,6 +152,33 @@ impl<const N:usize> Access<N>{
   assert_eq!(grants.require(owner,SOCKET,4),Ok(()));
   assert_eq!(grants.attenuate(owner,50,VIEW,60),Err(Error::Expired));
   assert_eq!(grants.require(owner,SOCKET,50),Err(Error::Expired));
+ }
+
+ #[test]fn orbit_permissions_batch_grants_and_revocations_are_atomic(){
+  let a=Identity{pid:1,generation:1};let b=Identity{pid:2,generation:1};
+  let mut c=Access::<2>::new();
+  assert_eq!(c.grant_batch(&[(a,VIEW,50),(a,FILE_READ,50)]),
+             Err(Error::Duplicate));
+  assert_eq!(c.require(a,VIEW,1),Err(Error::NotFound));
+  assert_eq!(c.grant_batch(&[(a,VIEW|FILE_READ,50),(b,SOCKET,60)]),Ok(2));
+  assert_eq!(c.active_rights(b,1),Ok(SOCKET));
+  assert_eq!(c.revoke_batch(&[a,a]),Err(Error::Duplicate));
+  assert_eq!(c.require(a,VIEW,1),Ok(()));
+  assert_eq!(c.revoke_batch(&[a,b]),Ok(2));
+  assert_eq!(c.require(b,SOCKET,1),Err(Error::NotFound));
+ }
+ #[test]fn orbit_permissions_bulk_attenuation_never_escalates(){
+  let a=Identity{pid:1,generation:1};let b=Identity{pid:2,generation:1};
+  let mut c=Access::<2>::new();
+  c.grant_batch(&[(a,VIEW|FILE_READ,80),(b,SOCKET,70)]).unwrap();
+  assert_eq!(c.attenuate_batch(2,&[(a,VIEW,60),(b,DRIVER,60)]),
+             Err(Error::Denied));
+  assert_eq!(c.require(a,FILE_READ,4),Ok(()));
+  assert_eq!(c.attenuate_batch(2,&[(a,VIEW,60),(b,SOCKET,55)]),Ok(2));
+  assert_eq!(c.require(a,FILE_READ,4),Err(Error::Denied));
+  assert_eq!(c.active_rights(b,56),Err(Error::Expired));
+  assert_eq!(c.reap_expired(60),2);
+  assert_eq!(c.require(a,VIEW,60),Err(Error::NotFound));
  }
 
 }
