@@ -274,6 +274,12 @@ impl<D:BlockDevice> DurableFs<D>{
         let inactive=1-self.active;
         let bytes=encode(&proposed,self.disk.sector_count());
         self.disk.write_sector(inactive,&bytes)?;
+        // Verify the readback BEFORE publishing the new in-memory head.
+        // A block device that acknowledges but discards a metadata write
+        // must never be treated as a committed filesystem transaction.
+        let mut observed=[0u8;SECTOR_BYTES];
+        self.disk.read_sector(inactive,&mut observed)?;
+        if observed!=bytes{return Err(FsError::InvalidVolume);}
         self.previous=Some(self.meta);
         self.meta=proposed;
         self.active=inactive;
@@ -287,7 +293,13 @@ impl<D:BlockDevice> DurableFs<D>{
                 let end=(start+SECTOR_BYTES).min(data.len());
                 sector[..end-start].copy_from_slice(&data[start..end]);
             }
-            self.disk.write_sector(block_start(slot,bank)+i as u64,&sector)?;
+            let lba=block_start(slot,bank)+i as u64;
+            self.disk.write_sector(lba,&sector)?;
+            // Detect devices that report successful writes but return stale
+            // or corrupted data before making a new checksum head visible.
+            let mut observed=[0u8;SECTOR_BYTES];
+            self.disk.read_sector(lba,&mut observed)?;
+            if observed!=sector{return Err(FsError::InvalidVolume);}
         }
         Ok(())
     }
@@ -387,6 +399,7 @@ mod tests{
     struct Disk{
         sectors:[[u8;SECTOR_BYTES];MIN_SECTORS as usize],
         fail_at:Option<usize>,
+        ignore_at:Option<usize>,
         writes:usize
     }
     impl BlockDevice for Disk{
@@ -404,13 +417,17 @@ mod tests{
                 sector[0]=0x7f;
                 return Err(BlockError::Io);
             }
+            if self.ignore_at==Some(self.writes){
+                self.writes+=1; // Lying storage acknowledges a dropped write
+                return Ok(());
+            }
             *sector=*data;
             self.writes+=1;
             Ok(())
         }
     }
     fn blank()->Disk{
-        Disk{sectors:[[0;SECTOR_BYTES];MIN_SECTORS as usize],fail_at:None,writes:0}
+        Disk{sectors:[[0;SECTOR_BYTES];MIN_SECTORS as usize],fail_at:None,ignore_at:None,writes:0}
     }
     fn get(fs:&mut DurableFs<Disk>,path:&str)->Vec<u8>{
         let mut out=[0u8;MAX_FILE_BYTES];
@@ -466,6 +483,22 @@ mod tests{
             disk.fail_at=None;
             let mut mounted=DurableFs::mount(disk).unwrap();
             assert_eq!(get(&mut mounted,"/data"),[0x55;900]);
+        }
+    }
+    #[test]
+    fn lying_storage_data_or_metadata_ack_cannot_commit_invalid_generation(){
+        for dropped in [0usize,4usize]{
+            let mut fs=DurableFs::format_blank(blank()).unwrap();
+            fs.create_path("/data",b"previous committed").unwrap();
+            let mut disk=fs.into_device();
+            disk.ignore_at=Some(disk.writes+dropped);
+            let mut fs=DurableFs::mount(disk).unwrap();
+            assert_eq!(fs.overwrite_path("/data",b"new uncommitted"),
+                Err(FsError::InvalidVolume));
+            let mut disk=fs.into_device();
+            disk.ignore_at=None;
+            let mut remount=DurableFs::mount(disk).unwrap();
+            assert_eq!(get(&mut remount,"/data"),b"previous committed");
         }
     }
     #[test]
