@@ -245,6 +245,17 @@ impl<const P:usize> Endpoint<P>{
 }
 
 /// Internet one's-complement checksum, including odd trailing bytes.
+impl<const P:usize> Endpoint<P>{
+ /// Complete a connection only after parsing and checksumming the actual
+ /// IPv4/TCP SYN|ACK bytes. Peer address and port, leased local port,
+ /// authenticated process generation and expected TCP ACK must all match.
+ pub fn accept_verified_syn_ack(&self,actor:Identity,local_port:u16,
+   peer:TcpPeer,local_ip:[u8;4],now:u64,
+   connection:&mut TcpHandshake,wire:&[u8])->Result<(),Error>{
+  let (remote_seq,acked)=parse_ipv4_syn_ack(wire,peer,local_ip,local_port)?;
+  self.accept_tcp_syn_ack(actor,local_port,peer,now,connection,remote_seq,acked)
+ }
+}
 fn internet_sum(data:&[u8])->u32{
  let mut sum=0u32;
  for pair in data.chunks(2){
@@ -499,6 +510,37 @@ mod m2_tests{
   let mut bad=p;bad[33]=0x10;
   assert_eq!(parse_ipv4_syn_ack(&bad,peer,[192,0,2,20],51000),
     Err(Error::Malformed));
+ }
+
+
+ #[test]fn verified_tcp_packet_must_match_handshake_sequence_owner_and_port(){
+  let actor=Identity{pid:8,generation:4};
+  let mut rights=Access::<1>::new();rights.grant(actor,SOCKET,100).unwrap();
+  let mut ep=Endpoint::<1>::new();
+  ep.acquire(&rights,actor,51000,1,90).unwrap();
+  let peer=TcpPeer{address:[192,0,2,10],port:443};
+  let mut conn=ep.begin_tcp_connect(actor,51000,peer,1,400,5).unwrap();
+  let wire=tcp_handshake_packet();
+  assert_eq!(ep.accept_verified_syn_ack(actor,51000,peer,[192,0,2,20],
+     2,&mut conn,&wire),Ok(()));
+  assert_eq!(conn.state(),TcpState::Established);
+  assert_eq!(conn.next_remote_sequence(),901);
+ }
+ #[test]fn stale_identity_and_checksum_corruption_cannot_open_connection(){
+  let actor=Identity{pid:8,generation:4};
+  let mut rights=Access::<1>::new();rights.grant(actor,SOCKET,100).unwrap();
+  let mut ep=Endpoint::<1>::new();
+  ep.acquire(&rights,actor,51000,1,90).unwrap();
+  let peer=TcpPeer{address:[192,0,2,10],port:443};
+  let mut conn=ep.begin_tcp_connect(actor,51000,peer,1,400,5).unwrap();
+  let mut wire=tcp_handshake_packet();wire[33]^=1;
+  assert_eq!(ep.accept_verified_syn_ack(actor,51000,peer,
+     [192,0,2,20],2,&mut conn,&wire),Err(Error::Malformed));
+  assert_eq!(conn.state(),TcpState::SynSent);
+  assert_eq!(ep.accept_verified_syn_ack(Identity{generation:5,..actor},
+     51000,peer,[192,0,2,20],2,&mut conn,&tcp_handshake_packet()),
+     Err(Error::Denied));
+  assert_eq!(conn.state(),TcpState::SynSent);
  }
 
 }
