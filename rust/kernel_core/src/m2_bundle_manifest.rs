@@ -22,7 +22,7 @@ pub struct BundleManifest{
 }
 pub struct SignedBundle{pub manifest:BundleManifest,pub signature:[u8;64]}
 #[derive(Debug,PartialEq,Eq)]
-pub enum Error{Invalid,Unauthorized,StaleInstall,Signature(batch4_signature::Error),
+pub enum Error{Invalid,Unauthorized,StaleInstall,RollbackDenied,Signature(batch4_signature::Error),
  Storage(StorageError)}
 impl BundleManifest{
  pub fn canonical(&self)->[u8;TRANSCRIPT_BYTES]{
@@ -145,6 +145,16 @@ pub fn stage_consented_cas<D:BlockDevice,R:BundleSource,V:Verify,
  auth.require(installer,crate::batch6_security::INSTALL,now)
    .map_err(|_|Error::Unauthorized)?;
  if store.active()!=expected{return Err(Error::StaleInstall);}
+ // A signed old package is still a rollback. The same partition may not
+ // be silently reassigned to a different app, even with a valid signature.
+ // This is a local version floor, NOT a secure monotonic counter: recovery
+ // from a fully rolled-back physical disk still needs a trusted counter.
+ if let Some(installed)=expected{
+  if installed.id!=package.manifest.app{return Err(Error::StaleInstall);}
+  if package.manifest.version<=installed.version{
+   return Err(Error::RollbackDenied);
+  }
+ }
  stage_consented(store,package,auth,installer,app_process,consent,
   now,roots,verifier,source)
 }
@@ -336,6 +346,19 @@ mod m2_tests{
   assert_eq!(stage_consented_cas(&mut store,None,&signed,&auth(),
     admin(),process,&ledger,2,&roots,&verifier,&mut Slice(&bytes)),
     Err(Error::StaleInstall));
+  // Valid publisher signature and still-live consent cannot authorize
+  // reinstallation of the same version over the committed package.
+  assert_eq!(stage_consented_cas(&mut store,Some(installed),&signed,&auth(),
+    admin(),process,&ledger,2,&roots,&verifier,&mut Slice(&bytes)),
+    Err(Error::RollbackDenied));
+  let mut replacement=SignedBundle{
+    manifest:signed.manifest,signature:signed.signature
+  };
+  replacement.manifest.app=10;
+  assert_eq!(stage_consented_cas(&mut store,Some(installed),&replacement,
+    &auth(),admin(),process,&ledger,2,&roots,&verifier,&mut Slice(&bytes)),
+    Err(Error::StaleInstall));
+  assert_eq!(store.active(),Some(installed));
   let disk=store.into_device();assert!(disk.writes>0);
   let remounted=BlobStore::mount(disk).unwrap();
   assert_eq!(remounted.active(),Some(installed));
