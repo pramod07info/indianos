@@ -214,3 +214,124 @@ mod orbit_r005_file_maintenance_tests{
   assert_eq!(fs.version(),0);
  }
 }
+
+
+/// R006: deterministic, versioned export/import for an authorized storage
+/// service. The caller must persist the exported bytes via a checksummed,
+/// power-loss-safe block backend. This RAM-only implementation does NOT
+/// establish reboot durability by itself.
+pub const SNAPSHOT_HEADER:usize=14;
+fn snapshot_checksum(bytes:&[u8])->u32{
+ let mut h=0x811c9dc5u32;
+ for &byte in bytes{h=(h^(byte as u32)).wrapping_mul(0x0100_0193);}
+ h
+}
+impl<const N:usize> RamFs<N>{
+ /// Encode an entire consistent RAM generation; a short caller buffer
+ /// remains untouched, rather than receiving half a filesystem.
+ pub fn export_snapshot(&self,out:&mut[u8])->Result<usize,Error>{
+  if self.count()>u16::MAX as usize{return Err(Error::Invalid);}
+  let mut required=SNAPSHOT_HEADER+4;
+  for file in self.files.iter().flatten(){
+   required=required.checked_add(1+2+8)
+    .and_then(|n|n.checked_add(file.path_len))
+    .and_then(|n|n.checked_add(file.data_len))
+    .ok_or(Error::Exhausted)?;
+  }
+  if out.len()<required{return Err(Error::OutputTooSmall);}
+  out[..4].copy_from_slice(b"IRFS");
+  out[4..12].copy_from_slice(&self.version.to_le_bytes());
+  out[12..14].copy_from_slice(&(self.count() as u16).to_le_bytes());
+  let mut p=SNAPSHOT_HEADER;
+  for file in self.files.iter().flatten(){
+   out[p]=file.path_len as u8;p+=1;
+   out[p..p+2].copy_from_slice(&(file.data_len as u16).to_le_bytes());p+=2;
+   out[p..p+8].copy_from_slice(&file.version.to_le_bytes());p+=8;
+   out[p..p+file.path_len].copy_from_slice(&file.path[..file.path_len]);
+   p+=file.path_len;
+   out[p..p+file.data_len].copy_from_slice(&file.data[..file.data_len]);
+   p+=file.data_len;
+  }
+  let checksum=snapshot_checksum(&out[..p]);
+  out[p..p+4].copy_from_slice(&checksum.to_le_bytes());
+  Ok(required)
+ }
+ /// Validate the complete untrusted snapshot and publish only after
+ /// checksum, path, generation, count and duplicate checks all pass.
+ pub fn import_snapshot(&mut self,input:&[u8])->Result<(),Error>{
+  if input.len()<SNAPSHOT_HEADER+4||&input[..4]!=b"IRFS"{
+   return Err(Error::Invalid);
+  }
+  let data_len=input.len()-4;
+  let got=u32::from_le_bytes(input[data_len..].try_into()
+   .map_err(|_|Error::Invalid)?);
+  if snapshot_checksum(&input[..data_len])!=got{return Err(Error::Invalid);}
+  let generation=u64::from_le_bytes(input[4..12].try_into()
+   .map_err(|_|Error::Invalid)?);
+  let count=u16::from_le_bytes(input[12..14].try_into()
+   .map_err(|_|Error::Invalid)?) as usize;
+  if count>N||(count!=0&&generation==0){return Err(Error::Invalid);}
+  let mut staged=Self::new();let mut p=SNAPSHOT_HEADER;
+  for index in 0..count{
+   if p.checked_add(11).is_none_or(|end|end>data_len){return Err(Error::Invalid);}
+   let path_len=input[p] as usize;p+=1;
+   let content_len=u16::from_le_bytes([input[p],input[p+1]]) as usize;p+=2;
+   let version=u64::from_le_bytes(input[p..p+8].try_into()
+    .map_err(|_|Error::Invalid)?);p+=8;
+   let end=p.checked_add(path_len).and_then(|n|n.checked_add(content_len))
+    .ok_or(Error::Invalid)?;
+   if end>data_len||path_len>PATH_MAX||content_len>CONTENT_MAX||
+      version==0||version>generation{return Err(Error::Invalid);}
+   let path=&input[p..p+path_len];p+=path_len;
+   if !Self::valid_path(path)||staged.lookup(path).is_some(){
+    return Err(Error::Invalid);
+   }
+   let mut item=File{path:[0;PATH_MAX],path_len,
+    data:[0;CONTENT_MAX],data_len:content_len,version};
+   item.path[..path_len].copy_from_slice(path);
+   item.data[..content_len].copy_from_slice(&input[p..p+content_len]);
+   p+=content_len;staged.files[index]=Some(item);
+  }
+  if p!=data_len{return Err(Error::Invalid);}
+  staged.version=generation;
+  *self=staged;Ok(())
+ }
+}
+#[cfg(test)]
+mod r006_snapshot_tests{
+ use super::*;
+ #[test]fn snapshot_restores_entire_directory_and_versions(){
+  let mut fs=RamFs::<3>::new();
+  fs.replace(b"/notes/one",b"first").unwrap();
+  let v=fs.replace(b"/notes/two",b"second").unwrap();
+  fs.delete_if_version(b"/notes/one",1).unwrap();
+  let mut bytes=[0xccu8;512];let n=fs.export_snapshot(&mut bytes).unwrap();
+  let mut restored=RamFs::<3>::new();
+  restored.import_snapshot(&bytes[..n]).unwrap();
+  assert_eq!(restored.count(),1);
+  assert_eq!(restored.metadata(b"/notes/two"),Ok((v,6)));
+  assert_eq!(restored.version(),3);
+  let mut out=[0u8;6];
+  assert_eq!(restored.read(b"/notes/two",0,&mut out),Ok(6));
+  assert_eq!(&out,b"second");
+ }
+ #[test]fn tampering_and_truncation_cannot_clobber_existing_files(){
+  let mut fs=RamFs::<2>::new();fs.replace(b"/safe",b"original").unwrap();
+  let mut raw=[0u8;128];let n=fs.export_snapshot(&mut raw).unwrap();
+  raw[19]^=1;
+  assert_eq!(fs.import_snapshot(&raw[..n]),Err(Error::Invalid));
+  raw[19]^=1;
+  assert_eq!(fs.import_snapshot(&raw[..n-1]),Err(Error::Invalid));
+  let mut out=[0u8;8];fs.read(b"/safe",0,&mut out).unwrap();
+  assert_eq!(&out,b"original");
+ }
+ #[test]fn short_encode_is_atomic_and_empty_snapshot_roundtrips(){
+  let mut fs=RamFs::<1>::new();fs.replace(b"/a",b"hello").unwrap();
+  let mut out=[0xaau8;12];
+  assert_eq!(fs.export_snapshot(&mut out),Err(Error::OutputTooSmall));
+  assert_eq!(out,[0xaa;12]);
+  let empty=RamFs::<1>::new();let mut image=[0u8;18];
+  assert_eq!(empty.export_snapshot(&mut image),Ok(18));
+  fs.import_snapshot(&image).unwrap();assert_eq!(fs.count(),0);
+ }
+}

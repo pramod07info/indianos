@@ -215,3 +215,109 @@ impl<const N:usize> Surfaces<N>{
  }
 
 }
+
+/// R006 compositor transition: atomic frame batches, full-window redraw,
+/// scoped cancellation and backpressure introspection. These act on the
+/// existing authenticated mailbox, not arbitrary framebuffer pointers.
+impl<const N:usize> Surfaces<N>{
+ pub fn submit_batch<const W:usize>(&mut self,windows:&Windows<W>,
+  caller:Identity,updates:&[(u32,Rect)])->Result<usize,Error>{
+  if updates.is_empty()||updates.len()>N{return Err(Error::Invalid);}
+  let mut staged=Self{messages:self.messages,count:self.count,next:self.next};
+  for &(window,rect) in updates{staged.submit(windows,caller,window,rect)?;}
+  *self=staged;Ok(updates.len())
+ }
+ pub fn redraw_window<const W:usize>(&mut self,windows:&Windows<W>,
+  caller:Identity,window:u32)->Result<u64,Error>{
+  if !windows.owns(caller.pid,caller.generation,window){
+   return Err(Error::NotOwner);
+  }
+  let geometry=windows.get(window).ok_or(Error::NotOwner)?.rect;
+  self.submit_coalesced(windows,caller,window,Rect{
+   x:0,y:0,w:geometry.w,h:geometry.h,
+  })
+ }
+ pub fn pending_owner(&self,caller:Identity)->usize{
+  if caller.pid==0||caller.generation==0{return 0;}
+  self.messages[..self.count].iter().flatten()
+   .filter(|m|m.owner==caller).count()
+ }
+ /// Cancel stale frame publications after an app window is closed without
+ /// discarding other windows or other owners' pending work.
+ pub fn cancel_window(&mut self,caller:Identity,window:u32)->usize{
+  if caller.pid==0||caller.generation==0||window==0{return 0;}
+  let mut removed=0;let mut i=0;
+  while i<self.count{
+   if self.messages[i].is_some_and(|d|d.owner==caller&&d.window==window){
+    for j in i+1..self.count{self.messages[j-1]=self.messages[j];}
+    self.count-=1;self.messages[self.count]=None;removed+=1;
+   }else{i+=1;}
+  }
+  removed
+ }
+ /// Render only after compositor validates a fresh grant, then retire
+ /// damage for one owner without touching any neighboring process.
+ pub fn drain_owner(&mut self,owner:Identity,output:&mut[Damage])
+  ->Result<usize,Error>{
+  if owner.pid==0||owner.generation==0{return Err(Error::NotOwner);}
+  let needed=self.pending_owner(owner);
+  if output.len()<needed{return Err(Error::Full);}
+  let mut count=0;let mut i=0;
+  while i<self.count{
+   if self.messages[i].is_some_and(|m|m.owner==owner){
+    output[count]=self.messages[i].ok_or(Error::Empty)?;
+    count+=1;
+    for j in i+1..self.count{self.messages[j-1]=self.messages[j];}
+    self.count-=1;self.messages[self.count]=None;
+   }else{i+=1;}
+  }
+  Ok(count)
+ }
+}
+#[cfg(test)]
+mod r006_compositor_batch_tests{
+ use super::*;
+ use crate::batch2_windows::Window;
+ fn owner()->Identity{Identity{pid:20,generation:7}}
+ fn windows()->Windows<3>{
+  let mut x=Windows::new();
+  x.create(Window{pid:20,generation:7,id:1,rect:Rect{x:0,y:0,w:100,h:90}}).unwrap();
+  x.create(Window{pid:20,generation:7,id:2,rect:Rect{x:150,y:20,w:40,h:50}}).unwrap();
+  x.create(Window{pid:30,generation:7,id:3,rect:Rect{x:250,y:20,w:40,h:50}}).unwrap();
+  x
+ }
+ #[test]fn multi_window_damage_is_fully_atomic_even_when_invalid(){
+  let w=windows();let mut q=Surfaces::<4>::new();
+  let r=Rect{x:1,y:2,w:5,h:6};
+  assert_eq!(q.submit_batch(&w,owner(),&[(1,r),(3,r)]),Err(Error::NotOwner));
+  assert_eq!(q.pending_owner(owner()),0);
+  assert_eq!(q.submit_batch(&w,owner(),&[(1,r),(2,r)]),Ok(2));
+  assert_eq!(q.pending_owner(owner()),2);
+  assert_eq!(q.submit_batch(&w,owner(),&[(1,r),(2,Rect{x:99,..r})]),
+   Err(Error::Invalid));
+  assert_eq!(q.pending_owner(owner()),2);
+ }
+ #[test]fn full_redraw_and_owner_drain_do_not_drop_peers(){
+  let w=windows();let mut q=Surfaces::<3>::new();
+  let peer=Identity{pid:30,generation:7};
+  q.redraw_window(&w,owner(),1).unwrap();
+  q.redraw_window(&w,peer,3).unwrap();
+  q.redraw_window(&w,owner(),1).unwrap();
+  assert_eq!(q.pending_owner(owner()),1);
+  let dummy=Damage{owner:peer,window:0,rect:Rect{x:0,y:0,w:1,h:1},serial:0};
+  let mut empty:[Damage;0]=[];
+  assert_eq!(q.drain_owner(owner(),&mut empty),Err(Error::Full));
+  let mut got=[dummy;1];
+  assert_eq!(q.drain_owner(owner(),&mut got),Ok(1));
+  assert_eq!(got[0].rect.w,100);
+  assert_eq!(q.pending_owner(peer),1);
+ }
+ #[test]fn closing_window_reaps_only_matching_damage(){
+  let w=windows();let mut q=Surfaces::<4>::new();
+  let r=Rect{x:0,y:0,w:3,h:3};
+  q.submit_batch(&w,owner(),&[(1,r),(2,r)]).unwrap();
+  assert_eq!(q.cancel_window(owner(),1),1);
+  assert_eq!(q.pending_owner(owner()),1);
+  assert_eq!(q.next().unwrap().window,2);
+ }
+}
