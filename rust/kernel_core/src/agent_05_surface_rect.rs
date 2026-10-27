@@ -87,3 +87,45 @@ mod motion_tests {
         assert_eq!(move_owned(window(), 1, 1, 4, 5), Err(RectError::InvalidOwner));
     }
 }
+
+
+/// Conservative CPU-desktop damage region covering two authorized
+/// rectangles. This is metadata only and never writes framebuffer pixels.
+pub fn union_owned(a:Rectangle,b:Rectangle,owner:u32,caller:u32)
+    ->Result<Rectangle,RectError>{
+    if owner==0||owner!=caller{return Err(RectError::InvalidOwner)}
+    let (ar,ab)=edges(a)?;
+    let (br,bb)=edges(b)?;
+    let left=core::cmp::min(a.x,b.x);
+    let top=core::cmp::min(a.y,b.y);
+    let right=core::cmp::max(ar,br);
+    let bottom=core::cmp::max(ab,bb);
+    Ok(Rectangle{x:left,y:top,width:right-left,height:bottom-top})
+}
+#[cfg(test)]
+mod damage_union_tests{
+    use super::*;
+    fn rect(x:u32,y:u32,w:u32,h:u32)->Rectangle{
+        Rectangle{x,y,width:w,height:h}
+    }
+    #[test]fn merging_adjacent_and_distant_damage_stays_bounded(){
+        assert_eq!(union_owned(rect(4,8,20,10),rect(24,8,6,10),5,5),
+                   Ok(rect(4,8,26,10)));
+        assert_eq!(union_owned(rect(1270,790,10,10),rect(0,0,2,3),5,5),
+                   Ok(rect(0,0,1280,800)));
+    }
+    #[test]fn rejects_foreign_owner_and_zero_owner(){
+        assert_eq!(union_owned(rect(0,0,1,1),rect(0,0,1,1),5,6),
+                   Err(RectError::InvalidOwner));
+        assert_eq!(union_owned(rect(0,0,1,1),rect(0,0,1,1),0,0),
+                   Err(RectError::InvalidOwner));
+    }
+    #[test]fn rejects_corrupted_dimensions_and_screen_escape(){
+        assert_eq!(union_owned(rect(0,0,1,1),rect(1279,0,2,1),1,1),
+                   Err(RectError::OutsideScreen));
+        assert_eq!(union_owned(rect(u32::MAX,0,2,2),rect(0,0,1,1),1,1),
+                   Err(RectError::Overflow));
+        assert_eq!(union_owned(rect(0,0,1,1),rect(0,0,0,1),1,1),
+                   Err(RectError::Empty));
+    }
+}

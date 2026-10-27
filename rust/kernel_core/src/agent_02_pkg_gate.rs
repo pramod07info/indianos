@@ -221,3 +221,75 @@ mod batch1_payload_tests {
     }
 }
 
+
+
+/// Validate a proposed signer rotation for continuity and non-reuse of
+/// existing key IDs. Trusted authorization of the proposed list is separate.
+pub fn validate_trust_rotation(old:&[TrustAnchor],next:&[TrustAnchor],
+    revoked:&[u32])->Result<(),GuestPackageError>{
+    if old.is_empty()||next.is_empty(){return Err(GuestPackageError::Malformed)}
+    for (i,k) in next.iter().enumerate(){
+        if k.id==0||k.ed25519_public_key==[0;32]||revoked.contains(&k.id){
+            return Err(GuestPackageError::UntrustedKey)
+        }
+        if next[..i].iter().any(|x|x.id==k.id){
+            return Err(GuestPackageError::Malformed)
+        }
+        if old.iter().any(|x|x.id==k.id&&
+           x.ed25519_public_key!=k.ed25519_public_key){
+            return Err(GuestPackageError::UntrustedKey)
+        }
+    }
+    for (i,k) in old.iter().enumerate(){
+        if k.id==0||old[..i].iter().any(|x|x.id==k.id){
+            return Err(GuestPackageError::Malformed)
+        }
+    }
+    if !old.iter().any(|k|next.contains(k)&&!revoked.contains(&k.id)){
+        return Err(GuestPackageError::UntrustedKey)
+    }
+    Ok(())
+}
+#[cfg(test)]
+mod rotation_tests {
+    use super::*;
+    fn key(id:u32,b:u8)->TrustAnchor{
+        TrustAnchor{id,ed25519_public_key:[b;32]}
+    }
+    #[test]fn retained_trusted_key_allows_addition(){
+        assert_eq!(validate_trust_rotation(&[key(2,3)],
+                   &[key(2,3),key(4,5)],&[]),Ok(()));
+    }
+    #[test]fn signer_rekeying_duplicates_and_revocation_are_denied(){
+        assert_eq!(validate_trust_rotation(&[key(2,3)],&[key(2,4)],&[]),
+                   Err(GuestPackageError::UntrustedKey));
+        assert_eq!(validate_trust_rotation(&[key(2,3)],
+                   &[key(2,3),key(2,3)],&[]),Err(GuestPackageError::Malformed));
+        assert_eq!(validate_trust_rotation(&[key(2,3)],&[key(2,3)],&[2]),
+                   Err(GuestPackageError::UntrustedKey));
+    }
+    #[test]fn empty_or_discontinuous_rotation_fails_closed(){
+        assert_eq!(validate_trust_rotation(&[],&[key(2,3)],&[]),
+                   Err(GuestPackageError::Malformed));
+        assert_eq!(validate_trust_rotation(&[key(2,3)],&[key(4,5)],&[]),
+                   Err(GuestPackageError::UntrustedKey));
+        assert_eq!(validate_trust_rotation(&[key(2,3)],&[key(2,3),key(0,1)],&[]),
+                   Err(GuestPackageError::UntrustedKey));
+    }
+}
+
+
+/// Disallow rollback of authenticated trust-store epochs.
+/// Authentication itself must occur in the independent trusted verifier.
+pub fn validate_trust_epoch(current:u64,proposed:u64,authenticated:bool)
+ ->Result<u64,GuestPackageError>{
+ if !authenticated||current==0||proposed==0{return Err(GuestPackageError::Unsigned)}
+ if proposed<=current{return Err(GuestPackageError::Downgrade)}
+ Ok(proposed)
+}
+#[cfg(test)]mod trust_epoch_tests{
+ use super::*;
+ #[test]fn allows_verified_monotonic_update(){assert_eq!(validate_trust_epoch(2,3,true),Ok(3));}
+ #[test]fn denies_unverified_proposals(){assert_eq!(validate_trust_epoch(2,4,false),Err(GuestPackageError::Unsigned));assert_eq!(validate_trust_epoch(0,2,true),Err(GuestPackageError::Unsigned));}
+ #[test]fn rejects_rollback_and_epoch_reuse(){assert_eq!(validate_trust_epoch(5,5,true),Err(GuestPackageError::Downgrade));assert_eq!(validate_trust_epoch(5,4,true),Err(GuestPackageError::Downgrade));}
+}
