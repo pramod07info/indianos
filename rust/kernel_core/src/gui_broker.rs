@@ -96,6 +96,56 @@ impl<const W:usize,const Q:usize> Broker<W,Q>{
         }
         Ok(n)
     }
+    /// Atomically publish a sequence of owner-bound GUI events. This is
+    /// serialized kernel input context; SMP locking is not implemented.
+    pub fn post_batch(&mut self,owner:u32,events:&[(u32,u32)])
+        ->Result<usize,Error>{
+        if events.is_empty(){return Err(Error::Invalid);}
+        if owner==0{return Err(Error::Unauthorized);}
+        if self.len.checked_add(events.len()).is_none_or(|n|n>Q){
+            return Err(Error::Full);
+        }
+        if self.sequence.checked_add(events.len() as u32).is_none(){
+            return Err(Error::Exhausted);
+        }
+        for &(window,kind) in events{
+            if kind!=FOCUS&&kind!=POINTER_FOCUS{return Err(Error::Invalid);}
+            if !self.owns(owner,window){return Err(Error::Unauthorized);}
+        }
+        for &(window,kind) in events{
+            self.post(owner,window,kind)?;
+        }
+        Ok(events.len())
+    }
+    /// Non-destructive status on a trusted owner queue. Other owners are
+    /// not disclosed to clients.
+    pub fn pending_owner(&self,owner:u32)->Result<usize,Error>{
+        if !self.known(owner){return Err(Error::Unauthorized);}
+        Ok(self.events[..self.len].iter().flatten()
+            .filter(|e|e.owner==owner).count())
+    }
+    /// Drop a *single* withdrawn owner/window grant along with only the
+    /// queued events targeted at that window.
+    pub fn revoke_window(&mut self,owner:u32,window:u32)->Result<(),Error>{
+        let grant=self.windows.iter_mut().find(|g|
+            g.is_some_and(|x|x.owner==owner&&x.window==window))
+            .ok_or(Error::Unauthorized)?;
+        *grant=None;
+        let mut i=0;
+        while i<self.len{
+            if self.events[i].is_some_and(|e|e.owner==owner&&e.window==window){
+                self.remove(i);
+            }else{i+=1;}
+        }
+        Ok(())
+    }
+    /// Preview latest event for one authenticated owner; never consumes
+    /// messages or advances sequence numbers.
+    pub fn latest_owner(&self,owner:u32)->Result<Event,Error>{
+        if !self.known(owner){return Err(Error::Unauthorized);}
+        self.events[..self.len].iter().rev().flatten()
+            .find(|e|e.owner==owner).copied().ok_or(Error::Empty)
+    }
     fn remove(&mut self,index:usize){
         for i in index..self.len-1{self.events[i]=self.events[i+1];}
         self.len-=1;self.events[self.len]=None;
@@ -116,6 +166,31 @@ impl<const W:usize,const Q:usize> Broker<W,Q>{
 #[cfg(test)]
 mod tests{
     use super::*;
+    #[test]fn orbit_event_batches_never_publish_partial_foreign_events(){
+        let mut b=Broker::<3,4>::new();b.grant(1,10).unwrap();
+        b.grant(1,11).unwrap();b.grant(2,12).unwrap();
+        assert_eq!(b.post_batch(1,&[(10,FOCUS),(12,FOCUS)]),
+                   Err(Error::Unauthorized));
+        assert_eq!(b.pending_owner(1),Ok(0));
+        assert_eq!(b.post_batch(1,&[(10,FOCUS),(11,POINTER_FOCUS)]),
+                   Ok(2));
+        assert_eq!(b.pending_owner(1),Ok(2));
+        assert_eq!(b.latest_owner(1).unwrap().window,11);
+    }
+    #[test]fn orbit_queue_capacity_and_grant_revocation_preserve_other_events(){
+        let mut b=Broker::<3,3>::new();b.grant(1,10).unwrap();
+        b.grant(1,11).unwrap();b.grant(2,12).unwrap();
+        b.post_batch(1,&[(10,FOCUS),(11,POINTER_FOCUS)]).unwrap();
+        assert_eq!(b.post_batch(2,&[(12,FOCUS),(12,FOCUS)]),
+                   Err(Error::Full));
+        assert_eq!(b.pending_owner(2),Ok(0));
+        b.post_focus(2,12).unwrap();
+        b.revoke_window(1,10).unwrap();
+        assert_eq!(b.pending_owner(1),Ok(1));
+        assert_eq!(b.pending_owner(2),Ok(1));
+        assert!(!b.owns(1,10));
+        assert_eq!(b.post_batch(1,&[(10,FOCUS)]),Err(Error::Unauthorized));
+    }
     #[test]fn orbit_notification_drain_is_atomic_fifo_and_owner_bound(){
         let mut broker=Broker::<2,5>::new();
         broker.grant(7,1).unwrap();broker.grant(8,2).unwrap();
