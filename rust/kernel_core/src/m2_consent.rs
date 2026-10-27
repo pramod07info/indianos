@@ -50,6 +50,24 @@ impl<const P:usize> Ledger<P>{
   if now>=approval.expires{return Err(Error::Expired);}
   Ok(())
  }
+ /// Kernel-side signed-application filesystem authorization preflight.
+ /// The trusted syscall ingress must obtain the PID and generation from
+ /// its scheduler, never from untrusted user arguments. All modifying VFS,
+ /// mmap and raw-storage entrypoints still need independent integration.
+ pub fn require_file_access(&self,process:Identity,app:Record,
+   now:u64,path:&str,required:u32)->Result<(),Error>{
+  self.require(process,app,now)?;
+  if required!=crate::batch6_security::FILE_READ&&
+     required!=crate::batch6_security::FILE_WRITE{
+   return Err(Error::Denied);
+  }
+  if app.rights&required!=required{return Err(Error::Denied);}
+  // Even a signed installed app may not directly access firmware/system keys,
+  // recovery images or snapshot stores through this untrusted-file surface.
+  crate::fs_write_guard::WriteGuard::allow_path(path)
+    .map_err(|_|Error::Denied)?;
+  Ok(())
+ }
  pub fn revoke(&mut self,process:Identity)->Result<(),Error>{
   let Some(slot)=self.records.iter_mut().find(|x|
     x.is_some_and(|a|a.process==process))else{return Err(Error::Denied)};
@@ -89,6 +107,34 @@ mod m2_tests{
   assert_eq!(ledger.require(process(),app(),1),Err(Error::Denied));
   assert_eq!(ledger.revoke(Identity{generation:2,..process()}),Ok(()));
   assert_eq!(ledger.require(Identity{generation:2,..process()},app(),1),Err(Error::Denied));
+ }
+ #[test]fn m2_consent_file_access_requires_signed_image_and_exact_live_pid(){
+  let app=Record{rights:FILE_READ|FILE_WRITE,..app()};
+  let mut ledger=Ledger::<1>::new();
+  ledger.approve(&auth(),actor(),1,process(),app,
+    FILE_READ|FILE_WRITE,30).unwrap();
+  for right in [FILE_READ,FILE_WRITE]{
+   assert_eq!(ledger.require_file_access(process(),app,2,
+     "/home/notes",right),Ok(()));
+  }
+  assert_eq!(ledger.require_file_access(process(),app,2,
+    "/keys/private",FILE_READ),Err(Error::Denied));
+  assert_eq!(ledger.require_file_access(process(),app,2,
+    "/boot/kernel",FILE_WRITE),Err(Error::Denied));
+  assert_eq!(ledger.require_file_access(process(),app,2,
+    "/home/../boot/kernel",FILE_READ),Err(Error::Denied));
+  assert_eq!(ledger.require_file_access(process(),app,2,
+    "/home/notes",INSTALL),Err(Error::Denied));
+  assert_eq!(ledger.require_file_access(Identity{generation:2,..process()},
+    app,2,"/home/notes",FILE_READ),Err(Error::Denied));
+  assert_eq!(ledger.require_file_access(process(),
+    Record{digest:[5;32],..app},2,"/home/notes",FILE_READ),
+    Err(Error::Denied));
+  assert_eq!(ledger.require_file_access(process(),app,30,
+    "/home/notes",FILE_READ),Err(Error::Expired));
+  ledger.retire(process());
+  assert_eq!(ledger.require_file_access(process(),app,2,
+    "/home/notes",FILE_READ),Err(Error::Denied));
  }
  #[test]fn m2_consent_rejects_unauthenticated_or_stale_administrators(){
   let mut ledger=Ledger::<1>::new();
