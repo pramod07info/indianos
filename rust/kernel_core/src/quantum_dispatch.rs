@@ -134,3 +134,105 @@ mod tests{
     }
 
 }
+
+
+/// Orbit R005 quota-aware, PID-generation-isolated quantum dispatcher.
+/// Simulated jobs only: no physical quantum processing hardware is assumed.
+use crate::batch5_session::Identity as MeterOwner;
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+struct MeterRecord{owner:MeterOwner,job:u64}
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum MeterError{InvalidOwner,QuotaExceeded,Untracked,Service(DispatchError)}
+pub struct QuantumMeter<const N:usize>{
+ records:[Option<MeterRecord>;N],per_owner:usize,
+}
+impl<const N:usize> QuantumMeter<N>{
+ pub const fn new(per_owner:usize)->Self{
+  Self{records:[None;N],per_owner}
+ }
+ pub fn active(&self,owner:MeterOwner)->usize{
+  self.records.iter().flatten().filter(|r|r.owner==owner).count()
+ }
+ pub fn clear_owner(&mut self,owner:MeterOwner)->usize{
+  if owner.pid==0||owner.generation==0{return 0;}
+  let mut removed=0;
+  for item in &mut self.records{
+   if item.is_some_and(|r|r.owner==owner){*item=None;removed+=1;}
+  }
+  removed
+ }
+ fn tracked(&self,owner:MeterOwner,id:u64)->bool{
+  self.records.iter().flatten().any(|r|r.owner==owner&&r.job==id&&id!=0)
+ }
+ /// Enforce quota and access to known jobs before calling the simulated
+ /// quantum service. A failing submit consumes no quota entry.
+ pub fn dispatch(&mut self,svc:&mut QuantumService,owner:MeterOwner,
+  request:QuantumRequest,input:Option<&[u8]>,
+  output:Option<&mut[u8;RESULT_BYTES]>)->Result<Reply,MeterError>{
+  if owner.pid==0||owner.generation==0{return Err(MeterError::InvalidOwner);}
+  match request.operation{
+   QuantumOperation::Submit=>{
+    if self.per_owner==0||self.active(owner)>=self.per_owner||
+       self.records.iter().all(Option::is_some){
+     return Err(MeterError::QuotaExceeded);
+    }
+    let reply=dispatch_scoped(svc,owner,request,input,output)
+     .map_err(MeterError::Service)?;
+    let Reply::Submitted(job)=reply else{return Err(MeterError::Untracked);};
+    let slot=self.records.iter_mut().find(|r|r.is_none())
+     .ok_or(MeterError::QuotaExceeded)?;
+    *slot=Some(MeterRecord{owner,job});
+    Ok(reply)
+   },
+   QuantumOperation::Status|QuantumOperation::Result|QuantumOperation::Release=>{
+    if !self.tracked(owner,request.job_id){return Err(MeterError::Untracked);}
+    let reply=dispatch_scoped(svc,owner,request,input,output)
+     .map_err(MeterError::Service)?;
+    if request.operation==QuantumOperation::Release{
+     let slot=self.records.iter_mut().find(|r|
+      r.is_some_and(|x|x.owner==owner&&x.job==request.job_id))
+      .ok_or(MeterError::Untracked)?;
+     *slot=None;
+    }
+    Ok(reply)
+   }
+  }
+ }
+}
+#[cfg(test)]
+mod orbit_r005_quantum_meter_tests{
+ use super::*;
+ const BELL:[u8;10]=[1,2,2,0,1,0,0,4,0,1];
+ fn owner()->MeterOwner{MeterOwner{pid:17,generation:2}}
+ #[test]fn per_generation_quota_is_enforced_and_release_returns_capacity(){
+  let mut service=QuantumService::new();let mut meter=QuantumMeter::<2>::new(1);
+  let submit=QuantumRequest::parse(0,0x400000,10,0).unwrap();
+  let first=meter.dispatch(&mut service,owner(),submit,Some(&BELL),None).unwrap();
+  let Reply::Submitted(job)=first else{panic!("expected job")};
+  assert_eq!(meter.dispatch(&mut service,owner(),submit,Some(&BELL),None),
+   Err(MeterError::QuotaExceeded));
+  let release=QuantumRequest::parse(3,0,0,job).unwrap();
+  assert_eq!(meter.dispatch(&mut service,owner(),release,None,None),Ok(Reply::Released));
+  assert_eq!(meter.active(owner()),0);
+  assert!(meter.dispatch(&mut service,owner(),submit,Some(&BELL),None).is_ok());
+ }
+ #[test]fn recycled_pid_cannot_read_older_quantum_generation(){
+  let mut service=QuantumService::new();let mut meter=QuantumMeter::<2>::new(2);
+  let submit=QuantumRequest::parse(0,0x400000,10,0).unwrap();
+  let id=match meter.dispatch(&mut service,owner(),submit,Some(&BELL),None).unwrap(){
+   Reply::Submitted(x)=>x,_=>panic!("submit")};
+  let stale=MeterOwner{generation:3,..owner()};
+  let status=QuantumRequest::parse(1,0,0,id).unwrap();
+  assert_eq!(meter.dispatch(&mut service,stale,status,None,None),Err(MeterError::Untracked));
+  assert_eq!(meter.active(stale),0);
+  assert_eq!(meter.clear_owner(owner()),1);
+  assert_eq!(meter.active(owner()),0);
+ }
+ #[test]fn malformed_submit_consumes_no_credit(){
+  let mut service=QuantumService::new();let mut meter=QuantumMeter::<1>::new(1);
+  let submit=QuantumRequest::parse(0,0x400000,10,0).unwrap();
+  assert_eq!(meter.dispatch(&mut service,owner(),submit,Some(&BELL[..4]),None),
+   Err(MeterError::Service(DispatchError::BadBuffer)));
+  assert_eq!(meter.active(owner()),0);
+ }
+}
