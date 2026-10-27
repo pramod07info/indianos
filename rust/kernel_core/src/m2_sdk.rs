@@ -77,6 +77,31 @@ impl<const N:usize> Catalog<N>{
   self.items=staged.items;
   Ok(())
  }
+ /// Atomically stage a group of trusted manifests and verify the final
+ /// dependency graph. Signature checks and actual disk writes are separate.
+ pub fn replace_group(&mut self,updates:&[Package])->Result<(),Error>{
+  if updates.is_empty()||updates.len()>N{return Err(Error::Capacity);}
+  let mut staged=Self{items:self.items};
+  for (index,&next) in updates.iter().enumerate(){
+   if updates[..index].iter().any(|p|p.id==next.id){
+    return Err(Error::Duplicate);
+   }
+   let slot=staged.items.iter().position(|p|p.is_some_and(|p|p.id==next.id))
+     .ok_or(Error::Missing)?;
+   let current=staged.items[slot].ok_or(Error::Missing)?;
+   if next.version<=current.version||next.rights&!current.rights!=0{
+    return Err(Error::Invalid);
+   }
+   staged.items[slot]=None;
+   staged.add(next)?;
+  }
+  let mut plan=[0u32;N];
+  for p in staged.items.iter().flatten(){
+   staged.resolve(p.id,&mut plan)?;
+  }
+  self.items=staged.items;
+  Ok(())
+ }
  fn visit(&self,id:u32,state:&mut[u8;N],out:&mut[u32],len:&mut usize)
   ->Result<(),Error>{
   let i=self.items.iter().position(|p|p.is_some_and(|x|x.id==id))
@@ -186,6 +211,33 @@ mod m2_tests{
   let mut order=[0u32;3];
   assert_eq!(c.resolve(1,&mut order),Ok(2));
   assert_eq!(&order[..2],&[2,1]);
+ }
+
+
+ #[test]fn group_update_validates_final_dag_and_migrates_dependencies_atomically(){
+  let mut c=Catalog::<3>::new();
+  c.add(pkg(1,[2,0,0,0])).unwrap();
+  c.add(pkg(2,[0;4])).unwrap();
+  let mut next1=pkg(1,[0;4]);next1.version=2;
+  let mut next2=pkg(2,[1,0,0,0]);next2.version=2;
+  assert_eq!(c.replace_group(&[next2,next1]),Ok(()));
+  assert_eq!(c.get(1),Some(next1));
+  assert_eq!(c.get(2),Some(next2));
+  let mut plan=[0u32;3];
+  assert_eq!(c.resolve(2,&mut plan),Ok(2));
+  assert_eq!(&plan[..2],&[1,2]);
+ }
+ #[test]fn package_group_update_rejects_cycles_and_partial_publication(){
+  let mut c=Catalog::<3>::new();
+  c.add(pkg(1,[0;4])).unwrap();c.add(pkg(2,[0;4])).unwrap();
+  let mut next1=pkg(1,[2,0,0,0]);next1.version=2;
+  let mut next2=pkg(2,[1,0,0,0]);next2.version=2;
+  assert_eq!(c.replace_group(&[next1,next2]),Err(Error::Cycle));
+  assert_eq!(c.get(1),Some(pkg(1,[0;4])));
+  assert_eq!(c.get(2),Some(pkg(2,[0;4])));
+  next2.deps=[0;4];
+  assert_eq!(c.replace_group(&[next1,next1]),Err(Error::Duplicate));
+  assert_eq!(c.get(1),Some(pkg(1,[0;4])));
  }
 
 }
