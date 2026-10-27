@@ -75,6 +75,27 @@ impl<const W:usize,const Q:usize> Broker<W,Q>{
             .ok_or(Error::Empty)?;
         self.remove(index);Ok(())
     }
+    /// Orbit L5: transfer all pending notifications for an authorized PID
+    /// as one batch. A short output slice cannot partially consume events.
+    /// Per-owner FIFO is preserved; events for other processes stay queued.
+    pub fn drain_owner(&mut self,owner:u32,into:&mut[Event])
+        ->Result<usize,Error>{
+        if !self.known(owner){return Err(Error::Unauthorized);}
+        let needed=self.events[..self.len].iter().flatten()
+            .filter(|e|e.owner==owner).count();
+        if needed>into.len(){return Err(Error::Full);}
+        let mut n=0;
+        let mut i=0;
+        while i<self.len{
+            if let Some(event)=self.events[i]{
+                if event.owner==owner{
+                    into[n]=event;n+=1;self.remove(i);continue;
+                }
+            }
+            i+=1;
+        }
+        Ok(n)
+    }
     fn remove(&mut self,index:usize){
         for i in index..self.len-1{self.events[i]=self.events[i+1];}
         self.len-=1;self.events[self.len]=None;
@@ -95,6 +116,22 @@ impl<const W:usize,const Q:usize> Broker<W,Q>{
 #[cfg(test)]
 mod tests{
     use super::*;
+    #[test]fn orbit_notification_drain_is_atomic_fifo_and_owner_bound(){
+        let mut broker=Broker::<2,5>::new();
+        broker.grant(7,1).unwrap();broker.grant(8,2).unwrap();
+        let first=broker.post_focus(7,1).unwrap();
+        let peer=broker.post_pointer_focus(8,2).unwrap();
+        let last=broker.post_pointer_focus(7,1).unwrap();
+        let mut short=[Event{owner:0,window:0,kind:0,sequence:0};1];
+        assert_eq!(broker.drain_owner(7,&mut short),Err(Error::Full));
+        assert_eq!(broker.peek(7),Ok(first));
+        let mut out=[Event{owner:0,window:0,kind:0,sequence:0};2];
+        assert_eq!(broker.drain_owner(7,&mut out),Ok(2));
+        assert_eq!(out,[first,last]);
+        assert_eq!(broker.peek(8),Ok(peer));
+        assert_eq!(broker.peek(7),Err(Error::Empty));
+        assert_eq!(broker.drain_owner(9,&mut out),Err(Error::Unauthorized));
+    }
     #[test]fn cross_pid_spoof_and_duplicate_grants_denied(){
         let mut b=Broker::<2,3>::new();
         assert_eq!(b.grant(0,1),Err(Error::Invalid));
