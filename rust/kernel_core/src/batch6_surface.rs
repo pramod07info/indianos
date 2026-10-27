@@ -24,6 +24,27 @@ impl<const N:usize> Surfaces<N>{
   self.messages[self.count]=Some(Damage{owner:caller,window,rect,serial});
   self.count+=1;Ok(serial)
  }
+ /// Tolerant client dirty-rectangle submission with strict clipping to
+ /// the current live owned window. Completely off-surface submissions fail.
+ /// Returned damage can never reveal pixels outside the sender's window.
+ pub fn submit_clipped<const W:usize>(&mut self,windows:&Windows<W>,
+  caller:Identity,window:u32,rect:Rect)->Result<u64,Error>{
+  if caller.pid==0||caller.generation==0||window==0||
+    !windows.owns(caller.pid,caller.generation,window){
+   return Err(Error::NotOwner);
+  }
+  let window_rect=windows.get(window).ok_or(Error::NotOwner)?.rect;
+  if rect.w==0||rect.h==0||rect.x>=window_rect.w||rect.y>=window_rect.h{
+   return Err(Error::Invalid);
+  }
+  let right=rect.x.checked_add(rect.w).unwrap_or(u32::MAX)
+    .min(window_rect.w);
+  let bottom=rect.y.checked_add(rect.h).unwrap_or(u32::MAX)
+    .min(window_rect.h);
+  self.submit(windows,caller,window,Rect{
+    x:rect.x,y:rect.y,w:right-rect.x,h:bottom-rect.y,
+  })
+ }
  /// Trusted compositor only: caller is the scheduler-authenticated service.
  pub fn next(&mut self)->Result<Damage,Error>{
   if self.count==0{return Err(Error::Empty);}
@@ -119,4 +140,28 @@ impl<const N:usize> Surfaces<N>{
   q.submit(&windows,id,7,Rect{x:1,y:1,w:2,h:2}).unwrap();
   q.retire(id);assert_eq!(q.next(),Err(Error::Empty));
  }
+
+ #[test]fn compositor_clips_oversized_user_rectangles_to_current_surface(){
+  let mut win=w();let owner=Identity{pid:2,generation:4};
+  let mut mailbox=Surfaces::<2>::new();
+  mailbox.submit_clipped(&win,owner,7,
+    Rect{x:95,y:70,w:30,h:40}).unwrap();
+  let (_,frame)=mailbox.next_live(&win).unwrap();
+  assert_eq!(frame,Rect{x:95,y:70,w:5,h:10});
+  assert_eq!(mailbox.submit_clipped(&win,owner,7,
+    Rect{x:101,y:0,w:20,h:10}),Err(Error::Invalid));
+  assert_eq!(mailbox.submit_clipped(&win,owner,7,
+    Rect{x:0,y:0,w:0,h:10}),Err(Error::Invalid));
+  win.retire(2,4);
+  assert_eq!(mailbox.submit_clipped(&win,owner,7,
+    Rect{x:0,y:0,w:1,h:1}),Err(Error::NotOwner));
+ }
+ #[test]fn recycled_pid_cannot_publish_clipped_damage(){
+  let win=w();let owner=Identity{pid:2,generation:4};
+  let mut mailbox=Surfaces::<2>::new();
+  assert_eq!(mailbox.submit_clipped(&win,Identity{generation:5,..owner},
+    7,Rect{x:0,y:0,w:10,h:10}),Err(Error::NotOwner));
+  assert_eq!(mailbox.next(),Err(Error::Empty));
+ }
+
 }
