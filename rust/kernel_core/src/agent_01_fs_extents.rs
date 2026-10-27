@@ -437,3 +437,34 @@ mod owner_set_consistency_tests {
             Err(ExtentError::Overflow));
     }
 }
+
+#[cfg(test)]
+mod owner_set_boundary_regression_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_zero_length_owner_even_when_other_owners_overlap() {
+        let a = [Extent { start: 1, blocks: 3 }];
+        let alias = [Extent { start: 2, blocks: 1 }];
+        let empty_extent = [Extent { start: 5, blocks: 0 }];
+        assert_eq!(validate_owner_set_disjoint(
+            &[&a, &alias, &empty_extent], 10, 3, 1, 4),
+            Err(ExtentError::Empty));
+    }
+
+    #[test]
+    fn accepts_adjacent_owners_at_last_device_block() {
+        let a = [Extent { start: u64::MAX - 3, blocks: 1 }];
+        let b = [Extent { start: u64::MAX - 2, blocks: 2 }];
+        assert_eq!(validate_owner_set_disjoint(
+            &[&a, &b], u64::MAX, 2, 1, 3), Ok(true));
+    }
+
+    #[test]
+    fn rejects_overlapping_owners_at_last_device_block() {
+        let a = [Extent { start: u64::MAX - 3, blocks: 2 }];
+        let b = [Extent { start: u64::MAX - 2, blocks: 2 }];
+        assert_eq!(validate_owner_set_disjoint(
+            &[&a, &b], u64::MAX, 2, 1, 4), Ok(false));
+    }
+}
