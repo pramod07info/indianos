@@ -176,6 +176,39 @@ impl<const P:usize> Ledger<P>{
        .map_err(NetworkError::Socket)
  }
 
+ /// Continuous installed-app consent check, not just bind-time approval.
+ /// The signed Record and scheduler identity are kernel supplied.
+ pub fn allow_app_dns<const S:usize>(&self,
+   socket:&crate::m2_network::Endpoint<S>,owner:Identity,
+   app:Record,now:u64,port:u16,domain:&[u8])
+   ->Result<(),NetworkError>{
+   self.require(owner,app,now).map_err(NetworkError::Consent)?;
+   if app.rights&crate::batch6_security::SOCKET==0{
+    return Err(NetworkError::Consent(Error::Denied));
+   }
+   socket.allow_query(owner,port,now,domain).map_err(NetworkError::Socket)
+ }
+ /// A successful parser result does not authenticate the underlying UDP
+ /// transport: peer/transaction checks remain the network ingress's duty.
+ pub fn accept_app_dns_a<const S:usize>(&self,
+   socket:&crate::m2_network::Endpoint<S>,owner:Identity,app:Record,
+   now:u64,port:u16,id:u16,domain:&[u8],response:&[u8])
+   ->Result<[u8;4],NetworkError>{
+   self.allow_app_dns(socket,owner,app,now,port,domain)?;
+   socket.accept_dns_a(owner,port,now,id,domain,response)
+      .map_err(NetworkError::Socket)
+ }
+ /// TLS preflight is only name+certificate policy. Actual TLS 1.3 record
+ /// exchange and handshake require a separate native transport integration.
+ pub fn allow_app_tls<const S:usize,
+    V:crate::batch3_network_security::TlsCertificateVerifier>(
+   &self,socket:&crate::m2_network::Endpoint<S>,
+   owner:Identity,app:Record,now:u64,port:u16,domain:&[u8],
+   certificate:&[u8],verifier:&V)->Result<(),NetworkError>{
+   self.allow_app_dns(socket,owner,app,now,port,domain)?;
+   socket.allow_tls(owner,port,now,domain,certificate,verifier)
+     .map_err(NetworkError::Socket)
+ }
  pub fn revoke(&mut self,process:Identity)->Result<(),Error>{
   let Some(slot)=self.records.iter_mut().find(|x|
     x.is_some_and(|a|a.process==process))else{return Err(Error::Denied)};
@@ -430,6 +463,48 @@ mod m2_tests{
           process(),app,2,50400,19),Err(NetworkError::Consent(Error::Denied)));
   assert_eq!(sockets.allow_query(process(),50400,3,b"example.com"),
           Err(crate::m2_network::Error::Denied));
+ }
+
+
+ #[test]fn connected_app_must_keep_consent_for_each_dns_request(){
+  let network_app=Record{rights:SOCKET,..app()};
+  let mut ledger=Ledger::<1>::new();
+  ledger.approve(&auth(),actor(),1,process(),network_app,SOCKET,10).unwrap();
+  let mut caps=Access::<1>::new();
+  caps.grant(process(),SOCKET,25).unwrap();
+  let mut sockets=crate::m2_network::Endpoint::<1>::new();
+  ledger.acquire_socket(&mut sockets,&caps,process(),network_app,2,54000,9).unwrap();
+  assert_eq!(ledger.allow_app_dns(&sockets,process(),network_app,3,54000,
+    b"example.com"),Ok(()));
+  assert_eq!(ledger.allow_app_dns(&sockets,process(),
+    Record{digest:[1;32],..network_app},3,54000,b"example.com"),
+    Err(NetworkError::Consent(Error::Denied)));
+  assert_eq!(ledger.allow_app_dns(&sockets,process(),network_app,10,54000,
+    b"example.com"),Err(NetworkError::Consent(Error::Expired)));
+  ledger.retire(process());
+  assert_eq!(ledger.allow_app_dns(&sockets,process(),network_app,3,54000,
+    b"example.com"),Err(NetworkError::Consent(Error::Denied)));
+ }
+ #[test]fn network_app_tls_requires_valid_cert_and_prevents_stale_owner(){
+  struct Deny;
+  impl crate::batch3_network_security::TlsCertificateVerifier for Deny{
+   fn verify_chain_and_name(&self,_:&[u8],_:&[u8])->bool{false}
+  }
+  let network_app=Record{rights:SOCKET,..app()};
+  let mut ledger=Ledger::<1>::new();
+  ledger.approve(&auth(),actor(),1,process(),network_app,SOCKET,30).unwrap();
+  let mut caps=Access::<1>::new();caps.grant(process(),SOCKET,35).unwrap();
+  let mut sockets=crate::m2_network::Endpoint::<1>::new();
+  ledger.acquire_socket(&mut sockets,&caps,process(),network_app,2,54000,20).unwrap();
+  assert_eq!(ledger.allow_app_tls(&sockets,process(),network_app,
+    3,54000,b"example.com",b"bad",&Deny),
+    Err(NetworkError::Socket(crate::m2_network::Error::Unverified)));
+  assert_eq!(ledger.allow_app_dns(&sockets,
+    Identity{generation:2,..process()},network_app,3,54000,b"example.com"),
+    Err(NetworkError::Consent(Error::Denied)));
+  assert_eq!(ledger.allow_app_dns(&sockets,process(),network_app,
+    21,54000,b"example.com"),
+    Err(NetworkError::Socket(crate::m2_network::Error::Denied)));
  }
 
 }
