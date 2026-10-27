@@ -41,7 +41,7 @@ pub fn command<D:BlockDevice,const N:usize>(
  if input.is_empty()||input.len()>MAX_COMMAND||input.iter().any(|c|
   *c!=b' '&&!c.is_ascii_graphic()){return Err(Error::Invalid);}
  let line=core::str::from_utf8(input).map_err(|_|Error::Invalid)?.trim();
- if line=="help"{return publish(b"pwd ls /dir cat /path write /path text append /path text mkdir /dir mv /old /new cp /src /dst rm /path",out);}
+ if line=="help"{return publish(b"pwd ls /dir cat /path write /path text append /path text mkdir /dir mv /old /new cp /src /dst rm /path mkfile /path",out);}
  if line=="pwd"{return publish(b"/",out);}
  let (verb,raw)=line.split_once(' ').ok_or(Error::Unknown)?;
  let mut name=[0u8;64];
@@ -60,6 +60,16 @@ pub fn command<D:BlockDevice,const N:usize>(
    // Intentionally reject oversized files rather than disclose partial data.
    let n=fs.read(p,&mut buf).map_err(Error::Io)?;
    publish(&buf[..n],out)
+  }
+  "mkfile"=>{
+   // Creation is explicit, never truncates an existing file. Check the
+   // output and authorization before changing durable device metadata.
+   auth.require(caller,FILE_WRITE,now).map_err(|_|Error::Denied)?;
+   if out.len()<7{return Err(Error::OutputTooSmall);}
+   let p=path(raw,&mut name)?;
+   writable_path(p)?;
+   fs.create(p,&[]).map_err(Error::Io)?;
+   publish(b"created",out)
   }
   "mkdir"=>{
    auth.require(caller,FILE_WRITE,now).map_err(|_|Error::Denied)?;
@@ -408,6 +418,40 @@ mod tests{
   let mut fs=HierVfs::mount(disk).unwrap();
   let (n,data)=run(&mut fs,&access,user(),b"cat /home/target").unwrap();
   assert_eq!(&data[..n],b"committed");
+ }
+
+
+ #[test]fn mkfile_empty_file_is_durable_across_remount(){
+  let mut fs=HierVfs::format_blank(blank()).unwrap();
+  let access=grants();
+  run(&mut fs,&access,user(),b"mkdir /home").unwrap();
+  assert_eq!(run(&mut fs,&access,user(),b"mkfile /home/blank").unwrap().0,7);
+  let mut fs=HierVfs::mount(fs.into_device()).unwrap();
+  let (n,_)=run(&mut fs,&access,user(),b"cat /home/blank").unwrap();
+  assert_eq!(n,0);
+ }
+ #[test]fn mkfile_denies_reserved_paths_and_duplicate_mutations(){
+  let mut fs=HierVfs::format_blank(blank()).unwrap();
+  let access=grants();
+  assert_eq!(run(&mut fs,&access,user(),b"mkfile /boot/system"),
+             Err(Error::Denied));
+  run(&mut fs,&access,user(),b"mkfile /blank").unwrap();
+  let generation=fs.generation();
+  assert_eq!(run(&mut fs,&access,user(),b"mkfile /blank"),
+             Err(Error::Io(FsError::Exists)));
+  assert_eq!(fs.generation(),generation);
+ }
+ #[test]fn mkfile_small_response_and_stale_identity_do_not_write(){
+  let mut fs=HierVfs::format_blank(blank()).unwrap();
+  let access=grants();
+  let generation=fs.generation();
+  let mut out=[0xcc;2];
+  assert_eq!(command(&mut fs,&access,user(),1,b"mkfile /blank",&mut out),
+             Err(Error::OutputTooSmall));
+  assert_eq!(out,[0xcc;2]);
+  assert_eq!(run(&mut fs,&access,Identity{pid:3,generation:2},
+                 b"mkfile /blank"),Err(Error::Denied));
+  assert_eq!(fs.generation(),generation);
  }
 
 }
