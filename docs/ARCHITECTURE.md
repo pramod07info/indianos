@@ -319,3 +319,30 @@ qualified physical hardware. CPU software rendering stays the fallback.
 CI runs `hd3b2_` host tests both with/without the M2 feature and a
 bare-metal `no_std` compile, in addition to existing full kernel and
 QEMU acceptance. This is engineering groundwork, not HD3B final acceptance.
+
+## Issue #124 HD3B.3: test-only virtio split-ring wire format
+
+After HD3B.2 validated numeric queues, `hardware_virtio_split` now
+serializes two-direct-descriptor GPU control requests in the precise
+virtio 1.2 split-ring little-endian format: 16-byte descriptors with
+NEXT and WRITE flags, a bounded available-index wrap and head ring, and
+a used-ring decoder that can match completed descriptor heads, reject
+unknown heads, bad lengths, stale generations, repeated indices,
+out-of-order completions, reused inflight buffers, and aliasing.
+It retires the pending queue state and clears its staged wire image
+when its owner exits. These behaviors are covered by eight host tests.
+
+**Only host-supplied mock completion bytes are accepted.** No DMA memory
+is exposed, no real used-ring memory is mapped, no eventfd/IRQ, PCI
+doorbell, cache-coherence barrier, or device descriptor write occurs.
+An independent trusted pinned-buffer/IOMMU implementation must ensure
+device-authorized memory and necessary virtio publish/fetch barriers
+before these bytes can be used by a real GPU transport. The current
+`SplitCodec` is an in-memory encoder, not a transport, and a malicious
+device may lie about successful work even if descriptor bounds pass.
+Hardware GPU acceleration remains unavailable; CPU fallback is intact.
+
+The full kernel CI additionally runs `hd3b3_` tests with and without
+M2 features and checks `no_std`. The code is staged on top of HD3B.2
+and must not be merged into `main` before its parent passes exact-head
+kernel/QEMU acceptance.
