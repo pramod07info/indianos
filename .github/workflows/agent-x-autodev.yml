@@ -144,6 +144,23 @@ jobs:
             exit 1
           fi
 
+      - name: Verify native freestanding linker before Agent X kernel build
+        if: steps.task.outputs.selected == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Full kernel CI installs binutils and lld, but this workflow did
+          # not. The validated candidate was rejected at the ELF link step
+          # with "collect2: fatal error: cannot find ld" (run 40438073733).
+          if ! command -v ld >/dev/null || ! command -v ld.lld >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y binutils lld clang
+          fi
+          command -v clang
+          command -v ld
+          command -v ld.lld
+          make toolchain-check
+
       - name: Validate generated Rust, kernel source ownership and kernel link
         if: steps.task.outputs.selected == 'true'
         shell: bash

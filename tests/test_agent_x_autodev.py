@@ -148,6 +148,17 @@ class GuardedCodegenTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "no preapproved fallback"):
                 agent.trusted_fallback_for(name)
 
+    def test_workflow_requires_cross_linker_before_kernel_link(self) -> None:
+        workflow = SCRIPT.parent.parent / ".github" / "workflows" / "agent-x-autodev.yml"
+        source = workflow.read_text(encoding="utf-8")
+        check = "Verify native freestanding linker before Agent X kernel build"
+        target = "Validate generated Rust, kernel source ownership and kernel link"
+        self.assertIn(check, source)
+        self.assertIn("sudo apt-get install -y binutils lld clang", source)
+        self.assertIn("command -v ld.lld", source)
+        self.assertIn("make toolchain-check", source)
+        self.assertLess(source.index(check), source.index(target))
+
     def test_empty_backlog_is_non_destructive(self) -> None:
         for task in agent.TASKS:
             (self.root / agent.MODULE_ROOT / (task["name"] + ".rs")).write_text("// existing\n")
