@@ -121,3 +121,96 @@ impl<const N:usize> AtomicFileBackend for RamFs<N>{
   assert_eq!(disk.replace(b"/../bad",b"x"),Err(Error::Invalid));
  }
 }
+
+/// Orbit R005: atomic RAM-file maintenance operations. These preserve the
+/// in-memory directory invariant but do NOT supply durable reboot storage.
+impl<const N:usize> RamFs<N>{
+ /// Read one file's generation and length without copying its contents.
+ pub fn metadata(&self,path:&[u8])->Result<(u64,usize),Error>{
+  if !Self::valid_path(path){return Err(Error::Invalid);}
+  let index=self.lookup(path).ok_or(Error::NotFound)?;
+  let file=self.files[index].ok_or(Error::NotFound)?;
+  Ok((file.version,file.data_len))
+ }
+ /// Delete only a file the caller has already authorized and observed.
+ /// Version precondition prevents a stale UI action deleting new contents.
+ pub fn delete_if_version(&mut self,path:&[u8],expected:u64)->Result<u64,Error>{
+  if !Self::valid_path(path){return Err(Error::Invalid);}
+  let index=self.lookup(path).ok_or(Error::NotFound)?;
+  let file=self.files[index].ok_or(Error::NotFound)?;
+  if expected==0||file.version!=expected{return Err(Error::Invalid);}
+  let next=self.version.checked_add(1).ok_or(Error::Exhausted)?;
+  self.files[index]=None;self.version=next;Ok(next)
+ }
+ /// Fail closed for duplicate destinations, stale file versions and bad
+ /// paths. No source is destroyed until every precondition has passed.
+ pub fn rename_if_version(&mut self,from:&[u8],to:&[u8],
+  expected:u64)->Result<u64,Error>{
+  if !Self::valid_path(from)||!Self::valid_path(to)||from==to{
+   return Err(Error::Invalid);
+  }
+  let index=self.lookup(from).ok_or(Error::NotFound)?;
+  let mut file=self.files[index].ok_or(Error::NotFound)?;
+  if expected==0||file.version!=expected||self.lookup(to).is_some(){
+   return Err(Error::Invalid);
+  }
+  let next=self.version.checked_add(1).ok_or(Error::Exhausted)?;
+  file.path=[0;PATH_MAX];file.path[..to.len()].copy_from_slice(to);
+  file.path_len=to.len();file.version=next;
+  self.files[index]=Some(file);self.version=next;Ok(next)
+ }
+ /// Full-data copy with no partial target and no implicit overwrite.
+ /// The trusted caller must enforce read and write grants on both paths.
+ pub fn copy_new(&mut self,from:&[u8],to:&[u8])->Result<u64,Error>{
+  if !Self::valid_path(from)||!Self::valid_path(to)||from==to{
+   return Err(Error::Invalid);
+  }
+  let src=self.lookup(from).ok_or(Error::NotFound)?;
+  if self.lookup(to).is_some(){return Err(Error::Invalid);}
+  let dest=self.files.iter().position(Option::is_none).ok_or(Error::Full)?;
+  let next=self.version.checked_add(1).ok_or(Error::Exhausted)?;
+  let mut file=self.files[src].ok_or(Error::NotFound)?;
+  file.path=[0;PATH_MAX];file.path[..to.len()].copy_from_slice(to);
+  file.path_len=to.len();file.version=next;
+  self.files[dest]=Some(file);self.version=next;Ok(next)
+ }
+}
+#[cfg(test)]
+mod orbit_r005_file_maintenance_tests{
+ use super::*;
+ #[test]fn copy_rename_delete_all_preserve_contents_and_generations(){
+  let mut fs=RamFs::<3>::new();
+  let first=fs.replace(b"/alpha",b"original").unwrap();
+  assert_eq!(fs.metadata(b"/alpha"),Ok((first,8)));
+  let copied=fs.copy_new(b"/alpha",b"/backup").unwrap();
+  let renamed=fs.rename_if_version(b"/backup",b"/renamed",copied).unwrap();
+  assert_eq!(fs.metadata(b"/backup"),Err(Error::NotFound));
+  let mut out=[0u8;8];
+  assert_eq!(fs.read(b"/renamed",0,&mut out),Ok(8));
+  assert_eq!(&out,b"original");
+  assert_eq!(fs.delete_if_version(b"/renamed",renamed),Ok(4));
+  assert_eq!(fs.count(),1);
+  assert_eq!(fs.metadata(b"/alpha"),Ok((first,8)));
+ }
+ #[test]fn collisions_and_stale_ui_versions_never_mutate_files(){
+  let mut fs=RamFs::<2>::new();
+  fs.replace(b"/a",b"old").unwrap();
+  fs.replace(b"/b",b"keep").unwrap();
+  let v=fs.version();
+  assert_eq!(fs.copy_new(b"/a",b"/b"),Err(Error::Invalid));
+  assert_eq!(fs.rename_if_version(b"/a",b"/b",1),Err(Error::Invalid));
+  assert_eq!(fs.delete_if_version(b"/a",99),Err(Error::Invalid));
+  assert_eq!(fs.rename_if_version(b"/a",b"/../escape",1),Err(Error::Invalid));
+  assert_eq!(fs.copy_new(b"/a",b"/c"),Err(Error::Full));
+  assert_eq!(fs.version(),v);
+  let mut out=[0u8;4];fs.read(b"/b",0,&mut out).unwrap();
+  assert_eq!(&out,b"keep");
+ }
+ #[test]fn missing_files_and_zero_capacity_fail_without_publish(){
+  let mut fs=RamFs::<0>::new();
+  assert_eq!(fs.copy_new(b"/a",b"/b"),Err(Error::NotFound));
+  assert_eq!(fs.rename_if_version(b"/a",b"/b",1),Err(Error::NotFound));
+  assert_eq!(fs.delete_if_version(b"/a",1),Err(Error::NotFound));
+  assert_eq!(fs.version(),0);
+ }
+}
