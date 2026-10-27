@@ -56,6 +56,20 @@ impl Policy{
   self.rights&needed==needed&&
    grants.require(caller,needed,now).is_ok()
  }
+ /// Enforce a kernel-derived live permission plus a bounded user span
+ /// for installed-app file reads/writes. Ingress still must validate the
+ /// page-table mapping and copy buffers into trusted kernel memory.
+ pub fn allow_live_buffer<const N:usize>(&self,
+   grants:&crate::batch6_security::Access<N>,caller:Identity,now:u64,
+   syscall:u64,operation:u64,addr:u64,length:u64,user_top:u64)->bool{
+  if !self.allow_live(grants,caller,now,syscall,operation){
+   return false;
+  }
+  // File read/write services accept pointers; other operations must be
+  // verified against their specific syscall ABI before being admitted.
+  if !matches!(syscall,11|12|13|32|34){return false;}
+  crate::batch4_linux_abi::validate_user_span(addr,length,user_top).is_ok()
+ }
  pub fn allow(&self,caller:Identity,syscall:u64,operation:u64)->bool{
   if caller!=self.identity{return false;}
   match Self::required(syscall,operation){
@@ -171,6 +185,24 @@ mod m2_tests{
   assert!(!policy.allow_live(&grants,who,2,30,0));
   assert!(!policy.allow_live(&grants,who,2,7,0));
   assert!(!policy.allow_live(&grants,who,2,32,200));
+ }
+
+
+ #[test]fn installed_app_buffers_must_be_bounded_before_authorized_file_io(){
+  use crate::batch6_security::{Access,VIEW,FILE_READ};
+  let actor=who();
+  let policy=Policy::new(actor,VIEW|FILE_READ).unwrap();
+  let mut grants=Access::<1>::new();
+  grants.grant(actor,VIEW|FILE_READ,10).unwrap();
+  assert!(policy.allow_live_buffer(&grants,actor,1,12,0,
+    0x2000,32,0x10000));
+  for (addr,size) in [(0,32),(0x2000,0),(u64::MAX,20),(0xfff0,100)]{
+   assert!(!policy.allow_live_buffer(&grants,actor,1,12,0,addr,size,0x10000));
+  }
+  assert!(!policy.allow_live_buffer(&grants,actor,1,30,0,0x2000,32,0x10000));
+  assert!(!policy.allow_live_buffer(&grants,actor,10,12,0,0x2000,32,0x10000));
+  assert!(!policy.allow_live_buffer(&grants,
+    Identity{generation:2,..actor},1,12,0,0x2000,32,0x10000));
  }
 
 }
