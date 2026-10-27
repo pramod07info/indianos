@@ -41,7 +41,7 @@ pub fn command<D:BlockDevice,const N:usize>(
  if input.is_empty()||input.len()>MAX_COMMAND||input.iter().any(|c|
   *c!=b' '&&!c.is_ascii_graphic()){return Err(Error::Invalid);}
  let line=core::str::from_utf8(input).map_err(|_|Error::Invalid)?.trim();
- if line=="help"{return publish(b"pwd ls /dir cat /path write /path text mkdir /dir mv /old /new cp /src /dst rm /path",out);}
+ if line=="help"{return publish(b"pwd ls /dir cat /path write /path text append /path text mkdir /dir mv /old /new cp /src /dst rm /path",out);}
  if line=="pwd"{return publish(b"/",out);}
  let (verb,raw)=line.split_once(' ').ok_or(Error::Unknown)?;
  let mut name=[0u8;64];
@@ -84,6 +84,22 @@ pub fn command<D:BlockDevice,const N:usize>(
     Err(e)=>return Err(Error::Io(e)),
    };
    publish(b"saved",out)
+  }
+  "append"=>{
+   // DurableFS commits a whole new checksummed image through write_at;
+   // exact prior file content is verified before any new disk mutation.
+   auth.require(caller,FILE_READ|FILE_WRITE,now).map_err(|_|Error::Denied)?;
+   if out.len()<8{return Err(Error::OutputTooSmall);}
+   let (raw_path,data)=raw.split_once(' ').ok_or(Error::Invalid)?;
+   if data.is_empty()||data.len()>MAX_TRANSFER{return Err(Error::Invalid);}
+   let p=path(raw_path,&mut name)?;
+   writable_path(p)?;
+   let mut prior=[0u8;crate::durablefs::MAX_FILE_BYTES];
+   let len=fs.read(p,&mut prior).map_err(Error::Io)?;
+   if len.checked_add(data.len()).is_none_or(|n|
+      n>crate::durablefs::MAX_FILE_BYTES){return Err(Error::Io(FsError::TooLarge));}
+   fs.write_at(p,len as u64,data.as_bytes()).map_err(Error::Io)?;
+   publish(b"appended",out)
   }
   "cp"=>{
    // A copy reads the source AND mutates the destination. Neither a
@@ -283,6 +299,45 @@ mod tests{
   assert_eq!(&b[..n],b"okay");
  }
 
+ #[test]fn terminal_append_is_committed_across_multiple_remounts(){
+  let access=grants();
+  let mut fs=HierVfs::format_blank(blank()).unwrap();
+  run(&mut fs,&access,user(),b"mkdir /home").unwrap();
+  run(&mut fs,&access,user(),b"write /home/log first").unwrap();
+  fs=HierVfs::mount(fs.into_device()).unwrap();
+  let (n,reply)=run(&mut fs,&access,user(),b"append /home/log +second").unwrap();
+  assert_eq!(&reply[..n],b"appended");
+  fs=HierVfs::mount(fs.into_device()).unwrap();
+  run(&mut fs,&access,user(),b"append /home/log +third").unwrap();
+  fs=HierVfs::mount(fs.into_device()).unwrap();
+  let (n,contents)=run(&mut fs,&access,user(),b"cat /home/log").unwrap();
+  assert_eq!(&contents[..n],b"first+second+third");
+ }
+ #[test]fn terminal_append_denial_and_torn_write_preserve_last_commit(){
+  let access=grants();
+  let mut fs=HierVfs::format_blank(blank()).unwrap();
+  run(&mut fs,&access,user(),b"mkdir /docs").unwrap();
+  run(&mut fs,&access,user(),b"write /docs/notes stable").unwrap();
+  let before=fs.generation();
+  let stale=Identity{generation:2,..user()};
+  assert_eq!(run(&mut fs,&access,stale,b"append /docs/notes evil"),
+    Err(Error::Denied));
+  assert_eq!(run(&mut fs,&access,user(),b"append /boot/kernel evil"),
+    Err(Error::Denied));
+  let mut too_small=[0x5a;7];
+  assert_eq!(command(&mut fs,&access,user(),1,b"append /docs/notes evil",
+    &mut too_small),Err(Error::OutputTooSmall));
+  assert_eq!(too_small,[0x5a;7]);
+  assert_eq!(fs.generation(),before);
+  let mut disk=fs.into_device();disk.fail_writes=true;
+  let mut fs=HierVfs::mount(disk).unwrap();
+  assert_eq!(run(&mut fs,&access,user(),b"append /docs/notes unsafe"),
+    Err(Error::Io(FsError::Io)));
+  let mut disk=fs.into_device();disk.fail_writes=false;
+  let mut fs=HierVfs::mount(disk).unwrap();
+  let (n,content)=run(&mut fs,&access,user(),b"cat /docs/notes").unwrap();
+  assert_eq!(&content[..n],b"stable");
+ }
  #[test]fn terminal_copy_is_durable_and_requires_both_rights(){
   let mut fs=HierVfs::format_blank(blank()).unwrap();
   let access=grants();
