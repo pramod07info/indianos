@@ -217,3 +217,39 @@ mod intersection_tests {
         assert_eq!(intersect_grants(sample(3), sample(4), request()), Err(CapabilityError::Rights));
     }
 }
+
+
+/// Authorization for short-lived filesystem/network grants: expiry is
+/// checked *after* owner, resource, rights, epoch and generation validation.
+/// A recycled PID or replayed grant can never extend its lifetime.
+pub fn authorize_until(grant:Grant,request:Request,now:u64,expires_at:u64)
+    ->Result<(),CapabilityError>{
+    authorize(grant,request)?;
+    if expires_at==0 || now>=expires_at {
+        return Err(CapabilityError::Stale);
+    }
+    Ok(())
+}
+#[cfg(test)]
+mod grant_expiration_tests{
+    use super::*;
+    fn pair()->(Grant,Request){
+        (Grant{owner:5,resource:7,rights:3,epoch:2,generation:9,revoked:false},
+         Request{caller:5,resource:7,required_rights:1,
+                 current_epoch:2,current_generation:9})
+    }
+    #[test]fn valid_grant_before_expiry_is_authorized(){
+        let (g,r)=pair();assert_eq!(authorize_until(g,r,19,20),Ok(()));
+    }
+    #[test]fn exact_expiry_and_zero_expiry_are_denied(){
+        let (g,r)=pair();
+        assert_eq!(authorize_until(g,r,20,20),Err(CapabilityError::Stale));
+        assert_eq!(authorize_until(g,r,0,0),Err(CapabilityError::Stale));
+    }
+    #[test]fn revoked_or_recycled_identity_never_reauthorizes(){
+        let (mut g,mut r)=pair();r.current_generation=10;
+        assert_eq!(authorize_until(g,r,1,20),Err(CapabilityError::Stale));
+        r.current_generation=9;g.revoked=true;
+        assert_eq!(authorize_until(g,r,1,20),Err(CapabilityError::Revoked));
+    }
+}
