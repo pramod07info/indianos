@@ -149,3 +149,19 @@ mod retry_gate_tests{
         assert_eq!(retry_if_due(s,u32::MAX,150,150),Err(ServiceError::CounterOverflow));
     }
 }
+
+
+/// Ensure the observed scheduler tick is strictly newer than the last
+/// consumed retry tick, preventing replay of one observed deadline.
+pub fn retry_fresh(service:Service,observed_generation:u32,
+ now:u64,deadline:u64,last_consumed:u64)->Result<Service,ServiceError>{
+ if now<=last_consumed{return Err(ServiceError::InvalidTransition)}
+ retry_if_due(service,observed_generation,now,deadline)
+}
+#[cfg(test)]mod replay_retry_tests{
+ use super::*;
+ fn waiting()->Service{Service{state:State::WaitingRestart,retries:0,retry_budget:2,generation:8}}
+ #[test]fn newer_deadline_allows_retry(){assert_eq!(retry_fresh(waiting(),8,100,99,90).unwrap().generation,9);}
+ #[test]fn repeated_tick_cannot_retry(){assert_eq!(retry_fresh(waiting(),8,100,99,100),Err(ServiceError::InvalidTransition));}
+ #[test]fn wrong_generation_cannot_retry(){assert_eq!(retry_fresh(waiting(),9,100,99,90),Err(ServiceError::InvalidTransition));}
+}
