@@ -13,7 +13,8 @@ pub enum FileError{Authorization(Error),Storage(crate::durablefs::FsError)}
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 struct Approval{
  process:Identity,app:u32,version:u64,digest:[u8;32],
- approved_rights:u32,expires:u64,
+ approved_rights:u32,deps:[u32;crate::m2_sdk::MAX_DEPS],
+ minimums:[u64;crate::m2_sdk::MAX_DEPS],expires:u64,
 }
 pub struct Ledger<const P:usize>{records:[Option<Approval>;P]}
 impl<const P:usize> Ledger<P>{
@@ -27,7 +28,7 @@ impl<const P:usize> Ledger<P>{
   auth.require(administrator,INSTALL,now).map_err(|_|Error::Denied)?;
   if process.pid==0||process.generation==0||app.id==0||app.version==0||
      app.digest==[0;32]||approved_rights&!ALL!=0||
-     app.rights&!approved_rights!=0||expires<=now{
+     app.rights!=approved_rights||expires<=now{
     return Err(Error::Invalid);
   }
   // Never silently transfer old permissions to a reused PID.
@@ -37,7 +38,8 @@ impl<const P:usize> Ledger<P>{
   let slot=self.records.iter_mut().find(|x|x.is_none())
    .ok_or(Error::Capacity)?;
   *slot=Some(Approval{process,app:app.id,version:app.version,
-    digest:app.digest,approved_rights,expires});
+    digest:app.digest,approved_rights,deps:app.deps,
+    minimums:app.minimums,expires});
   Ok(())
  }
  /// Do not use package name alone: stale generations, upgraded binaries,
@@ -47,7 +49,8 @@ impl<const P:usize> Ledger<P>{
     .ok_or(Error::Denied)?;
   if approval.process!=process||approval.app!=app.id||
      approval.version!=app.version||approval.digest!=app.digest||
-     (app.rights&!approval.approved_rights)!=0{
+     app.rights!=approval.approved_rights||
+     app.deps!=approval.deps||app.minimums!=approval.minimums{
    return Err(Error::Denied);
   }
   if now>=approval.expires{return Err(Error::Expired);}
@@ -174,12 +177,18 @@ mod m2_tests{
   assert_eq!(ledger.require(process(),app(),1),Err(Error::Denied));
   assert_eq!(ledger.approve(&auth(),actor(),1,process(),app(),0,20),
    Err(Error::Invalid));
+  assert_eq!(ledger.approve(&auth(),actor(),1,process(),app(),
+    FILE_READ|FILE_WRITE,20),Err(Error::Invalid));
   ledger.approve(&auth(),actor(),1,process(),app(),FILE_READ,20).unwrap();
   assert_eq!(ledger.require(process(),app(),1),Ok(()));
   assert_eq!(ledger.require(Identity{generation:2,..process()},app(),1),Err(Error::Denied));
   assert_eq!(ledger.require(process(),Record{version:3,..app()},1),Err(Error::Denied));
   assert_eq!(ledger.require(process(),Record{digest:[4;32],..app()},1),Err(Error::Denied));
   assert_eq!(ledger.require(process(),Record{rights:FILE_READ|FILE_WRITE,..app()},1),Err(Error::Denied));
+  let mut altered=app();altered.deps[0]=12;altered.minimums[0]=2;
+  assert_eq!(ledger.require(process(),altered,1),Err(Error::Denied));
+  altered=app();altered.minimums[0]=5;
+  assert_eq!(ledger.require(process(),altered,1),Err(Error::Denied));
   assert_eq!(ledger.require(process(),app(),20),Err(Error::Expired));
   assert_eq!(ledger.approve(&auth(),actor(),1,Identity{generation:2,..process()},
     app(),FILE_READ,30),Err(Error::Duplicate));
