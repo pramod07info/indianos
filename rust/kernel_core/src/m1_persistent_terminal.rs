@@ -41,7 +41,7 @@ pub fn command<D:BlockDevice,const N:usize>(
  if input.is_empty()||input.len()>MAX_COMMAND||input.iter().any(|c|
   *c!=b' '&&!c.is_ascii_graphic()){return Err(Error::Invalid);}
  let line=core::str::from_utf8(input).map_err(|_|Error::Invalid)?.trim();
- if line=="help"{return publish(b"pwd ls /dir cat /path write /path text append /path text mkdir /dir mv /old /new cp /src /dst rm /path mkfile /path truncate /path head /path count rmdir /dir mvdir /old /new",out);}
+ if line=="help"{return publish(b"pwd ls /dir cat /path write /path text append /path text mkdir /dir mv /old /new cp /src /dst rm /path mkfile /path truncate /path head /path count rmdir /dir mvdir /old /new pread /file offset count pwrite /file@offset text",out);}
  if line=="pwd"{return publish(b"/",out);}
  let (verb,raw)=line.split_once(' ').ok_or(Error::Unknown)?;
  let mut name=[0u8;64];
@@ -155,6 +155,37 @@ pub fn command<D:BlockDevice,const N:usize>(
    writable_path(dest)?;
    fs.rename_dir(src,dest).map_err(Error::Io)?;
    publish(b"moved",out)
+  }
+  "pread"=>{
+   // Bounded random-access read with an authenticated process grant.
+   auth.require(caller,FILE_READ,now).map_err(|_|Error::Denied)?;
+   let mut items=raw.split(' ');
+   let raw_path=items.next().ok_or(Error::Invalid)?;
+   let offset=items.next().ok_or(Error::Invalid)?
+     .parse::<u64>().map_err(|_|Error::Invalid)?;
+   let count=items.next().ok_or(Error::Invalid)?
+     .parse::<usize>().map_err(|_|Error::Invalid)?;
+   if items.next().is_some()||count==0||count>MAX_TRANSFER{
+    return Err(Error::Invalid);
+   }
+   let p=path(raw_path,&mut name)?;
+   let mut data=[0u8;MAX_TRANSFER];
+   let n=fs.read_at(p,offset,&mut data[..count]).map_err(Error::Io)?;
+   publish(&data[..n],out)
+  }
+  "pwrite"=>{
+   // In-place bounded persistent update; never creates sparse holes or
+   // bypasses the protected mount namespace. Output preflight precedes I/O.
+   auth.require(caller,FILE_WRITE,now).map_err(|_|Error::Denied)?;
+   if out.len()<5{return Err(Error::OutputTooSmall);}
+   let (where_at,data)=raw.split_once(' ').ok_or(Error::Invalid)?;
+   let (raw_path,offset)=where_at.split_once('@').ok_or(Error::Invalid)?;
+   let offset=offset.parse::<u64>().map_err(|_|Error::Invalid)?;
+   if data.is_empty()||data.len()>MAX_TRANSFER{return Err(Error::Invalid);}
+   let p=path(raw_path,&mut name)?;
+   writable_path(p)?;
+   fs.write_at(p,offset,data.as_bytes()).map_err(Error::Io)?;
+   publish(b"saved",out)
   }
   "cp"=>{
    // A copy reads the source AND mutates the destination. Neither a
@@ -593,6 +624,46 @@ mod tests{
              Err(Error::Denied));
   assert_eq!(fs.generation(),old);
   run(&mut fs,&a,user(),b"rmdir /empty").unwrap();
+ }
+
+
+ #[test]fn persistent_random_access_survives_mount_and_keeps_other_bytes(){
+  let mut fs=HierVfs::format_blank(blank()).unwrap();let a=grants();
+  run(&mut fs,&a,user(),b"write /note abcdefgh").unwrap();
+  let (n,out)=run(&mut fs,&a,user(),b"pread /note 2 3").unwrap();
+  assert_eq!(&out[..n],b"cde");
+  run(&mut fs,&a,user(),b"pwrite /note@3 XYZ").unwrap();
+  let mut fs=HierVfs::mount(fs.into_device()).unwrap();
+  let (n,out)=run(&mut fs,&a,user(),b"cat /note").unwrap();
+  assert_eq!(&out[..n],b"abcXYZgh");
+ }
+ #[test]fn random_io_rejects_stale_caller_protected_write_and_sparse_holes(){
+  let mut fs=HierVfs::format_blank(blank()).unwrap();let a=grants();
+  run(&mut fs,&a,user(),b"write /note original").unwrap();
+  let generation=fs.generation();
+  let stale=Identity{generation:2,..user()};
+  assert_eq!(run(&mut fs,&a,stale,b"pread /note 1 2"),Err(Error::Denied));
+  assert_eq!(run(&mut fs,&a,stale,b"pwrite /note@0 bad"),Err(Error::Denied));
+  assert_eq!(run(&mut fs,&a,user(),b"pwrite /system/key@0 bad"),Err(Error::Denied));
+  assert!(matches!(run(&mut fs,&a,user(),b"pwrite /note@1000 bad"),Err(Error::Io(_))));
+  assert_eq!(fs.generation(),generation);
+  let (n,out)=run(&mut fs,&a,user(),b"cat /note").unwrap();
+  assert_eq!(&out[..n],b"original");
+ }
+ #[test]fn malformed_offsets_and_output_preflight_never_touch_disk(){
+  let mut fs=HierVfs::format_blank(blank()).unwrap();let a=grants();
+  run(&mut fs,&a,user(),b"write /note hello").unwrap();
+  let before=fs.generation();
+  for cmd in [b"pread /note x 2".as_slice(),b"pread /note 0 0",
+              b"pread /note 0 300",b"pwrite /note@-1 text",
+              b"pwrite /note@invalid text"]{
+   assert!(run(&mut fs,&a,user(),cmd).is_err());
+  }
+  let mut out=[0x99u8;2];
+  assert_eq!(command(&mut fs,&a,user(),1,b"pwrite /note@0 hi",&mut out),
+             Err(Error::OutputTooSmall));
+  assert_eq!(out,[0x99;2]);
+  assert_eq!(fs.generation(),before);
  }
 
 }
