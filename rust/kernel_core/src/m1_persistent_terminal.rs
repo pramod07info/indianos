@@ -41,7 +41,7 @@ pub fn command<D:BlockDevice,const N:usize>(
  if input.is_empty()||input.len()>MAX_COMMAND||input.iter().any(|c|
   *c!=b' '&&!c.is_ascii_graphic()){return Err(Error::Invalid);}
  let line=core::str::from_utf8(input).map_err(|_|Error::Invalid)?.trim();
- if line=="help"{return publish(b"pwd ls /dir cat /path write /path text mkdir /dir mv /old /new",out);}
+ if line=="help"{return publish(b"pwd ls /dir cat /path write /path text mkdir /dir mv /old /new rm /path",out);}
  if line=="pwd"{return publish(b"/",out);}
  let (verb,raw)=line.split_once(' ').ok_or(Error::Unknown)?;
  let mut name=[0u8;64];
@@ -84,6 +84,14 @@ pub fn command<D:BlockDevice,const N:usize>(
     Err(e)=>return Err(Error::Io(e)),
    };
    publish(b"saved",out)
+  }
+  "rm"=>{
+   auth.require(caller,FILE_WRITE,now).map_err(|_|Error::Denied)?;
+   if out.len()<7{return Err(Error::OutputTooSmall);}
+   let p=path(raw,&mut name)?;
+   writable_path(p)?;
+   fs.unlink(p).map_err(Error::Io)?;
+   publish(b"removed",out)
   }
   "mv"=>{
    auth.require(caller,FILE_WRITE,now).map_err(|_|Error::Denied)?;
@@ -208,6 +216,40 @@ mod tests{
   assert_eq!(&buf[..n],b"trusted");
   let (n,buf)=run(&mut fs,&access,user(),b"cat /home/note").unwrap();
   assert_eq!(&buf[..n],b"personal");
+ }
+ #[test]fn terminal_removal_and_multi_write_survive_separate_remounts(){
+  let mut fs=HierVfs::format_blank(blank()).unwrap();
+  let access=grants();
+  run(&mut fs,&access,user(),b"mkdir /docs").unwrap();
+  run(&mut fs,&access,user(),b"write /docs/note first").unwrap();
+  fs=HierVfs::mount(fs.into_device()).unwrap();
+  run(&mut fs,&access,user(),b"write /docs/note second").unwrap();
+  fs=HierVfs::mount(fs.into_device()).unwrap();
+  let (count,bytes)=run(&mut fs,&access,user(),b"cat /docs/note").unwrap();
+  assert_eq!(&bytes[..count],b"second");
+  let (count,bytes)=run(&mut fs,&access,user(),b"rm /docs/note").unwrap();
+  assert_eq!(&bytes[..count],b"removed");
+  fs=HierVfs::mount(fs.into_device()).unwrap();
+  assert_eq!(run(&mut fs,&access,user(),b"cat /docs/note"),
+    Err(Error::Io(FsError::NotFound)));
+ }
+ #[test]fn terminal_remove_denied_and_short_output_cannot_delete_data(){
+  let mut fs=HierVfs::format_blank(blank()).unwrap();
+  let access=grants();
+  fs.mkdir("/system").unwrap();
+  fs.create("/system/config",b"trusted").unwrap();
+  fs.mkdir("/docs").unwrap();fs.create("/docs/file",b"keep").unwrap();
+  let generation=fs.generation();
+  assert_eq!(run(&mut fs,&access,user(),b"rm /system/config"),Err(Error::Denied));
+  let stale=Identity{generation:2,..user()};
+  assert_eq!(run(&mut fs,&access,stale,b"rm /docs/file"),Err(Error::Denied));
+  let mut short=[0xf0;2];
+  assert_eq!(command(&mut fs,&access,user(),1,b"rm /docs/file",&mut short),
+    Err(Error::OutputTooSmall));
+  assert_eq!(short,[0xf0;2]);
+  assert_eq!(fs.generation(),generation);
+  let (n,out)=run(&mut fs,&access,user(),b"cat /docs/file").unwrap();
+  assert_eq!(&out[..n],b"keep");
  }
  #[test]fn security_m1_namespace_guard_does_not_block_unrelated_names(){
   let mut fs=HierVfs::format_blank(blank()).unwrap();
