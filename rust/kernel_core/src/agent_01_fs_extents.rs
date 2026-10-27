@@ -208,3 +208,80 @@ mod extent_budget_tests {
         assert_eq!(validate_extent_budget(&overflow, u64::MAX, 0, 0), Err(ExtentError::Overflow));
     }
 }
+
+
+/// Compare two independently validated extent owners without allocating.
+/// Returns false when any physical block is claimed by both owners.
+/// Corrupt metadata in either owner is always an error, never a disjoint result.
+/// Policy helper only: callers must authenticate ownership before using it.
+pub fn extent_owners_disjoint(
+    left: &[Extent],
+    right: &[Extent],
+    device_blocks: u64,
+) -> Result<bool, ExtentError> {
+    validate_extents(left, device_blocks)?;
+    validate_extents(right, device_blocks)?;
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < left.len() && j < right.len() {
+        // Validation above proves these additions cannot overflow.
+        let left_end = left[i].start + left[i].blocks;
+        let right_end = right[j].start + right[j].blocks;
+        if left[i].start < right_end && right[j].start < left_end {
+            return Ok(false);
+        }
+        if left_end <= right_end {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    Ok(true)
+}
+
+#[cfg(test)]
+mod cross_owner_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_partial_and_contained_cross_owner_aliases() {
+        let left = [Extent { start: 2, blocks: 5 }];
+        assert_eq!(extent_owners_disjoint(
+            &left, &[Extent { start: 6, blocks: 3 }], 20), Ok(false));
+        assert_eq!(extent_owners_disjoint(
+            &left, &[Extent { start: 3, blocks: 1 }], 20), Ok(false));
+    }
+
+    #[test]
+    fn accepts_adjacent_fragmented_and_empty_owners() {
+        let left = [Extent { start: 1, blocks: 2 },
+                    Extent { start: 8, blocks: 2 }];
+        let right = [Extent { start: 3, blocks: 5 },
+                     Extent { start: 10, blocks: 2 }];
+        assert_eq!(extent_owners_disjoint(&left, &right, 12), Ok(true));
+        assert_eq!(extent_owners_disjoint(&left, &[], 12), Ok(true));
+        assert_eq!(extent_owners_disjoint(&[], &right, 12), Ok(true));
+    }
+
+    #[test]
+    fn rejects_corruption_in_either_owner_before_comparing() {
+        let good = [Extent { start: 0, blocks: 2 }];
+        let bad = [Extent { start: 9, blocks: 2 }];
+        assert_eq!(extent_owners_disjoint(&good, &bad, 10),
+                   Err(ExtentError::OutsideDevice));
+        assert_eq!(extent_owners_disjoint(&bad, &good, 10),
+                   Err(ExtentError::OutsideDevice));
+        let overlap = [Extent { start: 3, blocks: 2 },
+                       Extent { start: 4, blocks: 2 }];
+        assert_eq!(extent_owners_disjoint(&good, &overlap, 10),
+                   Err(ExtentError::Overlap));
+    }
+
+    #[test]
+    fn handles_last_device_boundary_without_wrapping() {
+        let left = [Extent { start: u64::MAX - 4, blocks: 2 }];
+        let adjacent = [Extent { start: u64::MAX - 2, blocks: 2 }];
+        let overlapping = [Extent { start: u64::MAX - 3, blocks: 2 }];
+        assert_eq!(extent_owners_disjoint(&left, &adjacent, u64::MAX), Ok(true));
+        assert_eq!(extent_owners_disjoint(&left, &overlapping, u64::MAX), Ok(false));
+    }
+}
