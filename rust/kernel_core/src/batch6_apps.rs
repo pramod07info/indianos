@@ -61,3 +61,75 @@ pub fn classify(request:Requested<'_>,host_arch:u16)->Result<Availability,Error>
    bytes:&elf,mac:None},62),Err(Error::Unverified));
  }
 }
+
+/// Orbit R005: preflight multiple signed application candidates before any
+/// install decision. No executable parser can turn an absent Windows, Linux,
+/// Android or macOS runtime into working binary compatibility.
+pub fn classify_batch(requests:&[Requested<'_>],host_arch:u16,
+ out:&mut[Availability])->Result<usize,Error>{
+ if requests.is_empty()||out.len()<requests.len(){
+  return Err(Error::UnknownFormat);
+ }
+ for request in requests{
+  let _=classify(Requested{format:request.format,verified:request.verified,
+    bytes:request.bytes,mac:request.mac},host_arch)?;
+ }
+ for (i,request) in requests.iter().enumerate(){
+  out[i]=classify(Requested{format:request.format,verified:request.verified,
+    bytes:request.bytes,mac:request.mac},host_arch)?;
+ }
+ Ok(requests.len())
+}
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum ExecutionGate{NativeAllowed,WebRequired,RemoteApprovalRequired,
+ RuntimeRequired,PortRequired}
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum LaunchError{NoConsent,UntrustedNative,UnsupportedRuntime}
+/// Deterministic route planner: optional assistant recommendations cannot
+/// bypass explicit consent, a signed-app gate or a missing runtime.
+pub fn launch_gate(route:Availability,consented:bool,
+ trusted_native:bool)->Result<ExecutionGate,LaunchError>{
+ if !consented{return Err(LaunchError::NoConsent);}
+ Ok(match route{
+  Availability::Native=>{
+   if !trusted_native{return Err(LaunchError::UntrustedNative);}
+   ExecutionGate::NativeAllowed
+  },
+  Availability::RuntimeMissing=>ExecutionGate::RuntimeRequired,
+  Availability::Web=>ExecutionGate::WebRequired,
+  Availability::AuthorizedRemote=>ExecutionGate::RemoteApprovalRequired,
+  Availability::PortRequired=>ExecutionGate::PortRequired,
+ })
+}
+/// Only a verified native route is eligible for a local direct launch.
+pub fn may_execute_locally(route:ExecutionGate)->bool{
+ matches!(route,ExecutionGate::NativeAllowed)
+}
+#[cfg(test)]
+mod orbit_r005_compat_tests{
+ use super::*;
+ #[test]fn native_batch_is_atomic_against_unverified_input(){
+  let first=Requested{format:Format::Native,verified:true,bytes:b"",mac:None};
+  let bad=Requested{format:Format::Native,verified:false,bytes:b"",mac:None};
+  let mut out=[Availability::RuntimeMissing;2];
+  assert_eq!(classify_batch(&[first,bad],62,&mut out),Err(Error::Unverified));
+  assert_eq!(out,[Availability::RuntimeMissing;2]);
+  assert_eq!(classify_batch(&[first],62,&mut out),Ok(1));
+  assert_eq!(out[0],Availability::Native);
+ }
+ #[test]fn unsupported_platforms_never_convert_into_native_execution(){
+  for route in [Availability::RuntimeMissing,Availability::Web,
+   Availability::AuthorizedRemote,Availability::PortRequired]{
+   let mode=launch_gate(route,true,true).unwrap();
+   assert!(!may_execute_locally(mode));
+  }
+  assert_eq!(launch_gate(Availability::Native,false,true),Err(LaunchError::NoConsent));
+  assert_eq!(launch_gate(Availability::Native,true,false),
+   Err(LaunchError::UntrustedNative));
+  assert!(may_execute_locally(launch_gate(Availability::Native,true,true).unwrap()));
+ }
+ #[test]fn short_output_does_not_expose_partly_classified_candidates(){
+  let input=[Requested{format:Format::Native,verified:true,bytes:b"",mac:None}];
+  assert_eq!(classify_batch(&input,62,&mut []),Err(Error::UnknownFormat));
+ }
+}
