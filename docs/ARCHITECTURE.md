@@ -367,3 +367,32 @@ wire-integrated with HD3B.3 and does not make GPU rendering functional.
 Real acceleration requires a trusted hardware transport, an authenticated
 driver, DMA ownership, CPU/device coherency and emulator/device tests.
 The default CPU-rendered desktop remains intact.
+
+## Issue #124 HD3B.5: checked GPU control submission to mock split queues
+
+The HD3B.5 `hardware_gpu_guarded_queue` software interface composes
+HD3B.4's strict six-command policy with HD3B.3's bounded split-ring
+descriptor encoder. No command descriptor can be staged until command
+fields, owner generation, suggested framebuffer backing, command length
+and response capacity pass validation. It binds the pending response
+type to the descriptor head and validates exact response byte length,
+virtio status, zero reserved header fields, display-info scanout bounds
+and used-ring completion bookkeeping before releasing a mock request.
+Bad status, device metadata, overlapping DMA ranges or stale owner
+identity leave queued data unreleased for controlled retirement.
+
+Eight adversarial host tests exercise normal command flow, malformed
+requests, forged display info, bad used-head/length and ring overlap,
+owner reuse, response formatting, and teardown; mandatory kernel CI
+also runs no_std and the M2 feature variant.
+
+**This does not implement live device transport.** Both request and
+response bytes and physical interval metadata are supplied by a test
+caller; no pinned pages or independently verified IOMMU translations
+are available. This cannot attest that device-visible DMA bytes match
+the checked command. No PCI bus mastering, DMA, MMIO or hardware
+notifications are enabled. A future production binding must check
+actual pinned immutable request contents, IOMMU domain ownership,
+cache fences, signed driver authorizations and hostile device
+completions before enabling a real virtqueue. CPU rendering remains
+the ordinary boot fallback.
