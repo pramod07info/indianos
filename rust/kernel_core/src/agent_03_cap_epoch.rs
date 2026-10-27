@@ -161,3 +161,59 @@ mod agent05_reassignment_tests {
         assert_eq!(revoke_owned(g,r),Err(CapabilityError::Stale));
     }
 }
+
+/* Restrict two independently authorized grants without widening rights. */
+pub fn intersect_grants(a: Grant, b: Grant, request: Request) -> Result<Grant, CapabilityError> {
+    authorize(a, request)?;
+    authorize(b, request)?;
+    if a.owner != b.owner || a.resource != b.resource
+        || a.epoch != b.epoch || a.generation != b.generation
+    {
+        return Err(CapabilityError::Stale);
+    }
+    let rights = a.rights & b.rights;
+    if rights == 0 {
+        return Err(CapabilityError::Rights);
+    }
+    Ok(Grant { rights, ..a })
+}
+
+#[cfg(test)]
+mod intersection_tests {
+    use super::*;
+
+    fn sample(rights: u32) -> Grant {
+        Grant { owner: 2, resource: 4, rights, epoch: 3, generation: 1, revoked: false }
+    }
+    fn request() -> Request {
+        Request { caller: 2, resource: 4, required_rights: 1,
+            current_epoch: 3, current_generation: 1 }
+    }
+
+    #[test]
+    fn only_shared_rights_survive() {
+        assert_eq!(intersect_grants(sample(3), sample(5), request()).unwrap().rights, 1);
+    }
+    #[test]
+    fn stale_epoch_is_denied() {
+        let mut b = sample(3);
+        b.epoch = 4;
+        assert_eq!(intersect_grants(sample(3), b, request()), Err(CapabilityError::Stale));
+    }
+    #[test]
+    fn revoked_grants_are_denied() {
+        let mut b = sample(3);
+        b.revoked = true;
+        assert_eq!(intersect_grants(sample(3), b, request()), Err(CapabilityError::Revoked));
+    }
+    #[test]
+    fn foreign_owner_is_denied() {
+        let mut b = sample(3);
+        b.owner = 99;
+        assert_eq!(intersect_grants(sample(3), b, request()), Err(CapabilityError::Owner));
+    }
+    #[test]
+    fn missing_requested_rights_are_denied() {
+        assert_eq!(intersect_grants(sample(3), sample(4), request()), Err(CapabilityError::Rights));
+    }
+}
