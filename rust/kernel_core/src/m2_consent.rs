@@ -11,6 +11,8 @@ pub enum Error{Invalid,Denied,Expired,Capacity,Duplicate}
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 pub enum FileError{Authorization(Error),Storage(crate::durablefs::FsError)}
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum NetworkError{Consent(Error),Socket(crate::m2_network::Error)}
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
 struct Approval{
  process:Identity,app:u32,version:u64,digest:[u8;32],
  approved_rights:u32,deps:[u32;crate::m2_sdk::MAX_DEPS],
@@ -153,6 +155,27 @@ impl<const P:usize> Ledger<P>{
   if result.is_ok(){guard.completed(1);}
   result
  }
+
+ /// Signed-installation consent + authenticated scheduler credentials
+ /// must both authorize creating a socket bound to a specific process.
+ /// Retiring the process must revoke this approval AND the endpoint lease.
+ pub fn acquire_socket<const N:usize,const S:usize>(
+   &self,socket:&mut crate::m2_network::Endpoint<S>,auth:&Access<N>,
+   process:Identity,app:Record,now:u64,local_port:u16,deadline:u64
+ )->Result<(),NetworkError>{
+   self.require(process,app,now).map_err(NetworkError::Consent)?;
+   if app.rights&crate::batch6_security::SOCKET==0||
+      deadline<=now{return Err(NetworkError::Consent(Error::Denied));}
+   let approval=self.records.iter().flatten()
+      .find(|a|a.process==process)
+      .ok_or(NetworkError::Consent(Error::Denied))?;
+   if deadline>approval.expires{
+      return Err(NetworkError::Consent(Error::Denied));
+   }
+   socket.acquire(auth,process,local_port,now,deadline)
+       .map_err(NetworkError::Socket)
+ }
+
  pub fn revoke(&mut self,process:Identity)->Result<(),Error>{
   let Some(slot)=self.records.iter_mut().find(|x|
     x.is_some_and(|a|a.process==process))else{return Err(Error::Denied)};
@@ -359,6 +382,54 @@ mod m2_tests{
   assert_eq!(ledger.read_authorized(&mut fs,process(),app(),2,
     "/home/a",&mut buf),Ok(8));
   assert_eq!(&buf[..8],b"original");
+ }
+
+
+ #[test]fn approved_signed_app_can_bind_network_socket_with_process_identity(){
+  let app=Record{rights:SOCKET,..app()};
+  let mut ledger=Ledger::<1>::new();
+  ledger.approve(&auth(),actor(),1,process(),app,SOCKET,30).unwrap();
+  let mut network_auth=Access::<1>::new();
+  network_auth.grant(process(),SOCKET,40).unwrap();
+  let mut sockets=crate::m2_network::Endpoint::<1>::new();
+  assert_eq!(ledger.acquire_socket(&mut sockets,&network_auth,
+         process(),app,2,50400,20),Ok(()));
+  assert_eq!(sockets.allow_query(process(),50400,3,b"example.com"),Ok(()));
+  assert_eq!(sockets.allow_query(Identity{generation:2,..process()},
+         50400,3,b"example.com"),Err(crate::m2_network::Error::Denied));
+ }
+ #[test]fn changed_digest_and_unapproved_network_rights_do_not_bind(){
+  let app=Record{rights:SOCKET,..app()};
+  let mut ledger=Ledger::<1>::new();
+  ledger.approve(&auth(),actor(),1,process(),app,SOCKET,30).unwrap();
+  let mut network_auth=Access::<1>::new();
+  network_auth.grant(process(),SOCKET,40).unwrap();
+  let mut sockets=crate::m2_network::Endpoint::<1>::new();
+  assert_eq!(ledger.acquire_socket(&mut sockets,&network_auth,
+          process(),Record{digest:[9;32],..app},2,50400,20),
+          Err(NetworkError::Consent(Error::Denied)));
+  assert_eq!(ledger.acquire_socket(&mut sockets,&network_auth,
+          process(),Record{rights:FILE_READ,..app},2,50400,20),
+          Err(NetworkError::Consent(Error::Denied)));
+  assert_eq!(sockets.allow_query(process(),50400,3,b"example.com"),
+          Err(crate::m2_network::Error::Denied));
+ }
+ #[test]fn network_lease_never_outlives_install_consent(){
+  let app=Record{rights:SOCKET,..app()};
+  let mut ledger=Ledger::<1>::new();
+  ledger.approve(&auth(),actor(),1,process(),app,SOCKET,20).unwrap();
+  let mut network_auth=Access::<1>::new();
+  network_auth.grant(process(),SOCKET,40).unwrap();
+  let mut sockets=crate::m2_network::Endpoint::<1>::new();
+  assert_eq!(ledger.acquire_socket(&mut sockets,&network_auth,
+          process(),app,2,50400,21),Err(NetworkError::Consent(Error::Denied)));
+  assert_eq!(ledger.acquire_socket(&mut sockets,&network_auth,
+          process(),app,20,50400,21),Err(NetworkError::Consent(Error::Expired)));
+  ledger.retire(process());
+  assert_eq!(ledger.acquire_socket(&mut sockets,&network_auth,
+          process(),app,2,50400,19),Err(NetworkError::Consent(Error::Denied)));
+  assert_eq!(sockets.allow_query(process(),50400,3,b"example.com"),
+          Err(crate::m2_network::Error::Denied));
  }
 
 }
