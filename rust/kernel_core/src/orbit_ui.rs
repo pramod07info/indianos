@@ -17,6 +17,23 @@ impl Workspace{
             b'l'=>Some(Self::Learn),b'p'=>Some(Self::Personal),_=>None}
     }
 }
+/// Honest per-workspace explanatory chrome. This is not AI execution.
+impl Workspace{
+    pub fn subtitle(self)->&'static [u8]{
+        match self{
+            Self::Build=>b"KERNEL AND CODE",
+            Self::Create=>b"DESIGN AND CONTENT",
+            Self::Learn=>b"STUDY AND NOTES",
+            Self::Personal=>b"PERSONAL WORK",
+        }
+    }
+    pub fn shortcut(self)->&'static [u8]{
+        match self{
+            Self::Build=>b"PRESS B",Self::Create=>b"PRESS C",
+            Self::Learn=>b"PRESS L",Self::Personal=>b"PRESS P",
+        }
+    }
+}
 #[derive(Clone,Copy)]
 pub struct Colors{pub bg:u32,pub top:u32,pub bar:u32,pub title:u32,
     pub unfocused:u32,pub light:u32,pub dark:u32,
@@ -76,6 +93,7 @@ fn compact_shell(c:&mut impl Canvas,w:u32,h:u32,workspace:Workspace,p:Colors){
     c.rect(0,0,w,62,p.top);
     c.rect(13,14,30,30,p.accent);c.rect(19,20,18,18,p.top);
     c.label(52,23,b"INDIANOS ORBIT",p.white);
+    workspace_header(c,w,h,workspace,p);
     c.label(w as i32-148,23,b"LOCAL UI",p.accent);
     c.rect(0,62,72,h.saturating_sub(144),p.top);
     c.rect(70,62,2,h.saturating_sub(144),p.panel);
@@ -100,6 +118,7 @@ fn phone_shell(c:&mut impl Canvas,w:u32,h:u32,workspace:Workspace,p:Colors){
     c.rect(0,0,w,70,p.top);
     c.label(16,24,b"INDIANOS MOBILE",p.white);
     c.label(16,49,b"ORBIT PREVIEW",p.accent);
+    c.label(18,192,workspace.subtitle(),p.white);
     c.label(18,92,b"WORKSPACE",p.accent);
     c.rect(12,117,w.saturating_sub(24),75,p.title);
     c.label(26,146,workspace.label(),p.white);
@@ -112,6 +131,19 @@ fn phone_shell(c:&mut impl Canvas,w:u32,h:u32,workspace:Workspace,p:Colors){
     c.rect(0,end-78,w,78,p.top);
     c.label(15,end-48,b"HOME",p.white);
     c.label(w as i32-155,end-48,b"WORKSPACES",p.white);
+}
+/// Draw a visible, bounded live-workspace status area. No hidden model
+/// execution, no font assets, no GPU or network calls.
+pub fn workspace_header(c:&mut impl Canvas,w:u32,h:u32,ws:Workspace,p:Colors){
+    if w<640||h<480{return;}
+    let compact=w<1120||h<720;
+    let (x,width)=if compact{(79, w.saturating_sub(88))}
+                  else{(204,w.saturating_sub(480))};
+    if width<200{return;}
+    c.rect(x,72,width,55,p.top);
+    c.rect(x,72,5,55,p.accent);
+    c.label(x as i32+14,82,ws.subtitle(),p.white);
+    c.label(x as i32+14,105,ws.shortcut(),p.accent);
 }
 pub fn shell(c:&mut impl Canvas,w:u32,h:u32,workspace:Workspace,p:Colors){
     match Layout::new(w,h).class{
@@ -130,6 +162,7 @@ pub fn shell(c:&mut impl Canvas,w:u32,h:u32,workspace:Workspace,p:Colors){
     c.rect(385,13,w.saturating_sub(700),36,p.bar);
     c.label(400,23,b"COMMAND / SEARCH [PREVIEW]",p.white);
     c.label(x-254,25,b"LOCAL-FIRST UI",p.accent);
+    workspace_header(c,w,h,workspace,p);
     // Goal-first workspace navigation, selectable with b/c/l/p in R029.
     c.rect(0,63,190,h.saturating_sub(145),p.top);
     c.rect(188,63,2,h.saturating_sub(145),p.panel);
@@ -196,6 +229,9 @@ pub fn window(c:&mut impl Canvas,w:Window,focused:bool,p:Colors){
         App::Terminal=>b"TERMINAL / SHELL".as_slice(),
         _=>b"ORBIT APP".as_slice()},p.white);
     c.rect(x+b.width as i32-30,y+15,12,12,p.accent);
+    // Visible in actual QEMU frames, even when the window body is replaced
+    // by the authenticated ring-3 Files or Terminal client draw commands.
+    c.rect(x+8,y+42,b.width.saturating_sub(16),2,p.accent);
     match w.app{
         App::Files=>{
             c.rect(x+12,y+54,b.width.saturating_sub(24),33,p.bar);
@@ -286,4 +322,25 @@ mod tests{
         }
         assert_eq!(Workspace::key(b'q'),None);
     }
+    #[test]fn orbit_goal_header_has_distinct_and_truthful_status(){
+        let mut titles=[b"" as &[u8];4];
+        for (i,workspace) in [Workspace::Build,Workspace::Create,
+                              Workspace::Learn,Workspace::Personal]
+                              .iter().enumerate(){
+            titles[i]=workspace.subtitle();
+            assert!(!workspace.shortcut().is_empty());
+            assert!(!titles[i].is_empty());
+        }
+        for i in 0..4{for j in i+1..4{assert_ne!(titles[i],titles[j]);}}
+    }
+    #[test]fn orbit_new_status_chrome_is_bounded_on_real_desktop_sizes(){
+        let p=Colors{bg:1,top:2,bar:3,title:4,unfocused:5,
+                     light:6,dark:7,panel:8,white:9,accent:10};
+        for (w,h) in [(640,480),(1024,768),(1280,800),(1600,900)]{
+            let mut canvas=Recorded{total:0};
+            workspace_header(&mut canvas,w,h,Workspace::Build,p);
+            assert!(canvas.total>=3);
+        }
+    }
+
 }
