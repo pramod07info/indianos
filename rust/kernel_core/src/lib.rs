@@ -12,6 +12,8 @@ use core::ptr;
 
 #[cfg(feature="orbit-ui-preview")]
 mod orbit_ui;
+/// Mobile screen/input contract: model-only, no privileged phone hardware or restore execution.
+pub mod orbit_mobile;
 mod syscall;
 mod program;
 mod initramfs;
