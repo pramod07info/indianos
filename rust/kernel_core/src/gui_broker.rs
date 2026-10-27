@@ -412,3 +412,74 @@ mod batch1_surface_layout_tests {
     }
 }
 
+
+
+/// Orbit R005: transactional window ownership lifecycle in serialized kernel
+/// context. Actual ring-3 compositor wiring and SMP protection are separate.
+impl<const W:usize,const Q:usize> Broker<W,Q>{
+ /// Register an entire workspace only when every window has valid,
+ /// nonduplicated ownership. Partial application is forbidden.
+ pub fn grant_batch(&mut self,requests:&[(u32,u32)])->Result<usize,Error>{
+  if requests.is_empty()||requests.len()>W{return Err(Error::Invalid);}
+  let mut pending=Self{windows:self.windows,events:self.events,
+   len:self.len,sequence:self.sequence};
+  for &(owner,window) in requests{pending.grant(owner,window)?;}
+  self.windows=pending.windows;Ok(requests.len())
+ }
+ /// Fully tear down several owner/window bindings or none at all.
+ pub fn revoke_batch(&mut self,requests:&[(u32,u32)])->Result<usize,Error>{
+  if requests.is_empty()||requests.len()>W{return Err(Error::Invalid);}
+  let mut pending=Self{windows:self.windows,events:self.events,
+   len:self.len,sequence:self.sequence};
+  for &(owner,window) in requests{pending.revoke_window(owner,window)?;}
+  self.windows=pending.windows;self.events=pending.events;
+  self.len=pending.len;Ok(requests.len())
+ }
+ /// Trusted window service can reassign a window after an app restart.
+ /// Buffered input from the old process is scrubbed, never inherited.
+ pub fn reassign_window(&mut self,old_owner:u32,new_owner:u32,window:u32)
+  ->Result<(),Error>{
+  if old_owner==0||new_owner==0||old_owner==new_owner||window==0{
+   return Err(Error::Invalid);
+  }
+  let index=self.windows.iter().position(|w|
+   w.is_some_and(|b|b.owner==old_owner&&b.window==window))
+   .ok_or(Error::Unauthorized)?;
+  // Forget queued events before publishing the new owner grant.
+  let mut pos=0;
+  while pos<self.len{
+   if self.events[pos].is_some_and(|e|e.window==window){self.remove(pos);}
+   else{pos+=1;}
+  }
+  self.windows[index]=Some(Binding{owner:new_owner,window});
+  Ok(())
+ }
+}
+#[cfg(test)]
+mod orbit_r005_broker_tests{
+ use super::*;
+ #[test]fn workspace_grants_are_all_or_nothing(){
+  let mut b=Broker::<3,4>::new();
+  assert_eq!(b.grant_batch(&[(7,10),(7,11),(8,12)]),Ok(3));
+  assert_eq!(b.grant_batch(&[(9,13),(9,11)]),Err(Error::Duplicate));
+  assert!(!b.owns(9,13));assert!(b.owns(8,12));
+ }
+ #[test]fn transfer_rejects_stale_events_and_does_not_hijack_other_windows(){
+  let mut b=Broker::<3,4>::new();b.grant(1,10).unwrap();b.grant(2,20).unwrap();
+  b.post_focus(1,10).unwrap();let peer=b.post_focus(2,20).unwrap();
+  assert_eq!(b.reassign_window(2,3,10),Err(Error::Unauthorized));
+  b.reassign_window(1,3,10).unwrap();
+  assert_eq!(b.peek(3),Err(Error::Empty));
+  assert_eq!(b.peek(2),Ok(peer));
+  assert_eq!(b.post_focus(1,10),Err(Error::Unauthorized));
+  assert_eq!(b.post_focus(3,10).unwrap().owner,3);
+ }
+ #[test]fn invalid_revocation_batch_cannot_destroy_any_grants(){
+  let mut b=Broker::<3,4>::new();b.grant_batch(&[(1,10),(1,11),(2,20)]).unwrap();
+  let event=b.post_focus(1,10).unwrap();
+  assert_eq!(b.revoke_batch(&[(1,10),(2,999)]),Err(Error::Unauthorized));
+  assert_eq!(b.peek(1),Ok(event));assert!(b.owns(1,10));
+  assert_eq!(b.revoke_batch(&[(1,10),(1,11)]),Ok(2));
+  assert!(!b.known(1));assert!(b.known(2));
+ }
+}
