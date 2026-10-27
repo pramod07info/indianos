@@ -95,6 +95,31 @@ pub fn run_batch_authorized<const N:usize>(
  output[..total].copy_from_slice(&staged[..total]);
  Ok(total)
 }
+/// Execute two real, bounded CPU neural network layers per sample.
+/// Both layers and the entire batch are verified before writing output.
+pub fn run_two_layer_batch<const N:usize>(
+ access:&Access<N>,actor:Identity,now:u64,
+ first:&Dense<'_>,second:&Dense<'_>,samples:usize,
+ input:&[i8],output:&mut[i16])->Result<usize,Error>{
+ access.require(actor,VIEW,now).map_err(|_|Error::Denied)?;
+ if samples==0||samples>MAX_BATCH||
+   first.neurons!=second.features||
+   first.features.checked_mul(samples)!=Some(input.len())||
+   second.neurons.checked_mul(samples).is_none_or(|n|n>output.len()){
+   return Err(Error::Shape);
+ }
+ validate(first,first.features,first.neurons)?;
+ validate(second,first.neurons,second.neurons)?;
+ let mut staged=[0i16;MAX_BATCH*MAX_NEURONS];
+ for n in 0..samples{
+  let x=n*first.features;let y=n*second.neurons;
+  run_two_layers(first,second,&input[x..x+first.features],
+    &mut staged[y..y+second.neurons])?;
+ }
+ let count=samples*second.neurons;
+ output[..count].copy_from_slice(&staged[..count]);
+ Ok(count)
+}
 #[cfg(test)]
 mod tests{
  use super::*;
@@ -174,6 +199,37 @@ mod tests{
   assert_eq!(run_batch_authorized(&auth,who,20,&m,&[1,2,3,4],2,&mut out),
    Err(Error::Denied));
   assert_eq!(out,[99;4]);
+ }
+
+
+ #[test]fn two_layer_batch_executes_real_forward_pass_for_distinct_samples(){
+  let w=[2,-1,-1,4];let b=[1,-2];
+  let first=model(&w,&b);
+  let w2=[2,1];let b2=[0];
+  let second=Dense{features:2,neurons:1,
+   weights:&w2,bias:&b2,shift:0,relu:true};
+  let actor=Identity{pid:50,generation:2};
+  let mut acl=Access::<1>::new();acl.grant(actor,VIEW,100).unwrap();
+  let mut out=[0i16;2];
+  assert_eq!(run_two_layer_batch(&acl,actor,1,&first,&second,2,
+    &[2,3,1,1],&mut out),Ok(2));
+  assert_eq!(out,[12,5]);
+ }
+ #[test]fn invalid_second_layer_or_expired_owner_keeps_all_outputs_intact(){
+  let w=[2,-1,-1,4];let b=[1,-2];let first=model(&w,&b);
+  let w2=[2,1];let b2=[0];
+  let mut second=Dense{features:2,neurons:1,
+   weights:&w2,bias:&b2,shift:0,relu:true};
+  let actor=Identity{pid:50,generation:2};
+  let mut acl=Access::<1>::new();acl.grant(actor,VIEW,10).unwrap();
+  let mut out=[77i16;2];
+  second.features=1;
+  assert_eq!(run_two_layer_batch(&acl,actor,1,&first,&second,2,
+    &[2,3,1,1],&mut out),Err(Error::Shape));
+  second.features=2;
+  assert_eq!(run_two_layer_batch(&acl,actor,10,&first,&second,2,
+    &[2,3,1,1],&mut out),Err(Error::Denied));
+  assert_eq!(out,[77;2]);
  }
 
 }
