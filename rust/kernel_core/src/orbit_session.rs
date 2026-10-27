@@ -271,3 +271,99 @@ pub fn decode(raw:&[u8])->Result<Entry,Error>{
     }
 
 }
+
+
+/// Orbit R005: atomic session previews and safe metadata editing. These
+/// functions never relaunch applications or recreate revoked capabilities.
+impl<const N:usize> Ledger<N>{
+ /// Replace one session's symbolic app list atomically. No token, address
+ /// or executable path can be serialized through the app-id-only contract.
+ pub fn replace_apps(&mut self,owner:Owner,slot:u32,apps:&[u8])
+  ->Result<(),Error>{
+  if apps.len()>MAX_SESSION_APPS||apps.iter().any(|v|!(1..=6).contains(v)){
+   return Err(Error::Invalid);
+  }
+  for (i,&app) in apps.iter().enumerate(){
+   if apps[..i].contains(&app){return Err(Error::Duplicate);}
+  }
+  let entry=self.mine_mut(owner,slot)?;
+  let mut next=[0u8;MAX_SESSION_APPS];
+  next[..apps.len()].copy_from_slice(apps);
+  entry.apps=next;entry.count=apps.len() as u8;Ok(())
+ }
+ /// Review multiple session slots in one operation. The destination
+ /// remains unchanged if any slot is stale, denied, expired or too small.
+ pub fn plan_many(&self,owner:Owner,slots:&[u32],now:u64,
+  permitted:&[u8],out:&mut[u8])->Result<usize,Error>{
+  if !owner.valid()||slots.is_empty()||slots.len()>N{
+   return Err(Error::Invalid);
+  }
+  let mut size=0usize;
+  for (i,&slot) in slots.iter().enumerate(){
+   if slot==0||slots[..i].contains(&slot){return Err(Error::Duplicate);}
+   let entry=self.entries.iter().flatten().find(|e|e.slot==slot)
+    .ok_or(Error::Missing)?;
+   if entry.owner!=owner{return Err(Error::Denied);}
+   if now>=entry.expires{return Err(Error::Expired);}
+   let apps=&entry.apps[..entry.count as usize];
+   if apps.iter().any(|a|!permitted.contains(a)){return Err(Error::Denied);}
+   size=size.checked_add(apps.len()).ok_or(Error::TooSmall)?;
+  }
+  if size>out.len(){return Err(Error::TooSmall);}
+  let mut pos=0;
+  for &slot in slots{
+   let entry=self.entries.iter().flatten().find(|e|e.slot==slot)
+    .ok_or(Error::Missing)?;
+   let slice=&entry.apps[..entry.count as usize];
+   out[pos..pos+slice.len()].copy_from_slice(slice);pos+=slice.len();
+  }
+  Ok(size)
+ }
+ /// Atomically forget several snapshots; an invalid or foreign slot
+ /// leaves every record untouched.
+ pub fn forget_many(&mut self,owner:Owner,slots:&[u32])->Result<usize,Error>{
+  if !owner.valid()||slots.is_empty()||slots.len()>N{
+   return Err(Error::Invalid);
+  }
+  let mut next=Self{entries:self.entries};
+  for (i,&slot) in slots.iter().enumerate(){
+   if slots[..i].contains(&slot){return Err(Error::Duplicate);}
+   next.forget(owner,slot)?;
+  }
+  self.entries=next.entries;Ok(slots.len())
+ }
+}
+#[cfg(test)]
+mod orbit_r005_session_tests{
+ use super::*;
+ fn a()->Owner{Owner{pid:7,generation:3}}
+ #[test]fn preview_many_never_writes_partial_or_foreign_record(){
+  let mut ledger=Ledger::<3>::new();ledger.open(a(),1,0,100).unwrap();
+  ledger.open(a(),2,1,50).unwrap();
+  ledger.include_app(a(),1,1).unwrap();ledger.include_app(a(),2,2).unwrap();
+  let mut out=[99u8;3];
+  assert_eq!(ledger.plan_many(a(),&[1,2],50,&[1,2],&mut out),Err(Error::Expired));
+  assert_eq!(out,[99;3]);
+  assert_eq!(ledger.plan_many(a(),&[1,2],1,&[1,2],&mut out),Ok(2));
+  assert_eq!(&out[..2],&[1,2]);
+  assert_eq!(ledger.plan_many(Owner{generation:4,..a()},&[1],1,&[1],&mut out),
+   Err(Error::Denied));
+ }
+ #[test]fn replacement_scrubs_old_ids_and_detects_duplicates(){
+  let mut l=Ledger::<1>::new();l.open(a(),1,0,100).unwrap();
+  l.replace_apps(a(),1,&[1,2,3]).unwrap();
+  assert_eq!(l.replace_apps(a(),1,&[3,3]),Err(Error::Duplicate));
+  assert_eq!(l.view(a(),1).unwrap().count,3);
+  l.replace_apps(a(),1,&[4]).unwrap();
+  assert_eq!(l.view(a(),1).unwrap().apps,[4,0,0,0]);
+ }
+ #[test]fn transactional_forget_blocks_cross_owner_deletions(){
+  let mut l=Ledger::<3>::new();l.open(a(),1,0,100).unwrap();
+  l.open(a(),2,0,100).unwrap();
+  let foreign=Owner{pid:8,generation:1};l.open(foreign,3,0,100).unwrap();
+  assert_eq!(l.forget_many(a(),&[1,3]),Err(Error::Denied));
+  assert!(l.view(a(),1).is_ok());assert!(l.view(a(),2).is_ok());
+  assert_eq!(l.forget_many(a(),&[1,2]),Ok(2));
+  assert!(l.view(foreign,3).is_ok());
+ }
+}
