@@ -355,3 +355,85 @@ mod owner_batch_tests {
             Err(ExtentError::Overflow));
     }
 }
+
+/* Metadata-only, bounded cross-owner consistency audit. */
+/// Validate all owners and quotas before testing pairwise aliases.
+/// No device I/O, allocation, or ownership authentication is performed.
+pub fn validate_owner_set_disjoint(
+    owners: &[&[Extent]],
+    device_blocks: u64,
+    max_owners: usize,
+    max_extents_per_owner: usize,
+    max_total_blocks: u64,
+) -> Result<bool, ExtentError> {
+    if owners.len() > max_owners {
+        return Err(ExtentError::Capacity);
+    }
+    let mut total = 0u64;
+    for owner in owners {
+        let blocks = validate_extent_budget(
+            owner, device_blocks, max_extents_per_owner, device_blocks,
+        )?;
+        total = total.checked_add(blocks).ok_or(ExtentError::Overflow)?;
+    }
+    if total > max_total_blocks {
+        return Err(ExtentError::Capacity);
+    }
+
+    let mut disjoint = true;
+    for (i, left) in owners.iter().enumerate() {
+        for right in owners.iter().skip(i + 1) {
+            if !extent_owners_disjoint(left, right, device_blocks)? {
+                disjoint = false;
+            }
+        }
+    }
+    Ok(disjoint)
+}
+
+#[cfg(test)]
+mod owner_set_consistency_tests {
+    use super::*;
+
+    #[test]
+    fn disjoint_adjacent_and_empty_owners_are_allowed() {
+        let a = [Extent { start: 0, blocks: 2 }];
+        let b = [Extent { start: 2, blocks: 3 }];
+        assert_eq!(validate_owner_set_disjoint(&[&a, &b, &[]], 10, 3, 1, 5), Ok(true));
+        assert_eq!(validate_owner_set_disjoint(&[], 0, 0, 0, 0), Ok(true));
+    }
+
+    #[test]
+    fn cross_owner_alias_is_detected() {
+        let a = [Extent { start: 1, blocks: 4 }];
+        let b = [Extent { start: 3, blocks: 2 }];
+        assert_eq!(validate_owner_set_disjoint(&[&a, &b], 10, 2, 1, 6), Ok(false));
+    }
+
+    #[test]
+    fn later_corrupt_metadata_is_not_masked_by_alias() {
+        let a = [Extent { start: 1, blocks: 4 }];
+        let b = [Extent { start: 3, blocks: 2 }];
+        let bad = [Extent { start: 9, blocks: 2 }];
+        assert_eq!(validate_owner_set_disjoint(&[&a, &b, &bad], 10, 3, 1, 8),
+            Err(ExtentError::OutsideDevice));
+    }
+
+    #[test]
+    fn owner_count_extent_count_and_total_budget_are_bounded() {
+        let a = [Extent { start: 0, blocks: 2 }, Extent { start: 3, blocks: 1 }];
+        assert_eq!(validate_owner_set_disjoint(&[&a], 10, 0, 2, 3),
+            Err(ExtentError::Capacity));
+        assert_eq!(validate_owner_set_disjoint(&[&a], 10, 1, 1, 3),
+            Err(ExtentError::Capacity));
+        assert_eq!(validate_owner_set_disjoint(&[&a], 10, 1, 2, 2),
+            Err(ExtentError::Capacity));
+    }
+
+    #[test]
+    fn aggregate_block_count_overflow_fails_closed() {
+        let all = [Extent { start: 0, blocks: u64::MAX }];
+        assert_eq!(validate_owner_set_disjoint(&[&all, &all], u64::MAX, 2, 1, u64::MAX),
+            Err(ExtentError::Overflow));
+    }
+}
