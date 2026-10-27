@@ -85,7 +85,7 @@ fn gpt<D:BlockDevice>(disk:&mut D,index:u32)->Result<Partition,Error>{
  let entries=le32(&hdr[80..84]) as usize;
  let entry_size=le32(&hdr[84..88]) as usize;
  let checksum=le32(&hdr[88..92]);
- if le64(&hdr[24..32])!=1||alternate<=1||alternate>=capacity||
+ if le64(&hdr[24..32])!=1||alternate!=capacity-1||
    first<3||last<first||last>=capacity||last>=alternate||
    table<2||table>=first||entries==0||entries>MAX_GPT_ENTRIES||
    entry_size!=128{return Err(Error::Unsupported);}
@@ -170,18 +170,19 @@ pub fn mount<'a,D:BlockDevice>(disk:&'a mut D,index:u32)
 mod m1_partition_tests{
  use super::*;
  const COUNT:usize=256;
- struct Disk{data:[[u8;SECTOR_BYTES];COUNT],writes:usize}
+ struct Disk{data:[[u8;SECTOR_BYTES];COUNT],writes:usize,fail_at:Option<usize>}
  impl BlockDevice for Disk{
   fn sector_count(&self)->u64{COUNT as u64}
   fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
    *out=*self.data.get(lba as usize).ok_or(BlockError::OutOfRange)?;Ok(())
   }
   fn write_sector(&mut self,lba:u64,input:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   if self.fail_at==Some(self.writes){return Err(BlockError::Io);}
    *self.data.get_mut(lba as usize).ok_or(BlockError::OutOfRange)?=*input;
    self.writes+=1;Ok(())
   }
  }
- fn new()->Disk{Disk{data:[[0;SECTOR_BYTES];COUNT],writes:0}}
+ fn new()->Disk{Disk{data:[[0;SECTOR_BYTES];COUNT],writes:0,fail_at:None}}
  fn mbr_disk()->Disk{
   let mut d=new();d.data[0][510]=0x55;d.data[0][511]=0xaa;
   let entry=&mut d.data[0][446..462];entry[4]=0x83;
@@ -293,6 +294,40 @@ mod m1_partition_tests{
   let header_crc=crc(&disk.data[1][..92]);
   disk.data[1][16..20].copy_from_slice(&header_crc.to_le_bytes());
   assert_eq!(inspect(&mut disk,0),Err(Error::Invalid));
+  assert_eq!(disk.writes,0);
+ }
+ #[test]fn m1_partition_failed_cow_commit_recovers_previous_file_after_reboot(){
+  let mut disk=mbr_disk();
+  {
+   let window=BlockWindow::new(&mut disk,10,100).unwrap();
+   let mut fs=HierVfs::format_blank(window).unwrap();
+   fs.mkdir("/home").unwrap();
+   fs.create("/home/note",b"committed").unwrap();
+  }
+  // The second write in the next transaction fails. Do not publish a
+  // partially written new file or touch any sector outside this partition.
+  disk.fail_at=Some(disk.writes+1);
+  {
+   let mut fs=mount(&mut disk,0).unwrap();
+   assert!(fs.overwrite("/home/note",b"interrupted").is_err());
+  }
+  disk.fail_at=None;
+  {
+   let mut fs=mount(&mut disk,0).unwrap();
+   let mut out=[0u8;32];
+   assert_eq!(fs.read("/home/note",&mut out),Ok(9));
+   assert_eq!(&out[..9],b"committed");
+  }
+  assert_eq!(disk.data[9],[0;SECTOR_BYTES]);
+  assert_eq!(disk.data[110],[0;SECTOR_BYTES]);
+ }
+ #[test]fn m1_gpt_requires_backup_header_at_end_of_selected_device(){
+  let mut disk=gpt_disk();
+  disk.data[1][32..40].copy_from_slice(&200u64.to_le_bytes());
+  disk.data[1][16..20].fill(0);
+  let hcrc=crc(&disk.data[1][..92]);
+  disk.data[1][16..20].copy_from_slice(&hcrc.to_le_bytes());
+  assert_eq!(inspect(&mut disk,0),Err(Error::Unsupported));
   assert_eq!(disk.writes,0);
  }
  #[test]fn m1_partition_remount_keeps_last_committed_overwrite(){
