@@ -1,0 +1,42 @@
+name: IndianOS latest UI screenshot capture (QEMU)
+on:
+  push:
+    branches: [capture-latest-indianos-ui-20261027]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  capture-latest-real-ui:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install QEMU and pinned build dependencies
+        run: |
+          sudo timeout 300s apt-get update -o Acquire::Retries=3 -o Acquire::http::Timeout=40
+          sudo timeout 600s apt-get install -y --no-install-recommends -o Acquire::Retries=3 -o Acquire::http::Timeout=40 clang lld binutils xorriso qemu-system-x86 ovmf curl openssl
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
+      - name: Test ring-3 graphics ownership on current kernel
+        run: cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --features test-r029-userspace
+      - name: Build and boot current-source ring-3 GUI in actual QEMU
+        env:
+          R029_USER_SCREENSHOT_DIR: build/latest-ui-screenshots
+        run: |
+          set -euo pipefail
+          OVMF_PATH=""
+          for f in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/edk2/ovmf/OVMF_CODE_4M.fd /usr/share/edk2/ovmf/OVMF_CODE.fd; do
+            if test -f "$f"; then OVMF_PATH="$f"; break; fi
+          done
+          test -n "$OVMF_PATH"
+          make test-r029-user-surfaces-qemu OVMF_CODE="$OVMF_PATH"
+          echo "${GITHUB_SHA}" > build/latest-ui-screenshots/SOURCE_COMMIT.txt
+      - name: Upload raw screenshot pixels from real QEMU VGA
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: indianos-latest-real-qemu-ui-frames
+          path: build/latest-ui-screenshots/
+          if-no-files-found: warn
+          retention-days: 14
