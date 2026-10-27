@@ -53,3 +53,86 @@ pub fn macos(app:batch4_macos_policy::App)->Result<Route,Error>{
    authorized_host:false,proprietary_frameworks:true}),Err(Error::Unlicensed));
  }
 }
+
+/// Availability is supplied only by the trusted kernel runtime registry;
+/// these bits are NOT read from untrusted application manifests.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct TrustedRuntimes{
+ pub linux:bool,pub win32:bool,pub android:bool,pub web:bool,
+ pub authorized_remote:bool,
+}
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum RuntimeError{Unsigned,NoConsent,NoGrant,Unavailable}
+/// Route admission is distinct from classification. An unsigned executable,
+/// expired/recycled process, absent compatible runtime or missing admin
+/// consent cannot transition to execution. No third-party code is launched.
+pub fn authorize_runtime<const N:usize>(
+ route:Route,verified:bool,consent:bool,
+ owner:crate::batch5_session::Identity,now:u64,
+ auth:&crate::batch6_security::Access<N>,runtimes:TrustedRuntimes,
+)->Result<Route,RuntimeError>{
+ if !verified{return Err(RuntimeError::Unsigned);}
+ if !consent{return Err(RuntimeError::NoConsent);}
+ let required=if route==Route::AuthorizedRemote{
+  crate::batch6_security::VIEW|crate::batch6_security::SOCKET
+ }else{crate::batch6_security::VIEW};
+ auth.require(owner,required,now).map_err(|_|RuntimeError::NoGrant)?;
+ let available=match route{
+  Route::Native|Route::PortableRebuild=>true,
+  Route::NeedsLinuxRuntime=>runtimes.linux,
+  Route::NeedsWin32Runtime=>runtimes.win32,
+  Route::NeedsAndroidRuntime=>runtimes.android,
+  Route::Web=>runtimes.web,
+  Route::AuthorizedRemote=>runtimes.authorized_remote,
+ };
+ if !available{return Err(RuntimeError::Unavailable);}
+ Ok(route)
+}
+#[cfg(test)]
+mod guarded_runtime_tests{
+ use super::*;
+ use crate::batch5_session::Identity;
+ use crate::batch6_security::{Access,SOCKET,VIEW};
+ fn principal()->Identity{Identity{pid:22,generation:5}}
+ fn auth()->Access<1>{
+  let mut a=Access::new();
+  a.grant(principal(),VIEW|SOCKET,100).unwrap();a
+ }
+ fn all()->TrustedRuntimes{TrustedRuntimes{
+  linux:true,win32:true,android:true,web:true,authorized_remote:true,
+ }}
+ #[test]fn classified_foreign_format_requires_actual_runtime(){
+  let a=auth();
+  let absent=TrustedRuntimes{linux:false,win32:false,android:false,
+    web:false,authorized_remote:false};
+  for route in [Route::NeedsLinuxRuntime,Route::NeedsWin32Runtime,
+                Route::NeedsAndroidRuntime,Route::Web,Route::AuthorizedRemote]{
+   assert_eq!(authorize_runtime(route,true,true,principal(),2,&a,absent),
+              Err(RuntimeError::Unavailable));
+   assert_eq!(authorize_runtime(route,true,true,principal(),2,&a,all()),
+              Ok(route));
+  }
+ }
+ #[test]fn unsigned_and_unconsented_executables_never_run(){
+  let a=auth();
+  assert_eq!(authorize_runtime(Route::NeedsLinuxRuntime,false,true,
+      principal(),2,&a,all()),Err(RuntimeError::Unsigned));
+  assert_eq!(authorize_runtime(Route::Native,true,false,
+      principal(),2,&a,all()),Err(RuntimeError::NoConsent));
+ }
+ #[test]fn reused_pid_and_expired_grants_are_not_inherited(){
+  let a=auth();
+  let recycled=Identity{generation:6,..principal()};
+  assert_eq!(authorize_runtime(Route::Native,true,true,recycled,2,&a,all()),
+             Err(RuntimeError::NoGrant));
+  assert_eq!(authorize_runtime(Route::Native,true,true,principal(),100,&a,all()),
+             Err(RuntimeError::NoGrant));
+ }
+ #[test]fn remote_compatibility_additionally_requires_socket_rights(){
+  let mut a=Access::<1>::new();a.grant(principal(),VIEW,100).unwrap();
+  assert_eq!(authorize_runtime(Route::AuthorizedRemote,true,true,
+      principal(),2,&a,all()),Err(RuntimeError::NoGrant));
+  assert_eq!(authorize_runtime(Route::NeedsLinuxRuntime,true,true,
+      principal(),2,&a,all()),Ok(Route::NeedsLinuxRuntime));
+ }
+}
