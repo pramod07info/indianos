@@ -244,6 +244,48 @@ impl<const P:usize> Endpoint<P>{
  }
 }
 
+/// Internet one's-complement checksum, including odd trailing bytes.
+fn internet_sum(data:&[u8])->u32{
+ let mut sum=0u32;
+ for pair in data.chunks(2){
+  let word=(u16::from(pair[0])<<8)|u16::from(*pair.get(1).unwrap_or(&0));
+  sum+=u32::from(word);
+ }
+ sum
+}
+fn checked_checksum(mut sum:u32)->u16{
+ while sum>>16!=0{sum=(sum&0xffff)+(sum>>16);}
+ !(sum as u16)
+}
+/// Validate an exact IPv4 TCP SYN|ACK datagram from a specific peer.
+/// No IPv4 options/fragments or TCP options in this narrow first wire slice.
+/// A caller must still authenticate NIC receive ownership and routing; this
+/// decoder does not open a socket or emit ACK packets.
+pub fn parse_ipv4_syn_ack(
+ packet:&[u8],peer:TcpPeer,local_ip:[u8;4],local_port:u16,
+)->Result<(u32,u32),Error>{
+ if packet.len()!=40||!peer.valid()||local_ip==[0;4]||local_port==0||
+   packet[0]!=0x45||packet[9]!=6||packet[8]==0||
+   u16::from_be_bytes([packet[2],packet[3]]) as usize!=packet.len()||
+   u16::from_be_bytes([packet[6],packet[7]])&0x3fff!=0||
+   packet[12..16]!=peer.address||packet[16..20]!=local_ip{
+  return Err(Error::Malformed);
+ }
+ if checked_checksum(internet_sum(&packet[..20]))!=0{
+  return Err(Error::Malformed);
+ }
+ let tcp=&packet[20..];
+ let source=u16::from_be_bytes([tcp[0],tcp[1]]);
+ let dest=u16::from_be_bytes([tcp[2],tcp[3]]);
+ if source!=peer.port||dest!=local_port||tcp[12]!=0x50||
+    tcp[13]!=0x12||tcp[18]!=0||tcp[19]!=0{return Err(Error::Malformed);}
+ let sum=internet_sum(&packet[12..20])+6+tcp.len() as u32+
+   internet_sum(tcp);
+ if checked_checksum(sum)!=0{return Err(Error::Malformed);}
+ let seq=u32::from_be_bytes(tcp[4..8].try_into().map_err(|_|Error::Malformed)?);
+ let ack=u32::from_be_bytes(tcp[8..12].try_into().map_err(|_|Error::Malformed)?);
+ Ok((seq,ack))
+}
 #[cfg(test)]
 mod m2_tests{
  use super::*;
@@ -416,6 +458,47 @@ mod m2_tests{
   endpoint.retire(owner);
   assert_eq!(endpoint.retry_tcp_syn(owner,51000,peer,20,&mut later),
     Err(Error::Denied));
+ }
+
+
+ fn tcp_handshake_packet()->[u8;40]{
+  let mut p=[0u8;40];
+  p[0]=0x45;p[2..4].copy_from_slice(&40u16.to_be_bytes());
+  p[8]=64;p[9]=6;
+  p[12..16].copy_from_slice(&[192,0,2,10]);
+  p[16..20].copy_from_slice(&[192,0,2,20]);
+  p[20..22].copy_from_slice(&443u16.to_be_bytes());
+  p[22..24].copy_from_slice(&51000u16.to_be_bytes());
+  p[24..28].copy_from_slice(&900u32.to_be_bytes());
+  p[28..32].copy_from_slice(&401u32.to_be_bytes());
+  p[32]=0x50;p[33]=0x12;p[34..36].copy_from_slice(&4096u16.to_be_bytes());
+  let ip=checked_checksum(internet_sum(&p[..20]));
+  p[10..12].copy_from_slice(&ip.to_be_bytes());
+  let tcp=checked_checksum(internet_sum(&p[12..20])+6+20+
+    internet_sum(&p[20..]));
+  p[36..38].copy_from_slice(&tcp.to_be_bytes());
+  p
+ }
+ #[test]fn verified_ipv4_tcp_synack_decodes_sequence_and_ack(){
+  let p=tcp_handshake_packet();
+  let peer=TcpPeer{address:[192,0,2,10],port:443};
+  assert_eq!(parse_ipv4_syn_ack(&p,peer,[192,0,2,20],51000),Ok((900,401)));
+ }
+ #[test]fn spoofed_peer_corrupt_checksum_and_fragmented_ipv4_are_rejected(){
+  let p=tcp_handshake_packet();
+  let peer=TcpPeer{address:[192,0,2,10],port:443};
+  let spoof=TcpPeer{address:[192,0,2,11],port:443};
+  assert_eq!(parse_ipv4_syn_ack(&p,spoof,[192,0,2,20],51000),
+    Err(Error::Malformed));
+  let mut bad=p;bad[28]^=1;
+  assert_eq!(parse_ipv4_syn_ack(&bad,peer,[192,0,2,20],51000),
+    Err(Error::Malformed));
+  let mut bad=p;bad[6]=0x20;
+  assert_eq!(parse_ipv4_syn_ack(&bad,peer,[192,0,2,20],51000),
+    Err(Error::Malformed));
+  let mut bad=p;bad[33]=0x10;
+  assert_eq!(parse_ipv4_syn_ack(&bad,peer,[192,0,2,20],51000),
+    Err(Error::Malformed));
  }
 
 }
