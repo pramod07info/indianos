@@ -83,6 +83,24 @@ pub fn plan_linux_load(signed:bool,bytes:&[u8],
  out[..used].copy_from_slice(&staged[..used]);
  Ok(used)
 }
+/// Materialize a verified PT_LOAD region into a *trusted* staging buffer.
+/// Page-table mapping, W^X PTEs, ASLR, dynamic linking and syscall runtime
+/// remain outside this pure loader. This never executes any foreign code.
+pub fn stage_linux_segment(image:&[u8],region:LoadRegion,
+ output:&mut[u8])->Result<usize,LoadError>{
+ let memory=usize::try_from(region.memory_bytes).map_err(|_|LoadError::Capacity)?;
+ let file=usize::try_from(region.file_bytes).map_err(|_|LoadError::Capacity)?;
+ let offset=usize::try_from(region.offset).map_err(|_|LoadError::Invalid)?;
+ if region.address<4096||region.flags&!7!=0||region.flags&3==3||
+    memory==0||file>memory||memory>output.len(){
+  return Err(LoadError::Unsafe);
+ }
+ let end=offset.checked_add(file).ok_or(LoadError::Invalid)?;
+ let payload=image.get(offset..end).ok_or(LoadError::Invalid)?;
+ output[..file].copy_from_slice(payload);
+ output[file..memory].fill(0);
+ Ok(memory)
+}
 #[cfg(test)]mod tests{use super::*;
  #[test]fn unknown_call_denied(){assert_eq!(classify(500),Err(Error::Unsupported));}
  #[test]fn userspace_pointer_bounded(){assert_eq!(validate_user_span(4096,4,8192),Ok(()));
@@ -152,6 +170,30 @@ pub fn plan_linux_load(signed:bool,bytes:&[u8],
   assert_eq!(out,[original]);
   assert_eq!(plan_linux_load(false,&sample_linux_elf(),&mut out),
     Err(LoadError::Invalid));
+ }
+
+
+ #[test]fn linux_segment_materialization_copies_file_and_zero_fills_bss(){
+  let image=sample_linux_elf();
+  let mut plan=[LoadRegion{address:0,file_bytes:0,memory_bytes:0,
+    offset:0,flags:0};1];
+  plan_linux_load(true,&image,&mut plan).unwrap();
+  let mut dst=[0xaau8;4096];
+  assert_eq!(stage_linux_segment(&image,plan[0],&mut dst),Ok(4096));
+  assert_eq!(&dst[..128],&image);
+  assert!(dst[128..].iter().all(|x|*x==0));
+ }
+ #[test]fn invalid_elf_region_does_not_modify_target_memory(){
+  let image=sample_linux_elf();
+  let mut dst=[9u8;32];
+  let mut region=LoadRegion{address:0x400000,file_bytes:8,
+    memory_bytes:16,offset:0,flags:5};
+  region.flags=7;
+  assert_eq!(stage_linux_segment(&image,region,&mut dst),Err(LoadError::Unsafe));
+  assert_eq!(dst,[9;32]);
+  region.flags=5;region.offset=1000;
+  assert_eq!(stage_linux_segment(&image,region,&mut dst),Err(LoadError::Invalid));
+  assert_eq!(dst,[9;32]);
  }
 
 }
