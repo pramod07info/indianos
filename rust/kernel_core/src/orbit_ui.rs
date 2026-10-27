@@ -344,3 +344,87 @@ mod tests{
     }
 
 }
+
+
+/// R005 optional accessible paint entrypoints. These render to the existing
+/// bounded framebuffer Canvas; they do not enable a native GPU, fonts or a
+/// phone build, and remain opt-in until QEMU pixel acceptance is complete.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct Accessibility{
+ pub high_contrast:bool,
+ pub keyboard_focus:bool,
+ pub scale_percent:u16,
+}
+impl Accessibility{
+ pub const fn normal()->Self{Self{high_contrast:false,keyboard_focus:false,scale_percent:100}}
+ pub fn valid(self)->bool{(100..=200).contains(&self.scale_percent)}
+ pub fn colors(self,mut p:Colors)->Colors{
+  if self.high_contrast{
+   p.bg=0x000000;p.top=0x000000;p.bar=0x111111;
+   p.title=0x202020;p.dark=0x000000;p.light=0x222222;
+   p.panel=0xffffff;p.white=0xffffff;p.accent=0xffff00;
+  }
+  p
+ }
+ /// Scale target geometry without exceeding a physical frame boundary.
+ pub fn focus_box(self,frame_w:u32,frame_h:u32,
+  x:u32,y:u32,w:u32,h:u32)->Option<(i32,i32,u32,u32)>{
+  if !self.valid()||!self.keyboard_focus||
+   x>=frame_w||y>=frame_h||w==0||h==0{return None;}
+  let scale=self.scale_percent as u32;
+  let sw=w.checked_mul(scale)?.checked_div(100)?;
+  let sh=h.checked_mul(scale)?.checked_div(100)?;
+  let width=sw.min(frame_w-x);
+  let height=sh.min(frame_h-y);
+  if width==0||height==0{return None;}
+  Some((x as i32,y as i32,width,height))
+ }
+}
+/// Separate entrypoint for physical keyboard focus, exposing a visible
+/// yellow focus boundary and high-contrast palette when explicitly selected.
+pub fn shell_accessible(c:&mut impl Canvas,w:u32,h:u32,
+ workspace:Workspace,p:Colors,settings:Accessibility)->bool{
+ if !settings.valid()||w==0||h==0{return false;}
+ let paint=settings.colors(p);
+ shell(c,w,h,workspace,paint);
+ if let Some((x,y,bw,bh))=settings.focus_box(w,h,12,68,w.saturating_sub(24),60){
+  c.rect(x,y,bw,3,paint.accent);
+  c.rect(x,y+bh as i32-3,bw,3,paint.accent);
+ }
+ true
+}
+#[cfg(test)]
+mod orbit_r005_accessibility_tests{
+ use super::*;
+ struct Counter{rects:usize,focus_yellow:usize}
+ impl Canvas for Counter{
+  fn rect(&mut self,x:i32,y:i32,w:u32,h:u32,color:u32){
+   assert!(x>=0&&y>=0&&w<=1600&&h<=1600);
+   self.rects+=1;if color==0xffff00{self.focus_yellow+=1;}
+  }
+  fn label(&mut self,x:i32,y:i32,_:&[u8],_:u32){
+   assert!(x>=0&&y>=0);
+  }
+ }
+ fn colors()->Colors{Colors{bg:1,top:2,bar:3,title:4,unfocused:5,
+   light:6,dark:7,panel:8,white:9,accent:10}}
+ #[test]fn accessible_frame_renders_keyboard_focus_and_contrast(){
+  let settings=Accessibility{high_contrast:true,keyboard_focus:true,scale_percent:150};
+  let mut canvas=Counter{rects:0,focus_yellow:0};
+  assert!(shell_accessible(&mut canvas,800,600,Workspace::Build,colors(),settings));
+  assert!(canvas.rects>10);assert!(canvas.focus_yellow>=2);
+ }
+ #[test]fn focus_is_clipped_and_invalid_zoom_is_rejected(){
+  let settings=Accessibility{high_contrast:false,keyboard_focus:true,scale_percent:200};
+  assert_eq!(settings.focus_box(640,480,630,470,30,30),Some((630,470,10,10)));
+  assert_eq!(settings.focus_box(640,480,640,0,20,20),None);
+  let bad=Accessibility{scale_percent:300,..settings};
+  let mut canvas=Counter{rects:0,focus_yellow:0};
+  assert!(!shell_accessible(&mut canvas,800,600,Workspace::Build,colors(),bad));
+  assert_eq!(canvas.rects,0);
+ }
+ #[test]fn ordinary_palette_stays_unchanged_without_contrast(){
+  let normal=Accessibility::normal();let old=colors();let next=normal.colors(old);
+  assert_eq!(next.bg,old.bg);assert_eq!(next.accent,old.accent);
+ }
+}
