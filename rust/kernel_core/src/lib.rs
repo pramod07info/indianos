@@ -46,6 +46,8 @@ pub mod hardware_virtio_queue;
 /// HD3B.3: mock split-virtqueue wire serialization and validated completions.
 /// No hardware transport or memory mapping is enabled.
 pub mod hardware_virtio_split;
+/// HD3B.4: bounded virtio-GPU command authorization (no hardware transport).
+pub mod hardware_gpu_control_policy;
 pub mod agent_08_boot_slot;
 pub mod agent_09_ci_policy;
 pub mod agent_10_app_policy;

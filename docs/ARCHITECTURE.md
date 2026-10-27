@@ -346,3 +346,24 @@ The full kernel CI additionally runs `hd3b3_` tests with and without
 M2 features and checks `no_std`. The code is staged on top of HD3B.2
 and must not be merged into `main` before its parent passes exact-head
 kernel/QEMU acceptance.
+
+## Issue #124 HD3B.4: GPU 2D command policy and protected backing proposals
+
+The `hardware_gpu_control_policy` no_std decoder independently checks all
+six 2D GPU command encodings issued by HD3B.1 (display info, create-2D,
+attach backing, set scanout, transfer-to-host and flush). It fails closed
+on malformed lengths, nonzero reserved/fence fields, unknown command types,
+unsupported pixel formats, oversized images, invalid rectangles, nonzero
+reserved slots, wrong process generation, absent proposed IOMMU domain,
+missing virtio ACCESS_PLATFORM/VERSION_1 features, unapproved backing
+physical intervals and overlap with proposed virtqueue-ring memory.
+Framebuffer geometry is constrained to a checked 4-MiB RGBA limit.
+Tests include benign valid commands and adversarial command mutations.
+
+**Scope:** all validations operate on software-provided numeric metadata.
+This does NOT authenticate real DMA/IOMMU mappings, pin pages, handle
+hardware interrupts, write PCI MMIO, or send GPU commands. It is not
+wire-integrated with HD3B.3 and does not make GPU rendering functional.
+Real acceleration requires a trusted hardware transport, an authenticated
+driver, DMA ownership, CPU/device coherency and emulator/device tests.
+The default CPU-rendered desktop remains intact.
