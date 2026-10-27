@@ -219,14 +219,19 @@ mod m2_tests{
     "/home/note",&mut output),Ok(7));
   assert_eq!(&output[..7],b"durable");
   let generation=fs.generation();
+  assert_eq!(guard.statistics().completed_writes,1);
+  assert_eq!(ledger.write_authorized(&mut fs,&mut guard,process(),app,2,
+    "/home/note",b""),
+    Err(FileError::Authorization(Error::Denied)));
+  assert_eq!(fs.generation(),generation);
   let stale=Identity{generation:2,..process()};
   assert_eq!(ledger.write_authorized(&mut fs,&mut guard,stale,app,2,
     "/home/note",b"attack"),
     Err(FileError::Authorization(Error::Denied)));
-  assert_eq!(ledger.write_authorized(&mut fs,process(),app,2,
+  assert_eq!(ledger.write_authorized(&mut fs,&mut guard,process(),app,2,
     "/system/config",b"attack"),
     Err(FileError::Authorization(Error::Denied)));
-  assert_eq!(ledger.write_authorized(&mut fs,process(),app,2,
+  assert_eq!(ledger.write_authorized(&mut fs,&mut guard,process(),app,2,
     "/home/../system/config",b"attack"),
     Err(FileError::Authorization(Error::Denied)));
   assert_eq!(ledger.write_authorized(&mut fs,&mut guard,process(),app,30,
