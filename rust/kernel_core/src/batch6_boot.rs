@@ -23,6 +23,12 @@ pub struct BootHealth{
  pub ready_for_desktop_input:bool,
 }
 
+/// Kernel-service blockers are classified from actual scheduler ownership.
+/// This is a diagnosis for the boot supervisor, not hardware state probing.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum BootBlocker{
+ Cold,InitMissing,DesktopMissing,DesktopRestartExhausted,Stopped,Ready,
+}
 pub struct Bootstrap<const P:usize,const E:usize,const W:usize,const K:usize>{
  pub session:Session<P,E,W,K>,phase:Phase,init:Option<Identity>,
  desktop:Option<Identity>,desktop_restarts:u8,
@@ -48,6 +54,28 @@ impl<const P:usize,const E:usize,const W:usize,const K:usize>
   }
  }
 
+ /// Disambiguate incomplete startup, restart budget exhaustion and the
+ /// irrevocable loss of PID1 before admitting trusted desktop input.
+ pub fn blocker(&self)->BootBlocker{
+  let health=self.health();
+  match health.phase{
+   Phase::Cold=>BootBlocker::Cold,
+   Phase::Stopped=>BootBlocker::Stopped,
+   Phase::InitReady=>if health.pid1.is_some(){
+     BootBlocker::DesktopMissing
+    }else{BootBlocker::InitMissing},
+   Phase::DesktopReady=>if health.pid1.is_none(){
+      BootBlocker::InitMissing
+     }else if health.desktop.is_none(){
+      BootBlocker::DesktopMissing
+     }else{BootBlocker::Ready},
+   Phase::Degraded=>if health.pid1.is_none(){
+      BootBlocker::InitMissing
+     }else if health.remaining_desktop_restarts==0{
+      BootBlocker::DesktopRestartExhausted
+     }else{BootBlocker::DesktopMissing},
+  }
+ }
  pub fn configure(&mut self,init_id:u16,desktop_id:u16)->Result<(),Error>{
   if self.phase!=Phase::Cold||init_id==0||desktop_id==init_id{
    return Err(Error::State);
@@ -299,6 +327,35 @@ impl<const P:usize,const E:usize,const W:usize,const K:usize>
   let mut invalid=launch(id(2));invalid.image.verified=false;
   assert!(b.start_desktop(id(2),invalid,settings(),20).is_err());
   assert!(!b.health().ready_for_desktop_input);
+ }
+
+
+ #[test]fn boot_blockers_track_authenticated_service_lifecycles(){
+  let mut b=Bootstrap::<3,3,3,3>::new();
+  assert_eq!(b.blocker(),BootBlocker::Cold);
+  b.configure(11,22).unwrap();
+  b.start_init(id(1),launch(id(1)),settings(),11).unwrap();
+  assert_eq!(b.blocker(),BootBlocker::DesktopMissing);
+  b.start_desktop(id(2),launch(id(2)),settings(),22).unwrap();
+  assert_eq!(b.blocker(),BootBlocker::Ready);
+  b.process_exited(id(2)).unwrap();
+  assert_eq!(b.blocker(),BootBlocker::DesktopMissing);
+  b.process_exited(id(1)).unwrap();
+  assert_eq!(b.blocker(),BootBlocker::Stopped);
+ }
+ #[test]fn repeated_desktop_restarts_eventually_report_exhaustion(){
+  let mut b=Bootstrap::<3,3,3,3>::new();b.configure(11,22).unwrap();
+  b.start_init(id(1),launch(id(1)),settings(),11).unwrap();
+  b.start_desktop(id(2),launch(id(2)),settings(),22).unwrap();
+  for generation in 2..=4{
+   let current=Identity{pid:2,generation:generation-1};
+   b.process_exited(current).unwrap();
+   assert_eq!(b.blocker(),BootBlocker::DesktopMissing);
+   let next=Identity{pid:2,generation};
+   b.recover_desktop(next,launch(next),settings()).unwrap();
+  }
+  b.process_exited(Identity{pid:2,generation:4}).unwrap();
+  assert_eq!(b.blocker(),BootBlocker::DesktopRestartExhausted);
  }
 
 }
