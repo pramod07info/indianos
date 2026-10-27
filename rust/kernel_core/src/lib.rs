@@ -16,6 +16,7 @@ mod initramfs;
 pub mod block;
 /// Bounded, no-allocation, scheduler-owned IPC primitive (not yet a syscall).
 pub mod ipc;
+pub mod udp_owner_epoch;
 /// Preapproved isolated agent module slots.
 pub mod agent_01_fs_extents;
 pub mod agent_02_pkg_gate;
