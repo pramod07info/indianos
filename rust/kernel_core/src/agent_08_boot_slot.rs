@@ -200,6 +200,12 @@ pub fn recover_journal<D:BlockDevice>(disk:&mut D)
         let mut sector=[0u8;SECTOR_BYTES];
         disk.read_sector(lba,&mut sector).map_err(|_|JournalError::Io)?;
         if let Some(record)=decode_journal(&sector) {
+            // Two different valid records at the same generation indicate
+            // split-brain metadata; never arbitrarily prefer one copy.
+            if latest.as_ref().is_some_and(|(old,_)|
+                record.generation==old.generation && record!=*old){
+                return Err(JournalError::Invalid);
+            }
             if latest.as_ref().is_none_or(|(old,_)| record.generation>old.generation){
                 latest=Some((record,lba));
             }
@@ -219,6 +225,11 @@ pub fn commit_boot_attempt<D:BlockDevice>(disk:&mut D,min_version:u64)
         .ok_or(JournalError::Exhausted)?;
     let encoded=encode_journal(latest).ok_or(JournalError::Invalid)?;
     disk.write_sector(1-active,&encoded).map_err(|_|JournalError::Io)?;
+    // A successful device acknowledgement alone does not prove that the
+    // new boot journal can be read back unchanged.
+    let mut readback=[0u8;SECTOR_BYTES];
+    disk.read_sector(1-active,&mut readback).map_err(|_|JournalError::Io)?;
+    if readback!=encoded{return Err(JournalError::Io);}
     Ok(selected)
 }
 #[cfg(test)]
@@ -276,5 +287,40 @@ mod batch1_disk_journal_tests {
         let mut blank=Disk{sectors:[[0;SECTOR_BYTES];2],fail:false};
         assert_eq!(commit_boot_attempt(&mut blank,1),Err(JournalError::Invalid));
     }
+
+    #[test]
+    fn two_valid_divergent_same_generation_copies_are_rejected(){
+        let mut d=disk();
+        let mut conflicting=base();
+        conflicting.slots[0].version+=1;
+        d.sectors[1]=encode_journal(conflicting).unwrap();
+        assert_eq!(recover_journal(&mut d),Err(JournalError::Invalid));
+    }
+    #[test]
+    fn identical_generation_copies_still_allow_regular_boot(){
+        let mut d=disk();
+        assert_eq!(recover_journal(&mut d).unwrap().0.generation,10);
+        assert_eq!(commit_boot_attempt(&mut d,1),Ok(1));
+        assert_eq!(recover_journal(&mut d).unwrap().0.generation,11);
+    }
+    struct CorruptingDisk(Disk);
+    impl BlockDevice for CorruptingDisk {
+        fn sector_count(&self)->u64{self.0.sector_count()}
+        fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+            ->Result<(),BlockError>{self.0.read_sector(lba,out)}
+        fn write_sector(&mut self,lba:u64,data:&[u8;SECTOR_BYTES])
+            ->Result<(),BlockError>{
+            self.0.write_sector(lba,data)?;
+            self.0.sectors[lba as usize][16]^=1;
+            Ok(())
+        }
+    }
+    #[test]
+    fn acknowledged_corrupt_write_is_rejected_and_old_record_recovers(){
+        let mut d=CorruptingDisk(disk());
+        assert_eq!(commit_boot_attempt(&mut d,1),Err(JournalError::Io));
+        assert_eq!(recover_journal(&mut d).unwrap().0.generation,10);
+    }
+
 }
 
