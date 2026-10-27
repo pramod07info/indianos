@@ -138,6 +138,20 @@ impl<D:BlockDevice> HierVfs<D>{
   self.parents(&p)?;
   self.fs.write_range_path(p.name(),offset,data)
  }
+ /// Durable destination creation from a complete, CRC-verified source.
+ /// The current R027 on-disk bank still limits file size; unlike small
+ /// Terminal copy buffers this never silently truncates the source.
+ /// Both paths are validated before any destination metadata publication.
+ pub fn copy_file(&mut self,source:&str,target:&str)->Result<(),FsError>{
+  let from=checked(source,Kind::File)?;
+  let to=checked(target,Kind::File)?;
+  if from.path()==to.path(){return Err(FsError::Exists);}
+  self.parents(&from)?;self.parents(&to)?;
+  if self.conflicting(to.path(),Kind::File)?{return Err(FsError::Exists);}
+  let mut data=[0u8;MAX_FILE_BYTES];
+  let count=self.fs.read_path(from.name(),&mut data)?;
+  self.fs.create_path(to.name(),&data[..count])
+ }
  pub fn unlink(&mut self,path:&str)->Result<(),FsError>{
   let p=checked(path,Kind::File)?;
   self.parents(&p)?;
@@ -446,4 +460,33 @@ mod tests{
   assert_eq!(mounted.read("/etc/config",&mut data),Ok(4));
   assert_eq!(&data[..4],b"safe");
  }
+
+ #[test]fn complete_multi_chunk_file_copy_survives_device_remount(){
+  let mut fs=fresh();fs.mkdir("/home").unwrap();
+  let mut content=[0u8;700];
+  for (i,b) in content.iter_mut().enumerate(){*b=(i%251) as u8;}
+  fs.create("/home/source",&content).unwrap();
+  fs.copy_file("/home/source","/home/copy").unwrap();
+  let mut fs=HierVfs::mount(fs.into_device()).unwrap();
+  let mut read=[0u8;700];
+  assert_eq!(fs.read("/home/copy",&mut read),Ok(700));
+  assert_eq!(read,content);
+  assert_eq!(fs.copy_file("/home/source","/home/copy"),Err(FsError::Exists));
+  fs.overwrite("/home/copy",b"independent").unwrap();
+  assert_eq!(fs.read("/home/source",&mut read),Ok(700));
+  assert_eq!(read,content);
+ }
+ #[test]fn missing_source_and_missing_parent_do_not_publish_copy_metadata(){
+  let mut fs=fresh();
+  fs.create("/original",b"stable").unwrap();
+  let old=fs.generation();
+  assert_eq!(fs.copy_file("/absent","/copy"),Err(FsError::NotFound));
+  assert_eq!(fs.copy_file("/original","/absent/copy"),Err(FsError::NotFound));
+  assert_eq!(fs.copy_file("/original","/original"),Err(FsError::Exists));
+  assert_eq!(fs.generation(),old);
+  let mut output=[0u8;16];
+  assert_eq!(fs.read("/original",&mut output),Ok(6));
+  assert_eq!(&output[..6],b"stable");
+ }
+
 }
