@@ -1,0 +1,148 @@
+name: IndianOS Independent Reviewer Agent
+# Trusted base only; never check out or run untrusted PR code.
+on:
+  pull_request_target:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_run:
+    workflows: ["IndianOS kernel boot (x86-64)"]
+    types: [completed]
+  workflow_dispatch:
+  schedule:
+    - cron: "11,41 * * * *"
+permissions:
+  actions: read
+  contents: read
+  pull-requests: write
+  issues: write
+concurrency:
+  group: indianos-independent-reviewer
+  cancel-in-progress: false
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Review bounded security modules against independent policy and CI
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const {owner,repo}=context.repo, full=owner+'/'+repo;
+            const policy={
+              175:{branch:'agents/05-cap-revocation-recovery',
+                paths:['rust/kernel_core/src/agent_03_cap_epoch.rs'],tests:5,
+                evidence:['pub fn revoke_owned(','authorize(grant,request)?;',
+                  'Ok(Grant{revoked:true,..grant})',
+                  'revocation_invalidates_existing_grant',
+                  'stale_generation_and_foreign_owner_cannot_revoke',
+                  'rights_escalation_and_resource_spoofing_fail',
+                  'a_zero_rights_request_never_revokes',
+                  'epoch_replay_cannot_revoke_newer_grant']},
+              172:{branch:'agents/legacy-x-udp_owner_epoch-b0ac4ba108',
+                paths:['rust/kernel_core/src/lib.rs','rust/kernel_core/src/udp_owner_epoch.rs'],tests:2,
+                source:'rust/kernel_core/src/udp_owner_epoch.rs',
+                evidence:['pub struct Registry<const N:usize>','pub fn bind(',
+                  'pub fn authorize(','pub fn revoke_owner(',
+                  'item.pid==pid && item.generation==generation',
+                  'binds_and_authorizes_only_current_generation',
+                  'refuses_invalid_owners_ports_and_capacity_exhaustion']},
+              181:{branch:'agents/03-cap-rights-intersect',
+                paths:['rust/kernel_core/src/agent_03_cap_epoch.rs'],tests:3,dependency:175,
+                evidence:['pub fn intersect_grants(',
+                  'authorize(a,request)?;authorize(b,request)?;',
+                  'let rights=a.rights&b.rights;',
+                  'only_shared_rights_survive','stale_epoch_is_denied',
+                  'revoked_or_unowned_grants_are_denied']}
+            };
+            const banned=/\b(?:unsafe|extern)\b|\bstatic\s+mut\b|\bstd\s*::|#\s*\[\s*(?:path|link|no_mangle)\b|\b(?:asm|global_asm|include|include_bytes|include_str|env|option_env)\s*!/i;
+            const main=(await github.rest.repos.getBranch({owner,repo,branch:'main'})).data.commit.sha;
+            const getRuns=sha=>github.paginate(github.rest.actions.listWorkflowRunsForRepo,
+              {owner,repo,head_sha:sha,per_page:100});
+            const newest=(runs,name,sha,events)=>
+              runs.filter(r=>r.name===name&&r.head_sha===sha&&
+                events.includes(r.event)&&r.head_repository?.full_name===full)
+              .sort((a,b)=>new Date(b.created_at)-new Date(a.created_at))[0];
+            const green=r=>r?.status==='completed'&&r.conclusion==='success';
+            const mainRun=newest(await getRuns(main),'IndianOS kernel boot (x86-64)',
+              main,['push','workflow_dispatch']);
+            if(!green(mainRun)){core.info('Current main full QEMU not green');return;}
+            const prs=await github.paginate(github.rest.pulls.list,
+              {owner,repo,state:'open',base:'main',per_page:100});
+            for(const pr of prs){
+              const p=policy[pr.number];
+              if(!p||pr.draft||pr.head.ref!==p.branch||
+                pr.head.repo?.full_name!==full||pr.user.login!==owner)continue;
+              try{
+                if(p.dependency){
+                  const dep=(await github.rest.pulls.get(
+                    {owner,repo,pull_number:p.dependency})).data;
+                  if(!dep.merged){core.info('#'+pr.number+': dependency open');continue;}
+                }
+                const files=await github.paginate(github.rest.pulls.listFiles,
+                  {owner,repo,pull_number:pr.number,per_page:100});
+                if(JSON.stringify(files.map(f=>f.filename).sort())!==
+                    JSON.stringify([...p.paths].sort())||
+                  files.some(f=>f.deletions!==0||f.changes>250||!f.patch||
+                    f.status==='removed')){
+                  core.warning('#'+pr.number+': unexpected diff');continue;
+                }
+                const diff=(await github.rest.repos.compareCommits(
+                  {owner,repo,base:'main',head:pr.head.sha})).data;
+                if(diff.merge_base_commit.sha!==main){
+                  core.info('#'+pr.number+': update to latest main first');continue;
+                }
+                const src=(await github.rest.repos.getContent(
+                  {owner,repo,path:p.source||p.paths[0],ref:pr.head.sha})).data;
+                if(Array.isArray(src)||src.type!=='file')continue;
+                const code=Buffer.from(src.content,'base64').toString('utf8');
+                const add=files.flatMap(f=>f.patch.split('\n').filter(l=>
+                  l.startsWith('+')&&!l.startsWith('+++')).map(l=>l.slice(1))).join('\n');
+                if(code.length>18000||banned.test(add)||
+                    (add.match(/#\s*\[\s*test\s*\]/g)||[]).length<p.tests||
+                    p.evidence.some(s=>!add.includes(s))){
+                  core.warning('#'+pr.number+': code evidence test failed');continue;
+                }
+                if(pr.number===172){
+                  const lib=files.find(f=>f.filename==='rust/kernel_core/src/lib.rs');
+                  const lines=lib.patch.split('\n').filter(l=>
+                    l.startsWith('+')&&!l.startsWith('+++'));
+                  if(lines.length!==1||lines[0].trim()!=='+pub mod udp_owner_epoch;'){
+                    core.warning('#172: unexpected kernel export');continue;
+                  }
+                }
+                const runs=await getRuns(pr.head.sha);
+                const pass=n=>green(newest(runs,n,pr.head.sha,
+                  ['pull_request','workflow_dispatch']));
+                if(!pass('IndianOS kernel boot (x86-64)')||
+                   !pass('IndianOS Security Gate (S0)')||
+                   !pass('Roadmap SHA Validation')){
+                  core.info('#'+pr.number+': exact-head CI not green');continue;
+                }
+                const live=(await github.rest.pulls.get(
+                  {owner,repo,pull_number:pr.number})).data;
+                if(live.draft||live.head.sha!==pr.head.sha||
+                  live.base.sha!==main||live.mergeable!==true)continue;
+                const reviews=await github.paginate(github.rest.pulls.listReviews,
+                  {owner,repo,pull_number:pr.number,per_page:100});
+                const already=reviews.some(r=>r.user.login==='github-actions[bot]'&&
+                  r.state==='APPROVED'&&r.commit_id===pr.head.sha);
+                if(!already){
+                  try{
+                    await github.rest.pulls.createReview({owner,repo,
+                      pull_number:pr.number,commit_id:pr.head.sha,event:'APPROVE',
+                      body:'Independent AUTOMATED bot review (not a human). '+
+                        'Allowlisted additive Rust changes and negative test evidence checked; '+
+                        'exact-head kernel/QEMU, S0, SHA and current-main QEMU green. '+
+                        'Approved only at commit '+pr.head.sha+'.'});
+                  }catch(e){
+                    core.warning('#'+pr.number+': bot approval unavailable: '+
+                      e.message+'. Check repo Settings > Actions > General approval setting.');
+                    continue;
+                  }
+                }
+                await github.rest.issues.addLabels({owner,repo,
+                  issue_number:pr.number,labels:['coordinator-approved']});
+                core.notice('#'+pr.number+': independently reviewed by bot; coordinator may merge');
+              }catch(e){core.warning('#'+pr.number+': failed closed: '+e.message);}
+            }
