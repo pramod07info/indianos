@@ -23,6 +23,32 @@ impl<const N:usize> LaunchQueue<N> {
         Ok(())
     }
     /// Must be called with authenticated scheduler PID+generation.
+    /// Orbit L1: atomic multi-app startup preflight: if any image is
+    /// unverified, stale or capacity-exceeding, no launch request publishes.
+    pub fn stage_batch(&mut self,requests:&[Launch])->Result<(),LaunchError>{
+        if requests.is_empty()||requests.len()>N{return Err(LaunchError::Full);}
+        let mut staged=Self{entries:self.entries};
+        for intent in requests{staged.stage(*intent)?;}
+        self.entries=staged.entries;Ok(())
+    }
+    /// Orbit L2: inspect only the exact authenticated process generation.
+    /// This is an *intention*, not proof a binary was already executed.
+    pub fn inspect(&self,pid:u32,generation:u64)->Result<Launch,LaunchError>{
+        let request=self.entries.iter().flatten().find(|p|p.pid==pid&&pid!=0)
+            .ok_or(LaunchError::Empty)?;
+        if generation==0||request.generation!=generation{
+            return Err(LaunchError::Unauthorized);
+        }
+        Ok(*request)
+    }
+    /// Orbit L3: revoke a specific incarnation without touching a recycled
+    /// PID or another process's queued launch.
+    pub fn cancel(&mut self,pid:u32,generation:u64)->Result<(),LaunchError>{
+        if self.retire(pid,generation){Ok(())}else{Err(LaunchError::Unauthorized)}
+    }
+    /// Orbit L4: bounded observable status for privileged launcher only.
+    pub fn pending(&self)->usize{self.entries.iter().filter(|p|p.is_some()).count()}
+    pub fn available(&self)->usize{N-self.pending()}
     pub fn take(&mut self,pid:u32,generation:u64)->Result<Launch,LaunchError>{
         let slot=self.entries.iter_mut().find(|x|
             x.is_some_and(|request|request.pid==pid)).ok_or(LaunchError::Empty)?;
@@ -42,6 +68,32 @@ mod tests{
     use super::*;
     fn intent()->Launch{Launch{pid:4,generation:2,image:Image{
         image_id:5,entry:0x1000,mapped_end:0x2000,verified:true}}}
+    #[test]fn orbit_batch_launch_is_transactional_and_enforces_identity(){
+        let mut q=LaunchQueue::<3>::new();
+        let first=intent();
+        let mut second=intent();second.pid=5;
+        let mut third=intent();third.pid=6;third.image.verified=false;
+        assert_eq!(q.stage_batch(&[first,second,third]),Err(LaunchError::Unverified));
+        assert_eq!(q.pending(),0);assert_eq!(q.available(),3);
+        q.stage_batch(&[first,second]).unwrap();
+        assert_eq!(q.pending(),2);
+        assert_eq!(q.inspect(4,3),Err(LaunchError::Unauthorized));
+        assert_eq!(q.inspect(4,2),Ok(first));
+        assert_eq!(q.cancel(4,3),Err(LaunchError::Unauthorized));
+        assert_eq!(q.pending(),2);
+        q.cancel(4,2).unwrap();
+        assert_eq!(q.pending(),1);
+        assert_eq!(q.inspect(5,2),Ok(second));
+    }
+    #[test]fn orbit_batch_duplicates_and_over_capacity_do_not_publish(){
+        let mut q=LaunchQueue::<2>::new();let item=intent();
+        assert_eq!(q.stage_batch(&[item,item]),Err(LaunchError::Duplicate));
+        assert_eq!(q.pending(),0);
+        let mut second=item;second.pid=5;
+        let mut third=item;third.pid=6;
+        assert_eq!(q.stage_batch(&[item,second,third]),Err(LaunchError::Full));
+        assert_eq!(q.pending(),0);
+    }
     #[test] fn staged_verified_launch_has_one_consumer(){
         let mut q=LaunchQueue::<1>::new();
         q.stage(intent()).unwrap();
