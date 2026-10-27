@@ -202,3 +202,121 @@ mod tests{
     }
 
 }
+
+
+/// R006: bounded batch operations for the authenticated quantum simulation
+/// service. These are CPU simulator jobs; neither QPU nor GPU hardware is
+/// configured or assumed to exist.
+impl QuantumService{
+ /// Validate the complete batch and available queue capacity first; if an
+ /// unexpectedly exhausted job ID fails a later submission, cancel all
+ /// already-published jobs from this batch before returning an error.
+ pub fn submit_batch_scoped(&mut self,actor:Identity,
+  requests:&[&[u8]],out:&mut[u64])->Result<usize,ServiceError>{
+  if actor.pid==0||actor.generation==0{return Err(ServiceError::InvalidOwner);}
+  if requests.is_empty()||requests.len()>MAX_JOBS||out.len()<requests.len(){
+   return Err(ServiceError::Queue(QueueError::Full));
+  }
+  let free=self.owners.iter().filter(|x|x.job==0).count();
+  if free<requests.len(){return Err(ServiceError::Queue(QueueError::Full));}
+  for request in requests{
+   crate::quantum_protocol::decode(request)
+    .map_err(|e|ServiceError::Queue(QueueError::InvalidRequest(e)))?;
+  }
+  let mut ids=[0u64;MAX_JOBS];let mut created=0usize;
+  for request in requests{
+   match self.submit_scoped(actor,request){
+    Ok(id)=>{ids[created]=id;created+=1;},
+    Err(error)=>{
+     for &id in &ids[..created]{
+      let _=self.release_scoped(actor,id);
+     }
+     return Err(error);
+    }
+   }
+  }
+  out[..created].copy_from_slice(&ids[..created]);Ok(created)
+ }
+ /// Transactional cross-job status view. Rejecting even one foreign/stale
+ /// ID leaves the destination untouched.
+ pub fn status_batch_scoped(&self,actor:Identity,ids:&[u64],
+  out:&mut[JobStatus])->Result<usize,ServiceError>{
+  if actor.pid==0||actor.generation==0{return Err(ServiceError::InvalidOwner);}
+  if ids.is_empty()||ids.len()>MAX_JOBS||out.len()<ids.len(){
+   return Err(ServiceError::Queue(QueueError::Full));
+  }
+  let mut staged=[JobStatus::Queued;MAX_JOBS];
+  for (i,&id) in ids.iter().enumerate(){
+   if ids[..i].contains(&id){return Err(ServiceError::NotOwner);}
+   staged[i]=self.status_scoped(actor,id)?;
+  }
+  out[..ids.len()].copy_from_slice(&staged[..ids.len()]);
+  Ok(ids.len())
+ }
+ /// Process teardown or user cancellation of a list of known jobs.
+ /// Validate ownership and duplicates BEFORE releasing a single job.
+ pub fn cancel_batch_scoped(&mut self,actor:Identity,ids:&[u64])
+  ->Result<usize,ServiceError>{
+  if actor.pid==0||actor.generation==0{return Err(ServiceError::InvalidOwner);}
+  if ids.is_empty()||ids.len()>MAX_JOBS{
+   return Err(ServiceError::Queue(QueueError::Full));
+  }
+  for (i,&id) in ids.iter().enumerate(){
+   if ids[..i].contains(&id){return Err(ServiceError::NotOwner);}
+   self.check_scoped(actor,id)?;
+  }
+  for &id in ids{self.release_scoped(actor,id)?;}
+  Ok(ids.len())
+ }
+ /// A capacity-bounded owner-only inventory, never disclosing other
+ /// processes' request bytes or their quantum result amplitudes.
+ pub fn active_job_ids_scoped(&self,actor:Identity,out:&mut[u64])
+  ->Result<usize,ServiceError>{
+  if actor.pid==0||actor.generation==0{return Err(ServiceError::InvalidOwner);}
+  let total=self.owners.iter().filter(|x|
+   x.job!=0&&x.owner==actor.pid&&x.generation==actor.generation).count();
+  if total>out.len(){return Err(ServiceError::Queue(QueueError::Full));}
+  let mut n=0;
+  for item in &self.owners{
+   if item.job!=0&&item.owner==actor.pid&&item.generation==actor.generation{
+    out[n]=item.job;n+=1;
+   }
+  }
+  Ok(n)
+ }
+}
+#[cfg(test)]
+mod r006_quantum_batch_tests{
+ use super::*;
+ const BELL:[u8;10]=[1,2,2,0,1,0,0,4,0,1];
+ fn owner()->Identity{Identity{pid:60,generation:8}}
+ #[test]fn submit_and_status_multiple_jobs_without_escaping_owner(){
+  let mut svc=QuantumService::new();let mut ids=[0u64;2];
+  assert_eq!(svc.submit_batch_scoped(owner(),&[&BELL,&BELL],&mut ids),Ok(2));
+  assert!(ids[0]>0&&ids[1]>ids[0]);
+  let mut observed=[JobStatus::Queued;2];
+  assert_eq!(svc.status_batch_scoped(owner(),&ids,&mut observed),Ok(2));
+  assert_eq!(observed,[JobStatus::Queued;2]);
+  assert_eq!(svc.run_next(),Some(ids[0]));
+  assert_eq!(svc.run_next(),Some(ids[1]));
+  assert_eq!(svc.status_batch_scoped(owner(),&ids,&mut observed),Ok(2));
+  assert_eq!(observed,[JobStatus::Completed;2]);
+ }
+ #[test]fn bad_batch_does_not_publish_any_jobs_or_partial_ids(){
+  let mut svc=QuantumService::new();let mut ids=[88u64;2];
+  assert!(svc.submit_batch_scoped(owner(),&[&BELL,&[0xff]],&mut ids).is_err());
+  assert_eq!(ids,[88;2]);
+  let mut visible=[0u64;MAX_JOBS];
+  assert_eq!(svc.active_job_ids_scoped(owner(),&mut visible),Ok(0));
+ }
+ #[test]fn foreign_and_stale_generations_cannot_cancel_peer_jobs(){
+  let mut svc=QuantumService::new();let mut ids=[0u64;2];
+  svc.submit_batch_scoped(owner(),&[&BELL,&BELL],&mut ids).unwrap();
+  let stale=Identity{generation:9,..owner()};
+  assert_eq!(svc.cancel_batch_scoped(stale,&ids),Err(ServiceError::NotOwner));
+  assert_eq!(svc.cancel_batch_scoped(owner(),&[ids[0],ids[0]]),
+   Err(ServiceError::NotOwner));
+  assert_eq!(svc.cancel_batch_scoped(owner(),&ids),Ok(2));
+  assert_eq!(svc.active_job_ids_scoped(owner(),&mut ids),Ok(0));
+ }
+}
