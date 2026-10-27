@@ -146,3 +146,65 @@ mod span_tests {
         assert_eq!(map_logical_span(&[],10,0,0,&mut out),Err(ExtentError::Empty));
     }
 }
+
+
+/// Validate that all requested logical blocks are mapped before data access.
+pub fn contains_logical_span(items:&[Extent],blocks:u64,start:u64,count:u64)
+ ->Result<bool,ExtentError>{
+ let total=validate_extents(items,blocks)?;
+ let end=start.checked_add(count).ok_or(ExtentError::Overflow)?;
+ Ok(count>0&&start<total&&end<=total)
+}
+#[cfg(test)]mod prefix_guard_tests{
+ use super::*;
+ #[test]fn accepts_complete_range(){assert_eq!(contains_logical_span(&[Extent{start:2,blocks:5}],20,1,4),Ok(true));}
+ #[test]fn refuses_outside_or_empty(){assert_eq!(contains_logical_span(&[Extent{start:2,blocks:5}],20,5,1),Ok(false));assert_eq!(contains_logical_span(&[],20,0,0),Ok(false));}
+ #[test]fn rejects_overflow_and_bad_extent(){assert_eq!(contains_logical_span(&[Extent{start:1,blocks:3}],20,u64::MAX,2),Err(ExtentError::Overflow));assert_eq!(contains_logical_span(&[Extent{start:19,blocks:2}],20,0,1),Err(ExtentError::OutsideDevice));}
+}
+
+
+/// Validate all physical extents and then enforce an explicit metadata and
+/// allocation budget. This is a pure policy helper; it never touches a disk.
+/// Corrupt extent metadata takes precedence over a capacity rejection.
+pub fn validate_extent_budget(
+    items: &[Extent],
+    device_blocks: u64,
+    max_extents: usize,
+    max_blocks: u64,
+) -> Result<u64, ExtentError> {
+    let total = validate_extents(items, device_blocks)?;
+    if items.len() > max_extents || total > max_blocks {
+        return Err(ExtentError::Capacity);
+    }
+    Ok(total)
+}
+
+#[cfg(test)]
+mod extent_budget_tests {
+    use super::*;
+
+    #[test]
+    fn exact_extent_and_block_budget_is_allowed() {
+        let items = [Extent { start: 2, blocks: 3 }, Extent { start: 9, blocks: 2 }];
+        assert_eq!(validate_extent_budget(&items, 12, 2, 5), Ok(5));
+        assert_eq!(validate_extent_budget(&[], 0, 0, 0), Ok(0));
+    }
+
+    #[test]
+    fn extent_count_and_total_block_quota_fail_closed() {
+        let items = [Extent { start: 2, blocks: 3 }, Extent { start: 9, blocks: 2 }];
+        assert_eq!(validate_extent_budget(&items, 12, 1, 5), Err(ExtentError::Capacity));
+        assert_eq!(validate_extent_budget(&items, 12, 2, 4), Err(ExtentError::Capacity));
+        assert_eq!(validate_extent_budget(&items, 12, 0, 0), Err(ExtentError::Capacity));
+    }
+
+    #[test]
+    fn corrupt_metadata_is_rejected_before_quota_decision() {
+        let overlapping = [Extent { start: 1, blocks: 3 }, Extent { start: 2, blocks: 1 }];
+        assert_eq!(validate_extent_budget(&overlapping, 20, 0, 0), Err(ExtentError::Overlap));
+        let beyond = [Extent { start: 19, blocks: 2 }];
+        assert_eq!(validate_extent_budget(&beyond, 20, 0, 0), Err(ExtentError::OutsideDevice));
+        let overflow = [Extent { start: u64::MAX, blocks: 2 }];
+        assert_eq!(validate_extent_budget(&overflow, u64::MAX, 0, 0), Err(ExtentError::Overflow));
+    }
+}
