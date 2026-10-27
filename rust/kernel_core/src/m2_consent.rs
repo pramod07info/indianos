@@ -86,17 +86,24 @@ impl<const P:usize> Ledger<P>{
  /// All destination checks run before any copy-on-write transaction.
  /// Missing files are created only after the same authorization preflight.
  pub fn write_authorized<D:crate::block::BlockDevice>(
-  &self,fs:&mut crate::hier_vfs::HierVfs<D>,process:Identity,
+  &self,fs:&mut crate::hier_vfs::HierVfs<D>,
+  guard:&mut crate::fs_write_guard::WriteGuard,process:Identity,
   app:Record,now:u64,path:&str,data:&[u8]
  )->Result<(),FileError>{
   self.require_file_access(process,app,now,path,
     crate::batch6_security::FILE_WRITE).map_err(FileError::Authorization)?;
-  match fs.overwrite(path,data){
+  // Reuse the existing S0 per-service ransomware/write budget rather than
+  // introducing an unmetered alternate write entry point.
+  guard.preflight(path,data.len())
+    .map_err(|_|FileError::Authorization(Error::Denied))?;
+  let result=match fs.overwrite(path,data){
    Ok(())=>Ok(()),
    Err(crate::durablefs::FsError::NotFound)=>
     fs.create(path,data).map_err(FileError::Storage),
    Err(e)=>Err(FileError::Storage(e)),
-  }
+  };
+  if result.is_ok(){guard.completed(data.len());}
+  result
  }
  pub fn revoke(&mut self,process:Identity)->Result<(),Error>{
   let Some(slot)=self.records.iter_mut().find(|x|
@@ -140,6 +147,7 @@ mod m2_tests{
  }
  #[test]fn m2_consent_file_access_requires_signed_image_and_exact_live_pid(){
   let app=Record{rights:FILE_READ|FILE_WRITE,..app()};
+  let mut guard=crate::fs_write_guard::WriteGuard::new();
   let mut ledger=Ledger::<1>::new();
   ledger.approve(&auth(),actor(),1,process(),app,
     FILE_READ|FILE_WRITE,30).unwrap();
@@ -204,7 +212,7 @@ mod m2_tests{
   let mut ledger=Ledger::<1>::new();
   ledger.approve(&auth(),actor(),1,process(),app,
     FILE_READ|FILE_WRITE,30).unwrap();
-  assert_eq!(ledger.write_authorized(&mut fs,process(),app,2,
+  assert_eq!(ledger.write_authorized(&mut fs,&mut guard,process(),app,2,
     "/home/note",b"durable"),Ok(()));
   let mut output=[0u8;16];
   assert_eq!(ledger.read_authorized(&mut fs,process(),app,2,
@@ -212,7 +220,7 @@ mod m2_tests{
   assert_eq!(&output[..7],b"durable");
   let generation=fs.generation();
   let stale=Identity{generation:2,..process()};
-  assert_eq!(ledger.write_authorized(&mut fs,stale,app,2,
+  assert_eq!(ledger.write_authorized(&mut fs,&mut guard,stale,app,2,
     "/home/note",b"attack"),
     Err(FileError::Authorization(Error::Denied)));
   assert_eq!(ledger.write_authorized(&mut fs,process(),app,2,
@@ -221,7 +229,7 @@ mod m2_tests{
   assert_eq!(ledger.write_authorized(&mut fs,process(),app,2,
     "/home/../system/config",b"attack"),
     Err(FileError::Authorization(Error::Denied)));
-  assert_eq!(ledger.write_authorized(&mut fs,process(),app,30,
+  assert_eq!(ledger.write_authorized(&mut fs,&mut guard,process(),app,30,
     "/home/note",b"expired"),
     Err(FileError::Authorization(Error::Expired)));
   assert_eq!(fs.generation(),generation);
@@ -255,9 +263,10 @@ mod m2_tests{
   let mut fs=HierVfs::format_blank(Disk{data:[[0;SECTOR_BYTES];100]}).unwrap();
   fs.mkdir("/home").unwrap();fs.create("/home/a",b"original").unwrap();
   let mut ledger=Ledger::<1>::new();
+  let mut guard=crate::fs_write_guard::WriteGuard::new();
   ledger.approve(&auth(),actor(),1,process(),app(),FILE_READ,20).unwrap();
   let generation=fs.generation();
-  assert_eq!(ledger.write_authorized(&mut fs,process(),app(),2,
+  assert_eq!(ledger.write_authorized(&mut fs,&mut guard,process(),app(),2,
     "/home/a",b"changed"),
     Err(FileError::Authorization(Error::Denied)));
   assert_eq!(fs.generation(),generation);
