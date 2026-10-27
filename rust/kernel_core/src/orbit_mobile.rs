@@ -40,6 +40,38 @@ impl Layout{
     }
     /// M2: bottom navigation stays inside the safe area, including notches
     /// and gesture exclusion zones.
+    /// Screen below the system header and above bottom gestures. Never
+    /// assumes fullscreen access through a device notch or keyboard.
+    pub fn content_area(self,header:u32)->Result<Box2D,Error>{
+        let nav=self.bottom_nav();
+        let top=self.safe.y.checked_add(header).ok_or(Error::Invalid)?;
+        if top>=nav.y{return Err(Error::TooSmall);}
+        Ok(Box2D{x:self.safe.x,y:top,width:self.safe.width,height:nav.y-top})
+    }
+    /// Accessible controls from one horizontal toolbar, at least 44 pixels
+    /// tall and wide each. Fail before returning any invalid hit target.
+    pub fn toolbar_target(self,index:usize,count:usize)
+        ->Result<Box2D,Error>{
+        if count==0||count>8||index>=count{return Err(Error::Invalid);}
+        let area=self.content_area(60)?;
+        if area.width/(count as u32)<44{return Err(Error::TooSmall);}
+        let width=area.width as u64;
+        let x0=width*index as u64/count as u64;
+        let x1=width*(index+1) as u64/count as u64;
+        Ok(Box2D{x:area.x+x0 as u32,y:area.y,width:(x1-x0) as u32,height:52})
+    }
+    /// New display orientation requires a new viewport and insets. Keep
+    /// this pure; no false claim of automatic accelerometer activation.
+    pub fn relayout(self,width:u32,height:u32,insets:Insets)
+        ->Result<Self,Error>{Self::new(width,height,insets)}
+    /// Percent-based position for migration of an on-screen pointer to a
+    /// new viewport. No raw pointer/coordinate is used as authority.
+    pub fn normalized(self,position:Point)->Option<(u16,u16)>{
+        if !self.safe.contains(position){return None;}
+        let x=(position.x-self.safe.x) as u64*1000/self.safe.width as u64;
+        let y=(position.y-self.safe.y) as u64*1000/self.safe.height as u64;
+        Some((x as u16,y as u16))
+    }
     pub fn bottom_nav(self)->Box2D{
         let height=64.min(self.safe.height);
         Box2D{x:self.safe.x,y:self.safe.y+self.safe.height-height,
@@ -86,6 +118,10 @@ impl Contact{
         if !viewport.safe.contains(point){return Err(Error::Invalid);}
         self.last=point;Ok(())
     }
+    /// On screen lock/rotation, atomically discard the touch contact; an
+    /// old contact ID can no longer complete a gesture.
+    pub fn reset(&mut self){self.id=None;}
+    pub fn active(&self)->bool{self.id.is_some()}
     pub fn cancel(&mut self,id:u32)->Result<(),Error>{
         if self.id!=Some(id){return Err(Error::Denied);}
         self.id=None;Ok(())
@@ -168,4 +204,32 @@ impl Contact{
         t.cancel(10).unwrap();
         assert_eq!(t.end(10,Point{x:100,y:100},l),Err(Error::Denied));
     }
+    #[test]fn orbit_mobile_rotation_and_content_area_are_safe(){
+        let old=Layout::new(390,844,insets()).unwrap();
+        let content=old.content_area(60).unwrap();
+        assert_eq!(content.y,84);
+        assert!(content.y+content.height<=old.bottom_nav().y);
+        let changed=old.relayout(844,390,Insets{left:12,right:12,
+                                     top:0,bottom:12}).unwrap();
+        assert_eq!(changed.form,Form::Landscape);
+        assert!(changed.content_area(60).is_ok());
+        assert_eq!(old.normalized(Point{x:0,y:0}),None);
+        assert_eq!(old.normalized(Point{x:195,y:424}),Some((500,500)));
+    }
+    #[test]fn orbit_mobile_accessible_targets_and_rotation_invalidate_contacts(){
+        let layout=Layout::new(412,915,insets()).unwrap();
+        for index in 0..5{
+            let b=layout.toolbar_target(index,5).unwrap();
+            assert!(b.width>=44&&b.height>=44);
+            assert!(layout.safe.contains(Point{x:b.x,y:b.y}));
+        }
+        assert_eq!(layout.toolbar_target(8,9),Err(Error::Invalid));
+        let mut c=Contact::new();
+        c.begin(8,Point{x:120,y:120},layout).unwrap();
+        assert!(c.active());
+        c.reset();
+        assert!(!c.active());
+        assert_eq!(c.end(8,Point{x:150,y:120},layout),Err(Error::Denied));
+    }
+
 }
