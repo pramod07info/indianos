@@ -129,3 +129,40 @@ mod damage_union_tests{
                    Err(RectError::Empty));
     }
 }
+
+
+/// Source of truth for a desktop surface is the scheduler's PID and process
+/// generation. Matching PID alone is insufficient after process retirement.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct SurfacePrincipal { pub pid:u32, pub generation:u64 }
+pub fn clip_session_owned(surface:Rectangle,clip:Rectangle,
+    owner:SurfacePrincipal,caller:SurfacePrincipal)
+    ->Result<Option<Rectangle>,RectError>{
+    if owner.pid==0 || owner.generation==0 || owner!=caller {
+        return Err(RectError::InvalidOwner);
+    }
+    clip_owned(surface,clip,owner.pid,caller.pid)
+}
+#[cfg(test)]
+mod generation_surface_tests {
+    use super::*;
+    fn principal(generation:u64)->SurfacePrincipal{
+        SurfacePrincipal{pid:7,generation}
+    }
+    fn rect()->Rectangle{Rectangle{x:10,y:10,width:20,height:20}}
+    #[test]fn active_session_can_clip_its_owned_surface(){
+        assert_eq!(clip_session_owned(rect(),rect(),principal(2),principal(2)),
+                   Ok(Some(rect())));
+    }
+    #[test]fn recycled_pid_does_not_inherit_surface_ownership(){
+        assert_eq!(clip_session_owned(rect(),rect(),principal(2),principal(3)),
+                   Err(RectError::InvalidOwner));
+    }
+    #[test]fn empty_identity_and_invalid_bounds_fail_closed(){
+        assert_eq!(clip_session_owned(rect(),rect(),principal(0),principal(0)),
+                   Err(RectError::InvalidOwner));
+        let bad=Rectangle{x:1279,y:0,width:2,height:1};
+        assert_eq!(clip_session_owned(bad,rect(),principal(2),principal(2)),
+                   Err(RectError::OutsideScreen));
+    }
+}
