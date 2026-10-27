@@ -105,6 +105,51 @@ impl<const P:usize> Ledger<P>{
   if result.is_ok(){guard.completed(data.len());}
   result
  }
+ /// Metadata mutations are filesystem writes too: account each
+ /// successful operation against the existing S0 bounded write budget.
+ /// A denied rename must not permit moving a protected source or creating
+ /// a protected destination.
+ pub fn rename_file_authorized<D:crate::block::BlockDevice>(
+  &self,fs:&mut crate::hier_vfs::HierVfs<D>,
+  guard:&mut crate::fs_write_guard::WriteGuard,
+  process:Identity,app:Record,now:u64,source:&str,destination:&str
+ )->Result<(),FileError>{
+  for name in [source,destination]{
+   self.require_file_access(process,app,now,name,
+     crate::batch6_security::FILE_WRITE).map_err(FileError::Authorization)?;
+  }
+  guard.preflight(destination,1)
+    .map_err(|_|FileError::Authorization(Error::Denied))?;
+  let result=fs.rename_file(source,destination).map_err(FileError::Storage);
+  if result.is_ok(){guard.completed(1);}
+  result
+ }
+ pub fn unlink_authorized<D:crate::block::BlockDevice>(
+  &self,fs:&mut crate::hier_vfs::HierVfs<D>,
+  guard:&mut crate::fs_write_guard::WriteGuard,
+  process:Identity,app:Record,now:u64,path:&str
+ )->Result<(),FileError>{
+  self.require_file_access(process,app,now,path,
+    crate::batch6_security::FILE_WRITE).map_err(FileError::Authorization)?;
+  guard.preflight(path,1)
+    .map_err(|_|FileError::Authorization(Error::Denied))?;
+  let result=fs.unlink(path).map_err(FileError::Storage);
+  if result.is_ok(){guard.completed(1);}
+  result
+ }
+ pub fn mkdir_authorized<D:crate::block::BlockDevice>(
+  &self,fs:&mut crate::hier_vfs::HierVfs<D>,
+  guard:&mut crate::fs_write_guard::WriteGuard,
+  process:Identity,app:Record,now:u64,path:&str
+ )->Result<(),FileError>{
+  self.require_file_access(process,app,now,path,
+    crate::batch6_security::FILE_WRITE).map_err(FileError::Authorization)?;
+  guard.preflight(path,1)
+    .map_err(|_|FileError::Authorization(Error::Denied))?;
+  let result=fs.mkdir(path).map_err(FileError::Storage);
+  if result.is_ok(){guard.completed(1);}
+  result
+ }
  pub fn revoke(&mut self,process:Identity)->Result<(),Error>{
   let Some(slot)=self.records.iter_mut().find(|x|
     x.is_some_and(|a|a.process==process))else{return Err(Error::Denied)};
@@ -245,6 +290,32 @@ mod m2_tests{
   let mut protected=[0u8;16];
   assert_eq!(fs.read("/system/config",&mut protected),Ok(7));
   assert_eq!(&protected[..7],b"trusted");
+  let previous=fs.generation();
+  assert_eq!(ledger.rename_file_authorized(&mut fs,&mut guard,process(),
+    app,2,"/system/config","/home/leaked"),
+    Err(FileError::Authorization(Error::Denied)));
+  assert_eq!(ledger.rename_file_authorized(&mut fs,&mut guard,process(),
+    app,2,"/home/note","/system/leaked"),
+    Err(FileError::Authorization(Error::Denied)));
+  assert_eq!(ledger.unlink_authorized(&mut fs,&mut guard,process(),
+    app,2,"/system/config"),Err(FileError::Authorization(Error::Denied)));
+  assert_eq!(fs.generation(),previous);
+  assert_eq!(ledger.mkdir_authorized(&mut fs,&mut guard,process(),
+    app,2,"/home/archive"),Ok(()));
+  assert_eq!(ledger.rename_file_authorized(&mut fs,&mut guard,process(),
+    app,2,"/home/note","/home/archive/note"),Ok(()));
+  fs=HierVfs::mount(fs.into_device()).unwrap();
+  assert_eq!(ledger.read_authorized(&mut fs,process(),app,2,
+    "/home/archive/note",&mut output),Ok(7));
+  assert_eq!(&output[..7],b"durable");
+  assert_eq!(ledger.unlink_authorized(&mut fs,&mut guard,process(),
+    app,2,"/home/archive/note"),Ok(()));
+  fs=HierVfs::mount(fs.into_device()).unwrap();
+  assert_eq!(fs.read("/home/archive/note",&mut output),
+    Err(crate::durablefs::FsError::NotFound));
+  assert_eq!(fs.read("/system/config",&mut protected),Ok(7));
+  assert_eq!(&protected[..7],b"trusted");
+  assert_eq!(guard.statistics().completed_writes,4);
   ledger.retire(process());
   assert_eq!(ledger.read_authorized(&mut fs,process(),app,2,
     "/home/note",&mut output),
