@@ -41,7 +41,7 @@ pub fn command<D:BlockDevice,const N:usize>(
  if input.is_empty()||input.len()>MAX_COMMAND||input.iter().any(|c|
   *c!=b' '&&!c.is_ascii_graphic()){return Err(Error::Invalid);}
  let line=core::str::from_utf8(input).map_err(|_|Error::Invalid)?.trim();
- if line=="help"{return publish(b"pwd ls /dir cat /path write /path text mkdir /dir mv /old /new rm /path",out);}
+ if line=="help"{return publish(b"pwd ls /dir cat /path write /path text mkdir /dir mv /old /new cp /src /dst rm /path",out);}
  if line=="pwd"{return publish(b"/",out);}
  let (verb,raw)=line.split_once(' ').ok_or(Error::Unknown)?;
  let mut name=[0u8;64];
@@ -84,6 +84,28 @@ pub fn command<D:BlockDevice,const N:usize>(
     Err(e)=>return Err(Error::Io(e)),
    };
    publish(b"saved",out)
+  }
+  "cp"=>{
+   // A copy reads the source AND mutates the destination. Neither a
+   // read-only nor a write-only grant may authorize this operation.
+   auth.require(caller,FILE_READ|FILE_WRITE,now).map_err(|_|Error::Denied)?;
+   if out.len()<6{return Err(Error::OutputTooSmall);}
+   let (left,right)=raw.split_once(' ').ok_or(Error::Invalid)?;
+   let from=path(left,&mut name)?;
+   let mut target=[0u8;64];
+   let to=path(right,&mut target)?;
+   if from==to{return Err(Error::Invalid);}
+   writable_path(to)?;
+   // Read the entire source before any destination mutation. In particular,
+   // a missing/oversized source or a protected destination is fail-closed.
+   let mut bytes=[0u8;MAX_TRANSFER];
+   let n=fs.read(from,&mut bytes).map_err(Error::Io)?;
+   match fs.overwrite(to,&bytes[..n]){
+    Ok(())=>{},
+    Err(FsError::NotFound)=>fs.create(to,&bytes[..n]).map_err(Error::Io)?,
+    Err(e)=>return Err(Error::Io(e)),
+   }
+   publish(b"copied",out)
   }
   "rm"=>{
    auth.require(caller,FILE_WRITE,now).map_err(|_|Error::Denied)?;
@@ -259,6 +281,78 @@ mod tests{
                 b"write /systematic/log okay").unwrap().0,5);
   let (n,b)=run(&mut fs,&access,user(),b"cat /systematic/log").unwrap();
   assert_eq!(&b[..n],b"okay");
+ }
+
+ #[test]fn terminal_copy_is_durable_and_requires_both_rights(){
+  let mut fs=HierVfs::format_blank(blank()).unwrap();
+  let access=grants();
+  fs.mkdir("/home").unwrap();
+  fs.create("/home/source",b"durable source").unwrap();
+  fs.create("/home/target",b"old target").unwrap();
+  let mut read_only=Access::<1>::new();
+  read_only.grant(user(),FILE_READ,500).unwrap();
+  let mut write_only=Access::<1>::new();
+  write_only.grant(user(),FILE_WRITE,500).unwrap();
+  let before=fs.generation();
+  assert_eq!(run(&mut fs,&read_only,user(),b"cp /home/source /home/target"),
+             Err(Error::Denied));
+  assert_eq!(run(&mut fs,&write_only,user(),b"cp /home/source /home/target"),
+             Err(Error::Denied));
+  assert_eq!(fs.generation(),before);
+  let (n,result)=run(&mut fs,&access,user(),b"cp /home/source /home/target").unwrap();
+  assert_eq!(&result[..n],b"copied");
+  fs=HierVfs::mount(fs.into_device()).unwrap();
+  let (n,data)=run(&mut fs,&access,user(),b"cat /home/target").unwrap();
+  assert_eq!(&data[..n],b"durable source");
+  run(&mut fs,&access,user(),b"cp /home/source /home/second").unwrap();
+  fs=HierVfs::mount(fs.into_device()).unwrap();
+  let (n,data)=run(&mut fs,&access,user(),b"cat /home/second").unwrap();
+  assert_eq!(&data[..n],b"durable source");
+ }
+ #[test]fn terminal_copy_rejected_paths_and_small_output_do_not_mutate(){
+  let mut fs=HierVfs::format_blank(blank()).unwrap();
+  let access=grants();
+  fs.mkdir("/home").unwrap();fs.mkdir("/system").unwrap();
+  fs.create("/home/source",b"good").unwrap();
+  fs.create("/home/target",b"keep").unwrap();
+  fs.create("/system/config",b"protected").unwrap();
+  let before=fs.generation();
+  for cmd in [
+   b"cp /home/source /system/config".as_slice(),
+   b"cp /system/config /boot/config".as_slice(),
+  ]{
+   assert_eq!(run(&mut fs,&access,user(),cmd),Err(Error::Denied));
+  }
+  assert_eq!(run(&mut fs,&access,user(),b"cp /home/source /home/source"),
+             Err(Error::Invalid));
+  assert_eq!(run(&mut fs,&access,user(),b"cp /home/missing /home/target"),
+             Err(Error::Io(FsError::NotFound)));
+  let mut small=[0xcc;5];
+  assert_eq!(command(&mut fs,&access,user(),1,
+             b"cp /home/source /home/target",&mut small),
+             Err(Error::OutputTooSmall));
+  assert_eq!(small,[0xcc;5]);
+  assert_eq!(fs.generation(),before);
+  fs=HierVfs::mount(fs.into_device()).unwrap();
+  let (n,data)=run(&mut fs,&access,user(),b"cat /home/target").unwrap();
+  assert_eq!(&data[..n],b"keep");
+  let (n,data)=run(&mut fs,&access,user(),b"cat /system/config").unwrap();
+  assert_eq!(&data[..n],b"protected");
+ }
+ #[test]fn terminal_copy_failed_disk_write_keeps_last_committed_target(){
+  let mut fs=HierVfs::format_blank(blank()).unwrap();
+  let access=grants();
+  fs.mkdir("/home").unwrap();
+  fs.create("/home/source",b"replacement").unwrap();
+  fs.create("/home/target",b"committed").unwrap();
+  let mut disk=fs.into_device();disk.fail_writes=true;
+  let mut fs=HierVfs::mount(disk).unwrap();
+  assert_eq!(run(&mut fs,&access,user(),b"cp /home/source /home/target"),
+             Err(Error::Io(FsError::Io)));
+  let mut disk=fs.into_device();disk.fail_writes=false;
+  let mut fs=HierVfs::mount(disk).unwrap();
+  let (n,data)=run(&mut fs,&access,user(),b"cat /home/target").unwrap();
+  assert_eq!(&data[..n],b"committed");
  }
 
 }
