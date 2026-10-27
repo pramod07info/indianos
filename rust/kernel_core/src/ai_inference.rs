@@ -120,6 +120,69 @@ pub fn run_two_layer_batch<const N:usize>(
  output[..count].copy_from_slice(&staged[..count]);
  Ok(count)
 }
+/// Bounded classification of local CPU model logits, not a generative AI
+/// assistant or calibrated probability. Ties prefer the lowest output ID.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct Prediction{pub class:usize,pub score:i16,pub margin:i32}
+impl Prediction{
+    pub const fn empty()->Self{Self{class:0,score:0,margin:0}}
+}
+pub fn top_class(logits:&[i16])->Result<Prediction,Error>{
+    if logits.is_empty()||logits.len()>MAX_NEURONS{return Err(Error::Shape);}
+    let mut best=0usize;
+    let mut runner:Option<i16>=None;
+    for i in 1..logits.len(){
+        if logits[i]>logits[best]{
+            runner=Some(runner.map_or(logits[best],|x|x.max(logits[best])));
+            best=i;
+        }else{
+            runner=Some(runner.map_or(logits[i],|x|x.max(logits[i])));
+        }
+    }
+    Ok(Prediction{class:best,score:logits[best],
+        margin:runner.map_or(0,|other|logits[best] as i32-other as i32)})
+}
+/// Enforce live user identity and run the full real dense CPU pipeline.
+pub fn classify_authorized<const N:usize>(
+    acl:&Access<N>,owner:Identity,now:u64,model:&Dense<'_>,
+    input:&[i8])->Result<Prediction,Error>{
+    let mut scores=[0i16;MAX_NEURONS];
+    let len=run_authorized(acl,owner,now,model,input,&mut scores)?;
+    top_class(&scores[..len])
+}
+/// Recheck both actual model layers, then classify output. All computation
+/// stays in bounded caller/stack memory without disclosing raw model weights.
+pub fn classify_two_layer<const N:usize>(
+    acl:&Access<N>,owner:Identity,now:u64,
+    first:&Dense<'_>,second:&Dense<'_>,input:&[i8])
+    ->Result<Prediction,Error>{
+    acl.require(owner,VIEW,now).map_err(|_|Error::Denied)?;
+    let mut scores=[0i16;MAX_NEURONS];
+    let size=run_two_layers(first,second,input,&mut scores)?;
+    top_class(&scores[..size])
+}
+/// Atomic multi-sample classification: a single malformed input, expired
+/// grant or undersized output produces no published prediction.
+pub fn classify_batch<const N:usize>(
+    acl:&Access<N>,owner:Identity,now:u64,model:&Dense<'_>,
+    inputs:&[i8],samples:usize,out:&mut[Prediction])
+    ->Result<usize,Error>{
+    acl.require(owner,VIEW,now).map_err(|_|Error::Denied)?;
+    if samples==0||samples>MAX_BATCH||out.len()<samples||
+       model.features.checked_mul(samples)!=Some(inputs.len()){
+        return Err(Error::Shape);
+    }
+    validate(model,model.features,model.neurons)?;
+    let mut staged=[Prediction::empty();MAX_BATCH];
+    let mut scores=[0i16;MAX_NEURONS];
+    for i in 0..samples{
+        let from=i*model.features;
+        let len=run_dense(model,&inputs[from..from+model.features],&mut scores)?;
+        staged[i]=top_class(&scores[..len])?;
+    }
+    out[..samples].copy_from_slice(&staged[..samples]);
+    Ok(samples)
+}
 #[cfg(test)]
 mod tests{
  use super::*;
@@ -230,6 +293,29 @@ mod tests{
   assert_eq!(run_two_layer_batch(&acl,actor,10,&first,&second,2,
     &[2,3,1,1],&mut out),Err(Error::Denied));
   assert_eq!(out,[77;2]);
+ }
+
+ #[test]fn orbit_ai_top_class_margin_ties_and_signed_values(){
+  assert_eq!(top_class(&[-2,-7,-3]),Ok(Prediction{class:0,score:-2,margin:1}));
+  assert_eq!(top_class(&[4,4,0]),Ok(Prediction{class:0,score:4,margin:0}));
+  assert_eq!(top_class(&[]),Err(Error::Shape));
+ }
+ #[test]fn orbit_ai_batched_classification_never_partially_publishes(){
+  let weight=[1i8,0,0,1];let bias=[0i32,0];
+  let m=model(&weight,&bias);
+  let who=Identity{pid:9,generation:3};
+  let mut acl=Access::<1>::new();acl.grant(who,VIEW,20).unwrap();
+  let sentinel=Prediction{class:99,score:99,margin:99};
+  let mut out=[sentinel;2];
+  assert_eq!(classify_batch(&acl,who,1,&m,&[3,1,1,8],2,&mut out),Ok(2));
+  assert_eq!(out[0].class,0);assert_eq!(out[1].class,1);
+  out=[sentinel;2];
+  assert_eq!(classify_batch(&acl,who,20,&m,&[3,1,1,8],2,&mut out),
+             Err(Error::Denied));
+  assert_eq!(out,[sentinel;2]);
+  assert_eq!(classify_batch(&acl,who,1,&m,&[3,1],2,&mut out),
+             Err(Error::Shape));
+  assert_eq!(out,[sentinel;2]);
  }
 
 }
