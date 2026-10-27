@@ -12,6 +12,17 @@ pub enum Error{State,Service(InitError),Session(SessionError)}
 pub enum Phase{Cold,InitReady,DesktopReady,Degraded,Stopped}
 /// Bound graphical service crash restarts for each boot session.
 pub const MAX_DESKTOP_RESTARTS:u8=3;
+/// Exposes only verified runtime ownership, never claims physical framebuffer
+/// or driver startup without the corresponding real QEMU boot evidence.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct BootHealth{
+ pub phase:Phase,
+ pub pid1:Option<Identity>,
+ pub desktop:Option<Identity>,
+ pub remaining_desktop_restarts:u8,
+ pub ready_for_desktop_input:bool,
+}
+
 pub struct Bootstrap<const P:usize,const E:usize,const W:usize,const K:usize>{
  pub session:Session<P,E,W,K>,phase:Phase,init:Option<Identity>,
  desktop:Option<Identity>,desktop_restarts:u8,
@@ -22,6 +33,21 @@ impl<const P:usize,const E:usize,const W:usize,const K:usize>
   phase:Phase::Cold,init:None,desktop:None,desktop_restarts:0}}
  pub fn phase(&self)->Phase{self.phase}
  pub fn desktop_restart_count(&self)->u8{self.desktop_restarts}
+ /// Fail-closed service health for native startup and recovery supervision.
+ /// A mere DesktopReady phase is insufficient if the owning PCB has gone.
+ pub fn health(&self)->BootHealth{
+  let pid1=self.init.filter(|x|self.session.owns(*x));
+  let desktop=self.desktop.filter(|x|self.session.owns(*x));
+  BootHealth{
+   phase:self.phase,
+   pid1,desktop,
+   remaining_desktop_restarts:MAX_DESKTOP_RESTARTS
+      .saturating_sub(self.desktop_restarts),
+   ready_for_desktop_input:self.phase==Phase::DesktopReady
+     &&pid1.is_some()&&desktop.is_some(),
+  }
+ }
+
  pub fn configure(&mut self,init_id:u16,desktop_id:u16)->Result<(),Error>{
   if self.phase!=Phase::Cold||init_id==0||desktop_id==init_id{
    return Err(Error::State);
@@ -242,6 +268,37 @@ impl<const P:usize,const E:usize,const W:usize,const K:usize>
   assert_eq!(b.desktop_restart_count(),0);
   b.recover_desktop(new,launch(new),settings()).unwrap();
   assert_eq!(b.desktop_restart_count(),1);
+ }
+
+
+ #[test]fn health_only_reports_real_live_init_and_desktop(){
+  let mut b=Bootstrap::<3,3,3,3>::new();
+  assert!(!b.health().ready_for_desktop_input);
+  b.configure(10,20).unwrap();
+  b.start_init(id(1),launch(id(1)),settings(),10).unwrap();
+  assert_eq!(b.health().pid1,Some(id(1)));
+  assert!(!b.health().ready_for_desktop_input);
+  b.start_desktop(id(2),launch(id(2)),settings(),20).unwrap();
+  assert!(b.health().ready_for_desktop_input);
+  b.process_exited(id(2)).unwrap();
+  assert!(!b.health().ready_for_desktop_input);
+  assert_eq!(b.health().desktop,None);
+  let newer=Identity{pid:2,generation:2};
+  b.recover_desktop(newer,launch(newer),settings()).unwrap();
+  assert!(b.health().ready_for_desktop_input);
+  assert_eq!(b.health().remaining_desktop_restarts,MAX_DESKTOP_RESTARTS-1);
+  b.process_exited(id(1)).unwrap();
+  assert_eq!(b.health().phase,Phase::Stopped);
+  assert_eq!(b.health().desktop,None);
+  assert!(!b.health().ready_for_desktop_input);
+ }
+ #[test]fn unsigned_boot_never_reports_ready_for_user_input(){
+  let mut b=Bootstrap::<3,3,3,3>::new();
+  b.configure(10,20).unwrap();
+  b.start_init(id(1),launch(id(1)),settings(),10).unwrap();
+  let mut invalid=launch(id(2));invalid.image.verified=false;
+  assert!(b.start_desktop(id(2),invalid,settings(),20).is_err());
+  assert!(!b.health().ready_for_desktop_input);
  }
 
 }
