@@ -45,6 +45,32 @@ impl<const N:usize> Surfaces<N>{
     x:rect.x,y:rect.y,w:right-rect.x,h:bottom-rect.y,
   })
  }
+ /// Merge repeated client updates into one queued full-window invalidation
+ /// when the queue is already saturated. Preserves event ordering and never
+ /// aliases another process's window, generation or compositor privileges.
+ pub fn submit_coalesced<const W:usize>(&mut self,windows:&Windows<W>,
+  caller:Identity,window:u32,rect:Rect)->Result<u64,Error>{
+  if caller.pid==0||caller.generation==0||
+    !windows.owns(caller.pid,caller.generation,window){
+   return Err(Error::NotOwner);
+  }
+  let geometry=windows.get(window).ok_or(Error::NotOwner)?.rect;
+  if rect.w==0||rect.h==0||
+     rect.x.checked_add(rect.w).is_none_or(|end|end>geometry.w)||
+     rect.y.checked_add(rect.h).is_none_or(|end|end>geometry.h){
+    return Err(Error::Invalid);
+  }
+  for old in self.messages[..self.count].iter_mut().flatten(){
+   if old.owner==caller&&old.window==window{
+    let x=old.rect.x.min(rect.x);let y=old.rect.y.min(rect.y);
+    let right=(old.rect.x+old.rect.w).max(rect.x+rect.w);
+    let bottom=(old.rect.y+old.rect.h).max(rect.y+rect.h);
+    old.rect=Rect{x,y,w:right-x,h:bottom-y};
+    return Ok(old.serial);
+   }
+  }
+  self.submit(windows,caller,window,rect)
+ }
  /// Trusted compositor only: caller is the scheduler-authenticated service.
  pub fn next(&mut self)->Result<Damage,Error>{
   if self.count==0{return Err(Error::Empty);}
@@ -162,6 +188,30 @@ impl<const N:usize> Surfaces<N>{
   assert_eq!(mailbox.submit_clipped(&win,Identity{generation:5,..owner},
     7,Rect{x:0,y:0,w:10,h:10}),Err(Error::NotOwner));
   assert_eq!(mailbox.next(),Err(Error::Empty));
+ }
+
+
+ #[test]fn compositor_damage_coalescing_merges_before_queue_overflow(){
+  let win=w();let owner=Identity{pid:2,generation:4};
+  let mut q=Surfaces::<1>::new();
+  let first=q.submit_coalesced(&win,owner,7,Rect{x:1,y:1,w:2,h:2}).unwrap();
+  for i in 2..50{
+   assert_eq!(q.submit_coalesced(&win,owner,7,
+      Rect{x:i,y:2,w:1,h:1}),Ok(first));
+  }
+  let next=q.next().unwrap();
+  assert_eq!(next.rect,Rect{x:1,y:1,w:49,h:2});
+  assert_eq!(q.next(),Err(Error::Empty));
+ }
+ #[test]fn compositor_coalescing_rejects_wrong_pid_generation_and_invalid_rect(){
+  let win=w();let owner=Identity{pid:2,generation:4};
+  let mut q=Surfaces::<1>::new();
+  q.submit_coalesced(&win,owner,7,Rect{x:0,y:0,w:2,h:2}).unwrap();
+  assert_eq!(q.submit_coalesced(&win,Identity{generation:5,..owner},7,
+     Rect{x:0,y:0,w:2,h:2}),Err(Error::NotOwner));
+  assert_eq!(q.submit_coalesced(&win,owner,7,
+     Rect{x:90,y:0,w:20,h:2}),Err(Error::Invalid));
+  assert_eq!(q.next().unwrap().rect,Rect{x:0,y:0,w:2,h:2});
  }
 
 }
