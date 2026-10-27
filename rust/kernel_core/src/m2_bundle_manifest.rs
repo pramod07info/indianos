@@ -22,7 +22,7 @@ pub struct BundleManifest{
 }
 pub struct SignedBundle{pub manifest:BundleManifest,pub signature:[u8;64]}
 #[derive(Debug,PartialEq,Eq)]
-pub enum Error{Invalid,Signature(batch4_signature::Error),
+pub enum Error{Invalid,Unauthorized,Signature(batch4_signature::Error),
  Storage(StorageError)}
 impl BundleManifest{
  pub fn canonical(&self)->[u8;TRANSCRIPT_BYTES]{
@@ -88,6 +88,21 @@ pub fn stage_verified<D:BlockDevice,R:BundleSource,V:Verify>(
  store.stage(m.app,m.version,m.length as usize,m.digest,source)
   .map_err(Error::Storage)
 }
+/// Preferred on-device installer entry point: the kernel supervisor must
+/// hold an unexpired INSTALL grant AND verify publisher authority before
+/// the first write to a separately selected disposable/package partition.
+/// A real interactive consent UI and protected hardware key root remain
+/// separate requirements; callers must not treat this as user approval.
+pub fn stage_authorized<D:BlockDevice,R:BundleSource,V:Verify,const N:usize>(
+ store:&mut BlobStore<D>,package:&SignedBundle,
+ auth:&crate::batch6_security::Access<N>,
+ installer:crate::batch5_session::Identity,now:u64,
+ roots:&[Root],verifier:&V,source:&mut R
+)->Result<Info,Error>{
+ auth.require(installer,crate::batch6_security::INSTALL,now)
+   .map_err(|_|Error::Unauthorized)?;
+ stage_verified(store,package,roots,verifier,source)
+}
 #[cfg(test)]
 mod m2_tests{
  use super::*;
@@ -145,6 +160,56 @@ mod m2_tests{
   signed.manifest.deps=[0;4];signed.manifest.minimums=[0;4];
   signed.manifest.app=0;
   assert_eq!(signed.verify(&roots,&verifier),Err(Error::Invalid));
+ }
+ #[test]fn m2_authorized_installer_guards_all_writes_and_remounts_package(){
+  use crate::block::{BlockDevice,BlockError,SECTOR_BYTES};
+  use crate::m2_blob_store::{REQUIRED_SECTORS,BundleSource};
+  struct Disk{blocks:std::vec::Vec<[u8;SECTOR_BYTES]>,writes:u32}
+  impl BlockDevice for Disk{
+   fn sector_count(&self)->u64{self.blocks.len() as u64}
+   fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+     ->Result<(),BlockError>{
+    *out=*self.blocks.get(lba as usize).ok_or(BlockError::OutOfRange)?;Ok(())
+   }
+   fn write_sector(&mut self,lba:u64,data:&[u8;SECTOR_BYTES])
+     ->Result<(),BlockError>{
+    *self.blocks.get_mut(lba as usize).ok_or(BlockError::OutOfRange)?=*data;
+    self.writes+=1;Ok(())
+   }
+  }
+  struct Slice<'a>(&'a [u8]);
+  impl BundleSource for Slice<'_>{
+   fn read_exact(&mut self,offset:u32,out:&mut[u8])->Result<(),()>{
+    out.copy_from_slice(self.0.get(offset as usize..offset as usize+out.len()).ok_or(())?);
+    Ok(())
+   }
+  }
+  let (signed,registry)=sample();
+  let verifier=Trusted{registry:&registry,backend:&Ed25519Backend};
+  let roots=[registry.root(7).unwrap()];
+  let bytes=[0x72u8;32768];
+  let mut store=BlobStore::mount(Disk{
+   blocks:std::vec![[0;SECTOR_BYTES];REQUIRED_SECTORS as usize],writes:0
+  }).unwrap();
+  let denied=Access::<1>::new();
+  assert_eq!(stage_authorized(&mut store,&signed,&denied,admin(),1,
+    &roots,&verifier,&mut Slice(&bytes)),Err(Error::Unauthorized));
+  assert_eq!(store.active(),None);
+  let mut bad=SignedBundle{manifest:signed.manifest,signature:signed.signature};
+  bad.signature[0]^=1;
+  assert!(matches!(stage_authorized(&mut store,&bad,&auth(),admin(),1,
+    &roots,&verifier,&mut Slice(&bytes)),Err(Error::Signature(_))));
+  assert_eq!(store.active(),None);
+  let info=stage_authorized(&mut store,&signed,&auth(),admin(),1,
+    &roots,&verifier,&mut Slice(&bytes)).unwrap();
+  assert_eq!(info.length,bytes.len() as u32);
+  let disk=store.into_device();
+  assert!(disk.writes>0);
+  let mut remounted=BlobStore::mount(disk).unwrap();
+  assert_eq!(remounted.active(),Some(info));
+  let mut out=[0u8;12];
+  remounted.verified_range(0,&mut out).unwrap();
+  assert_eq!(out,[0x72;12]);
  }
  #[test]fn m2_bundle_revoked_publisher_signature_fails_closed(){
   let (signed,mut registry)=sample();
