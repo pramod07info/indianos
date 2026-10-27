@@ -85,6 +85,23 @@ pub fn tls_peer_gate<V:TlsCertificateVerifier>(verifier:&V,
     }
     Ok(())
 }
+/// Fail-closed *policy* for the transport's externally verified TLS 1.3
+/// negotiation. Not a TLS engine: caller MUST run actual cryptographic
+/// handshake, transcript authentication, record AEAD, replay protection,
+/// certificate chain/expiry/SAN validation and trusted-root management.
+pub fn tls13_peer_preflight<V:TlsCertificateVerifier>(
+ verifier:&V,hostname:&[u8],certificate:&[u8],
+ negotiated_version:u16,alpn:&[u8]
+)->Result<(),NetworkError>{
+ // RFC 8446 negotiated protocol version. Never silently downgrade to TLS 1.2.
+ if negotiated_version!=0x0304{return Err(NetworkError::Unverified);}
+ // For now only bounded printable protocol identifiers (e.g. h2, http/1.1).
+ if alpn.is_empty()||alpn.len()>32||alpn.iter().any(|b|
+   !b.is_ascii_alphanumeric()&&!matches!(*b,b'-'|b'_'|b'.'|b'/')){
+  return Err(NetworkError::Malformed);
+ }
+ tls_peer_gate(verifier,hostname,certificate)
+}
 #[cfg(test)]
 mod tests{
     use super::*;
@@ -125,6 +142,25 @@ mod tests{
         assert_eq!(tls_peer_gate(&verifier,b"example.org",b"cert"),Ok(()));
         assert_eq!(tls_peer_gate(&verifier,b"example.org",&[]),
           Err(NetworkError::Malformed));
+    }
+    #[test]fn tls13_policy_requires_exact_version_alpn_and_verified_peer(){
+        let verifier=AllowForTests;
+        assert_eq!(tls13_peer_preflight(&verifier,b"example.org",b"cert",
+          0x0304,b"h2"),Ok(()));
+        assert_eq!(tls13_peer_preflight(&verifier,b"example.org",b"cert",
+          0x0304,b"http/1.1"),Ok(()));
+        for version in [0x0301,0x0302,0x0303,0x0305]{
+            assert_eq!(tls13_peer_preflight(&verifier,b"example.org",b"cert",
+              version,b"h2"),Err(NetworkError::Unverified));
+        }
+        for token in [b"".as_slice(),b"bad\0alpn",b"h2\n"]{
+            assert_eq!(tls13_peer_preflight(&verifier,b"example.org",b"cert",
+              0x0304,token),Err(NetworkError::Malformed));
+        }
+        assert_eq!(tls13_peer_preflight(&Deny,b"example.org",b"cert",
+          0x0304,b"h2"),Err(NetworkError::Unverified));
+        assert_eq!(tls13_peer_preflight(&verifier,b"example.org/",b"cert",
+          0x0304,b"h2"),Err(NetworkError::Malformed));
     }
     #[test]fn tls_fails_closed_without_verified_certificate(){
         assert_eq!(tls_peer_gate(&Deny,b"example.org",b"cert"),
