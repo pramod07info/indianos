@@ -31,6 +31,33 @@ impl<const N:usize> Surfaces<N>{
   for i in 1..self.count{self.messages[i-1]=self.messages[i];}
   self.count-=1;self.messages[self.count]=None;Ok(event)
  }
+ /// Compositor-only drain: translate a client-local dirty rectangle into
+ /// validated screen-space coordinates using the CURRENT window geometry.
+ /// Ignore obsolete damage from retired processes, recycled window IDs or
+ /// windows resized after the damage was queued. A ring-3 compositor must
+ /// receive these results over an authenticated kernel-owned IPC channel.
+ pub fn next_live<const W:usize>(&mut self,windows:&Windows<W>)
+  ->Result<(Damage,Rect),Error>{
+  loop{
+   let event=self.next()?;
+   if !windows.owns(event.owner.pid,event.owner.generation,event.window){
+    continue;
+   }
+   let Some(window)=windows.get(event.window)else{continue;};
+   let local=event.rect;
+   if local.x.checked_add(local.w).is_none_or(|x|x>window.rect.w)||
+      local.y.checked_add(local.h).is_none_or(|y|y>window.rect.h){
+    continue;
+   }
+   let Some(x)=window.rect.x.checked_add(local.x)else{continue;};
+   let Some(y)=window.rect.y.checked_add(local.y)else{continue;};
+   let Some(right)=x.checked_add(local.w)else{continue;};
+   let Some(bottom)=y.checked_add(local.h)else{continue;};
+   if right>crate::batch2_windows::WIDTH||
+      bottom>crate::batch2_windows::HEIGHT{continue;}
+   return Ok((event,Rect{x,y,w:local.w,h:local.h}));
+  }
+ }
  pub fn retire(&mut self,caller:Identity){
   let mut i=0;
   while i<self.count{
@@ -59,6 +86,33 @@ impl<const N:usize> Surfaces<N>{
   assert_eq!(q.submit(&windows,id,7,Rect{x:0,y:0,w:1,h:1}),Err(Error::Full));
   assert_eq!(q.next().unwrap().owner,id);
   assert_eq!(q.next(),Err(Error::Empty));
+ }
+ #[test]fn compositor_drains_authenticated_local_damage_in_screen_space(){
+  let mut windows=Windows::<2>::new();
+  let owner=Identity{pid:2,generation:4};
+  windows.create(Window{pid:2,generation:4,id:7,
+    rect:Rect{x:45,y:65,w:100,h:80}}).unwrap();
+  let mut q=Surfaces::<3>::new();
+  q.submit(&windows,owner,7,Rect{x:5,y:6,w:10,h:12}).unwrap();
+  let (event,rect)=q.next_live(&windows).unwrap();
+  assert_eq!(event.owner,owner);
+  assert_eq!(rect,Rect{x:50,y:71,w:10,h:12});
+  assert_eq!(q.next_live(&windows),Err(Error::Empty));
+ }
+ #[test]fn compositor_discards_stale_generation_and_resized_damage(){
+  let mut windows=Windows::<2>::new();
+  let old=Identity{pid:2,generation:4};
+  windows.create(Window{pid:2,generation:4,id:7,
+    rect:Rect{x:0,y:0,w:100,h:80}}).unwrap();
+  let mut q=Surfaces::<4>::new();
+  q.submit(&windows,old,7,Rect{x:90,y:5,w:10,h:10}).unwrap();
+  windows.move_to(2,4,7,Rect{x:1,y:1,w:40,h:40}).unwrap();
+  assert_eq!(q.next_live(&windows),Err(Error::Empty));
+  q.submit(&windows,old,7,Rect{x:1,y:1,w:5,h:5}).unwrap();
+  windows.retire(2,4);
+  windows.create(Window{pid:2,generation:5,id:7,
+    rect:Rect{x:0,y:0,w:100,h:80}}).unwrap();
+  assert_eq!(q.next_live(&windows),Err(Error::Empty));
  }
  #[test]fn retirement_drops_queued_frame_updates(){
   let windows=w();let mut q=Surfaces::<1>::new();let id=Identity{pid:2,generation:4};
