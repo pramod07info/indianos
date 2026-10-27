@@ -14,6 +14,8 @@ use core::ptr;
 mod orbit_ui;
 /// Session ribbon metadata: model-only, no privileged phone hardware or restore execution.
 pub mod orbit_session;
+/// Mobile/tablet screen and input geometry: no device hardware or ARM64 runtime.
+pub mod orbit_mobile;
 mod syscall;
 mod program;
 mod initramfs;
