@@ -48,6 +48,9 @@ pub mod hardware_virtio_queue;
 pub mod hardware_virtio_split;
 /// HD3B.4: bounded virtio-GPU command authorization (no hardware transport).
 pub mod hardware_gpu_control_policy;
+/// HD3B.5: mandatory 2D command policy before mock split-queue encoding.
+/// Software staging only; physical DMA/PCI and GPU acceleration remain off.
+pub mod hardware_gpu_guarded_queue;
 pub mod agent_08_boot_slot;
 pub mod agent_09_ci_policy;
 pub mod agent_10_app_policy;
