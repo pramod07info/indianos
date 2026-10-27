@@ -53,7 +53,8 @@ pub fn shell(c:&mut impl Canvas,w:u32,h:u32,workspace:Workspace,p:Colors){
     c.label(22,487,b"QUICK ACCESS",p.accent);
     c.label(24,526,b"FILES",p.white);
     c.label(24,561,b"TERMINAL",p.white);
-    c.label(24,596,b"SETTINGS [PLANNED]",p.white);
+    c.label(24,596,b"SETTINGS",p.white);
+    c.label(24,626,b"[PREVIEW]",p.accent);
     // Realistically label the assistant shell, don't imply an AI is running.
     let right=x-260;
     c.rect(right,77,245,h.saturating_sub(171),p.top);
@@ -107,7 +108,10 @@ pub fn window(c:&mut impl Canvas,w:Window,focused:bool,p:Colors){
             c.rect(x+12,y+54,b.width.saturating_sub(24),33,p.bar);
             c.label(x+23,y+62,b"HOME / PROJECTS",p.white);
             for row in 0..4{
-                let yy=y+105+row*56;
+                // Leave the real ring-3 client paint area at y+146..y+222
+                // unobstructed; static category placeholders must not
+                // collide with authenticated user-content rectangles.
+                let yy=y+105+if row==0{0}else{120+(row-1)*58};
                 if yy+42>=y+b.height as i32{break;}
                 c.rect(x+19,yy,27,24,p.title);
                 c.rect(x+22,yy-4,16,7,p.accent);
