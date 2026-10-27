@@ -14,6 +14,25 @@ use crate::batch2_windows::{Window,Rect};
 use crate::m1_persistent_terminal::{self,Error as TerminalError};
 use crate::m1_input::{InputLine,Event as KeyEvent,Error as KeyError,MAX_LINE};
 
+/// PS/2 set-1 unshifted ASCII subset for trusted QEMU keyboard events.
+/// A full keymap, modifiers, Unicode and independent compositor remain M1 work.
+fn ascii_from_set1(scan:u16)->Option<u8>{
+ Some(match scan{
+  0x1e=>b'a',0x30=>b'b',0x2e=>b'c',0x20=>b'd',
+  0x12=>b'e',0x21=>b'f',0x22=>b'g',0x23=>b'h',
+  0x17=>b'i',0x24=>b'j',0x25=>b'k',0x26=>b'l',
+  0x32=>b'm',0x31=>b'n',0x18=>b'o',0x19=>b'p',
+  0x10=>b'q',0x13=>b'r',0x1f=>b's',0x14=>b't',
+  0x16=>b'u',0x2f=>b'v',0x11=>b'w',0x2d=>b'x',
+  0x15=>b'y',0x2c=>b'z',
+  0x02=>b'1',0x03=>b'2',0x04=>b'3',0x05=>b'4',
+  0x06=>b'5',0x07=>b'6',0x08=>b'7',0x09=>b'8',
+  0x0a=>b'9',0x0b=>b'0',
+  0x39=>b' ',0x35=>b'/',0x34=>b'.',0x0c=>b'-',
+  0x0d=>b'=',0x1c=>b'\n',0x0e=>8,
+  _=>return None,
+ })
+}
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 pub enum Error{
  State,Boot(BootError),Auth(AccessError),
@@ -100,6 +119,24 @@ impl<D:BlockDevice,const P:usize,const E:usize,const W:usize,
    },
    KeyEvent::Empty=>Ok(None),
   }
+ }
+ /// A trusted kernel PS/2 ingress source supplies an actual set-1
+ /// scancode and edge. Focus, PID and generation are resolved through
+ /// the session's authenticated hardware input queue, never user registers.
+ /// The actual x86 IRQ hookup and userspace compositor remain pending.
+ pub fn physical_key(&mut self,now:u64,scan:u16,pressed:bool,
+  out:&mut[u8])->Result<Option<usize>,Error>{
+  let owner=self.owner.ok_or(Error::State)?;
+  if self.boot.desktop_identity()!=Some(owner){return Err(Error::State);}
+  self.boot.session.physical_key(scan,pressed)
+    .map_err(|e|Error::Boot(BootError::Session(e)))?;
+  let event=self.boot.session.receive_key(owner)
+    .map_err(|e|Error::Boot(BootError::Session(e)))?;
+  if event.focus.pid!=owner.pid||event.focus.generation!=owner.generation||
+     event.focus.window!=self.window{return Err(Error::State);}
+  if !event.pressed{return Ok(None);}
+  let ch=ascii_from_set1(event.scan_code).ok_or(Error::Keyboard(KeyError::Invalid))?;
+  self.key(owner,now,ch,out)
  }
  pub fn next_draw(&mut self)->Result<Damage,Error>{
   let damage=self.surface.next().map_err(Error::Graphics)?;
@@ -267,6 +304,38 @@ mod tests{
   assert_eq!(disk.data[0][510..512],[0x55,0xaa]);
   assert_eq!(disk.data[15],[0;SECTOR_BYTES]);
   assert_eq!(disk.data[116],[0;SECTOR_BYTES]);
+ }
+ #[test]fn m1_physical_scancode_routes_only_to_focused_authenticated_terminal(){
+  let disk=Disk{data:[[0;SECTOR_BYTES];SECTORS]};
+  let mut gui=TestDesk::from_mounted(HierVfs::format_blank(disk).unwrap());
+  gui.start(user(1),load(1),user(2),load(2),settings(),8,99).unwrap();
+  let mut out=[0u8;256];
+  for scan in [0x32,0x25,0x20,0x17,0x13,0x39,0x35,
+               0x23,0x18,0x32,0x12]{
+   assert_eq!(gui.physical_key(1,scan,false,&mut out),Ok(None));
+   assert_eq!(gui.physical_key(1,scan,true,&mut out),Ok(None));
+  }
+  assert_eq!(gui.physical_key(1,0x1c,true,&mut out),Ok(Some(7)));
+  assert_eq!(&out[..7],b"created");
+  let mut names=[0u8;256];
+  assert_eq!(gui.volume.list_dir("/",&mut names),Ok(7));
+  assert_eq!(&names[..7],b"d:home\n");
+  assert_eq!(gui.physical_key(1,0,true,&mut out),
+    Err(Error::Boot(BootError::Session(
+      crate::batch5_session::SessionError::Input(
+       crate::batch2_keyboard::InputError::Invalid)))));
+ }
+ #[test]fn m1_keyboard_retires_with_desktop_and_rejects_unmapped_scancode(){
+  let disk=Disk{data:[[0;SECTOR_BYTES];SECTORS]};
+  let mut gui=TestDesk::from_mounted(HierVfs::format_blank(disk).unwrap());
+  gui.start(user(1),load(1),user(2),load(2),settings(),8,99).unwrap();
+  let mut out=[0u8;32];
+  assert_eq!(gui.physical_key(1,0x3b,true,&mut out),
+    Err(Error::Keyboard(KeyError::Invalid))); // function key not ASCII
+  assert_eq!(gui.input.length(),0);
+  gui.exit(user(2)).unwrap();
+  assert_eq!(gui.physical_key(1,0x1e,true,&mut out),Err(Error::State));
+  assert_eq!(gui.next_draw(),Err(Error::Graphics(SurfaceError::Empty)));
  }
  #[test]fn expired_rights_prevent_file_writes(){
   let disk=Disk{data:[[0u8;SECTOR_BYTES];SECTORS]};
