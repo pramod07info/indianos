@@ -56,6 +56,27 @@ impl<const N:usize> Catalog<N>{
   self.items[i]=None;
   Ok(())
  }
+ /// Stage a trusted updated manifest without mutating the active catalog.
+ /// Reject version downgrades, permission escalation, missing dependencies,
+ /// cycles and ABI incompatibility before any publication. Actual on-disk
+ /// package download/signature verification and rollback occur elsewhere.
+ pub fn replace_checked(&mut self,next:Package)->Result<(),Error>{
+  let index=self.items.iter().position(|p|p.is_some_and(|p|p.id==next.id))
+    .ok_or(Error::Missing)?;
+  let current=self.items[index].ok_or(Error::Missing)?;
+  if next.version<=current.version||next.rights&!current.rights!=0{
+   return Err(Error::Invalid);
+  }
+  let mut staged=Self{items:self.items};
+  staged.items[index]=None;
+  staged.add(next)?;
+  let mut planned=[0u32;N];
+  for app in staged.items.iter().flatten(){
+   staged.resolve(app.id,&mut planned)?;
+  }
+  self.items=staged.items;
+  Ok(())
+ }
  fn visit(&self,id:u32,state:&mut[u8;N],out:&mut[u32],len:&mut usize)
   ->Result<(),Error>{
   let i=self.items.iter().position(|p|p.is_some_and(|x|x.id==id))
@@ -135,6 +156,36 @@ mod m2_tests{
   let mut out=[88u32;3];
   assert_eq!(c.resolve(1,&mut out),Err(Error::Cycle));
   assert_eq!(out,[88;3]);
+ }
+
+
+ #[test]fn updated_signed_catalog_plan_is_atomic_and_rejects_escalation(){
+  use crate::batch6_security::{VIEW,FILE_READ,FILE_WRITE};
+  let mut c=Catalog::<3>::new();
+  let mut app=pkg(1,[2,0,0,0]);app.rights=VIEW|FILE_READ;
+  c.add(app).unwrap();c.add(pkg(2,[0;4])).unwrap();
+  let mut candidate=app;candidate.version=2;candidate.payload_digest=[5;32];
+  candidate.rights|=FILE_WRITE;
+  assert_eq!(c.replace_checked(candidate),Err(Error::Invalid));
+  assert_eq!(c.get(1),Some(app));
+  candidate.rights=VIEW;candidate.deps=[3,0,0,0];
+  assert_eq!(c.replace_checked(candidate),Err(Error::Missing));
+  assert_eq!(c.get(1),Some(app));
+  candidate.deps=[2,0,0,0];
+  assert_eq!(c.replace_checked(candidate),Ok(()));
+  assert_eq!(c.get(1),Some(candidate));
+  assert_eq!(c.replace_checked(app),Err(Error::Invalid));
+ }
+ #[test]fn catalog_update_rejects_cycles_without_changing_dependency_plan(){
+  let mut c=Catalog::<3>::new();
+  c.add(pkg(1,[2,0,0,0])).unwrap();
+  c.add(pkg(2,[0;4])).unwrap();
+  let mut next=pkg(2,[1,0,0,0]);next.version=2;
+  assert_eq!(c.replace_checked(next),Err(Error::Cycle));
+  assert_eq!(c.get(2),Some(pkg(2,[0;4])));
+  let mut order=[0u32;3];
+  assert_eq!(c.resolve(1,&mut order),Ok(2));
+  assert_eq!(&order[..2],&[2,1]);
  }
 
 }
