@@ -179,6 +179,53 @@ impl<D:BlockDevice,const P:usize,const E:usize,const W:usize,
   }
   Ok(damage)
  }
+ /// Trusted scheduler call when the desktop process faults or exits.
+ /// Preserve committed filesystem objects while clearing ALL transient UI
+ /// ownership, focus, modifier keys, buffered commands and damage events.
+ pub fn desktop_crashed(&mut self,identity:Identity)->Result<(),Error>{
+  if self.owner!=Some(identity){return Err(Error::State);}
+  self.boot.process_exited(identity).map_err(Error::Boot)?;
+  self.surface.retire(identity);
+  self.rights.revoke(identity).map_err(Error::Auth)?;
+  self.input.reset();
+  self.owner=None;
+  self.window=0;
+  self.shift_left=false;self.shift_right=false;self.redraw_pending=false;
+  Ok(())
+ }
+ /// Install the new, scheduler-authenticated desktop image after a crash.
+ /// PID1 must still be live; Bootstrap enforces a finite restart budget.
+ /// This is the service-model bridge, not hardware IRQ or bootloader wiring.
+ pub fn restart_desktop(&mut self,identity:Identity,launch:Launch,
+  settings:Settings,window:u32,expires:u64)->Result<(),Error>{
+  if self.owner.is_some()||window==0||expires==0||G==0||Q==0||
+     identity.pid==0||identity.generation==0||
+     launch.pid!=identity.pid||launch.generation!=identity.generation{
+    return Err(Error::State);
+  }
+  self.boot.recover_desktop(identity,launch,settings).map_err(Error::Boot)?;
+  let result=(||{
+   self.boot.session.create_window(identity,Window{
+    pid:identity.pid,generation:identity.generation,id:window,
+    rect:Rect{x:16,y:16,w:640,h:480},
+   }).map_err(|e|Error::Boot(BootError::Session(e)))?;
+   self.rights.grant(identity,VIEW|FILE_READ|FILE_WRITE,expires)
+     .map_err(Error::Auth)?;
+   self.boot.session.focus(identity,window)
+     .map_err(|e|Error::Boot(BootError::Session(e)))?;
+   Ok::<(),Error>(())
+  })();
+  if let Err(error)=result{
+   let _=self.rights.revoke(identity);
+   let _=self.boot.process_exited(identity);
+   return Err(error);
+  }
+  self.owner=Some(identity);self.window=window;
+  self.input.reset();self.shift_left=false;self.shift_right=false;
+  self.redraw_pending=false;
+  self.request_redraw(identity)?;
+  Ok(())
+ }
  pub fn exit(&mut self,caller:Identity)->Result<(),Error>{
   if self.owner!=Some(caller){return Err(Error::State);}
   self.surface.retire(caller);
@@ -446,6 +493,42 @@ mod tests{
   assert_eq!(resumed.physical_key(1,0x2e,true,&mut out),Ok(None));
   assert_eq!(resumed.input.length(),1);
   assert_eq!(resumed.physical_key(1,0x1c,false,&mut out),Ok(None));
+ }
+
+
+ #[test]fn desktop_crash_restart_preserves_files_and_revokes_old_inputs(){
+  let disk=Disk{data:[[0u8;SECTOR_BYTES];SECTORS]};
+  let mut gui=TestDesk::from_mounted(HierVfs::format_blank(disk).unwrap());
+  gui.start(user(1),load(1),user(2),load(2),settings(),8,99).unwrap();
+  let mut out=[0u8;256];
+  gui.execute(user(2),1,b"write /note survived",&mut out).unwrap();
+  gui.key(user(2),1,b'a',&mut out).unwrap();
+  gui.desktop_crashed(user(2)).unwrap();
+  assert_eq!(gui.execute(user(2),1,b"cat /note",&mut out),Err(Error::State));
+  let next=Identity{pid:2,generation:2};
+  let mut new_launch=load(2);new_launch.generation=2;
+  gui.restart_desktop(next,new_launch,settings(),9,100).unwrap();
+  assert_eq!(gui.execute(next,1,b"cat /note",&mut out),Ok(8));
+  assert_eq!(&out[..8],b"survived");
+  assert_eq!(gui.execute(user(2),1,b"cat /note",&mut out),Err(Error::State));
+  assert_eq!(gui.input.length(),0);
+  let damage=gui.next_draw().unwrap();
+  assert_eq!(damage.owner,next);
+  assert_eq!(damage.window,9);
+ }
+ #[test]fn invalid_desktop_restart_cannot_steal_old_files_or_focus(){
+  let disk=Disk{data:[[0u8;SECTOR_BYTES];SECTORS]};
+  let mut gui=TestDesk::from_mounted(HierVfs::format_blank(disk).unwrap());
+  gui.start(user(1),load(1),user(2),load(2),settings(),8,99).unwrap();
+  gui.desktop_crashed(user(2)).unwrap();
+  let next=Identity{pid:2,generation:2};
+  let mut bad=load(2);bad.generation=2;bad.image.verified=false;
+  assert!(gui.restart_desktop(next,bad,settings(),9,100).is_err());
+  assert!(!gui.boot.session.owns(next));
+  let mut proper=load(2);proper.generation=2;
+  assert_eq!(gui.restart_desktop(next,proper,settings(),9,100),Ok(()));
+  assert_eq!(gui.restart_desktop(next,proper,settings(),10,100),Err(Error::State));
+  assert_eq!(gui.desktop_crashed(user(2)),Err(Error::State));
  }
 
 }
