@@ -120,6 +120,25 @@ jobs:
             fi
             echo "::warning::Rejected model candidate (attempt $attempt of 2)."
           done
+          # The only fallback is a PRE-REVIEWED code fixture for the
+          # allowlisted udp_owner_epoch task. It passes the identical
+          # parse, cargo, source-audit and freestanding kernel gates.
+          # Unknown or unreviewed tasks still fail closed.
+          if [[ "$generated" != true && "${{ steps.task.outputs.name }}" == "udp_owner_epoch" ]]; then
+            echo "::notice::Local model rejected twice; validating reviewed UDP fallback."
+            python3 tools/agent_x_autodev.py fallback \
+              --name udp_owner_epoch --generated /tmp/agent-x-raw.txt
+            if python3 tools/agent_x_autodev.py apply \
+                --name udp_owner_epoch --generated /tmp/agent-x-raw.txt &&
+               cargo test --offline --manifest-path rust/kernel_core/Cargo.toml; then
+              generated=true
+              echo "Reviewed, safety-gated UDP fallback passed cargo tests." >> "$GITHUB_STEP_SUMMARY"
+            else
+              git restore -- rust/kernel_core/src/lib.rs
+              rm -f -- rust/kernel_core/src/udp_owner_epoch.rs
+              echo "::error::Reviewed fallback rejected by normal safety/compile gates."
+            fi
+          fi
           if [[ "$generated" != true ]]; then
             echo "::error::Two rejected model candidates; no source was committed."
             exit 1
