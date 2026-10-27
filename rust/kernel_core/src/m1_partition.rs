@@ -93,6 +93,11 @@ fn gpt<D:BlockDevice>(disk:&mut D,index:u32)->Result<Partition,Error>{
  let sectors=total.div_ceil(SECTOR_BYTES);
  let table_end=table.checked_add(sectors as u64).ok_or(Error::OutOfRange)?;
  if table_end>first{return Err(Error::Invalid);}
+ // The last usable LBA may not overlap the secondary GPT entry array
+ // immediately preceding the alternate header. No data may be mounted there.
+ if alternate<=sectors as u64 || last>=alternate-sectors as u64 {
+  return Err(Error::Invalid);
+ }
  // Verify the complete entry array BEFORE interpreting any partition.
  let mut calculated=!0u32;
  for s in 0..sectors{
@@ -110,7 +115,9 @@ fn gpt<D:BlockDevice>(disk:&mut D,index:u32)->Result<Partition,Error>{
   let off=byte%SECTOR_BYTES;
   let entry=&sector[off..off+entry_size];
   if entry[..16].iter().all(|&v|v==0){
-   if i==index as usize{return Err(Error::NotFound);}
+   // An unused type GUID must not carry stale bounds or a unique identifier.
+   if entry.iter().any(|&v|v!=0){return Err(Error::Invalid);}
+   // An absent selected slot must not mask later corrupt live entries.
    continue;
   }
   if entry[16..32].iter().all(|&v|v==0){return Err(Error::Invalid);}
@@ -131,8 +138,20 @@ pub fn inspect<D:BlockDevice>(disk:&mut D,index:u32)->Result<Partition,Error>{
  if first[510]!=0x55||first[511]!=0xaa{return Err(Error::Invalid);}
  let protective=(0..4).any(|i|first[446+i*16+4]==0xee);
  if protective{
-  if first[450]!=0xee{return Err(Error::Invalid);}
-  if le32(&first[454..458])!=1{return Err(Error::Invalid);}
+  if first[450]!=0xee||first[446]!=0||le32(&first[454..458])!=1{
+   return Err(Error::Invalid);
+  }
+  // Reject ambiguous hybrid layouts and multiple protective entries.
+  // This is a strict read-only discovery policy, never a repair/formatter.
+  for slot in 1..4{
+   if first[446+slot*16..446+(slot+1)*16].iter().any(|&b|b!=0){
+    return Err(Error::Unsupported);
+   }
+  }
+  let covered=le32(&first[458..462]) as u64;
+  if covered<(disk.sector_count()-1).min(u32::MAX as u64){
+   return Err(Error::Invalid);
+  }
   gpt(disk,index)
  }else{mbr(disk,index,&first)}
 }
@@ -241,6 +260,60 @@ mod m1_partition_tests{
   disk.data[0][462+12..462+16].copy_from_slice(&40u32.to_le_bytes());
   assert_eq!(inspect(&mut disk,0),Err(Error::Overlap));
   assert_eq!(disk.writes,0);
+ }
+ #[test]fn m1_gpt_absent_slot_cannot_hide_corrupt_later_partition(){
+  let mut disk=gpt_disk();
+  disk.data[2][..128].fill(0); // requested index zero is unused
+  let entry=&mut disk.data[2][128..256];
+  entry[..16].fill(7);entry[16..32].fill(9);
+  entry[32..40].copy_from_slice(&40u64.to_le_bytes());
+  entry[40..48].copy_from_slice(&230u64.to_le_bytes()); // past last usable 222
+  let table_crc=crc(&disk.data[2]);
+  disk.data[1][88..92].copy_from_slice(&table_crc.to_le_bytes());
+  disk.data[1][16..20].fill(0);
+  let header_crc=crc(&disk.data[1][..92]);
+  disk.data[1][16..20].copy_from_slice(&header_crc.to_le_bytes());
+  assert_eq!(inspect(&mut disk,0),Err(Error::OutOfRange));
+  assert_eq!(disk.writes,0);
+ }
+ #[test]fn m1_gpt_rejects_hybrid_protective_mbr_and_truncated_coverage(){
+  let mut disk=gpt_disk();
+  disk.data[0][462+4]=0x83; // shadow partition beside GPT protective entry
+  assert_eq!(inspect(&mut disk,0),Err(Error::Unsupported));
+  assert_eq!(disk.writes,0);
+  let mut disk=gpt_disk();
+  disk.data[0][458..462].copy_from_slice(&10u32.to_le_bytes());
+  assert_eq!(inspect(&mut disk,0),Err(Error::Invalid));
+  assert_eq!(disk.writes,0);
+ }
+ #[test]fn m1_gpt_rejects_data_claiming_backup_metadata_sectors(){
+  let mut disk=gpt_disk();
+  disk.data[1][48..56].copy_from_slice(&254u64.to_le_bytes());
+  disk.data[1][16..20].fill(0);
+  let header_crc=crc(&disk.data[1][..92]);
+  disk.data[1][16..20].copy_from_slice(&header_crc.to_le_bytes());
+  assert_eq!(inspect(&mut disk,0),Err(Error::Invalid));
+  assert_eq!(disk.writes,0);
+ }
+ #[test]fn m1_partition_remount_keeps_last_committed_overwrite(){
+  let mut disk=mbr_disk();
+  {
+   let window=BlockWindow::new(&mut disk,10,100).unwrap();
+   let mut fs=HierVfs::format_blank(window).unwrap();
+   fs.mkdir("/home").unwrap();
+   fs.create("/home/note",b"old").unwrap();
+   fs.overwrite("/home/note",b"new committed").unwrap();
+  }
+  let before=disk.writes;
+  {
+   let mut fs=mount(&mut disk,0).unwrap();
+   let mut output=[0u8;32];
+   assert_eq!(fs.read("/home/note",&mut output),Ok(13));
+   assert_eq!(&output[..13],b"new committed");
+  }
+  assert_eq!(disk.writes,before); // inspection and remount are read-only
+  assert_eq!(disk.data[9],[0;SECTOR_BYTES]);
+  assert_eq!(disk.data[110],[0;SECTOR_BYTES]);
  }
  #[test]fn m1_unrecognized_media_and_bad_bounds_fail_closed(){
   let mut disk=new();assert_eq!(inspect(&mut disk,0),Err(Error::Invalid));
