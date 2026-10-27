@@ -521,3 +521,106 @@ mod compute_backend_tests{
             Err(ComputeError::Unavailable));
  }
 }
+
+
+/// R006 guided installer evaluation. User-friendly setup can be automatic
+/// in presentation, never in physical disk destruction. These flags MUST
+/// come from trusted UEFI, block-device and signature-verifier backends.
+pub const MIN_INSTALL_BYTES:u64=8*1024*1024*1024;
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct InstallEvidence{
+ pub uefi_boot:bool,pub disk_bytes:u64,pub disk_unmounted:bool,
+ pub selected_target:bool,pub recovery_available:bool,
+ pub signed_image:bool,pub user_confirmed:bool,
+ pub verified_gpu_driver:bool,
+}
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum InstallMode{Unsupported,PreviewOnly,GuidedDisk}
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum DisplayBackend{Software,VerifiedAccelerated}
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct InstallAssessment{
+ pub mode:InstallMode,pub display:DisplayBackend,
+ pub needs_confirmation:bool,pub recovery_ready:bool,
+ pub disk_suitable:bool,pub cpu_suitable:bool,
+}
+/// Deliberately separate hardware *detected* from a signed, DMA-safe GPU
+/// *driver activated*. No automatic partitioning, key wipe or boot write.
+pub fn assess_install(inventory:&Inventory,e:InstallEvidence)->InstallAssessment{
+ let cpu=inventory.cpu.supported()&&e.uefi_boot;
+ let disk=e.selected_target&&e.disk_unmounted&&e.disk_bytes>=MIN_INSTALL_BYTES;
+ let proof=e.signed_image&&e.recovery_available;
+ let authorized=e.user_confirmed&&disk&&proof;
+ let mode=if !cpu{InstallMode::Unsupported}
+  else if authorized{InstallMode::GuidedDisk}
+  else{InstallMode::PreviewOnly};
+ let display=if inventory.gpu_count>0&&e.verified_gpu_driver{
+  DisplayBackend::VerifiedAccelerated
+ }else{DisplayBackend::Software};
+ InstallAssessment{mode,display,needs_confirmation:!e.user_confirmed,
+  recovery_ready:e.recovery_available,disk_suitable:disk,cpu_suitable:cpu}
+}
+/// The installer must display these human-readable blockers BEFORE the
+/// user grants permission to modify a selected physical drive.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum InstallBlocker{Cpu,Disk,Signature,Recovery,Approval}
+pub fn installation_blockers(assessment:InstallAssessment,e:InstallEvidence,
+ into:&mut[InstallBlocker])->Result<usize,Error>{
+ let mut flags=[None;5];let mut n=0usize;
+ for (failed,item) in [
+  (!assessment.cpu_suitable,InstallBlocker::Cpu),
+  (!assessment.disk_suitable,InstallBlocker::Disk),
+  (!e.signed_image,InstallBlocker::Signature),
+  (!e.recovery_available,InstallBlocker::Recovery),
+  (!e.user_confirmed,InstallBlocker::Approval)]{
+  if failed{flags[n]=Some(item);n+=1;}
+ }
+ if into.len()<n{return Err(Error::OutputTooSmall);}
+ for (i,item) in flags[..n].iter().enumerate(){
+  into[i]=item.ok_or(Error::OutputTooSmall)?;
+ }
+ Ok(n)
+}
+#[cfg(test)]
+mod r006_guided_install_tests{
+ use super::*;
+ fn inventory()->Inventory{
+  Inventory{abi:PROFILE_ABI,cpu:Cpu{vendor:*b"GenuineIntel",family:6,model:1,
+    stepping:1,features:CPU_REQUIRED,max_basic:7,max_extended:0x8000_0001},
+   accelerators:[None;MAX_ACCELERATORS],count:0,gpu_count:0,npu_count:0,
+   physical_qpu_available:false,cpu_software_fallback:true}
+ }
+ fn evidence()->InstallEvidence{
+  InstallEvidence{uefi_boot:true,disk_bytes:MIN_INSTALL_BYTES,
+   disk_unmounted:true,selected_target:true,recovery_available:true,
+   signed_image:true,user_confirmed:true,verified_gpu_driver:false}
+ }
+ #[test]fn guided_install_needs_explicit_recovery_disk_and_signature_proofs(){
+  let h=inventory();let e=evidence();
+  assert_eq!(assess_install(&h,e).mode,InstallMode::GuidedDisk);
+  for bad in [InstallEvidence{user_confirmed:false,..e},
+   InstallEvidence{recovery_available:false,..e},
+   InstallEvidence{signed_image:false,..e},
+   InstallEvidence{disk_unmounted:false,..e},
+   InstallEvidence{disk_bytes:1,..e}]{
+   assert_eq!(assess_install(&h,bad).mode,InstallMode::PreviewOnly);
+  }
+ }
+ #[test]fn CPU_unqualified_boot_blocks_install_regardless_of_user_confirm(){
+  let mut h=inventory();h.cpu.features=0;
+  assert_eq!(assess_install(&h,evidence()).mode,InstallMode::Unsupported);
+  assert_eq!(assess_install(&h,evidence()).display,DisplayBackend::Software);
+ }
+ #[test]fn blockers_are_complete_and_never_partially_published(){
+  let h=inventory();let mut e=evidence();
+  e.disk_unmounted=false;e.signed_image=false;e.user_confirmed=false;
+  let assessment=assess_install(&h,e);
+  let mut short=[InstallBlocker::Cpu;1];
+  assert_eq!(installation_blockers(assessment,e,&mut short),Err(Error::OutputTooSmall));
+  assert_eq!(short,[InstallBlocker::Cpu]);
+  let mut enough=[InstallBlocker::Cpu;5];
+  assert_eq!(installation_blockers(assessment,e,&mut enough),Ok(3));
+  assert_eq!(&enough[..3],&[InstallBlocker::Disk,InstallBlocker::Signature,
+    InstallBlocker::Approval]);
+ }
+}
