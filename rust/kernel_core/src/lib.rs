@@ -10,6 +10,8 @@
 
 use core::ptr;
 
+#[cfg(feature="orbit-ui-preview")]
+mod orbit_ui;
 mod syscall;
 mod program;
 mod initramfs;
