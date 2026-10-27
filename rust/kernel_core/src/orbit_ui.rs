@@ -68,6 +68,7 @@ pub fn shell(c:&mut impl Canvas,w:u32,h:u32,workspace:Workspace,p:Colors){
     c.rect(right+15,334,215,81,p.light);
     c.label(right+26,352,b"REVIEW FIRST",p.white);
     c.label(right+26,379,b"POLICY PREVIEW",p.accent);
+    c.rect(right+15,411,215,20,p.bar);
     c.label(right+20,456,b"PRIVATE BY DESIGN",p.white);
     c.label(right+20,488,b"QEMU UI PREVIEW",p.accent);
     // Session ribbon: not a real snapshot/restore or filesystem history.
