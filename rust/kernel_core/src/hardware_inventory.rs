@@ -393,3 +393,131 @@ mod tests{
   assert!(core::str::from_utf8(&out[..n]).unwrap().contains("no driver"));
  }
 }
+
+
+/// Trusted kernel driver registry evidence. Application manifests must never
+/// construct or supply these entries; the supervisor supplies them only after
+/// signed driver identity, device binding and resource isolation checks.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct DriverEvidence {
+ pub bus:u8,pub slot:u8,pub function:u8,pub vendor:u16,pub device:u16,
+ pub authorized:bool,
+}
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum ComputeWork{Graphics,Inference,QuantumSimulation,PhysicalQuantum}
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum ComputeBackend{Cpu,Gpu,Npu,CpuQuantumSimulator,TrustedQpu}
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum ComputeError{InvalidInventory,Unavailable}
+/// Selects a POLICY backend, never binds or executes any GPU, NPU or QPU.
+/// Real physical quantum hardware is unavailable unless separately registered
+/// by an authenticated provider; bus-0 PCI discovery can never assert it.
+pub fn choose_compute_backend(info:&Inventory,work:ComputeWork,
+ trusted_drivers:&[DriverEvidence],authenticated_qpu_provider:bool)
+ ->Result<ComputeBackend,ComputeError>{
+ if info.abi!=PROFILE_ABI||!info.cpu.supported()||
+    info.count as usize>MAX_ACCELERATORS{
+  return Err(ComputeError::InvalidInventory);
+ }
+ let mut gpu=0u8;
+ let mut npu=0u8;
+ let mut gpu_ready=false;
+ let mut npu_ready=false;
+ for (i,entry) in info.accelerators.iter().enumerate(){
+  if i>=info.count as usize {
+   if entry.is_some(){return Err(ComputeError::InvalidInventory);}
+   continue;
+  }
+  let device=entry.ok_or(ComputeError::InvalidInventory)?;
+  if info.accelerators[..i].iter().flatten().any(|a|
+     a.bus==device.bus&&a.slot==device.slot&&a.function==device.function){
+   return Err(ComputeError::InvalidInventory);
+  }
+  let approved=trusted_drivers.iter().any(|driver|
+   driver.authorized&&driver.bus==device.bus&&driver.slot==device.slot&&
+   driver.function==device.function&&driver.vendor==device.header.vendor&&
+   driver.device==device.header.device);
+  match device.kind{
+   Accelerator::Gpu=>{gpu+=1;gpu_ready|=approved;},
+   Accelerator::Npu=>{npu+=1;npu_ready|=approved;},
+  }
+ }
+ if gpu!=info.gpu_count||npu!=info.npu_count||
+    info.count!=gpu+npu{return Err(ComputeError::InvalidInventory);}
+ match work{
+  ComputeWork::Graphics if gpu_ready=>Ok(ComputeBackend::Gpu),
+  ComputeWork::Inference if npu_ready=>Ok(ComputeBackend::Npu),
+  ComputeWork::Inference if gpu_ready=>Ok(ComputeBackend::Gpu),
+  ComputeWork::PhysicalQuantum=>{
+   if info.physical_qpu_available&&authenticated_qpu_provider {
+    Ok(ComputeBackend::TrustedQpu)
+   }else{Err(ComputeError::Unavailable)}
+  },
+  ComputeWork::QuantumSimulation if info.cpu_software_fallback=>
+      Ok(ComputeBackend::CpuQuantumSimulator),
+  ComputeWork::Graphics|ComputeWork::Inference
+   if info.cpu_software_fallback=>Ok(ComputeBackend::Cpu),
+  _=>Err(ComputeError::Unavailable),
+ }
+}
+#[cfg(test)]
+mod compute_backend_tests{
+ use super::*;
+ fn inv()->Inventory{
+  let cpu=Cpu{vendor:*b"GenuineIntel",family:6,model:1,stepping:0,
+   features:CPU_REQUIRED,max_basic:7,max_extended:0x8000_0001};
+  let mut accelerators=[None;MAX_ACCELERATORS];
+  accelerators[0]=Some(Device{bus:0,slot:2,function:0,kind:Accelerator::Gpu,
+   header:PciHeader{vendor:0x1af4,device:0x1050,
+    class:3,subclass:0,prog_if:0,header_type:0}});
+  accelerators[1]=Some(Device{bus:0,slot:3,function:0,kind:Accelerator::Npu,
+   header:PciHeader{vendor:0x8086,device:0x00aa,
+    class:0x12,subclass:0,prog_if:0,header_type:0}});
+  Inventory{abi:PROFILE_ABI,cpu,accelerators,count:2,gpu_count:1,
+   npu_count:1,physical_qpu_available:false,cpu_software_fallback:true}
+ }
+ fn gpu()->DriverEvidence{DriverEvidence{bus:0,slot:2,function:0,
+  vendor:0x1af4,device:0x1050,authorized:true}}
+ fn npu()->DriverEvidence{DriverEvidence{bus:0,slot:3,function:0,
+  vendor:0x8086,device:0x00aa,authorized:true}}
+ #[test]fn unbound_accelerators_never_bypass_cpu_fallback(){
+  let i=inv();
+  assert_eq!(choose_compute_backend(&i,ComputeWork::Graphics,&[],false),
+            Ok(ComputeBackend::Cpu));
+  assert_eq!(choose_compute_backend(&i,ComputeWork::Inference,&[],false),
+            Ok(ComputeBackend::Cpu));
+  assert_eq!(choose_compute_backend(&i,ComputeWork::QuantumSimulation,&[],false),
+            Ok(ComputeBackend::CpuQuantumSimulator));
+  assert_eq!(choose_compute_backend(&i,ComputeWork::PhysicalQuantum,&[],true),
+            Err(ComputeError::Unavailable));
+ }
+ #[test]fn verified_device_identity_selects_gpu_and_npu(){
+  let i=inv();
+  assert_eq!(choose_compute_backend(&i,ComputeWork::Graphics,&[gpu()],false),
+            Ok(ComputeBackend::Gpu));
+  assert_eq!(choose_compute_backend(&i,ComputeWork::Inference,&[gpu()],false),
+            Ok(ComputeBackend::Gpu));
+  assert_eq!(choose_compute_backend(&i,ComputeWork::Inference,&[gpu(),npu()],false),
+            Ok(ComputeBackend::Npu));
+ }
+ #[test]fn spoofed_or_disabled_driver_does_not_enable_hardware(){
+  let i=inv();
+  let mut counterfeit=gpu();counterfeit.device=999;
+  assert_eq!(choose_compute_backend(&i,ComputeWork::Graphics,&[counterfeit],false),
+            Ok(ComputeBackend::Cpu));
+  counterfeit=gpu();counterfeit.authorized=false;
+  assert_eq!(choose_compute_backend(&i,ComputeWork::Graphics,&[counterfeit],false),
+            Ok(ComputeBackend::Cpu));
+ }
+ #[test]fn malformed_inventory_and_missing_fallback_fail_closed(){
+  let mut i=inv();i.gpu_count=2;
+  assert_eq!(choose_compute_backend(&i,ComputeWork::Graphics,&[gpu()],false),
+            Err(ComputeError::InvalidInventory));
+  let mut i=inv();i.accelerators[2]=i.accelerators[0];
+  assert_eq!(choose_compute_backend(&i,ComputeWork::Graphics,&[gpu()],false),
+            Err(ComputeError::InvalidInventory));
+  let mut i=inv();i.cpu_software_fallback=false;
+  assert_eq!(choose_compute_backend(&i,ComputeWork::QuantumSimulation,&[],false),
+            Err(ComputeError::Unavailable));
+ }
+}
