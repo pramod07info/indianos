@@ -277,3 +277,19 @@ mod rotation_tests {
                    Err(GuestPackageError::UntrustedKey));
     }
 }
+
+
+/// Disallow rollback of authenticated trust-store epochs.
+/// Authentication itself must occur in the independent trusted verifier.
+pub fn validate_trust_epoch(current:u64,proposed:u64,authenticated:bool)
+ ->Result<u64,GuestPackageError>{
+ if !authenticated||current==0||proposed==0{return Err(GuestPackageError::Unsigned)}
+ if proposed<=current{return Err(GuestPackageError::Downgrade)}
+ Ok(proposed)
+}
+#[cfg(test)]mod trust_epoch_tests{
+ use super::*;
+ #[test]fn allows_verified_monotonic_update(){assert_eq!(validate_trust_epoch(2,3,true),Ok(3));}
+ #[test]fn denies_unverified_proposals(){assert_eq!(validate_trust_epoch(2,4,false),Err(GuestPackageError::Unsigned));assert_eq!(validate_trust_epoch(0,2,true),Err(GuestPackageError::Unsigned));}
+ #[test]fn rejects_rollback_and_epoch_reuse(){assert_eq!(validate_trust_epoch(5,5,true),Err(GuestPackageError::Downgrade));assert_eq!(validate_trust_epoch(5,4,true),Err(GuestPackageError::Downgrade));}
+}
