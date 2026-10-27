@@ -60,6 +60,28 @@ impl<const P:usize,const E:usize,const W:usize,const K:usize>
   self.session.service_ready(service_id).map_err(Error::Service)?;
   self.desktop=Some(id);self.phase=Phase::DesktopReady;Ok(())
  }
+ /// Restore only the desktop service after a crash, while the original
+ /// authenticated init process is still alive. Does not resurrect PID1,
+ /// bypass image verification, or claim the hardware boot path is wired.
+ /// All prior windows, focus and IPC were revoked by process_exited.
+ pub fn recover_desktop(&mut self,id:Identity,launch:Launch,
+  settings:Settings)->Result<(),Error>{
+  if self.phase!=Phase::Degraded||self.desktop.is_some()||
+     self.init.is_none_or(|init|!self.session.owns(init)||init.pid==id.pid)||
+     self.session.next_service().map_err(Error::Service)?.is_some(){
+   return Err(Error::State);
+  }
+  // Prove that the trusted loader/scheduler identity matches the proposed
+  // image *before* modifying the running desktop session.
+  if id.pid==0||id.generation==0||
+     id.pid!=launch.pid||id.generation!=launch.generation{
+   return Err(Error::State);
+  }
+  self.session.stage(launch,settings).map_err(Error::Session)?;
+  self.desktop=Some(id);
+  self.phase=Phase::DesktopReady;
+  Ok(())
+ }
  pub fn process_exited(&mut self,id:Identity)->Result<(),Error>{
   // PID1 is the lifetime root of the graphical session. Once it dies,
   // all desktop ownership (windows, keyboard focus, IPC and settings)
@@ -131,4 +153,58 @@ impl<const P:usize,const E:usize,const W:usize,const K:usize>
     crate::batch2_launcher::LaunchError::Unverified))));
   assert_eq!(b.phase(),Phase::Cold);
  }
+
+ #[test]fn supervised_desktop_crash_restart_rejects_stale_windows(){
+  use crate::batch2_windows::{Rect,Window};
+  let mut b=Bootstrap::<3,3,3,3>::new();
+  b.configure(10,20).unwrap();
+  b.start_init(id(1),launch(id(1)),settings(),10).unwrap();
+  b.start_desktop(id(2),launch(id(2)),settings(),20).unwrap();
+  b.session.create_window(id(2),Window{pid:2,generation:1,id:40,
+      rect:Rect{x:0,y:0,w:40,h:40}}).unwrap();
+  b.session.focus(id(2),40).unwrap();
+  b.process_exited(id(2)).unwrap();
+  let resumed=Identity{pid:2,generation:2};
+  b.recover_desktop(resumed,launch(resumed),settings()).unwrap();
+  assert_eq!(b.phase(),Phase::DesktopReady);
+  assert_eq!(b.desktop_identity(),Some(resumed));
+  assert!(!b.session.windows.owns(2,1,40));
+  assert_eq!(b.session.receive_key(id(2)),Err(SessionError::Unauthorized));
+  assert!(b.session.owns(id(1)));
+ }
+ #[test]fn desktop_restart_requires_live_init_and_verified_image(){
+  let mut b=Bootstrap::<3,3,3,3>::new();
+  b.configure(10,20).unwrap();
+  b.start_init(id(1),launch(id(1)),settings(),10).unwrap();
+  b.start_desktop(id(2),launch(id(2)),settings(),20).unwrap();
+  b.process_exited(id(2)).unwrap();
+  let newer=Identity{pid:2,generation:3};
+  let mut bad=launch(newer);bad.image.verified=false;
+  assert_eq!(b.recover_desktop(newer,bad,settings()),
+            Err(Error::Session(SessionError::Launch(
+              crate::batch2_launcher::LaunchError::Unverified))));
+  assert_eq!(b.phase(),Phase::Degraded);
+  assert!(!b.session.owns(newer));
+  b.process_exited(id(1)).unwrap();
+  assert_eq!(b.recover_desktop(newer,launch(newer),settings()),
+            Err(Error::State));
+ }
+ #[test]fn desktop_restart_rejects_identity_spoofing_without_staging(){
+  let mut b=Bootstrap::<3,3,3,3>::new();
+  b.configure(10,20).unwrap();
+  b.start_init(id(1),launch(id(1)),settings(),10).unwrap();
+  b.start_desktop(id(2),launch(id(2)),settings(),20).unwrap();
+  b.process_exited(id(2)).unwrap();
+  let newer=Identity{pid:2,generation:2};
+  assert_eq!(b.recover_desktop(newer,launch(id(2)),settings()),
+            Err(Error::State));
+  assert_eq!(b.recover_desktop(id(1),launch(id(1)),settings()),
+            Err(Error::State));
+  assert!(!b.session.owns(newer));
+  assert_eq!(b.phase(),Phase::Degraded);
+  b.recover_desktop(newer,launch(newer),settings()).unwrap();
+  assert_eq!(b.recover_desktop(newer,launch(newer),settings()),
+            Err(Error::State));
+ }
+
 }
