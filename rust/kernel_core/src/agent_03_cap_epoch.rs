@@ -99,3 +99,65 @@ mod attenuation_tests {
         assert_eq!(attenuate_grant(g, r, 1), Err(CapabilityError::Revoked));
     }
 }
+
+
+/// Pure owner-checked revocation: verify exact resource, rights and epoch
+/// before marking a grant as permanently revoked.
+pub fn revoke_owned(grant:Grant,request:Request)->Result<Grant,CapabilityError>{
+    authorize(grant,request)?;
+    Ok(Grant{revoked:true,..grant})
+}
+#[cfg(test)]
+mod revocation_tests{
+    use super::*;
+    fn pair()->(Grant,Request){
+        (Grant{owner:17,resource:31,rights:0b11,epoch:4,
+               generation:7,revoked:false},
+         Request{caller:17,resource:31,required_rights:1,
+                 current_epoch:4,current_generation:7})
+    }
+    #[test]fn revocation_invalidates_existing_grant(){
+        let (g,r)=pair();
+        let gone=revoke_owned(g,r).unwrap();
+        assert!(gone.revoked);
+        assert_eq!(authorize(gone,r),Err(CapabilityError::Revoked));
+        assert_eq!(revoke_owned(gone,r),Err(CapabilityError::Revoked));
+    }
+    #[test]fn stale_generation_and_foreign_owner_cannot_revoke(){
+        let (g,mut r)=pair();
+        r.current_generation=8;
+        assert_eq!(revoke_owned(g,r),Err(CapabilityError::Stale));
+        r.current_generation=7;r.caller=19;
+        assert_eq!(revoke_owned(g,r),Err(CapabilityError::Owner));
+    }
+    #[test]fn rights_escalation_and_resource_spoofing_fail(){
+        let (g,mut r)=pair();
+        r.required_rights=0b100;
+        assert_eq!(revoke_owned(g,r),Err(CapabilityError::Rights));
+        r.required_rights=1;r.resource=8;
+        assert_eq!(revoke_owned(g,r),Err(CapabilityError::Resource));
+    }
+}
+
+
+#[cfg(test)]
+mod agent05_reassignment_tests {
+    use super::*;
+    #[test]
+    fn a_zero_rights_request_never_revokes() {
+        let g=Grant{owner:3,resource:8,rights:7,epoch:5,
+                    generation:19,revoked:false};
+        let r=Request{caller:3,resource:8,required_rights:0,
+                      current_epoch:5,current_generation:19};
+        assert_eq!(revoke_owned(g,r),Err(CapabilityError::Rights));
+        assert_eq!(g.revoked,false);
+    }
+    #[test]
+    fn epoch_replay_cannot_revoke_newer_grant() {
+        let g=Grant{owner:3,resource:8,rights:7,epoch:5,
+                    generation:19,revoked:false};
+        let r=Request{caller:3,resource:8,required_rights:1,
+                      current_epoch:4,current_generation:19};
+        assert_eq!(revoke_owned(g,r),Err(CapabilityError::Stale));
+    }
+}
