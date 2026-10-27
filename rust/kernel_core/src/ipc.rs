@@ -221,6 +221,36 @@ impl<const M:usize,const D:usize> ScopedRouter<M,D>{
   });
   target.count+=1;Ok(())
  }
+ /// Send to a set of distinct authenticated receivers as one
+ /// serialized operation. Any stale recipient or full queue rejects the
+ /// complete fanout without delivering a partial message.
+ pub fn multicast(&mut self,sender:Identity,recipients:&[Identity],
+  payload:&[u8])->Result<(),IpcError>{
+  if sender.pid==0||sender.generation==0||recipients.is_empty(){
+   return Err(IpcError::InvalidPid);
+  }
+  if payload.len()>MAX_PAYLOAD{return Err(IpcError::PayloadTooLarge);}
+  if !self.boxes.iter().flatten().any(|b|b.owner==sender){
+   return Err(IpcError::UnknownSender);
+  }
+  for (index,recipient) in recipients.iter().enumerate(){
+   if recipient.pid==0||recipient.generation==0{
+    return Err(IpcError::InvalidPid);
+   }
+   if recipients[..index].contains(recipient){
+    return Err(IpcError::DuplicateReceiver);
+   }
+   let target=self.boxes.iter().flatten().find(|b|b.owner==*recipient)
+     .ok_or(IpcError::UnknownReceiver)?;
+   if target.count==D{return Err(IpcError::Full);}
+  }
+  // Serialized syscall context: no other mutator may run between preflight
+  // and publication. This is not yet a multicore-safe lockless queue.
+  for &recipient in recipients{
+   self.send(sender,recipient,payload)?;
+  }
+  Ok(())
+ }
  pub fn receive(&mut self,receiver:Identity)->Result<TaggedMessage,IpcError>{
   let b=self.boxes.iter_mut().flatten().find(|b|b.owner==receiver)
     .ok_or(IpcError::UnknownReceiver)?;
@@ -328,6 +358,32 @@ mod tests {
   assert_eq!(router.receive(b).unwrap().payload(),b"two");
   router.reap(b).unwrap();
   assert_eq!(router.receive(b),Err(IpcError::UnknownReceiver));
+ }
+
+
+ #[test]fn atomic_multicast_fanout_delivers_only_if_every_mailbox_has_capacity(){
+  let mut router=ScopedRouter::<3,1>::new().unwrap();
+  let a=Identity{pid:1,generation:1};
+  let b=Identity{pid:2,generation:1};
+  let c=Identity{pid:3,generation:1};
+  for owner in [a,b,c]{router.register(owner).unwrap();}
+  router.send(a,b,b"busy").unwrap();
+  assert_eq!(router.multicast(a,&[b,c],b"news"),Err(IpcError::Full));
+  assert_eq!(router.pending(c),Ok(0));
+  assert_eq!(router.receive(b).unwrap().payload(),b"busy");
+  router.multicast(a,&[b,c],b"news").unwrap();
+  assert_eq!(router.receive(b).unwrap().payload(),b"news");
+  assert_eq!(router.receive(c).unwrap().payload(),b"news");
+ }
+ #[test]fn multicast_rejects_duplicate_or_stale_receiver_before_publication(){
+  let mut router=ScopedRouter::<2,2>::new().unwrap();
+  let a=Identity{pid:1,generation:1};
+  let b=Identity{pid:2,generation:1};
+  router.register(a).unwrap();router.register(b).unwrap();
+  assert_eq!(router.multicast(a,&[b,b],b"x"),Err(IpcError::DuplicateReceiver));
+  assert_eq!(router.multicast(a,&[b,Identity{generation:2,..b}],b"x"),
+      Err(IpcError::UnknownReceiver));
+  assert_eq!(router.pending(b),Ok(0));
  }
 
 }
