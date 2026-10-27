@@ -102,6 +102,60 @@ impl<const N:usize> Catalog<N>{
   self.items=staged.items;
   Ok(())
  }
+ /// Enumerate the entire trusted package catalog without leaking partial
+ /// manifest records into a too-small destination.
+ pub fn inventory(&self,out:&mut[Package])->Result<usize,Error>{
+  let count=self.items.iter().filter(|p|p.is_some()).count();
+  if out.len()<count{return Err(Error::Capacity);}
+  let mut index=0;
+  for p in self.items.iter().flatten(){out[index]=*p;index+=1;}
+  Ok(count)
+ }
+ /// Preview the combined dependency closure of multiple launch requests.
+ /// De-duplicates shared dependencies and refuses partial output.
+ pub fn resolve_group(&self,roots:&[u32],out:&mut[u32])
+  ->Result<usize,Error>{
+  if roots.is_empty()||roots.len()>N{return Err(Error::Invalid);}
+  let mut staged=[0u32;N];let mut count=0;
+  for (index,root) in roots.iter().enumerate(){
+   if roots[..index].contains(root){return Err(Error::Duplicate);}
+   let mut plan=[0u32;N];
+   let size=self.resolve(*root,&mut plan)?;
+   for dep in plan[..size].iter().copied(){
+    if !staged[..count].contains(&dep){
+     if count>=N{return Err(Error::Capacity);}
+     staged[count]=dep;count+=1;
+    }
+   }
+  }
+  if count>out.len(){return Err(Error::Capacity);}
+  out[..count].copy_from_slice(&staged[..count]);Ok(count)
+ }
+ /// Remove several apps together, accepting mutual references among only
+ /// removed packages, but preserving all dependencies of remaining apps.
+ /// This changes trusted catalog memory, not installed on-disk apps.
+ pub fn remove_group(&mut self,ids:&[u32])->Result<usize,Error>{
+  if ids.is_empty()||ids.len()>N{return Err(Error::Invalid);}
+  let mut staged=Self{items:self.items};
+  for (i,&id) in ids.iter().enumerate(){
+   if id==0{return Err(Error::Invalid);}
+   if ids[..i].contains(&id){return Err(Error::Duplicate);}
+   let slot=staged.items.iter_mut().find(|p|p.is_some_and(|p|p.id==id))
+    .ok_or(Error::Missing)?;
+   *slot=None;
+  }
+  let mut plan=[0u32;N];
+  for p in staged.items.iter().flatten(){
+   match staged.resolve(p.id,&mut plan){
+    Err(Error::Missing)=>return Err(Error::InUse),
+    Err(e)=>return Err(e),
+    Ok(_)=>{}
+   }
+  }
+  self.items=staged.items;Ok(ids.len())
+ }
+ /// Present a finite number of package versions for a trusted dashboard.
+ pub fn latest_version(&self,id:u32)->Option<u64>{self.get(id).map(|p|p.version)}
  fn visit(&self,id:u32,state:&mut[u8;N],out:&mut[u32],len:&mut usize)
   ->Result<(),Error>{
   let i=self.items.iter().position(|p|p.is_some_and(|x|x.id==id))
@@ -238,6 +292,33 @@ mod m2_tests{
   next2.deps=[0;4];
   assert_eq!(c.replace_group(&[next1,next1]),Err(Error::Duplicate));
   assert_eq!(c.get(1),Some(pkg(1,[0;4])));
+ }
+
+ #[test]fn orbit_sdk_group_uninstall_keeps_transitive_dependents_safe(){
+  let mut c=Catalog::<5>::new();
+  c.add(pkg(1,[0;4])).unwrap();c.add(pkg(2,[1,0,0,0])).unwrap();
+  c.add(pkg(3,[2,0,0,0])).unwrap();
+  assert_eq!(c.remove_group(&[1,2]),Err(Error::InUse));
+  assert!(c.get(1).is_some()&&c.get(2).is_some());
+  assert_eq!(c.remove_group(&[3,2]),Ok(2));
+  assert!(c.get(3).is_none()&&c.get(2).is_none());
+  assert!(c.get(1).is_some());
+ }
+ #[test]fn orbit_sdk_batch_resolve_and_catalog_inventory_atomic(){
+  let mut c=Catalog::<5>::new();
+  for (id,deps) in [(1,[0;4]),(2,[1,0,0,0]),(3,[1,0,0,0])]{
+   c.add(pkg(id,deps)).unwrap();
+  }
+  let mut out=[77u32;1];
+  assert_eq!(c.resolve_group(&[2,3],&mut out),Err(Error::Capacity));
+  assert_eq!(out,[77]);
+  let mut enough=[0u32;5];
+  assert_eq!(c.resolve_group(&[2,3],&mut enough),Ok(3));
+  assert_eq!(&enough[..3],&[1,2,3]);
+  let mut apps=[pkg(9,[0;4]);2];
+  assert_eq!(c.inventory(&mut apps),Err(Error::Capacity));
+  assert_eq!(apps[0].id,9);
+  assert_eq!(c.latest_version(2),Some(1));
  }
 
 }
