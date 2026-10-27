@@ -92,6 +92,64 @@ impl Desktop{
         }
         Ok(())
     }
+    /// Orbit W1: resize an existing window atomically inside validated
+    /// screen bounds; invalid requests never mutate live geometry.
+    pub fn resize(&mut self,id:u32,width:u32,height:u32)->Result<(),DesktopError>{
+        let original=self.windows().find(|w|w.id==id).copied()
+            .ok_or(DesktopError::NotFound)?;
+        self.set_bounds(id,Rect::new(original.bounds.x,original.bounds.y,width,height))
+    }
+    /// Orbit W2: snap a window into the left/right half of a caller-approved
+    /// work area, excluding the rail and taskbar. No forged caller authority.
+    pub fn snap_half(&mut self,id:u32,area:Rect,right:bool)
+        ->Result<(),DesktopError>{
+        if !self.valid(area)||area.width<MIN_WIDTH*2{return Err(DesktopError::InvalidBounds);}
+        let left=area.width/2;
+        let width=if right{area.width-left}else{left};
+        let x=if right{area.x+left as i32}else{area.x};
+        self.set_bounds(id,Rect::new(x,area.y,width,area.height))
+    }
+    /// Orbit W3: maximize into an authorized work area. The returned prior
+    /// bounds are an explicit restore token; the caller must retain them.
+    pub fn maximize_in(&mut self,id:u32,area:Rect)->Result<Rect,DesktopError>{
+        if !self.valid(area){return Err(DesktopError::InvalidBounds);}
+        let old=self.windows().find(|w|w.id==id).map(|w|w.bounds)
+            .ok_or(DesktopError::NotFound)?;
+        self.set_bounds(id,area)?;
+        Ok(old)
+    }
+    /// Orbit W4: caller-owned restore token is validated against current
+    /// dimensions. Restoring cannot escape the active display boundaries.
+    pub fn restore_bounds(&mut self,id:u32,original:Rect)
+        ->Result<(),DesktopError>{self.set_bounds(id,original)}
+    /// Orbit W5: rotate focus over visible, non-minimized windows. Does not
+    /// revive a closed/minimized app or cross a process ownership boundary.
+    pub fn focus_next_visible(&mut self)->Result<u32,DesktopError>{
+        let active=self.focused;
+        let mut candidates=[None;MAX_WINDOWS];
+        let mut length=0;
+        for w in self.windows(){
+            if w.visible&&!w.minimized{
+                candidates[length]=Some(w.id);length+=1;
+            }
+        }
+        if length==0{return Err(DesktopError::NotFound);}
+        let next=active.and_then(|current|
+            candidates[..length].iter().position(|x|*x==Some(current)))
+            .map_or(0,|index|(index+1)%length);
+        let id=candidates[next].ok_or(DesktopError::NotFound)?;
+        self.focus(id)?;
+        Ok(id)
+    }
+    /// Internal all-or-nothing bounds update reused across resize, snap
+    /// and maximize. It deliberately does not change stacking order.
+    fn set_bounds(&mut self,id:u32,rect:Rect)->Result<(),DesktopError>{
+        if !self.valid(rect){return Err(DesktopError::InvalidBounds);}
+        let window=self.windows[..self.count].iter_mut().find_map(|item|
+            item.as_mut().filter(|w|w.id==id)).ok_or(DesktopError::NotFound)?;
+        window.bounds=rect;
+        Ok(())
+    }
     pub fn focused(&self)->Option<u32>{self.focused}
     pub fn windows(&self)->impl DoubleEndedIterator<Item=&Window> + '_{
         self.windows[..self.count].iter().filter_map(Option::as_ref)
@@ -105,6 +163,51 @@ impl Desktop{
 mod tests{
     use super::*;
     fn bounds()->Rect{Rect::new(10,10,320,240)}
+    #[test]fn orbit_resize_is_atomic_at_display_boundaries(){
+        let mut d=Desktop::new(800,600).unwrap();
+        let id=d.open(App::Files,Rect::new(40,60,300,240)).unwrap();
+        assert_eq!(d.resize(id,400,260),Ok(()));
+        assert_eq!(d.windows().next().unwrap().bounds,Rect::new(40,60,400,260));
+        assert_eq!(d.resize(id,900,260),Err(DesktopError::InvalidBounds));
+        assert_eq!(d.resize(id,20,260),Err(DesktopError::InvalidBounds));
+        assert_eq!(d.windows().next().unwrap().bounds,Rect::new(40,60,400,260));
+    }
+    #[test]fn orbit_snap_halves_never_leave_approved_work_area(){
+        let mut d=Desktop::new(1280,800).unwrap();
+        let id=d.open(App::Files,Rect::new(80,100,420,300)).unwrap();
+        let work=Rect::new(195,62,800,600);
+        d.snap_half(id,work,false).unwrap();
+        assert_eq!(d.windows().next().unwrap().bounds,Rect::new(195,62,400,600));
+        d.snap_half(id,work,true).unwrap();
+        assert_eq!(d.windows().next().unwrap().bounds,Rect::new(595,62,400,600));
+        assert_eq!(d.snap_half(id,Rect::new(1,1,200,600),false),
+                   Err(DesktopError::InvalidBounds));
+    }
+    #[test]fn orbit_maximize_returns_token_and_restore_rejects_bad_geometry(){
+        let mut d=Desktop::new(1280,800).unwrap();
+        let old=Rect::new(36,88,500,400);
+        let id=d.open(App::Terminal,old).unwrap();
+        let work=Rect::new(15,62,1220,655);
+        let previous=d.maximize_in(id,work).unwrap();
+        assert_eq!(previous,old);
+        assert_eq!(d.restore_bounds(id,Rect::new(-1,0,500,400)),
+                   Err(DesktopError::InvalidBounds));
+        assert_eq!(d.windows().next().unwrap().bounds,work);
+        d.restore_bounds(id,previous).unwrap();
+        assert_eq!(d.windows().next().unwrap().bounds,old);
+    }
+    #[test]fn orbit_focus_cycle_skips_minimized_windows(){
+        let mut d=Desktop::new(800,600).unwrap();
+        let a=d.open(App::Files,bounds()).unwrap();
+        let b=d.open(App::Terminal,bounds()).unwrap();
+        let c=d.open(App::Settings,bounds()).unwrap();
+        d.minimize(b).unwrap();
+        assert_eq!(d.focus_next_visible(),Ok(a));
+        assert_eq!(d.focus_next_visible(),Ok(c));
+        d.minimize(a).unwrap();d.minimize(c).unwrap();
+        assert_eq!(d.focus_next_visible(),Err(DesktopError::NotFound));
+        assert_eq!(d.focused(),None);
+    }
     #[test]fn open_focus_minimize_close(){
         let mut d=Desktop::new(1024,768).unwrap();
         let a=d.open(App::Files,bounds()).unwrap();
