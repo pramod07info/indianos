@@ -61,11 +61,11 @@ impl Layout{
             ));
         }
         let fw=((w-110)*56/100).max(300).min(w-95);
-        let tw=((w-125)*48/100).max(270).min(w-75);
+        let tw=((w-125)*48/100).max(318).min(w-75);
         let fh=(h-183).min(490);
-        let th=(h-224).min(455);
+        let th=(h-214).min(455);
         Some((Rect::new(82,82,fw,fh),
-              Rect::new((w-tw-15) as i32,138,tw,th)))
+              Rect::new((w-tw-15) as i32,128,tw,th)))
     }
 }
 /// Actual framebuffer rendering at small x86 QEMU resolutions.
@@ -247,6 +247,12 @@ mod tests{
                 assert!(r.width>=160&&r.height>=100);
                 assert!((r.x as u32)+r.width<=w);
                 assert!((r.y as u32)+r.height<=h-80);
+                // The existing x86 ring-3 R029 client still uses fixed
+                // pixel command bounds; smaller windows must not reject
+                // valid 270px-wide Terminal and 207px-high commands.
+                if r==terminal{
+                    assert!(r.width>=308&&r.height>=261);
+                }
             }
         }
         assert!(Layout::new(3840,2160).windows().is_none());
