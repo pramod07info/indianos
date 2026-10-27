@@ -63,9 +63,24 @@ impl<D:BlockDevice,const P:usize,const E:usize,const W:usize,
  pub fn start(&mut self,init:Identity,init_image:Launch,
   user:Identity,user_image:Launch,settings:Settings,
   window:u32,expires:u64)->Result<(),Error>{
-  if self.owner.is_some()||init==user||window==0||expires==0{
+  if self.owner.is_some()||init==user||window==0||expires==0||
+     init.pid==0||user.pid==0||init.pid==user.pid||
+     init.generation==0||user.generation==0||
+     init_image.pid!=init.pid||init_image.generation!=init.generation||
+     user_image.pid!=user.pid||user_image.generation!=user.generation||
+     P<2||W==0||K==0||G==0||Q==0{
    return Err(Error::State);
   }
+  // Validate BOTH signed launch descriptors before mutating the init
+  // service graph. An invalid Desktop ELF must not strand PID1 in
+  // InitReady or prevent a subsequent clean startup attempt.
+  let mut preflight=crate::batch2_launcher::LaunchQueue::<2>::new();
+  preflight.stage(init_image)
+    .map_err(|e|Error::Boot(BootError::Session(
+      crate::batch5_session::SessionError::Launch(e))))?;
+  preflight.stage(user_image)
+    .map_err(|e|Error::Boot(BootError::Session(
+      crate::batch5_session::SessionError::Launch(e))))?;
   self.boot.configure(11,22).map_err(Error::Boot)?;
   self.boot.start_init(init,init_image,settings,11).map_err(Error::Boot)?;
   self.boot.start_desktop(user,user_image,settings,22).map_err(Error::Boot)?;
@@ -304,6 +319,24 @@ mod tests{
   assert_eq!(disk.data[0][510..512],[0x55,0xaa]);
   assert_eq!(disk.data[15],[0;SECTOR_BYTES]);
   assert_eq!(disk.data[116],[0;SECTOR_BYTES]);
+ }
+ #[test]fn m1_invalid_desktop_elf_cannot_partially_start_pid1(){
+  let disk=Disk{data:[[0u8;SECTOR_BYTES];SECTORS]};
+  let mut gui=TestDesk::from_mounted(HierVfs::format_blank(disk).unwrap());
+  let mut invalid=load(2);invalid.image.verified=false;
+  assert_eq!(gui.start(user(1),load(1),user(2),invalid,
+    settings(),8,99),
+    Err(Error::Boot(BootError::Session(
+      crate::batch5_session::SessionError::Launch(
+        crate::batch2_launcher::LaunchError::Unverified)))));
+  assert_eq!(gui.boot.phase(),crate::batch6_boot::Phase::Cold);
+  assert_eq!(gui.boot.desktop_identity(),None);
+  let mut mismatched=load(2);mismatched.generation=3;
+  assert_eq!(gui.start(user(1),load(1),user(2),mismatched,
+    settings(),8,99),Err(Error::State));
+  assert_eq!(gui.boot.phase(),crate::batch6_boot::Phase::Cold);
+  gui.start(user(1),load(1),user(2),load(2),settings(),8,99).unwrap();
+  assert_eq!(gui.boot.desktop_identity(),Some(user(2)));
  }
  #[test]fn m1_physical_scancode_routes_only_to_focused_authenticated_terminal(){
   let disk=Disk{data:[[0;SECTOR_BYTES];SECTORS]};
