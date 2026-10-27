@@ -42,6 +42,20 @@ impl Policy{
    _=>None
   }
  }
+ /// Check the installed-app grant on EVERY syscall, not merely when
+ /// the application was first launched. A caller cannot retain rights
+ /// after capability attenuation, revocation or time-based expiry.
+ pub fn allow_live<const N:usize>(&self,
+  grants:&crate::batch6_security::Access<N>,caller:Identity,
+  now:u64,syscall:u64,operation:u64)->bool{
+  if caller!=self.identity{return false;}
+  let Some(required)=Self::required(syscall,operation)else{return false;};
+  let needed=if required==0{
+   crate::batch6_security::VIEW
+  }else{required};
+  self.rights&needed==needed&&
+   grants.require(caller,needed,now).is_ok()
+ }
  pub fn allow(&self,caller:Identity,syscall:u64,operation:u64)->bool{
   if caller!=self.identity{return false;}
   match Self::required(syscall,operation){
@@ -133,4 +147,30 @@ mod m2_tests{
   assert!(Policy::new(Identity{pid:0,..who()},0).is_none());
   assert!(Policy::new(who(),ALL|64).is_none());
  }
+
+ #[test]fn live_installed_app_syscalls_obey_revoke_and_expiry(){
+  use crate::batch6_security::{Access,VIEW,FILE_READ};
+  let who=who();
+  let policy=Policy::new(who,VIEW|FILE_READ).unwrap();
+  let mut grants=Access::<1>::new();
+  grants.grant(who,VIEW|FILE_READ,20).unwrap();
+  assert!(policy.allow_live(&grants,who,1,12,0));
+  assert!(!policy.allow_live(&grants,who,1,11,0));
+  assert!(!policy.allow_live(&grants,who,20,12,0));
+  assert!(!policy.allow_live(&grants,Identity{generation:2,..who},1,12,0));
+  grants.revoke(who).unwrap();
+  assert!(!policy.allow_live(&grants,who,1,12,0));
+ }
+ #[test]fn attenuation_and_privileged_syscalls_fail_closed(){
+  use crate::batch6_security::{Access,VIEW,FILE_READ};
+  let who=who();let policy=Policy::new(who,VIEW|FILE_READ).unwrap();
+  let mut grants=Access::<1>::new();grants.grant(who,VIEW|FILE_READ,100).unwrap();
+  grants.attenuate(who,1,VIEW,50).unwrap();
+  assert!(!policy.allow_live(&grants,who,2,12,0));
+  assert!(policy.allow_live(&grants,who,2,0,0));
+  assert!(!policy.allow_live(&grants,who,2,30,0));
+  assert!(!policy.allow_live(&grants,who,2,7,0));
+  assert!(!policy.allow_live(&grants,who,2,32,200));
+ }
+
 }
