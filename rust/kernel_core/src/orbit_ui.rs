@@ -25,7 +25,100 @@ pub trait Canvas{
     fn rect(&mut self,x:i32,y:i32,w:u32,h:u32,color:u32);
     fn label(&mut self,x:i32,y:i32,text:&[u8],color:u32);
 }
+/// Pure, no-heap classification shared by desktop GUI and future mobile ports.
+/// Phone geometry is an offline layout contract only: IndianOS does NOT boot
+/// on ARM64/phones and the present x86 VGA backend requires >=640x480.
+#[derive(Clone,Copy,Debug,Eq,PartialEq)]
+pub enum DisplayClass{PhonePortrait,Compact,Desktop}
+#[derive(Clone,Copy,Debug,Eq,PartialEq)]
+pub struct Layout{pub class:DisplayClass,pub width:u32,pub height:u32}
+impl Layout{
+    pub const fn new(width:u32,height:u32)->Self{
+        let class=if width<640 {DisplayClass::PhonePortrait}
+        else if width<1120||height<720{DisplayClass::Compact}
+        else{DisplayClass::Desktop};
+        Self{class,width,height}
+    }
+    pub const fn usable_desktop(&self)->bool{
+        self.width>=640&&self.height>=480&&
+        self.width<=1600&&self.height<=1600
+    }
+    /// Two actual independent GUI windows on supported VGA configurations.
+    /// Choose sizes from usable area and keep them outside the top/ribbon.
+    /// Does not claim native multiple monitors, runtime resize or touch input.
+    pub fn windows(self)->Option<(crate::desktop::Rect,crate::desktop::Rect)>{
+        use crate::desktop::Rect;
+        if !self.usable_desktop(){return None;}
+        let (w,h)=(self.width,self.height);
+        if self.class==DisplayClass::Desktop{
+            let area=w-202-264-32;
+            let files_w=area*56/100;
+            let terminal_w=area-files_w-14;
+            let height=(h-246).min(482);
+            return Some((
+                Rect::new(204,143,files_w,height),
+                Rect::new((204+files_w+14) as i32,143,terminal_w,height)
+            ));
+        }
+        let fw=((w-110)*56/100).max(300).min(w-95);
+        let tw=((w-125)*48/100).max(318).min(w-75);
+        let fh=(h-183).min(490);
+        let th=(h-214).min(455);
+        Some((Rect::new(82,82,fw,fh),
+              Rect::new((w-tw-15) as i32,128,tw,th)))
+    }
+}
+/// Actual framebuffer rendering at small x86 QEMU resolutions.
+/// Larger screens retain the existing Orbit R001 rail/assistant/ribbon.
+fn compact_shell(c:&mut impl Canvas,w:u32,h:u32,workspace:Workspace,p:Colors){
+    let end=h as i32;
+    c.rect(0,0,w,h,p.bg);
+    c.rect(0,0,w,62,p.top);
+    c.rect(13,14,30,30,p.accent);c.rect(19,20,18,18,p.top);
+    c.label(52,23,b"INDIANOS ORBIT",p.white);
+    c.label(w as i32-148,23,b"LOCAL UI",p.accent);
+    c.rect(0,62,72,h.saturating_sub(144),p.top);
+    c.rect(70,62,2,h.saturating_sub(144),p.panel);
+    let entries=[Workspace::Build,Workspace::Create,
+                 Workspace::Learn,Workspace::Personal];
+    for (i,item) in entries.iter().enumerate(){
+        let y=110+i as i32*75;
+        c.rect(12,y-7,49,55,if *item==workspace{p.title}else{p.bar});
+        c.rect(12,y-7,4,55,if *item==workspace{p.accent}else{p.panel});
+        c.label(24,y+8,&item.label()[..1],p.white);
+    }
+    c.rect(0,end-82,w,82,p.top);
+    c.rect(0,end-83,w,1,p.accent);
+    c.label(20,end-57,b"SESSION / PREVIEW",p.accent);
+    c.label(20,end-28,b"FILES  TERMINAL  |  RESTORE PLANNED",p.white);
+}
+/// Phone layout *preview only*: not called by the current VGA backend.
+/// Kept behind tested geometry so a future ARM64 renderer can reuse it.
+fn phone_shell(c:&mut impl Canvas,w:u32,h:u32,workspace:Workspace,p:Colors){
+    let end=h as i32;
+    c.rect(0,0,w,h,p.bg);
+    c.rect(0,0,w,70,p.top);
+    c.label(16,24,b"INDIANOS MOBILE",p.white);
+    c.label(16,49,b"ORBIT PREVIEW",p.accent);
+    c.label(18,92,b"WORKSPACE",p.accent);
+    c.rect(12,117,w.saturating_sub(24),75,p.title);
+    c.label(26,146,workspace.label(),p.white);
+    c.rect(12,216,w.saturating_sub(24),112,p.light);
+    c.label(27,236,b"FILES",p.white);
+    c.label(27,272,b"WINDOWS / PLANNED",p.accent);
+    c.rect(12,341,w.saturating_sub(24),112,p.light);
+    c.label(27,360,b"ORBIT ASSISTANT",p.white);
+    c.label(27,394,b"NOT CONNECTED",p.accent);
+    c.rect(0,end-78,w,78,p.top);
+    c.label(15,end-48,b"HOME",p.white);
+    c.label(w as i32-155,end-48,b"WORKSPACES",p.white);
+}
 pub fn shell(c:&mut impl Canvas,w:u32,h:u32,workspace:Workspace,p:Colors){
+    match Layout::new(w,h).class{
+        DisplayClass::PhonePortrait=>{phone_shell(c,w,h,workspace,p);return;},
+        DisplayClass::Compact=>{compact_shell(c,w,h,workspace,p);return;},
+        DisplayClass::Desktop=>{}
+    }
     let x=w as i32;let y=h as i32;
     c.rect(0,0,w,h,p.bg);
     // A deliberate flat-color fallback: no PNG loader, GPU or fake blur.
@@ -134,6 +227,58 @@ pub fn window(c:&mut impl Canvas,w:Window,focused:bool,p:Colors){
 #[cfg(test)]
 mod tests{
     use super::*;
+    #[test]fn layouts_cover_phone_tablet_laptop_and_desktop_without_claiming_hardware(){
+        let phone=Layout::new(390,844);
+        assert_eq!(phone.class,DisplayClass::PhonePortrait);
+        assert!(!phone.usable_desktop());
+        assert!(phone.windows().is_none());
+        for (w,h,expected) in [
+            (640,480,DisplayClass::Compact),
+            (800,600,DisplayClass::Compact),
+            (1024,768,DisplayClass::Compact),
+            (1280,800,DisplayClass::Desktop),
+            (1600,900,DisplayClass::Desktop)
+        ]{
+            let layout=Layout::new(w,h);
+            assert_eq!(layout.class,expected);
+            let (files,terminal)=layout.windows().unwrap();
+            for r in [files,terminal]{
+                assert!(r.x>=0&&r.y>=62);
+                assert!(r.width>=160&&r.height>=100);
+                assert!((r.x as u32)+r.width<=w);
+                assert!((r.y as u32)+r.height<=h-80);
+                // The existing x86 ring-3 R029 client still uses fixed
+                // pixel command bounds; smaller windows must not reject
+                // valid 270px-wide Terminal and 207px-high commands.
+                if r==terminal{
+                    assert!(r.width>=308&&r.height>=261);
+                }
+            }
+        }
+        assert!(Layout::new(3840,2160).windows().is_none());
+    }
+    struct Recorded{total:u32}
+    impl Canvas for Recorded{
+        fn rect(&mut self,x:i32,y:i32,w:u32,h:u32,_color:u32){
+            assert!(w<=4096&&h<=4096);
+            assert!(x>=0&&y>=0);
+            self.total+=1;
+        }
+        fn label(&mut self,x:i32,y:i32,text:&[u8],_color:u32){
+            assert!(x>=0&&y>=0&&text.len()<=36);
+            self.total+=1;
+        }
+    }
+    #[test]fn all_three_form_factors_have_bounded_nonempty_shell_commands(){
+        let color=Colors{bg:1,top:2,bar:3,title:4,unfocused:5,
+                         light:6,dark:7,panel:8,white:9,accent:10};
+        for (w,h) in [(390,844),(640,480),(800,600),(1024,768),
+                       (1280,800),(1600,900)]{
+            let mut canvas=Recorded{total:0};
+            shell(&mut canvas,w,h,Workspace::Build,color);
+            assert!(canvas.total>=15);
+        }
+    }
     #[test]fn workspace_hotkeys_are_deterministic_and_no_accidental_switch(){
         for (key,w) in [(b'b',Workspace::Build),(b'c',Workspace::Create),
                         (b'l',Workspace::Learn),(b'p',Workspace::Personal)]{
