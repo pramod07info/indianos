@@ -82,6 +82,55 @@ impl<const N:usize> Ledger<N>{
         }
         count
     }
+    /// Change the selected goal workspace for the same process incarnation.
+    pub fn select_workspace(&mut self,owner:Owner,slot:u32,workspace:u8)
+        ->Result<(),Error>{
+        if workspace>3{return Err(Error::Invalid);}
+        self.mine_mut(owner,slot)?.workspace=workspace;Ok(())
+    }
+    /// Drop a previously approved symbolic app from a session; scrub
+    /// vacated storage to prevent stale metadata resurfacing.
+    pub fn remove_app(&mut self,owner:Owner,slot:u32,app:u8)
+        ->Result<(),Error>{
+        let entry=self.mine_mut(owner,slot)?;
+        let index=entry.apps[..entry.count as usize].iter().position(|v|*v==app)
+            .ok_or(Error::Missing)?;
+        let last=entry.count as usize-1;
+        for i in index..last{entry.apps[i]=entry.apps[i+1];}
+        entry.apps[last]=0;entry.count-=1;
+        Ok(())
+    }
+    /// A session can reduce its deadline, never silently extend a grant.
+    pub fn shorten_deadline(&mut self,owner:Owner,slot:u32,
+                            now:u64,deadline:u64)->Result<(),Error>{
+        let entry=self.mine_mut(owner,slot)?;
+        if now>=entry.expires{return Err(Error::Expired);}
+        if deadline<=now||deadline>entry.expires{return Err(Error::Invalid);}
+        entry.expires=deadline;Ok(())
+    }
+    /// Complete owner-specific preview listing, with no partial output.
+    pub fn inventory(&self,owner:Owner,out:&mut[Entry])
+        ->Result<usize,Error>{
+        if !owner.valid(){return Err(Error::Denied);}
+        let total=self.entries.iter().flatten().filter(|x|x.owner==owner).count();
+        if out.len()<total{return Err(Error::TooSmall);}
+        let mut index=0;
+        for item in self.entries.iter().flatten(){
+            if item.owner==owner{out[index]=*item;index+=1;}
+        }
+        Ok(total)
+    }
+    /// Expire saved metadata, but do not run any application or read
+    /// untrusted on-disk bytes as authenticated session state.
+    pub fn expire(&mut self,now:u64)->usize{
+        let mut removed=0;
+        for item in &mut self.entries{
+            if item.is_some_and(|x|now>=x.expires){
+                *item=None;removed+=1;
+            }
+        }
+        removed
+    }
     pub fn view(&self,owner:Owner,slot:u32)->Result<Entry,Error>{
         let e=self.entries.iter().flatten().find(|e|e.slot==slot)
             .ok_or(Error::Missing)?;
@@ -195,4 +244,30 @@ pub fn decode(raw:&[u8])->Result<Entry,Error>{
         bytes[21]^=0x80;bytes[0]=0;
         assert_eq!(decode(&bytes),Err(Error::Corrupt));
     }
+    #[test]fn orbit_session_goal_switch_and_app_removal_are_owner_bound(){
+        let mut l=Ledger::<2>::new();l.open(owner(),1,0,100).unwrap();
+        l.include_app(owner(),1,1).unwrap();l.include_app(owner(),1,2).unwrap();
+        l.select_workspace(owner(),1,3).unwrap();
+        assert_eq!(l.view(owner(),1).unwrap().workspace,3);
+        assert_eq!(l.select_workspace(owner(),1,4),Err(Error::Invalid));
+        let stale=Owner{generation:9,..owner()};
+        assert_eq!(l.remove_app(stale,1,1),Err(Error::Denied));
+        l.remove_app(owner(),1,1).unwrap();
+        assert_eq!(l.view(owner(),1).unwrap().apps,[2,0,0,0]);
+    }
+    #[test]fn orbit_session_deadline_and_inventory_no_partial_output(){
+        let mut l=Ledger::<3>::new();
+        l.open(owner(),1,0,100).unwrap();l.open(owner(),2,1,110).unwrap();
+        let sentinel=Entry{slot:99,owner:owner(),workspace:3,expires:99,
+            apps:[0;MAX_SESSION_APPS],count:0};
+        let mut short=[sentinel];
+        assert_eq!(l.inventory(owner(),&mut short),Err(Error::TooSmall));
+        assert_eq!(short,[sentinel]);
+        assert_eq!(l.shorten_deadline(owner(),1,1,120),Err(Error::Invalid));
+        l.shorten_deadline(owner(),1,1,60).unwrap();
+        assert_eq!(l.expire(60),1);
+        assert_eq!(l.inventory(owner(),&mut short),Ok(1));
+        assert_eq!(short[0].slot,2);
+    }
+
 }
