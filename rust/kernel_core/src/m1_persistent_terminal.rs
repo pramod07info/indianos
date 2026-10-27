@@ -41,7 +41,7 @@ pub fn command<D:BlockDevice,const N:usize>(
  if input.is_empty()||input.len()>MAX_COMMAND||input.iter().any(|c|
   *c!=b' '&&!c.is_ascii_graphic()){return Err(Error::Invalid);}
  let line=core::str::from_utf8(input).map_err(|_|Error::Invalid)?.trim();
- if line=="help"{return publish(b"pwd ls /dir cat /path write /path text append /path text mkdir /dir mv /old /new cp /src /dst rm /path mkfile /path truncate /path head /path count",out);}
+ if line=="help"{return publish(b"pwd ls /dir cat /path write /path text append /path text mkdir /dir mv /old /new cp /src /dst rm /path mkfile /path truncate /path head /path count rmdir /dir mvdir /old /new",out);}
  if line=="pwd"{return publish(b"/",out);}
  let (verb,raw)=line.split_once(' ').ok_or(Error::Unknown)?;
  let mut name=[0u8;64];
@@ -132,6 +132,29 @@ pub fn command<D:BlockDevice,const N:usize>(
    let mut bytes=[0u8;MAX_TRANSFER];
    let size=fs.read(p,&mut bytes).map_err(Error::Io)?;
    publish(&bytes[..core::cmp::min(count,size)],out)
+  }
+  "rmdir"=>{
+   // Delete empty directories only, using the persistent VFS tree guard.
+   auth.require(caller,FILE_WRITE,now).map_err(|_|Error::Denied)?;
+   if out.len()<7{return Err(Error::OutputTooSmall);}
+   let dir=path(raw,&mut name)?;
+   writable_path(dir)?;
+   fs.rmdir(dir).map_err(Error::Io)?;
+   publish(b"removed",out)
+  }
+  "mvdir"=>{
+   // Move an entire directory subtree transactionally: verify both names
+   // and deny protected namespaces before any COW metadata modification.
+   auth.require(caller,FILE_WRITE,now).map_err(|_|Error::Denied)?;
+   if out.len()<5{return Err(Error::OutputTooSmall);}
+   let (src,dest)=raw.split_once(' ').ok_or(Error::Invalid)?;
+   let src=path(src,&mut name)?;
+   let mut target=[0u8;64];
+   let dest=path(dest,&mut target)?;
+   writable_path(src)?;
+   writable_path(dest)?;
+   fs.rename_dir(src,dest).map_err(Error::Io)?;
+   publish(b"moved",out)
   }
   "cp"=>{
    // A copy reads the source AND mutates the destination. Neither a
@@ -527,6 +550,49 @@ mod tests{
   assert_eq!(out,[0xaa;4]);
   let (n,b)=run(&mut fs,&access,user(),b"cat /note").unwrap();
   assert_eq!(&b[..n],b"original");
+ }
+
+
+ #[test]fn recursive_directory_move_and_empty_remove_survive_remount(){
+  let mut fs=HierVfs::format_blank(blank()).unwrap();let a=grants();
+  run(&mut fs,&a,user(),b"mkdir /old").unwrap();
+  run(&mut fs,&a,user(),b"mkdir /old/sub").unwrap();
+  run(&mut fs,&a,user(),b"write /old/sub/note forever").unwrap();
+  run(&mut fs,&a,user(),b"mvdir /old /new").unwrap();
+  let mut fs=HierVfs::mount(fs.into_device()).unwrap();
+  let (n,data)=run(&mut fs,&a,user(),b"cat /new/sub/note").unwrap();
+  assert_eq!(&data[..n],b"forever");
+  assert_eq!(run(&mut fs,&a,user(),b"rmdir /new"),
+             Err(Error::Io(FsError::Full)));
+  run(&mut fs,&a,user(),b"rm /new/sub/note").unwrap();
+  run(&mut fs,&a,user(),b"rmdir /new/sub").unwrap();
+  run(&mut fs,&a,user(),b"rmdir /new").unwrap();
+  let mut fs=HierVfs::mount(fs.into_device()).unwrap();
+  assert!(matches!(run(&mut fs,&a,user(),b"ls /new"),Err(Error::Io(_))));
+ }
+ #[test]fn directory_cycle_and_protected_destination_never_mutate_disk(){
+  let mut fs=HierVfs::format_blank(blank()).unwrap();let a=grants();
+  run(&mut fs,&a,user(),b"mkdir /safe").unwrap();
+  run(&mut fs,&a,user(),b"mkdir /safe/sub").unwrap();
+  let old=fs.generation();
+  assert_eq!(run(&mut fs,&a,user(),b"mvdir /safe /safe/sub/cycle"),
+             Err(Error::Io(FsError::InvalidName)));
+  assert_eq!(run(&mut fs,&a,user(),b"mvdir /safe /system"),
+             Err(Error::Denied));
+  assert_eq!(fs.generation(),old);
+ }
+ #[test]fn directory_operation_requires_live_grant_and_output_preflight(){
+  let mut fs=HierVfs::format_blank(blank()).unwrap();let a=grants();
+  run(&mut fs,&a,user(),b"mkdir /empty").unwrap();
+  let old=fs.generation();
+  let mut out=[0x5bu8;3];
+  assert_eq!(command(&mut fs,&a,user(),1,b"rmdir /empty",&mut out),
+             Err(Error::OutputTooSmall));
+  assert_eq!(out,[0x5b;3]);
+  assert_eq!(run(&mut fs,&a,Identity{generation:2,..user()},b"rmdir /empty"),
+             Err(Error::Denied));
+  assert_eq!(fs.generation(),old);
+  run(&mut fs,&a,user(),b"rmdir /empty").unwrap();
  }
 
 }
