@@ -200,7 +200,10 @@ pub fn command<D:BlockDevice,const N:usize>(
    writable_path(to)?;
    // Read the entire source before any destination mutation. In particular,
    // a missing/oversized source or a protected destination is fail-closed.
-   let mut bytes=[0u8;MAX_TRANSFER];
+   // Files may be larger than a single terminal transfer. Stage the
+   // complete, checksummed source (up to the current COW volume limit) before
+   // publishing any destination metadata. This avoids partial copies.
+   let mut bytes=[0u8;crate::durablefs::MAX_FILE_BYTES];
    let n=fs.read(from,&mut bytes).map_err(Error::Io)?;
    match fs.overwrite(to,&bytes[..n]){
     Ok(())=>{},
@@ -664,6 +667,42 @@ mod tests{
              Err(Error::OutputTooSmall));
   assert_eq!(out,[0x99;2]);
   assert_eq!(fs.generation(),before);
+ }
+
+
+ #[test]fn copies_multi_transfer_file_and_preserves_bytes_after_reboot(){
+  let mut fs=HierVfs::format_blank(blank()).unwrap();
+  let access=grants();
+  let mut contents=[0u8;600];
+  for (i,c) in contents.iter_mut().enumerate(){*c=b'A'+(i%26) as u8;}
+  fs.create("/source",&contents).unwrap();
+  let (n,b)=run(&mut fs,&access,user(),b"cp /source /copy").unwrap();
+  assert_eq!(&b[..n],b"copied");
+  let mut fs=HierVfs::mount(fs.into_device()).unwrap();
+  let mut out=[0u8;600];
+  assert_eq!(fs.read("/copy",&mut out),Ok(600));
+  assert_eq!(out,contents);
+  // Copy must be a distinct object; source survives destination overwrite.
+  fs.overwrite("/copy",b"independent").unwrap();
+  assert_eq!(fs.read("/source",&mut out),Ok(600));
+  assert_eq!(out,contents);
+ }
+ #[test]fn copy_preflight_and_stale_process_do_not_create_destination(){
+  let mut fs=HierVfs::format_blank(blank()).unwrap();
+  let access=grants();
+  fs.create("/source",b"protected source").unwrap();
+  let before=fs.generation();
+  let mut output=[0x7bu8;4];
+  assert_eq!(command(&mut fs,&access,user(),1,b"cp /source /copy",&mut output),
+             Err(Error::OutputTooSmall));
+  assert_eq!(output,[0x7b;4]);
+  assert_eq!(run(&mut fs,&access,Identity{pid:3,generation:2},
+             b"cp /source /copy"),Err(Error::Denied));
+  assert_eq!(run(&mut fs,&access,user(),b"cp /source /system"),
+             Err(Error::Denied));
+  assert_eq!(fs.generation(),before);
+  let mut out=[0u8;32];
+  assert_eq!(fs.read("/copy",&mut out),Err(FsError::NotFound));
  }
 
 }
