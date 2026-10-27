@@ -61,9 +61,22 @@ impl<const P:usize,const E:usize,const W:usize,const K:usize>
   self.desktop=Some(id);self.phase=Phase::DesktopReady;Ok(())
  }
  pub fn process_exited(&mut self,id:Identity)->Result<(),Error>{
+  // PID1 is the lifetime root of the graphical session. Once it dies,
+  // all desktop ownership (windows, keyboard focus, IPC and settings)
+  // must be invalidated before the caller can recycle a process ID.
   self.session.retire(id).map_err(Error::Session)?;
-  if self.desktop==Some(id){self.desktop=None;self.phase=Phase::Degraded;}
-  if self.init==Some(id){self.init=None;self.phase=Phase::Stopped;}
+  if self.init==Some(id){
+   if let Some(desktop)=self.desktop.take(){
+    if self.session.owns(desktop){
+     self.session.retire(desktop).map_err(Error::Session)?;
+    }
+   }
+   self.init=None;
+   self.phase=Phase::Stopped;
+  }else if self.desktop==Some(id){
+   self.desktop=None;
+   self.phase=Phase::Degraded;
+  }
   Ok(())
  }
  pub fn desktop_identity(&self)->Option<Identity>{
@@ -88,6 +101,27 @@ impl<const P:usize,const E:usize,const W:usize,const K:usize>
   b.process_exited(id(2)).unwrap();
   assert_eq!(b.phase(),Phase::Degraded);
   assert_eq!(b.desktop_identity(),None);
+ }
+ #[test]fn init_exit_revokes_desktop_focus_windows_and_launches(){
+  use crate::batch2_windows::{Window,Rect};
+  use crate::batch5_session::SessionError;
+  let mut b=Bootstrap::<3,3,3,3>::new();
+  b.configure(10,20).unwrap();
+  b.start_init(id(1),launch(id(1)),settings(),10).unwrap();
+  b.start_desktop(id(2),launch(id(2)),settings(),20).unwrap();
+  b.session.create_window(id(2),Window{pid:2,generation:1,id:8,
+    rect:Rect{x:0,y:0,w:100,h:80}}).unwrap();
+  b.session.focus(id(2),8).unwrap();
+  b.session.physical_key(30,true).unwrap();
+  b.process_exited(id(1)).unwrap();
+  assert_eq!(b.phase(),Phase::Stopped);
+  assert_eq!(b.desktop_identity(),None);
+  assert!(!b.session.owns(id(1)));
+  assert!(!b.session.owns(id(2)));
+  assert!(b.session.windows.get(8).is_none());
+  assert_eq!(b.session.receive_key(id(2)),Err(SessionError::Unauthorized));
+  assert!(b.session.physical_key(30,true).is_err());
+  assert!(b.session.consume_launch(id(2)).is_err());
  }
  #[test]fn unsigned_boot_image_cannot_activate_service(){
   let mut b=Bootstrap::<2,2,2,2>::new();b.configure(1,2).unwrap();
