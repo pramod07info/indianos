@@ -69,6 +69,32 @@ pub fn run_authorized<const N:usize>(access:&Access<N>,who:Identity,now:u64,
  access.require(who,VIEW,now).map_err(|_|Error::Denied)?;
  run_dense(model,input,output)
 }
+pub const MAX_BATCH:usize=8;
+/// Execute up to eight dense-model samples with one authenticated grant.
+/// All geometry is prevalidated and output remains unchanged on errors.
+pub fn run_batch_authorized<const N:usize>(
+ access:&Access<N>,who:Identity,now:u64,model:&Dense<'_>,
+ inputs:&[i8],samples:usize,output:&mut[i16],
+)->Result<usize,Error>{
+ access.require(who,VIEW,now).map_err(|_|Error::Denied)?;
+ if samples==0||samples>MAX_BATCH||
+    model.features.checked_mul(samples)!=Some(inputs.len())||
+    model.neurons.checked_mul(samples).is_none_or(|x|output.len()<x){
+  return Err(Error::Shape);
+ }
+ validate(model,model.features,model.neurons)?;
+ let mut staged=[0i16;MAX_BATCH*MAX_NEURONS];
+ for index in 0..samples{
+  let in_start=index*model.features;
+  let out_start=index*model.neurons;
+  run_dense(model,
+    &inputs[in_start..in_start+model.features],
+    &mut staged[out_start..out_start+model.neurons])?;
+ }
+ let total=samples*model.neurons;
+ output[..total].copy_from_slice(&staged[..total]);
+ Ok(total)
+}
 #[cfg(test)]
 mod tests{
  use super::*;
@@ -125,4 +151,29 @@ mod tests{
   assert_eq!(run_authorized(&access,actor,1,&m,&[2,3],&mut out),Ok(2));
   assert_eq!(out,[2,8]);
  }
+
+ #[test]fn batched_inference_executes_distinct_samples_without_aliasing(){
+  let weights=[2,-1,-1,4];let bias=[1,-2];
+  let m=model(&weights,&bias);
+  let who=Identity{pid:30,generation:7};
+  let mut auth=Access::<1>::new();auth.grant(who,VIEW,20).unwrap();
+  let mut out=[0i16;4];
+  assert_eq!(run_batch_authorized(&auth,who,1,&m,&[2,3,1,1],2,&mut out),Ok(4));
+  assert_eq!(out,[2,8,2,1]);
+ }
+ #[test]fn failed_batch_preflight_leaves_output_untouched(){
+  let weights=[2,-1,-1,4];let bias=[1,-2];
+  let m=model(&weights,&bias);
+  let who=Identity{pid:30,generation:7};
+  let mut auth=Access::<1>::new();auth.grant(who,VIEW,20).unwrap();
+  let mut out=[99i16;4];
+  assert_eq!(run_batch_authorized(&auth,who,1,&m,&[1,2],2,&mut out),
+   Err(Error::Shape));
+  assert_eq!(run_batch_authorized(&auth,who,1,&m,&[1,2],0,&mut out),
+   Err(Error::Shape));
+  assert_eq!(run_batch_authorized(&auth,who,20,&m,&[1,2,3,4],2,&mut out),
+   Err(Error::Denied));
+  assert_eq!(out,[99;4]);
+ }
+
 }
