@@ -170,6 +170,13 @@ impl<D:BlockDevice> DurableFs<D>{
         let data=encode(&meta,disk.sector_count());
         disk.write_sector(0,&data)?;
         disk.write_sector(1,&data)?;
+        // Formatting is explicitly opt-in, but it must still fail closed if
+        // the selected device acknowledges a dropped or torn superblock.
+        for lba in 0..2{
+            let mut observed=[0u8;SECTOR_BYTES];
+            disk.read_sector(lba,&mut observed)?;
+            if observed!=data{return Err(FsError::InvalidVolume);}
+        }
         Ok(Self{disk,meta,active:0,previous:Some(meta)})
     }
     pub fn mount(mut disk:D)->Result<Self,FsError>{
@@ -182,6 +189,15 @@ impl<D:BlockDevice> DurableFs<D>{
             disk.read_sector(n as u64,&mut bytes)?;
             if let Some(meta)=decode(&bytes,disk.sector_count()){
                 if verify_metadata(&mut disk,&meta){*slot=Some(meta);}
+            }
+        }
+        // Two independently valid copies with the same generation must
+        // describe exactly the same state. Picking one arbitrarily would
+        // hide a split-brain/corrupted checkpoint and risk silent data loss.
+        if let (Some(a),Some(b))=(candidates[0],candidates[1]){
+            if a.generation==b.generation && encode(&a,disk.sector_count())!=
+                encode(&b,disk.sector_count()){
+                return Err(FsError::InvalidVolume);
             }
         }
         let (active,meta,previous)=match (candidates[0],candidates[1]){
@@ -500,6 +516,31 @@ mod tests{
             let mut remount=DurableFs::mount(disk).unwrap();
             assert_eq!(get(&mut remount,"/data"),b"previous committed");
         }
+    }
+    #[test]
+    fn format_detects_acknowledged_but_missing_superblock(){
+        for dropped in [0usize,1usize]{
+            let mut disk=blank();disk.ignore_at=Some(dropped);
+            assert!(matches!(DurableFs::format_blank(disk),
+                Err(FsError::InvalidVolume)));
+        }
+    }
+    #[test]
+    fn equal_generation_split_brain_is_rejected_without_disk_mutation(){
+        let mut fs=DurableFs::format_blank(blank()).unwrap();
+        fs.create_path("/data",b"committed").unwrap();
+        let mut disk=fs.into_device();
+        // Both copies pass CRC and data verification but disagree on
+        // directory contents at the same generation.
+        let active=1usize;
+        let good=decode(&disk.sectors[active],MIN_SECTORS).unwrap();
+        let mut divergent=good;
+        divergent.entries[0]=Entry::EMPTY;
+        disk.sectors[1-active]=encode(&divergent,MIN_SECTORS);
+        let writes=disk.writes;
+        assert!(matches!(DurableFs::mount(disk.clone()),
+            Err(FsError::InvalidVolume)));
+        assert_eq!(disk.writes,writes);
     }
     #[test]
     fn no_autoformat_corrupt_superblocks_and_safe_names(){
