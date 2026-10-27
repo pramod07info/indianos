@@ -31,6 +31,15 @@ struct Palette{
 impl Palette{
     fn new()->Option<Self>{
         let p=|r,g,b|boot::desktop_rgb(r,g,b);
+        if cfg!(feature="orbit-ui-preview"){
+            return Some(Self{
+                bg:p(8,23,41)?,top:p(8,18,32)?,bar:p(18,40,61)?,
+                title:p(19,86,118)?,unfocused:p(31,50,71)?,
+                light:p(20,35,54)?,dark:p(9,17,30)?,
+                panel:p(41,70,90)?,white:p(235,245,251)?,
+                accent:p(248,185,70)?
+            });
+        }
         Some(Self{
             bg:p(16,28,55)?,top:p(12,20,43)?,
             bar:p(22,41,75)?,title:p(15,110,136)?,
@@ -84,7 +93,32 @@ impl Surface{
             self.glyph(x+(i as i32)*12,y,ch,color);
         }
     }
+    #[cfg(feature="orbit-ui-preview")]
+    fn orbit_palette(&self)->crate::orbit_ui::Colors{
+        let p=self.palette;
+        crate::orbit_ui::Colors{bg:p.bg,top:p.top,bar:p.bar,title:p.title,
+          unfocused:p.unfocused,light:p.light,dark:p.dark,panel:p.panel,
+          white:p.white,accent:p.accent}
+    }
+    #[cfg(feature="orbit-ui-preview")]
+    fn orbit_shell(&mut self,selection:u8){
+        use crate::orbit_ui::{shell,Workspace};
+        let workspace=match selection{
+            1=>Workspace::Create,2=>Workspace::Learn,
+            3=>Workspace::Personal,_=>Workspace::Build
+        };
+        let colors=self.orbit_palette();
+        let width=self.width as u32;let height=self.height as u32;
+        shell(self,width,height,workspace,colors);
+    }
     fn draw_window(&mut self,w:crate::desktop::Window,focused:bool){
+        #[cfg(feature="orbit-ui-preview")]
+        {
+            let colors=self.orbit_palette();
+            crate::orbit_ui::window(self,w,focused,colors);
+            return;
+        }
+
         if !w.visible||w.minimized{return;}
         let b=w.bounds;let x=b.x;let y=b.y;
         let p=self.palette;
@@ -123,14 +157,20 @@ impl Surface{
             _=>{}
         }
     }
-    fn render(&mut self,desktop:&Desktop,mouse_x:i32,mouse_y:i32){
+    fn render(&mut self,desktop:&Desktop,mouse_x:i32,mouse_y:i32,orbit:u8){
         let p=self.palette;
-        self.fill(0,0,self.width as u32,self.height as u32,p.bg);
-        self.fill(0,0,self.width as u32,48,p.top);
-        self.text(20,18,b"INDIANOS DESKTOP",p.white);
-        self.fill(0,(self.height-42) as i32,self.width as u32,42,p.bar);
-        self.fill(20,(self.height-34) as i32,90,25,p.title);
-        self.text(30,(self.height-29) as i32,b"APPS",p.white);
+        #[cfg(feature="orbit-ui-preview")]
+        self.orbit_shell(orbit);
+        #[cfg(not(feature="orbit-ui-preview"))]
+        {
+            let _=orbit;
+            self.fill(0,0,self.width as u32,self.height as u32,p.bg);
+            self.fill(0,0,self.width as u32,48,p.top);
+            self.text(20,18,b"INDIANOS DESKTOP",p.white);
+            self.fill(0,(self.height-42) as i32,self.width as u32,42,p.bar);
+            self.fill(20,(self.height-34) as i32,90,25,p.title);
+            self.text(30,(self.height-29) as i32,b"APPS",p.white);
+        }
         let focused=desktop.focused();
         for w in desktop.windows(){self.draw_window(*w,focused==Some(w.id));}
         // Crosshair mouse cursor. All positions are clipped by fill().
@@ -215,12 +255,17 @@ impl UserSurfaceService{
         let palette=out.palette;
         // Paint desktop chrome, then each window AND its user commands in
         // the same z-order. A rear window can never paint over front chrome.
-        out.fill(0,0,out.width as u32,out.height as u32,palette.bg);
-        out.fill(0,0,out.width as u32,48,palette.top);
-        out.text(20,18,b"INDIANOS DESKTOP",palette.white);
-        out.fill(0,(out.height-42) as i32,out.width as u32,42,palette.bar);
-        out.fill(20,(out.height-34) as i32,90,25,palette.title);
-        out.text(30,(out.height-29) as i32,b"APPS",palette.white);
+        #[cfg(feature="orbit-ui-preview")]
+        out.orbit_shell(self.session.orbit);
+        #[cfg(not(feature="orbit-ui-preview"))]
+        {
+            out.fill(0,0,out.width as u32,out.height as u32,palette.bg);
+            out.fill(0,0,out.width as u32,48,palette.top);
+            out.text(20,18,b"INDIANOS DESKTOP",palette.white);
+            out.fill(0,(out.height-42) as i32,out.width as u32,42,palette.bar);
+            out.fill(20,(out.height-34) as i32,90,25,palette.title);
+            out.text(30,(out.height-29) as i32,b"APPS",palette.white);
+        }
         for window in self.session.desktop.windows(){
             out.draw_window(*window,self.session.desktop.focused()==Some(window.id));
             let Some((origin_x,origin_y,_,_))=self.client_bounds(window.id)
@@ -503,6 +548,7 @@ pub(crate) fn user_surface_verified()->bool{
 }
 pub(crate) struct Session{
     desktop:Desktop,files:u32,terminal:u32,active:u32,
+    orbit:u8,
     mouse_x:i32,mouse_y:i32,was_down:bool,
     dragging:Option<(u32,i32,i32)>,
     focused_mouse:u32,
@@ -512,16 +558,21 @@ pub(crate) struct Session{
 impl Session{
     fn new(w:u32,h:u32)->Option<Self>{
         let mut desktop=Desktop::new(w,h).ok()?;
-        let win_w=(w*49/100).max(320).min(w-80);
-        let win_h=(h*50/100).max(240).min(h-110);
-        let left_x=45;
-        let top_y=75;
-        let right_x=(w-win_w-36) as i32;
-        let right_y=(h-win_h-65) as i32;
-        let files=desktop.open(App::Files,Rect::new(left_x,top_y,win_w,win_h)).ok()?;
-        let terminal=desktop.open(App::Terminal,
-            Rect::new(right_x,right_y,win_w,win_h)).ok()?;
-        Some(Self{desktop,files,terminal,active:terminal,
+        let (fw,fh,tw,th,lx,ty,rx,ry)=
+            if cfg!(feature="orbit-ui-preview") && w>=1120&&h>=720{
+                let area=w-202-264-32;
+                let files_w=area*56/100;
+                let terminal_w=area-files_w-14;
+                (files_w,(h-246).min(482),terminal_w,(h-246).min(482),
+                  204,143,(204+files_w+14) as i32,143)
+            }else{
+                let ww=(w*49/100).max(320).min(w-80);
+                let wh=(h*50/100).max(240).min(h-110);
+                (ww,wh,ww,wh,45,75,(w-ww-36) as i32,(h-wh-65) as i32)
+            };
+        let files=desktop.open(App::Files,Rect::new(lx,ty,fw,fh)).ok()?;
+        let terminal=desktop.open(App::Terminal,Rect::new(rx,ry,tw,th)).ok()?;
+        Some(Self{desktop,files,terminal,active:terminal,orbit:0,
             mouse_x:(w/2) as i32,mouse_y:(h/2) as i32,
             was_down:false,dragging:None,focused_mouse:0,focused_keyboard:0,
             moves:0,minimizations:0,restores:0,closures:0})
@@ -575,6 +626,11 @@ impl Session{
         self.mouse_x!=old_x || self.mouse_y!=old_y || clicked
     }
     fn on_key(&mut self,ch:u8)->bool{
+        #[cfg(feature="orbit-ui-preview")]
+        if let Some(next)=crate::orbit_ui::Workspace::key(ch){
+            self.orbit=next as u8;
+            return false;
+        }
         match ch{
             b'1'=>{if self.focus(self.files){
                 self.focused_keyboard+=1;
@@ -638,14 +694,14 @@ pub(crate) fn run()->bool{
         log(b"IndianOS: FATAL R029 auxiliary PS2 mouse enable failed\n\0");
         return false;
     };
-    surface.render(&session.desktop,session.mouse_x,session.mouse_y);
+    surface.render(&session.desktop,session.mouse_x,session.mouse_y,session.orbit);
     log(b"IndianOS: R029 two graphical framebuffer windows visible\n\0");
     log(b"IndianOS: R029 PS2 mouse and serial keyboard ready\n\0");
     let mut completed=false;
     for _ in 0..GUI_ITERATIONS{
         if let Some(packet)=mouse.poll(){
             if session.on_mouse(packet){
-                surface.render(&session.desktop,session.mouse_x,session.mouse_y);
+                surface.render(&session.desktop,session.mouse_x,session.mouse_y,session.orbit);
             }
         }
         if let Some(ch)=input::poll_byte(){
@@ -653,7 +709,7 @@ pub(crate) fn run()->bool{
                 completed=true;
                 break;
             }
-            surface.render(&session.desktop,session.mouse_x,session.mouse_y);
+            surface.render(&session.desktop,session.mouse_x,session.mouse_y,session.orbit);
         }
         core::hint::spin_loop();
     }
@@ -699,6 +755,19 @@ mod tests{
         surface.fill(i32::MAX,i32::MAX,u32::MAX,u32::MAX,22);
         assert_eq!(&data[80*48*4..],&[0xccu8;32]);
     }
+    #[cfg(feature="orbit-ui-preview")]
+    #[test]fn orbit_workspace_hotkeys_preserve_live_window_ownership(){
+        let mut s=Session::new(1280,800).unwrap();
+        let original=s.desktop.focused();
+        for (hotkey,slot) in [(b'c',1),(b'l',2),(b'p',3),(b'b',0)]{
+            assert!(!s.on_key(hotkey));
+            assert_eq!(s.orbit,slot);
+            assert_eq!(s.desktop.focused(),original);
+        }
+        assert_eq!(s.desktop.windows().count(),2);
+        assert!(s.desktop.windows().all(|w|w.bounds.x>=190
+            &&w.bounds.y>=62));
+    }
     #[test]fn mouse_click_changes_z_order_and_drag_is_bounded(){
         let mut s=Session::new(800,600).unwrap();
         // Initial mouse position is screen center. Move onto the first
@@ -710,5 +779,15 @@ mod tests{
         assert!(s.desktop.windows().find(|w|w.id==s.files)
             .is_some_and(|w|w.bounds.x>=0));
         s.on_mouse(Packet{dx:0,dy:0,left:false});
+    }
+}
+
+#[cfg(feature="orbit-ui-preview")]
+impl crate::orbit_ui::Canvas for Surface{
+    fn rect(&mut self,x:i32,y:i32,w:u32,h:u32,color:u32){
+        Surface::fill(self,x,y,w,h,color);
+    }
+    fn label(&mut self,x:i32,y:i32,text:&[u8],color:u32){
+        Surface::text(self,x,y,text,color);
     }
 }
