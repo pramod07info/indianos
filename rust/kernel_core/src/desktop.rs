@@ -26,6 +26,12 @@ pub struct Window{
 }
 #[derive(Clone,Copy,Debug,Eq,PartialEq)]
 pub enum DesktopError{InvalidDisplay,InvalidBounds,Full,NotFound,IdExhausted}
+/// Reversible window-placement metadata, not a durable session snapshot.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct LayoutSnapshot{
+    slots:[Option<(u32,Rect)>;MAX_WINDOWS],
+    count:usize
+}
 pub struct Desktop{
     pub width:u32,pub height:u32,
     windows:[Option<Window>;MAX_WINDOWS],
@@ -150,6 +156,79 @@ impl Desktop{
         window.bounds=rect;
         Ok(())
     }
+    /// Return a complete, non-mutating list of displayed windows.
+    /// Too-small outputs are rejected before copying any identifier.
+    pub fn visible_ids(&self,out:&mut[u32])->Result<usize,DesktopError>{
+        let count=self.windows().filter(|w|w.visible&&!w.minimized).count();
+        if out.len()<count{return Err(DesktopError::Full);}
+        let mut i=0;
+        for w in self.windows(){
+            if w.visible&&!w.minimized{out[i]=w.id;i+=1;}
+        }
+        Ok(count)
+    }
+    /// Atomic geometry snapshot. IDs are never reused within a Desktop;
+    /// the caller is responsible for authenticating the screen owner.
+    pub fn snapshot(&self)->LayoutSnapshot{
+        let mut slots=[None;MAX_WINDOWS];
+        let mut count=0;
+        for w in self.windows(){
+            slots[count]=Some((w.id,w.bounds));count+=1;
+        }
+        LayoutSnapshot{slots,count}
+    }
+    /// Restore only when the identical set of windows still exists and
+    /// every saved rectangle remains valid on the current display.
+    pub fn apply_snapshot(&mut self,snapshot:LayoutSnapshot)
+        ->Result<(),DesktopError>{
+        if snapshot.count!=self.count{return Err(DesktopError::InvalidBounds);}
+        let mut staged=self.windows;
+        for saved in snapshot.slots[..snapshot.count].iter().copied(){
+            let Some((id,rect))=saved else{return Err(DesktopError::InvalidBounds)};
+            if !self.valid(rect){return Err(DesktopError::InvalidBounds);}
+            let slot=staged[..self.count].iter_mut().find_map(|slot|
+                slot.as_mut().filter(|w|w.id==id))
+                .ok_or(DesktopError::NotFound)?;
+            slot.bounds=rect;
+        }
+        self.windows=staged;Ok(())
+    }
+    /// Tile 1..=MAX_WINDOWS visible windows in a bounded grid in one
+    /// transaction. If any tile is too small nothing is moved.
+    pub fn tile_visible(&mut self,area:Rect,columns:usize)
+        ->Result<usize,DesktopError>{
+        if !self.valid(area)||columns==0||columns>MAX_WINDOWS{
+            return Err(DesktopError::InvalidBounds);
+        }
+        let count=self.windows().filter(|w|w.visible&&!w.minimized).count();
+        if count==0{return Err(DesktopError::NotFound);}
+        let cols=columns.min(count);let rows=(count+cols-1)/cols;
+        if area.width/(cols as u32)<MIN_WIDTH||
+           area.height/(rows as u32)<MIN_HEIGHT{
+            return Err(DesktopError::InvalidBounds);
+        }
+        let mut staged=self.windows;
+        let mut n=0usize;
+        for slot in staged[..self.count].iter_mut(){
+            let Some(w)=slot.as_mut() else{continue};
+            if !w.visible||w.minimized{continue;}
+            let col=n%cols;let row=n/cols;
+            let start_x=area.width as u64*col as u64/cols as u64;
+            let end_x=area.width as u64*(col+1) as u64/cols as u64;
+            let start_y=area.height as u64*row as u64/rows as u64;
+            let end_y=area.height as u64*(row+1) as u64/rows as u64;
+            let rect=Rect::new(area.x+start_x as i32,area.y+start_y as i32,
+                (end_x-start_x) as u32,(end_y-start_y) as u32);
+            if !self.valid(rect){return Err(DesktopError::InvalidBounds);}
+            w.bounds=rect;n+=1;
+        }
+        self.windows=staged;Ok(n)
+    }
+    /// Find an existing live window for an app without opening duplicates.
+    pub fn existing_app(&self,app:App)->Option<u32>{
+        self.windows().rev().find(|w|w.app==app&&w.visible&&!w.minimized)
+            .map(|w|w.id)
+    }
     pub fn focused(&self)->Option<u32>{self.focused}
     pub fn windows(&self)->impl DoubleEndedIterator<Item=&Window> + '_{
         self.windows[..self.count].iter().filter_map(Option::as_ref)
@@ -243,4 +322,36 @@ mod tests{
         assert_eq!(d.open(App::Files,bounds()),Err(DesktopError::Full));
         assert_eq!(d.close(999),Err(DesktopError::NotFound));
     }
+    #[test]fn orbit_grid_tiling_and_atomic_rollback(){
+        let mut d=Desktop::new(1280,800).unwrap();
+        let a=d.open(App::Files,Rect::new(40,70,350,270)).unwrap();
+        let b=d.open(App::Terminal,Rect::new(90,95,350,270)).unwrap();
+        let c=d.open(App::Settings,Rect::new(140,125,350,270)).unwrap();
+        let old=d.snapshot();
+        let area=Rect::new(200,65,960,620);
+        assert_eq!(d.tile_visible(area,2),Ok(3));
+        assert_eq!(d.windows().count(),3);
+        assert_eq!(d.existing_app(App::Terminal),Some(b));
+        let tiled=d.snapshot();
+        assert_eq!(d.tile_visible(Rect::new(0,0,200,200),2),
+                   Err(DesktopError::InvalidBounds));
+        assert_eq!(d.snapshot(),tiled);
+        assert_eq!(d.apply_snapshot(old),Ok(()));
+        assert_eq!(d.snapshot(),old);
+        d.close(c).unwrap();
+        assert_eq!(d.apply_snapshot(old),Err(DesktopError::InvalidBounds));
+        assert_eq!(d.existing_app(App::Files),Some(a));
+    }
+    #[test]fn orbit_visible_inventory_never_partial_writes(){
+        let mut d=Desktop::new(800,600).unwrap();
+        let a=d.open(App::Files,Rect::new(10,10,320,240)).unwrap();
+        let b=d.open(App::Terminal,Rect::new(30,30,320,240)).unwrap();
+        let mut short=[123u32;1];
+        assert_eq!(d.visible_ids(&mut short),Err(DesktopError::Full));
+        assert_eq!(short,[123]);
+        d.minimize(b).unwrap();
+        assert_eq!(d.visible_ids(&mut short),Ok(1));
+        assert_eq!(short,[a]);
+    }
+
 }
