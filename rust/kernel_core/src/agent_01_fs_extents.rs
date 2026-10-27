@@ -512,3 +512,83 @@ mod span_atomicity_boundary_regression_tests {
         assert_eq!(output, [sentinel]);
     }
 }
+
+/* Agent01: admission against a globally consistent owner set. */
+/// Admit a new owner only when the existing owners are mutually disjoint
+/// AND the candidate does not alias any existing owner. The simpler
+/// candidate_disjoint_from_owners helper does not audit existing owners.
+/// This is metadata-only; authenticated ownership and device I/O remain
+/// the responsibility of the caller. Corrupt candidate metadata is rejected
+/// before reporting any existing-owner collision.
+pub fn candidate_disjoint_from_consistent_owners(
+    candidate: &[Extent],
+    owners: &[&[Extent]],
+    device_blocks: u64,
+    max_owners: usize,
+    max_owner_extents: usize,
+    max_existing_blocks: u64,
+    max_candidate_extents: usize,
+    max_candidate_blocks: u64,
+) -> Result<bool, ExtentError> {
+    validate_extent_budget(
+        candidate, device_blocks, max_candidate_extents, max_candidate_blocks,
+    )?;
+    let existing_disjoint = validate_owner_set_disjoint(
+        owners, device_blocks, max_owners, max_owner_extents, max_existing_blocks,
+    )?;
+    let candidate_disjoint = candidate_disjoint_from_owners(
+        candidate, owners, device_blocks, max_owners, max_owner_extents,
+        max_candidate_extents, max_candidate_blocks,
+    )?;
+    Ok(existing_disjoint && candidate_disjoint)
+}
+
+#[cfg(test)]
+mod consistent_admission_tests {
+    use super::*;
+
+    #[test]
+    fn admits_disjoint_candidate_with_adjacent_existing_owners() {
+        let a = [Extent { start: 0, blocks: 2 }];
+        let b = [Extent { start: 2, blocks: 2 }];
+        let c = [Extent { start: 4, blocks: 2 }];
+        assert_eq!(candidate_disjoint_from_consistent_owners(
+            &c, &[&a, &b], 10, 2, 1, 4, 1, 2), Ok(true));
+    }
+
+    #[test]
+    fn rejects_preexisting_alias_even_when_candidate_is_disjoint() {
+        let a = [Extent { start: 0, blocks: 3 }];
+        let b = [Extent { start: 2, blocks: 2 }];
+        let c = [Extent { start: 7, blocks: 1 }];
+        assert_eq!(candidate_disjoint_from_consistent_owners(
+            &c, &[&a, &b], 10, 2, 1, 5, 1, 1), Ok(false));
+    }
+
+    #[test]
+    fn rejects_candidate_alias_and_corrupt_metadata() {
+        let a = [Extent { start: 1, blocks: 3 }];
+        let alias = [Extent { start: 3, blocks: 2 }];
+        let bad = [Extent { start: 9, blocks: 2 }];
+        assert_eq!(candidate_disjoint_from_consistent_owners(
+            &alias, &[&a], 10, 1, 1, 3, 1, 2), Ok(false));
+        assert_eq!(candidate_disjoint_from_consistent_owners(
+            &bad, &[&a], 10, 1, 1, 3, 1, 2),
+            Err(ExtentError::OutsideDevice));
+        assert_eq!(candidate_disjoint_from_consistent_owners(
+            &alias, &[&a, &bad], 10, 2, 1, 5, 1, 2),
+            Err(ExtentError::OutsideDevice));
+    }
+
+    #[test]
+    fn enforces_existing_aggregate_and_candidate_budgets() {
+        let a = [Extent { start: 0, blocks: 3 }];
+        let c = [Extent { start: 6, blocks: 2 }];
+        assert_eq!(candidate_disjoint_from_consistent_owners(
+            &c, &[&a], 10, 1, 1, 2, 1, 2),
+            Err(ExtentError::Capacity));
+        assert_eq!(candidate_disjoint_from_consistent_owners(
+            &c, &[&a], 10, 1, 1, 3, 1, 1),
+            Err(ExtentError::Capacity));
+    }
+}
