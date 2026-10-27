@@ -109,7 +109,18 @@ pub fn verify_guest_manifest<V: GuestSignatureVerifier>(
     }
     if target_arch != host_arch { return Err(GuestPackageError::WrongArchitecture); }
     if version < min_version { return Err(GuestPackageError::Downgrade); }
-    let anchor = anchors.iter().find(|key| key.id != 0 && key.id == key_id)
+    // Never accept ambiguous signer IDs, zero keys or attacker-sized trust
+    // lists: first-match semantics silently change the effective trust root.
+    if anchors.is_empty() || anchors.len()>32 {return Err(GuestPackageError::Malformed);}
+    for (i,key) in anchors.iter().enumerate(){
+        if key.id==0 || key.ed25519_public_key==[0;32]{
+            return Err(GuestPackageError::UntrustedKey);
+        }
+        if anchors[..i].iter().any(|prev| prev.id==key.id){
+            return Err(GuestPackageError::Malformed);
+        }
+    }
+    let anchor = anchors.iter().find(|key| key.id==key_id)
         .ok_or(GuestPackageError::UntrustedKey)?;
     if !verifier.verify(&anchor.ed25519_public_key, manifest, signature) {
         return Err(GuestPackageError::Unsigned);
@@ -292,4 +303,31 @@ pub fn validate_trust_epoch(current:u64,proposed:u64,authenticated:bool)
  #[test]fn allows_verified_monotonic_update(){assert_eq!(validate_trust_epoch(2,3,true),Ok(3));}
  #[test]fn denies_unverified_proposals(){assert_eq!(validate_trust_epoch(2,4,false),Err(GuestPackageError::Unsigned));assert_eq!(validate_trust_epoch(0,2,true),Err(GuestPackageError::Unsigned));}
  #[test]fn rejects_rollback_and_epoch_reuse(){assert_eq!(validate_trust_epoch(5,5,true),Err(GuestPackageError::Downgrade));assert_eq!(validate_trust_epoch(5,4,true),Err(GuestPackageError::Downgrade));}
+}
+
+
+#[cfg(test)]
+mod strict_anchor_tests {
+    use super::*;
+    struct Allow;
+    impl GuestSignatureVerifier for Allow {
+        fn verify(&self,_:&[u8;32],_:&[u8],_:&[u8;64])->bool {true}
+    }
+    fn a(id:u32,byte:u8)->TrustAnchor{
+        TrustAnchor{id,ed25519_public_key:[byte;32]}
+    }
+    fn check(keys:&[TrustAnchor])->Result<(),GuestPackageError>{
+        verify_guest_manifest(&Allow,keys,7,b"manifest",&[9;64],2,62,62,1)
+    }
+    #[test]fn canonical_single_anchor_remains_valid(){
+        assert_eq!(check(&[a(7,42)]),Ok(()));
+    }
+    #[test]fn duplicate_and_oversized_roots_are_rejected(){
+        assert_eq!(check(&[a(7,42),a(7,43)]),Err(GuestPackageError::Malformed));
+        assert_eq!(check(&[a(7,42);33]),Err(GuestPackageError::Malformed));
+    }
+    #[test]fn zero_key_and_foreign_signer_fail_closed(){
+        assert_eq!(check(&[a(7,0)]),Err(GuestPackageError::UntrustedKey));
+        assert_eq!(check(&[a(8,42)]),Err(GuestPackageError::UntrustedKey));
+    }
 }
