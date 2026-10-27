@@ -212,6 +212,7 @@ pub mod quantum_circuit;
 pub mod quantum_protocol;
 pub mod quantum_queue;
 pub mod quantum_service;
+pub mod ai_inference;
 pub mod quantum_abi;
 pub mod quantum_dispatch;
 pub mod desktop;
