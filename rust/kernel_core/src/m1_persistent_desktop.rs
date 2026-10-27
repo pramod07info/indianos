@@ -104,7 +104,11 @@ impl<D:BlockDevice,const P:usize,const E:usize,const W:usize,
   self.boot.session.focus(user,window)
    .map_err(|e|Error::Boot(BootError::Session(e)))?;
   self.owner=Some(user);self.window=window;
-  self.shift_left=false;self.shift_right=false;self.redraw_pending=false;Ok(())
+  self.shift_left=false;self.shift_right=false;self.redraw_pending=false;
+  // A newly started desktop needs its first frame even with no keystrokes.
+  // The compositor consumes this owner-bound damage during normal startup.
+  self.request_redraw(user)?;
+  Ok(())
  }
  /// Coalesce full-window updates until the compositor drains the pending
  /// event. Input remains bounded by InputLine; pending damage is owned by
@@ -224,6 +228,20 @@ impl<D:BlockDevice,const P:usize,const E:usize,const W:usize,
   self.input.reset();self.shift_left=false;self.shift_right=false;
   self.redraw_pending=false;
   self.request_redraw(identity)?;
+  Ok(())
+ }
+ /// Authenticated orderly shutdown: terminate the graphical session,
+ /// revoke all window/file/input grants and retire PID1, leaving the mounted
+ /// durable volume unchanged for a later reboot. Does not power off hardware.
+ pub fn shutdown(&mut self,init:Identity)->Result<(),Error>{
+  if init.pid==0||init.generation==0||self.owner==Some(init)||
+     !self.boot.session.owns(init)||self.boot.phase()==crate::batch6_boot::Phase::Stopped{
+   return Err(Error::State);
+  }
+  if let Some(desktop)=self.owner{
+   self.exit(desktop)?;
+  }
+  self.boot.process_exited(init).map_err(Error::Boot)?;
   Ok(())
  }
  pub fn exit(&mut self,caller:Identity)->Result<(),Error>{
@@ -529,6 +547,33 @@ mod tests{
   assert_eq!(gui.restart_desktop(next,proper,settings(),9,100),Ok(()));
   assert_eq!(gui.restart_desktop(next,proper,settings(),10,100),Err(Error::State));
   assert_eq!(gui.desktop_crashed(user(2)),Err(Error::State));
+ }
+
+
+ #[test]fn graphical_desktop_presents_initial_frame_before_any_input(){
+  let disk=Disk{data:[[0u8;SECTOR_BYTES];SECTORS]};
+  let mut desk=TestDesk::from_mounted(HierVfs::format_blank(disk).unwrap());
+  desk.start(user(1),load(1),user(2),load(2),settings(),8,50).unwrap();
+  let frame=desk.next_draw().unwrap();
+  assert_eq!(frame.owner,user(2));assert_eq!(frame.window,8);
+  assert_eq!(desk.next_draw(),Err(Error::Graphics(SurfaceError::Empty)));
+ }
+ #[test]fn clean_shutdown_revokes_desktop_and_preserves_user_files(){
+  let disk=Disk{data:[[0u8;SECTOR_BYTES];SECTORS]};
+  let mut desk=TestDesk::from_mounted(HierVfs::format_blank(disk).unwrap());
+  desk.start(user(1),load(1),user(2),load(2),settings(),8,100).unwrap();
+  let mut out=[0u8;256];
+  desk.execute(user(2),1,b"write /note survives",&mut out).unwrap();
+  assert_eq!(desk.shutdown(user(2)),Err(Error::State));
+  assert_eq!(desk.shutdown(Identity{pid:1,generation:2}),Err(Error::State));
+  assert_eq!(desk.shutdown(user(1)),Ok(()));
+  assert_eq!(desk.boot.phase(),crate::batch6_boot::Phase::Stopped);
+  assert_eq!(desk.execute(user(2),1,b"cat /note",&mut out),Err(Error::State));
+  let disk=desk.into_device();
+  let mut fs=HierVfs::mount(disk).unwrap();
+  let mut buf=[0u8;32];
+  assert_eq!(fs.read("/note",&mut buf),Ok(8));
+  assert_eq!(&buf[..8],b"survives");
  }
 
 }
