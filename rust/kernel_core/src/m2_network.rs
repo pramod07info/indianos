@@ -175,6 +175,75 @@ impl<const P:usize> Endpoint<P>{
   self.retry_tcp_segment(owner,local_port,now,&mut flight.flight)
  }
 }
+/// Transport-independent TCP client SYN handshake control state.
+/// The network driver must validate IPv4/TCP checksums, source addresses and
+/// peer identity before invoking accept_syn_ack. No packets are sent here.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum TcpState{SynSent,Established,Closing,Closed}
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct TcpHandshake{
+ owner:Identity,local_port:u16,remote:TcpPeer,
+ state:TcpState,local_next:u32,remote_next:u32,
+ retry_at:u64,interval:u64,retries:u8,
+}
+impl TcpHandshake{
+ pub fn state(&self)->TcpState{self.state}
+ pub fn retry_count(&self)->u8{self.retries}
+ pub fn next_local_sequence(&self)->u32{self.local_next}
+ pub fn next_remote_sequence(&self)->u32{self.remote_next}
+}
+impl<const P:usize> Endpoint<P>{
+ pub fn begin_tcp_connect(&self,actor:Identity,port:u16,peer:TcpPeer,
+   now:u64,initial_sequence:u32,timeout:u64)->Result<TcpHandshake,Error>{
+  self.ports.require(actor,port,now).map_err(|_|Error::Denied)?;
+  if !peer.valid()||timeout==0{return Err(Error::Invalid);}
+  let next=initial_sequence.checked_add(1).ok_or(Error::Invalid)?;
+  let retry_at=now.checked_add(timeout).ok_or(Error::Invalid)?;
+  Ok(TcpHandshake{owner:actor,local_port:port,remote:peer,
+    state:TcpState::SynSent,local_next:next,remote_next:0,
+    retry_at,interval:timeout,retries:0})
+ }
+ /// Peer+sequence proof is mandatory even if the claimed ACK looks valid.
+ /// A SYN|ACK TCP frame must have passed checksum and network address checks.
+ pub fn accept_tcp_syn_ack(&self,actor:Identity,port:u16,peer:TcpPeer,
+   now:u64,connection:&mut TcpHandshake,remote_sequence:u32,ack:u32)
+   ->Result<(),Error>{
+  self.ports.require(actor,port,now).map_err(|_|Error::Denied)?;
+  if actor!=connection.owner||port!=connection.local_port||
+     peer!=connection.remote||connection.state!=TcpState::SynSent||
+     ack!=connection.local_next{return Err(Error::Denied);}
+  let next=remote_sequence.checked_add(1).ok_or(Error::Invalid)?;
+  connection.remote_next=next;
+  connection.state=TcpState::Established;
+  Ok(())
+ }
+ /// True means the driver should retransmit the original SYN packet.
+ pub fn retry_tcp_syn(&self,actor:Identity,port:u16,peer:TcpPeer,
+   now:u64,connection:&mut TcpHandshake)->Result<bool,Error>{
+  self.ports.require(actor,port,now).map_err(|_|Error::Denied)?;
+  if actor!=connection.owner||port!=connection.local_port||
+    peer!=connection.remote{return Err(Error::Denied);}
+  if connection.state==TcpState::Established{return Ok(false);}
+  if connection.state!=TcpState::SynSent{return Err(Error::Denied);}
+  if now<connection.retry_at{return Ok(false);}
+  if connection.retries>=MAX_TCP_RETRIES{
+   connection.state=TcpState::Closed;
+   return Err(Error::RetryExhausted);
+  }
+  let next=now.checked_add(connection.interval).ok_or(Error::Invalid)?;
+  connection.retries+=1;connection.retry_at=next;
+  Ok(true)
+ }
+ /// Explicit local closure is owner scoped and invalidates the connection.
+ pub fn close_tcp_connection(&self,actor:Identity,port:u16,
+   connection:&mut TcpHandshake)->Result<(),Error>{
+  if actor!=connection.owner||port!=connection.local_port||
+    connection.state==TcpState::Closed{return Err(Error::Denied);}
+  connection.state=TcpState::Closed;
+  Ok(())
+ }
+}
+
 #[cfg(test)]
 mod m2_tests{
  use super::*;
@@ -300,4 +369,53 @@ mod m2_tests{
    Err(Error::Unverified));
   sock.retire(a);assert_eq!(sock.allow_query(a,6000,2,b"example.com"),Err(Error::Denied));
  }
+
+ #[test]fn tcp_connect_requires_verified_peer_and_exact_ack(){
+  let owner=Identity{pid:11,generation:4};
+  let mut acl=Access::<1>::new();acl.grant(owner,SOCKET,200).unwrap();
+  let mut endpoint=Endpoint::<1>::new();
+  endpoint.acquire(&acl,owner,51000,1,150).unwrap();
+  let peer=TcpPeer{address:[192,0,2,10],port:443};
+  let wrong=TcpPeer{address:[192,0,2,11],port:443};
+  let mut conn=endpoint.begin_tcp_connect(owner,51000,peer,2,400,5).unwrap();
+  assert_eq!(conn.state(),TcpState::SynSent);
+  assert_eq!(endpoint.accept_tcp_syn_ack(owner,51000,wrong,3,&mut conn,900,401),
+    Err(Error::Denied));
+  assert_eq!(endpoint.accept_tcp_syn_ack(owner,51000,peer,3,&mut conn,900,400),
+    Err(Error::Denied));
+  let stale=Identity{generation:5,..owner};
+  assert_eq!(endpoint.accept_tcp_syn_ack(stale,51000,peer,3,&mut conn,900,401),
+    Err(Error::Denied));
+  assert_eq!(conn.state(),TcpState::SynSent);
+  endpoint.accept_tcp_syn_ack(owner,51000,peer,3,&mut conn,900,401).unwrap();
+  assert_eq!(conn.state(),TcpState::Established);
+  assert_eq!(conn.next_remote_sequence(),901);
+  assert_eq!(endpoint.retry_tcp_syn(owner,51000,peer,10,&mut conn),Ok(false));
+  endpoint.close_tcp_connection(owner,51000,&mut conn).unwrap();
+  assert_eq!(conn.state(),TcpState::Closed);
+  assert!(endpoint.accept_tcp_syn_ack(owner,51000,peer,11,&mut conn,901,401).is_err());
+ }
+ #[test]fn tcp_syn_retries_stop_and_socket_expiry_prevents_reuse(){
+  let owner=Identity{pid:11,generation:4};
+  let mut acl=Access::<1>::new();acl.grant(owner,SOCKET,200).unwrap();
+  let mut endpoint=Endpoint::<1>::new();
+  endpoint.acquire(&acl,owner,51000,1,21).unwrap();
+  let peer=TcpPeer{address:[192,0,2,10],port:443};
+  let mut conn=endpoint.begin_tcp_connect(owner,51000,peer,1,10,4).unwrap();
+  assert_eq!(endpoint.retry_tcp_syn(owner,51000,peer,4,&mut conn),Ok(false));
+  for (tick,n) in [(5,1),(9,2),(13,3)]{
+   assert_eq!(endpoint.retry_tcp_syn(owner,51000,peer,tick,&mut conn),Ok(true));
+   assert_eq!(conn.retry_count(),n);
+  }
+  assert_eq!(endpoint.retry_tcp_syn(owner,51000,peer,17,&mut conn),
+    Err(Error::RetryExhausted));
+  assert_eq!(conn.state(),TcpState::Closed);
+  let mut later=endpoint.begin_tcp_connect(owner,51000,peer,18,25,5).unwrap();
+  assert_eq!(endpoint.accept_tcp_syn_ack(owner,51000,peer,21,&mut later,700,26),
+    Err(Error::Denied));
+  endpoint.retire(owner);
+  assert_eq!(endpoint.retry_tcp_syn(owner,51000,peer,20,&mut later),
+    Err(Error::Denied));
+ }
+
 }
