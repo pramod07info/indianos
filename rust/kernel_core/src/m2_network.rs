@@ -137,6 +137,44 @@ impl<const P:usize> Endpoint<P>{
   Ok(true)
  }
 }
+/// Peer-bound in-flight segment tracking for a real transport ingress.
+ /// Caller still MUST validate the received TCP/IPv4 checksum, packet
+ /// source/destination pair and TCP header before forwarding acknowledgments.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct TcpPeer{pub address:[u8;4],pub port:u16}
+impl TcpPeer{
+ fn valid(self)->bool{
+  self.port!=0&&self.address!=[0;4]&&self.address!=[255;4]&&
+  self.address[0]!=0&&self.address[0]<224
+ }
+}
+#[derive(Debug,PartialEq,Eq)]
+pub struct PeerFlight{peer:TcpPeer,flight:TcpFlight}
+impl PeerFlight{
+ pub fn complete(&self)->bool{self.flight.complete()}
+ pub fn retries(&self)->u8{self.flight.retries()}
+}
+impl<const P:usize> Endpoint<P>{
+ pub fn track_peer_segment(&self,owner:Identity,local_port:u16,
+  peer:TcpPeer,now:u64,sequence:u32,bytes:u16,timeout:u64)
+  ->Result<PeerFlight,Error>{
+  if !peer.valid(){return Err(Error::Invalid);}
+  let flight=self.track_tcp_segment(owner,local_port,now,sequence,bytes,timeout)?;
+  Ok(PeerFlight{peer,flight})
+ }
+ /// Only call after the transport authenticated the sender peer and ACK.
+ pub fn accept_peer_ack(&self,owner:Identity,local_port:u16,
+  peer:TcpPeer,now:u64,flight:&mut PeerFlight,ack:u32)
+  ->Result<(),Error>{
+  if flight.peer!=peer{return Err(Error::Denied);}
+  self.accept_tcp_ack(owner,local_port,now,&mut flight.flight,ack)
+ }
+ pub fn retry_peer_segment(&self,owner:Identity,local_port:u16,
+  peer:TcpPeer,now:u64,flight:&mut PeerFlight)->Result<bool,Error>{
+  if flight.peer!=peer{return Err(Error::Denied);}
+  self.retry_tcp_segment(owner,local_port,now,&mut flight.flight)
+ }
+}
 #[cfg(test)]
 mod m2_tests{
  use super::*;
@@ -205,6 +243,49 @@ mod m2_tests{
   let mut flight=sock.track_tcp_segment(owner,6040,2,100,3,3).unwrap();
   assert_eq!(sock.retry_tcp_segment(owner,6040,31,&mut flight),Err(Error::Denied));
   assert_eq!(sock.accept_tcp_ack(owner,6040,31,&mut flight,103),Err(Error::Denied));
+ }
+ #[test]fn m2_peer_flight_requires_exact_remote_address_port_and_owner(){
+  let owner=Identity{pid:7,generation:2};
+  let stale=Identity{generation:3,..owner};
+  let mut auth=Access::<1>::new();auth.grant(owner,SOCKET,100).unwrap();
+  let mut endpoint=Endpoint::<1>::new();
+  endpoint.acquire(&auth,owner,6040,1,50).unwrap();
+  let peer=TcpPeer{address:[203,0,113,10],port:443};
+  let imposter=TcpPeer{address:[203,0,113,11],port:443};
+  let mut flight=endpoint.track_peer_segment(owner,6040,peer,
+    1,500,5,5).unwrap();
+  assert_eq!(endpoint.accept_peer_ack(owner,6040,imposter,2,
+    &mut flight,505),Err(Error::Denied));
+  assert_eq!(endpoint.accept_peer_ack(stale,6040,peer,2,
+    &mut flight,505),Err(Error::Denied));
+  assert_eq!(endpoint.retry_peer_segment(owner,6040,imposter,6,
+    &mut flight),Err(Error::Denied));
+  assert_eq!(endpoint.retry_peer_segment(owner,6040,peer,6,
+    &mut flight),Ok(true));
+  assert_eq!(flight.retries(),1);
+  assert_eq!(endpoint.accept_peer_ack(owner,6040,peer,7,
+    &mut flight,505),Ok(()));
+  assert!(flight.complete());
+  assert_eq!(endpoint.retry_peer_segment(owner,6040,peer,11,
+    &mut flight),Ok(false));
+  endpoint.retire(owner);
+  assert_eq!(endpoint.accept_peer_ack(owner,6040,peer,12,
+    &mut flight,505),Err(Error::Denied));
+ }
+ #[test]fn m2_peer_flight_rejects_nonunicast_destination_and_overflow(){
+  let owner=Identity{pid:7,generation:2};
+  let mut auth=Access::<1>::new();auth.grant(owner,SOCKET,100).unwrap();
+  let mut endpoint=Endpoint::<1>::new();
+  endpoint.acquire(&auth,owner,6040,1,50).unwrap();
+  for addr in [[0;4],[255;4],[224,1,2,3],[0,1,2,3]]{
+   assert_eq!(endpoint.track_peer_segment(owner,6040,TcpPeer{
+      address:addr,port:443},1,5,1,1),Err(Error::Invalid));
+  }
+  let peer=TcpPeer{address:[203,0,113,10],port:443};
+  assert_eq!(endpoint.track_peer_segment(owner,6040,TcpPeer{
+   port:0,..peer},1,5,1,1),Err(Error::Invalid));
+  assert_eq!(endpoint.track_peer_segment(owner,6040,peer,
+   1,u32::MAX,2,1),Err(Error::Invalid));
  }
  #[test]fn m2_socket_lease_stale_owner_and_tls_fail_closed(){
   let a=Identity{pid:7,generation:1};

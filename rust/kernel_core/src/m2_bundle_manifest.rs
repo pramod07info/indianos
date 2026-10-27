@@ -22,7 +22,7 @@ pub struct BundleManifest{
 }
 pub struct SignedBundle{pub manifest:BundleManifest,pub signature:[u8;64]}
 #[derive(Debug,PartialEq,Eq)]
-pub enum Error{Invalid,Unauthorized,Signature(batch4_signature::Error),
+pub enum Error{Invalid,Unauthorized,StaleInstall,Signature(batch4_signature::Error),
  Storage(StorageError)}
 impl BundleManifest{
  pub fn canonical(&self)->[u8;TRANSCRIPT_BYTES]{
@@ -128,6 +128,25 @@ pub fn stage_consented<D:BlockDevice,R:BundleSource,V:Verify,
  // Publisher verification and full blob digest validation remain mandatory
  // after consent preflight and before the new blob becomes active.
  stage_verified(store,package,roots,verifier,source)
+}
+/// Compare-and-stage entry point for a supervisor that serialized access
+/// to a dedicated package partition. The caller must supply the exact
+/// previously verified active version/generation/digest observed before
+/// prompting the user. A stale or replaced base cannot silently install.
+pub fn stage_consented_cas<D:BlockDevice,R:BundleSource,V:Verify,
+ const N:usize,const P:usize>(
+ store:&mut BlobStore<D>,expected:Option<Info>,package:&SignedBundle,
+ auth:&crate::batch6_security::Access<N>,
+ installer:crate::batch5_session::Identity,
+ app_process:crate::batch5_session::Identity,
+ consent:&crate::m2_consent::Ledger<P>,now:u64,
+ roots:&[Root],verifier:&V,source:&mut R
+)->Result<Info,Error>{
+ auth.require(installer,crate::batch6_security::INSTALL,now)
+   .map_err(|_|Error::Unauthorized)?;
+ if store.active()!=expected{return Err(Error::StaleInstall);}
+ stage_consented(store,package,auth,installer,app_process,consent,
+  now,roots,verifier,source)
 }
 #[cfg(test)]
 mod m2_tests{
@@ -305,9 +324,18 @@ mod m2_tests{
     process,&ledger,2,&roots,&verifier,&mut Slice(&bytes)),
     Err(Error::Signature(_))));
   assert_eq!(store.active(),None);
-  let installed=stage_consented(&mut store,&signed,&auth(),admin(),
-    process,&ledger,2,&roots,&verifier,&mut Slice(&bytes)).unwrap();
+  // A stale expected on-disk generation MUST reject before source I/O.
+  let false_base=Some(Info{id:9,version:1,length:bytes.len() as u32,
+    digest:signed.manifest.digest,generation:1,bank:0});
+  assert_eq!(stage_consented_cas(&mut store,false_base,&signed,&auth(),
+    admin(),process,&ledger,2,&roots,&verifier,&mut Slice(&bytes)),
+    Err(Error::StaleInstall));
+  let installed=stage_consented_cas(&mut store,None,&signed,&auth(),
+    admin(),process,&ledger,2,&roots,&verifier,&mut Slice(&bytes)).unwrap();
   assert_eq!(installed.length,bytes.len() as u32);
+  assert_eq!(stage_consented_cas(&mut store,None,&signed,&auth(),
+    admin(),process,&ledger,2,&roots,&verifier,&mut Slice(&bytes)),
+    Err(Error::StaleInstall));
   let disk=store.into_device();assert!(disk.writes>0);
   let remounted=BlobStore::mount(disk).unwrap();
   assert_eq!(remounted.active(),Some(installed));
