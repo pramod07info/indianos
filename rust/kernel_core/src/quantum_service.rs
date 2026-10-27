@@ -3,14 +3,15 @@
 //! Callers must supply an authenticated nonzero process identity from the
 //! kernel process table; never trust an owner ID copied from a user request.
 use crate::quantum_queue::{QuantumQueue,QueueError,JobStatus,RESULT_BYTES,MAX_JOBS};
+use crate::batch5_session::Identity;
 #[derive(Clone,Copy,Debug,Eq,PartialEq)]
 pub enum ServiceError{InvalidOwner,NotOwner,Queue(QueueError)}
 impl From<QueueError> for ServiceError{
     fn from(e:QueueError)->Self{Self::Queue(e)}
 }
 #[derive(Clone,Copy)]
-struct Ownership{job:u64,owner:u32}
-impl Ownership{const fn empty()->Self{Self{job:0,owner:0}}}
+struct Ownership{job:u64,owner:u32,generation:u64}
+impl Ownership{const fn empty()->Self{Self{job:0,owner:0,generation:0}}}
 pub struct QuantumService{
     queue:QuantumQueue,
     owners:[Ownership;MAX_JOBS],
@@ -22,7 +23,7 @@ impl QuantumService{
     }
     fn check_owner(&self,owner:u32,id:u64)->Result<(),ServiceError>{
         if owner==0{return Err(ServiceError::InvalidOwner);}
-        if self.owners.iter().any(|x|x.job==id && id!=0 && x.owner==owner){
+        if self.owners.iter().any(|x|x.job==id && id!=0 && x.owner==owner && x.generation==0){
             Ok(())
         }else{Err(ServiceError::NotOwner)}
     }
@@ -32,7 +33,7 @@ impl QuantumService{
         let id=self.queue.submit(request)?;
         let entry=self.owners.iter_mut().find(|x|x.job==0)
             .expect("ownership slots track queue slots");
-        *entry=Ownership{job:id,owner};
+        *entry=Ownership{job:id,owner,generation:0};
         Ok(id)
     }
     pub fn status(&self,owner:u32,id:u64)->Result<JobStatus,ServiceError>{
@@ -50,6 +51,56 @@ impl QuantumService{
             .expect("owned job must have ownership entry");
         *entry=Ownership::empty();
         Ok(())
+    }
+    /// Scheduler-authenticated generation-scoped job submission. PIDs may
+    /// be recycled; old job handles must never become the next process's.
+    pub fn submit_scoped(&mut self,actor:Identity,request:&[u8])
+        ->Result<u64,ServiceError>{
+        if actor.pid==0||actor.generation==0{return Err(ServiceError::InvalidOwner);}
+        let id=self.queue.submit(request)?;
+        let entry=self.owners.iter_mut().find(|x|x.job==0)
+            .expect("ownership slots track queue slots");
+        *entry=Ownership{job:id,owner:actor.pid,generation:actor.generation};
+        Ok(id)
+    }
+    fn check_scoped(&self,actor:Identity,id:u64)->Result<(),ServiceError>{
+        if actor.pid==0||actor.generation==0{return Err(ServiceError::InvalidOwner);}
+        if self.owners.iter().any(|x|
+            x.job==id&&id!=0&&x.owner==actor.pid&&x.generation==actor.generation){
+            Ok(())
+        }else{Err(ServiceError::NotOwner)}
+    }
+    pub fn status_scoped(&self,actor:Identity,id:u64)
+        ->Result<JobStatus,ServiceError>{
+        self.check_scoped(actor,id)?;
+        self.queue.status(id).map_err(ServiceError::Queue)
+    }
+    pub fn result_scoped(&self,actor:Identity,id:u64,out:&mut[u8;RESULT_BYTES])
+        ->Result<(),ServiceError>{
+        self.check_scoped(actor,id)?;
+        self.queue.result(id,out).map_err(ServiceError::Queue)
+    }
+    pub fn release_scoped(&mut self,actor:Identity,id:u64)
+        ->Result<(),ServiceError>{
+        self.check_scoped(actor,id)?;
+        self.queue.release(id)?;
+        let entry=self.owners.iter_mut().find(|x|x.job==id)
+            .expect("authorized job has slot");
+        *entry=Ownership::empty();
+        Ok(())
+    }
+    /// Trusted reaper cancels ONLY jobs of the old PID generation.
+    pub fn process_terminated_scoped(&mut self,actor:Identity)
+        ->Result<usize,ServiceError>{
+        if actor.pid==0||actor.generation==0{return Err(ServiceError::InvalidOwner);}
+        let mut count=0;
+        for entry in &mut self.owners{
+            if entry.job!=0&&entry.owner==actor.pid&&entry.generation==actor.generation{
+                self.queue.release(entry.job)?;
+                *entry=Ownership::empty();count+=1;
+            }
+        }
+        Ok(count)
     }
     /// Called by a trusted process lifecycle owner on exit or fault.
     /// Jobs belonging to other process identities remain available.
@@ -116,4 +167,38 @@ mod tests{
         assert_eq!(service.status(1,b),Err(ServiceError::NotOwner));
         assert_eq!(service.run_next(),Some(b));
     }
+
+    #[test]fn scoped_jobs_cannot_be_stolen_when_pid_is_reused(){
+        let mut svc=QuantumService::new();
+        let old=Identity{pid:17,generation:8};
+        let next=Identity{pid:17,generation:9};
+        let job=svc.submit_scoped(old,BELL).unwrap();
+        assert_eq!(svc.status_scoped(next,job),Err(ServiceError::NotOwner));
+        assert_eq!(svc.status(17,job),Err(ServiceError::NotOwner));
+        assert_eq!(svc.release_scoped(next,job),Err(ServiceError::NotOwner));
+        assert_eq!(svc.run_next(),Some(job));
+        let mut out=[0x55;RESULT_BYTES];
+        assert_eq!(svc.result_scoped(next,job,&mut out),Err(ServiceError::NotOwner));
+        assert!(out.iter().all(|b|*b==0x55));
+        assert_eq!(svc.result_scoped(old,job,&mut out),Ok(()));
+    }
+    #[test]fn scoped_reaper_leaves_new_pid_generation_jobs_untouched(){
+        let mut svc=QuantumService::new();
+        let old=Identity{pid:17,generation:8};
+        let next=Identity{pid:17,generation:9};
+        let first=svc.submit_scoped(old,BELL).unwrap();
+        let second=svc.submit_scoped(next,BELL).unwrap();
+        assert_eq!(svc.process_terminated_scoped(old),Ok(1));
+        assert_eq!(svc.status_scoped(old,first),Err(ServiceError::NotOwner));
+        assert_eq!(svc.status_scoped(next,second),Ok(JobStatus::Queued));
+        assert_eq!(svc.run_next(),Some(second));
+        assert_eq!(svc.process_terminated_scoped(next),Ok(1));
+    }
+    #[test]fn zero_generation_is_not_an_authenticated_compute_owner(){
+        let mut svc=QuantumService::new();
+        let invalid=Identity{pid:17,generation:0};
+        assert_eq!(svc.submit_scoped(invalid,BELL),Err(ServiceError::InvalidOwner));
+        assert_eq!(svc.process_terminated_scoped(invalid),Err(ServiceError::InvalidOwner));
+    }
+
 }
