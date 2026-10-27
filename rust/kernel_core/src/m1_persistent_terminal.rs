@@ -41,7 +41,7 @@ pub fn command<D:BlockDevice,const N:usize>(
  if input.is_empty()||input.len()>MAX_COMMAND||input.iter().any(|c|
   *c!=b' '&&!c.is_ascii_graphic()){return Err(Error::Invalid);}
  let line=core::str::from_utf8(input).map_err(|_|Error::Invalid)?.trim();
- if line=="help"{return publish(b"pwd ls /dir cat /path write /path text append /path text mkdir /dir mv /old /new cp /src /dst rm /path mkfile /path",out);}
+ if line=="help"{return publish(b"pwd ls /dir cat /path write /path text append /path text mkdir /dir mv /old /new cp /src /dst rm /path mkfile /path truncate /path head /path count",out);}
  if line=="pwd"{return publish(b"/",out);}
  let (verb,raw)=line.split_once(' ').ok_or(Error::Unknown)?;
  let mut name=[0u8;64];
@@ -110,6 +110,28 @@ pub fn command<D:BlockDevice,const N:usize>(
       n>crate::durablefs::MAX_FILE_BYTES){return Err(Error::Io(FsError::TooLarge));}
    fs.write_at(p,len as u64,data.as_bytes()).map_err(Error::Io)?;
    publish(b"appended",out)
+  }
+  "truncate"=>{
+   // Retains the existing file entry, empties only its data, and publishes
+   // through the already mounted COW volume. Never auto-creates a path.
+   auth.require(caller,FILE_WRITE,now).map_err(|_|Error::Denied)?;
+   if out.len()<9{return Err(Error::OutputTooSmall);}
+   let p=path(raw,&mut name)?;
+   writable_path(p)?;
+   fs.overwrite(p,b"").map_err(Error::Io)?;
+   publish(b"truncated",out)
+  }
+  "head"=>{
+   // Read-only, bounded prefix output from a persisted file. A user can
+   // request no more than the VFS transfer limit; malformed counts fail.
+   auth.require(caller,FILE_READ,now).map_err(|_|Error::Denied)?;
+   let (raw_path,raw_count)=raw.split_once(' ').ok_or(Error::Invalid)?;
+   let count=raw_count.parse::<usize>().map_err(|_|Error::Invalid)?;
+   if count==0||count>MAX_TRANSFER{return Err(Error::Invalid);}
+   let p=path(raw_path,&mut name)?;
+   let mut bytes=[0u8;MAX_TRANSFER];
+   let size=fs.read(p,&mut bytes).map_err(Error::Io)?;
+   publish(&bytes[..core::cmp::min(count,size)],out)
   }
   "cp"=>{
    // A copy reads the source AND mutates the destination. Neither a
@@ -452,6 +474,59 @@ mod tests{
   assert_eq!(run(&mut fs,&access,Identity{pid:3,generation:2},
                  b"mkfile /blank"),Err(Error::Denied));
   assert_eq!(fs.generation(),generation);
+ }
+
+
+ #[test]fn truncate_and_head_survive_a_real_block_device_remount(){
+  let mut fs=HierVfs::format_blank(blank()).unwrap();
+  let access=grants();
+  run(&mut fs,&access,user(),b"mkdir /home").unwrap();
+  run(&mut fs,&access,user(),b"write /home/log abcdef").unwrap();
+  let (n,b)=run(&mut fs,&access,user(),b"head /home/log 3").unwrap();
+  assert_eq!(&b[..n],b"abc");
+  let mut fs=HierVfs::mount(fs.into_device()).unwrap();
+  let (n,b)=run(&mut fs,&access,user(),b"head /home/log 99").unwrap();
+  assert_eq!(&b[..n],b"abcdef");
+  assert_eq!(run(&mut fs,&access,user(),b"truncate /home/log").unwrap().0,9);
+  let mut fs=HierVfs::mount(fs.into_device()).unwrap();
+  assert_eq!(run(&mut fs,&access,user(),b"cat /home/log").unwrap().0,0);
+  run(&mut fs,&access,user(),b"append /home/log xyz").unwrap();
+  let (n,b)=run(&mut fs,&access,user(),b"head /home/log 2").unwrap();
+  assert_eq!(&b[..n],b"xy");
+ }
+ #[test]fn truncate_denies_protected_and_missing_paths_without_mutation(){
+  let mut fs=HierVfs::format_blank(blank()).unwrap();
+  let access=grants();
+  let generation=fs.generation();
+  assert_eq!(run(&mut fs,&access,user(),b"truncate /system/settings"),
+             Err(Error::Denied));
+  assert_eq!(run(&mut fs,&access,user(),b"truncate /absent"),
+             Err(Error::Io(FsError::NotFound)));
+  assert_eq!(fs.generation(),generation);
+ }
+ #[test]fn bounded_head_rejects_malformed_counts_and_stale_process_generation(){
+  let mut fs=HierVfs::format_blank(blank()).unwrap();
+  let access=grants();
+  run(&mut fs,&access,user(),b"mkfile /empty").unwrap();
+  for cmd in [b"head /empty 0".as_slice(),b"head /empty x",
+              b"head /empty 9999999",b"head /empty -1"]{
+   assert_eq!(run(&mut fs,&access,user(),cmd),Err(Error::Invalid));
+  }
+  assert_eq!(run(&mut fs,&access,
+    Identity{generation:2,..user()},b"head /empty 1"),Err(Error::Denied));
+ }
+ #[test]fn insufficient_terminal_output_never_truncates_file(){
+  let mut fs=HierVfs::format_blank(blank()).unwrap();
+  let access=grants();
+  run(&mut fs,&access,user(),b"write /note original").unwrap();
+  let generation=fs.generation();
+  let mut out=[0xaau8;4];
+  assert_eq!(command(&mut fs,&access,user(),1,b"truncate /note",&mut out),
+             Err(Error::OutputTooSmall));
+  assert_eq!(fs.generation(),generation);
+  assert_eq!(out,[0xaa;4]);
+  let (n,b)=run(&mut fs,&access,user(),b"cat /note").unwrap();
+  assert_eq!(&b[..n],b"original");
  }
 
 }
