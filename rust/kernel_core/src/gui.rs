@@ -558,15 +558,16 @@ pub(crate) struct Session{
 impl Session{
     fn new(w:u32,h:u32)->Option<Self>{
         let mut desktop=Desktop::new(w,h).ok()?;
+        #[cfg(feature="orbit-ui-preview")]
         let (files_rect,terminal_rect)=
-            if cfg!(feature="orbit-ui-preview"){
-                crate::orbit_ui::Layout::new(w,h).windows()?
-            }else{
-                let ww=(w*49/100).max(320).min(w-80);
-                let wh=(h*50/100).max(240).min(h-110);
-                (Rect::new(45,75,ww,wh),
-                 Rect::new((w-ww-36) as i32,(h-wh-65) as i32,ww,wh))
-            };
+            crate::orbit_ui::Layout::new(w,h).windows()?;
+        #[cfg(not(feature="orbit-ui-preview"))]
+        let (files_rect,terminal_rect)={
+            let ww=(w*49/100).max(320).min(w-80);
+            let wh=(h*50/100).max(240).min(h-110);
+            (Rect::new(45,75,ww,wh),
+             Rect::new((w-ww-36) as i32,(h-wh-65) as i32,ww,wh))
+        };
         let files=desktop.open(App::Files,files_rect).ok()?;
         let terminal=desktop.open(App::Terminal,terminal_rect).ok()?;
         Some(Self{desktop,files,terminal,active:terminal,orbit:0,
