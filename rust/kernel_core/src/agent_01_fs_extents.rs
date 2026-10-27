@@ -285,3 +285,73 @@ mod cross_owner_tests {
         assert_eq!(extent_owners_disjoint(&left, &overlapping, u64::MAX), Ok(false));
     }
 }
+
+
+/// Metadata-only admission check for a candidate against existing owners.
+/// Validates every owner even after a collision; no device I/O or allocation.
+/// Existing owners must be checked against each other by their caller.
+pub fn candidate_disjoint_from_owners(
+    candidate: &[Extent], owners: &[&[Extent]], device_blocks: u64,
+    max_owners: usize, max_owner_extents: usize,
+    max_candidate_extents: usize, max_candidate_blocks: u64,
+) -> Result<bool, ExtentError> {
+    if owners.len() > max_owners { return Err(ExtentError::Capacity); }
+    validate_extent_budget(candidate, device_blocks,
+                           max_candidate_extents, max_candidate_blocks)?;
+    let mut disjoint = true;
+    for owner in owners {
+        validate_extent_budget(owner, device_blocks, max_owner_extents, device_blocks)?;
+        if !extent_owners_disjoint(candidate, owner, device_blocks)? {
+            disjoint = false;
+        }
+    }
+    Ok(disjoint)
+}
+
+#[cfg(test)]
+mod owner_batch_tests {
+    use super::*;
+    const C: [Extent; 1] = [Extent { start: 4, blocks: 2 }];
+
+    #[test]
+    fn adjacent_and_empty_owners_are_disjoint() {
+        let a = [Extent { start: 0, blocks: 4 }];
+        let b = [Extent { start: 6, blocks: 2 }];
+        assert_eq!(candidate_disjoint_from_owners(
+            &C, &[&a, &b], 10, 2, 1, 1, 2), Ok(true));
+        assert_eq!(candidate_disjoint_from_owners(
+            &C, &[], 10, 0, 0, 1, 2), Ok(true));
+    }
+
+    #[test]
+    fn alias_is_reported_but_later_corruption_is_not_masked() {
+        let a = [Extent { start: 5, blocks: 1 }];
+        let b = [Extent { start: 9, blocks: 2 }];
+        assert_eq!(candidate_disjoint_from_owners(
+            &C, &[&a], 10, 1, 1, 1, 2), Ok(false));
+        assert_eq!(candidate_disjoint_from_owners(
+            &C, &[&a, &b], 10, 2, 1, 1, 2),
+            Err(ExtentError::OutsideDevice));
+    }
+
+    #[test]
+    fn every_quota_fails_closed() {
+        let a = [Extent { start: 0, blocks: 2 }];
+        assert_eq!(candidate_disjoint_from_owners(
+            &C, &[&a], 10, 0, 1, 1, 2), Err(ExtentError::Capacity));
+        assert_eq!(candidate_disjoint_from_owners(
+            &C, &[&a], 10, 1, 0, 1, 2), Err(ExtentError::Capacity));
+        assert_eq!(candidate_disjoint_from_owners(
+            &C, &[&a], 10, 1, 1, 0, 2), Err(ExtentError::Capacity));
+        assert_eq!(candidate_disjoint_from_owners(
+            &C, &[&a], 10, 1, 1, 1, 1), Err(ExtentError::Capacity));
+    }
+
+    #[test]
+    fn corrupt_candidate_is_rejected_before_comparison() {
+        let bad = [Extent { start: u64::MAX, blocks: 2 }];
+        assert_eq!(candidate_disjoint_from_owners(
+            &bad, &[], u64::MAX, 0, 0, 1, 2),
+            Err(ExtentError::Overflow));
+    }
+}
