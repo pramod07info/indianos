@@ -146,3 +146,18 @@ mod span_tests {
         assert_eq!(map_logical_span(&[],10,0,0,&mut out),Err(ExtentError::Empty));
     }
 }
+
+
+/// Validate that all requested logical blocks are mapped before data access.
+pub fn contains_logical_span(items:&[Extent],blocks:u64,start:u64,count:u64)
+ ->Result<bool,ExtentError>{
+ let total=validate_extents(items,blocks)?;
+ let end=start.checked_add(count).ok_or(ExtentError::Overflow)?;
+ Ok(count>0&&start<total&&end<=total)
+}
+#[cfg(test)]mod prefix_guard_tests{
+ use super::*;
+ #[test]fn accepts_complete_range(){assert_eq!(contains_logical_span(&[Extent{start:2,blocks:5}],20,1,4),Ok(true));}
+ #[test]fn refuses_outside_or_empty(){assert_eq!(contains_logical_span(&[Extent{start:2,blocks:5}],20,5,1),Ok(false));assert_eq!(contains_logical_span(&[],20,0,0),Ok(false));}
+ #[test]fn rejects_overflow_and_bad_extent(){assert_eq!(contains_logical_span(&[Extent{start:1,blocks:3}],20,u64::MAX,2),Err(ExtentError::Overflow));assert_eq!(contains_logical_span(&[Extent{start:19,blocks:2}],20,0,1),Err(ExtentError::OutsideDevice));}
+}
