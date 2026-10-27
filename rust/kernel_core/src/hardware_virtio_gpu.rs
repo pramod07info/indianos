@@ -255,6 +255,36 @@ impl<T:ControlTransport> Protocol<T>{
   self.command(RESOURCE_FLUSH,&extra[..24],RESP_OK_NODATA,&mut response)?;
   Ok(())
  }
+ /// Update an already allocated and attached scanout resource using
+ /// strict bounds and actual virtio-gpu transfer/flush command encoding.
+ /// Native transport, page-pinning and IOMMU ownership remain separate.
+ pub fn refresh_subrect(&mut self,display:Scanout,resource:u32,
+  rect:Rect)->Result<(),Error>{
+  if !self.ready||resource==0||display.width==0||display.height==0||
+     display.width>MAX_WIDTH||display.height>MAX_HEIGHT{
+   return Err(Error::Unisolated);
+  }
+  if rect.width==0||rect.height==0||
+     rect.x.checked_add(rect.width).is_none_or(|v|v>display.width)||
+     rect.y.checked_add(rect.height).is_none_or(|v|v>display.height){
+   return Err(Error::Dimensions);
+  }
+  let offset=u64::from(rect.y).checked_mul(u64::from(display.width))
+    .and_then(|x|x.checked_add(u64::from(rect.x)))
+    .and_then(|x|x.checked_mul(4)).ok_or(Error::Dimensions)?;
+  let mut extra=[0u8;32];
+  let mut response=[0u8;CONTROL_HEADER];
+  put32(&mut extra,0,rect.x);put32(&mut extra,4,rect.y);
+  put32(&mut extra,8,rect.width);put32(&mut extra,12,rect.height);
+  put64(&mut extra,16,offset);put32(&mut extra,24,resource);
+  self.command(TRANSFER_TO_HOST_2D,&extra[..32],RESP_OK_NODATA,&mut response)?;
+  extra.fill(0);
+  put32(&mut extra,0,rect.x);put32(&mut extra,4,rect.y);
+  put32(&mut extra,8,rect.width);put32(&mut extra,12,rect.height);
+  put32(&mut extra,16,resource);
+  self.command(RESOURCE_FLUSH,&extra[..24],RESP_OK_NODATA,&mut response)?;
+  Ok(())
+ }
 }
 /// This report deliberately states *capability discovery only*.
 /// GPU queues, shaders, DMA and all drivers remain disabled at normal boot.
@@ -417,4 +447,25 @@ mod hd3b_tests{
    Err(Error::Dimensions));
   assert_eq!(gpu.transport.index,1); // no command submitted on failure
  }
+
+ #[test]fn virtio_gpu_partial_damage_emits_transfer_then_flush(){
+  let mut gpu=Protocol::new(transport(0));
+  let display=gpu.discover_display().unwrap();
+  assert_eq!(gpu.refresh_subrect(display,1,Rect{
+   x:2,y:3,width:10,height:5}),Ok(()));
+  assert_eq!(&gpu.transport.types[..3],
+   &[GET_DISPLAY_INFO,TRANSFER_TO_HOST_2D,RESOURCE_FLUSH]);
+ }
+ #[test]fn virtio_gpu_offscreen_damage_is_rejected_before_queue_submit(){
+  let mut gpu=Protocol::new(transport(0));
+  let display=gpu.discover_display().unwrap();
+  assert_eq!(gpu.refresh_subrect(display,1,Rect{
+   x:60,y:0,width:10,height:2}),Err(Error::Dimensions));
+  assert_eq!(gpu.refresh_subrect(display,1,Rect{
+   x:0,y:0,width:0,height:2}),Err(Error::Dimensions));
+  assert_eq!(gpu.refresh_subrect(display,0,Rect{
+   x:0,y:0,width:10,height:2}),Err(Error::Unisolated));
+  assert_eq!(gpu.transport.index,1);
+ }
+
 }
