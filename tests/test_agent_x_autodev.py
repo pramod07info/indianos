@@ -129,6 +129,25 @@ class GuardedCodegenTests(unittest.TestCase):
         agent.prepare(self.root, prompt, None)
         self.assertIn("process generation", prompt.read_text())
 
+    def test_reviewed_udp_fallback_still_passes_the_model_safety_boundary(self) -> None:
+        candidate = self.root / "fallback.txt"
+        output = agent.trusted_fallback_for("udp_owner_epoch")
+        udp = next(item for item in agent.TASKS if item["name"] == "udp_owner_epoch")
+        validated = agent.parse_generated(output, udp)
+        self.assertIn("pub struct Registry", validated)
+        self.assertIn("pub fn authorize", validated)
+        self.assertIn("generation!=generation", validated)
+        self.assertGreaterEqual(validated.count("#[test]"), 2)
+        candidate.write_text(output, encoding="utf-8")
+        agent.apply(self.root, "udp_owner_epoch", candidate)
+        self.assertTrue((self.root / agent.MODULE_ROOT / "udp_owner_epoch.rs").exists())
+        self.assertIn("pub mod udp_owner_epoch;", (self.root / agent.LIB).read_text())
+
+    def test_reviewed_fallback_does_not_bypass_allowlist(self) -> None:
+        for name in ("../../etc/passwd", "capability", "process_events", ""):
+            with self.assertRaisesRegex(ValueError, "no preapproved fallback"):
+                agent.trusted_fallback_for(name)
+
     def test_empty_backlog_is_non_destructive(self) -> None:
         for task in agent.TASKS:
             (self.root / agent.MODULE_ROOT / (task["name"] + ".rs")).write_text("// existing\n")

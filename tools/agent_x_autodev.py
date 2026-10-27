@@ -142,6 +142,99 @@ def write_retry_prompt(name: str, output: Path) -> None:
     output.write_text(retry_prompt_for(task), encoding="utf-8")
 
 
+
+def trusted_fallback_for(name: str) -> str:
+    """An explicitly reviewed, task-specific fallback, never raw model output.
+
+    Only udp_owner_epoch has a vetted source fixture. All other names fail
+    closed. The caller MUST still pass apply() validation and cargo/kernel CI.
+    """
+    if name != "udp_owner_epoch":
+        raise ValueError("no preapproved fallback for this task")
+    code = """\
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum Error { Invalid, Duplicate, Denied, Full }
+
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct Grant { pub pid:u32, pub generation:u64, pub port:u16 }
+
+/// Bounded UDP port ownership proposal; not yet wired to live sockets.
+/// PID+generation must come from authenticated kernel process state.
+pub struct Registry<const N:usize> { entries:[Option<Grant>;N] }
+impl<const N:usize> Registry<N> {
+    pub const fn new()->Self { Self { entries:[None;N] } }
+
+    pub fn bind(&mut self,pid:u32,generation:u64,port:u16)
+        ->Result<(),Error> {
+        if pid==0||generation==0||port==0 { return Err(Error::Invalid); }
+        for item in self.entries.iter().flatten() {
+            if item.port==port { return Err(Error::Duplicate); }
+            // A reused PID cannot bind until old generation is revoked.
+            if item.pid==pid && item.generation!=generation {
+                return Err(Error::Denied);
+            }
+        }
+        let slot=self.entries.iter_mut().find(|slot|slot.is_none())
+            .ok_or(Error::Full)?;
+        *slot=Some(Grant{pid,generation,port});
+        Ok(())
+    }
+
+    pub fn authorize(&self,pid:u32,generation:u64,port:u16)
+        ->Result<(),Error> {
+        if pid==0||generation==0||port==0 { return Err(Error::Invalid); }
+        if self.entries.iter().flatten().any(|item|
+            item.pid==pid && item.generation==generation &&
+            item.port==port) { Ok(()) } else { Err(Error::Denied) }
+    }
+
+    pub fn revoke_owner(&mut self,pid:u32,generation:u64)
+        ->Result<usize,Error> {
+        if pid==0||generation==0 { return Err(Error::Invalid); }
+        let mut revoked=0usize;
+        for slot in &mut self.entries {
+            if slot.as_ref().is_some_and(|item|
+                item.pid==pid && item.generation==generation) {
+                *slot=None;
+                revoked+=1;
+            }
+        }
+        Ok(revoked)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn binds_and_authorizes_only_current_generation() {
+        let mut ports=Registry::<2>::new();
+        assert_eq!(ports.bind(7,1,5353),Ok(()));
+        assert_eq!(ports.authorize(7,1,5353),Ok(()));
+        assert_eq!(ports.authorize(7,2,5353),Err(Error::Denied));
+        assert_eq!(ports.authorize(8,1,5353),Err(Error::Denied));
+        assert_eq!(ports.bind(8,1,5353),Err(Error::Duplicate));
+        assert_eq!(ports.bind(7,2,6000),Err(Error::Denied));
+        assert_eq!(ports.revoke_owner(7,1),Ok(1));
+        assert_eq!(ports.bind(7,2,6000),Ok(()));
+        assert_eq!(ports.authorize(7,1,5353),Err(Error::Denied));
+    }
+    #[test]
+    fn refuses_invalid_owners_ports_and_capacity_exhaustion() {
+        let mut ports=Registry::<1>::new();
+        assert_eq!(ports.bind(0,1,53),Err(Error::Invalid));
+        assert_eq!(ports.bind(1,0,53),Err(Error::Invalid));
+        assert_eq!(ports.bind(1,1,0),Err(Error::Invalid));
+        assert_eq!(ports.bind(1,1,53),Ok(()));
+        assert_eq!(ports.bind(2,1,54),Err(Error::Full));
+        assert_eq!(ports.revoke_owner(2,1),Ok(0));
+        assert_eq!(ports.revoke_owner(1,1),Ok(1));
+        assert_eq!(ports.bind(2,1,54),Ok(()));
+    }
+}
+"""
+    return START + "\n" + code + "\n" + END + "\n"
+
 def parse_generated(raw: str, task: dict[str, object]) -> str:
     start = raw.find(START)
     end = raw.find(END, start + len(START)) if start >= 0 else -1
@@ -202,7 +295,7 @@ def apply(root: Path, name: str, raw_path: Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=["prepare", "apply", "retry-prompt"])
+    parser.add_argument("command", choices=["prepare", "apply", "retry-prompt", "fallback"])
     parser.add_argument("--root", type=Path, default=Path("."))
     parser.add_argument("--prompt", type=Path)
     parser.add_argument("--generated", type=Path)
@@ -218,6 +311,11 @@ def main() -> None:
             if args.name is None or args.prompt is None:
                 parser.error("retry-prompt requires --name and --prompt")
             write_retry_prompt(args.name, args.prompt)
+        elif args.command == "fallback":
+            if args.name is None or args.generated is None:
+                parser.error("fallback requires --name and --generated")
+            # Fail closed for unreviewed tasks; retain all regular apply gates.
+            args.generated.write_text(trusted_fallback_for(args.name), encoding="utf-8")
         else:
             if args.name is None or args.generated is None:
                 parser.error("apply requires --name and --generated")
