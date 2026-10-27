@@ -85,7 +85,7 @@ fn gpt<D:BlockDevice>(disk:&mut D,index:u32)->Result<Partition,Error>{
  let entries=le32(&hdr[80..84]) as usize;
  let entry_size=le32(&hdr[84..88]) as usize;
  let checksum=le32(&hdr[88..92]);
- if le64(&hdr[24..32])!=1||alternate<=1||alternate>=capacity||
+ if le64(&hdr[24..32])!=1||alternate!=capacity-1||
    first<3||last<first||last>=capacity||last>=alternate||
    table<2||table>=first||entries==0||entries>MAX_GPT_ENTRIES||
    entry_size!=128{return Err(Error::Unsupported);}
@@ -93,6 +93,11 @@ fn gpt<D:BlockDevice>(disk:&mut D,index:u32)->Result<Partition,Error>{
  let sectors=total.div_ceil(SECTOR_BYTES);
  let table_end=table.checked_add(sectors as u64).ok_or(Error::OutOfRange)?;
  if table_end>first{return Err(Error::Invalid);}
+ // The last usable LBA may not overlap the secondary GPT entry array
+ // immediately preceding the alternate header. No data may be mounted there.
+ if alternate<=sectors as u64 || last>=alternate-sectors as u64 {
+  return Err(Error::Invalid);
+ }
  // Verify the complete entry array BEFORE interpreting any partition.
  let mut calculated=!0u32;
  for s in 0..sectors{
@@ -101,6 +106,40 @@ fn gpt<D:BlockDevice>(disk:&mut D,index:u32)->Result<Partition,Error>{
   calculated=crc_update(calculated,&buf[..n]);
  }
  if !calculated!=checksum{return Err(Error::Invalid);}
+ // Verify the backup GPT header and its *separate* entry array before
+ // mounting any selected volume. A valid primary CRC alone cannot prove
+ // that the device's secondary metadata is consistent after interrupted
+ // partition-table writes. Never attempt automatic repair here.
+ let backup_table=alternate.checked_sub(sectors as u64)
+   .ok_or(Error::OutOfRange)?;
+ let backup=read(disk,alternate)?;
+ if &backup[..8]!=b"EFI PART"||
+    le32(&backup[8..12])!=0x0001_0000||
+    le32(&backup[12..16]) as usize!=size||
+    backup[20..24]!=[0;4]||
+    le64(&backup[24..32])!=alternate||
+    le64(&backup[32..40])!=1||
+    le64(&backup[40..48])!=first||
+    le64(&backup[48..56])!=last||
+    backup[56..72]!=hdr[56..72]||
+    le64(&backup[72..80])!=backup_table||
+    le32(&backup[80..84]) as usize!=entries||
+    le32(&backup[84..88]) as usize!=entry_size||
+    le32(&backup[88..92])!=checksum{
+  return Err(Error::Invalid);
+ }
+ let mut checked_backup=backup;
+ checked_backup[16..20].fill(0);
+ if crc(&checked_backup[..size])!=le32(&backup[16..20]){
+  return Err(Error::Invalid);
+ }
+ let mut backup_crc=!0u32;
+ for s in 0..sectors{
+  let sector=read(disk,backup_table+s as u64)?;
+  let n=total.saturating_sub(s*SECTOR_BYTES).min(SECTOR_BYTES);
+  backup_crc=crc_update(backup_crc,&sector[..n]);
+ }
+ if !backup_crc!=checksum{return Err(Error::Invalid);}
  if index as usize>=entries{return Err(Error::NotFound);}
  let mut seen=[None;MAX_GPT_ENTRIES];
  for i in 0..entries{
@@ -110,7 +149,9 @@ fn gpt<D:BlockDevice>(disk:&mut D,index:u32)->Result<Partition,Error>{
   let off=byte%SECTOR_BYTES;
   let entry=&sector[off..off+entry_size];
   if entry[..16].iter().all(|&v|v==0){
-   if i==index as usize{return Err(Error::NotFound);}
+   // An unused type GUID must not carry stale bounds or a unique identifier.
+   if entry.iter().any(|&v|v!=0){return Err(Error::Invalid);}
+   // An absent selected slot must not mask later corrupt live entries.
    continue;
   }
   if entry[16..32].iter().all(|&v|v==0){return Err(Error::Invalid);}
@@ -131,8 +172,20 @@ pub fn inspect<D:BlockDevice>(disk:&mut D,index:u32)->Result<Partition,Error>{
  if first[510]!=0x55||first[511]!=0xaa{return Err(Error::Invalid);}
  let protective=(0..4).any(|i|first[446+i*16+4]==0xee);
  if protective{
-  if first[450]!=0xee{return Err(Error::Invalid);}
-  if le32(&first[454..458])!=1{return Err(Error::Invalid);}
+  if first[450]!=0xee||first[446]!=0||le32(&first[454..458])!=1{
+   return Err(Error::Invalid);
+  }
+  // Reject ambiguous hybrid layouts and multiple protective entries.
+  // This is a strict read-only discovery policy, never a repair/formatter.
+  for slot in 1..4{
+   if first[446+slot*16..446+(slot+1)*16].iter().any(|&b|b!=0){
+    return Err(Error::Unsupported);
+   }
+  }
+  let covered=le32(&first[458..462]) as u64;
+  if covered<(disk.sector_count()-1).min(u32::MAX as u64){
+   return Err(Error::Invalid);
+  }
   gpt(disk,index)
  }else{mbr(disk,index,&first)}
 }
@@ -151,18 +204,19 @@ pub fn mount<'a,D:BlockDevice>(disk:&'a mut D,index:u32)
 mod m1_partition_tests{
  use super::*;
  const COUNT:usize=256;
- struct Disk{data:[[u8;SECTOR_BYTES];COUNT],writes:usize}
+ struct Disk{data:[[u8;SECTOR_BYTES];COUNT],writes:usize,fail_at:Option<usize>}
  impl BlockDevice for Disk{
   fn sector_count(&self)->u64{COUNT as u64}
   fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
    *out=*self.data.get(lba as usize).ok_or(BlockError::OutOfRange)?;Ok(())
   }
   fn write_sector(&mut self,lba:u64,input:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   if self.fail_at==Some(self.writes){return Err(BlockError::Io);}
    *self.data.get_mut(lba as usize).ok_or(BlockError::OutOfRange)?=*input;
    self.writes+=1;Ok(())
   }
  }
- fn new()->Disk{Disk{data:[[0;SECTOR_BYTES];COUNT],writes:0}}
+ fn new()->Disk{Disk{data:[[0;SECTOR_BYTES];COUNT],writes:0,fail_at:None}}
  fn mbr_disk()->Disk{
   let mut d=new();d.data[0][510]=0x55;d.data[0][511]=0xaa;
   let entry=&mut d.data[0][446..462];entry[4]=0x83;
@@ -192,7 +246,21 @@ mod m1_partition_tests{
   h[84..88].copy_from_slice(&128u32.to_le_bytes());
   h[88..92].copy_from_slice(&table_crc.to_le_bytes());
   let hcrc=crc(&h[..92]);h[16..20].copy_from_slice(&hcrc.to_le_bytes());
+  sync_backup(&mut d);
   d
+ }
+ // Keep the synthetic secondary table/header fully independent and valid,
+ // including the secondary header's own CRC and reversed LBA pointers.
+ fn sync_backup(d:&mut Disk){
+  d.data[254]=d.data[2];
+  let mut header=d.data[1];
+  header[24..32].copy_from_slice(&255u64.to_le_bytes());
+  header[32..40].copy_from_slice(&1u64.to_le_bytes());
+  header[72..80].copy_from_slice(&254u64.to_le_bytes());
+  header[16..20].fill(0);
+  let checksum=crc(&header[..92]);
+  header[16..20].copy_from_slice(&checksum.to_le_bytes());
+  d.data[255]=header;
  }
  #[test]fn m1_mbr_partition_mount_and_reboot_guards(){
   let mut disk=mbr_disk();
@@ -242,6 +310,95 @@ mod m1_partition_tests{
   assert_eq!(inspect(&mut disk,0),Err(Error::Overlap));
   assert_eq!(disk.writes,0);
  }
+ #[test]fn m1_gpt_absent_slot_cannot_hide_corrupt_later_partition(){
+  let mut disk=gpt_disk();
+  disk.data[2][..128].fill(0); // requested index zero is unused
+  let entry=&mut disk.data[2][128..256];
+  entry[..16].fill(7);entry[16..32].fill(9);
+  entry[32..40].copy_from_slice(&40u64.to_le_bytes());
+  entry[40..48].copy_from_slice(&230u64.to_le_bytes()); // past last usable 222
+  let table_crc=crc(&disk.data[2]);
+  disk.data[1][88..92].copy_from_slice(&table_crc.to_le_bytes());
+  disk.data[1][16..20].fill(0);
+  let header_crc=crc(&disk.data[1][..92]);
+  disk.data[1][16..20].copy_from_slice(&header_crc.to_le_bytes());
+  sync_backup(&mut disk); // backup agrees; the live entry is still invalid
+  assert_eq!(inspect(&mut disk,0),Err(Error::OutOfRange));
+  assert_eq!(disk.writes,0);
+ }
+ #[test]fn m1_gpt_rejects_hybrid_protective_mbr_and_truncated_coverage(){
+  let mut disk=gpt_disk();
+  disk.data[0][462+4]=0x83; // shadow partition beside GPT protective entry
+  assert_eq!(inspect(&mut disk,0),Err(Error::Unsupported));
+  assert_eq!(disk.writes,0);
+  let mut disk=gpt_disk();
+  disk.data[0][458..462].copy_from_slice(&10u32.to_le_bytes());
+  assert_eq!(inspect(&mut disk,0),Err(Error::Invalid));
+  assert_eq!(disk.writes,0);
+ }
+ #[test]fn m1_gpt_rejects_data_claiming_backup_metadata_sectors(){
+  let mut disk=gpt_disk();
+  disk.data[1][48..56].copy_from_slice(&254u64.to_le_bytes());
+  disk.data[1][16..20].fill(0);
+  let header_crc=crc(&disk.data[1][..92]);
+  disk.data[1][16..20].copy_from_slice(&header_crc.to_le_bytes());
+  assert_eq!(inspect(&mut disk,0),Err(Error::Invalid));
+  assert_eq!(disk.writes,0);
+ }
+ #[test]fn m1_partition_failed_cow_commit_recovers_previous_file_after_reboot(){
+  let mut disk=mbr_disk();
+  {
+   let window=BlockWindow::new(&mut disk,10,100).unwrap();
+   let mut fs=HierVfs::format_blank(window).unwrap();
+   fs.mkdir("/home").unwrap();
+   fs.create("/home/note",b"committed").unwrap();
+  }
+  // The second write in the next transaction fails. Do not publish a
+  // partially written new file or touch any sector outside this partition.
+  disk.fail_at=Some(disk.writes+1);
+  {
+   let mut fs=mount(&mut disk,0).unwrap();
+   assert!(fs.overwrite("/home/note",b"interrupted").is_err());
+  }
+  disk.fail_at=None;
+  {
+   let mut fs=mount(&mut disk,0).unwrap();
+   let mut out=[0u8;32];
+   assert_eq!(fs.read("/home/note",&mut out),Ok(9));
+   assert_eq!(&out[..9],b"committed");
+  }
+  assert_eq!(disk.data[9],[0;SECTOR_BYTES]);
+  assert_eq!(disk.data[110],[0;SECTOR_BYTES]);
+ }
+ #[test]fn m1_gpt_requires_backup_header_at_end_of_selected_device(){
+  let mut disk=gpt_disk();
+  disk.data[1][32..40].copy_from_slice(&200u64.to_le_bytes());
+  disk.data[1][16..20].fill(0);
+  let hcrc=crc(&disk.data[1][..92]);
+  disk.data[1][16..20].copy_from_slice(&hcrc.to_le_bytes());
+  assert_eq!(inspect(&mut disk,0),Err(Error::Unsupported));
+  assert_eq!(disk.writes,0);
+ }
+ #[test]fn m1_partition_remount_keeps_last_committed_overwrite(){
+  let mut disk=mbr_disk();
+  {
+   let window=BlockWindow::new(&mut disk,10,100).unwrap();
+   let mut fs=HierVfs::format_blank(window).unwrap();
+   fs.mkdir("/home").unwrap();
+   fs.create("/home/note",b"old").unwrap();
+   fs.overwrite("/home/note",b"new committed").unwrap();
+  }
+  let before=disk.writes;
+  {
+   let mut fs=mount(&mut disk,0).unwrap();
+   let mut output=[0u8;32];
+   assert_eq!(fs.read("/home/note",&mut output),Ok(13));
+   assert_eq!(&output[..13],b"new committed");
+  }
+  assert_eq!(disk.writes,before); // inspection and remount are read-only
+  assert_eq!(disk.data[9],[0;SECTOR_BYTES]);
+  assert_eq!(disk.data[110],[0;SECTOR_BYTES]);
+ }
  #[test]fn m1_unrecognized_media_and_bad_bounds_fail_closed(){
   let mut disk=new();assert_eq!(inspect(&mut disk,0),Err(Error::Invalid));
   let mut disk=mbr_disk();
@@ -250,4 +407,29 @@ mod m1_partition_tests{
   let mut disk=mbr_disk();assert_eq!(inspect(&mut disk,1),Err(Error::NotFound));
   let mut disk=gpt_disk();assert_eq!(inspect(&mut disk,4),Err(Error::NotFound));
  }
+ #[test]fn m1_gpt_backup_header_and_secondary_table_must_match_primary(){
+  let mut disk=gpt_disk();
+  assert_eq!(inspect(&mut disk,0),Ok(Partition{
+   scheme:Scheme::Gpt,index:0,start:40,sectors:100
+  }));
+  assert_eq!(disk.writes,0);
+  // The primary GPT remains valid; corrupting only the backup must fail.
+  let mut bad_header=gpt_disk();
+  bad_header.data[255][16]^=1;
+  assert_eq!(inspect(&mut bad_header,0),Err(Error::Invalid));
+  assert_eq!(bad_header.writes,0);
+  let mut bad_table=gpt_disk();
+  bad_table.data[254][0]^=1;
+  assert_eq!(inspect(&mut bad_table,0),Err(Error::Invalid));
+  assert_eq!(bad_table.writes,0);
+  let mut mismatched_pointer=gpt_disk();
+  mismatched_pointer.data[255][32..40]
+   .copy_from_slice(&2u64.to_le_bytes());
+  mismatched_pointer.data[255][16..20].fill(0);
+  let checksum=crc(&mismatched_pointer.data[255][..92]);
+  mismatched_pointer.data[255][16..20].copy_from_slice(&checksum.to_le_bytes());
+  assert_eq!(inspect(&mut mismatched_pointer,0),Err(Error::Invalid));
+  assert_eq!(mismatched_pointer.writes,0);
+ }
+
 }
