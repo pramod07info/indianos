@@ -11,7 +11,7 @@ pub struct Package{
  pub payload_digest:[u8;32],
 }
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
-pub enum Error{Invalid,Duplicate,Missing,Cycle,Capacity,UnsupportedAbi}
+pub enum Error{Invalid,Duplicate,Missing,Cycle,Capacity,UnsupportedAbi,InUse}
 pub struct Catalog<const N:usize>{items:[Option<Package>;N]}
 impl<const N:usize> Catalog<N>{
  pub const fn new()->Self{Self{items:[None;N]}}
@@ -34,9 +34,27 @@ impl<const N:usize> Catalog<N>{
  /// Topological ordering: dependencies always precede dependent app.
  /// Does not trust unverified manifest strings or install any package.
  pub fn resolve(&self,id:u32,out:&mut[u32])->Result<usize,Error>{
+  // Compute the entire dependency closure before publishing any entry.
+  // A malformed/missing/cyclic/oversized plan cannot partially install.
   let mut visited=[0u8;N];let mut len=0usize;
-  self.visit(id,&mut visited,out,&mut len)?;
+  let mut staged=[0u32;N];
+  self.visit(id,&mut visited,&mut staged,&mut len)?;
+  if len>out.len(){return Err(Error::Capacity);}
+  out[..len].copy_from_slice(&staged[..len]);
   Ok(len)
+ }
+ /// Remove a catalog entry only when no registered application depends
+ /// on it. This is purely trusted catalog state; persisted app-store records
+ /// and on-disk binaries still require transactional installer integration.
+ pub fn remove_unreferenced(&mut self,id:u32)->Result<(),Error>{
+  let i=self.items.iter().position(|p|p.is_some_and(|x|x.id==id))
+   .ok_or(Error::Missing)?;
+  if self.items.iter().flatten().any(|p|
+      p.id!=id&&p.deps.contains(&id)){
+   return Err(Error::InUse);
+  }
+  self.items[i]=None;
+  Ok(())
  }
  fn visit(&self,id:u32,state:&mut[u8;N],out:&mut[u32],len:&mut usize)
   ->Result<(),Error>{
@@ -81,4 +99,42 @@ mod m2_tests{
   let mut bad=pkg(3,[0;4]);bad.abi=999;
   assert_eq!(c.add(bad),Err(Error::UnsupportedAbi));
  }
+
+ #[test]fn invalid_or_undersized_dependency_plan_is_atomic(){
+  let mut c=Catalog::<4>::new();
+  c.add(pkg(1,[2,3,0,0])).unwrap();
+  c.add(pkg(2,[0;4])).unwrap();
+  c.add(pkg(3,[4,0,0,0])).unwrap();
+  let mut out=[77u32;4];
+  assert_eq!(c.resolve(1,&mut out),Err(Error::Missing));
+  assert_eq!(out,[77;4]);
+  c.add(pkg(4,[0;4])).unwrap();
+  let mut short=[77u32;3];
+  assert_eq!(c.resolve(1,&mut short),Err(Error::Capacity));
+  assert_eq!(short,[77;3]);
+  assert_eq!(c.resolve(1,&mut out),Ok(4));
+  assert_eq!(out,[2,4,3,1]);
+ }
+ #[test]fn depended_on_package_cannot_be_uninstalled(){
+  let mut c=Catalog::<3>::new();
+  c.add(pkg(1,[2,0,0,0])).unwrap();
+  c.add(pkg(2,[0;4])).unwrap();
+  assert_eq!(c.remove_unreferenced(2),Err(Error::InUse));
+  assert!(c.get(2).is_some());
+  c.remove_unreferenced(1).unwrap();
+  c.remove_unreferenced(2).unwrap();
+  assert_eq!(c.get(2),None);
+  assert_eq!(c.remove_unreferenced(2),Err(Error::Missing));
+  c.add(pkg(3,[0;4])).unwrap();
+  assert!(c.get(3).is_some());
+ }
+ #[test]fn cycle_detection_does_not_publish_partial_install_plan(){
+  let mut c=Catalog::<3>::new();
+  c.add(pkg(1,[2,0,0,0])).unwrap();
+  c.add(pkg(2,[1,0,0,0])).unwrap();
+  let mut out=[88u32;3];
+  assert_eq!(c.resolve(1,&mut out),Err(Error::Cycle));
+  assert_eq!(out,[88;3]);
+ }
+
 }
