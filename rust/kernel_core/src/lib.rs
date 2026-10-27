@@ -12,6 +12,8 @@ use core::ptr;
 
 #[cfg(feature="orbit-ui-preview")]
 mod orbit_ui;
+/// Session ribbon metadata: model-only, no privileged phone hardware or restore execution.
+pub mod orbit_session;
 mod syscall;
 mod program;
 mod initramfs;
