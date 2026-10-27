@@ -106,6 +106,40 @@ fn gpt<D:BlockDevice>(disk:&mut D,index:u32)->Result<Partition,Error>{
   calculated=crc_update(calculated,&buf[..n]);
  }
  if !calculated!=checksum{return Err(Error::Invalid);}
+ // Verify the backup GPT header and its *separate* entry array before
+ // mounting any selected volume. A valid primary CRC alone cannot prove
+ // that the device's secondary metadata is consistent after interrupted
+ // partition-table writes. Never attempt automatic repair here.
+ let backup_table=alternate.checked_sub(sectors as u64)
+   .ok_or(Error::OutOfRange)?;
+ let backup=read(disk,alternate)?;
+ if &backup[..8]!=b"EFI PART"||
+    le32(&backup[8..12])!=0x0001_0000||
+    le32(&backup[12..16]) as usize!=size||
+    backup[20..24]!=[0;4]||
+    le64(&backup[24..32])!=alternate||
+    le64(&backup[32..40])!=1||
+    le64(&backup[40..48])!=first||
+    le64(&backup[48..56])!=last||
+    backup[56..72]!=hdr[56..72]||
+    le64(&backup[72..80])!=backup_table||
+    le32(&backup[80..84]) as usize!=entries||
+    le32(&backup[84..88]) as usize!=entry_size||
+    le32(&backup[88..92])!=checksum{
+  return Err(Error::Invalid);
+ }
+ let mut checked_backup=backup;
+ checked_backup[16..20].fill(0);
+ if crc(&checked_backup[..size])!=le32(&backup[16..20]){
+  return Err(Error::Invalid);
+ }
+ let mut backup_crc=!0u32;
+ for s in 0..sectors{
+  let sector=read(disk,backup_table+s as u64)?;
+  let n=total.saturating_sub(s*SECTOR_BYTES).min(SECTOR_BYTES);
+  backup_crc=crc_update(backup_crc,&sector[..n]);
+ }
+ if !backup_crc!=checksum{return Err(Error::Invalid);}
  if index as usize>=entries{return Err(Error::NotFound);}
  let mut seen=[None;MAX_GPT_ENTRIES];
  for i in 0..entries{
@@ -212,7 +246,21 @@ mod m1_partition_tests{
   h[84..88].copy_from_slice(&128u32.to_le_bytes());
   h[88..92].copy_from_slice(&table_crc.to_le_bytes());
   let hcrc=crc(&h[..92]);h[16..20].copy_from_slice(&hcrc.to_le_bytes());
+  sync_backup(&mut d);
   d
+ }
+ // Keep the synthetic secondary table/header fully independent and valid,
+ // including the secondary header's own CRC and reversed LBA pointers.
+ fn sync_backup(d:&mut Disk){
+  d.data[254]=d.data[2];
+  let mut header=d.data[1];
+  header[24..32].copy_from_slice(&255u64.to_le_bytes());
+  header[32..40].copy_from_slice(&1u64.to_le_bytes());
+  header[72..80].copy_from_slice(&254u64.to_le_bytes());
+  header[16..20].fill(0);
+  let checksum=crc(&header[..92]);
+  header[16..20].copy_from_slice(&checksum.to_le_bytes());
+  d.data[255]=header;
  }
  #[test]fn m1_mbr_partition_mount_and_reboot_guards(){
   let mut disk=mbr_disk();
@@ -274,6 +322,7 @@ mod m1_partition_tests{
   disk.data[1][16..20].fill(0);
   let header_crc=crc(&disk.data[1][..92]);
   disk.data[1][16..20].copy_from_slice(&header_crc.to_le_bytes());
+  sync_backup(&mut disk); // backup agrees; the live entry is still invalid
   assert_eq!(inspect(&mut disk,0),Err(Error::OutOfRange));
   assert_eq!(disk.writes,0);
  }
@@ -358,4 +407,29 @@ mod m1_partition_tests{
   let mut disk=mbr_disk();assert_eq!(inspect(&mut disk,1),Err(Error::NotFound));
   let mut disk=gpt_disk();assert_eq!(inspect(&mut disk,4),Err(Error::NotFound));
  }
+ #[test]fn m1_gpt_backup_header_and_secondary_table_must_match_primary(){
+  let mut disk=gpt_disk();
+  assert_eq!(inspect(&mut disk,0),Ok(Partition{
+   scheme:Scheme::Gpt,index:0,start:40,sectors:100
+  }));
+  assert_eq!(disk.writes,0);
+  // The primary GPT remains valid; corrupting only the backup must fail.
+  let mut bad_header=gpt_disk();
+  bad_header.data[255][16]^=1;
+  assert_eq!(inspect(&mut bad_header,0),Err(Error::Invalid));
+  assert_eq!(bad_header.writes,0);
+  let mut bad_table=gpt_disk();
+  bad_table.data[254][0]^=1;
+  assert_eq!(inspect(&mut bad_table,0),Err(Error::Invalid));
+  assert_eq!(bad_table.writes,0);
+  let mut mismatched_pointer=gpt_disk();
+  mismatched_pointer.data[255][32..40]
+   .copy_from_slice(&2u64.to_le_bytes());
+  mismatched_pointer.data[255][16..20].fill(0);
+  let checksum=crc(&mismatched_pointer.data[255][..92]);
+  mismatched_pointer.data[255][16..20].copy_from_slice(&checksum.to_le_bytes());
+  assert_eq!(inspect(&mut mismatched_pointer,0),Err(Error::Invalid));
+  assert_eq!(mismatched_pointer.writes,0);
+ }
+
 }
