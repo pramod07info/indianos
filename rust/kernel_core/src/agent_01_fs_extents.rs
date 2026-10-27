@@ -468,3 +468,47 @@ mod owner_set_boundary_regression_tests {
             &[&a, &b], u64::MAX, 2, 1, 4), Ok(false));
     }
 }
+
+#[cfg(test)]
+mod span_atomicity_boundary_regression_tests {
+    use super::*;
+
+    #[test]
+    fn invalid_later_extent_leaves_output_unchanged() {
+        let items = [
+            Extent { start: 1, blocks: 2 },
+            Extent { start: 9, blocks: 2 },
+        ];
+        let sentinel = Extent { start: 77, blocks: 88 };
+        let mut output = [sentinel; 2];
+        assert_eq!(map_logical_span(&items, 10, 0, 1, &mut output),
+            Err(ExtentError::OutsideDevice));
+        assert_eq!(output, [sentinel; 2]);
+    }
+
+    #[test]
+    fn zero_capacity_output_fails_without_mutation() {
+        let items = [Extent { start: 4, blocks: 2 }];
+        let mut output: [Extent; 0] = [];
+        assert_eq!(map_logical_span(&items, 10, 0, 1, &mut output),
+            Err(ExtentError::Capacity));
+    }
+
+    #[test]
+    fn maps_last_valid_device_block() {
+        let items = [Extent { start: u64::MAX - 1, blocks: 1 }];
+        let mut output = [Extent { start: 0, blocks: 0 }];
+        assert_eq!(map_logical_span(&items, u64::MAX, 0, 1, &mut output), Ok(1));
+        assert_eq!(output, items);
+    }
+
+    #[test]
+    fn past_logical_end_leaves_output_unchanged() {
+        let items = [Extent { start: 3, blocks: 2 }];
+        let sentinel = Extent { start: 71, blocks: 72 };
+        let mut output = [sentinel];
+        assert_eq!(map_logical_span(&items, 10, 1, 2, &mut output),
+            Err(ExtentError::OutsideDevice));
+        assert_eq!(output, [sentinel]);
+    }
+}
