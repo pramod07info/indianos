@@ -10,15 +10,18 @@ use crate::batch5_session::{Identity,Session,SessionError};
 pub enum Error{State,Service(InitError),Session(SessionError)}
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 pub enum Phase{Cold,InitReady,DesktopReady,Degraded,Stopped}
+/// Bound graphical service crash restarts for each boot session.
+pub const MAX_DESKTOP_RESTARTS:u8=3;
 pub struct Bootstrap<const P:usize,const E:usize,const W:usize,const K:usize>{
  pub session:Session<P,E,W,K>,phase:Phase,init:Option<Identity>,
- desktop:Option<Identity>,
+ desktop:Option<Identity>,desktop_restarts:u8,
 }
 impl<const P:usize,const E:usize,const W:usize,const K:usize>
  Bootstrap<P,E,W,K>{
  pub const fn new()->Self{Self{session:Session::new(),
-  phase:Phase::Cold,init:None,desktop:None}}
+  phase:Phase::Cold,init:None,desktop:None,desktop_restarts:0}}
  pub fn phase(&self)->Phase{self.phase}
+ pub fn desktop_restart_count(&self)->u8{self.desktop_restarts}
  pub fn configure(&mut self,init_id:u16,desktop_id:u16)->Result<(),Error>{
   if self.phase!=Phase::Cold||init_id==0||desktop_id==init_id{
    return Err(Error::State);
@@ -67,6 +70,7 @@ impl<const P:usize,const E:usize,const W:usize,const K:usize>
  pub fn recover_desktop(&mut self,id:Identity,launch:Launch,
   settings:Settings)->Result<(),Error>{
   if self.phase!=Phase::Degraded||self.desktop.is_some()||
+     self.desktop_restarts>=MAX_DESKTOP_RESTARTS||
      self.init.is_none_or(|init|!self.session.owns(init)||init.pid==id.pid)||
      self.session.next_service().map_err(Error::Service)?.is_some(){
    return Err(Error::State);
@@ -79,6 +83,7 @@ impl<const P:usize,const E:usize,const W:usize,const K:usize>
   }
   self.session.stage(launch,settings).map_err(Error::Session)?;
   self.desktop=Some(id);
+  self.desktop_restarts+=1;
   self.phase=Phase::DesktopReady;
   Ok(())
  }
@@ -205,6 +210,38 @@ impl<const P:usize,const E:usize,const W:usize,const K:usize>
   b.recover_desktop(newer,launch(newer),settings()).unwrap();
   assert_eq!(b.recover_desktop(newer,launch(newer),settings()),
             Err(Error::State));
+ }
+
+
+ #[test]fn failing_desktop_restarts_are_bounded_per_boot_session(){
+  let mut b=Bootstrap::<3,3,3,3>::new();b.configure(10,20).unwrap();
+  b.start_init(id(1),launch(id(1)),settings(),10).unwrap();
+  b.start_desktop(id(2),launch(id(2)),settings(),20).unwrap();
+  for generation in 2..=4u64{
+   let old=Identity{pid:2,generation:generation-1};
+   b.process_exited(old).unwrap();
+   let now=Identity{pid:2,generation};
+   assert_eq!(b.recover_desktop(now,launch(now),settings()),Ok(()));
+   assert_eq!(b.desktop_restart_count(),(generation-1) as u8);
+  }
+  b.process_exited(Identity{pid:2,generation:4}).unwrap();
+  let fifth=Identity{pid:2,generation:5};
+  assert_eq!(b.recover_desktop(fifth,launch(fifth),settings()),Err(Error::State));
+  assert_eq!(b.phase(),Phase::Degraded);
+  assert!(!b.session.owns(fifth));
+  assert!(b.session.owns(id(1)));
+ }
+ #[test]fn failed_restart_does_not_consume_budget(){
+  let mut b=Bootstrap::<3,3,3,3>::new();b.configure(10,20).unwrap();
+  b.start_init(id(1),launch(id(1)),settings(),10).unwrap();
+  b.start_desktop(id(2),launch(id(2)),settings(),20).unwrap();
+  b.process_exited(id(2)).unwrap();
+  let new=Identity{pid:2,generation:2};
+  let mut bad=launch(new);bad.image.verified=false;
+  assert!(b.recover_desktop(new,bad,settings()).is_err());
+  assert_eq!(b.desktop_restart_count(),0);
+  b.recover_desktop(new,launch(new),settings()).unwrap();
+  assert_eq!(b.desktop_restart_count(),1);
  }
 
 }
