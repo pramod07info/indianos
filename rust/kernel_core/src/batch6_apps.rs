@@ -72,11 +72,19 @@ pub fn classify_batch(requests:&[Requested<'_>],host_arch:u16,
  }
  for request in requests{
   let _=classify(Requested{format:request.format,verified:request.verified,
-    bytes:request.bytes,mac:request.mac},host_arch)?;
+    bytes:request.bytes,mac:request.mac.as_ref().map(|m|batch4_macos_policy::App{
+     source_portable:m.source_portable,web_app:m.web_app,
+     remote_license:m.remote_license,authorized_host:m.authorized_host,
+     proprietary_frameworks:m.proprietary_frameworks
+    })},host_arch)?;
  }
  for (i,request) in requests.iter().enumerate(){
   out[i]=classify(Requested{format:request.format,verified:request.verified,
-    bytes:request.bytes,mac:request.mac},host_arch)?;
+    bytes:request.bytes,mac:request.mac.as_ref().map(|m|batch4_macos_policy::App{
+     source_portable:m.source_portable,web_app:m.web_app,
+     remote_license:m.remote_license,authorized_host:m.authorized_host,
+     proprietary_frameworks:m.proprietary_frameworks
+    })},host_arch)?;
  }
  Ok(requests.len())
 }
@@ -114,7 +122,7 @@ mod orbit_r005_compat_tests{
   let mut out=[Availability::RuntimeMissing;2];
   assert_eq!(classify_batch(&[first,bad],62,&mut out),Err(Error::Unverified));
   assert_eq!(out,[Availability::RuntimeMissing;2]);
-  assert_eq!(classify_batch(&[first],62,&mut out),Ok(1));
+  assert_eq!(classify_batch(&[Requested{format:Format::Native,verified:true,bytes:b"",mac:None}],62,&mut out),Ok(1));
   assert_eq!(out[0],Availability::Native);
  }
  #[test]fn unsupported_platforms_never_convert_into_native_execution(){
