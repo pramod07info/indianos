@@ -151,7 +151,7 @@ impl<const MAILBOXES: usize, const DEPTH: usize> IpcRouter<MAILBOXES, DEPTH> {
 /// All methods require scheduler-authenticated identities and serialized
 /// kernel access (not yet an SMP-safe live syscall implementation).
 use crate::batch5_session::Identity;
-#[derive(Clone,Copy)]
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
 pub struct TaggedMessage{
  sender:Identity,length:u8,bytes:[u8;MAX_PAYLOAD],
 }
