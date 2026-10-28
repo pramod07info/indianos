@@ -16,6 +16,9 @@ mod orbit_ui;
 pub mod orbit_session;
 /// Mobile/tablet screen and input geometry: no device hardware or ARM64 runtime.
 pub mod orbit_mobile;
+/// R018: 40 bounded developer workstation service operations in five tracks.
+/// Host tests and no_std compilation; not separate coding processes.
+pub mod workstation_r018;
 mod syscall;
 mod program;
 mod initramfs;
