@@ -592,3 +592,74 @@ mod consistent_admission_tests {
             Err(ExtentError::Capacity));
     }
 }
+
+
+// R007: filesystem allocation planning. Pure metadata: no block writes,
+// reservation or power-failure durability is implied.
+pub fn first_fit_extent(owners:&[&[Extent]],device_blocks:u64,
+    request_blocks:u64,max_existing_extents:usize)->Result<Option<Extent>,ExtentError>{
+    if request_blocks==0{return Err(ExtentError::Empty);}
+    if request_blocks>device_blocks{return Ok(None);}
+    let mut total=0usize;
+    for (i,owner) in owners.iter().enumerate(){
+        validate_extents(owner,device_blocks)?;
+        total=total.checked_add(owner.len()).ok_or(ExtentError::Capacity)?;
+        if total>max_existing_extents{return Err(ExtentError::Capacity);}
+        for range in *owner{
+            for earlier_owner in &owners[..i]{
+                for earlier in *earlier_owner{
+                    if range.start<earlier.start+earlier.blocks &&
+                       earlier.start<range.start+range.blocks{
+                        return Err(ExtentError::Overlap);
+                    }
+                }
+            }
+        }
+    }
+    let mut cursor=0u64;
+    loop{
+        let mut nearest=device_blocks;
+        let mut occupied_end=None;
+        for owner in owners{
+            for range in *owner{
+                let end=range.start+range.blocks;
+                if range.start<=cursor && cursor<end{
+                    occupied_end=Some(occupied_end.map_or(end,|v:u64|v.max(end)));
+                }else if range.start>cursor{
+                    nearest=nearest.min(range.start);
+                }
+            }
+        }
+        if let Some(end)=occupied_end{cursor=end;continue;}
+        let free=nearest-cursor;
+        if request_blocks<=free{
+            return Ok(Some(Extent{start:cursor,blocks:request_blocks}));
+        }
+        if nearest==device_blocks{return Ok(None);}
+        cursor=nearest;
+    }
+}
+#[cfg(test)] mod r007_allocator_tests{
+    use super::*;
+    #[test]fn allocates_first_gap_between_independent_owners(){
+        let a=[Extent{start:0,blocks:3},Extent{start:8,blocks:2}];
+        let b=[Extent{start:4,blocks:2}];
+        assert_eq!(first_fit_extent(&[&a,&b],12,2,3),Ok(Some(Extent{start:6,blocks:2})));
+        assert_eq!(first_fit_extent(&[&a,&b],12,3,3),Ok(None));
+        assert_eq!(first_fit_extent(&[],8,8,0),Ok(Some(Extent{start:0,blocks:8})));
+    }
+    #[test]fn rejects_cross_owner_alias_and_corrupt_input(){
+        let a=[Extent{start:1,blocks:5}];
+        let collision=[Extent{start:4,blocks:2}];
+        assert_eq!(first_fit_extent(&[&a,&collision],20,1,2),Err(ExtentError::Overlap));
+        assert_eq!(first_fit_extent(&[&[Extent{start:19,blocks:2}]],20,1,1),
+            Err(ExtentError::OutsideDevice));
+        assert_eq!(first_fit_extent(&[&a],20,1,0),Err(ExtentError::Capacity));
+    }
+    #[test]fn handles_invalid_empty_full_and_overflow_without_mutation(){
+        assert_eq!(first_fit_extent(&[],10,0,0),Err(ExtentError::Empty));
+        assert_eq!(first_fit_extent(&[],10,11,0),Ok(None));
+        assert_eq!(first_fit_extent(&[&[Extent{start:u64::MAX,blocks:2}]],
+            u64::MAX,1,1),Err(ExtentError::Overflow));
+    }
+}

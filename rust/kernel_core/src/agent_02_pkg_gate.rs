@@ -331,3 +331,67 @@ mod strict_anchor_tests {
         assert_eq!(check(&[a(8,42)]),Err(GuestPackageError::UntrustedKey));
     }
 }
+
+
+// R007: multi-party manifest endorsement; uses the separate, injected real
+// signature verifier and locally provisioned trust anchors. Test doubles
+// below are NOT cryptographic signing or verification implementations.
+#[derive(Clone,Copy)]
+pub struct ManifestVote{pub key_id:u32,pub signature:[u8;64]}
+pub fn verify_manifest_quorum<V:GuestSignatureVerifier>(
+    verifier:&V,anchors:&[TrustAnchor],votes:&[ManifestVote],quorum:usize,
+    manifest:&[u8],version:u64,arch:u16,host:u16,min_version:u64)
+    ->Result<usize,GuestPackageError>{
+    if quorum==0||quorum>anchors.len()||votes.len()<quorum||
+       votes.len()>anchors.len()||votes.len()>32{
+        return Err(GuestPackageError::Malformed);
+    }
+    for (i,vote) in votes.iter().enumerate(){
+        if vote.key_id==0||votes[..i].iter().any(|prior|prior.key_id==vote.key_id){
+            return Err(GuestPackageError::Malformed);
+        }
+        verify_guest_manifest(verifier,anchors,vote.key_id,manifest,
+            &vote.signature,version,arch,host,min_version)?;
+    }
+    Ok(votes.len())
+}
+#[cfg(test)]mod r007_quorum_tests{
+    use super::*;
+    struct TestOnlyVerifier;
+    impl GuestSignatureVerifier for TestOnlyVerifier{
+        fn verify(&self,key:&[u8;32],msg:&[u8],sig:&[u8;64])->bool{
+            msg==b"approved" && sig[0]==key[0]
+        }
+    }
+    fn roots()->[TrustAnchor;3]{
+        [TrustAnchor{id:7,ed25519_public_key:[7;32]},
+         TrustAnchor{id:8,ed25519_public_key:[8;32]},
+         TrustAnchor{id:9,ed25519_public_key:[9;32]}]
+    }
+    fn votes()->[ManifestVote;2]{
+        [ManifestVote{key_id:7,signature:[7;64]},
+         ManifestVote{key_id:8,signature:[8;64]}]
+    }
+    fn check(v:&[ManifestVote],q:usize,version:u64)
+       ->Result<usize,GuestPackageError>{
+        verify_manifest_quorum(&TestOnlyVerifier,&roots(),v,q,
+            b"approved",version,0x8664,0x8664,4)
+    }
+    #[test]fn distinct_real_verifier_callbacks_establish_quorum(){
+        assert_eq!(check(&votes(),2,4),Ok(2));
+        assert_eq!(check(&votes(),3,4),Err(GuestPackageError::Malformed));
+    }
+    #[test]fn duplicate_and_fake_votes_do_not_count(){
+        let v=votes();let mut duplicate=v;duplicate[1]=v[0];
+        assert_eq!(check(&duplicate,2,4),Err(GuestPackageError::Malformed));
+        let mut bad=v;bad[1].signature[0]=0;
+        assert_eq!(check(&bad,2,4),Err(GuestPackageError::Unsigned));
+    }
+    #[test]fn manifest_and_architecture_floor_are_mandatory(){
+        assert_eq!(check(&votes(),2,3),Err(GuestPackageError::Downgrade));
+        assert_eq!(check(&votes(),0,4),Err(GuestPackageError::Malformed));
+        assert_eq!(verify_manifest_quorum(&TestOnlyVerifier,&roots(),&votes(),2,
+            b"approved",4,0x1234,0x8664,4),
+            Err(GuestPackageError::WrongArchitecture));
+    }
+}
