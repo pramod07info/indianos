@@ -554,3 +554,58 @@ mod r013_cpu_fairness_tests{
   assert_eq!(q.validate_queues(),Ok(1));
  }
 }
+
+/// R014 all-or-nothing scheduler admission for groups of service workers.
+/// The caller supplies CPU masks authenticated by the process supervisor.
+impl<const C:usize,const N:usize> CoreRunQueues<C,N>{
+ pub fn enqueue_batch_affine(&mut self,
+  requests:&[(Runnable,u64)],placed:&mut[usize])->Result<usize,DispatchError>{
+  if requests.is_empty()||placed.len()<requests.len()||
+     requests.len()>C.saturating_mul(N){return Err(DispatchError::Full);}
+  let mut shadow=Self{queues:self.queues,length:self.length,cursor:self.cursor};
+  let mut targets=[0usize;64];
+  // Keep transient bookkeeping bounded and reject an unexpectedly
+  // oversized request without changing any scheduler queues.
+  if requests.len()>targets.len(){return Err(DispatchError::Full);}
+  for (i,&(task,mask)) in requests.iter().enumerate(){
+   targets[i]=shadow.enqueue_affine(task,mask)?;
+  }
+  self.queues=shadow.queues;self.length=shadow.length;self.cursor=shadow.cursor;
+  placed[..requests.len()].copy_from_slice(&targets[..requests.len()]);
+  Ok(requests.len())
+ }
+ pub fn queue_occupancy(&self,cpu:usize)->Result<(usize,usize),DispatchError>{
+  if cpu>=C{return Err(DispatchError::InvalidCpu);}
+  Ok((self.length[cpu],N.saturating_sub(self.length[cpu])))
+ }
+ pub fn contains_epoch(&self,pid:u32,generation:u64)->bool{
+  if pid==0||generation==0{return false;}
+  self.queues.iter().flatten().flatten().any(|t|
+   t.pid==pid&&t.generation==generation)
+ }
+}
+#[cfg(test)]
+mod r014_group_admission_tests{
+ use super::*;
+ fn t(pid:u32,gen:u64)->Runnable{Runnable{pid,generation:gen,priority:1}}
+ #[test]fn group_admission_distributes_workers_atomically(){
+  let mut q=CoreRunQueues::<2,2>::new();let mut cpus=[99;3];
+  assert_eq!(q.enqueue_batch_affine(&[
+    (t(1,1),3),(t(2,1),3),(t(3,1),3)],&mut cpus),Ok(3));
+  assert_eq!(q.total_runnable(),3);
+  assert_eq!(cpus,[0,1,0]);assert!(q.contains_epoch(3,1));
+ }
+ #[test]fn duplicate_in_second_batch_item_rolls_back_first(){
+  let mut q=CoreRunQueues::<2,2>::new();let mut cpus=[99;2];
+  assert_eq!(q.enqueue_batch_affine(&[(t(1,1),3),(t(1,1),3)],
+    &mut cpus),Err(DispatchError::Duplicate));
+  assert_eq!(q.total_runnable(),0);assert_eq!(cpus,[99;2]);
+ }
+ #[test]fn capacity_or_invalid_mask_keeps_existing_service(){
+  let mut q=CoreRunQueues::<1,1>::new();q.enqueue(0,t(4,1)).unwrap();
+  let mut cpus=[99;1];assert_eq!(q.enqueue_batch_affine(
+    &[(t(5,1),1)],&mut cpus),Err(DispatchError::Full));
+  assert_eq!(q.queue_occupancy(0),Ok((1,0)));
+  assert!(q.contains_epoch(4,1));assert!(!q.contains_epoch(5,1));
+ }
+}
