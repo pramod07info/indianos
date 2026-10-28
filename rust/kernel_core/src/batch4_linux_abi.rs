@@ -285,7 +285,9 @@ impl<const N:usize> FileDescriptors<N>{
    fd:u32,handle:u64,rights:u8)->Result<(),FdError>{
   if owner.pid==0||owner.generation==0||fd<3||handle==0||
      rights==0||rights&!(FD_READ|FD_WRITE)!=0{return Err(FdError::Invalid);}
-  if self.entries.iter().flatten().any(|e|e.owner==owner&&e.fd==fd){
+  // File descriptors cannot ambiguously refer to two generations of the
+  // same numeric PID. A trusted scheduler must retire the old generation.
+  if self.entries.iter().flatten().any(|e|e.owner.pid==owner.pid&&e.fd==fd){
    return Err(FdError::Duplicate);
   }
   let slot=self.entries.iter_mut().find(|s|s.is_none()).ok_or(FdError::Full)?;
@@ -521,5 +523,89 @@ mod r012_linux_close_range_tests{
   let mut out=[99u32;1];
   assert_eq!(f.owned_fds(id(2,1),&mut out),Err(FdError::Full));
   assert_eq!(out,[99]);
+ }
+}
+
+/// R013 verified ELF region set intended for a trusted ring3 loader.
+/// This validates the virtual memory plan; actual page table mappings,
+/// relocation and running foreign Linux binaries remain separate work.
+pub fn validate_exec_regions(regions:&[LoadRegion],entry:u64,
+ user_top:u64)->Result<usize,LoadError>{
+ if regions.is_empty()||regions.len()>MAX_LOAD_REGIONS||
+    entry<4096||entry>=user_top{return Err(LoadError::Entry);}
+ let mut executable=false;
+ for (i,region) in regions.iter().enumerate(){
+  let end=region.address.checked_add(region.memory_bytes)
+    .ok_or(LoadError::Unsafe)?;
+  if region.address<4096||region.memory_bytes==0||
+     region.file_bytes>region.memory_bytes||end>user_top||
+     region.flags&!7!=0||region.flags&3==3{
+   return Err(LoadError::Unsafe);
+  }
+  if region.flags&1!=0&&entry>=region.address&&entry<end{
+   executable=true;
+  }
+  for other in &regions[..i]{
+   let other_end=other.address.checked_add(other.memory_bytes)
+     .ok_or(LoadError::Unsafe)?;
+   if region.address<other_end&&other.address<end{
+    return Err(LoadError::Overlap);
+   }
+  }
+ }
+ if !executable{return Err(LoadError::Entry);}
+ Ok(regions.len())
+}
+/// POSIX-style dup2 with atomic replacement. Only the source process
+/// generation can overwrite its own existing file descriptor.
+impl<const N:usize> FileDescriptors<N>{
+ pub fn dup2_scoped(&mut self,owner:crate::batch5_session::Identity,
+   source:u32,target:u32,rights:u8)->Result<(),FdError>{
+  if owner.pid==0||owner.generation==0||target<3||
+     rights==0||rights&!(FD_READ|FD_WRITE)!=0{return Err(FdError::Invalid);}
+  let handle=self.resolve(owner,source,rights)?;
+  if source==target{return Ok(());}
+  let mut staged=Self{entries:self.entries};
+  if staged.entries.iter().flatten().any(|e|e.owner.pid==owner.pid&&
+    e.fd==target&&e.owner!=owner){
+   return Err(FdError::Denied);
+  }
+  if staged.entries.iter().flatten().any(|e|e.owner==owner&&e.fd==target){
+   staged.close(owner,target)?;
+  }
+  staged.attach(owner,target,handle,rights)?;
+  self.entries=staged.entries;Ok(())
+ }
+}
+#[cfg(test)]
+mod r013_linux_loader_tests{
+ use super::*;use crate::batch5_session::Identity;
+ fn id(g:u64)->Identity{Identity{pid:41,generation:g}}
+ fn region(start:u64,flags:u32)->LoadRegion{LoadRegion{
+  address:start,file_bytes:5,memory_bytes:4096,offset:0,flags}}
+ #[test]fn region_set_accepts_rx_and_rw_without_overlap(){
+  assert_eq!(validate_exec_regions(&[
+   region(0x1000,5),region(0x3000,6)],0x1000,0x8000),Ok(2));
+  assert_eq!(validate_exec_regions(&[
+   region(0x1000,5),region(0x2000,6)],0x1000,0x8000),Ok(2));
+ }
+ #[test]fn overlapping_or_wx_regions_fail_before_mapping(){
+  assert_eq!(validate_exec_regions(&[
+    region(0x1000,5),region(0x1800,6)],0x1000,0x8000),Err(LoadError::Overlap));
+  assert_eq!(validate_exec_regions(&[
+    region(0x1000,7)],0x1000,0x8000),Err(LoadError::Unsafe));
+  assert_eq!(validate_exec_regions(&[
+    region(0x1000,6)],0x1000,0x8000),Err(LoadError::Entry));
+ }
+ #[test]fn dup2_replaces_only_owner_fd_and_retains_other_epoch(){
+  let mut f=FileDescriptors::<3>::new();
+  f.attach(id(1),3,11,FD_READ).unwrap();
+  f.attach(id(1),4,22,FD_WRITE).unwrap();
+  assert_eq!(f.attach(id(2),4,33,FD_READ),Err(FdError::Duplicate));
+  f.attach(id(2),5,33,FD_READ).unwrap();
+  f.dup2_scoped(id(1),3,4,FD_READ).unwrap();
+  assert_eq!(f.resolve(id(1),4,FD_READ),Ok(11));
+  assert_eq!(f.resolve(id(2),5,FD_READ),Ok(33));
+  assert_eq!(f.dup2_scoped(id(2),5,3,FD_WRITE),Err(FdError::Denied));
  }
 }
