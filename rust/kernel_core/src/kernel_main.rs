@@ -126,6 +126,9 @@ pub extern "C" fn kmain()->!{
         need(crate::workstation_r023::agent_20::smoke().is_ok(),
              b"IndianOS: FATAL R023 real developer workstation guest acceptance\n\0");
         log(b"IndianOS: R023 real source terminal-test-release workflow PASSED\n\0");
+        need(crate::workstation_r024::agent_20::smoke().is_ok(),
+             b"IndianOS: FATAL R024 live file-manager-editor-terminal guest smoke\n\0");
+        log(b"IndianOS: R024 live file-manager-editor-terminal developer workstation PASSED\n\0");
     }
     unsafe{boot_draw_status();}
     #[cfg(feature="test-r029-userspace")]
