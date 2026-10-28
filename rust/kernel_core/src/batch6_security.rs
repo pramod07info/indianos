@@ -403,3 +403,54 @@ mod r006_security_journal_tests{
   assert_eq!(audit.validate(),Ok(()));
  }
 }
+
+ 
+/// R009 privileged capability rotation for process restarts. A restart
+/// inherits at most the old process rights and never extends expiration.
+/// Caller must provide kernel-authenticated old and new identities.
+impl<const N:usize> Access<N>{
+ pub fn rotate_process_grant(&mut self,old:Identity,new:Identity,
+   rights:u32,expires:u64,now:u64)->Result<(),Error>{
+  if old.pid==0||old.generation==0||new.pid==0||new.generation==0||
+     old==new||rights==0||rights&!ALL!=0||expires<=now{
+    return Err(Error::Invalid);
+  }
+  let index=self.grants.iter().position(|slot|
+    slot.is_some_and(|g|g.owner==old)).ok_or(Error::NotFound)?;
+  let grant=self.grants[index].ok_or(Error::NotFound)?;
+  if grant.revoked||now>=grant.expires{return Err(Error::Denied);}
+  if rights&grant.rights!=rights||expires>grant.expires{return Err(Error::Denied);}
+  if self.grants.iter().enumerate().any(|(i,s)|i!=index&&
+     s.is_some_and(|g|g.owner.pid==new.pid)){return Err(Error::Duplicate);}
+  self.grants[index]=Some(Grant{owner:new,rights,expires,revoked:false});
+  Ok(())
+ }
+}
+#[cfg(test)]
+mod r009_capability_rotation_tests{
+ use super::*;
+ fn ident(pid:u32,generation:u64)->Identity{Identity{pid,generation}}
+ #[test]fn restart_attenuates_and_rejects_stale_process(){
+  let mut a=Access::<2>::new();let old=ident(9,3);let fresh=ident(9,4);
+  a.grant(old,FILE_READ|FILE_WRITE,90).unwrap();
+  a.rotate_process_grant(old,fresh,FILE_READ,70,10).unwrap();
+  assert_eq!(a.require(old,FILE_READ,11),Err(Error::Denied));
+  assert_eq!(a.require(fresh,FILE_READ,11),Ok(()));
+  assert_eq!(a.require(fresh,FILE_WRITE,11),Err(Error::Denied));
+  assert_eq!(a.require(fresh,FILE_READ,70),Err(Error::Expired));
+ }
+ #[test]fn forbidden_escalation_has_no_side_effect(){
+  let mut a=Access::<1>::new();let old=ident(3,1);let fresh=ident(3,2);
+  a.grant(old,VIEW,30).unwrap();
+  assert_eq!(a.rotate_process_grant(old,fresh,FILE_WRITE,20,1),Err(Error::Denied));
+  assert_eq!(a.require(old,VIEW,2),Ok(()));
+  assert_eq!(a.rotate_process_grant(old,fresh,VIEW,31,1),Err(Error::Denied));
+  assert_eq!(a.require(old,VIEW,2),Ok(()));
+ }
+ #[test]fn foreign_pid_collision_is_rejected_before_rotation(){
+  let mut a=Access::<2>::new();let old=ident(4,1);let foreign=ident(5,1);
+  a.grant(old,VIEW,60).unwrap();a.grant(foreign,VIEW,60).unwrap();
+  assert_eq!(a.rotate_process_grant(old,ident(5,2),VIEW,30,1),Err(Error::Duplicate));
+  assert_eq!(a.require(old,VIEW,2),Ok(()));
+ }
+}
