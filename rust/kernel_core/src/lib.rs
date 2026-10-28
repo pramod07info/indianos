@@ -84,6 +84,9 @@ pub mod m1_persistent_desktop;
 /// R019: real durable source editor service, guarded by M1 auth and volume generations.
 #[cfg(feature="test-r031-vfs")]
 pub mod m1_disk_editor;
+/// R019 WS01/WS03: authenticated project tree over durable HierVfs.
+#[cfg(feature="test-r031-vfs")]
+pub mod m1_project_workspace;
 // M2 Developer Alpha integrated host-testable foundations. The guest must
 // wire actual network, signature-verifier, ELF loader and UI services later.
 #[cfg(feature="test-m2-developer-alpha")]
