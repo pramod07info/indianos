@@ -531,28 +531,6 @@ mod tests{
   assert_eq!(fs.generation(),before);
  }
 
-}
-
- 
-/// R009: bounded seek/read/persist abstraction for authenticated file
-/// services. Exposes existing atomic COW range operations while ensuring
-/// no successful prefix is falsely reported on a short verified read.
-impl<D:BlockDevice> HierVfs<D>{
- pub fn read_exact_range(&mut self,path:&str,offset:u64,
-   output:&mut[u8])->Result<(),FsError>{
-  if output.is_empty()||output.len()>MAX_TRANSFER{return Err(FsError::TooLarge);}
-  let mut staged=[0u8;MAX_TRANSFER];
-  let size=self.read_at(path,offset,&mut staged[..output.len()])?;
-  if size!=output.len(){return Err(FsError::TooLarge);}
-  output.copy_from_slice(&staged[..size]);Ok(())
- }
- pub fn overwrite_chunk(&mut self,path:&str,offset:u64,
-   expected_generation:u64,chunk:&[u8])->Result<(usize,u64),FsError>{
-  if self.generation()!=expected_generation{return Err(FsError::InvalidVolume);}
-  let n=self.write_at(path,offset,chunk)?;
-  Ok((n,self.generation()))
- }
-
  #[test]fn r009_copy_dispatch_persists_and_replaces_complete_files(){
   let mut v=fresh();
   v.mkdir("/home").unwrap();
@@ -587,4 +565,25 @@ impl<D:BlockDevice> HierVfs<D>{
   assert_eq!(v.read("/home/note",&mut out),Ok(5));
   assert_eq!(&out[..5],b"okllo");
  }
+}
+
+/// R009: bounded seek/read/persist abstraction for authenticated file
+/// services. Exposes existing atomic COW range operations while ensuring
+/// no successful prefix is falsely reported on a short verified read.
+impl<D:BlockDevice> HierVfs<D>{
+ pub fn read_exact_range(&mut self,path:&str,offset:u64,
+   output:&mut[u8])->Result<(),FsError>{
+  if output.is_empty()||output.len()>MAX_TRANSFER{return Err(FsError::TooLarge);}
+  let mut staged=[0u8;MAX_TRANSFER];
+  let size=self.read_at(path,offset,&mut staged[..output.len()])?;
+  if size!=output.len(){return Err(FsError::TooLarge);}
+  output.copy_from_slice(&staged[..size]);Ok(())
+ }
+ pub fn overwrite_chunk(&mut self,path:&str,offset:u64,
+   expected_generation:u64,chunk:&[u8])->Result<(usize,u64),FsError>{
+  if self.generation()!=expected_generation{return Err(FsError::InvalidVolume);}
+  let n=self.write_at(path,offset,chunk)?;
+  Ok((n,self.generation()))
+ }
+
 }
