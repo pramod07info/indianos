@@ -122,3 +122,84 @@ pub fn bounded_workspace_smoke()->bool{
   assert!(core::mem::size_of::<RamFs<1>>()>=2048);
  }
 }
+
+
+/// R012: bounded session persistence handshake for the interactive workspace.
+/// The trusted storage service must persist exported bytes to a durable COW
+/// block volume. This method does not claim RAM survives a reboot.
+impl<const P:usize,const E:usize,const W:usize,const K:usize,
+ const F:usize,const G:usize,const Q:usize> Workspace<P,E,W,K,F,G,Q>{
+ pub fn export_files(&self,caller:Identity,now:u64,out:&mut[u8])
+  ->Result<usize,Error>{
+  self.require(caller,now)?;
+  self.access.require(caller,FILE_READ,now).map_err(Error::Auth)?;
+  self.disk.export_snapshot(out).map_err(|_|Error::Terminal(TerminalError::Io))
+ }
+ /// Atomically replace RAM file state only after checksum and generation
+ /// validation; no partial file tree is published for corrupted backups.
+ pub fn restore_files(&mut self,caller:Identity,now:u64,backup:&[u8])
+  ->Result<(),Error>{
+  self.require(caller,now)?;
+  self.access.require(caller,FILE_WRITE,now).map_err(Error::Auth)?;
+  self.disk.import_snapshot(backup)
+    .map_err(|_|Error::Terminal(TerminalError::Io))
+ }
+ /// Execute a complete physical keyboard line through the actual Terminal
+ /// buffer, rather than bypassing the authenticated input path.
+ pub fn type_and_submit(&mut self,caller:Identity,now:u64,
+  line:&[u8],out:&mut[u8])->Result<usize,Error>{
+  self.require(caller,now)?;
+  if line.is_empty()||line.len()>crate::batch7_terminal::COMMAND_MAX||
+     line.iter().any(|b|*b!=b' '&&!b.is_ascii_graphic()){
+   return Err(Error::Terminal(TerminalError::Invalid));
+  }
+  let mut typed=Terminal::new();
+  for &ch in line{typed.type_byte(ch).map_err(Error::Terminal)?;}
+  self.terminal=typed;
+  self.submit(caller,now,out)
+ }
+}
+#[cfg(test)]
+mod r012_workspace_restore_tests{
+ use super::*;
+ use crate::batch2_launcher::Image;
+ use crate::batch2_settings::Theme;
+ fn id(pid:u32)->Identity{Identity{pid,generation:1}}
+ fn ready()->Workspace<3,3,2,2,3,2,8>{
+  let mut w=Workspace::new();
+  let image=|pid|Launch{pid,generation:1,image:Image{
+   image_id:pid,entry:0x1000,mapped_end:0x2000,verified:true}};
+  w.initialize(id(1),image(1),id(2),image(2),
+    Settings{theme:Theme::Dark,pointer_speed:5,key_repeat:10},50,100).unwrap();
+  w
+ }
+ #[test]fn terminal_ui_file_state_round_trips_through_verified_snapshot(){
+  let mut w=ready();let mut out=[0u8;OUTPUT_MAX];
+  assert_eq!(w.type_and_submit(id(2),1,b"write /note hello",&mut out),Ok(5));
+  let mut snapshot=[0u8;512];
+  let n=w.export_files(id(2),1,&mut snapshot).unwrap();
+  w.execute(id(2),1,b"write /note changed",&mut out).unwrap();
+  w.restore_files(id(2),1,&snapshot[..n]).unwrap();
+  assert_eq!(w.execute(id(2),1,b"cat /note",&mut out),Ok(5));
+  assert_eq!(&out[..5],b"hello");
+ }
+ #[test]fn corrupted_backup_and foreign_generation_fail_without_mutation(){
+  let mut w=ready();let mut out=[0u8;OUTPUT_MAX];
+  w.execute(id(2),1,b"write /note safe",&mut out).unwrap();
+  let mut snapshot=[0u8;512];
+  let n=w.export_files(id(2),1,&mut snapshot).unwrap();
+  snapshot[15]^=1;
+  assert!(w.restore_files(id(2),1,&snapshot[..n]).is_err());
+  assert_eq!(w.execute(id(2),1,b"cat /note",&mut out),Ok(4));
+  assert_eq!(&out[..4],b"safe");
+  let stale=Identity{generation:2,..id(2)};
+  assert!(w.export_files(stale,1,&mut snapshot).is_err());
+  assert!(w.restore_files(stale,1,&snapshot[..n]).is_err());
+ }
+ #[test]fn invalid_keyboard_line_cannot_change_file_or_frame_queue(){
+  let mut w=ready();let mut out=[0xccu8;OUTPUT_MAX];
+  assert!(w.type_and_submit(id(2),1,b"write /note\nhi",&mut out).is_err());
+  assert_eq!(w.disk.count(),0);
+  assert_eq!(out,[0xcc;OUTPUT_MAX]);
+ }
+}
