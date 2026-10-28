@@ -907,3 +907,79 @@ mod r013_fair_frames_tests{
   assert_eq!(q.present_fair(None,&mut[blank()]).unwrap().0,2);
  }
 }
+
+/// R014 compositor-level bounded dirty rectangle coalescing, preserving
+/// the original frame epoch while combining adjacent app updates.
+impl<const N:usize> DamageQueue<N>{
+ pub fn combine_window_damage(&mut self,owner:u32,window:u32)
+   ->Result<usize,Error>{
+  if owner==0||window==0{return Err(Error::Invalid);}
+  let mut count=0;let mut minx=u32::MAX;let mut miny=u32::MAX;
+  let mut maxx=0u32;let mut maxy=0u32;let mut epoch=0u64;
+  for event in self.entries[..self.len].iter().flatten(){
+   if event.owner==owner&&event.window==window{
+    count+=1;minx=minx.min(event.x);miny=miny.min(event.y);
+    maxx=maxx.max(event.x.checked_add(event.width).ok_or(Error::Invalid)?);
+    maxy=maxy.max(event.y.checked_add(event.height).ok_or(Error::Invalid)?);
+    epoch=if epoch==0{event.epoch}else{epoch.min(event.epoch)};
+   }
+  }
+  if count<2{return Ok(0);}
+  let combined=FrameDamage{owner,window,epoch,x:minx,y:miny,
+    width:maxx-minx,height:maxy-miny};
+  let mut remaining=[None;N];let mut len=0;let mut inserted=false;
+  for event in self.entries[..self.len].iter().flatten(){
+   if event.owner==owner&&event.window==window{
+    if !inserted{remaining[len]=Some(combined);len+=1;inserted=true;}
+   }else{remaining[len]=Some(*event);len+=1;}
+  }
+  self.entries=remaining;self.len=len;Ok(count-1)
+ }
+ pub fn oldest_frame(&self)->Option<FrameDamage>{
+  self.entries[..self.len].iter().flatten().min_by_key(|e|e.epoch).copied()
+ }
+ pub fn discard_window(&mut self,owner:u32,window:u32)->usize{
+  let mut kept=[None;N];let mut used=0;
+  for item in self.entries[..self.len].iter().flatten(){
+   if item.owner!=owner||item.window!=window{
+    kept[used]=Some(*item);used+=1;
+   }
+  }
+  let removed=self.len-used;self.entries=kept;self.len=used;removed
+ }
+}
+#[cfg(test)]
+mod r014_compositor_coalesce_tests{
+ use super::*;use crate::agent_05_surface_rect::Rectangle;
+ fn layout()->SurfaceLayout<3>{
+  let mut l=SurfaceLayout::new();
+  l.grant(3,10,Rectangle{x:0,y:0,width:80,height:80}).unwrap();
+  l.grant(4,20,Rectangle{x:0,y:0,width:80,height:80}).unwrap();l
+ }
+ fn blank()->FrameDamage{FrameDamage{owner:0,window:0,epoch:0,
+  x:0,y:0,width:0,height:0}}
+ #[test]fn merges_repeated_window_damage_and_preserves_peer_frames(){
+  let l=layout();let mut q=DamageQueue::<4>::new();
+  q.submit(&l,3,&[(10,1,2,3,4)]).unwrap();
+  q.submit(&l,4,&[(20,1,1,2,2)]).unwrap();
+  q.submit(&l,3,&[(10,10,11,4,5)]).unwrap();
+  assert_eq!(q.combine_window_damage(3,10),Ok(1));
+  assert_eq!(q.pending(),2);assert_eq!(q.oldest_frame().unwrap().owner,3);
+  let mut out=[blank();2];assert_eq!(q.drain(&mut out),Ok(2));
+  assert_eq!((out[0].x,out[0].y,out[0].width,out[0].height),(1,2,13,14));
+  assert_eq!(out[1].owner,4);
+ }
+ #[test]fn wrong_owner_and_missing_window_have_no_side_effects(){
+  let l=layout();let mut q=DamageQueue::<2>::new();
+  q.submit(&l,3,&[(10,1,1,2,2)]).unwrap();
+  assert_eq!(q.combine_window_damage(4,10),Ok(0));
+  assert_eq!(q.discard_window(4,10),0);assert_eq!(q.pending(),1);
+ }
+ #[test]fn window_close_disposes_only_owner_local_damage(){
+  let l=layout();let mut q=DamageQueue::<2>::new();
+  q.submit(&l,3,&[(10,1,1,2,2)]).unwrap();
+  q.submit(&l,4,&[(20,1,1,2,2)]).unwrap();
+  assert_eq!(q.discard_window(3,10),1);assert_eq!(q.pending(),1);
+  assert_eq!(q.oldest_frame().unwrap().owner,4);
+ }
+}
