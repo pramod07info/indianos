@@ -273,3 +273,109 @@ pub fn plan_multi_roots(items:&[Dependency<'_>],roots:&[u16],
             true,&mut [0;2]),Err(PlanError::Duplicate));
     }
 }
+
+
+// R008: app set transaction with dependency-safe removal and rollback of
+// policy state. Real signed content storage, ELF loader and ABI stay separate.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum AppLedgerFault{Invalid,Full,Missing,Duplicate,RequiredDependency,Policy(PlanError)}
+#[derive(Clone,Copy)]
+pub struct AppLedger<const N:usize>{ids:[Option<u16>;N]}
+impl<const N:usize> AppLedger<N>{
+ pub const fn new()->Self{Self{ids:[None;N]}}
+ pub fn count(&self)->usize{self.ids.iter().flatten().count()}
+ pub fn contains(&self,id:u16)->bool{
+  self.ids.iter().flatten().any(|v|*v==id)
+ }
+ pub fn add(&mut self,id:u16)->Result<(),AppLedgerFault>{
+  if id==0{return Err(AppLedgerFault::Invalid)}
+  if self.contains(id){return Err(AppLedgerFault::Duplicate)}
+  let slot=self.ids.iter_mut().find(|v|v.is_none()).ok_or(AppLedgerFault::Full)?;
+  *slot=Some(id);Ok(())
+ }
+ pub fn install_roots(&mut self,items:&[Dependency<'_>],roots:&[u16],
+  host:Architecture,granted:u32,consent:bool)->Result<usize,AppLedgerFault>{
+  let mut plan=[0u16;MAX_DEPENDENCY_NODES];
+  let ordered=plan_multi_roots(items,roots,host,granted,consent,&mut plan)
+   .map_err(AppLedgerFault::Policy)?;
+  let mut candidate=*self;
+  let mut inserted=0usize;
+  for &id in &plan[..ordered.count]{
+   if !candidate.contains(id){candidate.add(id)?;inserted+=1}
+  }
+  *self=candidate;Ok(inserted)
+ }
+ pub fn uninstall(&mut self,id:u16,items:&[Dependency<'_>])
+  ->Result<(),AppLedgerFault>{
+  if !self.contains(id){return Err(AppLedgerFault::Missing)}
+  // Fail closed if any other installed app transitively requires the target.
+  for installed in self.ids.iter().flatten(){
+   if *installed==id{continue}
+   let mut stack=[0u16;MAX_DEPENDENCY_NODES];
+   let mut used=0usize;
+   stack[0]=*installed;used=1;
+   let mut visited=[0u16;MAX_DEPENDENCY_NODES];
+   let mut seen=0usize;
+   while used>0{
+    used-=1;let current=stack[used];
+    if visited[..seen].contains(&current){continue}
+    if seen>=MAX_DEPENDENCY_NODES{return Err(AppLedgerFault::Invalid)}
+    visited[seen]=current;seen+=1;
+    let node=items.iter().find(|n|n.id==current).ok_or(AppLedgerFault::Missing)?;
+    for &dependency in node.dependencies{
+     if dependency==id{return Err(AppLedgerFault::RequiredDependency)}
+     if !visited[..seen].contains(&dependency){
+      if used>=MAX_DEPENDENCY_NODES{return Err(AppLedgerFault::Invalid)}
+      stack[used]=dependency;used+=1
+     }
+    }
+   }
+  }
+  let slot=self.ids.iter_mut().find(|v|v.is_some_and(|x|x==id))
+   .ok_or(AppLedgerFault::Missing)?;
+  *slot=None;Ok(())
+ }
+ pub fn snapshot(&self,out:&mut[u16])->Result<usize,AppLedgerFault>{
+  if out.len()<self.count(){return Err(AppLedgerFault::Full)}
+  let mut cursor=0;
+  for id in self.ids.iter().flatten(){out[cursor]=*id;cursor+=1}
+  Ok(cursor)
+ }
+}
+#[cfg(test)]mod r008_app_transactions_tests{
+ use super::*;
+ fn c(permissions:u32)->Candidate{
+  Candidate{catalog_trusted:true,manifest_signed:true,
+   architecture:Architecture::X86_64,requested_permissions:permissions}
+ }
+ #[test]fn installs_shared_dependencies_only_once(){
+  let nodes=[
+   Dependency{id:1,dependencies:&[3],candidate:c(1)},
+   Dependency{id:2,dependencies:&[3],candidate:c(2)},
+   Dependency{id:3,dependencies:&[],candidate:c(4)}];
+  let mut l=AppLedger::<3>::new();
+  assert_eq!(l.install_roots(&nodes,&[1,2],Architecture::X86_64,7,true),Ok(3));
+  assert_eq!(l.count(),3);
+  assert_eq!(l.uninstall(3,&nodes),Err(AppLedgerFault::RequiredDependency));
+  l.uninstall(1,&nodes).unwrap();
+  assert_eq!(l.uninstall(3,&nodes),Err(AppLedgerFault::RequiredDependency));
+  l.uninstall(2,&nodes).unwrap();l.uninstall(3,&nodes).unwrap();
+  assert_eq!(l.count(),0);
+ }
+ #[test]fn capacity_failure_never_partially_installs(){
+  let nodes=[
+   Dependency{id:1,dependencies:&[2],candidate:c(1)},
+   Dependency{id:2,dependencies:&[],candidate:c(2)}];
+  let mut l=AppLedger::<1>::new();
+  assert_eq!(l.install_roots(&nodes,&[1],Architecture::X86_64,3,true),
+   Err(AppLedgerFault::Full));
+  assert_eq!(l.count(),0);
+ }
+ #[test]fn unsigned_app_or_missing_permission_fails_closed(){
+  let items=[Dependency{id:1,dependencies:&[],candidate:c(4)}];
+  let mut l=AppLedger::<2>::new();
+  assert!(l.install_roots(&items,&[1],Architecture::X86_64,1,true).is_err());
+  assert!(l.install_roots(&items,&[1],Architecture::X86_64,7,false).is_err());
+  assert_eq!(l.count(),0);
+ }
+}
