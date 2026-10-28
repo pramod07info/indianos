@@ -588,3 +588,68 @@ mod r009_gpu_damage_tests{
   ],&mut out),Err(Error::Dimensions));
  }
 }
+
+ 
+/// R010 display backing *metadata* preflight. A native GPU worker must also
+/// prove DMA pinning, IOMMU ownership and device isolation before calling
+/// paint; arithmetic validity alone is not a DMA authorization.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct BackingPlan{
+ pub physical:u64,pub allocated_bytes:u32,pub stride_bytes:u32,
+ pub visible_bytes:u32,
+}
+pub fn validate_backing_plan(display:Scanout,physical:u64,allocated:u32,
+  stride:u32)->Result<BackingPlan,Error>{
+ if display.width==0||display.height==0||
+   display.width>MAX_WIDTH||display.height>MAX_HEIGHT||
+   display.scanout>=16||physical==0||physical&4095!=0||
+   allocated==0||allocated>4*1024*1024{return Err(Error::Dimensions);}
+ let row=display.width.checked_mul(4).ok_or(Error::Dimensions)?;
+ if stride<row||stride&3!=0{return Err(Error::Dimensions);}
+ let visible=u64::from(display.height-1).checked_mul(u64::from(stride))
+   .and_then(|x|x.checked_add(u64::from(row))).ok_or(Error::Dimensions)?;
+ if visible>u64::from(allocated)||
+    physical.checked_add(u64::from(allocated)).is_none(){
+   return Err(Error::Dimensions);
+ }
+ Ok(BackingPlan{physical,allocated_bytes:allocated,
+    stride_bytes:stride,visible_bytes:visible as u32})
+}
+impl<T:ControlTransport> Protocol<T>{
+ /// The existing virtio-gpu 2D protocol accepts only tightly packed scanout
+ /// backing. An independent DMA ownership check is still mandatory.
+ pub fn paint_tightly_packed(&mut self,display:Scanout,resource:u32,
+   backing:BackingPlan)->Result<(),Error>{
+  let stride=display.width.checked_mul(4).ok_or(Error::Dimensions)?;
+  let checked=validate_backing_plan(display,backing.physical,
+    backing.allocated_bytes,backing.stride_bytes)?;
+  if checked.stride_bytes!=stride{return Err(Error::Unsupported);}
+  self.paint(display,resource,checked.physical,checked.allocated_bytes)
+ }
+}
+#[cfg(test)]
+mod r010_gpu_backing_tests{
+ use super::*;
+ fn screen()->Scanout{Scanout{width:800,height:600,scanout:0}}
+ #[test]fn strict_scanout_memory_layout_is_bounded(){
+  let bytes=800*600*4;
+  assert_eq!(validate_backing_plan(screen(),0x200000,bytes,3200),
+    Ok(BackingPlan{physical:0x200000,allocated_bytes:bytes,
+      stride_bytes:3200,visible_bytes:bytes}));
+ }
+ #[test]fn rejects_unaligned_physical_and_short_surface(){
+  assert_eq!(validate_backing_plan(screen(),0x200001,800*600*4,3200),
+    Err(Error::Dimensions));
+  assert_eq!(validate_backing_plan(screen(),0x200000,800,3200),
+    Err(Error::Dimensions));
+  assert_eq!(validate_backing_plan(screen(),0x200000,800*600*4,3199),
+    Err(Error::Dimensions));
+ }
+ #[test]fn validates_padded_stride_without_claiming_native_dma(){
+  let plan=validate_backing_plan(screen(),0x200000,2048*1024,3264).unwrap();
+  assert_eq!(plan.stride_bytes,3264);
+  assert!(plan.visible_bytes>800*600*4);
+  assert_eq!(validate_backing_plan(screen(),u64::MAX-4095,0x2000,3200),
+    Err(Error::Dimensions));
+ }
+}
