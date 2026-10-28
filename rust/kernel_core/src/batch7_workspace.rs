@@ -292,13 +292,13 @@ impl<const P:usize,const E:usize,const W:usize,const K:usize,
  pub fn execute_script_visible(&mut self,caller:Identity,now:u64,
    commands:&[&[u8]],snapshot:&mut[u8],output:&mut[u8])
    ->Result<usize,Error>{
+  if output.len()<OUTPUT_MAX{return Err(Error::Terminal(TerminalError::Io));}
   let mut staged=[0u8;OUTPUT_MAX];
   let n=self.execute_script_atomic(caller,now,commands,snapshot,&mut staged)?;
   if n>output.len(){return Err(Error::Terminal(TerminalError::Io));}
   output[..n].copy_from_slice(&staged[..n]);
   Ok(n)
  }
- pub fn has_pending_frame(&self)->bool{self.frames.pending()>0}
  pub fn current_desktop(&self)->Option<Identity>{self.desktop}
 }
 #[cfg(test)]
@@ -318,14 +318,14 @@ mod r014_visible_script_tests{
   let n=w.execute_script_visible(id(2),1,
     &[b"write /x value",b"cat /x"],&mut snap,&mut out).unwrap();
   assert_eq!(n,5);assert_eq!(&out[..n],b"value");
-  assert!(w.has_pending_frame());assert_eq!(w.current_desktop(),Some(id(2)));
+  assert!(w.next_frame().is_ok());assert_eq!(w.current_desktop(),Some(id(2)));
  }
  #[test]fn invalid_second_command_never_shows_partial_terminal_output(){
   let mut w=ready();let mut snap=[0;512];let mut out=[0xcc;OUTPUT_MAX];
   assert!(w.execute_script_visible(id(2),1,
     &[b"write /x value",b"cat /unknown"],&mut snap,&mut out).is_err());
   assert_eq!(out,[0xcc;OUTPUT_MAX]);assert_eq!(w.disk.count(),0);
-  assert!(!w.has_pending_frame());
+  assert!(w.next_frame().is_err());
  }
  #[test]fn wrong_generation_cannot_observe_or_mutate_desktop(){
   let mut w=ready();let mut snap=[0;512];let mut out=[0xcc;OUTPUT_MAX];
