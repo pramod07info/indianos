@@ -166,10 +166,10 @@ pub fn classify_workstation_batch(input:&[Requested<'_>],host_arch:u16,
  if input.is_empty()||output.len()<input.len(){return Err(Error::UnknownFormat);}
  let mut stage=[WorkstationLaunch::RebuildRequired;16];
  if input.len()>stage.len(){return Err(Error::UnknownFormat);}
+ let mut available=[Availability::RuntimeMissing;16];
+ classify_batch(input,host_arch,&mut available[..input.len()])?;
  for (i,request) in input.iter().enumerate(){
-  let available=classify(Requested{format:request.format,
-    verified:request.verified,bytes:request.bytes,mac:request.mac},host_arch)?;
-  stage[i]=workstation_launch_plan(available,consent,request.verified)
+  stage[i]=workstation_launch_plan(available[i],consent,request.verified)
     .map_err(|_|Error::Unverified)?;
  }
  output[..input.len()].copy_from_slice(&stage[..input.len()]);
