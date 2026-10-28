@@ -849,3 +849,44 @@ impl<const N:usize> Access<N>{
  }
 }
 
+
+
+/// R017 developer-workstation capability summaries are derived from the
+/// live grant, never from user-supplied role labels or cached login state.
+impl<const N:usize> Access<N>{
+ pub fn workstation_rights(&self,owner:Identity,now:u64)->u32{
+  self.permitted_mask_at(owner,now)&(VIEW|FILE_READ|FILE_WRITE|SOCKET)
+ }
+ pub fn verify_project_rights<const L:usize>(&self,
+  audit:&mut SecurityAudit<L>,owner:Identity,now:u64,
+  needs_network:bool)->Result<(),AuditError>{
+  let mut needed=[FILE_READ,FILE_WRITE,0];
+  let count=if needs_network{needed[2]=SOCKET;3}else{2};
+  self.require_batch_audited(audit,owner,now,&needed[..count])?;
+  Ok(())
+ }
+}
+#[cfg(test)]mod r017_project_security_tests{
+ use super::*;fn id(g:u64)->Identity{Identity{pid:71,generation:g}}
+ #[test]fn editor_grants_do_not_implicitly_include_network(){
+  let mut grants=Access::<1>::new();let mut log=SecurityAudit::<6>::new();
+  grants.grant(id(1),VIEW|FILE_READ|FILE_WRITE,100).unwrap();
+  assert_eq!(grants.verify_project_rights(&mut log,id(1),1,false),Ok(()));
+  assert_eq!(grants.workstation_rights(id(1),1),VIEW|FILE_READ|FILE_WRITE);
+  assert_eq!(log.validate(),Ok(()));
+ }
+ #[test]fn unavailable_network_permission_is_logged_and_denied(){
+  let mut grants=Access::<1>::new();let mut log=SecurityAudit::<4>::new();
+  grants.grant(id(1),VIEW|FILE_READ|FILE_WRITE,100).unwrap();
+  assert_eq!(grants.verify_project_rights(&mut log,id(1),1,true),
+    Err(AuditError::Denied));
+  assert_eq!(log.remaining(),1);assert_eq!(log.validate(),Ok(()));
+ }
+ #[test]fn expired_and_recycled_pid_never_expose_rights(){
+  let mut grants=Access::<1>::new();let mut log=SecurityAudit::<4>::new();
+  grants.grant(id(1),VIEW|FILE_READ|FILE_WRITE,2).unwrap();
+  assert_eq!(grants.workstation_rights(id(1),2),0);
+  assert_eq!(grants.workstation_rights(id(2),1),0);
+  assert!(grants.verify_project_rights(&mut log,id(2),1,false).is_err());
+ }
+}
