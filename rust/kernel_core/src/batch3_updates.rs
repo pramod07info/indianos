@@ -475,3 +475,68 @@ mod r012_slot_metadata_tests{
   assert_eq!(decode_slot_record(&bytes),Ok((BootSlot::B,1000,Some((BootSlot::A,24)))));
  }
 }
+
+/// R013 fail-closed A/B recovery. A checksum alone cannot reauthenticate
+/// the staged OS bytes after reboot: pending images require fresh signature
+/// and digest verification by the trusted updater before they may be booted.
+impl SlotTransaction{
+ pub fn boot_record(&self)->Result<[u8;SLOT_RECORD_BYTES],UpdateError>{
+  if self.anti_rollback==0{return Err(UpdateError::Invalid);}
+  let pending=self.pending.map(|(slot,candidate,_)|(slot,candidate.image_id));
+  Ok(encode_slot_record(self.active,self.anti_rollback,pending))
+ }
+ pub fn recovered_from_record(bytes:&[u8],minimum_version:u64)
+   ->Result<Self,UpdateError>{
+  let (active,version,_unverified_pending)=decode_slot_record(bytes)?;
+  if version<minimum_version{return Err(UpdateError::Downgrade);}
+  // Never revive unverified boot attempts from a checksum-only record.
+  Ok(Self::new(active,version))
+ }
+ pub fn recover_expired(&mut self,now:u64)->bool{
+  let expired=self.pending.is_some_and(|(_,_,deadline)|
+    now>deadline||self.attempts_left==0);
+  if expired{self.fallback();}
+  expired
+ }
+ pub fn trusted_boot_image(&self,now:u64)->Option<u32>{
+  self.pending.and_then(|(_,candidate,deadline)|
+   if now<=deadline&&self.attempts_left>0&&candidate.verified_signature&&
+      candidate.payload_digest_verified{Some(candidate.image_id)}
+   else{None})
+ }
+}
+#[cfg(test)]
+mod r013_ota_recovery_tests{
+ use super::*;
+ fn image(version:u64)->Candidate{Candidate{image_id:44,version,
+   verified_signature:true,payload_digest_verified:true,target_arch:62}}
+ #[test]fn reboot_never_automatically_executes_unverified_pending_slot(){
+  let mut tx=SlotTransaction::new(BootSlot::A,10);
+  tx.stage(BootSlot::B,image(11),true,100,2).unwrap();
+  let record=tx.boot_record().unwrap();
+  assert_eq!(decode_slot_record(&record),
+    Ok((BootSlot::A,10,Some((BootSlot::B,44)))));
+  let recovered=SlotTransaction::recovered_from_record(&record,10).unwrap();
+  assert_eq!(recovered.active(),BootSlot::A);
+  assert!(!recovered.pending());
+  assert_eq!(recovered.trusted_boot_image(10),None);
+ }
+ #[test]fn recovery_fences_downgrades_and_detects_corrupt_metadata(){
+  let tx=SlotTransaction::new(BootSlot::B,20);
+  let record=tx.boot_record().unwrap();
+  assert!(matches!(SlotTransaction::recovered_from_record(&record,21),
+    Err(UpdateError::Downgrade)));
+  let mut bad=record;bad[8]^=1;
+  assert!(matches!(SlotTransaction::recovered_from_record(&bad,10),
+    Err(UpdateError::Untrusted)));
+ }
+ #[test]fn deadline_and_exhausted_attempts_keep_existing_boot_slot(){
+  let mut tx=SlotTransaction::new(BootSlot::A,10);
+  tx.stage(BootSlot::B,image(11),true,100,1).unwrap();
+  assert_eq!(tx.trusted_boot_image(99),Some(44));
+  tx.boot_attempt(90).unwrap();
+  assert!(tx.recover_expired(91));
+  assert_eq!(tx.active(),BootSlot::A);
+  assert!(!tx.pending());
+ }
+}
