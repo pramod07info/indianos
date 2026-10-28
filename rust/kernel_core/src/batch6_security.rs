@@ -265,3 +265,141 @@ mod orbit_r005_kernel_access_tests{
   assert_eq!(a.authorize_many(&[(user(),VIEW),(user(),FILE_READ)],1),Ok(2));
  }
 }
+
+
+/// R006 bounded security decision journal. Checksum detects accidental
+/// corruption only; persistent tamper-evident audit trails require trusted
+/// storage, authentication and an independently reviewed MAC/signature.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum AuditKind{Allowed,Denied,Incident}
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct AuditEvent{
+ pub owner:Identity,pub requested:u32,pub time:u64,
+ pub kind:AuditKind,pub serial:u64,pub checksum:u32,
+}
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum AuditError{Full,Invalid,Corrupt,Denied}
+pub struct SecurityAudit<const N:usize>{
+ entries:[Option<AuditEvent>;N],used:usize,next:u64,chain:u32,
+}
+fn mix_audit(mut value:u32,bytes:&[u8])->u32{
+ for &b in bytes{value=(value^(b as u32)).wrapping_mul(0x01000193);}
+ value
+}
+fn event_hash(seed:u32,event:AuditEvent)->u32{
+ let h=mix_audit(seed,&event.owner.pid.to_le_bytes());
+ let h=mix_audit(h,&event.owner.generation.to_le_bytes());
+ let h=mix_audit(h,&event.requested.to_le_bytes());
+ let h=mix_audit(h,&event.time.to_le_bytes());
+ let h=mix_audit(h,&event.serial.to_le_bytes());
+ mix_audit(h,&[match event.kind{
+  AuditKind::Allowed=>1,AuditKind::Denied=>2,AuditKind::Incident=>3}])
+}
+impl<const N:usize> SecurityAudit<N>{
+ pub const fn new()->Self{Self{
+  entries:[None;N],used:0,next:1,chain:0x811c9dc5,
+ }}
+ pub fn remaining(&self)->usize{N-self.used}
+ pub fn record(&mut self,owner:Identity,requested:u32,
+  now:u64,kind:AuditKind)->Result<u64,AuditError>{
+  if owner.pid==0||owner.generation==0||requested&!ALL!=0||
+   (requested==0&&kind!=AuditKind::Incident){
+   return Err(AuditError::Invalid);
+  }
+  if self.used>=N||self.next==u64::MAX{return Err(AuditError::Full);}
+  let mut event=AuditEvent{owner,requested,time:now,
+   kind,serial:self.next,checksum:0};
+  event.checksum=event_hash(self.chain,event);
+  self.entries[self.used]=Some(event);
+  self.used+=1;self.next+=1;self.chain=event.checksum;
+  Ok(event.serial)
+ }
+ pub fn validate(&self)->Result<(),AuditError>{
+  let mut hash=0x811c9dc5;
+  for item in &self.entries[..self.used]{
+   let e=item.ok_or(AuditError::Corrupt)?;
+   if e.serial==0||e.checksum!=event_hash(hash,e){
+    return Err(AuditError::Corrupt);
+   }
+   hash=e.checksum;
+  }
+  if hash!=self.chain{return Err(AuditError::Corrupt);}
+  Ok(())
+ }
+ pub fn read_owner(&self,owner:Identity,out:&mut[AuditEvent])
+  ->Result<usize,AuditError>{
+  if owner.pid==0||owner.generation==0{return Err(AuditError::Invalid);}
+  self.validate()?;
+  let count=self.entries[..self.used].iter().flatten()
+   .filter(|e|e.owner==owner).count();
+  if count>out.len(){return Err(AuditError::Full);}
+  let mut n=0;
+  for event in self.entries[..self.used].iter().flatten(){
+   if event.owner==owner{out[n]=*event;n+=1;}
+  }
+  Ok(n)
+ }
+}
+impl<const N:usize> Access<N>{
+ /// A full audit journal fails closed, including legitimate allow requests.
+ /// Record the authorization decision before returning it to syscall ingress.
+ pub fn require_audited<const L:usize>(&self,audit:&mut SecurityAudit<L>,
+  owner:Identity,right:u32,now:u64)->Result<(),AuditError>{
+  if owner.pid==0||owner.generation==0{return Err(AuditError::Invalid);}
+  let check=self.require(owner,right,now);
+  audit.record(owner,right,now,if check.is_ok(){
+   AuditKind::Allowed}else{AuditKind::Denied})?;
+  check.map_err(|_|AuditError::Denied)
+ }
+ pub fn lockdown_audited<const L:usize>(&mut self,
+  audit:&mut SecurityAudit<L>,trusted_supervisor:Identity,
+  now:u64)->Result<usize,AuditError>{
+  // Supervisor identification must come from a trusted PCB, not user bytes.
+  audit.record(trusted_supervisor,FILE_WRITE|INSTALL|DRIVER,
+   now,AuditKind::Incident)?;
+  Ok(self.lockdown_mutations())
+ }
+}
+#[cfg(test)]
+mod r006_security_journal_tests{
+ use super::*;
+ fn a()->Identity{Identity{pid:41,generation:2}}
+ fn b()->Identity{Identity{pid:41,generation:3}}
+ const EMPTY:AuditEvent=AuditEvent{
+  owner:Identity{pid:0,generation:0},requested:0,time:0,
+  kind:AuditKind::Denied,serial:0,checksum:0,
+ };
+ #[test]fn allow_deny_and_lockdown_are_logged_in_order(){
+  let mut access=Access::<2>::new();
+  access.grant(a(),FILE_READ|FILE_WRITE,50).unwrap();
+  let mut audit=SecurityAudit::<4>::new();
+  assert_eq!(access.require_audited(&mut audit,a(),FILE_READ,2),Ok(()));
+  assert_eq!(access.require_audited(&mut audit,b(),FILE_READ,2),Err(AuditError::Denied));
+  assert_eq!(access.lockdown_audited(&mut audit,a(),3),Ok(1));
+  assert_eq!(access.require(a(),FILE_WRITE,3),Err(Error::Denied));
+  assert_eq!(audit.validate(),Ok(()));
+  let mut owner=[EMPTY;3];
+  assert_eq!(audit.read_owner(a(),&mut owner),Ok(2));
+  assert_eq!(owner[0].kind,AuditKind::Allowed);
+  assert_eq!(owner[1].kind,AuditKind::Incident);
+ }
+ #[test]fn full_journal_refuses_unrecorded_privileged_action(){
+  let mut access=Access::<1>::new();access.grant(a(),FILE_WRITE,10).unwrap();
+  let mut audit=SecurityAudit::<1>::new();
+  assert!(access.require_audited(&mut audit,a(),FILE_WRITE,1).is_ok());
+  assert_eq!(access.require_audited(&mut audit,a(),FILE_WRITE,2),Err(AuditError::Full));
+  assert_eq!(access.lockdown_audited(&mut audit,a(),3),Err(AuditError::Full));
+  assert_eq!(access.require(a(),FILE_WRITE,3),Ok(()));
+ }
+ #[test]fn stale_owners_cannot_read_other_generation_and_short_output_is_atomic(){
+  let mut audit=SecurityAudit::<2>::new();
+  audit.record(a(),VIEW,1,AuditKind::Allowed).unwrap();
+  audit.record(a(),VIEW,2,AuditKind::Denied).unwrap();
+  let mut short=[EMPTY;1];
+  assert_eq!(audit.read_owner(a(),&mut short),Err(AuditError::Full));
+  assert_eq!(short,[EMPTY]);
+  let mut out=[EMPTY;2];
+  assert_eq!(audit.read_owner(b(),&mut out),Ok(0));
+  assert_eq!(audit.validate(),Ok(()));
+ }
+}
