@@ -1,0 +1,162 @@
+name: IndianOS desktop screenshot history (real QEMU)
+on:
+  push:
+    branches:
+      - main
+      - 'snapshot/r010-*'
+    paths:
+      - 'rust/kernel_core/src/orbit_ui.rs'
+      - 'rust/kernel_core/src/gui.rs'
+      - 'rust/kernel_core/src/gui_broker.rs'
+      - 'rust/kernel_core/src/desktop.rs'
+      - 'rust/kernel_core/src/batch6_boot.rs'
+      - 'rust/kernel_core/src/m1_*.rs'
+      - 'rust/kernel_core/src/hardware_virtio_gpu.rs'
+      - 'rust/kernel_core/Cargo.toml'
+      - 'tools/test_r029_user_surfaces_qemu.py'
+      - 'tools/archive_qemu_desktop.py'
+      - '.github/workflows/desktop-screenshot-history.yml'
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: 'Optional exact historical source commit to screenshot'
+        required: false
+        type: string
+      version:
+        description: 'Release label, e.g. R010'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+concurrency:
+  group: desktop-screenshots-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout screenshot capture tools
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - name: Identify source commit and version
+        id: source
+        shell: bash
+        env:
+          REQUEST_SHA: ${{ inputs.source_sha || '' }}
+          REQUEST_VERSION: ${{ inputs.version || '' }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF_NAME" == snapshot/r010-* ]]; then
+            SOURCE_SHA="$(git rev-parse HEAD^)"
+            VERSION="R010"
+          elif [[ -n "$REQUEST_SHA" ]]; then
+            SOURCE_SHA="$REQUEST_SHA"
+            VERSION="${REQUEST_VERSION:-historical}"
+          else
+            SOURCE_SHA="$GITHUB_SHA"
+            VERSION="${REQUEST_VERSION:-commit}"
+          fi
+          if [[ ! "$SOURCE_SHA" =~ ^[a-f0-9]{40}$ ]]; then
+            echo "Invalid source SHA" >&2
+            exit 1
+          fi
+          VERSION="$(printf '%s' "$VERSION" | tr -cd 'A-Za-z0-9._-')"
+          test -n "$VERSION"
+          echo "sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Source: $SOURCE_SHA ($VERSION)"
+      - name: Checkout exact IndianOS version to render
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.source.outputs.sha }}
+          path: historical-source
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
+      - name: Install actual QEMU, OVMF and ISO dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo timeout 300s apt-get update -o Acquire::Retries=3 -o Acquire::http::Timeout=40
+          sudo timeout 600s apt-get install -y --no-install-recommends -o Acquire::Retries=3 -o Acquire::http::Timeout=40 clang lld binutils xorriso qemu-system-x86 ovmf curl openssl
+      - name: Render real screenshot from exact source commit (not a mockup)
+        working-directory: historical-source
+        shell: bash
+        env:
+          R029_USER_SCREENSHOT_DIR: ${{ runner.temp }}/actual-qemu-frames
+        run: |
+          set -euo pipefail
+          OVMF_PATH=""
+          for f in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/edk2/ovmf/OVMF_CODE_4M.fd /usr/share/edk2/ovmf/OVMF_CODE.fd; do
+            if test -f "$f"; then OVMF_PATH="$f"; break; fi
+          done
+          test -n "$OVMF_PATH"
+          make test-orbit-ui-qemu OVMF_CODE="$OVMF_PATH"
+      - name: Convert validated QEMU PPM captures to lossless PNG with provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/archive_qemu_desktop.py \
+            --input "${RUNNER_TEMP}/actual-qemu-frames" \
+            --output "${RUNNER_TEMP}/desktop-capture" \
+            --source-sha "${{ steps.source.outputs.sha }}" \
+            --workflow-sha "$GITHUB_SHA" \
+            --version "${{ steps.source.outputs.version }}" \
+            --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+      - name: Upload actual PNG screenshots as durable Actions artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: real-qemu-desktop-${{ steps.source.outputs.version }}-${{ steps.source.outputs.sha }}
+          path: ${{ runner.temp }}/desktop-capture/
+          if-no-files-found: error
+          retention-days: 90
+      - name: Checkout latest main for versioned screenshot archive
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          path: screenshot-archive
+          fetch-depth: 1
+      - name: Archive desktop screenshot in development/screenshots/
+        shell: bash
+        working-directory: screenshot-archive
+        env:
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+          VERSION: ${{ steps.source.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          prefix="$(printf '%s' "$VERSION" | tr '[:upper:]' '[:lower:]')"
+          folder="development/screenshots/${prefix}-${SOURCE_SHA:0:8}"
+          mkdir -p "$folder"
+          cp "$RUNNER_TEMP"/desktop-capture/*.png "$folder/"
+          cp "$RUNNER_TEMP"/desktop-capture/metadata.json "$folder/"
+          if [[ -f development/screenshots/latest.png ]] && cmp -s \
+            development/screenshots/latest.png "$folder/03-user-surface.png"; then
+            echo "Pixel-identical to the previously archived desktop"
+          else
+            cp "$folder/03-user-surface.png" development/screenshots/latest.png
+          fi
+          git config user.name "indianos-screenshot-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add development/screenshots
+          if git diff --cached --quiet; then
+            echo "Screenshot for this source already archived"
+            exit 0
+          fi
+          git commit -m "docs(screenshots): archive genuine $VERSION QEMU desktop ${SOURCE_SHA:0:8}"
+          if git push origin HEAD:main; then
+            echo "Versioned QEMU screenshot saved on main: $folder"
+          else
+            echo "::warning::Protected/concurrent main rejected archive push; opening a screenshot-only PR."
+            archive_branch="screenshots/capture-$GITHUB_RUN_ID"
+            git push origin "HEAD:refs/heads/$archive_branch"
+            gh pr create --base main --head "$archive_branch" \
+              --title "docs: archive real $VERSION QEMU desktop ${SOURCE_SHA:0:8}" \
+              --body "Real QEMU screenshot and provenance from $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID. No simulated UI or implementation changes."
+          fi
