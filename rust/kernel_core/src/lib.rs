@@ -31,6 +31,8 @@ pub mod workstation_r022;
 pub mod workstation_r023;
 /// R024: real RAM file manager, source editor, restricted shell and workstation test integration.
 pub mod workstation_r024;
+/// R025: twenty kernel-backed developer-workstation source, editor, build and debug workstreams.
+pub mod workstation_r025;
 mod syscall;
 mod program;
 mod initramfs;
