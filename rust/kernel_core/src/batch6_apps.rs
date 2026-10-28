@@ -151,7 +151,7 @@ pub fn workstation_launch_plan(availability:Availability,
  consent:bool,signed_native:bool)->Result<WorkstationLaunch,LaunchError>{
  let gate=launch_gate(availability,consent,signed_native)?;
  Ok(match gate{
-  ExecutionGate::Native=>WorkstationLaunch::NativeReady,
+  ExecutionGate::NativeAllowed=>WorkstationLaunch::NativeReady,
   _=>match availability{
    Availability::Native=>WorkstationLaunch::NativeReady,
    Availability::RuntimeMissing=>WorkstationLaunch::ExternalRuntimeNeeded,
