@@ -645,3 +645,66 @@ mod r013_charged_simulation_tests{
   assert_eq!(b.active_owners(),1);
  }
 }
+
+/// R014 charge an entire simulator request batch only after all requests
+/// validate and the queue reserves every job; failed input spends no CPU
+/// admission credits and publishes no job handles.
+pub fn submit_batch_charged<const N:usize>(service:&mut QuantumService,
+ budget:&mut QuantumWorkBudget<N>,owner:Identity,
+ requests:&[&[u8]],out:&mut[u64])->Result<usize,ServiceError>{
+ if owner.pid==0||owner.generation==0{
+  return Err(ServiceError::InvalidOwner);
+ }
+ if requests.is_empty()||requests.len()>MAX_JOBS||
+   out.len()<requests.len()||budget.remaining(owner)
+     .is_none_or(|remaining|(remaining as usize)<requests.len()){
+  return Err(ServiceError::NotOwner);
+ }
+ let mut ids=[0u64;MAX_JOBS];
+ let n=service.submit_batch_scoped(owner,requests,&mut ids)?;
+ for _ in 0..n{
+  if let Err(err)=budget.charge(owner){
+   service.cancel_batch_scoped(owner,&ids[..n])?;
+   return Err(err);
+  }
+ }
+ out[..n].copy_from_slice(&ids[..n]);Ok(n)
+}
+pub fn cancel_batch_budgeted<const N:usize>(service:&mut QuantumService,
+ budget:&mut QuantumWorkBudget<N>,owner:Identity,
+ ids:&[u64])->Result<usize,ServiceError>{
+ if budget.remaining(owner).is_none(){return Err(ServiceError::NotOwner);}
+ // Cancellation does not regenerate previously consumed CPU credits.
+ service.cancel_batch_scoped(owner,ids)
+}
+#[cfg(test)]
+mod r014_quantum_bulk_quota_tests{
+ use super::*;
+ const BELL:[u8;10]=[1,2,2,0,1,0,0,4,0,1];
+ fn id(g:u64)->Identity{Identity{pid:60,generation:g}}
+ #[test]fn valid_batch_consumes_exactly_two_credits(){
+  let mut s=QuantumService::new();let mut b=QuantumWorkBudget::<2>::new();
+  b.admit(id(1),3).unwrap();let mut out=[0u64;2];
+  assert_eq!(submit_batch_charged(&mut s,&mut b,id(1),
+    &[&BELL,&BELL],&mut out),Ok(2));
+  assert_eq!(b.remaining(id(1)),Some(1));
+  assert!(out[0]>0&&out[1]>out[0]);
+ }
+ #[test]fn malformed_second_job_does_not_charge_or_leak_first_job(){
+  let mut s=QuantumService::new();let mut b=QuantumWorkBudget::<1>::new();
+  b.admit(id(1),3).unwrap();let mut out=[99u64;2];
+  assert!(submit_batch_charged(&mut s,&mut b,id(1),
+    &[&BELL,b"bad"],&mut out).is_err());
+  assert_eq!(b.remaining(id(1)),Some(3));
+  assert_eq!(out,[99;2]);assert_eq!(s.active_count_scoped(id(1)),Ok(0));
+ }
+ #[test]fn cancelled_stale_epoch_cannot_restore_or_remove_newer_jobs(){
+  let mut s=QuantumService::new();let mut b=QuantumWorkBudget::<1>::new();
+  b.admit(id(2),1).unwrap();let mut out=[0u64;1];
+  submit_batch_charged(&mut s,&mut b,id(2),&[&BELL],&mut out).unwrap();
+  assert_eq!(cancel_batch_budgeted(&mut s,&mut b,id(1),&out),
+    Err(ServiceError::NotOwner));
+  assert_eq!(cancel_batch_budgeted(&mut s,&mut b,id(2),&out),Ok(1));
+  assert_eq!(b.remaining(id(2)),Some(0));
+ }
+}
