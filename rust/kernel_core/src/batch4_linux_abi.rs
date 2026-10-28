@@ -846,3 +846,60 @@ impl<const N:usize> FileDescriptors<N>{
   assert_eq!(f.close_all_on_exit(id(2)),1);
  }
 }
+
+
+/// R017 developer POSIX FD inspector and transactional close selection.
+/// This is process-scoped descriptor bookkeeping, not foreign ELF execution.
+impl<const N:usize> FileDescriptors<N>{
+ pub fn snapshot_owner_handles(&self,
+  owner:crate::batch5_session::Identity,
+  out:&mut[(u32,u64,u8)])->Result<usize,FdError>{
+  if owner.pid==0||owner.generation==0{return Err(FdError::Invalid);}
+  let total=self.entries.iter().flatten().filter(|e|e.owner==owner).count();
+  if total>out.len(){return Err(FdError::Full);}
+  let mut count=0;
+  for entry in self.entries.iter().flatten(){
+   if entry.owner==owner{
+    out[count]=(entry.fd,entry.handle,entry.rights);count+=1;
+   }
+  }
+  Ok(count)
+ }
+ pub fn close_selected_atomic(&mut self,
+  owner:crate::batch5_session::Identity,ids:&[u32])
+  ->Result<usize,FdError>{
+  if owner.pid==0||owner.generation==0||ids.is_empty()||
+   ids.len()>N{return Err(FdError::Invalid);}
+  let mut staged=Self{entries:self.entries};
+  for (i,&fd) in ids.iter().enumerate(){
+   if fd<3||ids[..i].contains(&fd){return Err(FdError::Duplicate);}
+   staged.close(owner,fd)?;
+  }
+  self.entries=staged.entries;Ok(ids.len())
+ }
+}
+#[cfg(test)]mod r017_dev_posix_fd_tests{
+ use super::*;use crate::batch5_session::Identity;
+ fn id(g:u64)->Identity{Identity{pid:55,generation:g}}
+ #[test]fn owner_can_preview_and_close_two_handles_atomically(){
+  let mut t=FileDescriptors::<3>::new();
+  t.attach(id(1),3,10,FD_READ).unwrap();t.attach(id(1),4,20,FD_WRITE).unwrap();
+  let mut out=[(0,0,0);2];
+  assert_eq!(t.snapshot_owner_handles(id(1),&mut out),Ok(2));
+  assert_eq!(out[0].1,10);
+  assert_eq!(t.close_selected_atomic(id(1),&[3,4]),Ok(2));
+  assert_eq!(t.descriptors_for_epoch(id(1)),0);
+ }
+ #[test]fn invalid_second_fd_never_partially_closes_first(){
+  let mut t=FileDescriptors::<2>::new();t.attach(id(1),3,10,FD_READ).unwrap();
+  assert_eq!(t.close_selected_atomic(id(1),&[3,9]),Err(FdError::NotFound));
+  assert_eq!(t.resolve(id(1),3,FD_READ),Ok(10));
+ }
+ #[test]fn recycled_pid_cannot_read_old_open_descriptors(){
+  let mut t=FileDescriptors::<1>::new();t.attach(id(2),3,10,FD_READ).unwrap();
+  let mut out=[(99,99,99);1];
+  assert_eq!(t.snapshot_owner_handles(id(1),&mut out),Ok(0));
+  assert_eq!(out,[(99,99,99)]);
+  assert_eq!(t.close_selected_atomic(id(1),&[3]),Err(FdError::Denied));
+ }
+}

@@ -108,6 +108,9 @@ pub extern "C" fn kmain()->!{
         need(crate::batch7_workspace::bounded_workspace_smoke(),
              b"IndianOS: FATAL R041 workspace read/write/revocation smoke\n\0");
         log(b"IndianOS: R041 RAM workspace terminal write/read/revocation PASSED\n\0");
+        need(crate::batch7_workspace::bounded_developer_workstation_smoke(),
+             b"IndianOS: FATAL R017 developer workstation guest smoke\n\0");
+        log(b"IndianOS: R017 workstation RAM project editing PASSED\n\0");
     }
     unsafe{boot_draw_status();}
     #[cfg(feature="test-r029-userspace")]

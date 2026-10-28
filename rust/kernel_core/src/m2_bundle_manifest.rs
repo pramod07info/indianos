@@ -365,3 +365,54 @@ mod m2_tests{
  }
 
 }
+
+
+/// R017 signed package publishing preflight. This never turns a hash into
+/// a signature: cryptographic verification is required by stage_authorized.
+pub fn manifest_dependency_snapshot(m:&BundleManifest,
+ out:&mut[(u32,u64)])->Result<usize,Error>{
+ if m.app==0||m.version==0||m.length==0||m.digest==[0;32]{
+  return Err(Error::Invalid);
+ }
+ let mut count=0;
+ for i in 0..MAX_DEPS{
+  let (id,minimum)=(m.deps[i],m.minimums[i]);
+  if (id==0)!=(minimum==0)||id==m.app||
+    (id!=0&&m.deps[..i].contains(&id)){return Err(Error::Invalid);}
+  if id!=0{count+=1;}
+ }
+ if count>out.len(){return Err(Error::Invalid);}
+ let mut at=0;
+ for i in 0..MAX_DEPS{
+  if m.deps[i]!=0{out[at]=(m.deps[i],m.minimums[i]);at+=1;}
+ }
+ Ok(count)
+}
+pub fn manifest_toolchain_compatible(m:&BundleManifest,abi:u16,
+ approved_rights:u32)->bool{
+ abi==ABI&&m.rights&!approved_rights==0&&m.rights&!ALL==0&&
+ m.app!=0&&m.version!=0&&m.digest!=[0;32]
+}
+#[cfg(test)]mod r017_manifest_deps_tests{
+ use super::*;
+ fn pkg()->BundleManifest{BundleManifest{
+  app:5,version:2,length:128,digest:[7;32],rights:1,
+  deps:[1,2,0,0],minimums:[3,4,0,0],signer:10,epoch:1}}
+ #[test]fn dependency_order_and_minimum_versions_are_preserved(){
+  let m=pkg();let mut out=[(0,0);4];
+  assert_eq!(manifest_dependency_snapshot(&m,&mut out),Ok(2));
+  assert_eq!(&out[..2],&[(1,3),(2,4)]);
+  assert!(manifest_toolchain_compatible(&m,ABI,1));
+ }
+ #[test]fn invalid_dependency_never_partially_publishes(){
+  let mut m=pkg();m.deps[1]=1;let mut out=[(99,99);4];
+  assert_eq!(manifest_dependency_snapshot(&m,&mut out),Err(Error::Invalid));
+  assert_eq!(out,[(99,99);4]);
+ }
+ #[test]fn unauthorized_rights_or_short_output_fail_closed(){
+  let m=pkg();let mut out=[(99,99);1];
+  assert!(manifest_dependency_snapshot(&m,&mut out).is_err());
+  assert_eq!(out,[(99,99)]);
+  assert!(!manifest_toolchain_compatible(&m,ABI,0));
+ }
+}

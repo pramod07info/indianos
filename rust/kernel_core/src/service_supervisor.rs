@@ -234,3 +234,51 @@ mod batch1_supervisor_generation_tests {
     }
 }
 
+
+
+/// R017 workstation process panel and monitored service start group.
+/// Only the trusted supervisor can call start_batch or view all services.
+impl<const N:usize> ServiceTable<N>{
+ pub fn snapshot_all(&self,out:&mut[ServiceSlot])->Option<usize>{
+  let count=self.slots.iter().flatten().count();
+  if count>out.len(){return None;}
+  let mut at=0;
+  for item in self.slots.iter().flatten(){out[at]=*item;at+=1;}
+  Some(at)
+ }
+ pub fn start_batch(&mut self,services:&[u32])->bool{
+  if services.is_empty()||services.len()>N{return false;}
+  let mut shadow=Self{slots:self.slots};
+  for (i,&service) in services.iter().enumerate(){
+   if service==0||services[..i].contains(&service)||
+      shadow.start(service)==ServiceAction::Deny{
+    return false;
+   }
+  }
+  self.slots=shadow.slots;true
+ }
+ pub fn active_services(&self)->usize{
+  self.slots.iter().flatten().filter(|s|s.active).count()
+ }
+}
+#[cfg(test)]mod r017_service_panel_tests{
+ use super::*;
+ #[test]fn two_dev_services_start_in_one_transaction(){
+  let mut t=ServiceTable::<2>::new();
+  assert!(t.configure(1,10,1));assert!(t.configure(2,20,1));
+  assert!(t.start_batch(&[1,2]));assert_eq!(t.active_services(),2);
+  let mut out=[t.snapshot(1).unwrap();2];
+  assert_eq!(t.snapshot_all(&mut out),Some(2));
+  assert_eq!(out[1].service_id,2);
+ }
+ #[test]fn bad_second_service_does_not_start_first(){
+  let mut t=ServiceTable::<2>::new();t.configure(1,10,1);
+  assert!(!t.start_batch(&[1,99]));assert_eq!(t.active_services(),0);
+ }
+ #[test]fn snapshot_too_short_never_publishes_partial_state(){
+  let mut t=ServiceTable::<2>::new();t.configure(1,10,1);t.configure(2,20,1);
+  let mut out=[t.snapshot(1).unwrap();1];
+  assert_eq!(t.snapshot_all(&mut out),None);
+  assert_eq!(out[0].service_id,1);
+ }
+}

@@ -1049,3 +1049,57 @@ impl<D:BlockDevice> HierVfs<D>{
     &mut short,&mut b).is_err());
  }
 }
+
+
+/// R017 bounded project-file content verification. The caller can compare
+/// two durable files without exposing either into a partially filled result.
+impl<D:BlockDevice> HierVfs<D>{
+ pub fn checksum_file_at(&mut self,path:&str,expected:u64)
+  ->Result<(usize,u32),FsError>{
+  if self.generation()!=expected{return Err(FsError::InvalidVolume);}
+  let mut data=[0u8;MAX_FILE_BYTES];
+  let len=self.read(path,&mut data)?;
+  if self.generation()!=expected{return Err(FsError::InvalidVolume);}
+  let mut h=0x811c9dc5u32;
+  for &byte in &data[..len]{h=(h^(byte as u32)).wrapping_mul(0x01000193);}
+  Ok((len,h))
+ }
+ pub fn project_files_equal(&mut self,a:&str,b:&str,expected:u64)
+  ->Result<bool,FsError>{
+  if a==b{return Err(FsError::InvalidVolume);}
+  let mut left=[0u8;MAX_FILE_BYTES];let mut right=[0u8;MAX_FILE_BYTES];
+  let (an,bn)=self.read_pair_atomic(a,b,expected,&mut left,&mut right)?;
+  Ok(an==bn&&left[..an]==right[..bn])
+ }
+}
+#[cfg(test)]mod r017_project_verification_tests{
+ use super::*;use crate::block::{BlockDevice,BlockError,SECTOR_BYTES};
+ struct Disk([[u8;SECTOR_BYTES];100]);
+ impl BlockDevice for Disk{
+  fn sector_count(&self)->u64{100}
+  fn read_sector(&mut self,l:u64,b:&mut[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{*b=*self.0.get(l as usize).ok_or(BlockError::OutOfRange)?;Ok(())}
+  fn write_sector(&mut self,l:u64,b:&[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{*self.0.get_mut(l as usize).ok_or(BlockError::OutOfRange)?=*b;Ok(())}
+ }
+ fn fs()->HierVfs<Disk>{
+  let mut f=HierVfs::format_blank(Disk([[0;SECTOR_BYTES];100])).unwrap();
+  f.create("/one",b"code").unwrap();f.create("/two",b"code").unwrap();f
+ }
+ #[test]fn checksums_and_equal_copies_are_consistent(){
+  let mut f=fs();let g=f.generation();
+  assert_eq!(f.project_files_equal("/one","/two",g),Ok(true));
+  assert_eq!(f.checksum_file_at("/one",g).unwrap().0,4);
+ }
+ #[test]fn differing_files_do_not_compare_equal(){
+  let mut f=fs();f.overwrite("/two",b"new").unwrap();
+  let g=f.generation();
+  assert_eq!(f.project_files_equal("/one","/two",g),Ok(false));
+ }
+ #[test]fn revision_mismatch_refuses_snapshot(){
+  let mut f=fs();
+  let g=f.generation();
+  assert!(f.checksum_file_at("/one",g+1).is_err());
+  assert!(f.project_files_equal("/one","/one",g).is_err());
+ }
+}
