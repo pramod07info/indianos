@@ -216,3 +216,89 @@ mod batch1_pci_snapshot_tests {
     }
 }
 
+
+// R007: classify trusted read-only PCI config snapshots for driver discovery.
+// Never enables bus mastering, maps MMIO or executes device DMA.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum PciKind{Storage,Network,Display}
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct ClassifiedDevice{pub slot:u16,pub info:DeviceInfo,pub kind:PciKind}
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum PciPlanError{Capacity,Config(ConfigError),Aperture(SetError)}
+pub fn classify_headers(headers:&[[u8;16]],out:&mut[ClassifiedDevice])
+    ->Result<usize,PciPlanError>{
+    if headers.len()>MAX_PCI_HEADERS{return Err(PciPlanError::Capacity);}
+    let mut needed=0usize;
+    for h in headers{
+        match decode_config(h){
+            Ok(d) if matches!(d.class,1|2|3)=>needed+=1,
+            Ok(_)|Err(ConfigError::Absent)=>{},
+            Err(e)=>return Err(PciPlanError::Config(e)),
+        }
+    }
+    if needed>out.len(){return Err(PciPlanError::Capacity);}
+    let mut count=0;
+    for (slot,h) in headers.iter().enumerate(){
+        if let Ok(info)=decode_config(h){
+            let kind=match info.class{
+                1=>Some(PciKind::Storage),
+                2=>Some(PciKind::Network),
+                3=>Some(PciKind::Display),
+                _=>None,
+            };
+            if let Some(kind)=kind{
+                out[count]=ClassifiedDevice{slot:slot as u16,info,kind};count+=1;
+            }
+        }
+    }
+    Ok(count)
+}
+pub fn dma_window_preflight(regions:&[Aperture],reserved:&[Aperture],
+    lower:u64,upper:u64,alignment:u64)->Result<(),PciPlanError>{
+    // Every candidate must be valid even if it does not conflict.
+    validate_set(regions,lower,upper,alignment).map_err(PciPlanError::Aperture)?;
+    validate_set(reserved,lower,upper,alignment).map_err(PciPlanError::Aperture)?;
+    for region in regions{
+        let end=region.base+region.length;
+        for r in reserved{
+            if region.base<r.base+r.length&&r.base<end{
+                return Err(PciPlanError::Aperture(SetError::Overlap));
+            }
+        }
+    }
+    Ok(())
+}
+#[cfg(test)]mod r007_device_tests{
+    use super::*;
+    fn header(class:u8)->[u8;16]{
+        let mut h=[0u8;16];
+        h[..2].copy_from_slice(&0x8086u16.to_le_bytes());
+        h[2..4].copy_from_slice(&0x100eu16.to_le_bytes());
+        h[11]=class;h
+    }
+    #[test]fn classifies_storage_network_and_display_in_stable_order(){
+        let headers=[header(2),[0xff;16],header(3),header(1)];
+        let sentinel=ClassifiedDevice{slot:99,info:decode_config(&header(1)).unwrap(),
+            kind:PciKind::Storage};
+        let mut out=[sentinel;3];
+        assert_eq!(classify_headers(&headers,&mut out),Ok(3));
+        assert_eq!(out[0].kind,PciKind::Network);
+        assert_eq!(out[1].slot,2);
+        assert_eq!(out[2].kind,PciKind::Storage);
+    }
+    #[test]fn short_output_does_not_publish_partial_device_ids(){
+        let mut out=[ClassifiedDevice{slot:9,info:decode_config(&header(1)).unwrap(),
+            kind:PciKind::Storage};1];
+        let before=out;
+        assert_eq!(classify_headers(&[header(1),header(3)],&mut out),
+            Err(PciPlanError::Capacity));
+        assert_eq!(out,before);
+    }
+    #[test]fn overlapping_or_misaligned_dma_windows_are_denied(){
+        let allowed=[Aperture{base:0x2000,length:0x1000}];
+        let reserved=[Aperture{base:0x2000,length:0x2000}];
+        assert_eq!(dma_window_preflight(&allowed,&reserved,0x1000,0x10000,0x1000),
+            Err(PciPlanError::Aperture(SetError::Overlap)));
+        assert_eq!(dma_window_preflight(&allowed,&[],0x1000,0x10000,0x1000),Ok(()));
+    }
+}
