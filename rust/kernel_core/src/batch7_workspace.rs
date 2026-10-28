@@ -203,3 +203,83 @@ mod r012_workspace_restore_tests{
   assert_eq!(out,[0xcc;OUTPUT_MAX]);
  }
 }
+
+/// R013: transactional interactive desktop command batch. A trusted
+/// storage service supplies snapshot scratch; RAM state is not durable yet.
+impl<const P:usize,const E:usize,const W:usize,const K:usize,
+ const F:usize,const G:usize,const Q:usize> Workspace<P,E,W,K,F,G,Q>{
+ pub fn execute_script_atomic(&mut self,caller:Identity,now:u64,
+   commands:&[&[u8]],scratch:&mut[u8],out:&mut[u8])->Result<usize,Error>{
+  self.require(caller,now)?;
+  self.access.require(caller,FILE_READ|FILE_WRITE,now).map_err(Error::Auth)?;
+  if commands.is_empty()||commands.len()>16{return Err(Error::NotRunning);}
+  for line in commands{
+   if line.is_empty()||line.len()>crate::batch7_terminal::COMMAND_MAX||
+     line.iter().any(|c|*c!=b' '&&!c.is_ascii_graphic()){
+    return Err(Error::Terminal(TerminalError::Invalid));
+   }
+  }
+  let saved=self.disk.export_snapshot(scratch)
+    .map_err(|_|Error::Terminal(TerminalError::Io))?;
+  let mut last=0;
+  for &line in commands{
+   match crate::batch7_terminal::execute(
+      &self.access,caller,now,&mut self.disk,line,out){
+    Ok(n)=>last=n,
+    Err(err)=>{
+     self.disk.import_snapshot(&scratch[..saved])
+       .map_err(|_|Error::Terminal(TerminalError::Io))?;
+     return Err(Error::Terminal(err));
+    }
+   }
+  }
+  if let Err(err)=self.frames.submit(&self.boot.session.windows,
+     caller,self.window,Rect{x:0,y:0,w:640,h:480}){
+   self.disk.import_snapshot(&scratch[..saved])
+     .map_err(|_|Error::Terminal(TerminalError::Io))?;
+   return Err(Error::Surface(err));
+  }
+  Ok(last)
+ }
+ pub fn app_file_generation(&self,caller:Identity,now:u64)->Result<u64,Error>{
+  self.require(caller,now)?;
+  self.access.require(caller,FILE_READ,now).map_err(Error::Auth)?;
+  Ok(self.disk.version())
+ }
+}
+#[cfg(test)]
+mod r013_desktop_transaction_tests{
+ use super::*;use crate::batch2_launcher::Image;
+ use crate::batch2_settings::Theme;
+ fn id(pid:u32)->Identity{Identity{pid,generation:1}}
+ fn workspace()->Workspace<3,3,2,2,3,2,8>{
+  let mut w=Workspace::new();
+  let launch=|pid|Launch{pid,generation:1,image:Image{
+   image_id:pid,entry:0x1000,mapped_end:0x2000,verified:true}};
+  w.initialize(id(1),launch(1),id(2),launch(2),
+   Settings{theme:Theme::Dark,pointer_speed:5,key_repeat:10},50,100).unwrap();w
+ }
+ #[test]fn script_writes_two_files_but_only_one_redraw(){
+  let mut w=workspace();let mut scratch=[0;512];let mut out=[0;OUTPUT_MAX];
+  assert_eq!(w.execute_script_atomic(id(2),1,&[
+   b"write /a alpha",b"cp /a /b",b"cat /b"
+  ],&mut scratch,&mut out),Ok(5));
+  assert_eq!(&out[..5],b"alpha");assert_eq!(w.disk.count(),2);
+  assert!(w.next_frame().is_ok());assert!(w.next_frame().is_err());
+ }
+ #[test]fn later_failing_command_reverts_first_file(){
+  let mut w=workspace();let mut scratch=[0;512];let mut out=[0;OUTPUT_MAX];
+  assert!(w.execute_script_atomic(id(2),1,&[
+   b"write /a alpha",b"cat /missing"
+  ],&mut scratch,&mut out).is_err());
+  assert_eq!(w.disk.count(),0);assert!(w.next_frame().is_err());
+ }
+ #[test]fn foreign_generation_and_short_snapshot_never_write(){
+  let mut w=workspace();let mut tiny=[0;2];let mut out=[0;OUTPUT_MAX];
+  assert!(w.execute_script_atomic(Identity{generation:2,..id(2)},1,
+    &[b"write /a hi"],&mut tiny,&mut out).is_err());
+  assert!(w.execute_script_atomic(id(2),1,&[b"write /a hi"],
+    &mut tiny,&mut out).is_err());
+  assert_eq!(w.app_file_generation(id(2),1),Ok(0));
+ }
+}
