@@ -483,3 +483,75 @@ mod orbit_r005_broker_tests{
   assert!(!b.known(1));assert!(b.known(2));
  }
 }
+
+ 
+/// R009 input delivery protocol. The trusted input driver may queue decoded
+/// keys only against a window owned by the authenticated receiving process.
+/// Event.kind carries the key and press/release information without changing
+/// the existing fixed-size 16-byte mailbox wire layout.
+pub const KEY_DOWN:u32=3;
+pub const KEY_UP:u32=4;
+pub const POINTER_CLICK:u32=5;
+pub fn decode_key_event(kind:u32)->Option<(u16,bool)>{
+ let tag=kind&0xffff;
+ let code=(kind>>16) as u16;
+ if code==0||code>255{return None;}
+ match tag{KEY_DOWN=>Some((code,true)),KEY_UP=>Some((code,false)),_=>None}
+}
+impl<const W:usize,const Q:usize> Broker<W,Q>{
+ pub fn post_keyboard(&mut self,authenticated_owner:u32,window:u32,
+   scan_code:u16,pressed:bool)->Result<Event,Error>{
+  if scan_code==0||scan_code>255{return Err(Error::Invalid);}
+  let tag=if pressed{KEY_DOWN}else{KEY_UP};
+  self.post(authenticated_owner,window,((scan_code as u32)<<16)|tag)
+ }
+ pub fn post_pointer_click(&mut self,authenticated_owner:u32,window:u32,
+   button:u8)->Result<Event,Error>{
+  if button==0||button>3{return Err(Error::Invalid);}
+  self.post(authenticated_owner,window,((button as u32)<<16)|POINTER_CLICK)
+ }
+ /// Deliver a batch of decoded keys atomically: no partial publication
+ /// if ownership, capacity or sequence space checks fail.
+ pub fn post_keyboard_batch(&mut self,authenticated_owner:u32,window:u32,
+   keys:&[(u16,bool)])->Result<usize,Error>{
+  if keys.is_empty()||keys.len()>Q{return Err(Error::Invalid);}
+  if !self.owns(authenticated_owner,window){return Err(Error::Unauthorized);}
+  if self.len.checked_add(keys.len()).is_none_or(|n|n>Q){return Err(Error::Full);}
+  if self.sequence.checked_add(keys.len() as u32).is_none(){return Err(Error::Exhausted);}
+  if keys.iter().any(|(k,_)|*k==0||*k>255){return Err(Error::Invalid);}
+  for &(key,down) in keys{self.post_keyboard(authenticated_owner,window,key,down)?;}
+  Ok(keys.len())
+ }
+}
+#[cfg(test)]
+mod r009_input_delivery_tests{
+ use super::*;
+ #[test]fn keyboard_event_wire_is_owned_and_decodable(){
+  let mut broker=Broker::<2,5>::new();
+  broker.grant(12,40).unwrap();broker.grant(13,41).unwrap();
+  let e=broker.post_keyboard(12,40,30,true).unwrap();
+  assert_eq!(decode_key_event(e.kind),Some((30,true)));
+  assert_eq!(u32::from_le_bytes(e.wire()[8..12].try_into().unwrap()),e.kind);
+  assert_eq!(broker.post_keyboard(13,40,30,false),Err(Error::Unauthorized));
+  assert_eq!(broker.post_pointer_click(12,40,0),Err(Error::Invalid));
+ }
+ #[test]fn batch_preflight_prevents_partial_key_delivery(){
+  let mut broker=Broker::<1,2>::new();broker.grant(17,2).unwrap();
+  assert_eq!(broker.post_keyboard_batch(17,2,&[(1,true),(0,false)]),Err(Error::Invalid));
+  assert_eq!(broker.pending_owner(17),Ok(0));
+  assert_eq!(broker.post_keyboard_batch(17,2,&[(1,true),(1,false)]),Ok(2));
+  assert_eq!(broker.post_keyboard_batch(17,2,&[(1,true)]),Err(Error::Full));
+  let mut events=[Event{owner:0,window:0,kind:0,sequence:0};2];
+  assert_eq!(broker.drain_owner(17,&mut events),Ok(2));
+  assert_eq!(events[0].sequence+1,events[1].sequence);
+ }
+ #[test]fn process_exit_revokes_owned_input_without_touching_peer(){
+  let mut broker=Broker::<2,3>::new();
+  broker.grant(5,9).unwrap();broker.grant(6,10).unwrap();
+  broker.post_keyboard(5,9,8,true).unwrap();
+  broker.post_keyboard(6,10,9,true).unwrap();
+  broker.revoke(5);
+  assert_eq!(broker.peek(5),Err(Error::Unauthorized));
+  assert_eq!(decode_key_event(broker.peek(6).unwrap().kind),Some((9,true)));
+ }
+}
