@@ -324,3 +324,83 @@ mod batch1_disk_journal_tests {
 
 }
 
+
+// R007: upper-layer immutable boot-metadata transitions. The trusted caller
+// must perform actual image verification and persist journals through the
+// existing readback-verified BlockDevice backend before making them active.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum UpdatePolicyError{Invalid,Stale,Unverified,NoFallback,Exhausted}
+pub fn stage_verified_slot(current:Journal,active:usize,new_version:u64,
+    verified_by_trusted_loader:bool,attempt_budget:u8)
+    ->Result<Journal,UpdatePolicyError>{
+    if active>1||current.generation==0||new_version==0||attempt_budget==0{
+        return Err(UpdatePolicyError::Invalid);
+    }
+    if !verified_by_trusted_loader{return Err(UpdatePolicyError::Unverified);}
+    let live=current.slots[active];
+    if !live.valid_metadata||!live.committed||live.version==0||
+       live.attempts_remaining==0{return Err(UpdatePolicyError::NoFallback);}
+    if new_version<=live.version{return Err(UpdatePolicyError::Stale);}
+    let next_generation=current.generation.checked_add(1)
+        .ok_or(UpdatePolicyError::Exhausted)?;
+    let mut next=current;
+    next.slots[1-active]=Slot{valid_metadata:true,committed:true,
+        version:new_version,attempts_remaining:attempt_budget};
+    next.generation=next_generation;
+    Ok(next)
+}
+pub fn confirm_boot_healthy(current:Journal,slot:usize,
+    observed_version:u64,reset_attempts:u8)
+    ->Result<Journal,UpdatePolicyError>{
+    if slot>1||current.generation==0||reset_attempts==0{
+        return Err(UpdatePolicyError::Invalid);
+    }
+    let actual=current.slots[slot];
+    if !actual.valid_metadata||!actual.committed||
+       actual.version!=observed_version||actual.attempts_remaining==0{
+        return Err(UpdatePolicyError::Stale);
+    }
+    let mut updated=current;
+    updated.generation=current.generation.checked_add(1)
+        .ok_or(UpdatePolicyError::Exhausted)?;
+    updated.slots[slot].attempts_remaining=reset_attempts;
+    Ok(updated)
+}
+pub fn rollback_after_failure(current:Journal,failed:usize,min_version:u64)
+    ->Result<(Journal,usize),UpdatePolicyError>{
+    if failed>1||current.generation==0{return Err(UpdatePolicyError::Invalid);}
+    let backup=1-failed;
+    let previous=current.slots[backup];
+    if !bootable(previous,min_version){return Err(UpdatePolicyError::NoFallback);}
+    let mut next=current;
+    next.generation=current.generation.checked_add(1)
+        .ok_or(UpdatePolicyError::Exhausted)?;
+    next.slots[failed].attempts_remaining=0;
+    Ok((next,backup))
+}
+#[cfg(test)]mod r007_boot_policy_tests{
+    use super::*;
+    fn base()->Journal{Journal{generation:10,slots:[
+        Slot{valid_metadata:true,committed:true,version:5,attempts_remaining:3},
+        Slot{valid_metadata:true,committed:false,version:0,attempts_remaining:0}]}}
+    #[test]fn stages_upgrade_and_validates_observed_health(){
+        let staged=stage_verified_slot(base(),0,6,true,2).unwrap();
+        assert_eq!(staged.slots[1].version,6);
+        assert_eq!(staged.generation,11);
+        let confirmed=confirm_boot_healthy(staged,1,6,4).unwrap();
+        assert_eq!(confirmed.slots[1].attempts_remaining,4);
+        assert_eq!(confirmed.generation,12);
+        assert_eq!(confirm_boot_healthy(staged,1,5,4),Err(UpdatePolicyError::Stale));
+    }
+    #[test]fn rollback_requires_known_good_anti_rollback_compliant_fallback(){
+        let staged=stage_verified_slot(base(),0,7,true,2).unwrap();
+        assert_eq!(rollback_after_failure(staged,1,5).unwrap().1,0);
+        assert_eq!(rollback_after_failure(staged,1,6),Err(UpdatePolicyError::NoFallback));
+        assert_eq!(rollback_after_failure(staged,0,5).unwrap().1,1);
+    }
+    #[test]fn unsigned_downgrade_and_missing_budget_never_stage(){
+        assert_eq!(stage_verified_slot(base(),0,7,false,2),Err(UpdatePolicyError::Unverified));
+        assert_eq!(stage_verified_slot(base(),0,5,true,2),Err(UpdatePolicyError::Stale));
+        assert_eq!(stage_verified_slot(base(),0,7,true,0),Err(UpdatePolicyError::Invalid));
+    }
+}
