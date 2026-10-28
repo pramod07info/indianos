@@ -662,3 +662,72 @@ mod r012_epoch_audit_tests{
   assert_eq!(j.remaining(),1);
  }
 }
+
+/// R013 audit-backed expiration/reaping. No grant disappears without a
+/// journal event, and a full/corrupted audit leaves live state unchanged.
+impl<const N:usize> Access<N>{
+ pub fn reap_expired_audited<const L:usize>(&mut self,
+   audit:&mut SecurityAudit<L>,now:u64)->Result<usize,AuditError>{
+  audit.validate()?;
+  let count=self.grants.iter().flatten().filter(|g|
+    !g.revoked&&now>=g.expires).count();
+  if count>audit.remaining(){return Err(AuditError::Full);}
+  let mut staged=SecurityAudit{
+   entries:audit.entries,used:audit.used,next:audit.next,chain:audit.chain};
+  for grant in self.grants.iter().flatten(){
+   if !grant.revoked&&now>=grant.expires{
+    staged.record(grant.owner,grant.rights,now,AuditKind::Incident)?;
+   }
+  }
+  let mut removed=0;
+  for slot in &mut self.grants{
+   if slot.is_some_and(|g|now>=g.expires){
+    *slot=None;removed+=1;
+   }
+  }
+  *audit=staged;
+  Ok(removed)
+ }
+ /// Exact process-generation security state without exposing raw tokens.
+ pub fn owner_rights_checked(&self,owner:Identity,now:u64)
+   ->Result<u32,Error>{
+  if owner.pid==0||owner.generation==0{return Err(Error::Invalid);}
+  let grant=self.grants.iter().flatten().find(|g|g.owner.pid==owner.pid)
+    .ok_or(Error::NotFound)?;
+  if grant.owner!=owner||grant.revoked{return Err(Error::Denied);}
+  if now>=grant.expires{return Err(Error::Expired);}
+  Ok(grant.rights)
+ }
+ pub fn active_grants(&self,now:u64)->usize{
+  self.grants.iter().flatten().filter(|g|!g.revoked&&now<g.expires).count()
+ }
+}
+#[cfg(test)]
+mod r013_security_reaper_tests{
+ use super::*;
+ fn id(pid:u32,g:u64)->Identity{Identity{pid,generation:g}}
+ #[test]fn expiry_requires_audited_event_and_retains_other_owner(){
+  let mut a=Access::<3>::new();let mut journal=SecurityAudit::<3>::new();
+  a.grant(id(1,1),FILE_READ,10).unwrap();
+  a.grant(id(2,1),VIEW,100).unwrap();
+  assert_eq!(a.reap_expired_audited(&mut journal,10),Ok(1));
+  assert_eq!(journal.validate(),Ok(()));
+  assert_eq!(a.active_grants(10),1);
+  assert_eq!(a.require(id(2,1),VIEW,11),Ok(()));
+ }
+ #[test]fn exhausted_audit_capacity_aborts_cleanup_atomically(){
+  let mut a=Access::<1>::new();let mut journal=SecurityAudit::<0>::new();
+  a.grant(id(1,1),VIEW,10).unwrap();
+  assert_eq!(a.reap_expired_audited(&mut journal,11),Err(AuditError::Full));
+  assert_eq!(a.active_grants(1),1);
+  assert_eq!(a.owner_rights_checked(id(1,1),1),Ok(VIEW));
+ }
+ #[test]fn retired_pid_can_reuse_tombstone_without_stale_access(){
+  let mut a=Access::<1>::new();let mut journal=SecurityAudit::<1>::new();
+  a.grant(id(1,1),FILE_READ,10).unwrap();
+  a.reap_expired_audited(&mut journal,10).unwrap();
+  a.grant(id(1,2),VIEW,90).unwrap();
+  assert_eq!(a.owner_rights_checked(id(1,1),11),Err(Error::Denied));
+  assert_eq!(a.owner_rights_checked(id(1,2),11),Ok(VIEW));
+ }
+}
