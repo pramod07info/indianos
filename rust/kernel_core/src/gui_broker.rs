@@ -827,3 +827,83 @@ mod r012_damage_presentation_tests{
   assert_eq!(q.pending(),0);
  }
 }
+
+/// R013 fair one-owner-at-a-time compositor presentation. An owner with
+/// many queued frames cannot permanently starve a different owner.
+impl<const N:usize> DamageQueue<N>{
+ pub fn present_fair(&mut self,last_owner:Option<u32>,out:&mut[FrameDamage])
+   ->Result<(u32,u64,usize),Error>{
+  let first=self.entries[..self.len].iter().flatten().next().copied()
+    .ok_or(Error::Empty)?;
+  let chosen=self.entries[..self.len].iter().flatten()
+    .find(|event|Some(event.owner)!=last_owner)
+    .copied().unwrap_or(first);
+  let needed=self.entries[..self.len].iter().flatten().filter(|e|
+    e.owner==chosen.owner&&e.epoch==chosen.epoch).count();
+  if out.len()<needed{return Err(Error::Full);}
+  let mut written=0;
+  for event in self.entries[..self.len].iter().flatten(){
+   if event.owner==chosen.owner&&event.epoch==chosen.epoch{
+    out[written]=*event;written+=1;
+   }
+  }
+  let retired=self.acknowledge(chosen.owner,chosen.epoch)?;
+  Ok((chosen.owner,chosen.epoch,retired))
+ }
+ pub fn fault_owner<const W:usize,const Q:usize>(
+  &mut self,broker:&mut Broker<W,Q>,owner:u32)->usize{
+  broker.revoke(owner);
+  self.invalidate_owner(owner)
+ }
+ pub fn distinct_owners(&self)->usize{
+  let mut count=0;
+  for i in 0..self.len{
+   if let Some(event)=self.entries[i]{
+    if !self.entries[..i].iter().flatten().any(|e|e.owner==event.owner){
+     count+=1;
+    }
+   }
+  }
+  count
+ }
+}
+#[cfg(test)]
+mod r013_fair_frames_tests{
+ use super::*;use crate::agent_05_surface_rect::Rectangle;
+ fn layout()->SurfaceLayout<2>{
+  let mut l=SurfaceLayout::new();
+  l.grant(1,10,Rectangle{x:0,y:0,width:40,height:30}).unwrap();
+  l.grant(2,20,Rectangle{x:0,y:0,width:40,height:30}).unwrap();l
+ }
+ fn blank()->FrameDamage{FrameDamage{owner:0,window:0,epoch:0,
+  x:0,y:0,width:0,height:0}}
+ #[test]fn round_robin_owner_switches_with_backlog(){
+  let l=layout();let mut q=DamageQueue::<4>::new();
+  q.submit(&l,1,&[(10,0,0,2,2)]).unwrap();
+  q.submit(&l,1,&[(10,3,3,2,2)]).unwrap();
+  q.submit(&l,2,&[(20,0,0,1,1)]).unwrap();
+  assert_eq!(q.distinct_owners(),2);
+  let mut out=[blank();2];
+  assert_eq!(q.present_fair(None,&mut out).unwrap().0,1);
+  assert_eq!(q.present_fair(Some(1),&mut out).unwrap().0,2);
+  assert_eq!(q.present_fair(Some(2),&mut out).unwrap().0,1);
+  assert_eq!(q.pending(),0);
+ }
+ #[test]fn undersized_output_never_consumes_frames(){
+  let l=layout();let mut q=DamageQueue::<3>::new();
+  q.submit(&l,1,&[(10,0,0,2,2),(10,3,3,2,2)]).unwrap();
+  let mut out=[blank();1];
+  assert_eq!(q.present_fair(None,&mut out),Err(Error::Full));
+  assert_eq!(q.pending(),2);assert_eq!(out,[blank()]);
+ }
+ #[test]fn crashing_owner_preserves_peer_frames(){
+  let l=layout();let mut q=DamageQueue::<2>::new();
+  let mut broker=Broker::<2,4>::new();
+  broker.grant(1,10).unwrap();broker.grant(2,20).unwrap();
+  q.submit(&l,1,&[(10,0,0,2,2)]).unwrap();
+  q.submit(&l,2,&[(20,0,0,2,2)]).unwrap();
+  assert_eq!(q.fault_owner(&mut broker,1),1);
+  assert_eq!(q.pending(),1);
+  assert_eq!(q.present_fair(None,&mut[blank()]).unwrap().0,2);
+ }
+}

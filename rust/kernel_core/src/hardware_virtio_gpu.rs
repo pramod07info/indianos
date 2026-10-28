@@ -806,3 +806,78 @@ mod r012_framebuffer_fallback_tests{
   assert_eq!(choose_backend(false,true,true),RenderBackend::CpuSafe);
  }
 }
+
+/// R013 CPU fallback compositor: perform a real pixel copy from a trusted
+/// unprivileged bitmap into an owned scanout. Source and framebuffer are
+/// independent buffers; this does not configure virtio GPU DMA.
+pub fn cpu_blit_argb(display:Scanout,src:&[u32],source_stride:usize,
+  framebuffer:&mut[u32],target_stride:usize,
+  source_width:u32,source_height:u32,x:u32,y:u32)
+   ->Result<usize,Error>{
+ if display.width==0||display.height==0||
+    display.width>MAX_WIDTH||display.height>MAX_HEIGHT||
+    source_width==0||source_height==0||
+    source_stride<source_width as usize||
+    target_stride<display.width as usize||
+    x.checked_add(source_width).is_none_or(|v|v>display.width)||
+    y.checked_add(source_height).is_none_or(|v|v>display.height){
+  return Err(Error::Dimensions);
+ }
+ let source_required=source_stride.checked_mul(source_height as usize)
+   .ok_or(Error::Dimensions)?;
+ let target_required=target_stride.checked_mul(display.height as usize)
+   .ok_or(Error::Dimensions)?;
+ if src.len()<source_required||framebuffer.len()<target_required{
+  return Err(Error::Dimensions);
+ }
+ for row in 0..source_height as usize{
+  let from=row*source_stride;
+  let to=(y as usize+row)*target_stride+x as usize;
+  framebuffer[to..to+source_width as usize]
+    .copy_from_slice(&src[from..from+source_width as usize]);
+ }
+ Ok((source_width as usize)*(source_height as usize))
+}
+/// Simple alpha composition of a pre-multiplied ARGB foreground over a
+/// packed opaque destination. Validation runs before any pixel changes.
+pub fn cpu_blend_pixel(dst:&mut[u32],width:usize,height:usize,stride:usize,
+  x:usize,y:usize,argb:u32)->Result<(),Error>{
+ let required=stride.checked_mul(height).ok_or(Error::Dimensions)?;
+ if width==0||height==0||stride<width||x>=width||y>=height||
+    dst.len()<required{return Err(Error::Dimensions);}
+ let index=y*stride+x;let alpha=(argb>>24)&255;
+ let inverse=255-alpha;let old=dst[index];
+ let blend=|shift:u32|{
+  let fg=(argb>>shift)&255;let bg=(old>>shift)&255;
+  (fg*alpha+bg*inverse+127)/255
+ };
+ dst[index]=0xff00_0000|(blend(16)<<16)|(blend(8)<<8)|blend(0);
+ Ok(())
+}
+#[cfg(test)]
+mod r013_cpu_blitter_tests{
+ use super::*;
+ fn screen()->Scanout{Scanout{width:4,height:3,scanout:0}}
+ #[test]fn two_by_two_pixel_blit_keeps_row_padding_untouched(){
+  let mut out=[0xaa_u32;18];let src=[0x12,0x34,0x56,0x78];
+  assert_eq!(cpu_blit_argb(screen(),&src,2,&mut out,6,2,2,1,1),Ok(4));
+  assert_eq!(out[7],0x12);assert_eq!(out[8],0x34);
+  assert_eq!(out[13],0x56);assert_eq!(out[14],0x78);
+  assert_eq!(out[6],0xaa);assert_eq!(out[9],0xaa);
+ }
+ #[test]fn invalid_bounds_reject_before_framebuffer_mutation(){
+  let mut out=[0xaa_u32;12];let src=[1u32;4];
+  assert_eq!(cpu_blit_argb(screen(),&src,2,&mut out,4,2,2,3,2),
+   Err(Error::Dimensions));
+  assert_eq!(cpu_blit_argb(screen(),&src,1,&mut out,4,2,2,0,0),
+   Err(Error::Dimensions));
+  assert_eq!(out,[0xaa;12]);
+ }
+ #[test]fn alpha_pixel_rejects_bad_layout_and_blends_valid_pixel(){
+  let mut out=[0xff00_0000;4];
+  assert_eq!(cpu_blend_pixel(&mut out,2,2,2,2,0,0xff0000ff),
+   Err(Error::Dimensions));
+  assert_eq!(cpu_blend_pixel(&mut out,2,2,2,0,0,0xffff0000),Ok(()));
+  assert_eq!(out[0],0xffff0000);assert_eq!(out[1],0xff000000);
+ }
+}
