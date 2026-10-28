@@ -246,3 +246,98 @@ impl<const N:usize> WindowMap<N>{
         assert_eq!(map.hit(5,5).unwrap().unwrap().id,1);
     }
 }
+
+
+// R008 desktop session state; GPU scanout and input-driver hookup remain separate.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct SessionWindow{pub window:WindowHit,pub minimized:bool}
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum SessionFault{Invalid,Missing,Duplicate,Full,Geometry(RectError)}
+#[derive(Clone,Copy)]
+pub struct FocusSession<const N:usize>{
+ windows:[Option<SessionWindow>;N],focus:Option<u32>,
+}
+impl<const N:usize> FocusSession<N>{
+ pub const fn new()->Self{Self{windows:[None;N],focus:None}}
+ pub fn focused(&self)->Option<u32>{self.focus}
+ pub fn visible(&self)->usize{self.windows.iter().flatten().filter(|v|!v.minimized).count()}
+ pub fn open(&mut self,w:WindowHit)->Result<(),SessionFault>{
+  if w.id==0||w.owner.pid==0||w.owner.generation==0{return Err(SessionFault::Invalid)}
+  edges(w.bounds).map_err(SessionFault::Geometry)?;
+  if self.windows.iter().flatten().any(|v|v.window.id==w.id||v.window.z==w.z){
+   return Err(SessionFault::Duplicate);
+  }
+  let slot=self.windows.iter_mut().find(|v|v.is_none()).ok_or(SessionFault::Full)?;
+  *slot=Some(SessionWindow{window:w,minimized:false});self.focus=Some(w.id);Ok(())
+ }
+ pub fn hit(&self,x:u32,y:u32)->Result<Option<WindowHit>,SessionFault>{
+  let mut top:Option<WindowHit>=None;
+  for v in self.windows.iter().flatten(){
+   let (right,bottom)=edges(v.window.bounds).map_err(SessionFault::Geometry)?;
+   if !v.minimized&&x>=v.window.bounds.x&&x<right&&
+    y>=v.window.bounds.y&&y<bottom&&
+    top.is_none_or(|old|v.window.z>old.z){top=Some(v.window)}
+  }
+  Ok(top)
+ }
+ pub fn focus_at(&mut self,x:u32,y:u32)->Result<Option<u32>,SessionFault>{
+  let next=self.hit(x,y)?.map(|w|w.id);self.focus=next;Ok(next)
+ }
+ pub fn keyboard_owner(&self)->Option<SurfacePrincipal>{
+  self.windows.iter().flatten().find(|v|!v.minimized&&
+   Some(v.window.id)==self.focus).map(|v|v.window.owner)
+ }
+ pub fn minimize(&mut self,id:u32,who:SurfacePrincipal,hide:bool)
+  ->Result<(),SessionFault>{
+  let slot=self.windows.iter_mut().find(|x|x.is_some_and(|v|v.window.id==id))
+   .ok_or(SessionFault::Missing)?;
+  let v=slot.as_mut().ok_or(SessionFault::Missing)?;
+  if who.pid==0||who!=v.window.owner{return Err(SessionFault::Invalid)}
+  v.minimized=hide;
+  if hide&&self.focus==Some(id){self.focus=None}
+  if !hide{self.focus=Some(id)}
+  Ok(())
+ }
+ pub fn close(&mut self,id:u32,who:SurfacePrincipal)->Result<(),SessionFault>{
+  let slot=self.windows.iter_mut().find(|x|x.is_some_and(|v|v.window.id==id))
+   .ok_or(SessionFault::Missing)?;
+  if who.pid==0||slot.as_ref().ok_or(SessionFault::Missing)?.window.owner!=who{
+   return Err(SessionFault::Invalid)
+  }
+  *slot=None;if self.focus==Some(id){self.focus=None}Ok(())
+ }
+}
+#[cfg(test)]mod r008_desktop_focus_tests{
+ use super::*;
+ fn p(pid:u32,generation:u64)->SurfacePrincipal{SurfacePrincipal{pid,generation}}
+ fn w(id:u32,z:u16,owner:SurfacePrincipal,x:u32)->WindowHit{
+  WindowHit{id,z,owner,bounds:Rectangle{x,y:0,width:100,height:100}}
+ }
+ #[test]fn overlap_focus_and_keyboard_isolation(){
+  let mut d=FocusSession::<2>::new();
+  d.open(w(1,1,p(8,2),0)).unwrap();d.open(w(2,2,p(9,3),20)).unwrap();
+  assert_eq!(d.focus_at(30,10),Ok(Some(2)));
+  assert_eq!(d.keyboard_owner(),Some(p(9,3)));
+  assert_eq!(d.minimize(2,p(9,2),true),Err(SessionFault::Invalid));
+  d.minimize(2,p(9,3),true).unwrap();
+  assert_eq!(d.focus_at(30,10),Ok(Some(1)));
+  assert_eq!(d.keyboard_owner(),Some(p(8,2)));
+ }
+ #[test]fn minimize_restore_and_owner_scoped_close(){
+  let mut d=FocusSession::<1>::new();
+  d.open(w(1,1,p(7,1),0)).unwrap();
+  d.minimize(1,p(7,1),true).unwrap();
+  assert_eq!(d.visible(),0);
+  d.minimize(1,p(7,1),false).unwrap();
+  assert_eq!(d.focused(),Some(1));
+  assert_eq!(d.close(1,p(7,2)),Err(SessionFault::Invalid));
+  d.close(1,p(7,1)).unwrap();assert_eq!(d.visible(),0);
+ }
+ #[test]fn invalid_geometry_is_never_published(){
+  let mut d=FocusSession::<1>::new();
+  let invalid=WindowHit{id:1,z:1,owner:p(1,1),
+   bounds:Rectangle{x:1280,y:0,width:10,height:10}};
+  assert_eq!(d.open(invalid),Err(SessionFault::Geometry(RectError::OutsideScreen)));
+  assert_eq!(d.focused(),None);
+ }
+}
