@@ -183,7 +183,7 @@ mod r012_workspace_restore_tests{
   assert_eq!(w.execute(id(2),1,b"cat /note",&mut out),Ok(5));
   assert_eq!(&out[..5],b"hello");
  }
- #[test]fn corrupted_backup_and foreign_generation_fail_without_mutation(){
+ #[test]fn corrupted_backup_and_foreign_generation_fail_without_mutation(){
   let mut w=ready();let mut out=[0u8;OUTPUT_MAX];
   w.execute(id(2),1,b"write /note safe",&mut out).unwrap();
   let mut snapshot=[0u8;512];
