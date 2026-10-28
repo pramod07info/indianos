@@ -748,3 +748,82 @@ mod r011_damage_queue_tests{
   assert_eq!(q.drain(&mut out),Ok(1));assert_eq!(out[0].owner,4);
  }
 }
+
+
+/// R012: compositor acknowledgement is separate from fetching draw work.
+/// Failed or untrusted presentation must not discard pending damage.
+impl<const N:usize> DamageQueue<N>{
+ pub fn preview_owner(&self,owner:u32,out:&mut[FrameDamage])
+  ->Result<usize,Error>{
+  if owner==0{return Err(Error::Unauthorized);}
+  let required=self.entries[..self.len].iter().flatten()
+    .filter(|d|d.owner==owner).count();
+  if out.len()<required{return Err(Error::Full);}
+  let mut copied=0;
+  for damage in self.entries[..self.len].iter().flatten(){
+   if damage.owner==owner{out[copied]=*damage;copied+=1;}
+  }
+  Ok(copied)
+ }
+ /// A trusted compositor calls this after a successful presentation fence.
+ /// Only exact owner/epoch records are removed, preserving other windows.
+ pub fn acknowledge(&mut self,owner:u32,epoch:u64)
+  ->Result<usize,Error>{
+  if owner==0||epoch==0{return Err(Error::Unauthorized);}
+  if !self.entries[..self.len].iter().flatten().any(|d|
+     d.owner==owner&&d.epoch==epoch){return Err(Error::Empty);}
+  let mut write=0;let mut removed=0;
+  for read in 0..self.len{
+   if let Some(d)=self.entries[read]{
+    if d.owner==owner&&d.epoch==epoch{removed+=1;}
+    else{self.entries[write]=Some(d);write+=1;}
+   }
+  }
+  self.entries[write..self.len].fill(None);self.len=write;
+  Ok(removed)
+ }
+ pub fn pending_owner(&self,owner:u32)->usize{
+  self.entries[..self.len].iter().flatten().filter(|d|d.owner==owner).count()
+ }
+}
+#[cfg(test)]
+mod r012_damage_presentation_tests{
+ use super::*;
+ use crate::agent_05_surface_rect::Rectangle;
+ fn layout()->SurfaceLayout<2>{
+  let mut l=SurfaceLayout::new();
+  l.grant(1,10,Rectangle{x:0,y:0,width:80,height:60}).unwrap();
+  l.grant(2,20,Rectangle{x:0,y:0,width:80,height:60}).unwrap();l
+ }
+ fn empty()->FrameDamage{FrameDamage{owner:0,window:0,epoch:0,
+  x:0,y:0,width:0,height:0}}
+ #[test]fn preview_does_not_consume_and_ack_releases_only_frame(){
+  let layout=layout();let mut q=DamageQueue::<4>::new();
+  let a=q.submit(&layout,1,&[(10,0,0,1,1),(10,3,3,2,2)]).unwrap();
+  let b=q.submit(&layout,2,&[(20,1,1,3,3)]).unwrap();
+  let mut out=[empty();2];
+  assert_eq!(q.preview_owner(1,&mut out),Ok(2));
+  assert_eq!(out[0].epoch,a);
+  assert_eq!(q.pending(),3);
+  assert_eq!(q.acknowledge(1,a),Ok(2));
+  assert_eq!(q.pending_owner(2),1);
+  assert_eq!(q.acknowledge(2,b),Ok(1));
+ }
+ #[test]fn rejected_wrong_epoch_and_short_buffer_do_not_mutate(){
+  let layout=layout();let mut q=DamageQueue::<2>::new();
+  let epoch=q.submit(&layout,1,&[(10,0,0,2,2),(10,2,2,1,1)]).unwrap();
+  let mut out=[empty();1];
+  assert_eq!(q.preview_owner(1,&mut out),Err(Error::Full));
+  assert_eq!(out,[empty()]);
+  assert_eq!(q.acknowledge(2,epoch),Err(Error::Empty));
+  assert_eq!(q.pending(),2);
+ }
+ #[test]fn removing_crashed_owner_preserves_others_ack_queue(){
+  let layout=layout();let mut q=DamageQueue::<2>::new();
+  q.submit(&layout,1,&[(10,0,0,1,1)]).unwrap();
+  let epoch=q.submit(&layout,2,&[(20,0,0,1,1)]).unwrap();
+  assert_eq!(q.invalidate_owner(1),1);
+  assert_eq!(q.acknowledge(2,epoch),Ok(1));
+  assert_eq!(q.pending(),0);
+ }
+}
