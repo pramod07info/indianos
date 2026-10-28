@@ -199,3 +199,77 @@ mod batch1_dependency_graph_tests{
     }
 }
 
+
+// R007: multiple application roots planned as one dependency-ordered,
+// permission-checked dry run. A separate trusted installer must persist
+// signed payloads, perform compatibility checks and execute transactions.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct MultiAppPlan{pub count:usize,pub requested_permissions:u32}
+pub fn plan_multi_roots(items:&[Dependency<'_>],roots:&[u16],
+    host:Architecture,granted:u32,consent:bool,
+    output:&mut[u16])->Result<MultiAppPlan,PlanError>{
+    if roots.is_empty()||roots.len()>MAX_DEPENDENCY_NODES{
+        return Err(PlanError::Empty);
+    }
+    if items.len()>MAX_DEPENDENCY_NODES{return Err(PlanError::TooMany);}
+    let mut ordered=[0u16;MAX_DEPENDENCY_NODES];
+    let mut total=0usize;
+    let mut permissions=0u32;
+    for (i,root) in roots.iter().enumerate(){
+        if *root==0{return Err(PlanError::Empty);}
+        if roots[..i].contains(root){return Err(PlanError::Duplicate);}
+        let mut scratch=[0u16;MAX_DEPENDENCY_NODES];
+        let n=plan_dependencies(items,*root,host,granted,consent,&mut scratch)?;
+        for &id in &scratch[..n]{
+            if !ordered[..total].contains(&id){
+                let entry=items.iter().find(|node|node.id==id)
+                    .ok_or(PlanError::Unknown)?;
+                permissions|=entry.candidate.requested_permissions;
+                ordered[total]=id;total+=1;
+            }
+        }
+    }
+    if total>output.len(){return Err(PlanError::OutputFull);}
+    output[..total].copy_from_slice(&ordered[..total]);
+    Ok(MultiAppPlan{count:total,requested_permissions:permissions})
+}
+#[cfg(test)]mod r007_multi_application_tests{
+    use super::*;
+    fn c(rights:u32)->Candidate{
+        Candidate{catalog_trusted:true,manifest_signed:true,
+            architecture:Architecture::X86_64,requested_permissions:rights}
+    }
+    #[test]fn shared_dependencies_are_installed_once_before_multiple_apps(){
+        let items=[
+            Dependency{id:1,dependencies:&[3],candidate:c(1)},
+            Dependency{id:2,dependencies:&[3],candidate:c(2)},
+            Dependency{id:3,dependencies:&[],candidate:c(4)}];
+        let mut out=[0u16;3];
+        assert_eq!(plan_multi_roots(&items,&[1,2],Architecture::X86_64,7,
+            true,&mut out),Ok(MultiAppPlan{count:3,requested_permissions:7}));
+        assert_eq!(out,[3,1,2]);
+    }
+    #[test]fn failed_permission_or_small_buffer_does_not_write_output(){
+        let items=[
+            Dependency{id:1,dependencies:&[2],candidate:c(1)},
+            Dependency{id:2,dependencies:&[],candidate:c(4)}];
+        let mut out=[77u16;1];
+        assert_eq!(plan_multi_roots(&items,&[1],Architecture::X86_64,7,
+            true,&mut out),Err(PlanError::OutputFull));
+        assert_eq!(out,[77]);
+        assert_eq!(plan_multi_roots(&items,&[1],Architecture::X86_64,1,
+            true,&mut out),
+            Err(PlanError::Policy(InstallError::PermissionDenied)));
+        assert_eq!(out,[77]);
+    }
+    #[test]fn duplicate_roots_and_unknown_dependencies_fail_closed(){
+        let items=[Dependency{id:1,dependencies:&[4],candidate:c(0)}];
+        assert_eq!(plan_multi_roots(&items,&[1],Architecture::X86_64,0,
+            true,&mut [0;2]),Err(PlanError::Unknown));
+        assert_eq!(plan_multi_roots(&items,&[1,1],Architecture::X86_64,0,
+            true,&mut [0;2]),Err(PlanError::Unknown));
+        let safe=[Dependency{id:1,dependencies:&[],candidate:c(0)}];
+        assert_eq!(plan_multi_roots(&safe,&[1,1],Architecture::X86_64,0,
+            true,&mut [0;2]),Err(PlanError::Duplicate));
+    }
+}
