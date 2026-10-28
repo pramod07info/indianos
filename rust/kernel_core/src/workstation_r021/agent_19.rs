@@ -39,7 +39,7 @@ impl Channel{
  pub fn eligible(&self,cohort:u32,target:Track)->bool{
   self.release.is_some_and(|r|
    (r.state==Stage::Canary||r.state==Stage::Full)&&
-   (cohort%100)<r.rollout_percent&&r.track==target)
+   (cohort%100)<(r.rollout_percent as u32)&&r.track==target)
  }
  pub fn pause(&mut self,admin:u32)->Result<(),Error>{
   let r=self.release.as_mut().ok_or(Error::Missing)?;
