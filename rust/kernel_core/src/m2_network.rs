@@ -783,3 +783,66 @@ mod r011_connection_lease_tests{
   assert_eq!(t.established(actor(2),6001,peer(),5),Ok(()));
  }
 }
+
+
+/// R012 require both a valid established owner+peer socket and independent
+/// certificate trust before authorizing a high-privilege OTA TLS channel.
+/// Still not a TLS record-layer or packet-sending implementation.
+pub fn permit_https<const N:usize,const P:usize,V:TlsCertificateVerifier>(
+ connections:&ConnectionTable<N>,endpoint:&Endpoint<P>,
+ actor:Identity,local_port:u16,peer:TcpPeer,
+ now:u64,hostname:&[u8],certificate:&[u8],verifier:&V
+)->Result<(),Error>{
+ if !peer.valid()||peer.port!=443||
+   !connections.verified(actor,local_port,peer){
+  return Err(Error::Denied);
+ }
+ endpoint.allow_tls(actor,local_port,now,hostname,certificate,verifier)
+}
+/// Avoid retaining completed or dead process sockets after a trust epoch
+/// changes; only a trusted scheduler may nominate the retiring identity.
+impl<const N:usize> ConnectionTable<N>{
+ pub fn purge_deadline(&mut self,now:u64)->usize{
+  let mut count=0;
+  for slot in &mut self.leases{
+   if slot.is_some_and(|s|!s.established&&s.deadline<now){
+     *slot=None;count+=1;
+   }
+  }
+  count
+ }
+ pub fn active(&self)->usize{self.leases.iter().flatten().count()}
+ pub fn established_count(&self,actor:Identity)->usize{
+  self.leases.iter().flatten().filter(|s|s.actor==actor&&s.established).count()
+ }
+}
+#[cfg(test)]
+mod r012_secure_network_tests{
+ use super::*;
+ fn owner()->Identity{Identity{pid:1,generation:2}}
+ fn peer()->TcpPeer{TcpPeer{address:[1,2,3,4],port:443}}
+ #[test]fn tcp_lease_expires_before_establishment_and_is_reclaimed(){
+  let mut connections=ConnectionTable::<2>::new();
+  connections.begin(owner(),6000,peer(),5,8).unwrap();
+  assert_eq!(connections.established_count(owner()),0);
+  assert_eq!(connections.purge_deadline(14),1);
+  assert_eq!(connections.active(),0);
+  assert_eq!(connections.established(owner(),6000,peer(),10),Err(Error::NotFound));
+ }
+ #[test]fn trusted_peer_only_marked_established_in_valid_window(){
+  let mut connections=ConnectionTable::<2>::new();
+  connections.begin(owner(),6000,peer(),5,8).unwrap();
+  connections.established(owner(),6000,peer(),13).unwrap();
+  assert_eq!(connections.established_count(owner()),1);
+  assert_eq!(connections.purge_deadline(30),0);
+  assert!(connections.verified(owner(),6000,peer()));
+ }
+ #[test]fn stale_pid_epoch_does_not_observe_current_tcp_session(){
+  let mut connections=ConnectionTable::<1>::new();
+  connections.begin(owner(),6000,peer(),5,8).unwrap();
+  connections.established(owner(),6000,peer(),10).unwrap();
+  let stale=Identity{generation:3,..owner()};
+  assert!(!connections.verified(stale,6000,peer()));
+  assert_eq!(connections.established_count(stale),0);
+ }
+}
