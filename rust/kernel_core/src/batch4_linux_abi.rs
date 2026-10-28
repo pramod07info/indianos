@@ -285,7 +285,9 @@ impl<const N:usize> FileDescriptors<N>{
    fd:u32,handle:u64,rights:u8)->Result<(),FdError>{
   if owner.pid==0||owner.generation==0||fd<3||handle==0||
      rights==0||rights&!(FD_READ|FD_WRITE)!=0{return Err(FdError::Invalid);}
-  if self.entries.iter().flatten().any(|e|e.owner==owner&&e.fd==fd){
+  // File descriptors cannot ambiguously refer to two generations of the
+  // same numeric PID. A trusted scheduler must retire the old generation.
+  if self.entries.iter().flatten().any(|e|e.owner.pid==owner.pid&&e.fd==fd){
    return Err(FdError::Duplicate);
   }
   let slot=self.entries.iter_mut().find(|s|s.is_none()).ok_or(FdError::Full)?;
@@ -599,10 +601,11 @@ mod r013_linux_loader_tests{
   let mut f=FileDescriptors::<3>::new();
   f.attach(id(1),3,11,FD_READ).unwrap();
   f.attach(id(1),4,22,FD_WRITE).unwrap();
-  f.attach(id(2),4,33,FD_READ).unwrap();
+  assert_eq!(f.attach(id(2),4,33,FD_READ),Err(FdError::Duplicate));
+  f.attach(id(2),5,33,FD_READ).unwrap();
   f.dup2_scoped(id(1),3,4,FD_READ).unwrap();
   assert_eq!(f.resolve(id(1),4,FD_READ),Ok(11));
-  assert_eq!(f.resolve(id(2),4,FD_READ),Ok(33));
-  assert_eq!(f.dup2_scoped(id(2),4,3,FD_WRITE),Err(FdError::Denied));
+  assert_eq!(f.resolve(id(2),5,FD_READ),Ok(33));
+  assert_eq!(f.dup2_scoped(id(2),5,3,FD_WRITE),Err(FdError::Denied));
  }
 }
