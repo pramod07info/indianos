@@ -642,3 +642,109 @@ mod r010_focus_capture_tests{
   assert_eq!(input.focus(&mut broker,202).unwrap().owner,22);
  }
 }
+
+ 
+/// R011 generation-checked compositor work queue. A trusted surface broker
+/// supplies ownership; no window ID in a client event grants draw authority.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct FrameDamage{pub owner:u32,pub window:u32,pub epoch:u64,
+ pub x:u32,pub y:u32,pub width:u32,pub height:u32}
+pub struct DamageQueue<const N:usize>{
+ entries:[Option<FrameDamage>;N],len:usize,next_epoch:u64,
+}
+impl<const N:usize> DamageQueue<N>{
+ pub const fn new()->Self{Self{entries:[None;N],len:0,next_epoch:1}}
+ pub fn pending(&self)->usize{self.len}
+ pub fn invalidate_owner(&mut self,owner:u32)->usize{
+  let mut out=0;
+  for i in 0..self.len{
+   if let Some(d)=self.entries[i]{
+    if d.owner==owner{out+=1;self.entries[i]=None;}
+   }
+  }
+  if out>0{
+   let mut write=0;
+   for read in 0..self.len{
+    if let Some(d)=self.entries[read]{self.entries[write]=Some(d);write+=1;}
+   }
+   for i in write..self.len{self.entries[i]=None;}
+   self.len=write;
+  }
+  out
+ }
+ /// Validate whole batch, including window ownership and rectangles, before
+ /// publishing any frame updates.
+ pub fn submit<const W:usize>(&mut self,layout:&SurfaceLayout<W>,
+  owner:u32,requests:&[(u32,u32,u32,u32,u32)])->Result<u64,Error>{
+  if owner==0||requests.is_empty()||requests.len()>N.saturating_sub(self.len){
+   return Err(Error::Full);
+  }
+  let sequence=self.next_epoch.checked_add(1).ok_or(Error::Exhausted)?;
+  for &(window,x,y,w,h) in requests{
+   let geometry=layout.geometry(owner,window)?;
+   if w==0||h==0||x.checked_add(w).is_none()||
+      y.checked_add(h).is_none()||
+      x.checked_add(w).is_none_or(|end|end>geometry.width)||
+      y.checked_add(h).is_none_or(|end|end>geometry.height){
+    return Err(Error::Invalid);
+   }
+  }
+  for &(window,x,y,w,h) in requests{
+   self.entries[self.len]=Some(FrameDamage{owner,window,epoch:sequence,
+      x,y,width:w,height:h});
+   self.len+=1;
+  }
+  self.next_epoch=sequence;Ok(sequence)
+ }
+ /// Fail-atomic drain: caller provides all required output slots and each
+ /// output entry has the same monotonically assigned frame epoch.
+ pub fn drain(&mut self,out:&mut[FrameDamage])->Result<usize,Error>{
+  if out.len()<self.len{return Err(Error::Full);}
+  let n=self.len;
+  for (i,slot) in self.entries[..n].iter().enumerate(){
+   out[i]=slot.ok_or(Error::Invalid)?;
+  }
+  self.entries[..n].fill(None);self.len=0;Ok(n)
+ }
+}
+#[cfg(test)]
+mod r011_damage_queue_tests{
+ use super::*;
+ use crate::agent_05_surface_rect::Rectangle;
+ fn layout()->SurfaceLayout<3>{
+  let mut l=SurfaceLayout::<3>::new();
+  l.grant(3,10,Rectangle{x:0,y:0,width:100,height:80}).unwrap();
+  l.grant(4,20,Rectangle{x:100,y:40,width:50,height:40}).unwrap();l
+ }
+ #[test]fn redraw_batch_is_all_or_nothing_and_epoch_ordered(){
+  let l=layout();let mut q=DamageQueue::<3>::new();
+  assert_eq!(q.submit(&l,3,&[(10,0,0,10,10),(20,0,0,10,10)]),
+    Err(Error::Unauthorized));
+  assert_eq!(q.pending(),0);
+  let first=q.submit(&l,3,&[(10,0,0,10,10),(10,60,50,30,20)]).unwrap();
+  assert_eq!(q.submit(&l,3,&[(10,100,0,1,1)]),Err(Error::Invalid));
+  let mut out=[FrameDamage{owner:0,window:0,epoch:0,
+    x:0,y:0,width:0,height:0};3];
+  assert_eq!(q.drain(&mut out),Ok(2));
+  assert_eq!(out[0].epoch,first);assert_eq!(out[1].epoch,first);
+  assert_eq!(q.pending(),0);
+ }
+ #[test]fn short_output_does_not_consume_pending_frames(){
+  let l=layout();let mut q=DamageQueue::<2>::new();
+  q.submit(&l,3,&[(10,0,0,5,5),(10,10,10,5,5)]).unwrap();
+  let mut short=[FrameDamage{owner:0,window:0,epoch:0,
+    x:0,y:0,width:0,height:0};1];
+  assert_eq!(q.drain(&mut short),Err(Error::Full));
+  assert_eq!(q.pending(),2);
+ }
+ #[test]fn crashed_client_cannot_erase_other_clients_frame(){
+  let l=layout();let mut q=DamageQueue::<3>::new();
+  q.submit(&l,3,&[(10,0,0,5,5)]).unwrap();
+  q.submit(&l,4,&[(20,1,1,5,5)]).unwrap();
+  assert_eq!(q.invalidate_owner(3),1);
+  assert_eq!(q.pending(),1);
+  let mut out=[FrameDamage{owner:0,window:0,epoch:0,
+    x:0,y:0,width:0,height:0};1];
+  assert_eq!(q.drain(&mut out),Ok(1));assert_eq!(out[0].owner,4);
+ }
+}
