@@ -479,3 +479,78 @@ mod r012_rebalance_tests{
   assert_eq!(q.total_runnable(),1);
  }
 }
+
+/// R013 load-balancing admission with a maximum migration budget and
+/// deterministic CPU mask; actual cross-core synchronization/IPIs remain
+/// the responsibility of the trusted SMP scheduler.
+impl<const C:usize,const N:usize> CoreRunQueues<C,N>{
+ pub fn balance_budgeted(&mut self,allowed:u64,max_moves:usize,
+   out:&mut[Runnable])->Result<usize,DispatchError>{
+  if allowed==0||C==0{return Err(DispatchError::InvalidCpu);}
+  if out.len()<max_moves{return Err(DispatchError::Full);}
+  let mut staged=Self{queues:self.queues,length:self.length,cursor:self.cursor};
+  let mut n=0;
+  while n<max_moves{
+   match staged.rebalance_once(allowed)?{
+    Some(task)=>{out[n]=task;n+=1;}
+    None=>break,
+   }
+  }
+  self.queues=staged.queues;self.length=staged.length;self.cursor=staged.cursor;
+  Ok(n)
+ }
+ /// Reclaim exactly one authenticated task incarnation across all CPUs.
+ /// Never treat numeric PID reuse as permission to kill a newer epoch.
+ pub fn evict_exact(&mut self,pid:u32,generation:u64)
+   ->Result<usize,DispatchError>{
+  if pid==0||generation==0{return Err(DispatchError::InvalidTask);}
+  Ok(self.evict(pid,generation))
+ }
+ /// Validate each per-CPU work queue's basic invariants before SMP
+ /// rendezvous or QEMU scheduling acceptance is claimed.
+ pub fn validate_queues(&self)->Result<usize,DispatchError>{
+  let mut total=0usize;
+  for cpu in 0..C{
+   if self.length[cpu]>N{return Err(DispatchError::Full);}
+   for i in 0..self.length[cpu]{
+    let task=self.queues[cpu][i].ok_or(DispatchError::InvalidTask)?;
+    if task.pid==0||task.generation==0{return Err(DispatchError::InvalidTask);}
+    for j in i+1..self.length[cpu]{
+     if self.queues[cpu][j].is_some_and(|t|
+       t.pid==task.pid&&t.generation==task.generation){
+      return Err(DispatchError::Duplicate);
+     }
+    }
+    total+=1;
+   }
+  }
+  Ok(total)
+ }
+}
+#[cfg(test)]
+mod r013_cpu_fairness_tests{
+ use super::*;
+ fn t(pid:u32,gen:u64)->Runnable{Runnable{pid,generation:gen,priority:1}}
+ #[test]fn multiple_moves_preserve_all_tasks_and_balance_cores(){
+  let mut q=CoreRunQueues::<3,5>::new();
+  for pid in 1..=5{q.enqueue(0,t(pid,1)).unwrap();}
+  let mut moved=[t(99,1);3];
+  let n=q.balance_budgeted(0b111,3,&mut moved).unwrap();
+  assert!(n>0);assert_eq!(q.total_runnable(),5);
+  assert_eq!(q.validate_queues(),Ok(5));
+ }
+ #[test]fn short_move_output_never_mutates_queues(){
+  let mut q=CoreRunQueues::<2,3>::new();
+  q.enqueue(0,t(1,1)).unwrap();q.enqueue(0,t(2,1)).unwrap();
+  let mut short=[t(99,1);1];
+  assert_eq!(q.balance_budgeted(3,2,&mut short),Err(DispatchError::Full));
+  assert_eq!(q.queue_len(0),Ok(2));assert_eq!(short,[t(99,1)]);
+ }
+ #[test]fn kill_old_epoch_preserves_new_epoch_after_pid_reuse(){
+  let mut q=CoreRunQueues::<2,3>::new();
+  q.enqueue(0,t(10,1)).unwrap();q.enqueue(1,t(10,2)).unwrap();
+  assert_eq!(q.evict_exact(10,1),Ok(1));
+  assert_eq!(q.next(1),Ok(t(10,2)));
+  assert_eq!(q.validate_queues(),Ok(1));
+ }
+}
