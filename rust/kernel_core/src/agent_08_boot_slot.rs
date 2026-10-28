@@ -413,7 +413,7 @@ pub enum TrialFault{Invalid,Pending,Missing,Policy(UpdatePolicyError)}
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 pub struct BootTrial{
  pub journal:Journal,pub active:usize,pub pending:Option<usize>,
- pub minimum_version:u64,
+ pub minimum_version:u64,pub attempted:bool,
 }
 impl BootTrial{
  pub fn new(journal:Journal,active:usize,minimum_version:u64)->Result<Self,TrialFault>{
@@ -421,7 +421,7 @@ impl BootTrial{
    !bootable(journal.slots[active],minimum_version){
    return Err(TrialFault::Invalid)
   }
-  Ok(Self{journal,active,pending:None,minimum_version})
+  Ok(Self{journal,active,pending:None,minimum_version,attempted:false})
  }
  pub fn stage(&mut self,version:u64,verified:bool,budget:u8,
   power_sufficient:bool)->Result<usize,TrialFault>{
@@ -431,35 +431,42 @@ impl BootTrial{
    .map_err(TrialFault::Policy)?;
   let target=1-self.active;
   if !bootable(update.slots[target],self.minimum_version){return Err(TrialFault::Invalid)}
-  self.journal=update;self.pending=Some(target);Ok(target)
+  self.journal=update;self.pending=Some(target);self.attempted=false;Ok(target)
  }
  pub fn consume_attempt(&mut self,selected:usize)->Result<u8,TrialFault>{
   if self.pending!=Some(selected){return Err(TrialFault::Missing)}
+  if self.attempted{return Err(TrialFault::Invalid)}
   let s=self.journal.slots[selected];
   if !bootable(s,self.minimum_version){return Err(TrialFault::Invalid)}
   let next=self.journal.generation.checked_add(1).ok_or(TrialFault::Invalid)?;
   self.journal.slots[selected].attempts_remaining-=1;
-  self.journal.generation=next;
+  self.journal.generation=next;self.attempted=true;
   Ok(self.journal.slots[selected].attempts_remaining)
  }
  pub fn healthy(&mut self,selected:usize,observed_version:u64,budget:u8)
   ->Result<(),TrialFault>{
   if self.pending!=Some(selected){return Err(TrialFault::Missing)}
-  self.journal=confirm_boot_healthy(self.journal,selected,observed_version,budget)
-   .map_err(TrialFault::Policy)?;
-  self.active=selected;self.pending=None;Ok(())
+  if !self.attempted||budget==0{return Err(TrialFault::Invalid)}
+  let slot=self.journal.slots[selected];
+  if !slot.valid_metadata||!slot.committed||slot.version!=observed_version {
+   return Err(TrialFault::Policy(UpdatePolicyError::Stale))
+  }
+  let next=self.journal.generation.checked_add(1).ok_or(TrialFault::Invalid)?;
+  self.journal.slots[selected].attempts_remaining=budget;
+  self.journal.generation=next;
+  self.active=selected;self.pending=None;self.attempted=false;Ok(())
  }
  pub fn fail(&mut self,selected:usize)->Result<usize,TrialFault>{
   if self.pending!=Some(selected){return Err(TrialFault::Missing)}
   let (rollback,backup)=rollback_after_failure(self.journal,selected,self.minimum_version)
    .map_err(TrialFault::Policy)?;
-  self.journal=rollback;self.active=backup;self.pending=None;Ok(backup)
+  self.journal=rollback;self.active=backup;self.pending=None;self.attempted=false;Ok(backup)
  }
  pub fn cancel(&mut self)->Result<(),TrialFault>{
   let target=self.pending.ok_or(TrialFault::Missing)?;
   let next=self.journal.generation.checked_add(1).ok_or(TrialFault::Invalid)?;
   self.journal.slots[target].attempts_remaining=0;
-  self.journal.generation=next;self.pending=None;Ok(())
+  self.journal.generation=next;self.pending=None;self.attempted=false;Ok(())
  }
 }
 #[cfg(test)]mod r008_ota_trial_tests{
@@ -491,5 +498,14 @@ impl BootTrial{
   assert_eq!(t.healthy(0,6,2),Err(TrialFault::Missing));
   assert_eq!(t.stage(7,true,2,true),Err(TrialFault::Pending));
   t.cancel().unwrap();assert_eq!(t.pending,None);
+ }
+ #[test]fn last_boot_attempt_may_still_be_confirmed_healthy(){
+  let mut t=BootTrial::new(journal(),0,5).unwrap();
+  t.stage(8,true,1,true).unwrap();
+  assert_eq!(t.consume_attempt(1),Ok(0));
+  assert_eq!(t.consume_attempt(1),Err(TrialFault::Invalid));
+  t.healthy(1,8,3).unwrap();
+  assert_eq!(t.active,1);
+  assert_eq!(t.journal.slots[1].attempts_remaining,3);
  }
 }
