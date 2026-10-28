@@ -582,3 +582,66 @@ mod r012_quantum_budget_integration_tests{
   assert_eq!(svc.active_count_scoped(id(1)),Ok(0));
  }
 }
+
+/// R013 charge real CPU work credits for quantum-simulator admissions.
+/// Earlier read-only quota preflight could admit repeatedly without ever
+/// consuming credits. This path charges each successful job exactly once.
+impl<const N:usize> QuantumWorkBudget<N>{
+ pub fn charge(&mut self,owner:Identity)->Result<u16,ServiceError>{
+  if owner.pid==0||owner.generation==0{
+   return Err(ServiceError::InvalidOwner);
+  }
+  let grant=self.grants.iter_mut().flatten().find(|g|g.owner==owner)
+   .ok_or(ServiceError::NotOwner)?;
+  if grant.consumed>=grant.credits{return Err(ServiceError::NotOwner);}
+  grant.consumed+=1;Ok(grant.credits-grant.consumed)
+ }
+ pub fn active_owners(&self)->usize{
+  self.grants.iter().flatten().filter(|g|g.consumed<g.credits).count()
+ }
+}
+pub fn submit_charged<const N:usize>(service:&mut QuantumService,
+  budget:&mut QuantumWorkBudget<N>,owner:Identity,request:&[u8],
+  active_limit:usize)->Result<u64,ServiceError>{
+ if budget.remaining(owner).is_none_or(|credits|credits==0){
+  return Err(ServiceError::NotOwner);
+ }
+ // Only debit quota AFTER a valid queue submission. No charge is made
+ // for malformed jobs, queue exhaustion, or an unrelated PID generation.
+ let job=service.submit_quotad_scoped(owner,request,active_limit)?;
+ if let Err(e)=budget.charge(owner){
+  service.release_scoped(owner,job)?;
+  return Err(e);
+ }
+ Ok(job)
+}
+#[cfg(test)]
+mod r013_charged_simulation_tests{
+ use super::*;
+ const BELL:[u8;10]=[1,2,2,0,1,0,0,4,0,1];
+ fn id(g:u64)->Identity{Identity{pid:40,generation:g}}
+ #[test]fn two_credits_allow_exactly_two_successful_jobs(){
+  let mut svc=QuantumService::new();let mut b=QuantumWorkBudget::<1>::new();
+  b.admit(id(1),2).unwrap();
+  assert!(submit_charged(&mut svc,&mut b,id(1),&BELL,3).is_ok());
+  assert_eq!(b.remaining(id(1)),Some(1));
+  assert!(submit_charged(&mut svc,&mut b,id(1),&BELL,3).is_ok());
+  assert_eq!(b.remaining(id(1)),Some(0));
+  assert_eq!(submit_charged(&mut svc,&mut b,id(1),&BELL,3),
+    Err(ServiceError::NotOwner));
+ }
+ #[test]fn malformed_job_or_full_queue_does_not_spend_work_credit(){
+  let mut svc=QuantumService::new();let mut b=QuantumWorkBudget::<1>::new();
+  b.admit(id(1),2).unwrap();
+  assert!(submit_charged(&mut svc,&mut b,id(1),b"bad",2).is_err());
+  assert_eq!(b.remaining(id(1)),Some(2));
+ }
+ #[test]fn stale_pid_epoch_cannot_charge_new_process_grant(){
+  let mut svc=QuantumService::new();let mut b=QuantumWorkBudget::<1>::new();
+  b.admit(id(2),1).unwrap();
+  assert_eq!(submit_charged(&mut svc,&mut b,id(1),&BELL,1),
+    Err(ServiceError::NotOwner));
+  assert_eq!(b.remaining(id(2)),Some(1));
+  assert_eq!(b.active_owners(),1);
+ }
+}
