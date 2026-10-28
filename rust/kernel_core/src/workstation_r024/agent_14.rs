@@ -65,7 +65,7 @@ pub fn line_count(data:&[u8])->usize{
   assert_eq!(filter(b"hello\n",b"hello",Filter::Contains,&mut out),
    Err(Error::Full));assert_eq!(out,[88;3]);
  }
- #[test]fn empty_search_and missing_files_are rejected(){
+ #[test]fn empty_search_and_missing_files_are_rejected(){
   let fs=RamFs::<1>::new();let mut out=[0;64];
   assert_eq!(cat_grep(&fs,b"/missing",b"error",&mut out),Err(Error::Missing));
   assert_eq!(filter(b"foo",b"",Filter::Contains,&mut out),Err(Error::Invalid));
