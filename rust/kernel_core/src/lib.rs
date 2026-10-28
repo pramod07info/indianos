@@ -27,6 +27,8 @@ pub mod workstation_r020;
 pub mod workstation_r021;
 /// R022: integrated developer workspace with real RAM source operations, release gates and guest smoke.
 pub mod workstation_r022;
+/// R023: real guest file scaffold/editor/search/terminal APIs and integrated developer acceptance.
+pub mod workstation_r023;
 mod syscall;
 mod program;
 mod initramfs;
