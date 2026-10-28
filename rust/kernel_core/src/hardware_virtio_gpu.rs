@@ -958,3 +958,58 @@ mod r014_cpu_desktop_raster_tests{
     Err(Error::Dimensions));
  }
 }
+
+
+/// R016 safe CPU fallback: paint the desktop, menu strip, task dock and a
+/// bounded list of independent application panels in one validated pass.
+/// This is actual framebuffer memory painting, not an activated GPU driver.
+pub fn cpu_draw_workspace(display:Scanout,stride:usize,pixels:&mut[u32],
+  windows:&[Rect],colors:[u32;4])->Result<usize,Error>{
+ let width=display.width as usize;let height=display.height as usize;
+ if width<16||height<16||width>MAX_WIDTH as usize||
+   height>MAX_HEIGHT as usize||display.scanout>=16||
+   stride<width||stride.checked_mul(height).is_none_or(|n|n>pixels.len())||
+   windows.len()>12{return Err(Error::Dimensions);}
+ for &rect in windows{
+  if rect.width<3||rect.height<3||
+    rect.x.checked_add(rect.width).is_none_or(|e|e>display.width)||
+    rect.y.checked_add(rect.height).is_none_or(|e|e>display.height){
+   return Err(Error::Dimensions);
+  }
+ }
+ let full=Rect{x:0,y:0,width:display.width,height:display.height};
+ cpu_fill_rect(display,stride,pixels,full,colors[0])?;
+ cpu_fill_rect(display,stride,pixels,
+  Rect{height:3,..full},colors[1])?;
+ cpu_fill_rect(display,stride,pixels,
+  Rect{y:display.height-4,height:4,..full},colors[2])?;
+ for &rect in windows{
+  cpu_draw_panel(display,stride,pixels,rect,colors[0],colors[1],colors[3])?;
+ }
+ Ok(width*height)
+}
+#[cfg(test)]mod r016_cpu_workspace_tests{
+ use super::*;
+ fn d()->Scanout{Scanout{width:32,height:24,scanout:0}}
+ #[test]fn desktop_paints_menu_dock_and_two_windows(){
+  let mut p=[0u32;32*24];
+  let w=[Rect{x:2,y:4,width:10,height:10},
+    Rect{x:16,y:5,width:10,height:11}];
+  assert_eq!(cpu_draw_workspace(d(),32,&mut p,&w,[1,2,3,4]),Ok(768));
+  assert_eq!(p[0],2);assert_eq!(p[20*32],3);
+  assert_eq!(p[4*32+2],4);assert_eq!(p[6*32+17],2);
+ }
+ #[test]fn invalid_second_window_preflights_without_painting(){
+  let mut p=[99u32;768];
+  let windows=[Rect{x:2,y:4,width:10,height:10},
+   Rect{x:31,y:2,width:8,height:8}];
+  assert_eq!(cpu_draw_workspace(d(),32,&mut p,&windows,[1,2,3,4]),
+    Err(Error::Dimensions));assert_eq!(p,[99;768]);
+ }
+ #[test]fn stride_padding_is_preserved_and_small_displays_rejected(){
+  let mut p=[5u32;34*24];cpu_draw_workspace(d(),34,&mut p,&[],[1,2,3,4]).unwrap();
+  for row in 0..24{assert_eq!(&p[row*34+32..row*34+34],&[5,5]);}
+  assert_eq!(cpu_draw_workspace(Scanout{width:8,height:24,scanout:0},
+    34,&mut p,&[],[1,2,3,4]),Err(Error::Dimensions));
+ }
+}

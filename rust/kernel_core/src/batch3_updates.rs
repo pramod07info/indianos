@@ -680,3 +680,50 @@ mod r015_ota_challenge_lifecycle_tests {
   assert!(!tx.pending());assert!(!tx.challenge_pending());
  }
 }
+
+
+/// R016: choose a verified, monotonic recovery record from two independent
+/// COW metadata copies. Pending images are NEVER trusted from these checksums.
+pub fn recover_mirrored_slots(first:&[u8],second:&[u8],
+  version_floor:u64)->Result<SlotTransaction,UpdateError>{
+ let a=SlotTransaction::recovered_from_record(first,version_floor);
+ let b=SlotTransaction::recovered_from_record(second,version_floor);
+ match (a,b){
+  (Ok(a),Ok(b))=>if a.floor()>=b.floor(){Ok(a)}else{Ok(b)},
+  (Ok(a),Err(_))=>Ok(a),
+  (Err(_),Ok(b))=>Ok(b),
+  (Err(e),Err(_))=>Err(e),
+ }
+}
+pub fn recovery_record_matches(record:&[u8],slot:BootSlot,
+  minimum_version:u64)->bool{
+ SlotTransaction::recovered_from_record(record,minimum_version)
+   .is_ok_and(|tx|tx.active()==slot)
+}
+#[cfg(test)]mod r016_ota_mirror_tests{
+ use super::*;
+ #[test]fn newest_valid_metadata_wins_without_restoring_pending_image(){
+  let old=encode_slot_record(BootSlot::A,11,None);
+  let new=encode_slot_record(BootSlot::B,12,Some((BootSlot::A,44)));
+  let recovered=recover_mirrored_slots(&old,&new,10).unwrap();
+  assert_eq!(recovered.active(),BootSlot::B);
+  assert_eq!(recovered.floor(),12);
+  assert!(!recovered.pending());
+  assert!(recovery_record_matches(&new,BootSlot::B,12));
+ }
+ #[test]fn corrupted_new_copy_falls_back_to_healthy_old_copy(){
+  let old=encode_slot_record(BootSlot::A,11,None);
+  let mut bad=encode_slot_record(BootSlot::B,12,None);
+  bad[9]^=7;
+  let recovered=recover_mirrored_slots(&old,&bad,10).unwrap();
+  assert_eq!(recovered.active(),BootSlot::A);
+  assert_eq!(recovered.floor(),11);
+ }
+ #[test]fn downgrade_or_two_broken_copies_never_advance_slot(){
+  let old=encode_slot_record(BootSlot::A,9,None);
+  let other=encode_slot_record(BootSlot::B,8,None);
+  assert!(recover_mirrored_slots(&old,&other,10).is_err());
+  assert!(recover_mirrored_slots(&[],&[],1).is_err());
+  assert!(!recovery_record_matches(&old,BootSlot::A,10));
+ }
+}

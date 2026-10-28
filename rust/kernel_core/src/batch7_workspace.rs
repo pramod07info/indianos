@@ -335,3 +335,87 @@ mod r014_visible_script_tests{
   assert_eq!(out,[0xcc;OUTPUT_MAX]);assert_eq!(w.disk.count(),0);
  }
 }
+
+/// R016: portable checksummed workspace checkpoint envelope. The storage
+/// caller must durably write these bytes; RAM snapshots are not disk commits.
+pub const R016_CHECKPOINT_HEADER:usize=24;
+fn r016_snapshot_hash(bytes:&[u8])->u32{
+ let mut h=0x811c9dc5u32;
+ for &b in bytes{h=(h^(b as u32)).wrapping_mul(0x01000193);}
+ h
+}
+impl<const P:usize,const E:usize,const W:usize,const K:usize,
+ const F:usize,const G:usize,const Q:usize> Workspace<P,E,W,K,F,G,Q>{
+ pub fn export_guarded_checkpoint(&self,owner:Identity,now:u64,
+  output:&mut[u8])->Result<usize,Error>{
+  if output.len()<R016_CHECKPOINT_HEADER{return Err(Error::NotRunning);}
+  self.require(owner,now)?;
+  let n=self.export_files(owner,now,&mut output[R016_CHECKPOINT_HEADER..])?;
+  if n>u32::MAX as usize{return Err(Error::NotRunning);}
+  output[..4].copy_from_slice(b"R16W");
+  output[4..12].copy_from_slice(&self.disk.version().to_le_bytes());
+  output[12..16].copy_from_slice(&(n as u32).to_le_bytes());
+  let checksum=r016_snapshot_hash(
+    &output[R016_CHECKPOINT_HEADER..R016_CHECKPOINT_HEADER+n]);
+  output[16..20].copy_from_slice(&checksum.to_le_bytes());
+  output[20..24].fill(0);
+  Ok(R016_CHECKPOINT_HEADER+n)
+ }
+ pub fn restore_guarded_checkpoint(&mut self,owner:Identity,now:u64,
+   expected_current:u64,record:&[u8])->Result<(),Error>{
+  self.require(owner,now)?;
+  if self.disk.version()!=expected_current||
+    record.len()<R016_CHECKPOINT_HEADER||&record[..4]!=b"R16W"||
+    record[20..24]!=[0;4]{return Err(Error::NotRunning);}
+  let n=u32::from_le_bytes(record[12..16].try_into()
+    .map_err(|_|Error::NotRunning)?) as usize;
+  if R016_CHECKPOINT_HEADER.checked_add(n)!=Some(record.len()){
+   return Err(Error::NotRunning);
+  }
+  let hash=u32::from_le_bytes(record[16..20].try_into()
+    .map_err(|_|Error::NotRunning)?);
+  if r016_snapshot_hash(&record[R016_CHECKPOINT_HEADER..])!=hash{
+   return Err(Error::NotRunning);
+  }
+  self.restore_files(owner,now,&record[R016_CHECKPOINT_HEADER..])
+ }
+}
+#[cfg(test)]mod r016_workspace_checkpoint_tests{
+ use super::*;use crate::batch2_launcher::{Launch,Image};
+ use crate::batch2_settings::{Settings,Theme};
+ fn id(g:u64)->Identity{Identity{pid:2,generation:g}}
+ fn ready()->Workspace<3,3,2,2,3,2,8>{
+  let mut w=Workspace::new();
+  let mk=|p|Launch{pid:p,generation:1,image:Image{
+    image_id:p,entry:0x1000,mapped_end:0x2000,verified:true}};
+  w.initialize(Identity{pid:1,generation:1},mk(1),id(1),mk(2),
+    Settings{theme:Theme::Dark,pointer_speed:5,key_repeat:10},50,100).unwrap();w
+ }
+ #[test]fn export_restore_with_generation_guard(){
+  let mut w=ready();let mut out=[0u8;OUTPUT_MAX];
+  w.execute(id(1),1,b"write /note hello",&mut out).unwrap();
+  let mut saved=[0u8;1024];
+  let n=w.export_guarded_checkpoint(id(1),1,&mut saved).unwrap();
+  w.execute(id(1),1,b"write /note changed",&mut out).unwrap();
+  let current=w.disk.version();
+  w.restore_guarded_checkpoint(id(1),1,current,&saved[..n]).unwrap();
+  assert_eq!(w.execute(id(1),1,b"cat /note",&mut out),Ok(5));
+  assert_eq!(&out[..5],b"hello");
+ }
+ #[test]fn corrupt_or_truncated_checkpoint_does_not_mutate(){
+  let mut w=ready();let mut buf=[0u8;1024];
+  let n=w.export_guarded_checkpoint(id(1),1,&mut buf).unwrap();
+  let g=w.disk.version();
+  assert!(w.restore_guarded_checkpoint(id(1),1,g,&buf[..n-1]).is_err());
+  buf[n-1]^=1;
+  assert!(w.restore_guarded_checkpoint(id(1),1,g,&buf[..n]).is_err());
+  assert_eq!(w.disk.version(),g);
+ }
+ #[test]fn stale_identity_and_generation_cannot_restore(){
+  let mut w=ready();let mut buf=[0u8;1024];
+  let n=w.export_guarded_checkpoint(id(1),1,&mut buf).unwrap();
+  assert!(w.export_guarded_checkpoint(id(2),1,&mut buf).is_err());
+  assert!(w.restore_guarded_checkpoint(id(1),1,999,&buf[..n]).is_err());
+ }
+}
+
