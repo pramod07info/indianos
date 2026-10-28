@@ -359,3 +359,112 @@ impl<const P:usize,const E:usize,const W:usize,const K:usize>
  }
 
 }
+
+/// R006: one transaction for a minimal graphical service dependency chain.
+/// The trusted kernel must still instantiate CPUs, load ELF images and wire
+/// real interrupts; this controller only manages authenticated services.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct GraphicalPlan{
+ pub init_service:u16,pub desktop_service:u16,
+ pub init:Identity,pub desktop:Identity,
+ pub init_image:Launch,pub desktop_image:Launch,
+ pub settings:Settings,
+}
+impl<const P:usize,const E:usize,const W:usize,const K:usize>
+ Bootstrap<P,E,W,K>{
+ /// Preflight every static boot invariant BEFORE publishing even PID1.
+ /// Any unexpected service/staging failure restores an entirely cold plan.
+ pub fn start_graphical_plan(&mut self,plan:GraphicalPlan)->Result<BootHealth,Error>{
+  if self.phase!=Phase::Cold||self.init.is_some()||self.desktop.is_some()||
+   P<2||plan.init_service==0||plan.desktop_service==0||
+   plan.init_service==plan.desktop_service||
+   plan.init.pid==0||plan.desktop.pid==0||
+   plan.init.pid==plan.desktop.pid||
+   plan.init.generation==0||plan.desktop.generation==0||
+   plan.init_image.pid!=plan.init.pid||
+   plan.init_image.generation!=plan.init.generation||
+   plan.desktop_image.pid!=plan.desktop.pid||
+   plan.desktop_image.generation!=plan.desktop.generation||
+   !plan.init_image.image.verified||!plan.desktop_image.image.verified{
+   return Err(Error::State);
+  }
+  let step=(||{
+   self.configure(plan.init_service,plan.desktop_service)?;
+   self.start_init(plan.init,plan.init_image,plan.settings,plan.init_service)?;
+   self.start_desktop(plan.desktop,plan.desktop_image,plan.settings,
+     plan.desktop_service)?;
+   Ok::<(),Error>(())
+  })();
+  if let Err(reason)=step{
+   *self=Self::new();
+   return Err(reason);
+  }
+  if !self.health().ready_for_desktop_input{
+   *self=Self::new();return Err(Error::State);
+  }
+  Ok(self.health())
+ }
+ /// Caller-authenticated desktop input gate. A stale process generation,
+ /// orphaned compositor, or failed init never receives new UI events.
+ pub fn admit_desktop_input(&self,caller:Identity)->Result<(),Error>{
+  if caller.pid==0||caller.generation==0||
+   self.blocker()!=BootBlocker::Ready||
+   self.health().desktop!=Some(caller){
+    return Err(Error::State);
+  }
+  Ok(())
+ }
+ /// Orderly shutdown of desktop then PID1, revoking service ownership.
+ /// Unlike a raw phase transition this also retires windows and input.
+ pub fn shutdown_graphical(&mut self,init:Identity)->Result<(),Error>{
+  if self.init!=Some(init)||!self.session.owns(init){
+   return Err(Error::State);
+  }
+  if let Some(desktop)=self.desktop{
+   self.process_exited(desktop)?;
+  }
+  self.process_exited(init)
+ }
+}
+#[cfg(test)]
+mod r006_boot_transaction_tests{
+ use super::*;
+ use crate::batch2_launcher::Image;
+ use crate::batch2_settings::Theme;
+ fn id(pid:u32)->Identity{Identity{pid,generation:4}}
+ fn launch(i:Identity)->Launch{Launch{pid:i.pid,generation:i.generation,
+   image:Image{image_id:i.pid,entry:0x1000,mapped_end:0x2000,verified:true}}}
+ fn plan()->GraphicalPlan{
+  GraphicalPlan{init_service:11,desktop_service:22,init:id(1),desktop:id(2),
+   init_image:launch(id(1)),desktop_image:launch(id(2)),
+   settings:Settings{theme:Theme::Dark,pointer_speed:5,key_repeat:10}}
+ }
+ #[test]fn complete_boot_plan_allows_only_owning_desktop(){
+  let mut b=Bootstrap::<3,3,3,3>::new();
+  let status=b.start_graphical_plan(plan()).unwrap();
+  assert_eq!(status.phase,Phase::DesktopReady);
+  assert!(status.ready_for_desktop_input);
+  assert_eq!(b.admit_desktop_input(id(2)),Ok(()));
+  assert_eq!(b.admit_desktop_input(Identity{generation:5,..id(2)}),Err(Error::State));
+  assert_eq!(b.shutdown_graphical(id(1)),Ok(()));
+  assert_eq!(b.phase(),Phase::Stopped);
+  assert_eq!(b.admit_desktop_input(id(2)),Err(Error::State));
+ }
+ #[test]fn failed_desktop_stage_rolls_entire_plan_back_to_cold(){
+  let mut b=Bootstrap::<3,3,3,3>::new();
+  let mut p=plan();p.desktop_image.image.entry=0;
+  assert!(b.start_graphical_plan(p).is_err());
+  assert_eq!(b.phase(),Phase::Cold);
+  assert!(!b.session.owns(id(1)));
+  assert!(!b.session.owns(id(2)));
+  assert!(b.start_graphical_plan(plan()).is_ok());
+ }
+ #[test]fn preflight_rejects_wrong_ownership_without_partial_stage(){
+  let mut b=Bootstrap::<3,3,3,3>::new();
+  let mut p=plan();p.desktop.generation=77;
+  assert_eq!(b.start_graphical_plan(p),Err(Error::State));
+  assert_eq!(b.phase(),Phase::Cold);
+  let mut short=Bootstrap::<1,3,3,3>::new();
+  assert_eq!(short.start_graphical_plan(plan()),Err(Error::State));
+ }
+}
