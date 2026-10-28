@@ -52,7 +52,8 @@ pub fn smoke()->Result<(),Error>{
  }
  let mut authority=agent_17::Authority::<1>::new();
  authority.issue(true,agent_17::Lease{id:1,owner,rights:1,
-  expires:100,uses_remaining:2,revoked:false})?;
+  expires:100,uses_remaining:2,revoked:false})
+  .map_err(|_|Error::Denied)?;
  let mut ui=agent_18::Dispatcher::<1>::new(owner);
  ui.submit(owner,1,agent_18::Action::ReadFile,1,fs.version())?;
  ui.approve(owner,1,&mut authority,1,1)?;

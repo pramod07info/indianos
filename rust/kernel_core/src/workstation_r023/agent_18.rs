@@ -35,7 +35,8 @@ impl<const N:usize> Dispatcher<N>{
   let at=self.queue.iter().position(|x|x.is_some_and(|r|r.id==id))
    .ok_or(Error::Missing)?;
   let mut request=self.queue[at].ok_or(Error::Missing)?;
-  lease.use_rights(actor,lease_id,request.rights,now)?;
+  lease.use_rights(actor,lease_id,request.rights,now)
+   .map_err(|_|Error::Denied)?;
   request.approved=true;self.queue[at]=Some(request);Ok(())
  }
  pub fn execute_readonly<const F:usize,const B:usize>(
