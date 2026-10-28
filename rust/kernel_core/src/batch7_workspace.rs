@@ -419,3 +419,50 @@ impl<const P:usize,const E:usize,const W:usize,const K:usize,
  }
 }
 
+
+
+/// R017 developer workstation: the terminal script is guarded by a project
+/// revision. Failed validation must not alter files, frames or terminal output.
+impl<const P:usize,const E:usize,const W:usize,const K:usize,
+ const F:usize,const G:usize,const Q:usize> Workspace<P,E,W,K,F,G,Q>{
+ pub fn project_revision(&self,actor:Identity,now:u64)->Result<u64,Error>{
+  self.app_file_generation(actor,now)
+ }
+ pub fn run_project_commands(&mut self,actor:Identity,now:u64,
+  expected_revision:u64,commands:&[&[u8]],snapshot:&mut[u8],
+  out:&mut[u8])->Result<(usize,u64),Error>{
+  if self.project_revision(actor,now)?!=expected_revision{
+   return Err(Error::NotRunning);
+  }
+  let len=self.execute_script_visible(actor,now,commands,snapshot,out)?;
+  Ok((len,self.disk.version()))
+ }
+}
+#[cfg(test)]mod r017_project_workspace_tests{
+ use super::*;use crate::batch2_launcher::{Launch,Image};
+ use crate::batch2_settings::{Settings,Theme};
+ fn id(g:u64)->Identity{Identity{pid:2,generation:g}}
+ fn ready()->Workspace<3,3,2,2,3,2,8>{
+  let mut w=Workspace::new();
+  let mk=|p|Launch{pid:p,generation:1,image:Image{
+   image_id:p,entry:0x1000,mapped_end:0x2000,verified:true}};
+  w.initialize(Identity{pid:1,generation:1},mk(1),id(1),mk(2),
+   Settings{theme:Theme::Dark,pointer_speed:5,key_repeat:10},50,100).unwrap();w
+ }
+ #[test]fn versioned_script_creates_and_reads_actual_file(){
+  let mut w=ready();let mut s=[0u8;1024];let mut o=[0u8;OUTPUT_MAX];
+  let revision=w.project_revision(id(1),1).unwrap();
+  let (n,updated)=w.run_project_commands(id(1),1,revision,
+   &[b"write /src main",b"cat /src"],&mut s,&mut o).unwrap();
+  assert_eq!(n,4);assert_eq!(&o[..n],b"main");assert!(updated>revision);
+ }
+ #[test]fn stale_project_generation_never_changes_output(){
+  let mut w=ready();let mut s=[0;1024];let mut o=[7u8;OUTPUT_MAX];
+  assert!(w.run_project_commands(id(1),1,999,
+   &[b"write /src overwrite"],&mut s,&mut o).is_err());
+  assert_eq!(o,[7;OUTPUT_MAX]);assert_eq!(w.disk.count(),0);
+ }
+ #[test]fn recycled_process_cannot_read_project_revision(){
+  let w=ready();assert!(w.project_revision(id(2),1).is_err());
+ }
+}
