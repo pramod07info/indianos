@@ -156,3 +156,92 @@ mod tests {
         assert_eq!(q.dequeue(),Err(EventError::Empty));
     }
 }
+
+ 
+/// R009 multi-core scheduler foundation. Separate single-owner queues are
+/// supplied by a trusted CPU dispatcher; a real SMP implementation must
+/// provide locking, IPIs, TLB shootdown and hardware context switching.
+#[derive(Clone,Copy,Debug,Eq,PartialEq)]
+pub enum DispatchError { InvalidCpu, InvalidTask, Duplicate, Full, Empty }
+#[derive(Clone,Copy,Debug,Eq,PartialEq)]
+pub struct Runnable { pub pid:u32, pub generation:u64, pub priority:u8 }
+pub struct CoreRunQueues<const C:usize,const N:usize>{
+ queues:[[Option<Runnable>;N];C], length:[usize;C], cursor:[usize;C],
+}
+impl<const C:usize,const N:usize> CoreRunQueues<C,N>{
+ pub const fn new()->Self{
+  Self{queues:[[None;N];C],length:[0;C],cursor:[0;C]}
+ }
+ pub fn queue_len(&self,cpu:usize)->Result<usize,DispatchError>{
+  self.length.get(cpu).copied().ok_or(DispatchError::InvalidCpu)
+ }
+ pub fn enqueue(&mut self,cpu:usize,task:Runnable)->Result<(),DispatchError>{
+  if task.pid==0||task.generation==0{return Err(DispatchError::InvalidTask);}
+  if cpu>=C{return Err(DispatchError::InvalidCpu);}
+  if self.queues.iter().flatten().flatten().any(|t|
+       t.pid==task.pid&&t.generation==task.generation){return Err(DispatchError::Duplicate);}
+  if self.length[cpu]==N{return Err(DispatchError::Full);}
+  self.queues[cpu][self.length[cpu]]=Some(task);self.length[cpu]+=1;Ok(())
+ }
+ pub fn next(&mut self,cpu:usize)->Result<Runnable,DispatchError>{
+  if cpu>=C{return Err(DispatchError::InvalidCpu);}
+  let count=self.length[cpu];
+  if count==0{return Err(DispatchError::Empty);}
+  let index=self.cursor[cpu]%count;
+  let task=self.queues[cpu][index].ok_or(DispatchError::Empty)?;
+  self.cursor[cpu]=(index+1)%count;Ok(task)
+ }
+ pub fn evict(&mut self,pid:u32,generation:u64)->usize{
+  if pid==0||generation==0{return 0;}
+  let mut removed=0;
+  for cpu in 0..C{
+   let mut i=0;
+   while i<self.length[cpu]{
+    if self.queues[cpu][i].is_some_and(|t|t.pid==pid&&t.generation==generation){
+     for j in i..self.length[cpu]-1{self.queues[cpu][j]=self.queues[cpu][j+1];}
+     self.length[cpu]-=1;
+     self.queues[cpu][self.length[cpu]]=None;
+     if self.length[cpu]==0{self.cursor[cpu]=0;}
+     else if self.cursor[cpu]>i{self.cursor[cpu]-=1;}
+     else{self.cursor[cpu]%=self.length[cpu];}
+     removed+=1;
+    }else{i+=1;}
+   }
+  }
+  removed
+ }
+}
+#[cfg(test)]
+mod r009_core_run_queue_tests{
+ use super::*;
+ fn task(pid:u32,generation:u64)->Runnable{Runnable{pid,generation,priority:1}}
+ #[test]fn fair_rotation_for_each_core(){
+  let mut q=CoreRunQueues::<2,3>::new();
+  q.enqueue(0,task(1,1)).unwrap();q.enqueue(0,task(2,1)).unwrap();
+  q.enqueue(1,task(3,1)).unwrap();
+  assert_eq!(q.next(0),Ok(task(1,1)));
+  assert_eq!(q.next(0),Ok(task(2,1)));
+  assert_eq!(q.next(0),Ok(task(1,1)));
+  assert_eq!(q.next(1),Ok(task(3,1)));
+ }
+ #[test]fn reuse_and_cross_core_duplicate_fail_closed(){
+  let mut q=CoreRunQueues::<2,2>::new();
+  q.enqueue(0,task(7,1)).unwrap();
+  assert_eq!(q.enqueue(1,task(7,1)),Err(DispatchError::Duplicate));
+  assert_eq!(q.enqueue(2,task(8,1)),Err(DispatchError::InvalidCpu));
+  assert_eq!(q.evict(7,1),1);
+  q.enqueue(1,task(7,2)).unwrap();
+  assert_eq!(q.evict(7,1),0);
+  assert_eq!(q.next(1),Ok(task(7,2)));
+ }
+ #[test]fn queue_capacity_and_zero_cores_do_not_panic(){
+  let mut q=CoreRunQueues::<0,0>::new();
+  assert_eq!(q.next(0),Err(DispatchError::InvalidCpu));
+  assert_eq!(q.enqueue(0,task(1,1)),Err(DispatchError::InvalidCpu));
+  let mut one=CoreRunQueues::<1,1>::new();
+  one.enqueue(0,task(1,1)).unwrap();
+  assert_eq!(one.enqueue(0,task(2,1)),Err(DispatchError::Full));
+  assert_eq!(one.evict(1,1),1);
+  assert_eq!(one.next(0),Err(DispatchError::Empty));
+ }
+}

@@ -320,3 +320,65 @@ mod r006_quantum_batch_tests{
   assert_eq!(svc.active_job_ids_scoped(owner(),&mut ids),Ok(0));
  }
 }
+
+ 
+/// R009: completion collection for an isolated simulation worker. Output is
+/// fail-atomic: a short result buffer cannot disclose a partial job set.
+impl QuantumService{
+ pub fn completed_scoped(&self,actor:Identity,
+   out:&mut[u64])->Result<usize,ServiceError>{
+  if actor.pid==0||actor.generation==0{return Err(ServiceError::InvalidOwner);}
+  let mut needed=0usize;
+  for item in &self.owners{
+   if item.job!=0&&item.owner==actor.pid&&item.generation==actor.generation&&
+     self.queue.status(item.job)?==JobStatus::Completed{
+    needed+=1;
+   }
+  }
+  if needed>out.len(){return Err(ServiceError::Queue(QueueError::Full));}
+  let mut offset=0;
+  for item in &self.owners{
+   if item.job!=0&&item.owner==actor.pid&&item.generation==actor.generation&&
+     self.queue.status(item.job)?==JobStatus::Completed{
+    out[offset]=item.job;offset+=1;
+   }
+  }
+  Ok(needed)
+ }
+ pub fn release_completed_scoped(&mut self,actor:Identity,
+   out:&mut[u64])->Result<usize,ServiceError>{
+  // All ownership and buffer checks complete before the first mutation.
+  let n=self.completed_scoped(actor,out)?;
+  for &job in &out[..n]{self.release_scoped(actor,job)?;}
+  Ok(n)
+ }
+}
+#[cfg(test)]
+mod r009_quantum_completion_tests{
+ use super::*;
+ const BELL:[u8;10]=[1,2,2,0,1,0,0,4,0,1];
+ fn id(pid:u32,generation:u64)->Identity{Identity{pid,generation}}
+ #[test]fn results_are_not_cross_visible_or_claimed_early(){
+  let mut s=QuantumService::new();
+  let one=s.submit_scoped(id(1,1),&BELL).unwrap();
+  let _two=s.submit_scoped(id(2,1),&BELL).unwrap();
+  let mut out=[0u64;2];
+  assert_eq!(s.completed_scoped(id(1,1),&mut out),Ok(0));
+  assert_eq!(s.run_next(),Some(one));
+  assert_eq!(s.completed_scoped(id(1,1),&mut out),Ok(1));
+  assert_eq!(out[0],one);
+  assert_eq!(s.completed_scoped(id(1,2),&mut out),Ok(0));
+ }
+ #[test]fn short_output_does_not_release_any_completed_jobs(){
+  let mut s=QuantumService::new();
+  let a=s.submit_scoped(id(4,1),&BELL).unwrap();
+  let b=s.submit_scoped(id(4,1),&BELL).unwrap();
+  assert_eq!(s.run_next(),Some(a));assert_eq!(s.run_next(),Some(b));
+  let mut short=[99u64;1];
+  assert!(s.release_completed_scoped(id(4,1),&mut short).is_err());
+  assert_eq!(short,[99]);
+  let mut all=[0u64;2];
+  assert_eq!(s.release_completed_scoped(id(4,1),&mut all),Ok(2));
+  assert_eq!(s.active_job_ids_scoped(id(4,1),&mut all),Ok(0));
+ }
+}

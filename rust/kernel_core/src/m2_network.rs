@@ -544,3 +544,92 @@ mod m2_tests{
  }
 
 }
+
+ 
+/// R009 fixed-capacity, generation-scoped cache for already authenticated DNS
+/// A replies. A hit rechecks the live socket lease; stale processes cannot
+/// keep network results after their capability is revoked.
+#[derive(Clone,Copy)]
+struct CachedA{
+ owner:Identity,local_port:u16,name:[u8;253],len:usize,
+ ip:[u8;4],expires:u64,
+}
+pub struct DnsLeaseCache<const N:usize>{
+ entries:[Option<CachedA>;N],next:usize,
+}
+impl<const N:usize> DnsLeaseCache<N>{
+ pub const fn new()->Self{Self{entries:[None;N],next:0}}
+ pub fn resolve_verified<const P:usize>(
+  &mut self,endpoint:&Endpoint<P>,owner:Identity,local_port:u16,
+  now:u64,id:u16,name:&[u8],packet:&[u8])->Result<[u8;4],Error>{
+  let ip=endpoint.accept_dns_a(owner,local_port,now,id,name,packet)?;
+  if N==0{return Ok(ip);}
+  // The strict DNS parser has already validated the entire answer.
+  let mut off=12usize;
+  for label in name.split(|b|*b==b'.'){off+=1+label.len();}
+  off+=1+4;
+  let ttl=u32::from_be_bytes(packet[off+6..off+10].try_into()
+    .map_err(|_|Error::Malformed)?).min(120);
+  let expires=now.checked_add(ttl as u64).ok_or(Error::Invalid)?;
+  let mut fixed=[0u8;253];fixed[..name.len()].copy_from_slice(name);
+  let entry=CachedA{owner,local_port,name:fixed,len:name.len(),ip,expires};
+  let index=self.entries.iter().position(|saved|saved.is_some_and(|x|
+    x.owner==owner&&x.local_port==local_port&&
+    x.len==name.len()&&x.name[..x.len]==*name))
+    .unwrap_or(self.next);
+  self.entries[index]=Some(entry);self.next=(index+1)%N;
+  Ok(ip)
+ }
+ pub fn cached<const P:usize>(&self,endpoint:&Endpoint<P>,
+  owner:Identity,local_port:u16,now:u64,name:&[u8])
+  ->Result<Option<[u8;4]>,Error>{
+  endpoint.allow_query(owner,local_port,now,name)?;
+  Ok(self.entries.iter().flatten().find(|x|
+    x.owner==owner&&x.local_port==local_port&&now<x.expires&&
+    x.len==name.len()&&x.name[..x.len]==*name).map(|x|x.ip))
+ }
+ pub fn retire(&mut self,owner:Identity){
+  for e in &mut self.entries{
+   if e.is_some_and(|x|x.owner==owner){*e=None;}
+  }
+ }
+}
+#[cfg(test)]
+mod r009_dns_lease_cache_tests{
+ use super::*;
+ fn owner()->Identity{Identity{pid:75,generation:2}}
+ fn answer()->[u8;38]{
+  [0x12,0x34,0x81,0x80,0,1,0,1,0,0,0,0,
+   1,b'a',2,b'i',b'o',0,0,1,0,1,
+   0xc0,0x0c,0,1,0,1,0,0,0,30,0,4,1,2,3,4]
+ }
+ fn socket()->Endpoint<1>{
+  let mut endpoint=Endpoint::new();
+  let mut a=Access::<1>::new();a.grant(owner(),SOCKET,100).unwrap();
+  endpoint.acquire(&a,owner(),1100,1,90).unwrap();endpoint
+ }
+ #[test]fn valid_answer_caches_then_expires(){
+  let endpoint=socket();let mut cache=DnsLeaseCache::<2>::new();
+  assert_eq!(cache.resolve_verified(&endpoint,owner(),1100,2,0x1234,
+    b"a.io",&answer()),Ok([1,2,3,4]));
+  assert_eq!(cache.cached(&endpoint,owner(),1100,20,b"a.io"),Ok(Some([1,2,3,4])));
+  assert_eq!(cache.cached(&endpoint,owner(),1100,32,b"a.io"),Ok(None));
+ }
+ #[test]fn foreign_generation_and_revocation_do_not_reuse_cache(){
+  let mut endpoint=socket();let mut cache=DnsLeaseCache::<1>::new();
+  cache.resolve_verified(&endpoint,owner(),1100,2,0x1234,b"a.io",&answer()).unwrap();
+  assert_eq!(cache.cached(&endpoint,Identity{generation:3,..owner()},1100,3,b"a.io"),
+    Err(Error::Denied));
+  endpoint.retire(owner());
+  assert_eq!(cache.cached(&endpoint,owner(),1100,3,b"a.io"),Err(Error::Denied));
+  cache.retire(owner());
+ }
+ #[test]fn malformed_answer_never_replaces_cached_valid_address(){
+  let endpoint=socket();let mut cache=DnsLeaseCache::<1>::new();
+  cache.resolve_verified(&endpoint,owner(),1100,2,0x1234,b"a.io",&answer()).unwrap();
+  let mut corrupt=answer();corrupt[0]=0;
+  assert_eq!(cache.resolve_verified(&endpoint,owner(),1100,3,0x1234,
+     b"a.io",&corrupt),Err(Error::Malformed));
+  assert_eq!(cache.cached(&endpoint,owner(),1100,3,b"a.io"),Ok(Some([1,2,3,4])));
+ }
+}

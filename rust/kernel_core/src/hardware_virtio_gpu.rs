@@ -512,3 +512,79 @@ mod hd3b_tests{
  }
 
 }
+
+ 
+/// R009 compositor-to-virtio-GPU dirty region reduction. Bounds are checked
+/// before the first transport command. No physical memory is mapped here.
+pub fn coalesce_damage(display:Scanout,dirty:&[Rect],
+ out:&mut[Rect])->Result<usize,Error>{
+ if display.width==0||display.height==0||
+   display.width>MAX_WIDTH||display.height>MAX_HEIGHT||
+   dirty.is_empty()||dirty.len()>8||out.is_empty(){return Err(Error::Dimensions);}
+ let mut combined=[Rect{x:0,y:0,width:0,height:0};8];
+ let mut count=0usize;
+ for &r in dirty{
+  let right=r.x.checked_add(r.width).ok_or(Error::Dimensions)?;
+  let bottom=r.y.checked_add(r.height).ok_or(Error::Dimensions)?;
+  if r.width==0||r.height==0||right>display.width||
+    bottom>display.height{return Err(Error::Dimensions);}
+  let mut item=r;
+  let mut pos=0;
+  while pos<count{
+   let other=combined[pos];
+   let a_right=other.x+other.width;let a_bottom=other.y+other.height;
+   let b_right=item.x+item.width;let b_bottom=item.y+item.height;
+   if item.x<=a_right&&other.x<=b_right&&
+      item.y<=a_bottom&&other.y<=b_bottom{
+    let x=item.x.min(other.x);let y=item.y.min(other.y);
+    item=Rect{x,y,width:b_right.max(a_right)-x,
+      height:b_bottom.max(a_bottom)-y};
+    count-=1;
+    combined[pos]=combined[count];
+    pos=0; // Revisit earlier rectangles after a union expands.
+   }else{pos+=1;}
+  }
+  combined[count]=item;count+=1;
+ }
+ if count>out.len(){return Err(Error::Dimensions);}
+ out[..count].copy_from_slice(&combined[..count]);Ok(count)
+}
+impl<T:ControlTransport> Protocol<T>{
+ /// Coalesce and refresh using the already authenticated control transport.
+ /// Damage input is never trusted to provide a physical DMA address.
+ pub fn refresh_coalesced(&mut self,display:Scanout,resource:u32,
+   dirty:&[Rect])->Result<usize,Error>{
+  let mut combined=[Rect{x:0,y:0,width:0,height:0};8];
+  let n=coalesce_damage(display,dirty,&mut combined)?;
+  self.refresh_batch(display,resource,&combined[..n])
+ }
+}
+#[cfg(test)]
+mod r009_gpu_damage_tests{
+ use super::*;
+ fn display()->Scanout{Scanout{width:128,height:96,scanout:0}}
+ #[test]fn overlapping_regions_are_coalesced(){
+  let mut output=[Rect{x:0,y:0,width:0,height:0};8];
+  let dirty=[Rect{x:10,y:10,width:20,height:20},
+    Rect{x:20,y:20,width:20,height:20},
+    Rect{x:80,y:80,width:10,height:10}];
+  assert_eq!(coalesce_damage(display(),&dirty,&mut output),Ok(2));
+  assert!(output[..2].contains(&Rect{x:10,y:10,width:30,height:30}));
+  assert!(output[..2].contains(&Rect{x:80,y:80,width:10,height:10}));
+ }
+ #[test]fn bad_damage_has_no_partial_output(){
+  let sentinel=Rect{x:7,y:7,width:7,height:7};
+  let mut output=[sentinel;2];
+  let dirty=[Rect{x:1,y:1,width:2,height:2},
+    Rect{x:127,y:0,width:3,height:1}];
+  assert_eq!(coalesce_damage(display(),&dirty,&mut output),Err(Error::Dimensions));
+  assert_eq!(output,[sentinel;2]);
+ }
+ #[test]fn zero_size_and_short_capacity_are_rejected(){
+  let mut out=[Rect{x:0,y:0,width:0,height:0};1];
+  assert_eq!(coalesce_damage(display(),&[],&mut out),Err(Error::Dimensions));
+  assert_eq!(coalesce_damage(display(),&[
+   Rect{x:1,y:1,width:1,height:1},Rect{x:90,y:70,width:1,height:1}
+  ],&mut out),Err(Error::Dimensions));
+ }
+}
