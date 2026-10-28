@@ -558,7 +558,14 @@ impl SlotTransaction{
   if !candidate.verified_signature||!candidate.payload_digest_verified{
    return Err(UpdateError::Untrusted);
   }
-  if self.issued.is_some()||candidate.version<=self.anti_rollback||now>deadline{
+  if self.issued.is_some(){
+   // An exhausted retry budget remains NoAttempts even while the most
+   // recent challenge is outstanding (backward-compatible ABI semantics).
+   return Err(if self.attempts_left==0{
+    UpdateError::NoAttempts
+   }else{UpdateError::WrongState});
+  }
+  if candidate.version<=self.anti_rollback||now>deadline{
    return Err(UpdateError::WrongState);
   }
   let (verified_slot,image_id)=self.boot_attempt(now)?;
