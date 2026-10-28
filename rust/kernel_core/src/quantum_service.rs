@@ -445,3 +445,88 @@ mod r010_quantum_quota_tests{
   assert_eq!(service.active_count_scoped(id(5,0)),Err(ServiceError::InvalidOwner));
  }
 }
+
+ 
+/// R011 no_std process-level budget policy for the existing CPU simulator.
+/// A real worker must enforce wall-clock instruction/memory quotas at the
+/// execution boundary; this grant is not a hardware quantum capability.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct WorkTicket{pub owner:Identity,pub credits:u16,pub consumed:u16}
+pub struct QuantumWorkBudget<const N:usize>{
+ grants:[Option<WorkTicket>;N],cursor:usize,
+}
+impl<const N:usize> QuantumWorkBudget<N>{
+ pub const fn new()->Self{Self{grants:[None;N],cursor:0}}
+ pub fn admit(&mut self,owner:Identity,credits:u16)->Result<(),ServiceError>{
+  if owner.pid==0||owner.generation==0||credits==0{
+   return Err(ServiceError::InvalidOwner);
+  }
+  if self.grants.iter().flatten().any(|g|g.owner==owner){
+   return Err(ServiceError::NotOwner);
+  }
+  let slot=self.grants.iter_mut().find(|s|s.is_none())
+    .ok_or(ServiceError::Queue(QueueError::Full))?;
+  *slot=Some(WorkTicket{owner,credits,consumed:0});Ok(())
+ }
+ pub fn next_owner(&mut self)->Option<Identity>{
+  if N==0{return None;}
+  for offset in 0..N{
+   let i=(self.cursor+offset)%N;
+   if let Some(mut t)=self.grants[i]{
+    if t.consumed<t.credits{
+     t.consumed+=1;self.grants[i]=Some(t);
+     self.cursor=(i+1)%N;return Some(t.owner);
+    }
+   }
+  }
+  None
+ }
+ pub fn replenish(&mut self,owner:Identity,credits:u16)
+   ->Result<(),ServiceError>{
+  if credits==0{return Err(ServiceError::InvalidOwner);}
+  let slot=self.grants.iter_mut().find(|s|
+    s.is_some_and(|g|g.owner==owner)).ok_or(ServiceError::NotOwner)?;
+  let mut t=slot.ok_or(ServiceError::NotOwner)?;
+  t.credits=credits;t.consumed=0;*slot=Some(t);Ok(())
+ }
+ pub fn terminate(&mut self,owner:Identity)->bool{
+  let mut any=false;
+  for slot in &mut self.grants{
+   if slot.is_some_and(|s|s.owner==owner){*slot=None;any=true;}
+  }
+  any
+ }
+ pub fn remaining(&self,owner:Identity)->Option<u16>{
+  self.grants.iter().flatten().find(|t|t.owner==owner)
+    .map(|t|t.credits.saturating_sub(t.consumed))
+ }
+}
+#[cfg(test)]
+mod r011_quantum_fairness_tests{
+ use super::*;
+ fn id(pid:u32,generation:u64)->Identity{Identity{pid,generation}}
+ #[test]fn round_robin_drives_two_owners_with_bounded_credits(){
+  let mut q=QuantumWorkBudget::<2>::new();
+  q.admit(id(1,1),2).unwrap();q.admit(id(2,1),2).unwrap();
+  assert_eq!(q.next_owner(),Some(id(1,1)));
+  assert_eq!(q.next_owner(),Some(id(2,1)));
+  assert_eq!(q.next_owner(),Some(id(1,1)));
+  assert_eq!(q.next_owner(),Some(id(2,1)));
+  assert_eq!(q.next_owner(),None);
+ }
+ #[test]fn stale_process_termination_does_not_revoke_reused_pid(){
+  let mut q=QuantumWorkBudget::<2>::new();
+  q.admit(id(1,1),1).unwrap();q.admit(id(1,2),2).unwrap();
+  assert!(q.terminate(id(1,1)));
+  assert_eq!(q.remaining(id(1,2)),Some(2));
+  assert_eq!(q.remaining(id(1,1)),None);
+ }
+ #[test]fn exhausted_credit_requires_trusted_replenishment(){
+  let mut q=QuantumWorkBudget::<1>::new();q.admit(id(3,1),1).unwrap();
+  assert_eq!(q.next_owner(),Some(id(3,1)));
+  assert_eq!(q.next_owner(),None);
+  assert_eq!(q.replenish(id(3,1),2),Ok(()));
+  assert_eq!(q.remaining(id(3,1)),Some(2));
+  assert_eq!(q.next_owner(),Some(id(3,1)));
+ }
+}
