@@ -64,7 +64,7 @@ pub fn rename_all<const F:usize,const IMAGE:usize>(
   assert_eq!(rename_all::<1,4096>(&mut fs,1,b"a",b"long"),
     Err(Error::Full));assert_eq!(fs.version(),1);
  }
- #[test]fn stale_revision_and non_identifier_input_are_rejected(){
+ #[test]fn stale_revision_and_non_identifier_input_are_rejected(){
   let mut fs=RamFs::<1>::new();fs.replace(b"/a",b"old").unwrap();
   assert_eq!(rename_all::<1,512>(&mut fs,0,b"old",b"new"),Err(Error::Stale));
   assert_eq!(rename_all::<1,512>(&mut fs,1,b"old",b"bad/path"),Err(Error::Invalid));

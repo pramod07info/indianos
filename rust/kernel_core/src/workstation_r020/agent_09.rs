@@ -59,7 +59,7 @@ impl<const N:usize> Registry<N>{
   assert!(r.match_input(7,1,10,21,1).is_none());
   assert!(r.find_by_output(8,[8;32]).is_none());
  }
- #[test]fn untrusted_and duplicate_build_cannot_be_authoritative(){
+ #[test]fn untrusted_and_duplicate_build_cannot_be_authoritative(){
   let mut r=Registry::<1>::new();
   assert_eq!(r.publish(7,1,10,17,1,[8;32],false),Err(Error::Denied));
   r.publish(7,1,10,17,1,[8;32],true).unwrap();

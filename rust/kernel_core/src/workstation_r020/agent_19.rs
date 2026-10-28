@@ -62,7 +62,7 @@ impl<const N:usize> Registry<N>{
   assert_eq!(s.retire(id(1)).unwrap().queued_jobs,3);
   assert!(!s.active(id(1),2));assert_eq!(s.count(),0);
  }
- #[test]fn reused_pid_is_denied until_previous_session_is_reaped(){
+ #[test]fn reused_pid_is_denied_until_previous_session_is_reaped(){
   let mut s=Registry::<1>::new();s.login(id(1),1,10).unwrap();
   assert_eq!(s.login(id(2),2,10),Err(Error::Denied));
   s.retire(id(1)).unwrap();assert_eq!(s.login(id(2),2,10),Ok(()));

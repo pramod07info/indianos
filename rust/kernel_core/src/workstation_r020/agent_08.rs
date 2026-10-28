@@ -56,14 +56,14 @@ impl<const N:usize> Feed<N>{
   assert_eq!(f.first_error(7,1).unwrap().line,10);
   let mut out=[SENTINEL;3];assert_eq!(f.by_job(7,1,&mut out),Ok(2));
  }
- #[test]fn malformed_and duplicate diagnostics cannot corrupt_feed(){
+ #[test]fn malformed_and_duplicate_diagnostics_cannot_corrupt_feed(){
   let mut f=Feed::<1>::new();let msg=b"a.rs:1:1:error failed";
   assert_eq!(f.submit(7,1,msg),Ok(1));
   assert_eq!(f.submit(7,1,msg),Err(Error::Conflict));
   assert_eq!(f.submit(7,1,b"../a:1:1:error bad"),Err(Error::Invalid));
   assert_eq!(f.count(7,Severity::Error),1);
  }
- #[test]fn short_output_and foreign_owner_are_safe(){
+ #[test]fn short_output_and_foreign_owner_are_safe(){
   let mut f=Feed::<2>::new();
   f.submit(7,1,b"a:1:1:error a").unwrap();
   f.submit(7,1,b"b:1:1:error b").unwrap();

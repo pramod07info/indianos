@@ -14,7 +14,8 @@ pub fn encode<const N:usize>(store:&Store<N>,user:u32,generation:u64,
  raw[4]=match settings.theme{Theme::Light=>1,Theme::Dark=>2};
  raw[5]=settings.pointer_speed;raw[6]=settings.key_repeat;
  raw[7..15].copy_from_slice(&generation.to_le_bytes());
- raw[15..19].copy_from_slice(&hash(&raw[..15]).to_le_bytes());
+ let checksum=hash(&raw[..15]);
+ raw[15..19].copy_from_slice(&checksum.to_le_bytes());
  out[..LENGTH].copy_from_slice(&raw);Ok(LENGTH)
 }
 pub fn decode<const N:usize>(store:&mut Store<N>,user:u32,
@@ -50,7 +51,7 @@ pub fn settings_changed(a:Settings,b:Settings)->bool{a!=b}
   assert_eq!(decode(&mut s,7,1,&raw),Err(Error::Denied));
   assert_eq!(s.read(7,1),Ok(options()));
  }
- #[test]fn recycled_identity_and short_buffer_cannot_leak_settings(){
+ #[test]fn recycled_identity_and_short_buffer_cannot_leak_settings(){
   let mut s=Store::<1>::new();s.register(7,1,options()).unwrap();
   let mut short=[99u8;3];
   assert_eq!(encode(&s,7,1,&mut short),Err(Error::Full));

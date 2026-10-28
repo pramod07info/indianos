@@ -56,7 +56,7 @@ impl<const N:usize> Router<N>{
   let mut r=Router::<2>::new();r.bind(7,10,66,1,100,2).unwrap();
   r.focus(0,7,10).unwrap();assert_eq!(r.route(7,0,66,1,2),Ok(100));
  }
- #[test]fn foreign_owner_and missing_capability_cannot_trigger_build(){
+ #[test]fn foreign_owner_and_missing_capability_cannot_trigger_build(){
   let mut r=Router::<1>::new();r.bind(7,10,66,1,100,2).unwrap();
   r.focus(0,7,10).unwrap();
   assert_eq!(r.route(8,0,66,1,2),Err(Error::Missing));

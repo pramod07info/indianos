@@ -56,7 +56,7 @@ pub fn can_apply<const F:usize>(fs:&RamFs<F>,patch:&Patch<'_>)->bool{
   apply::<2,2048>(&mut fs,2,&list).unwrap();
   let mut a=[0u8;6];fs.read(b"/a",0,&mut a).unwrap();assert_eq!(&a,b"fn bar");
  }
- #[test]fn stale_second_patch leaves first source file untouched(){
+ #[test]fn stale_second_patch_leaves_first_source_file_untouched(){
   let mut fs=RamFs::<2>::new();
   fs.replace(b"/a",b"abc").unwrap();fs.replace(b"/b",b"def").unwrap();
   let list=[Patch{path:b"/a",offset:0,old:b"a",replacement:b"x"},
@@ -64,7 +64,7 @@ pub fn can_apply<const F:usize>(fs:&RamFs<F>,patch:&Patch<'_>)->bool{
   assert_eq!(apply::<2,2048>(&mut fs,2,&list),Err(Error::Stale));
   let mut out=[0u8;3];fs.read(b"/a",0,&mut out).unwrap();assert_eq!(&out,b"abc");
  }
- #[test]fn repeat_patch_same_file_refuses ambiguous_overlap(){
+ #[test]fn repeat_patch_same_file_refuses_ambiguous_overlap(){
   let mut fs=RamFs::<1>::new();fs.replace(b"/a",b"abc").unwrap();
   let list=[Patch{path:b"/a",offset:0,old:b"a",replacement:b"x"},
    Patch{path:b"/a",offset:1,old:b"b",replacement:b"y"}];

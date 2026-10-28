@@ -76,7 +76,7 @@ impl<const B:usize,const H:usize> Document<B,H>{
   assert_eq!(d.copy(7,&mut out),Ok(3));assert_eq!(&out[..3],b"one");
   d.redo(7,3).unwrap();assert_eq!(d.copy(7,&mut out),Ok(7));
  }
- #[test]fn new_edit_clears_redo_and rejects stale_generation(){
+ #[test]fn new_edit_clears_redo_and_rejects_stale_generation(){
   let mut d=Document::<16,2>::new(7);
   d.replace(7,0,0,0,b"x").unwrap();d.undo(7,1).unwrap();
   d.replace(7,2,0,0,b"y").unwrap();
