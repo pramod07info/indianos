@@ -43,7 +43,7 @@ pub fn can_apply<const F:usize>(fs:&RamFs<F>,patch:&Patch<'_>)->bool{
  if end>size||patch.old.is_empty(){return false;}
  let mut old=[0u8;CONTENT_MAX];
  fs.read(patch.path,patch.offset as u64,&mut old[..patch.old.len()])
-   .is_ok_and(|n|n==patch.old.len()&&old[..n]==*patch.old)
+   .is_ok_and(|n|n==patch.old.len()&&&old[..n]==patch.old)
 }
 #[cfg(test)]mod tests{
  use super::*;
