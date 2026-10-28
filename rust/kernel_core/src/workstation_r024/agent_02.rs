@@ -69,12 +69,14 @@ impl<const N:usize> Bin<N>{
   let mut fs=RamFs::<1>::new();fs.replace(b"/a",b"old").unwrap();
   let mut bin=Bin::<1>::new(id(1));let slot=bin.trash(id(1),&mut fs,b"/a",1).unwrap();
   fs.replace(b"/a",b"new").unwrap();
-  assert_eq!(bin.restore(id(1),&mut fs,slot,fs.version()),Err(Error::Conflict));
+  let revision=fs.version();
+  assert_eq!(bin.restore(id(1),&mut fs,slot,revision),Err(Error::Conflict));
   let mut out=[0;3];fs.read(b"/a",0,&mut out).unwrap();assert_eq!(&out,b"new");
  }
  #[test]fn recycled_process_identity_cannot_resurrect_other_users_trash(){
   let mut fs=RamFs::<1>::new();fs.replace(b"/a",b"a").unwrap();
   let mut bin=Bin::<1>::new(id(1));let slot=bin.trash(id(1),&mut fs,b"/a",1).unwrap();
-  assert_eq!(bin.restore(id(2),&mut fs,slot,fs.version()),Err(Error::Denied));
+  let revision=fs.version();
+  assert_eq!(bin.restore(id(2),&mut fs,slot,revision),Err(Error::Denied));
  }
 }
