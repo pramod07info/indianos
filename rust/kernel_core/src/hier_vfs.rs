@@ -984,3 +984,68 @@ mod r014_durable_idempotency_tests{
     Err(FsError::InvalidVolume));
  }
 }
+
+
+/// R016: pair reads must be atomic to the caller even if the second
+/// path is absent, the generation is stale, or the output is too short.
+impl<D:BlockDevice> HierVfs<D>{
+ pub fn read_pair_atomic(&mut self,first:&str,second:&str,expected:u64,
+  a_out:&mut[u8],b_out:&mut[u8])->Result<(usize,usize),FsError>{
+  if self.generation()!=expected{return Err(FsError::InvalidVolume);}
+  let mut a=[0u8;MAX_FILE_BYTES];let mut b=[0u8;MAX_FILE_BYTES];
+  let n=self.read(first,&mut a)?;let m=self.read(second,&mut b)?;
+  if self.generation()!=expected||n>a_out.len()||m>b_out.len(){
+   return Err(FsError::InvalidVolume);
+  }
+  a_out[..n].copy_from_slice(&a[..n]);
+  b_out[..m].copy_from_slice(&b[..m]);Ok((n,m))
+ }
+ pub fn verify_recovery_copy(&mut self,source:&str,backup:&str,
+  expected:u64)->Result<bool,FsError>{
+  if source==backup||self.generation()!=expected{
+   return Err(FsError::InvalidVolume);
+  }
+  let mut a=[0;MAX_FILE_BYTES];let mut b=[0;MAX_FILE_BYTES];
+  let (n,m)=self.read_pair_atomic(source,backup,expected,&mut a,&mut b)?;
+  Ok(n==m&&a[..n]==b[..m])
+ }
+}
+#[cfg(test)]mod r016_vfs_atomic_pair_tests{
+ use super::*;use crate::block::{BlockDevice,BlockError,SECTOR_BYTES};
+ #[derive(Clone)]struct Disk([[u8;SECTOR_BYTES];100]);
+ impl BlockDevice for Disk{
+  fn sector_count(&self)->u64{100}
+  fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+  ->Result<(),BlockError>{
+   *out=*self.0.get(lba as usize).ok_or(BlockError::OutOfRange)?;Ok(())
+  }
+  fn write_sector(&mut self,lba:u64,data:&[u8;SECTOR_BYTES])
+  ->Result<(),BlockError>{
+   *self.0.get_mut(lba as usize).ok_or(BlockError::OutOfRange)?=*data;Ok(())
+  }
+ }
+ fn setup()->HierVfs<Disk>{
+  let mut f=HierVfs::format_blank(Disk([[0;SECTOR_BYTES];100])).unwrap();
+  f.create("/a",b"alpha").unwrap();f.create("/b",b"beta").unwrap();f
+ }
+ #[test]fn valid_pair_returns_both_files(){
+  let mut f=setup();let mut a=[0;8];let mut b=[0;8];
+  assert_eq!(f.read_pair_atomic("/a","/b",f.generation(),
+    &mut a,&mut b),Ok((5,4)));
+  assert_eq!(&a[..5],b"alpha");assert_eq!(&b[..4],b"beta");
+ }
+ #[test]fn failed_second_read_does_not_expose_first(){
+  let mut f=setup();let mut a=[9;8];let mut b=[8;8];
+  assert!(f.read_pair_atomic("/a","/missing",f.generation(),
+    &mut a,&mut b).is_err());
+  assert_eq!(a,[9;8]);assert_eq!(b,[8;8]);
+ }
+ #[test]fn stale_and_short_output_fail_before_copy(){
+  let mut f=setup();let mut short=[7u8;1];let mut b=[8;8];
+  assert!(f.read_pair_atomic("/a","/b",f.generation(),
+    &mut short,&mut b).is_err());
+  assert_eq!(short,[7]);assert_eq!(b,[8;8]);
+  assert!(f.read_pair_atomic("/a","/b",f.generation()+1,
+    &mut short,&mut b).is_err());
+ }
+}
