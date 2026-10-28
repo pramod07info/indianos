@@ -355,8 +355,9 @@ impl<const P:usize,const E:usize,const W:usize,const K:usize,
   output[..4].copy_from_slice(b"R16W");
   output[4..12].copy_from_slice(&self.disk.version().to_le_bytes());
   output[12..16].copy_from_slice(&(n as u32).to_le_bytes());
-  output[16..20].copy_from_slice(&r016_snapshot_hash(
-    &output[R016_CHECKPOINT_HEADER..R016_CHECKPOINT_HEADER+n]).to_le_bytes());
+  let checksum=r016_snapshot_hash(
+    &output[R016_CHECKPOINT_HEADER..R016_CHECKPOINT_HEADER+n]);
+  output[16..20].copy_from_slice(&checksum.to_le_bytes());
   output[20..24].fill(0);
   Ok(R016_CHECKPOINT_HEADER+n)
  }
