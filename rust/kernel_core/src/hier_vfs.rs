@@ -1093,11 +1093,13 @@ impl<D:BlockDevice> HierVfs<D>{
  }
  #[test]fn differing_files_do_not_compare_equal(){
   let mut f=fs();f.overwrite("/two",b"new").unwrap();
-  assert_eq!(f.project_files_equal("/one","/two",f.generation()),Ok(false));
+  let g=f.generation();
+  assert_eq!(f.project_files_equal("/one","/two",g),Ok(false));
  }
  #[test]fn revision_mismatch_refuses_snapshot(){
   let mut f=fs();
-  assert!(f.checksum_file_at("/one",f.generation()+1).is_err());
-  assert!(f.project_files_equal("/one","/one",f.generation()).is_err());
+  let g=f.generation();
+  assert!(f.checksum_file_at("/one",g+1).is_err());
+  assert!(f.project_files_equal("/one","/one",g).is_err());
  }
 }
