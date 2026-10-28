@@ -395,3 +395,95 @@ pub fn verify_manifest_quorum<V:GuestSignatureVerifier>(
             Err(GuestPackageError::WrongArchitecture));
     }
 }
+
+
+// R008: transaction ledger consumes trusted verification results; signature
+// verification and persistent application payload installation remain external.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct InstalledPackage{pub id:u32,pub package:Package}
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum PackageTransactionError{Invalid,Full,Duplicate,Missing,Security(PackageError)}
+#[derive(Clone,Copy)]
+pub struct PackageLedger<const N:usize>{
+ slots:[Option<InstalledPackage>;N],version_floor:u64,
+}
+impl<const N:usize> PackageLedger<N>{
+ pub const fn new(version_floor:u64)->Self{
+  Self{slots:[None;N],version_floor}
+ }
+ pub fn count(&self)->usize{self.slots.iter().flatten().count()}
+ pub fn get(&self,id:u32)->Option<InstalledPackage>{
+  self.slots.iter().flatten().find(|x|x.id==id).copied()
+ }
+ pub fn install(&mut self,item:InstalledPackage,signers:&[u32])
+  ->Result<(),PackageTransactionError>{
+  if item.id==0||item.package.version==0{return Err(PackageTransactionError::Invalid)}
+  let old=self.get(item.id);
+  let floor=old.map_or(self.version_floor,|o|self.version_floor.max(o.package.version));
+  permit_from_trust_store(item.package,signers,floor)
+   .map_err(PackageTransactionError::Security)?;
+  if old.is_some_and(|o|item.package.version<=o.package.version){
+   return Err(PackageTransactionError::Duplicate);
+  }
+  let idx=self.slots.iter().position(|s|s.is_some_and(|x|x.id==item.id))
+   .or_else(||self.slots.iter().position(|s|s.is_none()))
+   .ok_or(PackageTransactionError::Full)?;
+  self.slots[idx]=Some(item);Ok(())
+ }
+ pub fn install_batch(&mut self,items:&[InstalledPackage],signers:&[u32])
+  ->Result<usize,PackageTransactionError>{
+  if items.is_empty()||items.len()>N{return Err(PackageTransactionError::Full)}
+  let mut trial=*self;
+  for (i,item) in items.iter().enumerate(){
+   if items[..i].iter().any(|v|v.id==item.id){return Err(PackageTransactionError::Duplicate)}
+   trial.install(*item,signers)?;
+  }
+  *self=trial;Ok(items.len())
+ }
+ pub fn uninstall(&mut self,id:u32)->Result<InstalledPackage,PackageTransactionError>{
+  let slot=self.slots.iter_mut().find(|x|x.is_some_and(|v|v.id==id))
+   .ok_or(PackageTransactionError::Missing)?;
+  let old=slot.ok_or(PackageTransactionError::Missing)?;
+  *slot=None;Ok(old)
+ }
+ pub fn raise_floor(&mut self,floor:u64,authorized:bool)
+  ->Result<(),PackageTransactionError>{
+  if !authorized||floor==0||floor<self.version_floor||
+   self.slots.iter().flatten().any(|v|v.package.version<floor){
+   return Err(PackageTransactionError::Invalid);
+  }
+  self.version_floor=floor;Ok(())
+ }
+}
+#[cfg(test)]mod r008_package_lifecycle_tests{
+ use super::*;
+ fn item(id:u32,version:u64,signer:u32)->InstalledPackage{
+  InstalledPackage{id,package:Package{signature_verified:true,signer_id:signer,version}}
+ }
+ #[test]fn batch_install_is_rollback_safe(){
+  let mut l=PackageLedger::<3>::new(1);
+  l.install(item(1,2,7),&[7]).unwrap();
+  assert_eq!(l.install_batch(&[item(1,3,7),item(2,4,9)],&[7]),
+   Err(PackageTransactionError::Security(PackageError::UntrustedSigner)));
+  assert_eq!(l.get(1).unwrap().package.version,2);
+  assert_eq!(l.count(),1);
+  assert_eq!(l.install_batch(&[item(1,3,7),item(2,4,7)],&[7]),Ok(2));
+ }
+ #[test]fn unsigned_and_downgrade_fail_closed(){
+  let mut l=PackageLedger::<2>::new(2);
+  l.install(item(1,4,7),&[7]).unwrap();
+  assert_eq!(l.install(item(1,3,7),&[7]),
+   Err(PackageTransactionError::Security(PackageError::Downgrade)));
+  let mut fake=item(2,5,7);fake.package.signature_verified=false;
+  assert_eq!(l.install(fake,&[7]),
+   Err(PackageTransactionError::Security(PackageError::Unverified)));
+ }
+ #[test]fn floor_advance_requires_clean_installed_versions(){
+  let mut l=PackageLedger::<2>::new(1);
+  l.install(item(1,2,7),&[7]).unwrap();
+  assert_eq!(l.raise_floor(3,true),Err(PackageTransactionError::Invalid));
+  l.uninstall(1).unwrap();l.raise_floor(3,true).unwrap();
+  assert_eq!(l.install(item(1,2,7),&[7]),
+   Err(PackageTransactionError::Security(PackageError::Downgrade)));
+ }
+}
