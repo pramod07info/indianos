@@ -673,3 +673,49 @@ impl<const C:usize,const N:usize> CoreRunQueues<C,N>{
  }
 }
 
+
+
+/// R017 developer process inspector. The supervisor can list runnable
+/// process generations without modifying the live run queues or cursor.
+impl<const C:usize,const N:usize> CoreRunQueues<C,N>{
+ pub fn snapshot_runnable(&self,out:&mut[(usize,Runnable)])
+  ->Result<usize,DispatchError>{
+  let count=self.total_runnable();
+  if out.len()<count{return Err(DispatchError::Full);}
+  let mut at=0;
+  for cpu in 0..C{
+   for task in self.queues[cpu][..self.length[cpu]].iter().flatten(){
+    out[at]=(cpu,*task);at+=1;
+   }
+  }
+  Ok(at)
+ }
+ pub fn terminate_workstation_group(&mut self,epochs:&[(u32,u64)])
+  ->Result<usize,DispatchError>{
+  self.evict_epochs_atomic(epochs)
+ }
+}
+#[cfg(test)]mod r017_process_inspector_tests{
+ use super::*;
+ fn task(pid:u32,g:u64)->Runnable{Runnable{pid,generation:g,priority:1}}
+ #[test]fn captures_all_runnable_workers_and_cpu_affinity(){
+  let mut q=CoreRunQueues::<2,2>::new();
+  q.enqueue(0,task(1,1)).unwrap();q.enqueue(1,task(2,1)).unwrap();
+  let mut out=[(99,task(9,9));2];
+  assert_eq!(q.snapshot_runnable(&mut out),Ok(2));
+  assert_eq!(out[0].0,0);assert_eq!(out[1].0,1);
+ }
+ #[test]fn too_small_view_does_not_mutate_queue_or_output(){
+  let mut q=CoreRunQueues::<2,2>::new();
+  q.enqueue(0,task(1,1)).unwrap();q.enqueue(1,task(2,1)).unwrap();
+  let mut out=[(99,task(9,9));1];
+  assert_eq!(q.snapshot_runnable(&mut out),Err(DispatchError::Full));
+  assert_eq!(out[0].0,99);assert_eq!(q.total_runnable(),2);
+ }
+ #[test]fn old_generation_teardown_does_not_kill_reused_pid(){
+  let mut q=CoreRunQueues::<2,2>::new();
+  q.enqueue(0,task(1,1)).unwrap();q.enqueue(1,task(1,2)).unwrap();
+  assert_eq!(q.terminate_workstation_group(&[(1,1)]),Ok(1));
+  assert!(q.contains_epoch(1,2));assert!(!q.contains_epoch(1,1));
+ }
+}
