@@ -609,3 +609,83 @@ mod r013_linux_loader_tests{
   assert_eq!(f.dup2_scoped(id(2),5,3,FD_WRITE),Err(FdError::Denied));
  }
 }
+
+/// R014 atomic POSIX descriptor remapping. All source handles and rights
+/// are validated in a private table before any live process FD is replaced.
+impl<const N:usize> FileDescriptors<N>{
+ pub fn dup2_batch_atomic(&mut self,
+  owner:crate::batch5_session::Identity,
+  mappings:&[(u32,u32,u8)])->Result<usize,FdError>{
+  if owner.pid==0||owner.generation==0||mappings.is_empty()||
+    mappings.len()>N{return Err(FdError::Invalid);}
+  for (i,&(_,target,_)) in mappings.iter().enumerate(){
+   if mappings[..i].iter().any(|(_,prior,_)|*prior==target){
+    return Err(FdError::Duplicate);
+   }
+  }
+  let mut staged=Self{entries:self.entries};
+  for &(source,target,rights) in mappings{
+   staged.dup2_scoped(owner,source,target,rights)?;
+  }
+  self.entries=staged.entries;Ok(mappings.len())
+ }
+ /// Execve-style FD hygiene: close all descriptors except explicitly
+ /// selected owner-scoped inheritable handles. The caller must verify the
+ /// executable image and process generation before entering ring3.
+ pub fn exec_retain_atomic(&mut self,
+  owner:crate::batch5_session::Identity,keep:&[u32])
+  ->Result<usize,FdError>{
+  if owner.pid==0||owner.generation==0||keep.len()>N{
+   return Err(FdError::Invalid);
+  }
+  for (i,&fd) in keep.iter().enumerate(){
+   if fd<3||keep[..i].contains(&fd){return Err(FdError::Duplicate);}
+   self.resolve(owner,fd,FD_READ)
+     .or_else(|_|self.resolve(owner,fd,FD_WRITE))?;
+  }
+  let mut removed=0;
+  for slot in &mut self.entries{
+   if slot.is_some_and(|s|s.owner==owner&&!keep.contains(&s.fd)){
+    *slot=None;removed+=1;
+   }
+  }
+  Ok(removed)
+ }
+ pub fn descriptors_for_epoch(&self,owner:crate::batch5_session::Identity)
+  ->usize{
+  self.entries.iter().flatten().filter(|entry|entry.owner==owner).count()
+ }
+}
+#[cfg(test)]
+mod r014_posix_exec_descriptor_tests{
+ use super::*;use crate::batch5_session::Identity;
+ fn owner(g:u64)->Identity{Identity{pid:19,generation:g}}
+ #[test]fn atomic_multiple_dup2_replaces_sources_without_rights_escalation(){
+  let mut t=FileDescriptors::<4>::new();
+  t.attach(owner(1),3,11,FD_READ|FD_WRITE).unwrap();
+  t.attach(owner(1),4,22,FD_READ).unwrap();
+  assert_eq!(t.dup2_batch_atomic(owner(1),&[
+   (3,5,FD_READ),(3,6,FD_WRITE)]),Ok(2));
+  assert_eq!(t.resolve(owner(1),5,FD_READ),Ok(11));
+  assert_eq!(t.resolve(owner(1),6,FD_WRITE),Ok(11));
+  assert_eq!(t.resolve(owner(1),5,FD_WRITE),Err(FdError::Denied));
+ }
+ #[test]fn invalid_second_dup_does_not_commit_first(){
+  let mut t=FileDescriptors::<3>::new();
+  t.attach(owner(1),3,11,FD_READ).unwrap();
+  assert_eq!(t.dup2_batch_atomic(owner(1),&[
+    (3,5,FD_READ),(3,6,FD_WRITE)]),Err(FdError::Denied));
+  assert_eq!(t.descriptors_for_epoch(owner(1)),1);
+  assert_eq!(t.resolve(owner(1),5,FD_READ),Err(FdError::NotFound));
+ }
+ #[test]fn exec_retains_only_authenticated_process_descriptors(){
+  let mut t=FileDescriptors::<4>::new();
+  t.attach(owner(1),3,11,FD_READ).unwrap();
+  t.attach(owner(1),4,22,FD_WRITE).unwrap();
+  t.attach(owner(2),5,33,FD_READ).unwrap();
+  assert_eq!(t.exec_retain_atomic(owner(1),&[3]),Ok(1));
+  assert_eq!(t.descriptors_for_epoch(owner(1)),1);
+  assert_eq!(t.resolve(owner(2),5,FD_READ),Ok(33));
+  assert_eq!(t.exec_retain_atomic(owner(1),&[4]),Err(FdError::NotFound));
+ }
+}

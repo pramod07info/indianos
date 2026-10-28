@@ -18,7 +18,10 @@ const BSY:u8=0x80;
 const DRQ:u8=0x08;
 const ERR:u8=0x01;
 const DF:u8=0x20;
-const TIMEOUT:usize=1_000_000;
+// QEMU TCG can pause a vCPU while its host write/flush I/O completes.
+// Keep a finite failure bound, but tolerate slow or oversubscribed CI hosts.
+// This is an iteration bound, not a production-grade calibrated timer.
+const TIMEOUT:usize=8_000_000;
 const MAX_LBA28:u64=1<<28;
 
 #[inline]
@@ -138,9 +141,13 @@ impl BlockDevice for AtaPio {
         for pair in data.chunks_exact(2){
             unsafe{outw(DATA,u16::from_le_bytes([pair[0],pair[1]]));}
         }
+        // ATA requires >=400ns settling after the last PIO data word;
+        // polling too soon is especially unreliable under QEMU TCG.
+        settle();
         // Do not issue FLUSH while the drive still has DRQ asserted.
         complete()?;
         unsafe{outb(STATUS,0xe7);} // FLUSH CACHE (ATA command)
+        settle();
         complete()
     }
 }
