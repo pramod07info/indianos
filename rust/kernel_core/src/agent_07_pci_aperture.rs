@@ -302,3 +302,91 @@ pub fn dma_window_preflight(regions:&[Aperture],reserved:&[Aperture],
         assert_eq!(dma_window_preflight(&allowed,&[],0x1000,0x10000,0x1000),Ok(()));
     }
 }
+
+
+// R008: bounded device claim registry; this never enables bus mastering or MMIO.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct DeviceClaim{pub slot:u16,pub owner:u32,pub aperture:Aperture}
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum ClaimFault{Invalid,Conflict,Full,Missing}
+#[derive(Clone,Copy)]
+pub struct ClaimRegistry<const N:usize>{
+ slots:[Option<DeviceClaim>;N],lower:u64,upper:u64,alignment:u64,
+}
+impl<const N:usize> ClaimRegistry<N>{
+ pub const fn new(lower:u64,upper:u64,alignment:u64)->Self{
+  Self{slots:[None;N],lower,upper,alignment}
+ }
+ pub fn len(&self)->usize{self.slots.iter().flatten().count()}
+ pub fn claim(&mut self,c:DeviceClaim)->Result<(),ClaimFault>{
+  if c.owner==0||validate(c.aperture,self.lower,self.upper,self.alignment).is_err(){
+   return Err(ClaimFault::Invalid)
+  }
+  let end=c.aperture.base+c.aperture.length;
+  if self.slots.iter().flatten().any(|v|v.slot==c.slot||
+   (c.aperture.base<v.aperture.base+v.aperture.length&&
+    v.aperture.base<end)){return Err(ClaimFault::Conflict)}
+  let slot=self.slots.iter_mut().find(|x|x.is_none()).ok_or(ClaimFault::Full)?;
+  *slot=Some(c);Ok(())
+ }
+ pub fn claim_batch(&mut self,items:&[DeviceClaim])
+  ->Result<usize,ClaimFault>{
+  if items.is_empty()||items.len()>N{return Err(ClaimFault::Full)}
+  let mut pending=*self;
+  for c in items{pending.claim(*c)?}
+  *self=pending;Ok(items.len())
+ }
+ pub fn verify_owner(&self,slot:u16,owner:u32,region:Aperture)->bool{
+  owner!=0&&self.slots.iter().flatten().any(|v|
+   v.slot==slot&&v.owner==owner&&v.aperture==region)
+ }
+ pub fn release(&mut self,slot:u16,owner:u32)->Result<(),ClaimFault>{
+  let cell=self.slots.iter_mut().find(|x|
+   x.is_some_and(|v|v.slot==slot)).ok_or(ClaimFault::Missing)?;
+  if owner==0||!cell.is_some_and(|v|v.owner==owner){return Err(ClaimFault::Invalid)}
+  *cell=None;Ok(())
+ }
+ pub fn validate_reserved(&self,reserved:&[Aperture])->Result<(),ClaimFault>{
+  let mut reserved_ok=true;
+  for r in reserved{
+   if validate(*r,self.lower,self.upper,self.alignment).is_err(){reserved_ok=false}
+  }
+  if !reserved_ok{return Err(ClaimFault::Invalid)}
+  for c in self.slots.iter().flatten(){
+   for r in reserved{
+    if c.aperture.base<r.base+r.length&&r.base<c.aperture.base+c.aperture.length{
+     return Err(ClaimFault::Conflict)
+    }
+   }
+  }
+  Ok(())
+ }
+}
+#[cfg(test)]mod r008_pci_claim_tests{
+ use super::*;
+ fn claim(slot:u16,owner:u32,base:u64)->DeviceClaim{
+  DeviceClaim{slot,owner,aperture:Aperture{base,length:0x1000}}
+ }
+ #[test]fn atomic_gpu_network_dma_binding(){
+  let mut d=ClaimRegistry::<3>::new(0x1000,0x10000,0x1000);
+  assert_eq!(d.claim_batch(&[claim(2,10,0x2000),claim(3,11,0x3000)]),Ok(2));
+  assert!(d.verify_owner(2,10,Aperture{base:0x2000,length:0x1000}));
+  assert!(!d.verify_owner(2,11,Aperture{base:0x2000,length:0x1000}));
+  assert_eq!(d.release(2,11),Err(ClaimFault::Invalid));
+  d.release(2,10).unwrap();assert_eq!(d.len(),1);
+ }
+ #[test]fn overlap_and_reserved_ranges_blocked(){
+  let mut d=ClaimRegistry::<3>::new(0x1000,0x10000,0x1000);
+  d.claim(claim(1,10,0x2000)).unwrap();
+  assert_eq!(d.claim(claim(2,11,0x2000)),Err(ClaimFault::Conflict));
+  assert_eq!(d.validate_reserved(&[Aperture{base:0x2000,length:0x1000}]),
+   Err(ClaimFault::Conflict));
+ }
+ #[test]fn failed_batch_cannot_publish_partial_claims(){
+  let mut d=ClaimRegistry::<2>::new(0x1000,0x10000,0x1000);
+  assert_eq!(d.claim_batch(&[claim(1,10,0x2000),claim(2,11,0x2000)]),
+   Err(ClaimFault::Conflict));
+  assert_eq!(d.len(),0);
+  assert_eq!(d.claim(claim(1,0,0x2000)),Err(ClaimFault::Invalid));
+ }
+}
