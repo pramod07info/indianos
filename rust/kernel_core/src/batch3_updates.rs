@@ -540,3 +540,72 @@ mod r013_ota_recovery_tests{
   assert!(!tx.pending());
  }
 }
+
+/// R014 handoff to a trusted boot manager. A boot attempt is authorized
+/// only for the exact verified slot/image/version tuple and a bounded
+/// deadline. The signature/digest checks still belong to the real updater.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct BootHealthChallenge{
+ pub slot:BootSlot,pub image_id:u32,pub version:u64,pub deadline:u64,
+}
+impl SlotTransaction{
+ pub fn issue_boot_challenge(&mut self,now:u64)
+   ->Result<BootHealthChallenge,UpdateError>{
+  let (slot,candidate,deadline)=self.pending.ok_or(UpdateError::WrongState)?;
+  if !candidate.verified_signature||!candidate.payload_digest_verified{
+   return Err(UpdateError::Untrusted);
+  }
+  if candidate.version<=self.anti_rollback||now>deadline{
+   return Err(UpdateError::WrongState);
+  }
+  let (verified_slot,image_id)=self.boot_attempt(now)?;
+  Ok(BootHealthChallenge{slot:verified_slot,image_id,
+    version:candidate.version,deadline})
+ }
+ pub fn confirm_boot_challenge(&mut self,
+  challenge:BootHealthChallenge,now:u64,measured_image:u32,
+  running_version:u64,healthy:bool)->Result<u64,UpdateError>{
+  let (slot,candidate,deadline)=self.pending.ok_or(UpdateError::WrongState)?;
+  if !healthy||now>challenge.deadline||deadline!=challenge.deadline||
+    challenge.slot!=slot||challenge.image_id!=candidate.image_id||
+    measured_image!=candidate.image_id||
+    challenge.version!=candidate.version||running_version!=candidate.version{
+   return Err(UpdateError::WrongState);
+  }
+  self.confirm_health(slot,candidate.image_id,now,true)
+ }
+ pub fn remaining_boot_attempts(&self)->u8{self.attempts_left}
+}
+#[cfg(test)]
+mod r014_boot_measurement_tests{
+ use super::*;
+ fn candidate(v:u64)->Candidate{Candidate{image_id:71,version:v,
+   verified_signature:true,payload_digest_verified:true,target_arch:62}}
+ #[test]fn good_measured_boot_promotes_only_verified_inactive_slot(){
+  let mut t=SlotTransaction::new(BootSlot::A,10);
+  t.stage(BootSlot::B,candidate(11),true,80,2).unwrap();
+  let challenge=t.issue_boot_challenge(20).unwrap();
+  assert_eq!(challenge.image_id,71);assert_eq!(t.remaining_boot_attempts(),1);
+  assert_eq!(t.confirm_boot_challenge(challenge,30,71,11,true),Ok(11));
+  assert_eq!(t.active(),BootSlot::B);assert_eq!(t.floor(),11);
+ }
+ #[test]fn wrong_measured_version_or_image_does_not_promote_slot(){
+  let mut t=SlotTransaction::new(BootSlot::A,10);
+  t.stage(BootSlot::B,candidate(11),true,80,2).unwrap();
+  let c=t.issue_boot_challenge(20).unwrap();
+  assert_eq!(t.confirm_boot_challenge(c,30,72,11,true),
+     Err(UpdateError::WrongState));
+  assert_eq!(t.confirm_boot_challenge(c,30,71,10,true),
+     Err(UpdateError::WrongState));
+  assert_eq!(t.active(),BootSlot::A);assert!(t.pending());
+ }
+ #[test]fn expired_boot_challenge_keeps_last_good_slot(){
+  let mut t=SlotTransaction::new(BootSlot::A,10);
+  t.stage(BootSlot::B,candidate(11),true,80,1).unwrap();
+  let c=t.issue_boot_challenge(20).unwrap();
+  assert_eq!(t.issue_boot_challenge(21),Err(UpdateError::NoAttempts));
+  assert_eq!(t.confirm_boot_challenge(c,81,71,11,true),
+    Err(UpdateError::WrongState));
+  assert_eq!(t.fallback(),BootSlot::A);assert!(!t.pending());
+ }
+}
