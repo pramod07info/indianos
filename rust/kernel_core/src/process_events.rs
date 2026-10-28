@@ -245,3 +245,80 @@ mod r009_core_run_queue_tests{
   assert_eq!(one.next(0),Err(DispatchError::Empty));
  }
 }
+
+ 
+/// R010 safe single-dispatcher queue migration. Kernel SMP callers MUST
+/// hold both run-queue locks and arrange IPI/TLB synchronization separately.
+impl<const C:usize,const N:usize> CoreRunQueues<C,N>{
+ pub fn migrate(&mut self,from:usize,to:usize,pid:u32,
+  generation:u64)->Result<(),DispatchError>{
+  if from>=C||to>=C{return Err(DispatchError::InvalidCpu);}
+  if from==to||pid==0||generation==0{return Err(DispatchError::InvalidTask);}
+  let position=self.queues[from][..self.length[from]].iter().position(|s|
+    s.is_some_and(|task|task.pid==pid&&task.generation==generation))
+    .ok_or(DispatchError::InvalidTask)?;
+  if self.length[to]>=N{return Err(DispatchError::Full);}
+  let task=self.queues[from][position].ok_or(DispatchError::InvalidTask)?;
+  for i in position..self.length[from]-1{self.queues[from][i]=self.queues[from][i+1];}
+  self.length[from]-=1;self.queues[from][self.length[from]]=None;
+  if self.length[from]==0{self.cursor[from]=0;}
+  else if self.cursor[from]>position{self.cursor[from]-=1;}
+  else{self.cursor[from]%=self.length[from];}
+  self.queues[to][self.length[to]]=Some(task);self.length[to]+=1;
+  Ok(())
+ }
+ pub fn steal_for_idle(&mut self,idle:usize)->Result<Option<Runnable>,DispatchError>{
+  if idle>=C{return Err(DispatchError::InvalidCpu);}
+  if self.length[idle]!=0{return Ok(None);}
+  let mut donor=None;
+  for cpu in 0..C{
+   if cpu!=idle&&self.length[cpu]>1&&donor.is_none_or(|d:usize|
+      self.length[cpu]>self.length[d]){donor=Some(cpu);}
+  }
+  let Some(from)=donor else{return Ok(None)};
+  let task=self.queues[from][self.length[from]-1].ok_or(DispatchError::Empty)?;
+  self.migrate(from,idle,task.pid,task.generation)?;
+  Ok(Some(task))
+ }
+ pub fn snapshot_core(&self,cpu:usize,out:&mut[Runnable])
+  ->Result<usize,DispatchError>{
+  if cpu>=C{return Err(DispatchError::InvalidCpu);}
+  if out.len()<self.length[cpu]{return Err(DispatchError::Full);}
+  for (i,entry) in self.queues[cpu][..self.length[cpu]].iter().enumerate(){
+   out[i]=entry.ok_or(DispatchError::Empty)?;
+  }
+  Ok(self.length[cpu])
+ }
+}
+#[cfg(test)]
+mod r010_smp_migration_tests{
+ use super::*;
+ fn job(pid:u32,generation:u64)->Runnable{Runnable{pid,generation,priority:1}}
+ #[test]fn migrate_preserves_affinity_and_no_duplicate(){
+  let mut q=CoreRunQueues::<2,3>::new();
+  q.enqueue(0,job(4,2)).unwrap();q.enqueue(0,job(5,2)).unwrap();
+  q.migrate(0,1,job(5,2).pid,2).unwrap();
+  assert_eq!(q.queue_len(0),Ok(1));assert_eq!(q.queue_len(1),Ok(1));
+  assert_eq!(q.next(1),Ok(job(5,2)));
+  assert_eq!(q.enqueue(0,job(5,2)),Err(DispatchError::Duplicate));
+ }
+ #[test]fn steal_from_busy_core_is_generation_preserving(){
+  let mut q=CoreRunQueues::<2,3>::new();
+  q.enqueue(0,job(1,5)).unwrap();q.enqueue(0,job(2,6)).unwrap();
+  assert_eq!(q.steal_for_idle(1),Ok(Some(job(2,6))));
+  assert_eq!(q.next(0),Ok(job(1,5)));
+  assert_eq!(q.next(1),Ok(job(2,6)));
+  assert_eq!(q.steal_for_idle(1),Ok(None));
+ }
+ #[test]fn full_destination_or_stale_generation_is_atomic(){
+  let mut q=CoreRunQueues::<2,2>::new();
+  q.enqueue(0,job(1,3)).unwrap();q.enqueue(1,job(2,3)).unwrap();
+  q.enqueue(1,job(3,3)).unwrap();
+  assert_eq!(q.migrate(0,1,1,3),Err(DispatchError::Full));
+  assert_eq!(q.migrate(0,1,1,4),Err(DispatchError::InvalidTask));
+  assert_eq!(q.next(0),Ok(job(1,3)));
+  let mut tiny=[job(99,1);1];
+  assert_eq!(q.snapshot_core(1,&mut tiny),Err(DispatchError::Full));
+  assert_eq!(tiny,[job(99,1)]);
+ }
+}
