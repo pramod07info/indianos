@@ -164,3 +164,88 @@ pub fn require_reviewed_merge(checks:&[NamedCheck<'_>],required:&[&str],
             Err(ReviewGateError::Checks(NamedGateError::Incomplete)));
     }
 }
+
+
+// R008: release provenance binds the tested source, reviewed source and
+// release artifact to the same immutable SHA. External API authenticity is
+// required; caller-supplied strings are not signed attestations.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct BuildArtifact<'a>{
+ pub name:&'a str,pub source_sha:&'a str,pub digest:&'a str,
+ pub checks_passed:bool,
+}
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum ReleaseFault{Invalid,Missing,Duplicate,Stale,Failed,Review(ReviewGateError)}
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct ReleaseVerdict{pub artifacts:usize,pub reviews:usize}
+pub fn check_release<'a>(target:&str,author:&str,
+ checks:&[NamedCheck<'a>],required_checks:&[&str],
+ reviews:&[ReviewerEvidence<'a>],required_reviewers:usize,
+ artifacts:&[BuildArtifact<'a>],required_artifacts:&[&str])
+ ->Result<ReleaseVerdict,ReleaseFault>{
+ let reviews_count=require_reviewed_merge(checks,required_checks,target,author,
+  reviews,required_reviewers).map_err(ReleaseFault::Review)?;
+ if target.is_empty()||required_artifacts.is_empty()||
+  artifacts.len()!=required_artifacts.len()||artifacts.len()>16{
+  return Err(ReleaseFault::Missing)
+ }
+ for (i,artifact) in artifacts.iter().enumerate(){
+  if artifact.name.is_empty()||artifact.digest.len()<16||
+   artifact.digest.bytes().any(|c|!c.is_ascii_hexdigit()){
+   return Err(ReleaseFault::Invalid)
+  }
+  if artifact.source_sha!=target{return Err(ReleaseFault::Stale)}
+  if !artifact.checks_passed{return Err(ReleaseFault::Failed)}
+  if artifacts[..i].iter().any(|p|p.name==artifact.name){
+   return Err(ReleaseFault::Duplicate)
+  }
+  if !required_artifacts.contains(&artifact.name){return Err(ReleaseFault::Invalid)}
+ }
+ for required in required_artifacts{
+  if !artifacts.iter().any(|a|a.name==*required){return Err(ReleaseFault::Missing)}
+ }
+ Ok(ReleaseVerdict{artifacts:artifacts.len(),reviews:reviews_count})
+}
+pub fn allow_promote(old_version:u64,next_version:u64,rollback_floor:u64,
+ release:ReleaseVerdict)->Result<u64,ReleaseFault>{
+ if next_version<=old_version||next_version<rollback_floor||
+  release.artifacts==0||release.reviews==0{return Err(ReleaseFault::Invalid)}
+ Ok(next_version)
+}
+#[cfg(test)]mod r008_release_provenance_tests{
+ use super::*;
+ fn check()->[NamedCheck<'static>;2]{[
+  NamedCheck{name:"kernel",sha:"abc",status:Status::Success},
+  NamedCheck{name:"security",sha:"abc",status:Status::Success}
+ ]}
+ fn review()->[ReviewerEvidence<'static>;1]{[
+  ReviewerEvidence{reviewer:"independent",sha:"abc",approved:true}
+ ]}
+ fn artifacts()->[BuildArtifact<'static>;2]{[
+  BuildArtifact{name:"kernel-elf",source_sha:"abc",
+   digest:"abcdeffedcba1234",checks_passed:true},
+  BuildArtifact{name:"qemu-report",source_sha:"abc",
+   digest:"0123456789abcdef",checks_passed:true}
+ ]}
+ fn run<'a>(artifacts:&[BuildArtifact<'a>])->Result<ReleaseVerdict,ReleaseFault>{
+  check_release("abc","author",&check(),&["kernel","security"],
+   &review(),1,artifacts,&["kernel-elf","qemu-report"])
+ }
+ #[test]fn all_green_exact_sha_reviewed_artifacts_pass(){
+  assert_eq!(run(&artifacts()),Ok(ReleaseVerdict{artifacts:2,reviews:1}));
+ }
+ #[test]fn stale_or_duplicated_provenance_is_blocked(){
+  let mut data=artifacts();data[0].source_sha="old";
+  assert_eq!(run(&data),Err(ReleaseFault::Stale));
+  data=artifacts();data[1].name="kernel-elf";
+  assert_eq!(run(&data),Err(ReleaseFault::Duplicate));
+ }
+ #[test]fn unsigned_fake_digest_or_failed_attestation_is_blocked(){
+  let mut data=artifacts();data[0].digest="unsigned";
+  assert_eq!(run(&data),Err(ReleaseFault::Invalid));
+  data=artifacts();data[0].checks_passed=false;
+  assert_eq!(run(&data),Err(ReleaseFault::Failed));
+  assert_eq!(allow_promote(10,10,9,ReleaseVerdict{artifacts:2,reviews:1}),
+   Err(ReleaseFault::Invalid));
+ }
+}
