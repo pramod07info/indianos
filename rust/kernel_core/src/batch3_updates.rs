@@ -413,3 +413,65 @@ mod r011_ota_slot_tests{
   assert!(!t.pending());
  }
 }
+
+
+/// R012 persistable A/B slot selection metadata for a trusted boot updater.
+/// Metadata bytes must be flushed with the inactive slot's verified image;
+/// this encoding is not a substitute for a signed manifest or secure boot.
+pub const SLOT_RECORD_BYTES:usize=22;
+pub fn encode_slot_record(active:BootSlot,version:u64,
+  pending:Option<(BootSlot,u32)>)->[u8;SLOT_RECORD_BYTES]{
+ let mut out=[0u8;SLOT_RECORD_BYTES];
+ out[..4].copy_from_slice(b"IOS2");
+ out[4]=match active{BootSlot::A=>1,BootSlot::B=>2};
+ out[5..13].copy_from_slice(&version.to_le_bytes());
+ let (code,image)=pending.map_or((0,0),|(s,id)|
+   (match s{BootSlot::A=>1,BootSlot::B=>2},id));
+ out[13]=code;out[14..18].copy_from_slice(&image.to_le_bytes());
+ let mut checksum=0x811c9dc5u32;
+ for &value in &out[..18]{
+  checksum=(checksum^(value as u32)).wrapping_mul(0x01000193);
+ }
+ out[18..22].copy_from_slice(&checksum.to_le_bytes());out
+}
+pub fn decode_slot_record(bytes:&[u8])->Result<(BootSlot,u64,Option<(BootSlot,u32)>),UpdateError>{
+ if bytes.len()!=SLOT_RECORD_BYTES||&bytes[..4]!=b"IOS2"{
+  return Err(UpdateError::Invalid);
+ }
+ let mut checksum=0x811c9dc5u32;
+ for &v in &bytes[..18]{checksum=(checksum^(v as u32)).wrapping_mul(0x01000193);}
+ if bytes[18..22]!=checksum.to_le_bytes(){return Err(UpdateError::Untrusted);}
+ let active=match bytes[4]{1=>BootSlot::A,2=>BootSlot::B,_=>return Err(UpdateError::Invalid)};
+ let version=u64::from_le_bytes(bytes[5..13].try_into().map_err(|_|UpdateError::Invalid)?);
+ let image=u32::from_le_bytes(bytes[14..18].try_into().map_err(|_|UpdateError::Invalid)?);
+ let pending=match bytes[13]{
+  0 if image==0=>None,
+  1 if image!=0&&active!=BootSlot::A=>Some((BootSlot::A,image)),
+  2 if image!=0&&active!=BootSlot::B=>Some((BootSlot::B,image)),
+  _=>return Err(UpdateError::Invalid),
+ };
+ if version==0{return Err(UpdateError::Invalid);}
+ Ok((active,version,pending))
+}
+#[cfg(test)]
+mod r012_slot_metadata_tests{
+ use super::*;
+ #[test]fn slot_record_roundtrip_rejects_wrong_active_target(){
+  let data=encode_slot_record(BootSlot::A,12,Some((BootSlot::B,44)));
+  assert_eq!(decode_slot_record(&data),Ok((BootSlot::A,12,Some((BootSlot::B,44)))));
+  assert_eq!(decode_slot_record(&data[..21]),Err(UpdateError::Invalid));
+ }
+ #[test]fn corrupted_critical_byte_or_invalid_pending_fails_closed(){
+  let mut data=encode_slot_record(BootSlot::B,9,None);
+  data[4]^=1;
+  assert_eq!(decode_slot_record(&data),Err(UpdateError::Untrusted));
+  let mut invalid=encode_slot_record(BootSlot::A,10,Some((BootSlot::A,22)));
+  assert_eq!(decode_slot_record(&invalid),Err(UpdateError::Invalid));
+  invalid[14]^=2;
+  assert_eq!(decode_slot_record(&invalid),Err(UpdateError::Untrusted));
+ }
+ #[test]fn records_keep_version_and_pending_image_identity(){
+  let bytes=encode_slot_record(BootSlot::B,1000,Some((BootSlot::A,24)));
+  assert_eq!(decode_slot_record(&bytes),Ok((BootSlot::B,1000,Some((BootSlot::A,24)))));
+ }
+}
