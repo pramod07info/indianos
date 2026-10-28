@@ -240,6 +240,10 @@ impl<D:BlockDevice> HierVfs<D>{
    7=>{self.rename_file(path,second)?;Ok(0)},
    8=>self.list_dir(path,data),
    9=>{self.rename_dir(path,second)?;Ok(0)},
+   // R009 privileged VFS batch: durable, full-file CRC-verified copy APIs.
+   // The caller retains responsibility for syscall capability admission.
+   10=>{self.copy_file(path,second)?;Ok(0)},
+   11=>{self.copy_replace(path,second)?;Ok(0)},
    _=>Err(FsError::InvalidName)
   }
  }
@@ -527,4 +531,25 @@ mod tests{
   assert_eq!(fs.generation(),before);
  }
 
+}
+
+ 
+/// R009: bounded seek/read/persist abstraction for authenticated file
+/// services. Exposes existing atomic COW range operations while ensuring
+/// no successful prefix is falsely reported on a short verified read.
+impl<D:BlockDevice> HierVfs<D>{
+ pub fn read_exact_range(&mut self,path:&str,offset:u64,
+   output:&mut[u8])->Result<(),FsError>{
+  if output.is_empty()||output.len()>MAX_TRANSFER{return Err(FsError::TooLarge);}
+  let mut staged=[0u8;MAX_TRANSFER];
+  let size=self.read_at(path,offset,&mut staged[..output.len()])?;
+  if size!=output.len(){return Err(FsError::TooLarge);}
+  output.copy_from_slice(&staged[..size]);Ok(())
+ }
+ pub fn overwrite_chunk(&mut self,path:&str,offset:u64,
+   expected_generation:u64,chunk:&[u8])->Result<(usize,u64),FsError>{
+  if self.generation()!=expected_generation{return Err(FsError::InvalidVolume);}
+  let n=self.write_at(path,offset,chunk)?;
+  Ok((n,self.generation()))
+ }
 }
