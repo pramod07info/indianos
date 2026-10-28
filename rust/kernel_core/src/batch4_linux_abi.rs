@@ -268,3 +268,111 @@ mod r009_linux_std_io_tests{
     Err(Error::Unsupported));
  }
 }
+
+ 
+/// R010 Linux ABI adapter for process-scoped virtual file descriptors.
+pub const FD_READ:u8=1;
+pub const FD_WRITE:u8=2;
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct Descriptor{owner:crate::batch5_session::Identity,
+ fd:u32,handle:u64,rights:u8}
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum FdError{Invalid,Full,Duplicate,Denied,NotFound}
+pub struct FileDescriptors<const N:usize>{entries:[Option<Descriptor>;N]}
+impl<const N:usize> FileDescriptors<N>{
+ pub const fn new()->Self{Self{entries:[None;N]}}
+ pub fn attach(&mut self,owner:crate::batch5_session::Identity,
+   fd:u32,handle:u64,rights:u8)->Result<(),FdError>{
+  if owner.pid==0||owner.generation==0||fd<3||handle==0||
+     rights==0||rights&!(FD_READ|FD_WRITE)!=0{return Err(FdError::Invalid);}
+  if self.entries.iter().flatten().any(|e|e.owner==owner&&e.fd==fd){
+   return Err(FdError::Duplicate);
+  }
+  let slot=self.entries.iter_mut().find(|s|s.is_none()).ok_or(FdError::Full)?;
+  *slot=Some(Descriptor{owner,fd,handle,rights});Ok(())
+ }
+ pub fn resolve(&self,owner:crate::batch5_session::Identity,
+  fd:u32,needed:u8)->Result<u64,FdError>{
+  if owner.pid==0||owner.generation==0||needed==0||
+    needed&!(FD_READ|FD_WRITE)!=0{return Err(FdError::Invalid);}
+  let entry=self.entries.iter().flatten().find(|e|e.owner.pid==owner.pid&&e.fd==fd)
+    .ok_or(FdError::NotFound)?;
+  if entry.owner!=owner||entry.rights&needed!=needed{return Err(FdError::Denied);}
+  Ok(entry.handle)
+ }
+ pub fn close(&mut self,owner:crate::batch5_session::Identity,
+   fd:u32)->Result<u64,FdError>{
+  let slot=self.entries.iter_mut().find(|s|
+    s.is_some_and(|e|e.owner.pid==owner.pid&&e.fd==fd))
+    .ok_or(FdError::NotFound)?;
+  let entry=slot.ok_or(FdError::NotFound)?;
+  if entry.owner!=owner{return Err(FdError::Denied);}
+  *slot=None;Ok(entry.handle)
+ }
+ pub fn retire(&mut self,owner:crate::batch5_session::Identity)->usize{
+  let mut n=0;
+  for slot in &mut self.entries{
+   if slot.is_some_and(|e|e.owner==owner){*slot=None;n+=1;}
+  }
+  n
+ }
+}
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum FileIo{Read{handle:u64,addr:u64,len:u32},
+ Write{handle:u64,addr:u64,len:u32}}
+pub fn translate_file_io<const CAP:usize,const GRANTS:usize>(
+ table:&FileDescriptors<CAP>,auth:&crate::batch6_security::Access<GRANTS>,
+ owner:crate::batch5_session::Identity,now:u64,
+ number:u64,fd:u32,addr:u64,length:u64,user_top:u64
+)->Result<FileIo,Error>{
+ let operation=authorize(auth,owner,now,number,addr,length,user_top)?;
+ let needed=match operation{
+  Op::Read=>FD_READ,Op::Write=>FD_WRITE,_=>return Err(Error::Unsupported),
+ };
+ let handle=table.resolve(owner,fd,needed).map_err(|_|Error::Denied)?;
+ let len=u32::try_from(length).map_err(|_|Error::Pointer)?;
+ match operation{
+  Op::Read=>Ok(FileIo::Read{handle,addr,len}),
+  Op::Write=>Ok(FileIo::Write{handle,addr,len}),
+  _=>Err(Error::Unsupported),
+ }
+}
+#[cfg(test)]
+mod r010_linux_fd_tests{
+ use super::*;
+ use crate::batch5_session::Identity;
+ use crate::batch6_security::{Access,FILE_READ,FILE_WRITE};
+ fn id(g:u64)->Identity{Identity{pid:41,generation:g}}
+ fn auth()->Access<1>{
+  let mut access=Access::new();
+  access.grant(id(2),FILE_READ|FILE_WRITE,100).unwrap();access
+ }
+ #[test]fn directory_handles_are_not_shared_after_pid_reuse(){
+  let mut table=FileDescriptors::<2>::new();
+  table.attach(id(2),3,99,FD_READ).unwrap();
+  assert_eq!(table.resolve(id(2),3,FD_READ),Ok(99));
+  assert_eq!(table.resolve(id(3),3,FD_READ),Err(FdError::Denied));
+  assert_eq!(table.resolve(id(2),3,FD_WRITE),Err(FdError::Denied));
+  assert_eq!(table.retire(id(2)),1);
+  assert_eq!(table.resolve(id(2),3,FD_READ),Err(FdError::NotFound));
+ }
+ #[test]fn io_translation_enforces_fd_rights_and_user_ranges(){
+  let mut table=FileDescriptors::<1>::new();table.attach(id(2),5,0x1000,FD_READ).unwrap();
+  let a=auth();
+  assert_eq!(translate_file_io(&table,&a,id(2),10,0,5,0x2000,12,0x8000),
+    Ok(FileIo::Read{handle:0x1000,addr:0x2000,len:12}));
+  assert_eq!(translate_file_io(&table,&a,id(2),10,1,5,0x2000,12,0x8000),
+    Err(Error::Denied));
+  assert_eq!(translate_file_io(&table,&a,id(2),10,0,5,1,12,0x8000),
+    Err(Error::Pointer));
+ }
+ #[test]fn descriptor_capacity_duplicate_and_close_are_fail_closed(){
+  let mut table=FileDescriptors::<1>::new();
+  table.attach(id(2),3,15,FD_READ|FD_WRITE).unwrap();
+  assert_eq!(table.attach(id(2),3,16,FD_READ),Err(FdError::Duplicate));
+  assert_eq!(table.attach(id(2),4,16,FD_READ),Err(FdError::Full));
+  assert_eq!(table.close(id(3),3),Err(FdError::Denied));
+  assert_eq!(table.close(id(2),3),Ok(15));
+  assert_eq!(table.close(id(2),3),Err(FdError::NotFound));
+ }
+}

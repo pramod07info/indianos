@@ -555,3 +555,90 @@ mod r009_input_delivery_tests{
   assert_eq!(decode_key_event(broker.peek(6).unwrap().kind),Some((9,true)));
  }
 }
+
+ 
+/// R010 single-compositor input routing. The active window is selected only
+/// by a trusted compositor, never by a client-supplied target PID.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct FocusTarget{pub owner:u32,pub window:u32}
+pub struct DesktopInput{
+ focused:Option<FocusTarget>,capture:Option<FocusTarget>,
+}
+impl DesktopInput{
+ pub const fn new()->Self{Self{focused:None,capture:None}}
+ pub fn focused(&self)->Option<FocusTarget>{self.focused}
+ pub fn captured(&self)->Option<FocusTarget>{self.capture}
+ pub fn focus<const W:usize,const Q:usize>(&mut self,broker:&mut Broker<W,Q>,
+  window:u32)->Result<FocusTarget,Error>{
+  let owner=broker.owner(window).ok_or(Error::Unauthorized)?;
+  // Notify before changing state: a full input queue must not steal focus.
+  broker.post_focus(owner,window)?;
+  let target=FocusTarget{owner,window};self.focused=Some(target);
+  self.capture=None;Ok(target)
+ }
+ /// Capture starts only from the focused, authenticated owner.
+ pub fn capture_pointer<const W:usize,const Q:usize>(&mut self,
+  broker:&Broker<W,Q>,owner:u32,window:u32)->Result<(),Error>{
+  let target=FocusTarget{owner,window};
+  if self.focused!=Some(target)||!broker.owns(owner,window){
+   return Err(Error::Unauthorized);
+  }
+  self.capture=Some(target);Ok(())
+ }
+ pub fn release_pointer(&mut self,owner:u32){
+  if self.capture.is_some_and(|t|t.owner==owner){self.capture=None;}
+ }
+ pub fn keyboard<const W:usize,const Q:usize>(&mut self,
+  broker:&mut Broker<W,Q>,code:u16,pressed:bool)->Result<Event,Error>{
+  let target=self.focused.ok_or(Error::Empty)?;
+  if !broker.owns(target.owner,target.window){
+   self.focused=None;self.capture=None;return Err(Error::Unauthorized);
+  }
+  broker.post_keyboard(target.owner,target.window,code,pressed)
+ }
+ pub fn click<const W:usize,const Q:usize>(&mut self,
+  broker:&mut Broker<W,Q>,button:u8)->Result<Event,Error>{
+  let target=self.capture.or(self.focused).ok_or(Error::Empty)?;
+  if !broker.owns(target.owner,target.window){
+   self.capture=None;self.focused=None;return Err(Error::Unauthorized);
+  }
+  broker.post_pointer_click(target.owner,target.window,button)
+ }
+ pub fn process_exited<const W:usize,const Q:usize>(&mut self,
+  broker:&mut Broker<W,Q>,owner:u32){
+  broker.revoke(owner);
+  if self.focused.is_some_and(|t|t.owner==owner){self.focused=None;}
+  if self.capture.is_some_and(|t|t.owner==owner){self.capture=None;}
+ }
+}
+#[cfg(test)]
+mod r010_focus_capture_tests{
+ use super::*;
+ #[test]fn physical_focus_routes_to_authenticated_window_owner(){
+  let mut broker=Broker::<2,8>::new();broker.grant(11,101).unwrap();broker.grant(22,202).unwrap();
+  let mut input=DesktopInput::new();
+  assert_eq!(input.focus(&mut broker,202),Ok(FocusTarget{owner:22,window:202}));
+  assert_eq!(input.keyboard(&mut broker,30,true).unwrap().owner,22);
+  assert_eq!(input.focus(&mut broker,999),Err(Error::Unauthorized));
+  assert_eq!(input.focused(),Some(FocusTarget{owner:22,window:202}));
+ }
+ #[test]fn pointer_capture_cannot_be_stolen_by_foreign_window(){
+  let mut broker=Broker::<2,8>::new();broker.grant(11,101).unwrap();broker.grant(22,202).unwrap();
+  let mut input=DesktopInput::new();input.focus(&mut broker,101).unwrap();
+  assert_eq!(input.capture_pointer(&broker,22,202),Err(Error::Unauthorized));
+  input.capture_pointer(&broker,11,101).unwrap();
+  assert_eq!(input.click(&mut broker,1).unwrap().window,101);
+  input.release_pointer(22);
+  assert_eq!(input.captured(),Some(FocusTarget{owner:11,window:101}));
+  input.release_pointer(11);assert_eq!(input.captured(),None);
+ }
+ #[test]fn crashing_owner_releases_focus_capture_and_queued_events(){
+  let mut broker=Broker::<2,8>::new();broker.grant(11,101).unwrap();broker.grant(22,202).unwrap();
+  let mut input=DesktopInput::new();input.focus(&mut broker,101).unwrap();
+  input.capture_pointer(&broker,11,101).unwrap();
+  input.process_exited(&mut broker,11);
+  assert_eq!(input.focused(),None);assert_eq!(input.captured(),None);
+  assert_eq!(input.keyboard(&mut broker,1,true),Err(Error::Empty));
+  assert_eq!(input.focus(&mut broker,202).unwrap().owner,22);
+ }
+}

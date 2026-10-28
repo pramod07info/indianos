@@ -382,3 +382,66 @@ mod r009_quantum_completion_tests{
   assert_eq!(s.active_job_ids_scoped(id(4,1),&mut all),Ok(0));
  }
 }
+
+ 
+/// R010 scheduler-facing quantum simulator work quotas, not a QPU driver.
+/// The native service must still meter actual CPU time and memory.
+impl QuantumService{
+ pub fn active_count_scoped(&self,actor:Identity)->Result<usize,ServiceError>{
+  if actor.pid==0||actor.generation==0{return Err(ServiceError::InvalidOwner);}
+  Ok(self.owners.iter().filter(|x|
+     x.job!=0&&x.owner==actor.pid&&x.generation==actor.generation).count())
+ }
+ pub fn submit_quotad_scoped(&mut self,actor:Identity,request:&[u8],
+  maximum_active:usize)->Result<u64,ServiceError>{
+  if maximum_active==0||maximum_active>MAX_JOBS{
+   return Err(ServiceError::Queue(QueueError::Full));
+  }
+  if self.active_count_scoped(actor)?>=maximum_active{
+   return Err(ServiceError::Queue(QueueError::Full));
+  }
+  self.submit_scoped(actor,request)
+ }
+ pub fn drive_budget(&mut self,maximum_jobs:usize)->usize{
+  // The worker is explicitly invoked by a trusted scheduler. No hidden
+  // background thread, unbounded loop or timer access is created.
+  let mut completed=0;
+  for _ in 0..maximum_jobs.min(MAX_JOBS){
+   if self.run_next().is_some(){completed+=1;}else{break;}
+  }
+  completed
+ }
+}
+#[cfg(test)]
+mod r010_quantum_quota_tests{
+ use super::*;
+ const BELL:[u8;10]=[1,2,2,0,1,0,0,4,0,1];
+ fn id(pid:u32,generation:u64)->Identity{Identity{pid,generation}}
+ #[test]fn one_process_cannot_exceed_its_active_job_limit(){
+  let mut service=QuantumService::new();let who=id(101,7);
+  let first=service.submit_quotad_scoped(who,&BELL,1).unwrap();
+  assert_eq!(service.active_count_scoped(who),Ok(1));
+  assert_eq!(service.submit_quotad_scoped(who,&BELL,1),
+    Err(ServiceError::Queue(QueueError::Full)));
+  assert_eq!(service.active_count_scoped(id(101,8)),Ok(0));
+  service.release_scoped(who,first).unwrap();
+  assert!(service.submit_quotad_scoped(who,&BELL,1).is_ok());
+ }
+ #[test]fn cpu_worker_respects_small_execution_budget(){
+  let mut service=QuantumService::new();let who=id(103,2);
+  service.submit_quotad_scoped(who,&BELL,2).unwrap();
+  service.submit_quotad_scoped(who,&BELL,2).unwrap();
+  assert_eq!(service.drive_budget(0),0);
+  assert_eq!(service.drive_budget(1),1);
+  assert_eq!(service.drive_budget(1),1);
+  assert_eq!(service.drive_budget(1),0);
+ }
+ #[test]fn stale_process_quota_and_invalid_owner_denied(){
+  let mut service=QuantumService::new();
+  assert_eq!(service.submit_quotad_scoped(id(0,2),&BELL,1),
+    Err(ServiceError::InvalidOwner));
+  assert_eq!(service.submit_quotad_scoped(id(5,3),&BELL,0),
+    Err(ServiceError::Queue(QueueError::Full)));
+  assert_eq!(service.active_count_scoped(id(5,0)),Err(ServiceError::InvalidOwner));
+ }
+}
