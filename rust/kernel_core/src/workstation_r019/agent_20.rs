@@ -3,7 +3,7 @@
 //! Deliberately not a claim of a booted graphical IDE or host compiler.
 use super::Error;
 use super::{agent_01,agent_02,agent_03,agent_05,agent_06,agent_09,
- agent_14,agent_18,agent_19};
+ agent_14,agent_19};
 use crate::batch5_session::Identity;
 use crate::batch6_security::{Access,FILE_READ,FILE_WRITE};
 use crate::batch7_ramfs::RamFs;
