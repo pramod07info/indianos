@@ -531,3 +531,72 @@ mod r009_desktop_restart_tests{
   assert_eq!(b.health().desktop,Some(id(2,6)));
  }
 }
+
+ 
+/// R010 service restart throttle. The native scheduler must provide a
+/// monotonic tick clock and verified identities; this is not a boot driver.
+pub struct RestartGate{last_success:Option<u64>,minimum_ticks:u64}
+impl RestartGate{
+ pub const fn new(minimum_ticks:u64)->Self{
+  Self{last_success:None,minimum_ticks}
+ }
+ pub fn last_success(&self)->Option<u64>{self.last_success}
+ pub fn attempt<const P:usize,const E:usize,const W:usize,const K:usize>(
+  &mut self,boot:&mut Bootstrap<P,E,W,K>,now:u64,
+  dead:Identity,replacement:Identity,launch:Launch,settings:Settings)
+  ->Result<BootHealth,Error>{
+  if self.last_success.is_some_and(|then|
+      now.checked_sub(then).is_none_or(|elapsed|elapsed<self.minimum_ticks)){
+    return Err(Error::State);
+  }
+  // No clock or retry bookkeeping is committed until the owning scheduler
+  // has retired the old process and fully staged a verified replacement.
+  let health=boot.restart_failed_desktop(dead,replacement,launch,settings)?;
+  self.last_success=Some(now);Ok(health)
+ }
+ /// A new authenticated user session resets only the throttle, not the
+ /// owning bootstrap's separate global crash-restart budget.
+ pub fn new_session(&mut self){self.last_success=None;}
+}
+#[cfg(test)]
+mod r010_boot_throttle_tests{
+ use super::*;
+ use crate::batch2_launcher::Image;
+ use crate::batch2_settings::Theme;
+ fn id(g:u64)->Identity{Identity{pid:2,generation:g}}
+ fn launch(x:Identity)->Launch{Launch{pid:x.pid,generation:x.generation,
+  image:Image{image_id:x.pid,entry:0x1000,mapped_end:0x2000,verified:true}}}
+ fn settings()->Settings{Settings{theme:Theme::Dark,pointer_speed:5,key_repeat:10}}
+ fn running()->Bootstrap<3,3,3,3>{
+  let mut boot=Bootstrap::<3,3,3,3>::new();
+  let init=Identity{pid:1,generation:2};
+  boot.configure(11,22).unwrap();
+  boot.start_init(init,launch(init),settings(),11).unwrap();
+  boot.start_desktop(id(2),launch(id(2)),settings(),22).unwrap();boot
+ }
+ #[test]fn restart_throttle_rejects_early_retry_before_modifying_boot(){
+  let mut boot=running();let mut throttle=RestartGate::new(10);
+  assert_eq!(throttle.attempt(&mut boot,20,id(2),id(3),launch(id(3)),settings())
+    .unwrap().desktop,Some(id(3)));
+  assert_eq!(throttle.attempt(&mut boot,25,id(3),id(4),launch(id(4)),settings()),
+    Err(Error::State));
+  assert_eq!(boot.health().desktop,Some(id(3)));
+  assert_eq!(throttle.last_success(),Some(20));
+  assert_eq!(throttle.attempt(&mut boot,30,id(3),id(4),launch(id(4)),settings())
+    .unwrap().desktop,Some(id(4)));
+ }
+ #[test]fn failed_identity_check_never_consumes_restart_window(){
+  let mut boot=running();let mut throttle=RestartGate::new(20);
+  assert_eq!(throttle.attempt(&mut boot,60,id(2),id(3),launch(id(4)),settings()),
+    Err(Error::State));
+  assert_eq!(throttle.last_success(),None);
+  assert!(throttle.attempt(&mut boot,60,id(2),id(3),launch(id(3)),settings()).is_ok());
+ }
+ #[test]fn monotonic_clock_regression_fails_closed(){
+  let mut boot=running();let mut throttle=RestartGate::new(8);
+  throttle.attempt(&mut boot,100,id(2),id(3),launch(id(3)),settings()).unwrap();
+  assert_eq!(throttle.attempt(&mut boot,99,id(3),id(4),launch(id(4)),settings()),
+    Err(Error::State));
+  assert_eq!(boot.health().desktop,Some(id(3)));
+ }
+}
