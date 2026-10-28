@@ -653,3 +653,95 @@ mod r010_gpu_backing_tests{
     Err(Error::Dimensions));
  }
 }
+
+ 
+/// R011 scanout coordination in trusted compositor context. Mapping GPU BAR
+/// and granting IOMMU-backed DMA are separate privileged driver operations.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct DisplayLease{pub owner:u32,pub resource:u32,pub scanout:Scanout,
+ pub backing:BackingPlan,pub pending_frames:u32}
+pub struct MultiDisplay<const N:usize>{leases:[Option<DisplayLease>;N]}
+impl<const N:usize> MultiDisplay<N>{
+ pub const fn new()->Self{Self{leases:[None;N]}}
+ pub fn attach(&mut self,owner:u32,resource:u32,
+  scanout:Scanout,backing:BackingPlan)->Result<(),Error>{
+  if owner==0||resource==0{return Err(Error::Dimensions);}
+  let validated=validate_backing_plan(scanout,backing.physical,
+   backing.allocated_bytes,backing.stride_bytes)?;
+  if validated!=backing{return Err(Error::Dimensions);}
+  if self.leases.iter().flatten().any(|lease|
+      lease.scanout.scanout==scanout.scanout||lease.resource==resource){
+   return Err(Error::Unsupported);
+  }
+  let slot=self.leases.iter_mut().find(|entry|entry.is_none())
+    .ok_or(Error::Dimensions)?;
+  *slot=Some(DisplayLease{owner,resource,scanout,backing,
+    pending_frames:0});Ok(())
+ }
+ pub fn submit_damage(&mut self,owner:u32,resource:u32,
+  regions:&[Rect])->Result<usize,Error>{
+  let lease=self.leases.iter_mut().flatten().find(|s|
+    s.resource==resource&&s.owner==owner).ok_or(Error::Unsupported)?;
+  if regions.is_empty()||regions.len()>32{return Err(Error::Dimensions);}
+  // Validate every rectangle before mutating submitted-frame accounting.
+  for rect in regions{
+   if rect.width==0||rect.height==0||
+      rect.x.checked_add(rect.width).is_none_or(|v|v>lease.scanout.width)||
+      rect.y.checked_add(rect.height).is_none_or(|v|v>lease.scanout.height){
+    return Err(Error::Dimensions);
+   }
+  }
+  let next=lease.pending_frames.checked_add(1).ok_or(Error::Dimensions)?;
+  lease.pending_frames=next;Ok(regions.len())
+ }
+ pub fn present(&mut self,owner:u32,resource:u32)->Result<u32,Error>{
+  let lease=self.leases.iter_mut().flatten().find(|s|
+    s.resource==resource&&s.owner==owner).ok_or(Error::Unsupported)?;
+  if lease.pending_frames==0{return Err(Error::Dimensions);}
+  lease.pending_frames-=1;Ok(lease.pending_frames)
+ }
+ pub fn retire_owner(&mut self,owner:u32)->usize{
+  let mut n=0;
+  for slot in &mut self.leases{
+   if slot.is_some_and(|s|s.owner==owner){*slot=None;n+=1;}
+  }
+  n
+ }
+ pub fn active(&self)->usize{self.leases.iter().flatten().count()}
+}
+#[cfg(test)]
+mod r011_multiscanout_tests{
+ use super::*;
+ fn lease(id:u32)->(Scanout,BackingPlan){
+  let scanout=Scanout{width:100,height:50,scanout:id};
+  let backing=validate_backing_plan(scanout,0x1000+u64::from(id)*0x1000,
+     100*50*4,400).unwrap();
+  (scanout,backing)
+ }
+ #[test]fn two_distinct_displays_share_no_resource_or_scanout(){
+  let mut display=MultiDisplay::<2>::new();
+  let (s,b)=lease(0);display.attach(1,10,s,b).unwrap();
+  let (s,b)=lease(1);display.attach(2,20,s,b).unwrap();
+  assert_eq!(display.active(),2);
+  assert_eq!(display.attach(3,20,s,b),Err(Error::Unsupported));
+ }
+ #[test]fn invalid_damage_and_foreign_owner_do_not_advance_frame(){
+  let mut display=MultiDisplay::<1>::new();let(s,b)=lease(0);
+  display.attach(1,5,s,b).unwrap();
+  assert_eq!(display.submit_damage(2,5,&[Rect{x:0,y:0,width:2,height:2}]),
+    Err(Error::Unsupported));
+  assert_eq!(display.submit_damage(1,5,&[Rect{x:99,y:49,width:2,height:2}]),
+    Err(Error::Dimensions));
+  assert_eq!(display.present(1,5),Err(Error::Dimensions));
+  assert_eq!(display.submit_damage(1,5,&[Rect{x:0,y:0,width:2,height:2}]),Ok(1));
+  assert_eq!(display.present(1,5),Ok(0));
+ }
+ #[test]fn compositor_crash_releases_only_its_display(){
+  let mut display=MultiDisplay::<2>::new();
+  let(s,b)=lease(0);display.attach(1,5,s,b).unwrap();
+  let(s,b)=lease(1);display.attach(2,6,s,b).unwrap();
+  assert_eq!(display.retire_owner(1),1);
+  assert_eq!(display.active(),1);
+  assert_eq!(display.submit_damage(2,6,&[Rect{x:0,y:0,width:1,height:1}]),Ok(1));
+ }
+}
