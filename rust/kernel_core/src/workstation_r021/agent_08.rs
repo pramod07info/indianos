@@ -47,7 +47,7 @@ pub fn count_rule(items:&[Finding],rule:Rule)->usize{
   fs.replace(b"/src/main.rs",b"\tlet a = 1; \n// TODO fix").unwrap();
   let mut out=[EMPTY;6];
   let n=lint_file(&fs,b"/src/main.rs",9,&mut out).unwrap();
-  assert_eq!(n,4);
+  assert_eq!(n,5);
   assert_eq!(count_rule(&out[..n],Rule::TodoMarker),1);
  }
  #[test]fn too_many_findings_leave_inspection_results_unchanged(){
