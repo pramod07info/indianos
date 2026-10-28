@@ -141,3 +141,57 @@ mod orbit_r005_compat_tests{
   assert_eq!(classify_batch(&input,62,&mut []),Err(Error::UnknownFormat));
  }
 }
+
+
+/// R017 workstation application launch chooser. Classification describes
+/// compatibility requirements, never silently executes Windows/macOS/Linux.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum WorkstationLaunch{NativeReady,ExternalRuntimeNeeded,WebLink,RemoteOnly,RebuildRequired}
+pub fn workstation_launch_plan(availability:Availability,
+ consent:bool,signed_native:bool)->Result<WorkstationLaunch,LaunchError>{
+ let gate=launch_gate(availability,consent,signed_native)?;
+ Ok(match gate{
+  ExecutionGate::Native=>WorkstationLaunch::NativeReady,
+  _=>match availability{
+   Availability::Native=>WorkstationLaunch::NativeReady,
+   Availability::RuntimeMissing=>WorkstationLaunch::ExternalRuntimeNeeded,
+   Availability::Web=>WorkstationLaunch::WebLink,
+   Availability::AuthorizedRemote=>WorkstationLaunch::RemoteOnly,
+   Availability::PortRequired=>WorkstationLaunch::RebuildRequired,
+  },
+ })
+}
+pub fn classify_workstation_batch(input:&[Requested<'_>],host_arch:u16,
+ output:&mut[WorkstationLaunch],consent:bool)->Result<usize,Error>{
+ if input.is_empty()||output.len()<input.len(){return Err(Error::UnknownFormat);}
+ let mut stage=[WorkstationLaunch::RebuildRequired;16];
+ if input.len()>stage.len(){return Err(Error::UnknownFormat);}
+ for (i,request) in input.iter().enumerate(){
+  let available=classify(Requested{format:request.format,
+    verified:request.verified,bytes:request.bytes,mac:request.mac},host_arch)?;
+  stage[i]=workstation_launch_plan(available,consent,request.verified)
+    .map_err(|_|Error::Unverified)?;
+ }
+ output[..input.len()].copy_from_slice(&stage[..input.len()]);
+ Ok(input.len())
+}
+#[cfg(test)]mod r017_workstation_compat_tests{
+ use super::*;
+ #[test]fn native_still_requires_signature_and_user_consent(){
+  assert_eq!(workstation_launch_plan(Availability::Native,true,true),
+    Ok(WorkstationLaunch::NativeReady));
+  assert!(workstation_launch_plan(Availability::Native,false,true).is_err());
+  assert!(workstation_launch_plan(Availability::Native,true,false).is_err());
+ }
+ #[test]fn third_party_runtime_is_never_treated_as_native(){
+  let result=workstation_launch_plan(Availability::RuntimeMissing,true,true);
+  assert_ne!(result,Ok(WorkstationLaunch::NativeReady));
+ }
+ #[test]fn batch_of_native_candidates_is_bounded_and_atomic(){
+  let requests=[Requested{format:Format::Native,verified:true,bytes:b"",mac:None}];
+  let mut out=[WorkstationLaunch::RebuildRequired;1];
+  assert_eq!(classify_workstation_batch(&requests,62,&mut out,true),Ok(1));
+  assert_eq!(out,[WorkstationLaunch::NativeReady]);
+  assert!(classify_workstation_batch(&requests,62,&mut [],true).is_err());
+ }
+}
