@@ -67,3 +67,60 @@ mod tests{
         assert_eq!(t.phase(),Phase::Idle);
     }
 }
+
+ 
+/// R009 installer handoff: invoke a trusted durable package backend only
+/// after signed payload, architecture and explicit consent were accepted.
+/// The callback must itself be atomic/durable and perform actual signature
+/// verification; this wrapper does not make filesystem writes safe.
+#[derive(Debug,PartialEq,Eq)]
+pub enum CommitError<E>{Policy(InstallError),Backend(E)}
+impl Transaction{
+ pub fn commit_with<T,E,F>(&mut self,backend:F)->Result<T,CommitError<E>>
+   where F:FnOnce(Proposal)->Result<T,E>{
+  if self.phase!=Phase::Approved{return Err(CommitError::Policy(InstallError::WrongState));}
+  let proposal=self.proposal.ok_or(CommitError::Policy(InstallError::WrongState))?;
+  match backend(proposal){
+   Ok(receipt)=>{self.phase=Phase::Committed;Ok(receipt)},
+   Err(error)=>{
+    // A failed backend cannot reuse an old consent token. The backend
+    // remains responsible for rollback of any staged disk transaction.
+    self.rollback();Err(CommitError::Backend(error))
+   }
+  }
+ }
+ pub fn proposal(&self)->Option<Proposal>{self.proposal}
+}
+#[cfg(test)]
+mod r009_install_backend_tests{
+ use super::*;
+ fn signed()->Proposal{Proposal{app_id:7,manifest_verified:true,
+   payload_verified:true,permissions:3,architecture_ok:true}}
+ #[test]fn approved_install_commits_backend_receipt(){
+  let mut t=Transaction::new();t.stage(signed()).unwrap();
+  t.approve(3,true).unwrap();
+  let receipt=t.commit_with(|p|->Result<u64,&'static str>{
+   assert_eq!(p.app_id,7);Ok(0x5555)
+  });
+  assert_eq!(receipt,Ok(0x5555));
+  assert_eq!(t.phase(),Phase::Committed);
+ }
+ #[test]fn backend_failure_invalidates_consent_and_requires_reapproval(){
+  let mut t=Transaction::new();t.stage(signed()).unwrap();
+  t.approve(3,true).unwrap();
+  assert_eq!(t.commit_with(|_|->Result<(),u8>{Err(8)}),Err(CommitError::Backend(8)));
+  assert_eq!(t.phase(),Phase::Idle);
+  assert_eq!(t.commit_with(|_|->Result<(),u8>{Ok(())}),
+    Err(CommitError::Policy(InstallError::WrongState)));
+ }
+ #[test]fn unsigned_or_unapproved_install_never_calls_backend(){
+  let mut t=Transaction::new();
+  let mut invoked=false;
+  assert_eq!(t.commit_with(|_|->Result<(),u8>{invoked=true;Ok(())}),
+    Err(CommitError::Policy(InstallError::WrongState)));
+  assert!(!invoked);
+  let mut p=signed();p.manifest_verified=false;
+  assert_eq!(t.stage(p),Err(InstallError::Untrusted));
+  assert!(!invoked);
+ }
+}
