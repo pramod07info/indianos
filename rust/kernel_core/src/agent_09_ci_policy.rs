@@ -99,3 +99,68 @@ mod named_gate_tests {
             &["kernel"],"a"), Err(NamedGateError::Unexpected));
     }
 }
+
+
+// R007: fail-closed integration policy. Inputs must be read from GitHub's
+// authenticated API; this is not a signature verifier or CI runner.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct ReviewerEvidence<'a>{
+    pub reviewer:&'a str,pub sha:&'a str,pub approved:bool,
+}
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum ReviewGateError{
+    Checks(NamedGateError),Missing,SelfReview,Duplicate,Stale,Rejected,
+}
+pub fn require_reviewed_merge(checks:&[NamedCheck<'_>],required:&[&str],
+    target_sha:&str,author:&str,reviews:&[ReviewerEvidence<'_>],
+    minimum_independent:usize)->Result<usize,ReviewGateError>{
+    require_named_checks(checks,required,target_sha).map_err(ReviewGateError::Checks)?;
+    if author.is_empty()||minimum_independent==0||minimum_independent>10||
+       reviews.len()>20{return Err(ReviewGateError::Missing);}
+    for (i,review) in reviews.iter().enumerate(){
+        if review.reviewer.is_empty(){return Err(ReviewGateError::Missing);}
+        if review.sha!=target_sha{return Err(ReviewGateError::Stale);}
+        if review.reviewer==author{return Err(ReviewGateError::SelfReview);}
+        if !review.approved{return Err(ReviewGateError::Rejected);}
+        if reviews[..i].iter().any(|old|old.reviewer==review.reviewer){
+            return Err(ReviewGateError::Duplicate);
+        }
+    }
+    if reviews.len()<minimum_independent{return Err(ReviewGateError::Missing);}
+    Ok(reviews.len())
+}
+#[cfg(test)]mod r007_review_gate_tests{
+    use super::*;
+    fn checks()->[NamedCheck<'static>;2]{
+        [NamedCheck{name:"kernel",sha:"abc",status:Status::Success},
+         NamedCheck{name:"security",sha:"abc",status:Status::Success}]
+    }
+    fn review(user:&'static str,sha:&'static str,approved:bool)
+       ->ReviewerEvidence<'static>{
+        ReviewerEvidence{reviewer:user,sha,approved}
+    }
+    fn check(reviews:&[ReviewerEvidence<'_>],min:usize)
+       ->Result<usize,ReviewGateError>{
+        require_reviewed_merge(&checks(),&["kernel","security"],"abc",
+            "author",reviews,min)
+    }
+    #[test]fn two_independent_approvals_bound_to_exact_sha(){
+        assert_eq!(check(&[review("alice","abc",true),
+            review("bob","abc",true)],2),Ok(2));
+    }
+    #[test]fn cannot_self_approve_duplicate_or_reuse_stale_sha(){
+        assert_eq!(check(&[review("author","abc",true)],1),Err(ReviewGateError::SelfReview));
+        assert_eq!(check(&[review("alice","old",true)],1),Err(ReviewGateError::Stale));
+        assert_eq!(check(&[review("alice","abc",true),
+            review("alice","abc",true)],2),Err(ReviewGateError::Duplicate));
+    }
+    #[test]fn pending_checks_and_changes_requested_block_approval(){
+        assert_eq!(check(&[review("alice","abc",false)],1),Err(ReviewGateError::Rejected));
+        assert_eq!(check(&[review("alice","abc",true)],2),Err(ReviewGateError::Missing));
+        let pending=[NamedCheck{name:"kernel",sha:"abc",status:Status::Pending},
+            NamedCheck{name:"security",sha:"abc",status:Status::Success}];
+        assert_eq!(require_reviewed_merge(&pending,&["kernel","security"],"abc",
+            "author",&[review("alice","abc",true)],1),
+            Err(ReviewGateError::Checks(NamedGateError::Incomplete)));
+    }
+}
