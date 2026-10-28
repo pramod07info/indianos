@@ -25,6 +25,8 @@ pub mod workstation_r019;
 pub mod workstation_r020;
 /// R021: developer workstation integration, project source tools and safe build/debug workflows.
 pub mod workstation_r021;
+/// R022: integrated developer workspace with real RAM source operations, release gates and guest smoke.
+pub mod workstation_r022;
 mod syscall;
 mod program;
 mod initramfs;
