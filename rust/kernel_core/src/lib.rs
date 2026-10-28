@@ -21,6 +21,8 @@ pub mod orbit_mobile;
 pub mod workstation_r018;
 /// R019: 20 integrated developer-workstation source/service workstreams.
 pub mod workstation_r019;
+/// R020: 20 tested developer-workstation operations integrated with real RAM VFS, UI and build policy.
+pub mod workstation_r020;
 mod syscall;
 mod program;
 mod initramfs;
