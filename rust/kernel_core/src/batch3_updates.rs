@@ -157,3 +157,116 @@ mod orbit_r005_smart_update_tests{
   assert_eq!(u.abort_staged(),Err(UpdateError::WrongState));
  }
 }
+
+
+/// R006 automatic update orchestration controls. The future network service
+/// must download over authenticated HTTPS, verify signed metadata and stage
+/// durable inactive-slot bytes. This code controls WHEN it may do so.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum Channel{Stable,Beta}
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct UpdateEnvironment{
+ pub internet_authenticated:bool,pub metered:bool,pub allow_metered:bool,
+ pub battery_percent:u8,pub external_power:bool,
+ pub active_user_session:bool,pub restart_approved:bool,
+ pub selected_channel:Channel,
+}
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct ReleasePolicy{
+ pub channel:Channel,pub rollout_percentage:u8,
+ pub device_cohort:u8,pub urgent:bool,
+}
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum GateError{Offline,Metered,Power,BadRollout,Channel,Busy,Approval,Image(UpdateError)}
+impl From<UpdateError> for GateError{
+ fn from(x:UpdateError)->Self{Self::Image(x)}
+}
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct UpdateDecision{pub eligible:bool,pub restart_now:bool}
+pub fn preflight_download(env:UpdateEnvironment,policy:ReleasePolicy)
+ ->Result<UpdateDecision,GateError>{
+ if policy.rollout_percentage==0||policy.rollout_percentage>100||
+   policy.device_cohort>=100{return Err(GateError::BadRollout);}
+ if policy.channel!=env.selected_channel{return Err(GateError::Channel);}
+ if !env.internet_authenticated{return Err(GateError::Offline);}
+ if env.metered&&!env.allow_metered{return Err(GateError::Metered);}
+ if !env.external_power&&env.battery_percent<40{return Err(GateError::Power);}
+ Ok(UpdateDecision{eligible:policy.device_cohort<policy.rollout_percentage,
+   restart_now:env.restart_approved&&!env.active_user_session})
+}
+pub struct SmartUpdate{pub slot:Update,download_eligible:bool}
+impl SmartUpdate{
+ pub const fn new(running:u64,floor:u64)->Self{
+  Self{slot:Update::new(running,floor),download_eligible:false}
+ }
+ /// Mark an image for trusted inactive-slot staging only after passing
+ /// signature/digest/architecture/downgrade and rollout policy checks.
+ pub fn prepare(&mut self,env:UpdateEnvironment,policy:ReleasePolicy,
+  candidate:Candidate,host_arch:u16)->Result<(),GateError>{
+  let eligible=preflight_download(env,policy)?;
+  if !eligible.eligible{return Err(GateError::BadRollout);}
+  self.slot.stage(candidate,host_arch)?;
+  self.download_eligible=true;Ok(())
+ }
+ /// Requires genuine inactive slot flush plus an explicit restart choice
+ /// while a user session is active. No background forced reboot.
+ pub fn activate(&mut self,env:UpdateEnvironment,
+  inactive_slot_flushed:bool,retries:u8)->Result<(),GateError>{
+  if !self.download_eligible{return Err(GateError::Busy);}
+  if env.active_user_session&&!env.restart_approved{
+   return Err(GateError::Approval);
+  }
+  self.slot.prepared(inactive_slot_flushed,retries)?;
+  Ok(())
+ }
+ /// Identify exactly which image was booted and health-tested. A wrong
+ /// boot slot never advances the anti-rollback floor.
+ pub fn confirm(&mut self,image:u32,healthy:bool)->Result<(),GateError>{
+  self.slot.confirm_exact(image,healthy)?;
+  self.download_eligible=false;Ok(())
+ }
+ pub fn cancel(&mut self){self.slot.rollback();self.download_eligible=false;}
+}
+#[cfg(test)]
+mod r006_ota_workflow_tests{
+ use super::*;
+ fn env()->UpdateEnvironment{
+  UpdateEnvironment{internet_authenticated:true,metered:false,
+   allow_metered:false,battery_percent:70,external_power:false,
+   active_user_session:true,restart_approved:false,selected_channel:Channel::Stable}
+ }
+ fn policy()->ReleasePolicy{ReleasePolicy{
+  channel:Channel::Stable,rollout_percentage:25,device_cohort:10,urgent:false}}
+ fn signed()->Candidate{Candidate{image_id:88,version:12,verified_signature:true,
+  payload_digest_verified:true,target_arch:62}}
+ #[test]fn rollout_power_network_and_metered_constraints_are_enforced(){
+  let e=env();let p=policy();
+  assert!(preflight_download(e,p).unwrap().eligible);
+  assert_eq!(preflight_download(UpdateEnvironment{internet_authenticated:false,..e},p),
+   Err(GateError::Offline));
+  assert_eq!(preflight_download(UpdateEnvironment{metered:true,..e},p),
+   Err(GateError::Metered));
+  assert_eq!(preflight_download(UpdateEnvironment{battery_percent:9,..e},p),
+   Err(GateError::Power));
+  assert!(!preflight_download(e,ReleasePolicy{device_cohort:30,..p}).unwrap().eligible);
+ }
+ #[test]fn pending_user_approval_and_verified_slot_are_mandatory(){
+  let mut agent=SmartUpdate::new(11,11);
+  agent.prepare(env(),policy(),signed(),62).unwrap();
+  assert_eq!(agent.activate(env(),true,2),Err(GateError::Approval));
+  let approved=UpdateEnvironment{restart_approved:true,..env()};
+  assert_eq!(agent.activate(approved,false,2),Err(GateError::Image(UpdateError::WrongState)));
+  agent.activate(approved,true,2).unwrap();
+  assert_eq!(agent.confirm(87,true),Err(GateError::Image(UpdateError::WrongState)));
+  agent.confirm(88,true).unwrap();
+  assert_eq!(agent.slot.running_floor(),(12,12));
+ }
+ #[test]fn bad_signatures_never_publish_download_eligibility(){
+  let mut agent=SmartUpdate::new(10,10);
+  let invalid=Candidate{verified_signature:false,..signed()};
+  assert_eq!(agent.prepare(env(),policy(),invalid,62),
+   Err(GateError::Image(UpdateError::Untrusted)));
+  assert_eq!(agent.activate(env(),true,2),Err(GateError::Busy));
+  assert_eq!(agent.slot.state(),Stage::Idle);
+ }
+}
