@@ -19,6 +19,8 @@ pub mod orbit_mobile;
 /// R018: 40 bounded developer workstation service operations in five tracks.
 /// Host tests and no_std compilation; not separate coding processes.
 pub mod workstation_r018;
+/// R019: 20 integrated developer-workstation source/service workstreams.
+pub mod workstation_r019;
 mod syscall;
 mod program;
 mod initramfs;
