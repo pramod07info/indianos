@@ -731,3 +731,55 @@ mod r013_security_reaper_tests{
   assert_eq!(a.owner_rights_checked(id(1,2),11),Ok(VIEW));
  }
 }
+
+/// R014 audit-atomic privilege provisioning. The commit is rejected if
+/// either the capability table or the append-only journal cannot accept
+/// all proposed grants. No half-provisioned desktop session may launch.
+impl<const N:usize> Access<N>{
+ pub fn grant_batch_audited<const L:usize>(&mut self,
+  audit:&mut SecurityAudit<L>,now:u64,grants:&[(Identity,u32,u64)])
+  ->Result<usize,AuditError>{
+  audit.validate()?;
+  if grants.is_empty()||grants.len()>N||grants.len()>audit.remaining(){
+   return Err(AuditError::Full);
+  }
+  let mut staged=Self{grants:self.grants};
+  staged.grant_batch(grants).map_err(|_|AuditError::Denied)?;
+  let mut log=SecurityAudit{
+   entries:audit.entries,used:audit.used,next:audit.next,chain:audit.chain,
+  };
+  for &(owner,rights,expiration) in grants{
+   if expiration<=now{return Err(AuditError::Invalid);}
+   log.record(owner,rights,now,AuditKind::Allowed)?;
+  }
+  self.grants=staged.grants;*audit=log;Ok(grants.len())
+ }
+ pub fn unrevoked_owners(&self,now:u64)->usize{
+  self.grants.iter().flatten().filter(|g|!g.revoked&&now<g.expires).count()
+ }
+}
+#[cfg(test)]
+mod r014_audit_atomic_provision_tests{
+ use super::*;
+ fn id(p:u32)->Identity{Identity{pid:p,generation:1}}
+ #[test]fn batch_grant_and_audit_commit_together(){
+  let mut a=Access::<3>::new();let mut log=SecurityAudit::<3>::new();
+  assert_eq!(a.grant_batch_audited(&mut log,5,&[
+   (id(1),VIEW,20),(id(2),FILE_READ,30)]),Ok(2));
+  assert_eq!(a.require(id(1),VIEW,6),Ok(()));
+  assert_eq!(a.require(id(2),FILE_READ,6),Ok(()));
+  assert_eq!(log.remaining(),1);assert_eq!(log.validate(),Ok(()));
+ }
+ #[test]fn duplicate_pid_or_excess_capacity_does_not_partially_grant(){
+  let mut a=Access::<3>::new();let mut log=SecurityAudit::<3>::new();
+  assert_eq!(a.grant_batch_audited(&mut log,5,&[
+   (id(1),VIEW,20),(id(1),FILE_WRITE,20)]),Err(AuditError::Denied));
+  assert_eq!(a.unrevoked_owners(5),0);assert_eq!(log.remaining(),3);
+ }
+ #[test]fn expired_in_batch_aborts_permissions_and_log(){
+  let mut a=Access::<2>::new();let mut log=SecurityAudit::<2>::new();
+  assert_eq!(a.grant_batch_audited(&mut log,10,&[
+   (id(1),VIEW,20),(id(2),VIEW,10)]),Err(AuditError::Invalid));
+  assert_eq!(a.unrevoked_owners(10),0);assert_eq!(log.remaining(),2);
+ }
+}
