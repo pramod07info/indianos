@@ -881,3 +881,80 @@ mod r013_cpu_blitter_tests{
   assert_eq!(out[0],0xffff0000);assert_eq!(out[1],0xff000000);
  }
 }
+
+/// R014 CPU fallback desktop panel rasterizer. Draws a bordered window body
+/// with a title strip in a verified framebuffer without any DMA capability.
+pub fn cpu_draw_panel(display:Scanout,stride:usize,pixels:&mut[u32],
+ rect:Rect,background:u32,title:u32,border:u32)->Result<usize,Error>{
+ if rect.width<3||rect.height<3||rect.x.checked_add(rect.width)
+     .is_none_or(|v|v>display.width)||
+   rect.y.checked_add(rect.height).is_none_or(|v|v>display.height){
+  return Err(Error::Dimensions);
+ }
+ let required=stride.checked_mul(display.height as usize)
+  .ok_or(Error::Dimensions)?;
+ if stride<display.width as usize||pixels.len()<required{
+  return Err(Error::Dimensions);
+ }
+ cpu_fill_rect(display,stride,pixels,rect,background)?;
+ let header=Rect{height:rect.height.min(24),..rect};
+ cpu_fill_rect(display,stride,pixels,header,title)?;
+ let top=Rect{height:1,..rect};
+ let bottom=Rect{y:rect.y+rect.height-1,height:1,..rect};
+ let left=Rect{width:1,..rect};
+ let right=Rect{x:rect.x+rect.width-1,width:1,..rect};
+ for edge in [top,bottom,left,right]{
+  cpu_fill_rect(display,stride,pixels,edge,border)?;
+ }
+ Ok((rect.width as usize)*(rect.height as usize))
+}
+/// Paint a small monochrome 8x8 glyph from a trusted ROM glyph map, with
+/// clipped/bounded access and alpha-safe foreground/background selection.
+pub fn cpu_draw_glyph8(display:Scanout,stride:usize,pixels:&mut[u32],
+ x:u32,y:u32,rows:[u8;8],foreground:u32,background:u32)
+ ->Result<usize,Error>{
+ if x.checked_add(8).is_none_or(|v|v>display.width)||
+   y.checked_add(8).is_none_or(|v|v>display.height)||
+   stride<display.width as usize||
+   stride.checked_mul(display.height as usize)
+     .is_none_or(|needed|needed>pixels.len()){
+  return Err(Error::Dimensions);
+ }
+ for (row,bits) in rows.into_iter().enumerate(){
+  let offset=(y as usize+row)*stride+x as usize;
+  for column in 0..8{
+   pixels[offset+column]=if bits&(0x80>>column)!=0{
+    foreground
+   }else{background};
+  }
+ }
+ Ok(64)
+}
+#[cfg(test)]
+mod r014_cpu_desktop_raster_tests{
+ use super::*;
+ fn screen()->Scanout{Scanout{width:16,height:16,scanout:0}}
+ #[test]fn window_panel_paints_title_background_and_protected_border(){
+  let mut p=[0u32;256];
+  assert_eq!(cpu_draw_panel(screen(),16,&mut p,
+   Rect{x:1,y:1,width:10,height:10},1,2,3),Ok(100));
+  assert_eq!(p[1*16+1],3);assert_eq!(p[2*16+2],2);
+  assert_eq!(p[9*16+2],2);assert_eq!(p[10*16+2],3);
+  assert_eq!(p[0],0);
+ }
+ #[test]fn invalid_panel_bounds_do_not_modify_framebuffer(){
+  let mut p=[7u32;256];
+  assert_eq!(cpu_draw_panel(screen(),16,&mut p,
+   Rect{x:15,y:0,width:4,height:4},1,2,3),Err(Error::Dimensions));
+  assert_eq!(p,[7u32;256]);
+ }
+ #[test]fn glyph_raster_respects_bitmask_and_row_bounds(){
+  let mut p=[0u32;256];
+  let rows=[0b10000001;8];
+  assert_eq!(cpu_draw_glyph8(screen(),16,&mut p,4,5,rows,0xff,3),Ok(64));
+  assert_eq!(p[5*16+4],0xff);assert_eq!(p[5*16+5],3);
+  assert_eq!(p[5*16+11],0xff);
+  assert_eq!(cpu_draw_glyph8(screen(),16,&mut p,10,10,rows,0,0),
+    Err(Error::Dimensions));
+ }
+}
