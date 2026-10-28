@@ -57,7 +57,7 @@ pub fn checksum<const B:usize>(editor:&Buffer<B>,owner:u32)
   assert_eq!(editor_to_disk(&e,&mut fs,7,0,b"/a"),Err(Error::Stale));
   let mut got=[0u8;3];fs.read(b"/a",0,&mut got).unwrap();assert_eq!(&got,b"new");
  }
- #[test]fn reused_owner_and missing_word_are_denied(){
+ #[test]fn reused_owner_and_missing_word_are_denied(){
   let mut e=Buffer::<32>::new(7);e.load(7,0,b"hello").unwrap();
   assert_eq!(replace_one(&mut e,8,1,b"hello",b"x"),Err(Error::Denied));
   assert_eq!(replace_one(&mut e,7,1,b"absent",b"x"),Err(Error::Missing));
