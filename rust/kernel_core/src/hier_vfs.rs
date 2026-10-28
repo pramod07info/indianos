@@ -905,3 +905,82 @@ mod r013_checkpoint_lifecycle_tests{
   assert_eq!(fs.read("/bak",&mut[0;4]),Err(FsError::NotFound));
  }
 }
+
+/// R014 avoid generating unnecessary durable bank writes for unchanged
+/// application state; use one generation-fenced COW commit for real changes.
+impl<D:BlockDevice> HierVfs<D>{
+ pub fn overwrite_if_changed(&mut self,path:&str,expected:u64,
+   content:&[u8])->Result<(u64,bool),FsError>{
+  if self.generation()!=expected{return Err(FsError::InvalidVolume);}
+  if content.len()>MAX_FILE_BYTES{return Err(FsError::TooLarge);}
+  let mut existing=[0u8;MAX_FILE_BYTES];
+  let n=self.read(path,&mut existing)?;
+  if n==content.len()&&existing[..n]==*content{return Ok((expected,false));}
+  self.overwrite(path,content)?;
+  Ok((self.generation(),true))
+ }
+ /// Verify a named recovery copy before changing any destination metadata.
+ pub fn restore_verified_if_different(&mut self,destination:&str,
+   backup:&str,expected:u64)->Result<(u64,bool),FsError>{
+  if self.generation()!=expected||destination==backup{
+   return Err(FsError::InvalidVolume);
+  }
+  let mut saved=[0u8;MAX_FILE_BYTES];
+  let n=self.read(backup,&mut saved)?;
+  let (gen,changed)=self.overwrite_if_changed(destination,expected,&saved[..n])?;
+  Ok((gen,changed))
+ }
+ pub fn read_two_checked(&mut self,first:&str,second:&str,expected:u64,
+   a:&mut[u8],b:&mut[u8])->Result<(usize,usize),FsError>{
+  if self.generation()!=expected{return Err(FsError::InvalidVolume);}
+  let n=self.read(first,a)?;
+  let m=self.read(second,b)?;
+  if self.generation()!=expected{return Err(FsError::InvalidVolume);}
+  Ok((n,m))
+ }
+}
+#[cfg(test)]
+mod r014_durable_idempotency_tests{
+ use super::*;use crate::block::{BlockDevice,BlockError,SECTOR_BYTES};
+ const COUNT:usize=100;
+ #[derive(Clone)]struct Device{sectors:[[u8;SECTOR_BYTES];COUNT]}
+ impl BlockDevice for Device{
+  fn sector_count(&self)->u64{COUNT as u64}
+  fn read_sector(&mut self,n:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   *out=*self.sectors.get(n as usize).ok_or(BlockError::OutOfRange)?;Ok(())
+  }
+  fn write_sector(&mut self,n:u64,buffer:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   *self.sectors.get_mut(n as usize).ok_or(BlockError::OutOfRange)?=*buffer;Ok(())
+  }
+ }
+ fn fresh()->HierVfs<Device>{
+  let mut fs=HierVfs::format_blank(Device{sectors:[[0;SECTOR_BYTES];COUNT]}).unwrap();
+  fs.create("/data",b"hello").unwrap();fs
+ }
+ #[test]fn repeated_identical_write_skips_flash_wear_and_generation(){
+  let mut fs=fresh();let g=fs.generation();
+  assert_eq!(fs.overwrite_if_changed("/data",g,b"hello"),Ok((g,false)));
+  assert_eq!(fs.generation(),g);
+  let (next,changed)=fs.overwrite_if_changed("/data",g,b"world").unwrap();
+  assert!(changed);assert_eq!(next,g+1);
+ }
+ #[test]fn cold_remount_restores_backup_and_skips_second_restore(){
+  let mut fs=fresh();fs.checkpoint("/data","/backup",fs.generation()).unwrap();
+  fs.overwrite("/data",b"bad").unwrap();
+  let mut fs=HierVfs::mount(fs.into_device()).unwrap();
+  let g=fs.generation();
+  assert_eq!(fs.restore_verified_if_different("/data","/backup",g),
+    Ok((g+1,true)));
+  let g=fs.generation();assert_eq!(fs.restore_verified_if_different(
+    "/data","/backup",g),Ok((g,false)));
+ }
+ #[test]fn stale_writer_cannot_overwrite_or_read_as_current_generation(){
+  let mut fs=fresh();let stale=fs.generation();
+  fs.overwrite("/data",b"new").unwrap();
+  assert_eq!(fs.overwrite_if_changed("/data",stale,b"old"),
+    Err(FsError::InvalidVolume));
+  let mut a=[0;8];let mut b=[0;8];
+  assert_eq!(fs.read_two_checked("/data","/data",stale,&mut a,&mut b),
+    Err(FsError::InvalidVolume));
+ }
+}
