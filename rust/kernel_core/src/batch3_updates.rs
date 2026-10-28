@@ -270,3 +270,60 @@ mod r006_ota_workflow_tests{
   assert_eq!(agent.slot.state(),Stage::Idle);
  }
 }
+
+ 
+/// R010 deterministic on-device OTA polling scheduler. A trusted clock,
+/// signed manifest fetcher, durable A/B slot writer and real HTTPS stack
+/// must be connected separately. This type never downloads or reboots.
+pub struct UpdatePoller{
+ next_check:u64,interval:u64,failures:u8,
+}
+impl UpdatePoller{
+ pub fn new(now:u64,interval:u64)->Result<Self,GateError>{
+  if interval==0||interval>86_400{return Err(GateError::Busy);}
+  let next=now.checked_add(interval).ok_or(GateError::Busy)?;
+  Ok(Self{next_check:next,interval,failures:0})
+ }
+ pub fn next_check(&self)->u64{self.next_check}
+ pub fn eligible(&self,now:u64)->bool{now>=self.next_check}
+ pub fn record_check(&mut self,now:u64,success:bool)->Result<u64,GateError>{
+  if now<self.next_check{return Err(GateError::Busy);}
+  let failures=if success{0}else{self.failures.saturating_add(1).min(5)};
+  let factor=1u64<<u32::from(failures);
+  let delay=self.interval.checked_mul(factor).ok_or(GateError::Busy)?;
+  let next=now.checked_add(delay).ok_or(GateError::Busy)?;
+  self.failures=failures;self.next_check=next;Ok(next)
+ }
+ /// Never force a reboot during an active session without explicit consent.
+ pub fn may_restart(&self,environment:UpdateEnvironment)->bool{
+  environment.restart_approved || !environment.active_user_session
+ }
+}
+#[cfg(test)]
+mod r010_ota_poller_tests{
+ use super::*;
+ #[test]fn poller_schedules_periodic_success_and_backoff(){
+  let mut poller=UpdatePoller::new(100,10).unwrap();
+  assert!(!poller.eligible(109));assert!(poller.eligible(110));
+  assert_eq!(poller.record_check(110,true),Ok(120));
+  assert_eq!(poller.record_check(120,false),Ok(140));
+  assert_eq!(poller.record_check(140,false),Ok(180));
+  assert_eq!(poller.record_check(180,true),Ok(190));
+ }
+ #[test]fn impossible_timestamp_cannot_overwrite_valid_schedule(){
+  let mut poller=UpdatePoller::new(100,10).unwrap();
+  assert_eq!(poller.record_check(109,false),Err(GateError::Busy));
+  assert_eq!(poller.next_check(),110);
+  assert_eq!(poller.record_check(u64::MAX,false),Err(GateError::Busy));
+  assert_eq!(poller.next_check(),110);
+ }
+ #[test]fn restart_approval_is_explicit_in_active_session(){
+  let poller=UpdatePoller::new(0,10).unwrap();
+  let environment=UpdateEnvironment{internet_authenticated:true,metered:false,
+   allow_metered:false,battery_percent:80,external_power:false,
+   active_user_session:true,restart_approved:false,selected_channel:Channel::Stable};
+  assert!(!poller.may_restart(environment));
+  assert!(poller.may_restart(UpdateEnvironment{restart_approved:true,..environment}));
+  assert!(poller.may_restart(UpdateEnvironment{active_user_session:false,..environment}));
+ }
+}
