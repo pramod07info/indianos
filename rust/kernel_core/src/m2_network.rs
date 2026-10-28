@@ -42,16 +42,15 @@ impl<const P:usize> Endpoint<P>{
 }
 fn valid_domain(name:&[u8])->bool{
  if name.is_empty()||name.len()>253{return false;}
- let mut label=0usize;
- for &b in name{
-  if b==b'.'{
-   if label==0||label>63{return false;}
-   label=0;
-  }else if b.is_ascii_alphanumeric()||b==b'-'{
-   label+=1;if label>63{return false;}
-  }else{return false;}
+ for label in name.split(|&b|b==b'.'){
+  if label.is_empty()||label.len()>63||
+     !label[0].is_ascii_alphanumeric()||
+     !label[label.len()-1].is_ascii_alphanumeric()||
+     !label.iter().all(|b|b.is_ascii_alphanumeric()||*b==b'-'){
+   return false;
+  }
  }
- label!=0
+ true
 }
 fn be16(b:&[u8])->u16{u16::from_be_bytes([b[0],b[1]])}
 pub fn parse_dns_a(id:u16,domain:&[u8],wire:&[u8])->Result<[u8;4],Error>{
@@ -631,5 +630,68 @@ mod r009_dns_lease_cache_tests{
   assert_eq!(cache.resolve_verified(&endpoint,owner(),1100,3,0x1234,
      b"a.io",&corrupt),Err(Error::Malformed));
   assert_eq!(cache.cached(&endpoint,owner(),1100,3,b"a.io"),Ok(Some([1,2,3,4])));
+ }
+}
+
+ 
+/// R010 cache lifecycle control: purge stale TTL entries and invalidate
+/// response records when a trusted resolver reconnects or its lease changes.
+impl<const N:usize> DnsLeaseCache<N>{
+ pub fn sweep_expired(&mut self,now:u64)->usize{
+  let mut removed=0;
+  for entry in &mut self.entries{
+   if entry.is_some_and(|x|now>=x.expires){*entry=None;removed+=1;}
+  }
+  removed
+ }
+ pub fn invalidate_name(&mut self,owner:Identity,
+  local_port:u16,name:&[u8])->usize{
+  if owner.pid==0||owner.generation==0||local_port==0||
+     !valid_domain(name){return 0;}
+  let mut removed=0;
+  for entry in &mut self.entries{
+   if entry.is_some_and(|x|x.owner==owner&&x.local_port==local_port&&
+       x.len==name.len()&&x.name[..x.len]==*name){
+    *entry=None;removed+=1;
+   }
+  }
+  removed
+ }
+ pub fn entries_active(&self,now:u64)->usize{
+  self.entries.iter().flatten().filter(|entry|entry.expires>now).count()
+ }
+}
+#[cfg(test)]
+mod r010_dns_cache_hardening_tests{
+ use super::*;
+ #[test]fn unsafe_label_boundaries_never_enter_dns_lookup(){
+  assert!(!valid_domain(b"-host.example"));
+  assert!(!valid_domain(b"host-.example"));
+  assert!(!valid_domain(b"host..example"));
+  assert!(!valid_domain(b"host.example."));
+  assert!(valid_domain(b"safe-host.example"));
+ }
+ #[test]fn expiry_and_exact_name_invalidation_preserve_peers(){
+  let a=Identity{pid:7,generation:2};
+  let b=Identity{pid:8,generation:2};
+  let mut cache=DnsLeaseCache::<3>::new();
+  let mut name=[0u8;253];name[..4].copy_from_slice(b"a.io");
+  cache.entries[0]=Some(CachedA{owner:a,local_port:5000,
+    name,len:4,ip:[1,2,3,4],expires:40});
+  cache.entries[1]=Some(CachedA{owner:b,local_port:5000,
+    name,len:4,ip:[8,8,8,8],expires:80});
+  assert_eq!(cache.invalidate_name(a,5000,b"a.io"),1);
+  assert_eq!(cache.entries_active(25),1);
+  assert_eq!(cache.sweep_expired(80),1);
+  assert_eq!(cache.entries_active(80),0);
+ }
+ #[test]fn invalid_query_is_fail_closed_and_does_not_invalidate(){
+  let owner=Identity{pid:5,generation:2};
+  let mut cache=DnsLeaseCache::<1>::new();
+  let mut name=[0u8;253];name[..4].copy_from_slice(b"a.io");
+  cache.entries[0]=Some(CachedA{owner,local_port:1234,
+    name,len:4,ip:[1,1,1,1],expires:50});
+  assert_eq!(cache.invalidate_name(owner,1234,b"-bad"),0);
+  assert_eq!(cache.entries_active(2),1);
  }
 }
