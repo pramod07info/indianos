@@ -12,7 +12,7 @@ pub fn execute<const F:usize,const B:usize,const N:usize>(
  fs:&RamFs<F>,steps:&[Step<'_>],output:&mut[u8;B],
  index:&mut[Record;N])->Result<usize,Error>{
  if steps.is_empty()||steps.len()>N{return Err(Error::Invalid);}
- let mut stage=[0u8;B];let mut records=[EMPTY;N];let mut cursor=0;
+ let mut stage=[0u8;B];let mut records=[EMPTY;N];let mut cursor=0usize;
  for (i,s) in steps.iter().enumerate(){
   let mut temp=[0u8;2048];
   let n=agent_10::run(fs,s.path,s.command,s.param,&mut temp)?;
