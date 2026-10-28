@@ -337,10 +337,12 @@ pub enum BootSlot{A,B}
 pub struct SlotTransaction{
  active:BootSlot,pending:Option<(BootSlot,Candidate,u64)>,
  attempts_left:u8,anti_rollback:u64,
+ issued:Option<BootHealthChallenge>,
 }
 impl SlotTransaction{
  pub const fn new(active:BootSlot,running_version:u64)->Self{
-  Self{active,pending:None,attempts_left:0,anti_rollback:running_version}
+  Self{active,pending:None,attempts_left:0,anti_rollback:running_version,
+   issued:None}
  }
  pub fn active(&self)->BootSlot{self.active}
  pub fn pending(&self)->bool{self.pending.is_some()}
@@ -354,7 +356,7 @@ impl SlotTransaction{
    return Err(UpdateError::Untrusted);
   }
   self.pending=Some((slot,candidate,deadline));
-  self.attempts_left=attempts;Ok(())
+  self.attempts_left=attempts;self.issued=None;Ok(())
  }
  /// The firmware boot adapter must select this candidate only after a
  /// durable slot write and can retry at most the verified budget.
@@ -371,10 +373,11 @@ impl SlotTransaction{
   }
   self.anti_rollback=self.anti_rollback.max(candidate.version);
   self.active=slot;self.pending=None;self.attempts_left=0;
+  self.issued=None;
   Ok(self.anti_rollback)
  }
  pub fn fallback(&mut self)->BootSlot{
-  self.pending=None;self.attempts_left=0;self.active
+  self.pending=None;self.attempts_left=0;self.issued=None;self.active
  }
  pub fn floor(&self)->u64{self.anti_rollback}
 }
@@ -555,18 +558,30 @@ impl SlotTransaction{
   if !candidate.verified_signature||!candidate.payload_digest_verified{
    return Err(UpdateError::Untrusted);
   }
+  if self.issued.is_some(){
+   // An exhausted retry budget remains NoAttempts even while the most
+   // recent challenge is outstanding (backward-compatible ABI semantics).
+   return Err(if self.attempts_left==0{
+    UpdateError::NoAttempts
+   }else{UpdateError::WrongState});
+  }
   if candidate.version<=self.anti_rollback||now>deadline{
    return Err(UpdateError::WrongState);
   }
   let (verified_slot,image_id)=self.boot_attempt(now)?;
-  Ok(BootHealthChallenge{slot:verified_slot,image_id,
-    version:candidate.version,deadline})
+  let challenge=BootHealthChallenge{slot:verified_slot,image_id,
+    version:candidate.version,deadline};
+  self.issued=Some(challenge);
+  Ok(challenge)
  }
  pub fn confirm_boot_challenge(&mut self,
   challenge:BootHealthChallenge,now:u64,measured_image:u32,
   running_version:u64,healthy:bool)->Result<u64,UpdateError>{
   let (slot,candidate,deadline)=self.pending.ok_or(UpdateError::WrongState)?;
-  if !healthy||now>challenge.deadline||deadline!=challenge.deadline||
+  // Refuse fabricated or stale challenges, including attempts to confirm
+  // without actually issuing a trusted boot handoff for this update.
+  if self.issued!=Some(challenge)||!healthy||
+    now>challenge.deadline||deadline!=challenge.deadline||
     challenge.slot!=slot||challenge.image_id!=candidate.image_id||
     measured_image!=candidate.image_id||
     challenge.version!=candidate.version||running_version!=candidate.version{
@@ -574,6 +589,16 @@ impl SlotTransaction{
   }
   self.confirm_health(slot,candidate.image_id,now,true)
  }
+ /// A failed boot may explicitly abandon the exact outstanding challenge.
+ /// The remaining attempt budget is not replenished.
+ pub fn abandon_boot_challenge(&mut self,
+   challenge:BootHealthChallenge)->Result<u8,UpdateError>{
+  if self.issued!=Some(challenge){return Err(UpdateError::WrongState);}
+  self.issued=None;
+  if self.attempts_left==0{self.fallback();}
+  Ok(self.attempts_left)
+ }
+ pub fn challenge_pending(&self)->bool{self.issued.is_some()}
  pub fn remaining_boot_attempts(&self)->u8{self.attempts_left}
 }
 #[cfg(test)]
@@ -607,5 +632,51 @@ mod r014_boot_measurement_tests{
   assert_eq!(t.confirm_boot_challenge(c,81,71,11,true),
     Err(UpdateError::WrongState));
   assert_eq!(t.fallback(),BootSlot::A);assert!(!t.pending());
+ }
+}
+
+/// R015 challenge lifecycle tests for no-replay A/B update handoffs.
+#[cfg(test)]
+mod r015_ota_challenge_lifecycle_tests {
+ use super::*;
+ fn image()->Candidate{Candidate{image_id:80,version:11,
+  verified_signature:true,payload_digest_verified:true,target_arch:62}}
+ #[test]
+ fn cannot_confirm_without_issue_even_with_guessed_matching_tuple(){
+  let mut tx=SlotTransaction::new(BootSlot::A,10);
+  tx.stage(BootSlot::B,image(),true,100,2).unwrap();
+  let forged=BootHealthChallenge{slot:BootSlot::B,image_id:80,
+    version:11,deadline:100};
+  assert_eq!(tx.confirm_boot_challenge(forged,20,80,11,true),
+    Err(UpdateError::WrongState));
+  assert_eq!(tx.floor(),10);assert_eq!(tx.active(),BootSlot::A);
+ }
+ #[test]
+ fn duplicate_handoff_is_rejected_without_spending_second_attempt(){
+  let mut tx=SlotTransaction::new(BootSlot::A,10);
+  tx.stage(BootSlot::B,image(),true,100,2).unwrap();
+  let challenge=tx.issue_boot_challenge(20).unwrap();
+  assert_eq!(tx.remaining_boot_attempts(),1);
+  assert_eq!(tx.issue_boot_challenge(21),Err(UpdateError::WrongState));
+  assert_eq!(tx.remaining_boot_attempts(),1);
+  assert!(tx.challenge_pending());
+  assert_eq!(tx.confirm_boot_challenge(challenge,22,80,11,true),Ok(11));
+  assert!(!tx.challenge_pending());
+ }
+ #[test]
+ fn failed_handoff_requires_explicit_reissue_and_preserves_safe_slot(){
+  let mut tx=SlotTransaction::new(BootSlot::A,10);
+  tx.stage(BootSlot::B,image(),true,100,2).unwrap();
+  let old=tx.issue_boot_challenge(20).unwrap();
+  assert_eq!(tx.abandon_boot_challenge(old),Ok(1));
+  assert!(!tx.challenge_pending());
+  assert_eq!(tx.confirm_boot_challenge(old,21,80,11,true),
+    Err(UpdateError::WrongState));
+  assert_eq!(tx.active(),BootSlot::A);
+  let next=tx.issue_boot_challenge(22).unwrap();
+  assert_eq!(tx.remaining_boot_attempts(),0);
+  assert_eq!(tx.abandon_boot_challenge(next),Ok(0));
+  assert_eq!(tx.active(),BootSlot::A);
+  assert!(!tx.pending());assert!(!tx.challenge_pending());
  }
 }
