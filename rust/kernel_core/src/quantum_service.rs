@@ -657,7 +657,7 @@ pub fn submit_batch_charged<const N:usize>(service:&mut QuantumService,
  }
  if requests.is_empty()||requests.len()>MAX_JOBS||
    out.len()<requests.len()||budget.remaining(owner)
-     .is_none_or(|remaining|remaining as usize<requests.len()){
+     .is_none_or(|remaining|(remaining as usize)<requests.len()){
   return Err(ServiceError::NotOwner);
  }
  let mut ids=[0u64;MAX_JOBS];
