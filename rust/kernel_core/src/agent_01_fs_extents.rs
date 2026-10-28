@@ -663,3 +663,87 @@ pub fn first_fit_extent(owners:&[&[Extent]],device_blocks:u64,
             u64::MAX,1,1),Err(ExtentError::Overflow));
     }
 }
+
+
+// R008 storage transaction policy. Durable block writes and replay are separate.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct AllocatedRange {pub owner:u32,pub region:Extent}
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum LedgerFault { Invalid, Missing, Occupied, Full, NoSpace }
+#[derive(Clone,Copy)]
+pub struct ExtentLedger<const N:usize>{device:u64,slots:[Option<AllocatedRange>;N]}
+impl<const N:usize> ExtentLedger<N>{
+ pub const fn new(device:u64)->Self{Self{device,slots:[None;N]}}
+ pub fn count(&self)->usize{self.slots.iter().flatten().count()}
+ pub fn reserve(&mut self,owner:u32,region:Extent)->Result<(),LedgerFault>{
+  if owner==0||validate_extents(&[region],self.device).is_err(){return Err(LedgerFault::Invalid)}
+  if self.slots.iter().flatten().any(|v|{
+   region.start<v.region.start+v.region.blocks&&
+   v.region.start<region.start+region.blocks
+  }){return Err(LedgerFault::Occupied)}
+  let empty=self.slots.iter_mut().find(|v|v.is_none()).ok_or(LedgerFault::Full)?;
+  *empty=Some(AllocatedRange{owner,region});Ok(())
+ }
+ pub fn allocate(&mut self,owner:u32,blocks:u64)->Result<Extent,LedgerFault>{
+  if owner==0||blocks==0||self.device==0{return Err(LedgerFault::Invalid)}
+  if self.count()==N{return Err(LedgerFault::Full)}
+  let mut start=0u64;
+  loop{
+   let mut next=self.device;
+   let mut occupied=None;
+   for e in self.slots.iter().flatten(){
+    let end=e.region.start+e.region.blocks;
+    if e.region.start<=start&&start<end{occupied=Some(end)}
+    else if e.region.start>start{next=next.min(e.region.start)}
+   }
+   if let Some(end)=occupied{start=end;continue}
+   if blocks<=next-start {
+    let extent=Extent{start,blocks};self.reserve(owner,extent)?;return Ok(extent)
+   }
+   if next==self.device{return Err(LedgerFault::NoSpace)}
+   start=next;
+  }
+ }
+ pub fn release(&mut self,owner:u32,region:Extent)->Result<(),LedgerFault>{
+  let slot=self.slots.iter_mut().find(|v|
+   v.is_some_and(|r|r.owner==owner&&r.region==region)).ok_or(LedgerFault::Missing)?;
+  *slot=None;Ok(())
+ }
+ pub fn reserve_batch(&mut self,items:&[AllocatedRange])->Result<usize,LedgerFault>{
+  let mut trial=*self;
+  for item in items{trial.reserve(item.owner,item.region)?}
+  *self=trial;Ok(items.len())
+ }
+ pub fn check_consistency(&self)->Result<(),LedgerFault>{
+  let mut trial=Self::new(self.device);
+  for e in self.slots.iter().flatten(){trial.reserve(e.owner,e.region)?}
+  Ok(())
+ }
+}
+#[cfg(test)]mod r008_extent_ledger_tests{
+ use super::*;
+ fn e(start:u64,blocks:u64)->Extent{Extent{start,blocks}}
+ #[test]fn fragments_reuse_and_owner_auth(){
+  let mut v=ExtentLedger::<4>::new(12);
+  v.reserve(1,e(0,3)).unwrap();v.reserve(2,e(5,3)).unwrap();
+  assert_eq!(v.allocate(3,2),Ok(e(3,2)));
+  assert_eq!(v.release(1,e(5,3)),Err(LedgerFault::Missing));
+  v.release(1,e(0,3)).unwrap();
+  assert_eq!(v.allocate(4,2),Ok(e(0,2)));
+  assert_eq!(v.check_consistency(),Ok(()));
+ }
+ #[test]fn batch_failure_is_atomic(){
+  let mut v=ExtentLedger::<2>::new(10);
+  v.reserve(1,e(0,2)).unwrap();
+  assert_eq!(v.reserve_batch(&[AllocatedRange{owner:2,region:e(2,2)},
+   AllocatedRange{owner:3,region:e(4,2)}]),Err(LedgerFault::Full));
+  assert_eq!(v.count(),1);
+  assert_eq!(v.allocate(3,2),Ok(e(2,2)));
+ }
+ #[test]fn overlap_and_outside_rejected(){
+  let mut v=ExtentLedger::<2>::new(8);v.reserve(1,e(1,4)).unwrap();
+  assert_eq!(v.reserve(2,e(3,3)),Err(LedgerFault::Occupied));
+  assert_eq!(v.reserve(2,e(7,3)),Err(LedgerFault::Invalid));
+  assert_eq!(v.allocate(3,9),Err(LedgerFault::NoSpace));
+ }
+}
