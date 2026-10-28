@@ -22,6 +22,11 @@ pub fn normalize<const B:usize>(input:&[u8],tab_width:usize,
    for dst in &mut temp[p..p+spaces]{*dst=b' ';}
    p+=spaces;stats.tab_expanded+=1;i+=1;continue;
   }
+  if b==b'\n'||b==b'\r'&&input.get(i+1)==Some(&b'\n'){
+   while p>line_start&&temp[p-1]==b' '{
+    p-=1;stats.trimmed+=1;
+   }
+  }
   if b==b'\r'&&input.get(i+1)==Some(&b'\n'){
    stats.crlf_converted+=1;i+=1;continue;
   }
