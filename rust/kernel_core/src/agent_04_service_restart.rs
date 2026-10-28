@@ -282,7 +282,7 @@ impl<const N:usize> DependencySupervisor<N>{
  pub fn start_batch(&mut self,order:&[u16])->Result<usize,DependencyFault>{
   if order.is_empty()||order.len()>N{return Err(DependencyFault::Full)}
   let mut staged=*self;
-  for id in order{staged.start(*id)?}
+  for id in order{staged.start(*id)?;}
   *self=staged;Ok(order.len())
  }
  pub fn crash_cascade(&mut self,id:u16,generation:u32)->Result<usize,DependencyFault>{
