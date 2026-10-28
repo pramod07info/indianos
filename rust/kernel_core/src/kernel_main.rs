@@ -145,8 +145,14 @@ pub extern "C" fn kmain()->!{
         for (i,byte) in pattern.iter_mut().enumerate(){
             *byte=(i as u8).wrapping_mul(37).wrapping_add(0x5a);
         }
-        need(disk.write_sector(8,&pattern).is_ok(),
-             b"IndianOS: FATAL R015 ATA write\n\0");
+        // Distinguish failed SELECT/DRQ, data transfer and cache flush in
+        // disposable QEMU without retrying an ambiguous partial write.
+        let write_result=disk.write_sector(8,&pattern);
+        if write_result.is_err() {
+            let report=disk.failure_diagnostic();
+            unsafe{serial_write(report.as_ptr().cast())};
+        }
+        need(write_result.is_ok(),b"IndianOS: FATAL R015 ATA write\n\0");
         let mut actual=[0u8;SECTOR_BYTES];
         need(disk.read_sector(8,&mut actual).is_ok() && actual==pattern,
              b"IndianOS: FATAL R015 ATA readback mismatch\n\0");
