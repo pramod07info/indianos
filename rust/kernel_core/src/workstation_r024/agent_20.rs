@@ -16,8 +16,10 @@ pub fn smoke()->Result<(),Error>{
  let mut usage=agent_04::stats(&fs,b"/p")?;
  if usage.files!=2{return Err(Error::Conflict);}
  let mut bin=agent_02::Bin::<2>::new(owner);
- let slot=bin.trash(owner,&mut fs,b"/p/copy.rs",fs.version())?;
- bin.restore(owner,&mut fs,slot,fs.version())?;
+ let expected=fs.version();
+ let slot=bin.trash(owner,&mut fs,b"/p/copy.rs",expected)?;
+ let expected=fs.version();
+ bin.restore(owner,&mut fs,slot,expected)?;
  let mut hit=[agent_07::EMPTY;4];
  if agent_07::scan(&fs,b"/p",b"main",&mut hit)!=Ok(2){
   return Err(Error::Conflict);
