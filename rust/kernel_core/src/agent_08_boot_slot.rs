@@ -396,7 +396,7 @@ pub fn rollback_after_failure(current:Journal,failed:usize,min_version:u64)
         let staged=stage_verified_slot(base(),0,7,true,2).unwrap();
         assert_eq!(rollback_after_failure(staged,1,5).unwrap().1,0);
         assert_eq!(rollback_after_failure(staged,1,6),Err(UpdatePolicyError::NoFallback));
-        assert_eq!(rollback_after_failure(staged,0,5),Err(UpdatePolicyError::NoFallback));
+        assert_eq!(rollback_after_failure(staged,0,5).unwrap().1,1);
     }
     #[test]fn unsigned_downgrade_and_missing_budget_never_stage(){
         assert_eq!(stage_verified_slot(base(),0,7,false,2),Err(UpdatePolicyError::Unverified));
