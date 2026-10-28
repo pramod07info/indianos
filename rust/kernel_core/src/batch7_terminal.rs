@@ -115,6 +115,55 @@ pub fn execute<const F:usize,const G:usize>(
    .map_err(|_|Error::Denied)?;
   return publish(b"saved",out);
  }
+
+ // R006: privileged Files/Terminal operations against real in-memory data.
+ // Every operation is checked against a scheduler-authenticated PID/epoch.
+ if let Some(rest)=line.strip_prefix("cp ").or_else(||line.strip_prefix("mv ")){
+  let mut words=rest.split_ascii_whitespace();
+  let source=words.next().ok_or(Error::Invalid)?;
+  let dest=words.next().ok_or(Error::Invalid)?;
+  if words.next().is_some(){return Err(Error::Invalid);}
+  if out.len()<5{return Err(Error::Overflow);}
+  auth.require(caller,FILE_READ|FILE_WRITE,now).map_err(|_|Error::Denied)?;
+  let mut src=[0u8;PATH_MAX];let mut dst=[0u8;PATH_MAX];
+  let a=crate::vfs_path::normalize_absolute(source,&mut src)
+   .map_err(|_|Error::Invalid)?;
+  let b=crate::vfs_path::normalize_absolute(dest,&mut dst)
+   .map_err(|_|Error::Invalid)?;
+  if a<2||b<2{return Err(Error::Invalid);}
+  if line.starts_with("mv "){
+   let (version,_)=fs.metadata(&src[..a]).map_err(|_|Error::Io)?;
+   fs.rename_if_version(&src[..a],&dst[..b],version).map_err(|_|Error::Io)?;
+  }else{
+   fs.copy_new(&src[..a],&dst[..b]).map_err(|_|Error::Io)?;
+  }
+  return publish(b"saved",out);
+ }
+ if let Some(path)=line.strip_prefix("rm "){
+  if out.len()<7{return Err(Error::Overflow);}
+  auth.require(caller,FILE_WRITE,now).map_err(|_|Error::Denied)?;
+  let mut name=[0u8;PATH_MAX];
+  let n=crate::vfs_path::normalize_absolute(path,&mut name)
+   .map_err(|_|Error::Invalid)?;
+  if n<2{return Err(Error::Invalid);}
+  let (version,_)=fs.metadata(&name[..n]).map_err(|_|Error::Io)?;
+  fs.delete_if_version(&name[..n],version).map_err(|_|Error::Io)?;
+  return publish(b"deleted",out);
+ }
+ if let Some(path)=line.strip_prefix("wc "){
+  auth.require(caller,FILE_READ,now).map_err(|_|Error::Denied)?;
+  let mut name=[0u8;PATH_MAX];
+  let n=crate::vfs_path::normalize_absolute(path,&mut name)
+   .map_err(|_|Error::Invalid)?;
+  if n<2{return Err(Error::Invalid);}
+  let (_,size)=fs.metadata(&name[..n]).map_err(|_|Error::Io)?;
+  let mut decimal=[0u8;20];let mut value=size;let mut used=0;
+  loop{
+   decimal[19-used]=b'0'+(value%10) as u8;used+=1;value/=10;
+   if value==0{break;}
+  }
+  return publish(&decimal[20-used..],out);
+ }
  Err(Error::Unsupported)
 }
 #[cfg(test)]mod tests{
@@ -188,5 +237,48 @@ mod orbit_r005_terminal_tests{
   fs.replace(b"/note",b"hello").unwrap();
   assert_eq!(execute(&rights(),identity(),100,&mut fs,b"tail /note",&mut out),
     Err(Error::Denied));
+ }
+}
+
+
+#[cfg(test)]
+mod r006_shell_files_tests{
+ use super::*;
+ fn owner()->Identity{Identity{pid:8,generation:4}}
+ fn acl()->Access<2>{
+  let mut a=Access::new();a.grant(owner(),FILE_READ|FILE_WRITE,100).unwrap();a
+ }
+ #[test]fn cp_mv_wc_rm_are_real_file_mutations(){
+  let mut fs=RamFs::<3>::new();let mut out=[0u8;OUTPUT_MAX];
+  execute(&acl(),owner(),2,&mut fs,b"write /source hello",&mut out).unwrap();
+  assert_eq!(execute(&acl(),owner(),2,&mut fs,b"cp /source /copy",&mut out),Ok(5));
+  assert_eq!(execute(&acl(),owner(),2,&mut fs,b"mv /copy /renamed",&mut out),Ok(5));
+  assert_eq!(execute(&acl(),owner(),2,&mut fs,b"wc /renamed",&mut out),Ok(1));
+  assert_eq!(&out[..1],b"5");
+  assert_eq!(execute(&acl(),owner(),2,&mut fs,b"rm /renamed",&mut out),Ok(7));
+  assert_eq!(fs.count(),1);
+  assert_eq!(execute(&acl(),owner(),2,&mut fs,b"cat /renamed",&mut out),Err(Error::Io));
+  assert_eq!(execute(&acl(),owner(),2,&mut fs,b"cat /source",&mut out),Ok(5));
+ }
+ #[test]fn bad_paths_capacity_and_duplicate_target_do_not_drop_source(){
+  let mut fs=RamFs::<2>::new();fs.replace(b"/a",b"safe").unwrap();
+  fs.replace(b"/b",b"keep").unwrap();
+  let mut output=[0xaau8;OUTPUT_MAX];
+  assert_eq!(execute(&acl(),owner(),1,&mut fs,b"mv /a /b",&mut output),Err(Error::Io));
+  assert_eq!(execute(&acl(),owner(),1,&mut fs,b"cp /a /c",&mut output),Err(Error::Io));
+  assert_eq!(execute(&acl(),owner(),1,&mut fs,b"rm /../a",&mut output),Err(Error::Invalid));
+  let mut verify=[0u8;4];fs.read(b"/a",0,&mut verify).unwrap();
+  assert_eq!(&verify,b"safe");
+  assert_eq!(output,[0xaa;OUTPUT_MAX]);
+ }
+ #[test]fn mismatched_generation_and_expired_rights_block_all_mutations(){
+  let mut fs=RamFs::<2>::new();fs.replace(b"/a",b"safe").unwrap();
+  let mut output=[0x55u8;OUTPUT_MAX];
+  let stale=Identity{generation:5,..owner()};
+  for cmd in [b"cp /a /b".as_slice(),b"mv /a /b",b"rm /a",b"wc /a"]{
+   assert_eq!(execute(&acl(),stale,1,&mut fs,cmd,&mut output),Err(Error::Denied));
+   assert_eq!(execute(&acl(),owner(),100,&mut fs,cmd,&mut output),Err(Error::Denied));
+  }
+  assert_eq!(fs.count(),1);
  }
 }
