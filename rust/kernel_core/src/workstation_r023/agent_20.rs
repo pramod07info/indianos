@@ -14,7 +14,8 @@ pub fn smoke()->Result<(),Error>{
  let mut source=[0u8;2048];fs.read(name,0,&mut source[..size])
   .map_err(|_|Error::Missing)?;
  if !agent_04::balanced(&source[..size]){return Err(Error::Conflict);}
- let rename=agent_03::replace_all::<4,8192>(&mut fs,fs.version(),
+ let expected=fs.version();
+ let rename=agent_03::replace_all::<4,8192>(&mut fs,expected,
   b"/p",b"TODO",b"DONE")?;
  if rename.occurrences!=1{return Err(Error::Conflict);}
  let (rev,_)=fs.metadata(name).map_err(|_|Error::Missing)?;
