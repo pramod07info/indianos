@@ -66,8 +66,10 @@ pub fn approval_required(items:&[Decision])->bool{
   assert!(!all_resolved(&[d]));assert_eq!(conflicts(&[d]),1);
  }
  #[test]fn invalid_multi_file_plan_never_publishes_partial_decisions(){
-  let mut out=[ZERO;2];let mismatch=FileState{path_hash:2,digest:3,revision:1};
-  assert_eq!(plan(&[file(1),file(2)],&[file(1),file(2)],
+  let mut out=[ZERO;2];
+  let second=FileState{path_hash:2,..file(2)};
+  let mismatch=FileState{path_hash:3,..file(3)};
+  assert_eq!(plan(&[file(1),second],&[file(1),second],
     &[file(1),mismatch],&mut out),Err(Error::Invalid));
   assert_eq!(out,[ZERO;2]);
  }
