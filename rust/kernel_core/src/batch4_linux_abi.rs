@@ -376,3 +376,79 @@ mod r010_linux_fd_tests{
   assert_eq!(table.close(id(2),3),Err(FdError::NotFound));
  }
 }
+
+ 
+/// R011 Linux-style descriptor duplication, but no actual foreign binary is
+/// executed without authenticated process loader, stack and ring3 syscall ABI.
+impl<const N:usize> FileDescriptors<N>{
+ pub fn duplicate(&mut self,owner:crate::batch5_session::Identity,
+  source:u32,target:u32,rights:u8)->Result<(),FdError>{
+  if source==target||target<3||rights==0||
+    rights&!(FD_READ|FD_WRITE)!=0{return Err(FdError::Invalid);}
+  let handle=self.resolve(owner,source,rights)?;
+  if self.entries.iter().flatten().any(|e|e.owner==owner&&e.fd==target){
+   return Err(FdError::Duplicate);
+  }
+  self.attach(owner,target,handle,rights)
+ }
+ /// Transfer only granted rights to a child created by the trusted scheduler.
+ /// All child descriptors are installed or none are.
+ pub fn inherit_atomic(&mut self,parent:crate::batch5_session::Identity,
+  child:crate::batch5_session::Identity,
+  allowed:u8)->Result<usize,FdError>{
+  if child.pid==0||child.generation==0||parent.pid==0||
+    parent==child||allowed==0||allowed&!(FD_READ|FD_WRITE)!=0{
+   return Err(FdError::Invalid);
+  }
+  let mut staged=Self{entries:self.entries};
+  let mut count=0;
+  for entry in self.entries.iter().flatten(){
+   if entry.owner!=parent{continue;}
+   let rights=entry.rights&allowed;
+   if rights==0{continue;}
+   staged.attach(child,entry.fd,entry.handle,rights)?;
+   count+=1;
+  }
+  self.entries=staged.entries;Ok(count)
+ }
+ /// New executable image starts with an empty nonstandard descriptor table.
+ /// Stdio 0/1/2 are mediated separately by translate_stdio.
+ pub fn exec_close_all(&mut self,owner:crate::batch5_session::Identity)->usize{
+  self.retire(owner)
+ }
+ pub fn active_count(&self,owner:crate::batch5_session::Identity)->usize{
+  self.entries.iter().flatten().filter(|e|e.owner==owner).count()
+ }
+}
+#[cfg(test)]
+mod r011_linux_dup_tests{
+ use super::*;
+ use crate::batch5_session::Identity;
+ fn id(pid:u32)->Identity{Identity{pid,generation:2}}
+ #[test]fn duplicate_creates_distinct_fd_with_attenuated_rights(){
+  let mut f=FileDescriptors::<3>::new();
+  f.attach(id(1),3,99,FD_READ|FD_WRITE).unwrap();
+  assert_eq!(f.duplicate(id(1),3,4,FD_READ),Ok(()));
+  assert_eq!(f.resolve(id(1),4,FD_READ),Ok(99));
+  assert_eq!(f.resolve(id(1),4,FD_WRITE),Err(FdError::Denied));
+  assert_eq!(f.duplicate(id(1),3,4,FD_READ),Err(FdError::Duplicate));
+ }
+ #[test]fn failed_child_inheritance_does_not_publish_partial_fds(){
+  let mut f=FileDescriptors::<2>::new();
+  f.attach(id(1),3,11,FD_READ).unwrap();
+  f.attach(id(1),4,12,FD_READ).unwrap();
+  assert_eq!(f.inherit_atomic(id(1),id(2),FD_READ),Err(FdError::Full));
+  assert_eq!(f.active_count(id(2)),0);
+  assert_eq!(f.active_count(id(1)),2);
+ }
+ #[test]fn exec_closes_owned_handles_only_and_fork_fences_owner(){
+  let mut f=FileDescriptors::<3>::new();
+  f.attach(id(1),3,55,FD_READ).unwrap();
+  f.attach(id(2),4,66,FD_WRITE).unwrap();
+  assert_eq!(f.inherit_atomic(id(1),id(3),FD_READ),Ok(1));
+  assert_eq!(f.resolve(id(3),3,FD_READ),Ok(55));
+  assert_eq!(f.exec_close_all(id(1)),1);
+  assert_eq!(f.active_count(id(3)),1);
+  assert_eq!(f.resolve(id(2),4,FD_WRITE),Ok(66));
+ }
+}
