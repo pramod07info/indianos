@@ -151,3 +151,106 @@ impl<const N:usize> RouteManager<N>{
         assert_eq!(t.remove(0,0),Err(ManagedRouteError::Missing));
     }
 }
+
+
+// R008: multiple candidate routes with link health and lease generations;
+// longest-prefix and lowest-cost selection, no actual packet transmission.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct RouteCandidate{pub route:Route,pub metric:u16,pub link:u16,
+ pub epoch:u64,pub healthy:bool}
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum FailoverFault{Invalid,Full,Duplicate,Missing}
+#[derive(Clone,Copy)]
+pub struct FailoverRoutes<const N:usize>{entries:[Option<RouteCandidate>;N]}
+impl<const N:usize> FailoverRoutes<N>{
+ pub const fn new()->Self{Self{entries:[None;N]}}
+ pub fn len(&self)->usize{self.entries.iter().flatten().count()}
+ pub fn add(&mut self,c:RouteCandidate)->Result<(),FailoverFault>{
+  if c.link==0||c.epoch==0||validate_table(&[c.route]).is_err()||
+   (c.route.next_hop!=0 &&
+    (c.route.next_hop>>24==127||c.route.next_hop>=0xe000_0000)){
+   return Err(FailoverFault::Invalid)
+  }
+  if self.entries.iter().flatten().any(|v|v.link==c.link&&
+   v.route.network==c.route.network&&v.route.prefix==c.route.prefix){
+   return Err(FailoverFault::Duplicate)
+  }
+  let slot=self.entries.iter_mut().find(|e|e.is_none()).ok_or(FailoverFault::Full)?;
+  *slot=Some(c);Ok(())
+ }
+ pub fn replace_batch(&mut self,items:&[RouteCandidate])->Result<usize,FailoverFault>{
+  if items.is_empty()||items.len()>N{return Err(FailoverFault::Full)}
+  let mut next=Self::new();
+  for c in items{next.add(*c)?}
+  *self=next;Ok(items.len())
+ }
+ pub fn set_health(&mut self,link:u16,epoch:u64,healthy:bool)
+  ->Result<usize,FailoverFault>{
+  if link==0||epoch==0{return Err(FailoverFault::Invalid)}
+  let mut count=0;
+  for item in &mut self.entries{
+   if let Some(route)=item{
+    if route.link==link{
+     if route.epoch!=epoch{return Err(FailoverFault::Invalid)}
+     count+=1;
+    }
+   }
+  }
+  if count==0{return Err(FailoverFault::Missing)}
+  for item in &mut self.entries{
+   if let Some(route)=item{if route.link==link{route.healthy=healthy}}
+  }
+  Ok(count)
+ }
+ pub fn resolve(&self,destination:u32)->Option<RouteCandidate>{
+  let mut best:Option<RouteCandidate>=None;
+  for c in self.entries.iter().flatten(){
+   if !c.healthy{continue}
+   let mask=if c.route.prefix==0{0}else{
+    u32::MAX << (32-u32::from(c.route.prefix))
+   };
+   if destination&mask !=c.route.network{continue}
+   if best.is_none_or(|old|c.route.prefix>old.route.prefix||
+    (c.route.prefix==old.route.prefix&&c.metric<old.metric)){best=Some(*c)}
+  }
+  best
+ }
+ pub fn expire_link(&mut self,link:u16,epoch:u64)->usize{
+  let mut removed=0;
+  for slot in &mut self.entries{
+   if slot.is_some_and(|v|v.link==link&&v.epoch==epoch){
+    *slot=None;removed+=1
+   }
+  }
+  removed
+ }
+}
+#[cfg(test)]mod r008_network_failover_tests{
+ use super::*;
+ fn c(net:u32,prefix:u8,link:u16,metric:u16)->RouteCandidate{
+  RouteCandidate{route:Route{network:net,prefix,next_hop:0},metric,link,
+   epoch:4,healthy:true}
+ }
+ #[test]fn specific_route_overrides_fast_default(){
+  let mut n=FailoverRoutes::<4>::new();
+  n.add(c(0,0,1,1)).unwrap();n.add(c(0x0a00_0000,8,2,10)).unwrap();
+  assert_eq!(n.resolve(0x0a01_0203).unwrap().link,2);
+  assert_eq!(n.resolve(0x0808_0808).unwrap().link,1);
+ }
+ #[test]fn health_fallback_and_lease_expiry(){
+  let mut n=FailoverRoutes::<3>::new();
+  n.add(c(0,0,1,10)).unwrap();n.add(c(0,0,2,20)).unwrap();
+  assert_eq!(n.resolve(123).unwrap().link,1);
+  assert_eq!(n.set_health(1,3,false),Err(FailoverFault::Invalid));
+  n.set_health(1,4,false).unwrap();
+  assert_eq!(n.resolve(123).unwrap().link,2);
+  assert_eq!(n.expire_link(2,4),1);
+  assert_eq!(n.resolve(123),None);
+ }
+ #[test]fn invalid_batch_keeps_original_routes(){
+  let mut n=FailoverRoutes::<2>::new();n.add(c(0,0,1,1)).unwrap();
+  assert_eq!(n.replace_batch(&[c(0,0,2,1),c(0,0,2,2)]),
+   Err(FailoverFault::Duplicate));
+  assert_eq!(n.resolve(123).unwrap().link,1);
+ }
+}
