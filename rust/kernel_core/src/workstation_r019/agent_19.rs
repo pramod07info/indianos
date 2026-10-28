@@ -36,13 +36,13 @@ impl Release{
  pub fn publish_manifest(&mut self,supervisor:bool,
   out:&mut[u8])->Result<usize,Error>{
   if !supervisor||self.stage!=Stage::Approved{return Err(Error::Denied);}
-  if out.len()<48{return Err(Error::Full);}
-  let mut payload=[0u8;48];
+  if out.len()<52{return Err(Error::Full);}
+  let mut payload=[0u8;52];
   payload[..4].copy_from_slice(&self.app.to_le_bytes());
   payload[4..12].copy_from_slice(&self.version.to_le_bytes());
   payload[12..44].copy_from_slice(&self.digest);
-  payload[44..48].copy_from_slice(&(self.previous_version as u32).to_le_bytes());
-  out[..48].copy_from_slice(&payload);self.stage=Stage::Published;Ok(48)
+  payload[44..52].copy_from_slice(&self.previous_version.to_le_bytes());
+  out[..52].copy_from_slice(&payload);self.stage=Stage::Published;Ok(52)
  }
  pub fn cancel(&mut self,owner:u32)->Result<(),Error>{
   if owner!=self.owner||owner==0{return Err(Error::Denied);}
@@ -57,15 +57,15 @@ impl Release{
   let mut r=release();r.record_checks(1,true,true).unwrap();
   assert_eq!(r.review(1),Err(Error::Denied));
   r.review(2).unwrap();r.approve(2).unwrap();
-  let mut payload=[0u8;48];assert_eq!(r.publish_manifest(true,&mut payload),Ok(48));
+  let mut payload=[0u8;52];assert_eq!(r.publish_manifest(true,&mut payload),Ok(48));
   assert_eq!(r.stage,Stage::Published);
  }
  #[test]fn failed_build_or_unsigned_artifact_never_deploys(){
   let mut r=release();r.record_checks(1,false,true).unwrap();
   assert_eq!(r.review(2),Err(Error::NotReady));
-  let mut out=[7u8;48];
+  let mut out=[7u8;52];
   assert_eq!(r.publish_manifest(true,&mut out),Err(Error::Denied));
-  assert_eq!(out,[7;48]);
+  assert_eq!(out,[7;52]);
  }
  #[test]fn short_publish_buffer_preserves_approved_state(){
   let mut r=release();r.record_checks(1,true,true).unwrap();
