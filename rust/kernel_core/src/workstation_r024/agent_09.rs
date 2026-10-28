@@ -18,7 +18,9 @@ pub fn locate<const F:usize>(fs:&RamFs<F>,d:Diagnostic)->Result<Finding,Error>{
  let mut line=1u32;let mut col=1u32;
  for i in 0..=len{
   if line==d.line&&col==d.column{
-   return Ok(Finding{path:d.path,len:d.path_len,byte:i,line,
+   let mut full_path=[0u8;PATH_MAX];
+   full_path[..d.path_len].copy_from_slice(&d.path[..d.path_len]);
+   return Ok(Finding{path:full_path,len:d.path_len,byte:i,line,
     column:col,version,severity:d.severity});
   }
   if i==len{break;}
