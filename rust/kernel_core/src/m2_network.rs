@@ -711,7 +711,7 @@ impl<const N:usize> ConnectionTable<N>{
  pub fn begin(&mut self,actor:Identity,local_port:u16,peer:TcpPeer,
   now:u64,timeout:u64)->Result<(),Error>{
   if actor.pid==0||actor.generation==0||local_port==0||
-     peer.port==0||timeout==0{return Err(Error::Invalid);}
+     !peer.valid()||timeout==0{return Err(Error::Invalid);}
   let deadline=now.checked_add(timeout).ok_or(Error::Invalid)?;
   if self.leases.iter().flatten().any(|s|
      s.actor==actor&&s.local_port==local_port){return Err(Error::Denied);}
@@ -910,5 +910,62 @@ mod r013_network_expiration_tests{
   assert_eq!(t.purge_stale(4),1);
   t.begin(id(2),5555,peer(),4,3).unwrap();
   assert_eq!(t.active(),1);
+ }
+}
+
+/// R014 secure connection admission joins kernel-authenticated socket rights
+/// with an active bound port and validated remote peer. This is the policy
+/// ingress required BEFORE packet transport and TLS record verification.
+impl<const N:usize> ConnectionTable<N>{
+ pub fn begin_authorized<const P:usize,const G:usize>(&mut self,
+  endpoint:&Endpoint<P>,access:&Access<G>,owner:Identity,local_port:u16,
+  peer:TcpPeer,now:u64,timeout:u64)->Result<(),Error>{
+  access.require(owner,SOCKET,now).map_err(|_|Error::Denied)?;
+  endpoint.ports.require(owner,local_port,now).map_err(|_|Error::Denied)?;
+  self.begin(owner,local_port,peer,now,timeout)
+ }
+ pub fn terminate_peer(&mut self,actor:Identity,peer:TcpPeer)->usize{
+  let mut removed=0;
+  for slot in &mut self.leases{
+   if slot.is_some_and(|s|s.actor==actor&&s.peer==peer){
+    *slot=None;removed+=1;
+   }
+  }
+  removed
+ }
+ pub fn active_for(&self,actor:Identity)->usize{
+  self.leases.iter().flatten().filter(|s|s.actor==actor).count()
+ }
+}
+#[cfg(test)]
+mod r014_authorized_network_tests{
+ use super::*;use crate::batch6_security::SOCKET;
+ fn id(g:u64)->Identity{Identity{pid:50,generation:g}}
+ fn peer()->TcpPeer{TcpPeer{address:[8,8,8,8],port:443}}
+ #[test]fn established_socket_requires_capability_and_bound_port(){
+  let mut c=ConnectionTable::<2>::new();
+  let mut endpoint=Endpoint::<2>::new();let mut access=Access::<2>::new();
+  assert_eq!(c.begin_authorized(&endpoint,&access,id(1),5000,peer(),1,20),
+    Err(Error::Denied));
+  access.grant(id(1),SOCKET,100).unwrap();
+  endpoint.acquire(&access,id(1),5000,1,100).unwrap();
+  c.begin_authorized(&endpoint,&access,id(1),5000,peer(),1,20).unwrap();
+  assert_eq!(c.active_for(id(1)),1);
+ }
+ #[test]fn stale_pid_epoch_is_denied_and_cannot_close_current_peer(){
+  let mut c=ConnectionTable::<2>::new();
+  let mut endpoint=Endpoint::<2>::new();let mut access=Access::<2>::new();
+  access.grant(id(1),SOCKET,100).unwrap();
+  endpoint.acquire(&access,id(1),5000,1,100).unwrap();
+  c.begin_authorized(&endpoint,&access,id(1),5000,peer(),1,20).unwrap();
+  assert_eq!(c.begin_authorized(&endpoint,&access,id(2),5001,peer(),1,20),
+    Err(Error::Denied));
+  assert_eq!(c.terminate_peer(id(2),peer()),0);assert_eq!(c.active_for(id(1)),1);
+ }
+ #[test]fn invalid_multicast_peer_is_rejected_before_allocation(){
+  let mut c=ConnectionTable::<1>::new();
+  assert_eq!(c.begin(id(1),5000,TcpPeer{address:[239,0,0,1],port:443},
+     1,20),Err(Error::Invalid));
+  assert_eq!(c.active(),0);
  }
 }
