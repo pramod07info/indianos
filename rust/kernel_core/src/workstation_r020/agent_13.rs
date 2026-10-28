@@ -6,9 +6,13 @@ pub struct Patch<'a>{pub path:&'a[u8],pub offset:usize,
  pub old:&'a[u8],pub replacement:&'a[u8]}
 pub fn apply<const F:usize,const IMAGE:usize>(fs:&mut RamFs<F>,
  rev:u64,patches:&[Patch<'_>])->Result<u64,Error>{
- if patches.is_empty()||patches.len()>F||rev!=fs.version(){
-  return Err(Error::Stale);
+ if patches.is_empty()||rev!=fs.version(){return Err(Error::Stale);}
+ for (i,p) in patches.iter().enumerate(){
+  if p.old.is_empty()||patches[..i].iter().any(|old|old.path==p.path){
+   return Err(Error::Conflict);
+  }
  }
+ if patches.len()>F{return Err(Error::Full);}
  let mut snapshot=[0u8;IMAGE];
  let size=fs.export_snapshot(&mut snapshot).map_err(|_|Error::Full)?;
  let mut staged=RamFs::<F>::new();

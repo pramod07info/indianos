@@ -60,7 +60,10 @@ pub fn rename_all<const F:usize,const IMAGE:usize>(
   assert_eq!(&out[..n],b"bar fooBar");
  }
  #[test]fn destination_capacity_failure_does_not_edit_any_file(){
-  let mut fs=RamFs::<1>::new();fs.replace(b"/a",&[b'a';CONTENT_MAX]).unwrap();
+  let mut fs=RamFs::<1>::new();
+  let mut tokens=[b' ';CONTENT_MAX];
+  for i in (0..CONTENT_MAX).step_by(2){tokens[i]=b'a';}
+  fs.replace(b"/a",&tokens).unwrap();
   assert_eq!(rename_all::<1,4096>(&mut fs,1,b"a",b"long"),
     Err(Error::Full));assert_eq!(fs.version(),1);
  }
