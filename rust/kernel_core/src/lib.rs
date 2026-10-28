@@ -23,6 +23,8 @@ pub mod workstation_r018;
 pub mod workstation_r019;
 /// R020: 20 tested developer-workstation operations integrated with real RAM VFS, UI and build policy.
 pub mod workstation_r020;
+/// R021: developer workstation integration, project source tools and safe build/debug workflows.
+pub mod workstation_r021;
 mod syscall;
 mod program;
 mod initramfs;
