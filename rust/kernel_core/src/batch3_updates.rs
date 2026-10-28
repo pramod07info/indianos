@@ -327,3 +327,89 @@ mod r010_ota_poller_tests{
   assert!(poller.may_restart(UpdateEnvironment{active_user_session:false,..environment}));
  }
 }
+
+ 
+/// R011 signed-update *control plane*. Trusted downloader and storage worker
+/// must verify bytes and flush an inactive partition before reporting staged.
+/// This does not implement TLS, signature cryptography, or firmware writes.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum BootSlot{A,B}
+pub struct SlotTransaction{
+ active:BootSlot,pending:Option<(BootSlot,Candidate,u64)>,
+ attempts_left:u8,anti_rollback:u64,
+}
+impl SlotTransaction{
+ pub const fn new(active:BootSlot,running_version:u64)->Self{
+  Self{active,pending:None,attempts_left:0,anti_rollback:running_version}
+ }
+ pub fn active(&self)->BootSlot{self.active}
+ pub fn pending(&self)->bool{self.pending.is_some()}
+ pub fn stage(&mut self,slot:BootSlot,candidate:Candidate,
+  flushed:bool,deadline:u64,attempts:u8)->Result<(),UpdateError>{
+  if self.pending.is_some()||slot==self.active||!flushed||attempts==0||
+    candidate.image_id==0||candidate.version<=self.anti_rollback{
+   return Err(UpdateError::WrongState);
+  }
+  if !candidate.verified_signature||!candidate.payload_digest_verified{
+   return Err(UpdateError::Untrusted);
+  }
+  self.pending=Some((slot,candidate,deadline));
+  self.attempts_left=attempts;Ok(())
+ }
+ /// The firmware boot adapter must select this candidate only after a
+ /// durable slot write and can retry at most the verified budget.
+ pub fn boot_attempt(&mut self,now:u64)->Result<(BootSlot,u32),UpdateError>{
+  let (slot,candidate,deadline)=self.pending.ok_or(UpdateError::WrongState)?;
+  if now>deadline||self.attempts_left==0{return Err(UpdateError::NoAttempts);}
+  self.attempts_left-=1;Ok((slot,candidate.image_id))
+ }
+ pub fn confirm_health(&mut self,slot:BootSlot,image:u32,now:u64,
+  healthy:bool)->Result<u64,UpdateError>{
+  let(expected,candidate,deadline)=self.pending.ok_or(UpdateError::WrongState)?;
+  if !healthy||now>deadline||slot!=expected||image!=candidate.image_id{
+   return Err(UpdateError::WrongState);
+  }
+  self.anti_rollback=self.anti_rollback.max(candidate.version);
+  self.active=slot;self.pending=None;self.attempts_left=0;
+  Ok(self.anti_rollback)
+ }
+ pub fn fallback(&mut self)->BootSlot{
+  self.pending=None;self.attempts_left=0;self.active
+ }
+ pub fn floor(&self)->u64{self.anti_rollback}
+}
+#[cfg(test)]
+mod r011_ota_slot_tests{
+ use super::*;
+ fn candidate(version:u64)->Candidate{
+  Candidate{image_id:42,version,verified_signature:true,
+   payload_digest_verified:true,target_arch:62}
+ }
+ #[test]fn verified_slot_transitions_only_after_correct_health(){
+  let mut t=SlotTransaction::new(BootSlot::A,10);
+  t.stage(BootSlot::B,candidate(11),true,100,2).unwrap();
+  assert_eq!(t.boot_attempt(30),Ok((BootSlot::B,42)));
+  assert_eq!(t.confirm_health(BootSlot::A,42,40,true),Err(UpdateError::WrongState));
+  assert_eq!(t.active(),BootSlot::A);
+  assert_eq!(t.confirm_health(BootSlot::B,42,40,true),Ok(11));
+  assert_eq!(t.active(),BootSlot::B);
+  assert_eq!(t.floor(),11);
+ }
+ #[test]fn exhausted_boot_attempts_keep_safe_slot_active(){
+  let mut t=SlotTransaction::new(BootSlot::A,10);
+  t.stage(BootSlot::B,candidate(11),true,100,1).unwrap();
+  assert_eq!(t.boot_attempt(10),Ok((BootSlot::B,42)));
+  assert_eq!(t.boot_attempt(11),Err(UpdateError::NoAttempts));
+  assert_eq!(t.fallback(),BootSlot::A);
+  assert_eq!(t.active(),BootSlot::A);
+ }
+ #[test]fn downgrade_and_invalid_signature_cannot_publish_pending_slot(){
+  let mut t=SlotTransaction::new(BootSlot::B,9);
+  let mut bad=candidate(10);bad.verified_signature=false;
+  assert_eq!(t.stage(BootSlot::A,bad,true,100,1),Err(UpdateError::Untrusted));
+  assert!(!t.pending());
+  assert_eq!(t.stage(BootSlot::A,candidate(9),true,100,1),
+    Err(UpdateError::WrongState));
+  assert!(!t.pending());
+ }
+}
