@@ -969,3 +969,68 @@ mod r014_authorized_network_tests{
   assert_eq!(c.active(),0);
  }
 }
+
+
+/// R016: one scheduler transaction may provision several outbound sockets.
+/// All identity, capacity, destination and timeout checks happen on a
+/// private table; one bad request cannot leave half-open leases behind.
+impl<const N:usize> ConnectionTable<N>{
+ pub fn begin_batch(&mut self,
+  requests:&[(Identity,u16,TcpPeer,u64,u64)])->Result<usize,Error>{
+  if requests.is_empty()||requests.len()>N{return Err(Error::Invalid);}
+  let mut shadow=Self{leases:self.leases};
+  for &(owner,port,peer,now,timeout) in requests{
+   shadow.begin(owner,port,peer,now,timeout)?;
+  }
+  self.leases=shadow.leases;Ok(requests.len())
+ }
+ pub fn snapshot_owner(&self,owner:Identity,now:u64,
+   out:&mut[ConnectionLease])->Result<usize,Error>{
+  if owner.pid==0||owner.generation==0{return Err(Error::Invalid);}
+  let count=self.leases.iter().flatten()
+    .filter(|l|l.actor==owner&&now<=l.deadline).count();
+  if count>out.len(){return Err(Error::RetryExhausted);}
+  let mut n=0;
+  for lease in self.leases.iter().flatten(){
+   if lease.actor==owner&&now<=lease.deadline{
+    out[n]=*lease;n+=1;
+   }
+  }
+  Ok(n)
+ }
+}
+#[cfg(test)]mod r016_socket_batch_tests{
+ use super::*;
+ fn id(g:u64)->Identity{Identity{pid:9,generation:g}}
+ fn peer(n:u8)->TcpPeer{TcpPeer{address:[10,0,0,n],port:443}}
+ #[test]fn two_connections_are_added_to_a_single_owner(){
+  let mut c=ConnectionTable::<3>::new();
+  assert_eq!(c.begin_batch(&[
+   (id(1),5000,peer(1),1,20),(id(1),5001,peer(2),1,30)]),Ok(2));
+  assert_eq!(c.active_for(id(1)),2);
+  let placeholder=ConnectionLease{actor:id(1),local_port:0,peer:peer(1),
+    deadline:0,attempts:0,established:false};
+  let mut out=[placeholder;2];
+  assert_eq!(c.snapshot_owner(id(1),10,&mut out),Ok(2));
+  assert_eq!(out[0].local_port,5000);assert_eq!(out[1].local_port,5001);
+ }
+ #[test]fn second_bad_peer_causes_no_partial_lease(){
+  let mut c=ConnectionTable::<3>::new();
+  assert_eq!(c.begin_batch(&[
+   (id(1),5000,peer(1),1,20),
+   (id(1),5001,TcpPeer{address:[239,0,0,1],port:80},1,20)]),
+   Err(Error::Invalid));
+  assert_eq!(c.active_for(id(1)),0);
+ }
+ #[test]fn short_snapshot_and_recycled_pid_cannot_observe_sockets(){
+  let mut c=ConnectionTable::<2>::new();
+  c.begin_batch(&[(id(1),5000,peer(1),1,20),(id(1),5001,peer(2),1,20)])
+   .unwrap();
+  let placeholder=ConnectionLease{actor:id(1),local_port:0,peer:peer(1),
+    deadline:0,attempts:0,established:false};
+  let mut short=[placeholder;1];
+  assert_eq!(c.snapshot_owner(id(1),2,&mut short),
+    Err(Error::RetryExhausted));assert_eq!(short,[placeholder]);
+  assert_eq!(c.snapshot_owner(id(2),2,&mut short),Ok(0));
+ }
+}

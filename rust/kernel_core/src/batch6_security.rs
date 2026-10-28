@@ -783,3 +783,69 @@ mod r014_audit_atomic_provision_tests{
   assert_eq!(a.unrevoked_owners(10),0);assert_eq!(log.remaining(),2);
  }
 }
+
+/// R016 kernel syscall gate for multi-capability transactions. All decisions
+/// are journalled together; a full or corrupt journal denies authorization.
+impl<const N:usize> Access<N>{
+ pub fn require_batch_audited<const L:usize>(&self,
+   audit:&mut SecurityAudit<L>,owner:Identity,now:u64,rights:&[u32])
+   ->Result<usize,AuditError>{
+  if owner.pid==0||owner.generation==0||rights.is_empty()||
+    rights.len()>L||audit.remaining()<rights.len(){
+   return Err(AuditError::Full);
+  }
+  audit.validate()?;
+  let mut scratch=SecurityAudit{entries:audit.entries,
+    used:audit.used,next:audit.next,chain:audit.chain};
+  let mut permitted=true;
+  for &right in rights{
+   if right==0||right&!ALL!=0{return Err(AuditError::Invalid);}
+   let decision=self.require(owner,right,now).is_ok();
+   scratch.record(owner,right,now,if decision{
+     AuditKind::Allowed
+   }else{AuditKind::Denied})?;
+   if !decision{permitted=false;}
+  }
+  *audit=scratch;
+  if permitted{Ok(rights.len())}else{Err(AuditError::Denied)}
+ }
+ pub fn permitted_mask_at(&self,owner:Identity,now:u64)->u32{
+  if owner.pid==0||owner.generation==0{return 0;}
+  let mut mask=0;
+  for bit in [VIEW,FILE_READ,FILE_WRITE,INSTALL,SOCKET,DRIVER]{
+   if self.require(owner,bit,now).is_ok(){mask|=bit;}
+  }
+  mask
+ }
+}
+#[cfg(test)]mod r016_audited_multi_gate_tests{
+ use super::*;fn id(g:u64)->Identity{Identity{pid:5,generation:g}}
+ #[test]fn two_rights_publish_audit_only_when_capacity_is_sufficient(){
+  let mut access=Access::<1>::new();let mut log=SecurityAudit::<3>::new();
+  access.grant(id(1),VIEW|FILE_READ,100).unwrap();
+  assert_eq!(access.require_batch_audited(&mut log,id(1),2,
+   &[VIEW,FILE_READ]),Ok(2));
+  assert_eq!(log.remaining(),1);
+  assert_eq!(access.permitted_mask_at(id(1),2),VIEW|FILE_READ);
+ }
+ #[test]fn denied_second_permission_is_audited_but_not_granted(){
+  let mut access=Access::<1>::new();let mut log=SecurityAudit::<2>::new();
+  access.grant(id(1),VIEW,100).unwrap();
+  assert_eq!(access.require_batch_audited(&mut log,id(1),2,
+    &[VIEW,FILE_WRITE]),Err(AuditError::Denied));
+  assert_eq!(access.require(id(1),FILE_WRITE,2),Err(Error::Denied));
+  assert_eq!(log.validate(),Ok(()));assert_eq!(log.remaining(),0);
+ }
+ #[test]fn journal_capacity_invalid_rights_and_recycled_pid_fail_closed(){
+  let mut access=Access::<1>::new();let mut log=SecurityAudit::<1>::new();
+  access.grant(id(1),VIEW,100).unwrap();
+  assert_eq!(access.require_batch_audited(&mut log,id(1),2,
+    &[VIEW,VIEW]),Err(AuditError::Full));
+  assert_eq!(log.remaining(),1);
+  assert_eq!(access.require_batch_audited(&mut log,id(1),2,
+    &[0]),Err(AuditError::Invalid));
+  assert_eq!(log.remaining(),1);
+  assert_eq!(access.permitted_mask_at(id(2),2),0);
+ }
+}
+

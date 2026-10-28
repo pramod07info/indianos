@@ -708,3 +708,73 @@ mod r014_quantum_bulk_quota_tests{
   assert_eq!(b.remaining(id(2)),Some(0));
  }
 }
+
+
+/// R016: one authenticated job coordinator may provision fair work credits
+/// to several process generations without half-admitted quota slots.
+impl<const N:usize> QuantumWorkBudget<N>{
+ pub fn admit_batch(&mut self,requests:&[(Identity,u16)])
+  ->Result<usize,ServiceError>{
+  if requests.is_empty()||requests.len()>N{
+   return Err(ServiceError::Queue(QueueError::Full));
+  }
+  let mut candidate=Self{grants:self.grants,cursor:self.cursor};
+  for &(owner,credits) in requests{
+   candidate.admit(owner,credits)?;
+  }
+  self.grants=candidate.grants;self.cursor=candidate.cursor;
+  Ok(requests.len())
+ }
+ pub fn remaining_batch(&self,owners:&[Identity],
+  output:&mut[u16])->Result<usize,ServiceError>{
+  if owners.is_empty()||owners.len()>N||output.len()<owners.len(){
+   return Err(ServiceError::Queue(QueueError::Full));
+  }
+  let mut temp=[0u16;N];
+  for (i,&owner) in owners.iter().enumerate(){
+   temp[i]=self.remaining(owner).ok_or(ServiceError::NotOwner)?;
+  }
+  output[..owners.len()].copy_from_slice(&temp[..owners.len()]);
+  Ok(owners.len())
+ }
+ pub fn retire_batch(&mut self,owners:&[Identity])
+  ->Result<usize,ServiceError>{
+  if owners.is_empty()||owners.len()>N{
+   return Err(ServiceError::Queue(QueueError::Full));
+  }
+  for (i,&owner) in owners.iter().enumerate(){
+   if owner.pid==0||owner.generation==0||owners[..i].contains(&owner)||
+      self.remaining(owner).is_none(){return Err(ServiceError::NotOwner);}
+  }
+  for &owner in owners{self.terminate(owner);}
+  Ok(owners.len())
+ }
+}
+#[cfg(test)]mod r016_quantum_multiuser_tests{
+ use super::*;
+ fn id(p:u32,g:u64)->Identity{Identity{pid:p,generation:g}}
+ #[test]fn batch_admission_round_robins_independent_owners(){
+  let mut b=QuantumWorkBudget::<2>::new();
+  assert_eq!(b.admit_batch(&[(id(1,1),2),(id(2,1),1)]),Ok(2));
+  assert_eq!(b.next_owner(),Some(id(1,1)));
+  assert_eq!(b.next_owner(),Some(id(2,1)));
+  assert_eq!(b.next_owner(),Some(id(1,1)));
+  assert_eq!(b.next_owner(),None);
+ }
+ #[test]fn duplicate_second_owner_is_atomic(){
+  let mut b=QuantumWorkBudget::<2>::new();
+  assert!(b.admit_batch(&[(id(1,1),1),(id(1,1),3)]).is_err());
+  assert_eq!(b.remaining(id(1,1)),None);
+ }
+ #[test]fn stale_pid_and_failed_cleanup_do_not_erase_new_generation(){
+  let mut b=QuantumWorkBudget::<2>::new();
+  b.admit_batch(&[(id(1,1),1),(id(1,2),2)]).unwrap();
+  let mut out=[99u16;1];
+  assert!(b.remaining_batch(&[id(1,1),id(1,2)],&mut out).is_err());
+  assert_eq!(out,[99]);
+  assert!(b.retire_batch(&[id(1,1),id(3,1)]).is_err());
+  assert_eq!(b.remaining(id(1,1)),Some(1));
+  assert_eq!(b.retire_batch(&[id(1,1)]),Ok(1));
+  assert_eq!(b.remaining(id(1,2)),Some(2));
+ }
+}

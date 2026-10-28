@@ -609,3 +609,67 @@ mod r014_group_admission_tests{
   assert!(q.contains_epoch(4,1));assert!(!q.contains_epoch(5,1));
  }
 }
+
+/// R016: scheduler-only atomic cleanup for several authenticated process
+/// incarnations. No SMP inter-core locking is implied by this helper.
+impl<const C:usize,const N:usize> CoreRunQueues<C,N>{
+ pub fn evict_epochs_atomic(&mut self,epochs:&[(u32,u64)])
+  ->Result<usize,DispatchError>{
+  if epochs.is_empty()||epochs.len()>C.saturating_mul(N){
+   return Err(DispatchError::InvalidTask);
+  }
+  for (i,&(pid,generation)) in epochs.iter().enumerate(){
+   if pid==0||generation==0||epochs[..i].contains(&(pid,generation)){
+    return Err(DispatchError::InvalidTask);
+   }
+   if !self.contains_epoch(pid,generation){
+    return Err(DispatchError::InvalidTask);
+   }
+  }
+  let mut staged=Self{queues:self.queues,length:self.length,cursor:self.cursor};
+  let mut removed=0usize;
+  for &(pid,generation) in epochs{
+   removed+=staged.evict(pid,generation);
+  }
+  self.queues=staged.queues;self.length=staged.length;self.cursor=staged.cursor;
+  Ok(removed)
+ }
+ pub fn capacity_snapshot(&self,output:&mut[(usize,usize)])
+  ->Result<usize,DispatchError>{
+  if output.len()<C{return Err(DispatchError::Full);}
+  for (i,item) in output[..C].iter_mut().enumerate(){
+   *item=(self.length[i],N.saturating_sub(self.length[i]));
+  }
+  Ok(C)
+ }
+}
+#[cfg(test)]mod r016_epoch_teardown_tests{
+ use super::*;
+ fn task(pid:u32,g:u64)->Runnable{Runnable{pid,generation:g,priority:1}}
+ #[test]fn batch_teardown_preserves_unrelated_epoch(){
+  let mut q=CoreRunQueues::<2,3>::new();
+  q.enqueue(0,task(1,1)).unwrap();q.enqueue(1,task(2,1)).unwrap();
+  q.enqueue(0,task(1,2)).unwrap();
+  assert_eq!(q.evict_epochs_atomic(&[(1,1),(2,1)]),Ok(2));
+  assert_eq!(q.total_runnable(),1);assert!(q.contains_epoch(1,2));
+ }
+ #[test]fn invalid_second_epoch_cannot_partially_evict(){
+  let mut q=CoreRunQueues::<2,2>::new();
+  q.enqueue(0,task(1,1)).unwrap();q.enqueue(1,task(2,1)).unwrap();
+  assert_eq!(q.evict_epochs_atomic(&[(1,1),(3,1)]),
+    Err(DispatchError::InvalidTask));
+  assert_eq!(q.total_runnable(),2);
+  assert_eq!(q.evict_epochs_atomic(&[(1,1),(1,1)]),
+    Err(DispatchError::InvalidTask));
+ }
+ #[test]fn short_capacity_snapshot_preserves_output(){
+  let mut q=CoreRunQueues::<2,2>::new();
+  q.enqueue(0,task(1,1)).unwrap();
+  let mut short=[(7,7);1];
+  assert_eq!(q.capacity_snapshot(&mut short),Err(DispatchError::Full));
+  assert_eq!(short,[(7,7)]);
+  let mut both=[(0,0);2];assert_eq!(q.capacity_snapshot(&mut both),Ok(2));
+  assert_eq!(both,[(1,1),(0,2)]);
+ }
+}
+

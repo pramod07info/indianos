@@ -774,3 +774,75 @@ mod r015_linux_mapping_safety_tests {
   assert_eq!(validate_exec_regions(&[rx,safe],0x4000,0x10000),Ok(2));
  }
 }
+
+
+/// R016 parallel POSIX dup2 remap. Unlike sequential dup operations,
+/// each source descriptor is captured from the ORIGINAL process table,
+/// allowing safe swaps with no accidental handle overwrite.
+impl<const N:usize> FileDescriptors<N>{
+ pub fn dup2_parallel_atomic(&mut self,
+  owner:crate::batch5_session::Identity,
+  moves:&[(u32,u32,u8)])->Result<usize,FdError>{
+  if owner.pid==0||owner.generation==0||moves.is_empty()||
+    moves.len()>N{return Err(FdError::Invalid);}
+  let mut handles=[0u64;N];
+  for (i,&(source,target,rights)) in moves.iter().enumerate(){
+   if target<3||rights==0||rights&!(FD_READ|FD_WRITE)!=0{
+    return Err(FdError::Invalid);
+   }
+   if moves[..i].iter().any(|(_,dest,_)|*dest==target){
+    return Err(FdError::Duplicate);
+   }
+   handles[i]=self.resolve(owner,source,rights)?;
+  }
+  let mut scratch=Self{entries:self.entries};
+  for (i,&(_,target,rights)) in moves.iter().enumerate(){
+   // A numeric PID cannot overwrite descriptors from a stale generation.
+   if scratch.entries.iter().flatten().any(|e|
+      e.owner.pid==owner.pid&&e.owner!=owner&&e.fd==target){
+    return Err(FdError::Denied);
+   }
+   if scratch.entries.iter().flatten().any(|e|
+      e.owner==owner&&e.fd==target){
+    scratch.close(owner,target)?;
+   }
+   scratch.attach(owner,target,handles[i],rights)?;
+  }
+  self.entries=scratch.entries;Ok(moves.len())
+ }
+ pub fn close_all_on_exit(&mut self,
+  owner:crate::batch5_session::Identity)->usize{
+  if owner.pid==0||owner.generation==0{return 0;}
+  self.retire(owner)
+ }
+}
+#[cfg(test)]mod r016_posix_parallel_tests{
+ use super::*;use crate::batch5_session::Identity;
+ fn id(g:u64)->Identity{Identity{pid:30,generation:g}}
+ #[test]fn swap_reads_both_sources_before_mutating_table(){
+  let mut f=FileDescriptors::<3>::new();
+  f.attach(id(1),3,100,FD_READ).unwrap();
+  f.attach(id(1),4,200,FD_READ).unwrap();
+  assert_eq!(f.dup2_parallel_atomic(id(1),&[
+    (3,4,FD_READ),(4,3,FD_READ)]),Ok(2));
+  assert_eq!(f.resolve(id(1),3,FD_READ),Ok(200));
+  assert_eq!(f.resolve(id(1),4,FD_READ),Ok(100));
+ }
+ #[test]fn bad_second_source_does_not_change_first_fd(){
+  let mut f=FileDescriptors::<3>::new();
+  f.attach(id(1),3,100,FD_READ).unwrap();
+  assert_eq!(f.dup2_parallel_atomic(id(1),&[
+    (3,4,FD_READ),(99,5,FD_READ)]),Err(FdError::NotFound));
+  assert_eq!(f.resolve(id(1),4,FD_READ),Err(FdError::NotFound));
+  assert_eq!(f.resolve(id(1),3,FD_READ),Ok(100));
+ }
+ #[test]fn reused_pid_does_not_inherit_or_close_old_descriptor(){
+  let mut f=FileDescriptors::<3>::new();
+  f.attach(id(2),3,300,FD_READ).unwrap();
+  assert_eq!(f.dup2_parallel_atomic(id(1),&[(3,5,FD_READ)]),
+    Err(FdError::Denied));
+  assert_eq!(f.close_all_on_exit(id(1)),0);
+  assert_eq!(f.resolve(id(2),3,FD_READ),Ok(300));
+  assert_eq!(f.close_all_on_exit(id(2)),1);
+ }
+}

@@ -983,3 +983,80 @@ mod r014_compositor_coalesce_tests{
   assert_eq!(q.oldest_frame().unwrap().owner,4);
  }
 }
+
+/// R016: non-consuming event view plus atomic acknowledgement for a ring-3
+/// compositor. The caller's owner must come from the scheduler, not a packet.
+impl<const W:usize,const Q:usize> Broker<W,Q>{
+ pub fn preview_events(&self,owner:u32,out:&mut[Event])
+  ->Result<usize,Error>{
+  if !self.known(owner){return Err(Error::Unauthorized);}
+  let count=self.events[..self.len].iter().flatten()
+   .filter(|e|e.owner==owner).count();
+  if count>out.len(){return Err(Error::Full);}
+  let mut n=0;
+  for item in self.events[..self.len].iter().flatten(){
+   if item.owner==owner{out[n]=*item;n+=1;}
+  }
+  Ok(n)
+ }
+ pub fn acknowledge_events(&mut self,owner:u32,serials:&[u32])
+  ->Result<usize,Error>{
+  if !self.known(owner){return Err(Error::Unauthorized);}
+  if serials.is_empty()||serials.len()>self.len{return Err(Error::Invalid);}
+  for (i,&seq) in serials.iter().enumerate(){
+   if seq==0||serials[..i].contains(&seq){return Err(Error::Invalid);}
+   if !self.events[..self.len].iter().flatten()
+       .any(|e|e.owner==owner&&e.sequence==seq){
+    return Err(Error::Unauthorized);
+   }
+  }
+  for &seq in serials{self.ack(owner,seq)?;}
+  Ok(serials.len())
+ }
+ pub fn cancel_owned_events(&mut self,owner:u32)->Result<usize,Error>{
+  if !self.known(owner){return Err(Error::Unauthorized);}
+  let mut removed=0;let mut i=0;
+  while i<self.len{
+   if self.events[i].is_some_and(|e|e.owner==owner){
+    self.remove(i);removed+=1;
+   }else{i+=1;}
+  }
+  Ok(removed)
+ }
+}
+#[cfg(test)]mod r016_gui_event_transactions_tests{
+ use super::*;
+ #[test]fn preview_and_ack_preserve_other_clients(){
+  let mut b=Broker::<2,4>::new();b.grant(1,11).unwrap();b.grant(2,22).unwrap();
+  let a=b.post_focus(1,11).unwrap();
+  let peer=b.post_focus(2,22).unwrap();
+  b.post_pointer_focus(1,11).unwrap();
+  let mut events=[a;2];
+  assert_eq!(b.preview_events(1,&mut events),Ok(2));
+  assert_eq!(events[0].sequence,a.sequence);
+  assert_eq!(b.acknowledge_events(1,&[a.sequence]),Ok(1));
+  assert_eq!(b.peek(2),Ok(peer));
+ }
+ #[test]fn invalid_ack_batch_cannot_discard_valid_event(){
+  let mut b=Broker::<2,3>::new();b.grant(1,11).unwrap();b.grant(2,22).unwrap();
+  let first=b.post_focus(1,11).unwrap();
+  let foreign=b.post_focus(2,22).unwrap();
+  assert_eq!(b.acknowledge_events(1,&[first.sequence,foreign.sequence]),
+    Err(Error::Unauthorized));
+  assert_eq!(b.peek(1),Ok(first));
+  assert_eq!(b.acknowledge_events(1,&[first.sequence,first.sequence]),
+    Err(Error::Invalid));
+ }
+ #[test]fn cancellation_is_owner_scoped_and_short_preview_is_atomic(){
+  let mut b=Broker::<2,3>::new();b.grant(1,11).unwrap();b.grant(2,22).unwrap();
+  let first=b.post_focus(1,11).unwrap();
+  b.post_pointer_focus(1,11).unwrap();let peer=b.post_focus(2,22).unwrap();
+  let mut small=[peer;1];
+  assert_eq!(b.preview_events(1,&mut small),Err(Error::Full));
+  assert_eq!(small,[peer]);
+  assert_eq!(b.cancel_owned_events(1),Ok(2));
+  assert_eq!(b.peek(2),Ok(peer));
+  assert_eq!(b.acknowledge_events(1,&[first.sequence]),Err(Error::Unauthorized));
+ }
+}
+
