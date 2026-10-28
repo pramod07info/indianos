@@ -46,6 +46,56 @@ R022 and R023 are **kernel-library foundations**, not proof that filesystem
 syscalls or scheduler lifecycle notifications are wired into live ring-3
 execution. Those integrations belong to R025 and require new QEMU tests.
 
+## IndianOS original design system and three-edition UX backlog (added 2026-10-28)
+
+**Status: all tasks below are planned, not implemented or approved.** Product
+direction: **one independent IndianOS kernel, three distinct experiences**:
+**Home Canvas** (Desktop), **Workgrid** (Developer Workstation), and **Ops
+Plane** (headless-first Server). Share secure OS services and reusable design
+tokens, but do not clone the distinctive layout, artwork, icons, logos,
+animations or proprietary UI assets of Windows, macOS, Linux distributions or
+other products. Familiar accessibility conventions are permitted. No
+unqualified originality, legal clearance, or hardware/app compatibility claim
+may be made without review and evidence.
+
+Proposed v0.1 design tokens (subject to accessibility and brand review):
+main ink `#132337`, teal `#007D77`, amber `#C88726`, slate
+`#52677B`, mist `#F6F8F7`, dark background `#0A1321`, error
+`#B63B4B`. The proposed logo exploration is **Three Paths, One Core**,
+symbolizing the three editions and shared kernel; it is a *concept*, not a
+released logo or cleared trademark. Plan English/Hindi and Devanagari text
+shaping with properly licensed fonts.
+
+| ID | Priority | Deliverable | Acceptance / evidence required |
+|---|---|---|---|
+| UX01 | P0 | IndianOS brand & originality specification | Record logo sketches, unique identity rationale, brand palette and naming rules; document provenance and visual-similarity/trademark review **before** public logo release; no copied third-party assets |
+| UX02 | P0 | Shared design tokens, typography, original icon library | Reusable light/dark colors, spacing, component states, type scales, keyboard-focus styles and custom icons; contrast/accessibility checks and verified font licenses including Devanagari |
+| UX03 | P0 | User-space compositor & safe surface protocol foundation | Complete pending R029 ring-3 window server, per-app surface isolation, event-driven input and focus; QEMU pixel/input tests and no untrusted app access to another app's memory |
+| UX04 | P1 | Shared component library and shell interaction patterns | Working buttons, menus, dialogs, notifications, files/permissions prompts and error/loading/empty states; keyboard navigation, reduced motion and regression tests |
+| UX05 | P1 | Desktop / **Home Canvas** edition | Functional home, application launcher, file manager, search, settings, notifications and update/recovery screens; real working navigation and QEMU screenshot + interaction evidence rather than static mocks |
+| UX06 | P1 | Developer Workstation / **Workgrid** edition | Resizable project workspaces, terminal, Git/build/test feedback and project session restore; integrate service/database/debugging panels only when underlying backends exist; automated workflow tests |
+| UX07 | P1 | Server / **Ops Plane** edition | Headless boot with optional authenticated remote admin: services, deployments, metrics, logs, network, security, backups and recovery; prove server operation without a graphical UI and permission/audit tests |
+| UX08 | P1 | Unified, hardware-aware installer and edition selection | Detect supported CPU/firmware/storage, explain device/partition impact, select Desktop/Developer/Server profile, refuse unsupported devices and destructive defaults; disposable-QEMU-disk install/rollback tests before real hardware |
+| UX09 | P1 | Shared edition profiles and service/package manifests | One kernel, separate default services/UI; Server excludes heavyweight desktop by default; switching/add-on features uses validated packages and never bypasses permission checks |
+| UX10 | P1 | Unified files and app-install experience | VFS file-picker and permissions design, tested filesystem drivers, truthful supported-format checks, signed native app installation; do not imply that `.exe`, `.app`, `.deb` or `.apk` runs merely from its extension |
+| UX11 | P1 | Accessibility, multilingual and responsive UX validation | English/Hindi flows, Indic input/text shaping, keyboard-only operation, screen-reader hooks, scaling, contrast, reduced motion, error guidance; tested across all three editions |
+| UX12 | P1 | Updates, security and recovery UX | Clear staged/verified updates, user-visible approval for disruptive changes, signed packages, rollback and recovery flows; test interrupted update and failed signature behavior |
+| UX13 | P2 | Original motion, wallpaper, boot and lock-screen identity | Distinctive but restrained animations and legally original assets; performance budgets, reduced-motion alternatives and pixel tests; do not hold up kernel reliability work |
+| UX14 | P2 | Three-edition end-to-end visual acceptance & release criteria | Independent actual QEMU screenshots/video captures and functional smoke tests for every screen; no mockups claimed as implemented; publish verified supported hardware/feature matrix |
+
+**Implementation order / dependency gates:**
+
+1. Lock `UX01–UX02` specification only after originality, licensing, and accessibility review. Draft visuals are provisional.
+2. Finish `UX03` (R029 compositor/security foundation) before claiming production Desktop UI; develop `UX04` and early Home Canvas alongside bounded QEMU acceptance.
+3. Deliver working `UX05` Desktop screens, then reusable `UX06` developer workflows; neither edition may claim Linux/Windows/macOS application compatibility until it is verified app-by-app.
+4. Deliver `UX07` Server headless services and authenticated optional Ops Plane. Use shared kernel/services, **not** three forked kernels.
+5. Deliver `UX08–UX12` installer/profile, filesystem/app integration, accessibility, signed updates and recovery with safety gates; `UX13–UX14` polish and release evidence follow functional acceptance.
+
+**Definition of done:** a design mockup or passing unit test is insufficient:
+each displayed feature must have a real event-to-visible-result path, documented
+fallback/error handling, applicable security checks and reproducible QEMU or
+hardware evidence. Preserve existing kernel, boot and CI regressions.
+
 ## Commit / validation policy
 
 1. Work on an isolated verification branch to run host regression tests,
