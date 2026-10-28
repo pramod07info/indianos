@@ -165,3 +165,85 @@ pub fn retry_fresh(service:Service,observed_generation:u32,
  #[test]fn repeated_tick_cannot_retry(){assert_eq!(retry_fresh(waiting(),8,100,99,100),Err(ServiceError::InvalidTransition));}
  #[test]fn wrong_generation_cannot_retry(){assert_eq!(retry_fresh(waiting(),9,100,99,90),Err(ServiceError::InvalidTransition));}
 }
+
+
+// R007: deterministic supervisor policy, not an actual process scheduler.
+// At most N services are tracked and retries require exact generation.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct TrackedService{pub id:u16,pub service:Service,pub deadline:u64}
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum SupervisorError{Invalid,Full,Missing,Duplicate,Service(ServiceError)}
+pub struct ServiceGroup<const N:usize>{entries:[Option<TrackedService>;N]}
+impl<const N:usize> ServiceGroup<N>{
+    pub const fn new()->Self{Self{entries:[None;N]}}
+    fn index(&self,id:u16)->Option<usize>{
+        self.entries.iter().position(|x|x.is_some_and(|s|s.id==id))
+    }
+    pub fn register(&mut self,id:u16,retry_budget:u8)
+        ->Result<u32,SupervisorError>{
+        if id==0||retry_budget==0{return Err(SupervisorError::Invalid);}
+        if self.index(id).is_some(){return Err(SupervisorError::Duplicate);}
+        let slot=self.entries.iter_mut().find(|e|e.is_none())
+            .ok_or(SupervisorError::Full)?;
+        let svc=transition(Service{state:State::Stopped,retries:0,
+            retry_budget,generation:0},Event::Start).map_err(SupervisorError::Service)?;
+        *slot=Some(TrackedService{id,service:svc,deadline:0});
+        Ok(svc.generation)
+    }
+    pub fn status(&self,id:u16)->Option<TrackedService>{
+        self.index(id).and_then(|i|self.entries[i])
+    }
+    pub fn crash(&mut self,id:u16,generation:u32,now:u64,interval:u64)
+        ->Result<TrackedService,SupervisorError>{
+        let i=self.index(id).ok_or(SupervisorError::Missing)?;
+        let mut entry=self.entries[i].ok_or(SupervisorError::Missing)?;
+        if entry.service.generation!=generation{
+            return Err(SupervisorError::Invalid);
+        }
+        entry.service=transition(entry.service,Event::Crash)
+            .map_err(SupervisorError::Service)?;
+        entry.deadline=if entry.service.state==State::WaitingRestart{
+            retry_deadline(entry.service,now,interval)
+                .map_err(SupervisorError::Service)?
+        }else{0};
+        self.entries[i]=Some(entry);Ok(entry)
+    }
+    pub fn retry(&mut self,id:u16,generation:u32,now:u64)
+        ->Result<TrackedService,SupervisorError>{
+        let i=self.index(id).ok_or(SupervisorError::Missing)?;
+        let mut entry=self.entries[i].ok_or(SupervisorError::Missing)?;
+        entry.service=retry_if_due(entry.service,generation,now,entry.deadline)
+            .map_err(SupervisorError::Service)?;
+        entry.deadline=0;self.entries[i]=Some(entry);Ok(entry)
+    }
+    pub fn stop(&mut self,id:u16,generation:u32)->Result<(),SupervisorError>{
+        let i=self.index(id).ok_or(SupervisorError::Missing)?;
+        let entry=self.entries[i].ok_or(SupervisorError::Missing)?;
+        if entry.service.generation!=generation{return Err(SupervisorError::Invalid);}
+        self.entries[i]=None;Ok(())
+    }
+}
+#[cfg(test)]mod r007_supervisor_tests{
+    use super::*;
+    #[test]fn crash_retry_exhaustion_and_manual_cleanup(){
+        let mut g=ServiceGroup::<2>::new();
+        let gen=g.register(2,1).unwrap();
+        let crash=g.crash(2,gen,10,5).unwrap();
+        assert_eq!(crash.deadline,15);
+        assert_eq!(g.retry(2,gen,14),Err(SupervisorError::Service(ServiceError::InvalidTransition)));
+        let running=g.retry(2,gen,15).unwrap();
+        assert_eq!(running.service.generation,2);
+        assert_eq!(g.crash(2,2,20,5).unwrap().service.state,State::Exhausted);
+        assert_eq!(g.retry(2,2,30),Err(SupervisorError::Service(ServiceError::InvalidTransition)));
+        assert_eq!(g.stop(2,2),Ok(()));
+        assert!(g.status(2).is_none());
+    }
+    #[test]fn duplicate_capacity_and_stale_generation_fail_closed(){
+        let mut g=ServiceGroup::<1>::new();
+        g.register(1,2).unwrap();
+        assert_eq!(g.register(1,2),Err(SupervisorError::Duplicate));
+        assert_eq!(g.register(2,2),Err(SupervisorError::Full));
+        assert_eq!(g.crash(1,99,0,3),Err(SupervisorError::Invalid));
+        assert_eq!(g.status(1).unwrap().service.state,State::Running);
+    }
+}
