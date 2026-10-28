@@ -695,3 +695,91 @@ mod r010_dns_cache_hardening_tests{
   assert_eq!(cache.entries_active(2),1);
  }
 }
+
+ 
+/// R011 pre-transport TCP connection admission. A trusted network worker
+/// supplies only authenticated socket owners and verified peer addresses.
+/// Real TCP packet IO, congestion control and certificate trust remain to wire.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct ConnectionLease{
+ pub actor:Identity,pub local_port:u16,pub peer:TcpPeer,
+ pub deadline:u64,pub attempts:u8,pub established:bool,
+}
+pub struct ConnectionTable<const N:usize>{leases:[Option<ConnectionLease>;N]}
+impl<const N:usize> ConnectionTable<N>{
+ pub const fn new()->Self{Self{leases:[None;N]}}
+ pub fn begin(&mut self,actor:Identity,local_port:u16,peer:TcpPeer,
+  now:u64,timeout:u64)->Result<(),Error>{
+  if actor.pid==0||actor.generation==0||local_port==0||
+     peer.port==0||timeout==0{return Err(Error::Invalid);}
+  let deadline=now.checked_add(timeout).ok_or(Error::Invalid)?;
+  if self.leases.iter().flatten().any(|s|
+     s.actor==actor&&s.local_port==local_port){return Err(Error::Denied);}
+  let slot=self.leases.iter_mut().find(|s|s.is_none())
+   .ok_or(Error::RetryExhausted)?;
+  *slot=Some(ConnectionLease{actor,local_port,peer,deadline,
+    attempts:0,established:false});Ok(())
+ }
+ pub fn retry(&mut self,actor:Identity,local_port:u16,peer:TcpPeer,
+  now:u64,timeout:u64)->Result<u8,Error>{
+  if timeout==0{return Err(Error::Invalid);}
+  let slot=self.leases.iter_mut().flatten().find(|s|
+    s.actor==actor&&s.local_port==local_port&&s.peer==peer)
+    .ok_or(Error::NotFound)?;
+  if slot.established||now<slot.deadline{return Err(Error::Denied);}
+  if slot.attempts>=MAX_TCP_RETRIES{return Err(Error::RetryExhausted);}
+  let next_deadline=now.checked_add(timeout).ok_or(Error::Invalid)?;
+  slot.attempts+=1;slot.deadline=next_deadline;Ok(slot.attempts)
+ }
+ pub fn established(&mut self,actor:Identity,local_port:u16,
+  peer:TcpPeer,now:u64)->Result<(),Error>{
+  let slot=self.leases.iter_mut().flatten().find(|s|
+    s.actor==actor&&s.local_port==local_port&&s.peer==peer)
+    .ok_or(Error::NotFound)?;
+  if now>slot.deadline||slot.established{return Err(Error::Denied);}
+  slot.established=true;Ok(())
+ }
+ pub fn verified(&self,actor:Identity,local_port:u16,
+  peer:TcpPeer)->bool{
+  self.leases.iter().flatten().any(|s|s.actor==actor&&
+   s.local_port==local_port&&s.peer==peer&&s.established)
+ }
+ pub fn retire(&mut self,actor:Identity)->usize{
+  let mut count=0;
+  for slot in &mut self.leases{
+   if slot.is_some_and(|s|s.actor==actor){*slot=None;count+=1;}
+  }
+  count
+ }
+}
+#[cfg(test)]
+mod r011_connection_lease_tests{
+ use super::*;
+ fn actor(gen:u64)->Identity{Identity{pid:7,generation:gen}}
+ fn peer()->TcpPeer{TcpPeer{address:[1,1,1,1],port:443}}
+ #[test]fn establish_only_within_authenticated_peer_deadline(){
+  let mut t=ConnectionTable::<2>::new();
+  t.begin(actor(1),6000,peer(),10,10).unwrap();
+  assert_eq!(t.established(actor(2),6000,peer(),19),Err(Error::NotFound));
+  t.established(actor(1),6000,peer(),20).unwrap();
+  assert!(t.verified(actor(1),6000,peer()));
+  assert!(!t.verified(actor(2),6000,peer()));
+ }
+ #[test]fn retries_are_bounded_and_time_gated(){
+  let mut t=ConnectionTable::<1>::new();
+  t.begin(actor(1),6000,peer(),0,10).unwrap();
+  assert_eq!(t.retry(actor(1),6000,peer(),9,10),Err(Error::Denied));
+  assert_eq!(t.retry(actor(1),6000,peer(),10,10),Ok(1));
+  assert_eq!(t.retry(actor(1),6000,peer(),20,10),Ok(2));
+  assert_eq!(t.retry(actor(1),6000,peer(),30,10),Ok(3));
+  assert_eq!(t.retry(actor(1),6000,peer(),40,10),Err(Error::RetryExhausted));
+ }
+ #[test]fn process_reap_preserves_other_generation_connection(){
+  let mut t=ConnectionTable::<2>::new();
+  t.begin(actor(1),6000,peer(),0,10).unwrap();
+  t.begin(actor(2),6001,peer(),0,10).unwrap();
+  assert_eq!(t.retire(actor(1)),1);
+  assert_eq!(t.established(actor(1),6000,peer(),5),Err(Error::NotFound));
+  assert_eq!(t.established(actor(2),6001,peer(),5),Ok(()));
+ }
+}
