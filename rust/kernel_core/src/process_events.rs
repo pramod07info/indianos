@@ -322,3 +322,97 @@ mod r010_smp_migration_tests{
   assert_eq!(tiny,[job(99,1)]);
  }
 }
+
+ 
+/// R011 affinity-aware admission. CPU masks represent slots 0..63 and are
+/// selected only by a trusted scheduler after authenticating the process.
+impl<const C:usize,const N:usize> CoreRunQueues<C,N>{
+ pub fn enqueue_affine(&mut self,task:Runnable,allowed:u64)
+  ->Result<usize,DispatchError>{
+  if task.pid==0||task.generation==0||allowed==0||C==0{
+   return Err(DispatchError::InvalidTask);
+  }
+  if self.queues.iter().flatten().flatten().any(|known|
+     known.pid==task.pid&&known.generation==task.generation){
+   return Err(DispatchError::Duplicate);
+  }
+  let mut chosen=None;
+  for cpu in 0..C.min(64){
+   if allowed&(1u64<<cpu)==0||self.length[cpu]>=N{continue;}
+   if chosen.is_none_or(|current:usize|self.length[cpu]<self.length[current]){
+    chosen=Some(cpu);
+   }
+  }
+  let cpu=chosen.ok_or(DispatchError::Full)?;
+  self.enqueue(cpu,task)?;Ok(cpu)
+ }
+ /// Restrict cross-core migration by an explicit policy mask.
+ pub fn migrate_affine(&mut self,from:usize,to:usize,
+  task:Runnable,allowed:u64)->Result<(),DispatchError>{
+  if to>=64||allowed&(1u64<<to)==0{return Err(DispatchError::InvalidTask);}
+  self.migrate(from,to,task.pid,task.generation)
+ }
+ /// Fair round-robin scan for tasks meeting a priority threshold. Avoids
+ /// starvation by allowing trusted scheduler to lower the threshold.
+ pub fn next_eligible(&mut self,cpu:usize,minimum_priority:u8)
+  ->Result<Runnable,DispatchError>{
+  if cpu>=C{return Err(DispatchError::InvalidCpu);}
+  let count=self.length[cpu];
+  if count==0{return Err(DispatchError::Empty);}
+  for offset in 0..count{
+   let i=(self.cursor[cpu]+offset)%count;
+   if let Some(task)=self.queues[cpu][i]{
+    if task.priority>=minimum_priority{
+     self.cursor[cpu]=(i+1)%count;return Ok(task);
+    }
+   }
+  }
+  Err(DispatchError::Empty)
+ }
+ pub fn retire_all_epochs(&mut self,pid:u32)->usize{
+  if pid==0{return 0;}
+  let mut ids=[(0u32,0u64);0];let _=&mut ids;
+  let mut removed=0;
+  for cpu in 0..C{
+   let mut i=0;
+   while i<self.length[cpu]{
+    if self.queues[cpu][i].is_some_and(|task|task.pid==pid){
+     let generation=self.queues[cpu][i].unwrap().generation;
+     removed+=self.evict(pid,generation);
+     i=0;
+   }else{i+=1;}
+   }
+  }
+  removed
+ }
+}
+#[cfg(test)]
+mod r011_affinity_tests{
+ use super::*;
+ fn j(pid:u32,p:u8)->Runnable{Runnable{pid,generation:1,priority:p}}
+ #[test]fn least_loaded_eligible_cpu_is_selected_without_duplicate(){
+  let mut q=CoreRunQueues::<3,2>::new();
+  assert_eq!(q.enqueue_affine(j(1,2),0b011),Ok(0));
+  assert_eq!(q.enqueue_affine(j(2,3),0b011),Ok(1));
+  assert_eq!(q.enqueue_affine(j(3,4),0b100),Ok(2));
+  assert_eq!(q.enqueue_affine(j(3,4),0b100),Err(DispatchError::Duplicate));
+ }
+ #[test]fn invalid_affinity_migration_and_capacity_preserve_state(){
+  let mut q=CoreRunQueues::<2,1>::new();
+  q.enqueue(0,j(1,2)).unwrap();q.enqueue(1,j(2,2)).unwrap();
+  assert_eq!(q.enqueue_affine(j(3,2),0b11),Err(DispatchError::Full));
+  assert_eq!(q.migrate_affine(0,1,j(1,2),0b01),Err(DispatchError::InvalidTask));
+  assert_eq!(q.next(0),Ok(j(1,2)));
+ }
+ #[test]fn eligible_rr_threshold_and_all_epoch_cleanup(){
+  let mut q=CoreRunQueues::<2,3>::new();
+  q.enqueue(0,j(4,1)).unwrap();
+  q.enqueue(0,j(5,3)).unwrap();
+  q.enqueue(1,Runnable{pid:4,generation:2,priority:3}).unwrap();
+  assert_eq!(q.next_eligible(0,3),Ok(j(5,3)));
+  assert_eq!(q.next_eligible(0,4),Err(DispatchError::Empty));
+  assert_eq!(q.retire_all_epochs(4),2);
+  assert_eq!(q.next(0),Ok(j(5,3)));
+  assert_eq!(q.next(1),Err(DispatchError::Empty));
+ }
+}
