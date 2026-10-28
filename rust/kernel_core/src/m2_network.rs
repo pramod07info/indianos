@@ -794,7 +794,7 @@ pub fn permit_https<const N:usize,const P:usize,V:TlsCertificateVerifier>(
  now:u64,hostname:&[u8],certificate:&[u8],verifier:&V
 )->Result<(),Error>{
  if !peer.valid()||peer.port!=443||
-   !connections.verified(actor,local_port,peer){
+   !connections.verified_at(actor,local_port,peer,now){
   return Err(Error::Denied);
  }
  endpoint.allow_tls(actor,local_port,now,hostname,certificate,verifier)
@@ -844,5 +844,71 @@ mod r012_secure_network_tests{
   let stale=Identity{generation:3,..owner()};
   assert!(!connections.verified(stale,6000,peer()));
   assert_eq!(connections.established_count(stale),0);
+ }
+}
+
+/// R013 expiry-aware TCP lease management. A connected session must be
+/// renewed by the trusted network service before its deadline; an old
+/// 'established' bit alone cannot authorize an OTA HTTPS request forever.
+impl<const N:usize> ConnectionTable<N>{
+ pub fn verified_at(&self,actor:Identity,port:u16,peer:TcpPeer,now:u64)
+   ->bool{
+  self.leases.iter().flatten().any(|s|
+   s.actor==actor&&s.local_port==port&&s.peer==peer&&
+   s.established&&now<=s.deadline)
+ }
+ pub fn keepalive_authenticated(&mut self,actor:Identity,port:u16,
+   peer:TcpPeer,now:u64,extension:u64)->Result<u64,Error>{
+  if actor.pid==0||actor.generation==0||extension==0{
+   return Err(Error::Invalid);
+  }
+  let lease=self.leases.iter_mut().flatten().find(|s|
+    s.actor==actor&&s.local_port==port&&s.peer==peer)
+    .ok_or(Error::NotFound)?;
+  if !lease.established||now>lease.deadline{return Err(Error::Denied);}
+  let new_deadline=now.checked_add(extension).ok_or(Error::Invalid)?;
+  if new_deadline<=lease.deadline{return Err(Error::Invalid);}
+  lease.deadline=new_deadline;Ok(new_deadline)
+ }
+ pub fn purge_stale(&mut self,now:u64)->usize{
+  let mut count=0;
+  for slot in &mut self.leases{
+   if slot.is_some_and(|s|now>s.deadline){*slot=None;count+=1;}
+  }
+  count
+ }
+}
+#[cfg(test)]
+mod r013_network_expiration_tests{
+ use super::*;
+ fn id(g:u64)->Identity{Identity{pid:70,generation:g}}
+ fn peer()->TcpPeer{TcpPeer{address:[4,4,4,4],port:443}}
+ #[test]fn idle_tls_connection_expires_without_authenticated_renewal(){
+  let mut t=ConnectionTable::<1>::new();
+  t.begin(id(1),5555,peer(),5,10).unwrap();
+  t.established(id(1),5555,peer(),10).unwrap();
+  assert!(t.verified_at(id(1),5555,peer(),15));
+  assert!(!t.verified_at(id(1),5555,peer(),16));
+  assert_eq!(t.purge_stale(16),1);
+  assert!(!t.verified_at(id(1),5555,peer(),16));
+ }
+ #[test]fn authenticated_keepalive_fences_wrong_epoch_and_timestamps(){
+  let mut t=ConnectionTable::<1>::new();
+  t.begin(id(1),5555,peer(),5,10).unwrap();
+  t.established(id(1),5555,peer(),10).unwrap();
+  assert_eq!(t.keepalive_authenticated(id(2),5555,peer(),12,10),
+    Err(Error::NotFound));
+  assert_eq!(t.keepalive_authenticated(id(1),5555,peer(),12,20),Ok(32));
+  assert!(t.verified_at(id(1),5555,peer(),30));
+  assert_eq!(t.keepalive_authenticated(id(1),5555,peer(),33,10),
+    Err(Error::Denied));
+ }
+ #[test]fn bounded_reuse_of_expired_socket_slot(){
+  let mut t=ConnectionTable::<1>::new();
+  t.begin(id(1),5555,peer(),0,3).unwrap();
+  assert_eq!(t.begin(id(2),5555,peer(),0,3),Err(Error::RetryExhausted));
+  assert_eq!(t.purge_stale(4),1);
+  t.begin(id(2),5555,peer(),4,3).unwrap();
+  assert_eq!(t.active(),1);
  }
 }
