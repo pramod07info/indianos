@@ -1029,23 +1029,23 @@ impl<D:BlockDevice> HierVfs<D>{
   f.create("/a",b"alpha").unwrap();f.create("/b",b"beta").unwrap();f
  }
  #[test]fn valid_pair_returns_both_files(){
-  let mut f=setup();let mut a=[0;8];let mut b=[0;8];
-  assert_eq!(f.read_pair_atomic("/a","/b",f.generation(),
+  let mut f=setup();let g=f.generation();let mut a=[0;8];let mut b=[0;8];
+  assert_eq!(f.read_pair_atomic("/a","/b",g,
     &mut a,&mut b),Ok((5,4)));
   assert_eq!(&a[..5],b"alpha");assert_eq!(&b[..4],b"beta");
  }
  #[test]fn failed_second_read_does_not_expose_first(){
-  let mut f=setup();let mut a=[9;8];let mut b=[8;8];
-  assert!(f.read_pair_atomic("/a","/missing",f.generation(),
+  let mut f=setup();let g=f.generation();let mut a=[9;8];let mut b=[8;8];
+  assert!(f.read_pair_atomic("/a","/missing",g,
     &mut a,&mut b).is_err());
   assert_eq!(a,[9;8]);assert_eq!(b,[8;8]);
  }
  #[test]fn stale_and_short_output_fail_before_copy(){
-  let mut f=setup();let mut short=[7u8;1];let mut b=[8;8];
-  assert!(f.read_pair_atomic("/a","/b",f.generation(),
+  let mut f=setup();let g=f.generation();let mut short=[7u8;1];let mut b=[8;8];
+  assert!(f.read_pair_atomic("/a","/b",g,
     &mut short,&mut b).is_err());
   assert_eq!(short,[7]);assert_eq!(b,[8;8]);
-  assert!(f.read_pair_atomic("/a","/b",f.generation()+1,
+  assert!(f.read_pair_atomic("/a","/b",g+1,
     &mut short,&mut b).is_err());
  }
 }
