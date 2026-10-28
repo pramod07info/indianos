@@ -109,8 +109,8 @@ shaping with properly licensed fonts.
 | UX05 | P1 | Desktop / **Home Canvas** edition | Functional home, application launcher, file manager, search, settings, notifications and update/recovery screens; real working navigation and QEMU screenshot + interaction evidence rather than static mocks |
 | UX06 | P1 | Developer Workstation / **Workgrid** edition | Resizable project workspaces, terminal, Git/build/test feedback and project session restore; integrate service/database/debugging panels only when underlying backends exist; automated workflow tests |
 | UX07 | P1 | Server / **Ops Plane** edition | Headless boot with optional authenticated remote admin: services, deployments, metrics, logs, network, security, backups and recovery; prove server operation without a graphical UI and permission/audit tests |
-| UX08 | P1 | Unified, hardware-aware installer and edition selection | Detect supported CPU/firmware/storage, explain device/partition impact, select Desktop/Developer/Server profile, refuse unsupported devices and destructive defaults; disposable-QEMU-disk install/rollback tests before real hardware |
-| UX09 | P1 | Shared edition profiles and service/package manifests | One kernel, separate default services/UI; Server excludes heavyweight desktop by default; switching/add-on features uses validated packages and never bypasses permission checks |
+| UX08 | P1 | Unified, hardware-aware installer and edition selection | Detect supported CPU/firmware/storage; offer Desktop/Developer/Server/All-in-One and custom multi-select; preview package footprint and partition effects, refuse unsupported devices and unsafe defaults; disposable-QEMU-disk rollback tests before physical hardware |
+| UX09 | P1 | Shared edition profiles and service/package manifests | One kernel with signed declarative profile manifests and dependency resolution; Server excludes GUI by default, All-in-One installs all selected bundles but enables services only by policy; reversible add/remove never bypasses permissions |
 | UX10 | P1 | Unified files and app-install experience | VFS file-picker and permissions design, tested filesystem drivers, truthful supported-format checks, signed native app installation; do not imply that `.exe`, `.app`, `.deb` or `.apk` runs merely from its extension |
 | UX11 | P1 | Accessibility, multilingual and responsive UX validation | English/Hindi flows, Indic input/text shaping, keyboard-only operation, screen-reader hooks, scaling, contrast, reduced motion, error guidance; tested across all three editions |
 | UX12 | P1 | Updates, security and recovery UX | Clear staged/verified updates, user-visible approval for disruptive changes, signed packages, rollback and recovery flows; test interrupted update and failed signature behavior |
@@ -129,6 +129,32 @@ shaping with properly licensed fonts.
 each displayed feature must have a real event-to-visible-result path, documented
 fallback/error handling, applicable security checks and reproducible QEMU or
 hardware evidence. Preserve existing kernel, boot and CI regressions.
+
+## Four installer presets / optional feature workflow (2026-10-28)
+
+**Product decision:** one IndianOS kernel, three functional editions, and
+**four installer presets**. The fourth preset **All-in-One** is the union of
+Desktop + Developer Workstation + Server *profiles*, **not** a fourth kernel,
+fourth independent operating system, or license to launch every service
+simultaneously. Detailed specification:
+[edition profiles & All-in-One plan](EDITION_PROFILES_AND_ALL_IN_ONE.md).
+
+| ID | Priority | Planned development task | Acceptance / evidence required |
+|---|---|---|---|
+| UX15 | P1 | All-in-One preset and combination-aware installer | Installer offers Desktop, Developer, Server and All-in-One; permits custom multi-select of all three, previews exact packages/services/disk impact and dependency conflicts; QEMU disposable-disk test with no silent destructive writes |
+| UX16 | P1 | Safe feature enable/disable and edition switching without reinstall | Signed, rollback-capable profile transactions; enabling Developer tools and Server services on Desktop retains user data; restart only when necessary; idempotence, disk-space, power-loss and rollback tests |
+| UX17 | P1 | On-demand services and measurable lightweight defaults | Service manifest declares required/on-demand/disabled/always-on policies; GUI not started in headless Server; idle services do not consume CPU/RAM; benchmark idle RAM/disk/boot time per preset and All-in-One; no unverified absolute targets |
+| UX18 | P1 | Resource governance for mixed Desktop + Developer + Server workloads | Per-service/group CPU, RAM, I/O and connection budgets when supported, admission control and observability; active server workload cannot silently exhaust desktop resources; preserve security isolation and prove overload/recovery tests |
+
+**Workflow integration:** complete K01–K07 kernel and userspace interface
+design review first; implement manifest schema/service supervisor and signed
+package transactions, then installer UX and headless Server. Test Desktop,
+Developer, Server, All-in-One and custom combinations on the **same kernel
+revision**. Do not run unused compatibility VMs, heavy IDEs, databases or
+containers just because the packages are installed. Servers may run in the
+background **only when explicitly enabled** with visible controls and quotas.
+Failures must preserve the last working profile. Keep the M1–M5 milestone
+gates authoritative.
 
 ## Commit / validation policy
 

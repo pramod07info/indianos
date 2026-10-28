@@ -124,6 +124,33 @@ repeatable quality/security tests. No universal compatibility claim.
 **M5 exit:** A maintainable, signed, supportable public OS release passes
 the published hardware, accessibility, reliability and security criteria.
 
+## Cross-edition delivery track (planned, not yet implemented)
+
+Detailed behavior: [edition profiles & All-in-One specification](EDITION_PROFILES_AND_ALL_IN_ONE.md).
+**One kernel, three editions, four installer presets:** Desktop, Developer
+Workstation, Server and **All-in-One** (combined bundle). Users may also select
+individual combinations. Four presets do **not** create four kernels.
+
+- [ ] **M1 dependency:** stable normal boot/PID1/service supervisor and
+      filesystem foundations required for persistent profile configuration.
+      Do not delay mandatory M1 safety/boot acceptance for installer polish.
+- [ ] **M2 work:** versioned signed profile/package manifests, dependency
+      resolver, on-demand lifecycle, safe enable/disable of developer tools and
+      optional server services; verify non-destructive transitions.
+- [ ] **M3 work:** secure hardware-aware installer with all four presets,
+      warnings and confirmation before partition changes, tested rollback and
+      resource constraints with real hardware evidence.
+- [ ] **M3+/M5 validation:** measure idle RAM, storage, startup and background
+      workload interference for each preset; headless Server must operate
+      without GUI; All-in-One must not start unneeded services/VMs by default.
+- [ ] Never call the full combination lightweight without published tests;
+      workloads such as IDEs, Java servers, VMs and databases have additional
+      RAM/CPU/storage requirements beyond the installed OS baseline.
+
+All-in-One is a **feature-selection and service-policy** concern; the native
+IndianOS kernel remains shared. Existing milestone exit conditions are
+unchanged.
+
 ## M1 development branch policy
 
 1. Work in a new M1 feature branch from the last verified main SHA.

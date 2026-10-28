@@ -163,6 +163,37 @@ that the features below are implemented or safe on physical hardware.
 - One substantial, reviewable commit per coherent implementation batch,
   followed by integration-branch checks and final-main SHA verification.
 
+## 11A. Optional edition profiles, shared kernel and resource policy
+
+**Design target, not currently implemented.** Desktop, Developer Workstation,
+and Server are userland feature profiles, while **All-in-One** is a combined
+installer preset. Installing three profiles does not load three kernels.
+Kernel interface contracts must support service/process isolation, optional
+headless boot, resource accounting, quotas, shared on-disk packages and
+rollback; none should require the kernel to know edition branding.
+
+- A signed versioned manifest identifies required/optional packages, enabled,
+  on-demand and disabled services, configuration migrations and dependencies.
+- The effective set is a validated **union** of selected profiles; conflicts
+  must be presented before installation, not silently overridden.
+- Core kernel and mandatory security/recovery services cannot be disabled
+  by a profile. GUI/compositor is optional; Server can boot headless.
+- Installing a database/runtime/VM must **not** start it by default. A server
+  can stay active in the background when user explicitly chooses always-on
+  deployment, with status, limits and audit controls.
+- Define scheduling/accounting interfaces for memory, CPU time, I/O and
+  network quotas. Prefer safe admission/failure over unbounded resource
+  exhaustion; full quota enforcement depends on later implementation.
+- Profile activation/deactivation is a transaction using verified packages,
+  dependency checks, user-data preservation, rollback and recovery. Profile
+  switching must not change disk partitions automatically.
+- Accept each preset and a full three-profile combination under the same
+  kernel build with idle/loaded performance measurements and regressions.
+
+See [edition profiles & All-in-One plan](EDITION_PROFILES_AND_ALL_IN_ONE.md)
+and backlog UX08–UX09 / UX15–UX18. These requirements extend K02/K03/K06/K07
+design reviews without changing current verified QEMU claims.
+
 ## 12. Architecture-freeze readiness checklist
 
 Architecture v1 can be labeled **reviewed/frozen** only when:
