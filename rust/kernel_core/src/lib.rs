@@ -29,6 +29,8 @@ pub mod workstation_r021;
 pub mod workstation_r022;
 /// R023: real guest file scaffold/editor/search/terminal APIs and integrated developer acceptance.
 pub mod workstation_r023;
+/// R024: real RAM file manager, source editor, restricted shell and workstation test integration.
+pub mod workstation_r024;
 mod syscall;
 mod program;
 mod initramfs;
