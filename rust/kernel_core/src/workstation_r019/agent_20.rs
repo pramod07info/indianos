@@ -42,7 +42,7 @@ pub fn smoke()->Result<(),Error>{
  let mut release=agent_19::Release::new(7,1,2,[1;32],1)?;
  release.record_checks(7,true,true)?;
  release.review(8)?;release.approve(8)?;
- let mut payload=[0u8;48];release.publish_manifest(true,&mut payload)?;
+ let mut payload=[0u8;52];release.publish_manifest(true,&mut payload)?;
  if payload[0]!=1||staging.commit_index(7)!=1{return Err(Error::Conflict);}
  Ok(())
 }
