@@ -335,3 +335,59 @@ mod r006_snapshot_tests{
   fs.import_snapshot(&image).unwrap();assert_eq!(fs.count(),0);
  }
 }
+
+
+/// R017 editor writes using a file-system revision precondition. A rejected
+/// change leaves the old bytes and sequence intact. RAM is not durable disk.
+impl<const N:usize> RamFs<N>{
+ pub fn save_if_revision(&mut self,path:&[u8],data:&[u8],expected:u64)
+  ->Result<u64,Error>{
+  if self.version!=expected{return Err(Error::Invalid);}
+  self.replace(path,data)
+ }
+ pub fn append_if_revision(&mut self,path:&[u8],suffix:&[u8],expected:u64)
+  ->Result<u64,Error>{
+  if self.version!=expected{return Err(Error::Invalid);}
+  let i=self.lookup(path).ok_or(Error::NotFound)?;
+  let entry=self.files[i].ok_or(Error::NotFound)?;
+  let end=entry.data_len.checked_add(suffix.len()).ok_or(Error::Invalid)?;
+  if end>CONTENT_MAX{return Err(Error::Invalid);}
+  let mut tmp=[0u8;CONTENT_MAX];
+  tmp[..entry.data_len].copy_from_slice(&entry.data[..entry.data_len]);
+  tmp[entry.data_len..end].copy_from_slice(suffix);
+  self.replace(path,&tmp[..end])
+ }
+ pub fn truncate_if_revision(&mut self,path:&[u8],len:usize,expected:u64)
+  ->Result<u64,Error>{
+  if self.version!=expected{return Err(Error::Invalid);}
+  let i=self.lookup(path).ok_or(Error::NotFound)?;
+  let entry=self.files[i].ok_or(Error::NotFound)?;
+  if len>entry.data_len{return Err(Error::Invalid);}
+  self.replace(path,&entry.data[..len])
+ }
+}
+#[cfg(test)]mod r017_editor_save_tests{
+ use super::*;
+ #[test]fn save_append_truncate_same_file_preserves_bytes(){
+  let mut f=RamFs::<1>::new();
+  f.save_if_revision(b"/code",b"main",0).unwrap();
+  f.append_if_revision(b"/code",b".rs",1).unwrap();
+  f.truncate_if_revision(b"/code",4,2).unwrap();
+  let mut out=[0;8];assert_eq!(f.read(b"/code",0,&mut out),Ok(4));
+  assert_eq!(&out[..4],b"main");
+ }
+ #[test]fn stale_editor_save_does_not_overwrite_newer_revision(){
+  let mut f=RamFs::<1>::new();f.replace(b"/code",b"new").unwrap();
+  assert_eq!(f.save_if_revision(b"/code",b"old",0),Err(Error::Invalid));
+  assert_eq!(f.append_if_revision(b"/code",b"bad",0),Err(Error::Invalid));
+  assert_eq!(f.version(),1);
+ }
+ #[test]fn overcapacity_append_does_not_truncate_or_modify(){
+  let mut f=RamFs::<1>::new();
+  f.replace(b"/code",&[b'a';CONTENT_MAX]).unwrap();
+  assert_eq!(f.append_if_revision(b"/code",b"x",1),Err(Error::Invalid));
+  assert_eq!(f.truncate_if_revision(b"/code",CONTENT_MAX+1,1),
+   Err(Error::Invalid));
+  assert_eq!(f.version(),1);
+ }
+}

@@ -130,3 +130,69 @@ pub fn preview<D:BlockDevice,const APPS:usize,const G:usize>(
   assert_eq!(card(&catalog,&mut i,&acl,viewer,31,9),Err(Error::Denied));
  }
 }
+
+
+/// R017 developer workstation app catalog: snapshot the installed and
+/// available versions of several tools before publishing any UI cards.
+pub fn cards_batch<D:BlockDevice,const APPS:usize,const G:usize>(
+ catalog:&Catalog<APPS>,inventory:&mut Inventory<D>,
+ auth:&Access<G>,viewer:Identity,now:u64,ids:&[u32],
+ out:&mut[AppCard])->Result<usize,Error>{
+ if ids.is_empty()||ids.len()>APPS||ids.len()>out.len(){
+  return Err(Error::Unknown);
+ }
+ let empty=AppCard{id:0,available:0,installed:0,rights:0,
+  state:State::NotInstalled};
+ let mut staged=[empty;APPS];
+ for (i,&id) in ids.iter().enumerate(){
+  if id==0||ids[..i].contains(&id){return Err(Error::Unknown);}
+  staged[i]=card(catalog,inventory,auth,viewer,now,id)?;
+ }
+ out[..ids.len()].copy_from_slice(&staged[..ids.len()]);
+ Ok(ids.len())
+}
+pub fn updates_available(cards:&[AppCard])->usize{
+ cards.iter().filter(|c|c.state==State::UpdateAvailable).count()
+}
+#[cfg(test)]mod r017_app_catalog_tests{
+ use super::*;use crate::block::{BlockError,SECTOR_BYTES};
+ use crate::m2_sdk::{Package,ABI};
+ struct Disk([[u8;SECTOR_BYTES];100]);
+ impl BlockDevice for Disk{
+  fn sector_count(&self)->u64{100}
+  fn read_sector(&mut self,l:u64,b:&mut[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{*b=*self.0.get(l as usize).ok_or(BlockError::OutOfRange)?;Ok(())}
+  fn write_sector(&mut self,l:u64,b:&[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{*self.0.get_mut(l as usize).ok_or(BlockError::OutOfRange)?=*b;Ok(())}
+ }
+ fn fixture()->(Catalog<2>,Inventory<Disk>,Access<1>,Identity){
+  let mut c=Catalog::<2>::new();
+  for id in [1,2]{c.add(Package{id,version:2,abi:ABI,rights:VIEW,
+   deps:[0;4],payload_digest:[id as u8;32]}).unwrap();}
+  let mut inv=Inventory::from_mounted(
+    crate::hier_vfs::HierVfs::format_blank(Disk([[0;SECTOR_BYTES];100])).unwrap());
+  inv.init_directory().unwrap();
+  let id=Identity{pid:7,generation:1};
+  let mut acl=Access::<1>::new();acl.grant(id,VIEW,100).unwrap();
+  (c,inv,acl,id)
+ }
+ #[test]fn two_tools_return_consistent_catalog_cards(){
+  let (c,mut inv,acl,id)=fixture();
+  let empty=AppCard{id:0,available:0,installed:0,rights:0,state:State::NotInstalled};
+  let mut out=[empty;2];
+  assert_eq!(cards_batch(&c,&mut inv,&acl,id,1,&[1,2],&mut out),Ok(2));
+  assert_eq!(out[0].available,2);assert_eq!(out[1].id,2);
+  assert_eq!(updates_available(&out),0);
+ }
+ #[test]fn unknown_second_package_does_not_publish_first(){
+  let (c,mut inv,acl,id)=fixture();
+  let empty=AppCard{id:99,available:0,installed:0,rights:0,state:State::NotInstalled};
+  let mut out=[empty;2];
+  assert_eq!(cards_batch(&c,&mut inv,&acl,id,1,&[1,50],&mut out),Err(Error::Unknown));
+  assert_eq!(out,[empty;2]);
+ }
+ #[test]fn expired_viewer_cannot_read_tool_inventory(){
+  let (c,mut inv,acl,id)=fixture();let mut out=[];
+  assert!(cards_batch(&c,&mut inv,&acl,id,101,&[1],&mut out).is_err());
+ }
+}

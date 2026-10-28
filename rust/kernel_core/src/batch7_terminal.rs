@@ -282,3 +282,48 @@ mod r006_shell_files_tests{
   assert_eq!(fs.count(),1);
  }
 }
+
+
+/// R017 interactive terminal edit buffer. This remains a bounded command
+/// editor and never invokes a host shell or an unsigned native executable.
+impl Terminal{
+ pub fn current_command(&self)->&[u8]{&self.line[..self.length]}
+ pub fn set_command(&mut self,text:&[u8])->Result<(),Error>{
+  if text.len()>COMMAND_MAX||text.iter().any(|b|
+      *b!=b' '&&!b.is_ascii_graphic()){return Err(Error::Invalid);}
+  let mut staged=[0;COMMAND_MAX];
+  staged[..text.len()].copy_from_slice(text);
+  self.line=staged;self.length=text.len();Ok(())
+ }
+ pub fn erase_word(&mut self)->usize{
+  let old=self.length;
+  while self.length>0&&self.line[self.length-1]==b' '{
+   self.backspace();
+  }
+  while self.length>0&&self.line[self.length-1]!=b' '{
+   self.backspace();
+  }
+  old-self.length
+ }
+ pub fn clear_command(&mut self){self.line=[0;COMMAND_MAX];self.length=0;}
+}
+#[cfg(test)]mod r017_terminal_editor_tests{
+ use super::*;
+ #[test]fn replacing_and_editing_line_is_deterministic(){
+  let mut t=Terminal::new();t.set_command(b"build src/main").unwrap();
+  assert_eq!(t.erase_word(),8);assert_eq!(t.current_command(),b"build ");
+  t.type_byte(b'x').unwrap();assert_eq!(t.current_command(),b"build x");
+  t.clear_command();assert!(t.current_command().is_empty());
+ }
+ #[test]fn malformed_or_overlong_edit_is_atomic(){
+  let mut t=Terminal::new();t.set_command(b"safe").unwrap();
+  assert_eq!(t.set_command(b"oops\n"),Err(Error::Invalid));
+  assert_eq!(t.set_command(&[b'a';COMMAND_MAX+1]),Err(Error::Invalid));
+  assert_eq!(t.current_command(),b"safe");
+ }
+ #[test]fn deleting_entire_word_on_empty_line_is_safe(){
+  let mut t=Terminal::new();assert_eq!(t.erase_word(),0);
+  t.set_command(b"one").unwrap();assert_eq!(t.erase_word(),3);
+  assert!(t.current_command().is_empty());
+ }
+}

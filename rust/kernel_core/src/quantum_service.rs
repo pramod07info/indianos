@@ -778,3 +778,52 @@ impl<const N:usize> QuantumWorkBudget<N>{
   assert_eq!(b.remaining(id(1,2)),Some(2));
  }
 }
+
+
+/// R017 developer CPU simulator panel. QuantumWorkBudget tracks scheduling
+/// credits for CPU simulation only; no QPU/accelerator is activated.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct ComputeCredit{pub owner:Identity,pub remaining:u16}
+impl<const N:usize> QuantumWorkBudget<N>{
+ pub fn credit_snapshot(&self,out:&mut[ComputeCredit])
+  ->Result<usize,ServiceError>{
+  let count=self.grants.iter().flatten().count();
+  if count>out.len(){return Err(ServiceError::Queue(QueueError::Full));}
+  let mut at=0;
+  for ticket in self.grants.iter().flatten(){
+   out[at]=ComputeCredit{owner:ticket.owner,
+    remaining:ticket.credits.saturating_sub(ticket.consumed)};
+   at+=1;
+  }
+  Ok(at)
+ }
+ pub fn exhausted_owners(&self)->usize{
+  self.grants.iter().flatten().filter(|t|t.consumed>=t.credits).count()
+ }
+}
+#[cfg(test)]mod r017_simulator_panel_tests{
+ use super::*;
+ fn id(n:u32)->Identity{Identity{pid:n,generation:1}}
+ #[test]fn credit_inventory_reflects_running_work(){
+  let mut b=QuantumWorkBudget::<2>::new();
+  b.admit_batch(&[(id(1),2),(id(2),1)]).unwrap();
+  b.charge(id(1)).unwrap();
+  let mut out=[ComputeCredit{owner:id(9),remaining:99};2];
+  assert_eq!(b.credit_snapshot(&mut out),Ok(2));
+  assert_eq!(out[0].remaining,1);assert_eq!(out[1].remaining,1);
+  b.charge(id(2)).unwrap();assert_eq!(b.exhausted_owners(),1);
+ }
+ #[test]fn too_short_snapshot_does_not_modify_output(){
+  let mut b=QuantumWorkBudget::<2>::new();
+  b.admit_batch(&[(id(1),1),(id(2),1)]).unwrap();
+  let mut out=[ComputeCredit{owner:id(9),remaining:99};1];
+  assert!(b.credit_snapshot(&mut out).is_err());
+  assert_eq!(out[0].remaining,99);
+ }
+ #[test]fn retiring_old_generation_never_discloses_or_revokes_new_one(){
+  let mut b=QuantumWorkBudget::<2>::new();
+  b.admit_batch(&[(id(1),1),(Identity{generation:2,..id(1)},2)]).unwrap();
+  assert_eq!(b.retire_batch(&[id(1)]),Ok(1));
+  assert_eq!(b.remaining(Identity{generation:2,..id(1)}),Some(2));
+ }
+}

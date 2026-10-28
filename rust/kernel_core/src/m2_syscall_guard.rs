@@ -206,3 +206,48 @@ mod m2_tests{
  }
 
 }
+
+
+/// R017 workstation sandbox preflights a complete installed-app action
+/// sequence. The actual kernel syscall dispatcher still checks each call.
+impl Policy{
+ pub fn allow_workstation_batch<const N:usize>(&self,
+  grants:&crate::batch6_security::Access<N>,actor:Identity,now:u64,
+  actions:&[(u64,u64)])->bool{
+  !actions.is_empty()&&actions.len()<=32&&
+    actions.iter().all(|&(syscall,operation)|
+      self.allow_live(grants,actor,now,syscall,operation))
+ }
+ pub fn denied_workstation_action<const N:usize>(&self,
+  grants:&crate::batch6_security::Access<N>,actor:Identity,now:u64,
+  actions:&[(u64,u64)])->Option<usize>{
+  actions.iter().position(|&(syscall,operation)|
+    !self.allow_live(grants,actor,now,syscall,operation))
+ }
+}
+#[cfg(test)]mod r017_workstation_sandbox_tests{
+ use super::*;
+ use crate::batch6_security::{Access,FILE_READ,FILE_WRITE,VIEW};
+ fn id(g:u64)->Identity{Identity{pid:99,generation:g}}
+ #[test]fn valid_editor_read_write_uses_exact_live_rights(){
+  let p=Policy::new(id(1),VIEW|FILE_READ|FILE_WRITE).unwrap();
+  let mut g=Access::<1>::new();
+  g.grant(id(1),VIEW|FILE_READ|FILE_WRITE,50).unwrap();
+  assert!(p.allow_workstation_batch(&g,id(1),1,&[(12,0),(11,0)]));
+  assert_eq!(p.denied_workstation_action(&g,id(1),1,&[(12,0),(11,0)]),None);
+ }
+ #[test]fn unknown_privileged_syscall_is_denied_inside_batch(){
+  let p=Policy::new(id(1),VIEW|FILE_READ).unwrap();
+  let mut g=Access::<1>::new();g.grant(id(1),VIEW|FILE_READ,50).unwrap();
+  assert!(!p.allow_workstation_batch(&g,id(1),1,&[(12,0),(30,0)]));
+  assert_eq!(p.denied_workstation_action(&g,id(1),1,&[(12,0),(30,0)]),
+    Some(1));
+ }
+ #[test]fn expired_or_recycled_identity_does_not_execute(){
+  let p=Policy::new(id(1),VIEW|FILE_READ).unwrap();
+  let mut g=Access::<1>::new();g.grant(id(1),VIEW|FILE_READ,5).unwrap();
+  assert!(!p.allow_workstation_batch(&g,id(2),1,&[(12,0)]));
+  assert!(!p.allow_workstation_batch(&g,id(1),5,&[(12,0)]));
+  assert!(!p.allow_workstation_batch(&g,id(1),1,&[]));
+ }
+}

@@ -1034,3 +1034,60 @@ impl<const N:usize> ConnectionTable<N>{
   assert_eq!(c.snapshot_owner(id(2),2,&mut short),Ok(0));
  }
 }
+
+
+/// R017 network development sessions require both live socket rights and
+/// an already authenticated local port for every outbound peer.
+impl<const N:usize> ConnectionTable<N>{
+ pub fn begin_group_authorized<const P:usize,const G:usize>(
+  &mut self,endpoint:&Endpoint<P>,auth:&Access<G>,
+  requests:&[(Identity,u16,TcpPeer,u64,u64)])->Result<usize,Error>{
+  if requests.is_empty()||requests.len()>N{return Err(Error::Invalid);}
+  let mut staged=Self{leases:self.leases};
+  for &(owner,port,peer,now,timeout) in requests{
+   staged.begin_authorized(endpoint,auth,owner,port,peer,now,timeout)?;
+  }
+  self.leases=staged.leases;Ok(requests.len())
+ }
+ pub fn session_deadlines(&self,owner:Identity,out:&mut[u64])
+  ->Result<usize,Error>{
+  if owner.pid==0||owner.generation==0{return Err(Error::Invalid);}
+  let count=self.leases.iter().flatten().filter(|l|l.actor==owner).count();
+  if count>out.len(){return Err(Error::RetryExhausted);}
+  let mut at=0;
+  for lease in self.leases.iter().flatten(){
+   if lease.actor==owner{out[at]=lease.deadline;at+=1;}
+  }
+  Ok(at)
+ }
+}
+#[cfg(test)]mod r017_workbench_sockets_tests{
+ use super::*;use crate::batch6_security::SOCKET;
+ fn id(g:u64)->Identity{Identity{pid:40,generation:g}}
+ fn peer(n:u8)->TcpPeer{TcpPeer{address:[8,8,8,n],port:443}}
+ #[test]fn two_allowed_dev_connections_commit_together(){
+  let mut c=ConnectionTable::<2>::new();let mut e=Endpoint::<2>::new();
+  let mut acl=Access::<1>::new();acl.grant(id(1),SOCKET,100).unwrap();
+  e.acquire(&acl,id(1),5000,1,100).unwrap();
+  e.acquire(&acl,id(1),5001,1,100).unwrap();
+  assert_eq!(c.begin_group_authorized(&e,&acl,&[
+   (id(1),5000,peer(1),2,20),(id(1),5001,peer(2),2,30)]),Ok(2));
+  let mut deadlines=[0;2];assert_eq!(c.session_deadlines(id(1),&mut deadlines),Ok(2));
+  assert_eq!(deadlines,[22,32]);
+ }
+ #[test]fn missing_second_port_fails_without_partial_connection(){
+  let mut c=ConnectionTable::<2>::new();let mut e=Endpoint::<2>::new();
+  let mut acl=Access::<1>::new();acl.grant(id(1),SOCKET,100).unwrap();
+  e.acquire(&acl,id(1),5000,1,100).unwrap();
+  assert!(c.begin_group_authorized(&e,&acl,&[
+   (id(1),5000,peer(1),2,20),(id(1),5001,peer(2),2,20)]).is_err());
+  assert_eq!(c.active_for(id(1)),0);
+ }
+ #[test]fn stale_pid_cannot_inspect_active_connection(){
+  let mut c=ConnectionTable::<1>::new();
+  c.begin(id(1),5000,peer(1),2,20).unwrap();
+  let mut dates=[77u64;1];
+  assert_eq!(c.session_deadlines(id(2),&mut dates),Ok(0));
+  assert_eq!(dates,[77]);
+ }
+}

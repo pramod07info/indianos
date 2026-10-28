@@ -322,3 +322,54 @@ mod m2_tests{
  }
 
 }
+
+
+/// R017 trusted developer-toolchain dependency planning. A dependency plan
+/// must be fully resolved before publishing required rights or package IDs.
+impl<const N:usize> Catalog<N>{
+ pub fn plan_toolchain(&self,root:u32,max_rights:u32,
+  ids:&mut[u32])->Result<(usize,u32),Error>{
+  if max_rights&!crate::batch6_security::ALL!=0{return Err(Error::Invalid);}
+  let mut staged=[0u32;N];let count=self.resolve(root,&mut staged)?;
+  if count>ids.len(){return Err(Error::Capacity);}
+  let mut rights=0u32;
+  for &id in &staged[..count]{
+   let p=self.get(id).ok_or(Error::Missing)?;
+   rights|=p.rights;
+  }
+  if rights&!max_rights!=0{return Err(Error::Invalid);}
+  ids[..count].copy_from_slice(&staged[..count]);
+  Ok((count,rights))
+ }
+ pub fn would_upgrade(&self,id:u32,target_version:u64)->Result<bool,Error>{
+  let current=self.get(id).ok_or(Error::Missing)?;
+  if target_version==0{return Err(Error::Invalid);}
+  Ok(target_version>current.version)
+ }
+}
+#[cfg(test)]mod r017_toolchain_plan_tests{
+ use super::*;
+ fn pkg(id:u32,deps:[u32;MAX_DEPS],rights:u32)->Package{
+  Package{id,version:1,abi:ABI,rights,deps,payload_digest:[id as u8;32]}
+ }
+ #[test]fn compiler_requires_dependency_before_plugin(){
+  let mut c=Catalog::<3>::new();c.add(pkg(1,[0;4],1)).unwrap();
+  c.add(pkg(2,[1,0,0,0],2)).unwrap();
+  let mut out=[0;3];
+  assert_eq!(c.plan_toolchain(2,3,&mut out),Ok((2,3)));
+  assert_eq!(&out[..2],&[1,2]);assert_eq!(c.would_upgrade(2,2),Ok(true));
+ }
+ #[test]fn missing_permission_does_not_publish_dependency_plan(){
+  let mut c=Catalog::<2>::new();c.add(pkg(1,[0;4],4)).unwrap();
+  let mut out=[99;2];
+  assert_eq!(c.plan_toolchain(1,1,&mut out),Err(Error::Invalid));
+  assert_eq!(out,[99;2]);
+ }
+ #[test]fn short_dependency_output_does_not_partially_commit(){
+  let mut c=Catalog::<2>::new();c.add(pkg(1,[0;4],1)).unwrap();
+  c.add(pkg(2,[1,0,0,0],1)).unwrap();
+  let mut out=[42;1];
+  assert_eq!(c.plan_toolchain(2,1,&mut out),Err(Error::Capacity));
+  assert_eq!(out,[42]);
+ }
+}

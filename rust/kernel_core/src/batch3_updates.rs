@@ -727,3 +727,47 @@ pub fn recovery_record_matches(record:&[u8],slot:BootSlot,
   assert!(!recovery_record_matches(&old,BootSlot::A,10));
  }
 }
+
+
+/// R017 developer workstation update decisions. A UI hint cannot replace
+/// actual verified disk bytes, user consent, or a trusted bootloader.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct WorkstationUpdateStatus{
+ pub active:BootSlot,pub version_floor:u64,
+ pub pending_verified_at_boot:bool,pub restart_allowed:bool,
+}
+pub fn workstation_update_status(primary:&[u8],backup:&[u8],
+ minimum_version:u64,environment:UpdateEnvironment,
+ pending_image_trusted:bool)->Result<WorkstationUpdateStatus,UpdateError>{
+ let recovered=recover_mirrored_slots(primary,backup,minimum_version)?;
+ Ok(WorkstationUpdateStatus{
+  active:recovered.active(),version_floor:recovered.floor(),
+  // Checksum-backed metadata cannot authorize a pending image after reboot.
+  pending_verified_at_boot:false,
+  restart_allowed:environment.restart_approved||
+    !environment.active_user_session,
+ })
+}
+#[cfg(test)]mod r017_workstation_update_tests{
+ use super::*;
+ fn env()->UpdateEnvironment{UpdateEnvironment{
+  internet_authenticated:true,metered:false,allow_metered:false,
+  battery_percent:80,external_power:true,active_user_session:true,
+  restart_approved:false,selected_channel:Channel::Stable}}
+ #[test]fn active_workstation_does_not_restart_without_approval(){
+  let a=encode_slot_record(BootSlot::A,10,None);
+  let s=workstation_update_status(&a,&a,10,env(),true).unwrap();
+  assert!(!s.restart_allowed);assert!(!s.pending_verified_at_boot);
+ }
+ #[test]fn verified_record_and_explicit_restart_consent_allow_ui_action(){
+  let a=encode_slot_record(BootSlot::B,20,None);
+  let approved=UpdateEnvironment{restart_approved:true,..env()};
+  let s=workstation_update_status(&a,&a,10,approved,false).unwrap();
+  assert_eq!(s.active,BootSlot::B);assert_eq!(s.version_floor,20);
+  assert!(s.restart_allowed);
+ }
+ #[test]fn corrupt_or_downgraded_images_never_publish_update_status(){
+  let a=encode_slot_record(BootSlot::A,9,None);
+  assert!(workstation_update_status(&a,&[],10,env(),true).is_err());
+ }
+}

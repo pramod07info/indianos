@@ -419,3 +419,87 @@ impl<const P:usize,const E:usize,const W:usize,const K:usize,
  }
 }
 
+
+
+/// R017 developer workstation: the terminal script is guarded by a project
+/// revision. Failed validation must not alter files, frames or terminal output.
+impl<const P:usize,const E:usize,const W:usize,const K:usize,
+ const F:usize,const G:usize,const Q:usize> Workspace<P,E,W,K,F,G,Q>{
+ pub fn project_revision(&self,actor:Identity,now:u64)->Result<u64,Error>{
+  self.app_file_generation(actor,now)
+ }
+ pub fn run_project_commands(&mut self,actor:Identity,now:u64,
+  expected_revision:u64,commands:&[&[u8]],snapshot:&mut[u8],
+  out:&mut[u8])->Result<(usize,u64),Error>{
+  if self.project_revision(actor,now)?!=expected_revision{
+   return Err(Error::NotRunning);
+  }
+  let len=self.execute_script_visible(actor,now,commands,snapshot,out)?;
+  Ok((len,self.disk.version()))
+ }
+}
+#[cfg(test)]mod r017_project_workspace_tests{
+ use super::*;use crate::batch2_launcher::{Launch,Image};
+ use crate::batch2_settings::{Settings,Theme};
+ fn id(g:u64)->Identity{Identity{pid:2,generation:g}}
+ fn ready()->Workspace<3,3,2,2,3,2,8>{
+  let mut w=Workspace::new();
+  let mk=|p|Launch{pid:p,generation:1,image:Image{
+   image_id:p,entry:0x1000,mapped_end:0x2000,verified:true}};
+  w.initialize(Identity{pid:1,generation:1},mk(1),id(1),mk(2),
+   Settings{theme:Theme::Dark,pointer_speed:5,key_repeat:10},50,100).unwrap();w
+ }
+ #[test]fn versioned_script_creates_and_reads_actual_file(){
+  let mut w=ready();let mut s=[0u8;1024];let mut o=[0u8;OUTPUT_MAX];
+  let revision=w.project_revision(id(1),1).unwrap();
+  let (n,updated)=w.run_project_commands(id(1),1,revision,
+   &[b"write /src main",b"cat /src"],&mut s,&mut o).unwrap();
+  assert_eq!(n,4);assert_eq!(&o[..n],b"main");assert!(updated>revision);
+ }
+ #[test]fn stale_project_generation_never_changes_output(){
+  let mut w=ready();let mut s=[0;1024];let mut o=[7u8;OUTPUT_MAX];
+  assert!(w.run_project_commands(id(1),1,999,
+   &[b"write /src overwrite"],&mut s,&mut o).is_err());
+  assert_eq!(o,[7;OUTPUT_MAX]);assert_eq!(w.disk.count(),0);
+ }
+ #[test]fn recycled_process_cannot_read_project_revision(){
+  let w=ready();assert!(w.project_revision(id(2),1).is_err());
+ }
+}
+
+
+/// R017 integrated workstation smoke, exercised in Rust tests and the
+/// opt-in R041 QEMU guest. Uses real RAM file operations and UI damage
+/// bookkeeping, but does not claim a fully interactive ring-3 desktop.
+pub fn bounded_developer_workstation_smoke()->bool{
+ use crate::batch2_launcher::{Launch,Image};
+ use crate::batch2_settings::{Settings,Theme};
+ let init=Identity{pid:1,generation:1};
+ let actor=Identity{pid:2,generation:1};
+ let mk=|p|Launch{pid:p,generation:1,image:Image{
+    image_id:p,entry:0x1000,mapped_end:0x2000,verified:true}};
+ let mut ws=Workspace::<3,3,2,2,3,2,8>::new();
+ if ws.initialize(init,mk(1),actor,mk(2),
+   Settings{theme:Theme::Dark,pointer_speed:5,key_repeat:10},50,100).is_err(){
+   return false;
+ }
+ let revision=match ws.project_revision(actor,1){Ok(v)=>v,Err(_)=>return false};
+ let mut snapshot=[0u8;1024];let mut output=[0u8;OUTPUT_MAX];
+ let Ok((count,next))=ws.run_project_commands(actor,1,revision,
+   &[b"write /src main",b"cat /src"],&mut snapshot,&mut output) else {
+   return false;
+ };
+ if count!=4||&output[..count]!=b"main"||next<=revision{return false;}
+ // A stale editor revision cannot overwrite the latest project file.
+ if ws.disk.save_if_revision(b"/src",b"old",revision).is_ok(){return false;}
+ if ws.disk.append_if_revision(b"/src",b".rs",next).is_err(){return false;}
+ if ws.execute(actor,1,b"cat /src",&mut output)!=Ok(7)||
+    &output[..7]!=b"main.rs"{return false;}
+ ws.next_frame().is_ok()&&ws.next_frame().is_ok()&&ws.next_frame().is_err()
+}
+#[cfg(test)]mod r017_workstation_smoke_test{
+ use super::*;
+ #[test]fn guest_project_editing_and_frame_damage_are_integrated(){
+  assert!(bounded_developer_workstation_smoke());
+ }
+}

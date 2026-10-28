@@ -1060,3 +1060,51 @@ impl<const W:usize,const Q:usize> Broker<W,Q>{
  }
 }
 
+
+
+/// R017 developer UI input stream: acknowledge only a contiguous owner
+/// prefix after the compositor has safely applied it.
+impl<const W:usize,const Q:usize> Broker<W,Q>{
+ pub fn preview_workstation_input(&self,owner:u32,out:&mut[Event])
+  ->Result<usize,Error>{self.preview_events(owner,out)}
+ pub fn acknowledge_through(&mut self,owner:u32,serial:u32)
+  ->Result<usize,Error>{
+  if serial==0||!self.known(owner){return Err(Error::Unauthorized);}
+  let mut numbers=[0u32;Q];let mut count=0;
+  for event in self.events[..self.len].iter().flatten(){
+   if event.owner==owner&&event.sequence<=serial{
+    numbers[count]=event.sequence;count+=1;
+   }
+  }
+  if count==0{return Err(Error::Empty);}
+  if numbers[count-1]!=serial{return Err(Error::Unauthorized);}
+  self.acknowledge_events(owner,&numbers[..count])
+ }
+ pub fn pending_input_for(&self,owner:u32)->Result<usize,Error>{
+  self.pending_owner(owner)
+ }
+}
+#[cfg(test)]mod r017_workstation_input_stream_tests{
+ use super::*;
+ #[test]fn ack_owner_prefix_does_not_erase_peer_events(){
+  let mut b=Broker::<2,5>::new();b.grant(1,10).unwrap();b.grant(2,20).unwrap();
+  let first=b.post_focus(1,10).unwrap();let peer=b.post_focus(2,20).unwrap();
+  let last=b.post_pointer_focus(1,10).unwrap();
+  assert_eq!(b.acknowledge_through(1,last.sequence),Ok(2));
+  assert_eq!(b.peek(2),Ok(peer));assert_eq!(b.pending_input_for(1),Ok(0));
+  assert!(first.sequence<last.sequence);
+ }
+ #[test]fn invented_serial_is_denied_without_mutation(){
+  let mut b=Broker::<1,2>::new();b.grant(1,10).unwrap();
+  let ev=b.post_focus(1,10).unwrap();
+  assert_eq!(b.acknowledge_through(1,ev.sequence+1),
+    Err(Error::Unauthorized));assert_eq!(b.peek(1),Ok(ev));
+ }
+ #[test]fn preview_never_consumes_and_short_output_is_denied(){
+  let mut b=Broker::<1,2>::new();b.grant(1,10).unwrap();
+  b.post_focus(1,10).unwrap();b.post_pointer_focus(1,10).unwrap();
+  let mut out=[Event{owner:9,window:9,kind:9,sequence:9};1];
+  assert_eq!(b.preview_workstation_input(1,&mut out),Err(Error::Full));
+  assert_eq!(out[0].owner,9);assert_eq!(b.pending_input_for(1),Ok(2));
+ }
+}

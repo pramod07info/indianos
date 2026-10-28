@@ -77,3 +77,54 @@ mod tests{
         assert!(!t.owns(10,2,5));assert!(t.owns(10,3,5));
     }
 }
+
+
+/// R017 multi-window developer workspace: all requested geometry changes
+/// succeed together or the layout remains completely unchanged.
+impl<const N:usize> Windows<N>{
+ pub fn move_batch(&mut self,pid:u32,generation:u64,
+  updates:&[(u32,Rect)])->Result<usize,WindowError>{
+  if pid==0||generation==0||updates.is_empty()||updates.len()>N{
+   return Err(WindowError::Invalid);
+  }
+  let mut shadow=Self{slots:self.slots};
+  for (i,&(id,rect)) in updates.iter().enumerate(){
+   if updates[..i].iter().any(|(prior,_)|*prior==id){
+    return Err(WindowError::Duplicate);
+   }
+   shadow.move_to(pid,generation,id,rect)?;
+  }
+  self.slots=shadow.slots;Ok(updates.len())
+ }
+ pub fn tile_two(&mut self,pid:u32,generation:u64,
+  left:u32,right:u32)->Result<(),WindowError>{
+  if left==right{return Err(WindowError::Duplicate);}
+  let mid=WIDTH/2;
+  self.move_batch(pid,generation,&[
+   (left,Rect{x:0,y:0,w:mid,h:HEIGHT}),
+   (right,Rect{x:mid,y:0,w:WIDTH-mid,h:HEIGHT})
+  ])?;Ok(())
+ }
+}
+#[cfg(test)]mod r017_workstation_tiling_tests{
+ use super::*;
+ fn w(id:u32,p:u32)->Window{Window{pid:p,generation:1,id,
+  rect:Rect{x:1,y:1,w:100,h:100}}}
+ #[test]fn editor_and_terminal_tile_as_two_windows(){
+  let mut a=Windows::<2>::new();a.create(w(1,10)).unwrap();a.create(w(2,10)).unwrap();
+  a.tile_two(10,1,1,2).unwrap();
+  assert_eq!(a.get(1).unwrap().rect.w,WIDTH/2);
+  assert_eq!(a.get(2).unwrap().rect.x,WIDTH/2);
+ }
+ #[test]fn unauthorized_second_window_cannot_move_first(){
+  let mut a=Windows::<2>::new();a.create(w(1,10)).unwrap();a.create(w(2,11)).unwrap();
+  assert!(a.tile_two(10,1,1,2).is_err());
+  assert_eq!(a.get(1).unwrap().rect.x,1);
+ }
+ #[test]fn duplicate_ids_and_invalid_rectangle_fail_atomically(){
+  let mut a=Windows::<1>::new();a.create(w(1,10)).unwrap();
+  assert_eq!(a.move_batch(10,1,&[(1,Rect{x:0,y:0,w:10,h:10}),
+   (1,Rect{x:0,y:0,w:12,h:12})]),Err(WindowError::Invalid));
+  assert_eq!(a.get(1).unwrap().rect.x,1);
+ }
+}
