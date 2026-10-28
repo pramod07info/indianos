@@ -3,7 +3,8 @@
 use super::Error;
 use crate::batch5_session::Identity;
 use crate::batch7_ramfs::RamFs;
-use super::{agent_12,agent_17};
+use super::agent_12;
+use crate::workstation_r022::agent_17;
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 pub enum Action{ShowFiles,ReadFile,Search,OpenSettings,Build,RunTests}
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]

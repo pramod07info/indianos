@@ -53,7 +53,7 @@ pub fn as_str(token:&Token)->Result<&str,Error>{
 }
 pub fn render<const N:usize>(tokens:&[Token],out:&mut[u8;N])
  ->Result<usize,Error>{
- let mut stage=[0u8;N];let mut n=0;
+ let mut stage=[0u8;N];let mut n=0usize;
  for (i,t) in tokens.iter().enumerate(){
   let sep=if i==0{0}else{1};
   if n.checked_add(sep+t.len).is_none_or(|end|end>N){return Err(Error::Full);}

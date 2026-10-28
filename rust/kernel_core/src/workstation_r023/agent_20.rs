@@ -1,7 +1,8 @@
 //! R023/20: end-to-end RAM-backed Developer Workstation acceptance.
 //! Actual scaffold, edits, format, terminal, test/results, build and release.
 use super::{Error,agent_01,agent_03,agent_04,agent_05,agent_08,
- agent_10,agent_11,agent_12,agent_15,agent_16,agent_17,agent_18,agent_19};
+ agent_10,agent_11,agent_12,agent_15,agent_16,agent_18,agent_19};
+use crate::workstation_r022::agent_17;
 use crate::batch5_session::Identity;
 use crate::batch7_ramfs::RamFs;
 pub fn smoke()->Result<(),Error>{
@@ -32,7 +33,7 @@ pub fn smoke()->Result<(),Error>{
  // A diagnostic arrives from a trusted compiler and applies an exact fix.
  fs.replace(b"/p/issue.rs",b"retrun 1;").map_err(|_|Error::Full)?;
  let diagnostic=crate::workstation_r019::agent_04::parse(
-  b"/p/issue.rs:1:1:error unknown return")?;
+  b"/p/issue.rs:1:1:error unknown return").map_err(|_|Error::Invalid)?;
  let fix=agent_16::propose(&fs,&diagnostic,b"retrun",b"return")?;
  agent_16::apply(&mut fs,fix)?;
  let mut jobs=agent_10::Scheduler::<1>::new(7);
@@ -40,7 +41,7 @@ pub fn smoke()->Result<(),Error>{
  jobs.finish(true,1,0,2)?;
  let mut tests=agent_15::Results::<2>::new(7,2);
  tests.ingest(true,7,b"test source::smoke ... ok")?;
- if tests.finish(true,7)!=(1,0,0){return Err(Error::Conflict);}
+ if tests.finish(true,7)?!=(1,0,0){return Err(Error::Conflict);}
  let mut release=agent_19::Releases::<1>::new();
  release.prepare(7,1,&fs,[4;32],1,2)?;
  release.validate(true,7,1,&fs,&jobs,&tests)?;
