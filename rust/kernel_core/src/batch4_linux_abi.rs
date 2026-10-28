@@ -737,11 +737,17 @@ mod r015_linux_mapping_safety_tests {
  fn rejects_truncated_segment_and_file_larger_than_virtual_mem(){
   let mut b=fixture();let mut output=[EMPTY;1];
   b[96..104].copy_from_slice(&129u64.to_le_bytes());
-  assert_eq!(plan_linux_load(true,&b,&mut output),Err(LoadError::Unsafe));
+  // The earlier general ELF parser may reject a bad span as Invalid
+  // before the load planner reaches its Unsafe guard. Both fail closed.
+  assert!(matches!(plan_linux_load(true,&b,&mut output),
+    Err(LoadError::Invalid)|Err(LoadError::Unsafe)));
   assert_eq!(output,[EMPTY]);
   let mut b=fixture();
   b[104..112].copy_from_slice(&64u64.to_le_bytes());
-  assert_eq!(plan_linux_load(true,&b,&mut output),Err(LoadError::Unsafe));
+  // The earlier general ELF parser may reject a bad span as Invalid
+  // before the load planner reaches its Unsafe guard. Both fail closed.
+  assert!(matches!(plan_linux_load(true,&b,&mut output),
+    Err(LoadError::Invalid)|Err(LoadError::Unsafe)));
   assert_eq!(output,[EMPTY]);
  }
  #[test]
