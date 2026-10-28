@@ -197,3 +197,74 @@ pub fn stage_linux_segment(image:&[u8],region:LoadRegion,
  }
 
 }
+
+ 
+/// R009 syscall argument translation for a minimal, statically linked Linux
+/// process. This is a kernel-facing ABI adapter, NOT an ELF runtime: the
+/// native file service still needs to dispatch these validated operations.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum LinuxCall{
+ StdinRead{address:u64,length:u32},
+ StdoutWrite{fd:u32,address:u64,length:u32},
+ Close{fd:u32},
+ GetPid{pid:u32},
+ Exit{status:i32},
+}
+pub fn translate_stdio<const N:usize>(
+ auth:&crate::batch6_security::Access<N>,
+ actor:crate::batch5_session::Identity,now:u64,
+ number:u64,args:[u64;6],user_top:u64
+)->Result<LinuxCall,Error>{
+ let op=authorize(auth,actor,now,number,args[1],args[2],user_top)?;
+ match op{
+  Op::Read=>{
+   if args[0]!=0||args[2]>u32::MAX as u64{return Err(Error::Denied);}
+   Ok(LinuxCall::StdinRead{address:args[1],length:args[2] as u32})
+  },
+  Op::Write=>{
+   if !(args[0]==1||args[0]==2)||args[2]>u32::MAX as u64{
+    return Err(Error::Denied);
+   }
+   Ok(LinuxCall::StdoutWrite{fd:args[0] as u32,
+     address:args[1],length:args[2] as u32})
+  },
+  Op::Close=>{
+   if args[0]>2{return Err(Error::Denied);}
+   Ok(LinuxCall::Close{fd:args[0] as u32})
+  },
+  Op::GetPid=>Ok(LinuxCall::GetPid{pid:actor.pid}),
+  Op::Exit=>Ok(LinuxCall::Exit{status:args[0] as u32 as i32}),
+  Op::MemoryMap=>Err(Error::Unsupported),
+ }
+}
+#[cfg(test)]
+mod r009_linux_std_io_tests{
+ use super::*;
+ use crate::batch5_session::Identity;
+ use crate::batch6_security::{Access,VIEW,FILE_READ,FILE_WRITE};
+ fn actor()->Identity{Identity{pid:14,generation:7}}
+ fn auth()->Access<1>{
+  let mut a=Access::new();
+  a.grant(actor(),VIEW|FILE_READ|FILE_WRITE,100).unwrap();a
+ }
+ #[test]fn stdio_and_process_identity_translate_without_trusting_user_pid(){
+  let a=auth();
+  assert_eq!(translate_stdio(&a,actor(),2,39,[0;6],0x800000),
+    Ok(LinuxCall::GetPid{pid:14}));
+  assert_eq!(translate_stdio(&a,actor(),2,1,[1,0x1000,32,0,0,0],0x800000),
+    Ok(LinuxCall::StdoutWrite{fd:1,address:0x1000,length:32}));
+  assert_eq!(translate_stdio(&a,actor(),2,0,[0,0x2000,4,0,0,0],0x800000),
+    Ok(LinuxCall::StdinRead{address:0x2000,length:4}));
+ }
+ #[test]fn unrelated_descriptors_invalid_user_buffers_and_foreign_pids_denied(){
+  let a=auth();
+  assert_eq!(translate_stdio(&a,actor(),2,1,[7,0x1000,4,0,0,0],0x800000),
+    Err(Error::Denied));
+  assert_eq!(translate_stdio(&a,actor(),2,1,[1,0x10,4,0,0,0],0x800000),
+    Err(Error::Pointer));
+  assert_eq!(translate_stdio(&a,Identity{generation:8,..actor()},
+    2,1,[1,0x1000,4,0,0,0],0x800000),Err(Error::Denied));
+  assert_eq!(translate_stdio(&a,actor(),2,999,[0;6],0x800000),
+    Err(Error::Unsupported));
+ }
+}
