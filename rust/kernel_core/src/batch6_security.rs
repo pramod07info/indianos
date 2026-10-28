@@ -514,3 +514,76 @@ mod r010_atomic_identity_handoff_tests{
   assert_eq!(a.require(id(2,2),FILE_READ,10),Ok(()));
  }
 }
+
+ 
+/// R011 journaled capability mutation. Both side effects commit together:
+/// neither a partial grant transfer nor a missing audit entry is accepted.
+impl<const N:usize> Access<N>{
+ pub fn rotate_audited<const L:usize>(
+  &mut self,journal:&mut SecurityAudit<L>,
+  requests:&[(Identity,Identity,u32,u64)],now:u64
+ )->Result<usize,AuditError>{
+  journal.validate()?;
+  if requests.is_empty()||journal.remaining()<requests.len(){
+   return Err(AuditError::Full);
+  }
+  let mut grants=Self{grants:self.grants};
+  grants.rotate_batch_atomic(requests,now).map_err(|_|AuditError::Denied)?;
+  let mut staged=SecurityAudit{
+   entries:journal.entries,used:journal.used,next:journal.next,chain:journal.chain,
+  };
+  for &(_,new,rights,_) in requests{
+   staged.record(new,rights,now,AuditKind::Allowed)?;
+  }
+  self.grants=grants.grants;*journal=staged;Ok(requests.len())
+ }
+ pub fn revoke_pid_audited<const L:usize>(
+  &mut self,journal:&mut SecurityAudit<L>,pid:u32,now:u64
+ )->Result<usize,AuditError>{
+  if pid==0{return Err(AuditError::Invalid);}
+  journal.validate()?;
+  let matches=self.grants.iter().flatten().filter(|g|
+     g.owner.pid==pid&&!g.revoked).count();
+  if matches>journal.remaining(){return Err(AuditError::Full);}
+  let mut next=SecurityAudit{
+   entries:journal.entries,used:journal.used,next:journal.next,chain:journal.chain,
+  };
+  for grant in self.grants.iter().flatten(){
+   if grant.owner.pid==pid&&!grant.revoked{
+    next.record(grant.owner,grant.rights,now,AuditKind::Incident)?;
+   }
+  }
+  let count=self.revoke_pid(pid);
+  *journal=next;Ok(count)
+ }
+}
+#[cfg(test)]
+mod r011_audited_delegation_tests{
+ use super::*;
+ fn id(pid:u32,gen:u64)->Identity{Identity{pid,generation:gen}}
+ #[test]fn journaled_batch_rotates_all_grants_and_chains_events(){
+  let mut a=Access::<2>::new();let mut j=SecurityAudit::<3>::new();
+  a.grant(id(1,1),VIEW,40).unwrap();a.grant(id(2,1),SOCKET,40).unwrap();
+  assert_eq!(a.rotate_audited(&mut j,&[
+    (id(1,1),id(1,2),VIEW,30),(id(2,1),id(2,2),SOCKET,30)],10),Ok(2));
+  assert_eq!(j.validate(),Ok(()));
+  assert_eq!(j.remaining(),1);
+  assert_eq!(a.require(id(1,2),VIEW,11),Ok(()));
+ }
+ #[test]fn full_journal_rejects_grant_handoff_before_mutation(){
+  let mut a=Access::<1>::new();let mut j=SecurityAudit::<0>::new();
+  a.grant(id(5,1),VIEW,40).unwrap();
+  assert_eq!(a.rotate_audited(&mut j,&[(id(5,1),id(5,2),VIEW,20)],10),
+    Err(AuditError::Full));
+  assert_eq!(a.require(id(5,1),VIEW,11),Ok(()));
+ }
+ #[test]fn audited_pid_reap_does_not_revoke_unrelated_owner(){
+  let mut a=Access::<3>::new();let mut j=SecurityAudit::<3>::new();
+  a.grant(id(1,2),VIEW,40).unwrap();a.grant(id(2,2),FILE_READ,40).unwrap();
+  assert_eq!(a.revoke_pid_audited(&mut j,1,15),Ok(1));
+  assert_eq!(j.validate(),Ok(()));
+  assert_eq!(a.require(id(1,2),VIEW,16),Err(Error::Denied));
+  assert_eq!(a.require(id(2,2),FILE_READ,16),Ok(()));
+  assert_eq!(a.revoke_pid_audited(&mut j,1,17),Ok(0));
+ }
+}
