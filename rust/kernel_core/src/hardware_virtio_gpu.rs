@@ -997,7 +997,7 @@ pub fn cpu_draw_workspace(display:Scanout,stride:usize,pixels:&mut[u32],
     Rect{x:16,y:5,width:10,height:11}];
   assert_eq!(cpu_draw_workspace(d(),32,&mut p,&w,[1,2,3,4]),Ok(768));
   assert_eq!(p[0],2);assert_eq!(p[20*32],3);
-  assert_eq!(p[4*32+2],4);assert_eq!(p[5*32+17],2);
+  assert_eq!(p[4*32+2],4);assert_eq!(p[6*32+17],2);
  }
  #[test]fn invalid_second_window_preflights_without_painting(){
   let mut p=[99u32;768];
