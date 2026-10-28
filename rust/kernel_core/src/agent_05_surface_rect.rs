@@ -166,3 +166,83 @@ mod generation_surface_tests {
                    Err(RectError::OutsideScreen));
     }
 }
+
+
+// R007: desktop event-routing metadata. Window owners are authenticated by
+// the caller's scheduler identity; pixel writes happen in another component.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct WindowHit{pub id:u32,pub owner:SurfacePrincipal,pub bounds:Rectangle,pub z:u16}
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum WindowError{Invalid,Full,Duplicate,Missing,Geometry(RectError)}
+pub struct WindowMap<const N:usize>{entries:[Option<WindowHit>;N]}
+impl<const N:usize> WindowMap<N>{
+    pub const fn new()->Self{Self{entries:[None;N]}}
+    pub fn add(&mut self,w:WindowHit)->Result<(),WindowError>{
+        if w.id==0||w.owner.pid==0||w.owner.generation==0{return Err(WindowError::Invalid);}
+        edges(w.bounds).map_err(WindowError::Geometry)?;
+        if self.entries.iter().flatten().any(|v|v.id==w.id||v.z==w.z){
+            return Err(WindowError::Duplicate);
+        }
+        let slot=self.entries.iter_mut().find(|v|v.is_none()).ok_or(WindowError::Full)?;
+        *slot=Some(w);Ok(())
+    }
+    pub fn hit(&self,x:u32,y:u32)->Result<Option<WindowHit>,WindowError>{
+        let mut chosen:Option<WindowHit>=None;
+        // Preflight EVERY rectangle: corrupted low windows cannot evade
+        // detection by a valid top window.
+        for entry in self.entries.iter().flatten(){
+            let (right,bottom)=edges(entry.bounds).map_err(WindowError::Geometry)?;
+            if x>=entry.bounds.x&&x<right&&y>=entry.bounds.y&&y<bottom{
+                if chosen.is_none_or(|prev|entry.z>prev.z){chosen=Some(*entry);}
+            }
+        }
+        Ok(chosen)
+    }
+    pub fn move_window(&mut self,id:u32,caller:SurfacePrincipal,
+        dx:i32,dy:i32)->Result<Rectangle,WindowError>{
+        let slot=self.entries.iter_mut().find(|v|v.is_some_and(|w|w.id==id))
+            .ok_or(WindowError::Missing)?;
+        let mut w=slot.ok_or(WindowError::Missing)?;
+        if caller.pid==0||caller.generation==0||w.owner!=caller{
+            return Err(WindowError::Invalid);
+        }
+        let moved=move_owned(w.bounds,dx,dy,caller.pid,caller.pid)
+            .map_err(WindowError::Geometry)?;
+        w.bounds=moved;*slot=Some(w);Ok(moved)
+    }
+    pub fn close(&mut self,id:u32,caller:SurfacePrincipal)->Result<(),WindowError>{
+        let slot=self.entries.iter_mut().find(|v|v.is_some_and(|w|w.id==id))
+            .ok_or(WindowError::Missing)?;
+        if slot.ok_or(WindowError::Missing)?.owner!=caller||caller.pid==0{
+            return Err(WindowError::Invalid);
+        }
+        *slot=None;Ok(())
+    }
+}
+#[cfg(test)]mod r007_pointer_tests{
+    use super::*;
+    fn p(g:u64)->SurfacePrincipal{SurfacePrincipal{pid:8,generation:g}}
+    fn r(x:u32)->Rectangle{Rectangle{x,y:0,width:100,height:100}}
+    fn w(id:u32,z:u16,owner:SurfacePrincipal,x:u32)->WindowHit{
+        WindowHit{id,z,owner,bounds:r(x)}
+    }
+    #[test]fn topmost_hit_and_identity_checked_move(){
+        let mut map=WindowMap::<3>::new();
+        map.add(w(1,1,p(1),0)).unwrap();
+        map.add(w(2,2,p(2),50)).unwrap();
+        assert_eq!(map.hit(60,20).unwrap().unwrap().id,2);
+        assert_eq!(map.move_window(2,p(1),10,0),Err(WindowError::Invalid));
+        map.move_window(2,p(2),100,0).unwrap();
+        assert_eq!(map.hit(60,20).unwrap().unwrap().id,1);
+        map.close(2,p(2)).unwrap();
+        assert!(map.hit(200,20).unwrap().is_none());
+    }
+    #[test]fn invalid_geometry_and_duplicate_z_never_publish(){
+        let mut map=WindowMap::<1>::new();
+        map.add(w(1,1,p(1),0)).unwrap();
+        assert_eq!(map.add(w(2,1,p(2),5)),Err(WindowError::Duplicate));
+        assert_eq!(map.move_window(1,p(1),i32::MAX,0),
+            Err(WindowError::Geometry(RectError::OutsideScreen)));
+        assert_eq!(map.hit(5,5).unwrap().unwrap().id,1);
+    }
+}
