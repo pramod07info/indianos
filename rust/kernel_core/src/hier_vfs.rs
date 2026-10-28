@@ -552,4 +552,39 @@ impl<D:BlockDevice> HierVfs<D>{
   let n=self.write_at(path,offset,chunk)?;
   Ok((n,self.generation()))
  }
+
+ #[test]fn r009_copy_dispatch_persists_and_replaces_complete_files(){
+  let mut v=fresh();
+  v.mkdir("/home").unwrap();
+  v.create("/home/src",b"hello-data").unwrap();
+  let mut output=[0u8;MAX_TRANSFER];
+  assert_eq!(v.dispatch(10,"/home/src","/home/copy",&mut output,0),Ok(0));
+  assert_eq!(v.read("/home/copy",&mut output),Ok(10));
+  assert_eq!(&output[..10],b"hello-data");
+  v.overwrite("/home/src",b"upgraded").unwrap();
+  assert_eq!(v.dispatch(11,"/home/src","/home/copy",&mut output,0),Ok(0));
+  let mut v=HierVfs::mount(v.into_device()).unwrap();
+  assert_eq!(v.read("/home/copy",&mut output),Ok(8));
+  assert_eq!(&output[..8],b"upgraded");
+ }
+ #[test]fn r009_exact_read_never_exposes_a_partial_result(){
+  let mut v=fresh();v.mkdir("/home").unwrap();
+  v.create("/home/note",b"abc").unwrap();
+  let mut out=[0xaa;5];
+  assert_eq!(v.read_exact_range("/home/note",0,&mut out),Err(FsError::TooLarge));
+  assert_eq!(out,[0xaa;5]);
+  assert_eq!(v.read_exact_range("/home/note",0,&mut out[..3]),Ok(()));
+  assert_eq!(&out[..3],b"abc");
+ }
+ #[test]fn r009_generation_guard_blocks_stale_writer(){
+  let mut v=fresh();v.mkdir("/home").unwrap();
+  v.create("/home/note",b"hello").unwrap();
+  let before=v.generation();
+  assert_eq!(v.overwrite_chunk("/home/note",0,before-1,b"bad"),
+    Err(FsError::InvalidVolume));
+  assert_eq!(v.overwrite_chunk("/home/note",0,before,b"ok").unwrap().0,2);
+  let mut out=[0u8;8];
+  assert_eq!(v.read("/home/note",&mut out),Ok(5));
+  assert_eq!(&out[..5],b"okllo");
+ }
 }
