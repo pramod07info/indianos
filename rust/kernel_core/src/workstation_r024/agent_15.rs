@@ -6,7 +6,7 @@ fn is_key(key:&[u8])->bool{
  !key.is_empty()&&key.len()<=48&&key.iter().all(|b|
   b.is_ascii_alphanumeric()||*b==b'_'||*b==b'-')
 }
-pub fn find(data:&[u8],key:&[u8])->Option<&[u8]>{
+pub fn find<'a>(data:&'a[u8],key:&[u8])->Option<&'a[u8]>{
  if !is_key(key){return None;}
  for line in data.split(|b|*b==b'\n'){
   let Some(pos)=line.iter().position(|b|*b==b'=')else{continue};
@@ -77,12 +77,12 @@ pub fn get<const F:usize>(fs:&RamFs<F>,path:&[u8],key:&[u8],
   let n=get(&fs,b"/p/config",b"target",&mut out).unwrap();
   assert_eq!(&out[..n],b"x86_64");
  }
- #[test]fn malformed_config_and_command_injection_values_are denied(){
+ #[test]fn malformed_config_and_command_injection_values_are_denied(){
   let mut fs=RamFs::<1>::new();fs.replace(b"/a",b"bad line").unwrap();
   assert_eq!(set(&mut fs,b"/a",1,b"x",b"y"),Err(Error::Invalid));
   assert_eq!(set(&mut fs,b"/a",1,b"x",b"bad\ncommand"),Err(Error::Invalid));
  }
- #[test]fn stale_config_edit_does_not overwrite current_settings(){
+ #[test]fn stale_config_edit_does_not_overwrite_current_settings(){
   let mut fs=RamFs::<1>::new();fs.replace(b"/a",b"x=one\n").unwrap();
   fs.replace(b"/a",b"x=two\n").unwrap();
   assert_eq!(set(&mut fs,b"/a",1,b"x",b"three"),Err(Error::Stale));
