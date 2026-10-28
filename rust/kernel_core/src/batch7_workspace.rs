@@ -283,3 +283,55 @@ mod r013_desktop_transaction_tests{
   assert_eq!(w.app_file_generation(id(2),1),Ok(0));
  }
 }
+
+/// R014 commit both filesystem mutations and terminal-visible output only
+/// after the complete script succeeds. Never expose a failed intermediate
+/// command's text to the caller or enqueue a partial desktop repaint.
+impl<const P:usize,const E:usize,const W:usize,const K:usize,
+ const F:usize,const G:usize,const Q:usize> Workspace<P,E,W,K,F,G,Q>{
+ pub fn execute_script_visible(&mut self,caller:Identity,now:u64,
+   commands:&[&[u8]],snapshot:&mut[u8],output:&mut[u8])
+   ->Result<usize,Error>{
+  let mut staged=[0u8;OUTPUT_MAX];
+  let n=self.execute_script_atomic(caller,now,commands,snapshot,&mut staged)?;
+  if n>output.len(){return Err(Error::Terminal(TerminalError::Io));}
+  output[..n].copy_from_slice(&staged[..n]);
+  Ok(n)
+ }
+ pub fn has_pending_frame(&self)->bool{self.frames.pending()>0}
+ pub fn current_desktop(&self)->Option<Identity>{self.desktop}
+}
+#[cfg(test)]
+mod r014_visible_script_tests{
+ use super::*;use crate::batch2_launcher::Image;
+ use crate::batch2_settings::Theme;
+ fn id(p:u32)->Identity{Identity{pid:p,generation:1}}
+ fn ready()->Workspace<3,3,2,2,3,2,8>{
+  let mut w=Workspace::new();
+  let launch=|p|Launch{pid:p,generation:1,image:Image{
+    image_id:p,entry:0x1000,mapped_end:0x2000,verified:true}};
+  w.initialize(id(1),launch(1),id(2),launch(2),
+    Settings{theme:Theme::Dark,pointer_speed:5,key_repeat:10},50,100).unwrap();w
+ }
+ #[test]fn successful_script_publishes_terminal_output_and_one_frame(){
+  let mut w=ready();let mut snap=[0;512];let mut out=[0xcc;OUTPUT_MAX];
+  let n=w.execute_script_visible(id(2),1,
+    &[b"write /x value",b"cat /x"],&mut snap,&mut out).unwrap();
+  assert_eq!(n,5);assert_eq!(&out[..n],b"value");
+  assert!(w.has_pending_frame());assert_eq!(w.current_desktop(),Some(id(2)));
+ }
+ #[test]fn invalid_second_command_never_shows_partial_terminal_output(){
+  let mut w=ready();let mut snap=[0;512];let mut out=[0xcc;OUTPUT_MAX];
+  assert!(w.execute_script_visible(id(2),1,
+    &[b"write /x value",b"cat /unknown"],&mut snap,&mut out).is_err());
+  assert_eq!(out,[0xcc;OUTPUT_MAX]);assert_eq!(w.disk.count(),0);
+  assert!(!w.has_pending_frame());
+ }
+ #[test]fn wrong_generation_cannot_observe_or_mutate_desktop(){
+  let mut w=ready();let mut snap=[0;512];let mut out=[0xcc;OUTPUT_MAX];
+  let stale=Identity{pid:2,generation:2};
+  assert!(w.execute_script_visible(stale,1,
+    &[b"write /x value"],&mut snap,&mut out).is_err());
+  assert_eq!(out,[0xcc;OUTPUT_MAX]);assert_eq!(w.disk.count(),0);
+ }
+}
