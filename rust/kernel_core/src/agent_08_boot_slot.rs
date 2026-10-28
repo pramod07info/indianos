@@ -404,3 +404,92 @@ pub fn rollback_after_failure(current:Journal,failed:usize,min_version:u64)
         assert_eq!(stage_verified_slot(base(),0,7,true,0),Err(UpdatePolicyError::Invalid));
     }
 }
+
+
+// R008: update trial state around checked two-copy boot journal. Network
+// transport, firmware writes and installer signature verification are external.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum TrialFault{Invalid,Pending,Missing,Policy(UpdatePolicyError)}
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct BootTrial{
+ pub journal:Journal,pub active:usize,pub pending:Option<usize>,
+ pub minimum_version:u64,
+}
+impl BootTrial{
+ pub fn new(journal:Journal,active:usize,minimum_version:u64)->Result<Self,TrialFault>{
+  if active>1||journal.generation==0||
+   !bootable(journal.slots[active],minimum_version){
+   return Err(TrialFault::Invalid)
+  }
+  Ok(Self{journal,active,pending:None,minimum_version})
+ }
+ pub fn stage(&mut self,version:u64,verified:bool,budget:u8,
+  power_sufficient:bool)->Result<usize,TrialFault>{
+  if self.pending.is_some(){return Err(TrialFault::Pending)}
+  if !power_sufficient{return Err(TrialFault::Invalid)}
+  let update=stage_verified_slot(self.journal,self.active,version,verified,budget)
+   .map_err(TrialFault::Policy)?;
+  let target=1-self.active;
+  if !bootable(update.slots[target],self.minimum_version){return Err(TrialFault::Invalid)}
+  self.journal=update;self.pending=Some(target);Ok(target)
+ }
+ pub fn consume_attempt(&mut self,selected:usize)->Result<u8,TrialFault>{
+  if self.pending!=Some(selected){return Err(TrialFault::Missing)}
+  let s=self.journal.slots[selected];
+  if !bootable(s,self.minimum_version){return Err(TrialFault::Invalid)}
+  let next=self.journal.generation.checked_add(1).ok_or(TrialFault::Invalid)?;
+  self.journal.slots[selected].attempts_remaining-=1;
+  self.journal.generation=next;
+  Ok(self.journal.slots[selected].attempts_remaining)
+ }
+ pub fn healthy(&mut self,selected:usize,observed_version:u64,budget:u8)
+  ->Result<(),TrialFault>{
+  if self.pending!=Some(selected){return Err(TrialFault::Missing)}
+  self.journal=confirm_boot_healthy(self.journal,selected,observed_version,budget)
+   .map_err(TrialFault::Policy)?;
+  self.active=selected;self.pending=None;Ok(())
+ }
+ pub fn fail(&mut self,selected:usize)->Result<usize,TrialFault>{
+  if self.pending!=Some(selected){return Err(TrialFault::Missing)}
+  let (rollback,backup)=rollback_after_failure(self.journal,selected,self.minimum_version)
+   .map_err(TrialFault::Policy)?;
+  self.journal=rollback;self.active=backup;self.pending=None;Ok(backup)
+ }
+ pub fn cancel(&mut self)->Result<(),TrialFault>{
+  let target=self.pending.ok_or(TrialFault::Missing)?;
+  let next=self.journal.generation.checked_add(1).ok_or(TrialFault::Invalid)?;
+  self.journal.slots[target].attempts_remaining=0;
+  self.journal.generation=next;self.pending=None;Ok(())
+ }
+}
+#[cfg(test)]mod r008_ota_trial_tests{
+ use super::*;
+ fn journal()->Journal{
+  Journal{generation:2,slots:[
+   Slot{valid_metadata:true,committed:true,version:5,attempts_remaining:3},
+   Slot{valid_metadata:false,committed:false,version:0,attempts_remaining:0}]}
+ }
+ #[test]fn trusted_update_attempt_confirms_and_switches_active(){
+  let mut t=BootTrial::new(journal(),0,5).unwrap();
+  assert_eq!(t.stage(6,true,3,true),Ok(1));
+  assert_eq!(t.consume_attempt(1),Ok(2));
+  t.healthy(1,6,3).unwrap();
+  assert_eq!(t.active,1);assert_eq!(t.pending,None);
+ }
+ #[test]fn unhealthy_update_rolls_back_to_previously_working_slot(){
+  let mut t=BootTrial::new(journal(),0,5).unwrap();
+  t.stage(7,true,1,true).unwrap();
+  assert_eq!(t.fail(1),Ok(0));
+  assert_eq!(t.journal.slots[1].attempts_remaining,0);
+  assert_eq!(t.active,0);
+ }
+ #[test]fn signature_power_and_identity_gates_are_enforced(){
+  let mut t=BootTrial::new(journal(),0,5).unwrap();
+  assert_eq!(t.stage(6,false,2,true),Err(TrialFault::Policy(UpdatePolicyError::Unverified)));
+  assert_eq!(t.stage(6,true,2,false),Err(TrialFault::Invalid));
+  t.stage(6,true,2,true).unwrap();
+  assert_eq!(t.healthy(0,6,2),Err(TrialFault::Missing));
+  assert_eq!(t.stage(7,true,2,true),Err(TrialFault::Pending));
+  t.cancel().unwrap();assert_eq!(t.pending,None);
+ }
+}
