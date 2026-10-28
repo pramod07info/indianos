@@ -15,11 +15,20 @@ impl<const N:usize> Access<N>{
   ->Result<(),Error>{
   if owner.pid==0||owner.generation==0||rights==0||rights&!ALL!=0||
    expires==0{return Err(Error::Invalid);}
-  if self.grants.iter().flatten().any(|g|g.owner.pid==owner.pid){
+  // A live grant monopolizes a numeric PID. A revoked tombstone must
+  // never prevent a new scheduler-authenticated generation from starting.
+  if self.grants.iter().flatten().any(|g|
+      g.owner.pid==owner.pid&&!g.revoked){
    return Err(Error::Duplicate);
   }
-  let slot=self.grants.iter_mut().find(|x|x.is_none()).ok_or(Error::Full)?;
-  *slot=Some(Grant{owner,rights,expires,revoked:false});Ok(())
+  // Reuse the same PID's tombstone first: require() finds by numeric PID,
+  // so retaining an old entry beside a new one could deny valid lookups.
+  let index=self.grants.iter().position(|slot|
+      slot.is_some_and(|g|g.owner.pid==owner.pid&&g.revoked))
+    .or_else(||self.grants.iter().position(|s|s.is_none()))
+    .or_else(||self.grants.iter().position(|s|s.is_some_and(|g|g.revoked)))
+    .ok_or(Error::Full)?;
+  self.grants[index]=Some(Grant{owner,rights,expires,revoked:false});Ok(())
  }
  pub fn require(&self,owner:Identity,needed:u32,now:u64)->Result<(),Error>{
   if owner.pid==0||owner.generation==0||needed==0||needed&!ALL!=0{
@@ -585,5 +594,71 @@ mod r011_audited_delegation_tests{
   assert_eq!(a.require(id(1,2),VIEW,16),Err(Error::Denied));
   assert_eq!(a.require(id(2,2),FILE_READ,16),Ok(()));
   assert_eq!(a.revoke_pid_audited(&mut j,1,17),Ok(0));
+ }
+}
+
+
+/// R012: correct PID/epoch-specific process reaping. The earlier PID-wide
+/// method can revoke an unrelated fresh generation of the same numeric PID.
+/// Call this after trusted scheduler authentication and audit validation.
+impl<const N:usize> Access<N>{
+ pub fn revoke_identity_audited<const L:usize>(&mut self,
+   audit:&mut SecurityAudit<L>,dead:Identity,now:u64)
+   ->Result<usize,AuditError>{
+  if dead.pid==0||dead.generation==0{return Err(AuditError::Invalid);}
+  audit.validate()?;
+  let affected=self.grants.iter().flatten().filter(|g|
+    g.owner==dead&&!g.revoked).count();
+  if affected>audit.remaining(){return Err(AuditError::Full);}
+  let mut staged=SecurityAudit{
+    entries:audit.entries,used:audit.used,next:audit.next,chain:audit.chain};
+  for grant in self.grants.iter().flatten(){
+   if grant.owner==dead&&!grant.revoked{
+    staged.record(dead,grant.rights,now,AuditKind::Incident)?;
+   }
+  }
+  let mut removed=0;
+  for slot in &mut self.grants{
+   if let Some(grant)=slot.as_mut(){
+    if grant.owner==dead&&!grant.revoked{grant.revoked=true;removed+=1;}
+   }
+  }
+  *audit=staged;Ok(removed)
+ }
+ pub fn owned_process_count(&self,pid:u32,now:u64)->usize{
+  self.grants.iter().flatten().filter(|g|
+    g.owner.pid==pid&&!g.revoked&&g.expires>now).count()
+ }
+}
+#[cfg(test)]
+mod r012_epoch_audit_tests{
+ use super::*;
+ fn id(g:u64)->Identity{Identity{pid:42,generation:g}}
+ #[test]fn old_generation_reap_preserves_reused_pid_new_grants(){
+  let mut a=Access::<2>::new();let mut j=SecurityAudit::<2>::new();
+  a.grant(id(1),FILE_READ,100).unwrap();
+  // Numeric PID reuse while its predecessor is still alive is forbidden.
+  assert_eq!(a.grant(id(2),VIEW,100),Err(Error::Duplicate));
+  assert_eq!(a.revoke_identity_audited(&mut j,id(1),10),Ok(1));
+  // Once the old generation has been revoked, the kernel may admit a
+  // distinct process incarnation without returning the old authority.
+  a.grant(id(2),VIEW,100).unwrap();
+  assert_eq!(a.require(id(1),FILE_READ,11),Err(Error::Denied));
+  assert_eq!(a.require(id(2),VIEW,11),Ok(()));
+  assert_eq!(j.validate(),Ok(()));
+  assert_eq!(a.owned_process_count(42,11),1);
+ }
+ #[test]fn audit_capacity_failure_fails_before_revoke(){
+  let mut a=Access::<1>::new();let mut j=SecurityAudit::<0>::new();
+  a.grant(id(1),VIEW,100).unwrap();
+  assert_eq!(a.revoke_identity_audited(&mut j,id(1),10),Err(AuditError::Full));
+  assert_eq!(a.require(id(1),VIEW,11),Ok(()));
+ }
+ #[test]fn stale_reap_does_not_modify_future_grant(){
+  let mut a=Access::<1>::new();let mut j=SecurityAudit::<1>::new();
+  a.grant(id(2),VIEW,100).unwrap();
+  assert_eq!(a.revoke_identity_audited(&mut j,id(1),10),Ok(0));
+  assert_eq!(a.require(id(2),VIEW,11),Ok(()));
+  assert_eq!(j.remaining(),1);
  }
 }
