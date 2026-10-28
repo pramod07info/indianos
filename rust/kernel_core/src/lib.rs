@@ -78,6 +78,9 @@ pub mod m1_partition;
 pub mod m1_persistent_terminal;
 #[cfg(feature="test-r031-vfs")]
 pub mod m1_persistent_desktop;
+/// R019: real durable source editor service, guarded by M1 auth and volume generations.
+#[cfg(feature="test-r031-vfs")]
+pub mod m1_disk_editor;
 // M2 Developer Alpha integrated host-testable foundations. The guest must
 // wire actual network, signature-verifier, ELF loader and UI services later.
 #[cfg(feature="test-m2-developer-alpha")]

@@ -577,3 +577,65 @@ mod tests{
  }
 
 }
+
+
+
+/// R019: auth-routed disk-backed developer source editing. These methods
+/// operate on the existing mounted persistent HierVfs. The GUI's text
+/// painting/cursor controls and ring-3 IPC wiring remain separate.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum EditorRouteError {
+ State,
+ Permission(AccessError),
+ Editor(crate::m1_disk_editor::Error),
+}
+impl<D:BlockDevice,const P:usize,const E:usize,const W:usize,
+ const K:usize,const G:usize,const Q:usize> Desktop<D,P,E,W,K,G,Q> {
+ fn admit_editor(&self,caller:Identity,now:u64,right:u32)
+   ->Result<(),EditorRouteError>{
+  if self.owner!=Some(caller)||self.boot.desktop_identity()!=Some(caller)||
+     !self.boot.session.owns(caller){return Err(EditorRouteError::State);}
+  self.rights.require(caller,right,now)
+    .map_err(EditorRouteError::Permission)
+ }
+ /// Open existing verified durable source file under current Desktop owner.
+ pub fn editor_open(&mut self,caller:Identity,now:u64,
+    editor:&mut crate::m1_disk_editor::DiskEditor,path:&str)
+    ->Result<crate::m1_disk_editor::Status,EditorRouteError>{
+  self.admit_editor(caller,now,FILE_READ)?;
+  editor.open(caller,&mut self.volume,path).map_err(EditorRouteError::Editor)
+ }
+ /// Apply a complete insertion/deletion/replacement to an open buffer.
+ /// This is a change to the working copy; explicit editor_save persists it.
+ pub fn editor_replace(&mut self,caller:Identity,now:u64,
+    editor:&mut crate::m1_disk_editor::DiskEditor,
+    start:usize,end:usize,bytes:&[u8])->Result<usize,EditorRouteError>{
+  self.admit_editor(caller,now,FILE_WRITE)?;
+  editor.replace(caller,start,end,bytes).map_err(EditorRouteError::Editor)
+ }
+ pub fn editor_save(&mut self,caller:Identity,now:u64,
+    editor:&mut crate::m1_disk_editor::DiskEditor)
+    ->Result<u64,EditorRouteError>{
+  self.admit_editor(caller,now,FILE_WRITE)?;
+  editor.save(caller,&mut self.volume).map_err(EditorRouteError::Editor)
+ }
+ /// Explicitly discard stale/dirty editor bytes and reload committed data.
+ pub fn editor_reload(&mut self,caller:Identity,now:u64,
+    editor:&mut crate::m1_disk_editor::DiskEditor)
+    ->Result<crate::m1_disk_editor::Status,EditorRouteError>{
+  self.admit_editor(caller,now,FILE_READ)?;
+  editor.reload(caller,&mut self.volume).map_err(EditorRouteError::Editor)
+ }
+ pub fn editor_read(&self,caller:Identity,now:u64,
+    editor:&crate::m1_disk_editor::DiskEditor,out:&mut[u8])
+    ->Result<usize,EditorRouteError>{
+  self.admit_editor(caller,now,FILE_READ)?;
+  editor.read(caller,out).map_err(EditorRouteError::Editor)
+ }
+ pub fn editor_close(&self,caller:Identity,now:u64,
+    editor:&mut crate::m1_disk_editor::DiskEditor,discard:bool)
+    ->Result<(),EditorRouteError>{
+  self.admit_editor(caller,now,FILE_READ)?;
+  editor.close(caller,discard).map_err(EditorRouteError::Editor)
+ }
+}
