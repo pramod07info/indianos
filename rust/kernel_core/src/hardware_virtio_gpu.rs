@@ -1013,3 +1013,63 @@ pub fn cpu_draw_workspace(display:Scanout,stride:usize,pixels:&mut[u32],
     34,&mut p,&[],[1,2,3,4]),Err(Error::Dimensions));
  }
 }
+
+
+/// R017 compositor workspace focus indicator and task grouping on a trusted
+/// CPU framebuffer. Preflight all surfaces before drawing any pixels.
+pub fn cpu_draw_workstation_focus(display:Scanout,stride:usize,
+ pixels:&mut[u32],focused:Rect,highlight:u32)->Result<usize,Error>{
+ if focused.width<2||focused.height<2||
+  focused.x.checked_add(focused.width).is_none_or(|x|x>display.width)||
+  focused.y.checked_add(focused.height).is_none_or(|y|y>display.height)||
+  stride<display.width as usize||
+  stride.checked_mul(display.height as usize).is_none_or(|n|n>pixels.len()){
+  return Err(Error::Dimensions);
+ }
+ let upper=Rect{height:1,..focused};
+ let lower=Rect{y:focused.y+focused.height-1,height:1,..focused};
+ let left=Rect{width:1,..focused};
+ let right=Rect{x:focused.x+focused.width-1,width:1,..focused};
+ for edge in [upper,lower,left,right]{
+  cpu_fill_rect(display,stride,pixels,edge,highlight)?;
+ }
+ Ok((focused.width as usize*2)+(focused.height as usize*2)-4)
+}
+pub fn cpu_draw_workstation_grid(display:Scanout,stride:usize,
+ pixels:&mut[u32],step:u32,color:u32)->Result<usize,Error>{
+ if step==0||step>256||display.width==0||display.height==0||
+  display.width>MAX_WIDTH||display.height>MAX_HEIGHT||
+  stride<display.width as usize||stride.checked_mul(display.height as usize)
+   .is_none_or(|n|n>pixels.len()){return Err(Error::Dimensions);}
+ let mut count=0;
+ for y in 0..display.height{
+  for x in 0..display.width{
+   if x%step==0||y%step==0{
+    pixels[y as usize*stride+x as usize]=color;count+=1;
+   }
+  }
+ }
+ Ok(count)
+}
+#[cfg(test)]mod r017_dev_desktop_gpu_fallback_tests{
+ use super::*;
+ fn screen()->Scanout{Scanout{width:16,height:16,scanout:0}}
+ #[test]fn focus_outline_only_touches_requested_border(){
+  let mut p=[0;256];
+  assert_eq!(cpu_draw_workstation_focus(screen(),16,&mut p,
+   Rect{x:2,y:2,width:6,height:6},99),Ok(20));
+  assert_eq!(p[2*16+2],99);assert_eq!(p[3*16+3],0);
+ }
+ #[test]fn invalid_framebuffer_is_left_unchanged(){
+  let mut p=[7;256];
+  assert!(cpu_draw_workstation_focus(screen(),16,&mut p,
+   Rect{x:15,y:15,width:5,height:5},10).is_err());
+  assert_eq!(p,[7;256]);
+ }
+ #[test]fn bounded_grid_does_not_overwrite_stride_padding(){
+  let mut p=[5;18*16];
+  assert!(cpu_draw_workstation_grid(screen(),18,&mut p,4,6).is_ok());
+  for y in 0..16{assert_eq!(&p[y*18+16..y*18+18],&[5,5]);}
+  assert!(cpu_draw_workstation_grid(screen(),18,&mut p,0,8).is_err());
+ }
+}
