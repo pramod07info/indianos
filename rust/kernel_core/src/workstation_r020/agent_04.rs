@@ -28,7 +28,7 @@ pub fn rename_all<const F:usize,const IMAGE:usize>(
    let matches=src+from.len()<=len&&&text[src..src+from.len()]==from;
    let boundary_left=src==0||!(text[src-1].is_ascii_alphanumeric()||text[src-1]==b'_');
    let right=src+from.len();
-   let boundary_right=right==len||!(text[right].is_ascii_alphanumeric()||text[right]==b'_');
+   let boundary_right=right>=len||!(text[right].is_ascii_alphanumeric()||text[right]==b'_');
    if matches&&boundary_left&&boundary_right{
     if dst+to.len()>CONTENT_MAX{return Err(Error::Full);}
     updated[dst..dst+to.len()].copy_from_slice(to);
