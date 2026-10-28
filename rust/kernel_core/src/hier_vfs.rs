@@ -240,6 +240,10 @@ impl<D:BlockDevice> HierVfs<D>{
    7=>{self.rename_file(path,second)?;Ok(0)},
    8=>self.list_dir(path,data),
    9=>{self.rename_dir(path,second)?;Ok(0)},
+   // R009 privileged VFS batch: durable, full-file CRC-verified copy APIs.
+   // The caller retains responsibility for syscall capability admission.
+   10=>{self.copy_file(path,second)?;Ok(0)},
+   11=>{self.copy_replace(path,second)?;Ok(0)},
    _=>Err(FsError::InvalidName)
   }
  }
@@ -525,6 +529,61 @@ mod tests{
   assert_eq!(fs.copy_replace("/src","/missing"),Err(FsError::NotFound));
   assert_eq!(fs.copy_replace("/src","/src"),Err(FsError::Exists));
   assert_eq!(fs.generation(),before);
+ }
+
+ #[test]fn r009_copy_dispatch_persists_and_replaces_complete_files(){
+  let mut v=fresh();
+  v.mkdir("/home").unwrap();
+  v.create("/home/src",b"hello-data").unwrap();
+  let mut output=[0u8;MAX_TRANSFER];
+  assert_eq!(v.dispatch(10,"/home/src","/home/copy",&mut output,0),Ok(0));
+  assert_eq!(v.read("/home/copy",&mut output),Ok(10));
+  assert_eq!(&output[..10],b"hello-data");
+  v.overwrite("/home/src",b"upgraded").unwrap();
+  assert_eq!(v.dispatch(11,"/home/src","/home/copy",&mut output,0),Ok(0));
+  let mut v=HierVfs::mount(v.into_device()).unwrap();
+  assert_eq!(v.read("/home/copy",&mut output),Ok(8));
+  assert_eq!(&output[..8],b"upgraded");
+ }
+ #[test]fn r009_exact_read_never_exposes_a_partial_result(){
+  let mut v=fresh();v.mkdir("/home").unwrap();
+  v.create("/home/note",b"abc").unwrap();
+  let mut out=[0xaa;5];
+  assert_eq!(v.read_exact_range("/home/note",0,&mut out),Err(FsError::TooLarge));
+  assert_eq!(out,[0xaa;5]);
+  assert_eq!(v.read_exact_range("/home/note",0,&mut out[..3]),Ok(()));
+  assert_eq!(&out[..3],b"abc");
+ }
+ #[test]fn r009_generation_guard_blocks_stale_writer(){
+  let mut v=fresh();v.mkdir("/home").unwrap();
+  v.create("/home/note",b"hello").unwrap();
+  let before=v.generation();
+  assert_eq!(v.overwrite_chunk("/home/note",0,before-1,b"bad"),
+    Err(FsError::InvalidVolume));
+  assert_eq!(v.overwrite_chunk("/home/note",0,before,b"ok").unwrap().0,2);
+  let mut out=[0u8;8];
+  assert_eq!(v.read("/home/note",&mut out),Ok(5));
+  assert_eq!(&out[..5],b"okllo");
+ }
+}
+
+/// R009: bounded seek/read/persist abstraction for authenticated file
+/// services. Exposes existing atomic COW range operations while ensuring
+/// no successful prefix is falsely reported on a short verified read.
+impl<D:BlockDevice> HierVfs<D>{
+ pub fn read_exact_range(&mut self,path:&str,offset:u64,
+   output:&mut[u8])->Result<(),FsError>{
+  if output.is_empty()||output.len()>MAX_TRANSFER{return Err(FsError::TooLarge);}
+  let mut staged=[0u8;MAX_TRANSFER];
+  let size=self.read_at(path,offset,&mut staged[..output.len()])?;
+  if size!=output.len(){return Err(FsError::TooLarge);}
+  output.copy_from_slice(&staged[..size]);Ok(())
+ }
+ pub fn overwrite_chunk(&mut self,path:&str,offset:u64,
+   expected_generation:u64,chunk:&[u8])->Result<(usize,u64),FsError>{
+  if self.generation()!=expected_generation{return Err(FsError::InvalidVolume);}
+  let n=self.write_at(path,offset,chunk)?;
+  Ok((n,self.generation()))
  }
 
 }
