@@ -468,3 +468,66 @@ mod r006_boot_transaction_tests{
   assert_eq!(short.start_graphical_plan(plan()),Err(Error::State));
  }
 }
+
+ 
+/// R009: one supervisor transaction for a crashed desktop process. This
+/// does not synthesize process identities: the caller must supply identities
+/// authenticated by the kernel scheduler and a verified loader image.
+impl<const P:usize,const E:usize,const W:usize,const K:usize>
+ Bootstrap<P,E,W,K>{
+ pub fn restart_failed_desktop(&mut self,dead:Identity,replacement:Identity,
+   launch:Launch,settings:Settings)->Result<BootHealth,Error>{
+  if self.phase!=Phase::DesktopReady||self.desktop!=Some(dead)||
+     !self.session.owns(dead)||self.init.is_none_or(|i|!self.session.owns(i))||
+     self.desktop_restarts>=MAX_DESKTOP_RESTARTS||
+     replacement.pid==0||replacement.generation==0||
+     replacement==dead||replacement.pid==self.init.unwrap().pid||
+     replacement.pid!=launch.pid||replacement.generation!=launch.generation||
+     self.session.owns(replacement){return Err(Error::State);}
+  // All preflight checks run before tearing down the old desktop.
+  self.process_exited(dead)?;
+  self.recover_desktop(replacement,launch,settings)?;
+  Ok(self.health())
+ }
+}
+#[cfg(test)]
+mod r009_desktop_restart_tests{
+ use super::*;
+ use crate::batch2_launcher::Image;
+ use crate::batch2_settings::Theme;
+ fn id(pid:u32,generation:u64)->Identity{Identity{pid,generation}}
+ fn image(x:Identity)->Launch{Launch{pid:x.pid,generation:x.generation,
+   image:Image{image_id:x.pid,entry:0x1000,mapped_end:0x2000,verified:true}}}
+ fn settings()->Settings{Settings{theme:Theme::Dark,pointer_speed:5,key_repeat:10}}
+ fn ready()->Bootstrap<3,3,3,3>{
+  let mut b=Bootstrap::new();let init=id(1,3);let desktop=id(2,3);
+  b.configure(11,22).unwrap();
+  b.start_init(init,image(init),settings(),11).unwrap();
+  b.start_desktop(desktop,image(desktop),settings(),22).unwrap();b
+ }
+ #[test]fn crashed_desktop_restarts_without_losing_pid1(){
+  let mut b=ready();let new=id(2,4);
+  let status=b.restart_failed_desktop(id(2,3),new,image(new),settings()).unwrap();
+  assert_eq!(status.phase,Phase::DesktopReady);
+  assert_eq!(status.pid1,Some(id(1,3)));
+  assert_eq!(status.desktop,Some(new));
+  assert!(!b.session.owns(id(2,3)));
+  assert_eq!(b.desktop_restart_count(),1);
+ }
+ #[test]fn forged_replacement_never_tears_down_healthy_desktop(){
+  let mut b=ready();let fresh=id(2,4);
+  assert_eq!(b.restart_failed_desktop(id(2,3),fresh,image(id(2,5)),settings()),Err(Error::State));
+  assert_eq!(b.health().desktop,Some(id(2,3)));
+  assert_eq!(b.desktop_restart_count(),0);
+ }
+ #[test]fn crash_restart_budget_exhaustion_fails_closed(){
+  let mut b=ready();
+  for gen in 4..=6{
+   let newer=id(2,gen);
+   b.restart_failed_desktop(id(2,gen-1),newer,image(newer),settings()).unwrap();
+  }
+  let next=id(2,7);
+  assert_eq!(b.restart_failed_desktop(id(2,6),next,image(next),settings()),Err(Error::State));
+  assert_eq!(b.health().desktop,Some(id(2,6)));
+ }
+}
