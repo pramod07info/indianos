@@ -749,3 +749,76 @@ mod r011_transaction_tests{
   assert_eq!(&out[..9],b"123456789");
  }
 }
+
+
+/// R012: durable checkpoint/restore for the current single-bank-sized file.
+/// The existing COW filesystem persists the snapshot and target separately;
+/// this is not yet an atomic multi-file transaction on disk.
+impl<D:BlockDevice> HierVfs<D>{
+ pub fn checkpoint(&mut self,path:&str,backup:&str,
+   expected:u64)->Result<u64,FsError>{
+  if self.generation()!=expected{return Err(FsError::InvalidVolume);}
+  self.copy_file(path,backup)?;
+  Ok(self.generation())
+ }
+ pub fn recover_checkpoint(&mut self,path:&str,backup:&str,
+   expected:u64)->Result<u64,FsError>{
+  if self.generation()!=expected{return Err(FsError::InvalidVolume);}
+  let mut verified=[0u8;MAX_FILE_BYTES];
+  let count=self.read(backup,&mut verified)?;
+  // Re-read the checkpoint and verify its exact CRC-covered byte extent
+  // before replacing the destination with one COW metadata publication.
+  let mut repeated=[0u8;MAX_FILE_BYTES];
+  if self.read(backup,&mut repeated)?!=count||
+     verified[..count]!=repeated[..count]{
+   return Err(FsError::InvalidVolume);
+  }
+  self.copy_replace(backup,path)?;
+  Ok(self.generation())
+ }
+ pub fn read_generation_checked(&mut self,path:&str,expected:u64,
+  output:&mut[u8])->Result<usize,FsError>{
+  if self.generation()!=expected{return Err(FsError::InvalidVolume);}
+  let n=self.read(path,output)?;
+  if self.generation()!=expected{return Err(FsError::InvalidVolume);}
+  Ok(n)
+ }
+}
+#[cfg(test)]
+mod r012_checkpoint_tests{
+ use super::*;use crate::block::{BlockDevice,BlockError,SECTOR_BYTES};
+ const COUNT:usize=100;
+ #[derive(Clone)]
+ struct Disk{sectors:[[u8;SECTOR_BYTES];COUNT]}
+ impl BlockDevice for Disk{
+  fn sector_count(&self)->u64{COUNT as u64}
+  fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   *out=*self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?;Ok(())
+  }
+  fn write_sector(&mut self,lba:u64,data:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   *self.sectors.get_mut(lba as usize).ok_or(BlockError::OutOfRange)?=*data;Ok(())
+  }
+ }
+ fn disk()->HierVfs<Disk>{
+  let mut fs=HierVfs::format_blank(Disk{sectors:[[0;SECTOR_BYTES];COUNT]}).unwrap();
+  fs.create("/app",b"before").unwrap();fs
+ }
+ #[test]fn checkpoint_restores_persisted_file_after_reboot(){
+  let mut fs=disk();let gen=fs.generation();
+  fs.checkpoint("/app","/backup",gen).unwrap();
+  fs.overwrite("/app",b"changed").unwrap();
+  let gen=fs.generation();
+  fs.recover_checkpoint("/app","/backup",gen).unwrap();
+  let mut fs=HierVfs::mount(fs.into_device()).unwrap();
+  let mut out=[0u8;16];assert_eq!(fs.read("/app",&mut out),Ok(6));
+  assert_eq!(&out[..6],b"before");
+ }
+ #[test]fn stale_generation_never_overwrites_valid_volume(){
+  let mut fs=disk();let gen=fs.generation();let mut out=[0xee;8];
+  assert_eq!(fs.checkpoint("/app","/backup",gen-1),Err(FsError::InvalidVolume));
+  assert_eq!(fs.read_generation_checked("/app",gen-1,&mut out),
+    Err(FsError::InvalidVolume));
+  assert_eq!(out,[0xee;8]);
+  assert_eq!(fs.generation(),gen);
+ }
+}

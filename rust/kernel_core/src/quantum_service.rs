@@ -530,3 +530,55 @@ mod r011_quantum_fairness_tests{
   assert_eq!(q.next_owner(),Some(id(3,1)));
  }
 }
+
+
+/// R012 join simulator queue admission to the per-owner CPU work budget.
+/// Work grants remain scheduler-scoped and do not authorize hardware QPU.
+pub fn submit_budgeted<const N:usize>(service:&mut QuantumService,
+ budget:&QuantumWorkBudget<N>,actor:Identity,request:&[u8],
+ maximum_active:usize)->Result<u64,ServiceError>{
+ if budget.remaining(actor).is_none_or(|remaining|remaining==0){
+  return Err(ServiceError::NotOwner);
+ }
+ service.submit_quotad_scoped(actor,request,maximum_active)
+}
+pub fn retire_budgeted<const N:usize>(service:&mut QuantumService,
+ budget:&mut QuantumWorkBudget<N>,actor:Identity)
+ ->Result<usize,ServiceError>{
+ if actor.pid==0||actor.generation==0{return Err(ServiceError::InvalidOwner);}
+ let retired=service.process_terminated_scoped(actor)?;
+ budget.terminate(actor);
+ Ok(retired)
+}
+#[cfg(test)]
+mod r012_quantum_budget_integration_tests{
+ use super::*;
+ const BELL:[u8;10]=[1,2,2,0,1,0,0,4,0,1];
+ fn id(g:u64)->Identity{Identity{pid:7,generation:g}}
+ #[test]fn unknown_actor_cannot_submit_without_scheduler_budget(){
+  let mut svc=QuantumService::new();
+  let budget=QuantumWorkBudget::<1>::new();
+  assert_eq!(submit_budgeted(&mut svc,&budget,id(1),&BELL,2),
+    Err(ServiceError::NotOwner));
+  assert_eq!(svc.active_count_scoped(id(1)),Ok(0));
+ }
+ #[test]fn permitted_actor_uses_generation_scoped_job_quota(){
+  let mut svc=QuantumService::new();
+  let mut budget=QuantumWorkBudget::<1>::new();
+  budget.admit(id(1),1).unwrap();
+  assert!(submit_budgeted(&mut svc,&budget,id(1),&BELL,1).is_ok());
+  assert_eq!(submit_budgeted(&mut svc,&budget,id(1),&BELL,1),
+    Err(ServiceError::Queue(QueueError::Full)));
+  assert_eq!(submit_budgeted(&mut svc,&budget,id(2),&BELL,1),
+    Err(ServiceError::NotOwner));
+ }
+ #[test]fn process_retirement_removes_owned_jobs_and_work_grants(){
+  let mut svc=QuantumService::new();
+  let mut budget=QuantumWorkBudget::<1>::new();
+  budget.admit(id(1),3).unwrap();
+  submit_budgeted(&mut svc,&budget,id(1),&BELL,2).unwrap();
+  assert_eq!(retire_budgeted(&mut svc,&mut budget,id(1)),Ok(1));
+  assert_eq!(budget.remaining(id(1)),None);
+  assert_eq!(svc.active_count_scoped(id(1)),Ok(0));
+ }
+}

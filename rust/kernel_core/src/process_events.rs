@@ -416,3 +416,66 @@ mod r011_affinity_tests{
   assert_eq!(q.next(1),Err(DispatchError::Empty));
  }
 }
+
+
+/// R012: bounded queue-level CPU balancing. The real SMP runtime must hold
+/// runqueue locks and coordinate IPIs and memory barriers before using this.
+impl<const C:usize,const N:usize> CoreRunQueues<C,N>{
+ pub fn rebalance_once(&mut self,allowed:u64)
+  ->Result<Option<Runnable>,DispatchError>{
+  if C==0||allowed==0{return Err(DispatchError::InvalidCpu);}
+  let mut fullest=None;let mut emptiest=None;
+  for cpu in 0..C.min(64){
+   if allowed&(1u64<<cpu)==0{continue;}
+   if fullest.is_none_or(|idx:usize|self.length[cpu]>self.length[idx]){
+    fullest=Some(cpu);
+   }
+   if emptiest.is_none_or(|idx:usize|self.length[cpu]<self.length[idx]){
+    emptiest=Some(cpu);
+   }
+  }
+  let from=fullest.ok_or(DispatchError::InvalidCpu)?;
+  let to=emptiest.ok_or(DispatchError::InvalidCpu)?;
+  if from==to||self.length[from]<=self.length[to]+1{return Ok(None);}
+  let task=self.queues[from][self.length[from]-1]
+    .ok_or(DispatchError::Empty)?;
+  self.migrate(from,to,task.pid,task.generation)?;
+  Ok(Some(task))
+ }
+ pub fn remove_epoch(&mut self,task:Runnable)->Result<usize,DispatchError>{
+  if task.pid==0||task.generation==0{return Err(DispatchError::InvalidTask);}
+  Ok(self.evict(task.pid,task.generation))
+ }
+ pub fn total_runnable(&self)->usize{
+  self.length.iter().copied().sum()
+ }
+}
+#[cfg(test)]
+mod r012_rebalance_tests{
+ use super::*;
+ fn t(pid:u32,gen:u64)->Runnable{Runnable{pid,generation:gen,priority:1}}
+ #[test]fn rebalancing_migrates_only_one_task_per_iteration(){
+  let mut q=CoreRunQueues::<3,4>::new();
+  q.enqueue(0,t(1,1)).unwrap();q.enqueue(0,t(2,1)).unwrap();
+  q.enqueue(0,t(3,1)).unwrap();
+  assert_eq!(q.total_runnable(),3);
+  assert_eq!(q.rebalance_once(0b111),Ok(Some(t(3,1))));
+  assert_eq!(q.total_runnable(),3);
+  assert_eq!(q.queue_len(0),Ok(2));assert_eq!(q.queue_len(1),Ok(1));
+  assert_eq!(q.rebalance_once(0b111),Ok(Some(t(2,1))));
+  assert_eq!(q.total_runnable(),3);
+ }
+ #[test]fn restricted_affinity_does_not_touch_disallowed_core(){
+  let mut q=CoreRunQueues::<2,3>::new();
+  q.enqueue(0,t(1,1)).unwrap();q.enqueue(0,t(2,1)).unwrap();
+  assert_eq!(q.rebalance_once(0b01),Ok(None));
+  assert_eq!(q.queue_len(1),Ok(0));
+ }
+ #[test]fn process_epoch_teardown_removes_only_old_process(){
+  let mut q=CoreRunQueues::<2,3>::new();
+  q.enqueue(0,t(5,1)).unwrap();q.enqueue(1,t(5,2)).unwrap();
+  assert_eq!(q.remove_epoch(t(5,1)),Ok(1));
+  assert_eq!(q.next(1),Ok(t(5,2)));
+  assert_eq!(q.total_runnable(),1);
+ }
+}

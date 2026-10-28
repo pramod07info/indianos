@@ -452,3 +452,74 @@ mod r011_linux_dup_tests{
   assert_eq!(f.resolve(id(2),4,FD_WRITE),Ok(66));
  }
 }
+
+
+/// R012 authenticated Linux descriptor close-range plan. A userspace-provided
+/// range never bypasses owner/epoch checks and cannot affect other processes.
+impl<const N:usize> FileDescriptors<N>{
+ pub fn close_range(&mut self,owner:crate::batch5_session::Identity,
+  first:u32,last:u32)->Result<usize,FdError>{
+  if owner.pid==0||owner.generation==0||first<3||last<first{
+   return Err(FdError::Invalid);
+  }
+  let mut removed=0;
+  for slot in &mut self.entries{
+   if slot.is_some_and(|e|e.owner==owner&&
+       e.fd>=first&&e.fd<=last){
+    *slot=None;removed+=1;
+   }
+  }
+  Ok(removed)
+ }
+ pub fn close_range_checked(&mut self,owner:crate::batch5_session::Identity,
+  first:u32,last:u32,max_count:usize)->Result<usize,FdError>{
+  if owner.pid==0||owner.generation==0||first<3||last<first{
+   return Err(FdError::Invalid);
+  }
+  let matches=self.entries.iter().flatten().filter(|e|
+    e.owner==owner&&e.fd>=first&&e.fd<=last).count();
+  if matches>max_count{return Err(FdError::Full);}
+  self.close_range(owner,first,last)
+ }
+ pub fn owned_fds(&self,owner:crate::batch5_session::Identity,
+  out:&mut[u32])->Result<usize,FdError>{
+  if owner.pid==0||owner.generation==0{return Err(FdError::Invalid);}
+  let count=self.entries.iter().flatten().filter(|e|e.owner==owner).count();
+  if out.len()<count{return Err(FdError::Full);}
+  let mut used=0;
+  for e in self.entries.iter().flatten(){
+   if e.owner==owner{out[used]=e.fd;used+=1;}
+  }
+  Ok(used)
+ }
+}
+#[cfg(test)]
+mod r012_linux_close_range_tests{
+ use super::*;use crate::batch5_session::Identity;
+ fn id(pid:u32,gen:u64)->Identity{Identity{pid,generation:gen}}
+ #[test]fn close_range_is_epoch_scoped_and_protects_other_processes(){
+  let mut f=FileDescriptors::<3>::new();
+  f.attach(id(2,1),3,11,FD_READ).unwrap();
+  f.attach(id(2,2),4,22,FD_READ).unwrap();
+  f.attach(id(3,1),5,33,FD_WRITE).unwrap();
+  assert_eq!(f.close_range(id(2,1),3,5),Ok(1));
+  assert_eq!(f.resolve(id(2,2),4,FD_READ),Ok(22));
+  assert_eq!(f.resolve(id(3,1),5,FD_WRITE),Ok(33));
+ }
+ #[test]fn bounded_close_does_not_publish_partial_mutation(){
+  let mut f=FileDescriptors::<2>::new();
+  f.attach(id(2,1),3,11,FD_READ).unwrap();
+  f.attach(id(2,1),4,22,FD_READ).unwrap();
+  assert_eq!(f.close_range_checked(id(2,1),3,4,1),Err(FdError::Full));
+  assert_eq!(f.active_count(id(2,1)),2);
+  assert_eq!(f.close_range_checked(id(2,1),3,4,2),Ok(2));
+ }
+ #[test]fn fd_listing_never_overwrites_short_output(){
+  let mut f=FileDescriptors::<2>::new();
+  f.attach(id(2,1),3,11,FD_READ).unwrap();
+  f.attach(id(2,1),4,22,FD_READ).unwrap();
+  let mut out=[99u32;1];
+  assert_eq!(f.owned_fds(id(2,1),&mut out),Err(FdError::Full));
+  assert_eq!(out,[99]);
+ }
+}
