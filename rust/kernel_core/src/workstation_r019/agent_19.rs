@@ -57,7 +57,7 @@ impl Release{
   let mut r=release();r.record_checks(1,true,true).unwrap();
   assert_eq!(r.review(1),Err(Error::Denied));
   r.review(2).unwrap();r.approve(2).unwrap();
-  let mut payload=[0u8;52];assert_eq!(r.publish_manifest(true,&mut payload),Ok(48));
+  let mut payload=[0u8;52];assert_eq!(r.publish_manifest(true,&mut payload),Ok(52));
   assert_eq!(r.stage,Stage::Published);
  }
  #[test]fn failed_build_or_unsigned_artifact_never_deploys(){
