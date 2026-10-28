@@ -22,6 +22,8 @@ pub mod agent_14;
 pub mod agent_15;
 pub mod agent_16;
 pub mod agent_17;
+/// The package catalog exists only in the M2 developer-alpha build.
+#[cfg(feature="test-m2-developer-alpha")]
 pub mod agent_18;
 pub mod agent_19;
 pub mod agent_20;
