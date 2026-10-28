@@ -56,8 +56,11 @@ pub fn plan_linux_load(signed:bool,bytes:&[u8],
  for i in 0..count{
   let at=start.checked_add(i.checked_mul(56).ok_or(LoadError::Invalid)?)
    .ok_or(LoadError::Invalid)?;
-  let hdr=bytes.get(at..at+56).ok_or(LoadError::Invalid)?;
+  let hdr_end=at.checked_add(56).ok_or(LoadError::Invalid)?;
+  let hdr=bytes.get(at..hdr_end).ok_or(LoadError::Invalid)?;
   let kind=u32::from_le_bytes(hdr[0..4].try_into().unwrap());
+  // PT_INTERP requires an unsupported userspace dynamic linker.
+  if kind==3{return Err(LoadError::Invalid);}
   if kind!=1{continue;}
   let flags=u32::from_le_bytes(hdr[4..8].try_into().unwrap());
   let file_offset=u64::from_le_bytes(hdr[8..16].try_into().unwrap());
@@ -65,15 +68,25 @@ pub fn plan_linux_load(signed:bool,bytes:&[u8],
   let file_bytes=u64::from_le_bytes(hdr[32..40].try_into().unwrap());
   let memory_bytes=u64::from_le_bytes(hdr[40..48].try_into().unwrap());
   let end=address.checked_add(memory_bytes).ok_or(LoadError::Unsafe)?;
-  if flags&!7!=0||flags&3==3||memory_bytes==0||
+  let file_end=file_offset.checked_add(file_bytes).ok_or(LoadError::Unsafe)?;
+  // Page-based W^X enforcement: disjoint byte ranges in the same page
+  // cannot safely have different read/write/execute protection.
+  let page_start=address&!4095u64;
+  let page_end=end.checked_add(4095).ok_or(LoadError::Unsafe)?&!4095u64;
+  if flags&!7!=0||flags&3==3||memory_bytes==0||file_bytes>memory_bytes||
      address<4096||end>0x0000_8000_0000_0000||
+     file_end>bytes.len() as u64||
      file_offset%4096!=address%4096{return Err(LoadError::Unsafe);}
   for region in &staged[..used]{
-   let old_end=region.address+region.memory_bytes;
-   if address<old_end&&region.address<end{return Err(LoadError::Overlap);}
+   let old_start=region.address&!4095u64;
+   let old_end=region.address.checked_add(region.memory_bytes)
+      .and_then(|v|v.checked_add(4095)).ok_or(LoadError::Unsafe)?&!4095u64;
+   if page_start<old_end&&old_start<page_end{return Err(LoadError::Overlap);}
   }
   if used>=MAX_LOAD_REGIONS{return Err(LoadError::Capacity);}
-  if flags&1!=0&&entry>=address&&entry<end{entry_ok=true;}
+  // Reject entry points into zero-filled BSS or unmapped segment tails.
+  let executable_end=address.checked_add(file_bytes).ok_or(LoadError::Unsafe)?;
+  if flags&1!=0&&entry>=address&&entry<executable_end{entry_ok=true;}
   staged[used]=LoadRegion{address,file_bytes,memory_bytes,
    offset:file_offset,flags};
   used+=1;
@@ -542,13 +555,18 @@ pub fn validate_exec_regions(regions:&[LoadRegion],entry:u64,
      region.flags&!7!=0||region.flags&3==3{
    return Err(LoadError::Unsafe);
   }
-  if region.flags&1!=0&&entry>=region.address&&entry<end{
+  let exec_end=region.address.checked_add(region.file_bytes)
+     .ok_or(LoadError::Unsafe)?;
+  if region.flags&1!=0&&entry>=region.address&&entry<exec_end{
    executable=true;
   }
+  let page_start=region.address&!4095u64;
+  let page_end=end.checked_add(4095).ok_or(LoadError::Unsafe)?&!4095u64;
   for other in &regions[..i]{
-   let other_end=other.address.checked_add(other.memory_bytes)
-     .ok_or(LoadError::Unsafe)?;
-   if region.address<other_end&&other.address<end{
+   let old_start=other.address&!4095u64;
+   let old_end=other.address.checked_add(other.memory_bytes)
+     .and_then(|e|e.checked_add(4095)).ok_or(LoadError::Unsafe)?&!4095u64;
+   if page_start<old_end&&old_start<page_end{
     return Err(LoadError::Overlap);
    }
   }
@@ -687,5 +705,66 @@ mod r014_posix_exec_descriptor_tests{
   assert_eq!(t.descriptors_for_epoch(owner(1)),1);
   assert_eq!(t.resolve(owner(2),5,FD_READ),Ok(33));
   assert_eq!(t.exec_retain_atomic(owner(1),&[4]),Err(FdError::NotFound));
+ }
+}
+
+/// R015: source-validated Linux ELF fixture adversarial tests.
+/// The load plan remains a pure preflight; no foreign Linux process runs here.
+#[cfg(test)]
+mod r015_linux_mapping_safety_tests {
+ use super::*;
+ fn fixture()->[u8;128]{
+  let mut b=[0u8;128];
+  b[..4].copy_from_slice(b"\x7fELF");b[4]=2;b[5]=1;b[6]=1;
+  b[16..18].copy_from_slice(&2u16.to_le_bytes());
+  b[18..20].copy_from_slice(&62u16.to_le_bytes());
+  b[20..24].copy_from_slice(&1u32.to_le_bytes());
+  b[24..32].copy_from_slice(&0x401000u64.to_le_bytes());
+  b[32..40].copy_from_slice(&64u64.to_le_bytes());
+  b[52..54].copy_from_slice(&64u16.to_le_bytes());
+  b[54..56].copy_from_slice(&56u16.to_le_bytes());
+  b[56..58].copy_from_slice(&1u16.to_le_bytes());
+  b[64..68].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+  b[68..72].copy_from_slice(&5u32.to_le_bytes()); // RX
+  b[80..88].copy_from_slice(&0x401000u64.to_le_bytes());
+  b[96..104].copy_from_slice(&128u64.to_le_bytes());
+  b[104..112].copy_from_slice(&4096u64.to_le_bytes());
+  b
+ }
+ const EMPTY:LoadRegion=LoadRegion{address:0,file_bytes:0,
+  memory_bytes:0,offset:0,flags:0};
+ #[test]
+ fn rejects_truncated_segment_and_file_larger_than_virtual_mem(){
+  let mut b=fixture();let mut output=[EMPTY;1];
+  b[96..104].copy_from_slice(&129u64.to_le_bytes());
+  assert_eq!(plan_linux_load(true,&b,&mut output),Err(LoadError::Unsafe));
+  assert_eq!(output,[EMPTY]);
+  let mut b=fixture();
+  b[104..112].copy_from_slice(&64u64.to_le_bytes());
+  assert_eq!(plan_linux_load(true,&b,&mut output),Err(LoadError::Unsafe));
+  assert_eq!(output,[EMPTY]);
+ }
+ #[test]
+ fn rejects_entry_inside_non_file_backed_bss(){
+  let mut b=fixture();let mut output=[EMPTY;1];
+  b[24..32].copy_from_slice(&0x401100u64.to_le_bytes());
+  assert_eq!(plan_linux_load(true,&b,&mut output),Err(LoadError::Entry));
+  assert_eq!(output,[EMPTY]);
+ }
+ #[test]
+ fn rejects_interpreter_instead_of_falsely_accepting_dynamic_binary(){
+  let mut b=fixture();let mut output=[EMPTY;1];
+  b[64..68].copy_from_slice(&3u32.to_le_bytes());
+  assert_eq!(plan_linux_load(true,&b,&mut output),Err(LoadError::Invalid));
+  assert_eq!(output,[EMPTY]);
+ }
+ #[test]
+ fn rejects_same_page_mixed_permissions_without_pte_alias(){
+  let rx=LoadRegion{address:0x4000,file_bytes:4,memory_bytes:4,offset:0,flags:5};
+  let rw=LoadRegion{address:0x4008,file_bytes:4,memory_bytes:4,offset:8,flags:6};
+  assert_eq!(validate_exec_regions(&[rx,rw],0x4000,0x10000),
+    Err(LoadError::Overlap));
+  let safe=LoadRegion{address:0x5000,..rw};
+  assert_eq!(validate_exec_regions(&[rx,safe],0x4000,0x10000),Ok(2));
  }
 }
