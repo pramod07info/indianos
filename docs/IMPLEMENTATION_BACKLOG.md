@@ -5,6 +5,40 @@ QEMU kernel to a usable OS. **An item is done only after its acceptance checks
 are observed**. Source code, diagrams, and passing host tests alone do not
 establish working interrupts, a desktop, or third-party application support.
 
+## Kernel-first architecture design and integration gate (2026-10-28)
+
+**Decision:** complete and review the kernel architecture baseline **before**
+prioritizing three-edition UI implementation. This is design-first, not an
+instruction to stop mandatory CI, safety fixes or current M1 kernel integration.
+Target specification: [kernel architecture baseline v1](KERNEL_ARCHITECTURE_BASELINE_V1.md).
+Existing verified QEMU foundations remain verified at their actual scope;
+unimplemented contracts below remain **OPEN**.
+
+| Workstream | Priority | Kernel architecture deliverable | Design acceptance |
+|---|---|---|---|
+| K01 | P0 | Boot handoff, CPU/firmware inventory and hardware abstraction | Versioned BootInfo, initialization state machine, ownership/validation, recovery boot and fallback contract |
+| K02 | P0 | Memory, processes, thread scheduler and future SMP | PMM/VMM map ownership, kernel/user isolation, preemption, teardown, locking, OOM and multicore plan |
+| K03 | P0 | Native syscall ABI, IPC, capabilities and PID1/services | Versioned syscall/handle protocols, process lifetime, IPC rights, crash/restart semantics and ABI compatibility policy |
+| K04 | P0 | VFS, block storage and persistent recovery | Mount/path semantics, per-user rights, journaling/flush/rename guarantees, partition safety, explicit filesystem-driver scope |
+| K05 | P0 | Driver lifecycle, DMA/IRQ contract and architecture ports | QEMU-first interface; resources/ownership, IRQ isolation, platform-specific x86-64 vs ARM64 extension plan |
+| K06 | P0 | Reliable TCP/IP/socket API and headless service hosting | DHCP/DNS, listening sockets, multi-connection handling, timeouts, network security and Server profile contract |
+| K07 | P0 | Threat model, permission gates and signed recovery chain | Untrusted input inventory; kernel/driver/app boundaries, rollback and auditable security acceptance |
+| K08 | P1 | Graphics/compositor boundary and VM/compatibility contracts | User-space compositor, protected surface ownership, virtualization requirements, app-by-app compatibility limits |
+| K09 | P1 | Kernel diagnostics, failure recovery and performance budgets | Panic/logging strategy, fault injection, metrics and reproducible QEMU/hardware benchmarks |
+| K10 | P0 | Architecture review, ADR reconciliation and freeze criteria | Reconcile C-first ADR with Rust-first implementation, explicit open decisions, reviewed versioned contracts and M1–M5 test traceability |
+
+**Kernel design gate:** K01–K10 architecture deliverables must receive
+technical/security review with documented open decisions before an
+architecture-freeze claim. 'Design approved' does not mean 'module coded'
+or 'production-ready'. Implementation is a separate evidence-driven gate.
+
+**Priority change for original UI backlog:** UX01–UX02 visual design
+exploration may continue in parallel without touching kernel interfaces.
+UX03 depends on K02/K03/K05/K07/K08; UX05–UX07 must not be claimed
+production-ready until their underlying kernel, storage, networking,
+security and userland service contracts pass. Three editions share **one
+kernel**, with distinct user-space profiles, not three kernels.
+
 ## Verified foundations (not general-purpose production features)
 
 - [x] UEFI/Limine x86-64 QEMU boot with a Rust-first no_std kernel
