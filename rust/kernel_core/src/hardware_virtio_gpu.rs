@@ -745,3 +745,64 @@ mod r011_multiscanout_tests{
   assert_eq!(display.submit_damage(2,6,&[Rect{x:0,y:0,width:1,height:1}]),Ok(1));
  }
 }
+
+
+/// R012 functional CPU framebuffer fallback for GPU-less boot. The caller
+/// owns a trusted scanout buffer; this does not grant or expose GPU DMA.
+pub fn cpu_fill_rect(display:Scanout,stride_pixels:usize,
+  framebuffer:&mut[u32],rect:Rect,argb:u32)->Result<usize,Error>{
+ if display.width==0||display.height==0||
+    display.width>MAX_WIDTH||display.height>MAX_HEIGHT||
+    display.scanout>=16{return Err(Error::Dimensions);}
+ let width=display.width as usize;let height=display.height as usize;
+ if stride_pixels<width||rect.width==0||rect.height==0||
+    rect.x.checked_add(rect.width).is_none_or(|v|v>display.width)||
+    rect.y.checked_add(rect.height).is_none_or(|v|v>display.height){
+   return Err(Error::Dimensions);
+ }
+ let size=stride_pixels.checked_mul(height).ok_or(Error::Dimensions)?;
+ if framebuffer.len()<size{return Err(Error::Dimensions);}
+ let pixels=(rect.width as usize).checked_mul(rect.height as usize)
+   .ok_or(Error::Dimensions)?;
+ for y in rect.y as usize..(rect.y+rect.height) as usize{
+  let start=y*stride_pixels+rect.x as usize;
+  framebuffer[start..start+rect.width as usize].fill(argb);
+ }
+ Ok(pixels)
+}
+/// Trusted compositor presenter can select CPU mode when GPU isolation
+/// proof is absent, rather than issuing unsafe virtqueue commands.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum RenderBackend{CpuSafe,GpuIsolated}
+pub fn choose_backend(gpu_present:bool,iommu_isolated:bool,
+  pinned_backing:bool)->RenderBackend{
+ if gpu_present&&iommu_isolated&&pinned_backing{
+  RenderBackend::GpuIsolated
+ }else{RenderBackend::CpuSafe}
+}
+#[cfg(test)]
+mod r012_framebuffer_fallback_tests{
+ use super::*;
+ fn display()->Scanout{Scanout{width:4,height:3,scanout:0}}
+ #[test]fn paints_bounded_region_without_touching_padding(){
+  let mut pixels=[0x55u32;18];
+  assert_eq!(cpu_fill_rect(display(),6,&mut pixels,
+    Rect{x:1,y:1,width:2,height:2},0x11223344),Ok(4));
+  assert_eq!(&pixels[7..9],&[0x11223344;2]);
+  assert_eq!(&pixels[13..15],&[0x11223344;2]);
+  assert_eq!(pixels[6],0x55);assert_eq!(pixels[9],0x55);
+ }
+ #[test]fn wrong_stride_and_overrun_rejected_without_pixels(){
+  let mut pixels=[1u32;12];
+  assert_eq!(cpu_fill_rect(display(),4,&mut pixels,
+    Rect{x:3,y:0,width:2,height:1},2),Err(Error::Dimensions));
+  assert_eq!(cpu_fill_rect(display(),3,&mut pixels,
+    Rect{x:0,y:0,width:1,height:1},2),Err(Error::Dimensions));
+  assert_eq!(pixels,[1u32;12]);
+ }
+ #[test]fn absent_dma_trust_selects_safe_cpu_fallback(){
+  assert_eq!(choose_backend(true,false,true),RenderBackend::CpuSafe);
+  assert_eq!(choose_backend(true,true,true),RenderBackend::GpuIsolated);
+  assert_eq!(choose_backend(false,true,true),RenderBackend::CpuSafe);
+ }
+}
