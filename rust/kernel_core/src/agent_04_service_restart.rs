@@ -247,3 +247,94 @@ impl<const N:usize> ServiceGroup<N>{
         assert_eq!(g.status(1).unwrap().service.state,State::Running);
     }
 }
+
+
+// R008 dependency boot policy; does not spawn processes or recover a kernel.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct DependentService{pub id:u16,pub parent:u16,pub generation:u32,pub running:bool}
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum DependencyFault{Invalid,Missing,Duplicate,Full,Blocked,Overflow}
+#[derive(Clone,Copy)]
+pub struct DependencySupervisor<const N:usize>{nodes:[Option<DependentService>;N]}
+impl<const N:usize> DependencySupervisor<N>{
+ pub const fn new()->Self{Self{nodes:[None;N]}}
+ pub fn get(&self,id:u16)->Option<DependentService>{
+  self.nodes.iter().flatten().find(|v|v.id==id).copied()
+ }
+ pub fn register(&mut self,id:u16,parent:u16)->Result<(),DependencyFault>{
+  if id==0||id==parent{return Err(DependencyFault::Invalid)}
+  if self.get(id).is_some(){return Err(DependencyFault::Duplicate)}
+  if parent!=0&&self.get(parent).is_none(){return Err(DependencyFault::Blocked)}
+  let slot=self.nodes.iter_mut().find(|x|x.is_none()).ok_or(DependencyFault::Full)?;
+  *slot=Some(DependentService{id,parent,generation:0,running:false});Ok(())
+ }
+ pub fn start(&mut self,id:u16)->Result<u32,DependencyFault>{
+  let service=self.get(id).ok_or(DependencyFault::Missing)?;
+  if service.running{return Err(DependencyFault::Duplicate)}
+  if service.parent!=0&&!self.get(service.parent).is_some_and(|p|p.running){
+   return Err(DependencyFault::Blocked)
+  }
+  let generation=service.generation.checked_add(1).ok_or(DependencyFault::Overflow)?;
+  let slot=self.nodes.iter_mut().find(|x|x.is_some_and(|v|v.id==id))
+   .ok_or(DependencyFault::Missing)?;
+  *slot=Some(DependentService{generation,running:true,..service});Ok(generation)
+ }
+ pub fn start_batch(&mut self,order:&[u16])->Result<usize,DependencyFault>{
+  if order.is_empty()||order.len()>N{return Err(DependencyFault::Full)}
+  let mut staged=*self;
+  for id in order{staged.start(*id)?;}
+  *self=staged;Ok(order.len())
+ }
+ pub fn crash_cascade(&mut self,id:u16,generation:u32)->Result<usize,DependencyFault>{
+  let origin=self.get(id).ok_or(DependencyFault::Missing)?;
+  if !origin.running||origin.generation!=generation{return Err(DependencyFault::Invalid)}
+  let mut affected=[false;N];
+  for (i,item) in self.nodes.iter().enumerate(){
+   if item.is_some_and(|v|v.id==id){affected[i]=true;}
+  }
+  for _ in 0..N{
+   for i in 0..N{
+    if let Some(v)=self.nodes[i]{
+     if v.parent!=0&&self.nodes.iter().enumerate().any(|(j,p)|
+      affected[j]&&p.is_some_and(|p|p.id==v.parent)){affected[i]=true}
+    }
+   }
+  }
+  let mut stopped=0;
+  for (i,item) in self.nodes.iter_mut().enumerate(){
+   if affected[i]{
+    if let Some(s)=item{
+     if s.running{stopped+=1}
+     s.running=false;
+    }
+   }
+  }
+  Ok(stopped)
+ }
+}
+#[cfg(test)]mod r008_dependency_supervisor_tests{
+ use super::*;
+ #[test]fn starts_in_dependency_order_and_cascades_failure(){
+  let mut s=DependencySupervisor::<3>::new();
+  s.register(1,0).unwrap();s.register(2,1).unwrap();s.register(3,2).unwrap();
+  assert_eq!(s.start(3),Err(DependencyFault::Blocked));
+  assert_eq!(s.start_batch(&[1,2,3]),Ok(3));
+  assert_eq!(s.crash_cascade(1,1),Ok(3));
+  assert_eq!(s.get(3).unwrap().running,false);
+  assert_eq!(s.start_batch(&[1,2,3]),Ok(3));
+  assert_eq!(s.get(3).unwrap().generation,2);
+ }
+ #[test]fn stale_generation_cannot_crash_new_session(){
+  let mut s=DependencySupervisor::<2>::new();
+  s.register(1,0).unwrap();s.start(1).unwrap();
+  assert_eq!(s.crash_cascade(1,0),Err(DependencyFault::Invalid));
+  assert_eq!(s.get(1).unwrap().running,true);
+ }
+ #[test]fn failed_start_transaction_is_atomic(){
+  let mut s=DependencySupervisor::<2>::new();
+  s.register(1,0).unwrap();s.register(2,1).unwrap();
+  assert_eq!(s.start_batch(&[1,1]),Err(DependencyFault::Duplicate));
+  assert_eq!(s.get(1).unwrap().running,false);
+  assert_eq!(s.start_batch(&[2,1]),Err(DependencyFault::Blocked));
+ }
+}
