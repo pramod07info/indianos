@@ -337,3 +337,100 @@ impl<const N:usize> DelegationTable<N>{
         assert_eq!(d.active(),0);
     }
 }
+
+
+// R008 bounded time-limited capability delegation and lifecycle cleanup.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct TimedGrant{pub grant:Grant,pub expires_at:u64}
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum LeaseFault{Invalid,Full,Duplicate,Missing,Expired,Denied(CapabilityError)}
+#[derive(Clone,Copy)]
+pub struct LeaseTable<const N:usize>{entries:[Option<TimedGrant>;N]}
+impl<const N:usize> LeaseTable<N>{
+ pub const fn new()->Self{Self{entries:[None;N]}}
+ pub fn len(&self)->usize{self.entries.iter().flatten().count()}
+ pub fn delegate(&mut self,parent:Grant,issuer:Request,child:TimedGrant,now:u64)
+  ->Result<(),LeaseFault>{
+  if now>=child.expires_at||child.grant.owner==0||child.grant.revoked||
+   child.grant.rights==0||child.grant.generation==0||
+   child.grant.resource!=parent.resource||child.grant.epoch!=parent.epoch||
+   (child.grant.rights&!parent.rights)!=0{return Err(LeaseFault::Invalid)}
+  let mut proof=issuer;proof.required_rights=child.grant.rights;
+  authorize(parent,proof).map_err(LeaseFault::Denied)?;
+  if self.entries.iter().flatten().any(|v|
+   v.grant.owner==child.grant.owner&&v.grant.resource==child.grant.resource){
+   return Err(LeaseFault::Duplicate);
+  }
+  let slot=self.entries.iter_mut().find(|v|v.is_none()).ok_or(LeaseFault::Full)?;
+  *slot=Some(child);Ok(())
+ }
+ pub fn delegate_batch(&mut self,parent:Grant,issuer:Request,
+  children:&[TimedGrant],now:u64)->Result<usize,LeaseFault>{
+  if children.is_empty()||children.len()>N{return Err(LeaseFault::Full)}
+  let mut candidate=*self;
+  for child in children{candidate.delegate(parent,issuer,*child,now)?}
+  *self=candidate;Ok(children.len())
+ }
+ pub fn check(&self,request:Request,now:u64)->Result<(),LeaseFault>{
+  let lease=self.entries.iter().flatten().find(|v|
+   v.grant.owner==request.caller&&v.grant.resource==request.resource)
+   .ok_or(LeaseFault::Missing)?;
+  if now>=lease.expires_at{return Err(LeaseFault::Expired)}
+  authorize(lease.grant,request).map_err(LeaseFault::Denied)
+ }
+ pub fn revoke_identity(&mut self,owner:u32,generation:u64)->usize{
+  if owner==0||generation==0{return 0}
+  let mut removed=0;
+  for slot in &mut self.entries{
+   if slot.is_some_and(|v|v.grant.owner==owner&&v.grant.generation==generation){
+    *slot=None;removed+=1
+   }
+  }
+  removed
+ }
+ pub fn sweep(&mut self,now:u64)->usize{
+  let mut removed=0;
+  for slot in &mut self.entries{
+   if slot.is_some_and(|v|now>=v.expires_at){*slot=None;removed+=1}
+  }
+  removed
+ }
+}
+#[cfg(test)]mod r008_timed_capabilities_tests{
+ use super::*;
+ fn g(owner:u32,rights:u32)->Grant{
+  Grant{owner,resource:5,rights,epoch:2,generation:7,revoked:false}
+ }
+ fn r(caller:u32,rights:u32)->Request{
+  Request{caller,resource:5,required_rights:rights,current_epoch:2,current_generation:7}
+ }
+ #[test]fn expiry_and_generation_scoped_cleanup(){
+  let mut t=LeaseTable::<2>::new();
+  t.delegate(g(1,7),r(1,7),TimedGrant{grant:g(2,3),expires_at:20},10).unwrap();
+  assert_eq!(t.check(r(2,1),19),Ok(()));
+  assert_eq!(t.check(r(2,1),20),Err(LeaseFault::Expired));
+  assert_eq!(t.sweep(20),1);
+  assert_eq!(t.check(r(2,1),19),Err(LeaseFault::Missing));
+ }
+ #[test]fn atomic_batch_denies_escalation(){
+  let mut t=LeaseTable::<2>::new();
+  assert_eq!(t.delegate_batch(g(1,7),r(1,7),
+   &[TimedGrant{grant:g(2,1),expires_at:20},
+     TimedGrant{grant:g(3,8),expires_at:20}],5),Err(LeaseFault::Invalid));
+  assert_eq!(t.len(),0);
+  assert_eq!(t.delegate_batch(g(1,7),r(1,7),
+   &[TimedGrant{grant:g(2,1),expires_at:20},
+     TimedGrant{grant:g(3,2),expires_at:20}],5),Ok(2));
+  assert_eq!(t.revoke_identity(2,7),1);
+  assert_eq!(t.check(r(3,2),10),Ok(()));
+ }
+ #[test]fn forged_issuer_and_stale_epoch_fail(){
+  let mut t=LeaseTable::<1>::new();
+  assert_eq!(t.delegate(g(1,7),r(99,1),
+   TimedGrant{grant:g(2,1),expires_at:20},5),
+   Err(LeaseFault::Denied(CapabilityError::Owner)));
+  let mut stale=g(2,1);stale.epoch=1;
+  assert_eq!(t.delegate(g(1,7),r(1,1),
+   TimedGrant{grant:stale,expires_at:20},5),Err(LeaseFault::Invalid));
+ }
+}
