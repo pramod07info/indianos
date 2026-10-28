@@ -253,3 +253,87 @@ mod grant_expiration_tests{
         assert_eq!(authorize_until(g,r,1,20),Err(CapabilityError::Revoked));
     }
 }
+
+
+// R007: supervised least-authority delegation table. The authenticated
+// parent request and child PID/generation MUST come from kernel scheduler data.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum DelegationError{Invalid,Full,Duplicate,Unauthorized(CapabilityError),Missing}
+pub struct DelegationTable<const N:usize>{entries:[Option<Grant>;N]}
+impl<const N:usize> DelegationTable<N>{
+    pub const fn new()->Self{Self{entries:[None;N]}}
+    pub fn issue(&mut self,parent:Grant,parent_request:Request,
+        child:Grant)->Result<(),DelegationError>{
+        if child.owner==0||child.generation==0||child.epoch==0||
+            child.rights==0||child.revoked||child.resource!=parent.resource||
+            child.epoch!=parent.epoch {
+            return Err(DelegationError::Invalid);
+        }
+        let mut required=parent_request;
+        required.required_rights=child.rights;
+        authorize(parent,required).map_err(DelegationError::Unauthorized)?;
+        if self.entries.iter().flatten().any(|old|
+            old.owner==child.owner&&old.resource==child.resource){
+            return Err(DelegationError::Duplicate);
+        }
+        let slot=self.entries.iter_mut().find(|v|v.is_none())
+            .ok_or(DelegationError::Full)?;
+        *slot=Some(child);Ok(())
+    }
+    pub fn check(&self,request:Request)->Result<(),DelegationError>{
+        let grant=self.entries.iter().flatten().find(|g|
+            g.owner==request.caller&&g.resource==request.resource)
+            .ok_or(DelegationError::Missing)?;
+        authorize(*grant,request).map_err(DelegationError::Unauthorized)
+    }
+    pub fn revoke_process(&mut self,pid:u32,generation:u64)->usize{
+        if pid==0||generation==0{return 0;}
+        let mut n=0;
+        for slot in &mut self.entries{
+            if slot.is_some_and(|g|g.owner==pid&&g.generation==generation){
+                *slot=None;n+=1;
+            }
+        }
+        n
+    }
+    pub fn active(&self)->usize{self.entries.iter().flatten().count()}
+}
+#[cfg(test)]mod r007_delegation_tests{
+    use super::*;
+    fn parent()->Grant{Grant{owner:2,resource:6,rights:7,epoch:4,generation:8,revoked:false}}
+    fn request()->Request{Request{caller:2,resource:6,required_rights:1,
+        current_epoch:4,current_generation:8}}
+    fn child()->Grant{Grant{owner:3,resource:6,rights:3,epoch:4,generation:1,revoked:false}}
+    #[test]fn delegates_restricted_rights_and_revokes_exact_incarnation(){
+        let mut d=DelegationTable::<2>::new();
+        assert_eq!(d.issue(parent(),request(),child()),Ok(()));
+        let check=Request{caller:3,resource:6,required_rights:2,
+            current_epoch:4,current_generation:1};
+        assert_eq!(d.check(check),Ok(()));
+        assert_eq!(d.revoke_process(3,2),0);
+        assert_eq!(d.check(check),Ok(()));
+        assert_eq!(d.revoke_process(3,1),1);
+        assert_eq!(d.check(check),Err(DelegationError::Missing));
+    }
+    #[test]fn rejects_escalation_replay_and_duplicate_delegation(){
+        let mut d=DelegationTable::<1>::new();
+        let mut over=child();over.rights=8;
+        assert_eq!(d.issue(parent(),request(),over),
+            Err(DelegationError::Unauthorized(CapabilityError::Rights)));
+        d.issue(parent(),request(),child()).unwrap();
+        assert_eq!(d.issue(parent(),request(),child()),Err(DelegationError::Duplicate));
+        let mut other=child();other.owner=4;
+        assert_eq!(d.issue(parent(),request(),other),Err(DelegationError::Full));
+        let stale=Request{current_generation:2,..Request{caller:3,resource:6,
+            required_rights:1,current_epoch:4,current_generation:1}};
+        assert_eq!(d.check(stale),
+            Err(DelegationError::Unauthorized(CapabilityError::Stale)));
+    }
+    #[test]fn revoked_parent_never_issues_new_authority(){
+        let mut d=DelegationTable::<1>::new();
+        let mut p=parent();p.revoked=true;
+        assert_eq!(d.issue(p,request(),child()),
+            Err(DelegationError::Unauthorized(CapabilityError::Revoked)));
+        assert_eq!(d.active(),0);
+    }
+}
