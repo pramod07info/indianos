@@ -565,6 +565,43 @@ mod tests{
   assert_eq!(v.read("/home/note",&mut out),Ok(5));
   assert_eq!(&out[..5],b"okllo");
  }
+ #[test]fn r010_snapshot_restore_survives_remount(){
+  let mut fs=fresh();fs.mkdir("/home").unwrap();
+  fs.create("/home/data",b"before").unwrap();
+  let first=fs.generation();
+  let backup_gen=fs.snapshot_checked("/home/data","/home/backup",first).unwrap();
+  assert!(backup_gen>first);
+  fs.overwrite("/home/data",b"after").unwrap();
+  let now=fs.generation();
+  let restored=fs.restore_snapshot("/home/backup","/home/data",now).unwrap();
+  assert!(restored>now);
+  let mut fs=HierVfs::mount(fs.into_device()).unwrap();
+  let mut output=[0u8;32];
+  assert_eq!(fs.read("/home/data",&mut output),Ok(6));
+  assert_eq!(&output[..6],b"before");
+ }
+ #[test]fn r010_stale_restore_fails_without_mutation(){
+  let mut fs=fresh();fs.mkdir("/home").unwrap();
+  fs.create("/home/data",b"original").unwrap();
+  let before=fs.generation();
+  assert_eq!(fs.snapshot_checked("/home/data","/home/old",before-1),
+    Err(FsError::InvalidVolume));
+  assert_eq!(fs.generation(),before);
+  let mut output=[0u8;16];
+  assert_eq!(fs.read("/home/old",&mut output),Err(FsError::NotFound));
+ }
+ #[test]fn r010_verified_copy_checks_complete_payload(){
+  let mut fs=fresh();
+  let mut data=[0u8;700];for (i,b) in data.iter_mut().enumerate(){*b=(i%251) as u8;}
+  fs.create("/src",&data).unwrap();
+  let next=fs.copy_verified("/src","/dst",fs.generation()).unwrap();
+  assert_eq!(next,fs.generation());
+  let mut fs=HierVfs::mount(fs.into_device()).unwrap();
+  let mut output=[0u8;700];
+  assert_eq!(fs.read("/dst",&mut output),Ok(700));
+  assert_eq!(output,data);
+ }
+
 }
 
 /// R009: bounded seek/read/persist abstraction for authenticated file
@@ -586,4 +623,38 @@ impl<D:BlockDevice> HierVfs<D>{
   Ok((n,self.generation()))
  }
 
+}
+
+ 
+/// R010 immutable-consumer snapshot and crash-safe restore primitives.
+/// Snapshot allocation and restore both use the existing CRC-verified
+/// alternate-bank filesystem commit, not partial block writes.
+impl<D:BlockDevice> HierVfs<D>{
+ pub fn snapshot_checked(&mut self,source:&str,backup:&str,
+  generation:u64)->Result<u64,FsError>{
+  if self.generation()!=generation{return Err(FsError::InvalidVolume);}
+  self.copy_file(source,backup)?;
+  Ok(self.generation())
+ }
+ pub fn restore_snapshot(&mut self,backup:&str,destination:&str,
+  generation:u64)->Result<u64,FsError>{
+  if self.generation()!=generation{return Err(FsError::InvalidVolume);}
+  self.copy_replace(backup,destination)?;
+  Ok(self.generation())
+ }
+ pub fn copy_verified(&mut self,source:&str,target:&str,
+  generation:u64)->Result<u64,FsError>{
+  if self.generation()!=generation{return Err(FsError::InvalidVolume);}
+  // Verify the source's CRC and complete length before reserving
+  // destination metadata. The full-file API never truncates silently.
+  let mut original=[0u8;MAX_FILE_BYTES];
+  let n=self.read(source,&mut original)?;
+  self.copy_file(source,target)?;
+  let mut verify=[0u8;MAX_FILE_BYTES];
+  let stored=self.read(target,&mut verify)?;
+  if stored!=n||verify[..stored]!=original[..n]{
+   return Err(FsError::InvalidVolume);
+  }
+  Ok(self.generation())
+ }
 }
