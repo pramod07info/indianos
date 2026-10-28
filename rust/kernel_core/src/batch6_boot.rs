@@ -600,3 +600,101 @@ mod r010_boot_throttle_tests{
   assert_eq!(boot.health().desktop,Some(id(3)));
  }
 }
+
+ 
+/// R011 runtime service-readiness coordinator. The kernel scheduler is the
+/// authority for PID+epoch identities; launch callbacks must be wired by PID1.
+/// A desktop input gate requires the compositor and its two core applications.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum DesktopService{Terminal,Files}
+pub struct DesktopReadiness{
+ init:Identity,desktop:Identity,terminal:Option<Identity>,
+ files:Option<Identity>,deadline:u64,revision:u64,
+}
+impl DesktopReadiness{
+ pub fn from_health(health:BootHealth,deadline:u64)->Result<Self,Error>{
+  if !health.ready_for_desktop_input{return Err(Error::State);}
+  let init=health.pid1.ok_or(Error::State)?;
+  let desktop=health.desktop.ok_or(Error::State)?;
+  if init.pid==desktop.pid{return Err(Error::State);}
+  Ok(Self{init,desktop,terminal:None,files:None,deadline,revision:1})
+ }
+ pub fn revision(&self)->u64{self.revision}
+ pub fn input_ready(&self,health:BootHealth,now:u64)->bool{
+  now<=self.deadline&&health.ready_for_desktop_input&&
+   health.pid1==Some(self.init)&&health.desktop==Some(self.desktop)&&
+   self.terminal.is_some()&&self.files.is_some()
+ }
+ pub fn start_service(&mut self,kind:DesktopService,id:Identity,
+   now:u64)->Result<u64,Error>{
+  if now>self.deadline||id.pid==0||id.generation==0||
+     id.pid==self.init.pid||id.pid==self.desktop.pid||
+     self.terminal.is_some_and(|s|s.pid==id.pid)||
+     self.files.is_some_and(|s|s.pid==id.pid){return Err(Error::State);}
+  let slot=match kind{
+   DesktopService::Terminal=>&mut self.terminal,
+   DesktopService::Files=>&mut self.files,
+  };
+  if slot.is_some(){return Err(Error::State);}
+  let next=self.revision.checked_add(1).ok_or(Error::State)?;
+  *slot=Some(id);self.revision=next;Ok(next)
+ }
+ /// Dead service identities are exact-generation matched; stale events
+ /// cannot revoke a restarted application's readiness.
+ pub fn process_exited(&mut self,dead:Identity)->bool{
+  let mut changed=false;
+  if self.terminal==Some(dead){self.terminal=None;changed=true;}
+  if self.files==Some(dead){self.files=None;changed=true;}
+  if changed{self.revision=self.revision.saturating_add(1);}
+  changed
+ }
+ pub fn reset_desktop(&mut self,health:BootHealth,deadline:u64)
+   ->Result<(),Error>{
+  if !health.ready_for_desktop_input||health.pid1!=Some(self.init){
+   return Err(Error::State);
+  }
+  let current=health.desktop.ok_or(Error::State)?;
+  if current.pid!=self.desktop.pid||current.generation<=self.desktop.generation{
+   return Err(Error::State);
+  }
+  let next=self.revision.checked_add(1).ok_or(Error::State)?;
+  self.desktop=current;self.terminal=None;self.files=None;
+  self.deadline=deadline;self.revision=next;Ok(())
+ }
+}
+#[cfg(test)]
+mod r011_desktop_readiness_tests{
+ use super::*;
+ fn id(pid:u32,generation:u64)->Identity{Identity{pid,generation}}
+ fn health(desktop:u64)->BootHealth{BootHealth{phase:Phase::DesktopReady,
+  pid1:Some(id(1,3)),desktop:Some(id(2,desktop)),
+  remaining_desktop_restarts:2,ready_for_desktop_input:true}}
+ #[test]fn terminal_and_files_required_before_first_input(){
+  let mut a=DesktopReadiness::from_health(health(5),100).unwrap();
+  assert!(!a.input_ready(health(5),10));
+  a.start_service(DesktopService::Terminal,id(3,1),20).unwrap();
+  assert!(!a.input_ready(health(5),30));
+  a.start_service(DesktopService::Files,id(4,1),40).unwrap();
+  assert!(a.input_ready(health(5),100));
+  assert!(!a.input_ready(health(5),101));
+ }
+ #[test]fn stale_exit_and_duplicate_pid_do_not_destroy_readiness(){
+  let mut a=DesktopReadiness::from_health(health(5),100).unwrap();
+  a.start_service(DesktopService::Terminal,id(3,2),10).unwrap();
+  assert_eq!(a.start_service(DesktopService::Files,id(3,3),11),Err(Error::State));
+  a.start_service(DesktopService::Files,id(4,2),12).unwrap();
+  assert!(!a.process_exited(id(4,1)));
+  assert!(a.input_ready(health(5),12));
+  assert!(a.process_exited(id(4,2)));
+  assert!(!a.input_ready(health(5),13));
+ }
+ #[test]fn desktop_recovery_requires_epoch_advance_and_restarts_apps(){
+  let mut a=DesktopReadiness::from_health(health(5),100).unwrap();
+  a.start_service(DesktopService::Terminal,id(3,1),2).unwrap();
+  a.start_service(DesktopService::Files,id(4,1),3).unwrap();
+  assert_eq!(a.reset_desktop(health(5),200),Err(Error::State));
+  a.reset_desktop(health(6),200).unwrap();
+  assert!(!a.input_ready(health(6),5));
+  assert!(!a.input_ready(health(5),5));
+ }
+}

@@ -658,3 +658,94 @@ impl<D:BlockDevice> HierVfs<D>{
   Ok(self.generation())
  }
 }
+
+ 
+/// R011 full-file bounded COW transaction: validate every chunk first,
+/// publish exactly one durable bank after all staged mutations succeed.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct RangeChange<'a>{pub offset:u64,pub bytes:&'a[u8]}
+impl<D:BlockDevice> HierVfs<D>{
+ pub fn write_transaction(&mut self,path:&str,expected_generation:u64,
+  changes:&[RangeChange<'_>])->Result<u64,FsError>{
+  if changes.is_empty()||self.generation()!=expected_generation{
+   return Err(FsError::InvalidVolume);
+  }
+  let mut staged=[0u8;MAX_FILE_BYTES];
+  let existing=self.read(path,&mut staged)?;
+  let mut size=existing;
+  for change in changes{
+   if change.bytes.is_empty()||change.bytes.len()>MAX_TRANSFER||
+      change.offset>size as u64{return Err(FsError::TooLarge);}
+   let from=usize::try_from(change.offset).map_err(|_|FsError::TooLarge)?;
+   let end=from.checked_add(change.bytes.len()).ok_or(FsError::TooLarge)?;
+   if end>MAX_FILE_BYTES{return Err(FsError::TooLarge);}
+   staged[from..end].copy_from_slice(change.bytes);
+   size=size.max(end);
+  }
+  // One COW metadata publication for the entire requested batch.
+  self.overwrite(path,&staged[..size])?;
+  Ok(self.generation())
+ }
+ pub fn append_transaction(&mut self,path:&str,expected_generation:u64,
+  chunks:&[&[u8]])->Result<u64,FsError>{
+  if chunks.is_empty()||self.generation()!=expected_generation{
+   return Err(FsError::InvalidVolume);
+  }
+  let mut staged=[0u8;MAX_FILE_BYTES];
+  let mut size=self.read(path,&mut staged)?;
+  for &chunk in chunks{
+   if chunk.is_empty()||chunk.len()>MAX_TRANSFER{return Err(FsError::TooLarge);}
+   let end=size.checked_add(chunk.len()).ok_or(FsError::TooLarge)?;
+   if end>MAX_FILE_BYTES{return Err(FsError::TooLarge);}
+   staged[size..end].copy_from_slice(chunk);size=end;
+  }
+  self.overwrite(path,&staged[..size])?;
+  Ok(self.generation())
+ }
+}
+#[cfg(test)]
+mod r011_transaction_tests{
+ use super::*;
+ use crate::block::{BlockDevice,BlockError,SECTOR_BYTES};
+ const COUNT:usize=100;
+ #[derive(Clone)]
+ struct Disk{sectors:[[u8;SECTOR_BYTES];COUNT]}
+ impl BlockDevice for Disk{
+  fn sector_count(&self)->u64{COUNT as u64}
+  fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   *out=*self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?;Ok(())
+  }
+  fn write_sector(&mut self,lba:u64,data:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   *self.sectors.get_mut(lba as usize).ok_or(BlockError::OutOfRange)?=*data;Ok(())
+  }
+ }
+ fn ready()->HierVfs<Disk>{
+  let mut fs=HierVfs::format_blank(Disk{sectors:[[0;SECTOR_BYTES];COUNT]}).unwrap();
+  fs.create("/app",b"12345").unwrap();fs
+ }
+ #[test]fn two_updates_commit_once_and_survive_remount(){
+  let mut fs=ready();let before=fs.generation();
+  let after=fs.write_transaction("/app",before,&[
+   RangeChange{offset:1,bytes:b"ab"},RangeChange{offset:5,bytes:b"Z"}]).unwrap();
+  assert_eq!(after,before+1);
+  let mut fs=HierVfs::mount(fs.into_device()).unwrap();
+  let mut out=[0u8;16];assert_eq!(fs.read("/app",&mut out),Ok(6));
+  assert_eq!(&out[..6],b"1ab45Z");
+ }
+ #[test]fn invalid_second_chunk_never_publishes_first_chunk(){
+  let mut fs=ready();let before=fs.generation();
+  assert_eq!(fs.write_transaction("/app",before,&[
+    RangeChange{offset:0,bytes:b"AAA"},
+    RangeChange{offset:99,bytes:b"bad"}]),Err(FsError::TooLarge));
+  assert_eq!(fs.generation(),before);
+  let mut out=[0u8;10];assert_eq!(fs.read("/app",&mut out),Ok(5));
+  assert_eq!(&out[..5],b"12345");
+ }
+ #[test]fn atomic_append_maintains_generation_and_rejects_stale_writer(){
+  let mut fs=ready();let before=fs.generation();
+  fs.append_transaction("/app",before,&[b"678",b"9"]).unwrap();
+  assert_eq!(fs.append_transaction("/app",before,&[b"0"]),Err(FsError::InvalidVolume));
+  let mut out=[0u8;16];assert_eq!(fs.read("/app",&mut out),Ok(9));
+  assert_eq!(&out[..9],b"123456789");
+ }
+}
