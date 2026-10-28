@@ -114,6 +114,9 @@ pub extern "C" fn kmain()->!{
         need(crate::workstation_r019::agent_20::smoke().is_ok(),
              b"IndianOS: FATAL R019 developer workstation integrated workflow\n\0");
         log(b"IndianOS: R019 developer workstation edit-build-stage-approval PASSED\n\0");
+        need(crate::workstation_r020::agent_20::smoke().is_ok(),
+             b"IndianOS: FATAL R020 developer workstation real-file session smoke\n\0");
+        log(b"IndianOS: R020 developer workstation session-edit-build-windows PASSED\n\0");
     }
     unsafe{boot_draw_status();}
     #[cfg(feature="test-r029-userspace")]
