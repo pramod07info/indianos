@@ -454,3 +454,63 @@ mod r009_capability_rotation_tests{
   assert_eq!(a.require(old,VIEW,2),Ok(()));
  }
 }
+
+ 
+/// R010 atomic privilege handoff. No process receives a partial grant set:
+/// every requested generation/rights change must be valid before publication.
+/// The trusted scheduler must authenticate every Identity.
+impl<const N:usize> Access<N>{
+ pub fn rotate_batch_atomic(&mut self,requests:&[(Identity,Identity,u32,u64)],
+  now:u64)->Result<usize,Error>{
+  if requests.is_empty()||requests.len()>N{return Err(Error::Invalid);}
+  let mut staged=Self{grants:self.grants};
+  for &(old,new,rights,deadline) in requests{
+   staged.rotate_process_grant(old,new,rights,deadline,now)?;
+  }
+  self.grants=staged.grants;
+  Ok(requests.len())
+ }
+ /// A terminating process cannot transfer rights via its retired PID.
+ pub fn revoke_pid(&mut self,pid:u32)->usize{
+  if pid==0{return 0;}
+  let mut count=0;
+  for slot in &mut self.grants{
+   if let Some(grant)=slot.as_mut(){
+    if grant.owner.pid==pid&&!grant.revoked{grant.revoked=true;count+=1;}
+   }
+  }
+  count
+ }
+}
+#[cfg(test)]
+mod r010_atomic_identity_handoff_tests{
+ use super::*;
+ fn id(pid:u32,generation:u64)->Identity{Identity{pid,generation}}
+ #[test]fn batch_rotates_two_grants_only_after_all_preconditions(){
+  let mut a=Access::<3>::new();
+  a.grant(id(1,1),VIEW|FILE_READ,80).unwrap();
+  a.grant(id(2,1),VIEW|SOCKET,90).unwrap();
+  assert_eq!(a.rotate_batch_atomic(&[
+    (id(1,1),id(1,2),VIEW,60),(id(2,1),id(2,2),SOCKET,65)],10),Ok(2));
+  assert_eq!(a.require(id(1,1),VIEW,15),Err(Error::Denied));
+  assert_eq!(a.require(id(1,2),VIEW,15),Ok(()));
+  assert_eq!(a.require(id(2,2),SOCKET,15),Ok(()));
+ }
+ #[test]fn failing_second_rotation_keeps_every_previous_grant(){
+  let mut a=Access::<2>::new();a.grant(id(1,1),VIEW,80).unwrap();
+  a.grant(id(2,1),FILE_READ,80).unwrap();
+  assert_eq!(a.rotate_batch_atomic(&[
+    (id(1,1),id(1,2),VIEW,60),
+    (id(2,1),id(2,2),FILE_WRITE,60)],10),Err(Error::Denied));
+  assert_eq!(a.require(id(1,1),VIEW,20),Ok(()));
+  assert_eq!(a.require(id(1,2),VIEW,20),Err(Error::Denied));
+ }
+ #[test]fn retiring_pid_clears_only_its_grant(){
+  let mut a=Access::<2>::new();
+  a.grant(id(1,2),VIEW,90).unwrap();a.grant(id(2,2),FILE_READ,90).unwrap();
+  assert_eq!(a.revoke_pid(1),1);
+  assert_eq!(a.revoke_pid(1),0);
+  assert_eq!(a.require(id(1,2),VIEW,10),Err(Error::Denied));
+  assert_eq!(a.require(id(2,2),FILE_READ,10),Ok(()));
+ }
+}
