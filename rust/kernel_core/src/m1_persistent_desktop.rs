@@ -639,3 +639,150 @@ impl<D:BlockDevice,const P:usize,const E:usize,const W:usize,
   editor.close(caller,discard).map_err(EditorRouteError::Editor)
  }
 }
+
+
+
+/// R019 WS01/WS03: authenticated project-tree CRUD on durable HierVfs.
+/// Only the currently running Desktop identity and explicit VFS capability
+/// can invoke these APIs; no direct untrusted application access is provided.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum ProjectRouteError {
+ Permission(EditorRouteError),
+ Project(crate::m1_project_workspace::Error),
+}
+impl<D:BlockDevice,const P:usize,const E:usize,const W:usize,
+ const K:usize,const G:usize,const Q:usize> Desktop<D,P,E,W,K,G,Q>{
+ pub fn project_create(&mut self,caller:Identity,now:u64,
+    project:&mut crate::m1_project_workspace::ProjectTree,name:&str)
+    ->Result<(),ProjectRouteError>{
+  self.admit_editor(caller,now,FILE_WRITE).map_err(ProjectRouteError::Permission)?;
+  project.create(caller,&mut self.volume,name).map_err(ProjectRouteError::Project)
+ }
+ pub fn project_open(&mut self,caller:Identity,now:u64,
+    project:&mut crate::m1_project_workspace::ProjectTree,name:&str)
+    ->Result<(),ProjectRouteError>{
+  self.admit_editor(caller,now,FILE_READ).map_err(ProjectRouteError::Permission)?;
+  project.open(caller,&mut self.volume,name).map_err(ProjectRouteError::Project)
+ }
+ pub fn project_list(&mut self,caller:Identity,now:u64,
+    project:&crate::m1_project_workspace::ProjectTree,out:&mut[u8])
+    ->Result<usize,ProjectRouteError>{
+  self.admit_editor(caller,now,FILE_READ).map_err(ProjectRouteError::Permission)?;
+  project.list(caller,&mut self.volume,out).map_err(ProjectRouteError::Project)
+ }
+ pub fn project_refresh(&mut self,caller:Identity,now:u64,
+    project:&mut crate::m1_project_workspace::ProjectTree)
+    ->Result<u64,ProjectRouteError>{
+  self.admit_editor(caller,now,FILE_READ).map_err(ProjectRouteError::Permission)?;
+  project.refresh(caller,&mut self.volume).map_err(ProjectRouteError::Project)
+ }
+ pub fn project_create_file(&mut self,caller:Identity,now:u64,
+    project:&mut crate::m1_project_workspace::ProjectTree,
+    name:&str,data:&[u8])->Result<(),ProjectRouteError>{
+  self.admit_editor(caller,now,FILE_WRITE).map_err(ProjectRouteError::Permission)?;
+  project.create_file(caller,&mut self.volume,name,data).map_err(ProjectRouteError::Project)
+ }
+ pub fn project_read_file(&mut self,caller:Identity,now:u64,
+    project:&crate::m1_project_workspace::ProjectTree,
+    name:&str,out:&mut[u8])->Result<usize,ProjectRouteError>{
+  self.admit_editor(caller,now,FILE_READ).map_err(ProjectRouteError::Permission)?;
+  project.read_file(caller,&mut self.volume,name,out).map_err(ProjectRouteError::Project)
+ }
+ pub fn project_save_file(&mut self,caller:Identity,now:u64,
+    project:&mut crate::m1_project_workspace::ProjectTree,
+    name:&str,data:&[u8])->Result<(),ProjectRouteError>{
+  self.admit_editor(caller,now,FILE_WRITE).map_err(ProjectRouteError::Permission)?;
+  project.save_file(caller,&mut self.volume,name,data).map_err(ProjectRouteError::Project)
+ }
+ pub fn project_rename_file(&mut self,caller:Identity,now:u64,
+    project:&mut crate::m1_project_workspace::ProjectTree,
+    old:&str,new:&str)->Result<(),ProjectRouteError>{
+  self.admit_editor(caller,now,FILE_WRITE).map_err(ProjectRouteError::Permission)?;
+  project.rename_file(caller,&mut self.volume,old,new).map_err(ProjectRouteError::Project)
+ }
+ pub fn project_delete_file(&mut self,caller:Identity,now:u64,
+    project:&mut crate::m1_project_workspace::ProjectTree,
+    name:&str)->Result<(),ProjectRouteError>{
+  self.admit_editor(caller,now,FILE_WRITE).map_err(ProjectRouteError::Permission)?;
+  project.delete_file(caller,&mut self.volume,name).map_err(ProjectRouteError::Project)
+ }
+ pub fn project_rename(&mut self,caller:Identity,now:u64,
+    project:&mut crate::m1_project_workspace::ProjectTree,
+    name:&str)->Result<(),ProjectRouteError>{
+  self.admit_editor(caller,now,FILE_WRITE).map_err(ProjectRouteError::Permission)?;
+  project.rename_project(caller,&mut self.volume,name).map_err(ProjectRouteError::Project)
+ }
+ pub fn project_remove_empty(&mut self,caller:Identity,now:u64,
+    project:&mut crate::m1_project_workspace::ProjectTree)
+    ->Result<(),ProjectRouteError>{
+  self.admit_editor(caller,now,FILE_WRITE).map_err(ProjectRouteError::Permission)?;
+  project.remove_empty_project(caller,&mut self.volume).map_err(ProjectRouteError::Project)
+ }
+ pub fn project_close(&self,caller:Identity,now:u64,
+    project:&mut crate::m1_project_workspace::ProjectTree)
+    ->Result<(),ProjectRouteError>{
+  self.admit_editor(caller,now,FILE_READ).map_err(ProjectRouteError::Permission)?;
+  project.close(caller).map_err(ProjectRouteError::Project)
+ }
+}
+
+
+#[cfg(test)]
+mod r019_project_desktop_integration_tests {
+ use super::*;
+ use crate::block::{BlockError,SECTOR_BYTES};
+ use crate::batch2_launcher::Image;
+ use crate::batch2_settings::Theme;
+ use crate::m1_project_workspace::ProjectTree;
+ struct Disk{data:[[u8;SECTOR_BYTES];100]}
+ impl BlockDevice for Disk {
+  fn sector_count(&self)->u64{100}
+  fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{
+   *out=*self.data.get(lba as usize).ok_or(BlockError::OutOfRange)?;Ok(())
+  }
+  fn write_sector(&mut self,lba:u64,data:&[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{
+   *self.data.get_mut(lba as usize).ok_or(BlockError::OutOfRange)?=*data;Ok(())
+  }
+ }
+ type TestDesk=Desktop<Disk,3,3,2,2,3,8>;
+ fn identity(pid:u32)->Identity{Identity{pid,generation:1}}
+ fn image(pid:u32)->Launch{
+  Launch{pid,generation:1,image:Image{
+   image_id:pid,entry:0x1000,mapped_end:0x2000,verified:true}}
+ }
+ fn settings()->Settings{Settings{
+  theme:Theme::Dark,pointer_speed:5,key_repeat:10}}
+ #[test]fn real_project_operations_authorize_desktop_and_survive_remount(){
+  let fs=HierVfs::format_blank(Disk{data:[[0;SECTOR_BYTES];100]}).unwrap();
+  let mut desktop=TestDesk::from_mounted(fs);
+  desktop.start(identity(1),image(1),identity(2),image(2),
+    settings(),8,50).unwrap();
+  let mut project=ProjectTree::new();
+  assert_eq!(desktop.project_create(identity(2),1,&mut project,"demo"),Ok(()));
+  assert_eq!(desktop.project_create_file(identity(2),1,&mut project,"code",b"hello"),Ok(()));
+  let mut result=[0u8;32];
+  assert_eq!(desktop.project_read_file(identity(2),1,&project,"code",&mut result),Ok(5));
+  assert_eq!(&result[..5],b"hello");
+  let recycled=Identity{pid:2,generation:2};
+  assert!(desktop.project_save_file(recycled,1,&mut project,"code",b"bad").is_err());
+  assert_eq!(desktop.project_rename_file(identity(2),1,&mut project,"code","main"),Ok(()));
+  assert_eq!(desktop.project_rename(identity(2),1,&mut project,"next"),Ok(()));
+  let disk=desktop.into_device();
+  let mut remounted=HierVfs::mount(disk).unwrap();
+  let mut data=[0u8;32];
+  assert_eq!(remounted.read("/work/next/main",&mut data),Ok(5));
+  assert_eq!(&data[..5],b"hello");
+ }
+ #[test]fn expired_capability_rejects_mutation_before_disk_write(){
+  let fs=HierVfs::format_blank(Disk{data:[[0;SECTOR_BYTES];100]}).unwrap();
+  let mut desktop=TestDesk::from_mounted(fs);
+  desktop.start(identity(1),image(1),identity(2),image(2),
+    settings(),8,5).unwrap();
+  let mut project=ProjectTree::new();
+  assert!(desktop.project_create(identity(2),5,&mut project,"demo").is_err());
+  let mut listing=[0u8;32];
+  assert!(desktop.volume.list_dir("/work/demo",&mut listing).is_err());
+ }
+}

@@ -1,0 +1,311 @@
+//! R019 WS01/WS03: authenticated project tree on the existing durable HierVfs.
+//!
+//! Source files and directories are REAL persistent sector-backed objects.
+//! The allocation-free R027 volume currently supports eight objects, so this
+//! is a bounded service, not an unlimited developer workspace or a GUI.
+//! A trusted Desktop grants read/write permissions before dispatching here.
+use crate::batch5_session::Identity;
+use crate::block::BlockDevice;
+use crate::durablefs::{FsError, MAX_FILE_BYTES};
+use crate::hier_vfs::HierVfs;
+
+pub const NAME_MAX: usize = 12;
+pub const PROJECT_PATH_MAX: usize = 22;
+const PARENT: &str = "/work";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Error {
+    Unauthorized,
+    Invalid,
+    NotOpen,
+    AlreadyOpen,
+    Stale,
+    Full,
+    Dirty,
+    Fs(FsError),
+}
+impl From<FsError> for Error { fn from(e: FsError) -> Self { Self::Fs(e) } }
+
+/// A detached session does not retain disk bytes or become a source of truth.
+/// The owned process generation and filesystem generation must both match.
+pub struct ProjectTree {
+    owner: Option<Identity>,
+    path: [u8; PROJECT_PATH_MAX],
+    length: usize,
+    generation: u64,
+}
+impl ProjectTree {
+    pub const fn new() -> Self {
+        Self { owner: None, path: [0; PROJECT_PATH_MAX],
+               length: 0, generation: 0 }
+    }
+    fn check(&self, caller: Identity) -> Result<(), Error> {
+        if caller.pid == 0 || caller.generation == 0 || self.owner != Some(caller) {
+            return Err(Error::Unauthorized);
+        }
+        Ok(())
+    }
+    fn check_fresh<D: BlockDevice>(&self, caller: Identity,
+        fs: &HierVfs<D>) -> Result<(), Error> {
+        self.check(caller)?;
+        if fs.generation() != self.generation { return Err(Error::Stale); }
+        Ok(())
+    }
+    fn valid(name: &str) -> Result<(), Error> {
+        if name.is_empty() || name.len() > NAME_MAX ||
+           name.bytes().any(|b| !(b.is_ascii_alphanumeric() || b == b'-' || b == b'_')) {
+            return Err(Error::Invalid);
+        }
+        Ok(())
+    }
+    fn project_path(name: &str) -> Result<([u8; PROJECT_PATH_MAX], usize), Error> {
+        Self::valid(name)?;
+        let bytes = name.as_bytes();
+        let size = PARENT.len() + 1 + bytes.len();
+        if size > PROJECT_PATH_MAX { return Err(Error::Invalid); }
+        let mut path = [0u8; PROJECT_PATH_MAX];
+        path[..PARENT.len()].copy_from_slice(PARENT.as_bytes());
+        path[PARENT.len()] = b'/';
+        path[PARENT.len() + 1..size].copy_from_slice(bytes);
+        Ok((path, size))
+    }
+    fn pathname(&self) -> &str {
+        core::str::from_utf8(&self.path[..self.length]).unwrap()
+    }
+    fn child(&self, name: &str) -> Result<([u8; PROJECT_PATH_MAX], usize), Error> {
+        Self::valid(name)?;
+        let len = self.length + 1 + name.len();
+        if len > PROJECT_PATH_MAX { return Err(Error::Invalid); }
+        let mut buf = [0; PROJECT_PATH_MAX];
+        buf[..self.length].copy_from_slice(&self.path[..self.length]);
+        buf[self.length] = b'/';
+        buf[self.length + 1..len].copy_from_slice(name.as_bytes());
+        Ok((buf, len))
+    }
+    fn str_path(path: &[u8], len: usize) -> &str {
+        core::str::from_utf8(&path[..len]).unwrap()
+    }
+
+    /// Create a real COW-backed project directory, then attach to it.
+    /// Creating the shared parent may succeed independently if subsequent
+    /// project creation exhausts disk capacity; it never deletes user files.
+    pub fn create<D: BlockDevice>(&mut self, caller: Identity,
+        fs: &mut HierVfs<D>, name: &str) -> Result<(), Error> {
+        if self.owner.is_some() { return Err(Error::AlreadyOpen); }
+        if caller.pid == 0 || caller.generation == 0 { return Err(Error::Unauthorized); }
+        let (path, len) = Self::project_path(name)?;
+        match fs.mkdir(PARENT) {
+            Ok(()) | Err(FsError::Exists) => (),
+            Err(e) => return Err(e.into()),
+        };
+        fs.mkdir(Self::str_path(&path, len))?;
+        self.path = path;
+        self.length = len;
+        self.generation = fs.generation();
+        self.owner = Some(caller);
+        Ok(())
+    }
+    /// Attach an existing persistent project only if it is a real directory.
+    /// No arbitrary paths or .. traversal are accepted from an application.
+    pub fn open<D: BlockDevice>(&mut self, caller: Identity,
+        fs: &mut HierVfs<D>, name: &str) -> Result<(), Error> {
+        if self.owner.is_some() { return Err(Error::AlreadyOpen); }
+        if caller.pid == 0 || caller.generation == 0 { return Err(Error::Unauthorized); }
+        let (path, len) = Self::project_path(name)?;
+        let mut listing = [0u8; 256];
+        fs.list_dir(Self::str_path(&path, len), &mut listing)?;
+        self.path = path;
+        self.length = len;
+        self.generation = fs.generation();
+        self.owner = Some(caller);
+        Ok(())
+    }
+    /// Guard against unobserved concurrent modifications of the same volume.
+    /// Explicit refresh is required before using the updated project tree.
+    pub fn refresh<D: BlockDevice>(&mut self, caller: Identity,
+        fs: &mut HierVfs<D>) -> Result<u64, Error> {
+        self.check(caller)?;
+        let mut listing = [0u8; 256];
+        fs.list_dir(self.pathname(), &mut listing)?;
+        self.generation = fs.generation();
+        Ok(self.generation)
+    }
+    /// Copy actual on-disk directory entries into a caller-owned buffer.
+    pub fn list<D: BlockDevice>(&self, caller: Identity,
+        fs: &mut HierVfs<D>, out: &mut [u8]) -> Result<usize, Error> {
+        self.check_fresh(caller, fs)?;
+        fs.list_dir(self.pathname(), out).map_err(Error::Fs)
+    }
+    /// Real durable create; safe leaf names cannot escape project root.
+    pub fn create_file<D: BlockDevice>(&mut self, caller: Identity,
+        fs: &mut HierVfs<D>, name: &str, data: &[u8]) -> Result<(), Error> {
+        self.check_fresh(caller, fs)?;
+        if data.len() > MAX_FILE_BYTES { return Err(Error::Full); }
+        let (path, len) = self.child(name)?;
+        fs.create(Self::str_path(&path, len), data)?;
+        self.generation = fs.generation();
+        Ok(())
+    }
+    pub fn read_file<D: BlockDevice>(&self, caller: Identity,
+        fs: &mut HierVfs<D>, name: &str, out: &mut [u8]) -> Result<usize, Error> {
+        self.check_fresh(caller, fs)?;
+        let (path, len) = self.child(name)?;
+        fs.read(Self::str_path(&path, len), out).map_err(Error::Fs)
+    }
+    /// Replaces the whole committed file transactionally via the COW backend.
+    pub fn save_file<D: BlockDevice>(&mut self, caller: Identity,
+        fs: &mut HierVfs<D>, name: &str, data: &[u8]) -> Result<(), Error> {
+        self.check_fresh(caller, fs)?;
+        if data.len() > MAX_FILE_BYTES { return Err(Error::Full); }
+        let (path, len) = self.child(name)?;
+        fs.overwrite(Self::str_path(&path, len), data)?;
+        self.generation = fs.generation();
+        Ok(())
+    }
+    pub fn rename_file<D: BlockDevice>(&mut self, caller: Identity,
+        fs: &mut HierVfs<D>, source: &str, target: &str) -> Result<(), Error> {
+        self.check_fresh(caller, fs)?;
+        if source == target { return Err(Error::Invalid); }
+        let (a, alen) = self.child(source)?;
+        let (b, blen) = self.child(target)?;
+        fs.rename_file(Self::str_path(&a, alen), Self::str_path(&b, blen))?;
+        self.generation = fs.generation();
+        Ok(())
+    }
+    pub fn delete_file<D: BlockDevice>(&mut self, caller: Identity,
+        fs: &mut HierVfs<D>, name: &str) -> Result<(), Error> {
+        self.check_fresh(caller, fs)?;
+        let (path, len) = self.child(name)?;
+        fs.unlink(Self::str_path(&path, len))?;
+        self.generation = fs.generation();
+        Ok(())
+    }
+    /// Atomic directory-tree rename is delegated to the existing R031.4 COW
+    /// implementation; no file data is copied into a temporary RAM directory.
+    pub fn rename_project<D: BlockDevice>(&mut self, caller: Identity,
+        fs: &mut HierVfs<D>, name: &str) -> Result<(), Error> {
+        self.check_fresh(caller, fs)?;
+        let (target, len) = Self::project_path(name)?;
+        fs.rename_dir(self.pathname(), Self::str_path(&target, len))?;
+        self.path = target;
+        self.length = len;
+        self.generation = fs.generation();
+        Ok(())
+    }
+    /// Remove ONLY an empty project; existing files are never recursively
+    /// destroyed. An explicit caller command must opt in to the deletion.
+    pub fn remove_empty_project<D: BlockDevice>(&mut self, caller: Identity,
+        fs: &mut HierVfs<D>) -> Result<(), Error> {
+        self.check_fresh(caller, fs)?;
+        fs.rmdir(self.pathname())?;
+        *self = Self::new();
+        Ok(())
+    }
+    pub fn close(&mut self, caller: Identity) -> Result<(), Error> {
+        self.check(caller)?;
+        *self = Self::new(); Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::block::{BlockError, SECTOR_BYTES};
+    const SECTORS: usize = 100;
+    struct Disk { sectors: [[u8; SECTOR_BYTES]; SECTORS] }
+    impl Disk { fn new() -> Self { Self { sectors: [[0; SECTOR_BYTES]; SECTORS] } } }
+    impl BlockDevice for Disk {
+        fn sector_count(&self) -> u64 { SECTORS as u64 }
+        fn read_sector(&mut self, lba: u64, out: &mut [u8; SECTOR_BYTES])
+            -> Result<(), BlockError> {
+            *out = *self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?;
+            Ok(())
+        }
+        fn write_sector(&mut self, lba: u64, data: &[u8; SECTOR_BYTES])
+            -> Result<(), BlockError> {
+            *self.sectors.get_mut(lba as usize).ok_or(BlockError::OutOfRange)? = *data;
+            Ok(())
+        }
+    }
+    fn a() -> Identity { Identity { pid: 2, generation: 1 } }
+    fn stale_id() -> Identity { Identity { pid: 2, generation: 2 } }
+    fn fresh() -> HierVfs<Disk> {
+        HierVfs::format_blank(Disk::new()).unwrap()
+    }
+    #[test]
+    fn persistent_project_create_save_rename_and_reboot() {
+        let mut fs = fresh(); let mut p = ProjectTree::new();
+        p.create(a(), &mut fs, "demo").unwrap();
+        p.create_file(a(), &mut fs, "main", b"fn main(){}").unwrap();
+        p.save_file(a(), &mut fs, "main", b"fn main(){42}").unwrap();
+        p.rename_file(a(), &mut fs, "main", "src").unwrap();
+        p.rename_project(a(), &mut fs, "next").unwrap();
+        p.close(a()).unwrap();
+        let disk = fs.into_device();
+        let mut remounted = HierVfs::mount(disk).unwrap();
+        let mut again = ProjectTree::new();
+        again.open(a(), &mut remounted, "next").unwrap();
+        let mut out = [0u8; 32];
+        assert_eq!(again.read_file(a(), &mut remounted, "src", &mut out), Ok(13));
+        assert_eq!(&out[..13], b"fn main(){42}");
+        let mut list = [0u8; 32];
+        let len = again.list(a(), &mut remounted, &mut list).unwrap();
+        assert_eq!(&list[..len], b"f:src\n");
+    }
+    #[test]
+    fn traversal_and_identity_stale_access_cannot_modify_files() {
+        let mut fs = fresh(); let mut p = ProjectTree::new();
+        p.create(a(), &mut fs, "demo").unwrap();
+        assert_eq!(p.create_file(stale_id(), &mut fs, "x", b"x"), Err(Error::Unauthorized));
+        assert_eq!(p.create_file(a(), &mut fs, "../sys", b"x"), Err(Error::Invalid));
+        assert_eq!(p.create_file(a(), &mut fs, "bad/file", b"x"), Err(Error::Invalid));
+        p.create_file(a(), &mut fs, "file", b"original").unwrap();
+        assert_eq!(p.save_file(stale_id(), &mut fs, "file", b"bad"), Err(Error::Unauthorized));
+        let mut out = [0u8; 8];
+        assert_eq!(p.read_file(a(), &mut fs, "file", &mut out), Ok(8));
+        assert_eq!(&out, b"original");
+    }
+    #[test]
+    fn external_write_requires_refresh_not_lost_update() {
+        let mut fs = fresh(); let mut p = ProjectTree::new();
+        p.create(a(), &mut fs, "demo").unwrap();
+        p.create_file(a(), &mut fs, "file", b"old").unwrap();
+        fs.overwrite("/work/demo/file", b"new").unwrap();
+        assert_eq!(p.save_file(a(), &mut fs, "file", b"bad"), Err(Error::Stale));
+        p.refresh(a(), &mut fs).unwrap();
+        let mut out = [0u8; 16];
+        assert_eq!(p.read_file(a(), &mut fs, "file", &mut out), Ok(3));
+        assert_eq!(&out[..3], b"new");
+    }
+    #[test]
+    fn empty_project_removal_never_deletes_nonempty_content() {
+        let mut fs = fresh(); let mut p = ProjectTree::new();
+        p.create(a(), &mut fs, "demo").unwrap();
+        p.create_file(a(), &mut fs, "code", b"important").unwrap();
+        assert!(p.remove_empty_project(a(), &mut fs).is_err());
+        let mut out = [0u8; 16];
+        assert_eq!(p.read_file(a(), &mut fs, "code", &mut out), Ok(9));
+        assert_eq!(&out[..9], b"important");
+        p.delete_file(a(), &mut fs, "code").unwrap();
+        p.remove_empty_project(a(), &mut fs).unwrap();
+        assert_eq!(p.close(a()), Err(Error::Unauthorized));
+    }
+    #[test]
+    fn bad_projects_or_missing_parent_are_not_attached() {
+        let mut fs = fresh(); let mut p = ProjectTree::new();
+        assert_eq!(p.open(a(), &mut fs, "missing"), Err(Error::Fs(FsError::NotFound)));
+        assert_eq!(p.create(a(), &mut fs, "bad.name"), Err(Error::Invalid));
+        p.create(a(), &mut fs, "demo").unwrap();
+        assert_eq!(p.create(a(), &mut fs, "other"), Err(Error::AlreadyOpen));
+        assert_eq!(p.open(a(), &mut fs, "demo"), Err(Error::AlreadyOpen));
+    }
+    #[test]
+    fn listing_short_destination_preserves_caller_bytes() {
+        let mut fs = fresh(); let mut p = ProjectTree::new();
+        p.create(a(), &mut fs, "demo").unwrap();
+        p.create_file(a(), &mut fs, "code", b"x").unwrap();
+        let mut short = [0xAAu8; 1];
+        assert!(p.list(a(), &mut fs, &mut short).is_err());
+        assert_eq!(short, [0xAA]);
+    }
+}
