@@ -43,6 +43,8 @@ pub mod workstation_r028;
 pub mod workstation_r029;
 /// R030: 20 bounded real-file IDE productivity and safety modules.
 pub mod workstation_r030;
+/// R031: 20 source-file, editor, terminal, build, debug and pane workstreams.
+pub mod workstation_r031;
 mod syscall;
 mod program;
 mod initramfs;
