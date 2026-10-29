@@ -132,6 +132,9 @@ pub extern "C" fn kmain()->!{
         need(crate::workstation_r025::agent_20::smoke().is_ok(),
              b"IndianOS: FATAL R025 developer-workstation project-build-debug guest smoke\n\0");
         log(b"IndianOS: R025 developer-workstation project-build-debug acceptance PASSED\n\0");
+        need(crate::workstation_r026::agent_20::smoke().is_ok(),
+             b"IndianOS: FATAL R026 integrated workstation QEMU acceptance\n\0");
+        log(b"IndianOS: R026 real-workstation project editor terminal build debug PASSED\n\0");
     }
     unsafe{boot_draw_status();}
     #[cfg(feature="test-r029-userspace")]
