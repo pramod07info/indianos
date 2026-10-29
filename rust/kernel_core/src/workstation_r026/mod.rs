@@ -2,6 +2,22 @@
 //! Real RamFs source editing is not disk persistence. Build/debug state requires trusted worker.
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 pub enum Error{Invalid,Denied,Full,Missing,Stale,Conflict,Overflow,NotReady}
+impl From<crate::workstation_r025::Error> for Error{
+ fn from(e:crate::workstation_r025::Error)->Self{
+  use crate::workstation_r025::Error as Old;
+  match e{
+   Old::Invalid=>Self::Invalid,
+   Old::Denied=>Self::Denied,
+   Old::Full=>Self::Full,
+   Old::Missing=>Self::Missing,
+   Old::Stale=>Self::Stale,
+   Old::Conflict=>Self::Conflict,
+   Old::Overflow=>Self::Overflow,
+   Old::NotReady=>Self::NotReady,
+  }
+ }
+}
+
 pub mod agent_01;
 pub mod agent_02;
 pub mod agent_03;
