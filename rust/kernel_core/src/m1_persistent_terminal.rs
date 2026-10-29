@@ -19,7 +19,7 @@ pub const COMMAND_VERBS:&[&str]=&[
  "help","pwd","tools","ls","cat","write","append","mkdir","mv",
  "cp","rm","mkfile","truncate","head","count","rmdir","mvdir",
  "pread","pwrite","lines","hash","stat","tail","find","grep","cmp",
- "touch","copynew","replace","appendln",
+ "touch","copynew","replace","appendln","health",
 ];
 /// Complete exactly one printable lower-case verb prefix. Ambiguous matches,
 /// empty prefixes and user-supplied paths never cause completion or I/O.
@@ -88,7 +88,26 @@ pub fn command<D:BlockDevice,const N:usize>(
  let line=core::str::from_utf8(input).map_err(|_|Error::Invalid)?.trim();
  if line=="help"{return publish(b"pwd ls /dir cat /path write /path text append /path text mkdir /dir mv /old /new cp /src /dst rm /path mkfile /path truncate /path head /path count rmdir /dir mvdir /old /new pread /file offset count pwrite /file@offset text",out);}
  if line=="pwd"{return publish(b"/",out);}
- if line=="tools"{return publish(b"count lines tail find grep hash cmp stat touch copynew replace appendln",out);}
+ if line=="tools"{return publish(b"count lines tail find grep hash cmp stat touch copynew replace appendln health",out);}
+ if line=="health"{
+  auth.require(caller,FILE_READ,now).map_err(|_|Error::Denied)?;
+  let health=fs.mounted_health().map_err(Error::Io)?;
+  let mut scratch=[0u8;96];
+  let status=match health.redundancy{
+   crate::durablefs::Redundancy::Healthy=>b"healthy ".as_slice(),
+   crate::durablefs::Redundancy::Degraded=>b"degraded ".as_slice(),
+  };
+  scratch[..status.len()].copy_from_slice(status);
+  let mut at=status.len();
+  for (prefix,value) in [
+   (b"gen:".as_slice(),health.current_generation),
+   (b" copies:".as_slice(),health.valid_copies as u64),
+  ]{
+   scratch[at..at+prefix.len()].copy_from_slice(prefix);at+=prefix.len();
+   let n=publish_number(value,&mut scratch[at..])?;at+=n;
+  }
+  return publish(&scratch[..at],out);
+ }
  let (verb,raw)=line.split_once(' ').ok_or(Error::Unknown)?;
  let mut name=[0u8;64];
  match verb{
@@ -495,8 +514,42 @@ mod tests{
   let size=command(fs,access,who,1,cmd,&mut out)?;
   Ok((size,out))
  }
+ #[test]fn m1_r046_readonly_terminal_health_reports_redundancy_and_generation(){
+  let mut fs=HierVfs::format_blank(blank()).unwrap();
+  let auth=grants();
+  let (n,out)=run(&mut fs,&auth,user(),b"health").unwrap();
+  assert_eq!(&out[..n],b"healthy gen:1 copies:2");
+  fs.create("/note",b"committed").unwrap();
+  let before=fs.generation();
+  let (n,out)=run(&mut fs,&auth,user(),b"health").unwrap();
+  assert_eq!(&out[..n],b"healthy gen:2 copies:2");
+  assert_eq!(fs.generation(),before);
+  let mut disk=fs.into_device();
+  disk.data[0][24]^=1; // older metadata invalid, newest still valid
+  let mut fs=HierVfs::mount(disk).unwrap();
+  let (n,out)=run(&mut fs,&auth,user(),b"health").unwrap();
+  assert_eq!(&out[..n],b"degraded gen:2 copies:1");
+  assert_eq!(fs.generation(),before);
+ }
+ #[test]fn m1_r046_health_refuses_stale_identity_and_short_output_without_writes(){
+  let mut fs=HierVfs::format_blank(blank()).unwrap();
+  let auth=grants();
+  let generation=fs.generation();
+  let mut short=[0x5au8;5];
+  assert_eq!(command(&mut fs,&auth,user(),1,b"health",&mut short),
+   Err(Error::OutputTooSmall));
+  assert_eq!(short,[0x5a;5]);
+  assert_eq!(fs.generation(),generation);
+  let stale=Identity{generation:2,..user()};
+  assert_eq!(run(&mut fs,&auth,stale,b"health"),Err(Error::Denied));
+  let mut write_only=Access::<1>::new();
+  write_only.grant(user(),FILE_WRITE,500).unwrap();
+  assert_eq!(run(&mut fs,&write_only,user(),b"health"),Err(Error::Denied));
+  assert_eq!(fs.generation(),generation);
+  assert_eq!(complete_verb(b"heal"),Some("health"));
+ }
  #[test]fn r044_command_registry_drives_unique_safe_completion(){
-  assert_eq!(COMMAND_VERBS.len(),30);
+  assert_eq!(COMMAND_VERBS.len(),31);
   for (i,verb) in COMMAND_VERBS.iter().enumerate(){
    assert!(verb.as_bytes().iter().all(|b|b.is_ascii_lowercase()));
    assert!(!COMMAND_VERBS[..i].contains(verb));
