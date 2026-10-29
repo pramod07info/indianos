@@ -1,0 +1,4 @@
+//! R034/09: Project activity ledger.
+use super::Error;
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]pub struct Event{pub seq:u64,pub actor:u32,pub operation:u8}pub struct Ledger<const N:usize>{events:[Option<Event>;N],len:usize}impl<const N:usize> Ledger<N>{pub fn new()->Self{Self{events:[None;N],len:0}}pub fn push(&mut self,event:Event)->Result<(),Error>{if event.actor==0||event.operation==0||event.seq==0||self.len>0&&event.seq<=self.events[self.len-1].ok_or(Error::Invalid)?.seq{return Err(Error::Stale);}if self.len==N{return Err(Error::Full);}self.events[self.len]=Some(event);self.len+=1;Ok(())}pub fn len(&self)->usize{self.len}}
+#[cfg(test)] mod tests {use super::*;#[test]fn functional_and_boundary_cases(){let mut l=Ledger::<2>::new();l.push(Event{seq:1,actor:7,operation:1}).unwrap();assert_eq!(l.push(Event{seq:1,actor:7,operation:1}),Err(Error::Stale));}}

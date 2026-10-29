@@ -1,0 +1,4 @@
+//! R034/12: Terminal safe output line paging.
+use super::Error;
+pub fn page(data:&[u8],skip:usize,limit:usize,out:&mut[u8])->Result<usize,Error>{if limit==0{return Err(Error::Invalid);}let(mut line,mut a,mut w)=(0usize,0usize,0usize);for(i,b)in data.iter().enumerate(){if *b!=b'\n'{continue;}if line>=skip&&line<skip+limit{let segment=&data[a..=i];if w+segment.len()>out.len(){return Err(Error::Full);}out[w..w+segment.len()].copy_from_slice(segment);w+=segment.len();}line+=1;a=i+1;}if a<data.len()&&line>=skip&&line<skip+limit{let rest=&data[a..];if w+rest.len()>out.len(){return Err(Error::Full);}out[w..w+rest.len()].copy_from_slice(rest);w+=rest.len();}Ok(w)}
+#[cfg(test)] mod tests {use super::*;#[test]fn functional_and_boundary_cases(){let mut b=[0u8;16];let n=page(b"a\nb\nc\n",1,1,&mut b).unwrap();assert_eq!(&b[..n],b"b\n");}}

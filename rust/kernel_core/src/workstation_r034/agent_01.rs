@@ -1,0 +1,4 @@
+//! R034/01: Owner-scoped workspace recent projects.
+use super::Error;
+pub struct Recent<const N:usize>{owner:u64,items:[u32;N],len:usize}impl<const N:usize> Recent<N>{pub fn new(owner:u64)->Self{Self{owner,items:[0;N],len:0}}pub fn visit(&mut self,owner:u64,project:u32)->Result<(),Error>{if owner==0||owner!=self.owner{return Err(Error::Denied);}if project==0||N==0{return Err(Error::Invalid);}let mut old=self.items;let mut n=1;self.items[0]=project;for x in old.iter().take(self.len){if *x!=project&&n<N{self.items[n]=*x;n+=1;}}self.len=n;Ok(())}pub fn at(&self,owner:u64,i:usize)->Result<u32,Error>{if owner!=self.owner||owner==0{return Err(Error::Denied);}self.items.get(i).copied().filter(|_|i<self.len).ok_or(Error::Missing)}}
+#[cfg(test)] mod tests {use super::*;#[test]fn functional_and_boundary_cases(){let mut r=Recent::<2>::new(7);r.visit(7,1).unwrap();r.visit(7,2).unwrap();r.visit(7,1).unwrap();assert_eq!(r.at(7,0),Ok(1));assert_eq!(r.at(7,1),Ok(2));}}

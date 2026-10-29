@@ -1,0 +1,4 @@
+//! R034/11: Terminal command line history with no shell execution.
+use super::Error;
+pub struct Commands<const N:usize>{owner:u32,hashes:[u64;N],len:usize}impl<const N:usize> Commands<N>{pub fn new(owner:u32)->Self{Self{owner,hashes:[0;N],len:0}}pub fn record(&mut self,owner:u32,cmd:&[u8])->Result<(),Error>{if owner==0||owner!=self.owner{return Err(Error::Denied);}if cmd.is_empty()||cmd.len()>128||cmd.contains(&0){return Err(Error::Invalid);}let hash=cmd.iter().fold(0xcbf29ce484222325u64,|a,b|(a^(*b as u64)).wrapping_mul(0x100000001b3));if self.len==N{return Err(Error::Full);}self.hashes[self.len]=hash;self.len+=1;Ok(())}pub fn count(&self,owner:u32)->Result<usize,Error>{if owner!=self.owner{return Err(Error::Denied);}Ok(self.len)}}
+#[cfg(test)] mod tests {use super::*;#[test]fn functional_and_boundary_cases(){let mut c=Commands::<2>::new(7);c.record(7,b"ls /p").unwrap();assert_eq!(c.count(7),Ok(1));assert_eq!(c.record(8,b"ls /p"),Err(Error::Denied));}}

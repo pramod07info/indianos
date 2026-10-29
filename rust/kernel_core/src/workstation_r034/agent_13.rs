@@ -1,0 +1,4 @@
+//! R034/13: Terminal owner session quota.
+use super::Error;
+pub struct Quota{owner:u32,used:usize,limit:usize}impl Quota{pub fn new(owner:u32,limit:usize)->Self{Self{owner,used:0,limit}}pub fn reserve(&mut self,owner:u32,bytes:usize)->Result<(),Error>{if owner==0||owner!=self.owner{return Err(Error::Denied);}let new=self.used.checked_add(bytes).ok_or(Error::Overflow)?;if new>self.limit{return Err(Error::Full);}self.used=new;Ok(())}pub fn free(&mut self,owner:u32,bytes:usize)->Result<(),Error>{if owner!=self.owner{return Err(Error::Denied);}self.used=self.used.checked_sub(bytes).ok_or(Error::Invalid)?;Ok(())}}
+#[cfg(test)] mod tests {use super::*;#[test]fn functional_and_boundary_cases(){let mut q=Quota::new(7,10);q.reserve(7,8).unwrap();assert_eq!(q.reserve(7,3),Err(Error::Full));q.free(7,4).unwrap();q.reserve(7,3).unwrap();}}
