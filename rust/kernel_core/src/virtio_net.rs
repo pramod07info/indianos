@@ -175,6 +175,8 @@ pub struct VirtioNet{
     mac:[u8;6],
     rx:Queue,
     tx:Queue,
+    // A broken completion or TX timeout makes DMA ownership uncertain.
+    faulted:bool,
 }
 impl VirtioNet{
     /// # Safety
@@ -219,7 +221,7 @@ impl VirtioNet{
         unsafe{outb(port+0x12,DEVICE_ACK|DRIVER|DRIVER_OK);}
         compiler_fence(Ordering::SeqCst);
         unsafe{outw(port+0x10,QUEUE_RX);}
-        Ok(Self{port,mac,rx,tx})
+        Ok(Self{port,mac,rx,tx,faulted:false})
     }
     pub fn close(self){
         // Quiesce all DMA before releasing any physical frames to PMM.
@@ -228,9 +230,17 @@ impl VirtioNet{
         self.rx.release();self.tx.release();
     }
 }
+/// Validate used length without untrusted DMA length subtraction/overflow.
+fn receive_payload_len(used_len:usize,capacity:usize)->Result<usize,Error>{
+    if used_len<10 || used_len>1514+10 {return Err(Error::Invalid);}
+    let payload=used_len-10;
+    if payload>capacity {return Err(Error::Invalid);}
+    Ok(payload)
+}
 impl EthernetDevice for VirtioNet{
     fn mac(&self)->[u8;6]{self.mac}
     fn send(&mut self,frame:&[u8])->Result<(),Error>{
+        if self.faulted{return Err(Error::Device);}
         if frame.len()<14 || frame.len()>1514{return Err(Error::Invalid);}
         // A legacy virtio-net frame has a ten-byte header with all
         // segmentation/checksum offload fields clear.
@@ -244,20 +254,36 @@ impl EthernetDevice for VirtioNet{
         unsafe{outw(self.port+0x10,QUEUE_TX);}
         for _ in 0..TIMEOUT{
             if self.tx.complete(){
-                if self.tx.consume().is_none(){return Err(Error::Device);}
+                if self.tx.consume().is_none(){
+                    self.faulted=true;
+                    return Err(Error::Device);
+                }
                 return Ok(());
             }
             core::hint::spin_loop();
         }
+        // Do not reuse the descriptor: the device could still read its DMA buffer.
+        self.faulted=true;
         Err(Error::Timeout)
     }
     fn poll(&mut self,out:&mut [u8])->Result<Option<usize>,Error>{
+        if self.faulted{return Err(Error::Device);}
         if !self.rx.complete(){return Ok(None);}
-        let Some(length)=self.rx.consume()else{return Err(Error::Device);};
-        if length<10 || length>1514+10 || out.len()<length-10{
-            return Err(Error::Invalid);
-        }
-        let n=length-10;
+        let Some(length)=self.rx.consume()else{
+            self.faulted=true;
+            return Err(Error::Device);
+        };
+        let n=match receive_payload_len(length,out.len()){
+            Ok(n)=>n,
+            Err(error)=>{
+                // The descriptor ID was valid. Discard bad input, rearm RX.
+                // Caller receives an error and no bytes are copied.
+                self.rx.offer();
+                compiler_fence(Ordering::Release);
+                unsafe{outw(self.port+0x10,QUEUE_RX);}
+                return Err(error);
+            }
+        };
         compiler_fence(Ordering::Acquire);
         unsafe{ptr::copy_nonoverlapping(self.rx.buffer.add(10),out.as_mut_ptr(),n);}
         self.rx.offer();
@@ -283,4 +309,14 @@ mod tests{
         assert!(direct_map(0xffff800000000000,0x1001).is_none());
         assert!(direct_map(0xffff800000000000,0x1000).is_some());
     }
+    #[test]
+    fn receive_lengths_reject_short_oversized_and_small_caller_buffers(){
+        assert_eq!(receive_payload_len(74,64),Ok(64));
+        assert_eq!(receive_payload_len(1524,1514),Ok(1514));
+        assert_eq!(receive_payload_len(9,1600),Err(Error::Invalid));
+        assert_eq!(receive_payload_len(1525,1600),Err(Error::Invalid));
+        assert_eq!(receive_payload_len(110,99),Err(Error::Invalid));
+        assert_eq!(receive_payload_len(usize::MAX,usize::MAX),Err(Error::Invalid));
+    }
+
 }

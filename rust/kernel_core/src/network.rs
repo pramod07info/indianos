@@ -151,18 +151,17 @@ fn dns_query(out:&mut [u8],mac:[u8;6])->usize{
     udp_frame(out,mac,53,&request[..end+4],0x2802)
 }
 fn valid_dns(frame:&[u8],mac:[u8;6])->bool{
-    let Ok(payload)=parse_udp(frame,mac,53)else{return false;};
-    if payload.len()<12+DNS_NAME.len()+4+16 ||
-       be16(&payload[..2])!=0x2828 ||
-       be16(&payload[2..4])!=0x8180 ||
-       be16(&payload[4..6])!=1 || be16(&payload[6..8])!=1 ||
-       &payload[12..12+DNS_NAME.len()]!=DNS_NAME{return false;}
-    let answer=12+DNS_NAME.len()+4;
-    payload[answer..answer+2]==[0xc0,0x0c] &&
-    be16(&payload[answer+2..answer+4])==1 &&
-    be16(&payload[answer+4..answer+6])==1 &&
-    be16(&payload[answer+10..answer+12])==4 &&
-    payload[answer+12..answer+16]==PEER_IP
+    // The trusted NIC-delivered frame first passes Ethernet/IPv4 peer,
+    // destination, length, checksum and fragmentation validation.
+    let Ok(ip)=validate_ipv4(frame,mac)else{return false;};
+    if ip.proto!=17{return false;}
+    let ip_len=be16(&frame[16..18]) as usize;
+    // The M2 verifier binds checksum, ports, query ID, exact question,
+    // response length and expected DNS A answer. Ignore Ethernet padding.
+    crate::m2_network::parse_ipv4_udp_dns_a(
+        &frame[14..14+ip_len],PEER_IP,LOCAL_IP,CLIENT_PORT,0x2828,
+        b"indianos.test"
+    )==Ok(PEER_IP)
 }
 #[derive(Clone,Copy,Debug)]
 pub struct TcpSegment<'a>{pub seq:u32,pub ack:u32,pub flags:u8,pub data:&'a [u8]}
@@ -246,6 +245,7 @@ pub fn run_demo<D:EthernetDevice>(
     transmit(dev,dns_query)?;
     wait_for(dev,valid_dns)?;
     stage(b"IndianOS: R028 UDP DNS A query indianos.test PASSED\n\0");
+    stage(b"IndianOS: M2 live NIC IPv4/UDP DNS verifier PASSED\n\0");
     // Strict stop-and-wait TCP handshake and one request-response exchange.
     transmit(dev,|b,m|tcp_frame(b,m,TCP_SEQ,0,0x02,&[],0x2804))?;
     wait_for(dev,|frame,mac|{
@@ -684,3 +684,64 @@ mod batch1_epoch_udp_tests {
     }
 }
 
+
+
+#[cfg(test)]
+mod r038_live_dns_tests {
+    use super::*;
+    const MAC:[u8;6]=[0x52,0x54,0,0x12,0x34,0x56];
+    fn response()->([u8;FRAME_CAP],usize) {
+        let mut frame=[0u8;FRAME_CAP];
+        let dns_length=12+DNS_NAME.len()+4+16;
+        let udp_length=8+dns_length;
+        let len=14+20+udp_length;
+        ethernet_header(&mut frame,MAC,PEER_MAC,0x0800);
+        ipv4_header(&mut frame[14..34],17,udp_length,0x3828);
+        frame[26..30].copy_from_slice(&PEER_IP);
+        frame[30..34].copy_from_slice(&LOCAL_IP);
+        put16(&mut frame,24,0);
+        let ip_sum=checksum(&frame[14..34]);
+        put16(&mut frame,24,ip_sum);
+        let udp=&mut frame[34..len];
+        put16(udp,0,53);
+        put16(udp,2,CLIENT_PORT);
+        put16(udp,4,udp_length as u16);
+        let dns=&mut udp[8..];
+        dns[..12].copy_from_slice(b"\x28\x28\x81\x80\x00\x01\x00\x01\x00\x00\x00\x00");
+        dns[12..12+DNS_NAME.len()].copy_from_slice(DNS_NAME);
+        let answer=12+DNS_NAME.len();
+        dns[answer..answer+4].copy_from_slice(&[0,1,0,1]);
+        dns[answer+4..answer+20].copy_from_slice(&[
+            0xc0,0x0c,0,1,0,1,0,0,0,60,0,4,
+            PEER_IP[0],PEER_IP[1],PEER_IP[2],PEER_IP[3]
+        ]);
+        let udp_sum=transport_sum(&PEER_IP,&LOCAL_IP,17,udp);
+        put16(udp,6,if udp_sum==0{0xffff}else{udp_sum});
+        (frame,len)
+    }
+    #[test]
+    fn r038_live_dns_accepts_full_checksums_and_ethernet_padding(){
+        let (frame,n)=response();
+        assert!(valid_dns(&frame[..n],MAC));
+        assert!(valid_dns(&frame[..n+4],MAC));
+    }
+    #[test]
+    fn r038_live_dns_rejects_mac_port_answer_and_transaction_tamper(){
+        let (frame,n)=response();
+        let mut bad=frame;bad[0]^=1;
+        assert!(!valid_dns(&bad[..n],MAC));
+        bad=frame;bad[34]^=1;
+        assert!(!valid_dns(&bad[..n],MAC));
+        bad=frame;bad[n-1]^=1;
+        assert!(!valid_dns(&bad[..n],MAC));
+        bad=frame;bad[42]^=1;
+        assert!(!valid_dns(&bad[..n],MAC));
+    }
+    #[test]
+    fn r038_live_dns_rejects_truncation_and_fragmentation(){
+        let (frame,n)=response();
+        assert!(!valid_dns(&frame[..n-1],MAC));
+        let mut bad=frame;bad[20]=0x20;
+        assert!(!valid_dns(&bad[..n],MAC));
+    }
+}
