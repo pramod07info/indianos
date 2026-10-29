@@ -97,9 +97,30 @@ pub unsafe extern "C" fn pmm_initialize(
     region_count: u64, reader: RegionReader, context: *mut c_void,
 ) -> bool {
     let s = unsafe { state() };
+    unsafe { initialize(s, region_count, reader, context) }
+}
+
+// Separate state permits adversarial map tests without racing the ABI global.
+unsafe fn initialize(s: &mut State, region_count: u64, reader: RegionReader,
+    context: *mut c_void) -> bool {
     s.reset();
     let Some(callback) = reader else { return false; };
     if !(1..=MAX_ENTRIES).contains(&region_count) { return false; }
+    // Validate the WHOLE firmware map before applying the bitmap/span caps.
+    // A large usable region must not hide malformed or overlapping tail
+    // entries, including reserved ranges outside the frames we can manage.
+    for index in 0..region_count {
+        let Some(region) = (unsafe { read_region(callback, index, context) })
+            else { return false; };
+        if region.kind != 0 { continue; }
+        for other_index in 0..region_count {
+            if other_index == index { continue; }
+            let Some(other) = (unsafe { read_region(callback, other_index, context) })
+                else { return false; };
+            if overlap(region.base, region.base + region.length,
+                other.base, other.base + other.length) { return false; }
+        }
+    }
     for index in 0..region_count {
         let Some(region) = (unsafe { read_region(callback, index, context) }) else {
             s.reset();
@@ -114,20 +135,11 @@ pub unsafe extern "C" fn pmm_initialize(
         if begin < PAGE { begin = PAGE; }
         let end = (region.base + region.length) & !(PAGE - 1);
         if end <= begin { continue; }
-        for other_index in 0..region_count {
-            if other_index == index { continue; }
-            let Some(other) = (unsafe { read_region(callback, other_index, context) }) else {
-                s.reset();
-                return false;
-            };
-            if overlap(begin, end, other.base, other.base + other.length) {
-                s.reset();
-                return false;
-            }
-        }
+        // The reader is a trusted immutable boot-map adapter; preflight
+        // above validated even sub-page overlaps before inward alignment.
+        if s.total == MAX_FRAMES as u64 { break; }
         if s.count == MAX_SPANS { s.reset(); return false; }
         let mut count = (end - begin) / PAGE;
-        if s.total == MAX_FRAMES as u64 { break; }
         count = count.min(MAX_FRAMES as u64 - s.total);
         s.spans[s.count] = Span {
             base: begin, count, bit_offset: s.total,
@@ -241,6 +253,50 @@ pub extern "C" fn pmm_self_test() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    unsafe extern "C" fn map_reader(index:u64,out:*mut Region,ctx:*mut c_void)->bool {
+        let map=unsafe { &*(ctx.cast::<Vec<Region>>()) };
+        let Some(region)=map.get(index as usize) else { return false; };
+        unsafe { out.write(*region); }
+        true
+    }
+    fn init_map(state:&mut State,mut map:Vec<Region>)->bool {
+        unsafe { initialize(state,map.len() as u64,Some(map_reader),
+            (&mut map as *mut Vec<Region>).cast()) }
+    }
+    #[test]
+    fn capacity_limit_does_not_hide_invalid_firmware_tail() {
+        let mut s=State::empty();
+        let large=Region{base:PAGE,length:MAX_FRAMES as u64*PAGE,kind:0};
+        let tail=Region{base:0x10_0000_0000,length:PAGE,kind:0};
+        let bad=Region{base:tail.base+1,length:1,kind:2};
+        // A tail usable region conflicts with reserved bytes, even
+        // if the allocator has already filled its bitmap from `large`.
+        assert!(!init_map(&mut s,vec![large,tail,bad]));
+        assert!(!s.initialized); assert_eq!(s.total,0);
+        for bad in [Region{base:u64::MAX,length:2,kind:1},
+            Region{base:0x10_0000_0000,length:0,kind:1}] {
+            assert!(!init_map(&mut s,vec![large,
+                Region{base:0x10_0000_0000,length:PAGE,kind:0},bad]));
+            assert!(!s.initialized); assert_eq!(s.total,0);
+        }
+        assert!(init_map(&mut s,vec![large,
+            Region{base:0x10_0000_0000,length:PAGE,kind:0}]));
+        assert_eq!(s.total,MAX_FRAMES as u64);
+    }
+    #[test]
+    fn subpage_conflicts_reject_and_failed_reinitialize_discards_old_state() {
+        let mut s=State::empty();
+        assert!(init_map(&mut s,vec![Region{base:PAGE,length:PAGE,kind:0}]));
+        assert!(!init_map(&mut s,vec![
+            Region{base:PAGE+1,length:PAGE*2-1,kind:0},
+            Region{base:PAGE+2,length:1,kind:1}]));
+        assert!(!s.initialized); assert_eq!(s.total,0);
+        assert!(!init_map(&mut s,vec![Region{base:1,length:1,kind:0}]));
+        assert!(init_map(&mut s,vec![
+            Region{base:PAGE,length:PAGE,kind:0},
+            Region{base:PAGE*2,length:PAGE,kind:1}]));
+        assert_eq!(s.total,1); assert_eq!(s.physical_at(0),Some(PAGE));
+    }
     #[test]
     fn contiguous_allocator_contract_rejects_invalid_requests(){
         let mut frame=0u64;
