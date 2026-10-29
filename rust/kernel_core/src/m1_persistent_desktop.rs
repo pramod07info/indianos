@@ -143,7 +143,22 @@ impl<D:BlockDevice,const P:usize,const E:usize,const W:usize,
   self.rights.require(caller,VIEW,now).map_err(Error::Auth)?;
   let mut line=[0u8;MAX_LINE];
   match self.input.feed(key,&mut line).map_err(Error::Keyboard)?{
-   KeyEvent::Submitted(n)=>self.execute(caller,now,&line[..n],out).map(Some),
+   KeyEvent::Submitted(n)=>{
+    match self.execute(caller,now,&line[..n],out){
+     Ok(n)=>Ok(Some(n)),
+     Err(error)=>{
+      // Only Terminal-level failures are safely retryable. A graphical
+      // redraw error might occur AFTER the file write actually committed.
+      if matches!(error,Error::Terminal(_)){
+       for &ch in &line[..n]{
+        self.input.feed(ch,&mut[]).map_err(Error::Keyboard)?;
+       }
+       self.request_redraw(caller)?;
+      }
+      Err(error)
+     }
+    }
+   },
    KeyEvent::Typed|KeyEvent::Erased=>{
     self.request_redraw(caller)?;
     Ok(None)
@@ -313,6 +328,20 @@ mod tests{
   resumed.start(user(1),load(1),user(2),load(2),settings(),9,100).unwrap();
   assert_eq!(resumed.execute(user(2),1,b"cat /home/note",&mut out),Ok(8));
   assert_eq!(&out[..8],b"IndianOS");
+ }
+ #[test]fn r039_failed_terminal_command_keeps_editable_input(){
+  let disk=Disk{data:[[0u8;SECTOR_BYTES];SECTORS]};
+  let mut gui=TestDesk::from_mounted(HierVfs::format_blank(disk).unwrap());
+  gui.start(user(1),load(1),user(2),load(2),settings(),8,99).unwrap();
+  for &ch in b"mkdir /home"{gui.key(user(2),1,ch,&mut[]).unwrap();}
+  let mut short=[0xaau8;2];
+  assert_eq!(gui.key(user(2),1,b'\n',&mut short),
+    Err(Error::Terminal(TerminalError::OutputTooSmall)));
+  assert_eq!(gui.input.length(),11);
+  assert_eq!(short,[0xaa;2]);
+  let mut out=[0u8;256];
+  assert_eq!(gui.key(user(2),1,b'\n',&mut out),Ok(Some(7)));
+  assert_eq!(gui.input.length(),0);
  }
  #[test]fn authenticated_keyboard_enters_persistent_commands(){
   let disk=Disk{data:[[0u8;SECTOR_BYTES];SECTORS]};

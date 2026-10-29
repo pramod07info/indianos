@@ -271,6 +271,38 @@ impl ProjectTree {
         Ok(len)
     }
 
+    /// Replace all non-overlapping literal Unicode occurrences within ONE
+    /// project file, committing with exactly one COW overwrite.
+    /// A failed bound/identity/version check cannot partially change disk.
+    pub fn replace_all<D:BlockDevice>(&mut self,caller:Identity,
+        fs:&mut HierVfs<D>,name:&str,needle:&str,replacement:&str
+    )->Result<usize,Error>{
+        self.check_fresh(caller,fs)?;
+        if needle.is_empty(){return Err(Error::Invalid);}
+        let (p,n)=self.child(name)?;
+        let mut previous=[0u8;MAX_FILE_BYTES];
+        let size=fs.read(Self::str_path(&p,n),&mut previous)?;
+        let text=core::str::from_utf8(&previous[..size]).map_err(|_|Error::Invalid)?;
+        let mut updated=[0u8;MAX_FILE_BYTES];
+        let mut input=0usize;let mut output=0usize;let mut count=0usize;
+        while input<size{
+            if text[input..].starts_with(needle){
+                let end=output.checked_add(replacement.len()).ok_or(Error::Full)?;
+                if end>MAX_FILE_BYTES{return Err(Error::Full);}
+                updated[output..end].copy_from_slice(replacement.as_bytes());
+                output=end;input+=needle.len();count+=1;
+            }else{
+                let width=text[input..].chars().next().unwrap().len_utf8();
+                if output+width>MAX_FILE_BYTES{return Err(Error::Full);}
+                updated[output..output+width].copy_from_slice(&previous[input..input+width]);
+                output+=width;input+=width;
+            }
+        }
+        if count==0||updated[..output]==previous[..size]{return Ok(count);}
+        fs.overwrite(Self::str_path(&p,n),&updated[..output])?;
+        self.generation=fs.generation();
+        Ok(count)
+    }
     /// Navigate to an absolute source character line/column, respecting UTF-8.
     pub fn source_offset<D: BlockDevice>(&self, caller: Identity,
         fs: &mut HierVfs<D>, name: &str, line: usize, column: usize
@@ -526,4 +558,33 @@ mod tests {
         assert!(p.list(a(), &mut fs, &mut short).is_err());
         assert_eq!(short, [0xAA]);
     }
+    #[test]
+    fn r039_unicode_replace_all_survives_disk_remount(){
+        let mut fs=fresh();let mut p=ProjectTree::new();
+        p.create(a(),&mut fs,"demo").unwrap();
+        p.create_file(a(),&mut fs,"code","α β α α".as_bytes()).unwrap();
+        assert_eq!(p.replace_all(a(),&mut fs,"code","α","lambda"),Ok(3));
+        let generation=fs.generation();
+        assert_eq!(p.replace_all(a(),&mut fs,"code","missing","value"),Ok(0));
+        assert_eq!(fs.generation(),generation);
+        p.close(a()).unwrap();
+        let mut fs=HierVfs::mount(fs.into_device()).unwrap();
+        let mut p=ProjectTree::new();p.open(a(),&mut fs,"demo").unwrap();
+        let mut out=[0;64];let n=p.open_source(a(),&mut fs,"code",&mut out).unwrap();
+        assert_eq!(&out[..n],b"lambda \xce\xb2 lambda lambda");
+    }
+    #[test]
+    fn r039_replace_all_invalid_oversize_and_stale_owner_are_atomic(){
+        let mut fs=fresh();let mut p=ProjectTree::new();
+        p.create(a(),&mut fs,"demo").unwrap();
+        p.create_file(a(),&mut fs,"code",b"aaaa").unwrap();
+        let generation=fs.generation();
+        assert_eq!(p.replace_all(stale_id(),&mut fs,"code","a","X"),Err(Error::Unauthorized));
+        assert_eq!(p.replace_all(a(),&mut fs,"code","","X"),Err(Error::Invalid));
+        assert_eq!(p.replace_all(a(),&mut fs,"code","a",&"X".repeat(MAX_FILE_BYTES)),Err(Error::Full));
+        assert_eq!(fs.generation(),generation);
+        fs.overwrite("/work/demo/code",b"external").unwrap();
+        assert_eq!(p.replace_all(a(),&mut fs,"code","e","E"),Err(Error::Stale));
+    }
+
 }
