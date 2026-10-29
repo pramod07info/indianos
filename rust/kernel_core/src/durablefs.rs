@@ -162,6 +162,9 @@ pub struct VolumeHealth{
 }
 pub struct DurableFs<D:BlockDevice>{
     disk:D,meta:Metadata,active:u64,previous:Option<Metadata>,
+    // Exact observed heads, including an invalid/degraded copy. A stale
+    // mount must not choose a COW bank using obsolete extent ownership.
+    heads:[[u8;SECTOR_BYTES];2],
 }
 impl<D:BlockDevice> DurableFs<D>{
     /// Formats only a fully blank bounded device; caller has opted into writing.
@@ -189,16 +192,18 @@ impl<D:BlockDevice> DurableFs<D>{
             disk.read_sector(lba,&mut observed)?;
             if observed!=data{return Err(FsError::InvalidVolume);}
         }
-        Ok(Self{disk,meta,active:0,previous:Some(meta)})
+        Ok(Self{disk,meta,active:0,previous:Some(meta),heads:[data;2]})
     }
     pub fn mount(mut disk:D)->Result<Self,FsError>{
         if disk.sector_count()<MIN_SECTORS || disk.sector_count()>u32::MAX as u64{
             return Err(FsError::InvalidVolume);
         }
         let mut candidates:[Option<Metadata>;2]=[None,None];
+        let mut heads=[[0u8;SECTOR_BYTES];2];
         for (n,slot) in candidates.iter_mut().enumerate(){
             let mut bytes=[0u8;SECTOR_BYTES];
             disk.read_sector(n as u64,&mut bytes)?;
+            heads[n]=bytes;
             if let Some(meta)=decode(&bytes,disk.sector_count()){
                 if verify_metadata(&mut disk,&meta){*slot=Some(meta);}
             }
@@ -228,7 +233,7 @@ impl<D:BlockDevice> DurableFs<D>{
             (None,Some(b))=>(1,b,None),
             (None,None)=>return Err(FsError::InvalidVolume),
         };
-        Ok(Self{disk,meta,active,previous})
+        Ok(Self{disk,meta,active,previous,heads})
     }
     /// Verify both superblocks and all referenced COW payload checksums
     /// without modifying the device or choosing a destructive recovery path.
@@ -299,6 +304,7 @@ impl<D:BlockDevice> DurableFs<D>{
     /// metadata sector. A failed/partial write leaves the active head intact.
     /// The BlockDevice write contract must durably flush each sector.
     pub fn repair_redundancy(&mut self)->Result<bool,FsError>{
+        self.check_heads()?;
         let health=self.mounted_health()?;
         if health.redundancy==Redundancy::Healthy{return Ok(false);}
         if health.valid_copies!=1{return Err(FsError::InvalidVolume);}
@@ -316,6 +322,7 @@ impl<D:BlockDevice> DurableFs<D>{
             return Err(FsError::InvalidVolume);
         }
         self.previous=Some(self.meta);
+        self.heads[inactive as usize]=bytes;
         Ok(true)
     }
     pub fn generation(&self)->u64{self.meta.generation}
@@ -393,7 +400,19 @@ impl<D:BlockDevice> DurableFs<D>{
             (!present.used || present.bank!=bank) &&
             (!previous.used || previous.bank!=bank))
     }
+    /// The volume owner must serialize whole operations across mounts.
+    /// This detects stale handles between operations, not concurrent DMA
+    /// writers or a substitute for a device-wide filesystem lock.
+    fn check_heads(&mut self)->Result<(),FsError>{
+        for index in 0..2 {
+            let mut observed=[0u8;SECTOR_BYTES];
+            self.disk.read_sector(index as u64,&mut observed)?;
+            if observed!=self.heads[index]{return Err(FsError::InvalidVolume);}
+        }
+        Ok(())
+    }
     fn publish(&mut self,mut proposed:Metadata)->Result<(),FsError>{
+        self.check_heads()?;
         proposed.generation=self.meta.generation.checked_add(1)
             .ok_or(FsError::InvalidVolume)?;
         let inactive=1-self.active;
@@ -408,6 +427,7 @@ impl<D:BlockDevice> DurableFs<D>{
         self.previous=Some(self.meta);
         self.meta=proposed;
         self.active=inactive;
+        self.heads[inactive as usize]=bytes;
         Ok(())
     }
     fn write_bank(&mut self,slot:usize,bank:u8,data:&[u8])->Result<(),FsError>{
@@ -438,6 +458,9 @@ impl<D:BlockDevice> DurableFs<D>{
             (0..ENTRIES).find(|&i|!self.meta.entries[i].used)
                 .ok_or(FsError::Full)?
         };
+        // Check BEFORE writing data, not only when publishing metadata:
+        // another mount may now reference our apparently-unused bank.
+        self.check_heads()?;
         let bank=self.available_bank(index).ok_or(FsError::Full)?;
         self.write_bank(index,bank,data)?;
         let mut next=self.meta;
@@ -520,6 +543,62 @@ impl<D:BlockDevice> DurableFs<D>{
 #[cfg(test)]
 mod tests{
     use super::*;
+    #[derive(Clone)]
+    struct SharedDisk(std::rc::Rc<std::cell::RefCell<Disk>>);
+    impl BlockDevice for SharedDisk {
+        fn sector_count(&self)->u64{MIN_SECTORS}
+        fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+            self.0.borrow_mut().read_sector(lba,out)
+        }
+        fn write_sector(&mut self,lba:u64,data:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+            self.0.borrow_mut().write_sector(lba,data)
+        }
+    }
+    #[test]fn stale_mount_cannot_overwrite_newer_checkpoint_or_live_data_bank(){
+        let shared=SharedDisk(std::rc::Rc::new(std::cell::RefCell::new(blank())));
+        let mut writer=DurableFs::format_blank(shared.clone()).unwrap();
+        writer.create_path("/data",b"initial").unwrap();
+        let mut stale=DurableFs::mount(shared.clone()).unwrap();
+        writer.overwrite_path("/data",b"second").unwrap();
+        writer.overwrite_path("/data",b"newest").unwrap();
+        // After two updates the stale mount's free bank is live again.
+        let before=shared.0.borrow().sectors;
+        let writes=shared.0.borrow().writes;
+        assert_eq!(stale.overwrite_path("/data",b"corrupt"),Err(FsError::InvalidVolume));
+        assert_eq!(stale.create_path("/new",b"bad"),Err(FsError::InvalidVolume));
+        assert_eq!(stale.delete_path("/data"),Err(FsError::InvalidVolume));
+        assert_eq!(stale.rename_path("/data","/moved"),Err(FsError::InvalidVolume));
+        assert_eq!(stale.repair_redundancy(),Err(FsError::InvalidVolume));
+        assert_eq!(shared.0.borrow().writes,writes);
+        assert_eq!(shared.0.borrow().sectors,before);
+        let mut fresh=DurableFs::mount(shared).unwrap();
+        let mut out=[0u8;32];
+        let n=fresh.read_path("/data",&mut out).unwrap();
+        assert_eq!(&out[..n],b"newest");
+        fresh.overwrite_path("/data",b"fresh mount succeeds").unwrap();
+    }
+    #[test]fn changed_inactive_head_and_failed_publish_require_remount(){
+        let mut fs=DurableFs::format_blank(blank()).unwrap();
+        fs.create_path("/data",b"keep").unwrap();
+        let inactive=1-fs.active as usize;
+        fs.disk.sectors[inactive][0]^=1;
+        let writes=fs.disk.writes;
+        assert_eq!(fs.overwrite_path("/data",b"deny"),Err(FsError::InvalidVolume));
+        assert_eq!(fs.disk.writes,writes);
+        // Remounting explicitly observes the degraded copy and retains the
+        // existing recovery behavior; no auto-repair is introduced.
+        let mut fs=DurableFs::mount(fs.into_device()).unwrap();
+        fs.overwrite_path("/data",b"after remount").unwrap();
+        fs.disk.fail_at=Some(fs.disk.writes+4);
+        assert_eq!(fs.overwrite_path("/data",b"torn"),Err(FsError::Io));
+        fs.disk.fail_at=None;
+        let writes=fs.disk.writes;
+        assert_eq!(fs.overwrite_path("/data",b"retry"),Err(FsError::InvalidVolume));
+        assert_eq!(fs.disk.writes,writes);
+        let mut fs=DurableFs::mount(fs.into_device()).unwrap();
+        assert_eq!(get(&mut fs,"/data"),b"after remount");
+        fs.overwrite_path("/data",b"recovered").unwrap();
+    }
     #[derive(Clone)]
     struct Disk{
         sectors:[[u8;SECTOR_BYTES];MIN_SECTORS as usize],
