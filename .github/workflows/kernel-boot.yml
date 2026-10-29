@@ -14,6 +14,12 @@ on:
       # All QEMU Python acceptance tests and regression tests must trigger
       # the full kernel build when their assertions or inputs change.
       - "tools/test_*.py"
+      # The screenshot archive bot makes a docs-only follow-up commit on
+      # main. Reviewer/coordinator require kernel CI green at that exact
+      # new SHA. Run this workflow for screenshots too; the screenshot
+      # workflow itself does NOT watch development/screenshots/**, so
+      # there is no screenshot->kernel->screenshot commit loop.
+      - "development/screenshots/**"
       - "tests/test_*.py"
       - "tests/test_smoke_boot.py"
       - "tests/test_pmm.c"
@@ -81,6 +87,8 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+      - name: Verify exact-main screenshot SHA gate cannot be orphaned
+        run: python3 -m unittest discover -s tests -p 'test_ci_screenshot_sha_gate.py' -v
       - name: Install emulator and image-building dependencies
         run: |
           sudo apt-get update

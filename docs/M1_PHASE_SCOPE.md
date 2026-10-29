@@ -504,3 +504,33 @@ Actual independently executing coding workers launched through this
 GitHub connector: 0. The 20 scoped items are testable work, not
 20 live autonomous programming agents. Exact-head Rust/no_std, M1/QEMU,
 S0 and full kernel boot pass remain required before merge.
+
+
+#### R047 exact-main screenshot-archive CI coordination fix
+
+The 2026-10-29 R047 review revealed an automation deadlock:
+the screenshot capture bot adds a new development/screenshots/ commit
+directly to main after a valid feature merge, but kernel-boot.yml
+excluded screenshots from its push path filter. Because both the
+independent reviewer and coordinator require a successful kernel boot
+at the exact latest main SHA, they refused new PRs after every archive.
+
+R047 now includes development/screenshots/** in the full-kernel
+main push trigger for ordinary human/credentialed commits. Crucially,
+GitHub suppresses on.push workflow execution for writes authenticated
+with its default GITHUB_TOKEN. The screenshot archive workflow therefore
+also receives actions:write and issues an explicit kernel-boot.yml
+workflow_dispatch on main AFTER its screenshot git push succeeds. That
+is GitHub's documented exception to GITHUB_TOKEN recursion suppression.
+A screenshot-only main commit must thus produce new exact-head kernel
+QEMU evidence. The screenshot capture workflow does NOT listen to
+kernel workflow_run events or development/screenshots/** pushes, so
+this cannot cause a screenshot->kernel->screenshot commit loop.
+The tests/test_ci_screenshot_sha_gate.py regression validates the
+full-kernel screenshot path filter, mandatory authenticated explicit
+workflow_dispatch, reviewer SHA gating and anti-recursion contract; it
+is executed by the full kernel workflow itself. Existing human/bot review approvals
+and exact-head Security S0/roadmap conditions remain unchanged.
+This is a prospective workflow fix: it cannot retroactively produce
+a kernel CI run for a pre-existing main SHA, and does not justify
+bypassing any protected-main merge gate.

@@ -30,6 +30,7 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  actions: write  # explicit workflow_dispatch after GITHUB_TOKEN archive push
 concurrency:
   group: desktop-screenshots-${{ github.ref }}
   cancel-in-progress: false
@@ -152,6 +153,18 @@ jobs:
           git commit -m "docs(screenshots): archive genuine $VERSION QEMU desktop ${SOURCE_SHA:0:8}"
           if git push origin HEAD:main; then
             echo "Versioned QEMU screenshot saved on main: $folder"
+            # IMPORTANT: a push authenticated with github.token never
+            # triggers the ordinary on.push Actions workflows. Both
+            # coordinator and reviewer require kernel CI green at the
+            # exact latest main SHA. Explicit workflow_dispatch is the
+            # supported exception to that GitHub recursion guard.
+            # The screenshot workflow itself has no workflow_run trigger,
+            # so this cannot create an infinite screenshot/archive loop.
+            gh workflow run kernel-boot.yml --ref main || {
+              echo "::error::Screenshot archive advanced main but exact-SHA kernel CI could not be dispatched"
+              exit 1
+            }
+            echo "Dispatched exact-main kernel boot verification after screenshot archive"
           else
             echo "::warning::Protected/concurrent main rejected archive push; opening a screenshot-only PR."
             archive_branch="screenshots/capture-$GITHUB_RUN_ID"
