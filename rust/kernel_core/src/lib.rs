@@ -39,6 +39,8 @@ pub mod workstation_r026;
 pub mod workstation_r027;
 /// R028 kernel-backed file operations, editor, terminal, build, debugger, and preferences.
 pub mod workstation_r028;
+/// R029 real developer-workstation file, code editing, terminal, build and UI operations.
+pub mod workstation_r029;
 mod syscall;
 mod program;
 mod initramfs;
