@@ -76,7 +76,7 @@ impl<const N:usize> Env<N>{
  }
  #[test]fn recycled_user_session_is_denied_access_to_environment(){
   let mut env=Env::<1>::new(id(1));env.set(id(1),b"FOO",b"bar").unwrap();
-  assert_eq!(env.expand(id(2),b"\${FOO}",&mut [0;8]),Err(Error::Denied));
+  assert_eq!(env.expand(id(2),b"${FOO}",&mut [0;8]),Err(Error::Denied));
  }
  #[test]fn command_control_bytes_and_sensitive_keys_fail_validation(){
   let mut env=Env::<1>::new(id(1));
