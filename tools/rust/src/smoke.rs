@@ -7,7 +7,7 @@ use std::{
     io::{Read,Write},
     path::{Path,PathBuf},
     process::{Command,Stdio},
-    sync::mpsc,
+    sync::{mpsc,Arc,Mutex},
     thread,
     time::{Duration,Instant,SystemTime,UNIX_EPOCH},
 };
@@ -405,6 +405,32 @@ fn matching_vars(code:&Path)->Option<PathBuf>{
     let vars=code.with_file_name(format!("OVMF_VARS{suffix}"));
     vars.is_file().then_some(vars)
 }
+// Kill and reap on every return path, including monitor/console errors.
+struct QemuChild(std::process::Child);
+impl std::ops::Deref for QemuChild {
+    type Target=std::process::Child;
+    fn deref(&self)->&Self::Target { &self.0 }
+}
+impl std::ops::DerefMut for QemuChild {
+    fn deref_mut(&mut self)->&mut Self::Target { &mut self.0 }
+}
+impl Drop for QemuChild {
+    fn drop(&mut self) { let _=self.0.kill(); let _=self.0.wait(); }
+}
+fn machine_argument(machine:&str,mode:&str)->String {
+    // HPET legacy replacement can suppress PIT IRQ0 during calibration.
+    if mode=="preempt" { format!("{machine},hpet=off") } else { machine.into() }
+}
+fn drain_stderr(mut source:impl Read,tail:&Mutex<Vec<u8>>) {
+    let mut bytes=[0u8;4096];
+    while let Ok(n)=source.read(&mut bytes) {
+        if n==0 { break }
+        let mut saved=tail.lock().unwrap();
+        saved.extend_from_slice(&bytes[..n]);
+        let excess=saved.len().saturating_sub(8192);
+        saved.drain(..excess);
+    }
+}
 pub fn run(args:&[String])->Result<String,String>{
     let iso=PathBuf::from(option(args,"--iso").ok_or("missing --iso")?);
     let ovmf=PathBuf::from(option(args,"--ovmf").ok_or("missing --ovmf")?);
@@ -427,12 +453,11 @@ pub fn run(args:&[String])->Result<String,String>{
     }
 
     let mut command=Command::new(qemu);
-    command.args(["-machine",&machine,"-m","512M"]);
+    command.args(["-machine",&machine_argument(&machine,&mode),"-m","512M"]);
     command.args(["-drive",&format!("if=pflash,unit=0,format=raw,file={},readonly=on",ovmf.display())]);
     command.args(["-cdrom",iso.to_str().ok_or("non-UTF8 ISO path")?,
                   "-boot","d","-display","none","-serial","stdio",
                   "-no-reboot","-no-shutdown"]);
-    if mode=="preempt"{command.arg("-no-hpet");}
 
     let mut tmp:Option<TempVars>=None;
     if let Some(template)=matching_vars(&ovmf){
@@ -460,8 +485,12 @@ pub fn run(args:&[String])->Result<String,String>{
         command.args(["-monitor","none"]);None
     };
     let _cleanup=tmp;
-    let mut child=command.stdin(if mode=="interactive"||mode=="r026"{Stdio::piped()}else{Stdio::null()}).stdout(Stdio::piped())
-        .stderr(Stdio::null()).spawn().map_err(|e|format!("cannot start QEMU: {e}"))?;
+    let mut child=QemuChild(command.stdin(if mode=="interactive"||mode=="r026"{Stdio::piped()}else{Stdio::null()}).stdout(Stdio::piped())
+        .stderr(Stdio::piped()).spawn().map_err(|e|format!("cannot start QEMU: {e}"))?);
+    let stderr_tail=Arc::new(Mutex::new(Vec::new()));
+    let stderr=child.stderr.take().ok_or("no QEMU stderr")?;
+    let saved=Arc::clone(&stderr_tail);
+    let stderr_reader=thread::spawn(move || drain_stderr(stderr,&saved));
     let stdout=child.stdout.take().ok_or("no QEMU stdout")?;
     let mut stdin=if mode=="interactive"||mode=="r026"{child.stdin.take()}else{None};
     #[cfg(unix)]
@@ -471,7 +500,8 @@ pub fn run(args:&[String])->Result<String,String>{
             if let Ok(stream)=UnixStream::connect(path){found=Some(stream);break;}
             thread::sleep(Duration::from_millis(50));
         }
-        Some(found.ok_or("unable to connect to QEMU HMP monitor")?)
+        Some(found.ok_or_else(||format!("unable to connect to QEMU HMP monitor; QEMU stderr: {}",
+            String::from_utf8_lossy(&stderr_tail.lock().unwrap())))?)
     }else{None};
     #[cfg(unix)]
     if let Some(ref hmp)=monitor{
@@ -562,8 +592,9 @@ pub fn run(args:&[String])->Result<String,String>{
         }
     }
     let _=child.kill();
-    let _=child.wait();
+    let status=child.wait().ok();
     let _=reader.join();
+    let _=stderr_reader.join();
     let text=String::from_utf8_lossy(&output).into_owned();
     if !passed {
         let reason=verify(&mode,&text).err().unwrap_or_else(||"QEMU timed out".into());
@@ -579,13 +610,46 @@ pub fn run(args:&[String])->Result<String,String>{
                 text.contains("IndianOS: R014.2 PS/2 data pending without IRQ1"),
                 text.contains("IndianOS user: R014 shell: exit"))
         }else{String::new()};
-        return Err(format!("{reason}\\n{diagnostics}--- QEMU serial output ---\\n{tail}"))
+        return Err(format!("{reason}\nQEMU exit status: {status:?}\n--- QEMU stderr (last 8192 bytes) ---\n{}\n{diagnostics}--- QEMU serial output ---\n{tail}",
+            String::from_utf8_lossy(&stderr_tail.lock().unwrap())))
     }
     Ok(text)
 }
 #[cfg(test)]
 mod tests{
     use super::*;
+    #[test]
+    fn machine_property_preserves_ordinary_modes() {
+        for machine in ["pc","q35"] {
+            assert_eq!(machine_argument(machine,"preempt"),format!("{machine},hpet=off"));
+            for mode in ["normal","keyboard","scheduler","r026"] {
+                assert_eq!(machine_argument(machine,mode),machine);
+            }
+        }
+    }
+    #[test]
+    #[cfg(unix)]
+    fn startup_failure_retains_bounded_stderr_without_blocking() {
+        use std::os::unix::fs::PermissionsExt;
+        let stamp=SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let dir=std::env::temp_dir().join(format!("indianos-smoke-test-{}-{stamp}",std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let _cleanup=TempVars{dir:dir.clone()};
+        let firmware=dir.join("firmware");
+        fs::write(&firmware,b"fixture").unwrap();
+        let fixture=dir.join("fake-qemu");
+        fs::write(&fixture,b"#!/usr/bin/python3\nimport os\nos.write(2, b'x' * 262144)\nos.write(2, b'QEMU fixture: invalid option\\n')\nraise SystemExit(23)\n").unwrap();
+        fs::set_permissions(&fixture,fs::Permissions::from_mode(0o700)).unwrap();
+        let args=vec!["--iso".into(),firmware.display().to_string(),
+            "--ovmf".into(),firmware.display().to_string(),
+            "--qemu".into(),fixture.display().to_string(),"--timeout".into(),"5".into()];
+        let start=Instant::now();
+        let error=run(&args).unwrap_err();
+        assert!(start.elapsed()<Duration::from_secs(5));
+        assert!(error.contains("QEMU fixture: invalid option"),"{error}");
+        assert!(error.contains("QEMU exit status:"));
+        assert!(error.len()<10000);
+    }
     #[test]
     fn rejects_missing_and_out_of_order_markers(){
         assert!(verify("normal","").is_err());

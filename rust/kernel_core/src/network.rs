@@ -446,7 +446,9 @@ impl<const PORTS: usize, const QUEUE: usize> UdpEndpoints<PORTS, QUEUE> {
     pub(crate) fn enqueue(&mut self, dest_port: u16, data: &[u8])
         -> Result<(), SocketError>
     {
-        if data.is_empty() || data.len() > R033_UDP_BYTES { return Err(SocketError::Invalid); }
+        // A UDP datagram can have an empty payload. It still consumes one
+        // queue slot and must be observable as Ok(0), not a missing message.
+        if data.len() > R033_UDP_BYTES { return Err(SocketError::Invalid); }
         let pid = self.ports.iter().flatten().find(|p| p.port == dest_port)
             .map(|p| p.pid).ok_or(SocketError::Denied)?;
         if self.len == QUEUE { return Err(SocketError::Full); }
@@ -458,6 +460,8 @@ impl<const PORTS: usize, const QUEUE: usize> UdpEndpoints<PORTS, QUEUE> {
         self.len += 1;
         Ok(())
     }
+    /// Consume exactly one datagram. Ok(0) is an empty datagram; Empty means
+    /// none is queued. A short destination never consumes the datagram.
     pub fn receive(&mut self, pid: u32, port: u16, out: &mut [u8])
         -> Result<usize, SocketError>
     {
@@ -473,19 +477,36 @@ impl<const PORTS: usize, const QUEUE: usize> UdpEndpoints<PORTS, QUEUE> {
         self.queue[self.len] = None;
         Ok(item.len)
     }
+    /// Close one authenticated binding, discarding only its unread datagrams.
+    /// Other bindings of the same owner remain live. Rebinding cannot inherit
+    /// data delivered before this close, even if the new owner has another PID.
+    pub fn close(&mut self, pid: u32, port: u16) -> Result<(), SocketError> {
+        let index = self.ports.iter().position(|p|
+            p.is_some_and(|entry| entry.pid == pid && entry.port == port)
+        ).ok_or(SocketError::Denied)?;
+        self.ports[index] = None;
+        self.discard_queued(pid, Some(port));
+        Ok(())
+    }
+    fn discard_queued(&mut self, pid: u32, port: Option<u16>) {
+        let original = self.len;
+        let mut kept = 0;
+        for index in 0..original {
+            let item = self.queue[index];
+            let remove = item.is_some_and(|entry|
+                entry.destination_pid == pid &&
+                port.is_none_or(|port| entry.destination_port == port));
+            if !remove { self.queue[kept] = item; kept += 1; }
+        }
+        self.queue[kept..original].fill(None);
+        self.len = kept;
+    }
     pub fn close_all(&mut self, pid: u32) {
         if pid == 0 { return; }
         for p in &mut self.ports {
             if p.is_some_and(|entry| entry.pid == pid) { *p = None; }
         }
-        let mut i = 0;
-        while i < self.len {
-            if self.queue[i].is_some_and(|entry| entry.destination_pid == pid) {
-                for n in i..self.len - 1 { self.queue[n] = self.queue[n + 1]; }
-                self.len -= 1;
-                self.queue[self.len] = None;
-            } else { i += 1; }
-        }
+        self.discard_queued(pid, None);
     }
 }
 #[cfg(test)]
@@ -518,7 +539,7 @@ mod r033_udp_tests {
         let mut t = UdpEndpoints::<2, 1>::new();
         t.bind(5, 6000).unwrap();
         t.bind(6, 6001).unwrap();
-        assert_eq!(t.enqueue(6000, &[]), Err(SocketError::Invalid));
+        assert_eq!(t.enqueue(6000, &[0;R033_UDP_BYTES+1]), Err(SocketError::Invalid));
         t.enqueue(6000, b"x").unwrap();
         assert_eq!(t.enqueue(6001, b"y"), Err(SocketError::Full));
         t.close_all(5);
@@ -587,6 +608,98 @@ mod r034_ingress_tests {
         let sum = transport_sum(&PEER_IP, &LOCAL_IP, 17, udp);
         put16(udp, 6, if sum == 0 { 0xffff } else { sum });
         (frame, 34 + udp_length)
+    }
+
+    #[test]
+    fn empty_wire_datagrams_are_real_fifo_messages_not_empty_queue() {
+        let mut endpoints = UdpEndpoints::<1, 3>::new();
+        endpoints.bind(10,6000).unwrap();
+        for data in [&[][..],&b"payload"[..],&[][..]] {
+            let (frame,n)=peer_frame(6000,data);
+            endpoints.ingest_ethernet_frame(&frame[..n],LOCAL_MAC).unwrap();
+        }
+        let (frame,n)=peer_frame(6000,&[]);
+        assert_eq!(endpoints.ingest_ethernet_frame(&frame[..n],LOCAL_MAC),
+            Err(IngressError::Endpoint(SocketError::Full)));
+        assert_eq!(endpoints.receive(20,6000,&mut []),Err(SocketError::Denied));
+        assert_eq!(endpoints.receive(10,6000,&mut []),Ok(0));
+        assert_eq!(endpoints.receive(10,6000,&mut []),Err(SocketError::TooShort));
+        let mut out=[0xa5;8];
+        assert_eq!(endpoints.receive(10,6000,&mut out),Ok(7));
+        assert_eq!(&out[..7],b"payload");assert_eq!(out[7],0xa5);
+        assert_eq!(endpoints.receive(10,6000,&mut out),Ok(0));
+        assert_eq!(&out[..7],b"payload");
+        assert_eq!(endpoints.receive(10,6000,&mut out),Err(SocketError::Empty));
+    }
+
+    #[test]
+    fn closing_one_port_purges_its_datagrams_and_preserves_other_bindings() {
+        let mut endpoints=UdpEndpoints::<3,5>::new();
+        endpoints.bind(10,6000).unwrap();endpoints.bind(10,6001).unwrap();
+        endpoints.bind(20,7000).unwrap();
+        for (port,data) in [(6000,&b"drop"[..]),(6001,&b"first"[..]),
+            (7000,&b"peer"[..]),(6000,&[][..]),(6001,&b"last"[..])] {
+            let (frame,n)=peer_frame(port,data);
+            endpoints.ingest_ethernet_frame(&frame[..n],LOCAL_MAC).unwrap();
+        }
+        assert_eq!(endpoints.close(20,6000),Err(SocketError::Denied));
+        assert_eq!(endpoints.len,5);
+        assert_eq!(endpoints.close(10,6000),Ok(()));
+        assert_eq!(endpoints.close(10,6000),Err(SocketError::Denied));
+        endpoints.bind(30,6000).unwrap();
+        let mut out=[0u8;8];
+        assert_eq!(endpoints.receive(30,6000,&mut out),Err(SocketError::Empty));
+        for (pid,port,data) in [(10,6001,&b"first"[..]),(20,7000,&b"peer"[..]),
+            (10,6001,&b"last"[..])] {
+            assert_eq!(endpoints.receive(pid,port,&mut out),Ok(data.len()));
+            assert_eq!(&out[..data.len()],data);
+        }
+        assert_eq!(endpoints.len,0);
+        assert!(endpoints.queue.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn epoch_close_denies_stale_owner_and_releases_only_last_binding_identity() {
+        let mut endpoints=EpochUdpEndpoints::<3,3>::new();
+        endpoints.bind(10,1,6000).unwrap();endpoints.bind(10,1,6001).unwrap();
+        endpoints.bind(20,2,7000).unwrap();
+        for (port,data) in [(6000,&[][..]),(6001,&b"live"[..]),(7000,&b"peer"[..])] {
+            let (frame,n)=peer_frame(port,data);
+            endpoints.ingest_ethernet_frame(&frame[..n],LOCAL_MAC).unwrap();
+        }
+        assert_eq!(endpoints.close(10,2,6000),Err(SocketError::Denied));
+        assert_eq!(endpoints.close(20,2,6000),Err(SocketError::Denied));
+        assert_eq!(endpoints.receive(10,1,6000,&mut []),Ok(0));
+        assert_eq!(endpoints.close(10,1,6000),Ok(()));
+        assert_eq!(endpoints.bind(10,2,6000),Err(SocketError::Denied));
+        let mut out=[0u8;8];
+        assert_eq!(endpoints.receive(10,1,6001,&mut out),Ok(4));
+        assert_eq!(&out[..4],b"live");
+        assert_eq!(endpoints.close(10,1,6001),Ok(()));
+        endpoints.bind(10,2,6000).unwrap();
+        assert_eq!(endpoints.close(10,1,6000),Err(SocketError::Denied));
+        assert_eq!(endpoints.receive(10,2,6000,&mut out),Err(SocketError::Empty));
+        assert_eq!(endpoints.receive(20,2,7000,&mut out),Ok(4));
+        assert_eq!(&out[..4],b"peer");
+        endpoints.retire(10,2).unwrap();
+        assert_eq!(endpoints.close(10,2,6000),Err(SocketError::Denied));
+        assert!(endpoints.endpoints.owns(20,7000));
+    }
+
+    #[test]
+    fn zero_capacity_still_checks_empty_datagram_ownership_and_capacity() {
+        let mut no_queue=UdpEndpoints::<1,0>::new();
+        no_queue.bind(10,6000).unwrap();
+        let (frame,n)=peer_frame(6000,&[]);
+        assert_eq!(no_queue.ingest_ethernet_frame(&frame[..n],LOCAL_MAC),
+            Err(IngressError::Endpoint(SocketError::Full)));
+        assert_eq!(no_queue.receive(10,6000,&mut []),Err(SocketError::Empty));
+        no_queue.close(10,6000).unwrap();
+        let mut no_ports=UdpEndpoints::<0,1>::new();
+        assert_eq!(no_ports.bind(10,6000),Err(SocketError::Full));
+        assert_eq!(no_ports.ingest_ethernet_frame(&frame[..n],LOCAL_MAC),
+            Err(IngressError::Endpoint(SocketError::Denied)));
+        assert_eq!(no_ports.close(10,6000),Err(SocketError::Denied));
     }
 
     #[test]
@@ -716,6 +829,19 @@ impl<const PORTS: usize, const QUEUE: usize> EpochUdpEndpoints<PORTS, QUEUE> {
         port: u16, out: &mut [u8]) -> Result<usize,SocketError> {
         if !self.authenticated(pid,generation) { return Err(SocketError::Denied); }
         self.endpoints.receive(pid,port,out)
+    }
+    /// Retire one port without revoking another port of this generation.
+    /// The owner record is released only when its final binding closes.
+    pub fn close(&mut self, pid: u32, generation: u64, port: u16)
+        -> Result<(),SocketError> {
+        if !self.authenticated(pid,generation) { return Err(SocketError::Denied); }
+        self.endpoints.close(pid,port)?;
+        if !self.endpoints.ports.iter().flatten().any(|entry|entry.pid==pid) {
+            for owner in &mut self.owners {
+                if *owner==Some((pid,generation)) { *owner=None; }
+            }
+        }
+        Ok(())
     }
     pub fn ingest_ethernet_frame(&mut self, frame: &[u8], mac: [u8;6])
         -> Result<(),IngressError> {

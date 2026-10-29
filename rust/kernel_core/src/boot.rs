@@ -115,7 +115,8 @@ pub unsafe extern "C" fn boot_initramfs_file(
     if modules.count!=1 || modules.modules.is_null(){return false}
     let file=unsafe {ptr::read_volatile(modules.modules)};
     let Some(file)=(unsafe {file.as_ref()}) else {return false};
-    if file.address.is_null() || !(16..=32*1024*1024).contains(&file.size){return false}
+    if !(16..=32*1024*1024).contains(&file.size) ||
+       !buffer_span_ok(file.address as usize,file.size,1){return false}
     let mut found=Ramfile{bytes:ptr::null(),length:0};
     if !unsafe {indianos_initramfs_lookup(file.address,file.size as usize,path,&mut found)} {
         return false
@@ -130,13 +131,28 @@ fn mask(size:u8,shift:u8)->Option<u32>{
     if size==0 || size>8 || shift>=32 || (size as u32)+(shift as u32)>32 {return None}
     Some(((1u32<<size)-1)<<shift)
 }
+/// Validate arithmetic before creating a slice or using pointer offsets.
+/// This does not establish mapping, allocation provenance, or exclusive access:
+/// those remain requirements of the Limine boot caller. IndianOS uses four-level
+/// x86-64 paging, so both ends must belong to the same 48-bit canonical half.
+fn buffer_span_ok(start:usize,length:u64,alignment:usize)->bool {
+    if start==0 || length==0 || !alignment.is_power_of_two() ||
+       start&(alignment-1)!=0 || length>isize::MAX as u64 {
+        return false
+    }
+    let Ok(length)=usize::try_from(length) else {return false};
+    let Some(end)=start.checked_add(length) else {return false};
+    let first_half=(start as u64)>>47;
+    let last_half=((end-1) as u64)>>47;
+    (first_half==0 || first_half==0x1ffff) && first_half==last_half
+}
 fn framebuffer_ok(f:&Framebuffer)->bool {
-    if f.address.is_null() || f.width==0 || f.height==0 ||
-       f.model!=1 || f.bpp!=32 || f.pitch%4!=0 ||
-       (f.address as usize)&3!=0 ||
-       f.width>u64::MAX/4 || f.pitch<f.width*4 ||
-       f.height>u64::MAX/f.pitch ||
-       f.height>(usize::MAX as u64)/f.pitch {
+    if f.width==0 || f.height==0 || f.model!=1 || f.bpp!=32 ||
+       f.pitch%4!=0 || f.width>u64::MAX/4 || f.pitch<f.width*4 {
+        return false
+    }
+    let Some(length)=f.pitch.checked_mul(f.height) else {return false};
+    if !buffer_span_ok(f.address as usize,length,core::mem::align_of::<u32>()) {
         return false
     }
     let Some(r)=mask(f.red_size,f.red_shift) else {return false};
@@ -240,6 +256,54 @@ mod tests{
         assert_eq!(mask(8,24),Some(0xff000000));
         assert_eq!(mask(9,3),None);
         assert_eq!(mask(8,29),None);
+    }
+    // These are arithmetic descriptors only; no synthetic pointer is read.
+    #[test]
+    fn buffer_span_boundaries(){
+        assert!(buffer_span_ok(0x1000,4096,4));
+        assert!(buffer_span_ok(0xffff_8000_0000_0000,4096,4));
+        assert!(buffer_span_ok(0x0000_7fff_ffff_fffc,4,4));
+        assert!(!buffer_span_ok(0,4,4));
+        assert!(!buffer_span_ok(0x1000,0,4));
+        assert!(!buffer_span_ok(0x1001,4,4));
+        assert!(!buffer_span_ok(0x1000,4,3));
+        assert!(!buffer_span_ok(0x1000,4,0));
+        assert!(!buffer_span_ok(0x1000,isize::MAX as u64+1,1));
+        assert!(!buffer_span_ok(usize::MAX-3,4,4));
+        assert!(!buffer_span_ok(0x0000_8000_0000_0000,4,4));
+        assert!(!buffer_span_ok(0xffff_7fff_ffff_fffc,4,4));
+        assert!(!buffer_span_ok(0x0000_7fff_ffff_fffc,8,4));
+        assert!(!buffer_span_ok(0x0000_7fff_ffff_ffff,0xffff_0000_0000_0002,1));
+        // Module buffers have byte alignment but the same range constraints.
+        assert!(buffer_span_ok(0x1001,16,1));
+        assert!(!buffer_span_ok(0x0000_7fff_ffff_fff8,16,1));
+    }
+    fn framebuffer_descriptor(address:usize)->Framebuffer {
+        Framebuffer{address:address as *mut u8,width:2,height:2,pitch:8,
+            bpp:32,model:1,red_size:8,red_shift:16,green_size:8,
+            green_shift:8,blue_size:8,blue_shift:0}
+    }
+    #[test]
+    fn framebuffer_span_checks(){
+        let mut f=framebuffer_descriptor(0xffff_8000_0000_1000);
+        assert!(framebuffer_ok(&f));
+        f.address=0x0000_7fff_ffff_fff8 as *mut u8;
+        assert!(!framebuffer_ok(&f));
+        f.address=(usize::MAX-7) as *mut u8;
+        assert!(!framebuffer_ok(&f));
+        f.address=0x1001 as *mut u8;
+        assert!(!framebuffer_ok(&f));
+        f.address=0x1000 as *mut u8;
+        f.height=u64::MAX;
+        assert!(!framebuffer_ok(&f));
+        f.height=1;
+        f.pitch=1u64<<63;
+        assert!(!framebuffer_ok(&f));
+        f.pitch=4;
+        assert!(!framebuffer_ok(&f));
+        f.pitch=8;
+        f.green_shift=16;
+        assert!(!framebuffer_ok(&f));
     }
     #[test]
     fn framebuffer_prefix_layout(){

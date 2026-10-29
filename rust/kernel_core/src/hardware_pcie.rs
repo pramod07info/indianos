@@ -54,10 +54,14 @@ pub fn scan<C:CpuProbe,P:BridgeProbe>(
  // are validated before enqueue. No blind scan of 256 buses.
  let mut scheduled=[false;256];
  let mut queue=[0u8;MAX_DISCOVERED_BUSES];
+ // A queued bus inherits every ancestor's window transitively. Each
+ // child's ceiling must fit its parent's ceiling; bus numbers increase.
+ let mut ceilings=[255u8;MAX_DISCOVERED_BUSES];
+ let mut parents=[0usize;MAX_DISCOVERED_BUSES];
  let mut tail=1usize;let mut head=0usize;
  scheduled[0]=true;
  while head<tail{
-  let bus=queue[head];head+=1;
+  let current=head;let bus=queue[current];head+=1;
   state.scanned_buses+=1;
   for slot in 0..32u8{
    let Some(raw0)=provider.read_header(bus,slot,0).map_err(Error::Pci)?
@@ -86,15 +90,26 @@ pub fn scan<C:CpuProbe,P:BridgeProbe>(
      // A PCI bridge can be physically present but unconfigured; bus 0
      // means no subordinate is reachable yet. Do not crash early boot.
      if secondary==0{continue;}
-     if primary!=bus||secondary==bus||subordinate<secondary{
+     if primary!=bus||secondary<=bus||subordinate<secondary
+      ||subordinate>ceilings[current]{
       return Err(Error::MalformedBridge);
+     }
+     // Sibling bridges on this bus must route disjoint inclusive ranges.
+     // Comparing only secondary IDs misses different starts with shared
+     // descendants. Nested bridges are compared only with their siblings.
+     for i in 1..tail{
+      if parents[i]==current && secondary<=ceilings[i]
+       && queue[i]<=subordinate{
+       return Err(Error::AmbiguousBus);
+      }
      }
      if scheduled[secondary as usize]{
       return Err(Error::AmbiguousBus);
      }
      if tail>=MAX_DISCOVERED_BUSES{return Err(Error::TooManyBuses);}
      scheduled[secondary as usize]=true;
-     queue[tail]=secondary;tail+=1;
+     queue[tail]=secondary;ceilings[tail]=subordinate;
+     parents[tail]=current;tail+=1;
      state.discovered_bridges+=1;
     }
    }
@@ -310,4 +325,91 @@ mod tests{
   assert_ne!(CPU_AVX&result.inventory.cpu.features,0);
   assert_eq!(result.inventory.cpu.features&CPU_REQUIRED,CPU_REQUIRED);
  }
+ // Sparse provider covers all bus IDs and functions without allocating a
+ // 256-bus config image. Counts expose accidental reads beyond a window.
+ struct RoutedMock{
+  entries:[Option<(u8,u8,u8,[u8;16],(u8,u8,u8))>;40],
+  reads:[usize;256],fail_bridge:bool,
+ }
+ impl RoutedMock{
+  fn new()->Self{Self{entries:[None;40],reads:[0;256],fail_bridge:false}}
+  fn device(&mut self,b:u8,s:u8,f:u8,class:u8,header:u8,buses:(u8,u8,u8)){
+   let mut raw=[0u8;16];raw[0]=1;raw[2]=1;
+   raw[11]=class;raw[10]=if class==6{4}else{0};raw[14]=header;
+   *self.entries.iter_mut().find(|e|e.is_none()).unwrap()=
+    Some((b,s,f,raw,buses));
+  }
+  fn bridge(&mut self,b:u8,s:u8,secondary:u8,end:u8){
+   self.device(b,s,0,6,1,(b,secondary,end));
+  }
+ }
+ impl PciProbe for RoutedMock{
+  fn read_header(&mut self,b:u8,s:u8,f:u8)->Result<Option<[u8;16]>,Hd0Error>{
+   self.reads[b as usize]+=1;
+   Ok(self.entries.iter().flatten().find(|e|(e.0,e.1,e.2)==(b,s,f))
+    .map(|e|e.3))
+  }
+ }
+ impl BridgeProbe for RoutedMock{
+  fn read_bridge_buses(&mut self,b:u8,s:u8,f:u8)->Result<(u8,u8,u8),Hd0Error>{
+   if self.fail_bridge{return Err(Hd0Error::ProbeFailed);}
+   self.entries.iter().flatten().find(|e|(e.0,e.1,e.2)==(b,s,f))
+    .map(|e|e.4).ok_or(Hd0Error::ProbeFailed)
+  }
+ }
+ #[test]fn bridge_windows_reject_ancestor_escape_before_probing_destination(){
+  for (secondary,end) in [(4,4),(2,4)]{
+   let mut p=RoutedMock::new();p.bridge(0,0,1,3);
+   p.bridge(1,0,secondary,end);
+   assert_eq!(scan(&Cpu,&mut p),Err(Error::MalformedBridge));
+   assert_eq!(p.reads[secondary as usize],0);
+  }
+  // A grandchild may not regain a wider grandparent window.
+  let mut p=RoutedMock::new();p.bridge(0,0,1,8);
+  p.bridge(1,0,2,3);p.bridge(2,0,3,4);
+  assert_eq!(scan(&Cpu,&mut p),Err(Error::MalformedBridge));
+  assert_eq!(p.reads[3],0);assert_eq!(p.reads[4],0);
+ }
+ #[test]fn bridge_windows_reject_sibling_intersection_in_either_order(){
+  for ranges in [[(1,5),(3,7)],[(3,7),(1,5)],[(1,3),(3,4)]]{
+   let mut p=RoutedMock::new();
+   p.bridge(0,0,ranges[0].0,ranges[0].1);
+   p.bridge(0,1,ranges[1].0,ranges[1].1);
+   assert_eq!(scan(&Cpu,&mut p),Err(Error::AmbiguousBus));
+   assert!(p.reads[1..].iter().all(|n|*n==0));
+  }
+  let mut p=RoutedMock::new();p.bridge(0,0,1,8);
+  p.bridge(1,0,2,5);p.bridge(1,1,4,6);
+  assert_eq!(scan(&Cpu,&mut p),Err(Error::AmbiguousBus));
+  assert_eq!(p.reads[2],0);assert_eq!(p.reads[4],0);
+ }
+ #[test]fn bridge_windows_require_increasing_secondary_even_without_cycle(){
+  let mut p=RoutedMock::new();p.bridge(0,0,4,8);p.bridge(4,0,2,3);
+  assert_eq!(scan(&Cpu,&mut p),Err(Error::MalformedBridge));
+  assert_eq!(p.reads[2],0);
+ }
+ #[test]fn bridge_windows_accept_multilevel_multifunction_and_adjacent_siblings(){
+  let mut p=RoutedMock::new();p.bridge(0,0,1,5);p.bridge(0,1,6,6);
+  p.device(1,0,0,6,0x81,(1,2,3));
+  p.device(1,0,1,6,1,(1,4,5));
+  p.bridge(2,0,3,3);p.bridge(4,0,5,5);
+  p.device(3,0,0,3,0x80,(0,0,0));
+  p.device(3,0,7,0x12,0,(0,0,0));
+  let result=scan(&Cpu,&mut p).unwrap();
+  assert_eq!(result.scanned_buses,7);assert_eq!(result.discovered_bridges,6);
+  assert_eq!(result.inventory.gpu_count,1);assert_eq!(result.inventory.npu_count,1);
+  assert!(result.inventory.cpu_software_fallback);
+  assert_eq!(p.reads[3],39);
+  assert!(p.reads[7..].iter().all(|n|*n==0));
+ }
+ #[test]fn bridge_windows_preserve_bus_limit_and_bridge_read_failure(){
+  let mut p=RoutedMock::new();
+  for b in 0..32{p.bridge(b,0,b+1,32);}
+  assert_eq!(scan(&Cpu,&mut p),Err(Error::TooManyBuses));
+  assert_eq!(p.reads[32],0);
+  let mut p=RoutedMock::new();p.bridge(0,0,1,1);p.fail_bridge=true;
+  assert_eq!(scan(&Cpu,&mut p),Err(Error::Pci(Hd0Error::ProbeFailed)));
+  assert_eq!(p.reads[1],0);
+ }
+
 }

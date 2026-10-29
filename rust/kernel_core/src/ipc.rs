@@ -3,7 +3,8 @@
 //! No heap allocation, interrupts, blocking, or untrusted user pointers.
 //! The privileged caller must authenticate the sender against the current PCB;
 //! this is *not* yet exposed as a syscall or scheduler-integrated IPC service.
-//! Each mailbox has a fixed receiver PID, and teardown discards queued messages.
+//! Each mailbox has a fixed receiver PID. Teardown discards its received
+//! messages and any pending messages it sent to peers.
 
 pub const MAX_PAYLOAD: usize = 64;
 pub const MAX_MAILBOX_DEPTH: usize = 32;
@@ -77,6 +78,24 @@ impl<const DEPTH: usize> Mailbox<DEPTH> {
         Ok(message)
     }
 
+    // Compact in logical FIFO order. The write cursor never passes the read
+    // cursor, including when the ring wraps, so unread messages stay intact.
+    fn discard_sender(&mut self, sender: u32) {
+        let original_count = self.count;
+        let mut kept = 0;
+        for offset in 0..original_count {
+            let read = (self.head + offset) % DEPTH;
+            if let Some(message) = self.slots[read].take() {
+                if message.sender != sender {
+                    let write = (self.head + kept) % DEPTH;
+                    self.slots[write] = Some(message);
+                    kept += 1;
+                }
+            }
+        }
+        self.count = kept;
+    }
+
     pub fn clear(&mut self) {
         self.slots.fill(None);
         self.head = 0;
@@ -110,12 +129,16 @@ impl<const MAILBOXES: usize, const DEPTH: usize> IpcRouter<MAILBOXES, DEPTH> {
         Ok(())
     }
 
-    /// A retired PID must not receive messages after its resources are freed.
+    /// Drop the receiver mailbox and its pending outbound traffic before PID
+    /// reuse. An unknown PID leaves every mailbox unchanged.
     pub fn unregister(&mut self, pid: u32) -> Result<(), IpcError> {
         let slot = self.mailboxes.iter_mut()
             .find(|slot| slot.as_ref().is_some_and(|m| m.receiver == pid))
             .ok_or(IpcError::UnknownReceiver)?;
         *slot = None;
+        for mailbox in self.mailboxes.iter_mut().flatten() {
+            mailbox.discard_sender(pid);
+        }
         Ok(())
     }
 
@@ -318,6 +341,100 @@ mod tests {
         router.register(2).unwrap();
         assert_eq!(router.receive(2), Err(IpcError::Empty));
         assert_eq!(router.unregister(3), Err(IpcError::UnknownReceiver));
+    }
+
+    #[test]
+    fn ipc_unregister_recycled_sender_purges_all_peers() {
+        let mut router = IpcRouter::<4, 4>::new().unwrap();
+        for pid in 1..=4 { router.register(pid).unwrap(); }
+        for peer in 2..=4 {
+            router.send(1, peer, b"old").unwrap();
+            router.send(2, peer, b"keep").unwrap();
+            router.send(1, peer, b"old again").unwrap();
+        }
+        router.send(1, 1, b"self").unwrap();
+        router.send(2, 1, b"inbound").unwrap();
+        router.unregister(1).unwrap();
+        assert_eq!(router.send(1, 2, b"absent"), Err(IpcError::UnknownSender));
+        router.register(1).unwrap();
+        assert_eq!(router.receive(1), Err(IpcError::Empty));
+        for peer in 2..=4 {
+            assert_eq!(router.pending(peer), Ok(1));
+            router.send(1, peer, b"fresh").unwrap();
+            let retained = router.receive(peer).unwrap();
+            assert_eq!(retained.sender(), 2);
+            assert_eq!(retained.payload(), b"keep");
+            assert_eq!(router.receive(peer).unwrap().payload(), b"fresh");
+            assert_eq!(router.receive(peer), Err(IpcError::Empty));
+        }
+    }
+
+    // Enumerate every sender arrangement and head position in a full ring.
+    // Refill to capacity after teardown to catch holes and stale tail slots.
+    fn check_teardown_rings<const D: usize>() {
+        for head in 0..D {
+            for mask in 0..(1usize << D) {
+                let mut router = IpcRouter::<3, D>::new().unwrap();
+                for pid in 1..=3 { router.register(pid).unwrap(); }
+                for _ in 0..head {
+                    router.send(3, 2, b"advance").unwrap();
+                    router.receive(2).unwrap();
+                }
+                let mut expected = [None; D];
+                let mut kept = 0;
+                for index in 0..D {
+                    let sender = if mask & (1 << index) == 0 { 1 } else { 3 };
+                    let mut payload = [index as u8; MAX_PAYLOAD];
+                    payload[0] = 0;
+                    router.send(sender, 2, &payload).unwrap();
+                    if sender == 3 {
+                        expected[kept] = Some(Message::new(sender, &payload).unwrap());
+                        kept += 1;
+                    }
+                }
+                // Failure must preserve exact wrapped queue contents.
+                assert_eq!(router.unregister(99), Err(IpcError::UnknownReceiver));
+                assert_eq!(router.unregister(0), Err(IpcError::UnknownReceiver));
+                assert_eq!(router.pending(2), Ok(D));
+                router.unregister(1).unwrap();
+                assert_eq!(router.pending(2), Ok(kept));
+                for _ in kept..D { router.send(3, 2, b"").unwrap(); }
+                assert_eq!(router.send(3, 2, b"full"), Err(IpcError::Full));
+                for message in expected.iter().take(kept) {
+                    assert_eq!(router.receive(2), Ok(message.unwrap()));
+                }
+                for _ in kept..D {
+                    let message = router.receive(2).unwrap();
+                    assert_eq!(message.sender(), 3);
+                    assert_eq!(message.payload(), b"");
+                }
+                assert_eq!(router.receive(2), Err(IpcError::Empty));
+            }
+        }
+    }
+
+    #[test]
+    fn ipc_teardown_preserves_wrapped_fifo_and_reclaims_capacity() {
+        check_teardown_rings::<1>();
+        check_teardown_rings::<2>();
+        check_teardown_rings::<5>();
+    }
+
+    #[test]
+    fn ipc_teardown_empty_maximum_queue_and_invalid_depth() {
+        assert!(matches!(IpcRouter::<3, 0>::new(), Err(IpcError::InvalidConfiguration)));
+        let mut router = IpcRouter::<3, MAX_MAILBOX_DEPTH>::new().unwrap();
+        for pid in 1..=3 { router.register(pid).unwrap(); }
+        router.unregister(1).unwrap();
+        assert_eq!(router.pending(2), Ok(0));
+        router.register(1).unwrap();
+        for _ in 0..MAX_MAILBOX_DEPTH { router.send(1, 2, b"old").unwrap(); }
+        router.unregister(1).unwrap();
+        for _ in 0..MAX_MAILBOX_DEPTH { router.send(3, 2, b"new").unwrap(); }
+        assert_eq!(router.send(3, 2, b"full"), Err(IpcError::Full));
+        for _ in 0..MAX_MAILBOX_DEPTH {
+            assert_eq!(router.receive(2).unwrap().payload(), b"new");
+        }
     }
 
     #[test]

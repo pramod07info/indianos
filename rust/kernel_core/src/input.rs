@@ -50,11 +50,25 @@ const SHIFTED:[u8;128]={
 /// not accidentally perform the unmodified GUI/Terminal shortcut.
 #[derive(Default)]
 pub(crate) struct ScanDecoder{
-    shift_left:bool,shift_right:bool,caps:bool,extended:bool,
+    shift_left:bool,shift_right:bool,caps:bool,caps_down:bool,extended:bool,
     ctrl_left:bool,ctrl_right:bool,alt_left:bool,alt_right:bool,
     pause_remaining:u8,
 }
 impl ScanDecoder{
+    /// A discarded primary transfer may have been a modifier break or prefix.
+    /// Keep the committed lock choice, but forget all untrustworthy held and
+    /// multi-byte state. The discarded byte never produces input.
+    fn feed_transfer(&mut self,status:u8,code:u8)->Option<u8>{
+        if status&1==0 || status&0x20!=0{return None;}
+        if !valid_keyboard_status(status){
+            let caps=self.caps;
+            *self=Self::default();
+            self.caps=caps;
+            return None;
+        }
+        self.feed(code)
+    }
+
     pub(crate) fn feed(&mut self,code:u8)->Option<u8>{
         if self.pause_remaining>0{
             self.pause_remaining-=1;
@@ -92,7 +106,11 @@ impl ScanDecoder{
             0x36=>{self.shift_right=!released;return None;},
             0x1d=>{self.ctrl_left=!released;return None;},
             0x38=>{self.alt_left=!released;return None;},
-            0x3a=>{if !released{self.caps=!self.caps;}return None;},
+            0x3a=>{
+                if !released&&!self.caps_down{self.caps=!self.caps;}
+                self.caps_down=!released;
+                return None;
+            },
             _=>{},
         }
         if released||self.modifiers_active(){return None;}
@@ -118,7 +136,7 @@ pub(crate) fn filter(b:u8)->Option<u8>{
     }
 }
 static mut SCAN:ScanDecoder=ScanDecoder{
-    shift_left:false,shift_right:false,caps:false,extended:false,
+    shift_left:false,shift_right:false,caps:false,caps_down:false,extended:false,
     ctrl_left:false,ctrl_right:false,alt_left:false,alt_right:false,
     pause_remaining:0
 };
@@ -324,12 +342,10 @@ pub extern "C" fn x86_64_keyboard_irq_dispatch(){
         unsafe {serial_write(b"IndianOS: R014.2 IRQ1 first interrupt delivered\n\0".as_ptr().cast());}
     }
     let status=unsafe{inb(PS2_STATUS)};
-    if status&1!=0 {
+    if status&1!=0&&status&0x20==0 {
         let code=unsafe{inb(PS2_DATA)};
-        if valid_keyboard_status(status){
-            if let Some(ch)=unsafe{(&mut *core::ptr::addr_of_mut!(SCAN)).feed(code)}{
-                enqueue(ch);
-            }
+        if let Some(ch)=unsafe{(&mut *core::ptr::addr_of_mut!(SCAN)).feed_transfer(status,code)}{
+            enqueue(ch);
         }
     }
     unsafe{outb(0x20,0x20);} // specific master PIC EOI
@@ -381,8 +397,7 @@ pub(crate) fn poll_byte()->Option<u8>{
     // those bytes and must be able to consume a complete three-byte frame.
     if status&1!=0&&status&0x20==0{
         let code=unsafe{inb(PS2_DATA)};
-        if !valid_keyboard_status(status){return None;}
-        return unsafe{(&mut *core::ptr::addr_of_mut!(SCAN)).feed(code)}
+        return unsafe{(&mut *core::ptr::addr_of_mut!(SCAN)).feed_transfer(status,code)}
             .map(mark_physical_key);
     }
     None
@@ -496,6 +511,7 @@ mod tests{
         assert_eq!(d.feed(0xb6),None);
         assert_eq!(d.feed(0x3a),None);
         assert_eq!(d.feed(0x1e),Some(b'A'));
+        assert_eq!(d.feed(0xba),None);
         assert_eq!(d.feed(0x3a),None);
         assert_eq!(d.feed(0x1e),Some(b'a'));
         assert_eq!(d.feed(0x9e),None);
@@ -507,7 +523,66 @@ mod tests{
         for byte in [0x1d,0x1e,0x9e,0x9d,0xe0,0x48,0xe0,0xc8]{
             if let Some(ch)=d.feed(byte){assert_eq!(mark_physical_key(ch),ch);}
         }
+        for status in [0x41,0x81,0x21]{
+            if let Some(ch)=d.feed_transfer(status,0x1e){mark_physical_key(ch);}
+        }
         assert_eq!(physical_keys_accepted(),before+1);
+    }
+    #[test]
+    fn caps_typematic_toggles_once_per_press(){
+        let mut d=ScanDecoder::default();
+        for expected in [b'A',b'a']{
+            for _ in 0..4{
+                assert_eq!(d.feed_transfer(0x01,0x3a),None);
+                assert_eq!(d.feed_transfer(0x01,0x1e),Some(expected));
+            }
+            assert_eq!(d.feed_transfer(0x01,0xba),None);
+        }
+    }
+    #[test]
+    fn corrupt_primary_transfers_release_stale_modifiers(){
+        for status in [0x41,0x81,0xc1]{
+            for prefix in [false,true]{
+                for scan in [0x2a,0x36,0x1d,0x38]{
+                    if prefix && (scan==0x2a||scan==0x36){continue;}
+                    let mut d=ScanDecoder::default();
+                    if prefix{assert_eq!(d.feed_transfer(1,0xe0),None);}
+                    assert_eq!(d.feed_transfer(1,scan),None);
+                    assert_eq!(d.feed_transfer(status,scan|0x80),None);
+                    assert_eq!(d.feed_transfer(1,0x1e),Some(b'a'));
+                    // Fresh Ctrl still blocks ordinary desktop shortcuts.
+                    assert_eq!(d.feed_transfer(1,0x1d),None);
+                    assert_eq!(d.feed_transfer(1,0x1e),None);
+                }
+            }
+        }
+    }
+    #[test]
+    fn corrupt_transfer_clears_prefix_pause_and_preserves_lock(){
+        for status in [0x41,0x81]{
+            for prefix in [0xe0,0xe1]{
+                let mut d=ScanDecoder::default();
+                assert_eq!(d.feed_transfer(1,0x3a),None);
+                assert_eq!(d.feed_transfer(1,prefix),None);
+                // Even a printable corrupt transfer cannot manufacture text.
+                assert_eq!(d.feed_transfer(status,0x1e),None);
+                assert_eq!(d.feed_transfer(1,0x1e),Some(b'A'));
+                assert_eq!(d.feed_transfer(1,0xe0),None);
+                assert_eq!(d.feed_transfer(1,0x48),Some(0x10));
+            }
+        }
+    }
+    #[test]
+    fn aux_and_empty_status_do_not_change_keyboard_state(){
+        let mut d=ScanDecoder::default();
+        assert_eq!(d.feed_transfer(1,0xe0),None);
+        for status in [0,0x40,0x80,0x21,0x61,0xa1,0xe1]{
+            assert_eq!(d.feed_transfer(status,0x1e),None);
+        }
+        assert_eq!(d.feed_transfer(1,0x48),Some(0x10));
+        assert_eq!(d.feed_transfer(1,0x2a),None);
+        assert_eq!(d.feed_transfer(0xe1,0xaa),None);
+        assert_eq!(d.feed_transfer(1,0x1e),Some(b'A'));
     }
     #[test]
     fn terminal_input_filters_controls(){

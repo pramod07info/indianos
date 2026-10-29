@@ -147,14 +147,6 @@ fn gpt<D:BlockDevice>(disk:&mut D)->Result<PartitionSet,Error>{
  if alternate<=sectors as u64 || last>=alternate-sectors as u64 {
   return Err(Error::Invalid);
  }
- // Verify the complete entry array BEFORE interpreting any partition.
- let mut calculated=!0u32;
- for s in 0..sectors{
-  let buf=read(disk,table+s as u64)?;
-  let n=total.saturating_sub(s*SECTOR_BYTES).min(SECTOR_BYTES);
-  calculated=crc_update(calculated,&buf[..n]);
- }
- if !calculated!=checksum{return Err(Error::Invalid);}
  // Verify the backup GPT header and its *separate* entry array before
  // mounting any selected volume. A valid primary CRC alone cannot prove
  // that the device's secondary metadata is consistent after interrupted
@@ -182,47 +174,48 @@ fn gpt<D:BlockDevice>(disk:&mut D)->Result<PartitionSet,Error>{
  if crc(&checked_backup[..size])!=le32(&backup[16..20]){
   return Err(Error::Invalid);
  }
+ // Validate and decode each primary sector from ONE read. Re-reading a
+ // table after its CRC/mirror check could expose different, unchecked
+ // partition bounds on a changing or faulty device. The catalog stays local
+ // and is returned only after the complete arrays pass both CRC checks.
+ let mut calculated=!0u32;
  let mut backup_crc=!0u32;
- for s in 0..sectors{
-  let sector=read(disk,backup_table+s as u64)?;
-  let n=total.saturating_sub(s*SECTOR_BYTES).min(SECTOR_BYTES);
-  backup_crc=crc_update(backup_crc,&sector[..n]);
-  // Equal CRC32 values alone cannot rule out a colliding backup GPT table.
-  let primary=read(disk,table+s as u64)?;
-  if sector[..n]!=primary[..n]{return Err(Error::Invalid);}
- }
- if !backup_crc!=checksum{return Err(Error::Invalid);}
  let mut found=PartitionSet::empty(Scheme::Gpt);
  found.disk_guid.copy_from_slice(&hdr[56..72]);
- // Store the identity from the same fully validated layout as its geometry.
- for i in 0..entries{
-  let byte=i*entry_size;
-  let lba=table+(byte/SECTOR_BYTES) as u64;
-  let sector=read(disk,lba)?;
-  let off=byte%SECTOR_BYTES;
-  let entry=&sector[off..off+entry_size];
-  if entry[..16].iter().all(|&v|v==0){
-   // An unused type GUID must not carry stale bounds or a unique identifier.
-   if entry.iter().any(|&v|v!=0){return Err(Error::Invalid);}
-   // An absent selected slot must not mask later corrupt live entries.
-   continue;
+ for s in 0..sectors{
+  let primary=read(disk,table+s as u64)?;
+  let backup=read(disk,backup_table+s as u64)?;
+  let n=total.saturating_sub(s*SECTOR_BYTES).min(SECTOR_BYTES);
+  if primary[..n]!=backup[..n]{return Err(Error::Invalid);}
+  calculated=crc_update(calculated,&primary[..n]);
+  backup_crc=crc_update(backup_crc,&backup[..n]);
+  for off in (0..n).step_by(entry_size){
+   let i=(s*SECTOR_BYTES+off)/entry_size;
+   let entry=&primary[off..off+entry_size];
+   if entry[..16].iter().all(|&v|v==0){
+    // An unused type GUID must not carry stale bounds or a unique identifier.
+    if entry.iter().any(|&v|v!=0){return Err(Error::Invalid);}
+    // An absent selected slot must not mask later corrupt live entries.
+    continue;
+   }
+   if entry[16..32].iter().all(|&v|v==0){return Err(Error::Invalid);}
+   // An unused entry has a zero GUID, so checking earlier slots is safe.
+   // Forbid duplicated live partition identifiers before selecting a mount.
+   if found.gpt_guids[..i].iter().any(|guid| guid.as_slice()==&entry[16..32]){
+    return Err(Error::Invalid);
+   }
+   let start=le64(&entry[32..40]);let end=le64(&entry[40..48]);
+   if start<first||end>last||end<start{return Err(Error::OutOfRange);}
+   let exclusive=end.checked_add(1).ok_or(Error::OutOfRange)?;
+   for prior in found.iter(){
+    let prior_end=prior.start+prior.sectors; // already validated below capacity
+    if start<prior_end&&prior.start<exclusive{return Err(Error::Overlap);}
+   }
+   found.gpt_guids[i].copy_from_slice(&entry[16..32]);
+   found.record(Partition{scheme:Scheme::Gpt,index:i as u32,start,sectors:exclusive-start})?;
   }
-  if entry[16..32].iter().all(|&v|v==0){return Err(Error::Invalid);}
-  // An unused entry has a zero GUID, so checking earlier slots is safe.
-  // Forbid duplicated live partition identifiers before selecting a mount.
-  if found.gpt_guids[..i].iter().any(|guid| guid.as_slice()==&entry[16..32]){
-   return Err(Error::Invalid);
-  }
-  let start=le64(&entry[32..40]);let end=le64(&entry[40..48]);
-  if start<first||end>last||end<start{return Err(Error::OutOfRange);}
-  let exclusive=end.checked_add(1).ok_or(Error::OutOfRange)?;
-  for prior in found.iter(){
-   let prior_end=prior.start+prior.sectors; // already validated below capacity
-   if start<prior_end&&prior.start<exclusive{return Err(Error::Overlap);}
-  }
-  found.gpt_guids[i].copy_from_slice(&entry[16..32]);
-  found.record(Partition{scheme:Scheme::Gpt,index:i as u32,start,sectors:exclusive-start})?;
  }
+ if !calculated!=checksum || !backup_crc!=checksum{return Err(Error::Invalid);}
  Ok(found)
 }
 /// Validate the complete MBR/GPT table, both GPT copies and all live
@@ -398,6 +391,89 @@ mod m1_partition_tests{
   let checksum=crc(&header[..92]);
   header[16..20].copy_from_slice(&checksum.to_le_bytes());
   d.data[255]=header;
+ }
+ struct ChangingGpt{
+  disk:Disk,primary_reads:usize,backup_reads:usize,
+  change_after:usize,change_backup:bool,changed:[u8;SECTOR_BYTES],
+ }
+ impl ChangingGpt{
+  fn new(change_after:usize,change_backup:bool)->Self{
+   let disk=gpt_disk();let mut changed=disk.data[2];
+   // Another valid, nonoverlapping 100-sector partition. Its geometry
+   // has NOT been authorized by the checksum in either GPT header.
+   changed[32..40].copy_from_slice(&60u64.to_le_bytes());
+   changed[40..48].copy_from_slice(&159u64.to_le_bytes());
+   Self{disk,primary_reads:0,backup_reads:0,change_after,change_backup,changed}
+  }
+ }
+ impl BlockDevice for ChangingGpt{
+  fn sector_count(&self)->u64{COUNT as u64}
+  fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   if lba==2{
+    self.primary_reads+=1;
+    if self.primary_reads>=self.change_after{*out=self.changed;return Ok(());}
+   }
+   if lba==254{
+    self.backup_reads+=1;
+    if self.change_backup{*out=self.changed;return Ok(());}
+   }
+   self.disk.read_sector(lba,out)
+  }
+  fn write_sector(&mut self,lba:u64,input:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   self.disk.write_sector(lba,input)
+  }
+ }
+ #[test]fn m1_gpt_selection_decodes_exact_crc_and_mirror_checked_bytes(){
+  let mut disk=ChangingGpt::new(3,false);
+  // The old three-pass parser checked / compared LBA2, then accepted
+  // a different partition from its third read without validating it.
+  assert_eq!(inspect(&mut disk,0),Ok(Partition{
+   scheme:Scheme::Gpt,index:0,start:40,sectors:100
+  }));
+  assert_eq!(disk.primary_reads,1);assert_eq!(disk.backup_reads,1);
+  assert_eq!(disk.disk.writes,0);
+ }
+ #[test]fn m1_gpt_changing_arrays_cannot_escape_mirror_or_final_crc_checks(){
+  let mut disk=ChangingGpt::new(1,false);
+  assert_eq!(discover(&mut disk),Err(Error::Invalid));
+  assert_eq!(disk.disk.writes,0);
+  // Even equal replacement arrays must match the checksum from both
+  // checked headers. Geometry validation alone is not authentication.
+  let mut disk=ChangingGpt::new(1,true);
+  assert_eq!(discover(&mut disk),Err(Error::Invalid));
+  assert_eq!(disk.primary_reads,1);assert_eq!(disk.backup_reads,1);
+  assert_eq!(disk.disk.writes,0);
+ }
+ #[test]fn m1_gpt_streaming_validates_final_partial_table_sector(){
+  let mut disk=gpt_disk();
+  let entry=&mut disk.data[3][..128];
+  entry[..16].fill(3);entry[16..32].fill(4);
+  entry[32..40].copy_from_slice(&150u64.to_le_bytes());
+  entry[40..48].copy_from_slice(&199u64.to_le_bytes());
+  let checksum=!crc_update(crc_update(!0,&disk.data[2]),&disk.data[3][..128]);
+  disk.data[1][80..84].copy_from_slice(&5u32.to_le_bytes());
+  disk.data[1][88..92].copy_from_slice(&checksum.to_le_bytes());
+  disk.data[1][16..20].fill(0);
+  let header_crc=crc(&disk.data[1][..92]);
+  disk.data[1][16..20].copy_from_slice(&header_crc.to_le_bytes());
+  disk.data[253]=disk.data[2];disk.data[254]=disk.data[3];
+  let mut backup=disk.data[1];
+  backup[24..32].copy_from_slice(&255u64.to_le_bytes());
+  backup[32..40].copy_from_slice(&1u64.to_le_bytes());
+  backup[72..80].copy_from_slice(&253u64.to_le_bytes());
+  backup[16..20].fill(0);let header_crc=crc(&backup[..92]);
+  backup[16..20].copy_from_slice(&header_crc.to_le_bytes());
+  disk.data[255]=backup;
+  // Bytes beyond the declared entry array are padding, not GPT entries.
+  disk.data[254][200]=0xa5;
+  let found=discover(&mut disk).unwrap();
+  assert_eq!(found.len(),2);
+  assert_eq!(found.get(4),Some(Partition{
+   scheme:Scheme::Gpt,index:4,start:150,sectors:50
+  }));
+  disk.data[254][64]^=1; // inside the last entry: exact mirror comparison
+  assert_eq!(discover(&mut disk),Err(Error::Invalid));
+  assert_eq!(disk.writes,0);
  }
  #[test]fn m1_mbr_partition_mount_and_reboot_guards(){
   let mut disk=mbr_disk();

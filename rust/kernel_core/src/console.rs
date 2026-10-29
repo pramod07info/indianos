@@ -11,6 +11,8 @@ const MAX_ROWS:usize=40;
 struct Screen {
     surface:ConsoleFramebuffer,
     cols:usize,rows:usize,col:usize,row:usize,
+    // The cursor stays inside the owned cell rectangle even after a full line.
+    pending_wrap:bool,
 }
 static mut SCREEN:Option<Screen>=None;
 
@@ -84,6 +86,7 @@ fn paint(s:&Screen,col:usize,row:usize,ch:u8) {
     }
 }
 fn advance(s:&mut Screen){
+    s.pending_wrap=false;
     s.col=0;
     if s.row+1<s.rows{s.row+=1;}else{
         // Small scroll region; never touch unowned framebuffer pixels.
@@ -103,17 +106,20 @@ fn advance(s:&mut Screen){
 }
 fn put(s:&mut Screen,byte:u8){
     match byte{
-        b'\r'=>s.col=0,
+        b'\r'=>{s.col=0;s.pending_wrap=false;},
         b'\n'=>advance(s),
         8=>{
-            if s.col>0{
+            if s.pending_wrap{
+                s.pending_wrap=false;
+                paint(s,s.col,s.row,b' ');
+            }else if s.col>0{
                 s.col-=1;paint(s,s.col,s.row,b' ');
             }
         }
         32..=126=>{
+            if s.pending_wrap{advance(s);}
             paint(s,s.col,s.row,byte);
-            s.col+=1;
-            if s.col>=s.cols{advance(s);}
+            if s.col+1<s.cols{s.col+=1;}else{s.pending_wrap=true;}
         }
         _=>{}
     }
@@ -123,7 +129,7 @@ pub(crate) fn init()->bool{
     let cols=(surface.width/CELL_W).min(MAX_COLS);
     let rows=(surface.height/CELL_H).min(MAX_ROWS);
     if cols<20||rows<4{return false;}
-    let mut s=Screen{surface,cols,rows,col:0,row:0};
+    let mut s=Screen{surface,cols,rows,col:0,row:0,pending_wrap:false};
     for row in 0..rows{for col in 0..cols{paint(&s,col,row,b' ');}}
     for &b in b"IndianOS R014.2 framebuffer terminal\n"{put(&mut s,b);}
     unsafe{SCREEN=Some(s);}
@@ -144,6 +150,97 @@ pub(crate) fn echo(byte:u8){
 #[cfg(test)]
 mod tests {
     use super::*;
+    const SENTINEL:u32=0x12345678;
+    const FG:u32=0xffffff;
+    const BG:u32=0x102030;
+    // Extra scanlines, fractional cells, and pitch padding surround the owned area.
+    fn fixture(cols:usize,rows:usize)->(std::vec::Vec<u32>,Screen){
+        let width=cols*CELL_W+3;
+        let height=rows*CELL_H+3;
+        let stride=width+5;
+        let mut pixels=std::vec![SENTINEL;stride*height+2];
+        let surface=ConsoleFramebuffer{address:unsafe{pixels.as_mut_ptr().add(1)}.cast(),
+            width,height,pitch:stride*4,fg:FG,bg:BG};
+        let screen=Screen{surface,cols,rows,col:0,row:0,pending_wrap:false};
+        for row in 0..rows{for col in 0..cols{paint(&screen,col,row,b' ');}}
+        (pixels,screen)
+    }
+    fn cell(pixels:&[u32],s:&Screen,col:usize,row:usize,ch:u8){
+        for y in 0..CELL_H{for x in 0..CELL_W{
+            let bits=if y/2<7{glyph(ch)[y/2]}else{0};
+            let lit=x>=1&&x<6&&bits&(1<<(5-x))!=0;
+            assert_eq!(pixels[1+(row*CELL_H+y)*(s.surface.pitch/4)+col*CELL_W+x],
+                if lit{FG}else{BG},"cell ({col},{row}) pixel ({x},{y})");
+        }}
+    }
+    fn bounded(pixels:&[u32],s:&Screen){
+        assert!(s.col<s.cols&&s.row<s.rows);
+        let stride=s.surface.pitch/4;
+        for (i,pixel) in pixels.iter().enumerate(){
+            if i==0||i==pixels.len()-1{assert_eq!(*pixel,SENTINEL);continue;}
+            let offset=i-1;
+            if offset/stride>=s.rows*CELL_H||offset%stride>=s.cols*CELL_W{
+                assert_eq!(*pixel,SENTINEL,"outside owned rectangle at {offset}");
+            }
+        }
+    }
+    #[test] fn last_column_newline_advances_once(){
+        let (pixels,mut s)=fixture(2,3);
+        for &b in b"AB\nC"{put(&mut s,b);}
+        cell(&pixels,&s,0,0,b'A');cell(&pixels,&s,1,0,b'B');
+        cell(&pixels,&s,0,1,b'C');cell(&pixels,&s,0,2,b' ');
+        assert_eq!((s.col,s.row,s.pending_wrap),(1,1,false));bounded(&pixels,&s);
+    }
+    #[test] fn last_column_backspace_erases_before_wrap(){
+        let (pixels,mut s)=fixture(2,1);
+        for &b in b"AB"{put(&mut s,b);}
+        cell(&pixels,&s,0,0,b'A');cell(&pixels,&s,1,0,b'B');
+        put(&mut s,8);
+        cell(&pixels,&s,0,0,b'A');cell(&pixels,&s,1,0,b' ');
+        assert_eq!((s.col,s.row,s.pending_wrap),(1,0,false));
+        put(&mut s,b'C');cell(&pixels,&s,1,0,b'C');
+        bounded(&pixels,&s);
+    }
+    #[test] fn carriage_return_cancels_pending_wrap(){
+        let (pixels,mut s)=fixture(2,2);
+        for &b in b"AB\rC"{put(&mut s,b);}
+        cell(&pixels,&s,0,0,b'C');cell(&pixels,&s,1,0,b'B');
+        cell(&pixels,&s,0,1,b' ');
+        assert_eq!((s.col,s.row,s.pending_wrap),(1,0,false));bounded(&pixels,&s);
+    }
+    #[test] fn bottom_right_waits_for_printable_then_scrolls_owned_pixels(){
+        let (pixels,mut s)=fixture(2,2);
+        for &b in b"ABCD"{put(&mut s,b);}
+        cell(&pixels,&s,0,0,b'A');cell(&pixels,&s,1,0,b'B');
+        cell(&pixels,&s,0,1,b'C');cell(&pixels,&s,1,1,b'D');
+        assert_eq!((s.col,s.row,s.pending_wrap),(1,1,true));
+        put(&mut s,0);assert!(s.pending_wrap);
+        put(&mut s,b'E');
+        cell(&pixels,&s,0,0,b'C');cell(&pixels,&s,1,0,b'D');
+        cell(&pixels,&s,0,1,b'E');cell(&pixels,&s,1,1,b' ');bounded(&pixels,&s);
+    }
+    #[test] fn bottom_right_newline_scrolls_exactly_once(){
+        let (pixels,mut s)=fixture(2,2);
+        for &b in b"ABCD\n"{put(&mut s,b);}
+        cell(&pixels,&s,0,0,b'C');cell(&pixels,&s,1,0,b'D');
+        cell(&pixels,&s,0,1,b' ');cell(&pixels,&s,1,1,b' ');
+        assert_eq!((s.col,s.row,s.pending_wrap),(0,1,false));bounded(&pixels,&s);
+    }
+    #[test] fn single_column_wraps_and_backspaces_without_crossing_rows(){
+        let (pixels,mut s)=fixture(1,2);
+        for &b in b"AB\x08\x08"{put(&mut s,b);}
+        cell(&pixels,&s,0,0,b'A');cell(&pixels,&s,0,1,b' ');
+        assert_eq!((s.col,s.row,s.pending_wrap),(0,1,false));bounded(&pixels,&s);
+    }
+    #[test] fn single_cell_controls_and_wrap_stay_bounded(){
+        let (pixels,mut s)=fixture(1,1);
+        for &b in b"A\x08B\rC"{put(&mut s,b);bounded(&pixels,&s);}
+        cell(&pixels,&s,0,0,b'C');assert!(s.pending_wrap);
+        put(&mut s,b'\n');cell(&pixels,&s,0,0,b' ');assert!(!s.pending_wrap);
+        put(&mut s,8);cell(&pixels,&s,0,0,b' ');
+        for &b in b"DE"{put(&mut s,b);bounded(&pixels,&s);}
+        cell(&pixels,&s,0,0,b'E');
+    }
     #[test] fn glyphs_are_bounded(){
         assert_eq!(glyph(b' '),[0;7]);
         assert_ne!(glyph(b'A'),glyph(b'?'));

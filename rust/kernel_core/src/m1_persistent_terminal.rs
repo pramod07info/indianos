@@ -85,7 +85,10 @@ pub fn command<D:BlockDevice,const N:usize>(
  input:&[u8],out:&mut[u8])->Result<usize,Error>{
  if input.is_empty()||input.len()>MAX_COMMAND||input.iter().any(|c|
   *c!=b' '&&!c.is_ascii_graphic()){return Err(Error::Invalid);}
- let line=core::str::from_utf8(input).map_err(|_|Error::Invalid)?.trim();
+ // Ignore leading command indentation, but never trim literal payloads:
+ // trailing spaces are file/search data, not an implicit edit request.
+ let entered=core::str::from_utf8(input).map_err(|_|Error::Invalid)?.trim_start();
+ let line=entered.trim_end();
  if line=="help"{return publish(b"pwd ls /dir cat /path write /path text append /path text mkdir /dir mv /old /new cp /src /dst rm /path mkfile /path truncate /path head /path count rmdir /dir mvdir /old /new pread /file offset count pwrite /file@offset text",out);}
  if line=="pwd"{return publish(b"/",out);}
  if line=="tools"{return publish(b"count lines tail find grep hash cmp stat touch copynew replace appendln health",out);}
@@ -108,7 +111,11 @@ pub fn command<D:BlockDevice,const N:usize>(
   }
   return publish(&scratch[..at],out);
  }
- let (verb,raw)=line.split_once(' ').ok_or(Error::Unknown)?;
+ let (verb,arguments)=entered.split_once(' ').ok_or(Error::Unknown)?;
+ let raw=if matches!(verb,"write"|"append"|"appendln"|"pwrite"|
+    "replace"|"find"|"grep"){
+  arguments
+ }else{arguments.trim_end()};
  let mut name=[0u8;64];
  match verb{
   "count"|"lines"|"hash"|"stat"=>{
@@ -513,6 +520,78 @@ mod tests{
   let mut out=[0xaau8;MAX_TRANSFER];
   let size=command(fs,access,who,1,cmd,&mut out)?;
   Ok((size,out))
+ }
+ #[test]fn m1_terminal_typed_literal_spaces_survive_each_disk_remount(){
+  use crate::m1_input::{InputLine,Event,MAX_LINE};
+  let mut fs=HierVfs::format_blank(blank()).unwrap();let auth=grants();
+  for (entered,expected) in [
+   (b"  write /note hello  ".as_slice(),b"hello  ".as_slice()),
+   (b"append /note   ",b"hello    "),
+   (b"pwrite /note@0 X  ",b"X  lo    "),
+   (b"appendln /note end  ",b"X  lo    end  \n"),
+  ]{
+   let mut line=InputLine::new();let mut submitted=[0u8;MAX_LINE];
+   for &key in entered{line.feed(key,&mut[]).unwrap();}
+   assert_eq!(line.feed(b'\n',&mut submitted),Ok(Event::Submitted(entered.len())));
+   assert_eq!(&submitted[..entered.len()],entered);
+   run(&mut fs,&auth,user(),&submitted[..entered.len()]).unwrap();
+   fs=HierVfs::mount(fs.into_device()).unwrap();
+   let (n,stored)=run(&mut fs,&auth,user(),b"cat /note").unwrap();
+   assert_eq!(&stored[..n],expected);
+  }
+  // The maximum supported edited line must not lose its final spaces.
+  let mut entered=[b'x';MAX_LINE];let prefix=b"write /full ";
+  entered[..prefix.len()].copy_from_slice(prefix);
+  entered[MAX_LINE-2..].fill(b' ');
+  run(&mut fs,&auth,user(),&entered).unwrap();
+  let mut fs=HierVfs::mount(fs.into_device()).unwrap();
+  let (n,stored)=run(&mut fs,&auth,user(),b"cat /full").unwrap();
+  assert_eq!(&stored[..n],&entered[prefix.len()..]);
+ }
+ #[test]fn m1_terminal_literal_search_and_replacement_keep_trailing_spaces(){
+  let mut fs=HierVfs::format_blank(blank()).unwrap();let auth=grants();
+  fs.create("/note",b"cat cat  dog\ncat dog\n").unwrap();
+  let (n,out)=run(&mut fs,&auth,user(),b"find /note cat  ").unwrap();
+  assert_eq!(&out[..n],b"4");
+  let (n,out)=run(&mut fs,&auth,user(),b"grep /note cat  ").unwrap();
+  assert_eq!(&out[..n],b"cat cat  dog\n");
+  fs.overwrite("/note",b"cat cat").unwrap();
+  run(&mut fs,&auth,user(),b"replace /note cat dog  ").unwrap();
+  let mut fs=HierVfs::mount(fs.into_device()).unwrap();
+  let (n,out)=run(&mut fs,&auth,user(),b"cat /note").unwrap();
+  assert_eq!(&out[..n],b"dog   dog  ");
+  run(&mut fs,&auth,user(),b"replace /note dog  ").unwrap();
+  let (n,out)=run(&mut fs,&auth,user(),b"cat /note").unwrap();
+  assert_eq!(&out[..n],b"       "); // preserve old separators plus replacements
+ }
+ #[test]fn m1_terminal_space_payload_denial_and_failed_write_preserve_disk(){
+  let mut fs=HierVfs::format_blank(blank()).unwrap();let auth=grants();
+  fs.create("/note",b"keep  ").unwrap();let generation=fs.generation();
+  let mut short=[0x77;4];
+  assert_eq!(command(&mut fs,&auth,user(),1,b"write /note   ",&mut short),
+   Err(Error::OutputTooSmall));
+  assert_eq!(short,[0x77;4]);
+  assert_eq!(run(&mut fs,&auth,Identity{generation:2,..user()},b"write /note   "),
+   Err(Error::Denied));
+  assert_eq!(fs.generation(),generation);
+  let mut disk=fs.into_device();let original=disk.data;disk.fail_writes=true;
+  let mut fs=HierVfs::mount(disk).unwrap();
+  assert_eq!(run(&mut fs,&auth,user(),b"write /note   "),Err(Error::Io(FsError::Io)));
+  let disk=fs.into_device();assert_eq!(disk.data,original);
+ }
+ #[test]fn m1_terminal_nonliteral_command_whitespace_remains_compatible(){
+  let mut fs=HierVfs::format_blank(blank()).unwrap();let auth=grants();
+  for entered in [b"pwd".as_slice(),b"  pwd   "]{
+   let (n,out)=run(&mut fs,&auth,user(),entered).unwrap();
+   assert_eq!(&out[..n],b"/");
+  }
+  run(&mut fs,&auth,user(),b"  write /note abc  ").unwrap();
+  let (n,out)=run(&mut fs,&auth,user(),b"  head /note 3   ").unwrap();
+  assert_eq!(&out[..n],b"abc");
+  run(&mut fs,&auth,user(),b"  mv /note /moved   ").unwrap();
+  let (n,out)=run(&mut fs,&auth,user(),b"cat /moved   ").unwrap();
+  assert_eq!(&out[..n],b"abc  ");
+  assert_eq!(run(&mut fs,&auth,user(),b"write /empty "),Err(Error::Invalid));
  }
  #[test]fn m1_r046_readonly_terminal_health_reports_redundancy_and_generation(){
   let mut fs=HierVfs::format_blank(blank()).unwrap();

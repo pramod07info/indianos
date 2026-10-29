@@ -90,14 +90,26 @@ pub unsafe extern "C" fn indianos_user_image_destroy(
     if !img.tables.initialized { return false; }
     // Revoke user-copy access before any frame is freed or unmapped.
     img.ready = false;
+    if img.page_count as usize > MAX_IMAGE_PAGES { return false; }
     let mut ok = true;
     for i in (0..img.page_count as usize).rev() {
         let page = img.pages[i];
-        if !unsafe { vmm_unmap_page(&mut img.tables, page.virtual_address) } {
-            ok = false;
-            continue;
+        // Preserve ownership across a failed teardown. Zero physical means
+        // already released; zero virtual means unmapped, awaiting release.
+        // Real user images never map virtual page zero or physical frame zero.
+        if page.physical_address == 0 { continue; }
+        if page.virtual_address != 0 {
+            if !unsafe { vmm_unmap_page(&mut img.tables, page.virtual_address) } {
+                ok = false;
+                continue;
+            }
+            img.pages[i].virtual_address = 0;
         }
-        if !unsafe { release(img, page.physical_address) } { ok = false; }
+        if unsafe { release(img, page.physical_address) } {
+            img.pages[i].physical_address = 0;
+        } else {
+            ok = false;
+        }
     }
     if !ok { return false; } // preserve root metadata on partial failure
     if !unsafe { vmm_destroy_empty(&mut img.tables) } { return false; }
@@ -323,6 +335,100 @@ pub(crate) unsafe fn indianos_user_copy_writable(
 mod tests {
     use super::*;
     use core::mem::{size_of, offset_of};
+    struct Ram {
+        frames: Vec<Box<[u64;512]>>, used: [bool;16], released: [u8;16],
+        refuse_release: u64, refuse_access: u64,
+    }
+    impl Ram {
+        fn new()->Self {
+            Self { frames:(0..16).map(|_|Box::new([0;512])).collect(),
+                used:[false;16],released:[0;16],refuse_release:0,refuse_access:0 }
+        }
+        fn index(physical:u64)->Option<usize> {
+            if physical==0 || physical%PAGE as u64!=0 { return None; }
+            let index=(physical/PAGE as u64-1) as usize;
+            (index<16).then_some(index)
+        }
+    }
+    unsafe extern "C" fn ram_alloc(out:*mut u64,ctx:*mut c_void)->bool {
+        let ram=unsafe { &mut *ctx.cast::<Ram>() };
+        let Some(index)=ram.used.iter().position(|&used|!used) else {return false;};
+        ram.used[index]=true;
+        unsafe { out.write((index as u64+1)*PAGE as u64); }
+        true
+    }
+    unsafe extern "C" fn ram_release(physical:u64,ctx:*mut c_void)->bool {
+        let ram=unsafe { &mut *ctx.cast::<Ram>() };
+        if ram.refuse_release==physical { return false; }
+        let Some(index)=Ram::index(physical) else {return false;};
+        assert!(ram.used[index],"double release of {physical:x}");
+        ram.used[index]=false;ram.released[index]+=1;
+        true
+    }
+    unsafe extern "C" fn ram_access(physical:u64,ctx:*mut c_void)->*mut c_void {
+        let ram=unsafe { &mut *ctx.cast::<Ram>() };
+        if ram.refuse_access==physical {return ptr::null_mut();}
+        let Some(index)=Ram::index(physical) else {return ptr::null_mut();};
+        if !ram.used[index] {return ptr::null_mut();}
+        ram.frames[index].as_mut_ptr().cast()
+    }
+    fn staged(ram:&mut Ram)->UserImage {
+        let backend=Backend {allocate:Some(ram_alloc),release:Some(ram_release),
+            access:Some(ram_access),context:(ram as *mut Ram).cast()};
+        let mut img:UserImage=unsafe {core::mem::zeroed()};
+        assert!(unsafe {vmm_create(&mut img.tables,&backend)});
+        let perms=Permissions {writable:true,executable:false,user:true};
+        for va in [0x400000,0x401000] {assert!(unsafe {stage(&mut img,va,perms)}.is_some());}
+        img.plan.stack_begin=0x400000;img.plan.stack_end=0x402000;
+        img.ready=true;img
+    }
+    #[test]
+    fn failed_data_release_can_retry_without_reunmap_or_double_free() {
+        let mut ram=Ram::new();let mut img=staged(&mut ram);
+        let refused=img.pages[1].physical_address;
+        ram.refuse_release=refused;
+        assert!(!unsafe {indianos_user_image_destroy(&mut img)});
+        assert!(!img.ready);assert!(img.tables.initialized);
+        assert_eq!(img.pages[0].physical_address,0);
+        assert_eq!(img.pages[1].virtual_address,0);
+        assert_eq!(img.pages[1].physical_address,refused);
+        assert!(!unsafe {indianos_user_can_write(&img,0x400000,1)});
+        let mut out=[0xaa;4];
+        assert!(!unsafe {indianos_user_copy_readonly(&img,0x400000,out.as_mut_ptr().cast(),4)});
+        assert_eq!(out,[0xaa;4]);
+        ram.refuse_release=0;
+        assert!(unsafe {indianos_user_image_destroy(&mut img)});
+        assert_eq!(img.page_count,0);assert!(!img.tables.initialized);
+        assert!(ram.used.iter().all(|&used|!used));
+        assert!(ram.released.iter().all(|&count|count<=1));
+        assert!(!unsafe {indianos_user_image_destroy(&mut img)});
+    }
+    #[test]
+    fn failed_root_access_and_release_preserve_retryable_image_ownership() {
+        let mut ram=Ram::new();let mut img=staged(&mut ram);
+        let root=img.tables.root_physical;
+        ram.refuse_access=root;
+        assert!(!unsafe {indianos_user_image_destroy(&mut img)});
+        assert!(!img.ready);assert_eq!(img.page_count,2);
+        assert!(img.pages[..2].iter().all(|p|p.virtual_address!=0&&p.physical_address!=0));
+        ram.refuse_access=0;ram.refuse_release=root;
+        assert!(!unsafe {indianos_user_image_destroy(&mut img)});
+        assert!(img.pages[..2].iter().all(|p|p.physical_address==0));
+        assert_eq!(img.tables.root_physical,root);
+        ram.refuse_release=0;
+        assert!(unsafe {indianos_user_image_destroy(&mut img)});
+        assert!(ram.used.iter().all(|&used|!used));
+    }
+    #[test]
+    fn invalid_page_count_denies_teardown_before_indexing_and_revokes_copy() {
+        let mut ram=Ram::new();let mut img=staged(&mut ram);
+        img.page_count=MAX_IMAGE_PAGES as u16+1;
+        let before=ram.used;
+        assert!(!unsafe {indianos_user_image_destroy(&mut img)});
+        assert!(!img.ready);assert_eq!(ram.used,before);
+        img.page_count=2;
+        assert!(unsafe {indianos_user_image_destroy(&mut img)});
+    }
     #[test]
     fn c_abi_and_user_copy_bounds() {
         assert_eq!(size_of::<UserPage>(), 16);

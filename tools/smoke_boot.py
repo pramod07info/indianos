@@ -358,6 +358,12 @@ def matching_ovmf_vars(code: Path) -> Path | None:
     return None
 
 
+def machine_argument(machine: str, mode: str) -> str:
+    # HPET legacy replacement can suppress PIT IRQ0 during calibration.
+    # The machine property works on QEMU releases that removed -no-hpet.
+    return f"{machine},hpet=off" if mode == "preempt" else machine
+
+
 def run_smoke(iso: Path, ovmf: Path, qemu: str, timeout: float,
               mode: str = "normal", machine: str = "q35",
               extra_devices: tuple[str, ...] = ()) -> str:
@@ -387,16 +393,12 @@ def run_smoke(iso: Path, ovmf: Path, qemu: str, timeout: float,
     }
     verify = verifiers[mode]
     argv = [
-        qemu, "-machine", machine, "-m", "512M",
+        qemu, "-machine", machine_argument(machine, mode), "-m", "512M",
         "-drive", f"if=pflash,unit=0,format=raw,file={ovmf},readonly=on",
         "-cdrom", str(iso), "-boot", "d", "-display", "none",
         "-serial", "stdio", "-monitor", "none", "-no-reboot", "-no-shutdown",
     ]
     argv.extend(extra_devices)
-    if mode == "preempt":
-        # HPET legacy replacement can suppress PIT IRQ0 on some firmware.
-        # Keep this emulator-only override out of all ordinary boot paths.
-        argv.append("-no-hpet")
     tempvars = None
     vars_template = matching_ovmf_vars(ovmf)
     if vars_template is not None:

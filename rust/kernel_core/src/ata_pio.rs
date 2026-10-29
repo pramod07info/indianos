@@ -110,9 +110,31 @@ fn wait_status(require_data:bool)->Result<(),BlockError>{
 fn ready()->Result<(),BlockError>{wait_status(true)}
 /// Wait for a PIO transfer or FLUSH CACHE to finish, requiring DRQ clear.
 fn complete()->Result<(),BlockError>{wait_status(false)}
+/// Optional IDENTIFY words use bit 14 set and bit 15 clear as their
+/// validity signature. Other patterns mean "not reported", not zero support.
+fn identify_word_valid(word:u16)->bool { word&0xc000==0x4000 }
+fn logical_sector_words(words:&[u16;256])->Option<u32>{
+    if !identify_word_valid(words[106]) || words[106]&(1<<12)==0 {
+        return Some(256);
+    }
+    let size=((words[118] as u32)<<16)|words[117] as u32;
+    // Bit 12 declares a sector longer than 256 words; smaller values
+    // contradict that declaration, including zero/uninitialized sizes.
+    if size<=256 {None} else {Some(size)}
+}
 fn capacity(words:&[u16;256])->Option<u64>{
-    // IDENTIFY bit 0 of word 49 indicates LBA support.
-    if words[49]&(1<<9)==0{return None;}
+    // Word 0 bit 15 identifies a non-ATA device; bit 2 means that the
+    // IDENTIFY response is incomplete (e.g. requires spin-up first).
+    if words[0]&0x8004!=0 {return None;}
+    // Word 49 bit 9 indicates LBA support (it has no optional validity tag).
+    if words[49]&(1<<9)==0 {return None;}
+    // Words 117/118 count words, not bytes. Reject both malformed sizes
+    // and valid larger logical sectors before exposing a 512-byte device.
+    if logical_sector_words(words)?!=256 {return None;}
+    // A valid command-set declaration explicitly denying FLUSH CACHE is
+    // incompatible with our write path. Legacy devices with no declaration
+    // remain test-only candidates; successful command completion is required.
+    if identify_word_valid(words[83]) && words[83]&(1<<12)==0 {return None;}
     let sectors=((words[61] as u64)<<16)|(words[60] as u64);
     if sectors==0{return None;}
     Some(sectors.min(MAX_LBA28))
@@ -136,6 +158,7 @@ impl AtaPio {
         ready()?;
         let mut words=[0u16;256];
         for word in &mut words{*word=unsafe{inw(DATA)};}
+        complete()?;
         let sectors=capacity(&words).ok_or(BlockError::Io)?;
         Ok(Self{sectors,last_stage:AtaStage::Idle})
     }
@@ -219,6 +242,59 @@ mod tests {
         assert_eq!(capacity(&words),Some(0x11234));
         words[60]=0xffff;words[61]=0xffff;
         assert_eq!(capacity(&words),Some(MAX_LBA28));
+    }
+    fn identify_512()->[u16;256] {
+        let mut words=[0;256];
+        words[49]=1<<9;words[60]=1024;
+        words
+    }
+    #[test]
+    fn identify_rejects_4kn_and_malformed_long_sector_declarations(){
+        for size in [0u32,1,255,256,257,2048,u32::MAX] {
+            let mut words=identify_512();
+            words[106]=0x5000;
+            words[117]=size as u16;words[118]=(size>>16) as u16;
+            assert_eq!(capacity(&words),None,"logical words={size}");
+        }
+    }
+    #[test]
+    fn identify_optional_geometry_uses_ata_validity_signature(){
+        let mut words=identify_512();
+        // Legacy absent/unreported geometry defaults to 512-byte logical
+        // sectors. Invalid signatures must not activate the size fields.
+        for declaration in [0,0x1000,0x9000,0xd000,0x4000,0x6003] {
+            words[106]=declaration;
+            words[117]=2048;words[118]=0xffff;
+            assert_eq!(capacity(&words),Some(1024));
+        }
+        // 512e physical-sector multiples do not change logical transfer size.
+        words[106]=0x6003;
+        assert_eq!(capacity(&words),Some(1024));
+    }
+    #[test]
+    fn identify_rejects_non_ata_incomplete_and_explicitly_missing_flush(){
+        let mut words=identify_512();
+        for identity in [0x8000,0x0004,0xffff] {
+            words[0]=identity;
+            assert_eq!(capacity(&words),None);
+        }
+        words[0]=0x0040;
+        words[83]=0x4000;
+        assert_eq!(capacity(&words),None);
+        words[83]=0x5000;
+        assert_eq!(capacity(&words),Some(1024));
+        for unreported in [0,0x1000,0x8000,0xffff] {
+            words[83]=unreported;
+            assert_eq!(capacity(&words),Some(1024));
+        }
+    }
+    #[test]
+    fn identify_lba28_bounds(){
+        let mut words=identify_512();
+        for sectors in [1,MAX_LBA28-1,MAX_LBA28,MAX_LBA28+1,u32::MAX as u64] {
+            words[60]=sectors as u16;words[61]=(sectors>>16) as u16;
+            assert_eq!(capacity(&words),Some(sectors.min(MAX_LBA28)));
+        }
     }
     #[test]
     fn transfer_states_require_expected_drq_and_no_error(){

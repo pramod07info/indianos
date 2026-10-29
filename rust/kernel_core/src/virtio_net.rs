@@ -1,6 +1,6 @@
 //! R028 QEMU-only legacy virtio-net PCI driver, single CPU and IRQs masked.
 //!
-//! The transport uses 2 contiguous 3-page DMA vrings, one receive and one
+//! The transport uses two bounded contiguous DMA vrings, one receive and one
 //! transmit packet buffer. No interrupt/shared IRQs, multiqueue, mergeable
 //! buffers, checksum offload, or modern virtio PCI capability negotiation.
 //! The device MUST be an emulated 0x1af4:0x1000 virtio-net legacy PCI card.
@@ -9,8 +9,7 @@ use core::{arch::asm,ptr,sync::atomic::{compiler_fence,Ordering}};
 use crate::network::{EthernetDevice,Error};
 
 const PAGE:usize=4096;
-const QSIZE:u16=256;
-const RING_FRAMES:u32=3;
+const MAX_QUEUE_SIZE:u16=1024;
 const FRAME_CAP:usize=2048;
 const VENDOR:u16=0x1af4;
 const DEVICE:u16=0x1000;
@@ -85,6 +84,24 @@ fn direct_map(hhdm:u64,phys:u64)->Option<*mut u8>{
     if virtual_addr>>48!=0xffff || (virtual_addr & (1u64<<47))==0{return None;}
     Some(virtual_addr as *mut u8)
 }
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+struct QueueLayout{size:u16,avail:usize,used:usize,frames:u32}
+impl QueueLayout{
+    fn new(size:u16)->Option<Self>{
+        if size==0||!size.is_power_of_two()||size>MAX_QUEUE_SIZE{return None;}
+        let avail=(size as usize).checked_mul(16)?;
+        let avail_end=avail.checked_add(4)?.checked_add(size as usize*2)?;
+        let used=avail_end.checked_add(PAGE-1)?&!(PAGE-1);
+        let end=used.checked_add(4)?.checked_add(size as usize*8)?;
+        let frames=end.checked_add(PAGE-1)?/PAGE;
+        if frames==0||frames>16{return None;}
+        Some(Self{size,avail,used,frames:frames as u32})
+    }
+}
+fn queue_layout(port:u16,queue:u16)->Option<QueueLayout>{
+    unsafe{outw(port+0x0e,queue);}
+    QueueLayout::new(unsafe{inw(port+0x0c)})
+}
 struct Queue{
     ring_phys:u64,
     ring:*mut u8,
@@ -92,37 +109,41 @@ struct Queue{
     buffer:*mut u8,
     queued:u16,
     used:u16,
+    layout:QueueLayout,
 }
 impl Queue {
-    fn allocate(hhdm:u64)->Result<Self,Error>{
+    fn allocate(hhdm:u64,layout:QueueLayout)->Result<Self,Error>{
         let mut ring_phys=0u64;
-        if !unsafe{pmm_allocate_contiguous_frames(RING_FRAMES,&mut ring_phys)}{
+        if !unsafe{pmm_allocate_contiguous_frames(layout.frames,&mut ring_phys)}{
             return Err(Error::Device);
         }
         let mut bufphys=0u64;
         if !unsafe{pmm_allocate_frame(&mut bufphys)}{
-            for n in 0..RING_FRAMES{
+            for n in 0..layout.frames{
                 let _=unsafe{pmm_release_frame(ring_phys+n as u64*PAGE as u64)};
             }
             return Err(Error::Device);
         }
-        let (Some(ring),Some(buffer))=(direct_map(hhdm,ring_phys),direct_map(hhdm,bufphys))
+        let last=ring_phys.checked_add((layout.frames as u64-1)*PAGE as u64);
+        let ring_end_valid=last.is_some_and(|last|direct_map(hhdm,last).is_some());
+        let (Some(ring),Some(buffer),true)=(direct_map(hhdm,ring_phys),
+            direct_map(hhdm,bufphys),ring_end_valid)
         else{
             let _=unsafe{pmm_release_frame(bufphys)};
-            for n in 0..RING_FRAMES{
+            for n in 0..layout.frames{
                 let _=unsafe{pmm_release_frame(ring_phys+n as u64*PAGE as u64)};
             }
             return Err(Error::Device);
         };
         unsafe{
-            ptr::write_bytes(ring,0,RING_FRAMES as usize*PAGE);
+            ptr::write_bytes(ring,0,layout.frames as usize*PAGE);
             ptr::write_bytes(buffer,0,PAGE);
         }
-        Ok(Self{ring_phys,ring,buffer_phys:bufphys,buffer,queued:0,used:0})
+        Ok(Self{ring_phys,ring,buffer_phys:bufphys,buffer,queued:0,used:0,layout})
     }
     fn descriptor(&mut self,size:u32,device_writes:bool){
-        // Descriptor table occupies ring page 0; index 0 is the only
-        // submitted descriptor, all other 255 are intentionally unused.
+        // Index zero remains the only submitted descriptor. Device ring
+        // capacity changes the layout, not the number of owned buffers.
         unsafe{
             ptr::write_volatile(self.ring.cast::<u64>(),self.buffer_phys);
             ptr::write_volatile(self.ring.add(8).cast::<u32>(),size);
@@ -132,21 +153,21 @@ impl Queue {
         }
     }
     fn offer(&mut self){
-        let slot=(self.queued as usize%QSIZE as usize)*2;
+        let slot=(self.queued as usize%self.layout.size as usize)*2;
         unsafe{
-            ptr::write_volatile(self.ring.add(PAGE+4+slot).cast::<u16>(),0);
+            ptr::write_volatile(self.ring.add(self.layout.avail+4+slot).cast::<u16>(),0);
         }
         compiler_fence(Ordering::Release);
         self.queued=self.queued.wrapping_add(1);
-        unsafe{ptr::write_volatile(self.ring.add(PAGE+2).cast::<u16>(),self.queued);}
+        unsafe{ptr::write_volatile(self.ring.add(self.layout.avail+2).cast::<u16>(),self.queued);}
     }
     fn complete(&self)->bool{
-        let idx=unsafe{ptr::read_volatile(self.ring.add(PAGE*2+2).cast::<u16>())};
+        let idx=unsafe{ptr::read_volatile(self.ring.add(self.layout.used+2).cast::<u16>())};
         compiler_fence(Ordering::Acquire);
         idx!=self.used
     }
     fn consume(&mut self)->Result<Option<usize>,Error>{
-        let idx=unsafe{ptr::read_volatile(self.ring.add(PAGE*2+2).cast::<u16>())};
+        let idx=unsafe{ptr::read_volatile(self.ring.add(self.layout.used+2).cast::<u16>())};
         // Observe the device's publication before reading its used element
         // and DMA bytes. x86 coherent DMA supplies the hardware ordering.
         compiler_fence(Ordering::Acquire);
@@ -155,23 +176,23 @@ impl Queue {
         // or unsolicited completion cannot transfer buffer ownership back.
         if self.queued.wrapping_sub(self.used)!=1 ||
            idx.wrapping_sub(self.used)!=1{return Err(Error::Device);}
-        let pos=(self.used as usize%QSIZE as usize)*8;
-        let id=unsafe{ptr::read_volatile(self.ring.add(PAGE*2+4+pos).cast::<u32>())};
-        let size=unsafe{ptr::read_volatile(self.ring.add(PAGE*2+8+pos).cast::<u32>())};
+        let pos=(self.used as usize%self.layout.size as usize)*8;
+        let id=unsafe{ptr::read_volatile(self.ring.add(self.layout.used+4+pos).cast::<u32>())};
+        let size=unsafe{ptr::read_volatile(self.ring.add(self.layout.used+8+pos).cast::<u32>())};
         if id!=0 || size as usize>FRAME_CAP{return Err(Error::Device);}
         self.used=self.used.wrapping_add(1);
         Ok(Some(size as usize))
     }
     fn release(self){
         let _=unsafe{pmm_release_frame(self.buffer_phys)};
-        for n in 0..RING_FRAMES{
+        for n in 0..self.layout.frames{
             let _=unsafe{pmm_release_frame(self.ring_phys+n as u64*PAGE as u64)};
         }
     }
 }
 fn configure_queue(port:u16,queue:u16,q:&Queue)->bool{
     unsafe{outw(port+0x0e,queue);}
-    if unsafe{inw(port+0x0c)}!=QSIZE ||
+    if unsafe{inw(port+0x0c)}!=q.layout.size ||
        q.ring_phys/PAGE as u64>u32::MAX as u64{
         return false;
     }
@@ -211,8 +232,14 @@ impl VirtioNet{
         }
         let mut hhdm=0u64;
         if !unsafe{boot_hhdm_offset(&mut hhdm)}{return Err(Error::Device);}
-        let mut rx=Queue::allocate(hhdm)?;
-        let mut tx=match Queue::allocate(hhdm){
+        // Legacy devices expose a fixed size rather than accepting our
+        // preferred size. QEMU revisions use both 256 and 1024 RX entries.
+        let (Some(rx_layout),Some(tx_layout))=(queue_layout(port,QUEUE_RX),
+            queue_layout(port,QUEUE_TX))else{
+            unsafe{outb(port+0x12,0);}return Err(Error::Device);
+        };
+        let mut rx=Queue::allocate(hhdm,rx_layout)?;
+        let mut tx=match Queue::allocate(hhdm,tx_layout){
             Ok(v)=>v,
             Err(e)=>{rx.release();return Err(e);}
         };
@@ -306,14 +333,15 @@ mod tests{
     use super::*;
     fn mock_queue(ring:&mut [u64;1536],buffer:&mut [u64;512])->Queue{
         Queue{ring_phys:0x1000,ring:ring.as_mut_ptr().cast(),
-            buffer_phys:0x4000,buffer:buffer.as_mut_ptr().cast(),queued:0,used:0}
+            buffer_phys:0x4000,buffer:buffer.as_mut_ptr().cast(),queued:0,used:0,
+            layout:QueueLayout::new(256).unwrap()}
     }
     fn completion(q:&Queue,index:u16,id:u32,len:u32){
-        let pos=q.used as usize%QSIZE as usize*8;
+        let pos=q.used as usize%q.layout.size as usize*8;
         unsafe{
-            ptr::write_volatile(q.ring.add(PAGE*2+4+pos).cast::<u32>(),id);
-            ptr::write_volatile(q.ring.add(PAGE*2+8+pos).cast::<u32>(),len);
-            ptr::write_volatile(q.ring.add(PAGE*2+2).cast::<u16>(),index);
+            ptr::write_volatile(q.ring.add(q.layout.used+4+pos).cast::<u32>(),id);
+            ptr::write_volatile(q.ring.add(q.layout.used+8+pos).cast::<u32>(),len);
+            ptr::write_volatile(q.ring.add(q.layout.used+2).cast::<u16>(),index);
         }
     }
     #[test]fn completions_require_exact_outstanding_descriptor_and_progress(){
@@ -358,11 +386,39 @@ mod tests{
         assert_eq!(dev.poll(&mut out),Err(Error::Device));
     }
     #[test]fn dma_allocation_counts_and_ring_layout(){
-        assert_eq!(QSIZE,256);
-        assert_eq!(RING_FRAMES as usize*PAGE,12288);
-        assert_eq!(PAGE+4+2*(QSIZE as usize-1)+2,4612);
-        assert!(PAGE+4+2*(QSIZE as usize-1)<PAGE*2);
-        assert!(PAGE*2+4+8*(QSIZE as usize-1)+8<3*PAGE);
+        let layout=QueueLayout::new(256).unwrap();
+        assert_eq!(layout.frames as usize*PAGE,12288);
+        assert_eq!(layout.avail,4096);assert_eq!(layout.used,8192);
+        assert_eq!(layout.avail+4+2*(layout.size as usize-1)+2,4612);
+        assert!(layout.avail+4+2*layout.size as usize<=layout.used);
+        assert!(layout.used+4+8*layout.size as usize<=layout.frames as usize*PAGE);
+    }
+    #[test]fn legacy_queue_layouts_are_bounded_aligned_and_nonoverlapping(){
+        for size in [0,3,255,1025,2048,u16::MAX]{assert_eq!(QueueLayout::new(size),None);}
+        for power in 0..=10{
+            let size=1<<power;let layout=QueueLayout::new(size).unwrap();
+            assert_eq!(layout.avail,16*size as usize);
+            assert_eq!(layout.used%PAGE,0);
+            assert!(layout.avail+4+2*size as usize<=layout.used);
+            assert!(layout.used+4+8*size as usize<=layout.frames as usize*PAGE);
+            assert!(layout.frames<=8);
+        }
+        assert_eq!(QueueLayout::new(1024),Some(QueueLayout{
+            size:1024,avail:16384,used:20480,frames:8}));
+    }
+    #[test]fn large_legacy_ring_last_slot_and_index_wrap_stay_inside_dma_allocation(){
+        let layout=QueueLayout::new(1024).unwrap();
+        let mut backing=[0xdddd_dddd_dddd_ddddu64;4097];
+        backing[..4096].fill(0);let mut data=[0u64;512];
+        let mut q=Queue{ring_phys:0x1000,ring:backing.as_mut_ptr().cast(),
+            buffer_phys:0x9000,buffer:data.as_mut_ptr().cast(),queued:u16::MAX,
+            used:u16::MAX,layout};
+        completion(&q,u16::MAX,0,0);
+        q.offer();assert_eq!(q.queued,0);
+        completion(&q,0,0,74);
+        assert_eq!(q.consume(),Ok(Some(74)));assert_eq!(q.used,0);
+        assert_eq!(q.consume(),Ok(None));
+        assert_eq!(backing[4096],0xdddd_dddd_dddd_dddd);
     }
     #[test]fn refuse_phys_overflow_and_invalid_hhdm(){
         assert!(direct_map(u64::MAX,0x1000).is_none());

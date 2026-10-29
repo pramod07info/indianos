@@ -11,10 +11,34 @@ from smoke_boot import (assert_milestones, assert_hardware_inventory,
                         assert_expected_usermode, assert_expected_userfault,
                         assert_expected_processes, assert_expected_scheduler,
                         assert_expected_preempt,
-                        matching_ovmf_vars, MILESTONES)  # noqa: E402
+                        matching_ovmf_vars, machine_argument, run_smoke, MILESTONES)  # noqa: E402
 
 
 class SmokeBootTests(unittest.TestCase):
+    def test_machine_property_preserves_modes(self):
+        for machine in ("pc", "q35"):
+            self.assertEqual(machine_argument(machine, "preempt"), f"{machine},hpet=off")
+            for mode in ("normal", "scheduler", "usermode"):
+                self.assertEqual(machine_argument(machine, mode), machine)
+
+    def test_subprocess_failure_reports_qemu_error_and_actual_machine(self):
+        for machine in ("pc", "q35"):
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                firmware = root / "firmware"
+                firmware.write_bytes(b"fixture")
+                fixture = root / "qemu"
+                fixture.write_text(
+                    "#!/usr/bin/python3\nimport sys\n"
+                    "print(sys.argv[sys.argv.index('-machine') + 1], file=sys.stderr)\n"
+                    "print('QEMU fixture: invalid option', file=sys.stderr)\n"
+                    "raise SystemExit(23)\n")
+                fixture.chmod(0o700)
+                with self.assertRaises(AssertionError) as caught:
+                    run_smoke(firmware, firmware, str(fixture), 5, "preempt", machine)
+                self.assertIn(f"{machine},hpet=off", str(caught.exception))
+                self.assertIn("QEMU fixture: invalid option", str(caught.exception))
+
     def test_hd0_boot_detects_cpu_and_reports_no_fake_qpu(self):
         assert_hardware_inventory(
             "IndianOS HD0 CPU=GenuineIntel x86-64 family=6 model=58; "

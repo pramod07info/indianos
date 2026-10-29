@@ -132,11 +132,20 @@ fn verified_payload<D:BlockDevice>(disk:&mut D,slot:usize,e:Entry)
     if !hash!=e.checksum{return Err(FsError::InvalidVolume);}
     Ok(())
 }
-fn verify_metadata<D:BlockDevice>(disk:&mut D,meta:&Metadata)->bool{
+fn verify_metadata<D:BlockDevice>(disk:&mut D,meta:&Metadata)->Result<bool,FsError>{
     for (slot,entry) in meta.entries.iter().enumerate(){
-        if entry.used && verified_payload(disk,slot,*entry).is_err(){return false;}
+        if !entry.used{continue;}
+        match verified_payload(disk,slot,*entry){
+            Ok(())=>{},
+            // Checksum corruption is evidence that this checkpoint cannot
+            // be used. A transport error is not: silently selecting an
+            // older head on a transient read failure could lose committed
+            // data when the recovery mount next publishes a new head.
+            Err(FsError::InvalidVolume)=>return Ok(false),
+            Err(error)=>return Err(error),
+        }
     }
-    true
+    Ok(true)
 }
 fn canonical_path(path:&str)->Result<[u8;NAME_BYTES],FsError>{
     let mut normalized=[0u8;NAME_BYTES];
@@ -205,7 +214,7 @@ impl<D:BlockDevice> DurableFs<D>{
             disk.read_sector(n as u64,&mut bytes)?;
             heads[n]=bytes;
             if let Some(meta)=decode(&bytes,disk.sector_count()){
-                if verify_metadata(&mut disk,&meta){*slot=Some(meta);}
+                if verify_metadata(&mut disk,&meta)?{*slot=Some(meta);}
             }
         }
         // Two independently valid copies with the same generation must
@@ -247,7 +256,7 @@ impl<D:BlockDevice> DurableFs<D>{
             let mut header=[0u8;SECTOR_BYTES];
             disk.read_sector(index as u64,&mut header)?;
             if let Some(meta)=decode(&header,disk.sector_count()){
-                if verify_metadata(disk,&meta){copies[index]=Some(meta);}
+                if verify_metadata(disk,&meta)?{copies[index]=Some(meta);}
             }
         }
         let (latest,previous,valid_copies)=match (copies[0],copies[1]){
@@ -604,12 +613,14 @@ mod tests{
         sectors:[[u8;SECTOR_BYTES];MIN_SECTORS as usize],
         fail_at:Option<usize>,
         ignore_at:Option<usize>,
+        fail_read_lba:Option<u64>,
         writes:usize
     }
     impl BlockDevice for Disk{
         fn sector_count(&self)->u64{MIN_SECTORS}
         fn read_sector(&mut self,lba:u64,out:&mut [u8;SECTOR_BYTES])
             ->Result<(),BlockError>{
+            if self.fail_read_lba==Some(lba){return Err(BlockError::Io);}
             let value=self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?;
             *out=*value;Ok(())
         }
@@ -631,7 +642,8 @@ mod tests{
         }
     }
     fn blank()->Disk{
-        Disk{sectors:[[0;SECTOR_BYTES];MIN_SECTORS as usize],fail_at:None,ignore_at:None,writes:0}
+        Disk{sectors:[[0;SECTOR_BYTES];MIN_SECTORS as usize],fail_at:None,
+            ignore_at:None,fail_read_lba:None,writes:0}
     }
     fn get(fs:&mut DurableFs<Disk>,path:&str)->Vec<u8>{
         let mut out=[0u8;MAX_FILE_BYTES];
@@ -872,6 +884,64 @@ mod tests{
         let mut mounted=DurableFs::mount(d).unwrap();
         assert_eq!(get(&mut mounted,"/file"),b"old");
         assert_ne!(active,2);
+    }
+
+    #[test]
+    fn m1_payload_io_failure_never_masquerades_as_checkpoint_corruption(){
+        let mut fs=DurableFs::format_blank(blank()).unwrap();
+        fs.create_path("/file",&[0x31;900]).unwrap();
+        fs.overwrite_path("/file",&[0x72;900]).unwrap();
+        let current=fs.meta.entries[0];
+        let previous=fs.previous.unwrap().entries[0];
+        let disk=fs.into_device();
+        // Failure in either generation, including after one readable data
+        // sector, is uncertainty about media rather than corruption proof.
+        for entry in [current,previous]{
+            for sector in [0,1]{
+                let mut unreadable=disk.clone();
+                unreadable.fail_read_lba=Some(block_start(0,entry.bank)+sector);
+                let before=unreadable.sectors;
+                let writes=unreadable.writes;
+                assert_eq!(DurableFs::inspect_health(&mut unreadable),Err(FsError::Io));
+                assert_eq!(unreadable.writes,writes);
+                assert_eq!(unreadable.sectors,before);
+                assert!(matches!(DurableFs::mount(unreadable.clone()),Err(FsError::Io)));
+                assert!(matches!(DurableFs::mount_healthy(unreadable.clone()),Err(FsError::Io)));
+                unreadable.fail_read_lba=None;
+                let health=DurableFs::inspect_health(&mut unreadable).unwrap();
+                assert_eq!(health.redundancy,Redundancy::Healthy);
+                assert_eq!(health.current_generation,3);
+                let mut remounted=DurableFs::mount(unreadable).unwrap();
+                assert_eq!(get(&mut remounted,"/file"),[0x72;900]);
+            }
+        }
+    }
+
+    #[test]
+    fn m1_repair_and_health_propagate_payload_io_without_writing(){
+        let mut fs=DurableFs::format_blank(blank()).unwrap();
+        fs.create_path("/file",&[0x45;900]).unwrap();
+        // Prepare a genuinely degraded metadata copy. A data read failure
+        // must still block repair instead of producing a false diagnosis.
+        let inactive=1-fs.active as usize;
+        let mut disk=fs.into_device();
+        disk.sectors[inactive][0]^=1;
+        let mut fs=DurableFs::mount(disk).unwrap();
+        let data_lba=block_start(0,fs.meta.entries[0].bank)+1;
+        fs.disk.fail_read_lba=Some(data_lba);
+        let before=fs.disk.sectors;
+        let writes=fs.disk.writes;
+        assert_eq!(fs.mounted_health(),Err(FsError::Io));
+        assert_eq!(fs.repair_redundancy(),Err(FsError::Io));
+        let mut output=[0xa5;900];
+        assert_eq!(fs.read_path("/file",&mut output),Err(FsError::Io));
+        assert_eq!(output,[0xa5;900]);
+        assert_eq!(fs.disk.writes,writes);
+        assert_eq!(fs.disk.sectors,before);
+        fs.disk.fail_read_lba=None;
+        assert_eq!(fs.repair_redundancy(),Ok(true));
+        let mut remounted=DurableFs::mount_healthy(fs.into_device()).unwrap();
+        assert_eq!(get(&mut remounted,"/file"),[0x45;900]);
     }
 
     #[test]
