@@ -50,7 +50,8 @@ impl Palette{
     }
 }
 struct Surface {
-    ptr:*mut u8,width:usize,height:usize,pitch:usize,palette:Palette
+    ptr:*mut u8,width:usize,height:usize,pitch:usize,palette:Palette,
+    rgb:fn(u8,u8,u8)->Option<u32>
 }
 impl Surface{
     fn from_boot()->Option<Self>{
@@ -61,7 +62,7 @@ impl Surface{
             return None;
         }
         Some(Self{ptr:f.address,width:f.width,height:f.height,
-            pitch:f.pitch,palette:Palette::new()?})
+            pitch:f.pitch,palette:Palette::new()?,rgb:boot::desktop_rgb})
     }
     fn fill(&mut self,x:i32,y:i32,width:u32,height:u32,color:u32){
         if width==0||height==0{return;}
@@ -112,6 +113,7 @@ impl Surface{
         shell(self,width,height,workspace,colors);
     }
     fn draw_window(&mut self,w:crate::desktop::Window,focused:bool){
+        if !w.visible||w.minimized{return;}
         #[cfg(feature="orbit-ui-preview")]
         {
             let colors=self.orbit_palette();
@@ -119,7 +121,6 @@ impl Surface{
             return;
         }
 
-        if !w.visible||w.minimized{return;}
         let b=w.bounds;let x=b.x;let y=b.y;
         let p=self.palette;
         self.fill(x-2,y-2,b.width+4,b.height+4,p.dark);
@@ -252,6 +253,10 @@ impl UserSurfaceService{
     }
     fn redraw(&self)->bool{
         let Some(mut out)=Surface::from_boot()else{return false;};
+        self.paint(&mut out)
+    }
+    // The boot framebuffer and memory-backed tests share this exact raster path.
+    fn paint(&self,out:&mut Surface)->bool{
         let palette=out.palette;
         // Paint desktop chrome, then each window AND its user commands in
         // the same z-order. A rear window can never paint over front chrome.
@@ -267,13 +272,16 @@ impl UserSurfaceService{
             out.text(30,(out.height-29) as i32,b"APPS",palette.white);
         }
         for window in self.session.desktop.windows(){
+            // Chrome and retained client content have one visibility contract.
+            // Keep backing commands intact so an explicit focus can restore them.
+            if !window.visible||window.minimized{continue;}
             out.draw_window(*window,self.session.desktop.focused()==Some(window.id));
             let Some((origin_x,origin_y,_,_))=self.client_bounds(window.id)
                 else{return false;};
             let slot=window.id as usize-1;
             for command in &self.commands[slot][..self.counts[slot]]{
                 let rgb=command.rgb;
-                let Some(color)=boot::desktop_rgb(
+                let Some(color)=(out.rgb)(
                     ((rgb>>16)&0xff) as u8,((rgb>>8)&0xff) as u8,(rgb&0xff) as u8
                 )else{return false;};
                 let x=origin_x+command.x as i32;
@@ -421,6 +429,10 @@ impl UserSurfaceService{
     }
     #[cfg(feature="test-r029-frame-server")]
     fn present_frame(&mut self,pid:u32,front:u32)->bool{
+        self.present_with(pid,front,Self::redraw)
+    }
+    #[cfg(feature="test-r029-frame-server")]
+    fn present_with(&mut self,pid:u32,front:u32,paint:impl FnOnce(&Self)->bool)->bool{
         let limit=if cfg!(feature="test-r031-boot-desktop"){64}
                   else if cfg!(feature="test-r029-desktop-suite"){5}else{2};
         if self.frame_state(pid).is_none() ||
@@ -436,7 +448,7 @@ impl UserSurfaceService{
         // policy. The privileged kernel remains only a clipped raster
         // backend in this opt-in implementation.
         if !self.session.focus(front){return false;}
-        if !self.redraw(){return false;}
+        if !paint(self){return false;}
         self.frames_presented+=1;
         log(b"IndianOS: R029.4 user-controlled framebuffer frame presented\n\0");
         true
@@ -732,6 +744,98 @@ pub(crate) fn run()->bool{
 #[cfg(test)]
 mod tests{
     use super::*;
+    #[cfg(feature="test-r029-desktop-suite")]
+    #[test]fn retained_clients_obey_visibility_through_authenticated_present(){
+        // No firmware mapping or PS/2 I/O: only the destination and RGB packing
+        // differ from boot. present_with and paint are the production paths.
+        let mut broker=Broker::new();
+        broker.grant(2,1).unwrap();broker.grant(3,2).unwrap();
+        let mut svc=UserSurfaceService{
+            session:Session::new(800,600).unwrap(),
+            commands:[[UserCommand::EMPTY;COMMAND_LIMIT];2],counts:[0,0],
+            focused:0,broker,frames_presented:0,launcher_visible:false,
+            desktop_actions:0,
+            #[cfg(feature="test-r031-supervisor")]
+            restart_count:0,
+            // Mouse is integer-only state; this test never polls hardware.
+            mouse:unsafe{core::mem::zeroed()},
+        };
+        svc.session.desktop.restore_bounds(1,Rect::new(100,100,400,300)).unwrap();
+        svc.session.desktop.restore_bounds(2,Rect::new(100,50,400,300)).unwrap();
+        svc.session.mouse_x=790;svc.session.mouse_y=590;
+        fn wire(id:u32,operation:u32,rgb:u32)->[u8;64]{
+            let mut b=[0;64];
+            b[..4].copy_from_slice(b"R29U");
+            b[4..8].copy_from_slice(&1u32.to_le_bytes());
+            b[8..12].copy_from_slice(&id.to_le_bytes());
+            b[12..16].copy_from_slice(&operation.to_le_bytes());
+            b[20..22].copy_from_slice(&382u16.to_le_bytes());
+            b[22..24].copy_from_slice(&246u16.to_le_bytes());
+            b[24..28].copy_from_slice(&rgb.to_le_bytes());
+            if operation==TEXT{b[32]=b'X';}
+            b
+        }
+        const FILES:u32=0x123456;
+        const TERMINAL:u32=0xabcdef;
+        for (pid,id,color) in [(2,1,FILES),(3,2,TERMINAL)]{
+            assert!(svc.submit(pid,&wire(id,FILL,color)));
+            assert!(svc.submit(pid,&wire(id,TEXT,color)));
+        }
+        // Files-GUI presents require the real client startup threshold.
+        #[cfg(feature="test-r031-files-gui")]
+        for _ in 0..3{assert!(svc.submit(2,&wire(1,FILL,FILES)));}
+        let retained=svc.commands;
+        let retained_counts=svc.counts;
+        let p=Palette{bg:2,top:3,bar:4,title:5,unfocused:6,
+            light:7,dark:8,panel:9,white:10,accent:11};
+        const PITCH:usize=804;
+        const GUARD:u32=0xfeedface;
+        let mut pixels=std::vec![GUARD;PITCH*600+16];
+        let mut out=Surface{ptr:pixels.as_mut_ptr().cast(),width:800,height:600,
+            pitch:PITCH*4,palette:p,
+            rgb:|r,g,b|Some(((r as u32)<<16)|((g as u32)<<8)|b as u32)};
+        let pixel=|data:&[u32],x:usize,y:usize|data[y*PITCH+x];
+        assert!(svc.present_with(1,2,|s|s.paint(&mut out)));
+        // Terminal content overlaps Files' titlebar while Terminal is in front.
+        assert_eq!(pixel(&pixels,115,105),TERMINAL);
+        svc.session.desktop.minimize(2).unwrap();
+        // A redraw after minimization retains the old stacking order: this
+        // catches the original ghost client painting over the exposed peer.
+        assert!(svc.paint(&mut out));
+        assert_eq!(pixel(&pixels,115,105),p.title);
+        assert_eq!(pixel(&pixels,115,160),FILES);
+        assert!(!pixels.contains(&TERMINAL));
+        let before=pixels.clone();
+        let frame=svc.frames_presented;
+        // Foreign applications can neither alter another backing stream nor
+        // trigger composition or restore its hidden window via frame present.
+        assert!(!svc.submit(2,&wire(2,FILL,0xff0000)));
+        for pid in [0,2,3,99]{
+            assert!(!svc.present_with(pid,2,|s|s.paint(&mut out)));
+        }
+        assert!(!svc.present_with(1,99,|s|s.paint(&mut out)));
+        assert_eq!(pixels,before);assert_eq!(svc.frames_presented,frame);
+        assert!(svc.window(2).unwrap().minimized);
+        assert_eq!(svc.commands,retained);assert_eq!(svc.counts,retained_counts);
+        assert!(svc.present_with(1,1,|s|s.paint(&mut out)));
+        assert_eq!(pixel(&pixels,115,105),p.title);
+        assert_eq!(pixel(&pixels,115,160),FILES);
+        assert!(!pixels.contains(&TERMINAL));
+        // An explicit server-selected focus restores the independent backing.
+        assert!(svc.present_with(1,2,|s|s.paint(&mut out)));
+        assert_eq!(pixel(&pixels,115,105),TERMINAL);
+        // With both visible, back-to-front replay preserves peer chrome too.
+        assert!(svc.present_with(1,1,|s|s.paint(&mut out)));
+        assert_eq!(pixel(&pixels,115,105),p.title);
+        assert_eq!(pixel(&pixels,115,160),FILES);
+        svc.session.desktop.close(2).unwrap();
+        assert!(!svc.submit(3,&wire(2,FILL,0xff0000)));
+        assert!(svc.present_with(1,1,|s|s.paint(&mut out)));
+        assert!(!pixels.contains(&TERMINAL));
+        assert_eq!(svc.commands,retained);
+        assert_eq!(&pixels[PITCH*600..],&[GUARD;16]);
+        for row in 0..600{assert_eq!(&pixels[row*PITCH+800..(row+1)*PITCH],&[GUARD;4]);}
+    }
     #[test]fn physical_character_cycle_updates_session_target_and_live_geometry(){
         let mut s=Session::new(800,600).unwrap();
         let third=s.desktop.open(App::Settings,Rect::new(20,60,320,240)).unwrap();
@@ -769,7 +873,7 @@ mod tests{
         let p=Palette{bg:2,top:3,bar:4,title:5,unfocused:6,
             light:7,dark:8,panel:9,white:10,accent:11};
         let mut surface=Surface{ptr:data.as_mut_ptr(),width:80,height:48,
-            pitch:80*4,palette:p};
+            pitch:80*4,palette:p,rgb:|_,_,_|None};
         surface.fill(-200,-200,400,400,0x0123_4567);
         assert_eq!(&data[80*48*4..],&[0xccu8;32]);
         assert_eq!(&data[..4],&0x0123_4567u32.to_ne_bytes());

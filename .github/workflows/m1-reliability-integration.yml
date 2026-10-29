@@ -1,0 +1,36 @@
+name: M1 combined reliability regression
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "rust/kernel_core/**"
+      - ".github/workflows/m1-reliability-integration.yml"
+  push:
+    branches: [main]
+    paths:
+      - "rust/kernel_core/**"
+      - ".github/workflows/m1-reliability-integration.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  combined-regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
+      - name: All host tests with the impacted runtime modules enabled
+        run: >-
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml
+          --lib --features pmm,vmm,test-r031-files-gui,test-r031-supervisor,test-r028-network,test-irq-keyboard
+      - name: Freestanding combined runtime compilation
+        run: >-
+          cargo check --locked --offline --manifest-path rust/kernel_core/Cargo.toml
+          --no-default-features --target x86_64-unknown-none
+          --features pmm,vmm,test-r031-files-gui,test-r031-supervisor,test-r028-network,test-irq-keyboard

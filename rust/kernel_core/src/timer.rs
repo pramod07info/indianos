@@ -325,6 +325,8 @@ static XAPIC_TIMER_ARMED:AtomicBool=AtomicBool::new(false);
 // Unlike ARMED (UC binding/initialization), RUNNING denotes an unmasked
 // periodic timer. A calibration one-shot must never trigger preemption.
 static XAPIC_TIMER_RUNNING:AtomicBool=AtomicBool::new(false);
+// A masked register alone does not establish an active measurement.
+static XAPIC_CALIBRATING:AtomicBool=AtomicBool::new(false);
 /// # Safety
 /// BSP ring0 only, interrupts disabled. Caller proves that virtual_base
 /// maps exactly the reported xAPIC physical page as supervisor-only UC
@@ -400,18 +402,22 @@ pub unsafe extern "C" fn x86_64_xapic_timer_start_calibrated(
         core::ptr::write_volatile(lvt,cfg.lvt);
         core::ptr::write_volatile(initial,cfg.initial_count);
     }
+    XAPIC_CALIBRATING.store(false,Ordering::Release);
     XAPIC_TIMER_RUNNING.store(true,Ordering::Release);
     true
 }
 /// R019.8: begin a bounded masked one-shot measurement.
 /// A separate reference clock must measure the interval; the timer remains
 /// masked throughout, so this cannot cause an unhandled APIC interrupt.
+/// Rejects a second begin until stop or periodic start ends the measurement;
+/// restarting the counter would invalidate the outstanding reference interval.
 /// # Safety
 /// BSP ring0 only with interrupts disabled, valid UC xAPIC mapping,
 /// and no concurrent timer user. Caller must stop sampling before wrap.
 #[no_mangle]
 pub unsafe extern "C" fn x86_64_xapic_calibration_begin(initial_count:u32)->bool{
-    if XAPIC_TIMER_RUNNING.load(Ordering::Acquire){return false;}
+    if XAPIC_TIMER_RUNNING.load(Ordering::Acquire) ||
+       XAPIC_CALIBRATING.load(Ordering::Acquire){return false;}
     if initial_count==0 || !XAPIC_TIMER_ARMED.load(Ordering::Acquire){return false;}
     let (Some(lvt),Some(divide),Some(initial))=(
         xapic_reg(XAPIC_LVT_TIMER_OFFSET),
@@ -426,16 +432,18 @@ pub unsafe extern "C" fn x86_64_xapic_calibration_begin(initial_count:u32)->bool
         core::ptr::write_volatile(divide,divide_value);
         core::ptr::write_volatile(initial,initial_count);
     }
+    XAPIC_CALIBRATING.store(true,Ordering::Release);
     true
 }
 /// R019.7: sample the current count of a prepared, masked xAPIC timer.
-/// Returns zero when unbound, unprepared, or unmasked; a zero count is not
+/// Returns zero outside an active masked calibration; a zero count is not
 /// usable for calibration. Does not start or acknowledge any interrupt.
 /// # Safety
 /// Ring0 BSP only, with interrupts disabled and the UC mapping alive.
 #[no_mangle]
 pub unsafe extern "C" fn x86_64_xapic_timer_sample_masked()->u32{
-    if !XAPIC_TIMER_ARMED.load(Ordering::Acquire){return 0;}
+    if !XAPIC_TIMER_ARMED.load(Ordering::Acquire) ||
+       !XAPIC_CALIBRATING.load(Ordering::Acquire){return 0;}
     let Some(lvt)=xapic_reg(XAPIC_LVT_TIMER_OFFSET)else{return 0;};
     let Some(current)=xapic_reg(XAPIC_TIMER_CURRENT_OFFSET)else{return 0;};
     if unsafe{core::ptr::read_volatile(lvt)}&(1<<16)==0{return 0;}
@@ -457,6 +465,7 @@ pub unsafe extern "C" fn x86_64_xapic_timer_stop()->bool{
         core::ptr::write_volatile(lvt,old|(1<<16));
         core::ptr::write_volatile(initial,0);
     }
+    XAPIC_CALIBRATING.store(false,Ordering::Release);
     XAPIC_TIMER_RUNNING.store(false,Ordering::Release);
     true
 }
@@ -659,6 +668,72 @@ pub extern "C" fn x86_64_timer_pic_mask()->u8{
 #[cfg(test)]
 mod tests {
     use super::*;
+    static MMIO_TEST_LOCK:std::sync::Mutex<()>=std::sync::Mutex::new(());
+    #[repr(align(4096))]
+    struct RegisterPage([u32;1024]);
+    struct TimerState([u64;6]);
+    impl TimerState {
+        fn save()->Self {
+            Self([XAPIC_VIRTUAL.load(Ordering::Acquire),
+                XAPIC_TIMER_ARMED.load(Ordering::Acquire) as u64,
+                XAPIC_TIMER_RUNNING.load(Ordering::Acquire) as u64,
+                XAPIC_CALIBRATING.load(Ordering::Acquire) as u64,
+                XAPIC_IRQ_TICKS.load(Ordering::Acquire),
+                XAPIC_PREEMPTIONS.load(Ordering::Acquire)])
+        }
+    }
+    impl Drop for TimerState {
+        fn drop(&mut self){
+            XAPIC_VIRTUAL.store(self.0[0],Ordering::Release);
+            XAPIC_TIMER_ARMED.store(self.0[1]!=0,Ordering::Release);
+            XAPIC_TIMER_RUNNING.store(self.0[2]!=0,Ordering::Release);
+            XAPIC_CALIBRATING.store(self.0[3]!=0,Ordering::Release);
+            XAPIC_IRQ_TICKS.store(self.0[4],Ordering::Release);
+            XAPIC_PREEMPTIONS.store(self.0[5],Ordering::Release);
+        }
+    }
+    #[test]
+    fn calibration_lifecycle_preserves_reference_window_and_rejects_stale_samples(){
+        let _lock=MMIO_TEST_LOCK.lock().unwrap();
+        let mut page=RegisterPage([0;1024]);
+        let _restore=TimerState::save();
+        // Host-only injection of valid local register storage. Never invoke
+        // the binding MSR probe or privileged port I/O in a host test.
+        XAPIC_VIRTUAL.store(page.0.as_mut_ptr() as u64,Ordering::Release);
+        XAPIC_TIMER_ARMED.store(false,Ordering::Release);
+        XAPIC_TIMER_RUNNING.store(false,Ordering::Release);
+        XAPIC_CALIBRATING.store(false,Ordering::Release);
+        unsafe {
+            assert!(x86_64_xapic_timer_prepare_masked(0x40));
+            page.0[XAPIC_TIMER_CURRENT_OFFSET/4]=900;
+            assert_eq!(x86_64_xapic_timer_sample_masked(),0);
+            assert!(!x86_64_xapic_calibration_begin(0));
+            assert!(x86_64_xapic_calibration_begin(1000));
+            assert_eq!(x86_64_xapic_timer_sample_masked(),900);
+            let measuring=page.0;
+            assert!(!x86_64_xapic_calibration_begin(2000));
+            assert_eq!(page.0,measuring);
+            assert!(!x86_64_xapic_timer_start_calibrated(0x41,16,50));
+            assert_eq!(page.0,measuring);
+            assert_eq!(x86_64_xapic_timer_sample_masked(),900);
+            assert!(x86_64_xapic_timer_stop());
+            assert_eq!(page.0[XAPIC_TIMER_INITIAL_OFFSET/4],0);
+            assert_ne!(page.0[XAPIC_LVT_TIMER_OFFSET/4]&(1<<16),0);
+            assert_eq!(x86_64_xapic_timer_sample_masked(),0);
+            assert!(x86_64_xapic_calibration_begin(2000));
+            assert!(x86_64_xapic_timer_start_calibrated(0x40,16,50));
+            assert!(!XAPIC_CALIBRATING.load(Ordering::Acquire));
+            assert!(x86_64_xapic_timer_preemption_ready());
+            let running=page.0;
+            assert!(!x86_64_xapic_calibration_begin(3000));
+            assert_eq!(page.0,running);
+            assert!(x86_64_xapic_timer_stop());
+            assert!(!x86_64_xapic_timer_preemption_ready());
+            assert_eq!(x86_64_xapic_timer_sample_masked(),0);
+            assert!(x86_64_xapic_calibration_begin(3000));
+        }
+    }
+
     #[test]
     fn legacy_irq0_blockers_are_independent_and_read_only(){
         assert_eq!(legacy_irq0_blockers(0,0,0,0,0),0);
@@ -818,6 +893,7 @@ mod tests {
     }
     #[test]
     fn xapic_mmio_register_access_rejects_unbound_and_unaligned(){
+        let _lock=MMIO_TEST_LOCK.lock().unwrap();
         assert!(xapic_reg(XAPIC_EOI_OFFSET).is_none());
         assert!(xapic_reg(0x401).is_none());
         assert!(xapic_reg(0x321).is_none());
@@ -839,6 +915,7 @@ mod tests {
     }
     #[test]
     fn stopped_timer_cannot_record_preemption(){
+        let _lock=MMIO_TEST_LOCK.lock().unwrap();
         assert!(!XAPIC_TIMER_RUNNING.load(Ordering::Acquire));
         let before=x86_64_xapic_timer_preemption_count();
         xapic_record_preemption();

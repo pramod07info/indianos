@@ -5,6 +5,7 @@
 use crate::block::{BlockDevice,BlockWindow};
 use crate::durablefs::{FsError,MAX_FILE_BYTES,MIN_SECTORS};
 use crate::hier_vfs::HierVfs;
+use crate::vfs_path::normalize_absolute;
 use crate::ata_pio::AtaPio;
 use crate::fs_write_guard::{WriteGuard,Statistics};
 
@@ -53,8 +54,15 @@ impl FileHandles{
     }
     pub fn open<D:BlockDevice>(&mut self,pid:u32,path:&str,mode:u64,
                                fs:&mut HierVfs<D>)->Result<u64,FsError>{
-        if !Self::policy(pid,path,mode)||path.len()>23||
-           !path.starts_with('/')||path.as_bytes().contains(&0){
+        // Authorize and retain the same bounded canonical spelling that the
+        // VFS resolves. Reject traversal rather than resolving it, even when
+        // its destination would otherwise be authorized.
+        let mut bytes=[0u8;24];
+        let len=normalize_absolute(path,&mut bytes[..23])
+            .map_err(|_|FsError::InvalidName)?;
+        let path=core::str::from_utf8(&bytes[..len])
+            .map_err(|_|FsError::InvalidName)?;
+        if !Self::policy(pid,path,mode){
             return Err(FsError::InvalidName);
         }
         // S0: even trusted PID1's ordinary application handle cannot
@@ -71,10 +79,8 @@ impl FileHandles{
         fs.read_at(path,0,&mut [])?;
         let token=self.next;
         self.next=self.next.checked_add(1).ok_or(FsError::Full)?;
-        let mut bytes=[0u8;24];
-        bytes[..path.len()].copy_from_slice(path.as_bytes());
         self.entries[slot]=Handle{token,pid,mode,offset:0,
-                                  path:bytes,len:path.len()};
+                                  path:bytes,len};
         Ok(token)
     }
     pub fn read<D:BlockDevice>(&mut self,pid:u32,token:u64,
@@ -302,6 +308,76 @@ mod tests{
         assert_eq!(handles.write(1,fd,b"T",&mut fs),Ok(1));
         assert_eq!(handles.security_statistics().completed_writes,1);
         assert_eq!(handles.security_statistics().changed_bytes,1);
+    }
+
+    #[test] fn canonical_shared_aliases_store_the_authorized_path(){
+        let mut fs=fresh();fs.mkdir("/shared").unwrap();
+        fs.create("/shared/note",b"durable").unwrap();
+        let mut handles=FileHandles::new();
+        for alias in ["//shared/./note", "/./shared//note/", "/shared/./././././././note"]{
+            let token=handles.open(2,alias,READ,&mut fs).unwrap();
+            let index=handles.index(2,token).unwrap();
+            assert_eq!(handles.entries[index].pathname(),"/shared/note");
+            let mut data=[0u8;8];
+            assert_eq!(handles.read(2,token,&mut data,&mut fs),Ok(7));
+            assert_eq!(&data[..7],b"durable");
+            handles.close(2,token).unwrap();
+        }
+        let token=handles.open(1,"//shared/./note/",WRITE,&mut fs).unwrap();
+        assert_eq!(handles.write(1,token,b"D",&mut fs),Ok(1));
+        let mut fs=HierVfs::mount(fs.into_device()).unwrap();
+        let mut data=[0u8;8];
+        assert_eq!(fs.read_at("/shared/note",0,&mut data),Ok(7));
+        assert_eq!(&data[..7],b"Durable");
+    }
+    #[test] fn failed_opens_preserve_slots_tokens_and_exact_shared_boundary(){
+        let mut fs=fresh();fs.mkdir("/shared").unwrap();fs.mkdir("/sharedx").unwrap();
+        fs.create("/shared/note",b"ok").unwrap();
+        fs.create("/sharedx/note",b"private").unwrap();
+        let mut handles=FileHandles::new();
+        for (pid,path,mode) in [
+            (2,"/shared/../shared/note",READ),(2,"/../shared/note",READ),
+            (2,"/shared/note\0",READ),(2,"shared/note",READ),
+            (2,"/shared/abcdefghijklmnop",READ),
+            (2,"//sharedx/./note",READ),(2,"/shared",READ),
+            (2,"/shared/missing",READ),(2,"/shared/note",WRITE),
+            (2,"/shared/note",READ|WRITE),(1,"/shared/note",0),
+            (1,"/shared/note",4),(3,"/shared/note",READ),
+        ]{
+            assert!(handles.open(pid,path,mode,&mut fs).is_err(),"{path}");
+            assert_eq!(handles.next,1);
+            assert!(handles.entries.iter().all(|h|h.token==0));
+        }
+        for expected in 1..=4{
+            assert_eq!(handles.open(2,"//shared/./note",READ,&mut fs),Ok(expected));
+        }
+        assert_eq!(handles.open(2,"/shared/note",READ,&mut fs),Err(FsError::Full));
+        assert_eq!(handles.next,5);
+        assert_eq!(handles.close(1,1),Err(FsError::InvalidName));
+        assert_eq!(handles.seek(1,1,0),Err(FsError::InvalidName));
+        assert_eq!(handles.read(1,1,&mut [0u8;2],&mut fs),Err(FsError::InvalidName));
+        handles.close(2,1).unwrap();
+        assert_eq!(handles.open(2,"/shared/note",READ,&mut fs),Ok(5));
+        assert_eq!(handles.seek(2,1,0),Err(FsError::InvalidName));
+    }
+    #[test] fn protected_alias_denials_and_token_exhaustion_are_atomic(){
+        let mut fs=fresh();fs.mkdir("/boot").unwrap();
+        fs.create("/boot/init",b"trusted").unwrap();
+        let mut handles=FileHandles::new();
+        for alias in ["/./boot/init", "////boot/././././././init/", "/boot//init/"]{
+            assert_eq!(handles.open(1,alias,READ|WRITE,&mut fs),Err(FsError::InvalidName));
+            assert_eq!(handles.next,1);
+            assert!(handles.entries.iter().all(|h|h.token==0));
+        }
+        assert_eq!(handles.security_statistics().denials,3);
+        assert_eq!(handles.security_statistics().completed_writes,0);
+        handles.next=u64::MAX;
+        assert_eq!(handles.open(1,"/./boot/init",READ,&mut fs),Err(FsError::Full));
+        assert_eq!(handles.next,u64::MAX);
+        assert!(handles.entries.iter().all(|h|h.token==0));
+        let mut data=[0u8;7];
+        assert_eq!(fs.read_at("/boot/init",0,&mut data),Ok(7));
+        assert_eq!(&data,b"trusted");
     }
 
 }

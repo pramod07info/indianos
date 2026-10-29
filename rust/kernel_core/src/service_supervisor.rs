@@ -69,11 +69,15 @@ pub struct ServiceSlot {
     pub max_restarts: u8,
     pub active: bool,
 }
+// Private authorization state: `active` remains a public snapshot field only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ServicePhase { Configured, Stopped, Active, Pending, Exhausted }
 pub struct ServiceTable<const N: usize> {
+    phases: [ServicePhase; N],
     slots: [Option<ServiceSlot>; N],
 }
 impl<const N: usize> ServiceTable<N> {
-    pub const fn new() -> Self { Self { slots: [None; N] } }
+    pub const fn new() -> Self { Self { slots: [None; N], phases: [ServicePhase::Configured; N] } }
 
     /// Trusted init configures a service before handing it to the scheduler.
     pub fn configure(&mut self, service_id: u32, pid: u32, max_restarts: u8) -> bool {
@@ -81,18 +85,27 @@ impl<const N: usize> ServiceTable<N> {
             .any(|s| s.service_id == service_id || s.pid == pid) {
             return false;
         }
-        let Some(free) = self.slots.iter_mut().find(|s| s.is_none()) else { return false; };
+        let Some((index, free)) = self.slots.iter_mut().enumerate().find(|(_, s)| s.is_none()) else { return false; };
+        self.phases[index] = ServicePhase::Configured;
         *free = Some(ServiceSlot {
             service_id, pid, generation: 0, restarts: 0, max_restarts, active: false,
         });
         true
     }
 
+    /// Start only a configured or deliberately stopped service. Pending
+    /// replacements require `prepared`; exhausted services stay inactive.
     pub fn start(&mut self, service_id: u32) -> ServiceAction {
-        let Some(slot) = self.slots.iter_mut().flatten()
-            .find(|s| s.service_id == service_id) else { return ServiceAction::Deny; };
-        if slot.active { return ServiceAction::Deny; }
-        let Some(generation) = slot.generation.checked_add(1) else { return ServiceAction::Deny; };
+        let Some(index) = self.slots.iter().position(|s| s.as_ref().is_some_and(|s| s.service_id == service_id)) else { return ServiceAction::Deny; };
+        if !matches!(self.phases[index], ServicePhase::Configured | ServicePhase::Stopped) {
+            return ServiceAction::Deny;
+        }
+        let slot = self.slots[index].as_mut().unwrap();
+        let Some(generation) = slot.generation.checked_add(1) else {
+            self.phases[index] = ServicePhase::Exhausted;
+            return ServiceAction::Deny;
+        };
+        self.phases[index] = ServicePhase::Active;
         slot.generation = generation;
         slot.active = true;
         ServiceAction::Start { pid: slot.pid, generation }
@@ -105,14 +118,17 @@ impl<const N: usize> ServiceTable<N> {
             self.slots.iter().flatten().any(|s| s.pid == replacement_pid) {
             return ServiceAction::Deny;
         }
-        let Some(slot) = self.slots.iter_mut().flatten()
-            .find(|s| s.pid == pid && s.active) else { return ServiceAction::Deny; };
-        if slot.restarts >= slot.max_restarts { slot.active = false; return ServiceAction::Deny; }
+        let Some(index) = self.slots.iter().position(|s| s.as_ref().is_some_and(|s| s.pid == pid && s.active)) else { return ServiceAction::Deny; };
+        if self.phases[index] != ServicePhase::Active { return ServiceAction::Deny; }
+        let slot = self.slots[index].as_mut().unwrap();
+        if slot.restarts >= slot.max_restarts { slot.active = false; self.phases[index] = ServicePhase::Exhausted; return ServiceAction::Deny; }
         let (Some(restarts), Some(generation)) =
             (slot.restarts.checked_add(1), slot.generation.checked_add(1)) else {
             slot.active = false;
+            self.phases[index] = ServicePhase::Exhausted;
             return ServiceAction::Deny;
         };
+        self.phases[index] = ServicePhase::Pending;
         slot.pid = replacement_pid;
         slot.restarts = restarts;
         slot.generation = generation;
@@ -122,19 +138,22 @@ impl<const N: usize> ServiceTable<N> {
 
     /// Only the replacement for the *same* service/generation may become active.
     pub fn prepared(&mut self, service_id: u32, pid: u32, generation: u32) -> bool {
-        if let Some(slot) = self.slots.iter_mut().flatten()
-            .find(|s| s.service_id == service_id && s.pid == pid && s.generation == generation) {
-            if slot.active || slot.restarts == 0 { return false; }
+        if let Some(index) = self.slots.iter().position(|s| s.as_ref().is_some_and(|s| s.service_id == service_id && s.pid == pid && s.generation == generation)) {
+            if self.phases[index] != ServicePhase::Pending { return false; }
+            self.phases[index] = ServicePhase::Active;
+            let slot = self.slots[index].as_mut().unwrap();
             slot.active = true;
             return true;
         }
         false
     }
 
+    /// Stop an active service, invalidating its preparation token. Pending
+    /// reservations are not cancelled; a stopped service may explicitly start.
     pub fn stop(&mut self, service_id: u32, pid: u32) -> bool {
-        if let Some(slot) = self.slots.iter_mut().flatten()
-            .find(|s| s.service_id == service_id && s.pid == pid && s.active) {
-            slot.active = false;
+        if let Some(index) = self.slots.iter().position(|s| s.as_ref().is_some_and(|s| s.service_id == service_id && s.pid == pid && s.active)) {
+            self.phases[index] = ServicePhase::Stopped;
+            self.slots[index].as_mut().unwrap().active = false;
             return true;
         }
         false
@@ -197,10 +216,11 @@ impl<const N: usize> ServiceTable<N> {
         if service_id == 0 || authenticated_pid == 0 || generation == 0 {
             return false;
         }
-        let Some(slot) = self.slots.iter_mut().flatten().find(|s|
+        let Some(index) = self.slots.iter().position(|s| s.as_ref().is_some_and(|s|
             s.service_id == service_id && s.pid == authenticated_pid &&
-            s.generation == generation && s.active) else { return false; };
-        slot.active = false;
+            s.generation == generation && s.active)) else { return false; };
+        self.phases[index] = ServicePhase::Stopped;
+        self.slots[index].as_mut().unwrap().active = false;
         true
     }
 }
@@ -248,14 +268,14 @@ impl<const N:usize> ServiceTable<N>{
  }
  pub fn start_batch(&mut self,services:&[u32])->bool{
   if services.is_empty()||services.len()>N{return false;}
-  let mut shadow=Self{slots:self.slots};
+  let mut shadow=Self{slots:self.slots,phases:self.phases};
   for (i,&service) in services.iter().enumerate(){
    if service==0||services[..i].contains(&service)||
       shadow.start(service)==ServiceAction::Deny{
     return false;
    }
   }
-  self.slots=shadow.slots;true
+  self.slots=shadow.slots;self.phases=shadow.phases;true
  }
  pub fn active_services(&self)->usize{
   self.slots.iter().flatten().filter(|s|s.active).count()
@@ -281,4 +301,83 @@ impl<const N:usize> ServiceTable<N>{
   assert_eq!(t.snapshot_all(&mut out),None);
   assert_eq!(out[0].service_id,1);
  }
+}
+
+#[cfg(test)]
+mod restart_phase_tests {
+    use super::*;
+
+    #[test]
+    fn pending_restart_cannot_bypass_preparation_or_disturb_peer() {
+        let mut t = ServiceTable::<2>::new();
+        t.configure(1, 10, 1); t.configure(2, 20, 1);
+        assert!(t.start_batch(&[1, 2]));
+        let peer = t.snapshot(2);
+        assert_eq!(t.crash(10, 11), ServiceAction::Restart { pid: 11, generation: 2 });
+        let pending = t.snapshot(1);
+        assert_eq!(t.start(1), ServiceAction::Deny);
+        assert!(!t.stop(1, 11));
+        assert!(!t.stop_exact(1, 11, 2));
+        assert_eq!(t.snapshot(1), pending);
+        assert!(!t.prepared(1, 10, 2));
+        assert!(t.prepared(1, 11, 2));
+        assert!(!t.prepared(1, 11, 2));
+        assert_eq!(t.snapshot(2), peer);
+    }
+
+    #[test]
+    fn stop_invalidates_prepared_but_allows_explicit_new_start() {
+        for exact in [false, true] {
+            let mut t = ServiceTable::<1>::new();
+            t.configure(1, 10, 2); t.start(1); t.crash(10, 11);
+            assert!(t.prepared(1, 11, 2));
+            assert!(if exact { t.stop_exact(1, 11, 2) } else { t.stop(1, 11) });
+            assert!(!t.prepared(1, 11, 2));
+            assert_eq!(t.start(1), ServiceAction::Start { pid: 11, generation: 3 });
+            assert!(!t.prepared(1, 11, 2));
+        }
+    }
+
+    #[test]
+    fn retry_exhaustion_is_terminal_for_all_activation_paths() {
+        let mut t = ServiceTable::<1>::new();
+        t.configure(1, 10, 1); t.start(1); t.crash(10, 11);
+        assert!(t.prepared(1, 11, 2));
+        assert_eq!(t.crash(11, 12), ServiceAction::Deny);
+        assert!(!t.prepared(1, 11, 2));
+        assert_eq!(t.start(1), ServiceAction::Deny);
+        assert!(!t.start_batch(&[1]));
+        assert!(!t.snapshot(1).unwrap().active);
+    }
+
+    #[test]
+    fn failed_batch_rolls_back_slot_and_phase_state() {
+        let mut t = ServiceTable::<2>::new();
+        t.configure(1, 10, 1); t.configure(2, 20, 1);
+        t.start(2); t.crash(20, 21);
+        let before = t.slots;
+        let phases = t.phases;
+        assert!(!t.start_batch(&[1, 2]));
+        assert_eq!(t.slots, before); assert_eq!(t.phases, phases);
+        assert_eq!(t.start(1), ServiceAction::Start { pid: 10, generation: 1 });
+        assert!(t.prepared(2, 21, 2));
+    }
+
+    #[test]
+    fn generation_overflow_fails_closed_for_start_and_crash() {
+        let mut t = ServiceTable::<2>::new();
+        t.configure(1, 10, 2); t.configure(2, 20, 2);
+        t.slots[0].as_mut().unwrap().generation = u32::MAX;
+        assert_eq!(t.start(1), ServiceAction::Deny);
+        assert_eq!(t.phases[0], ServicePhase::Exhausted);
+        assert!(!t.prepared(1, 10, u32::MAX));
+        t.start(2);
+        t.slots[1].as_mut().unwrap().generation = u32::MAX;
+        assert_eq!(t.crash(20, 21), ServiceAction::Deny);
+        assert!(!t.snapshot(2).unwrap().active);
+        assert_eq!(t.start(2), ServiceAction::Deny);
+        assert!(!t.prepared(2, 20, u32::MAX));
+        assert_eq!(t.snapshot(2).unwrap().pid, 20);
+        assert_eq!(t.snapshot(2).unwrap().restarts, 0);
+    }
 }

@@ -73,12 +73,57 @@ impl<D:BlockDevice> HierVfs<D>{
  }
  pub fn into_device(self)->D{self.fs.into_device()}
  pub fn generation(&self)->u64{self.fs.generation()}
+ fn contradictory_alias(&self,p:&Path)->bool{
+  let mut key=p.key;key[2]=if key[2]==b'd'{b'f'}else{b'd'};
+  let mut own=false;let mut opposite=false;
+  self.fs.visit_names(|n|{
+   if n.as_bytes()==&p.key[1..p.key_len]{own=true;}
+   if n.as_bytes()==&key[1..p.key_len]{opposite=true;}
+  });
+  own && opposite
+ }
+ // Validate the entire chain iteratively; a leaf marker alone is insufficient.
  fn directory(&mut self,p:&str)->Result<(),FsError>{
-  if p=="/"{return Ok(());}
-  let k=checked(p,Kind::Directory)?;
-  let mut buf=[0u8;8];
-  if self.fs.read_path(k.name(),&mut buf)?!=8 ||&buf!=DIR_MARKER{
-   return Err(FsError::InvalidVolume);
+  let k=checked(p,Kind::Directory)?;let name=k.path();
+  for end in 1..=name.len(){
+   if end!=name.len() && name.as_bytes()[end]!=b'/'{continue;}
+   let prefix=checked(&name[..end],Kind::Directory)?;
+   if self.contradictory_alias(&prefix){return Err(FsError::InvalidVolume);}
+   let mut buf=[0u8;8];
+   match self.fs.read_path(prefix.name(),&mut buf){
+    Ok(8) if &buf==DIR_MARKER=>{},
+    Ok(_)|Err(FsError::TooLarge)=>return Err(FsError::InvalidVolume),
+    Err(e)=>return Err(e),
+   }
+  }
+  Ok(())
+ }
+ // Metadata is bounded by the durable format, so snapshot names without heap
+ // allocation before reading directory payloads through the mutable device.
+ fn listing_integrity(&mut self)->Result<(),FsError>{
+  let mut keys=[[0u8;24];crate::durablefs::MAX_FILES];
+  let mut lengths=[0usize;crate::durablefs::MAX_FILES];let mut count=0;
+  self.fs.visit_names(|name|{
+   // Only ~d/~f are reserved by this VFS. Other flat legacy keys belong
+   // to separate callers and must not be diagnosed as a corrupt namespace.
+   if name.starts_with("~d") || name.starts_with("~f"){
+    keys[count][..name.len()].copy_from_slice(name.as_bytes());
+    lengths[count]=name.len();count+=1;
+   }
+  });
+  for i in 0..count{
+   let key=&keys[i][..lengths[i]];
+   if key.len()<3 || !matches!(key[1],b'd'|b'f'){return Err(FsError::InvalidVolume);}
+   let mut logical=[0u8;24];logical[0]=b'/';
+   for (j,&byte) in key[2..].iter().enumerate(){
+    logical[j+1]=if byte==b'~'{b'/'}else{byte};
+   }
+   let kind=if key[1]==b'd'{Kind::Directory}else{Kind::File};
+   let raw=core::str::from_utf8(&logical[..key.len()-1]).map_err(|_|FsError::InvalidVolume)?;
+   let path=checked(raw,kind).map_err(|_|FsError::InvalidVolume)?;
+   if &path.key[1..path.key_len]!=key || self.contradictory_alias(&path){return Err(FsError::InvalidVolume);}
+   let result=if kind==Kind::Directory{self.directory(path.path())}else{self.parents(&path)};
+   match result{Err(FsError::NotFound)=>return Err(FsError::InvalidVolume),other=>other?}
   }
   Ok(())
  }
@@ -123,6 +168,7 @@ impl<D:BlockDevice> HierVfs<D>{
       name.as_bytes()[2..].starts_with(pref){has_child=true;}
   });
   if has_child{return Err(FsError::Full);}
+  if self.contradictory_alias(&p){return Err(FsError::InvalidVolume);}
   self.fs.delete_path(p.name())
  }
  pub fn create(&mut self,path:&str,data:&[u8])->Result<(),FsError>{
@@ -134,11 +180,13 @@ impl<D:BlockDevice> HierVfs<D>{
  pub fn read(&mut self,path:&str,out:&mut [u8])->Result<usize,FsError>{
   let p=checked(path,Kind::File)?;
   self.parents(&p)?;
+  if self.contradictory_alias(&p){return Err(FsError::InvalidVolume);}
   self.fs.read_path(p.name(),out)
  }
  pub fn overwrite(&mut self,path:&str,data:&[u8])->Result<(),FsError>{
   let p=checked(path,Kind::File)?;
   self.parents(&p)?;
+  if self.contradictory_alias(&p){return Err(FsError::InvalidVolume);}
   self.fs.overwrite_path(p.name(),data)
  }
  /// Offset-based read of existing files. A large on-disk file can be read
@@ -148,6 +196,7 @@ impl<D:BlockDevice> HierVfs<D>{
   if out.len()>MAX_TRANSFER{return Err(FsError::TooLarge);}
   let p=checked(path,Kind::File)?;
   self.parents(&p)?;
+  if self.contradictory_alias(&p){return Err(FsError::InvalidVolume);}
   self.fs.read_range_path(p.name(),offset,out)
  }
  /// Offset-based append or in-place overwrite. Do not allow sparse holes.
@@ -156,6 +205,7 @@ impl<D:BlockDevice> HierVfs<D>{
   if data.is_empty()||data.len()>MAX_TRANSFER{return Err(FsError::TooLarge);}
   let p=checked(path,Kind::File)?;
   self.parents(&p)?;
+  if self.contradictory_alias(&p){return Err(FsError::InvalidVolume);}
   self.fs.write_range_path(p.name(),offset,data)
  }
  /// Durable destination creation from a complete, CRC-verified source.
@@ -167,6 +217,7 @@ impl<D:BlockDevice> HierVfs<D>{
   let to=checked(target,Kind::File)?;
   if from.path()==to.path(){return Err(FsError::Exists);}
   self.parents(&from)?;self.parents(&to)?;
+  if self.contradictory_alias(&from){return Err(FsError::InvalidVolume);}
   if self.conflicting(to.path(),Kind::File)?{return Err(FsError::Exists);}
   let mut data=[0u8;MAX_FILE_BYTES];
   let count=self.fs.read_path(from.name(),&mut data)?;
@@ -180,6 +231,7 @@ impl<D:BlockDevice> HierVfs<D>{
   let to=checked(destination,Kind::File)?;
   if from.path()==to.path(){return Err(FsError::Exists);}
   self.parents(&from)?;self.parents(&to)?;
+  if self.contradictory_alias(&from){return Err(FsError::InvalidVolume);}
   if self.conflicting(to.path(),Kind::File)?{return Err(FsError::Exists);}
   // Validate both existing files completely before any write transaction.
   let mut buffer=[0u8;MAX_FILE_BYTES];
@@ -191,12 +243,14 @@ impl<D:BlockDevice> HierVfs<D>{
  pub fn unlink(&mut self,path:&str)->Result<(),FsError>{
   let p=checked(path,Kind::File)?;
   self.parents(&p)?;
+  if self.contradictory_alias(&p){return Err(FsError::InvalidVolume);}
   self.fs.delete_path(p.name())
  }
  pub fn rename_file(&mut self,source:&str,target:&str)->Result<(),FsError>{
   let from=checked(source,Kind::File)?;
   let to=checked(target,Kind::File)?;
   self.parents(&from)?;self.parents(&to)?;
+  if self.contradictory_alias(&from){return Err(FsError::InvalidVolume);}
   if self.conflicting(to.path(),Kind::File)?{return Err(FsError::Exists);}
   self.fs.rename_path(from.name(),to.name())
  }
@@ -219,7 +273,11 @@ impl<D:BlockDevice> HierVfs<D>{
   }
  }
  pub fn list_dir(&mut self,path:&str,out:&mut [u8])->Result<usize,FsError>{
+  let mut canonical=[0u8;64];
+  let len=normalize_absolute(path,&mut canonical).map_err(|_|FsError::InvalidName)?;
+  let path=core::str::from_utf8(&canonical[..len]).map_err(|_|FsError::InvalidName)?;
   if path!="/"{self.directory(path)?;}
+  self.listing_integrity()?;
   let stem=if path=="/"{None}else{Some(checked(path,Kind::Directory)?)};
   let prefix=stem.as_ref().map(|p|p.stem().as_bytes());
   let mut scratch=[0u8;MAX_TRANSFER];let mut used=0usize;
@@ -321,6 +379,105 @@ mod tests{
  }
  fn fresh()->HierVfs<Disk>{
   HierVfs::format_blank(Disk{blocks:[[0;SECTOR_BYTES];COUNT],writes:0,tear:None}).unwrap()
+ }
+ #[test]fn valid_wrong_type_lookup_is_not_namespace_corruption(){
+  let mut v=fresh();v.mkdir("/dir").unwrap();v.create("/file",b"ok").unwrap();
+  let before=v.generation();let mut out=[0xcc;32];
+  assert_eq!(v.read("/dir",&mut out),Err(FsError::NotFound));
+  assert_eq!(v.read_at("/dir",0,&mut out),Err(FsError::NotFound));
+  assert_eq!(v.list_dir("/file",&mut out),Err(FsError::NotFound));
+  assert_eq!(v.mkdir("/file/child"),Err(FsError::NotFound));
+  assert_eq!(out,[0xcc;32]);assert_eq!(v.generation(),before);
+ }
+ #[test]fn contradictory_file_alias_cannot_read_or_mutate(){
+  let mut v=fresh();v.create("/a",b"original").unwrap();v.create("/target",b"safe").unwrap();
+  v.fs.create_path("/~da",DIR_MARKER).unwrap();
+  let disk=v.into_device();let before=disk.blocks;let writes=disk.writes;
+  let mut v=HierVfs::mount(disk).unwrap();let generation=v.generation();
+  let mut out=[0xcc;32];
+  assert_eq!(v.read("/a",&mut out),Err(FsError::InvalidVolume));
+  assert_eq!(v.read_at("/a",0,&mut out),Err(FsError::InvalidVolume));
+  assert_eq!(v.overwrite("/a",b"bad"),Err(FsError::InvalidVolume));
+  assert_eq!(v.write_at("/a",0,b"bad"),Err(FsError::InvalidVolume));
+  assert_eq!(v.unlink("/a"),Err(FsError::InvalidVolume));
+  assert_eq!(v.rename_file("/a","/new"),Err(FsError::InvalidVolume));
+  assert_eq!(v.copy_file("/a","/new"),Err(FsError::InvalidVolume));
+  assert_eq!(v.copy_replace("/a","/target"),Err(FsError::InvalidVolume));
+  assert_eq!(v.create("/a",b"collision"),Err(FsError::Exists));
+  assert_eq!(v.copy_file("/target","/a"),Err(FsError::Exists));
+  assert_eq!(out,[0xcc;32]);assert_eq!(v.generation(),generation);
+  let disk=v.into_device();assert_eq!(disk.blocks,before);assert_eq!(disk.writes,writes);
+ }
+ #[test]fn canonical_listing_aliases_survive_remount(){
+  let mut v=fresh();v.mkdir("//a/./").unwrap();v.create("/a/f",b"ok").unwrap();
+  let mut v=HierVfs::mount(v.into_device()).unwrap();
+  for path in ["/","////","/././","//.///"]{
+   let mut out=[0xcc;32];let n=v.list_dir(path,&mut out).unwrap();
+   assert_eq!(&out[..n],b"d:a\n");
+  }
+  let mut out=[0;32];let n=v.list_dir("//a/./",&mut out).unwrap();
+  assert_eq!(&out[..n],b"f:f\n");
+ }
+ #[test]fn legacy_keys_outside_reserved_namespace_remain_opaque(){
+  let mut v=fresh();v.fs.create_path("/~x-old",b"opaque").unwrap();
+  v.mkdir("/a").unwrap();v.create("/a/f",b"ok").unwrap();
+  let mut v=HierVfs::mount(v.into_device()).unwrap();let generation=v.generation();
+  let mut out=[0xcc;32];let n=v.list_dir("/",&mut out).unwrap();
+  assert_eq!(&out[..n],b"d:a\n");assert_eq!(v.generation(),generation);
+  let mut raw=crate::durablefs::DurableFs::mount(v.into_device()).unwrap();
+  assert_eq!(raw.read_path("/~x-old",&mut out),Ok(6));
+  assert_eq!(&out[..6],b"opaque");
+ }
+ #[test]fn orphan_bad_marker_and_alias_fail_without_output_or_writes(){
+  for case in 0..5{
+   let mut v=fresh();
+   match case{
+    0=>{v.fs.create_path("/~da~b",DIR_MARKER).unwrap();},
+    1=>{v.fs.create_path("/~da",b"bad").unwrap();},
+    2=>{v.mkdir("/a").unwrap();v.fs.create_path("/~fa",b"alias").unwrap();},
+    3=>{v.fs.create_path("/~fa~leaf",b"orphan").unwrap();},
+    _=>{v.fs.create_path("/~da~~b",DIR_MARKER).unwrap();},
+   }
+   let disk=v.into_device();let before=disk.blocks;let writes=disk.writes;
+   let mut v=HierVfs::mount(disk).unwrap();let generation=v.generation();
+   let mut out=[0xcc;MAX_TRANSFER];
+   assert_eq!(v.list_dir("/",&mut out),Err(FsError::InvalidVolume));
+   assert_eq!(out,[0xcc;MAX_TRANSFER]);assert_eq!(v.generation(),generation);
+   if case==0{
+    assert_eq!(v.list_dir("/a/b",&mut out),Err(FsError::NotFound));
+    assert_eq!(v.mkdir("/a/b/c"),Err(FsError::NotFound));
+    assert_eq!(v.read("/a/b/f",&mut out),Err(FsError::NotFound));
+   }
+   if case==2{
+    assert_eq!(v.mkdir("/a/b"),Err(FsError::InvalidVolume));
+    assert_eq!(v.read("/a",&mut out),Err(FsError::InvalidVolume));
+   }
+   assert_eq!(out,[0xcc;MAX_TRANSFER]);
+   let disk=v.into_device();assert_eq!(disk.blocks,before);assert_eq!(disk.writes,writes);
+  }
+ }
+ #[test]fn directory_payload_read_fault_keeps_listing_and_media_unchanged(){
+  struct Fault<'a>{disk:Disk,fail:&'a core::cell::Cell<bool>}
+  impl BlockDevice for Fault<'_>{
+   fn sector_count(&self)->u64{self.disk.sector_count()}
+   fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+    if self.fail.get() && lba>=2{return Err(BlockError::Io);}
+    self.disk.read_sector(lba,out)
+   }
+   fn write_sector(&mut self,lba:u64,data:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+    self.disk.write_sector(lba,data)
+   }
+  }
+  let mut v=fresh();v.mkdir("/a").unwrap();v.mkdir("/a/b").unwrap();
+  let disk=v.into_device();let before=disk.blocks;let writes=disk.writes;
+  let fail=core::cell::Cell::new(false);
+  let mut v=HierVfs::mount(Fault{disk,fail:&fail}).unwrap();fail.set(true);
+  let mut out=[0xcc;MAX_TRANSFER];
+  assert_eq!(v.list_dir("/",&mut out),Err(FsError::Io));
+  assert_eq!(v.list_dir("/a/b",&mut out),Err(FsError::Io));
+  assert_eq!(v.mkdir("/a/b/c"),Err(FsError::Io));
+  assert_eq!(out,[0xcc;MAX_TRANSFER]);
+  let disk=v.into_device().disk;assert_eq!(disk.blocks,before);assert_eq!(disk.writes,writes);
  }
  #[test]fn hierarchy_reboot_listing_parent_and_conflicts(){
   let mut v=fresh();

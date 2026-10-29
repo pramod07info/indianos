@@ -6,7 +6,8 @@ pub const POINTER_FOCUS:u32=2;
 #[derive(Clone,Copy,Debug,Eq,PartialEq)]
 pub enum Error{Invalid,Duplicate,Full,Unauthorized,Empty,Exhausted}
 #[derive(Clone,Copy,Debug,Eq,PartialEq)]
-struct Binding{owner:u32,window:u32}
+// Epochs distinguish successive grants of the same owner/window pair.
+struct Binding{owner:u32,window:u32,epoch:u64}
 #[derive(Clone,Copy,Debug,Eq,PartialEq)]
 pub struct Event{pub owner:u32,pub window:u32,pub kind:u32,pub sequence:u32}
 impl Event{
@@ -20,11 +21,11 @@ impl Event{
 }
 /// Single-CPU syscall context only: no IRQ or SMP concurrency allowed.
 pub struct Broker<const W:usize,const Q:usize>{
-    windows:[Option<Binding>;W],events:[Option<Event>;Q],len:usize,sequence:u32
+    windows:[Option<Binding>;W],events:[Option<Event>;Q],len:usize,sequence:u32,grant_epoch:u64
 }
 impl<const W:usize,const Q:usize> Broker<W,Q>{
     pub const fn new()->Self{
-        Self{windows:[None;W],events:[None;Q],len:0,sequence:0}
+        Self{windows:[None;W],events:[None;Q],len:0,sequence:0,grant_epoch:0}
     }
     /// Grants are performed only by the trusted window service.
     pub fn grant(&mut self,owner:u32,window:u32)->Result<(),Error>{
@@ -33,7 +34,11 @@ impl<const W:usize,const Q:usize> Broker<W,Q>{
             return Err(Error::Duplicate);
         }
         let slot=self.windows.iter_mut().find(|b|b.is_none()).ok_or(Error::Full)?;
-        *slot=Some(Binding{owner,window});Ok(())
+        let epoch=self.grant_epoch.checked_add(1).ok_or(Error::Exhausted)?;
+        *slot=Some(Binding{owner,window,epoch});self.grant_epoch=epoch;Ok(())
+    }
+    fn binding(&self,owner:u32,window:u32)->Option<Binding>{
+        self.windows.iter().flatten().find(|b|b.owner==owner&&b.window==window).copied()
     }
     pub fn owns(&self,owner:u32,window:u32)->bool{
         owner!=0&&window!=0&&self.windows.iter().flatten()
@@ -422,15 +427,15 @@ impl<const W:usize,const Q:usize> Broker<W,Q>{
  pub fn grant_batch(&mut self,requests:&[(u32,u32)])->Result<usize,Error>{
   if requests.is_empty()||requests.len()>W{return Err(Error::Invalid);}
   let mut pending=Self{windows:self.windows,events:self.events,
-   len:self.len,sequence:self.sequence};
+   len:self.len,sequence:self.sequence,grant_epoch:self.grant_epoch};
   for &(owner,window) in requests{pending.grant(owner,window)?;}
-  self.windows=pending.windows;Ok(requests.len())
+  self.windows=pending.windows;self.grant_epoch=pending.grant_epoch;Ok(requests.len())
  }
  /// Fully tear down several owner/window bindings or none at all.
  pub fn revoke_batch(&mut self,requests:&[(u32,u32)])->Result<usize,Error>{
   if requests.is_empty()||requests.len()>W{return Err(Error::Invalid);}
   let mut pending=Self{windows:self.windows,events:self.events,
-   len:self.len,sequence:self.sequence};
+   len:self.len,sequence:self.sequence,grant_epoch:self.grant_epoch};
   for &(owner,window) in requests{pending.revoke_window(owner,window)?;}
   self.windows=pending.windows;self.events=pending.events;
   self.len=pending.len;Ok(requests.len())
@@ -445,13 +450,15 @@ impl<const W:usize,const Q:usize> Broker<W,Q>{
   let index=self.windows.iter().position(|w|
    w.is_some_and(|b|b.owner==old_owner&&b.window==window))
    .ok_or(Error::Unauthorized)?;
+  let epoch=self.grant_epoch.checked_add(1).ok_or(Error::Exhausted)?;
   // Forget queued events before publishing the new owner grant.
   let mut pos=0;
   while pos<self.len{
    if self.events[pos].is_some_and(|e|e.window==window){self.remove(pos);}
    else{pos+=1;}
   }
-  self.windows[index]=Some(Binding{owner:new_owner,window});
+  self.windows[index]=Some(Binding{owner:new_owner,window,epoch});
+  self.grant_epoch=epoch;
   Ok(())
  }
 }
@@ -562,25 +569,25 @@ mod r009_input_delivery_tests{
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 pub struct FocusTarget{pub owner:u32,pub window:u32}
 pub struct DesktopInput{
- focused:Option<FocusTarget>,capture:Option<FocusTarget>,
+ focused:Option<Binding>,capture:Option<Binding>,
 }
 impl DesktopInput{
  pub const fn new()->Self{Self{focused:None,capture:None}}
- pub fn focused(&self)->Option<FocusTarget>{self.focused}
- pub fn captured(&self)->Option<FocusTarget>{self.capture}
+ pub fn focused(&self)->Option<FocusTarget>{self.focused.map(|b|FocusTarget{owner:b.owner,window:b.window})}
+ pub fn captured(&self)->Option<FocusTarget>{self.capture.map(|b|FocusTarget{owner:b.owner,window:b.window})}
  pub fn focus<const W:usize,const Q:usize>(&mut self,broker:&mut Broker<W,Q>,
   window:u32)->Result<FocusTarget,Error>{
   let owner=broker.owner(window).ok_or(Error::Unauthorized)?;
   // Notify before changing state: a full input queue must not steal focus.
   broker.post_focus(owner,window)?;
-  let target=FocusTarget{owner,window};self.focused=Some(target);
+  let target=FocusTarget{owner,window};self.focused=broker.binding(owner,window);
   self.capture=None;Ok(target)
  }
  /// Capture starts only from the focused, authenticated owner.
  pub fn capture_pointer<const W:usize,const Q:usize>(&mut self,
   broker:&Broker<W,Q>,owner:u32,window:u32)->Result<(),Error>{
-  let target=FocusTarget{owner,window};
-  if self.focused!=Some(target)||!broker.owns(owner,window){
+  let target=broker.binding(owner,window).ok_or(Error::Unauthorized)?;
+  if self.focused!=Some(target){
    return Err(Error::Unauthorized);
   }
   self.capture=Some(target);Ok(())
@@ -591,7 +598,7 @@ impl DesktopInput{
  pub fn keyboard<const W:usize,const Q:usize>(&mut self,
   broker:&mut Broker<W,Q>,code:u16,pressed:bool)->Result<Event,Error>{
   let target=self.focused.ok_or(Error::Empty)?;
-  if !broker.owns(target.owner,target.window){
+  if broker.binding(target.owner,target.window)!=Some(target){
    self.focused=None;self.capture=None;return Err(Error::Unauthorized);
   }
   broker.post_keyboard(target.owner,target.window,code,pressed)
@@ -599,7 +606,7 @@ impl DesktopInput{
  pub fn click<const W:usize,const Q:usize>(&mut self,
   broker:&mut Broker<W,Q>,button:u8)->Result<Event,Error>{
   let target=self.capture.or(self.focused).ok_or(Error::Empty)?;
-  if !broker.owns(target.owner,target.window){
+  if broker.binding(target.owner,target.window)!=Some(target){
    self.capture=None;self.focused=None;return Err(Error::Unauthorized);
   }
   broker.post_pointer_click(target.owner,target.window,button)
@@ -1106,5 +1113,56 @@ impl<const W:usize,const Q:usize> Broker<W,Q>{
   let mut out=[Event{owner:9,window:9,kind:9,sequence:9};1];
   assert_eq!(b.preview_workstation_input(1,&mut out),Err(Error::Full));
   assert_eq!(out[0].owner,9);assert_eq!(b.pending_input_for(1),Ok(2));
+ }
+}
+
+#[cfg(test)]
+mod m1_input_grant_lifecycle_tests {
+ use super::*;
+ #[test]
+ fn withdrawn_grant_cannot_resurrect_focus_or_capture() {
+  for reassign in [false,true] {
+   for pointer in [false,true] {
+    let mut b=Broker::<2,8>::new();b.grant(1,10).unwrap();b.grant(2,20).unwrap();
+    let mut input=DesktopInput::new();input.focus(&mut b,10).unwrap();
+    input.capture_pointer(&b,1,10).unwrap();
+    let peer=b.post_focus(2,20).unwrap();
+    if reassign {b.reassign_window(1,3,10).unwrap();b.reassign_window(3,1,10).unwrap();}
+    else {b.revoke_window(1,10).unwrap();b.grant(1,10).unwrap();}
+    assert_eq!(input.capture_pointer(&b,2,20),Err(Error::Unauthorized));
+    assert_eq!(input.capture_pointer(&b,1,10),Err(Error::Unauthorized));
+    let result=if pointer {input.click(&mut b,1)} else {input.keyboard(&mut b,30,true)};
+    assert_eq!(result,Err(Error::Unauthorized));
+    assert_eq!(input.focused(),None);assert_eq!(input.captured(),None);
+    assert_eq!(b.peek(1),Err(Error::Empty));assert_eq!(b.peek(2),Ok(peer));
+    input.focus(&mut b,10).unwrap();input.capture_pointer(&b,1,10).unwrap();
+    assert_eq!(input.keyboard(&mut b,30,true).unwrap().window,10);
+    assert_eq!(input.click(&mut b,1).unwrap().owner,1);
+    assert_eq!(b.peek(2),Ok(peer));
+   }
+  }
+ }
+ #[test]
+ fn full_queue_preserves_focus_and_capture() {
+  let mut b=Broker::<2,1>::new();b.grant(1,10).unwrap();b.grant(2,20).unwrap();
+  let mut input=DesktopInput::new();let target=input.focus(&mut b,10).unwrap();
+  input.capture_pointer(&b,1,10).unwrap();
+  assert_eq!(input.focus(&mut b,20),Err(Error::Full));
+  assert_eq!(input.focused(),Some(target));assert_eq!(input.captured(),Some(target));
+  let event=b.peek(1).unwrap();b.ack(1,event.sequence).unwrap();
+  assert_eq!(input.click(&mut b,1).unwrap().owner,1);
+ }
+ #[test]
+ fn grant_exhaustion_is_atomic_and_batches_track_epochs() {
+  let mut b=Broker::<4,4>::new();b.grant(1,10).unwrap();
+  let event=b.post_focus(1,10).unwrap();
+  b.grant_epoch=u64::MAX-1;
+  assert_eq!(b.grant_batch(&[(2,20),(3,30)]),Err(Error::Exhausted));
+  assert_eq!(b.grant_epoch,u64::MAX-1);assert!(!b.owns(2,20));
+  assert_eq!(b.grant_batch(&[(2,20)]),Ok(1));assert_eq!(b.grant_epoch,u64::MAX);
+  assert_eq!(b.grant(3,30),Err(Error::Exhausted));
+  assert_eq!(b.reassign_window(1,3,10),Err(Error::Exhausted));
+  assert!(b.owns(1,10));assert_eq!(b.peek(1),Ok(event));
+  b.revoke_window(1,10).unwrap();assert_eq!(b.grant(1,10),Err(Error::Exhausted));
  }
 }

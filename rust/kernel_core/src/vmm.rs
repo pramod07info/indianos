@@ -128,8 +128,10 @@ pub unsafe extern "C" fn vmm_create(space: *mut Space, backend: *const Backend) 
 unsafe fn undo(s: &Space, slots: &[*mut u64; 3],
                frames: &[u64; 3], count: usize) {
     for i in (0..count).rev() {
+        // A refused release retains ownership. Keep this empty table and
+        // its ancestors reachable for a later map or destroy operation.
+        if !unsafe { release(s, frames[i]) } { break; }
         unsafe { ptr::write_volatile(slots[i], 0); }
-        let _ = unsafe { release(s, frames[i]) };
     }
 }
 
@@ -245,6 +247,8 @@ pub unsafe extern "C" fn vmm_query_page(
 /// # Safety
 /// \`space\` is exclusively writable kernel metadata. The caller still owns
 /// the unmapped leaf data frame; only empty page-table frames are released.
+/// Once the leaf is removed this returns true, even if optional table
+/// pruning is refused. Retained empty tables remain owned by the space.
 #[no_mangle]
 pub unsafe extern "C" fn vmm_unmap_page(space: *mut Space, va: u64) -> bool {
     let Some(s) = (unsafe { space.as_mut() }) else { return false; };
@@ -268,8 +272,10 @@ pub unsafe extern "C" fn vmm_unmap_page(space: *mut Space, va: u64) -> bool {
     unsafe { set_entry(tables[3], indices[3], 0); }
     for level in (1..4).rev() {
         if !unsafe { empty_table(tables[level]) } { break; }
+        // The leaf is already unmapped. Pruning is optional: a refused
+        // release must keep the empty table linked and owned for retry.
+        if !unsafe { release(s, frames[level]) } { break; }
         unsafe { set_entry(tables[level - 1], indices[level - 1], 0); }
-        if !unsafe { release(s, frames[level]) } { return false; }
     }
     true
 }
@@ -280,11 +286,45 @@ pub unsafe extern "C" fn vmm_unmap_page(space: *mut Space, va: u64) -> bool {
 pub unsafe extern "C" fn vmm_destroy_empty(space: *mut Space) -> bool {
     let Some(s) = (unsafe { space.as_mut() }) else { return false; };
     if !ready(s) { return false; }
-    let root = unsafe { at(s, s.root_physical) };
-    if !unsafe { empty_table(root) } ||
+    if !unsafe { has_no_mappings(s, s.root_physical, 0) } ||
+       !unsafe { reclaim_empty_children(s, s.root_physical, 0) } ||
        !unsafe { release(s, s.root_physical) } { return false; }
     s.root_physical = 0;
     s.initialized = false;
+    true
+}
+
+// Check every branch before destroying anything: a refused cleanup may
+// leave linked empty tables alongside still-live mappings in other branches.
+unsafe fn has_no_mappings(s: &Space, physical: u64, level: usize) -> bool {
+    let table = unsafe { at(s, physical) };
+    if table.is_null() { return false; }
+    for i in 0..ENTRIES {
+        let value = unsafe { entry(table, i) };
+        if value == 0 { continue; }
+        if level == 3 || value & PRESENT == 0 || value & HUGE != 0 ||
+            !physical_page(value & ADDRESS) ||
+            !unsafe { has_no_mappings(s, value & ADDRESS, level + 1) } {
+            return false;
+        }
+    }
+    true
+}
+
+// Successful partial reclamation is safe: accepted releases are unlinked,
+// while refused releases remain linked and may be retried by the caller.
+unsafe fn reclaim_empty_children(s: &Space, physical: u64, level: usize) -> bool {
+    let table = unsafe { at(s, physical) };
+    if table.is_null() { return false; }
+    if level == 3 { return unsafe { empty_table(table) }; }
+    for i in 0..ENTRIES {
+        let value = unsafe { entry(table, i) };
+        if value == 0 { continue; }
+        let child = value & ADDRESS;
+        if !unsafe { reclaim_empty_children(s, child, level + 1) } ||
+            !unsafe { release(s, child) } { return false; }
+        unsafe { set_entry(table, i, 0); }
+    }
     true
 }
 
@@ -292,6 +332,105 @@ pub unsafe extern "C" fn vmm_destroy_empty(space: *mut Space) -> bool {
 mod tests {
     use super::*;
     use core::mem::{size_of, align_of, offset_of};
+    struct Pool {
+        pages: [[u64;512];16], busy:[bool;16],
+        allocation_budget:Option<usize>, refuse_release:u64,
+        released:Vec<u64>,
+    }
+    impl Pool {
+        fn new()->Self{Self{pages:[[0;512];16],busy:[false;16],
+            allocation_budget:None,refuse_release:0,released:Vec::new()}}
+        fn backend(&mut self)->Backend{Backend{allocate:Some(pool_allocate),
+            release:Some(pool_release),access:Some(pool_access),
+            context:(self as *mut Self).cast()}}
+        fn live(&self)->usize{self.busy.iter().filter(|&&b|b).count()}
+    }
+    unsafe extern "C" fn pool_allocate(out:*mut u64,ctx:*mut c_void)->bool{
+        let pool=unsafe{&mut *ctx.cast::<Pool>()};
+        if pool.allocation_budget==Some(0){return false;}
+        let Some(slot)=pool.busy.iter().position(|&b|!b)else{return false;};
+        if let Some(budget)=pool.allocation_budget.as_mut(){*budget-=1;}
+        pool.busy[slot]=true;pool.pages[slot].fill(0xaaaa_aaaa_aaaa_aaaa);
+        unsafe{out.write((slot as u64+1)*PAGE);}
+        true
+    }
+    unsafe extern "C" fn pool_release(pa:u64,ctx:*mut c_void)->bool{
+        let pool=unsafe{&mut *ctx.cast::<Pool>()};
+        if pa==pool.refuse_release||pa<PAGE||pa>16*PAGE||pa%PAGE!=0{return false;}
+        let slot=pa as usize/PAGE as usize-1;
+        if !pool.busy[slot]{panic!("duplicate or unowned release {pa:#x}");}
+        pool.busy[slot]=false;pool.released.push(pa);true
+    }
+    unsafe extern "C" fn pool_access(pa:u64,ctx:*mut c_void)->*mut c_void{
+        let pool=unsafe{&mut *ctx.cast::<Pool>()};
+        if pa<PAGE||pa>16*PAGE||pa%PAGE!=0{return ptr::null_mut();}
+        let slot=pa as usize/PAGE as usize-1;
+        if !pool.busy[slot]{return ptr::null_mut();}
+        pool.pages[slot].as_mut_ptr().cast()
+    }
+    fn create(pool:&mut Pool)->Space{
+        let mut s=Space{root_physical:0,backend:pool.backend(),initialized:false};
+        assert!(unsafe{vmm_create(&mut s,&pool.backend())});s
+    }
+    fn table_frames(pool:&Pool,pa:u64,level:usize)->usize{
+        let mut count=1;
+        assert!(pool.busy[(pa/PAGE-1) as usize]);
+        if level<3{for &e in &pool.pages[(pa/PAGE-1) as usize]{
+            if e&PRESENT!=0{count+=table_frames(pool,e&ADDRESS,level+1);}
+        }}
+        count
+    }
+    const DATA:Permissions=Permissions{writable:true,executable:false,user:true};
+    #[test]fn unmap_refused_table_release_retains_reachable_ownership(){
+        for frame in [0x4000,0x3000,0x2000]{
+            let mut pool=Pool::new();let mut s=create(&mut pool);
+            assert!(unsafe{vmm_map_page(&mut s,0x400000,0x1000000,DATA)});
+            pool.refuse_release=frame;
+            assert!(unsafe{vmm_unmap_page(&mut s,0x400000)});
+            let mut out=Mapping{physical:123,permissions:DATA};
+            assert!(!unsafe{vmm_query_page(&s,0x400000,&mut out)});
+            assert_eq!(out.physical,123);
+            assert_eq!(table_frames(&pool,s.root_physical,0),pool.live());
+            assert_eq!(pool.live(),frame as usize/PAGE as usize);
+            pool.refuse_release=0;
+            assert!(unsafe{vmm_destroy_empty(&mut s)});
+            assert_eq!(pool.live(),0);assert!(!s.initialized);
+            assert!(!pool.released.contains(&0x1000000));
+        }
+    }
+    #[test]fn failed_mapping_rollback_keeps_refused_tables_available_for_destroy(){
+        for budget in [1usize,2]{
+            let mut pool=Pool::new();let mut s=create(&mut pool);
+            pool.allocation_budget=Some(budget);
+            pool.refuse_release=(budget as u64+1)*PAGE;
+            assert!(!unsafe{vmm_map_page(&mut s,0x400000,0x1000000,DATA)});
+            assert_eq!(pool.live(),budget+1);
+            assert_eq!(table_frames(&pool,s.root_physical,0),pool.live());
+            pool.refuse_release=0;
+            assert!(unsafe{vmm_destroy_empty(&mut s)});assert_eq!(pool.live(),0);
+        }
+    }
+    #[test]fn destroy_preflight_preserves_live_sibling_and_retries_partial_cleanup(){
+        let mut pool=Pool::new();let mut s=create(&mut pool);
+        assert!(unsafe{vmm_map_page(&mut s,0x400000,0x1000000,DATA)});
+        assert!(unsafe{vmm_map_page(&mut s,1u64<<39,0x1001000,DATA)});
+        pool.refuse_release=0x4000;
+        assert!(unsafe{vmm_unmap_page(&mut s,0x400000)});
+        let before=pool.live();let released=pool.released.len();
+        assert!(!unsafe{vmm_destroy_empty(&mut s)});
+        assert_eq!(pool.live(),before);assert_eq!(pool.released.len(),released);
+        pool.refuse_release=0x7000;
+        assert!(unsafe{vmm_unmap_page(&mut s,1u64<<39)});
+        // First branch can be reclaimed, second remains owned on failure.
+        assert!(!unsafe{vmm_destroy_empty(&mut s)});
+        assert_eq!(table_frames(&pool,s.root_physical,0),pool.live());
+        assert_eq!(pool.live(),4);
+        pool.refuse_release=0x1000; // root refusal is also retryable
+        assert!(!unsafe{vmm_destroy_empty(&mut s)});
+        assert_eq!(pool.live(),1);assert!(s.initialized);
+        pool.refuse_release=0;
+        assert!(unsafe{vmm_destroy_empty(&mut s)});assert_eq!(pool.live(),0);
+    }
     #[test]
     fn c_abi_layout() {
         assert_eq!(size_of::<Backend>(), 32);
