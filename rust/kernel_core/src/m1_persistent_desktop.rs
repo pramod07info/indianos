@@ -211,8 +211,9 @@ impl<D:BlockDevice,const P:usize,const E:usize,const W:usize,
   // Focus-bound Control+U clears a draft and Control+W deletes a word.
   // Set-1 control scancode edges are tracked separately from Shift.
   if event.scan_code==0x1d {self.control_down=true;return Ok(None);}
-  if self.control_down && (event.scan_code==0x16 || event.scan_code==0x11){
+  if self.control_down && (event.scan_code==0x16 || event.scan_code==0x11 || event.scan_code==0x25){
    if event.scan_code==0x16 {self.input.clear_line();}
+   else if event.scan_code==0x25 {self.input.kill_line();}
    else {self.input.erase_word();}
    self.history_active=false;self.request_redraw(owner)?;
    return Ok(None);
@@ -400,6 +401,18 @@ mod tests{
   let mut out=[0u8;256];
   assert_eq!(gui.key(user(2),1,b'\n',&mut out),Ok(Some(7)));
   assert_eq!(gui.input.length(),0);
+ }
+ #[test]fn r042_ctrl_k_clears_draft_without_submitting_disk_command(){
+  let disk=Disk{data:[[0u8;SECTOR_BYTES];SECTORS]};
+  let mut gui=TestDesk::from_mounted(HierVfs::format_blank(disk).unwrap());
+  gui.start(user(1),load(1),user(2),load(2),settings(),8,99).unwrap();
+  let mut out=[0u8;256];
+  for &ch in b"mkdir /unsafe"{gui.key(user(2),1,ch,&mut out).unwrap();}
+  gui.physical_key(1,0x1d,true,&mut out).unwrap();
+  gui.physical_key(1,0x25,true,&mut out).unwrap();
+  assert!(gui.input.bytes().is_empty());
+  gui.physical_key(1,0x1d,false,&mut out).unwrap();
+  assert_eq!(gui.key(user(2),1,b'\n',&mut out),Ok(None));
  }
  #[test]fn r041_ctrl_word_delete_and_clear_are_focus_bound(){
   let disk=Disk{data:[[0u8;SECTOR_BYTES];SECTORS]};
