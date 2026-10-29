@@ -296,6 +296,49 @@ pub fn parse_ipv4_syn_ack(
  let ack=u32::from_be_bytes(tcp[8..12].try_into().map_err(|_|Error::Malformed)?);
  Ok((seq,ack))
 }
+
+/// Parse a complete IPv4/UDP DNS A response from actual received packet bytes.
+/// This validates packet structure, exact endpoints, IP and UDP checksums,
+/// DNS transaction/question and bounded answer. A UDP checksum is not
+/// cryptographic source authentication: the NIC/route ownership and the
+/// legitimacy of the configured DNS server remain transport responsibilities.
+pub fn parse_ipv4_udp_dns_a(
+ wire:&[u8],server_ip:[u8;4],client_ip:[u8;4],client_port:u16,
+ transaction_id:u16,domain:&[u8],
+)->Result<[u8;4],Error>{
+ if wire.len()<40||wire.len()>540||server_ip==[0;4]||
+    client_ip==[0;4]||client_port==0||wire[0]!=0x45||
+    wire[8]==0||wire[9]!=17||
+    u16::from_be_bytes([wire[2],wire[3]]) as usize!=wire.len()||
+    u16::from_be_bytes([wire[6],wire[7]])&0x3fff!=0||
+    wire[12..16]!=server_ip||wire[16..20]!=client_ip||
+    checked_checksum(internet_sum(&wire[..20]))!=0{
+  return Err(Error::Malformed);
+ }
+ let udp=&wire[20..];
+ if u16::from_be_bytes([udp[0],udp[1]])!=53||
+    u16::from_be_bytes([udp[2],udp[3]])!=client_port||
+    u16::from_be_bytes([udp[4],udp[5]]) as usize!=udp.len()||
+    (udp[6]==0&&udp[7]==0){
+  return Err(Error::Malformed);
+ }
+ // IPv4 UDP pseudoheader = source + destination + zero/protocol + length.
+ let sum=internet_sum(&wire[12..20])+17+udp.len() as u32+
+   internet_sum(udp);
+ if checked_checksum(sum)!=0{return Err(Error::Malformed);}
+ parse_dns_a(transaction_id,domain,&udp[8..])
+}
+impl<const P:usize> Endpoint<P>{
+ /// The caller supplies a NIC-received datagram, not a caller-fabricated DNS
+ /// payload. Process/port lease must still be valid at the receipt time.
+ pub fn accept_verified_dns_ipv4(&self,owner:Identity,local_port:u16,
+   now:u64,server_ip:[u8;4],client_ip:[u8;4],
+   transaction_id:u16,name:&[u8],wire:&[u8])->Result<[u8;4],Error>{
+  self.allow_query(owner,local_port,now,name)?;
+  parse_ipv4_udp_dns_a(wire,server_ip,client_ip,local_port,transaction_id,name)
+ }
+}
+
 #[cfg(test)]
 mod m2_tests{
  use super::*;
@@ -1089,5 +1132,83 @@ impl<const N:usize> ConnectionTable<N>{
   let mut dates=[77u64;1];
   assert_eq!(c.session_deadlines(id(2),&mut dates),Ok(0));
   assert_eq!(dates,[77]);
+ }
+}
+
+
+#[cfg(test)]
+mod m2_dns_ipv4_wire_tests {
+ use super::*;
+ const DNS_SERVER:[u8;4]=[192,0,2,53];
+ const CLIENT:[u8;4]=[192,0,2,10];
+ fn datagram()->[u8;73]{
+  let mut b=[0u8;73];
+  b[0]=0x45; b[2..4].copy_from_slice(&73u16.to_be_bytes());
+  b[8]=64; b[9]=17;
+  b[12..16].copy_from_slice(&DNS_SERVER);
+  b[16..20].copy_from_slice(&CLIENT);
+  b[20..22].copy_from_slice(&53u16.to_be_bytes());
+  b[22..24].copy_from_slice(&6040u16.to_be_bytes());
+  b[24..26].copy_from_slice(&53u16.to_be_bytes());
+  b[28..40].copy_from_slice(b"\x12\x34\x81\x80\x00\x01\x00\x01\x00\x00\x00\x00");
+  b[40..53].copy_from_slice(b"\x07example\x03com\x00");
+  b[53..57].copy_from_slice(&[0,1,0,1]);
+  b[57..73].copy_from_slice(&[0xc0,0x0c,0,1,0,1,0,0,0,60,0,4,203,0,113,7]);
+  let udp_sum=internet_sum(&b[12..20])+17+53+
+    internet_sum(&b[20..]);
+  b[26..28].copy_from_slice(&checked_checksum(udp_sum).to_be_bytes());
+  let ip_sum=checked_checksum(internet_sum(&b[..20]));
+  b[10..12].copy_from_slice(&ip_sum.to_be_bytes());
+  b
+ }
+ fn decode(b:&[u8])->Result<[u8;4],Error>{
+  parse_ipv4_udp_dns_a(b,DNS_SERVER,CLIENT,6040,0x1234,b"example.com")
+ }
+ #[test]
+ fn m2_dns_ipv4_full_wire_validates_checksum_and_dns_answer(){
+  assert_eq!(decode(&datagram()),Ok([203,0,113,7]));
+ }
+ #[test]
+ fn m2_dns_ipv4_rejects_source_destination_port_and_txid_substitution(){
+  let b=datagram();
+  assert_eq!(parse_ipv4_udp_dns_a(&b,[192,0,2,54],CLIENT,6040,0x1234,b"example.com"),Err(Error::Malformed));
+  assert_eq!(parse_ipv4_udp_dns_a(&b,DNS_SERVER,[192,0,2,11],6040,0x1234,b"example.com"),Err(Error::Malformed));
+  assert_eq!(parse_ipv4_udp_dns_a(&b,DNS_SERVER,CLIENT,6041,0x1234,b"example.com"),Err(Error::Malformed));
+  assert_eq!(parse_ipv4_udp_dns_a(&b,DNS_SERVER,CLIENT,6040,0x1235,b"example.com"),Err(Error::Malformed));
+  assert_eq!(parse_ipv4_udp_dns_a(&b,DNS_SERVER,CLIENT,6040,0x1234,b"wrong.com"),Err(Error::Malformed));
+ }
+ #[test]
+ fn m2_dns_ipv4_rejects_corruption_fragments_zero_checksums_and_truncation(){
+  let b=datagram();
+  let mut corrupt=b;corrupt[72]^=1;
+  assert_eq!(decode(&corrupt),Err(Error::Malformed));
+  let mut fragment=b;fragment[6]=0x20;
+  assert_eq!(decode(&fragment),Err(Error::Malformed));
+  let mut zero_udp=b;zero_udp[26]=0;zero_udp[27]=0;
+  assert_eq!(decode(&zero_udp),Err(Error::Malformed));
+  let mut bad_length=b;bad_length[25]=54;
+  assert_eq!(decode(&bad_length),Err(Error::Malformed));
+  let mut wrong_protocol=b;wrong_protocol[9]=6;
+  assert_eq!(decode(&wrong_protocol),Err(Error::Malformed));
+  assert_eq!(decode(&b[..72]),Err(Error::Malformed));
+  assert_eq!(decode(&b[..39]),Err(Error::Malformed));
+ }
+ #[test]
+ fn m2_dns_ipv4_owner_generation_and_port_expiry_are_enforced(){
+  let owner=Identity{pid:7,generation:2};
+  let stale=Identity{pid:7,generation:3};
+  let mut access=Access::<1>::new();
+  access.grant(owner,SOCKET,100).unwrap();
+  let mut endpoint=Endpoint::<1>::new();
+  endpoint.acquire(&access,owner,6040,1,50).unwrap();
+  let wire=datagram();
+  assert_eq!(endpoint.accept_verified_dns_ipv4(owner,6040,2,DNS_SERVER,CLIENT,
+    0x1234,b"example.com",&wire),Ok([203,0,113,7]));
+  assert_eq!(endpoint.accept_verified_dns_ipv4(stale,6040,2,DNS_SERVER,CLIENT,
+    0x1234,b"example.com",&wire),Err(Error::Denied));
+  assert_eq!(endpoint.accept_verified_dns_ipv4(owner,6041,2,DNS_SERVER,CLIENT,
+    0x1234,b"example.com",&wire),Err(Error::Denied));
+  assert_eq!(endpoint.accept_verified_dns_ipv4(owner,6040,51,DNS_SERVER,CLIENT,
+    0x1234,b"example.com",&wire),Err(Error::Denied));
  }
 }

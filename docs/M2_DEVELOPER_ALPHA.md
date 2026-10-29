@@ -634,3 +634,21 @@ user consent GUI and actual hardware TPM/UEFI trust roots. A 64KiB QEMU
 test proves the native loading path under emulation, NOT that arbitrary
 third-party applications or real GPUs/QPUs can execute. The CPU-only
 fallback must remain functional for future accelerators.
+
+## Checked IPv4/UDP DNS ingress development slice (2026-10-29)
+
+The Rust `m2_network` service now includes a bounded parser that consumes a complete
+received IPv4/UDP datagram rather than trusting a pre-stripped DNS payload.
+It checks IPv4 header length, transport protocol, fragmentation, packet length,
+source and destination addresses, IPv4 checksum, DNS-server UDP source port,
+leased destination port, UDP length, mandatory nonzero UDP checksum and the
+existing strict DNS transaction/question/A answer. The process-generation and
+lease-expiration guard is enforced before accepting an answer. Host regressions
+use valid checksummed packets and modify the wire bytes to demonstrate rejection
+of tampering, wrong peer, fragments, stale owners and truncated responses.
+
+**Limit:** This is an actual parser and integrity gate, not DHCP, a live NIC
+receiver, cryptographic DNS authentication, DNSSEC, TLS, or a general socket API.
+The NIC/route trust boundary must still supply genuine receive buffers and
+validate the configured DNS server. The existing R028 QEMU network demo is
+separate and must not be claimed to exercise this new path without wiring it.
