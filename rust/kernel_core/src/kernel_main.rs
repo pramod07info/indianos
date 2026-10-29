@@ -150,6 +150,9 @@ pub extern "C" fn kmain()->!{
         need(crate::workstation_r031::agent_20::smoke().is_ok(),
              b"IndianOS: FATAL R031 workstation integrated guest acceptance\n\0");
         log(b"IndianOS: R031 workstation real source editor terminal release debug PASSED\n\0");
+        need(crate::workstation_r032::agent_20::smoke().is_ok(),
+             b"IndianOS: FATAL R032 workstation full integration guest smoke\n\0");
+        log(b"IndianOS: R032 workstation projects editor terminal build debug PASSED\n\0");
     }
     unsafe{boot_draw_status();}
     #[cfg(feature="test-r029-userspace")]
