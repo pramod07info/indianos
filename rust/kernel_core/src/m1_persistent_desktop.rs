@@ -532,6 +532,20 @@ impl<'a,D:BlockDevice,const P:usize,const E:usize,const W:usize,
   selected:m1_partition::Partition)->Result<Self,MountError>{
   m1_partition::mount_checked_healthy(disk,selected).map(Self::from_mounted)
  }
+ /// Read-only GPT identity and redundancy preflight for an explicitly
+ /// chosen volume. This does not mount, repair or format the device. Callers
+ /// retain this token and pass it to mount_gpt_identity_selected(), which
+ /// revalidates both GUIDs and refuses a degraded volume.
+ pub fn preflight_gpt_identity(disk:&mut D,index:u32)
+  ->Result<(m1_partition::GptSelection,crate::durablefs::VolumeHealth),MountError>{
+  let token=m1_partition::inspect_gpt_selection(disk,index)
+   .map_err(MountError::Partition)?;
+  let health=m1_partition::probe_volume(disk,index)?;
+  if health.partition!=token.partition{
+   return Err(MountError::Partition(m1_partition::Error::Invalid));
+  }
+  Ok((token,health.volume))
+ }
  /// Strict identity-pinned GPT mount for the durable Developer Desktop.
  pub fn mount_gpt_identity_selected(disk:&'a mut D,
   selected:m1_partition::GptSelection)->Result<Self,MountError>{
