@@ -47,7 +47,7 @@ pub fn grep<const F:usize,const N:usize>(fs:&RamFs<F>,who:Identity,ticket:Ticket
   let mut out=[EMPTY;3];assert_eq!(grep(&fs,who,t,1,b"/p",b"error",&mut out),Ok(2));
   assert_eq!(out[0].line,2);
  }
- #[test]fn invalid_pattern_and expired_grant_are_denied(){
+ #[test]fn invalid_pattern_and_expired_grant_are_denied(){
   let mut fs=RamFs::<1>::new();fs.replace(b"/p/a",b"secret").unwrap();
   let who=Identity{pid:3,generation:1};let t=rights::grant(true,who,&fs,b"/p",READ,10).unwrap();
   assert_eq!(grep(&fs,who,t,10,b"/p",b"secret",&mut[EMPTY;1]),Err(Error::Denied));

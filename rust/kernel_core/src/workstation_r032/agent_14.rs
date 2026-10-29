@@ -65,7 +65,7 @@ impl<const N:usize> Plan<N>{
   for id in 0..3{assert_eq!(plan.next(7),Ok(Some(id)));plan.finish(7,true,id,true).unwrap();}
   assert!(plan.green());
  }
- #[test]fn failed_build_blocks_dependent_packaging_and foreign_completion(){
+ #[test]fn failed_build_blocks_dependent_packaging_and_foreign_completion(){
   let mut plan=Plan::<2>::new(7);plan.add(7,0,0).unwrap();plan.add(7,1,1).unwrap();
   assert_eq!(plan.next(7),Ok(Some(0)));
   assert_eq!(plan.finish(8,true,0,true),Err(Error::Denied));
