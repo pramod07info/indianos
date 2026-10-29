@@ -72,7 +72,7 @@ fn validate_ipv4<'a>(frame:&'a [u8],local_mac:[u8;6])->Result<Ipv4<'a>,Error>{
         return Err(Error::Invalid);
     }
     let ip=&frame[14..];
-    if ip[0]!=0x45 || ip[8]==0 || (be16(&ip[6..8])&0x3fff)!=0 ||
+    if ip[0]!=0x45 || ip[8]==0 || (be16(&ip[6..8])&0xbfff)!=0 ||
        ip[12..16]!=PEER_IP || ip[16..20]!=LOCAL_IP{return Err(Error::Invalid);}
     let len=be16(&ip[2..4]) as usize;
     if len<20 || len>ip.len(){return Err(Error::Invalid);}
@@ -109,7 +109,7 @@ fn icmp_request(out:&mut [u8],mac:[u8;6])->usize{
 }
 fn valid_icmp(frame:&[u8],mac:[u8;6])->bool{
     let Ok(p)=validate_ipv4(frame,mac)else{return false;};
-    p.proto==1 && p.body.len()==12 && p.body[0]==0 &&
+    p.proto==1 && p.body.len()==12 && p.body[0]==0 && p.body[1]==0 &&
     checksum(p.body)==0 && be16(&p.body[4..6])==0x2828 &&
     be16(&p.body[6..8])==1 && &p.body[8..12]==b"PING"
 }
@@ -186,12 +186,41 @@ fn parse_tcp<'a>(frame:&'a [u8],mac:[u8;6])->Result<TcpSegment<'a>,Error>{
     if ip.proto!=6 || ip.body.len()<20{return Err(Error::Invalid);}
     let tcp=ip.body;
     let hlen=(tcp[12]>>4) as usize*4;
-    if hlen<20 || hlen>tcp.len() ||
+    if hlen<20 || hlen>tcp.len() || tcp[12]&0x0f!=0 ||
        be16(&tcp[..2])!=PEER_TCP_PORT ||
        be16(&tcp[2..4])!=CLIENT_PORT{return Err(Error::Invalid);}
     if transport_sum(&PEER_IP,&LOCAL_IP,6,tcp)!=0{return Err(Error::Checksum);}
+    let flags=tcp[13];
+    // This non-ECN demo cannot accept contradictory connection control or
+    // malformed options simply because their transport checksum is valid.
+    if flags&0x03==0x03 || flags&0x06==0x06 || flags&0x05==0x05 ||
+       !valid_tcp_options(&tcp[20..hlen],flags&0x02!=0){
+        return Err(Error::Invalid);
+    }
     Ok(TcpSegment{seq:be32(&tcp[4..8]),ack:be32(&tcp[8..12]),
         flags:tcp[13],data:&tcp[hlen..]})
+}
+fn valid_tcp_options(mut options:&[u8],syn:bool)->bool{
+    while let Some(&kind)=options.first(){
+        match kind{
+            0=>return options[1..].iter().all(|&b|b==0), // EOL padding
+            1=>{options=&options[1..];continue;}, // NOP
+            _=>{},
+        }
+        let Some(&size)=options.get(1)else{return false;};
+        let size=size as usize;
+        if size<2||size>options.len(){return false;}
+        match kind{
+            2 if !syn||size!=4=>return false, // MSS
+            3 if !syn||size!=3||options[2]>14=>return false, // window scale
+            4 if !syn||size!=2=>return false, // SACK permitted
+            5 if syn||size<10||(size-2)%8!=0=>return false, // SACK blocks
+            8 if size!=10=>return false, // timestamps
+            _=>{}, // Unknown well-framed options are ignored per TCP.
+        }
+        options=&options[size..];
+    }
+    true
 }
 fn wait_for<D:EthernetDevice>(dev:&mut D,
     mut matcher:impl FnMut(&[u8],[u8;6])->bool)->Result<(),Error>
@@ -250,7 +279,7 @@ pub fn run_demo<D:EthernetDevice>(
     transmit(dev,|b,m|tcp_frame(b,m,TCP_SEQ,0,0x02,&[],0x2804))?;
     wait_for(dev,|frame,mac|{
         parse_tcp(frame,mac).is_ok_and(|seg|
-            seg.flags&0x12==0x12 && seg.flags&0x04==0 &&
+            seg.flags==0x12 &&
             seg.seq==TCP_PEER_SEQ && seg.ack==TCP_SEQ+1 &&
             seg.data.is_empty())
     })?;
@@ -259,7 +288,7 @@ pub fn run_demo<D:EthernetDevice>(
     transmit(dev,|b,m|tcp_frame(b,m,TCP_SEQ+1,TCP_PEER_SEQ+1,0x18,TCP_REQ,0x2806))?;
     wait_for(dev,|frame,mac|{
         parse_tcp(frame,mac).is_ok_and(|seg|
-            seg.flags&0x18==0x18 && seg.flags&0x04==0 &&
+            seg.flags==0x18 &&
             seg.seq==TCP_PEER_SEQ+1 &&
             seg.ack==TCP_SEQ+1+TCP_REQ.len() as u32 &&
             seg.data==TCP_RESP)
@@ -273,6 +302,54 @@ pub fn run_demo<D:EthernetDevice>(
 #[cfg(test)]
 mod tests{
     use super::*;
+    const TEST_MAC:[u8;6]=[2,0,0,0,0,1];
+    fn incoming_tcp(options:&[u8],flags:u8)->([u8;FRAME_CAP],usize){
+        assert_eq!(options.len()%4,0);
+        let mut frame=[0u8;FRAME_CAP];
+        let n=tcp_frame(&mut frame,TEST_MAC,TCP_PEER_SEQ,TCP_SEQ+1,flags,&[],1)
+            +options.len();
+        frame[..6].copy_from_slice(&TEST_MAC);frame[6..12].copy_from_slice(&PEER_MAC);
+        frame[26..30].copy_from_slice(&PEER_IP);frame[30..34].copy_from_slice(&LOCAL_IP);
+        put16(&mut frame,16,(n-14) as u16);
+        put16(&mut frame,24,0);let sum=checksum(&frame[14..34]);put16(&mut frame,24,sum);
+        let tcp=&mut frame[34..n];
+        put16(tcp,0,PEER_TCP_PORT);put16(tcp,2,CLIENT_PORT);
+        tcp[12]=(((20+options.len())/4) as u8)<<4;
+        tcp[20..].copy_from_slice(options);
+        put16(tcp,16,0);let sum=transport_sum(&PEER_IP,&LOCAL_IP,6,tcp);put16(tcp,16,sum);
+        (frame,n)
+    }
+    #[test]fn checksummed_tcp_options_and_control_flags_are_validated(){
+        for options in [&[2,4,5,180][..],&[1,3,3,7][..],&[4,2,0,0][..],
+            &[30,4,1,2][..],&[][..]]{
+            let (f,n)=incoming_tcp(options,0x12);
+            assert!(parse_tcp(&f[..n],TEST_MAC).is_ok());
+        }
+        for options in [&[2,0,0,0][..],&[2,5,0,0][..],&[3,3,15,0][..],
+            &[4,3,0,0][..],&[8,4,0,0][..],&[0,1,0,0][..],&[1,1,1,2][..]]{
+            let (f,n)=incoming_tcp(options,0x12);
+            assert!(matches!(parse_tcp(&f[..n],TEST_MAC),Err(Error::Invalid)),"{options:?}");
+        }
+        for flags in [0x13,0x16,0x15]{
+            let (f,n)=incoming_tcp(&[],flags);
+            assert!(matches!(parse_tcp(&f[..n],TEST_MAC),Err(Error::Invalid)));
+        }
+        let (f,n)=incoming_tcp(&[2,4,5,180],0x10);
+        assert!(matches!(parse_tcp(&f[..n],TEST_MAC),Err(Error::Invalid)));
+    }
+    #[test]fn reserved_ipv4_and_tcp_bits_rejected_even_with_valid_checksums(){
+        let (mut f,n)=incoming_tcp(&[],0x12);
+        put16(&mut f,20,0x8000);put16(&mut f,24,0);
+        let sum=checksum(&f[14..34]);put16(&mut f,24,sum);
+        assert!(matches!(parse_tcp(&f[..n],TEST_MAC),Err(Error::Invalid)));
+        let (mut f,n)=incoming_tcp(&[],0x12);f[46]|=1;
+        put16(&mut f,50,0);let sum=transport_sum(&PEER_IP,&LOCAL_IP,6,&f[34..n]);
+        put16(&mut f,50,sum);
+        assert!(matches!(parse_tcp(&f[..n],TEST_MAC),Err(Error::Invalid)));
+        // Every truncation must return an error rather than index out of bounds.
+        let (f,n)=incoming_tcp(&[2,4,5,180],0x12);
+        for length in 0..n{assert!(parse_tcp(&f[..length],TEST_MAC).is_err());}
+    }
     #[test]
     fn rfc_checksums_and_packet_bounds(){
         assert_eq!(checksum(b"\x00\x01\xf2\x03\xf4"),0x19fa);
