@@ -25,7 +25,7 @@ pub fn list<const F:usize,const O:usize>(fs:&RamFs<F>,root:&[u8],
  *out=results;Ok(count)
 }
 pub fn total_bytes(items:&[Entry])->Result<usize,Error>{
- items.iter().try_fold(0,|acc,x|acc.checked_add(x.bytes).ok_or(Error::Overflow))
+ items.iter().try_fold(0usize,|acc,x|acc.checked_add(x.bytes).ok_or(Error::Overflow))
 }
 pub fn source_count(items:&[Entry])->usize{
  items.iter().filter(|x|x.path[..x.len].ends_with(b".rs")).count()
