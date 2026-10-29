@@ -21,6 +21,21 @@ impl InputLine{
  /// oversized history never wipe the current draft.
  /// Clear the current command without modifying completed history.
  pub fn clear_line(&mut self){self.reset();}
+ /// Ctrl+A: return the current command to the start of its input session.
+ /// The bounded InputLine is append-only; full cursor editing is provided
+ /// by LineEditor separately, so this method never silently moves a cursor.
+ pub fn is_empty(&self)->bool{self.length==0}
+ /// Ctrl+K: clear the unsubmitted line without executing it.
+ pub fn kill_line(&mut self)->Event{
+  if self.is_empty(){return Event::Empty;}
+  self.reset();Event::Erased
+ }
+ /// Reject a second untrusted command if the current draft is nonempty.
+ /// This keeps history replay explicit rather than concatenating commands.
+ pub fn restore_if_empty(&mut self,source:&[u8])->Result<(),Error>{
+  if !self.is_empty(){return Err(Error::Invalid);}
+  self.set_line(source)
+ }
  /// Erase the previous ASCII word, including separating spaces.
  /// No mutation occurs if the command is already empty.
  pub fn erase_word(&mut self)->Event{
@@ -290,6 +305,16 @@ impl LineEditor{
   assert_eq!(e.bytes().len(),MAX_LINE);
  }
 
+ #[test]fn r042_kill_and_safe_restore_preserve_draft_invariants(){
+  let mut line=InputLine::new();
+  line.set_line(b"echo existing").unwrap();
+  assert_eq!(line.restore_if_empty(b"other"),Err(Error::Invalid));
+  assert_eq!(line.bytes(),b"echo existing");
+  assert_eq!(line.kill_line(),Event::Erased);
+  assert_eq!(line.kill_line(),Event::Empty);
+  line.restore_if_empty(b"pwd").unwrap();
+  assert_eq!(line.bytes(),b"pwd");
+ }
  #[test]fn r041_terminal_ctrl_w_and_ctrl_u_are_bounded(){
   let mut line=InputLine::new();line.set_line(b"echo hello world").unwrap();
   assert_eq!(line.erase_word(),Event::Erased);
