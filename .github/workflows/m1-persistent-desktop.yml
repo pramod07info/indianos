@@ -32,6 +32,11 @@ jobs:
           # R043: run substantial Terminal, source editor and Desktop integration
           # regression cases rather than silently skipping them with m1_ only.
           cargo test --offline --manifest-path rust/kernel_core/Cargo.toml --features test-r031-vfs r043_
+          # Keep R041/R042 keyboard and R044 live-caret/clipboard/history
+          # regressions in the mandatory M1 gate. Do not hide failures.
+          cargo test --offline --manifest-path rust/kernel_core/Cargo.toml --features test-r031-vfs r041_
+          cargo test --offline --manifest-path rust/kernel_core/Cargo.toml --features test-r031-vfs r042_
+          cargo test --offline --manifest-path rust/kernel_core/Cargo.toml --features test-r031-vfs r044_
       - name: Build M1 durable VFS service interfaces in no_std mode
         run: |
           cargo check --offline --manifest-path rust/kernel_core/Cargo.toml --no-default-features --features test-r031-vfs

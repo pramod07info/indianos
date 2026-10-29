@@ -267,3 +267,53 @@ full kernel boot and actual graphical Files/disk persistence QEMU coverage.
 All test and QEMU results must be verified by exact-head GitHub Actions
 before any merge. Source test services do NOT alone close the eight outstanding
 M1 acceptance gates (real normal-boot ring-3 UI/IRQ/storage/recovery proof).
+
+
+### R044 M1: live Desktop Terminal cursor editor, protected history and safe input routing (2026-10-29)
+
+The previous InputLine was append-only even though LineEditor supported
+cursor operations in isolated tests. R044 wires the real bounded LineEditor
+into the active authenticated Desktop key and PS/2 event path.
+
+20 scoped, independently testable workstation capabilities (NOT 20
+independently running code-writing agents):
+
+1. Use the real cursor-aware LineEditor as the live InputLine backend.
+2. Insert ordinary printable bytes at the authenticated caret position.
+3. Backspace from the caret without corrupting the trailing text.
+4. Forward Delete at the caret.
+5. Navigate Left and Right through focused physical PS/2 events.
+6. Navigate Home and End through focused physical PS/2 events.
+7. Accept E0-prefixed extended navigation; reject arbitrary high bits.
+8. Implement protected Ctrl+A/E Home/End bindings.
+9. Implement protected Ctrl+B/F Left/Right bindings.
+10. Implement Ctrl+W/Backspace word erasure and Ctrl+D forward delete.
+11. Provide bounded full-range replacement and atomic multi-byte paste.
+12. Provide validated per-session clipboard copy, cut, and paste.
+13. Expose owner-checked, short-buffer-safe input/caret snapshots.
+14. Retain up to eight successful commands in a bounded overwrite ring.
+15. Deduplicate consecutive identical commands and exclude failed commands.
+16. Navigate history with Up/Down and Ctrl+P/N while restoring the draft.
+17. Scrub history and clipboard on exit, crash, restart and PID reuse.
+18. Support Escape cancellation without performing durable I/O.
+19. Complete unambiguous command prefixes using the real 30-verb registry.
+20. Complete printable US set-1 punctuation/Shift mapping and refuse
+    unknown Ctrl combinations rather than inserting unintended letters.
+
+The implementation is allocation-free, bounded by MAX_LINE, and requires
+an authenticated Desktop owner, PID-generation, current focused window
+and live capability before private command/clipboard operations.
+History recall and completion never execute a command without Enter.
+
+R044 regression tests cover invalid input, selection rollback, capacity,
+process isolation, capability expiry, real PS/2 scan mapping, caret and
+history state machine, lifecycle scrubbing and safe command completion.
+M1 CI explicitly invokes r041_, r042_ and r044_ test groups in addition
+to prior M1/R040/R043, no_std, actual QEMU graphical Files and persistent
+disk reboot. Security S0 and full native kernel boot remain mandatory.
+
+Remaining M1 gates in issue #616 are NOT closed by host-side service tests:
+real hardware IRQ-to-scheduler-to-ring3 input, independent ring3 compositor,
+recovery and full normal-boot Desktop evidence remain outstanding. The
+repository "Ten Modules One Build" workflow verifies code but does NOT
+launch 20 autonomous code-writing agents.
