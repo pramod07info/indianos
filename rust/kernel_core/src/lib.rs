@@ -33,6 +33,8 @@ pub mod workstation_r023;
 pub mod workstation_r024;
 /// R025: twenty kernel-backed developer-workstation source, editor, build and debug workstreams.
 pub mod workstation_r025;
+/// R026 real file/editor/terminal/build/debug implementation.
+pub mod workstation_r026;
 mod syscall;
 mod program;
 mod initramfs;
