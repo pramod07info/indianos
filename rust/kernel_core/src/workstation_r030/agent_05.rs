@@ -8,7 +8,7 @@ pub fn replace_all<const F:usize>(fs:&mut RamFs<F>,path:&[u8],
  if rev!=revision{return Err(Error::Stale);}
  let mut src=[0u8;CONTENT_MAX];fs.read(path,0,&mut src[..n])
   .map_err(|_|Error::Missing)?;
- let mut staged=[0u8;CONTENT_MAX];let (mut i,mut p,mut changes)=(0,0,0);
+ let mut staged=[0u8;CONTENT_MAX];let (mut i,mut p,mut changes)=(0usize,0usize,0usize);
  while i<n{
   let matched=i+needle.len()<=n&&&src[i..i+needle.len()]==needle;
   let next=if matched{replacement}else{&src[i..i+1]};

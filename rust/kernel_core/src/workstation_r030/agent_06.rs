@@ -11,7 +11,7 @@ pub fn rename<const F:usize>(fs:&mut RamFs<F>,path:&[u8],revision:u64,
  if rev!=revision{return Err(Error::Stale);}
  let mut src=[0u8;CONTENT_MAX];fs.read(path,0,&mut src[..n])
   .map_err(|_|Error::Missing)?;
- let mut dst=[0u8;CONTENT_MAX];let(mut i,mut w,mut hits)=(0,0,0);
+ let mut dst=[0u8;CONTENT_MAX];let(mut i,mut w,mut hits)=(0usize,0usize,0usize);
  while i<n{
   let matched=i+old.len()<=n&&&src[i..i+old.len()]==old&&
    (i==0||!ident(src[i-1]))&&
