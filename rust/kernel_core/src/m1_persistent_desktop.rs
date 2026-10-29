@@ -12,7 +12,8 @@ use crate::batch2_launcher::Launch;
 use crate::batch2_settings::Settings;
 use crate::batch2_windows::{Window,Rect};
 use crate::m1_persistent_terminal::{self,Error as TerminalError};
-use crate::m1_input::{InputLine,Event as KeyEvent,Error as KeyError,MAX_LINE};
+use crate::m1_input::{InputLine,EditKey,Event as KeyEvent,Error as KeyError,MAX_LINE};
+const HISTORY_DEPTH:usize=8;
 
 /// PS/2 set-1 unshifted ASCII subset for trusted QEMU keyboard events.
 /// A full keymap, modifiers, Unicode and independent compositor remain M1 work.
@@ -30,6 +31,10 @@ fn ascii_from_set1(scan:u16,shift:bool)->Option<u8>{
   0x0a=>b'9',0x0b=>b'0',
   0x39=>b' ',0x35=>b'/',0x34=>b'.',0x0c=>b'-',
   0x0d=>b'=',0x1c=>b'\n',0x0e=>8,
+  // Extra US set-1 punctuation needed for real source editing.
+  0x29=>0x60,0x1a=>b'[',0x1b=>b']',0x27=>b';',
+  0x28=>0x27,0x2b=>0x5c,0x33=>b',',0x37=>b'*',
+  0x4a=>b'-',0x4e=>b'+',
   _=>return None,
  };
  if !shift{return Some(basic);}
@@ -38,7 +43,9 @@ fn ascii_from_set1(scan:u16,shift:bool)->Option<u8>{
   b'1'=>b'!',b'2'=>b'@',b'3'=>b'#',b'4'=>b'$',
   b'5'=>b'%',b'6'=>b'^',b'7'=>b'&',b'8'=>b'*',
   b'9'=>b'(',b'0'=>b')',b'-'=>b'_',b'='=>b'+',
-  b'/'=>b'?',b'.'=>b'>',
+  b'/'=>b'?',b'.'=>b'>',b','=>b'<',0x60=>b'~',
+  b'['=>b'{',b']'=>b'}',b';'=>b':',0x27=>b'"',
+  0x5c=>b'|',
   _=>basic,
  })
 }
@@ -57,6 +64,10 @@ pub struct Desktop<D:BlockDevice,const P:usize,const E:usize,
  // Session-bound last successful command and the draft before recall.
  control_down:bool,
  history:[u8;MAX_LINE],history_len:usize,
+ // Fixed-size ring of eight fully scrubbed successful command revisions.
+ history_ring:[[u8;MAX_LINE];HISTORY_DEPTH],
+ history_sizes:[usize;HISTORY_DEPTH],
+ history_total:usize,history_head:usize,history_depth:usize,
  draft:[u8;MAX_LINE],draft_len:usize,history_active:bool,
  owner:Option<Identity>,
  window:u32,
@@ -74,6 +85,9 @@ impl<D:BlockDevice,const P:usize,const E:usize,const W:usize,
   Self{boot:Bootstrap::new(),rights:Access::new(),volume,
    surface:Surfaces::new(),input:InputLine::new(),owner:None,
    control_down:false,history:[0;MAX_LINE],history_len:0,
+   history_ring:[[0;MAX_LINE];HISTORY_DEPTH],
+   history_sizes:[0;HISTORY_DEPTH],history_total:0,
+   history_head:0,history_depth:0,
    draft:[0;MAX_LINE],draft_len:0,history_active:false,
    window:0,shift_left:false,shift_right:false,redraw_pending:false}
  }
@@ -121,8 +135,79 @@ impl<D:BlockDevice,const P:usize,const E:usize,const W:usize,
  /// process restart, a recycled PID or a different user's desktop.
  fn forget_history(&mut self){
   self.history.fill(0);self.history_len=0;
+  self.history_ring=[[0;MAX_LINE];HISTORY_DEPTH];
+  self.history_sizes=[0;HISTORY_DEPTH];
+  self.history_total=0;self.history_head=0;self.history_depth=0;
   self.draft.fill(0);self.draft_len=0;self.history_active=false;
   self.control_down=false;
+  self.input.forget();
+ }
+ /// Store successful commands only, deduplicating consecutive identical
+ /// commands and overwriting the oldest entry when eight are retained.
+ fn record_history(&mut self,command:&[u8]){
+  if command.is_empty(){return;}
+  if self.history_len!=command.len()||&self.history[..self.history_len]!=command{
+   self.history.fill(0);self.history[..command.len()].copy_from_slice(command);
+   self.history_len=command.len();
+   self.history_ring[self.history_head].fill(0);
+   self.history_ring[self.history_head][..command.len()].copy_from_slice(command);
+   self.history_sizes[self.history_head]=command.len();
+   self.history_head=(self.history_head+1)%HISTORY_DEPTH;
+   self.history_total=(self.history_total+1).min(HISTORY_DEPTH);
+  }
+  self.history_active=false;self.history_depth=0;
+  self.draft.fill(0);self.draft_len=0;
+ }
+ /// Navigate backwards through eight owner-only successful commands.
+ /// The currently edited draft is saved exactly once on the first Up.
+ fn history_up(&mut self)->Result<bool,KeyError>{
+  if self.history_total==0{return Ok(false);}
+  if !self.history_active{
+   self.draft.fill(0);
+   self.draft_len=self.input.length();
+   self.draft[..self.draft_len].copy_from_slice(self.input.bytes());
+   self.history_depth=0;
+  }
+  self.history_depth=(self.history_depth+1).min(self.history_total);
+  let index=(self.history_head+HISTORY_DEPTH-self.history_depth)%HISTORY_DEPTH;
+  self.input.set_line(&self.history_ring[index][..self.history_sizes[index]])?;
+  self.history_active=true;
+  Ok(true)
+ }
+ /// Newer history entries are exposed until Down restores the draft.
+ fn history_down(&mut self)->Result<bool,KeyError>{
+  if !self.history_active{return Ok(false);}
+  if self.history_depth>1{
+   self.history_depth-=1;
+   let index=(self.history_head+HISTORY_DEPTH-self.history_depth)%HISTORY_DEPTH;
+   self.input.set_line(&self.history_ring[index][..self.history_sizes[index]])?;
+  }else{
+   self.input.set_line(&self.draft[..self.draft_len])?;
+   self.history_active=false;self.history_depth=0;
+   self.draft.fill(0);self.draft_len=0;
+  }
+  Ok(true)
+ }
+ /// Complete only unambiguous command-name prefixes; never execute here.
+ /// No path or argument is ever silently altered by tab-completion.
+ fn complete_verb(&mut self)->Result<bool,KeyError>{
+  // Match the real Terminal parser's published verb registry.
+  if self.input.caret()!=self.input.length()||self.input.is_empty()||
+     self.input.bytes().iter().any(|b|*b==b' '){return Ok(false);}
+  let prefix=self.input.bytes();
+  let mut found=None;
+  for &word in m1_persistent_terminal::COMMAND_VERBS{
+   if word.as_bytes().starts_with(prefix){
+    if found.is_some(){return Ok(false);}
+    found=Some(word);
+   }
+  }
+  if let Some(word)=found{
+   if word.as_bytes()==prefix{return Ok(false);}
+   self.input.set_line(word.as_bytes())?;
+   return Ok(true);
+  }
+  Ok(false)
  }
  /// Coalesce full-window updates until the compositor drains the pending
  /// event. Input remains bounded by InputLine; pending damage is owned by
@@ -160,10 +245,7 @@ impl<D:BlockDevice,const P:usize,const E:usize,const W:usize,
    KeyEvent::Submitted(n)=>{
     match self.execute(caller,now,&line[..n],out){
      Ok(result_bytes)=>{
-      self.history.fill(0);
-      self.history[..n].copy_from_slice(&line[..n]);
-      self.history_len=n;self.history_active=false;
-      self.draft.fill(0);self.draft_len=0;
+      self.record_history(&line[..n]);
       Ok(Some(result_bytes))
      },
      Err(error)=>{
@@ -180,7 +262,10 @@ impl<D:BlockDevice,const P:usize,const E:usize,const W:usize,
     }
    },
    KeyEvent::Typed|KeyEvent::Erased=>{
-    self.history_active=false;
+    if self.history_active{
+     self.history_active=false;self.history_depth=0;
+     self.draft.fill(0);self.draft_len=0;
+    }
     self.request_redraw(caller)?;
     Ok(None)
    },
@@ -201,52 +286,126 @@ impl<D:BlockDevice,const P:usize,const E:usize,const W:usize,
     .map_err(|e|Error::Boot(BootError::Session(e)))?;
   if event.focus.pid!=owner.pid||event.focus.generation!=owner.generation||
      event.focus.window!=self.window{return Err(Error::State);}
-  // Only trusted, focused PS/2 edges may modify keyboard state.
-  match event.scan_code{
+  // Set-1 extended key codes are represented as 0xE0xx by the trusted
+  // kernel broker. Reject arbitrary high bits instead of masking data.
+  let scan=if event.scan_code<=0xff{event.scan_code}
+   else if event.scan_code&0xff00==0xe000{event.scan_code&0xff}
+   else{return Err(Error::Keyboard(KeyError::Invalid));};
+  match scan{
    0x2a=>{self.shift_left=event.pressed;return Ok(None);},
    0x36=>{self.shift_right=event.pressed;return Ok(None);},
+   0x1d=>{self.control_down=event.pressed;return Ok(None);},
    _=>{},
   }
-  if !event.pressed {if event.scan_code==0x1d {self.control_down=false;}return Ok(None);}
-  // Focus-bound Control+U clears a draft and Control+W deletes a word.
-  // Set-1 control scancode edges are tracked separately from Shift.
-  if event.scan_code==0x1d {self.control_down=true;return Ok(None);}
-  if self.control_down && (event.scan_code==0x16 || event.scan_code==0x11 || event.scan_code==0x25){
-   if event.scan_code==0x16 {self.input.clear_line();}
-   else if event.scan_code==0x25 {self.input.kill_line();}
-   else {self.input.erase_word();}
-   self.history_active=false;self.request_redraw(owner)?;
-   return Ok(None);
-  }
-  // Only the focused kernel-authenticated PS/2 input may recall or restore
-  // a Terminal command. The draft is not lost by a history Up/Down cycle.
-  if event.scan_code==0x48 {
-   if self.history_len>0 {
-    if !self.history_active {
-     self.draft.fill(0);
-     self.draft_len=self.input.length();
-     self.draft[..self.draft_len].copy_from_slice(self.input.bytes());
+  if !event.pressed{return Ok(None);}
+  // No Ctrl+letter sequence may accidentally enter a character or execute
+  // an unmodified shortcut. Only explicitly allowlisted commands apply.
+  if self.control_down{
+   let result=match scan{
+    0x16|0x25=>{self.input.kill_line();true}, // Ctrl+U/K
+    0x11|0x0e=>{self.input.erase_word();true}, // Ctrl+W/Backspace
+    0x1e=>{self.input.action(EditKey::Home).map_err(Error::Keyboard)?;true},
+    0x12=>{self.input.action(EditKey::End).map_err(Error::Keyboard)?;true},
+    0x30=>{self.input.action(EditKey::Left).map_err(Error::Keyboard)?;true},
+    0x21=>{self.input.action(EditKey::Right).map_err(Error::Keyboard)?;true},
+    0x20=>{self.input.action(EditKey::Delete).map_err(Error::Keyboard)?;true},
+    0x19=>{self.history_up().map_err(Error::Keyboard)?},
+    0x31=>{self.history_down().map_err(Error::Keyboard)?},
+    _=>false,
+   };
+   if result{
+    if scan!=0x19&&scan!=0x31{
+     self.history_active=false;self.history_depth=0;
     }
-    self.input.set_line(&self.history[..self.history_len])
-      .map_err(Error::Keyboard)?;
-    self.history_active=true;
     self.request_redraw(owner)?;
    }
    return Ok(None);
   }
-  if event.scan_code==0x50 {
-   if self.history_active {
-    self.input.set_line(&self.draft[..self.draft_len])
-      .map_err(Error::Keyboard)?;
-    self.history_active=false;
+  match scan{
+   // Left, Right, Home, End, Delete: tested with ordinary and E0 set-1 codes.
+   0x4b|0x4d|0x47|0x4f|0x53=>{
+    let action=match scan{
+     0x4b=>EditKey::Left,0x4d=>EditKey::Right,
+     0x47=>EditKey::Home,0x4f=>EditKey::End,
+     _=>EditKey::Delete,
+    };
+    self.input.action(action).map_err(Error::Keyboard)?;
+    self.request_redraw(owner)?;
+    return Ok(None);
+   },
+   0x48|0x50=>{
+    let changed=if scan==0x48{self.history_up()}else{self.history_down()}
+     .map_err(Error::Keyboard)?;
+    if changed{self.request_redraw(owner)?;}
+    return Ok(None);
+   },
+   0x01=>{ // Escape cancels unsent input, never executes storage I/O.
+    self.input.kill_line();
+    self.history_active=false;self.history_depth=0;
     self.draft.fill(0);self.draft_len=0;
     self.request_redraw(owner)?;
-   }
-   return Ok(None);
+    return Ok(None);
+   },
+   0x0f=>{ // Tab completes an unambiguous command verb.
+    if self.complete_verb().map_err(Error::Keyboard)?{
+     self.request_redraw(owner)?;
+    }
+    return Ok(None);
+   },
+   _=>{},
   }
-  let ch=ascii_from_set1(event.scan_code,self.shift_left||self.shift_right)
+  let ch=ascii_from_set1(scan,self.shift_left||self.shift_right)
     .ok_or(Error::Keyboard(KeyError::Invalid))?;
   self.key(owner,now,ch,out)
+ }
+ /// Copy/cut/paste a bounded terminal selection from a trusted Desktop
+ /// service only while the target session's capabilities are live.
+ pub fn input_copy(&mut self,caller:Identity,now:u64,
+   start:usize,end:usize)->Result<usize,Error>{
+  self.admit_input(caller,now)?;
+  self.input.copy_range(start,end).map_err(Error::Keyboard)
+ }
+ pub fn input_cut(&mut self,caller:Identity,now:u64,
+   start:usize,end:usize)->Result<usize,Error>{
+  self.admit_input(caller,now)?;
+  let count=self.input.cut_range(start,end).map_err(Error::Keyboard)?;
+  self.request_redraw(caller)?;
+  Ok(count)
+ }
+ pub fn input_paste(&mut self,caller:Identity,now:u64,
+   bytes:&[u8])->Result<(),Error>{
+  self.admit_input(caller,now)?;
+  self.input.paste(bytes).map_err(Error::Keyboard)?;
+  self.request_redraw(caller)?;
+  Ok(())
+ }
+ pub fn input_paste_clipboard(&mut self,caller:Identity,now:u64)
+   ->Result<(),Error>{
+  self.admit_input(caller,now)?;
+  self.input.paste_clipboard().map_err(Error::Keyboard)?;
+  self.request_redraw(caller)?;
+  Ok(())
+ }
+ pub fn input_snapshot(&self,caller:Identity,now:u64,
+   out:&mut[u8])->Result<(usize,usize),Error>{
+  self.admit_input(caller,now)?;
+  if out.len()<self.input.length(){return Err(Error::Keyboard(KeyError::TooSmall));}
+  let n=self.input.length();out[..n].copy_from_slice(self.input.bytes());
+  Ok((n,self.input.caret()))
+ }
+ pub fn history_snapshot(&self,caller:Identity,now:u64,
+   depth:usize,out:&mut[u8])->Result<usize,Error>{
+  self.admit_input(caller,now)?;
+  if depth==0||depth>self.history_total{return Err(Error::State);}
+  let index=(self.history_head+HISTORY_DEPTH-depth)%HISTORY_DEPTH;
+  let n=self.history_sizes[index];
+  if out.len()<n{return Err(Error::Keyboard(KeyError::TooSmall));}
+  out[..n].copy_from_slice(&self.history_ring[index][..n]);Ok(n)
+ }
+ fn admit_input(&self,caller:Identity,now:u64)->Result<(),Error>{
+  if self.owner!=Some(caller)||self.boot.desktop_identity()!=Some(caller)||
+     !self.boot.session.owns(caller){return Err(Error::State);}
+  self.rights.require(caller,VIEW,now).map_err(Error::Auth)
  }
  pub fn next_draw(&mut self)->Result<Damage,Error>{
   let damage=self.surface.next().map_err(Error::Graphics)?;
@@ -427,6 +586,208 @@ mod tests{
   assert!(gui.input.bytes().is_empty());
   gui.physical_key(1,0x1d,false,&mut out).unwrap();
   assert!(!gui.control_down);
+ }
+ #[test]fn r044_caret_corrected_terminal_command_durably_writes_after_remount(){
+  let disk=Disk{data:[[0u8;SECTOR_BYTES];SECTORS]};
+  let mut gui=TestDesk::from_mounted(HierVfs::format_blank(disk).unwrap());
+  gui.start(user(1),load(1),user(2),load(2),settings(),8,99).unwrap();
+  let mut out=[0;256];
+  gui.execute(user(2),1,b"mkdir /docs",&mut out).unwrap();
+  for &b in b"wite /docs/a stored"{gui.key(user(2),1,b,&mut out).unwrap();}
+  gui.physical_key(1,0xe047,true,&mut out).unwrap(); // Home
+  gui.physical_key(1,0xe04d,true,&mut out).unwrap(); // Right
+  gui.key(user(2),1,b'r',&mut out).unwrap();
+  assert_eq!(gui.input.bytes(),b"write /docs/a stored");
+  assert_eq!(gui.key(user(2),1,b'\n',&mut out),Ok(Some(5)));
+  let mut fs=HierVfs::mount(gui.into_device()).unwrap();
+  let mut data=[0;16];
+  assert_eq!(fs.read("/docs/a",&mut data),Ok(6));
+  assert_eq!(&data[..6],b"stored");
+ }
+ #[test]fn r044_full_us_keyboard_punctuation_and_shift_pairs(){
+  for (scan,plain,shifted) in [
+   (0x29,0x60,b'~'),(0x1a,b'[',b'{'),(0x1b,b']',b'}'),
+   (0x27,b';',b':'),(0x28,0x27,b'"'),(0x2b,0x5c,b'|'),
+   (0x33,b',',b'<'),(0x34,b'.',b'>'),(0x35,b'/',b'?'),
+   (0x0c,b'-',b'_'),(0x0d,b'=',b'+'),
+  ]{
+   assert_eq!(ascii_from_set1(scan,false),Some(plain));
+   assert_eq!(ascii_from_set1(scan,true),Some(shifted));
+  }
+  assert_eq!(ascii_from_set1(0xffff,false),None);
+ }
+ #[test]fn r044_full_us_keyboard_source_symbols_enter_live_input(){
+  let disk=Disk{data:[[0u8;SECTOR_BYTES];SECTORS]};
+  let mut gui=TestDesk::from_mounted(HierVfs::format_blank(disk).unwrap());
+  gui.start(user(1),load(1),user(2),load(2),settings(),8,99).unwrap();
+  let mut out=[0;256];
+  gui.physical_key(1,0x2a,true,&mut out).unwrap();
+  gui.physical_key(1,0x1a,true,&mut out).unwrap();
+  gui.physical_key(1,0x1b,true,&mut out).unwrap();
+  gui.physical_key(1,0x28,true,&mut out).unwrap();
+  gui.physical_key(1,0x2a,false,&mut out).unwrap();
+  gui.physical_key(1,0x2b,true,&mut out).unwrap();
+  assert_eq!(gui.input.bytes(),&[b'{',b'}',b'"',0x5c]);
+ }
+ #[test]fn r044_real_ps2_caret_insertion_deletion_and_extended_codes(){
+  let disk=Disk{data:[[0u8;SECTOR_BYTES];SECTORS]};
+  let mut gui=TestDesk::from_mounted(HierVfs::format_blank(disk).unwrap());
+  gui.start(user(1),load(1),user(2),load(2),settings(),8,99).unwrap();
+  let mut out=[0;256];
+  for &key in b"wite"{gui.key(user(2),1,key,&mut out).unwrap();}
+  gui.physical_key(1,0xe047,true,&mut out).unwrap(); // extended Home
+  gui.physical_key(1,0xe04d,true,&mut out).unwrap(); // extended Right
+  gui.key(user(2),1,b'r',&mut out).unwrap();
+  assert_eq!(gui.input.bytes(),b"write");
+  assert_eq!(gui.input.caret(),2);
+  gui.physical_key(1,0xe04d,true,&mut out).unwrap();
+  gui.physical_key(1,0xe053,true,&mut out).unwrap(); // Delete 't'
+  assert_eq!(gui.input.bytes(),b"wrie");
+  gui.physical_key(1,0xe047,true,&mut out).unwrap();
+  gui.physical_key(1,0xe04f,true,&mut out).unwrap();
+  assert_eq!(gui.input.caret(),4);
+  assert!(gui.physical_key(1,0xd000,true,&mut out).is_err());
+ }
+ #[test]fn r044_physical_ctrl_word_cursor_and_unmapped_combo_never_type(){
+  let disk=Disk{data:[[0u8;SECTOR_BYTES];SECTORS]};
+  let mut gui=TestDesk::from_mounted(HierVfs::format_blank(disk).unwrap());
+  gui.start(user(1),load(1),user(2),load(2),settings(),8,99).unwrap();
+  let mut out=[0;256];
+  for &b in b"one two three"{gui.key(user(2),1,b,&mut out).unwrap();}
+  gui.physical_key(1,0x1d,true,&mut out).unwrap();
+  gui.physical_key(1,0x1e,true,&mut out).unwrap(); // Ctrl+A
+  assert_eq!(gui.input.caret(),0);
+  gui.physical_key(1,0x12,true,&mut out).unwrap(); // Ctrl+E
+  assert_eq!(gui.input.caret(),13);
+  gui.physical_key(1,0x30,true,&mut out).unwrap(); // Ctrl+B
+  assert_eq!(gui.input.caret(),12);
+  gui.physical_key(1,0x21,true,&mut out).unwrap(); // Ctrl+F
+  assert_eq!(gui.input.caret(),13);
+  gui.physical_key(1,0x14,true,&mut out).unwrap(); // Unmapped Ctrl+T
+  assert_eq!(gui.input.bytes(),b"one two three");
+  gui.physical_key(1,0x1d,false,&mut out).unwrap();
+ }
+ #[test]fn r044_ring_history_keeps_eight_successful_commands_after_wrap(){
+  let disk=Disk{data:[[0u8;SECTOR_BYTES];SECTORS]};
+  let mut gui=TestDesk::from_mounted(HierVfs::format_blank(disk).unwrap());
+  gui.start(user(1),load(1),user(2),load(2),settings(),8,99).unwrap();
+  let mut out=[0;256];
+  let commands=[
+   b"pwd".as_slice(),b"tools".as_slice(),b"ls /".as_slice(),
+   b"mkdir /docs".as_slice(),b"write /docs/a one".as_slice(),
+   b"cat /docs/a".as_slice(),b"count /docs/a".as_slice(),
+   b"stat /docs/a".as_slice(),b"head /docs/a 1".as_slice(),
+   b"help".as_slice()
+  ];
+  for cmd in commands{
+   // Only keyboard submission records history; direct execute is stateless.
+   for &b in cmd{gui.key(user(2),1,b,&mut out).unwrap();}
+   assert!(gui.key(user(2),1,b'\n',&mut out).unwrap().is_some());
+  }
+  assert_eq!(gui.history_total,8);
+  assert_eq!(gui.history_len,4);
+  assert_eq!(&gui.history[..4],b"help");
+  let mut old=[0;MAX_LINE];
+  let n=gui.history_snapshot(user(2),1,8,&mut old).unwrap();
+  assert_eq!(&old[..n],b"ls /");
+  for _ in 0..12{gui.physical_key(1,0x48,true,&mut out).unwrap();}
+  assert_eq!(gui.input.bytes(),b"ls /");
+  gui.physical_key(1,0x50,true,&mut out).unwrap();
+  assert_eq!(gui.input.bytes(),b"mkdir /docs");
+ }
+ #[test]fn r044_history_success_only_dedup_and_draft_roundtrip(){
+  let disk=Disk{data:[[0u8;SECTOR_BYTES];SECTORS]};
+  let mut gui=TestDesk::from_mounted(HierVfs::format_blank(disk).unwrap());
+  gui.start(user(1),load(1),user(2),load(2),settings(),8,99).unwrap();
+  let mut out=[0;256];
+  for _ in 0..2{
+   for &ch in b"pwd"{gui.key(user(2),1,ch,&mut out).unwrap();}
+   gui.key(user(2),1,b'\n',&mut out).unwrap();
+  }
+  assert_eq!(gui.history_total,1);
+  for &ch in b"cat /missing"{gui.key(user(2),1,ch,&mut out).unwrap();}
+  assert!(gui.key(user(2),1,b'\n',&mut out).is_err());
+  assert_eq!(gui.history_total,1);
+  assert_eq!(gui.input.bytes(),b"cat /missing");
+  gui.physical_key(1,0x48,true,&mut out).unwrap();
+  assert_eq!(gui.input.bytes(),b"pwd");
+  gui.physical_key(1,0x50,true,&mut out).unwrap();
+  assert_eq!(gui.input.bytes(),b"cat /missing");
+ }
+ #[test]fn r044_input_clipboard_auth_atomic_paste_and_snapshot(){
+  let disk=Disk{data:[[0u8;SECTOR_BYTES];SECTORS]};
+  let mut gui=TestDesk::from_mounted(HierVfs::format_blank(disk).unwrap());
+  gui.start(user(1),load(1),user(2),load(2),settings(),8,10).unwrap();
+  let mut out=[0;256];
+  gui.input.set_line(b"echo local").unwrap();
+  let wrong=user(3);
+  assert!(gui.input_copy(wrong,1,0,4).is_err());
+  assert_eq!(gui.input_copy(user(2),1,0,4),Ok(4));
+  assert_eq!(gui.input_cut(user(2),1,0,5),Ok(5));
+  assert_eq!(gui.input.bytes(),b"local");
+  gui.input_paste_clipboard(user(2),1).unwrap();
+  assert_eq!(gui.input.bytes(),b"echo local");
+  assert_eq!(gui.input_snapshot(user(2),1,&mut out),Ok((10,5)));
+  assert_eq!(&out[..10],b"echo local");
+  assert!(gui.input_snapshot(user(2),10,&mut out).is_err());
+  let mut short=[0xaa;2];
+  assert_eq!(gui.input_snapshot(user(2),1,&mut short),
+    Err(Error::Keyboard(KeyError::TooSmall)));
+  assert_eq!(short,[0xaa;2]);
+  assert_eq!(gui.input_paste(user(2),1,b"unsafe\nline"),
+    Err(Error::Keyboard(KeyError::Invalid)));
+  assert_eq!(gui.input.bytes(),b"echo local");
+ }
+ #[test]fn r044_tab_completion_unique_ambiguous_and_escape_cancel(){
+  let disk=Disk{data:[[0u8;SECTOR_BYTES];SECTORS]};
+  let mut gui=TestDesk::from_mounted(HierVfs::format_blank(disk).unwrap());
+  gui.start(user(1),load(1),user(2),load(2),settings(),8,99).unwrap();
+  let mut out=[0;256];
+  for &ch in b"mkf"{gui.key(user(2),1,ch,&mut out).unwrap();}
+  gui.physical_key(1,0x0f,true,&mut out).unwrap();
+  assert_eq!(gui.input.bytes(),b"mkfile");
+  gui.physical_key(1,0x01,true,&mut out).unwrap();
+  assert!(gui.input.bytes().is_empty());
+  for &ch in b"app"{gui.key(user(2),1,ch,&mut out).unwrap();}
+  gui.physical_key(1,0x0f,true,&mut out).unwrap();
+  assert_eq!(gui.input.bytes(),b"app"); // append vs appendln
+  gui.physical_key(1,0x01,true,&mut out).unwrap();
+  assert!(gui.input.bytes().is_empty());
+ }
+ #[test]fn r044_history_clipboard_scrubbed_on_crash_and_pid_reuse(){
+  let disk=Disk{data:[[0u8;SECTOR_BYTES];SECTORS]};
+  let mut gui=TestDesk::from_mounted(HierVfs::format_blank(disk).unwrap());
+  gui.start(user(1),load(1),user(2),load(2),settings(),8,99).unwrap();
+  let mut out=[0;256];
+  for &ch in b"pwd"{gui.key(user(2),1,ch,&mut out).unwrap();}
+  gui.key(user(2),1,b'\n',&mut out).unwrap();
+  gui.input.set_line(b"private").unwrap();
+  gui.input_copy(user(2),1,0,7).unwrap();
+  gui.desktop_crashed(user(2)).unwrap();
+  assert_eq!(gui.history_total,0);
+  assert!(gui.input.clipboard_bytes().is_empty());
+  assert!(gui.input.bytes().is_empty());
+  assert!(gui.history_snapshot(user(2),1,1,&mut out).is_err());
+ }
+ #[test]fn r044_ctrl_previous_next_history_keeps_authenticated_depth(){
+  let disk=Disk{data:[[0u8;SECTOR_BYTES];SECTORS]};
+  let mut gui=TestDesk::from_mounted(HierVfs::format_blank(disk).unwrap());
+  gui.start(user(1),load(1),user(2),load(2),settings(),8,99).unwrap();
+  let mut out=[0;256];
+  for cmd in [b"pwd".as_slice(),b"tools".as_slice()]{
+   for &b in cmd{gui.key(user(2),1,b,&mut out).unwrap();}
+   gui.key(user(2),1,b'\n',&mut out).unwrap();
+  }
+  gui.physical_key(1,0x1d,true,&mut out).unwrap();
+  gui.physical_key(1,0x19,true,&mut out).unwrap(); // Ctrl+P
+  assert_eq!(gui.input.bytes(),b"tools");
+  gui.physical_key(1,0x19,true,&mut out).unwrap();
+  assert_eq!(gui.input.bytes(),b"pwd");
+  gui.physical_key(1,0x31,true,&mut out).unwrap(); // Ctrl+N
+  assert_eq!(gui.input.bytes(),b"tools");
+  gui.physical_key(1,0x31,true,&mut out).unwrap();
+  assert!(gui.input.bytes().is_empty());
+  gui.physical_key(1,0x1d,false,&mut out).unwrap();
  }
  #[test]fn r040_keyboard_up_down_recalls_last_command_and_preserves_draft(){
   let disk=Disk{data:[[0u8;SECTOR_BYTES];SECTORS]};

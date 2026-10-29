@@ -13,6 +13,30 @@ use crate::vfs_path::normalize_absolute;
 use crate::fs_write_guard::{WriteGuard,Error as GuardError};
 
 pub const MAX_COMMAND:usize=192;
+/// The actual persistent Terminal's supported verbs. Shared with the live
+/// Desktop's Tab completion so hidden/unknown commands are never suggested.
+pub const COMMAND_VERBS:&[&str]=&[
+ "help","pwd","tools","ls","cat","write","append","mkdir","mv",
+ "cp","rm","mkfile","truncate","head","count","rmdir","mvdir",
+ "pread","pwrite","lines","hash","stat","tail","find","grep","cmp",
+ "touch","copynew","replace","appendln",
+];
+/// Complete exactly one printable lower-case verb prefix. Ambiguous matches,
+/// empty prefixes and user-supplied paths never cause completion or I/O.
+pub fn complete_verb(prefix:&[u8])->Option<&'static str>{
+ if prefix.is_empty()||prefix.iter().any(|b|!b.is_ascii_lowercase()){
+  return None;
+ }
+ let mut found=None;
+ for &word in COMMAND_VERBS{
+  if word.as_bytes().starts_with(prefix){
+   if found.is_some(){return None;}
+   found=Some(word);
+  }
+ }
+ found
+}
+
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 pub enum Error{Invalid,Denied,Io(FsError),OutputTooSmall,Unknown}
 fn path<'a>(input:&str,buffer:&'a mut [u8;64])->Result<&'a str,Error>{
@@ -470,6 +494,21 @@ mod tests{
   let mut out=[0xaau8;MAX_TRANSFER];
   let size=command(fs,access,who,1,cmd,&mut out)?;
   Ok((size,out))
+ }
+ #[test]fn r044_command_registry_drives_unique_safe_completion(){
+  assert_eq!(COMMAND_VERBS.len(),30);
+  for (i,verb) in COMMAND_VERBS.iter().enumerate(){
+   assert!(verb.as_bytes().iter().all(|b|b.is_ascii_lowercase()));
+   assert!(!COMMAND_VERBS[..i].contains(verb));
+  }
+  assert_eq!(complete_verb(b"mkf"),Some("mkfile"));
+  assert_eq!(complete_verb(b"copyne"),Some("copynew"));
+  assert_eq!(complete_verb(b"rmd"),Some("rmdir"));
+  assert_eq!(complete_verb(b"app"),None);
+  assert_eq!(complete_verb(b"pw"),None);
+  assert_eq!(complete_verb(b""),None);
+  assert_eq!(complete_verb(b"rm /"),None);
+  assert_eq!(complete_verb(b"PWD"),None);
  }
  #[test]fn r043_terminal_inspection_tools_report_durable_bytes_and_lines(){
   let mut fs=HierVfs::format_blank(blank()).unwrap();let auth=grants();

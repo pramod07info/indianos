@@ -7,78 +7,91 @@ pub enum Error{Invalid,Full,TooSmall}
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 pub enum Event{Typed,Erased,Submitted(usize),Empty}
 
+/// Live per-process editable command line. Uses the same bounded cursor
+/// editor as the existing standalone line-editing tests: no second source
+/// buffer, dynamic allocation or privileged input pointers.
 pub struct InputLine {
- bytes:[u8;MAX_LINE],
- length:usize,
+ editor:LineEditor,
+ clipboard:[u8;MAX_LINE],
+ clipboard_len:usize,
 }
 impl InputLine{
- pub const fn new()->Self{Self{bytes:[0;MAX_LINE],length:0}}
- pub fn length(&self)->usize{self.length}
- /// Caller-owned view for bounded Terminal history. No exposing raw
- /// pointers or any bytes beyond the authenticated command's length.
- pub fn bytes(&self)->&[u8]{&self.bytes[..self.length]}
- /// Replace a trusted editable command atomically; invalid controls and
- /// oversized history never wipe the current draft.
- /// Clear the current command without modifying completed history.
+ pub const fn new()->Self{
+  Self{editor:LineEditor::new(),clipboard:[0;MAX_LINE],clipboard_len:0}
+ }
+ pub fn length(&self)->usize{self.editor.bytes().len()}
+ pub fn bytes(&self)->&[u8]{self.editor.bytes()}
+ pub fn caret(&self)->usize{self.editor.caret()}
+ pub fn is_empty(&self)->bool{self.length()==0}
+ pub fn clipboard_bytes(&self)->&[u8]{&self.clipboard[..self.clipboard_len]}
+ /// Reset an executed draft without destroying the authenticated session's
+ /// clipboard, which can be pasted into a subsequent command.
+ pub fn reset(&mut self){self.editor.clear();}
+ /// On crash/restart/exit erase all process-private command/clipboard bytes.
+ pub fn forget(&mut self){
+  self.reset();self.clipboard.fill(0);self.clipboard_len=0;
+ }
  pub fn clear_line(&mut self){self.reset();}
- /// Ctrl+A: return the current command to the start of its input session.
- /// The bounded InputLine is append-only; full cursor editing is provided
- /// by LineEditor separately, so this method never silently moves a cursor.
- pub fn is_empty(&self)->bool{self.length==0}
- /// Ctrl+K: clear the unsubmitted line without executing it.
  pub fn kill_line(&mut self)->Event{
   if self.is_empty(){return Event::Empty;}
   self.reset();Event::Erased
  }
- /// Reject a second untrusted command if the current draft is nonempty.
- /// This keeps history replay explicit rather than concatenating commands.
  pub fn restore_if_empty(&mut self,source:&[u8])->Result<(),Error>{
   if !self.is_empty(){return Err(Error::Invalid);}
   self.set_line(source)
  }
- /// Erase the previous ASCII word, including separating spaces.
- /// No mutation occurs if the command is already empty.
- pub fn erase_word(&mut self)->Event{
-  if self.length==0{return Event::Empty;}
-  let mut end=self.length;
-  while end>0&&self.bytes[end-1]==b' '{end-=1;}
-  while end>0&&self.bytes[end-1]!=b' '{end-=1;}
-  self.bytes[end..self.length].fill(0);
-  self.length=end;Event::Erased
- }
+ /// Erase the word immediately before the CURRENT caret.
+ pub fn erase_word(&mut self)->Event{self.editor.erase_previous_word()}
  pub fn set_line(&mut self,line:&[u8])->Result<(),Error>{
-  if line.len()>MAX_LINE{return Err(Error::Full);}
-  if line.iter().any(|byte|!(b' '..=b'~').contains(byte)){
-   return Err(Error::Invalid);
-  }
-  self.reset();
-  self.bytes[..line.len()].copy_from_slice(line);
-  self.length=line.len();Ok(())
+  self.editor.replace_line(line)
  }
- pub fn reset(&mut self){
-  self.bytes.fill(0);
-  self.length=0;
+ /// Kernel-only navigation API; submitting a line is permitted ONLY
+ /// through feed() with a user-issued Enter, never a navigation event.
+ pub fn action(&mut self,key:EditKey)->Result<Event,Error>{
+  if key==EditKey::Submit{return Err(Error::Invalid);}
+  self.editor.edit(key,&mut[])
+ }
+ pub fn word_left(&mut self)->usize{self.editor.previous_word()}
+ pub fn word_right(&mut self)->usize{self.editor.next_word()}
+ pub fn delete_to_end(&mut self)->Event{
+  let at=self.editor.caret;
+  if at==self.editor.len{return Event::Empty;}
+  self.editor.line[at..self.editor.len].fill(0);
+  self.editor.len=at;Event::Erased
+ }
+ /// Atomic validated selection replacement, including overlap and capacity.
+ pub fn replace_range(&mut self,start:usize,end:usize,next:&[u8])
+  ->Result<Event,Error>{
+  self.editor.replace_range(start,end,next)
+ }
+ /// A keyboard source may paste only bounded printable ASCII; all-or-nothing.
+ pub fn paste(&mut self,text:&[u8])->Result<(),Error>{self.editor.paste(text)}
+ /// Store a selection only after range/capacity preflight. Previous clipboard
+ /// survives invalid operations and short/malformed selection.
+ pub fn copy_range(&mut self,start:usize,end:usize)->Result<usize,Error>{
+  if start>=end{return Err(Error::Invalid);}
+  let mut data=[0u8;MAX_LINE];
+  let count=self.editor.copy_range(start,end,&mut data)?;
+  self.clipboard.fill(0);self.clipboard[..count].copy_from_slice(&data[..count]);
+  self.clipboard_len=count;Ok(count)
+ }
+ pub fn cut_range(&mut self,start:usize,end:usize)->Result<usize,Error>{
+  if start>=end{return Err(Error::Invalid);}
+  if end>self.length(){return Err(Error::Invalid);}
+  let len=self.copy_range(start,end)?;
+  self.editor.replace_range(start,end,b"")?;
+  Ok(len)
+ }
+ pub fn paste_clipboard(&mut self)->Result<Event,Error>{
+  if self.clipboard_len==0{return Ok(Event::Empty);}
+  self.editor.paste(&self.clipboard[..self.clipboard_len])?;
+  Ok(Event::Typed)
  }
  pub fn feed(&mut self,key:u8,out:&mut[u8])->Result<Event,Error>{
-  match key {
-   b'\n'|b'\r' =>{
-    if self.length==0{return Ok(Event::Empty);}
-    if out.len()<self.length{return Err(Error::TooSmall);}
-    let len=self.length;
-    out[..len].copy_from_slice(&self.bytes[..len]);
-    self.reset();
-    Ok(Event::Submitted(len))
-   }
-   8|127=>{
-    if self.length==0{return Ok(Event::Empty);}
-    self.length-=1;self.bytes[self.length]=0;
-    Ok(Event::Erased)
-   }
-   b' '..=b'~'=>{
-    if self.length>=MAX_LINE{return Err(Error::Full);}
-    self.bytes[self.length]=key;
-    self.length+=1;Ok(Event::Typed)
-   }
+  match key{
+   b'\n'|b'\r'=>self.editor.edit(EditKey::Submit,out),
+   8|127=>self.editor.edit(EditKey::Backspace,&mut[]),
+   b' '..=b'~'=>self.editor.edit(EditKey::Insert(key),&mut[]),
    _=>Err(Error::Invalid)
   }
  }
@@ -140,6 +153,25 @@ impl LineEditor{
         self.line.copy_within(end..self.len,start);
         self.len-=end-start;self.line[self.len..].fill(0);
         Event::Erased
+    }
+    /// Replace one source range as a single bounded atomic edit, always
+    /// leaving the cursor immediately after the inserted replacement.
+    pub fn replace_range(&mut self,start:usize,end:usize,next:&[u8])
+        ->Result<Event,Error>{
+        if start>end||end>self.len{return Err(Error::Invalid);}
+        if next.iter().any(|&byte|!(b' '..=b'~').contains(&byte)){
+            return Err(Error::Invalid);
+        }
+        let new_len=self.len-(end-start);
+        let new_len=new_len.checked_add(next.len()).ok_or(Error::Full)?;
+        if new_len>MAX_LINE{return Err(Error::Full);}
+        if start==end&&next.is_empty(){return Ok(Event::Empty);}
+        let mut new=[0u8;MAX_LINE];
+        new[..start].copy_from_slice(&self.line[..start]);
+        new[start..start+next.len()].copy_from_slice(next);
+        new[start+next.len()..new_len].copy_from_slice(&self.line[end..self.len]);
+        self.line=new;self.len=new_len;self.caret=start+next.len();
+        Ok(if next.is_empty(){Event::Erased}else{Event::Typed})
     }
     /// Copy a selection only after destination preflight.
     pub fn copy_range(&self,start:usize,end:usize,out:&mut[u8])
@@ -305,6 +337,65 @@ impl LineEditor{
   assert_eq!(e.bytes().len(),MAX_LINE);
  }
 
+ #[test]fn r044_live_line_editor_cursor_insertion_and_forward_delete(){
+  let mut input=InputLine::new();
+  input.set_line(b"wite /x hi").unwrap();
+  input.action(EditKey::Home).unwrap();
+  input.action(EditKey::Right).unwrap();
+  input.feed(b'r',&mut[]).unwrap();
+  assert_eq!(input.bytes(),b"write /x hi");
+  assert_eq!(input.caret(),2);
+  input.action(EditKey::Right).unwrap();
+  input.action(EditKey::Delete).unwrap();
+  assert_eq!(input.bytes(),b"wrie /x hi");
+ }
+ #[test]fn r044_input_caret_navigation_and_word_delete_are_bounded(){
+  let mut x=InputLine::new();x.set_line(b"one two three").unwrap();
+  x.action(EditKey::Home).unwrap();
+  x.action(EditKey::Left).unwrap();assert_eq!(x.caret(),0);
+  x.word_right();assert_eq!(x.caret(),4);
+  x.word_right();assert_eq!(x.caret(),8);
+  x.erase_word();assert_eq!(x.bytes(),b"one three");
+  assert_eq!(x.caret(),4);
+  x.action(EditKey::End).unwrap();assert_eq!(x.caret(),9);
+  x.word_left();assert_eq!(x.caret(),4);
+  x.delete_to_end();assert_eq!(x.bytes(),b"one ");
+  assert_eq!(x.action(EditKey::Submit),Err(Error::Invalid));
+ }
+ #[test]fn r044_selection_cut_paste_and_cursor_are_owner_memory_bounded(){
+  let mut x=InputLine::new();x.set_line(b"one two three").unwrap();
+  assert_eq!(x.copy_range(4,7),Ok(3));
+  assert_eq!(x.clipboard_bytes(),b"two");
+  assert_eq!(x.cut_range(4,8),Ok(4));
+  assert_eq!(x.bytes(),b"one three");
+  assert_eq!(x.clipboard_bytes(),b"two ");
+  x.action(EditKey::End).unwrap();
+  x.paste_clipboard().unwrap();
+  assert_eq!(x.bytes(),b"one threetwo ");
+  x.reset();assert!(x.is_empty());assert_eq!(x.clipboard_bytes(),b"two ");
+  x.forget();assert!(x.clipboard_bytes().is_empty());
+ }
+ #[test]fn r044_selection_and_paste_fail_without_partial_buffer_modification(){
+  let mut x=InputLine::new();x.set_line(b"abc").unwrap();
+  x.copy_range(0,2).unwrap();
+  let original=*b"abc";
+  assert_eq!(x.copy_range(0,99),Err(Error::Invalid));
+  assert_eq!(x.clipboard_bytes(),b"ab");
+  assert_eq!(x.replace_range(0,1,b"bad\nline"),Err(Error::Invalid));
+  assert_eq!(x.bytes(),original);
+  x.set_line(&[b'x';MAX_LINE]).unwrap();
+  assert_eq!(x.paste_clipboard(),Err(Error::Full));
+  assert_eq!(x.bytes(),&[b'x';MAX_LINE]);
+ }
+ #[test]fn r044_replacement_overlapping_selection_preserves_cursor_and_tail(){
+  let mut input=InputLine::new();input.set_line(b"abc-def").unwrap();
+  assert_eq!(input.replace_range(2,5,b"XYZ"),Ok(Event::Typed));
+  assert_eq!(input.bytes(),b"abXYZef");
+  assert_eq!(input.caret(),5);
+  assert_eq!(input.replace_range(2,5,b""),Ok(Event::Erased));
+  assert_eq!(input.bytes(),b"abef");
+  assert_eq!(input.caret(),2);
+ }
  #[test]fn r042_kill_and_safe_restore_preserve_draft_invariants(){
   let mut line=InputLine::new();
   line.set_line(b"echo existing").unwrap();
