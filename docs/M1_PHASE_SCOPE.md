@@ -152,3 +152,30 @@
 
 ## Integration note
 M1.1 is currently an actively evolving draft branch with one squashed feature commit, not all M1 completion. Subsequent work may be integrated into that same branch (replacing the single feature commit after checks are re-run), but only publish a release-complete claim after the above exit gate is independently satisfied.
+
+
+### M1 G1/G2 selected-partition Terminal integration slice (2026-10-29)
+
+The Rust \`m1_persistent_terminal::command_on_partition\` service bridges
+a scheduler-authenticated process identity and the existing Terminal parser
+to \`m1_partition::mount\`. The caller explicitly selects an MBR/GPT
+partition ordinal, receives bounded filesystem errors, and uses only
+\`BlockWindow\`-isolated checked COW I/O. Unlike the RAM-only R041 command
+interpreter, every individual command mounts the selected real block volume
+and rereads committed metadata. The service never formats a device.
+
+Adversarial Rust regressions use two independently provisioned disk
+partitions, write different contents at the same absolute VFS pathname,
+rename and remount, verify untouched MBR/neighbor/gap sectors, reject stale
+process generation, invalid partition index and corrupt media, and
+simulate a failed COW sector write with committed-file recovery. These are
+real \`BlockDevice\` sector operations in host tests, not a live QEMU
+keyboard or true syscall proof.
+
+**Status: G1 and G2 remain OPEN.** This kernel service does not yet connect
+to actual ring-3 keyboard IRQ/syscall ingress, does not qualify physical
+disks, and does not establish a GUI screenshot/reboot acceptance. Run
+\`cargo test --offline --manifest-path rust/kernel_core/Cargo.toml
+m1_selected_partition_\` plus all M1, no_std, security and QEMU CI against
+the exact integration SHA. Never promote the milestone checkbox based on
+host tests alone.
