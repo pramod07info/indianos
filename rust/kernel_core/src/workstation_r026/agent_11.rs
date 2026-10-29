@@ -35,7 +35,7 @@ pub fn redirect<const F:usize>(fs:&mut RamFs<F>,owner:Identity,
 pub fn output_size<const F:usize>(fs:&RamFs<F>,source:&[u8],
  command:builtins::Command,param:&[u8])->Result<usize,Error>{
  let mut out=[0u8;CONTENT_MAX];
- builtins::run(fs,source,command,param,&mut out)
+ builtins::run(fs,source,command,param,&mut out).map_err(Error::from)
 }
 #[cfg(test)]mod tests{
  use super::*;fn owner()->Identity{Identity{pid:7,generation:1}}
