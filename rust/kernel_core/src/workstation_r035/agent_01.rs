@@ -1,0 +1,5 @@
+//! R035/01 — Owner-scoped project command session. Kernel-side implementation over actual RamFs/state.
+use super::Error;
+use crate::batch7_ramfs::{RamFs,CONTENT_MAX};
+pub struct Session{owner:u64,generation:u64,root:[u8;96],len:usize}impl Session{pub fn new(owner:u64,generation:u64,root:&[u8])->Result<Self,Error>{if owner==0||generation==0||root.len()<2||root.len()>96||root[0]!=b'/'||root.ends_with(b"/"){return Err(Error::Invalid);}let mut p=[0;96];p[..root.len()].copy_from_slice(root);Ok(Self{owner,generation,root:p,len:root.len()})}pub fn authorize(&self,owner:u64,generation:u64,path:&[u8])->Result<(),Error>{if self.owner!=owner||self.generation!=generation||owner==0{return Err(Error::Denied);}if !path.starts_with(&self.root[..self.len])||path.get(self.len)!=Some(&b'/')||path.contains(&0)||path.windows(2).any(|p|p==b".."){return Err(Error::Denied);}Ok(())}}
+#[cfg(test)]mod tests{use super::*;#[test]fn real_workflow_and_failure_guard(){let s=Session::new(7,1,b"/projects/demo").unwrap();assert_eq!(s.authorize(7,1,b"/projects/demo/src/main.rs"),Ok(()));assert_eq!(s.authorize(8,1,b"/projects/demo/src/main.rs"),Err(Error::Denied));}}
