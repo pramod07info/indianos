@@ -7,6 +7,7 @@ use crate::block::BlockDevice;
 use crate::durablefs::{FsError, MAX_FILE_BYTES};
 use crate::hier_vfs::HierVfs;
 use crate::vfs_path::normalize_absolute;
+use crate::fs_write_guard::WriteGuard;
 
 pub const EDITOR_PATH_MAX: usize = 24;
 
@@ -147,10 +148,34 @@ impl DiskEditor {
         self.authorize(caller)?;
         if fs.generation() != self.baseline { return Err(Error::Stale); }
         if self.dirty {
+            // This direct Editor path bypasses FileHandles' S0 write guard.
+            // Deny OS/recovery/key namespaces before any durable COW write.
+            WriteGuard::allow_path(self.pathname()).map_err(|_|Error::Unauthorized)?;
             fs.overwrite(self.pathname(), &self.data[..self.used])?;
             self.baseline = fs.generation();
             self.dirty = false;
         }
+        Ok(self.baseline)
+    }
+    /// Save current edits as a separate durable file without replacing the
+    /// original or bypassing reserved OS paths. A failed create does not
+    /// change the editor's original path, data, dirty flag or history.
+    pub fn save_as<D:BlockDevice>(&mut self,caller:Identity,
+        fs:&mut HierVfs<D>,destination:&str)->Result<u64,Error>{
+        self.authorize(caller)?;
+        if fs.generation()!=self.baseline {return Err(Error::Stale);}
+        let mut normalized=[0u8;EDITOR_PATH_MAX];
+        let n=normalize_absolute(destination,&mut normalized)
+            .map_err(|_|Error::Invalid)?;
+        if n<2 || n>EDITOR_PATH_MAX {return Err(Error::Invalid);}
+        let destination=core::str::from_utf8(&normalized[..n])
+            .map_err(|_|Error::Invalid)?;
+        WriteGuard::allow_path(destination).map_err(|_|Error::Unauthorized)?;
+        if destination==self.pathname() {return Err(Error::Invalid);}
+        fs.create(destination,&self.data[..self.used])?;
+        self.path=normalized;self.path_len=n;
+        self.baseline=fs.generation();self.dirty=false;
+        self.undo=None;self.redo=None;
         Ok(self.baseline)
     }
     /// Explicit conflict resolution: discard local changes and reread
@@ -353,6 +378,59 @@ mod tests {
         assert_eq!(e.redo(owner()),Err(Error::Invalid));
         e.reload(owner(),&mut fs).unwrap();
         assert_eq!(e.undo(owner()),Err(Error::Invalid));
+    }
+
+    #[test]
+    fn r040_reserved_os_namespaces_cannot_be_modified_by_editor(){
+        let mut fs=volume();
+        fs.mkdir("/system").unwrap();
+        fs.create("/system/secret",b"trusted").unwrap();
+        let mut editor=DiskEditor::new();
+        editor.open(owner(),&mut fs,"/system/secret").unwrap();
+        editor.append(owner(),b" tampered").unwrap();
+        let generation=fs.generation();
+        assert_eq!(editor.save(owner(),&mut fs),Err(Error::Unauthorized));
+        assert_eq!(editor.save_as(owner(),&mut fs,"/boot/init"),Err(Error::Unauthorized));
+        assert_eq!(fs.generation(),generation);
+        let mut bytes=[0u8;32];
+        assert_eq!(fs.read("/system/secret",&mut bytes),Ok(7));
+        assert_eq!(&bytes[..7],b"trusted");
+        assert!(editor.status(owner()).unwrap().dirty);
+    }
+    #[test]
+    fn r040_save_as_preserves_source_and_commits_new_document_after_remount(){
+        let mut fs=volume();let mut editor=DiskEditor::new();
+        editor.open(owner(),&mut fs,"/source.rs").unwrap();
+        editor.append(owner(),b" new").unwrap();
+        assert_eq!(editor.save_as(other(),&mut fs,"/copy.rs"),Err(Error::Unauthorized));
+        assert_eq!(editor.save_as(owner(),&mut fs,"/source.rs"),Err(Error::Invalid));
+        editor.save_as(owner(),&mut fs,"/copy.rs").unwrap();
+        assert!(!editor.status(owner()).unwrap().dirty);
+        assert_eq!(editor.undo(owner()),Err(Error::Invalid));
+        editor.close(owner(),false).unwrap();
+        let mut fs=HierVfs::mount(fs.into_device()).unwrap();
+        let mut a=[0;32];let mut b=[0;32];
+        assert_eq!(fs.read("/source.rs",&mut a),Ok(12));
+        assert_eq!(&a[..12],b"fn main() {}");
+        assert_eq!(fs.read("/copy.rs",&mut b),Ok(16));
+        assert_eq!(&b[..16],b"fn main() {} new");
+    }
+    #[test]
+    fn r040_failed_save_as_is_atomic_for_existing_and_stale_destinations(){
+        let mut fs=volume();
+        fs.create("/exists.rs",b"safe").unwrap();
+        let mut editor=DiskEditor::new();
+        editor.open(owner(),&mut fs,"/source.rs").unwrap();
+        editor.append(owner(),b"!").unwrap();
+        let generation=fs.generation();
+        assert_eq!(editor.save_as(owner(),&mut fs,"/exists.rs"),
+            Err(Error::Filesystem(FsError::Exists)));
+        assert_eq!(fs.generation(),generation);
+        let mut bytes=[0;32];
+        assert_eq!(editor.read(owner(),&mut bytes),Ok(13));
+        assert_eq!(&bytes[..13],b"fn main() {}!");
+        fs.overwrite("/exists.rs",b"external").unwrap();
+        assert_eq!(editor.save_as(owner(),&mut fs,"/new.rs"),Err(Error::Stale));
     }
 
 }

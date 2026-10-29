@@ -54,6 +54,9 @@ pub struct Desktop<D:BlockDevice,const P:usize,const E:usize,
  pub volume:HierVfs<D>,
  pub surface:Surfaces<Q>,
  pub input:InputLine,
+ // Session-bound last successful command and the draft before recall.
+ history:[u8;MAX_LINE],history_len:usize,
+ draft:[u8;MAX_LINE],draft_len:usize,history_active:bool,
  owner:Option<Identity>,
  window:u32,
  // Authenticated PS/2 modifier state, reset on each desktop session.
@@ -69,6 +72,8 @@ impl<D:BlockDevice,const P:usize,const E:usize,const W:usize,
  pub fn from_mounted(volume:HierVfs<D>)->Self{
   Self{boot:Bootstrap::new(),rights:Access::new(),volume,
    surface:Surfaces::new(),input:InputLine::new(),owner:None,
+   history:[0;MAX_LINE],history_len:0,
+   draft:[0;MAX_LINE],draft_len:0,history_active:false,
    window:0,shift_left:false,shift_right:false,redraw_pending:false}
  }
  pub fn start(&mut self,init:Identity,init_image:Launch,
@@ -105,10 +110,17 @@ impl<D:BlockDevice,const P:usize,const E:usize,const W:usize,
    .map_err(|e|Error::Boot(BootError::Session(e)))?;
   self.owner=Some(user);self.window=window;
   self.shift_left=false;self.shift_right=false;self.redraw_pending=false;
+  self.forget_history();
   // A newly started desktop needs its first frame even with no keystrokes.
   // The compositor consumes this owner-bound damage during normal startup.
   self.request_redraw(user)?;
   Ok(())
+ }
+ /// Confidential input history is transient and must never survive a
+ /// process restart, a recycled PID or a different user's desktop.
+ fn forget_history(&mut self){
+  self.history.fill(0);self.history_len=0;
+  self.draft.fill(0);self.draft_len=0;self.history_active=false;
  }
  /// Coalesce full-window updates until the compositor drains the pending
  /// event. Input remains bounded by InputLine; pending damage is owned by
@@ -145,7 +157,13 @@ impl<D:BlockDevice,const P:usize,const E:usize,const W:usize,
   match self.input.feed(key,&mut line).map_err(Error::Keyboard)?{
    KeyEvent::Submitted(n)=>{
     match self.execute(caller,now,&line[..n],out){
-     Ok(n)=>Ok(Some(n)),
+     Ok(result_bytes)=>{
+      self.history.fill(0);
+      self.history[..n].copy_from_slice(&line[..n]);
+      self.history_len=n;self.history_active=false;
+      self.draft.fill(0);self.draft_len=0;
+      Ok(Some(result_bytes))
+     },
      Err(error)=>{
       // Only Terminal-level failures are safely retryable. A graphical
       // redraw error might occur AFTER the file write actually committed.
@@ -160,6 +178,7 @@ impl<D:BlockDevice,const P:usize,const E:usize,const W:usize,
     }
    },
    KeyEvent::Typed|KeyEvent::Erased=>{
+    self.history_active=false;
     self.request_redraw(caller)?;
     Ok(None)
    },
@@ -187,6 +206,32 @@ impl<D:BlockDevice,const P:usize,const E:usize,const W:usize,
    _=>{},
   }
   if !event.pressed{return Ok(None);}
+  // Only the focused kernel-authenticated PS/2 input may recall or restore
+  // a Terminal command. The draft is not lost by a history Up/Down cycle.
+  if event.scan_code==0x48 {
+   if self.history_len>0 {
+    if !self.history_active {
+     self.draft.fill(0);
+     self.draft_len=self.input.length();
+     self.draft[..self.draft_len].copy_from_slice(self.input.bytes());
+    }
+    self.input.set_line(&self.history[..self.history_len])
+      .map_err(Error::Keyboard)?;
+    self.history_active=true;
+    self.request_redraw(owner)?;
+   }
+   return Ok(None);
+  }
+  if event.scan_code==0x50 {
+   if self.history_active {
+    self.input.set_line(&self.draft[..self.draft_len])
+      .map_err(Error::Keyboard)?;
+    self.history_active=false;
+    self.draft.fill(0);self.draft_len=0;
+    self.request_redraw(owner)?;
+   }
+   return Ok(None);
+  }
   let ch=ascii_from_set1(event.scan_code,self.shift_left||self.shift_right)
     .ok_or(Error::Keyboard(KeyError::Invalid))?;
   self.key(owner,now,ch,out)
@@ -206,7 +251,7 @@ impl<D:BlockDevice,const P:usize,const E:usize,const W:usize,
   self.boot.process_exited(identity).map_err(Error::Boot)?;
   self.surface.retire(identity);
   self.rights.revoke(identity).map_err(Error::Auth)?;
-  self.input.reset();
+  self.input.reset();self.forget_history();
   self.owner=None;
   self.window=0;
   self.shift_left=false;self.shift_right=false;self.redraw_pending=false;
@@ -240,7 +285,8 @@ impl<D:BlockDevice,const P:usize,const E:usize,const W:usize,
    return Err(error);
   }
   self.owner=Some(identity);self.window=window;
-  self.input.reset();self.shift_left=false;self.shift_right=false;
+  self.input.reset();self.forget_history();
+  self.shift_left=false;self.shift_right=false;
   self.redraw_pending=false;
   self.request_redraw(identity)?;
   Ok(())
@@ -264,7 +310,8 @@ impl<D:BlockDevice,const P:usize,const E:usize,const W:usize,
   self.surface.retire(caller);
   self.rights.revoke(caller).map_err(Error::Auth)?;
   self.boot.process_exited(caller).map_err(Error::Boot)?;
-  self.input.reset();self.owner=None;self.window=0;
+  self.input.reset();self.forget_history();
+  self.owner=None;self.window=0;
   self.shift_left=false;self.shift_right=false;
   self.redraw_pending=false;Ok(())
  }
@@ -342,6 +389,27 @@ mod tests{
   let mut out=[0u8;256];
   assert_eq!(gui.key(user(2),1,b'\n',&mut out),Ok(Some(7)));
   assert_eq!(gui.input.length(),0);
+ }
+ #[test]fn r040_keyboard_up_down_recalls_last_command_and_preserves_draft(){
+  let disk=Disk{data:[[0u8;SECTOR_BYTES];SECTORS]};
+  let mut gui=TestDesk::from_mounted(HierVfs::format_blank(disk).unwrap());
+  gui.start(user(1),load(1),user(2),load(2),settings(),8,99).unwrap();
+  let mut out=[0u8;256];
+  for &ch in b"pwd"{gui.key(user(2),1,ch,&mut out).unwrap();}
+  assert_eq!(gui.key(user(2),1,b'\n',&mut out),Ok(Some(1)));
+  for &ch in b"cat"{gui.key(user(2),1,ch,&mut out).unwrap();}
+  assert_eq!(gui.input.bytes(),b"cat");
+  assert_eq!(gui.physical_key(1,0x48,true,&mut out),Ok(None));
+  assert_eq!(gui.input.bytes(),b"pwd");
+  assert_eq!(gui.physical_key(1,0x50,true,&mut out),Ok(None));
+  assert_eq!(gui.input.bytes(),b"cat");
+  assert_eq!(gui.physical_key(1,0x48,true,&mut out),Ok(None));
+  assert_eq!(gui.input.bytes(),b"pwd");
+  assert_eq!(gui.physical_key(1,0x48,false,&mut out),Ok(None));
+  assert_eq!(gui.input.bytes(),b"pwd");
+  gui.exit(user(2)).unwrap();
+  assert_eq!(gui.history_len,0);
+  assert!(gui.input.bytes().is_empty());
  }
  #[test]fn authenticated_keyboard_enters_persistent_commands(){
   let disk=Disk{data:[[0u8;SECTOR_BYTES];SECTORS]};
@@ -642,6 +710,26 @@ impl<D:BlockDevice,const P:usize,const E:usize,const W:usize,
   self.admit_editor(caller,now,FILE_WRITE)?;
   editor.replace(caller,start,end,bytes).map_err(EditorRouteError::Editor)
  }
+ /// An expired grant or stale PID must not undo protected editor bytes.
+ pub fn editor_undo(&mut self,caller:Identity,now:u64,
+    editor:&mut crate::m1_disk_editor::DiskEditor
+    )->Result<usize,EditorRouteError>{
+  self.admit_editor(caller,now,FILE_WRITE)?;
+  editor.undo(caller).map_err(EditorRouteError::Editor)
+ }
+ pub fn editor_redo(&mut self,caller:Identity,now:u64,
+    editor:&mut crate::m1_disk_editor::DiskEditor
+    )->Result<usize,EditorRouteError>{
+  self.admit_editor(caller,now,FILE_WRITE)?;
+  editor.redo(caller).map_err(EditorRouteError::Editor)
+ }
+ /// Save a distinct named source file via the authenticated mounted volume.
+ pub fn editor_save_as(&mut self,caller:Identity,now:u64,
+    editor:&mut crate::m1_disk_editor::DiskEditor,target:&str
+    )->Result<u64,EditorRouteError>{
+  self.admit_editor(caller,now,FILE_WRITE)?;
+  editor.save_as(caller,&mut self.volume,target).map_err(EditorRouteError::Editor)
+ }
  pub fn editor_save(&mut self,caller:Identity,now:u64,
     editor:&mut crate::m1_disk_editor::DiskEditor)
     ->Result<u64,EditorRouteError>{
@@ -723,6 +811,15 @@ impl<D:BlockDevice,const P:usize,const E:usize,const W:usize,
   self.admit_editor(caller,now,FILE_WRITE).map_err(ProjectRouteError::Permission)?;
   project.save_file(caller,&mut self.volume,name,data).map_err(ProjectRouteError::Project)
  }
+ /// Route durable literal replacement through the current Desktop owner,
+ /// expiry and FILE_WRITE grant, not untrusted project-supplied PID values.
+ pub fn project_replace_all(&mut self,caller:Identity,now:u64,
+    project:&mut crate::m1_project_workspace::ProjectTree,
+    file:&str,find:&str,replacement:&str)->Result<usize,ProjectRouteError>{
+  self.admit_editor(caller,now,FILE_WRITE).map_err(ProjectRouteError::Permission)?;
+  project.replace_all(caller,&mut self.volume,file,find,replacement)
+   .map_err(ProjectRouteError::Project)
+ }
  pub fn project_rename_file(&mut self,caller:Identity,now:u64,
     project:&mut crate::m1_project_workspace::ProjectTree,
     old:&str,new:&str)->Result<(),ProjectRouteError>{
@@ -803,6 +900,44 @@ mod r019_project_desktop_integration_tests {
   let mut data=[0u8;32];
   assert_eq!(remounted.read("/work/next/main",&mut data),Ok(5));
   assert_eq!(&data[..5],b"hello");
+ }
+ #[test]fn r040_desktop_editor_routes_undo_redo_save_as_persist_to_disk(){
+  let mut fs=HierVfs::format_blank(Disk{data:[[0;SECTOR_BYTES];100]}).unwrap();
+  fs.create("/source.rs",b"old").unwrap();
+  let mut desk=TestDesk::from_mounted(fs);
+  desk.start(identity(1),image(1),identity(2),image(2),settings(),8,50).unwrap();
+  let mut editor=crate::m1_disk_editor::DiskEditor::new();
+  desk.editor_open(identity(2),1,&mut editor,"/source.rs").unwrap();
+  assert_eq!(desk.editor_replace(identity(2),1,&mut editor,0,3,b"new"),Ok(3));
+  assert_eq!(desk.editor_undo(identity(2),1,&mut editor),Ok(3));
+  assert_eq!(desk.editor_redo(identity(2),1,&mut editor),Ok(3));
+  assert!(desk.editor_save_as(Identity{pid:2,generation:2},1,
+      &mut editor,"/copy.rs").is_err());
+  desk.editor_save_as(identity(2),1,&mut editor,"/copy.rs").unwrap();
+  let mut fs=HierVfs::mount(desk.into_device()).unwrap();
+  let mut out=[0;16];
+  assert_eq!(fs.read("/source.rs",&mut out),Ok(3));
+  assert_eq!(&out[..3],b"old");
+  assert_eq!(fs.read("/copy.rs",&mut out),Ok(3));
+  assert_eq!(&out[..3],b"new");
+ }
+ #[test]fn r040_project_replace_all_checks_expiry_pid_and_disk_persistence(){
+  let fs=HierVfs::format_blank(Disk{data:[[0;SECTOR_BYTES];100]}).unwrap();
+  let mut desk=TestDesk::from_mounted(fs);
+  desk.start(identity(1),image(1),identity(2),image(2),settings(),8,5).unwrap();
+  let mut p=ProjectTree::new();
+  desk.project_create(identity(2),1,&mut p,"demo").unwrap();
+  desk.project_create_file(identity(2),1,&mut p,"code",b"abc abc").unwrap();
+  assert!(desk.project_replace_all(identity(2),5,&mut p,
+      "code","abc","xyz").is_err());
+  assert!(desk.project_replace_all(Identity{pid:2,generation:2},1,&mut p,
+      "code","abc","xyz").is_err());
+  assert_eq!(desk.project_replace_all(identity(2),1,&mut p,
+      "code","abc","xyz"),Ok(2));
+  let mut fs=HierVfs::mount(desk.into_device()).unwrap();
+  let mut out=[0;16];
+  assert_eq!(fs.read("/work/demo/code",&mut out),Ok(7));
+  assert_eq!(&out[..7],b"xyz xyz");
  }
  #[test]fn expired_capability_rejects_mutation_before_disk_write(){
   let fs=HierVfs::format_blank(Disk{data:[[0;SECTOR_BYTES];100]}).unwrap();

@@ -26,6 +26,9 @@ jobs:
       - name: Execute M1 MBR/GPT partition parser, remount and Terminal tests
         run: |
           cargo test --offline --manifest-path rust/kernel_core/Cargo.toml --features test-r031-vfs m1_
+          # R040: fail CI if the new security, desktop routing or input
+          # history tests fail; the legacy m1_ filter alone would skip them.
+          cargo test --offline --manifest-path rust/kernel_core/Cargo.toml --features test-r031-vfs r040_
       - name: Build M1 durable VFS service interfaces in no_std mode
         run: |
           cargo check --offline --manifest-path rust/kernel_core/Cargo.toml --no-default-features --features test-r031-vfs

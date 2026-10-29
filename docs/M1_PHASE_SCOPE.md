@@ -192,3 +192,32 @@ Four new regression tests cover owner generation, bounds, no-op replacement,
 remount persistence and undo/redo. Existing tests and QEMU checks remain
 mandatory. This is service logic, not proof of live ring-3 IDE/compositor.
 No claim of twenty concurrent coding agents or completion of M1 gates.
+
+
+### R040 M1 workstation service integration (2026-10-29)
+
+This batch changes three Rust production modules, the M1 CI acceptance
+workflow, and this ledger. It is one consolidated commit; no placeholder
+agent source files or 20 concurrently executing agents are claimed.
+
+- Authenticated editor: direct DiskEditor save now protects OS, boot,
+  firmware, recovery and key namespaces. Save As commits a separate file
+  through a mounted COW HierVfs only if generation, identity, path and
+  destination existence checks pass. Failed saves retain the user's dirty
+  editor bytes and leave original disk files untouched.
+- Desktop source editing: live PID generation and unexpired FILE_WRITE
+  capability are mandatory for undo, redo, Save As, and UTF-8 project
+  source replace-all. The replacement is a single-file COW transaction,
+  not a multi-file atomic edit.
+- Keyboard history: trusted focused PS/2 Up and Down arrow codes recall
+  the last successfully executed Terminal command and restore a draft.
+  History is scrubbed on exit, process fault or restart.
+- Tests: seven new R040 regressions cover identities, protected paths,
+  duplicate target, disk remount, bounds, keyboard history and expiry.
+  The M1 CI workflow explicitly runs both existing m1_ tests and new
+  r040_ tests; mandatory no_std, security and QEMU checks remain enabled.
+
+M1 accepted milestone gates remain unchanged. The real normal-boot
+ring-3 compositor and user Terminal, IRQ-to-disk filesystem read-after-
+reboot, physical hardware and recovery acceptance remain open under
+the M1-first directive in issue #616.
