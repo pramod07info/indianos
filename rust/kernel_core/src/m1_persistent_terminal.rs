@@ -236,6 +236,35 @@ pub fn command<D:BlockDevice,const N:usize>(
  }
 }
 
+
+/// Execute a bounded, authenticated Terminal command against an explicitly
+/// selected existing on-disk MBR/GPT partition. This is the G1/G2 kernel
+/// service bridge, not yet a ring-3 syscall or keyboard driver.
+///
+/// The partition parser verifies all GPT metadata and rejects hybrid media.
+/// BlockWindow confines durable VFS writes to the selected partition; no
+/// disk is ever formatted here. A new mount for each command provides a
+/// genuine metadata reload, rather than a RAM-only file snapshot.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum PartitionCommandError {
+ Mount(crate::m1_partition::MountError),
+ Command(Error),
+}
+pub fn command_on_partition<D:BlockDevice,const N:usize>(
+ disk:&mut D,selected_index:u32,auth:&Access<N>,caller:Identity,
+ now:u64,input:&[u8],out:&mut[u8],
+)->Result<usize,PartitionCommandError>{
+ // Reject obviously untrusted identities before touching device metadata.
+ // Fine-grained command rights are still enforced by command() itself.
+ if caller.pid==0||caller.generation==0{
+  return Err(PartitionCommandError::Command(Error::Denied));
+ }
+ let mut volume=crate::m1_partition::mount(disk,selected_index)
+  .map_err(PartitionCommandError::Mount)?;
+ command(&mut volume,auth,caller,now,input,out)
+  .map_err(PartitionCommandError::Command)
+}
+
 #[cfg(test)]
 mod tests{
  use super::*;
@@ -705,4 +734,132 @@ mod tests{
   assert_eq!(fs.read("/copy",&mut out),Err(FsError::NotFound));
  }
 
+}
+
+
+// M1 G1/G2: actual block-device partitions, not a simulated RAM namespace.
+// All remounts reconstruct VFS metadata from the selected disk sectors.
+#[cfg(test)]
+mod m1_partition_terminal_integration_tests {
+ use super::*;
+ use crate::block::{BlockWindow,BlockError,SECTOR_BYTES};
+ use crate::m1_partition::{Error as PartError,MountError,Partition,Scheme};
+
+ const SECTORS:usize=256;
+ const FIRST_START:u64=10;
+ const SECOND_START:u64=120;
+ const LENGTH:u64=100;
+ struct Disk {
+  sectors:[[u8;SECTOR_BYTES];SECTORS],
+  writes:usize,
+  fail_at:Option<usize>,
+ }
+ impl BlockDevice for Disk {
+  fn sector_count(&self)->u64{SECTORS as u64}
+  fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{
+   *out=*self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?;
+   Ok(())
+  }
+  fn write_sector(&mut self,lba:u64,bytes:&[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{
+   if self.fail_at==Some(self.writes){return Err(BlockError::Io);}
+   *self.sectors.get_mut(lba as usize).ok_or(BlockError::OutOfRange)?= *bytes;
+   self.writes+=1;
+   Ok(())
+  }
+ }
+ fn disk()->Disk{
+  let mut d=Disk{sectors:[[0;SECTOR_BYTES];SECTORS],writes:0,fail_at:None};
+  d.sectors[0][510]=0x55;
+  d.sectors[0][511]=0xaa;
+  for (slot,start) in [(0usize,FIRST_START),(1usize,SECOND_START)]{
+   let off=446+slot*16;
+   d.sectors[0][off+4]=0x83;
+   d.sectors[0][off+8..off+12].copy_from_slice(&(start as u32).to_le_bytes());
+   d.sectors[0][off+12..off+16].copy_from_slice(&(LENGTH as u32).to_le_bytes());
+  }
+  // Explicit test provisioning. The production command API never formats.
+  for start in [FIRST_START,SECOND_START]{
+   let window=BlockWindow::new(&mut d,start,LENGTH).unwrap();
+   let mut volume=HierVfs::format_blank(window).unwrap();
+   volume.mkdir("/home").unwrap();
+  }
+  d
+ }
+ fn owner()->Identity{Identity{pid:3,generation:7}}
+ fn access()->Access<1>{
+  let mut a=Access::new();
+  a.grant(owner(),FILE_READ|FILE_WRITE,100).unwrap();
+  a
+ }
+ fn exec(d:&mut Disk,index:u32,actor:Identity,command_bytes:&[u8])
+  ->Result<(usize,[u8;MAX_TRANSFER]),PartitionCommandError>{
+  let mut out=[0xa5;MAX_TRANSFER];
+  let n=command_on_partition(d,index,&access(),actor,1,command_bytes,&mut out)?;
+  Ok((n,out))
+ }
+ #[test]
+ fn m1_selected_partition_terminal_commands_survive_remount_and_are_isolated(){
+  let mut d=disk();
+  let metadata=d.sectors[0];
+  let gap=d.sectors[110];
+  let untouched=d.sectors[220];
+  let (n,out)=exec(&mut d,0,owner(),b"write /home/note first").unwrap();
+  assert_eq!(&out[..n],b"saved");
+  exec(&mut d,1,owner(),b"write /home/note second").unwrap();
+  let (n,a)=exec(&mut d,0,owner(),b"cat /home/note").unwrap();
+  assert_eq!(&a[..n],b"first");
+  let (n,b)=exec(&mut d,1,owner(),b"cat /home/note").unwrap();
+  assert_eq!(&b[..n],b"second");
+  exec(&mut d,0,owner(),b"mv /home/note /home/moved").unwrap();
+  let (n,a)=exec(&mut d,0,owner(),b"cat /home/moved").unwrap();
+  assert_eq!(&a[..n],b"first");
+  let (n,b)=exec(&mut d,1,owner(),b"cat /home/note").unwrap();
+  assert_eq!(&b[..n],b"second");
+  assert_eq!(d.sectors[0],metadata);
+  assert_eq!(d.sectors[110],gap);
+  assert_eq!(d.sectors[220],untouched);
+ }
+ #[test]
+ fn m1_selected_partition_denied_identity_corruption_and_bad_index_cannot_write(){
+  let mut d=disk();
+  let before=d.writes;
+  let stale=Identity{generation:8,..owner()};
+  let mut output=[0xa5;16];
+  assert_eq!(command_on_partition(&mut d,0,&access(),stale,1,
+   b"write /home/evil denied",&mut output),
+   Err(PartitionCommandError::Command(Error::Denied)));
+  assert_eq!(d.writes,before);
+  assert_eq!(output,[0xa5;16]);
+  assert_eq!(command_on_partition(&mut d,0,&access(),Identity{pid:0,generation:7},
+   1,b"cat /home/note",&mut output),
+   Err(PartitionCommandError::Command(Error::Denied)));
+  assert_eq!(command_on_partition(&mut d,2,&access(),owner(),1,
+   b"write /home/evil denied",&mut output),
+   Err(PartitionCommandError::Mount(MountError::Partition(PartError::NotFound))));
+  assert_eq!(d.writes,before);
+  d.sectors[0][510]=0;
+  assert_eq!(command_on_partition(&mut d,0,&access(),owner(),1,
+   b"write /home/evil denied",&mut output),
+   Err(PartitionCommandError::Mount(MountError::Partition(PartError::Invalid))));
+  assert_eq!(d.writes,before);
+ }
+ #[test]
+ fn m1_selected_partition_power_cut_keeps_previous_committed_file(){
+  let mut d=disk();
+  exec(&mut d,0,owner(),b"write /home/note stable").unwrap();
+  // Every command remounts its selected window; fail a COW sector write.
+  d.fail_at=Some(d.writes+1);
+  let mut response=[0x66;16];
+  assert_eq!(command_on_partition(&mut d,0,&access(),owner(),1,
+   b"write /home/note corrupted",&mut response),
+   Err(PartitionCommandError::Command(Error::Io(FsError::Io))));
+  assert_eq!(response,[0x66;16]);
+  d.fail_at=None;
+  let (n,out)=exec(&mut d,0,owner(),b"cat /home/note").unwrap();
+  assert_eq!(&out[..n],b"stable");
+  assert_eq!(exec(&mut d,1,owner(),b"cat /home/note"),
+   Err(PartitionCommandError::Command(Error::Io(FsError::NotFound))));
+ }
 }
