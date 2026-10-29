@@ -44,7 +44,7 @@ pub fn smoke()->Result<(),Error>{
  let mut env=agent_10::Env::<2>::new(owner);
  env.set(owner,b"PROJECT",b"/p")?;
  let mut expanded=[0u8;32];
- let n=env.expand(owner,b"\${PROJECT}/a.rs",&mut expanded)?;
+ let n=env.expand(owner,b"${PROJECT}/a.rs",&mut expanded)?;
  if &expanded[..n]!=b"/p/a.rs"{return Err(Error::Conflict);}
  let writer=ticket::grant(true,owner,&fs,b"/p",ticket::WRITE,100)?;
  let version=fs.version();
@@ -101,7 +101,7 @@ pub fn smoke()->Result<(),Error>{
   let fs=RamFs::<1>::new();
   let ticket=ticket::grant(true,actor,&fs,b"/p",ticket::READ,10).unwrap();
   assert_eq!(ticket::authorize(ticket,actor,1,ticket::READ,b"/q/main"),
-   Err(ticket::Error::Denied));
+   Err(crate::workstation_r025::Error::Denied));
  }
  #[test]fn failed_atomic_source_copy_keeps_all_original_files(){
   let mut fs=RamFs::<2>::new();
