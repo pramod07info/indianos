@@ -49,6 +49,8 @@ pub mod workstation_r031;
 pub mod workstation_r032;
 /// R033: 20 workstation core source, terminal, debugger and UI safety utilities.
 pub mod workstation_r033;
+/// R034: twenty integrated developer workstation state and workflow modules.
+pub mod workstation_r034;
 mod syscall;
 mod program;
 mod initramfs;

@@ -1,0 +1,4 @@
+//! R034/19: Workspace panel focus and visibility registry.
+use super::Error;
+pub struct Panels{owner:u32,shown:u32,focused:u8}impl Panels{pub fn new(owner:u32)->Self{Self{owner,shown:1,focused:0}}pub fn show(&mut self,owner:u32,id:u8)->Result<(),Error>{if owner!=self.owner||owner==0{return Err(Error::Denied);}if id>=16{return Err(Error::Invalid);}self.shown|=1<<id;self.focused=id;Ok(())}pub fn hide(&mut self,owner:u32,id:u8)->Result<(),Error>{if owner!=self.owner{return Err(Error::Denied);}if id>=16||self.focused==id{return Err(Error::Conflict);}self.shown&=!(1<<id);Ok(())}pub fn focused(&self)->u8{self.focused}}
+#[cfg(test)] mod tests {use super::*;#[test]fn functional_and_boundary_cases(){let mut p=Panels::new(7);p.show(7,2).unwrap();assert_eq!(p.focused(),2);assert_eq!(p.hide(7,2),Err(Error::Conflict));}}

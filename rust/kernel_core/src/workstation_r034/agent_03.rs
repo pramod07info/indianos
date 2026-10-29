@@ -1,0 +1,4 @@
+//! R034/03: Project tree hierarchical path grouping.
+use super::Error;
+pub fn parent(path:&[u8],out:&mut[u8])->Result<usize,Error>{if path.len()<3||path[0]!=b'/'||path.ends_with(b"/")||path.windows(2).any(|b|b==b".."){return Err(Error::Invalid);}let p=path.iter().rposition(|b|*b==b'/').ok_or(Error::Invalid)?;if p==0{return Err(Error::Invalid);}if p>out.len(){return Err(Error::Full);}out[..p].copy_from_slice(&path[..p]);Ok(p)}pub fn depth(path:&[u8])->Result<usize,Error>{if path.is_empty()||path[0]!=b'/'{return Err(Error::Invalid);}Ok(path.iter().filter(|&&b|b==b'/').count())}
+#[cfg(test)] mod tests {use super::*;#[test]fn functional_and_boundary_cases(){let mut out=[0;32];let n=parent(b"/p/src/main.rs",&mut out).unwrap();assert_eq!(&out[..n],b"/p/src");assert_eq!(depth(b"/p/src/main.rs"),Ok(3));}}
