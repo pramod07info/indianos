@@ -36,6 +36,11 @@ fn mouse_command(byte:u8)->bool{
     if !command(0xd4) || !payload(byte){return false;}
     read_reply()==Some(0xfa)
 }
+/// PS/2 OBF must belong to the auxiliary mouse and have no controller
+/// parity/timeout flag. The keyboard broker owns primary-port bytes.
+fn valid_mouse_status(status:u8)->bool{
+    status&0x21==0x21&&status&0xc0==0
+}
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 pub(crate) struct Packet{pub dx:i16,pub dy:i16,pub left:bool}
 pub(crate) struct Mouse {
@@ -58,8 +63,16 @@ impl Mouse{
     pub(crate) fn poll(&mut self)->Option<Packet>{
         for _ in 0..3{
             let status=unsafe{input(CTRL)};
-            if status&1==0 || status&0x20==0{return None;}
+            // Never steal primary keyboard bytes; they must reach the
+            // independent Set-1 driver even while a partial mouse packet
+            // is queued. Discard and resync only broken AUX transfers.
+            if status&1==0||status&0x20==0{return None;}
             let byte=unsafe{input(DATA)};
+            if !valid_mouse_status(status){
+                self.packet=[0;3];
+                self.received=0;
+                return None;
+            }
             if let Some(packet)=self.feed(byte){return Some(packet);}
         }
         None
@@ -83,6 +96,32 @@ impl Mouse{
 #[cfg(test)]
 mod tests{
     use super::*;
+    #[test]fn m1_r047_primary_keyboard_status_never_claimed_by_mouse(){
+        for status in [0x00,0x01,0x03,0x11,0x80,0x81,0xff]{
+            assert!(!valid_mouse_status(status));
+        }
+        for status in [0x21,0x23,0x31]{
+            assert!(valid_mouse_status(status));
+        }
+    }
+    #[test]fn m1_r047_corrupt_aux_status_is_rejected_before_packet_decode(){
+        for status in [0x61,0xa1,0xe1]{
+            assert!(!valid_mouse_status(status));
+        }
+    }
+    #[test]fn m1_r047_mouse_out_of_sync_bytes_cannot_forge_a_click(){
+        let mut mouse=Mouse{packet:[0;3],received:0,last_left:false};
+        assert_eq!(mouse.feed(0x01),None);
+        assert_eq!(mouse.feed(0x09),None);
+        assert_eq!(mouse.feed(0),None);
+        assert_eq!(mouse.feed(0),Some(Packet{dx:0,dy:0,left:true}));
+        assert_eq!(mouse.feed(0xc9),None); // invalid overflow header
+        assert_eq!(mouse.feed(0),None);
+        assert_eq!(mouse.feed(0),None);
+        assert_eq!(mouse.feed(0x08),None);
+        assert_eq!(mouse.feed(1),None);
+        assert_eq!(mouse.feed(2),Some(Packet{dx:1,dy:2,left:false}));
+    }
     #[test]fn packet_sync_buttons_and_signed_axes(){
         let mut m=Mouse{packet:[0;3],received:0,last_left:false};
         assert_eq!(m.feed(0),None);

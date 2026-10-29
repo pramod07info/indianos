@@ -433,3 +433,74 @@ Evidence status: OPEN until exact PR SHA passes all mandatory Rust, S0 and
 QEMU checks. Do not mark G6 or any other eight outstanding M1 gates complete
 based solely on host-side tests. Full independent ring-3 normal-boot,
 physical device fault tests and fsync/write-barrier audit still pending.
+
+
+### R047 — G5 authentic QEMU PS/2 keyboard and desktop input evidence (2026-10-29)
+
+**M1 completion-first, not a 20-agent factory claim.** The prior graphical
+Files QEMU test accepted only COM1 serial() input for all keyboard
+shortcuts and therefore proved serial control, not guest PS/2 keyboard
+delivery. This batch changes actual native kernel 8042 input and the
+real QEMU test to require a hardware-emulated keyboard transition,
+an authenticated Desktop action and visible framebuffer changes across
+a persistent-disk reboot. The unchanged serial path remains a separate
+control, never an acceptable substitute for the PS/2 gate.
+
+20 scoped engineering and verification deliverables (NOT 20
+independently coding workstations):
+1. Use the native Set-1 PS/2 make-code path in the QEMU acceptance test.
+2. Prove physical keyboard and COM1 serial inputs have different origins.
+3. Increment physical evidence only after an accepted keyboard byte.
+4. Emit a one-time in-kernel physical evidence marker, not a host echo.
+5. Reject controller AUX mouse bytes from the keyboard decoder.
+6. Preserve AUX bytes for the independent PS/2 mouse packet broker.
+7. Reject 8042 controller parity and timeout errors.
+8. Ignore all PS/2 break codes without submitting shortcuts.
+9. Track left Ctrl separately from ordinary key content.
+10. Track right Ctrl through E0-prefixed press/release codes.
+11. Track left Alt independently of printable keys.
+12. Track right Alt with E0 make/break transitions.
+13. Block modified keys from issuing unmodified desktop/Terminal commands.
+14. Consume the E1 Pause/Break sequence without leaving Ctrl stuck.
+15. Accept genuine E0 up/down history navigation and reject releases.
+16. Decode E0 keypad Enter and Slash without leaking extended codes.
+17. Preserve independent left/right Shift and CapsLock semantics.
+18. Prove physical launcher and Files/Terminal focus actions through live
+    ring-3 serial acknowledgments and distinct VGA pixels.
+19. Repeat physical keyboard verification after the same scratch disk
+    is remounted on a second QEMU boot; keep real mouse and file guards.
+20. Exercise physical-key shutdown and retain COM1, Files content, IPC
+    refresh, ring-3 process reaping and neighbor-sector checks.
+
+Production code: rust/kernel_core/src/input.rs (native x86 port-input
+decoder and physical provenance) plus rust/kernel_core/src/ps2_mouse.rs
+(AUX parity/timeout rejection, packet resync and guarded keyboard-vs-mouse
+buffer ownership). Acceptance:
+tools/test_r031_files_gui_qemu.py (HMP sendkey, no COM1 fallback,
+actual framebuffer screendumps), plus mandatory
+.github/workflows/m1-persistent-desktop.yml trigger and R047 host
+regression invocation. The native QEMU test requires the real kernel
+marker "R047 genuine PS2 keyboard byte accepted by kernel input" AFTER
+each boot's physical sendkey, followed by an actual Desktop focus or
+launcher acknowledgment and graphical pixel change. Host-only tests
+cannot masquerade as guest QEMU evidence.
+
+Acceptance limits: This improves G5 evidence but does NOT prove
+IRQ-driven input, a full Terminal command typed by PS/2 into durable
+HierVfs with GUI readback, or independent userspace compositor window
+management. Native QEMU can use single-BSP 8042 polling (not necessarily
+IRQ1); the current automatic Desktop boot remains feature-gated.
+Do not close any of the eight outstanding high-level M1 gates from R047
+alone. No physical host disk devices are opened or modified.
+
+Execution: one integration branch, one squashed commit and one PR.
+Mandatory CI runs seven pure decoder tests plus graphical-feature AUX
+mouse regressions under the real GUI feature set. The QEMU test must
+run its authenticated real-8042 sequence on both boots with the same
+isolated disposable scratch disk. Any missing physical origin marker,
+Desktop action or framebuffer change is a failure, never a serial fallback.
+
+Actual independently executing coding workers launched through this
+GitHub connector: 0. The 20 scoped items are testable work, not
+20 live autonomous programming agents. Exact-head Rust/no_std, M1/QEMU,
+S0 and full kernel boot pass remain required before merge.
