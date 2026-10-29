@@ -10,7 +10,7 @@ pub fn split(screen:Rect,axis:Axis,ratio:u8,min:u16)->Result<Layout,Error>{
   return Err(Error::Invalid);
  }
  let length=if axis==Axis::Horizontal{screen.w}else{screen.h};
- if length as u32<2*min as u32{return Err(Error::Full);}
+ if (length as u32)<2*(min as u32){return Err(Error::Full);}
  let first=(length as u32*ratio as u32/100) as u16;
  if first<min||length-first<min{return Err(Error::Full);}
  if screen.x as u32+screen.w as u32>u16::MAX as u32||
