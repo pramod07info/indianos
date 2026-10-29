@@ -532,6 +532,12 @@ impl<'a,D:BlockDevice,const P:usize,const E:usize,const W:usize,
   selected:m1_partition::Partition)->Result<Self,MountError>{
   m1_partition::mount_checked_healthy(disk,selected).map(Self::from_mounted)
  }
+ /// Strict identity-pinned GPT mount for the durable Developer Desktop.
+ pub fn mount_gpt_identity_selected(disk:&'a mut D,
+  selected:m1_partition::GptSelection)->Result<Self,MountError>{
+  m1_partition::mount_gpt_selected_healthy(disk,selected)
+   .map(Self::from_mounted)
+ }
  pub fn mount_selected(disk:&'a mut D,index:u32)->Result<Self,MountError>{
   m1_partition::mount(disk,index).map(Self::from_mounted)
  }

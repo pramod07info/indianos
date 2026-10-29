@@ -11,6 +11,12 @@ use crate::durablefs::{DurableFs,FsError,VolumeHealth,MIN_SECTORS};
 pub enum Scheme{Mbr,Gpt}
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 pub struct Partition{pub scheme:Scheme,pub index:u32,pub start:u64,pub sectors:u64}
+/// Disk and per-partition GUIDs pin an explicit GPT selection across reboot.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct GptSelection{
+ pub partition:Partition,pub disk_guid:[u8;16],
+ pub unique_partition_guid:[u8;16],
+}
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 pub enum Error{Io,Invalid,Unsupported,NotFound,Overlap,OutOfRange,TooSmall}
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
@@ -23,17 +29,26 @@ pub const MAX_GPT_ENTRIES:usize=128;
 pub struct PartitionSet{
  scheme:Scheme,
  slots:[Option<Partition>;MAX_GPT_ENTRIES],
+ gpt_guids:[[u8;16];MAX_GPT_ENTRIES],disk_guid:[u8;16],
  count:usize,
 }
 impl PartitionSet{
  fn empty(scheme:Scheme)->Self{
-  Self{scheme,slots:[None;MAX_GPT_ENTRIES],count:0}
+  Self{scheme,slots:[None;MAX_GPT_ENTRIES],
+   gpt_guids:[[0;16];MAX_GPT_ENTRIES],disk_guid:[0;16],count:0}
  }
  pub fn scheme(&self)->Scheme{self.scheme}
  pub fn len(&self)->usize{self.count}
  pub fn is_empty(&self)->bool{self.count==0}
  pub fn get(&self,index:u32)->Option<Partition>{
   self.slots.get(index as usize).copied().flatten()
+ }
+ /// MBR has no unique partition GUID; no synthetic GPT identity is supplied.
+ pub fn get_gpt_selection(&self,index:u32)->Option<GptSelection>{
+  if self.scheme!=Scheme::Gpt{return None;}
+  let partition=self.get(index)?;
+  Some(GptSelection{partition,disk_guid:self.disk_guid,
+   unique_partition_guid:*self.gpt_guids.get(index as usize)?})
  }
  /// Iterate only live entries with original indices, in stable disk order.
  pub fn iter(&self)->impl Iterator<Item=Partition>+'_{
@@ -172,12 +187,14 @@ fn gpt<D:BlockDevice>(disk:&mut D)->Result<PartitionSet,Error>{
   let sector=read(disk,backup_table+s as u64)?;
   let n=total.saturating_sub(s*SECTOR_BYTES).min(SECTOR_BYTES);
   backup_crc=crc_update(backup_crc,&sector[..n]);
+  // Equal CRC32 values alone cannot rule out a colliding backup GPT table.
+  let primary=read(disk,table+s as u64)?;
+  if sector[..n]!=primary[..n]{return Err(Error::Invalid);}
  }
  if !backup_crc!=checksum{return Err(Error::Invalid);}
  let mut found=PartitionSet::empty(Scheme::Gpt);
- // GPT unique partition GUIDs identify distinct volumes across reboot.
- // Duplicate GUIDs make per-volume identity ambiguous even with safe LBAs.
- let mut unique_guids=[[0u8;16];MAX_GPT_ENTRIES];
+ found.disk_guid.copy_from_slice(&hdr[56..72]);
+ // Store the identity from the same fully validated layout as its geometry.
  for i in 0..entries{
   let byte=i*entry_size;
   let lba=table+(byte/SECTOR_BYTES) as u64;
@@ -193,7 +210,7 @@ fn gpt<D:BlockDevice>(disk:&mut D)->Result<PartitionSet,Error>{
   if entry[16..32].iter().all(|&v|v==0){return Err(Error::Invalid);}
   // An unused entry has a zero GUID, so checking earlier slots is safe.
   // Forbid duplicated live partition identifiers before selecting a mount.
-  if unique_guids[..i].iter().any(|guid| guid.as_slice()==&entry[16..32]){
+  if found.gpt_guids[..i].iter().any(|guid| guid.as_slice()==&entry[16..32]){
    return Err(Error::Invalid);
   }
   let start=le64(&entry[32..40]);let end=le64(&entry[40..48]);
@@ -203,7 +220,7 @@ fn gpt<D:BlockDevice>(disk:&mut D)->Result<PartitionSet,Error>{
    let prior_end=prior.start+prior.sectors; // already validated below capacity
    if start<prior_end&&prior.start<exclusive{return Err(Error::Overlap);}
   }
-  unique_guids[i].copy_from_slice(&entry[16..32]);
+  found.gpt_guids[i].copy_from_slice(&entry[16..32]);
   found.record(Partition{scheme:Scheme::Gpt,index:i as u32,start,sectors:exclusive-start})?;
  }
  Ok(found)
@@ -241,6 +258,13 @@ fn discover_verified<D:BlockDevice>(disk:&mut D)->Result<PartitionSet,Error>{
 /// Select one existing ordinal only after validating the entire layout.
 pub fn inspect<D:BlockDevice>(disk:&mut D,index:u32)->Result<Partition,Error>{
  discover(disk)?.get(index).ok_or(Error::NotFound)
+}
+/// The disk and partition GUIDs come from a fully read-only GPT validation.
+pub fn inspect_gpt_selection<D:BlockDevice>(disk:&mut D,index:u32)
+ ->Result<GptSelection,Error>{
+ let catalog=discover(disk)?;
+ if catalog.scheme()!=Scheme::Gpt{return Err(Error::Unsupported);}
+ catalog.get_gpt_selection(index).ok_or(Error::NotFound)
 }
 /// Read-only validated disk geometry and independent COW metadata health.
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
@@ -295,6 +319,15 @@ pub fn mount_checked_healthy<'a,D:BlockDevice>(disk:&'a mut D,
 /// Mount previously provisioned IndianOS volume inside an explicitly chosen
 /// partition. The disk is borrowed; the view cannot access neighboring
 /// partitions. Neither inspection nor mount formats any disk.
+/// Reject a changed disk GUID or partition GUID even when LBAs are unchanged.
+/// Caller must quiesce the block device between preflight and mounting.
+pub fn mount_gpt_selected_healthy<'a,D:BlockDevice>(disk:&'a mut D,
+ expected:GptSelection)->Result<HierVfs<BlockWindow<'a,D>>,MountError>{
+ let actual=inspect_gpt_selection(disk,expected.partition.index)
+  .map_err(MountError::Partition)?;
+ if actual!=expected{return Err(MountError::Partition(Error::Invalid));}
+ mount_checked_healthy(disk,actual.partition)
+}
 pub fn mount<'a,D:BlockDevice>(disk:&'a mut D,index:u32)
  ->Result<HierVfs<BlockWindow<'a,D>>,MountError>{
  let part=inspect(disk,index).map_err(MountError::Partition)?;
@@ -737,6 +770,61 @@ mod m1_partition_tests{
   assert_eq!(mount_checked_healthy(&mut disk,stale).err(),
    Some(MountError::Partition(Error::Invalid)));
   assert_eq!(disk.writes,before);
+ }
+ 
+ #[test]fn m1_r048_rejects_gpt_backup_array_with_equal_crc_but_different_bytes(){
+  let mut d=gpt_disk();
+  let original=crc(&d.data[2]);
+  // The two perturbations cancel under CRC32 but not byte-for-byte.
+  d.data[254][56]^=1;
+  d.data[254][112..116].copy_from_slice(&[0xd7,0x13,0x95,0x1d]);
+  assert_eq!(crc(&d.data[254]),original);
+  assert_eq!(le32(&d.data[255][88..92]),original);
+  assert_eq!(inspect(&mut d,0),Err(Error::Invalid));
+  assert_eq!(d.writes,0);
+ }
+ #[test]fn m1_r048_rejects_reused_partition_geometry_with_different_guid(){
+  let mut d=gpt_disk();
+  let selected=inspect_gpt_selection(&mut d,0).unwrap();
+  assert_eq!(selected.unique_partition_guid,[2;16]);
+  d.data[2][16..32].fill(7);rechecksum_gpt(&mut d);
+  assert_eq!(inspect(&mut d,0),Ok(selected.partition));
+  assert_eq!(mount_gpt_selected_healthy(&mut d,selected).err(),
+   Some(MountError::Partition(Error::Invalid)));
+  assert_eq!(d.writes,0);
+ }
+ #[test]fn m1_r048_rejects_disk_guid_change_even_when_geometry_matches(){
+  let mut d=gpt_disk();
+  let selected=inspect_gpt_selection(&mut d,0).unwrap();
+  d.data[1][56..72].fill(8);rechecksum_gpt(&mut d);
+  assert_eq!(inspect(&mut d,0),Ok(selected.partition));
+  assert_eq!(mount_gpt_selected_healthy(&mut d,selected).err(),
+   Some(MountError::Partition(Error::Invalid)));
+  assert_eq!(d.writes,0);
+ }
+ #[test]fn m1_r048_guid_pinned_mount_reads_existing_file_without_writes(){
+  let mut d=gpt_disk();
+  let selected=inspect_gpt_selection(&mut d,0).unwrap();
+  {
+   let win=BlockWindow::new(&mut d,40,100).unwrap();
+   let mut fs=HierVfs::format_blank(win).unwrap();
+   fs.mkdir("/docs").unwrap();fs.create("/docs/note",b"identity").unwrap();
+  }
+  let writes=d.writes;
+  {
+   let mut fs=mount_gpt_selected_healthy(&mut d,selected).unwrap();
+   let mut out=[0u8;16];
+   assert_eq!(fs.read("/docs/note",&mut out),Ok(8));
+   assert_eq!(&out[..8],b"identity");
+  }
+  assert_eq!(d.writes,writes);
+  assert_eq!(d.data[39],[0;SECTOR_BYTES]);
+  assert_eq!(d.data[140],[0;SECTOR_BYTES]);
+ }
+ #[test]fn m1_r048_mbr_has_no_fabricated_guid_identity(){
+  let mut d=mbr_disk();
+  assert_eq!(inspect_gpt_selection(&mut d,0),Err(Error::Unsupported));
+  assert_eq!(d.writes,0);
  }
  #[test]fn m1_r045_empty_valid_mbr_reports_no_partitions_without_format(){
   let mut d=new();d.data[0][510]=0x55;d.data[0][511]=0xaa;
