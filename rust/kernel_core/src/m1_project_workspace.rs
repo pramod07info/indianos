@@ -201,6 +201,154 @@ impl ProjectTree {
         *self = Self::new();
         Ok(())
     }
+    /// Read a bounded UTF-8 source file and publish only complete bytes.
+    pub fn open_source<D: BlockDevice>(&self, caller: Identity,
+        fs: &mut HierVfs<D>, name: &str, out: &mut [u8]
+    ) -> Result<usize, Error> {
+        self.check_fresh(caller, fs)?;
+        let (p, n) = self.child(name)?;
+        let mut staging = [0u8; MAX_FILE_BYTES];
+        let count = fs.read(Self::str_path(&p, n), &mut staging)?;
+        if core::str::from_utf8(&staging[..count]).is_err() { return Err(Error::Invalid); }
+        if count > out.len() { return Err(Error::Full); }
+        out[..count].copy_from_slice(&staging[..count]);
+        Ok(count)
+    }
+
+    /// Revision-locked Unicode-safe edit committed through durable COW VFS.
+    /// No write occurs until every byte boundary, size and authority check passes.
+    pub fn edit_range<D: BlockDevice>(&mut self, caller: Identity,
+        fs: &mut HierVfs<D>, name: &str, start: usize, end: usize, insert: &[u8]
+    ) -> Result<usize, Error> {
+        self.check_fresh(caller, fs)?;
+        let (p, n) = self.child(name)?;
+        let mut old = [0u8; MAX_FILE_BYTES];
+        let size = fs.read(Self::str_path(&p, n), &mut old)?;
+        let text = core::str::from_utf8(&old[..size]).map_err(|_|Error::Invalid)?;
+        if start > end || end > size ||
+            !text.is_char_boundary(start) || !text.is_char_boundary(end) ||
+            core::str::from_utf8(insert).is_err() { return Err(Error::Invalid); }
+        let next_size = size - (end - start) + insert.len();
+        if next_size > MAX_FILE_BYTES { return Err(Error::Full); }
+        let mut next = [0u8; MAX_FILE_BYTES];
+        next[..start].copy_from_slice(&old[..start]);
+        next[start..start + insert.len()].copy_from_slice(insert);
+        next[start + insert.len()..next_size].copy_from_slice(&old[end..size]);
+        fs.overwrite(Self::str_path(&p, n), &next[..next_size])?;
+        self.generation = fs.generation();
+        Ok(next_size)
+    }
+
+    /// Append text to a real disk-backed source file, not the volatile RamFs.
+    pub fn append_source<D: BlockDevice>(&mut self, caller: Identity,
+        fs: &mut HierVfs<D>, name: &str, suffix: &[u8]
+    ) -> Result<usize, Error> {
+        self.check_fresh(caller, fs)?;
+        if core::str::from_utf8(suffix).is_err() { return Err(Error::Invalid); }
+        let (p, n) = self.child(name)?;
+        let mut original = [0u8; MAX_FILE_BYTES];
+        let size = fs.read(Self::str_path(&p, n), &mut original)?;
+        if core::str::from_utf8(&original[..size]).is_err() ||
+           suffix.len() > MAX_FILE_BYTES - size { return Err(Error::Full); }
+        original[size..size + suffix.len()].copy_from_slice(suffix);
+        fs.overwrite(Self::str_path(&p, n), &original[..size + suffix.len()])?;
+        self.generation = fs.generation();
+        Ok(size + suffix.len())
+    }
+
+    /// Create a second durable COW file without overwriting an existing leaf.
+    pub fn duplicate_file<D: BlockDevice>(&mut self, caller: Identity,
+        fs: &mut HierVfs<D>, source: &str, destination: &str
+    ) -> Result<usize, Error> {
+        self.check_fresh(caller, fs)?;
+        if source == destination { return Err(Error::Invalid); }
+        let (a, alen) = self.child(source)?;
+        let (b, blen) = self.child(destination)?;
+        let mut data = [0u8; MAX_FILE_BYTES];
+        let len = fs.read(Self::str_path(&a, alen), &mut data)?;
+        fs.create(Self::str_path(&b, blen), &data[..len])?;
+        self.generation = fs.generation();
+        Ok(len)
+    }
+
+    /// Navigate to an absolute source character line/column, respecting UTF-8.
+    pub fn source_offset<D: BlockDevice>(&self, caller: Identity,
+        fs: &mut HierVfs<D>, name: &str, line: usize, column: usize
+    ) -> Result<usize, Error> {
+        self.check_fresh(caller, fs)?;
+        if line == 0 || column == 0 { return Err(Error::Invalid); }
+        let (p, n) = self.child(name)?;
+        let mut bytes = [0u8; MAX_FILE_BYTES];
+        let count = fs.read(Self::str_path(&p, n), &mut bytes)?;
+        let source = core::str::from_utf8(&bytes[..count]).map_err(|_|Error::Invalid)?;
+        let mut at = 0;
+        for (index, row) in source.split('\n').enumerate() {
+            if index + 1 == line {
+                let offset = row.char_indices().nth(column - 1).map(|x| x.0)
+                    .or_else(|| if column == row.chars().count() + 1 {
+                        Some(row.len()) } else { None }).ok_or(Error::Invalid)?;
+                return Ok(at + offset);
+            }
+            at += row.len() + 1;
+        }
+        Err(Error::Invalid)
+    }
+
+    /// Find a source term from a byte-aligned cursor without mutating the VFS.
+    pub fn find_source<D: BlockDevice>(&self, caller: Identity,
+        fs: &mut HierVfs<D>, name: &str, query: &[u8],
+        from: usize, out: &mut [usize]
+    ) -> Result<usize, Error> {
+        self.check_fresh(caller, fs)?;
+        if query.is_empty() || core::str::from_utf8(query).is_err() {
+            return Err(Error::Invalid);
+        }
+        let (p, n) = self.child(name)?;
+        let mut data = [0u8; MAX_FILE_BYTES];
+        let count = fs.read(Self::str_path(&p, n), &mut data)?;
+        let text = core::str::from_utf8(&data[..count]).map_err(|_|Error::Invalid)?;
+        if from > count || !text.is_char_boundary(from) { return Err(Error::Invalid); }
+        let mut matches = [0usize; MAX_FILE_BYTES];
+        let mut total = 0;
+        for (offset, part) in data[from..count].windows(query.len()).enumerate() {
+            if part == query && text.is_char_boundary(from + offset) {
+                if total == out.len() { return Err(Error::Full); }
+                matches[total] = from + offset;
+                total += 1;
+            }
+        }
+        out[..total].copy_from_slice(&matches[..total]);
+        Ok(total)
+    }
+
+    /// Count actual source lines in the persisted file.
+    pub fn source_lines<D: BlockDevice>(&self, caller: Identity,
+        fs: &mut HierVfs<D>, name: &str
+    ) -> Result<usize, Error> {
+        self.check_fresh(caller, fs)?;
+        let (p, n) = self.child(name)?;
+        let mut data = [0u8; MAX_FILE_BYTES];
+        let count = fs.read(Self::str_path(&p, n), &mut data)?;
+        core::str::from_utf8(&data[..count]).map_err(|_|Error::Invalid)?;
+        if count == 0 { return Ok(0); }
+        let newlines = data[..count].iter().filter(|b| **b == b'\n').count();
+        Ok(newlines + usize::from(data[count - 1] != b'\n'))
+    }
+
+    /// Read-only source checksum for a revision-sensitive build cache.
+    /// FNV is not cryptographic and must never authenticate executable bytes.
+    pub fn source_checksum<D: BlockDevice>(&self, caller: Identity,
+        fs: &mut HierVfs<D>, name: &str
+    ) -> Result<u64, Error> {
+        self.check_fresh(caller, fs)?;
+        let (p, n) = self.child(name)?;
+        let mut data = [0u8; MAX_FILE_BYTES];
+        let count = fs.read(Self::str_path(&p, n), &mut data)?;
+        let hash = data[..count].iter().fold(0xcbf29ce484222325u64,
+            |h, b| (h ^ (*b as u64)).wrapping_mul(0x100000001b3));
+        Ok(hash)
+    }
+
     pub fn close(&mut self, caller: Identity) -> Result<(), Error> {
         self.check(caller)?;
         *self = Self::new(); Ok(())
@@ -298,6 +446,76 @@ mod tests {
         p.create(a(), &mut fs, "demo").unwrap();
         assert_eq!(p.create(a(), &mut fs, "other"), Err(Error::AlreadyOpen));
         assert_eq!(p.open(a(), &mut fs, "demo"), Err(Error::AlreadyOpen));
+    }
+    #[test]
+    fn unicode_edit_survives_remount_and_cursor_navigation() {
+        let mut fs = fresh(); let mut p = ProjectTree::new();
+        p.create(a(), &mut fs, "demo").unwrap();
+        p.create_file(a(), &mut fs, "source", "aβc\n".as_bytes()).unwrap();
+        assert_eq!(p.source_offset(a(), &mut fs, "source", 1, 3), Ok(3));
+        assert_eq!(p.edit_range(a(), &mut fs, "source", 1, 3, b"XYZ"), Ok(6));
+        assert_eq!(p.source_lines(a(), &mut fs, "source"), Ok(1));
+        p.close(a()).unwrap();
+        let mut remount = HierVfs::mount(fs.into_device()).unwrap();
+        let mut reopened = ProjectTree::new();
+        reopened.open(a(), &mut remount, "demo").unwrap();
+        let mut out = [0; 16];
+        assert_eq!(reopened.open_source(a(), &mut remount, "source", &mut out), Ok(6));
+        assert_eq!(&out[..6], b"aXYZc\n");
+    }
+    #[test]
+    fn edit_invalid_unicode_boundaries_and_owner_fail_without_writes() {
+        let mut fs = fresh(); let mut p = ProjectTree::new();
+        p.create(a(), &mut fs, "demo").unwrap();
+        p.create_file(a(), &mut fs, "source", "αβ".as_bytes()).unwrap();
+        let generation = fs.generation();
+        assert_eq!(p.edit_range(a(), &mut fs, "source", 1, 2, b"x"), Err(Error::Invalid));
+        assert_eq!(p.edit_range(stale_id(), &mut fs, "source", 0, 2, b"x"), Err(Error::Unauthorized));
+        assert_eq!(fs.generation(), generation);
+        let mut out = [0; 8];
+        let n = p.open_source(a(), &mut fs, "source", &mut out).unwrap();
+        assert_eq!(&out[..n], "αβ".as_bytes());
+    }
+    #[test]
+    fn append_duplicate_and_find_across_persistent_project() {
+        let mut fs = fresh(); let mut p = ProjectTree::new();
+        p.create(a(), &mut fs, "demo").unwrap();
+        p.create_file(a(), &mut fs, "main", b"hello\n").unwrap();
+        assert_eq!(p.append_source(a(), &mut fs, "main", b"hello\n"), Ok(12));
+        assert_eq!(p.duplicate_file(a(), &mut fs, "main", "copy"), Ok(12));
+        let mut offsets = [0usize; 2];
+        assert_eq!(p.find_source(a(), &mut fs, "main", b"hello", 0, &mut offsets), Ok(2));
+        assert_eq!(offsets, [0, 6]);
+        assert_eq!(p.duplicate_file(a(), &mut fs, "main", "copy"),
+                   Err(Error::Fs(FsError::Exists)));
+        let mut data = [0; 16];
+        assert_eq!(p.read_file(a(), &mut fs, "copy", &mut data), Ok(12));
+        assert_eq!(&data[..12], b"hello\nhello\n");
+    }
+    #[test]
+    fn find_short_output_is_atomic_and_stale_generation_blocks_all_edits() {
+        let mut fs = fresh(); let mut p = ProjectTree::new();
+        p.create(a(), &mut fs, "demo").unwrap();
+        p.create_file(a(), &mut fs, "main", b"aa aa").unwrap();
+        let mut short = [99usize; 1];
+        assert_eq!(p.find_source(a(), &mut fs, "main", b"aa", 0, &mut short), Err(Error::Full));
+        assert_eq!(short, [99]);
+        fs.overwrite("/work/demo/main", b"changed").unwrap();
+        assert_eq!(p.append_source(a(), &mut fs, "main", b"bad"), Err(Error::Stale));
+        assert_eq!(p.edit_range(a(), &mut fs, "main", 0, 1, b"bad"), Err(Error::Stale));
+        assert_eq!(p.source_checksum(a(), &mut fs, "main"), Err(Error::Stale));
+    }
+    #[test]
+    fn checksum_tracks_real_edits_and_duplicate_does_not_modify_source() {
+        let mut fs = fresh(); let mut p = ProjectTree::new();
+        p.create(a(), &mut fs, "demo").unwrap();
+        p.create_file(a(), &mut fs, "main", b"old").unwrap();
+        let first = p.source_checksum(a(), &mut fs, "main").unwrap();
+        p.duplicate_file(a(), &mut fs, "main", "backup").unwrap();
+        let second = p.source_checksum(a(), &mut fs, "main").unwrap();
+        assert_eq!(first, second);
+        p.save_file(a(), &mut fs, "main", b"new").unwrap();
+        assert_ne!(p.source_checksum(a(), &mut fs, "main").unwrap(), first);
     }
     #[test]
     fn listing_short_destination_preserves_caller_bytes() {
