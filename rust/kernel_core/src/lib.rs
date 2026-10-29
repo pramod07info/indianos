@@ -35,6 +35,8 @@ pub mod workstation_r024;
 pub mod workstation_r025;
 /// R026 real file/editor/terminal/build/debug implementation.
 pub mod workstation_r026;
+/// R027: actual project file, editor, terminal, build, debugger and UI-state operations.
+pub mod workstation_r027;
 mod syscall;
 mod program;
 mod initramfs;
