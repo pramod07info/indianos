@@ -45,6 +45,8 @@ pub mod workstation_r029;
 pub mod workstation_r030;
 /// R031: 20 source-file, editor, terminal, build, debug and pane workstreams.
 pub mod workstation_r031;
+/// R032: twenty integrated native source, project, terminal and IDE services.
+pub mod workstation_r032;
 mod syscall;
 mod program;
 mod initramfs;
