@@ -122,6 +122,86 @@ impl DiskEditor {
     pub fn append(&mut self, caller: Identity, data: &[u8]) -> Result<usize, Error> {
         self.replace(caller, self.used, self.used, data)
     }
+    /// Unicode-safe local source editing. The byte-oriented replace()
+    /// remains available to kernel-owned binary tools; source routes use
+    /// this explicit UTF-8/boundary-checked variant instead.
+    pub fn replace_text(&mut self,caller:Identity,from:usize,to:usize,
+        insert:&str)->Result<usize,Error>{
+        self.authorize(caller)?;
+        let text=core::str::from_utf8(&self.data[..self.used])
+            .map_err(|_|Error::Invalid)?;
+        if from>to||to>self.used||
+           !text.is_char_boundary(from)||!text.is_char_boundary(to){
+            return Err(Error::Invalid);
+        }
+        self.replace(caller,from,to,insert.as_bytes())
+    }
+    /// Literal Unicode replacement of every non-overlapping source
+    /// occurrence in ONE unsaved buffer, with ONE reversible edit.
+    /// Overflow or failed authority checks preserve undo/redo and bytes.
+    pub fn replace_all_text(&mut self,caller:Identity,needle:&str,
+        replacement:&str)->Result<usize,Error>{
+        self.authorize(caller)?;
+        if needle.is_empty(){return Err(Error::Invalid);}
+        let text=core::str::from_utf8(&self.data[..self.used])
+            .map_err(|_|Error::Invalid)?;
+        let mut staged=[0u8;MAX_FILE_BYTES];
+        let mut source=0usize;let mut target=0usize;let mut count=0usize;
+        while source<self.used{
+            if text[source..].starts_with(needle){
+                let end=target.checked_add(replacement.len()).ok_or(Error::Full)?;
+                if end>MAX_FILE_BYTES{return Err(Error::Full);}
+                staged[target..end].copy_from_slice(replacement.as_bytes());
+                target=end;source+=needle.len();count+=1;
+            }else{
+                let width=text[source..].chars().next().ok_or(Error::Invalid)?.len_utf8();
+                if target+width>MAX_FILE_BYTES{return Err(Error::Full);}
+                staged[target..target+width]
+                    .copy_from_slice(&self.data[source..source+width]);
+                target+=width;source+=width;
+            }
+        }
+        if count==0{return Ok(0);}
+        if target==self.used && staged[..target]==self.data[..self.used]{
+            return Ok(count);
+        }
+        self.undo=Some(Snapshot{data:self.data,used:self.used});
+        self.redo=None;
+        self.data=staged;self.used=target;self.dirty=true;
+        Ok(count)
+    }
+    /// Find a Unicode literal in the current unsaved buffer from a
+    /// character boundary, returning a byte offset for source navigation.
+    pub fn find_text(&self,caller:Identity,needle:&str,
+        from:usize)->Result<Option<usize>,Error>{
+        self.authorize(caller)?;
+        if needle.is_empty(){return Err(Error::Invalid);}
+        let text=core::str::from_utf8(&self.data[..self.used])
+            .map_err(|_|Error::Invalid)?;
+        if from>self.used||!text.is_char_boundary(from){return Err(Error::Invalid);}
+        Ok(text[from..].find(needle).map(|offset|from+offset))
+    }
+    /// Translate 1-based source line and Unicode scalar column to the
+    /// byte offset used by replace_text; valid at end of any line.
+    pub fn text_offset(&self,caller:Identity,
+        line:usize,column:usize)->Result<usize,Error>{
+        self.authorize(caller)?;
+        if line==0||column==0{return Err(Error::Invalid);}
+        let text=core::str::from_utf8(&self.data[..self.used])
+            .map_err(|_|Error::Invalid)?;
+        let mut base=0;
+        for (index,row) in text.split('\n').enumerate(){
+            if index+1==line{
+                let local=row.char_indices().nth(column-1).map(|x|x.0)
+                   .or_else(||if column==row.chars().count()+1{
+                       Some(row.len())
+                   }else{None}).ok_or(Error::Invalid)?;
+                return Ok(base+local);
+            }
+            base+=row.len()+1;
+        }
+        Err(Error::Invalid)
+    }
     /// Undo exactly one successful local edit. The result is dirty even
     /// if the previous edit had been saved to durable storage.
     pub fn undo(&mut self,caller:Identity)->Result<usize,Error>{
@@ -431,6 +511,62 @@ mod tests {
         assert_eq!(&bytes[..13],b"fn main() {}!");
         fs.overwrite("/exists.rs",b"external").unwrap();
         assert_eq!(editor.save_as(owner(),&mut fs,"/new.rs"),Err(Error::Stale));
+    }
+
+    #[test]
+    fn r043_editor_unicode_navigation_replacement_and_remount(){
+        let mut fs=volume();
+        let mut editor=DiskEditor::new();
+        editor.open(owner(),&mut fs,"/source.rs").unwrap();
+        editor.append(owner(),"\nnaïve 🍀\n".as_bytes()).unwrap();
+        let position=editor.find_text(owner(),"ï",0).unwrap().unwrap();
+        assert!(editor.replace_text(owner(),position+1,position+2,"x").is_err());
+        assert_eq!(editor.replace_text(owner(),position,position+"ï".len(),"i"),Ok(24));
+        assert_eq!(editor.find_text(owner(),"naive",0),Ok(Some(13)));
+        assert_eq!(editor.text_offset(owner(),2,6),Ok(18));
+        editor.save(owner(),&mut fs).unwrap();
+        editor.close(owner(),false).unwrap();
+        let mut fs=HierVfs::mount(fs.into_device()).unwrap();
+        let mut next=DiskEditor::new();
+        next.open(owner(),&mut fs,"/source.rs").unwrap();
+        assert_eq!(next.find_text(owner(),"naive",0),Ok(Some(13)));
+    }
+    #[test]
+    fn r043_editor_replace_all_is_one_undo_and_failure_is_atomic(){
+        let mut fs=volume();
+        let mut editor=DiskEditor::new();
+        editor.open(owner(),&mut fs,"/source.rs").unwrap();
+        editor.replace_text(owner(),0,12,"α α α").unwrap();
+        let base=fs.generation();
+        assert_eq!(editor.replace_all_text(other(),"α","β"),Err(Error::Unauthorized));
+        assert_eq!(editor.replace_all_text(owner(),"α",&"x".repeat(MAX_FILE_BYTES)),
+            Err(Error::Full));
+        assert_eq!(fs.generation(),base);
+        assert_eq!(editor.replace_all_text(owner(),"α","β"),Ok(3));
+        let mut out=[0u8;32];
+        assert_eq!(editor.read(owner(),&mut out),Ok("β β β".len()));
+        assert_eq!(&out[..8],"β β β".as_bytes());
+        assert_eq!(editor.undo(owner()),Ok("α α α".len()));
+        assert_eq!(editor.redo(owner()),Ok("β β β".len()));
+        editor.save(owner(),&mut fs).unwrap();
+        let mut fs=HierVfs::mount(fs.into_device()).unwrap();
+        let mut bytes=[0u8;24];
+        assert_eq!(fs.read("/source.rs",&mut bytes),Ok(8));
+        assert_eq!(&bytes[..8],"β β β".as_bytes());
+    }
+    #[test]
+    fn r043_editor_invalid_utf8_text_offsets_never_mutate(){
+        let mut fs=volume();let mut editor=DiskEditor::new();
+        editor.open(owner(),&mut fs,"/source.rs").unwrap();
+        let before=fs.generation();
+        assert_eq!(editor.replace_text(owner(),0,1,"🍀"),Ok(15));
+        assert_eq!(editor.replace_text(owner(),1,2,"bad"),Err(Error::Invalid));
+        assert_eq!(editor.text_offset(owner(),1,0),Err(Error::Invalid));
+        assert_eq!(editor.find_text(owner(),"🍀",1),Err(Error::Invalid));
+        assert_eq!(fs.generation(),before);
+        let mut data=[0;32];
+        assert_eq!(editor.read(owner(),&mut data),Ok(15));
+        assert_eq!(&data[..4],"🍀".as_bytes());
     }
 
 }

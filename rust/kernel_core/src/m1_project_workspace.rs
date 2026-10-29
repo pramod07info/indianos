@@ -367,6 +367,68 @@ impl ProjectTree {
         Ok(newlines + usize::from(data[count - 1] != b'\n'))
     }
 
+    /// Return one Unicode source line, without its newline delimiter.
+    /// Output remains unchanged on short destination and invalid input.
+    pub fn read_source_line<D:BlockDevice>(&self,caller:Identity,
+        fs:&mut HierVfs<D>,name:&str,line:usize,out:&mut[u8]
+    )->Result<usize,Error>{
+        self.check_fresh(caller,fs)?;
+        if line==0{return Err(Error::Invalid);}
+        let (p,n)=self.child(name)?;
+        let mut bytes=[0u8;MAX_FILE_BYTES];
+        let count=fs.read(Self::str_path(&p,n),&mut bytes)?;
+        let text=core::str::from_utf8(&bytes[..count]).map_err(|_|Error::Invalid)?;
+        let row=text.split('\n').nth(line-1).ok_or(Error::Invalid)?;
+        if row.len()>out.len(){return Err(Error::Full);}
+        out[..row.len()].copy_from_slice(row.as_bytes());
+        Ok(row.len())
+    }
+    /// Insert a full UTF-8 line before the one-based destination row.
+    /// Commits ONE bounded file replacement, not an intermediate file.
+    pub fn insert_source_line<D:BlockDevice>(&mut self,caller:Identity,
+        fs:&mut HierVfs<D>,name:&str,line:usize,source:&str
+    )->Result<usize,Error>{
+        self.check_fresh(caller,fs)?;
+        if line==0||source.contains('\n')||source.contains('\r'){
+            return Err(Error::Invalid);
+        }
+        let (p,n)=self.child(name)?;
+        let mut old=[0u8;MAX_FILE_BYTES];
+        let count=fs.read(Self::str_path(&p,n),&mut old)?;
+        let text=core::str::from_utf8(&old[..count]).map_err(|_|Error::Invalid)?;
+        let mut offset=0;
+        for _ in 1..line{
+            offset+=text[offset..].find('\n').ok_or(Error::Invalid)?+1;
+        }
+        let needed=source.len().checked_add(1).ok_or(Error::Full)?;
+        if count.checked_add(needed).is_none_or(|n|n>MAX_FILE_BYTES){
+            return Err(Error::Full);
+        }
+        let mut next=[0u8;MAX_FILE_BYTES];
+        next[..source.len()].copy_from_slice(source.as_bytes());
+        next[source.len()]=b'\n';
+        self.edit_range(caller,fs,name,offset,offset,&next[..needed])
+    }
+    /// Delete exactly one complete source line and its trailing newline.
+    /// No recursive deletion, file removal, or other-line rewrite.
+    pub fn delete_source_line<D:BlockDevice>(&mut self,caller:Identity,
+        fs:&mut HierVfs<D>,name:&str,line:usize
+    )->Result<usize,Error>{
+        self.check_fresh(caller,fs)?;
+        if line==0{return Err(Error::Invalid);}
+        let (p,n)=self.child(name)?;
+        let mut old=[0u8;MAX_FILE_BYTES];
+        let count=fs.read(Self::str_path(&p,n),&mut old)?;
+        let text=core::str::from_utf8(&old[..count]).map_err(|_|Error::Invalid)?;
+        let mut start=0;
+        for _ in 1..line{
+            start+=text[start..].find('\n').ok_or(Error::Invalid)?+1;
+        }
+        if start==count{return Err(Error::Invalid);}
+        let end=start+text[start..].find('\n').map(|n|n+1)
+            .unwrap_or(count-start);
+        self.edit_range(caller,fs,name,start,end,b"")
+    }
     /// Read-only source checksum for a revision-sensitive build cache.
     /// FNV is not cryptographic and must never authenticate executable bytes.
     pub fn source_checksum<D: BlockDevice>(&self, caller: Identity,
@@ -411,6 +473,42 @@ mod tests {
     fn stale_id() -> Identity { Identity { pid: 2, generation: 2 } }
     fn fresh() -> HierVfs<Disk> {
         HierVfs::format_blank(Disk::new()).unwrap()
+    }
+    #[test]
+    fn r043_project_line_insertion_read_and_removal_survive_remount(){
+        let mut fs=fresh();let mut p=ProjectTree::new();
+        p.create(a(),&mut fs,"demo").unwrap();
+        p.create_file(a(),&mut fs,"main","one\nthree\n".as_bytes()).unwrap();
+        assert_eq!(p.insert_source_line(a(),&mut fs,"main",2,"two 🍀"),
+            Ok("one\ntwo 🍀\nthree\n".len()));
+        let mut row=[0u8;40];
+        assert_eq!(p.read_source_line(a(),&mut fs,"main",2,&mut row),Ok(8));
+        assert_eq!(&row[..8],"two 🍀".as_bytes());
+        assert_eq!(p.delete_source_line(a(),&mut fs,"main",1),
+            Ok("two 🍀\nthree\n".len()));
+        let mut fs=HierVfs::mount(fs.into_device()).unwrap();
+        let mut next=ProjectTree::new();
+        next.open(a(),&mut fs,"demo").unwrap();
+        let mut data=[0u8;48];
+        assert_eq!(next.read_file(a(),&mut fs,"main",&mut data),Ok(15));
+        assert_eq!(&data[..15],"two 🍀\nthree\n".as_bytes());
+    }
+    #[test]
+    fn r043_project_line_errors_and_short_output_are_atomic(){
+        let mut fs=fresh();let mut p=ProjectTree::new();
+        p.create(a(),&mut fs,"demo").unwrap();
+        p.create_file(a(),&mut fs,"main",b"alpha\nbeta").unwrap();
+        let before=fs.generation();
+        let mut out=[0x5a;2];
+        assert_eq!(p.read_source_line(a(),&mut fs,"main",1,&mut out),Err(Error::Full));
+        assert_eq!(out,[0x5a;2]);
+        assert_eq!(p.insert_source_line(a(),&mut fs,"main",5,"x"),Err(Error::Invalid));
+        assert_eq!(p.insert_source_line(a(),&mut fs,"main",1,"invalid\nline"),
+            Err(Error::Invalid));
+        assert_eq!(p.delete_source_line(a(),&mut fs,"main",8),Err(Error::Invalid));
+        assert_eq!(p.insert_source_line(stale_id(),&mut fs,"main",1,"evil"),
+            Err(Error::Unauthorized));
+        assert_eq!(fs.generation(),before);
     }
     #[test]
     fn persistent_project_create_save_rename_and_reboot() {

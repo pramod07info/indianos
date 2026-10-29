@@ -35,6 +35,27 @@ fn publish(data:&[u8],out:&mut[u8])->Result<usize,Error>{
  if data.len()>out.len(){return Err(Error::OutputTooSmall);}
  out[..data.len()].copy_from_slice(data);Ok(data.len())
 }
+/// Bounded numeric response; no allocator, locale or partial caller writes.
+fn publish_number(mut value:u64,out:&mut[u8])->Result<usize,Error>{
+ let mut digits=[0u8;20];
+ let mut i=digits.len();
+ loop{
+  i-=1;digits[i]=b'0'+(value%10) as u8;value/=10;
+  if value==0{break;}
+ }
+ publish(&digits[i..],out)
+}
+/// Deterministic content fingerprint for diagnostics, NOT a signature.
+fn publish_hash(bytes:&[u8],out:&mut[u8])->Result<usize,Error>{
+ let hash=bytes.iter().fold(0xcbf29ce484222325u64,
+  |h,b|(h^(*b as u64)).wrapping_mul(0x100000001b3));
+ let mut digits=[0u8;16];
+ for (i,place) in digits.iter_mut().enumerate(){
+  let nibble=((hash>>((15-i)*4))&0xf) as u8;
+  *place=if nibble<10{b'0'+nibble}else{b'a'+nibble-10};
+ }
+ publish(&digits,out)
+}
 pub fn command<D:BlockDevice,const N:usize>(
  fs:&mut HierVfs<D>,auth:&Access<N>,caller:Identity,now:u64,
  input:&[u8],out:&mut[u8])->Result<usize,Error>{
@@ -43,9 +64,164 @@ pub fn command<D:BlockDevice,const N:usize>(
  let line=core::str::from_utf8(input).map_err(|_|Error::Invalid)?.trim();
  if line=="help"{return publish(b"pwd ls /dir cat /path write /path text append /path text mkdir /dir mv /old /new cp /src /dst rm /path mkfile /path truncate /path head /path count rmdir /dir mvdir /old /new pread /file offset count pwrite /file@offset text",out);}
  if line=="pwd"{return publish(b"/",out);}
+ if line=="tools"{return publish(b"count lines tail find grep hash cmp stat touch copynew replace appendln",out);}
  let (verb,raw)=line.split_once(' ').ok_or(Error::Unknown)?;
  let mut name=[0u8;64];
  match verb{
+  "count"|"lines"|"hash"|"stat"=>{
+   auth.require(caller,FILE_READ,now).map_err(|_|Error::Denied)?;
+   let p=path(raw,&mut name)?;
+   let mut bytes=[0u8;crate::durablefs::MAX_FILE_BYTES];
+   let n=fs.read(p,&mut bytes).map_err(Error::Io)?;
+   match verb{
+    "count"=>publish_number(n as u64,out),
+    "hash"=>publish_hash(&bytes[..n],out),
+    "lines"=>{
+     core::str::from_utf8(&bytes[..n]).map_err(|_|Error::Invalid)?;
+     let count=bytes[..n].iter().filter(|b|**b==b'\n').count()
+      +usize::from(n>0&&bytes[n-1]!=b'\n');
+     publish_number(count as u64,out)
+    },
+    // Expose only volume generation and byte length; no raw metadata.
+    "stat"=>{
+     let mut buf=[0u8;64];let mut at=0;
+     for (prefix,value) in [(b"bytes:".as_slice(),n as u64),
+                             (b" generation:".as_slice(),fs.generation())]{
+      buf[at..at+prefix.len()].copy_from_slice(prefix);at+=prefix.len();
+      let len=publish_number(value,&mut buf[at..])?;at+=len;
+     }
+     publish(&buf[..at],out)
+    },
+    _=>Err(Error::Unknown)
+   }
+  }
+  "tail"=>{
+   auth.require(caller,FILE_READ,now).map_err(|_|Error::Denied)?;
+   let (source,requested)=raw.split_once(' ').ok_or(Error::Invalid)?;
+   let count=requested.parse::<usize>().map_err(|_|Error::Invalid)?;
+   if count==0||count>MAX_TRANSFER{return Err(Error::Invalid);}
+   let p=path(source,&mut name)?;
+   let mut bytes=[0u8;crate::durablefs::MAX_FILE_BYTES];
+   let n=fs.read(p,&mut bytes).map_err(Error::Io)?;
+   publish(&bytes[n.saturating_sub(count)..n],out)
+  }
+  "find"|"grep"=>{
+   auth.require(caller,FILE_READ,now).map_err(|_|Error::Denied)?;
+   let (source,needle)=raw.split_once(' ').ok_or(Error::Invalid)?;
+   if needle.is_empty(){return Err(Error::Invalid);}
+   let p=path(source,&mut name)?;
+   let mut bytes=[0u8;crate::durablefs::MAX_FILE_BYTES];
+   let n=fs.read(p,&mut bytes).map_err(Error::Io)?;
+   let text=core::str::from_utf8(&bytes[..n]).map_err(|_|Error::Invalid)?;
+   if verb=="find"{
+    return match text.find(needle){
+     Some(offset)=>publish_number(offset as u64,out),
+     None=>publish(b"not found",out)
+    };
+   }
+   // Stage ALL matching lines before publishing a single output byte.
+   let mut matched=[0u8;crate::durablefs::MAX_FILE_BYTES];
+   let mut len=0;
+   for line in text.split_inclusive('\n'){
+    if line.contains(needle){
+     matched[len..len+line.len()].copy_from_slice(line.as_bytes());
+     len+=line.len();
+    }
+   }
+   publish(&matched[..len],out)
+  }
+  "cmp"=>{
+   auth.require(caller,FILE_READ,now).map_err(|_|Error::Denied)?;
+   let (left,right)=raw.split_once(' ').ok_or(Error::Invalid)?;
+   let a=path(left,&mut name)?;
+   let mut other=[0u8;64];let b=path(right,&mut other)?;
+   let mut first=[0u8;crate::durablefs::MAX_FILE_BYTES];
+   let mut second=[0u8;crate::durablefs::MAX_FILE_BYTES];
+   let x=fs.read(a,&mut first).map_err(Error::Io)?;
+   let y=fs.read(b,&mut second).map_err(Error::Io)?;
+   publish(if first[..x]==second[..y]{b"equal"}else{b"different"},out)
+  }
+  "touch"=>{
+   auth.require(caller,FILE_READ|FILE_WRITE,now).map_err(|_|Error::Denied)?;
+   if out.len()<7{return Err(Error::OutputTooSmall);}
+   let p=path(raw,&mut name)?;
+   writable_path(p)?;
+   let mut buffer=[0u8;crate::durablefs::MAX_FILE_BYTES];
+   match fs.read(p,&mut buffer){
+    Ok(_)=>publish(b"exists",out),
+    Err(FsError::NotFound)=>{
+     fs.create(p,b"").map_err(Error::Io)?;
+     publish(b"created",out)
+    },
+    Err(e)=>Err(Error::Io(e))
+   }
+  }
+  "copynew"=>{
+   auth.require(caller,FILE_READ|FILE_WRITE,now).map_err(|_|Error::Denied)?;
+   if out.len()<6{return Err(Error::OutputTooSmall);}
+   let (source,target)=raw.split_once(' ').ok_or(Error::Invalid)?;
+   let a=path(source,&mut name)?;
+   let mut dest=[0u8;64];let b=path(target,&mut dest)?;
+   if a==b{return Err(Error::Invalid);}
+   writable_path(b)?;
+   let mut bytes=[0u8;crate::durablefs::MAX_FILE_BYTES];
+   let count=fs.read(a,&mut bytes).map_err(Error::Io)?;
+   fs.create(b,&bytes[..count]).map_err(Error::Io)?;
+   publish(b"copied",out)
+  }
+  "replace"=>{
+   // Literal text replacement is a single COW overwrite, never a
+   // destructive series of edits; no partial file changes on overflow.
+   auth.require(caller,FILE_READ|FILE_WRITE,now).map_err(|_|Error::Denied)?;
+   if out.len()<9{return Err(Error::OutputTooSmall);}
+   let mut args=raw.splitn(3,' ');
+   let source=args.next().ok_or(Error::Invalid)?;
+   let needle=args.next().ok_or(Error::Invalid)?;
+   let replacement=args.next().ok_or(Error::Invalid)?;
+   if needle.is_empty()||replacement.is_empty(){return Err(Error::Invalid);}
+   let p=path(source,&mut name)?;
+   writable_path(p)?;
+   let mut previous=[0u8;crate::durablefs::MAX_FILE_BYTES];
+   let n=fs.read(p,&mut previous).map_err(Error::Io)?;
+   let text=core::str::from_utf8(&previous[..n]).map_err(|_|Error::Invalid)?;
+   let mut updated=[0u8;crate::durablefs::MAX_FILE_BYTES];
+   let mut read=0usize;let mut written=0usize;let mut replaced=0usize;
+   while read<n{
+    if text[read..].starts_with(needle){
+     let next=written.checked_add(replacement.len()).ok_or(Error::Invalid)?;
+     if next>updated.len(){return Err(Error::Io(FsError::TooLarge));}
+     updated[written..next].copy_from_slice(replacement.as_bytes());
+     written=next;read+=needle.len();replaced+=1;
+    }else{
+     let width=text[read..].chars().next().ok_or(Error::Invalid)?.len_utf8();
+     if written+width>updated.len(){return Err(Error::Io(FsError::TooLarge));}
+     updated[written..written+width].copy_from_slice(&previous[read..read+width]);
+     written+=width;read+=width;
+    }
+   }
+   if replaced==0{return publish(b"unchanged",out);}
+   if written==n&&updated[..written]==previous[..n]{
+    return publish(b"unchanged",out);
+   }
+   fs.overwrite(p,&updated[..written]).map_err(Error::Io)?;
+   publish(b"replaced",out)
+  }
+  "appendln"=>{
+   auth.require(caller,FILE_READ|FILE_WRITE,now).map_err(|_|Error::Denied)?;
+   if out.len()<8{return Err(Error::OutputTooSmall);}
+   let (source,data)=raw.split_once(' ').ok_or(Error::Invalid)?;
+   if data.is_empty()||data.len()>MAX_TRANSFER{return Err(Error::Invalid);}
+   let p=path(source,&mut name)?;
+   writable_path(p)?;
+   let mut existing=[0u8;crate::durablefs::MAX_FILE_BYTES];
+   let n=fs.read(p,&mut existing).map_err(Error::Io)?;
+   let next=n.checked_add(data.len()+1).ok_or(Error::Invalid)?;
+   if next>existing.len(){return Err(Error::Io(FsError::TooLarge));}
+   existing[n..n+data.len()].copy_from_slice(data.as_bytes());
+   existing[next-1]=b'\n';
+   fs.overwrite(p,&existing[..next]).map_err(Error::Io)?;
+   publish(b"appended",out)
+  }
   "ls"=>{
    auth.require(caller,FILE_READ,now).map_err(|_|Error::Denied)?;
    let p=if raw=="/"{"/"}else{path(raw,&mut name)?};
@@ -295,6 +471,94 @@ mod tests{
   let size=command(fs,access,who,1,cmd,&mut out)?;
   Ok((size,out))
  }
+ #[test]fn r043_terminal_inspection_tools_report_durable_bytes_and_lines(){
+  let mut fs=HierVfs::format_blank(blank()).unwrap();let auth=grants();
+  fs.create("/source",b"one\nsecond\nthird").unwrap();
+  let start=fs.generation();
+  let (n,out)=run(&mut fs,&auth,user(),b"count /source").unwrap();
+  assert_eq!(&out[..n],b"16");
+  let (n,out)=run(&mut fs,&auth,user(),b"lines /source").unwrap();
+  assert_eq!(&out[..n],b"3");
+  let (n,out)=run(&mut fs,&auth,user(),b"stat /source").unwrap();
+  assert!(core::str::from_utf8(&out[..n]).unwrap().starts_with("bytes:16 generation:"));
+  let (n,out)=run(&mut fs,&auth,user(),b"hash /source").unwrap();
+  assert_eq!(n,16);assert!(out[..n].iter().all(|b|b.is_ascii_hexdigit()));
+  assert_eq!(fs.generation(),start);
+  let mut remounted=HierVfs::mount(fs.into_device()).unwrap();
+  let (n,out)=run(&mut remounted,&auth,user(),b"tail /source 5").unwrap();
+  assert_eq!(&out[..n],b"third");
+ }
+ #[test]fn r043_terminal_search_and_compare_are_bounded_and_read_only(){
+  let mut fs=HierVfs::format_blank(blank()).unwrap();let auth=grants();
+  fs.create("/a",b"alpha\nbeta alpha\n").unwrap();
+  fs.create("/b",b"alpha\nbeta alpha\n").unwrap();
+  let rev=fs.generation();
+  let (n,out)=run(&mut fs,&auth,user(),b"find /a beta").unwrap();
+  assert_eq!(&out[..n],b"6");
+  let (n,out)=run(&mut fs,&auth,user(),b"grep /a alpha").unwrap();
+  assert_eq!(&out[..n],b"alpha\nbeta alpha\n");
+  let (n,out)=run(&mut fs,&auth,user(),b"cmp /a /b").unwrap();
+  assert_eq!(&out[..n],b"equal");
+  let (n,out)=run(&mut fs,&auth,user(),b"find /a absent").unwrap();
+  assert_eq!(&out[..n],b"not found");
+  let mut tiny=[0x44;3];
+  assert_eq!(command(&mut fs,&auth,user(),1,b"grep /a alpha",&mut tiny),
+    Err(Error::OutputTooSmall));
+  assert_eq!(tiny,[0x44;3]);assert_eq!(fs.generation(),rev);
+ }
+ #[test]fn r043_copynew_touch_and_appendln_preserve_cow_after_reboot(){
+  let mut fs=HierVfs::format_blank(blank()).unwrap();let auth=grants();
+  fs.mkdir("/docs").unwrap();fs.create("/docs/source",b"start").unwrap();
+  run(&mut fs,&auth,user(),b"copynew /docs/source /docs/copy").unwrap();
+  assert_eq!(run(&mut fs,&auth,user(),b"copynew /docs/source /docs/copy"),
+    Err(Error::Io(FsError::Exists)));
+  run(&mut fs,&auth,user(),b"appendln /docs/copy line").unwrap();
+  let mut fs=HierVfs::mount(fs.into_device()).unwrap();
+  let (n,out)=run(&mut fs,&auth,user(),b"cat /docs/copy").unwrap();
+  assert_eq!(&out[..n],b"startline\n");
+  run(&mut fs,&auth,user(),b"touch /docs/empty").unwrap();
+  let rev=fs.generation();
+  let (n,out)=run(&mut fs,&auth,user(),b"touch /docs/empty").unwrap();
+  assert_eq!(&out[..n],b"exists");assert_eq!(fs.generation(),rev);
+  let mut fs=HierVfs::mount(fs.into_device()).unwrap();
+  assert_eq!(run(&mut fs,&auth,user(),b"cat /docs/empty").unwrap().0,0);
+ }
+ #[test]fn r043_replace_is_atomic_authorized_and_persists_after_remount(){
+  let mut fs=HierVfs::format_blank(blank()).unwrap();let auth=grants();
+  fs.create("/code",b"cat cat cat").unwrap();
+  let before=fs.generation();
+  let mut tiny=[0x77;2];
+  assert_eq!(command(&mut fs,&auth,user(),1,b"replace /code cat dog",&mut tiny),
+    Err(Error::OutputTooSmall));
+  assert_eq!(tiny,[0x77;2]);assert_eq!(fs.generation(),before);
+  assert_eq!(run(&mut fs,&auth,Identity{generation:2,..user()},
+    b"replace /code cat dog"),Err(Error::Denied));
+  assert_eq!(run(&mut fs,&auth,user(),b"replace /code cat dog").unwrap().0,8);
+  let (n,out)=run(&mut fs,&auth,user(),b"replace /code cat dog").unwrap();
+  assert_eq!(&out[..n],b"unchanged");
+  let mut fs=HierVfs::mount(fs.into_device()).unwrap();
+  let (n,out)=run(&mut fs,&auth,user(),b"cat /code").unwrap();
+  assert_eq!(&out[..n],b"dog dog dog");
+ }
+ #[test]fn r043_write_tools_protect_reserved_namespace_and_byte_caps(){
+  let mut fs=HierVfs::format_blank(blank()).unwrap();let auth=grants();
+  fs.mkdir("/system").unwrap();fs.create("/system/config",b"trusted").unwrap();
+  fs.create("/source",b"stable").unwrap();
+  let rev=fs.generation();
+  for command_line in [
+   b"touch /system/new".as_slice(),
+   b"copynew /source /system/new".as_slice(),
+   b"appendln /system/config bad".as_slice(),
+   b"replace /system/config trusted bad".as_slice(),
+  ]{
+   assert_eq!(run(&mut fs,&auth,user(),command_line),Err(Error::Denied));
+  }
+  assert_eq!(fs.generation(),rev);
+  let mut out=[0u8;MAX_TRANSFER];
+  assert_eq!(command(&mut fs,&auth,user(),1,b"tail /source 257",&mut out),
+    Err(Error::Invalid));
+ }
+
  #[test]fn actual_directory_file_rename_and_reboot_remount(){
   let mut fs=HierVfs::format_blank(blank()).unwrap();
   let access=grants();
