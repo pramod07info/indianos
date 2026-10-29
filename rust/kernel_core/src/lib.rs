@@ -53,6 +53,8 @@ pub mod workstation_r033;
 pub mod workstation_r034;
 /// R035: connected native developer workstation file and IDE workflows.
 pub mod workstation_r035;
+/// R036 connected guest filesystem, editor, terminal, build and debug workflows.
+pub mod workstation_r036;
 mod syscall;
 mod program;
 mod initramfs;
