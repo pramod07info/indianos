@@ -317,3 +317,59 @@ real hardware IRQ-to-scheduler-to-ring3 input, independent ring3 compositor,
 recovery and full normal-boot Desktop evidence remain outstanding. The
 repository "Ten Modules One Build" workflow verifies code but does NOT
 launch 20 autonomous code-writing agents.
+
+
+### R045 — M1 G2/G6 read-only partition inventory and storage integrity preflight (2026-10-29)
+
+This batch obeys the M1-first freeze in issue #616: no unrelated workstation
+features, placeholder agent files, compatibility experiments or fake
+percentage/gate-completion claims. Deliverables improve the installer/Files
+preflight and failure evidence for safe persistent Desktop storage.
+
+The following are 20 scoped engineering tasks, NOT 20 independently running
+software-coding agents:
+
+1. Immutable validated partition catalog with stable on-disk indices.
+2. Single-pass defensive MBR discovery without implicit selection.
+3. Single-pass whole-GPT discovery after primary/secondary CRC validation.
+4. Keep GPT sparse partition indices rather than renumbering entries.
+5. Reject GPT duplicate unique IDs across live non-overlapping entries.
+6. Reject overlapping GPT/MBR partitions before exposing the catalog.
+7. Validate unused slots before exposing later live records.
+8. Fail atomically when catalog destination buffer is too small.
+9. Return disk I/O failures without exposing unverified partial catalog data.
+10. Distinguish a valid empty partition map from an invalid disk.
+11. Recheck scheme/index/start/size against fresh partition metadata on mount.
+12. Continue rejecting unformatted volumes; no mount-triggered autoformat.
+13. Provide a hard read-only BlockDevice adapter for inspection APIs.
+14. Combine the read-only adapter with bounded selected-sector windows.
+15. Reject even a mistaken format request through a read-only window.
+16. Report two independently checksum-verified COW metadata generations.
+17. Report degraded single-copy volume health, never silently say healthy.
+18. Reject divergent valid equal-generation split-brain metadata.
+19. Detect corrupt latest data/metadata and report the valid fallback state.
+20. Wire selected-partition health and geometry-locked mount into M1 Desktop.
+
+Production modules: rust/kernel_core/src/{block,durablefs,hier_vfs,
+m1_partition,m1_persistent_desktop}.rs. A read-only inspection cannot
+write through the ReadOnlyDevice capability, even if a later caller
+accidentally invokes write_sector. Read-only diagnostics use both COW heads
+and actual file-payload checksums; no recovery repair is automatically
+performed. Selected mounts still refuse a changed or unformatted partition.
+
+New focused tests: 19 tests in block.rs, durablefs.rs and m1_partition.rs,
+plus existing Desktop partition integration test extended with real
+read-only health preflight and checked mount. Scenarios include sparse
+MBR/GPT, duplicate and overlapping entries, secondary GPT corruption,
+short outputs, simulated disk I/O errors, torn or invalid COW head,
+corrupted current file payload, restored redundancy via a valid next
+commit, selected partition remount and protected neighbor sectors.
+The mandatory M1 workflow now explicitly runs the r045_ group alongside
+earlier M1/R040-R044, freestanding no_std and real QEMU graphical
+Files plus persistent scratch-disk reboot checks. S0 and full kernel boot
+are still required on the exact integration head.
+
+**Acceptance remains unchanged:** G2 and G6 (along with other eight
+unchecked gates) need integrated physical/normal-boot and selected-QEMU
+recovery evidence under issue #616. Service-level host tests and the
+existing QEMU Files smoke alone do not close those high-level gates.

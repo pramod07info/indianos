@@ -3,20 +3,54 @@
 //! choose, mount or format an arbitrary physical disk. No writes during
 //! discovery. GPT 1.0 with 128-byte entries (<=128) is supported; extended
 //! MBR partitions, backup-header recovery and exotic sector sizes are not.
-use crate::block::{BlockDevice,BlockError,BlockWindow,SECTOR_BYTES};
+use crate::block::{BlockDevice,BlockError,BlockWindow,ReadOnlyDevice,SECTOR_BYTES};
 use crate::hier_vfs::HierVfs;
-use crate::durablefs::{FsError,MIN_SECTORS};
+use crate::durablefs::{DurableFs,FsError,VolumeHealth,MIN_SECTORS};
 
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 pub enum Scheme{Mbr,Gpt}
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 pub struct Partition{pub scheme:Scheme,pub index:u32,pub start:u64,pub sectors:u64}
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
-pub enum Error{Io,Invalid,Unsupported,NotFound,Overlap,OutOfRange}
+pub enum Error{Io,Invalid,Unsupported,NotFound,Overlap,OutOfRange,TooSmall}
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 pub enum MountError{Partition(Error),Filesystem(FsError)}
 impl From<BlockError> for Error{fn from(_:BlockError)->Self{Self::Io}}
-const MAX_GPT_ENTRIES:usize=128;
+pub const MAX_GPT_ENTRIES:usize=128;
+/// Complete validated, read-only partition catalog. Sparse on-disk
+/// ordinals are preserved, and callers never infer that slot 0 is present.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct PartitionSet{
+ scheme:Scheme,
+ slots:[Option<Partition>;MAX_GPT_ENTRIES],
+ count:usize,
+}
+impl PartitionSet{
+ fn empty(scheme:Scheme)->Self{
+  Self{scheme,slots:[None;MAX_GPT_ENTRIES],count:0}
+ }
+ pub fn scheme(&self)->Scheme{self.scheme}
+ pub fn len(&self)->usize{self.count}
+ pub fn is_empty(&self)->bool{self.count==0}
+ pub fn get(&self,index:u32)->Option<Partition>{
+  self.slots.get(index as usize).copied().flatten()
+ }
+ /// Iterate only live entries with original indices, in stable disk order.
+ pub fn iter(&self)->impl Iterator<Item=Partition>+'_{
+  self.slots.iter().flatten().copied()
+ }
+ /// Never expose a partially populated output when caller capacity is short.
+ pub fn copy_to(&self,output:&mut[Partition])->Result<usize,Error>{
+  if output.len()<self.count{return Err(Error::TooSmall);}
+  for (item,slot) in self.iter().zip(output.iter_mut()){*slot=item;}
+  Ok(self.count)
+ }
+ fn record(&mut self,partition:Partition)->Result<(),Error>{
+  let slot=self.slots.get_mut(partition.index as usize).ok_or(Error::Invalid)?;
+  if slot.is_some(){return Err(Error::Invalid);}
+  *slot=Some(partition);self.count+=1;Ok(())
+ }
+}
 fn le32(src:&[u8])->u32{u32::from_le_bytes(src.try_into().unwrap())}
 fn le64(src:&[u8])->u64{u64::from_le_bytes(src.try_into().unwrap())}
 fn crc_update(mut state:u32,bytes:&[u8])->u32{
@@ -38,11 +72,11 @@ fn read<D:BlockDevice>(disk:&mut D,sector:u64)->Result<[u8;SECTOR_BYTES],Error>{
  disk.read_sector(sector,&mut buf)?;
  Ok(buf)
 }
-fn mbr<D:BlockDevice>(disk:&mut D,index:u32,first:&[u8;SECTOR_BYTES])
- ->Result<Partition,Error>{
- if index>=4{return Err(Error::NotFound);}
+fn mbr<D:BlockDevice>(disk:&mut D,first:&[u8;SECTOR_BYTES])
+ ->Result<PartitionSet,Error>{
  let capacity=disk.sector_count();
  let mut seen=[None;4];
+ let mut found=PartitionSet::empty(Scheme::Mbr);
  for i in 0..4{
   let off=446+i*16;
   let slot=&first[off..off+16];
@@ -59,11 +93,11 @@ fn mbr<D:BlockDevice>(disk:&mut D,index:u32,first:&[u8;SECTOR_BYTES])
    if begin<other_end&&other_start<end{return Err(Error::Overlap);}
   }
   seen[i]=Some((begin,end));
+  found.record(Partition{scheme:Scheme::Mbr,index:i as u32,start,sectors:end-start})?;
  }
- let (start,end)=seen[index as usize].ok_or(Error::NotFound)?;
- Ok(Partition{scheme:Scheme::Mbr,index,start,sectors:end-start})
+ Ok(found)
 }
-fn gpt<D:BlockDevice>(disk:&mut D,index:u32)->Result<Partition,Error>{
+fn gpt<D:BlockDevice>(disk:&mut D)->Result<PartitionSet,Error>{
  let capacity=disk.sector_count();
  if capacity<68{return Err(Error::Invalid);}
  let hdr=read(disk,1)?;
@@ -140,8 +174,7 @@ fn gpt<D:BlockDevice>(disk:&mut D,index:u32)->Result<Partition,Error>{
   backup_crc=crc_update(backup_crc,&sector[..n]);
  }
  if !backup_crc!=checksum{return Err(Error::Invalid);}
- if index as usize>=entries{return Err(Error::NotFound);}
- let mut seen=[None;MAX_GPT_ENTRIES];
+ let mut found=PartitionSet::empty(Scheme::Gpt);
  // GPT unique partition GUIDs identify distinct volumes across reboot.
  // Duplicate GUIDs make per-volume identity ambiguous even with safe LBAs.
  let mut unique_guids=[[0u8;16];MAX_GPT_ENTRIES];
@@ -166,16 +199,23 @@ fn gpt<D:BlockDevice>(disk:&mut D,index:u32)->Result<Partition,Error>{
   let start=le64(&entry[32..40]);let end=le64(&entry[40..48]);
   if start<first||end>last||end<start{return Err(Error::OutOfRange);}
   let exclusive=end.checked_add(1).ok_or(Error::OutOfRange)?;
-  for &(previous_start,previous_end) in seen.iter().flatten(){
-   if start<previous_end&&previous_start<exclusive{return Err(Error::Overlap);}
+  for prior in found.iter(){
+   let prior_end=prior.start+prior.sectors; // already validated below capacity
+   if start<prior_end&&prior.start<exclusive{return Err(Error::Overlap);}
   }
-  seen[i]=Some((start,exclusive));
   unique_guids[i].copy_from_slice(&entry[16..32]);
+  found.record(Partition{scheme:Scheme::Gpt,index:i as u32,start,sectors:exclusive-start})?;
  }
- let (start,end)=seen[index as usize].ok_or(Error::NotFound)?;
- Ok(Partition{scheme:Scheme::Gpt,index,start,sectors:end-start})
+ Ok(found)
 }
-pub fn inspect<D:BlockDevice>(disk:&mut D,index:u32)->Result<Partition,Error>{
+/// Validate the complete MBR/GPT table, both GPT copies and all live
+/// partition bounds before returning any read-only discovery result.
+/// No formatting, repair, mounting or writes occur here.
+pub fn discover<D:BlockDevice>(disk:&mut D)->Result<PartitionSet,Error>{
+ let mut read_only=ReadOnlyDevice::new(disk);
+ discover_verified(&mut read_only)
+}
+fn discover_verified<D:BlockDevice>(disk:&mut D)->Result<PartitionSet,Error>{
  if disk.sector_count()<2{return Err(Error::Invalid);}
  let first=read(disk,0)?;
  if first[510]!=0x55||first[511]!=0xaa{return Err(Error::Invalid);}
@@ -195,8 +235,45 @@ pub fn inspect<D:BlockDevice>(disk:&mut D,index:u32)->Result<Partition,Error>{
   if covered<(disk.sector_count()-1).min(u32::MAX as u64){
    return Err(Error::Invalid);
   }
-  gpt(disk,index)
- }else{mbr(disk,index,&first)}
+  gpt(disk)
+ }else{mbr(disk,&first)}
+}
+/// Select one existing ordinal only after validating the entire layout.
+pub fn inspect<D:BlockDevice>(disk:&mut D,index:u32)->Result<Partition,Error>{
+ discover(disk)?.get(index).ok_or(Error::NotFound)
+}
+/// Read-only validated disk geometry and independent COW metadata health.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct PartitionHealth{pub partition:Partition,pub volume:VolumeHealth}
+/// Probe a user-selected partition without formatting or mounting it.
+/// The whole partition table is validated, then both superblocks/payload
+/// checksums are read from an isolated BlockWindow. No write is performed.
+pub fn probe_volume<D:BlockDevice>(disk:&mut D,index:u32)
+ ->Result<PartitionHealth,MountError>{
+ let partition=inspect(disk,index).map_err(MountError::Partition)?;
+ if partition.sectors<MIN_SECTORS{
+  return Err(MountError::Partition(Error::OutOfRange));
+ }
+ let mut window=BlockWindow::new(disk,partition.start,partition.sectors)
+  .map_err(|_|MountError::Partition(Error::OutOfRange))?;
+ let mut read_only=ReadOnlyDevice::new(&mut window);
+ let volume=DurableFs::inspect_health(&mut read_only)
+  .map_err(MountError::Filesystem)?;
+ Ok(PartitionHealth{partition,volume})
+}
+/// Mount a previously chosen partition only when its full on-disk geometry
+/// still matches a fresh complete read-only layout validation. This closes a
+/// time-of-check/time-of-use gap before bounded VFS selection. No formatting.
+pub fn mount_checked<'a,D:BlockDevice>(disk:&'a mut D,
+ expected:Partition)->Result<HierVfs<BlockWindow<'a,D>>,MountError>{
+ let actual=inspect(disk,expected.index).map_err(MountError::Partition)?;
+ if actual!=expected{return Err(MountError::Partition(Error::Invalid));}
+ if actual.sectors<MIN_SECTORS{
+  return Err(MountError::Partition(Error::OutOfRange));
+ }
+ let bounded=BlockWindow::new(disk,actual.start,actual.sectors)
+  .map_err(|_|MountError::Partition(Error::OutOfRange))?;
+ HierVfs::mount(bounded).map_err(MountError::Filesystem)
 }
 /// Mount previously provisioned IndianOS volume inside an explicitly chosen
 /// partition. The disk is borrowed; the view cannot access neighboring
@@ -213,10 +290,11 @@ pub fn mount<'a,D:BlockDevice>(disk:&'a mut D,index:u32)
 mod m1_partition_tests{
  use super::*;
  const COUNT:usize=256;
- struct Disk{data:[[u8;SECTOR_BYTES];COUNT],writes:usize,fail_at:Option<usize>}
+ struct Disk{data:[[u8;SECTOR_BYTES];COUNT],writes:usize,fail_at:Option<usize>,fail_read:Option<u64>}
  impl BlockDevice for Disk{
   fn sector_count(&self)->u64{COUNT as u64}
   fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   if self.fail_read==Some(lba){return Err(BlockError::Io);}
    *out=*self.data.get(lba as usize).ok_or(BlockError::OutOfRange)?;Ok(())
   }
   fn write_sector(&mut self,lba:u64,input:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
@@ -225,7 +303,7 @@ mod m1_partition_tests{
    self.writes+=1;Ok(())
   }
  }
- fn new()->Disk{Disk{data:[[0;SECTOR_BYTES];COUNT],writes:0,fail_at:None}}
+ fn new()->Disk{Disk{data:[[0;SECTOR_BYTES];COUNT],writes:0,fail_at:None,fail_read:None}}
  fn mbr_disk()->Disk{
   let mut d=new();d.data[0][510]=0x55;d.data[0][511]=0xaa;
   let entry=&mut d.data[0][446..462];entry[4]=0x83;
@@ -467,6 +545,160 @@ mod m1_partition_tests{
   mismatched_pointer.data[255][16..20].copy_from_slice(&checksum.to_le_bytes());
   assert_eq!(inspect(&mut mismatched_pointer,0),Err(Error::Invalid));
   assert_eq!(mismatched_pointer.writes,0);
+ }
+
+ fn rechecksum_gpt(d:&mut Disk){
+  let table_crc=crc(&d.data[2]);
+  d.data[1][88..92].copy_from_slice(&table_crc.to_le_bytes());
+  d.data[1][16..20].fill(0);
+  let header_crc=crc(&d.data[1][..92]);
+  d.data[1][16..20].copy_from_slice(&header_crc.to_le_bytes());
+  sync_backup(d);
+ }
+ #[test]fn m1_r045_mbr_inventory_preserves_sparse_ordinals_without_writes(){
+  let mut d=mbr_disk();
+  let slot=&mut d.data[0][446+2*16..446+3*16];
+  slot[4]=0x83;slot[8..12].copy_from_slice(&120u32.to_le_bytes());
+  slot[12..16].copy_from_slice(&100u32.to_le_bytes());
+  let scanned=discover(&mut d).unwrap();
+  assert_eq!(scanned.scheme(),Scheme::Mbr);
+  assert_eq!(scanned.len(),2);
+  assert_eq!(scanned.get(0).unwrap().start,10);
+  assert_eq!(scanned.get(1),None);
+  assert_eq!(scanned.get(2).unwrap().start,120);
+  assert_eq!(scanned.get(4),None);
+  assert_eq!(scanned.iter().map(|x|x.index).collect::<Vec<_>>(),vec![0,2]);
+  assert_eq!(inspect(&mut d,1),Err(Error::NotFound));
+  assert_eq!(d.writes,0);
+ }
+ #[test]fn m1_r045_gpt_inventory_preserves_sparse_entries_and_validates_all(){
+  let mut d=gpt_disk();
+  let entry=&mut d.data[2][2*128..3*128];
+  entry[..16].fill(4);entry[16..32].fill(5);
+  entry[32..40].copy_from_slice(&145u64.to_le_bytes());
+  entry[40..48].copy_from_slice(&200u64.to_le_bytes());
+  rechecksum_gpt(&mut d);
+  let scanned=discover(&mut d).unwrap();
+  assert_eq!(scanned.scheme(),Scheme::Gpt);
+  assert_eq!(scanned.len(),2);
+  assert_eq!(scanned.get(1),None);
+  assert_eq!(scanned.get(2).unwrap().sectors,56);
+  assert_eq!(scanned.iter().map(|p|p.index).collect::<Vec<_>>(),vec![0,2]);
+  assert_eq!(d.writes,0);
+  d.data[254][256]^=1;
+  assert_eq!(discover(&mut d),Err(Error::Invalid));
+  assert_eq!(d.writes,0);
+ }
+ #[test]fn m1_r045_inventory_short_destination_is_unmodified(){
+  let mut d=mbr_disk();
+  let slot=&mut d.data[0][462..478];
+  slot[4]=0x83;slot[8..12].copy_from_slice(&120u32.to_le_bytes());
+  slot[12..16].copy_from_slice(&90u32.to_le_bytes());
+  let set=discover(&mut d).unwrap();
+  let original=Partition{scheme:Scheme::Gpt,index:99,start:999,sectors:1};
+  let mut short=[original;1];
+  assert_eq!(set.copy_to(&mut short),Err(Error::TooSmall));
+  assert_eq!(short,[original]);
+  let mut wide=[original;3];
+  assert_eq!(set.copy_to(&mut wide),Ok(2));
+  assert_eq!(wide[0].index,0);
+  assert_eq!(wide[1].index,1);
+  assert_eq!(wide[2],original);
+  assert_eq!(d.writes,0);
+ }
+ #[test]fn m1_r045_read_errors_and_corrupted_layout_fail_closed(){
+  let mut d=gpt_disk();d.fail_read=Some(255);
+  assert_eq!(discover(&mut d),Err(Error::Io));
+  assert_eq!(d.writes,0);
+  d.fail_read=None;d.data[0][462+4]=0x83;
+  assert_eq!(discover(&mut d),Err(Error::Unsupported));
+  assert_eq!(d.writes,0);
+ }
+ #[test]fn m1_r045_checked_mount_detects_changed_geometry_before_writing(){
+  let mut d=mbr_disk();
+  let original=inspect(&mut d,0).unwrap();
+  let stale=Partition{start:original.start+1,..original};
+  assert!(matches!(mount_checked(&mut d,stale),
+   Err(MountError::Partition(Error::Invalid))));
+  assert_eq!(d.writes,0);
+  {
+   let win=BlockWindow::new(&mut d,10,100).unwrap();
+   let mut fs=HierVfs::format_blank(win).unwrap();
+   fs.mkdir("/docs").unwrap();fs.create("/docs/file",b"stable").unwrap();
+  }
+  let before=d.writes;
+  {
+   let mut fs=mount_checked(&mut d,original).unwrap();
+   let mut out=[0;32];
+   assert_eq!(fs.read("/docs/file",&mut out),Ok(6));
+   assert_eq!(&out[..6],b"stable");
+  }
+  assert_eq!(d.writes,before);
+  assert_eq!(d.data[9],[0;SECTOR_BYTES]);
+  assert_eq!(d.data[110],[0;SECTOR_BYTES]);
+ }
+ #[test]fn m1_r045_partition_probe_reports_verified_healthy_then_degraded(){
+  let mut d=gpt_disk();
+  let part=inspect(&mut d,0).unwrap();
+  assert_eq!(probe_volume(&mut d,0),
+   Err(MountError::Filesystem(FsError::InvalidVolume)));
+  assert_eq!(d.writes,0);
+  {
+   let win=BlockWindow::new(&mut d,part.start,part.sectors).unwrap();
+   let mut fs=HierVfs::format_blank(win).unwrap();
+   fs.mkdir("/docs").unwrap();fs.create("/docs/a",b"new").unwrap();
+  }
+  let before=d.writes;
+  let health=probe_volume(&mut d,0).unwrap();
+  assert_eq!(health.partition,part);
+  assert_eq!(health.volume.valid_copies,2);
+  assert_eq!(health.volume.redundancy,crate::durablefs::Redundancy::Healthy);
+  assert_eq!(d.writes,before);
+  d.data[40][19]^=1; // corrupt only selected window's first superblock
+  let degraded=probe_volume(&mut d,0).unwrap();
+  assert_eq!(degraded.volume.valid_copies,1);
+  assert_eq!(degraded.volume.redundancy,crate::durablefs::Redundancy::Degraded);
+  assert_eq!(d.writes,before);
+  assert_eq!(d.data[39],[0;SECTOR_BYTES]);
+  assert_eq!(d.data[140],[0;SECTOR_BYTES]);
+ }
+ #[test]fn m1_r045_failed_selected_probe_cannot_format_any_device(){
+  let mut d=mbr_disk();
+  let before=d.writes;
+  assert_eq!(probe_volume(&mut d,0),
+   Err(MountError::Filesystem(FsError::InvalidVolume)));
+  assert_eq!(probe_volume(&mut d,1),Err(MountError::Partition(Error::NotFound)));
+  assert_eq!(d.writes,before);
+  assert_eq!(d.data[10],[0;SECTOR_BYTES]);
+ }
+ #[test]fn m1_r045_backup_gpt_metadata_must_match_before_any_volume_probe(){
+  let mut d=gpt_disk();
+  d.data[255][16]^=0x2;
+  assert_eq!(probe_volume(&mut d,0),Err(MountError::Partition(Error::Invalid)));
+  assert_eq!(d.writes,0);
+ }
+
+ #[test]fn m1_r045_empty_valid_mbr_reports_no_partitions_without_format(){
+  let mut d=new();d.data[0][510]=0x55;d.data[0][511]=0xaa;
+  let inventory=discover(&mut d).unwrap();
+  assert!(inventory.is_empty());
+  assert_eq!(inventory.len(),0);
+  assert_eq!(inventory.get(0),None);
+  assert_eq!(inspect(&mut d,0),Err(Error::NotFound));
+  assert_eq!(d.writes,0);
+ }
+ #[test]fn m1_r045_explicit_format_is_blocked_through_read_only_window(){
+  let mut d=mbr_disk();
+  let before=d.writes;
+  {
+   let mut window=BlockWindow::new(&mut d,10,100).unwrap();
+   let readonly=ReadOnlyDevice::new(&mut window);
+   // Even a mistaken explicit formatting call can never reach a disk
+   // mutation through the read-only diagnostic capability.
+   assert!(matches!(HierVfs::format_blank(readonly),Err(FsError::Io)));
+  }
+  assert_eq!(d.writes,before);
+  assert_eq!(d.data[10],[0;SECTOR_BYTES]);
  }
 
 }

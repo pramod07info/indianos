@@ -496,6 +496,18 @@ impl<D:BlockDevice,const P:usize,const E:usize,const W:usize,
 impl<'a,D:BlockDevice,const P:usize,const E:usize,const W:usize,
  const K:usize,const G:usize,const Q:usize>
  Desktop<BlockWindow<'a,D>,P,E,W,K,G,Q>{
+ /// Workspace/installer read-only preflight. Never attempts autoformat,
+ /// writes or repair, even if the selected volume is degraded.
+ pub fn preflight_selected(disk:&mut D,index:u32)
+  ->Result<m1_partition::PartitionHealth,MountError>{
+  m1_partition::probe_volume(disk,index)
+ }
+ /// Explicit geometry-locked selection that refuses a changed partition
+ /// before returning a mounted persistent Desktop service.
+ pub fn mount_checked_selected(disk:&'a mut D,
+  selected:m1_partition::Partition)->Result<Self,MountError>{
+  m1_partition::mount_checked(disk,selected).map(Self::from_mounted)
+ }
  pub fn mount_selected(disk:&'a mut D,index:u32)->Result<Self,MountError>{
   m1_partition::mount(disk,index).map(Self::from_mounted)
  }
@@ -877,14 +889,25 @@ mod tests{
   disk.data[0][458..462].copy_from_slice(&100u32.to_le_bytes());
   assert!(Desktop::<crate::block::BlockWindow<'_,PartitionDisk>,3,3,3,3,3,5>
    ::mount_selected(&mut disk,0).is_err()); // never autoformats
+  assert!(Desktop::<crate::block::BlockWindow<'_,PartitionDisk>,3,3,3,3,3,5>
+   ::preflight_selected(&mut disk,0).is_err()); // health check is read-only
   {
    let view=BlockWindow::new(&mut disk,16,100).unwrap();
    let fs=HierVfs::format_blank(view).unwrap();
    drop(fs);
   }
+  let selected=crate::m1_partition::inspect(&mut disk,0).unwrap();
+  let report=Desktop::<crate::block::BlockWindow<'_,PartitionDisk>,3,3,3,3,3,5>
+   ::preflight_selected(&mut disk,0).unwrap();
+  assert_eq!(report.partition,selected);
+  assert_eq!(report.volume.valid_copies,2);
+  assert!(Desktop::<crate::block::BlockWindow<'_,PartitionDisk>,3,3,3,3,3,5>
+   ::mount_checked_selected(&mut disk,crate::m1_partition::Partition{
+     sectors:99,..selected
+   }).is_err());
   {
    let mut desk=Desktop::<crate::block::BlockWindow<'_,PartitionDisk>,3,3,3,3,3,5>
-    ::mount_selected(&mut disk,0).unwrap();
+    ::mount_checked_selected(&mut disk,selected).unwrap();
    desk.start(user(1),load(1),user(2),load(2),settings(),10,100).unwrap();
    let mut output=[0u8;256];
    assert_eq!(desk.execute(user(2),1,b"mkdir /docs",&mut output),Ok(7));
