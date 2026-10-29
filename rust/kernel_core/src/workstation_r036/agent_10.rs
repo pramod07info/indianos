@@ -1,0 +1,5 @@
+//! R036/10: Editor undo checkpoint with source digest. Real guest filesystem/workstation operation.
+use super::Error;
+use crate::batch7_ramfs::{RamFs,CONTENT_MAX,PATH_MAX};
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]pub struct Checkpoint{pub revision:u64,pub digest:u64,pub bytes:usize}pub fn capture<const F:usize>(fs:&RamFs<F>,path:&[u8])->Result<Checkpoint,Error>{let(revision,n)=fs.metadata(path).map_err(|_|Error::Missing)?;let mut data=[0;CONTENT_MAX];fs.read(path,0,&mut data[..n]).map_err(|_|Error::Missing)?;Ok(Checkpoint{revision,digest:crate::workstation_r032::agent_02::digest(&data[..n]),bytes:n})}pub fn unchanged<const F:usize>(fs:&RamFs<F>,path:&[u8],saved:Checkpoint)->Result<bool,Error>{let current=capture(fs,path)?;Ok(saved==current)}
+#[cfg(test)]mod tests{use super::*;#[test]fn real_functional_regression(){let mut fs=RamFs::<1>::new();fs.replace(b"/p/a",b"before").unwrap();let c=capture(&fs,b"/p/a").unwrap();assert_eq!(unchanged(&fs,b"/p/a",c),Ok(true));fs.replace(b"/p/a",b"after").unwrap();assert_eq!(unchanged(&fs,b"/p/a",c),Ok(false));}}

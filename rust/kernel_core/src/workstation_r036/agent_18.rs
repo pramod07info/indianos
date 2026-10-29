@@ -1,0 +1,5 @@
+//! R036/18: Bounded debugger trace with monotonic frames.
+use super::Error;
+use crate::batch7_ramfs::{RamFs,CONTENT_MAX,PATH_MAX};
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]pub struct Frame{pub sequence:u64,pub pc:u64}pub struct Trace<const N:usize>{owner:u64,frames:[Option<Frame>;N],used:usize,last:u64}impl<const N:usize> Trace<N>{pub fn new(owner:u64)->Self{Self{owner,frames:[None;N],used:0,last:0}}pub fn push(&mut self,owner:u64,trusted:bool,frame:Frame)->Result<(),Error>{if owner==0||owner!=self.owner||!trusted{return Err(Error::Denied);}if frame.sequence<=self.last||frame.pc==0{return Err(Error::Stale);}if N==0{return Err(Error::Full);}if self.used==N{for i in 1..N{self.frames[i-1]=self.frames[i];}self.used-=1;}self.frames[self.used]=Some(frame);self.used+=1;self.last=frame.sequence;Ok(())}pub fn latest(&self)->Option<Frame>{if self.used==0{None}else{self.frames[self.used-1]}}}
+#[cfg(test)]mod tests{use super::*;#[test]fn real_functional_regression(){let mut t=Trace::<2>::new(7);t.push(7,true,Frame{sequence:1,pc:42}).unwrap();t.push(7,true,Frame{sequence:2,pc:44}).unwrap();assert_eq!(t.latest(),Some(Frame{sequence:2,pc:44}));}}

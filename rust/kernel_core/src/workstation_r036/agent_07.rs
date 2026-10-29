@@ -1,0 +1,5 @@
+//! R036/07: Source line and column jump navigation. Real guest filesystem/workstation operation.
+use super::Error;
+use crate::batch7_ramfs::{RamFs,CONTENT_MAX,PATH_MAX};
+pub fn locate<const F:usize>(fs:&RamFs<F>,path:&[u8],line:usize,column:usize)->Result<usize,Error>{if line==0||column==0{return Err(Error::Invalid);}let(_,n)=fs.metadata(path).map_err(|_|Error::Missing)?;let mut data=[0;CONTENT_MAX];fs.read(path,0,&mut data[..n]).map_err(|_|Error::Missing)?;let text=core::str::from_utf8(&data[..n]).map_err(|_|Error::Invalid)?;let mut position=0;for(i,part)in text.split('\n').enumerate(){if i+1==line{let offset=part.char_indices().nth(column-1).map(|(p,_)|p).or_else(||if column==part.chars().count()+1{Some(part.len())}else{None}).ok_or(Error::Invalid)?;return Ok(position+offset);}position+=part.len()+1;}Err(Error::Missing)}
+#[cfg(test)]mod tests{use super::*;#[test]fn real_functional_regression(){let mut fs=RamFs::<1>::new();fs.replace(b"/p/a","one\nαβ".as_bytes()).unwrap();assert_eq!(locate(&fs,b"/p/a",2,2),Ok(6));assert_eq!(locate(&fs,b"/p/a",2,5),Err(Error::Invalid));}}
