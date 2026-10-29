@@ -221,3 +221,49 @@ M1 accepted milestone gates remain unchanged. The real normal-boot
 ring-3 compositor and user Terminal, IRQ-to-disk filesystem read-after-
 reboot, physical hardware and recovery acceptance remain open under
 the M1-first directive in issue #616.
+
+
+### R043 M1 workstation file toolkit, source editor and project line navigation (2026-10-29)
+
+This is a M1-first, **single-commit integrated functional batch**. No fake
+Agent 01..20 files and no assertion that the existing GitHub "ten modules"
+verification workflow launched independently executing code-writing agents.
+
+Actual production work:
+1. Terminal "tools" command shows the supported file-tool subset.
+2. Terminal count returns exact persisted file byte length (previously in help
+   but unimplemented).
+3. Terminal lines counts persisted UTF-8 source lines.
+4. Terminal hash returns a 16-character FNV-1a diagnostic fingerprint
+   (NOT a cryptographic integrity/authenticity mechanism).
+5. Terminal stat returns file byte length and volume revision.
+6. Terminal tail reads the last bounded N bytes, even for files larger than
+   the terminal's output transfer.
+7. Terminal find locates the first literal text match by byte offset.
+8. Terminal grep returns complete matching lines without partial output.
+9. Terminal cmp compares two complete persisted files.
+10. Terminal touch creates an empty file only when absent, preserving existing
+    data and enforcing reserved namespace denial.
+11. Terminal copynew creates a new checked copy, failing rather than
+    overwriting an existing destination.
+12. Terminal replace performs full-file literal replacement with exactly one
+    copy-on-write commit and no partial edits on oversize/bad paths.
+13. Terminal appendln appends a line and LF via one durable file overwrite.
+14. DiskEditor replace_text checks Unicode boundaries before local changes.
+15. DiskEditor replace_all_text performs one undoable Unicode refactoring.
+16. DiskEditor find_text navigates the in-memory unsaved source revision.
+17. DiskEditor text_offset maps line/column to UTF-8 source offsets.
+18. ProjectTree read_source_line reads a single Unicode source line atomically.
+19. ProjectTree insert_source_line and delete_source_line commit durable
+    bounded, per-file revision-locked line edits.
+20. Desktop routes the new source editing, code search, file duplication,
+    line navigation and line operations behind live PID-generation capability
+    checks rather than trusting process-supplied identities.
+
+Verification: 12 focused R043 regression tests added across Terminal,
+DiskEditor, ProjectTree and Desktop. The mandatory M1 workflow runs the new
+r043_ group in addition to prior M1 and R040 tests, no_std, kernel S0,
+full kernel boot and actual graphical Files/disk persistence QEMU coverage.
+All test and QEMU results must be verified by exact-head GitHub Actions
+before any merge. Source test services do NOT alone close the eight outstanding
+M1 acceptance gates (real normal-boot ring-3 UI/IRQ/storage/recovery proof).

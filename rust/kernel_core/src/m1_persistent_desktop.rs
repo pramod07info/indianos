@@ -768,6 +768,32 @@ impl<D:BlockDevice,const P:usize,const E:usize,const W:usize,
   self.admit_editor(caller,now,FILE_WRITE)?;
   editor.save_as(caller,&mut self.volume,target).map_err(EditorRouteError::Editor)
  }
+ /// Unicode-safe editing of the open unsaved source buffer.
+ pub fn editor_replace_text(&mut self,caller:Identity,now:u64,
+    editor:&mut crate::m1_disk_editor::DiskEditor,
+    from:usize,to:usize,insert:&str)->Result<usize,EditorRouteError>{
+  self.admit_editor(caller,now,FILE_WRITE)?;
+  editor.replace_text(caller,from,to,insert).map_err(EditorRouteError::Editor)
+ }
+ /// One owner-bound undo snapshot for whole-document literal refactoring.
+ pub fn editor_replace_all_text(&mut self,caller:Identity,now:u64,
+    editor:&mut crate::m1_disk_editor::DiskEditor,
+    needle:&str,replacement:&str)->Result<usize,EditorRouteError>{
+  self.admit_editor(caller,now,FILE_WRITE)?;
+  editor.replace_all_text(caller,needle,replacement).map_err(EditorRouteError::Editor)
+ }
+ pub fn editor_find_text(&self,caller:Identity,now:u64,
+    editor:&crate::m1_disk_editor::DiskEditor,
+    needle:&str,from:usize)->Result<Option<usize>,EditorRouteError>{
+  self.admit_editor(caller,now,FILE_READ)?;
+  editor.find_text(caller,needle,from).map_err(EditorRouteError::Editor)
+ }
+ pub fn editor_text_offset(&self,caller:Identity,now:u64,
+    editor:&crate::m1_disk_editor::DiskEditor,
+    line:usize,column:usize)->Result<usize,EditorRouteError>{
+  self.admit_editor(caller,now,FILE_READ)?;
+  editor.text_offset(caller,line,column).map_err(EditorRouteError::Editor)
+ }
  pub fn editor_save(&mut self,caller:Identity,now:u64,
     editor:&mut crate::m1_disk_editor::DiskEditor)
     ->Result<u64,EditorRouteError>{
@@ -856,6 +882,64 @@ impl<D:BlockDevice,const P:usize,const E:usize,const W:usize,
     file:&str,find:&str,replacement:&str)->Result<usize,ProjectRouteError>{
   self.admit_editor(caller,now,FILE_WRITE).map_err(ProjectRouteError::Permission)?;
   project.replace_all(caller,&mut self.volume,file,find,replacement)
+   .map_err(ProjectRouteError::Project)
+ }
+ /// Authenticated per-line source access; never exposes full VFS handles.
+ pub fn project_read_source_line(&mut self,caller:Identity,now:u64,
+    project:&crate::m1_project_workspace::ProjectTree,
+    file:&str,line:usize,out:&mut[u8])->Result<usize,ProjectRouteError>{
+  self.admit_editor(caller,now,FILE_READ).map_err(ProjectRouteError::Permission)?;
+  project.read_source_line(caller,&mut self.volume,file,line,out)
+   .map_err(ProjectRouteError::Project)
+ }
+ pub fn project_insert_source_line(&mut self,caller:Identity,now:u64,
+    project:&mut crate::m1_project_workspace::ProjectTree,
+    file:&str,line:usize,source:&str)->Result<usize,ProjectRouteError>{
+  self.admit_editor(caller,now,FILE_WRITE).map_err(ProjectRouteError::Permission)?;
+  project.insert_source_line(caller,&mut self.volume,file,line,source)
+   .map_err(ProjectRouteError::Project)
+ }
+ pub fn project_delete_source_line(&mut self,caller:Identity,now:u64,
+    project:&mut crate::m1_project_workspace::ProjectTree,
+    file:&str,line:usize)->Result<usize,ProjectRouteError>{
+  self.admit_editor(caller,now,FILE_WRITE).map_err(ProjectRouteError::Permission)?;
+  project.delete_source_line(caller,&mut self.volume,file,line)
+   .map_err(ProjectRouteError::Project)
+ }
+ pub fn project_source_offset(&mut self,caller:Identity,now:u64,
+    project:&crate::m1_project_workspace::ProjectTree,
+    file:&str,line:usize,column:usize)->Result<usize,ProjectRouteError>{
+  self.admit_editor(caller,now,FILE_READ).map_err(ProjectRouteError::Permission)?;
+  project.source_offset(caller,&mut self.volume,file,line,column)
+   .map_err(ProjectRouteError::Project)
+ }
+ pub fn project_source_lines(&mut self,caller:Identity,now:u64,
+    project:&crate::m1_project_workspace::ProjectTree,
+    file:&str)->Result<usize,ProjectRouteError>{
+  self.admit_editor(caller,now,FILE_READ).map_err(ProjectRouteError::Permission)?;
+  project.source_lines(caller,&mut self.volume,file).map_err(ProjectRouteError::Project)
+ }
+ pub fn project_source_checksum(&mut self,caller:Identity,now:u64,
+    project:&crate::m1_project_workspace::ProjectTree,
+    file:&str)->Result<u64,ProjectRouteError>{
+  self.admit_editor(caller,now,FILE_READ).map_err(ProjectRouteError::Permission)?;
+  project.source_checksum(caller,&mut self.volume,file)
+   .map_err(ProjectRouteError::Project)
+ }
+ pub fn project_find_source(&mut self,caller:Identity,now:u64,
+    project:&crate::m1_project_workspace::ProjectTree,
+    file:&str,query:&[u8],from:usize,out:&mut[usize]
+    )->Result<usize,ProjectRouteError>{
+  self.admit_editor(caller,now,FILE_READ).map_err(ProjectRouteError::Permission)?;
+  project.find_source(caller,&mut self.volume,file,query,from,out)
+   .map_err(ProjectRouteError::Project)
+ }
+ pub fn project_duplicate_file(&mut self,caller:Identity,now:u64,
+    project:&mut crate::m1_project_workspace::ProjectTree,
+    source:&str,dest:&str)->Result<usize,ProjectRouteError>{
+  self.admit_editor(caller,now,FILE_READ|FILE_WRITE)
+   .map_err(ProjectRouteError::Permission)?;
+  project.duplicate_file(caller,&mut self.volume,source,dest)
    .map_err(ProjectRouteError::Project)
  }
  pub fn project_rename_file(&mut self,caller:Identity,now:u64,
@@ -976,6 +1060,52 @@ mod r019_project_desktop_integration_tests {
   let mut out=[0;16];
   assert_eq!(fs.read("/work/demo/code",&mut out),Ok(7));
   assert_eq!(&out[..7],b"xyz xyz");
+ }
+ #[test]fn r043_desktop_source_editor_unicode_routes_are_owner_bound(){
+  let mut fs=HierVfs::format_blank(Disk{data:[[0;SECTOR_BYTES];100]}).unwrap();
+  fs.create("/src",b"foo foo").unwrap();
+  let mut gui=TestDesk::from_mounted(fs);
+  gui.start(identity(1),image(1),identity(2),image(2),settings(),8,50).unwrap();
+  let mut editor=crate::m1_disk_editor::DiskEditor::new();
+  gui.editor_open(identity(2),1,&mut editor,"/src").unwrap();
+  assert_eq!(gui.editor_find_text(identity(2),1,&editor,"foo",1),Ok(Some(4)));
+  let other=Identity{pid:2,generation:2};
+  assert!(gui.editor_replace_all_text(other,1,&mut editor,"foo","🍀").is_err());
+  assert_eq!(gui.editor_replace_all_text(identity(2),1,&mut editor,"foo","🍀"),Ok(2));
+  assert_eq!(gui.editor_text_offset(identity(2),1,&editor,1,2),Ok(4));
+  gui.editor_save(identity(2),1,&mut editor).unwrap();
+  let mut fs=HierVfs::mount(gui.into_device()).unwrap();
+  let mut output=[0;32];
+  assert_eq!(fs.read("/src",&mut output),Ok("🍀 🍀".len()));
+  assert_eq!(&output[.."🍀 🍀".len()],"🍀 🍀".as_bytes());
+ }
+ #[test]fn r043_desktop_project_line_routes_check_permissions_and_remount(){
+  let fs=HierVfs::format_blank(Disk{data:[[0;SECTOR_BYTES];100]}).unwrap();
+  let mut gui=TestDesk::from_mounted(fs);
+  gui.start(identity(1),image(1),identity(2),image(2),settings(),8,5).unwrap();
+  let mut project=ProjectTree::new();
+  gui.project_create(identity(2),1,&mut project,"demo").unwrap();
+  gui.project_create_file(identity(2),1,&mut project,"main",b"one\nthree\n").unwrap();
+  assert!(gui.project_insert_source_line(identity(2),5,&mut project,
+      "main",2,"two").is_err());
+  assert_eq!(gui.project_insert_source_line(identity(2),1,&mut project,
+     "main",2,"two"),Ok(14));
+  let mut output=[0;32];
+  assert_eq!(gui.project_read_source_line(identity(2),1,&project,
+     "main",2,&mut output),Ok(3));
+  assert_eq!(&output[..3],b"two");
+  assert_eq!(gui.project_source_lines(identity(2),1,&project,"main"),Ok(3));
+  assert_eq!(gui.project_source_offset(identity(2),1,&project,"main",3,1),Ok(8));
+  assert_eq!(gui.project_find_source(identity(2),1,&project,"main",b"three",0,
+       &mut [0usize;2]),Ok(1));
+  assert!(gui.project_source_checksum(identity(2),1,&project,"main").is_ok());
+  assert_eq!(gui.project_duplicate_file(identity(2),1,&mut project,
+     "main","copy"),Ok(14));
+  let disk=gui.into_device();
+  let mut fs=HierVfs::mount(disk).unwrap();
+  let mut result=[0;24];
+  assert_eq!(fs.read("/work/demo/copy",&mut result),Ok(14));
+  assert_eq!(&result[..14],b"one\ntwo\nthree\n");
  }
  #[test]fn expired_capability_rejects_mutation_before_disk_write(){
   let fs=HierVfs::format_blank(Disk{data:[[0;SECTOR_BYTES];100]}).unwrap();
