@@ -1,0 +1,5 @@
+//! R035/16 — Per-source trusted unit-test status ledger.
+use super::Error;
+use crate::batch7_ramfs::{RamFs,CONTENT_MAX};
+pub struct Suite<const N:usize>{owner:u64,results:[Option<(u64,bool)>;N],len:usize}impl<const N:usize> Suite<N>{pub fn new(owner:u64)->Self{Self{owner,results:[None;N],len:0}}pub fn report(&mut self,owner:u64,trusted:bool,id:u64,passed:bool)->Result<(),Error>{if owner==0||owner!=self.owner||!trusted{return Err(Error::Denied);}if id==0||self.results[..self.len].iter().any(|r|r.is_some_and(|(v,_)|v==id)){return Err(Error::Conflict);}if self.len==N{return Err(Error::Full);}self.results[self.len]=Some((id,passed));self.len+=1;Ok(())}pub fn all_passed(&self,owner:u64)->Result<bool,Error>{if owner!=self.owner{return Err(Error::Denied);}Ok(self.len>0&&self.results[..self.len].iter().all(|r|r.is_some_and(|(_,ok)|ok)))}}
+#[cfg(test)]mod tests{use super::*;#[test]fn real_workflow_and_failure_guard(){let mut s=Suite::<2>::new(7);s.report(7,true,1,true).unwrap();s.report(7,true,2,false).unwrap();assert_eq!(s.all_passed(7),Ok(false));assert_eq!(s.report(8,true,3,true),Err(Error::Denied));}}

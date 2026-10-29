@@ -51,6 +51,8 @@ pub mod workstation_r032;
 pub mod workstation_r033;
 /// R034: twenty integrated developer workstation state and workflow modules.
 pub mod workstation_r034;
+/// R035: connected native developer workstation file and IDE workflows.
+pub mod workstation_r035;
 mod syscall;
 mod program;
 mod initramfs;
