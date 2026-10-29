@@ -9,6 +9,16 @@ QEMU and physical hardware as specified, not merely code merged or host
 unit tests passing. Each milestone can have multiple **one-commit batches**;
 never confuse a single commit with completing a multi-year milestone.
 
+## M1-only development priority override — 2026-10-29
+
+**Active directive: [M1 completion-first gate tracker #616](https://github.com/pramod07info/indianos/issues/616).** Prioritize closure of the remaining **8 unchecked high-level M1 acceptance gates** and the full [99-task M1 phase scope](M1_PHASE_SCOPE.md) before scheduling any new unrelated Developer Workstation, M2, AI, compatibility, theme or marketing feature batches. This is a **development prioritization change**, not a claim that feature requests have been removed or existing code is broken. Finish/review an existing in-flight PR on its actual merits; no feature batch counts as a verified M1 exit.
+
+**Dependency-based execution:** (1) authenticated Terminal + block-backed VFS, defensive MBR/GPT partition mounts and power-loss-safe remount/reboot; (2) normal boot to PID1, truly independent ring-3 compositor and physical/simulated keyboard+mouse event handling; (3) independent process file syscalls, security/isolation, driver and recovery verification. These are overlapping engineering tracks, but only run parallel workers actually available.
+
+**Integration policy:** substantial production code + regression tests + real QEMU acceptance per batch; one consolidated commit and PR; run impacted M1, kernel boot, security and M2 non-regression checks on exact SHA; merge only after required CI passes, then verify merged main. Never turn a checkbox green based on mock behavior, host-only unit tests, PR title, line count or agent count. Current baseline remains **5/13**, pending **8/13**, until exact-SHA acceptance evidence justifies changing it.
+
+**First production slice:** harden GPT duplicate unique partition GUID rejection in `rust/kernel_core/src/m1_partition.rs`, with a fully checksummed nonoverlapping-partition regression. This does not by itself close the M1 partition gate; genuine QEMU partition selection, remount and corruption/failed-write acceptance are still required.
+
 ## M1 — Bootable, usable IndianOS desktop (current)
 
 **Full requirements ledger for M1:** [M1 all required phases and 99 task gates](M1_PHASE_SCOPE.md). No single existing change-set fulfills every phase; this ledger is the explicit completion contract.

@@ -142,6 +142,9 @@ fn gpt<D:BlockDevice>(disk:&mut D,index:u32)->Result<Partition,Error>{
  if !backup_crc!=checksum{return Err(Error::Invalid);}
  if index as usize>=entries{return Err(Error::NotFound);}
  let mut seen=[None;MAX_GPT_ENTRIES];
+ // GPT unique partition GUIDs identify distinct volumes across reboot.
+ // Duplicate GUIDs make per-volume identity ambiguous even with safe LBAs.
+ let mut unique_guids=[[0u8;16];MAX_GPT_ENTRIES];
  for i in 0..entries{
   let byte=i*entry_size;
   let lba=table+(byte/SECTOR_BYTES) as u64;
@@ -155,6 +158,11 @@ fn gpt<D:BlockDevice>(disk:&mut D,index:u32)->Result<Partition,Error>{
    continue;
   }
   if entry[16..32].iter().all(|&v|v==0){return Err(Error::Invalid);}
+  // An unused entry has a zero GUID, so checking earlier slots is safe.
+  // Forbid duplicated live partition identifiers before selecting a mount.
+  if unique_guids[..i].iter().any(|guid| guid.as_slice()==&entry[16..32]){
+   return Err(Error::Invalid);
+  }
   let start=le64(&entry[32..40]);let end=le64(&entry[40..48]);
   if start<first||end>last||end<start{return Err(Error::OutOfRange);}
   let exclusive=end.checked_add(1).ok_or(Error::OutOfRange)?;
@@ -162,6 +170,7 @@ fn gpt<D:BlockDevice>(disk:&mut D,index:u32)->Result<Partition,Error>{
    if start<previous_end&&previous_start<exclusive{return Err(Error::Overlap);}
   }
   seen[i]=Some((start,exclusive));
+  unique_guids[i].copy_from_slice(&entry[16..32]);
  }
  let (start,end)=seen[index as usize].ok_or(Error::NotFound)?;
  Ok(Partition{scheme:Scheme::Gpt,index,start,sectors:end-start})
@@ -296,6 +305,34 @@ mod m1_partition_tests{
   let mut out=[0;12];
   assert_eq!(fs.read("/home/a",&mut out),Ok(3));
   assert_eq!(&out[..3],b"gpt");
+ }
+ #[test]fn m1_gpt_rejects_duplicate_unique_partition_guids_without_writes(){
+  // Both partitions are in range and nonoverlapping. The only invalidity
+  // is that they claim the same unique volume identifier.
+  let mut disk=gpt_disk();
+  {
+   let second=&mut disk.data[2][128..256];
+   second[..16].fill(3); // distinct partition type
+   second[16..32].fill(4); // initially distinct partition identifier
+   second[32..40].copy_from_slice(&150u64.to_le_bytes());
+   second[40..48].copy_from_slice(&199u64.to_le_bytes());
+  }
+  let update_crcs=|disk:&mut Disk|{
+   let table_checksum=crc(&disk.data[2]);
+   disk.data[1][88..92].copy_from_slice(&table_checksum.to_le_bytes());
+   disk.data[1][16..20].fill(0);
+   let header_checksum=crc(&disk.data[1][..92]);
+   disk.data[1][16..20].copy_from_slice(&header_checksum.to_le_bytes());
+   sync_backup(disk);
+  };
+  update_crcs(&mut disk);
+  assert_eq!(inspect(&mut disk,0),Ok(Partition{
+   scheme:Scheme::Gpt,index:0,start:40,sectors:100
+  }));
+  disk.data[2][144..160].fill(2); // duplicate first entry's unique GUID
+  update_crcs(&mut disk); // both GPT tables and headers are CRC-valid
+  assert_eq!(inspect(&mut disk,0),Err(Error::Invalid));
+  assert_eq!(disk.writes,0); // reject before any mount or write
  }
  #[test]fn m1_corrupted_headers_entries_and_overlap_rejected_without_writes(){
   let mut disk=gpt_disk();

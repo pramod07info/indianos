@@ -5,6 +5,12 @@ QEMU kernel to a usable OS. **An item is done only after its acceptance checks
 are observed**. Source code, diagrams, and passing host tests alone do not
 establish working interrupts, a desktop, or third-party application support.
 
+## M1 acceptance-first priority (2026-10-29)
+
+**New development strategy:** [M1-only gate tracker #616](https://github.com/pramod07info/indianos/issues/616) is the active priority until all 8 remaining high-level M1 gates and their detailed acceptance tests close. Do not schedule additional unrelated 20-feature workstation/M2 batches. Reuse and integrate existing kernel, partition, persistent Terminal, filesystem and graphical services rather than creating duplicate modules.
+
+**First batches, dependency order:** persistent Terminal/partition + powercut/reboot → normal PID1/true ring-3 compositor + PS/2 input → authenticated cross-process syscall filesystem + physical-device recovery acceptance. One reviewed integration commit and PR per batch, with exact SHA Rust/no_std and real QEMU CI. No gate completion claims without observed end-to-end acceptance; keep existing experimental limitations explicit.
+
 ## Kernel-first architecture design and integration gate (2026-10-28)
 
 **Decision:** complete and review the kernel architecture baseline **before**
