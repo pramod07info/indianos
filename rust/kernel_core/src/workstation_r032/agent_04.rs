@@ -24,7 +24,7 @@ pub fn verify<const F:usize,const N:usize>(fs:&RamFs<F>,root:&[u8],
    report.added+=1;
   }
  }
- *out=dirty;Ok(report)
+ out[..count].copy_from_slice(&dirty[..count]);Ok(report)
 }
 pub fn clean(report:Audit)->bool{report.missing==0&&report.stale==0&&report.added==0}
 #[cfg(test)]mod tests{
