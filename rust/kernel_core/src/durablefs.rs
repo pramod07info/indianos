@@ -148,6 +148,18 @@ fn canonical_path(path:&str)->Result<[u8;NAME_BYTES],FsError>{
     let mut output=[0u8;NAME_BYTES];output[..name.len()].copy_from_slice(name);Ok(output)
 }
 
+/// Read-only, fully checksum-verified redundancy information. A single
+/// usable metadata bank is DEGRADDED, not proof that power-loss recovery is
+/// complete. This report never edits or attempts to repair the disk.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum Redundancy{Healthy,Degraded}
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct VolumeHealth{
+ pub redundancy:Redundancy,
+ pub valid_copies:u8,
+ pub current_generation:u64,
+ pub previous_generation:Option<u64>,
+}
 pub struct DurableFs<D:BlockDevice>{
     disk:D,meta:Metadata,active:u64,previous:Option<Metadata>,
 }
@@ -208,6 +220,43 @@ impl<D:BlockDevice> DurableFs<D>{
             (None,None)=>return Err(FsError::InvalidVolume),
         };
         Ok(Self{disk,meta,active,previous})
+    }
+    /// Verify both superblocks and all referenced COW payload checksums
+    /// without modifying the device or choosing a destructive recovery path.
+    /// Fail closed on two valid same-generation but divergent checkpoints.
+    pub fn inspect_health(disk:&mut D)->Result<VolumeHealth,FsError>{
+        if disk.sector_count()<MIN_SECTORS||disk.sector_count()>u32::MAX as u64{
+            return Err(FsError::InvalidVolume);
+        }
+        let mut copies=[None,None];
+        for index in 0..2{
+            let mut header=[0u8;SECTOR_BYTES];
+            disk.read_sector(index as u64,&mut header)?;
+            if let Some(meta)=decode(&header,disk.sector_count()){
+                if verify_metadata(disk,&meta){copies[index]=Some(meta);}
+            }
+        }
+        let (latest,previous,valid_copies)=match (copies[0],copies[1]){
+            (Some(a),Some(b))=>{
+                if a.generation==b.generation&&
+                   encode(&a,disk.sector_count())!=encode(&b,disk.sector_count()){
+                    return Err(FsError::InvalidVolume);
+                }
+                if a.generation>=b.generation{
+                    (a,Some(b),2)
+                }else{(b,Some(a),2)}
+            },
+            (Some(a),None)=>(a,None,1),
+            (None,Some(b))=>(b,None,1),
+            (None,None)=>return Err(FsError::InvalidVolume),
+        };
+        Ok(VolumeHealth{
+            redundancy:if valid_copies==2{Redundancy::Healthy}
+                       else{Redundancy::Degraded},
+            valid_copies,
+            current_generation:latest.generation,
+            previous_generation:previous.map(|m|m.generation),
+        })
     }
     pub fn generation(&self)->u64{self.meta.generation}
     /// Expose verified metadata names only, without mutable disk state.
@@ -575,4 +624,115 @@ mod tests{
         disk.sectors[block_start(0,current_bank) as usize][0]^=0x01;
         assert!(matches!(DurableFs::mount(disk),Err(FsError::InvalidVolume)));
     }
+    #[test]
+    fn m1_r045_clean_and_committed_volume_health_is_read_only(){
+        let mut fs=DurableFs::format_blank(blank()).unwrap();
+        let original=fs.into_device();
+        let mut d=original;
+        let writes=d.writes;
+        let h=DurableFs::inspect_health(&mut d).unwrap();
+        assert_eq!(h.redundancy,Redundancy::Healthy);
+        assert_eq!(h.valid_copies,2);
+        assert_eq!(h.current_generation,1);
+        assert_eq!(h.previous_generation,Some(1));
+        assert_eq!(d.writes,writes);
+        let mut fs=DurableFs::mount(d).unwrap();
+        fs.create_path("/file",b"hello world").unwrap();
+        let mut d=fs.into_device();
+        let writes=d.writes;
+        let h=DurableFs::inspect_health(&mut d).unwrap();
+        assert_eq!(h.redundancy,Redundancy::Healthy);
+        assert_eq!(h.valid_copies,2);
+        assert_eq!(h.current_generation,2);
+        assert_eq!(h.previous_generation,Some(1));
+        assert_eq!(d.writes,writes);
+    }
+    #[test]
+    fn m1_r045_single_metadata_copy_corruption_is_reported_as_degraded(){
+        let mut fs=DurableFs::format_blank(blank()).unwrap();
+        fs.create_path("/file",b"stable").unwrap();
+        let active=fs.active as usize;
+        let mut d=fs.into_device();
+        let before=d.writes;
+        d.sectors[1-active][24]^=1;
+        let h=DurableFs::inspect_health(&mut d).unwrap();
+        assert_eq!(h.redundancy,Redundancy::Degraded);
+        assert_eq!(h.valid_copies,1);
+        assert_eq!(h.current_generation,2);
+        assert_eq!(h.previous_generation,None);
+        assert_eq!(d.writes,before);
+        let mut mounted=DurableFs::mount(d).unwrap();
+        assert_eq!(get(&mut mounted,"/file"),b"stable");
+    }
+    #[test]
+    fn m1_r045_corrupt_latest_checkpoint_falls_back_to_previous_valid_bank(){
+        let mut fs=DurableFs::format_blank(blank()).unwrap();
+        fs.create_path("/file",b"first").unwrap();
+        fs.overwrite_path("/file",b"second").unwrap();
+        let active=fs.active as usize;
+        let mut d=fs.into_device();
+        d.sectors[active][30]^=1;
+        let h=DurableFs::inspect_health(&mut d).unwrap();
+        assert_eq!(h.redundancy,Redundancy::Degraded);
+        assert_eq!(h.current_generation,2);
+        let mut fs=DurableFs::mount(d).unwrap();
+        assert_eq!(get(&mut fs,"/file"),b"first");
+    }
+    #[test]
+    fn m1_r045_two_invalid_copies_cannot_be_misreported_as_healthy(){
+        let mut fs=DurableFs::format_blank(blank()).unwrap();
+        fs.create_path("/file",b"stable").unwrap();
+        let mut d=fs.into_device();
+        let before=d.writes;
+        d.sectors[0][16]^=7;
+        d.sectors[1][16]^=9;
+        assert_eq!(DurableFs::inspect_health(&mut d),Err(FsError::InvalidVolume));
+        assert_eq!(d.writes,before);
+    }
+    #[test]
+    fn m1_r045_equal_generation_split_brain_health_rejected(){
+        let mut fs=DurableFs::format_blank(blank()).unwrap();
+        fs.create_path("/file",b"data").unwrap();
+        let mut d=fs.into_device();
+        let same=decode(&d.sectors[1],MIN_SECTORS).unwrap();
+        let mut different=same;
+        different.entries[0]=Entry::EMPTY;
+        d.sectors[0]=encode(&different,MIN_SECTORS);
+        let writes=d.writes;
+        assert_eq!(DurableFs::inspect_health(&mut d),Err(FsError::InvalidVolume));
+        assert_eq!(d.writes,writes);
+    }
+    #[test]
+    fn m1_r045_recovery_write_restores_redundancy_without_reformat(){
+        let mut fs=DurableFs::format_blank(blank()).unwrap();
+        fs.create_path("/file",b"first").unwrap();
+        let active=fs.active as usize;
+        let mut d=fs.into_device();
+        d.sectors[1-active][24]^=1;
+        assert_eq!(DurableFs::inspect_health(&mut d).unwrap().valid_copies,1);
+        let mut recovered=DurableFs::mount(d).unwrap();
+        recovered.overwrite_path("/file",b"new commit").unwrap();
+        let mut d=recovered.into_device();
+        assert_eq!(DurableFs::inspect_health(&mut d).unwrap().valid_copies,2);
+        let mut remounted=DurableFs::mount(d).unwrap();
+        assert_eq!(get(&mut remounted,"/file"),b"new commit");
+    }
+    #[test]
+    fn m1_r045_bad_data_checksum_disqualifies_only_referencing_generation(){
+        let mut fs=DurableFs::format_blank(blank()).unwrap();
+        fs.create_path("/file",b"old").unwrap();
+        fs.overwrite_path("/file",b"new").unwrap();
+        let active=fs.active as usize;
+        let bank=fs.meta.entries[0].bank;
+        let mut d=fs.into_device();
+        d.sectors[block_start(0,bank) as usize][0]^=0xff;
+        let h=DurableFs::inspect_health(&mut d).unwrap();
+        assert_eq!(h.valid_copies,1);
+        assert_eq!(h.redundancy,Redundancy::Degraded);
+        assert_eq!(h.current_generation,2);
+        let mut mounted=DurableFs::mount(d).unwrap();
+        assert_eq!(get(&mut mounted,"/file"),b"old");
+        assert_ne!(active,2);
+    }
+
 }

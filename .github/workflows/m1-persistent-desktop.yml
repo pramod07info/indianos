@@ -4,12 +4,18 @@ on:
     branches: [main, milestone/m1-desktop-storage]
     paths:
       - 'rust/kernel_core/src/m1_*.rs'
+      - 'rust/kernel_core/src/block.rs'
+      - 'rust/kernel_core/src/durablefs.rs'
+      - 'rust/kernel_core/src/hier_vfs.rs'
       - 'rust/kernel_core/src/lib.rs'
       - 'rust/kernel_core/Cargo.toml'
       - '.github/workflows/m1-persistent-desktop.yml'
   pull_request:
     paths:
       - 'rust/kernel_core/src/m1_*.rs'
+      - 'rust/kernel_core/src/block.rs'
+      - 'rust/kernel_core/src/durablefs.rs'
+      - 'rust/kernel_core/src/hier_vfs.rs'
       - 'rust/kernel_core/src/lib.rs'
       - 'rust/kernel_core/Cargo.toml'
       - '.github/workflows/m1-persistent-desktop.yml'
@@ -37,6 +43,9 @@ jobs:
           cargo test --offline --manifest-path rust/kernel_core/Cargo.toml --features test-r031-vfs r041_
           cargo test --offline --manifest-path rust/kernel_core/Cargo.toml --features test-r031-vfs r042_
           cargo test --offline --manifest-path rust/kernel_core/Cargo.toml --features test-r031-vfs r044_
+          # R045 mandatory read-only MBR/GPT inventory, geometry-locked mount,
+          # redundant COW health and crash/corruption regression tests.
+          cargo test --offline --manifest-path rust/kernel_core/Cargo.toml --features test-r031-vfs r045_
       - name: Build M1 durable VFS service interfaces in no_std mode
         run: |
           cargo check --offline --manifest-path rust/kernel_core/Cargo.toml --no-default-features --features test-r031-vfs

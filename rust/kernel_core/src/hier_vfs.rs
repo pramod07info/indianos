@@ -3,7 +3,7 @@
 //! Existing root /app and /note remain separate from reserved /~[df]* keys.
 //! 8 total storage objects (directories count); max 21 bytes of logical path.
 use crate::block::{BlockDevice,BlockWindow};
-use crate::durablefs::{DurableFs,FsError,MIN_SECTORS,MAX_FILE_BYTES};
+use crate::durablefs::{DurableFs,FsError,VolumeHealth,MIN_SECTORS,MAX_FILE_BYTES};
 use crate::vfs_path::normalize_absolute;
 use crate::ata_pio::AtaPio;
 pub const MAX_TRANSFER:usize=256;
@@ -45,6 +45,11 @@ fn checked(input:&str,kind:Kind)->Result<Path,FsError>{
 }
 pub struct HierVfs<D:BlockDevice>{fs:DurableFs<D>}
 impl<D:BlockDevice> HierVfs<D>{
+ /// Pure read-only preflight for Files/Terminal before a selected volume
+ /// is mounted. Returns verified redundancy without attempting any repair.
+ pub fn probe_device(disk:&mut D)->Result<VolumeHealth,FsError>{
+  DurableFs::inspect_health(disk)
+ }
  pub fn mount(disk:D)->Result<Self,FsError>{
   Ok(Self{fs:DurableFs::mount(disk)?})
  }

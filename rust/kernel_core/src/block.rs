@@ -13,6 +13,20 @@ pub trait BlockDevice {
     fn write_sector(&mut self, lba: u64, data: &[u8; SECTOR_BYTES]) -> Result<(), BlockError>;
 }
 
+/// A hard read-only capability. Even if a future discovery or diagnostic
+/// mistakenly attempts write_sector(), it cannot reach the physical device.
+/// This is a borrowed view, not a snapshot or a software-only convention.
+pub struct ReadOnlyDevice<'a,D:BlockDevice>{device:&'a mut D}
+impl<'a,D:BlockDevice> ReadOnlyDevice<'a,D>{
+ pub fn new(device:&'a mut D)->Self{Self{device}}
+}
+impl<D:BlockDevice> BlockDevice for ReadOnlyDevice<'_,D>{
+ fn sector_count(&self)->u64{self.device.sector_count()}
+ fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+  ->Result<(),BlockError>{self.device.read_sector(lba,out)}
+ fn write_sector(&mut self,_lba:u64,_bytes:&[u8;SECTOR_BYTES])
+  ->Result<(),BlockError>{Err(BlockError::ReadOnly)}
+}
 /// Restrict access to a validated block-device window; no I/O occurs on construction.
 /// Destructive formatting is still an explicit responsibility of the caller.
 pub struct BlockWindow<'a, D: BlockDevice> {
@@ -155,6 +169,37 @@ mod tests {
         assert!(disk.bytes.iter().all(|&v| v == 0x33));
     }
 
+    #[test]
+    fn m1_r045_hard_readonly_borrow_denies_writes_and_preserves_data(){
+        let mut disk=RamDisk{bytes:[0x55;SECTOR_BYTES*4],readonly:false};
+        {
+            let mut readonly=ReadOnlyDevice::new(&mut disk);
+            assert_eq!(readonly.sector_count(),4);
+            let mut output=[0u8;SECTOR_BYTES];
+            assert_eq!(readonly.read_sector(3,&mut output),Ok(()));
+            assert_eq!(output,[0x55;SECTOR_BYTES]);
+            assert_eq!(readonly.write_sector(2,&[0x44;SECTOR_BYTES]),
+                Err(BlockError::ReadOnly));
+            assert_eq!(write_sectors(&mut readonly,0,&[0;SECTOR_BYTES]),
+                Err(BlockError::ReadOnly));
+        }
+        assert_eq!(disk.bytes,[0x55;SECTOR_BYTES*4]);
+    }
+    #[test]
+    fn m1_r045_readonly_window_stacks_with_partition_bounds(){
+        let mut disk=RamDisk{bytes:[0x11;SECTOR_BYTES*4],readonly:false};
+        {
+            let mut window=BlockWindow::new(&mut disk,1,2).unwrap();
+            let mut readonly=ReadOnlyDevice::new(&mut window);
+            let mut output=[0u8;SECTOR_BYTES];
+            assert_eq!(readonly.read_sector(1,&mut output),Ok(()));
+            assert_eq!(output,[0x11;SECTOR_BYTES]);
+            assert_eq!(readonly.read_sector(2,&mut output),Err(BlockError::OutOfRange));
+            assert_eq!(readonly.write_sector(0,&[0x44;SECTOR_BYTES]),
+                Err(BlockError::ReadOnly));
+        }
+        assert_eq!(disk.bytes,[0x11;SECTOR_BYTES*4]);
+    }
     #[test]
     fn read_only_device_rejects_writes() {
         let mut disk = RamDisk { bytes: [0; SECTOR_BYTES * 4], readonly: true };
