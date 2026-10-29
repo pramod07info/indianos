@@ -13,7 +13,7 @@ pub fn smoke()->Result<(),Error>{
   .map_err(|_|Error::Full)?;
  fs.replace(b"/p/lib.rs",b"// library\n").map_err(|_|Error::Full)?;
  fs.replace(b"/p/log",b"ok\nerror\n").map_err(|_|Error::Full)?;
- let mut deltas=[agent_03::EMPTY;5];
+ let mut deltas=[agent_03::EMPTY;64];
  if agent_03::files(&fs,b"/p/main.rs",b"/p/lib.rs",&mut deltas)?==0{
   return Err(Error::Conflict);
  }
