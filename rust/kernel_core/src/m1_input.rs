@@ -14,6 +14,20 @@ pub struct InputLine {
 impl InputLine{
  pub const fn new()->Self{Self{bytes:[0;MAX_LINE],length:0}}
  pub fn length(&self)->usize{self.length}
+ /// Caller-owned view for bounded Terminal history. No exposing raw
+ /// pointers or any bytes beyond the authenticated command's length.
+ pub fn bytes(&self)->&[u8]{&self.bytes[..self.length]}
+ /// Replace a trusted editable command atomically; invalid controls and
+ /// oversized history never wipe the current draft.
+ pub fn set_line(&mut self,line:&[u8])->Result<(),Error>{
+  if line.len()>MAX_LINE{return Err(Error::Full);}
+  if line.iter().any(|byte|!(b' '..=b'~').contains(byte)){
+   return Err(Error::Invalid);
+  }
+  self.reset();
+  self.bytes[..line.len()].copy_from_slice(line);
+  self.length=line.len();Ok(())
+ }
  pub fn reset(&mut self){
   self.bytes.fill(0);
   self.length=0;
@@ -262,6 +276,20 @@ impl LineEditor{
   assert_eq!(e.caret(),original);assert_eq!(e.bytes().len(),MAX_LINE-1);
   assert_eq!(e.paste(b"z"),Ok(()));
   assert_eq!(e.bytes().len(),MAX_LINE);
+ }
+
+ #[test]fn r040_terminal_history_restoration_is_atomic_and_bounded(){
+  let mut line=InputLine::new();
+  line.set_line(b"write /home/a persisted").unwrap();
+  assert_eq!(line.bytes(),b"write /home/a persisted");
+  assert_eq!(line.set_line(b"unsafe\ncommand"),Err(Error::Invalid));
+  assert_eq!(line.bytes(),b"write /home/a persisted");
+  assert_eq!(line.set_line(&[b'x';MAX_LINE+1]),Err(Error::Full));
+  assert_eq!(line.bytes(),b"write /home/a persisted");
+  let mut output=[0u8;MAX_LINE];
+  assert_eq!(line.feed(b'\n',&mut output),Ok(Event::Submitted(23)));
+  assert_eq!(&output[..23],b"write /home/a persisted");
+  assert!(line.bytes().is_empty());
  }
 
 }
