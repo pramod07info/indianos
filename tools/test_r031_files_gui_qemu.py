@@ -11,6 +11,28 @@ READY="R031.1 AUTOMATIC DESKTOP READY: PID1 shell PID2 Files PID3 Terminal"
 PASS="IndianOS: R031.1 automatic boot-to-desktop services and shutdown PASSED"
 START=24
 TOTAL=128
+PHYSICAL="IndianOS: R047 genuine PS2 keyboard byte accepted by kernel input"
+
+def physical_key(session:QemuSession,key:str,marker:str,
+                 folder:Path,boot_index:int,step:int,
+                 previous:tuple[int,int,bytes],first:bool):
+    """Inject a REAL emulated 8042 key transition through QEMU HMP.
+    Never use COM1 or a test-only in-memory dispatch for this assertion.
+    """
+    if key not in ("a","1","2","h","m","r","q"):
+        raise AssertionError("unapproved PS2 test keystroke")
+    start=len(session.output)
+    session.hmp(f"sendkey {key} 80")
+    if first:
+        session.until(PHYSICAL,20,since=start)
+    session.until(marker,20,since=start)
+    if key=="q":
+        return previous
+    frame=session.shot(folder/f"r047-ps2-{boot_index}-{step}-{key}.ppm")
+    if differences(previous,frame)<10:
+        raise AssertionError("physical PS2 keyboard action did not repaint real QEMU framebuffer: "+key)
+    print(f"R047 physical QEMU PS/2 keyboard {key}: guest input and visual action confirmed")
+    return frame
 
 def guard(disk:Path):
     raw=disk.read_bytes()
@@ -54,28 +76,55 @@ def boot(qemu:str,iso:Path,ovmf:Path,disk:Path,folder:Path,index:int):
             updated=session.shot(folder/"r0319-updated.ppm")
             if differences(before,updated)<8:
                 raise AssertionError("persistent file refresh did not redraw GUI pixels")
-        # Existing desktop contracts require real keyboard transitions and
-        # physical PS/2 mouse input before the authenticated shutdown.
-        for char,marker in [
-            (b"a","R031.1 application launcher OPEN"),
-            (b"a","R031.1 application launcher CLOSED"),
-            (b"2","R031.1 user switched to Terminal app"),
-            (b"1","R031.1 user switched to Files app"),
-            (b"2","R031.1 user switched to Terminal app"),
-            (b"h","R031.1 Files window moved"),
-            (b"m","R031.1 Terminal minimized"),
-            (b"r","R031.1 Terminal restored"),
-        ]:
-            offset=len(session.output)
-            session.serial(char)
-            session.until(marker,15,since=offset)
+        # In both QEMU boots, physical input must reach the guest through
+        # the virtual 8042. The existing serial path is still exercised by
+        # distinct steps; serial-only shortcuts cannot satisfy this proof.
+        if PHYSICAL.encode() in session.output:
+            raise AssertionError("PS2 evidence appeared before physical sendkey")
+        actions=[
+            ("a","R031.1 application launcher OPEN"),
+            ("a","R031.1 application launcher CLOSED"),
+            ("2","R031.1 user switched to Terminal app"),
+            ("1","R031.1 user switched to Files app"),
+            ("2","R031.1 user switched to Terminal app"),
+            ("h","R031.1 Files window moved"),
+            ("m","R031.1 Terminal minimized"),
+            ("r","R031.1 Terminal restored"),
+        ]
+        previous=updated if index==0 else before
+        first_physical=True
+        for step,(char,marker) in enumerate(actions):
+            # Physical launcher + focus during first boot, and focus plus
+            # restore during the second boot after the same disk remount.
+            use_ps2=(step in (0,2,3,4) if index==0
+                     else step in (2,4,7))
+            if use_ps2:
+                previous=physical_key(
+                    session,char,marker,folder,index,step,previous,
+                    first_physical)
+                first_physical=False
+            else:
+                offset=len(session.output)
+                session.serial(char.encode())
+                session.until(marker,15,since=offset)
+                previous=session.shot(folder/f"r047-serial-{index}-{step}.ppm")
+        if first_physical:
+            raise AssertionError("no real 8042 keyboard event was tested")
+
         session.hmp("mouse_move 100 135")
         session.drain_serial(0.2)
         session.hmp("mouse_button 1")
         session.drain_serial(0.2)
         session.hmp("mouse_button 0")
         session.until("R031.1 physical PS2 mouse event reached desktop service",15)
-        session.serial(b"q")
+        if index==0:
+            # Shutdown must also be reachable from a physical keyboard,
+            # not only the test's serial control channel.
+            physical_key(session,"q",
+                "R031.1 shutdown requested: notifying Files and Terminal",
+                folder,index,9,previous,False)
+        else:
+            session.serial(b"q")
         session.until("R031.1 Files service stopped and capabilities revoked",15)
         session.until("R031.1 session manager exiting after app services",15)
         session.until("IndianOS: PID 1 REAPED",15)
@@ -105,6 +154,7 @@ def main():
         for index in range(2):
             boot(a.qemu,a.iso.resolve(),a.ovmf.resolve(),disk,folder,index)
             guard(disk)
-    print("R031.9 PASS: real GUI file content, IPC refresh, persistent reboot, "
-          "strict PID2 directory policy, isolated graphics and bounded disk")
+    print("R047 PASS: actual QEMU PS/2 keyboard across two boots, "
+          "real framebuffer changes and original R031.9 durable "
+          "Files/reboot/IPC and disk-boundary verification")
 if __name__=="__main__":main()

@@ -3,7 +3,6 @@
 //! is a best-effort secondary source. No keyboard IRQs or SMP yet.
 //! No untrusted byte is interpreted as an escape sequence.
 use core::arch::asm;
-#[cfg(feature="test-irq-keyboard")]
 use core::sync::atomic::{AtomicU64,Ordering};
 #[cfg(feature="test-irq-keyboard")]
 unsafe extern "C" {fn serial_write(message:*const core::ffi::c_char);}
@@ -46,32 +45,67 @@ const SHIFTED:[u8;128]={
     a[51]=b'<';a[52]=b'>';a[53]=b'?';
     a
 };
+/// Bounded, stateful Set-1 decoder for the actual legacy 8042 keyboard.
+/// Only committed make codes become characters. Ctrl/Alt modified keys do
+/// not accidentally perform the unmodified GUI/Terminal shortcut.
 #[derive(Default)]
-pub(crate) struct ScanDecoder{shift_left:bool,shift_right:bool,caps:bool,extended:bool}
+pub(crate) struct ScanDecoder{
+    shift_left:bool,shift_right:bool,caps:bool,extended:bool,
+    ctrl_left:bool,ctrl_right:bool,alt_left:bool,alt_right:bool,
+    pause_remaining:u8,
+}
 impl ScanDecoder{
-    pub(crate) fn feed(&mut self, code:u8)->Option<u8>{
-        if code==0xe0||code==0xe1{self.extended=true;return None;}
+    pub(crate) fn feed(&mut self,code:u8)->Option<u8>{
+        if self.pause_remaining>0{
+            self.pause_remaining-=1;
+            return None;
+        }
+        // Pause sends E1 1D 45 E1 9D C5, NOT a character or Ctrl.
+        if code==0xe1{
+            self.extended=false;
+            self.pause_remaining=5;
+            return None;
+        }
+        if code==0xe0{
+            self.extended=true;
+            return None;
+        }
+        let released=code&0x80!=0;
+        let key=code&0x7f;
         if self.extended{
             self.extended=false;
-            return match code{0x48=>Some(0x10),0x50=>Some(0x0e),_=>None};
+            match key{
+                0x1d=>{self.ctrl_right=!released;return None;},
+                0x38=>{self.alt_right=!released;return None;},
+                // Extended cursor keys are the existing bounded shell
+                // history codes, not printable input or ANSI escapes.
+                0x48 if !released&&!self.modifiers_active()=>return Some(0x10),
+                0x50 if !released&&!self.modifiers_active()=>return Some(0x0e),
+                // Keypad Enter and Slash remain usable in the native shell.
+                0x1c if !released&&!self.modifiers_active()=>return Some(b'\n'),
+                0x35 if !released&&!self.modifiers_active()=>return Some(b'/'),
+                _=>return None,
+            }
         }
-        let up=code&0x80!=0;
-        let key=(code&0x7f) as usize;
         match key{
-            42=>{self.shift_left=!up;return None;}
-            54=>{self.shift_right=!up;return None;}
-            58=>{if !up{self.caps=!self.caps;}return None;}
-            _=>{}
+            0x2a=>{self.shift_left=!released;return None;},
+            0x36=>{self.shift_right=!released;return None;},
+            0x1d=>{self.ctrl_left=!released;return None;},
+            0x38=>{self.alt_left=!released;return None;},
+            0x3a=>{if !released{self.caps=!self.caps;}return None;},
+            _=>{},
         }
-        if up{return None;}
+        if released||self.modifiers_active(){return None;}
         let shift=self.shift_left||self.shift_right;
-        let mut byte=if shift{SHIFTED[key]}else{KEYMAP[key]};
-        // Shift and CapsLock combine using XOR for alphabetic keys.
-        // SHIFTED maps punctuation; letters remain lowercase in both maps.
-        if byte.is_ascii_alphabetic() && (shift!=self.caps) {
+        let mut byte=if shift{SHIFTED[key as usize]}else{KEYMAP[key as usize]};
+        // Shift and CapsLock combine via XOR only for letters.
+        if byte.is_ascii_alphabetic() && (shift!=self.caps){
             byte=byte.to_ascii_uppercase();
         }
         filter(byte)
+    }
+    fn modifiers_active(&self)->bool{
+        self.ctrl_left||self.ctrl_right||self.alt_left||self.alt_right
     }
 }
 pub(crate) fn filter(b:u8)->Option<u8>{
@@ -84,8 +118,36 @@ pub(crate) fn filter(b:u8)->Option<u8>{
     }
 }
 static mut SCAN:ScanDecoder=ScanDecoder{
-    shift_left:false,shift_right:false,caps:false,extended:false
+    shift_left:false,shift_right:false,caps:false,extended:false,
+    ctrl_left:false,ctrl_right:false,alt_left:false,alt_right:false,
+    pause_remaining:0
 };
+/// Counts physical bytes AFTER a valid 8042 keyboard make-code has been
+/// consumed. Serial/UART input does not affect this counter.
+static PS2_KEYS_ACCEPTED:AtomicU64=AtomicU64::new(0);
+pub(crate) fn physical_keys_accepted()->u64{
+    PS2_KEYS_ACCEPTED.load(Ordering::Relaxed)
+}
+#[cfg(not(test))]
+fn mark_physical_key(byte:u8)->u8{
+    if PS2_KEYS_ACCEPTED.fetch_add(1,Ordering::Relaxed)==0{
+        unsafe extern "C" {fn serial_write(message:*const core::ffi::c_char);}
+        unsafe{
+            serial_write(b"IndianOS: R047 genuine PS2 keyboard byte accepted by kernel input\n\0"
+                .as_ptr().cast());
+        }
+    }
+    byte
+}
+#[cfg(test)]
+fn mark_physical_key(byte:u8)->u8{
+    PS2_KEYS_ACCEPTED.fetch_add(1,Ordering::Relaxed);
+    byte
+}
+/// Read only error-free set-1 bytes from the primary PS/2 controller port.
+fn valid_keyboard_status(status:u8)->bool{
+    status&0x01!=0 && status&0xe0==0 // OBF, !AUX, !timeout, !parity
+}
 #[cfg(feature="test-irq-keyboard")]
 const QUEUE_SIZE:usize=128;
 #[cfg(feature="test-irq-keyboard")]
@@ -264,7 +326,7 @@ pub extern "C" fn x86_64_keyboard_irq_dispatch(){
     let status=unsafe{inb(PS2_STATUS)};
     if status&1!=0 {
         let code=unsafe{inb(PS2_DATA)};
-        if status&0x20==0 {
+        if valid_keyboard_status(status){
             if let Some(ch)=unsafe{(&mut *core::ptr::addr_of_mut!(SCAN)).feed(code)}{
                 enqueue(ch);
             }
@@ -274,7 +336,7 @@ pub extern "C" fn x86_64_keyboard_irq_dispatch(){
 }
 pub(crate) fn poll_byte()->Option<u8>{
     #[cfg(feature="test-irq-keyboard")]
-    if let Some(byte)=dequeue(){return Some(byte);}
+    if let Some(byte)=dequeue(){return Some(mark_physical_key(byte));}
 
     // Bounded non-blocking UART polling; the shell performs its own wait.
     if unsafe{inb(COM1+5)}&1!=0{
@@ -315,9 +377,13 @@ pub(crate) fn poll_byte()->Option<u8>{
     }
     let status=unsafe{inb(PS2_STATUS)};
     // Avoid accidentally consuming auxiliary PS/2 mouse packets.
+    // Do not drain AUX (mouse) packets: the GUI PS/2 mouse broker owns
+    // those bytes and must be able to consume a complete three-byte frame.
     if status&1!=0&&status&0x20==0{
         let code=unsafe{inb(PS2_DATA)};
-        return unsafe{(&mut *core::ptr::addr_of_mut!(SCAN)).feed(code)};
+        if !valid_keyboard_status(status){return None;}
+        return unsafe{(&mut *core::ptr::addr_of_mut!(SCAN)).feed(code)}
+            .map(mark_physical_key);
     }
     None
 }
@@ -367,6 +433,81 @@ mod tests{
         assert_eq!(result[126],126);
         assert_eq!(dequeue(),None);
         enqueue(b'Z');assert_eq!(dequeue(),Some(b'Z'));
+    }
+    #[test]
+    fn m1_r047_ctrl_and_alt_cannot_inject_unmodified_desktop_hotkeys(){
+        let mut d=ScanDecoder::default();
+        for (press,release) in [(0x1d,0x9d),(0x38,0xb8)]{
+            assert_eq!(d.feed(press),None);
+            for key in [0x1e,0x02,0x23,0x10,0x32,0x1c]{
+                assert_eq!(d.feed(key),None,"hotkey {key:#x} must be blocked");
+            }
+            assert_eq!(d.feed(release),None);
+            assert_eq!(d.feed(0x1e),Some(b'a'));
+        }
+    }
+    #[test]
+    fn m1_r047_extended_ctrl_alt_and_release_are_not_characters(){
+        let mut d=ScanDecoder::default();
+        for (down,up) in [(0x1d,0x9d),(0x38,0xb8)]{
+            assert_eq!(d.feed(0xe0),None);assert_eq!(d.feed(down),None);
+            assert_eq!(d.feed(0x30),None);
+            assert_eq!(d.feed(0xe0),None);assert_eq!(d.feed(0x48),None);
+            assert_eq!(d.feed(0xe0),None);assert_eq!(d.feed(up),None);
+            assert_eq!(d.feed(0x30),Some(b'b'));
+        }
+    }
+    #[test]
+    fn m1_r047_pause_does_not_stick_ctrl_or_type_bogus_characters(){
+        let mut d=ScanDecoder::default();
+        for byte in [0xe1,0x1d,0x45,0xe1,0x9d,0xc5]{
+            assert_eq!(d.feed(byte),None);
+        }
+        assert_eq!(d.feed(0x1e),Some(b'a'));
+    }
+    #[test]
+    fn m1_r047_ps2_aux_parity_and_timeout_status_are_rejected(){
+        for status in [0x00,0x20,0x21,0x41,0x81,0xc1,0xff]{
+            assert!(!valid_keyboard_status(status));
+        }
+        for status in [0x01,0x03,0x11]{
+            assert!(valid_keyboard_status(status));
+        }
+    }
+    #[test]
+    fn m1_r047_extended_keypad_enter_slash_and_break_discipline(){
+        let mut d=ScanDecoder::default();
+        for (scan,ch) in [(0x1c,b'\n'),(0x35,b'/'),(0x48,0x10),(0x50,0x0e)]{
+            assert_eq!(d.feed(0xe0),None);
+            assert_eq!(d.feed(scan),Some(ch));
+            assert_eq!(d.feed(0xe0),None);
+            assert_eq!(d.feed(scan|0x80),None);
+        }
+        assert_eq!(d.feed(0x1c),Some(b'\n'));
+    }
+    #[test]
+    fn m1_r047_shift_caps_and_releases_are_balanced(){
+        let mut d=ScanDecoder::default();
+        assert_eq!(d.feed(0x2a),None);
+        assert_eq!(d.feed(0x1e),Some(b'A'));
+        assert_eq!(d.feed(0x36),None);
+        assert_eq!(d.feed(0xaa),None);
+        assert_eq!(d.feed(0x1e),Some(b'A'));
+        assert_eq!(d.feed(0xb6),None);
+        assert_eq!(d.feed(0x3a),None);
+        assert_eq!(d.feed(0x1e),Some(b'A'));
+        assert_eq!(d.feed(0x3a),None);
+        assert_eq!(d.feed(0x1e),Some(b'a'));
+        assert_eq!(d.feed(0x9e),None);
+    }
+    #[test]
+    fn m1_r047_only_genuine_accepted_scan_codes_increment_physical_count(){
+        let before=physical_keys_accepted();
+        let mut d=ScanDecoder::default();
+        for byte in [0x1d,0x1e,0x9e,0x9d,0xe0,0x48,0xe0,0xc8]{
+            if let Some(ch)=d.feed(byte){assert_eq!(mark_physical_key(ch),ch);}
+        }
+        assert_eq!(physical_keys_accepted(),before+1);
     }
     #[test]
     fn terminal_input_filters_controls(){
