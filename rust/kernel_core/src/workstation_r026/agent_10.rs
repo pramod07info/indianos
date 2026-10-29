@@ -70,7 +70,7 @@ impl<const N:usize> Env<N>{
  #[test]fn resolves_guest_terminal_project_env_and_expands_literal_path(){
   let mut env=Env::<2>::new(id(1));env.set(id(1),b"PROJECT",b"alpha").unwrap();
   let mut out=[0;32];
-  let n=env.expand(id(1),b"/\${PROJECT}/src",&mut out).unwrap();
+  let n=env.expand(id(1),b"/${PROJECT}/src",&mut out).unwrap();
   assert_eq!(&out[..n],b"/alpha/src");
   assert_eq!(env.count(id(1)),Ok(1));
  }
