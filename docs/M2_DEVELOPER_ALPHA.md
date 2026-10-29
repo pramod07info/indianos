@@ -652,3 +652,28 @@ receiver, cryptographic DNS authentication, DNSSEC, TLS, or a general socket API
 The NIC/route trust boundary must still supply genuine receive buffers and
 validate the configured DNS server. The existing R028 QEMU network demo is
 separate and must not be claimed to exercise this new path without wiring it.
+
+
+## R038 live DNS ingress and virtio queue error recovery (development)
+
+The existing strict M2 checked IPv4/UDP DNS A parser is now called on the
+**real R028 guest NIC-received Ethernet packet**, after the guest validates
+Ethernet sender/receiver, IPv4 protocol, checksum and fragmentation. Its
+shared M2 parser checks UDP checksum, lengths, exact source/destination ports,
+DNS transaction, question and answer. The deterministic QEMU peer must emit
+a new \`M2 live NIC IPv4/UDP DNS verifier PASSED\` serial marker. Ethernet
+padding is accepted only outside the validated IPv4 total-length boundary.
+
+The legacy virtio-net RX driver now drops malformed/oversize valid-ID used
+buffers without writing to the caller and re-offers its RX descriptor, so the
+single-buffer NIC is not starved after a rejected packet. A malformed queue
+completion or TX timeout puts the driver into a fail-closed state, preventing
+DMA buffer reuse until explicit reset. Host tests cover payload bounds and
+the real receive-path DNS decisions.
+
+Verify exact-head with \`cargo test --offline --manifest-path
+rust/kernel_core/Cargo.toml r038_live_dns_\`,
+\`cargo test --offline --manifest-path rust/kernel_core/Cargo.toml
+receive_lengths_reject_\`, no_std compilation, S0, M2 and
+\`make test-r028-network-qemu\`. Do not claim production sockets, DHCP,
+DNSSEC or physical NIC support: the QEMU test runs an isolated peer.

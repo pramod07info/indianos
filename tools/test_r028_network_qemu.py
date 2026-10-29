@@ -31,6 +31,7 @@ MARKERS=(
     "IndianOS: R028 IPv4 ICMP echo ping PASSED",
     "IndianOS: R028 IPv4 UDP echo PASSED",
     "IndianOS: R028 UDP DNS A query indianos.test PASSED",
+    "IndianOS: M2 live NIC IPv4/UDP DNS verifier PASSED",
     "IndianOS: R028 TCP three-way handshake SYN-ACK verified",
     "IndianOS: R028 TCP client request-response PASSED",
     "IndianOS: R028 QEMU virtio-net end-to-end network client PASSED",

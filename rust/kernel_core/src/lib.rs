@@ -153,7 +153,8 @@ pub mod m2_boot_trust;
 pub mod m2_syscall_guard;
 #[cfg(feature="test-m2-developer-alpha")]
 pub mod m2_inventory;
-#[cfg(feature="test-m2-developer-alpha")]
+// The strict M2 DNS parser is also used by the real R028 guest NIC path.
+// Keep it available in the freestanding build without enabling M2 SDK crypto.
 pub mod m2_network;
 #[cfg(feature="test-m2-developer-alpha")]
 pub mod m2_store;
