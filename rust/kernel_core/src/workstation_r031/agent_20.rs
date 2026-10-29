@@ -6,7 +6,7 @@ use super::{Error,agent_01,agent_02,agent_03,agent_04,agent_05,agent_06,
 use crate::batch7_ramfs::RamFs;
 use crate::batch5_session::Identity;
 use crate::workstation_r025::agent_02 as rights;
-use crate::workstation_r030::{agent_16 as diagnostics,agent_17 as tests};
+use crate::workstation_r030::{agent_16 as diagnostics,agent_17 as test_records};
 use crate::workstation_r029::agent_18::Rect;
 pub fn smoke()->Result<(),Error>{
  let mut fs=RamFs::<8>::new();
@@ -75,13 +75,13 @@ pub fn smoke()->Result<(),Error>{
  let mut jobs=agent_14::Queue::<1>::new(7);
  jobs.enqueue(7,1,100)?;jobs.start(7,1,1)?;jobs.finish(7,true,1,0)?;
  let mut env=crate::workstation_r030::agent_13::Env::<1>::new(7);
- env.set(7,b"HOME",b"/projects/p")?;
+ env.set(7,b"HOME",b"/projects/p").map_err(|_|Error::Denied)?;
  let n=agent_15::expand(&env,7,b"workspace=${HOME}",&mut output)?;
  if &output[..n]!=b"workspace=/projects/p"{return Err(Error::Conflict);}
  let mut cache=agent_16::Cache::new(7);
  cache.certify(7,true,true,&fs,b"/projects/p",b"rustc")?;
- let mut ledger=tests::Ledger::<1>::new(7);
- ledger.record(7,true,tests::Test{suite:1,sequence:1,passed:true})
+ let mut ledger=test_records::Ledger::<1>::new(7);
+ ledger.record(7,true,test_records::Test{suite:1,sequence:1,passed:true})
   .map_err(|_|Error::Denied)?;
  let report=diagnostics::parse(true,b"warning: unused").map_err(|_|Error::Invalid)?;
  let permit=agent_17::authorize(7,true,&fs,b"/projects/p",b"rustc",

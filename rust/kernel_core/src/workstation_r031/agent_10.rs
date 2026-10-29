@@ -23,7 +23,7 @@ impl<const N:usize> Bookmarks<N>{
   slot:usize)->Result<usize,Error>{
   if owner==0||owner!=self.owner{return Err(Error::Denied);}
   let b=self.items.get(slot).and_then(|b|*b).ok_or(Error::Missing)?;
-  if fs.metadata(&b.path[..b.len]).is_err_or(|(v,_)|v!=b.rev){
+  if !fs.metadata(&b.path[..b.len]).is_ok_and(|(v,_)|v==b.rev){
    return Err(Error::Stale);
   }
   Ok(b.byte)

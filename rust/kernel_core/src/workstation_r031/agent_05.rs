@@ -8,7 +8,7 @@ pub const EMPTY:Baseline=Baseline{path:[0;PATH_MAX],len:0,generation:0};
 pub fn capture<const F:usize,const N:usize>(fs:&RamFs<F>,root:&[u8],
  out:&mut[Baseline;N])->Result<usize,Error>{
  let mut entries=[agent_01::EMPTY;N];
- let n=agent_01::inventory(fs,root,&mut entries)?;
+ let n=agent_01::inventory(fs,root,&mut entries).map_err(|e|match e{crate::workstation_r030::Error::Full=>Error::Full,_=>Error::Invalid})?;
  let mut b=[EMPTY;N];
  for i in 0..n{b[i]=Baseline{path:entries[i].path,len:entries[i].len,
   generation:entries[i].revision};}
@@ -19,7 +19,7 @@ pub fn changed<const F:usize>(fs:&RamFs<F>,old:&[Baseline],
  let mut changed=0;
  for (i,b) in old.iter().enumerate(){
   if b.len==0{continue;}
-  let stale=fs.metadata(&b.path[..b.len]).is_err_or(|(v,_)|v!=b.generation);
+  let stale=!fs.metadata(&b.path[..b.len]).is_ok_and(|(v,_)|v==b.generation);
   if stale{if changed==out.len(){return Err(Error::Full);}
    out[changed]=i;changed+=1;}
  }
