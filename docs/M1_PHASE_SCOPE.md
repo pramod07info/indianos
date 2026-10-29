@@ -179,3 +179,16 @@ disks, and does not establish a GUI screenshot/reboot acceptance. Run
 m1_selected_partition_\` plus all M1, no_std, security and QEMU CI against
 the exact integration SHA. Never promote the milestone checkbox based on
 host tests alone.
+
+
+### R039 developer workstation M1 kernel-service slice (2026-10-29)
+
+Actual Rust functions implemented: bounded owner-only DiskEditor undo/redo
+including history invalidation and post-save dirty semantics; ProjectTree
+literal UTF-8 replace-all using one generation-checked durable COW write;
+and failure-safe desktop Terminal Enter retry that retains the command after
+a Terminal-layer error but never replays after a post-commit redraw error.
+Four new regression tests cover owner generation, bounds, no-op replacement,
+remount persistence and undo/redo. Existing tests and QEMU checks remain
+mandatory. This is service logic, not proof of live ring-3 IDE/compositor.
+No claim of twenty concurrent coding agents or completion of M1 gates.

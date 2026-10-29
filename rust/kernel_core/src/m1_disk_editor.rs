@@ -26,6 +26,9 @@ pub struct Status {
     pub filesystem_generation: u64,
 }
 
+/// Snapshot of the previous edit for bounded, owner-only undo/redo.
+#[derive(Clone, Copy)]
+struct Snapshot { data:[u8;MAX_FILE_BYTES], used:usize }
 /// No heap and no unverified filesystem cache: one owner-bound open document.
 /// The filesystem itself uses separate CRC-protected copy-on-write banks.
 pub struct DiskEditor {
@@ -36,11 +39,14 @@ pub struct DiskEditor {
     used: usize,
     baseline: u64,
     dirty: bool,
+    undo: Option<Snapshot>,
+    redo: Option<Snapshot>,
 }
 impl DiskEditor {
     pub const fn new() -> Self {
         Self { owner: None, path: [0; EDITOR_PATH_MAX], path_len: 0,
-            data: [0; MAX_FILE_BYTES], used: 0, baseline: 0, dirty: false }
+            data: [0; MAX_FILE_BYTES], used: 0, baseline: 0, dirty: false,
+            undo: None, redo: None }
     }
     fn authorize(&self, caller: Identity) -> Result<(), Error> {
         if caller.pid == 0 || caller.generation == 0 || self.owner != Some(caller) {
@@ -72,6 +78,7 @@ impl DiskEditor {
         self.used = len;
         self.baseline = generation;
         self.dirty = false;
+        self.undo = None; self.redo = None;
         self.owner = Some(caller);
         Ok(self.status(caller)?)
     }
@@ -101,6 +108,11 @@ impl DiskEditor {
         staged[from..from + replacement.len()].copy_from_slice(replacement);
         staged[from + replacement.len()..new_len]
             .copy_from_slice(&self.data[to..self.used]);
+        if new_len==self.used && staged[..new_len]==self.data[..self.used]{
+            return Ok(self.used);
+        }
+        self.undo=Some(Snapshot{data:self.data,used:self.used});
+        self.redo=None;
         self.data = staged;
         self.used = new_len;
         self.dirty = true;
@@ -108,6 +120,23 @@ impl DiskEditor {
     }
     pub fn append(&mut self, caller: Identity, data: &[u8]) -> Result<usize, Error> {
         self.replace(caller, self.used, self.used, data)
+    }
+    /// Undo exactly one successful local edit. The result is dirty even
+    /// if the previous edit had been saved to durable storage.
+    pub fn undo(&mut self,caller:Identity)->Result<usize,Error>{
+        self.authorize(caller)?;
+        let old=self.undo.take().ok_or(Error::Invalid)?;
+        self.redo=Some(Snapshot{data:self.data,used:self.used});
+        self.data=old.data;self.used=old.used;self.dirty=true;
+        Ok(self.used)
+    }
+    /// Redo the single previously undone local change; a new edit clears it.
+    pub fn redo(&mut self,caller:Identity)->Result<usize,Error>{
+        self.authorize(caller)?;
+        let next=self.redo.take().ok_or(Error::Invalid)?;
+        self.undo=Some(Snapshot{data:self.data,used:self.used});
+        self.data=next.data;self.used=next.used;self.dirty=true;
+        Ok(self.used)
     }
     /// A concurrent volume generation invalidates the session. This is
     /// conservative (unrelated file updates also require reload) but it
@@ -137,6 +166,7 @@ impl DiskEditor {
         self.used = size;
         self.baseline = generation;
         self.dirty = false;
+        self.undo = None;self.redo = None;
         self.status(caller)
     }
     /// Closing dirty buffers requires explicit discard consent.
@@ -292,4 +322,37 @@ mod tests {
         assert_eq!(editor.read(owner(), &mut data), Ok(13));
         assert_eq!(&data[..], b"fn main() {}!");
     }
+    #[test]
+    fn r039_undo_redo_owner_bound_and_durable_after_save(){
+        let mut fs=volume();let mut e=DiskEditor::new();
+        e.open(owner(),&mut fs,"/source.rs").unwrap();
+        assert_eq!(e.undo(owner()),Err(Error::Invalid));
+        e.append(owner(),b"!").unwrap();
+        assert_eq!(e.undo(other()),Err(Error::Unauthorized));
+        assert_eq!(e.undo(owner()),Ok(12));
+        assert_eq!(e.redo(owner()),Ok(13));
+        e.save(owner(),&mut fs).unwrap();
+        assert_eq!(e.undo(owner()),Ok(12));
+        assert!(e.status(owner()).unwrap().dirty);
+        e.save(owner(),&mut fs).unwrap();
+        e.close(owner(),false).unwrap();
+        let mut fs=HierVfs::mount(fs.into_device()).unwrap();
+        let mut b=[0;32];assert_eq!(fs.read("/source.rs",&mut b),Ok(12));
+        assert_eq!(&b[..12],b"fn main() {}");
+    }
+    #[test]
+    fn r039_invalid_edit_keeps_undo_and_new_edit_discards_redo(){
+        let mut fs=volume();let mut e=DiskEditor::new();
+        e.open(owner(),&mut fs,"/source.rs").unwrap();
+        e.append(owner(),b"!").unwrap();
+        assert_eq!(e.replace(owner(),5,3,b"bad"),Err(Error::Invalid));
+        assert_eq!(e.undo(owner()),Ok(12));
+        assert_eq!(e.redo(owner()),Ok(13));
+        e.undo(owner()).unwrap();
+        e.append(owner(),b"?").unwrap();
+        assert_eq!(e.redo(owner()),Err(Error::Invalid));
+        e.reload(owner(),&mut fs).unwrap();
+        assert_eq!(e.undo(owner()),Err(Error::Invalid));
+    }
+
 }
