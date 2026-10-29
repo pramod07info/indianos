@@ -20,13 +20,11 @@ pub fn restore<const F:usize,const B:usize>(fs:&mut RamFs<F>,expected:u64,
  trash_path:&[u8],to:&[u8])->Result<u64,Error>{
  if !trash_path.starts_with(b"/trash/"){return Err(Error::Invalid);}
  if to.starts_with(b"/trash/"){return Err(Error::Invalid);}
- trash::<F,B>(fs,expected,to,trash_path).err().map_or_else(
- ||Err(Error::Conflict),|_|{
  if fs.version()!=expected{return Err(Error::Stale);}
+ if to.len()<2||to.len()>PATH_MAX||to.starts_with(b"/trash/"){return Err(Error::Invalid);}
  let (rev,_)=fs.metadata(trash_path).map_err(|_|Error::Missing)?;
  if fs.metadata(to).is_ok(){return Err(Error::Conflict);}
  fs.rename_if_version(trash_path,to,rev).map_err(|_|Error::Conflict)
- })
 }
 pub fn entries<const F:usize>(fs:&RamFs<F>)->usize{
  let mut n=0;
