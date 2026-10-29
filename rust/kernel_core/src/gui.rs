@@ -630,6 +630,14 @@ impl Session{
             return false;
         }
         match ch{
+            // Polling QEMU desktop shortcut: cycle all visible windows,
+            // then use the same focus path as direct selection.
+            b'n'=>{if let Ok(id)=self.desktop.focus_next_visible(){
+                if self.focus(id){
+                    self.focused_keyboard+=1;
+                    log(b"IndianOS: R029 keyboard cycled visible window\n\0");
+                }
+            }}
             b'1'=>{if self.focus(self.files){
                 self.focused_keyboard+=1;
                 log(b"IndianOS: R029 keyboard focused Files window\n\0");
@@ -724,6 +732,21 @@ pub(crate) fn run()->bool{
 #[cfg(test)]
 mod tests{
     use super::*;
+    #[test]fn physical_character_cycle_updates_session_target_and_live_geometry(){
+        let mut s=Session::new(800,600).unwrap();
+        let third=s.desktop.open(App::Settings,Rect::new(20,60,320,240)).unwrap();
+        for id in [s.files,s.terminal,third,s.files,s.terminal,third]{
+            assert!(!s.on_key(b'n'));
+            assert_eq!(s.active,id);assert_eq!(s.desktop.focused(),Some(id));
+        }
+        s.desktop.minimize(s.terminal).unwrap();
+        s.on_key(b'n');assert_eq!(s.active,s.files);
+        s.on_key(b'n');assert_eq!(s.active,third);
+        let before=s.desktop.windows().find(|w|w.id==third).unwrap().bounds;
+        s.on_key(b'h');
+        assert!(s.desktop.windows().find(|w|w.id==third).unwrap().bounds.x>before.x);
+        s.on_key(b'x');assert!(!s.desktop.windows().any(|w|w.id==third));
+    }
     #[test]fn windows_keyboard_focus_move_minimize_restore_close(){
         let mut s=Session::new(1024,768).unwrap();
         assert_eq!(s.desktop.windows().count(),2);
