@@ -128,22 +128,14 @@ impl Desktop{
     /// dimensions. Restoring cannot escape the active display boundaries.
     pub fn restore_bounds(&mut self,id:u32,original:Rect)
         ->Result<(),DesktopError>{self.set_bounds(id,original)}
-    /// Orbit W5: rotate focus over visible, non-minimized windows. Does not
-    /// revive a closed/minimized app or cross a process ownership boundary.
+    /// Rotate in stable creation-ID order, independently of stacking order.
+    /// Raising the selected window must not change the next cycle target.
+    /// Closed/minimized windows are skipped, never implicitly restored.
     pub fn focus_next_visible(&mut self)->Result<u32,DesktopError>{
-        let active=self.focused;
-        let mut candidates=[None;MAX_WINDOWS];
-        let mut length=0;
-        for w in self.windows(){
-            if w.visible&&!w.minimized{
-                candidates[length]=Some(w.id);length+=1;
-            }
-        }
-        if length==0{return Err(DesktopError::NotFound);}
-        let next=active.and_then(|current|
-            candidates[..length].iter().position(|x|*x==Some(current)))
-            .map_or(0,|index|(index+1)%length);
-        let id=candidates[next].ok_or(DesktopError::NotFound)?;
+        let visible=||self.windows().filter(|w|w.visible&&!w.minimized);
+        let first=visible().map(|w|w.id).min().ok_or(DesktopError::NotFound)?;
+        let id=self.focused.and_then(|current|
+            visible().filter(|w|w.id>current).map(|w|w.id).min()).unwrap_or(first);
         self.focus(id)?;
         Ok(id)
     }
@@ -242,6 +234,37 @@ impl Desktop{
 mod tests{
     use super::*;
     fn bounds()->Rect{Rect::new(10,10,320,240)}
+    #[test]fn cycling_reaches_every_window_across_repeated_stack_changes(){
+        let mut d=Desktop::new(800,600).unwrap();
+        let mut ids=[0;MAX_WINDOWS];
+        for id in &mut ids{*id=d.open(App::Files,bounds()).unwrap();}
+        // Eight windows, three complete laps. The old z-order algorithm
+        // bounced between two windows and starved the remaining six.
+        for _ in 0..3{for &id in &ids{
+            assert_eq!(d.focus_next_visible(),Ok(id));
+            assert_eq!(d.focused(),Some(id));
+            assert_eq!(d.hit_test(20,20),Some(id));
+        }}
+        d.focus(ids[3]).unwrap();
+        assert_eq!(d.focus_next_visible(),Ok(ids[4]));
+        d.minimize(ids[5]).unwrap();d.close(ids[6]).unwrap();
+        assert_eq!(d.focus_next_visible(),Ok(ids[7]));
+        assert_eq!(d.focus_next_visible(),Ok(ids[0]));
+        assert!(!d.windows().find(|w|w.id==ids[5]).unwrap().visible);
+    }
+    #[test]fn cycle_single_empty_and_new_window_never_restore_hidden_apps(){
+        let mut d=Desktop::new(800,600).unwrap();
+        assert_eq!(d.focus_next_visible(),Err(DesktopError::NotFound));
+        let a=d.open(App::Files,bounds()).unwrap();
+        assert_eq!(d.focus_next_visible(),Ok(a));
+        d.minimize(a).unwrap();let before=d.snapshot();
+        assert_eq!(d.focus_next_visible(),Err(DesktopError::NotFound));
+        assert_eq!(d.snapshot(),before);assert_eq!(d.focused(),None);
+        let b=d.open(App::Terminal,bounds()).unwrap();
+        assert_eq!(d.focus_next_visible(),Ok(b));
+        d.focus(a).unwrap();assert_eq!(d.focus_next_visible(),Ok(b));
+        d.close(b).unwrap();assert_eq!(d.focus_next_visible(),Ok(a));
+    }
     #[test]fn orbit_resize_is_atomic_at_display_boundaries(){
         let mut d=Desktop::new(800,600).unwrap();
         let id=d.open(App::Files,Rect::new(40,60,300,240)).unwrap();
