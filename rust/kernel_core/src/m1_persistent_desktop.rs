@@ -407,6 +407,24 @@ impl<D:BlockDevice,const P:usize,const E:usize,const W:usize,
      !self.boot.session.owns(caller){return Err(Error::State);}
   self.rights.require(caller,VIEW,now).map_err(Error::Auth)
  }
+ /// Owner-only live filesystem redundancy report; reads both metadata
+ /// heads and file checksums without writing media or exposing raw sectors.
+ pub fn volume_health(&mut self,caller:Identity,now:u64)
+  ->Result<crate::durablefs::VolumeHealth,Error>{
+  self.admit_input(caller,now)?;
+  self.rights.require(caller,FILE_READ,now).map_err(Error::Auth)?;
+  self.volume.mounted_health().map_err(|e|Error::Terminal(TerminalError::Io(e)))
+ }
+ /// Explicit authenticated metadata-only repair. Read+write capability is
+ /// required; never triggered by mount, boot or an untrusted Terminal string.
+ /// This does not restore damaged file payloads or reformat any media.
+ pub fn repair_volume_redundancy(&mut self,caller:Identity,now:u64)
+  ->Result<bool,Error>{
+  self.admit_input(caller,now)?;
+  self.rights.require(caller,FILE_READ|FILE_WRITE,now).map_err(Error::Auth)?;
+  self.volume.repair_redundancy()
+   .map_err(|e|Error::Terminal(TerminalError::Io(e)))
+ }
  pub fn next_draw(&mut self)->Result<Damage,Error>{
   let damage=self.surface.next().map_err(Error::Graphics)?;
   if self.owner==Some(damage.owner)&&damage.window==self.window{
@@ -508,6 +526,12 @@ impl<'a,D:BlockDevice,const P:usize,const E:usize,const W:usize,
   selected:m1_partition::Partition)->Result<Self,MountError>{
   m1_partition::mount_checked(disk,selected).map(Self::from_mounted)
  }
+ /// Refuse a degraded selected disk during normal Desktop launch. The UI
+ /// may explicitly show a read-only recovery view from preflight_selected.
+ pub fn mount_healthy_selected(disk:&'a mut D,
+  selected:m1_partition::Partition)->Result<Self,MountError>{
+  m1_partition::mount_checked_healthy(disk,selected).map(Self::from_mounted)
+ }
  pub fn mount_selected(disk:&'a mut D,index:u32)->Result<Self,MountError>{
   m1_partition::mount(disk,index).map(Self::from_mounted)
  }
@@ -537,6 +561,49 @@ mod tests{
   image_id:pid,entry:0x1000,mapped_end:0x2000,verified:true}}}
  fn settings()->Settings{Settings{theme:Theme::Dark,pointer_speed:5,key_repeat:10}}
  type TestDesk=Desktop<Disk,3,3,3,3,3,5>;
+ #[test]fn m1_r046_owner_checked_health_and_repair_survive_desktop_restart(){
+  let mut fs=HierVfs::format_blank(Disk{data:[[0u8;SECTOR_BYTES];SECTORS]}).unwrap();
+  fs.mkdir("/docs").unwrap();fs.create("/docs/note",b"keep").unwrap();
+  let mut disk=fs.into_device();
+  // After two file writes newest metadata is at sector zero, leaving
+  // sector one as a verified prior generation; damage that older copy.
+  disk.data[1][24]^=1;
+  let mut gui=TestDesk::from_mounted(HierVfs::mount(disk).unwrap());
+  gui.start(user(1),load(1),user(2),load(2),settings(),8,9).unwrap();
+  let report=gui.volume_health(user(2),1).unwrap();
+  assert_eq!(report.valid_copies,1);
+  assert_eq!(report.redundancy,crate::durablefs::Redundancy::Degraded);
+  let stale=Identity{generation:2,..user(2)};
+  assert!(gui.repair_volume_redundancy(stale,1).is_err());
+  assert!(gui.volume_health(user(3),1).is_err());
+  assert!(gui.repair_volume_redundancy(user(2),9).is_err());
+  assert_eq!(gui.repair_volume_redundancy(user(2),1),Ok(true));
+  assert_eq!(gui.repair_volume_redundancy(user(2),1),Ok(false));
+  assert_eq!(gui.volume_health(user(2),1).unwrap().valid_copies,2);
+  let mut reply=[0u8;96];
+  let n=gui.execute(user(2),1,b"health",&mut reply).unwrap();
+  assert!(reply[..n].starts_with(b"healthy gen:"));
+  gui.exit(user(2)).unwrap();
+  assert!(gui.volume_health(user(2),1).is_err());
+  let mut fs=HierVfs::mount_healthy(gui.into_device()).unwrap();
+  let mut result=[0u8;16];
+  assert_eq!(fs.read("/docs/note",&mut result),Ok(4));
+  assert_eq!(&result[..4],b"keep");
+ }
+ #[test]fn m1_r046_desktop_repair_is_not_executable_via_terminal_string(){
+  let mut fs=HierVfs::format_blank(Disk{data:[[0u8;SECTOR_BYTES];SECTORS]}).unwrap();
+  fs.create("/note",b"original").unwrap();
+  let mut disk=fs.into_device();
+  disk.data[0][24]^=1; // valid current newer head remains
+  let mut gui=TestDesk::from_mounted(HierVfs::mount(disk).unwrap());
+  gui.start(user(1),load(1),user(2),load(2),settings(),8,99).unwrap();
+  let before=gui.volume_health(user(2),1).unwrap();
+  assert_eq!(before.valid_copies,1);
+  let mut output=[0u8;128];
+  assert!(gui.execute(user(2),1,b"repair",&mut output).is_err());
+  assert!(gui.execute(user(2),1,b"heal",&mut output).is_err());
+  assert_eq!(gui.volume_health(user(2),1).unwrap(),before);
+ }
  #[test]fn desktop_file_created_and_visible_after_real_vfs_remount(){
   let disk=Disk{data:[[0u8;SECTOR_BYTES];SECTORS]};
   let v=HierVfs::format_blank(disk).unwrap();

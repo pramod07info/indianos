@@ -373,3 +373,63 @@ are still required on the exact integration head.
 unchecked gates) need integrated physical/normal-boot and selected-QEMU
 recovery evidence under issue #616. Service-level host tests and the
 existing QEMU Files smoke alone do not close those high-level gates.
+
+
+### R046 — M1 G6 crash-safe COW checkpoint recovery and authenticated storage repair (2026-10-29)
+
+M1-first scope, following issue #616 rather than unrelated workstation feature
+expansion. This change retains the existing R027 three-bank COW format, does
+not introduce automatic formatting, and does not touch physical disks. It is
+not a complete real-world power-loss/fsync guarantee: BlockDevice drivers
+must meet their documented per-sector durable write/flush contract.
+
+20 concrete G6 implementation/acceptance work items, NOT 20 separate running
+coding agents:
+
+1. Fail-closed validation of impossible nonadjacent metadata generations.
+2. Reject CRC-valid divergent same-generation metadata during health probing.
+3. Strict healthy-only mount for unattended normal-boot startup paths.
+4. Explicit degraded volume reporting for recovery/diagnostic UI paths.
+5. Inspect both live heads and checksum-verify all referenced file payloads.
+6. Cross-check on-disk active metadata against the mounted in-memory head.
+7. Refuse stale or externally modified mounted metadata before any repair.
+8. Explicit metadata-only repair of exactly one invalid redundant head.
+9. Verify the repaired metadata sector via immediate readback.
+10. Revalidate both heads and all file checksums before repair acknowledgment.
+11. Preserve every data bank and existing VFS object during redundancy repair.
+12. Never rewrite an already healthy rollback generation (no-op repair).
+13. Keep future three-bank COW writes valid after a successful repair.
+14. Exercise power-loss failure at each of four COW data sectors and publish.
+15. Exercise lying storage acknowledgments at each of those five stages.
+16. Exercise torn metadata-only repair and preserve the previous committed file.
+17. Exercise falsely acknowledged dropped metadata-only repair.
+18. Expose audited health and explicit metadata repair on the actual HierVfs.
+19. Expose authenticated, time-bound Desktop health and repair routes; reject
+    stale PID, wrong owner, expired grants and untrusted Terminal commands.
+20. Expose a read-only Terminal health command and strict checked-partition
+    mount without autoformat; verify directory/files after reboot/remount.
+
+Production modules changed: durablefs, hier_vfs, m1_partition,
+m1_persistent_terminal and m1_persistent_desktop (Rust) plus the mandatory M1
+workflow. Tests: twenty new tests prefixed m1_r046_ distributed across
+those five real modules, including the real Desktop service, partition-bound
+VFS tests and a fault-injected synthetic block device. The M1 CI workflow
+explicitly runs the m1_r046_ subset; older M1/R040-R045, no_std, S0 and
+QEMU graphical Files + scratch disk reboot remain mandatory.
+
+Operational safety:
+- Terminal "health" requires FILE_READ and reports only status, generation
+  and number of checksum-verified metadata heads, not raw disk contents.
+- Untrusted Terminal "repair" and "heal" strings are deliberately unknown.
+- The only repair entrypoint is explicitly invoked through the scheduler-
+  authenticated Desktop owner with live FILE_READ and FILE_WRITE grants.
+- A successful metadata-only repair does not restore corrupted file contents
+  or replace hardware/flush qualification. Never auto-heal on normal boot.
+- mount_healthy refuses degraded storage; regular mount is retained for
+  explicit controlled recovery. Read-only partition health inspection
+  remains available for diagnosis.
+
+Evidence status: OPEN until exact PR SHA passes all mandatory Rust, S0 and
+QEMU checks. Do not mark G6 or any other eight outstanding M1 gates complete
+based solely on host-side tests. Full independent ring-3 normal-boot,
+physical device fault tests and fsync/write-barrier audit still pending.

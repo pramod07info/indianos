@@ -212,6 +212,15 @@ impl<D:BlockDevice> DurableFs<D>{
                 return Err(FsError::InvalidVolume);
             }
         }
+        if let (Some(a),Some(b))=(candidates[0],candidates[1]){
+            // The two alternating metadata heads must be identical at the
+            // initial checkpoint or exactly one generation apart. Larger
+            // valid-but-divergent gaps indicate stale/mixed media, not an
+            // ordinary interrupted write. Never silently pick a winner.
+            if a.generation.abs_diff(b.generation)>1{
+                return Err(FsError::InvalidVolume);
+            }
+        }
         let (active,meta,previous)=match (candidates[0],candidates[1]){
             (Some(a),Some(b)) if b.generation>a.generation=>(1,b,Some(a)),
             (Some(a),Some(b))=>(0,a,Some(b)),
@@ -238,8 +247,9 @@ impl<D:BlockDevice> DurableFs<D>{
         }
         let (latest,previous,valid_copies)=match (copies[0],copies[1]){
             (Some(a),Some(b))=>{
-                if a.generation==b.generation&&
-                   encode(&a,disk.sector_count())!=encode(&b,disk.sector_count()){
+                if a.generation.abs_diff(b.generation)>1 ||
+                   (a.generation==b.generation&&
+                    encode(&a,disk.sector_count())!=encode(&b,disk.sector_count())){
                     return Err(FsError::InvalidVolume);
                 }
                 if a.generation>=b.generation{
@@ -257,6 +267,56 @@ impl<D:BlockDevice> DurableFs<D>{
             current_generation:latest.generation,
             previous_generation:previous.map(|m|m.generation),
         })
+    }
+    /// Refuse a degraded or internally inconsistent mount for operations
+    /// requiring two independently verified COW metadata copies. Read-only
+    /// preflight still uses inspect_health to explain the specific condition.
+    pub fn mount_healthy(mut disk:D)->Result<Self,FsError>{
+        let health=Self::inspect_health(&mut disk)?;
+        if health.redundancy!=Redundancy::Healthy{
+            return Err(FsError::InvalidVolume);
+        }
+        Self::mount(disk)
+    }
+    /// Re-probe actual disk sectors, not cached metadata. Fail if a different
+    /// process changed the current head while this filesystem was mounted.
+    pub fn mounted_health(&mut self)->Result<VolumeHealth,FsError>{
+        let report=Self::inspect_health(&mut self.disk)?;
+        let mut active=[0u8;SECTOR_BYTES];
+        self.disk.read_sector(self.active,&mut active)?;
+        if active!=encode(&self.meta,self.disk.sector_count()) ||
+           report.current_generation!=self.meta.generation{
+            return Err(FsError::InvalidVolume);
+        }
+        Ok(report)
+    }
+    /// Explicit, opt-in single-superblock redundancy repair. Only allowed
+    /// when exactly ONE metadata head and every referenced payload verify.
+    /// No file banks, directory entries or file contents are written.
+    /// Do not use this as a replacement for fsync or media replacement.
+    ///
+    /// The previously committed head is read before writing the inactive
+    /// metadata sector. A failed/partial write leaves the active head intact.
+    /// The BlockDevice write contract must durably flush each sector.
+    pub fn repair_redundancy(&mut self)->Result<bool,FsError>{
+        let health=self.mounted_health()?;
+        if health.redundancy==Redundancy::Healthy{return Ok(false);}
+        if health.valid_copies!=1{return Err(FsError::InvalidVolume);}
+        let inactive=1-self.active;
+        let bytes=encode(&self.meta,self.disk.sector_count());
+        self.disk.write_sector(inactive,&bytes)?;
+        let mut observed=[0u8;SECTOR_BYTES];
+        self.disk.read_sector(inactive,&mut observed)?;
+        if observed!=bytes{return Err(FsError::InvalidVolume);}
+        // Validate BOTH newly published copies and all referenced file
+        // payloads before acknowledging an admin-triggered repair.
+        let after=Self::inspect_health(&mut self.disk)?;
+        if after.valid_copies!=2 ||
+           after.current_generation!=self.meta.generation{
+            return Err(FsError::InvalidVolume);
+        }
+        self.previous=Some(self.meta);
+        Ok(true)
     }
     pub fn generation(&self)->u64{self.meta.generation}
     /// Expose verified metadata names only, without mutable disk state.
@@ -733,6 +793,166 @@ mod tests{
         let mut mounted=DurableFs::mount(d).unwrap();
         assert_eq!(get(&mut mounted,"/file"),b"old");
         assert_ne!(active,2);
+    }
+
+    #[test]
+    fn m1_r046_strict_mount_rejects_degraded_but_recovery_mount_reads_file(){
+        let mut fs=DurableFs::format_blank(blank()).unwrap();
+        fs.create_path("/note",b"keep").unwrap();
+        let active=fs.active as usize;
+        let mut disk=fs.into_device();
+        disk.sectors[1-active][24]^=0x10;
+        let initial=disk.writes;
+        assert!(matches!(DurableFs::mount_healthy(disk.clone()),
+            Err(FsError::InvalidVolume)));
+        let mut recovered=DurableFs::mount(disk).unwrap();
+        assert_eq!(get(&mut recovered,"/note"),b"keep");
+        assert_eq!(recovered.mounted_health().unwrap().valid_copies,1);
+        assert_eq!(recovered.disk.writes,initial);
+    }
+    #[test]
+    fn m1_r046_explicit_repair_restores_both_superblocks_without_file_writes(){
+        let mut fs=DurableFs::format_blank(blank()).unwrap();
+        fs.create_path("/note",b"committed data").unwrap();
+        let active=fs.active as usize;
+        let mut disk=fs.into_device();
+        disk.sectors[1-active][24]^=0x41;
+        let before=disk.sectors.clone();
+        let before_writes=disk.writes;
+        let mut fs=DurableFs::mount(disk).unwrap();
+        assert_eq!(fs.mounted_health().unwrap().valid_copies,1);
+        assert_eq!(fs.repair_redundancy(),Ok(true));
+        assert_eq!(fs.disk.writes,before_writes+1);
+        for i in 2..MIN_SECTORS as usize{
+            assert_eq!(fs.disk.sectors[i],before[i],"payload sector {i} mutated");
+        }
+        let mut fs=DurableFs::mount_healthy(fs.into_device()).unwrap();
+        assert_eq!(fs.mounted_health().unwrap().valid_copies,2);
+        assert_eq!(get(&mut fs,"/note"),b"committed data");
+    }
+    #[test]
+    fn m1_r046_noop_repair_never_erases_valid_rollback_generation(){
+        let mut fs=DurableFs::format_blank(blank()).unwrap();
+        fs.create_path("/note",b"version one").unwrap();
+        fs.overwrite_path("/note",b"version two").unwrap();
+        let before=fs.disk.writes;
+        assert_eq!(fs.repair_redundancy(),Ok(false));
+        assert_eq!(fs.disk.writes,before);
+        let health=fs.mounted_health().unwrap();
+        assert_eq!(health.current_generation,3);
+        assert_eq!(health.previous_generation,Some(2));
+        assert_eq!(get(&mut fs,"/note"),b"version two");
+    }
+    #[test]
+    fn m1_r046_failed_repair_write_preserves_previous_committed_payload(){
+        let mut fs=DurableFs::format_blank(blank()).unwrap();
+        fs.create_path("/note",b"safe").unwrap();
+        let active=fs.active as usize;
+        let mut disk=fs.into_device();
+        disk.sectors[1-active][24]^=1;
+        disk.fail_at=Some(disk.writes);
+        let mut fs=DurableFs::mount(disk).unwrap();
+        assert_eq!(fs.repair_redundancy(),Err(FsError::Io));
+        let mut disk=fs.into_device();
+        disk.fail_at=None;
+        let mut fs=DurableFs::mount(disk).unwrap();
+        assert_eq!(get(&mut fs,"/note"),b"safe");
+        assert_eq!(fs.mounted_health().unwrap().valid_copies,1);
+        assert_eq!(fs.repair_redundancy(),Ok(true));
+        let mut fs=DurableFs::mount_healthy(fs.into_device()).unwrap();
+        assert_eq!(get(&mut fs,"/note"),b"safe");
+    }
+    #[test]
+    fn m1_r046_acknowledged_but_missing_repair_write_never_signals_success(){
+        let mut fs=DurableFs::format_blank(blank()).unwrap();
+        fs.create_path("/note",b"unchanged").unwrap();
+        let active=fs.active as usize;
+        let mut disk=fs.into_device();
+        disk.sectors[1-active][24]^=1;
+        disk.ignore_at=Some(disk.writes);
+        let mut fs=DurableFs::mount(disk).unwrap();
+        assert_eq!(fs.repair_redundancy(),Err(FsError::InvalidVolume));
+        let mut disk=fs.into_device();
+        disk.ignore_at=None;
+        let mut fs=DurableFs::mount(disk).unwrap();
+        assert_eq!(fs.mounted_health().unwrap().valid_copies,1);
+        assert_eq!(get(&mut fs,"/note"),b"unchanged");
+    }
+    #[test]
+    fn m1_r046_fully_healthy_repair_then_cow_write_and_remount(){
+        let mut fs=DurableFs::format_blank(blank()).unwrap();
+        fs.create_path("/note",b"first").unwrap();
+        let active=fs.active as usize;
+        let mut disk=fs.into_device();
+        disk.sectors[1-active][24]^=1;
+        let mut fs=DurableFs::mount(disk).unwrap();
+        fs.repair_redundancy().unwrap();
+        fs.overwrite_path("/note",b"second").unwrap();
+        let mut fs=DurableFs::mount_healthy(fs.into_device()).unwrap();
+        assert_eq!(get(&mut fs,"/note"),b"second");
+        assert_eq!(fs.mounted_health().unwrap().valid_copies,2);
+    }
+    #[test]
+    fn m1_r046_reject_valid_checksums_with_nonadjacent_metadata_versions(){
+        let mut fs=DurableFs::format_blank(blank()).unwrap();
+        fs.create_path("/note",b"first").unwrap();
+        fs.overwrite_path("/note",b"second").unwrap();
+        fs.overwrite_path("/note",b"third").unwrap();
+        let older=(1-fs.active) as usize;
+        let mut disk=fs.into_device();
+        let mut decoded=decode(&disk.sectors[older],MIN_SECTORS).unwrap();
+        decoded.generation=1; // still valid CRC/payload but impossible gap
+        disk.sectors[older]=encode(&decoded,MIN_SECTORS);
+        let before=disk.writes;
+        assert_eq!(DurableFs::inspect_health(&mut disk),Err(FsError::InvalidVolume));
+        assert!(matches!(DurableFs::mount(disk.clone()),Err(FsError::InvalidVolume)));
+        assert_eq!(disk.writes,before);
+    }
+    #[test]
+    fn m1_r046_repair_rejects_stale_live_superblock_without_writing(){
+        let mut fs=DurableFs::format_blank(blank()).unwrap();
+        fs.create_path("/note",b"safe").unwrap();
+        let active=fs.active as usize;
+        fs.disk.sectors[1-active][24]^=1;
+        fs.disk.sectors[active][24]^=1; // current cached head now invalid
+        let writes=fs.disk.writes;
+        assert_eq!(fs.mounted_health(),Err(FsError::InvalidVolume));
+        assert_eq!(fs.repair_redundancy(),Err(FsError::InvalidVolume));
+        assert_eq!(fs.disk.writes,writes);
+    }
+    #[test]
+    fn m1_r046_torn_cow_update_at_each_sector_preserves_last_commit(){
+        for stage in 0..5{
+            let mut fs=DurableFs::format_blank(blank()).unwrap();
+            fs.create_path("/note",&[0x55;1100]).unwrap();
+            let mut disk=fs.into_device();
+            disk.fail_at=Some(disk.writes+stage);
+            let mut fs=DurableFs::mount(disk).unwrap();
+            assert_eq!(fs.overwrite_path("/note",&[0xaa;1900]),Err(FsError::Io),
+                "failed stage {stage}");
+            let mut disk=fs.into_device();
+            disk.fail_at=None;
+            let mut remounted=DurableFs::mount(disk).unwrap();
+            assert_eq!(get(&mut remounted,"/note").as_slice(),&[0x55;1100],
+                "torn stage {stage}");
+        }
+    }
+    #[test]
+    fn m1_r046_silent_dropped_cow_write_at_each_stage_never_commits(){
+        for stage in 0..5{
+            let mut fs=DurableFs::format_blank(blank()).unwrap();
+            fs.create_path("/note",&[0x55;1100]).unwrap();
+            let mut disk=fs.into_device();
+            disk.ignore_at=Some(disk.writes+stage);
+            let mut fs=DurableFs::mount(disk).unwrap();
+            assert_eq!(fs.overwrite_path("/note",&[0xaa;1900]),
+                Err(FsError::InvalidVolume),"ignored stage {stage}");
+            let mut disk=fs.into_device();
+            disk.ignore_at=None;
+            let mut remounted=DurableFs::mount(disk).unwrap();
+            assert_eq!(get(&mut remounted,"/note").as_slice(),&[0x55;1100],
+                "ignored stage {stage}");
+        }
     }
 
 }

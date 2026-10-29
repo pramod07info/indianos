@@ -275,6 +275,23 @@ pub fn mount_checked<'a,D:BlockDevice>(disk:&'a mut D,
   .map_err(|_|MountError::Partition(Error::OutOfRange))?;
  HierVfs::mount(bounded).map_err(MountError::Filesystem)
 }
+/// Strict preflight-selected mount. Refuse a changed GPT/MBR geometry or
+/// any degraded COW filesystem. No autoformat, recovery or disk writes.
+pub fn mount_checked_healthy<'a,D:BlockDevice>(disk:&'a mut D,
+ expected:Partition)->Result<HierVfs<BlockWindow<'a,D>>,MountError>{
+ // Check the user's selected geometry BEFORE reading any filesystem
+ // metadata, so a stale selection is rejected independently of health.
+ let fresh=inspect(disk,expected.index).map_err(MountError::Partition)?;
+ if fresh!=expected{return Err(MountError::Partition(Error::Invalid));}
+ let health=probe_volume(disk,expected.index)?;
+ if health.partition!=expected{return Err(MountError::Partition(Error::Invalid));}
+ if health.volume.redundancy!=crate::durablefs::Redundancy::Healthy{
+  return Err(MountError::Filesystem(FsError::InvalidVolume));
+ }
+ let bounded=BlockWindow::new(disk,expected.start,expected.sectors)
+  .map_err(|_|MountError::Partition(Error::OutOfRange))?;
+ HierVfs::mount_healthy(bounded).map_err(MountError::Filesystem)
+}
 /// Mount previously provisioned IndianOS volume inside an explicitly chosen
 /// partition. The disk is borrowed; the view cannot access neighboring
 /// partitions. Neither inspection nor mount formats any disk.
@@ -678,6 +695,49 @@ mod m1_partition_tests{
   assert_eq!(d.writes,0);
  }
 
+ #[test]fn m1_r046_strict_partition_mount_refuses_degraded_until_explicit_repair(){
+  let mut disk=mbr_disk();
+  let selected=inspect(&mut disk,0).unwrap();
+  {
+   let window=BlockWindow::new(&mut disk,10,100).unwrap();
+   let mut fs=HierVfs::format_blank(window).unwrap();
+   fs.mkdir("/docs").unwrap();
+   fs.create("/docs/note",b"preserved").unwrap();
+  }
+  let original=disk.writes;
+  disk.data[11][24]^=0x11; // older superblock corrupt
+  assert_eq!(probe_volume(&mut disk,0).unwrap().volume.valid_copies,1);
+  assert!(matches!(mount_checked_healthy(&mut disk,selected),
+    Err(MountError::Filesystem(FsError::InvalidVolume))));
+  assert_eq!(disk.writes,original);
+  {
+   let mut fs=mount_checked(&mut disk,selected).unwrap();
+   let mut readback=[0u8;32];
+   assert_eq!(fs.read("/docs/note",&mut readback),Ok(9));
+   assert_eq!(&readback[..9],b"preserved");
+   assert_eq!(fs.repair_redundancy(),Ok(true));
+  }
+  {
+   let mut fs=mount_checked_healthy(&mut disk,selected).unwrap();
+   let mut readback=[0u8;32];
+   assert_eq!(fs.read("/docs/note",&mut readback),Ok(9));
+   assert_eq!(&readback[..9],b"preserved");
+  }
+  assert_eq!(disk.data[9],[0;SECTOR_BYTES]);
+  assert_eq!(disk.data[110],[0;SECTOR_BYTES]);
+ }
+ #[test]fn m1_r046_strict_mount_rechecks_geometry_and_rejects_unformatted_disk(){
+  let mut disk=gpt_disk();
+  let selected=inspect(&mut disk,0).unwrap();
+  let before=disk.writes;
+  assert!(matches!(mount_checked_healthy(&mut disk,selected),
+   Err(MountError::Filesystem(FsError::InvalidVolume))));
+  assert_eq!(disk.writes,before);
+  let stale=Partition{sectors:selected.sectors-1,..selected};
+  assert_eq!(mount_checked_healthy(&mut disk,stale).err(),
+   Some(MountError::Partition(Error::Invalid)));
+  assert_eq!(disk.writes,before);
+ }
  #[test]fn m1_r045_empty_valid_mbr_reports_no_partitions_without_format(){
   let mut d=new();d.data[0][510]=0x55;d.data[0][511]=0xaa;
   let inventory=discover(&mut d).unwrap();

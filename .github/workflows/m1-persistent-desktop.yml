@@ -46,6 +46,9 @@ jobs:
           # R045 mandatory read-only MBR/GPT inventory, geometry-locked mount,
           # redundant COW health and crash/corruption regression tests.
           cargo test --offline --manifest-path rust/kernel_core/Cargo.toml --features test-r031-vfs r045_
+          # R046: enforce exact failed-write/recovery, strict mounts,
+          # authenticated Desktop repair and real VFS remount regressions.
+          cargo test --offline --manifest-path rust/kernel_core/Cargo.toml --features test-r031-vfs m1_r046_
       - name: Build M1 durable VFS service interfaces in no_std mode
         run: |
           cargo check --offline --manifest-path rust/kernel_core/Cargo.toml --no-default-features --features test-r031-vfs

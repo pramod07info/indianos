@@ -53,6 +53,21 @@ impl<D:BlockDevice> HierVfs<D>{
  pub fn mount(disk:D)->Result<Self,FsError>{
   Ok(Self{fs:DurableFs::mount(disk)?})
  }
+ /// Strict Desktop/installer mount: refuse volume media with only a single
+ /// surviving verified metadata head; caller can inspect the health first.
+ pub fn mount_healthy(disk:D)->Result<Self,FsError>{
+  Ok(Self{fs:DurableFs::mount_healthy(disk)?})
+ }
+ /// Re-read the mounted device and validate all file checksums plus both
+ /// metadata copies without causing a write or automatic repair.
+ pub fn mounted_health(&mut self)->Result<VolumeHealth,FsError>{
+  self.fs.mounted_health()
+ }
+ /// Opt-in metadata-only recovery, for an authorized kernel Desktop route.
+ /// Unlike a destructive filesystem format, it never overwrites file banks.
+ pub fn repair_redundancy(&mut self)->Result<bool,FsError>{
+  self.fs.repair_redundancy()
+ }
  pub fn format_blank(disk:D)->Result<Self,FsError>{
   Ok(Self{fs:DurableFs::format_blank(disk)?})
  }
@@ -1106,5 +1121,82 @@ impl<D:BlockDevice> HierVfs<D>{
   let g=f.generation();
   assert!(f.checksum_file_at("/one",g+1).is_err());
   assert!(f.project_files_equal("/one","/one",g).is_err());
+ }
+}
+
+#[cfg(test)]
+mod m1_r046_vfs_redundancy_integration_tests{
+ use super::*;
+ use crate::block::{BlockError,SECTOR_BYTES};
+ #[derive(Clone)]
+ struct Disk{data:[[u8;SECTOR_BYTES];100],writes:usize}
+ impl BlockDevice for Disk{
+  fn sector_count(&self)->u64{100}
+  fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{
+   *out=*self.data.get(lba as usize).ok_or(BlockError::OutOfRange)?;Ok(())
+  }
+  fn write_sector(&mut self,lba:u64,from:&[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{
+   *self.data.get_mut(lba as usize).ok_or(BlockError::OutOfRange)?=*from;
+   self.writes+=1;Ok(())
+  }
+ }
+ fn fresh()->Disk{Disk{data:[[0u8;SECTOR_BYTES];100],writes:0}}
+ fn committed()->Disk{
+  let mut fs=HierVfs::format_blank(fresh()).unwrap();
+  fs.mkdir("/home").unwrap();
+  fs.create("/home/note",b"verified").unwrap();
+  fs.into_device()
+ }
+ #[test]fn m1_r046_vfs_strict_boot_refuses_degraded_but_mount_can_inspect(){
+  let mut disk=committed();
+  disk.data[1][24]^=1;
+  let before=disk.writes;
+  assert_eq!(HierVfs::<Disk>::probe_device(&mut disk).unwrap().valid_copies,1);
+  assert!(matches!(HierVfs::mount_healthy(disk.clone()),Err(FsError::InvalidVolume)));
+  let mut fs=HierVfs::mount(disk).unwrap();
+  let mut out=[0u8;32];
+  assert_eq!(fs.read("/home/note",&mut out),Ok(8));
+  assert_eq!(&out[..8],b"verified");
+  assert_eq!(fs.mounted_health().unwrap().valid_copies,1);
+  assert_eq!(fs.into_device().writes,before);
+ }
+ #[test]fn m1_r046_vfs_repair_restores_user_directory_after_remount(){
+  let mut disk=committed();
+  disk.data[1][24]^=1;
+  let previous=disk.data;
+  let mut fs=HierVfs::mount(disk).unwrap();
+  assert_eq!(fs.repair_redundancy(),Ok(true));
+  let disk=fs.into_device();
+  assert_eq!(&disk.data[2..],&previous[2..]);
+  let mut fs=HierVfs::mount_healthy(disk).unwrap();
+  let mut names=[0u8;256];
+  let n=fs.list_dir("/home",&mut names).unwrap();
+  assert_eq!(&names[..n],b"f:note\n");
+  let mut out=[0u8;16];
+  assert_eq!(fs.read("/home/note",&mut out),Ok(8));
+  assert_eq!(&out[..8],b"verified");
+ }
+ #[test]fn m1_r046_vfs_repair_does_not_touch_healthy_generations(){
+  let mut disk=committed();
+  let before=disk.writes;
+  let snapshot=disk.data;
+  let mut fs=HierVfs::mount_healthy(disk).unwrap();
+  assert_eq!(fs.repair_redundancy(),Ok(false));
+  let disk=fs.into_device();
+  assert_eq!(disk.writes,before);
+  assert_eq!(disk.data,snapshot);
+ }
+ #[test]fn m1_r046_vfs_corrupt_both_metadata_heads_refuses_repair_or_mount(){
+  let mut disk=committed();
+  disk.data[0][24]^=1;
+  disk.data[1][24]^=1;
+  let before=disk.writes;
+  assert_eq!(HierVfs::<Disk>::probe_device(&mut disk),
+   Err(FsError::InvalidVolume));
+  assert!(matches!(HierVfs::mount(disk.clone()),Err(FsError::InvalidVolume)));
+  assert!(matches!(HierVfs::mount_healthy(disk.clone()),Err(FsError::InvalidVolume)));
+  assert_eq!(disk.writes,before);
  }
 }
