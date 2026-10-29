@@ -141,18 +141,26 @@ impl Queue {
         unsafe{ptr::write_volatile(self.ring.add(PAGE+2).cast::<u16>(),self.queued);}
     }
     fn complete(&self)->bool{
-        compiler_fence(Ordering::Acquire);
         let idx=unsafe{ptr::read_volatile(self.ring.add(PAGE*2+2).cast::<u16>())};
+        compiler_fence(Ordering::Acquire);
         idx!=self.used
     }
-    fn consume(&mut self)->Option<usize>{
-        if !self.complete(){return None;}
+    fn consume(&mut self)->Result<Option<usize>,Error>{
+        let idx=unsafe{ptr::read_volatile(self.ring.add(PAGE*2+2).cast::<u16>())};
+        // Observe the device's publication before reading its used element
+        // and DMA bytes. x86 coherent DMA supplies the hardware ordering.
+        compiler_fence(Ordering::Acquire);
+        if idx==self.used{return Ok(None);}
+        // Only descriptor zero is ever outstanding. A jump, rewind, replay
+        // or unsolicited completion cannot transfer buffer ownership back.
+        if self.queued.wrapping_sub(self.used)!=1 ||
+           idx.wrapping_sub(self.used)!=1{return Err(Error::Device);}
         let pos=(self.used as usize%QSIZE as usize)*8;
         let id=unsafe{ptr::read_volatile(self.ring.add(PAGE*2+4+pos).cast::<u32>())};
         let size=unsafe{ptr::read_volatile(self.ring.add(PAGE*2+8+pos).cast::<u32>())};
+        if id!=0 || size as usize>FRAME_CAP{return Err(Error::Device);}
         self.used=self.used.wrapping_add(1);
-        if id!=0 || size as usize>FRAME_CAP{return None;}
-        Some(size as usize)
+        Ok(Some(size as usize))
     }
     fn release(self){
         let _=unsafe{pmm_release_frame(self.buffer_phys)};
@@ -254,7 +262,7 @@ impl EthernetDevice for VirtioNet{
         unsafe{outw(self.port+0x10,QUEUE_TX);}
         for _ in 0..TIMEOUT{
             if self.tx.complete(){
-                if self.tx.consume().is_none(){
+                if !matches!(self.tx.consume(),Ok(Some(_))){
                     self.faulted=true;
                     return Err(Error::Device);
                 }
@@ -269,9 +277,10 @@ impl EthernetDevice for VirtioNet{
     fn poll(&mut self,out:&mut [u8])->Result<Option<usize>,Error>{
         if self.faulted{return Err(Error::Device);}
         if !self.rx.complete(){return Ok(None);}
-        let Some(length)=self.rx.consume()else{
-            self.faulted=true;
-            return Err(Error::Device);
+        let length=match self.rx.consume(){
+            Ok(Some(length))=>length,
+            Ok(None)=>return Ok(None),
+            Err(error)=>{self.faulted=true;return Err(error);}
         };
         let n=match receive_payload_len(length,out.len()){
             Ok(n)=>n,
@@ -295,6 +304,59 @@ impl EthernetDevice for VirtioNet{
 #[cfg(test)]
 mod tests{
     use super::*;
+    fn mock_queue(ring:&mut [u64;1536],buffer:&mut [u64;512])->Queue{
+        Queue{ring_phys:0x1000,ring:ring.as_mut_ptr().cast(),
+            buffer_phys:0x4000,buffer:buffer.as_mut_ptr().cast(),queued:0,used:0}
+    }
+    fn completion(q:&Queue,index:u16,id:u32,len:u32){
+        let pos=q.used as usize%QSIZE as usize*8;
+        unsafe{
+            ptr::write_volatile(q.ring.add(PAGE*2+4+pos).cast::<u32>(),id);
+            ptr::write_volatile(q.ring.add(PAGE*2+8+pos).cast::<u32>(),len);
+            ptr::write_volatile(q.ring.add(PAGE*2+2).cast::<u16>(),index);
+        }
+    }
+    #[test]fn completions_require_exact_outstanding_descriptor_and_progress(){
+        for (queued,used,index,id,len) in [
+            (1,0,2,0,74),(1,0,u16::MAX,0,74), // jump / rewind
+            (0,0,1,0,74),(2,0,1,0,74), // no offer / overcommit
+            (1,0,1,1,74),(1,0,1,0,FRAME_CAP as u32+1),
+        ]{
+            let mut ring=[0u64;1536];let mut buf=[0u64;512];
+            let mut q=mock_queue(&mut ring,&mut buf);
+            q.queued=queued;q.used=used;completion(&q,index,id,len);
+            assert_eq!(q.consume(),Err(Error::Device));
+            assert_eq!((q.used,q.queued),(used,queued));
+        }
+    }
+    #[test]fn completion_wraparound_transfers_ownership_exactly_once(){
+        let mut ring=[0u64;1536];let mut buf=[0u64;512];
+        let mut q=mock_queue(&mut ring,&mut buf);
+        q.used=u16::MAX;q.queued=u16::MAX;
+        completion(&q,u16::MAX,0,0);
+        assert_eq!(q.consume(),Ok(None));
+        q.offer();assert_eq!(q.queued,0);
+        completion(&q,0,0,74);
+        assert_eq!(q.consume(),Ok(Some(74)));assert_eq!(q.used,0);
+        assert_eq!(q.consume(),Ok(None));
+        // Replaying the old index must not return the same DMA bytes.
+        completion(&q,u16::MAX,0,74);
+        assert_eq!(q.consume(),Err(Error::Device));assert_eq!(q.used,0);
+    }
+    #[test]fn malformed_rx_faults_before_copy_or_descriptor_rearm(){
+        let mut rr=[0u64;1536];let mut rb=[0u64;512];
+        let mut tr=[0u64;1536];let mut tb=[0u64;512];
+        let mut rx=mock_queue(&mut rr,&mut rb);rx.offer();
+        completion(&rx,2,0,74);
+        let mut dev=VirtioNet{port:0,mac:[2;6],rx,
+            tx:mock_queue(&mut tr,&mut tb),faulted:false};
+        let mut out=[0xaa;100];
+        assert_eq!(dev.poll(&mut out),Err(Error::Device));
+        assert!(dev.faulted);assert_eq!(out,[0xaa;100]);
+        assert_eq!(dev.rx.queued,1);assert_eq!(dev.rx.used,0);
+        assert_eq!(dev.send(&[0;60]),Err(Error::Device));
+        assert_eq!(dev.poll(&mut out),Err(Error::Device));
+    }
     #[test]fn dma_allocation_counts_and_ring_layout(){
         assert_eq!(QSIZE,256);
         assert_eq!(RING_FRAMES as usize*PAGE,12288);

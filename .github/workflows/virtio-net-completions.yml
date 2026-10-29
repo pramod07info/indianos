@@ -1,0 +1,29 @@
+name: virtio-net-completions
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "rust/kernel_core/src/virtio_net.rs"
+      - ".github/workflows/virtio-net-completions.yml"
+  push:
+    branches: [main]
+    paths:
+      - "rust/kernel_core/src/virtio_net.rs"
+      - ".github/workflows/virtio-net-completions.yml"
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
+      - name: Feature-enabled host regression
+        run: cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features test-r028-network virtio_net::tests
+      - name: Freestanding compilation
+        run: cargo check --locked --offline --manifest-path rust/kernel_core/Cargo.toml --no-default-features --target x86_64-unknown-none --features test-r028-network
+
