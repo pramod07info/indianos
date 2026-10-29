@@ -55,6 +55,7 @@ pub struct Desktop<D:BlockDevice,const P:usize,const E:usize,
  pub surface:Surfaces<Q>,
  pub input:InputLine,
  // Session-bound last successful command and the draft before recall.
+ control_down:bool,
  history:[u8;MAX_LINE],history_len:usize,
  draft:[u8;MAX_LINE],draft_len:usize,history_active:bool,
  owner:Option<Identity>,
@@ -72,7 +73,7 @@ impl<D:BlockDevice,const P:usize,const E:usize,const W:usize,
  pub fn from_mounted(volume:HierVfs<D>)->Self{
   Self{boot:Bootstrap::new(),rights:Access::new(),volume,
    surface:Surfaces::new(),input:InputLine::new(),owner:None,
-   history:[0;MAX_LINE],history_len:0,
+   control_down:false,history:[0;MAX_LINE],history_len:0,
    draft:[0;MAX_LINE],draft_len:0,history_active:false,
    window:0,shift_left:false,shift_right:false,redraw_pending:false}
  }
@@ -121,6 +122,7 @@ impl<D:BlockDevice,const P:usize,const E:usize,const W:usize,
  fn forget_history(&mut self){
   self.history.fill(0);self.history_len=0;
   self.draft.fill(0);self.draft_len=0;self.history_active=false;
+  self.control_down=false;
  }
  /// Coalesce full-window updates until the compositor drains the pending
  /// event. Input remains bounded by InputLine; pending damage is owned by
@@ -205,7 +207,16 @@ impl<D:BlockDevice,const P:usize,const E:usize,const W:usize,
    0x36=>{self.shift_right=event.pressed;return Ok(None);},
    _=>{},
   }
-  if !event.pressed{return Ok(None);}
+  if !event.pressed {if event.scan_code==0x1d {self.control_down=false;}return Ok(None);}
+  // Focus-bound Control+U clears a draft and Control+W deletes a word.
+  // Set-1 control scancode edges are tracked separately from Shift.
+  if event.scan_code==0x1d {self.control_down=true;return Ok(None);}
+  if self.control_down && (event.scan_code==0x16 || event.scan_code==0x11){
+   if event.scan_code==0x16 {self.input.clear_line();}
+   else {self.input.erase_word();}
+   self.history_active=false;self.request_redraw(owner)?;
+   return Ok(None);
+  }
   // Only the focused kernel-authenticated PS/2 input may recall or restore
   // a Terminal command. The draft is not lost by a history Up/Down cycle.
   if event.scan_code==0x48 {
@@ -389,6 +400,20 @@ mod tests{
   let mut out=[0u8;256];
   assert_eq!(gui.key(user(2),1,b'\n',&mut out),Ok(Some(7)));
   assert_eq!(gui.input.length(),0);
+ }
+ #[test]fn r041_ctrl_word_delete_and_clear_are_focus_bound(){
+  let disk=Disk{data:[[0u8;SECTOR_BYTES];SECTORS]};
+  let mut gui=TestDesk::from_mounted(HierVfs::format_blank(disk).unwrap());
+  gui.start(user(1),load(1),user(2),load(2),settings(),8,99).unwrap();
+  let mut out=[0u8;256];
+  for &ch in b"hello world"{gui.key(user(2),1,ch,&mut out).unwrap();}
+  gui.physical_key(1,0x1d,true,&mut out).unwrap();
+  gui.physical_key(1,0x11,true,&mut out).unwrap();
+  assert_eq!(gui.input.bytes(),b"hello ");
+  gui.physical_key(1,0x16,true,&mut out).unwrap();
+  assert!(gui.input.bytes().is_empty());
+  gui.physical_key(1,0x1d,false,&mut out).unwrap();
+  assert!(!gui.control_down);
  }
  #[test]fn r040_keyboard_up_down_recalls_last_command_and_preserves_draft(){
   let disk=Disk{data:[[0u8;SECTOR_BYTES];SECTORS]};

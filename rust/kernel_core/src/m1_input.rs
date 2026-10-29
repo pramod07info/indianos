@@ -19,6 +19,18 @@ impl InputLine{
  pub fn bytes(&self)->&[u8]{&self.bytes[..self.length]}
  /// Replace a trusted editable command atomically; invalid controls and
  /// oversized history never wipe the current draft.
+ /// Clear the current command without modifying completed history.
+ pub fn clear_line(&mut self){self.reset();}
+ /// Erase the previous ASCII word, including separating spaces.
+ /// No mutation occurs if the command is already empty.
+ pub fn erase_word(&mut self)->Event{
+  if self.length==0{return Event::Empty;}
+  let mut end=self.length;
+  while end>0&&self.bytes[end-1]==b' '{end-=1;}
+  while end>0&&self.bytes[end-1]!=b' '{end-=1;}
+  self.bytes[end..self.length].fill(0);
+  self.length=end;Event::Erased
+ }
  pub fn set_line(&mut self,line:&[u8])->Result<(),Error>{
   if line.len()>MAX_LINE{return Err(Error::Full);}
   if line.iter().any(|byte|!(b' '..=b'~').contains(byte)){
@@ -278,6 +290,15 @@ impl LineEditor{
   assert_eq!(e.bytes().len(),MAX_LINE);
  }
 
+ #[test]fn r041_terminal_ctrl_w_and_ctrl_u_are_bounded(){
+  let mut line=InputLine::new();line.set_line(b"echo hello world").unwrap();
+  assert_eq!(line.erase_word(),Event::Erased);
+  assert_eq!(line.bytes(),b"echo hello ");
+  assert_eq!(line.erase_word(),Event::Erased);
+  assert_eq!(line.bytes(),b"echo ");
+  line.clear_line();assert!(line.bytes().is_empty());
+  assert_eq!(line.erase_word(),Event::Empty);
+ }
  #[test]fn r040_terminal_history_restoration_is_atomic_and_bounded(){
   let mut line=InputLine::new();
   line.set_line(b"write /home/a persisted").unwrap();
