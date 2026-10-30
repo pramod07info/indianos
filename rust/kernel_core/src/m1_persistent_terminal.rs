@@ -476,15 +476,58 @@ pub enum PartitionCommandError {
  Mount(crate::m1_partition::MountError),
  Command(Error),
 }
+/// Do not probe or disclose any partition metadata before checking that
+/// the scheduler-derived caller still has an active filesystem capability.
+/// Fine-grained per-command permissions are checked again by command().
+fn preflight_partition_caller<const N:usize>(
+ auth:&Access<N>,caller:Identity,now:u64,
+)->Result<(),PartitionCommandError>{
+ if caller.pid==0||caller.generation==0{
+  return Err(PartitionCommandError::Command(Error::Denied));
+ }
+ let rights=auth.active_rights(caller,now)
+  .map_err(|_|PartitionCommandError::Command(Error::Denied))?;
+ if rights&(FILE_READ|FILE_WRITE)==0{
+  return Err(PartitionCommandError::Command(Error::Denied));
+ }
+ Ok(())
+}
+/// Explicit MBR/GPT geometry-locked, healthy COW mount for an authenticated
+/// Terminal command. Caller supplies a previously inspected partition;
+/// a changed ordinal, LBA range, missing partition or degraded volume is
+/// rejected without formatting or repairing disk sectors.
+pub fn command_on_checked_partition<D:BlockDevice,const N:usize>(
+ disk:&mut D,selected:crate::m1_partition::Partition,
+ auth:&Access<N>,caller:Identity,now:u64,input:&[u8],out:&mut[u8],
+)->Result<usize,PartitionCommandError>{
+ preflight_partition_caller(auth,caller,now)?;
+ let mut volume=crate::m1_partition::mount_checked_healthy(disk,selected)
+  .map_err(PartitionCommandError::Mount)?;
+ command(&mut volume,auth,caller,now,input,out)
+  .map_err(PartitionCommandError::Command)
+}
+/// The preferred persistent developer workstation command entrypoint.
+/// A user explicitly selects a GPT partition and stores its disk GUID and
+/// unique partition GUID. Every invocation revalidates both identifiers,
+/// complete primary/backup GPT metadata, geometry and COW redundancy before
+/// permitting authenticated read/write/mkdir/rename operations.
+pub fn command_on_gpt_selection<D:BlockDevice,const N:usize>(
+ disk:&mut D,selected:crate::m1_partition::GptSelection,
+ auth:&Access<N>,caller:Identity,now:u64,input:&[u8],out:&mut[u8],
+)->Result<usize,PartitionCommandError>{
+ preflight_partition_caller(auth,caller,now)?;
+ let mut volume=crate::m1_partition::mount_gpt_selected_healthy(disk,selected)
+  .map_err(PartitionCommandError::Mount)?;
+ command(&mut volume,auth,caller,now,input,out)
+  .map_err(PartitionCommandError::Command)
+}
 pub fn command_on_partition<D:BlockDevice,const N:usize>(
  disk:&mut D,selected_index:u32,auth:&Access<N>,caller:Identity,
  now:u64,input:&[u8],out:&mut[u8],
 )->Result<usize,PartitionCommandError>{
- // Reject obviously untrusted identities before touching device metadata.
- // Fine-grained command rights are still enforced by command() itself.
- if caller.pid==0||caller.generation==0{
-  return Err(PartitionCommandError::Command(Error::Denied));
- }
+ // Require an active owner/generation/expiry and filesystem scope before
+ // any on-disk discovery. The command parser remains the final rights gate.
+ preflight_partition_caller(auth,caller,now)?;
  let mut volume=crate::m1_partition::mount(disk,selected_index)
   .map_err(PartitionCommandError::Mount)?;
  command(&mut volume,auth,caller,now,input,out)

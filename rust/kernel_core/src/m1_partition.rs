@@ -902,6 +902,165 @@ mod m1_partition_tests{
   assert_eq!(inspect_gpt_selection(&mut d,0),Err(Error::Unsupported));
   assert_eq!(d.writes,0);
  }
+
+ #[test]fn m1_r049_gpt_selected_terminal_creates_moves_and_reads_across_remounts(){
+  use crate::m1_persistent_terminal::command_on_gpt_selection;
+  use crate::batch5_session::Identity;
+  use crate::batch6_security::{Access,FILE_READ,FILE_WRITE};
+  let mut d=gpt_disk();
+  let selected=inspect_gpt_selection(&mut d,0).unwrap();
+  {
+   let w=BlockWindow::new(&mut d,40,100).unwrap();
+   let mut fs=HierVfs::format_blank(w).unwrap();
+   fs.mkdir("/docs").unwrap();
+  }
+  let user=Identity{pid:3,generation:7};
+  let mut auth=Access::<1>::new();
+  auth.grant(user,FILE_READ|FILE_WRITE,100).unwrap();
+  let mut output=[0xcc;256];
+  assert_eq!(command_on_gpt_selection(&mut d,selected,&auth,user,1,
+   b"write /docs/plan persistent",&mut output),Ok(5));
+  assert_eq!(&output[..5],b"saved");
+  assert_eq!(command_on_gpt_selection(&mut d,selected,&auth,user,2,
+   b"mv /docs/plan /docs/done",&mut output),Ok(5));
+  assert_eq!(command_on_gpt_selection(&mut d,selected,&auth,user,3,
+   b"cat /docs/done",&mut output),Ok(10));
+  assert_eq!(&output[..10],b"persistent");
+  assert_eq!(d.data[39],[0;SECTOR_BYTES]);
+  assert_eq!(d.data[140],[0;SECTOR_BYTES]);
+ }
+ #[test]fn m1_r049_gpt_selection_cannot_be_reused_after_partition_guid_rotation(){
+  use crate::m1_persistent_terminal::{command_on_gpt_selection,PartitionCommandError};
+  use crate::batch5_session::Identity;
+  use crate::batch6_security::{Access,FILE_READ,FILE_WRITE};
+  let mut d=gpt_disk();
+  let selected=inspect_gpt_selection(&mut d,0).unwrap();
+  let user=Identity{pid:3,generation:2};
+  let mut auth=Access::<1>::new();
+  auth.grant(user,FILE_READ|FILE_WRITE,100).unwrap();
+  d.data[2][16..32].fill(7);rechecksum_gpt(&mut d);
+  let old_writes=d.writes;
+  let mut output=[0xaa;32];
+  assert_eq!(command_on_gpt_selection(&mut d,selected,&auth,user,1,
+   b"write /note bad",&mut output),
+   Err(PartitionCommandError::Mount(MountError::Partition(Error::Invalid))));
+  assert_eq!(d.writes,old_writes);assert_eq!(output,[0xaa;32]);
+ }
+ #[test]fn m1_r049_gpt_selection_cannot_be_reused_after_disk_guid_rotation(){
+  use crate::m1_persistent_terminal::{command_on_gpt_selection,PartitionCommandError};
+  use crate::batch5_session::Identity;
+  use crate::batch6_security::{Access,FILE_WRITE};
+  let mut d=gpt_disk();
+  let selected=inspect_gpt_selection(&mut d,0).unwrap();
+  let user=Identity{pid:3,generation:2};
+  let mut auth=Access::<1>::new();auth.grant(user,FILE_WRITE,100).unwrap();
+  d.data[1][56..72].fill(8);rechecksum_gpt(&mut d);
+  let mut output=[0xaa;32];
+  assert_eq!(command_on_gpt_selection(&mut d,selected,&auth,user,1,
+   b"write /note bad",&mut output),
+   Err(PartitionCommandError::Mount(MountError::Partition(Error::Invalid))));
+  assert_eq!(d.writes,0);assert_eq!(output,[0xaa;32]);
+ }
+ #[test]fn m1_r049_selected_terminal_rejects_unsafe_geometry_without_writes(){
+  use crate::m1_persistent_terminal::{command_on_checked_partition,PartitionCommandError};
+  use crate::batch5_session::Identity;
+  use crate::batch6_security::{Access,FILE_READ,FILE_WRITE};
+  let mut d=mbr_disk();
+  let selected=inspect(&mut d,0).unwrap();
+  let stale=Partition{start:selected.start+1,..selected};
+  let user=Identity{pid:3,generation:2};
+  let mut auth=Access::<1>::new();
+  auth.grant(user,FILE_READ|FILE_WRITE,100).unwrap();
+  let mut output=[0x55;16];
+  assert_eq!(command_on_checked_partition(&mut d,stale,&auth,user,1,
+   b"mkdir /lost",&mut output),
+   Err(PartitionCommandError::Mount(MountError::Partition(Error::Invalid))));
+  assert_eq!(d.writes,0);assert_eq!(output,[0x55;16]);
+ }
+ #[test]fn m1_r049_selected_terminal_requires_healthy_redundancy(){
+  use crate::m1_persistent_terminal::{command_on_gpt_selection,PartitionCommandError};
+  use crate::batch5_session::Identity;
+  use crate::batch6_security::{Access,FILE_READ,FILE_WRITE};
+  let mut d=gpt_disk();
+  let selected=inspect_gpt_selection(&mut d,0).unwrap();
+  {
+   let win=BlockWindow::new(&mut d,40,100).unwrap();
+   let mut fs=HierVfs::format_blank(win).unwrap();
+   fs.mkdir("/docs").unwrap();fs.create("/docs/plan",b"stable").unwrap();
+  }
+  d.data[40][19]^=0x11; // damage one checkpoint only
+  let user=Identity{pid:3,generation:2};
+  let mut auth=Access::<1>::new();auth.grant(user,FILE_READ|FILE_WRITE,100).unwrap();
+  let writes=d.writes;
+  let mut output=[0x77;64];
+  assert_eq!(command_on_gpt_selection(&mut d,selected,&auth,user,1,
+   b"write /docs/plan changed",&mut output),
+   Err(PartitionCommandError::Mount(MountError::Filesystem(FsError::InvalidVolume))));
+  assert_eq!(d.writes,writes);assert_eq!(output,[0x77;64]);
+ }
+ #[test]fn m1_r049_missing_and_expired_grants_cannot_trigger_device_reads(){
+  use crate::m1_persistent_terminal::{command_on_gpt_selection,PartitionCommandError,Error as CmdErr};
+  use crate::batch5_session::Identity;
+  use crate::batch6_security::{Access,FILE_READ};
+  struct Metered<'a>{disk:&'a mut Disk,reads:usize}
+  impl BlockDevice for Metered<'_>{
+   fn sector_count(&self)->u64{self.disk.sector_count()}
+   fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+    self.reads+=1;self.disk.read_sector(lba,out)
+   }
+   fn write_sector(&mut self,lba:u64,data:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+    self.disk.write_sector(lba,data)
+   }
+  }
+  let mut d=gpt_disk();let token=inspect_gpt_selection(&mut d,0).unwrap();
+  let user=Identity{pid:3,generation:7};
+  let mut auth=Access::<1>::new();auth.grant(user,FILE_READ,10).unwrap();
+  let mut meter=Metered{disk:&mut d,reads:0};
+  let mut out=[0x33;32];
+  for (who,now) in [(user,10),(Identity{generation:8,..user},1),
+                    (Identity{pid:0,..user},1)]{
+   assert_eq!(command_on_gpt_selection(&mut meter,token,&auth,who,now,
+     b"cat /docs/a",&mut out),
+     Err(PartitionCommandError::Command(CmdErr::Denied)));
+  }
+  assert_eq!(meter.reads,0);assert_eq!(out,[0x33;32]);
+  assert_eq!(meter.disk.writes,0);
+ }
+ #[test]fn m1_r049_strict_terminal_refuses_unformatted_selected_media(){
+  use crate::m1_persistent_terminal::{command_on_gpt_selection,PartitionCommandError};
+  use crate::batch5_session::Identity;
+  use crate::batch6_security::{Access,FILE_READ,FILE_WRITE};
+  let mut d=gpt_disk();let token=inspect_gpt_selection(&mut d,0).unwrap();
+  let user=Identity{pid:3,generation:2};
+  let mut auth=Access::<1>::new();auth.grant(user,FILE_READ|FILE_WRITE,100).unwrap();
+  let mut output=[0x55;32];
+  assert_eq!(command_on_gpt_selection(&mut d,token,&auth,user,1,
+    b"write /file never",&mut output),
+    Err(PartitionCommandError::Mount(MountError::Filesystem(FsError::InvalidVolume))));
+  assert_eq!(d.writes,0);assert_eq!(output,[0x55;32]);
+ }
+ #[test]fn m1_r049_readonly_gpt_grant_cannot_mutate_existing_files(){
+  use crate::m1_persistent_terminal::{command_on_gpt_selection,PartitionCommandError,Error as CmdErr};
+  use crate::batch5_session::Identity;
+  use crate::batch6_security::{Access,FILE_READ};
+  let mut d=gpt_disk();let token=inspect_gpt_selection(&mut d,0).unwrap();
+  {
+   let win=BlockWindow::new(&mut d,40,100).unwrap();
+   let mut fs=HierVfs::format_blank(win).unwrap();
+   fs.create("/note",b"safe").unwrap();
+  }
+  let user=Identity{pid:3,generation:2};
+  let mut auth=Access::<1>::new();auth.grant(user,FILE_READ,100).unwrap();
+  let writes=d.writes;
+  let mut output=[0x44;32];
+  assert_eq!(command_on_gpt_selection(&mut d,token,&auth,user,1,
+   b"write /note bad",&mut output),
+   Err(PartitionCommandError::Command(CmdErr::Denied)));
+  assert_eq!(d.writes,writes);assert_eq!(output,[0x44;32]);
+  assert_eq!(command_on_gpt_selection(&mut d,token,&auth,user,2,
+   b"cat /note",&mut output),Ok(4));
+  assert_eq!(&output[..4],b"safe");
+ }
  #[test]fn m1_r045_empty_valid_mbr_reports_no_partitions_without_format(){
   let mut d=new();d.data[0][510]=0x55;d.data[0][511]=0xaa;
   let inventory=discover(&mut d).unwrap();
