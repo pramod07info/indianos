@@ -18,7 +18,7 @@ pub const MAX_COMMAND:usize=192;
 pub const COMMAND_VERBS:&[&str]=&[
  "help","pwd","tools","ls","cat","write","append","mkdir","mv",
  "cp","rm","mkfile","truncate","head","count","rmdir","mvdir",
- "pread","pwrite","lines","line","hash","stat","tail","find","grep","cmp",
+ "pread","pwrite","lines","line","hash","stat","tail","find","grep","cmp","diffat",
  "touch","copynew","replace","appendln","health",
 ];
 /// Complete exactly one printable lower-case verb prefix. Ambiguous matches,
@@ -91,7 +91,7 @@ pub fn command<D:BlockDevice,const N:usize>(
  let line=entered.trim_end();
  if line=="help"{return publish(b"pwd ls /dir cat /path write /path text append /path text mkdir /dir mv /old /new cp /src /dst rm /path mkfile /path truncate /path head /path count rmdir /dir mvdir /old /new pread /file offset count pwrite /file@offset text",out);}
  if line=="pwd"{return publish(b"/",out);}
- if line=="tools"{return publish(b"count lines line tail find grep hash cmp stat touch copynew replace appendln health",out);}
+ if line=="tools"{return publish(b"count lines line tail find grep hash cmp diffat stat touch copynew replace appendln health",out);}
  if line=="health"{
   auth.require(caller,FILE_READ,now).map_err(|_|Error::Denied)?;
   let health=fs.mounted_health().map_err(Error::Io)?;
@@ -195,6 +195,30 @@ pub fn command<D:BlockDevice,const N:usize>(
     }
    }
    publish(&matched[..len],out)
+  }
+  // Diagnostic diff: report the first byte offset that differs between
+  // two authenticated durable files, or "equal" when identical. The
+  // first mismatching offset is the shorter length when one is a prefix.
+  // This is a read-only primitive, not an allocator-backed unified diff.
+  "diffat"=>{
+   auth.require(caller,FILE_READ,now).map_err(|_|Error::Denied)?;
+   let mut args=raw.split_ascii_whitespace();
+   let left=args.next().ok_or(Error::Invalid)?;
+   let right=args.next().ok_or(Error::Invalid)?;
+   if args.next().is_some(){return Err(Error::Invalid);}
+   let a=path(left,&mut name)?;
+   let mut peer=[0u8;64];
+   let b=path(right,&mut peer)?;
+   let mut first=[0u8;crate::durablefs::MAX_FILE_BYTES];
+   let mut second=[0u8;crate::durablefs::MAX_FILE_BYTES];
+   let x=fs.read(a,&mut first).map_err(Error::Io)?;
+   let y=fs.read(b,&mut second).map_err(Error::Io)?;
+   if x==y&&first[..x]==second[..y]{
+    return publish(b"equal",out);
+   }
+   let first_difference=first[..x].iter().zip(second[..y].iter())
+    .position(|(a,b)|a!=b).unwrap_or(x.min(y));
+   publish_number(first_difference as u64,out)
   }
   "cmp"=>{
    auth.require(caller,FILE_READ,now).map_err(|_|Error::Denied)?;
@@ -717,6 +741,41 @@ mod tests{
   }
   assert_eq!(fs.generation(),generation);
  }
+ #[test]fn r059_durable_diffat_reports_first_mismatch_and_prefix_boundary(){
+  let mut fs=HierVfs::format_blank(blank()).unwrap();let auth=grants();
+  fs.create("/one",b"hello alpha").unwrap();
+  fs.create("/two",b"hello beta").unwrap();
+  fs.create("/short",b"hello").unwrap();
+  let generation=fs.generation();
+  let (n,out)=run(&mut fs,&auth,user(),b"diffat /one /two").unwrap();
+  assert_eq!(&out[..n],b"6");
+  let (n,out)=run(&mut fs,&auth,user(),b"diffat /one /short").unwrap();
+  assert_eq!(&out[..n],b"5");
+  let (n,out)=run(&mut fs,&auth,user(),b"diffat /one /one").unwrap();
+  assert_eq!(&out[..n],b"equal");
+  fs=HierVfs::mount(fs.into_device()).unwrap();
+  let (n,out)=run(&mut fs,&auth,user(),b"diffat /one /two").unwrap();
+  assert_eq!(&out[..n],b"6");
+  assert_eq!(fs.generation(),generation);
+ }
+ #[test]fn r059_diffat_denied_paths_short_output_and_missing_files_are_atomic(){
+  let mut fs=HierVfs::format_blank(blank()).unwrap();let auth=grants();
+  fs.create("/one",b"same").unwrap();
+  fs.create("/two",b"same").unwrap();
+  let generation=fs.generation();
+  let mut short=[0x6d;2];
+  assert_eq!(command(&mut fs,&auth,user(),1,b"diffat /one /two",&mut short),
+    Err(Error::OutputTooSmall));
+  assert_eq!(short,[0x6d;2]);
+  let old=Identity{generation:4,..user()};
+  assert_eq!(run(&mut fs,&auth,old,b"diffat /one /two"),Err(Error::Denied));
+  assert_eq!(run(&mut fs,&auth,user(),b"diffat /../one /two"),
+    Err(Error::Invalid));
+  assert_eq!(run(&mut fs,&auth,user(),b"diffat /one /missing"),
+    Err(Error::Io(FsError::NotFound)));
+  assert_eq!(fs.generation(),generation);
+  assert_eq!(short,[0x6d;2]);
+ }
  #[test]fn m1_terminal_typed_literal_spaces_survive_each_disk_remount(){
   use crate::m1_input::{InputLine,Event,MAX_LINE};
   let mut fs=HierVfs::format_blank(blank()).unwrap();let auth=grants();
@@ -824,7 +883,7 @@ mod tests{
   assert_eq!(complete_verb(b"heal"),Some("health"));
  }
  #[test]fn r044_command_registry_drives_unique_safe_completion(){
-  assert_eq!(COMMAND_VERBS.len(),32);
+  assert_eq!(COMMAND_VERBS.len(),33);
   for (i,verb) in COMMAND_VERBS.iter().enumerate(){
    assert!(verb.as_bytes().iter().all(|b|b.is_ascii_lowercase()));
    assert!(!COMMAND_VERBS[..i].contains(verb));

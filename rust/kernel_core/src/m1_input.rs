@@ -148,6 +148,31 @@ impl InputLine{
   self.history_cursor=Some(next);
   Ok(entry.len)
  }
+ /// Reverse-search prior successfully submitted commands by a printable
+ /// prefix. Success loads the newest matching entry older than the current
+ /// history cursor; a miss never modifies the editor or saved draft.
+ /// The original draft remains recoverable via history_next().
+ pub fn history_search_previous(&mut self,prefix:&[u8])
+  ->Result<usize,Error>{
+  if prefix.is_empty()||prefix.len()>MAX_LINE||
+     prefix.iter().any(|&b|!(b' '..=b'~').contains(&b)){
+   return Err(Error::Invalid);
+  }
+  let end=self.history_cursor.unwrap_or(self.history_len);
+  let index=(0..end).rev().find(|&i|
+   self.history[i].is_some_and(|entry|
+      entry.bytes[..entry.len].starts_with(prefix))).ok_or(Error::Invalid)?;
+  let selected=self.history[index].ok_or(Error::Invalid)?;
+  if self.history_cursor.is_none(){
+   self.history_draft.fill(0);
+   self.history_draft_len=self.length();
+   self.history_draft[..self.history_draft_len]
+    .copy_from_slice(self.editor.bytes());
+  }
+  self.editor.replace_line(&selected.bytes[..selected.len])?;
+  self.history_cursor=Some(index);
+  Ok(selected.len)
+ }
  pub fn history_next(&mut self)->Result<usize,Error>{
   let index=self.history_cursor.ok_or(Error::Invalid)?;
   if index+1==self.history_len{
@@ -590,6 +615,42 @@ impl LineEditor{
   line.forget();
   assert_eq!(line.history_count(),0);
   assert_eq!(line.history_previous(),Err(Error::Invalid));
+ }
+ #[test]fn r059_reverse_history_prefix_search_restores_original_draft(){
+  let mut input=InputLine::new();let mut out=[0u8;MAX_LINE];
+  for command in [b"build one".as_slice(),b"help",b"build two",
+                  b"build three",b"status"]{
+   input.set_line(command).unwrap();
+   input.feed(b'\n',&mut out).unwrap();
+  }
+  input.set_line(b"unfinished").unwrap();
+  assert_eq!(input.history_search_previous(b"build"),Ok(11));
+  assert_eq!(input.bytes(),b"build three");
+  assert_eq!(input.history_search_previous(b"build"),Ok(9));
+  assert_eq!(input.bytes(),b"build two");
+  assert_eq!(input.history_search_previous(b"build"),Err(Error::Invalid));
+  assert_eq!(input.bytes(),b"build two");
+  // The search does not lose the user's original in-progress draft.
+  assert_eq!(input.history_next(),Ok(11));
+  assert_eq!(input.bytes(),b"build three");
+  assert_eq!(input.history_next(),Ok(6));
+  assert_eq!(input.bytes(),b"status");
+  assert_eq!(input.history_next(),Ok(10));
+  assert_eq!(input.bytes(),b"unfinished");
+ }
+ #[test]fn r059_reverse_search_miss_and_invalid_prefix_leave_draft_intact(){
+  let mut input=InputLine::new();let mut out=[0u8;MAX_LINE];
+  input.set_line(b"cat /notes").unwrap();input.feed(b'\n',&mut out).unwrap();
+  input.set_line(b"work in progress").unwrap();
+  for prefix in [b"".as_slice(),b"wrong",b"cat\n",b"CAT"]{
+   assert_eq!(input.history_search_previous(prefix),Err(Error::Invalid));
+   assert_eq!(input.bytes(),b"work in progress");
+  }
+  assert_eq!(input.history_search_previous(b"cat"),Ok(10));
+  assert_eq!(input.bytes(),b"cat /notes");
+  input.forget();
+  assert_eq!(input.history_search_previous(b"cat"),Err(Error::Invalid));
+  assert_eq!(input.history_count(),0);
  }
  #[test]fn r042_kill_and_safe_restore_preserve_draft_invariants(){
   let mut line=InputLine::new();
