@@ -292,7 +292,7 @@ mod paging;
 mod paging_cpu;
 #[cfg(feature = "user-runtime")]
 mod user_runtime;
-#[cfg(feature = "test-interactive")]
+#[cfg(any(feature = "test-interactive",feature="normal-init"))]
 mod input;
 #[cfg(any(feature = "test-irq-keyboard", feature="test-r029-desktop"))]
 mod console;

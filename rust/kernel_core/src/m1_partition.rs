@@ -225,8 +225,36 @@ fn gpt<D:BlockDevice>(disk:&mut D)->Result<PartitionSet,Error>{
 /// partition bounds before returning any read-only discovery result.
 /// No formatting, repair, mounting or writes occur here.
 pub fn discover<D:BlockDevice>(disk:&mut D)->Result<PartitionSet,Error>{
- let mut read_only=ReadOnlyDevice::new(disk);
- discover_verified(&mut read_only)
+ let capacity=disk.sector_count();
+ if capacity<2{return Err(Error::Invalid);}
+ let mut pinned=DiscoveryDevice{disk,capacity};
+ let result=discover_verified(&mut pinned)?;
+ pinned.check_capacity()?;
+ Ok(result)
+}
+/// A discovery result must describe one capacity throughout validation.
+/// Returning the snapshot here also prevents a zero-capacity media removal
+/// from underflowing protective-MBR arithmetic after the initial check.
+/// The adapter remains a hard read-only capability, including on errors.
+struct DiscoveryDevice<'a,D:BlockDevice>{disk:&'a mut D,capacity:u64}
+impl<D:BlockDevice> DiscoveryDevice<'_,D>{
+ fn check_capacity(&self)->Result<(),BlockError>{
+  if self.disk.sector_count()!=self.capacity{return Err(BlockError::Io);}
+  Ok(())
+ }
+}
+impl<D:BlockDevice> BlockDevice for DiscoveryDevice<'_,D>{
+ fn sector_count(&self)->u64{self.capacity}
+ fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+  ->Result<(),BlockError>{
+  self.check_capacity()?;
+  crate::block::check_range(self.capacity,lba,1)?;
+  self.disk.read_sector(lba,out)?;
+  if let Err(error)=self.check_capacity(){out.fill(0);return Err(error);}
+  Ok(())
+ }
+ fn write_sector(&mut self,_lba:u64,_bytes:&[u8;SECTOR_BYTES])
+  ->Result<(),BlockError>{Err(BlockError::ReadOnly)}
 }
 fn discover_verified<D:BlockDevice>(disk:&mut D)->Result<PartitionSet,Error>{
  if disk.sector_count()<2{return Err(Error::Invalid);}
@@ -345,7 +373,17 @@ pub fn mount_gpt_selected_healthy<'a,D:BlockDevice>(disk:&'a mut D,
  if health.redundancy!=crate::durablefs::Redundancy::Healthy{
   return Err(MountError::Filesystem(FsError::InvalidVolume));
  }
- mount_checked_healthy(disk,actual.partition)
+ let mut mounted=mount_checked_healthy(disk,actual.partition)?;
+ // The actual mount performs further filesystem reads after the earlier
+ // GUID preflight. Revalidate while retaining the mounted device borrow;
+ // dropping and remounting here would simply recreate the same gap.
+ mounted.validate_device(|window|window.validate_parent(|parent|{
+  let final_selection=inspect_gpt_selection(parent,expected.partition.index)
+   .map_err(MountError::Partition)?;
+  if final_selection!=expected{return Err(MountError::Partition(Error::Invalid));}
+  Ok(())
+ }))?;
+ Ok(mounted)
 }
 /// Explicit recovery operation used by the authenticated Terminal service.
 /// Keep the original GUID/geometry binding while admitting one good COW head;
@@ -1686,6 +1724,111 @@ mod m1_partition_tests{
   assert!(matches!(mount_gpt_selected_healthy(&mut changed,token),
    Err(MountError::Partition(Error::Invalid))));
   assert!(changed.swapped);assert_eq!(changed.disk.writes,writes);
+ }
+ #[test]fn m1_gpt_selected_mount_rejects_identity_change_during_final_mount_read(){
+  struct LateSwap{disk:Disk,volume_reads:usize,swap_at:usize,mode:usize}
+  impl BlockDevice for LateSwap{
+   fn sector_count(&self)->u64{self.disk.sector_count()}
+   fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+    if self.mode==2&&self.volume_reads>=self.swap_at&&lba==1{
+     return Err(BlockError::Io);
+    }
+    self.disk.read_sector(lba,out)?;
+    if (40..140).contains(&lba){
+     self.volume_reads+=1;
+     if self.volume_reads==self.swap_at{
+      match self.mode{
+       0=>self.disk.data[1][56..72].fill(9),
+       1=>self.disk.data[2][16..32].fill(9),
+       _=>{},
+      }
+      rechecksum_gpt(&mut self.disk);
+     }
+    }
+    Ok(())
+   }
+   fn write_sector(&mut self,lba:u64,bytes:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+    self.disk.write_sector(lba,bytes)
+   }
+  }
+  for mode in 0..3{
+   let mut disk=m1_recovery_disk();
+   let selected=inspect_gpt_selection(&mut disk,0).unwrap();
+   let writes=disk.writes;
+   let mut stable=LateSwap{disk,volume_reads:0,swap_at:usize::MAX,mode};
+   drop(mount_gpt_selected_healthy(&mut stable,selected).unwrap());
+   let final_read=stable.volume_reads;assert!(final_read>1);
+   // Rotation after the final filesystem transfer used to return a writable
+   // foreign-volume mount. A failed final identity read must also fail closed.
+   stable.volume_reads=0;stable.swap_at=final_read;
+   let expected=if mode==2{Error::Io}else{Error::Invalid};
+   assert_eq!(mount_gpt_selected_healthy(&mut stable,selected).err(),
+    Some(MountError::Partition(expected)));
+   assert_eq!(stable.volume_reads,final_read);assert_eq!(stable.disk.writes,writes);
+  }
+ }
+ // Faulty/removable drivers can change capacity between discovery reads.
+ struct ChangingCapacity{disk:Disk,capacity:core::cell::Cell<u64>,reads:usize,
+  change_at:usize,replacement:u64}
+ impl BlockDevice for ChangingCapacity{
+  fn sector_count(&self)->u64{self.capacity.get()}
+  fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   self.reads+=1;
+   let result=self.disk.read_sector(lba,out);
+   if self.reads==self.change_at{self.capacity.set(self.replacement);}
+   result
+  }
+  fn write_sector(&mut self,lba:u64,bytes:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   self.disk.write_sector(lba,bytes)
+  }
+ }
+ #[test]fn m1_discovery_rejects_capacity_change_at_every_gpt_transfer(){
+  for at in 1..=5{
+   for replacement in [0,1,255,257,u64::MAX]{
+    let mut changed=ChangingCapacity{disk:gpt_disk(),capacity:core::cell::Cell::new(256),
+     reads:0,change_at:at,replacement};
+    assert!(discover(&mut changed).is_err(),"accepted change at read {at} to {replacement}");
+    assert_eq!(changed.disk.writes,0);
+    assert_eq!(changed.reads,at,"continued reads after known geometry change");
+   }
+  }
+ }
+ #[test]fn m1_discovery_rejects_mbr_capacity_growth_and_shrink(){
+  for replacement in [0,1,64,257,u64::MAX]{
+   let mut changed=ChangingCapacity{disk:mbr_disk(),capacity:core::cell::Cell::new(256),
+    reads:0,change_at:1,replacement};
+   assert!(discover(&mut changed).is_err());
+   assert_eq!(changed.disk.writes,0);assert_eq!(changed.reads,1);
+  }
+ }
+ #[test]fn m1_discovery_adapter_rejects_pre_read_changes_and_all_writes(){
+  let mut disk=ChangingCapacity{disk:gpt_disk(),capacity:core::cell::Cell::new(256),
+   reads:0,change_at:usize::MAX,replacement:0};
+  let mut pinned=DiscoveryDevice{disk:&mut disk,capacity:256};
+  let mut bytes=[0xa5;SECTOR_BYTES];
+  assert_eq!(pinned.write_sector(0,&bytes),Err(BlockError::ReadOnly));
+  assert_eq!(pinned.read_sector(256,&mut bytes),Err(BlockError::OutOfRange));
+  pinned.disk.capacity.set(0);
+  assert_eq!(pinned.read_sector(0,&mut bytes),Err(BlockError::Io));
+  assert_eq!(pinned.disk.reads,0);assert_eq!(pinned.disk.disk.writes,0);
+ }
+ #[test]fn m1_discovery_adapter_scrubs_changed_transfer_and_rejects_tiny_media(){
+  let mut disk=ChangingCapacity{disk:gpt_disk(),capacity:core::cell::Cell::new(256),
+   reads:0,change_at:1,replacement:0};
+  let mut bytes=[0xa5;SECTOR_BYTES];
+  let mut pinned=DiscoveryDevice{disk:&mut disk,capacity:256};
+  assert_eq!(pinned.read_sector(0,&mut bytes),Err(BlockError::Io));
+  assert_eq!(bytes,[0;SECTOR_BYTES]);
+  assert_eq!(discover(&mut disk),Err(Error::Invalid));
+  assert_eq!(disk.reads,1);assert_eq!(disk.disk.writes,0);
+ }
+ #[test]fn m1_discovery_stable_capacity_keeps_sparse_catalog_and_read_errors(){
+  let mut stable=ChangingCapacity{disk:gpt_disk(),capacity:core::cell::Cell::new(256),
+   reads:0,change_at:usize::MAX,replacement:0};
+  assert_eq!(discover(&mut stable).unwrap().get(0).unwrap().start,40);
+  assert_eq!(stable.reads,5);assert_eq!(stable.disk.writes,0);
+  stable.disk.fail_read=Some(255);
+  assert_eq!(discover(&mut stable),Err(Error::Io));
  }
  #[test]fn m1_r045_empty_valid_mbr_reports_no_partitions_without_format(){
   let mut d=new();d.data[0][510]=0x55;d.data[0][511]=0xaa;

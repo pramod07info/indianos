@@ -16,6 +16,8 @@ ed25519-compact = { path = "vendor/ed25519-compact", default-features = false, o
 # Unit tests use std; the actual bare-metal build explicitly disables it.
 default = ["std"]
 std = []
+# Production single-process bootstrap, separate from experimental desktop profiles.
+normal-init = ["user-runtime"]
 preempt = []
 cpu-entry = []
 vmm = []

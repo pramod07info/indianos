@@ -80,11 +80,18 @@ unsafe fn discard_tree(b: &Backend, frame: u64, level: u8) -> bool {
             if !valid_frame(next) ||
                 !unsafe { discard_tree(b, next, level - 1) } {
                 ok = false;
+            } else {
+                // Detach only children whose entire owned subtree has been
+                // released. A retry must never visit their freed frames.
+                unsafe { ptr::write_volatile(t.add(i), 0); }
             }
         }
     }
-    if !unsafe { release(b, frame) } { ok = false; }
-    ok
+    // Keep this table and all failed-child links live for the caller's next
+    // serialized retry. Releasing a parent here would lose owned descendants
+    // and leave CloneResult pointing at a freed root.
+    if !ok { return false; }
+    unsafe { release(b, frame) }
 }
 unsafe fn clone_level(
     b: &Backend, source: u64, level: u8, allocated: &mut u32,
@@ -214,7 +221,10 @@ pub unsafe extern "C" fn paging_detach_user_half(
 }
 /// # Safety
 /// Result refers to owned, inactive root. Borrowed user children MUST be
-/// detached first. This recurses only up to 4 page-table levels.
+/// detached first. This recurses only up to 4 page-table levels. On failure,
+/// result retains the still-owned root and unfreed descendants for retry;
+/// successfully released child links are cleared before returning. The table
+/// count remains the original allocation count until complete release.
 #[no_mangle]
 pub unsafe extern "C" fn paging_clone_release(
     backend: *const Backend, result: *mut CloneResult,
@@ -277,4 +287,139 @@ mod tests {
         assert!(valid_frame(0x1000));
         assert!(!valid_frame(0x1234));
     }
+}
+
+#[cfg(test)]
+mod release_retry_tests {
+    use super::*;
+    struct Memory {
+        tables: [[u64; TABLE_ENTRIES]; 8],
+        live: [bool; 8],
+        released: [usize; 8],
+        fail_frame: u64,
+        deny_access: u64,
+    }
+    impl Memory {
+        fn new() -> Self {
+            let mut m = Self { tables: [[0; TABLE_ENTRIES]; 8],
+                live: [true; 8], released: [0; 8], fail_frame: 0, deny_access: 0 };
+            // Four levels, two siblings and borrowed huge/data leaf frames.
+            m.tables[0][256] = 0x2000 | 3;
+            m.tables[0][257] = 0x6000 | 3;
+            m.tables[1][0] = 0x3000 | 3;
+            m.tables[1][1] = 0x5000 | 3;
+            m.tables[2][0] = 0x4000 | 3;
+            m.tables[2][1] = 0x200000 | PRESENT | HUGE;
+            m.tables[3][0] = 0x9000 | 3; // mapped payload is not owned here
+            m.tables[5][0] = 0x7000 | 3;
+            m.tables[6][0] = 0x8000 | 3;
+            m
+        }
+        fn backend(&mut self) -> Backend {
+            Backend { allocate: Some(allocate), release: Some(release_frame),
+                access: Some(access), context: (self as *mut Self).cast() }
+        }
+    }
+    unsafe extern "C" fn allocate(_: *mut u64, _: *mut c_void) -> bool { false }
+    fn index(frame: u64) -> usize {
+        assert!((0x1000..=0x8000).contains(&frame));
+        assert_eq!(frame & 4095, 0);
+        (frame / 4096 - 1) as usize
+    }
+    unsafe extern "C" fn access(frame: u64, context: *mut c_void) -> *mut u64 {
+        let m = unsafe { &mut *context.cast::<Memory>() };
+        let i = index(frame);
+        assert!(m.live[i], "access to a freed table");
+        if frame == m.deny_access { return ptr::null_mut(); }
+        m.tables[i].as_mut_ptr()
+    }
+    unsafe extern "C" fn release_frame(frame: u64, context: *mut c_void) -> bool {
+        let m = unsafe { &mut *context.cast::<Memory>() };
+        let i = index(frame);
+        assert!(m.live[i], "double release");
+        if frame == m.fail_frame { return false; }
+        m.live[i] = false;
+        m.released[i] += 1;
+        // Poison released tables: later traversal is forbidden even if memory
+        // was not immediately reassigned by this synthetic frame allocator.
+        m.tables[i].fill(u64::MAX);
+        true
+    }
+    #[test]
+    fn m1_clone_release_retries_each_level_without_freeing_live_ancestors() {
+        for fail in 1..=8 {
+            let mut m = Memory::new();
+            m.fail_frame = fail * 4096;
+            let backend = m.backend();
+            let mut result = CloneResult { root: 0x1000, table_count: 8 };
+            assert!(!unsafe { paging_clone_release(&backend, &mut result) });
+            assert_eq!(result.root, 0x1000); assert_eq!(result.table_count, 8);
+            assert!(m.live[0]); assert!(m.live[(fail - 1) as usize]);
+            let releases = m.released;
+            // Persistent refusal cannot double-free successful siblings.
+            assert!(!unsafe { paging_clone_release(&backend, &mut result) });
+            assert_eq!(m.released, releases);
+            m.fail_frame = 0;
+            assert!(unsafe { paging_clone_release(&backend, &mut result) });
+            assert_eq!(result.root, 0); assert_eq!(result.table_count, 0);
+            assert_eq!(m.released, [1; 8]); assert_eq!(m.live, [false; 8]);
+            assert!(!unsafe { paging_clone_release(&backend, &mut result) });
+            assert_eq!(m.released, [1; 8]);
+        }
+    }
+    #[test]
+    fn m1_clone_release_access_failure_retains_subtree_for_retry() {
+        for denied in 1..=8 {
+            let mut m = Memory::new();m.deny_access = denied * 4096;
+            let backend = m.backend();
+            let mut result = CloneResult { root: 0x1000, table_count: 8 };
+            assert!(!unsafe { paging_clone_release(&backend, &mut result) });
+            assert!(m.live[0]); assert!(m.live[(denied - 1) as usize]);
+            m.deny_access = 0;
+            assert!(unsafe { paging_clone_release(&backend, &mut result) });
+            assert_eq!(m.released, [1; 8]);
+        }
+    }
+    #[test]
+    fn m1_clone_construction_allocation_failure_preserves_source_and_rolls_back() {
+        struct Construction {
+            source: [[u64; TABLE_ENTRIES]; 4],
+            owned: [[u64; TABLE_ENTRIES]; 4],
+            live: [bool; 4], next: usize, fail_at: usize,
+        }
+        unsafe extern "C" fn alloc(out:*mut u64,c:*mut c_void)->bool {
+            let m=unsafe{&mut *c.cast::<Construction>()};
+            if m.next==m.fail_at{return false;}
+            let i=m.next;m.next+=1;m.live[i]=true;
+            unsafe{*out=0x10000+i as u64*4096;}true
+        }
+        unsafe extern "C" fn access(p:u64,c:*mut c_void)->*mut u64 {
+            let m=unsafe{&mut *c.cast::<Construction>()};
+            if (0x1000..=0x4000).contains(&p){
+                return m.source[(p/4096-1) as usize].as_mut_ptr();
+            }
+            let i=((p-0x10000)/4096) as usize;
+            assert!(m.live[i]);m.owned[i].as_mut_ptr()
+        }
+        unsafe extern "C" fn free(p:u64,c:*mut c_void)->bool {
+            assert!(p>=0x10000,"source frame must never be released");
+            let m=unsafe{&mut *c.cast::<Construction>()};
+            let i=((p-0x10000)/4096) as usize;
+            assert!(m.live[i]);m.live[i]=false;true
+        }
+        for fail_at in 0..4 {
+            let mut m=Construction{source:[[0;TABLE_ENTRIES];4],
+                owned:[[0;TABLE_ENTRIES];4],live:[false;4],next:0,fail_at};
+            m.source[0][256]=0x2000|3;m.source[1][0]=0x3000|3;
+            m.source[2][0]=0x4000|3;m.source[3][0]=0x9000|3;
+            let original=m.source;
+            let b=Backend{allocate:Some(alloc),release:Some(free),access:Some(access),
+                context:(&mut m as *mut Construction).cast()};
+            let mut result=CloneResult{root:0,table_count:0};
+            assert!(!unsafe{paging_clone_kernel_half(&b,0x1000,&mut result)});
+            assert_eq!(result.root,0);assert_eq!(result.table_count,0);
+            assert_eq!(m.live,[false;4]);assert_eq!(m.source,original);
+        }
+    }
+
 }

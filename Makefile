@@ -786,6 +786,14 @@ else ifeq ($(USERMODE_SELFTEST),1)
 RUST_INIT_FEATURE := demo
 else
 RUST_INIT_FEATURE :=
+# Ordinary Rust boots execute a bounded native PID1 console. Keep every
+# negative/experimental profile on its original independently tested route.
+ifeq ($(strip $(filter test-%,$(RUST_FEATURES))),)
+ifeq ($(RUST_MAIN)$(RUST_USER_RUNTIME),11)
+RUST_INIT_FEATURE := normal-init
+RUST_FEATURES += --features normal-init
+endif
+endif
 endif
 RUST_APP_FLAGS := -C relocation-model=static -C link-arg=-T$(CURDIR)/userland/demo/linker.ld -C link-arg=--no-pie -C link-arg=-z -C link-arg=max-page-size=0x1000
 $(USER_ELF): $(wildcard userland/rust/src/*.rs) userland/rust/Cargo.toml userland/rust/Cargo.lock userland/demo/linker.ld Makefile
@@ -931,6 +939,9 @@ $(LIMINE_BINARY)/limine.c: $(LIMINE_TARBALL)
 	@rm -rf $(LIMINE_BINARY)
 	@tar -xzf $(LIMINE_TARBALL) -C $(BUILD)/third_party
 	@test -f $@
+# Archive timestamps predate the download. Refresh the extracted prerequisite
+# so make rebuilds the host utility after replacing its entire directory.
+	@touch $@
 
 $(LIMINE_BINARY)/limine: $(LIMINE_BINARY)/limine.c
 	$(MAKE) -C $(LIMINE_BINARY) limine
@@ -1165,3 +1176,13 @@ test-r027-durable-qemu:
 test-rust-ata-qemu:
 	$(MAKE) image BUILD=build/r015-ata RUST_CORE=1 R015_ATA_TEST=1
 	python3 tools/test_ata_qemu.py --iso build/r015-ata/indianos.iso --qemu "$(QEMU)" --ovmf "$(OVMF_CODE)"
+
+.PHONY: test-normal-init-host test-normal-init-qemu
+test-normal-init-host:
+	@mkdir -p build/normal-init-host
+	rustc --edition=2021 --test userland/rust/tests/bootstrap_line.rs -o build/normal-init-host/bootstrap_line
+	build/normal-init-host/bootstrap_line
+
+test-normal-init-qemu:
+	$(MAKE) image BUILD=build/normal-init RUST_CORE=1
+	python3 tools/test_normal_init_qemu.py --iso build/normal-init/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)"

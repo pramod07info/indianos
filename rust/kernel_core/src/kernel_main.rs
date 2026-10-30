@@ -680,6 +680,25 @@ pub extern "C" fn kmain()->!{
             log(b"IndianOS: R029 ring3 command-owned two-window surfaces PASSED\n\0");
         }
     }
+    #[cfg(feature="normal-init")]
+    {
+        log(b"IndianOS: normal boot starting native PID1\n\0");
+        let mut table=ProcessTable::empty();
+        if !unsafe{indianos_process_table_init(&mut table)} {
+            recover_init(b"IndianOS recovery: reason=pid1-table-failed\n\0")
+        }
+        let init_pcb=unsafe{indianos_process_create(&mut table)};
+        if init_pcb.is_null() || unsafe{(*init_pcb).pid}!=1 {
+            recover_init(b"IndianOS recovery: reason=pid1-allocation-failed\n\0")
+        }
+        let clean=unsafe{x86_64_user_process_run(init_pcb,init,init_size) &&
+                         indianos_process_success(init_pcb)};
+        if !clean {
+            recover_init(b"IndianOS recovery: reason=pid1-failed\n\0")
+        }
+        log(b"IndianOS: normal PID1 exited and resources reclaimed\n\0");
+        recover_init(b"IndianOS recovery: reason=pid1-stopped\n\0")
+    }
     #[cfg(feature="test-pagefault")]
     {
         log(b"IndianOS: triggering intentional page fault\n\0");

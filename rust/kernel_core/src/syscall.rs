@@ -91,7 +91,7 @@ pub unsafe extern "C" fn indianos_syscall_validate(
             user_range(plan, request.arg0, 32, false), // QUANTUM descriptor
         2 => request.arg1 == 0, // EXIT
         3 => request.arg0 == 0 && request.arg1 == 0, // YIELD
-        #[cfg(any(feature = "test-shell", feature = "test-ipc"))]
+        #[cfg(any(feature = "test-shell", feature = "test-ipc",feature="normal-init"))]
         4 => request.arg0 == 0 && request.arg1 == 0, // GETPID
         #[cfg(feature = "test-shell")]
         5 => request.arg0 == 1 && request.arg1 == 0, // allowlisted /bin/worker
@@ -122,14 +122,14 @@ pub unsafe extern "C" fn indianos_syscall_validate(
         32 => (1..=11).contains(&request.arg0) &&
               user_range(plan,request.arg1,64,false), // installed native app
         #[cfg(feature="test-r031-vfs")]
-        33 => (1..=5).contains(&request.arg0) &&
+        33 => (1..=6).contains(&request.arg0) &&
               user_range(plan,request.arg1,64,false), // R031.6 handles
         #[cfg(feature="test-r031-files-gui")]
         34 => request.arg0==1 &&
               user_range(plan,request.arg1,64,false), // PID2 shared dir listing
         #[cfg(feature = "test-r026")]
         16 | 17 => request.arg0 == 2 && request.arg1 == 0, // worker status/reap query
-        #[cfg(feature="test-interactive")]
+        #[cfg(any(feature="test-interactive",feature="normal-init"))]
         6 => request.arg1 == 1 && user_range(plan,request.arg0,1,true),
         #[cfg(all(feature="test-ipc",not(feature="test-r025")))]
         8 => (4..=68).contains(&request.arg1) &&
@@ -205,6 +205,21 @@ pub extern "C" fn indianos_syscall_self_test() -> bool {
 mod tests {
     use super::*;
     use core::mem::{align_of, offset_of, size_of};
+
+    #[cfg(feature="test-r031-vfs")]
+    #[test]
+    fn native_truncate_ingress_accepts_only_known_actions_and_complete_descriptors(){
+        let plan=ProgramPlan{entry:USER_MIN,stack_begin:USER_TOP-STACK_BYTES,
+            stack_end:USER_TOP,guard_begin:USER_TOP-STACK_BYTES-PAGE_BYTES,
+            segment_count:0,segments:[ProgramSegment::empty();MAX_SEGMENTS]};
+        let check=|action,address|unsafe{indianos_syscall_validate(&plan,
+            SyscallRequest{number:33,arg0:action,arg1:address})};
+        for action in 1..=6{assert!(check(action,plan.stack_begin));}
+        for action in [0,7,u64::MAX]{assert!(!check(action,plan.stack_begin));}
+        for address in [plan.guard_begin,plan.stack_end-63,USER_TOP,u64::MAX]{
+            assert!(!check(6,address));
+        }
+    }
 
     #[test]
     fn ffi_layout_is_identical_to_c() {

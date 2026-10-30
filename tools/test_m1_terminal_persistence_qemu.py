@@ -75,6 +75,12 @@ def exact_readback(output: bytes, since: int) -> None:
         raise AssertionError("Terminal did not read back the exact persisted payload")
 
 
+def exact_terminal_line(output: bytes, since: int, expected: str) -> None:
+    lines = output[since:].replace(b"\r", b"").split(b"\n")[:-1]
+    if expected.encode() not in lines:
+        raise AssertionError("missing exact fresh filesystem response")
+
+
 def boot(qemu: str, iso: Path, ovmf: Path, disk: Path, folder: Path, index: int) -> None:
     monitor = folder / f"terminal-{index}.sock"
     command = [qemu, "-machine", "pc", "-m", "256M", "-smp", "1",
@@ -152,6 +158,19 @@ def boot(qemu: str, iso: Path, ovmf: Path, disk: Path, folder: Path, index: int)
 
         if index == 0:
             files_repainted(typed, result)
+        # Additional real filesystem commands execute through PID1, rather
+        # than formatting a client-side fixture. Repeat on the same disk reboot.
+        for text, expected in (("ls", "IndianOS user: R055 Terminal directory: f:readme"),
+                               ("stat", "IndianOS user: R055 Terminal stat: 10 BYTES")):
+            type_command(session, text)
+            typed_extra = session.shot(folder / f"terminal-{index}-{text}-typed.ppm")
+            command_start = acknowledged_key(session, "ret")
+            session.until(expected, 15, since=command_start)
+            session.drain_serial(0.1)
+            exact_terminal_line(bytes(session.output), command_start, expected)
+            result = session.shot(folder / f"terminal-{index}-{text}-result.ppm")
+            changed(typed_extra, result, "brokered filesystem " + text)
+
         acknowledged_key(session, "tab")
         left = session.shot(folder / f"terminal-{index}-left-editor.ppm")
         changed(result, left, "physical Tab leaving the editor")

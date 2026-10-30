@@ -18,6 +18,7 @@ path = "tests/shell_commands.rs"
 
 [features]
 default = []
+normal-init = []
 demo = []
 worker = []
 shell = []

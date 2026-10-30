@@ -350,10 +350,10 @@ pub struct OwnedSurface {
     pub rectangle: crate::agent_05_surface_rect::Rectangle,
 }
 pub struct SurfaceLayout<const N: usize> {
-    surfaces: [Option<OwnedSurface>; N],
+    surfaces: [Option<OwnedSurface>; N], epochs:[u64;N], next_epoch:u64,
 }
 impl<const N: usize> SurfaceLayout<N> {
-    pub const fn new() -> Self { Self { surfaces: [None; N] } }
+    pub const fn new() -> Self { Self { surfaces: [None; N], epochs:[0;N], next_epoch:0 } }
     pub fn grant(&mut self, owner: u32, window: u32,
         rectangle: crate::agent_05_surface_rect::Rectangle) -> Result<(), Error> {
         if owner == 0 || window == 0 { return Err(Error::Invalid); }
@@ -362,10 +362,17 @@ impl<const N: usize> SurfaceLayout<N> {
         }
         crate::agent_05_surface_rect::clip_owned(rectangle,rectangle,owner,owner)
             .map_err(|_| Error::Invalid)?;
-        let free = self.surfaces.iter_mut().find(|slot| slot.is_none())
+        let index = self.surfaces.iter().position(|slot| slot.is_none())
             .ok_or(Error::Full)?;
-        *free=Some(OwnedSurface{owner,window,rectangle});
+        let epoch=self.next_epoch.checked_add(1).ok_or(Error::Exhausted)?;
+        self.surfaces[index]=Some(OwnedSurface{owner,window,rectangle});
+        self.epochs[index]=epoch;
+        self.next_epoch=epoch;
         Ok(())
+    }
+    fn epoch(&self,owner:u32,window:u32)->Option<u64>{
+        self.surfaces.iter().position(|s|s.is_some_and(|s|
+            s.owner==owner&&s.window==window)).map(|i|self.epochs[i])
     }
     pub fn geometry(&self, owner: u32, window: u32)
         -> Result<crate::agent_05_surface_rect::Rectangle, Error> {
@@ -380,7 +387,13 @@ impl<const N: usize> SurfaceLayout<N> {
             .ok_or(Error::Unauthorized)?;
         let moved=crate::agent_05_surface_rect::move_owned(
             slot.rectangle, dx, dy, owner, owner).map_err(|_|Error::Invalid)?;
-        slot.rectangle=moved;
+        if moved!=slot.rectangle{
+            let epoch=self.next_epoch.checked_add(1).ok_or(Error::Exhausted)?;
+            slot.rectangle=moved;
+            let index=self.surfaces.iter().position(|s|s.is_some_and(|s|
+                s.owner==owner&&s.window==window)).unwrap();
+            self.epochs[index]=epoch;self.next_epoch=epoch;
+        }
         Ok(moved)
     }
     pub fn revoke(&mut self, owner: u32) {
@@ -656,8 +669,16 @@ mod r010_focus_capture_tests{
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 pub struct FrameDamage{pub owner:u32,pub window:u32,pub epoch:u64,
  pub x:u32,pub y:u32,pub width:u32,pub height:u32}
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+struct DamageAuthority{grant:u64,surface:u64}
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+struct QueuedDamage{frame:FrameDamage,authority:Option<DamageAuthority>}
+impl core::ops::Deref for QueuedDamage{
+ type Target=FrameDamage;
+ fn deref(&self)->&FrameDamage{&self.frame}
+}
 pub struct DamageQueue<const N:usize>{
- entries:[Option<FrameDamage>;N],len:usize,next_epoch:u64,
+ entries:[Option<QueuedDamage>;N],len:usize,next_epoch:u64,
 }
 impl<const N:usize> DamageQueue<N>{
  pub const fn new()->Self{Self{entries:[None;N],len:0,next_epoch:1}}
@@ -697,11 +718,31 @@ impl<const N:usize> DamageQueue<N>{
    }
   }
   for &(window,x,y,w,h) in requests{
-   self.entries[self.len]=Some(FrameDamage{owner,window,epoch:sequence,
-      x,y,width:w,height:h});
+   self.entries[self.len]=Some(QueuedDamage{frame:FrameDamage{owner,window,epoch:sequence,
+      x,y,width:w,height:h},authority:None});
    self.len+=1;
   }
   self.next_epoch=sequence;Ok(sequence)
+ }
+ /// Bind a whole validated frame to the current broker and surface grants.
+ /// Legacy submit() remains usable for trusted local queues, but its work is
+ /// deliberately ineligible for present_fair_verified(). Serialized context
+ /// must retain these same Broker/SurfaceLayout instances for their lifetime.
+ pub fn submit_verified<const B:usize,const Q:usize,const L:usize>(
+  &mut self,broker:&Broker<B,Q>,layout:&SurfaceLayout<L>,owner:u32,
+  requests:&[(u32,u32,u32,u32,u32)])->Result<u64,Error>{
+  if owner==0||requests.is_empty(){return Err(Error::Invalid);}
+  for &(window,_,_,_,_) in requests{
+   broker.binding(owner,window).ok_or(Error::Unauthorized)?;
+  }
+  let start=self.len;
+  let epoch=self.submit(layout,owner,requests)?;
+  for queued in self.entries[start..self.len].iter_mut().flatten(){
+   let grant=broker.binding(owner,queued.window).unwrap().epoch;
+   let surface=layout.epoch(owner,queued.window).unwrap();
+   queued.authority=Some(DamageAuthority{grant,surface});
+  }
+  Ok(epoch)
  }
  /// Fail-atomic drain: caller provides all required output slots and each
  /// output entry has the same monotonically assigned frame epoch.
@@ -709,7 +750,7 @@ impl<const N:usize> DamageQueue<N>{
   if out.len()<self.len{return Err(Error::Full);}
   let n=self.len;
   for (i,slot) in self.entries[..n].iter().enumerate(){
-   out[i]=slot.ok_or(Error::Invalid)?;
+   out[i]=slot.ok_or(Error::Invalid)?.frame;
   }
   self.entries[..n].fill(None);self.len=0;Ok(n)
  }
@@ -768,7 +809,7 @@ impl<const N:usize> DamageQueue<N>{
   if out.len()<required{return Err(Error::Full);}
   let mut copied=0;
   for damage in self.entries[..self.len].iter().flatten(){
-   if damage.owner==owner{out[copied]=*damage;copied+=1;}
+   if damage.owner==owner{out[copied]=damage.frame;copied+=1;}
   }
   Ok(copied)
  }
@@ -851,7 +892,7 @@ impl<const N:usize> DamageQueue<N>{
   let mut written=0;
   for event in self.entries[..self.len].iter().flatten(){
    if event.owner==chosen.owner&&event.epoch==chosen.epoch{
-    out[written]=*event;written+=1;
+    out[written]=event.frame;written+=1;
    }
   }
   let retired=self.acknowledge(chosen.owner,chosen.epoch)?;
@@ -932,8 +973,16 @@ impl<const N:usize> DamageQueue<N>{
    }
   }
   if count<2{return Ok(0);}
-  let combined=FrameDamage{owner,window,epoch,x:minx,y:miny,
-    width:maxx-minx,height:maxy-miny};
+  let authority=self.entries[..self.len].iter().flatten()
+   .find(|e|e.owner==owner&&e.window==window).unwrap().authority;
+  // Never merge work across authority incarnations: doing so can launder
+  // stale damage into a newly authorized frame.
+  if self.entries[..self.len].iter().flatten().any(|e|
+   e.owner==owner&&e.window==window&&e.authority!=authority){
+   return Err(Error::Unauthorized);
+  }
+  let combined=QueuedDamage{frame:FrameDamage{owner,window,epoch,x:minx,y:miny,
+    width:maxx-minx,height:maxy-miny},authority};
   let mut remaining=[None;N];let mut len=0;let mut inserted=false;
   for event in self.entries[..self.len].iter().flatten(){
    if event.owner==owner&&event.window==window{
@@ -948,7 +997,9 @@ impl<const N:usize> DamageQueue<N>{
   &mut self,broker:&Broker<B,Q>,layout:&SurfaceLayout<L>)->usize{
   let mut surviving=[None;N];let mut count=0;
   for frame in self.entries[..self.len].iter().flatten(){
-   let valid=broker.owns(frame.owner,frame.window)&&
+   let valid=frame.authority.is_some_and(|a|
+    broker.binding(frame.owner,frame.window).is_some_and(|b|b.epoch==a.grant)&&
+    layout.epoch(frame.owner,frame.window)==Some(a.surface))&&
     layout.geometry(frame.owner,frame.window).ok().is_some_and(|g|
      frame.width!=0&&frame.height!=0&&
      frame.x.checked_add(frame.width).is_some_and(|end|end<=g.width)&&
@@ -985,7 +1036,7 @@ impl<const N:usize> DamageQueue<N>{
   Ok(self.discard_window(old_owner,window))
  }
  pub fn oldest_frame(&self)->Option<FrameDamage>{
-  self.entries[..self.len].iter().flatten().min_by_key(|e|e.epoch).copied()
+  self.entries[..self.len].iter().flatten().min_by_key(|e|e.epoch).map(|e|e.frame)
  }
  pub fn discard_window(&mut self,owner:u32,window:u32)->usize{
   let mut kept=[None;N];let mut used=0;
@@ -1011,8 +1062,8 @@ mod r014_compositor_coalesce_tests{
   let mut broker=Broker::<3,8>::new();
   broker.grant(3,10).unwrap();broker.grant(4,20).unwrap();
   let mut layout=layout();let mut q=DamageQueue::<4>::new();
-  q.submit(&layout,3,&[(10,1,1,4,4)]).unwrap();
-  q.submit(&layout,4,&[(20,2,2,3,3)]).unwrap();
+  q.submit_verified(&broker,&layout,3,&[(10,1,1,4,4)]).unwrap();
+  q.submit_verified(&broker,&layout,4,&[(20,2,2,3,3)]).unwrap();
   broker.revoke_window(3,10).unwrap();layout.revoke(3);
   assert_eq!(q.purge_unowned(&broker,&layout),1);
   assert_eq!(q.pending(),1);
@@ -1024,7 +1075,7 @@ mod r014_compositor_coalesce_tests{
   let mut broker=Broker::<3,8>::new();
   broker.grant(3,10).unwrap();broker.grant(4,20).unwrap();
   let layout=layout();let mut q=DamageQueue::<4>::new();
-  q.submit(&layout,4,&[(20,1,1,2,2),(20,4,4,2,2)]).unwrap();
+  q.submit_verified(&broker,&layout,4,&[(20,1,1,2,2),(20,4,4,2,2)]).unwrap();
   let mut short=[blank();1];
   assert_eq!(q.present_fair_verified(&broker,&layout,None,&mut short),
    Err(Error::Full));
@@ -1266,5 +1317,79 @@ mod m1_input_grant_lifecycle_tests {
   assert_eq!(b.reassign_window(1,3,10),Err(Error::Exhausted));
   assert!(b.owns(1,10));assert_eq!(b.peek(1),Ok(event));
   b.revoke_window(1,10).unwrap();assert_eq!(b.grant(1,10),Err(Error::Exhausted));
+ }
+}
+
+#[cfg(test)]
+mod m1_damage_authority_tests{
+ use super::*;
+ use crate::agent_05_surface_rect::Rectangle;
+ fn blank()->FrameDamage{FrameDamage{owner:0,window:0,epoch:0,
+  x:0,y:0,width:0,height:0}}
+ fn setup()->(Broker<3,4>,SurfaceLayout<3>,DamageQueue<8>){
+  let mut b=Broker::new();let mut l=SurfaceLayout::new();
+  for (owner,window) in [(1,10),(2,20)]{
+   b.grant(owner,window).unwrap();
+   l.grant(owner,window,Rectangle{x:0,y:0,width:80,height:80}).unwrap();
+  }
+  (b,l,DamageQueue::new())
+ }
+ #[test]fn m1_damage_recycled_grant_cannot_resurrect_frame(){
+  for transfer in [false,true]{
+   let (mut b,l,mut q)=setup();
+   q.submit_verified(&b,&l,1,&[(10,1,1,4,4)]).unwrap();
+   let peer=q.submit_verified(&b,&l,2,&[(20,2,2,3,3)]).unwrap();
+   if transfer{b.reassign_window(1,3,10).unwrap();b.reassign_window(3,1,10).unwrap();}
+   else{b.revoke_window(1,10).unwrap();b.grant(1,10).unwrap();}
+   let fresh=q.submit_verified(&b,&l,1,&[(10,3,3,2,2)]).unwrap();
+   assert_eq!(q.combine_window_damage(1,10),Err(Error::Unauthorized));
+   assert_eq!(q.purge_unowned(&b,&l),1);
+   let mut out=[blank();1];
+   assert_eq!(q.present_fair_verified(&b,&l,None,&mut out),Ok((2,peer,1)));
+   assert_eq!(q.present_fair_verified(&b,&l,Some(2),&mut out),Ok((1,fresh,1)));
+   assert_eq!(out[0].x,3);assert_eq!(q.pending(),0);
+  }
+ }
+ #[test]fn m1_damage_recycled_surface_and_unbound_frames_fail_closed(){
+  let (b,mut l,mut q)=setup();
+  q.submit_verified(&b,&l,1,&[(10,0,0,1,1)]).unwrap();
+  q.submit(&l,2,&[(20,0,0,1,1)]).unwrap();
+  l.revoke(1);
+  l.grant(1,10,Rectangle{x:0,y:0,width:80,height:80}).unwrap();
+  assert_eq!(q.purge_unowned(&b,&l),2);
+  q.submit_verified(&b,&l,1,&[(10,0,0,1,1)]).unwrap();
+  let mut out=[blank();1];
+  assert!(q.present_fair_verified(&b,&l,None,&mut out).is_ok());
+ }
+ #[test]fn m1_damage_submission_failure_preserves_queue_and_epoch(){
+  let (b,l,mut q)=setup();
+  let first=q.submit_verified(&b,&l,1,&[(10,0,0,1,1)]).unwrap();
+  assert_eq!(q.submit_verified(&b,&l,1,&[(10,0,0,1,1),(20,0,0,1,1)]),
+   Err(Error::Unauthorized));
+  assert_eq!(q.submit_verified(&b,&l,1,&[(10,0,0,1,1),(10,80,0,1,1)]),
+   Err(Error::Invalid));
+  assert_eq!(q.pending(),1);
+  assert_eq!(q.submit_verified(&b,&l,1,&[(10,0,0,1,1)]),Ok(first+1));
+  let mut short=[blank();1];
+  // Two separate frames; coalescing is allowed only within the same grants.
+  assert_eq!(q.combine_window_damage(1,10),Ok(1));
+  assert!(q.present_fair_verified(&b,&l,None,&mut short).is_ok());
+ }
+ #[test]fn m1_damage_moved_surface_rejects_pre_move_work(){
+  let (b,mut l,mut q)=setup();
+  q.submit_verified(&b,&l,1,&[(10,0,0,1,1)]).unwrap();
+  l.move_owned(1,10,1,1).unwrap();l.move_owned(1,10,-1,-1).unwrap();
+  assert_eq!(q.purge_unowned(&b,&l),1);
+  q.submit_verified(&b,&l,1,&[(10,0,0,1,1)]).unwrap();
+  let geometry=l.geometry(1,10).unwrap();l.next_epoch=u64::MAX;
+  assert_eq!(l.move_owned(1,10,1,1),Err(Error::Exhausted));
+  assert_eq!(l.geometry(1,10),Ok(geometry));
+  assert_eq!(q.purge_unowned(&b,&l),0);
+ }
+ #[test]fn m1_damage_surface_epoch_exhaustion_does_not_publish(){
+  let (_,mut l,_)=setup();l.next_epoch=u64::MAX;
+  assert_eq!(l.grant(3,30,Rectangle{x:0,y:0,width:4,height:4}),Err(Error::Exhausted));
+  assert_eq!(l.geometry(3,30),Err(Error::Unauthorized));
+  assert!(l.geometry(1,10).is_ok());
  }
 }
