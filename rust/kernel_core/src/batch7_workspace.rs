@@ -222,9 +222,11 @@ impl<const P:usize,const E:usize,const W:usize,const K:usize,
   let saved=self.disk.export_snapshot(scratch)
     .map_err(|_|Error::Terminal(TerminalError::Io))?;
   let mut last=0;
+  // A failed transaction must not publish intermediate command output.
+  let mut staged_output=[0u8;OUTPUT_MAX];
   for &line in commands{
    match crate::batch7_terminal::execute(
-      &self.access,caller,now,&mut self.disk,line,out){
+      &self.access,caller,now,&mut self.disk,line,&mut staged_output){
     Ok(n)=>last=n,
     Err(err)=>{
      self.disk.import_snapshot(&scratch[..saved])
@@ -233,12 +235,18 @@ impl<const P:usize,const E:usize,const W:usize,const K:usize,
     }
    }
   }
+  if last>out.len(){
+   self.disk.import_snapshot(&scratch[..saved])
+     .map_err(|_|Error::Terminal(TerminalError::Io))?;
+   return Err(Error::Terminal(TerminalError::Overflow));
+  }
   if let Err(err)=self.frames.submit(&self.boot.session.windows,
      caller,self.window,Rect{x:0,y:0,w:640,h:480}){
    self.disk.import_snapshot(&scratch[..saved])
      .map_err(|_|Error::Terminal(TerminalError::Io))?;
    return Err(Error::Surface(err));
   }
+  out[..last].copy_from_slice(&staged_output[..last]);
   Ok(last)
  }
  pub fn app_file_generation(&self,caller:Identity,now:u64)->Result<u64,Error>{
@@ -273,6 +281,25 @@ mod r013_desktop_transaction_tests{
    b"write /a alpha",b"cat /missing"
   ],&mut scratch,&mut out).is_err());
   assert_eq!(w.disk.count(),0);assert!(w.next_frame().is_err());
+ }
+ #[test]fn r055_direct_script_failure_does_not_publish_partial_output(){
+  let mut w=workspace();let mut scratch=[0;512];let mut out=[0xa7;OUTPUT_MAX];
+  assert!(w.execute_script_atomic(id(2),1,&[
+    b"write /a alpha",b"cat /absent"
+  ],&mut scratch,&mut out).is_err());
+  assert_eq!(out,[0xa7;OUTPUT_MAX]);
+  assert_eq!(w.disk.count(),0);
+  assert!(w.next_frame().is_err());
+ }
+ #[test]fn r055_direct_script_short_output_rolls_back_before_frame(){
+  let mut w=workspace();let mut scratch=[0;512];let mut out=[0xa7;3];
+  assert_eq!(w.execute_script_atomic(id(2),1,&[
+    b"write /a alpha",b"cat /a"
+  ],&mut scratch,&mut out),
+    Err(Error::Terminal(TerminalError::Overflow)));
+  assert_eq!(out,[0xa7;3]);
+  assert_eq!(w.disk.count(),0);
+  assert!(w.next_frame().is_err());
  }
  #[test]fn foreign_generation_and_short_snapshot_never_write(){
   let mut w=workspace();let mut tiny=[0;2];let mut out=[0;OUTPUT_MAX];

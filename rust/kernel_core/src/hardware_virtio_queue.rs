@@ -128,8 +128,27 @@ pub struct QueueModel<const N:usize>{
 }
 impl<const N:usize> QueueModel<N>{
  pub fn new(staged:StagedQueue)->Result<Self,Error>{
-  if N==0||N>staged.rings.queue_size as usize||
-     staged.hardware_enabled(){return Err(Error::Invalid)}
+  let rings=staged.rings;
+  if staged.owner.pid==0||staged.owner.generation==0||
+     staged.iommu_domain==0||
+     staged.features&REQUIRED_FEATURES!=REQUIRED_FEATURES||
+     rings.queue_size<2||rings.queue_size>MAX_QUEUE_SIZE||
+     !rings.queue_size.is_power_of_two()||
+     N==0||N>rings.queue_size as usize||staged.hardware_enabled(){
+   return Err(Error::Invalid);
+  }
+  // Public StagedQueue values can bypass stage(). Repeat numeric checks
+  // before descriptor accounting. This never proves hardware isolation.
+  let q=rings.queue_size as u64;
+  validate_ring(staged.dma,rings.descriptors,16*q)?;
+  validate_ring(staged.dma,rings.available,6+2*q)?;
+  validate_ring(staged.dma,rings.used,6+8*q)?;
+  let list=[rings.descriptors,rings.available,rings.used];
+  for (i,ap) in list.iter().enumerate(){
+   for other in &list[..i]{
+    if overlaps(*ap,*other)?{return Err(Error::Overlap);}
+   }
+  }
   Ok(Self{staged,slots:[None;N],next:1})
  }
  fn buffer(&self,ap:Aperture)->Result<(),Error>{
@@ -285,6 +304,26 @@ mod hd3b2_tests{
   assert_eq!(q.retire(stale),Err(Error::Denied));
   assert_eq!(q.retire(owner()),Ok(()));
   assert_eq!(q.inflight(),0);
+ }
+ #[test]fn r055_forged_queue_plan_cannot_bypass_ring_boundaries(){
+  let mut fake=staged();
+  fake.rings.used=fake.rings.available;
+  assert!(matches!(QueueModel::<2>::new(fake),Err(Error::Overlap)));
+  fake=staged();fake.rings.descriptors=ap(0x2000_0001,4096);
+  assert!(matches!(QueueModel::<2>::new(fake),Err(Error::Range)));
+  fake=staged();fake.rings.queue_size=3;
+  assert!(matches!(QueueModel::<2>::new(fake),Err(Error::Invalid)));
+  fake=staged();fake.rings.used=ap(u64::MAX-4095,4096);
+  assert!(QueueModel::<2>::new(fake).is_err());
+ }
+ #[test]fn r055_forged_owner_feature_or_isolation_denied(){
+  let mut fake=staged();fake.owner.pid=0;
+  assert!(matches!(QueueModel::<2>::new(fake),Err(Error::Invalid)));
+  fake=staged();fake.features=VIRTIO_F_VERSION_1;
+  assert!(matches!(QueueModel::<2>::new(fake),Err(Error::Invalid)));
+  fake=staged();fake.iommu_domain=0;
+  assert!(matches!(QueueModel::<2>::new(fake),Err(Error::Invalid)));
+  assert!(QueueModel::<2>::new(staged()).is_ok());
  }
  #[test]fn hd3b2_rejects_ring_aliases_and_device_buffers(){
   let mut q=QueueModel::<2>::new(staged()).unwrap();

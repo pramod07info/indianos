@@ -84,9 +84,17 @@ pub fn read_sectors<D: BlockDevice>(
     }
     let count = (out.len() / SECTOR_BYTES) as u64;
     check_range(device.sector_count(), start, count)?;
-    for (index, chunk) in out.chunks_exact_mut(SECTOR_BYTES).enumerate() {
-        let sector: &mut [u8; SECTOR_BYTES] = chunk.try_into().map_err(|_| BlockError::Io)?;
-        device.read_sector(start + index as u64, sector)?;
+    // Failed sector I/O may have modified its destination; never return a
+    // partially populated multi-sector read buffer after an I/O error.
+    // Invalid range requests above leave the original output untouched.
+    let mut sector = [0u8; SECTOR_BYTES];
+    for index in 0..(count as usize) {
+        if let Err(error) = device.read_sector(start + index as u64, &mut sector) {
+            out.fill(0);
+            return Err(error);
+        }
+        let at = index * SECTOR_BYTES;
+        out[at..at + SECTOR_BYTES].copy_from_slice(&sector);
     }
     Ok(())
 }
@@ -146,6 +154,39 @@ mod tests {
         assert_eq!(check_range(4, u64::MAX, 2), Err(BlockError::OutOfRange));
         assert_eq!(check_range(4, 0, 0), Err(BlockError::OutOfRange));
         assert_eq!(write_sectors(&mut disk, 0, &[0; 1]), Err(BlockError::OutOfRange));
+    }
+    #[test]
+    fn r055_failed_multisector_read_wipes_partial_prefix_and_tail() {
+        struct Interrupted { disk: RamDisk, reads: usize }
+        impl BlockDevice for Interrupted {
+            fn sector_count(&self)->u64{self.disk.sector_count()}
+            fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+                ->Result<(),BlockError>{
+                if self.reads == 1 {
+                    out.fill(0x77); // faulting devices may dirty buffers
+                    return Err(BlockError::Io);
+                }
+                self.reads += 1;
+                self.disk.read_sector(lba,out)
+            }
+            fn write_sector(&mut self,lba:u64,bytes:&[u8;SECTOR_BYTES])
+                ->Result<(),BlockError>{self.disk.write_sector(lba,bytes)}
+        }
+        let mut disk=Interrupted{disk:RamDisk{
+            bytes:[0x33;SECTOR_BYTES*4],readonly:false},reads:0};
+        let mut out=[0xa5;SECTOR_BYTES*3];
+        assert_eq!(read_sectors(&mut disk,0,&mut out),Err(BlockError::Io));
+        assert_eq!(out,[0;SECTOR_BYTES*3]);
+        assert_eq!(disk.reads,1);
+    }
+    #[test]
+    fn r055_invalid_multisector_read_is_preflight_atomic() {
+        let mut disk=RamDisk{bytes:[0x33;SECTOR_BYTES*4],readonly:false};
+        let mut out=[0xa5;SECTOR_BYTES*2];
+        assert_eq!(read_sectors(&mut disk,3,&mut out),Err(BlockError::OutOfRange));
+        assert_eq!(out,[0xa5;SECTOR_BYTES*2]);
+        assert_eq!(read_sectors(&mut disk,0,&mut out),Ok(()));
+        assert_eq!(out,[0x33;SECTOR_BYTES*2]);
     }
     #[test]
     fn bounded_partition_enforces_range_and_preserves_neighbors() {
