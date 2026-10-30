@@ -942,6 +942,31 @@ impl<const N:usize> DamageQueue<N>{
   }
   self.entries=remaining;self.len=len;Ok(count-1)
  }
+ /// A compositor must never replay damage whose owner/window has been
+ /// revoked or whose bounds changed. Keep peer frames in their FIFO order.
+ pub fn purge_unowned<const B:usize,const Q:usize,const L:usize>(
+  &mut self,broker:&Broker<B,Q>,layout:&SurfaceLayout<L>)->usize{
+  let mut surviving=[None;N];let mut count=0;
+  for frame in self.entries[..self.len].iter().flatten(){
+   let valid=broker.owns(frame.owner,frame.window)&&
+    layout.geometry(frame.owner,frame.window).ok().is_some_and(|g|
+     frame.width!=0&&frame.height!=0&&
+     frame.x.checked_add(frame.width).is_some_and(|end|end<=g.width)&&
+     frame.y.checked_add(frame.height).is_some_and(|end|end<=g.height));
+   if valid{surviving[count]=Some(*frame);count+=1;}
+  }
+  let removed=self.len-count;
+  self.entries=surviving;self.len=count;removed
+ }
+ /// Trusted, current-authorization-aware presentation. A short result
+ /// buffer does not consume remaining valid work.
+ pub fn present_fair_verified<const B:usize,const Q:usize,const L:usize>(
+  &mut self,broker:&Broker<B,Q>,layout:&SurfaceLayout<L>,
+  previous:Option<u32>,out:&mut[FrameDamage])
+  ->Result<(u32,u64,usize),Error>{
+  self.purge_unowned(broker,layout);
+  self.present_fair(previous,out)
+ }
  pub fn oldest_frame(&self)->Option<FrameDamage>{
   self.entries[..self.len].iter().flatten().min_by_key(|e|e.epoch).copied()
  }
@@ -965,6 +990,32 @@ mod r014_compositor_coalesce_tests{
  }
  fn blank()->FrameDamage{FrameDamage{owner:0,window:0,epoch:0,
   x:0,y:0,width:0,height:0}}
+ #[test]fn m1_r052_compositor_drops_revoked_window_without_peer_damage(){
+  let mut broker=Broker::<3,8>::new();
+  broker.grant(3,10).unwrap();broker.grant(4,20).unwrap();
+  let mut layout=layout();let mut q=DamageQueue::<4>::new();
+  q.submit(&layout,3,&[(10,1,1,4,4)]).unwrap();
+  q.submit(&layout,4,&[(20,2,2,3,3)]).unwrap();
+  broker.revoke_window(3,10).unwrap();layout.revoke(3);
+  assert_eq!(q.purge_unowned(&broker,&layout),1);
+  assert_eq!(q.pending(),1);
+  let mut out=[blank();1];
+  assert_eq!(q.present_fair_verified(&broker,&layout,None,&mut out).unwrap().0,4);
+  assert_eq!(out[0].owner,4);
+ }
+ #[test]fn m1_r052_compositor_short_buffer_keeps_valid_peer_frames(){
+  let mut broker=Broker::<3,8>::new();
+  broker.grant(3,10).unwrap();broker.grant(4,20).unwrap();
+  let layout=layout();let mut q=DamageQueue::<4>::new();
+  q.submit(&layout,4,&[(20,1,1,2,2),(20,4,4,2,2)]).unwrap();
+  let mut short=[blank();1];
+  assert_eq!(q.present_fair_verified(&broker,&layout,None,&mut short),
+   Err(Error::Full));
+  assert_eq!(short,[blank()]);assert_eq!(q.pending(),2);
+  let mut full=[blank();2];
+  assert_eq!(q.present_fair_verified(&broker,&layout,None,&mut full).unwrap().2,2);
+  assert_eq!(q.pending(),0);
+ }
  #[test]fn merges_repeated_window_damage_and_preserves_peer_frames(){
   let l=layout();let mut q=DamageQueue::<4>::new();
   q.submit(&l,3,&[(10,1,2,3,4)]).unwrap();

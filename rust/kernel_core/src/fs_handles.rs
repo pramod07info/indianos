@@ -170,7 +170,18 @@ impl FileHandles{
             return Err(FsError::InvalidName);
         }
         // Charge *only* after a successful bounded, durable write.
-        let n=fs.write_at(h.pathname(),h.offset,input)?;
+        let n=match fs.write_at(h.pathname(),h.offset,input){
+            Ok(n)=>n,
+            Err(error)=>{
+                // An interrupted payload/metadata write may have changed
+                // durable state even when no success was reported. Retire
+                // the handle before a retry can reuse stale assumptions.
+                if matches!(error,FsError::Io|FsError::InvalidVolume){
+                    self.entries[slot]=Handle::EMPTY;
+                }
+                return Err(error);
+            }
+        };
         self.write_guard.completed(n);
         self.entries[slot].offset=h.offset.checked_add(n as u64)
             .ok_or(FsError::TooLarge)?;
@@ -664,6 +675,50 @@ mod tests{
         let mut out=[0;4];
         assert_eq!(table.read(1,token,&mut out,&mut fs),Ok(4));
         assert_eq!(&out,b"four");
+    }
+    #[test]fn m1_r052_io_failure_retires_handle_and_does_not_charge_budget(){
+        struct FaultDisk{disk:Disk,writes:usize,fail_at:Option<usize>}
+        impl BlockDevice for FaultDisk{
+            fn sector_count(&self)->u64{self.disk.sector_count()}
+            fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+                ->Result<(),BlockError>{self.disk.read_sector(lba,out)}
+            fn write_sector(&mut self,lba:u64,data:&[u8;SECTOR_BYTES])
+                ->Result<(),BlockError>{
+                if self.fail_at==Some(self.writes){
+                    self.fail_at=None;return Err(BlockError::Io);
+                }
+                self.writes+=1;self.disk.write_sector(lba,data)
+            }
+        }
+        let disk=FaultDisk{disk:Disk{sectors:[[0;SECTOR_BYTES];COUNT]},
+                           writes:0,fail_at:None};
+        let mut fs=HierVfs::format_blank(disk).unwrap();
+        fs.mkdir("/shared").unwrap();fs.create("/shared/note",b"stable").unwrap();
+        let mut dev=fs.into_device();dev.fail_at=Some(dev.writes);
+        let mut fs=HierVfs::mount(dev).unwrap();
+        let mut table=FileHandles::new();
+        let fd=table.open(1,"/shared/note",WRITE,&mut fs).unwrap();
+        assert_eq!(table.write(1,fd,b"bad",&mut fs),Err(FsError::Io));
+        assert_eq!(table.security_statistics().completed_writes,0);
+        assert_eq!(table.write(1,fd,b"retry",&mut fs),Err(FsError::InvalidName));
+        assert_eq!(table.seek(1,fd,0),Err(FsError::InvalidName));
+        let mut fs=HierVfs::mount(fs.into_device()).unwrap();
+        let mut data=[0u8;12];
+        assert_eq!(fs.read("/shared/note",&mut data),Ok(6));
+        assert_eq!(&data[..6],b"stable");
+        let reopened=table.open(1,"/shared/note",WRITE,&mut fs).unwrap();
+        assert_ne!(fd,reopened);
+        assert_eq!(table.write(1,reopened,b"S",&mut fs),Ok(1));
+    }
+    #[test]fn m1_r052_benign_out_of_bounds_write_does_not_retire_handle(){
+        let mut fs=fresh();fs.mkdir("/shared").unwrap();
+        fs.create("/shared/note",b"safe").unwrap();
+        let mut t=FileHandles::new();
+        let fd=t.open(1,"/shared/note",WRITE,&mut fs).unwrap();
+        assert_eq!(t.seek(1,fd,8),Ok(8));
+        assert_eq!(t.write(1,fd,b"X",&mut fs),Err(FsError::TooLarge));
+        assert_eq!(t.seek(1,fd,0),Ok(0));
+        assert_eq!(t.write(1,fd,b"Y",&mut fs),Ok(1));
     }
     #[test] fn authenticated_restarts_keep_rights_and_global_write_budget(){
         use crate::fs_write_guard::MAX_WRITE_OPERATIONS;
