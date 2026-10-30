@@ -534,6 +534,88 @@ pub fn command_on_partition<D:BlockDevice,const N:usize>(
   .map_err(PartitionCommandError::Command)
 }
 
+/// Authenticated, bounded, explicitly selected GPT Terminal session.
+/// Only scheduler-derived identities may be supplied by the trusted caller.
+/// This is a kernel-service API, not an unprivileged ring-3 syscall entry.
+/// New connections require a fresh disk/partition GUID selection and a healthy
+/// COW volume; old sessions never silently switch to replacement media.
+pub struct GptTerminalSession{
+ owner:Identity,
+ selection:crate::m1_partition::GptSelection,
+ expires:u64,
+ command_count:u64,
+ active:bool,
+}
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct TerminalSessionStatus{
+ pub partition_index:u32,pub commands:u64,pub expires:u64,
+}
+impl GptTerminalSession{
+ /// Read-only explicit selection. A missing grant or invalid deadline
+ /// cannot even probe the block device. The mount is immediately released.
+ pub fn open<D:BlockDevice,const N:usize>(
+  disk:&mut D,index:u32,auth:&Access<N>,caller:Identity,now:u64,expires:u64,
+ )->Result<Self,PartitionCommandError>{
+  preflight_partition_caller(auth,caller,now)?;
+  if expires<=now{return Err(PartitionCommandError::Command(Error::Denied));}
+  let selection=crate::m1_partition::inspect_gpt_selection(disk,index)
+   .map_err(|error|PartitionCommandError::Mount(
+     crate::m1_partition::MountError::Partition(error)))?;
+  // Reject unformatted or degraded media, and revalidate the GPT identity
+  // before accepting a session. No format or automatic repair is allowed.
+  drop(crate::m1_partition::mount_gpt_selected_healthy(disk,selection)
+   .map_err(PartitionCommandError::Mount)?);
+  Ok(Self{owner:caller,selection,expires,command_count:0,active:true})
+ }
+ fn authorize<const N:usize>(&self,auth:&Access<N>,caller:Identity,now:u64)
+  ->Result<(),PartitionCommandError>{
+  if !self.active||caller!=self.owner||now>=self.expires{
+   return Err(PartitionCommandError::Command(Error::Denied));
+  }
+  preflight_partition_caller(auth,caller,now)
+ }
+ /// An auth failure or malformed command never mutates session state.
+ /// A GPT identity, I/O or metadata mount failure permanently retires the
+ /// selection, preventing a later media swap from reviving it.
+ pub fn execute<D:BlockDevice,const N:usize>(
+  &mut self,disk:&mut D,auth:&Access<N>,caller:Identity,now:u64,
+  input:&[u8],out:&mut[u8],
+ )->Result<usize,PartitionCommandError>{
+  self.authorize(auth,caller,now)?;
+  let result=command_on_gpt_selection(disk,self.selection,auth,caller,now,input,out);
+  if matches!(result,Err(PartitionCommandError::Mount(_))){self.active=false;}
+  if result.is_ok(){self.command_count=self.command_count.saturating_add(1);}
+  result
+ }
+ /// No disk read is needed for owner-only session state inspection.
+ pub fn status<const N:usize>(&self,auth:&Access<N>,caller:Identity,now:u64)
+  ->Result<TerminalSessionStatus,PartitionCommandError>{
+  self.authorize(auth,caller,now)?;
+  Ok(TerminalSessionStatus{
+   partition_index:self.selection.partition.index,
+   commands:self.command_count,expires:self.expires,
+  })
+ }
+ /// A session may only reduce its own lifetime, never renew or expand it.
+ pub fn shorten<const N:usize>(&mut self,auth:&Access<N>,caller:Identity,
+  now:u64,new_expiry:u64)->Result<(),PartitionCommandError>{
+  self.authorize(auth,caller,now)?;
+  if new_expiry<=now||new_expiry>self.expires{
+   return Err(PartitionCommandError::Command(Error::Denied));
+  }
+  self.expires=new_expiry;Ok(())
+ }
+ /// Owner-only close; a recycled PID cannot close a different generation.
+ /// Closing invalidates the token but never touches persistent disk sectors.
+ pub fn close(&mut self,caller:Identity)->Result<(),PartitionCommandError>{
+  if !self.active||self.owner!=caller{
+   return Err(PartitionCommandError::Command(Error::Denied));
+  }
+  self.active=false;Ok(())
+ }
+ pub fn is_active(&self)->bool{self.active}
+}
+
 #[cfg(test)]
 mod tests{
  use super::*;
