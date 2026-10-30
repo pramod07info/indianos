@@ -411,6 +411,13 @@ impl<D:BlockDevice> DurableFs<D>{
         }
         self.publish(next)
     }
+    /// Validate device-specific identity without releasing the mounted
+    /// device and introducing another mount/read cycle. Kernel-internal
+    /// callers must perform inspection only and discard the mount on error.
+    pub(crate) fn validate_device<E>(&mut self,
+        validate:impl FnOnce(&mut D)->Result<(),E>)->Result<(),E>{
+        validate(&mut self.disk)
+    }
     pub fn into_device(self)->D{self.disk}
     fn find(&self,name:[u8;NAME_BYTES])->Option<usize>{
         self.meta.entries.iter().position(|e|e.used && e.name==name)

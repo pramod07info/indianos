@@ -9,6 +9,8 @@
 
 use core::arch::asm;
 use core::panic::PanicInfo;
+#[cfg(feature="normal-init")]
+mod bootstrap;
 #[cfg(any(feature="shell",feature="interactive",feature="r026-shell"))]
 mod shell;
 #[cfg(any(feature="r031-files-shell",feature="r031-files-terminal"))]
@@ -746,6 +748,33 @@ fn terminal_exchange(byte:u8,begin:bool)->bool{
         match message{
             b"A"=>return true,
             b"C"=>return false,
+            b"L"=>{
+                // PID3 supplies no path: only this broker's shared directory.
+                let mut data=[0u8;256];
+                let n=vfs_call(8,b"/shared",b"",&mut data,0);
+                let mut text=[0u8;terminal_line::MAX_NOTE];
+                let rendered=if n<=64{
+                    terminal_line::directory_text(&data[..n as usize],&mut text)
+                }else{None};
+                if let Some(size)=rendered{
+                    let mut reply=[0u8;21];reply[0]=b'L';
+                    reply[1..1+size].copy_from_slice(&text[..size]);
+                    suite_send(3,&reply[..1+size]);
+                    write(b"R055 PID1 listed persistent shared directory through bounded broker");
+                }else{suite_send(3,b"E");}
+            },
+            b"S"=>{
+                let mut data=[0u8;256];
+                let n=vfs_call(4,b"/shared/readme",b"",&mut data,0);
+                if n>terminal_line::MAX_NOTE as u64{suite_send(3,b"E");}
+                else{
+                    // This fixed-note stat reports actual readable byte length,
+                    // not unrelated metadata or an unvalidated client value.
+                    let reply=[b'S',b'0'+(n/10) as u8,b'0'+(n%10) as u8];
+                    suite_send(3,&reply);
+                    write(b"R055 PID1 measured persistent note through bounded broker");
+                }
+            },
             b"R"=>{
                 let mut data=[0u8;256];
                 let n=vfs_call(4,b"/shared/readme",b"",&mut data,0);
@@ -809,6 +838,8 @@ fn terminal_service(){
                     action=>{
                         match action{
                             Action::Read=>suite_send(1,b"R"),
+                            Action::List=>suite_send(1,b"L"),
+                            Action::Stat=>suite_send(1,b"S"),
                             Action::Write{bytes,len}=>{
                                 let mut request=[0u8;21];request[0]=b'W';
                                 request[1..1+len].copy_from_slice(&bytes[..len]);
@@ -820,6 +851,22 @@ fn terminal_service(){
                         match &response[8..8+size]{
                             b"O"=>terminal_field(b"SAVED"),
                             b"E"=>terminal_field(b"IO ERROR"),
+                            data if (1..=21).contains(&data.len())&&data[0]==b'L'&&
+                                data[1..].iter().all(|b|(0x20..=0x7e).contains(b))=>{
+                                terminal_field(if data.len()==1{b"EMPTY DIRECTORY"}else{&data[1..]});
+                                let mut text=[0u8;64];let prefix=b"R055 Terminal directory: ";
+                                text[..prefix.len()].copy_from_slice(prefix);
+                                text[prefix.len()..prefix.len()+data.len()-1].copy_from_slice(&data[1..]);
+                                write(&text[..prefix.len()+data.len()-1]);
+                            },
+                            data if data.len()==3&&data[0]==b'S'&&
+                                data[1].is_ascii_digit()&&data[2].is_ascii_digit()&&
+                                (data[1]-b'0')*10+data[2]-b'0'<=20=>{
+                                let mut text=*b"00 BYTES";text[..2].copy_from_slice(&data[1..]);
+                                terminal_field(&text);
+                                let mut report=*b"R055 Terminal stat: 00 BYTES";
+                                report[20..22].copy_from_slice(&data[1..]);write(&report);
+                            },
                             data if (2..=21).contains(&data.len())&&data[0]==b'D'&&
                                 data[1..].iter().all(|b|(0x20..=0x7e).contains(b))=>{
                                 terminal_field(&data[1..]);
@@ -1143,6 +1190,30 @@ fn files_app_smoke(data:&mut [u8;256]){
        &data[..4]!=b"FILE"{exit(217);}
     if file_handle_call(5,b"",rd,0,data,0)!=0{exit(218);}
     write(b"R031.6-8 PID1 native filesystem handles, rights and close verified");
+    // Exercise the live descriptor ABI, not just a host-side VFS helper.
+    data[..8].copy_from_slice(b"FILEtail");
+    if vfs_call(3,b"/etc/resize",b"",data,8)!=0{exit(179);}
+    let resize=file_handle_call(1,b"/etc/resize",0,3,data,0);
+    if resize==0||resize==u64::MAX{exit(180);}
+    if file_handle_call(4,b"",resize,0,data,0)!=0{exit(181);}
+    if file_handle_call(6,b"",resize,4,data,0)!=0{exit(182);}
+    // Truncation preserves the cursor and the prefix at the old offset.
+    if file_handle_call(2,b"",resize,0,data,4)!=4||&data[..4]!=b"FILE"{exit(183);}
+    if file_handle_call(6,b"",resize,8,data,0)!=0{exit(184);}
+    data[..4].fill(0xff);
+    if file_handle_call(2,b"",resize,0,data,4)!=4||data[..4]!=[0;4]{exit(185);}
+    if file_handle_call(6,b"",resize,2049,data,0)!=u64::MAX{exit(186);}
+    if file_handle_call(6,b"",resize,8,data,0)!=0{exit(187);}
+    if file_handle_call(5,b"",resize,0,data,0)!=0{exit(188);}
+    if file_handle_call(6,b"",resize,0,data,0)!=u64::MAX{exit(189);}
+    let readonly=file_handle_call(1,b"/etc/resize",0,1,data,0);
+    if readonly==0||readonly==u64::MAX{exit(190);}
+    if file_handle_call(6,b"",readonly,0,data,0)!=u64::MAX{exit(191);}
+    if file_handle_call(4,b"",readonly,0,data,0)!=0{exit(192);}
+    if file_handle_call(2,b"",readonly,0,data,8)!=8||
+       &data[..4]!=b"FILE"||data[4..8]!=[0;4]{exit(193);}
+    if file_handle_call(5,b"",readonly,0,data,0)!=0{exit(194);}
+    write(b"M1 native truncate: prefix, zero extension, cursor and denied capabilities verified");
 }
 #[cfg(feature="r031-vfs-init")]
 fn vfs_guest()->!{
@@ -1537,10 +1608,12 @@ pub extern "C" fn _start()->!{
         write(b"M009 timer task B finished");
         exit(0);
     }
-    // A harmless, valid ET_EXEC fixture for regular kernel boots.
+    #[cfg(feature="normal-init")]
+    bootstrap::run();
+    // A harmless, valid ET_EXEC fixture for explicitly minimal image builds.
     // It must never be launched outside the opt-in test variants.
     #[cfg(not(any(
-        feature="demo",feature="worker",feature="shell",feature="interactive",feature="sched-a",
+        feature="normal-init",feature="demo",feature="worker",feature="shell",feature="interactive",feature="sched-a",
         feature="sched-b",feature="ipc-a",feature="ipc-b",feature="r026-shell",feature="r026-worker",feature="r025-a",feature="r025-b",feature="fault-guard",feature="fault-supervisor",
         feature="preempt-a",feature="preempt-b",feature="r030-demo-v1",feature="r030-demo-v2"
     )))]

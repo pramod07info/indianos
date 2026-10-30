@@ -4,7 +4,7 @@
 pub const CAPACITY:usize=32;
 pub const MAX_NOTE:usize=20;
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
-pub enum Action{Changed,Read,Write{bytes:[u8;MAX_NOTE],len:usize},Invalid,Leave}
+pub enum Action{Changed,Read,List,Stat,Write{bytes:[u8;MAX_NOTE],len:usize},Invalid,Leave}
 pub struct Line{bytes:[u8;CAPACITY],len:usize,overflow:bool}
 impl Line{
  pub const fn new()->Self{Self{bytes:[0;CAPACITY],len:0,overflow:false}}
@@ -22,6 +22,8 @@ impl Line{
    b'\r'|b'\n'=>{
     let action=if self.overflow{Action::Invalid}
      else if &self.bytes[..self.len]==b"cat"{Action::Read}
+     else if &self.bytes[..self.len]==b"ls"{Action::List}
+     else if &self.bytes[..self.len]==b"stat"{Action::Stat}
      else if self.bytes[..self.len].starts_with(b"write "){
       let data=&self.bytes[6..self.len];
       if data.is_empty()||data.len()>MAX_NOTE{Action::Invalid}else{
@@ -39,4 +41,18 @@ impl Line{
    _=>Action::Invalid,
   }
  }
+}
+
+/// Convert one bounded directory response into printable IPC text. Reject
+/// incomplete records/control bytes rather than displaying an ambiguous prefix.
+pub fn directory_text(source:&[u8],out:&mut[u8;MAX_NOTE])->Option<usize>{
+ out.fill(0);
+ if source.is_empty(){return Some(0);}
+ if source.len()>MAX_NOTE+1||source.last()!=Some(&b'\n'){return None;}
+ let size=source.len()-1;
+ if source[..size].iter().any(|b|*b!=b'\n'&&!(0x20..=0x7e).contains(b)){return None;}
+ for (dst,src) in out[..size].iter_mut().zip(&source[..size]){
+  *dst=if *src==b'\n'{b' '}else{*src};
+ }
+ Some(size)
 }

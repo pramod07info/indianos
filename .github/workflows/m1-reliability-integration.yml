@@ -42,6 +42,10 @@ jobs:
           cargo check --locked --offline --manifest-path rust/kernel_core/Cargo.toml
           --no-default-features --target x86_64-unknown-none
           --features pmm,vmm,test-r031-files-gui,test-r031-supervisor,test-r028-network,test-irq-keyboard
+      - name: Ordinary PID1 profile and raw UART integrity regressions
+        run: |
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features normal-init
+          cargo check --locked --offline --manifest-path rust/kernel_core/Cargo.toml --no-default-features --target x86_64-unknown-none --features normal-init
 
   runtime-qemu:
     runs-on: ubuntu-latest
@@ -57,13 +61,36 @@ jobs:
           sudo apt-get install -y clang lld binutils xorriso qemu-system-x86 ovmf curl
       - name: Terminal parser and recovery harness regressions
         run: |
-          make test-m1-terminal-host
-          python3 -m unittest discover -s tests -v
+          set -euo pipefail
+          mkdir -p build/acceptance-logs
+          make test-m1-terminal-host 2>&1 | tee build/acceptance-logs/terminal-parser.log
+          python3 -m unittest discover -s tests -v 2>&1 | tee build/acceptance-logs/python.log
+      - name: Normal profile enters real PID1 and returns safely to recovery
+        run: |
+          set -euo pipefail
+          make test-normal-init-host test-normal-init-qemu 2>&1 | tee build/acceptance-logs/normal-init-qemu.log
       - name: Real physical input, Terminal persistence and reboot readback
-        run: make test-m1-terminal-persistence-qemu
+        run: |
+          set -euo pipefail
+          make test-m1-terminal-persistence-qemu 2>&1 | tee build/acceptance-logs/terminal-qemu.log
       - name: Read-only boot recovery with damaged init media
-        run: make test-boot-recovery-qemu
+        run: |
+          set -euo pipefail
+          make test-boot-recovery-qemu 2>&1 | tee build/acceptance-logs/recovery-qemu.log
       - name: Preserve existing Files and supervisor lifecycle acceptance
         run: |
-          make test-r031-files-gui-qemu
-          make test-r031-supervisor-qemu
+          set -euo pipefail
+          make test-r031-files-gui-qemu 2>&1 | tee build/acceptance-logs/files-qemu.log
+          make test-r031-supervisor-qemu 2>&1 | tee build/acceptance-logs/supervisor-qemu.log
+      - name: Native descriptor truncate and five-boot durable VFS recovery
+        run: |
+          set -euo pipefail
+          make test-r031-vfs-qemu 2>&1 | tee build/acceptance-logs/native-vfs-qemu.log
+      - name: Retain exact-revision runtime acceptance logs even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: m1-runtime-acceptance-${{ github.sha }}
+          path: build/acceptance-logs/
+          if-no-files-found: error
+          retention-days: 14

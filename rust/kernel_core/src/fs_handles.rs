@@ -199,6 +199,43 @@ impl FileHandles{
         self.entries[slot].filesystem_generation=fs.generation();
         Ok(n)
     }
+    /// Resize through an existing write capability. The cursor is preserved,
+    /// including when it lies beyond the new EOF; subsequent reads return EOF.
+    fn truncate_for<D:BlockDevice>(&mut self,owner:Identity,token:u64,
+        length:u64,fs:&mut HierVfs<D>)->Result<(),FsError>{
+        if length>MAX_FILE_BYTES as u64{return Err(FsError::TooLarge);}
+        let slot=self.index(owner,token)?;
+        let h=self.entries[slot];
+        if h.mode&WRITE==0||h.filesystem_generation!=fs.generation(){
+            return Err(FsError::InvalidName);
+        }
+        // Read/CRC verification must succeed before quota admission or writes.
+        let old=match fs.file_len(h.pathname()){
+            Ok(n)=>n,
+            Err(error)=>{
+                if matches!(error,FsError::Io|FsError::InvalidVolume){
+                    self.entries[slot]=Handle::EMPTY;
+                }
+                return Err(error);
+            }
+        };
+        let changed=old.abs_diff(length as usize);
+        if changed==0{return Ok(());}
+        // Account for removed bytes as well as zero-extension, so shrinking
+        // cannot evade the same service-wide mutation budget as writes.
+        if self.write_guard.preflight(h.pathname(),changed).is_err(){
+            return Err(FsError::InvalidName);
+        }
+        if let Err(error)=fs.truncate(h.pathname(),length){
+            if matches!(error,FsError::Io|FsError::InvalidVolume){
+                self.entries[slot]=Handle::EMPTY;
+            }
+            return Err(error);
+        }
+        self.write_guard.completed(changed);
+        self.entries[slot].filesystem_generation=fs.generation();
+        Ok(())
+    }
     pub fn seek(&mut self,pid:u32,token:u64,offset:u64)->Result<u64,FsError>{
         self.seek_for(Identity{pid,generation:0},token,offset)
     }
@@ -245,6 +282,7 @@ impl FileHandles{
             3=>self.write_for(owner,token,buffer,fs).map(|n|n as u64),
             4=>self.seek_for(owner,token,argument),
             5=>{self.close_for(owner,token)?;Ok(0)},
+            6=>{self.truncate_for(owner,token,argument,fs)?;Ok(0)},
             _=>Err(FsError::InvalidName)
         }
     }
@@ -292,6 +330,80 @@ mod tests{
     }
     fn fresh()->HierVfs<Disk>{
         HierVfs::format_blank(Disk{sectors:[[0u8;SECTOR_BYTES];COUNT]}).unwrap()
+    }
+    #[test] fn m1_truncate_authenticated_handle_refreshes_generation_preserves_cursor(){
+        let mut fs=fresh();fs.mkdir("/shared").unwrap();
+        fs.create("/shared/note",b"original").unwrap();
+        let mut table=FileHandles::new();let owner=table.bind_process(1).unwrap();
+        let peer=table.bind_process(2).unwrap();
+        let fd=table.dispatch_authenticated(1,owner,0,READ|WRITE,"/shared/note",&mut [],&mut fs).unwrap();
+        let reader=table.dispatch_authenticated(1,peer,0,READ,"/shared/note",&mut [],&mut fs).unwrap();
+        table.dispatch_authenticated(4,owner,fd,8,"",&mut [],&mut fs).unwrap();
+        assert_eq!(table.dispatch_authenticated(6,owner,fd,3,"",&mut [],&mut fs),Ok(0));
+        let mut out=[0xcc;16];
+        assert_eq!(table.dispatch_authenticated(2,owner,fd,0,"",&mut out,&mut fs),Ok(0));
+        assert_eq!(table.dispatch_authenticated(2,peer,reader,0,"",&mut out,&mut fs),Err(FsError::InvalidName));
+        table.dispatch_authenticated(4,owner,fd,0,"",&mut [],&mut fs).unwrap();
+        assert_eq!(table.dispatch_authenticated(2,owner,fd,0,"",&mut out,&mut fs),Ok(3));
+        assert_eq!(&out[..3],b"ori");
+        assert_eq!(table.dispatch_authenticated(6,owner,fd,7,"",&mut [],&mut fs),Ok(0));
+        assert_eq!(table.security_statistics().completed_writes,2);
+        assert_eq!(table.security_statistics().changed_bytes,9);
+        let mut fs=HierVfs::mount(fs.into_device()).unwrap();
+        assert_eq!(fs.read("/shared/note",&mut out),Ok(7));assert_eq!(&out[..7],b"ori\0\0\0\0");
+    }
+    #[test] fn m1_truncate_denies_readonly_stale_forged_oversize_without_mutation(){
+        let mut fs=fresh();fs.mkdir("/shared").unwrap();fs.create("/shared/note",b"safe").unwrap();
+        let mut table=FileHandles::new();let owner=table.bind_process(1).unwrap();let peer=table.bind_process(2).unwrap();
+        let fd=table.dispatch_authenticated(1,owner,0,WRITE,"/shared/note",&mut [],&mut fs).unwrap();
+        let reader=table.dispatch_authenticated(1,peer,0,READ,"/shared/note",&mut [],&mut fs).unwrap();
+        let generation=fs.generation();
+        for (identity,token,length) in [(peer,reader,0),(peer,fd,0),
+            (Identity{pid:1,generation:owner.generation+1},fd,0)]{
+            assert_eq!(table.dispatch_authenticated(6,identity,token,length,"",&mut [],&mut fs),Err(FsError::InvalidName));
+        }
+        assert_eq!(table.dispatch_authenticated(6,owner,fd,MAX_FILE_BYTES as u64+1,"",&mut [],&mut fs),Err(FsError::TooLarge));
+        assert_eq!(table.dispatch_authenticated(6,owner,fd,4,"",&mut [],&mut fs),Ok(0));
+        assert_eq!(fs.generation(),generation);assert_eq!(table.security_statistics().completed_writes,0);
+        fs.overwrite("/shared/note",b"replacement").unwrap();
+        assert_eq!(table.dispatch_authenticated(6,owner,fd,0,"",&mut [],&mut fs),Err(FsError::InvalidName));
+        assert_eq!(fs.file_len("/shared/note"),Ok(11));
+        table.retire_process(owner);
+        assert_eq!(table.dispatch_authenticated(6,owner,fd,0,"",&mut [],&mut fs),Err(FsError::InvalidName));
+    }
+    #[test] fn m1_truncate_shrink_and_extend_share_monotonic_write_budget(){
+        let mut fs=fresh();fs.create("/note",b"x").unwrap();let mut table=FileHandles::new();
+        let fd=table.open(1,"/note",WRITE,&mut fs).unwrap();
+        for index in 0..crate::fs_write_guard::MAX_WRITE_OPERATIONS{
+            assert_eq!(table.dispatch(6,1,fd,(index%2) as u64,"",&mut [],&mut fs),Ok(0));
+        }
+        assert_eq!(table.dispatch(6,1,fd,0,"",&mut [],&mut fs),Err(FsError::InvalidName));
+        assert_eq!(fs.file_len("/note"),Ok(1));
+        assert_eq!(table.security_statistics().completed_writes,32);
+        assert_eq!(table.security_statistics().changed_bytes,32);
+    }
+    #[test] fn m1_truncate_uncertain_io_retires_capability_without_success_charge(){
+        use std::{cell::Cell,rc::Rc};
+        struct FaultDisk{disk:Disk,fail:Rc<Cell<bool>>}
+        impl BlockDevice for FaultDisk{
+            fn sector_count(&self)->u64{self.disk.sector_count()}
+            fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{self.disk.read_sector(lba,out)}
+            fn write_sector(&mut self,lba:u64,data:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+                if self.fail.get(){return Err(BlockError::Io);}self.disk.write_sector(lba,data)
+            }
+        }
+        let failed=Rc::new(Cell::new(false));
+        let mut fs=HierVfs::format_blank(FaultDisk{disk:Disk{sectors:[[0;SECTOR_BYTES];COUNT]},fail:failed.clone()}).unwrap();
+        fs.create("/note",b"original").unwrap();let mut table=FileHandles::new();
+        let owner=table.bind_process(1).unwrap();
+        let fd=table.dispatch_authenticated(1,owner,0,WRITE,"/note",&mut [],&mut fs).unwrap();
+        failed.set(true);
+        assert_eq!(table.dispatch_authenticated(6,owner,fd,1,"",&mut [],&mut fs),Err(FsError::Io));
+        failed.set(false);
+        assert_eq!(table.dispatch_authenticated(6,owner,fd,1,"",&mut [],&mut fs),Err(FsError::InvalidName));
+        assert_eq!(table.security_statistics().completed_writes,0);
+        let mut fs=HierVfs::mount(fs.into_device()).unwrap();
+        assert_eq!(fs.file_len("/note"),Ok(8));
     }
     #[test] fn handle_seek_write_read_close_and_reuse(){
         let mut fs=fresh();

@@ -59,6 +59,12 @@ user physically interacts with Files/Terminal; a file is created, edited and
 read back after reboot; process isolation, screenshot/keyboard/mouse,
 filesystem corruption and recovery acceptance all pass at exact commit SHA.
 
+Latest bounded implementation evidence: [normal startup and ownership
+integration](M1_MAJOR_INTEGRATION.md). Normal boot now executes a ring-3 PID1
+serial bootstrap console; graphical normal startup remains open. This batch
+adds live Terminal listing/size, descriptor truncation and ownership/recovery
+hardening. It accepts no additional high-level M1 gate.
+
 ## M2 — Developer Alpha
 
 **Current M2 integrated workstream:** [M2 developer-alpha engineering

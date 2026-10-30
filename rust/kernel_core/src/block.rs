@@ -40,6 +40,15 @@ impl<'a, D: BlockDevice> BlockWindow<'a, D> {
         Ok(Self { device, start, count })
     }
     pub fn sector_start(&self) -> u64 { self.start }
+    /// Read-only parent inspection while the bounded view retains exclusive
+    /// ownership. Used to validate partition identity after the final mount.
+    pub(crate) fn validate_parent<E>(&mut self,
+        validate:impl FnOnce(&mut ReadOnlyDevice<'_,D>)->Result<(),E>)
+        ->Result<(),E>
+    {
+        validate(&mut ReadOnlyDevice::new(self.device))
+    }
+
 }
 impl<D: BlockDevice> BlockDevice for BlockWindow<'_, D> {
     fn sector_count(&self) -> u64 { self.count }

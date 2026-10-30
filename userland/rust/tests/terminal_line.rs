@@ -39,3 +39,24 @@ fn enter(line:&mut Line,bytes:&[u8])->Action{
  assert_eq!(&out,b"> 12345678901234567890");
  line.feed(b'\t');assert_eq!(line.display(&mut out),2);
 }
+#[test]fn directory_and_stat_commands_have_no_client_selected_paths(){
+ let mut line=Line::new();
+ assert_eq!(enter(&mut line,b"ls"),Action::List);
+ assert_eq!(enter(&mut line,b"stat"),Action::Stat);
+ for candidate in [b"ls /".as_slice(),b"ls /etc",b"stat /etc/secret",b"stat ",b"ls;cat"]{
+  assert_eq!(enter(&mut line,candidate),Action::Invalid);
+ }
+}
+#[test]fn directory_rendering_rejects_truncation_and_controls_without_partial_output(){
+ use terminal_line::directory_text;
+ let mut out=[0xff;MAX_NOTE];
+ assert_eq!(directory_text(b"f:readme\n",&mut out),Some(8));
+ assert_eq!(&out[..8],b"f:readme");
+ assert_eq!(directory_text(b"d:a\nf:b\n",&mut out),Some(7));
+ assert_eq!(&out[..7],b"d:a f:b");
+ assert_eq!(directory_text(b"",&mut out),Some(0));
+ for bad in [b"f:readme".as_slice(),b"f:a\x1b\n",b"f:a\r\n",b"f:abcdefghijklmnopqrs\n"]{
+  assert_eq!(directory_text(bad,&mut out),None);
+  assert_eq!(out,[0;MAX_NOTE]);
+ }
+}

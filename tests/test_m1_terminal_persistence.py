@@ -108,3 +108,14 @@ class TerminalPersistenceControls(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FilesystemCommandControls(unittest.TestCase):
+    def test_directory_response_requires_exact_fresh_complete_line(self):
+        expected = "IndianOS user: R055 Terminal directory: f:readme"
+        for data, start in [(expected.encode()+b"\n", len(expected)+1),
+                            (expected.encode()+b".secret\n", 0),
+                            (expected.encode(), 0)]:
+            with self.assertRaises(AssertionError):
+                harness.exact_terminal_line(data, start, expected)
+        harness.exact_terminal_line(expected.encode()+b"\r\n", 0, expected)

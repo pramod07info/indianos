@@ -20,7 +20,7 @@ use crate::syscall::{SyscallRequest,indianos_syscall_validate,ring3_frame_valid,
 use crate::program::indianos_program_user_range;
 use crate::boot::Region;
 use crate::user_image::{indianos_user_can_write,indianos_user_copy_writable};
-#[cfg(feature="test-interactive")]
+#[cfg(any(feature="test-interactive",feature="normal-init"))]
 use crate::input;
 #[cfg(feature="test-ipc")]
 use crate::ipc::{IpcRouter,IpcError};
@@ -43,6 +43,7 @@ struct DirectMap{offset:u64}
 struct Task{
  image:UserImage,root:CloneResult,pcb:*mut Process,
  frame:[u64;WORDS],saved:bool,attached:bool,timer_preemptions:u32,
+ authority_live:bool,
  #[cfg(feature="test-r031-vfs")]
  file_generation:u64,
  #[cfg(feature="test-ipc")]
@@ -165,6 +166,22 @@ fn cleanup_quantum_jobs(pid:u32){
  let _=jobs.process_terminated(pid);
 }
 
+static mut SESSION_DIRTY:bool=false;
+#[cfg(feature="preempt")]
+static mut SESSION_TIMER_ARMED:bool=false;
+#[cfg(any(feature="preempt",test))]
+fn stop_owned_timer(armed:&mut bool,stop:impl FnOnce()->bool)->bool{
+ if !*armed{return true;}
+ if !stop(){return false;}
+ *armed=false;true
+}
+#[cfg(feature="preempt")]
+fn stop_session_timer()->bool{
+ // Single-BSP scheduler entry/return only. Preserve ownership on failed stop
+ // across guard destruction and later scheduler invocations.
+ unsafe{stop_owned_timer(&mut *ptr::addr_of_mut!(SESSION_TIMER_ARMED),
+  ||crate::timer::x86_64_xapic_timer_stop())}
+}
 static mut M009_TASKS:[MaybeUninit<Task>;TASKS]=[const{MaybeUninit::uninit()};TASKS];
 #[cfg(feature="test-r031-supervisor")]
 static mut SUPERVISED_TERMINAL:crate::service_supervisor::TerminalSupervisor=
@@ -555,17 +572,24 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
    }
   },
   0=>1,
-  #[cfg(feature="test-interactive")]
+  #[cfg(any(feature="test-interactive",feature="normal-init"))]
   6=>{
    #[cfg(feature="test-r029-multiprocess")]
    if authenticated_gui_pid().is_none(){return BAD;}
-   #[cfg(not(feature="test-r029-multiprocess"))]
+   #[cfg(all(not(feature="test-r029-multiprocess"),feature="test-shell"))]
    if unsafe{ACTIVE_PID}!=1{return BAD;}
+   #[cfg(all(feature="normal-init",not(feature="test-shell")))]
+   if unsafe{ACTIVE_PROCESS.as_ref()}.is_none_or(|p|p.pid!=1||p.state!=3){return BAD;}
    if !unsafe{indianos_user_can_write(&*img,request.arg0,1)}{return BAD;}
-   let Some(byte)=input::poll_byte()else{return 0;};
+   #[cfg(feature="normal-init")]
+   let byte=input::normal_boot_byte();
+   #[cfg(not(feature="normal-init"))]
+   let byte=input::poll_byte();
+   let Some(byte)=byte else{return 0;};
    if !unsafe{indianos_user_copy_writable(&*img,request.arg0,&byte,1)}{
        return BAD;
    }
+   #[cfg(not(feature="normal-init"))]
    input::echo(byte);
    1
   },
@@ -573,6 +597,8 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
   4=>unsafe{ACTIVE_PID as u64},
   #[cfg(all(feature="test-ipc",not(feature="test-shell")))]
   4=>authenticated_ipc_pid().map_or(BAD,u64::from),
+  #[cfg(all(feature="normal-init",not(any(feature="test-shell",feature="test-ipc"))))]
+  4=>unsafe{ACTIVE_PROCESS.as_ref()}.filter(|p|p.state==3).map_or(BAD,|p|p.pid as u64),
   #[cfg(all(feature="test-shell",feature="test-r026"))]
   5=>{
    // PID1 is the only service manager. Grant exactly one worker lifetime.
@@ -752,7 +778,7 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
     0
    };
    if matches!(request.arg0,2|3|5) && argument!=0{return BAD;}
-   if request.arg0==4 && argument>crate::durablefs::MAX_FILE_BYTES as u64{
+   if matches!(request.arg0,4|6) && argument>crate::durablefs::MAX_FILE_BYTES as u64{
     return BAD;
    }
    let handles=unsafe{&mut *ptr::addr_of_mut!(R031_HANDLES)};
@@ -1066,9 +1092,10 @@ fn task_ptr(i:usize)->*mut Task{
 fn prepare(t:*mut Task,p:*mut Process,elf:*const u8,size:usize,original:u64,
  vmm:&VmmBackend,b:&CloneBackend,slot:usize)->bool{
  let task=unsafe{&mut *t};
- if p.is_null()||!unsafe{x86_64_user_interrupt_stack_select(slot as u32)} ||
+ if p.is_null(){return false;}
+ task.pcb=p;task.authority_live=true;
+ if !unsafe{x86_64_user_interrupt_stack_select(slot as u32)} ||
     !unsafe{indianos_user_image_load(&mut task.image,vmm,elf,size)}{return false;}
- task.pcb=p;
  if !unsafe{paging_clone_kernel_half(b,original,&mut task.root)} ||
     !unsafe{paging_attach_user_half(b,task.root.root,task.image.tables.root_physical)}{return false;}
  task.attached=true;
@@ -1155,8 +1182,25 @@ fn saved_valid(t:&Task)->bool{
  (unsafe{vmm_query_page(&t.image.tables,rip&!(PAGE-1),&mut map)}) &&
  map.permissions.user&&map.permissions.executable&&!map.permissions.writable
 }
-fn discard(t:*mut Task,b:&CloneBackend,terminal:bool)->bool{
- let task=unsafe{&mut *t};
+fn revoke_task_authority(task:&mut Task){
+ // This runs before any fallible release, including scheduler-abort rollback.
+ // Clear the continuation even when no PCB was bound during preparation.
+ task.saved=false;task.frame=[0;WORDS];task.image.ready=false;
+ #[cfg(feature="test-ipc")]
+ task.ipc_wait.cancel();
+ if !task.authority_live{return;}
+ task.authority_live=false;
+ if let Some(process)=unsafe{task.pcb.as_ref()}{
+  let pid=process.pid;
+  cleanup_quantum_jobs(pid);
+  #[cfg(feature="test-r029-multiprocess")]
+  crate::gui::user_surface_terminate(pid);
+  #[cfg(feature="test-ipc")]
+  if let Some(boxes)=router(){let _=boxes.unregister(pid);}
+  #[cfg(feature="test-r025")]
+  if let Some(svc)=services(){let _=svc.terminate(pid);}
+ }
+
  #[cfg(feature="test-r031-vfs")]
  if task.file_generation!=0{
   // Revoke before fallible page-table/frame reclamation. A retry or delayed
@@ -1168,9 +1212,10 @@ fn discard(t:*mut Task,b:&CloneBackend,terminal:bool)->bool{
   }
   task.file_generation=0;
  }
- // Retire continuation before any fallible resource teardown.
- #[cfg(feature="test-ipc")]
- task.ipc_wait.cancel();
+}
+fn discard(t:*mut Task,b:&CloneBackend,terminal:bool)->bool{
+ let task=unsafe{&mut *t};
+ revoke_task_authority(task);
  if task.attached{
   if !unsafe{paging_detach_user_half(b,task.root.root,task.image.tables.root_physical)}{return false;}
   task.attached=false;
@@ -1182,6 +1227,45 @@ fn discard(t:*mut Task,b:&CloneBackend,terminal:bool)->bool{
   pid_log(unsafe{(*task.pcb).pid},b"REAPED\0");
  }
  true
+}
+// A failed release retains its ownership metadata for the next serialized
+// invocation. Never overwrite a partially reclaimed image with zeroed storage.
+fn cleanup_session(backend:&CloneBackend,reclaim:bool)->bool{
+ let mut complete=reclaim;
+ for slot in 0..TASKS{
+  let task=unsafe{&mut *task_ptr(slot)};
+  revoke_task_authority(task);
+  // The old DirectMap lived on the previous invocation's stack. Rebind only
+  // the trusted backend context before retrying retained image reclamation.
+  task.image.tables.backend.context=backend.context;
+  if reclaim && !discard(task as *mut Task,backend,false){complete=false;}
+  // PCBs belong to the caller's stack-local ProcessTable. No static task may
+  // retain a pointer after that table's lifetime, including failed teardown.
+  task.pcb=ptr::null_mut();
+ }
+ #[cfg(feature="test-ipc")]
+ unsafe{IPC_ROUTER=None;}
+ #[cfg(feature="test-r025")]
+ unsafe{R025_SERVICES=None;}
+ unsafe{SESSION_DIRTY=!complete;}
+ complete
+}
+struct SessionRollback{backend:CloneBackend,kernel_root:u64}
+impl Drop for SessionRollback{
+ fn drop(&mut self){
+  #[cfg(feature="preempt")]
+  let timer_stopped=stop_session_timer();
+  #[cfg(not(feature="preempt"))]
+  let timer_stopped=true;
+  if !unsafe{SESSION_DIRTY}{return;}
+  let current:u64;
+  unsafe{asm!("mov {}, cr3",out(reg)current,options(nostack,nomem,preserves_flags));}
+  // If the assembly trampoline failed to restore CR3, revoke authority but
+  // retain all potentially active tables instead of freeing the current root.
+  if !cleanup_session(&self.backend,timer_stopped&&current&PHYS==self.kernel_root){
+   log(b"IndianOS: M009 rollback retained unreclaimed resources\n\0");
+  }
+ }
 }
 #[cfg(feature="test-r029-desktop-suite")]
 #[no_mangle]
@@ -1202,6 +1286,17 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
  let mut direct=DirectMap{offset};
  let vmm=vmm_backend(&mut direct);
  let backend=clone_backend(&mut direct);
+ #[cfg(feature="preempt")]
+ if !stop_session_timer(){
+  log(b"IndianOS: M009 prior timer stop remains uncertain\n\0");return false;
+ }
+ let active_retained_root=unsafe{SESSION_DIRTY} && (0..TASKS).any(|slot|{
+  let task=unsafe{&*task_ptr(slot)};
+  task.root.root!=0 && task.root.root==cpu.cr3&PHYS
+ });
+ if unsafe{SESSION_DIRTY} && (active_retained_root||!cleanup_session(&backend,true)){
+  log(b"IndianOS: M009 prior rollback still owns resources\n\0");return false;
+ }
  let mut table=ProcessTable::empty();
  let mut scheduler=Scheduler::empty();
  if !unsafe{indianos_process_table_init(&mut table)}{return false;}
@@ -1226,6 +1321,16 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
  for i in 0..TASKS{
   unsafe{ptr::write(task_ptr(i),core::mem::zeroed())};
  }
+ // Bind every created PCB before the first fallible image preparation. GUI
+ // grants may already exist for a peer whose ELF has not been attempted yet.
+ unsafe{
+  (*task_ptr(0)).pcb=p;(*task_ptr(0)).authority_live=true;
+  (*task_ptr(1)).pcb=q;(*task_ptr(1)).authority_live=true;
+ }
+ #[cfg(feature="test-r029-desktop-suite")]
+ unsafe{(*task_ptr(2)).pcb=third;(*task_ptr(2)).authority_live=true;}
+ unsafe{SESSION_DIRTY=true;}
+ let _rollback=SessionRollback{backend,kernel_root:cpu.cr3&PHYS};
  #[cfg(feature="test-r031-supervisor")]
  unsafe{SUPERVISED_TERMINAL=crate::service_supervisor::TerminalSupervisor::new();}
  #[cfg(feature="test-r026")]
@@ -1241,10 +1346,6 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
  let prepared=prepared_two;
  if !prepared||!unsafe{indianos_scheduler_init(&mut scheduler,&mut table)}{
   log(b"IndianOS: M009 FATAL cannot prepare two user contexts\n\0");
-  #[cfg(feature="test-r029-desktop-suite")]
-  let _=discard(task_ptr(2),&backend,false);
-  let _=discard(task_ptr(1),&backend,false);
-  let _=discard(task_ptr(0),&backend,false);
   return false;
  }
  #[cfg(feature="test-ipc")]
@@ -1279,10 +1380,11 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
  log(b"IndianOS: R029.5 three protected ring3 address spaces READY\n\0");
  #[cfg(feature="preempt")]
  {
+  // Arm rollback before calibration: a partially failed start must also mask
+  // the source before any task tables or authority can be reclaimed.
+  unsafe{SESSION_TIMER_ARMED=true;}
   if !unsafe{crate::timer::x86_64_xapic_start_qemu_100hz()}{
    log(b"IndianOS: R024 FATAL xAPIC/PIT2 calibration failed\n\0");
-   let _=discard(task_ptr(1),&backend,false);
-   let _=discard(task_ptr(0),&backend,false);
    return false;
   }
   log(b"IndianOS: R024 calibrated periodic xAPIC IRQ at 100 Hz\n\0");
@@ -1414,7 +1516,7 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
  #[cfg(feature="preempt")]
  {
   // Mask the local timer before reading counters and reclaiming memory.
-  if !unsafe{crate::timer::x86_64_xapic_timer_stop()}{ok=false;}
+  if !stop_session_timer(){ok=false;}
   let irqs=crate::timer::x86_64_xapic_timer_irq_count();
   let captures=crate::timer::x86_64_xapic_timer_preemption_count();
   if irqs==0{log(b"IndianOS: R024 FATAL no xAPIC IRQs delivered\n\0");}
@@ -1480,31 +1582,28 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
  }
  if !ok{
   log(b"IndianOS: M009 FATAL scheduler or memory ownership verification\n\0");
-  // On normal dispatch failure CR3 has been restored to the kernel.
-  // Reclaim both remaining images, even if their PCB state was rejected.
-  let first=discard(task_ptr(0),&backend,false);
-  let second=discard(task_ptr(1),&backend,false);
-  #[cfg(feature="test-r029-desktop-suite")]
-  let third_discard=discard(task_ptr(2),&backend,false);
-  #[cfg(not(feature="test-r029-desktop-suite"))]
-  let third_discard=true;
-  #[cfg(feature="test-r031-supervisor")]
-  let fourth_discard=discard(task_ptr(3),&backend,false);
-  #[cfg(not(feature="test-r031-supervisor"))]
-  let fourth_discard=true;
-  if !first||!second||!third_discard||!fourth_discard||
-     unsafe{pmm_free_frames()}!=before{
-   log(b"IndianOS: M009 FATAL partial rollback: memory not fully reclaimed\n\0");
-  }
+
  }
- ok
+ #[cfg(feature="preempt")]
+ let can_reclaim=!unsafe{SESSION_TIMER_ARMED};
+ #[cfg(not(feature="preempt"))]
+ let can_reclaim=true;
+ let reclaimed=cleanup_session(&backend,can_reclaim);
+ if reclaimed && unsafe{pmm_free_frames()}!=before{
+  log(b"IndianOS: M009 FATAL rollback frame count mismatch\n\0");return false;
+ }
+ ok&&reclaimed
 }
 #[cfg(test)]mod tests{
  use super::*;
+ static LOCK:std::sync::Mutex<()>=std::sync::Mutex::new(());
+ // Host tests link the real retirement/reclamation path; the serial hardware
+ // boundary alone is supplied here because the kernel COM1 driver is assembly.
+ #[export_name="serial_write"]
+ extern "C" fn host_serial_write(_: *const c_char){}
  #[cfg(feature="test-ipc")]
  #[test]fn all_waiting_tasks_expire_without_fabricated_ticks_or_dispatches(){
   use core::mem::ManuallyDrop;
-  static LOCK:std::sync::Mutex<()>=std::sync::Mutex::new(());
   let _lock=LOCK.lock().unwrap();
   struct Restore{
    tasks:ManuallyDrop<[MaybeUninit<Task>;TASKS]>,
@@ -1546,6 +1645,113 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
    }
   }
   assert_eq!(outputs,[[0xa5;crate::ipc::RECEIVE_BYTES];2]);
+ }
+ #[test]fn aborted_session_revokes_authority_before_failed_release_and_retries(){
+  use core::mem::ManuallyDrop;
+  let _lock=LOCK.lock().unwrap();
+  struct Restore{
+   tasks:ManuallyDrop<[MaybeUninit<Task>;TASKS]>,dirty:bool,
+   #[cfg(feature="test-ipc")]
+   router:ManuallyDrop<Option<IpcRouter<4,8>>>,
+   #[cfg(feature="test-r025")]
+   services:ManuallyDrop<Option<R025Services>>,
+   #[cfg(feature="test-r031-vfs")]
+   handles:ManuallyDrop<crate::fs_handles::FileHandles>,
+  }
+  impl Drop for Restore{fn drop(&mut self){unsafe{
+   ptr::write(ptr::addr_of_mut!(M009_TASKS),ManuallyDrop::take(&mut self.tasks));
+   SESSION_DIRTY=self.dirty;
+   #[cfg(feature="test-ipc")]
+   ptr::write(ptr::addr_of_mut!(IPC_ROUTER),ManuallyDrop::take(&mut self.router));
+   #[cfg(feature="test-r025")]
+   ptr::write(ptr::addr_of_mut!(R025_SERVICES),ManuallyDrop::take(&mut self.services));
+   #[cfg(feature="test-r031-vfs")]
+   ptr::write(ptr::addr_of_mut!(R031_HANDLES),ManuallyDrop::take(&mut self.handles));
+  }}}
+  let _restore=unsafe{Restore{
+   tasks:ManuallyDrop::new(ptr::read(ptr::addr_of!(M009_TASKS))),dirty:SESSION_DIRTY,
+   #[cfg(feature="test-ipc")]
+   router:ManuallyDrop::new(ptr::read(ptr::addr_of!(IPC_ROUTER))),
+   #[cfg(feature="test-r025")]
+   services:ManuallyDrop::new(ptr::read(ptr::addr_of!(R025_SERVICES))),
+   #[cfg(feature="test-r031-vfs")]
+   handles:ManuallyDrop::new(ptr::read(ptr::addr_of!(R031_HANDLES))),
+  }};
+  struct Memory{root:[u64;512],refuse:bool,releases:usize}
+  unsafe extern "C" fn allocate(_: *mut u64,_:*mut c_void)->bool{false}
+  unsafe extern "C" fn access(p:u64,c:*mut c_void)->*mut u64{
+   if p!=PAGE{return ptr::null_mut();}
+   unsafe{(&mut *c.cast::<Memory>()).root.as_mut_ptr()}
+  }
+  unsafe extern "C" fn release(p:u64,c:*mut c_void)->bool{
+   let m=unsafe{&mut *c.cast::<Memory>()};
+   assert_eq!(p,PAGE);
+   if m.refuse{return false;}
+   m.releases+=1;true
+  }
+  let mut memory=Memory{root:[0;512],refuse:true,releases:0};
+  let backend=CloneBackend{allocate:Some(allocate),release:Some(release),
+   access:Some(access),context:(&mut memory as *mut Memory).cast()};
+  let mut process=Process::empty();process.pid=1;process.state=2;
+  unsafe{
+   for slot in 0..TASKS{ptr::write(task_ptr(slot),core::mem::zeroed());}
+   SESSION_DIRTY=true;
+   let task=&mut *task_ptr(0);task.pcb=&mut process;task.authority_live=true;
+   task.saved=true;task.frame=[0x55;WORDS];task.image.ready=true;
+   task.root=CloneResult{root:PAGE,table_count:1};
+   #[cfg(feature="test-ipc")]{
+    let mut boxes=IpcRouter::<4,8>::new().unwrap();
+    boxes.register(1).unwrap();boxes.register(2).unwrap();
+    boxes.send(1,2,b"stale outbound").unwrap();
+    task.ipc_wait=crate::ipc::ReceiveWait::begin(&boxes,1,0x400000,32).unwrap();
+    IPC_ROUTER=Some(boxes);
+   }
+   #[cfg(feature="test-r025")]{R025_SERVICES=R025Services::new();}
+   #[cfg(feature="test-r031-vfs")]{
+    R031_HANDLES=crate::fs_handles::FileHandles::new();
+    task.file_generation=(&mut *ptr::addr_of_mut!(R031_HANDLES)).bind_process(1).unwrap().generation;
+   }
+   // Even a CR3 mismatch must retire credentials, but never release a table.
+   assert!(!cleanup_session(&backend,false));assert_eq!(memory.releases,0);
+   assert!(SESSION_DIRTY);assert!((*task_ptr(0)).pcb.is_null());
+   assert!(!(*task_ptr(0)).authority_live);assert!(!(*task_ptr(0)).saved);
+   assert_eq!((*task_ptr(0)).frame,[0;WORDS]);assert!(!(*task_ptr(0)).image.ready);
+   #[cfg(feature="test-ipc")]{
+    assert!(!(*task_ptr(0)).ipc_wait.active());assert!(router().is_none());
+   }
+   #[cfg(feature="test-r025")]{assert!(services().is_none());}
+   #[cfg(feature="test-r031-vfs")]{
+    assert!(!(&*ptr::addr_of!(R031_HANDLES)).owns(crate::batch5_session::Identity{pid:1,generation:1}));
+    let replacement=(&mut *ptr::addr_of_mut!(R031_HANDLES)).bind_process(1).unwrap();
+    assert!(replacement.generation>1);
+   }
+   #[cfg(feature="test-ipc")]{
+    let mut replacement=IpcRouter::<4,8>::new().unwrap();
+    replacement.register(1).unwrap();replacement.register(2).unwrap();
+    replacement.send(2,1,b"new incarnation").unwrap();IPC_ROUTER=Some(replacement);
+   }
+   // A delayed per-task retry cannot revoke a replacement PID's mailbox.
+   assert!(!discard(task_ptr(0),&backend,false));
+   #[cfg(feature="test-ipc")]{assert_eq!(router().unwrap().pending(1),Ok(1));}
+   // Release refusal preserves physical ownership for a later retry.
+   assert!(!cleanup_session(&backend,true));
+   assert_eq!((*task_ptr(0)).root.root,PAGE);assert_eq!(memory.releases,0);
+   memory.refuse=false;
+   assert!(cleanup_session(&backend,true));assert!(!SESSION_DIRTY);
+   assert_eq!((*task_ptr(0)).root.root,0);assert_eq!(memory.releases,1);
+   assert!(cleanup_session(&backend,true));assert_eq!(memory.releases,1);
+   #[cfg(feature="test-r031-vfs")]{
+    assert!((&*ptr::addr_of!(R031_HANDLES)).owns(crate::batch5_session::Identity{pid:1,generation:2}));
+   }
+  }
+ }
+ #[test]fn timer_stop_uncertainty_preserves_ownership_until_retry_succeeds(){
+  let mut armed=true;
+  assert!(!stop_owned_timer(&mut armed,||false));assert!(armed);
+  // The same persistent flag is consumed by the next scheduler invocation.
+  assert!(!stop_owned_timer(&mut armed,||false));assert!(armed);
+  assert!(stop_owned_timer(&mut armed,||true));assert!(!armed);
+  assert!(stop_owned_timer(&mut armed,||panic!("already stopped timer retried")));
  }
  #[test]fn syscall_capture_preserves_runtime_irq_policy_and_zero_return(){
   let mut process=Process::empty();process.pid=1;process.state=3;

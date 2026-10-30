@@ -71,6 +71,12 @@ impl<D:BlockDevice> HierVfs<D>{
  pub fn format_blank(disk:D)->Result<Self,FsError>{
   Ok(Self{fs:DurableFs::format_blank(disk)?})
  }
+ /// Kernel-internal post-mount identity validation; inspection only.
+ /// A caller must discard this mount if its validator returns an error.
+ pub(crate) fn validate_device<E>(&mut self,
+  validate:impl FnOnce(&mut D)->Result<(),E>)->Result<(),E>{
+  self.fs.validate_device(validate)
+ }
  pub fn into_device(self)->D{self.fs.into_device()}
  pub fn generation(&self)->u64{self.fs.generation()}
  fn contradictory_alias(&self,p:&Path)->bool{
@@ -207,6 +213,27 @@ impl<D:BlockDevice> HierVfs<D>{
   self.parents(&p)?;
   if self.contradictory_alias(&p){return Err(FsError::InvalidVolume);}
   self.fs.write_range_path(p.name(),offset,data)
+ }
+ /// Return the length only after verifying the complete file payload.
+ pub fn file_len(&mut self,path:&str)->Result<usize,FsError>{
+  let p=checked(path,Kind::File)?;
+  self.parents(&p)?;
+  if self.contradictory_alias(&p){return Err(FsError::InvalidVolume);}
+  self.fs.read_path(p.name(),&mut [0u8;MAX_FILE_BYTES])
+ }
+ /// Atomically resize an existing file, preserving its prefix. Extension
+ /// materializes zero bytes; stale bytes from an older COW bank never leak.
+ /// An unchanged length validates the payload but does not publish metadata.
+ pub fn truncate(&mut self,path:&str,length:u64)->Result<(),FsError>{
+  if length>MAX_FILE_BYTES as u64{return Err(FsError::TooLarge);}
+  let p=checked(path,Kind::File)?;
+  self.parents(&p)?;
+  if self.contradictory_alias(&p){return Err(FsError::InvalidVolume);}
+  let mut snapshot=[0u8;MAX_FILE_BYTES];
+  let old=self.fs.read_path(p.name(),&mut snapshot)?;
+  let length=length as usize;
+  if length==old{return Ok(());}
+  self.fs.overwrite_path(p.name(),&snapshot[..length])
  }
  /// Durable destination creation from a complete, CRC-verified source.
  /// The current R027 on-disk bank still limits file size; unlike small
@@ -379,6 +406,66 @@ mod tests{
  }
  fn fresh()->HierVfs<Disk>{
   HierVfs::format_blank(Disk{blocks:[[0;SECTOR_BYTES];COUNT],writes:0,tear:None}).unwrap()
+ }
+ #[test]fn m1_truncate_preserves_prefix_zero_fills_and_survives_remount(){
+  let mut v=fresh();v.mkdir("/shared").unwrap();
+  v.create("/shared/note",b"secret trailing bytes").unwrap();
+  v.truncate("/shared/note",3).unwrap();
+  v.truncate("/shared/note",700).unwrap();
+  assert_eq!(v.file_len("/shared/note"),Ok(700));
+  let mut v=HierVfs::mount(v.into_device()).unwrap();
+  let mut bytes=[0xff;MAX_FILE_BYTES];
+  assert_eq!(v.read("/shared/note",&mut bytes),Ok(700));
+  assert_eq!(&bytes[..3],b"sec");assert!(bytes[3..700].iter().all(|&b|b==0));
+  v.truncate("/shared/note",0).unwrap();
+  let mut v=HierVfs::mount(v.into_device()).unwrap();
+  assert_eq!(v.file_len("/shared/note"),Ok(0));
+ }
+ #[test]fn m1_truncate_corrupt_payload_rejects_stat_and_same_length_without_writes(){
+  let mut v=fresh();v.create("/note",b"verified").unwrap();
+  let disk=v.into_device();
+  // Locate the payload in the scratch image, without depending on a COW bank.
+  let payload=disk.blocks.iter().position(|b|&b[..8]==b"verified").unwrap();
+  let mut v=HierVfs::mount(disk.clone()).unwrap();
+  // Mutate the mounted device through a shared, test-only device wrapper.
+  struct SharedDisk(std::rc::Rc<std::cell::RefCell<Disk>>);
+  impl BlockDevice for SharedDisk{
+   fn sector_count(&self)->u64{self.0.borrow().sector_count()}
+   fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{self.0.borrow_mut().read_sector(lba,out)}
+   fn write_sector(&mut self,lba:u64,input:&[u8;SECTOR_BYTES])->Result<(),BlockError>{self.0.borrow_mut().write_sector(lba,input)}
+  }
+  assert_eq!(v.file_len("/note"),Ok(8));
+  let shared=std::rc::Rc::new(std::cell::RefCell::new(v.into_device()));
+  let mut v=HierVfs::mount(SharedDisk(shared.clone())).unwrap();
+  shared.borrow_mut().blocks[payload][0]^=1;
+  let before=shared.borrow().writes;
+  assert_eq!(v.file_len("/note"),Err(FsError::InvalidVolume));
+  assert_eq!(v.truncate("/note",8),Err(FsError::InvalidVolume));
+  assert_eq!(shared.borrow().writes,before);
+ }
+ #[test]fn m1_truncate_bounds_missing_directory_and_noop_are_atomic(){
+  let mut v=fresh();v.mkdir("/dir").unwrap();v.create("/note",b"safe").unwrap();
+  let generation=v.generation();
+  assert_eq!(v.truncate("/note",MAX_FILE_BYTES as u64+1),Err(FsError::TooLarge));
+  assert_eq!(v.truncate("/absent",0),Err(FsError::NotFound));
+  assert_eq!(v.truncate("/dir",0),Err(FsError::NotFound));
+  assert_eq!(v.truncate("/dir/../note",0),Err(FsError::InvalidName));
+  assert_eq!(v.truncate("/note",4),Ok(()));assert_eq!(v.generation(),generation);
+  let device=v.into_device();let writes=device.writes;let blocks=device.blocks;
+  let mut v=HierVfs::mount(device).unwrap();v.truncate("/note",4).unwrap();
+  let device=v.into_device();assert_eq!(device.writes,writes);assert_eq!(device.blocks,blocks);
+ }
+ #[test]fn m1_truncate_torn_cow_keeps_original_until_metadata_publication(){
+  let mut v=fresh();v.create("/note",b"original").unwrap();
+  let disk=v.into_device();
+  for cut in 0..5{
+   let mut device=disk.clone();device.tear=Some(device.writes+cut);
+   let mut v=HierVfs::mount(device).unwrap();
+   assert_eq!(v.truncate("/note",MAX_FILE_BYTES as u64),Err(FsError::Io));
+   let mut device=v.into_device();device.tear=None;
+   let mut v=HierVfs::mount(device).unwrap();let mut bytes=[0;MAX_FILE_BYTES];
+   assert_eq!(v.read("/note",&mut bytes),Ok(8));assert_eq!(&bytes[..8],b"original");
+  }
  }
  #[test]fn valid_wrong_type_lookup_is_not_namespace_corruption(){
   let mut v=fresh();v.mkdir("/dir").unwrap();v.create("/file",b"ok").unwrap();

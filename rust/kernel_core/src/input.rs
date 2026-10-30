@@ -351,6 +351,19 @@ pub extern "C" fn x86_64_keyboard_irq_dispatch(){
     }
     unsafe{outb(0x20,0x20);} // specific master PIC EOI
 }
+/// Production bootstrap UART ingress preserves every byte. Error transfers
+/// become a nonprinting poison byte so corruption cannot splice a command.
+#[cfg(feature="normal-init")]
+pub(crate) fn normal_boot_byte()->Option<u8>{
+    let status=unsafe{inb(COM1+5)};
+    if status&1==0{return None;}
+    let byte=unsafe{inb(COM1)};
+    Some(normal_uart_transfer(status,byte))
+}
+#[cfg(feature="normal-init")]
+fn normal_uart_transfer(status:u8,byte:u8)->u8{
+    if status&0x1e!=0{0}else{byte}
+}
 pub(crate) fn poll_byte()->Option<u8>{
     #[cfg(feature="test-irq-keyboard")]
     if let Some(byte)=dequeue(){return Some(mark_physical_key(byte));}
@@ -612,5 +625,17 @@ mod tests{
         assert_eq!(decoder.feed_transfer(0x21,0x0f),None);
         assert_eq!(decoder.feed_transfer(0xc1,0x0f),None);
         assert_eq!(decoder.feed_transfer(1,0x0f),Some(b'\t'));
+    }
+}
+
+#[cfg(all(test,feature="normal-init"))]
+mod normal_uart_tests{
+    use super::normal_uart_transfer;
+    #[test]
+    fn raw_uart_preserves_controls_and_poisons_line_errors(){
+        for byte in 0..=255u8{
+            assert_eq!(normal_uart_transfer(1,byte),byte);
+            for error in [2,4,8,16]{assert_eq!(normal_uart_transfer(1|error,byte),0);}
+        }
     }
 }

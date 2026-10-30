@@ -32,6 +32,15 @@ def check() -> None:
     require(write_fn.index("self.write_guard.completed(n)") >
             write_fn.index("fs.write_at("),
             "write budget is charged before success")
+    truncate=source.split("    fn truncate_for<",1)[1].split("    pub fn seek(",1)[0]
+    require("self.index(owner,token)?" in truncate and "h.mode&WRITE==0" in truncate,
+            "descriptor truncate lost owner or write-right authorization")
+    require("self.write_guard.preflight(h.pathname(),changed)" in truncate and
+            truncate.index("self.write_guard.preflight(") < truncate.index("fs.truncate("),
+            "descriptor truncate bypasses protected paths or mutation budget")
+    require(truncate.index("self.write_guard.completed(changed)") >
+            truncate.index("fs.truncate("),
+            "descriptor truncate charges mutation budget before durable success")
     require("write_guard:WriteGuard" in source and
             "write_guard:WriteGuard::new()" in source,
             "kernel write guard not stored and initialized")
