@@ -34,6 +34,27 @@ impl<const N:usize> RamFs<N>{
   self.files.iter().position(|x|x.is_some_and(|f|
    f.path_len==path.len()&&&f.path[..f.path_len]==path))
  }
+ /// Apply a bounded collection of independent file replacements as one
+ /// published in-memory transaction. A stale global revision, duplicate
+ /// pathname, exhausted capacity, malformed path or oversize value changes
+ /// NOTHING, including existing file versions.
+ ///
+ /// The caller must authenticate the process and enforce WRITE rights.
+ /// This is RAM-only; an external storage layer must persist snapshots.
+ pub fn replace_batch_if_revision(&mut self,expected:u64,
+  requests:&[(&[u8],&[u8])])->Result<u64,Error>{
+  if expected!=self.version{return Err(Error::Invalid);}
+  if requests.is_empty()||requests.len()>16{return Err(Error::Invalid);}
+  let mut staged=Self{files:self.files,version:self.version};
+  for (i,&(path,data)) in requests.iter().enumerate(){
+   if requests[..i].iter().any(|(earlier,_)|*earlier==path){
+    return Err(Error::Invalid);
+   }
+   staged.replace(path,data)?;
+  }
+  *self=staged;
+  Ok(self.version)
+ }
  pub fn version(&self)->u64{self.version}
  pub fn count(&self)->usize{self.files.iter().filter(|x|x.is_some()).count()}
  /// Copy all bytes into a local future generation BEFORE publishing it.
@@ -85,6 +106,54 @@ impl<const N:usize> AtomicFileBackend for RamFs<N>{
   if file.data_len>output.len(){return Err(());}
   output[..file.data_len].copy_from_slice(&file.data[..file.data_len]);
   Ok(file.data_len)
+ }
+}
+#[cfg(test)]
+mod r058_atomic_batch_tests{
+ use super::*;
+ #[test]fn two_files_commit_together_with_distinct_versions(){
+  let mut fs=RamFs::<3>::new();
+  fs.replace(b"/keep",b"old").unwrap();
+  let rev=fs.version();
+  let next=fs.replace_batch_if_revision(rev,
+    &[(b"/keep",b"new"),(b"/added",b"payload")]).unwrap();
+  assert_eq!(next,rev+2);
+  assert_eq!(fs.count(),2);
+  let mut data=[0u8;16];
+  assert_eq!(fs.read(b"/keep",0,&mut data),Ok(3));
+  assert_eq!(&data[..3],b"new");
+  assert_eq!(fs.read(b"/added",0,&mut data),Ok(7));
+  assert_eq!(&data[..7],b"payload");
+  assert_eq!(fs.metadata(b"/keep").unwrap().0,rev+1);
+  assert_eq!(fs.metadata(b"/added").unwrap().0,rev+2);
+ }
+ #[test]fn failed_second_write_and_stale_revision_roll_back_all_entries(){
+  let mut fs=RamFs::<1>::new();
+  fs.replace(b"/one",b"safe").unwrap();
+  let before=fs.version();
+  assert_eq!(fs.replace_batch_if_revision(before,
+    &[(b"/one",b"changed"),(b"/two",b"new")]),Err(Error::Full));
+  assert_eq!(fs.version(),before);
+  assert_eq!(fs.count(),1);
+  assert_eq!(fs.metadata(b"/one"),Ok((before,4)));
+  let mut data=[0;8];fs.read(b"/one",0,&mut data).unwrap();
+  assert_eq!(&data[..4],b"safe");
+  assert_eq!(fs.replace_batch_if_revision(0,&[(b"/one",b"wrong")]),
+    Err(Error::Invalid));
+  assert_eq!(fs.version(),before);
+ }
+ #[test]fn duplicate_paths_bad_request_and_oversize_fail_without_publish(){
+  let mut fs=RamFs::<3>::new();
+  let bad=[b'x';CONTENT_MAX+1];
+  for batch in [
+    [(b"/a".as_slice(),b"first".as_slice()),(b"/a",b"last")],
+    [(b"/a",b"valid"),(b"/../escape",b"invalid")],
+    [(b"/a",b"valid"),(b"/b",bad.as_slice())]
+  ]{
+   assert!(fs.replace_batch_if_revision(0,&batch).is_err());
+   assert_eq!(fs.version(),0);assert_eq!(fs.count(),0);
+  }
+  assert_eq!(fs.replace_batch_if_revision(0,&[]),Err(Error::Invalid));
  }
 }
 #[cfg(test)]mod tests{

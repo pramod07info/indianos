@@ -396,6 +396,27 @@ impl<const N: usize> SurfaceLayout<N> {
         }
         Ok(moved)
     }
+    /// Move several authenticated surfaces in one serialized desktop
+    /// transaction. Validate every owner, window, geometry and epoch
+    /// through a private shadow layout; failures cannot partially move
+    /// windows or advance any published surface grant epoch.
+    pub fn move_batch(&mut self,requests:&[(u32,u32,i32,i32)])
+        ->Result<usize,Error>{
+        if requests.is_empty()||requests.len()>N{return Err(Error::Invalid);}
+        let mut staged=Self{surfaces:self.surfaces,epochs:self.epochs,
+            next_epoch:self.next_epoch};
+        for (i,&(owner,window,dx,dy)) in requests.iter().enumerate(){
+            if requests[..i].iter().any(|&(prior_owner,prior_window,_,_)|
+               owner==prior_owner&&window==prior_window){
+                return Err(Error::Duplicate);
+            }
+            staged.move_owned(owner,window,dx,dy)?;
+        }
+        self.surfaces=staged.surfaces;
+        self.epochs=staged.epochs;
+        self.next_epoch=staged.next_epoch;
+        Ok(requests.len())
+    }
     pub fn revoke(&mut self, owner: u32) {
         if owner == 0 { return; }
         for slot in &mut self.surfaces {
@@ -416,6 +437,43 @@ mod batch1_surface_layout_tests {
         assert_eq!(layout.move_owned(10,100,-21,0),Err(Error::Invalid));
         assert_eq!(layout.geometry(10,100),Ok(original));
         assert_eq!(layout.move_owned(10,100,5,-5).unwrap().x,25);
+    }
+    #[test]
+    fn r058_batch_window_move_commits_every_surface_and_epoch(){
+        let mut layout=SurfaceLayout::<3>::new();
+        let first=Rectangle{x:5,y:7,width:40,height:20};
+        let second=Rectangle{x:70,y:4,width:20,height:10};
+        layout.grant(5,100,first).unwrap();
+        layout.grant(6,200,second).unwrap();
+        let previous_a=layout.epoch(5,100).unwrap();
+        let previous_b=layout.epoch(6,200).unwrap();
+        assert_eq!(layout.move_batch(&[(5,100,10,2),(6,200,-5,8)]),Ok(2));
+        assert_eq!(layout.geometry(5,100).unwrap().x,15);
+        assert_eq!(layout.geometry(5,100).unwrap().y,9);
+        assert_eq!(layout.geometry(6,200).unwrap().x,65);
+        assert_eq!(layout.geometry(6,200).unwrap().y,12);
+        assert!(layout.epoch(5,100).unwrap()>previous_a);
+        assert!(layout.epoch(6,200).unwrap()>previous_b);
+    }
+    #[test]
+    fn r058_invalid_batch_preserves_all_window_coordinates_and_epochs(){
+        let mut layout=SurfaceLayout::<3>::new();
+        let first=Rectangle{x:5,y:5,width:40,height:20};
+        let second=Rectangle{x:20,y:20,width:20,height:10};
+        layout.grant(5,100,first).unwrap();layout.grant(6,200,second).unwrap();
+        let before_a=layout.epoch(5,100);
+        let before_b=layout.epoch(6,200);
+        assert_eq!(layout.move_batch(&[(5,100,2,2),(9,200,1,1)]),
+                   Err(Error::Unauthorized));
+        assert_eq!(layout.move_batch(&[(5,100,2,2),(6,200,-100,0)]),
+                   Err(Error::Invalid));
+        assert_eq!(layout.move_batch(&[(5,100,1,1),(5,100,1,1)]),
+                   Err(Error::Duplicate));
+        assert_eq!(layout.move_batch(&[]),Err(Error::Invalid));
+        assert_eq!(layout.geometry(5,100),Ok(first));
+        assert_eq!(layout.geometry(6,200),Ok(second));
+        assert_eq!(layout.epoch(5,100),before_a);
+        assert_eq!(layout.epoch(6,200),before_b);
     }
     #[test]
     fn teardown_prevents_reused_window_from_inheriting_geometry() {

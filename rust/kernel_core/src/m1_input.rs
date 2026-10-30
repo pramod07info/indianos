@@ -10,14 +10,24 @@ pub enum Event{Typed,Erased,Submitted(usize),Empty}
 /// Live per-process editable command line. Uses the same bounded cursor
 /// editor as the existing standalone line-editing tests: no second source
 /// buffer, dynamic allocation or privileged input pointers.
+#[derive(Clone,Copy)]
+struct HistoryEntry{bytes:[u8;MAX_LINE],len:usize}
+pub const HISTORY_LIMIT:usize=4;
 pub struct InputLine {
  editor:LineEditor,
  clipboard:[u8;MAX_LINE],
  clipboard_len:usize,
+ history:[Option<HistoryEntry>;HISTORY_LIMIT],
+ history_len:usize,
+ history_cursor:Option<usize>,
+ history_draft:[u8;MAX_LINE],
+ history_draft_len:usize,
 }
 impl InputLine{
  pub const fn new()->Self{
-  Self{editor:LineEditor::new(),clipboard:[0;MAX_LINE],clipboard_len:0}
+  Self{editor:LineEditor::new(),clipboard:[0;MAX_LINE],clipboard_len:0,
+   history:[None;HISTORY_LIMIT],history_len:0,history_cursor:None,
+   history_draft:[0;MAX_LINE],history_draft_len:0}
  }
  pub fn length(&self)->usize{self.editor.bytes().len()}
  pub fn bytes(&self)->&[u8]{self.editor.bytes()}
@@ -26,10 +36,14 @@ impl InputLine{
  pub fn clipboard_bytes(&self)->&[u8]{&self.clipboard[..self.clipboard_len]}
  /// Reset an executed draft without destroying the authenticated session's
  /// clipboard, which can be pasted into a subsequent command.
- pub fn reset(&mut self){self.editor.clear();}
+ pub fn reset(&mut self){
+  self.editor.clear();self.history_cursor=None;
+  self.history_draft.fill(0);self.history_draft_len=0;
+ }
  /// On crash/restart/exit erase all process-private command/clipboard bytes.
  pub fn forget(&mut self){
   self.reset();self.clipboard.fill(0);self.clipboard_len=0;
+  self.history.fill(None);self.history_len=0;
  }
  pub fn clear_line(&mut self){self.reset();}
  pub fn kill_line(&mut self)->Event{
@@ -93,11 +107,80 @@ impl InputLine{
   self.editor.paste(&self.clipboard[..self.clipboard_len])?;
   Ok(Event::Typed)
  }
+ /// Store only a successfully submitted command, never a failed/partial
+ /// draft. Adjacent duplicate commands are coalesced. Oldest commands
+ /// expire first and never survive process forget/teardown.
+ fn remember(&mut self,command:&[u8]){
+  if command.is_empty(){return;}
+  if self.history_len>0{
+   if let Some(last)=self.history[self.history_len-1]{
+    if &last.bytes[..last.len]==command{return;}
+   }
+  }
+  let mut entry=HistoryEntry{bytes:[0;MAX_LINE],len:command.len()};
+  entry.bytes[..command.len()].copy_from_slice(command);
+  if self.history_len==HISTORY_LIMIT{
+   for i in 1..HISTORY_LIMIT{self.history[i-1]=self.history[i];}
+   self.history[HISTORY_LIMIT-1]=Some(entry);
+  }else{
+   self.history[self.history_len]=Some(entry);
+   self.history_len+=1;
+  }
+ }
+ pub fn history_count(&self)->usize{self.history_len}
+ /// Navigate from a current, potentially unsaved draft toward older
+ /// successfully submitted commands. The draft is restored on navigation
+ /// forward past the newest entry.
+ pub fn history_previous(&mut self)->Result<usize,Error>{
+  if self.history_len==0{return Err(Error::Invalid);}
+  let next=match self.history_cursor{
+   Some(index)=>index.saturating_sub(1),
+   None=>{
+    self.history_draft.fill(0);
+    self.history_draft_len=self.length();
+    self.history_draft[..self.history_draft_len]
+     .copy_from_slice(self.editor.bytes());
+    self.history_len-1
+   }
+  };
+  let entry=self.history[next].ok_or(Error::Invalid)?;
+  self.editor.replace_line(&entry.bytes[..entry.len])?;
+  self.history_cursor=Some(next);
+  Ok(entry.len)
+ }
+ pub fn history_next(&mut self)->Result<usize,Error>{
+  let index=self.history_cursor.ok_or(Error::Invalid)?;
+  if index+1==self.history_len{
+   let n=self.history_draft_len;
+   self.editor.replace_line(&self.history_draft[..n])?;
+   self.history_cursor=None;self.history_draft.fill(0);
+   self.history_draft_len=0;return Ok(n);
+  }
+  let next=index+1;
+  let entry=self.history[next].ok_or(Error::Invalid)?;
+  self.editor.replace_line(&entry.bytes[..entry.len])?;
+  self.history_cursor=Some(next);
+  Ok(entry.len)
+ }
  pub fn feed(&mut self,key:u8,out:&mut[u8])->Result<Event,Error>{
   match key{
-   b'\n'|b'\r'=>self.editor.edit(EditKey::Submit,out),
-   8|127=>self.editor.edit(EditKey::Backspace,&mut[]),
-   b' '..=b'~'=>self.editor.edit(EditKey::Insert(key),&mut[]),
+   b'\n'|b'\r'=>{
+    let event=self.editor.edit(EditKey::Submit,out)?;
+    if let Event::Submitted(n)=event{
+     self.remember(&out[..n]);
+     self.history_cursor=None;
+     self.history_draft.fill(0);self.history_draft_len=0;
+    }
+    Ok(event)
+   },
+   8|127=>{
+    let event=self.editor.edit(EditKey::Backspace,&mut[])?;
+    self.history_cursor=None;Ok(event)
+   },
+   b' '..=b'~'=>{
+    let event=self.editor.edit(EditKey::Insert(key),&mut[])?;
+    self.history_cursor=None;Ok(event)
+   },
    _=>Err(Error::Invalid)
   }
  }
@@ -462,6 +545,51 @@ impl LineEditor{
   assert_eq!(line.clipboard_bytes(),b"cat");
   assert_eq!(line.replace_all_literal(b"notfound",b"z"),Ok(0));
   assert_eq!(line.bytes(),b"dog dog and dog");
+ }
+ #[test]fn r058_input_history_navigation_preserves_unsubmitted_draft(){
+  let mut line=InputLine::new();let mut out=[0u8;MAX_LINE];
+  for cmd in [b"pwd".as_slice(),b"ls",b"cat /a"]{
+   line.set_line(cmd).unwrap();
+   assert_eq!(line.feed(b'\n',&mut out),Ok(Event::Submitted(cmd.len())));
+  }
+  assert_eq!(line.history_count(),3);
+  line.set_line(b"new draft").unwrap();
+  assert_eq!(line.history_previous(),Ok(6));
+  assert_eq!(line.bytes(),b"cat /a");
+  assert_eq!(line.history_previous(),Ok(2));
+  assert_eq!(line.bytes(),b"ls");
+  assert_eq!(line.history_previous(),Ok(3));
+  assert_eq!(line.bytes(),b"pwd");
+  assert_eq!(line.history_previous(),Ok(3));
+  assert_eq!(line.history_next(),Ok(2));
+  assert_eq!(line.history_next(),Ok(6));
+  assert_eq!(line.history_next(),Ok(9));
+  assert_eq!(line.bytes(),b"new draft");
+  assert_eq!(line.history_next(),Err(Error::Invalid));
+ }
+ #[test]fn r058_history_excludes_failed_submit_and_dedupes_recents(){
+  let mut line=InputLine::new();let mut small=[0xaa;2];
+  line.set_line(b"long").unwrap();
+  assert_eq!(line.feed(b'\n',&mut small),Err(Error::TooSmall));
+  assert_eq!(line.history_count(),0);
+  assert_eq!(line.bytes(),b"long");
+  let mut out=[0u8;MAX_LINE];
+  assert_eq!(line.feed(b'\n',&mut out),Ok(Event::Submitted(4)));
+  line.set_line(b"long").unwrap();
+  line.feed(b'\n',&mut out).unwrap();
+  assert_eq!(line.history_count(),1);
+  for word in [b"one".as_slice(),b"two",b"three",b"four"]{
+   line.set_line(word).unwrap();line.feed(b'\n',&mut out).unwrap();
+  }
+  assert_eq!(line.history_count(),HISTORY_LIMIT);
+  assert_eq!(line.history_previous(),Ok(4));
+  assert_eq!(line.bytes(),b"four");
+  line.history_previous().unwrap();line.history_previous().unwrap();
+  assert_eq!(line.history_previous(),Ok(3));
+  assert_eq!(line.bytes(),b"one");
+  line.forget();
+  assert_eq!(line.history_count(),0);
+  assert_eq!(line.history_previous(),Err(Error::Invalid));
  }
  #[test]fn r042_kill_and_safe_restore_preserve_draft_invariants(){
   let mut line=InputLine::new();
