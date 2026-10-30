@@ -461,6 +461,62 @@ impl ProjectTree {
         self.edit_range(caller,fs,name,start,end,replacement.as_bytes())
     }
 
+    /// Reorder a complete block of UTF-8 source lines within one file.
+    /// Destination is the original one-based line before which the block
+    /// should appear, or line_count+1 to move it to EOF. All movement is
+    /// committed with ONE durable COW overwrite and cannot expose a
+    /// partially moved project file after a power loss.
+    pub fn move_source_lines<D:BlockDevice>(&mut self,caller:Identity,
+        fs:&mut HierVfs<D>,name:&str,first:usize,count:usize,before:usize
+    )->Result<usize,Error>{
+        self.check_fresh(caller,fs)?;
+        if first==0||count==0||before==0{return Err(Error::Invalid);}
+        let last=first.checked_add(count-1).ok_or(Error::Invalid)?;
+        let (p,n)=self.child(name)?;
+        let mut original=[0u8;MAX_FILE_BYTES];
+        let used=fs.read(Self::str_path(&p,n),&mut original)?;
+        let text=core::str::from_utf8(&original[..used]).map_err(|_|Error::Invalid)?;
+        // A file without a final newline can have ambiguous row boundaries
+        // after moving the last row. Deny instead of concatenating lines.
+        if !text.ends_with('\n'){return Err(Error::Invalid);}
+        let mut start=None;
+        let mut end=None;
+        let mut destination=None;
+        let mut pos=0usize;
+        let mut total=0usize;
+        for row in text.split_inclusive('\n'){
+            total+=1;
+            if total==first{start=Some(pos);}
+            if total==before{destination=Some(pos);}
+            pos+=row.len();
+            if total==last{end=Some(pos);}
+        }
+        if before==total.checked_add(1).ok_or(Error::Invalid)?{
+            destination=Some(used);
+        }
+        let (Some(start),Some(end),Some(dest))=(start,end,destination)
+            else{return Err(Error::Invalid)};
+        // Moving before a line inside the block or directly after the
+        // block has no visible effect and must not advance disk generation.
+        if dest>=start&&dest<=end{return Ok(used);}
+        let mut staged=[0u8;MAX_FILE_BYTES];
+        if dest<start{
+            staged[..dest].copy_from_slice(&original[..dest]);
+            let moved=end-start;
+            staged[dest..dest+moved].copy_from_slice(&original[start..end]);
+            staged[dest+moved..end].copy_from_slice(&original[dest..start]);
+            staged[end..used].copy_from_slice(&original[end..used]);
+        }else{
+            staged[..start].copy_from_slice(&original[..start]);
+            staged[start..start+dest-end].copy_from_slice(&original[end..dest]);
+            staged[start+dest-end..dest].copy_from_slice(&original[start..end]);
+            staged[dest..used].copy_from_slice(&original[dest..used]);
+        }
+        fs.overwrite(Self::str_path(&p,n),&staged[..used])?;
+        self.generation=fs.generation();
+        Ok(used)
+    }
+
     /// Read-only source checksum for a revision-sensitive build cache.
     /// FNV is not cryptographic and must never authenticate executable bytes.
     pub fn source_checksum<D: BlockDevice>(&self, caller: Identity,
@@ -594,6 +650,42 @@ mod tests {
         let mut out=[0u8;32];
         let n=p.open_source(a(),&mut fs,"main",&mut out).unwrap();
         assert_eq!(&out[..n],b"alpha\nbeta\n");
+    }
+    #[test]
+    fn r058_move_unicode_source_lines_forward_and_backward_survives_remount(){
+        let mut fs=fresh();let mut p=ProjectTree::new();
+        p.create(a(),&mut fs,"demo").unwrap();
+        p.create_file(a(),&mut fs,"main","one\nβeta\nthree\n四\n".as_bytes()).unwrap();
+        let n=p.move_source_lines(a(),&mut fs,"main",2,1,5).unwrap();
+        assert_eq!(n,"one\nthree\n四\nβeta\n".len());
+        let mut out=[0u8;64];
+        p.open_source(a(),&mut fs,"main",&mut out).unwrap();
+        assert_eq!(&out[..n],"one\nthree\n四\nβeta\n".as_bytes());
+        p.close(a()).unwrap();
+        let mut remounted=HierVfs::mount(fs.into_device()).unwrap();
+        let mut reopened=ProjectTree::new();
+        reopened.open(a(),&mut remounted,"demo").unwrap();
+        let size=reopened.move_source_lines(a(),&mut remounted,"main",4,1,1).unwrap();
+        assert_eq!(size,n);
+        let count=reopened.open_source(a(),&mut remounted,"main",&mut out).unwrap();
+        assert_eq!(&out[..count],"βeta\none\nthree\n四\n".as_bytes());
+    }
+    #[test]
+    fn r058_line_move_noop_invalid_and_stale_are_disk_atomic(){
+        let mut fs=fresh();let mut p=ProjectTree::new();
+        p.create(a(),&mut fs,"demo").unwrap();
+        p.create_file(a(),&mut fs,"main",b"a\nb\nc\n").unwrap();
+        let generation=fs.generation();
+        assert_eq!(p.move_source_lines(a(),&mut fs,"main",2,1,2),Ok(6));
+        assert_eq!(p.move_source_lines(a(),&mut fs,"main",2,1,3),Ok(6));
+        assert_eq!(p.move_source_lines(a(),&mut fs,"main",0,1,2),Err(Error::Invalid));
+        assert_eq!(p.move_source_lines(a(),&mut fs,"main",2,2,5),Err(Error::Invalid));
+        assert_eq!(p.move_source_lines(stale_id(),&mut fs,"main",2,1,1),
+                   Err(Error::Unauthorized));
+        assert_eq!(fs.generation(),generation);
+        let mut out=[0u8;8];
+        assert_eq!(p.open_source(a(),&mut fs,"main",&mut out),Ok(6));
+        assert_eq!(&out[..6],b"a\nb\nc\n");
     }
     #[test]
     fn r043_project_line_errors_and_short_output_are_atomic(){

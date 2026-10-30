@@ -18,7 +18,7 @@ pub const MAX_COMMAND:usize=192;
 pub const COMMAND_VERBS:&[&str]=&[
  "help","pwd","tools","ls","cat","write","append","mkdir","mv",
  "cp","rm","mkfile","truncate","head","count","rmdir","mvdir",
- "pread","pwrite","lines","hash","stat","tail","find","grep","cmp",
+ "pread","pwrite","lines","line","hash","stat","tail","find","grep","cmp",
  "touch","copynew","replace","appendln","health",
 ];
 /// Complete exactly one printable lower-case verb prefix. Ambiguous matches,
@@ -91,7 +91,7 @@ pub fn command<D:BlockDevice,const N:usize>(
  let line=entered.trim_end();
  if line=="help"{return publish(b"pwd ls /dir cat /path write /path text append /path text mkdir /dir mv /old /new cp /src /dst rm /path mkfile /path truncate /path head /path count rmdir /dir mvdir /old /new pread /file offset count pwrite /file@offset text",out);}
  if line=="pwd"{return publish(b"/",out);}
- if line=="tools"{return publish(b"count lines tail find grep hash cmp stat touch copynew replace appendln health",out);}
+ if line=="tools"{return publish(b"count lines line tail find grep hash cmp stat touch copynew replace appendln health",out);}
  if line=="health"{
   auth.require(caller,FILE_READ,now).map_err(|_|Error::Denied)?;
   let health=fs.mounted_health().map_err(Error::Io)?;
@@ -144,6 +144,22 @@ pub fn command<D:BlockDevice,const N:usize>(
     },
     _=>Err(Error::Unknown)
    }
+  }
+  // Return one UTF-8 row from an authenticated persistent source file.
+  // Never publish an output prefix if UTF-8, row bounds or destination
+  // capacity validation fails. A final newline adds no phantom row.
+  "line"=>{
+   auth.require(caller,FILE_READ,now).map_err(|_|Error::Denied)?;
+   let (source,row)=raw.split_once(' ').ok_or(Error::Invalid)?;
+   let number=row.parse::<usize>().map_err(|_|Error::Invalid)?;
+   if number==0{return Err(Error::Invalid);}
+   let p=path(source,&mut name)?;
+   let mut bytes=[0u8;crate::durablefs::MAX_FILE_BYTES];
+   let count=fs.read(p,&mut bytes).map_err(Error::Io)?;
+   let text=core::str::from_utf8(&bytes[..count]).map_err(|_|Error::Invalid)?;
+   let selected=text.split_terminator('\n').nth(number-1)
+    .ok_or(Error::Invalid)?;
+   publish(selected.as_bytes(),out)
   }
   "tail"=>{
    auth.require(caller,FILE_READ,now).map_err(|_|Error::Denied)?;
@@ -672,6 +688,35 @@ mod tests{
   let size=command(fs,access,who,1,cmd,&mut out)?;
   Ok((size,out))
  }
+ #[test]fn r058_line_inspection_survives_disk_remount_and_unicode(){
+  let mut fs=HierVfs::format_blank(blank()).unwrap();let auth=grants();
+  fs.create("/source","alpha\nβeta\nthird\n".as_bytes()).unwrap();
+  let generation=fs.generation();
+  let (n,out)=run(&mut fs,&auth,user(),b"line /source 2").unwrap();
+  assert_eq!(&out[..n],"βeta".as_bytes());
+  assert_eq!(fs.generation(),generation);
+  assert_eq!(run(&mut fs,&auth,user(),b"line /source 4"),Err(Error::Invalid));
+  fs=HierVfs::mount(fs.into_device()).unwrap();
+  let (n,out)=run(&mut fs,&auth,user(),b"line /source 3").unwrap();
+  assert_eq!(&out[..n],b"third");
+  assert_eq!(fs.generation(),generation);
+ }
+ #[test]fn r058_line_selection_rejects_bad_rows_stale_owner_short_buffer(){
+  let mut fs=HierVfs::format_blank(blank()).unwrap();let auth=grants();
+  fs.create("/source",b"first\nsecond\n").unwrap();
+  let generation=fs.generation();
+  let mut short=[0xa5;3];
+  assert_eq!(command(&mut fs,&auth,user(),1,b"line /source 2",&mut short),
+   Err(Error::OutputTooSmall));
+  assert_eq!(short,[0xa5;3]);
+  let foreign=Identity{generation:2,..user()};
+  assert_eq!(run(&mut fs,&auth,foreign,b"line /source 1"),Err(Error::Denied));
+  for bad in [b"line /source 0".as_slice(),b"line /source 9",
+              b"line /../source 1",b"line /source -1"]{
+   assert_eq!(run(&mut fs,&auth,user(),bad),Err(Error::Invalid));
+  }
+  assert_eq!(fs.generation(),generation);
+ }
  #[test]fn m1_terminal_typed_literal_spaces_survive_each_disk_remount(){
   use crate::m1_input::{InputLine,Event,MAX_LINE};
   let mut fs=HierVfs::format_blank(blank()).unwrap();let auth=grants();
@@ -779,7 +824,7 @@ mod tests{
   assert_eq!(complete_verb(b"heal"),Some("health"));
  }
  #[test]fn r044_command_registry_drives_unique_safe_completion(){
-  assert_eq!(COMMAND_VERBS.len(),31);
+  assert_eq!(COMMAND_VERBS.len(),32);
   for (i,verb) in COMMAND_VERBS.iter().enumerate(){
    assert!(verb.as_bytes().iter().all(|b|b.is_ascii_lowercase()));
    assert!(!COMMAND_VERBS[..i].contains(verb));
