@@ -143,7 +143,11 @@ impl FileHandles{
             // closing and reopening the handle.
             return Err(FsError::InvalidName);
         }
-        let n=match fs.read_at(h.pathname(),h.offset,out){
+        // Stage the read into a bounded private buffer. The underlying
+        // filesystem may return an I/O error after touching its destination:
+        // no prefix or corrupt device bytes may leak to the caller.
+        let mut scratch=[0u8;72];
+        let n=match fs.read_at(h.pathname(),h.offset,&mut scratch[..out.len()]){
             Ok(n)=>n,
             Err(error)=>{
                 // An I/O or damaged-volume error makes the on-disk identity
@@ -155,8 +159,10 @@ impl FileHandles{
                 return Err(error);
             }
         };
-        self.entries[slot].offset=h.offset.checked_add(n as u64)
+        let next=h.offset.checked_add(n as u64)
             .ok_or(FsError::TooLarge)?;
+        out[..n].copy_from_slice(&scratch[..n]);
+        self.entries[slot].offset=next;
         Ok(n)
     }
     pub fn write<D:BlockDevice>(&mut self,pid:u32,token:u64,
@@ -875,6 +881,54 @@ mod tests{
         assert_ne!(new_fd,fd);
         assert_eq!(table.read(1,new_fd,&mut out,&mut fs),Ok(7));
         assert_eq!(&out[..7],b"persist");
+    }
+    #[test]fn m1_r056_faulted_read_does_not_publish_device_dirtied_bytes(){
+        use std::{cell::Cell,rc::Rc};
+        struct DirtyDisk{disk:Disk,fail:Rc<Cell<bool>>}
+        impl BlockDevice for DirtyDisk{
+            fn sector_count(&self)->u64{self.disk.sector_count()}
+            fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+                ->Result<(),BlockError>{
+                if self.fail.get(){
+                    out.fill(0x1f);
+                    return Err(BlockError::Io);
+                }
+                self.disk.read_sector(lba,out)
+            }
+            fn write_sector(&mut self,lba:u64,bytes:&[u8;SECTOR_BYTES])
+                ->Result<(),BlockError>{self.disk.write_sector(lba,bytes)}
+        }
+        let fail=Rc::new(Cell::new(false));
+        let mut fs=HierVfs::format_blank(DirtyDisk{
+            disk:Disk{sectors:[[0;SECTOR_BYTES];COUNT]},fail:fail.clone()
+        }).unwrap();
+        fs.mkdir("/shared").unwrap();
+        fs.create("/shared/note",b"durable").unwrap();
+        let mut handles=FileHandles::new();
+        let token=handles.open(1,"/shared/note",READ,&mut fs).unwrap();
+        let mut output=[0xa7;24];
+        fail.set(true);
+        assert_eq!(handles.read(1,token,&mut output,&mut fs),Err(FsError::Io));
+        assert_eq!(output,[0xa7;24]);
+        fail.set(false);
+        assert_eq!(handles.read(1,token,&mut output,&mut fs),
+                   Err(FsError::InvalidName));
+        let reopened=handles.open(1,"/shared/note",READ,&mut fs).unwrap();
+        assert_eq!(handles.read(1,reopened,&mut output,&mut fs),Ok(7));
+        assert_eq!(&output[..7],b"durable");
+        assert_eq!(&output[7..],&[0xa7;17]);
+    }
+    #[test]fn m1_r056_successful_short_read_preserves_output_tail(){
+        let mut fs=fresh();fs.mkdir("/shared").unwrap();
+        fs.create("/shared/note",b"five!").unwrap();
+        let mut handles=FileHandles::new();
+        let fd=handles.open(1,"/shared/note",READ,&mut fs).unwrap();
+        let mut out=[0xa9;16];
+        assert_eq!(handles.read(1,fd,&mut out,&mut fs),Ok(5));
+        assert_eq!(&out[..5],b"five!");
+        assert_eq!(&out[5..],&[0xa9;11]);
+        assert_eq!(handles.read(1,fd,&mut out,&mut fs),Ok(0));
+        assert_eq!(&out[5..],&[0xa9;11]);
     }
     #[test]fn m1_r053_invalid_read_count_preserves_valid_handle(){
         let mut fs=fresh();fs.mkdir("/shared").unwrap();

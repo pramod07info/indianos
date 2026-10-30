@@ -474,6 +474,28 @@ impl<const W:usize,const Q:usize> Broker<W,Q>{
   self.grant_epoch=epoch;
   Ok(())
  }
+ /// Transfer several crashed-app windows to replacement owners as one
+ /// transaction. Previously queued input for every old binding is erased;
+ /// unrelated windows, event order and global sequence are untouched.
+ /// The coordinator must retire old owner resources before publishing
+ /// any new compositor surfaces, and must serialize this with input IRQs.
+ pub fn reassign_batch(&mut self,requests:&[(u32,u32,u32)])
+  ->Result<usize,Error>{
+  if requests.is_empty()||requests.len()>W{return Err(Error::Invalid);}
+  let mut pending=Self{windows:self.windows,events:self.events,
+   len:self.len,sequence:self.sequence,grant_epoch:self.grant_epoch};
+  for (index,&(old_owner,new_owner,window)) in requests.iter().enumerate(){
+   if requests[..index].iter().any(|&(_,_,prior_window)|prior_window==window){
+    return Err(Error::Duplicate);
+   }
+   pending.reassign_window(old_owner,new_owner,window)?;
+  }
+  self.windows=pending.windows;
+  self.events=pending.events;
+  self.len=pending.len;
+  self.grant_epoch=pending.grant_epoch;
+  Ok(requests.len())
+ }
 }
 #[cfg(test)]
 mod orbit_r005_broker_tests{
@@ -493,6 +515,39 @@ mod orbit_r005_broker_tests{
   assert_eq!(b.peek(2),Ok(peer));
   assert_eq!(b.post_focus(1,10),Err(Error::Unauthorized));
   assert_eq!(b.post_focus(3,10).unwrap().owner,3);
+ }
+ #[test]fn m1_r056_multi_window_recovery_erases_old_input_but_preserves_peer(){
+  let mut b=Broker::<4,8>::new();
+  b.grant_batch(&[(3,10),(3,11),(4,20)]).unwrap();
+  b.post_focus(3,10).unwrap();
+  b.post_pointer_focus(3,11).unwrap();
+  let peer=b.post_focus(4,20).unwrap();
+  assert_eq!(b.reassign_batch(&[(3,5,10),(3,5,11)]),Ok(2));
+  assert_eq!(b.owner(10),Some(5));
+  assert_eq!(b.owner(11),Some(5));
+  assert_eq!(b.pending_owner(5),Ok(0));
+  assert_eq!(b.pending_owner(4),Ok(1));
+  assert_eq!(b.peek(4),Ok(peer));
+  assert_eq!(b.post_focus(3,10),Err(Error::Unauthorized));
+  assert!(b.post_focus(5,10).unwrap().sequence>peer.sequence);
+ }
+ #[test]fn m1_r056_invalid_transfer_batch_never_reassigns_partial_windows(){
+  let mut b=Broker::<4,8>::new();
+  b.grant_batch(&[(3,10),(3,11),(4,20)]).unwrap();
+  let old=b.post_focus(3,10).unwrap();
+  for changes in [
+   [(3,5,10),(4,5,11)],
+   [(3,5,10),(3,6,10)],
+   [(3,5,10),(3,5,999)]
+  ]{
+   assert!(b.reassign_batch(&changes).is_err());
+   assert_eq!(b.owner(10),Some(3));
+   assert_eq!(b.owner(11),Some(3));
+   assert_eq!(b.peek(3),Ok(old));
+   assert!(!b.known(5));
+  }
+  assert_eq!(b.reassign_batch(&[]),Err(Error::Invalid));
+  assert_eq!(b.post_pointer_focus(3,10).unwrap().sequence,old.sequence+1);
  }
  #[test]fn invalid_revocation_batch_cannot_destroy_any_grants(){
   let mut b=Broker::<3,4>::new();b.grant_batch(&[(1,10),(1,11),(2,20)]).unwrap();

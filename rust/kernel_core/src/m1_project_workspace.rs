@@ -430,6 +430,37 @@ impl ProjectTree {
             .unwrap_or(count-start);
         self.edit_range(caller,fs,name,start,end,b"")
     }
+    /// Replace a consecutive set of complete one-based source lines with
+    /// UTF-8 text through one durable COW commit. The insertion may itself
+    /// contain several newline-separated lines. No changes occur for missing
+    /// lines, expired owner generations, invalid ranges or oversize results.
+    /// Both the first and last selected line are included.
+    pub fn replace_source_lines<D:BlockDevice>(&mut self,caller:Identity,
+        fs:&mut HierVfs<D>,name:&str,first_line:usize,remove_count:usize,
+        replacement:&str
+    )->Result<usize,Error>{
+        self.check_fresh(caller,fs)?;
+        if first_line==0||remove_count==0{return Err(Error::Invalid);}
+        let last=first_line.checked_add(remove_count-1).ok_or(Error::Invalid)?;
+        let (path,n)=self.child(name)?;
+        let mut old=[0u8;MAX_FILE_BYTES];
+        let used=fs.read(Self::str_path(&path,n),&mut old)?;
+        let source=core::str::from_utf8(&old[..used]).map_err(|_|Error::Invalid)?;
+        let mut cursor=0usize;
+        let mut start=None;
+        let mut end=None;
+        // split_inclusive does not fabricate a trailing empty line after
+        // a final newline, consistent with source_lines() and read_source_line().
+        for (i,line) in source.split_inclusive('\n').enumerate(){
+            let number=i+1;
+            if number==first_line{start=Some(cursor);}
+            cursor+=line.len(); // already bounded by MAX_FILE_BYTES
+            if number==last{end=Some(cursor);break;}
+        }
+        let (Some(start),Some(end))=(start,end)else{return Err(Error::Invalid)};
+        self.edit_range(caller,fs,name,start,end,replacement.as_bytes())
+    }
+
     /// Read-only source checksum for a revision-sensitive build cache.
     /// FNV is not cryptographic and must never authenticate executable bytes.
     pub fn source_checksum<D: BlockDevice>(&self, caller: Identity,
@@ -521,6 +552,48 @@ mod tests {
             Err(Error::Invalid));
         assert_eq!(p.source_offset(a(),&mut fs,"empty",1,1),Err(Error::Invalid));
         assert_eq!(out,[0x55;4]);
+    }
+    #[test]
+    fn m1_r056_replace_complete_unicode_lines_survives_real_remount(){
+        let mut fs=fresh();let mut p=ProjectTree::new();
+        p.create(a(),&mut fs,"demo").unwrap();
+        p.create_file(a(),&mut fs,"main","one\nβeta\nthree\n".as_bytes()).unwrap();
+        let wanted="one\nB\nC\nthree\n";
+        assert_eq!(p.replace_source_lines(a(),&mut fs,"main",2,1,"B\nC\n"),
+                   Ok(wanted.len()));
+        p.close(a()).unwrap();
+        let mut remounted=HierVfs::mount(fs.into_device()).unwrap();
+        let mut reopened=ProjectTree::new();
+        reopened.open(a(),&mut remounted,"demo").unwrap();
+        let mut out=[0u8;64];
+        let len=reopened.open_source(a(),&mut remounted,"main",&mut out).unwrap();
+        assert_eq!(&out[..len],wanted.as_bytes());
+        assert_eq!(reopened.source_lines(a(),&mut remounted,"main"),Ok(4));
+        assert_eq!(reopened.replace_source_lines(a(),&mut remounted,
+           "main",3,2,"last"),Ok("one\nB\nlast".len()));
+        let len=reopened.open_source(a(),&mut remounted,"main",&mut out).unwrap();
+        assert_eq!(&out[..len],b"one\nB\nlast");
+    }
+    #[test]
+    fn m1_r056_invalid_multiline_edit_never_changes_durable_generation(){
+        let mut fs=fresh();let mut p=ProjectTree::new();
+        p.create(a(),&mut fs,"demo").unwrap();
+        p.create_file(a(),&mut fs,"main",b"alpha\nbeta\n").unwrap();
+        let generation=fs.generation();
+        assert_eq!(p.replace_source_lines(a(),&mut fs,"main",3,1,"bad\n"),
+                   Err(Error::Invalid));
+        assert_eq!(p.replace_source_lines(a(),&mut fs,"main",1,0,"bad\n"),
+                   Err(Error::Invalid));
+        assert_eq!(p.replace_source_lines(a(),&mut fs,"main",usize::MAX,2,"bad\n"),
+                   Err(Error::Invalid));
+        assert_eq!(p.replace_source_lines(stale_id(),&mut fs,"main",1,1,"bad\n"),
+                   Err(Error::Unauthorized));
+        assert_eq!(p.replace_source_lines(a(),&mut fs,"main",1,1,
+                    &"x".repeat(MAX_FILE_BYTES+1)),Err(Error::Full));
+        assert_eq!(fs.generation(),generation);
+        let mut out=[0u8;32];
+        let n=p.open_source(a(),&mut fs,"main",&mut out).unwrap();
+        assert_eq!(&out[..n],b"alpha\nbeta\n");
     }
     #[test]
     fn r043_project_line_errors_and_short_output_are_atomic(){
