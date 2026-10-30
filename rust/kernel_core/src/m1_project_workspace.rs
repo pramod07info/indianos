@@ -517,6 +517,51 @@ impl ProjectTree {
         Ok(used)
     }
 
+    /// Atomically indent or unindent a range of complete UTF-8 source rows.
+    /// Positive delta adds ASCII spaces; negative delta removes that many
+    /// leading spaces from EACH selected row (otherwise rejects the edit).
+    /// No intermediate COW generation or half-indented source is exposed.
+    pub fn adjust_source_indent<D:BlockDevice>(&mut self,caller:Identity,
+        fs:&mut HierVfs<D>,name:&str,first:usize,count:usize,delta:i8
+    )->Result<usize,Error>{
+        self.check_fresh(caller,fs)?;
+        if first==0||count==0||delta==0||!(-8..=8).contains(&delta){
+            return Err(Error::Invalid);
+        }
+        let last=first.checked_add(count-1).ok_or(Error::Invalid)?;
+        let (p,n)=self.child(name)?;
+        let mut original=[0u8;MAX_FILE_BYTES];
+        let used=fs.read(Self::str_path(&p,n),&mut original)?;
+        let source=core::str::from_utf8(&original[..used]).map_err(|_|Error::Invalid)?;
+        if source.is_empty(){return Err(Error::Invalid);}
+        let depth=delta.unsigned_abs() as usize;
+        let mut updated=[0u8;MAX_FILE_BYTES];
+        let mut length=0usize;
+        let mut seen=0usize;
+        for (i,row) in source.split_inclusive('\n').enumerate(){
+            let selected=(first..=last).contains(&(i+1));
+            let bytes=row.as_bytes();
+            let contents=if selected&&delta<0{
+                if bytes.len()<depth||!bytes[..depth].iter().all(|b|*b==b' '){
+                    return Err(Error::Invalid);
+                }
+                &bytes[depth..]
+            }else{bytes};
+            let padding=if selected&&delta>0{depth}else{0};
+            let next=length.checked_add(padding)
+                .and_then(|at|at.checked_add(contents.len())).ok_or(Error::Full)?;
+            if next>MAX_FILE_BYTES{return Err(Error::Full);}
+            updated[length..length+padding].fill(b' ');
+            updated[length+padding..next].copy_from_slice(contents);
+            length=next;
+            if selected{seen+=1;}
+        }
+        if seen!=count{return Err(Error::Invalid);}
+        fs.overwrite(Self::str_path(&p,n),&updated[..length])?;
+        self.generation=fs.generation();
+        Ok(length)
+    }
+
     /// Read-only source checksum for a revision-sensitive build cache.
     /// FNV is not cryptographic and must never authenticate executable bytes.
     pub fn source_checksum<D: BlockDevice>(&self, caller: Identity,
@@ -686,6 +731,46 @@ mod tests {
         let mut out=[0u8;8];
         assert_eq!(p.open_source(a(),&mut fs,"main",&mut out),Ok(6));
         assert_eq!(&out[..6],b"a\nb\nc\n");
+    }
+    #[test]
+    fn r059_durable_unicode_indent_then_unindent_survives_remount(){
+        let mut fs=fresh();let mut p=ProjectTree::new();
+        p.create(a(),&mut fs,"demo").unwrap();
+        p.create_file(a(),&mut fs,"main","alpha\nβeta\nγamma\nz".as_bytes()).unwrap();
+        let n=p.adjust_source_indent(a(),&mut fs,"main",2,2,2).unwrap();
+        let mut out=[0u8;64];
+        assert_eq!(p.open_source(a(),&mut fs,"main",&mut out),Ok(n));
+        assert_eq!(&out[..n],"alpha\n  βeta\n  γamma\nz".as_bytes());
+        p.close(a()).unwrap();
+        let mut disk=HierVfs::mount(fs.into_device()).unwrap();
+        let mut reopened=ProjectTree::new();
+        reopened.open(a(),&mut disk,"demo").unwrap();
+        let n=reopened.adjust_source_indent(a(),&mut disk,"main",2,2,-2).unwrap();
+        assert_eq!(reopened.open_source(a(),&mut disk,"main",&mut out),Ok(n));
+        assert_eq!(&out[..n],"alpha\nβeta\nγamma\nz".as_bytes());
+    }
+    #[test]
+    fn r059_bad_indent_and_oversize_leave_disk_generation_unchanged(){
+        let mut fs=fresh();let mut p=ProjectTree::new();
+        p.create(a(),&mut fs,"demo").unwrap();
+        p.create_file(a(),&mut fs,"main",b"plain\n  indented\n").unwrap();
+        let generation=fs.generation();
+        assert_eq!(p.adjust_source_indent(a(),&mut fs,"main",1,2,-2),
+                   Err(Error::Invalid));
+        assert_eq!(p.adjust_source_indent(a(),&mut fs,"main",1,3,2),
+                   Err(Error::Invalid));
+        assert_eq!(p.adjust_source_indent(stale_id(),&mut fs,"main",1,1,2),
+                   Err(Error::Unauthorized));
+        assert_eq!(p.adjust_source_indent(a(),&mut fs,"main",1,1,0),
+                   Err(Error::Invalid));
+        assert_eq!(fs.generation(),generation);
+        let mut out=[0u8;32];let n=p.open_source(a(),&mut fs,"main",&mut out).unwrap();
+        assert_eq!(&out[..n],b"plain\n  indented\n");
+        p.create_file(a(),&mut fs,"full",&[b'x';MAX_FILE_BYTES]).unwrap();
+        let generation=fs.generation();
+        assert_eq!(p.adjust_source_indent(a(),&mut fs,"full",1,1,1),
+                   Err(Error::Full));
+        assert_eq!(fs.generation(),generation);
     }
     #[test]
     fn r043_project_line_errors_and_short_output_are_atomic(){

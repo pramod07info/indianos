@@ -211,6 +211,26 @@ impl<const N:usize> RamFs<N>{
   let next=self.version.checked_add(1).ok_or(Error::Exhausted)?;
   self.files[index]=None;self.version=next;Ok(next)
  }
+ /// Delete several individually versioned files as one RAM transaction.
+ /// The global revision and each observed file revision must still match.
+ /// Duplicate paths or an unavailable/changed file roll back the entire
+ /// operation, including the global version counter. The kernel caller
+ /// must enforce WRITE capability for every path before invoking this API.
+ pub fn delete_batch_if_revision(&mut self,expected_global:u64,
+  files:&[(&[u8],u64)])->Result<u64,Error>{
+  if files.is_empty()||files.len()>N||expected_global!=self.version{
+   return Err(Error::Invalid);
+  }
+  let mut staged=Self{files:self.files,version:self.version};
+  for (i,&(path,expected_file)) in files.iter().enumerate(){
+   if files[..i].iter().any(|&(prior,_)|prior==path){
+    return Err(Error::Invalid);
+   }
+   staged.delete_if_version(path,expected_file)?;
+  }
+  *self=staged;
+  Ok(self.version)
+ }
  /// Fail closed for duplicate destinations, stale file versions and bad
  /// paths. No source is destroyed until every precondition has passed.
  pub fn rename_if_version(&mut self,from:&[u8],to:&[u8],
@@ -242,6 +262,51 @@ impl<const N:usize> RamFs<N>{
   file.path=[0;PATH_MAX];file.path[..to.len()].copy_from_slice(to);
   file.path_len=to.len();file.version=next;
   self.files[dest]=Some(file);self.version=next;Ok(next)
+ }
+}
+#[cfg(test)]
+mod r059_batch_delete_tests{
+ use super::*;
+ #[test]fn r059_remove_two_versioned_files_and_preserve_unrelated_data(){
+  let mut fs=RamFs::<4>::new();
+  let a=fs.replace(b"/one",b"data").unwrap();
+  let b=fs.replace(b"/two",b"secret").unwrap();
+  fs.replace(b"/peer",b"untouched").unwrap();
+  let current=fs.version();
+  assert_eq!(fs.delete_batch_if_revision(current,&[(b"/one",a),(b"/two",b)]),
+    Ok(current+2));
+  assert_eq!(fs.count(),1);
+  assert_eq!(fs.metadata(b"/one"),Err(Error::NotFound));
+  let mut out=[0u8;16];assert_eq!(fs.read(b"/peer",0,&mut out),Ok(9));
+  assert_eq!(&out[..9],b"untouched");
+ }
+ #[test]fn r059_stale_second_file_and_duplicate_request_rollback_all(){
+  let mut fs=RamFs::<4>::new();
+  let a=fs.replace(b"/one",b"original").unwrap();
+  let b=fs.replace(b"/two",b"keep").unwrap();
+  let generation=fs.version();
+  assert_eq!(fs.delete_batch_if_revision(generation,
+    &[(b"/one",a),(b"/two",b+1)]),Err(Error::Invalid));
+  assert_eq!(fs.version(),generation);
+  assert_eq!(fs.metadata(b"/one"),Ok((a,8)));
+  assert_eq!(fs.delete_batch_if_revision(generation,
+    &[(b"/one",a),(b"/one",a)]),Err(Error::Invalid));
+  assert_eq!(fs.version(),generation);
+  assert_eq!(fs.count(),2);
+  assert_eq!(fs.delete_batch_if_revision(generation-1,&[(b"/one",a)]),
+    Err(Error::Invalid));
+ }
+ #[test]fn r059_missing_and_malformed_paths_do_not_delete_valid_entry(){
+  let mut fs=RamFs::<3>::new();
+  let a=fs.replace(b"/one",b"safe").unwrap();
+  assert_eq!(fs.delete_batch_if_revision(a,&[(b"/one",a),(b"/gone",7)]),
+    Err(Error::NotFound));
+  assert_eq!(fs.delete_batch_if_revision(a,&[(b"/one",a),(b"/../bad",1)]),
+    Err(Error::Invalid));
+  assert_eq!(fs.delete_batch_if_revision(a,&[]),Err(Error::Invalid));
+  let mut out=[0u8;8];assert_eq!(fs.read(b"/one",0,&mut out),Ok(4));
+  assert_eq!(&out[..4],b"safe");
+  assert_eq!(fs.version(),a);
  }
 }
 #[cfg(test)]

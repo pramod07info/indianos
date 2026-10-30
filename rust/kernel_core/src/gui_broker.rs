@@ -417,6 +417,39 @@ impl<const N: usize> SurfaceLayout<N> {
         self.next_epoch=staged.next_epoch;
         Ok(requests.len())
     }
+    /// Reposition and resize a collection of trusted application surfaces
+    /// in one transaction. Every target must be fully inside the desktop
+    /// and owned by its original process; duplicate windows are forbidden.
+    /// A failed late validation does not change ANY geometry or epoch.
+    /// A no-op resize intentionally does not generate redraw epochs.
+    pub fn set_geometry_batch(&mut self,
+        requests:&[(u32,u32,crate::agent_05_surface_rect::Rectangle)]
+    )->Result<usize,Error>{
+        if requests.is_empty()||requests.len()>N{return Err(Error::Invalid);}
+        let mut staged=Self{surfaces:self.surfaces,epochs:self.epochs,
+            next_epoch:self.next_epoch};
+        for (i,&(owner,window,rectangle)) in requests.iter().enumerate(){
+            if requests[..i].iter().any(|&(_,prior,_)|prior==window){
+                return Err(Error::Duplicate);
+            }
+            let index=staged.surfaces.iter().position(|slot|
+                slot.is_some_and(|s|s.owner==owner&&s.window==window))
+                .ok_or(Error::Unauthorized)?;
+            crate::agent_05_surface_rect::clip_owned(
+                rectangle,rectangle,owner,owner).map_err(|_|Error::Invalid)?;
+            let previous=staged.surfaces[index].ok_or(Error::Unauthorized)?;
+            if previous.rectangle!=rectangle{
+                let epoch=staged.next_epoch.checked_add(1).ok_or(Error::Exhausted)?;
+                staged.surfaces[index]=Some(OwnedSurface{owner,window,rectangle});
+                staged.epochs[index]=epoch;
+                staged.next_epoch=epoch;
+            }
+        }
+        self.surfaces=staged.surfaces;
+        self.epochs=staged.epochs;
+        self.next_epoch=staged.next_epoch;
+        Ok(requests.len())
+    }
     pub fn revoke(&mut self, owner: u32) {
         if owner == 0 { return; }
         for slot in &mut self.surfaces {
@@ -474,6 +507,45 @@ mod batch1_surface_layout_tests {
         assert_eq!(layout.geometry(6,200),Ok(second));
         assert_eq!(layout.epoch(5,100),before_a);
         assert_eq!(layout.epoch(6,200),before_b);
+    }
+    #[test]
+    fn r059_atomic_batch_resize_and_reposition_updates_owned_surface_epochs(){
+        let mut layout=SurfaceLayout::<3>::new();
+        let old=Rectangle{x:5,y:10,width:30,height:25};
+        let peer=Rectangle{x:50,y:50,width:40,height:35};
+        layout.grant(1,10,old).unwrap();layout.grant(2,20,peer).unwrap();
+        let old_epoch=layout.epoch(1,10).unwrap();
+        let peer_epoch=layout.epoch(2,20).unwrap();
+        let bigger=Rectangle{x:9,y:15,width:90,height:55};
+        assert_eq!(layout.set_geometry_batch(&[(1,10,bigger),(2,20,peer)]),Ok(2));
+        assert_eq!(layout.geometry(1,10),Ok(bigger));
+        assert_eq!(layout.geometry(2,20),Ok(peer));
+        assert!(layout.epoch(1,10).unwrap()>old_epoch);
+        assert_eq!(layout.epoch(2,20),Some(peer_epoch));
+        let current=layout.epoch(1,10);
+        assert_eq!(layout.set_geometry_batch(&[(1,10,bigger)]),Ok(1));
+        assert_eq!(layout.epoch(1,10),current);
+    }
+    #[test]
+    fn r059_invalid_second_resize_rolls_back_first_window_and_epochs(){
+        let mut layout=SurfaceLayout::<3>::new();
+        let a=Rectangle{x:10,y:10,width:40,height:30};
+        let b=Rectangle{x:80,y:60,width:20,height:20};
+        layout.grant(3,30,a).unwrap();layout.grant(4,40,b).unwrap();
+        let old_a=layout.epoch(3,30);let old_b=layout.epoch(4,40);
+        let valid=Rectangle{x:10,y:10,width:60,height:45};
+        let bad=Rectangle{x:1270,y:4,width:20,height:20};
+        assert_eq!(layout.set_geometry_batch(&[(3,30,valid),(4,40,bad)]),
+                   Err(Error::Invalid));
+        assert_eq!(layout.set_geometry_batch(&[(3,30,valid),(9,40,b)]),
+                   Err(Error::Unauthorized));
+        assert_eq!(layout.set_geometry_batch(&[(3,30,valid),(3,30,a)]),
+                   Err(Error::Duplicate));
+        assert_eq!(layout.set_geometry_batch(&[]),Err(Error::Invalid));
+        assert_eq!(layout.geometry(3,30),Ok(a));
+        assert_eq!(layout.geometry(4,40),Ok(b));
+        assert_eq!(layout.epoch(3,30),old_a);
+        assert_eq!(layout.epoch(4,40),old_b);
     }
     #[test]
     fn teardown_prevents_reused_window_from_inheriting_geometry() {
