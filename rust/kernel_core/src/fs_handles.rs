@@ -143,7 +143,18 @@ impl FileHandles{
             // closing and reopening the handle.
             return Err(FsError::InvalidName);
         }
-        let n=fs.read_at(h.pathname(),h.offset,out)?;
+        let n=match fs.read_at(h.pathname(),h.offset,out){
+            Ok(n)=>n,
+            Err(error)=>{
+                // An I/O or damaged-volume error makes the on-disk identity
+                // uncertain. The caller must explicitly reopen on verified
+                // storage; a subsequent read cannot replay a stale token.
+                if matches!(error,FsError::Io|FsError::InvalidVolume){
+                    self.entries[slot]=Handle::EMPTY;
+                }
+                return Err(error);
+            }
+        };
         self.entries[slot].offset=h.offset.checked_add(n as u64)
             .ok_or(FsError::TooLarge)?;
         Ok(n)
@@ -719,6 +730,50 @@ mod tests{
         assert_eq!(t.write(1,fd,b"X",&mut fs),Err(FsError::TooLarge));
         assert_eq!(t.seek(1,fd,0),Ok(0));
         assert_eq!(t.write(1,fd,b"Y",&mut fs),Ok(1));
+    }
+    #[test]fn m1_r053_failed_block_read_retires_handle_before_retry(){
+        use std::{cell::Cell,rc::Rc};
+        struct FailingDisk{disk:Disk,fail:Rc<Cell<bool>>}
+        impl BlockDevice for FailingDisk{
+            fn sector_count(&self)->u64{self.disk.sector_count()}
+            fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+                ->Result<(),BlockError>{
+                if self.fail.get(){return Err(BlockError::Io);}
+                self.disk.read_sector(lba,out)
+            }
+            fn write_sector(&mut self,lba:u64,data:&[u8;SECTOR_BYTES])
+                ->Result<(),BlockError>{self.disk.write_sector(lba,data)}
+        }
+        let failed=Rc::new(Cell::new(false));
+        let mut fs=HierVfs::format_blank(FailingDisk{
+            disk:Disk{sectors:[[0;SECTOR_BYTES];COUNT]},fail:failed.clone()
+        }).unwrap();
+        fs.mkdir("/shared").unwrap();fs.create("/shared/note",b"persist").unwrap();
+        let mut table=FileHandles::new();
+        let fd=table.open(1,"/shared/note",READ,&mut fs).unwrap();
+        let before=table.security_statistics().completed_writes;
+        failed.set(true);
+        let mut out=[0xcc;32];
+        assert_eq!(table.read(1,fd,&mut out,&mut fs),Err(FsError::Io));
+        assert_eq!(table.seek(1,fd,0),Err(FsError::InvalidName));
+        assert_eq!(table.security_statistics().completed_writes,before);
+        failed.set(false);
+        assert_eq!(table.read(1,fd,&mut out,&mut fs),Err(FsError::InvalidName));
+        let new_fd=table.open(1,"/shared/note",READ,&mut fs).unwrap();
+        assert_ne!(new_fd,fd);
+        assert_eq!(table.read(1,new_fd,&mut out,&mut fs),Ok(7));
+        assert_eq!(&out[..7],b"persist");
+    }
+    #[test]fn m1_r053_invalid_read_count_preserves_valid_handle(){
+        let mut fs=fresh();fs.mkdir("/shared").unwrap();
+        fs.create("/shared/note",b"readable").unwrap();
+        let mut table=FileHandles::new();
+        let token=table.open(1,"/shared/note",READ,&mut fs).unwrap();
+        let mut too_big=[0;73];
+        assert_eq!(table.read(1,token,&mut too_big,&mut fs),Err(FsError::TooLarge));
+        let mut out=[0;16];
+        assert_eq!(table.read(1,token,&mut out,&mut fs),Ok(8));
+        assert_eq!(&out[..8],b"readable");
     }
     #[test] fn authenticated_restarts_keep_rights_and_global_write_budget(){
         use crate::fs_write_guard::MAX_WRITE_OPERATIONS;

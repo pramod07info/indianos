@@ -333,9 +333,18 @@ pub fn mount_checked_healthy<'a,D:BlockDevice>(disk:&'a mut D,
 /// Caller must quiesce the block device between preflight and mounting.
 pub fn mount_gpt_selected_healthy<'a,D:BlockDevice>(disk:&'a mut D,
  expected:GptSelection)->Result<HierVfs<BlockWindow<'a,D>>,MountError>{
- let actual=inspect_gpt_selection(disk,expected.partition.index)
+ // Reject a stale GUID selection BEFORE touching filesystem metadata,
+ // preserving the strict no-foreign-volume-read boundary and its error.
+ let initial=inspect_gpt_selection(disk,expected.partition.index)
   .map_err(MountError::Partition)?;
+ if initial!=expected{return Err(MountError::Partition(Error::Invalid));}
+ // Also revalidate both GUIDs AFTER COW health reads to catch a media swap
+ // while the selected volume is being probed.
+ let (actual,health)=probe_gpt_identity_health(disk,expected.partition.index)?;
  if actual!=expected{return Err(MountError::Partition(Error::Invalid));}
+ if health.redundancy!=crate::durablefs::Redundancy::Healthy{
+  return Err(MountError::Filesystem(FsError::InvalidVolume));
+ }
  mount_checked_healthy(disk,actual.partition)
 }
 /// Explicit recovery operation used by the authenticated Terminal service.
@@ -1632,6 +1641,51 @@ mod m1_partition_tests{
   assert_eq!(probe_gpt_identity_health(&mut changing,0),
    Err(MountError::Partition(Error::Invalid)));
   assert!(changing.swapped);assert_eq!(changing.disk.writes,before);
+ }
+ #[test]fn m1_r053_guid_pinned_mount_is_read_only_and_survives_remount(){
+  let mut d=gpt_disk();
+  {
+   let bounded=BlockWindow::new(&mut d,40,100).unwrap();
+   let mut fs=HierVfs::format_blank(bounded).unwrap();
+   fs.mkdir("/work").unwrap();
+   fs.create("/work/plan",b"durable").unwrap();
+  }
+  let token=inspect_gpt_selection(&mut d,0).unwrap();
+  let writes=d.writes;
+  for _ in 0..2{
+   let mut volume=mount_gpt_selected_healthy(&mut d,token).unwrap();
+   let mut out=[0;16];
+   assert_eq!(volume.read("/work/plan",&mut out),Ok(7));
+   assert_eq!(&out[..7],b"durable");
+  }
+  assert_eq!(d.writes,writes);
+ }
+ #[test]fn m1_r053_gpt_mount_denies_guid_swap_during_cow_health_reads(){
+  struct Changing{disk:Disk,swapped:bool}
+  impl BlockDevice for Changing{
+   fn sector_count(&self)->u64{self.disk.sector_count()}
+   fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+    ->Result<(),BlockError>{
+    if lba==40&&!self.swapped{
+     self.disk.data[1][56..72].fill(9);
+     rechecksum_gpt(&mut self.disk);
+     self.swapped=true;
+    }
+    self.disk.read_sector(lba,out)
+   }
+   fn write_sector(&mut self,lba:u64,data:&[u8;SECTOR_BYTES])
+    ->Result<(),BlockError>{self.disk.write_sector(lba,data)}
+  }
+  let mut d=gpt_disk();let token=inspect_gpt_selection(&mut d,0).unwrap();
+  {
+   let bounded=BlockWindow::new(&mut d,40,100).unwrap();
+   let mut fs=HierVfs::format_blank(bounded).unwrap();fs.mkdir("/work").unwrap();
+  }
+  let writes=d.writes;
+  let mut changed=Changing{disk:d,swapped:false};
+  assert!(matches!(mount_gpt_selected_healthy(&mut changed,token),
+   Err(MountError::Partition(Error::Invalid))));
+  assert!(changed.swapped);assert_eq!(changed.disk.writes,writes);
  }
  #[test]fn m1_r045_empty_valid_mbr_reports_no_partitions_without_format(){
   let mut d=new();d.data[0][510]=0x55;d.data[0][511]=0xaa;

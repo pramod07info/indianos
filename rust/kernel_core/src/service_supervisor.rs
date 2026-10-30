@@ -299,6 +299,20 @@ impl<const N:usize> ServiceTable<N>{
   out[..failures.len()].copy_from_slice(&decisions[..failures.len()]);
   true
  }
+ /// Stop several active allowlisted services as one generation-pinned
+ /// transaction. A stale PID, reused generation, duplicate service or
+ /// missing service leaves every service's state unchanged.
+ pub fn stop_batch_exact(&mut self,requests:&[(u32,u32,u32)])->bool{
+  if requests.is_empty()||requests.len()>N{return false;}
+  let mut staged=Self{phases:self.phases,slots:self.slots};
+  for (i,&(service_id,pid,generation)) in requests.iter().enumerate(){
+   if requests[..i].iter().any(|&(id,_,_)|id==service_id)||
+      !staged.stop_exact(service_id,pid,generation){
+    return false;
+   }
+  }
+  self.phases=staged.phases;self.slots=staged.slots;true
+ }
  pub fn active_services(&self)->usize{
   self.slots.iter().flatten().filter(|s|s.active).count()
  }
@@ -332,6 +346,33 @@ impl<const N:usize> ServiceTable<N>{
   }
   assert!(!t.crash_batch(&[(10,11),(20,21)],&mut output[..1]));
   assert_eq!(t.active_services(),2);
+ }
+ #[test]fn m1_r053_authenticated_multi_service_stop_is_transactional(){
+  let mut svc=ServiceTable::<3>::new();
+  assert!(svc.configure(1,10,2));assert!(svc.configure(2,20,2));
+  assert!(svc.start_batch(&[1,2]));
+  assert!(svc.stop_batch_exact(&[(1,10,1),(2,20,1)]));
+  assert_eq!(svc.active_services(),0);
+  assert_eq!(svc.start(1),ServiceAction::Start{pid:10,generation:2});
+  assert_eq!(svc.start(2),ServiceAction::Start{pid:20,generation:2});
+  assert!(!svc.stop_batch_exact(&[(1,10,1),(2,20,2)]));
+  assert_eq!(svc.active_services(),2);
+ }
+ #[test]fn m1_r053_stale_peer_generation_prevents_partial_shutdown(){
+  let mut svc=ServiceTable::<2>::new();
+  assert!(svc.configure(1,10,1));assert!(svc.configure(2,20,1));
+  assert!(svc.start_batch(&[1,2]));
+  let original_a=svc.snapshot(1);let original_b=svc.snapshot(2);
+  for req in [
+   [(1,10,1),(2,20,9)],
+   [(1,10,1),(1,10,1)],
+   [(1,10,1),(2,21,1)],
+  ]{
+   assert!(!svc.stop_batch_exact(&req));
+   assert_eq!(svc.snapshot(1),original_a);
+   assert_eq!(svc.snapshot(2),original_b);
+   assert_eq!(svc.active_services(),2);
+  }
  }
  #[test]fn two_dev_services_start_in_one_transaction(){
   let mut t=ServiceTable::<2>::new();

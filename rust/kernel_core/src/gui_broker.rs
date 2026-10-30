@@ -967,6 +967,23 @@ impl<const N:usize> DamageQueue<N>{
   self.purge_unowned(broker,layout);
   self.present_fair(previous,out)
  }
+ /// Atomically invalidate a window's draw work when its trusted owner
+ /// withdraws the grant. A wrong owner must neither revoke the grant nor
+ /// consume anyone's queued frames.
+ pub fn revoke_window_with_damage<const B:usize,const Q:usize>(
+  &mut self,broker:&mut Broker<B,Q>,owner:u32,window:u32)
+  ->Result<usize,Error>{
+  broker.revoke_window(owner,window)?;
+  Ok(self.discard_window(owner,window))
+ }
+ /// A window ID reused by another process never inherits old owner frames.
+ /// Validate the existing grant and new target before mutating either state.
+ pub fn transfer_window_with_damage<const B:usize,const Q:usize>(
+  &mut self,broker:&mut Broker<B,Q>,old_owner:u32,new_owner:u32,
+  window:u32)->Result<usize,Error>{
+  broker.reassign_window(old_owner,new_owner,window)?;
+  Ok(self.discard_window(old_owner,window))
+ }
  pub fn oldest_frame(&self)->Option<FrameDamage>{
   self.entries[..self.len].iter().flatten().min_by_key(|e|e.epoch).copied()
  }
@@ -1015,6 +1032,40 @@ mod r014_compositor_coalesce_tests{
   let mut full=[blank();2];
   assert_eq!(q.present_fair_verified(&broker,&layout,None,&mut full).unwrap().2,2);
   assert_eq!(q.pending(),0);
+ }
+ #[test]fn m1_r053_window_close_discards_only_matching_damage_and_events(){
+  let mut broker=Broker::<3,8>::new();
+  broker.grant(3,10).unwrap();broker.grant(4,20).unwrap();
+  let l=layout();let mut d=DamageQueue::<4>::new();
+  d.submit(&l,3,&[(10,1,1,3,3)]).unwrap();
+  d.submit(&l,4,&[(20,2,2,2,2)]).unwrap();
+  broker.post_focus(3,10).unwrap();
+  broker.post_focus(4,20).unwrap();
+  assert_eq!(d.revoke_window_with_damage(&mut broker,4,10),Err(Error::Unauthorized));
+  assert_eq!(d.pending(),2);
+  assert_eq!(d.revoke_window_with_damage(&mut broker,3,10),Ok(1));
+  assert_eq!(d.pending(),1);
+  assert_eq!(broker.owner(10),None);
+  assert_eq!(broker.pending_owner(4),Ok(1));
+  assert_eq!(d.oldest_frame().unwrap().owner,4);
+ }
+ #[test]fn m1_r053_window_transfer_drops_old_frames_before_new_owner_can_draw(){
+  let mut broker=Broker::<3,8>::new();
+  broker.grant(3,10).unwrap();broker.grant(4,20).unwrap();
+  let mut d=DamageQueue::<4>::new();let mut l=layout();
+  d.submit(&l,3,&[(10,0,0,5,5)]).unwrap();
+  d.submit(&l,4,&[(20,0,0,5,5)]).unwrap();
+  assert_eq!(d.transfer_window_with_damage(&mut broker,99,4,10),
+             Err(Error::Unauthorized));
+  assert_eq!(d.pending(),2);
+  assert_eq!(d.transfer_window_with_damage(&mut broker,3,4,10),Ok(1));
+  assert_eq!(broker.owner(10),Some(4));assert_eq!(d.pending(),1);
+  l.revoke(3);
+  l.grant(4,10,Rectangle{x:0,y:0,width:80,height:80}).unwrap();
+  d.submit(&l,4,&[(10,0,0,2,2)]).unwrap();
+  let mut out=[blank();2];
+  assert_eq!(d.drain(&mut out),Ok(2));
+  assert!(out.iter().all(|f|f.owner==4));
  }
  #[test]fn merges_repeated_window_damage_and_preserves_peer_frames(){
   let l=layout();let mut q=DamageQueue::<4>::new();

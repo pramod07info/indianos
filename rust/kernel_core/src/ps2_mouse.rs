@@ -26,15 +26,38 @@ fn payload(byte:u8)->bool{
     if !writable(){return false;}
     unsafe{output(DATA,byte);}true
 }
+/// Controller configuration replies use the primary data channel.
+fn controller_reply_ready(status:u8)->bool{
+    status&0x01!=0&&status&0xe0==0
+}
 fn read_reply()->Option<u8>{
     for _ in 0..MAX_WAIT{
-        if unsafe{input(CTRL)}&1!=0{return Some(unsafe{input(DATA)});}
+        let status=unsafe{input(CTRL)};
+        if status&1!=0{
+            // Never consume an auxiliary byte as controller config, and do
+            // not consume a corrupted transfer.
+            if !controller_reply_ready(status){return None;}
+            return Some(unsafe{input(DATA)});
+        }
     }
     None
 }
+/// Mouse ACK must arrive from the AUX channel, never a keyboard byte
+/// whose value happens to be 0xFA. A pending primary transfer belongs to
+/// the keyboard driver and is left untouched.
+fn mouse_ack()->bool{
+    for _ in 0..MAX_WAIT{
+        let status=unsafe{input(CTRL)};
+        if status&1!=0{
+            if !valid_mouse_status(status){return false;}
+            return unsafe{input(DATA)}==0xfa;
+        }
+    }
+    false
+}
 fn mouse_command(byte:u8)->bool{
     if !command(0xd4) || !payload(byte){return false;}
-    read_reply()==Some(0xfa)
+    mouse_ack()
 }
 /// PS/2 OBF must belong to the auxiliary mouse and have no controller
 /// parity/timeout flag. The keyboard broker owns primary-port bytes.
@@ -121,6 +144,25 @@ mod tests{
         assert_eq!(mouse.feed(0x08),None);
         assert_eq!(mouse.feed(1),None);
         assert_eq!(mouse.feed(2),Some(Packet{dx:1,dy:2,left:false}));
+    }
+    #[test]fn m1_r053_mouse_ack_never_consumes_primary_keyboard_status(){
+        for status in [0x00,0x01,0x03,0x11,0x61,0x81,0xa1,0xe1]{
+            assert!(!valid_mouse_status(status));
+        }
+        for status in [0x21,0x23,0x31]{
+            assert!(valid_mouse_status(status));
+        }
+        assert!(controller_reply_ready(0x01));
+        assert!(!controller_reply_ready(0x21));
+        assert!(!controller_reply_ready(0x81));
+    }
+    #[test]fn m1_r053_controller_and_mouse_ack_channels_are_disjoint(){
+        for status in 0u8..=u8::MAX{
+            assert!(!(controller_reply_ready(status)&&valid_mouse_status(status)),
+                "overlapping PS2 ownership at {status:#x}");
+        }
+        assert!(controller_reply_ready(0x11));
+        assert!(valid_mouse_status(0x31));
     }
     #[test]fn packet_sync_buttons_and_signed_axes(){
         let mut m=Mouse{packet:[0;3],received:0,last_left:false};
