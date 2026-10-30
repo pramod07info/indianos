@@ -118,6 +118,17 @@ impl<D:BlockDevice> BlobStore<D>{
   }
   Ok(sha.finish())
  }
+ /// Confirm that a cached active/backup entry still matches the exact
+ /// on-disk committed metadata. A different but valid header is NOT the
+ /// same authenticated package generation.
+ fn require_live_header(&mut self,info:Info)->Result<(),Error>{
+  let mut sector=[0u8;SECTOR_BYTES];
+  self.disk.read_sector(info.bank as u64,&mut sector)?;
+  if parse_header(info.bank,&sector)!=Some(info){
+   return Err(Error::Corrupt);
+  }
+  Ok(())
+ }
  pub fn active(&self)->Option<Info>{self.active}
  pub fn backup(&self)->Option<Info>{self.backup}
  pub fn into_device(self)->D{self.disk}
@@ -131,6 +142,14 @@ impl<D:BlockDevice> BlobStore<D>{
   if let Some(active)=self.active{
    if app!=active.id{return Err(Error::WrongApp);}
    if version<=active.version{return Err(Error::Downgrade);}
+  }
+  // A long-lived store handle must not overwrite the fallback bank
+  // when its committed active header or package bytes changed underneath.
+  if let Some(active)=self.active{
+   self.require_live_header(active)?;
+   if Self::disk_hash(&mut self.disk,active)?!=active.digest{
+    return Err(Error::HashMismatch);
+   }
   }
   let generation=match self.active{
    None=>1,Some(active)=>active.generation.checked_add(1)
@@ -172,6 +191,7 @@ impl<D:BlockDevice> BlobStore<D>{
  pub fn verified_range(&mut self,offset:usize,out:&mut[u8])->Result<(),Error>{
   let outcome=(||{
    let entry=self.active.ok_or(Error::NotFound)?;
+   self.require_live_header(entry)?;
    let end=offset.checked_add(out.len()).ok_or(Error::Invalid)?;
    if end>entry.length as usize{return Err(Error::Invalid);}
    let mut buf=[0u8;SECTOR_BYTES];
@@ -203,6 +223,11 @@ impl<D:BlockDevice> BlobStore<D>{
   let previous=self.backup.ok_or(Error::NoFallback)?;
   if active.id!=previous.id||active.bank==previous.bank{
    return Err(Error::Corrupt);
+  }
+  self.require_live_header(active)?;
+  self.require_live_header(previous)?;
+  if Self::disk_hash(&mut self.disk,active)?!=active.digest{
+   return Err(Error::HashMismatch);
   }
   if Self::disk_hash(&mut self.disk,previous)?!=previous.digest{
    return Err(Error::HashMismatch);
@@ -358,6 +383,42 @@ mod m2_tests{
   let mut output=[0x5a;80];
   assert_eq!(store.verified_range(17,&mut output),Err(Error::HashMismatch));
   assert_eq!(output,[0;80]);
+ }
+ #[test]fn r054_cached_header_replacement_denies_reads_without_leaking_bytes(){
+  let mut store=BlobStore::mount(MemoryDisk::new(REQUIRED_SECTORS as usize)).unwrap();
+  let bytes=package(3500,5);
+  let old=install(&mut store,1,&bytes).unwrap();
+  // The replacement is a correctly checksummed header but not OUR
+  // committed identity. No cached authorization may survive it.
+  store.disk.sectors[old.bank as usize]=header(Info{version:2,..old});
+  let mut out=[0x7b;32];
+  assert_eq!(store.verified_range(1,&mut out),Err(Error::Corrupt));
+  assert_eq!(out,[0;32]);
+  let writes=store.disk.writes;
+  assert_eq!(install(&mut store,2,&package(4000,6)),Err(Error::Corrupt));
+  assert_eq!(store.disk.writes,writes);
+ }
+ #[test]fn r054_stage_checks_live_package_before_overwriting_fallback(){
+  let mut store=BlobStore::mount(MemoryDisk::new(REQUIRED_SECTORS as usize)).unwrap();
+  let first=package(8192,3);
+  install(&mut store,1,&first).unwrap();
+  store.disk.sectors[lba(0,2) as usize][10]^=0x70;
+  let writes=store.disk.writes;
+  assert_eq!(install(&mut store,2,&package(8192,4)),
+   Err(Error::HashMismatch));
+  assert_eq!(store.disk.writes,writes);
+ }
+ #[test]fn r054_rollback_rejects_changed_backup_generation_before_commit(){
+  let mut store=BlobStore::mount(MemoryDisk::new(REQUIRED_SECTORS as usize)).unwrap();
+  let initial=package(1024,1);
+  install(&mut store,1,&initial).unwrap();
+  install(&mut store,2,&package(1024,2)).unwrap();
+  let backup=store.backup().unwrap();
+  store.disk.sectors[backup.bank as usize]=header(Info{version:7,..backup});
+  let writes=store.disk.writes;
+  assert_eq!(store.rollback(),Err(Error::Corrupt));
+  assert_eq!(store.disk.writes,writes);
+  assert_eq!(store.active().unwrap().version,2);
  }
  #[test]fn m2_blob_partition_window_guards_neighbors(){
   let mut disk=MemoryDisk::new(REQUIRED_SECTORS as usize+2);

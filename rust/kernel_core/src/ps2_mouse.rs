@@ -45,19 +45,35 @@ fn read_reply()->Option<u8>{
 /// Mouse ACK must arrive from the AUX channel, never a keyboard byte
 /// whose value happens to be 0xFA. A pending primary transfer belongs to
 /// the keyboard driver and is left untouched.
-fn mouse_ack()->bool{
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+enum AuxReply{Ack,Resend,Invalid}
+fn decode_aux_reply(byte:u8)->AuxReply{
+    match byte{0xfa=>AuxReply::Ack,0xfe=>AuxReply::Resend,
+        _=>AuxReply::Invalid}
+}
+fn mouse_ack()->Option<AuxReply>{
     for _ in 0..MAX_WAIT{
         let status=unsafe{input(CTRL)};
         if status&1!=0{
-            if !valid_mouse_status(status){return false;}
-            return unsafe{input(DATA)}==0xfa;
+            // Do not steal a primary keyboard byte while waiting for AUX.
+            if !valid_mouse_status(status){return None;}
+            return Some(decode_aux_reply(unsafe{input(DATA)}));
+        }
+    }
+    None
+}
+fn mouse_command(byte:u8)->bool{
+    // 8042 devices may request a resend; retry the *whole* D4+DATA
+    // transaction a finite number of times without touching IRQ1 bytes.
+    for _ in 0..3{
+        if !command(0xd4)||!payload(byte){return false;}
+        match mouse_ack(){
+            Some(AuxReply::Ack)=>return true,
+            Some(AuxReply::Resend)=>{},
+            _=>return false,
         }
     }
     false
-}
-fn mouse_command(byte:u8)->bool{
-    if !command(0xd4) || !payload(byte){return false;}
-    mouse_ack()
 }
 /// PS/2 OBF must belong to the auxiliary mouse and have no controller
 /// parity/timeout flag. The keyboard broker owns primary-port bytes.
@@ -71,10 +87,13 @@ pub(crate) struct Mouse {
 }
 impl Mouse{
     pub(crate) fn init()->Option<Self>{
-        // Drain firmware leftovers. Mouse IRQ remains disabled; no conflict
-        // with the PIC or the APIC IRQ route used by other test configurations.
+        // Drain AUX firmware leftovers only. Never consume a pending
+        // primary keyboard byte just to initialize a test-only mouse.
+        // If keyboard output is waiting, leave it intact and abort init.
         for _ in 0..64{
-            if unsafe{input(CTRL)}&1==0{break;}
+            let status=unsafe{input(CTRL)};
+            if status&1==0{break;}
+            if !valid_mouse_status(status){return None;}
             let _=unsafe{input(DATA)};
         }
         if !command(0xa8) || !command(0x20){return None;}
@@ -163,6 +182,22 @@ mod tests{
         }
         assert!(controller_reply_ready(0x11));
         assert!(valid_mouse_status(0x31));
+    }
+    #[test]fn r054_aux_resend_is_distinct_from_ack_and_failed_reply(){
+        assert_eq!(decode_aux_reply(0xfa),AuxReply::Ack);
+        assert_eq!(decode_aux_reply(0xfe),AuxReply::Resend);
+        for byte in [0x00,0x01,0xfc,0xfd,0xff]{
+            assert_eq!(decode_aux_reply(byte),AuxReply::Invalid);
+        }
+    }
+    #[test]fn r054_mouse_initialization_must_preserve_keyboard_bytes(){
+        for status in 0u8..=u8::MAX{
+            if status&1!=0&&status&0x20==0{
+                assert!(!valid_mouse_status(status));
+            }
+        }
+        assert!(valid_mouse_status(0x21));
+        assert!(!valid_mouse_status(0x01));
     }
     #[test]fn packet_sync_buttons_and_signed_axes(){
         let mut m=Mouse{packet:[0;3],received:0,last_left:false};

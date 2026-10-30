@@ -313,6 +313,54 @@ impl<const N:usize> ServiceTable<N>{
   }
   self.phases=staged.phases;self.slots=staged.slots;true
  }
+ /// Retry an unprepared replacement after the scheduler has torn down
+ /// and revoked its old mappings, grants and mailbox. The new PID must
+ /// be unused and gets a fresh generation AND a charged retry budget.
+ /// Pending remains non-active until prepared() is called.
+ pub fn retry_pending_exact(&mut self,service_id:u32,failed_pid:u32,
+   failed_generation:u32,fresh_pid:u32)->ServiceAction{
+  if service_id==0||failed_pid==0||failed_generation==0||
+     fresh_pid==0||fresh_pid==failed_pid||
+     self.slots.iter().flatten().any(|s|s.pid==fresh_pid){
+   return ServiceAction::Deny;
+  }
+  let Some(index)=self.slots.iter().position(|s|
+   s.as_ref().is_some_and(|s|s.service_id==service_id&&
+    s.pid==failed_pid&&s.generation==failed_generation))
+  else{return ServiceAction::Deny};
+  if self.phases[index]!=ServicePhase::Pending{
+   return ServiceAction::Deny;
+  }
+  let slot=self.slots[index].as_mut().unwrap();
+  if slot.restarts>=slot.max_restarts{return ServiceAction::Deny;}
+  let (Some(retries),Some(generation))=
+   (slot.restarts.checked_add(1),slot.generation.checked_add(1))
+  else{return ServiceAction::Deny};
+  slot.pid=fresh_pid;slot.restarts=retries;slot.generation=generation;
+  ServiceAction::Restart{pid:fresh_pid,generation}
+ }
+ /// Multiple pending restart retries are planned against a shadow copy.
+ /// A duplicate, stale or over-budget request leaves state and output
+ /// unchanged; peer services cannot be partially redirected.
+ pub fn retry_pending_batch_exact(&mut self,
+   requests:&[(u32,u32,u32,u32)],out:&mut[ServiceAction])->bool{
+  if requests.is_empty()||requests.len()>N||out.len()<requests.len(){
+   return false;
+  }
+  let mut staged=Self{phases:self.phases,slots:self.slots};
+  let mut actions=[ServiceAction::Deny;N];
+  for (i,&(id,pid,generation,replacement)) in requests.iter().enumerate(){
+   if requests[..i].iter().any(|&(prior_id,_,_,_)|prior_id==id){
+    return false;
+   }
+   let action=staged.retry_pending_exact(id,pid,generation,replacement);
+   if action==ServiceAction::Deny{return false;}
+   actions[i]=action;
+  }
+  self.phases=staged.phases;self.slots=staged.slots;
+  out[..requests.len()].copy_from_slice(&actions[..requests.len()]);
+  true
+ }
  pub fn active_services(&self)->usize{
   self.slots.iter().flatten().filter(|s|s.active).count()
  }
@@ -373,6 +421,41 @@ impl<const N:usize> ServiceTable<N>{
    assert_eq!(svc.snapshot(2),original_b);
    assert_eq!(svc.active_services(),2);
   }
+ }
+ #[test]fn r054_retry_pending_requires_new_pid_epoch_and_budget(){
+  let mut t=ServiceTable::<2>::new();
+  assert!(t.configure(1,10,2));assert!(t.configure(2,20,1));
+  assert!(t.start_batch(&[1,2]));
+  assert_eq!(t.crash(10,11),ServiceAction::Restart{pid:11,generation:2});
+  assert_eq!(t.retry_pending_exact(1,11,1,12),ServiceAction::Deny);
+  assert_eq!(t.retry_pending_exact(1,11,2,20),ServiceAction::Deny);
+  assert_eq!(t.retry_pending_exact(1,11,2,12),
+   ServiceAction::Restart{pid:12,generation:3});
+  assert!(!t.prepared(1,11,2));
+  assert_eq!(t.active_services(),1);
+  assert!(t.prepared(1,12,3));
+  assert_eq!(t.snapshot(1).unwrap().restarts,2);
+  assert_eq!(t.crash(12,13),ServiceAction::Deny);
+  assert_eq!(t.retry_pending_exact(1,12,3,14),ServiceAction::Deny);
+  assert!(t.snapshot(2).unwrap().active);
+ }
+ #[test]fn r054_batch_retry_has_no_partial_pid_reassignment(){
+  let mut t=ServiceTable::<2>::new();
+  assert!(t.configure(1,10,3));assert!(t.configure(2,20,1));
+  assert!(t.start_batch(&[1,2]));
+  assert!(t.crash_batch(&[(10,11),(20,21)],
+   &mut[ServiceAction::Deny;2]));
+  let before1=t.snapshot(1);let before2=t.snapshot(2);
+  let mut out=[ServiceAction::Start{pid:90,generation:90};2];
+  assert!(!t.retry_pending_batch_exact(
+   &[(1,11,2,12),(2,21,2,22)],&mut out));
+  assert_eq!(t.snapshot(1),before1);
+  assert_eq!(t.snapshot(2),before2);
+  assert_eq!(out,[ServiceAction::Start{pid:90,generation:90};2]);
+  assert_eq!(t.retry_pending_exact(1,11,2,12),
+   ServiceAction::Restart{pid:12,generation:3});
+  assert!(!t.prepared(1,11,2));
+  assert_eq!(t.active_services(),0);
  }
  #[test]fn two_dev_services_start_in_one_transaction(){
   let mut t=ServiceTable::<2>::new();
