@@ -11,6 +11,8 @@ use core::arch::asm;
 use core::panic::PanicInfo;
 #[cfg(any(feature="shell",feature="interactive",feature="r026-shell"))]
 mod shell;
+#[cfg(any(feature="r031-files-shell",feature="r031-files-terminal"))]
+mod terminal_line;
 
 #[panic_handler]
 fn panic(_info: &PanicInfo<'_>) -> ! { exit(125) }
@@ -25,7 +27,7 @@ fn call(number:u64,arg0:u64,arg1:u64)->u64 {
     }
     result
 }
-fn write(data:&'static [u8]){
+fn write(data:&[u8]){
     if call(1,data.as_ptr() as u64,data.len() as u64)!=data.len() as u64 {
         exit(1)
     }
@@ -676,12 +678,12 @@ fn files_shared_content(data:&mut [u8;256])->usize{
     if file_handle_call(5,b"",token,0,data,0)!=0{exit(203);}
     if count==0||count>20{exit(204);}
     let bytes=&data[..count as usize];
-    if bytes.iter().any(|b|!(b'A'..=b'Z').contains(b) && *b!=b' '){exit(205);}
+    if bytes.iter().any(|b|!(0x20..=0x7e).contains(b)){exit(205);}
     write(if bytes==b"HELLO INDIANOS"{
         b"R031.9 Files displayed HELLO INDIANOS from persistent volume"
     }else if bytes==b"FILE UPDATED"{
         b"R031.9 Files displayed FILE UPDATED from persistent volume"
-    }else{exit(206)});
+    }else{b"R051 Files rendered persisted Terminal content"});
     count as usize
 }
 #[cfg(feature="r031-files-app")]
@@ -691,7 +693,7 @@ fn files_gui_initial(){
     r029_draw(&r029_command(1,2,18,140,204,14,0x00ffffff,b"/shared"));
     r029_draw(&r029_command(1,2,18,163,156,14,0x00ffffff,b"f:readme"));
     let len=files_shared_content(&mut data);
-    r029_draw(&r029_command(1,2,18,190,(len*12) as u16,14,0x00ffffff,&data[..len]));
+    r029_draw(&r029_command(1,2,18,190,240,14,0x00ffffff,&data[..len]));
     write(b"R031.9 real file and directory contents rendered into Files window");
 }
 #[cfg(feature="r031-files-app")]
@@ -699,9 +701,8 @@ fn files_gui_refresh(){
     let mut data=[0u8;256];
     files_shared_listing(&mut data);
     let len=files_shared_content(&mut data);
-    // Two additional bounded commands replace only the preview area.
-    r029_draw(&r029_command(1,1,18,190,240,16,0x0045967c,&[]));
-    r029_draw(&r029_command(1,2,18,190,(len*12) as u16,14,0x00ffffff,&data[..len]));
+    // Replace the existing field; repeated saves do not consume new slots.
+    r029_draw(&r029_command(1,3,18,190,240,14,0x00ffffff,&data[..len]));
     write(b"R031.9 Files refreshed on-disk content after desktop IPC");
 }
 #[cfg(feature="r031-files-shell")]
@@ -714,13 +715,131 @@ fn shell_prepare_shared_data(){
         data[..14].copy_from_slice(b"HELLO INDIANOS");
         if vfs_call(3,b"/shared/readme",b"",&mut data,14)!=0{exit(208);}
         write(b"R031.9 PID1 provisioned persistent /shared/readme for GUI");
-    }else if (count==14&&&data[..14]==b"HELLO INDIANOS") ||
-             (count==12&&&data[..12]==b"FILE UPDATED"){
+    }else if (1..=20).contains(&count)&&
+             data[..count as usize].iter().all(|b|(0x20..=0x7e).contains(b)){
         write(b"R031.9 PID1 mounted existing persistent /shared/readme");
     }else{exit(209);}
     // PID1 can use the root VFS, but PID2 cannot read private files.
     if vfs_call(8,b"/shared",b"",&mut data,0)!=9||
        &data[..9]!=b"f:readme\n"{exit(210);}
+}
+#[cfg(any(feature="r031-files-shell",feature="r031-files-terminal"))]
+fn terminal_receive(sender:u32,out:&mut[u8;72])->usize{
+    loop{
+        // Authenticated cooperative wait, not an unbounded userland poll loop.
+        let n=call(35,out.as_mut_ptr() as u64,32);
+        if n==0{continue;}
+        if !(8..=72).contains(&n)||
+           u32::from_le_bytes(out[..4].try_into().unwrap())!=sender{exit(216);}
+        let size=u32::from_le_bytes(out[4..8].try_into().unwrap()) as usize;
+        if size>64||n!=size as u64+8{exit(217);}
+        return size;
+    }
+}
+#[cfg(feature="r031-files-shell")]
+fn terminal_exchange(byte:u8,begin:bool)->bool{
+    if begin{suite_send(3,b"B");}else{suite_send(3,&[b'K',byte]);}
+    let mut response=[0u8;72];
+    loop{
+        let len=terminal_receive(3,&mut response);
+        let message=&response[8..8+len];
+        match message{
+            b"A"=>return true,
+            b"C"=>return false,
+            b"R"=>{
+                let mut data=[0u8;256];
+                let n=vfs_call(4,b"/shared/readme",b"",&mut data,0);
+                if !(1..=20).contains(&n)||
+                   data[..n as usize].iter().any(|b|!(0x20..=0x7e).contains(b)){
+                    suite_send(3,b"E");
+                }else{
+                    let mut reply=[0u8;21];reply[0]=b'D';
+                    reply[1..1+n as usize].copy_from_slice(&data[..n as usize]);
+                    suite_send(3,&reply[..1+n as usize]);
+                    write(b"R051 PID1 read Terminal note through bounded file broker");
+                }
+            },
+            _ if (2..=21).contains(&len)&&message[0]==b'W'&&
+                 message[1..].iter().all(|b|(0x20..=0x7e).contains(b))=>{
+                // The sender cannot supply a path, PID, descriptor or pointer.
+                // This broker grants only overwrite of its one shared note.
+                let mut data=[0u8;256];data[..len-1].copy_from_slice(&message[1..]);
+                if vfs_call(5,b"/shared/readme",b"",&mut data,len-1)!=0{
+                    suite_send(3,b"E");continue;
+                }
+                suite_send(2,b"REFRESH");
+                let mut updated=[0u8;72];
+                let n=terminal_receive(2,&mut updated);
+                if &updated[8..8+n]!=b"UPDATED"{exit(218);}
+                suite_send(3,b"O");
+                write(b"R051 PID1 committed authenticated Terminal note and refreshed Files");
+            },
+            _=>exit(219),
+        }
+    }
+}
+#[cfg(feature="r031-files-terminal")]
+fn terminal_field(text:&[u8]){
+    r029_draw(&r029_command(2,3,24,181,270,14,0x00ffffff,text));
+}
+#[cfg(feature="r031-files-terminal")]
+fn terminal_service(){
+    use terminal_line::{Action,Line};
+    let mut line=Line::new();let mut editing=false;
+    let mut response=[0u8;72];
+    loop{
+        let len=terminal_receive(1,&mut response);
+        match &response[8..8+len]{
+            b"EXIT"=>break,
+            b"B"=>{
+                line.clear();editing=true;terminal_field(b"> ");suite_send(1,b"A");
+            },
+            message if message.len()==2&&message[0]==b'K'&&editing=>{
+                match line.feed(message[1]){
+                    Action::Changed=>{
+                        let mut display=[0;22];let n=line.display(&mut display);
+                        terminal_field(&display[..n]);suite_send(1,b"A");
+                    },
+                    Action::Leave=>{
+                        editing=false;terminal_field(b"TERMINAL READY");suite_send(1,b"C");
+                    },
+                    Action::Invalid=>{
+                        terminal_field(b"INVALID COMMAND");suite_send(1,b"A");
+                    },
+                    action=>{
+                        match action{
+                            Action::Read=>suite_send(1,b"R"),
+                            Action::Write{bytes,len}=>{
+                                let mut request=[0u8;21];request[0]=b'W';
+                                request[1..1+len].copy_from_slice(&bytes[..len]);
+                                suite_send(1,&request[..1+len]);
+                            },
+                            _=>exit(220),
+                        }
+                        let size=terminal_receive(1,&mut response);
+                        match &response[8..8+size]{
+                            b"O"=>terminal_field(b"SAVED"),
+                            b"E"=>terminal_field(b"IO ERROR"),
+                            data if (2..=21).contains(&data.len())&&data[0]==b'D'&&
+                                data[1..].iter().all(|b|(0x20..=0x7e).contains(b))=>{
+                                terminal_field(&data[1..]);
+                                write(b"R051 Terminal displayed brokered persistent note");
+                                let prefix=b"R051 Terminal readback: ";
+                                let mut readback=[0u8;64];
+                                readback[..prefix.len()].copy_from_slice(prefix);
+                                let end=prefix.len()+data.len()-1;
+                                readback[prefix.len()..end].copy_from_slice(&data[1..]);
+                                write(&readback[..end]);
+                            },
+                            _=>exit(221),
+                        }
+                        suite_send(1,b"A");
+                    },
+                }
+            },
+            _=>exit(222),
+        }
+    }
 }
 // R031.1: automatic boot-to-desktop QEMU session, real ring-3 PID1
 // system-service policy. PID2 Files and PID3 Terminal are independent ELF
@@ -756,6 +875,8 @@ fn r031_shell()->!{
     let mut launcher=false;
     let mut saw_pointer=false;
     let mut count=0u32;
+    #[cfg(feature="r031-files-shell")]
+    let mut terminal_edit=false;
     for _ in 0..300_000_000u32{
         let pointer=call(25,0,0);
         if pointer==u64::MAX{exit(173);}
@@ -775,6 +896,14 @@ fn r031_shell()->!{
             0=>{core::hint::spin_loop();continue;}
             1=>{},
             _=>exit(175),
+        }
+        #[cfg(feature="r031-files-shell")]
+        if terminal_edit || (front==2&&byte[0]==b'\n'){
+            let begin=!terminal_edit;
+            terminal_edit=terminal_exchange(byte[0],begin);
+            if call(23,2,0)!=0{exit(216);}
+            write(b"R051 Terminal physical input acknowledged");
+            continue;
         }
         match byte[0]{
             b'a'=>{
@@ -860,19 +989,17 @@ fn r031_files()->!{
     suite_receive(1,b"EXIT");
     #[cfg(feature="r031-files-app")]
     {
-        let mut already_refreshed=false;
         loop {
             let mut response=[0u8;72];
-            let n=call(9,response.as_mut_ptr() as u64,72);
-            if n==0{yield_now();continue;}
+            let n=call(35,response.as_mut_ptr() as u64,32);
+            if n==0{continue;}
             if n<8 ||u32::from_le_bytes(response[..4].try_into().unwrap())!=1 {
                 exit(213);
             }
             let len=u32::from_le_bytes(response[4..8].try_into().unwrap()) as usize;
             if n!=len as u64+8 {exit(214);}
             match &response[8..8+len]{
-                b"REFRESH" if !already_refreshed=>{
-                    already_refreshed=true;
+                b"REFRESH"=>{
                     files_gui_refresh();
                     suite_send(1,b"UPDATED");
                 }
@@ -931,17 +1058,7 @@ fn r031_terminal()->!{
     write(b"R031.1 Terminal service registered and running");
     yield_now();
     #[cfg(feature="r031-files-terminal")]
-    {
-        let mut reply=[0u8;72];
-        loop{
-            let n=call(9,reply.as_mut_ptr() as u64,72);
-            if n==0{yield_now();continue;}
-            if n!=12||u32::from_le_bytes(reply[..4].try_into().unwrap())!=1||
-               u32::from_le_bytes(reply[4..8].try_into().unwrap())!=4||
-               &reply[8..12]!=b"EXIT"{exit(142);}
-            break;
-        }
-    }
+    terminal_service();
     #[cfg(not(feature="r031-files-terminal"))]
     suite_receive(1,b"EXIT");
     let mut event=[0u8;16];

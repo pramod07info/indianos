@@ -314,7 +314,8 @@ mod limine_requests;
 mod cpu_entry;
 
 pub const MAX_PROCESSES: usize = 4;
-pub const MAX_DISPATCHES: u32 = if cfg!(feature = "preempt") { 2048 } else { 32 };
+pub const MAX_DISPATCHES: u32 = if cfg!(feature = "preempt") { 2048 }
+    else if cfg!(feature = "test-r031-files-gui") { 256 } else { 32 };
 
 const EMPTY: i32 = 0;
 const NEW: i32 = 1;
@@ -536,6 +537,14 @@ pub unsafe extern "C" fn indianos_scheduler_init(
 /// objects that are not being concurrently mutated on another CPU.
 #[no_mangle]
 pub unsafe extern "C" fn indianos_scheduler_next(s: *mut Scheduler) -> *mut Process {
+    unsafe{scheduler_next_matching(s, |_| true)}
+}
+
+/// Select eligible READY processes without charging dispatch budget for
+/// sleeping continuations. Same pointer/exclusion contract as the C entry.
+pub(crate) unsafe fn scheduler_next_matching(
+    s:*mut Scheduler,mut eligible:impl FnMut(&Process)->bool
+)->*mut Process{
     let Some(s) = (unsafe { s.as_mut() }) else { return ptr::null_mut(); };
     let Some(table) = (unsafe { s.table.as_mut() }) else { return ptr::null_mut(); };
     let count = table.count as usize;
@@ -546,7 +555,7 @@ pub unsafe extern "C" fn indianos_scheduler_next(s: *mut Scheduler) -> *mut Proc
         let index = (s.cursor as usize + offset) % count;
         let p = &mut table.slots[index];
         if p.pid != 0 && p.state == READY &&
-            p.address_space_root != 0 && !p.resources_reclaimed {
+            p.address_space_root != 0 && !p.resources_reclaimed && eligible(p) {
             s.cursor = ((index + 1) % count) as u32;
             s.dispatch_count += 1;
             return p;
@@ -678,6 +687,30 @@ mod tests {
             assert!(!indianos_process_success(b));
             assert_eq!(scheduler.yield_count, 2);
             assert_eq!(scheduler.dispatch_count, 4);
+        }
+    }
+
+    #[test]
+    fn scheduler_sleep_filter_preserves_round_robin_and_exact_dispatch_bound(){
+        let mut table=ProcessTable::empty();
+        unsafe{
+            indianos_process_table_init(&mut table);
+            let a=indianos_process_create(&mut table);let b=indianos_process_create(&mut table);
+            for (process,root) in [(a,0x1000),(b,0x2000)]{
+                assert!(indianos_process_ready(process));assert!(indianos_process_bind(process,root));
+            }
+            let mut scheduler=Scheduler::empty();assert!(indianos_scheduler_init(&mut scheduler,&mut table));
+            assert!(scheduler_next_matching(&mut scheduler,|_|false).is_null());
+            assert_eq!((scheduler.dispatch_count,scheduler.cursor,scheduler.tick_count),(0,0,0));
+            assert_eq!(scheduler_next_matching(&mut scheduler,|p|p.pid==2),b);
+            assert_eq!(scheduler_next_matching(&mut scheduler,|_|true),a);
+            for _ in 2..MAX_DISPATCHES{assert!(!indianos_scheduler_next(&mut scheduler).is_null());}
+            assert_eq!(scheduler.dispatch_count,MAX_DISPATCHES);
+            assert!(indianos_scheduler_next(&mut scheduler).is_null());
+            assert_eq!(scheduler.dispatch_count,MAX_DISPATCHES);
+            let expected=if cfg!(feature="preempt"){2048}
+                else if cfg!(feature="test-r031-files-gui"){256}else{32};
+            assert_eq!(MAX_DISPATCHES,expected);
         }
     }
 

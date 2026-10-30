@@ -5,11 +5,19 @@ on:
     branches: [main]
     paths:
       - "rust/kernel_core/**"
+      - "userland/rust/**"
+      - "tools/test_*.py"
+      - "tests/test_*.py"
+      - "Makefile"
       - ".github/workflows/m1-reliability-integration.yml"
   push:
     branches: [main]
     paths:
       - "rust/kernel_core/**"
+      - "userland/rust/**"
+      - "tools/test_*.py"
+      - "tests/test_*.py"
+      - "Makefile"
       - ".github/workflows/m1-reliability-integration.yml"
   workflow_dispatch:
 
@@ -34,3 +42,28 @@ jobs:
           cargo check --locked --offline --manifest-path rust/kernel_core/Cargo.toml
           --no-default-features --target x86_64-unknown-none
           --features pmm,vmm,test-r031-files-gui,test-r031-supervisor,test-r028-network,test-irq-keyboard
+
+  runtime-qemu:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
+      - name: Install disposable QEMU/UEFI test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld binutils xorriso qemu-system-x86 ovmf curl
+      - name: Terminal parser and recovery harness regressions
+        run: |
+          make test-m1-terminal-host
+          python3 -m unittest discover -s tests -v
+      - name: Real physical input, Terminal persistence and reboot readback
+        run: make test-m1-terminal-persistence-qemu
+      - name: Read-only boot recovery with damaged init media
+        run: make test-boot-recovery-qemu
+      - name: Preserve existing Files and supervisor lifecycle acceptance
+        run: |
+          make test-r031-files-gui-qemu
+          make test-r031-supervisor-qemu

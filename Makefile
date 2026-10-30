@@ -1125,6 +1125,20 @@ test-r031-files-gui-qemu:
 	$(MAKE) image BUILD=build/r031-files-gui RUST_CORE=1 R031_FILES_GUI_TEST=1
 	python3 tools/test_r031_files_gui_qemu.py --iso build/r031-files-gui/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)"
 
+.PHONY: test-m1-terminal-host test-m1-terminal-persistence-qemu test-boot-recovery-qemu
+test-m1-terminal-host:
+	mkdir -p build/m1-terminal-host
+	rustc --edition=2021 --test userland/rust/tests/terminal_line.rs -o build/m1-terminal-host/terminal_line
+	build/m1-terminal-host/terminal_line
+
+test-m1-terminal-persistence-qemu:
+	$(MAKE) image BUILD=build/m1-terminal-persistence RUST_CORE=1 R031_FILES_GUI_TEST=1
+	python3 tools/test_m1_terminal_persistence_qemu.py --iso build/m1-terminal-persistence/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)"
+
+test-boot-recovery-qemu:
+	$(MAKE) image BUILD=build/boot-recovery RUST_CORE=1
+	python3 tools/test_boot_recovery_qemu.py --iso build/boot-recovery/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)"
+
 .PHONY: test-r031-vfs-qemu
 test-r031-vfs-qemu:
 	$(MAKE) image BUILD=build/r031-vfs RUST_CORE=1 R031_VFS_TEST=1

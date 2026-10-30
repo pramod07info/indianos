@@ -9,6 +9,10 @@ pub(crate) const USER_TOP: u64 = 0x0000_7fff_f000_0000;
 pub(crate) const STACK_BYTES: u64 = 64 * 1024;
 pub(crate) const PAGE_BYTES: u64 = 4096;
 const MAX_WRITE: u64 = 256;
+/// Must match cpu_entry's initial ring-3 RFLAGS profile. Dispatch, syscall
+/// capture and resume validation share this policy, including IRQ keyboard.
+pub(crate) const USER_INTERRUPTS_ENABLED:bool=
+    cfg!(any(feature="preempt",feature="test-irq-keyboard"));
 pub(crate) const MAX_SEGMENTS: usize = 8;
 
 #[repr(C)]
@@ -136,6 +140,9 @@ pub unsafe extern "C" fn indianos_syscall_validate(
         #[cfg(feature="test-ipc")]
         9 => request.arg1 == 72 &&
             user_range(plan,request.arg0,72,true), // IPC_RECEIVE
+        #[cfg(feature="test-ipc")]
+        35 => (1..=crate::ipc::MAX_WAIT_ROUNDS as u64).contains(&request.arg1) &&
+            user_range(plan,request.arg0,crate::ipc::RECEIVE_BYTES as u64,true),
         #[cfg(feature="test-r025")]
         10 => request.arg0>0 && request.arg1==0, // request own capability
         #[cfg(feature="test-r025")]
@@ -393,6 +400,28 @@ mod tests {
             assert!(!valid(syscall,2,1));
         }
     }
+    #[cfg(feature="test-ipc")]
+    #[test]
+    fn ipc_wait_validates_full_destination_and_bounded_cooperative_budget(){
+        let plan=ProgramPlan{
+            entry:USER_MIN,stack_begin:USER_TOP-STACK_BYTES,stack_end:USER_TOP,
+            guard_begin:USER_TOP-STACK_BYTES-PAGE_BYTES,segment_count:0,
+            segments:[ProgramSegment::empty();MAX_SEGMENTS],
+        };
+        let valid=|address,budget|unsafe{indianos_syscall_validate(&plan,
+            SyscallRequest{number:35,arg0:address,arg1:budget})};
+        for budget in 1..=32{assert!(valid(plan.stack_begin,budget));}
+        for budget in [0,33,u64::MAX]{assert!(!valid(plan.stack_begin,budget));}
+        assert!(valid(plan.stack_end-72,1));
+        for address in [0,plan.guard_begin,plan.stack_end-71,plan.stack_end,u64::MAX]{
+            assert!(!valid(address,1));
+        }
+        assert!(unsafe{indianos_syscall_validate(&plan,SyscallRequest{
+            number:9,arg0:plan.stack_begin,arg1:72})});
+        assert!(!unsafe{indianos_syscall_validate(&plan,SyscallRequest{
+            number:9,arg0:plan.stack_begin,arg1:1})});
+    }
+
     #[test]
     fn trap_frame_blocks_supervisor_selectors_and_guard_stack() {
         let plan = ProgramPlan {

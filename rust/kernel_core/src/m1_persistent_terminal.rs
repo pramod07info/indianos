@@ -567,6 +567,24 @@ impl GptTerminalSession{
    .map_err(PartitionCommandError::Mount)?);
   Ok(Self{owner:caller,selection,expires,command_count:0,active:true})
  }
+ /// Explicit operator recovery of the originally selected GPT volume.
+ /// Both filesystem rights and a fresh deadline are required before any
+ /// device read. A healthy volume is a no-op; a degraded volume is repaired
+ /// only by this explicit request. Success returns a NEW healthy session and
+ /// whether one metadata head was repaired. No old/retired session is revived.
+ /// The trusted block-device owner must serialize/quiesce media access.
+ pub fn recover<D:BlockDevice,const N:usize>(
+  disk:&mut D,selection:crate::m1_partition::GptSelection,
+  auth:&Access<N>,caller:Identity,now:u64,expires:u64,
+ )->Result<(Self,bool),PartitionCommandError>{
+  preflight_partition_caller(auth,caller,now)?;
+  auth.require(caller,FILE_READ|FILE_WRITE,now)
+   .map_err(|_|PartitionCommandError::Command(Error::Denied))?;
+  if expires<=now{return Err(PartitionCommandError::Command(Error::Denied));}
+  let repaired=crate::m1_partition::repair_gpt_selected(disk,selection)
+   .map_err(PartitionCommandError::Mount)?;
+  Ok((Self{owner:caller,selection,expires,command_count:0,active:true},repaired))
+ }
  fn authorize<const N:usize>(&self,auth:&Access<N>,caller:Identity,now:u64)
   ->Result<(),PartitionCommandError>{
   if !self.active||caller!=self.owner||now>=self.expires{

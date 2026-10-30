@@ -16,7 +16,7 @@ use crate::paging_cpu::x86_64_paging_detect;
 use crate::vmm::{Backend as VmmBackend,Mapping,Permissions,vmm_query_page};
 use crate::user_image::{UserImage,indianos_user_image_load,
  indianos_user_image_destroy,indianos_user_copy_readonly};
-use crate::syscall::{SyscallRequest,indianos_syscall_validate,ring3_frame_valid,USER_TOP,STACK_BYTES,PAGE_BYTES};
+use crate::syscall::{SyscallRequest,indianos_syscall_validate,ring3_frame_valid,USER_INTERRUPTS_ENABLED,USER_TOP,STACK_BYTES,PAGE_BYTES};
 use crate::program::indianos_program_user_range;
 use crate::boot::Region;
 use crate::user_image::{indianos_user_can_write,indianos_user_copy_writable};
@@ -43,6 +43,10 @@ struct DirectMap{offset:u64}
 struct Task{
  image:UserImage,root:CloneResult,pcb:*mut Process,
  frame:[u64;WORDS],saved:bool,attached:bool,timer_preemptions:u32,
+ #[cfg(feature="test-r031-vfs")]
+ file_generation:u64,
+ #[cfg(feature="test-ipc")]
+ ipc_wait:crate::ipc::ReceiveWait,
 }
 #[cfg(feature="test-r029-desktop-suite")]
 static mut THIRD_ELF:(*const u8,usize)=(ptr::null(),0);
@@ -63,7 +67,7 @@ static mut ACTIVE_PROCESS:*mut Process=ptr::null_mut();
 static mut R031_HANDLES:crate::fs_handles::FileHandles=
     crate::fs_handles::FileHandles::new();
 #[cfg(feature="test-r031-vfs")]
-fn authenticated_file_pid()->Option<u32>{
+fn authenticated_file_identity()->Option<crate::batch5_session::Identity>{
     let process=unsafe{ptr::read(ptr::addr_of!(ACTIVE_PROCESS))};
     let task=active_task();
     let image=active_image();
@@ -75,7 +79,12 @@ fn authenticated_file_pid()->Option<u32>{
        !ptr::eq(&t.image as *const UserImage,image as *const UserImage){
         return None;
     }
-    Some(p.pid)
+    let owner=crate::batch5_session::Identity{pid:p.pid,generation:t.file_generation};
+    unsafe{(&*ptr::addr_of!(R031_HANDLES)).owns(owner)}.then_some(owner)
+}
+#[cfg(feature="test-r031-vfs")]
+fn authenticated_file_pid()->Option<u32>{
+    authenticated_file_identity().map(|owner|owner.pid)
 }
 #[cfg(feature="test-r026")]
 static mut R026_WORKER_REQUESTED:bool=false;
@@ -154,8 +163,6 @@ fn cleanup_quantum_jobs(pid:u32){
  if pid==0{return;}
  let jobs=unsafe{&mut *ptr::addr_of_mut!(QUANTUM_JOBS)};
  let _=jobs.process_terminated(pid);
- #[cfg(feature="test-r031-vfs")]
- unsafe{(&mut *ptr::addr_of_mut!(R031_HANDLES)).terminate(pid);}
 }
 
 static mut M009_TASKS:[MaybeUninit<Task>;TASKS]=[const{MaybeUninit::uninit()};TASKS];
@@ -210,16 +217,22 @@ fn last_fault()->(u64,u64,u64){unsafe{(LAST_VECTOR,LAST_ERROR,LAST_ADDRESS)}}
 fn capture(regs:*const u64,via_timer:bool)->bool{
  let t=active_task();if t.is_null()||regs.is_null(){return false;}
  let task=unsafe{&mut *t};
- let Some(pcb)=(unsafe{task.pcb.as_ref()})else{return false};
- if pcb.state!=3{return false;}
  // CPU-supplied kernel stack contains 15 registers followed by 5 QWORDs.
  let src=unsafe{&*(regs as *const [u64; WORDS])};
- if !ring3_frame_valid(src,&task.image.plan,via_timer){return false;}
+ capture_frame(task,src,via_timer)
+}
+fn capture_frame(task:&mut Task,src:&[u64;WORDS],via_timer:bool)->bool{
+ let Some(pcb)=(unsafe{task.pcb.as_ref()})else{return false};
+ if pcb.state!=3{return false;}
+ // User IF is a property of the runtime profile, including INT 0x80
+ // continuations; it does not depend on whether this capture came from IRQ.
+ if !ring3_frame_valid(src,&task.image.plan,USER_INTERRUPTS_ENABLED){return false;}
  task.frame.copy_from_slice(src);
  if !via_timer{task.frame[14]=0;}
  task.saved=true;
  true
 }
+
 #[no_mangle]
 pub unsafe extern "C" fn x86_64_scheduler_timer_dispatch(regs:*const u64){
  unsafe{x86_64_timer_ack_irq0()};
@@ -274,7 +287,7 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
  let img=active_image();
  if img.is_null()||regs.is_null(){return BAD;}
  let r=unsafe{&*(regs as *const [u64; WORDS])};
- if !ring3_frame_valid(r,unsafe{&(*img).plan},cfg!(any(feature="preempt",feature="test-irq-keyboard"))){return BAD;}
+ if !ring3_frame_valid(r,unsafe{&(*img).plan},USER_INTERRUPTS_ENABLED){return BAD;}
  // SYS_EXIT and SYS_WRITE must originate from a mapped user executable
  // instruction, not a writable or supervisor-only page.
  let mut source=Mapping{
@@ -456,17 +469,41 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
        return BAD;
    }
    let Some(boxes)=router()else{return BAD;};
-   let msg=match boxes.receive(receiver){
-      Ok(m)=>m,Err(IpcError::Empty)=>return 0,Err(_)=>return BAD,
-   };
-   let mut response=[0u8;72];
-   response[..4].copy_from_slice(&msg.sender().to_le_bytes());
-   response[4..8].copy_from_slice(&(msg.payload().len() as u32).to_le_bytes());
-   let len=msg.payload().len();
-   response[8..8+len].copy_from_slice(msg.payload());
-   if !unsafe{indianos_user_copy_writable(&*img,request.arg0,
-       response.as_ptr(),response.len())}{return BAD;}
-   (8+len) as u64
+   // Publish before consuming. Even a failed kernel copy preserves FIFO.
+   match boxes.receive_with(receiver,|message|{
+    let response=message.wire();
+    unsafe{indianos_user_copy_writable(&*img,request.arg0,
+        response.as_ptr(),response.len())}
+   }){
+    Ok(message)=>(8+message.payload().len()) as u64,
+    Err(IpcError::Empty)=>0,
+    Err(_)=>BAD,
+   }
+  },
+  #[cfg(feature="test-ipc")]
+  35=>{
+   let Some(receiver)=authenticated_ipc_pid()else{return BAD;};
+   if !unsafe{indianos_user_can_write(&*img,request.arg0,
+       crate::ipc::RECEIVE_BYTES)}{return BAD;}
+   let Some(boxes)=router()else{return BAD;};
+   match boxes.receive_with(receiver,|message|{
+    let response=message.wire();
+    unsafe{indianos_user_copy_writable(&*img,request.arg0,
+        response.as_ptr(),response.len())}
+   }){
+    Ok(message)=>return (8+message.payload().len()) as u64,
+    Err(IpcError::Empty)=>{},
+    Err(_)=>return BAD,
+   }
+   // The same serialized context preflights buffers, binds the current
+   // mailbox epoch and captures its exact task continuation before sleeping.
+   let Ok(wait)=crate::ipc::ReceiveWait::begin(boxes,receiver,
+       request.arg0,request.arg1)else{return BAD;};
+   if !capture(regs,false){return BAD;}
+   let task=active_task();
+   if task.is_null(){return BAD;}
+   unsafe{(*task).ipc_wait=wait;}
+   unsafe{x86_64_user_exit_to_kernel(YIELD)}
   },
   7=>{
    // Four little-endian u64 words: operation, buffer, length, job ID.
@@ -675,7 +712,7 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
   },
   #[cfg(feature="test-r031-vfs")]
   33=>{
-   let Some(pid)=authenticated_file_pid()else{return BAD;};
+   let Some(owner)=authenticated_file_identity()else{return BAD;};
    // Descriptor: path[24], opaque handle u64, argument u64,
    // pointer u64, length u64, reserved u64. Never dereference an
    // untrusted ring3 pointer outside validated copy helpers.
@@ -719,7 +756,7 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
     return BAD;
    }
    let handles=unsafe{&mut *ptr::addr_of_mut!(R031_HANDLES)};
-   let res=crate::fs_handles::operation(handles,request.arg0,pid,
+   let res=crate::fs_handles::operation_authenticated(handles,request.arg0,owner,
            handle,argument,path,&mut data[..size]);
    let Ok(n)=res else{return BAD;};
    if request.arg0==2 && n>0{
@@ -1049,12 +1086,67 @@ fn prepare(t:*mut Task,p:*mut Process,elf:*const u8,size:usize,original:u64,
   image_mapped(b,task.root.root,&task.image);
  if !safe||!unsafe{indianos_process_ready(p)} ||
     !unsafe{indianos_process_bind(p,task.root.root)}{return false;}
+ #[cfg(feature="test-r031-vfs")]
+ if (1..=2).contains(&unsafe{(*p).pid}){
+  // Bind only fully prepared contexts. The table and epoch allocator survive
+  // scheduler invocations; never reset them when PCB PIDs restart at one.
+  let handles=unsafe{&mut *ptr::addr_of_mut!(R031_HANDLES)};
+  let Ok(owner)=handles.bind_process(unsafe{(*p).pid})else{return false;};
+  task.file_generation=owner.generation;
+ }
  pid_log(unsafe{(*p).pid},b"READY\0");true
 }
+#[cfg(feature="test-ipc")]
+fn service_ipc_waiters()->bool{
+ use crate::ipc::WaitPoll;
+ let Some(boxes)=router()else{return false;};
+ for slot in 0..TASKS{
+  let task=unsafe{&mut *task_ptr(slot)};
+  if !task.ipc_wait.active(){continue;}
+  let Some(process)=(unsafe{task.pcb.as_ref()})else{return false;};
+  if process.pid!=task.ipc_wait.receiver()||process.state!=2||
+      !task.saved||!task.image.ready{
+   task.ipc_wait.cancel();return false;
+  }
+  let address=task.ipc_wait.address();
+  let image=&task.image;
+  let result=task.ipc_wait.poll(boxes,|message|{
+   // Revalidate after the wait and copy privately staged bytes before dequeue.
+   let response=message.wire();
+   unsafe{indianos_user_can_write(image,address,response.len())&&
+    indianos_user_copy_writable(image,address,response.as_ptr(),response.len())}
+  });
+  match result{
+   WaitPoll::Pending=>{},
+   WaitPoll::Delivered(length)=>task.frame[14]=length as u64,
+   WaitPoll::TimedOut=>task.frame[14]=0,
+   WaitPoll::Failed(_)=>task.frame[14]=BAD,
+  }
+ }
+ true
+}
+#[cfg(feature="test-ipc")]
+fn next_ipc_ready(scheduler:&mut Scheduler)->*mut Process{
+ // Each pass is one cooperative selection round, not an IRQ or clock tick.
+ // If every task sleeps, bounded empty passes expire all deadlines without
+ // dispatching user code or fabricating scheduler/hardware accounting.
+ for _ in 0..=crate::ipc::MAX_WAIT_ROUNDS as usize{
+  if !service_ipc_waiters(){return ptr::null_mut();}
+  let mut waiting=[0u32;TASKS];
+  for (slot,pid) in waiting.iter_mut().enumerate(){
+   let task=unsafe{&*task_ptr(slot)};
+   if task.ipc_wait.active(){*pid=task.ipc_wait.receiver();}
+  }
+  let process=unsafe{crate::scheduler_next_matching(scheduler,
+      |p|!waiting.contains(&p.pid))};
+  if !process.is_null()||waiting.iter().all(|&p|p==0){return process;}
+ }
+ ptr::null_mut()
+}
 fn saved_valid(t:&Task)->bool{
- if !t.saved||t.frame[16]!=0x2b||t.frame[19]!=0x33||
-    t.frame[17]&0x3000!=0||t.frame[17]&2==0{return false;}
- if (t.frame[17]&0x200!=0)!=cfg!(feature="preempt"){return false;}
+ if !t.saved||!ring3_frame_valid(&t.frame,&t.image.plan,USER_INTERRUPTS_ENABLED){
+  return false;
+ }
  let rip=t.frame[15];let rsp=t.frame[18];
  let mut map=Mapping{physical:0,permissions:Permissions{
   writable:false,executable:false,user:false}};
@@ -1065,6 +1157,20 @@ fn saved_valid(t:&Task)->bool{
 }
 fn discard(t:*mut Task,b:&CloneBackend,terminal:bool)->bool{
  let task=unsafe{&mut *t};
+ #[cfg(feature="test-r031-vfs")]
+ if task.file_generation!=0{
+  // Revoke before fallible page-table/frame reclamation. A retry or delayed
+  // cleanup cannot revoke a replacement incarnation with the same PID.
+  if !task.pcb.is_null(){
+   let owner=crate::batch5_session::Identity{
+    pid:unsafe{(*task.pcb).pid},generation:task.file_generation};
+   unsafe{(&mut *ptr::addr_of_mut!(R031_HANDLES)).retire_process(owner);}
+  }
+  task.file_generation=0;
+ }
+ // Retire continuation before any fallible resource teardown.
+ #[cfg(feature="test-ipc")]
+ task.ipc_wait.cancel();
  if task.attached{
   if !unsafe{paging_detach_user_half(b,task.root.root,task.image.tables.root_physical)}{return false;}
   task.attached=false;
@@ -1183,6 +1289,9 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
  }
  let mut ok=true;
  while ok&&!unsafe{indianos_scheduler_all_terminal(&scheduler)}{
+  #[cfg(feature="test-ipc")]
+  let pcb=next_ipc_ready(&mut scheduler);
+  #[cfg(not(feature="test-ipc"))]
   let pcb=unsafe{indianos_scheduler_next(&mut scheduler)};
   if pcb.is_null(){ok=false;break;}
   let pid=unsafe{(*pcb).pid};
@@ -1392,6 +1501,100 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
 }
 #[cfg(test)]mod tests{
  use super::*;
+ #[cfg(feature="test-ipc")]
+ #[test]fn all_waiting_tasks_expire_without_fabricated_ticks_or_dispatches(){
+  use core::mem::ManuallyDrop;
+  static LOCK:std::sync::Mutex<()>=std::sync::Mutex::new(());
+  let _lock=LOCK.lock().unwrap();
+  struct Restore{
+   tasks:ManuallyDrop<[MaybeUninit<Task>;TASKS]>,
+   router:ManuallyDrop<Option<IpcRouter<4,8>>>,
+  }
+  impl Drop for Restore{
+   fn drop(&mut self){unsafe{
+    ptr::write(ptr::addr_of_mut!(M009_TASKS),ManuallyDrop::take(&mut self.tasks));
+    ptr::write(ptr::addr_of_mut!(IPC_ROUTER),ManuallyDrop::take(&mut self.router));
+   }}
+  }
+  let _restore=unsafe{Restore{
+   tasks:ManuallyDrop::new(ptr::read(ptr::addr_of!(M009_TASKS))),
+   router:ManuallyDrop::new(ptr::read(ptr::addr_of!(IPC_ROUTER))),
+  }};
+  let mut table=ProcessTable::empty();
+  let mut boxes=IpcRouter::<4,8>::new().unwrap();
+  let mut outputs=[[0xa5u8;crate::ipc::RECEIVE_BYTES];2];
+  unsafe{
+   for slot in 0..TASKS{ptr::write(task_ptr(slot),core::mem::zeroed());}
+   indianos_process_table_init(&mut table);
+   for (slot,output) in outputs.iter_mut().enumerate(){
+    let process=indianos_process_create(&mut table);
+    assert!(indianos_process_ready(process));
+    assert!(indianos_process_bind(process,((slot+1) as u64)*PAGE));
+    boxes.register((*process).pid).unwrap();
+    let task=&mut *task_ptr(slot);
+    task.pcb=process;task.saved=true;task.image.ready=true;task.frame[14]=BAD;
+    task.ipc_wait=crate::ipc::ReceiveWait::begin(&boxes,(*process).pid,
+        output.as_mut_ptr() as u64,32).unwrap();
+   }
+   IPC_ROUTER=Some(boxes);
+   let mut scheduler=Scheduler::empty();assert!(indianos_scheduler_init(&mut scheduler,&mut table));
+   let selected=next_ipc_ready(&mut scheduler);
+   assert!(!selected.is_null());assert_eq!((*selected).pid,1);
+   assert_eq!((scheduler.dispatch_count,scheduler.tick_count,scheduler.yield_count),(1,0,0));
+   for slot in 0..2{
+    let task=&*task_ptr(slot);assert!(!task.ipc_wait.active());assert_eq!(task.frame[14],0);
+   }
+  }
+  assert_eq!(outputs,[[0xa5;crate::ipc::RECEIVE_BYTES];2]);
+ }
+ #[test]fn syscall_capture_preserves_runtime_irq_policy_and_zero_return(){
+  let mut process=Process::empty();process.pid=1;process.state=3;
+  let mut task:Task=unsafe{core::mem::zeroed()};task.pcb=&mut process;
+  task.image.plan.stack_begin=USER_TOP-STACK_BYTES;task.image.plan.stack_end=USER_TOP;
+  let mut frame=[0u64;WORDS];frame[14]=35;frame[15]=0x400000;
+  frame[16]=0x2b;frame[17]=2|if USER_INTERRUPTS_ENABLED{0x200}else{0};
+  frame[18]=USER_TOP-16;frame[19]=0x33;
+  assert!(capture_frame(&mut task,&frame,false));
+  assert!(task.saved);assert_eq!(task.frame[14],0);assert_eq!(task.frame[17],frame[17]);
+  let saved=task.frame;frame[17]^=0x200;
+  assert!(!capture_frame(&mut task,&frame,false));assert_eq!(task.frame,saved);
+  frame[17]^=0x200;frame[16]=0x08;
+  assert!(!capture_frame(&mut task,&frame,false));assert_eq!(task.frame,saved);
+ }
+ #[test]fn saved_frame_uses_same_irq_policy_with_actual_executable_mapping(){
+  unsafe extern "C" fn allocate(_: *mut u64,_:*mut c_void)->bool{false}
+  unsafe extern "C" fn release(_:u64,_:*mut c_void)->bool{false}
+  unsafe extern "C" fn access(physical:u64,context:*mut c_void)->*mut c_void{
+   if physical%PAGE!=0||!(PAGE..=4*PAGE).contains(&physical){return ptr::null_mut();}
+   unsafe{context.cast::<[u64;512]>().add((physical/PAGE-1) as usize).cast()}
+  }
+  let mut tables=[[0u64;512];4];
+  tables[0][0]=0x2000|7;tables[1][0]=0x3000|7;
+  tables[2][2]=0x4000|7;tables[3][0]=0x5000|5;
+  let mut task:Task=unsafe{core::mem::zeroed()};
+  task.image.tables=crate::vmm::Space{
+   root_physical:PAGE,initialized:true,
+   backend:VmmBackend{allocate:Some(allocate),release:Some(release),
+    access:Some(access),context:tables.as_mut_ptr().cast()},
+  };
+  task.image.plan.stack_begin=USER_TOP-STACK_BYTES;task.image.plan.stack_end=USER_TOP;
+  task.image.plan.segment_count=1;
+  task.image.plan.segments[0].virtual_address=0x400000;
+  task.image.plan.segments[0].memory_size=PAGE;
+  task.image.plan.segments[0].page_begin=0x400000;
+  task.image.plan.segments[0].page_end=0x401000;
+  task.image.plan.segments[0].executable=true;
+  task.saved=true;task.frame[15]=0x400000;task.frame[16]=0x2b;
+  task.frame[17]=2|if USER_INTERRUPTS_ENABLED{0x200}else{0};
+  task.frame[18]=USER_TOP-16;task.frame[19]=0x33;
+  assert!(saved_valid(&task));
+  let flags=task.frame[17];
+  for rejected in [flags^0x200,flags|0x3000,flags|(1<<14),flags|(1<<17)]{
+   task.frame[17]=rejected;assert!(!saved_valid(&task));
+  }
+  task.frame[17]=flags;task.frame[16]=0x08;assert!(!saved_valid(&task));
+  task.frame[16]=0x2b;tables[3][0]|=2;assert!(!saved_valid(&task));
+ }
  #[test]fn saved_frame_requires_correct_privileges(){
   assert_eq!(WORDS,20);
   assert_eq!(TASKS,if cfg!(feature="test-r031-supervisor"){4}

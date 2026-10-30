@@ -6,6 +6,9 @@ pub const WIRE_BYTES:usize=64;
 pub const COMMAND_LIMIT:usize=8;
 pub const FILL:u32=1;
 pub const TEXT:u32=2;
+/// Replace an existing text field with exactly the same client rectangle.
+/// This never allocates another retained command or changes window ownership.
+pub const REPLACE_TEXT:u32=3;
 pub const MAX_TEXT:usize=24;
 #[derive(Clone,Copy,Debug,Eq,PartialEq)]
 pub enum Error{Version,Operation,Window,Bounds,Color,Text,Reserved}
@@ -27,7 +30,7 @@ impl Command{
         let get16=|off:usize|u16::from_le_bytes(data[off..off+2].try_into().unwrap());
         let window=get32(8);let operation=get32(12);
         if window!=1 && window!=2{return Err(Error::Window);}
-        if operation!=FILL && operation!=TEXT{return Err(Error::Operation);}
+        if !matches!(operation,FILL|TEXT|REPLACE_TEXT){return Err(Error::Operation);}
         if data[28..32]!=[0;4]{return Err(Error::Reserved);}
         let x=get16(16);let y=get16(18);
         let width=get16(20);let height=get16(22);
@@ -79,6 +82,10 @@ mod tests{
         t[32..37].copy_from_slice(b"HELLO");
         let p=Command::parse(&t).unwrap();
         assert_eq!(&p.text[..p.text_len as usize],b"HELLO");
+        t[12..16].copy_from_slice(&REPLACE_TEXT.to_le_bytes());
+        assert_eq!(Command::parse(&t).unwrap().operation,REPLACE_TEXT);
+        t[12..16].copy_from_slice(&4u32.to_le_bytes());
+        assert_eq!(Command::parse(&t),Err(Error::Operation));
     }
     #[test]fn reject_malformed_unbounded_and_fake_pointers(){
         let mut a=command(1,FILL);

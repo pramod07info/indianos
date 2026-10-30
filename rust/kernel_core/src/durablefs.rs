@@ -170,7 +170,9 @@ pub struct VolumeHealth{
  pub previous_generation:Option<u64>,
 }
 pub struct DurableFs<D:BlockDevice>{
-    disk:D,meta:Metadata,active:u64,previous:Option<Metadata>,
+    // Geometry belongs to the validated mount. Reinterpreting cached heads
+    // with a later device size could silently discard their bank ownership.
+    disk:D,sectors:u64,meta:Metadata,active:u64,previous:Option<Metadata>,
     // Exact observed heads, including an invalid/degraded copy. A stale
     // mount must not choose a COW bank using obsolete extent ownership.
     heads:[[u8;SECTOR_BYTES];2],
@@ -179,20 +181,23 @@ impl<D:BlockDevice> DurableFs<D>{
     /// Formats only a fully blank bounded device; caller has opted into writing.
     /// Never auto-format from mount on corrupt or unexpected metadata.
     pub fn format_blank(mut disk:D)->Result<Self,FsError>{
-        if disk.sector_count()<MIN_SECTORS || disk.sector_count()>u32::MAX as u64 {
+        let sectors=disk.sector_count();
+        if sectors<MIN_SECTORS || sectors>u32::MAX as u64 {
             return Err(FsError::InvalidVolume);
         }
         // Formatting must not erase a disk whose two metadata sectors
         // happen to be zero while another sector contains existing data.
         // The selected window must be EXPLICITLY empty in its entirety.
-        for lba in 0..disk.sector_count(){
+        for lba in 0..sectors{
             let mut sector=[0u8;SECTOR_BYTES];
             disk.read_sector(lba,&mut sector)?;
             if sector.iter().any(|&b|b!=0){return Err(FsError::InvalidVolume);}
         }
+        if disk.sector_count()!=sectors{return Err(FsError::InvalidVolume);}
         let meta=Metadata::empty();
-        let data=encode(&meta,disk.sector_count());
+        let data=encode(&meta,sectors);
         disk.write_sector(0,&data)?;
+        if disk.sector_count()!=sectors{return Err(FsError::InvalidVolume);}
         disk.write_sector(1,&data)?;
         // Formatting is explicitly opt-in, but it must still fail closed if
         // the selected device acknowledges a dropped or torn superblock.
@@ -201,10 +206,12 @@ impl<D:BlockDevice> DurableFs<D>{
             disk.read_sector(lba,&mut observed)?;
             if observed!=data{return Err(FsError::InvalidVolume);}
         }
-        Ok(Self{disk,meta,active:0,previous:Some(meta),heads:[data;2]})
+        if disk.sector_count()!=sectors{return Err(FsError::InvalidVolume);}
+        Ok(Self{disk,sectors,meta,active:0,previous:Some(meta),heads:[data;2]})
     }
     pub fn mount(mut disk:D)->Result<Self,FsError>{
-        if disk.sector_count()<MIN_SECTORS || disk.sector_count()>u32::MAX as u64{
+        let sectors=disk.sector_count();
+        if sectors<MIN_SECTORS || sectors>u32::MAX as u64{
             return Err(FsError::InvalidVolume);
         }
         let mut candidates:[Option<Metadata>;2]=[None,None];
@@ -213,16 +220,16 @@ impl<D:BlockDevice> DurableFs<D>{
             let mut bytes=[0u8;SECTOR_BYTES];
             disk.read_sector(n as u64,&mut bytes)?;
             heads[n]=bytes;
-            if let Some(meta)=decode(&bytes,disk.sector_count()){
+            if let Some(meta)=decode(&bytes,sectors){
                 if verify_metadata(&mut disk,&meta)?{*slot=Some(meta);}
             }
         }
+        if disk.sector_count()!=sectors{return Err(FsError::InvalidVolume);}
         // Two independently valid copies with the same generation must
         // describe exactly the same state. Picking one arbitrarily would
         // hide a split-brain/corrupted checkpoint and risk silent data loss.
         if let (Some(a),Some(b))=(candidates[0],candidates[1]){
-            if a.generation==b.generation && encode(&a,disk.sector_count())!=
-                encode(&b,disk.sector_count()){
+            if a.generation==b.generation && encode(&a,sectors)!=encode(&b,sectors){
                 return Err(FsError::InvalidVolume);
             }
         }
@@ -242,28 +249,30 @@ impl<D:BlockDevice> DurableFs<D>{
             (None,Some(b))=>(1,b,None),
             (None,None)=>return Err(FsError::InvalidVolume),
         };
-        Ok(Self{disk,meta,active,previous,heads})
+        Ok(Self{disk,sectors,meta,active,previous,heads})
     }
     /// Verify both superblocks and all referenced COW payload checksums
     /// without modifying the device or choosing a destructive recovery path.
     /// Fail closed on two valid same-generation but divergent checkpoints.
     pub fn inspect_health(disk:&mut D)->Result<VolumeHealth,FsError>{
-        if disk.sector_count()<MIN_SECTORS||disk.sector_count()>u32::MAX as u64{
+        let sectors=disk.sector_count();
+        if sectors<MIN_SECTORS||sectors>u32::MAX as u64{
             return Err(FsError::InvalidVolume);
         }
         let mut copies=[None,None];
         for index in 0..2{
             let mut header=[0u8;SECTOR_BYTES];
             disk.read_sector(index as u64,&mut header)?;
-            if let Some(meta)=decode(&header,disk.sector_count()){
+            if let Some(meta)=decode(&header,sectors){
                 if verify_metadata(disk,&meta)?{copies[index]=Some(meta);}
             }
         }
+        if disk.sector_count()!=sectors{return Err(FsError::InvalidVolume);}
         let (latest,previous,valid_copies)=match (copies[0],copies[1]){
             (Some(a),Some(b))=>{
                 if a.generation.abs_diff(b.generation)>1 ||
                    (a.generation==b.generation&&
-                    encode(&a,disk.sector_count())!=encode(&b,disk.sector_count())){
+                    encode(&a,sectors)!=encode(&b,sectors)){
                     return Err(FsError::InvalidVolume);
                 }
                 if a.generation>=b.generation{
@@ -295,10 +304,12 @@ impl<D:BlockDevice> DurableFs<D>{
     /// Re-probe actual disk sectors, not cached metadata. Fail if a different
     /// process changed the current head while this filesystem was mounted.
     pub fn mounted_health(&mut self)->Result<VolumeHealth,FsError>{
+        self.check_geometry()?;
         let report=Self::inspect_health(&mut self.disk)?;
         let mut active=[0u8;SECTOR_BYTES];
         self.disk.read_sector(self.active,&mut active)?;
-        if active!=encode(&self.meta,self.disk.sector_count()) ||
+        self.check_geometry()?;
+        if active!=encode(&self.meta,self.sectors) ||
            report.current_generation!=self.meta.generation{
             return Err(FsError::InvalidVolume);
         }
@@ -318,7 +329,8 @@ impl<D:BlockDevice> DurableFs<D>{
         if health.redundancy==Redundancy::Healthy{return Ok(false);}
         if health.valid_copies!=1{return Err(FsError::InvalidVolume);}
         let inactive=1-self.active;
-        let bytes=encode(&self.meta,self.disk.sector_count());
+        let bytes=encode(&self.meta,self.sectors);
+        self.check_geometry()?;
         self.disk.write_sector(inactive,&bytes)?;
         let mut observed=[0u8;SECTOR_BYTES];
         self.disk.read_sector(inactive,&mut observed)?;
@@ -326,6 +338,7 @@ impl<D:BlockDevice> DurableFs<D>{
         // Validate BOTH newly published copies and all referenced file
         // payloads before acknowledging an admin-triggered repair.
         let after=Self::inspect_health(&mut self.disk)?;
+        self.check_geometry()?;
         if after.valid_copies!=2 ||
            after.current_generation!=self.meta.generation{
             return Err(FsError::InvalidVolume);
@@ -405,19 +418,36 @@ impl<D:BlockDevice> DurableFs<D>{
     fn available_bank(&self,slot:usize)->Option<u8>{
         let present=self.meta.entries[slot];
         let previous=self.previous.map(|m|m.entries[slot]).unwrap_or(Entry::EMPTY);
+        // Payload corruption disqualifies a checkpoint for mounting, not
+        // its bank ownership. Rewriting its bank could otherwise repair
+        // that payload and revive a rejected namespace after a power cut,
+        // before our replacement metadata is published. Keep references
+        // from BOTH structurally valid observed heads until overwritten.
+        // There are only two heads and three banks per slot, so this still
+        // leaves a bank available even on a degraded recovery mount.
+        let observed=self.heads.map(|head|decode(&head,self.sectors));
         (0..BANK_COUNT).find(|&bank|
             (!present.used || present.bank!=bank) &&
-            (!previous.used || previous.bank!=bank))
+            (!previous.used || previous.bank!=bank) &&
+            observed.iter().flatten().all(|meta|{
+                let entry=meta.entries[slot];
+                !entry.used || entry.bank!=bank
+            }))
     }
     /// The volume owner must serialize whole operations across mounts.
     /// This detects stale handles between operations, not concurrent DMA
     /// writers or a substitute for a device-wide filesystem lock.
     fn check_heads(&mut self)->Result<(),FsError>{
+        self.check_geometry()?;
         for index in 0..2 {
             let mut observed=[0u8;SECTOR_BYTES];
             self.disk.read_sector(index as u64,&mut observed)?;
             if observed!=self.heads[index]{return Err(FsError::InvalidVolume);}
         }
+        self.check_geometry()
+    }
+    fn check_geometry(&self)->Result<(),FsError>{
+        if self.disk.sector_count()!=self.sectors{return Err(FsError::InvalidVolume);}
         Ok(())
     }
     fn publish(&mut self,mut proposed:Metadata)->Result<(),FsError>{
@@ -425,13 +455,15 @@ impl<D:BlockDevice> DurableFs<D>{
         proposed.generation=self.meta.generation.checked_add(1)
             .ok_or(FsError::InvalidVolume)?;
         let inactive=1-self.active;
-        let bytes=encode(&proposed,self.disk.sector_count());
+        let bytes=encode(&proposed,self.sectors);
+        self.check_geometry()?;
         self.disk.write_sector(inactive,&bytes)?;
         // Verify the readback BEFORE publishing the new in-memory head.
         // A block device that acknowledges but discards a metadata write
         // must never be treated as a committed filesystem transaction.
         let mut observed=[0u8;SECTOR_BYTES];
         self.disk.read_sector(inactive,&mut observed)?;
+        self.check_geometry()?;
         if observed!=bytes{return Err(FsError::InvalidVolume);}
         self.previous=Some(self.meta);
         self.meta=proposed;
@@ -448,11 +480,13 @@ impl<D:BlockDevice> DurableFs<D>{
                 sector[..end-start].copy_from_slice(&data[start..end]);
             }
             let lba=block_start(slot,bank)+i as u64;
+            self.check_geometry()?;
             self.disk.write_sector(lba,&sector)?;
             // Detect devices that report successful writes but return stale
             // or corrupted data before making a new checksum head visible.
             let mut observed=[0u8;SECTOR_BYTES];
             self.disk.read_sector(lba,&mut observed)?;
+            self.check_geometry()?;
             if observed!=sector{return Err(FsError::InvalidVolume);}
         }
         Ok(())
@@ -644,6 +678,195 @@ mod tests{
     fn blank()->Disk{
         Disk{sectors:[[0;SECTOR_BYTES];MIN_SECTORS as usize],fail_at:None,
             ignore_at:None,fail_read_lba:None,writes:0}
+    }
+    /// A crash between sector transfers does not tear a later metadata
+    /// sector: it simply prevents that transfer and all subsequent writes.
+    struct PowerCutDisk{disk:Disk,writes_left:usize}
+    impl BlockDevice for PowerCutDisk{
+        fn sector_count(&self)->u64{self.disk.sector_count()}
+        fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+            ->Result<(),BlockError>{self.disk.read_sector(lba,out)}
+        fn write_sector(&mut self,lba:u64,data:&[u8;SECTOR_BYTES])
+            ->Result<(),BlockError>{
+            if self.writes_left==0{return Err(BlockError::Io);}
+            self.disk.write_sector(lba,data)?;
+            self.writes_left-=1;Ok(())
+        }
+    }
+    struct ChangingGeometryDisk{
+        disk:PowerCutDisk,sectors:std::rc::Rc<std::cell::Cell<u64>>,
+        switch_on_read:Option<(u64,u64)>,
+    }
+    impl BlockDevice for ChangingGeometryDisk{
+        fn sector_count(&self)->u64{self.sectors.get()}
+        fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+            ->Result<(),BlockError>{
+            self.disk.read_sector(lba,out)?;
+            if let Some((at,sectors))=self.switch_on_read{
+                if lba==at{self.sectors.set(sectors);self.switch_on_read=None;}
+            }
+            Ok(())
+        }
+        fn write_sector(&mut self,lba:u64,data:&[u8;SECTOR_BYTES])
+            ->Result<(),BlockError>{self.disk.write_sector(lba,data)}
+    }
+    fn payload_rejected_head(slot:usize,payload:&[u8],corrupt_byte:usize)->Disk{
+        let mut fs=DurableFs::format_blank(blank()).unwrap();
+        for index in 0..slot{
+            fs.create_path(&format!("/keep{index}"),b"unrelated committed data").unwrap();
+        }
+        fs.create_path("/rejected",payload).unwrap();
+        let bank=fs.meta.entries[slot].bank;
+        let mut disk=fs.into_device();
+        disk.sectors[block_start(slot,bank) as usize+corrupt_byte/SECTOR_BYTES]
+            [corrupt_byte%SECTOR_BYTES]^=1;
+        disk
+    }
+    #[test]fn m1_recovery_powercut_cannot_revive_payload_rejected_namespace(){
+        // Every slot, short/multisector/full-bank payload, first/last
+        // payload byte, and each cut BEFORE the metadata publication.
+        for slot in 0..ENTRIES{
+            for len in [1usize,17,513,1100,MAX_FILE_BYTES]{
+                let payload=vec![0x5a;len];
+                for corrupt_byte in [0,len-1]{
+                    let original=payload_rejected_head(slot,&payload,corrupt_byte);
+                    let heads=[original.sectors[0],original.sectors[1]];
+                    let recovery=DurableFs::mount(original.clone()).unwrap();
+                    let generation=recovery.generation();
+                    for cut in 0..=SECTORS_PER_BANK{
+                        let disk=PowerCutDisk{disk:original.clone(),writes_left:cut};
+                        let mut fs=DurableFs::mount(disk).unwrap();
+                        assert_eq!(fs.create_path("/intended",&payload),Err(FsError::Io));
+                        let disk=fs.into_device().disk;
+                        assert_eq!([disk.sectors[0],disk.sectors[1]],heads);
+                        assert_eq!(disk.writes,original.writes+cut);
+                        let mut recovered=DurableFs::mount(disk).unwrap();
+                        assert_eq!(recovered.generation(),generation,
+                            "slot {slot}, len {len}, corrupt {corrupt_byte}, cut {cut}");
+                        for name in ["/rejected","/intended"]{
+                            assert_eq!(recovered.read_path(name,&mut [0;MAX_FILE_BYTES]),
+                                Err(FsError::NotFound));
+                        }
+                        for index in 0..slot{
+                            assert_eq!(get(&mut recovered,&format!("/keep{index}")),
+                                b"unrelated committed data");
+                        }
+                        // Explicit remount/retry can still use the third
+                        // bank and publish exactly the intended namespace.
+                        recovered.create_path("/intended",&payload).unwrap();
+                        let mut committed=DurableFs::mount_healthy(recovered.into_device()).unwrap();
+                        assert_eq!(get(&mut committed,"/intended"),payload);
+                        assert_eq!(committed.read_path("/rejected",&mut [0;MAX_FILE_BYTES]),
+                            Err(FsError::NotFound));
+                    }
+                }
+            }
+        }
+    }
+    #[test]fn m1_recovery_quarantine_is_released_by_metadata_replacement(){
+        // Fill every slot. Retaining the rejected bank must neither lose a
+        // file slot nor permanently consume any of the three COW banks.
+        let payload=[0x63;MAX_FILE_BYTES];
+        let disk=payload_rejected_head(ENTRIES-1,&payload,MAX_FILE_BYTES-1);
+        let mut recovered=DurableFs::mount(disk).unwrap();
+        assert_eq!(recovered.available_bank(ENTRIES-1),Some(1));
+        recovered.create_path("/intended",&payload).unwrap();
+        assert_eq!(recovered.available_bank(ENTRIES-1),Some(0));
+        for round in 0..12u8{
+            let bytes=[round;MAX_FILE_BYTES];
+            recovered.overwrite_path("/intended",&bytes).unwrap();
+            recovered=DurableFs::mount_healthy(recovered.into_device()).unwrap();
+            assert_eq!(get(&mut recovered,"/intended"),bytes);
+        }
+        for index in 0..ENTRIES-1{
+            assert_eq!(get(&mut recovered,&format!("/keep{index}")),
+                b"unrelated committed data");
+        }
+    }
+    #[test]fn m1_recovery_surviving_and_rejected_heads_leave_third_bank_usable(){
+        for len in [1usize,513,MAX_FILE_BYTES]{
+            let before=vec![0x25;len];
+            let rejected=vec![0x76;len];
+            let mut fs=DurableFs::format_blank(blank()).unwrap();
+            fs.create_path("/data",&before).unwrap();
+            fs.overwrite_path("/data",&rejected).unwrap();
+            assert_eq!(fs.meta.entries[0].bank,1);
+            let mut original=fs.into_device();
+            original.sectors[block_start(0,1) as usize+(len-1)/SECTOR_BYTES]
+                [(len-1)%SECTOR_BYTES]^=1;
+            for cut in 0..=SECTORS_PER_BANK{
+                let disk=PowerCutDisk{disk:original.clone(),writes_left:cut};
+                let mut fs=DurableFs::mount(disk).unwrap();
+                assert_eq!(fs.available_bank(0),Some(2));
+                assert_eq!(fs.overwrite_path("/data",&rejected),Err(FsError::Io));
+                let mut recovered=DurableFs::mount(fs.into_device().disk).unwrap();
+                assert_eq!(get(&mut recovered,"/data"),before);
+                recovered.overwrite_path("/data",&rejected).unwrap();
+                assert_eq!(recovered.meta.entries[0].bank,2);
+                assert_eq!(recovered.available_bank(0),Some(1));
+                let mut committed=DurableFs::mount_healthy(recovered.into_device()).unwrap();
+                assert_eq!(get(&mut committed,"/data"),rejected);
+            }
+        }
+    }
+    #[test]fn m1_recovery_structurally_invalid_head_does_not_reserve_payload_bank(){
+        let mut disk=payload_rejected_head(0,b"payload",0);
+        disk.sectors[1][24]^=1; // bad metadata CRC cannot revive through data writes
+        let mut recovered=DurableFs::mount(disk).unwrap();
+        assert_eq!(recovered.available_bank(0),Some(0));
+        recovered.create_path("/intended",b"payload").unwrap();
+        let mut recovered=DurableFs::mount_healthy(recovered.into_device()).unwrap();
+        assert_eq!(get(&mut recovered,"/intended"),b"payload");
+    }
+    #[test]fn m1_recovery_changed_geometry_cannot_drop_quarantine_or_mutate(){
+        for changed in [0,MIN_SECTORS-1,MIN_SECTORS+1,u32::MAX as u64+1]{
+            let original=payload_rejected_head(1,b"identical payload",0);
+            let sectors=std::rc::Rc::new(std::cell::Cell::new(MIN_SECTORS));
+            let disk=ChangingGeometryDisk{
+                disk:PowerCutDisk{disk:original.clone(),writes_left:1},
+                sectors:sectors.clone(),
+                switch_on_read:None,
+            };
+            let mut fs=DurableFs::mount(disk).unwrap();
+            sectors.set(changed);
+            // The bank allocation must retain the originally decoded
+            // rejected head even when live geometry becomes untrustworthy.
+            assert_eq!(fs.available_bank(1),Some(1));
+            assert_eq!(fs.create_path("/intended",b"identical payload"),
+                Err(FsError::InvalidVolume));
+            assert_eq!(fs.overwrite_path("/keep0",b"changed"),
+                Err(FsError::InvalidVolume));
+            assert_eq!(fs.delete_path("/keep0"),Err(FsError::InvalidVolume));
+            assert_eq!(fs.rename_path("/keep0","/renamed"),Err(FsError::InvalidVolume));
+            assert_eq!(fs.repair_redundancy(),Err(FsError::InvalidVolume));
+            assert_eq!(fs.disk.disk.writes_left,1);
+            assert_eq!(fs.disk.disk.disk.writes,original.writes);
+            assert_eq!(fs.disk.disk.disk.sectors,original.sectors);
+            sectors.set(MIN_SECTORS);
+            let mut recovered=DurableFs::mount(fs.into_device().disk.disk).unwrap();
+            assert_eq!(get(&mut recovered,"/keep0"),b"unrelated committed data");
+            assert_eq!(recovered.read_path("/rejected",&mut [0;MAX_FILE_BYTES]),
+                Err(FsError::NotFound));
+        }
+    }
+    #[test]fn m1_recovery_geometry_must_stay_stable_through_mount_health_and_format(){
+        fn switching(disk:Disk)->ChangingGeometryDisk{
+            ChangingGeometryDisk{
+                // Even an attempted write would return Io instead of the
+                // expected geometry refusal, so these paths must not write.
+                disk:PowerCutDisk{disk,writes_left:0},
+                sectors:std::rc::Rc::new(std::cell::Cell::new(MIN_SECTORS)),
+                switch_on_read:Some((1,MIN_SECTORS+1)),
+            }
+        }
+        let fs=DurableFs::format_blank(blank()).unwrap();
+        let disk=fs.into_device();
+        assert!(matches!(DurableFs::mount(switching(disk.clone())),
+            Err(FsError::InvalidVolume)));
+        assert_eq!(DurableFs::inspect_health(&mut switching(disk)),
+            Err(FsError::InvalidVolume));
+        assert!(matches!(DurableFs::format_blank(switching(blank())),
+            Err(FsError::InvalidVolume)));
     }
     fn get(fs:&mut DurableFs<Disk>,path:&str)->Vec<u8>{
         let mut out=[0u8;MAX_FILE_BYTES];
