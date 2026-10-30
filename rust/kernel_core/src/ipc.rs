@@ -193,6 +193,37 @@ impl<const MAILBOXES: usize, const DEPTH: usize> IpcRouter<MAILBOXES, DEPTH> {
         target.enqueue(Message::new(sender, data)?)
     }
 
+    /// Send one identical payload to several distinct receivers atomically.
+    /// The kernel must authenticate sender against the current PCB first.
+    /// A full/unknown recipient or repeated target rejects the entire
+    /// transaction; no queue is mutated during the validation phase.
+    pub fn send_batch(&mut self,sender:u32,receivers:&[u32],data:&[u8])
+        ->Result<usize,IpcError>{
+        if sender==0{return Err(IpcError::InvalidPid);}
+        if receivers.is_empty()||receivers.len()>MAILBOXES{
+            return Err(IpcError::InvalidConfiguration);
+        }
+        let message=Message::new(sender,data)?;
+        if !self.mailboxes.iter().flatten().any(|m|m.receiver==sender){
+            return Err(IpcError::UnknownSender);
+        }
+        for (i,&pid) in receivers.iter().enumerate(){
+            if pid==0{return Err(IpcError::InvalidPid);}
+            if receivers[..i].contains(&pid){
+                return Err(IpcError::DuplicateReceiver);
+            }
+            let mailbox=self.mailboxes.iter().flatten()
+                .find(|m|m.receiver==pid).ok_or(IpcError::UnknownReceiver)?;
+            if mailbox.pending()==DEPTH{return Err(IpcError::Full);}
+        }
+        for &pid in receivers{
+            let mailbox=self.mailboxes.iter_mut().flatten()
+                .find(|m|m.receiver==pid).ok_or(IpcError::UnknownReceiver)?;
+            mailbox.enqueue(message)?;
+        }
+        Ok(receivers.len())
+    }
+
     /// Only the named receiver can consume its queue. The syscall handler
     /// derives this identity from the current PCB, not user input.
     pub fn receive(&mut self, receiver: u32) -> Result<Message, IpcError> {
@@ -424,8 +455,8 @@ mod tests {
         }),Err(IpcError::CopyFailed));
         assert_eq!(scratch,*b"bcd");assert_eq!(r.pending(2),Ok(3));
         assert_eq!(r.receive_batch_with(2,3,|msgs|{
-            assert_eq!(msgs.iter().map(|m|m.sender()).collect::<Vec<_>>(),
-                       vec![1,1,3]);true
+            assert_eq!([msgs[0].sender(),msgs[1].sender(),msgs[2].sender()],
+                       [1,1,3]);true
         }),Ok(3));
         assert_eq!(r.pending(2),Ok(0));
     }
@@ -447,6 +478,42 @@ mod tests {
         assert_eq!(r.receive(3).unwrap().payload(),b"peer");
     }
 
+    #[test]fn m1_r053_ipc_atomic_fanout_preserves_peer_fifo_on_full_queue(){
+        let mut r=IpcRouter::<4,2>::new().unwrap();
+        for pid in [1,2,3,4]{r.register(pid).unwrap();}
+        r.send(1,3,b"old").unwrap();
+        r.send(1,3,b"full").unwrap();
+        assert_eq!(r.send_batch(1,&[2,3,4],b"new"),Err(IpcError::Full));
+        assert_eq!(r.pending(2),Ok(0));assert_eq!(r.pending(4),Ok(0));
+        assert_eq!(r.receive(3).unwrap().payload(),b"old");
+        assert_eq!(r.receive(3).unwrap().payload(),b"full");
+        assert_eq!(r.send_batch(1,&[2,3,4],b"new"),Ok(3));
+        for pid in [2,3,4]{
+            let msg=r.receive(pid).unwrap();
+            assert_eq!(msg.sender(),1);
+            assert_eq!(msg.payload(),b"new");
+        }
+    }
+    #[test]fn m1_r053_ipc_fanout_rejects_duplicate_unknown_and_invalid_senders(){
+        let mut r=IpcRouter::<3,3>::new().unwrap();
+        for pid in [1,2,3]{r.register(pid).unwrap();}
+        for (sender,targets,wanted) in [
+            (1,&[2u32,2][..],IpcError::DuplicateReceiver),
+            (1,&[2,99][..],IpcError::UnknownReceiver),
+            (0,&[2,3][..],IpcError::InvalidPid),
+            (99,&[2,3][..],IpcError::UnknownSender),
+            (1,&[2,0][..],IpcError::InvalidPid),
+        ]{
+            assert_eq!(r.send_batch(sender,targets,b"blocked"),Err(wanted));
+            assert_eq!(r.pending(2),Ok(0));assert_eq!(r.pending(3),Ok(0));
+        }
+        assert_eq!(r.send_batch(1,&[],b"x"),Err(IpcError::InvalidConfiguration));
+        assert_eq!(r.send_batch(1,&[2,3],&[7u8;65]),
+            Err(IpcError::PayloadTooLarge));
+        assert_eq!(r.send_batch(1,&[3,2],b"accepted"),Ok(2));
+        assert_eq!(r.receive(2).unwrap().payload(),b"accepted");
+        assert_eq!(r.receive(3).unwrap().payload(),b"accepted");
+    }
     #[test]
     fn ipc_failed_delivery_retains_wrapped_fifo_and_wire_padding(){
         let mut router=IpcRouter::<2,2>::new().unwrap();
