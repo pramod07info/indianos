@@ -43,7 +43,7 @@ pub fn execute<const F:usize,const G:usize>(
  }
  let line=core::str::from_utf8(command).map_err(|_|Error::Invalid)?.trim();
  if line.is_empty(){return Err(Error::Invalid);}
- if line=="help"{return publish(b"help pwd ls cat /path write /path text",out);}
+ if line=="help"{return publish(b"help pwd ls cat write grep cp mv rm wc head tail append",out);}
  if line=="pwd"{return publish(b"/",out);}
  // Require actual per-process read grants rather than revealing file names.
  if line=="ls"{
@@ -71,6 +71,32 @@ pub fn execute<const F:usize,const G:usize>(
   let mut tmp=[0u8;OUTPUT_MAX];
   let size=fs.read_all(&canonical[..n],&mut tmp).map_err(|_|Error::Io)?;
   return publish(&tmp[..size],out);
+ }
+ // R057: bounded, read-only grep over a complete authenticated RAM file.
+ // No shell, regex engine or dynamic memory. Match whole lines by literal
+ // printable ASCII substring; reject output overflow without partial text.
+ if let Some(rest)=line.strip_prefix("grep "){
+  auth.require(caller,FILE_READ,now).map_err(|_|Error::Denied)?;
+  let (needle,path)=rest.split_once(' ').ok_or(Error::Invalid)?;
+  if needle.is_empty()||needle.len()>64||path.is_empty()||
+     path.contains(' '){return Err(Error::Invalid);}
+  let mut canonical=[0u8;PATH_MAX];
+  let n=crate::vfs_path::normalize_absolute(path,&mut canonical)
+   .map_err(|_|Error::Invalid)?;
+  if n<=1{return Err(Error::Invalid);}
+  let mut source=[0u8;crate::batch7_ramfs::CONTENT_MAX];
+  let size=fs.read_all(&canonical[..n],&mut source).map_err(|_|Error::Io)?;
+  let mut staged=[0u8;OUTPUT_MAX];
+  let mut written=0usize;
+  for row in source[..size].split(|ch|*ch==b'\n'){
+   if !row.windows(needle.len()).any(|w|w==needle.as_bytes()){continue;}
+   let end=written.checked_add(row.len()+1).ok_or(Error::Overflow)?;
+   if end>OUTPUT_MAX{return Err(Error::Overflow);}
+   staged[written..written+row.len()].copy_from_slice(row);
+   staged[written+row.len()]=b'\n';
+   written=end;
+  }
+  return publish(&staged[..written],out);
  }
  if let Some(rest)=line.strip_prefix("write "){
   let (path,data)=rest.split_once(' ').ok_or(Error::Invalid)?;
@@ -203,6 +229,50 @@ pub fn execute<const F:usize,const G:usize>(
  }
 }
 
+#[cfg(test)]
+mod r057_terminal_search_tests{
+ use super::*;
+ fn owner()->Identity{Identity{pid:17,generation:2}}
+ fn auth()->Access<1>{
+  let mut a=Access::new();a.grant(owner(),FILE_READ|FILE_WRITE,100).unwrap();a
+ }
+ #[test]fn grep_returns_only_matching_lines_without_mutating_file(){
+  let mut fs=RamFs::<1>::new();
+  fs.replace(b"/log",b"ok\nerror one\nok\nerror two\n").unwrap();
+  let version=fs.version();
+  let mut out=[0xcc;OUTPUT_MAX];
+  let n=execute(&auth(),owner(),1,&mut fs,b"grep error /log",&mut out).unwrap();
+  assert_eq!(&out[..n],b"error one\nerror two\n");
+  assert_eq!(&out[n..],&[0xcc;OUTPUT_MAX-20]);
+  assert_eq!(fs.version(),version);
+  assert_eq!(execute(&auth(),owner(),1,&mut fs,b"grep absent /log",&mut out),Ok(0));
+ }
+ #[test]fn grep_rejects_overflow_and_foreign_generation_without_output(){
+  let mut fs=RamFs::<1>::new();
+  fs.replace(b"/log",&[b'x';600]).unwrap();
+  let mut out=[0xa5;OUTPUT_MAX];
+  assert_eq!(execute(&auth(),owner(),1,&mut fs,b"grep x /log",&mut out),
+             Err(Error::Overflow));
+  assert_eq!(out,[0xa5;OUTPUT_MAX]);
+  let stale=Identity{generation:3,..owner()};
+  assert_eq!(execute(&auth(),stale,1,&mut fs,b"grep x /log",&mut out),
+             Err(Error::Denied));
+  assert_eq!(execute(&auth(),owner(),1,&mut fs,b"grep x /../log",&mut out),
+             Err(Error::Invalid));
+  assert_eq!(out,[0xa5;OUTPUT_MAX]);
+ }
+ #[test]fn grep_short_destination_and_missing_file_are_fail_closed(){
+  let mut fs=RamFs::<1>::new();
+  fs.replace(b"/log",b"ready now\nother\n").unwrap();
+  let mut short=[0x88;4];
+  assert_eq!(execute(&auth(),owner(),1,&mut fs,b"grep ready /log",&mut short),
+    Err(Error::Overflow));
+  assert_eq!(short,[0x88;4]);
+  assert_eq!(execute(&auth(),owner(),1,&mut fs,b"grep ready /missing",&mut short),
+    Err(Error::Io));
+  assert_eq!(short,[0x88;4]);
+ }
+}
 #[cfg(test)]
 mod orbit_r005_terminal_tests{
  use super::*;
