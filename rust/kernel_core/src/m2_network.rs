@@ -80,7 +80,12 @@ pub fn parse_dns_a(id:u16,domain:&[u8],wire:&[u8])->Result<[u8;4],Error>{
   be16(&wire[i+10..i+12])!=4{return Err(Error::Malformed);}
  let ttl=u32::from_be_bytes(wire[i+6..i+10].try_into().unwrap());
  if ttl==0||wire.len()!=i+16{return Err(Error::Malformed);}
- Ok(wire[i+12..i+16].try_into().unwrap())
+ let address:[u8;4]=wire[i+12..i+16].try_into()
+  .map_err(|_|Error::Malformed)?;
+ // Outbound unicast endpoints cannot be unspecified, multicast, limited
+ // broadcast or reserved-class addresses.
+ if address[0]==0||address[0]>=224{return Err(Error::Malformed);}
+ Ok(address)
 }
 /// Bounded TCP retransmission *policy*, not a TCP socket or TLS record layer.
 /// An authenticated ingress layer must verify source/destination address,
@@ -370,6 +375,16 @@ mod m2_tests{
   assert_eq!(parse_dns_a(0x1234,b"example.com",&reserved),Err(Error::Malformed));
   let mut trailing=[0u8;46];trailing[..45].copy_from_slice(&valid);
   assert_eq!(parse_dns_a(0x1234,b"example.com",&trailing),Err(Error::Malformed));
+ }
+ #[test]fn r055_dns_rejects_unicast_incompatible_a_records(){
+  for addr in [[0,0,0,0],[224,0,0,1],[239,1,2,3],
+    [240,0,0,1],[255,255,255,255]]{
+   let mut p=packet();p[41..45].copy_from_slice(&addr);
+   assert_eq!(parse_dns_a(0x1234,b"example.com",&p),
+     Err(Error::Malformed));
+  }
+  let mut p=packet();p[41..45].copy_from_slice(&[1,1,1,1]);
+  assert_eq!(parse_dns_a(0x1234,b"example.com",&p),Ok([1,1,1,1]));
  }
  #[test]fn m2_tcp_retry_budget_and_exact_ack_are_identity_bound(){
   let owner=Identity{pid:7,generation:2};

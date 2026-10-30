@@ -314,7 +314,8 @@ impl ProjectTree {
         let count = fs.read(Self::str_path(&p, n), &mut bytes)?;
         let source = core::str::from_utf8(&bytes[..count]).map_err(|_|Error::Invalid)?;
         let mut at = 0;
-        for (index, row) in source.split('\n').enumerate() {
+        // Reject phantom final row after a newline, consistent with source_lines().
+        for (index, row) in source.split_terminator('\n').enumerate() {
             if index + 1 == line {
                 let offset = row.char_indices().nth(column - 1).map(|x| x.0)
                     .or_else(|| if column == row.chars().count() + 1 {
@@ -378,7 +379,7 @@ impl ProjectTree {
         let mut bytes=[0u8;MAX_FILE_BYTES];
         let count=fs.read(Self::str_path(&p,n),&mut bytes)?;
         let text=core::str::from_utf8(&bytes[..count]).map_err(|_|Error::Invalid)?;
-        let row=text.split('\n').nth(line-1).ok_or(Error::Invalid)?;
+        let row=text.split_terminator('\n').nth(line-1).ok_or(Error::Invalid)?;
         if row.len()>out.len(){return Err(Error::Full);}
         out[..row.len()].copy_from_slice(row.as_bytes());
         Ok(row.len())
@@ -492,6 +493,34 @@ mod tests {
         let mut data=[0u8;48];
         assert_eq!(next.read_file(a(),&mut fs,"main",&mut data),Ok(15));
         assert_eq!(&data[..15],"two 🍀\nthree\n".as_bytes());
+    }
+    #[test]
+    fn r055_trailing_newline_cannot_expose_phantom_source_row(){
+        let mut fs=fresh();let mut p=ProjectTree::new();
+        p.create(a(),&mut fs,"demo").unwrap();
+        p.create_file(a(),&mut fs,"main",b"first\nsecond\n").unwrap();
+        assert_eq!(p.source_lines(a(),&mut fs,"main"),Ok(2));
+        let mut row=[0xaau8;16];
+        assert_eq!(p.read_source_line(a(),&mut fs,"main",2,&mut row),Ok(6));
+        assert_eq!(&row[..6],b"second");
+        let original=row;
+        assert_eq!(p.read_source_line(a(),&mut fs,"main",3,&mut row),
+            Err(Error::Invalid));
+        assert_eq!(row,original);
+        assert_eq!(p.source_offset(a(),&mut fs,"main",3,1),Err(Error::Invalid));
+        assert_eq!(p.source_offset(a(),&mut fs,"main",2,7),Ok(12));
+    }
+    #[test]
+    fn r055_empty_source_has_zero_visible_rows(){
+        let mut fs=fresh();let mut p=ProjectTree::new();
+        p.create(a(),&mut fs,"demo").unwrap();
+        p.create_file(a(),&mut fs,"empty",b"").unwrap();
+        let mut out=[0x55;4];
+        assert_eq!(p.source_lines(a(),&mut fs,"empty"),Ok(0));
+        assert_eq!(p.read_source_line(a(),&mut fs,"empty",1,&mut out),
+            Err(Error::Invalid));
+        assert_eq!(p.source_offset(a(),&mut fs,"empty",1,1),Err(Error::Invalid));
+        assert_eq!(out,[0x55;4]);
     }
     #[test]
     fn r043_project_line_errors_and_short_output_are_atomic(){
