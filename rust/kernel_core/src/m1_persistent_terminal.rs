@@ -593,15 +593,23 @@ impl GptTerminalSession{
   preflight_partition_caller(auth,caller,now)
  }
  /// An auth failure or malformed command never mutates session state.
- /// A GPT identity, I/O or metadata mount failure permanently retires the
- /// selection, preventing a later media swap from reviving it.
+ /// A GPT identity, mount or uncertain filesystem I/O failure permanently
+ /// retires the selection; a fresh session requires validated media.
+ /// Ordinary NotFound/Exists user errors leave the session active.
  pub fn execute<D:BlockDevice,const N:usize>(
   &mut self,disk:&mut D,auth:&Access<N>,caller:Identity,now:u64,
   input:&[u8],out:&mut[u8],
  )->Result<usize,PartitionCommandError>{
   self.authorize(auth,caller,now)?;
   let result=command_on_gpt_selection(disk,self.selection,auth,caller,now,input,out);
-  if matches!(result,Err(PartitionCommandError::Mount(_))){self.active=false;}
+  if matches!(result,Err(PartitionCommandError::Mount(_))|
+       Err(PartitionCommandError::Command(Error::Io(FsError::Io|FsError::InvalidVolume)))){
+   // A failed or ambiguously acknowledged data/metadata write may have
+   // changed the durable head. Never permit a session to issue a second
+   // command on its old checkpoint assumptions; require a fresh volume
+   // validation and newly authorized session.
+   self.active=false;
+  }
   if result.is_ok(){self.command_count=self.command_count.saturating_add(1);}
   result
  }

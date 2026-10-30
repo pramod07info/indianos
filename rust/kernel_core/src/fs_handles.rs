@@ -16,10 +16,15 @@ const SLOTS:usize=4;
 #[derive(Clone,Copy)]
 struct Handle {
     token:u64, pid:u32, generation:u64, mode:u64, offset:u64,
+    // Durable metadata generation at last validated I/O. A path by itself
+    // is not a persistent file-object identity: unlink/recreate or rename
+    // could otherwise redirect this handle to unrelated content.
+    filesystem_generation:u64,
     path:[u8;24], len:usize,
 }
 impl Handle{
-    const EMPTY:Self=Self{token:0,pid:0,generation:0,mode:0,offset:0,path:[0;24],len:0};
+    const EMPTY:Self=Self{token:0,pid:0,generation:0,mode:0,offset:0,
+        filesystem_generation:0,path:[0;24],len:0};
     fn pathname(&self)->&str{
         core::str::from_utf8(&self.path[..self.len]).unwrap()
     }
@@ -116,8 +121,8 @@ impl FileHandles{
         fs.read_at(path,0,&mut [])?;
         let token=self.next;
         self.next=self.next.checked_add(1).ok_or(FsError::Full)?;
-        self.entries[slot]=Handle{token,pid:owner.pid,generation:owner.generation,mode,offset:0,
-                                  path:bytes,len};
+        self.entries[slot]=Handle{token,pid:owner.pid,generation:owner.generation,
+            mode,offset:0,filesystem_generation:fs.generation(),path:bytes,len};
         Ok(token)
     }
     pub fn read<D:BlockDevice>(&mut self,pid:u32,token:u64,
@@ -131,7 +136,13 @@ impl FileHandles{
         if out.is_empty()||out.len()>72{return Err(FsError::TooLarge);}
         let slot=self.index(owner,token)?;
         let h=self.entries[slot];
-        if h.mode&READ==0{return Err(FsError::InvalidName);}
+        if h.mode&READ==0 || h.filesystem_generation!=fs.generation(){
+            // Never let a stale path handle acquire a newly created object.
+            // In the bounded COW implementation this is a conservative
+            // volume generation check: an unrelated mutation also requires
+            // closing and reopening the handle.
+            return Err(FsError::InvalidName);
+        }
         let n=fs.read_at(h.pathname(),h.offset,out)?;
         self.entries[slot].offset=h.offset.checked_add(n as u64)
             .ok_or(FsError::TooLarge)?;
@@ -148,7 +159,11 @@ impl FileHandles{
         if input.is_empty()||input.len()>256{return Err(FsError::TooLarge);}
         let slot=self.index(owner,token)?;
         let h=self.entries[slot];
-        if h.mode&WRITE==0{return Err(FsError::InvalidName);}
+        if h.mode&WRITE==0 || h.filesystem_generation!=fs.generation(){
+            // No write, quota charge or cursor advancement on an old
+            // volume snapshot; require explicit fresh object selection.
+            return Err(FsError::InvalidName);
+        }
         // Authorize immediately before mutation, not only on open.
         // The budget is shared by all handles and survives close/reopen.
         if self.write_guard.preflight(h.pathname(),input.len()).is_err(){
@@ -159,6 +174,7 @@ impl FileHandles{
         self.write_guard.completed(n);
         self.entries[slot].offset=h.offset.checked_add(n as u64)
             .ok_or(FsError::TooLarge)?;
+        self.entries[slot].filesystem_generation=fs.generation();
         Ok(n)
     }
     pub fn seek(&mut self,pid:u32,token:u64,offset:u64)->Result<u64,FsError>{
@@ -539,6 +555,115 @@ mod tests{
         assert_eq!(table.next_generation,u64::MAX);assert!(table.owns(owner));
         assert_eq!(table.dispatch_authenticated(2,owner,token,0,"",
             &mut [0;4],&mut fs),Ok(4));
+    }
+
+    #[test] fn m1_r051_old_handle_cannot_read_or_overwrite_unlinked_recreated_file(){
+        let mut fs=fresh();fs.mkdir("/shared").unwrap();
+        fs.create("/shared/note",b"original").unwrap();
+        let mut table=FileHandles::new();
+        let owner=table.bind_process(1).unwrap();
+        let token=table.dispatch_authenticated(1,owner,0,READ|WRITE,
+            "/shared/note",&mut [],&mut fs).unwrap();
+        let generation=fs.generation();
+        fs.unlink("/shared/note").unwrap();
+        fs.create("/shared/note",b"replacement").unwrap();
+        assert!(fs.generation()>generation);
+        let count=table.security_statistics().completed_writes;
+        let mut out=[0x55;32];
+        assert_eq!(table.dispatch_authenticated(2,owner,token,0,"",&mut out,&mut fs),
+            Err(FsError::InvalidName));
+        assert_eq!(out,[0x55;32]);
+        assert_eq!(table.dispatch_authenticated(3,owner,token,0,"",&mut [b'X'],&mut fs),
+            Err(FsError::InvalidName));
+        assert_eq!(table.security_statistics().completed_writes,count);
+        let mut exact=[0;32];
+        assert_eq!(fs.read("/shared/note",&mut exact),Ok(11));
+        assert_eq!(&exact[..11],b"replacement");
+    }
+    #[test] fn m1_r051_old_handle_cannot_follow_rename_and_new_path_occupant(){
+        let mut fs=fresh();fs.mkdir("/shared").unwrap();
+        fs.create("/shared/note",b"old").unwrap();
+        let mut table=FileHandles::new();
+        let token=table.open(1,"/shared/note",READ|WRITE,&mut fs).unwrap();
+        fs.rename_file("/shared/note","/shared/archive").unwrap();
+        fs.create("/shared/note",b"new").unwrap();
+        let before=fs.generation();
+        let mut out=[0x9a;8];
+        assert_eq!(table.read(1,token,&mut out,&mut fs),Err(FsError::InvalidName));
+        assert_eq!(table.write(1,token,b"x",&mut fs),Err(FsError::InvalidName));
+        assert_eq!(out,[0x9a;8]);assert_eq!(fs.generation(),before);
+        assert_eq!(fs.read("/shared/archive",&mut out),Ok(3));
+        assert_eq!(&out[..3],b"old");
+        let recent=table.open(1,"/shared/note",READ,&mut fs).unwrap();
+        assert_eq!(table.read(1,recent,&mut out,&mut fs),Ok(3));
+        assert_eq!(&out[..3],b"new");
+    }
+    #[test] fn m1_r051_same_handle_refreshes_after_successful_cow_writes(){
+        let mut fs=fresh();fs.mkdir("/shared").unwrap();
+        fs.create("/shared/note",b"0000").unwrap();
+        let mut table=FileHandles::new();
+        let token=table.open(1,"/shared/note",READ|WRITE,&mut fs).unwrap();
+        assert_eq!(table.write(1,token,b"A",&mut fs),Ok(1));
+        assert_eq!(table.write(1,token,b"B",&mut fs),Ok(1));
+        assert_eq!(table.seek(1,token,0),Ok(0));
+        let mut out=[0;4];
+        assert_eq!(table.read(1,token,&mut out,&mut fs),Ok(4));
+        assert_eq!(&out,b"AB00");
+        let mut remounted=HierVfs::mount(fs.into_device()).unwrap();
+        assert_eq!(remounted.read("/shared/note",&mut out),Ok(4));
+        assert_eq!(&out,b"AB00");
+    }
+    #[test] fn m1_r051_peer_handle_requires_reopen_after_writer_commits(){
+        let mut fs=fresh();fs.mkdir("/shared").unwrap();
+        fs.create("/shared/note",b"before").unwrap();
+        let mut table=FileHandles::new();
+        let init=table.bind_process(1).unwrap();
+        let files=table.bind_process(2).unwrap();
+        let reader=table.dispatch_authenticated(1,files,0,READ,
+            "/shared/note",&mut [],&mut fs).unwrap();
+        let writer=table.dispatch_authenticated(1,init,0,WRITE,
+            "/shared/note",&mut [],&mut fs).unwrap();
+        assert_eq!(table.dispatch_authenticated(3,init,writer,0,"",
+            &mut [b'X'],&mut fs),Ok(1));
+        let mut out=[0x3d;8];
+        assert_eq!(table.dispatch_authenticated(2,files,reader,0,"",
+            &mut out,&mut fs),Err(FsError::InvalidName));
+        assert_eq!(out,[0x3d;8]);
+        table.dispatch_authenticated(5,files,reader,0,"",&mut [],&mut fs).unwrap();
+        let fresh_reader=table.dispatch_authenticated(1,files,0,READ,
+            "/shared/note",&mut [],&mut fs).unwrap();
+        assert_eq!(table.dispatch_authenticated(2,files,fresh_reader,0,"",
+            &mut out,&mut fs),Ok(6));
+        assert_eq!(&out[..6],b"Xefore");
+    }
+    #[test] fn m1_r051_unrelated_cow_update_conservatively_retires_old_handle(){
+        let mut fs=fresh();fs.mkdir("/shared").unwrap();
+        fs.create("/shared/note",b"safe").unwrap();
+        fs.create("/shared/other",b"one").unwrap();
+        let mut table=FileHandles::new();
+        let token=table.open(1,"/shared/note",READ,&mut fs).unwrap();
+        fs.overwrite("/shared/other",b"two").unwrap();
+        let mut out=[0x61;8];
+        assert_eq!(table.read(1,token,&mut out,&mut fs),Err(FsError::InvalidName));
+        assert_eq!(out,[0x61;8]);
+        table.close(1,token).unwrap();
+        let current=table.open(1,"/shared/note",READ,&mut fs).unwrap();
+        assert_eq!(table.read(1,current,&mut out,&mut fs),Ok(4));
+        assert_eq!(&out[..4],b"safe");
+    }
+    #[test] fn m1_r051_read_failure_preserves_offset_and_volume_generation_token(){
+        let mut fs=fresh();fs.mkdir("/shared").unwrap();
+        fs.create("/shared/note",b"four").unwrap();
+        let mut table=FileHandles::new();
+        let token=table.open(1,"/shared/note",READ,&mut fs).unwrap();
+        let idx=table.index(Identity{pid:1,generation:0},token).unwrap();
+        let saved=table.entries[idx];
+        assert_eq!(table.read(1,token,&mut [0u8;73],&mut fs),Err(FsError::TooLarge));
+        assert_eq!(table.entries[idx].offset,saved.offset);
+        assert_eq!(table.entries[idx].filesystem_generation,saved.filesystem_generation);
+        let mut out=[0;4];
+        assert_eq!(table.read(1,token,&mut out,&mut fs),Ok(4));
+        assert_eq!(&out,b"four");
     }
     #[test] fn authenticated_restarts_keep_rights_and_global_write_budget(){
         use crate::fs_write_guard::MAX_WRITE_OPERATIONS;

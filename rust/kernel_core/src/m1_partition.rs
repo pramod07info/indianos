@@ -1544,6 +1544,41 @@ mod m1_partition_tests{
    assert_eq!(disk.data[140],[0x8c;SECTOR_BYTES]);
   }
  }
+
+ #[test]fn m1_r051_uncertain_terminal_cow_write_retires_session_before_retry(){
+  use crate::batch6_security::{FILE_READ,FILE_WRITE};
+  use crate::m1_persistent_terminal::{PartitionCommandError,Error as CmdError};
+  let mut d=m1_r050_provision();
+  let a=m1_r050_auth(FILE_READ|FILE_WRITE,200);
+  let mut s=m1_r050_open(&mut d);
+  let mut out=[0x42;32];
+  s.execute(&mut d,&a,m1_r050_owner(),2,b"write /work/a stable",&mut out).unwrap();
+  d.fail_at=Some(d.writes+1);
+  assert_eq!(s.execute(&mut d,&a,m1_r050_owner(),3,b"write /work/a broken",&mut out),
+   Err(PartitionCommandError::Command(CmdError::Io(FsError::Io))));
+  let writes=d.writes;
+  assert!(!s.is_active());
+  assert_eq!(s.execute(&mut d,&a,m1_r050_owner(),4,b"write /work/a retry",&mut out),
+   Err(PartitionCommandError::Command(CmdError::Denied)));
+  assert_eq!(d.writes,writes);
+  d.fail_at=None;
+  let mut clean=m1_r050_open(&mut d);
+  assert_eq!(clean.execute(&mut d,&a,m1_r050_owner(),5,b"cat /work/a",&mut out),Ok(6));
+  assert_eq!(&out[..6],b"stable");
+ }
+ #[test]fn m1_r051_non_io_terminal_error_does_not_retire_authenticated_session(){
+  use crate::batch6_security::{FILE_READ,FILE_WRITE};
+  use crate::m1_persistent_terminal::{PartitionCommandError,Error as CmdError};
+  let mut d=m1_r050_provision();
+  let a=m1_r050_auth(FILE_READ|FILE_WRITE,200);
+  let mut s=m1_r050_open(&mut d);
+  let mut out=[0x42;32];
+  assert_eq!(s.execute(&mut d,&a,m1_r050_owner(),2,b"cat /work/nope",&mut out),
+   Err(PartitionCommandError::Command(CmdError::Io(FsError::NotFound))));
+  assert!(s.is_active());
+  assert_eq!(s.execute(&mut d,&a,m1_r050_owner(),3,b"write /work/a yes",&mut out),Ok(5));
+  assert_eq!(s.status(&a,m1_r050_owner(),3).unwrap().commands,1);
+ }
  #[test]fn m1_r045_empty_valid_mbr_reports_no_partitions_without_format(){
   let mut d=new();d.data[0][510]=0x55;d.data[0][511]=0xaa;
   let inventory=discover(&mut d).unwrap();
