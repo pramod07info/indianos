@@ -538,13 +538,7 @@ impl<'a,D:BlockDevice,const P:usize,const E:usize,const W:usize,
  /// revalidates both GUIDs and refuses a degraded volume.
  pub fn preflight_gpt_identity(disk:&mut D,index:u32)
   ->Result<(m1_partition::GptSelection,crate::durablefs::VolumeHealth),MountError>{
-  let token=m1_partition::inspect_gpt_selection(disk,index)
-   .map_err(MountError::Partition)?;
-  let health=m1_partition::probe_volume(disk,index)?;
-  if health.partition!=token.partition{
-   return Err(MountError::Partition(m1_partition::Error::Invalid));
-  }
-  Ok((token,health.volume))
+  m1_partition::probe_gpt_identity_health(disk,index)
  }
  /// Strict identity-pinned GPT mount for the durable Developer Desktop.
  pub fn mount_gpt_identity_selected(disk:&'a mut D,

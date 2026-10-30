@@ -90,6 +90,27 @@ impl<const DEPTH: usize> Mailbox<DEPTH> {
         Ok(message)
     }
 
+    /// Transactional bounded FIFO receive: snapshot a prefix before asking
+    /// a trusted copy sink to publish it. Failure leaves ALL messages queued.
+    fn receive_batch_with(&mut self,limit:usize,
+        deliver:impl FnOnce(&[Message])->bool)->Result<usize,IpcError>{
+        if limit==0||limit>DEPTH{return Err(IpcError::InvalidConfiguration);}
+        if self.count==0{return Err(IpcError::Empty);}
+        let take=limit.min(self.count);
+        let empty=Message{sender:0,length:0,bytes:[0;MAX_PAYLOAD]};
+        let mut staged=[empty;DEPTH];
+        for (i,slot) in staged[..take].iter_mut().enumerate(){
+            *slot=self.slots[(self.head+i)%DEPTH].ok_or(IpcError::Empty)?;
+        }
+        if !deliver(&staged[..take]){return Err(IpcError::CopyFailed);}
+        for _ in 0..take{
+            self.slots[self.head]=None;
+            self.head=(self.head+1)%DEPTH;
+            self.count-=1;
+        }
+        Ok(take)
+    }
+
     // Compact in logical FIFO order. The write cursor never passes the read
     // cursor, including when the ring wraps, so unread messages stay intact.
     fn discard_sender(&mut self, sender: u32) {
@@ -184,6 +205,15 @@ impl<const MAILBOXES: usize, const DEPTH: usize> IpcRouter<MAILBOXES, DEPTH> {
         let target = self.mailboxes.iter_mut().flatten()
             .find(|m| m.receiver == receiver).ok_or(IpcError::UnknownReceiver)?;
         target.receive_with(deliver)
+    }
+
+    /// Authenticated receiver-scoped delivery; no partial dequeue on copy
+    /// failure, including when the mailbox ring buffer has wrapped.
+    pub fn receive_batch_with(&mut self,receiver:u32,limit:usize,
+        deliver:impl FnOnce(&[Message])->bool)->Result<usize,IpcError>{
+        let target=self.mailboxes.iter_mut().flatten()
+            .find(|m|m.receiver==receiver).ok_or(IpcError::UnknownReceiver)?;
+        target.receive_batch_with(limit,deliver)
     }
 
     fn epoch(&self,receiver:u32)->Result<u64,IpcError>{
@@ -380,6 +410,42 @@ impl<const M:usize,const D:usize> ScopedRouter<M,D>{
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]fn m1_r052_ipc_batch_copy_failure_keeps_wrapped_fifo(){
+        let mut r=IpcRouter::<3,3>::new().unwrap();
+        for pid in [1,2,3]{r.register(pid).unwrap();}
+        for b in [b'a',b'b',b'c']{r.send(1,2,&[b]).unwrap();}
+        assert_eq!(r.receive(2).unwrap().payload(),b"a");
+        r.send(3,2,b"d").unwrap();
+        let mut scratch=[0u8;3];
+        assert_eq!(r.receive_batch_with(2,3,|msgs|{
+            for (i,m) in msgs.iter().enumerate(){scratch[i]=m.payload()[0];}
+            false
+        }),Err(IpcError::CopyFailed));
+        assert_eq!(scratch,*b"bcd");assert_eq!(r.pending(2),Ok(3));
+        assert_eq!(r.receive_batch_with(2,3,|msgs|{
+            assert_eq!(msgs.iter().map(|m|m.sender()).collect::<Vec<_>>(),
+                       vec![1,1,3]);true
+        }),Ok(3));
+        assert_eq!(r.pending(2),Ok(0));
+    }
+    #[test]fn m1_r052_ipc_batch_invalid_limits_and_peer_isolation(){
+        let mut r=IpcRouter::<3,4>::new().unwrap();
+        for pid in [1,2,3]{r.register(pid).unwrap();}
+        r.send(1,2,b"a").unwrap();r.send(3,2,b"b").unwrap();
+        r.send(2,3,b"peer").unwrap();
+        for limit in [0,5]{
+            assert_eq!(r.receive_batch_with(2,limit,|_|false),
+                Err(IpcError::InvalidConfiguration));
+        }
+        assert_eq!(r.receive_batch_with(4,1,|_|true),Err(IpcError::UnknownReceiver));
+        assert_eq!(r.pending(2),Ok(2));
+        assert_eq!(r.receive_batch_with(2,1,|msgs|{
+            assert_eq!(msgs.len(),1);assert_eq!(msgs[0].payload(),b"a");true
+        }),Ok(1));
+        assert_eq!(r.receive(2).unwrap().payload(),b"b");
+        assert_eq!(r.receive(3).unwrap().payload(),b"peer");
+    }
 
     #[test]
     fn ipc_failed_delivery_retains_wrapped_fifo_and_wire_padding(){

@@ -277,12 +277,62 @@ impl<const N:usize> ServiceTable<N>{
   }
   self.slots=shadow.slots;self.phases=shadow.phases;true
  }
+ /// Reconcile several trusted PID faults into one atomic restart plan.
+ /// Any exhausted, duplicate or unknown request leaves every service
+ /// in its previous phase and leaves caller output untouched.
+ pub fn crash_batch(&mut self,failures:&[(u32,u32)],out:&mut[ServiceAction])->bool{
+  if failures.is_empty()||failures.len()>N||out.len()<failures.len(){
+   return false;
+  }
+  let mut staged=Self{phases:self.phases,slots:self.slots};
+  let mut decisions=[ServiceAction::Deny;N];
+  for (i,&(failed_pid,replacement_pid)) in failures.iter().enumerate(){
+   if failed_pid==0||replacement_pid==0||
+     failures[..i].iter().any(|&(old,new)|old==failed_pid||new==replacement_pid){
+    return false;
+   }
+   let action=staged.crash(failed_pid,replacement_pid);
+   if action==ServiceAction::Deny{return false;}
+   decisions[i]=action;
+  }
+  self.phases=staged.phases;self.slots=staged.slots;
+  out[..failures.len()].copy_from_slice(&decisions[..failures.len()]);
+  true
+ }
  pub fn active_services(&self)->usize{
   self.slots.iter().flatten().filter(|s|s.active).count()
  }
 }
 #[cfg(test)]mod r017_service_panel_tests{
  use super::*;
+ #[test]fn m1_r052_multi_service_restarts_require_exact_preparation(){
+  let mut t=ServiceTable::<3>::new();
+  assert!(t.configure(1,10,2));assert!(t.configure(2,20,2));
+  assert!(t.start_batch(&[1,2]));
+  let mut actions=[ServiceAction::Deny;2];
+  assert!(t.crash_batch(&[(10,11),(20,21)],&mut actions));
+  assert_eq!(actions,[ServiceAction::Restart{pid:11,generation:2},
+                      ServiceAction::Restart{pid:21,generation:2}]);
+  assert_eq!(t.active_services(),0);
+  assert!(!t.prepared(1,11,1));
+  assert!(t.prepared(1,11,2));assert!(t.prepared(2,21,2));
+  assert_eq!(t.active_services(),2);
+ }
+ #[test]fn m1_r052_bad_service_failover_batch_is_fail_atomic(){
+  let mut t=ServiceTable::<2>::new();
+  assert!(t.configure(1,10,1));assert!(t.configure(2,20,0));
+  assert!(t.start_batch(&[1,2]));
+  let original1=t.snapshot(1).unwrap();let original2=t.snapshot(2).unwrap();
+  let mut output=[ServiceAction::Start{pid:77,generation:77};2];
+  for inputs in [[(10,11),(20,21)],[(10,11),(10,22)],[(10,11),(20,11)]]{
+   assert!(!t.crash_batch(&inputs,&mut output));
+   assert_eq!(t.snapshot(1),Some(original1));
+   assert_eq!(t.snapshot(2),Some(original2));
+   assert_eq!(output,[ServiceAction::Start{pid:77,generation:77};2]);
+  }
+  assert!(!t.crash_batch(&[(10,11),(20,21)],&mut output[..1]));
+  assert_eq!(t.active_services(),2);
+ }
  #[test]fn two_dev_services_start_in_one_transaction(){
   let mut t=ServiceTable::<2>::new();
   assert!(t.configure(1,10,1));assert!(t.configure(2,20,1));

@@ -281,6 +281,20 @@ pub fn probe_volume<D:BlockDevice>(disk:&mut D,index:u32)
   .map_err(MountError::Filesystem)?;
  Ok(PartitionHealth{partition,volume})
 }
+/// Read-only health and full GPT identity preflight on removable media.
+/// A health probe that validates only LBAs can otherwise return a stale
+/// GUID token after the disk changes during its filesystem metadata reads.
+pub fn probe_gpt_identity_health<D:BlockDevice>(disk:&mut D,index:u32)
+ ->Result<(GptSelection,VolumeHealth),MountError>{
+ let before=inspect_gpt_selection(disk,index).map_err(MountError::Partition)?;
+ let health=probe_volume(disk,index)?;
+ if health.partition!=before.partition{
+  return Err(MountError::Partition(Error::Invalid));
+ }
+ let after=inspect_gpt_selection(disk,index).map_err(MountError::Partition)?;
+ if before!=after{return Err(MountError::Partition(Error::Invalid));}
+ Ok((before,health.volume))
+}
 /// Mount a previously chosen partition only when its full on-disk geometry
 /// still matches a fresh complete read-only layout validation. This closes a
 /// time-of-check/time-of-use gap before bounded VFS selection. No formatting.
@@ -1578,6 +1592,46 @@ mod m1_partition_tests{
   assert!(s.is_active());
   assert_eq!(s.execute(&mut d,&a,m1_r050_owner(),3,b"write /work/a yes",&mut out),Ok(5));
   assert_eq!(s.status(&a,m1_r050_owner(),3).unwrap().commands,1);
+ }
+ #[test]fn m1_r052_gpt_preflight_returns_healthy_identity_without_mutation(){
+  let mut d=gpt_disk();let selected=inspect_gpt_selection(&mut d,0).unwrap();
+  {
+   let w=BlockWindow::new(&mut d,40,100).unwrap();
+   let mut fs=HierVfs::format_blank(w).unwrap();fs.mkdir("/docs").unwrap();
+  }
+  let writes=d.writes;
+  let (actual,health)=probe_gpt_identity_health(&mut d,0).unwrap();
+  assert_eq!(actual,selected);
+  assert_eq!(health.redundancy,crate::durablefs::Redundancy::Healthy);
+  assert_eq!(d.writes,writes);
+ }
+ #[test]fn m1_r052_gpt_preflight_rejects_media_swap_while_reading_health(){
+  struct SwapOnHealth{disk:Disk,swapped:bool}
+  impl BlockDevice for SwapOnHealth{
+   fn sector_count(&self)->u64{self.disk.sector_count()}
+   fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+    ->Result<(),BlockError>{
+    if lba==40&&!self.swapped{
+     // Fully checksummed new GPT identity; exactly the same data LBAs.
+     self.disk.data[1][56..72].fill(9);
+     rechecksum_gpt(&mut self.disk);
+     self.swapped=true;
+    }
+    self.disk.read_sector(lba,out)
+   }
+   fn write_sector(&mut self,lba:u64,data:&[u8;SECTOR_BYTES])
+    ->Result<(),BlockError>{self.disk.write_sector(lba,data)}
+  }
+  let mut d=gpt_disk();
+  {
+   let w=BlockWindow::new(&mut d,40,100).unwrap();
+   let mut fs=HierVfs::format_blank(w).unwrap();fs.mkdir("/docs").unwrap();
+  }
+  let before=d.writes;
+  let mut changing=SwapOnHealth{disk:d,swapped:false};
+  assert_eq!(probe_gpt_identity_health(&mut changing,0),
+   Err(MountError::Partition(Error::Invalid)));
+  assert!(changing.swapped);assert_eq!(changing.disk.writes,before);
  }
  #[test]fn m1_r045_empty_valid_mbr_reports_no_partitions_without_format(){
   let mut d=new();d.data[0][510]=0x55;d.data[0][511]=0xaa;
