@@ -1090,6 +1090,22 @@ impl<const N:usize> DamageQueue<N>{
   broker.reassign_window(old_owner,new_owner,window)?;
   Ok(self.discard_window(old_owner,window))
  }
+ /// Transfer several app windows and drop every stale queued frame
+ /// after the broker accepts the entire transaction. Invalid batches leave
+ /// broker input and damage FIFO unchanged. Actual compositor surface
+ /// invalidation and recreation remain the trusted caller's responsibility.
+ pub fn transfer_batch_with_damage<const B:usize,const Q:usize>(
+  &mut self,broker:&mut Broker<B,Q>,requests:&[(u32,u32,u32)])
+  ->Result<usize,Error>{
+  broker.reassign_batch(requests)?;
+  let mut kept=[None;N];let mut n=0;
+  for frame in self.entries[..self.len].iter().flatten(){
+   if requests.iter().any(|&(_,_,window)|window==frame.window){continue;}
+   kept[n]=Some(*frame);n+=1;
+  }
+  let removed=self.len-n;
+  self.entries=kept;self.len=n;Ok(removed)
+ }
  pub fn oldest_frame(&self)->Option<FrameDamage>{
   self.entries[..self.len].iter().flatten().min_by_key(|e|e.epoch).map(|e|e.frame)
  }
@@ -1113,6 +1129,47 @@ mod r014_compositor_coalesce_tests{
  }
  fn blank()->FrameDamage{FrameDamage{owner:0,window:0,epoch:0,
   x:0,y:0,width:0,height:0}}
+ #[test]fn r057_atomic_multiwindow_transfer_discards_stale_frames(){
+  let mut broker=Broker::<4,8>::new();
+  broker.grant_batch(&[(3,10),(3,11),(4,20)]).unwrap();
+  let mut layout=SurfaceLayout::<4>::new();
+  for (owner,win) in [(3,10),(3,11),(4,20)]{
+   layout.grant(owner,win,Rectangle{x:0,y:0,width:80,height:80}).unwrap();
+  }
+  let mut damage=DamageQueue::<6>::new();
+  damage.submit_verified(&broker,&layout,3,&[(10,0,0,5,5),(11,0,0,5,5)]).unwrap();
+  damage.submit_verified(&broker,&layout,4,&[(20,0,0,5,5)]).unwrap();
+  let peer=broker.post_focus(4,20).unwrap();
+  broker.post_focus(3,10).unwrap();
+  assert_eq!(damage.transfer_batch_with_damage(&mut broker,&[(3,5,10),(3,5,11)]),
+    Ok(2));
+  assert_eq!(broker.owner(10),Some(5));
+  assert_eq!(broker.owner(11),Some(5));
+  assert_eq!(broker.peek(4),Ok(peer));
+  assert_eq!(broker.pending_owner(5),Ok(0));
+  assert_eq!(damage.pending(),1);
+  assert_eq!(damage.oldest_frame().unwrap().window,20);
+ }
+ #[test]fn r057_invalid_batch_leaves_damage_and_owner_events_untouched(){
+  let mut broker=Broker::<4,8>::new();
+  broker.grant_batch(&[(3,10),(3,11),(4,20)]).unwrap();
+  let mut layout=SurfaceLayout::<4>::new();
+  for (owner,win) in [(3,10),(3,11),(4,20)]{
+   layout.grant(owner,win,Rectangle{x:0,y:0,width:80,height:80}).unwrap();
+  }
+  let mut damage=DamageQueue::<6>::new();
+  damage.submit_verified(&broker,&layout,3,&[(10,0,0,5,5),(11,0,0,5,5)]).unwrap();
+  damage.submit_verified(&broker,&layout,4,&[(20,0,0,5,5)]).unwrap();
+  let existing=broker.post_focus(3,10).unwrap();
+  assert_eq!(damage.transfer_batch_with_damage(&mut broker,
+   &[(3,5,10),(99,6,11)]),Err(Error::Unauthorized));
+  assert_eq!(damage.pending(),3);
+  assert_eq!(broker.peek(3),Ok(existing));
+  assert_eq!(broker.owner(10),Some(3));
+  assert_eq!(broker.owner(11),Some(3));
+  assert_eq!(broker.owner(20),Some(4));
+  assert_eq!(broker.post_focus(3,11).unwrap().sequence,existing.sequence+1);
+ }
  #[test]fn m1_r052_compositor_drops_revoked_window_without_peer_damage(){
   let mut broker=Broker::<3,8>::new();
   broker.grant(3,10).unwrap();broker.grant(4,20).unwrap();

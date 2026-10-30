@@ -64,6 +64,12 @@ impl InputLine{
   ->Result<Event,Error>{
   self.editor.replace_range(start,end,next)
  }
+ /// One atomic literal replacement across the current command draft.
+ /// This cannot read files, send syscalls, or overwrite the clipboard.
+ pub fn replace_all_literal(&mut self,needle:&[u8],replacement:&[u8])
+  ->Result<usize,Error>{
+  self.editor.replace_all_literal(needle,replacement)
+ }
  /// A keyboard source may paste only bounded printable ASCII; all-or-nothing.
  pub fn paste(&mut self,text:&[u8])->Result<(),Error>{self.editor.paste(text)}
  /// Store a selection only after range/capacity preflight. Previous clipboard
@@ -172,6 +178,36 @@ impl LineEditor{
         new[start+next.len()..new_len].copy_from_slice(&self.line[end..self.len]);
         self.line=new;self.len=new_len;self.caret=start+next.len();
         Ok(if next.is_empty(){Event::Erased}else{Event::Typed})
+    }
+    /// Replace every non-overlapping literal ASCII occurrence in one bounded
+    /// edit. Errors never alter source bytes or the cursor. A successful
+    /// edit places the caret after the final resulting byte.
+    pub fn replace_all_literal(&mut self,needle:&[u8],replacement:&[u8])
+        ->Result<usize,Error>{
+        if needle.is_empty()||needle.len()>MAX_LINE||
+           needle.iter().chain(replacement.iter()).any(|b|
+               !(b' '..=b'~').contains(b)){
+            return Err(Error::Invalid);
+        }
+        let mut staged=[0u8;MAX_LINE];
+        let mut source=0usize;
+        let mut used=0usize;
+        let mut changed=0usize;
+        while source<self.len {
+            if self.line[source..self.len].starts_with(needle){
+                let end=used.checked_add(replacement.len()).ok_or(Error::Full)?;
+                if end>MAX_LINE{return Err(Error::Full);}
+                staged[used..end].copy_from_slice(replacement);
+                used=end;source+=needle.len();changed+=1;
+            }else{
+                if used==MAX_LINE{return Err(Error::Full);}
+                staged[used]=self.line[source];used+=1;source+=1;
+            }
+        }
+        if changed>0{
+            self.line=staged;self.len=used;self.caret=used;
+        }
+        Ok(changed)
     }
     /// Copy a selection only after destination preflight.
     pub fn copy_range(&self,start:usize,end:usize,out:&mut[u8])
@@ -395,6 +431,37 @@ impl LineEditor{
   assert_eq!(input.replace_range(2,5,b""),Ok(Event::Erased));
   assert_eq!(input.bytes(),b"abef");
   assert_eq!(input.caret(),2);
+ }
+ #[test]fn r057_editor_replace_all_literal_and_cursor_postcondition(){
+  let mut e=LineEditor::new();e.replace_line(b"foo + foo + foo").unwrap();
+  e.edit(EditKey::Home,&mut[]).unwrap();
+  assert_eq!(e.replace_all_literal(b"foo",b"barz"),Ok(3));
+  assert_eq!(e.bytes(),b"barz + barz + barz");
+  assert_eq!(e.caret(),e.bytes().len());
+  let old=e.caret();
+  assert_eq!(e.replace_all_literal(b"missing",b"x"),Ok(0));
+  assert_eq!(e.caret(),old);
+  assert_eq!(e.replace_all_literal(b"barz",b""),Ok(3));
+  assert_eq!(e.bytes(),b" +  + ");
+ }
+ #[test]fn r057_editor_replace_is_atomic_for_capacity_and_invalid_input(){
+  let mut e=LineEditor::new();
+  e.replace_line(&[b'a';MAX_LINE-1]).unwrap();
+  let cursor=e.caret();
+  assert_eq!(e.replace_all_literal(b"a",b"aa"),Err(Error::Full));
+  assert_eq!(e.replace_all_literal(b"",b"x"),Err(Error::Invalid));
+  assert_eq!(e.replace_all_literal(b"a",b"bad\n"),Err(Error::Invalid));
+  assert_eq!(e.bytes(),&[b'a';MAX_LINE-1]);
+  assert_eq!(e.caret(),cursor);
+ }
+ #[test]fn r057_input_line_replace_all_preserves_clipboard(){
+  let mut line=InputLine::new();line.set_line(b"cat cat and cat").unwrap();
+  line.copy_range(0,3).unwrap();
+  assert_eq!(line.replace_all_literal(b"cat",b"dog"),Ok(3));
+  assert_eq!(line.bytes(),b"dog dog and dog");
+  assert_eq!(line.clipboard_bytes(),b"cat");
+  assert_eq!(line.replace_all_literal(b"notfound",b"z"),Ok(0));
+  assert_eq!(line.bytes(),b"dog dog and dog");
  }
  #[test]fn r042_kill_and_safe_restore_preserve_draft_invariants(){
   let mut line=InputLine::new();
