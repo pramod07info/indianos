@@ -525,3 +525,99 @@ impl<const N:usize> RamFs<N>{
   assert_eq!(f.version(),1);
  }
 }
+
+
+/// R060: one in-memory rename transaction can move several files, including
+/// rename cycles (e.g. swapping two names), with optimistic concurrency.
+/// All source contents and versions are read from the ORIGINAL directory.
+/// Failed authentication at a higher layer, invalid paths or stale versions
+/// must not cause partial changes. The caller must authorize every path.
+impl<const N:usize> RamFs<N>{
+ pub fn rename_batch_if_revision(&mut self,expected_global:u64,
+   requests:&[(&[u8],&[u8],u64)])->Result<u64,Error>{
+  if requests.is_empty()||requests.len()>N||requests.len()>16||
+      self.version!=expected_global{return Err(Error::Invalid);}
+  for (i,&(from,to,expected_file)) in requests.iter().enumerate(){
+   if !Self::valid_path(from)||!Self::valid_path(to)||from==to||
+       expected_file==0{return Err(Error::Invalid);}
+   if requests[..i].iter().any(|&(old_from,old_to,_)|
+        old_from==from||old_to==to){return Err(Error::Invalid);}
+   let slot=self.lookup(from).ok_or(Error::NotFound)?;
+   if self.files[slot].ok_or(Error::NotFound)?.version!=expected_file{
+    return Err(Error::Invalid);
+   }
+   // An occupied destination is permitted only if it is also a source
+   // being moved by this SAME transaction (a rename chain or cycle).
+   if self.lookup(to).is_some()&&
+      !requests.iter().any(|&(moving,_,_)|moving==to){
+    return Err(Error::Invalid);
+   }
+  }
+  let mut staged=Self{files:self.files,version:self.version};
+  for &(from,to,_) in requests{
+   let slot=self.lookup(from).ok_or(Error::NotFound)?;
+   let mut file=self.files[slot].ok_or(Error::NotFound)?;
+   let version=staged.version.checked_add(1).ok_or(Error::Exhausted)?;
+   file.path=[0u8;PATH_MAX];
+   file.path[..to.len()].copy_from_slice(to);
+   file.path_len=to.len();
+   file.version=version;
+   staged.files[slot]=Some(file);
+   staged.version=version;
+  }
+  *self=staged;
+  Ok(self.version)
+ }
+}
+#[cfg(test)]
+mod r060_rename_batch_tests{
+ use super::*;
+ #[test]fn atomic_name_swap_retains_both_contents(){
+  let mut fs=RamFs::<3>::new();
+  let a=fs.replace(b"/left",b"alpha").unwrap();
+  let b=fs.replace(b"/right",b"beta").unwrap();
+  let generation=fs.version();
+  assert_eq!(fs.rename_batch_if_revision(generation,
+    &[(b"/left",b"/right",a),(b"/right",b"/left",b)]),
+    Ok(generation+2));
+  assert_eq!(fs.count(),2);
+  let mut out=[0u8;8];
+  assert_eq!(fs.read(b"/left",0,&mut out),Ok(4));
+  assert_eq!(&out[..4],b"beta");
+  assert_eq!(fs.read(b"/right",0,&mut out),Ok(5));
+  assert_eq!(&out[..5],b"alpha");
+ }
+ #[test]fn collision_stale_second_source_and_duplicate_target_roll_back(){
+  let mut fs=RamFs::<4>::new();
+  let a=fs.replace(b"/a",b"safe").unwrap();
+  let b=fs.replace(b"/b",b"keep").unwrap();
+  fs.replace(b"/occupied",b"peer").unwrap();
+  let current=fs.version();
+  assert_eq!(fs.rename_batch_if_revision(current,
+     &[(b"/a",b"/new",a),(b"/b",b"/occupied",b)]),
+     Err(Error::Invalid));
+  assert_eq!(fs.rename_batch_if_revision(current,
+     &[(b"/a",b"/new",a),(b"/b",b"/other",b+1)]),
+     Err(Error::Invalid));
+  assert_eq!(fs.rename_batch_if_revision(current,
+     &[(b"/a",b"/new",a),(b"/b",b"/new",b)]),
+     Err(Error::Invalid));
+  assert_eq!(fs.version(),current);
+  assert_eq!(fs.metadata(b"/a"),Ok((a,4)));
+  assert_eq!(fs.metadata(b"/b"),Ok((b,4)));
+  assert_eq!(fs.count(),3);
+ }
+ #[test]fn malformed_source_chain_and_empty_batch_do_not_publish(){
+  let mut fs=RamFs::<2>::new();
+  let v=fs.replace(b"/a",b"data").unwrap();
+  assert_eq!(fs.rename_batch_if_revision(v,&[]),Err(Error::Invalid));
+  assert_eq!(fs.rename_batch_if_revision(v,
+      &[(b"/a",b"/next",v),(b"/missing",b"/new",99)]),
+      Err(Error::NotFound));
+  assert_eq!(fs.rename_batch_if_revision(v,
+      &[(b"/a",b"/../escape",v)]),Err(Error::Invalid));
+  assert_eq!(fs.version(),v);
+  let mut out=[0;8];fs.read(b"/a",0,&mut out).unwrap();
+  assert_eq!(&out[..4],b"data");
+ }
+}

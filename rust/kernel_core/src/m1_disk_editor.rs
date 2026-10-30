@@ -570,3 +570,102 @@ mod tests {
     }
 
 }
+
+
+/// R060: one owner-authorized, UTF-8-safe multi-cursor source edit.
+/// Edits use offsets in the ORIGINAL buffer, sorted and non-overlapping.
+/// Overflow, stale owner and invalid character boundaries publish NOTHING;
+/// a successful group is a single undo/redo step and one durable save.
+impl DiskEditor{
+ pub fn replace_ranges_text(&mut self,caller:Identity,
+    edits:&[(usize,usize,&str)])->Result<usize,Error>{
+  self.authorize(caller)?;
+  if edits.is_empty()||edits.len()>16{return Err(Error::Invalid);}
+  let text=core::str::from_utf8(&self.data[..self.used])
+   .map_err(|_|Error::Invalid)?;
+  let mut staged=[0u8;MAX_FILE_BYTES];
+  let mut cursor=0usize;
+  let mut written=0usize;
+  for &(start,end,replacement) in edits{
+   if start<cursor||start>end||end>self.used||
+      !text.is_char_boundary(start)||!text.is_char_boundary(end){
+    return Err(Error::Invalid);
+   }
+   let unchanged=&self.data[cursor..start];
+   let next=written.checked_add(unchanged.len())
+     .and_then(|n|n.checked_add(replacement.len()))
+     .ok_or(Error::Full)?;
+   if next>MAX_FILE_BYTES{return Err(Error::Full);}
+   staged[written..written+unchanged.len()].copy_from_slice(unchanged);
+   staged[written+unchanged.len()..next]
+       .copy_from_slice(replacement.as_bytes());
+   cursor=end;
+   written=next;
+  }
+  let total=written.checked_add(self.used-cursor).ok_or(Error::Full)?;
+  if total>MAX_FILE_BYTES{return Err(Error::Full);}
+  staged[written..total].copy_from_slice(&self.data[cursor..self.used]);
+  if total==self.used&&staged[..total]==self.data[..self.used]{
+   return Ok(self.used);
+  }
+  self.undo=Some(Snapshot{data:self.data,used:self.used});
+  self.redo=None;
+  self.data=staged;self.used=total;self.dirty=true;
+  Ok(total)
+ }
+}
+#[cfg(test)]
+mod r060_multi_cursor_tests{
+ use super::*;
+ use crate::block::{BlockError,SECTOR_BYTES};
+ struct TestDisk{data:[[u8;SECTOR_BYTES];100]}
+ impl BlockDevice for TestDisk{
+  fn sector_count(&self)->u64{100}
+  fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   *out=*self.data.get(lba as usize).ok_or(BlockError::OutOfRange)?;Ok(())
+  }
+  fn write_sector(&mut self,lba:u64,bytes:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   *self.data.get_mut(lba as usize).ok_or(BlockError::OutOfRange)?=*bytes;Ok(())
+  }
+ }
+ fn ready()->HierVfs<TestDisk>{
+  let mut fs=HierVfs::format_blank(TestDisk{data:[[0;SECTOR_BYTES];100]}).unwrap();
+  fs.create("/source.rs",b"fn main() {}").unwrap();fs
+ }
+ fn owner()->Identity{Identity{pid:8,generation:3}}
+ #[test]fn multi_edit_single_undo_and_real_remount(){
+  let mut fs=ready();let mut e=DiskEditor::new();
+  e.open(owner(),&mut fs,"/source.rs").unwrap();
+  assert_eq!(e.replace_ranges_text(owner(),
+    &[(0,2,"pub fn"),(3,7,"start")]),Ok(17));
+  let mut out=[0u8;40];let n=e.read(owner(),&mut out).unwrap();
+  assert_eq!(&out[..n],b"pub fn start() {}");
+  assert_eq!(e.undo(owner()),Ok(12));
+  assert_eq!(e.redo(owner()),Ok(17));
+  e.save(owner(),&mut fs).unwrap();
+  let mut mounted=HierVfs::mount(fs.into_device()).unwrap();
+  let mut back=[0u8;40];
+  assert_eq!(mounted.read("/source.rs",&mut back),Ok(17));
+  assert_eq!(&back[..17],b"pub fn start() {}");
+ }
+ #[test]fn overlap_bad_utf8_boundary_and_overflow_never_apply_first_edit(){
+  let mut fs=ready();let mut e=DiskEditor::new();
+  e.open(owner(),&mut fs,"/source.rs").unwrap();
+  e.replace_text(owner(),0,2,"β").unwrap();
+  let mut before=[0u8;40];let n=e.read(owner(),&mut before).unwrap();
+  assert_eq!(e.replace_ranges_text(owner(),
+     &[(0,2,"ok"),(1,3,"bad")]),Err(Error::Invalid));
+  assert_eq!(e.replace_ranges_text(owner(),
+     &[(1,2,"x")]),Err(Error::Invalid));
+  let huge=[b'x';MAX_FILE_BYTES];
+  let huge=core::str::from_utf8(&huge).unwrap();
+  assert_eq!(e.replace_ranges_text(owner(),
+     &[(0,0,huge)]),Err(Error::Full));
+  let mut after=[0u8;40];
+  assert_eq!(e.read(owner(),&mut after),Ok(n));
+  assert_eq!(&before[..n],&after[..n]);
+  assert_eq!(e.replace_ranges_text(
+    Identity{generation:4,..owner()},&[(0,2,"bad")]),
+    Err(Error::Unauthorized));
+ }
+}

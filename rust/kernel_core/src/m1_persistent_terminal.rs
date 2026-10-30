@@ -19,7 +19,7 @@ pub const COMMAND_VERBS:&[&str]=&[
  "help","pwd","tools","ls","cat","write","append","mkdir","mv",
  "cp","rm","mkfile","truncate","head","count","rmdir","mvdir",
  "pread","pwrite","lines","line","hash","stat","tail","find","grep","cmp","diffat",
- "touch","copynew","replace","appendln","health",
+ "touch","copynew","replace","appendln","health","hex",
 ];
 /// Complete exactly one printable lower-case verb prefix. Ambiguous matches,
 /// empty prefixes and user-supplied paths never cause completion or I/O.
@@ -160,6 +160,31 @@ pub fn command<D:BlockDevice,const N:usize>(
    let selected=text.split_terminator('\n').nth(number-1)
     .ok_or(Error::Invalid)?;
    publish(selected.as_bytes(),out)
+  }
+  // Inspect a bounded range of real persistent file bytes as lower-case
+  // hexadecimal, without shell expansion or untrusted binary terminal data.
+  // All output is staged before publication; short buffers stay untouched.
+  "hex"=>{
+   auth.require(caller,FILE_READ,now).map_err(|_|Error::Denied)?;
+   let mut args=raw.split_ascii_whitespace();
+   let source=args.next().ok_or(Error::Invalid)?;
+   let offset=args.next().ok_or(Error::Invalid)?
+      .parse::<u64>().map_err(|_|Error::Invalid)?;
+   let count=args.next().ok_or(Error::Invalid)?
+      .parse::<usize>().map_err(|_|Error::Invalid)?;
+   if args.next().is_some()||count==0||count>MAX_TRANSFER{
+    return Err(Error::Invalid);
+   }
+   let p=path(source,&mut name)?;
+   let mut bytes=[0u8;MAX_TRANSFER];
+   let read=fs.read_at(p,offset,&mut bytes[..count]).map_err(Error::Io)?;
+   let mut encoded=[0u8;MAX_TRANSFER*2];
+   let alphabet=b"0123456789abcdef";
+   for (i,&b) in bytes[..read].iter().enumerate(){
+    encoded[2*i]=alphabet[(b>>4) as usize];
+    encoded[2*i+1]=alphabet[(b&15) as usize];
+   }
+   publish(&encoded[..read*2],out)
   }
   "tail"=>{
    auth.require(caller,FILE_READ,now).map_err(|_|Error::Denied)?;
@@ -883,13 +908,14 @@ mod tests{
   assert_eq!(complete_verb(b"heal"),Some("health"));
  }
  #[test]fn r044_command_registry_drives_unique_safe_completion(){
-  assert_eq!(COMMAND_VERBS.len(),33);
+  assert_eq!(COMMAND_VERBS.len(),34);
   for (i,verb) in COMMAND_VERBS.iter().enumerate(){
    assert!(verb.as_bytes().iter().all(|b|b.is_ascii_lowercase()));
    assert!(!COMMAND_VERBS[..i].contains(verb));
   }
   assert_eq!(complete_verb(b"mkf"),Some("mkfile"));
   assert_eq!(complete_verb(b"copyne"),Some("copynew"));
+  assert_eq!(complete_verb(b"hex"),Some("hex"));
   assert_eq!(complete_verb(b"rmd"),Some("rmdir"));
   assert_eq!(complete_verb(b"app"),None);
   assert_eq!(complete_verb(b"pw"),None);
@@ -1551,5 +1577,54 @@ mod m1_partition_terminal_integration_tests {
   assert_eq!(&out[..n],b"stable");
   assert_eq!(exec(&mut d,1,owner(),b"cat /home/note"),
    Err(PartitionCommandError::Command(Error::Io(FsError::NotFound))));
+ }
+}
+
+
+#[cfg(test)]
+mod r060_hex_diagnostic_tests{
+ use super::*;
+ use crate::block::{BlockError,SECTOR_BYTES};
+ struct TestDisk{sectors:[[u8;SECTOR_BYTES];100]}
+ impl BlockDevice for TestDisk{
+  fn sector_count(&self)->u64{100}
+  fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   *out=*self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?;Ok(())
+  }
+  fn write_sector(&mut self,lba:u64,bytes:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   *self.sectors.get_mut(lba as usize).ok_or(BlockError::OutOfRange)?=*bytes;Ok(())
+  }
+ }
+ fn owner()->Identity{Identity{pid:6,generation:4}}
+ fn ready()->(HierVfs<TestDisk>,Access<1>){
+  let mut fs=HierVfs::format_blank(TestDisk{
+   sectors:[[0;SECTOR_BYTES];100]}).unwrap();
+  fs.create("/binary",&[0,0x1f,0xff,b'A']).unwrap();
+  let mut auth=Access::new();auth.grant(owner(),FILE_READ,100).unwrap();
+  (fs,auth)
+ }
+ #[test]fn persistent_hex_bytes_survive_fresh_remount(){
+  let (mut fs,auth)=ready();let generation=fs.generation();
+  let mut out=[0xa5;32];
+  assert_eq!(command(&mut fs,&auth,owner(),1,b"hex /binary 1 3",&mut out),Ok(6));
+  assert_eq!(&out[..6],b"1fff41");
+  fs=HierVfs::mount(fs.into_device()).unwrap();
+  assert_eq!(command(&mut fs,&auth,owner(),1,b"hex /binary 0 4",&mut out),Ok(8));
+  assert_eq!(&out[..8],b"001fff41");
+  assert_eq!(fs.generation(),generation);
+ }
+ #[test]fn no_partial_hex_output_or_cross_generation_data_leak(){
+  let (mut fs,auth)=ready();let mut short=[0xb8;3];
+  assert_eq!(command(&mut fs,&auth,owner(),1,b"hex /binary 0 4",&mut short),
+    Err(Error::OutputTooSmall));
+  assert_eq!(short,[0xb8;3]);
+  assert_eq!(command(&mut fs,&auth,Identity{generation:5,..owner()},1,
+    b"hex /binary 0 2",&mut short),Err(Error::Denied));
+  for invalid in [b"hex /binary 0 0".as_slice(),b"hex /binary -1 2",
+    b"hex /binary 0 999999",b"hex /../bad 0 2"]{
+   assert_eq!(command(&mut fs,&auth,owner(),1,invalid,&mut short),
+       Err(Error::Invalid));
+  }
+  assert_eq!(short,[0xb8;3]);
  }
 }

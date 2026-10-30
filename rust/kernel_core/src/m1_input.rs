@@ -686,3 +686,66 @@ impl LineEditor{
  }
 
 }
+
+/// R060: forward prefix search complements reverse history search. Only
+/// successfully submitted entries are eligible; a missing match leaves
+/// both the selected command and the original unsent draft intact.
+impl InputLine{
+ pub fn history_search_next(&mut self,prefix:&[u8])->Result<usize,Error>{
+  if prefix.is_empty()||prefix.len()>MAX_LINE||
+     prefix.iter().any(|&b|!(b' '..=b'~').contains(&b)){
+   return Err(Error::Invalid);
+  }
+  let current=self.history_cursor.ok_or(Error::Invalid)?;
+  let index=((current+1)..self.history_len).find(|&i|
+   self.history[i].is_some_and(|entry|
+     entry.bytes[..entry.len].starts_with(prefix)))
+   .ok_or(Error::Invalid)?;
+  let selected=self.history[index].ok_or(Error::Invalid)?;
+  self.editor.replace_line(&selected.bytes[..selected.len])?;
+  self.history_cursor=Some(index);
+  Ok(selected.len)
+ }
+}
+#[cfg(test)]
+mod r060_forward_history_tests{
+ use super::*;
+ fn populated()->InputLine{
+  let mut input=InputLine::new();
+  let mut out=[0u8;MAX_LINE];
+  for line in [b"git status".as_slice(),b"cargo test",
+               b"git diff",b"git push"]{
+   input.set_line(line).unwrap();
+   assert_eq!(input.feed(b'\n',&mut out),Ok(Event::Submitted(line.len())));
+  }
+  input.set_line(b"unsent draft").unwrap();
+  input
+ }
+ #[test]fn forward_matches_only_newer_history_and_can_restore_draft(){
+  let mut input=populated();
+  assert_eq!(input.history_search_previous(b"git"),Ok(8));
+  assert_eq!(input.bytes(),b"git push");
+  assert_eq!(input.history_search_previous(b"git"),Ok(8));
+  assert_eq!(input.bytes(),b"git diff");
+  assert_eq!(input.history_search_previous(b"git"),Ok(10));
+  assert_eq!(input.bytes(),b"git status");
+  assert_eq!(input.history_search_next(b"git"),Ok(8));
+  assert_eq!(input.bytes(),b"git diff");
+  assert_eq!(input.history_search_next(b"git"),Ok(8));
+  assert_eq!(input.bytes(),b"git push");
+  assert_eq!(input.history_next(),Ok(12));
+  assert_eq!(input.bytes(),b"unsent draft");
+ }
+ #[test]fn bad_prefix_absent_match_and_unsaved_line_are_fail_closed(){
+  let mut input=populated();
+  assert_eq!(input.history_search_next(b"git"),Err(Error::Invalid));
+  assert_eq!(input.bytes(),b"unsent draft");
+  input.history_search_previous(b"git").unwrap();
+  let saved=b"git push";
+  assert_eq!(input.history_search_next(b"missing"),Err(Error::Invalid));
+  assert_eq!(input.history_search_next(b"\n"),Err(Error::Invalid));
+  assert_eq!(input.bytes(),saved);
+  assert_eq!(input.history_next(),Ok(12));
+  assert_eq!(input.bytes(),b"unsent draft");
+ }
+}
