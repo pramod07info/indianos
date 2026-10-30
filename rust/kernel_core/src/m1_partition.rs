@@ -1061,6 +1061,258 @@ mod m1_partition_tests{
    b"cat /note",&mut output),Ok(4));
   assert_eq!(&output[..4],b"safe");
  }
+
+ // R050 real GPT+COW fixture for the stateful owner-bound Terminal service.
+ fn m1_r050_provision()->Disk{
+  let mut d=gpt_disk();
+  {
+   let bounded=BlockWindow::new(&mut d,40,100).unwrap();
+   let mut fs=HierVfs::format_blank(bounded).unwrap();
+   fs.mkdir("/work").unwrap();
+  }
+  d
+ }
+ fn m1_r050_owner()->crate::batch5_session::Identity{
+  crate::batch5_session::Identity{pid:3,generation:7}
+ }
+ fn m1_r050_auth(rights:u32,expires:u64)->crate::batch6_security::Access<1>{
+  let mut a=crate::batch6_security::Access::new();
+  a.grant(m1_r050_owner(),rights,expires).unwrap();a
+ }
+ fn m1_r050_open(d:&mut Disk)->crate::m1_persistent_terminal::GptTerminalSession{
+  use crate::batch6_security::{FILE_READ,FILE_WRITE};
+  crate::m1_persistent_terminal::GptTerminalSession::open(
+   d,0,&m1_r050_auth(FILE_READ|FILE_WRITE,200),
+   m1_r050_owner(),1,150).unwrap()
+ }
+ #[test]fn m1_r050_gpt_session_persists_write_move_read_after_separate_mounts(){
+  use crate::batch6_security::{FILE_READ,FILE_WRITE};
+  let mut d=m1_r050_provision();
+  let mut s=m1_r050_open(&mut d);
+  let a=m1_r050_auth(FILE_READ|FILE_WRITE,200);
+  let mut out=[0xcc;256];
+  assert_eq!(s.execute(&mut d,&a,m1_r050_owner(),2,b"write /work/a hello",&mut out),Ok(5));
+  assert_eq!(s.execute(&mut d,&a,m1_r050_owner(),3,b"mv /work/a /work/b",&mut out),Ok(5));
+  assert_eq!(s.execute(&mut d,&a,m1_r050_owner(),4,b"cat /work/b",&mut out),Ok(5));
+  assert_eq!(&out[..5],b"hello");
+  assert_eq!(s.status(&a,m1_r050_owner(),4).unwrap().commands,3);
+  assert_eq!(d.data[39],[0;SECTOR_BYTES]);
+  assert_eq!(d.data[140],[0;SECTOR_BYTES]);
+ }
+ #[test]fn m1_r050_new_session_reads_file_committed_before_old_session_close(){
+  use crate::batch6_security::{FILE_READ,FILE_WRITE};
+  let mut d=m1_r050_provision();
+  let a=m1_r050_auth(FILE_READ|FILE_WRITE,200);
+  let mut old=m1_r050_open(&mut d);
+  let mut out=[0xcc;256];
+  old.execute(&mut d,&a,m1_r050_owner(),2,b"write /work/a durable",&mut out).unwrap();
+  old.close(m1_r050_owner()).unwrap();
+  let mut reopened=m1_r050_open(&mut d);
+  assert_eq!(reopened.execute(&mut d,&a,m1_r050_owner(),3,b"cat /work/a",&mut out),Ok(7));
+  assert_eq!(&out[..7],b"durable");
+ }
+ #[test]fn m1_r050_strict_session_rejects_unformatted_media_without_writes(){
+  use crate::batch6_security::{FILE_READ,FILE_WRITE};
+  use crate::m1_persistent_terminal::{GptTerminalSession,PartitionCommandError};
+  let mut d=gpt_disk();
+  assert!(matches!(GptTerminalSession::open(&mut d,0,
+   &m1_r050_auth(FILE_READ|FILE_WRITE,200),m1_r050_owner(),1,50),
+   Err(PartitionCommandError::Mount(MountError::Filesystem(FsError::InvalidVolume)))));
+  assert_eq!(d.writes,0);
+ }
+ #[test]fn m1_r050_session_rejects_expired_initial_deadline_before_any_disk_write(){
+  use crate::batch6_security::FILE_READ;
+  use crate::m1_persistent_terminal::{GptTerminalSession,PartitionCommandError,Error as CmdError};
+  let mut d=gpt_disk();
+  let a=m1_r050_auth(FILE_READ,200);
+  assert!(matches!(GptTerminalSession::open(&mut d,0,&a,m1_r050_owner(),10,10),
+   Err(PartitionCommandError::Command(CmdError::Denied))));
+  assert_eq!(d.writes,0);
+ }
+ #[test]fn m1_r050_recycled_pid_cannot_read_session_state_or_execute(){
+  use crate::batch6_security::{FILE_READ,FILE_WRITE};
+  use crate::m1_persistent_terminal::{PartitionCommandError,Error as CmdError};
+  let mut d=m1_r050_provision();let mut s=m1_r050_open(&mut d);
+  let auth=m1_r050_auth(FILE_READ|FILE_WRITE,200);
+  let recycled=crate::batch5_session::Identity{generation:8,..m1_r050_owner()};
+  let before=d.writes;let mut out=[0xa5;32];
+  assert_eq!(s.status(&auth,recycled,2),Err(PartitionCommandError::Command(CmdError::Denied)));
+  assert_eq!(s.execute(&mut d,&auth,recycled,2,b"write /work/b bad",&mut out),
+   Err(PartitionCommandError::Command(CmdError::Denied)));
+  assert_eq!(s.close(recycled),Err(PartitionCommandError::Command(CmdError::Denied)));
+  assert_eq!(d.writes,before);assert_eq!(out,[0xa5;32]);assert!(s.is_active());
+ }
+ #[test]fn m1_r050_foreign_pid_cannot_write_or_revoke_selected_volume(){
+  use crate::batch6_security::{FILE_READ,FILE_WRITE};
+  use crate::m1_persistent_terminal::{PartitionCommandError,Error as CmdError};
+  let mut d=m1_r050_provision();let mut s=m1_r050_open(&mut d);
+  let auth=m1_r050_auth(FILE_READ|FILE_WRITE,200);
+  let foreign=crate::batch5_session::Identity{pid:99,..m1_r050_owner()};
+  let before=d.writes;let mut out=[0x44;32];
+  assert_eq!(s.execute(&mut d,&auth,foreign,2,b"mkdir /work/private",&mut out),
+   Err(PartitionCommandError::Command(CmdError::Denied)));
+  assert_eq!(s.close(foreign),Err(PartitionCommandError::Command(CmdError::Denied)));
+  assert_eq!(d.writes,before);assert_eq!(out,[0x44;32]);assert!(s.is_active());
+ }
+ #[test]fn m1_r050_session_deadline_is_exclusive_and_denies_disk_mutation(){
+  use crate::batch6_security::{FILE_READ,FILE_WRITE};
+  use crate::m1_persistent_terminal::{PartitionCommandError,Error as CmdError};
+  let mut d=m1_r050_provision();let mut s=m1_r050_open(&mut d);
+  let a=m1_r050_auth(FILE_READ|FILE_WRITE,200);
+  let mut out=[0xcc;32];let before=d.writes;
+  assert_eq!(s.execute(&mut d,&a,m1_r050_owner(),150,b"write /work/a bad",&mut out),
+    Err(PartitionCommandError::Command(CmdError::Denied)));
+  assert_eq!(d.writes,before);assert_eq!(out,[0xcc;32]);
+ }
+ #[test]fn m1_r050_expired_underlying_capability_blocks_active_session(){
+  use crate::batch6_security::{FILE_READ,FILE_WRITE};
+  use crate::m1_persistent_terminal::{PartitionCommandError,Error as CmdError};
+  let mut d=m1_r050_provision();let mut s=m1_r050_open(&mut d);
+  let a=m1_r050_auth(FILE_READ|FILE_WRITE,5);
+  let before=d.writes;let mut out=[0xa5;32];
+  assert_eq!(s.execute(&mut d,&a,m1_r050_owner(),5,b"mkdir /work/oops",&mut out),
+    Err(PartitionCommandError::Command(CmdError::Denied)));
+  assert_eq!(d.writes,before);assert_eq!(out,[0xa5;32]);
+ }
+ #[test]fn m1_r050_lifetime_can_only_shorten_and_does_not_increase_authority(){
+  use crate::batch6_security::{FILE_READ,FILE_WRITE};
+  use crate::m1_persistent_terminal::{PartitionCommandError,Error as CmdError};
+  let mut d=m1_r050_provision();let mut s=m1_r050_open(&mut d);
+  let a=m1_r050_auth(FILE_READ|FILE_WRITE,200);
+  assert_eq!(s.shorten(&a,m1_r050_owner(),2,151),
+   Err(PartitionCommandError::Command(CmdError::Denied)));
+  assert_eq!(s.shorten(&a,m1_r050_owner(),2,2),
+   Err(PartitionCommandError::Command(CmdError::Denied)));
+  assert_eq!(s.shorten(&a,m1_r050_owner(),2,12),Ok(()));
+  assert_eq!(s.status(&a,m1_r050_owner(),11).unwrap().expires,12);
+  assert_eq!(s.status(&a,m1_r050_owner(),12),
+   Err(PartitionCommandError::Command(CmdError::Denied)));
+ }
+ #[test]fn m1_r050_closed_session_is_irrevocable_and_keeps_disk_intact(){
+  use crate::batch6_security::{FILE_READ,FILE_WRITE};
+  use crate::m1_persistent_terminal::{PartitionCommandError,Error as CmdError};
+  let mut d=m1_r050_provision();let mut s=m1_r050_open(&mut d);
+  let a=m1_r050_auth(FILE_READ|FILE_WRITE,200);
+  let old=d.writes;let mut out=[0x66;32];
+  assert_eq!(s.close(m1_r050_owner()),Ok(()));
+  assert!(!s.is_active());
+  assert_eq!(s.close(m1_r050_owner()),
+   Err(PartitionCommandError::Command(CmdError::Denied)));
+  assert_eq!(s.execute(&mut d,&a,m1_r050_owner(),2,b"write /work/b bad",&mut out),
+   Err(PartitionCommandError::Command(CmdError::Denied)));
+  assert_eq!(d.writes,old);assert_eq!(out,[0x66;32]);
+ }
+ #[test]fn m1_r050_malformed_command_does_not_revoke_valid_session(){
+  use crate::batch6_security::{FILE_READ,FILE_WRITE};
+  use crate::m1_persistent_terminal::{PartitionCommandError,Error as CmdError};
+  let mut d=m1_r050_provision();let mut s=m1_r050_open(&mut d);
+  let a=m1_r050_auth(FILE_READ|FILE_WRITE,200);let mut out=[0x33;32];
+  assert_eq!(s.execute(&mut d,&a,m1_r050_owner(),2,b"unknown /work/a",&mut out),
+   Err(PartitionCommandError::Command(CmdError::Unknown)));
+  assert!(s.is_active());
+  assert_eq!(s.execute(&mut d,&a,m1_r050_owner(),3,b"mkdir /work/sub",&mut out),Ok(7));
+  assert_eq!(&out[..7],b"created");
+  assert_eq!(s.status(&a,m1_r050_owner(),3).unwrap().commands,1);
+ }
+ #[test]fn m1_r050_short_caller_output_never_creates_file_and_allows_retry(){
+  use crate::batch6_security::{FILE_READ,FILE_WRITE};
+  use crate::m1_persistent_terminal::{PartitionCommandError,Error as CmdError};
+  let mut d=m1_r050_provision();let mut s=m1_r050_open(&mut d);
+  let a=m1_r050_auth(FILE_READ|FILE_WRITE,200);let before=d.writes;
+  let mut short=[0xff;1];
+  assert_eq!(s.execute(&mut d,&a,m1_r050_owner(),2,b"write /work/a text",&mut short),
+   Err(PartitionCommandError::Command(CmdError::OutputTooSmall)));
+  assert_eq!(d.writes,before);assert_eq!(short,[0xff;1]);
+  let mut full=[0;32];
+  assert_eq!(s.execute(&mut d,&a,m1_r050_owner(),3,b"write /work/a text",&mut full),Ok(5));
+ }
+ #[test]fn m1_r050_read_only_grant_can_read_but_not_mutate(){
+  use crate::batch6_security::{FILE_READ,FILE_WRITE};
+  use crate::m1_persistent_terminal::{GptTerminalSession,PartitionCommandError,Error as CmdError};
+  let mut d=m1_r050_provision();
+  let a=m1_r050_auth(FILE_READ,200);
+  let mut s=GptTerminalSession::open(&mut d,0,&a,m1_r050_owner(),1,100).unwrap();
+  let mut out=[0x11;32];let writes=d.writes;
+  assert_eq!(s.execute(&mut d,&a,m1_r050_owner(),2,b"mkdir /work/no",&mut out),
+   Err(PartitionCommandError::Command(CmdError::Denied)));
+  assert_eq!(d.writes,writes);assert_eq!(out,[0x11;32]);
+  assert_eq!(s.execute(&mut d,&a,m1_r050_owner(),3,b"ls /work",&mut out),Ok(0));
+  let _=FILE_WRITE;
+ }
+ #[test]fn m1_r050_partition_guid_change_revokes_session_permanently(){
+  use crate::batch6_security::{FILE_READ,FILE_WRITE};
+  use crate::m1_persistent_terminal::{PartitionCommandError,Error as CmdError};
+  let mut d=m1_r050_provision();let mut s=m1_r050_open(&mut d);
+  let a=m1_r050_auth(FILE_READ|FILE_WRITE,200);
+  d.data[2][16..32].fill(9);rechecksum_gpt(&mut d);
+  let mut out=[0xaa;32];let before=d.writes;
+  assert_eq!(s.execute(&mut d,&a,m1_r050_owner(),2,b"cat /work/a",&mut out),
+   Err(PartitionCommandError::Mount(MountError::Partition(Error::Invalid))));
+  assert!(!s.is_active());assert_eq!(d.writes,before);
+  d.data[2][16..32].fill(2);rechecksum_gpt(&mut d);
+  assert_eq!(s.execute(&mut d,&a,m1_r050_owner(),3,b"cat /work/a",&mut out),
+   Err(PartitionCommandError::Command(CmdError::Denied)));
+ }
+ #[test]fn m1_r050_disk_guid_change_revokes_session_without_write(){
+  use crate::batch6_security::{FILE_READ,FILE_WRITE};
+  use crate::m1_persistent_terminal::{PartitionCommandError};
+  let mut d=m1_r050_provision();let mut s=m1_r050_open(&mut d);
+  let a=m1_r050_auth(FILE_READ|FILE_WRITE,200);
+  d.data[1][56..72].fill(9);rechecksum_gpt(&mut d);
+  let mut out=[0xaa;32];let before=d.writes;
+  assert_eq!(s.execute(&mut d,&a,m1_r050_owner(),2,b"cat /work/a",&mut out),
+   Err(PartitionCommandError::Mount(MountError::Partition(Error::Invalid))));
+  assert!(!s.is_active());assert_eq!(d.writes,before);
+ }
+ #[test]fn m1_r050_backup_metadata_corruption_revokes_session(){
+  use crate::batch6_security::{FILE_READ,FILE_WRITE};
+  use crate::m1_persistent_terminal::PartitionCommandError;
+  let mut d=m1_r050_provision();let mut s=m1_r050_open(&mut d);
+  let a=m1_r050_auth(FILE_READ|FILE_WRITE,200);
+  d.data[255][16]^=1;
+  let before=d.writes;let mut out=[0xaa;32];
+  assert_eq!(s.execute(&mut d,&a,m1_r050_owner(),2,b"cat /work/a",&mut out),
+   Err(PartitionCommandError::Mount(MountError::Partition(Error::Invalid))));
+  assert!(!s.is_active());assert_eq!(d.writes,before);
+ }
+ #[test]fn m1_r050_degraded_cow_volume_does_not_open_session(){
+  use crate::batch6_security::{FILE_READ,FILE_WRITE};
+  use crate::m1_persistent_terminal::{GptTerminalSession,PartitionCommandError};
+  let mut d=m1_r050_provision();
+  d.data[40][19]^=1;
+  let writes=d.writes;
+  assert!(matches!(GptTerminalSession::open(&mut d,0,
+   &m1_r050_auth(FILE_READ|FILE_WRITE,200),m1_r050_owner(),1,100),
+   Err(PartitionCommandError::Mount(MountError::Filesystem(FsError::InvalidVolume)))));
+  assert_eq!(d.writes,writes);
+ }
+ #[test]fn m1_r050_failed_disk_write_preserves_previous_cow_file(){
+  use crate::batch6_security::{FILE_READ,FILE_WRITE};
+  use crate::m1_persistent_terminal::{PartitionCommandError,Error as CmdError};
+  let mut d=m1_r050_provision();let a=m1_r050_auth(FILE_READ|FILE_WRITE,200);
+  let mut s=m1_r050_open(&mut d);let mut out=[0;32];
+  s.execute(&mut d,&a,m1_r050_owner(),2,b"write /work/a stable",&mut out).unwrap();
+  d.fail_at=Some(d.writes+1);
+  assert_eq!(s.execute(&mut d,&a,m1_r050_owner(),3,b"write /work/a broken",&mut out),
+   Err(PartitionCommandError::Command(CmdError::Io(FsError::Io))));
+  d.fail_at=None;
+  // A write error alone is uncertain: re-open the volume on next command.
+  // No implicit new bytes may replace the previously confirmed data.
+  let mut next=m1_r050_open(&mut d);
+  assert_eq!(next.execute(&mut d,&a,m1_r050_owner(),4,b"cat /work/a",&mut out),Ok(6));
+  assert_eq!(&out[..6],b"stable");
+ }
+ #[test]fn m1_r050_owner_scope_is_checked_before_command_disk_access(){
+  use crate::batch6_security::{FILE_READ,FILE_WRITE};
+  use crate::m1_persistent_terminal::{PartitionCommandError,Error as CmdError};
+  let mut d=m1_r050_provision();let mut s=m1_r050_open(&mut d);
+  let a=m1_r050_auth(FILE_READ|FILE_WRITE,200);
+  let wrong=crate::batch5_session::Identity{pid:11,..m1_r050_owner()};
+  let before=d.writes;let mut out=[0x42;32];
+  assert_eq!(s.execute(&mut d,&a,wrong,2,b"stat /work/a",&mut out),
+   Err(PartitionCommandError::Command(CmdError::Denied)));
+  assert_eq!(d.writes,before);assert_eq!(out,[0x42;32]);
+ }
  #[test]fn m1_r045_empty_valid_mbr_reports_no_partitions_without_format(){
   let mut d=new();d.data[0][510]=0x55;d.data[0][511]=0xaa;
   let inventory=discover(&mut d).unwrap();
