@@ -127,6 +127,9 @@ fn gpt<D:BlockDevice>(disk:&mut D)->Result<PartitionSet,Error>{
  let mut check=hdr;
  check[16..20].fill(0);
  if crc(&check[..size])!=expected{return Err(Error::Invalid);}
+ // A nil DiskGUID cannot identify selected media across recovery/reopen.
+ // Reject it even when both headers and all partition checksums agree.
+ if hdr[56..72].iter().all(|&byte|byte==0){return Err(Error::Invalid);}
  let alternate=le64(&hdr[32..40]);
  let first=le64(&hdr[40..48]);
  let last=le64(&hdr[48..56]);
@@ -321,6 +324,29 @@ pub fn mount_gpt_selected_healthy<'a,D:BlockDevice>(disk:&'a mut D,
  if actual!=expected{return Err(MountError::Partition(Error::Invalid));}
  mount_checked_healthy(disk,actual.partition)
 }
+/// Explicit recovery operation used by the authenticated Terminal service.
+/// Keep the original GUID/geometry binding while admitting one good COW head;
+/// ordinary selected mounts remain healthy-only. Caller must hold the device
+/// quiescent throughout. Repair never formats or writes file payloads.
+pub(crate) fn repair_gpt_selected<D:BlockDevice>(disk:&mut D,
+ expected:GptSelection)->Result<bool,MountError>{
+ let actual=inspect_gpt_selection(disk,expected.partition.index)
+  .map_err(MountError::Partition)?;
+ if actual!=expected{return Err(MountError::Partition(Error::Invalid));}
+ if actual.partition.sectors<MIN_SECTORS{
+  return Err(MountError::Partition(Error::OutOfRange));
+ }
+ let repaired={
+  let bounded=BlockWindow::new(disk,actual.partition.start,actual.partition.sectors)
+   .map_err(|_|MountError::Partition(Error::OutOfRange))?;
+  let mut volume=HierVfs::mount(bounded).map_err(MountError::Filesystem)?;
+  volume.repair_redundancy().map_err(MountError::Filesystem)?
+ };
+ // Recovery succeeds only after a fresh complete identity/health check.
+ // A failed final read leaves the repair uncertain, never a usable session.
+ drop(mount_gpt_selected_healthy(disk,expected)?);
+ Ok(repaired)
+}
 pub fn mount<'a,D:BlockDevice>(disk:&'a mut D,index:u32)
  ->Result<HierVfs<BlockWindow<'a,D>>,MountError>{
  let part=inspect(disk,index).map_err(MountError::Partition)?;
@@ -371,6 +397,9 @@ mod m1_partition_tests{
   h[32..40].copy_from_slice(&255u64.to_le_bytes());
   h[40..48].copy_from_slice(&34u64.to_le_bytes());
   h[48..56].copy_from_slice(&222u64.to_le_bytes());
+  // A real GPT identity must not use the nil UUID. Nil rejection is tested
+  // separately with fully checksummed, matching primary/secondary headers.
+  h[56..72].fill(3);
   h[72..80].copy_from_slice(&2u64.to_le_bytes());
   h[80..84].copy_from_slice(&4u32.to_le_bytes());
   h[84..88].copy_from_slice(&128u32.to_le_bytes());
@@ -1312,6 +1341,208 @@ mod m1_partition_tests{
   assert_eq!(s.execute(&mut d,&a,wrong,2,b"stat /work/a",&mut out),
    Err(PartitionCommandError::Command(CmdError::Denied)));
   assert_eq!(d.writes,before);assert_eq!(out,[0x42;32]);
+ }
+ // Explicit recovery retains the GUID selection and returns a new service
+ // session. These fixtures use disposable in-memory media, never real disks.
+ fn m1_recovery_disk()->Disk{
+  let mut disk=m1_r050_provision();
+  {
+   let mut volume=mount(&mut disk,0).unwrap();
+   volume.create("/work/a",b"preserved").unwrap();
+  }
+  disk.data[39].fill(0x39);disk.data[140].fill(0x8c);
+  disk
+ }
+ #[test]fn m1_recovery_nil_disk_guid_cannot_create_a_pinned_selection(){
+  use crate::m1_persistent_terminal::{GptTerminalSession,PartitionCommandError};
+  use crate::batch6_security::{FILE_READ,FILE_WRITE};
+  let mut disk=m1_recovery_disk();
+  disk.data[1][56..72].fill(0);rechecksum_gpt(&mut disk);
+  let before=disk.writes;
+  assert_eq!(inspect_gpt_selection(&mut disk,0),Err(Error::Invalid));
+  assert!(matches!(GptTerminalSession::open(&mut disk,0,
+   &m1_r050_auth(FILE_READ|FILE_WRITE,200),m1_r050_owner(),1,100),
+   Err(PartitionCommandError::Mount(MountError::Partition(Error::Invalid)))));
+  assert_eq!(disk.writes,before);
+ }
+ #[test]fn m1_recovery_healthy_request_is_read_only_and_returns_a_fresh_session(){
+  use crate::m1_persistent_terminal::GptTerminalSession;
+  use crate::batch6_security::{FILE_READ,FILE_WRITE};
+  let mut disk=m1_recovery_disk();
+  let selected=inspect_gpt_selection(&mut disk,0).unwrap();
+  let auth=m1_r050_auth(FILE_READ|FILE_WRITE,200);let before=disk.writes;
+  let (mut fresh,repaired)=GptTerminalSession::recover(&mut disk,selected,
+   &auth,m1_r050_owner(),2,100).unwrap();
+  assert!(!repaired);assert_eq!(disk.writes,before);
+  assert_eq!(fresh.status(&auth,m1_r050_owner(),2).unwrap().commands,0);
+  let mut out=[0;32];
+  assert_eq!(fresh.execute(&mut disk,&auth,m1_r050_owner(),3,
+   b"cat /work/a",&mut out),Ok(9));
+  assert_eq!(&out[..9],b"preserved");
+ }
+ #[test]fn m1_recovery_repairs_only_selected_metadata_and_never_revives_retired_session(){
+  use crate::m1_persistent_terminal::{GptTerminalSession,PartitionCommandError,Error as CmdError};
+  use crate::batch6_security::{FILE_READ,FILE_WRITE};
+  let mut disk=m1_recovery_disk();
+  let selected=inspect_gpt_selection(&mut disk,0).unwrap();
+  let auth=m1_r050_auth(FILE_READ|FILE_WRITE,200);
+  let mut retired=GptTerminalSession::open(&mut disk,0,&auth,m1_r050_owner(),1,100).unwrap();
+  disk.data[41][19]^=1;
+  let mut out=[0xa5;32];
+  assert!(matches!(retired.execute(&mut disk,&auth,m1_r050_owner(),2,
+   b"cat /work/a",&mut out),Err(PartitionCommandError::Mount(_))));
+  assert!(!retired.is_active());assert_eq!(out,[0xa5;32]);
+  let before=disk.writes;let payloads=disk.data;
+  let (mut fresh,repaired)=GptTerminalSession::recover(&mut disk,selected,
+   &auth,m1_r050_owner(),3,100).unwrap();
+  assert!(repaired);assert_eq!(disk.writes,before+1);
+  for (sector,original) in payloads.iter().enumerate(){
+   if sector!=41{assert_eq!(&disk.data[sector],original);}
+  }
+  assert_eq!(fresh.execute(&mut disk,&auth,m1_r050_owner(),4,
+   b"cat /work/a",&mut out),Ok(9));
+  assert_eq!(&out[..9],b"preserved");
+  out.fill(0xa5);let before=disk.writes;
+  assert_eq!(retired.execute(&mut disk,&auth,m1_r050_owner(),4,
+   b"write /work/a forbidden",&mut out),
+   Err(PartitionCommandError::Command(CmdError::Denied)));
+  assert_eq!(out,[0xa5;32]);assert_eq!(disk.writes,before);
+  assert_eq!(disk.data[39],[0x39;SECTOR_BYTES]);
+  assert_eq!(disk.data[140],[0x8c;SECTOR_BYTES]);
+ }
+ #[test]fn m1_recovery_changed_disk_partition_or_geometry_never_writes(){
+  use crate::m1_persistent_terminal::{GptTerminalSession,PartitionCommandError};
+  use crate::batch6_security::{FILE_READ,FILE_WRITE};
+  for changed in 0..3{
+   let mut disk=m1_recovery_disk();
+   let selected=inspect_gpt_selection(&mut disk,0).unwrap();
+   disk.data[41][19]^=1;
+   match changed{
+    0=>disk.data[1][56..72].fill(9),
+    1=>disk.data[2][16..32].fill(9),
+    _=>disk.data[2][32..40].copy_from_slice(&41u64.to_le_bytes()),
+   }
+   rechecksum_gpt(&mut disk);let before=disk.writes;let image=disk.data;
+   assert!(matches!(GptTerminalSession::recover(&mut disk,selected,
+    &m1_r050_auth(FILE_READ|FILE_WRITE,200),m1_r050_owner(),2,100),
+    Err(PartitionCommandError::Mount(MountError::Partition(Error::Invalid)))));
+   assert_eq!(disk.writes,before);assert_eq!(disk.data,image);
+  }
+ }
+ #[test]fn m1_recovery_denied_owner_scope_or_deadline_performs_no_device_io(){
+  use crate::m1_persistent_terminal::{GptTerminalSession,PartitionCommandError,Error as CmdError};
+  use crate::batch6_security::{Access,FILE_READ,FILE_WRITE};
+  struct Metered<'a>{disk:&'a mut Disk,reads:usize,capacities:core::cell::Cell<usize>}
+  impl BlockDevice for Metered<'_>{
+   fn sector_count(&self)->u64{
+    self.capacities.set(self.capacities.get()+1);self.disk.sector_count()
+   }
+   fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+    self.reads+=1;self.disk.read_sector(lba,out)
+   }
+   fn write_sector(&mut self,lba:u64,bytes:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+    self.disk.write_sector(lba,bytes)
+   }
+  }
+  let mut disk=m1_recovery_disk();let selected=inspect_gpt_selection(&mut disk,0).unwrap();
+  let original=disk.writes;
+  let mut meter=Metered{disk:&mut disk,reads:0,capacities:core::cell::Cell::new(0)};
+  let owner=m1_r050_owner();
+  for (identity,rights,grant_expiry,now,deadline) in [
+   (owner,FILE_READ,200,2,100),(owner,FILE_WRITE,200,2,100),
+   (crate::batch5_session::Identity{generation:8,..owner},FILE_READ|FILE_WRITE,200,2,100),
+   (crate::batch5_session::Identity{pid:9,..owner},FILE_READ|FILE_WRITE,200,2,100),
+   (owner,FILE_READ|FILE_WRITE,2,2,100),(owner,FILE_READ|FILE_WRITE,200,2,2),
+   (owner,FILE_READ|FILE_WRITE,200,2,1),
+  ]{
+   let mut auth=Access::<1>::new();auth.grant(owner,rights,grant_expiry).unwrap();
+   assert!(matches!(GptTerminalSession::recover(&mut meter,selected,&auth,
+    identity,now,deadline),Err(PartitionCommandError::Command(CmdError::Denied))));
+  }
+  assert_eq!(meter.reads,0);assert_eq!(meter.capacities.get(),0);
+  assert_eq!(meter.disk.writes,original);
+ }
+ #[test]fn m1_recovery_invalid_or_unreadable_media_is_never_formatted(){
+  use crate::m1_persistent_terminal::GptTerminalSession;
+  use crate::batch6_security::{FILE_READ,FILE_WRITE};
+  for failure in 0..4{
+   let mut disk=if failure==0{gpt_disk()}else{m1_recovery_disk()};
+   let selected=inspect_gpt_selection(&mut disk,0).unwrap();
+   match failure{
+    1=>{disk.data[40][19]^=1;disk.data[41][19]^=1;},
+    2=>disk.fail_read=Some(2),
+    3=>disk.fail_read=Some(40),
+    _=>(),
+   }
+   let before=disk.writes;let image=disk.data;
+   assert!(GptTerminalSession::recover(&mut disk,selected,
+    &m1_r050_auth(FILE_READ|FILE_WRITE,200),m1_r050_owner(),2,100).is_err());
+   assert_eq!(disk.writes,before);assert_eq!(disk.data,image);
+  }
+ }
+ #[test]fn m1_recovery_failed_final_identity_read_never_issues_a_session(){
+  use crate::m1_persistent_terminal::{GptTerminalSession,PartitionCommandError};
+  use crate::batch6_security::{FILE_READ,FILE_WRITE};
+  struct PostWriteReadFault<'a>{disk:&'a mut Disk}
+  impl BlockDevice for PostWriteReadFault<'_>{
+   fn sector_count(&self)->u64{self.disk.sector_count()}
+   fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+    self.disk.read_sector(lba,out)
+   }
+   fn write_sector(&mut self,lba:u64,bytes:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+    self.disk.write_sector(lba,bytes)?;
+    self.disk.fail_read=Some(1);Ok(())
+   }
+  }
+  let mut disk=m1_recovery_disk();let selected=inspect_gpt_selection(&mut disk,0).unwrap();
+  disk.data[41][19]^=1;let before=disk.writes;
+  let auth=m1_r050_auth(FILE_READ|FILE_WRITE,200);
+  assert!(matches!(GptTerminalSession::recover(&mut PostWriteReadFault{disk:&mut disk},
+   selected,&auth,m1_r050_owner(),2,100),
+   Err(PartitionCommandError::Mount(MountError::Partition(Error::Io)))));
+  // The metadata sector was written, but final verification failed, so the
+  // caller receives uncertainty rather than an unverified fresh session.
+  assert_eq!(disk.writes,before+1);disk.fail_read=None;
+  let (mut fresh,repaired)=GptTerminalSession::recover(&mut disk,selected,
+   &auth,m1_r050_owner(),3,100).unwrap();assert!(!repaired);
+  let mut out=[0;32];assert_eq!(fresh.execute(&mut disk,&auth,m1_r050_owner(),4,
+   b"cat /work/a",&mut out),Ok(9));assert_eq!(&out[..9],b"preserved");
+ }
+ #[test]fn m1_recovery_interrupted_metadata_repair_preserves_payload_at_every_byte_cut(){
+  use crate::m1_persistent_terminal::{GptTerminalSession,PartitionCommandError};
+  use crate::batch6_security::{FILE_READ,FILE_WRITE};
+  struct Torn<'a>{disk:&'a mut Disk,cut:usize,attempts:usize}
+  impl BlockDevice for Torn<'_>{
+   fn sector_count(&self)->u64{self.disk.sector_count()}
+   fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+    self.disk.read_sector(lba,out)
+   }
+   fn write_sector(&mut self,lba:u64,bytes:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+    assert_eq!(lba,41);self.attempts+=1;self.disk.writes+=1;
+    self.disk.data[lba as usize][..self.cut].copy_from_slice(&bytes[..self.cut]);
+    Err(BlockError::Io)
+   }
+  }
+  for cut in 0..=SECTOR_BYTES{
+   let mut disk=m1_recovery_disk();let selected=inspect_gpt_selection(&mut disk,0).unwrap();
+   disk.data[41][19]^=1;let auth=m1_r050_auth(FILE_READ|FILE_WRITE,200);
+   {
+    let mut torn=Torn{disk:&mut disk,cut,attempts:0};
+    assert!(matches!(GptTerminalSession::recover(&mut torn,selected,
+     &auth,m1_r050_owner(),2,100),
+     Err(PartitionCommandError::Mount(MountError::Filesystem(FsError::Io)))));
+    assert_eq!(torn.attempts,1);
+   }
+   // Even a complete sector followed by an error is uncertain: no fresh
+   // session was issued. A subsequent explicit retry must verify the media.
+   let (mut fresh,_)=GptTerminalSession::recover(&mut disk,selected,
+    &auth,m1_r050_owner(),3,100).unwrap();
+   let mut out=[0;32];
+   assert_eq!(fresh.execute(&mut disk,&auth,m1_r050_owner(),4,
+    b"cat /work/a",&mut out),Ok(9));assert_eq!(&out[..9],b"preserved");
+   assert_eq!(disk.data[39],[0x39;SECTOR_BYTES]);
+   assert_eq!(disk.data[140],[0x8c;SECTOR_BYTES]);
+  }
  }
  #[test]fn m1_r045_empty_valid_mbr_reports_no_partitions_without_format(){
   let mut d=new();d.data[0][510]=0x55;d.data[0][511]=0xaa;

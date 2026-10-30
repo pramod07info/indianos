@@ -44,6 +44,79 @@ fn halt()->!{
 fn need(ok:bool,message:&'static [u8]){
     if !ok{log(message);halt()}
 }
+// Recovery deliberately offers no disk, memory, process or retry commands.
+// In particular, failed image staging must not be retried over uncertain state.
+const RECOVERY_LINE_BYTES:usize=32;
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+enum RecoveryCommand{Help,Status,Halt,Unknown,Rejected}
+struct RecoveryLine{
+    bytes:[u8;RECOVERY_LINE_BYTES],len:usize,rejected:bool,after_cr:bool,
+}
+impl RecoveryLine{
+    const fn new()->Self{
+        Self{bytes:[0;RECOVERY_LINE_BYTES],len:0,rejected:false,after_cr:false}
+    }
+    fn feed(&mut self,byte:u8)->Option<RecoveryCommand>{
+        if byte==b'\n'&&self.after_cr{self.after_cr=false;return None;}
+        self.after_cr=byte==b'\r';
+        if matches!(byte,b'\r'|b'\n'){
+            let result=if self.rejected{Some(RecoveryCommand::Rejected)}else{
+                match core::str::from_utf8(&self.bytes[..self.len]).unwrap().trim(){
+                    ""=>None,"help"=>Some(RecoveryCommand::Help),
+                    "status"=>Some(RecoveryCommand::Status),
+                    "halt"=>Some(RecoveryCommand::Halt),
+                    _=>Some(RecoveryCommand::Unknown),
+                }
+            };
+            self.len=0;self.rejected=false;
+            return result;
+        }
+        if self.rejected{return None;}
+        if matches!(byte,8|127){self.len=self.len.saturating_sub(1);}
+        else if byte==b' '||byte.is_ascii_graphic(){
+            if self.len==self.bytes.len(){self.rejected=true;}
+            else{self.bytes[self.len]=byte;self.len+=1;}
+        }else{self.rejected=true;}
+        None
+    }
+}
+/// Init recovery remains inside the kernel with interrupts masked. It polls
+/// only COM1 and never mounts, formats, allocates, launches or retries init.
+fn recover_init(reason:&'static [u8])->!{
+    unsafe{asm!("cli",options(nomem,nostack,preserves_flags));}
+    log(reason);
+    log(b"IndianOS recovery: read-only serial console ready\n\0");
+    log(b"IndianOS recovery: commands help status halt\nrecovery> \0");
+    let mut line=RecoveryLine::new();
+    loop{
+        let status:u8;
+        unsafe{asm!("in al, dx",out("al")status,in("dx")0x3fdu16,
+                    options(nostack,nomem,preserves_flags));}
+        if status&1==0{
+            unsafe{asm!("pause",options(nostack,nomem,preserves_flags));}
+            continue;
+        }
+        let byte:u8;
+        unsafe{asm!("in al, dx",out("al")byte,in("dx")0x3f8u16,
+                    options(nostack,nomem,preserves_flags));}
+        // A damaged transfer poisons the entire line, never a command suffix.
+        let byte=if status&0x1e!=0{0}else{byte};
+        let Some(command)=line.feed(byte)else{continue;};
+        match command{
+            RecoveryCommand::Help=>log(b"IndianOS recovery: help=status and command list; status=read-only boot state; halt=stop CPU\n\0"),
+            RecoveryCommand::Status=>{
+                log(reason);
+                log(b"IndianOS recovery: filesystem=offline writes=disabled user-exec=disabled\n\0");
+            },
+            RecoveryCommand::Halt=>{
+                log(b"IndianOS recovery: halted\n\0");halt()
+            },
+            RecoveryCommand::Unknown=>log(b"IndianOS recovery: unsupported command\n\0"),
+            RecoveryCommand::Rejected=>log(b"IndianOS recovery: input rejected\n\0"),
+        }
+        log(b"recovery> \0");
+    }
+}
 fn module(name:&'static [u8])->Option<(*const u8,usize)>{
     let mut data:*const u8=ptr::null();
     let mut len:usize=0;
@@ -450,11 +523,13 @@ pub extern "C" fn kmain()->!{
     }
     let (init,init_size)=module(b"/bin/init\0").unwrap_or_else(||{
         log(b"IndianOS: FATAL initramfs /bin/init is unavailable or invalid\n\0");
-        halt()
+        recover_init(b"IndianOS recovery: reason=init-unavailable-or-invalid\n\0")
     });
     log(b"IndianOS: read-only initramfs /bin/init validated\n\0");
-    need(unsafe{user_image_boot_stage_test(init,init_size)},
-         b"IndianOS: FATAL detached user-image staging failed\n\0");
+    if !unsafe{user_image_boot_stage_test(init,init_size)}{
+        log(b"IndianOS: FATAL detached user-image staging failed\n\0");
+        recover_init(b"IndianOS recovery: reason=init-staging-failed\n\0")
+    }
     log(b"IndianOS: initramfs /bin/init staged and released safely\n\0");
 
     #[cfg(all(feature="test-shell",not(feature="test-r026"),not(feature="test-r029-userspace")))]
@@ -615,4 +690,39 @@ pub extern "C" fn kmain()->!{
         }
     }
     halt()
+}
+
+#[cfg(test)]
+mod recovery_tests{
+    use super::*;
+    fn feed(line:&mut RecoveryLine,bytes:&[u8])->std::vec::Vec<RecoveryCommand>{
+        bytes.iter().filter_map(|b|line.feed(*b)).collect()
+    }
+    #[test]fn recovery_commands_are_bounded_and_explicit(){
+        let mut line=RecoveryLine::new();
+        assert_eq!(feed(&mut line,b" help \r\nstatus\nhalt\r"),
+            [RecoveryCommand::Help,RecoveryCommand::Status,RecoveryCommand::Halt]);
+        assert_eq!(feed(&mut line,b"\n\r\n"),[]);
+        assert_eq!(feed(&mut line,b"write /boot x\nreboot\nHELP\n"),
+            [RecoveryCommand::Unknown;3]);
+    }
+    #[test]fn recovery_editing_and_capacity_boundary(){
+        let mut line=RecoveryLine::new();
+        assert_eq!(feed(&mut line,b"\x08\x7fstatux\x08s\n"),[RecoveryCommand::Status]);
+        let mut full=[b' ';RECOVERY_LINE_BYTES];full[..4].copy_from_slice(b"help");
+        assert!(feed(&mut line,&full).is_empty());
+        assert_eq!(line.feed(b'\n'),Some(RecoveryCommand::Help));
+    }
+    #[test]fn recovery_overflow_and_controls_poison_whole_line(){
+        for bad in [0,1,9,27,128,255]{
+            let mut line=RecoveryLine::new();
+            assert_eq!(line.feed(bad),None);
+            assert_eq!(feed(&mut line,b"\x08halt\nstatus\n"),
+                [RecoveryCommand::Rejected,RecoveryCommand::Status]);
+        }
+        let mut line=RecoveryLine::new();
+        assert!(feed(&mut line,&[b' ';RECOVERY_LINE_BYTES+1]).is_empty());
+        assert_eq!(feed(&mut line,b"\x08halt\r\nhelp\n"),
+            [RecoveryCommand::Rejected,RecoveryCommand::Help]);
+    }
 }

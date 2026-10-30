@@ -129,6 +129,7 @@ impl ScanDecoder{
 pub(crate) fn filter(b:u8)->Option<u8>{
     match b {
         b'\r'|b'\n'=>Some(b'\n'),
+        b'\t'=>Some(b'\t'), // Bounded Terminal editing/completion control.
         8|127=>Some(8),
         0x10|0x0e=>Some(b), // R015 history navigation
         32..=126=>Some(b),
@@ -586,6 +587,7 @@ mod tests{
     }
     #[test]
     fn terminal_input_filters_controls(){
+        assert_eq!(filter(b'\t'),Some(b'\t'));
         assert_eq!(filter(b'\r'),Some(b'\n'));
         assert_eq!(filter(127),Some(8));
         assert_eq!(filter(0x1b),None);
@@ -598,5 +600,17 @@ mod tests{
         assert_eq!(keys.feed(0x50),Some(0x0e));
         assert_eq!(keys.feed(0x1c),Some(b'\n'));
         assert_eq!(keys.feed(0x0e),Some(8));
+    }
+    #[test]
+    fn physical_tab_reaches_editor_without_leaking_modified_shortcuts(){
+        let mut decoder=ScanDecoder::default();
+        assert_eq!(decoder.feed_transfer(1,0x0f),Some(b'\t'));
+        assert_eq!(decoder.feed_transfer(1,0x8f),None);
+        assert_eq!(decoder.feed_transfer(1,0x1d),None);
+        assert_eq!(decoder.feed_transfer(1,0x0f),None);
+        assert_eq!(decoder.feed_transfer(1,0x9d),None);
+        assert_eq!(decoder.feed_transfer(0x21,0x0f),None);
+        assert_eq!(decoder.feed_transfer(0xc1,0x0f),None);
+        assert_eq!(decoder.feed_transfer(1,0x0f),Some(b'\t'));
     }
 }

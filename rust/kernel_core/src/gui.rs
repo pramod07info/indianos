@@ -184,7 +184,7 @@ impl Surface{
 // *commands*, never the framebuffer mapping. The kernel alone clips, paints,
 // validates privilege, and keeps a replayable eight-command backing store.
 #[cfg(feature="test-r029-userspace")]
-use crate::gui_protocol::{Command as UserCommand,FILL,TEXT,COMMAND_LIMIT};
+use crate::gui_protocol::{Command as UserCommand,FILL,TEXT,REPLACE_TEXT,COMMAND_LIMIT};
 #[cfg(feature="test-r029-userspace")]
 use crate::gui_broker::{Broker,Event as GuiEvent};
 #[cfg(feature="test-r029-userspace")]
@@ -308,21 +308,33 @@ impl UserSurfaceService{
         true
     }
     fn submit(&mut self,pid:u32,bytes:&[u8;64])->bool{
-        let Ok(cmd)=UserCommand::parse(bytes)else{return false;};
+        // Frame-server clients stage commands; authenticated PID1 presents.
+        #[cfg(feature="test-r029-frame-server")]
+        {self.submit_with(pid,bytes,|_|true)}
+        #[cfg(not(feature="test-r029-frame-server"))]
+        {self.submit_with(pid,bytes,Self::redraw)}
+    }
+    fn submit_with(&mut self,pid:u32,bytes:&[u8;64],paint:impl FnOnce(&Self)->bool)->bool{
+        let Ok(mut cmd)=UserCommand::parse(bytes)else{return false;};
         if !self.broker.owns(pid,cmd.window){return false;}
         let slot=cmd.window as usize-1;
         let Some((_,_,width,height))=self.client_bounds(cmd.window)else{return false;};
-        if !cmd.within_client(width,height) || self.counts[slot]>=COMMAND_LIMIT{
-            return false;
+        if !cmd.within_client(width,height){return false;}
+        let before=self.counts[slot];
+        let index=if cmd.operation==REPLACE_TEXT{
+            let Some(index)=self.commands[slot][..before].iter().position(|old|
+                old.operation==TEXT&&old.x==cmd.x&&old.y==cmd.y&&
+                old.width==cmd.width&&old.height==cmd.height)else{return false;};
+            cmd.operation=TEXT;index
+        }else{
+            if before>=COMMAND_LIMIT{return false;}
+            self.counts[slot]+=1;before
+        };
+        let previous=self.commands[slot][index];
+        self.commands[slot][index]=cmd;
+        if paint(self){true}else{
+            self.commands[slot][index]=previous;self.counts[slot]=before;false
         }
-        self.commands[slot][self.counts[slot]]=cmd;
-        self.counts[slot]+=1;
-        // A client may submit commands but cannot cause a frame to be
-        // displayed. Only the authenticated ring-3 frame server can.
-        #[cfg(feature="test-r029-frame-server")]
-        {return true;}
-        #[cfg(not(feature="test-r029-frame-server"))]
-        if self.redraw(){true}else{self.counts[slot]-=1;false}
     }
     fn focus(&mut self,pid:u32,id:u32)->bool{
         if !self.broker.can_post(pid,id){return false;}
@@ -744,6 +756,61 @@ pub(crate) fn run()->bool{
 #[cfg(test)]
 mod tests{
     use super::*;
+    #[cfg(feature="test-r029-desktop-suite")]
+    #[test]fn owned_text_replacement_is_bounded_transactional_and_erases_shortened_glyphs(){
+        let mut broker=Broker::new();broker.grant(2,1).unwrap();broker.grant(3,2).unwrap();
+        let mut svc=UserSurfaceService{
+            session:Session::new(800,600).unwrap(),
+            commands:[[UserCommand::EMPTY;COMMAND_LIMIT];2],counts:[0,0],
+            focused:0,broker,frames_presented:0,launcher_visible:false,desktop_actions:0,
+            #[cfg(feature="test-r031-supervisor")]
+            restart_count:0,
+            mouse:unsafe{core::mem::zeroed()},
+        };
+        fn text(operation:u32,bytes:&[u8])->[u8;64]{
+            let mut b=[0;64];b[..4].copy_from_slice(b"R29U");
+            b[4..8].copy_from_slice(&1u32.to_le_bytes());
+            b[8..12].copy_from_slice(&2u32.to_le_bytes());
+            b[12..16].copy_from_slice(&operation.to_le_bytes());
+            b[16..18].copy_from_slice(&24u16.to_le_bytes());
+            b[18..20].copy_from_slice(&181u16.to_le_bytes());
+            b[20..22].copy_from_slice(&270u16.to_le_bytes());
+            b[22..24].copy_from_slice(&14u16.to_le_bytes());
+            b[24..28].copy_from_slice(&0xffffffu32.to_le_bytes());
+            b[32..32+bytes.len()].copy_from_slice(bytes);b
+        }
+        let replace=text(REPLACE_TEXT,b"A");
+        assert!(!svc.submit(3,&replace)); // No existing field.
+        assert!(svc.submit(3,&text(TEXT,b"LONGER")));
+        let original=svc.commands;
+        assert!(!svc.submit(2,&replace));
+        let mut moved=replace;moved[16]=25;
+        assert!(!svc.submit(3,&moved));
+        assert!(!svc.submit_with(3,&replace,|_|false));
+        assert_eq!(svc.commands,original);assert_eq!(svc.counts,[0,1]);
+        let p=Palette{bg:2,top:3,bar:4,title:5,unfocused:6,light:7,dark:8,panel:9,white:10,accent:11};
+        const PITCH:usize=804;const GUARD:u32=0xfeedface;
+        let mut pixels=std::vec![GUARD;PITCH*600+16];
+        let mut out=Surface{ptr:pixels.as_mut_ptr().cast(),width:800,height:600,pitch:PITCH*4,
+            palette:p,rgb:|r,g,b|Some(((r as u32)<<16)|((g as u32)<<8)|b as u32)};
+        assert!(svc.paint(&mut out));let long=pixels.clone();
+        for _ in 0..100{assert!(svc.submit(3,&replace));}
+        assert_eq!(svc.counts,[0,1]);assert_eq!(svc.commands[1][0].operation,TEXT);
+        assert!(svc.paint(&mut out));
+        let (x,y,_,_)=svc.client_bounds(2).unwrap();
+        // The old second-through-sixth glyphs disappear from actual pixels.
+        let mut erased=0;
+        for py in y as usize+181..y as usize+195{
+            for px in x as usize+36..x as usize+24+6*12{
+                if long[py*PITCH+px]==0xffffff&&pixels[py*PITCH+px]!=0xffffff{erased+=1;}
+            }
+        }
+        assert!(erased>10);
+        for row in 0..600{assert!(pixels[row*PITCH+800..(row+1)*PITCH].iter().all(|&v|v==GUARD));}
+        assert!(pixels[PITCH*600..].iter().all(|&v|v==GUARD));
+        svc.broker.revoke(3);
+        assert!(!svc.submit(3,&replace));
+    }
     #[cfg(feature="test-r029-desktop-suite")]
     #[test]fn retained_clients_obey_visibility_through_authenticated_present(){
         // No firmware mapping or PS/2 I/O: only the destination and RGB packing

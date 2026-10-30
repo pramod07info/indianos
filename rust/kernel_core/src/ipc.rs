@@ -1,8 +1,8 @@
-//! Bounded kernel-owned IPC mailboxes for the future userspace ABI.
+//! Bounded kernel-owned IPC mailboxes and cooperative receive continuations.
 //!
-//! No heap allocation, interrupts, blocking, or untrusted user pointers.
+//! No heap allocation, interrupt access, or dereferenced user pointers here.
 //! The privileged caller must authenticate the sender against the current PCB;
-//! this is *not* yet exposed as a syscall or scheduler-integrated IPC service.
+//! the live single-BSP runtime supplies syscall authentication and scheduling.
 //! Each mailbox has a fixed receiver PID. Teardown discards its received
 //! messages and any pending messages it sent to peers.
 
@@ -20,6 +20,7 @@ pub enum IpcError {
     PayloadTooLarge,
     Full,
     Empty,
+    CopyFailed,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -44,6 +45,7 @@ impl Message {
 
 pub struct Mailbox<const DEPTH: usize> {
     receiver: u32,
+    epoch: u64,
     slots: [Option<Message>; DEPTH],
     head: usize,
     count: usize,
@@ -55,7 +57,7 @@ impl<const DEPTH: usize> Mailbox<DEPTH> {
         if DEPTH == 0 || DEPTH > MAX_MAILBOX_DEPTH {
             return Err(IpcError::InvalidConfiguration);
         }
-        Ok(Self { receiver, slots: [None; DEPTH], head: 0, count: 0 })
+        Ok(Self { receiver, epoch: 0, slots: [None; DEPTH], head: 0, count: 0 })
     }
 
     pub fn receiver(&self) -> u32 { self.receiver }
@@ -71,8 +73,18 @@ impl<const DEPTH: usize> Mailbox<DEPTH> {
     }
 
     pub fn receive(&mut self) -> Result<Message, IpcError> {
+        self.receive_with(|_| true)
+    }
+
+    // Delivery is serialized with queue mutation. A failed user copy must
+    // leave the same message and FIFO position available for a later call.
+    fn receive_with(&mut self, deliver:impl FnOnce(&Message)->bool)
+        -> Result<Message,IpcError>
+    {
         if self.count == 0 { return Err(IpcError::Empty); }
-        let message = self.slots[self.head].take().ok_or(IpcError::Empty)?;
+        let message = self.slots[self.head].ok_or(IpcError::Empty)?;
+        if !deliver(&message) { return Err(IpcError::CopyFailed); }
+        self.slots[self.head] = None;
         self.head = (self.head + 1) % DEPTH;
         self.count -= 1;
         Ok(message)
@@ -108,6 +120,7 @@ impl<const DEPTH: usize> Mailbox<DEPTH> {
 /// Callers must authorize the sender PID before invoking send().
 pub struct IpcRouter<const MAILBOXES: usize, const DEPTH: usize> {
     mailboxes: [Option<Mailbox<DEPTH>>; MAILBOXES],
+    next_epoch:u64,
 }
 
 impl<const MAILBOXES: usize, const DEPTH: usize> IpcRouter<MAILBOXES, DEPTH> {
@@ -115,7 +128,7 @@ impl<const MAILBOXES: usize, const DEPTH: usize> IpcRouter<MAILBOXES, DEPTH> {
         if MAILBOXES == 0 || DEPTH == 0 || DEPTH > MAX_MAILBOX_DEPTH {
             return Err(IpcError::InvalidConfiguration);
         }
-        Ok(Self { mailboxes: core::array::from_fn(|_| None) })
+        Ok(Self { mailboxes: core::array::from_fn(|_| None),next_epoch:1 })
     }
 
     pub fn register(&mut self, pid: u32) -> Result<(), IpcError> {
@@ -125,7 +138,11 @@ impl<const MAILBOXES: usize, const DEPTH: usize> IpcRouter<MAILBOXES, DEPTH> {
         }
         let slot = self.mailboxes.iter_mut().find(|slot| slot.is_none())
             .ok_or(IpcError::NoFreeMailbox)?;
-        *slot = Some(Mailbox::new(pid)?);
+        let next = self.next_epoch.checked_add(1).ok_or(IpcError::NoFreeMailbox)?;
+        let mut mailbox = Mailbox::new(pid)?;
+        mailbox.epoch = self.next_epoch;
+        *slot = Some(mailbox);
+        self.next_epoch = next;
         Ok(())
     }
 
@@ -155,17 +172,89 @@ impl<const MAILBOXES: usize, const DEPTH: usize> IpcRouter<MAILBOXES, DEPTH> {
         target.enqueue(Message::new(sender, data)?)
     }
 
-    /// Only the named receiver can consume its queue. The future syscall
-    /// handler must derive this identity from the current PCB, not user input.
+    /// Only the named receiver can consume its queue. The syscall handler
+    /// derives this identity from the current PCB, not user input.
     pub fn receive(&mut self, receiver: u32) -> Result<Message, IpcError> {
+        self.receive_with(receiver, |_| true)
+    }
+
+    pub fn receive_with(&mut self,receiver:u32,deliver:impl FnOnce(&Message)->bool)
+        ->Result<Message,IpcError>
+    {
         let target = self.mailboxes.iter_mut().flatten()
             .find(|m| m.receiver == receiver).ok_or(IpcError::UnknownReceiver)?;
-        target.receive()
+        target.receive_with(deliver)
+    }
+
+    fn epoch(&self,receiver:u32)->Result<u64,IpcError>{
+        self.mailboxes.iter().flatten().find(|m|m.receiver==receiver)
+            .map(|m|m.epoch).ok_or(IpcError::UnknownReceiver)
     }
 
     pub fn pending(&self, receiver: u32) -> Result<usize, IpcError> {
         self.mailboxes.iter().flatten().find(|m| m.receiver == receiver)
             .map(|m| m.pending()).ok_or(IpcError::UnknownReceiver)
+    }
+}
+
+/// Wire layout shared by polling receive and cooperative wait.
+pub const RECEIVE_BYTES:usize=8+MAX_PAYLOAD;
+pub const MAX_WAIT_ROUNDS:u8=32;
+impl Message{
+    pub fn wire(&self)->[u8;RECEIVE_BYTES]{
+        let mut bytes=[0u8;RECEIVE_BYTES];
+        bytes[..4].copy_from_slice(&self.sender.to_le_bytes());
+        bytes[4..8].copy_from_slice(&(self.length as u32).to_le_bytes());
+        bytes[8..8+self.length as usize].copy_from_slice(self.payload());
+        bytes
+    }
+}
+
+/// A private kernel continuation, bound to one mailbox registration. Rounds
+/// count scheduler selection passes, never hardware ticks or wall-clock time.
+/// All-zero is inactive so a zero-initialized private Task remains valid.
+#[derive(Clone,Copy)]
+pub struct ReceiveWait{
+    receiver:u32,epoch:u64,address:u64,remaining:u8,fresh:bool,
+}
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum WaitPoll{Pending,Delivered(usize),TimedOut,Failed(IpcError)}
+impl ReceiveWait{
+    pub const fn empty()->Self{
+        Self{receiver:0,epoch:0,address:0,remaining:0,fresh:false}
+    }
+    pub fn begin<const M:usize,const D:usize>(router:&IpcRouter<M,D>,
+        receiver:u32,address:u64,rounds:u64)->Result<Self,IpcError>{
+        if address==0||rounds==0||rounds>MAX_WAIT_ROUNDS as u64{
+            return Err(IpcError::InvalidConfiguration);
+        }
+        let epoch=router.epoch(receiver)?;
+        Ok(Self{receiver,epoch,address,remaining:rounds as u8,fresh:true})
+    }
+    pub fn active(&self)->bool{self.receiver!=0}
+    pub fn receiver(&self)->u32{self.receiver}
+    pub fn address(&self)->u64{self.address}
+    pub fn cancel(&mut self){*self=Self::empty();}
+    pub fn poll<const M:usize,const D:usize>(&mut self,router:&mut IpcRouter<M,D>,
+        deliver:impl FnOnce(&Message)->bool)->WaitPoll{
+        if !self.active(){return WaitPoll::Failed(IpcError::UnknownReceiver);}
+        let result=if router.epoch(self.receiver)!=Ok(self.epoch){
+            WaitPoll::Failed(IpcError::UnknownReceiver)
+        }else{
+            match router.receive_with(self.receiver,deliver){
+                Ok(message)=>WaitPoll::Delivered(8+message.payload().len()),
+                Err(IpcError::Empty)=>{
+                    // The first pass permits at least one peer dispatch even
+                    // with a one-round budget. Queued data wins at the deadline.
+                    if self.fresh{self.fresh=false;}
+                    else{self.remaining=self.remaining.saturating_sub(1);}
+                    if self.remaining==0{WaitPoll::TimedOut}else{WaitPoll::Pending}
+                },
+                Err(error)=>WaitPoll::Failed(error),
+            }
+        };
+        if result!=WaitPoll::Pending{self.cancel();}
+        result
     }
 }
 
@@ -291,6 +380,81 @@ impl<const M:usize,const D:usize> ScopedRouter<M,D>{
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ipc_failed_delivery_retains_wrapped_fifo_and_wire_padding(){
+        let mut router=IpcRouter::<2,2>::new().unwrap();
+        router.register(1).unwrap();router.register(2).unwrap();
+        router.send(1,2,b"old").unwrap();router.receive(2).unwrap();
+        router.send(1,2,b"first").unwrap();router.send(2,2,b"second").unwrap();
+        assert_eq!(router.receive_with(2,|message|{
+            let wire=message.wire();
+            assert_eq!(&wire[..4],&1u32.to_le_bytes());
+            assert_eq!(&wire[4..8],&5u32.to_le_bytes());
+            assert_eq!(&wire[8..13],b"first");
+            assert!(wire[13..].iter().all(|&b|b==0));false
+        }),Err(IpcError::CopyFailed));
+        assert_eq!(router.pending(2),Ok(2));
+        assert_eq!(router.receive(2).unwrap().payload(),b"first");
+        assert_eq!(router.receive(2).unwrap().payload(),b"second");
+    }
+    #[test]
+    fn ipc_wait_is_bounded_and_does_not_publish_on_timeout(){
+        for rounds in 1..=MAX_WAIT_ROUNDS{
+            let mut router=IpcRouter::<1,1>::new().unwrap();router.register(1).unwrap();
+            let mut wait=ReceiveWait::begin(&router,1,0x400000,rounds as u64).unwrap();
+            let mut output=[0xa5;RECEIVE_BYTES];
+            for _ in 0..rounds{
+                assert_eq!(wait.poll(&mut router,|_|{output.fill(0);true}),WaitPoll::Pending);
+            }
+            assert_eq!(wait.poll(&mut router,|_|{output.fill(0);true}),WaitPoll::TimedOut);
+            assert_eq!(output,[0xa5;RECEIVE_BYTES]);assert!(!wait.active());
+        }
+    }
+    #[test]
+    fn ipc_wait_delivery_wins_at_deadline_and_copy_failure_preserves_message(){
+        let mut router=IpcRouter::<2,2>::new().unwrap();
+        router.register(1).unwrap();router.register(2).unwrap();
+        let mut wait=ReceiveWait::begin(&router,2,0x400000,1).unwrap();
+        assert_eq!(wait.poll(&mut router,|_|true),WaitPoll::Pending);
+        router.send(1,2,b"hello").unwrap();
+        assert_eq!(wait.poll(&mut router,|_|false),WaitPoll::Failed(IpcError::CopyFailed));
+        assert_eq!(router.pending(2),Ok(1));assert!(!wait.active());
+        let mut retry=ReceiveWait::begin(&router,2,0x400000,1).unwrap();
+        let mut output=[0xa5;RECEIVE_BYTES];
+        assert_eq!(retry.poll(&mut router,|message|{output=message.wire();true}),WaitPoll::Delivered(13));
+        assert_eq!(&output[8..13],b"hello");assert_eq!(router.pending(2),Ok(0));
+    }
+    #[test]
+    fn ipc_wait_cannot_inherit_recycled_mailbox_or_revoked_sender_traffic(){
+        let mut router=IpcRouter::<2,2>::new().unwrap();
+        router.register(1).unwrap();router.register(2).unwrap();
+        let mut wait=ReceiveWait::begin(&router,2,0x400000,2).unwrap();
+        router.unregister(2).unwrap();router.register(2).unwrap();
+        router.send(1,2,b"new process").unwrap();
+        assert_eq!(wait.poll(&mut router,|_|panic!("stale receiver delivered")),
+            WaitPoll::Failed(IpcError::UnknownReceiver));
+        assert_eq!(router.pending(2),Ok(1));
+        let mut current=ReceiveWait::begin(&router,2,0x400000,1).unwrap();
+        router.unregister(1).unwrap();
+        assert_eq!(current.poll(&mut router,|_|panic!("dead sender delivered")),WaitPoll::Pending);
+        assert_eq!(current.poll(&mut router,|_|false),WaitPoll::TimedOut);
+        let mut cancelled=ReceiveWait::begin(&router,2,0x400000,1).unwrap();
+        cancelled.cancel();assert!(!cancelled.active());
+    }
+    #[test]
+    fn ipc_wait_rejects_bad_budget_and_epoch_exhaustion_without_registration(){
+        let mut router=IpcRouter::<2,1>::new().unwrap();router.register(1).unwrap();
+        for budget in [0,33,u64::MAX]{
+            assert!(matches!(ReceiveWait::begin(&router,1,0x400000,budget),Err(IpcError::InvalidConfiguration)));
+        }
+        assert!(ReceiveWait::begin(&router,1,0,1).is_err());
+        assert!(ReceiveWait::begin(&router,9,0x400000,1).is_err());
+        router.next_epoch=u64::MAX;
+        assert_eq!(router.register(2),Err(IpcError::NoFreeMailbox));
+        assert_eq!(router.pending(2),Err(IpcError::UnknownReceiver));
+        assert_eq!(router.pending(1),Ok(0));
+    }
 
     #[test]
     fn ipc_fifo_wraparound_and_sender_identity() {
