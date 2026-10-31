@@ -1243,3 +1243,86 @@ mod r069_source_identifier_tests {
         assert_eq!(fs.generation(), before + 1);
     }
 }
+
+
+/// R070: report one-based source line numbers matching a literal Unicode
+/// query in the actual mounted project file. Each row is reported once,
+/// and the output buffer is not mutated until every capacity check passes.
+impl ProjectTree {
+    pub fn find_source_lines<D: BlockDevice>(&self, caller: Identity,
+        fs: &mut HierVfs<D>, name: &str, needle: &str,
+        out: &mut [usize]) -> Result<usize, Error> {
+        self.check_fresh(caller, fs)?;
+        if needle.is_empty() || needle.contains('\n') || needle.contains('\r') {
+            return Err(Error::Invalid);
+        }
+        let (p, n) = self.child(name)?;
+        let mut bytes = [0u8; MAX_FILE_BYTES];
+        let count = fs.read(Self::str_path(&p, n), &mut bytes)?;
+        let source = core::str::from_utf8(&bytes[..count]).map_err(|_| Error::Invalid)?;
+        let total = source.split_terminator('\n')
+            .filter(|row| row.contains(needle)).count();
+        if out.len() < total { return Err(Error::Full); }
+        let mut index = 0usize;
+        for (row_number, row) in source.split_terminator('\n').enumerate() {
+            if row.contains(needle) {
+                out[index] = row_number + 1;
+                index += 1;
+            }
+        }
+        Ok(total)
+    }
+}
+
+#[cfg(test)]
+mod r070_project_source_lines_tests {
+    use super::*;
+    use crate::block::{BlockError, SECTOR_BYTES};
+    struct Disk { sectors: [[u8; SECTOR_BYTES]; 100] }
+    impl BlockDevice for Disk {
+        fn sector_count(&self) -> u64 { 100 }
+        fn read_sector(&mut self, lba: u64, out: &mut [u8; SECTOR_BYTES])
+            -> Result<(), BlockError> {
+            *out = *self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?;
+            Ok(())
+        }
+        fn write_sector(&mut self, lba: u64, data: &[u8; SECTOR_BYTES])
+            -> Result<(), BlockError> {
+            *self.sectors.get_mut(lba as usize).ok_or(BlockError::OutOfRange)? = *data;
+            Ok(())
+        }
+    }
+    fn id() -> Identity { Identity { pid: 7, generation: 2 } }
+    fn setup() -> (HierVfs<Disk>, ProjectTree) {
+        let mut fs = HierVfs::format_blank(Disk { sectors: [[0; SECTOR_BYTES]; 100] }).unwrap();
+        let mut p = ProjectTree::new();
+        p.create(id(), &mut fs, "demo").unwrap();
+        p.create_file(id(), &mut fs, "main", "α foo\nbeta\nα α\n".as_bytes()).unwrap();
+        (fs, p)
+    }
+    #[test]
+    fn unicode_line_matches_survive_disk_remount() {
+        let (fs, mut p) = setup();
+        let mut fs = HierVfs::mount(fs.into_device()).unwrap();
+        p.refresh(id(), &mut fs).unwrap();
+        let mut rows = [0usize; 3];
+        assert_eq!(p.find_source_lines(id(), &mut fs, "main", "α", &mut rows), Ok(2));
+        assert_eq!(&rows[..2], &[1, 3]);
+        assert_eq!(p.find_source_lines(id(), &mut fs, "main", "missing", &mut rows), Ok(0));
+    }
+    #[test]
+    fn small_output_bad_query_and_stale_owner_are_atomic() {
+        let (mut fs, p) = setup();
+        let before = fs.generation();
+        let mut rows = [99usize; 1];
+        assert_eq!(p.find_source_lines(id(), &mut fs, "main", "α", &mut rows), Err(Error::Full));
+        assert_eq!(rows, [99]);
+        assert_eq!(p.find_source_lines(id(), &mut fs, "main", "", &mut rows), Err(Error::Invalid));
+        assert_eq!(p.find_source_lines(id(), &mut fs, "main", "a\nb", &mut rows), Err(Error::Invalid));
+        assert_eq!(p.find_source_lines(
+            Identity { generation: 3, ..id() }, &mut fs, "main", "α", &mut rows),
+            Err(Error::Unauthorized));
+        assert_eq!(rows, [99]);
+        assert_eq!(fs.generation(), before);
+    }
+}

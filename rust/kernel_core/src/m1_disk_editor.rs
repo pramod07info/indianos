@@ -1388,3 +1388,112 @@ mod r069_editor_whitespace_tests {
         assert_eq!(fs.generation(), generation);
     }
 }
+
+
+/// R070: indent or strictly unindent an inclusive 1-based UTF-8 source
+/// line range. Blank rows remain unchanged. A failed row, invalid range,
+/// overflowing buffer or recycled owner never touches the undo snapshot.
+impl DiskEditor {
+    pub fn indent_source_range(&mut self, caller: Identity, first: usize,
+        last: usize, remove: bool) -> Result<usize, Error> {
+        self.authorize(caller)?;
+        if first == 0 || last < first { return Err(Error::Invalid); }
+        let text = core::str::from_utf8(&self.data[..self.used])
+            .map_err(|_| Error::Invalid)?;
+        let mut staged = [0u8; MAX_FILE_BYTES];
+        let mut used = 0usize;
+        let mut rows = 0usize;
+        let mut changed = 0usize;
+        for row in text.split_inclusive('\n') {
+            rows += 1;
+            let body = row.strip_suffix('\n').unwrap_or(row);
+            let selected = rows >= first && rows <= last && !body.is_empty();
+            let contents = if selected && remove {
+                body.strip_prefix("    ").ok_or(Error::Invalid)?
+            } else { body };
+            let addition = contents.len()
+                .checked_add(if selected && !remove { 4 } else { 0 })
+                .and_then(|n| n.checked_add(usize::from(row.ends_with('\n'))))
+                .ok_or(Error::Full)?;
+            let end = used.checked_add(addition).ok_or(Error::Full)?;
+            if end > MAX_FILE_BYTES { return Err(Error::Full); }
+            if selected && !remove {
+                staged[used..used + 4].copy_from_slice(b"    ");
+                used += 4;
+            }
+            staged[used..used + contents.len()].copy_from_slice(contents.as_bytes());
+            used += contents.len();
+            if row.ends_with('\n') { staged[used] = b'\n'; used += 1; }
+            if selected { changed += 1; }
+        }
+        if rows < last { return Err(Error::Invalid); }
+        if changed == 0 { return Ok(0); }
+        self.replace(caller, 0, self.used, &staged[..used])?;
+        Ok(changed)
+    }
+}
+
+#[cfg(test)]
+mod r070_source_indentation_tests {
+    use super::*;
+    use crate::block::{BlockError, SECTOR_BYTES};
+    struct Disk { sectors: [[u8; SECTOR_BYTES]; 100] }
+    impl BlockDevice for Disk {
+        fn sector_count(&self) -> u64 { 100 }
+        fn read_sector(&mut self, lba: u64, out: &mut [u8; SECTOR_BYTES])
+            -> Result<(), BlockError> {
+            *out = *self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?;
+            Ok(())
+        }
+        fn write_sector(&mut self, lba: u64, data: &[u8; SECTOR_BYTES])
+            -> Result<(), BlockError> {
+            *self.sectors.get_mut(lba as usize).ok_or(BlockError::OutOfRange)? = *data;
+            Ok(())
+        }
+    }
+    fn id() -> Identity { Identity { pid: 9, generation: 2 } }
+    fn setup() -> (HierVfs<Disk>, DiskEditor) {
+        let mut fs = HierVfs::format_blank(Disk { sectors: [[0; SECTOR_BYTES]; 100] }).unwrap();
+        fs.create("/src", "α\nβ\nγ\n".as_bytes()).unwrap();
+        fs.create("/raw", &[0xff, 0xfe]).unwrap();
+        let mut editor = DiskEditor::new();
+        editor.open(id(), &mut fs, "/src").unwrap();
+        (fs, editor)
+    }
+    #[test]
+    fn indent_undo_redo_save_and_real_remount() {
+        let (mut fs, mut editor) = setup();
+        let expected = "    α\n    β\nγ\n".as_bytes();
+        assert_eq!(editor.indent_source_range(id(), 1, 2, false), Ok(2));
+        let mut out = [0u8; 40];
+        assert_eq!(editor.read(id(), &mut out), Ok(expected.len()));
+        assert_eq!(&out[..expected.len()], expected);
+        assert_eq!(editor.undo(id()), Ok("α\nβ\nγ\n".len()));
+        assert_eq!(editor.redo(id()), Ok(expected.len()));
+        editor.save(id(), &mut fs).unwrap();
+        let mut remounted = HierVfs::mount(fs.into_device()).unwrap();
+        assert_eq!(remounted.read("/src", &mut out), Ok(expected.len()));
+        assert_eq!(&out[..expected.len()], expected);
+    }
+    #[test]
+    fn unindent_is_atomic_and_noop_does_not_dirty() {
+        let (_fs, mut editor) = setup();
+        assert_eq!(editor.indent_source_range(id(), 1, 2, true), Err(Error::Invalid));
+        assert!(!editor.status(id()).unwrap().dirty);
+        assert_eq!(editor.indent_source_range(id(), 1, 4, false), Err(Error::Invalid));
+        assert!(!editor.status(id()).unwrap().dirty);
+        editor.indent_source_range(id(), 1, 2, false).unwrap();
+        assert_eq!(editor.indent_source_range(id(), 1, 2, true), Ok(2));
+        assert_eq!(editor.read(id(), &mut [0u8; 2]), Err(Error::Full));
+    }
+    #[test]
+    fn recycled_owner_and_binary_source_are_rejected() {
+        let (mut fs, mut editor) = setup();
+        assert_eq!(editor.indent_source_range(
+            Identity { generation: 3, ..id() }, 1, 1, false), Err(Error::Unauthorized));
+        editor.close(id(), false).unwrap();
+        editor.open(id(), &mut fs, "/raw").unwrap();
+        assert_eq!(editor.indent_source_range(id(), 1, 1, false), Err(Error::Invalid));
+        assert!(!editor.status(id()).unwrap().dirty);
+    }
+}

@@ -19,7 +19,7 @@ pub const COMMAND_VERBS:&[&str]=&[
  "help","pwd","tools","ls","cat","write","append","mkdir","mv",
  "cp","rm","mkfile","truncate","head","count","rmdir","mvdir",
  "pread","pwrite","lines","line","hash","stat","tail","find","grep","cmp","diffat",
- "touch","copynew","replace","appendln","health","hex","slice","concat","cmprange","bytefreq","patchhex","patchrange","copylines","wc","headlines","rfind",
+ "touch","copynew","replace","appendln","health","hex","slice","concat","cmprange","bytefreq","patchhex","patchrange","copylines","wc","headlines","rfind","taillines",
 ];
 /// Complete exactly one printable lower-case verb prefix. Ambiguous matches,
 /// empty prefixes and user-supplied paths never cause completion or I/O.
@@ -91,7 +91,7 @@ pub fn command<D:BlockDevice,const N:usize>(
  let line=entered.trim_end();
  if line=="help"{return publish(b"pwd ls /dir cat /path write /path text append /path text mkdir /dir mv /old /new cp /src /dst rm /path mkfile /path truncate /path head /path count rmdir /dir mvdir /old /new pread /file offset count pwrite /file@offset text",out);}
  if line=="pwd"{return publish(b"/",out);}
- if line=="tools"{return publish(b"count lines line tail find grep hash cmp diffat stat touch copynew replace appendln health hex slice concat cmprange bytefreq patchhex patchrange copylines wc headlines rfind",out);}
+ if line=="tools"{return publish(b"count lines line tail find grep hash cmp diffat stat touch copynew replace appendln health hex slice concat cmprange bytefreq patchhex patchrange copylines wc headlines rfind taillines",out);}
  if line=="health"{
   auth.require(caller,FILE_READ,now).map_err(|_|Error::Denied)?;
   let health=fs.mounted_health().map_err(Error::Io)?;
@@ -217,6 +217,27 @@ pub fn command<D:BlockDevice,const N:usize>(
     Some(position)=>publish_number(position as u64,out),
     None=>publish(b"not found",out),
    }
+  }
+  // Preview the last N complete UTF-8 source rows, unlike byte-tail.
+  // Validation and output-capacity checks finish before touching the caller.
+  "taillines"=>{
+   auth.require(caller,FILE_READ,now).map_err(|_|Error::Denied)?;
+   let mut args=raw.split_ascii_whitespace();
+   let source=args.next().ok_or(Error::Invalid)?;
+   let requested=args.next().ok_or(Error::Invalid)?
+      .parse::<usize>().map_err(|_|Error::Invalid)?;
+   if requested==0||requested>MAX_TRANSFER||args.next().is_some(){
+    return Err(Error::Invalid);
+   }
+   let p=path(source,&mut name)?;
+   let mut bytes=[0u8;crate::durablefs::MAX_FILE_BYTES];
+   let count=fs.read(p,&mut bytes).map_err(Error::Io)?;
+   let text=core::str::from_utf8(&bytes[..count]).map_err(|_|Error::Invalid)?;
+   let rows=text.split_terminator('\n').count();
+   let skip=rows.saturating_sub(requested);
+   let start=text.split_inclusive('\n').take(skip)
+      .map(|row|row.len()).sum::<usize>();
+   publish(&bytes[start..count],out)
   }
   "tail"=>{
    auth.require(caller,FILE_READ,now).map_err(|_|Error::Denied)?;
@@ -1161,8 +1182,8 @@ mod tests{
   assert_eq!(complete_verb(b"heal"),Some("health"));
  }
  #[test]fn r044_command_registry_drives_unique_safe_completion(){
-  // R069 extends the registered CLI by `headlines` and `rfind`.
-  assert_eq!(COMMAND_VERBS.len(),44);
+  // R070 extends the registered CLI with `taillines`.
+  assert_eq!(COMMAND_VERBS.len(),45);
   for (i,verb) in COMMAND_VERBS.iter().enumerate(){
    assert!(verb.as_bytes().iter().all(|b|b.is_ascii_lowercase()));
    assert!(!COMMAND_VERBS[..i].contains(verb));
@@ -1175,6 +1196,7 @@ mod tests{
   assert_eq!(complete_verb(b"cmpr"),Some("cmprange"));
   assert_eq!(complete_verb(b"headl"),Some("headlines"));
   assert_eq!(complete_verb(b"rfin"),Some("rfind"));
+  assert_eq!(complete_verb(b"tailli"),Some("taillines"));
   assert_eq!(complete_verb(b"hea"),None);
   assert_eq!(complete_verb(b"rmd"),Some("rmdir"));
   assert_eq!(complete_verb(b"app"),None);
@@ -2514,4 +2536,65 @@ mod r069_source_inspection_commands_tests {
   assert_eq!(command(&mut fs,&auth,other,1,b"rfind /src one",&mut out),Err(Error::Denied));
   assert_eq!(out,[0x55;32]);
  }
+}
+
+
+#[cfg(test)]
+mod r070_terminal_tail_lines_tests {
+    use super::*;
+    use crate::block::{BlockError, SECTOR_BYTES};
+    struct Disk { sectors: [[u8; SECTOR_BYTES]; 100] }
+    impl BlockDevice for Disk {
+        fn sector_count(&self) -> u64 { 100 }
+        fn read_sector(&mut self, lba: u64, out: &mut [u8; SECTOR_BYTES])
+            -> Result<(), BlockError> {
+            *out = *self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?;
+            Ok(())
+        }
+        fn write_sector(&mut self, lba: u64, data: &[u8; SECTOR_BYTES])
+            -> Result<(), BlockError> {
+            *self.sectors.get_mut(lba as usize).ok_or(BlockError::OutOfRange)? = *data;
+            Ok(())
+        }
+    }
+    fn id() -> Identity { Identity { pid: 7, generation: 2 } }
+    fn setup() -> (HierVfs<Disk>, Access<1>) {
+        let mut fs = HierVfs::format_blank(Disk { sectors: [[0; SECTOR_BYTES]; 100] }).unwrap();
+        fs.create("/src", "α\nβ\nγ\n".as_bytes()).unwrap();
+        fs.create("/bad", &[0xff, 0xfe]).unwrap();
+        let mut auth = Access::new();
+        auth.grant(id(), FILE_READ, 100).unwrap();
+        (fs, auth)
+    }
+    #[test]
+    fn complete_unicode_tail_rows_survive_real_remount() {
+        let (mut fs, auth) = setup();
+        let before = fs.generation();
+        let mut out = [0u8; 32];
+        let expected = "β\nγ\n".as_bytes();
+        assert_eq!(command(&mut fs, &auth, id(), 1, b"taillines /src 2", &mut out),
+            Ok(expected.len()));
+        assert_eq!(&out[..expected.len()], expected);
+        fs = HierVfs::mount(fs.into_device()).unwrap();
+        assert_eq!(command(&mut fs, &auth, id(), 1, b"taillines /src 1", &mut out),
+            Ok("γ\n".len()));
+        assert_eq!(&out[..3], "γ\n".as_bytes());
+        assert_eq!(fs.generation(), before);
+    }
+    #[test]
+    fn undersized_output_invalid_utf8_and_expired_identity_are_atomic() {
+        let (mut fs, auth) = setup();
+        let before = fs.generation();
+        let mut out = [0x52u8; 2];
+        assert_eq!(command(&mut fs, &auth, id(), 1, b"taillines /src 2", &mut out),
+            Err(Error::OutputTooSmall));
+        assert_eq!(command(&mut fs, &auth, id(), 1, b"taillines /bad 1", &mut out),
+            Err(Error::Invalid));
+        assert_eq!(command(&mut fs, &auth, id(), 1, b"taillines /src 0", &mut out),
+            Err(Error::Invalid));
+        assert_eq!(command(&mut fs, &auth, id(), 101, b"taillines /src 2", &mut out),
+            Err(Error::Denied));
+        assert_eq!(out, [0x52; 2]);
+        assert_eq!(fs.generation(), before);
+    }
 }
