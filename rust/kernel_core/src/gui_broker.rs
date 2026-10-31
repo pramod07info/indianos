@@ -2002,3 +2002,102 @@ mod r064_vertical_tiles_tests{
   assert_eq!(layout.geometry(2,20),Ok(old));
  }
 }
+
+
+/// R065: developer master/detail window layout. The first owned surface
+/// occupies a chosen proportion of the left column; remaining authenticated
+/// surfaces form a right-hand vertical stack. Geometry and redraw epochs
+/// are committed only after all ownership/bounds checks succeed.
+impl<const N:usize> SurfaceLayout<N>{
+ pub fn tile_master_stack(&mut self,windows:&[(u32,u32)],
+    area:crate::agent_05_surface_rect::Rectangle,
+    primary_percent:u32)->Result<usize,Error>{
+  use crate::agent_05_surface_rect::{Rectangle,clip_owned};
+  if windows.len()<2||windows.len()>N||primary_percent==0||
+     primary_percent>=100||area.width<2||
+     windows.len()-1>area.height as usize{return Err(Error::Invalid);}
+  clip_owned(area,area,1,1).map_err(|_|Error::Invalid)?;
+  let main_width=((area.width as u64)*(primary_percent as u64)/100) as u32;
+  if main_width==0||main_width>=area.width{return Err(Error::Invalid);}
+  let side_width=area.width-main_width;
+  let side_x=area.x.checked_add(main_width).ok_or(Error::Invalid)?;
+  let secondary=u32::try_from(windows.len()-1).map_err(|_|Error::Invalid)?;
+  let base_height=area.height/secondary;
+  let extra=area.height%secondary;
+  let empty=Rectangle{x:0,y:0,width:1,height:1};
+  let mut requests=[(0u32,0u32,empty);N];
+  requests[0]=(windows[0].0,windows[0].1,Rectangle{
+   x:area.x,y:area.y,width:main_width,height:area.height
+  });
+  let mut y=area.y;
+  for (i,&(owner,window)) in windows.iter().enumerate().skip(1){
+   let height=base_height+u32::from((i as u32)-1<extra);
+   requests[i]=(owner,window,Rectangle{
+    x:side_x,y,width:side_width,height
+   });
+   y=y.checked_add(height).ok_or(Error::Invalid)?;
+  }
+  self.set_geometry_batch(&requests[..windows.len()])
+ }
+}
+#[cfg(test)]
+mod r065_master_stack_tests{
+ use super::*;
+ use crate::agent_05_surface_rect::Rectangle;
+ fn r(x:u32,y:u32,w:u32,h:u32)->Rectangle{
+  Rectangle{x,y,width:w,height:h}
+ }
+ #[test]fn main_editor_and_two_side_panels_fill_layout_without_overlap(){
+  let mut layout=SurfaceLayout::<3>::new();
+  for (o,w) in [(1,10),(2,20),(3,30)]{
+   layout.grant(o,w,r(4,4,30,30)).unwrap();
+  }
+  let before=layout.next_epoch;
+  assert_eq!(layout.tile_master_stack(
+   &[(1,10),(2,20),(3,30)],r(10,20,101,81),60),Ok(3));
+  assert_eq!(layout.geometry(1,10),Ok(r(10,20,60,81)));
+  assert_eq!(layout.geometry(2,20),Ok(r(70,20,41,41)));
+  assert_eq!(layout.geometry(3,30),Ok(r(70,61,41,40)));
+  assert_eq!(layout.next_epoch,before+3);
+  assert_eq!(layout.tile_master_stack(
+   &[(1,10),(2,20),(3,30)],r(10,20,101,81),60),Ok(3));
+  assert_eq!(layout.next_epoch,before+3);
+ }
+ #[test]fn invalid_owner_duplicate_and_bad_percentage_keep_all_grants(){
+  let mut layout=SurfaceLayout::<3>::new();
+  let old=r(4,4,30,30);
+  for (o,w) in [(1,10),(2,20),(3,30)]{
+   layout.grant(o,w,old).unwrap();
+  }
+  let epoch=layout.next_epoch;
+  for percent in [0,1,100]{
+   assert_eq!(layout.tile_master_stack(
+    &[(1,10),(2,20),(3,30)],r(0,0,10,10),percent),
+    Err(Error::Invalid));
+  }
+  assert_eq!(layout.tile_master_stack(
+   &[(1,10),(2,99),(3,30)],r(0,0,100,100),60),
+   Err(Error::Unauthorized));
+  assert_eq!(layout.tile_master_stack(
+   &[(1,10),(2,20),(2,20)],r(0,0,100,100),60),
+   Err(Error::Duplicate));
+  assert_eq!(layout.next_epoch,epoch);
+  assert_eq!(layout.geometry(1,10),Ok(old));
+  assert_eq!(layout.geometry(2,20),Ok(old));
+  assert_eq!(layout.geometry(3,30),Ok(old));
+ }
+ #[test]fn two_columns_need_screen_capacity_and_nonempty_secondary_slots(){
+  let mut layout=SurfaceLayout::<3>::new();
+  for (o,w) in [(1,10),(2,20),(3,30)]{
+   layout.grant(o,w,r(4,4,30,30)).unwrap();
+  }
+  assert_eq!(layout.tile_master_stack(
+   &[(1,10)],r(0,0,100,100),50),Err(Error::Invalid));
+  assert_eq!(layout.tile_master_stack(
+   &[(1,10),(2,20),(3,30)],r(0,0,100,1),50),Err(Error::Invalid));
+  assert_eq!(layout.tile_master_stack(
+   &[(1,10),(2,20)],r(0,0,1,30),50),Err(Error::Invalid));
+  assert_eq!(layout.tile_master_stack(
+   &[(1,10),(2,20)],r(1270,0,50,20),50),Err(Error::Invalid));
+ }
+}
