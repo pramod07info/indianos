@@ -931,3 +931,78 @@ mod r062_atomic_keyboard_batch_tests{
   assert_eq!(input.history_count(),0);
  }
 }
+
+
+/// R063: complete a live Terminal draft only when exactly one previously
+/// submitted command matches its ASCII prefix. No command is executed; the
+/// keyboard broker still requires a separate explicit Enter event.
+/// Ambiguity, stale history, empty/nonprintable prefixes leave text intact.
+impl InputLine{
+ pub fn complete_from_history(&mut self)->Result<usize,Error>{
+  let prefix=self.editor.bytes();
+  if prefix.is_empty()||prefix.iter().any(|&b|!(b' '..=b'~').contains(&b)){
+   return Err(Error::Invalid);
+  }
+  let mut selected=None;
+  for entry in self.history.iter().flatten(){
+   if entry.bytes[..entry.len].starts_with(prefix){
+    if selected.is_some(){return Err(Error::Invalid);}
+    selected=Some(*entry);
+   }
+  }
+  let selected=selected.ok_or(Error::Invalid)?;
+  self.editor.replace_line(&selected.bytes[..selected.len])?;
+  self.history_cursor=None;
+  self.history_draft.fill(0);
+  self.history_draft_len=0;
+  Ok(selected.len)
+ }
+}
+#[cfg(test)]
+mod r063_history_completion_tests{
+ use super::*;
+ fn filled()->InputLine{
+  let mut input=InputLine::new();
+  let mut result=[0u8;MAX_LINE];
+  for cmd in [b"git status".as_slice(),b"cargo test",b"git diff"]{
+   input.set_line(cmd).unwrap();
+   input.feed(b'\n',&mut result).unwrap();
+  }
+  input
+ }
+ #[test]fn unique_history_completion_changes_editable_draft_not_command_execution(){
+  let mut input=filled();
+  input.set_line(b"cargo t").unwrap();
+  assert_eq!(input.complete_from_history(),Ok(10));
+  assert_eq!(input.bytes(),b"cargo test");
+  assert_eq!(input.caret(),10);
+  assert_eq!(input.history_count(),3);
+  let mut out=[0u8;MAX_LINE];
+  assert_eq!(input.feed(b'\n',&mut out),Ok(Event::Submitted(10)));
+  assert_eq!(&out[..10],b"cargo test");
+ }
+ #[test]fn ambiguous_unknown_and_empty_prefix_preserve_unsent_draft(){
+  let mut input=filled();
+  input.set_line(b"git ").unwrap();
+  assert_eq!(input.complete_from_history(),Err(Error::Invalid));
+  assert_eq!(input.bytes(),b"git ");
+  input.set_line(b"nosuch").unwrap();
+  assert_eq!(input.complete_from_history(),Err(Error::Invalid));
+  assert_eq!(input.bytes(),b"nosuch");
+  input.set_line(b"").unwrap();
+  assert_eq!(input.complete_from_history(),Err(Error::Invalid));
+  assert_eq!(input.history_count(),3);
+ }
+ #[test]fn successful_recall_does_not_discard_protected_clipboard_or_history(){
+  let mut input=filled();
+  input.set_line(b"git status").unwrap();
+  input.copy_range(0,3).unwrap();
+  input.set_line(b"cargo t").unwrap();
+  assert_eq!(input.complete_from_history(),Ok(10));
+  assert_eq!(input.clipboard_bytes(),b"git");
+  assert_eq!(input.history_previous(),Ok(8));
+  assert_eq!(input.bytes(),b"git diff");
+  assert_eq!(input.history_next(),Ok(10));
+  assert_eq!(input.bytes(),b"cargo test");
+ }
+}

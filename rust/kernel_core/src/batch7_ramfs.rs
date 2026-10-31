@@ -808,3 +808,74 @@ mod r062_atomic_copy_tests{
   assert_eq!(&out[..3],b"one");
  }
 }
+
+
+/// R063: optimistic Compare-And-Swap for an existing RAM-backed file.
+/// A caller-observed generation AND exact old byte content must agree.
+/// A mismatch never rewrites data or invalidates other GUI file views.
+/// Kernel services must still authorize the file's WRITE capability.
+impl<const N:usize> RamFs<N>{
+ pub fn compare_exchange_contents(&mut self,path:&[u8],
+    expected_version:u64,expected_bytes:&[u8],
+    replacement:&[u8])->Result<u64,Error>{
+  if !Self::valid_path(path)||expected_version==0||
+      expected_bytes.len()>CONTENT_MAX||replacement.len()>CONTENT_MAX{
+   return Err(Error::Invalid);
+  }
+  let slot=self.lookup(path).ok_or(Error::NotFound)?;
+  let existing=self.files[slot].ok_or(Error::NotFound)?;
+  if existing.version!=expected_version||
+      existing.data_len!=expected_bytes.len()||
+      &existing.data[..existing.data_len]!=expected_bytes{
+   return Err(Error::Invalid);
+  }
+  if existing.data_len==replacement.len()&&
+     &existing.data[..existing.data_len]==replacement{
+   return Ok(self.version);
+  }
+  self.replace(path,replacement)
+ }
+}
+#[cfg(test)]
+mod r063_compare_exchange_tests{
+ use super::*;
+ #[test]fn exact_content_and_version_publish_one_atomic_update(){
+  let mut fs=RamFs::<2>::new();
+  let version=fs.replace(b"/project",b"v1").unwrap();
+  let rev=fs.version();
+  assert_eq!(fs.compare_exchange_contents(
+   b"/project",version,b"v1",b"v2"),Ok(rev+1));
+  let mut out=[0u8;8];
+  assert_eq!(fs.read(b"/project",0,&mut out),Ok(2));
+  assert_eq!(&out[..2],b"v2");
+  assert_eq!(fs.metadata(b"/project"),Ok((rev+1,2)));
+ }
+ #[test]fn stale_version_or_wrong_old_bytes_never_overwrite_current_contents(){
+  let mut fs=RamFs::<1>::new();
+  let v=fs.replace(b"/project",b"safe").unwrap();
+  let rev=fs.version();
+  assert_eq!(fs.compare_exchange_contents(
+   b"/project",v+1,b"safe",b"bad"),Err(Error::Invalid));
+  assert_eq!(fs.compare_exchange_contents(
+   b"/project",v,b"wrong",b"bad"),Err(Error::Invalid));
+  assert_eq!(fs.compare_exchange_contents(
+   b"/missing",v,b"safe",b"bad"),Err(Error::NotFound));
+  assert_eq!(fs.version(),rev);
+  let mut out=[0u8;8];
+  assert_eq!(fs.read(b"/project",0,&mut out),Ok(4));
+  assert_eq!(&out[..4],b"safe");
+ }
+ #[test]fn no_op_cas_and_invalid_paths_never_advance_file_generation(){
+  let mut fs=RamFs::<1>::new();
+  let v=fs.replace(b"/project",b"stable").unwrap();
+  assert_eq!(fs.compare_exchange_contents(
+   b"/project",v,b"stable",b"stable"),Ok(v));
+  assert_eq!(fs.compare_exchange_contents(
+   b"/../bad",v,b"stable",b"changed"),Err(Error::Invalid));
+  assert_eq!(fs.compare_exchange_contents(
+   b"/project",v,b"stable",&[b'x';CONTENT_MAX+1]),
+   Err(Error::Invalid));
+  assert_eq!(fs.version(),v);
+  assert_eq!(fs.metadata(b"/project"),Ok((v,6)));
+ }
+}
