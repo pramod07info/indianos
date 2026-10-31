@@ -749,3 +749,118 @@ mod r060_forward_history_tests{
   assert_eq!(input.bytes(),b"unsent draft");
  }
 }
+
+
+/// R061: interactive terminal input supports reverse substring search in
+/// the fixed-size successful-command ring, not only prefix matching.
+/// A failed search does not touch an unsent draft or selection state.
+impl InputLine{
+ pub fn history_search_contains(&mut self,needle:&[u8])
+  ->Result<usize,Error>{
+  if needle.is_empty()||needle.len()>MAX_LINE||
+     needle.iter().any(|&b|!(b' '..=b'~').contains(&b)){
+    return Err(Error::Invalid);
+  }
+  let end=self.history_cursor.unwrap_or(self.history_len);
+  let index=(0..end).rev().find(|&i|self.history[i].is_some_and(|entry|
+    entry.bytes[..entry.len].windows(needle.len()).any(|part|part==needle)))
+    .ok_or(Error::Invalid)?;
+  let selected=self.history[index].ok_or(Error::Invalid)?;
+  if self.history_cursor.is_none(){
+   self.history_draft.fill(0);
+   self.history_draft_len=self.length();
+   self.history_draft[..self.history_draft_len]
+      .copy_from_slice(self.editor.bytes());
+  }
+  self.editor.replace_line(&selected.bytes[..selected.len])?;
+  self.history_cursor=Some(index);
+  Ok(selected.len)
+ }
+ pub fn transpose_near_caret(&mut self)->Result<(),Error>{
+  self.editor.transpose_adjacent()?;
+  self.history_cursor=None;
+  self.history_draft.fill(0);self.history_draft_len=0;
+  Ok(())
+ }
+}
+/// Swap two adjacent ASCII characters around the live caret without
+/// changing the line length or creating a partial edit. With the caret
+/// at the end, transpose the final two characters (typical shell usage).
+impl LineEditor{
+ pub fn transpose_adjacent(&mut self)->Result<(),Error>{
+  if self.len<2||self.caret==0{return Err(Error::Invalid);}
+  let index=if self.caret==self.len{
+   self.len-2
+  }else{
+   self.caret-1
+  };
+  self.line.swap(index,index+1);
+  self.caret=(index+2).min(self.len);
+  Ok(())
+ }
+}
+#[cfg(test)]
+mod r061_terminal_interaction_tests{
+ use super::*;
+ fn ready()->InputLine{
+  let mut input=InputLine::new();
+  let mut out=[0u8;MAX_LINE];
+  for cmd in [b"git status".as_slice(),b"cargo test",b"git diff",b"git push"]{
+   input.set_line(cmd).unwrap();
+   assert_eq!(input.feed(b'\n',&mut out),Ok(Event::Submitted(cmd.len())));
+  }
+  input.set_line(b"unsaved").unwrap();
+  input
+ }
+ #[test]fn reverse_substring_search_moves_across_history_and_restores_draft(){
+  let mut input=ready();
+  assert_eq!(input.history_search_contains(b"git"),Ok(8));
+  assert_eq!(input.bytes(),b"git push");
+  assert_eq!(input.history_search_contains(b"it"),Ok(8));
+  assert_eq!(input.bytes(),b"git diff");
+  assert_eq!(input.history_search_contains(b"status"),Ok(10));
+  assert_eq!(input.bytes(),b"git status");
+  assert_eq!(input.history_next(),Ok(10));
+  assert_eq!(input.history_next(),Ok(8));
+  assert_eq!(input.history_next(),Ok(8));
+  assert_eq!(input.history_next(),Ok(7));
+  assert_eq!(input.bytes(),b"unsaved");
+ }
+ #[test]fn bad_or_absent_substrings_do_not_modify_history_or_draft(){
+  let mut input=ready();
+  assert_eq!(input.history_search_contains(b""),Err(Error::Invalid));
+  assert_eq!(input.history_search_contains(b"\n"),Err(Error::Invalid));
+  assert_eq!(input.history_search_contains(b"missing"),Err(Error::Invalid));
+  assert_eq!(input.bytes(),b"unsaved");
+  input.history_search_contains(b"git").unwrap();
+  assert_eq!(input.history_search_contains(b"absent"),Err(Error::Invalid));
+  assert_eq!(input.bytes(),b"git push");
+  assert_eq!(input.history_next(),Ok(7));
+  assert_eq!(input.bytes(),b"unsaved");
+ }
+ #[test]fn transpose_at_caret_and_end_produces_real_editable_command(){
+  let mut line=LineEditor::new();
+  line.replace_line(b"acb").unwrap();
+  line.edit(EditKey::Left,&mut[]).unwrap();
+  assert_eq!(line.caret(),2);
+  line.transpose_adjacent().unwrap();
+  assert_eq!(line.bytes(),b"abc");
+  assert_eq!(line.caret(),3);
+  line.transpose_adjacent().unwrap();
+  assert_eq!(line.bytes(),b"acb");
+  let mut input=ready();
+  input.set_line(b"echo hlelo").unwrap();
+  input.transpose_near_caret().unwrap();
+  assert_eq!(input.bytes(),b"echo hleol");
+ }
+ #[test]fn zero_caret_and_too_short_input_never_partially_swap(){
+  let mut line=LineEditor::new();
+  line.replace_line(b"a").unwrap();
+  assert_eq!(line.transpose_adjacent(),Err(Error::Invalid));
+  line.replace_line(b"abcd").unwrap();
+  line.edit(EditKey::Home,&mut[]).unwrap();
+  assert_eq!(line.transpose_adjacent(),Err(Error::Invalid));
+  assert_eq!(line.caret(),0);
+  assert_eq!(line.bytes(),b"abcd");
+ }
+}

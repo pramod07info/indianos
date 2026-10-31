@@ -1702,3 +1702,87 @@ mod r060_tiling_tests{
   assert_eq!(layout.epoch(1,10),epoch);
  }
 }
+
+
+/// R061: 2-D developer workstation grid planner. Unlike merely moving
+/// windows, this packs each authenticated surface into a disjoint tile in
+/// the target rectangle and atomically publishes geometry/epoch changes.
+/// The actual user-space compositor must still consume the new layout.
+impl<const N:usize> SurfaceLayout<N>{
+ pub fn tile_grid(&mut self,windows:&[(u32,u32)],columns:usize,
+  area:crate::agent_05_surface_rect::Rectangle)->Result<usize,Error>{
+  use crate::agent_05_surface_rect::{Rectangle,clip_owned};
+  if windows.is_empty()||windows.len()>N||columns==0||
+     columns>windows.len()||columns>area.width as usize{
+    return Err(Error::Invalid);
+  }
+  clip_owned(area,area,1,1).map_err(|_|Error::Invalid)?;
+  let rows=windows.len()/columns+usize::from(windows.len()%columns!=0);
+  if rows>area.height as usize{return Err(Error::Invalid);}
+  let cols=columns as u32;
+  let rows=rows as u32;
+  let width=area.width/cols;
+  let width_extra=area.width%cols;
+  let height=area.height/rows;
+  let height_extra=area.height%rows;
+  let empty=Rectangle{x:0,y:0,width:1,height:1};
+  let mut requests=[(0u32,0u32,empty);N];
+  for (i,&(owner,window)) in windows.iter().enumerate(){
+   let c=(i%columns) as u32;
+   let r=(i/columns) as u32;
+   let left=area.x.checked_add(c*width)
+     .and_then(|x|x.checked_add(c.min(width_extra)))
+     .ok_or(Error::Invalid)?;
+   let top=area.y.checked_add(r*height)
+     .and_then(|y|y.checked_add(r.min(height_extra)))
+     .ok_or(Error::Invalid)?;
+   requests[i]=(owner,window,Rectangle{
+    x:left,y:top,width:width+u32::from(c<width_extra),
+    height:height+u32::from(r<height_extra)
+   });
+  }
+  self.set_geometry_batch(&requests[..windows.len()])
+ }
+}
+#[cfg(test)]
+mod r061_grid_layout_tests{
+ use super::*;
+ use crate::agent_05_surface_rect::Rectangle;
+ fn r(x:u32,y:u32,w:u32,h:u32)->Rectangle{
+  Rectangle{x,y,width:w,height:h}
+ }
+ #[test]fn odd_dimension_three_window_grid_covers_every_pixel_without_overlap(){
+  let mut layout=SurfaceLayout::<4>::new();
+  for (owner,window) in [(1,10),(2,20),(3,30)]{
+   layout.grant(owner,window,r(5,5,30,30)).unwrap();
+  }
+  assert_eq!(layout.tile_grid(&[(1,10),(2,20),(3,30)],2,
+    r(20,30,101,81)),Ok(3));
+  assert_eq!(layout.geometry(1,10),Ok(r(20,30,51,41)));
+  assert_eq!(layout.geometry(2,20),Ok(r(71,30,50,41)));
+  assert_eq!(layout.geometry(3,30),Ok(r(20,71,51,40)));
+  let epoch=layout.epoch(1,10);
+  assert_eq!(layout.tile_grid(&[(1,10),(2,20),(3,30)],2,
+    r(20,30,101,81)),Ok(3));
+  assert_eq!(layout.epoch(1,10),epoch);
+ }
+ #[test]fn invalid_late_owner_duplicate_and_bad_grid_do_not_move_any_window(){
+  let mut layout=SurfaceLayout::<3>::new();
+  let old=r(5,5,20,20);
+  layout.grant(1,10,old).unwrap();layout.grant(2,20,old).unwrap();
+  let before=layout.epoch(1,10);
+  assert_eq!(layout.tile_grid(&[(1,10),(9,20)],2,r(0,0,100,100)),
+    Err(Error::Unauthorized));
+  assert_eq!(layout.tile_grid(&[(1,10),(1,10)],2,r(0,0,100,100)),
+    Err(Error::Duplicate));
+  assert_eq!(layout.tile_grid(&[(1,10),(2,20)],0,r(0,0,100,100)),
+    Err(Error::Invalid));
+  assert_eq!(layout.tile_grid(&[(1,10),(2,20)],2,r(0,0,1,100)),
+    Err(Error::Invalid));
+  assert_eq!(layout.tile_grid(&[(1,10),(2,20)],2,r(1279,0,100,100)),
+    Err(Error::Invalid));
+  assert_eq!(layout.geometry(1,10),Ok(old));
+  assert_eq!(layout.geometry(2,20),Ok(old));
+  assert_eq!(layout.epoch(1,10),before);
+ }
+}
