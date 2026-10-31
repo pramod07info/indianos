@@ -19,7 +19,7 @@ pub const COMMAND_VERBS:&[&str]=&[
  "help","pwd","tools","ls","cat","write","append","mkdir","mv",
  "cp","rm","mkfile","truncate","head","count","rmdir","mvdir",
  "pread","pwrite","lines","line","hash","stat","tail","find","grep","cmp","diffat",
- "touch","copynew","replace","appendln","health","hex","slice","concat","cmprange","bytefreq","patchhex","patchrange","copylines","wc",
+ "touch","copynew","replace","appendln","health","hex","slice","concat","cmprange","bytefreq","patchhex","patchrange","copylines","wc","headlines","rfind",
 ];
 /// Complete exactly one printable lower-case verb prefix. Ambiguous matches,
 /// empty prefixes and user-supplied paths never cause completion or I/O.
@@ -91,7 +91,7 @@ pub fn command<D:BlockDevice,const N:usize>(
  let line=entered.trim_end();
  if line=="help"{return publish(b"pwd ls /dir cat /path write /path text append /path text mkdir /dir mv /old /new cp /src /dst rm /path mkfile /path truncate /path head /path count rmdir /dir mvdir /old /new pread /file offset count pwrite /file@offset text",out);}
  if line=="pwd"{return publish(b"/",out);}
- if line=="tools"{return publish(b"count lines line tail find grep hash cmp diffat stat touch copynew replace appendln health hex slice concat cmprange bytefreq patchhex patchrange copylines wc",out);}
+ if line=="tools"{return publish(b"count lines line tail find grep hash cmp diffat stat touch copynew replace appendln health hex slice concat cmprange bytefreq patchhex patchrange copylines wc headlines rfind",out);}
  if line=="health"{
   auth.require(caller,FILE_READ,now).map_err(|_|Error::Denied)?;
   let health=fs.mounted_health().map_err(Error::Io)?;
@@ -185,6 +185,38 @@ pub fn command<D:BlockDevice,const N:usize>(
     encoded[2*i+1]=alphabet[(b&15) as usize];
    }
    publish(&encoded[..read*2],out)
+  }
+  // Line-oriented source preview, unlike the byte-oriented "head" verb.
+  // UTF-8 and the ENTIRE output capacity are validated before publication.
+  "headlines"=>{
+   auth.require(caller,FILE_READ,now).map_err(|_|Error::Denied)?;
+   let mut args=raw.split_ascii_whitespace();
+   let source=args.next().ok_or(Error::Invalid)?;
+   let count=args.next().ok_or(Error::Invalid)?
+     .parse::<usize>().map_err(|_|Error::Invalid)?;
+   if count==0||count>MAX_TRANSFER||args.next().is_some(){return Err(Error::Invalid);}
+   let p=path(source,&mut name)?;
+   let mut bytes=[0u8;crate::durablefs::MAX_FILE_BYTES];
+   let size=fs.read(p,&mut bytes).map_err(Error::Io)?;
+   let text=core::str::from_utf8(&bytes[..size]).map_err(|_|Error::Invalid)?;
+   let mut end=0usize;
+   for line in text.split_inclusive('\n').take(count){end+=line.len();}
+   publish(&bytes[..end],out)
+  }
+  // Return the byte offset of the LAST exact UTF-8 substring in a durable
+  // file. Read-only, auth-gated and safe for downstream byte-offset tools.
+  "rfind"=>{
+   auth.require(caller,FILE_READ,now).map_err(|_|Error::Denied)?;
+   let (source,needle)=raw.split_once(' ').ok_or(Error::Invalid)?;
+   if needle.is_empty(){return Err(Error::Invalid);}
+   let p=path(source,&mut name)?;
+   let mut bytes=[0u8;crate::durablefs::MAX_FILE_BYTES];
+   let size=fs.read(p,&mut bytes).map_err(Error::Io)?;
+   let text=core::str::from_utf8(&bytes[..size]).map_err(|_|Error::Invalid)?;
+   match text.rfind(needle){
+    Some(position)=>publish_number(position as u64,out),
+    None=>publish(b"not found",out),
+   }
   }
   "tail"=>{
    auth.require(caller,FILE_READ,now).map_err(|_|Error::Denied)?;
@@ -1129,7 +1161,8 @@ mod tests{
   assert_eq!(complete_verb(b"heal"),Some("health"));
  }
  #[test]fn r044_command_registry_drives_unique_safe_completion(){
-  assert_eq!(COMMAND_VERBS.len(),42);
+  // R069 extends the registered CLI by `headlines` and `rfind`.
+  assert_eq!(COMMAND_VERBS.len(),44);
   for (i,verb) in COMMAND_VERBS.iter().enumerate(){
    assert!(verb.as_bytes().iter().all(|b|b.is_ascii_lowercase()));
    assert!(!COMMAND_VERBS[..i].contains(verb));
@@ -1140,6 +1173,9 @@ mod tests{
   assert_eq!(complete_verb(b"slic"),Some("slice"));
   assert_eq!(complete_verb(b"conc"),Some("concat"));
   assert_eq!(complete_verb(b"cmpr"),Some("cmprange"));
+  assert_eq!(complete_verb(b"headl"),Some("headlines"));
+  assert_eq!(complete_verb(b"rfin"),Some("rfind"));
+  assert_eq!(complete_verb(b"hea"),None);
   assert_eq!(complete_verb(b"rmd"),Some("rmdir"));
   assert_eq!(complete_verb(b"app"),None);
   assert_eq!(complete_verb(b"pw"),None);
@@ -2424,5 +2460,58 @@ mod r068_durable_word_count_tests{
    Identity{generation:7,..identity()},1,b"wc /text",&mut out),
    Err(Error::Denied));
   assert_eq!(out,[0x33;32]);assert_eq!(fs.generation(),before);
+ }
+}
+
+
+#[cfg(test)]
+mod r069_source_inspection_commands_tests {
+ use super::*;
+ use crate::block::{BlockError,SECTOR_BYTES};
+ struct Disk{sectors:[[u8;SECTOR_BYTES];100]}
+ impl BlockDevice for Disk {
+  fn sector_count(&self)->u64{100}
+  fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   *out=*self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?;Ok(())
+  }
+  fn write_sector(&mut self,lba:u64,bytes:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   *self.sectors.get_mut(lba as usize).ok_or(BlockError::OutOfRange)?=*bytes;Ok(())
+  }
+ }
+ fn id()->Identity{Identity{pid:3,generation:1}}
+ fn setup()->(HierVfs<Disk>,Access<1>){
+  let mut fs=HierVfs::format_blank(Disk{sectors:[[0;SECTOR_BYTES];100]}).unwrap();
+  fs.create("/src","α one\nsecond\nα one".as_bytes()).unwrap();
+  fs.create("/binary",&[0xff,0x80]).unwrap();
+  let mut auth=Access::new();auth.grant(id(),FILE_READ,100).unwrap();
+  (fs,auth)
+ }
+ #[test]fn preview_complete_rows_and_find_last_unicode_match_after_remount(){
+  let (mut fs,auth)=setup();let before=fs.generation();let mut out=[0u8;64];
+  let preview="α one\nsecond\n".as_bytes();
+  assert_eq!(command(&mut fs,&auth,id(),1,b"headlines /src 2",&mut out),Ok(preview.len()));
+  assert_eq!(&out[..preview.len()],preview);
+  assert_eq!(command(&mut fs,&auth,id(),1,b"rfind /src one",&mut out),Ok(2));
+  assert_eq!(&out[..2],b"17");
+  fs=HierVfs::mount(fs.into_device()).unwrap();
+  assert_eq!(command(&mut fs,&auth,id(),1,b"headlines /src 1",&mut out),Ok(7));
+  assert_eq!(&out[..7],"α one\n".as_bytes());
+  assert_eq!(fs.generation(),before);
+ }
+ #[test]fn invalid_source_utf8_and_small_output_have_no_side_effects(){
+  let (mut fs,auth)=setup();let gen=fs.generation();let mut out=[0xa5;4];
+  assert_eq!(command(&mut fs,&auth,id(),1,b"headlines /src 2",&mut out),Err(Error::OutputTooSmall));
+  assert_eq!(out,[0xa5;4]);
+  assert_eq!(command(&mut fs,&auth,id(),1,b"headlines /src 0",&mut out),Err(Error::Invalid));
+  assert_eq!(command(&mut fs,&auth,id(),1,b"headlines /binary 1",&mut out),Err(Error::Invalid));
+  assert_eq!(command(&mut fs,&auth,id(),1,b"rfind /binary a",&mut out),Err(Error::Invalid));
+  assert_eq!(fs.generation(),gen);assert_eq!(out,[0xa5;4]);
+ }
+ #[test]fn stale_identity_cannot_read_source_or_publish_bytes(){
+  let (mut fs,auth)=setup();let mut out=[0x55;32];
+  let other=Identity{generation:2,..id()};
+  assert_eq!(command(&mut fs,&auth,other,1,b"headlines /src 1",&mut out),Err(Error::Denied));
+  assert_eq!(command(&mut fs,&auth,other,1,b"rfind /src one",&mut out),Err(Error::Denied));
+  assert_eq!(out,[0x55;32]);
  }
 }
