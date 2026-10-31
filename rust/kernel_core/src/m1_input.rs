@@ -1177,3 +1177,78 @@ mod r065_history_redaction_tests{
   assert_eq!(input.clipboard_bytes(),b"");
  }
 }
+
+
+/// R066: insert a bounded fragment of a previously *successfully submitted*
+/// command at the CURRENT caret of a private unsent Terminal draft. This is
+/// a deliberate editing operation, not submission or clipboard access.
+/// Capacity, history index, fragment bounds and printable input are
+/// checked before mutating the live line; errors leave browsing state alone.
+impl InputLine{
+ pub fn paste_history_fragment(&mut self,index:usize,
+    from:usize,to:usize)->Result<usize,Error>{
+  let entry=self.history.get(index).and_then(|value|*value)
+    .ok_or(Error::Invalid)?;
+  if index>=self.history_len||from>=to||to>entry.len{
+   return Err(Error::Invalid);
+  }
+  let bytes=&entry.bytes[from..to];
+  if bytes.iter().any(|&b|!(b' '..=b'~').contains(&b)){
+   return Err(Error::Invalid);
+  }
+  self.editor.paste(bytes)?;
+  self.history_cursor=None;
+  self.history_draft.fill(0);
+  self.history_draft_len=0;
+  Ok(bytes.len())
+ }
+}
+#[cfg(test)]
+mod r066_history_fragment_tests{
+ use super::*;
+ fn ready()->InputLine{
+  let mut input=InputLine::new();
+  let mut out=[0u8;MAX_LINE];
+  for cmd in [b"git status".as_slice(),b"cargo test",b"git diff"]{
+   input.set_line(cmd).unwrap();
+   input.feed(b'\n',&mut out).unwrap();
+  }
+  input
+ }
+ #[test]fn inserts_a_real_command_fragment_at_caret_without_executing(){
+  let mut input=ready();
+  input.set_line(b"run ").unwrap();
+  assert_eq!(input.paste_history_fragment(1,6,10),Ok(4));
+  assert_eq!(input.bytes(),b"run test");
+  assert_eq!(input.history_count(),3);
+  assert_eq!(input.paste_history_fragment(0,0,3),Ok(3));
+  assert_eq!(input.bytes(),b"run testgit");
+  let mut out=[0u8;MAX_LINE];
+  assert_eq!(input.feed(b'\n',&mut out),Ok(Event::Submitted(11)));
+  assert_eq!(&out[..11],b"run testgit");
+ }
+ #[test]fn full_line_and_invalid_range_do_not_mutate_history_or_clipboard(){
+  let mut input=ready();
+  input.set_line(b"git status").unwrap();
+  input.copy_range(0,3).unwrap();
+  input.set_line(&[b'x';MAX_LINE]).unwrap();
+  assert_eq!(input.paste_history_fragment(1,0,5),Err(Error::Full));
+  assert_eq!(input.bytes(),&[b'x';MAX_LINE]);
+  for (index,from,to) in [(3,0,1),(0,1,1),(1,8,20),(1,10,11)]{
+   assert_eq!(input.paste_history_fragment(index,from,to),
+     Err(Error::Invalid));
+  }
+  assert_eq!(input.history_count(),3);
+  assert_eq!(input.clipboard_bytes(),b"git");
+ }
+ #[test]fn insertion_after_recall_is_still_an_unsent_explicit_edit(){
+  let mut input=ready();
+  input.set_line(b"draft").unwrap();
+  assert_eq!(input.history_previous(),Ok(8));
+  assert_eq!(input.bytes(),b"git diff");
+  assert_eq!(input.paste_history_fragment(0,0,3),Ok(3));
+  assert_eq!(input.bytes(),b"git diffgit");
+  assert_eq!(input.history_next(),Err(Error::Invalid));
+  assert_eq!(input.history_count(),3);
+ }
+}
