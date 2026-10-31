@@ -1521,3 +1521,64 @@ mod r070_shell_verb_edit_tests {
         assert_eq!(line.lowercase_command_verb(), Event::Empty);
     }
 }
+
+
+/// R071: move an interactive shell caret directly to indexed whitespace-
+/// delimited argument. Index 0 denotes the command verb; navigation
+/// preserves the editable line, clipboard and submitted command history.
+impl LineEditor {
+    pub fn jump_to_argument(&mut self, index: usize) -> Result<usize, Error> {
+        let mut at = 0usize;
+        let mut token = 0usize;
+        while at < self.len {
+            while at < self.len && self.line[at] == b' ' { at += 1; }
+            if at == self.len { break; }
+            if token == index {
+                self.caret = at;
+                return Ok(at);
+            }
+            token = token.checked_add(1).ok_or(Error::Invalid)?;
+            while at < self.len && self.line[at] != b' ' { at += 1; }
+        }
+        Err(Error::Invalid)
+    }
+}
+impl InputLine {
+    pub fn jump_to_argument(&mut self, index: usize) -> Result<usize, Error> {
+        self.editor.jump_to_argument(index)
+    }
+}
+
+#[cfg(test)]
+mod r071_terminal_argument_navigation_tests {
+    use super::*;
+    #[test]
+    fn navigates_real_draft_without_mutating_arguments() {
+        let mut input = InputLine::new();
+        input.set_line(b"  linespan  /Mixed  2   4 ").unwrap();
+        assert_eq!(input.jump_to_argument(0), Ok(2));
+        assert_eq!(input.jump_to_argument(1), Ok(12));
+        assert_eq!(input.jump_to_argument(2), Ok(20));
+        assert_eq!(input.jump_to_argument(3), Ok(24));
+        assert_eq!(input.caret(), 24);
+        assert_eq!(input.bytes(), b"  linespan  /Mixed  2   4 ");
+        assert_eq!(input.history_count(), 0);
+    }
+    #[test]
+    fn invalid_token_keeps_caret_clipboard_and_history() {
+        let mut input = InputLine::new();
+        let mut out = [0u8; MAX_LINE];
+        input.set_line(b"pwd").unwrap();
+        input.feed(b'\n', &mut out).unwrap();
+        input.set_line(b"cat /src").unwrap();
+        input.copy_range(0, 3).unwrap();
+        input.jump_to_argument(1).unwrap();
+        let previous = input.caret();
+        assert_eq!(input.jump_to_argument(99), Err(Error::Invalid));
+        assert_eq!(input.caret(), previous);
+        assert_eq!(input.clipboard_bytes(), b"cat");
+        assert_eq!(input.history_count(), 1);
+        input.set_line(b"  ").unwrap();
+        assert_eq!(input.jump_to_argument(0), Err(Error::Invalid));
+    }
+}

@@ -1992,3 +1992,91 @@ mod r070_workstation_authenticated_routes_tests {
         assert_eq!(out, [77, 77]);
     }
 }
+
+
+/// R071: route source newline normalization and lexical refactor preview
+/// through authenticated desktop session, generation and capability grants.
+impl<D: BlockDevice, const P: usize, const E: usize, const W: usize,
+     const K: usize, const G: usize, const Q: usize> Desktop<D, P, E, W, K, G, Q> {
+    pub fn editor_normalize_source_crlf(&mut self, caller: Identity, now: u64,
+        editor: &mut crate::m1_disk_editor::DiskEditor) -> Result<usize, EditorRouteError> {
+        self.admit_editor(caller, now, FILE_WRITE)?;
+        editor.normalize_source_crlf(caller).map_err(EditorRouteError::Editor)
+    }
+    pub fn project_preview_source_identifier_rename(&mut self, caller: Identity, now: u64,
+        project: &crate::m1_project_workspace::ProjectTree,
+        file: &str, old: &str, new: &str
+    ) -> Result<crate::m1_project_workspace::RenamePreview, ProjectRouteError> {
+        self.admit_editor(caller, now, FILE_READ).map_err(ProjectRouteError::Permission)?;
+        project.preview_source_identifier_rename(caller, &mut self.volume, file, old, new)
+            .map_err(ProjectRouteError::Project)
+    }
+}
+
+#[cfg(test)]
+mod r071_desktop_source_security_tests {
+    use super::*;
+    use crate::block::{BlockError, SECTOR_BYTES};
+    use crate::batch2_launcher::Image;
+    use crate::batch2_settings::{Settings, Theme};
+    struct Disk { sectors: [[u8; SECTOR_BYTES]; 100] }
+    impl BlockDevice for Disk {
+        fn sector_count(&self) -> u64 { 100 }
+        fn read_sector(&mut self, lba: u64, out: &mut [u8; SECTOR_BYTES]) -> Result<(), BlockError> {
+            *out = *self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?; Ok(())
+        }
+        fn write_sector(&mut self, lba: u64, data: &[u8; SECTOR_BYTES]) -> Result<(), BlockError> {
+            *self.sectors.get_mut(lba as usize).ok_or(BlockError::OutOfRange)? = *data; Ok(())
+        }
+    }
+    type Desk = Desktop<Disk, 3, 3, 2, 2, 3, 8>;
+    fn id(pid: u32) -> Identity { Identity { pid, generation: 1 } }
+    fn launch(pid: u32) -> Launch {
+        Launch { pid, generation: 1, image: Image {
+            image_id: pid, entry: 0x1000, mapped_end: 0x2000, verified: true
+        } }
+    }
+    fn ready() -> Desk {
+        let mut fs = HierVfs::format_blank(Disk { sectors: [[0; SECTOR_BYTES]; 100] }).unwrap();
+        fs.create("/src", "α\r\nβ\r\n".as_bytes()).unwrap();
+        let mut d = Desk::from_mounted(fs);
+        d.start(id(1), launch(1), id(2), launch(2),
+            Settings { theme: Theme::Dark, pointer_speed: 5, key_repeat: 10 }, 8, 5).unwrap();
+        d
+    }
+    #[test]
+    fn authenticated_editor_changes_disk_and_project_preview_does_not() {
+        let mut d = ready();
+        let mut e = crate::m1_disk_editor::DiskEditor::new();
+        d.editor_open(id(2), 1, &mut e, "/src").unwrap();
+        assert_eq!(d.editor_normalize_source_crlf(id(2), 1, &mut e), Ok(2));
+        d.editor_save(id(2), 1, &mut e).unwrap();
+        let mut p = crate::m1_project_workspace::ProjectTree::new();
+        d.project_create(id(2), 1, &mut p, "demo").unwrap();
+        d.project_create_file(id(2), 1, &mut p, "main", b"foo foo2 foo").unwrap();
+        let checksum = d.project_source_checksum(id(2), 1, &p, "main").unwrap();
+        let preview = d.project_preview_source_identifier_rename(
+            id(2), 1, &p, "main", "foo", "barbaz").unwrap();
+        assert_eq!(preview.matches, 2);
+        assert_eq!(d.project_source_checksum(id(2), 1, &p, "main").unwrap(), checksum);
+        let mut mounted = HierVfs::mount(d.into_device()).unwrap();
+        let mut out = [0u8; 32];
+        assert_eq!(mounted.read("/src", &mut out), Ok("α\nβ\n".len()));
+        assert_eq!(&out[.."α\nβ\n".len()], "α\nβ\n".as_bytes());
+    }
+    #[test]
+    fn expired_and_recycled_owner_cannot_edit_or_preview() {
+        let mut d = ready();
+        let mut e = crate::m1_disk_editor::DiskEditor::new();
+        d.editor_open(id(2), 1, &mut e, "/src").unwrap();
+        assert!(d.editor_normalize_source_crlf(id(2), 6, &mut e).is_err());
+        assert!(d.editor_normalize_source_crlf(
+            Identity { generation: 2, ..id(2) }, 1, &mut e).is_err());
+        assert!(!e.status(id(2)).unwrap().dirty);
+        let mut p = crate::m1_project_workspace::ProjectTree::new();
+        d.project_create(id(2), 1, &mut p, "demo").unwrap();
+        d.project_create_file(id(2), 1, &mut p, "main", b"foo").unwrap();
+        assert!(d.project_preview_source_identifier_rename(
+            id(2), 6, &p, "main", "foo", "bar").is_err());
+    }
+}

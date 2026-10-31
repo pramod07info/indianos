@@ -1497,3 +1497,88 @@ mod r070_source_indentation_tests {
         assert!(!editor.status(id()).unwrap().dirty);
     }
 }
+
+
+/// R071: atomically convert Windows CRLF rows to LF in one undoable,
+/// unsaved source edit. Stray CR and invalid UTF-8 never change editor state.
+impl DiskEditor {
+    pub fn normalize_source_crlf(&mut self, caller: Identity) -> Result<usize, Error> {
+        self.authorize(caller)?;
+        core::str::from_utf8(&self.data[..self.used]).map_err(|_| Error::Invalid)?;
+        let mut staged = [0u8; MAX_FILE_BYTES];
+        let mut i = 0usize;
+        let mut n = 0usize;
+        let mut changed = 0usize;
+        while i < self.used {
+            if self.data[i] == b'\r' {
+                if self.data.get(i + 1) != Some(&b'\n') { return Err(Error::Invalid); }
+                staged[n] = b'\n';
+                i += 2;
+                changed += 1;
+            } else {
+                staged[n] = self.data[i];
+                i += 1;
+            }
+            n += 1;
+        }
+        if changed > 0 { self.replace(caller, 0, self.used, &staged[..n])?; }
+        Ok(changed)
+    }
+}
+
+#[cfg(test)]
+mod r071_editor_crlf_tests {
+    use super::*;
+    use crate::block::{BlockError, SECTOR_BYTES};
+    struct Disk { sectors: [[u8; SECTOR_BYTES]; 100] }
+    impl BlockDevice for Disk {
+        fn sector_count(&self) -> u64 { 100 }
+        fn read_sector(&mut self, lba: u64, out: &mut [u8; SECTOR_BYTES]) -> Result<(), BlockError> {
+            *out = *self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?;
+            Ok(())
+        }
+        fn write_sector(&mut self, lba: u64, data: &[u8; SECTOR_BYTES]) -> Result<(), BlockError> {
+            *self.sectors.get_mut(lba as usize).ok_or(BlockError::OutOfRange)? = *data; Ok(())
+        }
+    }
+    fn id() -> Identity { Identity { pid: 7, generation: 3 } }
+    fn setup() -> (HierVfs<Disk>, DiskEditor) {
+        let mut fs = HierVfs::format_blank(Disk { sectors: [[0; SECTOR_BYTES]; 100] }).unwrap();
+        fs.create("/src", "α\r\nβ\r\nend\n".as_bytes()).unwrap();
+        fs.create("/bad", b"first\rbroken").unwrap();
+        fs.create("/binary", &[0xff, 0xfe]).unwrap();
+        let mut editor = DiskEditor::new();
+        editor.open(id(), &mut fs, "/src").unwrap();
+        (fs, editor)
+    }
+    #[test]
+    fn converts_unicode_lines_undo_redo_and_remount() {
+        let (mut fs, mut e) = setup();
+        assert_eq!(e.normalize_source_crlf(id()), Ok(2));
+        assert_eq!(e.undo(id()), Ok("α\r\nβ\r\nend\n".len()));
+        assert_eq!(e.redo(id()), Ok("α\nβ\nend\n".len()));
+        e.save(id(), &mut fs).unwrap();
+        assert_eq!(e.normalize_source_crlf(id()), Ok(0));
+        assert!(!e.status(id()).unwrap().dirty);
+        let mut fs = HierVfs::mount(fs.into_device()).unwrap();
+        let mut out = [0u8; 32];
+        assert_eq!(fs.read("/src", &mut out), Ok("α\nβ\nend\n".len()));
+        assert_eq!(&out[.."α\nβ\nend\n".len()], "α\nβ\nend\n".as_bytes());
+    }
+    #[test]
+    fn bad_cr_binary_and_recycled_owner_are_fail_closed() {
+        let (mut fs, mut e) = setup();
+        let generation = fs.generation();
+        assert_eq!(e.normalize_source_crlf(Identity { generation: 4, ..id() }),
+            Err(Error::Unauthorized));
+        assert!(!e.status(id()).unwrap().dirty);
+        e.close(id(), false).unwrap();
+        e.open(id(), &mut fs, "/bad").unwrap();
+        assert_eq!(e.normalize_source_crlf(id()), Err(Error::Invalid));
+        assert!(!e.status(id()).unwrap().dirty);
+        e.close(id(), false).unwrap();
+        e.open(id(), &mut fs, "/binary").unwrap();
+        assert_eq!(e.normalize_source_crlf(id()), Err(Error::Invalid));
+        assert_eq!(fs.generation(), generation);
+    }
+}
