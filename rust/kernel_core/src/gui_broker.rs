@@ -1635,3 +1635,70 @@ mod m1_damage_authority_tests{
   assert!(l.geometry(1,10).is_ok());
  }
 }
+
+
+/// R060: compositor-owned horizontal tiling for developer workspaces.
+/// Entire target geometry, ownership and epochs are validated by the
+/// existing atomic geometry transaction before any window is moved.
+/// This is metadata only; the userspace compositor must render the tiles.
+impl<const N:usize> SurfaceLayout<N>{
+ pub fn tile_horizontal(&mut self,
+   windows:&[(u32,u32)],
+   area:crate::agent_05_surface_rect::Rectangle)->Result<usize,Error>{
+  use crate::agent_05_surface_rect::{Rectangle,clip_owned};
+  if windows.is_empty()||windows.len()>N||
+     windows.len()>area.width as usize{return Err(Error::Invalid);}
+  clip_owned(area,area,1,1).map_err(|_|Error::Invalid)?;
+  let count=windows.len() as u32; // bounded by validated screen width
+  let base=area.width/count;
+  let surplus=area.width%count;
+  let empty=Rectangle{x:0,y:0,width:1,height:1};
+  let mut request=[(0u32,0u32,empty);N];
+  let mut x=area.x;
+  for (i,&(owner,window)) in windows.iter().enumerate(){
+   let width=base+u32::from((i as u32)<surplus);
+   request[i]=(owner,window,Rectangle{
+     x,y:area.y,width,height:area.height
+   });
+   x=x.checked_add(width).ok_or(Error::Invalid)?;
+  }
+  self.set_geometry_batch(&request[..windows.len()])
+ }
+}
+#[cfg(test)]
+mod r060_tiling_tests{
+ use super::*;
+ use crate::agent_05_surface_rect::Rectangle;
+ fn rect(x:u32,y:u32,w:u32,h:u32)->Rectangle{
+  Rectangle{x,y,width:w,height:h}
+ }
+ #[test]fn tile_three_owned_windows_with_exact_remaining_pixel_distribution(){
+  let mut layout=SurfaceLayout::<4>::new();
+  for (owner,window) in [(1,10),(2,20),(3,30)]{
+   layout.grant(owner,window,rect(4,4,20,20)).unwrap();
+  }
+  let previous=layout.epoch(1,10).unwrap();
+  assert_eq!(layout.tile_horizontal(&[(1,10),(2,20),(3,30)],
+      rect(20,30,101,70)),Ok(3));
+  assert_eq!(layout.geometry(1,10),Ok(rect(20,30,34,70)));
+  assert_eq!(layout.geometry(2,20),Ok(rect(54,30,34,70)));
+  assert_eq!(layout.geometry(3,30),Ok(rect(88,30,33,70)));
+  assert!(layout.epoch(1,10).unwrap()>previous);
+ }
+ #[test]fn invalid_late_owner_duplicate_and_offscreen_area_roll_back(){
+  let mut layout=SurfaceLayout::<2>::new();
+  let original=rect(5,5,30,30);
+  layout.grant(1,10,original).unwrap();
+  layout.grant(2,20,original).unwrap();
+  let epoch=layout.epoch(1,10);
+  assert_eq!(layout.tile_horizontal(&[(1,10),(9,20)],
+      rect(0,0,200,100)),Err(Error::Unauthorized));
+  assert_eq!(layout.tile_horizontal(&[(1,10),(1,10)],
+      rect(0,0,200,100)),Err(Error::Duplicate));
+  assert_eq!(layout.tile_horizontal(&[(1,10),(2,20)],
+      rect(1270,0,100,100)),Err(Error::Invalid));
+  assert_eq!(layout.geometry(1,10),Ok(original));
+  assert_eq!(layout.geometry(2,20),Ok(original));
+  assert_eq!(layout.epoch(1,10),epoch);
+ }
+}
