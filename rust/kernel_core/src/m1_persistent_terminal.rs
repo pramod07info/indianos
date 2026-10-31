@@ -19,7 +19,7 @@ pub const COMMAND_VERBS:&[&str]=&[
  "help","pwd","tools","ls","cat","write","append","mkdir","mv",
  "cp","rm","mkfile","truncate","head","count","rmdir","mvdir",
  "pread","pwrite","lines","line","hash","stat","tail","find","grep","cmp","diffat",
- "touch","copynew","replace","appendln","health","hex","slice","concat","cmprange","bytefreq","patchhex","patchrange","copylines","wc","headlines","rfind","taillines","linespan",
+ "touch","copynew","replace","appendln","health","hex","slice","concat","cmprange","bytefreq","patchhex","patchrange","copylines","wc","headlines","rfind","taillines","linespan","linehits",
 ];
 /// Complete exactly one printable lower-case verb prefix. Ambiguous matches,
 /// empty prefixes and user-supplied paths never cause completion or I/O.
@@ -91,7 +91,7 @@ pub fn command<D:BlockDevice,const N:usize>(
  let line=entered.trim_end();
  if line=="help"{return publish(b"pwd ls /dir cat /path write /path text append /path text mkdir /dir mv /old /new cp /src /dst rm /path mkfile /path truncate /path head /path count rmdir /dir mvdir /old /new pread /file offset count pwrite /file@offset text",out);}
  if line=="pwd"{return publish(b"/",out);}
- if line=="tools"{return publish(b"count lines line tail find grep hash cmp diffat stat touch copynew replace appendln health hex slice concat cmprange bytefreq patchhex patchrange copylines wc headlines rfind taillines linespan",out);}
+ if line=="tools"{return publish(b"count lines line tail find grep hash cmp diffat stat touch copynew replace appendln health hex slice concat cmprange bytefreq patchhex patchrange copylines wc headlines rfind taillines linespan linehits",out);}
  if line=="health"{
   auth.require(caller,FILE_READ,now).map_err(|_|Error::Denied)?;
   let health=fs.mounted_health().map_err(Error::Io)?;
@@ -267,6 +267,32 @@ pub fn command<D:BlockDevice,const N:usize>(
    }
    if total<stop-1{return Err(Error::Invalid);}
    publish(&bytes[first..last],out)
+  }
+  // Return one-based row numbers containing an exact printable substring.
+  // Output is assembled fully before publication and never mutates storage.
+  "linehits"=>{
+   auth.require(caller,FILE_READ,now).map_err(|_|Error::Denied)?;
+   let (source,needle)=raw.split_once(' ').ok_or(Error::Invalid)?;
+   if needle.is_empty(){return Err(Error::Invalid);}
+   let p=path(source,&mut name)?;
+   let mut bytes=[0u8;crate::durablefs::MAX_FILE_BYTES];
+   let n=fs.read(p,&mut bytes).map_err(Error::Io)?;
+   let text=core::str::from_utf8(&bytes[..n]).map_err(|_|Error::Invalid)?;
+   let mut staged=[0u8;crate::durablefs::MAX_FILE_BYTES];
+   let mut written=0usize;
+   for (index,line) in text.split_terminator('\n').enumerate(){
+    if line.contains(needle){
+     if written>0{
+      if written==staged.len(){return Err(Error::OutputTooSmall);}
+      staged[written]=b' ';written+=1;
+     }
+     let row=(index+1) as u64;
+     let len=publish_number(row,&mut staged[written..])?;
+     written+=len;
+    }
+   }
+   if written==0{publish(b"not found",out)}
+   else{publish(&staged[..written],out)}
   }
   "tail"=>{
    auth.require(caller,FILE_READ,now).map_err(|_|Error::Denied)?;
@@ -1211,8 +1237,8 @@ mod tests{
   assert_eq!(complete_verb(b"heal"),Some("health"));
  }
  #[test]fn r044_command_registry_drives_unique_safe_completion(){
-  // R071 extends the registered CLI with `linespan`.
-  assert_eq!(COMMAND_VERBS.len(),46);
+  // R072 extends the registered CLI with `linehits`.
+  assert_eq!(COMMAND_VERBS.len(),47);
   for (i,verb) in COMMAND_VERBS.iter().enumerate(){
    assert!(verb.as_bytes().iter().all(|b|b.is_ascii_lowercase()));
    assert!(!COMMAND_VERBS[..i].contains(verb));
@@ -1227,6 +1253,7 @@ mod tests{
   assert_eq!(complete_verb(b"rfin"),Some("rfind"));
   assert_eq!(complete_verb(b"tailli"),Some("taillines"));
   assert_eq!(complete_verb(b"linesp"),Some("linespan"));
+  assert_eq!(complete_verb(b"lineh"),Some("linehits"));
   assert_eq!(complete_verb(b"hea"),None);
   assert_eq!(complete_verb(b"rmd"),Some("rmdir"));
   assert_eq!(complete_verb(b"app"),None);
@@ -2684,5 +2711,59 @@ mod r071_terminal_linespan_tests {
             b"linespan /source 1 1", &mut out), Err(Error::Denied));
         assert_eq!(out, [0x41; 4]);
         assert_eq!(fs.generation(), previous);
+    }
+}
+
+
+#[cfg(test)]
+mod r072_terminal_matching_lines_tests {
+    use super::*;
+    use crate::block::{BlockError, SECTOR_BYTES};
+    struct Disk { sectors: [[u8; SECTOR_BYTES]; 100] }
+    impl BlockDevice for Disk {
+        fn sector_count(&self) -> u64 { 100 }
+        fn read_sector(&mut self, lba: u64, out: &mut [u8; SECTOR_BYTES]) -> Result<(), BlockError> {
+            *out = *self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?; Ok(())
+        }
+        fn write_sector(&mut self, lba: u64, data: &[u8; SECTOR_BYTES]) -> Result<(), BlockError> {
+            *self.sectors.get_mut(lba as usize).ok_or(BlockError::OutOfRange)? = *data; Ok(())
+        }
+    }
+    fn id() -> Identity { Identity { pid: 6, generation: 4 } }
+    fn setup() -> (HierVfs<Disk>, Access<1>) {
+        let mut fs = HierVfs::format_blank(Disk { sectors: [[0; SECTOR_BYTES]; 100] }).unwrap();
+        fs.create("/src", "α foo\nbar\nfoo α\n".as_bytes()).unwrap();
+        fs.create("/bad", &[0xff, 0xfe]).unwrap();
+        let mut access = Access::new();
+        access.grant(id(), FILE_READ, 20).unwrap();
+        (fs, access)
+    }
+    #[test]
+    fn reports_one_based_matching_unicode_source_rows_after_remount() {
+        let (mut fs, access) = setup();
+        let baseline = fs.generation();
+        let mut out = [0u8; 24];
+        assert_eq!(command(&mut fs, &access, id(), 1,
+            b"linehits /src foo", &mut out), Ok(3));
+        assert_eq!(&out[..3], b"1 3");
+        fs = HierVfs::mount(fs.into_device()).unwrap();
+        assert_eq!(command(&mut fs, &access, id(), 1,
+            b"linehits /src missing", &mut out), Ok(9));
+        assert_eq!(&out[..9], b"not found");
+        assert_eq!(fs.generation(), baseline);
+    }
+    #[test]
+    fn output_short_corruption_and_expired_identity_do_not_publish() {
+        let (mut fs, access) = setup();
+        let baseline = fs.generation();
+        let mut output = [0x61u8; 2];
+        assert_eq!(command(&mut fs, &access, id(), 1,
+            b"linehits /src foo", &mut output), Err(Error::OutputTooSmall));
+        assert_eq!(command(&mut fs, &access, id(), 1,
+            b"linehits /bad foo", &mut output), Err(Error::Invalid));
+        assert_eq!(command(&mut fs, &access, id(), 21,
+            b"linehits /src foo", &mut output), Err(Error::Denied));
+        assert_eq!(output, [0x61; 2]);
+        assert_eq!(fs.generation(), baseline);
     }
 }
