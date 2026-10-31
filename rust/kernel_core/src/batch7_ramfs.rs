@@ -1048,3 +1048,85 @@ mod r065_ram_splice_tests{
   assert_eq!(fs.version(),current);
  }
 }
+
+
+/// R066: bounded cross-file transactional byte splices. Every source must
+/// still match its observed per-file version AND the whole RAM filesystem
+/// generation. Replacements are computed on a private shadow; any invalid
+/// later operation discards all earlier work without publishing new epochs.
+/// The caller must authorize WRITE on every path. RAM is NOT durable storage.
+impl<const N:usize> RamFs<N>{
+ pub fn splice_batch_if_versions(&mut self,expected_global:u64,
+   requests:&[(&[u8],u64,usize,usize,&[u8])])->Result<u64,Error>{
+  if requests.is_empty()||requests.len()>16||requests.len()>N||
+     expected_global!=self.version{return Err(Error::Invalid);}
+  let mut staged=Self{files:self.files,version:self.version};
+  for (i,&(path,expected,offset,remove,insert)) in requests.iter().enumerate(){
+   if requests[..i].iter().any(|&(prior,_,_,_,_)|prior==path){
+    return Err(Error::Invalid);
+   }
+   staged.splice_if_file_revision(path,expected,offset,remove,insert)?;
+  }
+  *self=staged;
+  Ok(self.version)
+ }
+}
+#[cfg(test)]
+mod r066_atomic_multifile_splice_tests{
+ use super::*;
+ #[test]fn two_binary_documents_publish_only_after_both_splices_succeed(){
+  let mut fs=RamFs::<3>::new();
+  let first=fs.replace(b"/first",&[0,1,2,3]).unwrap();
+  let second=fs.replace(b"/second",b"abcd").unwrap();
+  let before=fs.version();
+  assert_eq!(fs.splice_batch_if_versions(before,&[
+    (b"/first",first,1,2,&[9,8,7]),
+    (b"/second",second,1,2,b"XY")
+  ]),Ok(before+2));
+  let mut out=[0u8;16];
+  assert_eq!(fs.read(b"/first",0,&mut out),Ok(5));
+  assert_eq!(&out[..5],&[0,9,8,7,3]);
+  assert_eq!(fs.read(b"/second",0,&mut out),Ok(4));
+  assert_eq!(&out[..4],b"aXYd");
+  assert_eq!(fs.metadata(b"/first"),Ok((before+1,5)));
+  assert_eq!(fs.metadata(b"/second"),Ok((before+2,4)));
+ }
+ #[test]fn late_stale_revision_or_duplicate_target_rolls_back_all_files(){
+  let mut fs=RamFs::<2>::new();
+  let a=fs.replace(b"/a",b"keep").unwrap();
+  let b=fs.replace(b"/b",b"peer").unwrap();
+  let before=fs.version();
+  assert_eq!(fs.splice_batch_if_versions(before,&[
+    (b"/a",a,0,2,b"NO"),(b"/b",b+1,0,1,b"X")
+  ]),Err(Error::Invalid));
+  assert_eq!(fs.splice_batch_if_versions(before,&[
+    (b"/a",a,0,2,b"NO"),(b"/a",a,0,1,b"X")
+  ]),Err(Error::Invalid));
+  assert_eq!(fs.splice_batch_if_versions(before+1,&[
+    (b"/a",a,0,2,b"NO")
+  ]),Err(Error::Invalid));
+  assert_eq!(fs.version(),before);
+  let mut out=[0u8;8];fs.read(b"/a",0,&mut out).unwrap();
+  assert_eq!(&out[..4],b"keep");
+  fs.read(b"/b",0,&mut out).unwrap();
+  assert_eq!(&out[..4],b"peer");
+ }
+ #[test]fn late_capacity_bad_path_and_noop_behave_atomically(){
+  let mut fs=RamFs::<2>::new();
+  let a=fs.replace(b"/a",b"one").unwrap();
+  let b=fs.replace(b"/b",&[b'x';CONTENT_MAX]).unwrap();
+  let before=fs.version();
+  assert_eq!(fs.splice_batch_if_versions(before,&[
+    (b"/a",a,0,1,b"OK"),(b"/b",b,0,0,b"!")
+  ]),Err(Error::Invalid));
+  assert_eq!(fs.splice_batch_if_versions(before,&[
+    (b"/a",a,0,1,b"OK"),(b"/../bad",b,0,1,b"!")
+  ]),Err(Error::Invalid));
+  assert_eq!(fs.version(),before);
+  assert_eq!(fs.splice_batch_if_versions(before,&[
+    (b"/a",a,0,1,b"o"),(b"/b",b,0,1,b"x")
+  ]),Ok(before));
+  assert_eq!(fs.metadata(b"/a"),Ok((a,3)));
+  assert_eq!(fs.metadata(b"/b"),Ok((b,CONTENT_MAX)));
+ }
+}

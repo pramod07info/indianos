@@ -1196,3 +1196,107 @@ mod r065_source_comment_tests{
   assert_eq!(editor.comment_source_range(actor(),1,1,false),Err(Error::Invalid));
  }
 }
+
+
+/// R066: replace an inclusive, one-based source-line selection with one
+/// or more UTF-8 rows. The existing final newline of the selected range
+/// is preserved; replacement must not inject a trailing phantom row.
+/// All validation and growth checks go through one authenticated replace(),
+/// preserving a single undo/redo step and disk COW save semantics.
+impl DiskEditor{
+ pub fn replace_source_lines(&mut self,caller:Identity,
+    first:usize,last:usize,replacement:&str)->Result<usize,Error>{
+  self.authorize(caller)?;
+  if first==0||last<first||replacement.ends_with('\n')||
+     replacement.bytes().any(|b|b==b'\r'||b==0){
+    return Err(Error::Invalid);
+  }
+  let text=core::str::from_utf8(&self.data[..self.used])
+    .map_err(|_|Error::Invalid)?;
+  let mut cursor=0usize;
+  let mut from=None;let mut to=None;
+  for (index,row) in text.split_terminator('\n').enumerate(){
+   let number=index+1;
+   let end=cursor.checked_add(row.len()).ok_or(Error::Full)?;
+   if number==first{from=Some(cursor);}
+   if number==last{to=Some(end);}
+   cursor=end.checked_add(1).ok_or(Error::Full)?;
+  }
+  let start=from.ok_or(Error::Invalid)?;
+  let end=to.ok_or(Error::Invalid)?;
+  self.replace_text(caller,start,end,replacement)
+ }
+}
+#[cfg(test)]
+mod r066_unicode_source_range_tests{
+ use super::*;
+ use crate::block::{BlockError,SECTOR_BYTES};
+ struct Disk{data:[[u8;SECTOR_BYTES];100]}
+ impl BlockDevice for Disk{
+  fn sector_count(&self)->u64{100}
+  fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   *out=*self.data.get(lba as usize).ok_or(BlockError::OutOfRange)?;Ok(())
+  }
+  fn write_sector(&mut self,lba:u64,bytes:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   *self.data.get_mut(lba as usize).ok_or(BlockError::OutOfRange)?=*bytes;Ok(())
+  }
+ }
+ fn actor()->Identity{Identity{pid:6,generation:4}}
+ fn setup()->HierVfs<Disk>{
+  let mut fs=HierVfs::format_blank(Disk{data:[[0;SECTOR_BYTES];100]}).unwrap();
+  fs.create("/code","α\nβ\nomega".as_bytes()).unwrap();
+  fs.create("/rows",b"first\nmiddle\nlast\n").unwrap();
+  fs.create("/binary",&[0xff,0x80]).unwrap();
+  fs
+ }
+ #[test]fn batch_source_replacement_is_one_undo_and_survives_disk_remount(){
+  let mut fs=setup();let mut editor=DiskEditor::new();
+  editor.open(actor(),&mut fs,"/code").unwrap();
+  let expected="first\nsecond\nthird\nomega".as_bytes();
+  assert_eq!(editor.replace_source_lines(
+    actor(),1,2,"first\nsecond\nthird"),Ok(expected.len()));
+  let mut out=[0u8;64];
+  assert_eq!(editor.read(actor(),&mut out),Ok(expected.len()));
+  assert_eq!(&out[..expected.len()],expected);
+  assert_eq!(editor.undo(actor()),Ok("α\nβ\nomega".len()));
+  assert_eq!(editor.redo(actor()),Ok(expected.len()));
+  editor.save(actor(),&mut fs).unwrap();
+  let mut remounted=HierVfs::mount(fs.into_device()).unwrap();
+  assert_eq!(remounted.read("/code",&mut out),Ok(expected.len()));
+  assert_eq!(&out[..expected.len()],expected);
+ }
+ #[test]fn final_terminated_line_keeps_newline_and_noop_is_clean(){
+  let mut fs=setup();let mut editor=DiskEditor::new();
+  editor.open(actor(),&mut fs,"/rows").unwrap();
+  assert_eq!(editor.replace_source_lines(actor(),2,3,"M\nN"),Ok(10));
+  let mut out=[0u8;32];editor.read(actor(),&mut out).unwrap();
+  assert_eq!(&out[..10],b"first\nM\nN\n");
+  editor.close(actor(),true).unwrap();
+  editor.open(actor(),&mut fs,"/code").unwrap();
+  assert_eq!(editor.replace_source_lines(actor(),2,2,"β"),
+    Ok("α\nβ\nomega".len()));
+  assert!(!editor.status(actor()).unwrap().dirty);
+ }
+ #[test]fn invalid_range_control_bytes_oversize_identity_and_binary_fail_closed(){
+  let mut fs=setup();let mut editor=DiskEditor::new();
+  editor.open(actor(),&mut fs,"/code").unwrap();
+  for (first,last) in [(0,1),(2,1),(1,4),(3,4)]{
+   assert_eq!(editor.replace_source_lines(actor(),first,last,"bad"),
+     Err(Error::Invalid));
+  }
+  assert_eq!(editor.replace_source_lines(actor(),1,1,"bad\n"),
+    Err(Error::Invalid));
+  assert_eq!(editor.replace_source_lines(actor(),1,1,"bad\r"),
+    Err(Error::Invalid));
+  let big=[b'X';MAX_FILE_BYTES+1];
+  assert_eq!(editor.replace_source_lines(actor(),1,1,
+    core::str::from_utf8(&big).unwrap()),Err(Error::Full));
+  assert_eq!(editor.replace_source_lines(
+    Identity{generation:5,..actor()},1,2,"bad"),Err(Error::Unauthorized));
+  assert!(!editor.status(actor()).unwrap().dirty);
+  editor.close(actor(),false).unwrap();
+  editor.open(actor(),&mut fs,"/binary").unwrap();
+  assert_eq!(editor.replace_source_lines(actor(),1,1,"safe"),
+    Err(Error::Invalid));
+ }
+}

@@ -19,7 +19,7 @@ pub const COMMAND_VERBS:&[&str]=&[
  "help","pwd","tools","ls","cat","write","append","mkdir","mv",
  "cp","rm","mkfile","truncate","head","count","rmdir","mvdir",
  "pread","pwrite","lines","line","hash","stat","tail","find","grep","cmp","diffat",
- "touch","copynew","replace","appendln","health","hex","slice","concat","cmprange","bytefreq","patchhex",
+ "touch","copynew","replace","appendln","health","hex","slice","concat","cmprange","bytefreq","patchhex","patchrange",
 ];
 /// Complete exactly one printable lower-case verb prefix. Ambiguous matches,
 /// empty prefixes and user-supplied paths never cause completion or I/O.
@@ -91,7 +91,7 @@ pub fn command<D:BlockDevice,const N:usize>(
  let line=entered.trim_end();
  if line=="help"{return publish(b"pwd ls /dir cat /path write /path text append /path text mkdir /dir mv /old /new cp /src /dst rm /path mkfile /path truncate /path head /path count rmdir /dir mvdir /old /new pread /file offset count pwrite /file@offset text",out);}
  if line=="pwd"{return publish(b"/",out);}
- if line=="tools"{return publish(b"count lines line tail find grep hash cmp diffat stat touch copynew replace appendln health hex slice concat cmprange bytefreq patchhex",out);}
+ if line=="tools"{return publish(b"count lines line tail find grep hash cmp diffat stat touch copynew replace appendln health hex slice concat cmprange bytefreq patchhex patchrange",out);}
  if line=="health"{
   auth.require(caller,FILE_READ,now).map_err(|_|Error::Denied)?;
   let health=fs.mounted_health().map_err(Error::Io)?;
@@ -408,6 +408,38 @@ pub fn command<D:BlockDevice,const N:usize>(
    if bytes[offset]==replacement{return publish(b"unchanged",out);}
    bytes[offset]=replacement;
    fs.overwrite(p,&bytes[..size]).map_err(Error::Io)?;
+   publish(b"patched",out)
+  }
+  // Bounded multi-byte patch of existing checksummed COW file contents.
+  // Command: patchrange /path offset HEXPAIRS. Decode every byte, preflight
+  // capacity and validate the entire existing file before ONE overwrite.
+  // No sparse writes, partial results or unauthorized reserved-path writes.
+  "patchrange"=>{
+   auth.require(caller,FILE_READ|FILE_WRITE,now).map_err(|_|Error::Denied)?;
+   if out.len()<9{return Err(Error::OutputTooSmall);}
+   let mut args=raw.split_ascii_whitespace();
+   let source=args.next().ok_or(Error::Invalid)?;
+   let offset=args.next().ok_or(Error::Invalid)?
+     .parse::<u64>().map_err(|_|Error::Invalid)?;
+   let encoded=args.next().ok_or(Error::Invalid)?;
+   if args.next().is_some()||encoded.is_empty()||encoded.len()%2!=0||
+      encoded.len()>MAX_TRANSFER*2{return Err(Error::Invalid);}
+   let mut patch=[0u8;MAX_TRANSFER];
+   let count=encoded.len()/2;
+   for (i,pair) in encoded.as_bytes().chunks_exact(2).enumerate(){
+    let hex=core::str::from_utf8(pair).map_err(|_|Error::Invalid)?;
+    patch[i]=r065_hex_byte(hex)?;
+   }
+   let path=path(source,&mut name)?;
+   writable_path(path)?;
+   let mut contents=[0u8;crate::durablefs::MAX_FILE_BYTES];
+   let size=fs.read(path,&mut contents).map_err(Error::Io)?;
+   let at=usize::try_from(offset).map_err(|_|Error::Invalid)?;
+   let end=at.checked_add(count).ok_or(Error::Invalid)?;
+   if end>size{return Err(Error::Invalid);}
+   if contents[at..end]==patch[..count]{return publish(b"unchanged",out);}
+   contents[at..end].copy_from_slice(&patch[..count]);
+   fs.overwrite(path,&contents[..size]).map_err(Error::Io)?;
    publish(b"patched",out)
   }
   "copynew"=>{
@@ -1047,7 +1079,7 @@ mod tests{
   assert_eq!(complete_verb(b"heal"),Some("health"));
  }
  #[test]fn r044_command_registry_drives_unique_safe_completion(){
-  assert_eq!(COMMAND_VERBS.len(),39);
+  assert_eq!(COMMAND_VERBS.len(),40);
   for (i,verb) in COMMAND_VERBS.iter().enumerate(){
    assert!(verb.as_bytes().iter().all(|b|b.is_ascii_lowercase()));
    assert!(!COMMAND_VERBS[..i].contains(verb));
@@ -2145,5 +2177,78 @@ mod r065_durable_hex_patch_tests{
    b"patchhex /missing 0 ff",&mut out),Err(Error::Io(FsError::NotFound)));
   assert_eq!(fs.generation(),before);
   assert_eq!(out,[0xac;16]);
+ }
+}
+
+
+#[cfg(test)]
+mod r066_durable_multibyte_patch_tests{
+ use super::*;
+ use crate::block::{BlockError,SECTOR_BYTES};
+ struct Disk{sectors:[[u8;SECTOR_BYTES];100]}
+ impl BlockDevice for Disk{
+  fn sector_count(&self)->u64{100}
+  fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   *out=*self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?;Ok(())
+  }
+  fn write_sector(&mut self,lba:u64,bytes:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   *self.sectors.get_mut(lba as usize).ok_or(BlockError::OutOfRange)?=*bytes;Ok(())
+  }
+ }
+ fn actor()->Identity{Identity{pid:17,generation:6}}
+ fn setup()->(HierVfs<Disk>,Access<1>){
+  let mut fs=HierVfs::format_blank(Disk{sectors:[[0;SECTOR_BYTES];100]}).unwrap();
+  fs.create("/binary",&[0,1,2,3,4,255]).unwrap();
+  let mut auth=Access::new();
+  auth.grant(actor(),FILE_READ|FILE_WRITE,100).unwrap();
+  (fs,auth)
+ }
+ #[test]fn multi_byte_patch_commits_once_and_survives_block_remount(){
+  let (mut fs,auth)=setup();let initial=fs.generation();
+  let mut out=[0u8;16];
+  assert_eq!(command(&mut fs,&auth,actor(),1,
+   b"patchrange /binary 1 414200",&mut out),Ok(7));
+  assert_eq!(&out[..7],b"patched");
+  assert_eq!(fs.generation(),initial+1);
+  fs=HierVfs::mount(fs.into_device()).unwrap();
+  let mut bytes=[0u8;16];assert_eq!(fs.read("/binary",&mut bytes),Ok(6));
+  assert_eq!(&bytes[..6],&[0,65,66,0,4,255]);
+  assert_eq!(command(&mut fs,&auth,actor(),1,
+   b"patchrange /binary 1 414200",&mut out),Ok(9));
+  assert_eq!(&out[..9],b"unchanged");
+  assert_eq!(fs.generation(),initial+1);
+ }
+ #[test]fn malformed_hex_and_overrun_reject_without_mutating_any_bytes(){
+  let (mut fs,auth)=setup();let generation=fs.generation();
+  let mut out=[0xa5;16];
+  for bad in [
+   b"patchrange /binary 0 0".as_slice(),
+   b"patchrange /binary 0 zz",
+   b"patchrange /binary 1 010",
+   b"patchrange /binary 4 010203",
+   b"patchrange /binary -1 01",
+   b"patchrange /binary 0 0102 extra",
+   b"patchrange /../bad 0 01",
+  ]{
+   assert_eq!(command(&mut fs,&auth,actor(),1,bad,&mut out),
+    Err(Error::Invalid));
+  }
+  assert_eq!(command(&mut fs,&auth,actor(),1,
+   b"patchrange /missing 0 0102",&mut out),Err(Error::Io(FsError::NotFound)));
+  assert_eq!(fs.generation(),generation);assert_eq!(out,[0xa5;16]);
+ }
+ #[test]fn authorization_protected_path_and_short_output_fail_closed(){
+  let (mut fs,auth)=setup();let generation=fs.generation();
+  let mut short=[0xa7;4];
+  assert_eq!(command(&mut fs,&auth,actor(),1,
+    b"patchrange /binary 1 4142",&mut short),Err(Error::OutputTooSmall));
+  assert_eq!(short,[0xa7;4]);
+  let mut out=[0xa7;16];
+  assert_eq!(command(&mut fs,&auth,
+   Identity{generation:7,..actor()},1,
+    b"patchrange /binary 1 4142",&mut out),Err(Error::Denied));
+  assert_eq!(command(&mut fs,&auth,actor(),1,
+   b"patchrange /system/boot 0 4142",&mut out),Err(Error::Denied));
+  assert_eq!(fs.generation(),generation);assert_eq!(out,[0xa7;16]);
  }
 }

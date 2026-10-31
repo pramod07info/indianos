@@ -2101,3 +2101,80 @@ mod r065_master_stack_tests{
    &[(1,10),(2,20)],r(1270,0,50,20),50),Err(Error::Invalid));
  }
 }
+
+
+/// R066: rotate the geometry assigned to a set of authenticated developer
+/// panels. Useful for moving editor/Terminal/log panels between an existing
+/// master+stack layout without destroying window ownership. Every target
+/// is verified before any compositor-visible geometry/epoch is published.
+impl<const N:usize> SurfaceLayout<N>{
+ pub fn rotate_panels(&mut self,windows:&[(u32,u32)],
+    steps:usize)->Result<usize,Error>{
+  use crate::agent_05_surface_rect::Rectangle;
+  if windows.len()<2||windows.len()>N||steps==0{return Err(Error::Invalid);}
+  let zero=Rectangle{x:0,y:0,width:1,height:1};
+  let mut observed=[zero;N];
+  for (i,&(owner,window)) in windows.iter().enumerate(){
+   if windows[..i].iter().any(|&(_,previous)|previous==window){
+    return Err(Error::Duplicate);
+   }
+   observed[i]=self.geometry(owner,window)?;
+  }
+  let shift=steps%windows.len();
+  if shift==0{return Ok(windows.len());}
+  let mut updates=[(0u32,0u32,zero);N];
+  for (i,&(owner,window)) in windows.iter().enumerate(){
+   let from=(i+windows.len()-shift)%windows.len();
+   updates[i]=(owner,window,observed[from]);
+  }
+  self.set_geometry_batch(&updates[..windows.len()])
+ }
+}
+#[cfg(test)]
+mod r066_panel_rotation_tests{
+ use super::*;
+ use crate::agent_05_surface_rect::Rectangle;
+ fn r(x:u32,y:u32,w:u32,h:u32)->Rectangle{
+  Rectangle{x,y,width:w,height:h}
+ }
+ #[test]fn rotation_moves_three_authenticated_panels_as_one_transaction(){
+  let mut layout=SurfaceLayout::<3>::new();
+  layout.grant(1,10,r(0,0,60,100)).unwrap();
+  layout.grant(2,20,r(60,0,40,50)).unwrap();
+  layout.grant(3,30,r(60,50,40,50)).unwrap();
+  let before=layout.next_epoch;
+  assert_eq!(layout.rotate_panels(&[(1,10),(2,20),(3,30)],1),Ok(3));
+  assert_eq!(layout.geometry(1,10),Ok(r(60,50,40,50)));
+  assert_eq!(layout.geometry(2,20),Ok(r(0,0,60,100)));
+  assert_eq!(layout.geometry(3,30),Ok(r(60,0,40,50)));
+  assert_eq!(layout.next_epoch,before+3);
+  assert_eq!(layout.rotate_panels(&[(1,10),(2,20),(3,30)],3),Ok(3));
+  assert_eq!(layout.next_epoch,before+3);
+ }
+ #[test]fn foreign_owner_late_duplicate_and_unrecognized_window_roll_back(){
+  let mut layout=SurfaceLayout::<3>::new();
+  let original=r(10,10,40,40);
+  layout.grant(1,10,original).unwrap();
+  layout.grant(2,20,r(50,10,40,40)).unwrap();
+  let epoch=layout.next_epoch;
+  assert_eq!(layout.rotate_panels(&[(1,10),(99,20)],1),
+   Err(Error::Unauthorized));
+  assert_eq!(layout.rotate_panels(&[(1,10),(2,20),(2,20)],1),
+   Err(Error::Duplicate));
+  assert_eq!(layout.rotate_panels(&[(1,10),(2,999)],1),
+   Err(Error::Unauthorized));
+  assert_eq!(layout.rotate_panels(&[(1,10),(2,20)],0),
+   Err(Error::Invalid));
+  assert_eq!(layout.epoch(1,10),Some(1));
+  assert_eq!(layout.next_epoch,epoch);
+  assert_eq!(layout.geometry(1,10),Ok(original));
+ }
+ #[test]fn two_window_swap_wraps_steps_without_spurious_epochs(){
+  let mut layout=SurfaceLayout::<2>::new();
+  layout.grant(1,10,r(1,1,10,10)).unwrap();
+  layout.grant(2,20,r(20,1,20,10)).unwrap();
+  assert_eq!(layout.rotate_panels(&[(1,10),(2,20)],101),Ok(2));
+  assert_eq!(layout.geometry(1,10),Ok(r(20,1,20,10)));
+  assert_eq!(layout.geometry(2,20),Ok(r(1,1,10,10)));
+ }
+}
