@@ -1326,3 +1326,98 @@ mod r070_project_source_lines_tests {
         assert_eq!(fs.generation(), before);
     }
 }
+
+
+/// R071 read-only refactor preview. The exact same ASCII identifier
+/// boundaries as rename_source_identifier are used, including lexical
+/// matches in comments and string literals (not a language-aware rename).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RenamePreview {
+    pub matches: usize,
+    pub resulting_bytes: usize,
+}
+impl ProjectTree {
+    pub fn preview_source_identifier_rename<D: BlockDevice>(&self, caller: Identity,
+        fs: &mut HierVfs<D>, file: &str, old: &str, new: &str
+    ) -> Result<RenamePreview, Error> {
+        self.check_fresh(caller, fs)?;
+        fn valid(s: &str) -> bool {
+            let b = s.as_bytes();
+            !b.is_empty() && (b[0].is_ascii_alphabetic() || b[0] == b'_')
+                && b.iter().all(|c| c.is_ascii_alphanumeric() || *c == b'_')
+        }
+        fn word(b: u8) -> bool { b.is_ascii_alphanumeric() || b == b'_' }
+        if !valid(old) || !valid(new) { return Err(Error::Invalid); }
+        let (p, len) = self.child(file)?;
+        let mut data = [0u8; MAX_FILE_BYTES];
+        let size = fs.read(Self::str_path(&p, len), &mut data)?;
+        let text = core::str::from_utf8(&data[..size]).map_err(|_| Error::Invalid)?;
+        let (mut pos, mut matches, mut resulting_bytes) = (0usize, 0usize, size);
+        while pos < size {
+            let end = pos.checked_add(old.len()).ok_or(Error::Full)?;
+            if end <= size && text[pos..].starts_with(old)
+                && (pos == 0 || !word(data[pos-1]))
+                && (end == size || !word(data[end])) {
+                resulting_bytes = resulting_bytes.checked_sub(old.len())
+                    .and_then(|n| n.checked_add(new.len())).ok_or(Error::Full)?;
+                if resulting_bytes > MAX_FILE_BYTES { return Err(Error::Full); }
+                matches += 1;
+                pos = end;
+            } else {
+                pos += text[pos..].chars().next().ok_or(Error::Invalid)?.len_utf8();
+            }
+        }
+        Ok(RenamePreview { matches, resulting_bytes })
+    }
+}
+
+#[cfg(test)]
+mod r071_project_rename_preview_tests {
+    use super::*;
+    use crate::block::{BlockError, SECTOR_BYTES};
+    struct Disk { sectors: [[u8; SECTOR_BYTES]; 100] }
+    impl BlockDevice for Disk {
+        fn sector_count(&self) -> u64 { 100 }
+        fn read_sector(&mut self, lba: u64, out: &mut [u8; SECTOR_BYTES]) -> Result<(), BlockError> {
+            *out = *self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?; Ok(())
+        }
+        fn write_sector(&mut self, lba: u64, data: &[u8; SECTOR_BYTES]) -> Result<(), BlockError> {
+            *self.sectors.get_mut(lba as usize).ok_or(BlockError::OutOfRange)? = *data; Ok(())
+        }
+    }
+    fn id() -> Identity { Identity { pid: 7, generation: 4 } }
+    fn setup() -> (HierVfs<Disk>, ProjectTree) {
+        let mut fs = HierVfs::format_blank(Disk { sectors: [[0; SECTOR_BYTES]; 100] }).unwrap();
+        let mut project = ProjectTree::new();
+        project.create(id(), &mut fs, "demo").unwrap();
+        project.create_file(id(), &mut fs, "main", "foo foobar (foo)\nα_foo\n".as_bytes()).unwrap();
+        (fs, project)
+    }
+    #[test]
+    fn predicts_unicode_safe_real_durable_refactor_without_writing() {
+        let (mut fs, mut p) = setup();
+        let generation = fs.generation();
+        let preview = p.preview_source_identifier_rename(id(), &mut fs, "main",
+            "foo", "new_name").unwrap();
+        assert_eq!(preview.matches, 2);
+        assert_eq!(fs.generation(), generation);
+        assert_eq!(p.rename_source_identifier(id(), &mut fs, "main", "foo", "new_name"), Ok(2));
+        let mut disk = HierVfs::mount(fs.into_device()).unwrap();
+        let mut output = [0u8; 64];
+        let n = disk.read("/work/demo/main", &mut output).unwrap();
+        assert_eq!(n, preview.resulting_bytes);
+        assert_eq!(&output[..n], "new_name foobar (new_name)\nα_foo\n".as_bytes());
+    }
+    #[test]
+    fn bad_identifier_missing_match_and_recycled_identity_leave_disk_unchanged() {
+        let (mut fs, p) = setup();
+        let generation = fs.generation();
+        assert_eq!(p.preview_source_identifier_rename(id(), &mut fs,
+            "main", "missing", "new").unwrap().matches, 0);
+        assert_eq!(p.preview_source_identifier_rename(id(), &mut fs,
+            "main", "bad.name", "new"), Err(Error::Invalid));
+        assert_eq!(p.preview_source_identifier_rename(Identity { generation: 5, ..id() },
+            &mut fs, "main", "foo", "new"), Err(Error::Unauthorized));
+        assert_eq!(fs.generation(), generation);
+    }
+}
