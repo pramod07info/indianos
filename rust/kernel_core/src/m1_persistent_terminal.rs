@@ -19,7 +19,7 @@ pub const COMMAND_VERBS:&[&str]=&[
  "help","pwd","tools","ls","cat","write","append","mkdir","mv",
  "cp","rm","mkfile","truncate","head","count","rmdir","mvdir",
  "pread","pwrite","lines","line","hash","stat","tail","find","grep","cmp","diffat",
- "touch","copynew","replace","appendln","health","hex","slice",
+ "touch","copynew","replace","appendln","health","hex","slice","concat",
 ];
 /// Complete exactly one printable lower-case verb prefix. Ambiguous matches,
 /// empty prefixes and user-supplied paths never cause completion or I/O.
@@ -91,7 +91,7 @@ pub fn command<D:BlockDevice,const N:usize>(
  let line=entered.trim_end();
  if line=="help"{return publish(b"pwd ls /dir cat /path write /path text append /path text mkdir /dir mv /old /new cp /src /dst rm /path mkfile /path truncate /path head /path count rmdir /dir mvdir /old /new pread /file offset count pwrite /file@offset text",out);}
  if line=="pwd"{return publish(b"/",out);}
- if line=="tools"{return publish(b"count lines line tail find grep hash cmp diffat stat touch copynew replace appendln health",out);}
+ if line=="tools"{return publish(b"count lines line tail find grep hash cmp diffat stat touch copynew replace appendln health hex slice concat",out);}
  if line=="health"{
   auth.require(caller,FILE_READ,now).map_err(|_|Error::Denied)?;
   let health=fs.mounted_health().map_err(Error::Io)?;
@@ -298,6 +298,35 @@ pub fn command<D:BlockDevice,const N:usize>(
    if n==0{return Err(Error::Invalid);}
    fs.create(dst,&bytes[..n]).map_err(Error::Io)?;
    publish(b"copied",out)
+  }
+  // Merge two existing binary payloads into a NEW checksummed destination.
+  // Both input reads and all bounds checks complete before a COW create.
+  // A failing second read, oversized sum or protected target cannot leave
+  // a truncated destination. The source files are never modified.
+  "concat"=>{
+   auth.require(caller,FILE_READ|FILE_WRITE,now).map_err(|_|Error::Denied)?;
+   if out.len()<6{return Err(Error::OutputTooSmall);}
+   let mut args=raw.split_ascii_whitespace();
+   let a=args.next().ok_or(Error::Invalid)?;
+   let b=args.next().ok_or(Error::Invalid)?;
+   let target=args.next().ok_or(Error::Invalid)?;
+   if args.next().is_some(){return Err(Error::Invalid);}
+   let first=path(a,&mut name)?;
+   let mut second_name=[0u8;64];
+   let second=path(b,&mut second_name)?;
+   let mut target_name=[0u8;64];
+   let destination=path(target,&mut target_name)?;
+   if destination==first||destination==second{return Err(Error::Invalid);}
+   writable_path(destination)?;
+   let mut payload=[0u8;crate::durablefs::MAX_FILE_BYTES];
+   let first_size=fs.read(first,&mut payload).map_err(Error::Io)?;
+   let mut next=[0u8;crate::durablefs::MAX_FILE_BYTES];
+   let second_size=fs.read(second,&mut next).map_err(Error::Io)?;
+   let total=first_size.checked_add(second_size).ok_or(Error::Invalid)?;
+   if total>payload.len(){return Err(Error::Invalid);}
+   payload[first_size..total].copy_from_slice(&next[..second_size]);
+   fs.create(destination,&payload[..total]).map_err(Error::Io)?;
+   publish(b"joined",out)
   }
   "copynew"=>{
    auth.require(caller,FILE_READ|FILE_WRITE,now).map_err(|_|Error::Denied)?;
@@ -936,7 +965,7 @@ mod tests{
   assert_eq!(complete_verb(b"heal"),Some("health"));
  }
  #[test]fn r044_command_registry_drives_unique_safe_completion(){
-  assert_eq!(COMMAND_VERBS.len(),35);
+  assert_eq!(COMMAND_VERBS.len(),36);
   for (i,verb) in COMMAND_VERBS.iter().enumerate(){
    assert!(verb.as_bytes().iter().all(|b|b.is_ascii_lowercase()));
    assert!(!COMMAND_VERBS[..i].contains(verb));
@@ -945,6 +974,7 @@ mod tests{
   assert_eq!(complete_verb(b"copyne"),Some("copynew"));
   assert_eq!(complete_verb(b"hex"),Some("hex"));
   assert_eq!(complete_verb(b"slic"),Some("slice"));
+  assert_eq!(complete_verb(b"conc"),Some("concat"));
   assert_eq!(complete_verb(b"rmd"),Some("rmdir"));
   assert_eq!(complete_verb(b"app"),None);
   assert_eq!(complete_verb(b"pw"),None);
@@ -1725,5 +1755,82 @@ mod r061_persistent_slice_tests{
   }
   assert_eq!(fs.generation(),before);
   assert_eq!(out,[0x22;16]);
+ }
+}
+
+
+#[cfg(test)]
+mod r062_durable_concat_tests{
+ use super::*;
+ use crate::block::{BlockError,SECTOR_BYTES};
+ struct TestDisk{sectors:[[u8;SECTOR_BYTES];100]}
+ impl BlockDevice for TestDisk{
+  fn sector_count(&self)->u64{100}
+  fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   *out=*self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?;Ok(())
+  }
+  fn write_sector(&mut self,lba:u64,bytes:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   *self.sectors.get_mut(lba as usize).ok_or(BlockError::OutOfRange)?=*bytes;Ok(())
+  }
+ }
+ fn identity()->Identity{Identity{pid:7,generation:3}}
+ fn setup()->(HierVfs<TestDisk>,Access<1>){
+  let mut fs=HierVfs::format_blank(TestDisk{sectors:[[0;SECTOR_BYTES];100]}).unwrap();
+  fs.create("/first",b"alpha").unwrap();
+  fs.create("/second",&[0,0xff,b'Z']).unwrap();
+  let mut auth=Access::new();
+  auth.grant(identity(),FILE_READ|FILE_WRITE,100).unwrap();
+  (fs,auth)
+ }
+ #[test]fn binary_concat_is_one_durable_create_across_reboot(){
+  let (mut fs,auth)=setup();let start=fs.generation();
+  let mut output=[0;16];
+  assert_eq!(command(&mut fs,&auth,identity(),1,
+   b"concat /first /second /joined",&mut output),Ok(6));
+  assert_eq!(&output[..6],b"joined");
+  assert_eq!(fs.generation(),start+1);
+  fs=HierVfs::mount(fs.into_device()).unwrap();
+  let mut saved=[0;16];
+  assert_eq!(fs.read("/joined",&mut saved),Ok(8));
+  assert_eq!(&saved[..8],b"alpha\x00\xffZ");
+  assert_eq!(fs.read("/first",&mut saved),Ok(5));
+  assert_eq!(&saved[..5],b"alpha");
+ }
+ #[test]fn short_response_existing_destination_and_stale_owner_preserve_disk(){
+  let (mut fs,auth)=setup();
+  fs.create("/joined",b"keep").unwrap();
+  let start=fs.generation();
+  let mut out=[0x6au8;5];
+  assert_eq!(command(&mut fs,&auth,identity(),1,
+   b"concat /first /second /new",&mut out),Err(Error::OutputTooSmall));
+  assert_eq!(out,[0x6a;5]);
+  let mut long=[0u8;16];
+  assert_eq!(command(&mut fs,&auth,identity(),1,
+   b"concat /first /second /joined",&mut long),
+   Err(Error::Io(FsError::Exists)));
+  assert_eq!(command(&mut fs,&auth,
+   Identity{generation:4,..identity()},1,
+   b"concat /first /second /new",&mut long),Err(Error::Denied));
+  assert_eq!(fs.generation(),start);
+  let mut kept=[0u8;8];assert_eq!(fs.read("/joined",&mut kept),Ok(4));
+  assert_eq!(&kept[..4],b"keep");
+ }
+ #[test]fn bad_source_missing_input_and_reserved_target_are_fail_closed(){
+  let (mut fs,auth)=setup();let start=fs.generation();
+  let mut out=[0x33;16];
+  for invalid in [
+    b"concat /first /second /first".as_slice(),
+    b"concat /first /second /../bad",
+    b"concat /first /second",
+    b"concat /first /second /new extra"
+  ]{
+   assert_eq!(command(&mut fs,&auth,identity(),1,invalid,&mut out),
+     Err(Error::Invalid));
+  }
+  assert_eq!(command(&mut fs,&auth,identity(),1,
+   b"concat /first /missing /new",&mut out),
+   Err(Error::Io(FsError::NotFound)));
+  assert_eq!(fs.generation(),start);
+  assert_eq!(out,[0x33;16]);
  }
 }

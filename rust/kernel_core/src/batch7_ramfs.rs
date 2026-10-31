@@ -724,3 +724,87 @@ mod r061_mixed_transaction_tests{
   assert_eq!(&out[..4],b"safe");
  }
 }
+
+
+/// R062: Copy multiple authenticated source files into new RAM file names
+/// in one optimistic transaction. A late capacity error, source revision
+/// mismatch, duplicate destination or invalid path publishes NOTHING.
+/// The calling service must check READ source and WRITE destination grants.
+impl<const N:usize> RamFs<N>{
+ pub fn copy_batch_if_revision(&mut self,expected_global:u64,
+  requests:&[(&[u8],&[u8],u64)])->Result<u64,Error>{
+  if requests.is_empty()||requests.len()>N||
+      requests.len()>16||self.version!=expected_global{
+   return Err(Error::Invalid);
+  }
+  let mut staged=Self{files:self.files,version:self.version};
+  for (i,&(from,to,version)) in requests.iter().enumerate(){
+   if requests[..i].iter().any(|&(_,previous,_)|previous==to){
+    return Err(Error::Invalid);
+   }
+   if !Self::valid_path(from)||!Self::valid_path(to)||from==to{
+    return Err(Error::Invalid);
+   }
+   let slot=staged.lookup(from).ok_or(Error::NotFound)?;
+   let file=staged.files[slot].ok_or(Error::NotFound)?;
+   if version==0||file.version!=version{return Err(Error::Invalid);}
+   staged.copy_new(from,to)?;
+  }
+  *self=staged;
+  Ok(self.version)
+ }
+}
+#[cfg(test)]
+mod r062_atomic_copy_tests{
+ use super::*;
+ #[test]fn distinct_sources_copy_data_and_versions_in_single_batch(){
+  let mut fs=RamFs::<4>::new();
+  let a=fs.replace(b"/a",b"alpha").unwrap();
+  let b=fs.replace(b"/b",b"beta").unwrap();
+  let start=fs.version();
+  assert_eq!(fs.copy_batch_if_revision(start,&[
+    (b"/a",b"/a-copy",a),(b"/b",b"/b-copy",b)
+  ]),Ok(start+2));
+  assert_eq!(fs.count(),4);
+  let mut out=[0u8;16];
+  assert_eq!(fs.read(b"/a-copy",0,&mut out),Ok(5));
+  assert_eq!(&out[..5],b"alpha");
+  assert_eq!(fs.read(b"/b-copy",0,&mut out),Ok(4));
+  assert_eq!(&out[..4],b"beta");
+  assert_eq!(fs.metadata(b"/a-copy").unwrap().0,start+1);
+  assert_eq!(fs.metadata(b"/b-copy").unwrap().0,start+2);
+ }
+ #[test]fn late_collision_duplicate_target_and_stale_file_roll_back_first_copy(){
+  let mut fs=RamFs::<4>::new();
+  let a=fs.replace(b"/a",b"keep").unwrap();
+  let b=fs.replace(b"/b",b"peer").unwrap();
+  let rev=fs.version();
+  for requests in [
+   [(b"/a".as_slice(),b"/new".as_slice(),a),(b"/b",b"/a",b)],
+   [(b"/a",b"/new",a),(b"/b",b"/new",b)],
+   [(b"/a",b"/new",a),(b"/b",b"/other",b+1)],
+  ]{
+   assert_eq!(fs.copy_batch_if_revision(rev,&requests),Err(Error::Invalid));
+   assert_eq!(fs.version(),rev);assert_eq!(fs.count(),2);
+   assert_eq!(fs.metadata(b"/new"),Err(Error::NotFound));
+  }
+ }
+ #[test]fn capacity_and_invalid_paths_do_not_publish_staged_copies(){
+  let mut fs=RamFs::<3>::new();
+  let a=fs.replace(b"/a",b"one").unwrap();
+  let b=fs.replace(b"/b",b"two").unwrap();
+  let rev=fs.version();
+  assert_eq!(fs.copy_batch_if_revision(rev,&[
+    (b"/a",b"/one",a),(b"/b",b"/two",b)
+  ]),Err(Error::Full));
+  assert_eq!(fs.copy_batch_if_revision(rev,&[
+    (b"/a",b"/one",a),(b"/b",b"/../escape",b)
+  ]),Err(Error::Invalid));
+  assert_eq!(fs.copy_batch_if_revision(rev+1,&[
+    (b"/a",b"/one",a)
+  ]),Err(Error::Invalid));
+  assert_eq!(fs.version(),rev);assert_eq!(fs.count(),2);
+  let mut out=[0u8;8];fs.read(b"/a",0,&mut out).unwrap();
+  assert_eq!(&out[..3],b"one");
+ }
+}
