@@ -19,7 +19,7 @@ pub const COMMAND_VERBS:&[&str]=&[
  "help","pwd","tools","ls","cat","write","append","mkdir","mv",
  "cp","rm","mkfile","truncate","head","count","rmdir","mvdir",
  "pread","pwrite","lines","line","hash","stat","tail","find","grep","cmp","diffat",
- "touch","copynew","replace","appendln","health","hex","slice","concat",
+ "touch","copynew","replace","appendln","health","hex","slice","concat","cmprange",
 ];
 /// Complete exactly one printable lower-case verb prefix. Ambiguous matches,
 /// empty prefixes and user-supplied paths never cause completion or I/O.
@@ -91,7 +91,7 @@ pub fn command<D:BlockDevice,const N:usize>(
  let line=entered.trim_end();
  if line=="help"{return publish(b"pwd ls /dir cat /path write /path text append /path text mkdir /dir mv /old /new cp /src /dst rm /path mkfile /path truncate /path head /path count rmdir /dir mvdir /old /new pread /file offset count pwrite /file@offset text",out);}
  if line=="pwd"{return publish(b"/",out);}
- if line=="tools"{return publish(b"count lines line tail find grep hash cmp diffat stat touch copynew replace appendln health hex slice concat",out);}
+ if line=="tools"{return publish(b"count lines line tail find grep hash cmp diffat stat touch copynew replace appendln health hex slice concat cmprange",out);}
  if line=="health"{
   auth.require(caller,FILE_READ,now).map_err(|_|Error::Denied)?;
   let health=fs.mounted_health().map_err(Error::Io)?;
@@ -327,6 +327,36 @@ pub fn command<D:BlockDevice,const N:usize>(
    payload[first_size..total].copy_from_slice(&next[..second_size]);
    fs.create(destination,&payload[..total]).map_err(Error::Io)?;
    publish(b"joined",out)
+  }
+  // Compare bounded ranges from two mounted durable files. This read-only
+  // diagnostic rejects missing/partial ranges, unauthorized identity,
+  // malformed offsets and short outputs before touching caller bytes.
+  "cmprange"=>{
+   auth.require(caller,FILE_READ,now).map_err(|_|Error::Denied)?;
+   let mut args=raw.split_ascii_whitespace();
+   let left=args.next().ok_or(Error::Invalid)?;
+   let left_offset=args.next().ok_or(Error::Invalid)?
+    .parse::<u64>().map_err(|_|Error::Invalid)?;
+   let right=args.next().ok_or(Error::Invalid)?;
+   let right_offset=args.next().ok_or(Error::Invalid)?
+    .parse::<u64>().map_err(|_|Error::Invalid)?;
+   let count=args.next().ok_or(Error::Invalid)?
+    .parse::<usize>().map_err(|_|Error::Invalid)?;
+   if args.next().is_some()||count==0||count>MAX_TRANSFER{
+    return Err(Error::Invalid);
+   }
+   if out.len()<9{return Err(Error::OutputTooSmall);}
+   let left=path(left,&mut name)?;
+   let mut peer=[0u8;64];
+   let right=path(right,&mut peer)?;
+   let mut first=[0u8;MAX_TRANSFER];
+   let mut second=[0u8;MAX_TRANSFER];
+   let n=fs.read_at(left,left_offset,&mut first[..count]).map_err(Error::Io)?;
+   let m=fs.read_at(right,right_offset,&mut second[..count]).map_err(Error::Io)?;
+   if n!=count||m!=count{return Err(Error::Invalid);}
+   publish(if first[..count]==second[..count]{
+    b"equal"
+   }else{b"different"},out)
   }
   "copynew"=>{
    auth.require(caller,FILE_READ|FILE_WRITE,now).map_err(|_|Error::Denied)?;
@@ -965,7 +995,7 @@ mod tests{
   assert_eq!(complete_verb(b"heal"),Some("health"));
  }
  #[test]fn r044_command_registry_drives_unique_safe_completion(){
-  assert_eq!(COMMAND_VERBS.len(),36);
+  assert_eq!(COMMAND_VERBS.len(),37);
   for (i,verb) in COMMAND_VERBS.iter().enumerate(){
    assert!(verb.as_bytes().iter().all(|b|b.is_ascii_lowercase()));
    assert!(!COMMAND_VERBS[..i].contains(verb));
@@ -975,6 +1005,7 @@ mod tests{
   assert_eq!(complete_verb(b"hex"),Some("hex"));
   assert_eq!(complete_verb(b"slic"),Some("slice"));
   assert_eq!(complete_verb(b"conc"),Some("concat"));
+  assert_eq!(complete_verb(b"cmpr"),Some("cmprange"));
   assert_eq!(complete_verb(b"rmd"),Some("rmdir"));
   assert_eq!(complete_verb(b"app"),None);
   assert_eq!(complete_verb(b"pw"),None);
@@ -1832,5 +1863,78 @@ mod r062_durable_concat_tests{
    Err(Error::Io(FsError::NotFound)));
   assert_eq!(fs.generation(),start);
   assert_eq!(out,[0x33;16]);
+ }
+}
+
+
+#[cfg(test)]
+mod r063_range_comparison_tests{
+ use super::*;
+ use crate::block::{BlockError,SECTOR_BYTES};
+ struct Disk{sectors:[[u8;SECTOR_BYTES];100]}
+ impl BlockDevice for Disk{
+  fn sector_count(&self)->u64{100}
+  fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   *out=*self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?;Ok(())
+  }
+  fn write_sector(&mut self,lba:u64,bytes:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   *self.sectors.get_mut(lba as usize).ok_or(BlockError::OutOfRange)?=*bytes;Ok(())
+  }
+ }
+ fn caller()->Identity{Identity{pid:8,generation:7}}
+ fn mounted()->(HierVfs<Disk>,Access<1>){
+  let mut fs=HierVfs::format_blank(Disk{sectors:[[0;SECTOR_BYTES];100]}).unwrap();
+  fs.create("/left",b"hello-world").unwrap();
+  fs.create("/right",b"XXhello-YY").unwrap();
+  let mut auth=Access::new();
+  auth.grant(caller(),FILE_READ,100).unwrap();
+  (fs,auth)
+ }
+ #[test]fn real_durable_byte_ranges_compare_identical_and_different_contents(){
+  let (mut fs,auth)=mounted();let generation=fs.generation();
+  let mut out=[0u8;24];
+  assert_eq!(command(&mut fs,&auth,caller(),1,
+    b"cmprange /left 0 /right 2 6",&mut out),Ok(5));
+  assert_eq!(&out[..5],b"equal");
+  assert_eq!(command(&mut fs,&auth,caller(),1,
+    b"cmprange /left 5 /right 2 4",&mut out),Ok(9));
+  assert_eq!(&out[..9],b"different");
+  fs=HierVfs::mount(fs.into_device()).unwrap();
+  assert_eq!(command(&mut fs,&auth,caller(),1,
+    b"cmprange /left 0 /right 2 6",&mut out),Ok(5));
+  assert_eq!(fs.generation(),generation);
+ }
+ #[test]fn short_response_and_stale_owner_never_publish_partial_comparison(){
+  let (mut fs,auth)=mounted();let generation=fs.generation();
+  let mut short=[0xa5;4];
+  assert_eq!(command(&mut fs,&auth,caller(),1,
+    b"cmprange /left 0 /right 2 6",&mut short),
+    Err(Error::OutputTooSmall));
+  assert_eq!(short,[0xa5;4]);
+  let stale=Identity{generation:9,..caller()};
+  let mut long=[0u8;24];
+  assert_eq!(command(&mut fs,&auth,stale,1,
+    b"cmprange /left 0 /right 2 6",&mut long),Err(Error::Denied));
+  assert_eq!(fs.generation(),generation);
+ }
+ #[test]fn invalid_missing_overrun_and_traversal_ranges_are_rejected(){
+  let (mut fs,auth)=mounted();let generation=fs.generation();
+  let mut out=[0xa5;24];
+  for bad in [
+    b"cmprange /left 0 /right 2 0".as_slice(),
+    b"cmprange /left 0 /right 2 999999",
+    b"cmprange /left -1 /right 2 4",
+    b"cmprange /left 0 /../right 2 4",
+    b"cmprange /left 0 /right 2 4 extra",
+  ]{
+   assert_eq!(command(&mut fs,&auth,caller(),1,bad,&mut out),Err(Error::Invalid));
+  }
+  assert_eq!(command(&mut fs,&auth,caller(),1,
+    b"cmprange /left 10 /right 2 6",&mut out),Err(Error::Invalid));
+  assert_eq!(command(&mut fs,&auth,caller(),1,
+    b"cmprange /left 0 /missing 0 3",&mut out),
+    Err(Error::Io(FsError::NotFound)));
+  assert_eq!(out,[0xa5;24]);
+  assert_eq!(fs.generation(),generation);
  }
 }

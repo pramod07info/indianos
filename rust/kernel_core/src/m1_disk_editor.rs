@@ -872,3 +872,120 @@ mod r062_source_line_deletion_tests{
   assert!(!e.status(actor()).unwrap().dirty);
  }
 }
+
+
+/// R063: insert a new UTF-8 source row before a 1-based existing row or
+/// immediately after the final row. A source row must not contain a newline,
+/// CR or NUL. The edit is ONE undoable transaction and remains unsaved until
+/// an authorized COW save. Nonempty final rows gain the required separator.
+impl DiskEditor{
+ pub fn insert_source_line(&mut self,caller:Identity,line:usize,
+    content:&str)->Result<usize,Error>{
+  self.authorize(caller)?;
+  if line==0||content.bytes().any(|b|b==b'\n'||b==b'\r'||b==0){
+   return Err(Error::Invalid);
+  }
+  let text=core::str::from_utf8(&self.data[..self.used])
+     .map_err(|_|Error::Invalid)?;
+  let total=text.split_terminator('\n').count();
+  if line>total.checked_add(1).ok_or(Error::Full)?{
+   return Err(Error::Invalid);
+  }
+  // Preflight capacity BEFORE touching the fixed-size scratch buffer.
+  let separator=usize::from(self.used!=0);
+  let addition=content.len().checked_add(separator).ok_or(Error::Full)?;
+  if self.used.checked_add(addition).is_none_or(|n|n>MAX_FILE_BYTES){
+   return Err(Error::Full);
+  }
+  let mut prefix=[0u8;MAX_FILE_BYTES];
+  let (offset,len)=if line<=total{
+   let mut pos=0usize;
+   for (index,row) in text.split_terminator('\n').enumerate(){
+    if index+1==line{break;}
+    pos=pos.checked_add(row.len()+1).ok_or(Error::Full)?;
+   }
+   prefix[..content.len()].copy_from_slice(content.as_bytes());
+   prefix[content.len()]=b'\n';
+   (pos,content.len()+1)
+  }else if self.used==0{
+   prefix[..content.len()].copy_from_slice(content.as_bytes());
+   (0,content.len())
+  }else if self.data[self.used-1]==b'\n'{
+   prefix[..content.len()].copy_from_slice(content.as_bytes());
+   prefix[content.len()]=b'\n';
+   (self.used,content.len()+1)
+  }else{
+   prefix[0]=b'\n';
+   prefix[1..content.len()+1].copy_from_slice(content.as_bytes());
+   (self.used,content.len()+1)
+  };
+  self.replace(caller,offset,offset,&prefix[..len])
+ }
+}
+#[cfg(test)]
+mod r063_source_line_insert_tests{
+ use super::*;
+ use crate::block::{BlockError,SECTOR_BYTES};
+ struct Disk{data:[[u8;SECTOR_BYTES];100]}
+ impl BlockDevice for Disk{
+  fn sector_count(&self)->u64{100}
+  fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   *out=*self.data.get(lba as usize).ok_or(BlockError::OutOfRange)?;Ok(())
+  }
+  fn write_sector(&mut self,lba:u64,bytes:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   *self.data.get_mut(lba as usize).ok_or(BlockError::OutOfRange)?=*bytes;Ok(())
+  }
+ }
+ fn actor()->Identity{Identity{pid:9,generation:5}}
+ fn newfs()->HierVfs<Disk>{
+  let mut fs=HierVfs::format_blank(Disk{data:[[0;SECTOR_BYTES];100]}).unwrap();
+  fs.create("/code","α\nγ".as_bytes()).unwrap();
+  fs.create("/empty",b"").unwrap();
+  fs.create("/lines",b"a\n").unwrap();fs
+ }
+ #[test]fn insert_unicode_line_is_single_undo_and_survives_disk_remount(){
+  let mut fs=newfs();let mut editor=DiskEditor::new();
+  editor.open(actor(),&mut fs,"/code").unwrap();
+  assert_eq!(editor.insert_source_line(actor(),2,"β"),Ok(8));
+  let mut data=[0u8;32];
+  assert_eq!(editor.read(actor(),&mut data),Ok(8));
+  assert_eq!(&data[..8],"α\nβ\nγ".as_bytes());
+  assert_eq!(editor.undo(actor()),Ok(5));
+  assert_eq!(editor.redo(actor()),Ok(8));
+  editor.save(actor(),&mut fs).unwrap();
+  let mut mounted=HierVfs::mount(fs.into_device()).unwrap();
+  assert_eq!(mounted.read("/code",&mut data),Ok(8));
+  assert_eq!(&data[..8],"α\nβ\nγ".as_bytes());
+ }
+ #[test]fn append_last_source_row_and_insert_into_empty_buffer(){
+  let mut fs=newfs();let mut editor=DiskEditor::new();
+  editor.open(actor(),&mut fs,"/code").unwrap();
+  assert_eq!(editor.insert_source_line(actor(),3,"ω"),Ok(8));
+  let mut output=[0u8;32];editor.read(actor(),&mut output).unwrap();
+  assert_eq!(&output[..8],"α\nγ\nω".as_bytes());
+  editor.close(actor(),true).unwrap();
+  editor.open(actor(),&mut fs,"/empty").unwrap();
+  assert_eq!(editor.insert_source_line(actor(),1,"first"),Ok(5));
+  editor.close(actor(),true).unwrap();
+  editor.open(actor(),&mut fs,"/lines").unwrap();
+  assert_eq!(editor.insert_source_line(actor(),2,"b"),Ok(4));
+  editor.read(actor(),&mut output).unwrap();
+  assert_eq!(&output[..4],b"a\nb\n");
+ }
+ #[test]fn invalid_index_control_payload_and_stale_owner_do_not_edit(){
+  let mut fs=newfs();let mut editor=DiskEditor::new();
+  editor.open(actor(),&mut fs,"/code").unwrap();
+  assert_eq!(editor.insert_source_line(actor(),0,"x"),Err(Error::Invalid));
+  assert_eq!(editor.insert_source_line(actor(),4,"x"),Err(Error::Invalid));
+  assert_eq!(editor.insert_source_line(actor(),2,"x\nbad"),Err(Error::Invalid));
+  assert_eq!(editor.insert_source_line(actor(),2,"x\r"),Err(Error::Invalid));
+  let huge=[b'x';MAX_FILE_BYTES+1];
+  let huge=core::str::from_utf8(&huge).unwrap();
+  assert_eq!(editor.insert_source_line(actor(),2,huge),Err(Error::Full));
+  assert_eq!(editor.insert_source_line(
+   Identity{generation:6,..actor()},2,"bad"),Err(Error::Unauthorized));
+  assert!(!editor.status(actor()).unwrap().dirty);
+  let mut output=[0u8;20];editor.read(actor(),&mut output).unwrap();
+  assert_eq!(&output[..5],"α\nγ".as_bytes());
+ }
+}

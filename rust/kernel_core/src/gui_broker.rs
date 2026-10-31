@@ -1854,3 +1854,79 @@ mod r062_cascade_layout_tests{
   assert_eq!(layout.geometry(2,20),Ok(original));
  }
 }
+
+
+/// R063: add a visible gutter/inset around each tile without applying
+/// an intermediate layout. The temporary grid validates owner, window,
+/// screen and geometry; inset preflight then publishes each final rectangle
+/// with one atomic epoch update. This avoids flicker and partial redraws.
+impl<const N:usize> SurfaceLayout<N>{
+ pub fn tile_grid_inset(&mut self,windows:&[(u32,u32)],
+    columns:usize,area:crate::agent_05_surface_rect::Rectangle,
+    inset:u32)->Result<usize,Error>{
+  use crate::agent_05_surface_rect::Rectangle;
+  if inset==0{return self.tile_grid(windows,columns,area);}
+  let pad=inset.checked_mul(2).ok_or(Error::Invalid)?;
+  let mut staged=Self{surfaces:self.surfaces,epochs:self.epochs,
+    next_epoch:self.next_epoch};
+  staged.tile_grid(windows,columns,area)?;
+  let zero=Rectangle{x:0,y:0,width:1,height:1};
+  let mut requests=[(0u32,0u32,zero);N];
+  for (i,&(owner,window)) in windows.iter().enumerate(){
+   let r=staged.geometry(owner,window)?;
+   if r.width<=pad||r.height<=pad{return Err(Error::Invalid);}
+   requests[i]=(owner,window,Rectangle{
+    x:r.x.checked_add(inset).ok_or(Error::Invalid)?,
+    y:r.y.checked_add(inset).ok_or(Error::Invalid)?,
+    width:r.width-pad,height:r.height-pad
+   });
+  }
+  self.set_geometry_batch(&requests[..windows.len()])
+ }
+}
+#[cfg(test)]
+mod r063_padded_grid_tests{
+ use super::*;
+ use crate::agent_05_surface_rect::Rectangle;
+ fn r(x:u32,y:u32,w:u32,h:u32)->Rectangle{
+  Rectangle{x,y,width:w,height:h}
+ }
+ #[test]fn padded_three_window_grid_is_exact_and_single_epoch_commit(){
+  let mut layout=SurfaceLayout::<3>::new();
+  for (owner,window) in [(1,10),(2,20),(3,30)]{
+   layout.grant(owner,window,r(0,0,20,20)).unwrap();
+  }
+  // Initial grants already consumed 3 epochs. One atomic layout
+  // transaction assigns a DISTINCT next epoch to EACH changed window.
+  let before=layout.next_epoch;
+  assert_eq!(layout.tile_grid_inset(
+    &[(1,10),(2,20),(3,30)],2,r(20,30,101,81),3),Ok(3));
+  assert_eq!(layout.geometry(1,10),Ok(r(23,33,45,35)));
+  assert_eq!(layout.geometry(2,20),Ok(r(74,33,44,35)));
+  assert_eq!(layout.geometry(3,30),Ok(r(23,74,45,34)));
+  assert_eq!(layout.epoch(1,10),Some(before+1));
+  assert_eq!(layout.epoch(2,20),Some(before+2));
+  assert_eq!(layout.epoch(3,30),Some(before+3));
+  assert_eq!(layout.next_epoch,before+3);
+  // Repeating an unchanged geometry layout must not consume epochs.
+  assert_eq!(layout.tile_grid_inset(
+    &[(1,10),(2,20),(3,30)],2,r(20,30,101,81),3),Ok(3));
+  assert_eq!(layout.next_epoch,before+3);
+ }
+ #[test]fn excessive_inset_and_late_unauthorized_owner_are_atomic(){
+  let mut layout=SurfaceLayout::<2>::new();
+  let old=r(5,5,20,20);
+  layout.grant(1,10,old).unwrap();
+  layout.grant(2,20,old).unwrap();
+  let epoch=layout.epoch(1,10);
+  assert_eq!(layout.tile_grid_inset(
+    &[(1,10),(2,20)],2,r(0,0,20,20),5),Err(Error::Invalid));
+  assert_eq!(layout.tile_grid_inset(
+    &[(1,10),(9,20)],2,r(0,0,100,100),1),Err(Error::Unauthorized));
+  assert_eq!(layout.tile_grid_inset(
+    &[(1,10),(1,10)],2,r(0,0,100,100),1),Err(Error::Duplicate));
+  assert_eq!(layout.geometry(1,10),Ok(old));
+  assert_eq!(layout.geometry(2,20),Ok(old));
+  assert_eq!(layout.epoch(1,10),epoch);
+ }
+}
