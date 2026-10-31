@@ -19,7 +19,7 @@ pub const COMMAND_VERBS:&[&str]=&[
  "help","pwd","tools","ls","cat","write","append","mkdir","mv",
  "cp","rm","mkfile","truncate","head","count","rmdir","mvdir",
  "pread","pwrite","lines","line","hash","stat","tail","find","grep","cmp","diffat",
- "touch","copynew","replace","appendln","health","hex","slice","concat","cmprange","bytefreq","patchhex","patchrange",
+ "touch","copynew","replace","appendln","health","hex","slice","concat","cmprange","bytefreq","patchhex","patchrange","copylines",
 ];
 /// Complete exactly one printable lower-case verb prefix. Ambiguous matches,
 /// empty prefixes and user-supplied paths never cause completion or I/O.
@@ -91,7 +91,7 @@ pub fn command<D:BlockDevice,const N:usize>(
  let line=entered.trim_end();
  if line=="help"{return publish(b"pwd ls /dir cat /path write /path text append /path text mkdir /dir mv /old /new cp /src /dst rm /path mkfile /path truncate /path head /path count rmdir /dir mvdir /old /new pread /file offset count pwrite /file@offset text",out);}
  if line=="pwd"{return publish(b"/",out);}
- if line=="tools"{return publish(b"count lines line tail find grep hash cmp diffat stat touch copynew replace appendln health hex slice concat cmprange bytefreq patchhex patchrange",out);}
+ if line=="tools"{return publish(b"count lines line tail find grep hash cmp diffat stat touch copynew replace appendln health hex slice concat cmprange bytefreq patchhex patchrange copylines",out);}
  if line=="health"{
   auth.require(caller,FILE_READ,now).map_err(|_|Error::Denied)?;
   let health=fs.mounted_health().map_err(Error::Io)?;
@@ -441,6 +441,39 @@ pub fn command<D:BlockDevice,const N:usize>(
    contents[at..end].copy_from_slice(&patch[..count]);
    fs.overwrite(path,&contents[..size]).map_err(Error::Io)?;
    publish(b"patched",out)
+  }
+  // Durable UTF-8 line snippet extraction into a NEW COW file; source
+  // remains unchanged and a pre-existing destination cannot be overwritten.
+  "copylines"=>{
+   auth.require(caller,FILE_READ|FILE_WRITE,now).map_err(|_|Error::Denied)?;
+   if out.len()<6{return Err(Error::OutputTooSmall);}
+   let mut args=raw.split_ascii_whitespace();
+   let source=args.next().ok_or(Error::Invalid)?;
+   let first=args.next().ok_or(Error::Invalid)?
+      .parse::<usize>().map_err(|_|Error::Invalid)?;
+   let count=args.next().ok_or(Error::Invalid)?
+      .parse::<usize>().map_err(|_|Error::Invalid)?;
+   let target=args.next().ok_or(Error::Invalid)?;
+   if args.next().is_some()||first==0||count==0{return Err(Error::Invalid);}
+   let last=first.checked_add(count-1).ok_or(Error::Invalid)?;
+   let a=path(source,&mut name)?;
+   let mut destination=[0u8;64];
+   let b=path(target,&mut destination)?;
+   if a==b{return Err(Error::Invalid);}
+   writable_path(b)?;
+   let mut bytes=[0u8;crate::durablefs::MAX_FILE_BYTES];
+   let n=fs.read(a,&mut bytes).map_err(Error::Io)?;
+   let text=core::str::from_utf8(&bytes[..n]).map_err(|_|Error::Invalid)?;
+   let mut start=None;let mut end=None;let mut cursor=0usize;
+   for (i,row) in text.split_inclusive('\n').enumerate(){
+    let line=i+1;
+    if line==first{start=Some(cursor);}
+    cursor+=row.len();
+    if line==last{end=Some(cursor);break;}
+   }
+   let (Some(start),Some(end))=(start,end)else{return Err(Error::Invalid)};
+   fs.create(b,&bytes[start..end]).map_err(Error::Io)?;
+   publish(b"copied",out)
   }
   "copynew"=>{
    auth.require(caller,FILE_READ|FILE_WRITE,now).map_err(|_|Error::Denied)?;
@@ -1079,7 +1112,7 @@ mod tests{
   assert_eq!(complete_verb(b"heal"),Some("health"));
  }
  #[test]fn r044_command_registry_drives_unique_safe_completion(){
-  assert_eq!(COMMAND_VERBS.len(),40);
+  assert_eq!(COMMAND_VERBS.len(),41);
   for (i,verb) in COMMAND_VERBS.iter().enumerate(){
    assert!(verb.as_bytes().iter().all(|b|b.is_ascii_lowercase()));
    assert!(!COMMAND_VERBS[..i].contains(verb));
@@ -2250,5 +2283,71 @@ mod r066_durable_multibyte_patch_tests{
   assert_eq!(command(&mut fs,&auth,actor(),1,
    b"patchrange /system/boot 0 4142",&mut out),Err(Error::Denied));
   assert_eq!(fs.generation(),generation);assert_eq!(out,[0xa7;16]);
+ }
+}
+
+
+#[cfg(test)]
+mod r067_terminal_copylines_tests{
+ use super::*;
+ use crate::block::{BlockError,SECTOR_BYTES};
+ struct Disk{data:[[u8;SECTOR_BYTES];100]}
+ impl BlockDevice for Disk{
+  fn sector_count(&self)->u64{100}
+  fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   *out=*self.data.get(lba as usize).ok_or(BlockError::OutOfRange)?;Ok(())
+  }
+  fn write_sector(&mut self,lba:u64,data:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   *self.data.get_mut(lba as usize).ok_or(BlockError::OutOfRange)?=*data;Ok(())
+  }
+ }
+ fn id()->Identity{Identity{pid:4,generation:9}}
+ fn mounted()->(HierVfs<Disk>,Access<1>){
+  let mut fs=HierVfs::format_blank(Disk{data:[[0;SECTOR_BYTES];100]}).unwrap();
+  fs.create("/source","α\nβ\nend".as_bytes()).unwrap();
+  let mut access=Access::new();
+  access.grant(id(),FILE_READ|FILE_WRITE,100).unwrap();
+  (fs,access)
+ }
+ #[test]fn copy_complete_source_lines_to_real_durable_file(){
+  let (mut fs,auth)=mounted();let before=fs.generation();
+  let mut out=[0u8;20];
+  assert_eq!(command(&mut fs,&auth,id(),1,
+    b"copylines /source 2 2 /sample",&mut out),Ok(6));
+  assert_eq!(&out[..6],b"copied");
+  assert_eq!(fs.generation(),before+1);
+  let mut fs=HierVfs::mount(fs.into_device()).unwrap();
+  let mut bytes=[0;20];
+  assert_eq!(fs.read("/sample",&mut bytes),Ok(6));
+  assert_eq!(&bytes[..6],"β\nend".as_bytes());
+  assert_eq!(fs.read("/source",&mut bytes),Ok(9));
+ }
+ #[test]fn invalid_rows_existing_destination_and_small_output_never_write(){
+  let (mut fs,auth)=mounted();fs.create("/old",b"safe").unwrap();
+  let gen=fs.generation();let mut short=[0xa5;5];
+  assert_eq!(command(&mut fs,&auth,id(),1,
+    b"copylines /source 1 1 /dest",&mut short),
+    Err(Error::OutputTooSmall));
+  assert_eq!(short,[0xa5;5]);
+  let mut out=[0u8;16];
+  for input in [b"copylines /source 0 1 /new".as_slice(),
+      b"copylines /source 2 8 /new",
+      b"copylines /source 1 1 /../bad",
+      b"copylines /source 1 1 /source"]{
+   assert_eq!(command(&mut fs,&auth,id(),1,input,&mut out),
+     Err(Error::Invalid));
+  }
+  assert_eq!(command(&mut fs,&auth,id(),1,
+    b"copylines /source 1 1 /old",&mut out),
+    Err(Error::Io(FsError::Exists)));
+  assert_eq!(fs.generation(),gen);
+ }
+ #[test]fn stale_identity_cannot_extract_source_to_new_file(){
+  let (mut fs,auth)=mounted();let gen=fs.generation();
+  let other=Identity{generation:10,..id()};
+  let mut out=[0xa7;16];
+  assert_eq!(command(&mut fs,&auth,other,1,
+    b"copylines /source 1 1 /dest",&mut out),Err(Error::Denied));
+  assert_eq!(out,[0xa7;16]);assert_eq!(fs.generation(),gen);
  }
 }

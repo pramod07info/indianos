@@ -1583,3 +1583,121 @@ mod r019_project_desktop_integration_tests {
   assert!(desktop.volume.list_dir("/work/demo",&mut listing).is_err());
  }
 }
+
+
+/// R067 workstation integration: expose existing source-editing transactions
+/// through the running Desktop's SAME PID/session/FILE_WRITE boundary.
+impl<D:BlockDevice,const P:usize,const E:usize,const W:usize,
+ const K:usize,const G:usize,const Q:usize> Desktop<D,P,E,W,K,G,Q> {
+ pub fn editor_insert_source_line(&mut self,caller:Identity,now:u64,
+  editor:&mut crate::m1_disk_editor::DiskEditor,line:usize,source:&str)
+  ->Result<usize,EditorRouteError>{
+  self.admit_editor(caller,now,FILE_WRITE)?;
+  editor.insert_source_line(caller,line,source).map_err(EditorRouteError::Editor)
+ }
+ pub fn editor_delete_source_line(&mut self,caller:Identity,now:u64,
+  editor:&mut crate::m1_disk_editor::DiskEditor,line:usize)
+  ->Result<usize,EditorRouteError>{
+  self.admit_editor(caller,now,FILE_WRITE)?;
+  editor.delete_source_line(caller,line).map_err(EditorRouteError::Editor)
+ }
+ pub fn editor_duplicate_source_line(&mut self,caller:Identity,now:u64,
+  editor:&mut crate::m1_disk_editor::DiskEditor,line:usize)
+  ->Result<usize,EditorRouteError>{
+  self.admit_editor(caller,now,FILE_WRITE)?;
+  editor.duplicate_source_line(caller,line).map_err(EditorRouteError::Editor)
+ }
+ pub fn project_move_source_lines(&mut self,caller:Identity,now:u64,
+  project:&mut crate::m1_project_workspace::ProjectTree,
+  file:&str,first:usize,count:usize,before:usize)
+  ->Result<usize,ProjectRouteError>{
+  self.admit_editor(caller,now,FILE_WRITE).map_err(ProjectRouteError::Permission)?;
+  project.move_source_lines(caller,&mut self.volume,file,first,count,before)
+   .map_err(ProjectRouteError::Project)
+ }
+ pub fn project_adjust_source_indent(&mut self,caller:Identity,now:u64,
+  project:&mut crate::m1_project_workspace::ProjectTree,
+  file:&str,first:usize,count:usize,delta:i8)
+  ->Result<usize,ProjectRouteError>{
+  self.admit_editor(caller,now,FILE_WRITE).map_err(ProjectRouteError::Permission)?;
+  project.adjust_source_indent(caller,&mut self.volume,file,first,count,delta)
+   .map_err(ProjectRouteError::Project)
+ }
+ pub fn project_copy_source_lines(&mut self,caller:Identity,now:u64,
+  project:&mut crate::m1_project_workspace::ProjectTree,
+  source:&str,destination:&str,first:usize,count:usize)
+  ->Result<usize,ProjectRouteError>{
+  self.admit_editor(caller,now,FILE_READ|FILE_WRITE)
+   .map_err(ProjectRouteError::Permission)?;
+  project.copy_source_lines(caller,&mut self.volume,source,destination,first,count)
+   .map_err(ProjectRouteError::Project)
+ }
+}
+#[cfg(test)]
+mod r067_desktop_source_routing_tests{
+ use super::*;
+ use crate::batch2_launcher::Image;
+ use crate::block::{BlockError,SECTOR_BYTES};
+ use crate::batch2_settings::{Settings,Theme};
+ struct Disk{data:[[u8;SECTOR_BYTES];100]}
+ impl BlockDevice for Disk {
+  fn sector_count(&self)->u64{100}
+  fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   *out=*self.data.get(lba as usize).ok_or(BlockError::OutOfRange)?;Ok(())
+  }
+  fn write_sector(&mut self,lba:u64,data:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   *self.data.get_mut(lba as usize).ok_or(BlockError::OutOfRange)?=*data;Ok(())
+  }
+ }
+ type Workstation=Desktop<Disk,3,3,2,2,3,8>;
+ fn id(pid:u32)->Identity{Identity{pid,generation:1}}
+ fn launch(pid:u32)->Launch{
+  Launch{pid,generation:1,image:Image{
+   image_id:pid,entry:0x1000,mapped_end:0x2000,verified:true}}
+ }
+ fn desktop()->Workstation{
+  let mut fs=HierVfs::format_blank(Disk{data:[[0;SECTOR_BYTES];100]}).unwrap();
+  fs.create("/editor",b"first\nlast").unwrap();
+  let mut d=Workstation::from_mounted(fs);
+  d.start(id(1),launch(1),id(2),launch(2),
+   Settings{theme:Theme::Dark,pointer_speed:5,key_repeat:10},8,15).unwrap();
+  d
+ }
+ #[test]fn real_desktop_editor_rows_are_authenticated_undoable_and_durable(){
+  let mut d=desktop();let mut editor=crate::m1_disk_editor::DiskEditor::new();
+  d.editor_open(id(2),1,&mut editor,"/editor").unwrap();
+  assert_eq!(d.editor_insert_source_line(id(2),1,&mut editor,2,"middle"),Ok(17));
+  assert_eq!(d.editor_duplicate_source_line(id(2),1,&mut editor,2),Ok(24));
+  assert_eq!(d.editor_delete_source_line(id(2),1,&mut editor,3),Ok(17));
+  let mut out=[0;32];
+  assert_eq!(d.editor_read(id(2),1,&editor,&mut out),Ok(17));
+  assert_eq!(&out[..17],b"first\nmiddle\nlast");
+  d.editor_save(id(2),1,&mut editor).unwrap();
+  let mut fs=HierVfs::mount(d.into_device()).unwrap();
+  assert_eq!(fs.read("/editor",&mut out),Ok(17));
+  assert_eq!(&out[..17],b"first\nmiddle\nlast");
+ }
+ #[test]fn stale_identity_and_expired_grant_never_update_open_editor(){
+  let mut d=desktop();let mut editor=crate::m1_disk_editor::DiskEditor::new();
+  d.editor_open(id(2),1,&mut editor,"/editor").unwrap();
+  let recycled=Identity{generation:2,..id(2)};
+  assert!(d.editor_insert_source_line(recycled,1,&mut editor,2,"bad").is_err());
+  assert!(d.editor_delete_source_line(id(2),15,&mut editor,1).is_err());
+  let mut out=[0;32];
+  assert_eq!(d.editor_read(id(2),1,&editor,&mut out),Ok(10));
+  assert_eq!(&out[..10],b"first\nlast");
+ }
+ #[test]fn desktop_project_line_movement_indent_and_copy_survive_remount(){
+  let mut d=desktop();let mut project=crate::m1_project_workspace::ProjectTree::new();
+  d.project_create(id(2),1,&mut project,"demo").unwrap();
+  d.project_create_file(id(2),1,&mut project,"code",b" a\n b\n c\n").unwrap();
+  assert_eq!(d.project_adjust_source_indent(id(2),1,&mut project,"code",1,2,1),Ok(11));
+  assert_eq!(d.project_move_source_lines(id(2),1,&mut project,"code",1,1,4),Ok(11));
+  assert_eq!(d.project_copy_source_lines(id(2),1,&mut project,"code","sample",1,2),Ok(7));
+  let mut fs=HierVfs::mount(d.into_device()).unwrap();
+  let mut out=[0;32];assert_eq!(fs.read("/work/demo/code",&mut out),Ok(11));
+  assert_eq!(&out[..11],b"  b\n c\n  a\n");
+  assert_eq!(fs.read("/work/demo/sample",&mut out),Ok(7));
+  assert_eq!(&out[..7],b"  b\n c\n");
+ }
+}

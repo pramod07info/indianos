@@ -2178,3 +2178,102 @@ mod r066_panel_rotation_tests{
   assert_eq!(layout.geometry(2,20),Ok(r(1,1,10,10)));
  }
 }
+
+
+/// R067: owner-bound layout bookmark for atomic restoration. Unlike a
+/// screenshot, this records real geometry plus epoch preconditions; a
+/// replaced/reassigned window or any subsequent move invalidates it.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct LayoutBookmark{
+ pub owner:u32,pub window:u32,pub epoch:u64,
+ pub rectangle:crate::agent_05_surface_rect::Rectangle,
+}
+impl<const N:usize> SurfaceLayout<N>{
+ /// A short caller buffer never receives a partial snapshot.
+ pub fn snapshot_windows(&self,windows:&[(u32,u32)],
+  out:&mut[LayoutBookmark])->Result<usize,Error>{
+  if windows.is_empty()||windows.len()>N||out.len()<windows.len(){
+   return Err(Error::Full);
+  }
+  for (i,&(owner,window)) in windows.iter().enumerate(){
+   if windows[..i].iter().any(|&(_,old)|old==window){
+    return Err(Error::Duplicate);
+   }
+   self.geometry(owner,window)?;
+  }
+  for (i,&(owner,window)) in windows.iter().enumerate(){
+   out[i]=LayoutBookmark{
+    owner,window,epoch:self.epoch(owner,window).ok_or(Error::Unauthorized)?,
+    rectangle:self.geometry(owner,window)?
+   };
+  }
+  Ok(windows.len())
+ }
+ /// Restore a saved layout only if each bound process still owns its
+ /// window AND the caller supplies the CURRENT epochs observed after a
+ /// temporary arrangement. The bookmark itself cannot grant ownership.
+ pub fn restore_layout_if_epochs(&mut self,bookmarks:&[LayoutBookmark],
+  expected_current:&[u64])->Result<usize,Error>{
+  use crate::agent_05_surface_rect::Rectangle;
+  if bookmarks.is_empty()||bookmarks.len()>N||
+     bookmarks.len()!=expected_current.len(){return Err(Error::Invalid);}
+  let mut updates=[(0u32,0u32,Rectangle{x:0,y:0,width:1,height:1});N];
+  for (i,entry) in bookmarks.iter().enumerate(){
+   if bookmarks[..i].iter().any(|previous|previous.window==entry.window){
+    return Err(Error::Duplicate);
+   }
+   if expected_current[i]==0||
+     self.epoch(entry.owner,entry.window)!=Some(expected_current[i]){
+    return Err(Error::Unauthorized);
+   }
+   // Bookmark must predate or equal current generation; reject future values.
+   if entry.epoch==0||entry.epoch>expected_current[i]{return Err(Error::Invalid);}
+   updates[i]=(entry.owner,entry.window,entry.rectangle);
+  }
+  self.set_geometry_batch(&updates[..bookmarks.len()])
+ }
+}
+#[cfg(test)]
+mod r067_bookmarked_layout_tests{
+ use super::*;
+ use crate::agent_05_surface_rect::Rectangle;
+ fn r(x:u32,y:u32,w:u32,h:u32)->Rectangle{
+  Rectangle{x,y,width:w,height:h}
+ }
+ fn blank()->LayoutBookmark{
+  LayoutBookmark{owner:0,window:0,epoch:0,rectangle:r(0,0,1,1)}
+ }
+ #[test]fn restore_all_unchanged_owned_windows_after_temporary_grid(){
+  let mut layout=SurfaceLayout::<3>::new();
+  layout.grant(1,10,r(10,10,40,30)).unwrap();
+  layout.grant(2,20,r(80,10,50,40)).unwrap();
+  let mut saved=[blank();2];
+  assert_eq!(layout.snapshot_windows(&[(1,10),(2,20)],&mut saved),Ok(2));
+  assert_eq!(layout.tile_grid(&[(1,10),(2,20)],2,r(0,0,200,100)),Ok(2));
+  let observed=[layout.epoch(1,10).unwrap(),layout.epoch(2,20).unwrap()];
+  assert_eq!(layout.restore_layout_if_epochs(&saved,&observed),Ok(2));
+  assert_eq!(layout.geometry(1,10),Ok(r(10,10,40,30)));
+  assert_eq!(layout.geometry(2,20),Ok(r(80,10,50,40)));
+ }
+ #[test]fn stale_epoch_foreign_owner_and_short_snapshot_are_fail_closed(){
+  let mut layout=SurfaceLayout::<2>::new();
+  layout.grant(1,10,r(5,5,20,20)).unwrap();
+  layout.grant(2,20,r(30,5,30,20)).unwrap();
+  let mut short=[blank();1];
+  assert_eq!(layout.snapshot_windows(&[(1,10),(2,20)],&mut short),Err(Error::Full));
+  assert_eq!(short,[blank();1]);
+  let mut snapshot=[blank();2];
+  layout.snapshot_windows(&[(1,10),(2,20)],&mut snapshot).unwrap();
+  layout.move_owned(1,10,5,0).unwrap();
+  let after=layout.geometry(1,10);
+  let epochs=[snapshot[0].epoch,snapshot[1].epoch];
+  assert_eq!(layout.restore_layout_if_epochs(&snapshot,&epochs),
+    Err(Error::Unauthorized));
+  assert_eq!(layout.geometry(1,10),after);
+  let invalid=[LayoutBookmark{owner:9,..snapshot[0]},snapshot[1]];
+  let actual=[layout.epoch(1,10).unwrap(),layout.epoch(2,20).unwrap()];
+  assert_eq!(layout.restore_layout_if_epochs(&invalid,&actual),
+    Err(Error::Unauthorized));
+  assert_eq!(layout.geometry(1,10),after);
+ }
+}
