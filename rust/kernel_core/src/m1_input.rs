@@ -1457,3 +1457,67 @@ mod r069_erase_to_home_tests {
         assert!(input.bytes().is_empty());
     }
 }
+
+
+/// R070: repair the shell command verb without changing the case of path
+/// arguments or a literal payload. No command is submitted by this action.
+impl LineEditor {
+    pub fn lowercase_command_verb(&mut self) -> Event {
+        let start = match self.line[..self.len].iter().position(|b| *b != b' ') {
+            Some(n) => n,
+            None => return Event::Empty,
+        };
+        let end = start + self.line[start..self.len].iter()
+            .position(|b| *b == b' ').unwrap_or(self.len - start);
+        let mut changed = false;
+        for byte in &mut self.line[start..end] {
+            if byte.is_ascii_uppercase() {
+                *byte = byte.to_ascii_lowercase();
+                changed = true;
+            }
+        }
+        if changed { Event::Typed } else { Event::Empty }
+    }
+}
+impl InputLine {
+    pub fn lowercase_command_verb(&mut self) -> Event {
+        let result = self.editor.lowercase_command_verb();
+        if result == Event::Typed {
+            self.history_cursor = None;
+            self.history_draft.fill(0);
+            self.history_draft_len = 0;
+        }
+        result
+    }
+}
+
+#[cfg(test)]
+mod r070_shell_verb_edit_tests {
+    use super::*;
+    #[test]
+    fn lowercases_only_verb_without_submitting_or_changing_caret() {
+        let mut line = InputLine::new();
+        line.set_line(b"  HEADLINES /MixedCase N").unwrap();
+        line.action(EditKey::Home).unwrap();
+        assert_eq!(line.lowercase_command_verb(), Event::Typed);
+        assert_eq!(line.bytes(), b"  headlines /MixedCase N");
+        assert_eq!(line.caret(), 0);
+        assert_eq!(line.lowercase_command_verb(), Event::Empty);
+        assert_eq!(line.history_count(), 0);
+    }
+    #[test]
+    fn command_history_and_clipboard_stay_intact() {
+        let mut line = InputLine::new();
+        let mut submission = [0u8; MAX_LINE];
+        line.set_line(b"pwd").unwrap();
+        line.feed(b'\n', &mut submission).unwrap();
+        line.set_line(b"CAT /Secret").unwrap();
+        line.copy_range(0, 3).unwrap();
+        assert_eq!(line.lowercase_command_verb(), Event::Typed);
+        assert_eq!(line.bytes(), b"cat /Secret");
+        assert_eq!(line.clipboard_bytes(), b"CAT");
+        assert_eq!(line.history_count(), 1);
+        line.set_line(b"   ").unwrap();
+        assert_eq!(line.lowercase_command_verb(), Event::Empty);
+    }
+}

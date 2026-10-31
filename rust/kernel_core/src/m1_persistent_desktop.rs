@@ -1896,3 +1896,99 @@ mod r069_desktop_refactoring_routes_tests {
         assert_eq!(&out[..11], b"old  \nold\t\n");
     }
 }
+
+
+/// R070: source formatting and IDE search must traverse the same authenticated
+/// desktop permission checks as other editor/project operations.
+impl<D: BlockDevice, const P: usize, const E: usize, const W: usize,
+     const K: usize, const G: usize, const Q: usize> Desktop<D, P, E, W, K, G, Q> {
+    pub fn editor_indent_source_range(&mut self, caller: Identity, now: u64,
+        editor: &mut crate::m1_disk_editor::DiskEditor,
+        first: usize, last: usize, remove: bool) -> Result<usize, EditorRouteError> {
+        self.admit_editor(caller, now, FILE_WRITE)?;
+        editor.indent_source_range(caller, first, last, remove)
+            .map_err(EditorRouteError::Editor)
+    }
+    pub fn project_find_source_lines(&mut self, caller: Identity, now: u64,
+        project: &crate::m1_project_workspace::ProjectTree,
+        file: &str, query: &str, out: &mut [usize]) -> Result<usize, ProjectRouteError> {
+        self.admit_editor(caller, now, FILE_READ).map_err(ProjectRouteError::Permission)?;
+        project.find_source_lines(caller, &mut self.volume, file, query, out)
+            .map_err(ProjectRouteError::Project)
+    }
+}
+
+#[cfg(test)]
+mod r070_workstation_authenticated_routes_tests {
+    use super::*;
+    use crate::block::{BlockError, SECTOR_BYTES};
+    use crate::batch2_launcher::Image;
+    use crate::batch2_settings::{Settings, Theme};
+    struct Disk { sectors: [[u8; SECTOR_BYTES]; 100] }
+    impl BlockDevice for Disk {
+        fn sector_count(&self) -> u64 { 100 }
+        fn read_sector(&mut self, lba: u64, out: &mut [u8; SECTOR_BYTES])
+            -> Result<(), BlockError> {
+            *out = *self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?;
+            Ok(())
+        }
+        fn write_sector(&mut self, lba: u64, data: &[u8; SECTOR_BYTES])
+            -> Result<(), BlockError> {
+            *self.sectors.get_mut(lba as usize).ok_or(BlockError::OutOfRange)? = *data;
+            Ok(())
+        }
+    }
+    type Desk = Desktop<Disk, 3, 3, 2, 2, 3, 8>;
+    fn id(pid: u32) -> Identity { Identity { pid, generation: 1 } }
+    fn launch(pid: u32) -> Launch {
+        Launch { pid, generation: 1, image: Image {
+            image_id: pid, entry: 0x1000, mapped_end: 0x2000, verified: true
+        } }
+    }
+    fn ready() -> Desk {
+        let mut fs = HierVfs::format_blank(Disk { sectors: [[0; SECTOR_BYTES]; 100] }).unwrap();
+        fs.create("/source", "α\nβ\n".as_bytes()).unwrap();
+        let mut desktop = Desk::from_mounted(fs);
+        desktop.start(id(1), launch(1), id(2), launch(2),
+            Settings { theme: Theme::Dark, pointer_speed: 5, key_repeat: 10 }, 8, 5)
+            .unwrap();
+        desktop
+    }
+    #[test]
+    fn owner_can_edit_and_query_real_rebootable_sources() {
+        let mut desktop = ready();
+        let mut editor = crate::m1_disk_editor::DiskEditor::new();
+        desktop.editor_open(id(2), 1, &mut editor, "/source").unwrap();
+        assert_eq!(desktop.editor_indent_source_range(id(2), 1, &mut editor, 1, 2, false),
+            Ok(2));
+        desktop.editor_save(id(2), 1, &mut editor).unwrap();
+        let mut project = crate::m1_project_workspace::ProjectTree::new();
+        desktop.project_create(id(2), 1, &mut project, "demo").unwrap();
+        desktop.project_create_file(id(2), 1, &mut project,
+            "main", "α\nbeta\nα\n".as_bytes()).unwrap();
+        let mut rows = [0usize; 3];
+        assert_eq!(desktop.project_find_source_lines(id(2), 1, &project,
+            "main", "α", &mut rows), Ok(2));
+        assert_eq!(&rows[..2], &[1, 3]);
+        let mut mounted = HierVfs::mount(desktop.into_device()).unwrap();
+        let mut out = [0u8; 32];
+        assert_eq!(mounted.read("/source", &mut out), Ok("    α\n    β\n".len()));
+    }
+    #[test]
+    fn expired_grant_and_recycled_identity_cannot_read_or_format() {
+        let mut desktop = ready();
+        let mut editor = crate::m1_disk_editor::DiskEditor::new();
+        desktop.editor_open(id(2), 1, &mut editor, "/source").unwrap();
+        assert!(desktop.editor_indent_source_range(id(2), 6, &mut editor, 1, 1, false).is_err());
+        assert!(desktop.editor_indent_source_range(
+            Identity { generation: 2, ..id(2) }, 1, &mut editor, 1, 1, false).is_err());
+        assert!(!editor.status(id(2)).unwrap().dirty);
+        let mut project = crate::m1_project_workspace::ProjectTree::new();
+        desktop.project_create(id(2), 1, &mut project, "demo").unwrap();
+        desktop.project_create_file(id(2), 1, &mut project, "main", b"alpha").unwrap();
+        let mut out = [77usize; 2];
+        assert!(desktop.project_find_source_lines(id(2), 6, &project,
+            "main", "alpha", &mut out).is_err());
+        assert_eq!(out, [77, 77]);
+    }
+}
