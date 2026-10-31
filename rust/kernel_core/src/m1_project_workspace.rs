@@ -1131,3 +1131,115 @@ mod r068_project_compare_save_tests{
   assert_eq!(fs.generation(),before+1);
  }
 }
+
+
+/// R069: replace complete ASCII programming identifiers in a durable
+/// UTF-8 project source file. This is lexical, not language-parser aware:
+/// comments and string literals are included, but identifier prefixes are
+/// never silently replaced. One successful refactor = one COW generation.
+impl ProjectTree {
+    pub fn rename_source_identifier<D: BlockDevice>(&mut self, caller: Identity,
+        fs: &mut HierVfs<D>, name: &str, old: &str, new: &str
+    ) -> Result<usize, Error> {
+        self.check_fresh(caller, fs)?;
+        fn valid_identifier(id: &str) -> bool {
+            let b = id.as_bytes();
+            !b.is_empty() && (b[0].is_ascii_alphabetic() || b[0] == b'_')
+                && b.iter().all(|c| c.is_ascii_alphanumeric() || *c == b'_')
+        }
+        fn word(c: u8) -> bool { c.is_ascii_alphanumeric() || c == b'_' }
+        if !valid_identifier(old) || !valid_identifier(new) { return Err(Error::Invalid); }
+        let (p, length) = self.child(name)?;
+        let path = Self::str_path(&p, length);
+        let mut previous = [0u8; MAX_FILE_BYTES];
+        let size = fs.read(path, &mut previous)?;
+        let source = core::str::from_utf8(&previous[..size]).map_err(|_| Error::Invalid)?;
+        let mut staged = [0u8; MAX_FILE_BYTES];
+        let mut pos = 0usize;
+        let mut written = 0usize;
+        let mut matches = 0usize;
+        while pos < size {
+            let last = pos.checked_add(old.len()).ok_or(Error::Full)?;
+            let found = last <= size && source[pos..].starts_with(old)
+                && (pos == 0 || !word(previous[pos - 1]))
+                && (last == size || !word(previous[last]));
+            if found {
+                let end = written.checked_add(new.len()).ok_or(Error::Full)?;
+                if end > MAX_FILE_BYTES { return Err(Error::Full); }
+                staged[written..end].copy_from_slice(new.as_bytes());
+                written = end;
+                pos = last;
+                matches += 1;
+            } else {
+                let width = source[pos..].chars().next().ok_or(Error::Invalid)?.len_utf8();
+                let end = written.checked_add(width).ok_or(Error::Full)?;
+                if end > MAX_FILE_BYTES { return Err(Error::Full); }
+                staged[written..end].copy_from_slice(&previous[pos..pos + width]);
+                written = end;
+                pos += width;
+            }
+        }
+        if matches == 0 || (written == size && staged[..written] == previous[..size]) {
+            return Ok(matches);
+        }
+        fs.overwrite(path, &staged[..written])?;
+        self.generation = fs.generation();
+        Ok(matches)
+    }
+}
+
+#[cfg(test)]
+mod r069_source_identifier_tests {
+    use super::*;
+    use crate::block::{BlockError, SECTOR_BYTES};
+    struct Disk { sectors: [[u8; SECTOR_BYTES]; 100] }
+    impl BlockDevice for Disk {
+        fn sector_count(&self) -> u64 { 100 }
+        fn read_sector(&mut self, lba: u64, out: &mut [u8; SECTOR_BYTES]) -> Result<(), BlockError> {
+            *out = *self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?; Ok(())
+        }
+        fn write_sector(&mut self, lba: u64, bytes: &[u8; SECTOR_BYTES]) -> Result<(), BlockError> {
+            *self.sectors.get_mut(lba as usize).ok_or(BlockError::OutOfRange)? = *bytes; Ok(())
+        }
+    }
+    fn user() -> Identity { Identity { pid: 8, generation: 4 } }
+    fn setup() -> (ProjectTree, HierVfs<Disk>) {
+        let mut fs = HierVfs::format_blank(Disk { sectors: [[0; SECTOR_BYTES]; 100] }).unwrap();
+        let mut p = ProjectTree::new();
+        p.create(user(), &mut fs, "demo").unwrap();
+        p.create_file(user(), &mut fs, "main", "foo foobar foo_2 (foo)\nα_foo\n".as_bytes()).unwrap();
+        (p, fs)
+    }
+    #[test]
+    fn renames_whole_identifiers_and_survives_remount() {
+        let (mut p, mut fs) = setup();
+        let before = fs.generation();
+        assert_eq!(p.rename_source_identifier(user(), &mut fs, "main", "foo", "bar"), Ok(2));
+        assert_eq!(fs.generation(), before + 1);
+        let mut fs = HierVfs::mount(fs.into_device()).unwrap();
+        let mut out = [0; 64];
+        let expected = "bar foobar foo_2 (bar)\nα_foo\n".as_bytes();
+        assert_eq!(fs.read("/work/demo/main", &mut out), Ok(expected.len()));
+        assert_eq!(&out[..expected.len()], expected);
+    }
+    #[test]
+    fn invalid_identifier_and_repeated_refactor_do_not_commit() {
+        let (mut p, mut fs) = setup();
+        let gen = fs.generation();
+        assert_eq!(p.rename_source_identifier(user(), &mut fs, "main", "foo", "foo"), Ok(2));
+        assert_eq!(p.rename_source_identifier(user(), &mut fs, "main", "foo.bar", "new"), Err(Error::Invalid));
+        assert_eq!(p.rename_source_identifier(user(), &mut fs, "main", "foobarX", "new"), Ok(0));
+        assert_eq!(fs.generation(), gen);
+    }
+    #[test]
+    fn stale_session_and_bad_path_leave_disk_unchanged() {
+        let (mut p, mut fs) = setup();
+        let before = fs.generation();
+        assert_eq!(p.rename_source_identifier(Identity { generation: 5, ..user() },
+            &mut fs, "main", "foo", "x"), Err(Error::Unauthorized));
+        assert_eq!(p.rename_source_identifier(user(), &mut fs, "../bad", "foo", "x"), Err(Error::Invalid));
+        fs.create("/foreign", b"data").unwrap();
+        assert_eq!(p.rename_source_identifier(user(), &mut fs, "main", "foo", "x"), Err(Error::Stale));
+        assert_eq!(fs.generation(), before + 1);
+    }
+}

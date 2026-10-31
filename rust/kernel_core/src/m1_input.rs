@@ -1388,3 +1388,72 @@ mod r068_forward_word_edit_tests{
   assert_eq!(input.history_count(),0);
  }
 }
+
+
+/// R069: Ctrl-U-style removal from the beginning of the draft through the
+/// live caret. It never submits the command, mutates history or clipboard,
+/// or leaves the erased bytes in the unused backing buffer.
+impl LineEditor {
+    pub fn erase_to_home(&mut self) -> Event {
+        if self.caret == 0 { return Event::Empty; }
+        let count = self.caret;
+        self.line.copy_within(count..self.len, 0);
+        self.len -= count;
+        self.caret = 0;
+        self.line[self.len..].fill(0);
+        Event::Erased
+    }
+}
+impl InputLine {
+    pub fn erase_to_home(&mut self) -> Event {
+        let result = self.editor.erase_to_home();
+        if result == Event::Erased {
+            self.history_cursor = None;
+            self.history_draft.fill(0);
+            self.history_draft_len = 0;
+        }
+        result
+    }
+}
+#[cfg(test)]
+mod r069_erase_to_home_tests {
+    use super::*;
+    #[test]
+    fn deletes_only_the_prefix_and_preserves_suffix_and_cursor() {
+        let mut input = InputLine::new();
+        input.set_line(b"cargo build").unwrap();
+        input.action(EditKey::Home).unwrap();
+        for _ in 0..6 { input.action(EditKey::Right).unwrap(); }
+        assert_eq!(input.erase_to_home(), Event::Erased);
+        assert_eq!(input.bytes(), b"build");
+        assert_eq!(input.caret(), 0);
+        assert_eq!(input.history_count(), 0);
+    }
+    #[test]
+    fn home_is_noop_and_full_draft_is_scrubbed() {
+        let mut input = InputLine::new();
+        input.set_line(b"git status").unwrap();
+        input.action(EditKey::Home).unwrap();
+        assert_eq!(input.erase_to_home(), Event::Empty);
+        assert_eq!(input.bytes(), b"git status");
+        input.action(EditKey::End).unwrap();
+        assert_eq!(input.erase_to_home(), Event::Erased);
+        assert!(input.bytes().is_empty());
+        assert_eq!(input.caret(), 0);
+        assert_eq!(input.erase_to_home(), Event::Empty);
+    }
+    #[test]
+    fn clipboard_and_successful_history_survive_unsent_erasure() {
+        let mut input = InputLine::new();
+        let mut out = [0u8; MAX_LINE];
+        input.set_line(b"echo ok").unwrap();
+        assert_eq!(input.feed(b'\n', &mut out), Ok(Event::Submitted(7)));
+        input.set_line(b"paste this").unwrap();
+        input.copy_range(0, 5).unwrap();
+        input.action(EditKey::End).unwrap();
+        assert_eq!(input.erase_to_home(), Event::Erased);
+        assert_eq!(input.history_count(), 1);
+        assert_eq!(input.clipboard_bytes(), b"paste");
+        assert!(input.bytes().is_empty());
+    }
+}

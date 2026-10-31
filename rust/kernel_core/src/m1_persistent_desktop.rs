@@ -1808,3 +1808,91 @@ mod r068_desktop_source_routes_tests{
   assert_eq!(&out[..3],b"two");
  }
 }
+
+
+/// R069: connect source cleanup and project identifier refactoring to the
+/// authenticated desktop. The UI cannot bypass the session or FILE_WRITE.
+impl<D: BlockDevice, const P: usize, const E: usize, const W: usize,
+     const K: usize, const G: usize, const Q: usize> Desktop<D, P, E, W, K, G, Q> {
+    pub fn editor_trim_source_trailing_whitespace(&mut self, caller: Identity, now: u64,
+        editor: &mut crate::m1_disk_editor::DiskEditor) -> Result<usize, EditorRouteError> {
+        self.admit_editor(caller, now, FILE_WRITE)?;
+        editor.trim_source_trailing_whitespace(caller).map_err(EditorRouteError::Editor)
+    }
+    pub fn project_rename_source_identifier(&mut self, caller: Identity, now: u64,
+        project: &mut crate::m1_project_workspace::ProjectTree,
+        file: &str, old: &str, new: &str) -> Result<usize, ProjectRouteError> {
+        self.admit_editor(caller, now, FILE_WRITE).map_err(ProjectRouteError::Permission)?;
+        project.rename_source_identifier(caller, &mut self.volume, file, old, new)
+            .map_err(ProjectRouteError::Project)
+    }
+}
+
+#[cfg(test)]
+mod r069_desktop_refactoring_routes_tests {
+    use super::*;
+    use crate::block::{BlockError, SECTOR_BYTES};
+    use crate::batch2_launcher::Image;
+    use crate::batch2_settings::{Settings, Theme};
+    struct Disk { data: [[u8; SECTOR_BYTES]; 100] }
+    impl BlockDevice for Disk {
+        fn sector_count(&self) -> u64 { 100 }
+        fn read_sector(&mut self, lba: u64, out: &mut [u8; SECTOR_BYTES]) -> Result<(), BlockError> {
+            *out = *self.data.get(lba as usize).ok_or(BlockError::OutOfRange)?; Ok(())
+        }
+        fn write_sector(&mut self, lba: u64, bytes: &[u8; SECTOR_BYTES]) -> Result<(), BlockError> {
+            *self.data.get_mut(lba as usize).ok_or(BlockError::OutOfRange)? = *bytes; Ok(())
+        }
+    }
+    type Desk = Desktop<Disk, 3, 3, 2, 2, 3, 8>;
+    fn id(pid: u32) -> Identity { Identity { pid, generation: 1 } }
+    fn launch(pid: u32) -> Launch {
+        Launch { pid, generation: 1, image: Image {
+            image_id: pid, entry: 0x1000, mapped_end: 0x2000, verified: true
+        }}
+    }
+    fn ready() -> Desk {
+        let mut fs = HierVfs::format_blank(Disk { data: [[0; SECTOR_BYTES]; 100] }).unwrap();
+        fs.create("/source", b"old  \nold\t\n").unwrap();
+        let mut d = Desk::from_mounted(fs);
+        d.start(id(1), launch(1), id(2), launch(2),
+            Settings { theme: Theme::Dark, pointer_speed: 5, key_repeat: 10 },
+            8, 5).unwrap();
+        d
+    }
+    #[test]
+    fn routes_real_editor_cleanup_and_project_refactor_to_disk() {
+        let mut d = ready();
+        let mut e = crate::m1_disk_editor::DiskEditor::new();
+        d.editor_open(id(2), 1, &mut e, "/source").unwrap();
+        assert_eq!(d.editor_trim_source_trailing_whitespace(id(2), 1, &mut e), Ok(8));
+        d.editor_save(id(2), 1, &mut e).unwrap();
+        let mut project = crate::m1_project_workspace::ProjectTree::new();
+        d.project_create(id(2), 1, &mut project, "demo").unwrap();
+        d.project_create_file(id(2), 1, &mut project, "main", b"old older old\n").unwrap();
+        assert_eq!(d.project_rename_source_identifier(
+            id(2), 1, &mut project, "main", "old", "new"), Ok(2));
+        let mut fs = HierVfs::mount(d.into_device()).unwrap();
+        let mut out = [0u8; 24];
+        assert_eq!(fs.read("/source", &mut out), Ok(8));
+        assert_eq!(&out[..8], b"old\nold\n");
+        assert_eq!(fs.read("/work/demo/main", &mut out), Ok(14));
+        assert_eq!(&out[..14], b"new older new\n");
+    }
+    #[test]
+    fn expired_or_recycled_desktop_cannot_edit_source() {
+        let mut d = ready();
+        let mut e = crate::m1_disk_editor::DiskEditor::new();
+        d.editor_open(id(2), 1, &mut e, "/source").unwrap();
+        assert!(d.editor_trim_source_trailing_whitespace(id(2), 5, &mut e).is_err());
+        assert!(d.editor_trim_source_trailing_whitespace(
+            Identity { generation: 2, ..id(2) }, 1, &mut e).is_err());
+        let mut p = crate::m1_project_workspace::ProjectTree::new();
+        d.project_create(id(2), 1, &mut p, "demo").unwrap();
+        d.project_create_file(id(2), 1, &mut p, "main", b"old").unwrap();
+        assert!(d.project_rename_source_identifier(id(2), 5, &mut p, "main", "old", "new").is_err());
+        let mut out = [0u8; 16];
+        assert_eq!(d.editor_read(id(2), 1, &e, &mut out), Ok(11));
+        assert_eq!(&out[..11], b"old  \nold\t\n");
+    }
+}

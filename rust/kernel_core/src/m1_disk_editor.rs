@@ -1300,3 +1300,91 @@ mod r066_unicode_source_range_tests{
     Err(Error::Invalid));
  }
 }
+
+
+/// R069: remove trailing horizontal whitespace from every source row in
+/// one reversible buffer edit. The editor stays unsaved until authorized
+/// save(), which uses the existing generation and system-path guards.
+impl DiskEditor {
+    pub fn trim_source_trailing_whitespace(&mut self, caller: Identity)
+        -> Result<usize, Error> {
+        self.authorize(caller)?;
+        let text = core::str::from_utf8(&self.data[..self.used]).map_err(|_| Error::Invalid)?;
+        let mut staged = [0u8; MAX_FILE_BYTES];
+        let mut used = 0usize;
+        for row in text.split_inclusive('\n') {
+            let newline = row.ends_with('\n');
+            let body = if newline { &row[..row.len() - 1] } else { row };
+            let clean = body.trim_end_matches(|ch| ch == ' ' || ch == '\t');
+            let end = used.checked_add(clean.len() + usize::from(newline)).ok_or(Error::Full)?;
+            if end > MAX_FILE_BYTES { return Err(Error::Full); }
+            staged[used..used + clean.len()].copy_from_slice(clean.as_bytes());
+            used += clean.len();
+            if newline { staged[used] = b'\n'; used += 1; }
+        }
+        if used == self.used && staged[..used] == self.data[..self.used] {
+            return Ok(self.used);
+        }
+        self.replace(caller, 0, self.used, &staged[..used])
+    }
+}
+
+#[cfg(test)]
+mod r069_editor_whitespace_tests {
+    use super::*;
+    use crate::block::{BlockError, SECTOR_BYTES};
+    struct Disk { data: [[u8; SECTOR_BYTES]; 100] }
+    impl BlockDevice for Disk {
+        fn sector_count(&self) -> u64 { 100 }
+        fn read_sector(&mut self, lba: u64, out: &mut [u8; SECTOR_BYTES]) -> Result<(), BlockError> {
+            *out = *self.data.get(lba as usize).ok_or(BlockError::OutOfRange)?; Ok(())
+        }
+        fn write_sector(&mut self, lba: u64, bytes: &[u8; SECTOR_BYTES]) -> Result<(), BlockError> {
+            *self.data.get_mut(lba as usize).ok_or(BlockError::OutOfRange)? = *bytes; Ok(())
+        }
+    }
+    fn id() -> Identity { Identity { pid: 6, generation: 4 } }
+    fn volume() -> HierVfs<Disk> {
+        let mut fs = HierVfs::format_blank(Disk { data: [[0; SECTOR_BYTES]; 100] }).unwrap();
+        fs.create("/source", "α  \nβ\t \nend \t".as_bytes()).unwrap();
+        fs.create("/binary", &[0xff, 0xfe]).unwrap();
+        fs
+    }
+    #[test]
+    fn cleanup_is_one_undo_redo_and_survives_save_and_remount() {
+        let mut fs = volume(); let mut editor = DiskEditor::new();
+        editor.open(id(), &mut fs, "/source").unwrap();
+        let clean = "α\nβ\nend".as_bytes();
+        let old = "α  \nβ\t \nend \t".as_bytes();
+        assert_eq!(editor.trim_source_trailing_whitespace(id()), Ok(clean.len()));
+        assert_eq!(editor.undo(id()), Ok(old.len()));
+        assert_eq!(editor.redo(id()), Ok(clean.len()));
+        let mut buf = [0u8; 40];
+        assert_eq!(editor.read(id(), &mut buf), Ok(clean.len()));
+        assert_eq!(&buf[..clean.len()], clean);
+        editor.save(id(), &mut fs).unwrap();
+        let mut fs = HierVfs::mount(fs.into_device()).unwrap();
+        assert_eq!(fs.read("/source", &mut buf), Ok(clean.len()));
+        assert_eq!(&buf[..clean.len()], clean);
+    }
+    #[test]
+    fn clean_source_is_noop_without_dirtying_editor() {
+        let mut fs = volume(); let mut editor = DiskEditor::new();
+        editor.open(id(), &mut fs, "/source").unwrap();
+        editor.trim_source_trailing_whitespace(id()).unwrap();
+        editor.save(id(), &mut fs).unwrap();
+        assert_eq!(editor.trim_source_trailing_whitespace(id()), Ok("α\nβ\nend".len()));
+        assert!(!editor.status(id()).unwrap().dirty);
+    }
+    #[test]
+    fn invalid_owner_and_binary_content_fail_closed() {
+        let mut fs = volume(); let mut editor = DiskEditor::new();
+        editor.open(id(), &mut fs, "/binary").unwrap();
+        let generation = fs.generation();
+        assert_eq!(editor.trim_source_trailing_whitespace(id()), Err(Error::Invalid));
+        assert_eq!(editor.trim_source_trailing_whitespace(
+            Identity { generation: 5, ..id() }), Err(Error::Unauthorized));
+        assert!(!editor.status(id()).unwrap().dirty);
+        assert_eq!(fs.generation(), generation);
+    }
+}
