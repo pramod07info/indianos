@@ -776,3 +776,99 @@ mod r061_line_duplicate_tests{
   assert!(!editor.status(owner()).unwrap().dirty);
  }
 }
+
+
+/// R062: safely delete one complete UTF-8 source line. A terminated line
+/// removes its following newline, while the final unterminated line removes
+/// its preceding separator. This prevents accidental empty phantom rows.
+/// Undo/redo and disk save remain single operations; invalid requests
+/// never change text, history or the COW filesystem generation.
+impl DiskEditor{
+ pub fn delete_source_line(&mut self,caller:Identity,
+     line:usize)->Result<usize,Error>{
+  self.authorize(caller)?;
+  if line==0{return Err(Error::Invalid);}
+  let text=core::str::from_utf8(&self.data[..self.used])
+    .map_err(|_|Error::Invalid)?;
+  let mut start=0usize;
+  for (index,row) in text.split_terminator('\n').enumerate(){
+   let end=start.checked_add(row.len()).ok_or(Error::Full)?;
+   if index+1==line{
+    let (from,to)=if end<self.used&&self.data[end]==b'\n'{
+     (start,end+1)
+    }else if start>0{
+     (start-1,end)
+    }else{
+     (start,end)
+    };
+    return self.replace(caller,from,to,b"");
+   }
+   start=end.checked_add(1).ok_or(Error::Full)?;
+  }
+  Err(Error::Invalid)
+ }
+}
+#[cfg(test)]
+mod r062_source_line_deletion_tests{
+ use super::*;
+ use crate::block::{BlockError,SECTOR_BYTES};
+ struct TestDisk{data:[[u8;SECTOR_BYTES];100]}
+ impl BlockDevice for TestDisk{
+  fn sector_count(&self)->u64{100}
+  fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   *out=*self.data.get(lba as usize).ok_or(BlockError::OutOfRange)?;Ok(())
+  }
+  fn write_sector(&mut self,lba:u64,bytes:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   *self.data.get_mut(lba as usize).ok_or(BlockError::OutOfRange)?=*bytes;Ok(())
+  }
+ }
+ fn actor()->Identity{Identity{pid:8,generation:11}}
+ fn fresh()->HierVfs<TestDisk>{
+  let mut fs=HierVfs::format_blank(TestDisk{data:[[0;SECTOR_BYTES];100]}).unwrap();
+  fs.create("/source","α\nβ\ngamma".as_bytes()).unwrap();fs
+ }
+ #[test]fn removes_unicode_middle_row_and_undo_redo_survive_disk_remount(){
+  let mut fs=fresh();let mut e=DiskEditor::new();
+  e.open(actor(),&mut fs,"/source").unwrap();
+  assert_eq!(e.delete_source_line(actor(),2),Ok(8));
+  let mut data=[0u8;32];
+  assert_eq!(e.read(actor(),&mut data),Ok(8));
+  assert_eq!(&data[..8],"α\ngamma".as_bytes());
+  assert_eq!(e.undo(actor()),Ok(11));
+  assert_eq!(e.redo(actor()),Ok(8));
+  e.save(actor(),&mut fs).unwrap();
+  let mut mounted=HierVfs::mount(fs.into_device()).unwrap();
+  assert_eq!(mounted.read("/source",&mut data),Ok(8));
+  assert_eq!(&data[..8],"α\ngamma".as_bytes());
+ }
+ #[test]fn delete_first_last_and_only_row_without_separator_corruption(){
+  let mut fs=fresh();fs.create("/one",b"single").unwrap();
+  let mut e=DiskEditor::new();
+  e.open(actor(),&mut fs,"/source").unwrap();
+  assert_eq!(e.delete_source_line(actor(),1),Ok(8));
+  let mut out=[0u8;32];e.read(actor(),&mut out).unwrap();
+  assert_eq!(&out[..8],b"\xce\xb2\ngamma");
+  assert_eq!(e.delete_source_line(actor(),2),Ok(2));
+  e.read(actor(),&mut out).unwrap();
+  assert_eq!(&out[..2],"β".as_bytes());
+  e.close(actor(),true).unwrap();
+  e.open(actor(),&mut fs,"/one").unwrap();
+  assert_eq!(e.delete_source_line(actor(),1),Ok(0));
+  assert_eq!(e.read(actor(),&mut out),Ok(0));
+ }
+ #[test]fn out_of_range_wrong_identity_and_bad_utf8_preserve_all_bytes(){
+  let mut fs=fresh();fs.create("/binary",&[0xff,0x80]).unwrap();
+  let mut e=DiskEditor::new();
+  e.open(actor(),&mut fs,"/source").unwrap();
+  for row in [0,4,99]{
+   assert_eq!(e.delete_source_line(actor(),row),Err(Error::Invalid));
+  }
+  assert_eq!(e.delete_source_line(Identity{generation:12,..actor()},1),
+     Err(Error::Unauthorized));
+  assert!(!e.status(actor()).unwrap().dirty);
+  e.close(actor(),false).unwrap();
+  e.open(actor(),&mut fs,"/binary").unwrap();
+  assert_eq!(e.delete_source_line(actor(),1),Err(Error::Invalid));
+  assert!(!e.status(actor()).unwrap().dirty);
+ }
+}

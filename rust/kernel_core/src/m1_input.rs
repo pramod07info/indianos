@@ -864,3 +864,70 @@ mod r061_terminal_interaction_tests{
   assert_eq!(line.bytes(),b"abcd");
  }
 }
+
+
+/// R062: a complete keyboard edit macro is published or rejected as ONE
+/// change to the authenticated Terminal input line. No Submit key may be
+/// smuggled into a macro and no invalid trailing key may partially modify
+/// the live buffer. This deliberately does not touch the OS command runner.
+impl InputLine{
+ pub fn edit_batch(&mut self,keys:&[EditKey])->Result<usize,Error>{
+  if keys.is_empty()||keys.len()>64||keys.contains(&EditKey::Submit){
+   return Err(Error::Invalid);
+  }
+  let mut staged=LineEditor{
+   line:self.editor.line,len:self.editor.len,caret:self.editor.caret
+  };
+  for key in keys{
+   staged.edit(*key,&mut[])?;
+  }
+  let changed=staged.bytes()!=self.editor.bytes();
+  self.editor=staged;
+  if changed{
+   self.history_cursor=None;
+   self.history_draft.fill(0);self.history_draft_len=0;
+  }
+  Ok(keys.len())
+ }
+}
+#[cfg(test)]
+mod r062_atomic_keyboard_batch_tests{
+ use super::*;
+ #[test]fn typed_navigation_and_insertion_form_one_edit(){
+  let mut input=InputLine::new();
+  input.set_line(b"git stat").unwrap();
+  assert_eq!(input.edit_batch(&[
+   EditKey::End,EditKey::Insert(b'u'),EditKey::Insert(b's'),
+   EditKey::Home,EditKey::Right,EditKey::Right,EditKey::Right,
+   EditKey::Insert(b' ')
+  ]),Ok(8));
+  assert_eq!(input.bytes(),b"git  status");
+  assert_eq!(input.caret(),4);
+ }
+ #[test]fn late_invalid_character_and_overflow_leave_live_draft_intact(){
+  let mut input=InputLine::new();
+  input.set_line(b"safe").unwrap();
+  let before=input.caret();
+  assert_eq!(input.edit_batch(&[
+    EditKey::Insert(b'!'),EditKey::Insert(0)
+  ]),Err(Error::Invalid));
+  assert_eq!(input.bytes(),b"safe");
+  assert_eq!(input.caret(),before);
+  input.set_line(&[b'x';MAX_LINE]).unwrap();
+  assert_eq!(input.edit_batch(&[
+    EditKey::Left,EditKey::Insert(b'!'),
+  ]),Err(Error::Full));
+  assert_eq!(input.bytes(),&[b'x';MAX_LINE]);
+  assert_eq!(input.caret(),MAX_LINE);
+ }
+ #[test]fn submit_in_macro_and_empty_macro_do_not_execute_or_clear_command(){
+  let mut input=InputLine::new();
+  input.set_line(b"write /note safe").unwrap();
+  assert_eq!(input.edit_batch(&[
+    EditKey::Insert(b'!'),EditKey::Submit
+  ]),Err(Error::Invalid));
+  assert_eq!(input.edit_batch(&[]),Err(Error::Invalid));
+  assert_eq!(input.bytes(),b"write /note safe");
+  assert_eq!(input.history_count(),0);
+ }
+}

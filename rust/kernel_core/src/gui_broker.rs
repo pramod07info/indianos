@@ -1786,3 +1786,71 @@ mod r061_grid_layout_tests{
   assert_eq!(layout.epoch(1,10),before);
  }
 }
+
+
+/// R062: stack authenticated developer windows into a visually accessible
+/// cascade. Each later surface is shifted, so no window silently overlays
+/// its predecessor completely. All geometry, owner/epoch and screen-bound
+/// checks are performed by the existing shadow-transaction layout setter.
+impl<const N:usize> SurfaceLayout<N>{
+ pub fn cascade_windows(&mut self,windows:&[(u32,u32)],
+    first:crate::agent_05_surface_rect::Rectangle,
+    step_x:u32,step_y:u32)->Result<usize,Error>{
+  use crate::agent_05_surface_rect::Rectangle;
+  if windows.is_empty()||windows.len()>N||step_x==0||step_y==0{
+   return Err(Error::Invalid);
+  }
+  let mut updates=[(0u32,0u32,Rectangle{x:0,y:0,width:1,height:1});N];
+  for (i,&(owner,window)) in windows.iter().enumerate(){
+   let index=u32::try_from(i).map_err(|_|Error::Invalid)?;
+   let dx=step_x.checked_mul(index).ok_or(Error::Invalid)?;
+   let dy=step_y.checked_mul(index).ok_or(Error::Invalid)?;
+   let x=first.x.checked_add(dx).ok_or(Error::Invalid)?;
+   let y=first.y.checked_add(dy).ok_or(Error::Invalid)?;
+   updates[i]=(owner,window,Rectangle{
+    x,y,width:first.width,height:first.height
+   });
+  }
+  self.set_geometry_batch(&updates[..windows.len()])
+ }
+}
+#[cfg(test)]
+mod r062_cascade_layout_tests{
+ use super::*;
+ use crate::agent_05_surface_rect::Rectangle;
+ fn rect(x:u32,y:u32,w:u32,h:u32)->Rectangle{
+  Rectangle{x,y,width:w,height:h}
+ }
+ #[test]fn three_owned_windows_cascade_with_distinct_redraw_epochs(){
+  let mut layout=SurfaceLayout::<3>::new();
+  let initial=rect(10,10,100,90);
+  for (o,w) in [(1,10),(2,20),(3,30)]{
+   layout.grant(o,w,initial).unwrap();
+  }
+  let before=layout.epoch(2,20);
+  assert_eq!(layout.cascade_windows(&[(1,10),(2,20),(3,30)],
+    rect(20,30,160,100),18,24),Ok(3));
+  assert_eq!(layout.geometry(1,10),Ok(rect(20,30,160,100)));
+  assert_eq!(layout.geometry(2,20),Ok(rect(38,54,160,100)));
+  assert_eq!(layout.geometry(3,30),Ok(rect(56,78,160,100)));
+  assert!(layout.epoch(2,20)>before);
+ }
+ #[test]fn late_foreign_owner_and_screen_overflow_preserve_every_window(){
+  let mut layout=SurfaceLayout::<2>::new();
+  let original=rect(5,5,30,30);
+  layout.grant(1,10,original).unwrap();
+  layout.grant(2,20,original).unwrap();
+  let old=layout.epoch(1,10);
+  assert_eq!(layout.cascade_windows(&[(1,10),(9,20)],
+   rect(10,10,50,50),10,10),Err(Error::Unauthorized));
+  assert_eq!(layout.cascade_windows(&[(1,10),(2,20)],
+   rect(1200,700,100,100),10,10),Err(Error::Invalid));
+  assert_eq!(layout.cascade_windows(&[(1,10),(1,10)],
+   rect(10,10,50,50),10,10),Err(Error::Duplicate));
+  assert_eq!(layout.cascade_windows(&[(1,10),(2,20)],
+   rect(10,10,50,50),0,10),Err(Error::Invalid));
+  assert_eq!(layout.epoch(1,10),old);
+  assert_eq!(layout.geometry(1,10),Ok(original));
+  assert_eq!(layout.geometry(2,20),Ok(original));
+ }
+}
