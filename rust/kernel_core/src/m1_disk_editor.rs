@@ -1082,3 +1082,117 @@ mod r064_source_line_replace_tests{
   assert_eq!(editor.replace_source_line(actor(),1,"safe"),Err(Error::Invalid));
  }
 }
+
+
+/// R065: source-editor multi-line comment and uncomment. Uses exactly one
+/// owner-authenticated, UTF-8-safe replacement for all selected rows and
+/// therefore one undo/redo step. Blank rows are preserved; uncommenting
+/// a nonblank row without the expected prefix fails the whole operation.
+/// COW persistence still requires a later authorized save().
+impl DiskEditor{
+ pub fn comment_source_range(&mut self,caller:Identity,first:usize,
+     last:usize,uncomment:bool)->Result<usize,Error>{
+  self.authorize(caller)?;
+  if first==0||last<first{return Err(Error::Invalid);}
+  let text=core::str::from_utf8(&self.data[..self.used])
+    .map_err(|_|Error::Invalid)?;
+  let mut staged=[0u8;MAX_FILE_BYTES];
+  let mut used=0usize;let mut rows=0usize;let mut changed=0usize;
+  for original in text.split_inclusive('\n'){
+   rows=rows.checked_add(1).ok_or(Error::Full)?;
+   let (line,separator)=match original.strip_suffix('\n'){
+    Some(value)=>(value,true),
+    None=>(original,false),
+   };
+   let selected=rows>=first&&rows<=last&&!line.is_empty();
+   let next=if selected&&uncomment{
+    let content=line.strip_prefix("// ").ok_or(Error::Invalid)?;
+    changed+=1;content
+   }else{line};
+   let addition=next.len()
+      .checked_add(if selected&&!uncomment{3}else{0})
+      .and_then(|n|n.checked_add(usize::from(separator)))
+      .ok_or(Error::Full)?;
+   let end=used.checked_add(addition).ok_or(Error::Full)?;
+   if end>MAX_FILE_BYTES{return Err(Error::Full);}
+   if selected&&!uncomment{
+    staged[used..used+3].copy_from_slice(b"// ");
+    used+=3;changed+=1;
+   }
+   staged[used..used+next.len()].copy_from_slice(next.as_bytes());
+   used+=next.len();
+   if separator{staged[used]=b'\n';used+=1;}
+  }
+  if last>rows{return Err(Error::Invalid);}
+  if changed==0{return Ok(0);}
+  let result=core::str::from_utf8(&staged[..used])
+    .map_err(|_|Error::Invalid)?;
+  self.replace_text(caller,0,self.used,result)?;
+  Ok(changed)
+ }
+}
+#[cfg(test)]
+mod r065_source_comment_tests{
+ use super::*;
+ use crate::block::{BlockError,SECTOR_BYTES};
+ struct Disk{data:[[u8;SECTOR_BYTES];100]}
+ impl BlockDevice for Disk{
+  fn sector_count(&self)->u64{100}
+  fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   *out=*self.data.get(lba as usize).ok_or(BlockError::OutOfRange)?;Ok(())
+  }
+  fn write_sector(&mut self,lba:u64,bytes:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   *self.data.get_mut(lba as usize).ok_or(BlockError::OutOfRange)?=*bytes;Ok(())
+  }
+ }
+ fn actor()->Identity{Identity{pid:12,generation:3}}
+ fn newfs()->HierVfs<Disk>{
+  let mut fs=HierVfs::format_blank(Disk{data:[[0;SECTOR_BYTES];100]}).unwrap();
+  fs.create("/code","α\nβ\nomega".as_bytes()).unwrap();
+  fs.create("/blank",b"a\n\nb\n").unwrap();
+  fs.create("/binary",&[0xff]).unwrap();
+  fs
+ }
+ #[test]fn comments_two_unicode_lines_with_one_undo_and_survives_remount(){
+  let mut fs=newfs();let mut editor=DiskEditor::new();
+  editor.open(actor(),&mut fs,"/code").unwrap();
+  assert_eq!(editor.comment_source_range(actor(),1,2,false),Ok(2));
+  let mut data=[0u8;32];
+  assert_eq!(editor.read(actor(),&mut data),Ok(17));
+  assert_eq!(&data[..17],"// α\n// β\nomega".as_bytes());
+  assert_eq!(editor.undo(actor()),Ok(11));
+  assert_eq!(editor.redo(actor()),Ok(17));
+  editor.save(actor(),&mut fs).unwrap();
+  let mut remounted=HierVfs::mount(fs.into_device()).unwrap();
+  assert_eq!(remounted.read("/code",&mut data),Ok(17));
+  assert_eq!(&data[..17],"// α\n// β\nomega".as_bytes());
+ }
+ #[test]fn preserves_blank_rows_and_terminating_newline_when_uncommenting(){
+  let mut fs=newfs();let mut editor=DiskEditor::new();
+  editor.open(actor(),&mut fs,"/blank").unwrap();
+  assert_eq!(editor.comment_source_range(actor(),1,3,false),Ok(2));
+  let mut out=[0u8;32];
+  assert_eq!(editor.read(actor(),&mut out),Ok(11));
+  assert_eq!(&out[..11],b"// a\n\n// b\n");
+  assert_eq!(editor.comment_source_range(actor(),1,3,true),Ok(2));
+  assert_eq!(editor.read(actor(),&mut out),Ok(5));
+  assert_eq!(&out[..5],b"a\n\nb\n");
+ }
+ #[test]fn malformed_rows_unauthorized_uncomment_and_binary_reject_atomically(){
+  let mut fs=newfs();let mut editor=DiskEditor::new();
+  editor.open(actor(),&mut fs,"/code").unwrap();
+  for (a,b,uncomment) in [(0,1,false),(1,4,false),(2,1,false),(1,2,true)]{
+   assert_eq!(editor.comment_source_range(actor(),a,b,uncomment),
+     Err(Error::Invalid));
+  }
+  assert_eq!(editor.comment_source_range(
+   Identity{generation:4,..actor()},1,1,false),Err(Error::Unauthorized));
+  assert!(!editor.status(actor()).unwrap().dirty);
+  let mut out=[0u8;32];
+  assert_eq!(editor.read(actor(),&mut out),Ok(11));
+  assert_eq!(&out[..11],"α\nβ\nomega".as_bytes());
+  editor.close(actor(),false).unwrap();
+  editor.open(actor(),&mut fs,"/binary").unwrap();
+  assert_eq!(editor.comment_source_range(actor(),1,1,false),Err(Error::Invalid));
+ }
+}

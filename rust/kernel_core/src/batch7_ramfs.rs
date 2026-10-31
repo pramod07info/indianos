@@ -965,3 +965,86 @@ mod r064_atomic_ram_append_tests{
   ]),Err(Error::Invalid));
  }
 }
+
+
+/// R065: optimistic byte-range splice of one authenticated RAM workspace
+/// file. The caller must enforce WRITE permission and provide the observed
+/// per-file revision. No sparse holes, hidden partial writes or disk claim.
+/// The entire resulting payload is staged before a generation is published.
+impl<const N:usize> RamFs<N>{
+ pub fn splice_if_file_revision(&mut self,path:&[u8],expected_file:u64,
+   offset:usize,remove_len:usize,insert:&[u8])->Result<u64,Error>{
+  if !Self::valid_path(path)||expected_file==0||insert.len()>CONTENT_MAX{
+   return Err(Error::Invalid);
+  }
+  let index=self.lookup(path).ok_or(Error::NotFound)?;
+  let current=self.files[index].ok_or(Error::NotFound)?;
+  let end=offset.checked_add(remove_len).ok_or(Error::Invalid)?;
+  if current.version!=expected_file||offset>current.data_len||
+     end>current.data_len{return Err(Error::Invalid);}
+  let new_len=current.data_len.checked_sub(remove_len)
+    .and_then(|size|size.checked_add(insert.len()))
+    .ok_or(Error::Invalid)?;
+  if new_len>CONTENT_MAX{return Err(Error::Invalid);}
+  let mut staged=[0u8;CONTENT_MAX];
+  staged[..offset].copy_from_slice(&current.data[..offset]);
+  staged[offset..offset+insert.len()].copy_from_slice(insert);
+  staged[offset+insert.len()..new_len]
+    .copy_from_slice(&current.data[end..current.data_len]);
+  if new_len==current.data_len&&
+     staged[..new_len]==current.data[..current.data_len]{
+    return Ok(self.version);
+  }
+  self.replace(path,&staged[..new_len])
+ }
+}
+#[cfg(test)]
+mod r065_ram_splice_tests{
+ use super::*;
+ #[test]fn splice_binary_ranges_and_append_with_exact_file_revision(){
+  let mut fs=RamFs::<2>::new();
+  let initial=fs.replace(b"/workspace",&[0,1,2,3,255]).unwrap();
+  let generation=fs.version();
+  assert_eq!(fs.splice_if_file_revision(
+    b"/workspace",initial,1,3,&[9,8]),Ok(generation+1));
+  let mut out=[0u8;16];
+  assert_eq!(fs.read(b"/workspace",0,&mut out),Ok(4));
+  assert_eq!(&out[..4],&[0,9,8,255]);
+  let next=fs.metadata(b"/workspace").unwrap().0;
+  assert_eq!(fs.splice_if_file_revision(
+   b"/workspace",next,4,0,&[7,6]),Ok(generation+2));
+  assert_eq!(fs.read(b"/workspace",0,&mut out),Ok(6));
+  assert_eq!(&out[..6],&[0,9,8,255,7,6]);
+ }
+ #[test]fn stale_revision_bad_offsets_and_path_cannot_touch_existing_data(){
+  let mut fs=RamFs::<1>::new();
+  let revision=fs.replace(b"/keep",b"safe").unwrap();
+  assert_eq!(fs.splice_if_file_revision(b"/keep",revision+1,0,1,b"!"),
+    Err(Error::Invalid));
+  assert_eq!(fs.splice_if_file_revision(b"/keep",revision,5,0,b"!"),
+    Err(Error::Invalid));
+  assert_eq!(fs.splice_if_file_revision(b"/keep",revision,3,2,b"!"),
+    Err(Error::Invalid));
+  assert_eq!(fs.splice_if_file_revision(b"/keep",revision,
+    usize::MAX,1,b"!"),Err(Error::Invalid));
+  assert_eq!(fs.splice_if_file_revision(b"/../bad",revision,0,1,b"!"),
+    Err(Error::Invalid));
+  assert_eq!(fs.splice_if_file_revision(b"/missing",revision,0,0,b"!"),
+    Err(Error::NotFound));
+  assert_eq!(fs.version(),revision);
+  let mut out=[0u8;8];fs.read(b"/keep",0,&mut out).unwrap();
+  assert_eq!(&out[..4],b"safe");
+ }
+ #[test]fn capacity_preflight_and_noop_preserve_generations(){
+  let mut fs=RamFs::<1>::new();
+  let current=fs.replace(b"/file",&[b'x';CONTENT_MAX]).unwrap();
+  assert_eq!(fs.splice_if_file_revision(b"/file",current,0,0,b"!"),
+    Err(Error::Invalid));
+  assert_eq!(fs.splice_if_file_revision(b"/file",current,0,1,b"x"),
+    Ok(current));
+  assert_eq!(fs.splice_if_file_revision(b"/file",current,0,0,b""),
+    Ok(current));
+  assert_eq!(fs.metadata(b"/file"),Ok((current,CONTENT_MAX)));
+  assert_eq!(fs.version(),current);
+ }
+}

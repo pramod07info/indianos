@@ -19,7 +19,7 @@ pub const COMMAND_VERBS:&[&str]=&[
  "help","pwd","tools","ls","cat","write","append","mkdir","mv",
  "cp","rm","mkfile","truncate","head","count","rmdir","mvdir",
  "pread","pwrite","lines","line","hash","stat","tail","find","grep","cmp","diffat",
- "touch","copynew","replace","appendln","health","hex","slice","concat","cmprange","bytefreq",
+ "touch","copynew","replace","appendln","health","hex","slice","concat","cmprange","bytefreq","patchhex",
 ];
 /// Complete exactly one printable lower-case verb prefix. Ambiguous matches,
 /// empty prefixes and user-supplied paths never cause completion or I/O.
@@ -91,7 +91,7 @@ pub fn command<D:BlockDevice,const N:usize>(
  let line=entered.trim_end();
  if line=="help"{return publish(b"pwd ls /dir cat /path write /path text append /path text mkdir /dir mv /old /new cp /src /dst rm /path mkfile /path truncate /path head /path count rmdir /dir mvdir /old /new pread /file offset count pwrite /file@offset text",out);}
  if line=="pwd"{return publish(b"/",out);}
- if line=="tools"{return publish(b"count lines line tail find grep hash cmp diffat stat touch copynew replace appendln health hex slice concat cmprange bytefreq",out);}
+ if line=="tools"{return publish(b"count lines line tail find grep hash cmp diffat stat touch copynew replace appendln health hex slice concat cmprange bytefreq patchhex",out);}
  if line=="health"{
   auth.require(caller,FILE_READ,now).map_err(|_|Error::Denied)?;
   let health=fs.mounted_health().map_err(Error::Io)?;
@@ -385,6 +385,30 @@ pub fn command<D:BlockDevice,const N:usize>(
    let n=fs.read(p,&mut data).map_err(Error::Io)?;
    let frequency=data[..n].iter().filter(|&&b|b==needle).count();
    publish_number(frequency as u64,out)
+  }
+  // Authenticated single-byte binary patch through a checksummed COW
+  // overwrite. No sparse writes and no mutation on invalid offset,
+  // protected namespace, short output, missing file or unchanged byte.
+  "patchhex"=>{
+   auth.require(caller,FILE_READ|FILE_WRITE,now).map_err(|_|Error::Denied)?;
+   if out.len()<9{return Err(Error::OutputTooSmall);}
+   let mut args=raw.split_ascii_whitespace();
+   let source=args.next().ok_or(Error::Invalid)?;
+   let offset=args.next().ok_or(Error::Invalid)?
+      .parse::<u64>().map_err(|_|Error::Invalid)?;
+   let encoded=args.next().ok_or(Error::Invalid)?;
+   if args.next().is_some(){return Err(Error::Invalid);}
+   let replacement=r065_hex_byte(encoded)?;
+   let p=path(source,&mut name)?;
+   writable_path(p)?;
+   let mut bytes=[0u8;crate::durablefs::MAX_FILE_BYTES];
+   let size=fs.read(p,&mut bytes).map_err(Error::Io)?;
+   let offset=usize::try_from(offset).map_err(|_|Error::Invalid)?;
+   if offset>=size{return Err(Error::Invalid);}
+   if bytes[offset]==replacement{return publish(b"unchanged",out);}
+   bytes[offset]=replacement;
+   fs.overwrite(p,&bytes[..size]).map_err(Error::Io)?;
+   publish(b"patched",out)
   }
   "copynew"=>{
    auth.require(caller,FILE_READ|FILE_WRITE,now).map_err(|_|Error::Denied)?;
@@ -1023,7 +1047,7 @@ mod tests{
   assert_eq!(complete_verb(b"heal"),Some("health"));
  }
  #[test]fn r044_command_registry_drives_unique_safe_completion(){
-  assert_eq!(COMMAND_VERBS.len(),38);
+  assert_eq!(COMMAND_VERBS.len(),39);
   for (i,verb) in COMMAND_VERBS.iter().enumerate(){
    assert!(verb.as_bytes().iter().all(|b|b.is_ascii_lowercase()));
    assert!(!COMMAND_VERBS[..i].contains(verb));
@@ -2030,5 +2054,96 @@ mod r064_byte_frequency_tests{
   let (mut fs,auth)=setup();let mut out=[0x42;0];
   assert_eq!(command(&mut fs,&auth,actor(),1,
    b"bytefreq /binary 00",&mut out),Err(Error::OutputTooSmall));
+ }
+}
+
+
+/// R065: strictly decode a single hex byte for binary file diagnostics.
+/// Reject signs, whitespace, partial digits and non-ASCII characters.
+fn r065_hex_byte(encoded:&str)->Result<u8,Error>{
+ let bytes=encoded.as_bytes();
+ if bytes.len()!=2{return Err(Error::Invalid);}
+ let nibble=|b:u8|->Result<u8,Error>{
+  match b{
+   b'0'..=b'9'=>Ok(b-b'0'),
+   b'a'..=b'f'=>Ok(b-b'a'+10),
+   b'A'..=b'F'=>Ok(b-b'A'+10),
+   _=>Err(Error::Invalid),
+  }
+ };
+ Ok((nibble(bytes[0])?<<4)|nibble(bytes[1])?)
+}
+#[cfg(test)]
+mod r065_durable_hex_patch_tests{
+ use super::*;
+ use crate::block::{BlockError,SECTOR_BYTES};
+ struct Disk{data:[[u8;SECTOR_BYTES];100]}
+ impl BlockDevice for Disk{
+  fn sector_count(&self)->u64{100}
+  fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   *out=*self.data.get(lba as usize).ok_or(BlockError::OutOfRange)?;Ok(())
+  }
+  fn write_sector(&mut self,lba:u64,bytes:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   *self.data.get_mut(lba as usize).ok_or(BlockError::OutOfRange)?=*bytes;Ok(())
+  }
+ }
+ fn actor()->Identity{Identity{pid:18,generation:4}}
+ fn setup()->(HierVfs<Disk>,Access<1>){
+  let mut fs=HierVfs::format_blank(Disk{data:[[0;SECTOR_BYTES];100]}).unwrap();
+  fs.create("/binary",&[0,65,255]).unwrap();
+  let mut auth=Access::new();
+  auth.grant(actor(),FILE_READ|FILE_WRITE,100).unwrap();
+  (fs,auth)
+ }
+ #[test]fn binary_edit_is_one_cow_overwrite_and_survives_mount(){
+  let (mut fs,auth)=setup();let before=fs.generation();
+  let mut out=[0u8;16];
+  assert_eq!(command(&mut fs,&auth,actor(),1,
+   b"patchhex /binary 1 7f",&mut out),Ok(7));
+  assert_eq!(&out[..7],b"patched");
+  assert_eq!(fs.generation(),before+1);
+  fs=HierVfs::mount(fs.into_device()).unwrap();
+  let mut bytes=[0u8;8];
+  assert_eq!(fs.read("/binary",&mut bytes),Ok(3));
+  assert_eq!(&bytes[..3],&[0,127,255]);
+  assert_eq!(command(&mut fs,&auth,actor(),1,
+   b"patchhex /binary 1 7F",&mut out),Ok(9));
+  assert_eq!(&out[..9],b"unchanged");
+  assert_eq!(fs.generation(),before+1);
+ }
+ #[test]fn short_output_stale_identity_and_reserved_namespace_fail_closed(){
+  let (mut fs,auth)=setup();let generation=fs.generation();
+  let mut short=[0xab;6];
+  assert_eq!(command(&mut fs,&auth,actor(),1,
+   b"patchhex /binary 1 09",&mut short),Err(Error::OutputTooSmall));
+  assert_eq!(short,[0xab;6]);
+  let mut out=[0xab;16];
+  assert_eq!(command(&mut fs,&auth,
+   Identity{generation:5,..actor()},1,
+   b"patchhex /binary 1 09",&mut out),Err(Error::Denied));
+  assert_eq!(command(&mut fs,&auth,actor(),1,
+   b"patchhex /boot/kernel 0 09",&mut out),Err(Error::Denied));
+  assert_eq!(fs.generation(),generation);
+  assert_eq!(out,[0xab;16]);
+ }
+ #[test]fn invalid_offsets_hex_paths_and_extra_args_preserve_disk(){
+  let (mut fs,auth)=setup();let before=fs.generation();
+  let mut out=[0xac;16];
+  for invalid in [
+   b"patchhex /binary 3 09".as_slice(),
+   b"patchhex /binary -1 09",
+   b"patchhex /binary 0 gg",
+   b"patchhex /binary 0 0",
+   b"patchhex /binary 0 123",
+   b"patchhex /binary 1 09 extra",
+   b"patchhex /../bad 0 09",
+  ]{
+   assert_eq!(command(&mut fs,&auth,actor(),1,invalid,&mut out),
+    Err(Error::Invalid));
+  }
+  assert_eq!(command(&mut fs,&auth,actor(),1,
+   b"patchhex /missing 0 ff",&mut out),Err(Error::Io(FsError::NotFound)));
+  assert_eq!(fs.generation(),before);
+  assert_eq!(out,[0xac;16]);
  }
 }

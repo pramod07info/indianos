@@ -1087,3 +1087,93 @@ mod r064_shared_history_completion_tests{
   assert_eq!(input.history_count(),3);
  }
 }
+
+
+/// R065: privacy-aware removal of exact successful commands from a
+/// process-local fixed history ring. Unknown/invalid commands are a no-op.
+/// While browsing, restore the unsent draft BEFORE compacting history so
+/// the user never loses their work or executes a recalled command.
+/// The caller must bind this InputLine to the authenticated process.
+impl InputLine{
+ pub fn forget_history_command(&mut self,command:&[u8])->Result<usize,Error>{
+  if command.is_empty()||command.len()>MAX_LINE||
+     command.iter().any(|&b|!(b' '..=b'~').contains(&b)){
+   return Err(Error::Invalid);
+  }
+  let removed=self.history.iter().flatten().filter(|entry|
+   &entry.bytes[..entry.len]==command).count();
+  if removed==0{return Err(Error::Invalid);}
+  // replace_line cannot fail: this draft was previously captured from
+  // the same fixed-capacity valid LineEditor.
+  if self.history_cursor.is_some(){
+   self.editor.replace_line(&self.history_draft[..self.history_draft_len])?;
+  }
+  let mut retained=[None;HISTORY_LIMIT];
+  let mut size=0usize;
+  for entry in self.history.iter().flatten(){
+   if &entry.bytes[..entry.len]!=command{
+    retained[size]=Some(*entry);size+=1;
+   }
+  }
+  self.history=retained;
+  self.history_len=size;
+  self.history_cursor=None;
+  self.history_draft.fill(0);
+  self.history_draft_len=0;
+  Ok(removed)
+ }
+}
+#[cfg(test)]
+mod r065_history_redaction_tests{
+ use super::*;
+ fn filled()->InputLine{
+  let mut input=InputLine::new();let mut out=[0u8;MAX_LINE];
+  for command in [b"git status".as_slice(),b"cargo test",b"git diff"]{
+   input.set_line(command).unwrap();
+   input.feed(b'\n',&mut out).unwrap();
+  }
+  input
+ }
+ #[test]fn removing_middle_command_preserves_newest_oldest_and_draft(){
+  let mut input=filled();
+  input.set_line(b"draft").unwrap();
+  assert_eq!(input.forget_history_command(b"cargo test"),Ok(1));
+  assert_eq!(input.history_count(),2);
+  assert_eq!(input.bytes(),b"draft");
+  assert_eq!(input.history_previous(),Ok(8));
+  assert_eq!(input.bytes(),b"git diff");
+  assert_eq!(input.history_previous(),Ok(10));
+  assert_eq!(input.bytes(),b"git status");
+  assert_eq!(input.history_next(),Ok(8));
+  assert_eq!(input.history_next(),Ok(5));
+  assert_eq!(input.bytes(),b"draft");
+ }
+ #[test]fn redacting_active_history_entry_restores_pending_unsent_text(){
+  let mut input=filled();
+  input.set_line(b"unsent work").unwrap();
+  assert_eq!(input.history_previous(),Ok(8));
+  assert_eq!(input.bytes(),b"git diff");
+  assert_eq!(input.forget_history_command(b"git diff"),Ok(1));
+  assert_eq!(input.bytes(),b"unsent work");
+  assert_eq!(input.history_count(),2);
+  assert_eq!(input.history_next(),Err(Error::Invalid));
+  assert_eq!(input.history_previous(),Ok(10));
+  assert_eq!(input.bytes(),b"cargo test");
+ }
+ #[test]fn exact_matches_only_and_invalid_requests_do_not_modify_clipboard(){
+  let mut input=filled();
+  input.set_line(b"git status").unwrap();
+  input.copy_range(0,3).unwrap();
+  assert_eq!(input.forget_history_command(b"git"),Err(Error::Invalid));
+  assert_eq!(input.forget_history_command(b""),Err(Error::Invalid));
+  assert_eq!(input.forget_history_command(b"bad\ncommand"),Err(Error::Invalid));
+  assert_eq!(input.history_count(),3);
+  assert_eq!(input.clipboard_bytes(),b"git");
+  assert_eq!(input.forget_history_command(b"git status"),Ok(1));
+  assert_eq!(input.history_count(),2);
+  assert_eq!(input.bytes(),b"git status");
+  input.forget();
+  assert_eq!(input.history_count(),0);
+  assert_eq!(input.clipboard_bytes(),b"");
+ }
+}
