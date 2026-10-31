@@ -19,7 +19,7 @@ pub const COMMAND_VERBS:&[&str]=&[
  "help","pwd","tools","ls","cat","write","append","mkdir","mv",
  "cp","rm","mkfile","truncate","head","count","rmdir","mvdir",
  "pread","pwrite","lines","line","hash","stat","tail","find","grep","cmp","diffat",
- "touch","copynew","replace","appendln","health","hex",
+ "touch","copynew","replace","appendln","health","hex","slice",
 ];
 /// Complete exactly one printable lower-case verb prefix. Ambiguous matches,
 /// empty prefixes and user-supplied paths never cause completion or I/O.
@@ -270,6 +270,34 @@ pub fn command<D:BlockDevice,const N:usize>(
     },
     Err(e)=>Err(Error::Io(e))
    }
+  }
+  // Durable non-clobbering extraction of a real file byte range.
+  // This copies binary data (including NULs) through one checksummed
+  // destination COW create. A denied, bad or short-output operation can
+  // neither modify a source file nor create a partial destination.
+  "slice"=>{
+   auth.require(caller,FILE_READ|FILE_WRITE,now).map_err(|_|Error::Denied)?;
+   if out.len()<6{return Err(Error::OutputTooSmall);}
+   let mut args=raw.split_ascii_whitespace();
+   let src=args.next().ok_or(Error::Invalid)?;
+   let offset=args.next().ok_or(Error::Invalid)?
+      .parse::<u64>().map_err(|_|Error::Invalid)?;
+   let count=args.next().ok_or(Error::Invalid)?
+      .parse::<usize>().map_err(|_|Error::Invalid)?;
+   let dst=args.next().ok_or(Error::Invalid)?;
+   if args.next().is_some()||count==0||count>MAX_TRANSFER{
+    return Err(Error::Invalid);
+   }
+   let src=path(src,&mut name)?;
+   let mut target=[0u8;64];
+   let dst=path(dst,&mut target)?;
+   if src==dst{return Err(Error::Invalid);}
+   writable_path(dst)?;
+   let mut bytes=[0u8;MAX_TRANSFER];
+   let n=fs.read_at(src,offset,&mut bytes[..count]).map_err(Error::Io)?;
+   if n==0{return Err(Error::Invalid);}
+   fs.create(dst,&bytes[..n]).map_err(Error::Io)?;
+   publish(b"copied",out)
   }
   "copynew"=>{
    auth.require(caller,FILE_READ|FILE_WRITE,now).map_err(|_|Error::Denied)?;
@@ -908,7 +936,7 @@ mod tests{
   assert_eq!(complete_verb(b"heal"),Some("health"));
  }
  #[test]fn r044_command_registry_drives_unique_safe_completion(){
-  assert_eq!(COMMAND_VERBS.len(),34);
+  assert_eq!(COMMAND_VERBS.len(),35);
   for (i,verb) in COMMAND_VERBS.iter().enumerate(){
    assert!(verb.as_bytes().iter().all(|b|b.is_ascii_lowercase()));
    assert!(!COMMAND_VERBS[..i].contains(verb));
@@ -916,6 +944,7 @@ mod tests{
   assert_eq!(complete_verb(b"mkf"),Some("mkfile"));
   assert_eq!(complete_verb(b"copyne"),Some("copynew"));
   assert_eq!(complete_verb(b"hex"),Some("hex"));
+  assert_eq!(complete_verb(b"slic"),Some("slice"));
   assert_eq!(complete_verb(b"rmd"),Some("rmdir"));
   assert_eq!(complete_verb(b"app"),None);
   assert_eq!(complete_verb(b"pw"),None);
@@ -1626,5 +1655,75 @@ mod r060_hex_diagnostic_tests{
        Err(Error::Invalid));
   }
   assert_eq!(short,[0xb8;3]);
+ }
+}
+
+
+#[cfg(test)]
+mod r061_persistent_slice_tests{
+ use super::*;
+ use crate::block::{BlockError,SECTOR_BYTES};
+ struct Disk{data:[[u8;SECTOR_BYTES];100]}
+ impl BlockDevice for Disk{
+  fn sector_count(&self)->u64{100}
+  fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   *out=*self.data.get(lba as usize).ok_or(BlockError::OutOfRange)?;Ok(())
+  }
+  fn write_sector(&mut self,lba:u64,bytes:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   *self.data.get_mut(lba as usize).ok_or(BlockError::OutOfRange)?=*bytes;Ok(())
+  }
+ }
+ fn actor()->Identity{Identity{pid:4,generation:6}}
+ fn ready()->(HierVfs<Disk>,Access<1>){
+  let mut fs=HierVfs::format_blank(Disk{data:[[0;SECTOR_BYTES];100]}).unwrap();
+  fs.create("/binary",&[0,1,2,3,255]).unwrap();
+  let mut access=Access::new();
+  access.grant(actor(),FILE_READ|FILE_WRITE,100).unwrap();
+  (fs,access)
+ }
+ #[test]fn binary_slice_is_durable_and_does_not_modify_source(){
+  let (mut fs,auth)=ready();let mut output=[0u8;16];
+  let before=fs.generation();
+  assert_eq!(command(&mut fs,&auth,actor(),1,
+    b"slice /binary 1 3 /portion",&mut output),Ok(6));
+  assert_eq!(&output[..6],b"copied");
+  assert!(fs.generation()>before);
+  let mut saved=[0u8;8];
+  assert_eq!(fs.read("/binary",&mut saved),Ok(5));
+  assert_eq!(&saved[..5],&[0,1,2,3,255]);
+  fs=HierVfs::mount(fs.into_device()).unwrap();
+  assert_eq!(fs.read("/portion",&mut saved),Ok(3));
+  assert_eq!(&saved[..3],&[1,2,3]);
+ }
+ #[test]fn existing_destination_and_short_output_do_not_publish(){
+  let (mut fs,auth)=ready();
+  fs.create("/portion",b"untouched").unwrap();
+  let version=fs.generation();let mut out=[0xa5;5];
+  assert_eq!(command(&mut fs,&auth,actor(),1,
+    b"slice /binary 0 3 /new",&mut out),Err(Error::OutputTooSmall));
+  assert_eq!(out,[0xa5;5]);assert_eq!(fs.generation(),version);
+  let mut long=[0u8;16];
+  assert_eq!(command(&mut fs,&auth,actor(),1,
+    b"slice /binary 0 3 /portion",&mut long),
+    Err(Error::Io(FsError::Exists)));
+  assert_eq!(fs.generation(),version);
+  let mut verify=[0u8;16];assert_eq!(fs.read("/portion",&mut verify),Ok(9));
+  assert_eq!(&verify[..9],b"untouched");
+ }
+ #[test]fn stale_owner_protected_path_and_bad_offsets_are_fail_closed(){
+  let (mut fs,auth)=ready();
+  let before=fs.generation();let mut out=[0x22;16];
+  let stale=Identity{generation:7,..actor()};
+  assert_eq!(command(&mut fs,&auth,stale,1,
+     b"slice /binary 0 2 /copy",&mut out),Err(Error::Denied));
+  for bad in [b"slice /binary 0 0 /copy".as_slice(),
+              b"slice /binary -1 2 /copy",
+              b"slice /binary 0 99999 /copy",
+              b"slice /binary 0 2 /../bad"]{
+   assert_eq!(command(&mut fs,&auth,actor(),1,bad,&mut out),
+     Err(Error::Invalid));
+  }
+  assert_eq!(fs.generation(),before);
+  assert_eq!(out,[0x22;16]);
  }
 }

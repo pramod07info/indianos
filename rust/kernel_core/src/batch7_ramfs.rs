@@ -621,3 +621,106 @@ mod r060_rename_batch_tests{
   assert_eq!(&out[..4],b"data");
  }
 }
+
+
+/// R061: trusted workstation transaction script for the RAM-backed Files
+/// model. Operations are deliberately serialized on a PRIVATE filesystem
+/// generation: any late full-table, stale file, collision, or invalid-path
+/// error rolls back every preceding mutation. Never claim reboot durability.
+#[derive(Clone,Copy)]
+pub enum RamMutation<'a>{
+ Put{path:&'a [u8],contents:&'a [u8]},
+ Remove{path:&'a [u8],version:u64},
+ Move{from:&'a [u8],to:&'a [u8],version:u64},
+}
+impl<const N:usize> RamFs<N>{
+ /// Requires a kernel-authenticated caller with suitable read/write grants
+ /// for EVERY source/destination before invoking. Not a raw userspace API.
+ pub fn transact_if_revision(&mut self,expected_global:u64,
+    operations:&[RamMutation<'_>])->Result<u64,Error>{
+  if operations.is_empty()||operations.len()>16||
+     expected_global!=self.version{return Err(Error::Invalid);}
+  let mut staged=Self{files:self.files,version:self.version};
+  for operation in operations{
+   match *operation{
+    RamMutation::Put{path,contents}=>{
+     staged.replace(path,contents)?;
+    },
+    RamMutation::Remove{path,version}=>{
+     staged.delete_if_version(path,version)?;
+    },
+    RamMutation::Move{from,to,version}=>{
+     staged.rename_if_version(from,to,version)?;
+    },
+   }
+  }
+  *self=staged;
+  Ok(self.version)
+ }
+}
+#[cfg(test)]
+mod r061_mixed_transaction_tests{
+ use super::*;
+ #[test]fn puts_removal_and_rename_publish_as_one_generation(){
+  let mut fs=RamFs::<4>::new();
+  let _keep=fs.replace(b"/keep",b"old").unwrap();
+  let gone=fs.replace(b"/gone",b"remove").unwrap();
+  let moved=fs.replace(b"/move",b"original").unwrap();
+  let before=fs.version();
+  assert_eq!(fs.transact_if_revision(before,&[
+    RamMutation::Put{path:b"/keep",contents:b"updated"},
+    RamMutation::Remove{path:b"/gone",version:gone},
+    RamMutation::Move{from:b"/move",to:b"/renamed",version:moved},
+    RamMutation::Put{path:b"/new",contents:b"new data"},
+  ]),Ok(before+4));
+  assert_eq!(fs.count(),3);
+  assert_eq!(fs.metadata(b"/gone"),Err(Error::NotFound));
+  assert_eq!(fs.metadata(b"/move"),Err(Error::NotFound));
+  let mut out=[0u8;16];
+  assert_eq!(fs.read(b"/keep",0,&mut out),Ok(7));
+  assert_eq!(&out[..7],b"updated");
+  assert_eq!(fs.read(b"/renamed",0,&mut out),Ok(8));
+  assert_eq!(&out[..8],b"original");
+  assert_eq!(fs.read(b"/new",0,&mut out),Ok(8));
+ }
+ #[test]fn late_version_conflict_and_name_collision_revert_earlier_updates(){
+  let mut fs=RamFs::<3>::new();
+  fs.replace(b"/a",b"safe").unwrap();
+  let b=fs.replace(b"/b",b"peer").unwrap();
+  let before=fs.version();
+  assert_eq!(fs.transact_if_revision(before,&[
+    RamMutation::Put{path:b"/a",contents:b"changed"},
+    RamMutation::Remove{path:b"/b",version:b+1},
+  ]),Err(Error::Invalid));
+  assert_eq!(fs.transact_if_revision(before,&[
+    RamMutation::Put{path:b"/a",contents:b"changed"},
+    RamMutation::Move{from:b"/b",to:b"/a",version:b},
+  ]),Err(Error::Invalid));
+  assert_eq!(fs.version(),before);
+  let mut out=[0u8;8];
+  assert_eq!(fs.read(b"/a",0,&mut out),Ok(4));
+  assert_eq!(&out[..4],b"safe");
+  assert_eq!(fs.read(b"/b",0,&mut out),Ok(4));
+  assert_eq!(&out[..4],b"peer");
+ }
+ #[test]fn full_capacity_bad_path_and_stale_global_leave_all_bytes(){
+  let mut fs=RamFs::<1>::new();
+  fs.replace(b"/keep",b"safe").unwrap();
+  let before=fs.version();
+  assert_eq!(fs.transact_if_revision(before,&[
+    RamMutation::Put{path:b"/keep",contents:b"unsafe"},
+    RamMutation::Put{path:b"/extra",contents:b"data"},
+  ]),Err(Error::Full));
+  assert_eq!(fs.transact_if_revision(before,&[
+    RamMutation::Put{path:b"/keep",contents:b"unsafe"},
+    RamMutation::Put{path:b"/../escape",contents:b"x"},
+  ]),Err(Error::Invalid));
+  assert_eq!(fs.transact_if_revision(0,&[
+    RamMutation::Put{path:b"/keep",contents:b"unsafe"},
+  ]),Err(Error::Invalid));
+  assert_eq!(fs.transact_if_revision(before,&[]),Err(Error::Invalid));
+  assert_eq!(fs.version(),before);
+  let mut out=[0u8;8];fs.read(b"/keep",0,&mut out).unwrap();
+  assert_eq!(&out[..4],b"safe");
+ }
+}

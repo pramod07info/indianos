@@ -669,3 +669,110 @@ mod r060_multi_cursor_tests{
     Err(Error::Unauthorized));
  }
 }
+
+
+/// R061: duplicate a complete UTF-8 source row immediately below itself.
+/// All offsets refer to one authenticated unsaved buffer. An invalid row,
+/// binary buffer, or full editor is left untouched, including undo/redo.
+/// The underlying save operation still uses a durable single COW overwrite.
+impl DiskEditor{
+ pub fn duplicate_source_line(&mut self,caller:Identity,
+    line:usize)->Result<usize,Error>{
+  self.authorize(caller)?;
+  if line==0{return Err(Error::Invalid);}
+  let text=core::str::from_utf8(&self.data[..self.used])
+      .map_err(|_|Error::Invalid)?;
+  let mut start=0usize;
+  let mut chosen=None;
+  for (index,row) in text.split_terminator('\n').enumerate(){
+   if index+1==line{
+    let end=start+row.len();
+    let terminated=end<self.used&&self.data[end]==b'\n';
+    chosen=Some((start,end,terminated));
+    break;
+   }
+   start=start.checked_add(row.len()+1).ok_or(Error::Full)?;
+  }
+  let (begin,end,terminated)=chosen.ok_or(Error::Invalid)?;
+  let copy_len=end-begin+1;
+  let next=self.used.checked_add(copy_len).ok_or(Error::Full)?;
+  if next>MAX_FILE_BYTES{return Err(Error::Full);}
+  let mut scratch=[0u8;MAX_FILE_BYTES];
+  let offset=if terminated{
+   scratch[..end-begin].copy_from_slice(&self.data[begin..end]);
+   scratch[end-begin]=b'\n';
+   end+1
+  }else{
+   scratch[0]=b'\n';
+   scratch[1..copy_len].copy_from_slice(&self.data[begin..end]);
+   end
+  };
+  self.replace(caller,offset,offset,&scratch[..copy_len])
+ }
+}
+#[cfg(test)]
+mod r061_line_duplicate_tests{
+ use super::*;
+ use crate::block::{BlockError,SECTOR_BYTES};
+ struct Disk{data:[[u8;SECTOR_BYTES];100]}
+ impl BlockDevice for Disk{
+  fn sector_count(&self)->u64{100}
+  fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   *out=*self.data.get(lba as usize).ok_or(BlockError::OutOfRange)?;Ok(())
+  }
+  fn write_sector(&mut self,lba:u64,bytes:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   *self.data.get_mut(lba as usize).ok_or(BlockError::OutOfRange)?=*bytes;Ok(())
+  }
+ }
+ fn owner()->Identity{Identity{pid:7,generation:9}}
+ fn volume()->HierVfs<Disk>{
+  let mut fs=HierVfs::format_blank(Disk{data:[[0;SECTOR_BYTES];100]}).unwrap();
+  fs.create("/code", "α\nβ".as_bytes()).unwrap();fs
+ }
+ #[test]fn unicode_row_duplication_is_single_undo_and_survives_remount(){
+  let mut fs=volume();let mut editor=DiskEditor::new();
+  editor.open(owner(),&mut fs,"/code").unwrap();
+  assert_eq!(editor.duplicate_source_line(owner(),1),Ok(8));
+  let mut out=[0u8;20];
+  assert_eq!(editor.read(owner(),&mut out),Ok(8));
+  assert_eq!(&out[..8],"α\nα\nβ".as_bytes());
+  assert_eq!(editor.undo(owner()),Ok(5));
+  assert_eq!(editor.redo(owner()),Ok(8));
+  editor.save(owner(),&mut fs).unwrap();
+  let mut mounted=HierVfs::mount(fs.into_device()).unwrap();
+  let mut saved=[0u8;20];assert_eq!(mounted.read("/code",&mut saved),Ok(8));
+  assert_eq!(&saved[..8],"α\nα\nβ".as_bytes());
+ }
+ #[test]fn last_line_and_terminal_newline_have_consistent_boundaries(){
+  let mut fs=volume();
+  fs.create("/newline",b"a\n").unwrap();
+  let mut editor=DiskEditor::new();
+  editor.open(owner(),&mut fs,"/newline").unwrap();
+  assert_eq!(editor.duplicate_source_line(owner(),1),Ok(4));
+  let mut out=[0u8;8];editor.read(owner(),&mut out).unwrap();
+  assert_eq!(&out[..4],b"a\na\n");
+  assert_eq!(editor.duplicate_source_line(owner(),3),Err(Error::Invalid));
+  editor.close(owner(),true).unwrap();
+  editor.open(owner(),&mut fs,"/code").unwrap();
+  assert_eq!(editor.duplicate_source_line(owner(),2),Ok(8));
+  editor.read(owner(),&mut out).unwrap();
+  assert_eq!(&out[..8],"α\nβ\nβ".as_bytes());
+ }
+ #[test]fn invalid_line_binary_file_and_foreign_owner_never_mutate(){
+  let mut fs=volume();fs.create("/binary",&[0xff,0xfe]).unwrap();
+  let mut editor=DiskEditor::new();
+  editor.open(owner(),&mut fs,"/code").unwrap();
+  let mut out=[0x6fu8;20];
+  assert_eq!(editor.duplicate_source_line(owner(),0),Err(Error::Invalid));
+  assert_eq!(editor.duplicate_source_line(owner(),99),Err(Error::Invalid));
+  assert_eq!(editor.duplicate_source_line(
+     Identity{generation:10,..owner()},1),Err(Error::Unauthorized));
+  assert_eq!(editor.read(owner(),&mut out),Ok(5));
+  assert_eq!(&out[..5],"α\nβ".as_bytes());
+  assert!(!editor.status(owner()).unwrap().dirty);
+  editor.close(owner(),false).unwrap();
+  editor.open(owner(),&mut fs,"/binary").unwrap();
+  assert_eq!(editor.duplicate_source_line(owner(),1),Err(Error::Invalid));
+  assert!(!editor.status(owner()).unwrap().dirty);
+ }
+}
