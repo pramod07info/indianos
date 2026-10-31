@@ -2277,3 +2277,75 @@ mod r067_bookmarked_layout_tests{
   assert_eq!(layout.geometry(1,10),after);
  }
 }
+
+
+/// R068: snap authenticated workstation windows to nearby edges of a
+/// bounded desktop working area. All updates use a single transactional
+/// compositor geometry publication; invalid late owners change nothing.
+impl<const N:usize> SurfaceLayout<N>{
+ pub fn snap_edges_batch(&mut self,windows:&[(u32,u32)],
+  area:crate::agent_05_surface_rect::Rectangle,
+  threshold:u32)->Result<usize,Error>{
+  use crate::agent_05_surface_rect::{Rectangle,clip_owned};
+  if windows.is_empty()||windows.len()>N||threshold==0{
+   return Err(Error::Invalid);
+  }
+  clip_owned(area,area,1,1).map_err(|_|Error::Invalid)?;
+  let right=area.x.checked_add(area.width).ok_or(Error::Invalid)?;
+  let bottom=area.y.checked_add(area.height).ok_or(Error::Invalid)?;
+  let mut requests=[(0u32,0u32,Rectangle{x:0,y:0,width:1,height:1});N];
+  for (i,&(owner,window)) in windows.iter().enumerate(){
+   if windows[..i].iter().any(|&(_,previous)|previous==window){
+    return Err(Error::Duplicate);
+   }
+   let mut r=self.geometry(owner,window)?;
+   if r.width>area.width||r.height>area.height{return Err(Error::Invalid);}
+   let far_x=right-r.width;
+   let far_y=bottom-r.height;
+   if r.x.abs_diff(area.x)<=threshold{r.x=area.x;}
+   else if r.x.abs_diff(far_x)<=threshold{r.x=far_x;}
+   if r.y.abs_diff(area.y)<=threshold{r.y=area.y;}
+   else if r.y.abs_diff(far_y)<=threshold{r.y=far_y;}
+   if r.x<area.x||r.x>far_x||r.y<area.y||r.y>far_y{
+    return Err(Error::Invalid);
+   }
+   requests[i]=(owner,window,r);
+  }
+  self.set_geometry_batch(&requests[..windows.len()])
+ }
+}
+#[cfg(test)]
+mod r068_snap_edges_tests{
+ use super::*;
+ use crate::agent_05_surface_rect::Rectangle;
+ fn r(x:u32,y:u32,w:u32,h:u32)->Rectangle{
+  Rectangle{x,y,width:w,height:h}
+ }
+ #[test]fn two_windows_snap_to_nearby_edges_in_one_layout_transaction(){
+  let mut layout=SurfaceLayout::<2>::new();
+  layout.grant(1,10,r(12,14,100,60)).unwrap();
+  layout.grant(2,20,r(187,135,100,60)).unwrap();
+  let before=layout.next_epoch;
+  assert_eq!(layout.snap_edges_batch(&[(1,10),(2,20)],
+   r(10,10,280,190),5),Ok(2));
+  assert_eq!(layout.geometry(1,10),Ok(r(10,10,100,60)));
+  assert_eq!(layout.geometry(2,20),Ok(r(190,140,100,60)));
+  assert_eq!(layout.next_epoch,before+2);
+  assert_eq!(layout.snap_edges_batch(&[(1,10),(2,20)],
+   r(10,10,280,190),5),Ok(2));
+  assert_eq!(layout.next_epoch,before+2);
+ }
+ #[test]fn bad_late_owner_duplicate_and_small_area_do_not_move_windows(){
+  let mut layout=SurfaceLayout::<2>::new();
+  layout.grant(1,10,r(12,14,100,60)).unwrap();
+  layout.grant(2,20,r(170,30,100,60)).unwrap();
+  let before=layout.next_epoch;let first=layout.geometry(1,10);
+  assert_eq!(layout.snap_edges_batch(&[(1,10),(9,20)],
+   r(10,10,280,190),5),Err(Error::Unauthorized));
+  assert_eq!(layout.snap_edges_batch(&[(1,10),(1,10)],
+   r(10,10,280,190),5),Err(Error::Duplicate));
+  assert_eq!(layout.snap_edges_batch(&[(1,10),(2,20)],
+   r(10,10,20,20),5),Err(Error::Invalid));
+  assert_eq!(layout.next_epoch,before);assert_eq!(layout.geometry(1,10),first);
+ }
+}

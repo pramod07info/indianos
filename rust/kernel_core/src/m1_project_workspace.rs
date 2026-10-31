@@ -1052,3 +1052,82 @@ mod r067_project_extract_tests{
   assert_eq!(fs.generation(),generation+1);
  }
 }
+
+
+/// R068: exact byte compare-and-save on a durable project file. The
+/// project generation AND original data must agree before any COW write.
+impl ProjectTree{
+ pub fn save_file_if_bytes<D:BlockDevice>(&mut self,caller:Identity,
+  fs:&mut HierVfs<D>,name:&str,expected:&[u8],next:&[u8])
+  ->Result<usize,Error>{
+  self.check_fresh(caller,fs)?;
+  if expected.len()>MAX_FILE_BYTES||next.len()>MAX_FILE_BYTES{
+   return Err(Error::Full);
+  }
+  let (path,n)=self.child(name)?;
+  let path=Self::str_path(&path,n);
+  let mut current=[0u8;MAX_FILE_BYTES];
+  let size=fs.read(path,&mut current)?;
+  if size!=expected.len()||&current[..size]!=expected{
+   return Err(Error::Stale);
+  }
+  if expected==next{return Ok(size);}
+  fs.overwrite(path,next)?;
+  self.generation=fs.generation();
+  Ok(next.len())
+ }
+}
+#[cfg(test)]
+mod r068_project_compare_save_tests{
+ use super::*;
+ use crate::block::{BlockError,SECTOR_BYTES};
+ struct Disk{sectors:[[u8;SECTOR_BYTES];100]}
+ impl BlockDevice for Disk{
+  fn sector_count(&self)->u64{100}
+  fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   *out=*self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?;Ok(())
+  }
+  fn write_sector(&mut self,lba:u64,bytes:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   *self.sectors.get_mut(lba as usize).ok_or(BlockError::OutOfRange)?=*bytes;Ok(())
+  }
+ }
+ fn id()->Identity{Identity{pid:8,generation:4}}
+ fn setup()->(ProjectTree,HierVfs<Disk>){
+  let mut fs=HierVfs::format_blank(Disk{sectors:[[0;SECTOR_BYTES];100]}).unwrap();
+  let mut p=ProjectTree::new();
+  p.create(id(),&mut fs,"demo").unwrap();
+  p.create_file(id(),&mut fs,"main",b"old code").unwrap();
+  (p,fs)
+ }
+ #[test]fn exact_old_bytes_commit_new_source_across_remount(){
+  let (mut p,mut fs)=setup();let before=fs.generation();
+  assert_eq!(p.save_file_if_bytes(id(),&mut fs,"main",b"old code",b"new code"),
+   Ok(8));
+  assert_eq!(fs.generation(),before+1);
+  let mut mounted=HierVfs::mount(fs.into_device()).unwrap();
+  let mut out=[0u8;16];
+  assert_eq!(mounted.read("/work/demo/main",&mut out),Ok(8));
+  assert_eq!(&out[..8],b"new code");
+ }
+ #[test]fn wrong_expected_bytes_and_identical_noop_do_not_advance_generation(){
+  let (mut p,mut fs)=setup();let before=fs.generation();
+  assert_eq!(p.save_file_if_bytes(id(),&mut fs,"main",b"other",b"bad"),
+    Err(Error::Stale));
+  assert_eq!(p.save_file_if_bytes(id(),&mut fs,"main",b"old code",b"old code"),
+    Ok(8));
+  assert_eq!(fs.generation(),before);
+  let mut out=[0u8;16];fs.read("/work/demo/main",&mut out).unwrap();
+  assert_eq!(&out[..8],b"old code");
+ }
+ #[test]fn foreign_pid_bad_path_and_external_write_fail_closed(){
+  let (mut p,mut fs)=setup();let before=fs.generation();
+  assert_eq!(p.save_file_if_bytes(Identity{generation:5,..id()},
+   &mut fs,"main",b"old code",b"bad"),Err(Error::Unauthorized));
+  assert_eq!(p.save_file_if_bytes(id(),&mut fs,"../bad",b"old code",b"bad"),
+   Err(Error::Invalid));
+  fs.create("/external",b"data").unwrap();
+  assert_eq!(p.save_file_if_bytes(id(),&mut fs,"main",b"old code",b"bad"),
+   Err(Error::Stale));
+  assert_eq!(fs.generation(),before+1);
+ }
+}

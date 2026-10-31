@@ -19,7 +19,7 @@ pub const COMMAND_VERBS:&[&str]=&[
  "help","pwd","tools","ls","cat","write","append","mkdir","mv",
  "cp","rm","mkfile","truncate","head","count","rmdir","mvdir",
  "pread","pwrite","lines","line","hash","stat","tail","find","grep","cmp","diffat",
- "touch","copynew","replace","appendln","health","hex","slice","concat","cmprange","bytefreq","patchhex","patchrange","copylines",
+ "touch","copynew","replace","appendln","health","hex","slice","concat","cmprange","bytefreq","patchhex","patchrange","copylines","wc",
 ];
 /// Complete exactly one printable lower-case verb prefix. Ambiguous matches,
 /// empty prefixes and user-supplied paths never cause completion or I/O.
@@ -91,7 +91,7 @@ pub fn command<D:BlockDevice,const N:usize>(
  let line=entered.trim_end();
  if line=="help"{return publish(b"pwd ls /dir cat /path write /path text append /path text mkdir /dir mv /old /new cp /src /dst rm /path mkfile /path truncate /path head /path count rmdir /dir mvdir /old /new pread /file offset count pwrite /file@offset text",out);}
  if line=="pwd"{return publish(b"/",out);}
- if line=="tools"{return publish(b"count lines line tail find grep hash cmp diffat stat touch copynew replace appendln health hex slice concat cmprange bytefreq patchhex patchrange copylines",out);}
+ if line=="tools"{return publish(b"count lines line tail find grep hash cmp diffat stat touch copynew replace appendln health hex slice concat cmprange bytefreq patchhex patchrange copylines wc",out);}
  if line=="health"{
   auth.require(caller,FILE_READ,now).map_err(|_|Error::Denied)?;
   let health=fs.mounted_health().map_err(Error::Io)?;
@@ -474,6 +474,23 @@ pub fn command<D:BlockDevice,const N:usize>(
    let (Some(start),Some(end))=(start,end)else{return Err(Error::Invalid)};
    fs.create(b,&bytes[start..end]).map_err(Error::Io)?;
    publish(b"copied",out)
+  }
+  // Unicode-aware durable file metrics: lines, words, UTF-8 bytes.
+  // Does not mutate mounted storage or publish partial caller output.
+  "wc"=>{
+   auth.require(caller,FILE_READ,now).map_err(|_|Error::Denied)?;
+   let source=path(raw,&mut name)?;
+   let mut bytes=[0u8;crate::durablefs::MAX_FILE_BYTES];
+   let n=fs.read(source,&mut bytes).map_err(Error::Io)?;
+   let text=core::str::from_utf8(&bytes[..n]).map_err(|_|Error::Invalid)?;
+   let rows=text.split_inclusive('\n').count();
+   let words=text.split_whitespace().count();
+   let mut encoded=[0u8;64];let mut used=0usize;
+   for (i,value) in [rows as u64,words as u64,n as u64].iter().enumerate(){
+    if i>0{encoded[used]=b' ';used+=1;}
+    used+=publish_number(*value,&mut encoded[used..])?;
+   }
+   publish(&encoded[..used],out)
   }
   "copynew"=>{
    auth.require(caller,FILE_READ|FILE_WRITE,now).map_err(|_|Error::Denied)?;
@@ -1112,7 +1129,7 @@ mod tests{
   assert_eq!(complete_verb(b"heal"),Some("health"));
  }
  #[test]fn r044_command_registry_drives_unique_safe_completion(){
-  assert_eq!(COMMAND_VERBS.len(),41);
+  assert_eq!(COMMAND_VERBS.len(),42);
   for (i,verb) in COMMAND_VERBS.iter().enumerate(){
    assert!(verb.as_bytes().iter().all(|b|b.is_ascii_lowercase()));
    assert!(!COMMAND_VERBS[..i].contains(verb));
@@ -2349,5 +2366,63 @@ mod r067_terminal_copylines_tests{
   assert_eq!(command(&mut fs,&auth,other,1,
     b"copylines /source 1 1 /dest",&mut out),Err(Error::Denied));
   assert_eq!(out,[0xa7;16]);assert_eq!(fs.generation(),gen);
+ }
+}
+
+
+#[cfg(test)]
+mod r068_durable_word_count_tests{
+ use super::*;
+ use crate::block::{BlockError,SECTOR_BYTES};
+ struct Disk{sectors:[[u8;SECTOR_BYTES];100]}
+ impl BlockDevice for Disk{
+  fn sector_count(&self)->u64{100}
+  fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   *out=*self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?;Ok(())
+  }
+  fn write_sector(&mut self,lba:u64,bytes:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   *self.sectors.get_mut(lba as usize).ok_or(BlockError::OutOfRange)?=*bytes;Ok(())
+  }
+ }
+ fn identity()->Identity{Identity{pid:9,generation:6}}
+ fn setup()->(HierVfs<Disk>,Access<1>){
+  let mut fs=HierVfs::format_blank(Disk{sectors:[[0;SECTOR_BYTES];100]}).unwrap();
+  fs.create("/text",b"one two\nthree\n").unwrap();
+  fs.create("/unicode","α b\n".as_bytes()).unwrap();
+  fs.create("/binary",&[0xff,0xfe]).unwrap();
+  let mut auth=Access::new();auth.grant(identity(),FILE_READ,100).unwrap();
+  (fs,auth)
+ }
+ #[test]fn counts_real_durable_unicode_words_lines_bytes_across_remount(){
+  let (mut fs,auth)=setup();let gen=fs.generation();let mut out=[0u8;32];
+  assert_eq!(command(&mut fs,&auth,identity(),1,b"wc /text",&mut out),Ok(6));
+  assert_eq!(&out[..6],b"2 3 14");
+  assert_eq!(command(&mut fs,&auth,identity(),1,b"wc /unicode",&mut out),Ok(5));
+  assert_eq!(&out[..5],b"1 2 5");
+  fs=HierVfs::mount(fs.into_device()).unwrap();
+  assert_eq!(command(&mut fs,&auth,identity(),1,b"wc /text",&mut out),Ok(6));
+  assert_eq!(fs.generation(),gen);
+ }
+ #[test]fn invalid_utf8_missing_source_and_bad_path_never_write_output(){
+  let (mut fs,auth)=setup();let gen=fs.generation();let mut out=[0xa5;32];
+  assert_eq!(command(&mut fs,&auth,identity(),1,b"wc /binary",&mut out),
+   Err(Error::Invalid));
+  assert_eq!(command(&mut fs,&auth,identity(),1,b"wc /missing",&mut out),
+   Err(Error::Io(FsError::NotFound)));
+  assert_eq!(command(&mut fs,&auth,identity(),1,b"wc /../escape",&mut out),
+   Err(Error::Invalid));
+  assert_eq!(fs.generation(),gen);assert_eq!(out,[0xa5;32]);
+ }
+ #[test]fn short_output_and_foreign_generation_are_fail_closed(){
+  let (mut fs,auth)=setup();let before=fs.generation();
+  let mut short=[0x33;3];
+  assert_eq!(command(&mut fs,&auth,identity(),1,b"wc /text",&mut short),
+   Err(Error::OutputTooSmall));
+  assert_eq!(short,[0x33;3]);
+  let mut out=[0x33;32];
+  assert_eq!(command(&mut fs,&auth,
+   Identity{generation:7,..identity()},1,b"wc /text",&mut out),
+   Err(Error::Denied));
+  assert_eq!(out,[0x33;32]);assert_eq!(fs.generation(),before);
  }
 }

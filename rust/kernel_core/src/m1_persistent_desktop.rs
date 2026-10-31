@@ -1701,3 +1701,110 @@ mod r067_desktop_source_routing_tests{
   assert_eq!(&out[..7],b"  b\n c\n");
  }
 }
+
+
+/// R068: authenticated desktop routing for whole-line source refactors and
+/// exact-byte optimistic project saves. A stale PID or expired write grant
+/// fails BEFORE any editor or disk mutation.
+impl<D:BlockDevice,const P:usize,const E:usize,const W:usize,
+ const K:usize,const G:usize,const Q:usize> Desktop<D,P,E,W,K,G,Q>{
+ pub fn editor_comment_source_range(&mut self,caller:Identity,now:u64,
+  editor:&mut crate::m1_disk_editor::DiskEditor,
+  first:usize,last:usize,uncomment:bool)->Result<usize,EditorRouteError>{
+  self.admit_editor(caller,now,FILE_WRITE)?;
+  editor.comment_source_range(caller,first,last,uncomment)
+   .map_err(EditorRouteError::Editor)
+ }
+ pub fn editor_replace_source_lines(&mut self,caller:Identity,now:u64,
+  editor:&mut crate::m1_disk_editor::DiskEditor,
+  first:usize,last:usize,replacement:&str)->Result<usize,EditorRouteError>{
+  self.admit_editor(caller,now,FILE_WRITE)?;
+  editor.replace_source_lines(caller,first,last,replacement)
+   .map_err(EditorRouteError::Editor)
+ }
+ pub fn editor_replace_ranges_text(&mut self,caller:Identity,now:u64,
+  editor:&mut crate::m1_disk_editor::DiskEditor,
+  ranges:&[(usize,usize,&str)])->Result<usize,EditorRouteError>{
+  self.admit_editor(caller,now,FILE_WRITE)?;
+  editor.replace_ranges_text(caller,ranges).map_err(EditorRouteError::Editor)
+ }
+ pub fn project_save_file_if_bytes(&mut self,caller:Identity,now:u64,
+  project:&mut crate::m1_project_workspace::ProjectTree,
+  file:&str,expected:&[u8],next:&[u8])->Result<usize,ProjectRouteError>{
+  self.admit_editor(caller,now,FILE_WRITE).map_err(ProjectRouteError::Permission)?;
+  project.save_file_if_bytes(caller,&mut self.volume,file,expected,next)
+   .map_err(ProjectRouteError::Project)
+ }
+}
+#[cfg(test)]
+mod r068_desktop_source_routes_tests{
+ use super::*;
+ use crate::block::{BlockError,SECTOR_BYTES};
+ use crate::batch2_launcher::Image;
+ use crate::batch2_settings::{Settings,Theme};
+ struct Disk{data:[[u8;SECTOR_BYTES];100]}
+ impl BlockDevice for Disk{
+  fn sector_count(&self)->u64{100}
+  fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   *out=*self.data.get(lba as usize).ok_or(BlockError::OutOfRange)?;Ok(())
+  }
+  fn write_sector(&mut self,lba:u64,data:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   *self.data.get_mut(lba as usize).ok_or(BlockError::OutOfRange)?=*data;Ok(())
+  }
+ }
+ type Desk=Desktop<Disk,3,3,2,2,3,8>;
+ fn id(pid:u32)->Identity{Identity{pid,generation:1}}
+ fn launch(pid:u32)->Launch{
+  Launch{pid,generation:1,image:Image{
+   image_id:pid,entry:0x1000,mapped_end:0x2000,verified:true}}
+ }
+ fn ready()->Desk{
+  let mut fs=HierVfs::format_blank(Disk{data:[[0;SECTOR_BYTES];100]}).unwrap();
+  fs.create("/src",b"a\nb\n").unwrap();
+  let mut d=Desk::from_mounted(fs);
+  d.start(id(1),launch(1),id(2),launch(2),
+    Settings{theme:Theme::Dark,pointer_speed:5,key_repeat:10},8,5).unwrap();
+  d
+ }
+ #[test]fn authenticated_comment_replace_and_save_survive_remount(){
+  let mut d=ready();let mut editor=crate::m1_disk_editor::DiskEditor::new();
+  d.editor_open(id(2),1,&mut editor,"/src").unwrap();
+  assert_eq!(d.editor_comment_source_range(id(2),1,&mut editor,1,2,false),Ok(2));
+  let mut buf=[0u8;32];
+  assert_eq!(d.editor_read(id(2),1,&editor,&mut buf),Ok(10));
+  assert_eq!(&buf[..10],b"// a\n// b\n");
+  assert_eq!(d.editor_comment_source_range(id(2),1,&mut editor,1,2,true),Ok(2));
+  assert_eq!(d.editor_replace_source_lines(id(2),1,&mut editor,2,2,"second"),Ok(9));
+  assert_eq!(d.editor_read(id(2),1,&editor,&mut buf),Ok(9));
+  assert_eq!(&buf[..9],b"a\nsecond\n");
+  d.editor_save(id(2),1,&mut editor).unwrap();
+  let mut fs=HierVfs::mount(d.into_device()).unwrap();
+  assert_eq!(fs.read("/src",&mut buf),Ok(9));
+  assert_eq!(&buf[..9],b"a\nsecond\n");
+ }
+ #[test]fn batch_refactor_is_atomic_with_expired_and_recycled_sessions(){
+  let mut d=ready();let mut e=crate::m1_disk_editor::DiskEditor::new();
+  d.editor_open(id(2),1,&mut e,"/src").unwrap();
+  assert_eq!(d.editor_replace_ranges_text(id(2),1,&mut e,
+    &[(0,1,"one"),(2,3,"two")]),Ok(8));
+  let mut buf=[0u8;16];assert_eq!(d.editor_read(id(2),1,&e,&mut buf),Ok(8));
+  assert_eq!(&buf[..8],b"one\ntwo\n");
+  assert!(d.editor_replace_ranges_text(id(2),5,&mut e,&[(0,1,"BAD")]).is_err());
+  assert!(d.editor_comment_source_range(
+    Identity{generation:2,..id(2)},1,&mut e,1,1,false).is_err());
+  assert_eq!(d.editor_read(id(2),1,&e,&mut buf),Ok(8));
+  assert_eq!(&buf[..8],b"one\ntwo\n");
+ }
+ #[test]fn desktop_optimistic_project_save_checks_identity_and_reboot(){
+  let mut d=ready();let mut p=crate::m1_project_workspace::ProjectTree::new();
+  d.project_create(id(2),1,&mut p,"demo").unwrap();
+  d.project_create_file(id(2),1,&mut p,"main",b"one").unwrap();
+  assert!(d.project_save_file_if_bytes(id(2),1,&mut p,"main",b"bad",b"x").is_err());
+  assert!(d.project_save_file_if_bytes(id(2),5,&mut p,"main",b"one",b"x").is_err());
+  assert_eq!(d.project_save_file_if_bytes(id(2),1,&mut p,"main",b"one",b"two"),Ok(3));
+  let mut fs=HierVfs::mount(d.into_device()).unwrap();
+  let mut out=[0u8;8];
+  assert_eq!(fs.read("/work/demo/main",&mut out),Ok(3));
+  assert_eq!(&out[..3],b"two");
+ }
+}

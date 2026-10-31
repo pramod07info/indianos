@@ -1324,3 +1324,67 @@ mod r067_history_suggestion_tests{
   assert_eq!(input.bytes(),b"cargo test");
  }
 }
+
+
+/// R068: delete the next shell word from the live keyboard caret without
+/// executing a command or changing the private clipboard/history.
+impl LineEditor{
+ pub fn erase_next_word(&mut self)->Event{
+  let start=self.caret;
+  while self.caret<self.len&&self.line[self.caret]==b' '{self.caret+=1;}
+  while self.caret<self.len&&self.line[self.caret]!=b' '{self.caret+=1;}
+  let end=self.caret;
+  if start==end{return Event::Empty;}
+  self.line.copy_within(end..self.len,start);
+  self.len-=end-start;
+  self.line[self.len..].fill(0);
+  self.caret=start;
+  Event::Erased
+ }
+}
+impl InputLine{
+ pub fn erase_next_word(&mut self)->Event{
+  let outcome=self.editor.erase_next_word();
+  if outcome==Event::Erased{
+   self.history_cursor=None;
+   self.history_draft.fill(0);self.history_draft_len=0;
+  }
+  outcome
+ }
+}
+#[cfg(test)]
+mod r068_forward_word_edit_tests{
+ use super::*;
+ #[test]fn delete_suffix_of_word_at_live_caret_preserves_past_characters(){
+  let mut input=InputLine::new();
+  input.set_line(b"git status --short").unwrap();
+  for _ in 0..4{input.action(EditKey::Left).unwrap();}
+  assert_eq!(input.caret(),14);
+  assert_eq!(input.erase_next_word(),Event::Erased);
+  assert_eq!(input.bytes(),b"git status --s");
+  assert_eq!(input.caret(),14);
+ }
+ #[test]fn delete_word_and_whitespace_preserving_other_arguments(){
+  let mut input=InputLine::new();
+  input.set_line(b"git  status --short").unwrap();
+  input.action(EditKey::Home).unwrap();
+  assert_eq!(input.erase_next_word(),Event::Erased);
+  assert_eq!(input.bytes(),b"  status --short");
+  assert_eq!(input.erase_next_word(),Event::Erased);
+  assert_eq!(input.bytes(),b" --short");
+  input.action(EditKey::End).unwrap();
+  assert_eq!(input.erase_next_word(),Event::Empty);
+ }
+ #[test]fn empty_and_final_caret_are_noops_and_never_submit(){
+  let mut input=InputLine::new();
+  assert_eq!(input.erase_next_word(),Event::Empty);
+  input.set_line(b"  ").unwrap();
+  input.action(EditKey::End).unwrap();
+  assert_eq!(input.erase_next_word(),Event::Empty);
+  assert_eq!(input.bytes(),b"  ");
+  input.action(EditKey::Home).unwrap();
+  assert_eq!(input.erase_next_word(),Event::Erased);
+  assert!(input.bytes().is_empty());
+  assert_eq!(input.history_count(),0);
+ }
+}
