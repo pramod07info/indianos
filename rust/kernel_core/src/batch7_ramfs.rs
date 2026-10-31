@@ -879,3 +879,89 @@ mod r063_compare_exchange_tests{
   assert_eq!(fs.metadata(b"/project"),Ok((v,6)));
  }
 }
+
+
+/// R064: optimistic, all-or-nothing append of multiple existing RAM files.
+/// Each file must still match its caller-observed revision when visited.
+/// All bytes and revision updates remain private until EVERY append succeeds.
+/// The caller is responsible for authenticating WRITE on every path;
+/// this RAM store does not provide disk durability.
+impl<const N:usize> RamFs<N>{
+ pub fn append_batch_if_versions(&mut self,expected_global:u64,
+    requests:&[(&[u8],u64,&[u8])])->Result<u64,Error>{
+  if requests.is_empty()||requests.len()>16||requests.len()>N||
+     expected_global!=self.version{return Err(Error::Invalid);}
+  let mut staged=Self{files:self.files,version:self.version};
+  for (i,&(path,revision,suffix)) in requests.iter().enumerate(){
+   if !Self::valid_path(path)||revision==0||suffix.is_empty()||
+      requests[..i].iter().any(|&(previous,_,_)|previous==path){
+    return Err(Error::Invalid);
+   }
+   let index=staged.lookup(path).ok_or(Error::NotFound)?;
+   let original=staged.files[index].ok_or(Error::NotFound)?;
+   if original.version!=revision{return Err(Error::Invalid);}
+   staged.append_if_revision(path,suffix,staged.version)?;
+  }
+  *self=staged;
+  Ok(self.version)
+ }
+}
+#[cfg(test)]
+mod r064_atomic_ram_append_tests{
+ use super::*;
+ #[test]fn append_two_existing_files_once_with_exact_versions(){
+  let mut fs=RamFs::<3>::new();
+  let a=fs.replace(b"/a",b"alpha").unwrap();
+  let b=fs.replace(b"/b",b"beta").unwrap();
+  let start=fs.version();
+  assert_eq!(fs.append_batch_if_versions(start,&[
+   (b"/a",a,b"-one"),(b"/b",b,b"-two"),
+  ]),Ok(start+2));
+  let mut out=[0u8;16];
+  assert_eq!(fs.read(b"/a",0,&mut out),Ok(9));
+  assert_eq!(&out[..9],b"alpha-one");
+  assert_eq!(fs.read(b"/b",0,&mut out),Ok(8));
+  assert_eq!(&out[..8],b"beta-two");
+  assert_eq!(fs.metadata(b"/a"),Ok((start+1,9)));
+  assert_eq!(fs.metadata(b"/b"),Ok((start+2,8)));
+ }
+ #[test]fn late_stale_revision_duplicate_and_invalid_path_rollback(){
+  let mut fs=RamFs::<3>::new();
+  let a=fs.replace(b"/a",b"safe").unwrap();
+  let b=fs.replace(b"/b",b"peer").unwrap();
+  let rev=fs.version();
+  assert_eq!(fs.append_batch_if_versions(rev,&[
+   (b"/a",a,b"!"),(b"/b",b+1,b"!"),
+  ]),Err(Error::Invalid));
+  assert_eq!(fs.append_batch_if_versions(rev,&[
+   (b"/a",a,b"!"),(b"/a",a,b"!"),
+  ]),Err(Error::Invalid));
+  assert_eq!(fs.append_batch_if_versions(rev,&[
+   (b"/a",a,b"!"),(b"/../bad",b,b"!"),
+  ]),Err(Error::Invalid));
+  assert_eq!(fs.append_batch_if_versions(rev+1,&[
+   (b"/a",a,b"!"),
+  ]),Err(Error::Invalid));
+  assert_eq!(fs.version(),rev);
+  let mut out=[0u8;16];fs.read(b"/a",0,&mut out).unwrap();
+  assert_eq!(&out[..4],b"safe");
+  fs.read(b"/b",0,&mut out).unwrap();
+  assert_eq!(&out[..4],b"peer");
+ }
+ #[test]fn late_capacity_failure_cannot_publish_earlier_append(){
+  let mut fs=RamFs::<2>::new();
+  let a=fs.replace(b"/a",b"stay").unwrap();
+  let full=[b'x';CONTENT_MAX];
+  let b=fs.replace(b"/b",&full).unwrap();
+  let rev=fs.version();
+  assert_eq!(fs.append_batch_if_versions(rev,&[
+   (b"/a",a,b"!"),(b"/b",b,b"!"),
+  ]),Err(Error::Invalid));
+  assert_eq!(fs.version(),rev);
+  assert_eq!(fs.metadata(b"/a"),Ok((a,4)));
+  assert_eq!(fs.metadata(b"/b"),Ok((b,CONTENT_MAX)));
+  assert_eq!(fs.append_batch_if_versions(rev,&[
+   (b"/a",a,b""),
+  ]),Err(Error::Invalid));
+ }
+}

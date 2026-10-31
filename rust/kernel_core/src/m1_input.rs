@@ -1006,3 +1006,84 @@ mod r063_history_completion_tests{
   assert_eq!(input.bytes(),b"cargo test");
  }
 }
+
+
+/// R064: expand a command draft to the LONGEST prefix shared by all
+/// matching successfully submitted commands. Unlike unique completion,
+/// this safely advances ambiguous drafts (for example, "git st" to
+/// "git sta") but NEVER submits any command. No history, clipboard or
+/// active command changes when there is no new shared character.
+impl InputLine{
+ pub fn complete_common_history_prefix(&mut self)->Result<usize,Error>{
+  let prefix=self.editor.bytes();
+  if prefix.is_empty()||prefix.iter().any(|&b|!(b' '..=b'~').contains(&b)){
+   return Err(Error::Invalid);
+  }
+  let mut common=[0u8;MAX_LINE];
+  let mut common_len=0usize;
+  let mut found=false;
+  for entry in self.history.iter().flatten(){
+   if !entry.bytes[..entry.len].starts_with(prefix){continue;}
+   if !found{
+    common_len=entry.len;
+    common[..common_len].copy_from_slice(&entry.bytes[..common_len]);
+    found=true;
+   }else{
+    let mut n=0usize;
+    while n<common_len&&n<entry.len&&common[n]==entry.bytes[n]{n+=1;}
+    common_len=n;
+   }
+  }
+  if !found||common_len<=prefix.len(){return Err(Error::Invalid);}
+  self.editor.replace_line(&common[..common_len])?;
+  self.history_cursor=None;
+  self.history_draft.fill(0);
+  self.history_draft_len=0;
+  Ok(common_len)
+ }
+}
+#[cfg(test)]
+mod r064_shared_history_completion_tests{
+ use super::*;
+ fn with_history()->InputLine{
+  let mut input=InputLine::new();let mut out=[0u8;MAX_LINE];
+  for command in [b"git status".as_slice(),b"git stash",b"cargo test"]{
+   input.set_line(command).unwrap();
+   input.feed(b'\n',&mut out).unwrap();
+  }
+  input
+ }
+ #[test]fn ambiguous_git_commands_complete_only_the_shared_prefix(){
+  let mut input=with_history();
+  input.set_line(b"git st").unwrap();
+  assert_eq!(input.complete_common_history_prefix(),Ok(7));
+  assert_eq!(input.bytes(),b"git sta");
+  assert_eq!(input.caret(),7);
+  assert_eq!(input.history_count(),3);
+  assert_eq!(input.complete_common_history_prefix(),Err(Error::Invalid));
+  assert_eq!(input.bytes(),b"git sta");
+ }
+ #[test]fn unique_match_extends_draft_without_implicit_enter(){
+  let mut input=with_history();
+  input.set_line(b"cargo t").unwrap();
+  assert_eq!(input.complete_common_history_prefix(),Ok(10));
+  assert_eq!(input.bytes(),b"cargo test");
+  assert_eq!(input.history_count(),3);
+  let mut out=[0u8;MAX_LINE];
+  assert_eq!(input.feed(b'\n',&mut out),Ok(Event::Submitted(10)));
+  assert_eq!(&out[..10],b"cargo test");
+ }
+ #[test]fn unknown_exact_and_empty_prefixes_preserve_clipboard_and_draft(){
+  let mut input=with_history();
+  input.set_line(b"git status").unwrap();
+  input.copy_range(0,3).unwrap();
+  assert_eq!(input.complete_common_history_prefix(),Err(Error::Invalid));
+  input.set_line(b"unknown").unwrap();
+  assert_eq!(input.complete_common_history_prefix(),Err(Error::Invalid));
+  assert_eq!(input.bytes(),b"unknown");
+  input.set_line(b"").unwrap();
+  assert_eq!(input.complete_common_history_prefix(),Err(Error::Invalid));
+  assert_eq!(input.clipboard_bytes(),b"git");
+  assert_eq!(input.history_count(),3);
+ }
+}

@@ -1930,3 +1930,75 @@ mod r063_padded_grid_tests{
   assert_eq!(layout.epoch(1,10),epoch);
  }
 }
+
+
+/// R064: vertical window tiling for terminal/editor/log panels.
+/// Every pane gets a nonzero height; odd pixels are distributed from the
+/// top. Ownership and final geometry are published in ONE validated
+/// transaction with no intermediate compositor-visible positions.
+impl<const N:usize> SurfaceLayout<N>{
+ pub fn tile_vertical(&mut self,windows:&[(u32,u32)],
+    area:crate::agent_05_surface_rect::Rectangle)->Result<usize,Error>{
+  use crate::agent_05_surface_rect::{Rectangle,clip_owned};
+  if windows.is_empty()||windows.len()>N||
+     windows.len()>area.height as usize{return Err(Error::Invalid);}
+  clip_owned(area,area,1,1).map_err(|_|Error::Invalid)?;
+  let count=u32::try_from(windows.len()).map_err(|_|Error::Invalid)?;
+  let base=area.height/count;
+  let extra=area.height%count;
+  let empty=Rectangle{x:0,y:0,width:1,height:1};
+  let mut requests=[(0u32,0u32,empty);N];
+  let mut y=area.y;
+  for (i,&(owner,window)) in windows.iter().enumerate(){
+   let height=base+u32::from((i as u32)<extra);
+   requests[i]=(owner,window,Rectangle{
+    x:area.x,y,width:area.width,height
+   });
+   y=y.checked_add(height).ok_or(Error::Invalid)?;
+  }
+  self.set_geometry_batch(&requests[..windows.len()])
+ }
+}
+#[cfg(test)]
+mod r064_vertical_tiles_tests{
+ use super::*;
+ use crate::agent_05_surface_rect::Rectangle;
+ fn r(x:u32,y:u32,w:u32,h:u32)->Rectangle{
+  Rectangle{x,y,width:w,height:h}
+ }
+ #[test]fn three_owned_windows_use_full_vertical_area_and_noop_keeps_epochs(){
+  let mut layout=SurfaceLayout::<3>::new();
+  let old=r(4,5,30,30);
+  for (owner,window) in [(1,10),(2,20),(3,30)]{
+   layout.grant(owner,window,old).unwrap();
+  }
+  let before=layout.next_epoch;
+  assert_eq!(layout.tile_vertical(&[(1,10),(2,20),(3,30)],
+   r(20,30,80,61)),Ok(3));
+  assert_eq!(layout.geometry(1,10),Ok(r(20,30,80,21)));
+  assert_eq!(layout.geometry(2,20),Ok(r(20,51,80,20)));
+  assert_eq!(layout.geometry(3,30),Ok(r(20,71,80,20)));
+  assert_eq!(layout.next_epoch,before+3);
+  assert_eq!(layout.tile_vertical(&[(1,10),(2,20),(3,30)],
+   r(20,30,80,61)),Ok(3));
+  assert_eq!(layout.next_epoch,before+3);
+ }
+ #[test]fn unauthorized_window_duplicate_and_offscreen_area_roll_back(){
+  let mut layout=SurfaceLayout::<2>::new();
+  let old=r(2,2,40,40);
+  layout.grant(1,10,old).unwrap();
+  layout.grant(2,20,old).unwrap();
+  let before=layout.next_epoch;
+  assert_eq!(layout.tile_vertical(&[(1,10),(9,20)],
+   r(10,10,60,60)),Err(Error::Unauthorized));
+  assert_eq!(layout.tile_vertical(&[(1,10),(1,10)],
+   r(10,10,60,60)),Err(Error::Duplicate));
+  assert_eq!(layout.tile_vertical(&[(1,10),(2,20)],
+   r(0,0,30,1)),Err(Error::Invalid));
+  assert_eq!(layout.tile_vertical(&[(1,10),(2,20)],
+   r(u32::MAX,0,60,100)),Err(Error::Invalid));
+  assert_eq!(layout.next_epoch,before);
+  assert_eq!(layout.geometry(1,10),Ok(old));
+  assert_eq!(layout.geometry(2,20),Ok(old));
+ }
+}
