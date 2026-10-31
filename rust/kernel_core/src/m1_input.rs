@@ -1252,3 +1252,75 @@ mod r066_history_fragment_tests{
   assert_eq!(input.history_count(),3);
  }
 }
+
+
+/// R067: history-based inline ghost text. Suggest the remainder of the
+/// most recent successful command matching the unsent draft. Nothing is
+/// inserted, submitted or moved; UI can explicitly accept the suggestion.
+impl InputLine{
+ pub fn suggest_history_suffix(&self,out:&mut[u8])->Result<usize,Error>{
+  let prefix=self.editor.bytes();
+  if prefix.is_empty(){return Err(Error::Invalid);}
+  let candidate=self.history[..self.history_len].iter().rev().flatten()
+   .find(|entry|entry.len>prefix.len()&&
+     entry.bytes[..entry.len].starts_with(prefix))
+   .ok_or(Error::Invalid)?;
+  let suggestion=&candidate.bytes[prefix.len()..candidate.len];
+  if suggestion.len()>out.len(){return Err(Error::TooSmall);}
+  out[..suggestion.len()].copy_from_slice(suggestion);
+  Ok(suggestion.len())
+ }
+ /// Only a separate explicit caller action accepts ghost text; this never
+ /// submits a command or alters the process-private clipboard/history.
+ pub fn accept_history_suffix(&mut self)->Result<usize,Error>{
+  let mut suffix=[0u8;MAX_LINE];
+  let n=self.suggest_history_suffix(&mut suffix)?;
+  let next=self.length().checked_add(n).ok_or(Error::Full)?;
+  if next>MAX_LINE{return Err(Error::Full);}
+  let mut staged=[0u8;MAX_LINE];
+  staged[..self.length()].copy_from_slice(self.bytes());
+  staged[self.length()..next].copy_from_slice(&suffix[..n]);
+  self.editor.replace_line(&staged[..next])?;
+  self.history_cursor=None;
+  self.history_draft.fill(0);self.history_draft_len=0;
+  Ok(next)
+ }
+}
+#[cfg(test)]
+mod r067_history_suggestion_tests{
+ use super::*;
+ fn sample()->InputLine{
+  let mut input=InputLine::new();let mut out=[0u8;MAX_LINE];
+  for cmd in [b"git status".as_slice(),b"cargo test",b"git diff"]{
+   input.set_line(cmd).unwrap();input.feed(b'\n',&mut out).unwrap();
+  }
+  input
+ }
+ #[test]fn suggestion_only_reads_newest_matching_history_and_accepts_explicitly(){
+  let mut input=sample();
+  input.set_line(b"git ").unwrap();
+  let mut out=[0u8;MAX_LINE];
+  assert_eq!(input.suggest_history_suffix(&mut out),Ok(4));
+  assert_eq!(&out[..4],b"diff");
+  assert_eq!(input.bytes(),b"git ");
+  assert_eq!(input.accept_history_suffix(),Ok(8));
+  assert_eq!(input.bytes(),b"git diff");
+  assert_eq!(input.history_count(),3);
+ }
+ #[test]fn short_buffer_and_unknown_prefix_preserve_caller_output_and_draft(){
+  let mut input=sample();input.set_line(b"cargo ").unwrap();
+  let mut short=[0xa5u8;3];
+  assert_eq!(input.suggest_history_suffix(&mut short),Err(Error::TooSmall));
+  assert_eq!(short,[0xa5;3]);
+  input.set_line(b"unknown").unwrap();
+  assert_eq!(input.suggest_history_suffix(&mut short),Err(Error::Invalid));
+  assert_eq!(input.bytes(),b"unknown");
+ }
+ #[test]fn empty_and_fully_matched_history_do_not_modify_input(){
+  let mut input=sample();input.set_line(b"").unwrap();
+  assert_eq!(input.accept_history_suffix(),Err(Error::Invalid));
+  input.set_line(b"cargo test").unwrap();
+  assert_eq!(input.accept_history_suffix(),Err(Error::Invalid));
+  assert_eq!(input.bytes(),b"cargo test");
+ }
+}

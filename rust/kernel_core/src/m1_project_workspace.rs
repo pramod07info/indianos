@@ -965,3 +965,90 @@ mod tests {
     }
 
 }
+
+
+/// R067: durable source-code snippet extraction to a NEW project file.
+/// The source range is 1-based and consists of complete UTF-8 lines,
+/// including existing newline separators. The destination is committed
+/// once through the existing non-clobbering checksummed COW create.
+impl ProjectTree{
+ pub fn copy_source_lines<D:BlockDevice>(&mut self,caller:Identity,
+  fs:&mut HierVfs<D>,source:&str,target:&str,first:usize,count:usize)
+  ->Result<usize,Error>{
+  self.check_fresh(caller,fs)?;
+  if first==0||count==0||source==target{return Err(Error::Invalid);}
+  let last=first.checked_add(count-1).ok_or(Error::Invalid)?;
+  let (from,from_len)=self.child(source)?;
+  let (to,to_len)=self.child(target)?;
+  let mut bytes=[0u8;MAX_FILE_BYTES];
+  let len=fs.read(Self::str_path(&from,from_len),&mut bytes)?;
+  let text=core::str::from_utf8(&bytes[..len]).map_err(|_|Error::Invalid)?;
+  let mut start=None;let mut finish=None;let mut cursor=0usize;
+  for (index,row) in text.split_inclusive('\n').enumerate(){
+   let line=index+1;
+   if line==first{start=Some(cursor);}
+   cursor+=row.len();
+   if line==last{finish=Some(cursor);break;}
+  }
+  let (Some(a),Some(b))=(start,finish)else{return Err(Error::Invalid)};
+  fs.create(Self::str_path(&to,to_len),&bytes[a..b])?;
+  self.generation=fs.generation();
+  Ok(b-a)
+ }
+}
+#[cfg(test)]
+mod r067_project_extract_tests{
+ use super::*;
+ use crate::block::{BlockError,SECTOR_BYTES};
+ struct Disk{data:[[u8;SECTOR_BYTES];100]}
+ impl BlockDevice for Disk{
+  fn sector_count(&self)->u64{100}
+  fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   *out=*self.data.get(lba as usize).ok_or(BlockError::OutOfRange)?;Ok(())
+  }
+  fn write_sector(&mut self,lba:u64,bytes:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   *self.data.get_mut(lba as usize).ok_or(BlockError::OutOfRange)?=*bytes;Ok(())
+  }
+ }
+ fn id()->Identity{Identity{pid:8,generation:4}}
+ fn setup()->(ProjectTree,HierVfs<Disk>){
+  let mut fs=HierVfs::format_blank(Disk{data:[[0;SECTOR_BYTES];100]}).unwrap();
+  let mut p=ProjectTree::new();
+  p.create(id(),&mut fs,"demo").unwrap();
+  p.create_file(id(),&mut fs,"src","α\nβ\nend".as_bytes()).unwrap();
+  (p,fs)
+ }
+ #[test]fn extracts_whole_utf8_rows_and_reboots_without_modifying_source(){
+  let (mut project,mut fs)=setup();let before=fs.generation();
+  assert_eq!(project.copy_source_lines(id(),&mut fs,"src","slice",2,2),Ok(6));
+  assert_eq!(fs.generation(),before+1);
+  let mut mounted=HierVfs::mount(fs.into_device()).unwrap();
+  let mut out=[0u8;32];
+  assert_eq!(mounted.read("/work/demo/slice",&mut out),Ok(6));
+  assert_eq!(&out[..6],"β\nend".as_bytes());
+  assert_eq!(mounted.read("/work/demo/src",&mut out),Ok(9));
+  assert_eq!(&out[..9],"α\nβ\nend".as_bytes());
+ }
+ #[test]fn wrong_rows_and_existing_target_leave_both_files_untouched(){
+  let (mut p,mut fs)=setup();p.create_file(id(),&mut fs,"exists",b"safe").unwrap();
+  let generation=fs.generation();
+  assert_eq!(p.copy_source_lines(id(),&mut fs,"src","new",0,1),Err(Error::Invalid));
+  assert_eq!(p.copy_source_lines(id(),&mut fs,"src","new",2,5),Err(Error::Invalid));
+  assert_eq!(p.copy_source_lines(id(),&mut fs,"src","src",1,1),Err(Error::Invalid));
+  assert_eq!(p.copy_source_lines(id(),&mut fs,"src","../oops",1,1),Err(Error::Invalid));
+  assert_eq!(p.copy_source_lines(id(),&mut fs,"src","exists",1,1),
+   Err(Error::Fs(FsError::Exists)));
+  assert_eq!(fs.generation(),generation);
+  let mut out=[0u8;12];
+  assert_eq!(fs.read("/work/demo/exists",&mut out),Ok(4));
+  assert_eq!(&out[..4],b"safe");
+ }
+ #[test]fn stale_volume_and_recycled_pid_must_not_copy_project_data(){
+  let (mut p,mut fs)=setup();let generation=fs.generation();
+  assert_eq!(p.copy_source_lines(Identity{generation:5,..id()},
+    &mut fs,"src","copy",1,1),Err(Error::Unauthorized));
+  fs.create("/external",b"other").unwrap();
+  assert_eq!(p.copy_source_lines(id(),&mut fs,"src","copy",1,1),Err(Error::Stale));
+  assert_eq!(fs.generation(),generation+1);
+ }
+}
