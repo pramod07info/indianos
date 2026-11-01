@@ -1,0 +1,35 @@
+{
+  "version": "commit",
+  "source_sha": "83576ad01f8edf4ee1cc9024d6b67ab9cc4b70ee",
+  "workflow_sha": "83576ad01f8edf4ee1cc9024d6b67ab9cc4b70ee",
+  "run_url": "https://github.com/pramod07info/indianos/actions/runs/41304340859",
+  "captured_at_utc": "2026-11-01T12:00:41.840484+00:00",
+  "capture": "real QEMU/OVMF VGA screendump; opt-in Orbit preview",
+  "frames": [
+    {
+      "file": "00-kernel-owned-desktop.png",
+      "width": 1280,
+      "height": 800,
+      "pixel_sha256": "59b66a4ef16e234d1da5dc45b53430b0e9d625310e9afa4aa18a09dff1f31e93"
+    },
+    {
+      "file": "01-user-surface.png",
+      "width": 1280,
+      "height": 800,
+      "pixel_sha256": "917251c559e82adf73a9ce84ad774088d7e8d40355b162f39c088fa73b9cf3c8"
+    },
+    {
+      "file": "02-user-surface.png",
+      "width": 1280,
+      "height": 800,
+      "pixel_sha256": "ca0896771ca73c43f46b0a6fcd3f824fe4a29be05e8cdf8b813a5352b6c9cd7c"
+    },
+    {
+      "file": "03-user-surface.png",
+      "width": 1280,
+      "height": 800,
+      "pixel_sha256": "51e772b219be0da514638fe835ea6fb3b765b26f0d5cc15a76ecb7f87a88f483"
+    }
+  ],
+  "limitations": "Not proof of default desktop boot, hardware GPU, or production readiness"
+}
