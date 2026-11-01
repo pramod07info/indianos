@@ -1259,6 +1259,45 @@ impl<D:BlockDevice,const P:usize,const E:usize,const W:usize,
   self.admit_editor(caller,now,FILE_READ)?;
   editor.text_offset(caller,line,column).map_err(EditorRouteError::Editor)
  }
+
+  /// R076: authenticated reverse byte-to-Unicode-cursor mapping.
+  pub fn editor_text_position(&self,caller:Identity,now:u64,
+    editor:&crate::m1_disk_editor::DiskEditor,at:usize)
+    ->Result<(usize,usize),EditorRouteError>{
+    self.admit_editor(caller,now,FILE_READ)?;
+    editor.text_position(caller,at).map_err(EditorRouteError::Editor)
+  }
+  pub fn editor_find_previous_text(&self,caller:Identity,now:u64,
+    editor:&crate::m1_disk_editor::DiskEditor,needle:&str,before:usize)
+    ->Result<Option<usize>,EditorRouteError>{
+    self.admit_editor(caller,now,FILE_READ)?;
+    editor.find_previous_text(caller,needle,before).map_err(EditorRouteError::Editor)
+  }
+  pub fn editor_find_text_page(&self,caller:Identity,now:u64,
+    editor:&crate::m1_disk_editor::DiskEditor,needle:&str,from:usize,
+    out:&mut[usize])->Result<(usize,Option<usize>),EditorRouteError>{
+    self.admit_editor(caller,now,FILE_READ)?;
+    editor.find_text_page(caller,needle,from,out).map_err(EditorRouteError::Editor)
+  }
+  pub fn editor_copy_text_selection(&self,caller:Identity,now:u64,
+    editor:&crate::m1_disk_editor::DiskEditor,from:usize,to:usize,
+    out:&mut[u8])->Result<usize,EditorRouteError>{
+    self.admit_editor(caller,now,FILE_READ)?;
+    editor.copy_text_selection(caller,from,to,out).map_err(EditorRouteError::Editor)
+  }
+  pub fn editor_cut_text_selection(&self,caller:Identity,now:u64,
+    editor:&mut crate::m1_disk_editor::DiskEditor,from:usize,to:usize,
+    out:&mut[u8])->Result<usize,EditorRouteError>{
+    self.admit_editor(caller,now,FILE_WRITE)?;
+    editor.cut_text_selection(caller,from,to,out).map_err(EditorRouteError::Editor)
+  }
+  pub fn editor_paste_text_selection(&self,caller:Identity,now:u64,
+    editor:&mut crate::m1_disk_editor::DiskEditor,from:usize,to:usize,
+    value:&str)->Result<usize,EditorRouteError>{
+    self.admit_editor(caller,now,FILE_WRITE)?;
+    editor.paste_text_selection(caller,from,to,value).map_err(EditorRouteError::Editor)
+  }
+
  pub fn editor_save(&mut self,caller:Identity,now:u64,
     editor:&mut crate::m1_disk_editor::DiskEditor)
     ->Result<u64,EditorRouteError>{
@@ -2540,5 +2579,32 @@ mod r075_expanded_desktop_source_tests {
         assert!(d.project_extract_source_selection(
             Identity { generation: 2, ..id(2) }, 1, &mut project,
             "main", "copy", 0, 3).is_err());
+    }
+
+    #[test]
+    fn r076_editor_navigation_clipboard_authority_and_real_remount(){
+        let mut d=ready();let mut e=crate::m1_disk_editor::DiskEditor::new();
+        d.editor_open(id(2),1,&mut e,"/source").unwrap();
+        assert_eq!(d.editor_text_position(id(2),1,&e,3),Ok((2,1)));
+        assert_eq!(d.editor_find_previous_text(id(2),1,&e,"α",2),Ok(Some(0)));
+        let mut matches=[99usize;2];
+        assert_eq!(d.editor_find_text_page(id(2),1,&e,"α",0,&mut matches),Ok((1,None)));
+        assert_eq!(matches[0],0);
+        let mut clip=[0xa5u8;8];
+        assert!(d.editor_copy_text_selection(
+            Identity{generation:2,..id(2)},1,&e,0,2,&mut clip).is_err());
+        assert!(d.editor_copy_text_selection(id(2),6,&e,0,2,&mut clip).is_err());
+        assert_eq!(clip,[0xa5;8]);
+        assert_eq!(d.editor_copy_text_selection(id(2),1,&e,0,2,&mut clip),Ok(2));
+        assert!(d.editor_cut_text_selection(id(2),6,&mut e,0,2,&mut clip).is_err());
+        assert!(d.editor_paste_text_selection(
+            Identity{generation:2,..id(2)},1,&mut e,0,0,"no").is_err());
+        assert!(!e.status(id(2)).unwrap().dirty);
+        assert_eq!(d.editor_cut_text_selection(id(2),1,&mut e,0,2,&mut clip),Ok(2));
+        assert_eq!(d.editor_paste_text_selection(id(2),1,&mut e,0,0,"α"),Ok(6));
+        d.editor_save(id(2),1,&mut e).unwrap();
+        let mut fs=HierVfs::mount(d.into_device()).unwrap();let mut out=[0u8;16];
+        assert_eq!(fs.read("/source",&mut out),Ok(6));
+        assert_eq!(&out[..6],"α\nβ\n".as_bytes());
     }
 }
