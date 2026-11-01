@@ -2316,3 +2316,102 @@ mod r080_input_argument_tests{
         assert_eq!(input.clipboard_bytes(),b"alpha");
     }
 }
+
+
+// M1/R081 workstream D: six complete argument-aware actions on the live
+// keyboard draft. Every mutation is bounded and never implicitly submits.
+impl InputLine{
+    /// Number of nonempty ASCII-space delimited command tokens.
+    pub fn argument_count(&self)->usize{
+        let mut total=0usize;let mut inside=false;
+        for &b in self.editor.bytes(){
+            if b==b' '{inside=false;}
+            else if !inside{total+=1;inside=true;}
+        }
+        total
+    }
+    /// Find an exact case-sensitive argument without exposing clipboard or
+    /// scanning submitted history.
+    pub fn find_argument_exact(&self,needle:&[u8])->Option<usize>{
+        if needle.is_empty(){return None;}
+        for idx in 0..self.argument_count(){
+            let Ok((a,b))=self.argument_bounds(idx) else{continue};
+            if &self.editor.bytes()[a..b]==needle{return Some(idx);}
+        }
+        None
+    }
+    /// Uppercase only a selected argument; existing editor enforces bounds.
+    pub fn uppercase_argument(&mut self,index:usize)->Result<Event,Error>{
+        let (a,b)=self.argument_bounds(index)?;
+        let mut upper=[0u8;MAX_LINE];
+        for (i,&v) in self.editor.bytes()[a..b].iter().enumerate(){
+            upper[i]=v.to_ascii_uppercase();
+        }
+        self.replace_range(a,b,&upper[..b-a])
+    }
+    /// Lowercase only the selected token, retaining other flags/paths.
+    pub fn lowercase_argument(&mut self,index:usize)->Result<Event,Error>{
+        let (a,b)=self.argument_bounds(index)?;
+        let mut lower=[0u8;MAX_LINE];
+        for (i,&v) in self.editor.bytes()[a..b].iter().enumerate(){
+            lower[i]=v.to_ascii_lowercase();
+        }
+        self.replace_range(a,b,&lower[..b-a])
+    }
+    /// Optimistic exact-token replacement, refusing a stale draft token.
+    pub fn replace_argument_if_equal(&mut self,index:usize,expected:&[u8],
+        new_value:&[u8])->Result<Event,Error>{
+        let (a,b)=self.argument_bounds(index)?;
+        if &self.editor.bytes()[a..b]!=expected{return Err(Error::Invalid);}
+        self.replace_range(a,b,new_value)
+    }
+    /// Rotate shell arguments (excluding the verb) left by one. This explicit
+    /// transform normalizes inter-argument separators to single spaces but
+    /// leaves the command verb and surrounding prefix/suffix unchanged.
+    pub fn rotate_arguments_left(&mut self)->Result<Event,Error>{
+        let count=self.argument_count();
+        if count<3{return Err(Error::Invalid);}
+        let (first,_)=self.argument_bounds(1)?;
+        let (_,last)=self.argument_bounds(count-1)?;
+        let mut staged=[0u8;MAX_LINE];let mut used=0usize;
+        for index in (2..count).chain(core::iter::once(1)){
+            let (a,b)=self.argument_bounds(index)?;
+            if used>0{staged[used]=b' ';used+=1;}
+            staged[used..used+(b-a)].copy_from_slice(&self.editor.bytes()[a..b]);
+            used+=b-a;
+        }
+        self.replace_range(first,last,&staged[..used])
+    }
+}
+#[cfg(test)]
+mod r081_live_argument_tests{
+    use super::*;
+    #[test]
+    fn locate_case_change_cas_and_rotate_while_preserving_no_submission(){
+        let mut input=InputLine::new();
+        input.set_line(b"run  Alpha  beta GAMMA").unwrap();
+        assert_eq!(input.argument_count(),4);
+        assert_eq!(input.find_argument_exact(b"beta"),Some(2));
+        assert_eq!(input.find_argument_exact(b"Beta"),None);
+        assert_eq!(input.lowercase_argument(3),Ok(Event::Typed));
+        assert_eq!(input.uppercase_argument(2),Ok(Event::Typed));
+        assert_eq!(input.bytes(),b"run  Alpha  BETA gamma");
+        assert_eq!(input.replace_argument_if_equal(1,b"Alpha",b"first"),Ok(Event::Typed));
+        assert_eq!(input.rotate_arguments_left(),Ok(Event::Typed));
+        assert_eq!(input.bytes(),b"run  BETA gamma first");
+        assert_eq!(input.history_count(),0);
+        assert!(input.clipboard_bytes().is_empty());
+    }
+    #[test]
+    fn invalid_ordinals_and_stale_text_leave_draft_unchanged(){
+        let mut input=InputLine::new();input.set_line(b"cmd one").unwrap();
+        assert_eq!(input.rotate_arguments_left(),Err(Error::Invalid));
+        assert_eq!(input.uppercase_argument(5),Err(Error::Invalid));
+        assert_eq!(input.lowercase_argument(5),Err(Error::Invalid));
+        assert_eq!(input.replace_argument_if_equal(1,b"two",b"other"),
+            Err(Error::Invalid));
+        assert_eq!(input.bytes(),b"cmd one");
+        assert_eq!(input.argument_count(),2);
+        assert_eq!(input.find_argument_exact(b""),None);
+    }
+}

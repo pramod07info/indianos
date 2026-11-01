@@ -2899,3 +2899,159 @@ mod r080_editor_reconciliation_tests {
         assert_eq!(pool.reload_slot(id(),&mut fs,1,true).unwrap().bytes,5);
     }
 }
+
+
+// M1/R081 workstream A: six real unsaved multi-document operations.
+// All edits remain owner-bound and use the same single-step undo machinery.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct PoolTextMetrics{
+    pub bytes:usize,pub lines:usize,pub scalars:usize,pub fnv64:u64,pub dirty:bool,
+}
+impl EditorPool{
+    /// Inspect the current unsaved UTF-8 buffer, not an outdated disk copy.
+    pub fn text_metrics(&self,who:Identity,slot:usize)->Result<PoolTextMetrics,Error>{
+        let doc=self.docs.get(slot).ok_or(Error::Invalid)?;
+        doc.authorize(who)?;
+        let text=core::str::from_utf8(&doc.data[..doc.used]).map_err(|_|Error::Invalid)?;
+        let hash=doc.data[..doc.used].iter().fold(0xcbf29ce484222325u64,
+            |h,b|(h^(*b as u64)).wrapping_mul(0x100000001b3));
+        Ok(PoolTextMetrics{bytes:doc.used,lines:if doc.used==0{0}else{
+            text.split_inclusive('\n').count()},scalars:text.chars().count(),
+            fnv64:hash,dirty:doc.dirty})
+    }
+    /// Search the two open slots from a selected starting slot and byte
+    /// cursor; later slots begin at offset zero.
+    pub fn find_across_slots(&self,who:Identity,needle:&str,
+        start_slot:usize,from:usize)->Result<Option<(usize,usize)>,Error>{
+        if start_slot>=EDITOR_POOL_SLOTS{return Err(Error::Invalid);}
+        for i in start_slot..EDITOR_POOL_SLOTS{
+            let doc=&self.docs[i];
+            if let Some(at)=doc.find_text(who,needle,if i==start_slot{from}else{0})?{
+                return Ok(Some((i,at)));
+            }
+        }
+        Ok(None)
+    }
+    /// Replace a Unicode selection only if its visible unsaved text exactly
+    /// matches an expected literal; rejected edits do not clear redo history.
+    pub fn replace_selection_if_equal(&mut self,who:Identity,slot:usize,
+        from:usize,to:usize,expected:&str,new_text:&str)->Result<usize,Error>{
+        let doc=self.docs.get_mut(slot).ok_or(Error::Invalid)?;
+        doc.authorize(who)?;
+        let text=core::str::from_utf8(&doc.data[..doc.used]).map_err(|_|Error::Invalid)?;
+        if text.get(from..to)!=Some(expected){return Err(Error::Stale);}
+        doc.replace_text(who,from,to,new_text)
+    }
+    /// Insert one whole source row from a different editor slot as a single
+    /// undoable target edit. Selection preserves UTF-8 and its newline.
+    pub fn insert_line_from_slot(&mut self,who:Identity,
+        source:usize,one_based_line:usize,target:usize,at:usize)
+        ->Result<usize,Error>{
+        if one_based_line==0||source==target{return Err(Error::Invalid);}
+        let doc=self.docs.get(source).ok_or(Error::Invalid)?;
+        doc.authorize(who)?;
+        let text=core::str::from_utf8(&doc.data[..doc.used]).map_err(|_|Error::Invalid)?;
+        let row=text.split_inclusive('\n').nth(one_based_line-1)
+            .ok_or(Error::Invalid)?;
+        let row_len=row.len();
+        let mut temporary=[0u8;MAX_FILE_BYTES];
+        temporary[..row_len].copy_from_slice(row.as_bytes());
+        let other=self.docs.get_mut(target).ok_or(Error::Invalid)?;
+        other.replace_text(who,at,at,
+            core::str::from_utf8(&temporary[..row_len]).map_err(|_|Error::Invalid)?)
+    }
+    /// Mirror an active UTF-8 source into another slot only if the target has
+    /// the exact revision the UI previously observed.
+    pub fn mirror_slot_if_checksum(&mut self,who:Identity,source:usize,
+        target:usize,expected:u64)->Result<usize,Error>{
+        if source==target{return Err(Error::Invalid);}
+        let snapshot=self.text_metrics(who,target)?;
+        if snapshot.fnv64!=expected{return Err(Error::Stale);}
+        let doc=self.docs.get(source).ok_or(Error::Invalid)?;
+        doc.authorize(who)?;
+        let text=core::str::from_utf8(&doc.data[..doc.used]).map_err(|_|Error::Invalid)?;
+        let text_len=text.len();
+        let mut staged=[0u8;MAX_FILE_BYTES];
+        staged[..text_len].copy_from_slice(text.as_bytes());
+        let other=self.docs.get_mut(target).ok_or(Error::Invalid)?;
+        let original=other.used;
+        other.replace_text(who,0,original,
+            core::str::from_utf8(&staged[..text_len]).map_err(|_|Error::Invalid)?)
+    }
+    /// Undo all edited open documents together; validate all required undo
+    /// snapshots and identities before changing any buffer.
+    pub fn undo_all_ready(&mut self,who:Identity)->Result<usize,Error>{
+        let mut count=0;
+        for doc in &self.docs{
+            if doc.owner.is_some(){
+                doc.authorize(who)?;
+                if doc.undo.is_none(){return Err(Error::Invalid);}
+                count+=1;
+            }
+        }
+        if count==0{return Err(Error::Invalid);}
+        for doc in &mut self.docs{
+            if doc.owner.is_some(){doc.undo(who)?;}
+        }
+        Ok(count)
+    }
+}
+
+#[cfg(test)]
+mod r081_pool_source_tests{
+    use super::*;
+    use crate::block::{BlockError,SECTOR_BYTES};
+    struct Disk{sectors:[[u8;SECTOR_BYTES];100]}
+    impl BlockDevice for Disk{
+        fn sector_count(&self)->u64{100}
+        fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+            *out=*self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?;Ok(())
+        }
+        fn write_sector(&mut self,lba:u64,data:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+            *self.sectors.get_mut(lba as usize).ok_or(BlockError::OutOfRange)?=*data;Ok(())
+        }
+    }
+    fn id()->Identity{Identity{pid:81,generation:1}}
+    fn setup()->(HierVfs<Disk>,EditorPool){
+        let mut fs=HierVfs::format_blank(Disk{sectors:[[0;SECTOR_BYTES];100]}).unwrap();
+        fs.create("/one","α one\nsecond\n".as_bytes()).unwrap();
+        fs.create("/two",b"second").unwrap();
+        let mut pool=EditorPool::new();
+        pool.open(id(),&mut fs,0,"/one").unwrap();
+        pool.open(id(),&mut fs,1,"/two").unwrap();
+        (fs,pool)
+    }
+    #[test]
+    fn six_live_source_features_are_unicode_and_owner_safe(){
+        let (mut fs,mut pool)=setup();
+        let before=pool.text_metrics(id(),1).unwrap();
+        assert_eq!(before.bytes,6);
+        assert_eq!(pool.find_across_slots(id(),"second",0,0),Ok(Some((0,7))));
+        assert_eq!(pool.find_across_slots(id(),"second",0,13),Ok(Some((1,0))));
+        assert_eq!(pool.replace_selection_if_equal(id(),0,3,6,"one","first"),Ok(16));
+        assert_eq!(pool.insert_line_from_slot(id(),0,1,1,0),Ok(15));
+        let digest=pool.text_metrics(id(),1).unwrap().fnv64;
+        assert_eq!(pool.mirror_slot_if_checksum(id(),0,1,digest),Ok(16));
+        assert_eq!(pool.undo_all_ready(id()),Ok(2));
+        let mut out=[0u8;32];
+        assert_eq!(pool.read(id(),0,&mut out),Ok(14));
+        assert_eq!(&out[..14],"α one\nsecond\n".as_bytes());
+        assert_eq!(pool.read(id(),1,&mut out),Ok(15));
+        assert_eq!(&out[..15],"α first\nsecond".as_bytes());
+        pool.save_all(id(),&mut fs).unwrap();
+        let mut fs=HierVfs::mount(fs.into_device()).unwrap();
+        assert_eq!(fs.read("/one",&mut out),Ok(14));
+    }
+    #[test]
+    fn all_or_nothing_undo_rejects_missing_history_and_wrong_owner(){
+        let (_fs,mut pool)=setup();
+        pool.replace_text(id(),0,0,0,"!").unwrap();
+        assert_eq!(pool.undo_all_ready(id()),Err(Error::Invalid));
+        assert_eq!(pool.replace_selection_if_equal(id(),1,0,2,"bad","x"),Err(Error::Stale));
+        assert_eq!(pool.insert_line_from_slot(id(),0,0,1,0),Err(Error::Invalid));
+        assert_eq!(pool.mirror_slot_if_checksum(id(),0,1,0),Err(Error::Stale));
+        assert_eq!(pool.text_metrics(Identity{generation:2,..id()},0),Err(Error::Unauthorized));
+        assert_eq!(pool.status(id(),0).unwrap().bytes,15);
+        assert!(!pool.status(id(),1).unwrap().dirty);
+    }
+}

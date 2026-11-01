@@ -3086,3 +3086,135 @@ mod r080_desktop_reconciliation_tests {
         assert_eq!(pool.status(id(2),1).unwrap().bytes,6);
     }
 }
+
+
+// M1/R081 workstream E: six real source-review routes through live
+// Desktop session authority, not direct public filesystem mutation.
+impl<D:BlockDevice,const P:usize,const E:usize,const W:usize,
+ const K:usize,const G:usize,const Q:usize> Desktop<D,P,E,W,K,G,Q>{
+    pub fn project_source_slice_checksum(&mut self,caller:Identity,now:u64,
+        project:&crate::m1_project_workspace::ProjectTree,
+        name:&str,from:usize,to:usize)->Result<u64,ProjectRouteError>{
+        self.admit_editor(caller,now,FILE_READ).map_err(ProjectRouteError::Permission)?;
+        project.source_slice_checksum(caller,&mut self.volume,name,from,to)
+            .map_err(ProjectRouteError::Project)
+    }
+    pub fn project_read_source_window_if_checksum(&mut self,caller:Identity,now:u64,
+        project:&crate::m1_project_workspace::ProjectTree,name:&str,
+        expected:u64,from:usize,to:usize,out:&mut[u8])->Result<usize,ProjectRouteError>{
+        self.admit_editor(caller,now,FILE_READ).map_err(ProjectRouteError::Permission)?;
+        project.read_source_window_if_checksum(caller,&mut self.volume,
+            name,expected,from,to,out).map_err(ProjectRouteError::Project)
+    }
+    pub fn project_patch_source_if_checksum(&mut self,caller:Identity,now:u64,
+        project:&mut crate::m1_project_workspace::ProjectTree,name:&str,
+        expected:u64,from:usize,to:usize,replacement:&str)
+        ->Result<usize,ProjectRouteError>{
+        self.admit_editor(caller,now,FILE_WRITE).map_err(ProjectRouteError::Permission)?;
+        project.patch_source_if_checksum(caller,&mut self.volume,name,
+            expected,from,to,replacement).map_err(ProjectRouteError::Project)
+    }
+    pub fn project_replace_first_literal_if_checksum(&mut self,caller:Identity,now:u64,
+        project:&mut crate::m1_project_workspace::ProjectTree,name:&str,
+        expected:u64,needle:&str,replacement:&str,from:usize)
+        ->Result<Option<usize>,ProjectRouteError>{
+        self.admit_editor(caller,now,FILE_WRITE).map_err(ProjectRouteError::Permission)?;
+        project.replace_first_literal_if_checksum(caller,&mut self.volume,
+            name,expected,needle,replacement,from).map_err(ProjectRouteError::Project)
+    }
+    pub fn project_prepend_source_if_checksum(&mut self,caller:Identity,now:u64,
+        project:&mut crate::m1_project_workspace::ProjectTree,name:&str,
+        expected:u64,header:&str)->Result<usize,ProjectRouteError>{
+        self.admit_editor(caller,now,FILE_WRITE).map_err(ProjectRouteError::Permission)?;
+        project.prepend_source_if_checksum(caller,&mut self.volume,
+            name,expected,header).map_err(ProjectRouteError::Project)
+    }
+    pub fn project_erase_source_range_if_checksum(&mut self,caller:Identity,now:u64,
+        project:&mut crate::m1_project_workspace::ProjectTree,name:&str,
+        expected:u64,from:usize,to:usize)->Result<usize,ProjectRouteError>{
+        self.admit_editor(caller,now,FILE_WRITE).map_err(ProjectRouteError::Permission)?;
+        project.erase_source_range_if_checksum(caller,&mut self.volume,
+            name,expected,from,to).map_err(ProjectRouteError::Project)
+    }
+}
+
+#[cfg(test)]
+mod r081_desktop_source_guard_tests{
+    use super::*;
+    use crate::block::{BlockError,SECTOR_BYTES};
+    use crate::batch2_launcher::Image;
+    use crate::batch2_settings::{Settings,Theme};
+    use crate::m1_project_workspace::ProjectTree;
+    struct Disk{sectors:[[u8;SECTOR_BYTES];100]}
+    impl BlockDevice for Disk{
+        fn sector_count(&self)->u64{100}
+        fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+            *out=*self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?;Ok(())
+        }
+        fn write_sector(&mut self,lba:u64,data:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+            *self.sectors.get_mut(lba as usize).ok_or(BlockError::OutOfRange)?=*data;Ok(())
+        }
+    }
+    type Desk=Desktop<Disk,3,3,2,2,3,8>;
+    fn id(pid:u32)->Identity{Identity{pid,generation:1}}
+    fn launch(pid:u32)->Launch{
+        Launch{pid,generation:1,image:Image{
+            image_id:pid,entry:0x1000,mapped_end:0x2000,verified:true
+        }}
+    }
+    fn setup()->(Desk,ProjectTree){
+        let fs=HierVfs::format_blank(Disk{sectors:[[0;SECTOR_BYTES];100]}).unwrap();
+        let mut d=Desk::from_mounted(fs);
+        d.start(id(1),launch(1),id(2),launch(2),
+            Settings{theme:Theme::Dark,pointer_speed:5,key_repeat:10},8,5).unwrap();
+        let mut p=ProjectTree::new();
+        d.project_create(id(2),1,&mut p,"demo").unwrap();
+        d.project_create_file(id(2),1,&mut p,"main","α red\nβ red\n".as_bytes()).unwrap();
+        (d,p)
+    }
+    #[test]
+    fn six_project_routes_enforce_live_authority_and_persist_real_changes(){
+        let (mut d,mut p)=setup();
+        let digest=d.project_source_summary(id(2),1,&p,"main").unwrap().fnv64;
+        let mut out=[0u8;32];
+        let slice=d.project_source_slice_checksum(id(2),1,&p,"main",0,2).unwrap();
+        assert_ne!(slice,0);
+        let count=d.project_read_source_window_if_checksum(
+            id(2),1,&p,"main",digest,0,7,&mut out).unwrap();
+        assert_eq!(&out[..count],"α red\n".as_bytes());
+        assert_eq!(d.project_replace_first_literal_if_checksum(
+            id(2),1,&mut p,"main",digest,"red","blue",0),Ok(Some(3)));
+        let digest=d.project_source_summary(id(2),1,&p,"main").unwrap().fnv64;
+        assert_eq!(d.project_prepend_source_if_checksum(
+            id(2),1,&mut p,"main",digest,"!"),Ok(16));
+        let digest=d.project_source_summary(id(2),1,&p,"main").unwrap().fnv64;
+        assert_eq!(d.project_erase_source_range_if_checksum(
+            id(2),1,&mut p,"main",digest,0,1),Ok(15));
+        let digest=d.project_source_summary(id(2),1,&p,"main").unwrap().fnv64;
+        assert_eq!(d.project_patch_source_if_checksum(
+            id(2),1,&mut p,"main",digest,3,7,"green"),Ok(16));
+        let mut fs=HierVfs::mount(d.into_device()).unwrap();
+        let len=fs.read("/work/demo/main",&mut out).unwrap();
+        assert_eq!(&out[..len],"α green\nβ red\n".as_bytes());
+    }
+    #[test]
+    fn expired_pid_reuse_stale_versions_and_small_buffers_are_denied(){
+        let (mut d,mut p)=setup();
+        let digest=d.project_source_summary(id(2),1,&p,"main").unwrap().fnv64;
+        let mut out=[0xaau8;2];
+        assert!(d.project_source_slice_checksum(id(2),6,&p,"main",0,2).is_err());
+        assert!(d.project_read_source_window_if_checksum(
+            id(2),6,&p,"main",digest,0,7,&mut out).is_err());
+        assert!(d.project_replace_first_literal_if_checksum(
+            id(2),6,&mut p,"main",digest,"red","new",0).is_err());
+        assert!(d.project_prepend_source_if_checksum(
+            id(2),6,&mut p,"main",digest,"X").is_err());
+        assert!(d.project_patch_source_if_checksum(
+            id(2),1,&mut p,"main",digest^1,0,0,"X").is_err());
+        assert!(d.project_erase_source_range_if_checksum(
+            Identity{generation:2,..id(2)},1,&mut p,"main",digest,0,2).is_err());
+        assert!(d.project_read_source_window_if_checksum(
+            id(2),1,&p,"main",digest,0,7,&mut out).is_err());
+        assert_eq!(out,[0xaa;2]);
+    }
+}
