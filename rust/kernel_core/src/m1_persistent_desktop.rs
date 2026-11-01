@@ -2651,3 +2651,137 @@ impl<D:BlockDevice,const P:usize,const E:usize,const W:usize,
   pool.save_all(caller,&mut self.volume).map_err(EditorRouteError::Editor)
  }
 }
+
+
+// R077 workstreams D/E: desktop permission boundary for the editor pool and
+// paged source browser. These are real VFS/editor routes, not mock UI pixels.
+impl<D: BlockDevice, const P: usize, const E: usize, const W: usize,
+     const K: usize, const G: usize, const Q: usize> Desktop<D, P, E, W, K, G, Q> {
+    pub fn editor_pool_status(&self, caller: Identity, now: u64,
+        pool: &crate::m1_disk_editor::EditorPool, slot: usize)
+        -> Result<crate::m1_disk_editor::Status, EditorRouteError> {
+        self.admit_editor(caller, now, FILE_READ)?;
+        pool.status(caller, slot).map_err(EditorRouteError::Editor)
+    }
+    pub fn editor_pool_read(&self, caller: Identity, now: u64,
+        pool: &crate::m1_disk_editor::EditorPool, slot: usize, out: &mut [u8])
+        -> Result<usize, EditorRouteError> {
+        self.admit_editor(caller, now, FILE_READ)?;
+        pool.read(caller, slot, out).map_err(EditorRouteError::Editor)
+    }
+    pub fn editor_pool_undo(&mut self, caller: Identity, now: u64,
+        pool: &mut crate::m1_disk_editor::EditorPool, slot: usize)
+        -> Result<usize, EditorRouteError> {
+        self.admit_editor(caller, now, FILE_WRITE)?;
+        pool.undo(caller, slot).map_err(EditorRouteError::Editor)
+    }
+    pub fn editor_pool_redo(&mut self, caller: Identity, now: u64,
+        pool: &mut crate::m1_disk_editor::EditorPool, slot: usize)
+        -> Result<usize, EditorRouteError> {
+        self.admit_editor(caller, now, FILE_WRITE)?;
+        pool.redo(caller, slot).map_err(EditorRouteError::Editor)
+    }
+    pub fn project_search_sources_page(&mut self, caller: Identity, now: u64,
+        project: &crate::m1_project_workspace::ProjectTree, needle: &str,
+        start: usize, out: &mut [crate::m1_project_workspace::ProjectMatch])
+        -> Result<(usize, Option<usize>), ProjectRouteError> {
+        self.admit_editor(caller, now, FILE_READ)
+            .map_err(ProjectRouteError::Permission)?;
+        project.search_sources_page(caller, &mut self.volume, needle, start, out)
+            .map_err(ProjectRouteError::Project)
+    }
+    pub fn project_read_source_window(&mut self, caller: Identity, now: u64,
+        project: &crate::m1_project_workspace::ProjectTree, name: &str,
+        offset: usize, limit: usize, out: &mut [u8])
+        -> Result<usize, ProjectRouteError> {
+        self.admit_editor(caller, now, FILE_READ)
+            .map_err(ProjectRouteError::Permission)?;
+        project.read_source_window(caller, &mut self.volume, name, offset, limit, out)
+            .map_err(ProjectRouteError::Project)
+    }
+}
+
+#[cfg(test)]
+mod r077_desktop_route_tests {
+    use super::*;
+    use crate::block::{BlockError, SECTOR_BYTES};
+    use crate::batch2_launcher::Image;
+    use crate::batch2_settings::{Settings, Theme};
+    use crate::m1_disk_editor::EditorPool;
+    use crate::m1_project_workspace::{ProjectTree, ProjectMatch};
+    struct Disk { sectors: [[u8; SECTOR_BYTES]; 100] }
+    impl BlockDevice for Disk {
+        fn sector_count(&self) -> u64 { 100 }
+        fn read_sector(&mut self, lba: u64, out: &mut [u8; SECTOR_BYTES])
+            -> Result<(), BlockError> {
+            *out = *self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?;
+            Ok(())
+        }
+        fn write_sector(&mut self, lba: u64, bytes: &[u8; SECTOR_BYTES])
+            -> Result<(), BlockError> {
+            *self.sectors.get_mut(lba as usize).ok_or(BlockError::OutOfRange)? = *bytes;
+            Ok(())
+        }
+    }
+    type Desk = Desktop<Disk, 3, 3, 2, 2, 3, 8>;
+    fn id(pid: u32) -> Identity { Identity { pid, generation: 1 } }
+    fn launch(pid: u32) -> Launch {
+        Launch { pid, generation: 1, image: Image {
+            image_id: pid, entry: 0x1000, mapped_end: 0x2000, verified: true
+        } }
+    }
+    fn ready() -> Desk {
+        let mut fs = HierVfs::format_blank(Disk { sectors: [[0; SECTOR_BYTES]; 100] }).unwrap();
+        fs.create("/source", b"first").unwrap();
+        let mut desk = Desk::from_mounted(fs);
+        desk.start(id(1), launch(1), id(2), launch(2),
+            Settings { theme: Theme::Dark, pointer_speed: 5, key_repeat: 10 },
+            8, 5).unwrap();
+        desk
+    }
+    #[test]
+    fn authorized_editor_pool_undo_redo_and_reader_preserve_disk() {
+        let mut desk = ready();
+        let mut pool = EditorPool::new();
+        desk.editor_pool_open(id(2), 1, &mut pool, 0, "/source").unwrap();
+        desk.editor_pool_replace_text(id(2), 1, &mut pool, 0, 5, 5, "!").unwrap();
+        assert_eq!(desk.editor_pool_status(id(2), 1, &pool, 0).unwrap().bytes, 6);
+        assert_eq!(desk.editor_pool_undo(id(2), 1, &mut pool, 0), Ok(5));
+        assert_eq!(desk.editor_pool_redo(id(2), 1, &mut pool, 0), Ok(6));
+        let mut out = [0u8; 8];
+        assert_eq!(desk.editor_pool_read(id(2), 1, &pool, 0, &mut out), Ok(6));
+        assert_eq!(&out[..6], b"first!");
+        assert!(desk.editor_pool_undo(id(2), 6, &mut pool, 0).is_err());
+        assert!(desk.editor_pool_read(Identity { generation: 2, ..id(2) },
+            1, &pool, 0, &mut out).is_err());
+        assert_eq!(&out[..6], b"first!");
+        desk.editor_pool_save_all(id(2), 1, &mut pool).unwrap();
+        let mut fs = HierVfs::mount(desk.into_device()).unwrap();
+        assert_eq!(fs.read("/source", &mut out), Ok(6));
+        assert_eq!(&out[..6], b"first!");
+    }
+    #[test]
+    fn authenticated_paged_project_search_and_window_survive_remount() {
+        let mut desk = ready();
+        let mut project = ProjectTree::new();
+        desk.project_create(id(2), 1, &mut project, "demo").unwrap();
+        desk.project_create_file(id(2), 1, &mut project,
+            "code", "α foo foo foo".as_bytes()).unwrap();
+        let mut matches = [ProjectMatch::EMPTY; 2];
+        let (n, cursor) = desk.project_search_sources_page(
+            id(2), 1, &project, "foo", 0, &mut matches).unwrap();
+        assert_eq!((n, cursor), (2, Some(2)));
+        let mut bytes = [0xceu8; 8];
+        assert!(desk.project_read_source_window(id(2), 6,
+            &project, "code", 3, 7, &mut bytes).is_err());
+        assert_eq!(bytes, [0xce; 8]);
+        assert_eq!(desk.project_read_source_window(id(2), 1,
+            &project, "code", 3, 7, &mut bytes), Ok(7));
+        assert_eq!(&bytes[..7], b"foo foo");
+        let mut fs = HierVfs::mount(desk.into_device()).unwrap();
+        let mut p = ProjectTree::new();
+        p.open(id(2), &mut fs, "demo").unwrap();
+        assert_eq!(p.search_sources_page(id(2), &mut fs, "foo", 2,
+            &mut matches), Ok((1, None)));
+    }
+}

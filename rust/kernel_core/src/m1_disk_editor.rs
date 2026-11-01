@@ -2524,3 +2524,78 @@ mod r076_multi_document_editor_tests {
         assert_eq!(again.save_all(owner(),&mut fs),Err(Error::Invalid));
     }
 }
+
+
+// R077 workstream A: make the existing two-document editor usable for
+// independent, authenticated undo/redo and status inspection.
+impl EditorPool {
+    pub fn status(&self, who: Identity, slot: usize) -> Result<Status, Error> {
+        self.docs.get(slot).ok_or(Error::Invalid)?.status(who)
+    }
+    pub fn undo(&mut self, who: Identity, slot: usize) -> Result<usize, Error> {
+        self.docs.get_mut(slot).ok_or(Error::Invalid)?.undo(who)
+    }
+    pub fn redo(&mut self, who: Identity, slot: usize) -> Result<usize, Error> {
+        self.docs.get_mut(slot).ok_or(Error::Invalid)?.redo(who)
+    }
+}
+
+#[cfg(test)]
+mod r077_editor_pool_tests {
+    use super::*;
+    use crate::block::{BlockError, SECTOR_BYTES};
+    struct Disk { sectors: [[u8; SECTOR_BYTES]; 100] }
+    impl BlockDevice for Disk {
+        fn sector_count(&self) -> u64 { 100 }
+        fn read_sector(&mut self, lba: u64, out: &mut [u8; SECTOR_BYTES])
+            -> Result<(), BlockError> {
+            *out = *self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?;
+            Ok(())
+        }
+        fn write_sector(&mut self, lba: u64, bytes: &[u8; SECTOR_BYTES])
+            -> Result<(), BlockError> {
+            *self.sectors.get_mut(lba as usize).ok_or(BlockError::OutOfRange)? = *bytes;
+            Ok(())
+        }
+    }
+    fn owner() -> Identity { Identity { pid: 35, generation: 1 } }
+    fn recycled() -> Identity { Identity { pid: 35, generation: 2 } }
+
+    #[test]
+    fn undo_redo_are_independent_across_two_real_documents() {
+        let mut fs = HierVfs::format_blank(Disk { sectors: [[0; SECTOR_BYTES]; 100] }).unwrap();
+        fs.create("/one", b"one").unwrap();
+        fs.create("/two", b"two").unwrap();
+        let mut pool = EditorPool::new();
+        pool.open(owner(), &mut fs, 0, "/one").unwrap();
+        pool.open(owner(), &mut fs, 1, "/two").unwrap();
+        pool.replace_text(owner(), 0, 3, 3, "1").unwrap();
+        pool.replace_text(owner(), 1, 3, 3, "2").unwrap();
+        assert_eq!(pool.undo(owner(), 0), Ok(3));
+        assert_eq!(pool.status(owner(), 1).unwrap().bytes, 4);
+        assert_eq!(pool.redo(owner(), 0), Ok(4));
+        assert_eq!(pool.undo(owner(), 1), Ok(3));
+        pool.save_all(owner(), &mut fs).unwrap();
+        let mut mounted = HierVfs::mount(fs.into_device()).unwrap();
+        let mut bytes = [0u8; 8];
+        assert_eq!(mounted.read("/one", &mut bytes), Ok(4));
+        assert_eq!(&bytes[..4], b"one1");
+        assert_eq!(mounted.read("/two", &mut bytes), Ok(3));
+        assert_eq!(&bytes[..3], b"two");
+    }
+
+    #[test]
+    fn rejected_slot_and_recycled_identity_never_change_a_document() {
+        let mut fs = HierVfs::format_blank(Disk { sectors: [[0; SECTOR_BYTES]; 100] }).unwrap();
+        fs.create("/one", b"base").unwrap();
+        let mut pool = EditorPool::new();
+        pool.open(owner(), &mut fs, 0, "/one").unwrap();
+        pool.replace_text(owner(), 0, 4, 4, "!").unwrap();
+        assert_eq!(pool.undo(recycled(), 0), Err(Error::Unauthorized));
+        assert_eq!(pool.redo(recycled(), 0), Err(Error::Unauthorized));
+        assert_eq!(pool.status(owner(), 2), Err(Error::Invalid));
+        let mut bytes = [0u8; 8];
+        assert_eq!(pool.read(owner(), 0, &mut bytes), Ok(5));
+        assert_eq!(&bytes[..5], b"base!");
+    }
+}
