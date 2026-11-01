@@ -2545,3 +2545,206 @@ mod r082_shell_argument_operations_tests{
         assert_eq!(line.bytes(),b"run good");
     }
 }
+
+
+// M1/R083 stream D: 20 real unsent shell-token checks/transforms.
+// No action submits a command or accesses the filesystem.
+impl InputLine{
+    pub fn argument_length(&self,index:usize)->Result<usize,Error>{
+        let (a,b)=self.argument_bounds(index)?;
+        let token=&self.editor.bytes()[a..b];
+        Ok(b-a)
+    }
+    pub fn argument_contains(&self,index:usize,needle:&[u8])->Result<bool,Error>{
+        let (a,b)=self.argument_bounds(index)?;
+        let token=&self.editor.bytes()[a..b];
+        if needle.is_empty(){return Err(Error::Invalid);} Ok(token.windows(needle.len()).any(|w|w==needle))
+    }
+    pub fn argument_is_ascii(&self,index:usize)->Result<bool,Error>{
+        let (a,b)=self.argument_bounds(index)?;
+        let token=&self.editor.bytes()[a..b];
+        Ok(token.is_ascii())
+    }
+    pub fn argument_is_number(&self,index:usize)->Result<bool,Error>{
+        let (a,b)=self.argument_bounds(index)?;
+        let token=&self.editor.bytes()[a..b];
+        Ok(token.iter().all(|b|b.is_ascii_digit()))
+    }
+    pub fn argument_is_option(&self,index:usize)->Result<bool,Error>{
+        let (a,b)=self.argument_bounds(index)?;
+        let token=&self.editor.bytes()[a..b];
+        Ok(token.starts_with(b"-"))
+    }
+    pub fn argument_is_absolute_path(&self,index:usize)->Result<bool,Error>{
+        let (a,b)=self.argument_bounds(index)?;
+        let token=&self.editor.bytes()[a..b];
+        Ok(token.starts_with(b"/"))
+    }
+    pub fn argument_is_lowercase_ascii(&self,index:usize)->Result<bool,Error>{
+        let (a,b)=self.argument_bounds(index)?;
+        let token=&self.editor.bytes()[a..b];
+        Ok(token.iter().all(|b|!b.is_ascii_alphabetic()||b.is_ascii_lowercase()))
+    }
+    pub fn argument_is_uppercase_ascii(&self,index:usize)->Result<bool,Error>{
+        let (a,b)=self.argument_bounds(index)?;
+        let token=&self.editor.bytes()[a..b];
+        Ok(token.iter().all(|b|!b.is_ascii_alphabetic()||b.is_ascii_uppercase()))
+    }
+
+    /// Find first token beginning with a literal byte sequence.
+    pub fn first_argument_prefix(&self,prefix:&[u8])->Result<Option<usize>,Error>{
+        if prefix.is_empty(){return Err(Error::Invalid);}
+        for index in 0..self.argument_count(){
+            let (a,b)=self.argument_bounds(index)?;
+            if self.editor.bytes()[a..b].starts_with(prefix){return Ok(Some(index));}
+        }
+        Ok(None)
+    }
+    /// Count flags in active unsent draft; absolute paths remain distinct.
+    pub fn count_option_arguments(&self)->usize{
+        (0..self.argument_count()).filter(|i|self.argument_is_option(*i)==Ok(true)).count()
+    }
+    /// Drop a verified token prefix only, with no change on stale content.
+    pub fn remove_argument_prefix(&mut self,index:usize,prefix:&[u8])
+        ->Result<Event,Error>{
+        let (a,b)=self.argument_bounds(index)?;
+        if prefix.is_empty()||prefix.len()>=b-a||
+            !self.editor.bytes()[a..b].starts_with(prefix){return Err(Error::Invalid);}
+        self.replace_range(a,a+prefix.len(),b"")
+    }
+    /// Drop a verified suffix without accidentally modifying another token.
+    pub fn remove_argument_suffix(&mut self,index:usize,suffix:&[u8])
+        ->Result<Event,Error>{
+        let (a,b)=self.argument_bounds(index)?;
+        if suffix.is_empty()||suffix.len()>=b-a||
+            !self.editor.bytes()[a..b].ends_with(suffix){return Err(Error::Invalid);}
+        self.replace_range(b-suffix.len(),b,b"")
+    }
+    /// Keep exactly N initial bytes of a selected ASCII command argument.
+    pub fn keep_argument_first(&mut self,index:usize,count:usize)
+        ->Result<Event,Error>{
+        let (a,b)=self.argument_bounds(index)?;
+        if count==0||count>=b-a||!self.editor.bytes()[a..b].is_ascii(){
+            return Err(Error::Invalid);
+        }
+        self.replace_range(a+count,b,b"")
+    }
+    /// Drop exactly N initial ASCII bytes; cannot leave an empty argument.
+    pub fn drop_argument_first(&mut self,index:usize,count:usize)
+        ->Result<Event,Error>{
+        let (a,b)=self.argument_bounds(index)?;
+        if count==0||count>=b-a||!self.editor.bytes()[a..b].is_ascii(){
+            return Err(Error::Invalid);
+        }
+        self.replace_range(a,a+count,b"")
+    }
+    /// Switch ASCII letter case in one token; no changes to other arguments.
+    pub fn swap_argument_ascii_case(&mut self,index:usize)->Result<Event,Error>{
+        let (a,b)=self.argument_bounds(index)?;
+        let mut staged=[0u8;MAX_LINE];
+        for (i,&v) in self.editor.bytes()[a..b].iter().enumerate(){
+            staged[i]=if v.is_ascii_uppercase(){v.to_ascii_lowercase()}
+                else{v.to_ascii_uppercase()};
+        }
+        self.replace_range(a,b,&staged[..b-a])
+    }
+    /// Replace first argument byte when the user's observed byte still agrees.
+    pub fn replace_argument_first_byte(&mut self,index:usize,expected:u8,new:u8)
+        ->Result<Event,Error>{
+        let (a,_)=self.argument_bounds(index)?;
+        if self.editor.bytes()[a]!=expected||!new.is_ascii_graphic(){
+            return Err(Error::Invalid);
+        }
+        self.replace_range(a,a+1,&[new])
+    }
+    /// Replace last argument byte with a single validated ASCII character.
+    pub fn replace_argument_last_byte(&mut self,index:usize,expected:u8,new:u8)
+        ->Result<Event,Error>{
+        let (_,b)=self.argument_bounds(index)?;
+        if self.editor.bytes()[b-1]!=expected||!new.is_ascii_graphic(){
+            return Err(Error::Invalid);
+        }
+        self.replace_range(b-1,b,&[new])
+    }
+    /// Remove all prefix '-' bytes, rejecting non-option arguments.
+    pub fn strip_argument_dashes(&mut self,index:usize)->Result<Event,Error>{
+        let (a,b)=self.argument_bounds(index)?;
+        let count=self.editor.bytes()[a..b].iter().take_while(|v|**v==b'-').count();
+        if count==0||count==b-a{return Err(Error::Invalid);}
+        self.replace_range(a,a+count,b"")
+    }
+    /// Insert one '-' when the selected token is not yet an option.
+    pub fn ensure_argument_dash(&mut self,index:usize)->Result<Event,Error>{
+        let (a,_)=self.argument_bounds(index)?;
+        if self.editor.bytes()[a]==b'-'{return Ok(Event::Empty);}
+        self.replace_range(a,a,b"-")
+    }
+    /// Repeat one token two to four times with normalized single separators,
+    /// making exactly one bounded edit and no implicit command execution.
+    pub fn repeat_argument_token(&mut self,index:usize,copies:usize)
+        ->Result<Event,Error>{
+        if !(2..=4).contains(&copies){return Err(Error::Invalid);}
+        let (a,b)=self.argument_bounds(index)?;
+        let token=&self.editor.bytes()[a..b];
+        if !token.is_ascii(){return Err(Error::Invalid);}
+        let len=(b-a).checked_mul(copies).and_then(|n|n.checked_add(copies-1))
+            .ok_or(Error::Full)?;
+        if len>MAX_LINE{return Err(Error::Full);}
+        let mut staged=[0u8;MAX_LINE];let mut used=0;
+        for i in 0..copies{
+            if i>0{staged[used]=b' ';used+=1;}
+            staged[used..used+token.len()].copy_from_slice(token);used+=token.len();
+        }
+        self.replace_range(a,b,&staged[..len])
+    }
+}
+#[cfg(test)]
+mod r083_argument_tests{
+    use super::*;
+    #[test]
+    fn ten_inspections_check_real_draft_tokens_without_exec(){
+        let mut line=InputLine::new();
+        line.set_line(b"run --fast /home 123 Code").unwrap();
+        assert_eq!(line.argument_length(1),Ok(6));
+        assert_eq!(line.argument_contains(2,b"om"),Ok(true));
+        assert_eq!(line.argument_is_ascii(4),Ok(true));
+        assert_eq!(line.argument_is_number(3),Ok(true));
+        assert_eq!(line.argument_is_option(1),Ok(true));
+        assert_eq!(line.argument_is_absolute_path(2),Ok(true));
+        assert_eq!(line.argument_is_lowercase_ascii(1),Ok(true));
+        assert_eq!(line.argument_is_uppercase_ascii(3),Ok(true));
+        assert_eq!(line.first_argument_prefix(b"/"),Ok(Some(2)));
+        assert_eq!(line.count_option_arguments(),1);
+    }
+    #[test]
+    fn ten_mutations_apply_atomic_argument_edits_not_history_entries(){
+        let mut line=InputLine::new();line.set_line(b"run --HELLO Case").unwrap();
+        assert_eq!(line.strip_argument_dashes(1),Ok(Event::Erased));
+        assert_eq!(line.swap_argument_ascii_case(1),Ok(Event::Typed));
+        assert_eq!(line.bytes(),b"run hello Case");
+        assert_eq!(line.remove_argument_prefix(1,b"he"),Ok(Event::Erased));
+        assert_eq!(line.remove_argument_suffix(1,b"lo"),Ok(Event::Erased));
+        assert_eq!(line.bytes(),b"run l Case");
+        assert_eq!(line.replace_argument_first_byte(2,b'C',b'B'),Ok(Event::Typed));
+        assert_eq!(line.replace_argument_last_byte(2,b'e',b'X'),Ok(Event::Typed));
+        assert_eq!(line.ensure_argument_dash(2),Ok(Event::Typed));
+        assert_eq!(line.bytes(),b"run l -BasX");
+        assert_eq!(line.keep_argument_first(2,3),Ok(Event::Erased));
+        assert_eq!(line.bytes(),b"run l -Ba");
+        assert_eq!(line.drop_argument_first(2,1),Ok(Event::Erased));
+        assert_eq!(line.bytes(),b"run l Ba");
+        assert_eq!(line.repeat_argument_token(1,3),Ok(Event::Typed));
+        assert_eq!(line.bytes(),b"run l l l Ba");
+        assert_eq!(line.history_count(),0);
+    }
+    #[test]
+    fn stale_missing_indices_overflow_and_short_read_preserve_draft(){
+        let mut line=InputLine::new();line.set_line(b"run example").unwrap();
+        assert_eq!(line.remove_argument_prefix(1,b"missing"),Err(Error::Invalid));
+        assert_eq!(line.remove_argument_suffix(1,b"missing"),Err(Error::Invalid));
+        assert_eq!(line.repeat_argument_token(1,100),Err(Error::Invalid));
+        assert_eq!(line.replace_argument_last_byte(1,b'x',b'y'),Err(Error::Invalid));
+        assert_eq!(line.argument_length(20),Err(Error::Invalid));
+        assert_eq!(line.bytes(),b"run example");
+    }
+}
