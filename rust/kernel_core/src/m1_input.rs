@@ -2415,3 +2415,133 @@ mod r081_live_argument_tests{
         assert_eq!(input.find_argument_exact(b""),None);
     }
 }
+
+
+// M1/R082 stream D — ten live, non-submitting shell argument operations.
+// All mutations use the bounded input editor; no history or command execution.
+impl InputLine {
+    /// Read a token into a caller buffer, preflighting its entire length.
+    pub fn read_argument(&self,index:usize,out:&mut[u8])->Result<usize,Error>{
+        let (start,end)=self.argument_bounds(index)?;
+        let size=end-start;
+        if out.len()<size{return Err(Error::TooSmall);}
+        out[..size].copy_from_slice(&self.editor.bytes()[start..end]);Ok(size)
+    }
+    /// Compare an exact token without changing the active keyboard cursor.
+    pub fn argument_equals(&self,index:usize,needle:&[u8])->Result<bool,Error>{
+        let (a,b)=self.argument_bounds(index)?;
+        Ok(&self.editor.bytes()[a..b]==needle)
+    }
+    /// Inspect a selected token's prefix without exposing its private draft.
+    pub fn argument_has_prefix(&self,index:usize,prefix:&[u8])
+        ->Result<bool,Error>{
+        let (a,b)=self.argument_bounds(index)?;
+        Ok(self.editor.bytes()[a..b].starts_with(prefix))
+    }
+    /// Inspect a selected token's suffix (e.g. a source extension).
+    pub fn argument_has_suffix(&self,index:usize,suffix:&[u8])
+        ->Result<bool,Error>{
+        let (a,b)=self.argument_bounds(index)?;
+        Ok(self.editor.bytes()[a..b].ends_with(suffix))
+    }
+    /// Add an ASCII prefix to exactly one argument as one reversible draft edit.
+    pub fn prefix_argument(&mut self,index:usize,prefix:&[u8])->Result<Event,Error>{
+        let (a,b)=self.argument_bounds(index)?;
+        let size=prefix.len().checked_add(b-a).ok_or(Error::Full)?;
+        if size>MAX_LINE{return Err(Error::Full);}
+        let mut staged=[0u8;MAX_LINE];
+        staged[..prefix.len()].copy_from_slice(prefix);
+        staged[prefix.len()..size].copy_from_slice(&self.editor.bytes()[a..b]);
+        self.replace_range(a,b,&staged[..size])
+    }
+    /// Add an ASCII suffix to a token while keeping the neighboring spacing.
+    pub fn suffix_argument(&mut self,index:usize,suffix:&[u8])->Result<Event,Error>{
+        let (a,b)=self.argument_bounds(index)?;
+        let size=(b-a).checked_add(suffix.len()).ok_or(Error::Full)?;
+        if size>MAX_LINE{return Err(Error::Full);}
+        let mut staged=[0u8;MAX_LINE];
+        staged[..b-a].copy_from_slice(&self.editor.bytes()[a..b]);
+        staged[b-a..size].copy_from_slice(suffix);
+        self.replace_range(a,b,&staged[..size])
+    }
+    /// ASCII title-case one token, leaving later bytes and other tokens
+    /// unchanged. Does not parse or modify file-system content.
+    pub fn capitalize_argument(&mut self,index:usize)->Result<Event,Error>{
+        let (a,b)=self.argument_bounds(index)?;
+        let mut staged=[0u8;MAX_LINE];
+        staged[..b-a].copy_from_slice(&self.editor.bytes()[a..b]);
+        if b>a{staged[0]=staged[0].to_ascii_uppercase();}
+        self.replace_range(a,b,&staged[..b-a])
+    }
+    /// Reverse one strictly ASCII shell token; reject non-ASCII rather than
+    /// manufacturing invalid UTF-8 or splitting a multibyte source scalar.
+    pub fn reverse_argument(&mut self,index:usize)->Result<Event,Error>{
+        let (a,b)=self.argument_bounds(index)?;
+        let bytes=&self.editor.bytes()[a..b];
+        if bytes.iter().any(|x|!x.is_ascii()){return Err(Error::Invalid);}
+        let mut staged=[0u8;MAX_LINE];
+        for (i,&x) in bytes.iter().rev().enumerate(){staged[i]=x;}
+        self.replace_range(a,b,&staged[..b-a])
+    }
+    /// Rotate all arguments after the executable to the right once while
+    /// retaining executable bytes and normalizing only internal separators.
+    pub fn rotate_arguments_right(&mut self)->Result<Event,Error>{
+        let count=self.argument_count();
+        if count<3{return Err(Error::Invalid);}
+        let (first,_)=self.argument_bounds(1)?;
+        let (_,last)=self.argument_bounds(count-1)?;
+        let mut staged=[0u8;MAX_LINE];let mut used=0;
+        for index in core::iter::once(count-1).chain(1..count-1){
+            let (a,b)=self.argument_bounds(index)?;
+            if used>0{staged[used]=b' ';used+=1;}
+            staged[used..used+b-a].copy_from_slice(&self.editor.bytes()[a..b]);
+            used+=b-a;
+        }
+        self.replace_range(first,last,&staged[..used])
+    }
+    /// Conditional argument removal: a changed token cannot be accidentally
+    /// deleted by a stale UI event.
+    pub fn delete_argument_if_equal(&mut self,index:usize,expected:&[u8])
+        ->Result<Event,Error>{
+        let (a,b)=self.argument_bounds(index)?;
+        if &self.editor.bytes()[a..b]!=expected{return Err(Error::Invalid);}
+        self.delete_argument(index)
+    }
+}
+#[cfg(test)]
+mod r082_shell_argument_operations_tests{
+    use super::*;
+    #[test]
+    fn ten_argument_services_transform_real_unsent_command_line(){
+        let mut line=InputLine::new();line.set_line(b"run alpha beta gamma").unwrap();
+        let mut out=[0xaau8;20];
+        assert_eq!(line.read_argument(1,&mut out),Ok(5));
+        assert_eq!(&out[..5],b"alpha");
+        assert_eq!(line.argument_equals(2,b"beta"),Ok(true));
+        assert_eq!(line.argument_has_prefix(3,b"gam"),Ok(true));
+        assert_eq!(line.argument_has_suffix(3,b"mma"),Ok(true));
+        assert_eq!(line.prefix_argument(1,b"pre"),Ok(Event::Typed));
+        assert_eq!(line.suffix_argument(2,b"end"),Ok(Event::Typed));
+        assert_eq!(line.capitalize_argument(1),Ok(Event::Typed));
+        assert_eq!(line.reverse_argument(3),Ok(Event::Typed));
+        assert_eq!(line.bytes(),b"run Prealpha betaend ammag");
+        assert_eq!(line.rotate_arguments_right(),Ok(Event::Typed));
+        assert_eq!(line.bytes(),b"run ammag Prealpha betaend");
+        assert_eq!(line.delete_argument_if_equal(3,b"betaend"),Ok(Event::Erased));
+        assert_eq!(line.bytes(),b"run ammag Prealpha");
+        assert_eq!(line.history_count(),0);
+        assert!(line.clipboard_bytes().is_empty());
+    }
+    #[test]
+    fn short_output_invalid_token_and_stale_deletion_never_edit(){
+        let mut line=InputLine::new();line.set_line(b"run good").unwrap();
+        let mut out=[0xa5u8;2];
+        assert_eq!(line.read_argument(1,&mut out),Err(Error::TooSmall));
+        assert_eq!(out,[0xa5;2]);
+        assert_eq!(line.rotate_arguments_right(),Err(Error::Invalid));
+        assert_eq!(line.delete_argument_if_equal(1,b"bad"),Err(Error::Invalid));
+        assert_eq!(line.prefix_argument(6,b"x"),Err(Error::Invalid));
+        assert_eq!(line.suffix_argument(6,b"x"),Err(Error::Invalid));
+        assert_eq!(line.bytes(),b"run good");
+    }
+}

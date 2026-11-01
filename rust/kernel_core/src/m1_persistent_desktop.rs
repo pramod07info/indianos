@@ -3218,3 +3218,163 @@ mod r081_desktop_source_guard_tests{
         assert_eq!(out,[0xaa;2]);
     }
 }
+
+
+// M1/R082 stream E — ten desktop routes to real project source operations.
+// All calls pass live Desktop process expiry/rights before touching VFS.
+impl<D:BlockDevice,const P:usize,const E:usize,const W:usize,
+ const K:usize,const G:usize,const Q:usize> Desktop<D,P,E,W,K,G,Q>{
+    pub fn project_count_source_literal(&mut self,caller:Identity,now:u64,
+        project:&crate::m1_project_workspace::ProjectTree,
+        name:&str,needle:&str)->Result<usize,ProjectRouteError>{
+        self.admit_editor(caller,now,FILE_READ).map_err(ProjectRouteError::Permission)?;
+        project.count_source_literal(caller,&mut self.volume,name,needle)
+            .map_err(ProjectRouteError::Project)
+    }
+    pub fn project_last_source_literal(&mut self,caller:Identity,now:u64,
+        project:&crate::m1_project_workspace::ProjectTree,
+        name:&str,needle:&str)->Result<Option<usize>,ProjectRouteError>{
+        self.admit_editor(caller,now,FILE_READ).map_err(ProjectRouteError::Permission)?;
+        project.last_source_literal(caller,&mut self.volume,name,needle)
+            .map_err(ProjectRouteError::Project)
+    }
+    pub fn project_read_source_row_bytes(&mut self,caller:Identity,now:u64,
+        project:&crate::m1_project_workspace::ProjectTree,
+        name:&str,line:usize,out:&mut[u8])->Result<usize,ProjectRouteError>{
+        self.admit_editor(caller,now,FILE_READ).map_err(ProjectRouteError::Permission)?;
+        project.read_source_row_bytes(caller,&mut self.volume,name,line,out)
+            .map_err(ProjectRouteError::Project)
+    }
+    pub fn project_count_nonblank_source_rows(&mut self,caller:Identity,now:u64,
+        project:&crate::m1_project_workspace::ProjectTree,
+        name:&str)->Result<usize,ProjectRouteError>{
+        self.admit_editor(caller,now,FILE_READ).map_err(ProjectRouteError::Permission)?;
+        project.count_nonblank_source_rows(caller,&mut self.volume,name)
+            .map_err(ProjectRouteError::Project)
+    }
+    pub fn project_source_starts_with(&mut self,caller:Identity,now:u64,
+        project:&crate::m1_project_workspace::ProjectTree,
+        name:&str,prefix:&str)->Result<bool,ProjectRouteError>{
+        self.admit_editor(caller,now,FILE_READ).map_err(ProjectRouteError::Permission)?;
+        project.source_starts_with(caller,&mut self.volume,name,prefix)
+            .map_err(ProjectRouteError::Project)
+    }
+    pub fn project_source_ends_with(&mut self,caller:Identity,now:u64,
+        project:&crate::m1_project_workspace::ProjectTree,
+        name:&str,suffix:&str)->Result<bool,ProjectRouteError>{
+        self.admit_editor(caller,now,FILE_READ).map_err(ProjectRouteError::Permission)?;
+        project.source_ends_with(caller,&mut self.volume,name,suffix)
+            .map_err(ProjectRouteError::Project)
+    }
+    pub fn project_replace_last_at_revision(&mut self,caller:Identity,now:u64,
+        project:&mut crate::m1_project_workspace::ProjectTree,name:&str,
+        expected:u64,old:&str,next:&str)->Result<Option<usize>,ProjectRouteError>{
+        self.admit_editor(caller,now,FILE_WRITE).map_err(ProjectRouteError::Permission)?;
+        project.replace_last_at_revision(caller,&mut self.volume,name,expected,old,next)
+            .map_err(ProjectRouteError::Project)
+    }
+    pub fn project_ensure_source_newline_at_revision(&mut self,caller:Identity,now:u64,
+        project:&mut crate::m1_project_workspace::ProjectTree,name:&str,
+        expected:u64)->Result<bool,ProjectRouteError>{
+        self.admit_editor(caller,now,FILE_WRITE).map_err(ProjectRouteError::Permission)?;
+        project.ensure_source_newline_at_revision(caller,&mut self.volume,name,expected)
+            .map_err(ProjectRouteError::Project)
+    }
+    pub fn project_remove_source_newline_at_revision(&mut self,caller:Identity,now:u64,
+        project:&mut crate::m1_project_workspace::ProjectTree,name:&str,
+        expected:u64)->Result<bool,ProjectRouteError>{
+        self.admit_editor(caller,now,FILE_WRITE).map_err(ProjectRouteError::Permission)?;
+        project.remove_source_newline_at_revision(caller,&mut self.volume,name,expected)
+            .map_err(ProjectRouteError::Project)
+    }
+    pub fn project_replace_source_row_at_revision(&mut self,caller:Identity,now:u64,
+        project:&mut crate::m1_project_workspace::ProjectTree,name:&str,
+        expected:u64,line:usize,replacement:&str)->Result<usize,ProjectRouteError>{
+        self.admit_editor(caller,now,FILE_WRITE).map_err(ProjectRouteError::Permission)?;
+        project.replace_source_row_at_revision(caller,&mut self.volume,name,
+            expected,line,replacement).map_err(ProjectRouteError::Project)
+    }
+}
+#[cfg(test)]
+mod r082_desktop_project_routes_tests{
+    use super::*;
+    use crate::block::{BlockError,SECTOR_BYTES};
+    use crate::batch2_launcher::Image;
+    use crate::batch2_settings::{Settings,Theme};
+    use crate::m1_project_workspace::ProjectTree;
+    struct Disk{sectors:[[u8;SECTOR_BYTES];100]}
+    impl BlockDevice for Disk{
+        fn sector_count(&self)->u64{100}
+        fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+            ->Result<(),BlockError>{
+            *out=*self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?;Ok(())
+        }
+        fn write_sector(&mut self,lba:u64,data:&[u8;SECTOR_BYTES])
+            ->Result<(),BlockError>{
+            *self.sectors.get_mut(lba as usize).ok_or(BlockError::OutOfRange)?=*data;Ok(())
+        }
+    }
+    type Desk=Desktop<Disk,3,3,2,2,3,8>;
+    fn id(pid:u32)->Identity{Identity{pid,generation:1}}
+    fn launch(pid:u32)->Launch{
+        Launch{pid,generation:1,image:Image{
+            image_id:pid,entry:0x1000,mapped_end:0x2000,verified:true
+        }}
+    }
+    fn setup()->(Desk,ProjectTree){
+        let fs=HierVfs::format_blank(Disk{sectors:[[0;SECTOR_BYTES];100]}).unwrap();
+        let mut d=Desk::from_mounted(fs);
+        d.start(id(1),launch(1),id(2),launch(2),
+            Settings{theme:Theme::Dark,pointer_speed:5,key_repeat:10},8,5).unwrap();
+        let mut p=ProjectTree::new();
+        d.project_create(id(2),1,&mut p,"demo").unwrap();
+        d.project_create_file(id(2),1,&mut p,"source","α cat\n\ncat\n".as_bytes()).unwrap();
+        (d,p)
+    }
+    #[test]
+    fn ten_secure_routes_read_and_modify_persistent_project_file(){
+        let (mut d,mut p)=setup();
+        assert_eq!(d.project_count_source_literal(id(2),1,&p,"source","cat"),Ok(2));
+        assert_eq!(d.project_last_source_literal(id(2),1,&p,"source","cat"),Ok(Some(8)));
+        let mut out=[0u8;32];
+        assert_eq!(d.project_read_source_row_bytes(id(2),1,&p,"source",1,&mut out),Ok(7));
+        assert_eq!(d.project_count_nonblank_source_rows(id(2),1,&p,"source"),Ok(2));
+        assert_eq!(d.project_source_starts_with(id(2),1,&p,"source","α"),Ok(true));
+        assert_eq!(d.project_source_ends_with(id(2),1,&p,"source","cat\n"),Ok(true));
+        let digest=d.project_source_summary(id(2),1,&p,"source").unwrap().fnv64;
+        assert_eq!(d.project_replace_last_at_revision(
+            id(2),1,&mut p,"source",digest,"cat","dog"),Ok(Some(8)));
+        let digest=d.project_source_summary(id(2),1,&p,"source").unwrap().fnv64;
+        assert_eq!(d.project_remove_source_newline_at_revision(
+            id(2),1,&mut p,"source",digest),Ok(true));
+        let digest=d.project_source_summary(id(2),1,&p,"source").unwrap().fnv64;
+        assert_eq!(d.project_ensure_source_newline_at_revision(
+            id(2),1,&mut p,"source",digest),Ok(true));
+        let digest=d.project_source_summary(id(2),1,&p,"source").unwrap().fnv64;
+        assert_eq!(d.project_replace_source_row_at_revision(
+            id(2),1,&mut p,"source",digest,1,"β fox\n"),Ok(12));
+        let mut fs=HierVfs::mount(d.into_device()).unwrap();
+        let n=fs.read("/work/demo/source",&mut out).unwrap();
+        assert_eq!(&out[..n],"β fox\n\ndog\n".as_bytes());
+    }
+    #[test]
+    fn expired_rights_stale_pid_and_tiny_output_prevent_unauthorized_edits(){
+        let (mut d,mut p)=setup();
+        let digest=d.project_source_summary(id(2),1,&p,"source").unwrap().fnv64;
+        let mut out=[0xa5u8;1];
+        assert!(d.project_read_source_row_bytes(id(2),1,&p,"source",1,&mut out).is_err());
+        assert!(d.project_count_source_literal(id(2),6,&p,"source","cat").is_err());
+        assert!(d.project_last_source_literal(id(2),6,&p,"source","cat").is_err());
+        assert!(d.project_source_starts_with(id(2),6,&p,"source","α").is_err());
+        assert!(d.project_source_ends_with(id(2),6,&p,"source","cat").is_err());
+        assert!(d.project_count_nonblank_source_rows(id(2),6,&p,"source").is_err());
+        assert!(d.project_replace_last_at_revision(id(2),6,&mut p,"source",digest,"cat","x").is_err());
+        assert!(d.project_remove_source_newline_at_revision(id(2),6,&mut p,"source",digest).is_err());
+        assert!(d.project_ensure_source_newline_at_revision(id(2),6,&mut p,"source",digest).is_err());
+        assert!(d.project_replace_source_row_at_revision(
+            Identity{generation:2,..id(2)},1,&mut p,"source",digest,1,"x").is_err());
+        assert_eq!(out,[0xa5]);
+        let mut data=[0u8;20];
+        assert_eq!(d.project_read_file(id(2),1,&p,"source",&mut data),Ok(12));
+    }
+}

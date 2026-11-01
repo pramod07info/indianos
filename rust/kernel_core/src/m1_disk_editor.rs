@@ -3055,3 +3055,159 @@ mod r081_pool_source_tests{
         assert!(!pool.status(id(),1).unwrap().dirty);
     }
 }
+
+
+// M1/R082 stream A — ten owner-bound active source-buffer functions.
+// These are live unsaved buffers; durable writes still use save_all().
+impl EditorPool {
+    /// Count nonoverlapping Unicode literals within the authenticated slot.
+    pub fn count_literal(&self,who:Identity,slot:usize,needle:&str)->Result<usize,Error>{
+        if needle.is_empty(){return Err(Error::Invalid);}
+        let d=self.docs.get(slot).ok_or(Error::Invalid)?;d.authorize(who)?;
+        let text=core::str::from_utf8(&d.data[..d.used]).map_err(|_|Error::Invalid)?;
+        Ok(text.match_indices(needle).count())
+    }
+    /// Find last Unicode source match at a complete character boundary.
+    pub fn last_literal(&self,who:Identity,slot:usize,needle:&str)
+        ->Result<Option<usize>,Error>{
+        let d=self.docs.get(slot).ok_or(Error::Invalid)?;
+        d.find_previous_text(who,needle,d.used)
+    }
+    /// Read one complete 1-based source row with a short-buffer preflight.
+    pub fn read_source_row(&self,who:Identity,slot:usize,row:usize,
+        out:&mut[u8])->Result<usize,Error>{
+        let d=self.docs.get(slot).ok_or(Error::Invalid)?;d.authorize(who)?;
+        if row==0{return Err(Error::Invalid);}
+        let text=core::str::from_utf8(&d.data[..d.used]).map_err(|_|Error::Invalid)?;
+        let line=text.split_inclusive('\n').nth(row-1).ok_or(Error::Invalid)?;
+        if out.len()<line.len(){return Err(Error::Full);}
+        out[..line.len()].copy_from_slice(line.as_bytes());Ok(line.len())
+    }
+    /// Append source text to one currently open buffer as a reversible edit.
+    pub fn append_source_text(&mut self,who:Identity,slot:usize,source:&str)
+        ->Result<usize,Error>{
+        let d=self.docs.get_mut(slot).ok_or(Error::Invalid)?;
+        d.replace_text(who,d.used,d.used,source)
+    }
+    /// Prepend source text without affecting another document's undo state.
+    pub fn prepend_source_text(&mut self,who:Identity,slot:usize,source:&str)
+        ->Result<usize,Error>{
+        self.docs.get_mut(slot).ok_or(Error::Invalid)?
+            .replace_text(who,0,0,source)
+    }
+    /// Replace precisely the last occurrence, not every identical symbol.
+    pub fn replace_last_literal(&mut self,who:Identity,slot:usize,
+        old:&str,new:&str)->Result<Option<usize>,Error>{
+        let d=self.docs.get_mut(slot).ok_or(Error::Invalid)?;
+        if old.is_empty(){return Err(Error::Invalid);}
+        let Some(pos)=d.find_previous_text(who,old,d.used)? else{return Ok(None)};
+        d.replace_text(who,pos,pos+old.len(),new)?;Ok(Some(pos))
+    }
+    /// Ensure one terminal LF exists without creating a second empty row.
+    pub fn ensure_final_newline(&mut self,who:Identity,slot:usize)
+        ->Result<bool,Error>{
+        let d=self.docs.get_mut(slot).ok_or(Error::Invalid)?;d.authorize(who)?;
+        core::str::from_utf8(&d.data[..d.used]).map_err(|_|Error::Invalid)?;
+        if d.data[..d.used].ends_with(b"\n"){return Ok(false);}
+        d.replace_text(who,d.used,d.used,"\n")?;Ok(true)
+    }
+    /// Remove only one final LF; preserve other rows and UTF-8 characters.
+    pub fn remove_final_newline(&mut self,who:Identity,slot:usize)
+        ->Result<bool,Error>{
+        let d=self.docs.get_mut(slot).ok_or(Error::Invalid)?;d.authorize(who)?;
+        core::str::from_utf8(&d.data[..d.used]).map_err(|_|Error::Invalid)?;
+        if !d.data[..d.used].ends_with(b"\n"){return Ok(false);}
+        d.replace_text(who,d.used-1,d.used,"")?;Ok(true)
+    }
+    /// Edit all nonoverlapping matches only at the active unsaved revision.
+    pub fn replace_all_at_revision(&mut self,who:Identity,slot:usize,
+        expected:u64,old:&str,new:&str)->Result<usize,Error>{
+        let version=self.text_metrics(who,slot)?;
+        if version.fnv64!=expected{return Err(Error::Stale);}
+        self.docs.get_mut(slot).ok_or(Error::Invalid)?
+            .replace_all_text(who,old,new)
+    }
+    /// Redo all open documents after preflighting every owner and snapshot.
+    pub fn redo_all_ready(&mut self,who:Identity)->Result<usize,Error>{
+        let mut count=0;
+        for d in &self.docs{
+            if d.owner.is_some(){
+                d.authorize(who)?;
+                if d.redo.is_none(){return Err(Error::Invalid);}
+                count+=1;
+            }
+        }
+        if count==0{return Err(Error::Invalid);}
+        for d in &mut self.docs{
+            if d.owner.is_some(){d.redo(who)?;}
+        }
+        Ok(count)
+    }
+}
+
+#[cfg(test)]
+mod r082_editor_pool_function_tests{
+    use super::*;
+    use crate::block::{BlockError,SECTOR_BYTES};
+    struct Disk{sectors:[[u8;SECTOR_BYTES];100]}
+    impl BlockDevice for Disk{
+        fn sector_count(&self)->u64{100}
+        fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+            ->Result<(),BlockError>{
+            *out=*self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?;Ok(())
+        }
+        fn write_sector(&mut self,lba:u64,data:&[u8;SECTOR_BYTES])
+            ->Result<(),BlockError>{
+            *self.sectors.get_mut(lba as usize).ok_or(BlockError::OutOfRange)?=*data;Ok(())
+        }
+    }
+    fn who()->Identity{Identity{pid:91,generation:1}}
+    fn setup()->(HierVfs<Disk>,EditorPool){
+        let mut fs=HierVfs::format_blank(Disk{sectors:[[0;SECTOR_BYTES];100]}).unwrap();
+        fs.create("/one","α cat\ncat\n".as_bytes()).unwrap();
+        fs.create("/two",b"dog").unwrap();
+        let mut pool=EditorPool::new();
+        pool.open(who(),&mut fs,0,"/one").unwrap();
+        pool.open(who(),&mut fs,1,"/two").unwrap();
+        (fs,pool)
+    }
+    #[test]
+    fn ten_editor_actions_remain_owner_safe_and_disk_persistent(){
+        let (mut fs,mut pool)=setup();
+        assert_eq!(pool.count_literal(who(),0,"cat"),Ok(2));
+        assert_eq!(pool.last_literal(who(),0,"cat"),Ok(Some(7)));
+        let mut out=[0xaau8;20];
+        assert_eq!(pool.read_source_row(who(),0,1,&mut out),Ok(7));
+        assert_eq!(&out[..7],"α cat\n".as_bytes());
+        assert_eq!(pool.append_source_text(who(),1," fish"),Ok(8));
+        assert_eq!(pool.prepend_source_text(who(),1,"big "),Ok(12));
+        assert_eq!(pool.replace_last_literal(who(),1,"fish","bird"),Ok(Some(8)));
+        assert_eq!(pool.ensure_final_newline(who(),1),Ok(true));
+        assert_eq!(pool.ensure_final_newline(who(),1),Ok(false));
+        assert_eq!(pool.remove_final_newline(who(),1),Ok(true));
+        let hash=pool.text_metrics(who(),0).unwrap().fnv64;
+        assert_eq!(pool.replace_all_at_revision(who(),0,hash,"cat","fox"),Ok(2));
+        assert_eq!(pool.undo_all_ready(who()),Ok(2));
+        assert_eq!(pool.redo_all_ready(who()),Ok(2));
+        pool.save_all(who(),&mut fs).unwrap();
+        let mut fs=HierVfs::mount(fs.into_device()).unwrap();
+        assert_eq!(fs.read("/one",&mut out),Ok(11));
+        assert_eq!(&out[..11],"α fox\nfox\n".as_bytes());
+        assert_eq!(fs.read("/two",&mut out),Ok(12));
+        assert_eq!(&out[..12],b"big dog bird");
+    }
+    #[test]
+    fn stale_revision_short_row_invalid_owner_and_rejected_redo_do_not_mutate(){
+        let (_fs,mut pool)=setup();let before=pool.text_metrics(who(),0).unwrap().fnv64;
+        let mut tiny=[0xa5u8;1];
+        assert_eq!(pool.read_source_row(who(),0,1,&mut tiny),Err(Error::Full));
+        assert_eq!(tiny,[0xa5]);
+        assert_eq!(pool.read_source_row(who(),0,0,&mut tiny),Err(Error::Invalid));
+        assert_eq!(pool.replace_all_at_revision(who(),0,before^1,"cat","oops"),
+            Err(Error::Stale));
+        assert_eq!(pool.redo_all_ready(who()),Err(Error::Invalid));
+        assert_eq!(pool.count_literal(Identity{generation:2,..who()},0,"cat"),
+            Err(Error::Unauthorized));
+        assert_eq!(pool.status(who(),0).unwrap().dirty,false);
+    }
+}

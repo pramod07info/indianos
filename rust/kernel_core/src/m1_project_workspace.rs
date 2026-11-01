@@ -2832,3 +2832,169 @@ mod r081_project_patch_tests{
         assert_eq!(fs.generation(),before);
     }
 }
+
+
+// M1/R082 stream B — ten durable UTF-8 source review and COW edit functions.
+// The read helper verifies ownership, path scope, media checksum and UTF-8.
+impl ProjectTree {
+    fn r082_text<'a,D:BlockDevice>(&self,who:Identity,fs:&mut HierVfs<D>,
+        name:&str,scratch:&'a mut [u8;MAX_FILE_BYTES])->Result<&'a str,Error>{
+        self.check_fresh(who,fs)?;
+        let (p,n)=self.child(name)?;
+        let len=fs.read(Self::str_path(&p,n),scratch)?;
+        core::str::from_utf8(&scratch[..len]).map_err(|_|Error::Invalid)
+    }
+    pub fn count_source_literal<D:BlockDevice>(&self,who:Identity,
+        fs:&mut HierVfs<D>,name:&str,needle:&str)->Result<usize,Error>{
+        if needle.is_empty(){return Err(Error::Invalid);}
+        let mut buf=[0u8;MAX_FILE_BYTES];
+        Ok(self.r082_text(who,fs,name,&mut buf)?.match_indices(needle).count())
+    }
+    pub fn last_source_literal<D:BlockDevice>(&self,who:Identity,
+        fs:&mut HierVfs<D>,name:&str,needle:&str)->Result<Option<usize>,Error>{
+        if needle.is_empty(){return Err(Error::Invalid);}
+        let mut buf=[0u8;MAX_FILE_BYTES];
+        Ok(self.r082_text(who,fs,name,&mut buf)?.rfind(needle))
+    }
+    pub fn read_source_row_bytes<D:BlockDevice>(&self,who:Identity,
+        fs:&mut HierVfs<D>,name:&str,line:usize,out:&mut[u8])->Result<usize,Error>{
+        if line==0{return Err(Error::Invalid);}
+        let mut buf=[0u8;MAX_FILE_BYTES];
+        let text=self.r082_text(who,fs,name,&mut buf)?;
+        let row=text.split_inclusive('\n').nth(line-1).ok_or(Error::Invalid)?;
+        if out.len()<row.len(){return Err(Error::Full);}
+        out[..row.len()].copy_from_slice(row.as_bytes());Ok(row.len())
+    }
+    pub fn count_nonblank_source_rows<D:BlockDevice>(&self,who:Identity,
+        fs:&mut HierVfs<D>,name:&str)->Result<usize,Error>{
+        let mut buf=[0u8;MAX_FILE_BYTES];
+        let text=self.r082_text(who,fs,name,&mut buf)?;
+        Ok(text.split_inclusive('\n').filter(|row|!row.trim().is_empty()).count())
+    }
+    pub fn source_starts_with<D:BlockDevice>(&self,who:Identity,
+        fs:&mut HierVfs<D>,name:&str,prefix:&str)->Result<bool,Error>{
+        if prefix.is_empty(){return Err(Error::Invalid);}
+        let mut buf=[0u8;MAX_FILE_BYTES];
+        Ok(self.r082_text(who,fs,name,&mut buf)?.starts_with(prefix))
+    }
+    pub fn source_ends_with<D:BlockDevice>(&self,who:Identity,
+        fs:&mut HierVfs<D>,name:&str,suffix:&str)->Result<bool,Error>{
+        if suffix.is_empty(){return Err(Error::Invalid);}
+        let mut buf=[0u8;MAX_FILE_BYTES];
+        Ok(self.r082_text(who,fs,name,&mut buf)?.ends_with(suffix))
+    }
+    /// Replace only the last match if the whole observed file still matches.
+    pub fn replace_last_at_revision<D:BlockDevice>(&mut self,who:Identity,
+        fs:&mut HierVfs<D>,name:&str,expected:u64,old:&str,next:&str)
+        ->Result<Option<usize>,Error>{
+        if old.is_empty(){return Err(Error::Invalid);}
+        let mut buf=[0u8;MAX_FILE_BYTES];
+        let text=self.r082_text(who,fs,name,&mut buf)?;
+        let pos=text.rfind(old);
+        // Keep optimistic check even if no match was found.
+        if self.source_summary(who,fs,name)?.fnv64!=expected{return Err(Error::Stale);}
+        if let Some(at)=pos{
+            self.patch_source_if_checksum(who,fs,name,expected,at,at+old.len(),next)?;
+        }
+        Ok(pos)
+    }
+    /// Add a terminating LF only when needed, subject to a revision guard.
+    pub fn ensure_source_newline_at_revision<D:BlockDevice>(&mut self,who:Identity,
+        fs:&mut HierVfs<D>,name:&str,expected:u64)->Result<bool,Error>{
+        let mut buf=[0u8;MAX_FILE_BYTES];
+        let text=self.r082_text(who,fs,name,&mut buf)?;
+        let len=text.len();let has=text.ends_with('\n');
+        if self.source_summary(who,fs,name)?.fnv64!=expected{return Err(Error::Stale);}
+        if has{return Ok(false);}
+        self.patch_source_if_checksum(who,fs,name,expected,len,len,"\n")?;
+        Ok(true)
+    }
+    /// Remove a single terminating LF only when the file version is still
+    /// the same; never strips a Unicode scalar or a preceding blank row.
+    pub fn remove_source_newline_at_revision<D:BlockDevice>(&mut self,who:Identity,
+        fs:&mut HierVfs<D>,name:&str,expected:u64)->Result<bool,Error>{
+        let mut buf=[0u8;MAX_FILE_BYTES];
+        let text=self.r082_text(who,fs,name,&mut buf)?;
+        let len=text.len();let has=text.ends_with('\n');
+        if self.source_summary(who,fs,name)?.fnv64!=expected{return Err(Error::Stale);}
+        if !has{return Ok(false);}
+        self.patch_source_if_checksum(who,fs,name,expected,len-1,len,"")?;
+        Ok(true)
+    }
+    /// Replace exactly one 1-based source row under a checked revision,
+    /// accepting complete UTF-8 replacement text including its newline.
+    pub fn replace_source_row_at_revision<D:BlockDevice>(&mut self,who:Identity,
+        fs:&mut HierVfs<D>,name:&str,expected:u64,line:usize,
+        replacement:&str)->Result<usize,Error>{
+        if line==0{return Err(Error::Invalid);}
+        let mut buf=[0u8;MAX_FILE_BYTES];
+        let text=self.r082_text(who,fs,name,&mut buf)?;
+        let mut start=0usize;let mut range=None;
+        for (i,row) in text.split_inclusive('\n').enumerate(){
+            if i+1==line{range=Some((start,start+row.len()));break;}
+            start+=row.len();
+        }
+        let (a,b)=range.ok_or(Error::Invalid)?;
+        self.patch_source_if_checksum(who,fs,name,expected,a,b,replacement)
+    }
+}
+#[cfg(test)]
+mod r082_project_source_tests{
+    use super::*;
+    use crate::block::{BlockError,SECTOR_BYTES};
+    struct Disk{sectors:[[u8;SECTOR_BYTES];100]}
+    impl BlockDevice for Disk {
+        fn sector_count(&self)->u64{100}
+        fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+            *out=*self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?;Ok(())
+        }
+        fn write_sector(&mut self,lba:u64,data:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+            *self.sectors.get_mut(lba as usize).ok_or(BlockError::OutOfRange)?=*data;Ok(())
+        }
+    }
+    fn who()->Identity{Identity{pid:92,generation:1}}
+    fn setup()->(HierVfs<Disk>,ProjectTree){
+        let mut fs=HierVfs::format_blank(Disk{sectors:[[0;SECTOR_BYTES];100]}).unwrap();
+        let mut p=ProjectTree::new();p.create(who(),&mut fs,"demo").unwrap();
+        p.create_file(who(),&mut fs,"main","α cat\n\ncat\n".as_bytes()).unwrap();
+        (fs,p)
+    }
+    #[test]
+    fn ten_project_features_query_and_edit_durable_source(){
+        let (mut fs,mut p)=setup();
+        assert_eq!(p.count_source_literal(who(),&mut fs,"main","cat"),Ok(2));
+        assert_eq!(p.last_source_literal(who(),&mut fs,"main","cat"),Ok(Some(8)));
+        let mut out=[0xaau8;24];
+        assert_eq!(p.read_source_row_bytes(who(),&mut fs,"main",1,&mut out),Ok(7));
+        assert_eq!(&out[..7],"α cat\n".as_bytes());
+        assert_eq!(p.count_nonblank_source_rows(who(),&mut fs,"main"),Ok(2));
+        assert_eq!(p.source_starts_with(who(),&mut fs,"main","α"),Ok(true));
+        assert_eq!(p.source_ends_with(who(),&mut fs,"main","cat\n"),Ok(true));
+        let hash=p.source_summary(who(),&mut fs,"main").unwrap().fnv64;
+        assert_eq!(p.replace_last_at_revision(who(),&mut fs,"main",hash,"cat","dog"),Ok(Some(8)));
+        let hash=p.source_summary(who(),&mut fs,"main").unwrap().fnv64;
+        assert_eq!(p.remove_source_newline_at_revision(who(),&mut fs,"main",hash),Ok(true));
+        let hash=p.source_summary(who(),&mut fs,"main").unwrap().fnv64;
+        assert_eq!(p.ensure_source_newline_at_revision(who(),&mut fs,"main",hash),Ok(true));
+        let hash=p.source_summary(who(),&mut fs,"main").unwrap().fnv64;
+        assert_eq!(p.replace_source_row_at_revision(who(),&mut fs,"main",hash,1,"β fox\n"),Ok(12));
+        let mut fs=HierVfs::mount(fs.into_device()).unwrap();
+        let mut p=ProjectTree::new();p.open(who(),&mut fs,"demo").unwrap();
+        let n=p.read_file(who(),&mut fs,"main",&mut out).unwrap();
+        assert_eq!(&out[..n],"β fox\n\ndog\n".as_bytes());
+    }
+    #[test]
+    fn stale_invalid_unicode_and_short_buffers_do_not_modify_project(){
+        let (mut fs,mut p)=setup();
+        let hash=p.source_summary(who(),&mut fs,"main").unwrap().fnv64;
+        let before=fs.generation();
+        let mut out=[0xa5u8;1];
+        assert_eq!(p.read_source_row_bytes(who(),&mut fs,"main",1,&mut out),Err(Error::Full));
+        assert_eq!(out,[0xa5]);
+        assert_eq!(p.replace_last_at_revision(who(),&mut fs,"main",hash^1,"cat","dog"),Err(Error::Stale));
+        assert_eq!(p.replace_source_row_at_revision(who(),&mut fs,"main",hash,0,"x"),Err(Error::Invalid));
+        assert_eq!(p.ensure_source_newline_at_revision(
+            Identity{generation:2,..who()},&mut fs,"main",hash),Err(Error::Unauthorized));
+        assert_eq!(fs.generation(),before);
+    }
+}
