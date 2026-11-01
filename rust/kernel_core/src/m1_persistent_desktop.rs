@@ -1355,6 +1355,24 @@ impl<D:BlockDevice,const P:usize,const E:usize,const W:usize,
   self.admit_editor(caller,now,FILE_READ).map_err(ProjectRouteError::Permission)?;
   project.list(caller,&mut self.volume,out).map_err(ProjectRouteError::Project)
  }
+
+ /// Authenticated durable pagination for the desktop file browser.
+ pub fn project_list_page(&mut self,caller:Identity,now:u64,
+    project:&crate::m1_project_workspace::ProjectTree,
+    start:usize,out:&mut[u8])->Result<(usize,Option<usize>),ProjectRouteError>{
+  self.admit_editor(caller,now,FILE_READ).map_err(ProjectRouteError::Permission)?;
+  project.list_page(caller,&mut self.volume,start,out).map_err(ProjectRouteError::Project)
+ }
+ /// Authenticated read-only cross-file project source search.
+ pub fn project_search_sources(&mut self,caller:Identity,now:u64,
+    project:&crate::m1_project_workspace::ProjectTree,needle:&str,
+    out:&mut[crate::m1_project_workspace::ProjectMatch])
+    ->Result<usize,ProjectRouteError>{
+  self.admit_editor(caller,now,FILE_READ).map_err(ProjectRouteError::Permission)?;
+  project.search_sources(caller,&mut self.volume,needle,out)
+   .map_err(ProjectRouteError::Project)
+ }
+
  pub fn project_refresh(&mut self,caller:Identity,now:u64,
     project:&mut crate::m1_project_workspace::ProjectTree)
     ->Result<u64,ProjectRouteError>{
@@ -2607,4 +2625,29 @@ mod r075_expanded_desktop_source_tests {
         assert_eq!(fs.read("/source",&mut out),Ok(6));
         assert_eq!(&out[..6],"α\nβ\n".as_bytes());
     }
+}
+
+
+// R076: permission-checked desktop dispatch for multiple owned documents.
+impl<D:BlockDevice,const P:usize,const E:usize,const W:usize,
+ const K:usize,const G:usize,const Q:usize> Desktop<D,P,E,W,K,G,Q>{
+ pub fn editor_pool_open(&mut self,caller:Identity,now:u64,
+    pool:&mut crate::m1_disk_editor::EditorPool,slot:usize,path:&str)
+    ->Result<crate::m1_disk_editor::Status,EditorRouteError>{
+  self.admit_editor(caller,now,FILE_READ)?;
+  pool.open(caller,&mut self.volume,slot,path).map_err(EditorRouteError::Editor)
+ }
+ pub fn editor_pool_replace_text(&mut self,caller:Identity,now:u64,
+    pool:&mut crate::m1_disk_editor::EditorPool,slot:usize,
+    from:usize,to:usize,value:&str)->Result<usize,EditorRouteError>{
+  self.admit_editor(caller,now,FILE_WRITE)?;
+  pool.replace_text(caller,slot,from,to,value).map_err(EditorRouteError::Editor)
+ }
+ pub fn editor_pool_save_all(&mut self,caller:Identity,now:u64,
+    pool:&mut crate::m1_disk_editor::EditorPool)
+    ->Result<[Option<Result<u64,crate::m1_disk_editor::Error>>;
+        crate::m1_disk_editor::EDITOR_POOL_SLOTS],EditorRouteError>{
+  self.admit_editor(caller,now,FILE_WRITE)?;
+  pool.save_all(caller,&mut self.volume).map_err(EditorRouteError::Editor)
+ }
 }

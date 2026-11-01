@@ -16,7 +16,7 @@ pub const MAX_COMMAND:usize=192;
 /// The actual persistent Terminal's supported verbs. Shared with the live
 /// Desktop's Tab completion so hidden/unknown commands are never suggested.
 pub const COMMAND_VERBS:&[&str]=&[
- "help","pwd","tools","ls","cat","write","append","mkdir","mv",
+ "help","pwd","tools","ls","cat","page","write","append","mkdir","mv",
  "cp","rm","mkfile","truncate","head","count","rmdir","mvdir",
  "pread","pwrite","lines","line","hash","stat","tail","find","grep","cmp","diffat",
  "touch","copynew","replace","appendln","health","hex","slice","concat","cmprange","bytefreq","patchhex","patchrange","copylines","wc","headlines","rfind","taillines","linespan","linehits","sourceview","sourcecontext","textprofile","blankrows","indentmap","eolcheck",
@@ -149,6 +149,26 @@ pub fn command<D:BlockDevice,const N:usize>(
   // Return one UTF-8 row from an authenticated persistent source file.
   // Never publish an output prefix if UTF-8, row bounds or destination
   // capacity validation fails. A final newline adds no phantom row.
+
+  // Bounded real-file output page; caller may resume at offset+bytes read.
+  "page"=>{
+   auth.require(caller,FILE_READ,now).map_err(|_|Error::Denied)?;
+   let mut args=raw.split_ascii_whitespace();
+   let source=args.next().ok_or(Error::Invalid)?;
+   let offset=args.next().ok_or(Error::Invalid)?
+       .parse::<u64>().map_err(|_|Error::Invalid)?;
+   let count=args.next().ok_or(Error::Invalid)?
+       .parse::<usize>().map_err(|_|Error::Invalid)?;
+   if count==0||count>MAX_TRANSFER||args.next().is_some(){
+    return Err(Error::Invalid);
+   }
+   if out.len()<count{return Err(Error::OutputTooSmall);}
+   let p=path(source,&mut name)?;
+   let mut bytes=[0u8;MAX_TRANSFER];
+   let n=fs.read_at(p,offset,&mut bytes[..count]).map_err(Error::Io)?;
+   publish(&bytes[..n],out)
+  }
+
   "line"=>{
    auth.require(caller,FILE_READ,now).map_err(|_|Error::Denied)?;
    let (source,row)=raw.split_once(' ').ok_or(Error::Invalid)?;
@@ -1435,7 +1455,7 @@ mod tests{
  }
  #[test]fn r044_command_registry_drives_unique_safe_completion(){
   // R075 expanded: 3 more native workstation file inspection commands.
-  assert_eq!(COMMAND_VERBS.len(),53);
+  assert_eq!(COMMAND_VERBS.len(),54);
   for (i,verb) in COMMAND_VERBS.iter().enumerate(){
    assert!(verb.as_bytes().iter().all(|b|b.is_ascii_lowercase()));
    assert!(!COMMAND_VERBS[..i].contains(verb));
@@ -3233,4 +3253,42 @@ mod r075_paged_tool_catalog_tests {
         let n = command(&mut fs, &auth, actor, 1, b"tools more", &mut output).unwrap();
         assert_eq!(&output[..n], b"blankrows indentmap eolcheck");
     }
+}
+
+#[cfg(test)]
+mod r076_terminal_page_tests{
+ use super::*;
+ use crate::block::{BlockError,SECTOR_BYTES};
+ struct Disk{sectors:[[u8;SECTOR_BYTES];100]}
+ impl BlockDevice for Disk{
+  fn sector_count(&self)->u64{100}
+  fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   *out=*self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?;Ok(())
+  }
+  fn write_sector(&mut self,lba:u64,data:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   *self.sectors.get_mut(lba as usize).ok_or(BlockError::OutOfRange)?=*data;Ok(())
+  }
+ }
+ fn id()->Identity{Identity{pid:28,generation:2}}
+ #[test]fn paged_output_checks_grants_capacity_and_survives_remount(){
+  let mut fs=HierVfs::format_blank(Disk{sectors:[[0;SECTOR_BYTES];100]}).unwrap();
+  fs.create("/note",b"abcdefghij").unwrap();
+  let gen=fs.generation();
+  let mut auth=Access::<1>::new();auth.grant(id(),FILE_READ,10).unwrap();
+  let mut out=[0xadu8;5];
+  assert_eq!(command(&mut fs,&auth,id(),1,b"page /note 3 4",&mut out),Ok(4));
+  assert_eq!(&out[..4],b"defg");
+  out.fill(0xad);
+  assert_eq!(command(&mut fs,&auth,id(),1,b"page /note 3 6",&mut out),
+    Err(Error::OutputTooSmall));
+  assert_eq!(out,[0xad;5]);
+  assert_eq!(command(&mut fs,&auth,id(),11,b"page /note 0 3",&mut out),
+    Err(Error::Denied));
+  assert_eq!(command(&mut fs,&auth,id(),1,b"page /note 0 0",&mut out),
+    Err(Error::Invalid));
+  assert_eq!(fs.generation(),gen);
+  fs=HierVfs::mount(fs.into_device()).unwrap();
+  assert_eq!(command(&mut fs,&auth,id(),1,b"page /note 8 2",&mut out),Ok(2));
+  assert_eq!(&out[..2],b"ij");
+ }
 }

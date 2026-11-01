@@ -1968,3 +1968,141 @@ mod r075_expanded_project_tests {
         assert_eq!(fs.generation(), before);
     }
 }
+
+// R076 bounded project listing/search over the real durable COW volume.
+pub const PROJECT_SEARCH_MAX: usize = 16;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProjectMatch {
+    pub file: [u8; NAME_MAX],
+    pub file_len: usize,
+    pub byte_offset: usize,
+}
+impl ProjectMatch {
+    pub const EMPTY: Self = Self { file: [0; NAME_MAX], file_len: 0, byte_offset: 0 };
+}
+impl ProjectTree {
+    /// Page whole f:name or d:name lines; cursor counts directory entries.
+    /// Failed calls never mutate output and no entry is split between pages.
+    pub fn list_page<D: BlockDevice>(&self, caller: Identity,
+        fs: &mut HierVfs<D>, start: usize, out: &mut [u8])
+        -> Result<(usize, Option<usize>), Error> {
+        self.check_fresh(caller, fs)?;
+        let mut entries = [0u8; crate::hier_vfs::MAX_TRANSFER];
+        let len = fs.list_dir(self.pathname(), &mut entries)?;
+        let total = entries[..len].iter().filter(|x| **x == b'\n').count();
+        if start > total { return Err(Error::Invalid); }
+        let mut used = 0usize;
+        for (i, entry) in entries[..len].split_inclusive(|b| *b == b'\n').enumerate() {
+            if i < start { continue; }
+            if entry.len() > out.len() - used {
+                if used == 0 { return Err(Error::Full); }
+                return Ok((used, Some(i)));
+            }
+            out[used..used + entry.len()].copy_from_slice(entry);
+            used += entry.len();
+        }
+        Ok((used, None))
+    }
+    /// Literal UTF-8 search of all direct project source files (the present
+    /// VFS is allocation-free and supports eight objects, not recursive trees).
+    /// A short result array and stale owner leave caller output unchanged.
+    pub fn search_sources<D: BlockDevice>(&self, caller: Identity,
+        fs: &mut HierVfs<D>, needle: &str, out: &mut [ProjectMatch])
+        -> Result<usize, Error> {
+        self.check_fresh(caller, fs)?;
+        if needle.is_empty() { return Err(Error::Invalid); }
+        let mut listing = [0u8; crate::hier_vfs::MAX_TRANSFER];
+        let listed = fs.list_dir(self.pathname(), &mut listing)?;
+        let mut staged = [ProjectMatch::EMPTY; PROJECT_SEARCH_MAX];
+        let mut found = 0usize;
+        for row in listing[..listed].split_inclusive(|b| *b == b'\n') {
+            if !row.starts_with(b"f:") || !row.ends_with(b"\n") { continue; }
+            let filename = core::str::from_utf8(&row[2..row.len()-1])
+                .map_err(|_| Error::Invalid)?;
+            let (path,len) = self.child(filename)?;
+            let mut data = [0u8; MAX_FILE_BYTES];
+            let n = fs.read(Self::str_path(&path,len), &mut data)?;
+            let Ok(text) = core::str::from_utf8(&data[..n]) else { continue };
+            for (at, _) in text.match_indices(needle) {
+                if found == out.len() || found == staged.len() {
+                    return Err(Error::Full);
+                }
+                let mut m = ProjectMatch::EMPTY;
+                m.file[..filename.len()].copy_from_slice(filename.as_bytes());
+                m.file_len = filename.len();
+                m.byte_offset = at;
+                staged[found] = m;
+                found += 1;
+            }
+        }
+        out[..found].copy_from_slice(&staged[..found]);
+        Ok(found)
+    }
+}
+#[cfg(test)]
+mod r076_project_browser_tests {
+    use super::*;
+    use crate::block::{BlockError, SECTOR_BYTES};
+    struct Disk { sectors: [[u8;SECTOR_BYTES];100] }
+    impl BlockDevice for Disk {
+        fn sector_count(&self)->u64 {100}
+        fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+            *out=*self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?;Ok(())
+        }
+        fn write_sector(&mut self,lba:u64,data:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+            *self.sectors.get_mut(lba as usize).ok_or(BlockError::OutOfRange)?=*data;Ok(())
+        }
+    }
+    fn id()->Identity {Identity{pid:27,generation:8}}
+    fn invalid()->Identity {Identity{pid:27,generation:7}}
+    fn fresh()->(HierVfs<Disk>,ProjectTree){
+        let mut fs=HierVfs::format_blank(Disk{sectors:[[0;SECTOR_BYTES];100]}).unwrap();
+        let mut p=ProjectTree::new();
+        p.create(id(),&mut fs,"demo").unwrap();
+        p.create_file(id(),&mut fs,"alpha","α foo foo\n".as_bytes()).unwrap();
+        p.create_file(id(),&mut fs,"beta",b"foo end\n").unwrap();
+        p.create_file(id(),&mut fs,"binary",&[0xff,0xfe]).unwrap();
+        (fs,p)
+    }
+    #[test]
+    fn pagination_is_complete_and_durable_after_remount(){
+        let (mut fs,p)=fresh();
+        let mut first=[0u8;8];
+        let (n,next)=p.list_page(id(),&mut fs,0,&mut first).unwrap();
+        assert_eq!(n,8);assert_eq!(next,Some(1));
+        let mut rest=[0u8;64];
+        let (m,end)=p.list_page(id(),&mut fs,next.unwrap(),&mut rest).unwrap();
+        assert_eq!(end,None);
+        let mut complete=[0u8;72];
+        let count=p.list(id(),&mut fs,&mut complete).unwrap();
+        assert_eq!(count,n+m);
+        assert_eq!(&complete[..n],&first[..n]);
+        assert_eq!(&complete[n..count],&rest[..m]);
+        let mut fs=HierVfs::mount(fs.into_device()).unwrap();
+        let mut p=ProjectTree::new();p.open(id(),&mut fs,"demo").unwrap();
+        let mut again=[0u8;72];
+        assert_eq!(p.list(id(),&mut fs,&mut again),Ok(count));
+    }
+    #[test]
+    fn cross_file_matches_reject_stale_identity_and_short_destinations(){
+        let (mut fs,p)=fresh();
+        let generation=fs.generation();
+        let mut results=[ProjectMatch::EMPTY;6];
+        assert_eq!(p.search_sources(id(),&mut fs,"foo",&mut results),Ok(3));
+        assert_eq!(&results[0].file[..results[0].file_len],b"alpha");
+        assert_eq!(results[0].byte_offset,"α ".len());
+        assert_eq!(&results[2].file[..results[2].file_len],b"beta");
+        assert_eq!(fs.generation(),generation);
+        let mut short=[ProjectMatch::EMPTY;1];
+        assert_eq!(p.search_sources(id(),&mut fs,"foo",&mut short),Err(Error::Full));
+        assert_eq!(short,[ProjectMatch::EMPTY]);
+        assert_eq!(p.search_sources(invalid(),&mut fs,"foo",&mut results),
+            Err(Error::Unauthorized));
+        let mut tiny=[0xaau8;3];
+        assert_eq!(p.list_page(id(),&mut fs,0,&mut tiny),Err(Error::Full));
+        assert_eq!(tiny,[0xaa;3]);
+        fs.overwrite("/work/demo/alpha",b"external").unwrap();
+        assert_eq!(p.search_sources(id(),&mut fs,"foo",&mut results),
+            Err(Error::Stale));
+    }
+}

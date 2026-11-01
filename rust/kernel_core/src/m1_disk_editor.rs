@@ -2230,42 +2230,6 @@ mod r075_expanded_editor_cleanup_tests {
 // These APIs operate on the actual unsaved DiskEditor buffer; they do not
 // claim that a graphical selection widget or multi-document IDE is complete.
 impl DiskEditor {
-    /// Convert a UTF-8 byte boundary to a one-based (line, Unicode scalar
-    /// column) position. This is the inverse of text_offset for valid offsets.
-    pub fn text_position(&self, caller: Identity, offset: usize)
-        -> Result<(usize, usize), Error> {
-        self.authorize(caller)?;
-        let text = core::str::from_utf8(&self.data[..self.used])
-            .map_err(|_| Error::Invalid)?;
-        if offset > self.used || !text.is_char_boundary(offset) {
-            return Err(Error::Invalid);
-        }
-        let (mut line, mut column) = (1usize, 1usize);
-        for ch in text[..offset].chars() {
-            if ch == '\n' {
-                line += 1;
-                column = 1;
-            } else {
-                column += 1;
-            }
-        }
-        Ok((line, column))
-    }
-
-    /// Find the last complete Unicode literal match ending at or before
-    /// the exclusive search boundary. No allocation or buffer mutation.
-    pub fn find_previous_text(&self, caller: Identity, needle: &str,
-        before: usize) -> Result<Option<usize>, Error> {
-        self.authorize(caller)?;
-        if needle.is_empty() { return Err(Error::Invalid); }
-        let text = core::str::from_utf8(&self.data[..self.used])
-            .map_err(|_| Error::Invalid)?;
-        if before > self.used || !text.is_char_boundary(before) {
-            return Err(Error::Invalid);
-        }
-        Ok(text[..before].rfind(needle))
-    }
-
     /// Find forward from a valid cursor, wrapping to the document start.
     pub fn find_text_wrapping(&self, caller: Identity, needle: &str,
         from: usize) -> Result<Option<usize>, Error> {
@@ -2420,5 +2384,143 @@ mod r076_editor_navigation_tests {
         editor.close(owner(), false).unwrap();
         editor.open(owner(), &mut fs, "/bin").unwrap();
         assert_eq!(editor.text_position(owner(), 0), Err(Error::Invalid));
+    }
+}
+
+
+// R076: two actual concurrent disk-backed source documents.
+// Every operation is owner-generation checked by its contained DiskEditor.
+// No heap allocation and no assumption that different source files have
+// independent VFS generation counters.
+pub const EDITOR_POOL_SLOTS: usize = 2;
+pub struct EditorPool {
+    docs: [DiskEditor; EDITOR_POOL_SLOTS],
+}
+impl EditorPool {
+    pub const fn new() -> Self {
+        Self { docs: [const { DiskEditor::new() }; EDITOR_POOL_SLOTS] }
+    }
+    pub fn open<D: BlockDevice>(&mut self, who: Identity,
+        fs: &mut HierVfs<D>, slot: usize, path: &str)
+        -> Result<Status, Error> {
+        let doc = self.docs.get_mut(slot).ok_or(Error::Invalid)?;
+        doc.open(who, fs, path)
+    }
+    pub fn read(&self, who: Identity, slot: usize, out: &mut [u8])
+        -> Result<usize, Error> {
+        self.docs.get(slot).ok_or(Error::Invalid)?.read(who, out)
+    }
+    pub fn replace_text(&mut self, who: Identity, slot: usize,
+        from: usize, to: usize, text: &str) -> Result<usize, Error> {
+        self.docs.get_mut(slot).ok_or(Error::Invalid)?
+            .replace_text(who, from, to, text)
+    }
+    pub fn close(&mut self, who: Identity, slot: usize, discard: bool)
+        -> Result<(), Error> {
+        self.docs.get_mut(slot).ok_or(Error::Invalid)?.close(who, discard)
+    }
+    /// Save every owned open source buffer and return one result per slot.
+    /// Reject stale/unauthorized/duplicate-path batches *before any writes*.
+    /// The COW VFS is transaction-atomic per file, not across the entire batch.
+    /// The exclusive &mut VFS permits refreshing peer generation only for
+    /// writes performed within this very save-all batch.
+    pub fn save_all<D: BlockDevice>(&mut self, who: Identity,
+        fs: &mut HierVfs<D>)
+        -> Result<[Option<Result<u64, Error>>; EDITOR_POOL_SLOTS], Error> {
+        if who.pid == 0 || who.generation == 0 { return Err(Error::Unauthorized); }
+        let original = fs.generation();
+        for i in 0..EDITOR_POOL_SLOTS {
+            let doc = &self.docs[i];
+            if doc.owner.is_some() && doc.owner != Some(who) {
+                return Err(Error::Unauthorized);
+            }
+            if doc.owner.is_some() && doc.dirty && doc.baseline != original {
+                return Err(Error::Stale);
+            }
+            if doc.owner == Some(who) && doc.dirty {
+                WriteGuard::allow_path(doc.pathname()).map_err(|_|Error::Unauthorized)?;
+            }
+            if doc.owner.is_some() {
+                for peer in &self.docs[..i] {
+                    if peer.owner.is_some() && peer.pathname() == doc.pathname() {
+                        return Err(Error::Invalid);
+                    }
+                }
+            }
+        }
+        let mut results: [Option<Result<u64,Error>>; EDITOR_POOL_SLOTS] =
+            [None; EDITOR_POOL_SLOTS];
+        for (i, doc) in self.docs.iter_mut().enumerate() {
+            if doc.owner == Some(who) {
+                if doc.dirty && doc.baseline == original {
+                    doc.baseline = fs.generation();
+                }
+                results[i] = Some(doc.save(who,fs));
+            }
+        }
+        Ok(results)
+    }
+}
+
+#[cfg(test)]
+mod r076_multi_document_editor_tests {
+    use super::*;
+    use crate::block::{BlockError, SECTOR_BYTES};
+    struct Disk { sectors: [[u8; SECTOR_BYTES]; 100] }
+    impl BlockDevice for Disk {
+        fn sector_count(&self) -> u64 { 100 }
+        fn read_sector(&mut self, lba: u64, out: &mut [u8; SECTOR_BYTES])
+            -> Result<(), BlockError> {
+            *out = *self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?;
+            Ok(())
+        }
+        fn write_sector(&mut self, lba: u64, data: &[u8; SECTOR_BYTES])
+            -> Result<(), BlockError> {
+            *self.sectors.get_mut(lba as usize).ok_or(BlockError::OutOfRange)? = *data;
+            Ok(())
+        }
+    }
+    fn owner() -> Identity { Identity { pid: 30, generation: 1 } }
+    fn recycled() -> Identity { Identity { pid: 30, generation: 2 } }
+    fn setup() -> (HierVfs<Disk>, EditorPool) {
+        let mut fs = HierVfs::format_blank(Disk { sectors: [[0; SECTOR_BYTES];100] }).unwrap();
+        fs.create("/one",b"hello").unwrap();
+        fs.create("/two","world β".as_bytes()).unwrap();
+        let mut pool = EditorPool::new();
+        pool.open(owner(),&mut fs,0,"/one").unwrap();
+        pool.open(owner(),&mut fs,1,"/two").unwrap();
+        (fs,pool)
+    }
+    #[test]
+    fn two_dirty_documents_save_without_self_staleness_and_survive_remount() {
+        let (mut fs, mut pool) = setup();
+        pool.replace_text(owner(),0,5,5,"!").unwrap();
+        pool.replace_text(owner(),1,0,0,"α ").unwrap();
+        let saved = pool.save_all(owner(),&mut fs).unwrap();
+        assert!(matches!(saved[0],Some(Ok(_))));
+        assert!(matches!(saved[1],Some(Ok(_))));
+        let mut fs = HierVfs::mount(fs.into_device()).unwrap();
+        let mut a = [0u8;20]; let mut b = [0u8;20];
+        assert_eq!(fs.read("/one",&mut a),Ok(6));
+        assert_eq!(&a[..6],b"hello!");
+        let expected="α world β";
+        assert_eq!(fs.read("/two",&mut b),Ok(expected.len()));
+        assert_eq!(&b[..expected.len()],expected.as_bytes());
+    }
+    #[test]
+    fn recycled_owner_stale_external_writer_and_duplicate_paths_fail_closed() {
+        let (mut fs, mut pool) = setup();
+        assert_eq!(pool.replace_text(recycled(),0,0,1,"bad"),Err(Error::Unauthorized));
+        assert_eq!(pool.open(owner(),&mut fs,2,"/one"),Err(Error::Invalid));
+        pool.replace_text(owner(),0,0,1,"H").unwrap();
+        fs.overwrite("/one",b"external").unwrap();
+        assert_eq!(pool.save_all(owner(),&mut fs),Err(Error::Stale));
+        let mut out = [0u8;20];
+        assert_eq!(fs.read("/one",&mut out),Ok(8));
+        assert_eq!(&out[..8],b"external");
+        let (mut fs, mut again) = setup();
+        again.close(owner(),1,false).unwrap();
+        again.open(owner(),&mut fs,1,"/one").unwrap();
+        assert_eq!(again.save_all(owner(),&mut fs),Err(Error::Invalid));
     }
 }
