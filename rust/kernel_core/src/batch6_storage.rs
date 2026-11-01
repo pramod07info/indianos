@@ -20,6 +20,12 @@ pub fn replace_verified<B:AtomicFileBackend,const N:usize>(
  let mut canonical=[0u8;PATH_CAP];
  let n=normalize_absolute(path,&mut canonical).map_err(|_|Error::Invalid)?;
  if n<2{return Err(Error::Invalid);}
+ // R085: this File/Terminal write path must enforce the same protected
+ // namespaces as the FileHandles ABI. Unsupported canonical paths fail closed.
+ let canonical_path=core::str::from_utf8(&canonical[..n])
+     .map_err(|_|Error::Invalid)?;
+ crate::fs_write_guard::WriteGuard::allow_path(canonical_path)
+     .map_err(|_|Error::Unauthorized)?;
  // The backend must flush a complete, checksummed COW generation before
  // publication. No partial update is accepted as a valid result.
  backend.write_atomic(&canonical[..n],image).map_err(|_|Error::Storage)?;
@@ -65,5 +71,78 @@ pub fn read_verified<B:AtomicFileBackend>(backend:&mut B,path:&str,
   assert_eq!(replace_verified(&acl,Identity{generation:5,..a},4,
    "/profile",b"bad",&mut disk),Err(Error::Unauthorized));
   assert_eq!(disk.len,5);
+ }
+}
+
+
+/// R085: security-gated read wrapper for syscall-facing services. Use this
+/// instead of trusted-only read_verified when the request comes from ring 3.
+pub fn read_authorized<B:AtomicFileBackend,const N:usize>(
+ auth:&Access<N>,owner:Identity,now:u64,backend:&mut B,
+ path:&str,out:&mut[u8])->Result<usize,Error>{
+ auth.require(owner,crate::batch6_security::FILE_READ,now)
+    .map_err(|_|Error::Unauthorized)?;
+ read_verified(backend,path,out)
+}
+
+/// Optional readback integrity check for synchronous, readable backends.
+/// A mismatch is reported but is NOT a durable rollback guarantee; real
+/// storage implementations must provide their own atomic commit/flush.
+pub fn replace_and_verify<B:AtomicFileBackend,const N:usize>(
+ auth:&Access<N>,owner:Identity,now:u64,path:&str,
+ image:&[u8],backend:&mut B)->Result<(),Error>{
+ replace_verified(auth,owner,now,path,image,backend)?;
+ let mut scratch=[0u8;MAX_WRITE];
+ let read=read_verified(backend,path,&mut scratch[..image.len()])?;
+ if read!=image.len()||&scratch[..read]!=image{
+    return Err(Error::Corrupt);
+ }
+ Ok(())
+}
+#[cfg(test)]
+mod r085_storage_acceptance{
+ use super::*;
+ use crate::batch6_security::{Access,FILE_READ,FILE_WRITE};
+ struct Memory{bytes:[u8;16],len:usize,corrupt:bool}
+ impl AtomicFileBackend for Memory{
+  fn write_atomic(&mut self,_path:&[u8],src:&[u8])->Result<(),()>{
+    if src.len()>16{return Err(());}
+    self.bytes[..src.len()].copy_from_slice(src);self.len=src.len();
+    Ok(())
+  }
+  fn read_all(&mut self,_path:&[u8],out:&mut[u8])->Result<usize,()>{
+    if out.len()<self.len{return Err(());}
+    out[..self.len].copy_from_slice(&self.bytes[..self.len]);
+    if self.corrupt&&self.len>0{out[0]^=1;}
+    Ok(self.len)
+  }
+ }
+ #[test]fn protected_namespace_denied_before_backend_write(){
+  let owner=Identity{pid:3,generation:9};
+  let mut acl=Access::<1>::new();acl.grant(owner,FILE_WRITE|FILE_READ,20).unwrap();
+  let mut backend=Memory{bytes:[0;16],len:0,corrupt:false};
+  for path in ["/boot/init","//system/./driver","/recovery/image",
+               "/security/config","/snapshots/bak"]{
+    assert_eq!(replace_verified(&acl,owner,1,path,b"unsafe",&mut backend),
+        Err(Error::Unauthorized));
+    assert_eq!(backend.len,0);
+  }
+  replace_verified(&acl,owner,1,"/workspace/file",b"safe",&mut backend).unwrap();
+  assert_eq!(&backend.bytes[..backend.len],b"safe");
+ }
+ #[test]fn authenticated_reads_and_readback_reject_stale_or_corrupt(){
+  let owner=Identity{pid:3,generation:9};
+  let mut acl=Access::<1>::new();acl.grant(owner,FILE_READ|FILE_WRITE,20).unwrap();
+  let mut backend=Memory{bytes:[0;16],len:0,corrupt:false};
+  replace_and_verify(&acl,owner,2,"/workspace/file",b"ok",&mut backend).unwrap();
+  let mut buf=[0;16];
+  assert_eq!(read_authorized(&acl,Identity{generation:8,..owner},
+    2,&mut backend,"/workspace/file",&mut buf),
+    Err(Error::Unauthorized));
+  assert_eq!(read_authorized(&acl,owner,2,&mut backend,
+    "/workspace/file",&mut buf),Ok(2));
+  backend.corrupt=true;
+  assert_eq!(replace_and_verify(&acl,owner,2,"/workspace/file",
+    b"new",&mut backend),Err(Error::Corrupt));
  }
 }

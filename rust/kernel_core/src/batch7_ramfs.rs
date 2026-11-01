@@ -1130,3 +1130,449 @@ mod r066_atomic_multifile_splice_tests{
   assert_eq!(fs.metadata(b"/b"),Ok((b,CONTENT_MAX)));
  }
 }
+
+
+/// R085 extension: bounded RAM-volume integrity, directory accounting, and
+/// single-file exact-revision mutation. RAM content is NOT durable; a real
+/// journaled block backend remains necessary for M1 disk acceptance.
+impl<const N:usize> RamFs<N>{
+    pub fn file_capacity(&self)->usize{N}
+    pub fn free_file_slots(&self)->usize{N-self.count()}
+    pub fn is_empty_volume(&self)->bool{self.count()==0}
+    pub fn contains_path(&self,path:&[u8])->bool{
+        Self::valid_path(path)&&self.lookup(path).is_some()
+    }
+    pub fn length_of(&self,path:&[u8])->Option<usize>{
+        self.lookup(path).and_then(|i|self.files[i].map(|f|f.data_len))
+    }
+    pub fn total_bytes(&self)->usize{
+        self.files.iter().flatten().map(|f|f.data_len).sum()
+    }
+    pub fn remaining_content_capacity(&self)->usize{
+        N.saturating_mul(CONTENT_MAX).saturating_sub(self.total_bytes())
+    }
+    pub fn largest_content(&self)->Option<usize>{
+        self.files.iter().flatten().map(|f|f.data_len).max()
+    }
+    pub fn smallest_content(&self)->Option<usize>{
+        self.files.iter().flatten().map(|f|f.data_len).min()
+    }
+    pub fn count_empty_files(&self)->usize{
+        self.files.iter().flatten().filter(|f|f.data_len==0).count()
+    }
+    pub fn count_nonempty_files(&self)->usize{
+        self.files.iter().flatten().filter(|f|f.data_len!=0).count()
+    }
+    /// Count nested files only inside an exact directory boundary; e.g.
+    /// /docs does not also match /docs-old. Root includes all entries.
+    pub fn count_in_directory(&self,dir:&[u8])->Result<usize,Error>{
+        if dir!=b"/"&&!Self::valid_path(dir){return Err(Error::Invalid);}
+        Ok(self.files.iter().flatten().filter(|f|{
+            dir==b"/"||(f.path_len>dir.len()&&
+                f.path[..f.path_len].starts_with(dir)&&
+                f.path[dir.len()]==b'/')
+        }).count())
+    }
+    pub fn bytes_in_directory(&self,dir:&[u8])->Result<usize,Error>{
+        if dir!=b"/"&&!Self::valid_path(dir){return Err(Error::Invalid);}
+        Ok(self.files.iter().flatten().filter(|f|{
+            dir==b"/"||(f.path_len>dir.len()&&
+                f.path[..f.path_len].starts_with(dir)&&
+                f.path[dir.len()]==b'/')
+        }).map(|f|f.data_len).sum())
+    }
+    pub fn count_with_suffix(&self,suffix:&[u8])->usize{
+        if suffix.is_empty(){return 0;}
+        self.files.iter().flatten().filter(|f|
+            f.path[..f.path_len].ends_with(suffix)).count()
+    }
+    /// Metadata and global versions must remain consistent with published
+    /// file generations; no duplicate logical pathname may be present.
+    pub fn check_invariants(&self)->bool{
+        for (i,entry) in self.files.iter().enumerate(){
+            let Some(file)=entry else{continue};
+            if file.path_len>PATH_MAX||file.data_len>CONTENT_MAX||
+                !Self::valid_path(&file.path[..file.path_len])||
+                file.version==0||file.version>self.version{return false;}
+            if self.files[..i].iter().flatten().any(|old|
+                old.path_len==file.path_len&&
+                old.path[..old.path_len]==file.path[..file.path_len]){
+                return false;
+            }
+        }
+        true
+    }
+    /// Remove all empty files as one published directory generation;
+    /// unexpected volume revisions cause no change at all.
+    pub fn purge_empty_if_revision(&mut self,expected:u64)->Result<usize,Error>{
+        if expected!=self.version{return Err(Error::Invalid);}
+        let count=self.count_empty_files();
+        if count==0{return Ok(0);}
+        let next=self.version.checked_add(1).ok_or(Error::Exhausted)?;
+        for file in &mut self.files{
+            if file.is_some_and(|entry|entry.data_len==0){*file=None;}
+        }
+        self.version=next;
+        Ok(count)
+    }
+    /// Rewrite exactly one existing file with a fixed number of zero bytes.
+    pub fn replace_with_zeros_if_file_revision(&mut self,path:&[u8],
+        expected:u64,length:usize)->Result<u64,Error>{
+        if length>CONTENT_MAX{return Err(Error::Invalid);}
+        let i=self.lookup(path).ok_or(Error::NotFound)?;
+        if self.files[i].is_none_or(|f|f.version!=expected){
+            return Err(Error::Invalid);
+        }
+        self.replace(path,&[0;CONTENT_MAX][..length])
+    }
+    pub fn swap_bytes_if_file_revision(&mut self,path:&[u8],
+        expected:u64,a:usize,b:usize)->Result<u64,Error>{
+        let i=self.lookup(path).ok_or(Error::NotFound)?;
+        let mut file=self.files[i].ok_or(Error::NotFound)?;
+        if file.version!=expected||a>=file.data_len||b>=file.data_len{
+            return Err(Error::Invalid);
+        }
+        if a==b||file.data[a]==file.data[b]{return Ok(self.version);}
+        let next=self.version.checked_add(1).ok_or(Error::Exhausted)?;
+        file.data.swap(a,b);file.version=next;
+        self.files[i]=Some(file);self.version=next;Ok(next)
+    }
+    pub fn zero_range_if_file_revision(&mut self,path:&[u8],
+        expected:u64,offset:usize,length:usize)->Result<u64,Error>{
+        let i=self.lookup(path).ok_or(Error::NotFound)?;
+        let mut file=self.files[i].ok_or(Error::NotFound)?;
+        if file.version!=expected||length==0||
+            offset.checked_add(length).is_none_or(|end|end>file.data_len){
+            return Err(Error::Invalid);
+        }
+        if file.data[offset..offset+length].iter().all(|b|*b==0){
+            return Ok(self.version);
+        }
+        let next=self.version.checked_add(1).ok_or(Error::Exhausted)?;
+        file.data[offset..offset+length].fill(0);file.version=next;
+        self.files[i]=Some(file);self.version=next;Ok(next)
+    }
+    pub fn invert_ascii_case_if_file_revision(&mut self,path:&[u8],
+        expected:u64)->Result<u64,Error>{
+        let i=self.lookup(path).ok_or(Error::NotFound)?;
+        let mut file=self.files[i].ok_or(Error::NotFound)?;
+        if file.version!=expected{return Err(Error::Invalid);}
+        let mut changed=false;
+        for b in &mut file.data[..file.data_len]{
+            if b.is_ascii_lowercase(){*b=b.to_ascii_uppercase();changed=true;}
+            else if b.is_ascii_uppercase(){*b=b.to_ascii_lowercase();changed=true;}
+        }
+        if !changed{return Ok(self.version);}
+        let next=self.version.checked_add(1).ok_or(Error::Exhausted)?;
+        file.version=next;self.files[i]=Some(file);self.version=next;Ok(next)
+    }
+}
+#[cfg(test)]
+mod r085_extension_ramfs_tests{
+    use super::*;
+    #[test]fn bounded_directory_accounting_and_metadata(){
+        let mut fs=RamFs::<4>::new();
+        assert_eq!(fs.file_capacity(),4);
+        assert_eq!(fs.free_file_slots(),4);
+        assert!(fs.is_empty_volume());
+        assert_eq!(fs.largest_content(),None);
+        fs.replace(b"/docs/a",b"abc").unwrap();
+        fs.replace(b"/docs/sub/b",b"long").unwrap();
+        fs.replace(b"/docs-old/none",b"").unwrap();
+        assert_eq!(fs.count_in_directory(b"/docs"),Ok(2));
+        assert_eq!(fs.count_in_directory(b"/"),Ok(3));
+        assert_eq!(fs.bytes_in_directory(b"/docs"),Ok(7));
+        assert_eq!(fs.count_in_directory(b"/bad/../path"),Err(Error::Invalid));
+        assert_eq!(fs.length_of(b"/docs/a"),Some(3));
+        assert_eq!(fs.length_of(b"/not-found"),None);
+        assert!(fs.contains_path(b"/docs/a"));
+        assert!(!fs.contains_path(b"/docs"));
+        assert_eq!(fs.total_bytes(),7);
+        assert_eq!(fs.remaining_content_capacity(),4*CONTENT_MAX-7);
+        assert_eq!(fs.largest_content(),Some(4));
+        assert_eq!(fs.smallest_content(),Some(0));
+        assert_eq!(fs.count_empty_files(),1);
+        assert_eq!(fs.count_nonempty_files(),2);
+        assert_eq!(fs.count_with_suffix(b"/a"),1);
+        assert_eq!(fs.count_with_suffix(b""),0);
+        assert_eq!(fs.free_file_slots(),1);
+        assert!(fs.check_invariants());
+        let before=fs.version();
+        assert_eq!(fs.purge_empty_if_revision(before+1),Err(Error::Invalid));
+        assert_eq!(fs.count(),3);
+        assert_eq!(fs.purge_empty_if_revision(before),Ok(1));
+        assert_eq!(fs.count(),2);
+        assert!(fs.check_invariants());
+    }
+    #[test]fn versioned_content_edits_are_atomic_and_do_not_overwrite_stale_data(){
+        let mut fs=RamFs::<2>::new();
+        let a=fs.replace(b"/src",b"abcDEF").unwrap();
+        assert_eq!(fs.swap_bytes_if_file_revision(b"/src",a,0,5),Ok(a+1));
+        let mut out=[0u8;16];
+        assert_eq!(fs.read(b"/src",0,&mut out),Ok(6));
+        assert_eq!(&out[..6],b"FbcDEa");
+        assert_eq!(fs.zero_range_if_file_revision(b"/src",a,1,2),
+            Err(Error::Invalid));
+        assert_eq!(fs.zero_range_if_file_revision(b"/src",a+1,1,2),Ok(a+2));
+        assert_eq!(fs.invert_ascii_case_if_file_revision(b"/src",a+2),Ok(a+3));
+        assert_eq!(fs.read(b"/src",0,&mut out),Ok(6));
+        assert_eq!(&out[..6],b"f\0\0deA");
+        assert_eq!(fs.replace_with_zeros_if_file_revision(b"/src",a+2,3),
+            Err(Error::Invalid));
+        assert_eq!(fs.replace_with_zeros_if_file_revision(b"/src",a+3,3),
+            Ok(a+4));
+        assert_eq!(fs.read(b"/src",0,&mut out),Ok(3));
+        assert_eq!(&out[..3],&[0,0,0]);
+        assert_eq!(fs.zero_range_if_file_revision(b"/src",a+4,0,3),Ok(a+4));
+        assert_eq!(fs.version(),a+4);
+        assert!(fs.check_invariants());
+    }
+}
+
+
+/// R085 extension III: byte-accurate, revision-pinned source operations on
+/// real, bounded in-memory files. All mutations are fail-closed and publish
+/// one new generation only after their entire preflight succeeds.
+/// This RAM store is NOT a persistent power-loss-safe disk filesystem.
+impl<const N:usize> RamFs<N>{
+    pub fn read_exact_if_file_revision(&self,path:&[u8],expected:u64,
+        out:&mut[u8])->Result<usize,Error>{
+        let (revision,len)=self.metadata(path)?;
+        if revision!=expected{return Err(Error::Invalid);}
+        if out.len()<len{return Err(Error::OutputTooSmall);}
+        let file=self.files[self.lookup(path).ok_or(Error::NotFound)?]
+            .ok_or(Error::NotFound)?;
+        out[..len].copy_from_slice(&file.data[..len]);Ok(len)
+    }
+    pub fn read_range_if_file_revision(&self,path:&[u8],expected:u64,
+        offset:usize,length:usize,out:&mut[u8])->Result<usize,Error>{
+        let (rev,size)=self.metadata(path)?;
+        if rev!=expected||offset.checked_add(length).is_none_or(|x|x>size){
+            return Err(Error::Invalid);
+        }
+        if out.len()<length{return Err(Error::OutputTooSmall);}
+        let file=self.files[self.lookup(path).ok_or(Error::NotFound)?]
+            .ok_or(Error::NotFound)?;
+        out[..length].copy_from_slice(&file.data[offset..offset+length]);
+        Ok(length)
+    }
+    pub fn read_prefix_if_file_revision(&self,path:&[u8],expected:u64,
+        length:usize,out:&mut[u8])->Result<usize,Error>{
+        self.read_range_if_file_revision(path,expected,0,length,out)
+    }
+    pub fn read_suffix_if_file_revision(&self,path:&[u8],expected:u64,
+        length:usize,out:&mut[u8])->Result<usize,Error>{
+        let (rev,size)=self.metadata(path)?;
+        if rev!=expected||length>size{return Err(Error::Invalid);}
+        self.read_range_if_file_revision(path,expected,size-length,length,out)
+    }
+    pub fn byte_at_if_file_revision(&self,path:&[u8],expected:u64,
+        offset:usize)->Result<u8,Error>{
+        let (rev,size)=self.metadata(path)?;
+        if rev!=expected||offset>=size{return Err(Error::Invalid);}
+        let f=self.files[self.lookup(path).ok_or(Error::NotFound)?]
+            .ok_or(Error::NotFound)?;
+        Ok(f.data[offset])
+    }
+    pub fn first_byte_if_file_revision(&self,path:&[u8],
+        expected:u64)->Result<Option<u8>,Error>{
+        let (rev,len)=self.metadata(path)?;
+        if rev!=expected{return Err(Error::Invalid);}
+        if len==0{return Ok(None);}
+        self.byte_at_if_file_revision(path,expected,0).map(Some)
+    }
+    pub fn last_byte_if_file_revision(&self,path:&[u8],
+        expected:u64)->Result<Option<u8>,Error>{
+        let (rev,len)=self.metadata(path)?;
+        if rev!=expected{return Err(Error::Invalid);}
+        if len==0{return Ok(None);}
+        self.byte_at_if_file_revision(path,expected,len-1).map(Some)
+    }
+    pub fn count_byte_if_file_revision(&self,path:&[u8],
+        expected:u64,byte:u8)->Result<usize,Error>{
+        let (rev,len)=self.metadata(path)?;
+        if rev!=expected{return Err(Error::Invalid);}
+        let f=self.files[self.lookup(path).ok_or(Error::NotFound)?]
+            .ok_or(Error::NotFound)?;
+        Ok(f.data[..len].iter().filter(|b|**b==byte).count())
+    }
+    pub fn find_literal_if_file_revision(&self,path:&[u8],
+        expected:u64,needle:&[u8])->Result<Option<usize>,Error>{
+        if needle.is_empty(){return Err(Error::Invalid);}
+        let (rev,len)=self.metadata(path)?;
+        if rev!=expected{return Err(Error::Invalid);}
+        let f=self.files[self.lookup(path).ok_or(Error::NotFound)?]
+            .ok_or(Error::NotFound)?;
+        Ok(f.data[..len].windows(needle.len()).position(|w|w==needle))
+    }
+    pub fn find_last_literal_if_file_revision(&self,path:&[u8],
+        expected:u64,needle:&[u8])->Result<Option<usize>,Error>{
+        if needle.is_empty(){return Err(Error::Invalid);}
+        let (rev,len)=self.metadata(path)?;
+        if rev!=expected{return Err(Error::Invalid);}
+        let f=self.files[self.lookup(path).ok_or(Error::NotFound)?]
+            .ok_or(Error::NotFound)?;
+        Ok(f.data[..len].windows(needle.len()).rposition(|w|w==needle))
+    }
+    pub fn starts_with_if_file_revision(&self,path:&[u8],
+        expected:u64,prefix:&[u8])->Result<bool,Error>{
+        let (rev,len)=self.metadata(path)?;
+        if rev!=expected{return Err(Error::Invalid);}
+        let f=self.files[self.lookup(path).ok_or(Error::NotFound)?]
+            .ok_or(Error::NotFound)?;
+        Ok(f.data[..len].starts_with(prefix))
+    }
+    pub fn ends_with_if_file_revision(&self,path:&[u8],
+        expected:u64,suffix:&[u8])->Result<bool,Error>{
+        let (rev,len)=self.metadata(path)?;
+        if rev!=expected{return Err(Error::Invalid);}
+        let f=self.files[self.lookup(path).ok_or(Error::NotFound)?]
+            .ok_or(Error::NotFound)?;
+        Ok(f.data[..len].ends_with(suffix))
+    }
+    pub fn has_nul_if_file_revision(&self,path:&[u8],
+        expected:u64)->Result<bool,Error>{
+        Ok(self.count_byte_if_file_revision(path,expected,0)?!=0)
+    }
+    /// Simple XOR parity is a diagnostic, NOT an integrity signature or MAC.
+    pub fn xor_parity_if_file_revision(&self,path:&[u8],
+        expected:u64)->Result<u8,Error>{
+        let (rev,len)=self.metadata(path)?;
+        if rev!=expected{return Err(Error::Invalid);}
+        let f=self.files[self.lookup(path).ok_or(Error::NotFound)?]
+            .ok_or(Error::NotFound)?;
+        Ok(f.data[..len].iter().fold(0u8,|sum,&byte|sum^byte))
+    }
+    pub fn fill_range_if_file_revision(&mut self,path:&[u8],
+        expected:u64,offset:usize,length:usize,byte:u8)->Result<u64,Error>{
+        let (rev,size)=self.metadata(path)?;
+        if rev!=expected||length==0||
+            offset.checked_add(length).is_none_or(|end|end>size){
+            return Err(Error::Invalid);
+        }
+        let mut f=self.files[self.lookup(path).ok_or(Error::NotFound)?]
+            .ok_or(Error::NotFound)?;
+        if f.data[offset..offset+length].iter().all(|v|*v==byte){
+            return Ok(self.version);
+        }
+        let next=self.version.checked_add(1).ok_or(Error::Exhausted)?;
+        f.data[offset..offset+length].fill(byte);f.version=next;
+        self.files[self.lookup(path).ok_or(Error::NotFound)?]=Some(f);
+        self.version=next;Ok(next)
+    }
+    pub fn xor_range_if_file_revision(&mut self,path:&[u8],
+        expected:u64,offset:usize,length:usize,mask:u8)->Result<u64,Error>{
+        let (rev,size)=self.metadata(path)?;
+        if rev!=expected||length==0||
+            offset.checked_add(length).is_none_or(|end|end>size){
+            return Err(Error::Invalid);
+        }
+        if mask==0{return Ok(self.version);}
+        let i=self.lookup(path).ok_or(Error::NotFound)?;
+        let mut f=self.files[i].ok_or(Error::NotFound)?;
+        let next=self.version.checked_add(1).ok_or(Error::Exhausted)?;
+        for x in &mut f.data[offset..offset+length]{*x^=mask;}
+        f.version=next;self.files[i]=Some(f);self.version=next;Ok(next)
+    }
+    pub fn reverse_range_if_file_revision(&mut self,path:&[u8],
+        expected:u64,offset:usize,length:usize)->Result<u64,Error>{
+        let (rev,size)=self.metadata(path)?;
+        if rev!=expected||length==0||
+            offset.checked_add(length).is_none_or(|end|end>size){
+            return Err(Error::Invalid);
+        }
+        if length==1{return Ok(self.version);}
+        let i=self.lookup(path).ok_or(Error::NotFound)?;
+        let mut f=self.files[i].ok_or(Error::NotFound)?;
+        let old=&f.data[offset..offset+length];
+        if old.iter().zip(old.iter().rev()).all(|(a,b)|a==b){
+            return Ok(self.version);
+        }
+        let next=self.version.checked_add(1).ok_or(Error::Exhausted)?;
+        f.data[offset..offset+length].reverse();
+        f.version=next;self.files[i]=Some(f);self.version=next;Ok(next)
+    }
+    pub fn rotate_left_if_file_revision(&mut self,path:&[u8],
+        expected:u64,shift:usize)->Result<u64,Error>{
+        let (rev,size)=self.metadata(path)?;
+        if rev!=expected{return Err(Error::Invalid);}
+        if size==0||shift%size==0{return Ok(self.version);}
+        let i=self.lookup(path).ok_or(Error::NotFound)?;
+        let mut f=self.files[i].ok_or(Error::NotFound)?;
+        let next=self.version.checked_add(1).ok_or(Error::Exhausted)?;
+        f.data[..size].rotate_left(shift%size);
+        f.version=next;self.files[i]=Some(f);self.version=next;Ok(next)
+    }
+    pub fn rotate_right_if_file_revision(&mut self,path:&[u8],
+        expected:u64,shift:usize)->Result<u64,Error>{
+        let (rev,size)=self.metadata(path)?;
+        if rev!=expected{return Err(Error::Invalid);}
+        if size==0||shift%size==0{return Ok(self.version);}
+        let i=self.lookup(path).ok_or(Error::NotFound)?;
+        let mut f=self.files[i].ok_or(Error::NotFound)?;
+        let next=self.version.checked_add(1).ok_or(Error::Exhausted)?;
+        f.data[..size].rotate_right(shift%size);
+        f.version=next;self.files[i]=Some(f);self.version=next;Ok(next)
+    }
+    pub fn replace_first_literal_if_file_revision(&mut self,path:&[u8],
+        expected:u64,needle:&[u8],replacement:&[u8])->Result<u64,Error>{
+        if needle.is_empty()||replacement.len()>CONTENT_MAX{
+            return Err(Error::Invalid);
+        }
+        let index=self.find_literal_if_file_revision(path,expected,needle)?
+            .ok_or(Error::NotFound)?;
+        self.splice_if_file_revision(path,expected,index,needle.len(),replacement)
+    }
+}
+#[cfg(test)]mod r085_extension3_ramfs_tests{
+    use super::*;
+    #[test]fn exact_revision_reads_never_modify_short_output(){
+        let mut f=RamFs::<2>::new();
+        let v=f.replace(b"/source",b"abABab").unwrap();
+        let mut small=[0xaau8;2];
+        assert_eq!(f.read_exact_if_file_revision(b"/source",v,&mut small),
+            Err(Error::OutputTooSmall));
+        assert_eq!(small,[0xaa,0xaa]);
+        assert_eq!(f.read_range_if_file_revision(b"/source",v,2,3,&mut [0;2]),
+            Err(Error::OutputTooSmall));
+        let mut out=[0;10];
+        assert_eq!(f.read_exact_if_file_revision(b"/source",v,&mut out),Ok(6));
+        assert_eq!(&out[..6],b"abABab");
+        assert_eq!(f.read_prefix_if_file_revision(b"/source",v,2,&mut out),Ok(2));
+        assert_eq!(&out[..2],b"ab");
+        assert_eq!(f.read_suffix_if_file_revision(b"/source",v,2,&mut out),Ok(2));
+        assert_eq!(&out[..2],b"ab");
+        assert_eq!(f.byte_at_if_file_revision(b"/source",v,2),Ok(b'A'));
+        assert_eq!(f.first_byte_if_file_revision(b"/source",v),Ok(Some(b'a')));
+        assert_eq!(f.last_byte_if_file_revision(b"/source",v),Ok(Some(b'b')));
+        assert_eq!(f.count_byte_if_file_revision(b"/source",v,b'a'),Ok(2));
+        assert_eq!(f.find_literal_if_file_revision(b"/source",v,b"ab"),Ok(Some(0)));
+        assert_eq!(f.find_last_literal_if_file_revision(b"/source",v,b"ab"),Ok(Some(4)));
+        assert_eq!(f.starts_with_if_file_revision(b"/source",v,b"ab"),Ok(true));
+        assert_eq!(f.ends_with_if_file_revision(b"/source",v,b"ab"),Ok(true));
+        assert_eq!(f.has_nul_if_file_revision(b"/source",v),Ok(false));
+        assert_eq!(f.xor_parity_if_file_revision(b"/source",v),
+            Ok(b'a'^b'b'^b'A'^b'B'^b'a'^b'b'));
+    }
+    #[test]fn bounded_mutations_preserve_bytes_on_stale_or_invalid_edits(){
+        let mut f=RamFs::<1>::new();
+        let v=f.replace(b"/source",b"abcde").unwrap();
+        assert_eq!(f.fill_range_if_file_revision(b"/source",v,99,2,b'!'),
+            Err(Error::Invalid));
+        assert_eq!(f.version(),v);
+        let next=f.fill_range_if_file_revision(b"/source",v,1,2,b'x').unwrap();
+        assert_eq!(next,v+1);
+        assert_eq!(f.xor_range_if_file_revision(b"/source",v,0,1,1),
+            Err(Error::Invalid));
+        let next=f.xor_range_if_file_revision(b"/source",next,0,1,1).unwrap();
+        let next=f.reverse_range_if_file_revision(b"/source",next,0,5).unwrap();
+        let next=f.rotate_left_if_file_revision(b"/source",next,1).unwrap();
+        let next=f.rotate_right_if_file_revision(b"/source",next,1).unwrap();
+        assert_eq!(f.find_literal_if_file_revision(b"/source",next,b"xx"),Ok(Some(2)));
+        let next=f.replace_first_literal_if_file_revision(b"/source",
+            next,b"xx",b"YY").unwrap();
+        let mut out=[0u8;10];
+        assert_eq!(f.read_exact_if_file_revision(b"/source",next,&mut out),Ok(5));
+        assert_eq!(&out[..5],b"edYY`");
+    }
+}
