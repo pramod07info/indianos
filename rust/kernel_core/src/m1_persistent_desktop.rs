@@ -2347,3 +2347,198 @@ mod r074_authenticated_workstation_tests {
         assert!(d.project_diagnose_source(id(2), 6, &project, "main").is_err());
     }
 }
+
+
+/// R075: authorize substantial multi-line editor operations and a bounded,
+/// atomic multi-range project commit using the current desktop process,
+/// capability and expiry checks. Neither path bypasses the mounted VFS.
+impl<D: BlockDevice, const P: usize, const E: usize, const W: usize,
+     const K: usize, const G: usize, const Q: usize> Desktop<D, P, E, W, K, G, Q> {
+    pub fn editor_reverse_source_lines(&mut self, caller: Identity, now: u64,
+        editor: &mut crate::m1_disk_editor::DiskEditor, first: usize, last: usize
+    ) -> Result<usize, EditorRouteError> {
+        self.admit_editor(caller, now, FILE_WRITE)?;
+        editor.reverse_source_lines(caller, first, last).map_err(EditorRouteError::Editor)
+    }
+    pub fn project_apply_source_patches_if_equal(&mut self, caller: Identity, now: u64,
+        project: &mut crate::m1_project_workspace::ProjectTree, file: &str,
+        patches: &[crate::m1_project_workspace::SourcePatch<'_>]
+    ) -> Result<usize, ProjectRouteError> {
+        self.admit_editor(caller, now, FILE_WRITE).map_err(ProjectRouteError::Permission)?;
+        project.apply_source_patches_if_equal(caller, &mut self.volume, file, patches)
+            .map_err(ProjectRouteError::Project)
+    }
+}
+
+#[cfg(test)]
+mod r075_desktop_source_workflow_tests {
+    use super::*;
+    use crate::block::{BlockError, SECTOR_BYTES};
+    use crate::batch2_launcher::Image;
+    use crate::batch2_settings::{Settings, Theme};
+    use crate::m1_project_workspace::SourcePatch;
+    struct Disk { sectors: [[u8; SECTOR_BYTES]; 100] }
+    impl BlockDevice for Disk {
+        fn sector_count(&self) -> u64 { 100 }
+        fn read_sector(&mut self, lba: u64, out: &mut [u8; SECTOR_BYTES]) -> Result<(), BlockError> {
+            *out = *self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?; Ok(())
+        }
+        fn write_sector(&mut self, lba: u64, data: &[u8; SECTOR_BYTES]) -> Result<(), BlockError> {
+            *self.sectors.get_mut(lba as usize).ok_or(BlockError::OutOfRange)? = *data; Ok(())
+        }
+    }
+    type Desk = Desktop<Disk, 3, 3, 2, 2, 3, 8>;
+    fn id(pid: u32) -> Identity { Identity { pid, generation: 1 } }
+    fn launch(pid: u32) -> Launch {
+        Launch { pid, generation: 1, image: Image {
+            image_id: pid, entry: 0x1000, mapped_end: 0x2000, verified: true
+        } }
+    }
+    fn ready() -> Desk {
+        let mut fs = HierVfs::format_blank(Disk { sectors: [[0; SECTOR_BYTES]; 100] }).unwrap();
+        fs.create("/source", "α\nβ\nγ".as_bytes()).unwrap();
+        let mut d = Desk::from_mounted(fs);
+        d.start(id(1), launch(1), id(2), launch(2),
+            Settings { theme: Theme::Dark, pointer_speed: 5, key_repeat: 10 }, 8, 5).unwrap();
+        d
+    }
+    #[test]
+    fn authenticated_reverse_and_atomic_patch_survive_real_reboot() {
+        let mut d = ready();
+        let mut e = crate::m1_disk_editor::DiskEditor::new();
+        d.editor_open(id(2), 1, &mut e, "/source").unwrap();
+        assert_eq!(d.editor_reverse_source_lines(id(2), 1, &mut e, 1, 3), Ok(3));
+        d.editor_save(id(2), 1, &mut e).unwrap();
+        let mut project = crate::m1_project_workspace::ProjectTree::new();
+        d.project_create(id(2), 1, &mut project, "demo").unwrap();
+        d.project_create_file(id(2), 1, &mut project, "main",
+            "α old\nβ old\n".as_bytes()).unwrap();
+        let patches = [SourcePatch { start: 3, expected: "old", replacement: "new" },
+                       SourcePatch { start: 10, expected: "old", replacement: "next" }];
+        assert_eq!(d.project_apply_source_patches_if_equal(
+            id(2), 1, &mut project, "main", &patches), Ok("α new\nβ next\n".len()));
+        let mut mounted = HierVfs::mount(d.into_device()).unwrap();
+        let mut bytes = [0u8; 40];
+        assert_eq!(mounted.read("/source", &mut bytes), Ok("γ\nβ\nα".len()));
+        assert_eq!(&bytes[.."γ\nβ\nα".len()], "γ\nβ\nα".as_bytes());
+        assert_eq!(mounted.read("/work/demo/main", &mut bytes), Ok("α new\nβ next\n".len()));
+    }
+    #[test]
+    fn expired_and_recycled_sessions_cannot_reverse_or_commit_project() {
+        let mut d = ready();
+        let mut e = crate::m1_disk_editor::DiskEditor::new();
+        d.editor_open(id(2), 1, &mut e, "/source").unwrap();
+        assert!(d.editor_reverse_source_lines(id(2), 6, &mut e, 1, 3).is_err());
+        assert!(d.editor_reverse_source_lines(
+            Identity { generation: 2, ..id(2) }, 1, &mut e, 1, 3).is_err());
+        assert!(!e.status(id(2)).unwrap().dirty);
+        let mut project = crate::m1_project_workspace::ProjectTree::new();
+        d.project_create(id(2), 1, &mut project, "demo").unwrap();
+        d.project_create_file(id(2), 1, &mut project, "main", b"old").unwrap();
+        let patch = [SourcePatch { start: 0, expected: "old", replacement: "bad" }];
+        assert!(d.project_apply_source_patches_if_equal(
+            id(2), 6, &mut project, "main", &patch).is_err());
+    }
+}
+
+
+// R075 expanded workstream C: three authenticated desktop operations
+// over actual persisted project source, not UI-only command stubs.
+impl<D: BlockDevice, const P: usize, const E: usize, const W: usize,
+     const K: usize, const G: usize, const Q: usize> Desktop<D, P, E, W, K, G, Q> {
+    /// Expose read-only Unicode line metrics under an unexpired read grant.
+    pub fn project_measure_source_line(&mut self, caller: Identity, now: u64,
+        project: &crate::m1_project_workspace::ProjectTree,
+        file: &str, line: usize
+    ) -> Result<crate::m1_project_workspace::SourceRowMetrics, ProjectRouteError> {
+        self.admit_editor(caller, now, FILE_READ).map_err(ProjectRouteError::Permission)?;
+        project.measure_source_line(caller, &mut self.volume, file, line)
+            .map_err(ProjectRouteError::Project)
+    }
+
+    /// Optimistic source append requires a current FILE_WRITE grant.
+    pub fn project_append_source_if_suffix_equal(&mut self, caller: Identity, now: u64,
+        project: &mut crate::m1_project_workspace::ProjectTree,
+        file: &str, expected_suffix: &str, added: &str
+    ) -> Result<usize, ProjectRouteError> {
+        self.admit_editor(caller, now, FILE_WRITE).map_err(ProjectRouteError::Permission)?;
+        project.append_source_if_suffix_equal(caller, &mut self.volume, file,
+            expected_suffix, added).map_err(ProjectRouteError::Project)
+    }
+
+    /// Extract an exact Unicode source selection into a new project file;
+    /// require both read and write authority before filesystem inspection.
+    pub fn project_extract_source_selection(&mut self, caller: Identity, now: u64,
+        project: &mut crate::m1_project_workspace::ProjectTree,
+        source: &str, destination: &str, start: usize, end: usize
+    ) -> Result<usize, ProjectRouteError> {
+        self.admit_editor(caller, now, FILE_READ).map_err(ProjectRouteError::Permission)?;
+        self.admit_editor(caller, now, FILE_WRITE).map_err(ProjectRouteError::Permission)?;
+        project.extract_source_selection(caller, &mut self.volume, source, destination,
+            start, end).map_err(ProjectRouteError::Project)
+    }
+}
+
+#[cfg(test)]
+mod r075_expanded_desktop_source_tests {
+    use super::*;
+    use crate::block::{BlockError, SECTOR_BYTES};
+    use crate::batch2_launcher::Image;
+    use crate::batch2_settings::{Settings, Theme};
+    struct Disk { sectors: [[u8; SECTOR_BYTES]; 100] }
+    impl BlockDevice for Disk {
+        fn sector_count(&self) -> u64 { 100 }
+        fn read_sector(&mut self, lba: u64, out: &mut [u8; SECTOR_BYTES]) -> Result<(), BlockError> {
+            *out = *self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?; Ok(())
+        }
+        fn write_sector(&mut self, lba: u64, data: &[u8; SECTOR_BYTES]) -> Result<(), BlockError> {
+            *self.sectors.get_mut(lba as usize).ok_or(BlockError::OutOfRange)? = *data; Ok(())
+        }
+    }
+    type Desk = Desktop<Disk, 3, 3, 2, 2, 3, 8>;
+    fn id(pid: u32) -> Identity { Identity { pid, generation: 1 } }
+    fn launch(pid: u32) -> Launch {
+        Launch { pid, generation: 1, image: Image {
+            image_id: pid, entry: 0x1000, mapped_end: 0x2000, verified: true
+        } }
+    }
+    fn ready() -> Desk {
+        let mut fs = HierVfs::format_blank(Disk { sectors: [[0; SECTOR_BYTES]; 100] }).unwrap();
+        fs.create("/source", "α\nβ\n".as_bytes()).unwrap();
+        let mut d = Desk::from_mounted(fs);
+        d.start(id(1), launch(1), id(2), launch(2),
+            Settings { theme: Theme::Dark, pointer_speed: 5, key_repeat: 10 }, 8, 5).unwrap();
+        d
+    }
+    #[test]
+    fn source_metrics_safe_append_and_selection_survive_remount() {
+        let mut d = ready();
+        let mut project = crate::m1_project_workspace::ProjectTree::new();
+        d.project_create(id(2), 1, &mut project, "demo").unwrap();
+        d.project_create_file(id(2), 1, &mut project,
+            "main", "α hi\nβ old\n".as_bytes()).unwrap();
+        let stats = d.project_measure_source_line(id(2), 1, &project, "main", 1).unwrap();
+        assert_eq!(stats.unicode_scalars, 4);
+        assert_eq!(d.project_append_source_if_suffix_equal(id(2), 1, &mut project,
+            "main", "β old\n", "γ next\n"), Ok("α hi\nβ old\nγ next\n".len()));
+        assert_eq!(d.project_extract_source_selection(id(2), 1, &mut project,
+            "main", "snippet", 0, "α hi\n".len()), Ok("α hi\n".len()));
+        let mut mounted = HierVfs::mount(d.into_device()).unwrap();
+        let mut out = [0u8; 48];
+        assert_eq!(mounted.read("/work/demo/snippet", &mut out), Ok("α hi\n".len()));
+        assert_eq!(&out[.."α hi\n".len()], "α hi\n".as_bytes());
+    }
+    #[test]
+    fn expired_grant_and_pid_reuse_never_publish_or_write_project_data() {
+        let mut d = ready();
+        let mut project = crate::m1_project_workspace::ProjectTree::new();
+        d.project_create(id(2), 1, &mut project, "demo").unwrap();
+        d.project_create_file(id(2), 1, &mut project, "main", b"old").unwrap();
+        assert!(d.project_measure_source_line(id(2), 6, &project, "main", 1).is_err());
+        assert!(d.project_append_source_if_suffix_equal(id(2), 6, &mut project,
+            "main", "old", "bad").is_err());
+        assert!(d.project_extract_source_selection(
+            Identity { generation: 2, ..id(2) }, 1, &mut project,
+            "main", "copy", 0, 3).is_err());
+    }
+}

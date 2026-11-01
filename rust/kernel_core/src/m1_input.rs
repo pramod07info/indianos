@@ -1815,3 +1815,230 @@ mod r074_terminal_token_delete_tests {
         assert_eq!(input.delete_argument(0), Err(Error::Invalid));
     }
 }
+
+
+/// R075: duplicate a whitespace-delimited command argument in the live,
+/// unsent terminal draft. This never issues a command or copies its value
+/// into the clipboard/history. All insertion capacity is checked first.
+impl LineEditor {
+    pub fn duplicate_argument(&mut self, index: usize) -> Result<Event, Error> {
+        let mut at = 0usize;
+        let mut token = 0usize;
+        while at < self.len {
+            while at < self.len && self.line[at] == b' ' { at += 1; }
+            if at == self.len { break; }
+            let start = at;
+            while at < self.len && self.line[at] != b' ' { at += 1; }
+            if token == index {
+                let width = at - start;
+                let new_size = self.len.checked_add(width+1).ok_or(Error::Full)?;
+                if new_size > MAX_LINE { return Err(Error::Full); }
+                let mut payload = [0u8; MAX_LINE];
+                payload[0] = b' ';
+                payload[1..width+1].copy_from_slice(&self.line[start..at]);
+                return self.replace_range(at, at, &payload[..width+1]);
+            }
+            token = token.checked_add(1).ok_or(Error::Invalid)?;
+        }
+        Err(Error::Invalid)
+    }
+}
+impl InputLine {
+    pub fn duplicate_argument(&mut self, index: usize) -> Result<Event, Error> {
+        let result = self.editor.duplicate_argument(index)?;
+        if result != Event::Empty {
+            self.history_cursor = None;
+            self.history_draft.fill(0);
+            self.history_draft_len = 0;
+        }
+        Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod r075_duplicate_shell_argument_tests {
+    use super::*;
+    #[test]
+    fn duplicates_selected_token_without_changing_case_clipboard_or_history() {
+        let mut line = InputLine::new();
+        let mut submitted = [0u8; MAX_LINE];
+        line.set_line(b"pwd").unwrap();
+        line.feed(b'\n', &mut submitted).unwrap();
+        line.set_line(b"git status  /MixedCase").unwrap();
+        line.copy_range(4, 10).unwrap();
+        assert_eq!(line.duplicate_argument(1), Ok(Event::Typed));
+        assert_eq!(line.bytes(), b"git status status  /MixedCase");
+        assert_eq!(line.caret(), b"git status status".len());
+        assert_eq!(line.clipboard_bytes(), b"status");
+        assert_eq!(line.history_count(), 1);
+    }
+    #[test]
+    fn missing_token_and_insufficient_capacity_preserve_draft() {
+        let mut line = InputLine::new();
+        line.set_line(b"run a").unwrap();
+        let before = line.caret();
+        assert_eq!(line.duplicate_argument(3), Err(Error::Invalid));
+        assert_eq!(line.bytes(), b"run a");
+        assert_eq!(line.caret(), before);
+        let full = [b'x'; MAX_LINE];
+        line.set_line(&full).unwrap();
+        assert_eq!(line.duplicate_argument(0), Err(Error::Full));
+        assert_eq!(line.bytes(), &full);
+    }
+}
+
+
+// R075 expanded workstream D: bounded transformations on unsent shell input.
+impl LineEditor {
+    /// Canonicalize only the space-separated argument separators. Paths and
+    /// other case-sensitive argument bytes are never lowercased.
+    pub fn compact_argument_spacing(&mut self) -> Result<Event, Error> {
+        let mut staged = [0u8; MAX_LINE];
+        let mut written = 0usize;
+        let mut gap = false;
+        for &byte in &self.line[..self.len] {
+            if byte == b' ' {
+                if written > 0 { gap = true; }
+            } else {
+                if gap { staged[written] = b' '; written += 1; gap = false; }
+                staged[written] = byte;
+                written += 1;
+            }
+        }
+        if written == self.len && staged[..written] == self.line[..self.len] {
+            return Ok(Event::Empty);
+        }
+        self.replace_line(&staged[..written])?;
+        Ok(Event::Typed)
+    }
+
+    /// Insert an argument before token N, or at N==token count to append.
+    /// No quoting/escaping is assumed: the terminal grammar uses ASCII spaces.
+    pub fn insert_argument_before(&mut self, index: usize,
+        argument: &[u8]) -> Result<Event, Error> {
+        if argument.is_empty() || argument.iter().any(|b| !b.is_ascii_graphic()) {
+            return Err(Error::Invalid);
+        }
+        let mut at = 0usize;
+        let mut ordinal = 0usize;
+        let mut insert = None;
+        while at < self.len {
+            while at < self.len && self.line[at] == b' ' { at += 1; }
+            if at == self.len { break; }
+            if ordinal == index { insert = Some(at); break; }
+            while at < self.len && self.line[at] != b' ' { at += 1; }
+            ordinal += 1;
+        }
+        if let Some(where_at) = insert {
+            let mut data = [0u8; MAX_LINE];
+            let required = argument.len()+1;
+            if required > MAX_LINE { return Err(Error::Full); }
+            data[..argument.len()].copy_from_slice(argument);
+            data[argument.len()] = b' ';
+            return self.replace_range(where_at, where_at, &data[..required]);
+        }
+        if index != ordinal { return Err(Error::Invalid); }
+        let end = self.line[..self.len].iter().rposition(|b| *b != b' ')
+            .map(|pos| pos+1).unwrap_or(0);
+        let mut data = [0u8; MAX_LINE];
+        let prefix = usize::from(end > 0);
+        if argument.len()+prefix > MAX_LINE { return Err(Error::Full); }
+        if prefix != 0 { data[0] = b' '; }
+        data[prefix..prefix+argument.len()].copy_from_slice(argument);
+        self.replace_range(end, end, &data[..prefix+argument.len()])
+    }
+
+    /// Move one argument to the final position, rebuilding the whitespace-
+    /// delimited draft in a single bounded operation without executing it.
+    pub fn move_argument_to_end(&mut self, index: usize) -> Result<Event, Error> {
+        let mut spans = [(0usize, 0usize); 32];
+        let mut count = 0usize;
+        let mut at = 0usize;
+        while at < self.len {
+            while at < self.len && self.line[at] == b' ' { at += 1; }
+            if at == self.len { break; }
+            if count == spans.len() { return Err(Error::Full); }
+            let start = at;
+            while at < self.len && self.line[at] != b' ' { at += 1; }
+            spans[count] = (start, at);
+            count += 1;
+        }
+        if index >= count { return Err(Error::Invalid); }
+        if index + 1 == count { return Ok(Event::Empty); }
+        let mut staged = [0u8; MAX_LINE];
+        let mut written = 0usize;
+        for token in (0..count).filter(|n| *n != index).chain(core::iter::once(index)) {
+            if written > 0 { staged[written] = b' '; written += 1; }
+            let (start, end) = spans[token];
+            staged[written..written+end-start].copy_from_slice(&self.line[start..end]);
+            written += end-start;
+        }
+        self.replace_line(&staged[..written])?;
+        Ok(Event::Typed)
+    }
+}
+impl InputLine {
+    pub fn compact_argument_spacing(&mut self) -> Result<Event, Error> {
+        let result = self.editor.compact_argument_spacing()?;
+        if result != Event::Empty {
+            self.history_cursor = None;
+            self.history_draft.fill(0);
+            self.history_draft_len = 0;
+        }
+        Ok(result)
+    }
+    pub fn insert_argument_before(&mut self, index: usize,
+        argument: &[u8]) -> Result<Event, Error> {
+        let result = self.editor.insert_argument_before(index, argument)?;
+        if result != Event::Empty {
+            self.history_cursor = None;
+            self.history_draft.fill(0);
+            self.history_draft_len = 0;
+        }
+        Ok(result)
+    }
+    pub fn move_argument_to_end(&mut self, index: usize) -> Result<Event, Error> {
+        let result = self.editor.move_argument_to_end(index)?;
+        if result != Event::Empty {
+            self.history_cursor = None;
+            self.history_draft.fill(0);
+            self.history_draft_len = 0;
+        }
+        Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod r075_expanded_shell_edit_tests {
+    use super::*;
+    #[test]
+    fn spacing_and_insert_preserve_mixed_case_paths_and_clipboard() {
+        let mut input = InputLine::new();
+        let mut command = [0u8; MAX_LINE];
+        input.set_line(b"pwd").unwrap(); input.feed(b'\n', &mut command).unwrap();
+        input.set_line(b"  git   status  /MiXeD  ").unwrap();
+        input.copy_range(2, 5).unwrap();
+        assert_eq!(input.compact_argument_spacing(), Ok(Event::Typed));
+        assert_eq!(input.bytes(), b"git status /MiXeD");
+        assert_eq!(input.insert_argument_before(1, b"log"), Ok(Event::Typed));
+        assert_eq!(input.bytes(), b"git log status /MiXeD");
+        assert_eq!(input.insert_argument_before(4, b"now"), Ok(Event::Typed));
+        assert_eq!(input.bytes(), b"git log status /MiXeD now");
+        assert_eq!(input.clipboard_bytes(), b"git");
+        assert_eq!(input.history_count(), 1);
+    }
+    #[test]
+    fn move_selected_argument_and_reject_invalid_index_or_invalid_input() {
+        let mut input = InputLine::new();
+        input.set_line(b"git status /Path").unwrap();
+        assert_eq!(input.move_argument_to_end(1), Ok(Event::Typed));
+        assert_eq!(input.bytes(), b"git /Path status");
+        assert_eq!(input.move_argument_to_end(2), Ok(Event::Empty));
+        let before = input.caret();
+        assert_eq!(input.move_argument_to_end(7), Err(Error::Invalid));
+        assert_eq!(input.insert_argument_before(9, b"next"), Err(Error::Invalid));
+        assert_eq!(input.insert_argument_before(1, b"bad space"), Err(Error::Invalid));
+        assert_eq!(input.bytes(), b"git /Path status");
+        assert_eq!(input.caret(), before);
+    }
+}
