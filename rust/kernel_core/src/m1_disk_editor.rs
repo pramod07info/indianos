@@ -2784,3 +2784,118 @@ mod r079_editor_multibuffer_tests {
         assert_eq!(matched,[]);
     }
 }
+
+
+// R080 workstream A: active multi-document source reconciliation.
+// These operations work on authenticated in-memory edits, never only an
+// outdated disk view. Durable changes still require explicit save_all().
+impl EditorPool {
+    /// First changed byte across two open, valid UTF-8 source buffers.
+    pub fn compare_open_text(&self,who:Identity,left:usize,right:usize)
+        ->Result<Option<usize>,Error>{
+        let a=self.docs.get(left).ok_or(Error::Invalid)?;
+        let b=self.docs.get(right).ok_or(Error::Invalid)?;
+        a.authorize(who)?;b.authorize(who)?;
+        core::str::from_utf8(&a.data[..a.used]).map_err(|_|Error::Invalid)?;
+        core::str::from_utf8(&b.data[..b.used]).map_err(|_|Error::Invalid)?;
+        let common=core::cmp::min(a.used,b.used);
+        for i in 0..common{
+            if a.data[i]!=b.data[i]{return Ok(Some(i));}
+        }
+        Ok(if a.used==b.used{None}else{Some(common)})
+    }
+    /// Copy selected Unicode text from one document into another as ONE
+    /// undoable destination edit. Source bytes and history stay unchanged.
+    pub fn transfer_selection(&mut self,who:Identity,source:usize,
+        from:usize,to:usize,target:usize,target_from:usize,target_to:usize)
+        ->Result<usize,Error>{
+        if source==target{return Err(Error::Invalid);}
+        let mut scratch=[0u8;MAX_FILE_BYTES];
+        let len=self.docs.get(source).ok_or(Error::Invalid)?
+            .copy_text_selection(who,from,to,&mut scratch)?;
+        let dest=self.docs.get_mut(target).ok_or(Error::Invalid)?;
+        dest.authorize(who)?;
+        let slice=core::str::from_utf8(&scratch[..len]).map_err(|_|Error::Invalid)?;
+        dest.paste_text_selection(who,target_from,target_to,slice)
+    }
+    /// Refresh one document from verified durable bytes, requiring explicit
+    /// discard if it has unsaved edits. Peer documents are untouched.
+    pub fn reload_slot<D:BlockDevice>(&mut self,who:Identity,
+        fs:&mut HierVfs<D>,slot:usize,discard:bool)->Result<Status,Error>{
+        let doc=self.docs.get_mut(slot).ok_or(Error::Invalid)?;
+        doc.authorize(who)?;
+        if doc.dirty&&!discard{return Err(Error::Dirty);}
+        doc.reload(who,fs)
+    }
+    /// Close all owned documents only after *every* slot passes authority
+    /// and dirty-buffer checks, avoiding a half-closed workspace.
+    pub fn close_all(&mut self,who:Identity,discard:bool)->Result<usize,Error>{
+        let mut active=0;
+        for doc in &self.docs{
+            if doc.owner.is_some(){
+                doc.authorize(who)?;
+                if doc.dirty&&!discard{return Err(Error::Dirty);}
+                active+=1;
+            }
+        }
+        for doc in &mut self.docs{
+            if doc.owner.is_some(){doc.close(who,discard)?;}
+        }
+        Ok(active)
+    }
+}
+
+#[cfg(test)]
+mod r080_editor_reconciliation_tests {
+    use super::*;
+    use crate::block::{BlockError,SECTOR_BYTES};
+    struct Disk{sectors:[[u8;SECTOR_BYTES];100]}
+    impl BlockDevice for Disk{
+        fn sector_count(&self)->u64{100}
+        fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+            *out=*self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?;Ok(())
+        }
+        fn write_sector(&mut self,lba:u64,data:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+            *self.sectors.get_mut(lba as usize).ok_or(BlockError::OutOfRange)?=*data;Ok(())
+        }
+    }
+    fn id()->Identity{Identity{pid:71,generation:1}}
+    fn setup()->(HierVfs<Disk>,EditorPool){
+        let mut fs=HierVfs::format_blank(Disk{sectors:[[0;SECTOR_BYTES];100]}).unwrap();
+        fs.create("/first","α text".as_bytes()).unwrap();
+        fs.create("/second",b"notes").unwrap();
+        let mut p=EditorPool::new();
+        p.open(id(),&mut fs,0,"/first").unwrap();
+        p.open(id(),&mut fs,1,"/second").unwrap();
+        (fs,p)
+    }
+    #[test]
+    fn compare_transfer_and_reload_real_unicode_source_survive_remount(){
+        let (mut fs,mut pool)=setup();
+        assert_eq!(pool.compare_open_text(id(),0,1),Ok(Some(0)));
+        assert_eq!(pool.transfer_selection(id(),0,0,2,1,5,5),Ok(7));
+        assert_eq!(pool.compare_open_text(id(),0,1),Ok(Some(0)));
+        pool.save_all(id(),&mut fs).unwrap();
+        let mut mounted=HierVfs::mount(fs.into_device()).unwrap();
+        let mut buf=[0u8;20];
+        assert_eq!(mounted.read("/second",&mut buf),Ok(7));
+        assert_eq!(&buf[..7],"notesα".as_bytes());
+        // The existing in-memory session may explicitly refresh after reboot.
+        assert_eq!(pool.reload_slot(id(),&mut mounted,1,false).unwrap().bytes,7);
+        assert_eq!(pool.close_all(id(),false),Ok(2));
+    }
+    #[test]
+    fn rejected_transfer_wrong_pid_dirty_close_and_reload_leave_peers_unchanged(){
+        let (mut fs,mut pool)=setup();
+        assert_eq!(pool.transfer_selection(id(),0,1,2,1,0,0),Err(Error::Invalid));
+        assert_eq!(pool.transfer_selection(id(),0,0,2,0,0,0),Err(Error::Invalid));
+        assert_eq!(pool.transfer_selection(
+            Identity{generation:2,..id()},0,0,2,1,0,0),Err(Error::Unauthorized));
+        pool.replace_text(id(),1,0,0,"!").unwrap();
+        assert_eq!(pool.reload_slot(id(),&mut fs,1,false),Err(Error::Dirty));
+        assert_eq!(pool.close_all(id(),false),Err(Error::Dirty));
+        assert_eq!(pool.status(id(),0).unwrap().bytes,"α text".len());
+        assert_eq!(pool.status(id(),1).unwrap().bytes,6);
+        assert_eq!(pool.reload_slot(id(),&mut fs,1,true).unwrap().bytes,5);
+    }
+}

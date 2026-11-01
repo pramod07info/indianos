@@ -2542,3 +2542,132 @@ mod r079_project_revision_tests {
             Err(Error::Stale));
     }
 }
+
+
+// R080 workstream B: revision-locked persistent source slices and saves.
+// These commands use actual mounted COW bytes, not an editable mock tree.
+impl ProjectTree {
+    /// Publish a whole UTF-8 source snapshot only when the observed FNV
+    /// revision still matches; output remains untouched on stale/short read.
+    pub fn read_source_if_checksum<D:BlockDevice>(&self,who:Identity,
+        fs:&mut HierVfs<D>,name:&str,expected:u64,out:&mut[u8])
+        ->Result<usize,Error>{
+        self.check_fresh(who,fs)?;
+        let (p,n)=self.child(name)?;
+        let mut bytes=[0u8;MAX_FILE_BYTES];
+        let len=fs.read(Self::str_path(&p,n),&mut bytes)?;
+        core::str::from_utf8(&bytes[..len]).map_err(|_|Error::Invalid)?;
+        let hash=bytes[..len].iter().fold(0xcbf29ce484222325u64,
+            |h,b|(h^(*b as u64)).wrapping_mul(0x100000001b3));
+        if hash!=expected{return Err(Error::Stale);}
+        if len>out.len(){return Err(Error::Full);}
+        out[..len].copy_from_slice(&bytes[..len]);Ok(len)
+    }
+    /// Optimistic Unicode suffix append through a single COW overwrite.
+    /// Refuses stale source revisions even when the requested suffix fits.
+    pub fn append_source_if_checksum<D:BlockDevice>(&mut self,who:Identity,
+        fs:&mut HierVfs<D>,name:&str,expected:u64,suffix:&str)
+        ->Result<u64,Error>{
+        self.check_fresh(who,fs)?;
+        let (p,n)=self.child(name)?;
+        let mut bytes=[0u8;MAX_FILE_BYTES];
+        let len=fs.read(Self::str_path(&p,n),&mut bytes)?;
+        core::str::from_utf8(&bytes[..len]).map_err(|_|Error::Invalid)?;
+        let total=len.checked_add(suffix.len()).ok_or(Error::Full)?;
+        if total>MAX_FILE_BYTES{return Err(Error::Full);}
+        bytes[len..total].copy_from_slice(suffix.as_bytes());
+        let merged=core::str::from_utf8(&bytes[..total]).map_err(|_|Error::Invalid)?;
+        self.replace_source_if_checksum(who,fs,name,expected,merged)
+    }
+    /// Cut the file at a valid UTF-8 byte boundary, preserving Unicode
+    /// scalars and guarding against an intervening external file revision.
+    pub fn truncate_source_if_checksum<D:BlockDevice>(&mut self,who:Identity,
+        fs:&mut HierVfs<D>,name:&str,expected:u64,keep:usize)
+        ->Result<u64,Error>{
+        self.check_fresh(who,fs)?;
+        let (p,n)=self.child(name)?;
+        let mut bytes=[0u8;MAX_FILE_BYTES];
+        let len=fs.read(Self::str_path(&p,n),&mut bytes)?;
+        let content=core::str::from_utf8(&bytes[..len]).map_err(|_|Error::Invalid)?;
+        let prefix=content.get(..keep).ok_or(Error::Invalid)?;
+        self.replace_source_if_checksum(who,fs,name,expected,prefix)
+    }
+    /// Create a new durable file from one verified UTF-8 source selection.
+    /// New-file-only COW semantics prevent overwriting an existing project.
+    pub fn extract_source_if_checksum<D:BlockDevice>(&mut self,who:Identity,
+        fs:&mut HierVfs<D>,source:&str,target:&str,expected:u64,
+        from:usize,to:usize)->Result<usize,Error>{
+        self.check_fresh(who,fs)?;
+        if source==target{return Err(Error::Invalid);}
+        let (p,n)=self.child(source)?;
+        let (dst,dn)=self.child(target)?;
+        let mut bytes=[0u8;MAX_FILE_BYTES];
+        let len=fs.read(Self::str_path(&p,n),&mut bytes)?;
+        let content=core::str::from_utf8(&bytes[..len]).map_err(|_|Error::Invalid)?;
+        let segment=content.get(from..to).ok_or(Error::Invalid)?;
+        let hash=bytes[..len].iter().fold(0xcbf29ce484222325u64,
+            |h,b|(h^(*b as u64)).wrapping_mul(0x100000001b3));
+        if hash!=expected{return Err(Error::Stale);}
+        fs.create(Self::str_path(&dst,dn),segment.as_bytes())?;
+        self.generation=fs.generation();Ok(segment.len())
+    }
+}
+
+#[cfg(test)]
+mod r080_revision_slice_tests{
+    use super::*;
+    use crate::block::{BlockError,SECTOR_BYTES};
+    struct Disk{sectors:[[u8;SECTOR_BYTES];100]}
+    impl BlockDevice for Disk {
+        fn sector_count(&self)->u64{100}
+        fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+            *out=*self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?;Ok(())
+        }
+        fn write_sector(&mut self,lba:u64,data:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+            *self.sectors.get_mut(lba as usize).ok_or(BlockError::OutOfRange)?=*data;Ok(())
+        }
+    }
+    fn id()->Identity{Identity{pid:72,generation:1}}
+    fn setup()->(HierVfs<Disk>,ProjectTree){
+        let mut fs=HierVfs::format_blank(Disk{sectors:[[0;SECTOR_BYTES];100]}).unwrap();
+        let mut p=ProjectTree::new();p.create(id(),&mut fs,"demo").unwrap();
+        p.create_file(id(),&mut fs,"source","α first\nβ end".as_bytes()).unwrap();
+        (fs,p)
+    }
+    #[test]
+    fn read_append_trim_and_extract_unicode_with_real_disk_remount(){
+        let (mut fs,mut p)=setup();
+        let before=p.source_summary(id(),&mut fs,"source").unwrap().fnv64;
+        let mut buf=[0u8;64];
+        let n=p.read_source_if_checksum(id(),&mut fs,"source",before,&mut buf).unwrap();
+        assert_eq!(&buf[..n],"α first\nβ end".as_bytes());
+        p.append_source_if_checksum(id(),&mut fs,"source",before,"!").unwrap();
+        let hash=p.source_summary(id(),&mut fs,"source").unwrap().fnv64;
+        assert_eq!(p.extract_source_if_checksum(id(),&mut fs,"source",
+            "snippet",hash,0,"α first\n".len()),Ok("α first\n".len()));
+        p.truncate_source_if_checksum(id(),&mut fs,"source",hash,3).unwrap();
+        let mut fs=HierVfs::mount(fs.into_device()).unwrap();
+        let mut p=ProjectTree::new();p.open(id(),&mut fs,"demo").unwrap();
+        let mut out=[0u8;64];
+        assert_eq!(p.read_file(id(),&mut fs,"source",&mut out),Ok(3));
+        assert_eq!(&out[..3],"α ".as_bytes());
+        let m=p.read_file(id(),&mut fs,"snippet",&mut out).unwrap();
+        assert_eq!(&out[..m],"α first\n".as_bytes());
+    }
+    #[test]
+    fn stale_checksum_bad_utf8_bounds_and_short_output_are_fail_closed(){
+        let (mut fs,mut p)=setup();
+        let hash=p.source_summary(id(),&mut fs,"source").unwrap().fnv64;
+        let generation=fs.generation();
+        let mut tiny=[0x55u8;2];
+        assert_eq!(p.read_source_if_checksum(id(),&mut fs,"source",hash,&mut tiny),Err(Error::Full));
+        assert_eq!(tiny,[0x55;2]);
+        assert_eq!(p.truncate_source_if_checksum(id(),&mut fs,"source",hash,1),Err(Error::Invalid));
+        assert_eq!(p.extract_source_if_checksum(id(),&mut fs,"source",
+            "bad",hash,1,2),Err(Error::Invalid));
+        assert_eq!(p.append_source_if_checksum(id(),&mut fs,"source",hash^1,"no"),Err(Error::Stale));
+        assert_eq!(p.extract_source_if_checksum(Identity{generation:2,..id()},&mut fs,
+            "source","bad",hash,0,2),Err(Error::Unauthorized));
+        assert_eq!(fs.generation(),generation);
+    }
+}

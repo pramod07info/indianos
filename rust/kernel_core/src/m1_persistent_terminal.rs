@@ -19,7 +19,7 @@ pub const COMMAND_VERBS:&[&str]=&[
  "help","pwd","tools","ls","cat","page","write","append","mkdir","mv",
  "cp","rm","mkfile","truncate","head","count","rmdir","mvdir",
  "pread","pwrite","lines","line","hash","stat","tail","find","grep","cmp","diffat",
- "touch","copynew","copyrange","matchpage","textpage","idpage","caswrite","casappend","castruncate","casclone","wordpage","idcount","replace","appendln","health","hex","slice","concat","cmprange","bytefreq","patchhex","patchrange","copylines","wc","headlines","rfind","taillines","linespan","linehits","sourceview","sourcecontext","textprofile","blankrows","indentmap","eolcheck",
+ "touch","copynew","copyrange","matchpage","textpage","idpage","caswrite","casappend","castruncate","casclone","wordpage","idcount","casrm","casmv","linepage","textstats","replace","appendln","health","hex","slice","concat","cmprange","bytefreq","patchhex","patchrange","copylines","wc","headlines","rfind","taillines","linespan","linehits","sourceview","sourcecontext","textprofile","blankrows","indentmap","eolcheck",
 ];
 /// Complete exactly one printable lower-case verb prefix. Ambiguous matches,
 /// empty prefixes and user-supplied paths never cause completion or I/O.
@@ -205,8 +205,11 @@ pub fn command<D:BlockDevice,const N:usize>(
    let mut bytes=[0u8;MAX_TRANSFER];
    let n=fs.read_at(src,offset,&mut bytes[..count]).map_err(Error::Io)?;
    if n!=count{return Err(Error::Invalid);}
+   let mut response=[0u8;20];
+   let response_len=publish_number(n as u64,&mut response)?;
+   if out.len()<response_len{return Err(Error::OutputTooSmall);}
    fs.create(dst,&bytes[..n]).map_err(Error::Io)?;
-   publish_number(n as u64,out)
+   publish(&response[..response_len],out)
   }
   // R078-09: UTF-8 boundary-safe source byte windows (no split glyphs).
   "textpage"=>{
@@ -400,6 +403,94 @@ pub fn command<D:BlockDevice,const N:usize>(
     total+=1;
    }
    publish_number(total as u64,out)
+  }
+
+  // R080-09: delete an on-disk file only if its exact observed FNV fingerprint
+  // still matches. This is a conflict guard; FNV is NOT cryptographic.
+  "casrm"=>{
+   auth.require(caller,FILE_READ|FILE_WRITE,now).map_err(|_|Error::Denied)?;
+   let mut args=raw.split_ascii_whitespace();
+   let filename=args.next().ok_or(Error::Invalid)?;
+   let digest=args.next().ok_or(Error::Invalid)?;
+   if digest.len()!=16||args.next().is_some(){return Err(Error::Invalid);}
+   let expected=u64::from_str_radix(digest,16).map_err(|_|Error::Invalid)?;
+   let p=path(filename,&mut name)?;
+   writable_path(p)?;
+   if out.len()<7{return Err(Error::OutputTooSmall);}
+   let mut data=[0u8;crate::durablefs::MAX_FILE_BYTES];
+   let n=fs.read(p,&mut data).map_err(Error::Io)?;
+   let actual=data[..n].iter().fold(0xcbf29ce484222325u64,
+       |h,b|(h^(*b as u64)).wrapping_mul(0x100000001b3));
+   if actual!=expected{return Err(Error::Denied);}
+   fs.unlink(p).map_err(Error::Io)?;
+   publish(b"removed",out)
+  }
+  // R080-10: rename only a verified current file revision; cannot overwrite
+  // another object or write under protected OS/recovery namespaces.
+  "casmv"=>{
+   auth.require(caller,FILE_READ|FILE_WRITE,now).map_err(|_|Error::Denied)?;
+   let mut args=raw.split_ascii_whitespace();
+   let source=args.next().ok_or(Error::Invalid)?;
+   let target=args.next().ok_or(Error::Invalid)?;
+   let digest=args.next().ok_or(Error::Invalid)?;
+   if digest.len()!=16||args.next().is_some(){return Err(Error::Invalid);}
+   let expected=u64::from_str_radix(digest,16).map_err(|_|Error::Invalid)?;
+   let mut oldpath=[0u8;64];let mut newpath=[0u8;64];
+   let src=path(source,&mut oldpath)?;
+   let dst=path(target,&mut newpath)?;
+   if src==dst{return Err(Error::Invalid);}
+   writable_path(src)?;writable_path(dst)?;
+   if out.len()<5{return Err(Error::OutputTooSmall);}
+   let mut data=[0u8;crate::durablefs::MAX_FILE_BYTES];
+   let n=fs.read(src,&mut data).map_err(Error::Io)?;
+   let actual=data[..n].iter().fold(0xcbf29ce484222325u64,
+       |h,b|(h^(*b as u64)).wrapping_mul(0x100000001b3));
+   if actual!=expected{return Err(Error::Denied);}
+   fs.rename_file(src,dst).map_err(Error::Io)?;
+   publish(b"moved",out)
+  }
+  // R080-11: complete Unicode source rows by zero-based page cursor.
+  // Assemble the entire requested output before publishing any user bytes.
+  "linepage"=>{
+   auth.require(caller,FILE_READ,now).map_err(|_|Error::Denied)?;
+   let mut args=raw.split_ascii_whitespace();
+   let filename=args.next().ok_or(Error::Invalid)?;
+   let start=args.next().ok_or(Error::Invalid)?
+       .parse::<usize>().map_err(|_|Error::Invalid)?;
+   let count=args.next().ok_or(Error::Invalid)?
+       .parse::<usize>().map_err(|_|Error::Invalid)?;
+   if count==0||count>16||args.next().is_some(){return Err(Error::Invalid);}
+   let upper=start.checked_add(count).ok_or(Error::Invalid)?;
+   let p=path(filename,&mut name)?;
+   let mut data=[0u8;crate::durablefs::MAX_FILE_BYTES];
+   let n=fs.read(p,&mut data).map_err(Error::Io)?;
+   let source=core::str::from_utf8(&data[..n]).map_err(|_|Error::Invalid)?;
+   let total=if n==0{0}else{source.split_inclusive('\n').count()};
+   if start>total{return Err(Error::Invalid);}
+   let mut staged=[0u8;crate::durablefs::MAX_FILE_BYTES];
+   let mut used=0;
+   for (i,row) in source.split_inclusive('\n').enumerate(){
+    if i<start||i>=upper{continue;}
+    staged[used..used+row.len()].copy_from_slice(row.as_bytes());used+=row.len();
+   }
+   publish(&staged[..used],out)
+  }
+  // R080-12: read-only three-field UTF-8 statistics from actual disk bytes.
+  "textstats"=>{
+   auth.require(caller,FILE_READ,now).map_err(|_|Error::Denied)?;
+   let p=path(raw,&mut name)?;
+   let mut data=[0u8;crate::durablefs::MAX_FILE_BYTES];
+   let n=fs.read(p,&mut data).map_err(Error::Io)?;
+   let source=core::str::from_utf8(&data[..n]).map_err(|_|Error::Invalid)?;
+   let lines=if n==0{0}else{source.split_inclusive('\n').count()};
+   let scalars=source.chars().count();
+   let mut staged=[0u8;80];
+   let mut used=publish_number(n as u64,&mut staged)?;
+   staged[used]=b' ';used+=1;
+   used+=publish_number(lines as u64,&mut staged[used..])?;
+   staged[used]=b' ';used+=1;
+   used+=publish_number(scalars as u64,&mut staged[used..])?;
+   publish(&staged[..used],out)
   }
   "page"=>{
    auth.require(caller,FILE_READ,now).map_err(|_|Error::Denied)?;
@@ -1705,7 +1796,7 @@ mod tests{
  }
  #[test]fn r044_command_registry_drives_unique_safe_completion(){
   // R078: four new developer commands after the R077 total of 56.
-  assert_eq!(COMMAND_VERBS.len(),64);
+  assert_eq!(COMMAND_VERBS.len(),68);
   for (i,verb) in COMMAND_VERBS.iter().enumerate(){
    assert!(verb.as_bytes().iter().all(|b|b.is_ascii_lowercase()));
    assert!(!COMMAND_VERBS[..i].contains(verb));
@@ -3742,5 +3833,69 @@ mod r079_terminal_revision_tests{
             Err(Error::OutputTooSmall));
         assert_eq!(fs.generation(),before);
         assert_eq!(out,[0xab]);
+    }
+}
+
+
+#[cfg(test)]
+mod r080_terminal_source_transaction_tests {
+    use super::*;
+    use crate::block::{BlockError,SECTOR_BYTES};
+    struct Disk{sectors:[[u8;SECTOR_BYTES];100]}
+    impl BlockDevice for Disk{
+        fn sector_count(&self)->u64{100}
+        fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+            *out=*self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?;Ok(())
+        }
+        fn write_sector(&mut self,lba:u64,data:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+            *self.sectors.get_mut(lba as usize).ok_or(BlockError::OutOfRange)?=*data;Ok(())
+        }
+    }
+    fn id()->Identity{Identity{pid:73,generation:1}}
+    fn setup()->(HierVfs<Disk>,Access<2>){
+        let mut fs=HierVfs::format_blank(Disk{sectors:[[0;SECTOR_BYTES];100]}).unwrap();
+        fs.create("/source","α hi\nβ bye\n".as_bytes()).unwrap();
+        let mut access=Access::new();
+        access.grant(id(),FILE_READ|FILE_WRITE,10).unwrap();
+        (fs,access)
+    }
+    #[test]
+    fn row_paging_stats_optimistic_move_and_remove_survive_real_reboot(){
+        let (mut fs,auth)=setup();
+        let mut out=[0u8;64];
+        let input=b"linepage /source 1 1";
+        let n=command(&mut fs,&auth,id(),1,input,&mut out).unwrap();
+        assert_eq!(&out[..n],"β bye\n".as_bytes());
+        let n=command(&mut fs,&auth,id(),1,b"textstats /source",&mut out).unwrap();
+        assert_eq!(&out[..n],b"13 2 11");
+        let digest="α hi\nβ bye\n".as_bytes().iter().fold(0xcbf29ce484222325u64,
+            |h,b|(h^(*b as u64)).wrapping_mul(0x100000001b3));
+        let mv=format!("casmv /source /renamed {:016x}",digest);
+        assert_eq!(command(&mut fs,&auth,id(),1,mv.as_bytes(),&mut out),Ok(5));
+        let mut mounted=HierVfs::mount(fs.into_device()).unwrap();
+        assert_eq!(mounted.read("/source",&mut out),Err(FsError::NotFound));
+        assert_eq!(mounted.read("/renamed",&mut out),Ok(13));
+        let rm=format!("casrm /renamed {:016x}",digest);
+        assert_eq!(command(&mut mounted,&auth,id(),1,rm.as_bytes(),&mut out),Ok(7));
+        let mut mounted=HierVfs::mount(mounted.into_device()).unwrap();
+        assert_eq!(mounted.read("/renamed",&mut out),Err(FsError::NotFound));
+    }
+    #[test]
+    fn wrong_digest_expired_grant_short_output_and_copyrange_preflight_are_atomic(){
+        let (mut fs,auth)=setup();
+        let before=fs.generation();
+        let mut tiny=[0xabu8;1];
+        assert_eq!(command(&mut fs,&auth,id(),1,b"casrm /source 0000000000000000",&mut tiny),
+            Err(Error::OutputTooSmall));
+        let mut output=[0x77u8;20];
+        assert_eq!(command(&mut fs,&auth,id(),1,
+            b"casmv /source /other 0000000000000000",&mut output),Err(Error::Denied));
+        assert_eq!(command(&mut fs,&auth,id(),11,b"textstats /source",&mut output),
+            Err(Error::Denied));
+        assert_eq!(command(&mut fs,&auth,id(),1,
+            b"copyrange /source /slice 0 10",&mut tiny),Err(Error::OutputTooSmall));
+        assert_eq!(tiny,[0xab]);
+        assert_eq!(fs.generation(),before);
+        assert_eq!(fs.read("/slice",&mut output),Err(FsError::NotFound));
     }
 }
