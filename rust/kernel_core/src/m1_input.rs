@@ -2212,3 +2212,107 @@ mod r079_caret_source_transforms{
         assert_eq!(line.length(),MAX_LINE);
     }
 }
+
+
+// R080 workstream D: complete live command-argument manipulation using one
+// bounded authenticated draft. Neither navigation nor editing executes it.
+impl InputLine {
+    /// The nth 0-based space-delimited argument; respects mixed-case paths.
+    fn argument_bounds(&self,which:usize)->Result<(usize,usize),Error>{
+        let bytes=self.editor.bytes();
+        let mut at=0usize;let mut ordinal=0usize;
+        while at<bytes.len(){
+            while at<bytes.len()&&bytes[at]==b' '{at+=1;}
+            if at==bytes.len(){break;}
+            let begin=at;
+            while at<bytes.len()&&bytes[at]!=b' '{at+=1;}
+            if ordinal==which{return Ok((begin,at));}
+            ordinal+=1;
+        }
+        Err(Error::Invalid)
+    }
+    /// Copy a token into the session-private clipboard only after successful
+    /// range checks; an invalid ordinal never changes clipboard content.
+    pub fn copy_argument(&mut self,which:usize)->Result<usize,Error>{
+        let (from,to)=self.argument_bounds(which)?;
+        self.copy_range(from,to)
+    }
+    /// Cut a token (with its adjacent spacing) using the existing
+    /// delete_argument implementation, retaining the token in clipboard.
+    pub fn cut_argument(&mut self,which:usize)->Result<usize,Error>{
+        let (from,to)=self.argument_bounds(which)?;
+        let len=to-from;
+        let mut staged=[0u8;MAX_LINE];
+        staged[..len].copy_from_slice(&self.editor.bytes()[from..to]);
+        self.delete_argument(which)?;
+        self.clipboard.fill(0);
+        self.clipboard[..len].copy_from_slice(&staged[..len]);
+        self.clipboard_len=len;
+        Ok(len)
+    }
+    /// Surround one token with validated printable caller delimiters.
+    /// The existing editor checks output capacity before any replacement.
+    pub fn wrap_argument(&mut self,which:usize,left:&[u8],right:&[u8])
+        ->Result<Event,Error>{
+        let (from,to)=self.argument_bounds(which)?;
+        if left.iter().chain(right.iter()).any(|b|!(b' '..=b'~').contains(b)){
+            return Err(Error::Invalid);
+        }
+        let total=left.len().checked_add(to-from)
+            .and_then(|n|n.checked_add(right.len())).ok_or(Error::Full)?;
+        if total>MAX_LINE{return Err(Error::Full);}
+        let mut staged=[0u8;MAX_LINE];
+        staged[..left.len()].copy_from_slice(left);
+        staged[left.len()..left.len()+to-from]
+            .copy_from_slice(&self.editor.bytes()[from..to]);
+        staged[left.len()+to-from..total].copy_from_slice(right);
+        self.replace_range(from,to,&staged[..total])
+    }
+    /// Swap adjacent arguments, retaining exactly the original separators,
+    /// with one atomic edit (and without touching command history).
+    pub fn swap_next_argument(&mut self,which:usize)->Result<Event,Error>{
+        let (a,b)=self.argument_bounds(which)?;
+        let (c,d)=self.argument_bounds(which.checked_add(1).ok_or(Error::Invalid)?)?;
+        if c<b{return Err(Error::Invalid);}
+        let mut staged=[0u8;MAX_LINE];
+        let mut used=0usize;
+        for segment in [&self.editor.bytes()[c..d],
+            &self.editor.bytes()[b..c],&self.editor.bytes()[a..b]]{
+            staged[used..used+segment.len()].copy_from_slice(segment);
+            used+=segment.len();
+        }
+        self.replace_range(a,d,&staged[..used])
+    }
+}
+#[cfg(test)]
+mod r080_input_argument_tests{
+    use super::*;
+    #[test]
+    fn copy_cut_wrap_and_swap_are_real_unsent_draft_edits(){
+        let mut input=InputLine::new();
+        input.set_line(b"git  alpha  beta").unwrap();
+        assert_eq!(input.copy_argument(1),Ok(5));
+        assert_eq!(input.clipboard_bytes(),b"alpha");
+        assert_eq!(input.swap_next_argument(1),Ok(Event::Typed));
+        assert_eq!(input.bytes(),b"git  beta  alpha");
+        assert_eq!(input.wrap_argument(1,b"(",b")"),Ok(Event::Typed));
+        assert_eq!(input.bytes(),b"git  (beta)  alpha");
+        assert_eq!(input.cut_argument(2),Ok(5));
+        assert_eq!(input.bytes(),b"git  (beta)");
+        assert_eq!(input.clipboard_bytes(),b"alpha");
+        assert_eq!(input.history_count(),0);
+    }
+    #[test]
+    fn malformed_tokens_bad_delimiters_and_capacity_are_atomic(){
+        let mut input=InputLine::new();
+        input.set_line(b"run alpha").unwrap();
+        input.copy_argument(1).unwrap();
+        assert_eq!(input.copy_argument(6),Err(Error::Invalid));
+        assert_eq!(input.cut_argument(6),Err(Error::Invalid));
+        assert_eq!(input.swap_next_argument(1),Err(Error::Invalid));
+        assert_eq!(input.wrap_argument(1,b"\n",b")"),Err(Error::Invalid));
+        assert_eq!(input.wrap_argument(1,&[b'(';MAX_LINE],b")"),Err(Error::Full));
+        assert_eq!(input.bytes(),b"run alpha");
+        assert_eq!(input.clipboard_bytes(),b"alpha");
+    }
+}

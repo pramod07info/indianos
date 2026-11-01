@@ -2986,3 +2986,103 @@ mod r079_desktop_source_review_tests{
         assert_eq!(&output[..4],b"safe");
     }
 }
+
+
+// R080 workstream E: authenticated multi-document reconciliation. These
+// routes do not bypass process-generation checks or the mounted COW VFS.
+impl<D:BlockDevice,const P:usize,const E:usize,const W:usize,
+ const K:usize,const G:usize,const Q:usize> Desktop<D,P,E,W,K,G,Q>{
+    pub fn editor_pool_compare_text(&self,caller:Identity,now:u64,
+        pool:&crate::m1_disk_editor::EditorPool,left:usize,right:usize)
+        ->Result<Option<usize>,EditorRouteError>{
+        self.admit_editor(caller,now,FILE_READ)?;
+        pool.compare_open_text(caller,left,right).map_err(EditorRouteError::Editor)
+    }
+    pub fn editor_pool_transfer_selection(&mut self,caller:Identity,now:u64,
+        pool:&mut crate::m1_disk_editor::EditorPool,
+        from_slot:usize,from:usize,to:usize,
+        to_slot:usize,dest_from:usize,dest_to:usize)->Result<usize,EditorRouteError>{
+        self.admit_editor(caller,now,FILE_READ|FILE_WRITE)?;
+        pool.transfer_selection(caller,from_slot,from,to,to_slot,dest_from,dest_to)
+            .map_err(EditorRouteError::Editor)
+    }
+    pub fn editor_pool_reload_slot(&mut self,caller:Identity,now:u64,
+        pool:&mut crate::m1_disk_editor::EditorPool,slot:usize,discard:bool)
+        ->Result<crate::m1_disk_editor::Status,EditorRouteError>{
+        self.admit_editor(caller,now,FILE_READ|FILE_WRITE)?;
+        pool.reload_slot(caller,&mut self.volume,slot,discard)
+            .map_err(EditorRouteError::Editor)
+    }
+    pub fn editor_pool_close_all(&mut self,caller:Identity,now:u64,
+        pool:&mut crate::m1_disk_editor::EditorPool,discard:bool)
+        ->Result<usize,EditorRouteError>{
+        self.admit_editor(caller,now,FILE_WRITE)?;
+        pool.close_all(caller,discard).map_err(EditorRouteError::Editor)
+    }
+}
+#[cfg(test)]
+mod r080_desktop_reconciliation_tests {
+    use super::*;
+    use crate::block::{BlockError,SECTOR_BYTES};
+    use crate::batch2_launcher::Image;
+    use crate::batch2_settings::{Settings,Theme};
+    use crate::m1_disk_editor::EditorPool;
+    struct Disk{sectors:[[u8;SECTOR_BYTES];100]}
+    impl BlockDevice for Disk{
+        fn sector_count(&self)->u64{100}
+        fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+            *out=*self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?;Ok(())
+        }
+        fn write_sector(&mut self,lba:u64,data:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+            *self.sectors.get_mut(lba as usize).ok_or(BlockError::OutOfRange)?=*data;Ok(())
+        }
+    }
+    type Desk=Desktop<Disk,3,3,2,2,3,8>;
+    fn id(pid:u32)->Identity{Identity{pid,generation:1}}
+    fn launch(pid:u32)->Launch{
+        Launch{pid,generation:1,image:Image{
+            image_id:pid,entry:0x1000,mapped_end:0x2000,verified:true
+        }}
+    }
+    fn setup()->Desk{
+        let mut fs=HierVfs::format_blank(Disk{sectors:[[0;SECTOR_BYTES];100]}).unwrap();
+        fs.create("/src","α hello".as_bytes()).unwrap();
+        fs.create("/notes",b"notes").unwrap();
+        let mut d=Desk::from_mounted(fs);
+        d.start(id(1),launch(1),id(2),launch(2),
+            Settings{theme:Theme::Dark,pointer_speed:5,key_repeat:10},8,5).unwrap();
+        d
+    }
+    #[test]
+    fn authorized_compare_transfer_save_reload_and_close_persist_after_reboot(){
+        let mut d=setup();let mut pool=EditorPool::new();
+        d.editor_pool_open(id(2),1,&mut pool,0,"/src").unwrap();
+        d.editor_pool_open(id(2),1,&mut pool,1,"/notes").unwrap();
+        assert_eq!(d.editor_pool_compare_text(id(2),1,&pool,0,1),Ok(Some(0)));
+        assert_eq!(d.editor_pool_transfer_selection(
+            id(2),1,&mut pool,0,0,2,1,5,5),Ok(7));
+        d.editor_pool_save_all(id(2),1,&mut pool).unwrap();
+        assert_eq!(d.editor_pool_reload_slot(id(2),1,&mut pool,1,false)
+            .unwrap().bytes,7);
+        assert_eq!(d.editor_pool_close_all(id(2),1,&mut pool,false),Ok(2));
+        let mut fs=HierVfs::mount(d.into_device()).unwrap();
+        let mut bytes=[0u8;20];
+        assert_eq!(fs.read("/notes",&mut bytes),Ok(7));
+        assert_eq!(&bytes[..7],"notesα".as_bytes());
+    }
+    #[test]
+    fn expired_rights_stale_pid_and_dirty_close_refuse_partial_changes(){
+        let mut d=setup();let mut pool=EditorPool::new();
+        d.editor_pool_open(id(2),1,&mut pool,0,"/src").unwrap();
+        d.editor_pool_open(id(2),1,&mut pool,1,"/notes").unwrap();
+        assert!(d.editor_pool_compare_text(id(2),6,&pool,0,1).is_err());
+        assert!(d.editor_pool_transfer_selection(id(2),6,&mut pool,0,0,2,1,0,0).is_err());
+        assert!(d.editor_pool_reload_slot(id(2),6,&mut pool,0,true).is_err());
+        assert!(d.editor_pool_close_all(Identity{generation:2,..id(2)},
+            1,&mut pool,true).is_err());
+        pool.replace_text(id(2),1,0,0,"!").unwrap();
+        assert!(d.editor_pool_close_all(id(2),1,&mut pool,false).is_err());
+        assert_eq!(pool.status(id(2),0).unwrap().bytes,"α hello".len());
+        assert_eq!(pool.status(id(2),1).unwrap().bytes,6);
+    }
+}
