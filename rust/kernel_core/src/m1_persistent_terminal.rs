@@ -19,7 +19,7 @@ pub const COMMAND_VERBS:&[&str]=&[
  "help","pwd","tools","ls","cat","page","write","append","mkdir","mv",
  "cp","rm","mkfile","truncate","head","count","rmdir","mvdir",
  "pread","pwrite","lines","line","hash","stat","tail","find","grep","cmp","diffat",
- "touch","copynew","replace","appendln","health","hex","slice","concat","cmprange","bytefreq","patchhex","patchrange","copylines","wc","headlines","rfind","taillines","linespan","linehits","sourceview","sourcecontext","textprofile","blankrows","indentmap","eolcheck",
+ "touch","copynew","copyrange","matchpage","replace","appendln","health","hex","slice","concat","cmprange","bytefreq","patchhex","patchrange","copylines","wc","headlines","rfind","taillines","linespan","linehits","sourceview","sourcecontext","textprofile","blankrows","indentmap","eolcheck",
 ];
 /// Complete exactly one printable lower-case verb prefix. Ambiguous matches,
 /// empty prefixes and user-supplied paths never cause completion or I/O.
@@ -151,6 +151,63 @@ pub fn command<D:BlockDevice,const N:usize>(
   // capacity validation fails. A final newline adds no phantom row.
 
   // Bounded real-file output page; caller may resume at offset+bytes read.
+  // R077: resumable literal match offsets for real UTF-8 source files.
+  // Offset pages are staged before publication; no out-of-bounds scans.
+  "matchpage"=>{
+   auth.require(caller,FILE_READ,now).map_err(|_|Error::Denied)?;
+   let mut args=raw.split_ascii_whitespace();
+   let source=args.next().ok_or(Error::Invalid)?;
+   let needle=args.next().ok_or(Error::Invalid)?;
+   let start=args.next().ok_or(Error::Invalid)?
+       .parse::<usize>().map_err(|_|Error::Invalid)?;
+   let limit=args.next().ok_or(Error::Invalid)?
+       .parse::<usize>().map_err(|_|Error::Invalid)?;
+   if needle.is_empty()||limit==0||limit>16||args.next().is_some(){
+    return Err(Error::Invalid);
+   }
+   let end=start.checked_add(limit).ok_or(Error::Invalid)?;
+   let p=path(source,&mut name)?;
+   let mut bytes=[0u8;crate::durablefs::MAX_FILE_BYTES];
+   let n=fs.read(p,&mut bytes).map_err(Error::Io)?;
+   let text=core::str::from_utf8(&bytes[..n]).map_err(|_|Error::Invalid)?;
+   let mut staged=[0u8;MAX_TRANSFER];
+   let mut used=0usize;let mut total=0usize;
+   for (at,_) in text.match_indices(needle){
+    if total>=start&&total<end{
+     used+=publish_number(at as u64,&mut staged[used..])?;
+     staged[used]=b'\n';used+=1;
+    }
+    total+=1;
+   }
+   if start>total{return Err(Error::Invalid);}
+   publish(&staged[..used],out)
+  }
+  // R077: create an immutable, checksum-protected slice of a source file.
+  // The target is new-only; protected paths and missing grants fail closed.
+  "copyrange"=>{
+   auth.require(caller,FILE_READ,now).map_err(|_|Error::Denied)?;
+   auth.require(caller,FILE_WRITE,now).map_err(|_|Error::Denied)?;
+   let mut args=raw.split_ascii_whitespace();
+   let source=args.next().ok_or(Error::Invalid)?;
+   let target=args.next().ok_or(Error::Invalid)?;
+   let offset=args.next().ok_or(Error::Invalid)?
+       .parse::<u64>().map_err(|_|Error::Invalid)?;
+   let count=args.next().ok_or(Error::Invalid)?
+       .parse::<usize>().map_err(|_|Error::Invalid)?;
+   if count==0||count>MAX_TRANSFER||args.next().is_some(){
+    return Err(Error::Invalid);
+   }
+   let mut source_buffer=[0u8;64];let mut target_buffer=[0u8;64];
+   let src=path(source,&mut source_buffer)?;
+   let dst=path(target,&mut target_buffer)?;
+   if src==dst{return Err(Error::Invalid);}
+   writable_path(dst)?;
+   let mut bytes=[0u8;MAX_TRANSFER];
+   let n=fs.read_at(src,offset,&mut bytes[..count]).map_err(Error::Io)?;
+   if n!=count{return Err(Error::Invalid);}
+   fs.create(dst,&bytes[..n]).map_err(Error::Io)?;
+   publish_number(n as u64,out)
+  }
   "page"=>{
    auth.require(caller,FILE_READ,now).map_err(|_|Error::Denied)?;
    let mut args=raw.split_ascii_whitespace();
@@ -1454,8 +1511,8 @@ mod tests{
   assert_eq!(complete_verb(b"heal"),Some("health"));
  }
  #[test]fn r044_command_registry_drives_unique_safe_completion(){
-  // R075 expanded: 3 more native workstation file inspection commands.
-  assert_eq!(COMMAND_VERBS.len(),54);
+  // R077 adds matchpage and copyrange to the existing 54 native commands.
+  assert_eq!(COMMAND_VERBS.len(),56);
   for (i,verb) in COMMAND_VERBS.iter().enumerate(){
    assert!(verb.as_bytes().iter().all(|b|b.is_ascii_lowercase()));
    assert!(!COMMAND_VERBS[..i].contains(verb));
@@ -3291,4 +3348,64 @@ mod r076_terminal_page_tests{
   assert_eq!(command(&mut fs,&auth,id(),1,b"page /note 8 2",&mut out),Ok(2));
   assert_eq!(&out[..2],b"ij");
  }
+}
+
+
+#[cfg(test)]
+mod r077_terminal_range_and_search_tests {
+    use super::*;
+    use crate::block::{BlockError, SECTOR_BYTES};
+    struct Disk { sectors: [[u8; SECTOR_BYTES]; 100] }
+    impl BlockDevice for Disk {
+        fn sector_count(&self) -> u64 { 100 }
+        fn read_sector(&mut self, lba: u64, out: &mut [u8; SECTOR_BYTES])
+            -> Result<(), BlockError> {
+            *out = *self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?;
+            Ok(())
+        }
+        fn write_sector(&mut self, lba: u64, bytes: &[u8; SECTOR_BYTES])
+            -> Result<(), BlockError> {
+            *self.sectors.get_mut(lba as usize).ok_or(BlockError::OutOfRange)? = *bytes;
+            Ok(())
+        }
+    }
+    fn id() -> Identity { Identity { pid: 32, generation: 5 } }
+    fn ready() -> (HierVfs<Disk>, Access<2>) {
+        let mut fs = HierVfs::format_blank(Disk { sectors: [[0; SECTOR_BYTES]; 100] }).unwrap();
+        fs.create("/src", "α foo foo\nfoo".as_bytes()).unwrap();
+        let mut access = Access::new();
+        access.grant(id(), FILE_READ | FILE_WRITE, 10).unwrap();
+        (fs, access)
+    }
+    #[test]
+    fn paged_occurrences_and_range_clone_survive_real_remount() {
+        let (mut fs, access) = ready();
+        let mut out = [0u8; 24];
+        let n = command(&mut fs, &access, id(), 1,
+            b"matchpage /src foo 1 2", &mut out).unwrap();
+        assert_eq!(&out[..n], b"7\n11\n");
+        assert_eq!(command(&mut fs, &access, id(), 1,
+            b"copyrange /src /excerpt 3 7", &mut out), Ok(1));
+        assert_eq!(out[0], b'7');
+        let mut mounted = HierVfs::mount(fs.into_device()).unwrap();
+        let mut data = [0u8; 16];
+        assert_eq!(mounted.read("/excerpt", &mut data), Ok(7));
+        assert_eq!(&data[..7], b"foo foo");
+    }
+    #[test]
+    fn protected_targets_short_output_and_expired_grants_are_rejected() {
+        let (mut fs, access) = ready();
+        let generation = fs.generation();
+        let mut out = [0xabu8; 2];
+        assert_eq!(command(&mut fs, &access, id(), 1,
+            b"matchpage /src foo 0 3", &mut out), Err(Error::OutputTooSmall));
+        assert_eq!(out, [0xab; 2]);
+        assert_eq!(command(&mut fs, &access, id(), 1,
+            b"copyrange /src /system/protected 0 3", &mut out), Err(Error::Denied));
+        assert_eq!(command(&mut fs, &access, id(), 11,
+            b"copyrange /src /new 0 3", &mut out), Err(Error::Denied));
+        assert_eq!(command(&mut fs, &access, id(), 1,
+            b"copyrange /src /new 0 999", &mut out), Err(Error::Invalid));
+        assert_eq!(fs.generation(), generation);
+    }
 }
