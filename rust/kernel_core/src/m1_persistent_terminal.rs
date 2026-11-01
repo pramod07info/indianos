@@ -19,7 +19,7 @@ pub const COMMAND_VERBS:&[&str]=&[
  "help","pwd","tools","ls","cat","page","write","append","mkdir","mv",
  "cp","rm","mkfile","truncate","head","count","rmdir","mvdir",
  "pread","pwrite","lines","line","hash","stat","tail","find","grep","cmp","diffat",
- "touch","copynew","copyrange","matchpage","textpage","idpage","caswrite","casappend","castruncate","casclone","wordpage","idcount","casrm","casmv","linepage","textstats","castext","casinsert","caserase","unicodehead","unicodetail","textverify","replace","appendln","health","hex","slice","concat","cmprange","bytefreq","patchhex","patchrange","copylines","wc","headlines","rfind","taillines","linespan","linehits","sourceview","sourcecontext","textprofile","blankrows","indentmap","eolcheck",
+ "touch","copynew","copyrange","matchpage","textpage","idpage","caswrite","casappend","castruncate","casclone","wordpage","idcount","casrm","casmv","linepage","textstats","castext","casinsert","caserase","unicodehead","unicodetail","textverify","casprepend","casstrip","casupper","caslower","casnewline","unicodepage","tabpositions","crpositions","leadingspaces","sourceprefix","replace","appendln","health","hex","slice","concat","cmprange","bytefreq","patchhex","patchrange","copylines","wc","headlines","rfind","taillines","linespan","linehits","sourceview","sourcecontext","textprofile","blankrows","indentmap","eolcheck",
 ];
 /// Complete exactly one printable lower-case verb prefix. Ambiguous matches,
 /// empty prefixes and user-supplied paths never cause completion or I/O.
@@ -114,7 +114,7 @@ pub fn command<D:BlockDevice,const N:usize>(
  }
  let (verb,arguments)=entered.split_once(' ').ok_or(Error::Unknown)?;
  let raw=if matches!(verb,"write"|"append"|"appendln"|"pwrite"|
-    "replace"|"find"|"grep"|"caswrite"|"casappend"|"castext"|"casinsert"){
+    "replace"|"find"|"grep"|"caswrite"|"casappend"|"castext"|"casinsert"|"casprepend"){
   arguments
  }else{arguments.trim_end()};
  let mut name=[0u8;64];
@@ -555,6 +555,127 @@ pub fn command<D:BlockDevice,const N:usize>(
    let mut data=[0u8;crate::durablefs::MAX_FILE_BYTES];
    let len=fs.read(p,&mut data).map_err(Error::Io)?;
    publish(if core::str::from_utf8(&data[..len]).is_ok(){b"utf8".as_slice()}else{b"binary".as_slice()},out)
+  }
+
+  // M1/R082/21-25: five real COW source transforms with optimistic
+  // whole-file FNV conflicts, policy-guarded paths and output preflight.
+  "casprepend"|"casstrip"|"casupper"|"caslower"|"casnewline"=>{
+   auth.require(caller,FILE_READ|FILE_WRITE,now).map_err(|_|Error::Denied)?;
+   let (filename,remaining)=raw.split_once(' ').ok_or(Error::Invalid)?;
+   let (digest,added)=match remaining.split_once(' '){
+    Some((d,tail))=>(d,tail),
+    None=>(remaining,"")
+   };
+   if digest.len()!=16{return Err(Error::Invalid);}
+   let expected=u64::from_str_radix(digest,16).map_err(|_|Error::Invalid)?;
+   if verb=="casprepend"&&added.is_empty(){return Err(Error::Invalid);}
+   if verb!="casprepend"&&!added.is_empty(){return Err(Error::Invalid);}
+   let p=path(filename,&mut name)?;writable_path(p)?;
+   let mut old=[0u8;crate::durablefs::MAX_FILE_BYTES];
+   let len=fs.read(p,&mut old).map_err(Error::Io)?;
+   core::str::from_utf8(&old[..len]).map_err(|_|Error::Invalid)?;
+   let hash=old[..len].iter().fold(0xcbf29ce484222325u64,
+     |h,b|(h^(*b as u64)).wrapping_mul(0x100000001b3));
+   if hash!=expected{return Err(Error::Denied);}
+   let mut staged=[0u8;crate::durablefs::MAX_FILE_BYTES];
+   let mut used=len;staged[..len].copy_from_slice(&old[..len]);
+   match verb{
+    "casprepend"=>{
+      used=len.checked_add(added.len()).ok_or(Error::Invalid)?;
+      if used>staged.len(){return Err(Error::Invalid);}
+      staged[..added.len()].copy_from_slice(added.as_bytes());
+      staged[added.len()..used].copy_from_slice(&old[..len]);
+    }
+    "casstrip"=>{
+      while used>0&&staged[used-1].is_ascii_whitespace(){used-=1;}
+    }
+    "casupper"=>{
+      for x in &mut staged[..used]{*x=x.to_ascii_uppercase();}
+    }
+    "caslower"=>{
+      for x in &mut staged[..used]{*x=x.to_ascii_lowercase();}
+    }
+    _=>{
+      if used==0||staged[used-1]!=b'\n'{
+       if used==staged.len(){return Err(Error::Invalid);}
+       staged[used]=b'\n';used+=1;
+      }
+    }
+   }
+   let mut response=[0u8;20];
+   let count=publish_number(used as u64,&mut response)?;
+   if out.len()<count{return Err(Error::OutputTooSmall);}
+   if used!=len||staged[..used]!=old[..len]{
+    fs.overwrite(p,&staged[..used]).map_err(Error::Io)?;
+   }
+   publish(&response[..count],out)
+  }
+  // M1/R082/26: Unicode scalar page, preserving valid UTF-8 boundaries.
+  "unicodepage"=>{
+   auth.require(caller,FILE_READ,now).map_err(|_|Error::Denied)?;
+   let mut args=raw.split_ascii_whitespace();
+   let filename=args.next().ok_or(Error::Invalid)?;
+   let from=args.next().ok_or(Error::Invalid)?.parse::<usize>().map_err(|_|Error::Invalid)?;
+   let count=args.next().ok_or(Error::Invalid)?.parse::<usize>().map_err(|_|Error::Invalid)?;
+   if count==0||count>crate::durablefs::MAX_FILE_BYTES||args.next().is_some(){
+     return Err(Error::Invalid);
+   }
+   let p=path(filename,&mut name)?;
+   let mut old=[0u8;crate::durablefs::MAX_FILE_BYTES];
+   let len=fs.read(p,&mut old).map_err(Error::Io)?;
+   let text=core::str::from_utf8(&old[..len]).map_err(|_|Error::Invalid)?;
+   let total=text.chars().count();
+   if from>total{return Err(Error::Invalid);}
+   let begin=text.char_indices().nth(from).map_or(len,|(i,_)|i);
+   let limit=from.saturating_add(count).min(total);
+   let finish=text.char_indices().nth(limit).map_or(len,|(i,_)|i);
+   publish(&old[begin..finish],out)
+  }
+  // M1/R082/27-28: diagnostic byte-position pages for tab and CR.
+  "tabpositions"|"crpositions"=>{
+   auth.require(caller,FILE_READ,now).map_err(|_|Error::Denied)?;
+   let p=path(raw,&mut name)?;
+   let mut old=[0u8;crate::durablefs::MAX_FILE_BYTES];
+   let len=fs.read(p,&mut old).map_err(Error::Io)?;
+   core::str::from_utf8(&old[..len]).map_err(|_|Error::Invalid)?;
+   let needle=if verb=="tabpositions"{b'\t'}else{b'\r'};
+   let mut staged=[0u8;crate::durablefs::MAX_FILE_BYTES];
+   let mut used=0usize;
+   for (at,&b) in old[..len].iter().enumerate(){
+    if b!=needle{continue;}
+    used+=publish_number(at as u64,&mut staged[used..])?;
+    if used==staged.len(){return Err(Error::OutputTooSmall);}
+    staged[used]=b'\n';used+=1;
+   }
+   publish(&staged[..used],out)
+  }
+  // M1/R082/29: source leading ASCII-space diagnostics, one decimal per row.
+  "leadingspaces"=>{
+   auth.require(caller,FILE_READ,now).map_err(|_|Error::Denied)?;
+   let p=path(raw,&mut name)?;
+   let mut old=[0u8;crate::durablefs::MAX_FILE_BYTES];
+   let len=fs.read(p,&mut old).map_err(Error::Io)?;
+   let text=core::str::from_utf8(&old[..len]).map_err(|_|Error::Invalid)?;
+   let mut staged=[0u8;crate::durablefs::MAX_FILE_BYTES];
+   let mut used=0;
+   for row in text.split_inclusive('\n'){
+    used+=publish_number(row.bytes().take_while(|b|*b==b' ').count() as u64,
+      &mut staged[used..])?;
+    if used==staged.len(){return Err(Error::OutputTooSmall);}
+    staged[used]=b'\n';used+=1;
+   }
+   publish(&staged[..used],out)
+  }
+  // M1/R082/30: prefix test of whole verified UTF-8 disk text.
+  "sourceprefix"=>{
+   auth.require(caller,FILE_READ,now).map_err(|_|Error::Denied)?;
+   let (filename,needle)=raw.split_once(' ').ok_or(Error::Invalid)?;
+   if needle.is_empty(){return Err(Error::Invalid);}
+   let p=path(filename,&mut name)?;
+   let mut old=[0u8;crate::durablefs::MAX_FILE_BYTES];
+   let len=fs.read(p,&mut old).map_err(Error::Io)?;
+   let text=core::str::from_utf8(&old[..len]).map_err(|_|Error::Invalid)?;
+   publish(if text.starts_with(needle){b"yes"}else{b"no"},out)
   }
   "page"=>{
    auth.require(caller,FILE_READ,now).map_err(|_|Error::Denied)?;
@@ -1860,7 +1981,7 @@ mod tests{
  }
  #[test]fn r044_command_registry_drives_unique_safe_completion(){
   // R078: four new developer commands after the R077 total of 56.
-  assert_eq!(COMMAND_VERBS.len(),74);
+  assert_eq!(COMMAND_VERBS.len(),84);
   for (i,verb) in COMMAND_VERBS.iter().enumerate(){
    assert!(verb.as_bytes().iter().all(|b|b.is_ascii_lowercase()));
    assert!(!COMMAND_VERBS[..i].contains(verb));
@@ -4064,5 +4185,90 @@ mod r081_terminal_utf8_cas_tests{
             Err(Error::Denied));
         assert_eq!(out,[0xa5]);
         assert_eq!(fs.generation(),before);
+    }
+}
+
+
+#[cfg(test)]
+mod r082_terminal_unicode_ops_tests {
+    use super::*;
+    use crate::block::{BlockError,SECTOR_BYTES};
+    struct Disk{sectors:[[u8;SECTOR_BYTES];100]}
+    impl BlockDevice for Disk{
+        fn sector_count(&self)->u64{100}
+        fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+            *out=*self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?;Ok(())
+        }
+        fn write_sector(&mut self,lba:u64,bytes:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+            *self.sectors.get_mut(lba as usize).ok_or(BlockError::OutOfRange)?=*bytes;Ok(())
+        }
+    }
+    fn who()->Identity{Identity{pid:93,generation:1}}
+    fn setup()->(HierVfs<Disk>,Access<2>){
+        let mut fs=HierVfs::format_blank(Disk{sectors:[[0;SECTOR_BYTES];100]}).unwrap();
+        fs.create("/main","α hi\n".as_bytes()).unwrap();
+        fs.create("/tabs",b"  A\tB\r\n").unwrap();
+        let mut rights=Access::new();
+        rights.grant(who(),FILE_READ|FILE_WRITE,10).unwrap();
+        (fs,rights)
+    }
+    fn hash(data:&[u8])->u64{data.iter().fold(0xcbf29ce484222325u64,
+         |h,b|(h^(*b as u64)).wrapping_mul(0x100000001b3))}
+    fn run(fs:&mut HierVfs<Disk>,rights:&Access<2>,cmd:&str)->(usize,[u8;48]){
+        let mut out=[0u8;48];
+        let n=command(fs,rights,who(),1,cmd.as_bytes(),&mut out).unwrap();
+        (n,out)
+    }
+    #[test]
+    fn five_cas_text_transformations_are_rebootable_and_unicode_preserving(){
+        let (mut fs,rights)=setup();
+        let old="α hi\n";
+        let command_text=format!("casprepend /main {:016x} !",hash(old.as_bytes()));
+        assert_eq!(run(&mut fs,&rights,&command_text).0,1);
+        let old="!α hi\n";
+        let strip=format!("casstrip /main {:016x}",hash(old.as_bytes()));
+        assert_eq!(run(&mut fs,&rights,&strip).0,1);
+        let old="!α hi";
+        let upper=format!("casupper /main {:016x}",hash(old.as_bytes()));
+        assert_eq!(run(&mut fs,&rights,&upper).0,1);
+        let old="!α HI";
+        let lower=format!("caslower /main {:016x}",hash(old.as_bytes()));
+        assert_eq!(run(&mut fs,&rights,&lower).0,1);
+        let old="!α hi";
+        let newline=format!("casnewline /main {:016x}",hash(old.as_bytes()));
+        assert_eq!(run(&mut fs,&rights,&newline).0,1);
+        let mut mounted=HierVfs::mount(fs.into_device()).unwrap();
+        let mut bytes=[0u8;20];
+        let n=mounted.read("/main",&mut bytes).unwrap();
+        assert_eq!(&bytes[..n],"!α hi\n".as_bytes());
+    }
+    #[test]
+    fn five_diagnostics_are_read_only_and_handle_non_ascii_positions(){
+        let (mut fs,rights)=setup();
+        let (n,out)=run(&mut fs,&rights,"unicodepage /main 0 2");
+        assert_eq!(&out[..n],"α ".as_bytes());
+        let (n,out)=run(&mut fs,&rights,"tabpositions /tabs");
+        assert_eq!(&out[..n],b"3\n");
+        let (n,out)=run(&mut fs,&rights,"crpositions /tabs");
+        assert_eq!(&out[..n],b"5\n");
+        let (n,out)=run(&mut fs,&rights,"leadingspaces /tabs");
+        assert_eq!(&out[..n],b"2\n");
+        let (n,out)=run(&mut fs,&rights,"sourceprefix /tabs   A");
+        assert_eq!(&out[..n],b"yes");
+    }
+    #[test]
+    fn stale_conflict_tiny_output_and_denied_identity_never_write(){
+        let (mut fs,rights)=setup();
+        let generation=fs.generation();
+        let mut tiny=[0xa5u8;0];
+        let mut out=[0xaau8;20];
+        let cmd=format!("casprepend /main {:016x} !",hash("α hi\n".as_bytes()));
+        assert_eq!(command(&mut fs,&rights,who(),1,cmd.as_bytes(),&mut tiny),
+            Err(Error::OutputTooSmall));
+        assert_eq!(command(&mut fs,&rights,who(),1,
+            b"casstrip /main 0000000000000000",&mut out),Err(Error::Denied));
+        assert_eq!(command(&mut fs,&rights,who(),11,b"tabpositions /tabs",&mut out),
+            Err(Error::Denied));
+        assert_eq!(fs.generation(),generation);
     }
 }
