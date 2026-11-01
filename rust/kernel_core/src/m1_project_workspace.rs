@@ -2404,3 +2404,141 @@ mod r078_project_source_tests {
             &mut fs,"renamed","bad",hash),Err(Error::Unauthorized));
     }
 }
+
+
+// M1/R079 workstation 2: revision-checked source previews and mutations.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct SourceSummary {
+    pub bytes:usize,
+    pub lines:usize,
+    pub unicode_scalars:usize,
+    pub fnv64:u64,
+}
+impl ProjectTree {
+    /// Read-only summary from the current real mounted project revision.
+    /// FNV is a cache/conflict hint, never a cryptographic file signature.
+    pub fn source_summary<D:BlockDevice>(&self,who:Identity,
+        fs:&mut HierVfs<D>,name:&str)->Result<SourceSummary,Error>{
+        self.check_fresh(who,fs)?;
+        let (p,n)=self.child(name)?;
+        let mut bytes=[0u8;MAX_FILE_BYTES];
+        let len=fs.read(Self::str_path(&p,n),&mut bytes)?;
+        let text=core::str::from_utf8(&bytes[..len]).map_err(|_|Error::Invalid)?;
+        let digest=bytes[..len].iter().fold(0xcbf29ce484222325u64,
+            |h,b|(h^(*b as u64)).wrapping_mul(0x100000001b3));
+        Ok(SourceSummary{bytes:len,
+            lines:if len==0{0}else{text.split_inclusive('\n').count()},
+            unicode_scalars:text.chars().count(),fnv64:digest})
+    }
+    /// First differing byte of two real source files; None means identical.
+    /// The read-only comparison rejects invalid UTF-8 rather than treating
+    /// malformed executable content as a regular text source.
+    pub fn compare_source_files<D:BlockDevice>(&self,who:Identity,
+        fs:&mut HierVfs<D>,left:&str,right:&str)->Result<Option<usize>,Error>{
+        self.check_fresh(who,fs)?;
+        let (a,an)=self.child(left)?;
+        let (b,bn)=self.child(right)?;
+        let mut one=[0u8;MAX_FILE_BYTES];
+        let mut two=[0u8;MAX_FILE_BYTES];
+        let x=fs.read(Self::str_path(&a,an),&mut one)?;
+        let y=fs.read(Self::str_path(&b,bn),&mut two)?;
+        core::str::from_utf8(&one[..x]).map_err(|_|Error::Invalid)?;
+        core::str::from_utf8(&two[..y]).map_err(|_|Error::Invalid)?;
+        for i in 0..core::cmp::min(x,y){
+            if one[i]!=two[i]{return Ok(Some(i));}
+        }
+        Ok(if x==y{None}else{Some(core::cmp::min(x,y))})
+    }
+    /// Optimistic full-file source save: only the exact observed checksum is
+    /// replaceable. The path is scoped to the live project, not global VFS.
+    pub fn replace_source_if_checksum<D:BlockDevice>(&mut self,who:Identity,
+        fs:&mut HierVfs<D>,name:&str,expected:u64,next:&str)
+        ->Result<u64,Error>{
+        self.check_fresh(who,fs)?;
+        if next.len()>MAX_FILE_BYTES{return Err(Error::Full);}
+        if self.source_checksum(who,fs,name)?!=expected{return Err(Error::Stale);}
+        let (p,n)=self.child(name)?;
+        // Identical bytes are a no-op; no unnecessary COW generation.
+        let mut old=[0u8;MAX_FILE_BYTES];
+        let count=fs.read(Self::str_path(&p,n),&mut old)?;
+        if &old[..count]!=next.as_bytes(){
+            fs.overwrite(Self::str_path(&p,n),next.as_bytes())?;
+            self.generation=fs.generation();
+        }
+        Ok(self.generation)
+    }
+    /// Conditional deletion for a source editor showing a precisely
+    /// observed version; missing or changed files are never removed.
+    pub fn delete_source_if_checksum<D:BlockDevice>(&mut self,who:Identity,
+        fs:&mut HierVfs<D>,name:&str,expected:u64)->Result<u64,Error>{
+        self.check_fresh(who,fs)?;
+        if self.source_checksum(who,fs,name)?!=expected{return Err(Error::Stale);}
+        let (p,n)=self.child(name)?;
+        fs.unlink(Self::str_path(&p,n))?;
+        self.generation=fs.generation();
+        Ok(self.generation)
+    }
+}
+#[cfg(test)]
+mod r079_project_revision_tests {
+    use super::*;
+    use crate::block::{BlockError,SECTOR_BYTES};
+    struct Disk{sectors:[[u8;SECTOR_BYTES];100]}
+    impl BlockDevice for Disk{
+        fn sector_count(&self)->u64{100}
+        fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+            ->Result<(),BlockError>{
+            *out=*self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?;Ok(())
+        }
+        fn write_sector(&mut self,lba:u64,data:&[u8;SECTOR_BYTES])
+            ->Result<(),BlockError>{
+            *self.sectors.get_mut(lba as usize).ok_or(BlockError::OutOfRange)?=*data;Ok(())
+        }
+    }
+    fn id()->Identity{Identity{pid:61,generation:1}}
+    fn ready()->(HierVfs<Disk>,ProjectTree){
+        let mut fs=HierVfs::format_blank(Disk{sectors:[[0;SECTOR_BYTES];100]}).unwrap();
+        let mut p=ProjectTree::new();
+        p.create(id(),&mut fs,"demo").unwrap();
+        p.create_file(id(),&mut fs,"src","α hi\nβ old\n".as_bytes()).unwrap();
+        p.create_file(id(),&mut fs,"peer","α hi\nβ old\n".as_bytes()).unwrap();
+        (fs,p)
+    }
+    #[test]
+    fn real_source_summary_diff_revision_save_and_delete_survive_remount(){
+        let (mut fs,mut p)=ready();
+        let summary=p.source_summary(id(),&mut fs,"src").unwrap();
+        assert_eq!(summary.bytes,"α hi\nβ old\n".len());
+        assert_eq!(summary.lines,2);
+        assert_eq!(summary.unicode_scalars,11);
+        assert_eq!(p.compare_source_files(id(),&mut fs,"src","peer"),Ok(None));
+        let generation=fs.generation();
+        assert_eq!(p.replace_source_if_checksum(id(),&mut fs,"src",summary.fnv64,"α hi\nβ old\n"),Ok(generation));
+        p.replace_source_if_checksum(id(),&mut fs,"src",summary.fnv64,"α hi\nβ new\n").unwrap();
+        assert_eq!(p.compare_source_files(id(),&mut fs,"src","peer"),Ok(Some(9)));
+        assert_eq!(p.delete_source_if_checksum(id(),&mut fs,"peer",summary.fnv64^1),Err(Error::Stale));
+        p.delete_source_if_checksum(id(),&mut fs,"peer",summary.fnv64).unwrap();
+        let mut fs=HierVfs::mount(fs.into_device()).unwrap();
+        let mut p=ProjectTree::new();p.open(id(),&mut fs,"demo").unwrap();
+        let mut out=[0u8;24];
+        let n=p.read_file(id(),&mut fs,"src",&mut out).unwrap();
+        assert_eq!(&out[..n],"α hi\nβ new\n".as_bytes());
+        assert!(p.read_file(id(),&mut fs,"peer",&mut out).is_err());
+    }
+    #[test]
+    fn bad_owner_invalid_utf8_stale_revision_and_wrong_digest_are_fail_closed(){
+        let (mut fs,mut p)=ready();
+        let before=fs.generation();
+        let hash=p.source_checksum(id(),&mut fs,"src").unwrap();
+        assert_eq!(p.replace_source_if_checksum(id(),&mut fs,"src",hash^1,"bad"),
+            Err(Error::Stale));
+        assert_eq!(p.delete_source_if_checksum(
+            Identity{generation:2,..id()},&mut fs,"src",hash),Err(Error::Unauthorized));
+        assert_eq!(fs.generation(),before);
+        p.create_file(id(),&mut fs,"binary",&[0xff,0xfe]).unwrap();
+        assert_eq!(p.source_summary(id(),&mut fs,"binary"),Err(Error::Invalid));
+        fs.overwrite("/work/demo/src",b"external").unwrap();
+        assert_eq!(p.replace_source_if_checksum(id(),&mut fs,"src",hash,"bad"),
+            Err(Error::Stale));
+    }
+}

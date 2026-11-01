@@ -2690,3 +2690,97 @@ mod r078_editor_pool_source_tests {
         assert!(!pool.status(id(),1).unwrap().dirty);
     }
 }
+
+
+// M1/R079 workstation 1: four independently authorized multi-buffer
+// operations over actual active source buffers, never stale disk snapshots.
+impl EditorPool {
+    /// Replace every literal Unicode match within a single selected slot,
+    /// producing exactly one reversible unsaved edit.
+    pub fn replace_all_text(&mut self,who:Identity,slot:usize,
+        needle:&str,replacement:&str)->Result<usize,Error>{
+        self.docs.get_mut(slot).ok_or(Error::Invalid)?
+            .replace_all_text(who,needle,replacement)
+    }
+    /// Previous match bounded to the selected document and a UTF-8 cursor.
+    pub fn find_previous_text(&self,who:Identity,slot:usize,
+        needle:&str,before:usize)->Result<Option<usize>,Error>{
+        self.docs.get(slot).ok_or(Error::Invalid)?
+            .find_previous_text(who,needle,before)
+    }
+    /// Stream a bounded page of nonoverlapping source match byte offsets.
+    pub fn find_text_page(&self,who:Identity,slot:usize,needle:&str,
+        from:usize,out:&mut[usize])->Result<(usize,Option<usize>),Error>{
+        self.docs.get(slot).ok_or(Error::Invalid)?
+            .find_text_page(who,needle,from,out)
+    }
+    /// Convert an active document's byte offset into one-based Unicode
+    /// line/scalar-column coordinates without copying source bytes.
+    pub fn text_position(&self,who:Identity,slot:usize,at:usize)
+        ->Result<(usize,usize),Error>{
+        self.docs.get(slot).ok_or(Error::Invalid)?.text_position(who,at)
+    }
+}
+
+#[cfg(test)]
+mod r079_editor_multibuffer_tests {
+    use super::*;
+    use crate::block::{BlockError,SECTOR_BYTES};
+    struct Disk{sectors:[[u8;SECTOR_BYTES];100]}
+    impl BlockDevice for Disk{
+        fn sector_count(&self)->u64{100}
+        fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+            ->Result<(),BlockError>{
+            *out=*self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?;
+            Ok(())
+        }
+        fn write_sector(&mut self,lba:u64,data:&[u8;SECTOR_BYTES])
+            ->Result<(),BlockError>{
+            *self.sectors.get_mut(lba as usize).ok_or(BlockError::OutOfRange)?=*data;Ok(())
+        }
+    }
+    fn who()->Identity{Identity{pid:60,generation:1}}
+    fn setup()->(HierVfs<Disk>,EditorPool){
+        let mut fs=HierVfs::format_blank(Disk{sectors:[[0;SECTOR_BYTES];100]}).unwrap();
+        fs.create("/one","α cat cat\n".as_bytes()).unwrap();
+        fs.create("/two",b"dog dog").unwrap();
+        let mut p=EditorPool::new();
+        p.open(who(),&mut fs,0,"/one").unwrap();
+        p.open(who(),&mut fs,1,"/two").unwrap();
+        (fs,p)
+    }
+    #[test]
+    fn replacements_pages_positions_and_previous_search_use_own_slot_and_remount(){
+        let (mut fs,mut p)=setup();
+        assert_eq!(p.text_position(who(),0,3),Ok((1,3)));
+        assert_eq!(p.find_previous_text(who(),0,"cat",10),Ok(Some(7)));
+        let mut matches=[usize::MAX;1];
+        assert_eq!(p.find_text_page(who(),0,"cat",0,&mut matches),Ok((1,Some(7))));
+        assert_eq!(matches,[3]);
+        assert_eq!(p.find_text_page(who(),0,"cat",7,&mut matches),Ok((1,None)));
+        assert_eq!(matches,[7]);
+        assert_eq!(p.replace_all_text(who(),0,"cat","猫"),Ok(2));
+        assert_eq!(p.replace_all_text(who(),1,"dog","fox"),Ok(2));
+        assert_eq!(p.undo(who(),1),Ok(7));
+        p.save_all(who(),&mut fs).unwrap();
+        let mut fs=HierVfs::mount(fs.into_device()).unwrap();
+        let mut out=[0u8;32];
+        let n=fs.read("/one",&mut out).unwrap();
+        assert_eq!(&out[..n],"α 猫 猫\n".as_bytes());
+        assert_eq!(fs.read("/two",&mut out),Ok(7));
+        assert_eq!(&out[..7],b"dog dog");
+    }
+    #[test]
+    fn stale_owner_invalid_boundaries_and_short_page_keep_data_and_results(){
+        let (_fs,mut p)=setup();
+        let generation=Identity{generation:2,..who()};
+        let mut matched=[77usize;0];
+        assert_eq!(p.find_text_page(who(),0,"cat",0,&mut matched),Err(Error::Full));
+        assert_eq!(p.find_previous_text(who(),0,"cat",1),Err(Error::Invalid));
+        assert_eq!(p.text_position(who(),0,1),Err(Error::Invalid));
+        assert_eq!(p.replace_all_text(generation,0,"cat","oops"),Err(Error::Unauthorized));
+        assert_eq!(p.replace_all_text(who(),2,"cat","oops"),Err(Error::Invalid));
+        assert!(!p.status(who(),0).unwrap().dirty);
+        assert_eq!(matched,[]);
+    }
+}

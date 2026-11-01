@@ -19,7 +19,7 @@ pub const COMMAND_VERBS:&[&str]=&[
  "help","pwd","tools","ls","cat","page","write","append","mkdir","mv",
  "cp","rm","mkfile","truncate","head","count","rmdir","mvdir",
  "pread","pwrite","lines","line","hash","stat","tail","find","grep","cmp","diffat",
- "touch","copynew","copyrange","matchpage","textpage","idpage","caswrite","casappend","replace","appendln","health","hex","slice","concat","cmprange","bytefreq","patchhex","patchrange","copylines","wc","headlines","rfind","taillines","linespan","linehits","sourceview","sourcecontext","textprofile","blankrows","indentmap","eolcheck",
+ "touch","copynew","copyrange","matchpage","textpage","idpage","caswrite","casappend","castruncate","casclone","wordpage","idcount","replace","appendln","health","hex","slice","concat","cmprange","bytefreq","patchhex","patchrange","copylines","wc","headlines","rfind","taillines","linespan","linehits","sourceview","sourcecontext","textprofile","blankrows","indentmap","eolcheck",
 ];
 /// Complete exactly one printable lower-case verb prefix. Ambiguous matches,
 /// empty prefixes and user-supplied paths never cause completion or I/O.
@@ -306,6 +306,100 @@ pub fn command<D:BlockDevice,const N:usize>(
    bytes[len..next].copy_from_slice(content.as_bytes());
    fs.overwrite(p,&bytes[..next]).map_err(Error::Io)?;
    publish(&digits[..count],out)
+  }
+
+  // R079-09: COW truncate only when the on-disk length still matches.
+  "castruncate"=>{
+   auth.require(caller,FILE_READ|FILE_WRITE,now).map_err(|_|Error::Denied)?;
+   let mut args=raw.split_ascii_whitespace();
+   let file=args.next().ok_or(Error::Invalid)?;
+   let prior=args.next().ok_or(Error::Invalid)?.parse::<usize>().map_err(|_|Error::Invalid)?;
+   let next=args.next().ok_or(Error::Invalid)?.parse::<usize>().map_err(|_|Error::Invalid)?;
+   if args.next().is_some()||next>crate::durablefs::MAX_FILE_BYTES{return Err(Error::Invalid);}
+   let p=path(file,&mut name)?;writable_path(p)?;
+   let observed=fs.file_len(p).map_err(Error::Io)?;
+   if observed!=prior{return Err(Error::Denied);}
+   let mut digits=[0u8;20];
+   let n=publish_number(next as u64,&mut digits)?;
+   if out.len()<n{return Err(Error::OutputTooSmall);}
+   fs.truncate(p,next as u64).map_err(Error::Io)?;
+   publish(&digits[..n],out)
+  }
+  // R079-10: optimistic, complete source clone to a new destination.
+  // FNV is a conflict detector and does not authenticate downloaded code.
+  "casclone"=>{
+   auth.require(caller,FILE_READ|FILE_WRITE,now).map_err(|_|Error::Denied)?;
+   let mut args=raw.split_ascii_whitespace();
+   let source=args.next().ok_or(Error::Invalid)?;
+   let target=args.next().ok_or(Error::Invalid)?;
+   let expected=args.next().ok_or(Error::Invalid)?;
+   if args.next().is_some()||expected.len()!=16{return Err(Error::Invalid);}
+   let expected=u64::from_str_radix(expected,16).map_err(|_|Error::Invalid)?;
+   let mut srcbuf=[0u8;64];let mut dstbuf=[0u8;64];
+   let src=path(source,&mut srcbuf)?;
+   let dst=path(target,&mut dstbuf)?;
+   if src==dst{return Err(Error::Invalid);}
+   writable_path(dst)?;
+   let mut bytes=[0u8;crate::durablefs::MAX_FILE_BYTES];
+   let n=fs.read(src,&mut bytes).map_err(Error::Io)?;
+   let digest=bytes[..n].iter().fold(0xcbf29ce484222325u64,
+      |h,b|(h^(*b as u64)).wrapping_mul(0x100000001b3));
+   if digest!=expected{return Err(Error::Denied);}
+   let mut digits=[0u8;20];let count=publish_number(n as u64,&mut digits)?;
+   if out.len()<count{return Err(Error::OutputTooSmall);}
+   fs.create(dst,&bytes[..n]).map_err(Error::Io)?;
+   publish(&digits[..count],out)
+  }
+  // R079-11: paginated UTF-8 word starts, not substring matches.
+  "wordpage"=>{
+   auth.require(caller,FILE_READ,now).map_err(|_|Error::Denied)?;
+   let mut args=raw.split_ascii_whitespace();
+   let source=args.next().ok_or(Error::Invalid)?;
+   let start=args.next().ok_or(Error::Invalid)?.parse::<usize>().map_err(|_|Error::Invalid)?;
+   let count=args.next().ok_or(Error::Invalid)?.parse::<usize>().map_err(|_|Error::Invalid)?;
+   if count==0||count>16||args.next().is_some(){return Err(Error::Invalid);}
+   let end=start.checked_add(count).ok_or(Error::Invalid)?;
+   let p=path(source,&mut name)?;
+   let mut bytes=[0u8;crate::durablefs::MAX_FILE_BYTES];
+   let n=fs.read(p,&mut bytes).map_err(Error::Io)?;
+   let text=core::str::from_utf8(&bytes[..n]).map_err(|_|Error::Invalid)?;
+   let mut staged=[0u8;MAX_TRANSFER];let mut used=0usize;
+   let mut total=0usize;let mut previous_space=true;
+   for (at,ch) in text.char_indices(){
+    let space=ch.is_whitespace();
+    if !space&&previous_space{
+     if total>=start&&total<end{
+      used+=publish_number(at as u64,&mut staged[used..])?;
+      staged[used]=b'\n';used+=1;
+     }
+     total+=1;
+    }
+    previous_space=space;
+   }
+   if start>total{return Err(Error::Invalid);}
+   publish(&staged[..used],out)
+  }
+  // R079-12: count complete ASCII identifiers, never their substrings.
+  "idcount"=>{
+   auth.require(caller,FILE_READ,now).map_err(|_|Error::Denied)?;
+   let (file,symbol)=raw.split_once(' ').ok_or(Error::Invalid)?;
+   if symbol.is_empty()||symbol.bytes().next().is_none_or(|b|
+        !b.is_ascii_alphabetic()&&b!=b'_')||
+      !symbol.bytes().all(|b|b.is_ascii_alphanumeric()||b==b'_'){
+      return Err(Error::Invalid);
+   }
+   let p=path(file,&mut name)?;
+   let mut bytes=[0u8;crate::durablefs::MAX_FILE_BYTES];
+   let n=fs.read(p,&mut bytes).map_err(Error::Io)?;
+   let text=core::str::from_utf8(&bytes[..n]).map_err(|_|Error::Invalid)?;
+   let mut total=0usize;
+   for (at,_) in text.match_indices(symbol){
+    let word=|b:u8|b.is_ascii_alphanumeric()||b==b'_';
+    if (at>0&&word(text.as_bytes()[at-1]))||
+       (at+symbol.len()<n&&word(text.as_bytes()[at+symbol.len()])){continue;}
+    total+=1;
+   }
+   publish_number(total as u64,out)
   }
   "page"=>{
    auth.require(caller,FILE_READ,now).map_err(|_|Error::Denied)?;
@@ -1611,7 +1705,7 @@ mod tests{
  }
  #[test]fn r044_command_registry_drives_unique_safe_completion(){
   // R078: four new developer commands after the R077 total of 56.
-  assert_eq!(COMMAND_VERBS.len(),60);
+  assert_eq!(COMMAND_VERBS.len(),64);
   for (i,verb) in COMMAND_VERBS.iter().enumerate(){
    assert!(verb.as_bytes().iter().all(|b|b.is_ascii_lowercase()));
    assert!(!COMMAND_VERBS[..i].contains(verb));
@@ -3585,5 +3679,68 @@ mod r078_terminal_source_and_cas_tests {
             b"textpage /src 0 3",&mut out),Err(Error::Denied));
         assert_eq!(out,[0x5e;3]);
         assert_eq!(fs.generation(),generation);
+    }
+}
+
+
+#[cfg(test)]
+mod r079_terminal_revision_tests{
+    use super::*;
+    use crate::block::{BlockError,SECTOR_BYTES};
+    struct Disk{sectors:[[u8;SECTOR_BYTES];100]}
+    impl BlockDevice for Disk{
+        fn sector_count(&self)->u64{100}
+        fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+            *out=*self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?;Ok(())
+        }
+        fn write_sector(&mut self,lba:u64,bytes:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+            *self.sectors.get_mut(lba as usize).ok_or(BlockError::OutOfRange)?=*bytes;Ok(())
+        }
+    }
+    fn user()->Identity{Identity{pid:62,generation:1}}
+    fn ready()->(HierVfs<Disk>,Access<2>){
+        let mut fs=HierVfs::format_blank(Disk{sectors:[[0;SECTOR_BYTES];100]}).unwrap();
+        fs.create("/src","α foo foo_bar\nfoo\n".as_bytes()).unwrap();
+        let mut access=Access::new();
+        access.grant(user(),FILE_READ|FILE_WRITE,10).unwrap();
+        (fs,access)
+    }
+    #[test]
+    fn word_offsets_idcount_and_conditional_clone_survive_remount(){
+        let (mut fs,auth)=ready();
+        let original="α foo foo_bar\nfoo\n";
+        let mut out=[0u8;24];
+        assert_eq!(command(&mut fs,&auth,user(),1,b"wordpage /src 1 2",&mut out),Ok(4));
+        assert_eq!(&out[..4],b"3\n7\n");
+        assert_eq!(command(&mut fs,&auth,user(),1,b"idcount /src foo",&mut out),Ok(1));
+        assert_eq!(out[0],b'2');
+        let digest=original.as_bytes().iter().fold(0xcbf29ce484222325u64,
+          |h,b|(h^(*b as u64)).wrapping_mul(0x100000001b3));
+        let clone=format!("casclone /src /clone {:016x}",digest);
+        assert_eq!(command(&mut fs,&auth,user(),1,clone.as_bytes(),&mut out),Ok(2));
+        assert_eq!(&out[..2],b"19");
+        assert_eq!(command(&mut fs,&auth,user(),1,b"castruncate /clone 19 4",&mut out),Ok(1));
+        assert_eq!(out[0],b'4');
+        let mut fs=HierVfs::mount(fs.into_device()).unwrap();
+        let mut bytes=[0u8;32];
+        assert_eq!(fs.read("/clone",&mut bytes),Ok(4));
+        assert_eq!(&bytes[..4],"α f".as_bytes());
+        assert_eq!(fs.read("/src",&mut bytes),Ok(19));
+        assert_eq!(&bytes[..19],original.as_bytes());
+    }
+    #[test]
+    fn stale_length_hash_short_output_and_authority_do_not_mutate(){
+        let (mut fs,auth)=ready();let before=fs.generation();
+        let mut out=[0xabu8;1];
+        assert_eq!(command(&mut fs,&auth,user(),1,b"castruncate /src 3 0",&mut out),
+            Err(Error::Denied));
+        assert_eq!(command(&mut fs,&auth,user(),1,
+            b"casclone /src /no 0000000000000000",&mut out),Err(Error::Denied));
+        assert_eq!(command(&mut fs,&auth,user(),11,b"wordpage /src 0 1",&mut out),
+            Err(Error::Denied));
+        assert_eq!(command(&mut fs,&auth,user(),1,b"wordpage /src 1 2",&mut out),
+            Err(Error::OutputTooSmall));
+        assert_eq!(fs.generation(),before);
+        assert_eq!(out,[0xab]);
     }
 }
