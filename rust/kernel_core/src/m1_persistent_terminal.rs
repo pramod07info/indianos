@@ -19,7 +19,7 @@ pub const COMMAND_VERBS:&[&str]=&[
  "help","pwd","tools","ls","cat","page","write","append","mkdir","mv",
  "cp","rm","mkfile","truncate","head","count","rmdir","mvdir",
  "pread","pwrite","lines","line","hash","stat","tail","find","grep","cmp","diffat",
- "touch","copynew","copyrange","matchpage","replace","appendln","health","hex","slice","concat","cmprange","bytefreq","patchhex","patchrange","copylines","wc","headlines","rfind","taillines","linespan","linehits","sourceview","sourcecontext","textprofile","blankrows","indentmap","eolcheck",
+ "touch","copynew","copyrange","matchpage","textpage","idpage","caswrite","casappend","replace","appendln","health","hex","slice","concat","cmprange","bytefreq","patchhex","patchrange","copylines","wc","headlines","rfind","taillines","linespan","linehits","sourceview","sourcecontext","textprofile","blankrows","indentmap","eolcheck",
 ];
 /// Complete exactly one printable lower-case verb prefix. Ambiguous matches,
 /// empty prefixes and user-supplied paths never cause completion or I/O.
@@ -114,7 +114,7 @@ pub fn command<D:BlockDevice,const N:usize>(
  }
  let (verb,arguments)=entered.split_once(' ').ok_or(Error::Unknown)?;
  let raw=if matches!(verb,"write"|"append"|"appendln"|"pwrite"|
-    "replace"|"find"|"grep"){
+    "replace"|"find"|"grep"|"caswrite"|"casappend"){
   arguments
  }else{arguments.trim_end()};
  let mut name=[0u8;64];
@@ -207,6 +207,105 @@ pub fn command<D:BlockDevice,const N:usize>(
    if n!=count{return Err(Error::Invalid);}
    fs.create(dst,&bytes[..n]).map_err(Error::Io)?;
    publish_number(n as u64,out)
+  }
+  // R078-09: UTF-8 boundary-safe source byte windows (no split glyphs).
+  "textpage"=>{
+   auth.require(caller,FILE_READ,now).map_err(|_|Error::Denied)?;
+   let mut args=raw.split_ascii_whitespace();
+   let source=args.next().ok_or(Error::Invalid)?;
+   let offset=args.next().ok_or(Error::Invalid)?
+       .parse::<usize>().map_err(|_|Error::Invalid)?;
+   let count=args.next().ok_or(Error::Invalid)?
+       .parse::<usize>().map_err(|_|Error::Invalid)?;
+   if count==0||count>MAX_TRANSFER||args.next().is_some(){return Err(Error::Invalid);}
+   let p=path(source,&mut name)?;
+   let mut bytes=[0u8;crate::durablefs::MAX_FILE_BYTES];
+   let n=fs.read(p,&mut bytes).map_err(Error::Io)?;
+   let source=core::str::from_utf8(&bytes[..n]).map_err(|_|Error::Invalid)?;
+   let end=core::cmp::min(n,offset.checked_add(count).ok_or(Error::Invalid)?);
+   let part=source.get(offset..end).ok_or(Error::Invalid)?;
+   publish(part.as_bytes(),out)
+  }
+  // R078-10: whole-identifier matches with a resumable occurrence cursor.
+  // Only ASCII identifiers are accepted; nonmatching UTF-8 bytes remain safe.
+  "idpage"=>{
+   auth.require(caller,FILE_READ,now).map_err(|_|Error::Denied)?;
+   let mut args=raw.split_ascii_whitespace();
+   let source=args.next().ok_or(Error::Invalid)?;
+   let symbol=args.next().ok_or(Error::Invalid)?;
+   let start=args.next().ok_or(Error::Invalid)?
+       .parse::<usize>().map_err(|_|Error::Invalid)?;
+   let count=args.next().ok_or(Error::Invalid)?
+       .parse::<usize>().map_err(|_|Error::Invalid)?;
+   if symbol.as_bytes().first().is_none_or(|b|
+       !b.is_ascii_alphabetic()&&*b!=b'_')||
+       !symbol.bytes().all(|b|b.is_ascii_alphanumeric()||b==b'_')||
+       count==0||count>8||args.next().is_some(){return Err(Error::Invalid);}
+   let end=start.checked_add(count).ok_or(Error::Invalid)?;
+   let p=path(source,&mut name)?;
+   let mut bytes=[0u8;crate::durablefs::MAX_FILE_BYTES];
+   let n=fs.read(p,&mut bytes).map_err(Error::Io)?;
+   let source=core::str::from_utf8(&bytes[..n]).map_err(|_|Error::Invalid)?;
+   let mut staged=[0u8;MAX_TRANSFER];
+   let mut used=0usize;let mut seen=0usize;
+   for (at,_) in source.match_indices(symbol){
+    let word=|b:u8|b.is_ascii_alphanumeric()||b==b'_';
+    if (at>0&&word(source.as_bytes()[at-1]))||
+       (at+symbol.len()<n&&word(source.as_bytes()[at+symbol.len()])){continue;}
+    if seen>=start&&seen<end {
+     used+=publish_number(at as u64,&mut staged[used..])?;
+     staged[used]=b'\n';used+=1;
+    }
+    seen=seen.checked_add(1).ok_or(Error::Invalid)?;
+   }
+   if start>seen{return Err(Error::Invalid);}
+   publish(&staged[..used],out)
+  }
+  // R078-11: compare-and-swap whole file contents using FNV as an
+  // optimistic conflict indicator, not an authentication hash/signature.
+  "caswrite"=>{
+   auth.require(caller,FILE_READ,now).map_err(|_|Error::Denied)?;
+   auth.require(caller,FILE_WRITE,now).map_err(|_|Error::Denied)?;
+   let (src,tail)=raw.split_once(' ').ok_or(Error::Invalid)?;
+   let (expected,content)=tail.split_once(' ').ok_or(Error::Invalid)?;
+   if expected.len()!=16||content.is_empty()||
+       content.len()>crate::durablefs::MAX_FILE_BYTES{return Err(Error::Invalid);}
+   let expected=u64::from_str_radix(expected,16).map_err(|_|Error::Invalid)?;
+   let p=path(src,&mut name)?;
+   writable_path(p)?;
+   let mut original=[0u8;crate::durablefs::MAX_FILE_BYTES];
+   let n=fs.read(p,&mut original).map_err(Error::Io)?;
+   let actual=original[..n].iter().fold(0xcbf29ce484222325u64,
+        |h,b|(h^(*b as u64)).wrapping_mul(0x100000001b3));
+   if expected!=actual{return Err(Error::Denied);}
+   let mut digits=[0u8;20];
+   let len=publish_number(content.len() as u64,&mut digits)?;
+   if out.len()<len{return Err(Error::OutputTooSmall);}
+   fs.overwrite(p,content.as_bytes()).map_err(Error::Io)?;
+   publish(&digits[..len],out)
+  }
+  // R078-12: append only if the source byte length is still what the
+  // editor observed; entire new file commits in one COW VFS generation.
+  "casappend"=>{
+   auth.require(caller,FILE_READ,now).map_err(|_|Error::Denied)?;
+   auth.require(caller,FILE_WRITE,now).map_err(|_|Error::Denied)?;
+   let (src,tail)=raw.split_once(' ').ok_or(Error::Invalid)?;
+   let (expected,content)=tail.split_once(' ').ok_or(Error::Invalid)?;
+   if content.is_empty(){return Err(Error::Invalid);}
+   let expected=expected.parse::<usize>().map_err(|_|Error::Invalid)?;
+   let p=path(src,&mut name)?;
+   writable_path(p)?;
+   let mut bytes=[0u8;crate::durablefs::MAX_FILE_BYTES];
+   let len=fs.read(p,&mut bytes).map_err(Error::Io)?;
+   if len!=expected{return Err(Error::Denied);}
+   let next=len.checked_add(content.len()).ok_or(Error::Invalid)?;
+   if next>bytes.len(){return Err(Error::Invalid);}
+   let mut digits=[0u8;20];
+   let count=publish_number(next as u64,&mut digits)?;
+   if out.len()<count{return Err(Error::OutputTooSmall);}
+   bytes[len..next].copy_from_slice(content.as_bytes());
+   fs.overwrite(p,&bytes[..next]).map_err(Error::Io)?;
+   publish(&digits[..count],out)
   }
   "page"=>{
    auth.require(caller,FILE_READ,now).map_err(|_|Error::Denied)?;
@@ -1511,8 +1610,8 @@ mod tests{
   assert_eq!(complete_verb(b"heal"),Some("health"));
  }
  #[test]fn r044_command_registry_drives_unique_safe_completion(){
-  // R077 adds matchpage and copyrange to the existing 54 native commands.
-  assert_eq!(COMMAND_VERBS.len(),56);
+  // R078: four new developer commands after the R077 total of 56.
+  assert_eq!(COMMAND_VERBS.len(),60);
   for (i,verb) in COMMAND_VERBS.iter().enumerate(){
    assert!(verb.as_bytes().iter().all(|b|b.is_ascii_lowercase()));
    assert!(!COMMAND_VERBS[..i].contains(verb));
@@ -1530,7 +1629,9 @@ mod tests{
   assert_eq!(complete_verb(b"lineh"),Some("linehits"));
   assert_eq!(complete_verb(b"sourcev"),Some("sourceview"));
   assert_eq!(complete_verb(b"sourcec"),Some("sourcecontext"));
-  assert_eq!(complete_verb(b"textp"),Some("textprofile"));
+  assert_eq!(complete_verb(b"textp"),None); // Both textpage and textprofile match.
+  assert_eq!(complete_verb(b"textpr"),Some("textprofile"));
+  assert_eq!(complete_verb(b"textpa"),Some("textpage"));
   assert_eq!(complete_verb(b"blankr"),Some("blankrows"));
   assert_eq!(complete_verb(b"indentm"),Some("indentmap"));
   assert_eq!(complete_verb(b"eolch"),Some("eolcheck"));
@@ -3407,5 +3508,82 @@ mod r077_terminal_range_and_search_tests {
         assert_eq!(command(&mut fs, &access, id(), 1,
             b"copyrange /src /new 0 999", &mut out), Err(Error::Invalid));
         assert_eq!(fs.generation(), generation);
+    }
+}
+
+
+#[cfg(test)]
+mod r078_terminal_source_and_cas_tests {
+    use super::*;
+    use crate::block::{BlockError,SECTOR_BYTES};
+    struct Disk{sectors:[[u8;SECTOR_BYTES];100]}
+    impl BlockDevice for Disk{
+        fn sector_count(&self)->u64{100}
+        fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+            ->Result<(),BlockError>{
+            *out=*self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?;Ok(())
+        }
+        fn write_sector(&mut self,lba:u64,data:&[u8;SECTOR_BYTES])
+            ->Result<(),BlockError>{
+            *self.sectors.get_mut(lba as usize).ok_or(BlockError::OutOfRange)?=*data;Ok(())
+        }
+    }
+    fn owner()->Identity{Identity{pid:44,generation:2}}
+    fn ready()->(HierVfs<Disk>,Access<2>){
+        let mut fs=HierVfs::format_blank(Disk{sectors:[[0;SECTOR_BYTES];100]}).unwrap();
+        fs.create("/src","α foo foo_bar\nfoo\n".as_bytes()).unwrap();
+        let mut rights=Access::new();
+        rights.grant(owner(),FILE_READ|FILE_WRITE,10).unwrap();
+        (fs,rights)
+    }
+    #[test]
+    fn real_unicode_textpage_and_identifier_page_preserve_file_bytes(){
+        let (mut fs,rights)=ready();
+        let before=fs.generation();
+        let mut out=[0u8;32];
+        assert_eq!(command(&mut fs,&rights,owner(),1,b"textpage /src 3 3",&mut out),Ok(3));
+        assert_eq!(&out[..3],b"foo");
+        assert_eq!(command(&mut fs,&rights,owner(),1,b"idpage /src foo 0 2",&mut out),Ok(5));
+        assert_eq!(&out[..5],b"3\n15\n");
+        assert_eq!(command(&mut fs,&rights,owner(),1,b"textpage /src 1 2",&mut out),
+            Err(Error::Invalid));
+        let mut short=[0xaau8;1];
+        assert_eq!(command(&mut fs,&rights,owner(),1,b"idpage /src foo 0 2",&mut short),
+            Err(Error::OutputTooSmall));
+        assert_eq!(short,[0xaa]);
+        assert_eq!(fs.generation(),before);
+    }
+    #[test]
+    fn conditional_write_append_and_reboot_are_durable(){
+        let (mut fs,rights)=ready();
+        let mut out=[0u8;24];
+        let original="α foo foo_bar\nfoo\n";
+        let digest=original.as_bytes().iter().fold(0xcbf29ce484222325u64,
+            |h,b|(h^(*b as u64)).wrapping_mul(0x100000001b3));
+        let update=format!("caswrite /src {:016x} changed",digest);
+        assert_eq!(command(&mut fs,&rights,owner(),1,update.as_bytes(),&mut out),Ok(1));
+        assert_eq!(out[0],b'7');
+        assert_eq!(command(&mut fs,&rights,owner(),1,b"casappend /src 7 !",&mut out),Ok(1));
+        assert_eq!(out[0],b'8');
+        let mut fs=HierVfs::mount(fs.into_device()).unwrap();
+        let mut bytes=[0u8;24];
+        assert_eq!(fs.read("/src",&mut bytes),Ok(8));
+        assert_eq!(&bytes[..8],b"changed!");
+    }
+    #[test]
+    fn stale_hash_length_reserved_destination_and_expired_grants_are_denied(){
+        let (mut fs,rights)=ready();
+        let generation=fs.generation();
+        let mut out=[0x5eu8;3];
+        assert_eq!(command(&mut fs,&rights,owner(),1,
+            b"caswrite /src 0000000000000000 wrong",&mut out),Err(Error::Denied));
+        assert_eq!(command(&mut fs,&rights,owner(),1,
+            b"casappend /src 999 wrong",&mut out),Err(Error::Denied));
+        assert_eq!(command(&mut fs,&rights,owner(),1,
+            b"caswrite /system/secret 0000000000000000 wrong",&mut out),Err(Error::Denied));
+        assert_eq!(command(&mut fs,&rights,owner(),11,
+            b"textpage /src 0 3",&mut out),Err(Error::Denied));
+        assert_eq!(out,[0x5e;3]);
+        assert_eq!(fs.generation(),generation);
     }
 }

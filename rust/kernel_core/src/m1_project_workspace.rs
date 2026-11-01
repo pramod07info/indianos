@@ -2233,3 +2233,174 @@ mod r077_project_navigation_tests {
         assert_eq!(matches[0].byte_offset, 99);
     }
 }
+
+
+// M1/R078 workstream 2 (tasks 05-08): source pagination, symbol-aware
+// workspace search and optimistic, durable file-management operations.
+impl ProjectTree {
+    /// Return complete UTF-8 source rows starting at a zero-based row cursor.
+    /// The cursor is valid only for this volume generation.
+    pub fn source_line_page<D:BlockDevice>(&self,caller:Identity,
+        fs:&mut HierVfs<D>,name:&str,start:usize,out:&mut[u8])
+        ->Result<(usize,Option<usize>),Error>{
+        self.check_fresh(caller,fs)?;
+        let (path,len)=self.child(name)?;
+        let mut bytes=[0u8;MAX_FILE_BYTES];
+        let n=fs.read(Self::str_path(&path,len),&mut bytes)?;
+        let source=core::str::from_utf8(&bytes[..n]).map_err(|_|Error::Invalid)?;
+        let total=if source.is_empty(){0}else{source.split_inclusive('\n').count()};
+        if start>total {return Err(Error::Invalid);}
+        let mut used=0;
+        for (i,row) in source.split_inclusive('\n').enumerate(){
+            if i<start {continue;}
+            if row.len()>out.len()-used{
+                return if used==0{Err(Error::Full)}else{Ok((used,Some(i)))};
+            }
+            out[used..used+row.len()].copy_from_slice(row.as_bytes());
+            used+=row.len();
+        }
+        Ok((used,None))
+    }
+
+    /// Whole ASCII identifier matches across direct UTF-8 source files,
+    /// rejecting partial-word hits and never returning binary file contents.
+    pub fn search_identifier_page<D:BlockDevice>(&self,caller:Identity,
+        fs:&mut HierVfs<D>,symbol:&str,start:usize,out:&mut[ProjectMatch])
+        ->Result<(usize,Option<usize>),Error>{
+        self.check_fresh(caller,fs)?;
+        let valid=symbol.as_bytes().first().is_some_and(|b|
+            b.is_ascii_alphabetic()||*b==b'_')
+            &&symbol.bytes().all(|b|b.is_ascii_alphanumeric()||b==b'_');
+        if !valid||out.is_empty()||out.len()>PROJECT_SEARCH_MAX {
+            return Err(Error::Invalid);
+        }
+        let end=start.checked_add(out.len()).ok_or(Error::Invalid)?;
+        let mut listing=[0u8;crate::hier_vfs::MAX_TRANSFER];
+        let listed=fs.list_dir(self.pathname(),&mut listing)?;
+        let mut staged=[ProjectMatch::EMPTY;PROJECT_SEARCH_MAX];
+        let mut used=0usize;let mut total=0usize;
+        for row in listing[..listed].split_inclusive(|b|*b==b'\n'){
+            if !row.starts_with(b"f:")||!row.ends_with(b"\n"){continue;}
+            let name=core::str::from_utf8(&row[2..row.len()-1])
+                .map_err(|_|Error::Invalid)?;
+            let (path,len)=self.child(name)?;
+            let mut bytes=[0u8;MAX_FILE_BYTES];
+            let n=fs.read(Self::str_path(&path,len),&mut bytes)?;
+            let Ok(source)=core::str::from_utf8(&bytes[..n]) else {continue};
+            for (at,_) in source.match_indices(symbol){
+                let word=|b:u8|b.is_ascii_alphanumeric()||b==b'_';
+                if (at>0&&word(source.as_bytes()[at-1]))||
+                    (at+symbol.len()<n&&word(source.as_bytes()[at+symbol.len()])) {
+                    continue;
+                }
+                if total>=start&&total<end{
+                    let mut m=ProjectMatch::EMPTY;
+                    m.file[..name.len()].copy_from_slice(name.as_bytes());
+                    m.file_len=name.len();m.byte_offset=at;
+                    staged[used]=m;used+=1;
+                }
+                total=total.checked_add(1).ok_or(Error::Full)?;
+            }
+        }
+        if start>total{return Err(Error::Invalid);}
+        out[..used].copy_from_slice(&staged[..used]);
+        Ok((used,if total>end{Some(end)}else{None}))
+    }
+
+    /// Copy a real file only if its observed bytes match the calling
+    /// editor's fingerprint. FNV is a non-security conflict indicator.
+    pub fn copy_source_if_checksum<D:BlockDevice>(&mut self,caller:Identity,
+        fs:&mut HierVfs<D>,source:&str,destination:&str,expected:u64)
+        ->Result<u64,Error>{
+        self.check_fresh(caller,fs)?;
+        if source==destination{return Err(Error::Invalid);}
+        let digest=self.source_checksum(caller,fs,source)?;
+        if digest!=expected{return Err(Error::Stale);}
+        let (a,alen)=self.child(source)?;
+        let (b,blen)=self.child(destination)?;
+        fs.copy_file(Self::str_path(&a,alen),Self::str_path(&b,blen))?;
+        self.generation=fs.generation();
+        Ok(self.generation)
+    }
+
+    /// Rename only the precise disk version examined by a source editor.
+    /// Never overwrite an existing project entry or grant path traversal.
+    pub fn rename_source_if_checksum<D:BlockDevice>(&mut self,caller:Identity,
+        fs:&mut HierVfs<D>,source:&str,destination:&str,expected:u64)
+        ->Result<u64,Error>{
+        self.check_fresh(caller,fs)?;
+        if source==destination{return Err(Error::Invalid);}
+        if self.source_checksum(caller,fs,source)?!=expected{return Err(Error::Stale);}
+        let (a,alen)=self.child(source)?;
+        let (b,blen)=self.child(destination)?;
+        fs.rename_file(Self::str_path(&a,alen),Self::str_path(&b,blen))?;
+        self.generation=fs.generation();
+        Ok(self.generation)
+    }
+}
+
+#[cfg(test)]
+mod r078_project_source_tests {
+    use super::*;
+    use crate::block::{BlockError,SECTOR_BYTES};
+    struct Disk{sectors:[[u8;SECTOR_BYTES];100]}
+    impl BlockDevice for Disk {
+        fn sector_count(&self)->u64{100}
+        fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+            ->Result<(),BlockError>{
+            *out=*self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?;Ok(())
+        }
+        fn write_sector(&mut self,lba:u64,bytes:&[u8;SECTOR_BYTES])
+            ->Result<(),BlockError>{
+            *self.sectors.get_mut(lba as usize).ok_or(BlockError::OutOfRange)?=*bytes;Ok(())
+        }
+    }
+    fn id()->Identity{Identity{pid:43,generation:1}}
+    fn ready()->(HierVfs<Disk>,ProjectTree){
+        let mut fs=HierVfs::format_blank(Disk{sectors:[[0;SECTOR_BYTES];100]}).unwrap();
+        let mut p=ProjectTree::new();
+        p.create(id(),&mut fs,"demo").unwrap();
+        p.create_file(id(),&mut fs,"main","α foo foo_bar\nfoo\n".as_bytes()).unwrap();
+        p.create_file(id(),&mut fs,"other",b"foo foo2 foo").unwrap();
+        (fs,p)
+    }
+    #[test]
+    fn page_only_complete_rows_and_find_whole_identifiers(){
+        let (mut fs,p)=ready();
+        let mut rows=[0u8;15];
+        let (n,cursor)=p.source_line_page(id(),&mut fs,"main",0,&mut rows).unwrap();
+        assert_eq!(&rows[..n],"α foo foo_bar\n".as_bytes());
+        assert_eq!(cursor,Some(1));
+        assert_eq!(p.source_line_page(id(),&mut fs,"main",1,&mut rows),
+            Ok((4,None)));
+        let mut results=[ProjectMatch::EMPTY;2];
+        assert_eq!(p.search_identifier_page(id(),&mut fs,"foo",0,&mut results),
+            Ok((2,Some(2))));
+        assert_eq!(results[0].byte_offset,3);
+        assert_eq!(results[1].byte_offset,15);
+        assert_eq!(p.search_identifier_page(id(),&mut fs,"foo",2,&mut results),
+            Ok((2,None)));
+    }
+    #[test]
+    fn expected_digest_copy_and_rename_are_durable_and_fail_closed(){
+        let (mut fs,mut p)=ready();
+        let hash=p.source_checksum(id(),&mut fs,"main").unwrap();
+        assert_eq!(p.copy_source_if_checksum(id(),&mut fs,"main","clone",hash^1),
+            Err(Error::Stale));
+        p.copy_source_if_checksum(id(),&mut fs,"main","clone",hash).unwrap();
+        let checksum=p.source_checksum(id(),&mut fs,"clone").unwrap();
+        assert_eq!(checksum,hash);
+        p.rename_source_if_checksum(id(),&mut fs,"clone","renamed",hash).unwrap();
+        let mut fs=HierVfs::mount(fs.into_device()).unwrap();
+        let mut p=ProjectTree::new();p.open(id(),&mut fs,"demo").unwrap();
+        let mut out=[0u8;40];
+        let n=p.read_file(id(),&mut fs,"renamed",&mut out).unwrap();
+        assert_eq!(&out[..n],"α foo foo_bar\nfoo\n".as_bytes());
+        let before=fs.generation();
+        assert_eq!(p.rename_source_if_checksum(id(),&mut fs,"renamed","other",hash),
+            Err(Error::Fs(FsError::Exists)));
+        assert_eq!(fs.generation(),before);
+        assert_eq!(p.copy_source_if_checksum(Identity{generation:2,..id()},
+            &mut fs,"renamed","bad",hash),Err(Error::Unauthorized));
+    }
+}

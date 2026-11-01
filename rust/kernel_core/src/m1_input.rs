@@ -2042,3 +2042,80 @@ mod r075_expanded_shell_edit_tests {
         assert_eq!(input.caret(), before);
     }
 }
+
+
+// M1/R078 workstream 4 (tasks 13-16): word selection/editing in the
+// session-owned live Terminal draft. No command is executed implicitly.
+impl InputLine {
+    /// Select an ASCII identifier adjacent to the caret. Spaces and shell
+    /// punctuation are delimiters; no UTF-8 assumption or heap allocation.
+    pub fn word_range_at_caret(&self)->Result<(usize,usize),Error>{
+        let bytes=self.editor.bytes();
+        let caret=self.editor.caret();
+        if caret>bytes.len(){return Err(Error::Invalid);}
+        let word=|b:u8|b.is_ascii_alphanumeric()||b==b'_';
+        let at=if caret<bytes.len()&&word(bytes[caret]){
+            caret
+        }else if caret>0&&word(bytes[caret-1]){
+            caret-1
+        }else{return Err(Error::Invalid)};
+        let mut start=at;let mut end=at+1;
+        while start>0&&word(bytes[start-1]){start-=1;}
+        while end<bytes.len()&&word(bytes[end]){end+=1;}
+        Ok((start,end))
+    }
+    /// Copy the whole identifier under/just before the caret into the
+    /// process-private clipboard. A miss keeps existing clipboard intact.
+    pub fn copy_caret_word(&mut self)->Result<usize,Error>{
+        let (a,b)=self.word_range_at_caret()?;
+        self.copy_range(a,b)
+    }
+    /// Cut only the selected word; existing suffix and spaces are retained.
+    pub fn cut_caret_word(&mut self)->Result<usize,Error>{
+        let (a,b)=self.word_range_at_caret()?;
+        self.cut_range(a,b)
+    }
+    /// Replace a command identifier without Enter, preserving history and
+    /// clipboard. The existing atomic editor checks ASCII and capacity.
+    pub fn replace_caret_word(&mut self,replacement:&[u8])->Result<Event,Error>{
+        let (a,b)=self.word_range_at_caret()?;
+        self.replace_range(a,b,replacement)
+    }
+}
+
+#[cfg(test)]
+mod r078_caret_word_tests {
+    use super::*;
+    #[test]
+    fn word_copy_cut_paste_and_explicit_replacement_edit_live_draft(){
+        let mut line=InputLine::new();
+        line.set_line(b"run alpha_beta").unwrap();
+        assert_eq!(line.word_range_at_caret(),Ok((4,14)));
+        assert_eq!(line.copy_caret_word(),Ok(10));
+        assert_eq!(line.clipboard_bytes(),b"alpha_beta");
+        assert_eq!(line.replace_caret_word(b"code"),Ok(Event::Typed));
+        assert_eq!(line.bytes(),b"run code");
+        assert_eq!(line.cut_caret_word(),Ok(4));
+        assert_eq!(line.bytes(),b"run ");
+        assert_eq!(line.clipboard_bytes(),b"code");
+        assert_eq!(line.paste_clipboard(),Ok(Event::Typed));
+        assert_eq!(line.bytes(),b"run code");
+        assert_eq!(line.history_count(),0);
+    }
+    #[test]
+    fn missing_word_invalid_ascii_and_overlong_replacement_are_atomic(){
+        let mut line=InputLine::new();
+        line.set_line(b"build").unwrap();
+        line.copy_caret_word().unwrap();
+        assert_eq!(line.replace_caret_word(b"\n"),Err(Error::Invalid));
+        assert_eq!(line.replace_caret_word(&[b'x';MAX_LINE+1]),Err(Error::Full));
+        assert_eq!(line.bytes(),b"build");
+        assert_eq!(line.clipboard_bytes(),b"build");
+        line.set_line(b" ").unwrap();
+        assert_eq!(line.copy_caret_word(),Err(Error::Invalid));
+        assert_eq!(line.cut_caret_word(),Err(Error::Invalid));
+        assert_eq!(line.replace_caret_word(b"oops"),Err(Error::Invalid));
+        assert_eq!(line.bytes(),b" ");
+        assert_eq!(line.clipboard_bytes(),b"build");
+    }
+}

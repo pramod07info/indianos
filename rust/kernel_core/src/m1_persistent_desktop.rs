@@ -2785,3 +2785,101 @@ mod r077_desktop_route_tests {
             &mut matches), Ok((1, None)));
     }
 }
+
+
+// M1/R078 workstream 5 (tasks 17-20): authenticated multi-document
+// source search and clipboard routing to the persistent developer desktop.
+impl<D:BlockDevice,const P:usize,const E:usize,const W:usize,
+ const K:usize,const G:usize,const Q:usize> Desktop<D,P,E,W,K,G,Q>{
+    pub fn editor_pool_find_text(&self,caller:Identity,now:u64,
+        pool:&crate::m1_disk_editor::EditorPool,slot:usize,needle:&str,from:usize)
+        ->Result<Option<usize>,EditorRouteError>{
+        self.admit_editor(caller,now,FILE_READ)?;
+        pool.find_text(caller,slot,needle,from).map_err(EditorRouteError::Editor)
+    }
+    pub fn editor_pool_copy_text(&self,caller:Identity,now:u64,
+        pool:&crate::m1_disk_editor::EditorPool,slot:usize,
+        from:usize,to:usize,out:&mut[u8])->Result<usize,EditorRouteError>{
+        self.admit_editor(caller,now,FILE_READ)?;
+        pool.copy_text(caller,slot,from,to,out).map_err(EditorRouteError::Editor)
+    }
+    pub fn editor_pool_cut_text(&mut self,caller:Identity,now:u64,
+        pool:&mut crate::m1_disk_editor::EditorPool,slot:usize,
+        from:usize,to:usize,out:&mut[u8])->Result<usize,EditorRouteError>{
+        self.admit_editor(caller,now,FILE_WRITE)?;
+        pool.cut_text(caller,slot,from,to,out).map_err(EditorRouteError::Editor)
+    }
+    pub fn editor_pool_paste_text(&mut self,caller:Identity,now:u64,
+        pool:&mut crate::m1_disk_editor::EditorPool,slot:usize,
+        from:usize,to:usize,content:&str)->Result<usize,EditorRouteError>{
+        self.admit_editor(caller,now,FILE_WRITE)?;
+        pool.paste_text(caller,slot,from,to,content).map_err(EditorRouteError::Editor)
+    }
+}
+
+#[cfg(test)]
+mod r078_desktop_multi_document_tests {
+    use super::*;
+    use crate::block::{BlockError,SECTOR_BYTES};
+    use crate::batch2_launcher::Image;
+    use crate::batch2_settings::{Settings,Theme};
+    use crate::m1_disk_editor::EditorPool;
+    struct Disk{sectors:[[u8;SECTOR_BYTES];100]}
+    impl BlockDevice for Disk {
+        fn sector_count(&self)->u64{100}
+        fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+            ->Result<(),BlockError>{
+            *out=*self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?;Ok(())
+        }
+        fn write_sector(&mut self,lba:u64,data:&[u8;SECTOR_BYTES])
+            ->Result<(),BlockError>{
+            *self.sectors.get_mut(lba as usize).ok_or(BlockError::OutOfRange)?=*data;Ok(())
+        }
+    }
+    type Desk=Desktop<Disk,3,3,2,2,3,8>;
+    fn id(pid:u32)->Identity{Identity{pid,generation:1}}
+    fn launch(pid:u32)->Launch{
+        Launch{pid,generation:1,image:Image{
+            image_id:pid,entry:0x1000,mapped_end:0x2000,verified:true
+        }}
+    }
+    fn ready()->Desk{
+        let mut fs=HierVfs::format_blank(Disk{sectors:[[0;SECTOR_BYTES];100]}).unwrap();
+        fs.create("/src","α read".as_bytes()).unwrap();
+        let mut d=Desk::from_mounted(fs);
+        d.start(id(1),launch(1),id(2),launch(2),
+            Settings{theme:Theme::Dark,pointer_speed:5,key_repeat:10},8,5).unwrap();
+        d
+    }
+    #[test]
+    fn approved_desktop_can_find_copy_cut_and_paste_verified_utf8_to_disk(){
+        let mut d=ready();
+        let mut pool=EditorPool::new();
+        d.editor_pool_open(id(2),1,&mut pool,0,"/src").unwrap();
+        assert_eq!(d.editor_pool_find_text(id(2),1,&pool,0,"read",0),Ok(Some(3)));
+        let mut clip=[0u8;16];
+        assert_eq!(d.editor_pool_copy_text(id(2),1,&pool,0,0,2,&mut clip),Ok(2));
+        assert_eq!(&clip[..2],"α".as_bytes());
+        assert_eq!(d.editor_pool_cut_text(id(2),1,&mut pool,0,0,2,&mut clip),Ok(2));
+        assert_eq!(d.editor_pool_paste_text(id(2),1,&mut pool,0,0,0,"β"),Ok(7));
+        d.editor_pool_save_all(id(2),1,&mut pool).unwrap();
+        let mut fs=HierVfs::mount(d.into_device()).unwrap();
+        let mut out=[0u8;16];
+        assert_eq!(fs.read("/src",&mut out),Ok(7));
+        assert_eq!(&out[..7],"β read".as_bytes());
+    }
+    #[test]
+    fn expired_and_recycled_desktop_process_never_leaks_or_edits_clipboard(){
+        let mut d=ready();
+        let mut pool=EditorPool::new();
+        d.editor_pool_open(id(2),1,&mut pool,0,"/src").unwrap();
+        let mut out=[0xbbu8;8];
+        assert!(d.editor_pool_find_text(id(2),6,&pool,0,"read",0).is_err());
+        assert!(d.editor_pool_copy_text(id(2),6,&pool,0,0,2,&mut out).is_err());
+        assert!(d.editor_pool_cut_text(id(2),6,&mut pool,0,0,2,&mut out).is_err());
+        assert!(d.editor_pool_paste_text(
+            Identity{generation:2,..id(2)},1,&mut pool,0,0,0,"X").is_err());
+        assert_eq!(out,[0xbb;8]);
+        assert!(!pool.status(id(2),0).unwrap().dirty);
+    }
+}
