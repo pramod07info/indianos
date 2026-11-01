@@ -1669,3 +1669,91 @@ mod r072_editor_tabs_tests {
         assert_eq!(e.expand_leading_source_tabs(id()), Err(Error::Invalid));
     }
 }
+
+
+/// R073 source hygiene: strip a UTF-8 BOM at file start and ensure nonempty
+/// UTF-8 source ends in LF. Stages both changes as one undoable edit;
+/// invalid UTF-8, NUL, size overflow and foreign owners fail closed.
+/// Returns the number of hygiene actions (BOM removed and/or LF appended).
+impl DiskEditor {
+    pub fn clean_source_encoding_and_eof(&mut self, caller: Identity) -> Result<usize, Error> {
+        self.authorize(caller)?;
+        let original = core::str::from_utf8(&self.data[..self.used])
+            .map_err(|_| Error::Invalid)?;
+        if original.as_bytes().contains(&0) { return Err(Error::Invalid); }
+        let bom = original.as_bytes().starts_with(&[0xef, 0xbb, 0xbf]);
+        let start = if bom { 3 } else { 0 };
+        let body = &self.data[start..self.used];
+        let add_lf = !body.is_empty() && !body.ends_with(b"\n");
+        let target = body.len() + usize::from(add_lf);
+        if target > MAX_FILE_BYTES { return Err(Error::Full); }
+        let count = usize::from(bom) + usize::from(add_lf);
+        if count == 0 { return Ok(0); }
+        let mut staged = [0u8; MAX_FILE_BYTES];
+        staged[..body.len()].copy_from_slice(body);
+        if add_lf { staged[body.len()] = b'\n'; }
+        self.replace(caller, 0, self.used, &staged[..target])?;
+        Ok(count)
+    }
+}
+
+#[cfg(test)]
+mod r073_source_hygiene_tests {
+    use super::*;
+    use crate::block::{BlockError, SECTOR_BYTES};
+    struct Disk { sectors: [[u8; SECTOR_BYTES]; 100] }
+    impl BlockDevice for Disk {
+        fn sector_count(&self) -> u64 { 100 }
+        fn read_sector(&mut self, lba: u64, out: &mut [u8; SECTOR_BYTES]) -> Result<(), BlockError> {
+            *out = *self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?;
+            Ok(())
+        }
+        fn write_sector(&mut self, lba: u64, data: &[u8; SECTOR_BYTES]) -> Result<(), BlockError> {
+            *self.sectors.get_mut(lba as usize).ok_or(BlockError::OutOfRange)? = *data;
+            Ok(())
+        }
+    }
+    fn id() -> Identity { Identity { pid: 4, generation: 5 } }
+    fn volume() -> HierVfs<Disk> {
+        let mut fs = HierVfs::format_blank(Disk { sectors: [[0; SECTOR_BYTES]; 100] }).unwrap();
+        fs.create("/src", "\u{feff}α\nβ".as_bytes()).unwrap();
+        fs.create("/binary", &[0xff, 0xfe]).unwrap();
+        fs.create("/nul", b"bad\0data").unwrap();
+        fs
+    }
+    #[test]
+    fn removes_bom_appends_lf_undoes_redoes_and_remounts() {
+        let mut fs = volume();
+        let mut e = DiskEditor::new();
+        e.open(id(), &mut fs, "/src").unwrap();
+        let old = "\u{feff}α\nβ";
+        let next = "α\nβ\n";
+        assert_eq!(e.clean_source_encoding_and_eof(id()), Ok(2));
+        assert_eq!(e.undo(id()), Ok(old.len()));
+        assert_eq!(e.redo(id()), Ok(next.len()));
+        e.save(id(), &mut fs).unwrap();
+        assert_eq!(e.clean_source_encoding_and_eof(id()), Ok(0));
+        assert!(!e.status(id()).unwrap().dirty);
+        let mut fs = HierVfs::mount(fs.into_device()).unwrap();
+        let mut out = [0u8; 32];
+        assert_eq!(fs.read("/src", &mut out), Ok(next.len()));
+        assert_eq!(&out[..next.len()], next.as_bytes());
+    }
+    #[test]
+    fn corrupt_and_untrusted_sources_cannot_change_disk_or_editor() {
+        let mut fs = volume();
+        let mut e = DiskEditor::new();
+        e.open(id(), &mut fs, "/src").unwrap();
+        let generation = fs.generation();
+        assert_eq!(e.clean_source_encoding_and_eof(
+            Identity { generation: 6, ..id() }), Err(Error::Unauthorized));
+        assert!(!e.status(id()).unwrap().dirty);
+        e.close(id(), false).unwrap();
+        e.open(id(), &mut fs, "/binary").unwrap();
+        assert_eq!(e.clean_source_encoding_and_eof(id()), Err(Error::Invalid));
+        e.close(id(), false).unwrap();
+        e.open(id(), &mut fs, "/nul").unwrap();
+        assert_eq!(e.clean_source_encoding_and_eof(id()), Err(Error::Invalid));
+        assert_eq!(fs.generation(), generation);
+    }
+}

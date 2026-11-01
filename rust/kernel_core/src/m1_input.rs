@@ -1664,3 +1664,74 @@ mod r072_shell_argument_reorder_tests {
         assert_eq!(line.history_count(), 1);
     }
 }
+
+
+/// R073: replace exactly one whitespace-separated command argument while
+/// preserving the verb, other arguments, spacing and private clipboard.
+/// No shell execution occurs, and preflight protects the current draft.
+impl LineEditor {
+    pub fn replace_argument(&mut self, index: usize, replacement: &[u8])
+        -> Result<Event, Error> {
+        if replacement.is_empty() || replacement.iter().any(|b| !b.is_ascii_graphic()) {
+            return Err(Error::Invalid);
+        }
+        let mut cursor = 0usize;
+        let mut token = 0usize;
+        while cursor < self.len {
+            while cursor < self.len && self.line[cursor] == b' ' { cursor += 1; }
+            if cursor == self.len { break; }
+            let from = cursor;
+            while cursor < self.len && self.line[cursor] != b' ' { cursor += 1; }
+            if token == index {
+                if self.line[from..cursor] == *replacement { return Ok(Event::Empty); }
+                return self.replace_range(from, cursor, replacement);
+            }
+            token = token.checked_add(1).ok_or(Error::Invalid)?;
+        }
+        Err(Error::Invalid)
+    }
+}
+impl InputLine {
+    pub fn replace_argument(&mut self, index: usize, replacement: &[u8])
+        -> Result<Event, Error> {
+        let changed = self.editor.replace_argument(index, replacement)?;
+        if changed != Event::Empty {
+            self.history_cursor = None;
+            self.history_draft.fill(0);
+            self.history_draft_len = 0;
+        }
+        Ok(changed)
+    }
+}
+
+#[cfg(test)]
+mod r073_argument_replacement_tests {
+    use super::*;
+    #[test]
+    fn replaces_only_selected_token_and_keeps_history_clipboard() {
+        let mut line = InputLine::new();
+        let mut submitted = [0u8; MAX_LINE];
+        line.set_line(b"pwd").unwrap();
+        line.feed(b'\n', &mut submitted).unwrap();
+        line.set_line(b"git  checkout  OldPath  ").unwrap();
+        line.copy_range(4, 13).unwrap();
+        assert_eq!(line.replace_argument(2, b"new/Path"), Ok(Event::Typed));
+        assert_eq!(line.bytes(), b"git  checkout  new/Path  ");
+        assert_eq!(line.caret(), "git  checkout  new/Path".len());
+        assert_eq!(line.clipboard_bytes(), b" checkout");
+        assert_eq!(line.history_count(), 1);
+        assert_eq!(line.replace_argument(2, b"new/Path"), Ok(Event::Empty));
+    }
+    #[test]
+    fn bad_argument_invalid_bytes_and_capacity_are_atomic() {
+        let mut line = InputLine::new();
+        line.set_line(b"write /file old").unwrap();
+        let caret = line.caret();
+        assert_eq!(line.replace_argument(100, b"x"), Err(Error::Invalid));
+        assert_eq!(line.replace_argument(2, b"two words"), Err(Error::Invalid));
+        assert_eq!(line.replace_argument(2, b"\n"), Err(Error::Invalid));
+        assert_eq!(line.replace_argument(2, &[b'x'; MAX_LINE]), Err(Error::Full));
+        assert_eq!(line.bytes(), b"write /file old");
+        assert_eq!(line.caret(), caret);
+    }
+}

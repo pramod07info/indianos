@@ -19,7 +19,7 @@ pub const COMMAND_VERBS:&[&str]=&[
  "help","pwd","tools","ls","cat","write","append","mkdir","mv",
  "cp","rm","mkfile","truncate","head","count","rmdir","mvdir",
  "pread","pwrite","lines","line","hash","stat","tail","find","grep","cmp","diffat",
- "touch","copynew","replace","appendln","health","hex","slice","concat","cmprange","bytefreq","patchhex","patchrange","copylines","wc","headlines","rfind","taillines","linespan","linehits",
+ "touch","copynew","replace","appendln","health","hex","slice","concat","cmprange","bytefreq","patchhex","patchrange","copylines","wc","headlines","rfind","taillines","linespan","linehits","sourceview",
 ];
 /// Complete exactly one printable lower-case verb prefix. Ambiguous matches,
 /// empty prefixes and user-supplied paths never cause completion or I/O.
@@ -91,7 +91,7 @@ pub fn command<D:BlockDevice,const N:usize>(
  let line=entered.trim_end();
  if line=="help"{return publish(b"pwd ls /dir cat /path write /path text append /path text mkdir /dir mv /old /new cp /src /dst rm /path mkfile /path truncate /path head /path count rmdir /dir mvdir /old /new pread /file offset count pwrite /file@offset text",out);}
  if line=="pwd"{return publish(b"/",out);}
- if line=="tools"{return publish(b"count lines line tail find grep hash cmp diffat stat touch copynew replace appendln health hex slice concat cmprange bytefreq patchhex patchrange copylines wc headlines rfind taillines linespan linehits",out);}
+ if line=="tools"{return publish(b"count lines line tail find grep hash cmp diffat stat touch copynew replace appendln health hex slice concat cmprange bytefreq patchhex patchrange copylines wc headlines rfind taillines linespan linehits sourceview",out);}
  if line=="health"{
   auth.require(caller,FILE_READ,now).map_err(|_|Error::Denied)?;
   let health=fs.mounted_health().map_err(Error::Io)?;
@@ -293,6 +293,42 @@ pub fn command<D:BlockDevice,const N:usize>(
    }
    if written==0{publish(b"not found",out)}
    else{publish(&staged[..written],out)}
+  }
+  // Present a developer source snippet with stable 1-based line numbers.
+  // Every row and number is staged before the caller buffer is touched.
+  "sourceview"=>{
+   auth.require(caller,FILE_READ,now).map_err(|_|Error::Denied)?;
+   let mut args=raw.split_ascii_whitespace();
+   let file=args.next().ok_or(Error::Invalid)?;
+   let start=args.next().ok_or(Error::Invalid)?
+      .parse::<usize>().map_err(|_|Error::Invalid)?;
+   let count=args.next().ok_or(Error::Invalid)?
+      .parse::<usize>().map_err(|_|Error::Invalid)?;
+   if start==0||count==0||count>MAX_TRANSFER||args.next().is_some(){
+    return Err(Error::Invalid);
+   }
+   let stop=start.checked_add(count).ok_or(Error::Invalid)?;
+   let p=path(file,&mut name)?;
+   let mut content=[0u8;crate::durablefs::MAX_FILE_BYTES];
+   let size=fs.read(p,&mut content).map_err(Error::Io)?;
+   let text=core::str::from_utf8(&content[..size]).map_err(|_|Error::Invalid)?;
+   let mut staged=[0u8;crate::durablefs::MAX_FILE_BYTES];
+   let mut used=0usize;
+   let mut selected=0usize;
+   for (index,row) in text.split_inclusive('\n').enumerate(){
+    let line=index+1;
+    if line<start||line>=stop{continue;}
+    let digits=publish_number(line as u64,&mut staged[used..])?;
+    used+=digits;
+    let next=used.checked_add(2).and_then(|n|n.checked_add(row.len()))
+      .ok_or(Error::OutputTooSmall)?;
+    if next>staged.len(){return Err(Error::OutputTooSmall);}
+    staged[used]=b'|';staged[used+1]=b' ';used+=2;
+    staged[used..used+row.len()].copy_from_slice(row.as_bytes());
+    used+=row.len();selected+=1;
+   }
+   if selected!=count{return Err(Error::Invalid);}
+   publish(&staged[..used],out)
   }
   "tail"=>{
    auth.require(caller,FILE_READ,now).map_err(|_|Error::Denied)?;
@@ -1237,8 +1273,8 @@ mod tests{
   assert_eq!(complete_verb(b"heal"),Some("health"));
  }
  #[test]fn r044_command_registry_drives_unique_safe_completion(){
-  // R072 extends the registered CLI with `linehits`.
-  assert_eq!(COMMAND_VERBS.len(),47);
+  // R073 extends the registered CLI with `sourceview`.
+  assert_eq!(COMMAND_VERBS.len(),48);
   for (i,verb) in COMMAND_VERBS.iter().enumerate(){
    assert!(verb.as_bytes().iter().all(|b|b.is_ascii_lowercase()));
    assert!(!COMMAND_VERBS[..i].contains(verb));
@@ -1254,6 +1290,7 @@ mod tests{
   assert_eq!(complete_verb(b"tailli"),Some("taillines"));
   assert_eq!(complete_verb(b"linesp"),Some("linespan"));
   assert_eq!(complete_verb(b"lineh"),Some("linehits"));
+  assert_eq!(complete_verb(b"sourcev"),Some("sourceview"));
   assert_eq!(complete_verb(b"hea"),None);
   assert_eq!(complete_verb(b"rmd"),Some("rmdir"));
   assert_eq!(complete_verb(b"app"),None);
@@ -2765,5 +2802,64 @@ mod r072_terminal_matching_lines_tests {
             b"linehits /src foo", &mut output), Err(Error::Denied));
         assert_eq!(output, [0x61; 2]);
         assert_eq!(fs.generation(), baseline);
+    }
+}
+
+
+#[cfg(test)]
+mod r073_terminal_numbered_source_tests {
+    use super::*;
+    use crate::block::{BlockError, SECTOR_BYTES};
+    struct Disk { sectors: [[u8; SECTOR_BYTES]; 100] }
+    impl BlockDevice for Disk {
+        fn sector_count(&self) -> u64 { 100 }
+        fn read_sector(&mut self, lba: u64, out: &mut [u8; SECTOR_BYTES]) -> Result<(), BlockError> {
+            *out = *self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?;
+            Ok(())
+        }
+        fn write_sector(&mut self, lba: u64, data: &[u8; SECTOR_BYTES]) -> Result<(), BlockError> {
+            *self.sectors.get_mut(lba as usize).ok_or(BlockError::OutOfRange)? = *data;
+            Ok(())
+        }
+    }
+    fn id() -> Identity { Identity { pid: 6, generation: 7 } }
+    fn ready() -> (HierVfs<Disk>, Access<1>) {
+        let mut fs = HierVfs::format_blank(Disk { sectors: [[0; SECTOR_BYTES]; 100] }).unwrap();
+        fs.create("/source", "α\nβ\nγ".as_bytes()).unwrap();
+        fs.create("/binary", &[0xff, 0xfe]).unwrap();
+        let mut auth = Access::new();
+        auth.grant(id(), FILE_READ, 60).unwrap();
+        (fs, auth)
+    }
+    #[test]
+    fn renders_numbered_unicode_lines_and_survives_real_reboot() {
+        let (mut fs, auth) = ready();
+        let generation = fs.generation();
+        let mut out = [0u8; 48];
+        let rows = "2| β\n3| γ";
+        assert_eq!(command(&mut fs, &auth, id(), 1,
+            b"sourceview /source 2 2", &mut out), Ok(rows.len()));
+        assert_eq!(&out[..rows.len()], rows.as_bytes());
+        fs = HierVfs::mount(fs.into_device()).unwrap();
+        assert_eq!(command(&mut fs, &auth, id(), 1,
+            b"sourceview /source 1 1", &mut out), Ok("1| α\n".len()));
+        assert_eq!(&out[.."1| α\n".len()], "1| α\n".as_bytes());
+        assert_eq!(fs.generation(), generation);
+    }
+    #[test]
+    fn short_output_invalid_utf8_and_expired_owner_publish_nothing() {
+        let (mut fs, auth) = ready();
+        let generation = fs.generation();
+        let mut out = [0x45u8; 3];
+        assert_eq!(command(&mut fs, &auth, id(), 1,
+            b"sourceview /source 2 2", &mut out), Err(Error::OutputTooSmall));
+        assert_eq!(command(&mut fs, &auth, id(), 1,
+            b"sourceview /source 3 2", &mut out), Err(Error::Invalid));
+        assert_eq!(command(&mut fs, &auth, id(), 1,
+            b"sourceview /binary 1 1", &mut out), Err(Error::Invalid));
+        assert_eq!(command(&mut fs, &auth, id(), 61,
+            b"sourceview /source 1 1", &mut out), Err(Error::Denied));
+        assert_eq!(out, [0x45; 3]);
+        assert_eq!(fs.generation(), generation);
     }
 }
