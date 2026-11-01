@@ -1735,3 +1735,83 @@ mod r073_argument_replacement_tests {
         assert_eq!(line.caret(), caret);
     }
 }
+
+
+/// R074: delete one indexed whitespace-delimited argument from the unsent
+/// terminal draft, removing the appropriate adjacent separator without
+/// destroying unrelated tokens, history or the private clipboard.
+impl LineEditor {
+    pub fn delete_argument(&mut self, index: usize) -> Result<Event, Error> {
+        let mut at = 0usize;
+        let mut ordinal = 0usize;
+        let mut match_range = None;
+        while at < self.len {
+            while at < self.len && self.line[at] == b' ' { at += 1; }
+            if at == self.len { break; }
+            let start = at;
+            while at < self.len && self.line[at] != b' ' { at += 1; }
+            let end = at;
+            if ordinal == index { match_range = Some((start, end)); break; }
+            ordinal = ordinal.checked_add(1).ok_or(Error::Invalid)?;
+        }
+        let (start, end) = match_range.ok_or(Error::Invalid)?;
+        // If another token follows, consume our following spaces; otherwise
+        // remove our preceding spaces and any trailing blanks as well.
+        let mut after = end;
+        while after < self.len && self.line[after] == b' ' { after += 1; }
+        if after < self.len {
+            self.replace_range(start, after, b"")
+        } else {
+            let mut before = start;
+            while before > 0 && self.line[before-1] == b' ' { before -= 1; }
+            self.replace_range(before, self.len, b"")
+        }
+    }
+}
+impl InputLine {
+    pub fn delete_argument(&mut self, index: usize) -> Result<Event, Error> {
+        let action = self.editor.delete_argument(index)?;
+        if action != Event::Empty {
+            self.history_cursor = None;
+            self.history_draft.fill(0);
+            self.history_draft_len = 0;
+        }
+        Ok(action)
+    }
+}
+
+#[cfg(test)]
+mod r074_terminal_token_delete_tests {
+    use super::*;
+    #[test]
+    fn deletes_middle_final_and_command_tokens_preserving_neighbors() {
+        let mut input = InputLine::new();
+        input.set_line(b"git  checkout   MyFile  now").unwrap();
+        assert_eq!(input.delete_argument(1), Ok(Event::Erased));
+        assert_eq!(input.bytes(), b"git  MyFile  now");
+        assert_eq!(input.delete_argument(2), Ok(Event::Erased));
+        assert_eq!(input.bytes(), b"git  MyFile");
+        assert_eq!(input.delete_argument(0), Ok(Event::Erased));
+        assert_eq!(input.bytes(), b"MyFile");
+        assert_eq!(input.delete_argument(0), Ok(Event::Erased));
+        assert_eq!(input.bytes(), b"");
+    }
+    #[test]
+    fn invalid_index_preserves_input_cursor_history_and_clipboard() {
+        let mut input = InputLine::new();
+        let mut submitted = [0u8; MAX_LINE];
+        input.set_line(b"pwd").unwrap();
+        input.feed(b'\n', &mut submitted).unwrap();
+        input.set_line(b"cat /source").unwrap();
+        input.copy_range(4, 11).unwrap();
+        let caret = input.caret();
+        assert_eq!(input.delete_argument(3), Err(Error::Invalid));
+        assert_eq!(input.delete_argument(usize::MAX), Err(Error::Invalid));
+        assert_eq!(input.bytes(), b"cat /source");
+        assert_eq!(input.caret(), caret);
+        assert_eq!(input.history_count(), 1);
+        assert_eq!(input.clipboard_bytes(), b"/source");
+        input.set_line(b"    ").unwrap();
+        assert_eq!(input.delete_argument(0), Err(Error::Invalid));
+    }
+}

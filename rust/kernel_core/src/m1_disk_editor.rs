@@ -1757,3 +1757,118 @@ mod r073_source_hygiene_tests {
         assert_eq!(fs.generation(), generation);
     }
 }
+
+
+/// R074: move a source row up or down by swapping its UTF-8 payload with
+/// the adjacent row while retaining newline delimiters at the two positions.
+/// Works even when the final row lacks a terminating LF. The entire swap is
+/// one undoable unsaved operation; bad rows, binary data and stale owners
+/// preserve both document contents and disk state.
+impl DiskEditor {
+    pub fn move_source_line_one(&mut self, caller: Identity, line: usize,
+        down: bool) -> Result<bool, Error> {
+        self.authorize(caller)?;
+        let source = core::str::from_utf8(&self.data[..self.used])
+            .map_err(|_| Error::Invalid)?;
+        if line == 0 { return Err(Error::Invalid); }
+        let mut ranges = [(0usize, 0usize, 0usize); 2];
+        let (first, second) = if down {
+            (line, line.checked_add(1).ok_or(Error::Invalid)?)
+        } else {
+            if line <= 1 { return Err(Error::Invalid); }
+            (line - 1, line)
+        };
+        let mut offset = 0usize;
+        for (i, row) in source.split_inclusive('\n').enumerate() {
+            let ordinal = i + 1;
+            let end = offset + row.len();
+            let body_end = if row.ends_with('\n') { end - 1 } else { end };
+            if ordinal == first { ranges[0] = (offset, body_end, end); }
+            if ordinal == second { ranges[1] = (offset, body_end, end); }
+            offset = end;
+        }
+        let (a, a_end, a_row_end) = ranges[0];
+        let (b, b_end, b_row_end) = ranges[1];
+        if a_row_end == 0 || b_row_end == 0 || a_row_end != b {
+            return Err(Error::Invalid);
+        }
+        let mut staged = [0u8; MAX_FILE_BYTES];
+        let mut used = 0usize;
+        // Preceding source rows.
+        staged[..a].copy_from_slice(&self.data[..a]);
+        used += a;
+        // The second row's body occupies the first row's newline slot.
+        staged[used..used + b_end-b].copy_from_slice(&self.data[b..b_end]);
+        used += b_end-b;
+        staged[used..used + a_row_end-a_end]
+            .copy_from_slice(&self.data[a_end..a_row_end]);
+        used += a_row_end-a_end;
+        // The first row's body occupies the second row's newline slot.
+        staged[used..used + a_end-a].copy_from_slice(&self.data[a..a_end]);
+        used += a_end-a;
+        staged[used..used + b_row_end-b_end]
+            .copy_from_slice(&self.data[b_end..b_row_end]);
+        used += b_row_end-b_end;
+        staged[used..self.used].copy_from_slice(&self.data[b_row_end..self.used]);
+        if staged[..self.used] == self.data[..self.used] { return Ok(false); }
+        self.replace(caller, 0, self.used, &staged[..self.used])?;
+        Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod r074_move_source_rows_tests {
+    use super::*;
+    use crate::block::{BlockError, SECTOR_BYTES};
+    struct Disk { sectors: [[u8; SECTOR_BYTES]; 100] }
+    impl BlockDevice for Disk {
+        fn sector_count(&self) -> u64 { 100 }
+        fn read_sector(&mut self, lba: u64, out: &mut [u8; SECTOR_BYTES]) -> Result<(), BlockError> {
+            *out = *self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?;
+            Ok(())
+        }
+        fn write_sector(&mut self, lba: u64, data: &[u8; SECTOR_BYTES]) -> Result<(), BlockError> {
+            *self.sectors.get_mut(lba as usize).ok_or(BlockError::OutOfRange)? = *data;
+            Ok(())
+        }
+    }
+    fn owner() -> Identity { Identity { pid: 11, generation: 3 } }
+    fn ready() -> HierVfs<Disk> {
+        let mut fs = HierVfs::format_blank(Disk { sectors: [[0; SECTOR_BYTES]; 100] }).unwrap();
+        fs.create("/source", "α\nβ\nγ".as_bytes()).unwrap();
+        fs.create("/binary", &[0xff, 0x80]).unwrap();
+        fs
+    }
+    #[test]
+    fn moves_unicode_rows_with_nonterminated_final_row_and_survives_remount() {
+        let mut fs = ready();
+        let mut editor = DiskEditor::new();
+        editor.open(owner(), &mut fs, "/source").unwrap();
+        let original = "α\nβ\nγ";
+        let moved = "α\nγ\nβ";
+        assert_eq!(editor.move_source_line_one(owner(), 2, true), Ok(true));
+        assert_eq!(editor.undo(owner()), Ok(original.len()));
+        assert_eq!(editor.redo(owner()), Ok(moved.len()));
+        editor.save(owner(), &mut fs).unwrap();
+        let mut mounted = HierVfs::mount(fs.into_device()).unwrap();
+        let mut output = [0u8; 32];
+        assert_eq!(mounted.read("/source", &mut output), Ok(moved.len()));
+        assert_eq!(&output[..moved.len()], moved.as_bytes());
+    }
+    #[test]
+    fn wrong_row_stale_identity_and_binary_source_never_modify_editor() {
+        let mut fs = ready();
+        let mut editor = DiskEditor::new();
+        editor.open(owner(), &mut fs, "/source").unwrap();
+        let before = fs.generation();
+        assert_eq!(editor.move_source_line_one(owner(), 3, true), Err(Error::Invalid));
+        assert_eq!(editor.move_source_line_one(owner(), 1, false), Err(Error::Invalid));
+        assert_eq!(editor.move_source_line_one(
+            Identity { generation: 4, ..owner() }, 2, true), Err(Error::Unauthorized));
+        assert!(!editor.status(owner()).unwrap().dirty);
+        editor.close(owner(), false).unwrap();
+        editor.open(owner(), &mut fs, "/binary").unwrap();
+        assert_eq!(editor.move_source_line_one(owner(), 1, true), Err(Error::Invalid));
+        assert_eq!(fs.generation(), before);
+    }
+}
