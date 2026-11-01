@@ -2883,3 +2883,106 @@ mod r078_desktop_multi_document_tests {
         assert!(!pool.status(id(2),0).unwrap().dirty);
     }
 }
+
+
+// M1/R079 workstation 5: four project-review routes through the authenticated
+// Desktop session. No unprivileged caller may invoke these as bare VFS writes.
+impl<D:BlockDevice,const P:usize,const E:usize,const W:usize,
+ const K:usize,const G:usize,const Q:usize> Desktop<D,P,E,W,K,G,Q>{
+    pub fn project_source_summary(&mut self,caller:Identity,now:u64,
+        project:&crate::m1_project_workspace::ProjectTree,name:&str)
+        ->Result<crate::m1_project_workspace::SourceSummary,ProjectRouteError>{
+        self.admit_editor(caller,now,FILE_READ).map_err(ProjectRouteError::Permission)?;
+        project.source_summary(caller,&mut self.volume,name).map_err(ProjectRouteError::Project)
+    }
+    pub fn project_compare_source_files(&mut self,caller:Identity,now:u64,
+        project:&crate::m1_project_workspace::ProjectTree,left:&str,right:&str)
+        ->Result<Option<usize>,ProjectRouteError>{
+        self.admit_editor(caller,now,FILE_READ).map_err(ProjectRouteError::Permission)?;
+        project.compare_source_files(caller,&mut self.volume,left,right)
+            .map_err(ProjectRouteError::Project)
+    }
+    pub fn project_replace_source_if_checksum(&mut self,caller:Identity,now:u64,
+        project:&mut crate::m1_project_workspace::ProjectTree,
+        name:&str,expected:u64,new_text:&str)->Result<u64,ProjectRouteError>{
+        self.admit_editor(caller,now,FILE_WRITE).map_err(ProjectRouteError::Permission)?;
+        project.replace_source_if_checksum(caller,&mut self.volume,name,expected,new_text)
+            .map_err(ProjectRouteError::Project)
+    }
+    pub fn project_delete_source_if_checksum(&mut self,caller:Identity,now:u64,
+        project:&mut crate::m1_project_workspace::ProjectTree,
+        name:&str,expected:u64)->Result<u64,ProjectRouteError>{
+        self.admit_editor(caller,now,FILE_WRITE).map_err(ProjectRouteError::Permission)?;
+        project.delete_source_if_checksum(caller,&mut self.volume,name,expected)
+            .map_err(ProjectRouteError::Project)
+    }
+}
+#[cfg(test)]
+mod r079_desktop_source_review_tests{
+    use super::*;
+    use crate::block::{BlockError,SECTOR_BYTES};
+    use crate::batch2_launcher::Image;
+    use crate::batch2_settings::{Settings,Theme};
+    use crate::m1_project_workspace::ProjectTree;
+    struct Disk{sectors:[[u8;SECTOR_BYTES];100]}
+    impl BlockDevice for Disk {
+        fn sector_count(&self)->u64{100}
+        fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+            ->Result<(),BlockError>{
+            *out=*self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?;Ok(())
+        }
+        fn write_sector(&mut self,lba:u64,data:&[u8;SECTOR_BYTES])
+            ->Result<(),BlockError>{
+            *self.sectors.get_mut(lba as usize).ok_or(BlockError::OutOfRange)?=*data;Ok(())
+        }
+    }
+    type Desk=Desktop<Disk,3,3,2,2,3,8>;
+    fn id(pid:u32)->Identity{Identity{pid,generation:1}}
+    fn launch(pid:u32)->Launch{
+        Launch{pid,generation:1,image:Image{
+            image_id:pid,entry:0x1000,mapped_end:0x2000,verified:true
+        }}
+    }
+    fn ready()->Desk{
+        let fs=HierVfs::format_blank(Disk{sectors:[[0;SECTOR_BYTES];100]}).unwrap();
+        let mut d=Desk::from_mounted(fs);
+        d.start(id(1),launch(1),id(2),launch(2),
+            Settings{theme:Theme::Dark,pointer_speed:5,key_repeat:10},8,5).unwrap();
+        d
+    }
+    #[test]
+    fn authorized_source_summary_compare_replace_and_delete_commit_to_disk(){
+        let mut d=ready();let mut project=ProjectTree::new();
+        d.project_create(id(2),1,&mut project,"demo").unwrap();
+        d.project_create_file(id(2),1,&mut project,"one","α old\n".as_bytes()).unwrap();
+        d.project_create_file(id(2),1,&mut project,"two","α old\n".as_bytes()).unwrap();
+        let summary=d.project_source_summary(id(2),1,&project,"one").unwrap();
+        assert_eq!(summary.lines,1);
+        assert_eq!(d.project_compare_source_files(id(2),1,&project,"one","two"),Ok(None));
+        d.project_replace_source_if_checksum(id(2),1,&mut project,
+            "one",summary.fnv64,"α new\n").unwrap();
+        assert!(d.project_compare_source_files(id(2),1,&project,"one","two")
+            .unwrap().is_some());
+        d.project_delete_source_if_checksum(id(2),1,&mut project,"two",summary.fnv64).unwrap();
+        let mut fs=HierVfs::mount(d.into_device()).unwrap();
+        let mut output=[0u8;20];
+        let n=fs.read("/work/demo/one",&mut output).unwrap();
+        assert_eq!(&output[..n],"α new\n".as_bytes());
+        assert!(fs.read("/work/demo/two",&mut output).is_err());
+    }
+    #[test]
+    fn expired_grants_and_recycled_identity_block_read_and_destructive_edits(){
+        let mut d=ready();let mut project=ProjectTree::new();
+        d.project_create(id(2),1,&mut project,"demo").unwrap();
+        d.project_create_file(id(2),1,&mut project,"one",b"safe").unwrap();
+        let digest=d.project_source_summary(id(2),1,&project,"one").unwrap().fnv64;
+        assert!(d.project_source_summary(id(2),6,&project,"one").is_err());
+        assert!(d.project_compare_source_files(id(2),6,&project,"one","one").is_err());
+        assert!(d.project_replace_source_if_checksum(id(2),6,&mut project,"one",digest,"X").is_err());
+        assert!(d.project_delete_source_if_checksum(
+            Identity{generation:2,..id(2)},1,&mut project,"one",digest).is_err());
+        let mut output=[0u8;8];
+        assert_eq!(d.project_read_file(id(2),1,&project,"one",&mut output),Ok(4));
+        assert_eq!(&output[..4],b"safe");
+    }
+}

@@ -2119,3 +2119,96 @@ mod r078_caret_word_tests {
         assert_eq!(line.clipboard_bytes(),b"build");
     }
 }
+
+
+// M1/R079 workstation 4: four non-submitting caret-word source transforms.
+// All edits use the same bounded draft transaction and remain in the
+// authenticated process, not terminal command execution or disk I/O.
+impl InputLine {
+    /// Uppercase only the ASCII identifier at the current caret.
+    pub fn uppercase_caret_word(&mut self)->Result<Event,Error>{
+        let (start,end)=self.word_range_at_caret()?;
+        let mut next=[0u8;MAX_LINE];
+        for (i,&b) in self.editor.bytes()[start..end].iter().enumerate(){
+            next[i]=b.to_ascii_uppercase();
+        }
+        self.replace_range(start,end,&next[..end-start])
+    }
+    /// Lowercase only the ASCII identifier at the caret, not file paths,
+    /// command history or adjacent arguments.
+    pub fn lowercase_caret_word(&mut self)->Result<Event,Error>{
+        let (start,end)=self.word_range_at_caret()?;
+        let mut next=[0u8;MAX_LINE];
+        for (i,&b) in self.editor.bytes()[start..end].iter().enumerate(){
+            next[i]=b.to_ascii_lowercase();
+        }
+        self.replace_range(start,end,&next[..end-start])
+    }
+    /// Duplicate the selected identifier as id_id (one undo-neutral
+    /// command-line edit); capacity is checked before touching the draft.
+    pub fn duplicate_caret_word(&mut self)->Result<Event,Error>{
+        let (start,end)=self.word_range_at_caret()?;
+        let size=end-start;
+        let total=size.checked_mul(2).and_then(|n|n.checked_add(1))
+            .ok_or(Error::Full)?;
+        if total>MAX_LINE{return Err(Error::Full);}
+        let mut next=[0u8;MAX_LINE];
+        next[..size].copy_from_slice(&self.editor.bytes()[start..end]);
+        next[size]=b'_';
+        next[size+1..total].copy_from_slice(&self.editor.bytes()[start..end]);
+        self.replace_range(start,end,&next[..total])
+    }
+    /// Wrap the current identifier in user-selected printable delimiters
+    /// such as quotes or braces while retaining all surrounding arguments.
+    pub fn surround_caret_word(&mut self,prefix:&[u8],suffix:&[u8])
+        ->Result<Event,Error>{
+        let (start,end)=self.word_range_at_caret()?;
+        let len=end-start;
+        let total=prefix.len().checked_add(len)
+            .and_then(|n|n.checked_add(suffix.len())).ok_or(Error::Full)?;
+        if total>MAX_LINE{return Err(Error::Full);}
+        if prefix.iter().chain(suffix.iter()).any(|&b|!(b' '..=b'~').contains(&b)){
+            return Err(Error::Invalid);
+        }
+        let mut next=[0u8;MAX_LINE];
+        next[..prefix.len()].copy_from_slice(prefix);
+        next[prefix.len()..prefix.len()+len]
+            .copy_from_slice(&self.editor.bytes()[start..end]);
+        next[prefix.len()+len..total].copy_from_slice(suffix);
+        self.replace_range(start,end,&next[..total])
+    }
+}
+#[cfg(test)]
+mod r079_caret_source_transforms{
+    use super::*;
+    #[test]
+    fn uppercase_lowercase_clone_and_quote_preserve_other_arguments(){
+        let mut line=InputLine::new();
+        line.set_line(b"run alpha_beta").unwrap();
+        assert_eq!(line.uppercase_caret_word(),Ok(Event::Typed));
+        assert_eq!(line.bytes(),b"run ALPHA_BETA");
+        assert_eq!(line.lowercase_caret_word(),Ok(Event::Typed));
+        assert_eq!(line.bytes(),b"run alpha_beta");
+        assert_eq!(line.duplicate_caret_word(),Ok(Event::Typed));
+        assert_eq!(line.bytes(),b"run alpha_beta_alpha_beta");
+        assert_eq!(line.surround_caret_word(b"(",b")"),Ok(Event::Typed));
+        assert_eq!(line.bytes(),b"run (alpha_beta_alpha_beta)");
+        assert_eq!(line.history_count(),0);
+        assert!(line.clipboard_bytes().is_empty());
+    }
+    #[test]
+    fn missing_word_invalid_delimiters_and_overlong_clones_never_edit(){
+        let mut line=InputLine::new();
+        line.set_line(b" ").unwrap();
+        assert_eq!(line.uppercase_caret_word(),Err(Error::Invalid));
+        assert_eq!(line.lowercase_caret_word(),Err(Error::Invalid));
+        assert_eq!(line.duplicate_caret_word(),Err(Error::Invalid));
+        line.set_line(b"alpha").unwrap();
+        assert_eq!(line.surround_caret_word(b"\n",b")"),Err(Error::Invalid));
+        assert_eq!(line.surround_caret_word(&[b'x';MAX_LINE],b""),Err(Error::Full));
+        assert_eq!(line.bytes(),b"alpha");
+        line.set_line(&[b'a';MAX_LINE]).unwrap();
+        assert_eq!(line.duplicate_caret_word(),Err(Error::Full));
+        assert_eq!(line.length(),MAX_LINE);
+    }
+}
