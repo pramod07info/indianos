@@ -2671,3 +2671,164 @@ mod r080_revision_slice_tests{
         assert_eq!(fs.generation(),generation);
     }
 }
+
+
+// M1/R081 workstream B: six Unicode source operations on the real COW
+// project directory, using optimistic whole-file revision preconditions.
+impl ProjectTree {
+    /// Content fingerprint for a caller-selected, Unicode-aligned source slice.
+    pub fn source_slice_checksum<D:BlockDevice>(&self,who:Identity,
+        fs:&mut HierVfs<D>,name:&str,from:usize,to:usize)->Result<u64,Error>{
+        self.check_fresh(who,fs)?;
+        let (p,n)=self.child(name)?;
+        let mut data=[0u8;MAX_FILE_BYTES];
+        let len=fs.read(Self::str_path(&p,n),&mut data)?;
+        let source=core::str::from_utf8(&data[..len]).map_err(|_|Error::Invalid)?;
+        let region=source.get(from..to).ok_or(Error::Invalid)?;
+        Ok(region.as_bytes().iter().fold(0xcbf29ce484222325u64,
+            |h,b|(h^(*b as u64)).wrapping_mul(0x100000001b3)))
+    }
+    /// Bounded UTF-8 window read that checks the revision of the *entire*
+    /// persisted file. On stale checks or short output buffers nothing leaks.
+    pub fn read_source_window_if_checksum<D:BlockDevice>(&self,who:Identity,
+        fs:&mut HierVfs<D>,name:&str,expected:u64,
+        from:usize,to:usize,out:&mut[u8])->Result<usize,Error>{
+        self.check_fresh(who,fs)?;
+        let (p,n)=self.child(name)?;
+        let mut data=[0u8;MAX_FILE_BYTES];
+        let len=fs.read(Self::str_path(&p,n),&mut data)?;
+        let source=core::str::from_utf8(&data[..len]).map_err(|_|Error::Invalid)?;
+        let region=source.get(from..to).ok_or(Error::Invalid)?;
+        let actual=data[..len].iter().fold(0xcbf29ce484222325u64,
+            |h,b|(h^(*b as u64)).wrapping_mul(0x100000001b3));
+        if actual!=expected{return Err(Error::Stale);}
+        if out.len()<region.len(){return Err(Error::Full);}
+        out[..region.len()].copy_from_slice(region.as_bytes());
+        Ok(region.len())
+    }
+    /// Durable Unicode source patch committed through one checksummed COW
+    /// overwrite. Stale/conflicting/out-of-bound edits cannot mutate the file.
+    pub fn patch_source_if_checksum<D:BlockDevice>(&mut self,who:Identity,
+        fs:&mut HierVfs<D>,name:&str,expected:u64,
+        from:usize,to:usize,replacement:&str)->Result<usize,Error>{
+        self.check_fresh(who,fs)?;
+        let (p,n)=self.child(name)?;
+        let mut data=[0u8;MAX_FILE_BYTES];
+        let len=fs.read(Self::str_path(&p,n),&mut data)?;
+        let source=core::str::from_utf8(&data[..len]).map_err(|_|Error::Invalid)?;
+        if source.get(from..to).is_none(){return Err(Error::Invalid);}
+        let actual=data[..len].iter().fold(0xcbf29ce484222325u64,
+            |h,b|(h^(*b as u64)).wrapping_mul(0x100000001b3));
+        if actual!=expected{return Err(Error::Stale);}
+        let size=len.checked_sub(to-from).and_then(|x|x.checked_add(replacement.len()))
+            .ok_or(Error::Full)?;
+        if size>MAX_FILE_BYTES{return Err(Error::Full);}
+        let mut staged=[0u8;MAX_FILE_BYTES];
+        staged[..from].copy_from_slice(&data[..from]);
+        staged[from..from+replacement.len()].copy_from_slice(replacement.as_bytes());
+        staged[from+replacement.len()..size].copy_from_slice(&data[to..len]);
+        if size!=len||staged[..size]!=data[..len]{
+            fs.overwrite(Self::str_path(&p,n),&staged[..size])?;
+            self.generation=fs.generation();
+        }
+        Ok(size)
+    }
+    /// Replace the first complete literal match after a UTF-8 search cursor.
+    /// The whole original file revision is checked again at durable commit.
+    pub fn replace_first_literal_if_checksum<D:BlockDevice>(&mut self,who:Identity,
+        fs:&mut HierVfs<D>,name:&str,expected:u64,
+        needle:&str,replacement:&str,from:usize)->Result<Option<usize>,Error>{
+        self.check_fresh(who,fs)?;
+        if needle.is_empty(){return Err(Error::Invalid);}
+        let (p,n)=self.child(name)?;
+        let mut data=[0u8;MAX_FILE_BYTES];
+        let len=fs.read(Self::str_path(&p,n),&mut data)?;
+        let source=core::str::from_utf8(&data[..len]).map_err(|_|Error::Invalid)?;
+        let tail=source.get(from..).ok_or(Error::Invalid)?;
+        let actual=data[..len].iter().fold(0xcbf29ce484222325u64,
+            |h,b|(h^(*b as u64)).wrapping_mul(0x100000001b3));
+        if actual!=expected{return Err(Error::Stale);}
+        let Some(local)=tail.find(needle) else{return Ok(None)};
+        let pos=from+local;
+        self.patch_source_if_checksum(who,fs,name,expected,pos,pos+needle.len(),replacement)?;
+        Ok(Some(pos))
+    }
+    /// Prepend a new Unicode header to an unchanged source revision.
+    pub fn prepend_source_if_checksum<D:BlockDevice>(&mut self,who:Identity,
+        fs:&mut HierVfs<D>,name:&str,expected:u64,header:&str)
+        ->Result<usize,Error>{
+        self.patch_source_if_checksum(who,fs,name,expected,0,0,header)
+    }
+    /// Erase a selected Unicode source range only at the exact observed
+    /// revision; an empty selection is deliberately rejected.
+    pub fn erase_source_range_if_checksum<D:BlockDevice>(&mut self,who:Identity,
+        fs:&mut HierVfs<D>,name:&str,expected:u64,from:usize,to:usize)
+        ->Result<usize,Error>{
+        if from>=to{return Err(Error::Invalid);}
+        self.patch_source_if_checksum(who,fs,name,expected,from,to,"")
+    }
+}
+#[cfg(test)]
+mod r081_project_patch_tests{
+    use super::*;
+    use crate::block::{BlockError,SECTOR_BYTES};
+    struct Disk{sectors:[[u8;SECTOR_BYTES];100]}
+    impl BlockDevice for Disk{
+        fn sector_count(&self)->u64{100}
+        fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+            *out=*self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?;Ok(())
+        }
+        fn write_sector(&mut self,lba:u64,data:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+            *self.sectors.get_mut(lba as usize).ok_or(BlockError::OutOfRange)?=*data;Ok(())
+        }
+    }
+    fn id()->Identity{Identity{pid:82,generation:1}}
+    fn setup()->(HierVfs<Disk>,ProjectTree){
+        let mut fs=HierVfs::format_blank(Disk{sectors:[[0;SECTOR_BYTES];100]}).unwrap();
+        let mut p=ProjectTree::new();p.create(id(),&mut fs,"demo").unwrap();
+        p.create_file(id(),&mut fs,"main","α red\nβ red\n".as_bytes()).unwrap();
+        (fs,p)
+    }
+    #[test]
+    fn checksum_window_patch_first_match_prepend_and_erase_reboot(){
+        let (mut fs,mut p)=setup();
+        let digest=p.source_summary(id(),&mut fs,"main").unwrap().fnv64;
+        let mut out=[0u8;32];
+        assert_eq!(p.read_source_window_if_checksum(id(),&mut fs,"main",
+            digest,0,7,&mut out),Ok(7));
+        assert_eq!(&out[..7],"α red\n".as_bytes());
+        let slice=p.source_slice_checksum(id(),&mut fs,"main",0,2).unwrap();
+        assert_eq!(slice,"α".as_bytes().iter().fold(0xcbf29ce484222325u64,
+            |h,b|(h^(*b as u64)).wrapping_mul(0x100000001b3)));
+        assert_eq!(p.replace_first_literal_if_checksum(id(),&mut fs,"main",
+            digest,"red","blue",0),Ok(Some(3)));
+        let digest=p.source_summary(id(),&mut fs,"main").unwrap().fnv64;
+        assert_eq!(p.prepend_source_if_checksum(id(),&mut fs,"main",digest,"!"),Ok(16));
+        let digest=p.source_summary(id(),&mut fs,"main").unwrap().fnv64;
+        assert_eq!(p.erase_source_range_if_checksum(id(),&mut fs,"main",digest,0,1),Ok(15));
+        let mut fs=HierVfs::mount(fs.into_device()).unwrap();
+        let mut p=ProjectTree::new();p.open(id(),&mut fs,"demo").unwrap();
+        let n=p.read_file(id(),&mut fs,"main",&mut out).unwrap();
+        assert_eq!(&out[..n],"α blue\nβ red\n".as_bytes());
+    }
+    #[test]
+    fn mismatched_digest_bad_unicode_and_short_buffers_preserve_disk(){
+        let (mut fs,mut p)=setup();
+        let digest=p.source_summary(id(),&mut fs,"main").unwrap().fnv64;
+        let before=fs.generation();
+        let mut out=[0xa5u8;1];
+        assert_eq!(p.read_source_window_if_checksum(id(),&mut fs,"main",
+            digest,0,7,&mut out),Err(Error::Full));
+        assert_eq!(out,[0xa5]);
+        assert_eq!(p.patch_source_if_checksum(id(),&mut fs,
+            "main",digest,1,2,"oops"),Err(Error::Invalid));
+        assert_eq!(p.patch_source_if_checksum(id(),&mut fs,
+            "main",digest^1,0,0,"oops"),Err(Error::Stale));
+        assert_eq!(p.erase_source_range_if_checksum(id(),&mut fs,
+            "main",digest,3,3),Err(Error::Invalid));
+        assert_eq!(p.replace_first_literal_if_checksum(
+            Identity{generation:2,..id()},&mut fs,"main",digest,"red","new",0),
+            Err(Error::Unauthorized));
+        assert_eq!(fs.generation(),before);
+    }
+}
