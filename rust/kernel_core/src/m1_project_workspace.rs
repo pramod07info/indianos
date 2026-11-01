@@ -2998,3 +2998,290 @@ mod r082_project_source_tests{
         assert_eq!(fs.generation(),before);
     }
 }
+
+
+// M1/R083 / Stream B: ten Unicode diagnostics and ten optimistic durable edits.
+// All operations use mounted HierVfs files, owner/generation checks, UTF-8
+// boundary validation and the existing one-commit COW patch primitive.
+impl ProjectTree {
+    /// Read current, owner-visible disk source; no RAM mirror or raw block access.
+    pub fn source_contains_literal<D:BlockDevice>(&self,who:Identity,fs:&mut HierVfs<D>,name:&str,needle:&str) -> Result<bool,Error>{
+        let mut data=[0u8;MAX_FILE_BYTES];
+        let text=self.r082_text(who,fs,name,&mut data)?;
+        if needle.is_empty(){return Err(Error::Invalid);} Ok(text.contains(needle))
+    }
+    /// Read current, owner-visible disk source; no RAM mirror or raw block access.
+    pub fn source_line_count_matching<D:BlockDevice>(&self,who:Identity,fs:&mut HierVfs<D>,name:&str,needle:&str) -> Result<usize,Error>{
+        let mut data=[0u8;MAX_FILE_BYTES];
+        let text=self.r082_text(who,fs,name,&mut data)?;
+        if needle.is_empty(){return Err(Error::Invalid);} Ok(text.split_inclusive('\n').filter(|r|r.contains(needle)).count())
+    }
+    /// Read current, owner-visible disk source; no RAM mirror or raw block access.
+    pub fn source_first_matching_line<D:BlockDevice>(&self,who:Identity,fs:&mut HierVfs<D>,name:&str,needle:&str) -> Result<Option<usize>,Error>{
+        let mut data=[0u8;MAX_FILE_BYTES];
+        let text=self.r082_text(who,fs,name,&mut data)?;
+        if needle.is_empty(){return Err(Error::Invalid);} Ok(text.split_inclusive('\n').position(|r|r.contains(needle)).map(|i|i+1))
+    }
+    /// Read current, owner-visible disk source; no RAM mirror or raw block access.
+    pub fn source_last_matching_line<D:BlockDevice>(&self,who:Identity,fs:&mut HierVfs<D>,name:&str,needle:&str) -> Result<Option<usize>,Error>{
+        let mut data=[0u8;MAX_FILE_BYTES];
+        let text=self.r082_text(who,fs,name,&mut data)?;
+        if needle.is_empty(){return Err(Error::Invalid);} Ok(text.split_inclusive('\n').enumerate().filter(|(_,r)|r.contains(needle)).map(|(i,_)|i+1).last())
+    }
+    /// Read current, owner-visible disk source; no RAM mirror or raw block access.
+    pub fn source_unicode_scalars<D:BlockDevice>(&self,who:Identity,fs:&mut HierVfs<D>,name:&str) -> Result<usize,Error>{
+        let mut data=[0u8;MAX_FILE_BYTES];
+        let text=self.r082_text(who,fs,name,&mut data)?;
+        Ok(text.chars().count())
+    }
+    /// Read current, owner-visible disk source; no RAM mirror or raw block access.
+    pub fn source_tab_characters<D:BlockDevice>(&self,who:Identity,fs:&mut HierVfs<D>,name:&str) -> Result<usize,Error>{
+        let mut data=[0u8;MAX_FILE_BYTES];
+        let text=self.r082_text(who,fs,name,&mut data)?;
+        Ok(text.bytes().filter(|b|*b==b'\t').count())
+    }
+    /// Read current, owner-visible disk source; no RAM mirror or raw block access.
+    pub fn source_crlf_pairs<D:BlockDevice>(&self,who:Identity,fs:&mut HierVfs<D>,name:&str) -> Result<usize,Error>{
+        let mut data=[0u8;MAX_FILE_BYTES];
+        let text=self.r082_text(who,fs,name,&mut data)?;
+        Ok(text.as_bytes().windows(2).filter(|w|*w==b"\r\n").count())
+    }
+    /// Read current, owner-visible disk source; no RAM mirror or raw block access.
+    pub fn source_ascii_digits<D:BlockDevice>(&self,who:Identity,fs:&mut HierVfs<D>,name:&str) -> Result<usize,Error>{
+        let mut data=[0u8;MAX_FILE_BYTES];
+        let text=self.r082_text(who,fs,name,&mut data)?;
+        Ok(text.bytes().filter(|b|b.is_ascii_digit()).count())
+    }
+    /// Read current, owner-visible disk source; no RAM mirror or raw block access.
+    pub fn source_trailing_spaces<D:BlockDevice>(&self,who:Identity,fs:&mut HierVfs<D>,name:&str) -> Result<usize,Error>{
+        let mut data=[0u8;MAX_FILE_BYTES];
+        let text=self.r082_text(who,fs,name,&mut data)?;
+        Ok(text.split_inclusive('\n').map(|r|r.trim_end_matches('\n').bytes().rev().take_while(|b|*b==b' ').count()).sum())
+    }
+    /// Read current, owner-visible disk source; no RAM mirror or raw block access.
+    pub fn source_longest_row_bytes<D:BlockDevice>(&self,who:Identity,fs:&mut HierVfs<D>,name:&str) -> Result<usize,Error>{
+        let mut data=[0u8;MAX_FILE_BYTES];
+        let text=self.r082_text(who,fs,name,&mut data)?;
+        Ok(text.split_inclusive('\n').map(|r|r.len()).max().unwrap_or(0))
+    }
+
+    fn r083_checked_text<'a,D:BlockDevice>(&self,who:Identity,
+        fs:&mut HierVfs<D>,name:&str,expected:u64,
+        bytes:&'a mut [u8;MAX_FILE_BYTES])->Result<&'a str,Error>{
+        let text=self.r082_text(who,fs,name,bytes)?;
+        let actual=text.as_bytes().iter().fold(0xcbf29ce484222325u64,
+            |h,b|(h^(*b as u64)).wrapping_mul(0x100000001b3));
+        if actual!=expected{return Err(Error::Stale);}
+        Ok(text)
+    }
+    /// Replace a complete Unicode prefix if it matches at the checked version.
+    pub fn replace_source_prefix_at_revision<D:BlockDevice>(&mut self,who:Identity,
+        fs:&mut HierVfs<D>,name:&str,expected:u64,old:&str,new:&str)
+        ->Result<bool,Error>{
+        if old.is_empty(){return Err(Error::Invalid);}
+        let mut bytes=[0u8;MAX_FILE_BYTES];
+        let text=self.r083_checked_text(who,fs,name,expected,&mut bytes)?;
+        if !text.starts_with(old){return Ok(false);}
+        self.patch_source_if_checksum(who,fs,name,expected,0,old.len(),new)?;
+        Ok(true)
+    }
+    /// Replace a complete Unicode suffix if its observed revision is current.
+    pub fn replace_source_suffix_at_revision<D:BlockDevice>(&mut self,who:Identity,
+        fs:&mut HierVfs<D>,name:&str,expected:u64,old:&str,new:&str)
+        ->Result<bool,Error>{
+        if old.is_empty(){return Err(Error::Invalid);}
+        let mut bytes=[0u8;MAX_FILE_BYTES];
+        let text=self.r083_checked_text(who,fs,name,expected,&mut bytes)?;
+        if !text.ends_with(old){return Ok(false);}
+        let start=text.len()-old.len();
+        self.patch_source_if_checksum(who,fs,name,expected,start,text.len(),new)?;
+        Ok(true)
+    }
+    /// Delete only the first literal, not all same-name identifiers.
+    pub fn erase_first_literal_at_revision<D:BlockDevice>(&mut self,who:Identity,
+        fs:&mut HierVfs<D>,name:&str,expected:u64,needle:&str)
+        ->Result<Option<usize>,Error>{
+        if needle.is_empty(){return Err(Error::Invalid);}
+        let mut bytes=[0u8;MAX_FILE_BYTES];
+        let text=self.r083_checked_text(who,fs,name,expected,&mut bytes)?;
+        let Some(at)=text.find(needle) else{return Ok(None)};
+        self.patch_source_if_checksum(who,fs,name,expected,at,at+needle.len(),"")?;
+        Ok(Some(at))
+    }
+    /// Delete only last matching literal, preserving earlier identical tokens.
+    pub fn erase_last_literal_at_revision<D:BlockDevice>(&mut self,who:Identity,
+        fs:&mut HierVfs<D>,name:&str,expected:u64,needle:&str)
+        ->Result<Option<usize>,Error>{
+        if needle.is_empty(){return Err(Error::Invalid);}
+        let mut bytes=[0u8;MAX_FILE_BYTES];
+        let text=self.r083_checked_text(who,fs,name,expected,&mut bytes)?;
+        let Some(at)=text.rfind(needle) else{return Ok(None)};
+        self.patch_source_if_checksum(who,fs,name,expected,at,at+needle.len(),"")?;
+        Ok(Some(at))
+    }
+    /// Insert a UTF-8 header before the first complete source occurrence.
+    pub fn insert_before_first_at_revision<D:BlockDevice>(&mut self,who:Identity,
+        fs:&mut HierVfs<D>,name:&str,expected:u64,needle:&str,insert:&str)
+        ->Result<Option<usize>,Error>{
+        if needle.is_empty()||insert.is_empty(){return Err(Error::Invalid);}
+        let mut bytes=[0u8;MAX_FILE_BYTES];
+        let text=self.r083_checked_text(who,fs,name,expected,&mut bytes)?;
+        let Some(at)=text.find(needle) else{return Ok(None)};
+        self.patch_source_if_checksum(who,fs,name,expected,at,at,insert)?;
+        Ok(Some(at))
+    }
+    /// Insert a UTF-8 suffix after the last complete source occurrence.
+    pub fn insert_after_last_at_revision<D:BlockDevice>(&mut self,who:Identity,
+        fs:&mut HierVfs<D>,name:&str,expected:u64,needle:&str,insert:&str)
+        ->Result<Option<usize>,Error>{
+        if needle.is_empty()||insert.is_empty(){return Err(Error::Invalid);}
+        let mut bytes=[0u8;MAX_FILE_BYTES];
+        let text=self.r083_checked_text(who,fs,name,expected,&mut bytes)?;
+        let Some(at)=text.rfind(needle) else{return Ok(None)};
+        let end=at+needle.len();
+        self.patch_source_if_checksum(who,fs,name,expected,end,end,insert)?;
+        Ok(Some(end))
+    }
+    /// Perform a single no-heap ASCII uppercase conversion on Unicode source.
+    pub fn uppercase_source_ascii_at_revision<D:BlockDevice>(&mut self,who:Identity,
+        fs:&mut HierVfs<D>,name:&str,expected:u64)->Result<usize,Error>{
+        let mut bytes=[0u8;MAX_FILE_BYTES];
+        let text=self.r083_checked_text(who,fs,name,expected,&mut bytes)?;
+        let n=text.len();let mut changes=0;
+        for byte in &mut bytes[..n]{
+            let upper=byte.to_ascii_uppercase();
+            if *byte!=upper{changes+=1;*byte=upper;}
+        }
+        if changes!=0{
+            let value=core::str::from_utf8(&bytes[..n]).map_err(|_|Error::Invalid)?;
+            self.replace_source_if_checksum(who,fs,name,expected,value)?;
+        }
+        Ok(changes)
+    }
+    /// Perform a single ASCII lowercase conversion, preserving non-ASCII.
+    pub fn lowercase_source_ascii_at_revision<D:BlockDevice>(&mut self,who:Identity,
+        fs:&mut HierVfs<D>,name:&str,expected:u64)->Result<usize,Error>{
+        let mut bytes=[0u8;MAX_FILE_BYTES];
+        let text=self.r083_checked_text(who,fs,name,expected,&mut bytes)?;
+        let n=text.len();let mut changes=0;
+        for byte in &mut bytes[..n]{
+            let lower=byte.to_ascii_lowercase();
+            if *byte!=lower{changes+=1;*byte=lower;}
+        }
+        if changes!=0{
+            let value=core::str::from_utf8(&bytes[..n]).map_err(|_|Error::Invalid)?;
+            self.replace_source_if_checksum(who,fs,name,expected,value)?;
+        }
+        Ok(changes)
+    }
+    /// Remove ASCII spaces directly before LF / EOF in one COW overwrite.
+    pub fn trim_source_trailing_spaces_at_revision<D:BlockDevice>(&mut self,who:Identity,
+        fs:&mut HierVfs<D>,name:&str,expected:u64)->Result<usize,Error>{
+        let mut bytes=[0u8;MAX_FILE_BYTES];
+        let text=self.r083_checked_text(who,fs,name,expected,&mut bytes)?;
+        let n=text.len();let mut staged=[0u8;MAX_FILE_BYTES];
+        let mut used=0usize;let mut removed=0usize;
+        for row in text.split_inclusive('\n'){
+            let with_lf=row.ends_with('\n');
+            let content=if with_lf{&row[..row.len()-1]}else{row};
+            let trimmed=content.trim_end_matches(' ');
+            staged[used..used+trimmed.len()].copy_from_slice(trimmed.as_bytes());
+            used+=trimmed.len();removed+=content.len()-trimmed.len();
+            if with_lf{staged[used]=b'\n';used+=1;}
+        }
+        if removed>0{
+            let clean=core::str::from_utf8(&staged[..used]).map_err(|_|Error::Invalid)?;
+            self.replace_source_if_checksum(who,fs,name,expected,clean)?;
+        }
+        Ok(removed)
+    }
+    /// Normalize CRLF pairs to LF in one source version, preserving bare CR.
+    pub fn normalize_source_crlf_at_revision<D:BlockDevice>(&mut self,who:Identity,
+        fs:&mut HierVfs<D>,name:&str,expected:u64)->Result<usize,Error>{
+        let mut bytes=[0u8;MAX_FILE_BYTES];
+        let text=self.r083_checked_text(who,fs,name,expected,&mut bytes)?;
+        let source=text.as_bytes();let mut staged=[0u8;MAX_FILE_BYTES];
+        let mut i=0usize;let mut used=0usize;let mut changes=0;
+        while i<source.len(){
+            if i+1<source.len()&&source[i]==b'\r'&&source[i+1]==b'\n'{
+                staged[used]=b'\n';i+=2;used+=1;changes+=1;
+            }else{staged[used]=source[i];i+=1;used+=1;}
+        }
+        if changes>0{
+            let clean=core::str::from_utf8(&staged[..used]).map_err(|_|Error::Invalid)?;
+            self.replace_source_if_checksum(who,fs,name,expected,clean)?;
+        }
+        Ok(changes)
+    }
+}
+
+#[cfg(test)]
+mod r083_project_tests{
+    use super::*;
+    use crate::block::{BlockError,SECTOR_BYTES};
+    struct Disk{sectors:[[u8;SECTOR_BYTES];100]}
+    impl BlockDevice for Disk{
+        fn sector_count(&self)->u64{100}
+        fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+            *out=*self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?;Ok(())
+        }
+        fn write_sector(&mut self,lba:u64,data:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+            *self.sectors.get_mut(lba as usize).ok_or(BlockError::OutOfRange)?=*data;Ok(())
+        }
+    }
+    fn who()->Identity{Identity{pid:103,generation:1}}
+    fn setup()->(HierVfs<Disk>,ProjectTree){
+        let mut fs=HierVfs::format_blank(Disk{sectors:[[0;SECTOR_BYTES];100]}).unwrap();
+        let mut p=ProjectTree::new();p.create(who(),&mut fs,"code").unwrap();
+        p.create_file(who(),&mut fs,"main",b"CAT  \r\none\t2\r\nCAT\n").unwrap();
+        (fs,p)
+    }
+    #[test]
+    fn read_inspection_metrics_and_all_ten_edits_survive_real_disk_remount(){
+        let (mut fs,mut p)=setup();
+        assert_eq!(p.source_contains_literal(who(),&mut fs,"main","CAT"),Ok(true));
+        assert_eq!(p.source_line_count_matching(who(),&mut fs,"main","CAT"),Ok(2));
+        assert_eq!(p.source_first_matching_line(who(),&mut fs,"main","CAT"),Ok(Some(1)));
+        assert_eq!(p.source_last_matching_line(who(),&mut fs,"main","CAT"),Ok(Some(3)));
+        assert_eq!(p.source_unicode_scalars(who(),&mut fs,"main"),Ok(18));
+        assert_eq!(p.source_tab_characters(who(),&mut fs,"main"),Ok(1));
+        assert_eq!(p.source_crlf_pairs(who(),&mut fs,"main"),Ok(2));
+        assert_eq!(p.source_ascii_digits(who(),&mut fs,"main"),Ok(1));
+        assert_eq!(p.source_trailing_spaces(who(),&mut fs,"main"),Ok(0));
+        assert_eq!(p.source_longest_row_bytes(who(),&mut fs,"main"),Ok(7));
+        let mut digest=p.source_summary(who(),&mut fs,"main").unwrap().fnv64;
+        assert_eq!(p.replace_source_prefix_at_revision(who(),&mut fs,"main",digest,"CAT","DOG"),Ok(true));
+        digest=p.source_summary(who(),&mut fs,"main").unwrap().fnv64;
+        assert_eq!(p.replace_source_suffix_at_revision(who(),&mut fs,"main",digest,"CAT\n","FOX\n"),Ok(true));
+        digest=p.source_summary(who(),&mut fs,"main").unwrap().fnv64;
+        assert_eq!(p.insert_before_first_at_revision(who(),&mut fs,"main",digest,"DOG","!"),Ok(Some(0)));
+        digest=p.source_summary(who(),&mut fs,"main").unwrap().fnv64;
+        assert_eq!(p.insert_after_last_at_revision(who(),&mut fs,"main",digest,"FOX","!"),Ok(Some(18)));
+        digest=p.source_summary(who(),&mut fs,"main").unwrap().fnv64;
+        assert_eq!(p.erase_first_literal_at_revision(who(),&mut fs,"main",digest,"!"),Ok(Some(0)));
+        digest=p.source_summary(who(),&mut fs,"main").unwrap().fnv64;
+        assert!(p.erase_last_literal_at_revision(who(),&mut fs,"main",digest,"!").unwrap().is_some());
+        digest=p.source_summary(who(),&mut fs,"main").unwrap().fnv64;
+        assert!(p.lowercase_source_ascii_at_revision(who(),&mut fs,"main",digest).unwrap()>0);
+        digest=p.source_summary(who(),&mut fs,"main").unwrap().fnv64;
+        assert!(p.uppercase_source_ascii_at_revision(who(),&mut fs,"main",digest).unwrap()>0);
+        digest=p.source_summary(who(),&mut fs,"main").unwrap().fnv64;
+        assert_eq!(p.normalize_source_crlf_at_revision(who(),&mut fs,"main",digest),Ok(2));
+        digest=p.source_summary(who(),&mut fs,"main").unwrap().fnv64;
+        assert_eq!(p.trim_source_trailing_spaces_at_revision(who(),&mut fs,"main",digest),Ok(2));
+        let mut fs=HierVfs::mount(fs.into_device()).unwrap();
+        let mut reopened=ProjectTree::new();reopened.open(who(),&mut fs,"code").unwrap();
+        let mut out=[0u8;30];let n=reopened.read_file(who(),&mut fs,"main",&mut out).unwrap();
+        assert_eq!(&out[..n],b"DOG\nONE\t2\nFOX\n");
+    }
+    #[test]
+    fn stale_foreign_and_bad_utf8_edits_preserve_disk(){
+        let (mut fs,mut p)=setup();let gen=fs.generation();
+        let hash=p.source_summary(who(),&mut fs,"main").unwrap().fnv64;
+        assert_eq!(p.replace_source_prefix_at_revision(who(),&mut fs,"main",hash^1,"CAT","X"),Err(Error::Stale));
+        assert_eq!(p.erase_first_literal_at_revision(who(),&mut fs,"main",hash,""),Err(Error::Invalid));
+        assert_eq!(p.normalize_source_crlf_at_revision(
+            Identity{generation:2,..who()},&mut fs,"main",hash),Err(Error::Unauthorized));
+        assert_eq!(fs.generation(),gen);
+    }
+}

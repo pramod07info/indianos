@@ -3211,3 +3211,223 @@ mod r082_editor_pool_function_tests{
         assert_eq!(pool.status(who(),0).unwrap().dirty,false);
     }
 }
+
+
+// M1/R083 Stream A — 20 per-slot operations over authenticated unsaved text.
+// Navigation never touches disk. Successful transforms use existing single
+// undo snapshots, not fake UI-only source state.
+impl EditorPool{
+    fn r083_text(&self,who:Identity,slot:usize)->Result<&str,Error>{
+        let d=self.docs.get(slot).ok_or(Error::Invalid)?;
+        d.authorize(who)?;
+        core::str::from_utf8(&d.data[..d.used]).map_err(|_|Error::Invalid)
+    }
+    pub fn buffer_contains_literal(&self,who:Identity,slot:usize,needle:&str)->Result<bool,Error>{
+        let t=self.r083_text(who,slot)?;
+        if needle.is_empty(){return Err(Error::Invalid);} Ok(t.contains(needle))
+    }
+    pub fn buffer_starts_with(&self,who:Identity,slot:usize,prefix:&str)->Result<bool,Error>{
+        let t=self.r083_text(who,slot)?;
+        if prefix.is_empty(){return Err(Error::Invalid);} Ok(t.starts_with(prefix))
+    }
+    pub fn buffer_ends_with(&self,who:Identity,slot:usize,suffix:&str)->Result<bool,Error>{
+        let t=self.r083_text(who,slot)?;
+        if suffix.is_empty(){return Err(Error::Invalid);} Ok(t.ends_with(suffix))
+    }
+    pub fn buffer_row_count(&self,who:Identity,slot:usize)->Result<usize,Error>{
+        let t=self.r083_text(who,slot)?;
+        Ok(if t.is_empty(){0}else{t.split_inclusive('\n').count()})
+    }
+    pub fn buffer_lines_with(&self,who:Identity,slot:usize,needle:&str)->Result<usize,Error>{
+        let t=self.r083_text(who,slot)?;
+        if needle.is_empty(){return Err(Error::Invalid);} Ok(t.split_inclusive('\n').filter(|r|r.contains(needle)).count())
+    }
+    pub fn buffer_first_line_with(&self,who:Identity,slot:usize,needle:&str)->Result<Option<usize>,Error>{
+        let t=self.r083_text(who,slot)?;
+        if needle.is_empty(){return Err(Error::Invalid);} Ok(t.split_inclusive('\n').position(|r|r.contains(needle)).map(|i|i+1))
+    }
+    pub fn buffer_last_line_with(&self,who:Identity,slot:usize,needle:&str)->Result<Option<usize>,Error>{
+        let t=self.r083_text(who,slot)?;
+        if needle.is_empty(){return Err(Error::Invalid);} Ok(t.split_inclusive('\n').enumerate().filter(|(_,r)|r.contains(needle)).map(|(i,_)|i+1).last())
+    }
+    pub fn buffer_tab_count(&self,who:Identity,slot:usize)->Result<usize,Error>{
+        let t=self.r083_text(who,slot)?;
+        Ok(t.bytes().filter(|b|*b==b'\t').count())
+    }
+    pub fn buffer_crlf_count(&self,who:Identity,slot:usize)->Result<usize,Error>{
+        let t=self.r083_text(who,slot)?;
+        Ok(t.as_bytes().windows(2).filter(|w|*w==b"\r\n").count())
+    }
+    pub fn buffer_trailing_spaces(&self,who:Identity,slot:usize)->Result<usize,Error>{
+        let t=self.r083_text(who,slot)?;
+        Ok(t.split_inclusive('\n').map(|r|r.trim_end_matches('\n').bytes().rev().take_while(|b|*b==b' ').count()).sum())
+    }
+
+    /// Replace a literal opening sequence in one undoable buffer edit.
+    pub fn buffer_replace_prefix(&mut self,who:Identity,slot:usize,
+        old:&str,new:&str)->Result<bool,Error>{
+        if old.is_empty(){return Err(Error::Invalid);}
+        let t=self.r083_text(who,slot)?;
+        if !t.starts_with(old){return Ok(false);}
+        self.docs[slot].replace_text(who,0,old.len(),new)?;Ok(true)
+    }
+    pub fn buffer_replace_suffix(&mut self,who:Identity,slot:usize,
+        old:&str,new:&str)->Result<bool,Error>{
+        if old.is_empty(){return Err(Error::Invalid);}
+        let t=self.r083_text(who,slot)?;
+        if !t.ends_with(old){return Ok(false);}
+        let from=t.len()-old.len();let end=t.len();
+        self.docs[slot].replace_text(who,from,end,new)?;Ok(true)
+    }
+    pub fn buffer_erase_first_literal(&mut self,who:Identity,slot:usize,
+        needle:&str)->Result<Option<usize>,Error>{
+        if needle.is_empty(){return Err(Error::Invalid);}
+        let t=self.r083_text(who,slot)?;
+        let Some(pos)=t.find(needle) else{return Ok(None)};
+        self.docs[slot].replace_text(who,pos,pos+needle.len(),"")?;Ok(Some(pos))
+    }
+    pub fn buffer_erase_last_literal(&mut self,who:Identity,slot:usize,
+        needle:&str)->Result<Option<usize>,Error>{
+        if needle.is_empty(){return Err(Error::Invalid);}
+        let t=self.r083_text(who,slot)?;
+        let Some(pos)=t.rfind(needle) else{return Ok(None)};
+        self.docs[slot].replace_text(who,pos,pos+needle.len(),"")?;Ok(Some(pos))
+    }
+    pub fn buffer_insert_before_first(&mut self,who:Identity,slot:usize,
+        needle:&str,insert:&str)->Result<Option<usize>,Error>{
+        if needle.is_empty()||insert.is_empty(){return Err(Error::Invalid);}
+        let t=self.r083_text(who,slot)?;
+        let Some(pos)=t.find(needle) else{return Ok(None)};
+        self.docs[slot].replace_text(who,pos,pos,insert)?;Ok(Some(pos))
+    }
+    pub fn buffer_insert_after_last(&mut self,who:Identity,slot:usize,
+        needle:&str,insert:&str)->Result<Option<usize>,Error>{
+        if needle.is_empty()||insert.is_empty(){return Err(Error::Invalid);}
+        let t=self.r083_text(who,slot)?;
+        let Some(pos)=t.rfind(needle) else{return Ok(None)};
+        let end=pos+needle.len();
+        self.docs[slot].replace_text(who,end,end,insert)?;Ok(Some(end))
+    }
+    pub fn buffer_uppercase_ascii(&mut self,who:Identity,slot:usize)
+        ->Result<usize,Error>{
+        let t=self.r083_text(who,slot)?;
+        let n=t.len();let mut stage=[0u8;MAX_FILE_BYTES];let mut changes=0;
+        for (i,b) in t.bytes().enumerate(){
+            stage[i]=b.to_ascii_uppercase();
+            if stage[i]!=b{changes+=1;}
+        }
+        if changes>0{
+            let value=core::str::from_utf8(&stage[..n]).map_err(|_|Error::Invalid)?;
+            self.docs[slot].replace_text(who,0,n,value)?;
+        }
+        Ok(changes)
+    }
+    pub fn buffer_lowercase_ascii(&mut self,who:Identity,slot:usize)
+        ->Result<usize,Error>{
+        let t=self.r083_text(who,slot)?;
+        let n=t.len();let mut stage=[0u8;MAX_FILE_BYTES];let mut changes=0;
+        for (i,b) in t.bytes().enumerate(){
+            stage[i]=b.to_ascii_lowercase();
+            if stage[i]!=b{changes+=1;}
+        }
+        if changes>0{
+            let value=core::str::from_utf8(&stage[..n]).map_err(|_|Error::Invalid)?;
+            self.docs[slot].replace_text(who,0,n,value)?;
+        }
+        Ok(changes)
+    }
+    pub fn buffer_trim_trailing_spaces(&mut self,who:Identity,slot:usize)
+        ->Result<usize,Error>{
+        let t=self.r083_text(who,slot)?;
+        let n=t.len();let mut stage=[0u8;MAX_FILE_BYTES];let mut used=0;let mut removed=0;
+        for row in t.split_inclusive('\n'){
+            let haslf=row.ends_with('\n');
+            let content=if haslf{&row[..row.len()-1]}else{row};
+            let trim=content.trim_end_matches(' ');
+            stage[used..used+trim.len()].copy_from_slice(trim.as_bytes());used+=trim.len();
+            removed+=content.len()-trim.len();
+            if haslf{stage[used]=b'\n';used+=1;}
+        }
+        if removed>0{
+            let value=core::str::from_utf8(&stage[..used]).map_err(|_|Error::Invalid)?;
+            self.docs[slot].replace_text(who,0,n,value)?;
+        }
+        Ok(removed)
+    }
+    pub fn buffer_normalize_crlf(&mut self,who:Identity,slot:usize)
+        ->Result<usize,Error>{
+        let t=self.r083_text(who,slot)?;
+        let n=t.len();let mut stage=[0u8;MAX_FILE_BYTES];let mut used=0;let mut i=0;
+        let mut count=0;
+        let source=t.as_bytes();
+        while i<n{
+            if i+1<n&&source[i]==b'\r'&&source[i+1]==b'\n'{
+                stage[used]=b'\n';used+=1;i+=2;count+=1;
+            }else{stage[used]=source[i];used+=1;i+=1;}
+        }
+        if count>0{
+            let value=core::str::from_utf8(&stage[..used]).map_err(|_|Error::Invalid)?;
+            self.docs[slot].replace_text(who,0,n,value)?;
+        }
+        Ok(count)
+    }
+}
+
+#[cfg(test)]
+mod r083_editor_tests{
+    use super::*;
+    use crate::block::{BlockError,SECTOR_BYTES};
+    struct Disk{sectors:[[u8;SECTOR_BYTES];100]}
+    impl BlockDevice for Disk{
+        fn sector_count(&self)->u64{100}
+        fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+            *out=*self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?;Ok(())
+        }
+        fn write_sector(&mut self,lba:u64,data:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+            *self.sectors.get_mut(lba as usize).ok_or(BlockError::OutOfRange)?=*data;Ok(())
+        }
+    }
+    fn who()->Identity{Identity{pid:104,generation:1}}
+    fn setup()->(HierVfs<Disk>,EditorPool){
+        let mut fs=HierVfs::format_blank(Disk{sectors:[[0;SECTOR_BYTES];100]}).unwrap();
+        fs.create("/main",b"CAT  \r\none\t2\r\nCAT\n").unwrap();
+        let mut p=EditorPool::new();p.open(who(),&mut fs,0,"/main").unwrap();(fs,p)
+    }
+    #[test]
+    fn twenty_live_operations_produce_one_undoable_utf8_result_per_edit(){
+        let (mut fs,mut p)=setup();
+        assert_eq!(p.buffer_contains_literal(who(),0,"CAT"),Ok(true));
+        assert_eq!(p.buffer_starts_with(who(),0,"CAT"),Ok(true));
+        assert_eq!(p.buffer_ends_with(who(),0,"CAT\n"),Ok(true));
+        assert_eq!(p.buffer_row_count(who(),0),Ok(3));
+        assert_eq!(p.buffer_lines_with(who(),0,"CAT"),Ok(2));
+        assert_eq!(p.buffer_first_line_with(who(),0,"CAT"),Ok(Some(1)));
+        assert_eq!(p.buffer_last_line_with(who(),0,"CAT"),Ok(Some(3)));
+        assert_eq!(p.buffer_tab_count(who(),0),Ok(1));
+        assert_eq!(p.buffer_crlf_count(who(),0),Ok(2));
+        assert_eq!(p.buffer_trailing_spaces(who(),0),Ok(0));
+        assert_eq!(p.buffer_replace_prefix(who(),0,"CAT","DOG"),Ok(true));
+        assert_eq!(p.buffer_replace_suffix(who(),0,"CAT\n","FOX\n"),Ok(true));
+        assert_eq!(p.buffer_insert_before_first(who(),0,"DOG","!"),Ok(Some(0)));
+        assert!(p.buffer_insert_after_last(who(),0,"FOX","!").unwrap().is_some());
+        assert_eq!(p.buffer_erase_first_literal(who(),0,"!"),Ok(Some(0)));
+        assert!(p.buffer_erase_last_literal(who(),0,"!").unwrap().is_some());
+        assert!(p.buffer_lowercase_ascii(who(),0).unwrap()>0);
+        assert!(p.buffer_uppercase_ascii(who(),0).unwrap()>0);
+        assert_eq!(p.buffer_normalize_crlf(who(),0),Ok(2));
+        assert_eq!(p.buffer_trim_trailing_spaces(who(),0),Ok(2));
+        p.save_all(who(),&mut fs).unwrap();
+        let mut fs=HierVfs::mount(fs.into_device()).unwrap();
+        let mut output=[0u8;50];let n=fs.read("/main",&mut output).unwrap();
+        assert_eq!(&output[..n],b"DOG\nONE\t2\nFOX\n");
+    }
+    #[test]
+    fn unauthorized_invalid_search_and_miss_keep_unsaved_data(){
+        let (_fs,mut p)=setup();
+        assert_eq!(p.buffer_contains_literal(Identity{generation:2,..who()},0,"CAT"),Err(Error::Unauthorized));
+        assert_eq!(p.buffer_replace_suffix(who(),0,"NO","new"),Ok(false));
+        assert_eq!(p.buffer_erase_first_literal(who(),0,""),Err(Error::Invalid));
+        assert_eq!(p.buffer_insert_after_last(who(),0,"missing","!"),Ok(None));
+        assert_eq!(p.status(who(),0).unwrap().dirty,false);
+    }
+}

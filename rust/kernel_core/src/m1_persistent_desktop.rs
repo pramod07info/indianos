@@ -3378,3 +3378,255 @@ mod r082_desktop_project_routes_tests{
         assert_eq!(d.project_read_file(id(2),1,&p,"source",&mut data),Ok(12));
     }
 }
+
+
+// M1/R083 Stream E — twenty fully permission-checked real source-workspace
+// desktop routes. No request can bypass the live process, capability expiry,
+// owner/project generation, path scoping or COW disk backing.
+impl<D:BlockDevice,const P:usize,const E:usize,const W:usize,
+ const K:usize,const G:usize,const Q:usize> Desktop<D,P,E,W,K,G,Q>{
+    /// FILE_READ-gated durable project source operation.
+    pub fn project_source_contains_literal(&mut self,caller:Identity,now:u64,
+        project:&crate::m1_project_workspace::ProjectTree,name:&str,needle:&str)
+        ->Result<bool,ProjectRouteError>{
+        self.admit_editor(caller,now,FILE_READ).map_err(ProjectRouteError::Permission)?;
+        project.source_contains_literal(caller,&mut self.volume,name,needle)
+            .map_err(ProjectRouteError::Project)
+    }
+    /// FILE_READ-gated durable project source operation.
+    pub fn project_source_line_count_matching(&mut self,caller:Identity,now:u64,
+        project:&crate::m1_project_workspace::ProjectTree,name:&str,needle:&str)
+        ->Result<usize,ProjectRouteError>{
+        self.admit_editor(caller,now,FILE_READ).map_err(ProjectRouteError::Permission)?;
+        project.source_line_count_matching(caller,&mut self.volume,name,needle)
+            .map_err(ProjectRouteError::Project)
+    }
+    /// FILE_READ-gated durable project source operation.
+    pub fn project_source_first_matching_line(&mut self,caller:Identity,now:u64,
+        project:&crate::m1_project_workspace::ProjectTree,name:&str,needle:&str)
+        ->Result<Option<usize>,ProjectRouteError>{
+        self.admit_editor(caller,now,FILE_READ).map_err(ProjectRouteError::Permission)?;
+        project.source_first_matching_line(caller,&mut self.volume,name,needle)
+            .map_err(ProjectRouteError::Project)
+    }
+    /// FILE_READ-gated durable project source operation.
+    pub fn project_source_last_matching_line(&mut self,caller:Identity,now:u64,
+        project:&crate::m1_project_workspace::ProjectTree,name:&str,needle:&str)
+        ->Result<Option<usize>,ProjectRouteError>{
+        self.admit_editor(caller,now,FILE_READ).map_err(ProjectRouteError::Permission)?;
+        project.source_last_matching_line(caller,&mut self.volume,name,needle)
+            .map_err(ProjectRouteError::Project)
+    }
+    /// FILE_READ-gated durable project source operation.
+    pub fn project_source_unicode_scalars(&mut self,caller:Identity,now:u64,
+        project:&crate::m1_project_workspace::ProjectTree,name:&str)
+        ->Result<usize,ProjectRouteError>{
+        self.admit_editor(caller,now,FILE_READ).map_err(ProjectRouteError::Permission)?;
+        project.source_unicode_scalars(caller,&mut self.volume,name)
+            .map_err(ProjectRouteError::Project)
+    }
+    /// FILE_READ-gated durable project source operation.
+    pub fn project_source_tab_characters(&mut self,caller:Identity,now:u64,
+        project:&crate::m1_project_workspace::ProjectTree,name:&str)
+        ->Result<usize,ProjectRouteError>{
+        self.admit_editor(caller,now,FILE_READ).map_err(ProjectRouteError::Permission)?;
+        project.source_tab_characters(caller,&mut self.volume,name)
+            .map_err(ProjectRouteError::Project)
+    }
+    /// FILE_READ-gated durable project source operation.
+    pub fn project_source_crlf_pairs(&mut self,caller:Identity,now:u64,
+        project:&crate::m1_project_workspace::ProjectTree,name:&str)
+        ->Result<usize,ProjectRouteError>{
+        self.admit_editor(caller,now,FILE_READ).map_err(ProjectRouteError::Permission)?;
+        project.source_crlf_pairs(caller,&mut self.volume,name)
+            .map_err(ProjectRouteError::Project)
+    }
+    /// FILE_READ-gated durable project source operation.
+    pub fn project_source_ascii_digits(&mut self,caller:Identity,now:u64,
+        project:&crate::m1_project_workspace::ProjectTree,name:&str)
+        ->Result<usize,ProjectRouteError>{
+        self.admit_editor(caller,now,FILE_READ).map_err(ProjectRouteError::Permission)?;
+        project.source_ascii_digits(caller,&mut self.volume,name)
+            .map_err(ProjectRouteError::Project)
+    }
+    /// FILE_READ-gated durable project source operation.
+    pub fn project_source_trailing_spaces(&mut self,caller:Identity,now:u64,
+        project:&crate::m1_project_workspace::ProjectTree,name:&str)
+        ->Result<usize,ProjectRouteError>{
+        self.admit_editor(caller,now,FILE_READ).map_err(ProjectRouteError::Permission)?;
+        project.source_trailing_spaces(caller,&mut self.volume,name)
+            .map_err(ProjectRouteError::Project)
+    }
+    /// FILE_READ-gated durable project source operation.
+    pub fn project_source_longest_row_bytes(&mut self,caller:Identity,now:u64,
+        project:&crate::m1_project_workspace::ProjectTree,name:&str)
+        ->Result<usize,ProjectRouteError>{
+        self.admit_editor(caller,now,FILE_READ).map_err(ProjectRouteError::Permission)?;
+        project.source_longest_row_bytes(caller,&mut self.volume,name)
+            .map_err(ProjectRouteError::Project)
+    }
+    /// FILE_WRITE-gated durable project source operation.
+    pub fn project_replace_source_prefix_at_revision(&mut self,caller:Identity,now:u64,
+        project:&mut crate::m1_project_workspace::ProjectTree,name:&str,expected:u64,old:&str,new:&str)
+        ->Result<bool,ProjectRouteError>{
+        self.admit_editor(caller,now,FILE_WRITE).map_err(ProjectRouteError::Permission)?;
+        project.replace_source_prefix_at_revision(caller,&mut self.volume,name,expected,old,new)
+            .map_err(ProjectRouteError::Project)
+    }
+    /// FILE_WRITE-gated durable project source operation.
+    pub fn project_replace_source_suffix_at_revision(&mut self,caller:Identity,now:u64,
+        project:&mut crate::m1_project_workspace::ProjectTree,name:&str,expected:u64,old:&str,new:&str)
+        ->Result<bool,ProjectRouteError>{
+        self.admit_editor(caller,now,FILE_WRITE).map_err(ProjectRouteError::Permission)?;
+        project.replace_source_suffix_at_revision(caller,&mut self.volume,name,expected,old,new)
+            .map_err(ProjectRouteError::Project)
+    }
+    /// FILE_WRITE-gated durable project source operation.
+    pub fn project_erase_first_literal_at_revision(&mut self,caller:Identity,now:u64,
+        project:&mut crate::m1_project_workspace::ProjectTree,name:&str,expected:u64,needle:&str)
+        ->Result<Option<usize>,ProjectRouteError>{
+        self.admit_editor(caller,now,FILE_WRITE).map_err(ProjectRouteError::Permission)?;
+        project.erase_first_literal_at_revision(caller,&mut self.volume,name,expected,needle)
+            .map_err(ProjectRouteError::Project)
+    }
+    /// FILE_WRITE-gated durable project source operation.
+    pub fn project_erase_last_literal_at_revision(&mut self,caller:Identity,now:u64,
+        project:&mut crate::m1_project_workspace::ProjectTree,name:&str,expected:u64,needle:&str)
+        ->Result<Option<usize>,ProjectRouteError>{
+        self.admit_editor(caller,now,FILE_WRITE).map_err(ProjectRouteError::Permission)?;
+        project.erase_last_literal_at_revision(caller,&mut self.volume,name,expected,needle)
+            .map_err(ProjectRouteError::Project)
+    }
+    /// FILE_WRITE-gated durable project source operation.
+    pub fn project_insert_before_first_at_revision(&mut self,caller:Identity,now:u64,
+        project:&mut crate::m1_project_workspace::ProjectTree,name:&str,expected:u64,needle:&str,insert:&str)
+        ->Result<Option<usize>,ProjectRouteError>{
+        self.admit_editor(caller,now,FILE_WRITE).map_err(ProjectRouteError::Permission)?;
+        project.insert_before_first_at_revision(caller,&mut self.volume,name,expected,needle,insert)
+            .map_err(ProjectRouteError::Project)
+    }
+    /// FILE_WRITE-gated durable project source operation.
+    pub fn project_insert_after_last_at_revision(&mut self,caller:Identity,now:u64,
+        project:&mut crate::m1_project_workspace::ProjectTree,name:&str,expected:u64,needle:&str,insert:&str)
+        ->Result<Option<usize>,ProjectRouteError>{
+        self.admit_editor(caller,now,FILE_WRITE).map_err(ProjectRouteError::Permission)?;
+        project.insert_after_last_at_revision(caller,&mut self.volume,name,expected,needle,insert)
+            .map_err(ProjectRouteError::Project)
+    }
+    /// FILE_WRITE-gated durable project source operation.
+    pub fn project_uppercase_source_ascii_at_revision(&mut self,caller:Identity,now:u64,
+        project:&mut crate::m1_project_workspace::ProjectTree,name:&str,expected:u64)
+        ->Result<usize,ProjectRouteError>{
+        self.admit_editor(caller,now,FILE_WRITE).map_err(ProjectRouteError::Permission)?;
+        project.uppercase_source_ascii_at_revision(caller,&mut self.volume,name,expected)
+            .map_err(ProjectRouteError::Project)
+    }
+    /// FILE_WRITE-gated durable project source operation.
+    pub fn project_lowercase_source_ascii_at_revision(&mut self,caller:Identity,now:u64,
+        project:&mut crate::m1_project_workspace::ProjectTree,name:&str,expected:u64)
+        ->Result<usize,ProjectRouteError>{
+        self.admit_editor(caller,now,FILE_WRITE).map_err(ProjectRouteError::Permission)?;
+        project.lowercase_source_ascii_at_revision(caller,&mut self.volume,name,expected)
+            .map_err(ProjectRouteError::Project)
+    }
+    /// FILE_WRITE-gated durable project source operation.
+    pub fn project_trim_source_trailing_spaces_at_revision(&mut self,caller:Identity,now:u64,
+        project:&mut crate::m1_project_workspace::ProjectTree,name:&str,expected:u64)
+        ->Result<usize,ProjectRouteError>{
+        self.admit_editor(caller,now,FILE_WRITE).map_err(ProjectRouteError::Permission)?;
+        project.trim_source_trailing_spaces_at_revision(caller,&mut self.volume,name,expected)
+            .map_err(ProjectRouteError::Project)
+    }
+    /// FILE_WRITE-gated durable project source operation.
+    pub fn project_normalize_source_crlf_at_revision(&mut self,caller:Identity,now:u64,
+        project:&mut crate::m1_project_workspace::ProjectTree,name:&str,expected:u64)
+        ->Result<usize,ProjectRouteError>{
+        self.admit_editor(caller,now,FILE_WRITE).map_err(ProjectRouteError::Permission)?;
+        project.normalize_source_crlf_at_revision(caller,&mut self.volume,name,expected)
+            .map_err(ProjectRouteError::Project)
+    }
+}
+
+#[cfg(test)]
+mod r083_desktop_source_tests{
+    use super::*;
+    use crate::block::{BlockError,SECTOR_BYTES};
+    use crate::batch2_launcher::Image;
+    use crate::batch2_settings::{Settings,Theme};
+    use crate::m1_project_workspace::ProjectTree;
+    struct Disk{sectors:[[u8;SECTOR_BYTES];100]}
+    impl BlockDevice for Disk{
+        fn sector_count(&self)->u64{100}
+        fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+            *out=*self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?;Ok(())
+        }
+        fn write_sector(&mut self,lba:u64,data:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+            *self.sectors.get_mut(lba as usize).ok_or(BlockError::OutOfRange)?=*data;Ok(())
+        }
+    }
+    type Desk=Desktop<Disk,3,3,2,2,3,8>;
+    fn id(pid:u32)->Identity{Identity{pid,generation:1}}
+    fn launch(pid:u32)->Launch{
+        Launch{pid,generation:1,image:Image{
+            image_id:pid,entry:0x1000,mapped_end:0x2000,verified:true
+        }}
+    }
+    fn setup()->(Desk,ProjectTree){
+        let fs=HierVfs::format_blank(Disk{sectors:[[0;SECTOR_BYTES];100]}).unwrap();
+        let mut d=Desk::from_mounted(fs);
+        d.start(id(1),launch(1),id(2),launch(2),
+            Settings{theme:Theme::Dark,pointer_speed:5,key_repeat:10},8,5).unwrap();
+        let mut p=ProjectTree::new();
+        d.project_create(id(2),1,&mut p,"code").unwrap();
+        d.project_create_file(id(2),1,&mut p,"main",b"CAT  \r\none\t2\r\nCAT\n").unwrap();
+        (d,p)
+    }
+    #[test]
+    fn authenticated_twenty_project_routes_operate_real_durable_files(){
+        let (mut d,mut p)=setup();
+        assert_eq!(d.project_source_contains_literal(id(2),1,&p,"main","CAT"),Ok(true));
+        assert_eq!(d.project_source_line_count_matching(id(2),1,&p,"main","CAT"),Ok(2));
+        assert_eq!(d.project_source_first_matching_line(id(2),1,&p,"main","CAT"),Ok(Some(1)));
+        assert_eq!(d.project_source_last_matching_line(id(2),1,&p,"main","CAT"),Ok(Some(3)));
+        assert_eq!(d.project_source_unicode_scalars(id(2),1,&p,"main"),Ok(18));
+        assert_eq!(d.project_source_tab_characters(id(2),1,&p,"main"),Ok(1));
+        assert_eq!(d.project_source_crlf_pairs(id(2),1,&p,"main"),Ok(2));
+        assert_eq!(d.project_source_ascii_digits(id(2),1,&p,"main"),Ok(1));
+        assert_eq!(d.project_source_trailing_spaces(id(2),1,&p,"main"),Ok(0));
+        assert_eq!(d.project_source_longest_row_bytes(id(2),1,&p,"main"),Ok(7));
+        let mut digest=d.project_source_summary(id(2),1,&p,"main").unwrap().fnv64;
+        assert_eq!(d.project_replace_source_prefix_at_revision(id(2),1,&mut p,"main",digest,"CAT","DOG"),Ok(true));
+        digest=d.project_source_summary(id(2),1,&p,"main").unwrap().fnv64;
+        assert_eq!(d.project_replace_source_suffix_at_revision(id(2),1,&mut p,"main",digest,"CAT\n","FOX\n"),Ok(true));
+        digest=d.project_source_summary(id(2),1,&p,"main").unwrap().fnv64;
+        assert_eq!(d.project_insert_before_first_at_revision(id(2),1,&mut p,"main",digest,"DOG","!"),Ok(Some(0)));
+        digest=d.project_source_summary(id(2),1,&p,"main").unwrap().fnv64;
+        assert!(d.project_insert_after_last_at_revision(id(2),1,&mut p,"main",digest,"FOX","!").unwrap().is_some());
+        digest=d.project_source_summary(id(2),1,&p,"main").unwrap().fnv64;
+        assert_eq!(d.project_erase_first_literal_at_revision(id(2),1,&mut p,"main",digest,"!"),Ok(Some(0)));
+        digest=d.project_source_summary(id(2),1,&p,"main").unwrap().fnv64;
+        assert!(d.project_erase_last_literal_at_revision(id(2),1,&mut p,"main",digest,"!").unwrap().is_some());
+        digest=d.project_source_summary(id(2),1,&p,"main").unwrap().fnv64;
+        assert!(d.project_lowercase_source_ascii_at_revision(id(2),1,&mut p,"main",digest).unwrap()>0);
+        digest=d.project_source_summary(id(2),1,&p,"main").unwrap().fnv64;
+        assert!(d.project_uppercase_source_ascii_at_revision(id(2),1,&mut p,"main",digest).unwrap()>0);
+        digest=d.project_source_summary(id(2),1,&p,"main").unwrap().fnv64;
+        assert_eq!(d.project_normalize_source_crlf_at_revision(id(2),1,&mut p,"main",digest),Ok(2));
+        digest=d.project_source_summary(id(2),1,&p,"main").unwrap().fnv64;
+        assert_eq!(d.project_trim_source_trailing_spaces_at_revision(id(2),1,&mut p,"main",digest),Ok(2));
+        let mut fs=HierVfs::mount(d.into_device()).unwrap();
+        let mut result=[0u8;30];let n=fs.read("/work/code/main",&mut result).unwrap();
+        assert_eq!(&result[..n],b"DOG\nONE\t2\nFOX\n");
+    }
+    #[test]
+    fn stale_process_caps_and_bad_revision_prevent_disk_mutation(){
+        let (mut d,mut p)=setup();
+        let digest=d.project_source_summary(id(2),1,&p,"main").unwrap().fnv64;
+        assert!(d.project_source_ascii_digits(id(2),6,&p,"main").is_err());
+        assert!(d.project_source_tab_characters(id(2),6,&p,"main").is_err());
+        assert!(d.project_replace_source_prefix_at_revision(id(2),6,&mut p,"main",digest,"CAT","X").is_err());
+        assert!(d.project_erase_first_literal_at_revision(
+            Identity{generation:2,..id(2)},1,&mut p,"main",digest,"CAT").is_err());
+        assert!(d.project_normalize_source_crlf_at_revision(id(2),1,&mut p,"main",digest^1).is_err());
+    }
+}

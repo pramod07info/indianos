@@ -19,7 +19,7 @@ pub const COMMAND_VERBS:&[&str]=&[
  "help","pwd","tools","ls","cat","page","write","append","mkdir","mv",
  "cp","rm","mkfile","truncate","head","count","rmdir","mvdir",
  "pread","pwrite","lines","line","hash","stat","tail","find","grep","cmp","diffat",
- "touch","copynew","copyrange","matchpage","textpage","idpage","caswrite","casappend","castruncate","casclone","wordpage","idcount","casrm","casmv","linepage","textstats","castext","casinsert","caserase","unicodehead","unicodetail","textverify","casprepend","casstrip","casupper","caslower","casnewline","unicodepage","tabpositions","crpositions","leadingspaces","sourceprefix","replace","appendln","health","hex","slice","concat","cmprange","bytefreq","patchhex","patchrange","copylines","wc","headlines","rfind","taillines","linespan","linehits","sourceview","sourcecontext","textprofile","blankrows","indentmap","eolcheck",
+ "touch","copynew","copyrange","matchpage","textpage","idpage","caswrite","casappend","castruncate","casclone","wordpage","idcount","casrm","casmv","linepage","textstats","castext","casinsert","caserase","unicodehead","unicodetail","textverify","casprepend","casstrip","casupper","caslower","casnewline","unicodepage","tabpositions","crpositions","leadingspaces","sourceprefix","srcupper","srclower","srcdigit","srcpunct","srcnonascii","srcwords","srctokens","srctabs","srccrlf","srclongest","srcshortest","srctrailws","srcleadingws","srcblank","srcunique","srcmaxcol","srcmixednl","srchasbom","srcfinalnl","srcnul","replace","appendln","health","hex","slice","concat","cmprange","bytefreq","patchhex","patchrange","copylines","wc","headlines","rfind","taillines","linespan","linehits","sourceview","sourcecontext","textprofile","blankrows","indentmap","eolcheck",
 ];
 /// Complete exactly one printable lower-case verb prefix. Ambiguous matches,
 /// empty prefixes and user-supplied paths never cause completion or I/O.
@@ -676,6 +676,68 @@ pub fn command<D:BlockDevice,const N:usize>(
    let len=fs.read(p,&mut old).map_err(Error::Io)?;
    let text=core::str::from_utf8(&old[..len]).map_err(|_|Error::Invalid)?;
    publish(if text.starts_with(needle){b"yes"}else{b"no"},out)
+  }
+
+  // R083: twenty distinct allocation-free source inspection commands.
+  // Every command reads the mounted durable file, checks live FILE_READ,
+  // validates UTF-8 before analysis, and publishes only a complete result.
+  "srcupper"|"srclower"|"srcdigit"|"srcpunct"|"srcnonascii"|
+  "srcwords"|"srctokens"|"srctabs"|"srccrlf"|"srclongest"|
+  "srcshortest"|"srctrailws"|"srcleadingws"|"srcblank"|
+  "srcunique"|"srcmaxcol"|"srcmixednl"|"srchasbom"|
+  "srcfinalnl"|"srcnul"=>{
+   auth.require(caller,FILE_READ,now).map_err(|_|Error::Denied)?;
+   let p=path(raw,&mut name)?;
+   let mut data=[0u8;crate::durablefs::MAX_FILE_BYTES];
+   let n=fs.read(p,&mut data).map_err(Error::Io)?;
+   let t=core::str::from_utf8(&data[..n]).map_err(|_|Error::Invalid)?;
+   let lines=t.split_inclusive('\n');
+   let value:usize=match verb{
+    "srcupper"=>t.bytes().filter(|b|b.is_ascii_uppercase()).count(),
+    "srclower"=>t.bytes().filter(|b|b.is_ascii_lowercase()).count(),
+    "srcdigit"=>t.bytes().filter(|b|b.is_ascii_digit()).count(),
+    "srcpunct"=>t.bytes().filter(|b|b.is_ascii_punctuation()).count(),
+    "srcnonascii"=>t.chars().filter(|c|!c.is_ascii()).count(),
+    "srcwords"=>t.split_whitespace().count(),
+    "srctokens"=>{
+      let mut prior=false;let mut total=0;
+      for &ch in t.as_bytes(){
+       let word=ch.is_ascii_alphanumeric()||ch==b'_';
+       if word&&!prior{total+=1;}
+       prior=word;
+      }
+      total
+    },
+    "srctabs"=>t.bytes().filter(|b|*b==b'\t').count(),
+    "srccrlf"=>t.as_bytes().windows(2).filter(|w|*w==b"\r\n").count(),
+    "srclongest"=>lines.map(|r|r.trim_end_matches('\n').len()).max().unwrap_or(0),
+    "srcshortest"=>lines.map(|r|r.trim_end_matches('\n').len()).min().unwrap_or(0),
+    "srctrailws"=>lines.map(|r|r.trim_end_matches('\n').bytes().rev()
+        .take_while(|b|*b==b' ').count()).sum(),
+    "srcleadingws"=>lines.map(|r|r.bytes().take_while(|b|*b==b' ').count()).sum(),
+    "srcblank"=>lines.filter(|r|r.trim().is_empty()).count(),
+    "srcunique"=>{
+      let mut mask=0u32;
+      for ch in t.bytes(){
+       if ch.is_ascii_alphabetic(){
+        mask|=1u32<<((ch.to_ascii_lowercase()-b'a') as u32);
+       }
+      }
+      mask.count_ones() as usize
+    },
+    "srcmaxcol"=>lines.map(|r|r.trim_end_matches('\n')
+       .trim_end_matches('\r').chars().count()).max().unwrap_or(0),
+    "srcmixednl"=>{
+       let crlf=t.as_bytes().windows(2).filter(|w|*w==b"\r\n").count();
+       let lf=t.bytes().filter(|b|*b==b'\n').count();
+       usize::from(crlf>0&&lf>crlf)
+    },
+    "srchasbom"=>usize::from(t.starts_with('\u{feff}')),
+    "srcfinalnl"=>usize::from(t.ends_with('\n')),
+    "srcnul"=>t.bytes().filter(|b|*b==0).count(),
+    _=>return Err(Error::Unknown)
+   };
+   publish_number(value as u64,out)
   }
   "page"=>{
    auth.require(caller,FILE_READ,now).map_err(|_|Error::Denied)?;
@@ -1981,7 +2043,7 @@ mod tests{
  }
  #[test]fn r044_command_registry_drives_unique_safe_completion(){
   // R078: four new developer commands after the R077 total of 56.
-  assert_eq!(COMMAND_VERBS.len(),84);
+  assert_eq!(COMMAND_VERBS.len(),104);
   for (i,verb) in COMMAND_VERBS.iter().enumerate(){
    assert!(verb.as_bytes().iter().all(|b|b.is_ascii_lowercase()));
    assert!(!COMMAND_VERBS[..i].contains(verb));
@@ -4270,5 +4332,64 @@ mod r082_terminal_unicode_ops_tests {
         assert_eq!(command(&mut fs,&rights,who(),11,b"tabpositions /tabs",&mut out),
             Err(Error::Denied));
         assert_eq!(fs.generation(),generation);
+    }
+}
+
+
+#[cfg(test)]
+mod r083_source_diagnostics_tests{
+    use super::*;
+    use crate::block::{BlockError,SECTOR_BYTES};
+    struct Disk{sectors:[[u8;SECTOR_BYTES];100]}
+    impl BlockDevice for Disk{
+        fn sector_count(&self)->u64{100}
+        fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+            *out=*self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?;Ok(())
+        }
+        fn write_sector(&mut self,lba:u64,bytes:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+            *self.sectors.get_mut(lba as usize).ok_or(BlockError::OutOfRange)?=*bytes;Ok(())
+        }
+    }
+    fn who()->Identity{Identity{pid:105,generation:1}}
+    fn setup()->(HierVfs<Disk>,Access<2>){
+        let mut fs=HierVfs::format_blank(Disk{sectors:[[0;SECTOR_BYTES];100]}).unwrap();
+        fs.create("/src","  aA9_\t\r\nβ\n".as_bytes()).unwrap();
+        fs.create("/nul",&[b'a',0,b'b']).unwrap();
+        let mut rights=Access::new();rights.grant(who(),FILE_READ,10).unwrap();
+        (fs,rights)
+    }
+    #[test]
+    fn all_twenty_commands_examine_real_durable_utf8_source(){
+        let (mut fs,rights)=setup();
+        let checks=[
+            ("srcupper /src","1"),("srclower /src","1"),("srcdigit /src","1"),
+            ("srcpunct /src","1"),("srcnonascii /src","1"),("srcwords /src","2"),
+            ("srctokens /src","1"),("srctabs /src","1"),("srccrlf /src","1"),
+            ("srclongest /src","8"),("srcshortest /src","2"),
+            ("srctrailws /src","0"),("srcleadingws /src","2"),
+            ("srcblank /src","0"),("srcunique /src","1"),
+            ("srcmaxcol /src","7"),("srcmixednl /src","1"),
+            ("srchasbom /src","0"),("srcfinalnl /src","1"),("srcnul /nul","1")
+        ];
+        for (cmd,want) in checks{
+            let mut out=[0u8;20];
+            let n=command(&mut fs,&rights,who(),1,cmd.as_bytes(),&mut out).unwrap();
+            assert_eq!(&out[..n],want.as_bytes(),"command {}",cmd);
+        }
+        let mut fs=HierVfs::mount(fs.into_device()).unwrap();
+        let mut out=[0u8;20];
+        assert_eq!(command(&mut fs,&rights,who(),1,b"srccrlf /src",&mut out),Ok(1));
+        assert_eq!(&out[..1],b"1");
+    }
+    #[test]
+    fn wrong_owner_short_output_and_bad_source_fail_closed(){
+        let (mut fs,rights)=setup();let before=fs.generation();
+        let mut tiny=[0xaau8;0];
+        assert_eq!(command(&mut fs,&rights,who(),1,b"srcupper /src",&mut tiny),
+            Err(Error::OutputTooSmall));
+        let mut out=[0xaau8;20];
+        assert_eq!(command(&mut fs,&rights,who(),11,b"srccrlf /src",&mut out),
+            Err(Error::Denied));
+        assert_eq!(fs.generation(),before);
     }
 }
