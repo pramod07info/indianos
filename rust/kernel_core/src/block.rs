@@ -56,7 +56,12 @@ impl<D: BlockDevice> BlockDevice for BlockWindow<'_, D> {
         -> Result<(), BlockError>
     {
         check_range(self.count, lba, 1)?;
-        self.device.read_sector(self.start + lba, out)
+        // A failing physical driver may have already changed its output.
+        // Only publish a successful sector to the mounted filesystem.
+        let mut sector = [0u8; SECTOR_BYTES];
+        self.device.read_sector(self.start + lba, &mut sector)?;
+        out.copy_from_slice(&sector);
+        Ok(())
     }
     fn write_sector(&mut self, lba: u64, data: &[u8; SECTOR_BYTES])
         -> Result<(), BlockError>
@@ -254,6 +259,44 @@ mod tests {
     fn read_only_device_rejects_writes() {
         let mut disk = RamDisk { bytes: [0; SECTOR_BYTES * 4], readonly: true };
         assert_eq!(write_sectors(&mut disk, 0, &[1; SECTOR_BYTES]), Err(BlockError::ReadOnly));
+    }
+
+    #[test]
+    fn m1_r086_bounded_sector_read_keeps_caller_buffer_on_driver_error() {
+        struct FaultingDisk { attempts: usize }
+        impl BlockDevice for FaultingDisk {
+            fn sector_count(&self) -> u64 { 4 }
+            fn read_sector(&mut self, _lba: u64, out: &mut [u8; SECTOR_BYTES])
+                -> Result<(), BlockError> {
+                self.attempts += 1;
+                // Simulate a real driver that partially touches a DMA bounce
+                // buffer before reporting device error.
+                out[..32].fill(0xef);
+                Err(BlockError::Io)
+            }
+            fn write_sector(&mut self, _lba: u64, _data: &[u8; SECTOR_BYTES])
+                -> Result<(), BlockError> { Err(BlockError::ReadOnly) }
+        }
+        let mut disk = FaultingDisk { attempts: 0 };
+        {
+            let mut volume = BlockWindow::new(&mut disk, 1, 2).unwrap();
+            let mut output = [0x5au8; SECTOR_BYTES];
+            assert_eq!(volume.read_sector(0, &mut output), Err(BlockError::Io));
+            assert_eq!(output, [0x5a; SECTOR_BYTES]);
+            assert_eq!(volume.read_sector(2, &mut output), Err(BlockError::OutOfRange));
+            assert_eq!(output, [0x5a; SECTOR_BYTES]);
+        }
+        assert_eq!(disk.attempts, 1);
+    }
+
+    #[test]
+    fn m1_r086_bounded_sector_read_publishes_full_successful_sector() {
+        let mut disk = RamDisk { bytes: [0; SECTOR_BYTES * 4], readonly: false };
+        disk.bytes[SECTOR_BYTES..SECTOR_BYTES * 2].fill(0x35);
+        let mut volume = BlockWindow::new(&mut disk, 1, 2).unwrap();
+        let mut output = [0x5a; SECTOR_BYTES];
+        assert_eq!(volume.read_sector(0, &mut output), Ok(()));
+        assert_eq!(output, [0x35; SECTOR_BYTES]);
     }
 }
 
