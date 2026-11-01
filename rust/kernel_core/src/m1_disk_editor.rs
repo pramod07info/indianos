@@ -1582,3 +1582,90 @@ mod r071_editor_crlf_tests {
         assert_eq!(fs.generation(), generation);
     }
 }
+
+
+/// R072: expand TAB indentation at the beginning of each source row to
+/// four ASCII spaces. Interior tabs (e.g. inside source literals) are left
+/// unchanged. Stage every byte before one reversible in-memory edit.
+impl DiskEditor {
+    pub fn expand_leading_source_tabs(&mut self, caller: Identity) -> Result<usize, Error> {
+        self.authorize(caller)?;
+        core::str::from_utf8(&self.data[..self.used]).map_err(|_| Error::Invalid)?;
+        let mut staged = [0u8; MAX_FILE_BYTES];
+        let mut at = 0usize;
+        let mut changed = 0usize;
+        let mut in_indent = true;
+        for &byte in &self.data[..self.used] {
+            if byte == b'\t' && in_indent {
+                let last = at.checked_add(4).ok_or(Error::Full)?;
+                if last > staged.len() { return Err(Error::Full); }
+                staged[at..last].fill(b' ');
+                at = last;
+                changed += 1;
+            } else {
+                if at == staged.len() { return Err(Error::Full); }
+                staged[at] = byte;
+                at += 1;
+                if byte == b'\n' { in_indent = true; }
+                else if byte != b' ' { in_indent = false; }
+            }
+        }
+        if changed != 0 { self.replace(caller, 0, self.used, &staged[..at])?; }
+        Ok(changed)
+    }
+}
+
+#[cfg(test)]
+mod r072_editor_tabs_tests {
+    use super::*;
+    use crate::block::{BlockError, SECTOR_BYTES};
+    struct Disk { sectors: [[u8; SECTOR_BYTES]; 100] }
+    impl BlockDevice for Disk {
+        fn sector_count(&self) -> u64 { 100 }
+        fn read_sector(&mut self, lba: u64, out: &mut [u8; SECTOR_BYTES]) -> Result<(), BlockError> {
+            *out = *self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?; Ok(())
+        }
+        fn write_sector(&mut self, lba: u64, data: &[u8; SECTOR_BYTES]) -> Result<(), BlockError> {
+            *self.sectors.get_mut(lba as usize).ok_or(BlockError::OutOfRange)? = *data; Ok(())
+        }
+    }
+    fn id() -> Identity { Identity { pid: 8, generation: 3 } }
+    fn volume() -> HierVfs<Disk> {
+        let mut fs = HierVfs::format_blank(Disk { sectors: [[0; SECTOR_BYTES]; 100] }).unwrap();
+        fs.create("/src", "\tα\n \tβ\tz\n\t\tγ\n".as_bytes()).unwrap();
+        fs.create("/binary", &[0xff, b'\t']).unwrap();
+        fs
+    }
+    #[test]
+    fn expands_leading_tabs_only_and_survives_undo_redo_and_reboot() {
+        let mut fs = volume();
+        let mut e = DiskEditor::new();
+        e.open(id(), &mut fs, "/src").unwrap();
+        let old = "\tα\n \tβ\tz\n\t\tγ\n";
+        let next = "    α\n     β\tz\n        γ\n";
+        assert_eq!(e.expand_leading_source_tabs(id()), Ok(4));
+        assert_eq!(e.undo(id()), Ok(old.len()));
+        assert_eq!(e.redo(id()), Ok(next.len()));
+        e.save(id(), &mut fs).unwrap();
+        let mut fs = HierVfs::mount(fs.into_device()).unwrap();
+        let mut out = [0u8; 48];
+        assert_eq!(fs.read("/src", &mut out), Ok(next.len()));
+        assert_eq!(&out[..next.len()], next.as_bytes());
+    }
+    #[test]
+    fn no_tabs_is_noop_binary_and_recycled_id_are_denied() {
+        let mut fs = volume();
+        let mut e = DiskEditor::new();
+        e.open(id(), &mut fs, "/src").unwrap();
+        assert_eq!(e.expand_leading_source_tabs(
+            Identity { generation: 4, ..id() }), Err(Error::Unauthorized));
+        assert!(!e.status(id()).unwrap().dirty);
+        e.expand_leading_source_tabs(id()).unwrap();
+        e.save(id(), &mut fs).unwrap();
+        assert_eq!(e.expand_leading_source_tabs(id()), Ok(0));
+        assert!(!e.status(id()).unwrap().dirty);
+        e.close(id(), false).unwrap();
+        e.open(id(), &mut fs, "/binary").unwrap();
+        assert_eq!(e.expand_leading_source_tabs(id()), Err(Error::Invalid));
+    }
+}

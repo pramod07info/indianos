@@ -2080,3 +2080,90 @@ mod r071_desktop_source_security_tests {
             id(2), 6, &p, "main", "foo", "bar").is_err());
     }
 }
+
+
+/// R072: independent ownership and capability checks for source
+/// indentation conversion and optimistic line-level project replacement.
+impl<D: BlockDevice, const P: usize, const E: usize, const W: usize,
+     const K: usize, const G: usize, const Q: usize> Desktop<D, P, E, W, K, G, Q> {
+    pub fn editor_expand_leading_source_tabs(&mut self, caller: Identity, now: u64,
+        editor: &mut crate::m1_disk_editor::DiskEditor) -> Result<usize, EditorRouteError> {
+        self.admit_editor(caller, now, FILE_WRITE)?;
+        editor.expand_leading_source_tabs(caller).map_err(EditorRouteError::Editor)
+    }
+    pub fn project_replace_source_line_if_equal(&mut self, caller: Identity, now: u64,
+        project: &mut crate::m1_project_workspace::ProjectTree,
+        file: &str, line: usize, old: &str, replacement: &str
+    ) -> Result<usize, ProjectRouteError> {
+        self.admit_editor(caller, now, FILE_WRITE).map_err(ProjectRouteError::Permission)?;
+        project.replace_source_line_if_equal(caller, &mut self.volume, file, line,
+            old, replacement).map_err(ProjectRouteError::Project)
+    }
+}
+
+#[cfg(test)]
+mod r072_desktop_real_source_routes_tests {
+    use super::*;
+    use crate::block::{BlockError, SECTOR_BYTES};
+    use crate::batch2_launcher::Image;
+    use crate::batch2_settings::{Settings, Theme};
+    struct Disk { sectors: [[u8; SECTOR_BYTES]; 100] }
+    impl BlockDevice for Disk {
+        fn sector_count(&self) -> u64 { 100 }
+        fn read_sector(&mut self, lba: u64, out: &mut [u8; SECTOR_BYTES]) -> Result<(), BlockError> {
+            *out = *self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?; Ok(())
+        }
+        fn write_sector(&mut self, lba: u64, data: &[u8; SECTOR_BYTES]) -> Result<(), BlockError> {
+            *self.sectors.get_mut(lba as usize).ok_or(BlockError::OutOfRange)? = *data; Ok(())
+        }
+    }
+    type Desk = Desktop<Disk, 3, 3, 2, 2, 3, 8>;
+    fn id(pid: u32) -> Identity { Identity { pid, generation: 1 } }
+    fn launch(pid: u32) -> Launch {
+        Launch { pid, generation: 1, image: Image {
+            image_id: pid, entry: 0x1000, mapped_end: 0x2000, verified: true
+        } }
+    }
+    fn ready() -> Desk {
+        let mut fs = HierVfs::format_blank(Disk { sectors: [[0; SECTOR_BYTES]; 100] }).unwrap();
+        fs.create("/source", "\tα\n".as_bytes()).unwrap();
+        let mut d = Desk::from_mounted(fs);
+        d.start(id(1), launch(1), id(2), launch(2),
+            Settings { theme: Theme::Dark, pointer_speed: 5, key_repeat: 10 }, 8, 5).unwrap();
+        d
+    }
+    #[test]
+    fn owner_can_format_and_replace_real_source_after_save() {
+        let mut d = ready();
+        let mut e = crate::m1_disk_editor::DiskEditor::new();
+        d.editor_open(id(2), 1, &mut e, "/source").unwrap();
+        assert_eq!(d.editor_expand_leading_source_tabs(id(2), 1, &mut e), Ok(1));
+        d.editor_save(id(2), 1, &mut e).unwrap();
+        let mut p = crate::m1_project_workspace::ProjectTree::new();
+        d.project_create(id(2), 1, &mut p, "demo").unwrap();
+        d.project_create_file(id(2), 1, &mut p, "main", "α\nβ\n".as_bytes()).unwrap();
+        assert_eq!(d.project_replace_source_line_if_equal(id(2), 1,
+            &mut p, "main", 2, "β", "γ"), Ok("α\nγ\n".len()));
+        let mut fs = HierVfs::mount(d.into_device()).unwrap();
+        let mut out = [0u8; 32];
+        assert_eq!(fs.read("/source", &mut out), Ok("    α\n".len()));
+        assert_eq!(&out[.."    α\n".len()], "    α\n".as_bytes());
+        assert_eq!(fs.read("/work/demo/main", &mut out), Ok("α\nγ\n".len()));
+        assert_eq!(&out[.."α\nγ\n".len()], "α\nγ\n".as_bytes());
+    }
+    #[test]
+    fn expired_grants_and_recycled_pid_fail_closed() {
+        let mut d = ready();
+        let mut e = crate::m1_disk_editor::DiskEditor::new();
+        d.editor_open(id(2), 1, &mut e, "/source").unwrap();
+        assert!(d.editor_expand_leading_source_tabs(id(2), 6, &mut e).is_err());
+        assert!(d.editor_expand_leading_source_tabs(
+            Identity { generation: 2, ..id(2) }, 1, &mut e).is_err());
+        assert!(!e.status(id(2)).unwrap().dirty);
+        let mut p = crate::m1_project_workspace::ProjectTree::new();
+        d.project_create(id(2), 1, &mut p, "demo").unwrap();
+        d.project_create_file(id(2), 1, &mut p, "main", b"old").unwrap();
+        assert!(d.project_replace_source_line_if_equal(id(2), 6,
+            &mut p, "main", 1, "old", "bad").is_err());
+    }
+}

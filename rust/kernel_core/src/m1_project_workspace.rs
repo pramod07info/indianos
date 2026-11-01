@@ -1421,3 +1421,103 @@ mod r071_project_rename_preview_tests {
         assert_eq!(fs.generation(), generation);
     }
 }
+
+
+/// R072: optimistic, single-row compare-and-swap. An exact expected UTF-8
+/// row (excluding newline) must still match before a one-generation COW
+/// replacement. Other rows, including final-line newlines, are preserved.
+impl ProjectTree {
+    pub fn replace_source_line_if_equal<D: BlockDevice>(&mut self, caller: Identity,
+        fs: &mut HierVfs<D>, file: &str, line: usize,
+        expected: &str, replacement: &str) -> Result<usize, Error> {
+        self.check_fresh(caller, fs)?;
+        if line == 0 || expected.contains('\n') || replacement.contains('\n')
+            || expected.contains('\r') || replacement.contains('\r')
+            || expected.contains('\0') || replacement.contains('\0') {
+            return Err(Error::Invalid);
+        }
+        let (path, n) = self.child(file)?;
+        let path = Self::str_path(&path, n);
+        let mut original = [0u8; MAX_FILE_BYTES];
+        let length = fs.read(path, &mut original)?;
+        let source = core::str::from_utf8(&original[..length])
+            .map_err(|_| Error::Invalid)?;
+        let mut offset = 0usize;
+        let mut selected = None;
+        for (i, row) in source.split_inclusive('\n').enumerate() {
+            let body = row.strip_suffix('\n').unwrap_or(row);
+            if i + 1 == line {
+                selected = Some((offset, offset + body.len(), body));
+                break;
+            }
+            offset += row.len();
+        }
+        let (start, end, body) = selected.ok_or(Error::Invalid)?;
+        if body != expected { return Err(Error::Stale); }
+        if body == replacement { return Ok(length); }
+        let new_length = length.checked_sub(end-start)
+            .and_then(|n| n.checked_add(replacement.len())).ok_or(Error::Full)?;
+        if new_length > MAX_FILE_BYTES { return Err(Error::Full); }
+        let mut updated = [0u8; MAX_FILE_BYTES];
+        updated[..start].copy_from_slice(&original[..start]);
+        updated[start..start + replacement.len()].copy_from_slice(replacement.as_bytes());
+        updated[start + replacement.len()..new_length]
+            .copy_from_slice(&original[end..length]);
+        fs.overwrite(path, &updated[..new_length])?;
+        self.generation = fs.generation();
+        Ok(new_length)
+    }
+}
+
+#[cfg(test)]
+mod r072_project_row_compare_swap_tests {
+    use super::*;
+    use crate::block::{BlockError, SECTOR_BYTES};
+    struct Disk { sectors: [[u8; SECTOR_BYTES]; 100] }
+    impl BlockDevice for Disk {
+        fn sector_count(&self) -> u64 { 100 }
+        fn read_sector(&mut self, lba: u64, out: &mut [u8; SECTOR_BYTES]) -> Result<(), BlockError> {
+            *out = *self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?; Ok(())
+        }
+        fn write_sector(&mut self, lba: u64, data: &[u8; SECTOR_BYTES]) -> Result<(), BlockError> {
+            *self.sectors.get_mut(lba as usize).ok_or(BlockError::OutOfRange)? = *data; Ok(())
+        }
+    }
+    fn id() -> Identity { Identity { pid: 9, generation: 3 } }
+    fn setup() -> (HierVfs<Disk>, ProjectTree) {
+        let mut fs = HierVfs::format_blank(Disk { sectors: [[0; SECTOR_BYTES]; 100] }).unwrap();
+        let mut p = ProjectTree::new();
+        p.create(id(), &mut fs, "demo").unwrap();
+        p.create_file(id(), &mut fs, "main", "α\nβ\nlast".as_bytes()).unwrap();
+        (fs, p)
+    }
+    #[test]
+    fn replaces_only_expected_unicode_row_and_reboots() {
+        let (mut fs, mut p) = setup();
+        let before = fs.generation();
+        let next = "α\nlong β\nlast";
+        assert_eq!(p.replace_source_line_if_equal(id(), &mut fs, "main", 2,
+            "β", "long β"), Ok(next.len()));
+        assert_eq!(fs.generation(), before + 1);
+        let fs = HierVfs::mount(fs.into_device()).unwrap();
+        let mut fs = fs;
+        let mut out = [0u8; 32];
+        assert_eq!(fs.read("/work/demo/main", &mut out), Ok(next.len()));
+        assert_eq!(&out[..next.len()], next.as_bytes());
+    }
+    #[test]
+    fn mismatch_invalid_row_and_recycled_id_never_commit() {
+        let (mut fs, mut p) = setup();
+        let generation = fs.generation();
+        assert_eq!(p.replace_source_line_if_equal(id(), &mut fs, "main", 2,
+            "other", "replace"), Err(Error::Stale));
+        assert_eq!(p.replace_source_line_if_equal(id(), &mut fs, "main", 9,
+            "x", "y"), Err(Error::Invalid));
+        assert_eq!(p.replace_source_line_if_equal(id(), &mut fs, "main", 1,
+            "α", "α"), Ok("α\nβ\nlast".len()));
+        assert_eq!(p.replace_source_line_if_equal(
+            Identity { generation: 4, ..id() }, &mut fs, "main", 1,
+            "α", "oops"), Err(Error::Unauthorized));
+        assert_eq!(fs.generation(), generation);
+    }
+}

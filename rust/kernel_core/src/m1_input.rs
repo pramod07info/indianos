@@ -1582,3 +1582,85 @@ mod r071_terminal_argument_navigation_tests {
         assert_eq!(input.jump_to_argument(0), Err(Error::Invalid));
     }
 }
+
+
+/// R072: reorder two adjacent whitespace-delimited command tokens in the
+/// live unsent draft. The exact intervening whitespace and surrounding
+/// tokens survive, with a single bounded, non-submitting mutation.
+impl LineEditor {
+    pub fn swap_adjacent_arguments(&mut self, first: usize) -> Result<Event, Error> {
+        let second = first.checked_add(1).ok_or(Error::Invalid)?;
+        let mut cursor = 0usize;
+        let mut token = 0usize;
+        let mut a = None;
+        let mut b = None;
+        while cursor < self.len {
+            while cursor < self.len && self.line[cursor] == b' ' { cursor += 1; }
+            if cursor == self.len { break; }
+            let begin = cursor;
+            while cursor < self.len && self.line[cursor] != b' ' { cursor += 1; }
+            if token == first { a = Some((begin, cursor)); }
+            if token == second { b = Some((begin, cursor)); break; }
+            token += 1;
+        }
+        let (a_start, a_end) = a.ok_or(Error::Invalid)?;
+        let (b_start, b_end) = b.ok_or(Error::Invalid)?;
+        let left = &self.line[a_start..a_end];
+        let right = &self.line[b_start..b_end];
+        if left == right { return Ok(Event::Empty); }
+        let mut staged = [0u8; MAX_LINE];
+        staged[..a_start].copy_from_slice(&self.line[..a_start]);
+        let mut at = a_start;
+        staged[at..at+right.len()].copy_from_slice(right);
+        at += right.len();
+        staged[at..at+b_start-a_end].copy_from_slice(&self.line[a_end..b_start]);
+        at += b_start-a_end;
+        staged[at..at+left.len()].copy_from_slice(left);
+        at += left.len();
+        staged[at..self.len].copy_from_slice(&self.line[b_end..self.len]);
+        let moved_len = right.len();
+        self.line = staged;
+        self.caret = a_start + moved_len;
+        Ok(Event::Typed)
+    }
+}
+impl InputLine {
+    pub fn swap_adjacent_arguments(&mut self, first: usize) -> Result<Event, Error> {
+        let result = self.editor.swap_adjacent_arguments(first)?;
+        if result == Event::Typed {
+            self.history_cursor = None;
+            self.history_draft.fill(0);
+            self.history_draft_len = 0;
+        }
+        Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod r072_shell_argument_reorder_tests {
+    use super::*;
+    #[test]
+    fn swaps_arguments_and_preserves_exact_delimiters_and_history() {
+        let mut line = InputLine::new();
+        line.set_line(b"git  checkout   main  ").unwrap();
+        assert_eq!(line.swap_adjacent_arguments(1), Ok(Event::Typed));
+        assert_eq!(line.bytes(), b"git  main   checkout  ");
+        assert_eq!(line.caret(), 9);
+        assert_eq!(line.history_count(), 0);
+    }
+    #[test]
+    fn missing_token_equal_token_and_clipboard_are_fail_closed() {
+        let mut line = InputLine::new();
+        let mut out = [0u8; MAX_LINE];
+        line.set_line(b"pwd").unwrap();
+        line.feed(b'\n', &mut out).unwrap();
+        line.set_line(b"run one one").unwrap();
+        line.copy_range(4, 7).unwrap();
+        assert_eq!(line.swap_adjacent_arguments(1), Ok(Event::Empty));
+        assert_eq!(line.bytes(), b"run one one");
+        assert_eq!(line.swap_adjacent_arguments(2), Err(Error::Invalid));
+        assert_eq!(line.swap_adjacent_arguments(usize::MAX), Err(Error::Invalid));
+        assert_eq!(line.clipboard_bytes(), b"one");
+        assert_eq!(line.history_count(), 1);
+    }
+}
