@@ -2599,3 +2599,94 @@ mod r077_editor_pool_tests {
         assert_eq!(&bytes[..5], b"base!");
     }
 }
+
+
+// M1/R078 workstream 1 (tasks 01-04): real multi-document source operations.
+impl EditorPool {
+    /// Search only the named open document; never leak a peer document's bytes.
+    pub fn find_text(&self, caller:Identity, slot:usize, needle:&str, from:usize)
+        ->Result<Option<usize>,Error>{
+        self.docs.get(slot).ok_or(Error::Invalid)?.find_text(caller,needle,from)
+    }
+    /// Unicode selection copied from one authenticated editor session.
+    pub fn copy_text(&self, caller:Identity, slot:usize, from:usize,to:usize,
+        out:&mut[u8])->Result<usize,Error>{
+        self.docs.get(slot).ok_or(Error::Invalid)?
+            .copy_text_selection(caller,from,to,out)
+    }
+    /// A selection cut modifies only its owning slot and is undoable.
+    pub fn cut_text(&mut self, caller:Identity, slot:usize, from:usize,to:usize,
+        out:&mut[u8])->Result<usize,Error>{
+        self.docs.get_mut(slot).ok_or(Error::Invalid)?
+            .cut_text_selection(caller,from,to,out)
+    }
+    /// Clipboard data comes from an authorized caller; no global clipboard.
+    pub fn paste_text(&mut self, caller:Identity, slot:usize, from:usize,to:usize,
+        data:&str)->Result<usize,Error>{
+        self.docs.get_mut(slot).ok_or(Error::Invalid)?
+            .paste_text_selection(caller,from,to,data)
+    }
+}
+
+#[cfg(test)]
+mod r078_editor_pool_source_tests {
+    use super::*;
+    use crate::block::{BlockError,SECTOR_BYTES};
+    struct Disk{sectors:[[u8;SECTOR_BYTES];100]}
+    impl BlockDevice for Disk {
+        fn sector_count(&self)->u64{100}
+        fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+            ->Result<(),BlockError>{
+            *out=*self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?;
+            Ok(())
+        }
+        fn write_sector(&mut self,lba:u64,data:&[u8;SECTOR_BYTES])
+            ->Result<(),BlockError>{
+            *self.sectors.get_mut(lba as usize).ok_or(BlockError::OutOfRange)?=*data;
+            Ok(())
+        }
+    }
+    fn id()->Identity{Identity{pid:42,generation:3}}
+    fn setup()->(HierVfs<Disk>,EditorPool){
+        let mut fs=HierVfs::format_blank(Disk{sectors:[[0;SECTOR_BYTES];100]}).unwrap();
+        fs.create("/one","α hello".as_bytes()).unwrap();
+        fs.create("/two",b"second").unwrap();
+        let mut pool=EditorPool::new();
+        pool.open(id(),&mut fs,0,"/one").unwrap();
+        pool.open(id(),&mut fs,1,"/two").unwrap();
+        (fs,pool)
+    }
+    #[test]
+    fn owned_search_copy_cut_paste_and_undo_are_slot_isolated_and_durable(){
+        let (mut fs,mut pool)=setup();
+        assert_eq!(pool.find_text(id(),0,"hello",0),Ok(Some(3)));
+        assert_eq!(pool.find_text(id(),1,"hello",0),Ok(None));
+        let mut clip=[0u8;16];
+        assert_eq!(pool.copy_text(id(),0,0,2,&mut clip),Ok(2));
+        assert_eq!(&clip[..2],"α".as_bytes());
+        assert_eq!(pool.cut_text(id(),0,0,2,&mut clip),Ok(2));
+        assert_eq!(pool.undo(id(),0),Ok("α hello".len()));
+        assert_eq!(pool.paste_text(id(),1,6,6,"!"),Ok(7));
+        pool.save_all(id(),&mut fs).unwrap();
+        let mut mounted=HierVfs::mount(fs.into_device()).unwrap();
+        let mut output=[0u8;16];
+        assert_eq!(mounted.read("/one",&mut output),Ok("α hello".len()));
+        assert_eq!(&output[.."α hello".len()],"α hello".as_bytes());
+        assert_eq!(mounted.read("/two",&mut output),Ok(7));
+        assert_eq!(&output[..7],b"second!");
+    }
+    #[test]
+    fn invalid_unicode_short_clip_wrong_owner_and_bad_slots_leave_buffers_clean(){
+        let (_fs,mut pool)=setup();
+        let mut clip=[0x55u8;1];
+        assert_eq!(pool.copy_text(id(),0,0,2,&mut clip),Err(Error::Full));
+        assert_eq!(pool.cut_text(id(),0,1,2,&mut clip),Err(Error::Invalid));
+        assert_eq!(pool.paste_text(id(),0,1,2,"X"),Err(Error::Invalid));
+        assert_eq!(pool.find_text(id(),2,"a",0),Err(Error::Invalid));
+        assert_eq!(pool.copy_text(Identity{generation:4,..id()},1,0,1,&mut clip),
+            Err(Error::Unauthorized));
+        assert_eq!(clip,[0x55]);
+        assert!(!pool.status(id(),0).unwrap().dirty);
+        assert!(!pool.status(id(),1).unwrap().dirty);
+    }
+}
