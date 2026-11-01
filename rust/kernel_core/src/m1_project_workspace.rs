@@ -1521,3 +1521,96 @@ mod r072_project_row_compare_swap_tests {
         assert_eq!(fs.generation(), generation);
     }
 }
+
+
+/// R073: optimistic source-range compare-and-replace on real COW storage.
+/// The caller must present byte-exact expected source at valid UTF-8
+/// boundaries, preventing lost updates to an inspected editor selection.
+/// The full file is committed only after preflight; all other bytes survive.
+impl ProjectTree {
+    pub fn replace_source_range_if_equal<D: BlockDevice>(&mut self, caller: Identity,
+        fs: &mut HierVfs<D>, file: &str, start: usize,
+        expected: &str, replacement: &str) -> Result<usize, Error> {
+        self.check_fresh(caller, fs)?;
+        if expected.contains('\0') || replacement.contains('\0') {
+            return Err(Error::Invalid);
+        }
+        let (path, length) = self.child(file)?;
+        let path = Self::str_path(&path, length);
+        let mut old = [0u8; MAX_FILE_BYTES];
+        let count = fs.read(path, &mut old)?;
+        let text = core::str::from_utf8(&old[..count]).map_err(|_| Error::Invalid)?;
+        let end = start.checked_add(expected.len()).ok_or(Error::Full)?;
+        if start > count || end > count || !text.is_char_boundary(start)
+            || !text.is_char_boundary(end) { return Err(Error::Invalid); }
+        if &text[start..end] != expected { return Err(Error::Stale); }
+        if expected == replacement { return Ok(count); }
+        let after = count.checked_sub(expected.len())
+            .and_then(|n| n.checked_add(replacement.len())).ok_or(Error::Full)?;
+        if after > MAX_FILE_BYTES { return Err(Error::Full); }
+        let mut staged = [0u8; MAX_FILE_BYTES];
+        staged[..start].copy_from_slice(&old[..start]);
+        staged[start..start+replacement.len()].copy_from_slice(replacement.as_bytes());
+        staged[start+replacement.len()..after].copy_from_slice(&old[end..count]);
+        fs.overwrite(path, &staged[..after])?;
+        self.generation = fs.generation();
+        Ok(after)
+    }
+}
+
+#[cfg(test)]
+mod r073_source_range_compare_swap_tests {
+    use super::*;
+    use crate::block::{BlockError, SECTOR_BYTES};
+    struct Disk { sectors: [[u8; SECTOR_BYTES]; 100] }
+    impl BlockDevice for Disk {
+        fn sector_count(&self) -> u64 { 100 }
+        fn read_sector(&mut self, lba: u64, out: &mut [u8; SECTOR_BYTES]) -> Result<(), BlockError> {
+            *out = *self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?;
+            Ok(())
+        }
+        fn write_sector(&mut self, lba: u64, data: &[u8; SECTOR_BYTES]) -> Result<(), BlockError> {
+            *self.sectors.get_mut(lba as usize).ok_or(BlockError::OutOfRange)? = *data;
+            Ok(())
+        }
+    }
+    fn id() -> Identity { Identity { pid: 6, generation: 4 } }
+    fn ready() -> (HierVfs<Disk>, ProjectTree) {
+        let mut fs = HierVfs::format_blank(Disk { sectors: [[0; SECTOR_BYTES]; 100] }).unwrap();
+        let mut p = ProjectTree::new();
+        p.create(id(), &mut fs, "demo").unwrap();
+        p.create_file(id(), &mut fs, "main", "α one\nβ two\n".as_bytes()).unwrap();
+        (fs, p)
+    }
+    #[test]
+    fn exact_unicode_multiline_selection_is_one_durable_commit() {
+        let (mut fs, mut p) = ready();
+        let old = "α one\nβ two\n";
+        let next = "α one\nγ third\n";
+        let generation = fs.generation();
+        assert_eq!(p.replace_source_range_if_equal(id(), &mut fs, "main",
+            "α one\n".len(), "β two", "γ third"), Ok(next.len()));
+        assert_eq!(fs.generation(), generation + 1);
+        let mut mounted = HierVfs::mount(fs.into_device()).unwrap();
+        let mut out = [0u8; 48];
+        assert_eq!(mounted.read("/work/demo/main", &mut out), Ok(next.len()));
+        assert_eq!(&out[..next.len()], next.as_bytes());
+        assert_eq!(old.len() + "γ third".len() - "β two".len(), next.len());
+    }
+    #[test]
+    fn invalid_unicode_boundary_stale_expected_and_identity_never_commit() {
+        let (mut fs, mut p) = ready();
+        let generation = fs.generation();
+        assert_eq!(p.replace_source_range_if_equal(id(), &mut fs, "main",
+            1, "x", "new"), Err(Error::Invalid));
+        assert_eq!(p.replace_source_range_if_equal(id(), &mut fs, "main",
+            0, "α", "other"), Ok("other one\nβ two\n".len()));
+        let changed = fs.generation();
+        assert_eq!(p.replace_source_range_if_equal(id(), &mut fs, "main",
+            0, "α", "bad"), Err(Error::Stale));
+        assert_eq!(p.replace_source_range_if_equal(Identity { generation: 5, ..id() },
+            &mut fs, "main", 0, "other", "wrong"), Err(Error::Unauthorized));
+        assert_eq!(fs.generation(), changed);
+        assert_eq!(changed, generation + 1);
+    }
+}
