@@ -1714,3 +1714,257 @@ mod r074_diagnostics_tests {
         assert_eq!(fs.generation(), before);
     }
 }
+
+
+/// R075: one UTF-8 source replacement staged against a caller-observed
+/// disk snapshot. start is a byte offset, not a Unicode scalar position.
+#[derive(Clone, Copy, Debug)]
+pub struct SourcePatch<'a> {
+    pub start: usize,
+    pub expected: &'a str,
+    pub replacement: &'a str,
+}
+impl ProjectTree {
+    /// Apply up to eight ordered, non-overlapping optimistic edits with one
+    /// durable COW generation. No partial source update can be observed.
+    pub fn apply_source_patches_if_equal<D: BlockDevice>(&mut self, caller: Identity,
+        fs: &mut HierVfs<D>, file: &str,
+        patches: &[SourcePatch<'_>]) -> Result<usize, Error> {
+        self.check_fresh(caller, fs)?;
+        if patches.is_empty() || patches.len() > 8 { return Err(Error::Invalid); }
+        let (path, n) = self.child(file)?;
+        let path = Self::str_path(&path, n);
+        let mut original = [0u8; MAX_FILE_BYTES];
+        let used = fs.read(path, &mut original)?;
+        let source = core::str::from_utf8(&original[..used]).map_err(|_| Error::Invalid)?;
+        let mut staged = [0u8; MAX_FILE_BYTES];
+        let mut from = 0usize;
+        let mut to = 0usize;
+        let mut last_start = None;
+        for patch in patches {
+            if patch.expected.contains('\0') || patch.replacement.contains('\0') {
+                return Err(Error::Invalid);
+            }
+            let end = patch.start.checked_add(patch.expected.len())
+                .ok_or(Error::Full)?;
+            if patch.start < from || end > used ||
+                !source.is_char_boundary(patch.start) ||
+                !source.is_char_boundary(end) ||
+                last_start == Some(patch.start) { return Err(Error::Invalid); }
+            if &source[patch.start..end] != patch.expected { return Err(Error::Stale); }
+            let untouched = patch.start - from;
+            let next = to.checked_add(untouched)
+                .and_then(|n| n.checked_add(patch.replacement.len()))
+                .ok_or(Error::Full)?;
+            if next > MAX_FILE_BYTES { return Err(Error::Full); }
+            staged[to..to+untouched].copy_from_slice(&original[from..patch.start]);
+            to += untouched;
+            staged[to..next].copy_from_slice(patch.replacement.as_bytes());
+            to = next;
+            from = end;
+            last_start = Some(patch.start);
+        }
+        let final_size = to.checked_add(used-from).ok_or(Error::Full)?;
+        if final_size > MAX_FILE_BYTES { return Err(Error::Full); }
+        staged[to..final_size].copy_from_slice(&original[from..used]);
+        if final_size == used && staged[..used] == original[..used] { return Ok(used); }
+        fs.overwrite(path, &staged[..final_size])?;
+        self.generation = fs.generation();
+        Ok(final_size)
+    }
+}
+
+#[cfg(test)]
+mod r075_atomic_source_patch_tests {
+    use super::*;
+    use crate::block::{BlockError, SECTOR_BYTES};
+    struct Disk { sectors: [[u8; SECTOR_BYTES]; 100] }
+    impl BlockDevice for Disk {
+        fn sector_count(&self) -> u64 { 100 }
+        fn read_sector(&mut self, lba: u64, out: &mut [u8; SECTOR_BYTES]) -> Result<(), BlockError> {
+            *out = *self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?; Ok(())
+        }
+        fn write_sector(&mut self, lba: u64, data: &[u8; SECTOR_BYTES]) -> Result<(), BlockError> {
+            *self.sectors.get_mut(lba as usize).ok_or(BlockError::OutOfRange)? = *data; Ok(())
+        }
+    }
+    fn actor() -> Identity { Identity { pid: 7, generation: 3 } }
+    fn ready() -> (HierVfs<Disk>, ProjectTree) {
+        let mut fs = HierVfs::format_blank(Disk { sectors: [[0; SECTOR_BYTES]; 100] }).unwrap();
+        let mut p = ProjectTree::new();
+        p.create(actor(), &mut fs, "demo").unwrap();
+        p.create_file(actor(), &mut fs, "main", "α old\nβ old\n".as_bytes()).unwrap();
+        (fs, p)
+    }
+    #[test]
+    fn two_source_edits_commit_one_generation_and_survive_remount() {
+        let (mut fs, mut p) = ready();
+        let before = fs.generation();
+        let edits = [SourcePatch { start: 3, expected: "old", replacement: "first" },
+                     SourcePatch { start: 10, expected: "old", replacement: "second" }];
+        let expected = "α first\nβ second\n";
+        assert_eq!(p.apply_source_patches_if_equal(actor(), &mut fs, "main", &edits),
+            Ok(expected.len()));
+        assert_eq!(fs.generation(), before+1);
+        let mut disk = HierVfs::mount(fs.into_device()).unwrap();
+        let mut bytes = [0u8; 48];
+        assert_eq!(disk.read("/work/demo/main", &mut bytes), Ok(expected.len()));
+        assert_eq!(&bytes[..expected.len()], expected.as_bytes());
+    }
+    #[test]
+    fn stale_patch_unsorted_unicode_boundary_and_pid_leave_original_intact() {
+        let (mut fs, mut p) = ready();
+        let before = fs.generation();
+        let mismatched = [SourcePatch { start: 3, expected: "old", replacement: "ok" },
+                          SourcePatch { start: 10, expected: "oops", replacement: "bad" }];
+        assert_eq!(p.apply_source_patches_if_equal(actor(), &mut fs, "main", &mismatched),
+            Err(Error::Stale));
+        let invalid = [SourcePatch { start: 1, expected: "x", replacement: "y" }];
+        assert_eq!(p.apply_source_patches_if_equal(actor(), &mut fs, "main", &invalid),
+            Err(Error::Invalid));
+        let repeated = [SourcePatch { start: 3, expected: "old", replacement: "x" },
+                        SourcePatch { start: 3, expected: "", replacement: "y" }];
+        assert_eq!(p.apply_source_patches_if_equal(actor(), &mut fs, "main", &repeated),
+            Err(Error::Invalid));
+        assert_eq!(p.apply_source_patches_if_equal(
+            Identity { generation: 4, ..actor() }, &mut fs, "main", &mismatched),
+            Err(Error::Unauthorized));
+        assert_eq!(fs.generation(), before);
+    }
+}
+
+
+// R075 expanded workstream B: durable project inspection and safe writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SourceRowMetrics {
+    pub bytes: usize,
+    pub unicode_scalars: usize,
+    pub leading_spaces: usize,
+    pub trailing_whitespace: usize,
+}
+impl ProjectTree {
+    /// Read-only metrics for exactly one 1-based Unicode source row.
+    pub fn measure_source_line<D: BlockDevice>(&self, owner: Identity,
+        fs: &mut HierVfs<D>, name: &str, line: usize
+    ) -> Result<SourceRowMetrics, Error> {
+        self.check_fresh(owner, fs)?;
+        if line == 0 { return Err(Error::Invalid); }
+        let (p, n) = self.child(name)?;
+        let mut bytes = [0u8; MAX_FILE_BYTES];
+        let len = fs.read(Self::str_path(&p, n), &mut bytes)?;
+        let source = core::str::from_utf8(&bytes[..len]).map_err(|_| Error::Invalid)?;
+        let row = source.split_inclusive('\n').nth(line - 1).ok_or(Error::Invalid)?;
+        let body = row.strip_suffix('\n').unwrap_or(row);
+        Ok(SourceRowMetrics {
+            bytes: body.len(),
+            unicode_scalars: body.chars().count(),
+            leading_spaces: body.bytes().take_while(|b| *b == b' ').count(),
+            trailing_whitespace: body.bytes().rev().take_while(
+                |b| *b == b' ' || *b == b'\t').count(),
+        })
+    }
+
+    /// Append only when the current file still has an exact expected
+    /// UTF-8 suffix. A mismatch rejects the update before the sole COW write.
+    pub fn append_source_if_suffix_equal<D: BlockDevice>(&mut self, owner: Identity,
+        fs: &mut HierVfs<D>, name: &str, suffix: &str, added: &str
+    ) -> Result<usize, Error> {
+        self.check_fresh(owner, fs)?;
+        if added.as_bytes().contains(&0) { return Err(Error::Invalid); }
+        let (p, n) = self.child(name)?;
+        let p = Self::str_path(&p, n);
+        let mut bytes = [0u8; MAX_FILE_BYTES];
+        let count = fs.read(p, &mut bytes)?;
+        let source = core::str::from_utf8(&bytes[..count]).map_err(|_| Error::Invalid)?;
+        if !source.ends_with(suffix) { return Err(Error::Stale); }
+        if added.is_empty() { return Ok(count); }
+        let end = count.checked_add(added.len()).ok_or(Error::Full)?;
+        if end > MAX_FILE_BYTES { return Err(Error::Full); }
+        bytes[count..end].copy_from_slice(added.as_bytes());
+        fs.overwrite(p, &bytes[..end])?;
+        self.generation = fs.generation();
+        Ok(end)
+    }
+
+    /// Create a new real durable project file from an exact UTF-8 byte
+    /// selection, without overwriting any existing project leaf.
+    pub fn extract_source_selection<D: BlockDevice>(&mut self, owner: Identity,
+        fs: &mut HierVfs<D>, src: &str, dst: &str, start: usize,
+        end: usize
+    ) -> Result<usize, Error> {
+        self.check_fresh(owner, fs)?;
+        if src == dst { return Err(Error::Invalid); }
+        let (from, from_n) = self.child(src)?;
+        let (to, to_n) = self.child(dst)?;
+        let mut bytes = [0u8; MAX_FILE_BYTES];
+        let used = fs.read(Self::str_path(&from, from_n), &mut bytes)?;
+        let text = core::str::from_utf8(&bytes[..used]).map_err(|_| Error::Invalid)?;
+        if start >= end || end > used || !text.is_char_boundary(start) ||
+            !text.is_char_boundary(end) { return Err(Error::Invalid); }
+        fs.create(Self::str_path(&to, to_n), &bytes[start..end])?;
+        self.generation = fs.generation();
+        Ok(end-start)
+    }
+}
+
+#[cfg(test)]
+mod r075_expanded_project_tests {
+    use super::*;
+    use crate::block::{BlockError, SECTOR_BYTES};
+    struct Disk { sectors: [[u8; SECTOR_BYTES]; 100] }
+    impl BlockDevice for Disk {
+        fn sector_count(&self) -> u64 { 100 }
+        fn read_sector(&mut self, lba: u64, out: &mut [u8; SECTOR_BYTES]) -> Result<(), BlockError> {
+            *out = *self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?; Ok(())
+        }
+        fn write_sector(&mut self, lba: u64, data: &[u8; SECTOR_BYTES]) -> Result<(), BlockError> {
+            *self.sectors.get_mut(lba as usize).ok_or(BlockError::OutOfRange)? = *data; Ok(())
+        }
+    }
+    fn actor() -> Identity { Identity { pid: 14, generation: 2 } }
+    fn fresh() -> (HierVfs<Disk>, ProjectTree) {
+        let mut fs = HierVfs::format_blank(Disk { sectors: [[0; SECTOR_BYTES]; 100] }).unwrap();
+        let mut p = ProjectTree::new();
+        p.create(actor(), &mut fs, "demo").unwrap();
+        p.create_file(actor(), &mut fs, "main", "  α \nβ end\n".as_bytes()).unwrap();
+        (fs, p)
+    }
+    #[test]
+    fn unicode_row_metrics_are_read_only_and_owner_bound() {
+        let (mut fs, p) = fresh();
+        let original_generation = fs.generation();
+        assert_eq!(p.measure_source_line(actor(), &mut fs, "main", 1),
+            Ok(SourceRowMetrics { bytes: 5, unicode_scalars: 4,
+                leading_spaces: 2, trailing_whitespace: 1 }));
+        assert_eq!(p.measure_source_line(actor(), &mut fs, "main", 4), Err(Error::Invalid));
+        assert_eq!(p.measure_source_line(Identity { generation: 3, ..actor() },
+            &mut fs, "main", 1), Err(Error::Unauthorized));
+        assert_eq!(fs.generation(), original_generation);
+    }
+    #[test]
+    fn expected_suffix_append_and_selection_extraction_commit_rebootably() {
+        let (mut fs, mut p) = fresh();
+        let generation = fs.generation();
+        assert_eq!(p.append_source_if_suffix_equal(actor(), &mut fs,
+            "main", "wrong", "X"), Err(Error::Stale));
+        assert_eq!(fs.generation(), generation);
+        assert_eq!(p.append_source_if_suffix_equal(actor(), &mut fs,
+            "main", "β end\n", "γ extra\n"), Ok("  α \nβ end\nγ extra\n".len()));
+        assert_eq!(p.extract_source_selection(actor(), &mut fs, "main",
+            "slice", 2, "  α \n".len()), Ok("α \n".len()));
+        let mut disk = HierVfs::mount(fs.into_device()).unwrap();
+        let mut out = [0u8; 48];
+        assert_eq!(disk.read("/work/demo/slice", &mut out), Ok("α \n".len()));
+        assert_eq!(&out[.."α \n".len()], "α \n".as_bytes());
+    }
+    #[test]
+    fn failed_selection_invalid_unicode_boundary_and_existing_dest_are_atomic() {
+        let (mut fs, mut p) = fresh();
+        let before = fs.generation();
+        assert_eq!(p.extract_source_selection(actor(), &mut fs,
+            "main", "part", 3, 6), Err(Error::Invalid));
+        assert_eq!(p.extract_source_selection(actor(), &mut fs,
+            "main", "main", 0, 2), Err(Error::Invalid));
+        assert_eq!(fs.generation(), before);
+    }
+}

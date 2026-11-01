@@ -19,7 +19,7 @@ pub const COMMAND_VERBS:&[&str]=&[
  "help","pwd","tools","ls","cat","write","append","mkdir","mv",
  "cp","rm","mkfile","truncate","head","count","rmdir","mvdir",
  "pread","pwrite","lines","line","hash","stat","tail","find","grep","cmp","diffat",
- "touch","copynew","replace","appendln","health","hex","slice","concat","cmprange","bytefreq","patchhex","patchrange","copylines","wc","headlines","rfind","taillines","linespan","linehits","sourceview","sourcecontext",
+ "touch","copynew","replace","appendln","health","hex","slice","concat","cmprange","bytefreq","patchhex","patchrange","copylines","wc","headlines","rfind","taillines","linespan","linehits","sourceview","sourcecontext","textprofile","blankrows","indentmap","eolcheck",
 ];
 /// Complete exactly one printable lower-case verb prefix. Ambiguous matches,
 /// empty prefixes and user-supplied paths never cause completion or I/O.
@@ -91,7 +91,8 @@ pub fn command<D:BlockDevice,const N:usize>(
  let line=entered.trim_end();
  if line=="help"{return publish(b"pwd ls /dir cat /path write /path text append /path text mkdir /dir mv /old /new cp /src /dst rm /path mkfile /path truncate /path head /path count rmdir /dir mvdir /old /new pread /file offset count pwrite /file@offset text",out);}
  if line=="pwd"{return publish(b"/",out);}
- if line=="tools"{return publish(b"count lines line tail find grep hash cmp diffat stat touch copynew replace appendln health hex slice concat cmprange bytefreq patchhex patchrange copylines wc headlines rfind taillines linespan linehits sourceview sourcecontext",out);}
+ if line=="tools"{return publish(b"count lines line tail find grep hash cmp diffat stat touch copynew replace appendln health hex slice concat cmprange bytefreq patchhex patchrange copylines wc headlines rfind taillines linespan linehits sourceview sourcecontext textprofile [tools more]",out);}
+ if line=="tools more"{return publish(b"blankrows indentmap eolcheck",out);}
  if line=="health"{
   auth.require(caller,FILE_READ,now).map_err(|_|Error::Denied)?;
   let health=fs.mounted_health().map_err(Error::Io)?;
@@ -370,6 +371,125 @@ pub fn command<D:BlockDevice,const N:usize>(
     written=next;
    }
    publish(&staged[..written],out)
+  }
+  // UTF-8-aware persisted source statistics. Character count and
+  // maxscalars count Unicode scalar values, NOT grapheme clusters or
+  // terminal display cells. No partial output or write-side effects.
+  "textprofile"=>{
+   auth.require(caller,FILE_READ,now).map_err(|_|Error::Denied)?;
+   if raw.is_empty()||raw.contains(' '){return Err(Error::Invalid);}
+   let p=path(raw,&mut name)?;
+   let mut bytes=[0u8;crate::durablefs::MAX_FILE_BYTES];
+   let n=fs.read(p,&mut bytes).map_err(Error::Io)?;
+   let source=core::str::from_utf8(&bytes[..n]).map_err(|_|Error::Invalid)?;
+   if source.as_bytes().contains(&0){return Err(Error::Invalid);}
+   let mut rows=0usize;
+   let mut longest=0usize;
+   for row in source.split_inclusive('\n'){
+    let content=row.strip_suffix('\n').unwrap_or(row);
+    rows+=1;
+    longest=longest.max(content.chars().count());
+   }
+   let values=[n as u64,source.chars().count() as u64,
+       rows as u64,longest as u64];
+   let labels=[b"bytes:".as_slice(),b" chars:".as_slice(),
+       b" rows:".as_slice(),b" maxscalars:".as_slice()];
+   let mut staged=[0u8;128];
+   let mut written=0usize;
+   for (label,value) in labels.iter().zip(values.iter()){
+    let next=written.checked_add(label.len()).ok_or(Error::OutputTooSmall)?;
+    if next>staged.len(){return Err(Error::OutputTooSmall);}
+    staged[written..next].copy_from_slice(label);written=next;
+    written+=publish_number(*value,&mut staged[written..])?;
+   }
+   publish(&staged[..written],out)
+  }
+  // R075: show 1-based blank or indentation-only source row numbers.
+  // Never publish partially formatted results into the caller buffer.
+  "blankrows"=>{
+   auth.require(caller,FILE_READ,now).map_err(|_|Error::Denied)?;
+   if raw.is_empty()||raw.contains(' '){return Err(Error::Invalid);}
+   let p=path(raw,&mut name)?;
+   let mut bytes=[0u8;crate::durablefs::MAX_FILE_BYTES];
+   let size=fs.read(p,&mut bytes).map_err(Error::Io)?;
+   let source=core::str::from_utf8(&bytes[..size]).map_err(|_|Error::Invalid)?;
+   let mut staged=[0u8;crate::durablefs::MAX_FILE_BYTES];
+   let mut written=0usize;
+   for (i,row) in source.split_inclusive('\n').enumerate(){
+    let body=row.strip_suffix('\n').unwrap_or(row);
+    if body.bytes().all(|b|b==b' '||b==b'\t'){
+     if written>0 {
+      if written==staged.len(){return Err(Error::OutputTooSmall);}
+      staged[written]=b' ';written+=1;
+     }
+     written+=publish_number((i+1) as u64,&mut staged[written..])?;
+    }
+   }
+   if written==0{publish(b"not found",out)}
+   else{publish(&staged[..written],out)}
+  }
+  // R075: numeric leading-space and leading-tab profile per Unicode row.
+  "indentmap"=>{
+   auth.require(caller,FILE_READ,now).map_err(|_|Error::Denied)?;
+   if raw.is_empty()||raw.contains(' '){return Err(Error::Invalid);}
+   let p=path(raw,&mut name)?;
+   let mut bytes=[0u8;crate::durablefs::MAX_FILE_BYTES];
+   let size=fs.read(p,&mut bytes).map_err(Error::Io)?;
+   let source=core::str::from_utf8(&bytes[..size]).map_err(|_|Error::Invalid)?;
+   let mut staged=[0u8;crate::durablefs::MAX_FILE_BYTES];
+   let mut written=0usize;
+   for (i,row) in source.split_inclusive('\n').enumerate(){
+    if written>0{
+     if written==staged.len(){return Err(Error::OutputTooSmall);}
+     staged[written]=b' ';written+=1;
+    }
+    written+=publish_number((i+1) as u64,&mut staged[written..])?;
+    if written==staged.len(){return Err(Error::OutputTooSmall);}
+    staged[written]=b':';written+=1;
+    let mut spaces=0usize;let mut tabs=0usize;
+    for byte in row.bytes(){
+     match byte{
+      b' '=>spaces+=1,
+      b'\t'=>tabs+=1,
+      _=>break
+     }
+    }
+    written+=publish_number(spaces as u64,&mut staged[written..])?;
+    if written==staged.len(){return Err(Error::OutputTooSmall);}
+    staged[written]=b':';written+=1;
+    written+=publish_number(tabs as u64,&mut staged[written..])?;
+   }
+   if written==0{publish(b"empty",out)}
+   else{publish(&staged[..written],out)}
+  }
+  // R075: source line-ending integrity metrics, no implicit conversion.
+  "eolcheck"=>{
+   auth.require(caller,FILE_READ,now).map_err(|_|Error::Denied)?;
+   if raw.is_empty()||raw.contains(' '){return Err(Error::Invalid);}
+   let p=path(raw,&mut name)?;
+   let mut bytes=[0u8;crate::durablefs::MAX_FILE_BYTES];
+   let n=fs.read(p,&mut bytes).map_err(Error::Io)?;
+   core::str::from_utf8(&bytes[..n]).map_err(|_|Error::Invalid)?;
+   let mut lf=0usize;let mut crlf=0usize;let mut barecr=0usize;
+   for (i,&byte) in bytes[..n].iter().enumerate(){
+    if byte==b'\n'{
+     lf+=1;
+     if i>0&&bytes[i-1]==b'\r'{crlf+=1;}
+    }
+    if byte==b'\r' && (i+1==n||bytes[i+1]!=b'\n'){barecr+=1;}
+   }
+   let labels=[b"lf:".as_slice(),b" crlf:".as_slice(),
+     b" barecr:".as_slice(),b" final:".as_slice()];
+   let values=[lf as u64,crlf as u64,barecr as u64,
+     u64::from(n>0&&bytes[n-1]==b'\n')];
+   let mut staged=[0u8;128];let mut used=0usize;
+   for (label,value) in labels.iter().zip(values.iter()){
+    let end=used.checked_add(label.len()).ok_or(Error::OutputTooSmall)?;
+    if end>staged.len(){return Err(Error::OutputTooSmall);}
+    staged[used..end].copy_from_slice(label);used=end;
+    used+=publish_number(*value,&mut staged[used..])?;
+   }
+   publish(&staged[..used],out)
   }
   "tail"=>{
    auth.require(caller,FILE_READ,now).map_err(|_|Error::Denied)?;
@@ -1314,8 +1434,8 @@ mod tests{
   assert_eq!(complete_verb(b"heal"),Some("health"));
  }
  #[test]fn r044_command_registry_drives_unique_safe_completion(){
-  // R074 extends the registered CLI with `sourcecontext`.
-  assert_eq!(COMMAND_VERBS.len(),49);
+  // R075 expanded: 3 more native workstation file inspection commands.
+  assert_eq!(COMMAND_VERBS.len(),53);
   for (i,verb) in COMMAND_VERBS.iter().enumerate(){
    assert!(verb.as_bytes().iter().all(|b|b.is_ascii_lowercase()));
    assert!(!COMMAND_VERBS[..i].contains(verb));
@@ -1333,6 +1453,10 @@ mod tests{
   assert_eq!(complete_verb(b"lineh"),Some("linehits"));
   assert_eq!(complete_verb(b"sourcev"),Some("sourceview"));
   assert_eq!(complete_verb(b"sourcec"),Some("sourcecontext"));
+  assert_eq!(complete_verb(b"textp"),Some("textprofile"));
+  assert_eq!(complete_verb(b"blankr"),Some("blankrows"));
+  assert_eq!(complete_verb(b"indentm"),Some("indentmap"));
+  assert_eq!(complete_verb(b"eolch"),Some("eolcheck"));
   assert_eq!(complete_verb(b"hea"),None);
   assert_eq!(complete_verb(b"rmd"),Some("rmdir"));
   assert_eq!(complete_verb(b"app"),None);
@@ -2962,5 +3086,151 @@ mod r074_sourcecontext_tests {
             b"sourcecontext /source foo 1", &mut out), Err(Error::Denied));
         assert_eq!(out, [0x6a; 3]);
         assert_eq!(fs.generation(), generation);
+    }
+}
+
+
+#[cfg(test)]
+mod r075_utf8_text_profile_tests {
+    use super::*;
+    use crate::block::{BlockError, SECTOR_BYTES};
+    struct Disk { sectors: [[u8; SECTOR_BYTES]; 100] }
+    impl BlockDevice for Disk {
+        fn sector_count(&self) -> u64 { 100 }
+        fn read_sector(&mut self, lba: u64, out: &mut [u8; SECTOR_BYTES]) -> Result<(), BlockError> {
+            *out = *self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?; Ok(())
+        }
+        fn write_sector(&mut self, lba: u64, data: &[u8; SECTOR_BYTES]) -> Result<(), BlockError> {
+            *self.sectors.get_mut(lba as usize).ok_or(BlockError::OutOfRange)? = *data; Ok(())
+        }
+    }
+    fn id() -> Identity { Identity { pid: 8, generation: 4 } }
+    fn ready() -> (HierVfs<Disk>, Access<1>) {
+        let mut fs = HierVfs::format_blank(Disk { sectors: [[0; SECTOR_BYTES]; 100] }).unwrap();
+        fs.create("/src", "α🙂\nβ\n".as_bytes()).unwrap();
+        fs.create("/empty", b"").unwrap();
+        fs.create("/binary", &[0xff, 0xfe]).unwrap();
+        let mut grants = Access::new();
+        grants.grant(id(), FILE_READ, 30).unwrap();
+        (fs, grants)
+    }
+    #[test]
+    fn unicode_scalar_profile_survives_real_filesystem_remount() {
+        let (mut fs, grants) = ready();
+        let before = fs.generation();
+        let expected = b"bytes:10 chars:5 rows:2 maxscalars:2";
+        let mut out = [0u8; 80];
+        assert_eq!(command(&mut fs, &grants, id(), 1, b"textprofile /src", &mut out),
+            Ok(expected.len()));
+        assert_eq!(&out[..expected.len()], expected);
+        fs = HierVfs::mount(fs.into_device()).unwrap();
+        let empty = b"bytes:0 chars:0 rows:0 maxscalars:0";
+        assert_eq!(command(&mut fs, &grants, id(), 1, b"textprofile /empty", &mut out),
+            Ok(empty.len()));
+        assert_eq!(&out[..empty.len()], empty);
+        assert_eq!(fs.generation(), before);
+    }
+    #[test]
+    fn invalid_utf8_short_output_and_expired_identity_are_fail_closed() {
+        let (mut fs, grants) = ready();
+        let before = fs.generation();
+        let mut out = [0x44u8; 3];
+        assert_eq!(command(&mut fs, &grants, id(), 1, b"textprofile /src", &mut out),
+            Err(Error::OutputTooSmall));
+        assert_eq!(command(&mut fs, &grants, id(), 1, b"textprofile /binary", &mut out),
+            Err(Error::Invalid));
+        assert_eq!(command(&mut fs, &grants, id(), 31, b"textprofile /src", &mut out),
+            Err(Error::Denied));
+        assert_eq!(out, [0x44; 3]);
+        assert_eq!(fs.generation(), before);
+    }
+}
+
+
+#[cfg(test)]
+mod r075_expanded_source_diagnostics_tests {
+    use super::*;
+    use crate::block::{BlockError, SECTOR_BYTES};
+    struct Disk { sectors: [[u8; SECTOR_BYTES]; 100] }
+    impl BlockDevice for Disk {
+        fn sector_count(&self) -> u64 { 100 }
+        fn read_sector(&mut self, lba: u64, out: &mut [u8; SECTOR_BYTES]) -> Result<(), BlockError> {
+            *out = *self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?; Ok(())
+        }
+        fn write_sector(&mut self, lba: u64, data: &[u8; SECTOR_BYTES]) -> Result<(), BlockError> {
+            *self.sectors.get_mut(lba as usize).ok_or(BlockError::OutOfRange)? = *data; Ok(())
+        }
+    }
+    fn id() -> Identity { Identity { pid: 7, generation: 4 } }
+    fn setup() -> (HierVfs<Disk>, Access<1>) {
+        let mut fs = HierVfs::format_blank(Disk { sectors: [[0; SECTOR_BYTES]; 100] }).unwrap();
+        fs.create("/src", " \tα \n\nβ\r\nlast\r".as_bytes()).unwrap();
+        fs.create("/bad", &[0xff, 0xfe]).unwrap();
+        let mut auth = Access::new();
+        auth.grant(id(), FILE_READ, 20).unwrap();
+        (fs, auth)
+    }
+    #[test]
+    fn three_source_analysis_commands_use_real_remountable_utf8_files() {
+        let (mut fs, auth) = setup();
+        let generation = fs.generation();
+        let mut out = [0u8; 96];
+        for (command_line, expected) in [
+            (b"blankrows /src".as_slice(), b"2".as_slice()),
+            (b"indentmap /src".as_slice(), b"1:1:1 2:0:0 3:0:0 4:0:0".as_slice()),
+            (b"eolcheck /src".as_slice(), b"lf:3 crlf:1 barecr:1 final:0".as_slice())
+        ]{
+            assert_eq!(command(&mut fs, &auth, id(), 1, command_line, &mut out),
+                Ok(expected.len()));
+            assert_eq!(&out[..expected.len()], expected);
+        }
+        fs = HierVfs::mount(fs.into_device()).unwrap();
+        assert_eq!(command(&mut fs, &auth, id(), 1, b"blankrows /src", &mut out), Ok(1));
+        assert_eq!(fs.generation(), generation);
+    }
+    #[test]
+    fn short_output_invalid_utf8_and_expired_grant_do_not_publish_bytes() {
+        let (mut fs, auth) = setup();
+        let previous = fs.generation();
+        let mut out = [0x5cu8; 2];
+        assert_eq!(command(&mut fs, &auth, id(), 1, b"indentmap /src", &mut out),
+            Err(Error::OutputTooSmall));
+        assert_eq!(command(&mut fs, &auth, id(), 1, b"eolcheck /bad", &mut out),
+            Err(Error::Invalid));
+        assert_eq!(command(&mut fs, &auth, id(), 21, b"blankrows /src", &mut out),
+            Err(Error::Denied));
+        assert_eq!(out, [0x5c; 2]);
+        assert_eq!(fs.generation(), previous);
+    }
+}
+
+
+#[cfg(test)]
+mod r075_paged_tool_catalog_tests {
+    use super::*;
+    use crate::block::{BlockError, SECTOR_BYTES};
+    struct Disk { sectors: [[u8; SECTOR_BYTES]; 100] }
+    impl BlockDevice for Disk {
+        fn sector_count(&self) -> u64 { 100 }
+        fn read_sector(&mut self, lba: u64, out: &mut [u8; SECTOR_BYTES]) -> Result<(), BlockError> {
+            *out = *self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?; Ok(())
+        }
+        fn write_sector(&mut self, lba: u64, data: &[u8; SECTOR_BYTES]) -> Result<(), BlockError> {
+            *self.sectors.get_mut(lba as usize).ok_or(BlockError::OutOfRange)? = *data; Ok(())
+        }
+    }
+    #[test]
+    fn tool_discovery_remains_bounded_for_existing_desktop_output() {
+        let mut fs = HierVfs::format_blank(Disk {
+            sectors: [[0; SECTOR_BYTES]; 100]
+        }).unwrap();
+        let auth = Access::<1>::new();
+        let actor = Identity { pid: 1, generation: 1 };
+        let mut output = [0u8; 256];
+        let n = command(&mut fs, &auth, actor, 1, b"tools", &mut output).unwrap();
+        assert!(n <= 256);
+        assert!(core::str::from_utf8(&output[..n]).unwrap().contains("tools more"));
+        let n = command(&mut fs, &auth, actor, 1, b"tools more", &mut output).unwrap();
+        assert_eq!(&output[..n], b"blankrows indentmap eolcheck");
     }
 }

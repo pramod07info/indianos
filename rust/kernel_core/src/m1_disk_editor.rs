@@ -1872,3 +1872,226 @@ mod r074_move_source_rows_tests {
         assert_eq!(fs.generation(), before);
     }
 }
+
+
+/// R075: reverse a contiguous range of source-line *bodies*. Newline
+/// delimiters stay at the same row positions, including an unterminated
+/// final line. Stage one complete UTF-8 edit for owner-bound undo/redo.
+impl DiskEditor {
+    pub fn reverse_source_lines(&mut self, caller: Identity,
+        first: usize, last: usize) -> Result<usize, Error> {
+        self.authorize(caller)?;
+        let text = core::str::from_utf8(&self.data[..self.used])
+            .map_err(|_| Error::Invalid)?;
+        if first == 0 || last <= first { return Err(Error::Invalid); }
+        // The editor supports a bounded 128-row reversal to protect kernel stacks.
+        let mut boundaries = [(0usize, 0usize, false); 128];
+        let mut rows = 0usize;
+        let mut pos = 0usize;
+        for row in text.split_inclusive('\n') {
+            if rows == boundaries.len() { return Err(Error::Full); }
+            let ends_in_lf = row.ends_with('\n');
+            let end = pos + row.len() - usize::from(ends_in_lf);
+            boundaries[rows] = (pos, end, ends_in_lf);
+            rows += 1;
+            pos += row.len();
+        }
+        if last > rows { return Err(Error::Invalid); }
+        let mut staged = [0u8; MAX_FILE_BYTES];
+        let mut used = 0usize;
+        for index in 0..rows {
+            let from_index = if (first-1..last).contains(&index) {
+                first-1 + last-1 - index
+            } else { index };
+            let (start, end, _) = boundaries[from_index];
+            let len = end - start;
+            staged[used..used+len].copy_from_slice(&self.data[start..end]);
+            used += len;
+            if boundaries[index].2 {
+                staged[used] = b'\n'; used += 1;
+            }
+        }
+        debug_assert_eq!(used, self.used);
+        if staged[..used] == self.data[..self.used] { return Ok(0); }
+        self.replace(caller, 0, self.used, &staged[..used])?;
+        Ok(last-first+1)
+    }
+}
+
+#[cfg(test)]
+mod r075_editor_reverse_source_lines_tests {
+    use super::*;
+    use crate::block::{BlockError, SECTOR_BYTES};
+    struct Disk { sectors: [[u8; SECTOR_BYTES]; 100] }
+    impl BlockDevice for Disk {
+        fn sector_count(&self) -> u64 { 100 }
+        fn read_sector(&mut self, lba: u64, out: &mut [u8; SECTOR_BYTES]) -> Result<(), BlockError> {
+            *out = *self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?; Ok(())
+        }
+        fn write_sector(&mut self, lba: u64, data: &[u8; SECTOR_BYTES]) -> Result<(), BlockError> {
+            *self.sectors.get_mut(lba as usize).ok_or(BlockError::OutOfRange)? = *data; Ok(())
+        }
+    }
+    fn owner() -> Identity { Identity { pid: 9, generation: 4 } }
+    fn setup() -> (HierVfs<Disk>, DiskEditor) {
+        let mut fs = HierVfs::format_blank(Disk { sectors: [[0; SECTOR_BYTES]; 100] }).unwrap();
+        fs.create("/src", "α\nbeta\nγ\nend".as_bytes()).unwrap();
+        fs.create("/binary", &[0xff, 0xfe]).unwrap();
+        let mut e = DiskEditor::new();
+        e.open(owner(), &mut fs, "/src").unwrap();
+        (fs, e)
+    }
+    #[test]
+    fn reverses_unicode_line_bodies_once_then_undo_redo_and_remount() {
+        let (mut fs, mut e) = setup();
+        let before = "α\nbeta\nγ\nend";
+        let after = "α\nend\nγ\nbeta";
+        assert_eq!(e.reverse_source_lines(owner(), 2, 4), Ok(3));
+        assert_eq!(e.undo(owner()), Ok(before.len()));
+        assert_eq!(e.redo(owner()), Ok(after.len()));
+        e.save(owner(), &mut fs).unwrap();
+        let mut disk = HierVfs::mount(fs.into_device()).unwrap();
+        let mut out = [0u8; 40];
+        assert_eq!(disk.read("/src", &mut out), Ok(after.len()));
+        assert_eq!(&out[..after.len()], after.as_bytes());
+    }
+    #[test]
+    fn invalid_rows_recycled_id_and_binary_are_fail_closed() {
+        let (mut fs, mut e) = setup();
+        assert_eq!(e.reverse_source_lines(owner(), 1, 8), Err(Error::Invalid));
+        assert_eq!(e.reverse_source_lines(owner(), 2, 2), Err(Error::Invalid));
+        assert_eq!(e.reverse_source_lines(Identity { generation: 5, ..owner() },
+            1, 3), Err(Error::Unauthorized));
+        assert!(!e.status(owner()).unwrap().dirty);
+        e.close(owner(), false).unwrap();
+        e.open(owner(), &mut fs, "/binary").unwrap();
+        assert_eq!(e.reverse_source_lines(owner(), 1, 2), Err(Error::Invalid));
+    }
+}
+
+
+// R075 expanded workstream A: three additional real source-cleanup APIs.
+impl DiskEditor {
+    /// Remove blank/whitespace-only rows as one reversible UTF-8 edit.
+    pub fn remove_source_blank_rows(&mut self, owner: Identity) -> Result<usize, Error> {
+        self.authorize(owner)?;
+        let text = core::str::from_utf8(&self.data[..self.used])
+            .map_err(|_| Error::Invalid)?;
+        let mut staged = [0u8; MAX_FILE_BYTES];
+        let mut target = 0usize;
+        let mut removed = 0usize;
+        for row in text.split_inclusive('\n') {
+            let body = row.strip_suffix('\n').unwrap_or(row);
+            if body.bytes().all(|b| b == b' ' || b == b'\t') {
+                removed += 1;
+                continue;
+            }
+            let end = target + row.len();
+            staged[target..end].copy_from_slice(row.as_bytes());
+            target = end;
+        }
+        if removed != 0 { self.replace(owner, 0, self.used, &staged[..target])?; }
+        Ok(removed)
+    }
+
+    /// Convert LF-only Unicode source to Windows CRLF, atomically.
+    /// Reject existing CR bytes instead of silently changing mixed endings.
+    pub fn convert_source_lf_to_crlf(&mut self, owner: Identity) -> Result<usize, Error> {
+        self.authorize(owner)?;
+        let text = core::str::from_utf8(&self.data[..self.used])
+            .map_err(|_| Error::Invalid)?;
+        if text.as_bytes().contains(&b'\r') { return Err(Error::Invalid); }
+        let mut staged = [0u8; MAX_FILE_BYTES];
+        let mut at = 0usize;
+        let mut converted = 0usize;
+        for byte in text.bytes() {
+            if byte == b'\n' {
+                if at + 2 > MAX_FILE_BYTES { return Err(Error::Full); }
+                staged[at] = b'\r'; staged[at + 1] = b'\n';
+                at += 2;
+                converted += 1;
+            } else {
+                if at == MAX_FILE_BYTES { return Err(Error::Full); }
+                staged[at] = byte;
+                at += 1;
+            }
+        }
+        if converted != 0 { self.replace(owner, 0, self.used, &staged[..at])?; }
+        Ok(converted)
+    }
+
+    /// Collapse only byte-identical *adjacent* Unicode source rows.
+    /// This is a file-local content operation, not a deduplication of
+    /// distant rows or a comment/string-aware source transformation.
+    pub fn deduplicate_adjacent_source_rows(&mut self, owner: Identity)
+        -> Result<usize, Error> {
+        self.authorize(owner)?;
+        let text = core::str::from_utf8(&self.data[..self.used])
+            .map_err(|_| Error::Invalid)?;
+        let mut staged = [0u8; MAX_FILE_BYTES];
+        let mut written = 0usize;
+        let mut previous = None::<&str>;
+        let mut skipped = 0usize;
+        for row in text.split_inclusive('\n') {
+            let body = row.strip_suffix('\n').unwrap_or(row);
+            if previous == Some(body) { skipped += 1; continue; }
+            staged[written..written+row.len()].copy_from_slice(row.as_bytes());
+            written += row.len();
+            previous = Some(body);
+        }
+        if skipped != 0 { self.replace(owner, 0, self.used, &staged[..written])?; }
+        Ok(skipped)
+    }
+}
+
+#[cfg(test)]
+mod r075_expanded_editor_cleanup_tests {
+    use super::*;
+    use crate::block::{BlockError, SECTOR_BYTES};
+    struct Disk { sectors: [[u8; SECTOR_BYTES]; 100] }
+    impl BlockDevice for Disk {
+        fn sector_count(&self) -> u64 { 100 }
+        fn read_sector(&mut self, lba: u64, out: &mut [u8; SECTOR_BYTES]) -> Result<(), BlockError> {
+            *out = *self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?; Ok(())
+        }
+        fn write_sector(&mut self, lba: u64, data: &[u8; SECTOR_BYTES]) -> Result<(), BlockError> {
+            *self.sectors.get_mut(lba as usize).ok_or(BlockError::OutOfRange)? = *data; Ok(())
+        }
+    }
+    fn id() -> Identity { Identity { pid: 19, generation: 3 } }
+    fn fresh() -> HierVfs<Disk> {
+        let mut fs = HierVfs::format_blank(Disk { sectors: [[0; SECTOR_BYTES]; 100] }).unwrap();
+        fs.create("/src", "α\n   \nα\nα\nβ\n".as_bytes()).unwrap();
+        fs.create("/bad", &[0xff, b'\n']).unwrap();
+        fs
+    }
+    #[test]
+    fn blank_removal_and_adjacent_dedup_are_reversible_and_durable() {
+        let mut fs = fresh(); let mut editor = DiskEditor::new();
+        editor.open(id(), &mut fs, "/src").unwrap();
+        assert_eq!(editor.remove_source_blank_rows(id()), Ok(1));
+        assert_eq!(editor.deduplicate_adjacent_source_rows(id()), Ok(2));
+        let expected = "α\nβ\n";
+        let mut bytes = [0u8; 32];
+        assert_eq!(editor.read(id(), &mut bytes), Ok(expected.len()));
+        assert_eq!(&bytes[..expected.len()], expected.as_bytes());
+        assert_eq!(editor.undo(id()), Ok("α\nα\nα\nβ\n".len()));
+        assert_eq!(editor.redo(id()), Ok(expected.len()));
+        editor.save(id(), &mut fs).unwrap();
+        let mut disk = HierVfs::mount(fs.into_device()).unwrap();
+        assert_eq!(disk.read("/src", &mut bytes), Ok(expected.len()));
+    }
+    #[test]
+    fn crlf_is_one_atomic_unicode_edit_and_bad_identity_is_rejected() {
+        let mut fs = fresh(); let mut editor = DiskEditor::new();
+        editor.open(id(), &mut fs, "/src").unwrap();
+        assert_eq!(editor.convert_source_lf_to_crlf(id()), Ok(5));
+        assert_eq!(editor.normalize_source_crlf(id()), Ok(5));
+        assert_eq!(editor.convert_source_lf_to_crlf(
+            Identity { generation: 4, ..id() }), Err(Error::Unauthorized));
+        // Intentionally discard the unsaved conversion before switching files.
+        editor.close(id(), true).unwrap();
+        editor.open(id(), &mut fs, "/bad").unwrap();
+        assert_eq!(editor.remove_source_blank_rows(id()), Err(Error::Invalid));
+    }
+}
