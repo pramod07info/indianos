@@ -1614,3 +1614,103 @@ mod r073_source_range_compare_swap_tests {
         assert_eq!(changed, generation + 1);
     }
 }
+
+
+/// R074: read-only diagnostic summary over the actual mounted project file.
+/// These are lexical line indicators, not a compiler/parser or inferred bugs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SourceDiagnostics {
+    pub source_rows: usize,
+    pub todo_rows: usize,
+    pub fixme_rows: usize,
+    pub trailing_whitespace_rows: usize,
+    pub tab_indented_rows: usize,
+    pub missing_final_newline: bool,
+}
+impl ProjectTree {
+    pub fn diagnose_source<D: BlockDevice>(&self, caller: Identity,
+        fs: &mut HierVfs<D>, name: &str) -> Result<SourceDiagnostics, Error> {
+        self.check_fresh(caller, fs)?;
+        let (path, length) = self.child(name)?;
+        let mut bytes = [0u8; MAX_FILE_BYTES];
+        let n = fs.read(Self::str_path(&path, length), &mut bytes)?;
+        let text = core::str::from_utf8(&bytes[..n]).map_err(|_| Error::Invalid)?;
+        if text.as_bytes().contains(&0) { return Err(Error::Invalid); }
+        let mut diagnostic = SourceDiagnostics {
+            source_rows: 0,
+            todo_rows: 0,
+            fixme_rows: 0,
+            trailing_whitespace_rows: 0,
+            tab_indented_rows: 0,
+            missing_final_newline: n > 0 && !text.ends_with('\n'),
+        };
+        for row in text.split_inclusive('\n') {
+            let body = row.strip_suffix('\n').unwrap_or(row);
+            diagnostic.source_rows += 1;
+            if body.contains("TODO") { diagnostic.todo_rows += 1; }
+            if body.contains("FIXME") { diagnostic.fixme_rows += 1; }
+            if body.ends_with(' ') || body.ends_with('\t') {
+                diagnostic.trailing_whitespace_rows += 1;
+            }
+            if body.as_bytes().iter().take_while(|b| **b == b' ' || **b == b'\t')
+                .any(|b| *b == b'\t') {
+                diagnostic.tab_indented_rows += 1;
+            }
+        }
+        Ok(diagnostic)
+    }
+}
+
+#[cfg(test)]
+mod r074_diagnostics_tests {
+    use super::*;
+    use crate::block::{BlockError, SECTOR_BYTES};
+    struct Disk { sectors: [[u8; SECTOR_BYTES]; 100] }
+    impl BlockDevice for Disk {
+        fn sector_count(&self) -> u64 { 100 }
+        fn read_sector(&mut self, lba: u64, out: &mut [u8; SECTOR_BYTES]) -> Result<(), BlockError> {
+            *out = *self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?;
+            Ok(())
+        }
+        fn write_sector(&mut self, lba: u64, data: &[u8; SECTOR_BYTES]) -> Result<(), BlockError> {
+            *self.sectors.get_mut(lba as usize).ok_or(BlockError::OutOfRange)? = *data;
+            Ok(())
+        }
+    }
+    fn id() -> Identity { Identity { pid: 9, generation: 4 } }
+    fn ready() -> (HierVfs<Disk>, ProjectTree) {
+        let mut fs = HierVfs::format_blank(Disk { sectors: [[0; SECTOR_BYTES]; 100] }).unwrap();
+        let mut project = ProjectTree::new();
+        project.create(id(), &mut fs, "demo").unwrap();
+        project.create_file(id(), &mut fs, "main",
+            "α TODO \n \tFIXME\nplain".as_bytes()).unwrap();
+        project.create_file(id(), &mut fs, "empty", b"").unwrap();
+        project.create_file(id(), &mut fs, "bad", &[0xff, 0xfe]).unwrap();
+        (fs, project)
+    }
+    #[test]
+    fn real_unicode_source_diagnostics_are_read_only_after_remount() {
+        let (fs, mut project) = ready();
+        let mut fs = HierVfs::mount(fs.into_device()).unwrap();
+        project.refresh(id(), &mut fs).unwrap();
+        let generation = fs.generation();
+        let result = project.diagnose_source(id(), &mut fs, "main").unwrap();
+        assert_eq!(result, SourceDiagnostics {
+            source_rows: 3, todo_rows: 1, fixme_rows: 1,
+            trailing_whitespace_rows: 1, tab_indented_rows: 1,
+            missing_final_newline: true,
+        });
+        assert_eq!(project.diagnose_source(id(), &mut fs, "empty").unwrap().source_rows, 0);
+        assert_eq!(fs.generation(), generation);
+    }
+    #[test]
+    fn corrupt_source_and_foreign_pid_do_not_read_or_mutate() {
+        let (mut fs, project) = ready();
+        let before = fs.generation();
+        assert_eq!(project.diagnose_source(id(), &mut fs, "bad"), Err(Error::Invalid));
+        assert_eq!(project.diagnose_source(
+            Identity { generation: 5, ..id() }, &mut fs, "main"),
+            Err(Error::Unauthorized));
+        assert_eq!(fs.generation(), before);
+    }
+}

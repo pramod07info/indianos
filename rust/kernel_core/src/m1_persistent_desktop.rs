@@ -2257,3 +2257,93 @@ mod r073_desktop_source_edits_tests {
             &mut p, "main", 0, "old", "bad").is_err());
     }
 }
+
+
+/// R074: route source-row movements through FILE_WRITE and live project
+/// diagnostics through FILE_READ. Session authentication stays in the
+/// trusted desktop, rather than being delegated to untrusted UI text.
+impl<D: BlockDevice, const P: usize, const E: usize, const W: usize,
+     const K: usize, const G: usize, const Q: usize> Desktop<D, P, E, W, K, G, Q> {
+    pub fn editor_move_source_line_one(&mut self, caller: Identity, now: u64,
+        editor: &mut crate::m1_disk_editor::DiskEditor, line: usize, down: bool)
+        -> Result<bool, EditorRouteError> {
+        self.admit_editor(caller, now, FILE_WRITE)?;
+        editor.move_source_line_one(caller, line, down).map_err(EditorRouteError::Editor)
+    }
+    pub fn project_diagnose_source(&mut self, caller: Identity, now: u64,
+        project: &crate::m1_project_workspace::ProjectTree, file: &str)
+        -> Result<crate::m1_project_workspace::SourceDiagnostics, ProjectRouteError> {
+        self.admit_editor(caller, now, FILE_READ).map_err(ProjectRouteError::Permission)?;
+        project.diagnose_source(caller, &mut self.volume, file)
+            .map_err(ProjectRouteError::Project)
+    }
+}
+
+#[cfg(test)]
+mod r074_authenticated_workstation_tests {
+    use super::*;
+    use crate::block::{BlockError, SECTOR_BYTES};
+    use crate::batch2_launcher::Image;
+    use crate::batch2_settings::{Settings, Theme};
+    struct Disk { sectors: [[u8; SECTOR_BYTES]; 100] }
+    impl BlockDevice for Disk {
+        fn sector_count(&self) -> u64 { 100 }
+        fn read_sector(&mut self, lba: u64, out: &mut [u8; SECTOR_BYTES]) -> Result<(), BlockError> {
+            *out = *self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?;
+            Ok(())
+        }
+        fn write_sector(&mut self, lba: u64, data: &[u8; SECTOR_BYTES]) -> Result<(), BlockError> {
+            *self.sectors.get_mut(lba as usize).ok_or(BlockError::OutOfRange)? = *data;
+            Ok(())
+        }
+    }
+    type Desk = Desktop<Disk, 3, 3, 2, 2, 3, 8>;
+    fn id(pid: u32) -> Identity { Identity { pid, generation: 1 } }
+    fn launch(pid: u32) -> Launch {
+        Launch { pid, generation: 1, image: Image {
+            image_id: pid, entry: 0x1000, mapped_end: 0x2000, verified: true
+        } }
+    }
+    fn ready() -> Desk {
+        let mut fs = HierVfs::format_blank(Disk { sectors: [[0; SECTOR_BYTES]; 100] }).unwrap();
+        fs.create("/source", "α\nβ\nγ".as_bytes()).unwrap();
+        let mut d = Desk::from_mounted(fs);
+        d.start(id(1), launch(1), id(2), launch(2),
+            Settings { theme: Theme::Dark, pointer_speed: 5, key_repeat: 10 }, 8, 5).unwrap();
+        d
+    }
+    #[test]
+    fn authorized_move_and_diagnostics_use_real_rebootable_source() {
+        let mut d = ready();
+        let mut editor = crate::m1_disk_editor::DiskEditor::new();
+        d.editor_open(id(2), 1, &mut editor, "/source").unwrap();
+        assert_eq!(d.editor_move_source_line_one(id(2), 1, &mut editor, 2, true), Ok(true));
+        d.editor_save(id(2), 1, &mut editor).unwrap();
+        let mut project = crate::m1_project_workspace::ProjectTree::new();
+        d.project_create(id(2), 1, &mut project, "demo").unwrap();
+        d.project_create_file(id(2), 1, &mut project,
+            "main", "TODO \n\tFIXME".as_bytes()).unwrap();
+        let stats = d.project_diagnose_source(id(2), 1, &project, "main").unwrap();
+        assert_eq!(stats.source_rows, 2);
+        assert_eq!(stats.todo_rows, 1);
+        assert_eq!(stats.fixme_rows, 1);
+        let mut fs = HierVfs::mount(d.into_device()).unwrap();
+        let mut out = [0u8; 32];
+        assert_eq!(fs.read("/source", &mut out), Ok("α\nγ\nβ".len()));
+        assert_eq!(&out[.."α\nγ\nβ".len()], "α\nγ\nβ".as_bytes());
+    }
+    #[test]
+    fn expired_and_recycled_process_must_not_edit_or_inspect_files() {
+        let mut d = ready();
+        let mut editor = crate::m1_disk_editor::DiskEditor::new();
+        d.editor_open(id(2), 1, &mut editor, "/source").unwrap();
+        assert!(d.editor_move_source_line_one(id(2), 6, &mut editor, 1, true).is_err());
+        assert!(d.editor_move_source_line_one(
+            Identity { generation: 2, ..id(2) }, 1, &mut editor, 1, true).is_err());
+        assert!(!editor.status(id(2)).unwrap().dirty);
+        let mut project = crate::m1_project_workspace::ProjectTree::new();
+        d.project_create(id(2), 1, &mut project, "demo").unwrap();
+        d.project_create_file(id(2), 1, &mut project, "main", b"TODO").unwrap();
+        assert!(d.project_diagnose_source(id(2), 6, &project, "main").is_err());
+    }
+}
