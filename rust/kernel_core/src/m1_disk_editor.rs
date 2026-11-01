@@ -2224,3 +2224,201 @@ mod r075_expanded_editor_cleanup_tests {
         assert_eq!(editor.remove_source_blank_rows(id()), Err(Error::Invalid));
     }
 }
+
+
+// R076: owner-authorized Unicode navigation, bounded selections and search.
+// These APIs operate on the actual unsaved DiskEditor buffer; they do not
+// claim that a graphical selection widget or multi-document IDE is complete.
+impl DiskEditor {
+    /// Convert a UTF-8 byte boundary to a one-based (line, Unicode scalar
+    /// column) position. This is the inverse of text_offset for valid offsets.
+    pub fn text_position(&self, caller: Identity, offset: usize)
+        -> Result<(usize, usize), Error> {
+        self.authorize(caller)?;
+        let text = core::str::from_utf8(&self.data[..self.used])
+            .map_err(|_| Error::Invalid)?;
+        if offset > self.used || !text.is_char_boundary(offset) {
+            return Err(Error::Invalid);
+        }
+        let (mut line, mut column) = (1usize, 1usize);
+        for ch in text[..offset].chars() {
+            if ch == '\n' {
+                line += 1;
+                column = 1;
+            } else {
+                column += 1;
+            }
+        }
+        Ok((line, column))
+    }
+
+    /// Find the last complete Unicode literal match ending at or before
+    /// the exclusive search boundary. No allocation or buffer mutation.
+    pub fn find_previous_text(&self, caller: Identity, needle: &str,
+        before: usize) -> Result<Option<usize>, Error> {
+        self.authorize(caller)?;
+        if needle.is_empty() { return Err(Error::Invalid); }
+        let text = core::str::from_utf8(&self.data[..self.used])
+            .map_err(|_| Error::Invalid)?;
+        if before > self.used || !text.is_char_boundary(before) {
+            return Err(Error::Invalid);
+        }
+        Ok(text[..before].rfind(needle))
+    }
+
+    /// Find forward from a valid cursor, wrapping to the document start.
+    pub fn find_text_wrapping(&self, caller: Identity, needle: &str,
+        from: usize) -> Result<Option<usize>, Error> {
+        if let Some(at) = self.find_text(caller, needle, from)? {
+            return Ok(Some(at));
+        }
+        self.find_text(caller, needle, 0)
+    }
+
+    /// Find backward before a valid cursor, wrapping to the final match.
+    pub fn find_previous_text_wrapping(&self, caller: Identity,
+        needle: &str, before: usize) -> Result<Option<usize>, Error> {
+        if let Some(at) = self.find_previous_text(caller, needle, before)? {
+            return Ok(Some(at));
+        }
+        self.find_previous_text(caller, needle, self.used)
+    }
+
+    /// Copy a UTF-8 selection into caller-provided bounded storage.
+    /// Invalid ranges, owners, or short outputs leave output unchanged.
+    pub fn copy_text(&self, caller: Identity, from: usize, to: usize,
+        out: &mut [u8]) -> Result<usize, Error> {
+        self.authorize(caller)?;
+        let text = core::str::from_utf8(&self.data[..self.used])
+            .map_err(|_| Error::Invalid)?;
+        if from > to || to > self.used
+            || !text.is_char_boundary(from) || !text.is_char_boundary(to) {
+            return Err(Error::Invalid);
+        }
+        let len = to - from;
+        if out.len() < len { return Err(Error::Full); }
+        out[..len].copy_from_slice(&self.data[from..to]);
+        Ok(len)
+    }
+
+    /// Atomically copy and remove a Unicode selection as one undoable edit.
+    /// No source mutation occurs when the clipboard is undersized.
+    pub fn cut_text(&mut self, caller: Identity, from: usize, to: usize,
+        out: &mut [u8]) -> Result<usize, Error> {
+        let len = self.copy_text(caller, from, to, out)?;
+        if len > 0 { self.replace_text(caller, from, to, "")?; }
+        Ok(len)
+    }
+
+    /// Insert clipboard UTF-8 at a valid cursor or replace a selection.
+    /// The existing bounded editor transaction supplies undo/redo.
+    pub fn paste_text(&mut self, caller: Identity, from: usize, to: usize,
+        clipboard: &str) -> Result<usize, Error> {
+        self.replace_text(caller, from, to, clipboard)
+    }
+}
+
+#[cfg(test)]
+mod r076_editor_navigation_tests {
+    use super::*;
+    use crate::block::{BlockError, SECTOR_BYTES};
+
+    struct Disk { sectors: [[u8; SECTOR_BYTES]; 100] }
+    impl BlockDevice for Disk {
+        fn sector_count(&self) -> u64 { 100 }
+        fn read_sector(&mut self, lba: u64, out: &mut [u8; SECTOR_BYTES])
+            -> Result<(), BlockError> {
+            *out = *self.sectors.get(lba as usize)
+                .ok_or(BlockError::OutOfRange)?;
+            Ok(())
+        }
+        fn write_sector(&mut self, lba: u64, bytes: &[u8; SECTOR_BYTES])
+            -> Result<(), BlockError> {
+            *self.sectors.get_mut(lba as usize)
+                .ok_or(BlockError::OutOfRange)? = *bytes;
+            Ok(())
+        }
+    }
+    fn owner() -> Identity { Identity { pid: 26, generation: 1 } }
+    fn recycled() -> Identity { Identity { pid: 26, generation: 2 } }
+    fn ready() -> (HierVfs<Disk>, DiskEditor) {
+        let mut fs = HierVfs::format_blank(Disk {
+            sectors: [[0; SECTOR_BYTES]; 100],
+        }).unwrap();
+        fs.create("/src", "α😀\nalpha alpha\n".as_bytes()).unwrap();
+        fs.create("/bin", &[0xff, 0xfe]).unwrap();
+        let mut editor = DiskEditor::new();
+        editor.open(owner(), &mut fs, "/src").unwrap();
+        (fs, editor)
+    }
+
+    #[test]
+    fn scalar_cursor_inverse_and_bidirectional_wrapped_search() {
+        let (_fs, editor) = ready();
+        let text = "α😀\nalpha alpha\n";
+        for offset in 0..=text.len() {
+            if text.is_char_boundary(offset) {
+                let (line, column) = editor.text_position(owner(), offset).unwrap();
+                assert_eq!(editor.text_offset(owner(), line, column), Ok(offset));
+            } else {
+                assert_eq!(editor.text_position(owner(), offset),
+                    Err(Error::Invalid));
+            }
+        }
+        let first = text.find("alpha").unwrap();
+        let last = text.rfind("alpha").unwrap();
+        assert_eq!(editor.find_previous_text(owner(), "alpha", last),
+            Ok(Some(first)));
+        assert_eq!(editor.find_previous_text(owner(), "alpha", first), Ok(None));
+        assert_eq!(editor.find_previous_text_wrapping(owner(), "alpha", first),
+            Ok(Some(last)));
+        assert_eq!(editor.find_text_wrapping(owner(), "alpha", text.len()),
+            Ok(Some(first)));
+        assert_eq!(editor.find_previous_text(owner(), "", text.len()),
+            Err(Error::Invalid));
+        assert_eq!(editor.find_text_wrapping(owner(), "not-found", 0), Ok(None));
+    }
+
+    #[test]
+    fn selection_copy_cut_paste_undo_and_real_remount() {
+        let (mut fs, mut editor) = ready();
+        let mut clipboard = [0xabu8; 32];
+        let selected = "α😀".len();
+        assert_eq!(editor.copy_text(owner(), 0, selected, &mut clipboard),
+            Ok(selected));
+        assert_eq!(&clipboard[..selected], "α😀".as_bytes());
+        assert_eq!(editor.cut_text(owner(), 0, selected, &mut clipboard),
+            Ok(selected));
+        assert_eq!(editor.undo(owner()), Ok("α😀\nalpha alpha\n".len()));
+        assert_eq!(editor.redo(owner()), Ok("\nalpha alpha\n".len()));
+        assert_eq!(editor.paste_text(owner(), 0, 0,
+            core::str::from_utf8(&clipboard[..selected]).unwrap()),
+            Ok("α😀\nalpha alpha\n".len()));
+        editor.save(owner(), &mut fs).unwrap();
+        let mut fs = HierVfs::mount(fs.into_device()).unwrap();
+        let mut bytes = [0u8; 64];
+        let len = fs.read("/src", &mut bytes).unwrap();
+        assert_eq!(&bytes[..len], "α😀\nalpha alpha\n".as_bytes());
+    }
+
+    #[test]
+    fn denied_identity_invalid_boundaries_and_small_clipboard_are_atomic() {
+        let (mut fs, mut editor) = ready();
+        let mut clipboard = [0x5au8; 3];
+        assert_eq!(editor.cut_text(owner(), 0, "α😀".len(), &mut clipboard),
+            Err(Error::Full));
+        assert_eq!(clipboard, [0x5a; 3]);
+        assert_eq!(editor.copy_text(recycled(), 0, 1, &mut clipboard),
+            Err(Error::Unauthorized));
+        assert_eq!(editor.copy_text(owner(), 1, 2, &mut clipboard),
+            Err(Error::Invalid));
+        assert_eq!(editor.find_previous_text(owner(), "a", 1),
+            Err(Error::Invalid));
+        assert_eq!(editor.paste_text(recycled(), 0, 0, "evil"),
+            Err(Error::Unauthorized));
+        assert!(!editor.status(owner()).unwrap().dirty);
+        editor.close(owner(), false).unwrap();
+        editor.open(owner(), &mut fs, "/bin").unwrap();
+        assert_eq!(editor.text_position(owner(), 0), Err(Error::Invalid));
+    }
+}
