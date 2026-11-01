@@ -202,6 +202,71 @@ impl DiskEditor {
         }
         Err(Error::Invalid)
     }
+
+    /// R076/15: inverse of text_offset, using 1-based Unicode scalar columns.
+    /// The newline byte is the end position of the preceding source row.
+    pub fn text_position(&self, who:Identity, at:usize)->Result<(usize,usize),Error>{
+        self.authorize(who)?;
+        let text=core::str::from_utf8(&self.data[..self.used]).map_err(|_|Error::Invalid)?;
+        if at>self.used||!text.is_char_boundary(at){return Err(Error::Invalid);}
+        let prefix=&text[..at];
+        Ok((prefix.bytes().filter(|b|*b==b'\n').count()+1,
+            prefix.rsplit('\n').next().unwrap_or("").chars().count()+1))
+    }
+    /// R076/17: previous complete literal match ending before this position.
+    pub fn find_previous_text(&self,who:Identity,needle:&str,before:usize)
+        ->Result<Option<usize>,Error>{
+        self.authorize(who)?;
+        if needle.is_empty(){return Err(Error::Invalid);}
+        let text=core::str::from_utf8(&self.data[..self.used]).map_err(|_|Error::Invalid)?;
+        if before>self.used||!text.is_char_boundary(before){return Err(Error::Invalid);}
+        Ok(text[..before].rfind(needle))
+    }
+    /// R076/17: bounded pages of literal match positions, non-overlapping.
+    /// next is the byte offset of the first match omitted from this page.
+    pub fn find_text_page(&self,who:Identity,needle:&str,from:usize,out:&mut[usize])
+        ->Result<(usize,Option<usize>),Error>{
+        self.authorize(who)?;
+        if needle.is_empty(){return Err(Error::Invalid);}
+        let text=core::str::from_utf8(&self.data[..self.used]).map_err(|_|Error::Invalid)?;
+        if from>self.used||!text.is_char_boundary(from){return Err(Error::Invalid);}
+        if out.is_empty(){return Err(Error::Full);}
+        let mut cursor=from;let mut count=0;
+        while let Some(delta)=text[cursor..].find(needle){
+            let at=cursor+delta;
+            if count==out.len(){return Ok((count,Some(at)));}
+            out[count]=at;count+=1;cursor=at+needle.len();
+        }
+        Ok((count,None))
+    }
+    /// R076/16: source selections are UTF-8-boundary checked and owner-bound.
+    /// The caller owns the clipboard and must retire it with its session.
+    pub fn copy_text_selection(&self,who:Identity,from:usize,to:usize,out:&mut[u8])
+        ->Result<usize,Error>{
+        self.authorize(who)?;
+        let text=core::str::from_utf8(&self.data[..self.used]).map_err(|_|Error::Invalid)?;
+        if from>to||to>self.used||!text.is_char_boundary(from)||
+            !text.is_char_boundary(to){return Err(Error::Invalid);}
+        let count=to-from;
+        if out.len()<count{return Err(Error::Full);}
+        out[..count].copy_from_slice(&self.data[from..to]);Ok(count)
+    }
+    /// R076/16: preflight both outputs; a failed cut preserves clipboard,
+    /// source and undo/redo. Saving still requires the normal VFS generation.
+    pub fn cut_text_selection(&mut self,who:Identity,from:usize,to:usize,out:&mut[u8])
+        ->Result<usize,Error>{
+        self.authorize(who)?;
+        let mut staged=[0u8;MAX_FILE_BYTES];
+        let n=self.copy_text_selection(who,from,to,&mut staged)?;
+        if out.len()<n{return Err(Error::Full);}
+        self.replace_text(who,from,to,"")?;
+        out[..n].copy_from_slice(&staged[..n]);Ok(n)
+    }
+    pub fn paste_text_selection(&mut self,who:Identity,from:usize,to:usize,text:&str)
+        ->Result<usize,Error>{
+        self.replace_text(who,from,to,text)
+    }
+
     /// Undo exactly one successful local edit. The result is dirty even
     /// if the previous edit had been saved to durable storage.
     pub fn undo(&mut self,caller:Identity)->Result<usize,Error>{
@@ -553,6 +618,70 @@ mod tests {
         let mut bytes=[0u8;24];
         assert_eq!(fs.read("/source.rs",&mut bytes),Ok(8));
         assert_eq!(&bytes[..8],"β β β".as_bytes());
+    }
+
+    #[test]
+    fn r076_utf8_bidirectional_cursor_and_durable_remount(){
+        let mut fs=volume();let mut editor=DiskEditor::new();
+        editor.open(owner(),&mut fs,"/source.rs").unwrap();
+        editor.replace_text(owner(),0,12,"α\n🍀z\n").unwrap();
+        assert_eq!(editor.text_position(owner(),0),Ok((1,1)));
+        assert_eq!(editor.text_position(owner(),2),Ok((1,2)));
+        assert_eq!(editor.text_position(owner(),3),Ok((2,1)));
+        assert_eq!(editor.text_position(owner(),7),Ok((2,2)));
+        assert_eq!(editor.text_position(owner(),9),Ok((3,1)));
+        assert_eq!(editor.text_offset(owner(),2,2),Ok(7));
+        assert_eq!(editor.text_position(owner(),4),Err(Error::Invalid));
+        assert_eq!(editor.text_position(other(),3),Err(Error::Unauthorized));
+        editor.save(owner(),&mut fs).unwrap();
+        let mut fs=HierVfs::mount(fs.into_device()).unwrap();
+        let mut next=DiskEditor::new();
+        next.open(owner(),&mut fs,"/source.rs").unwrap();
+        assert_eq!(next.text_position(owner(),7),Ok((2,2)));
+    }
+    #[test]
+    fn r076_literal_search_backward_and_pages_are_bounded(){
+        let mut fs=volume();let mut e=DiskEditor::new();
+        e.open(owner(),&mut fs,"/source.rs").unwrap();
+        e.replace_text(owner(),0,12,"α α α\n").unwrap();
+        assert_eq!(e.find_previous_text(owner(),"α",9),Ok(Some(6)));
+        assert_eq!(e.find_previous_text(owner(),"α",6),Ok(Some(3)));
+        assert_eq!(e.find_previous_text(owner(),"α",3),Ok(Some(0)));
+        assert_eq!(e.find_previous_text(owner(),"α",0),Ok(None));
+        let mut page=[99usize;2];
+        assert_eq!(e.find_text_page(owner(),"α",0,&mut page),Ok((2,Some(6))));
+        assert_eq!(page,[0,3]);
+        assert_eq!(e.find_text_page(owner(),"α",6,&mut page),Ok((1,None)));
+        assert_eq!(page[0],6);
+        let mut untouched=[99usize;2];
+        assert_eq!(e.find_text_page(owner(),"α",1,&mut untouched),Err(Error::Invalid));
+        assert_eq!(e.find_text_page(other(),"α",0,&mut untouched),Err(Error::Unauthorized));
+        assert_eq!(e.find_text_page(owner(),"",0,&mut untouched),Err(Error::Invalid));
+        assert_eq!(untouched,[99,99]);
+    }
+    #[test]
+    fn r076_unicode_selection_copy_cut_paste_is_durable(){
+        let mut fs=volume();let mut e=DiskEditor::new();
+        e.open(owner(),&mut fs,"/source.rs").unwrap();
+        e.replace_text(owner(),0,12,"α β γ").unwrap();
+        let mut too_small=[0xa5u8;1];
+        assert_eq!(e.cut_text_selection(owner(),3,5,&mut too_small),Err(Error::Full));
+        assert_eq!(too_small,[0xa5]);
+        let mut clipboard=[0xa5u8;8];
+        assert_eq!(e.copy_text_selection(other(),3,5,&mut clipboard),Err(Error::Unauthorized));
+        assert_eq!(e.copy_text_selection(owner(),4,5,&mut clipboard),Err(Error::Invalid));
+        assert_eq!(clipboard,[0xa5;8]);
+        assert_eq!(e.copy_text_selection(owner(),3,5,&mut clipboard),Ok(2));
+        assert_eq!(&clipboard[..2],"β".as_bytes());
+        assert_eq!(e.cut_text_selection(owner(),3,5,&mut clipboard),Ok(2));
+        assert_eq!(e.paste_text_selection(owner(),3,3,
+            core::str::from_utf8(&clipboard[..2]).unwrap()),Ok(8));
+        assert_eq!(e.paste_text_selection(owner(),8,8,"🍀"),Ok(12));
+        e.save(owner(),&mut fs).unwrap();
+        let mut fs=HierVfs::mount(fs.into_device()).unwrap();
+        let mut saved=[0u8;32];
+        assert_eq!(fs.read("/source.rs",&mut saved),Ok(12));
+        assert_eq!(&saved[..12],"α β γ🍀".as_bytes());
     }
     #[test]
     fn r043_editor_invalid_utf8_text_offsets_never_mutate(){
