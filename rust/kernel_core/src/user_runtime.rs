@@ -1344,6 +1344,13 @@ fn revoke_task_authority(task:&mut Task){
   if !task.pcb.is_null(){
    let owner=crate::batch5_session::Identity{
     pid:unsafe{(*task.pcb).pid},generation:task.file_generation};
+   // Only a previously live trusted PID2 lease makes a teardown
+   // assertion meaningful. Missing/failed task preparation must not produce
+   // a false QEMU "revocation succeeded" marker.
+   #[cfg(feature="test-r031-files-gui")]
+   let had_live_directory_lease=owner.pid==2 &&
+      unsafe{(&*ptr::addr_of!(R116_SHARED_LEASES))}
+        .permits_shared_directory(owner);
    if unsafe{(&*ptr::addr_of!(R031_HANDLES)).owns(owner)} {
     // Deduplicate repeated exit/rollback notices for this exact incarnation;
     // PID reuse must never remove or confuse the next owner's events.
@@ -1367,6 +1374,19 @@ fn revoke_task_authority(task:&mut Task){
    // supplied here; the supervisor can also retire multiple in one batch.
    let _=unsafe{(&mut *ptr::addr_of_mut!(R031_HANDLES))}
        .retire_process_batch_kernel(&[owner]);
+   #[cfg(feature="test-r031-files-gui")]
+   if had_live_directory_lease {
+     let lease_gone=!unsafe{(&*ptr::addr_of!(R116_SHARED_LEASES))}
+           .permits_shared_directory(owner);
+     let port_gone=unsafe{(&*ptr::addr_of!(R115_UDP_OWNERS))}
+           .owner_of(5502).is_none();
+     let file_gone=!unsafe{(&*ptr::addr_of!(R031_HANDLES))}.owns(owner);
+     if lease_gone && port_gone && file_gone {
+       log(b"R117 QEMU PID2 delegated directory and UDP authority revoked at scheduler exit\n\0");
+     }else{
+       log(b"IndianOS: FATAL R117 PID2 delegated authority retained after exit\n\0");
+     }
+   }
   }
   task.file_generation=0;
  }
