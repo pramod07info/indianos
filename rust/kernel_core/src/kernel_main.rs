@@ -492,8 +492,17 @@ pub extern "C" fn kmain()->!{
         });
         let slot=Slot{valid_metadata:true,committed:true,version:9,
                       attempts_remaining:2};
-        let saved=r114_boot_epoch::advance_epoch(
-            &mut region,&QemuFixture,prior,0,slot,21);
+        // A pinned floor is a test-only fixture here, not an attested
+        // production bootloader measurement or rollback-proof TPM counter.
+        let floor=r114_boot_epoch::SealedBootFloor{
+            minimum_epoch:prior,
+            minimum_journal_generation:20,
+            expected_slot:0,
+            minimum_slot_version:9,
+            expected_measurement:[0x42;32],
+        };
+        let saved=r114_boot_epoch::advance_epoch_guarded(
+            &mut region,&QemuFixture,prior,0,slot,21,floor);
         let verified=saved.is_ok_and(|r|
             r.epoch==prior+1 &&
             r114_boot_epoch::recovery_receipt(

@@ -128,8 +128,7 @@ pub(crate) fn consume_pid1_lifecycle_event(
         return Err(());
     }
     let queue=unsafe{&mut *ptr::addr_of_mut!(R114_FILE_EVENTS)};
-    if queue.peek()!=Some(expected){return Err(());}
-    queue.dequeue().map_err(|_|())
+    queue.acknowledge_exact_head(expected).ok_or(())
 }
 
 #[cfg(feature="test-r031-vfs")]
@@ -1363,7 +1362,11 @@ fn revoke_task_authority(task:&mut Task){
    #[cfg(feature="test-r031-files-gui")]
    {let _=unsafe{(&mut *ptr::addr_of_mut!(R116_SHARED_LEASES))}
           .revoke_identity(owner.pid,owner.generation);}
-   unsafe{(&mut *ptr::addr_of_mut!(R031_HANDLES)).retire_process(owner);}
+   // The same fail-atomic retirement preflight now services the actual
+   // scheduler teardown, not just host unit tests. One retiring task is
+   // supplied here; the supervisor can also retire multiple in one batch.
+   let _=unsafe{(&mut *ptr::addr_of_mut!(R031_HANDLES))}
+       .retire_process_batch_kernel(&[owner]);
   }
   task.file_generation=0;
  }

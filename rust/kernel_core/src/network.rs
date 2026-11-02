@@ -303,8 +303,8 @@ pub fn run_demo<D:EthernetDevice>(
        alternatives.resolve(destination).map(|r|r.link)!=Some(1){
         return Err(Error::Unexpected)
     }
-    transmit_leased_ipv4(dev,&routes,&alternatives,route_owner,1,
-        initial_clock+1,PEER_IP,
+    transmit_leased_ipv4_checked_clock(dev,&routes,&alternatives,route_owner,1,
+        PEER_IP,||initial_clock+1,
         |b,mac|udp_frame(b,mac,PEER_UDP_PORT,UDP_REQ,0x2803))?;
     let ingress=|frame:&[u8],mac:[u8;6]|{
         parse_udp(frame,mac,PEER_UDP_PORT).is_ok_and(|data|data==UDP_RESP)
@@ -335,8 +335,8 @@ pub fn run_demo<D:EthernetDevice>(
                 return Err(Error::Unexpected);
             }
             stage(b"IndianOS: R114 QEMU primary UDP path timed out and backup route selected\n\0");
-            transmit_leased_ipv4(dev,&routes,&alternatives,route_owner,1,
-                initial_clock+20,PEER_IP,
+            transmit_leased_ipv4_checked_clock(dev,&routes,&alternatives,route_owner,1,
+        PEER_IP,||initial_clock+20,
                 |b,mac|udp_frame(b,mac,PEER_UDP_PORT,UDP_REQ,0x2808))?;
             wait_for(dev,|frame,mac|{
                 parse_udp(frame,mac,PEER_UDP_PORT).is_ok_and(|data|data==UDP_RESP)
@@ -354,8 +354,8 @@ pub fn run_demo<D:EthernetDevice>(
         .map_err(|_| Error::Unexpected)?;
     if &udp_reply[..bytes] != UDP_RESP { return Err(Error::Unexpected); }
     stage(b"IndianOS: R028 IPv4 UDP echo PASSED\n\0");
-    transmit_leased_ipv4(dev,&routes,&alternatives,route_owner,1,
-        initial_clock+21,PEER_IP,dns_query)?;
+    transmit_leased_ipv4_checked_clock(dev,&routes,&alternatives,route_owner,1,
+        PEER_IP,||initial_clock+21,dns_query)?;
     wait_for(dev,|frame,mac|{
         valid_dns(frame,mac) &&
             udp_endpoints.ingest_registered_frame(
@@ -1796,5 +1796,96 @@ mod r116_registered_ring3_udp_tests{
      Err(SocketError::Denied));
   r.bind(2,9,5502).unwrap();
   assert_eq!(s.send_registered(&r,2,9,5502,5502,b"ok"),Ok(()));
+ }
+}
+
+
+/// R117: a synthetic-clock QEMU test or a genuine kernel monotonic timer
+/// can supply two *trusted* readings. Re-check the same lease receipt at
+/// dispatch time so expiry between packet preparation and send cannot
+/// authorize the original route. No user-originated timestamp is accepted.
+pub fn transmit_leased_ipv4_checked_clock<
+ D:EthernetDevice,const N:usize,const M:usize
+>(
+ dev:&mut D,
+ routes:&crate::agent_06_ipv4_route::OwnerRoutes<N>,
+ links:&crate::agent_06_ipv4_route::FailoverRoutes<M>,
+ owner:crate::batch5_session::Identity,owner_epoch:u64,
+ destination:[u8;4],mut clock:impl FnMut()->u64,
+ constructor:impl FnOnce(&mut[u8],[u8;6])->usize,
+)->Result<(),Error>{
+ let dest=u32::from_be_bytes(destination);
+ let before=clock();
+ let token=links.receipt_at(dest,before).ok_or(Error::Unexpected)?;
+ let at_dispatch=clock();
+ if at_dispatch<before||
+    !links.receipt_is_current_at(dest,at_dispatch,token){
+    return Err(Error::Unexpected)
+ }
+ transmit_leased_ipv4(dev,routes,links,owner,owner_epoch,
+    at_dispatch,destination,constructor)
+}
+#[cfg(test)]
+mod r117_monotonic_route_clock_tests {
+ use super::*;
+ use crate::agent_06_ipv4_route::{OwnerRoutes,FailoverRoutes,Route,RouteCandidate};
+ use crate::batch5_session::Identity;
+ struct Fake{writes:usize}
+ impl EthernetDevice for Fake{
+  fn mac(&self)->[u8;6]{[0x52,0x54,0,0x12,0x34,0x56]}
+  fn send(&mut self,_frame:&[u8])->Result<(),Error>{self.writes+=1;Ok(())}
+  fn poll(&mut self,_out:&mut[u8])->Result<Option<usize>,Error>{Ok(None)}
+ }
+ fn setup()->(OwnerRoutes<1>,FailoverRoutes<2>,Identity){
+  let owner=Identity{pid:1,generation:9};
+  let route=Route{network:0x0a07_0000,prefix:24,next_hop:0};
+  let mut owned=OwnerRoutes::new();
+  owned.bind_kernel(owner,3).unwrap();
+  owned.publish(owner,3,&[route]).unwrap();
+  let mut links=FailoverRoutes::new();
+  links.add_dhcp_lease(RouteCandidate{
+   route,metric:1,link:1,epoch:2,healthy:true},10,20).unwrap();
+  links.add(RouteCandidate{
+   route,metric:8,link:2,epoch:3,healthy:true}).unwrap();
+  (owned,links,owner)
+ }
+ fn send(nic:&mut Fake,owned:&OwnerRoutes<1>,links:&FailoverRoutes<2>,
+     owner:Identity,times:[u64;2])->Result<(),Error>{
+  let mut i=0;
+  transmit_leased_ipv4_checked_clock(nic,owned,links,owner,3,PEER_IP,
+    ||{let n=times[i];i+=1;n},
+    |buffer,mac|udp_frame(buffer,mac,PEER_UDP_PORT,b"clock",2))
+ }
+ #[test]fn lease_expiry_during_send_window_denies_frame(){
+  let (owned,links,owner)=setup();let mut nic=Fake{writes:0};
+  assert_eq!(send(&mut nic,&owned,&links,owner,[19,20]),
+      Err(Error::Unexpected));
+  assert_eq!(nic.writes,0);
+  assert_eq!(send(&mut nic,&owned,&links,owner,[20,20]),Ok(()));
+  assert_eq!(nic.writes,1);
+ }
+ #[test]fn clock_rollback_never_authorizes_route(){
+  let (owned,links,owner)=setup();let mut nic=Fake{writes:0};
+  assert_eq!(send(&mut nic,&owned,&links,owner,[21,20]),
+       Err(Error::Unexpected));
+  assert_eq!(nic.writes,0);
+  assert_eq!(send(&mut nic,&owned,&links,owner,[19,19]),Ok(()));
+  assert_eq!(nic.writes,1);
+ }
+ #[test]fn foreign_owner_or_expired_routes_never_transmit(){
+  let (owned,mut links,owner)=setup();let mut nic=Fake{writes:0};
+  assert_eq!(send(&mut nic,&owned,&links,
+       Identity{pid:1,generation:10},[18,18]),Err(Error::Unexpected));
+  assert_eq!(nic.writes,0);
+  links.expire_link(2,3);
+  assert_eq!(send(&mut nic,&owned,&links,owner,[20,20]),
+      Err(Error::Unexpected));
+  assert_eq!(nic.writes,0);
+ }
+ #[test]fn normal_same_epoch_delivery_reaches_real_device_trait(){
+  let (owned,links,owner)=setup();let mut nic=Fake{writes:0};
+  assert_eq!(send(&mut nic,&owned,&links,owner,[11,12]),Ok(()));
+  assert_eq!(send(&mut nic,&owned,&links,owner,[21,23]),Ok(()));
+  assert_eq!(nic.writes,2);
  }
 }

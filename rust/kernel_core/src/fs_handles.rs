@@ -2897,3 +2897,71 @@ pub fn operation_on_selected_volume_alias<D:BlockDevice>(
     operation_on_selected_volume(table,action,owner,token,argument,path,buffer,
                                  disk,receipt)
 }
+
+
+/// R117: a serialized supervisor may retire several exact process epochs as
+/// one operation. Validate every owner, duplicate and capacity first; a bad
+/// batch must never evict even one live peer or its file descriptors.
+impl FileHandles {
+    pub fn retire_process_batch_kernel(
+        &mut self, owners:&[Identity],
+    )->Result<usize,FsError>{
+        if owners.len()>self.owners.len(){return Err(FsError::Full);}
+        for (index,owner) in owners.iter().enumerate(){
+            if !self.owns(*owner)||
+               owners[..index].iter().any(|prior|prior.pid==owner.pid){
+                return Err(FsError::InvalidName);
+            }
+        }
+        for owner in owners{
+            // Preflight established all exact incarnations while this
+            // single-BSP kernel supervisor holds exclusive table ownership.
+            if !self.retire_process(*owner){return Err(FsError::InvalidName);}
+        }
+        Ok(owners.len())
+    }
+}
+#[cfg(test)]
+mod r117_atomic_file_teardown_tests {
+ use super::*;
+ #[test]fn both_live_generations_are_revoked_together(){
+  let mut t=FileHandles::new();
+  let a=t.bind_process(1).unwrap();let b=t.bind_process(2).unwrap();
+  let a_alias=t.mount_alias_for_current_root_kernel(a).unwrap();
+  let b_alias=t.mount_alias_for_current_root_kernel(b).unwrap();
+  assert_eq!(t.retire_process_batch_kernel(&[a,b]),Ok(2));
+  assert!(!t.owns(a));assert!(!t.owns(b));
+  assert!(!t.mount_alias_allows(a_alias,a,"/boot/init"));
+  assert!(!t.mount_alias_allows(b_alias,b,"/shared/note"));
+  let replacement=t.bind_process(2).unwrap();
+  assert!(t.owns(replacement));
+  assert!(!t.mount_alias_allows(b_alias,replacement,"/shared/note"));
+ }
+ #[test]fn stale_or_wrong_pid_batch_is_atomic(){
+  let mut t=FileHandles::new();
+  let a=t.bind_process(1).unwrap();let old=t.bind_process(2).unwrap();
+  let current=t.bind_process(2).unwrap();
+  let fresh=t.mount_alias_for_current_root_kernel(current).unwrap();
+  for denied in [
+   &[a,old][..],
+   &[a,a][..],
+   &[a,Identity{pid:3,generation:1}][..],
+   &[a,Identity{pid:2,generation:0}][..],
+  ]{
+   assert_eq!(t.retire_process_batch_kernel(denied),Err(FsError::InvalidName));
+   assert!(t.owns(a));assert!(t.owns(current));
+   assert!(t.mount_alias_allows(fresh,current,"/shared/note"));
+  }
+ }
+ #[test]fn oversized_batch_and_empty_batch_never_mutate(){
+  let mut t=FileHandles::new();let a=t.bind_process(1).unwrap();
+  let b=t.bind_process(2).unwrap();
+  assert_eq!(t.retire_process_batch_kernel(&[]),Ok(0));
+  assert_eq!(t.retire_process_batch_kernel(&[a,b,a]),Err(FsError::Full));
+  assert!(t.owns(a)&&t.owns(b));
+  assert_eq!(t.retire_process_batch_kernel(&[a]),Ok(1));
+  assert!(!t.owns(a));assert!(t.owns(b));
+  assert_eq!(t.retire_process_batch_kernel(&[a]),Err(FsError::InvalidName));
+  assert!(t.owns(b));
+ }
+}
