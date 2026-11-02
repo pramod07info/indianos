@@ -15,6 +15,7 @@ on:
       # ring-3 Files graphical persistence gate, not host-only tests.
       - 'rust/kernel_core/src/fs_handles.rs'
       - 'rust/kernel_core/src/user_runtime.rs'
+      - 'rust/kernel_core/src/user_image.rs'
       - 'rust/kernel_core/src/agent_03_cap_epoch.rs'
       - 'rust/kernel_core/src/process_events.rs'
       - 'rust/kernel_core/Cargo.toml'
@@ -33,6 +34,7 @@ on:
       # ring-3 Files graphical persistence gate, not host-only tests.
       - 'rust/kernel_core/src/fs_handles.rs'
       - 'rust/kernel_core/src/user_runtime.rs'
+      - 'rust/kernel_core/src/user_image.rs'
       - 'rust/kernel_core/src/agent_03_cap_epoch.rs'
       - 'rust/kernel_core/src/process_events.rs'
       - 'rust/kernel_core/Cargo.toml'
@@ -79,6 +81,10 @@ jobs:
         run: |
           cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --features test-r031-vfs r117_
           cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --features test-r031-files-gui r117_
+          # Require actual user-copy page-translation and guard-page tests
+          # used by ring-3 syscall 33. Host tests do not replace a real
+          # adversarial QEMU guest pointer test.
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --features test-r031-files-gui r117_guest_
       - name: Build M1 durable VFS service interfaces in no_std mode
         run: |
           cargo check --offline --manifest-path rust/kernel_core/Cargo.toml --no-default-features --features test-r031-vfs
