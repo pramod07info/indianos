@@ -249,8 +249,13 @@ impl<D:BlockDevice> BlockDevice for DiscoveryDevice<'_,D>{
   ->Result<(),BlockError>{
   self.check_capacity()?;
   crate::block::check_range(self.capacity,lba,1)?;
-  self.disk.read_sector(lba,out)?;
+  // The driver may dirty its output before returning an I/O error.
+  // Discovery must never expose an unverified or partially read sector.
+  let mut staged=[0u8;SECTOR_BYTES];
+  let transferred=self.disk.read_sector(lba,&mut staged);
   if let Err(error)=self.check_capacity(){out.fill(0);return Err(error);}
+  if let Err(error)=transferred{out.fill(0);return Err(error);}
+  out.copy_from_slice(&staged);
   Ok(())
  }
  fn write_sector(&mut self,_lba:u64,_bytes:&[u8;SECTOR_BYTES])
@@ -1812,6 +1817,42 @@ mod m1_partition_tests{
   assert_eq!(pinned.read_sector(0,&mut bytes),Err(BlockError::Io));
   assert_eq!(pinned.disk.reads,0);assert_eq!(pinned.disk.disk.writes,0);
  }
+
+ #[test]fn m1_r087b_discovery_driver_error_clears_dirty_output_without_any_writes(){
+  struct DirtyFailure{reads:usize,writes:usize}
+  impl BlockDevice for DirtyFailure{
+   fn sector_count(&self)->u64{256}
+   fn read_sector(&mut self,_lba:u64,out:&mut[u8;SECTOR_BYTES])
+    ->Result<(),BlockError>{
+    self.reads+=1;out.fill(0xfa);Err(BlockError::Io)
+   }
+   fn write_sector(&mut self,_lba:u64,_bytes:&[u8;SECTOR_BYTES])
+    ->Result<(),BlockError>{
+    self.writes+=1;Ok(())
+   }
+  }
+  let mut raw=DirtyFailure{reads:0,writes:0};
+  let mut view=DiscoveryDevice{disk:&mut raw,capacity:256};
+  let mut out=[0xa5;SECTOR_BYTES];
+  assert_eq!(view.read_sector(0,&mut out),Err(BlockError::Io));
+  assert_eq!(out,[0;SECTOR_BYTES]); // never expose dirty driver output
+  drop(view);
+  assert_eq!(raw.reads,1);assert_eq!(raw.writes,0);
+  assert_eq!(discover(&mut raw),Err(Error::Io));
+  assert_eq!(raw.writes,0);
+ }
+ #[test]fn m1_r087b_discovery_stable_mbr_reads_complete_sector_without_writes(){
+  let mut disk=mbr_disk();
+  let expected=disk.data[0];
+  let mut view=DiscoveryDevice{disk:&mut disk,capacity:256};
+  let mut out=[0xa5;SECTOR_BYTES];
+  assert_eq!(view.read_sector(0,&mut out),Ok(()));
+  assert_eq!(out,expected);
+  assert_eq!(view.write_sector(0,&expected),Err(BlockError::ReadOnly));
+  drop(view);
+  assert_eq!(disk.writes,0);
+ }
+
  #[test]fn m1_discovery_adapter_scrubs_changed_transfer_and_rejects_tiny_media(){
   let mut disk=ChangingCapacity{disk:gpt_disk(),capacity:core::cell::Cell::new(256),
    reads:0,change_at:1,replacement:0};
