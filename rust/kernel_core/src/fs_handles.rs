@@ -39,9 +39,6 @@ impl RootGrant {
 /// Opaque kernel-issued receipt for a single process-namespace revision.
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 pub struct NamespaceReceipt { owner:Identity, namespace_id:u64, revision:u64 }
-/// Kernel-minted alias scoped to a process incarnation and namespace revision.
-/// String path comparison alone is not an authority to access a mounted tree.
-#[derive(Clone,Copy)]
 /// A kernel-only, read-only proof of the exact mounted volume, root
 /// namespace and mount revision at the beginning of one selected-file call.
 /// This protects against cooperative remount/rebind paths; it is NOT an
@@ -52,6 +49,9 @@ pub struct SelectedOperationGuard{
     revision:u64,
     selected_volume:Option<crate::m1_partition::PartitionReceipt>,
 }
+/// Kernel-minted alias scoped to a process incarnation and namespace revision.
+/// String path comparison alone is not an authority to access a mounted tree.
+#[derive(Clone,Copy)]
 pub struct MountAlias {
     receipt:NamespaceReceipt, root:[u8;24], len:usize,
     // A kernel-selected physical mount is a different authority from its
