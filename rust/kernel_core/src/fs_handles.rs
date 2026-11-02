@@ -1085,16 +1085,25 @@ pub fn operation_on_selected_volume<D:BlockDevice>(
     if !table.selected_operation_guard_is_current(guard){
         return Err(FsError::InvalidName);
     }
-    table.last_syscall_namespace=Some(guard.namespace);
+    // An already authenticated mount receipt pins parent-disk capacity.
+    // Reject a device swap before any sector read (and before publication of
+    // a new last-admitted namespace). The full GPT/MBR proof is still
+    // checked by mount_partition_receipt_healthy after this quick preflight.
+    if disk.sector_count()!=receipt.device_sectors{
+        return Err(FsError::InvalidVolume);
+    }
     let prior=guard.selected_volume;
     // Only a new file open/create may bind the service to a volume. Existing
     // handle actions on an unfamiliar partition fail BEFORE any disk reads.
-    if prior!=Some(receipt){
+    // Also reject exhausted mount-revision numbers before touching media:
+    // a failed remount must not silently reset or reuse old alias authority.
+    let next_revision=if prior!=Some(receipt){
         if !matches!(action,1|29)||
            table.entries.iter().any(|entry|entry.token!=0){
             return Err(FsError::InvalidVolume);
         }
-    }
+        Some(table.volume_revision.checked_add(1).ok_or(FsError::Full)?)
+    }else{None};
     let mut volume=crate::m1_partition::mount_partition_receipt_healthy(
        disk,receipt).map_err(|_|FsError::InvalidVolume)?;
     // Revalidate the complete namespace, selected receipt, mount revision
@@ -1106,11 +1115,13 @@ pub fn operation_on_selected_volume<D:BlockDevice>(
     // alias, even when it presents familiar pathnames. Do not risk reusing
     // a token from the prior selected partition or stale mount generation.
     // Check exhaustion before changing any cached service authority.
-    if prior!=Some(receipt){
-        let next=table.volume_revision.checked_add(1).ok_or(FsError::Full)?;
+    if let Some(next)=next_revision{
         table.volume_revision=next;
         table.selected_volume=Some(receipt);
     }
+    // A namespace is admitted only after the complete selected disk receipt
+    // and health probe succeeded; a failed probe cannot publish admission.
+    table.last_syscall_namespace=Some(guard.namespace);
     let outcome=table.dispatch_for(action,owner,token,argument,path,buffer,&mut volume);
     if outcome.is_ok() && matches!(action,1|29){
         table.selected_volume=Some(receipt);
@@ -2240,6 +2251,114 @@ mod r106_checked_partition_authenticated_file_api_tests{
    *self.sectors.get_mut(l as usize).ok_or(BlockError::OutOfRange)?=*buf;
    self.writes+=1;Ok(())
   }
+ }
+ 
+ #[test]fn r118_capacity_swap_rejected_before_any_selected_disk_reads(){
+  struct Changed<'a>{inner:&'a mut Disk,reads:usize,writes:usize}
+  impl BlockDevice for Changed<'_>{
+   fn sector_count(&self)->u64{(COUNT as u64)+1}
+   fn read_sector(&mut self,l:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+    self.reads+=1;self.inner.read_sector(l,out)
+   }
+   fn write_sector(&mut self,l:u64,input:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+    self.writes+=1;self.inner.write_sector(l,input)
+   }
+  }
+  let (mut disk,receipt)=disk();
+  let mut table=FileHandles::new();
+  let owner=table.bind_process(1).unwrap();
+  let mut changed=Changed{inner:&mut disk,reads:0,writes:0};
+  assert_eq!(operation_on_selected_volume(&mut table,1,owner,0,READ,
+    "/shared/note",&mut[],&mut changed,receipt),Err(FsError::InvalidVolume));
+  assert_eq!((changed.reads,changed.writes),(0,0));
+  assert!(table.owns(owner));
+  assert_eq!(table.last_syscall_namespace(),None);
+ }
+
+
+ #[test]fn r118_initial_mount_revision_overflow_rejects_before_sector_io(){
+   let (mut disk,receipt)=disk();
+   let mut table=FileHandles::new();
+   let owner=table.bind_process(1).unwrap();
+   table.volume_revision=u64::MAX;
+   let reads=disk.reads;let writes=disk.writes;
+   assert_eq!(operation_on_selected_volume(&mut table,1,owner,0,READ,
+       "/shared/note",&mut[],&mut disk,receipt),Err(FsError::Full));
+   assert_eq!((disk.reads,disk.writes),(reads,writes));
+   assert_eq!(table.selected_volume,None);
+   assert_eq!(table.last_syscall_namespace(),None);
+   table.volume_revision=1;
+   let token=operation_on_selected_volume(&mut table,1,owner,0,READ,
+       "/shared/note",&mut[],&mut disk,receipt).unwrap();
+   assert!(token!=0);
+   assert_eq!(table.volume_revision,2);
+ }
+ #[test]fn r118_media_probe_failure_does_not_publish_namespace_authority(){
+   struct Failing<'a>{inner:&'a mut Disk,reads:usize}
+   impl BlockDevice for Failing<'_>{
+      fn sector_count(&self)->u64{COUNT as u64}
+      fn read_sector(&mut self,_:u64,_:&mut[u8;SECTOR_BYTES])
+         ->Result<(),BlockError>{self.reads+=1;Err(BlockError::Io)}
+      fn write_sector(&mut self,_:u64,_:&[u8;SECTOR_BYTES])
+         ->Result<(),BlockError>{Err(BlockError::Io)}
+   }
+   let (mut media,receipt)=disk();
+   let mut handles=FileHandles::new();
+   let owner=handles.bind_process(1).unwrap();
+   let old=handles.mount_alias_for_current_root_kernel(owner).unwrap();
+   let mut failing=Failing{inner:&mut media,reads:0};
+   assert_eq!(operation_on_selected_volume(&mut handles,1,owner,0,READ,
+       "/shared/note",&mut[],&mut failing,receipt),Err(FsError::InvalidVolume));
+   assert!(failing.reads>0);
+   assert!(handles.last_syscall_namespace().is_none());
+   assert_eq!(handles.selected_volume,None);
+   assert!(handles.mount_alias_allows(old,owner,"/shared/note"));
+ }
+
+ #[test]fn r118_failed_batch_preserves_file_handles_and_delegated_alias(){
+  let (mut disk,receipt)=disk();
+  let mut handles=FileHandles::new();
+  let admin=handles.bind_process(1).unwrap();
+  let guest=handles.bind_process(2).unwrap();
+  let token1=operation_on_selected_volume(&mut handles,1,admin,0,READ,
+     "/shared/note",&mut[],&mut disk,receipt).unwrap();
+  let token2=operation_on_selected_volume(&mut handles,1,guest,0,READ,
+     "/shared/note",&mut[],&mut disk,receipt).unwrap();
+  let alias=handles.mount_alias_for_current_root_kernel(guest).unwrap();
+  assert!(handles.mount_alias_allows(alias,guest,"/shared/note"));
+  assert_eq!(handles.retire_process_batch_kernel(&[
+     admin,Identity{pid:guest.pid,generation:guest.generation+1}]),
+     Err(FsError::InvalidName));
+  assert!(handles.owns(admin)&&handles.owns(guest));
+  assert!(handles.mount_alias_allows(alias,guest,"/shared/note"));
+  let mut data=[0u8;16];
+  assert_eq!(operation_on_selected_volume(&mut handles,2,admin,token1,0,
+      "",&mut data,&mut disk,receipt),Ok(9));
+  assert_eq!(operation_on_selected_volume(&mut handles,2,guest,token2,0,
+      "",&mut data,&mut disk,receipt),Ok(9));
+  assert_eq!(&data[..9],b"persisted");
+ }
+ #[test]fn r118_kernel_batch_retirement_drops_handles_and_recycled_pid_aliases(){
+  let (mut disk,receipt)=disk();
+  let mut handles=FileHandles::new();
+  let admin=handles.bind_process(1).unwrap();
+  let guest=handles.bind_process(2).unwrap();
+  let fd=operation_on_selected_volume(&mut handles,1,guest,0,READ,
+      "/shared/note",&mut[],&mut disk,receipt).unwrap();
+  let alias=handles.mount_alias_for_current_root_kernel(guest).unwrap();
+  assert_eq!(handles.retire_process_batch_kernel(&[admin,guest]),Ok(2));
+  assert!(!handles.mount_alias_allows(alias,guest,"/shared/note"));
+  let replacement=handles.bind_process(2).unwrap();
+  let before=disk.reads;
+  assert_eq!(operation_on_selected_volume(&mut handles,2,replacement,fd,0,
+      "",&mut[0u8;16],&mut disk,receipt),Err(FsError::InvalidName));
+  assert_eq!(operation_on_selected_volume(&mut handles,2,guest,fd,0,
+      "",&mut[0u8;16],&mut disk,receipt),Err(FsError::InvalidName));
+  assert_eq!(disk.reads,before);
+  assert!(!handles.mount_alias_allows(alias,replacement,"/shared/note"));
+  let fresh=operation_on_selected_volume(&mut handles,1,replacement,0,READ,
+      "/shared/note",&mut[],&mut disk,receipt).unwrap();
+  assert_ne!(fresh,fd);
  }
  fn disk()->(Disk,PartitionReceipt){
   let mut d=Disk{sectors:[[0;SECTOR_BYTES];COUNT],reads:0,writes:0};

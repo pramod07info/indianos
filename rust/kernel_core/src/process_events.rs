@@ -20,9 +20,19 @@ pub struct ProcessEvent {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EventError { InvalidPid, Full, Empty }
 
+/// Kernel-only one-time acknowledgement proof. The sequence does not derive
+/// from an untrusted guest-provided PID, kind or message payload.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EventReceipt {
+    pub sequence:u64,
+    pub event:ProcessEvent,
+}
+
 /// A FIFO event ring. Zero capacity is valid but cannot store any events.
 pub struct ProcessEvents<const CAPACITY: usize> {
     entries: [Option<ProcessEvent>; CAPACITY],
+    sequences: [u64; CAPACITY],
+    next_sequence:u64,
     head: usize,
     count: usize,
 }
@@ -33,7 +43,8 @@ impl<const CAPACITY: usize> Default for ProcessEvents<CAPACITY> {
 
 impl<const CAPACITY: usize> ProcessEvents<CAPACITY> {
     pub const fn new() -> Self {
-        Self { entries: [None; CAPACITY], head: 0, count: 0 }
+        Self { entries: [None; CAPACITY], sequences:[0;CAPACITY],
+            next_sequence:1, head: 0, count: 0 }
     }
     pub fn len(&self) -> usize { self.count }
     pub fn capacity(&self) -> usize { CAPACITY }
@@ -42,8 +53,12 @@ impl<const CAPACITY: usize> ProcessEvents<CAPACITY> {
     pub fn enqueue(&mut self, event: ProcessEvent) -> Result<(), EventError> {
         if event.pid == 0 { return Err(EventError::InvalidPid); }
         if self.count == CAPACITY { return Err(EventError::Full); }
+        // Never wrap to sequence 0 or reuse an earlier acknowledgement ID.
+        let next=self.next_sequence.checked_add(1).ok_or(EventError::Full)?;
         let tail = (self.head + self.count) % CAPACITY;
         self.entries[tail] = Some(event);
+        self.sequences[tail]=self.next_sequence;
+        self.next_sequence=next;
         self.count += 1;
         Ok(())
     }
@@ -53,31 +68,62 @@ impl<const CAPACITY: usize> ProcessEvents<CAPACITY> {
         self.entries[self.head]
     }
 
+    /// Read the current, immutable head event and its unique enqueue ID.
+    /// A consumer must retain this full receipt, not just the event value.
+    pub fn peek_receipt(&self)->Option<EventReceipt>{
+        if self.count==0{return None;}
+        let event=self.entries[self.head]?;
+        let sequence=self.sequences[self.head];
+        if sequence==0{return None;}
+        Some(EventReceipt{sequence,event})
+    }
+
+    /// A receipt from an earlier dequeue, identical message, or ring slot
+    /// reuse cannot consume this event. The ring is single-owner BSP only.
+    pub fn acknowledge_receipt(
+        &mut self,expected:EventReceipt
+    )->Option<ProcessEvent>{
+        if expected.sequence==0||self.peek_receipt()!=Some(expected){
+            return None;
+        }
+        self.dequeue().ok()
+    }
+
     pub fn dequeue(&mut self) -> Result<ProcessEvent, EventError> {
         if self.count == 0 { return Err(EventError::Empty); }
         let event = self.entries[self.head].take().ok_or(EventError::Empty)?;
+        self.sequences[self.head]=0;
         self.head = (self.head + 1) % CAPACITY;
         self.count -= 1;
         Ok(event)
     }
 
-    /// Remove a terminated process's pending events while preserving FIFO
-    /// order for all other PIDs. Does not alter global scheduling state.
-    pub fn clear_pid(&mut self, pid: u32) -> usize {
-        if pid == 0 || self.count == 0 { return 0; }
-        let original = self.count;
-        let mut removed = 0usize;
-        // Dequeue/re-enqueue exactly the original number of entries:
-        // surviving events retain their relative order, even across wrap.
-        for _ in 0..original {
-            let event = self.dequeue().expect("event ring invariant");
-            if event.pid == pid {
-                removed += 1;
-            } else {
-                self.enqueue(event).expect("event ring capacity invariant");
+    /// Compaction preserves FIFO order and existing receipt sequence IDs.
+    /// It must not allocate new IDs, especially after counter exhaustion.
+    fn remove_matching(&mut self,mut discard:impl FnMut(ProcessEvent)->bool)->usize{
+        let original=self.count;
+        let mut removed=0;
+        for _ in 0..original{
+            let at=self.head;
+            let event=self.entries[at].take().expect("validated FIFO entry");
+            let sequence=self.sequences[at];
+            self.sequences[at]=0;
+            self.head=(self.head+1)%CAPACITY;
+            self.count-=1;
+            if discard(event){removed+=1;}
+            else{
+                let tail=(self.head+self.count)%CAPACITY;
+                self.entries[tail]=Some(event);
+                self.sequences[tail]=sequence;
+                self.count+=1;
             }
         }
         removed
+    }
+    /// Remove the specified PID without invalidating peer acknowledgements.
+    pub fn clear_pid(&mut self,pid:u32)->usize{
+        if pid==0{return 0;}
+        self.remove_matching(|event|event.pid==pid)
     }
 }
 
@@ -731,7 +777,10 @@ impl<const CAPACITY: usize> ProcessEvents<CAPACITY> {
         if events.iter().any(|event| event.pid == 0) {
             return Err(EventError::InvalidPid);
         }
-        if events.len() > CAPACITY - self.count { return Err(EventError::Full); }
+        if events.len() > CAPACITY - self.count ||
+           (events.len() as u64)>u64::MAX-self.next_sequence {
+            return Err(EventError::Full);
+        }
         for &event in events { self.enqueue(event)?; }
         Ok(events.len())
     }
@@ -756,28 +805,14 @@ impl<const CAPACITY: usize> ProcessEvents<CAPACITY> {
                 .is_some_and(|e| e.pid == pid)).count()
     }
 
-    pub fn clear_kind(&mut self, kind: EventKind) -> usize {
-        let original = self.count;
-        let mut removed = 0;
-        for _ in 0..original {
-            let event = self.dequeue().expect("event ring invariant");
-            if event.kind == kind { removed += 1; }
-            else { self.enqueue(event).expect("event ring invariant"); }
-        }
-        removed
+    pub fn clear_kind(&mut self,kind:EventKind)->usize{
+        self.remove_matching(|event|event.kind==kind)
     }
 
     /// All-or-nothing validation of a multi-process teardown request.
-    pub fn clear_pids(&mut self, pids: &[u32]) -> Result<usize, EventError> {
-        if pids.contains(&0) { return Err(EventError::InvalidPid); }
-        let original = self.count;
-        let mut removed = 0;
-        for _ in 0..original {
-            let event = self.dequeue().expect("event ring invariant");
-            if pids.contains(&event.pid) { removed += 1; }
-            else { self.enqueue(event).expect("event ring invariant"); }
-        }
-        Ok(removed)
+    pub fn clear_pids(&mut self,pids:&[u32])->Result<usize,EventError>{
+        if pids.contains(&0){return Err(EventError::InvalidPid);}
+        Ok(self.remove_matching(|event|pids.contains(&event.pid)))
     }
 }
 
@@ -853,15 +888,9 @@ impl<const N:usize> ProcessEvents<N>{
   Ok(true)
  }
  pub fn clear_exact_exit(&mut self,pid:u32,generation:u64)->usize{
-  if pid==0||generation==0||self.count==0{return 0}
-  let initial=self.count;let mut deleted=0;
-  for _ in 0..initial{
-   let event=self.dequeue().expect("validated ring invariant");
-   if event.pid==pid&&event.kind==EventKind::Exited&&
-      event.value==generation{deleted+=1}
-   else{self.enqueue(event).expect("ring capacity invariant")}
-  }
-  deleted
+  if pid==0||generation==0{return 0;}
+  self.remove_matching(|event|event.pid==pid&&
+     event.kind==EventKind::Exited&&event.value==generation)
  }
 }
 #[cfg(test)]
@@ -917,6 +946,9 @@ mod r116_exit_event_generation_tests{
 }
 
 
+/// Legacy value-only acknowledgement for compatibility with existing tests.
+/// Privileged consumers MUST use acknowledge_receipt (unique enqueue ID):
+/// equal consecutive ProcessEvent payloads are not replay-safe here.
 /// R117: only a byte-for-byte matching head may be acknowledged; a stale
 /// process-incarnation receipt cannot dequeue a peer message or successor.
 /// Authentication of the consumer itself remains in the runtime supervisor.
@@ -975,5 +1007,89 @@ mod r117_exact_event_ack_tests {
   q.enqueue(e(1,EventKind::Exited,8)).unwrap();
   assert_eq!(q.acknowledge_exact_head(e(0,EventKind::Exited,8)),None);
   assert_eq!(q.len(),1);
+ }
+}
+
+
+#[cfg(test)]
+mod r118_sequence_bound_lifecycle_tests {
+ use super::*;
+ fn item()->ProcessEvent{ProcessEvent{pid:2,kind:EventKind::Message,value:55}}
+ #[test]
+ fn replay_cannot_consume_identical_successor_or_reused_ring_slot(){
+  let mut q=ProcessEvents::<2>::new();
+  q.enqueue(item()).unwrap();
+  let old=q.peek_receipt().unwrap();
+  q.enqueue(item()).unwrap();
+  assert_eq!(q.acknowledge_receipt(old),Some(item()));
+  let second=q.peek_receipt().unwrap();
+  assert_eq!(second.event,old.event);
+  assert_ne!(second.sequence,old.sequence);
+  assert_eq!(q.acknowledge_receipt(old),None);
+  assert_eq!(q.len(),1);
+  assert_eq!(q.acknowledge_receipt(second),Some(item()));
+  q.enqueue(item()).unwrap(); // wraps to previously reused ring slot
+  let wrapped=q.peek_receipt().unwrap();
+  assert_ne!(wrapped.sequence,old.sequence);
+  assert_eq!(q.acknowledge_receipt(old),None);
+  assert_eq!(q.acknowledge_receipt(wrapped),Some(item()));
+ }
+ #[test]
+ fn peer_or_forged_receipt_must_not_dequeue_head(){
+  let mut q=ProcessEvents::<2>::new();
+  q.enqueue(item()).unwrap();
+  let exact=q.peek_receipt().unwrap();
+  let wrong_sequence=EventReceipt{sequence:exact.sequence+1,..exact};
+  let wrong_pid=EventReceipt{event:ProcessEvent{pid:1,..item()},..exact};
+  assert_eq!(q.acknowledge_receipt(wrong_sequence),None);
+  assert_eq!(q.acknowledge_receipt(wrong_pid),None);
+  assert_eq!(q.acknowledge_receipt(EventReceipt{sequence:0,..exact}),None);
+  assert_eq!(q.len(),1);
+  assert_eq!(q.acknowledge_receipt(exact),Some(item()));
+ }
+ #[test]
+ fn capacity_and_sequence_exhaustion_leave_batch_unchanged(){
+  let mut q=ProcessEvents::<2>::new();
+  q.enqueue(item()).unwrap();
+  let head=q.peek_receipt().unwrap();
+  q.next_sequence=u64::MAX-1;
+  assert_eq!(q.enqueue_batch(&[item(),item()]),Err(EventError::Full));
+  assert_eq!(q.peek_receipt(),Some(head));
+  assert_eq!(q.len(),1);
+  assert_eq!(q.enqueue(item()),Ok(()));
+  assert_eq!(q.enqueue(item()),Err(EventError::Full));
+  assert_eq!(q.acknowledge_receipt(head),Some(item()));
+  assert_eq!(q.enqueue(item()),Err(EventError::Full));
+  let zero=ProcessEvents::<0>::new();
+  assert_eq!(zero.peek_receipt(),None);
+ }
+ #[test]
+ fn filtering_preserves_fifo_and_survivor_receipts(){
+  let mut q=ProcessEvents::<3>::new();
+  q.enqueue(ProcessEvent{pid:1,kind:EventKind::Started,value:1}).unwrap();
+  q.enqueue(item()).unwrap();
+  let removed=q.peek_receipt().unwrap();
+  assert_eq!(q.clear_pid(1),1);
+  assert_eq!(q.acknowledge_receipt(removed),None);
+  let survivor=q.peek_receipt().unwrap();
+  assert_eq!(survivor.event,item());
+  assert_eq!(q.acknowledge_receipt(survivor),Some(item()));
+ }
+ #[test]
+ fn sequence_exhaustion_keeps_survivor_receipt_across_filters(){
+  let mut q=ProcessEvents::<3>::new();
+  q.enqueue(item()).unwrap();
+  let receipt=q.peek_receipt().unwrap();
+  q.enqueue(ProcessEvent{pid:1,kind:EventKind::Exited,value:33}).unwrap();
+  q.enqueue(ProcessEvent{pid:9,kind:EventKind::Faulted,value:99}).unwrap();
+  q.next_sequence=u64::MAX;
+  assert_eq!(q.clear_pid(1),1);
+  assert_eq!(q.peek_receipt(),Some(receipt));
+  assert_eq!(q.clear_kind(EventKind::Faulted),1);
+  assert_eq!(q.peek_receipt(),Some(receipt));
+  assert_eq!(q.clear_pids(&[0]),Err(EventError::InvalidPid));
+  assert_eq!(q.clear_exact_exit(1,33),0);
+  assert_eq!(q.acknowledge_receipt(receipt),Some(item()));
+  assert_eq!(q.enqueue(item()),Err(EventError::Full));
  }
 }

@@ -114,13 +114,18 @@ pub fn recovery_receipt<D:BlockDevice,T:TrustedBootMeasurement>(
 /// The caller must be a trusted boot coordinator with an exclusive selected
 /// two-sector partition and must call this once per actual boot. Readback and
 /// sync prevent silently publishing an unacknowledged epoch.
-pub fn advance_epoch<D:BlockDevice,T:TrustedBootMeasurement>(
+fn advance_epoch_expected<D:BlockDevice,T:TrustedBootMeasurement>(
  disk:&mut D,trust:&T,current_epoch:u64,
- selected:usize,slot:Slot,journal_generation:u64
+ selected:usize,slot:Slot,journal_generation:u64,
+ expected_prior:Option<EpochRecord>,
 )->Result<EpochRecord,Error>{
  let measurement=trust.read_verified()?;
  if measurement==[0;32] {return Err(Error::Untrusted);}
  let (old,active,before)=recover(disk)?;
+ // The guarded path verified a specific physical journal snapshot. A device
+ // swap or concurrent writer changing the same epoch's signed metadata
+ // between admission and writing must be denied without publishing anything.
+ if expected_prior.is_some_and(|prior|prior!=old){return Err(Error::Stale);}
  if old.epoch!=current_epoch||selected>1||!slot.committed||
     !slot.valid_metadata||slot.attempts_remaining==0||
     journal_generation==0||journal_generation<old.journal_generation {
@@ -143,6 +148,14 @@ pub fn advance_epoch<D:BlockDevice,T:TrustedBootMeasurement>(
  disk.read_sector(active,&mut observed).map_err(|_|Error::Io)?;
  if observed!=before{return Err(Error::Stale);}
  Ok(next)
+}
+/// Preserve the unguarded legacy contract for existing signed recovery
+/// callers. Production policy must use advance_epoch_guarded instead.
+pub fn advance_epoch<D:BlockDevice,T:TrustedBootMeasurement>(
+ disk:&mut D,trust:&T,current_epoch:u64,
+ selected:usize,slot:Slot,journal_generation:u64
+)->Result<EpochRecord,Error>{
+ advance_epoch_expected(disk,trust,current_epoch,selected,slot,journal_generation,None)
 }
 #[cfg(test)]
 mod tests {
@@ -330,7 +343,10 @@ pub fn observe_with_sealed_floor<D:BlockDevice,T:TrustedBootMeasurement>(
  if floor.minimum_epoch==0||floor.minimum_journal_generation==0||
     floor.minimum_slot_version==0||floor.expected_slot>1||
     floor.expected_measurement==[0;32]{return Err(Error::Invalid)}
- let r=observe_verified_epoch(disk,trust)?;
+ let measurement=trust.read_verified()?;
+ if measurement==[0;32]{return Err(Error::Untrusted);}
+ let (r,_,_)=recover(disk)?;
+ if r.boot_measurement!=measurement{return Err(Error::Stale);}
  if r.epoch<floor.minimum_epoch||
     r.journal_generation<floor.minimum_journal_generation||
     r.slot_version<floor.minimum_slot_version||
@@ -403,6 +419,10 @@ mod r116_rollback_floor_tests{
 }
 
 
+struct MeasurementSnapshot([u8;32]);
+impl TrustedBootMeasurement for MeasurementSnapshot {
+ fn read_verified(&self)->Result<[u8;32],Error>{Ok(self.0)}
+}
 /// R117: before advancing a durable boot epoch, require an independently
 /// provided sealed floor for the *current* journal. A trusted measurement
 /// mismatch, rollback or invalid signed slot must fail before any mutation.
@@ -412,13 +432,19 @@ pub fn advance_epoch_guarded<D:BlockDevice,T:TrustedBootMeasurement>(
  selected:usize,slot:Slot,journal_generation:u64,
  floor:SealedBootFloor,
 )->Result<EpochRecord,Error>{
- let prior=observe_with_sealed_floor(disk,trust,floor)?;
+ // Snapshot platform-authenticated authority exactly once; a changing
+ // observer cannot authorize one journal and then publish a different one.
+ let measurement=trust.read_verified()?;
+ if measurement==[0;32]{return Err(Error::Untrusted);}
+ let verified=MeasurementSnapshot(measurement);
+ let prior=observe_with_sealed_floor(disk,&verified,floor)?;
  if prior.epoch!=old_epoch || prior.selected_slot as usize!=selected ||
     prior.slot_version!=slot.version ||
     journal_generation<floor.minimum_journal_generation {
     return Err(Error::Stale)
  }
- advance_epoch(disk,trust,old_epoch,selected,slot,journal_generation)
+ advance_epoch_expected(disk,&verified,old_epoch,selected,slot,
+    journal_generation,Some(prior))
 }
 #[cfg(test)]
 mod r117_guarded_advance_tests{
@@ -463,5 +489,175 @@ mod r117_guarded_advance_tests{
   assert_eq!(advance_epoch_guarded(&mut d,&tests::Trusted([0;32]),
     4,0,tests::slot(),21,floor()),Err(Error::Untrusted));
   assert_eq!(d.writes,0);
+ }
+}
+
+
+#[cfg(test)]
+mod r118_boot_measurement_snapshot_tests {
+ use super::*;
+ use core::cell::Cell;
+ struct ChangingObserver {reads:Cell<usize>,first:[u8;32]}
+ impl TrustedBootMeasurement for ChangingObserver {
+  fn read_verified(&self)->Result<[u8;32],Error>{
+   let count=self.reads.get();
+   self.reads.set(count+1);
+   if count==0 {Ok(self.first)} else {Ok([0x77;32])}
+  }
+ }
+ fn floor()->SealedBootFloor{
+  SealedBootFloor{minimum_epoch:4,minimum_journal_generation:20,
+   expected_slot:0,minimum_slot_version:9,expected_measurement:[3;32]}
+ }
+ #[test]
+ fn changing_platform_source_is_read_exactly_once_for_guarded_commit(){
+  let mut disk=tests::fixture();
+  let source=ChangingObserver{reads:Cell::new(0),first:[3;32]};
+  let next=advance_epoch_guarded(&mut disk,&source,4,0,tests::slot(),21,floor()).unwrap();
+  assert_eq!(source.reads.get(),1);
+  assert_eq!(next.epoch,5);
+  assert_eq!(next.boot_measurement,[3;32]);
+  assert_eq!(disk.writes,1);
+ }
+ #[test]
+ fn mismatched_first_platform_snapshot_cannot_mutate_disk(){
+  let mut disk=tests::fixture();
+  let source=ChangingObserver{reads:Cell::new(0),first:[4;32]};
+  assert_eq!(advance_epoch_guarded(&mut disk,&source,4,0,tests::slot(),21,floor()),
+   Err(Error::Stale));
+  assert_eq!(source.reads.get(),1);
+  assert_eq!(disk.writes,0);
+ }
+}
+
+#[cfg(test)]
+mod r118_epoch_media_swap_tests {
+ use super::*;
+ use crate::block::{BlockError,SECTOR_BYTES};
+ struct SwapOnSecondObservation{
+  inner:tests::Disk,
+  reads:usize,
+  alternate:[u8;SECTOR_BYTES],
+ }
+ impl BlockDevice for SwapOnSecondObservation{
+  fn sector_count(&self)->u64{2}
+  fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+      ->Result<(),BlockError>{
+   self.reads+=1;
+   if self.reads==3{
+    self.inner.sectors=[self.alternate;2];
+   }
+   self.inner.read_sector(lba,out)
+  }
+  fn write_sector(&mut self,lba:u64,value:&[u8;SECTOR_BYTES])
+      ->Result<(),BlockError>{self.inner.write_sector(lba,value)}
+  fn sync(&mut self)->Result<(),BlockError>{self.inner.sync()}
+ }
+ #[test]
+ fn same_epoch_different_signed_journal_after_guard_is_not_written(){
+  let initial=tests::fixture();
+  let mut changed=decode(&initial.sectors[0]).unwrap();
+  changed.journal_generation=22; // same epoch and boot measurement
+  let mut disk=SwapOnSecondObservation{
+   inner:initial,reads:0,alternate:encode(changed).unwrap(),
+  };
+  let floor=SealedBootFloor{minimum_epoch:4,minimum_journal_generation:20,
+   expected_slot:0,minimum_slot_version:9,expected_measurement:[3;32]};
+  assert_eq!(advance_epoch_guarded(&mut disk,&tests::Trusted([3;32]),
+   4,0,tests::slot(),23,floor),Err(Error::Stale));
+  assert_eq!(disk.inner.writes,0);
+  assert_eq!(disk.reads,4);
+ }
+}
+
+#[cfg(test)]
+mod r118_sealed_floor_and_recovery_matrix_tests {
+ use super::*;
+ use crate::block::{BlockError,SECTOR_BYTES};
+ fn floor()->SealedBootFloor{
+  SealedBootFloor{minimum_epoch:4,minimum_journal_generation:20,
+      expected_slot:0,minimum_slot_version:9,expected_measurement:[3;32]}
+ }
+ #[test]
+ fn every_signed_floor_and_slot_gate_denies_before_media_mutation(){
+  let mut disk=tests::fixture();
+  let valid=tests::slot();
+  let baseline=floor();
+  for rejected in [
+   SealedBootFloor{minimum_epoch:5,..baseline},
+   SealedBootFloor{minimum_journal_generation:21,..baseline},
+   SealedBootFloor{minimum_slot_version:10,..baseline},
+   SealedBootFloor{expected_slot:1,..baseline},
+   SealedBootFloor{expected_measurement:[8;32],..baseline}
+  ]{
+   assert_eq!(advance_epoch_guarded(&mut disk,&tests::Trusted([3;32]),
+       4,0,valid,21,rejected),Err(Error::Stale));
+  }
+  for invalid in [
+   Slot{committed:false,..valid},
+   Slot{valid_metadata:false,..valid},
+   Slot{attempts_remaining:0,..valid}
+  ]{
+   assert_eq!(advance_epoch_guarded(&mut disk,&tests::Trusted([3;32]),
+       4,0,invalid,21,baseline),Err(Error::Stale));
+  }
+  assert_eq!(advance_epoch_guarded(&mut disk,&tests::Trusted([3;32]),
+      4,1,valid,21,baseline),Err(Error::Stale));
+  assert_eq!(advance_epoch_guarded(&mut disk,&tests::Trusted([3;32]),
+      3,0,valid,21,baseline),Err(Error::Stale));
+  assert_eq!(advance_epoch_guarded(&mut disk,&tests::Trusted([3;32]),
+      4,0,valid,19,baseline),Err(Error::Stale));
+  assert_eq!(disk.writes,0);
+ }
+ #[test]
+ fn forged_predecessor_digest_and_divergent_same_epoch_cannot_advance(){
+  let mut disk=tests::fixture();
+  let mut forged=decode(&disk.sectors[1]).unwrap();
+  forged.epoch=5;
+  forged.preceding_digest=[0x99;32];
+  disk.sectors[1]=encode(forged).unwrap();
+  assert_eq!(advance_epoch_guarded(&mut disk,&tests::Trusted([3;32]),
+      4,0,tests::slot(),21,floor()),Err(Error::Invalid));
+  assert_eq!(disk.writes,0);
+  let mut disk=tests::fixture();
+  let mut divergent=decode(&disk.sectors[1]).unwrap();
+  divergent.slot_version+=1;
+  disk.sectors[1]=encode(divergent).unwrap();
+  assert_eq!(advance_epoch_guarded(&mut disk,&tests::Trusted([3;32]),
+      4,0,tests::slot(),21,floor()),Err(Error::Invalid));
+  assert_eq!(disk.writes,0);
+ }
+ #[test]
+ fn torn_newest_slot_never_bypasses_sealed_minimum_epoch(){
+  let mut disk=tests::fixture();
+  let new=advance_epoch_guarded(&mut disk,&tests::Trusted([3;32]),
+      4,0,tests::slot(),21,floor()).unwrap();
+  assert_eq!(new.epoch,5);
+  assert_eq!(disk.writes,1);
+  // The new commit occupies sector 0, because original sector 1 was the
+  // active copy. Simulate an interrupted storage write corrupting its CRC.
+  disk.sectors[0][40]^=0x80;
+  assert!(matches!(observe_with_sealed_floor(
+    &mut disk,&tests::Trusted([3;32]),
+    SealedBootFloor{minimum_epoch:5,minimum_journal_generation:21,..floor()}),
+    Err(Error::Stale)|Err(Error::Invalid)));
+ }
+ struct FailFlush{inner:tests::Disk}
+ impl BlockDevice for FailFlush {
+  fn sector_count(&self)->u64{self.inner.sector_count()}
+  fn read_sector(&mut self,lba:u64,output:&mut[u8;SECTOR_BYTES])
+       ->Result<(),BlockError>{self.inner.read_sector(lba,output)}
+  fn write_sector(&mut self,lba:u64,input:&[u8;SECTOR_BYTES])
+       ->Result<(),BlockError>{self.inner.write_sector(lba,input)}
+  fn sync(&mut self)->Result<(),BlockError>{Err(BlockError::Io)}
+ }
+ #[test]
+ fn unsuccessful_durable_flush_never_returns_commit_receipt(){
+  let mut disk=FailFlush{inner:tests::fixture()};
+  assert_eq!(advance_epoch_guarded(&mut disk,&tests::Trusted([3;32]),
+      4,0,tests::slot(),21,floor()),Err(Error::Io));
+  assert_eq!(disk.inner.writes,1);
+  // A write which reached the device but failed flush is not proof of
+  // durability, even when one in-memory sector now looks newest.
  }
 }

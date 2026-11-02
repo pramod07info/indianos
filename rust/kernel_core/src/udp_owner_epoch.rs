@@ -27,6 +27,13 @@ impl<const N:usize> Registry<N> {
         Ok(())
     }
 
+    /// Read-only exact-generation collision proof for a trusted teardown
+    /// coordinator. A stale task must never retire its successor's ports.
+    pub fn has_foreign_generation(&self,pid:u32,generation:u64)->bool{
+        self.entries.iter().flatten().any(|g|
+            g.pid==pid && g.generation!=generation)
+    }
+
     pub fn authorize(&self,pid:u32,generation:u64,port:u16)
         ->Result<(),Error> {
         if pid==0||generation==0||port==0 { return Err(Error::Invalid); }
