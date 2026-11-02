@@ -1889,3 +1889,88 @@ mod r117_monotonic_route_clock_tests {
   assert_eq!(nic.writes,2);
  }
 }
+
+
+/// R117 follow-up: cross-process release proof at the actual privileged
+/// syscall boundary. Kernel caller identity is trusted; claim is an untrusted
+/// request. Failure leaves both endpoint and registry tables intact.
+impl<const PORTS:usize,const QUEUE:usize> EpochUdpEndpoints<PORTS,QUEUE>{
+    pub fn close_claimed_registered<const N:usize>(
+        &mut self,
+        registry:&mut crate::udp_owner_epoch::Registry<N>,
+        caller:crate::batch5_session::Identity,
+        claim:crate::udp_owner_epoch::Grant,
+    )->Result<usize,SocketError>{
+        if caller.pid==0 || caller.generation==0 ||
+           claim.pid!=caller.pid || claim.generation!=caller.generation ||
+           claim.port==0{
+            return Err(SocketError::Denied);
+        }
+        self.close_registered_batch(registry,&[claim])
+    }
+}
+
+#[cfg(test)]
+mod r117_foreign_ring3_close_boundary_tests{
+    use super::*;
+    use crate::udp_owner_epoch::{Grant,Registry};
+    use crate::batch5_session::Identity;
+    fn id(pid:u32,generation:u64)->Identity{Identity{pid,generation}}
+    fn g(pid:u32,generation:u64,port:u16)->Grant{Grant{pid,generation,port}}
+    #[test]
+    fn forged_pid_or_generation_cannot_evict_a_registered_peer(){
+        let mut sockets=EpochUdpEndpoints::<2,4>::new();
+        let mut registry=Registry::<2>::new();
+        sockets.bind_registered(&mut registry,1,4,5501).unwrap();
+        sockets.bind_registered(&mut registry,2,8,5502).unwrap();
+        sockets.send_registered(&registry,1,4,5501,5502,b"peer").unwrap();
+        for (caller,claim) in [
+            (id(1,4),g(2,8,5502)),
+            (id(2,7),g(2,8,5502)),
+            (id(2,8),g(1,4,5501)),
+            (id(1,0),g(1,4,5501)),
+            (id(0,4),g(1,4,5501)),
+        ]{
+            assert_eq!(sockets.close_claimed_registered(
+                &mut registry,caller,claim),Err(SocketError::Denied));
+            assert_eq!(registry.active_count(),2);
+            assert_eq!(sockets.pending_owned(2,8),Ok(1));
+        }
+        let mut output=[0u8;8];
+        assert_eq!(sockets.receive_registered(&registry,2,8,5502,&mut output),
+            Ok(4));
+        assert_eq!(&output[..4],b"peer");
+    }
+    #[test]
+    fn successful_exact_close_preserves_other_incarnation(){
+        let mut sockets=EpochUdpEndpoints::<2,3>::new();
+        let mut registry=Registry::<2>::new();
+        sockets.bind_registered(&mut registry,1,1,5501).unwrap();
+        sockets.bind_registered(&mut registry,2,2,5502).unwrap();
+        assert_eq!(sockets.close_claimed_registered(
+            &mut registry,id(2,2),g(2,2,5502)),Ok(1));
+        assert_eq!(registry.owner_of(5502),None);
+        assert_eq!(registry.owner_of(5501),Some(g(1,1,5501)));
+        assert_eq!(sockets.send_registered(&registry,2,2,5502,5501,b"old"),
+            Err(SocketError::Denied));
+        sockets.bind_registered(&mut registry,2,3,5502).unwrap();
+        assert_eq!(sockets.close_claimed_registered(
+            &mut registry,id(2,2),g(2,2,5502)),Err(SocketError::Denied));
+        assert_eq!(registry.owner_of(5502),Some(g(2,3,5502)));
+        assert_eq!(sockets.send_registered(&registry,1,1,5501,5502,b"new"),
+            Ok(()));
+        let mut out=[0u8;8];
+        assert_eq!(sockets.receive_registered(&registry,2,3,5502,&mut out),
+            Ok(3));
+        assert_eq!(&out[..3],b"new");
+    }
+    #[test]
+    fn zero_port_and_wrong_registry_do_not_mutate_queue(){
+        let mut sockets=EpochUdpEndpoints::<1,2>::new();
+        let mut registry=Registry::<1>::new();
+        sockets.bind_registered(&mut registry,1,1,5501).unwrap();
+        assert_eq!(sockets.close_claimed_registered(
+            &mut registry,id(1,1),g(1,1,0)),Err(SocketError::Denied));
+        assert_eq!(registry.owner_of(5501),Some(g(1,1,5501)));
+    }
+}

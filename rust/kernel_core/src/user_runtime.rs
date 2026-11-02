@@ -914,7 +914,7 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
     4=>{
      let grant=crate::udp_owner_epoch::Grant{
        pid:owner.pid,generation:owner.generation,port:source};
-     socket.close_registered_batch(registry,&[grant]).map_or(BAD,|_|0)
+     socket.close_claimed_registered(registry,owner,grant).map_or(BAD,|_|0)
     },
     _=>BAD
    }
