@@ -63,6 +63,7 @@ def boot(qemu:str,iso:Path,ovmf:Path,disk:Path,folder:Path,index:int):
             session.until("R031.9 PID1 mounted existing persistent /shared/readme",45)
             message="R031.9 Files displayed FILE UPDATED from persistent volume"
         session.until(message,15)
+        session.until("R117 QEMU PID2 stack guard and crossing descriptor pointers denied",15)
         session.until("R114 PID2 ring3 invalid pointer, private path and denied write blocked",15)
         session.until("R031.9 real file and directory contents rendered into Files window",15)
         session.until("R114 PID1 ring3 forged UDP owner denied",15)

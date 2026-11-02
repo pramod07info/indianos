@@ -686,6 +686,22 @@ fn files_shared_listing(data:&mut [u8;256])->usize{
     if call(34,1,desc.as_ptr() as u64)!=u64::MAX{exit(224);}
     if file_handle_call(1,b"/shared/readme",0,3,data,0)!=u64::MAX{exit(225);}
     if file_handle_call(1,b"/shared/../etc/big",0,1,data,0)!=u64::MAX{exit(226);}
+    // R117: these addresses are fixed by the kernel's ProgramPlan for
+    // this x86-64 user ABI. Exercise actual INT 0x80 file and directory
+    // descriptor copies, including the unmapped stack guard and a partial
+    // descriptor that crosses USER_TOP. All calls must fail before disk I/O.
+    const USER_TOP:u64=0x0000_7fff_f000_0000;
+    const STACK_BYTES:u64=64*1024;
+    const PAGE_BYTES:u64=4096;
+    let guard=USER_TOP-STACK_BYTES-PAGE_BYTES;
+    for address in [
+        guard,guard+PAGE_BYTES-32,USER_TOP-32,USER_TOP,
+        u64::MAX-31,
+    ]{
+        if call(33,1,address)!=u64::MAX{exit(243);}
+        if call(34,1,address)!=u64::MAX{exit(244);}
+    }
+    write(b"R117 QEMU PID2 stack guard and crossing descriptor pointers denied");
     write(b"R114 PID2 ring3 invalid pointer, private path and denied write blocked");
     9
 }
