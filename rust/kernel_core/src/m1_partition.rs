@@ -2543,4 +2543,93 @@ mod m1_partition_tests{
   assert_eq!(disk.writes,0);
  }
 
+
+ // R114 verified read-only recovery selector: actual MBR/GPT receipts, valid
+ // formatted COW filesystem, reserved boot-slot sectors, zero write I/O.
+ #[test]fn r114_recovery_selector_requires_same_readonly_receipt(){
+  use crate::agent_08_boot_slot::{
+    select_recovery_slot_readonly,encode_slot,Slot,SlotIoError,SLOT_RECORD_BYTES};
+  let mut disk=mbr_disk();
+  {let w=BlockWindow::new(&mut disk,10,100).unwrap();
+   let mut fs=HierVfs::format_blank(w).unwrap();
+   fs.create("/hello",b"ok").unwrap();
+  }
+  let before=inspect_partition_receipt(&mut disk,0).unwrap();
+  let record=encode_slot(Slot{valid_metadata:true,committed:true,
+      version:17,attempts_remaining:2}).unwrap();
+  disk.data[150][..SLOT_RECORD_BYTES].copy_from_slice(&record);
+  let writes=disk.writes;
+  assert_eq!(select_recovery_slot_readonly(&mut disk,before,[150,151],10)
+      .unwrap().1.version,17);
+  assert_eq!(disk.writes,writes);
+  assert_eq!(select_recovery_slot_readonly(&mut disk,before,[10,151],10),
+      Err(SlotIoError::Geometry));
+  disk.data[0][447]^=1;
+  assert_eq!(select_recovery_slot_readonly(&mut disk,before,[150,151],10),
+      Err(SlotIoError::Verification));
+  assert_eq!(disk.writes,writes);
+ }
+ #[test]fn r114_recovery_selector_requires_valid_gpt_mirror_and_both_metadata_headers(){
+  use crate::agent_08_boot_slot::{
+    select_recovery_slot_readonly,encode_slot,Slot,SlotIoError,SLOT_RECORD_BYTES};
+  let mut disk=gpt_disk();
+  {let w=BlockWindow::new(&mut disk,40,100).unwrap();
+   let mut fs=HierVfs::format_blank(w).unwrap();
+   fs.create("/hello",b"ok").unwrap();
+  }
+  let receipt=inspect_partition_receipt(&mut disk,0).unwrap();
+  let record=encode_slot(Slot{valid_metadata:true,committed:true,
+      version:31,attempts_remaining:3}).unwrap();
+  disk.data[180][..SLOT_RECORD_BYTES].copy_from_slice(&record);
+  let writes=disk.writes;
+  assert_eq!(select_recovery_slot_readonly(&mut disk,receipt,[180,181],30)
+       .unwrap().1.version,31);
+  disk.data[254][12]^=1;
+  assert_eq!(select_recovery_slot_readonly(&mut disk,receipt,[180,181],30),
+       Err(SlotIoError::Verification));
+  assert_eq!(disk.writes,writes);
+ }
+
+
+ // R114: a mount-table media swap between selected-volume read operations
+ // must not issue an apparently healthy receipt or any disk write.
+ #[test]fn r114_partition_displacement_during_readonly_health_probe_fails_closed(){
+  let mut original=mbr_disk();
+  {let window=BlockWindow::new(&mut original,10,100).unwrap();
+   let mut fs=HierVfs::format_blank(window).unwrap();
+   fs.create("/hello",b"stable").unwrap();
+  }
+  let receipt=inspect_partition_receipt(&mut original,0).unwrap();
+  struct Switching{
+   data:Disk,seen:usize,swap_on:usize
+  }
+  impl BlockDevice for Switching{
+   fn sector_count(&self)->u64{self.data.sector_count()}
+   fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+      ->Result<(),BlockError>{
+    self.seen+=1;
+    if self.seen==self.swap_on {
+     // A new medium with different partition LBA but same sector count
+     // arrives during the real probe's first or second metadata pass.
+     self.data.data[0][454..458].copy_from_slice(&11u32.to_le_bytes());
+    }
+    self.data.read_sector(lba,out)
+   }
+   fn write_sector(&mut self,lba:u64,input:&[u8;SECTOR_BYTES])
+      ->Result<(),BlockError>{
+    self.data.write_sector(lba,input)
+   }
+  }
+  for nth_read in [2,5,8] {
+   let mut switched=Switching{
+    data:Disk{data:original.data,writes:original.writes,
+      fail_at:original.fail_at,fail_read:original.fail_read},
+    seen:0,swap_on:nth_read
+   };
+   let writes=switched.data.writes;
+   assert!(probe_selected_receipt_readonly(&mut switched,receipt).is_err());
+   assert_eq!(switched.data.writes,writes);
+  }
+ }
+
 }

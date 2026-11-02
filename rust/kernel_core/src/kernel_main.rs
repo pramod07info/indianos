@@ -83,7 +83,15 @@ impl RecoveryLine{
 /// Init recovery remains inside the kernel with interrupts masked. It polls
 /// only COM1 and never mounts, formats, allocates, launches or retries init.
 fn recover_init(reason:&'static [u8])->!{
-    unsafe{asm!("cli",options(nomem,nostack,preserves_flags));}
+    // The recovery shell must never run alongside an unmasked timer owner.
+    // Stop the exact timer sources owned by this kernel after CLI and before
+    // even the first recovery UART command. Faults remain fatal, not ignored.
+    unsafe{asm!("cli",options(nomem,nostack));}
+    #[cfg(feature="timer")]
+    if !unsafe{crate::timer::quiesce_for_shutdown()} {
+        log(b"IndianOS recovery: FATAL timer quiesce failed\n\0");
+        halt()
+    }
     log(reason);
     log(b"IndianOS recovery: read-only serial console ready\n\0");
     log(b"IndianOS recovery: commands help status halt\nrecovery> \0");
@@ -457,6 +465,42 @@ pub extern "C" fn kmain()->!{
     need(unsafe{pmm_self_test()},
          b"IndianOS: FATAL physical memory self-test failed\n\0");
     log(b"IndianOS: physical memory manager ready\n\0");
+    #[cfg(feature="test-r114-epoch")]
+    {
+        // QEMU-exclusive disposable 64-sector primary-master image, seeded
+        // independently by the test harness. Ordinary boots NEVER enter this.
+        // A deterministic test profile digest is not a firmware trust root.
+        use crate::block::{BlockDevice,BlockWindow};
+        use crate::agent_08_boot_slot::Slot;
+        use crate::r114_boot_epoch::{self,TrustedBootMeasurement};
+        struct QemuFixture;
+        impl TrustedBootMeasurement for QemuFixture {
+            fn read_verified(&self)->Result<[u8;32],r114_boot_epoch::Error>{
+                Ok([0x42;32]) // test-only trust fixture, never production
+            }
+        }
+        let mut disk=unsafe{crate::ata_pio::AtaPio::probe()}.unwrap_or_else(|_|{
+            log(b"IndianOS: FATAL R114 QEMU epoch disk not found\n\0");halt()
+        });
+        need(disk.sector_count()==64,
+             b"IndianOS: FATAL R114 refused non-disposable drive geometry\n\0");
+        let mut region=BlockWindow::new(&mut disk,40,2).unwrap_or_else(|_|{
+            log(b"IndianOS: FATAL R114 epoch selected window invalid\n\0");halt()
+        });
+        let prior=r114_boot_epoch::current_epoch(&mut region).unwrap_or_else(|_|{
+            log(b"IndianOS: FATAL R114 epoch journal not preprovisioned\n\0");halt()
+        });
+        let slot=Slot{valid_metadata:true,committed:true,version:9,
+                      attempts_remaining:2};
+        let saved=r114_boot_epoch::advance_epoch(
+            &mut region,&QemuFixture,prior,0,slot,21);
+        let verified=saved.is_ok_and(|r|
+            r.epoch==prior+1 &&
+            r114_boot_epoch::recovery_receipt(
+                &mut region,&QemuFixture,r.epoch,0,slot,21)==Ok(r));
+        need(verified,b"IndianOS: FATAL R114 QEMU boot epoch persistence\n\0");
+        log(b"IndianOS: R114 QEMU boot epoch advanced and recovery receipt verified\n\0");
+    }
     #[cfg(feature="test-r028-network")]
     {
         log(b"IndianOS: R028 legacy virtio-net PCI probe begin\n\0");
@@ -467,7 +511,11 @@ pub extern "C" fn kmain()->!{
             });
         log(b"IndianOS: R028 legacy virtio-net DMA queues initialized\n\0");
         let result=crate::network::run_demo(&mut nic,log);
-        nic.close();
+        // Even failed protocol probes must reset the NIC before any PMM DMA
+        // frame can be returned. Never report network PASS after an uncertain
+        // reset or silently release pages while the device may still DMA.
+        need(nic.close(),b"IndianOS: FATAL R114 virtio-net DMA stop readback failed\n\0");
+        log(b"IndianOS: R114 virtio-net reset and PCI bus-master shutdown verified PASSED\n\0");
         need(result.is_ok(),b"IndianOS: FATAL R028 ARP ICMP UDP DNS or TCP exchange\n\0");
         log(b"IndianOS: R028 QEMU virtio-net end-to-end network client PASSED\n\0");
     }
@@ -683,6 +731,12 @@ pub extern "C" fn kmain()->!{
     #[cfg(feature="normal-init")]
     {
         log(b"IndianOS: normal boot starting native PID1\n\0");
+        // This production normal-init profile does not enable the R031
+        // writable Files experiment or the R028 network development path.
+        // Explicit UART evidence is consumed by the real QEMU negative test.
+        #[cfg(all(not(feature="test-r031-vfs"),not(feature="test-r028-network")))]
+        log(b"IndianOS normal boot negative-control: experimental writable VFS and NIC disabled\n\0");
+
         let mut table=ProcessTable::empty();
         if !unsafe{indianos_process_table_init(&mut table)} {
             recover_init(b"IndianOS recovery: reason=pid1-table-failed\n\0")

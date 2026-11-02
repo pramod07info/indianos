@@ -201,6 +201,9 @@ fn configure_queue(port:u16,queue:u16,q:&Queue)->bool{
 }
 pub struct VirtioNet{
     port:u16,
+    bus:u8,
+    slot:u8,
+    function:u8,
     mac:[u8;6],
     rx:Queue,
     tx:Queue,
@@ -212,7 +215,7 @@ impl VirtioNet{
     /// QEMU legacy virtio-net, BSP with IRQs disabled and PMM initialized.
     /// No other I/O master may own the PCI device, DMA frames or virtqueues.
     pub unsafe fn probe()->Result<Self,Error>{
-        let Some((_,_,_,port))=discover()else{return Err(Error::Device);};
+        let Some((bus,slot,function,port))=discover()else{return Err(Error::Device);};
         unsafe{outb(port+0x12,0);outb(port+0x12,DEVICE_ACK|DRIVER);}
         let offered=unsafe{inl(port)};
         if offered&VIRTIO_MAC_FEATURE==0{
@@ -256,13 +259,34 @@ impl VirtioNet{
         unsafe{outb(port+0x12,DEVICE_ACK|DRIVER|DRIVER_OK);}
         compiler_fence(Ordering::SeqCst);
         unsafe{outw(port+0x10,QUEUE_RX);}
-        Ok(Self{port,mac,rx,tx,faulted:false})
+        Ok(Self{port,bus,slot,function,mac,rx,tx,faulted:false})
     }
-    pub fn close(self){
-        // Quiesce all DMA before releasing any physical frames to PMM.
+    /// Quiesce the legacy NIC and verify that the device has actually
+    /// acknowledged reset before releasing DMA pages to the PMM. A removed
+    /// device may return 0xff, so an uncertain reset must retain all DMA
+    /// frames rather than risk a use-after-free. Requires BSP+CLI and a
+    /// stable PCI I/O-port mapping; no IOMMU or real hardware qualification.
+    #[must_use]
+    pub fn close(self)->bool{
         unsafe{outb(self.port+0x12,0);}
         compiler_fence(Ordering::SeqCst);
+        // Re-read actual device STATUS, then deny further PCI bus-master DMA.
+        // Reads of PCI command are trusted only with unchanged device identity.
+        // Reset uncertainty or hot-unplug must retain buffers, NOT release
+        // frames still potentially reachable by the DMA engine.
+        if unsafe{inb(self.port+0x12)}!=0{return false;}
+        if pciread(self.bus,self.slot,self.function,0) !=
+             ((DEVICE as u32)<<16 | VENDOR as u32){return false;}
+        let command=pciread(self.bus,self.slot,self.function,0x04);
+        // Write only COMMAND[15:0]: status bits are W1C and must not be
+        // accidentally acknowledged while quarantining the controller.
+        let disabled=(command & 0xffff) & !0x0004;
+        pciwrite(self.bus,self.slot,self.function,0x04,disabled);
+        compiler_fence(Ordering::SeqCst);
+        let observed=pciread(self.bus,self.slot,self.function,0x04);
+        if observed & 0x0004 != 0 || (observed & 1)==0{return false;}
         self.rx.release();self.tx.release();
+        true
     }
 }
 /// Validate used length without untrusted DMA length subtraction/overflow.
@@ -376,7 +400,7 @@ mod tests{
         let mut tr=[0u64;1536];let mut tb=[0u64;512];
         let mut rx=mock_queue(&mut rr,&mut rb);rx.offer();
         completion(&rx,2,0,74);
-        let mut dev=VirtioNet{port:0,mac:[2;6],rx,
+        let mut dev=VirtioNet{port:0,bus:0,slot:0,function:0,mac:[2;6],rx,
             tx:mock_queue(&mut tr,&mut tb),faulted:false};
         let mut out=[0xaa;100];
         assert_eq!(dev.poll(&mut out),Err(Error::Device));

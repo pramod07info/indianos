@@ -670,6 +670,23 @@ fn files_shared_listing(data:&mut [u8;256])->usize{
     // PID2 cannot enumerate any private location.
     desc[..8].copy_from_slice(b"/etc\0\0\0\0");
     if call(34,1,desc.as_ptr() as u64)!=u64::MAX{exit(201);}
+    // Exact guest ring-3 negative controls. All attempts must fail BEFORE
+    // data reaches the native /shared filesystem. The same PID still reads
+    // its allowed file immediately after these attempts, proving isolation.
+    if call(34,1,u64::MAX)!=u64::MAX{exit(221);}
+    desc[..24].fill(0);
+    desc[..14].copy_from_slice(b"/shared/../etc");
+    if call(34,1,desc.as_ptr() as u64)!=u64::MAX{exit(222);}
+    desc[..24].fill(0);
+    desc[..8].copy_from_slice(b"/sharedx");
+    if call(34,1,desc.as_ptr() as u64)!=u64::MAX{exit(223);}
+    desc[..24].fill(0);
+    desc[..8].copy_from_slice(b"/shared\0");
+    desc[48..56].copy_from_slice(&u64::MAX.to_le_bytes());
+    if call(34,1,desc.as_ptr() as u64)!=u64::MAX{exit(224);}
+    if file_handle_call(1,b"/shared/readme",0,3,data,0)!=u64::MAX{exit(225);}
+    if file_handle_call(1,b"/shared/../etc/big",0,1,data,0)!=u64::MAX{exit(226);}
+    write(b"R114 PID2 ring3 invalid pointer, private path and denied write blocked");
     9
 }
 #[cfg(feature="r031-files-app")]
@@ -888,6 +905,28 @@ fn terminal_service(){
         }
     }
 }
+// Guest-visible local UDP syscall 36. The claim is intentionally supplied
+// from userspace and must be compared to the independently authenticated PCB.
+#[cfg(any(feature="r031-files-shell",feature="r031-files-app",feature="r031-files-terminal"))]
+fn local_udp(op:u64,claimed:u32,source:u16,destination:u16,
+             address:u64,length:usize)->u64 {
+ let mut descriptor=[0u8;64];
+ descriptor[..4].copy_from_slice(&claimed.to_le_bytes());
+ descriptor[8..10].copy_from_slice(&source.to_le_bytes());
+ descriptor[10..12].copy_from_slice(&destination.to_le_bytes());
+ descriptor[12..16].copy_from_slice(&(length as u32).to_le_bytes());
+ descriptor[16..24].copy_from_slice(&address.to_le_bytes());
+ call(36,op,descriptor.as_ptr() as u64)
+}
+#[cfg(any(feature="r031-files-shell",feature="r031-files-app"))]
+fn local_bind(pid:u32,source:u16){
+ if local_udp(1,pid,source,0,0,0)!=0{exit(229);}
+}
+#[cfg(any(feature="r031-files-shell",feature="r031-files-app"))]
+fn local_send(pid:u32,source:u16,destination:u16,payload:&[u8]){
+ if local_udp(2,pid,source,destination,payload.as_ptr() as u64,
+              payload.len())!=0{exit(230);}
+}
 // R031.1: automatic boot-to-desktop QEMU session, real ring-3 PID1
 // system-service policy. PID2 Files and PID3 Terminal are independent ELF
 // images, never framebuffer-mapped; all chrome changes are capability checked.
@@ -899,9 +938,26 @@ fn r031_shell()->!{
     if call(26,0,0)!=0{exit(193);}
     #[cfg(feature="r031-files-shell")]
     shell_prepare_shared_data();
+    #[cfg(feature="r031-files-shell")]
+    {
+        local_bind(1,5501);
+        if local_udp(1,2,5501,0,0,0)!=u64::MAX{exit(231);}
+        write(b"R114 PID1 ring3 forged UDP owner denied");
+    }
     write(b"R031.1 init launching GUI services without test-driver keystrokes");
     yield_now();
     suite_receive(2,b"FILES");
+    #[cfg(feature="r031-files-shell")]
+    {
+        let mut received=[0u8;64];
+        let n=local_udp(3,1,5501,0,received.as_mut_ptr() as u64,64);
+        if n!=4||&received[..4]!=b"PING"{exit(232);}
+        local_send(1,5501,5502,b"PONG");
+        write(b"R114 PID1 received PID2 UDP PING and replied");
+        // Cooperative scheduler: give the peer a real dispatch opportunity
+        // before init enters its continuous physical-input desktop loop.
+        yield_now();
+    }
     #[cfg(feature="r031-supervisor-shell")]
     {
         if call(26,0,0)!=4{exit(194);}
@@ -1027,10 +1083,30 @@ fn r031_files()->!{
     r029_draw(&r029_command(1,1,15,102,264,32,0x0045967c,&[]));
     r029_draw(&r029_command(1,2,18,109,240,14,0x00ffffff,b"FILES SERVICE PID2"));
     #[cfg(feature="r031-files-app")]
-    files_gui_initial();
+    {
+        files_gui_initial();
+        local_bind(2,5502);
+        if local_udp(1,1,5502,0,0,0)!=u64::MAX{exit(233);}
+        if local_udp(1,2,5501,0,0,0)!=u64::MAX{exit(234);}
+        local_send(2,5502,5501,b"PING");
+        write(b"R114 PID2 forged UDP owner and source port denied");
+    }
     suite_send(1,b"FILES");
     write(b"R031.1 Files service registered and running");
     yield_now();
+    #[cfg(feature="r031-files-app")]
+    {
+        let mut response=[0u8;64];
+        let mut received=false;
+        for _ in 0..16 {
+            let n=local_udp(3,2,5502,0,response.as_mut_ptr() as u64,64);
+            if n==0{yield_now();continue;}
+            if n!=4||&response[..4]!=b"PONG"{exit(235);}
+            received=true;break;
+        }
+        if !received{exit(236);}
+        write(b"R114 PID2 received isolated UDP PONG from PID1");
+    }
     #[cfg(all(not(feature="r031-supervisor-files"),
               not(feature="r031-files-app")))]
     suite_receive(1,b"EXIT");
@@ -1101,6 +1177,25 @@ fn r031_terminal()->!{
     suite_send(1,b"TERMINAL");
     #[cfg(feature="r031-supervisor-terminal")]
     write(b"R031.2 replacement PID4 registered IPC and window after crash");
+    #[cfg(feature="r031-files-terminal")]
+    {
+        // The actual PID3 process has no Files capability even when it can
+        // draw its own window or send requests to the PID1 file broker.
+        // Supply well-formed user descriptors to make this an AUTH test,
+        // not merely a bad-pointer syscall-validation test.
+        let mut file=[0u8;64];file[..14].copy_from_slice(b"/shared/readme");
+        file[32..40].copy_from_slice(&1u64.to_le_bytes());
+        if call(33,1,file.as_ptr() as u64)!=u64::MAX{exit(227);}
+        let mut directory=[0u8;64];
+        directory[..8].copy_from_slice(b"/shared\0");
+        let mut data=[0u8;72];
+        directory[48..56].copy_from_slice(&(data.as_mut_ptr() as u64).to_le_bytes());
+        directory[56..64].copy_from_slice(&72u64.to_le_bytes());
+        if call(34,1,directory.as_ptr() as u64)!=u64::MAX{exit(228);}
+        write(b"R114 Terminal PID3 denied direct Files handles and directory syscall");
+        if local_udp(1,3,5502,0,0,0)!=u64::MAX{exit(237);}
+        write(b"R114 Terminal PID3 denied UDP socket admission");
+    }
     #[cfg(not(feature="r031-supervisor-terminal"))]
     write(b"R031.1 Terminal service registered and running");
     yield_now();

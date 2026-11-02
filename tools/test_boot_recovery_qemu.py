@@ -154,7 +154,11 @@ def main() -> int:
     parser.add_argument("--ovmf", required=True, type=Path)
     parser.add_argument("--xorriso", default="xorriso")
     parser.add_argument("--timeout", type=float, default=35)
+    parser.add_argument("--cold-cycles", type=int, default=3,
+                        help="independent OVMF cold boots per normal/recovery control")
     args = parser.parse_args()
+    if not 2 <= args.cold_cycles <= 6:
+        parser.error("--cold-cycles must be between 2 and 6")
     if not args.iso.is_file() or not args.ovmf.is_file() or not 0 < args.timeout <= 180:
         parser.error("existing ISO/OVMF and timeout in (0, 180] required")
     iso = args.iso.resolve()
@@ -163,8 +167,12 @@ def main() -> int:
         root = Path(directory)
         guard = root / "sentinel.img"
         guard.write_bytes(bytes(range(256)) * 256)
-        boot(iso, args.qemu, ovmf, args.timeout, None, guard)
-        print("Boot recovery normal control PASS (sentinel unchanged)", flush=True)
+        # Every invocation starts a NEW QEMU/OVMF guest against the same
+        # disposable physical-drive sentinel. Zero prior VM state is reused.
+        for cycle in range(args.cold_cycles):
+            boot(iso, args.qemu, ovmf, args.timeout, None, guard)
+            print(f"Boot recovery normal cold boot {cycle+1}/{args.cold_cycles} PASS "
+                  "(sentinel unchanged)", flush=True)
         original_config = root / "original-limine.conf"
         checked_run([args.xorriso, "-osirrox", "on", "-indev", str(iso),
                      "-extract", "/boot/limine/limine.conf", str(original_config)])
@@ -206,8 +214,14 @@ def main() -> int:
                              str(tree), "-o", str(modified)])
             finally:
                 destination.write_bytes(original)
-            boot(modified, args.qemu, ovmf, args.timeout, reason, guard)
-            print(f"Boot recovery {name} PASS (sentinel unchanged)", flush=True)
+            # At least the missing-init failure is repeated through fresh
+            # OVMF guests to ensure read-only recovery is not a first-boot
+            # artifact. Other cases still execute at least one cold boot.
+            cycles = args.cold_cycles if name == "missing-init" else 1
+            for cycle in range(cycles):
+                boot(modified, args.qemu, ovmf, args.timeout, reason, guard)
+                print(f"Boot recovery {name} cold boot {cycle+1}/{cycles} PASS "
+                      "(sentinel unchanged)", flush=True)
     print("IndianOS read-only boot recovery QEMU PASSED")
     return 0
 

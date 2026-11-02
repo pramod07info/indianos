@@ -469,6 +469,86 @@ pub unsafe extern "C" fn x86_64_xapic_timer_stop()->bool{
     XAPIC_TIMER_RUNNING.store(false,Ordering::Release);
     true
 }
+/// Quiesce every timer source owned by this single-BSP experimental
+/// kernel before returning to the read-only recovery console. The caller
+/// MUST have disabled CPU interrupts (CLI) and must not subsequently enable
+/// them during shutdown. A failed MMIO or PIC readback prevents recovery
+/// services from starting. This intentionally leaves unrelated IRQ lines and
+/// firmware-owned devices untouched.
+/// # Safety
+/// BSP ring0, interrupts disabled; any registered UC xAPIC mapping must
+/// still be valid. This routine never unmasks or starts timer hardware.
+/// Run both independent quiescence operations even when one fails.
+/// A failed APIC stop must not leave the legacy IRQ0 route unnecessarily live.
+/// This helper is injected by host tests without touching privileged registers.
+fn quiesce_owned_sources(
+    xapic_armed:bool, legacy_armed:bool,
+    stop_apic:impl FnOnce()->bool,
+    mask_irq0:impl FnOnce()->bool,
+)->bool {
+    let apic_ok=if xapic_armed {stop_apic()} else {true};
+    let pic_ok=if legacy_armed {mask_irq0()} else {true};
+    apic_ok && pic_ok
+}
+pub unsafe fn quiesce_for_shutdown() -> bool {
+    let safe=quiesce_owned_sources(
+        XAPIC_TIMER_ARMED.load(Ordering::Acquire),
+        CONFIGURED.load(Ordering::Acquire),
+        || {
+            if !unsafe { x86_64_xapic_timer_stop() } {return false;}
+            let (Some(lvt),Some(initial))=(
+                xapic_reg(XAPIC_LVT_TIMER_OFFSET),
+                xapic_reg(XAPIC_TIMER_INITIAL_OFFSET)
+            ) else {return false;};
+            // Verify hardware registers rather than only software flags.
+            let lvt_value:u32=unsafe {core::ptr::read_volatile(lvt)};
+            let initial_count:u32=unsafe {core::ptr::read_volatile(initial)};
+            (lvt_value & (1u32<<16))!=0 && initial_count==0
+        },
+        || {
+            // PIT may continue counting; mask its kernel-owned PIC IRQ0.
+            let new_mask=inb(PIC1_DATA)|1;
+            outb(PIC1_DATA,new_mask);
+            if inb(PIC1_DATA)&1==0 {return false;}
+            CONFIGURED.store(false,Ordering::Release);
+            true
+        },
+    );
+    safe && !XAPIC_TIMER_RUNNING.load(Ordering::Acquire) &&
+      !XAPIC_CALIBRATING.load(Ordering::Acquire) &&
+      !CONFIGURED.load(Ordering::Acquire)
+}
+#[cfg(test)]
+mod r114_shutdown_quiescence_tests {
+    use super::quiesce_owned_sources;
+    use std::cell::RefCell;
+    #[test]
+    fn shutdown_attempts_both_sources_even_after_apic_failure() {
+        let history=RefCell::new(Vec::new());
+        let ok=quiesce_owned_sources(true,true,
+            ||{history.borrow_mut().push("apic");false},
+            ||{history.borrow_mut().push("irq0");true});
+        assert!(!ok);
+        assert_eq!(*history.borrow(),["apic","irq0"]);
+    }
+    #[test]
+    fn shutdown_refuses_each_independent_failed_readback() {
+        assert!(!quiesce_owned_sources(true,true,||true,||false));
+        assert!(!quiesce_owned_sources(true,true,||false,||true));
+        assert!(!quiesce_owned_sources(true,true,||false,||false));
+        assert!(quiesce_owned_sources(true,true,||true,||true));
+    }
+    #[test]
+    fn only_initialized_sources_are_touched() {
+        assert!(quiesce_owned_sources(false,false,
+            ||panic!("unarmed APIC"),||panic!("unarmed PIC")));
+        assert!(quiesce_owned_sources(true,false,
+            ||true,||panic!("unarmed PIC")));
+        assert!(quiesce_owned_sources(false,true,
+            ||panic!("unarmed APIC"),||true));
+    }
+}
+
 /// # Safety
 /// Call only from a genuine local APIC interrupt handler, after a validated
 /// UC binding; sending EOI for a PIC IRQ is incorrect.

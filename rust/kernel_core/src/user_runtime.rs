@@ -67,6 +67,34 @@ static mut ACTIVE_PROCESS:*mut Process=ptr::null_mut();
 #[cfg(feature="test-r031-vfs")]
 static mut R031_HANDLES:crate::fs_handles::FileHandles=
     crate::fs_handles::FileHandles::new();
+/// Trusted process lifecycle events (single-core kernel context).
+/// Events carry the authenticated PCB PID and its current file incarnation.
+#[cfg(feature="test-r031-vfs")]
+static mut R114_FILE_EVENTS:crate::process_events::ProcessEvents<16>=
+    crate::process_events::ProcessEvents::new();
+/// One-BSP, exclusive INT 0x80 local transport. Reset on session rollback.
+#[cfg(feature="test-r031-files-gui")]
+static mut R114_LOCAL_UDP:crate::network::EpochUdpEndpoints<2,8>=
+    crate::network::EpochUdpEndpoints::new();
+
+/// Kernel-only PID1 lifecycle event acknowledgement. A user-supplied PID or
+/// file descriptor cannot select a consumer; the current exact FileHandles
+/// incarnation is required, and failed verification never dequeues events.
+/// This queue is single-BSP syscall context, NOT interrupt- or SMP-safe.
+#[cfg(feature="test-r031-vfs")]
+pub(crate) fn consume_pid1_lifecycle_event(
+    consumer:crate::batch5_session::Identity,
+    expected:crate::process_events::ProcessEvent,
+)->Result<crate::process_events::ProcessEvent,()>{
+    if consumer.pid!=1 || consumer.generation==0 ||
+       !unsafe{(&*ptr::addr_of!(R031_HANDLES)).owns(consumer)}{
+        return Err(());
+    }
+    let queue=unsafe{&mut *ptr::addr_of_mut!(R114_FILE_EVENTS)};
+    if queue.peek()!=Some(expected){return Err(());}
+    queue.dequeue().map_err(|_|())
+}
+
 #[cfg(feature="test-r031-vfs")]
 fn authenticated_file_identity()->Option<crate::batch5_session::Identity>{
     let process=unsafe{ptr::read(ptr::addr_of!(ACTIVE_PROCESS))};
@@ -792,6 +820,51 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
    n
   },
   #[cfg(feature="test-r031-files-gui")]
+  36=>{
+   let Some(owner)=authenticated_file_identity()else{return BAD;};
+   // Never derive authority from the claimed PID or user buffer. Source
+   // identity and incarnation come from ACTIVE_PROCESS and FileHandles.
+   let mut desc=[0u8;64];
+   if !unsafe{indianos_user_copy_readonly(img,request.arg1,
+             desc.as_mut_ptr().cast(),desc.len())}{return BAD;}
+   if desc[4..8].iter().any(|&b|b!=0)||
+      desc[24..].iter().any(|&b|b!=0){return BAD;}
+   let claim=u32::from_le_bytes(desc[..4].try_into().unwrap());
+   let source=u16::from_le_bytes(desc[8..10].try_into().unwrap());
+   let destination=u16::from_le_bytes(desc[10..12].try_into().unwrap());
+   let count=u32::from_le_bytes(desc[12..16].try_into().unwrap()) as usize;
+   let address=u64::from_le_bytes(desc[16..24].try_into().unwrap());
+   if claim!=owner.pid||
+      source!=(if owner.pid==1{5501}else{5502}){return BAD;}
+   let mut data=[0u8;64];
+   match request.arg0{
+    1|4 if destination==0&&count==0&&address==0=>{},
+    2 if destination!=0&&count>0&&count<=data.len()&&
+     unsafe{indianos_user_copy_readonly(img,address,data.as_mut_ptr().cast(),count)}=>{},
+    3 if destination==0&&count==data.len()&&
+     unsafe{indianos_user_can_write(&*img,address,count)}=>{},
+    _=>return BAD
+   }
+   let socket=unsafe{&mut *ptr::addr_of_mut!(R114_LOCAL_UDP)};
+   match request.arg0{
+    1=>socket.bind(owner.pid,owner.generation,source).map_or(BAD,|_|0),
+    2=>socket.send_local(owner.pid,owner.generation,source,destination,
+             &data[..count]).map_or(BAD,|_|0),
+    3=>{
+     let n=match socket.receive(owner.pid,owner.generation,source,&mut data){
+      Ok(n)=>n,
+      Err(crate::network::SocketError::Empty)=>return 0,
+      Err(_)=>return BAD
+     };
+     if n>0 && !unsafe{indianos_user_copy_writable(&*img,address,
+                           data.as_ptr(),n)}{return BAD;}
+     n as u64
+    },
+    4=>socket.close(owner.pid,owner.generation,source).map_or(BAD,|_|0),
+    _=>BAD
+   }
+  },
+  #[cfg(feature="test-r031-files-gui")]
   34=>{
    if request.arg0!=1||authenticated_file_pid()!=Some(2){return BAD;}
    // READ-ONLY directory enumeration is limited to /shared.
@@ -1208,6 +1281,16 @@ fn revoke_task_authority(task:&mut Task){
   if !task.pcb.is_null(){
    let owner=crate::batch5_session::Identity{
     pid:unsafe{(*task.pcb).pid},generation:task.file_generation};
+   if unsafe{(&*ptr::addr_of!(R031_HANDLES)).owns(owner)} {
+    let event=crate::process_events::ProcessEvent {
+      pid:owner.pid,kind:crate::process_events::EventKind::Exited,
+      value:owner.generation};
+    // Never block mandatory teardown when a bounded diagnostics FIFO fills.
+    let _=unsafe{&mut *ptr::addr_of_mut!(R114_FILE_EVENTS)}.enqueue(event);
+   }
+   #[cfg(feature="test-r031-files-gui")]
+   {let _=unsafe{&mut *ptr::addr_of_mut!(R114_LOCAL_UDP)}
+        .retire(owner.pid,owner.generation);}
    unsafe{(&mut *ptr::addr_of_mut!(R031_HANDLES)).retire_process(owner);}
   }
   task.file_generation=0;
@@ -1247,6 +1330,8 @@ fn cleanup_session(backend:&CloneBackend,reclaim:bool)->bool{
  unsafe{IPC_ROUTER=None;}
  #[cfg(feature="test-r025")]
  unsafe{R025_SERVICES=None;}
+ #[cfg(feature="test-r031-files-gui")]
+ unsafe{R114_LOCAL_UDP=crate::network::EpochUdpEndpoints::new();}
  unsafe{SESSION_DIRTY=!complete;}
  complete
 }
@@ -1297,6 +1382,8 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
  if unsafe{SESSION_DIRTY} && (active_retained_root||!cleanup_session(&backend,true)){
   log(b"IndianOS: M009 prior rollback still owns resources\n\0");return false;
  }
+ #[cfg(feature="test-r031-files-gui")]
+ unsafe{R114_LOCAL_UDP=crate::network::EpochUdpEndpoints::new();}
  let mut table=ProcessTable::empty();
  let mut scheduler=Scheduler::empty();
  if !unsafe{indianos_process_table_init(&mut table)}{return false;}
@@ -1657,6 +1744,8 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
    services:ManuallyDrop<Option<R025Services>>,
    #[cfg(feature="test-r031-vfs")]
    handles:ManuallyDrop<crate::fs_handles::FileHandles>,
+   #[cfg(feature="test-r031-vfs")]
+   event_log:ManuallyDrop<crate::process_events::ProcessEvents<16>>,
   }
   impl Drop for Restore{fn drop(&mut self){unsafe{
    ptr::write(ptr::addr_of_mut!(M009_TASKS),ManuallyDrop::take(&mut self.tasks));
@@ -1667,6 +1756,8 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
    ptr::write(ptr::addr_of_mut!(R025_SERVICES),ManuallyDrop::take(&mut self.services));
    #[cfg(feature="test-r031-vfs")]
    ptr::write(ptr::addr_of_mut!(R031_HANDLES),ManuallyDrop::take(&mut self.handles));
+   #[cfg(feature="test-r031-vfs")]
+   ptr::write(ptr::addr_of_mut!(R114_FILE_EVENTS),ManuallyDrop::take(&mut self.event_log));
   }}}
   let _restore=unsafe{Restore{
    tasks:ManuallyDrop::new(ptr::read(ptr::addr_of!(M009_TASKS))),dirty:SESSION_DIRTY,
@@ -1676,6 +1767,8 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
    services:ManuallyDrop::new(ptr::read(ptr::addr_of!(R025_SERVICES))),
    #[cfg(feature="test-r031-vfs")]
    handles:ManuallyDrop::new(ptr::read(ptr::addr_of!(R031_HANDLES))),
+   #[cfg(feature="test-r031-vfs")]
+   event_log:ManuallyDrop::new(ptr::read(ptr::addr_of!(R114_FILE_EVENTS))),
   }};
   struct Memory{root:[u64;512],refuse:bool,releases:usize}
   unsafe extern "C" fn allocate(_: *mut u64,_:*mut c_void)->bool{false}
@@ -1709,6 +1802,7 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
    #[cfg(feature="test-r025")]{R025_SERVICES=R025Services::new();}
    #[cfg(feature="test-r031-vfs")]{
     R031_HANDLES=crate::fs_handles::FileHandles::new();
+    R114_FILE_EVENTS=crate::process_events::ProcessEvents::new();
     task.file_generation=(&mut *ptr::addr_of_mut!(R031_HANDLES)).bind_process(1).unwrap().generation;
    }
    // Even a CR3 mismatch must retire credentials, but never release a table.
@@ -1722,8 +1816,24 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
    #[cfg(feature="test-r025")]{assert!(services().is_none());}
    #[cfg(feature="test-r031-vfs")]{
     assert!(!(&*ptr::addr_of!(R031_HANDLES)).owns(crate::batch5_session::Identity{pid:1,generation:1}));
+    assert_eq!((&*ptr::addr_of!(R114_FILE_EVENTS)).peek(),Some(
+      crate::process_events::ProcessEvent{pid:1,
+        kind:crate::process_events::EventKind::Exited,value:1}));
+    assert_eq!((&*ptr::addr_of!(R114_FILE_EVENTS)).len(),1);
     let replacement=(&mut *ptr::addr_of_mut!(R031_HANDLES)).bind_process(1).unwrap();
     assert!(replacement.generation>1);
+    let expected=crate::process_events::ProcessEvent{pid:1,
+      kind:crate::process_events::EventKind::Exited,value:1};
+    assert_eq!(consume_pid1_lifecycle_event(
+      crate::batch5_session::Identity{pid:1,generation:1},expected),Err(()));
+    assert_eq!(consume_pid1_lifecycle_event(
+      crate::batch5_session::Identity{pid:2,generation:2},expected),Err(()));
+    assert_eq!((&*ptr::addr_of!(R114_FILE_EVENTS)).len(),1);
+    assert_eq!(consume_pid1_lifecycle_event(replacement,
+      crate::process_events::ProcessEvent{value:999,..expected}),Err(()));
+    assert_eq!(consume_pid1_lifecycle_event(replacement,expected),Ok(expected));
+    assert_eq!(consume_pid1_lifecycle_event(replacement,expected),Err(()));
+    assert_eq!((&*ptr::addr_of!(R114_FILE_EVENTS)).len(),0);
    }
    #[cfg(feature="test-ipc")]{
     let mut replacement=IpcRouter::<4,8>::new().unwrap();
@@ -1732,6 +1842,8 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
    }
    // A delayed per-task retry cannot revoke a replacement PID's mailbox.
    assert!(!discard(task_ptr(0),&backend,false));
+   #[cfg(feature="test-r031-vfs")]
+   assert_eq!((&*ptr::addr_of!(R114_FILE_EVENTS)).len(),0);
    #[cfg(feature="test-ipc")]{assert_eq!(router().unwrap().pending(1),Ok(1));}
    // Release refusal preserves physical ownership for a later retry.
    assert!(!cleanup_session(&backend,true));

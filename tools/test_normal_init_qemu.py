@@ -17,7 +17,9 @@ STATUS = "IndianOS user: bootstrap status: PID=1 ABI=1 filesystem=offline deskto
 REJECTED = "IndianOS user: bootstrap: input rejected"
 
 def verify_trace(text: str) -> None:
-    expected = ["IndianOS: normal boot starting native PID1", "PID 1 RUNNING",
+    expected = ["IndianOS: normal boot starting native PID1",
+                "IndianOS normal boot negative-control: experimental writable VFS and NIC disabled",
+                "PID 1 RUNNING",
                 PID1_READY, "bootstrap commands: help status halt", STATUS,
                 REJECTED, STATUS, REJECTED, STATUS,
                 "bootstrap: unsupported command", "bootstrap stopping PID1",

@@ -98,6 +98,7 @@ pub mod hardware_gpu_control_policy;
 /// Software staging only; physical DMA/PCI and GPU acceleration remain off.
 pub mod hardware_gpu_guarded_queue;
 pub mod agent_08_boot_slot;
+pub mod r114_boot_epoch;
 pub mod agent_09_ci_policy;
 pub mod agent_10_app_policy;
 /// Bounded per-process resource capability grants.
@@ -129,7 +130,7 @@ pub mod m1_project_workspace;
 pub mod m2_sdk;
 #[cfg(feature="test-m2-developer-alpha")]
 pub mod m2_elf;
-#[cfg(feature="test-m2-developer-alpha")]
+// SHA-256 is dependency-free no_std and also authenticates R114 boot recovery.
 pub mod m2_sha256;
 #[cfg(feature="test-m2-developer-alpha")]
 pub mod m2_blob_store;

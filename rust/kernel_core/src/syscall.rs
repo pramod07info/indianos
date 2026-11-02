@@ -125,6 +125,9 @@ pub unsafe extern "C" fn indianos_syscall_validate(
         33 => (1..=6).contains(&request.arg0) &&
               user_range(plan,request.arg1,64,false), // R031.6 handles
         #[cfg(feature="test-r031-files-gui")]
+        36 => (1..=4).contains(&request.arg0) &&
+              user_range(plan,request.arg1,64,false), // ring3 local UDP descriptor
+        #[cfg(feature="test-r031-files-gui")]
         34 => request.arg0==1 &&
               user_range(plan,request.arg1,64,false), // PID2 shared dir listing
         #[cfg(feature = "test-r026")]

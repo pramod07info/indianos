@@ -719,3 +719,117 @@ impl<const C:usize,const N:usize> CoreRunQueues<C,N>{
   assert!(q.contains_epoch(1,2));assert!(!q.contains_epoch(1,1));
  }
 }
+
+
+// R114: atomic bounded process-event operations for trusted lifecycle
+// coordinators. PID authentication and synchronization remain caller duties.
+impl<const CAPACITY: usize> ProcessEvents<CAPACITY> {
+    /// Validate the whole batch before publishing any event.
+    pub fn enqueue_batch(&mut self, events: &[ProcessEvent])
+        -> Result<usize, EventError>
+    {
+        if events.iter().any(|event| event.pid == 0) {
+            return Err(EventError::InvalidPid);
+        }
+        if events.len() > CAPACITY - self.count { return Err(EventError::Full); }
+        for &event in events { self.enqueue(event)?; }
+        Ok(events.len())
+    }
+
+    /// Copy the entire FIFO without consuming it; insufficient destination
+    /// capacity leaves the destination unchanged.
+    pub fn snapshot(&self, out: &mut [ProcessEvent])
+        -> Result<usize, EventError>
+    {
+        if out.len() < self.count { return Err(EventError::Full); }
+        for i in 0..self.count {
+            out[i] = self.entries[(self.head + i) % CAPACITY]
+                .ok_or(EventError::Empty)?;
+        }
+        Ok(self.count)
+    }
+
+    pub fn count_pid(&self, pid: u32) -> usize {
+        if pid == 0 { return 0; }
+        (0..self.count).filter(|&i|
+            self.entries[(self.head + i) % CAPACITY]
+                .is_some_and(|e| e.pid == pid)).count()
+    }
+
+    pub fn clear_kind(&mut self, kind: EventKind) -> usize {
+        let original = self.count;
+        let mut removed = 0;
+        for _ in 0..original {
+            let event = self.dequeue().expect("event ring invariant");
+            if event.kind == kind { removed += 1; }
+            else { self.enqueue(event).expect("event ring invariant"); }
+        }
+        removed
+    }
+
+    /// All-or-nothing validation of a multi-process teardown request.
+    pub fn clear_pids(&mut self, pids: &[u32]) -> Result<usize, EventError> {
+        if pids.contains(&0) { return Err(EventError::InvalidPid); }
+        let original = self.count;
+        let mut removed = 0;
+        for _ in 0..original {
+            let event = self.dequeue().expect("event ring invariant");
+            if pids.contains(&event.pid) { removed += 1; }
+            else { self.enqueue(event).expect("event ring invariant"); }
+        }
+        Ok(removed)
+    }
+}
+
+#[cfg(test)]
+mod r114_process_event_integrity {
+    use super::*;
+    fn event(pid: u32, value: u64) -> ProcessEvent {
+        ProcessEvent { pid, value, kind: EventKind::Message }
+    }
+    #[test]
+    fn batch_is_atomic_for_invalid_pid_and_capacity() {
+        let mut q = ProcessEvents::<2>::new();
+        assert_eq!(q.enqueue_batch(&[event(1,1),event(0,2)]), Err(EventError::InvalidPid));
+        assert_eq!(q.len(), 0);
+        assert_eq!(q.enqueue_batch(&[event(1,1),event(2,2)]), Ok(2));
+        assert_eq!(q.enqueue_batch(&[event(3,3)]), Err(EventError::Full));
+        assert_eq!(q.peek(), Some(event(1,1)));
+    }
+    #[test]
+    fn snapshot_preserves_destination_on_short_buffer_and_wrap() {
+        let mut q = ProcessEvents::<3>::new();
+        q.enqueue_batch(&[event(1,1),event(2,2),event(3,3)]).unwrap();
+        q.dequeue().unwrap();
+        q.enqueue(event(4,4)).unwrap();
+        let mut short = [event(9,9); 2];
+        assert_eq!(q.snapshot(&mut short), Err(EventError::Full));
+        assert_eq!(short, [event(9,9); 2]);
+        let mut all = [event(0,0); 3];
+        assert_eq!(q.snapshot(&mut all), Ok(3));
+        assert_eq!(all, [event(2,2),event(3,3),event(4,4)]);
+    }
+    #[test]
+    fn teardown_and_kind_cleanup_keep_other_events_in_order() {
+        let mut q = ProcessEvents::<6>::new();
+        q.enqueue_batch(&[event(1,1),event(2,2),event(3,3),event(2,4)]).unwrap();
+        q.enqueue(ProcessEvent{pid:9,kind:EventKind::Faulted,value:5}).unwrap();
+        assert_eq!(q.count_pid(2), 2);
+        assert_eq!(q.clear_pids(&[1,0]), Err(EventError::InvalidPid));
+        assert_eq!(q.len(), 5);
+        assert_eq!(q.clear_kind(EventKind::Faulted), 1);
+        assert_eq!(q.clear_pids(&[1,3]), Ok(2));
+        assert_eq!(q.dequeue().unwrap().value, 2);
+        assert_eq!(q.dequeue().unwrap().value, 4);
+    }
+    #[test]
+    fn empty_capacity_is_safe_for_every_new_operation() {
+        let mut q = ProcessEvents::<0>::new();
+        assert_eq!(q.enqueue_batch(&[]), Ok(0));
+        assert_eq!(q.enqueue_batch(&[event(1,1)]), Err(EventError::Full));
+        assert_eq!(q.snapshot(&mut []), Ok(0));
+        assert_eq!(q.clear_kind(EventKind::Started), 0);
+        assert_eq!(q.clear_pids(&[1]), Ok(0));
+        assert_eq!(q.count_pid(1), 0);
+    }
+}

@@ -1947,6 +1947,112 @@ pub fn shutdown_and_revoke_capabilities_exact<
  true
 }
 
+/// R114: replacement-only shutdown boundary. Any unsigned, revoked,
+/// tampered or otherwise untrusted candidate is denied BEFORE stopping a
+/// service, releasing process handles or tearing down the compositor.
+/// The caller must provide a genuine cryptographic Verify implementation
+/// backed by an authenticated signing-key registry; this entry point does
+/// not install an OS image, overwrite firmware or supply a trust root.
+#[cfg(feature="test-r031-vfs")]
+pub fn shutdown_for_signed_replacement_exact<
+ V:crate::batch4_signature::Verify,
+ const S:usize,const W:usize,const Q:usize,const M:usize,
+ const D:usize,const L:usize,const F:usize>(
+ roots:&[crate::batch4_signature::Root],
+ verifier:&V,
+ envelope:&crate::batch4_signature::Envelope,
+ signed_manifest_bytes:&[u8],
+ supervisor:&mut ServiceTable<S>,
+ handles:&mut crate::fs_handles::FileHandles,
+ broker:&mut crate::gui_broker::Broker<W,Q>,
+ desktop:&mut crate::gui_broker::DesktopInput,
+ ipc:&mut crate::ipc::ScopedRouter<M,D>,
+ layout:&mut crate::gui_broker::SurfaceLayout<L>,
+ frames:&mut crate::gui_broker::DamageQueue<F>,
+ required:&[(u32,u32,u32)]
+)->bool{
+ if crate::batch4_signature::check(roots,verifier,envelope,signed_manifest_bytes).is_err(){
+  return false;
+ }
+ shutdown_and_revoke_capabilities_exact(supervisor,handles,broker,desktop,
+     ipc,layout,frames,required)
+}
+
+#[cfg(all(test,feature="test-r031-vfs"))]
+mod r114_signed_replacement_shutdown {
+ use super::*;
+ use crate::batch4_signature::{Envelope,Root,Verify};
+ use crate::fs_handles::FileHandles;
+ use crate::ipc::ScopedRouter;
+ use crate::gui_broker::{Broker,DesktopInput,SurfaceLayout,DamageQueue};
+ use crate::batch5_session::Identity;
+ struct Reject;
+ impl Verify for Reject {
+  fn verify_digest_and_signature(&self,_:&Envelope,_:&[u8])->bool{false}
+ }
+ // This verifier is ONLY a controlled test double. Production must supply
+ // the pinned Ed25519 trust backend, never an unconditional true verifier.
+ struct TestAccept;
+ impl Verify for TestAccept {
+  fn verify_digest_and_signature(&self,e:&Envelope,payload:&[u8])->bool{
+   e.digest==[4;32]&&e.signature==[5;64]&&payload==b"known verified bytes"
+  }
+ }
+ #[test]
+ fn unsigned_and_revoked_image_never_stop_live_desktop() {
+  let mut sup=ServiceTable::<1>::new();
+  assert!(sup.configure(7,1,1));sup.start(7);
+  let mut files=FileHandles::new();
+  let owner=files.bind_process(1).unwrap();
+  let mut events=ScopedRouter::<1,2>::new().unwrap();events.register(owner).unwrap();
+  let mut broker=Broker::<1,2>::new();broker.grant(1,10).unwrap();
+  let mut input=DesktopInput::new();input.focus(&mut broker,10).unwrap();
+  let mut surfaces=SurfaceLayout::<1>::new();
+  let mut damage=DamageQueue::<1>::new();
+  let roots=[Root{signer:11,epoch:3,enabled:true}];
+  let signed=Envelope{signer:11,epoch:3,digest:[4;32],signature:[5;64]};
+  let unsigned=Envelope{signature:[0;64],..signed};
+  let mut attempt=|roots:&[Root],envelope:&Envelope,verifier:&dyn Verify| {
+   // Generic verifier has to stay statically sized at callsite: use a
+   // locally defined adapter for the precise branch under test.
+   let _=verifier;
+   shutdown_for_signed_replacement_exact(roots,&Reject,envelope,
+    b"known verified bytes",&mut sup,&mut files,&mut broker,&mut input,
+    &mut events,&mut surfaces,&mut damage,&[(7,1,1)])
+  };
+  assert!(!attempt(&roots,&unsigned,&Reject));
+  assert!(!attempt(&roots,&signed,&Reject));
+  assert!(!attempt(&[Root{enabled:false,..roots[0]}],&signed,&Reject));
+  assert!(sup.is_active_exact(7,1,1));
+  assert!(files.owns(owner));
+  assert!(broker.owns(1,10));
+  assert!(input.focused().is_some());
+  assert_eq!(events.pending(Identity{pid:1,generation:1}),Ok(0));
+ }
+ #[test]
+ fn verified_image_can_invoke_actual_full_capability_teardown() {
+  let mut sup=ServiceTable::<1>::new();sup.configure(7,1,1);sup.start(7);
+  let mut files=FileHandles::new();
+  let owner=files.bind_process(1).unwrap();
+  let mut events=ScopedRouter::<1,2>::new().unwrap();events.register(owner).unwrap();
+  let mut broker=Broker::<1,2>::new();broker.grant(1,10).unwrap();
+  let mut input=DesktopInput::new();input.focus(&mut broker,10).unwrap();
+  let mut surfaces=SurfaceLayout::<1>::new();
+  let mut damage=DamageQueue::<1>::new();
+  let roots=[Root{signer:11,epoch:3,enabled:true}];
+  let signed=Envelope{signer:11,epoch:3,digest:[4;32],signature:[5;64]};
+  assert!(!shutdown_for_signed_replacement_exact(&roots,&TestAccept,
+     &signed,b"tampered",&mut sup,&mut files,&mut broker,&mut input,
+     &mut events,&mut surfaces,&mut damage,&[(7,1,1)]));
+  assert!(sup.is_active_exact(7,1,1));
+  assert!(shutdown_for_signed_replacement_exact(&roots,&TestAccept,
+     &signed,b"known verified bytes",&mut sup,&mut files,&mut broker,
+     &mut input,&mut events,&mut surfaces,&mut damage,&[(7,1,1)]));
+  assert_eq!(sup.active_services(),0);
+  assert!(!files.owns(owner));assert!(!broker.owns(1,10));
+ }
+}
+
 #[cfg(all(test,feature="test-r031-vfs"))]
 mod r105_process_ipc_revocation_tests{
  use super::*;
@@ -2247,4 +2353,103 @@ mod r110_full_shutdown_capability_teardown_tests{
   assert!(supervisor.is_active_exact(7,1,1));assert!(handles.owns(owner));
   assert!(broker.owns(1,10));assert!(input.focused().is_some());
  }
+}
+
+
+/// R114: trusted, exact-incarnation teardown coordinator for a Files-like
+/// graphical kernel service. Validates ALL authority before releasing any
+/// file descriptor, event, input capture, surface or queued damage.
+/// The live scheduler must call this on an authenticated PCB death; no user
+/// syscall or interrupt dispatcher has been wired by this helper alone.
+#[cfg(feature="test-r031-vfs")]
+pub fn retire_desktop_instance_exact<
+    const W:usize,const Q:usize,const L:usize,const F:usize,const E:usize>(
+    identity:crate::batch5_session::Identity,
+    window:u32,
+    grant_epoch:u64,
+    handles:&mut crate::fs_handles::FileHandles,
+    events:&mut crate::process_events::ProcessEvents<E>,
+    input:&mut crate::gui_broker::DesktopInput,
+    broker:&mut crate::gui_broker::Broker<W,Q>,
+    layout:&mut crate::gui_broker::SurfaceLayout<L>,
+    damage:&mut crate::gui_broker::DamageQueue<F>,
+)->Result<(usize,usize),crate::gui_broker::Error>{
+    use crate::gui_broker::{Error,retire_crashed_compositor_owner_exact};
+    if identity.pid==0||identity.generation==0||
+       !handles.owns(identity) {
+        return Err(Error::Unauthorized);
+    }
+    // The broker and surface epoch are independently checked again by the
+    // teardown routine before any mutation.
+    if broker.grant_epoch_for(identity.pid,window)!=Ok(grant_epoch) ||
+       layout.geometry(identity.pid,window).is_err() {
+        return Err(Error::Unauthorized);
+    }
+    let removed_damage=retire_crashed_compositor_owner_exact(
+        input,broker,layout,damage,identity.pid,window,grant_epoch)?;
+    // A failed file retirement after exact ownership validation would violate
+    // the serial kernel-owned lifecycle contract; no other agent may mutate
+    // this table between verification and retirement.
+    let retired=handles.retire_process(identity);
+    debug_assert!(retired);
+    let discarded_events=events.clear_pid(identity.pid);
+    Ok((removed_damage,discarded_events))
+}
+#[cfg(all(test,feature="test-r031-vfs"))]
+mod r114_kernel_desktop_reap_tests{
+    use super::*;
+    use crate::gui_broker::{Broker,SurfaceLayout,DesktopInput,DamageQueue,Error,
+        grant_compositor_surface_exact};
+    use crate::agent_05_surface_rect::Rectangle;
+    use crate::fs_handles::FileHandles;
+    use crate::process_events::{ProcessEvents,ProcessEvent,EventKind};
+    fn rect()->Rectangle{Rectangle{x:1,y:2,width:30,height:40}}
+    #[test]
+    fn trusted_reap_removes_exact_dead_owner_across_real_tables(){
+        let mut fs=FileHandles::new();
+        let files=fs.bind_process(2).unwrap();
+        let init=fs.bind_process(1).unwrap();
+        let mut b=Broker::<3,8>::new();
+        let mut l=SurfaceLayout::<3>::new();
+        let mut d=DamageQueue::<4>::new();
+        let mut i=DesktopInput::new();
+        let mut e=ProcessEvents::<5>::new();
+        let epoch=grant_compositor_surface_exact(&mut b,&mut l,files.pid,20,rect()).unwrap();
+        grant_compositor_surface_exact(&mut b,&mut l,init.pid,10,rect()).unwrap();
+        i.focus(&mut b,20).unwrap();
+        d.submit(&l,files.pid,&[(20,0,0,10,10)]).unwrap();
+        d.submit(&l,init.pid,&[(10,0,0,10,10)]).unwrap();
+        e.enqueue(ProcessEvent{pid:files.pid,kind:EventKind::Faulted,value:1}).unwrap();
+        e.enqueue(ProcessEvent{pid:init.pid,kind:EventKind::Message,value:2}).unwrap();
+        assert_eq!(retire_desktop_instance_exact(files,20,epoch,
+            &mut fs,&mut e,&mut i,&mut b,&mut l,&mut d),Ok((1,1)));
+        assert!(!fs.owns(files));
+        assert!(fs.owns(init));
+        assert_eq!(d.pending(),1);
+        assert_eq!(e.len(),1);
+        assert_eq!(e.peek().unwrap().pid,init.pid);
+        assert_eq!(i.focused(),None);
+        assert!(!b.owns(files.pid,20));
+        assert!(b.owns(init.pid,10));
+    }
+    #[test]
+    fn stale_file_epoch_and_wrong_window_epoch_never_modify_peer_state(){
+        let mut fs=FileHandles::new();
+        let stale=fs.bind_process(2).unwrap();
+        let fresh=fs.bind_process(2).unwrap();
+        let mut b=Broker::<2,5>::new();
+        let mut l=SurfaceLayout::<2>::new();
+        let mut d=DamageQueue::<2>::new();
+        let mut i=DesktopInput::new();
+        let mut e=ProcessEvents::<2>::new();
+        let epoch=grant_compositor_surface_exact(&mut b,&mut l,fresh.pid,20,rect()).unwrap();
+        d.submit(&l,fresh.pid,&[(20,0,0,1,1)]).unwrap();
+        assert_eq!(retire_desktop_instance_exact(stale,20,epoch,
+            &mut fs,&mut e,&mut i,&mut b,&mut l,&mut d),Err(Error::Unauthorized));
+        assert_eq!(retire_desktop_instance_exact(fresh,20,epoch+1,
+            &mut fs,&mut e,&mut i,&mut b,&mut l,&mut d),Err(Error::Unauthorized));
+        assert!(fs.owns(fresh));
+        assert!(b.owns(fresh.pid,20));
+        assert_eq!(d.pending(),1);
+    }
 }

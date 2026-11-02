@@ -1,5 +1,13 @@
 name: Verify R028 virtio networking in QEMU
 on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'rust/kernel_core/src/network.rs'
+      - 'rust/kernel_core/src/agent_06_ipv4_route.rs'
+      - 'rust/kernel_core/src/virtio_net.rs'
+      - 'tools/test_r028_network_qemu.py'
+      - '.github/workflows/verify-r028-network.yml'
   push:
     branches: [agentx-r028-complete-20261023]
   workflow_dispatch:

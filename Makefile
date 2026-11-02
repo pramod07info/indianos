@@ -22,6 +22,8 @@ R015_ATA_TEST ?= 0
 R027_DURABLE_TEST ?= 0
 # Explicit single-core QEMU virtio-net network smoke; disabled ordinarily.
 R028_NETWORK_TEST ?= 0
+# Only QEMU fixture; refuses all disks except exact disposable 64-sector image.
+R114_EPOCH_TEST ?= 0
 # Real QEMU Orbit UI only; zero changes to default boot.
 ORBIT_UI_PREVIEW ?= 0
 ifeq ($(ORBIT_UI_PREVIEW),1)
@@ -197,7 +199,7 @@ RUST_FEATURES += $(if $(filter 1,$(EXCEPTION_SELFTEST)),--features test-ud2,) \
  $(if $(filter 1,$(PAGING_SWITCH_SELFTEST)),--features test-shadow,) \
  $(if $(filter 1,$(USERMODE_SELFTEST)),--features test-ring3,) \
  $(if $(filter 1,$(PROCESS_SELFTEST)),--features test-processes,) \
- $(if $(filter 1,$(SCHEDULER_SELFTEST)),--features test-scheduler,) $(if $(filter 1,$(R013_SHELL_TEST)),--features test-shell,) $(if $(filter 1,$(R014_INTERACTIVE_TEST)),--features test-interactive,) $(if $(filter 1,$(R014_IRQ_TEST)),--features test-irq-keyboard,) $(if $(filter 1,$(R015_ATA_TEST)),--features test-ata-disk,) $(if $(filter 1,$(R027_DURABLE_TEST)),--features test-r027-durable,) $(if $(filter 1,$(R028_NETWORK_TEST)),--features test-r028-network,) $(if $(filter 1,$(ORBIT_UI_PREVIEW)),--features orbit-ui-preview,) $(if $(filter 1,$(R029_DESKTOP_TEST)),--features test-r029-desktop,) $(if $(filter 1,$(R029_USERSPACE_TEST)),--features test-r029-userspace,) $(if $(filter 1,$(R029_PHYSICAL_TEST)),--features test-r029-physical-events,) $(if $(filter 1,$(R029_MULTIPROCESS_TEST)),--features test-r029-multiprocess,) $(if $(filter 1,$(R029_FRAME_SERVER_TEST)),--features test-r029-frame-server,) $(if $(filter 1,$(R029_DESKTOP_SUITE_TEST)),--features test-r029-desktop-suite,) $(if $(filter 1,$(R031_BOOT_DESKTOP_TEST)),--features test-r031-boot-desktop,) $(if $(filter 1,$(R031_SUPERVISOR_TEST)),--features test-r031-supervisor,) $(if $(filter 1,$(R031_FILES_GUI_TEST)),--features test-r031-files-gui,) $(if $(filter 1,$(R030_ONDEVICE_TEST)),--features test-r030-ondevice,) $(if $(filter 1,$(R031_VFS_TEST)),--features test-r031-vfs,) $(if $(filter 1,$(M2_DISK_EXEC_TEST)),--features test-m2-disk-exec,) $(if $(filter 1,$(R026_INTERACTIVE_TEST)),--features test-r026,) $(if $(filter 1,$(R025_COMPLETE_TEST)),--features test-r025,) $(if $(filter 1,$(R025_IPC_TEST)),--features test-ipc,)
+ $(if $(filter 1,$(SCHEDULER_SELFTEST)),--features test-scheduler,) $(if $(filter 1,$(R013_SHELL_TEST)),--features test-shell,) $(if $(filter 1,$(R014_INTERACTIVE_TEST)),--features test-interactive,) $(if $(filter 1,$(R014_IRQ_TEST)),--features test-irq-keyboard,) $(if $(filter 1,$(R015_ATA_TEST)),--features test-ata-disk,) $(if $(filter 1,$(R027_DURABLE_TEST)),--features test-r027-durable,) $(if $(filter 1,$(R028_NETWORK_TEST)),--features test-r028-network,) $(if $(filter 1,$(R114_EPOCH_TEST)),--features test-r114-epoch,) $(if $(filter 1,$(ORBIT_UI_PREVIEW)),--features orbit-ui-preview,) $(if $(filter 1,$(R029_DESKTOP_TEST)),--features test-r029-desktop,) $(if $(filter 1,$(R029_USERSPACE_TEST)),--features test-r029-userspace,) $(if $(filter 1,$(R029_PHYSICAL_TEST)),--features test-r029-physical-events,) $(if $(filter 1,$(R029_MULTIPROCESS_TEST)),--features test-r029-multiprocess,) $(if $(filter 1,$(R029_FRAME_SERVER_TEST)),--features test-r029-frame-server,) $(if $(filter 1,$(R029_DESKTOP_SUITE_TEST)),--features test-r029-desktop-suite,) $(if $(filter 1,$(R031_BOOT_DESKTOP_TEST)),--features test-r031-boot-desktop,) $(if $(filter 1,$(R031_SUPERVISOR_TEST)),--features test-r031-supervisor,) $(if $(filter 1,$(R031_FILES_GUI_TEST)),--features test-r031-files-gui,) $(if $(filter 1,$(R030_ONDEVICE_TEST)),--features test-r030-ondevice,) $(if $(filter 1,$(R031_VFS_TEST)),--features test-r031-vfs,) $(if $(filter 1,$(M2_DISK_EXEC_TEST)),--features test-m2-disk-exec,) $(if $(filter 1,$(R026_INTERACTIVE_TEST)),--features test-r026,) $(if $(filter 1,$(R025_COMPLETE_TEST)),--features test-r025,) $(if $(filter 1,$(R025_IPC_TEST)),--features test-ipc,)
 ifeq ($(USERFAULT_SELFTEST),1)
 RUST_FEATURES += $(if $(filter guard,$(USERFAULT_KIND)),--features test-fault-guard,--features test-fault-supervisor)
 endif
@@ -1186,3 +1188,8 @@ test-normal-init-host:
 test-normal-init-qemu:
 	$(MAKE) image BUILD=build/normal-init RUST_CORE=1
 	python3 tools/test_normal_init_qemu.py --iso build/normal-init/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)"
+
+.PHONY: test-r114-epoch-qemu
+test-r114-epoch-qemu:
+	$(MAKE) image BUILD=build/r114-epoch RUST_CORE=1 R114_EPOCH_TEST=1
+	python3 tools/test_r114_epoch_qemu.py --iso build/r114-epoch/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)"
