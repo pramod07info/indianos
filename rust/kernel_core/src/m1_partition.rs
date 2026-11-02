@@ -426,7 +426,20 @@ fn receipt_shape_preflight<D:BlockDevice>(
 )->Result<(),MountError>{
  let partition=expected.partition;
  let index_valid=match partition.scheme{
-  Scheme::Mbr=>partition.index<4 && expected.gpt.is_none(),
+  Scheme::Mbr=>{
+    // Cross-validate the PINNED metadata before any I/O: a forged receipt
+    // with a superficially plausible LBA range is not a partition identity.
+    if partition.index>=4 || expected.gpt.is_some() ||
+       expected.table_crc32!=crc(&expected.mbr_sector){
+      false
+    }else{
+      let offset=446+16*partition.index as usize;
+      let entry=&expected.mbr_sector[offset..offset+16];
+      entry[4]!=0 && !matches!(entry[4],0x05|0x0f|0x85|0xee) &&
+       le32(&entry[8..12]) as u64==partition.start &&
+       le32(&entry[12..16]) as u64==partition.sectors
+    }
+  },
   Scheme::Gpt=>partition.index<MAX_GPT_ENTRIES as u32 &&
      expected.gpt.is_some_and(|selection|
        selection.partition==partition),
@@ -654,8 +667,13 @@ mod m1_partition_tests{
   wrong_scheme.partition.scheme=Scheme::Gpt;
   let mut swapped=receipt;
   swapped.device_sectors+=1;
+  let mut forged_crc=receipt;
+  forged_crc.table_crc32^=1;
+  let mut forged_identity=receipt;
+  forged_identity.partition.start+=1;
   let mut watch=Counting{inner:&mut d,reads:0};
-  for bad in [variant,invalid,signature,wrong_scheme,swapped]{
+  for bad in [variant,invalid,signature,wrong_scheme,swapped,
+              forged_crc,forged_identity]{
    assert!(mount_partition_receipt_healthy(&mut watch,bad).is_err());
    assert!(probe_selected_receipt_readonly(&mut watch,bad).is_err());
   }

@@ -225,3 +225,6 @@ A new host regression exercises 32 deterministic three-process sessions crossing
 
 ### Full MBR/GPT selected-mount receipt preflight
 The production `mount_partition_receipt_healthy` and read-only diagnostic path now reject invalid pinned parent capacity, partition bounds/index/scheme/MBR signature before any sector read. The complete two-pass on-disk GPT/MBR validation remains mandatory afterward. A regression counts zero reads on invalid receipts. This is not physical concurrent disk mutation or SMP qualification.
+
+### Pinned MBR identity proof preflight
+The selected-mount preflight now compares the originally selected MBR partition index/LBA/length with the embedded MBR entry and validates its complete pinned sector CRC before reading disk. This is followed by mandatory fresh on-disk identity checks. A forged CRC or a conflicting but in-range LBA receipt is rejected with zero sector I/O. GPT still uses pinned GUID/geometry binding followed by mandatory on-disk table verification; this is **not** a physical disk lock.
