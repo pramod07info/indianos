@@ -99,6 +99,53 @@ def main():
             newer,older,prev=(a0,a1,p0) if e0>e1 else (a1,a0,p1)
             assert prev==hashlib.sha256(older).digest()
             print(f"R114 actual OVMF cold boot {epoch-1}: persisted epoch {epoch}")
+        # R116 real OVMF recovery matrix on one disposable, geometry-locked
+        # disk; a controlled two-copy media mutation is not an actual power
+        # cut and must not be reported as a physical durability qualification.
+        stable=disk.read_bytes()
+        assert len(stable)==SIZE*512
+        sectors=[
+            stable[START*512:(START+1)*512],
+            stable[(START+1)*512:(START+2)*512],
+        ]
+        epochs=[decode(s)[0] for s in sectors]
+        latest=0 if epochs[0]>epochs[1] else 1
+        older=1-latest
+        assert sorted(epochs)==[3,4]
+
+        # One damaged latest copy: kernel must recover from the retained old
+        # journal and write epoch 4 without modifying any other disk region.
+        recovered=bytearray(stable)
+        recovered[(START+latest)*512+104]^=0x31
+        disk.write_bytes(recovered)
+        boot(a.qemu,a.iso.resolve(),a.ovmf.resolve(),disk)
+        image=disk.read_bytes()
+        assert image[:START*512]==stable[:START*512]
+        assert image[(START+2)*512:]==stable[(START+2)*512:]
+        restored=[decode(image[(START+i)*512:(START+i+1)*512])[0]
+                  for i in (0,1)]
+        assert sorted(restored)==[3,4],restored
+        print("R116 OVMF single-copy journal tear recovery PASSED")
+
+        # Negative controls must fail before journal mutation. Each case
+        # replaces the older sector with a checksum-valid but semantically
+        # contradictory record while keeping the newest real epoch intact.
+        for name,forged in (
+            ("forged predecessor",record(5,bytes([0x99])*32)),
+            ("skipped epoch",record(10,hashlib.sha256(sectors[latest]).digest())),
+            ("divergent epoch",record(4,bytes([0x25])*32)),
+        ):
+            image=bytearray(stable)
+            at=(START+older)*512
+            image[at:at+512]=forged
+            disk.write_bytes(image)
+            control=disk.read_bytes()
+            boot(a.qemu,a.iso.resolve(),a.ovmf.resolve(),disk,negative=True)
+            assert disk.read_bytes()==control,(
+                f"{name} denial modified the disposable journal")
+            print(f"R116 OVMF {name} denial PASSED")
+        # Preserve the original both-invalid negative control.
+        disk.write_bytes(stable)
         corrupt=bytearray(disk.read_bytes())
         corrupt[START*512+104]^=0x3c
         corrupt[(START+1)*512+104]^=0x5a
@@ -107,5 +154,6 @@ def main():
         boot(a.qemu,a.iso.resolve(),a.ovmf.resolve(),disk,negative=True)
         assert disk.read_bytes()==control,"corrupt epoch negative-control mutated disk"
     print("R114 PASS: three actual OVMF epoch advances and corruption denial")
+    print("R116 PASS: single-copy recovery, forged-chain, skipped-epoch and divergent-copy OVMF matrix")
 if __name__=="__main__":
     main()

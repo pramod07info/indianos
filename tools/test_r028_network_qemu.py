@@ -30,6 +30,7 @@ MARKERS=(
     "IndianOS: R028 Ethernet ARP peer resolved",
     "IndianOS: R028 IPv4 ICMP echo ping PASSED",
     "IndianOS: R114 QEMU primary UDP path timed out and backup route selected",
+    "IndianOS: R116 QEMU DHCP lease expiry blocked primary UDP resend and backup succeeded",
     "IndianOS: R028 IPv4 UDP echo PASSED",
     "IndianOS: R028 UDP DNS A query indianos.test PASSED",
     "IndianOS: M2 live NIC IPv4/UDP DNS verifier PASSED",

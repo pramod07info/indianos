@@ -310,3 +310,94 @@ mod r115_boot_observation_tests {
             Err(Error::Stale));
     }
 }
+
+
+/// R116: a previously sealed minimum epoch and signed slot version may
+/// restrict a new trusted boot observation. The caller must obtain these
+/// floors from authenticated rollback-resistant storage, not the journal
+/// that is being examined. A host fixture is NOT a production trust root.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct SealedBootFloor {
+ pub minimum_epoch:u64,
+ pub minimum_journal_generation:u64,
+ pub expected_slot:u8,
+ pub minimum_slot_version:u64,
+ pub expected_measurement:[u8;32],
+}
+pub fn observe_with_sealed_floor<D:BlockDevice,T:TrustedBootMeasurement>(
+ disk:&mut D,trust:&T,floor:SealedBootFloor,
+)->Result<EpochRecord,Error>{
+ if floor.minimum_epoch==0||floor.minimum_journal_generation==0||
+    floor.minimum_slot_version==0||floor.expected_slot>1||
+    floor.expected_measurement==[0;32]{return Err(Error::Invalid)}
+ let r=observe_verified_epoch(disk,trust)?;
+ if r.epoch<floor.minimum_epoch||
+    r.journal_generation<floor.minimum_journal_generation||
+    r.slot_version<floor.minimum_slot_version||
+    r.selected_slot!=floor.expected_slot||
+    r.boot_measurement!=floor.expected_measurement{
+  return Err(Error::Stale)
+ }
+ Ok(r)
+}
+#[cfg(test)]
+mod r116_rollback_floor_tests{
+ use super::*;
+ fn floor()->SealedBootFloor {
+  SealedBootFloor{minimum_epoch:4,minimum_journal_generation:20,
+   expected_slot:0,minimum_slot_version:9,expected_measurement:[3;32]}
+ }
+ #[test]fn valid_sealed_floor_does_not_touch_disk(){
+  let mut disk=tests::fixture();let before=disk.writes;
+  let record=observe_with_sealed_floor(&mut disk,&tests::Trusted([3;32]),
+     floor()).unwrap();
+  assert_eq!(record.epoch,4);
+  assert_eq!(disk.writes,before);
+ }
+ #[test]fn rollback_floor_mismatch_is_never_authority(){
+  let mut disk=tests::fixture();
+  let p=floor();
+  for bad in [
+   SealedBootFloor{minimum_epoch:5,..p},
+   SealedBootFloor{minimum_journal_generation:21,..p},
+   SealedBootFloor{expected_slot:1,..p},
+   SealedBootFloor{minimum_slot_version:10,..p},
+   SealedBootFloor{expected_measurement:[4;32],..p},
+  ]{
+   assert_eq!(observe_with_sealed_floor(
+       &mut disk,&tests::Trusted([3;32]),bad),Err(Error::Stale));
+  }
+  assert_eq!(disk.writes,0);
+ }
+ #[test]fn zero_floors_and_untrusted_measurement_fail_closed(){
+  let mut disk=tests::fixture();let p=floor();
+  for bad in [
+   SealedBootFloor{minimum_epoch:0,..p},
+   SealedBootFloor{minimum_journal_generation:0,..p},
+   SealedBootFloor{minimum_slot_version:0,..p},
+   SealedBootFloor{expected_slot:2,..p},
+   SealedBootFloor{expected_measurement:[0;32],..p},
+  ]{
+   assert_eq!(observe_with_sealed_floor(
+       &mut disk,&tests::Trusted([3;32]),bad),Err(Error::Invalid));
+  }
+  assert_eq!(observe_with_sealed_floor(
+       &mut disk,&tests::Trusted([0;32]),p),Err(Error::Untrusted));
+  assert_eq!(disk.writes,0);
+ }
+ #[test]fn forged_digest_and_divergent_epoch_copies_fail(){
+  let mut disk=tests::fixture();
+  let mut forged=decode(&disk.sectors[1]).unwrap();
+  forged.epoch+=1;forged.preceding_digest=[9;32];
+  disk.sectors[1]=encode(forged).unwrap();
+  assert_eq!(observe_with_sealed_floor(
+      &mut disk,&tests::Trusted([3;32]),floor()),Err(Error::Invalid));
+  assert_eq!(disk.writes,0);
+  let mut disk=tests::fixture();
+  let mut divergent=decode(&disk.sectors[1]).unwrap();
+  divergent.slot_version=10;
+  disk.sectors[1]=encode(divergent).unwrap();
+  assert_eq!(observe_with_sealed_floor(
+      &mut disk,&tests::Trusted([3;32]),floor()),Err(Error::Invalid));
+ }
+}
