@@ -3219,3 +3219,48 @@ mod r117_selected_volume_guard_tests {
             table.selected_operation_guard(current).unwrap()));
     }
 }
+
+#[cfg(test)]
+mod r119_inherited_mount_authority_regressions{
+ use super::*;
+ #[test]
+ fn mount_revision_replacement_revokes_old_alias_and_operation_guard(){
+  let mut t=FileHandles::new();
+  let init=t.bind_process(1).unwrap();
+  let guest=t.bind_process(2).unwrap();
+  let old_guard=t.selected_operation_guard(guest).unwrap();
+  let old_alias=t.mount_alias_for_current_root_kernel(guest).unwrap();
+  assert!(t.mount_alias_allows(old_alias,guest,"/shared/note"));
+  t.volume_revision=t.volume_revision.checked_add(1).unwrap();
+  assert!(!t.selected_operation_guard_is_current(old_guard));
+  assert!(!t.mount_alias_allows(old_alias,guest,"/shared/note"));
+  let new_guard=t.selected_operation_guard(guest).unwrap();
+  let new_alias=t.mount_alias_for_current_root_kernel(guest).unwrap();
+  assert!(t.selected_operation_guard_is_current(new_guard));
+  assert!(t.mount_alias_allows(new_alias,guest,"/shared/note"));
+  assert!(t.owns(init));
+ }
+ #[test]
+ fn root_revision_and_pid_incarnation_reject_old_lookup_receipts(){
+  let mut t=FileHandles::new();
+  let original=t.bind_process(2).unwrap();
+  let lookup=t.selected_operation_guard(original).unwrap();
+  let alias=t.mount_alias_for_current_root_kernel(original).unwrap();
+  t.narrow_root_kernel(original,"/shared/docs").unwrap();
+  assert!(!t.selected_operation_guard_is_current(lookup));
+  assert!(!t.mount_alias_allows(alias,original,"/shared/docs/a"));
+  let after=t.selected_operation_guard(original).unwrap();
+  let replacement=t.bind_process(2).unwrap();
+  assert!(!t.selected_operation_guard_is_current(after));
+  assert!(!t.mount_alias_allows(alias,replacement,"/shared/docs/a"));
+ }
+ #[test]
+ fn selected_volume_quarantine_blocks_authority_before_probe(){
+  let mut t=FileHandles::new();
+  let p=t.bind_process(1).unwrap();
+  let guard=t.selected_operation_guard(p).unwrap();
+  t.selected_quarantined=true;
+  assert!(!t.selected_operation_guard_is_current(guard));
+  assert_eq!(t.selected_operation_guard(p),Err(FsError::InvalidVolume));
+ }
+}

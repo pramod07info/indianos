@@ -273,3 +273,23 @@ mod r115_atomic_udp_release_tests {
         assert_eq!(one.active_count(), 1);
     }
 }
+
+#[cfg(test)]
+mod r119_inherited_port_generation_regressions{
+ use super::*;
+ #[test]
+ fn delayed_retirement_cannot_revoke_new_generation_owner(){
+  let mut r=Registry::<3>::new();
+  r.bind(2,41,5300).unwrap();
+  assert!(r.has_foreign_generation(2,40));
+  assert!(!r.has_foreign_generation(2,41));
+  assert_eq!(r.revoke_owner(2,40),Ok(0));
+  assert_eq!(r.authorize(2,41,5300),Ok(()));
+  r.revoke_owner(2,41).unwrap();
+  r.bind(2,42,5300).unwrap();
+  assert_eq!(r.authorize(2,41,5300),Err(Error::Denied));
+  assert!(r.has_foreign_generation(2,41));
+  assert_eq!(r.revoke_owner(2,41),Ok(0));
+  assert_eq!(r.authorize(2,42,5300),Ok(()));
+ }
+}

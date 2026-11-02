@@ -191,3 +191,6 @@ Cohort: R118-019, R118-025, R118-026, R118-027, R118-028, R118-040, R118-041, R1
 
 ## Six commits / cohort 3 — test and release evidence
 Cohort: R118-056, R118-062, R118-063, R118-064, R118-065, R118-066, R118-067, R118-068, R118-069, R118-070. Added a standard-library Python exact-head read-only GitHub checker and hardware-vs-QEMU acceptance matrix. R118-069 is documentation-complete; other cohort items remain OPEN until evidence exists, including all hardware and protected-release gates.
+
+## Six commits / cohort 4 — inherited R117 hardware readiness
+Cohort: R118-071, R118-072, R118-073, R118-074, R118-075, R118-076, R118-077, R118-078, R118-079, R118-080. Added cooperative mount/namespace/reused-PID and UDP generation regressions plus physical qualification matrix. None of the ten inherited hardware and multi-core requirements is fully validated; all remain OPEN.
