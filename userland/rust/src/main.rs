@@ -952,6 +952,12 @@ fn r031_shell()->!{
         let mut received=[0u8;64];
         let n=local_udp(3,1,5501,0,received.as_mut_ptr() as u64,64);
         if n!=4||&received[..4]!=b"PING"{exit(232);}
+        // R117 actual ring-3 two-process denial. PID1 cannot close PID2's
+        // bound port by claiming PID2's identity, nor by substituting a
+        // foreign source port while claiming itself. PONG must still arrive.
+        if local_udp(4,2,5502,0,0,0)!=u64::MAX{exit(239);}
+        if local_udp(4,1,5502,0,0,0)!=u64::MAX{exit(240);}
+        write(b"R117 QEMU PID1 foreign PID2 UDP close attempts denied");
         local_send(1,5501,5502,b"PONG");
         write(b"R114 PID1 received PID2 UDP PING and replied");
         // Cooperative scheduler: give the peer a real dispatch opportunity
@@ -1090,6 +1096,11 @@ fn r031_files()->!{
         if local_udp(1,2,5501,0,0,0)!=u64::MAX{exit(234);}
         local_send(2,5502,5501,b"PING");
         write(b"R114 PID2 forged UDP owner and source port denied");
+        // A live PID1 port exists here. A forged PID1 close, or an
+        // authenticated PID2 request naming PID1's port, must not evict it.
+        if local_udp(4,1,5501,0,0,0)!=u64::MAX{exit(241);}
+        if local_udp(4,2,5501,0,0,0)!=u64::MAX{exit(242);}
+        write(b"R117 QEMU PID2 foreign PID1 UDP close attempts denied");
     }
     suite_send(1,b"FILES");
     write(b"R031.1 Files service registered and running");

@@ -67,6 +67,8 @@ def boot(qemu:str,iso:Path,ovmf:Path,disk:Path,folder:Path,index:int):
         session.until("R031.9 real file and directory contents rendered into Files window",15)
         session.until("R114 PID1 ring3 forged UDP owner denied",15)
         session.until("R114 PID2 forged UDP owner and source port denied",15)
+        session.until("R117 QEMU PID2 foreign PID1 UDP close attempts denied",15)
+        session.until("R117 QEMU PID1 foreign PID2 UDP close attempts denied",15)
         session.until("R114 PID1 received PID2 UDP PING and replied",15)
         session.until("R114 PID2 received isolated UDP PONG from PID1",15)
         session.until("R114 Terminal PID3 denied direct Files handles and directory syscall",15)
