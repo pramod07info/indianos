@@ -108,6 +108,21 @@ fn wait_status(require_data:bool)->Result<(),BlockError>{
     Err(BlockError::Io)
 }
 fn ready()->Result<(),BlockError>{wait_status(true)}
+/// Read all PIO words into private stack storage. A controller that fails
+/// its final status check must not leave a half-read sector in caller memory.
+/// This is invoked by the real hardware read path and is testable without
+/// touching privileged I/O ports on the host.
+fn read_words_staged<R,F>(out:&mut[u8;SECTOR_BYTES],
+    mut read_word:R,finish:F)->Result<(),BlockError>
+where R:FnMut()->u16,F:FnOnce()->Result<(),BlockError>{
+    let mut staged=[0u8;SECTOR_BYTES];
+    for pair in staged.chunks_exact_mut(2){
+        pair.copy_from_slice(&read_word().to_le_bytes());
+    }
+    finish()?;
+    out.copy_from_slice(&staged);
+    Ok(())
+}
 /// Wait for a PIO transfer or FLUSH CACHE to finish, requiring DRQ clear.
 fn complete()->Result<(),BlockError>{wait_status(false)}
 /// Optional IDENTIFY words use bit 14 set and bit 15 clear as their
@@ -197,14 +212,13 @@ impl BlockDevice for AtaPio {
     fn read_sector(&mut self,lba:u64,out:&mut [u8;SECTOR_BYTES])->Result<(),BlockError>{
         self.select(lba,0x20)?;
         self.last_stage=AtaStage::ReadWords;
-        for pair in out.chunks_exact_mut(2){
-            let value=unsafe{inw(DATA)}.to_le_bytes();
-            pair.copy_from_slice(&value);
-        }
         // All 256 words must be consumed and DRQ deasserted before
-        // issuing the next command (especially WRITE SECTORS).
-        self.last_stage=AtaStage::ReadDone;
-        complete()?;
+        // publishing bytes or issuing the next command.
+        let last_stage=&mut self.last_stage;
+        read_words_staged(out,||unsafe{inw(DATA)},||{
+            *last_stage=AtaStage::ReadDone;
+            complete()
+        })?;
         self.last_stage=AtaStage::Idle;
         Ok(())
     }
@@ -220,8 +234,15 @@ impl BlockDevice for AtaPio {
         // Do not issue FLUSH while the drive still has DRQ asserted.
         self.last_stage=AtaStage::WriteDone;
         complete()?;
+        self.sync()
+    }
+    fn sync(&mut self)->Result<(),BlockError>{
+        // Physical ATA FLUSH CACHE is an explicit durability barrier; do
+        // not acknowledge filesystem fsync before the controller completes.
+        self.last_stage=AtaStage::WaitIdle;
+        complete()?;
         self.last_stage=AtaStage::FlushCommand;
-        unsafe{outb(STATUS,0xe7);} // FLUSH CACHE (ATA command)
+        unsafe{outb(STATUS,0xe7);} // ATA FLUSH CACHE
         settle();
         self.last_stage=AtaStage::FlushDone;
         complete()?;
@@ -232,6 +253,30 @@ impl BlockDevice for AtaPio {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn m1_r088_staged_pio_read_exposes_no_bytes_on_completion_error(){
+        let mut out=[0xa5;SECTOR_BYTES];
+        let mut words=0u16;
+        assert_eq!(read_words_staged(&mut out,||{
+            words+=1;0x1234
+        },||Err(BlockError::Io)),Err(BlockError::Io));
+        assert_eq!(words,256); // Drain full sector before final status.
+        assert_eq!(out,[0xa5;SECTOR_BYTES]);
+    }
+    #[test]
+    fn m1_r088_staged_pio_read_publishes_full_little_endian_sector(){
+        let mut out=[0xa5;SECTOR_BYTES];
+        let mut words=0u16;
+        assert_eq!(read_words_staged(&mut out,||{
+            words+=1;
+            if words%2==0{0x6655}else{0x4433}
+        },||Ok(())),Ok(()));
+        assert_eq!(words,256);
+        for (i,pair) in out.chunks_exact(2).enumerate(){
+            assert_eq!(pair,if i%2==0{&[0x33,0x44]}else{&[0x55,0x66]});
+        }
+    }
     #[test]
     fn identify_requires_lba_and_capacity(){
         let mut words=[0u16;256];

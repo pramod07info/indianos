@@ -43,7 +43,16 @@ impl InputLine{
  /// On crash/restart/exit erase all process-private command/clipboard bytes.
  pub fn forget(&mut self){
   self.reset();self.clipboard.fill(0);self.clipboard_len=0;
-  self.history.fill(None);self.history_len=0;
+  // Scrub stored successful commands before invalidating the slots.
+  // Assigning Option::None alone is not a data-eraser: stale command
+  // bytes may remain in the backing enum allocation.
+  for slot in &mut self.history{
+   if let Some(entry)=slot.as_mut(){
+    entry.bytes.fill(0);entry.len=0;
+   }
+   *slot=None;
+  }
+  self.history_len=0;
  }
  pub fn clear_line(&mut self){self.reset();}
  pub fn kill_line(&mut self)->Event{
@@ -2747,4 +2756,44 @@ mod r083_argument_tests{
         assert_eq!(line.argument_length(20),Err(Error::Invalid));
         assert_eq!(line.bytes(),b"run example");
     }
+}
+
+
+#[cfg(test)]
+mod m1_r089_security_teardown_tests{
+ use super::*;
+ #[test]fn history_and_clipboard_are_unreachable_after_process_forget(){
+  let mut line=InputLine::new();
+  let mut out=[0u8;MAX_LINE];
+  for &c in b"write /secret token"{line.feed(c,&mut out).unwrap();}
+  assert_eq!(line.feed(b'\n',&mut out),
+             Ok(Event::Submitted(b"write /secret token".len())));
+  line.set_line(b"draft sensitive").unwrap();
+  assert_eq!(line.copy_range(0,5),Ok(5));
+  assert_eq!(line.clipboard_bytes(),b"draft");
+  line.forget();
+  assert_eq!(line.history_count(),0);
+  assert_eq!(line.length(),0);
+  assert_eq!(line.clipboard_bytes(),b"");
+  assert!(line.clipboard.iter().all(|&x|x==0));
+  assert!(line.history_draft.iter().all(|&x|x==0));
+  assert!(line.history.iter().all(|s|s.is_none()));
+  assert_eq!(line.history_previous(),Err(Error::Invalid));
+  assert_eq!(line.paste_clipboard(),Ok(Event::Empty));
+ }
+ #[test]fn all_history_slots_are_cleared_on_exit_not_just_latest(){
+  let mut line=InputLine::new();
+  let mut output=[0u8;MAX_LINE];
+  for command in [b"alpha".as_slice(),b"beta",b"gamma",b"delta"]{
+   line.set_line(command).unwrap();
+   assert_eq!(line.feed(b'\n',&mut output),Ok(Event::Submitted(command.len())));
+  }
+  assert_eq!(line.history_count(),HISTORY_LIMIT);
+  line.forget();
+  assert_eq!(line.history_count(),0);
+  assert!(line.history.iter().all(|s|s.is_none()));
+  line.set_line(b"new session").unwrap();
+  assert_eq!(line.history_search_previous(b"alpha"),Err(Error::Invalid));
+  assert_eq!(line.bytes(),b"new session");
+ }
 }

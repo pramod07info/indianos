@@ -62,7 +62,7 @@ pub struct Desktop<D:BlockDevice,const P:usize,const E:usize,
  pub surface:Surfaces<Q>,
  pub input:InputLine,
  // Session-bound last successful command and the draft before recall.
- control_down:bool,
+ control_down:bool,control_right:bool,
  history:[u8;MAX_LINE],history_len:usize,
  // Fixed-size ring of eight fully scrubbed successful command revisions.
  history_ring:[[u8;MAX_LINE];HISTORY_DEPTH],
@@ -73,6 +73,7 @@ pub struct Desktop<D:BlockDevice,const P:usize,const E:usize,
  window:u32,
  // Authenticated PS/2 modifier state, reset on each desktop session.
  shift_left:bool,shift_right:bool,
+ caps_lock:bool,caps_pressed:bool,
  // Exactly one pending full-window damage is sufficient; more keystrokes
  // mutate the input model and the eventual draw observes the latest state.
  redraw_pending:bool,
@@ -84,12 +85,13 @@ impl<D:BlockDevice,const P:usize,const E:usize,const W:usize,
  pub fn from_mounted(volume:HierVfs<D>)->Self{
   Self{boot:Bootstrap::new(),rights:Access::new(),volume,
    surface:Surfaces::new(),input:InputLine::new(),owner:None,
-   control_down:false,history:[0;MAX_LINE],history_len:0,
+   control_down:false,control_right:false,history:[0;MAX_LINE],history_len:0,
    history_ring:[[0;MAX_LINE];HISTORY_DEPTH],
    history_sizes:[0;HISTORY_DEPTH],history_total:0,
    history_head:0,history_depth:0,
    draft:[0;MAX_LINE],draft_len:0,history_active:false,
-   window:0,shift_left:false,shift_right:false,redraw_pending:false}
+   window:0,shift_left:false,shift_right:false,
+   caps_lock:false,caps_pressed:false,redraw_pending:false}
  }
  pub fn start(&mut self,init:Identity,init_image:Launch,
   user:Identity,user_image:Launch,settings:Settings,
@@ -139,7 +141,8 @@ impl<D:BlockDevice,const P:usize,const E:usize,const W:usize,
   self.history_sizes=[0;HISTORY_DEPTH];
   self.history_total=0;self.history_head=0;self.history_depth=0;
   self.draft.fill(0);self.draft_len=0;self.history_active=false;
-  self.control_down=false;
+  self.control_down=false;self.control_right=false;
+  self.caps_lock=false;self.caps_pressed=false;
   self.input.forget();
  }
  /// Store successful commands only, deduplicating consecutive identical
@@ -288,19 +291,34 @@ impl<D:BlockDevice,const P:usize,const E:usize,const W:usize,
      event.focus.window!=self.window{return Err(Error::State);}
   // Set-1 extended key codes are represented as 0xE0xx by the trusted
   // kernel broker. Reject arbitrary high bits instead of masking data.
+  let extended=event.scan_code&0xff00==0xe000;
   let scan=if event.scan_code<=0xff{event.scan_code}
-   else if event.scan_code&0xff00==0xe000{event.scan_code&0xff}
+   else if extended{event.scan_code&0xff}
    else{return Err(Error::Keyboard(KeyError::Invalid));};
   match scan{
    0x2a=>{self.shift_left=event.pressed;return Ok(None);},
    0x36=>{self.shift_right=event.pressed;return Ok(None);},
-   0x1d=>{self.control_down=event.pressed;return Ok(None);},
+   // Typematic repeated Caps Lock make events must toggle only once.
+   // This is a per-session keyboard model; hardware LED control is
+   // a separate driver-qualification gate, not implicitly claimed.
+   0x3a if !extended=>{
+    if event.pressed&&!self.caps_pressed{self.caps_lock=!self.caps_lock;}
+    self.caps_pressed=event.pressed;
+    return Ok(None);
+   },
+   0x1d=>{
+    // Left/right Ctrl have independent physical make/break edges.
+    // Releasing only one must not drop a still-held other modifier.
+    if extended{self.control_right=event.pressed;}
+    else{self.control_down=event.pressed;}
+    return Ok(None);
+   },
    _=>{},
   }
   if !event.pressed{return Ok(None);}
   // No Ctrl+letter sequence may accidentally enter a character or execute
   // an unmodified shortcut. Only explicitly allowlisted commands apply.
-  if self.control_down{
+  if self.control_down||self.control_right{
    let result=match scan{
     0x16|0x25=>{self.input.kill_line();true}, // Ctrl+U/K
     0x11|0x0e=>{self.input.erase_word();true}, // Ctrl+W/Backspace
@@ -354,8 +372,14 @@ impl<D:BlockDevice,const P:usize,const E:usize,const W:usize,
    },
    _=>{},
   }
-  let ch=ascii_from_set1(scan,self.shift_left||self.shift_right)
+  let shifted=self.shift_left||self.shift_right;
+  let mut ch=ascii_from_set1(scan,shifted)
     .ok_or(Error::Keyboard(KeyError::Invalid))?;
+  // Caps Lock affects letters only; with Shift it reverses alphabetic
+  // casing while retaining Shift's digit and punctuation mapping.
+  if self.caps_lock&&ch.is_ascii_alphabetic(){
+   ch=if shifted{ch.to_ascii_lowercase()}else{ch.to_ascii_uppercase()};
+  }
   self.key(owner,now,ch,out)
  }
  /// Copy/cut/paste a bounded terminal selection from a trusted Desktop
@@ -653,6 +677,71 @@ mod tests{
   let mut out=[0u8;256];
   assert_eq!(gui.key(user(2),1,b'\n',&mut out),Ok(Some(7)));
   assert_eq!(gui.input.length(),0);
+ }
+
+ #[test]fn m1_r088_dual_control_keys_retain_shortcut_until_both_released(){
+  let disk=Disk{data:[[0u8;SECTOR_BYTES];SECTORS]};
+  let mut gui=TestDesk::from_mounted(HierVfs::format_blank(disk).unwrap());
+  gui.start(user(1),load(1),user(2),load(2),settings(),8,99).unwrap();
+  let mut out=[0u8;256];
+  for &b in b"some text"{gui.key(user(2),1,b,&mut out).unwrap();}
+  gui.physical_key(1,0x1d,true,&mut out).unwrap();
+  gui.physical_key(1,0xe01d,true,&mut out).unwrap();
+  gui.physical_key(1,0xe01d,false,&mut out).unwrap();
+  assert!(gui.control_down);assert!(!gui.control_right);
+  gui.physical_key(1,0x25,true,&mut out).unwrap(); // Ctrl+K
+  assert!(gui.input.is_empty()); // left Ctrl must still be active
+  gui.physical_key(1,0x1d,false,&mut out).unwrap();
+  gui.physical_key(1,0x25,true,&mut out).unwrap(); // unmodified 'k'
+  assert_eq!(gui.input.bytes(),b"k");
+ }
+ #[test]fn m1_r088_right_control_shortcuts_stop_after_right_control_break(){
+  let disk=Disk{data:[[0u8;SECTOR_BYTES];SECTORS]};
+  let mut gui=TestDesk::from_mounted(HierVfs::format_blank(disk).unwrap());
+  gui.start(user(1),load(1),user(2),load(2),settings(),8,99).unwrap();
+  let mut out=[0u8;256];
+  for &b in b"secret"{gui.key(user(2),1,b,&mut out).unwrap();}
+  gui.physical_key(1,0xe01d,true,&mut out).unwrap();
+  assert!(!gui.control_down);assert!(gui.control_right);
+  gui.physical_key(1,0x25,true,&mut out).unwrap(); // Ctrl+K
+  assert!(gui.input.is_empty());
+  gui.physical_key(1,0xe01d,false,&mut out).unwrap();
+  gui.physical_key(1,0x25,true,&mut out).unwrap();
+  assert_eq!(gui.input.bytes(),b"k");
+  gui.exit(user(2)).unwrap();
+  assert!(!gui.control_down);assert!(!gui.control_right);
+ }
+
+ #[test]fn m1_r089_caps_lock_typematic_toggle_and_shift_are_consistent(){
+  let disk=Disk{data:[[0u8;SECTOR_BYTES];SECTORS]};
+  let mut gui=TestDesk::from_mounted(HierVfs::format_blank(disk).unwrap());
+  gui.start(user(1),load(1),user(2),load(2),settings(),8,99).unwrap();
+  let mut out=[0u8;256];
+  gui.physical_key(1,0x3a,true,&mut out).unwrap();
+  gui.physical_key(1,0x3a,true,&mut out).unwrap(); // repeated make
+  assert!(gui.caps_lock);assert!(gui.caps_pressed);
+  gui.physical_key(1,0x1e,true,&mut out).unwrap(); // A
+  gui.physical_key(1,0x2a,true,&mut out).unwrap(); // Shift
+  gui.physical_key(1,0x30,true,&mut out).unwrap(); // b (Caps XOR Shift)
+  gui.physical_key(1,0x02,true,&mut out).unwrap(); // ! (shifted digit)
+  gui.physical_key(1,0x2a,false,&mut out).unwrap();
+  gui.physical_key(1,0x3a,false,&mut out).unwrap();
+  gui.physical_key(1,0x3a,true,&mut out).unwrap(); // toggle off
+  assert!(!gui.caps_lock);
+  gui.physical_key(1,0x2e,true,&mut out).unwrap(); // c
+  assert_eq!(gui.input.bytes(),b"Ab!c");
+ }
+ #[test]fn m1_r089_caps_lock_releases_on_exit_and_does_not_leak_to_new_session(){
+  let disk=Disk{data:[[0u8;SECTOR_BYTES];SECTORS]};
+  let mut gui=TestDesk::from_mounted(HierVfs::format_blank(disk).unwrap());
+  gui.start(user(1),load(1),user(2),load(2),settings(),8,99).unwrap();
+  let mut out=[0u8;256];
+  gui.physical_key(1,0x3a,true,&mut out).unwrap();
+  assert!(gui.caps_lock);
+  gui.exit(user(2)).unwrap();
+  assert!(!gui.caps_lock);assert!(!gui.caps_pressed);
+  assert_eq!(gui.input.length(),0);
+  assert!(!gui.caps_lock);assert!(!gui.caps_pressed);
  }
  #[test]fn r042_ctrl_k_clears_draft_without_submitting_disk_command(){
   let disk=Disk{data:[[0u8;SECTOR_BYTES];SECTORS]};

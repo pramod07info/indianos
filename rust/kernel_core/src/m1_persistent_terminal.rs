@@ -16,7 +16,7 @@ pub const MAX_COMMAND:usize=192;
 /// The actual persistent Terminal's supported verbs. Shared with the live
 /// Desktop's Tab completion so hidden/unknown commands are never suggested.
 pub const COMMAND_VERBS:&[&str]=&[
- "help","pwd","tools","ls","cat","page","write","append","mkdir","mv",
+ "help","pwd","tools","fsync","ls","cat","page","write","append","mkdir","mv",
  "cp","rm","mkfile","truncate","head","count","rmdir","mvdir",
  "pread","pwrite","lines","line","hash","stat","tail","find","grep","cmp","diffat",
  "touch","copynew","copyrange","matchpage","textpage","idpage","caswrite","casappend","castruncate","casclone","wordpage","idcount","casrm","casmv","linepage","textstats","castext","casinsert","caserase","unicodehead","unicodetail","textverify","casprepend","casstrip","casupper","caslower","casnewline","unicodepage","tabpositions","crpositions","leadingspaces","sourceprefix","srcupper","srclower","srcdigit","srcpunct","srcnonascii","srcwords","srctokens","srctabs","srccrlf","srclongest","srcshortest","srctrailws","srcleadingws","srcblank","srcunique","srcmaxcol","srcmixednl","srchasbom","srcfinalnl","srcnul","replace","appendln","health","hex","slice","concat","cmprange","bytefreq","patchhex","patchrange","copylines","wc","headlines","rfind","taillines","linespan","linehits","sourceview","sourcecontext","textprofile","blankrows","indentmap","eolcheck",
@@ -91,6 +91,14 @@ pub fn command<D:BlockDevice,const N:usize>(
  let line=entered.trim_end();
  if line=="help"{return publish(b"pwd ls /dir cat /path write /path text append /path text mkdir /dir mv /old /new cp /src /dst rm /path mkfile /path truncate /path head /path count rmdir /dir mvdir /old /new pread /file offset count pwrite /file@offset text",out);}
  if line=="pwd"{return publish(b"/",out);}
+ if line=="fsync"{
+  // Neither read-only callers nor insufficient response buffers should
+  // issue a storage flush, and unsupported devices fail rather than lie.
+  auth.require(caller,FILE_WRITE,now).map_err(|_|Error::Denied)?;
+  if out.len()<6{return Err(Error::OutputTooSmall);}
+  fs.sync().map_err(Error::Io)?;
+  return publish(b"synced",out);
+ }
  if line=="tools"{return publish(b"count lines line tail find grep hash cmp diffat stat touch copynew replace appendln health hex slice concat cmprange bytefreq patchhex patchrange copylines wc headlines rfind taillines linespan linehits sourceview sourcecontext textprofile [tools more]",out);}
  if line=="tools more"{return publish(b"blankrows indentmap eolcheck",out);}
  if line=="health"{
@@ -1700,10 +1708,23 @@ pub fn command_on_checked_partition<D:BlockDevice,const N:usize>(
  auth:&Access<N>,caller:Identity,now:u64,input:&[u8],out:&mut[u8],
 )->Result<usize,PartitionCommandError>{
  preflight_partition_caller(auth,caller,now)?;
- let mut volume=crate::m1_partition::mount_checked_healthy(disk,selected)
-  .map_err(PartitionCommandError::Mount)?;
- command(&mut volume,auth,caller,now,input,out)
-  .map_err(PartitionCommandError::Command)
+ let result={
+  let mut volume=crate::m1_partition::mount_checked_healthy(disk,selected)
+   .map_err(PartitionCommandError::Mount)?;
+  command(&mut volume,auth,caller,now,input,out)
+ };
+ // An equal-capacity replacement can preserve valid LBAs while changing
+ // partition geometry. Never acknowledge a command on a stale selection.
+ let after=crate::m1_partition::inspect(disk,selected.index)
+  .map_err(|e|PartitionCommandError::Mount(
+   crate::m1_partition::MountError::Partition(e)));
+ match after{
+  Ok(actual) if actual==selected=>result.map_err(PartitionCommandError::Command),
+  Ok(_)=>{out.fill(0);Err(PartitionCommandError::Mount(
+   crate::m1_partition::MountError::Partition(
+    crate::m1_partition::Error::Invalid)))},
+  Err(e)=>{out.fill(0);Err(e)},
+ }
 }
 /// The preferred persistent developer workstation command entrypoint.
 /// A user explicitly selects a GPT partition and stores its disk GUID and
@@ -1715,10 +1736,25 @@ pub fn command_on_gpt_selection<D:BlockDevice,const N:usize>(
  auth:&Access<N>,caller:Identity,now:u64,input:&[u8],out:&mut[u8],
 )->Result<usize,PartitionCommandError>{
  preflight_partition_caller(auth,caller,now)?;
- let mut volume=crate::m1_partition::mount_gpt_selected_healthy(disk,selected)
-  .map_err(PartitionCommandError::Mount)?;
- command(&mut volume,auth,caller,now,input,out)
-  .map_err(PartitionCommandError::Command)
+ let result={
+  let mut volume=crate::m1_partition::mount_gpt_selected_healthy(disk,selected)
+   .map_err(PartitionCommandError::Mount)?;
+  command(&mut volume,auth,caller,now,input,out)
+ };
+ // Mounted file I/O may have happened after the last GUID validation.
+ // Always recheck the complete primary+backup GPT identity after releasing
+ // the filesystem borrow, including on an uncertain command error.
+ let after=crate::m1_partition::inspect_gpt_selection(
+  disk,selected.partition.index)
+  .map_err(|e|PartitionCommandError::Mount(
+   crate::m1_partition::MountError::Partition(e)));
+ match after{
+  Ok(actual) if actual==selected=>result.map_err(PartitionCommandError::Command),
+  Ok(_)=>{out.fill(0);Err(PartitionCommandError::Mount(
+   crate::m1_partition::MountError::Partition(
+    crate::m1_partition::Error::Invalid)))},
+  Err(e)=>{out.fill(0);Err(e)},
+ }
 }
 pub fn command_on_partition<D:BlockDevice,const N:usize>(
  disk:&mut D,selected_index:u32,auth:&Access<N>,caller:Identity,
@@ -1727,10 +1763,26 @@ pub fn command_on_partition<D:BlockDevice,const N:usize>(
  // Require an active owner/generation/expiry and filesystem scope before
  // any on-disk discovery. The command parser remains the final rights gate.
  preflight_partition_caller(auth,caller,now)?;
- let mut volume=crate::m1_partition::mount(disk,selected_index)
-  .map_err(PartitionCommandError::Mount)?;
- command(&mut volume,auth,caller,now,input,out)
-  .map_err(PartitionCommandError::Command)
+ // Pin the exact full partition layout across the command, not only the
+ // initial mount. No new disk is formatted or written by these inspections.
+ let selected=crate::m1_partition::inspect(disk,selected_index)
+  .map_err(|e|PartitionCommandError::Mount(
+   crate::m1_partition::MountError::Partition(e)))?;
+ let result={
+  let mut volume=crate::m1_partition::mount_checked(disk,selected)
+   .map_err(PartitionCommandError::Mount)?;
+  command(&mut volume,auth,caller,now,input,out)
+ };
+ let after=crate::m1_partition::inspect(disk,selected_index)
+  .map_err(|e|PartitionCommandError::Mount(
+   crate::m1_partition::MountError::Partition(e)));
+ match after{
+  Ok(actual) if actual==selected=>result.map_err(PartitionCommandError::Command),
+  Ok(_)=>{out.fill(0);Err(PartitionCommandError::Mount(
+   crate::m1_partition::MountError::Partition(
+    crate::m1_partition::Error::Invalid)))},
+  Err(e)=>{out.fill(0);Err(e)},
+ }
 }
 
 /// Authenticated, bounded, explicitly selected GPT Terminal session.
@@ -2043,7 +2095,7 @@ mod tests{
  }
  #[test]fn r044_command_registry_drives_unique_safe_completion(){
   // R078: four new developer commands after the R077 total of 56.
-  assert_eq!(COMMAND_VERBS.len(),104);
+  assert_eq!(COMMAND_VERBS.len(),105);
   for (i,verb) in COMMAND_VERBS.iter().enumerate(){
    assert!(verb.as_bytes().iter().all(|b|b.is_ascii_lowercase()));
    assert!(!COMMAND_VERBS[..i].contains(verb));
@@ -2712,6 +2764,113 @@ mod m1_partition_terminal_integration_tests {
    b"write /home/evil denied",&mut output),
    Err(PartitionCommandError::Mount(MountError::Partition(PartError::Invalid))));
   assert_eq!(d.writes,before);
+ }
+
+ #[test]
+ fn m1_r088_selected_mbr_command_rejects_geometry_swap_on_write_and_scrubs_reply(){
+  // A selected media boundary must be checked after the operation as well
+  // as before the mount. This driver keeps the same physical capacity.
+  struct SwapMbr{disk:Disk,swapped:bool}
+  impl BlockDevice for SwapMbr{
+   fn sector_count(&self)->u64{self.disk.sector_count()}
+   fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+    ->Result<(),BlockError>{self.disk.read_sector(lba,out)}
+   fn write_sector(&mut self,lba:u64,data:&[u8;SECTOR_BYTES])
+    ->Result<(),BlockError>{
+    self.disk.write_sector(lba,data)?;
+    if (FIRST_START..FIRST_START+LENGTH).contains(&lba)&&!self.swapped{
+     let offset=446+8;
+     self.disk.sectors[0][offset..offset+4].copy_from_slice(&11u32.to_le_bytes());
+     self.swapped=true;
+    }
+    Ok(())
+   }
+  }
+  let mut d=SwapMbr{disk:disk(),swapped:false};
+  let before=d.disk.writes;
+  let mut response=[0x6d;32];
+  let result=command_on_partition(&mut d,0,&access(),owner(),1,
+     b"write /home/item alive",&mut response);
+  assert_eq!(result,Err(PartitionCommandError::Mount(
+    MountError::Partition(PartError::Invalid))));
+  assert!(d.swapped);
+  assert!(d.disk.writes>before); // The write may have happened, not rolled back.
+  assert_eq!(response,[0;32]); // Never acknowledge a changed selected device.
+ }
+
+ #[test]
+ fn m1_r088_checked_partition_command_rejects_postmount_mbr_drift(){
+  struct SwapMbr{disk:Disk,swapped:bool}
+  impl BlockDevice for SwapMbr{
+   fn sector_count(&self)->u64{self.disk.sector_count()}
+   fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+    ->Result<(),BlockError>{self.disk.read_sector(lba,out)}
+   fn write_sector(&mut self,lba:u64,data:&[u8;SECTOR_BYTES])
+    ->Result<(),BlockError>{
+    self.disk.write_sector(lba,data)?;
+    if (FIRST_START..FIRST_START+LENGTH).contains(&lba)&&!self.swapped{
+     self.disk.sectors[0][446+8..446+12]
+      .copy_from_slice(&11u32.to_le_bytes());
+     self.swapped=true;
+    }
+    Ok(())
+   }
+  }
+  let mut d=SwapMbr{disk:disk(),swapped:false};
+  let selected=crate::m1_partition::inspect(&mut d,0).unwrap();
+  let mut response=[0x6d;32];
+  assert_eq!(command_on_checked_partition(&mut d,selected,
+    &access(),owner(),1,b"write /home/item alive",&mut response),
+    Err(PartitionCommandError::Mount(MountError::Partition(PartError::Invalid))));
+  assert!(d.swapped);
+  assert_eq!(response,[0;32]);
+ }
+
+ #[test]
+ fn m1_r088_fsync_uses_selected_volume_flush_and_never_fakes_success(){
+  struct Flushing{disk:Disk,flushes:usize,unsupported:bool}
+  impl BlockDevice for Flushing{
+   fn sector_count(&self)->u64{self.disk.sector_count()}
+   fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+    ->Result<(),BlockError>{self.disk.read_sector(lba,out)}
+   fn write_sector(&mut self,lba:u64,data:&[u8;SECTOR_BYTES])
+    ->Result<(),BlockError>{self.disk.write_sector(lba,data)}
+   fn sync(&mut self)->Result<(),BlockError>{
+    if self.unsupported{return Err(BlockError::Io);}
+    self.flushes+=1;Ok(())
+   }
+  }
+  let mut d=Flushing{disk:disk(),flushes:0,unsupported:false};
+  let mut out=[0xa5;16];
+  assert_eq!(command_on_partition(&mut d,0,&access(),owner(),1,
+   b"write /home/item stored",&mut out),Ok(5));
+  assert_eq!(command_on_partition(&mut d,0,&access(),owner(),1,
+   b"fsync",&mut out),Ok(6));
+  assert_eq!(&out[..6],b"synced");
+  assert_eq!(d.flushes,1);
+  let mut short=[0xa5;4];
+  assert_eq!(command_on_partition(&mut d,0,&access(),owner(),1,
+   b"fsync",&mut short),
+   Err(PartitionCommandError::Command(Error::OutputTooSmall)));
+  assert_eq!(short,[0xa5;4]);assert_eq!(d.flushes,1);
+  let denied=Identity{pid:owner().pid,generation:owner().generation+1};
+  assert_eq!(command_on_partition(&mut d,0,&access(),denied,1,
+   b"fsync",&mut out),
+   Err(PartitionCommandError::Command(Error::Denied)));
+  assert_eq!(d.flushes,1);
+  d.unsupported=true;
+  assert_eq!(command_on_partition(&mut d,0,&access(),owner(),1,
+   b"fsync",&mut out),
+   Err(PartitionCommandError::Command(Error::Io(FsError::Io))));
+  assert_eq!(d.flushes,1);
+  d.unsupported=false;
+  let (n,response)={
+   let mut result=[0;MAX_TRANSFER];
+   let n=command_on_partition(&mut d,0,&access(),owner(),1,
+    b"cat /home/item",&mut result).unwrap();
+   (n,result)
+  };
+  assert_eq!(&response[..n],b"stored");
  }
  #[test]
  fn m1_selected_partition_power_cut_keeps_previous_committed_file(){

@@ -11,6 +11,10 @@ pub trait BlockDevice {
     fn sector_count(&self) -> u64;
     fn read_sector(&mut self, lba: u64, out: &mut [u8; SECTOR_BYTES]) -> Result<(), BlockError>;
     fn write_sector(&mut self, lba: u64, data: &[u8; SECTOR_BYTES]) -> Result<(), BlockError>;
+    /// Explicit persistence barrier. An unknown driver must NOT pretend
+    /// it supports durable flushes; a caller may require fsync semantics.
+    /// Existing write_sector() contracts still mandate durable completion.
+    fn sync(&mut self) -> Result<(), BlockError> { Err(BlockError::Io) }
 }
 
 /// A hard read-only capability. Even if a future discovery or diagnostic
@@ -18,13 +22,23 @@ pub trait BlockDevice {
 /// This is a borrowed view, not a snapshot or a software-only convention.
 pub struct ReadOnlyDevice<'a,D:BlockDevice>{
  device:&'a mut D,
- // Health/discovery probes must not expand to newly inserted media.
+ // A read-only probe is bound to one geometry snapshot. Once a change
+ // has been observed, resetting the size cannot resurrect a stale probe.
  parent_capacity:u64,
+ invalidated:bool,
 }
 impl<'a,D:BlockDevice> ReadOnlyDevice<'a,D>{
  pub fn new(device:&'a mut D)->Self{
   let parent_capacity=device.sector_count();
-  Self{device,parent_capacity}
+  Self{device,parent_capacity,invalidated:false}
+ }
+ fn check_capacity(&mut self)->Result<(),BlockError>{
+  if self.invalidated{return Err(BlockError::Io);}
+  if self.device.sector_count()!=self.parent_capacity{
+   self.invalidated=true;
+   return Err(BlockError::Io);
+  }
+  Ok(())
  }
 }
 impl<D:BlockDevice> BlockDevice for ReadOnlyDevice<'_,D>{
@@ -32,16 +46,18 @@ impl<D:BlockDevice> BlockDevice for ReadOnlyDevice<'_,D>{
  fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
   ->Result<(),BlockError>{
   check_range(self.parent_capacity,lba,1)?;
-  if self.device.sector_count()!=self.parent_capacity{return Err(BlockError::Io);}
+  self.check_capacity()?;
   // Do not expose partial DMA/bounce-buffer output after a failed read.
   let mut staged=[0u8;SECTOR_BYTES];
-  self.device.read_sector(lba,&mut staged)?;
-  if self.device.sector_count()!=self.parent_capacity{return Err(BlockError::Io);}
+  let transferred=self.device.read_sector(lba,&mut staged);
+  self.check_capacity()?;
+  transferred?;
   out.copy_from_slice(&staged);
   Ok(())
  }
  fn write_sector(&mut self,_lba:u64,_bytes:&[u8;SECTOR_BYTES])
   ->Result<(),BlockError>{Err(BlockError::ReadOnly)}
+ fn sync(&mut self)->Result<(),BlockError>{Err(BlockError::ReadOnly)}
 }
 /// Restrict access to a validated block-device window; no I/O occurs on construction.
 /// Destructive formatting is still an explicit responsibility of the caller.
@@ -76,16 +92,18 @@ impl<'a, D: BlockDevice> BlockWindow<'a, D> {
     /// Read-only parent inspection while the bounded view retains exclusive
     /// ownership. Used to validate partition identity after the final mount.
     pub(crate) fn validate_parent<E>(&mut self,
-        validate:impl FnOnce(&mut ReadOnlyDevice<'_,D>)->Result<(),E>)
+        validate:impl FnOnce(&mut ReadOnlyDevice<'_,D>)->Result<(),E>,
+        map_failure:impl Fn(BlockError)->E)
         ->Result<(),E>
     {
-        // Do not permit identity validation against a known-stale mount.
-        // The validation callback is read-only; a changing capacity is
-        // checked both before and after the caller's inspection.
-        // This helper's error type is caller-defined, so capacity checks
-        // cannot be converted here without constraining E. Instead the
-        // caller's partition identity validator must reject changed media.
-        validate(&mut ReadOnlyDevice::new(self.device))
+        // The bounded mount must be healthy both before AND after parent
+        // identity inspection. The caller supplies a domain-error mapping;
+        // this prevents unchecked physical capacity changes from bypassing
+        // a valid GPT identity returned by a read-only callback.
+        self.check_parent_capacity().map_err(|e|map_failure(e))?;
+        let inspected=validate(&mut ReadOnlyDevice::new(self.device));
+        self.check_parent_capacity().map_err(|e|map_failure(e))?;
+        inspected
     }
 
 }
@@ -110,10 +128,25 @@ impl<D: BlockDevice> BlockDevice for BlockWindow<'_, D> {
         check_range(self.count, lba, 1)?;
         // Never write a selected LBA on a device with changed geometry.
         self.check_parent_capacity()?;
-        self.device.write_sector(self.start + lba, data)?;
+        // A driver can report I/O failure after partially writing a sector.
+        // This mounted partition must be retired, not reused for another
+        // mutation with a potentially torn filesystem generation.
+        if let Err(error)=self.device.write_sector(self.start + lba, data){
+            self.invalidated=true;
+            return Err(error);
+        }
         // A change during a write is uncertain (the write cannot be undone).
         // Make it an error so callers must not trust the mounted session.
         self.check_parent_capacity()
+    }
+    fn sync(&mut self)->Result<(),BlockError>{
+        self.check_parent_capacity()?;
+        // A failed cache flush is an uncertain durability boundary. Refuse
+        // subsequent traffic even if the driver later reports success.
+        let result=self.device.sync();
+        if result.is_err(){self.invalidated=true;}
+        self.check_parent_capacity()?;
+        result
     }
 }
 
@@ -582,6 +615,193 @@ mod tests {
         assert_eq!(disk.writes,1);
     }
 
+
+    #[test]
+    fn m1_r088_read_only_probe_never_reactivates_after_media_restoration() {
+        let capacity=core::cell::Cell::new(4);
+        let mut disk=R087bRemovable{capacity:&capacity,reads:0,writes:0,
+          change_on_read:false,change_on_write:false,fail_read:false};
+        let mut probe=ReadOnlyDevice::new(&mut disk);
+        let mut out=[0x5a;SECTOR_BYTES];
+        capacity.set(3);
+        assert_eq!(probe.read_sector(0,&mut out),Err(BlockError::Io));
+        capacity.set(4);
+        assert_eq!(probe.read_sector(0,&mut out),Err(BlockError::Io));
+        assert_eq!(out,[0x5a;SECTOR_BYTES]);
+        drop(probe);
+        assert_eq!(disk.reads,0);assert_eq!(disk.writes,0);
+    }
+
+    #[test]
+    fn m1_r088_read_only_probe_latches_mid_transfer_media_change() {
+        let capacity=core::cell::Cell::new(4);
+        let mut disk=R087bRemovable{capacity:&capacity,reads:0,writes:0,
+          change_on_read:true,change_on_write:false,fail_read:false};
+        let mut probe=ReadOnlyDevice::new(&mut disk);
+        let mut out=[0xa5;SECTOR_BYTES];
+        assert_eq!(probe.read_sector(0,&mut out),Err(BlockError::Io));
+        capacity.set(4);
+        assert_eq!(probe.read_sector(0,&mut out),Err(BlockError::Io));
+        assert_eq!(out,[0xa5;SECTOR_BYTES]);
+        drop(probe);
+        assert_eq!(disk.reads,1);
+    }
+
+    #[test]
+    fn m1_r088_sync_requires_explicit_block_driver_support(){
+        let mut disk=RamDisk{bytes:[0;SECTOR_BYTES*4],readonly:false};
+        assert_eq!(disk.sync(),Err(BlockError::Io));
+        let mut window=BlockWindow::new(&mut disk,1,2).unwrap();
+        assert_eq!(window.sync(),Err(BlockError::Io));
+        drop(window);
+        let mut probe=ReadOnlyDevice::new(&mut disk);
+        assert_eq!(probe.sync(),Err(BlockError::ReadOnly));
+    }
+
+    #[test]
+    fn m1_r088_bounded_sync_forwards_only_for_unchanged_media(){
+        struct FlushDisk<'a>{capacity:&'a core::cell::Cell<u64>,calls:u32}
+        impl BlockDevice for FlushDisk<'_>{
+            fn sector_count(&self)->u64{self.capacity.get()}
+            fn read_sector(&mut self,_:u64,out:&mut[u8;SECTOR_BYTES])
+              ->Result<(),BlockError>{out.fill(0);Ok(())}
+            fn write_sector(&mut self,_:u64,_:&[u8;SECTOR_BYTES])
+              ->Result<(),BlockError>{Ok(())}
+            fn sync(&mut self)->Result<(),BlockError>{self.calls+=1;Ok(())}
+        }
+        let capacity=core::cell::Cell::new(4);
+        let mut disk=FlushDisk{capacity:&capacity,calls:0};
+        let mut window=BlockWindow::new(&mut disk,1,2).unwrap();
+        assert_eq!(window.sync(),Ok(()));
+        capacity.set(5);
+        assert_eq!(window.sync(),Err(BlockError::Io));
+        capacity.set(4);
+        assert_eq!(window.sync(),Err(BlockError::Io));
+        drop(window);
+        assert_eq!(disk.calls,1);
+    }
+
+    struct R089UncertainDisk {
+        sectors:[[u8;SECTOR_BYTES];4],
+        writes:u32, reads:u32, syncs:u32,
+        fail_write:bool,fail_sync:bool,
+    }
+    impl R089UncertainDisk{
+        fn new()->Self{
+            Self{sectors:[[0;SECTOR_BYTES];4],writes:0,reads:0,
+                 syncs:0,fail_write:false,fail_sync:false}
+        }
+    }
+    impl BlockDevice for R089UncertainDisk{
+        fn sector_count(&self)->u64{4}
+        fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+          ->Result<(),BlockError>{
+            check_range(4,lba,1)?;
+            self.reads+=1;*out=self.sectors[lba as usize];Ok(())
+        }
+        fn write_sector(&mut self,lba:u64,data:&[u8;SECTOR_BYTES])
+          ->Result<(),BlockError>{
+            check_range(4,lba,1)?;
+            self.writes+=1;
+            self.sectors[lba as usize]=*data; // Partial/torn media possible.
+            if self.fail_write{Err(BlockError::Io)}else{Ok(())}
+        }
+        fn sync(&mut self)->Result<(),BlockError>{
+            self.syncs+=1;
+            if self.fail_sync{Err(BlockError::Io)}else{Ok(())}
+        }
+    }
+    #[test]
+    fn m1_r089_partition_window_retires_after_failed_sector_write(){
+        let mut disk=R089UncertainDisk::new();
+        disk.fail_write=true;
+        let mut mounted=BlockWindow::new(&mut disk,1,2).unwrap();
+        assert_eq!(mounted.write_sector(0,&[0x77;SECTOR_BYTES]),Err(BlockError::Io));
+        assert_eq!(mounted.write_sector(0,&[0x22;SECTOR_BYTES]),Err(BlockError::Io));
+        assert_eq!(mounted.read_sector(0,&mut[0;SECTOR_BYTES]),Err(BlockError::Io));
+        assert_eq!(mounted.sync(),Err(BlockError::Io));
+        drop(mounted);
+        assert_eq!(disk.writes,1);
+        assert_eq!(disk.reads,0);
+        assert_eq!(disk.syncs,0);
+        // An explicit fresh mount is the ONLY way to retry on inspected media.
+        disk.fail_write=false;
+        let mut fresh=BlockWindow::new(&mut disk,1,2).unwrap();
+        assert_eq!(fresh.write_sector(0,&[0x55;SECTOR_BYTES]),Ok(()));
+        drop(fresh);
+        assert_eq!(disk.writes,2);
+    }
+    #[test]
+    fn m1_r089_partition_window_retires_after_uncertain_flush(){
+        let mut disk=R089UncertainDisk::new();
+        disk.fail_sync=true;
+        let mut mounted=BlockWindow::new(&mut disk,1,2).unwrap();
+        assert_eq!(mounted.sync(),Err(BlockError::Io));
+        assert_eq!(mounted.sync(),Err(BlockError::Io));
+        assert_eq!(mounted.write_sector(0,&[0;SECTOR_BYTES]),Err(BlockError::Io));
+        assert_eq!(mounted.read_sector(0,&mut[0;SECTOR_BYTES]),Err(BlockError::Io));
+        drop(mounted);
+        assert_eq!(disk.syncs,1);assert_eq!(disk.writes,0);assert_eq!(disk.reads,0);
+        disk.fail_sync=false;
+        let mut fresh=BlockWindow::new(&mut disk,1,2).unwrap();
+        assert_eq!(fresh.sync(),Ok(()));
+        drop(fresh);
+        assert_eq!(disk.syncs,2);
+    }
+    #[test]
+    fn m1_r089_partition_window_stable_write_flush_and_read_survive(){
+        let mut disk=R089UncertainDisk::new();
+        let mut view=BlockWindow::new(&mut disk,1,2).unwrap();
+        let bytes=[0x42;SECTOR_BYTES];
+        assert_eq!(view.write_sector(1,&bytes),Ok(()));
+        assert_eq!(view.sync(),Ok(()));
+        let mut out=[0;SECTOR_BYTES];
+        assert_eq!(view.read_sector(1,&mut out),Ok(()));
+        assert_eq!(out,bytes);
+        drop(view);
+        assert_eq!(disk.writes,1);assert_eq!(disk.syncs,1);assert_eq!(disk.reads,1);
+    }
+
+    #[test]
+    fn m1_r089_parent_inspection_rejects_late_capacity_change(){
+        let size=core::cell::Cell::new(4u64);
+        let mut disk=R087GeometryDisk{
+            capacity:&size,reads:0,writes:0,
+            change_on_read:false,change_on_write:false,
+        };
+        let mut mounted=BlockWindow::new(&mut disk,1,2).unwrap();
+        let mut seen=[0u8;SECTOR_BYTES];
+        assert_eq!(mounted.validate_parent(|device|{
+            device.read_sector(0,&mut seen)?;
+            size.set(5); // after the last successful read
+            Ok::<(),BlockError>(())
+        },|e|e),Err(BlockError::Io));
+        size.set(4);
+        assert_eq!(mounted.read_sector(0,&mut seen),Err(BlockError::Io));
+        drop(mounted);
+        assert_eq!(disk.reads,1);
+    }
+    #[test]
+    fn m1_r089_parent_inspection_rejects_stale_mount_before_callback(){
+        let size=core::cell::Cell::new(4u64);
+        let mut disk=R087GeometryDisk{
+            capacity:&size,reads:0,writes:0,
+            change_on_read:false,change_on_write:false,
+        };
+        let mut mounted=BlockWindow::new(&mut disk,1,2).unwrap();
+        size.set(3);
+        let mut called=false;
+        assert_eq!(mounted.validate_parent(|_|{
+            called=true;Ok::<(),BlockError>(())
+        },|e|e),Err(BlockError::Io));
+        assert!(!called);
+        size.set(4);
+        assert_eq!(mounted.validate_parent(|_|Ok::<(),BlockError>(()),|e|e),
+                   Err(BlockError::Io));
+        drop(mounted);
+        assert_eq!(disk.reads,0);
+        assert_eq!(disk.writes,0);
+    }
     #[test]
     fn m1_r087b_stable_readonly_and_multi_sector_operations(){
         let capacity=core::cell::Cell::new(4);
@@ -609,21 +829,33 @@ pub struct ExtentReader<'a, D: BlockDevice> {
     device: &'a mut D,
     extents: &'a [crate::agent_01_fs_extents::Extent],
     logical_sectors: u64,
+    parent_capacity:u64,
+    invalidated:bool,
 }
 impl<'a, D: BlockDevice> ExtentReader<'a, D> {
     pub fn new(device: &'a mut D, extents: &'a [crate::agent_01_fs_extents::Extent])
         -> Result<Self, BlockError>
     {
+        let parent_capacity=device.sector_count();
         let count = crate::agent_01_fs_extents::validate_extents(
-            extents, device.sector_count()
+            extents,parent_capacity
         ).map_err(|_| BlockError::OutOfRange)?;
         if count == 0 { return Err(BlockError::OutOfRange); }
-        Ok(Self { device, extents, logical_sectors: count })
+        Ok(Self { device, extents, logical_sectors: count,
+                  parent_capacity,invalidated:false })
     }
-
-    fn physical_lba(&self, logical_lba: u64) -> Result<u64, BlockError> {
+    fn check_parent(&mut self)->Result<(),BlockError>{
+        if self.invalidated{return Err(BlockError::Io);}
+        if self.device.sector_count()!=self.parent_capacity{
+            self.invalidated=true;
+            return Err(BlockError::Io);
+        }
+        Ok(())
+    }
+    fn physical_lba(&mut self, logical_lba: u64) -> Result<u64, BlockError> {
+        self.check_parent()?;
         crate::agent_01_fs_extents::logical_to_physical(
-            self.extents, self.device.sector_count(), logical_lba
+            self.extents, self.parent_capacity, logical_lba
         ).map_err(|_| BlockError::OutOfRange)?
             .ok_or(BlockError::OutOfRange)
     }
@@ -635,7 +867,12 @@ impl<D: BlockDevice> BlockDevice for ExtentReader<'_, D> {
         -> Result<(), BlockError>
     {
         let mapped = self.physical_lba(lba)?;
-        self.device.read_sector(mapped, out)
+        let mut staged=[0u8;SECTOR_BYTES];
+        let transferred=self.device.read_sector(mapped,&mut staged);
+        self.check_parent()?;
+        transferred?;
+        out.copy_from_slice(&staged);
+        Ok(())
     }
 
     fn write_sector(&mut self, _lba: u64, _data: &[u8; SECTOR_BYTES])
@@ -643,6 +880,7 @@ impl<D: BlockDevice> BlockDevice for ExtentReader<'_, D> {
     {
         Err(BlockError::ReadOnly)
     }
+    fn sync(&mut self)->Result<(),BlockError>{Err(BlockError::ReadOnly)}
 }
 
 #[cfg(test)]
@@ -696,6 +934,48 @@ mod extent_reader_tests {
         assert!(matches!(ExtentReader::new(&mut disk, &overflow), Err(BlockError::OutOfRange)));
         assert_eq!(disk.writes, 0);
     }
+
+    #[test]
+    fn m1_r088_extent_view_stays_revoked_after_capacity_restored(){
+        struct Removable<'a>{size:&'a core::cell::Cell<u64>,reads:u32}
+        impl BlockDevice for Removable<'_>{
+            fn sector_count(&self)->u64{self.size.get()}
+            fn read_sector(&mut self,_lba:u64,out:&mut[u8;SECTOR_BYTES])
+              ->Result<(),BlockError>{self.reads+=1;out.fill(0x78);Ok(())}
+            fn write_sector(&mut self,_lba:u64,_:&[u8;SECTOR_BYTES])
+              ->Result<(),BlockError>{Err(BlockError::ReadOnly)}
+        }
+        let size=core::cell::Cell::new(8);
+        let mut disk=Removable{size:&size,reads:0};
+        let extents=[Extent{start:1,blocks:2}];
+        let mut view=ExtentReader::new(&mut disk,&extents).unwrap();
+        let mut out=[0x39;SECTOR_BYTES];
+        size.set(9);
+        assert_eq!(view.read_sector(0,&mut out),Err(BlockError::Io));
+        size.set(8);
+        assert_eq!(view.read_sector(0,&mut out),Err(BlockError::Io));
+        assert_eq!(out,[0x39;SECTOR_BYTES]);
+        drop(view);
+        assert_eq!(disk.reads,0);
+    }
+
+    #[test]
+    fn m1_r088_extent_read_stages_partial_driver_failure(){
+        struct Dirty;
+        impl BlockDevice for Dirty{
+            fn sector_count(&self)->u64{8}
+            fn read_sector(&mut self,_lba:u64,out:&mut[u8;SECTOR_BYTES])
+              ->Result<(),BlockError>{out.fill(0xfa);Err(BlockError::Io)}
+            fn write_sector(&mut self,_:u64,_:&[u8;SECTOR_BYTES])
+              ->Result<(),BlockError>{Err(BlockError::ReadOnly)}
+        }
+        let mut disk=Dirty;
+        let extents=[Extent{start:1,blocks:2}];
+        let mut view=ExtentReader::new(&mut disk,&extents).unwrap();
+        let mut out=[0x39;SECTOR_BYTES];
+        assert_eq!(view.read_sector(0,&mut out),Err(BlockError::Io));
+        assert_eq!(out,[0x39;SECTOR_BYTES]);
+    }
     #[test]
     fn extent_view_is_strictly_read_only() {
         let mut disk = device();
@@ -710,7 +990,8 @@ mod extent_reader_tests {
 
 /// Batch 1: read a byte range through a validated multi-extent block view.
 /// All bounds are checked before the first device read or output mutation.
-/// A device I/O error may leave an earlier output prefix filled.
+/// Mid-transfer device failure wipes the whole output; range-preflight
+/// rejection still preserves the caller's original buffer.
 pub fn read_extent_bytes<D: BlockDevice>(
     device: &mut D, extents: &[crate::agent_01_fs_extents::Extent],
     offset: u64, out: &mut [u8],
@@ -723,16 +1004,18 @@ pub fn read_extent_bytes<D: BlockDevice>(
         return Err(BlockError::OutOfRange);
     }
     let mut cursor = offset;
-    let mut remaining = out;
+    let mut written=0;
     let mut sector = [0u8; SECTOR_BYTES];
-    while !remaining.is_empty() {
-        reader.read_sector(cursor / SECTOR_BYTES as u64, &mut sector)?;
+    while written<out.len() {
+        if let Err(error)=reader.read_sector(cursor / SECTOR_BYTES as u64,&mut sector){
+            out.fill(0);
+            return Err(error);
+        }
         let position = (cursor % SECTOR_BYTES as u64) as usize;
-        let count = remaining.len().min(SECTOR_BYTES - position);
-        let (head, tail) = remaining.split_at_mut(count);
-        head.copy_from_slice(&sector[position..position + count]);
+        let count = (out.len()-written).min(SECTOR_BYTES-position);
+        out[written..written+count].copy_from_slice(&sector[position..position+count]);
         cursor += count as u64; // prior range preflight proves no overflow
-        remaining = tail;
+        written+=count;
     }
     Ok(())
 }
@@ -761,6 +1044,28 @@ mod batch1_extent_byte_tests {
         read_extent_bytes(&mut disk, &[Extent{start:1,blocks:1},
             Extent{start:4,blocks:1}], 510, &mut out).unwrap();
         assert_eq!(&out, b"aabbb");
+    }
+
+    #[test]
+    fn m1_r088_extent_byte_read_clears_completed_prefix_on_second_sector_failure(){
+        struct DirtySecond{reads:u32}
+        impl BlockDevice for DirtySecond{
+            fn sector_count(&self)->u64{6}
+            fn read_sector(&mut self,_:u64,out:&mut[u8;SECTOR_BYTES])
+              ->Result<(),BlockError>{
+                self.reads+=1;
+                if self.reads==2{out.fill(0xee);return Err(BlockError::Io);}
+                out.fill(0x2a);Ok(())
+            }
+            fn write_sector(&mut self,_:u64,_:&[u8;SECTOR_BYTES])
+              ->Result<(),BlockError>{Err(BlockError::ReadOnly)}
+        }
+        let mut disk=DirtySecond{reads:0};
+        let mut out=[0xa5;SECTOR_BYTES+3];
+        assert_eq!(read_extent_bytes(&mut disk,&[Extent{start:1,blocks:2}],
+                    0,&mut out),Err(BlockError::Io));
+        assert_eq!(out,[0;SECTOR_BYTES+3]);
+        assert_eq!(disk.reads,2);
     }
     #[test]
     fn preflight_rejects_overrun_without_mutating_caller_buffer() {
