@@ -42,7 +42,13 @@ pub struct NamespaceReceipt { owner:Identity, namespace_id:u64, revision:u64 }
 /// Kernel-minted alias scoped to a process incarnation and namespace revision.
 /// String path comparison alone is not an authority to access a mounted tree.
 #[derive(Clone,Copy)]
-pub struct MountAlias { receipt:NamespaceReceipt, root:[u8;24], len:usize }
+pub struct MountAlias {
+    receipt:NamespaceReceipt, root:[u8;24], len:usize,
+    // A kernel-selected physical mount is a different authority from its
+    // pathname. Every remount or recovery issues a new monotonic revision.
+    volume_revision:u64,
+    selected_volume:Option<crate::m1_partition::PartitionReceipt>,
+}
 impl MountAlias {
     fn root(&self)->&str {
         core::str::from_utf8(&self.root[..self.len]).unwrap()
@@ -65,6 +71,7 @@ pub struct FileHandles{
     // controller despite returning failure. Do not reuse any cached file
     // handles until privileged, full-receipt remount verification succeeds.
     selected_quarantined:bool,
+    volume_revision:u64,
 }
 impl FileHandles{
     pub const fn new()->Self{
@@ -73,7 +80,7 @@ impl FileHandles{
             roots:[RootGrant::EMPTY;2],
             root_revisions:[0;2],last_syscall_namespace:None,
             write_guard:WriteGuard::new(),selected_volume:None,
-            selected_quarantined:false}
+            selected_quarantined:false,volume_revision:1}
     }
     pub fn security_statistics(&self)->Statistics{
         self.write_guard.statistics()
@@ -182,13 +189,31 @@ impl FileHandles{
         let canonical=core::str::from_utf8(&path[..len])
             .map_err(|_|FsError::InvalidName)?;
         if !self.root_allows(owner,canonical){return Err(FsError::InvalidName);}
-        Ok(MountAlias{receipt,root:path,len})
+        Ok(MountAlias{receipt,root:path,len,
+            volume_revision:self.volume_revision,
+            selected_volume:self.selected_volume})
+    }
+    /// A trusted kernel entry point may mint only the caller's currently
+    /// bound namespace root. It never accepts a ring-3 selected mount path.
+    pub fn mount_alias_for_current_root_kernel(&self,owner:Identity)
+        ->Result<MountAlias,FsError>{
+        let receipt=self.namespace_receipt(owner)?;
+        let root=self.roots[(owner.pid-1) as usize];
+        if root.epoch!=owner.generation||root.len==0{
+            return Err(FsError::InvalidName)
+        }
+        Ok(MountAlias{receipt,root:root.path,len:root.len,
+            volume_revision:self.volume_revision,
+            selected_volume:self.selected_volume})
     }
     /// Authenticate both the alias origin and the target for every operation.
     /// Any PID reuse or root revision revokes previously minted aliases.
     pub fn mount_alias_allows(&self,alias:MountAlias,owner:Identity,path:&str)->bool{
         alias.receipt.owner==owner &&
         self.namespace_receipt_is_current(alias.receipt) &&
+        !self.selected_quarantined &&
+        alias.volume_revision==self.volume_revision &&
+        alias.selected_volume==self.selected_volume &&
         self.root_allows(owner,path) &&
         crate::vfs_path::is_within_tree(path,alias.root())==Ok(true)
     }
@@ -954,6 +979,13 @@ pub fn operation_authenticated_mount_alias(
        !table.mount_alias_allows(alias,owner,path){
         return Err(FsError::InvalidName);
     }
+    // Independently calculate the bounded relative suffix using the R115
+    // all-or-nothing canonicalization. An exact-root OPEN is never a file.
+    let mut relative=[0u8;24];
+    let Some(length)=crate::vfs_path::copy_relative_under_root(
+        path,alias.root(),&mut relative).map_err(|_|FsError::InvalidName)?
+    else{return Err(FsError::InvalidName)};
+    if action==1 && length==0{return Err(FsError::InvalidName);}
     operation_authenticated(table,action,owner,token,argument,path,buffer)
 }
 /// Authenticate before ATA probing or filesystem reads, including open.
@@ -995,6 +1027,10 @@ pub fn revalidate_quarantined_selected_volume<D:BlockDevice>(
  }
  let _mounted=crate::m1_partition::mount_partition_receipt_healthy(
      disk,receipt).map_err(|_|FsError::InvalidVolume)?;
+ // Recovery itself changes mount authority, even when the selected
+ // partition receipt identifies the same physical disk and GPT slot.
+ let next=table.volume_revision.checked_add(1).ok_or(FsError::Full)?;
+ table.volume_revision=next;
  table.selected_quarantined=false;
  Ok(())
 }
@@ -1027,10 +1063,20 @@ pub fn operation_on_selected_volume<D:BlockDevice>(
     }
     let mut volume=crate::m1_partition::mount_partition_receipt_healthy(
        disk,receipt).map_err(|_|FsError::InvalidVolume)?;
-    // Bind the successfully authenticated physical receipt before the
-    // first file mutation, even when that mutation later fails. Otherwise
-    // an uncertain first CREATE would have no receipt to revalidate.
-    if prior!=Some(receipt){table.selected_volume=Some(receipt);}
+    // The mount may have performed physical I/O; do not dispatch a user
+    // operation against a namespace receipt retired during probing.
+    if !table.namespace_receipt_is_current(namespace){
+        return Err(FsError::InvalidName);
+    }
+    // A newly mounted physical volume rotates every outstanding namespace
+    // alias, even when it presents familiar pathnames. Do not risk reusing
+    // a token from the prior selected partition or stale mount generation.
+    // Check exhaustion before changing any cached service authority.
+    if prior!=Some(receipt){
+        let next=table.volume_revision.checked_add(1).ok_or(FsError::Full)?;
+        table.volume_revision=next;
+        table.selected_volume=Some(receipt);
+    }
     let outcome=table.dispatch_for(action,owner,token,argument,path,buffer,&mut volume);
     if outcome.is_ok() && matches!(action,1|29){
         table.selected_volume=Some(receipt);
@@ -2196,6 +2242,44 @@ mod r106_checked_partition_authenticated_file_api_tests{
   assert_eq!(d.reads,reads);assert_eq!(d.writes,writes);
   assert_eq!(table.security_statistics().completed_writes,0);
  }
+
+ #[test]fn r115_selected_mount_rotates_alias_after_real_verified_volume_open(){
+  let (mut media,receipt)=disk();
+  let mut handles=FileHandles::new();
+  let guest=handles.bind_process(2).unwrap();
+  let old=handles.mount_alias_for_current_root_kernel(guest).unwrap();
+  assert!(handles.mount_alias_allows(old,guest,"/shared/note"));
+  let fd=operation_on_selected_volume(&mut handles,1,guest,0,READ,
+      "/shared/note",&mut[],&mut media,receipt).unwrap();
+  assert_ne!(fd,0);
+  assert!(!handles.mount_alias_allows(old,guest,"/shared/note"));
+  assert_eq!(operation_authenticated_mount_alias(&mut handles,old,1,guest,
+      0,READ,"/shared/note",&mut[]),Err(FsError::InvalidName));
+  let current=handles.mount_alias_for_current_root_kernel(guest).unwrap();
+  assert!(handles.mount_alias_allows(current,guest,"/shared/note"));
+  assert!(!handles.mount_alias_allows(current,guest,"/sharedness/private"));
+ }
+ #[test]fn r115_healthy_remount_and_quarantine_revoke_old_mount_alias(){
+  let (mut media,receipt)=disk();
+  let mut handles=FileHandles::new();
+  let guest=handles.bind_process(2).unwrap();
+  let admin=handles.bind_process(1).unwrap();
+  let fd=operation_on_selected_volume(&mut handles,1,guest,0,READ,
+      "/shared/note",&mut[],&mut media,receipt).unwrap();
+  operation_on_selected_volume(&mut handles,5,guest,fd,0,"",
+      &mut[],&mut media,receipt).unwrap();
+  let old=handles.mount_alias_for_current_root_kernel(guest).unwrap();
+  assert!(handles.mount_alias_allows(old,guest,"/shared/note"));
+  // Simulate a failed mutation that made the actual selected mount unsafe.
+  handles.selected_quarantined=true;
+  assert!(!handles.mount_alias_allows(old,guest,"/shared/note"));
+  revalidate_quarantined_selected_volume(&mut handles,admin,&mut media,receipt)
+      .unwrap();
+  assert!(!handles.mount_alias_allows(old,guest,"/shared/note"));
+  let fresh=handles.mount_alias_for_current_root_kernel(guest).unwrap();
+  assert!(handles.mount_alias_allows(fresh,guest,"/shared/note"));
+ }
+
  #[test]fn r109_foreign_stale_and_unknown_tokens_never_probe_selected_media(){
   let (mut d,receipt)=disk();let mut table=FileHandles::new();
   let owner=table.bind_process(2).unwrap();
@@ -2663,6 +2747,49 @@ mod r114_mount_alias_security_tests {
         assert!(!handles.mount_alias_allows(fresh,first,"/shared/docs/file"));
         assert_eq!(operation_authenticated_mount_alias(
             &mut handles,fresh,1,replacement,0,READ,"/shared/docs/file",&mut []),
+            Err(FsError::InvalidName));
+    }
+}
+
+
+
+#[cfg(test)]
+mod r115_live_namespace_open_security_tests {
+    use super::*;
+    #[test]
+    fn pid2_root_comes_from_kernel_and_cannot_be_widened() {
+        let mut files=FileHandles::new();
+        let pid2=files.bind_process(2).unwrap();
+        let alias=files.mount_alias_for_current_root_kernel(pid2).unwrap();
+        assert!(files.mount_alias_allows(alias,pid2,"/shared/docs"));
+        for target in ["/sharedness/keys","/etc/passwd","/shared/../etc",
+                       "/private", "shared/docs", "/shared\0/private"]{
+            assert_eq!(operation_authenticated_mount_alias(
+                &mut files,alias,1,pid2,0,READ,target,&mut []),
+                Err(FsError::InvalidName));
+        }
+        // Unauthorized file opens are denied before the ATA probe.
+        assert_eq!(operation_authenticated_mount_alias(
+            &mut files,alias,1,pid2,0,READ,"/shared",&mut []),
+            Err(FsError::InvalidName));
+    }
+    #[test]
+    fn narrowing_and_process_reuse_revoke_kernel_minted_alias() {
+        let mut files=FileHandles::new();
+        let first=files.bind_process(2).unwrap();
+        let old=files.mount_alias_for_current_root_kernel(first).unwrap();
+        files.narrow_root_kernel(first,"/shared/docs").unwrap();
+        assert!(!files.mount_alias_allows(old,first,"/shared/docs/note"));
+        assert_eq!(operation_authenticated_mount_alias(
+            &mut files,old,1,first,0,READ,"/shared/docs/note",&mut []),
+            Err(FsError::InvalidName));
+        let narrow=files.mount_alias_for_current_root_kernel(first).unwrap();
+        assert!(files.mount_alias_allows(narrow,first,"/shared/docs/note"));
+        assert!(!files.mount_alias_allows(narrow,first,"/shared2/note"));
+        let replacement=files.bind_process(2).unwrap();
+        assert!(!files.mount_alias_allows(narrow,replacement,"/shared/docs/note"));
+        assert_eq!(operation_authenticated_mount_alias(
+            &mut files,narrow,1,replacement,0,READ,"/shared/docs/note",&mut []),
             Err(FsError::InvalidName));
     }
 }
