@@ -1165,6 +1165,13 @@ impl<const PORTS:usize,const QUEUE:usize> EpochUdpEndpoints<PORTS,QUEUE> {
         &mut self,registry:&mut crate::udp_owner_epoch::Registry<N>,
         pid:u32,generation:u64)->Result<usize,SocketError>{
         if pid==0||generation==0{return Err(SocketError::Invalid);}
+        // A newer PID incarnation in the registry must not be disturbed by
+        // old, delayed scheduler retirement. Validate before mutating sockets.
+        if registry.has_foreign_generation(pid,generation) ||
+           self.owners.iter().flatten().any(|&(known,epoch)|
+              known==pid&&epoch!=generation){
+            return Err(SocketError::Denied);
+        }
         if self.authenticated(pid,generation){
             self.retire(pid,generation)?;
         }
@@ -2299,5 +2306,74 @@ mod r118_primary_backup_dispatch_expiry_tests {
   links.expire_link(2,3);
   assert_eq!(send(&mut nic,&owned,&links,owner,[18,19]),Err(Error::Unexpected));
   assert_eq!(nic.send_count,1);
+ }
+}
+
+#[cfg(test)]
+mod r119_scheduler_udp_ingress_regression_tests {
+ use super::*;
+ use crate::udp_owner_epoch::{Error as OwnerError,Registry,Grant};
+ const MAC:[u8;6]=[0x52,0x54,0,0x12,0x34,0x56];
+ fn frame(port:u16)->([u8;FRAME_CAP],usize){
+  let mut f=[0u8;FRAME_CAP];
+  ethernet_header(&mut f,MAC,PEER_MAC,0x0800);
+  ipv4_header(&mut f[14..34],17,12,0x3000);
+  f[26..30].copy_from_slice(&PEER_IP);
+  f[30..34].copy_from_slice(&LOCAL_IP);
+  put16(&mut f,24,0);
+  let ip=checksum(&f[14..34]);put16(&mut f,24,ip);
+  let udp=&mut f[34..46];
+  put16(udp,0,PEER_UDP_PORT);put16(udp,2,port);put16(udp,4,12);
+  udp[8..12].copy_from_slice(b"data");
+  let sum=transport_sum(&PEER_IP,&LOCAL_IP,17,udp);
+  put16(udp,6,if sum==0{0xffff}else{sum});
+  (f,46)
+ }
+ #[test]
+ fn foreign_registered_port_close_never_discards_owner_queue(){
+  let mut sockets=EpochUdpEndpoints::<3,4>::new();
+  let mut registry=Registry::<3>::new();
+  sockets.bind_registered(&mut registry,1,3,5111).unwrap();
+  sockets.bind_registered(&mut registry,2,4,5112).unwrap();
+  sockets.send_local(1,3,5111,5112,b"peer").unwrap();
+  let foreign=Grant{pid:1,generation:3,port:5112};
+  assert_eq!(sockets.close_registered_batch(&mut registry,&[foreign]),
+      Err(SocketError::Denied));
+  assert_eq!(registry.active_count(),2);
+  assert_eq!(sockets.pending_owned(2,4),Ok(1));
+  let mut out=[0u8;8];
+  assert_eq!(sockets.receive(2,4,5112,&mut out),Ok(4));
+  assert_eq!(&out[..4],b"peer");
+ }
+ #[test]
+ fn network_ingress_checks_port_generation_before_parsing(){
+  let mut sockets=EpochUdpEndpoints::<2,3>::new();
+  let mut registry=Registry::<2>::new();
+  sockets.bind_registered(&mut registry,7,9,5301).unwrap();
+  let (packet,n)=frame(5301);
+  assert_eq!(sockets.ingest_registered_frame(&registry,7,10,5301,
+      &packet[..n],MAC),Err(IngressError::Endpoint(SocketError::Denied)));
+  assert_eq!(sockets.pending_owned(7,9),Ok(0));
+  assert_eq!(sockets.ingest_registered_frame(&registry,7,9,5301,
+      &packet[..n],MAC),Ok(()));
+  assert_eq!(sockets.pending_owned(7,9),Ok(1));
+  assert_eq!(sockets.retire_exact_kernel(&mut registry,7,9),Ok(1));
+  sockets.bind_registered(&mut registry,7,10,5301).unwrap();
+  assert_eq!(sockets.ingest_registered_frame(&registry,7,9,5301,
+      &packet[..n],MAC),Err(IngressError::Endpoint(SocketError::Denied)));
+  assert_eq!(sockets.pending_owned(7,10),Ok(0));
+ }
+ #[test]
+ fn delayed_old_generation_cleanup_denies_new_registry_and_socket(){
+  let mut sockets=EpochUdpEndpoints::<2,2>::new();
+  let mut registry=Registry::<2>::new();
+  sockets.bind_registered(&mut registry,5,3,5101).unwrap();
+  assert_eq!(sockets.retire_exact_kernel(&mut registry,5,3),Ok(1));
+  sockets.bind_registered(&mut registry,5,4,5101).unwrap();
+  assert_eq!(sockets.retire_exact_kernel(&mut registry,5,3),
+      Err(SocketError::Denied));
+  assert_eq!(registry.authorize(5,4,5101),Ok(()));
+  assert_eq!(sockets.pending_owned(5,4),Ok(0));
+  assert_eq!(registry.authorize(5,3,5101),Err(OwnerError::Denied));
  }
 }

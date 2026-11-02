@@ -185,3 +185,6 @@ The additions below cover 19 **specific** ledger items with bounded new implemen
 
 ## Six commits / cohort 1 — filesystem and scheduler admission
 Cohort R118-001, R118-003, R118-004, R118-007, R118-009, R118-010, R118-013, R118-014, R118-016, R118-017. Implemented source: a failed write-time mount verification on an already selected disk quarantines cached handles; recovery revision exhaustion rejects without disk reads. Two regression tests. This does not complete the ten-item cohort; the physical SMP and QEMU gates remain open.
+
+## Six commits / cohort 2 — scheduler and NIC authority
+Cohort: R118-019, R118-025, R118-026, R118-027, R118-028, R118-040, R118-041, R118-042, R118-054, R118-055. Implemented: enforce registry/socket generation preflight in single-owner scheduler retirement; add host regression for forged UDP close, IRQ-equivalent ingress generation check, and stale process cleanup after PID reuse. This does **not** prove QEMU IRQ or physical multicore operation. Bootloader trust and unsafe physical power-cut remain OPEN.
