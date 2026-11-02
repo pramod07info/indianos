@@ -12,7 +12,7 @@ Base: `90656c3261bb6c4007f39e2a7d4a5403dc561f74` (merged R117 PR #749).
 - [ ] R118-001 — Audit cross-BSP mount revision synchronization
 - [x] R118-002 — Define documented lock order for namespace receipt admission
 - [ ] R118-003 — Reject stale mount revision after concurrent replace
-- [ ] R118-004 — Preflight partition identity before first disk read
+- [x] R118-004 — Preflight partition identity before first disk read
 - [x] R118-005 — Guard selected-volume receipt after mount probe
 - [x] R118-006 — Fail closed when volume geometry changes
 - [x] R118-007 — Reject cached handle after recovery revision
@@ -27,17 +27,17 @@ Base: `90656c3261bb6c4007f39e2a7d4a5403dc561f74` (merged R117 PR #749).
 ## W2 Scheduler and capability retirement
 
 - [x] R118-015 — Define file/network/capability teardown lock order
-- [ ] R118-016 — Audit scheduler exit from normal return
-- [ ] R118-017 — Audit scheduler exit from fault path
+- [x] R118-016 — Audit scheduler exit from normal return
+- [x] R118-017 — Audit scheduler exit from fault path
 - [x] R118-018 — Reject stale PID generation during revocation
-- [ ] R118-019 — Revoke delegated directory lease at owner exit
+- [x] R118-019 — Revoke delegated directory lease at owner exit
 - [x] R118-020 — Revoke exact owner UDP ports at exit
 - [x] R118-021 — Preserve peer PID leases on owner fault
 - [x] R118-022 — Close outstanding file handles atomically
 - [x] R118-023 — Reject replayed lifecycle exit acknowledgement
 - [x] R118-024 — Verify event FIFO head after wraparound
-- [ ] R118-025 — Check scheduler rollback cannot resurrect owner
-- [ ] R118-026 — Stress three-process mixed resource teardown
+- [x] R118-025 — Check scheduler rollback cannot resurrect owner
+- [x] R118-026 — Stress three-process mixed resource teardown
 - [ ] R118-027 — Run two-BSP scheduler revocation stress
 - [ ] R118-028 — Qualify real multicore IPI and teardown safety
 
@@ -228,3 +228,13 @@ The production `mount_partition_receipt_healthy` and read-only diagnostic path n
 
 ### Pinned MBR identity proof preflight
 The selected-mount preflight now compares the originally selected MBR partition index/LBA/length with the embedded MBR entry and validates its complete pinned sector CRC before reading disk. This is followed by mandatory fresh on-disk identity checks. A forged CRC or a conflicting but in-range LBA receipt is rejected with zero sector I/O. GPT still uses pinned GUID/geometry binding followed by mandatory on-disk table verification; this is **not** a physical disk lock.
+
+## Source-level closeout of six previously open tasks
+
+- **R118-004:** pinned MBR receipt is validated against original sector CRC, entry index and exact start/count before disk I/O; GPT GUID/geometry remain bound and verified through independent on-disk reads. This is not a physical no-lock concurrent-disk proof.
+- **R118-016/017:** the real scheduler normal terminal and fault branches both invoke `revoke_task_authority` before fallible page-table reclamation; the rollback/discard path invokes it idempotently again. This is source-level kernel integration, not SMP/IRQ fault qualification.
+- **R118-019:** production exit invokes exact PID-generation delegated shared-directory lease revocation, with host scheduler tests proving old generation gone and successor preserved.
+- **R118-025:** rollback/repeated retire and PID-reuse host tests preserve replacement owner’s exact capabilities, UDP grants and handles; no resurrection through stale worker cleanup.
+- **R118-026:** 32 deterministic three-process sessions exercise UDP registry and delegated capability tables, plus the existing two-owner filesystem ABI, checking stale batch denial, peer datagrams and rebind. This is mixed-service **host** stress, not a physical three-BSP run or a cross-service atomic commit.
+
+These six boxes record scoped source and host acceptance only. All exact-head CI, QEMU-specific, independent review and physical hardware gates remain open until their own evidence is available. The six-commit 60-ID assignment alone is never treated as completion.
