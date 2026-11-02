@@ -136,3 +136,7 @@ Five *logical* workstreams; no five independent autonomous engineering agents we
 ## R117 real-path integration addition
 
 The live single-BSP scheduler now invokes the exact-generation file retirement batch for its actual process teardown; the existing QEMU virtio-net packet send path now uses the double-sampled trusted-clock contract, with a **synthetic QEMU test clock only**. This does not qualify physical monotonic IRQ timing or SMP.
+
+## R117 multi-commit integration continuation
+
+Three focused implementation commits are permitted for this continuation at the user's explicit request; the previous one-commit rule is superseded **for this PR**. Current changes include (1) ring-3 authenticated socket-close helper wired to live syscall 36 with stale/foreign owner adversarial tests, (2) namespace + selected-volume revision guard before and after the actual partition mount probe, and (3) mandatory targeted `r117_` host tests, optimized no_std build and persistent graphical Files QEMU workflow on modified source paths. R117-071, 074, 084, 086, 088, 094 and 099 remain pending **full exact-head CI/acceptance** and SMP/hardware qualifications. Real multi-CPU concurrency is NOT proven by the single-BSP guard; COW disk simulation is NOT hardware power-cut evidence. Never mark these gates green from text or a successful cargo check alone.
