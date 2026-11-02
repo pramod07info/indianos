@@ -89,7 +89,7 @@ Base: `90656c3261bb6c4007f39e2a7d4a5403dc561f74` (merged R117 PR #749).
 - [ ] R118-066 — Require full QEMU network and boot matrix
 - [ ] R118-067 — Require independent kernel/security review
 - [ ] R118-068 — Confirm CI exact integration SHA
-- [ ] R118-069 — Record scope distinction between QEMU and physical hardware
+- [x] R118-069 — Record scope distinction between QEMU and physical hardware
 - [ ] R118-070 — Publish protected merge and post-merge main evidence
 
 ## Inherited from merged R117: 22 unresolved gates
@@ -188,3 +188,6 @@ Cohort R118-001, R118-003, R118-004, R118-007, R118-009, R118-010, R118-013, R11
 
 ## Six commits / cohort 2 — scheduler and NIC authority
 Cohort: R118-019, R118-025, R118-026, R118-027, R118-028, R118-040, R118-041, R118-042, R118-054, R118-055. Implemented: enforce registry/socket generation preflight in single-owner scheduler retirement; add host regression for forged UDP close, IRQ-equivalent ingress generation check, and stale process cleanup after PID reuse. This does **not** prove QEMU IRQ or physical multicore operation. Bootloader trust and unsafe physical power-cut remain OPEN.
+
+## Six commits / cohort 3 — test and release evidence
+Cohort: R118-056, R118-062, R118-063, R118-064, R118-065, R118-066, R118-067, R118-068, R118-069, R118-070. Added a standard-library Python exact-head read-only GitHub checker and hardware-vs-QEMU acceptance matrix. R118-069 is documentation-complete; other cohort items remain OPEN until evidence exists, including all hardware and protected-release gates.
