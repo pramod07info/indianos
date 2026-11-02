@@ -126,7 +126,15 @@ impl Mouse{
         if self.received<3{return None;}
         self.received=0;
         let [flags,x,y]=self.packet;
+        self.packet=[0;3]; // discard stale packet bytes after every frame
         if flags&0xc0!=0{return None;} // overflow: ignore entire packet.
+        // Standard PS/2 packet sign flags must agree with the high bit of
+        // their respective motion bytes. An inconsistent frame cannot
+        // produce a forged jump or a button transition in the desktop.
+        if ((x&0x80!=0)!=(flags&0x10!=0)) ||
+           ((y&0x80!=0)!=(flags&0x20!=0)){
+            return None;
+        }
         let dx=if flags&0x10!=0{(x as i16)-256}else{x as i16};
         let dy=if flags&0x20!=0{(y as i16)-256}else{y as i16};
         let left=flags&1!=0;
@@ -198,6 +206,35 @@ mod tests{
         }
         assert!(valid_mouse_status(0x21));
         assert!(!valid_mouse_status(0x01));
+    }
+
+    #[test]
+    fn m1_r088_mouse_rejects_inconsistent_signs_before_button_update(){
+        let mut mouse=Mouse{packet:[0;3],received:0,last_left:false};
+        for [header,x,y] in [[0x09,0x80,0],[0x19,0x01,0],
+                             [0x09,0,0x80],[0x29,0,0x01]]{
+            assert_eq!(mouse.feed(header),None);
+            assert_eq!(mouse.feed(x),None);
+            assert_eq!(mouse.feed(y),None);
+            assert!(!mouse.last_left);
+            assert_eq!(mouse.received,0);
+            assert_eq!(mouse.packet,[0;3]);
+        }
+        assert_eq!(mouse.feed(0x09),None);
+        assert_eq!(mouse.feed(1),None);
+        assert_eq!(mouse.feed(2),Some(Packet{dx:1,dy:2,left:true}));
+        assert!(mouse.last_left);
+    }
+    #[test]
+    fn m1_r088_mouse_valid_negative_axes_and_overflow_resynchronize(){
+        let mut mouse=Mouse{packet:[0;3],received:0,last_left:false};
+        for b in [0xc9,0x80,0x80]{assert_eq!(mouse.feed(b),None);}
+        assert_eq!(mouse.packet,[0;3]);
+        assert!(!mouse.last_left);
+        assert_eq!(mouse.feed(0x38),None);
+        assert_eq!(mouse.feed(0xfb),None);
+        assert_eq!(mouse.feed(0xf6),Some(Packet{dx:-5,dy:-10,left:false}));
+        assert_eq!(mouse.packet,[0;3]);
     }
     #[test]fn packet_sync_buttons_and_signed_axes(){
         let mut m=Mouse{packet:[0;3],received:0,last_left:false};

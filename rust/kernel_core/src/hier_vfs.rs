@@ -79,6 +79,9 @@ impl<D:BlockDevice> HierVfs<D>{
  }
  pub fn into_device(self)->D{self.fs.into_device()}
  pub fn generation(&self)->u64{self.fs.generation()}
+ /// An actual persistence barrier, forwarded to the selected block device.
+ /// Unsupported storage MUST return an error instead of false success.
+ pub fn sync(&mut self)->Result<(),FsError>{self.fs.sync()}
  fn contradictory_alias(&self,p:&Path)->bool{
   let mut key=p.key;key[2]=if key[2]==b'd'{b'f'}else{b'd'};
   let mut own=false;let mut opposite=false;
