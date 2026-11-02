@@ -227,7 +227,7 @@ fn gpt<D:BlockDevice>(disk:&mut D)->Result<PartitionSet,Error>{
 pub fn discover<D:BlockDevice>(disk:&mut D)->Result<PartitionSet,Error>{
  let capacity=disk.sector_count();
  if capacity<2{return Err(Error::Invalid);}
- let mut pinned=DiscoveryDevice{disk,capacity};
+ let mut pinned=DiscoveryDevice{disk,capacity,invalidated:core::cell::Cell::new(false)};
  let result=discover_verified(&mut pinned)?;
  pinned.check_capacity()?;
  Ok(result)
@@ -236,10 +236,16 @@ pub fn discover<D:BlockDevice>(disk:&mut D)->Result<PartitionSet,Error>{
 /// Returning the snapshot here also prevents a zero-capacity media removal
 /// from underflowing protective-MBR arithmetic after the initial check.
 /// The adapter remains a hard read-only capability, including on errors.
-struct DiscoveryDevice<'a,D:BlockDevice>{disk:&'a mut D,capacity:u64}
+struct DiscoveryDevice<'a,D:BlockDevice>{
+ disk:&'a mut D,capacity:u64,invalidated:core::cell::Cell<bool>,
+}
 impl<D:BlockDevice> DiscoveryDevice<'_,D>{
  fn check_capacity(&self)->Result<(),BlockError>{
-  if self.disk.sector_count()!=self.capacity{return Err(BlockError::Io);}
+  if self.invalidated.get(){return Err(BlockError::Io);}
+  if self.disk.sector_count()!=self.capacity{
+   self.invalidated.set(true);
+   return Err(BlockError::Io);
+  }
   Ok(())
  }
 }
@@ -387,7 +393,7 @@ pub fn mount_gpt_selected_healthy<'a,D:BlockDevice>(disk:&'a mut D,
    .map_err(MountError::Partition)?;
   if final_selection!=expected{return Err(MountError::Partition(Error::Invalid));}
   Ok(())
- }))?;
+ }, |_|MountError::Partition(Error::Invalid)))?;
  Ok(mounted)
 }
 /// Explicit recovery operation used by the authenticated Terminal service.
@@ -1419,6 +1425,87 @@ mod m1_partition_tests{
   disk.data[39].fill(0x39);disk.data[140].fill(0x8c);
   disk
  }
+
+ #[test]fn m1_r088_gpt_session_retires_if_guid_rotates_after_command_write(){
+  use crate::m1_persistent_terminal::{GptTerminalSession,PartitionCommandError};
+  use crate::batch6_security::{FILE_READ,FILE_WRITE};
+  struct Rotated{disk:Disk,rotate_on_write:bool,rotated:bool}
+  impl BlockDevice for Rotated{
+   fn sector_count(&self)->u64{self.disk.sector_count()}
+   fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+    ->Result<(),BlockError>{self.disk.read_sector(lba,out)}
+   fn write_sector(&mut self,lba:u64,data:&[u8;SECTOR_BYTES])
+    ->Result<(),BlockError>{
+    self.disk.write_sector(lba,data)?;
+    if self.rotate_on_write&&(40..140).contains(&lba)&&!self.rotated{
+     self.disk.data[1][56..72].fill(9);
+     rechecksum_gpt(&mut self.disk);
+     self.rotated=true;
+    }
+    Ok(())
+   }
+  }
+  let original=m1_recovery_disk();
+  let mut disk=Rotated{disk:original,rotate_on_write:false,rotated:false};
+  let auth=m1_r050_auth(FILE_READ|FILE_WRITE,200);
+  let owner=m1_r050_owner();
+  let mut session=GptTerminalSession::open(&mut disk,0,&auth,owner,1,150).unwrap();
+  disk.rotate_on_write=true;
+  let mut response=[0xa5;32];
+  assert_eq!(session.execute(&mut disk,&auth,owner,2,
+    b"write /work/a changed",&mut response),
+    Err(PartitionCommandError::Mount(MountError::Partition(Error::Invalid))));
+  assert!(disk.rotated);
+  assert_eq!(response,[0;32]);
+  assert!(!session.is_active());
+  // Even a later valid media view cannot revive an already retired session.
+  disk.disk.data[1][56..72].fill(1);
+  rechecksum_gpt(&mut disk.disk);
+  let mut other=[0xa5;32];
+  assert_eq!(session.execute(&mut disk,&auth,owner,3,b"cat /work/a",&mut other),
+    Err(PartitionCommandError::Command(
+      crate::m1_persistent_terminal::Error::Denied)));
+  assert_eq!(other,[0xa5;32]);
+ }
+
+ #[test]fn m1_r089_failing_gpt_fsync_retires_session_without_unauthorized_retry(){
+  use crate::m1_persistent_terminal::{GptTerminalSession,PartitionCommandError,Error as CmdError};
+  use crate::batch6_security::{FILE_READ,FILE_WRITE};
+  struct FlushDriver{disk:Disk,fail:bool,flushes:usize}
+  impl BlockDevice for FlushDriver{
+   fn sector_count(&self)->u64{self.disk.sector_count()}
+   fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+    ->Result<(),BlockError>{self.disk.read_sector(lba,out)}
+   fn write_sector(&mut self,lba:u64,input:&[u8;SECTOR_BYTES])
+    ->Result<(),BlockError>{self.disk.write_sector(lba,input)}
+   fn sync(&mut self)->Result<(),BlockError>{
+    self.flushes+=1;
+    if self.fail{Err(BlockError::Io)}else{Ok(())}
+   }
+  }
+  let mut disk=FlushDriver{disk:m1_recovery_disk(),fail:true,flushes:0};
+  let owner=m1_r050_owner();
+  let auth=m1_r050_auth(FILE_READ|FILE_WRITE,200);
+  let mut session=GptTerminalSession::open(&mut disk,0,&auth,owner,1,100).unwrap();
+  let mut out=[0xa5;32];
+  let writes=disk.disk.writes;
+  assert_eq!(session.execute(&mut disk,&auth,owner,2,b"fsync",&mut out),
+   Err(PartitionCommandError::Command(CmdError::Io(FsError::Io))));
+  assert!(!session.is_active());
+  assert_eq!(disk.flushes,1);
+  assert_eq!(disk.disk.writes,writes);
+  assert_eq!(out,[0xa5;32]);
+  disk.fail=false;
+  assert_eq!(session.execute(&mut disk,&auth,owner,3,b"fsync",&mut out),
+   Err(PartitionCommandError::Command(CmdError::Denied)));
+  assert_eq!(disk.flushes,1);
+  let mut fresh=GptTerminalSession::open(&mut disk,0,&auth,owner,3,100).unwrap();
+  assert_eq!(fresh.execute(&mut disk,&auth,owner,4,b"fsync",&mut out),Ok(6));
+  assert_eq!(&out[..6],b"synced");
+  assert_eq!(disk.flushes,2);
+  assert_eq!(fresh.execute(&mut disk,&auth,owner,5,b"cat /work/a",&mut out),Ok(9));
+  assert_eq!(&out[..9],b"preserved");
+ }
  #[test]fn m1_recovery_nil_disk_guid_cannot_create_a_pinned_selection(){
   use crate::m1_persistent_terminal::{GptTerminalSession,PartitionCommandError};
   use crate::batch6_security::{FILE_READ,FILE_WRITE};
@@ -1809,7 +1896,7 @@ mod m1_partition_tests{
  #[test]fn m1_discovery_adapter_rejects_pre_read_changes_and_all_writes(){
   let mut disk=ChangingCapacity{disk:gpt_disk(),capacity:core::cell::Cell::new(256),
    reads:0,change_at:usize::MAX,replacement:0};
-  let mut pinned=DiscoveryDevice{disk:&mut disk,capacity:256};
+  let mut pinned=DiscoveryDevice{disk:&mut disk,capacity:256,invalidated:core::cell::Cell::new(false)};
   let mut bytes=[0xa5;SECTOR_BYTES];
   assert_eq!(pinned.write_sector(0,&bytes),Err(BlockError::ReadOnly));
   assert_eq!(pinned.read_sector(256,&mut bytes),Err(BlockError::OutOfRange));
@@ -1832,7 +1919,7 @@ mod m1_partition_tests{
    }
   }
   let mut raw=DirtyFailure{reads:0,writes:0};
-  let mut view=DiscoveryDevice{disk:&mut raw,capacity:256};
+  let mut view=DiscoveryDevice{disk:&mut raw,capacity:256,invalidated:core::cell::Cell::new(false)};
   let mut out=[0xa5;SECTOR_BYTES];
   assert_eq!(view.read_sector(0,&mut out),Err(BlockError::Io));
   assert_eq!(out,[0;SECTOR_BYTES]); // never expose dirty driver output
@@ -1844,7 +1931,7 @@ mod m1_partition_tests{
  #[test]fn m1_r087b_discovery_stable_mbr_reads_complete_sector_without_writes(){
   let mut disk=mbr_disk();
   let expected=disk.data[0];
-  let mut view=DiscoveryDevice{disk:&mut disk,capacity:256};
+  let mut view=DiscoveryDevice{disk:&mut disk,capacity:256,invalidated:core::cell::Cell::new(false)};
   let mut out=[0xa5;SECTOR_BYTES];
   assert_eq!(view.read_sector(0,&mut out),Ok(()));
   assert_eq!(out,expected);
@@ -1853,11 +1940,42 @@ mod m1_partition_tests{
   assert_eq!(disk.writes,0);
  }
 
+
+ #[test]fn m1_r088_discovery_capacity_swap_is_permanently_rejected(){
+  let capacity=core::cell::Cell::new(256u64);
+  let mut disk=ChangingCapacity{disk:mbr_disk(),capacity,reads:0,
+   change_at:usize::MAX,replacement:0};
+  let mut view=DiscoveryDevice{disk:&mut disk,capacity:256,
+   invalidated:core::cell::Cell::new(false)};
+  let mut bytes=[0xa5;SECTOR_BYTES];
+  view.disk.capacity.set(257);
+  assert_eq!(view.read_sector(0,&mut bytes),Err(BlockError::Io));
+  view.disk.capacity.set(256);
+  assert_eq!(view.read_sector(0,&mut bytes),Err(BlockError::Io));
+  assert_eq!(bytes,[0xa5;SECTOR_BYTES]);
+  assert_eq!(view.check_capacity(),Err(BlockError::Io));
+  drop(view);
+  assert_eq!(disk.reads,0);assert_eq!(disk.disk.writes,0);
+ }
+ #[test]fn m1_r088_discovery_mid_read_swap_stays_revoked(){
+  let mut disk=ChangingCapacity{disk:mbr_disk(),
+   capacity:core::cell::Cell::new(256),reads:0,
+   change_at:1,replacement:257};
+  let mut view=DiscoveryDevice{disk:&mut disk,capacity:256,
+   invalidated:core::cell::Cell::new(false)};
+  let mut bytes=[0xa5;SECTOR_BYTES];
+  assert_eq!(view.read_sector(0,&mut bytes),Err(BlockError::Io));
+  assert_eq!(bytes,[0;SECTOR_BYTES]);
+  view.disk.capacity.set(256);
+  assert_eq!(view.read_sector(0,&mut bytes),Err(BlockError::Io));
+  drop(view);
+  assert_eq!(disk.reads,1);assert_eq!(disk.disk.writes,0);
+ }
  #[test]fn m1_discovery_adapter_scrubs_changed_transfer_and_rejects_tiny_media(){
   let mut disk=ChangingCapacity{disk:gpt_disk(),capacity:core::cell::Cell::new(256),
    reads:0,change_at:1,replacement:0};
   let mut bytes=[0xa5;SECTOR_BYTES];
-  let mut pinned=DiscoveryDevice{disk:&mut disk,capacity:256};
+  let mut pinned=DiscoveryDevice{disk:&mut disk,capacity:256,invalidated:core::cell::Cell::new(false)};
   assert_eq!(pinned.read_sector(0,&mut bytes),Err(BlockError::Io));
   assert_eq!(bytes,[0;SECTOR_BYTES]);
   assert_eq!(discover(&mut disk),Err(Error::Invalid));
