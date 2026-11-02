@@ -453,4 +453,80 @@ mod tests {
         img.page_count = 129;
         assert!(!page_owned(&img, 0x400000, 0x1000));
     }
+
+    // R117: user pointers for syscall 33 are copied through the same
+    // preflight as every live ring-3 descriptor. Crossing an unmapped page
+    // must fail before the first byte of kernel output is modified.
+    #[test]
+    fn r117_guest_descriptor_cross_page_guard_is_fail_atomic() {
+        let mut ram=Ram::new();
+        let mut img=staged(&mut ram);
+        let first=0x400ff8u64;
+        let second_va=0x401000u64;
+        let second_phys=img.pages[1].physical_address;
+        let mut out=[0xabu8;32];
+        assert!(unsafe{vmm_unmap_page(&mut img.tables,second_va)});
+        assert!(!unsafe{indianos_user_copy_readonly(
+            &img,first,out.as_mut_ptr().cast(),out.len())});
+        assert_eq!(out,[0xab;32]);
+        assert!(!unsafe{indianos_user_can_write(&img,first,32)});
+        assert!(unsafe{vmm_map_page(&mut img.tables,second_va,second_phys,
+            Permissions{writable:true,executable:false,user:true})});
+        assert!(unsafe{indianos_user_image_destroy(&mut img)});
+    }
+    #[test]
+    fn r117_guest_descriptor_unwritable_second_page_preserves_first_page() {
+        let mut ram=Ram::new();
+        let mut img=staged(&mut ram);
+        let first=0x400ff8u64;
+        let second_va=0x401000u64;
+        let second_phys=img.pages[1].physical_address;
+        let first_phys=img.pages[0].physical_address;
+        let first_idx=Ram::index(first_phys).unwrap();
+        let input=[0x73u8;32];
+        // The first page is writable. The second page is mapped readable,
+        // but must not allow a partial copy to the first eight bytes.
+        let first_bytes=unsafe{
+            core::slice::from_raw_parts(
+                ram.frames[first_idx].as_ptr().cast::<u8>().add(PAGE-8),8)
+        };
+        assert_eq!(first_bytes,[0;8]);
+        assert!(unsafe{vmm_unmap_page(&mut img.tables,second_va)});
+        assert!(unsafe{vmm_map_page(&mut img.tables,second_va,second_phys,
+            Permissions{writable:false,executable:false,user:true})});
+        assert!(!unsafe{indianos_user_copy_writable(
+            &img,first,input.as_ptr(),input.len())});
+        let first_bytes=unsafe{
+            core::slice::from_raw_parts(
+                ram.frames[first_idx].as_ptr().cast::<u8>().add(PAGE-8),8)
+        };
+        assert_eq!(first_bytes,[0;8]);
+        assert!(unsafe{vmm_unmap_page(&mut img.tables,second_va)});
+        assert!(unsafe{vmm_map_page(&mut img.tables,second_va,second_phys,
+            Permissions{writable:true,executable:false,user:true})});
+        assert!(unsafe{indianos_user_copy_writable(
+            &img,first,input.as_ptr(),input.len())});
+        let mut out=[0u8;32];
+        assert!(unsafe{indianos_user_copy_readonly(
+            &img,first,out.as_mut_ptr().cast(),out.len())});
+        assert_eq!(out,input);
+        assert!(unsafe{indianos_user_image_destroy(&mut img)});
+    }
+    #[test]
+    fn r117_guest_descriptor_noncanonical_and_guard_addresses_denied() {
+        let mut ram=Ram::new();
+        let mut img=staged(&mut ram);
+        let mut out=[0x3cu8;64];
+        for addr in [
+            0u64,0x3fffc0,0x401fffu64,0x402000u64,
+            0xffff_ffff_ffff_fff0u64,0x8000_0000_0000_0000u64,
+        ]{
+            assert!(!unsafe{indianos_user_copy_readonly(
+                &img,addr,out.as_mut_ptr().cast(),out.len())});
+            assert_eq!(out,[0x3c;64]);
+            assert!(!unsafe{indianos_user_can_write(&img,addr,64)});
+        }
+        assert!(unsafe{indianos_user_image_destroy(&mut img)});
+    }
+
 }
