@@ -89,9 +89,9 @@ Items 001–070 are 70 granular source-level behaviors implemented across five l
 ## 30 outstanding integration, hardware and release gates
 
 - [ ] R117-071 — Inherited R116-071 — Inherited R115-074 — Reject concurrent mount replacement during path lookup  
-- [ ] R117-072 — Inherited R116-072 — Inherited R115-075 — Add adversarial ring3 namespace pointer QEMU boot test
+- [x] R117-072 — Inherited R116-072 — Inherited R115-075 — Add adversarial ring3 namespace pointer QEMU boot test
 - [ ] R117-073 — Inherited R116-073 — Inherited R115-078 — Enforce port-generation checks at network ingress IRQ
-- [ ] R117-074 — Inherited R116-074 — Inherited R115-080 — Prove two guest processes cannot release peer ports in QEMU
+- [x] R117-074 — Inherited R116-074 — Inherited R115-080 — Prove two guest processes cannot release peer ports in QEMU
 - [ ] R117-075 — Inherited R116-075 — Inherited R115-083 — Exercise real ring3 delegated-handle revocation
 - [ ] R117-076 — Inherited R116-076 — Inherited R115-084 — Audit lock ordering of file/network lease teardown
 - [ ] R117-077 — Inherited R116-077 — Inherited R115-085 — Prove no scheduler teardown deadlock in SMP configuration
@@ -101,12 +101,12 @@ Items 001–070 are 70 granular source-level behaviors implemented across five l
 - [ ] R117-081 — Inherited R116-082 — Inherited R115-090 — Qualify physical boot-sector restoration on hardware
 - [ ] R117-082 — Inherited R116-083 — Inherited R115-092 — Read a kernel monotonic timestamp at transmit and retry
 - [ ] R117-083 — Inherited R116-085 — Inherited R115-095 — Qualify multiple physical NICs with IOMMU isolation
-- [ ] R117-084 — Inherited R116-086 — Inherited R115-096 — Complete required no_std release kernel build
+- [x] R117-084 — Inherited R116-086 — Inherited R115-096 — Complete required no_std release kernel build
 - [ ] R117-085 — Inherited R116-087 — Inherited R115-097 — Pass all host Rust tests on the exact integration commit
-- [ ] R117-086 — Inherited R116-088 — Inherited R115-098 — Pass persistent graphical desktop and VFS QEMU workflow
+- [x] R117-086 — Inherited R116-088 — Inherited R115-098 — Pass persistent graphical desktop and VFS QEMU workflow
 - [ ] R117-087 — Inherited R116-090 — Inherited R115-100 — Complete independent review and merge only with green required CI
-- [ ] R117-088 — Inherited R116-091 — Run ring3 QEMU two-process foreign-port close denial end to end
-- [ ] R117-089 — Inherited R116-092 — Run pointer-fuzz ring3 alias open with guard-page crossing
+- [x] R117-088 — Inherited R116-091 — Run ring3 QEMU two-process foreign-port close denial end to end
+- [x] R117-089 — Inherited R116-092 — Run pointer-fuzz ring3 alias open with guard-page crossing
 - [ ] R117-090 — Inherited R116-093 — Implement physical multicore scheduler lock ordering and IPI safety
 - [ ] R117-091 — Inherited R116-094 — Provide immutable production bootloader measurement root
 - [ ] R117-092 — Inherited R116-096 — Verify actual physical power-loss recovery and boot-sector repair
@@ -148,3 +148,18 @@ Latest previously green PR SHA `63a7f1b5ead15175c7a8cc1128462c64f52e3963` had **
 R117-072 and R117-089 now additionally have real `user_image` page-table based tests (`r117_guest_*`) for unmapped second page, read-only second page, invalid pointer overflow, and guard boundary denial; they are not equivalent to the specifically requested *adversarial ring-3 QEMU executable* acceptance. The graphical QEMU workflow now triggers when `user_image.rs` changes and runs these exact tests. Full guest-QEMU negative cases remain open.
 
 The user's request is for all 30 complete. Hardware-dependent R117-077/079/080/081/083/090/091/092/093/097 and full hardware IOMMU/power-loss paths cannot be responsibly checked without implementation plus physical lab evidence. The source tests only support the stated **single-BSP kernel** and **emulated** hardware scope.
+
+
+## Exact-head source evidence reconciliation
+
+The following **six gates** have verified end-to-end or optimized-build evidence from exact source commit `fff17005dec0605f367fb2e2f311e88ae6cea4be`:
+- **R117-072:** QEMU guest PID2 invoked actual file and directory syscalls on stack guard and crossing pointers; two-boot graphical Files CI SUCCESS on source SHA fff17005
+- **R117-074:** Both running QEMU guest processes attempted foreign UDP port closures and retained PING/PONG; graphical Files CI SUCCESS on source SHA fff17005
+- **R117-084:** Optimized freestanding no_std cargo build SUCCESS within durable-files-desktop on source SHA fff17005
+- **R117-086:** Full graphical Files persistent-disk QEMU two-boot workflow SUCCESS on source SHA fff17005
+- **R117-088:** Real two-guest PID1/PID2 foreign UDP close denial plus peer PING/PONG acceptance SUCCESS in graphical Files QEMU on source SHA fff17005
+- **R117-089:** Actual ring3 alias OPEN descriptor pointers crossed guard/USER_TOP boundaries and were denied; graphical Files QEMU SUCCESS on source SHA fff17005
+
+Source: https://github.com/pramod07info/indianos/pull/749/checks
+
+**Important:** This documentation-only reconciliation creates a new Git commit and must itself be reviewed. New exact-head CI is required before final merge. R117-085 (host tests on exact *final* SHA), R117-094 (complete final exact-head CI matrix), R117-099 (final release matrix), R117-087/095/096/100 (review/merge/release evidence), and all physical/SMP/firmware/IOMMU tests intentionally remain unchecked. The real scheduler directory-lease test passed on the previous source head, but R117-075 specifically asks for ring3 **delegated-handle revocation** acceptance, so it is not marked complete. R117-098 combines two-guest foreign port close and **ring3 lease revocation**; only the former was exercised in QEMU, so it remains open.
