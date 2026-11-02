@@ -29,11 +29,13 @@ MARKERS=(
     "IndianOS: R028 legacy virtio-net DMA queues initialized",
     "IndianOS: R028 Ethernet ARP peer resolved",
     "IndianOS: R028 IPv4 ICMP echo ping PASSED",
+    "IndianOS: R114 QEMU primary UDP path timed out and backup route selected",
     "IndianOS: R028 IPv4 UDP echo PASSED",
     "IndianOS: R028 UDP DNS A query indianos.test PASSED",
     "IndianOS: M2 live NIC IPv4/UDP DNS verifier PASSED",
     "IndianOS: R028 TCP three-way handshake SYN-ACK verified",
     "IndianOS: R028 TCP client request-response PASSED",
+    "IndianOS: R114 virtio-net reset and PCI bus-master shutdown verified PASSED",
     "IndianOS: R028 QEMU virtio-net end-to-end network client PASSED",
 )
 def u16(b:bytes)->int:return int.from_bytes(b,"big")
@@ -116,7 +118,13 @@ class Protocol:
             port=u16(data[2:4]);payload=data[8:]
             if port==UDP_PORT:
                 assert self.phase==2 and payload==b"r028-udp-request"
-                self.phase=3;self.counts["udp"]+=1
+                self.counts["udp"]+=1
+                if self.counts["udp"]==1:
+                    # Deterministic missing response (primary link blackhole).
+                    # Actual request reached the host over emulated Ethernet.
+                    return None
+                assert self.counts["udp"]==2,"unexpected retransmit count"
+                self.phase=3
                 return udp(b"r028-udp-response",UDP_PORT)
             if port==53:
                 assert self.phase==3 and len(payload)>=12+len(DNS_NAME)+4
@@ -222,8 +230,9 @@ def run(qemu:str,iso:pathlib.Path,ovmf:pathlib.Path)->None:
                     assert at>=0,f"missing or out of order {marker}"
                     position=at+len(marker)
                 for label in ("arp","ping","udp","dns","syn","data"):
-                    assert protocol.counts[label]==1,(
-                        f"host expected one verified {label} frame; got {protocol.counts[label]}")
+                    expected=2 if label=="udp" else 1
+                    assert protocol.counts[label]==expected,(
+                        f"host expected {expected} verified {label} frame(s); got {protocol.counts[label]}")
                 # Socket ACK is sent after the received TCP response. The
                 # kernel success marker is printed after that send completes.
                 print("R028 QEMU virtio-net ARP ICMP UDP DNS TCP end-to-end PASSED")

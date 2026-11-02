@@ -79,3 +79,106 @@ mod tests {
         assert_eq!(ports.bind(2,1,54),Ok(()));
     }
 }
+
+
+// R114: transactional owner operations. This remains a proposed policy
+// registry; live sockets must authenticate and serialize callers.
+impl<const N:usize> Registry<N> {
+    pub fn active_count(&self) -> usize {
+        self.entries.iter().flatten().count()
+    }
+    pub fn owner_of(&self, port:u16) -> Option<Grant> {
+        if port==0 { return None; }
+        self.entries.iter().flatten().find(|grant|grant.port==port).copied()
+    }
+    /// Roll back the entire group if any member is stale, collides, or full.
+    pub fn bind_batch(&mut self, grants:&[Grant]) -> Result<usize,Error> {
+        let mut staged=Self { entries:self.entries };
+        for &g in grants {
+            staged.bind(g.pid,g.generation,g.port)?;
+        }
+        self.entries=staged.entries;
+        Ok(grants.len())
+    }
+    /// Exact-owner release; wrong epochs cannot unbind another process.
+    pub fn unbind(&mut self, pid:u32, generation:u64, port:u16)
+        -> Result<(),Error>
+    {
+        if pid==0||generation==0||port==0{return Err(Error::Invalid);}
+        let slot=self.entries.iter_mut().find(|slot|
+            slot.as_ref().is_some_and(|g|
+                g.pid==pid&&g.generation==generation&&g.port==port))
+            .ok_or(Error::Denied)?;
+        *slot=None;
+        Ok(())
+    }
+    /// Atomic move of a grant, retaining the old port on any failure.
+    pub fn move_port(&mut self,pid:u32,generation:u64,
+        old_port:u16,new_port:u16)->Result<(),Error>
+    {
+        if pid==0||generation==0||old_port==0||new_port==0 {
+            return Err(Error::Invalid);
+        }
+        if old_port==new_port { return self.authorize(pid,generation,old_port); }
+        let mut staged=Self { entries:self.entries };
+        staged.unbind(pid,generation,old_port)?;
+        staged.bind(pid,generation,new_port)?;
+        self.entries=staged.entries;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod r114_udp_epoch_tests {
+    use super::*;
+    fn grant(pid:u32, generation:u64, port:u16)->Grant{
+        Grant{pid,generation,port}
+    }
+    #[test]
+    fn batch_admission_never_partially_binds() {
+        let mut ports=Registry::<3>::new();
+        ports.bind(1,1,10).unwrap();
+        assert_eq!(ports.bind_batch(&[grant(2,1,20),grant(3,1,10)]),
+            Err(Error::Duplicate));
+        assert_eq!(ports.active_count(),1);
+        assert_eq!(ports.owner_of(20),None);
+        assert_eq!(ports.bind_batch(&[grant(2,1,20),grant(3,1,30)]),Ok(2));
+        assert_eq!(ports.active_count(),3);
+        assert_eq!(ports.bind_batch(&[grant(4,1,40)]),Err(Error::Full));
+    }
+    #[test]
+    fn wrong_generation_never_releases_or_moves_a_port() {
+        let mut ports=Registry::<2>::new();
+        ports.bind(7,11,2500).unwrap();
+        assert_eq!(ports.unbind(7,12,2500),Err(Error::Denied));
+        assert_eq!(ports.move_port(7,12,2500,2600),Err(Error::Denied));
+        assert_eq!(ports.authorize(7,11,2500),Ok(()));
+        assert_eq!(ports.unbind(7,11,2500),Ok(()));
+        assert_eq!(ports.authorize(7,11,2500),Err(Error::Denied));
+    }
+    #[test]
+    fn failed_move_preserves_both_owners() {
+        let mut ports=Registry::<2>::new();
+        ports.bind(7,1,500).unwrap();
+        ports.bind(8,1,600).unwrap();
+        assert_eq!(ports.move_port(7,1,500,600),Err(Error::Duplicate));
+        assert_eq!(ports.owner_of(500),Some(grant(7,1,500)));
+        assert_eq!(ports.owner_of(600),Some(grant(8,1,600)));
+        assert_eq!(ports.move_port(7,1,500,500),Ok(()));
+        ports.unbind(8,1,600).unwrap();
+        assert_eq!(ports.move_port(7,1,500,600),Ok(()));
+        assert_eq!(ports.owner_of(500),None);
+        assert_eq!(ports.owner_of(600),Some(grant(7,1,600)));
+    }
+    #[test]
+    fn zero_capacity_and_invalid_batch_fail_closed() {
+        let mut empty=Registry::<0>::new();
+        assert_eq!(empty.bind_batch(&[]),Ok(0));
+        assert_eq!(empty.bind_batch(&[grant(1,1,1)]),Err(Error::Full));
+        assert_eq!(empty.active_count(),0);
+        let mut one=Registry::<1>::new();
+        assert_eq!(one.bind_batch(&[grant(1,0,1)]),Err(Error::Invalid));
+        assert_eq!(one.owner_of(0),None);
+        assert_eq!(one.move_port(0,1,1,2),Err(Error::Invalid));
+    }
+}

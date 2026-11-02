@@ -509,3 +509,484 @@ impl BootTrial{
   assert_eq!(t.journal.slots[1].attempts_remaining,3);
  }
 }
+
+
+/// Decode both independently checksummed boot metadata records. Torn or
+/// untrusted bytes are never interpreted as a bootable slot. This is only
+/// a read-only decision: firmware verification and durable writes are external.
+pub fn select_encoded_slots(records:&[[u8;SLOT_RECORD_BYTES];2],floor:u64)
+    ->Result<(usize,Slot),BootError>
+{
+    let invalid=Slot{valid_metadata:false,committed:false,version:0,
+        attempts_remaining:0};
+    let slots=[decode_slot(&records[0]).unwrap_or(invalid),
+               decode_slot(&records[1]).unwrap_or(invalid)];
+    let selected=select_slot(&slots,floor)?;
+    Ok((selected,slots[selected]))
+}
+
+/// Stage a CRC-updated record before mutating the in-memory mirror. The
+/// privileged caller must persist + fsync new metadata before booting.
+/// Interrupted physical writes are NOT handled by this codec.
+pub fn consume_encoded_attempt(records:&mut [[u8;SLOT_RECORD_BYTES];2],
+    floor:u64)->Result<usize,BootError>
+{
+    let (index,slot)=select_encoded_slots(records,floor)?;
+    let mut next=slot;
+    next.attempts_remaining-=1; // select_slot proves nonzero.
+    let staged=encode_slot(next).ok_or(BootError::NoBootableSlot)?;
+    records[index]=staged;
+    Ok(index)
+}
+
+/// Count valid committed records at a specified anti-rollback floor.
+/// Does not confer trust on an image or change firmware.
+pub fn bootable_record_count(records:&[[u8;SLOT_RECORD_BYTES];2],
+    floor:u64)->usize
+{
+    records.iter().filter_map(decode_slot)
+        .filter(|slot|bootable(*slot,floor)).count()
+}
+
+#[cfg(test)]
+mod r114_mirrored_boot_tests{
+    use super::*;
+    fn slot(v:u64,n:u8)->Slot{
+        Slot{valid_metadata:true,committed:true,version:v,attempts_remaining:n}
+    }
+    #[test]
+    fn checksum_damage_fails_over_to_last_valid_record(){
+        let mut r=[encode_slot(slot(5,2)).unwrap(),encode_slot(slot(9,2)).unwrap()];
+        r[1][18]=1;
+        assert_eq!(select_encoded_slots(&r,5),Ok((0,slot(5,2))));
+        assert_eq!(bootable_record_count(&r,5),1);
+    }
+    #[test]
+    fn consumption_never_modifies_another_slot(){
+        let mut r=[encode_slot(slot(5,2)).unwrap(),encode_slot(slot(9,1)).unwrap()];
+        let old=r[0];
+        assert_eq!(consume_encoded_attempt(&mut r,5),Ok(1));
+        assert_eq!(r[0],old);
+        assert_eq!(decode_slot(&r[1]),Some(slot(9,0)));
+        assert_eq!(consume_encoded_attempt(&mut r,5),Ok(0));
+        assert_eq!(decode_slot(&r[0]),Some(slot(5,1)));
+    }
+    #[test]
+    fn anti_rollback_and_corrupt_pair_leave_bytes_untouched(){
+        let mut r=[encode_slot(slot(1,2)).unwrap(),encode_slot(slot(3,2)).unwrap()];
+        let before=r;
+        assert_eq!(consume_encoded_attempt(&mut r,4),Err(BootError::NoBootableSlot));
+        assert_eq!(r,before);
+        r[0][0]=0;r[1][0]=0;
+        let before=r;
+        assert_eq!(consume_encoded_attempt(&mut r,0),Err(BootError::NoBootableSlot));
+        assert_eq!(r,before);
+    }
+    #[test]
+    fn uncommitted_or_exhausted_cannot_be_selected(){
+        let mut pending=slot(11,2);pending.committed=false;
+        let r=[encode_slot(pending).unwrap(),encode_slot(slot(10,0)).unwrap()];
+        assert_eq!(bootable_record_count(&r,0),0);
+        assert_eq!(select_encoded_slots(&r,0),Err(BootError::NoBootableSlot));
+    }
+}
+
+
+// R114 follow-up: two-phase inactive-slot storage updates over the existing
+// BlockDevice capability. Not wired to firmware/normal boot: the trusted boot
+// coordinator must provide two reserved, distinct, non-user LBAs and authenticate
+// any replacement image before publishing metadata.
+pub const BOOT_SECTOR_BYTES:usize=crate::block::SECTOR_BYTES;
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum SlotIoError { Device, Geometry, NoFallback, Downgrade, Verification }
+fn sector_record(slot:Slot)->Result<[u8;BOOT_SECTOR_BYTES],SlotIoError> {
+    let encoded=encode_slot(slot).ok_or(SlotIoError::Verification)?;
+    let mut full=[0u8;BOOT_SECTOR_BYTES];
+    full[..SLOT_RECORD_BYTES].copy_from_slice(&encoded);
+    Ok(full)
+}
+fn checked_sector_pair<D:crate::block::BlockDevice>(device:&D,
+    lbas:[u64;2])->Result<(),SlotIoError>{
+    let capacity=device.sector_count();
+    if lbas[0]==lbas[1]||lbas.iter().any(|&n|n>=capacity){
+        return Err(SlotIoError::Geometry)
+    }
+    Ok(())
+}
+fn read_pair<D:crate::block::BlockDevice>(
+    device:&mut D,lbas:[u64;2]
+)->Result<[Option<Slot>;2],SlotIoError>{
+    checked_sector_pair(device,lbas)?;
+    let mut selected=[None;2];
+    for i in 0..2 {
+        let mut bytes=[0u8;BOOT_SECTOR_BYTES];
+        device.read_sector(lbas[i],&mut bytes).map_err(|_|SlotIoError::Device)?;
+        if !bytes[SLOT_RECORD_BYTES..].iter().all(|&b|b==0){continue;}
+        let mut encoded=[0u8;SLOT_RECORD_BYTES];
+        encoded.copy_from_slice(&bytes[..SLOT_RECORD_BYTES]);
+        selected[i]=decode_slot(&encoded);
+    }
+    if checked_sector_pair(device,lbas).is_err(){return Err(SlotIoError::Device);}
+    Ok(selected)
+}
+/// Read both records, rejecting any I/O fault instead of treating it as
+/// corrupt-but-recoverable metadata. CRC damage to one record may fall back.
+pub fn load_slot_pair<D:crate::block::BlockDevice>(
+    device:&mut D,lbas:[u64;2],floor:u64
+)->Result<(usize,Slot),SlotIoError>{
+    let pair=read_pair(device,lbas)?;
+    let invalid=Slot{valid_metadata:false,committed:false,version:0,
+        attempts_remaining:0};
+    let slots=[pair[0].unwrap_or(invalid),pair[1].unwrap_or(invalid)];
+    let selected=select_slot(&slots,floor).map_err(|_|SlotIoError::NoFallback)?;
+    Ok((selected,slots[selected]))
+}
+fn write_barrier_verify<D:crate::block::BlockDevice>(
+    device:&mut D,lba:u64,record:&[u8;BOOT_SECTOR_BYTES])
+    ->Result<(),SlotIoError>{
+    device.write_sector(lba,record).map_err(|_|SlotIoError::Device)?;
+    device.sync().map_err(|_|SlotIoError::Device)?;
+    let mut observed=[0u8;BOOT_SECTOR_BYTES];
+    device.read_sector(lba,&mut observed).map_err(|_|SlotIoError::Device)?;
+    if observed!=*record{return Err(SlotIoError::Verification);}
+    Ok(())
+}
+/// Preserve the selected old slot while staging the new slot as uncommitted.
+/// Only after a successful flush+readback publish committed=true and flush
+/// again. Failures leave the old slot untouched, though the damaged inactive
+/// slot remains uncertain and requires readback/recovery on a new boot.
+pub fn publish_inactive_slot<D:crate::block::BlockDevice>(
+    device:&mut D,lbas:[u64;2],floor:u64,new:Slot
+)->Result<usize,SlotIoError>{
+    let (active,old)=load_slot_pair(device,lbas,floor)?;
+    if !new.valid_metadata||!new.committed||new.attempts_remaining==0||
+       new.version<=old.version||new.version<floor {
+        return Err(SlotIoError::Downgrade)
+    }
+    let inactive=1-active;
+    let mut staged=new;
+    staged.committed=false;
+    write_barrier_verify(device,lbas[inactive],&sector_record(staged)?)?;
+    write_barrier_verify(device,lbas[inactive],&sector_record(new)?)?;
+    Ok(inactive)
+}
+#[cfg(test)]
+mod r114_two_phase_sector_recovery_tests {
+    use super::*;
+    use crate::block::{BlockDevice,BlockError,SECTOR_BYTES};
+    struct Fake {
+        sectors:[[u8;SECTOR_BYTES];4], writes:usize,flushes:usize,
+        fail_write:usize,fail_flush:usize,
+    }
+    impl Fake {
+        fn new()->Self{
+            let mut disk=Self{sectors:[[0;SECTOR_BYTES];4],writes:0,
+                flushes:0,fail_write:0,fail_flush:0};
+            disk.sectors[1]=sector_record(Slot{valid_metadata:true,committed:true,
+                version:7,attempts_remaining:3}).unwrap();
+            disk
+        }
+    }
+    impl BlockDevice for Fake{
+        fn sector_count(&self)->u64{4}
+        fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+            ->Result<(),BlockError>{
+            *out=*self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?;
+            Ok(())
+        }
+        fn write_sector(&mut self,lba:u64,input:&[u8;SECTOR_BYTES])
+            ->Result<(),BlockError>{
+            self.writes+=1;
+            let slot=self.sectors.get_mut(lba as usize).ok_or(BlockError::OutOfRange)?;
+            if self.writes==self.fail_write {
+                slot[..17].copy_from_slice(&input[..17]); // torn write
+                return Err(BlockError::Io);
+            }
+            *slot=*input;Ok(())
+        }
+        fn sync(&mut self)->Result<(),BlockError>{
+            self.flushes+=1;
+            if self.flushes==self.fail_flush {Err(BlockError::Io)}
+            else {Ok(())}
+        }
+    }
+    fn next()->Slot {
+        Slot{valid_metadata:true,committed:true,version:8,attempts_remaining:2}
+    }
+    #[test]
+    fn successful_two_phase_update_selects_newer_after_remount(){
+        let mut d=Fake::new();
+        assert_eq!(publish_inactive_slot(&mut d,[1,2],7,next()),Ok(1));
+        assert_eq!(d.writes,2);
+        assert_eq!(d.flushes,2);
+        assert_eq!(load_slot_pair(&mut d,[1,2],7),Ok((1,next())));
+        assert_eq!(decode_slot(&d.sectors[1][..SLOT_RECORD_BYTES].try_into().unwrap()).unwrap().version,7);
+    }
+    #[test]
+    fn torn_first_and_second_writes_preserve_previous_committed_slot(){
+        for interrupted in [1,2] {
+            let mut d=Fake::new();d.fail_write=interrupted;
+            assert_eq!(publish_inactive_slot(&mut d,[1,2],7,next()),Err(SlotIoError::Device));
+            assert_eq!(load_slot_pair(&mut d,[1,2],7).unwrap().1.version,7);
+        }
+    }
+    #[test]
+    fn flush_failure_and_downgrade_are_fail_closed(){
+        for failed_flush in [1,2]{
+            let mut d=Fake::new();d.fail_flush=failed_flush;
+            assert_eq!(publish_inactive_slot(&mut d,[1,2],7,next()),Err(SlotIoError::Device));
+            // Do not claim the inactive sector is durable after a failed flush.
+            assert_eq!(d.sectors[1][..4],*b"IAB1");
+        }
+        let mut d=Fake::new();
+        let before=d.sectors;
+        assert_eq!(publish_inactive_slot(&mut d,[1,2],7,
+             Slot{version:7,..next()}),Err(SlotIoError::Downgrade));
+        assert_eq!(d.sectors,before);
+    }
+    #[test]
+    fn corrupt_records_bad_geometry_and_read_only_device_reject(){
+        let mut d=Fake::new();
+        assert_eq!(load_slot_pair(&mut d,[1,1],7),Err(SlotIoError::Geometry));
+        assert_eq!(publish_inactive_slot(&mut d,[1,5],7,next()),Err(SlotIoError::Geometry));
+        d.sectors[1][6]^=0x40;
+        assert_eq!(load_slot_pair(&mut d,[1,2],7),Err(SlotIoError::NoFallback));
+    }
+}
+
+
+/// Read-only recovery selection against an exact checked physical-partition
+/// receipt. Boot-slot metadata is separately stored in two reserved sectors
+/// OUTSIDE the selected filesystem. The trusted installer must allocate them
+/// and authenticate the image; this helper never writes, formats or loads it.
+#[cfg(feature="test-r031-vfs")]
+pub fn select_recovery_slot_readonly<D:crate::block::BlockDevice>(
+    disk:&mut D,
+    partition:crate::m1_partition::PartitionReceipt,
+    slot_lbas:[u64;2],
+    min_version:u64
+)->Result<(usize,Slot),SlotIoError>{
+    let start=partition.partition.start;
+    let end=start.checked_add(partition.partition.sectors)
+        .ok_or(SlotIoError::Geometry)?;
+    let capacity=partition.device_sectors;
+    // Exclude MBR/GPT primary and backup headers. Slot allocation remains
+    // explicitly reserved by installer; this is not a sector allocator.
+    if capacity<70 || slot_lbas[0]==slot_lbas[1] ||
+       slot_lbas.iter().any(|&sector|sector<34||
+          sector>=capacity.saturating_sub(34)||
+          (sector>=start&&sector<end)) {
+        return Err(SlotIoError::Geometry)
+    }
+    let mut readonly=crate::block::ReadOnlyDevice::new(disk);
+    // Before reading either slot, verify exact partition identity, geometry,
+    // metadata heads and data-bank health without granting any write.
+    let health=crate::m1_partition::probe_selected_receipt_readonly(
+        &mut readonly,partition).map_err(|_|SlotIoError::Verification)?;
+    if health.partition!=partition.partition{return Err(SlotIoError::Verification)}
+    let selected=load_slot_pair(&mut readonly,slot_lbas,min_version)?;
+    // Check receipt again after reading metadata so an observed hot-swap or
+    // changed GPT/MBR table cannot issue an apparently valid boot decision.
+    crate::m1_partition::probe_selected_receipt_readonly(
+        &mut readonly,partition).map_err(|_|SlotIoError::Verification)?;
+    Ok(selected)
+}
+
+
+// R114: restore an authenticated prior image from verified reserved backup
+// sectors into a distinct failed/inactive image region. The manifest is
+// domain-separated and binds the exact source, destination, sector count,
+// image version and SHA256 of the FULL source image. A real Ed25519 trust
+// backend must be supplied by the caller. Bootloader handoff, slot activation,
+// NVRAM, OVMF/physical firmware and reboot are NOT done here.
+pub const RECOVERY_MAX_SECTORS:u16=64;
+const RECOVERY_DOMAIN:&[u8;16]=b"IndianOS/RECV1\0\0";
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct SignedImageRecovery {
+ pub version:u64,pub backup_lba:u64,pub restore_lba:u64,
+ pub sectors:u16,pub digest:[u8;32],
+}
+impl SignedImageRecovery {
+ pub fn manifest(&self)->[u8;74] {
+  let mut data=[0u8;74];
+  data[..16].copy_from_slice(RECOVERY_DOMAIN);
+  data[16..24].copy_from_slice(&self.version.to_le_bytes());
+  data[24..32].copy_from_slice(&self.backup_lba.to_le_bytes());
+  data[32..40].copy_from_slice(&self.restore_lba.to_le_bytes());
+  data[40..42].copy_from_slice(&self.sectors.to_le_bytes());
+  data[42..74].copy_from_slice(&self.digest);
+  data
+ }
+ fn valid_geometry(&self,total:u64,floor:u64)->bool{
+  if self.version<floor||self.version==0||
+     self.sectors==0||self.sectors>RECOVERY_MAX_SECTORS||
+     self.digest==[0;32]||total<=68{return false;}
+  let Some(a)=self.backup_lba.checked_add(u64::from(self.sectors)) else{return false;};
+  let Some(b)=self.restore_lba.checked_add(u64::from(self.sectors)) else{return false;};
+  self.backup_lba>=34&&self.restore_lba>=34&&
+   a<=total-34&&b<=total-34&&
+   (a<=self.restore_lba||b<=self.backup_lba)
+ }
+}
+/// Actually copy authenticated backup sectors to an isolated restore region,
+/// flushing and verifying each destination sector via SHA256 readback.
+/// Reject all authentication/hash/geometry failures BEFORE ANY writes. A
+/// failed write/flush or readback never publishes a bootable slot record.
+/// The old backup region stays untouched even if restoring fails midway.
+pub fn restore_prior_signed_image<D:crate::block::BlockDevice,
+ V:crate::batch4_signature::Verify>(
+ device:&mut D,image:SignedImageRecovery,floor:u64,
+ roots:&[crate::batch4_signature::Root],verifier:&V,
+ envelope:&crate::batch4_signature::Envelope,
+)->Result<(),SlotIoError>{
+ if !image.valid_geometry(device.sector_count(),floor){
+  return Err(SlotIoError::Geometry);
+ }
+ let manifest=image.manifest();
+ if envelope.digest!=crate::m2_sha256::digest(&manifest) ||
+    crate::batch4_signature::check(roots,verifier,envelope,&manifest).is_err() {
+  return Err(SlotIoError::Verification);
+ }
+ let mut hash=crate::m2_sha256::Stream::new();
+ let mut buf=[0u8;BOOT_SECTOR_BYTES];
+ for i in 0..u64::from(image.sectors){
+  device.read_sector(image.backup_lba+i,&mut buf)
+    .map_err(|_|SlotIoError::Device)?;
+  hash.update(&buf).map_err(|_|SlotIoError::Verification)?;
+ }
+ if hash.finish()!=image.digest{return Err(SlotIoError::Verification);}
+ // Only after verifying every backup byte and signature may any write occur.
+ for i in 0..u64::from(image.sectors) {
+  device.read_sector(image.backup_lba+i,&mut buf)
+    .map_err(|_|SlotIoError::Device)?;
+  device.write_sector(image.restore_lba+i,&buf)
+    .map_err(|_|SlotIoError::Device)?;
+ }
+ device.sync().map_err(|_|SlotIoError::Device)?;
+ // Verify that the backup source did not change between authentication
+ // and the final restore write. A swapped/removable source may pass the
+ // initial signature check, then change during the copy (TOCTOU).
+ // In that case the inactive restore region is NEVER authorized for boot.
+ let mut rechecked=crate::m2_sha256::Stream::new();
+ for i in 0..u64::from(image.sectors){
+  device.read_sector(image.backup_lba+i,&mut buf)
+    .map_err(|_|SlotIoError::Device)?;
+  rechecked.update(&buf).map_err(|_|SlotIoError::Verification)?;
+ }
+ if rechecked.finish()!=image.digest{return Err(SlotIoError::Verification);}
+ let mut restored=crate::m2_sha256::Stream::new();
+ for i in 0..u64::from(image.sectors){
+  device.read_sector(image.restore_lba+i,&mut buf)
+    .map_err(|_|SlotIoError::Device)?;
+  restored.update(&buf).map_err(|_|SlotIoError::Verification)?;
+ }
+ if restored.finish()!=image.digest{return Err(SlotIoError::Verification);}
+ Ok(())
+}
+
+#[cfg(test)]
+mod r114_signed_system_image_restore_tests {
+ use super::*;
+ use crate::block::{BlockDevice,BlockError,SECTOR_BYTES};
+ use crate::batch4_signature::{Envelope,Root,Verify};
+ struct TrustedTest;
+ impl Verify for TrustedTest {
+  fn verify_digest_and_signature(&self,e:&Envelope,payload:&[u8])->bool {
+   // This is a host-test fixture, NOT a real publisher signature verifier.
+   e.digest==crate::m2_sha256::digest(payload)&&e.signature==[7;64]
+  }
+ }
+ struct Fake{
+  sectors:[[u8;SECTOR_BYTES];96],writes:usize,fail_write:bool,
+  corrupt_readback:bool,flushed:bool,tamper_backup_on_restore:bool,
+ }
+ impl Fake{
+  fn new()->Self {
+   let mut x=Self{sectors:[[0;SECTOR_BYTES];96],writes:0,
+    fail_write:false,corrupt_readback:false,flushed:false,
+    tamper_backup_on_restore:false};
+   x.sectors[35].fill(0x33);x.sectors[36].fill(0x59);
+   x
+  }
+  fn image(&self)->SignedImageRecovery {
+   let mut h=crate::m2_sha256::Stream::new();
+   h.update(&self.sectors[35]).unwrap();
+   h.update(&self.sectors[36]).unwrap();
+   SignedImageRecovery{version:8,backup_lba:35,restore_lba:45,
+    sectors:2,digest:h.finish()}
+  }
+ }
+ impl BlockDevice for Fake {
+  fn sector_count(&self)->u64{self.sectors.len() as u64}
+  fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+      ->Result<(),BlockError>{
+   *out=*self.sectors.get(lba as usize).ok_or(BlockError::OutOfRange)?;
+   if self.corrupt_readback&&self.flushed&&lba==45 {out[0]^=1;}
+   Ok(())
+  }
+  fn write_sector(&mut self,lba:u64,data:&[u8;SECTOR_BYTES])
+      ->Result<(),BlockError>{
+   self.writes+=1;
+   if self.fail_write{return Err(BlockError::Io);}
+   let target=self.sectors.get_mut(lba as usize).ok_or(BlockError::OutOfRange)?;
+   *target=*data;
+   if self.tamper_backup_on_restore&&lba==45{
+    self.sectors[36][0]^=0x5a;
+   }
+   Ok(())
+  }
+  fn sync(&mut self)->Result<(),BlockError>{self.flushed=true;Ok(())}
+ }
+ fn valid_envelope(job:SignedImageRecovery)->Envelope {
+  Envelope{signer:3,epoch:4,
+   digest:crate::m2_sha256::digest(&job.manifest()),signature:[7;64]}
+ }
+ fn roots()->[Root;1]{[Root{signer:3,epoch:4,enabled:true}]}
+ #[test]
+ fn authenticated_prior_image_restores_bytes_and_flushes() {
+  let mut disk=Fake::new();let image=disk.image();
+  let backup=[disk.sectors[35],disk.sectors[36]];
+  assert_eq!(restore_prior_signed_image(&mut disk,image,7,&roots(),
+      &TrustedTest,&valid_envelope(image)),Ok(()));
+  assert_eq!(disk.writes,2);assert!(disk.flushed);
+  assert_eq!(disk.sectors[45],backup[0]);assert_eq!(disk.sectors[46],backup[1]);
+ }
+ #[test]
+ fn unsigned_corrupt_downgrade_and_overlap_cannot_write() {
+  let mut d=Fake::new();let job=d.image();let mut signature=valid_envelope(job);
+  signature.signature=[0;64];
+  assert_eq!(restore_prior_signed_image(&mut d,job,7,&roots(),&TrustedTest,
+      &signature),Err(SlotIoError::Verification));
+  assert_eq!(restore_prior_signed_image(&mut d,job,9,&roots(),&TrustedTest,
+      &valid_envelope(job)),Err(SlotIoError::Geometry));
+  let overlap=SignedImageRecovery{restore_lba:35,..job};
+  assert_eq!(restore_prior_signed_image(&mut d,overlap,7,&roots(),&TrustedTest,
+      &valid_envelope(overlap)),Err(SlotIoError::Geometry));
+  d.sectors[35][0]^=1;
+  assert_eq!(restore_prior_signed_image(&mut d,job,7,&roots(),&TrustedTest,
+      &valid_envelope(job)),Err(SlotIoError::Verification));
+  assert_eq!(d.writes,0);
+ }
+ #[test]
+ fn backup_media_swap_between_signature_check_and_copy_is_denied() {
+  let mut d=Fake::new();let job=d.image();
+  d.tamper_backup_on_restore=true;
+  assert_eq!(restore_prior_signed_image(&mut d,job,7,&roots(),&TrustedTest,
+      &valid_envelope(job)),Err(SlotIoError::Verification));
+  assert_eq!(d.sectors[45][0],0x33);
+  assert!(d.flushed);
+  // No verified boot record or boot-slot publication takes place.
+ }
+ #[test]
+ fn failed_write_or_corrupt_readback_denies_success_and_preserves_backup() {
+  let mut d=Fake::new();let job=d.image();let original=d.sectors[35];
+  d.fail_write=true;
+  assert_eq!(restore_prior_signed_image(&mut d,job,7,&roots(),&TrustedTest,
+      &valid_envelope(job)),Err(SlotIoError::Device));
+  assert_eq!(d.sectors[35],original);
+  d.fail_write=false;d.corrupt_readback=true;
+  assert_eq!(restore_prior_signed_image(&mut d,job,7,&roots(),&TrustedTest,
+      &valid_envelope(job)),Err(SlotIoError::Verification));
+  assert_eq!(d.sectors[35],original);
+ }
+}

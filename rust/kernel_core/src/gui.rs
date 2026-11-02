@@ -279,6 +279,9 @@ impl UserSurfaceService{
             let Some((origin_x,origin_y,_,_))=self.client_bounds(window.id)
                 else{return false;};
             let slot=window.id as usize-1;
+            // A revoked client must never replay old raster commands,
+            // even when its window remains visible until teardown.
+            if self.broker.owner(window.id).is_none(){continue;}
             for command in &self.commands[slot][..self.counts[slot]]{
                 let rgb=command.rgb;
                 let Some(color)=(out.rgb)(
@@ -374,6 +377,18 @@ impl UserSurfaceService{
             #[cfg(feature="test-r029-frame-server")]
             let _=changed;
         }
+    }
+    /// Scheduler-owned crash teardown. Pending input and window grants are
+    /// revoked as one serialized kernel action. In-progress mouse gesture
+    /// state tied to the dead owner must not carry over to a new incarnation.
+    fn retire_client(&mut self,pid:u32){
+        if pid==0{return;}
+        if self.session.dragging.is_some_and(|(window,_,_)|
+           self.broker.owns(pid,window)){
+            self.session.dragging=None;
+            self.session.was_down=false;
+        }
+        self.broker.revoke(pid);
     }
     #[cfg(feature="test-r031-supervisor")]
     fn rotate_terminal(&mut self,pid:u32)->bool{
@@ -507,7 +522,7 @@ pub(crate) fn user_surface_peek(pid:u32)->Option<GuiEvent>{
 #[cfg(feature="test-r029-userspace")]
 pub(crate) fn user_surface_terminate(pid:u32){
     if let Some(svc)=user_service(){
-        svc.broker.revoke(pid);
+        svc.retire_client(pid);
         #[cfg(feature="test-r029-physical-events")]
         if !svc.broker.known(1) && !svc.broker.known(2)
             && !svc.broker.known(3)
@@ -808,7 +823,13 @@ mod tests{
         assert!(erased>10);
         for row in 0..600{assert!(pixels[row*PITCH+800..(row+1)*PITCH].iter().all(|&v|v==GUARD));}
         assert!(pixels[PITCH*600..].iter().all(|&v|v==GUARD));
-        svc.broker.revoke(3);
+        svc.session.dragging=Some((2,13,17));
+        svc.session.was_down=true;
+        let last_peer=svc.broker.grant_epoch_for(2,1).unwrap();
+        svc.retire_client(3);
+        assert_eq!(svc.session.dragging,None);
+        assert!(!svc.session.was_down);
+        assert_eq!(svc.broker.grant_epoch_for(2,1),Ok(last_peer));
         assert!(!svc.submit(3,&replace));
     }
     #[cfg(feature="test-r029-desktop-suite")]
@@ -895,6 +916,16 @@ mod tests{
         assert!(svc.present_with(1,1,|s|s.paint(&mut out)));
         assert_eq!(pixel(&pixels,115,105),p.title);
         assert_eq!(pixel(&pixels,115,160),FILES);
+        // Even with its desktop window still visible, a process that
+        // exits must lose the right to replay retained display commands.
+        svc.session.dragging=Some((2,50,60));
+        svc.session.was_down=true;
+        svc.retire_client(3);
+        assert_eq!(svc.session.dragging,None);
+        assert!(!svc.session.was_down);
+        assert!(svc.paint(&mut out));
+        assert!(!pixels.contains(&TERMINAL));
+        assert_eq!(svc.counts,retained_counts);
         svc.session.desktop.close(2).unwrap();
         assert!(!svc.submit(3,&wire(2,FILL,0xff0000)));
         assert!(svc.present_with(1,1,|s|s.paint(&mut out)));

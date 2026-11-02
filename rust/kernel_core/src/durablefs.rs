@@ -447,7 +447,7 @@ impl<D:BlockDevice> DurableFs<D>{
             if !entry.used{continue;}
             let len=entry.name.iter().position(|&b|b==0).unwrap_or(NAME_BYTES);
             if len<=2||entry.name[0]!=b'~'||
-               !matches!(entry.name[1],b'd'|b'f'){continue;}
+               !matches!(entry.name[1],b'd'|b'f'|b'l'){continue;}
             let rest=&entry.name[2..len];
             if rest!=old_stem && !(rest.starts_with(old_stem) &&
                                    rest.get(old_stem.len())==Some(&b'~')){continue;}

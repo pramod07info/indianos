@@ -1,6 +1,7 @@
 //! R031.3 bounded hierarchical VFS over R027's durable COW metadata.
-//! No on-disk format changes, allocation, recursive traversal, or symlinks.
-//! Existing root /app and /note remain separate from reserved /~[df]* keys.
+//! No on-disk format changes, allocation or recursive symlink traversal.
+//! Symlink metadata entries are durable, but are NEVER followed implicitly.
+//! Existing root /app and /note remain separate from reserved /~[dfl]* keys.
 //! 8 total storage objects (directories count); max 21 bytes of logical path.
 use crate::block::{BlockDevice,BlockWindow};
 use crate::durablefs::{DurableFs,FsError,VolumeHealth,MIN_SECTORS,MAX_FILE_BYTES};
@@ -9,7 +10,7 @@ use crate::ata_pio::AtaPio;
 pub const MAX_TRANSFER:usize=256;
 const DIR_MARKER:&[u8;8]=b"INDDIR31";
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
-enum Kind{Directory,File}
+enum Kind{Directory,File,Symlink}
 #[derive(Clone,Copy)]
 struct Path{
  canonical:[u8;64],canon_len:usize,
@@ -34,7 +35,7 @@ fn checked(input:&str,kind:Kind)->Result<Path,FsError>{
  }
  let mut key=[0u8;24];
  key[..3].copy_from_slice(match kind{
-  Kind::Directory=>b"/~d",Kind::File=>b"/~f"
+  Kind::Directory=>b"/~d",Kind::File=>b"/~f",Kind::Symlink=>b"/~l"
  });
  let key_len=count+2;
  if key_len>24{return Err(FsError::InvalidName);}
@@ -93,13 +94,16 @@ impl<D:BlockDevice> HierVfs<D>{
  /// Unsupported storage MUST return an error instead of false success.
  pub fn sync(&mut self)->Result<(),FsError>{self.fs.sync()}
  fn contradictory_alias(&self,p:&Path)->bool{
-  let mut key=p.key;key[2]=if key[2]==b'd'{b'f'}else{b'd'};
-  let mut own=false;let mut opposite=false;
-  self.fs.visit_names(|n|{
-   if n.as_bytes()==&p.key[1..p.key_len]{own=true;}
-   if n.as_bytes()==&key[1..p.key_len]{opposite=true;}
-  });
-  own && opposite
+  let mut own=false;let mut other=false;
+  for ty in [b'd',b'f',b'l'] {
+   let mut key=p.key;key[2]=ty;
+   self.fs.visit_names(|n|{
+    if n.as_bytes()==&key[1..p.key_len] {
+     if ty==p.key[2]{own=true;}else{other=true;}
+    }
+   });
+  }
+  own && other
  }
  // Validate the entire chain iteratively; a leaf marker alone is insufficient.
  fn directory(&mut self,p:&str)->Result<(),FsError>{
@@ -125,24 +129,34 @@ impl<D:BlockDevice> HierVfs<D>{
   self.fs.visit_names(|name|{
    // Only ~d/~f are reserved by this VFS. Other flat legacy keys belong
    // to separate callers and must not be diagnosed as a corrupt namespace.
-   if name.starts_with("~d") || name.starts_with("~f"){
+   if name.starts_with("~d") || name.starts_with("~f") ||
+      name.starts_with("~l"){
     keys[count][..name.len()].copy_from_slice(name.as_bytes());
     lengths[count]=name.len();count+=1;
    }
   });
   for i in 0..count{
    let key=&keys[i][..lengths[i]];
-   if key.len()<3 || !matches!(key[1],b'd'|b'f'){return Err(FsError::InvalidVolume);}
+   if key.len()<3 || !matches!(key[1],b'd'|b'f'|b'l'){return Err(FsError::InvalidVolume);}
    let mut logical=[0u8;24];logical[0]=b'/';
    for (j,&byte) in key[2..].iter().enumerate(){
     logical[j+1]=if byte==b'~'{b'/'}else{byte};
    }
-   let kind=if key[1]==b'd'{Kind::Directory}else{Kind::File};
+   let kind=match key[1]{b'd'=>Kind::Directory,b'f'=>Kind::File,
+     b'l'=>Kind::Symlink,_=>return Err(FsError::InvalidVolume)};
    let raw=core::str::from_utf8(&logical[..key.len()-1]).map_err(|_|FsError::InvalidVolume)?;
    let path=checked(raw,kind).map_err(|_|FsError::InvalidVolume)?;
    if &path.key[1..path.key_len]!=key || self.contradictory_alias(&path){return Err(FsError::InvalidVolume);}
    let result=if kind==Kind::Directory{self.directory(path.path())}else{self.parents(&path)};
    match result{Err(FsError::NotFound)=>return Err(FsError::InvalidVolume),other=>other?}
+   if kind==Kind::Symlink{
+    let mut payload=[0u8;MAX_TRANSFER];
+    let n=self.fs.read_path(path.name(),&mut payload)?;
+    let target=core::str::from_utf8(&payload[..n]).map_err(|_|FsError::InvalidVolume)?;
+    let mut canonical=[0u8;MAX_TRANSFER];
+    let len=normalize_absolute(target,&mut canonical).map_err(|_|FsError::InvalidVolume)?;
+    if n!=len||canonical[..len]!=payload[..n]{return Err(FsError::InvalidVolume);}
+   }
   }
   Ok(())
  }
@@ -155,15 +169,49 @@ impl<D:BlockDevice> HierVfs<D>{
   Ok(())
  }
  fn conflicting(&mut self,p:&str,kind:Kind)->Result<bool,FsError>{
-  let opposite=checked(p,match kind{
-   Kind::Directory=>Kind::File,Kind::File=>Kind::Directory
-  })?;
-  let mut b=[0u8;MAX_TRANSFER];
-  match self.fs.read_path(opposite.name(),&mut b){
-   Ok(_)=>Ok(true),
-   Err(FsError::NotFound)=>Ok(false),
-   Err(e)=>Err(e)
+  for other in [Kind::Directory,Kind::File,Kind::Symlink]{
+   if other==kind{continue;}
+   let key=checked(p,other)?;
+   let mut bytes=[0u8;MAX_TRANSFER];
+   match self.fs.read_path(key.name(),&mut bytes){
+    Ok(_)=>return Ok(true),
+    Err(FsError::NotFound)=>{},
+    Err(e)=>return Err(e),
+   }
   }
+  Ok(false)
+ }
+ /// Durable no-follow symlink: the link target is data, never an authority.
+ /// No implicit user, VFS, or privileged kernel caller may resolve this link.
+ pub fn symlink(&mut self,path:&str,target:&str)->Result<(),FsError>{
+  let link=checked(path,Kind::Symlink)?;
+  self.parents(&link)?;
+  if self.conflicting(link.path(),Kind::Symlink)?{return Err(FsError::Exists);}
+  let mut canonical=[0u8;MAX_TRANSFER];
+  let len=normalize_absolute(target,&mut canonical).map_err(|_|FsError::InvalidName)?;
+  if &canonical[..len]!=target.as_bytes()||link.path()==target{
+   return Err(FsError::InvalidName);
+  }
+  self.fs.create_path(link.name(),&canonical[..len])
+ }
+ pub fn readlink(&mut self,path:&str,out:&mut[u8])->Result<usize,FsError>{
+  let link=checked(path,Kind::Symlink)?;
+  self.parents(&link)?;
+  if self.contradictory_alias(&link){return Err(FsError::InvalidVolume);}
+  let mut target=[0u8;MAX_TRANSFER];
+  let n=self.fs.read_path(link.name(),&mut target)?;
+  let text=core::str::from_utf8(&target[..n]).map_err(|_|FsError::InvalidVolume)?;
+  let mut canonical=[0u8;MAX_TRANSFER];
+  let len=normalize_absolute(text,&mut canonical).map_err(|_|FsError::InvalidVolume)?;
+  if len!=n||canonical[..len]!=target[..n]{return Err(FsError::InvalidVolume);}
+  if n>out.len(){return Err(FsError::TooLarge);}
+  out[..n].copy_from_slice(&target[..n]);Ok(n)
+ }
+ pub fn unlink_symlink(&mut self,path:&str)->Result<(),FsError>{
+  let link=checked(path,Kind::Symlink)?;
+  self.parents(&link)?;
+  if self.contradictory_alias(&link){return Err(FsError::InvalidVolume);}
+  self.fs.delete_path(link.name())
  }
  pub fn mkdir(&mut self,path:&str)->Result<(),FsError>{
   let p=checked(path,Kind::Directory)?;
@@ -183,7 +231,7 @@ impl<D:BlockDevice> HierVfs<D>{
   let mut has_child=false;
   self.fs.visit_names(|name|{
    if name.len()>=3 && name.as_bytes()[0]==b'~' &&
-      matches!(name.as_bytes()[1],b'f'|b'd') &&
+      matches!(name.as_bytes()[1],b'f'|b'd'|b'l') &&
       name.as_bytes()[2..].starts_with(pref){has_child=true;}
   });
   if has_child{return Err(FsError::Full);}
@@ -323,7 +371,7 @@ impl<D:BlockDevice> HierVfs<D>{
   let mut scratch=[0u8;MAX_TRANSFER];let mut used=0usize;
   self.fs.visit_names(|name|{
    let bytes=name.as_bytes();
-   if bytes.len()<3||bytes[0]!=b'~'||!matches!(bytes[1],b'd'|b'f'){
+   if bytes.len()<3||bytes[0]!=b'~'||!matches!(bytes[1],b'd'|b'f'|b'l'){
     return;
    }
    let base=&bytes[2..];
@@ -420,6 +468,54 @@ mod tests{
  fn fresh()->HierVfs<Disk>{
   HierVfs::format_blank(Disk{blocks:[[0;SECTOR_BYTES];COUNT],writes:0,tear:None}).unwrap()
  }
+ #[test]fn r114_durable_links_never_follow_across_vfs_or_mounts(){
+  let mut fs=fresh();
+  fs.create("/note",b"secret").unwrap();
+  fs.mkdir("/dir").unwrap();
+  fs.symlink("/dir/link","/note").unwrap();
+  let mut buf=[0xabu8;32];
+  assert_eq!(fs.readlink("/dir/link",&mut buf),Ok(5));
+  assert_eq!(&buf[..5],b"/note");
+  assert_eq!(fs.read("/dir/link",&mut buf),Err(FsError::NotFound));
+  assert_eq!(fs.read_at("/dir/link",0,&mut buf),Err(FsError::NotFound));
+  assert_eq!(fs.mkdir("/dir/link"),Err(FsError::Exists));
+  assert_eq!(fs.create("/dir/link",b"overwrite"),Err(FsError::Exists));
+  assert_eq!(fs.create("/dir/link/escape",b"oops"),Err(FsError::NotFound));
+  assert_eq!(fs.list_dir("/dir",&mut buf),Ok(7));
+  assert_eq!(&buf[..7],b"l:link\n");
+  assert_eq!(fs.rmdir("/dir"),Err(FsError::Full));
+  let mut fs=HierVfs::mount_consistent_recovery(fs.into_device()).unwrap();
+  assert_eq!(fs.rename_dir("/dir","/other"),Ok(()));
+  assert_eq!(fs.readlink("/other/link",&mut buf),Ok(5));
+  assert_eq!(fs.read("/other/link",&mut buf),Err(FsError::NotFound));
+  fs.unlink_symlink("/other/link").unwrap();
+  assert_eq!(fs.read("/note",&mut buf),Ok(6));
+  assert_eq!(&buf[..6],b"secret");
+ }
+ #[test]fn r114_symlink_invalid_or_malformed_payload_is_fail_closed(){
+  let mut fs=fresh();
+  fs.mkdir("/safe").unwrap();
+  for bad in ["note","/safe/../note","/safe//note","/safe/./note"]{
+   assert_eq!(fs.symlink("/safe/link",bad),Err(FsError::InvalidName));
+  }
+  assert_eq!(fs.symlink("/safe/self","/safe/self"),Err(FsError::InvalidName));
+  assert_eq!(fs.symlink("/safe/link","/protected"),Ok(()));
+  let generation=fs.generation();
+  let mut too_short=[0x9cu8;2];
+  assert_eq!(fs.readlink("/safe/link",&mut too_short),Err(FsError::TooLarge));
+  assert_eq!(too_short,[0x9c;2]);
+  assert_eq!(fs.generation(),generation);
+  fs.fs.overwrite_path("/~lsafe~link",b"/safe/../escape").unwrap();
+  let disk=fs.into_device();
+  let writes=disk.writes;
+  assert!(matches!(HierVfs::mount_consistent_recovery(disk.clone()),
+      Err(FsError::InvalidVolume)));
+  let mut fs=HierVfs::mount(disk).unwrap();
+  assert_eq!(fs.readlink("/safe/link",&mut [0u8;32]),
+      Err(FsError::InvalidVolume));
+  assert_eq!(fs.into_device().writes,writes);
+ }
+
  #[test]fn r108_recovery_mount_returns_last_whole_directory_tree_after_torn_head(){
   let mut fs=fresh();
   fs.mkdir("/a").unwrap();

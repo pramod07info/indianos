@@ -29,9 +29,31 @@ impl Handle{
         core::str::from_utf8(&self.path[..self.len]).unwrap()
     }
 }
+/// Kernel-minted, per-incarnation filesystem namespace root.
+#[derive(Clone,Copy)]
+struct RootGrant { epoch:u64,path:[u8;24],len:usize }
+impl RootGrant {
+    const EMPTY:Self=Self{epoch:0,path:[0;24],len:0};
+    fn as_str(&self)->&str{core::str::from_utf8(&self.path[..self.len]).unwrap()}
+}
+/// Opaque kernel-issued receipt for a single process-namespace revision.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct NamespaceReceipt { owner:Identity, namespace_id:u64, revision:u64 }
+/// Kernel-minted alias scoped to a process incarnation and namespace revision.
+/// String path comparison alone is not an authority to access a mounted tree.
+#[derive(Clone,Copy)]
+pub struct MountAlias { receipt:NamespaceReceipt, root:[u8;24], len:usize }
+impl MountAlias {
+    fn root(&self)->&str {
+        core::str::from_utf8(&self.root[..self.len]).unwrap()
+    }
+}
 pub struct FileHandles{
     entries:[Handle;SLOTS],next:u64,
     owners:[u64;2],next_generation:u64,
+    roots:[RootGrant;2],
+    root_revisions:[u64;2],
+    last_syscall_namespace:Option<NamespaceReceipt>,
     // Kernel-owned service-wide budget: closing/opening handles must NOT
     // reset it. Process epochs do not implement general per-user ACLs.
     write_guard:WriteGuard,
@@ -48,6 +70,8 @@ impl FileHandles{
     pub const fn new()->Self{
         Self{entries:[Handle::EMPTY;SLOTS],next:1,
             owners:[0;2],next_generation:1,
+            roots:[RootGrant::EMPTY;2],
+            root_revisions:[0;2],last_syscall_namespace:None,
             write_guard:WriteGuard::new(),selected_volume:None,
             selected_quarantined:false}
     }
@@ -77,6 +101,15 @@ impl FileHandles{
             if h.pid==pid{*h=Handle::EMPTY;}
         }
         self.owners[(pid-1) as usize]=generation;
+        // Default roots are minted only by the trusted kernel process bind.
+        // PID2 is read-only and cannot escape the /shared namespace.
+        let mut grant=RootGrant::EMPTY;
+        let default=if pid==1{b"/".as_slice()}else{b"/shared".as_slice()};
+        grant.path[..default.len()].copy_from_slice(default);
+        grant.len=default.len();
+        grant.epoch=generation;
+        self.roots[(pid-1) as usize]=grant;
+        self.root_revisions[(pid-1) as usize]=1;
         self.next_generation=next;
         Ok(Identity{pid,generation})
     }
@@ -88,12 +121,88 @@ impl FileHandles{
     pub fn retire_process(&mut self,owner:Identity)->bool{
         if !self.owns(owner){return false;}
         self.owners[(owner.pid-1) as usize]=0;
+        self.roots[(owner.pid-1) as usize]=RootGrant::EMPTY;
+        self.root_revisions[(owner.pid-1) as usize]=0;
         for h in &mut self.entries{
             if h.pid==owner.pid&&h.generation==owner.generation{
                 *h=Handle::EMPTY;
             }
         }
         true
+    }
+    /// Narrow only: a process can never widen its root or reset the grant
+    /// by reopening a file. Every existing handle is revoked before the
+    /// new policy is exposed to the authenticated service.
+    pub fn narrow_root_kernel(&mut self,owner:Identity,root:&str)
+        ->Result<(),FsError>{
+        if !self.owns(owner){return Err(FsError::InvalidName);}
+        let mut normalized=[0u8;24];
+        let len=normalize_absolute(root,&mut normalized[..23])
+            .map_err(|_|FsError::InvalidName)?;
+        let root=core::str::from_utf8(&normalized[..len])
+            .map_err(|_|FsError::InvalidName)?;
+        let slot=(owner.pid-1) as usize;
+        if crate::vfs_path::is_within_tree(root,self.roots[slot].as_str())!=Ok(true){
+            return Err(FsError::InvalidName);
+        }
+        let revision=self.root_revisions[slot].checked_add(1)
+            .ok_or(FsError::Full)?;
+        self.roots[slot]=RootGrant{epoch:owner.generation,path:normalized,len};
+        self.root_revisions[slot]=revision;
+        for handle in &mut self.entries{
+            if handle.pid==owner.pid && handle.generation==owner.generation {
+                *handle=Handle::EMPTY;
+            }
+        }
+        Ok(())
+    }
+    pub fn namespace_receipt(&self,owner:Identity)
+        ->Result<NamespaceReceipt,FsError>{
+        if !self.owns(owner){return Err(FsError::InvalidName);}
+        let revision=self.root_revisions[(owner.pid-1) as usize];
+        if revision==0{return Err(FsError::InvalidName);}
+        // Each process incarnation is minted a distinct namespace ID by
+        // the kernel owner-generation allocator. Revision alone is not
+        // sufficient to prevent a same-number cross-process transplant.
+        let namespace_id=self.roots[(owner.pid-1) as usize].epoch;
+        if namespace_id!=owner.generation{return Err(FsError::InvalidName);}
+        Ok(NamespaceReceipt{owner,namespace_id,revision})
+    }
+    pub fn namespace_receipt_is_current(&self,receipt:NamespaceReceipt)->bool{
+        self.namespace_receipt(receipt.owner)==Ok(receipt)
+    }
+    /// The trusted kernel creates an alias only beneath the current root.
+    /// Never follow a symlink or resolve user-controlled mount spelling here.
+    pub fn mount_alias_kernel(&self,owner:Identity,root:&str)
+        ->Result<MountAlias,FsError>{
+        let receipt=self.namespace_receipt(owner)?;
+        let mut path=[0u8;24];
+        let len=normalize_absolute(root,&mut path[..23])
+            .map_err(|_|FsError::InvalidName)?;
+        let canonical=core::str::from_utf8(&path[..len])
+            .map_err(|_|FsError::InvalidName)?;
+        if !self.root_allows(owner,canonical){return Err(FsError::InvalidName);}
+        Ok(MountAlias{receipt,root:path,len})
+    }
+    /// Authenticate both the alias origin and the target for every operation.
+    /// Any PID reuse or root revision revokes previously minted aliases.
+    pub fn mount_alias_allows(&self,alias:MountAlias,owner:Identity,path:&str)->bool{
+        alias.receipt.owner==owner &&
+        self.namespace_receipt_is_current(alias.receipt) &&
+        self.root_allows(owner,path) &&
+        crate::vfs_path::is_within_tree(path,alias.root())==Ok(true)
+    }
+    /// Last admitted syscall's namespace snapshot. Stale receipts never
+    /// authorize access after a root narrowing or PID incarnation change.
+    pub fn last_syscall_namespace(&self)->Option<NamespaceReceipt>{
+        self.last_syscall_namespace
+    }
+    fn root_allows(&self,owner:Identity,path:&str)->bool{
+        if owner.generation==0{return true;} // legacy non-authenticated compatibility path
+        if !self.owns(owner){return false;}
+        let root=self.roots[(owner.pid-1) as usize];
+        root.epoch==owner.generation &&
+        crate::vfs_path::is_within_tree(path,root.as_str())==Ok(true)
     }
     fn index(&self,owner:Identity,token:u64)->Result<usize,FsError>{
         if token==0{return Err(FsError::InvalidName);}
@@ -106,7 +215,8 @@ impl FileHandles{
             // particular handle can still only be reduced, not escalated.
             1=>(1..=3).contains(&mode),
             // PID2 reads *only* explicitly shared subtree files.
-            2=>mode==READ && path.starts_with("/shared/"),
+            2=>mode==READ && crate::vfs_path::is_within_tree(path,"/shared")==Ok(true)
+                && path!="/shared",
             _=>false,
         }
     }
@@ -131,6 +241,7 @@ impl FileHandles{
                 let name=core::str::from_utf8(&name[..len])
                     .map_err(|_|FsError::InvalidName)?;
                 if !Self::policy(owner.pid,name,mode) ||
+                   !self.root_allows(owner,name) ||
                    (mode&WRITE!=0 && WriteGuard::allow_path(name).is_err()){
                     return Err(FsError::InvalidName);
                 }
@@ -151,7 +262,8 @@ impl FileHandles{
                     .map_err(|_|FsError::InvalidName)?;
                 let dest=core::str::from_utf8(&dst[..b])
                     .map_err(|_|FsError::InvalidName)?;
-                if !source.starts_with("/shared/")||
+                if !self.root_allows(owner,source)||!self.root_allows(owner,dest)||
+                   !source.starts_with("/shared/")||
                    !dest.starts_with("/shared/")||
                    WriteGuard::allow_path(source).is_err()||
                    WriteGuard::allow_path(dest).is_err(){
@@ -188,7 +300,8 @@ impl FileHandles{
             .map_err(|_|FsError::InvalidName)?;
         let path=core::str::from_utf8(&bytes[..len])
             .map_err(|_|FsError::InvalidName)?;
-        if !Self::policy(owner.pid,path,mode){
+        if !Self::policy(owner.pid,path,mode)||
+           !self.root_allows(owner,path){
             return Err(FsError::InvalidName);
         }
         // S0: even trusted PID1's ordinary application handle cannot
@@ -659,7 +772,8 @@ impl FileHandles{
             .map_err(|_|FsError::InvalidName)?;
         let canonical=core::str::from_utf8(&normalized[..n])
             .map_err(|_|FsError::InvalidName)?;
-        if !Self::policy(owner.pid,canonical,WRITE){
+        if !Self::policy(owner.pid,canonical,WRITE)||
+           !self.root_allows(owner,canonical){
             return Err(FsError::InvalidName);
         }
         let amount=data.len().max(1);
@@ -712,7 +826,7 @@ impl FileHandles{
             .map_err(|_|FsError::InvalidName)?;
         let to=core::str::from_utf8(&normalized[..n])
             .map_err(|_|FsError::InvalidName)?;
-        if !Self::policy(owner.pid,to,WRITE)||
+        if !Self::policy(owner.pid,to,WRITE)||!self.root_allows(owner,to)||
            WriteGuard::allow_path(to).is_err(){
             self.write_guard.deny();
             return Err(FsError::InvalidName);
@@ -758,7 +872,8 @@ impl FileHandles{
             .map_err(|_|FsError::InvalidName)?;
         let dst=core::str::from_utf8(&dst_buf[..dst_len])
             .map_err(|_|FsError::InvalidName)?;
-        if src==dst||!src.starts_with("/shared/")||
+        if src==dst||!self.root_allows(owner,src)||!self.root_allows(owner,dst)||
+           !src.starts_with("/shared/")||
            !dst.starts_with("/shared/")||
            !Self::policy(owner.pid,src,WRITE)||
            !Self::policy(owner.pid,dst,WRITE)||
@@ -829,11 +944,28 @@ pub fn operation(table:&mut FileHandles,action:u64,pid:u32,
                  ->Result<u64,FsError>{
     operation_for(table,action,Identity{pid,generation:0},token,argument,path,buffer)
 }
+/// Alias-scoped create/open cannot fall back to raw path authorization.
+/// A stale or foreign mount alias is rejected before ATA probing and I/O.
+pub fn operation_authenticated_mount_alias(
+    table:&mut FileHandles, alias:MountAlias, action:u64, owner:Identity,
+    token:u64,argument:u64,path:&str,buffer:&mut [u8]
+)->Result<u64,FsError>{
+    if !matches!(action,1|29)||token!=0||
+       !table.mount_alias_allows(alias,owner,path){
+        return Err(FsError::InvalidName);
+    }
+    operation_authenticated(table,action,owner,token,argument,path,buffer)
+}
 /// Authenticate before ATA probing or filesystem reads, including open.
 pub fn operation_authenticated(table:&mut FileHandles,action:u64,owner:Identity,
                  token:u64,argument:u64,path:&str,buffer:&mut [u8])
                  ->Result<u64,FsError>{
+    let namespace=table.namespace_receipt(owner)?;
     table.preflight_selected(action,owner,token,argument,path,buffer)?;
+    if !table.namespace_receipt_is_current(namespace){
+        return Err(FsError::InvalidName);
+    }
+    table.last_syscall_namespace=Some(namespace);
     operation_for(table,action,owner,token,argument,path,buffer)
 }
 fn operation_for(table:&mut FileHandles,action:u64,owner:Identity,
@@ -877,7 +1009,12 @@ pub fn operation_on_selected_volume<D:BlockDevice>(
     token:u64,argument:u64,path:&str,buffer:&mut[u8],
     disk:&mut D,receipt:crate::m1_partition::PartitionReceipt
 )->Result<u64,FsError>{
+    let namespace=table.namespace_receipt(owner)?;
     table.preflight_selected(action,owner,token,argument,path,buffer)?;
+    if !table.namespace_receipt_is_current(namespace){
+        return Err(FsError::InvalidName);
+    }
+    table.last_syscall_namespace=Some(namespace);
     if table.selected_quarantined{return Err(FsError::InvalidVolume);}
     let prior=table.selected_volume;
     // Only a new file open/create may bind the service to a volume. Existing
@@ -2370,4 +2507,162 @@ mod r108_auth_directory_tree_recovery {
   assert_eq!(&b[..7],b"persist");
   assert_eq!(handles.security_statistics().completed_writes,0);
  }
+}
+
+
+// R114 follow-up: this is the real authenticated FileHandles policy path,
+// not a disconnected path utility or a replacement ACL.
+#[cfg(test)]
+mod r114_live_files_policy_tests {
+    use super::*;
+    #[test]
+    fn pid2_is_confined_to_canonical_shared_tree() {
+        for name in ["/shared/note", "/shared/sub/file"] {
+            assert!(FileHandles::policy(2,name,READ));
+        }
+        for name in ["/shared", "/sharedness/note", "/boot/note",
+                     "/shared/../boot", "/../shared/note", "/shared/note\0evil"] {
+            assert!(!FileHandles::policy(2,name,READ),"{name}");
+        }
+        assert!(!FileHandles::policy(2,"/shared/note",WRITE));
+        assert!(!FileHandles::policy(3,"/shared/note",READ));
+        assert!(FileHandles::policy(1,"/etc/note",READ|WRITE));
+    }
+}
+
+
+#[cfg(test)]
+mod r114_root_grant_epoch_tests {
+ use super::*;
+ #[test]
+ fn roots_are_minted_per_incarnation_and_only_narrow(){
+  let mut t=FileHandles::new();
+  let parent=t.bind_process(1).unwrap();
+  let files=t.bind_process(2).unwrap();
+  assert!(t.root_allows(parent,"/etc/config"));
+  assert!(t.root_allows(files,"/shared/docs/file"));
+  assert!(!t.root_allows(files,"/sharedelse/file"));
+  assert!(!t.root_allows(files,"/boot/file"));
+  assert_eq!(t.narrow_root_kernel(files,"/shared/docs"),Ok(()));
+  assert!(!t.root_allows(files,"/shared/file"));
+  assert!(t.root_allows(files,"/shared/docs/file"));
+  assert_eq!(t.narrow_root_kernel(files,"/shared"),Err(FsError::InvalidName));
+  assert_eq!(t.narrow_root_kernel(files,"/shared/../boot"),Err(FsError::InvalidName));
+  assert_eq!(t.narrow_root_kernel(files,"/shared/docs/../"),Err(FsError::InvalidName));
+  assert_eq!(t.narrow_root_kernel(parent,"/etc"),Ok(()));
+  assert!(!t.root_allows(parent,"/boot/file"));
+  assert!(t.root_allows(parent,"/etc/config"));
+ }
+ #[test]
+ fn recycled_pid_cannot_reuse_root_or_narrow_replacement(){
+  let mut t=FileHandles::new();
+  let old=t.bind_process(2).unwrap();
+  t.narrow_root_kernel(old,"/shared/private").unwrap();
+  let current=t.bind_process(2).unwrap();
+  assert!(!t.root_allows(old,"/shared/private/a"));
+  assert_eq!(t.narrow_root_kernel(old,"/shared/private"),
+      Err(FsError::InvalidName));
+  assert!(t.root_allows(current,"/shared/other"));
+  assert!(!t.retire_process(old));
+  assert!(t.root_allows(current,"/shared/other"));
+  assert!(t.retire_process(current));
+  assert!(!t.root_allows(current,"/shared/a"));
+ }
+ #[test]
+ fn failed_narrow_does_not_change_authorized_root(){
+  let mut t=FileHandles::new();
+  let who=t.bind_process(2).unwrap();
+  for candidate in ["shared","/sharedness","/shared/../../system","/a\0b"]{
+   assert_eq!(t.narrow_root_kernel(who,candidate),Err(FsError::InvalidName));
+   assert!(t.root_allows(who,"/shared/ok"));
+  }
+ }
+}
+
+
+#[cfg(test)]
+mod r114_namespace_receipt_replay_tests{
+ use super::*;
+ #[test]
+ fn root_narrowing_invalidates_old_syscall_receipt(){
+  let mut handles=FileHandles::new();
+  let owner=handles.bind_process(2).unwrap();
+  let before=handles.namespace_receipt(owner).unwrap();
+  assert!(handles.namespace_receipt_is_current(before));
+  handles.narrow_root_kernel(owner,"/shared/docs").unwrap();
+  let after=handles.namespace_receipt(owner).unwrap();
+  assert_ne!(before,after);
+  assert!(!handles.namespace_receipt_is_current(before));
+  assert!(handles.namespace_receipt_is_current(after));
+  assert!(handles.root_allows(owner,"/shared/docs/a"));
+  assert!(!handles.root_allows(owner,"/shared/sibling"));
+ }
+ #[test]
+ fn pid_reuse_or_foreign_pid_cannot_replay_namespace_token(){
+  let mut handles=FileHandles::new();
+  let owner=handles.bind_process(1).unwrap();
+  let receipt=handles.namespace_receipt(owner).unwrap();
+  let other=handles.bind_process(2).unwrap();
+  assert!(!handles.namespace_receipt_is_current(NamespaceReceipt{
+      owner:other,namespace_id:receipt.namespace_id,revision:receipt.revision}));
+  let replacement=handles.bind_process(1).unwrap();
+  assert_ne!(replacement,owner);
+  assert!(!handles.namespace_receipt_is_current(receipt));
+  assert!(handles.namespace_receipt_is_current(
+      handles.namespace_receipt(replacement).unwrap()));
+ }
+ #[test]
+ fn failed_root_narrow_does_not_rotate_namespace_generation(){
+  let mut handles=FileHandles::new();
+  let owner=handles.bind_process(2).unwrap();
+  let prior=handles.namespace_receipt(owner).unwrap();
+  assert_eq!(handles.narrow_root_kernel(owner,"/etc"),
+      Err(FsError::InvalidName));
+  assert_eq!(handles.namespace_receipt(owner),Ok(prior));
+  assert!(!handles.retire_process(Identity{pid:2,generation:owner.generation+1}));
+  assert_eq!(handles.namespace_receipt(owner),Ok(prior));
+ }
+}
+
+#[cfg(test)]
+mod r114_mount_alias_security_tests {
+    use super::*;
+    #[test]
+    fn aliases_reject_sibling_prefix_traversal_and_foreign_identity() {
+        let mut handles=FileHandles::new();
+        let p2=handles.bind_process(2).unwrap();
+        let p1=handles.bind_process(1).unwrap();
+        let alias=handles.mount_alias_kernel(p2,"//shared/./docs").unwrap();
+        assert!(handles.mount_alias_allows(alias,p2,"/shared/docs/file"));
+        for path in ["/shared/docs2/file","/shared/../etc/keys",
+                     "/shared/private","shared/docs/file"]{
+            assert!(!handles.mount_alias_allows(alias,p2,path));
+        }
+        assert!(!handles.mount_alias_allows(alias,p1,"/shared/docs/file"));
+        assert!(handles.mount_alias_kernel(p2,"/etc").is_err());
+        assert!(handles.mount_alias_kernel(p2,"/shared/../etc").is_err());
+        // Rejected before any disk access, including a forged PID1 use.
+        assert_eq!(operation_authenticated_mount_alias(
+           &mut handles,alias,1,p1,0,READ,"/shared/docs/file",&mut []),
+           Err(FsError::InvalidName));
+    }
+    #[test]
+    fn root_narrowing_and_pid_reuse_withdraw_alias_before_io() {
+        let mut handles=FileHandles::new();
+        let first=handles.bind_process(2).unwrap();
+        let old=handles.mount_alias_kernel(first,"/shared/docs").unwrap();
+        handles.narrow_root_kernel(first,"/shared/docs").unwrap();
+        assert!(!handles.mount_alias_allows(old,first,"/shared/docs/file"));
+        assert_eq!(operation_authenticated_mount_alias(
+            &mut handles,old,1,first,0,READ,"/shared/docs/file",&mut []),
+            Err(FsError::InvalidName));
+        let fresh=handles.mount_alias_kernel(first,"/shared/docs").unwrap();
+        assert!(handles.mount_alias_allows(fresh,first,"/shared/docs/file"));
+        let replacement=handles.bind_process(2).unwrap();
+        assert!(!handles.mount_alias_allows(fresh,replacement,"/shared/docs/file"));
+        assert!(!handles.mount_alias_allows(fresh,first,"/shared/docs/file"));
+        assert_eq!(operation_authenticated_mount_alias(
+            &mut handles,fresh,1,replacement,0,READ,"/shared/docs/file",&mut []),
+            Err(FsError::InvalidName));
+    }
 }

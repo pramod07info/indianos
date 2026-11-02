@@ -149,3 +149,121 @@ mod tests {
         assert_eq!(output, [9; 70]);
     }
 }
+
+
+/// Normalize both operands before checking a namespace boundary. Root denotes
+/// the whole tree. This helper only checks spelling; it grants no I/O rights.
+pub fn is_within_tree(path: &str, root: &str) -> Result<bool, PathError> {
+    let mut candidate = [0u8; 256];
+    let mut boundary = [0u8; 256];
+    let n = normalize_absolute(path, &mut candidate)?;
+    let m = normalize_absolute(root, &mut boundary)?;
+    Ok(m == 1 || (n >= m && candidate[..m] == boundary[..m]
+        && (n == m || candidate[m] == b'/')))
+}
+
+/// Append one safe component without allocating. On any error, output is
+/// unchanged, including when a normalized parent would exceed capacity.
+pub fn join_child(parent: &str, child: &str, output: &mut [u8])
+    -> Result<usize, PathError>
+{
+    if child.is_empty() { return Err(PathError::Empty); }
+    if child.as_bytes().contains(&0) { return Err(PathError::EmbeddedNul); }
+    if child == "." || child == ".." { return Err(PathError::ParentTraversal); }
+    if child.contains('/') { return Err(PathError::Relative); }
+    if child.len() > MAX_COMPONENT_BYTES { return Err(PathError::ComponentTooLong); }
+    let mut normalized = [0u8; 256];
+    let n = normalize_absolute(parent, &mut normalized)?;
+    let separator = usize::from(n != 1);
+    let size = n.checked_add(separator)
+        .and_then(|x| x.checked_add(child.len()))
+        .ok_or(PathError::LengthOverflow)?;
+    if size > output.len() { return Err(PathError::OutputTooSmall); }
+    output[..n].copy_from_slice(&normalized[..n]);
+    if separator != 0 { output[n] = b'/'; }
+    output[n + separator..size].copy_from_slice(child.as_bytes());
+    Ok(size)
+}
+
+/// Copy the normalized parent of a non-root pathname, preserving output on
+/// failure. No filesystem lookup is performed.
+pub fn copy_parent(path: &str, output: &mut [u8]) -> Result<usize, PathError> {
+    let mut normalized = [0u8; 256];
+    let len = normalize_absolute(path, &mut normalized)?;
+    if len == 1 { return Err(PathError::Empty); }
+    let end = normalized[..len].iter().rposition(|&b| b == b'/')
+        .ok_or(PathError::Relative)?;
+    let parent_len = end.max(1);
+    if parent_len > output.len() { return Err(PathError::OutputTooSmall); }
+    output[..parent_len].copy_from_slice(&normalized[..parent_len]);
+    Ok(parent_len)
+}
+
+pub fn canonical_equals(a: &str, b: &str) -> Result<bool, PathError> {
+    let mut first = [0u8; 256];
+    let mut second = [0u8; 256];
+    let left = normalize_absolute(a, &mut first)?;
+    let right = normalize_absolute(b, &mut second)?;
+    Ok(first[..left] == second[..right])
+}
+
+pub fn path_depth(path: &str) -> Result<usize, PathError> {
+    let mut normalized = [0u8; 256];
+    let len = normalize_absolute(path, &mut normalized)?;
+    if len == 1 { return Ok(0); }
+    Ok(normalized[..len].iter().filter(|&&b| b == b'/').count())
+}
+
+#[cfg(test)]
+mod r114_path_boundary_tests {
+    use super::*;
+
+    #[test]
+    fn prefix_bypass_and_traversal_fail_closed() {
+        assert_eq!(is_within_tree("/shared/note", "/shared"), Ok(true));
+        assert_eq!(is_within_tree("//shared/./note", "/shared/"), Ok(true));
+        assert_eq!(is_within_tree("/sharedness/note", "/shared"), Ok(false));
+        assert_eq!(is_within_tree("/shared", "/shared"), Ok(true));
+        assert_eq!(is_within_tree("/etc", "/"), Ok(true));
+        assert_eq!(is_within_tree("/shared/../etc", "/shared"), Err(PathError::ParentTraversal));
+        assert_eq!(is_within_tree("shared/note", "/shared"), Err(PathError::Relative));
+    }
+    #[test]
+    fn joining_and_parent_selection_remain_atomic() {
+        let mut out = [0xa5; 32];
+        assert_eq!(join_child("/shared//.", "note", &mut out), Ok(12));
+        assert_eq!(&out[..12], b"/shared/note");
+        let before = out;
+        assert_eq!(join_child("/shared", "../keys", &mut out), Err(PathError::Relative));
+        assert_eq!(out, before);
+        assert_eq!(join_child("/shared", "..", &mut out), Err(PathError::ParentTraversal));
+        assert_eq!(out, before);
+        assert_eq!(copy_parent("/shared/note", &mut out), Ok(7));
+        assert_eq!(&out[..7], b"/shared");
+        assert_eq!(copy_parent("/a", &mut out), Ok(1));
+        assert_eq!(out[0], b'/');
+        let before = out;
+        assert_eq!(copy_parent("/", &mut out), Err(PathError::Empty));
+        assert_eq!(out, before);
+    }
+    #[test]
+    fn canonical_comparisons_and_depth_work_without_heap() {
+        assert_eq!(canonical_equals("//a/./b/", "/a/b"), Ok(true));
+        assert_eq!(canonical_equals("/a/b", "/a/bb"), Ok(false));
+        assert_eq!(canonical_equals("/a/../b", "/b"), Err(PathError::ParentTraversal));
+        assert_eq!(path_depth("/"), Ok(0));
+        assert_eq!(path_depth("//a//./b"), Ok(2));
+        assert_eq!(path_depth("bad"), Err(PathError::Relative));
+    }
+    #[test]
+    fn exact_capacity_and_non_ascii_components() {
+        let mut out = [0x33u8; 4];
+        assert_eq!(join_child("/", "abc", &mut out), Ok(4));
+        assert_eq!(&out, b"/abc");
+        assert_eq!(join_child("/x", "abc", &mut out), Err(PathError::OutputTooSmall));
+        assert_eq!(&out, b"/abc");
+        let mut utf8 = [0u8; 16];
+        assert_eq!(join_child("/", "é", &mut utf8), Ok(3));
+        assert_eq!(&utf8[..3], "/é".as_bytes());
+    }
+}
