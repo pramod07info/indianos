@@ -576,7 +576,10 @@ impl<const N:usize> ServiceTable<N>{
     /// Remaining generations of restart budget for the named service.
     pub fn remaining_restarts(&self,id:u32)->Option<u8>{
         let s=self.snapshot(id)?;
-        Some(s.max_restarts.saturating_sub(s.restarts))
+        // An exhausted generation cannot be renewed even when the
+        // configured retry budget still has unused credits.
+        Some(if s.generation==u32::MAX{0}
+             else{s.max_restarts.saturating_sub(s.restarts)})
     }
     /// Lookup real service ID only for a nonzero, uniquely allocated PID.
     pub fn owner_of_pid(&self,pid:u32)->Option<u32>{
@@ -710,7 +713,8 @@ impl<const N:usize> ServiceTable<N>{
     /// 4. Pending services with remaining authenticated restart budgets.
     pub fn retryable_pending_count(&self)->usize{
         (0..N).filter(|&i|self.phases[i]==ServicePhase::Pending&&
-            self.slots[i].is_some_and(|s|s.restarts<s.max_restarts)).count()
+            self.slots[i].is_some_and(|s|
+                s.restarts<s.max_restarts&&s.generation<u32::MAX)).count()
     }
     /// 5. Lookup the current generation associated with an exact owned PID.
     pub fn generation_for_pid(&self,pid:u32)->Option<u32>{
@@ -747,7 +751,8 @@ impl<const N:usize> ServiceTable<N>{
     pub fn can_restart_service(&self,id:u32)->bool{
         id!=0&&self.slots.iter().enumerate().any(|(i,s)|
             self.phases[i]==ServicePhase::Active&&s.is_some_and(|v|
-                v.service_id==id&&v.active&&v.restarts<v.max_restarts))
+                v.service_id==id&&v.active&&v.restarts<v.max_restarts&&
+                v.generation<u32::MAX))
     }
     /// 11. Snapshot all active processes; short buffer publishes nothing.
     pub fn snapshot_active(&self,out:&mut[ServiceSlot])->Option<usize>{
@@ -924,7 +929,8 @@ impl<const N:usize> ServiceTable<N> {
     /// 3. Remaining retry credits across all process services.
     pub fn restart_credits_left(&self)->u64{
         self.slots.iter().flatten().map(|s|
-            s.max_restarts.saturating_sub(s.restarts) as u64).sum()
+            (if s.generation==u32::MAX{0}
+              else{s.max_restarts.saturating_sub(s.restarts)}) as u64).sum()
     }
     /// 4. Exact current service epoch check.
     pub fn generation_matches(&self,id:u32,epoch:u32)->bool{
@@ -1701,4 +1707,544 @@ mod r084_batch_vi_supervisor_tests{
         assert_eq!(t.configured_count(),1);
         assert!(t.validate_service_table());
     }
+}
+
+
+
+/// R100: scheduler-only exact process-incarnation crash authorization.
+/// These APIs do not start an executable or grant user-process capabilities.
+impl<const N:usize> ServiceTable<N>{
+ pub fn crash_exact(&mut self,service:u32,pid:u32,generation:u32,
+                    replacement:u32)->ServiceAction{
+  if !self.is_active_exact(service,pid,generation){return ServiceAction::Deny;}
+  self.crash(pid,replacement)
+ }
+ /// All-or-none group of verified scheduler faults. A failure cannot
+ /// advance earlier services' generations or consume their restart quotas.
+ /// The caller must publish new process mappings/grants only after successful
+ /// returned actions and independent prepared() acknowledgement.
+ pub fn crash_group_exact(&mut self,requests:&[(u32,u32,u32,u32)],
+                           actions:&mut[ServiceAction])->bool{
+  if requests.is_empty()||requests.len()>N||actions.len()<requests.len(){
+   return false;
+  }
+  let mut staged=Self{phases:self.phases,slots:self.slots};
+  let mut results=[ServiceAction::Deny;N];
+  for (i,&(service,pid,generation,replacement)) in requests.iter().enumerate(){
+   let outcome=staged.crash_exact(service,pid,generation,replacement);
+   if !matches!(outcome,ServiceAction::Restart{..}){return false;}
+   results[i]=outcome;
+  }
+  self.phases=staged.phases;self.slots=staged.slots;
+  actions[..requests.len()].copy_from_slice(&results[..requests.len()]);
+  true
+ }
+}
+#[cfg(test)]
+mod r100_exact_service_crash_tests{
+ use super::*;
+ #[test]fn reused_pid_or_wrong_service_generation_cannot_restart(){
+  let mut t=ServiceTable::<2>::new();
+  assert!(t.configure(7,70,1));
+  assert_eq!(t.start(7),ServiceAction::Start{pid:70,generation:1});
+  assert_eq!(t.crash_exact(8,70,1,71),ServiceAction::Deny);
+  assert_eq!(t.crash_exact(7,70,0,71),ServiceAction::Deny);
+  assert_eq!(t.crash_exact(7,70,1,71),ServiceAction::Restart{pid:71,generation:2});
+  assert_eq!(t.crash_exact(7,70,1,72),ServiceAction::Deny);
+  assert!(!t.is_active_exact(7,71,2));
+  assert!(t.prepared(7,71,2));
+  assert!(t.is_active_exact(7,71,2));
+ }
+ #[test]fn failed_group_has_zero_partial_restart_side_effects(){
+  let mut t=ServiceTable::<2>::new();
+  assert!(t.configure(7,70,1));assert!(t.configure(8,80,1));
+  t.start(7);t.start(8);
+  let before7=t.snapshot(7);let before8=t.snapshot(8);
+  let mut out=[ServiceAction::Deny;2];
+  assert!(!t.crash_group_exact(&[(7,70,1,71),(8,80,2,81)],&mut out));
+  assert_eq!(t.snapshot(7),before7);assert_eq!(t.snapshot(8),before8);
+  assert_eq!(out,[ServiceAction::Deny;2]);
+ }
+ #[test]fn valid_group_reserves_independent_replacement_pids(){
+  let mut t=ServiceTable::<2>::new();
+  assert!(t.configure(7,70,1));assert!(t.configure(8,80,1));
+  t.start(7);t.start(8);
+  let mut out=[ServiceAction::Deny;2];
+  assert!(t.crash_group_exact(&[(7,70,1,71),(8,80,1,81)],&mut out));
+  assert_eq!(out,[ServiceAction::Restart{pid:71,generation:2},
+                  ServiceAction::Restart{pid:81,generation:2}]);
+  assert!(t.prepared(7,71,2));assert!(t.prepared(8,81,2));
+ }
+ #[test]fn group_refuses_replacement_pid_collisions_without_mutation(){
+  let mut t=ServiceTable::<2>::new();
+  assert!(t.configure(7,70,1));assert!(t.configure(8,80,1));
+  t.start(7);t.start(8);let a=t.snapshot(7);let b=t.snapshot(8);
+  let mut out=[ServiceAction::Deny;2];
+  assert!(!t.crash_group_exact(&[(7,70,1,71),(8,80,1,71)],&mut out));
+  assert_eq!(t.snapshot(7),a);assert_eq!(t.snapshot(8),b);
+ }
+}
+
+
+/// R101 trusted boot coordination: enforce exact and distinct service identities
+/// before treating the compositor, Files and Terminal as active services.
+impl<const N:usize> ServiceTable<N>{
+ pub fn all_active_exact(&self,required:&[(u32,u32,u32)])->bool{
+  if required.is_empty()||required.len()>N{return false;}
+  for (i,&(service,pid,generation)) in required.iter().enumerate(){
+   if service==0||pid==0||generation==0 ||
+      required[..i].iter().any(|&(s,p,_)|s==service||p==pid) ||
+      !self.is_active_exact(service,pid,generation){
+    return false;
+   }
+  }
+  true
+ }
+ /// Stop every currently active service, but only if the kernel supplies an
+ /// exact, complete set of active service/PID/epoch triples. A partial or
+ /// forged shutdown cannot terminate an unrelated service or leave some
+ /// services stopped because of a later authorization error.
+ pub fn shutdown_all_exact(&mut self,requests:&[(u32,u32,u32)])->bool{
+  if requests.len()!=self.active_services()||!self.all_active_exact(requests){
+   return false;
+  }
+  self.stop_batch_exact(requests)
+ }
+}
+#[cfg(test)]
+mod r101_boot_and_shutdown_checks{
+ use super::*;
+ #[test]fn boot_gate_requires_three_active_distinct_process_epochs(){
+  let mut s=ServiceTable::<3>::new();
+  for id in 1..=3{assert!(s.configure(id,id*10,1));}
+  for id in 1..=3{assert_eq!(s.start(id),ServiceAction::Start{pid:id*10,generation:1});}
+  assert!(s.all_active_exact(&[(1,10,1),(2,20,1),(3,30,1)]));
+  assert!(!s.all_active_exact(&[(1,10,1),(2,20,2),(3,30,1)]));
+  assert!(!s.all_active_exact(&[(1,10,1),(1,10,1)]));
+  assert!(!s.all_active_exact(&[(1,10,1),(2,10,1)]));
+ }
+ #[test]fn full_shutdown_needs_complete_authenticated_live_set(){
+  let mut s=ServiceTable::<3>::new();
+  assert!(s.configure(1,10,1));assert!(s.configure(2,20,1));
+  s.start(1);s.start(2);
+  assert!(!s.shutdown_all_exact(&[(1,10,1)]));
+  assert!(s.all_active_exact(&[(1,10,1),(2,20,1)]));
+  assert!(!s.shutdown_all_exact(&[(1,10,1),(2,20,2)]));
+  assert!(s.all_active_exact(&[(1,10,1),(2,20,1)]));
+  assert!(s.shutdown_all_exact(&[(1,10,1),(2,20,1)]));
+  assert_eq!(s.active_services(),0);
+ }
+ #[test]fn stale_shutdown_request_cannot_stop_replacement(){
+  let mut s=ServiceTable::<1>::new();assert!(s.configure(1,10,1));
+  s.start(1);assert_eq!(s.crash_exact(1,10,1,11),
+                          ServiceAction::Restart{pid:11,generation:2});
+  assert!(s.prepared(1,11,2));
+  assert!(!s.shutdown_all_exact(&[(1,10,1)]));
+  assert!(s.all_active_exact(&[(1,11,2)]));
+ }
+}
+
+
+/// Kernel scheduler handoff for a crashed process: restart only after the
+/// complete supervisor/service and file-handle PID incarnation agree.
+/// On a successful replacement reservation, invalidate all old file grants
+/// and compositor focus/queues BEFORE the new process is prepared.
+#[cfg(feature="test-r031-vfs")]
+pub fn restart_and_revoke_exact<const S:usize,const W:usize,const Q:usize>(
+ supervisor:&mut ServiceTable<S>,
+ handles:&mut crate::fs_handles::FileHandles,
+ broker:&mut crate::gui_broker::Broker<W,Q>,
+ desktop:&mut crate::gui_broker::DesktopInput,
+ service:u32,
+ crashed:crate::batch5_session::Identity,
+ replacement_pid:u32
+)->ServiceAction{
+ if crashed.generation==0||crashed.generation>u32::MAX as u64||
+    !handles.owns(crashed)||
+    !supervisor.is_active_exact(service,crashed.pid,crashed.generation as u32)||
+    !supervisor.can_restart_service(service){
+   return ServiceAction::Deny;
+ }
+ let decision=supervisor.crash_exact(service,crashed.pid,
+                   crashed.generation as u32,replacement_pid);
+ if matches!(decision,ServiceAction::Restart{..}){
+    // Neither call may fail after an authenticated preflight.
+    let retired=handles.retire_process(crashed);
+    debug_assert!(retired);
+    desktop.process_exited(broker,crashed.pid);
+ }
+ decision
+}
+/// Kernel-only crash recovery with all three process-scoped capabilities:
+/// file handles, GUI grants, and the authenticated IPC inbox/outbound
+/// messages. A missing IPC ownership record rejects the entire restart
+/// before any supervisor quota or capability mutation.
+#[cfg(feature="test-r031-vfs")]
+pub fn restart_and_revoke_full_exact<
+ const S:usize,const W:usize,const Q:usize,const M:usize,const D:usize>(
+ supervisor:&mut ServiceTable<S>,
+ handles:&mut crate::fs_handles::FileHandles,
+ broker:&mut crate::gui_broker::Broker<W,Q>,
+ desktop:&mut crate::gui_broker::DesktopInput,
+ ipc:&mut crate::ipc::ScopedRouter<M,D>,
+ service:u32,crashed:crate::batch5_session::Identity,replacement_pid:u32
+)->ServiceAction{
+ if ipc.pending(crashed).is_err(){return ServiceAction::Deny;}
+ let answer=restart_and_revoke_exact(supervisor,handles,broker,desktop,
+                                     service,crashed,replacement_pid);
+ if matches!(answer,ServiceAction::Restart{..}){
+   // Exiting process IPC registration was validated before any mutations.
+   // Reap removes both its receiver queue and old outbound messages in
+   // surviving peer mailboxes before a new PID can be prepared.
+   let result=ipc.reap(crashed);
+   debug_assert!(result.is_ok());
+ }
+ answer
+}
+/// Full kernel-owned shutdown capability teardown. Validate the entire
+/// exact active service list and every IPC/file owner *before* changing any
+/// supervisor state. After shutdown, retire each process's file handles,
+/// IPC receiver/outbound messages, keyboard/pointer focus, input grants,
+/// framebuffer surface grants and unpublished frame damage. This does not
+/// substitute for separately quiescing the platform's APIC/PIT/ATA hardware.
+#[cfg(feature="test-r031-vfs")]
+pub fn shutdown_and_revoke_capabilities_exact<
+ const S:usize,const W:usize,const Q:usize,const M:usize,
+ const D:usize,const L:usize,const F:usize>(
+ supervisor:&mut ServiceTable<S>,
+ handles:&mut crate::fs_handles::FileHandles,
+ broker:&mut crate::gui_broker::Broker<W,Q>,
+ desktop:&mut crate::gui_broker::DesktopInput,
+ ipc:&mut crate::ipc::ScopedRouter<M,D>,
+ layout:&mut crate::gui_broker::SurfaceLayout<L>,
+ frames:&mut crate::gui_broker::DamageQueue<F>,
+ required:&[(u32,u32,u32)]
+)->bool{
+ if required.is_empty()||required.len()!=supervisor.active_services()||
+    !supervisor.all_active_exact(required){return false;}
+ for &(_,pid,generation) in required{
+  let identity=crate::batch5_session::Identity{
+      pid,generation:generation as u64};
+  if ipc.pending(identity).is_err()||
+     ((pid==1||pid==2)&&!handles.owns(identity)){
+    return false;
+  }
+ }
+ if !supervisor.shutdown_all_exact(required){return false;}
+ for &(_,pid,generation) in required{
+  let identity=crate::batch5_session::Identity{
+      pid,generation:generation as u64};
+  if pid==1||pid==2{
+    let result=handles.retire_process(identity);
+    debug_assert!(result);
+  }
+  let result=ipc.reap(identity);
+  debug_assert!(result.is_ok());
+  desktop.process_exited(broker,pid);
+  layout.revoke(pid);
+  frames.invalidate_owner(pid);
+ }
+ true
+}
+
+#[cfg(all(test,feature="test-r031-vfs"))]
+mod r105_process_ipc_revocation_tests{
+ use super::*;
+ use crate::batch5_session::Identity;
+ use crate::fs_handles::FileHandles;
+ use crate::ipc::{ScopedRouter,IpcError};
+ use crate::gui_broker::{Broker,DesktopInput};
+ #[test]fn crash_reaps_old_ipc_inbound_and_peer_outbound_before_replacement(){
+  let mut t=ServiceTable::<2>::new();assert!(t.configure(7,1,1));
+  assert!(t.configure(8,2,0));t.start(7);t.start(8);
+  let mut handles=FileHandles::new();
+  let owner=handles.bind_process(1).unwrap();
+  let peer=Identity{pid:2,generation:1};
+  let mut bus=ScopedRouter::<2,4>::new().unwrap();
+  bus.register(owner).unwrap();bus.register(peer).unwrap();
+  bus.send(owner,peer,b"old sender").unwrap();
+  bus.send(peer,owner,b"old inbound").unwrap();
+  let mut gui=Broker::<2,6>::new();gui.grant(1,10).unwrap();gui.grant(2,20).unwrap();
+  let mut desktop=DesktopInput::new();desktop.focus(&mut gui,10).unwrap();
+  assert_eq!(restart_and_revoke_full_exact(&mut t,&mut handles,&mut gui,
+            &mut desktop,&mut bus,7,owner,3),
+            ServiceAction::Restart{pid:3,generation:2});
+  assert!(!handles.owns(owner));
+  assert_eq!(bus.pending(owner),Err(IpcError::UnknownReceiver));
+  assert_eq!(bus.pending(peer),Ok(0));
+  assert!(!gui.owns(1,10));assert!(gui.owns(2,20));
+  assert_eq!(desktop.focused(),None);
+  assert!(!t.is_active_exact(7,3,2));
+ }
+ #[test]fn unknown_ipc_owner_refuses_restart_and_preserves_all_capabilities(){
+  let mut t=ServiceTable::<1>::new();t.configure(7,1,1);t.start(7);
+  let mut handles=FileHandles::new();let owner=handles.bind_process(1).unwrap();
+  let mut ipc=ScopedRouter::<1,2>::new().unwrap();
+  let mut gui=Broker::<1,4>::new();gui.grant(1,10).unwrap();
+  let mut desktop=DesktopInput::new();desktop.focus(&mut gui,10).unwrap();
+  assert_eq!(restart_and_revoke_full_exact(&mut t,&mut handles,&mut gui,
+            &mut desktop,&mut ipc,7,owner,3),ServiceAction::Deny);
+  assert!(t.is_active_exact(7,1,1));
+  assert!(handles.owns(owner));assert!(gui.owns(1,10));
+  assert!(desktop.focused().is_some());
+ }
+ #[test]fn replayed_retired_pid_cannot_consume_second_restart(){
+  let mut t=ServiceTable::<1>::new();t.configure(7,1,2);t.start(7);
+  let mut handles=FileHandles::new();let owner=handles.bind_process(1).unwrap();
+  let mut ipc=ScopedRouter::<1,2>::new().unwrap();ipc.register(owner).unwrap();
+  let mut gui=Broker::<1,4>::new();gui.grant(1,10).unwrap();
+  let mut desktop=DesktopInput::new();desktop.focus(&mut gui,10).unwrap();
+  assert!(matches!(restart_and_revoke_full_exact(&mut t,&mut handles,&mut gui,
+        &mut desktop,&mut ipc,7,owner,3),ServiceAction::Restart{..}));
+  let snapshot=t.snapshot(7);
+  assert_eq!(restart_and_revoke_full_exact(&mut t,&mut handles,&mut gui,
+        &mut desktop,&mut ipc,7,owner,4),ServiceAction::Deny);
+  assert_eq!(t.snapshot(7),snapshot);
+ }
+}
+#[cfg(all(test,feature="test-r031-vfs"))]
+mod r102_cross_service_failure_isolation{
+ use super::*;
+ use crate::fs_handles::{FileHandles,READ};
+ use crate::gui_broker::{Broker,DesktopInput,Error as GuiError};
+ use crate::block::{BlockDevice,BlockError,SECTOR_BYTES};
+ use crate::hier_vfs::HierVfs;
+ struct Disk([[u8;SECTOR_BYTES];100]);
+ impl BlockDevice for Disk{
+  fn sector_count(&self)->u64{100}
+  fn read_sector(&mut self,l:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   *out=*self.0.get(l as usize).ok_or(BlockError::OutOfRange)?;Ok(())
+  }
+  fn write_sector(&mut self,l:u64,bytes:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   *self.0.get_mut(l as usize).ok_or(BlockError::OutOfRange)?=*bytes;Ok(())
+  }
+ }
+ #[test]fn trusted_crash_retires_old_handles_gui_focus_and_pending_events(){
+  let mut fs=HierVfs::format_blank(Disk([[0;SECTOR_BYTES];100])).unwrap();
+  fs.mkdir("/shared").unwrap();fs.create("/shared/item",b"data").unwrap();
+  let mut h=FileHandles::new();let owner=h.bind_process(1).unwrap();
+  let token=h.dispatch_authenticated(1,owner,0,READ,"/shared/item",
+       &mut[],&mut fs).unwrap();
+  let mut b=Broker::<2,8>::new();b.grant(1,10).unwrap();b.grant(2,20).unwrap();
+  let mut focus=DesktopInput::new();focus.focus(&mut b,10).unwrap();
+  focus.capture_pointer(&b,1,10).unwrap();
+  let mut t=ServiceTable::<2>::new();t.configure(7,1,1);t.start(7);
+  let result=restart_and_revoke_exact(&mut t,&mut h,&mut b,&mut focus,7,owner,2);
+  assert_eq!(result,ServiceAction::Restart{pid:2,generation:2});
+  assert!(!h.owns(owner));
+  assert_eq!(h.dispatch_authenticated(2,owner,token,0,"",
+       &mut[0;3],&mut fs),Err(crate::durablefs::FsError::InvalidName));
+  assert!(!b.owns(1,10));assert!(b.owns(2,20));
+  assert_eq!(focus.focused(),None);assert_eq!(focus.captured(),None);
+  assert_eq!(b.peek(1),Err(GuiError::Unauthorized));
+  assert!(t.prepared(7,2,2));
+ }
+ #[test]fn stale_owner_must_not_revoke_replacement_or_consume_restart_budget(){
+  let mut h=FileHandles::new();let original=h.bind_process(1).unwrap();
+  let replacement=h.bind_process(1).unwrap();
+  let mut b=Broker::<1,3>::new();b.grant(1,10).unwrap();
+  let mut focus=DesktopInput::new();focus.focus(&mut b,10).unwrap();
+  let mut t=ServiceTable::<1>::new();t.configure(7,1,1);t.start(7);
+  assert_eq!(restart_and_revoke_exact(&mut t,&mut h,&mut b,&mut focus,
+             7,original,2),ServiceAction::Deny);
+  assert!(h.owns(replacement));assert!(b.owns(1,10));
+  assert_eq!(focus.focused(),Some(crate::gui_broker::FocusTarget{owner:1,window:10}));
+  assert!(t.is_active_exact(7,1,1));
+ }
+ #[test]fn service_epoch_mismatch_refuses_revocation(){
+  let mut h=FileHandles::new();let first=h.bind_process(1).unwrap();
+  let owner=h.bind_process(1).unwrap();assert!(!h.owns(first));
+  let mut b=Broker::<1,3>::new();b.grant(1,10).unwrap();
+  let mut focus=DesktopInput::new();focus.focus(&mut b,10).unwrap();
+  let mut t=ServiceTable::<1>::new();t.configure(7,1,1);t.start(7);
+  assert_eq!(restart_and_revoke_exact(&mut t,&mut h,&mut b,&mut focus,
+             7,owner,2),ServiceAction::Deny);
+  assert!(h.owns(owner));assert!(b.owns(1,10));
+ }
+}
+
+
+/// Kernel-only supervisor activation gate. Pending process replacements
+/// become active only after the exact process incarnation owns both an IPC
+/// receiver mailbox and a fresh compositor window grant; stale userspace
+/// "ready" messages cannot activate an unprepared process.
+impl<const N:usize> ServiceTable<N>{
+ pub fn prepared_with_ipc_and_window<
+    const M:usize,const D:usize,const W:usize,const Q:usize>(
+    &mut self,service:u32,owner:crate::batch5_session::Identity,
+    router:&crate::ipc::ScopedRouter<M,D>,
+    windows:&crate::gui_broker::Broker<W,Q>,
+    window:u32,epoch:u64)->bool{
+   if service==0||owner.pid==0||owner.generation==0||
+      owner.generation>u32::MAX as u64||window==0||epoch==0{
+      return false;
+   }
+   if router.pending(owner).is_err() ||
+      windows.grant_epoch_for(owner.pid,window)!=Ok(epoch){
+      return false;
+   }
+   self.prepared(service,owner.pid,owner.generation as u32)
+ }
+}
+#[cfg(test)]
+mod r103_ipc_and_window_prepared_tests{
+ use super::*;
+ use crate::batch5_session::Identity;
+ use crate::gui_broker::Broker;
+ use crate::ipc::ScopedRouter;
+ #[test]fn replacement_becomes_ready_only_with_both_kernel_owned_grants(){
+  let mut sup=ServiceTable::<1>::new();sup.configure(7,10,1);sup.start(7);
+  assert_eq!(sup.crash_exact(7,10,1,11),ServiceAction::Restart{pid:11,generation:2});
+  let new_owner=Identity{pid:11,generation:2};
+  let mut ipc=ScopedRouter::<2,2>::new().unwrap();
+  let mut gui=Broker::<2,4>::new();
+  assert!(!sup.prepared_with_ipc_and_window(7,new_owner,&ipc,&gui,110,1));
+  ipc.register(new_owner).unwrap();
+  assert!(!sup.prepared_with_ipc_and_window(7,new_owner,&ipc,&gui,110,1));
+  gui.grant(11,110).unwrap();
+  let ep=gui.grant_epoch_for(11,110).unwrap();
+  assert!(!sup.prepared_with_ipc_and_window(7,new_owner,&ipc,&gui,110,ep+1));
+  assert!(sup.prepared_with_ipc_and_window(7,new_owner,&ipc,&gui,110,ep));
+  assert!(sup.is_active_exact(7,11,2));
+ }
+ #[test]fn foreign_or_stale_mailbox_cannot_activate_pending_process(){
+  let mut sup=ServiceTable::<1>::new();sup.configure(7,10,1);sup.start(7);
+  sup.crash_exact(7,10,1,11);
+  let bad=Identity{pid:11,generation:1};
+  let good=Identity{pid:11,generation:2};
+  let mut ipc=ScopedRouter::<1,2>::new().unwrap();ipc.register(bad).unwrap();
+  let mut gui=Broker::<1,2>::new();gui.grant(11,110).unwrap();
+  let ep=gui.grant_epoch_for(11,110).unwrap();
+  assert!(!sup.prepared_with_ipc_and_window(7,good,&ipc,&gui,110,ep));
+  assert!(!sup.prepared_with_ipc_and_window(7,bad,&ipc,&gui,110,ep));
+  assert!(!sup.is_active_exact(7,11,2));
+  ipc.reap(bad).unwrap();ipc.register(good).unwrap();
+  assert!(sup.prepared_with_ipc_and_window(7,good,&ipc,&gui,110,ep));
+ }
+ #[test]fn grant_revocation_blocks_activation_of_reissued_window(){
+  let mut sup=ServiceTable::<1>::new();sup.configure(7,10,1);sup.start(7);
+  sup.crash_exact(7,10,1,11);
+  let owner=Identity{pid:11,generation:2};
+  let mut ipc=ScopedRouter::<1,2>::new().unwrap();ipc.register(owner).unwrap();
+  let mut gui=Broker::<1,2>::new();gui.grant(11,110).unwrap();
+  let old=gui.grant_epoch_for(11,110).unwrap();
+  gui.revoke_window(11,110).unwrap();gui.grant(11,110).unwrap();
+  let new_epoch=gui.grant_epoch_for(11,110).unwrap();
+  assert_ne!(old,new_epoch);
+  assert!(!sup.prepared_with_ipc_and_window(7,owner,&ipc,&gui,110,old));
+  assert!(sup.prepared_with_ipc_and_window(7,owner,&ipc,&gui,110,new_epoch));
+ }
+}
+
+
+#[cfg(test)]
+mod r109_generation_and_restart_credit_admission {
+ use super::*;
+ #[test]fn active_generation_exhaustion_never_advertises_restart_credit(){
+  let mut t=ServiceTable::<2>::new();
+  assert!(t.configure(7,70,3));assert!(t.configure(8,80,2));
+  assert_eq!(t.start(7),ServiceAction::Start{pid:70,generation:1});
+  assert_eq!(t.start(8),ServiceAction::Start{pid:80,generation:1});
+  let slot=t.slots.iter().position(|s|s.is_some_and(|s|s.service_id==7)).unwrap();
+  t.slots[slot].as_mut().unwrap().generation=u32::MAX;
+  assert!(!t.can_restart_service(7));
+  assert_eq!(t.remaining_restarts(7),Some(0));
+  assert_eq!(t.restart_credits_left(),2);
+  assert_eq!(t.crash_exact(7,70,u32::MAX,71),ServiceAction::Deny);
+  assert!(t.is_exhausted_service(7));
+  assert_eq!(t.snapshot(7).unwrap().pid,70);
+  assert!(t.is_active_exact(8,80,1));
+ }
+ #[test]fn pending_generation_exhaustion_does_not_recycle_replacement_identity(){
+  let mut t=ServiceTable::<1>::new();
+  assert!(t.configure(7,70,3));
+  t.start(7);
+  assert_eq!(t.crash_exact(7,70,1,71),
+             ServiceAction::Restart{pid:71,generation:2});
+  let index=t.slots.iter().position(|s|s.is_some_and(|s|s.service_id==7)).unwrap();
+  t.slots[index].as_mut().unwrap().generation=u32::MAX;
+  let prior=t.snapshot(7);
+  assert_eq!(t.retryable_pending_count(),0);
+  assert_eq!(t.retry_pending_exact(7,71,u32::MAX,72),ServiceAction::Deny);
+  assert_eq!(t.snapshot(7),prior);
+  assert_eq!(t.remaining_restarts(7),Some(0));
+ }
+ #[test]fn exact_restart_budget_stops_at_configured_limit_and_cannot_steal_peer(){
+  let mut t=ServiceTable::<2>::new();
+  assert!(t.configure(7,70,1));assert!(t.configure(8,80,2));
+  t.start(7);t.start(8);
+  assert!(t.can_restart_service(7));
+  assert_eq!(t.crash_exact(7,70,1,71),ServiceAction::Restart{pid:71,generation:2});
+  assert_eq!(t.remaining_restarts(7),Some(0));
+  assert!(t.prepared(7,71,2));
+  assert!(!t.can_restart_service(7));
+  assert_eq!(t.crash_exact(7,71,2,72),ServiceAction::Deny);
+  assert!(!t.snapshot(7).unwrap().active);
+  assert!(t.is_active_exact(8,80,1));
+  assert_eq!(t.remaining_restarts(8),Some(2));
+ }
+}
+
+
+#[cfg(all(test,feature="test-r031-vfs"))]
+mod r110_full_shutdown_capability_teardown_tests{
+ use super::*;
+ use crate::fs_handles::FileHandles;
+ use crate::ipc::{ScopedRouter,IpcError};
+ use crate::gui_broker::{Broker,DesktopInput,SurfaceLayout,DamageQueue};
+ use crate::agent_05_surface_rect::Rectangle;
+ use crate::batch5_session::Identity;
+ fn rect()->Rectangle{Rectangle{x:0,y:0,width:32,height:24}}
+ #[test]fn full_shutdown_retires_files_ipc_focus_surfaces_damage_and_services(){
+  let mut supervisor=ServiceTable::<1>::new();
+  assert!(supervisor.configure(7,1,1));
+  assert_eq!(supervisor.start(7),ServiceAction::Start{pid:1,generation:1});
+  let mut handles=FileHandles::new();
+  let owner=handles.bind_process(1).unwrap();
+  let mut ipc=ScopedRouter::<1,2>::new().unwrap();ipc.register(owner).unwrap();
+  let mut broker=Broker::<1,4>::new();broker.grant(1,10).unwrap();
+  let mut input=DesktopInput::new();
+  input.focus(&mut broker,10).unwrap();
+  input.capture_pointer(&broker,1,10).unwrap();
+  let mut layout=SurfaceLayout::<1>::new();layout.grant(1,10,rect()).unwrap();
+  let mut frames=DamageQueue::<2>::new();
+  frames.submit(&layout,1,&[(10,0,0,2,2)]).unwrap();
+  assert!(shutdown_and_revoke_capabilities_exact(&mut supervisor,
+      &mut handles,&mut broker,&mut input,&mut ipc,
+      &mut layout,&mut frames,&[(7,1,1)]));
+  assert_eq!(supervisor.active_services(),0);
+  assert!(!handles.owns(owner));
+  assert_eq!(ipc.pending(owner),Err(IpcError::UnknownReceiver));
+  assert!(!broker.owns(1,10));
+  assert_eq!(input.focused(),None);assert_eq!(input.captured(),None);
+  assert_eq!(layout.geometry(1,10),Err(crate::gui_broker::Error::Unauthorized));
+  assert_eq!(frames.pending(),0);
+ }
+ #[test]fn stale_epoch_or_missing_ipc_rejects_entire_shutdown_without_mutation(){
+  let mut supervisor=ServiceTable::<1>::new();supervisor.configure(7,1,1);
+  supervisor.start(7);
+  let mut handles=FileHandles::new();let owner=handles.bind_process(1).unwrap();
+  let mut ipc=ScopedRouter::<1,2>::new().unwrap();ipc.register(owner).unwrap();
+  let mut broker=Broker::<1,4>::new();broker.grant(1,10).unwrap();
+  let mut input=DesktopInput::new();input.focus(&mut broker,10).unwrap();
+  let mut layout=SurfaceLayout::<1>::new();layout.grant(1,10,rect()).unwrap();
+  let mut frames=DamageQueue::<2>::new();
+  let attempt=|required:&[(u32,u32,u32)],supervisor:&mut ServiceTable<1>,
+      handles:&mut FileHandles,broker:&mut Broker<1,4>,
+      input:&mut DesktopInput,ipc:&mut ScopedRouter<1,2>,
+      layout:&mut SurfaceLayout<1>,frames:&mut DamageQueue<2>|{
+       shutdown_and_revoke_capabilities_exact(supervisor,handles,broker,input,
+           ipc,layout,frames,required)
+      };
+  assert!(!attempt(&[(7,1,2)],&mut supervisor,&mut handles,&mut broker,
+       &mut input,&mut ipc,&mut layout,&mut frames));
+  assert!(supervisor.is_active_exact(7,1,1));assert!(handles.owns(owner));
+  assert!(broker.owns(1,10));assert!(input.focused().is_some());
+  assert_eq!(layout.geometry(1,10),Ok(rect()));
+  assert!(ipc.reap(owner).is_ok());
+  assert!(!attempt(&[(7,1,1)],&mut supervisor,&mut handles,&mut broker,
+       &mut input,&mut ipc,&mut layout,&mut frames));
+  assert!(supervisor.is_active_exact(7,1,1));assert!(handles.owns(owner));
+  assert!(broker.owns(1,10));assert!(input.focused().is_some());
+ }
 }

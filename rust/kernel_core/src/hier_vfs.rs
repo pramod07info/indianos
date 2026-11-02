@@ -53,6 +53,16 @@ impl<D:BlockDevice> HierVfs<D>{
  pub fn mount(disk:D)->Result<Self,FsError>{
   Ok(Self{fs:DurableFs::mount(disk)?})
  }
+ /// Explicit recovery-only mount for an interrupted metadata transaction.
+ /// A valid COW checksum alone is insufficient for a hierarchical
+ /// namespace: every stored directory marker and file must have its
+ /// canonical parent chain, and contradictory file/dir aliases are denied.
+ /// No repair or write occurs; caller must explicitly select the volume.
+ pub fn mount_consistent_recovery(disk:D)->Result<Self,FsError>{
+  let mut volume=Self::mount(disk)?;
+  volume.listing_integrity()?;
+  Ok(volume)
+ }
  /// Strict Desktop/installer mount: refuse volume media with only a single
  /// surviving verified metadata head; caller can inspect the health first.
  pub fn mount_healthy(disk:D)->Result<Self,FsError>{
@@ -409,6 +419,42 @@ mod tests{
  }
  fn fresh()->HierVfs<Disk>{
   HierVfs::format_blank(Disk{blocks:[[0;SECTOR_BYTES];COUNT],writes:0,tear:None}).unwrap()
+ }
+ #[test]fn r108_recovery_mount_returns_last_whole_directory_tree_after_torn_head(){
+  let mut fs=fresh();
+  fs.mkdir("/a").unwrap();
+  fs.mkdir("/a/b").unwrap();
+  fs.create("/a/b/item",b"not-committed").unwrap();
+  let before=fs.into_device();
+  let mut disk=before.clone();
+  // Creation is generation 4 (head 1). Corrupt only that last
+  // checkpoint; generation 3's complete /a and /a/b tree stays valid.
+  disk.blocks[1][0]^=0x31;
+  let writes=disk.writes;
+  let mut recovered=HierVfs::mount_consistent_recovery(disk).unwrap();
+  let mut out=[0x7b;MAX_TRANSFER];
+  assert_eq!(recovered.read("/a/b/item",&mut out),Err(FsError::NotFound));
+  assert_eq!(recovered.list_dir("/a/b",&mut out),Ok(0));
+  assert_eq!(recovered.list_dir("/a",&mut out),Ok(4));
+  assert_eq!(&out[..4],b"d:b\n");
+  let disk=recovered.into_device();
+  assert_eq!(disk.writes,writes);
+ }
+ #[test]fn r108_recovery_mount_refuses_orphaned_file_even_if_cow_crc_is_valid(){
+  let disk=Disk{blocks:[[0;SECTOR_BYTES];COUNT],writes:0,tear:None};
+  let mut raw=DurableFs::format_blank(disk).unwrap();
+  // The underlying flat COW metadata is individually checksummed and
+  // valid, but this entry names a file under a missing parent directory.
+  raw.create_path("/~fa~b~item",b"unowned").unwrap();
+  let disk=raw.into_device();
+  let original_writes=disk.writes;
+  assert!(matches!(HierVfs::mount_consistent_recovery(disk.clone()),
+                  Err(FsError::InvalidVolume)));
+  assert_eq!(disk.writes,original_writes);
+  let mut legacy=DurableFs::mount(disk).unwrap();
+  let mut data=[0u8;16];
+  assert_eq!(legacy.read_path("/~fa~b~item",&mut data),Ok(7));
+  assert_eq!(&data[..7],b"unowned");
  }
  #[test]fn m1_truncate_preserves_prefix_zero_fills_and_survives_remount(){
   let mut v=fresh();v.mkdir("/shared").unwrap();

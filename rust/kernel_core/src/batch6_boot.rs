@@ -360,6 +360,114 @@ impl<const P:usize,const E:usize,const W:usize,const K:usize>
 
 }
 
+/// Kernel-owned, versioned diagnostic journal entry stored in the
+/// existing redundant copy-on-write filesystem. Not a usermode syscall:
+/// callers must already hold the privileged, validated mounted VFS.
+pub const BOOT_RECOVERY_PATH:&str="/recovery/boot-state";
+const RECOVERY_MAGIC:&[u8;8]=b"INDR113!";
+const RECOVERY_BYTES:usize=40;
+#[derive(Clone,Copy,Debug,Eq,PartialEq)]
+pub struct BootRecoveryRecord{
+ pub boot_epoch:u64,pub failure_code:u32,pub phase:Phase,
+ pub pid1:u32,pub desktop_pid:u32,pub restarts_left:u32,
+}
+#[cfg(feature="test-r031-vfs")]
+fn recovery_checksum(bytes:&[u8])->u32{
+ let mut h=2166136261u32;
+ for &byte in bytes{h=(h^(byte as u32)).wrapping_mul(16777619);}
+ h
+}
+#[cfg(feature="test-r031-vfs")]
+fn phase_to_byte(p:Phase)->u8{
+ match p{Phase::Cold=>0,Phase::InitReady=>1,Phase::DesktopReady=>2,
+   Phase::Degraded=>3,Phase::Stopped=>4}
+}
+#[cfg(feature="test-r031-vfs")]
+fn phase_from_byte(v:u8)->Option<Phase>{
+ match v{0=>Some(Phase::Cold),1=>Some(Phase::InitReady),
+ 2=>Some(Phase::DesktopReady),3=>Some(Phase::Degraded),
+ 4=>Some(Phase::Stopped),_=>None}
+}
+/// Read-only decode with independent record checksum in addition to the
+/// filesystem's own data/metadata CRC. Never accept a partial record or
+/// invented reboot epoch.
+#[cfg(feature="test-r031-vfs")]
+pub fn read_boot_recovery_record<D:crate::block::BlockDevice>(
+ fs:&mut crate::hier_vfs::HierVfs<D>
+)->Result<BootRecoveryRecord,crate::durablefs::FsError>{
+ use crate::durablefs::FsError;
+ let mut bytes=[0u8;RECOVERY_BYTES];
+ let n=fs.read(BOOT_RECOVERY_PATH,&mut bytes)?;
+ if n!=RECOVERY_BYTES||&bytes[..8]!=RECOVERY_MAGIC||bytes[8]!=1||
+    bytes[10..12]!=[0;2] ||
+    recovery_checksum(&bytes[..36])!=u32::from_le_bytes(bytes[36..40].try_into().unwrap()){
+  return Err(FsError::InvalidVolume);
+ }
+ let phase=phase_from_byte(bytes[9]).ok_or(FsError::InvalidVolume)?;
+ if !matches!(phase,Phase::Degraded|Phase::Stopped){return Err(FsError::InvalidVolume);}
+ let record=BootRecoveryRecord{
+  boot_epoch:u64::from_le_bytes(bytes[12..20].try_into().unwrap()),
+  failure_code:u32::from_le_bytes(bytes[20..24].try_into().unwrap()),
+  pid1:u32::from_le_bytes(bytes[24..28].try_into().unwrap()),
+  desktop_pid:u32::from_le_bytes(bytes[28..32].try_into().unwrap()),
+  restarts_left:u32::from_le_bytes(bytes[32..36].try_into().unwrap()),
+  phase,
+ };
+ if record.boot_epoch==0||record.failure_code==0{
+  return Err(FsError::InvalidVolume);
+ }
+ Ok(record)
+}
+/// Persist a genuine failed graphical boot/recovery state with monotonic
+/// kernel-issued reboot epochs. No automatic creation of a volume and no
+/// write to a host partition. Requires an explicit already mounted VFS;
+/// existing OS security guards forbid untrusted applications from
+/// mutating /recovery.
+#[cfg(feature="test-r031-vfs")]
+pub fn persist_boot_recovery_record<D:crate::block::BlockDevice>(
+ fs:&mut crate::hier_vfs::HierVfs<D>,health:BootHealth,
+ boot_epoch:u64,failure_code:u32,
+)->Result<BootRecoveryRecord,crate::durablefs::FsError>{
+ use crate::durablefs::FsError;
+ if boot_epoch==0||failure_code==0||
+    !matches!(health.phase,Phase::Degraded|Phase::Stopped) ||
+    health.ready_for_desktop_input{
+  return Err(FsError::InvalidName);
+ }
+ let prior=match read_boot_recovery_record(fs){
+  Ok(r)=>Some(r),
+  Err(FsError::NotFound)=>None,
+  Err(e)=>return Err(e),
+ };
+ if prior.is_some_and(|r|r.boot_epoch>=boot_epoch){
+  return Err(FsError::InvalidName);
+ }
+ let record=BootRecoveryRecord{
+  boot_epoch,failure_code,phase:health.phase,
+  pid1:health.pid1.map_or(0,|id|id.pid),
+  desktop_pid:health.desktop.map_or(0,|id|id.pid),
+  restarts_left:health.remaining_desktop_restarts as u32,
+ };
+ let mut data=[0u8;RECOVERY_BYTES];
+ data[..8].copy_from_slice(RECOVERY_MAGIC);
+ data[8]=1;data[9]=phase_to_byte(record.phase);
+ data[12..20].copy_from_slice(&record.boot_epoch.to_le_bytes());
+ data[20..24].copy_from_slice(&record.failure_code.to_le_bytes());
+ data[24..28].copy_from_slice(&record.pid1.to_le_bytes());
+ data[28..32].copy_from_slice(&record.desktop_pid.to_le_bytes());
+ data[32..36].copy_from_slice(&record.restarts_left.to_le_bytes());
+ let checksum=recovery_checksum(&data[..36]);
+ data[36..40].copy_from_slice(&checksum.to_le_bytes());
+ match fs.mkdir("/recovery"){
+  Ok(())|Err(FsError::Exists)=>{},
+  Err(e)=>return Err(e),
+ }
+ if prior.is_some(){fs.overwrite(BOOT_RECOVERY_PATH,&data)?;}
+ else{fs.create(BOOT_RECOVERY_PATH,&data)?;}
+ fs.sync()?;
+ Ok(record)
+}
+
 /// R006: one transaction for a minimal graphical service dependency chain.
 /// The trusted kernel must still instantiate CPUs, load ELF images and wire
 /// real interrupts; this controller only manages authenticated services.
@@ -696,5 +804,66 @@ mod r011_desktop_readiness_tests{
   a.reset_desktop(health(6),200).unwrap();
   assert!(!a.input_ready(health(6),5));
   assert!(!a.input_ready(health(5),5));
+ }
+}
+
+
+#[cfg(all(test,feature="test-r031-vfs"))]
+mod r113_reboot_recovery_record_tests{
+ use super::*;
+ use crate::block::{BlockDevice,BlockError,SECTOR_BYTES};
+ use crate::durablefs::FsError;
+ use crate::hier_vfs::HierVfs;
+ struct Disk([[u8;SECTOR_BYTES];100],usize);
+ impl BlockDevice for Disk{
+  fn sector_count(&self)->u64{100}
+  fn read_sector(&mut self,l:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   *out=*self.0.get(l as usize).ok_or(BlockError::OutOfRange)?;Ok(())
+  }
+  fn write_sector(&mut self,l:u64,buf:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   *self.0.get_mut(l as usize).ok_or(BlockError::OutOfRange)?=*buf;
+   self.1+=1;Ok(())
+  }
+  fn sync(&mut self)->Result<(),BlockError>{Ok(())}
+ }
+ fn disk()->HierVfs<Disk>{HierVfs::format_blank(Disk([[0;SECTOR_BYTES];100],0)).unwrap()}
+ fn failed(phase:Phase)->BootHealth{
+  BootHealth{phase,pid1:Some(Identity{pid:1,generation:7}),
+    desktop:None,remaining_desktop_restarts:2,ready_for_desktop_input:false}
+ }
+ #[test]fn persists_degraded_state_across_disk_reboot_without_autoformat(){
+  let mut fs=disk();
+  let old=failed(Phase::Degraded);
+  let expected=persist_boot_recovery_record(&mut fs,old,11,0x33).unwrap();
+  assert_eq!(expected.boot_epoch,11);
+  assert_eq!(expected.pid1,1);assert_eq!(expected.desktop_pid,0);
+  let write_count=fs.into_device();
+  let writes=write_count.1;
+  let mut remount=HierVfs::mount(write_count).unwrap();
+  assert_eq!(read_boot_recovery_record(&mut remount),Ok(expected));
+  assert_eq!(remount.into_device().1,writes);
+ }
+ #[test]fn cannot_replay_old_boot_epoch_or_persist_ready_desktop(){
+  let mut fs=disk();
+  assert_eq!(persist_boot_recovery_record(&mut fs,failed(Phase::InitReady),1,2),
+     Err(FsError::InvalidName));
+  persist_boot_recovery_record(&mut fs,failed(Phase::Degraded),12,2).unwrap();
+  let generation=fs.generation();
+  assert_eq!(persist_boot_recovery_record(&mut fs,failed(Phase::Stopped),12,3),
+     Err(FsError::InvalidName));
+  assert_eq!(fs.generation(),generation);
+  let rec=persist_boot_recovery_record(&mut fs,failed(Phase::Stopped),13,4).unwrap();
+  assert_eq!(rec.phase,Phase::Stopped);
+  assert_eq!(read_boot_recovery_record(&mut fs),Ok(rec));
+ }
+ #[test]fn checksum_valid_filesystem_but_corrupted_diagnostic_is_denied(){
+  let mut fs=disk();
+  persist_boot_recovery_record(&mut fs,failed(Phase::Degraded),10,1).unwrap();
+  let mut altered=[0u8;RECOVERY_BYTES];
+  assert_eq!(fs.read(BOOT_RECOVERY_PATH,&mut altered),Ok(RECOVERY_BYTES));
+  altered[24]^=0x55; // stale checksum, valid COW write
+  fs.overwrite(BOOT_RECOVERY_PATH,&altered).unwrap();
+  let mut recovered=HierVfs::mount(fs.into_device()).unwrap();
+  assert_eq!(read_boot_recovery_record(&mut recovered),Err(FsError::InvalidVolume));
  }
 }

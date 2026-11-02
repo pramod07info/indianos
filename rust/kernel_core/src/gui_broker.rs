@@ -44,6 +44,50 @@ impl<const W:usize,const Q:usize> Broker<W,Q>{
         owner!=0&&window!=0&&self.windows.iter().flatten()
             .any(|b|b.owner==owner&&b.window==window)
     }
+    /// Return a kernel-issued grant incarnation for one owner/window.
+    /// A revoked/reissued window ID gets a different epoch even when the
+    /// scheduler reuses the same PID.
+    pub fn grant_epoch_for(&self,owner:u32,window:u32)->Result<u64,Error>{
+        self.binding(owner,window).map(|b|b.epoch).ok_or(Error::Unauthorized)
+    }
+    /// Drain exactly one verified window grant. A stolen, revoked or reused
+    /// window ID cannot drain notifications from a fresh incarnation.
+    /// Short output returns Full without changing any queue entry.
+    pub fn drain_window_epoch(&mut self,owner:u32,window:u32,epoch:u64,
+         into:&mut[Event])->Result<usize,Error>{
+        if epoch==0 || self.binding(owner,window).is_none_or(|g|g.epoch!=epoch){
+            return Err(Error::Unauthorized);
+        }
+        let needed=self.events[..self.len].iter().flatten()
+            .filter(|e|e.owner==owner&&e.window==window).count();
+        if needed>into.len(){return Err(Error::Full);}
+        let mut n=0usize;
+        let mut index=0;
+        while index<self.len{
+            if self.events[index].is_some_and(|e|e.owner==owner&&e.window==window){
+                into[n]=self.events[index].unwrap();
+                n+=1;
+                self.remove(index);
+            }else{index+=1;}
+        }
+        Ok(n)
+    }
+    /// Trusted in-place recovery of a single crashed window. The exact old
+    /// grant epoch is mandatory; a delayed crash cannot revoke a replacement.
+    /// Stage the grant change and event filtering before commit, preserving
+    /// other windows' pending FIFO and the globally monotonic sequence.
+    pub fn recover_window_exact(&mut self,owner:u32,window:u32,
+         old_epoch:u64)->Result<u64,Error>{
+        if old_epoch==0||self.grant_epoch_for(owner,window)!=Ok(old_epoch){
+            return Err(Error::Unauthorized);
+        }
+        let mut staged=Self{windows:self.windows,events:self.events,
+            len:self.len,sequence:self.sequence,grant_epoch:self.grant_epoch};
+        staged.revoke_window(owner,window)?;
+        staged.grant(owner,window)?;
+        let next=staged.grant_epoch_for(owner,window)?;
+        *self=staged;Ok(next)
+    }
     pub fn owner(&self,window:u32)->Option<u32>{
         if window==0{return None;}
         self.windows.iter().flatten().find(|b|b.window==window).map(|b|b.owner)
@@ -110,7 +154,10 @@ impl<const W:usize,const Q:usize> Broker<W,Q>{
         if self.len.checked_add(events.len()).is_none_or(|n|n>Q){
             return Err(Error::Full);
         }
-        if self.sequence.checked_add(events.len() as u32).is_none(){
+        // Never truncate usize to u32 before checking serial exhaustion.
+        // On 64-bit kernels a huge event count must not wrap the sequence.
+        let requested=u32::try_from(events.len()).map_err(|_|Error::Exhausted)?;
+        if self.sequence.checked_add(requested).is_none(){
             return Err(Error::Exhausted);
         }
         for &(window,kind) in events{
@@ -121,6 +168,29 @@ impl<const W:usize,const Q:usize> Broker<W,Q>{
             self.post(owner,window,kind)?;
         }
         Ok(events.len())
+    }
+
+    /// Batch scheduling for physical input must not reorder or partially
+    /// publish event groups. Validate all window grants and event kinds first.
+    pub fn post_input_batch(&mut self,owner:u32,window:u32,
+        kinds:&[u32])->Result<usize,Error>{
+        if kinds.is_empty(){return Err(Error::Invalid);}
+        if !self.owns(owner,window){return Err(Error::Unauthorized);}
+        let wanted=u32::try_from(kinds.len()).map_err(|_|Error::Exhausted)?;
+        if self.len.checked_add(kinds.len()).is_none_or(|n|n>Q){
+            return Err(Error::Full);
+        }
+        if self.sequence.checked_add(wanted).is_none(){
+            return Err(Error::Exhausted);
+        }
+        for &kind in kinds{
+            // Strictly known GUI focus and keyboard event types.
+            if !matches!(kind,FOCUS|POINTER_FOCUS|KEY_DOWN|KEY_UP|POINTER_CLICK){
+                return Err(Error::Invalid);
+            }
+        }
+        for &kind in kinds{self.post(owner,window,kind)?;}
+        Ok(kinds.len())
     }
     /// Non-destructive status on a trusted owner queue. Other owners are
     /// not disclosed to clients.
@@ -781,6 +851,30 @@ impl DesktopInput{
   let target=FocusTarget{owner,window};self.focused=broker.binding(owner,window);
   self.capture=None;Ok(target)
  }
+ /// Client-requested focus must carry the process identity validated by
+ /// the syscall dispatcher. Never let a foreign window ID select a new owner.
+ pub fn focus_authenticated<const W:usize,const Q:usize>(&mut self,
+  broker:&mut Broker<W,Q>,authenticated_owner:u32,window:u32)
+  ->Result<FocusTarget,Error>{
+  if authenticated_owner==0||!broker.owns(authenticated_owner,window){
+   return Err(Error::Unauthorized);
+  }
+  self.focus(broker,window)
+ }
+ /// Revoke exactly one window and clear its input authority before the
+ /// owning service may reuse its ID at a fresh grant epoch. All remaining
+ /// windows and unrelated process events are kept.
+ pub fn window_closed<const W:usize,const Q:usize>(&mut self,
+  broker:&mut Broker<W,Q>,owner:u32,window:u32)->Result<(),Error>{
+  broker.revoke_window(owner,window)?;
+  if self.focused.is_some_and(|b|b.owner==owner&&b.window==window){
+    self.focused=None;
+  }
+  if self.capture.is_some_and(|b|b.owner==owner&&b.window==window){
+    self.capture=None;
+  }
+  Ok(())
+ }
  /// Capture starts only from the focused, authenticated owner.
  pub fn capture_pointer<const W:usize,const Q:usize>(&mut self,
   broker:&Broker<W,Q>,owner:u32,window:u32)->Result<(),Error>{
@@ -789,6 +883,31 @@ impl DesktopInput{
    return Err(Error::Unauthorized);
   }
   self.capture=Some(target);Ok(())
+ }
+ /// Capture a physical pointer for an *exact* kernel-authenticated
+ /// window grant incarnation. A stale capture request from a previous
+ /// process/window lifecycle cannot capture a newly reissued window.
+ pub fn capture_pointer_at_epoch<const W:usize,const Q:usize>(&mut self,
+  broker:&Broker<W,Q>,authenticated_owner:u32,window:u32,
+  expected_epoch:u64)->Result<(),Error>{
+  if expected_epoch==0{return Err(Error::Unauthorized);}
+  let binding=broker.binding(authenticated_owner,window)
+   .ok_or(Error::Unauthorized)?;
+  if binding.epoch!=expected_epoch||self.focused!=Some(binding){
+    return Err(Error::Unauthorized);
+  }
+  self.capture=Some(binding);
+  Ok(())
+ }
+ /// Release only the exact captured owner/window/epoch. Delayed release
+ /// from a crashed client must never clear the replacement's capture.
+ pub fn release_pointer_at_epoch(&mut self,owner:u32,window:u32,epoch:u64)
+  ->Result<(),Error>{
+  if epoch==0||self.capture.is_none_or(|b|b.owner!=owner||
+                      b.window!=window||b.epoch!=epoch){
+    return Err(Error::Unauthorized);
+  }
+  self.capture=None;Ok(())
  }
  pub fn release_pointer(&mut self,owner:u32){
   if self.capture.is_some_and(|t|t.owner==owner){self.capture=None;}
@@ -809,6 +928,50 @@ impl DesktopInput{
   }
   broker.post_pointer_click(target.owner,target.window,button)
  }
+
+ /// Publish a complete physical keyboard packet group to the compositor's
+ /// current granted focus, or none. Events preserve ordering, including
+ /// key-down/up pairs; a full queue never publishes an unmatched key-down.
+ pub fn keyboard_batch<const W:usize,const Q:usize>(&mut self,
+  broker:&mut Broker<W,Q>,keys:&[(u16,bool)])->Result<usize,Error>{
+  if keys.is_empty(){return Err(Error::Invalid);}
+  let target=self.focused.ok_or(Error::Empty)?;
+  if broker.binding(target.owner,target.window)!=Some(target){
+   self.focused=None;self.capture=None;
+   return Err(Error::Unauthorized);
+  }
+  if broker.len.checked_add(keys.len()).is_none_or(|n|n>Q){
+   return Err(Error::Full);
+  }
+  let mut staged=Broker{windows:broker.windows,events:broker.events,
+                       len:broker.len,sequence:broker.sequence,grant_epoch:broker.grant_epoch};
+  for &(code,pressed) in keys{
+   staged.post_keyboard(target.owner,target.window,code,pressed)?;
+  }
+  *broker=staged;
+  Ok(keys.len())
+ }
+ /// Deliver a sequence of mouse button actions to the currently captured
+ /// window, never leaking any input to a stale window grant.
+ pub fn click_batch<const W:usize,const Q:usize>(&mut self,
+  broker:&mut Broker<W,Q>,buttons:&[u8])->Result<usize,Error>{
+  if buttons.is_empty(){return Err(Error::Invalid);}
+  let target=self.capture.or(self.focused).ok_or(Error::Empty)?;
+  if broker.binding(target.owner,target.window)!=Some(target){
+   self.capture=None;self.focused=None;
+   return Err(Error::Unauthorized);
+  }
+  if broker.len.checked_add(buttons.len()).is_none_or(|n|n>Q){
+   return Err(Error::Full);
+  }
+  let mut staged=Broker{windows:broker.windows,events:broker.events,
+                       len:broker.len,sequence:broker.sequence,grant_epoch:broker.grant_epoch};
+  for &button in buttons{
+   staged.post_pointer_click(target.owner,target.window,button)?;
+  }
+  *broker=staged;
+  Ok(buttons.len())
+ }
  pub fn process_exited<const W:usize,const Q:usize>(&mut self,
   broker:&mut Broker<W,Q>,owner:u32){
   broker.revoke(owner);
@@ -816,6 +979,48 @@ impl DesktopInput{
   if self.capture.is_some_and(|t|t.owner==owner){self.capture=None;}
  }
 }
+/// Kernel-only atomic compositor surface admission. The input grant and
+/// framebuffer surface are created on staged copies; if either subsystem
+/// rejects the request, no grant, surface or event queue is changed.
+pub fn grant_compositor_surface_exact<const W:usize,const Q:usize,const L:usize>(
+ broker:&mut Broker<W,Q>,layout:&mut SurfaceLayout<L>,
+ owner:u32,window:u32,rectangle:crate::agent_05_surface_rect::Rectangle,
+)->Result<u64,Error>{
+ if owner==0||window==0{return Err(Error::Invalid);}
+ let mut queued=Broker{windows:broker.windows,events:broker.events,
+     len:broker.len,sequence:broker.sequence,grant_epoch:broker.grant_epoch};
+ let mut surfaces=SurfaceLayout{surfaces:layout.surfaces,
+     epochs:layout.epochs,next_epoch:layout.next_epoch};
+ queued.grant(owner,window)?;
+ surfaces.grant(owner,window,rectangle)?;
+ let epoch=queued.grant_epoch_for(owner,window)?;
+ *broker=queued;*layout=surfaces;
+ Ok(epoch)
+}
+
+/// Trusted compositor crash-finalization path. Validate the exact
+/// PID/window grant epoch BEFORE mutating anything. On a confirmed crash,
+/// release pointer capture, focused keyboard route, pending input, every
+/// window grant, queued dirty frames and framebuffer surface authority as
+/// a single kernel-serialized lifecycle transition. This is deliberately
+/// *not* a userspace-accessible way to evict another process.
+pub fn retire_crashed_compositor_owner_exact<
+ const W:usize,const Q:usize,const L:usize,const F:usize>(
+ input:&mut DesktopInput,
+ broker:&mut Broker<W,Q>,
+ layout:&mut SurfaceLayout<L>,
+ frames:&mut DamageQueue<F>,
+ owner:u32,window:u32,epoch:u64)->Result<usize,Error>{
+ if owner==0||window==0||epoch==0||
+    broker.grant_epoch_for(owner,window)!=Ok(epoch) ||
+    layout.geometry(owner,window).is_err(){
+  return Err(Error::Unauthorized);
+ }
+ input.process_exited(broker,owner);
+ layout.revoke(owner);
+ Ok(frames.invalidate_owner(owner))
+}
+
 #[cfg(test)]
 mod r010_focus_capture_tests{
  use super::*;
@@ -928,6 +1133,54 @@ impl<const N:usize> DamageQueue<N>{
    queued.authority=Some(DamageAuthority{grant,surface});
   }
   Ok(epoch)
+ }
+ /// Production-facing epoch-pinned drawing admission. A PID and a
+ /// recycled window number never authorize writing to a new framebuffer:
+ /// require both the current broker grant epoch and current compositor
+ /// surface generation for the *entire* batch. This check, geometry
+ /// clipping and queue insertion happen within one serialized kernel call.
+ pub fn submit_verified_at_grants<const B:usize,const Q:usize,const L:usize>(
+  &mut self,broker:&Broker<B,Q>,layout:&SurfaceLayout<L>,
+  owner:u32,window:u32,grant_epoch:u64,surface_epoch:u64,
+  rectangles:&[(u32,u32,u32,u32)])->Result<u64,Error>{
+  if owner==0||window==0||grant_epoch==0||surface_epoch==0||
+     rectangles.is_empty(){
+   return Err(Error::Unauthorized);
+  }
+  if broker.grant_epoch_for(owner,window)!=Ok(grant_epoch)||
+     layout.epoch(owner,window)!=Some(surface_epoch){
+   return Err(Error::Unauthorized);
+  }
+  if rectangles.len()>N.saturating_sub(self.len){
+   return Err(Error::Full);
+  }
+  let bounds=layout.geometry(owner,window)?;
+  // Staging is intentionally bounded. Enforce all rectangle extents
+  // before mutating the queue or allocating a frame epoch.
+  for &(x,y,w,h) in rectangles{
+   if w==0||h==0||
+      x.checked_add(w).is_none_or(|right|right>bounds.width)||
+      y.checked_add(h).is_none_or(|bottom|bottom>bounds.height){
+    return Err(Error::Invalid);
+   }
+  }
+  // Legacy trusted implementation already binds each published frame to
+  // exact broker and surface epochs; no caller-selected authority is stored.
+  let mut staged=Self{entries:self.entries,len:self.len,next_epoch:self.next_epoch};
+  let wanted=rectangles.len();
+  // Avoid requiring an unbounded scratch Vec on no_std kernels.
+  let next=staged.next_epoch.checked_add(1).ok_or(Error::Exhausted)?;
+  for &(x,y,width,height) in rectangles{
+   staged.entries[staged.len]=Some(QueuedDamage{
+    frame:FrameDamage{owner,window,epoch:next,x,y,width,height},
+    authority:Some(DamageAuthority{grant:grant_epoch,surface:surface_epoch})
+   });
+   staged.len+=1;
+  }
+  staged.next_epoch=next;
+  debug_assert_eq!(staged.len,self.len+wanted);
+  *self=staged;
+  Ok(next)
  }
  /// Fail-atomic drain: caller provides all required output slots and each
  /// output entry has the same monotonically assigned frame epoch.
@@ -2347,5 +2600,387 @@ mod r068_snap_edges_tests{
   assert_eq!(layout.snap_edges_batch(&[(1,10),(2,20)],
    r(10,10,20,20),5),Err(Error::Invalid));
   assert_eq!(layout.next_epoch,before);assert_eq!(layout.geometry(1,10),first);
+ }
+}
+
+
+#[cfg(test)]
+mod r100_gui_focused_input_tests{
+ use super::*;
+ #[test]fn batch_delivers_ordered_keyboard_and_pointer_events_to_owner(){
+  let mut broker=Broker::<2,5>::new();
+  broker.grant(4,10).unwrap();broker.grant(5,11).unwrap();
+  assert_eq!(broker.post_input_batch(4,10,&[KEY_DOWN,KEY_UP,POINTER_CLICK]),Ok(3));
+  assert_eq!(broker.pending_owner(4),Ok(3));
+  assert_eq!(broker.pending_owner(5),Ok(0));
+  let mut out=[Event{owner:0,window:0,kind:0,sequence:0};3];
+  assert_eq!(broker.drain_owner(4,&mut out),Ok(3));
+  assert_eq!(out.map(|e|e.kind),[KEY_DOWN,KEY_UP,POINTER_CLICK]);
+  assert!(out[0].sequence<out[1].sequence&&out[1].sequence<out[2].sequence);
+ }
+ #[test]fn mixed_foreign_and_invalid_input_does_not_publish_partial_batch(){
+  let mut broker=Broker::<2,4>::new();
+  broker.grant(4,10).unwrap();broker.grant(5,11).unwrap();
+  assert_eq!(broker.post_input_batch(4,11,&[KEY_DOWN]),Err(Error::Unauthorized));
+  assert_eq!(broker.post_input_batch(4,10,&[KEY_DOWN,0]),Err(Error::Invalid));
+  assert_eq!(broker.pending_owner(4),Ok(0));
+ }
+ #[test]fn queue_overflow_never_leaks_partial_input(){
+  let mut broker=Broker::<1,2>::new();
+  broker.grant(4,10).unwrap();
+  assert_eq!(broker.post_input_batch(4,10,&[KEY_DOWN,KEY_UP,POINTER_CLICK]),Err(Error::Full));
+  assert_eq!(broker.pending_owner(4),Ok(0));
+  assert_eq!(broker.post_input_batch(4,10,&[KEY_DOWN,KEY_UP]),Ok(2));
+  assert_eq!(broker.post_input_batch(4,10,&[KEY_DOWN]),Err(Error::Full));
+  assert_eq!(broker.pending_owner(4),Ok(2));
+ }
+ #[test]fn departed_process_cannot_receive_queued_keyboard_events(){
+  let mut broker=Broker::<1,4>::new();
+  broker.grant(4,10).unwrap();
+  broker.post_input_batch(4,10,&[KEY_DOWN,KEY_UP]).unwrap();
+  broker.revoke(4);
+  assert_eq!(broker.post_input_batch(4,10,&[KEY_DOWN]),Err(Error::Unauthorized));
+  assert_eq!(broker.pending_owner(4),Err(Error::Unauthorized));
+ }
+}
+
+
+#[cfg(test)]
+mod r101_compositor_atomic_input_tests {
+ use super::*;
+ #[test]fn keyboard_batch_preserves_down_up_order_and_is_owner_bound(){
+  let mut b=Broker::<2,8>::new();b.grant(7,10).unwrap();b.grant(8,11).unwrap();
+  let mut input=DesktopInput::new();
+  input.focus(&mut b,10).unwrap();
+  assert_eq!(input.keyboard_batch(&mut b,&[(30,true),(30,false)]),Ok(2));
+  let first=b.peek(7).unwrap();
+  assert_eq!(first.kind,FOCUS);
+  b.ack(7,first.sequence).unwrap();
+  let keydown=b.peek(7).unwrap();
+  assert_eq!(decode_key_event(keydown.kind),Some((30,true)));
+  b.ack(7,keydown.sequence).unwrap();
+  let keyup=b.peek(7).unwrap();
+  assert_eq!(decode_key_event(keyup.kind),Some((30,false)));
+  assert_eq!(b.pending_owner(8),Ok(0));
+ }
+ #[test]fn full_queue_refuses_entire_keyboard_pair(){
+  let mut b=Broker::<1,2>::new();b.grant(7,10).unwrap();
+  let mut input=DesktopInput::new();input.focus(&mut b,10).unwrap();
+  assert_eq!(input.keyboard_batch(&mut b,&[(30,true),(30,false)]),
+             Err(Error::Full));
+  assert_eq!(b.pending_owner(7),Ok(1));
+ }
+ #[test]fn pointer_batch_keeps_capture_owner_even_with_other_focus_candidates(){
+  let mut b=Broker::<2,8>::new();b.grant(7,10).unwrap();b.grant(8,11).unwrap();
+  let mut input=DesktopInput::new();input.focus(&mut b,10).unwrap();
+  input.capture_pointer(&b,7,10).unwrap();
+  assert_eq!(input.click_batch(&mut b,&[1,2]),Ok(2));
+  assert_eq!(b.pending_owner(8),Ok(0));
+  input.process_exited(&mut b,7);
+  assert_eq!(input.click_batch(&mut b,&[1]),Err(Error::Empty));
+  assert_eq!(b.pending_owner(7),Err(Error::Unauthorized));
+ }
+}
+
+
+#[cfg(test)]
+mod r102_authenticated_window_lifecycle_tests{
+ use super::*;
+ #[test]fn authenticated_focus_cannot_steal_another_clients_window(){
+  let mut broker=Broker::<2,6>::new();
+  broker.grant(4,10).unwrap();broker.grant(5,11).unwrap();
+  let mut input=DesktopInput::new();
+  assert_eq!(input.focus_authenticated(&mut broker,4,10),
+             Ok(FocusTarget{owner:4,window:10}));
+  assert_eq!(input.focus_authenticated(&mut broker,5,10),
+             Err(Error::Unauthorized));
+  assert_eq!(input.focused(),Some(FocusTarget{owner:4,window:10}));
+  assert_eq!(broker.pending_owner(5),Ok(0));
+ }
+ #[test]fn closed_window_retires_focus_capture_and_old_pending_input(){
+  let mut broker=Broker::<2,8>::new();
+  broker.grant(4,10).unwrap();broker.grant(5,11).unwrap();
+  let mut input=DesktopInput::new();
+  input.focus_authenticated(&mut broker,4,10).unwrap();
+  input.capture_pointer(&broker,4,10).unwrap();
+  input.keyboard(&mut broker,30,true).unwrap();
+  input.window_closed(&mut broker,4,10).unwrap();
+  assert_eq!(input.focused(),None);
+  assert_eq!(input.captured(),None);
+  assert_eq!(broker.pending_owner(4),Err(Error::Unauthorized));
+  assert_eq!(input.keyboard(&mut broker,30,false),Err(Error::Empty));
+  assert_eq!(broker.pending_owner(5),Ok(0));
+  broker.grant(4,10).unwrap();
+  assert_eq!(input.keyboard(&mut broker,30,true),Err(Error::Empty));
+ }
+ #[test]fn closing_foreign_window_is_noop_for_current_focus(){
+  let mut broker=Broker::<2,8>::new();
+  broker.grant(4,10).unwrap();broker.grant(5,11).unwrap();
+  let mut input=DesktopInput::new();
+  input.focus_authenticated(&mut broker,4,10).unwrap();
+  assert_eq!(input.window_closed(&mut broker,5,10),Err(Error::Unauthorized));
+  assert_eq!(input.focused(),Some(FocusTarget{owner:4,window:10}));
+  assert!(broker.owns(4,10));
+ }
+}
+
+
+#[cfg(test)]
+mod r103_epoch_scoped_gui_delivery_tests{
+ use super::*;
+ const EMPTY:Event=Event{owner:0,window:0,kind:0,sequence:0};
+ #[test]fn grant_aware_window_delivery_cannot_consume_peer_messages(){
+  let mut b=Broker::<3,8>::new();
+  b.grant(7,10).unwrap();b.grant(7,11).unwrap();b.grant(8,20).unwrap();
+  let cap=b.grant_epoch_for(7,10).unwrap();
+  b.post_keyboard(7,10,30,true).unwrap();
+  b.post_keyboard(7,11,31,true).unwrap();
+  b.post_keyboard(8,20,32,true).unwrap();
+  let mut out=[EMPTY;1];
+  assert_eq!(b.drain_window_epoch(7,10,cap+1,&mut out),Err(Error::Unauthorized));
+  assert_eq!(b.drain_window_epoch(7,10,cap,&mut out),Ok(1));
+  assert_eq!(out[0].window,10);
+  assert_eq!(b.pending_owner(7),Ok(1));
+  assert_eq!(b.pending_owner(8),Ok(1));
+  assert_eq!(b.drain_window_epoch(7,11,cap,&mut out),Err(Error::Unauthorized));
+ }
+ #[test]fn short_destination_never_consumes_any_input(){
+  let mut b=Broker::<1,4>::new();b.grant(7,10).unwrap();
+  let cap=b.grant_epoch_for(7,10).unwrap();
+  b.post_keyboard(7,10,30,true).unwrap();b.post_keyboard(7,10,30,false).unwrap();
+  let mut out=[EMPTY;1];
+  assert_eq!(b.drain_window_epoch(7,10,cap,&mut out),Err(Error::Full));
+  assert_eq!(out,[EMPTY]);
+  assert_eq!(b.pending_owner(7),Ok(2));
+  let mut big=[EMPTY;2];
+  assert_eq!(b.drain_window_epoch(7,10,cap,&mut big),Ok(2));
+  assert_eq!(decode_key_event(big[0].kind),Some((30,true)));
+  assert_eq!(decode_key_event(big[1].kind),Some((30,false)));
+ }
+ #[test]fn revoked_and_reissued_window_does_not_accept_old_grant_epoch(){
+  let mut b=Broker::<1,4>::new();b.grant(7,10).unwrap();
+  let old=b.grant_epoch_for(7,10).unwrap();
+  b.post_keyboard(7,10,30,true).unwrap();
+  b.revoke_window(7,10).unwrap();
+  b.grant(7,10).unwrap();
+  let current=b.grant_epoch_for(7,10).unwrap();
+  assert_ne!(old,current);
+  let mut out=[EMPTY;1];
+  assert_eq!(b.drain_window_epoch(7,10,old,&mut out),Err(Error::Unauthorized));
+  assert_eq!(b.drain_window_epoch(7,10,current,&mut out),Ok(0));
+ }
+}
+
+
+#[cfg(test)]
+mod r105_exact_pointer_capture_epoch_tests{
+ use super::*;
+ #[test]fn pointer_capture_requires_current_authentication_and_focus(){
+  let mut b=Broker::<2,8>::new();b.grant(7,10).unwrap();b.grant(8,20).unwrap();
+  let mut input=DesktopInput::new();input.focus(&mut b,10).unwrap();
+  let epoch=b.grant_epoch_for(7,10).unwrap();
+  assert_eq!(input.capture_pointer_at_epoch(&b,8,10,epoch),Err(Error::Unauthorized));
+  assert_eq!(input.capture_pointer_at_epoch(&b,7,10,epoch+1),Err(Error::Unauthorized));
+  assert_eq!(input.capture_pointer_at_epoch(&b,8,20,
+             b.grant_epoch_for(8,20).unwrap()),Err(Error::Unauthorized));
+  assert_eq!(input.capture_pointer_at_epoch(&b,7,10,epoch),Ok(()));
+  assert_eq!(input.captured(),Some(FocusTarget{owner:7,window:10}));
+ }
+ #[test]fn stale_release_does_not_unlock_replacement_capture(){
+  let mut b=Broker::<1,8>::new();b.grant(7,10).unwrap();
+  let mut input=DesktopInput::new();input.focus(&mut b,10).unwrap();
+  let old=b.grant_epoch_for(7,10).unwrap();
+  input.capture_pointer_at_epoch(&b,7,10,old).unwrap();
+  input.window_closed(&mut b,7,10).unwrap();
+  b.grant(7,10).unwrap();input.focus(&mut b,10).unwrap();
+  let new_epoch=b.grant_epoch_for(7,10).unwrap();
+  input.capture_pointer_at_epoch(&b,7,10,new_epoch).unwrap();
+  assert_eq!(input.release_pointer_at_epoch(7,10,old),Err(Error::Unauthorized));
+  assert_eq!(input.captured(),Some(FocusTarget{owner:7,window:10}));
+  assert_eq!(input.release_pointer_at_epoch(7,10,new_epoch),Ok(()));
+  assert_eq!(input.captured(),None);
+ }
+ #[test]fn process_exit_clears_exact_capture_and_preserves_peer_grants(){
+  let mut b=Broker::<2,8>::new();b.grant(7,10).unwrap();b.grant(8,20).unwrap();
+  let mut input=DesktopInput::new();input.focus(&mut b,10).unwrap();
+  let epoch=b.grant_epoch_for(7,10).unwrap();
+  input.capture_pointer_at_epoch(&b,7,10,epoch).unwrap();
+  input.process_exited(&mut b,7);
+  assert_eq!(input.focused(),None);assert_eq!(input.captured(),None);
+  assert_eq!(input.click(&mut b,1),Err(Error::Empty));
+  assert!(b.owns(8,20));assert!(!b.owns(7,10));
+ }
+}
+
+
+#[cfg(test)]
+mod r109_atomic_compositor_crash_cleanup_tests{
+ use super::*;
+ use crate::agent_05_surface_rect::Rectangle;
+ fn rect()->Rectangle{Rectangle{x:0,y:0,width:40,height:30}}
+ #[test]fn crashed_owner_loses_capture_input_damage_and_surfaces_but_peer_survives(){
+  let mut broker=Broker::<2,8>::new();broker.grant(1,10).unwrap();
+  broker.grant(2,20).unwrap();
+  let epoch=broker.grant_epoch_for(1,10).unwrap();
+  let mut layout=SurfaceLayout::<2>::new();
+  layout.grant(1,10,rect()).unwrap();layout.grant(2,20,rect()).unwrap();
+  let mut damage=DamageQueue::<4>::new();
+  damage.submit_verified(&broker,&layout,1,&[(10,0,0,3,3)]).unwrap();
+  damage.submit_verified(&broker,&layout,2,&[(20,0,0,2,2)]).unwrap();
+  let mut input=DesktopInput::new();
+  input.focus(&mut broker,10).unwrap();
+  input.capture_pointer_at_epoch(&broker,1,10,epoch).unwrap();
+  input.click(&mut broker,1).unwrap();
+  assert_eq!(broker.pending_owner(1),Ok(2)); // focus + click
+  assert_eq!(retire_crashed_compositor_owner_exact(
+      &mut input,&mut broker,&mut layout,&mut damage,1,10,epoch),Ok(1));
+  assert_eq!(input.focused(),None);assert_eq!(input.captured(),None);
+  assert_eq!(broker.pending_owner(1),Err(Error::Unauthorized));
+  assert_eq!(layout.geometry(1,10),Err(Error::Unauthorized));
+  assert_eq!(damage.pending(),1);
+  assert_eq!(broker.pending_owner(2),Ok(0));
+  assert_eq!(layout.geometry(2,20),Ok(rect()));
+  assert_eq!(input.click(&mut broker,1),Err(Error::Empty));
+ }
+ #[test]fn delayed_crash_from_prior_grant_must_not_evict_replacement_window(){
+  let mut broker=Broker::<1,8>::new();broker.grant(1,10).unwrap();
+  let old=broker.grant_epoch_for(1,10).unwrap();
+  let mut layout=SurfaceLayout::<1>::new();layout.grant(1,10,rect()).unwrap();
+  let mut damage=DamageQueue::<2>::new();
+  let mut input=DesktopInput::new();
+  assert_eq!(retire_crashed_compositor_owner_exact(
+      &mut input,&mut broker,&mut layout,&mut damage,1,10,old),Ok(0));
+  broker.grant(1,10).unwrap();layout.grant(1,10,rect()).unwrap();
+  let current=broker.grant_epoch_for(1,10).unwrap();assert_ne!(current,old);
+  input.focus(&mut broker,10).unwrap();
+  input.capture_pointer_at_epoch(&broker,1,10,current).unwrap();
+  damage.submit_verified(&broker,&layout,1,&[(10,0,0,2,2)]).unwrap();
+  assert_eq!(retire_crashed_compositor_owner_exact(
+      &mut input,&mut broker,&mut layout,&mut damage,1,10,old),
+      Err(Error::Unauthorized));
+  assert_eq!(input.captured(),Some(FocusTarget{owner:1,window:10}));
+  assert_eq!(layout.geometry(1,10),Ok(rect()));
+  assert_eq!(damage.pending(),1);
+  assert!(broker.owns(1,10));
+ }
+}
+
+#[cfg(test)]
+mod r110_surface_lifecycle_and_input_recovery_tests{
+ use super::*;
+ use crate::agent_05_surface_rect::Rectangle;
+ fn rect()->Rectangle{Rectangle{x:0,y:0,width:32,height:24}}
+ #[test]fn compositor_grants_atomic_for_broker_and_framebuffer(){
+  let mut broker=Broker::<2,8>::new();
+  let mut layout=SurfaceLayout::<1>::new();
+  let g=grant_compositor_surface_exact(&mut broker,&mut layout,7,70,rect()).unwrap();
+  assert_eq!(broker.grant_epoch_for(7,70),Ok(g));
+  assert_eq!(layout.geometry(7,70),Ok(rect()));
+  let epoch_before=broker.grant_epoch;
+  assert_eq!(grant_compositor_surface_exact(&mut broker,&mut layout,8,80,rect()),
+             Err(Error::Full));
+  assert!(!broker.owns(8,80));
+  assert_eq!(broker.grant_epoch,epoch_before);
+  assert_eq!(layout.geometry(7,70),Ok(rect()));
+  assert_eq!(layout.geometry(8,80),Err(Error::Unauthorized));
+ }
+ #[test]fn duplicate_surface_and_invalid_geometry_do_not_consume_grant_epoch(){
+  let mut broker=Broker::<2,8>::new();
+  let mut layout=SurfaceLayout::<2>::new();
+  grant_compositor_surface_exact(&mut broker,&mut layout,7,70,rect()).unwrap();
+  let before=broker.grant_epoch;
+  assert_eq!(grant_compositor_surface_exact(&mut broker,&mut layout,9,70,rect()),
+             Err(Error::Duplicate));
+  assert_eq!(grant_compositor_surface_exact(&mut broker,&mut layout,9,90,
+             Rectangle{x:0,y:0,width:0,height:24}),Err(Error::Invalid));
+  assert_eq!(broker.grant_epoch,before);
+  assert!(!broker.owns(9,90));assert!(!broker.owns(9,70));
+  assert_eq!(layout.geometry(7,70),Ok(rect()));
+ }
+ #[test]fn window_recovery_keeps_peer_queued_input_and_monotonic_order(){
+  let mut broker=Broker::<2,8>::new();
+  broker.grant(7,70).unwrap();broker.grant(8,80).unwrap();
+  let old=broker.grant_epoch_for(7,70).unwrap();
+  let first=broker.post_focus(8,80).unwrap();
+  let doomed=broker.post_focus(7,70).unwrap();
+  let second=broker.post_pointer_focus(8,80).unwrap();
+  assert!(first.sequence<doomed.sequence&&doomed.sequence<second.sequence);
+  let new=broker.recover_window_exact(7,70,old).unwrap();
+  assert_ne!(old,new);assert_eq!(broker.pending_owner(7),Ok(0));
+  assert_eq!(broker.pending_owner(8),Ok(2));
+  assert_eq!(broker.recover_window_exact(7,70,old),Err(Error::Unauthorized));
+  let after=broker.post_focus(7,70).unwrap();
+  assert!(after.sequence>second.sequence);
+  let mut peer=[Event{owner:0,window:0,kind:0,sequence:0};2];
+  assert_eq!(broker.drain_owner(8,&mut peer),Ok(2));
+  assert_eq!(peer[0],first);assert_eq!(peer[1],second);
+ }
+ #[test]fn failed_window_recovery_preserves_all_queued_input_and_grants(){
+  let mut broker=Broker::<2,4>::new();broker.grant(7,70).unwrap();
+  broker.grant(8,80).unwrap();
+  let old=broker.grant_epoch_for(7,70).unwrap();
+  let event=broker.post_focus(8,80).unwrap();
+  assert_eq!(broker.recover_window_exact(7,70,old+1),Err(Error::Unauthorized));
+  assert_eq!(broker.grant_epoch_for(7,70),Ok(old));
+  assert_eq!(broker.peek(8),Ok(event));
+  assert_eq!(broker.pending_owner(8),Ok(1));
+ }
+}
+
+
+#[cfg(test)]
+mod r112_epoch_bound_surface_damage_tests{
+ use super::*;
+ use crate::agent_05_surface_rect::Rectangle;
+ fn rectangle()->Rectangle{Rectangle{x:0,y:0,width:32,height:24}}
+ fn empty()->FrameDamage{FrameDamage{owner:0,window:0,epoch:0,
+     x:0,y:0,width:0,height:0}}
+ #[test]fn only_current_window_and_surface_epochs_can_draw_after_regrant(){
+  let mut broker=Broker::<1,4>::new();broker.grant(7,70).unwrap();
+  let mut layout=SurfaceLayout::<1>::new();
+  layout.grant(7,70,rectangle()).unwrap();
+  let old_grant=broker.grant_epoch_for(7,70).unwrap();
+  let old_surface=layout.epoch(7,70).unwrap();
+  let mut frames=DamageQueue::<4>::new();
+  frames.submit_verified_at_grants(&broker,&layout,7,70,old_grant,
+     old_surface,&[(0,0,2,2)]).unwrap();
+  broker.revoke_window(7,70).unwrap();layout.revoke(7);
+  broker.grant(7,70).unwrap();layout.grant(7,70,rectangle()).unwrap();
+  let new_grant=broker.grant_epoch_for(7,70).unwrap();
+  let new_surface=layout.epoch(7,70).unwrap();
+  assert_ne!(new_grant,old_grant);assert_ne!(new_surface,old_surface);
+  assert_eq!(frames.submit_verified_at_grants(&broker,&layout,7,70,old_grant,
+      old_surface,&[(0,0,4,4)]),Err(Error::Unauthorized));
+  assert_eq!(frames.submit_verified_at_grants(&broker,&layout,7,70,new_grant,
+      old_surface,&[(0,0,4,4)]),Err(Error::Unauthorized));
+  frames.submit_verified_at_grants(&broker,&layout,7,70,new_grant,
+      new_surface,&[(1,2,3,4)]).unwrap();
+  let mut output=[empty();1];
+  let (owner,_,count)=frames.present_fair_verified(&broker,&layout,None,
+      &mut output).unwrap();
+  assert_eq!(owner,7);assert_eq!(count,1);
+  assert_eq!(output[0].x,1);assert_eq!(output[0].y,2);
+  assert_eq!(frames.pending(),0);
+ }
+ #[test]fn foreign_damage_and_out_of_bounds_batch_do_not_publish_partially(){
+  let mut broker=Broker::<2,4>::new();broker.grant(7,70).unwrap();
+  broker.grant(8,80).unwrap();
+  let mut layout=SurfaceLayout::<2>::new();
+  layout.grant(7,70,rectangle()).unwrap();
+  layout.grant(8,80,rectangle()).unwrap();
+  let g=broker.grant_epoch_for(7,70).unwrap();
+  let e=layout.epoch(7,70).unwrap();
+  let mut frames=DamageQueue::<3>::new();
+  assert_eq!(frames.submit_verified_at_grants(&broker,&layout,8,70,g,e,
+      &[(0,0,2,2)]),Err(Error::Unauthorized));
+  assert_eq!(frames.submit_verified_at_grants(&broker,&layout,7,70,g,e,
+      &[(0,0,2,2),(30,0,5,2)]),Err(Error::Invalid));
+  assert_eq!(frames.pending(),0);
+  let first=frames.submit_verified_at_grants(&broker,&layout,7,70,g,e,
+      &[(0,0,2,2),(2,2,2,2)]).unwrap();
+  assert!(first>0);assert_eq!(frames.pending(),2);
+  assert_eq!(frames.submit_verified_at_grants(&broker,&layout,7,70,g,e,
+      &[(2,0,2,2),(5,0,2,2)]),Err(Error::Full));
+  assert_eq!(frames.pending(),2);
  }
 }
