@@ -1076,8 +1076,12 @@ pub fn operation_on_selected_volume<D:BlockDevice>(
     token:u64,argument:u64,path:&str,buffer:&mut[u8],
     disk:&mut D,receipt:crate::m1_partition::PartitionReceipt
 )->Result<u64,FsError>{
-    let guard=table.selected_operation_guard(owner)?;
+    // Preserve ABI: stale/revoked handle tokens are InvalidName even while
+    // the physical volume is quarantined. A fresh open remains InvalidVolume.
+    // This early preflight does no device I/O and cannot resurrect handles.
+    table.namespace_receipt(owner)?;
     table.preflight_selected(action,owner,token,argument,path,buffer)?;
+    let guard=table.selected_operation_guard(owner)?;
     if !table.selected_operation_guard_is_current(guard){
         return Err(FsError::InvalidName);
     }
