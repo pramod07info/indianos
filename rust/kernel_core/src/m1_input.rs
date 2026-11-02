@@ -36,9 +36,12 @@ impl InputLine{
  pub fn clipboard_bytes(&self)->&[u8]{&self.clipboard[..self.clipboard_len]}
  /// Reset an executed draft without destroying the authenticated session's
  /// clipboard, which can be pasted into a subsequent command.
- pub fn reset(&mut self){
-  self.editor.clear();self.history_cursor=None;
+ fn cancel_history_navigation(&mut self){
+  self.history_cursor=None;
   self.history_draft.fill(0);self.history_draft_len=0;
+ }
+ pub fn reset(&mut self){
+  self.editor.clear();self.cancel_history_navigation();
  }
  /// On crash/restart/exit erase all process-private command/clipboard bytes.
  pub fn forget(&mut self){
@@ -56,23 +59,33 @@ impl InputLine{
  }
  pub fn clear_line(&mut self){self.reset();}
  pub fn kill_line(&mut self)->Event{
-  if self.is_empty(){return Event::Empty;}
-  self.reset();Event::Erased
+  let erased=!self.is_empty();
+  // Even an empty line can carry an outstanding history-navigation draft.
+  // Kill must cancel that private state before the process accepts input.
+  self.reset();
+  if erased{Event::Erased}else{Event::Empty}
  }
  pub fn restore_if_empty(&mut self,source:&[u8])->Result<(),Error>{
   if !self.is_empty(){return Err(Error::Invalid);}
   self.set_line(source)
  }
  /// Erase the word immediately before the CURRENT caret.
- pub fn erase_word(&mut self)->Event{self.editor.erase_previous_word()}
+ pub fn erase_word(&mut self)->Event{
+  let event=self.editor.erase_previous_word();
+  if event==Event::Erased{self.cancel_history_navigation();}
+  event
+ }
  pub fn set_line(&mut self,line:&[u8])->Result<(),Error>{
-  self.editor.replace_line(line)
+  self.editor.replace_line(line)?;
+  self.cancel_history_navigation();Ok(())
  }
  /// Kernel-only navigation API; submitting a line is permitted ONLY
  /// through feed() with a user-issued Enter, never a navigation event.
  pub fn action(&mut self,key:EditKey)->Result<Event,Error>{
   if key==EditKey::Submit{return Err(Error::Invalid);}
-  self.editor.edit(key,&mut[])
+  let event=self.editor.edit(key,&mut[])?;
+  if matches!(event,Event::Typed|Event::Erased){self.cancel_history_navigation();}
+  Ok(event)
  }
  pub fn word_left(&mut self)->usize{self.editor.previous_word()}
  pub fn word_right(&mut self)->usize{self.editor.next_word()}
@@ -80,21 +93,29 @@ impl InputLine{
   let at=self.editor.caret;
   if at==self.editor.len{return Event::Empty;}
   self.editor.line[at..self.editor.len].fill(0);
-  self.editor.len=at;Event::Erased
+  self.editor.len=at;self.cancel_history_navigation();Event::Erased
  }
  /// Atomic validated selection replacement, including overlap and capacity.
  pub fn replace_range(&mut self,start:usize,end:usize,next:&[u8])
   ->Result<Event,Error>{
-  self.editor.replace_range(start,end,next)
+  let event=self.editor.replace_range(start,end,next)?;
+  if matches!(event,Event::Typed|Event::Erased){self.cancel_history_navigation();}
+  Ok(event)
  }
  /// One atomic literal replacement across the current command draft.
  /// This cannot read files, send syscalls, or overwrite the clipboard.
  pub fn replace_all_literal(&mut self,needle:&[u8],replacement:&[u8])
   ->Result<usize,Error>{
-  self.editor.replace_all_literal(needle,replacement)
+  let changed=self.editor.replace_all_literal(needle,replacement)?;
+  if changed>0{self.cancel_history_navigation();}
+  Ok(changed)
  }
  /// A keyboard source may paste only bounded printable ASCII; all-or-nothing.
- pub fn paste(&mut self,text:&[u8])->Result<(),Error>{self.editor.paste(text)}
+ pub fn paste(&mut self,text:&[u8])->Result<(),Error>{
+  self.editor.paste(text)?;
+  if !text.is_empty(){self.cancel_history_navigation();}
+  Ok(())
+ }
  /// Store a selection only after range/capacity preflight. Previous clipboard
  /// survives invalid operations and short/malformed selection.
  pub fn copy_range(&mut self,start:usize,end:usize)->Result<usize,Error>{
@@ -109,11 +130,13 @@ impl InputLine{
   if end>self.length(){return Err(Error::Invalid);}
   let len=self.copy_range(start,end)?;
   self.editor.replace_range(start,end,b"")?;
+  self.cancel_history_navigation();
   Ok(len)
  }
  pub fn paste_clipboard(&mut self)->Result<Event,Error>{
   if self.clipboard_len==0{return Ok(Event::Empty);}
   self.editor.paste(&self.clipboard[..self.clipboard_len])?;
+  self.cancel_history_navigation();
   Ok(Event::Typed)
  }
  /// Store only a successfully submitted command, never a failed/partial
@@ -209,11 +232,12 @@ impl InputLine{
    },
    8|127=>{
     let event=self.editor.edit(EditKey::Backspace,&mut[])?;
-    self.history_cursor=None;Ok(event)
+    if event==Event::Erased{self.cancel_history_navigation();}
+    Ok(event)
    },
    b' '..=b'~'=>{
     let event=self.editor.edit(EditKey::Insert(key),&mut[])?;
-    self.history_cursor=None;Ok(event)
+    self.cancel_history_navigation();Ok(event)
    },
    _=>Err(Error::Invalid)
   }
@@ -2795,5 +2819,122 @@ mod m1_r089_security_teardown_tests{
   line.set_line(b"new session").unwrap();
   assert_eq!(line.history_search_previous(b"alpha"),Err(Error::Invalid));
   assert_eq!(line.bytes(),b"new session");
+ }
+}
+
+// R089: editing a recalled command must not unexpectedly restore a stale
+// unsent draft when users later navigate history forward.
+#[cfg(test)]
+mod r089_history_edit_tests {
+ use super::*;
+ fn recalled()->InputLine{
+  let mut line=InputLine::new();
+  let mut out=[0u8;MAX_LINE];
+  line.set_line(b"write /note old").unwrap();
+  line.feed(b'\n',&mut out).unwrap();
+  line.set_line(b"unsent secret").unwrap();
+  line.history_previous().unwrap();
+  line
+ }
+ fn expect_fresh(line:&mut InputLine,expected:&[u8]){
+  assert_eq!(line.bytes(),expected);
+  assert_eq!(line.history_next(),Err(Error::Invalid));
+  assert_eq!(line.bytes(),expected);
+  assert_eq!(line.history_draft_len,0);
+  assert!(line.history_draft.iter().all(|&b|b==0));
+ }
+ #[test]fn typing_on_recalled_command_discards_saved_draft(){
+  let mut line=recalled();
+  line.feed(b'!',&mut[]).unwrap();
+  expect_fresh(&mut line,b"write /note old!");
+ }
+ #[test]fn pasting_on_recalled_command_discards_saved_draft(){
+  let mut line=recalled();
+  line.paste(b"!").unwrap();
+  expect_fresh(&mut line,b"write /note old!");
+ }
+ #[test]fn editing_recalled_command_via_action_discards_saved_draft(){
+  let mut line=recalled();
+  line.action(EditKey::Insert(b'!')).unwrap();
+  expect_fresh(&mut line,b"write /note old!");
+ }
+ #[test]fn replacing_recalled_command_discards_saved_draft(){
+  let mut line=recalled();
+  line.replace_range(0,5,b"echo").unwrap();
+  expect_fresh(&mut line,b"echo /note old");
+ }
+ #[test]fn failed_editor_mutation_keeps_history_navigation(){
+  let mut line=recalled();
+  assert_eq!(line.paste(b"\n"),Err(Error::Invalid));
+  assert_eq!(line.history_next(),Ok(b"unsent secret".len()));
+  assert_eq!(line.bytes(),b"unsent secret");
+ }
+}
+
+
+#[cfg(test)]
+mod r090_input_acceptance {
+ use super::*;
+ /// R090 I01: edit home inserts at front
+ #[test]fn r090_i01_edit_home_inserts_at_front(){let mut line=InputLine::new();line.set_line(b"abc").unwrap();line.action(EditKey::Home).unwrap();line.action(EditKey::Insert(b'!')).unwrap();assert_eq!(line.bytes(),b"!abc");}
+ /// R090 I02: edit end inserts at tail
+ #[test]fn r090_i02_edit_end_inserts_at_tail(){let mut line=InputLine::new();line.set_line(b"abc").unwrap();line.action(EditKey::Home).unwrap();line.action(EditKey::End).unwrap();line.action(EditKey::Insert(b'!')).unwrap();assert_eq!(line.bytes(),b"abc!");}
+ /// R090 I03: backspace at start is noop
+ #[test]fn r090_i03_backspace_at_start_is_noop(){let mut line=InputLine::new();line.set_line(b"abc").unwrap();line.action(EditKey::Home).unwrap();assert_eq!(line.action(EditKey::Backspace),Ok(Event::Empty));assert_eq!(line.bytes(),b"abc");}
+ /// R090 I04: delete at end is noop
+ #[test]fn r090_i04_delete_at_end_is_noop(){let mut line=InputLine::new();line.set_line(b"abc").unwrap();assert_eq!(line.action(EditKey::Delete),Ok(Event::Empty));assert_eq!(line.bytes(),b"abc");}
+ /// R090 I05: insert newline rejected without mutation
+ #[test]fn r090_i05_insert_newline_rejected_without_mutation(){let mut line=InputLine::new();line.set_line(b"abc").unwrap();assert_eq!(line.action(EditKey::Insert(b'\n')),Err(Error::Invalid));assert_eq!(line.bytes(),b"abc");}
+ /// R090 I06: set line invalid bytes preserve old draft
+ #[test]fn r090_i06_set_line_invalid_bytes_preserve_old_draft(){let mut line=InputLine::new();line.set_line(b"old").unwrap();assert_eq!(line.set_line(b"bad\nline"),Err(Error::Invalid));assert_eq!(line.bytes(),b"old");}
+ /// R090 I07: full length line refuses insert
+ #[test]fn r090_i07_full_length_line_refuses_insert(){let mut line=InputLine::new();line.set_line(&[b'x';MAX_LINE]).unwrap();assert_eq!(line.action(EditKey::Insert(b'y')),Err(Error::Full));assert_eq!(line.length(),MAX_LINE);assert!(line.bytes().iter().all(|&b|b==b'x'));}
+ /// R090 I08: paste control byte rejected atomically
+ #[test]fn r090_i08_paste_control_byte_rejected_atomically(){let mut line=InputLine::new();line.set_line(b"ready").unwrap();assert_eq!(line.paste(b"bad\rtext"),Err(Error::Invalid));assert_eq!(line.bytes(),b"ready");}
+ /// R090 I09: paste overflow rejected atomically
+ #[test]fn r090_i09_paste_overflow_rejected_atomically(){let mut line=InputLine::new();line.set_line(&[b'x';MAX_LINE-1]).unwrap();assert_eq!(line.paste(b"too"),Err(Error::Full));assert_eq!(line.length(),MAX_LINE-1);}
+ /// R090 I10: range replace preserves prefix and suffix
+ #[test]fn r090_i10_range_replace_preserves_prefix_and_suffix(){let mut line=InputLine::new();line.set_line(b"abcd").unwrap();assert_eq!(line.replace_range(1,3,b"XY"),Ok(Event::Typed));assert_eq!(line.bytes(),b"aXYd");}
+ /// R090 I11: inverted replace range preserves content
+ #[test]fn r090_i11_inverted_replace_range_preserves_content(){let mut line=InputLine::new();line.set_line(b"abcd").unwrap();assert_eq!(line.replace_range(3,1,b"X"),Err(Error::Invalid));assert_eq!(line.bytes(),b"abcd");}
+ /// R090 I12: literal replace all updates each match
+ #[test]fn r090_i12_literal_replace_all_updates_each_match(){let mut line=InputLine::new();line.set_line(b"a b a").unwrap();assert_eq!(line.replace_all_literal(b"a",b"z"),Ok(2));assert_eq!(line.bytes(),b"z b z");}
+ /// R090 I13: literal replace overflow preserves content
+ #[test]fn r090_i13_literal_replace_overflow_preserves_content(){let mut line=InputLine::new();line.set_line(&[b'x';MAX_LINE]).unwrap();assert_eq!(line.replace_all_literal(b"x",b"xx"),Err(Error::Full));assert_eq!(line.bytes(),&[b'x';MAX_LINE]);}
+ /// R090 I14: selection copy preserves editable line
+ #[test]fn r090_i14_selection_copy_preserves_editable_line(){let mut line=InputLine::new();line.set_line(b"abcdef").unwrap();assert_eq!(line.copy_range(1,3),Ok(2));assert_eq!(line.clipboard_bytes(),b"bc");assert_eq!(line.bytes(),b"abcdef");}
+ /// R090 I15: selection cut removes only requested range
+ #[test]fn r090_i15_selection_cut_removes_only_requested_range(){let mut line=InputLine::new();line.set_line(b"abcdef").unwrap();assert_eq!(line.cut_range(1,3),Ok(2));assert_eq!(line.bytes(),b"adef");assert_eq!(line.clipboard_bytes(),b"bc");}
+ /// R090 I16: clipboard paste reinserts selection
+ #[test]fn r090_i16_clipboard_paste_reinserts_selection(){let mut line=InputLine::new();line.set_line(b"abcd").unwrap();line.copy_range(1,3).unwrap();line.paste_clipboard().unwrap();assert_eq!(line.bytes(),b"abcdbc");}
+ /// R090 I17: kill line preserves private clipboard
+ #[test]fn r090_i17_kill_line_preserves_private_clipboard(){let mut line=InputLine::new();line.set_line(b"secret").unwrap();line.copy_range(0,6).unwrap();assert_eq!(line.kill_line(),Event::Erased);assert_eq!(line.bytes(),b"");assert_eq!(line.clipboard_bytes(),b"secret");}
+ /// R090 I18: process forget scrubs history and clipboard
+ #[test]fn r090_i18_process_forget_scrubs_history_and_clipboard(){let mut line=InputLine::new();let mut out=[0;MAX_LINE];line.set_line(b"secret").unwrap();line.copy_range(0,6).unwrap();line.feed(b'\n',&mut out).unwrap();assert_eq!(line.history_count(),1);line.forget();assert_eq!(line.history_count(),0);assert_eq!(line.clipboard_bytes(),b"");assert_eq!(line.history_previous(),Err(Error::Invalid));}
+ /// R090 I19: history next restores unsent draft without edit
+ #[test]fn r090_i19_history_next_restores_unsent_draft_without_edit(){let mut line=InputLine::new();let mut out=[0;MAX_LINE];line.set_line(b"first").unwrap();line.feed(b'\n',&mut out).unwrap();line.set_line(b"unsent").unwrap();assert_eq!(line.history_previous(),Ok(5));assert_eq!(line.history_next(),Ok(6));assert_eq!(line.bytes(),b"unsent");}
+ /// R090 I20: deleting recalled command cancels history draft
+ #[test]fn r090_i20_deleting_recalled_command_cancels_history_draft(){let mut line=InputLine::new();let mut out=[0;MAX_LINE];line.set_line(b"abc def").unwrap();line.feed(b'\n',&mut out).unwrap();line.set_line(b"draft").unwrap();line.history_previous().unwrap();assert_eq!(line.erase_word(),Event::Erased);assert_eq!(line.bytes(),b"abc ");assert_eq!(line.history_next(),Err(Error::Invalid));assert_eq!(line.history_draft_len,0);}
+}
+
+#[cfg(test)]
+mod r091_empty_history_reset {
+ use super::*;
+ #[test]fn kill_empty_draft_after_history_submit_is_fresh(){
+  let mut input=InputLine::new();
+  let mut submitted=[0u8;MAX_LINE];
+  input.set_line(b"secret").unwrap();
+  input.feed(b'\n',&mut submitted).unwrap();
+  assert_eq!(input.kill_line(),Event::Empty);
+  assert_eq!(input.bytes(),b"");
+  assert_eq!(input.history_next(),Err(Error::Invalid));
+ }
+ #[test]fn empty_kill_preserves_user_clipboard(){
+  let mut input=InputLine::new();
+  input.set_line(b"clipboard").unwrap();
+  input.copy_range(0,9).unwrap();
+  input.clear_line();
+  assert_eq!(input.kill_line(),Event::Empty);
+  assert_eq!(input.clipboard_bytes(),b"clipboard");
  }
 }

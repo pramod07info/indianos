@@ -1447,3 +1447,301 @@ mod m1_r046_vfs_redundancy_integration_tests{
   assert_eq!(disk.writes,before);
  }
 }
+
+
+ 
+/// R093: hierarchical path validation for transactional COW file operations.
+/// Every entry point checks parents and contradictory file/dir aliases before
+/// calling the underlying durable filesystem. No raw on-disk names escape.
+impl<D:BlockDevice> HierVfs<D>{
+ fn r093_checked_file(&mut self,path:&str)->Result<Path,FsError>{
+  let p=checked(path,Kind::File)?;
+  self.parents(&p)?;
+  if self.contradictory_alias(&p){return Err(FsError::InvalidVolume);}
+  Ok(p)
+ }
+ /// Hierarchical full-file append; limits one request to 256 input bytes.
+ pub fn append_file(&mut self,path:&str,bytes:&[u8])->Result<usize,FsError>{
+  if bytes.len()>MAX_TRANSFER{return Err(FsError::TooLarge);}
+  let p=self.r093_checked_file(path)?;
+  self.fs.append_path(p.name(),bytes)
+ }
+ /// Fill one byte-range without changing the stored file length.
+ pub fn fill_file_range(&mut self,path:&str,offset:usize,
+  count:usize,value:u8)->Result<usize,FsError>{
+  if count>MAX_TRANSFER{return Err(FsError::TooLarge);}
+  let p=self.r093_checked_file(path)?;
+  self.fs.fill_range_path(p.name(),offset,count,value)
+ }
+ /// Insert bytes and atomically move the tail.
+ pub fn insert_file_range(&mut self,path:&str,offset:usize,
+  value:&[u8])->Result<usize,FsError>{
+  if value.len()>MAX_TRANSFER{return Err(FsError::TooLarge);}
+  let p=self.r093_checked_file(path)?;
+  self.fs.insert_range_path(p.name(),offset,value)
+ }
+ /// Delete file bytes, compacting contents in one generation.
+ pub fn remove_file_range(&mut self,path:&str,offset:usize,
+  count:usize)->Result<usize,FsError>{
+  if count>MAX_TRANSFER{return Err(FsError::TooLarge);}
+  let p=self.r093_checked_file(path)?;
+  self.fs.remove_range_path(p.name(),offset,count)
+ }
+ /// Atomically replace a byte interval, with optional length change.
+ pub fn splice_file(&mut self,path:&str,offset:usize,delete:usize,
+  inserted:&[u8])->Result<usize,FsError>{
+  if inserted.len()>MAX_TRANSFER||delete>MAX_TRANSFER{
+   return Err(FsError::TooLarge);
+  }
+  let p=self.r093_checked_file(path)?;
+  self.fs.splice_path(p.name(),offset,delete,inserted)
+ }
+ /// Swap two *existing* files' names via one metadata commit.
+ pub fn swap_file_names(&mut self,left:&str,right:&str)->Result<(),FsError>{
+  let a=self.r093_checked_file(left)?;
+  let b=self.r093_checked_file(right)?;
+  self.fs.swap_paths(a.name(),b.name())
+ }
+ /// Move source into the name of an already existing target, atomically.
+ pub fn rename_file_overwrite(&mut self,source:&str,target:&str)
+  ->Result<(),FsError>{
+  let a=self.r093_checked_file(source)?;
+  let b=self.r093_checked_file(target)?;
+  self.fs.rename_overwrite_path(a.name(),b.name())
+ }
+ /// Compare-and-replace contents of a verified file; mismatch writes nothing.
+ pub fn compare_exchange_file(&mut self,path:&str,
+  expected:&[u8],next:&[u8])->Result<bool,FsError>{
+  if expected.len()>MAX_FILE_BYTES||next.len()>MAX_FILE_BYTES{
+   return Err(FsError::TooLarge);
+  }
+  let p=self.r093_checked_file(path)?;
+  self.fs.compare_exchange_path(p.name(),expected,next)
+ }
+ /// Conditional unlink with verified entire old contents.
+ pub fn unlink_if_equal(&mut self,path:&str,expected:&[u8])->Result<bool,FsError>{
+  if expected.len()>MAX_FILE_BYTES{return Err(FsError::TooLarge);}
+  let p=self.r093_checked_file(path)?;
+  self.fs.delete_if_equal_path(p.name(),expected)
+ }
+ /// Content-guarded rename. Parent existence and filename aliases are checked.
+ pub fn rename_file_if_equal(&mut self,source:&str,target:&str,
+  expected:&[u8])->Result<bool,FsError>{
+  if expected.len()>MAX_FILE_BYTES{return Err(FsError::TooLarge);}
+  let a=self.r093_checked_file(source)?;
+  let b=self.r093_checked_file(target)?;
+  self.fs.rename_if_equal_path(a.name(),b.name(),expected)
+ }
+ /// Bounded data copy from a verified source into an existing destination.
+ pub fn copy_file_range(&mut self,source:&str,from:usize,count:usize,
+  target:&str,to:usize)->Result<usize,FsError>{
+  if count>MAX_TRANSFER{return Err(FsError::TooLarge);}
+  let a=self.r093_checked_file(source)?;
+  let b=self.r093_checked_file(target)?;
+  self.fs.copy_range_into_path(a.name(),from,count,b.name(),to)
+ }
+ /// Full-file bounded literal replacement after both path and payload checks.
+ pub fn replace_all_file(&mut self,path:&str,needle:&[u8],
+  replacement:&[u8])->Result<usize,FsError>{
+  if needle.len()>MAX_TRANSFER||replacement.len()>MAX_TRANSFER{
+   return Err(FsError::TooLarge);
+  }
+  let p=self.r093_checked_file(path)?;
+  self.fs.replace_all_path(p.name(),needle,replacement)
+ }
+ /// Kernel-indexed CRC32, not a proof from unverified metadata alone.
+ pub fn crc32_file(&mut self,path:&str)->Result<u32,FsError>{
+  let p=self.r093_checked_file(path)?;
+  self.fs.verified_crc_path(p.name())
+ }
+ /// Full-file equality used for optimistic synchronization.
+ pub fn file_equals_bytes(&mut self,path:&str,
+  expected:&[u8])->Result<bool,FsError>{
+  if expected.len()>MAX_FILE_BYTES{return Err(FsError::TooLarge);}
+  let p=self.r093_checked_file(path)?;
+  self.fs.equals_path(p.name(),expected)
+ }
+}
+
+#[cfg(test)]
+mod r093_hier_cow_tests {
+ use super::*;
+ use crate::block::{BlockDevice,BlockError,SECTOR_BYTES};
+ struct Disk([[u8;SECTOR_BYTES];100]);
+ impl BlockDevice for Disk {
+  fn sector_count(&self)->u64{100}
+  fn read_sector(&mut self,l:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   *out=*self.0.get(l as usize).ok_or(BlockError::OutOfRange)?;Ok(())
+  }
+  fn write_sector(&mut self,l:u64,data:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   *self.0.get_mut(l as usize).ok_or(BlockError::OutOfRange)?=*data;Ok(())
+  }
+ }
+ fn volume()->HierVfs<Disk>{
+  let mut fs=HierVfs::format_blank(Disk([[0;SECTOR_BYTES];100])).unwrap();
+  fs.mkdir("/dir").unwrap();
+  fs.create("/dir/a",b"abc").unwrap();
+  fs.create("/dir/b",b"XY").unwrap();
+  fs
+ }
+ fn get(fs:&mut HierVfs<Disk>,path:&str)->Vec<u8>{
+  let mut b=[0;MAX_FILE_BYTES];let n=fs.read(path,&mut b).unwrap();b[..n].to_vec()
+ }
+ #[test]fn r093_append_and_fill_roundtrip(){
+  let mut fs=volume();
+  assert_eq!(fs.append_file("/dir/a",b"def"),Ok(3));
+  assert_eq!(fs.fill_file_range("/dir/a",1,2,b'x'),Ok(2));
+  let mut fs=HierVfs::mount(fs.into_device()).unwrap();
+  assert_eq!(get(&mut fs,"/dir/a"),b"axxdef");
+ }
+ #[test]fn r093_insert_remove_and_splice(){
+  let mut fs=volume();
+  fs.insert_file_range("/dir/a",1,b"ZZ").unwrap();
+  assert_eq!(get(&mut fs,"/dir/a"),b"aZZbc");
+  fs.remove_file_range("/dir/a",2,1).unwrap();
+  assert_eq!(get(&mut fs,"/dir/a"),b"aZbc");
+  fs.splice_file("/dir/a",1,2,b"hi").unwrap();
+  assert_eq!(get(&mut fs,"/dir/a"),b"ahic");
+ }
+ #[test]fn r093_swap_uses_one_metadata_generation(){
+  let mut fs=volume();let g=fs.generation();
+  fs.swap_file_names("/dir/a","/dir/b").unwrap();
+  assert_eq!(fs.generation(),g+1);
+  assert_eq!(get(&mut fs,"/dir/a"),b"XY");
+  assert_eq!(get(&mut fs,"/dir/b"),b"abc");
+ }
+ #[test]fn r093_rename_overwrite_keeps_only_destination(){
+  let mut fs=volume();
+  fs.rename_file_overwrite("/dir/a","/dir/b").unwrap();
+  assert_eq!(get(&mut fs,"/dir/b"),b"abc");
+  assert_eq!(fs.read("/dir/a",&mut[0;10]),Err(FsError::NotFound));
+ }
+ #[test]fn r093_optimistic_file_update_and_unlink(){
+  let mut fs=volume();
+  let old=fs.generation();
+  assert_eq!(fs.compare_exchange_file("/dir/a",b"wrong",b"X"),Ok(false));
+  assert_eq!(fs.generation(),old);
+  assert_eq!(fs.compare_exchange_file("/dir/a",b"abc",b"new"),Ok(true));
+  assert_eq!(fs.unlink_if_equal("/dir/a",b"no"),Ok(false));
+  assert_eq!(fs.unlink_if_equal("/dir/a",b"new"),Ok(true));
+ }
+ #[test]fn r093_conditional_rename_and_range_copy(){
+  let mut fs=volume();
+  assert_eq!(fs.rename_file_if_equal("/dir/a","/dir/c",b"no"),Ok(false));
+  assert_eq!(fs.rename_file_if_equal("/dir/a","/dir/c",b"abc"),Ok(true));
+  assert_eq!(fs.copy_file_range("/dir/c",0,2,"/dir/b",1),Ok(2));
+  assert_eq!(get(&mut fs,"/dir/b"),b"Xab");
+ }
+ #[test]fn r093_replacement_and_checked_comparison(){
+  let mut fs=volume();
+  assert_eq!(fs.replace_all_file("/dir/a",b"a",b"ok"),Ok(1));
+  assert_eq!(get(&mut fs,"/dir/a"),b"okbc");
+  assert_eq!(fs.file_equals_bytes("/dir/a",b"okbc"),Ok(true));
+  assert!(fs.crc32_file("/dir/a").unwrap()!=0);
+ }
+ #[test]fn r093_missing_parent_and_false_file_directory_alias_denied(){
+  let mut fs=volume();let g=fs.generation();
+  assert_eq!(fs.append_file("/absent/a",b"x"),Err(FsError::NotFound));
+  assert!(fs.insert_file_range("/dir",0,b"x").is_err());
+  assert!(fs.rename_file_overwrite("/dir/a","/dir").is_err());
+  assert_eq!(fs.generation(),g);
+ }
+ #[test]fn r093_large_request_preflight_prevents_mutation(){
+  let mut fs=volume();let g=fs.generation();
+  assert_eq!(fs.append_file("/dir/a",&[5;MAX_TRANSFER+1]),Err(FsError::TooLarge));
+  assert_eq!(fs.copy_file_range("/dir/a",0,MAX_TRANSFER+1,"/dir/b",0),Err(FsError::TooLarge));
+  assert_eq!(fs.generation(),g);
+ }
+}
+
+
+ 
+/// R098: checksum-verified user-namespace operations. None of these accepts
+/// encoded on-disk COW keys, directory aliases or missing parent paths.
+impl<D:BlockDevice> HierVfs<D>{
+ /// R098-01: find_bytes_file
+ pub fn find_bytes_file(&mut self,path:&str,needle:&[u8])->Result<Option<usize>,FsError>{
+ if needle.is_empty()||needle.len()>MAX_TRANSFER{return Err(FsError::TooLarge);}
+ let p=self.r093_checked_file(path)?;self.fs.find_bytes_path(p.name(),needle)
+}
+ /// R098-02: rfind_bytes_file
+ pub fn rfind_bytes_file(&mut self,path:&str,needle:&[u8])->Result<Option<usize>,FsError>{
+ if needle.is_empty()||needle.len()>MAX_TRANSFER{return Err(FsError::TooLarge);}
+ let p=self.r093_checked_file(path)?;self.fs.rfind_bytes_path(p.name(),needle)
+}
+ /// R098-03: count_bytes_file
+ pub fn count_bytes_file(&mut self,path:&str,needle:&[u8])->Result<usize,FsError>{
+ if needle.is_empty()||needle.len()>MAX_TRANSFER{return Err(FsError::TooLarge);}
+ let p=self.r093_checked_file(path)?;self.fs.count_bytes_path(p.name(),needle)
+}
+ /// R098-04: has_prefix_file
+ pub fn has_prefix_file(&mut self,path:&str,prefix:&[u8])->Result<bool,FsError>{
+ if prefix.len()>MAX_TRANSFER{return Err(FsError::TooLarge);}
+ let p=self.r093_checked_file(path)?;self.fs.has_prefix_path(p.name(),prefix)
+}
+ /// R098-05: has_suffix_file
+ pub fn has_suffix_file(&mut self,path:&str,suffix:&[u8])->Result<bool,FsError>{
+ if suffix.len()>MAX_TRANSFER{return Err(FsError::TooLarge);}
+ let p=self.r093_checked_file(path)?;self.fs.has_suffix_path(p.name(),suffix)
+}
+ /// R098-06: read_head_file
+ pub fn read_head_file(&mut self,path:&str,out:&mut[u8])->Result<usize,FsError>{
+ if out.len()>MAX_TRANSFER{return Err(FsError::TooLarge);}
+ let p=self.r093_checked_file(path)?;self.fs.read_head_path(p.name(),out)
+}
+ /// R098-07: read_tail_file
+ pub fn read_tail_file(&mut self,path:&str,out:&mut[u8])->Result<usize,FsError>{
+ if out.len()>MAX_TRANSFER{return Err(FsError::TooLarge);}
+ let p=self.r093_checked_file(path)?;self.fs.read_tail_path(p.name(),out)
+}
+ /// R098-08: prepend_file
+ pub fn prepend_file(&mut self,path:&str,bytes:&[u8])->Result<usize,FsError>{
+ if bytes.is_empty()||bytes.len()>MAX_TRANSFER{return Err(FsError::TooLarge);}
+ let p=self.r093_checked_file(path)?;self.fs.prepend_path(p.name(),bytes)
+}
+ /// R098-09: reverse_file_range
+ pub fn reverse_file_range(&mut self,path:&str,start:usize,count:usize)->Result<usize,FsError>{
+ if count>MAX_TRANSFER{return Err(FsError::TooLarge);}
+ let p=self.r093_checked_file(path)?;self.fs.reverse_range_path(p.name(),start,count)
+}
+ /// R098-10: append_if_generation_file
+ pub fn append_if_generation_file(&mut self,path:&str,expected:u64,bytes:&[u8])->Result<usize,FsError>{
+ if bytes.is_empty()||bytes.len()>MAX_TRANSFER{return Err(FsError::TooLarge);}
+ let p=self.r093_checked_file(path)?;self.fs.append_if_generation_path(p.name(),expected,bytes)
+}
+}
+
+#[cfg(test)]
+mod r098_integrated_namespace_tests {
+ use super::*;
+ use crate::block::{BlockDevice,BlockError,SECTOR_BYTES};
+ struct Disk([[u8;SECTOR_BYTES];100]);
+ impl BlockDevice for Disk {
+  fn sector_count(&self)->u64{100}
+  fn read_sector(&mut self,l:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   *out=*self.0.get(l as usize).ok_or(BlockError::OutOfRange)?;Ok(())
+  }
+  fn write_sector(&mut self,l:u64,data:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   *self.0.get_mut(l as usize).ok_or(BlockError::OutOfRange)?=*data;Ok(())
+  }
+ }
+ fn volume()->HierVfs<Disk>{
+  let mut fs=HierVfs::format_blank(Disk([[0;SECTOR_BYTES];100])).unwrap();
+  fs.mkdir("/dir").unwrap();fs.create("/dir/a",b"abc").unwrap();fs
+ }
+ fn get(fs:&mut HierVfs<Disk>,path:&str)->Vec<u8>{
+  let mut buf=[0;MAX_FILE_BYTES];let n=fs.read(path,&mut buf).unwrap();buf[..n].to_vec()
+ }
+ #[test]fn r098_01_find_first(){let mut fs=volume();fs.overwrite("/dir/a",b"abc abc").unwrap();assert_eq!(fs.find_bytes_file("/dir/a",b"bc"),Ok(Some(1)));}
+ #[test]fn r098_02_find_last(){let mut fs=volume();fs.overwrite("/dir/a",b"abc abc").unwrap();assert_eq!(fs.rfind_bytes_file("/dir/a",b"bc"),Ok(Some(5)));}
+ #[test]fn r098_03_count_disjoint(){let mut fs=volume();fs.overwrite("/dir/a",b"aaaaa").unwrap();assert_eq!(fs.count_bytes_file("/dir/a",b"aa"),Ok(2));}
+ #[test]fn r098_04_prefix_guard(){let mut fs=volume();assert_eq!(fs.has_prefix_file("/dir/a",b"ab"),Ok(true));assert_eq!(fs.has_prefix_file("/dir/a",b"bc"),Ok(false));}
+ #[test]fn r098_05_suffix_guard(){let mut fs=volume();assert_eq!(fs.has_suffix_file("/dir/a",b"bc"),Ok(true));assert_eq!(fs.has_suffix_file("/dir/a",b"ab"),Ok(false));}
+ #[test]fn r098_06_read_head(){let mut fs=volume();let mut out=[0xaa;2];assert_eq!(fs.read_head_file("/dir/a",&mut out),Ok(2));assert_eq!(&out,b"ab");}
+ #[test]fn r098_07_read_tail(){let mut fs=volume();let mut out=[0xaa;2];assert_eq!(fs.read_tail_file("/dir/a",&mut out),Ok(2));assert_eq!(&out,b"bc");}
+ #[test]fn r098_08_prepend_reboot(){let mut fs=volume();assert_eq!(fs.prepend_file("/dir/a",b"Z"),Ok(1));let mut fs=HierVfs::mount(fs.into_device()).unwrap();assert_eq!(get(&mut fs,"/dir/a"),b"Zabc");}
+ #[test]fn r098_09_reverse_range(){let mut fs=volume();fs.overwrite("/dir/a",b"abcdef").unwrap();assert_eq!(fs.reverse_file_range("/dir/a",1,4),Ok(4));assert_eq!(get(&mut fs,"/dir/a"),b"aedcbf");}
+ #[test]fn r098_10_optimistic_append(){let mut fs=volume();let g=fs.generation();assert_eq!(fs.append_if_generation_file("/dir/a",g+1,b"x"),Err(FsError::InvalidVolume));assert_eq!(fs.append_if_generation_file("/dir/a",g,b"x"),Ok(1));assert_eq!(get(&mut fs,"/dir/a"),b"abcx");}
+ #[test]fn r098_11_disallow_missing_parents(){let mut fs=volume();let g=fs.generation();assert_eq!(fs.find_bytes_file("/missing/a",b"x"),Err(FsError::NotFound));assert!(fs.prepend_file("/dir",b"x").is_err());assert_eq!(fs.generation(),g);}
+ #[test]fn r098_12_input_limit_guard(){let mut fs=volume();let g=fs.generation();assert_eq!(fs.find_bytes_file("/dir/a",&[1;MAX_TRANSFER+1]),Err(FsError::TooLarge));assert_eq!(fs.prepend_file("/dir/a",&[1;MAX_TRANSFER+1]),Err(FsError::TooLarge));assert_eq!(fs.generation(),g);}
+}

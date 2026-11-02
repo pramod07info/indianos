@@ -119,7 +119,11 @@ where R:FnMut()->u16,F:FnOnce()->Result<(),BlockError>{
     for pair in staged.chunks_exact_mut(2){
         pair.copy_from_slice(&read_word().to_le_bytes());
     }
-    finish()?;
+    if let Err(error)=finish(){
+        // Do not retain a partial hardware sector on the stack after failure.
+        staged.fill(0);
+        return Err(error);
+    }
     out.copy_from_slice(&staged);
     Ok(())
 }
@@ -217,6 +221,9 @@ impl BlockDevice for AtaPio {
         let last_stage=&mut self.last_stage;
         read_words_staged(out,||unsafe{inw(DATA)},||{
             *last_stage=AtaStage::ReadDone;
+            // ATA requires a 400ns settle after the last PIO word before
+            // its completion status is trusted (as in the write path).
+            settle();
             complete()
         })?;
         self.last_stage=AtaStage::Idle;
@@ -276,6 +283,16 @@ mod tests {
         for (i,pair) in out.chunks_exact(2).enumerate(){
             assert_eq!(pair,if i%2==0{&[0x33,0x44]}else{&[0x55,0x66]});
         }
+    }
+    #[test]
+    fn r089_identify_rejects_non_ata_and_incomplete_identify_independently(){
+        let base=identify_512();
+        for flag in [0x8000u16,0x0004,0x8004]{
+            let mut reported=base;
+            reported[0]|=flag;
+            assert_eq!(capacity(&reported),None);
+        }
+        assert_eq!(capacity(&base),Some(1024));
     }
     #[test]
     fn identify_requires_lba_and_capacity(){
@@ -375,4 +392,70 @@ mod tests {
         }
     }
 
+}
+
+#[cfg(test)]
+mod r090_ata_acceptance {
+ use super::*;
+ fn base()->[u16;256]{
+  let mut id=[0u16;256];
+  id[49]=1<<9;
+  id[60]=1024;
+  id
+ }
+ /// R090 A01: absent controller status is failure
+ #[test]fn r090_a01_absent_controller_status_is_failure(){assert_eq!(poll_status(0,true),PollResult::Failed);assert_eq!(poll_status(0,false),PollResult::Failed);}
+ /// R090 A02: all ones controller status is failure
+ #[test]fn r090_a02_all_ones_controller_status_is_failure(){assert_eq!(poll_status(0xff,true),PollResult::Failed);assert_eq!(poll_status(0xff,false),PollResult::Failed);}
+ /// R090 A03: busy without error is pending
+ #[test]fn r090_a03_busy_without_error_is_pending(){assert_eq!(poll_status(BSY,true),PollResult::Pending);assert_eq!(poll_status(BSY,false),PollResult::Pending);}
+ /// R090 A04: busy with error waits for completion
+ #[test]fn r090_a04_busy_with_error_waits_for_completion(){assert_eq!(poll_status(BSY|ERR,true),PollResult::Pending);}
+ /// R090 A05: data ready requires drq
+ #[test]fn r090_a05_data_ready_requires_drq(){assert_eq!(poll_status(0x40|DRQ,true),PollResult::Ready);}
+ /// R090 A06: data ready rejects missing drq
+ #[test]fn r090_a06_data_ready_rejects_missing_drq(){assert_eq!(poll_status(0x40,true),PollResult::Pending);}
+ /// R090 A07: completion ready requires cleared drq
+ #[test]fn r090_a07_completion_ready_requires_cleared_drq(){assert_eq!(poll_status(0x40,false),PollResult::Ready);}
+ /// R090 A08: completion waits for drq to clear
+ #[test]fn r090_a08_completion_waits_for_drq_to_clear(){assert_eq!(poll_status(0x40|DRQ,false),PollResult::Pending);}
+ /// R090 A09: completed command error is rejected
+ #[test]fn r090_a09_completed_command_error_is_rejected(){assert_eq!(poll_status(0x40|ERR,false),PollResult::Failed);assert_eq!(poll_status(0x40|ERR,true),PollResult::Failed);}
+ /// R090 A10: completed command drive fault is rejected
+ #[test]fn r090_a10_completed_command_drive_fault_is_rejected(){assert_eq!(poll_status(0x40|DF,false),PollResult::Failed);assert_eq!(poll_status(0x40|DF,true),PollResult::Failed);}
+ /// R090 A11: identify rejects missing lba capability
+ #[test]fn r090_a11_identify_rejects_missing_lba_capability(){let mut id=base();id[49]=0;assert_eq!(capacity(&id),None);}
+ /// R090 A12: identify rejects zero sector capacity
+ #[test]fn r090_a12_identify_rejects_zero_sector_capacity(){let mut id=base();id[60]=0;id[61]=0;assert_eq!(capacity(&id),None);}
+ /// R090 A13: identify limits capacity to lba28
+ #[test]fn r090_a13_identify_limits_capacity_to_lba28(){let mut id=base();id[60]=0xffff;id[61]=0xffff;assert_eq!(capacity(&id),Some(MAX_LBA28));}
+ /// R090 A14: identify rejects non ata device
+ #[test]fn r090_a14_identify_rejects_non_ata_device(){let mut id=base();id[0]=0x8000;assert_eq!(capacity(&id),None);}
+ /// R090 A15: identify rejects incomplete response
+ #[test]fn r090_a15_identify_rejects_incomplete_response(){let mut id=base();id[0]=0x0004;assert_eq!(capacity(&id),None);}
+ /// R090 A16: identify rejects explicit no flush support
+ #[test]fn r090_a16_identify_rejects_explicit_no_flush_support(){let mut id=base();id[83]=0x4000;assert_eq!(capacity(&id),None);}
+ /// R090 A17: identify rejects large logical sector
+ #[test]fn r090_a17_identify_rejects_large_logical_sector(){let mut id=base();id[106]=0x5000;id[117]=2048;id[118]=0;assert_eq!(capacity(&id),None);}
+ /// R090 A18: identify rejects contradictory sector declaration
+ #[test]fn r090_a18_identify_rejects_contradictory_sector_declaration(){let mut id=base();id[106]=0x5000;id[117]=256;id[118]=0;assert_eq!(capacity(&id),None);}
+ /// R090 A19: identify accepts unreported optional sector size
+ #[test]fn r090_a19_identify_accepts_unreported_optional_sector_size(){let mut id=base();id[106]=0;id[117]=2048;id[118]=0;assert_eq!(capacity(&id),Some(1024));}
+ /// R090 A20: failed staged pio read never exposes partial words
+ #[test]fn r090_a20_failed_staged_pio_read_never_exposes_partial_words(){let mut out=[0xa5;SECTOR_BYTES];let mut count=0;assert_eq!(read_words_staged(&mut out,||{count+=1;0x1234},||Err(BlockError::Io)),Err(BlockError::Io));assert_eq!(count,256);assert_eq!(out,[0xa5;SECTOR_BYTES]);}
+}
+
+#[cfg(test)]
+mod r091_ata_staging {
+ use super::*;
+ #[test]fn failed_finish_keeps_caller_sector_untouched(){
+  let mut out=[0x55;SECTOR_BYTES];let mut words=0;
+  assert_eq!(read_words_staged(&mut out,||{words+=1;0xaa55},||Err(BlockError::Io)),Err(BlockError::Io));
+  assert_eq!(words,256);assert_eq!(out,[0x55;SECTOR_BYTES]);
+ }
+ #[test]fn successful_finish_publishes_exact_words(){
+  let mut out=[0;SECTOR_BYTES];
+  assert_eq!(read_words_staged(&mut out,||0x55aa,||Ok(())),Ok(()));
+  assert_eq!(&out[..4],&[0xaa,0x55,0xaa,0x55]);
+ }
 }

@@ -194,8 +194,12 @@ impl<D:BlockDevice> DurableFs<D>{
         // happen to be zero while another sector contains existing data.
         // The selected window must be EXPLICITLY empty in its entirety.
         for lba in 0..sectors{
+            // Recheck around every read: a removable device can change
+            // geometry partway through a long blankness scan.
+            if disk.sector_count()!=sectors{return Err(FsError::InvalidVolume);}
             let mut sector=[0u8;SECTOR_BYTES];
             disk.read_sector(lba,&mut sector)?;
+            if disk.sector_count()!=sectors{return Err(FsError::InvalidVolume);}
             if sector.iter().any(|&b|b!=0){return Err(FsError::InvalidVolume);}
         }
         if disk.sector_count()!=sectors{return Err(FsError::InvalidVolume);}
@@ -204,11 +208,14 @@ impl<D:BlockDevice> DurableFs<D>{
         disk.write_sector(0,&data)?;
         if disk.sector_count()!=sectors{return Err(FsError::InvalidVolume);}
         disk.write_sector(1,&data)?;
+        if disk.sector_count()!=sectors{return Err(FsError::InvalidVolume);}
         // Formatting is explicitly opt-in, but it must still fail closed if
         // the selected device acknowledges a dropped or torn superblock.
         for lba in 0..2{
+            if disk.sector_count()!=sectors{return Err(FsError::InvalidVolume);}
             let mut observed=[0u8;SECTOR_BYTES];
             disk.read_sector(lba,&mut observed)?;
+            if disk.sector_count()!=sectors{return Err(FsError::InvalidVolume);}
             if observed!=data{return Err(FsError::InvalidVolume);}
         }
         if disk.sector_count()!=sectors{return Err(FsError::InvalidVolume);}
@@ -224,6 +231,7 @@ impl<D:BlockDevice> DurableFs<D>{
         for (n,slot) in candidates.iter_mut().enumerate(){
             let mut bytes=[0u8;SECTOR_BYTES];
             disk.read_sector(n as u64,&mut bytes)?;
+            if disk.sector_count()!=sectors{return Err(FsError::InvalidVolume);}
             heads[n]=bytes;
             if let Some(meta)=decode(&bytes,sectors){
                 if verify_metadata(&mut disk,&meta)?{*slot=Some(meta);}
@@ -268,6 +276,7 @@ impl<D:BlockDevice> DurableFs<D>{
         for index in 0..2{
             let mut header=[0u8;SECTOR_BYTES];
             disk.read_sector(index as u64,&mut header)?;
+            if disk.sector_count()!=sectors{return Err(FsError::InvalidVolume);}
             if let Some(meta)=decode(&header,sectors){
                 if verify_metadata(disk,&meta)?{copies[index]=Some(meta);}
             }
@@ -610,6 +619,439 @@ impl<D:BlockDevice> DurableFs<D>{
         self.overwrite_path(path,&snapshot[..len.max(end)])?;
         Ok(bytes.len())
     }
+
+    /// Load one fully verified file into private fixed-size scratch. Never
+    /// publish partial device output or trust only the metadata checksum.
+    fn r092_snapshot(&mut self,path:&str)->Result<(usize,[u8;MAX_FILE_BYTES]),FsError>{
+        let mut data=[0u8;MAX_FILE_BYTES];
+        let len=self.read_path(path,&mut data)?;
+        Ok((len,data))
+    }
+    /// Verified file length; catches stale geometry/corrupt payload before
+    /// returning a value potentially used to allocate or edit file content.
+    pub fn verified_len_path(&mut self,path:&str)->Result<usize,FsError>{
+        let (len,_)=self.r092_snapshot(path)?;
+        Ok(len)
+    }
+    /// CRC32 of the verified entire file, including empty files.
+    pub fn verified_crc_path(&mut self,path:&str)->Result<u32,FsError>{
+        let (len,data)=self.r092_snapshot(path)?;
+        Ok(crc(&data[..len]))
+    }
+    /// Compare all bytes against a verified on-disk file without writing.
+    pub fn equals_path(&mut self,path:&str,expected:&[u8])->Result<bool,FsError>{
+        let (len,data)=self.r092_snapshot(path)?;
+        Ok(len==expected.len() && &data[..len]==expected)
+    }
+    /// Atomic append to an existing file. No extension on an I/O failure.
+    pub fn append_path(&mut self,path:&str,tail:&[u8])->Result<usize,FsError>{
+        let (len,mut data)=self.r092_snapshot(path)?;
+        let end=len.checked_add(tail.len()).ok_or(FsError::TooLarge)?;
+        if end>MAX_FILE_BYTES{return Err(FsError::TooLarge);}
+        if tail.is_empty(){return Ok(0);}
+        data[len..end].copy_from_slice(tail);
+        self.overwrite_path(path,&data[..end])?;
+        Ok(tail.len())
+    }
+    /// Atomic truncate or zero-fill extension; never creates a sparse hole.
+    pub fn resize_path(&mut self,path:&str,new_len:usize)->Result<(),FsError>{
+        if new_len>MAX_FILE_BYTES{return Err(FsError::TooLarge);}
+        let (len,mut data)=self.r092_snapshot(path)?;
+        if new_len==len{return Ok(());}
+        if new_len>len{data[len..new_len].fill(0);}
+        self.overwrite_path(path,&data[..new_len])
+    }
+    /// Replace a bounded run with one byte without changing file size.
+    pub fn fill_range_path(&mut self,path:&str,offset:usize,
+                           count:usize,value:u8)->Result<usize,FsError>{
+        let (len,mut data)=self.r092_snapshot(path)?;
+        let end=offset.checked_add(count).ok_or(FsError::TooLarge)?;
+        if end>len{return Err(FsError::TooLarge);}
+        if count==0{return Ok(0);}
+        data[offset..end].fill(value);
+        self.overwrite_path(path,&data[..len])?;
+        Ok(count)
+    }
+    /// Insert bytes at a file offset, shifting the tail. One COW publication.
+    pub fn insert_range_path(&mut self,path:&str,offset:usize,
+                             inserted:&[u8])->Result<usize,FsError>{
+        let (len,mut data)=self.r092_snapshot(path)?;
+        if offset>len{return Err(FsError::TooLarge);}
+        let new_len=len.checked_add(inserted.len()).ok_or(FsError::TooLarge)?;
+        if new_len>MAX_FILE_BYTES{return Err(FsError::TooLarge);}
+        if inserted.is_empty(){return Ok(0);}
+        data.copy_within(offset..len,offset+inserted.len());
+        data[offset..offset+inserted.len()].copy_from_slice(inserted);
+        self.overwrite_path(path,&data[..new_len])?;
+        Ok(inserted.len())
+    }
+    /// Remove a range and close the gap, atomically replacing a file image.
+    pub fn remove_range_path(&mut self,path:&str,offset:usize,
+                             count:usize)->Result<usize,FsError>{
+        let (len,mut data)=self.r092_snapshot(path)?;
+        let end=offset.checked_add(count).ok_or(FsError::TooLarge)?;
+        if end>len{return Err(FsError::TooLarge);}
+        if count==0{return Ok(0);}
+        data.copy_within(end..len,offset);
+        self.overwrite_path(path,&data[..len-count])?;
+        Ok(count)
+    }
+    /// Atomic variable-length splice (insert, replace, delete) at one offset.
+    pub fn splice_path(&mut self,path:&str,offset:usize,remove:usize,
+                       inserted:&[u8])->Result<usize,FsError>{
+        let (len,data)=self.r092_snapshot(path)?;
+        let end=offset.checked_add(remove).ok_or(FsError::TooLarge)?;
+        if end>len{return Err(FsError::TooLarge);}
+        let new_len=(len-remove).checked_add(inserted.len()).ok_or(FsError::TooLarge)?;
+        if new_len>MAX_FILE_BYTES{return Err(FsError::TooLarge);}
+        if remove==0 && inserted.is_empty(){return Ok(0);}
+        let mut next=[0u8;MAX_FILE_BYTES];
+        next[..offset].copy_from_slice(&data[..offset]);
+        next[offset..offset+inserted.len()].copy_from_slice(inserted);
+        next[offset+inserted.len()..new_len].copy_from_slice(&data[end..len]);
+        self.overwrite_path(path,&next[..new_len])?;
+        Ok(inserted.len())
+    }
+    /// Copy only checksum-verified source bytes into a new independent slot.
+    /// Destination existence is checked before any physical writes.
+    pub fn copy_path(&mut self,source:&str,target:&str)->Result<(),FsError>{
+        let (len,data)=self.r092_snapshot(source)?;
+        self.create_path(target,&data[..len])
+    }
+    /// Atomically exchange two directory names in ONE metadata generation.
+    /// The existing payload banks and CRCs do not need rewriting.
+    pub fn swap_paths(&mut self,left:&str,right:&str)->Result<(),FsError>{
+        let a=canonical_path(left)?;
+        let b=canonical_path(right)?;
+        if a==b{return Err(FsError::InvalidName);}
+        let ai=self.find(a).ok_or(FsError::NotFound)?;
+        let bi=self.find(b).ok_or(FsError::NotFound)?;
+        let mut next=self.meta;
+        next.entries[ai].name=b;
+        next.entries[bi].name=a;
+        self.publish(next)
+    }
+    /// Atomically replace an existing destination path by renaming source.
+    /// Both metadata edits publish together, without copying data extents.
+    pub fn rename_overwrite_path(&mut self,source:&str,target:&str)
+        ->Result<(),FsError>{
+        let a=canonical_path(source)?;
+        let b=canonical_path(target)?;
+        if a==b{return Err(FsError::InvalidName);}
+        let ai=self.find(a).ok_or(FsError::NotFound)?;
+        let bi=self.find(b).ok_or(FsError::NotFound)?;
+        let mut next=self.meta;
+        next.entries[bi]=Entry::EMPTY;
+        next.entries[ai].name=b;
+        self.publish(next)
+    }
+    /// Compare-exchange file contents. A mismatch is a read-only operation.
+    /// The mounted generation is checked before publishing any replacement.
+    pub fn compare_exchange_path(&mut self,path:&str,
+        expected:&[u8],next:&[u8])->Result<bool,FsError>{
+        if next.len()>MAX_FILE_BYTES{return Err(FsError::TooLarge);}
+        let (len,data)=self.r092_snapshot(path)?;
+        if len!=expected.len() || &data[..len]!=expected{return Ok(false);}
+        if expected==next{return Ok(true);}
+        self.overwrite_path(path,next)?;
+        Ok(true)
+    }
+    /// Conditional removal, checked against the full checksummed old file.
+    pub fn delete_if_equal_path(&mut self,path:&str,
+        expected:&[u8])->Result<bool,FsError>{
+        let (len,data)=self.r092_snapshot(path)?;
+        if len!=expected.len() || &data[..len]!=expected{return Ok(false);}
+        self.delete_path(path)?;
+        Ok(true)
+    }
+    /// Conditional namespace move without a data rewrite.
+    pub fn rename_if_equal_path(&mut self,source:&str,target:&str,
+        expected:&[u8])->Result<bool,FsError>{
+        let (len,data)=self.r092_snapshot(source)?;
+        if len!=expected.len() || &data[..len]!=expected{return Ok(false);}
+        self.rename_path(source,target)?;
+        Ok(true)
+    }
+    /// Verified source range into an existing destination. Source and target
+    /// may be the same file; a private snapshot gives memmove semantics.
+    pub fn copy_range_into_path(&mut self,source:&str,from:usize,
+        count:usize,target:&str,to:usize)->Result<usize,FsError>{
+        let (src_len,src)=self.r092_snapshot(source)?;
+        let src_end=from.checked_add(count).ok_or(FsError::TooLarge)?;
+        if src_end>src_len{return Err(FsError::TooLarge);}
+        let (dst_len,mut dst)=self.r092_snapshot(target)?;
+        let dst_end=to.checked_add(count).ok_or(FsError::TooLarge)?;
+        if to>dst_len||dst_end>MAX_FILE_BYTES{return Err(FsError::TooLarge);}
+        if count==0{return Ok(0);}
+        dst[to..dst_end].copy_from_slice(&src[from..src_end]);
+        self.overwrite_path(target,&dst[..dst_len.max(dst_end)])?;
+        Ok(count)
+    }
+    /// Replace all disjoint literal byte occurrences in an existing file.
+    /// Build and bound the complete image before a single COW commit.
+    pub fn replace_all_path(&mut self,path:&str,needle:&[u8],
+        replacement:&[u8])->Result<usize,FsError>{
+        if needle.is_empty(){return Err(FsError::InvalidName);}
+        let (len,old)=self.r092_snapshot(path)?;
+        let mut next=[0u8;MAX_FILE_BYTES];
+        let mut at=0usize;
+        let mut write=0usize;
+        let mut changed=0usize;
+        while at<len{
+            if needle.len()<=len-at && &old[at..at+needle.len()]==needle{
+                let end=write.checked_add(replacement.len()).ok_or(FsError::TooLarge)?;
+                if end>MAX_FILE_BYTES{return Err(FsError::TooLarge);}
+                next[write..end].copy_from_slice(replacement);
+                write=end;at+=needle.len();changed+=1;
+            }else{
+                if write==MAX_FILE_BYTES{return Err(FsError::TooLarge);}
+                next[write]=old[at];at+=1;write+=1;
+            }
+        }
+        if changed==0{return Ok(0);}
+        self.overwrite_path(path,&next[..write])?;
+        Ok(changed)
+    }
+
+
+    // R095: atomic verified file transformations.
+    /// R095-01: prepend_path.
+    pub fn prepend_path(&mut self,path:&str,head:&[u8])->Result<usize,FsError>{
+ self.insert_range_path(path,0,head)
+}
+
+    /// R095-02: drop_prefix_path.
+    pub fn drop_prefix_path(&mut self,path:&str,count:usize)->Result<usize,FsError>{
+ self.remove_range_path(path,0,count)
+}
+
+    /// R095-03: drop_suffix_path.
+    pub fn drop_suffix_path(&mut self,path:&str,count:usize)->Result<usize,FsError>{
+ let (len,_)=self.r092_snapshot(path)?;
+ if count>len{return Err(FsError::TooLarge);}
+ self.remove_range_path(path,len-count,count)
+}
+
+    /// R095-04: replace_prefix_path.
+    pub fn replace_prefix_path(&mut self,path:&str,expected:&[u8],replacement:&[u8])->Result<bool,FsError>{
+ let (len,bytes)=self.r092_snapshot(path)?;
+ if expected.len()>len||!bytes[..len].starts_with(expected){return Ok(false);}
+ if expected==replacement{return Ok(true);}
+ self.splice_path(path,0,expected.len(),replacement)?;
+ Ok(true)
+}
+
+    /// R095-05: replace_suffix_path.
+    pub fn replace_suffix_path(&mut self,path:&str,expected:&[u8],replacement:&[u8])->Result<bool,FsError>{
+ let (len,bytes)=self.r092_snapshot(path)?;
+ if expected.len()>len||!bytes[..len].ends_with(expected){return Ok(false);}
+ if expected==replacement{return Ok(true);}
+ self.splice_path(path,len-expected.len(),expected.len(),replacement)?;
+ Ok(true)
+}
+
+    /// R095-06: reverse_range_path.
+    pub fn reverse_range_path(&mut self,path:&str,start:usize,count:usize)->Result<usize,FsError>{
+ let (len,mut data)=self.r092_snapshot(path)?;
+ let end=start.checked_add(count).ok_or(FsError::TooLarge)?;
+ if end>len{return Err(FsError::TooLarge);}
+ if count<2{return Ok(0);}
+ data[start..end].reverse();self.overwrite_path(path,&data[..len])?;Ok(count)
+}
+
+    /// R095-07: rotate_left_path.
+    pub fn rotate_left_path(&mut self,path:&str,start:usize,count:usize,steps:usize)->Result<usize,FsError>{
+ let (len,mut data)=self.r092_snapshot(path)?;
+ let end=start.checked_add(count).ok_or(FsError::TooLarge)?;
+ if end>len{return Err(FsError::TooLarge);}
+ if count<2||steps%count==0{return Ok(0);}
+ data[start..end].rotate_left(steps%count);
+ self.overwrite_path(path,&data[..len])?;
+ Ok(count)
+}
+
+    /// R095-08: rotate_right_path.
+    pub fn rotate_right_path(&mut self,path:&str,start:usize,count:usize,steps:usize)->Result<usize,FsError>{
+ let (len,mut data)=self.r092_snapshot(path)?;
+ let end=start.checked_add(count).ok_or(FsError::TooLarge)?;
+ if end>len{return Err(FsError::TooLarge);}
+ if count<2||steps%count==0{return Ok(0);}
+ data[start..end].rotate_right(steps%count);
+ self.overwrite_path(path,&data[..len])?;
+ Ok(count)
+}
+
+    /// R095-09: swap_ranges_path.
+    pub fn swap_ranges_path(&mut self,path:&str,left:usize,right:usize,count:usize)->Result<usize,FsError>{
+ let (len,mut data)=self.r092_snapshot(path)?;
+ let a=left.checked_add(count).ok_or(FsError::TooLarge)?;
+ let b=right.checked_add(count).ok_or(FsError::TooLarge)?;
+ if a>len||b>len{return Err(FsError::TooLarge);}
+ if count==0||left==right{return Ok(0);}
+ if left<b && right<a{return Err(FsError::InvalidName);}
+ for i in 0..count{data.swap(left+i,right+i);}
+ self.overwrite_path(path,&data[..len])?;Ok(count)
+}
+
+    /// R095-10: move_range_path.
+    pub fn move_range_path(&mut self,path:&str,from:usize,count:usize,to:usize)->Result<usize,FsError>{
+ let (len,bytes)=self.r092_snapshot(path)?;
+ let end=from.checked_add(count).ok_or(FsError::TooLarge)?;
+ if end>len||to>len-count{return Err(FsError::TooLarge);}
+ if count==0||from==to{return Ok(0);}
+ let mut without=[0u8;MAX_FILE_BYTES];
+ without[..from].copy_from_slice(&bytes[..from]);
+ without[from..len-count].copy_from_slice(&bytes[end..len]);
+ let mut next=[0u8;MAX_FILE_BYTES];
+ next[..to].copy_from_slice(&without[..to]);
+ next[to..to+count].copy_from_slice(&bytes[from..end]);
+ next[to+count..len].copy_from_slice(&without[to..len-count]);
+ self.overwrite_path(path,&next[..len])?;Ok(count)
+}
+
+    /// R095-11: xor_range_path.
+    pub fn xor_range_path(&mut self,path:&str,start:usize,count:usize,mask:u8)->Result<usize,FsError>{
+ let (len,mut data)=self.r092_snapshot(path)?;
+ let end=start.checked_add(count).ok_or(FsError::TooLarge)?;
+ if end>len{return Err(FsError::TooLarge);}
+ if count==0||mask==0{return Ok(0);}
+ for b in &mut data[start..end]{*b^=mask;}
+ self.overwrite_path(path,&data[..len])?;Ok(count)
+}
+
+    /// R095-12: uppercase_ascii_range_path.
+    pub fn uppercase_ascii_range_path(&mut self,path:&str,start:usize,count:usize)->Result<usize,FsError>{
+ let (len,mut data)=self.r092_snapshot(path)?;
+ let end=start.checked_add(count).ok_or(FsError::TooLarge)?;
+ if end>len{return Err(FsError::TooLarge);}
+ let mut changed=0usize;
+ for b in &mut data[start..end]{let up=b.to_ascii_uppercase();if *b!=up{*b=up;changed+=1;}}
+ if changed>0{self.overwrite_path(path,&data[..len])?;}
+ Ok(changed)
+}
+
+    // R096: checksum-verified bounded inspection.
+    /// R096-01: find_bytes_path.
+    pub fn find_bytes_path(&mut self,path:&str,needle:&[u8])->Result<Option<usize>,FsError>{
+ if needle.is_empty(){return Err(FsError::InvalidName);}
+ let (len,data)=self.r092_snapshot(path)?;
+ Ok(data[..len].windows(needle.len()).position(|w|w==needle))
+}
+
+    /// R096-02: rfind_bytes_path.
+    pub fn rfind_bytes_path(&mut self,path:&str,needle:&[u8])->Result<Option<usize>,FsError>{
+ if needle.is_empty(){return Err(FsError::InvalidName);}
+ let (len,data)=self.r092_snapshot(path)?;
+ Ok(data[..len].windows(needle.len()).rposition(|w|w==needle))
+}
+
+    /// R096-03: count_bytes_path.
+    pub fn count_bytes_path(&mut self,path:&str,needle:&[u8])->Result<usize,FsError>{
+ if needle.is_empty(){return Err(FsError::InvalidName);}
+ let (len,data)=self.r092_snapshot(path)?;
+ let mut at=0usize;let mut hits=0usize;
+ while at+needle.len()<=len{
+  if &data[at..at+needle.len()]==needle{hits+=1;at+=needle.len();}
+  else{at+=1;}
+ }
+ Ok(hits)
+}
+
+    /// R096-04: has_prefix_path.
+    pub fn has_prefix_path(&mut self,path:&str,prefix:&[u8])->Result<bool,FsError>{
+ let (len,data)=self.r092_snapshot(path)?;Ok(data[..len].starts_with(prefix))
+}
+
+    /// R096-05: has_suffix_path.
+    pub fn has_suffix_path(&mut self,path:&str,suffix:&[u8])->Result<bool,FsError>{
+ let (len,data)=self.r092_snapshot(path)?;Ok(data[..len].ends_with(suffix))
+}
+
+    /// R096-06: read_byte_path.
+    pub fn read_byte_path(&mut self,path:&str,offset:usize)->Result<Option<u8>,FsError>{
+ if offset>=MAX_FILE_BYTES{return Err(FsError::TooLarge);}
+ let (len,data)=self.r092_snapshot(path)?;
+ Ok(data[..len].get(offset).copied())
+}
+
+    /// R096-07: read_head_path.
+    pub fn read_head_path(&mut self,path:&str,out:&mut[u8])->Result<usize,FsError>{
+ let (len,data)=self.r092_snapshot(path)?;
+ let count=len.min(out.len());out[..count].copy_from_slice(&data[..count]);Ok(count)
+}
+
+    /// R096-08: read_tail_path.
+    pub fn read_tail_path(&mut self,path:&str,out:&mut[u8])->Result<usize,FsError>{
+ let (len,data)=self.r092_snapshot(path)?;
+ let count=len.min(out.len());out[..count].copy_from_slice(&data[len-count..len]);Ok(count)
+}
+
+    /// R096-09: range_equals_path.
+    pub fn range_equals_path(&mut self,path:&str,offset:usize,expected:&[u8])->Result<bool,FsError>{
+ let (len,data)=self.r092_snapshot(path)?;
+ let end=offset.checked_add(expected.len()).ok_or(FsError::TooLarge)?;
+ if end>len{return Ok(false);}
+ Ok(&data[offset..end]==expected)
+}
+
+    /// R096-10: verified_empty_path.
+    pub fn verified_empty_path(&mut self,path:&str)->Result<bool,FsError>{
+ let (len,_)=self.r092_snapshot(path)?;Ok(len==0)
+}
+
+    // R097: optimistic version-checked COW transactions.
+    
+ /// Re-read both metadata heads before accepting an optimistic generation.
+ fn r097_expect_generation(&mut self,expected:u64)->Result<(),FsError>{
+  if expected!=self.generation(){return Err(FsError::InvalidVolume);}
+  self.check_heads()
+ }
+
+    /// R097-01: append_if_generation_path.
+    pub fn append_if_generation_path(&mut self,path:&str,expected:u64,bytes:&[u8])->Result<usize,FsError>{
+ self.r097_expect_generation(expected)?;self.append_path(path,bytes)
+}
+
+    /// R097-02: insert_if_generation_path.
+    pub fn insert_if_generation_path(&mut self,path:&str,expected:u64,offset:usize,bytes:&[u8])->Result<usize,FsError>{
+ self.r097_expect_generation(expected)?;self.insert_range_path(path,offset,bytes)
+}
+
+    /// R097-03: remove_if_generation_path.
+    pub fn remove_if_generation_path(&mut self,path:&str,expected:u64,offset:usize,count:usize)->Result<usize,FsError>{
+ self.r097_expect_generation(expected)?;self.remove_range_path(path,offset,count)
+}
+
+    /// R097-04: splice_if_generation_path.
+    pub fn splice_if_generation_path(&mut self,path:&str,expected:u64,offset:usize,remove:usize,inserted:&[u8])->Result<usize,FsError>{
+ self.r097_expect_generation(expected)?;self.splice_path(path,offset,remove,inserted)
+}
+
+    /// R097-05: fill_if_generation_path.
+    pub fn fill_if_generation_path(&mut self,path:&str,expected:u64,offset:usize,count:usize,value:u8)->Result<usize,FsError>{
+ self.r097_expect_generation(expected)?;self.fill_range_path(path,offset,count,value)
+}
+
+    /// R097-06: delete_if_generation_path.
+    pub fn delete_if_generation_path(&mut self,path:&str,expected:u64)->Result<(),FsError>{
+ self.r097_expect_generation(expected)?;self.delete_path(path)
+}
+
+    /// R097-07: swap_if_generation_path.
+    pub fn swap_if_generation_path(&mut self,left:&str,right:&str,expected:u64)->Result<(),FsError>{
+ self.r097_expect_generation(expected)?;self.swap_paths(left,right)
+}
+
+    /// R097-08: rename_if_generation_path.
+    pub fn rename_if_generation_path(&mut self,from:&str,to:&str,expected:u64)->Result<(),FsError>{
+ self.r097_expect_generation(expected)?;self.rename_path(from,to)
+}
+
+    /// R097-09: copy_if_generation_path.
+    pub fn copy_if_generation_path(&mut self,from:&str,to:&str,expected:u64)->Result<(),FsError>{
+ self.r097_expect_generation(expected)?;self.copy_path(from,to)
+}
+
     pub fn delete_path(&mut self,path:&str)->Result<(),FsError>{
         let name=canonical_path(path)?;
         let slot=self.find(name).ok_or(FsError::NotFound)?;
@@ -1014,6 +1456,35 @@ mod tests{
             assert_eq!(recovered.read_path("/rejected",&mut [0;MAX_FILE_BYTES]),
                 Err(FsError::NotFound));
         }
+    }
+    #[test]fn m1_r089_format_stops_after_geometry_changes_on_first_write(){
+        use std::cell::Cell;
+        use std::rc::Rc;
+        struct ResizeAfterWrite{
+            disk:Disk,
+            geometry:Rc<Cell<u64>>,
+            writes:Rc<Cell<usize>>,
+        }
+        impl BlockDevice for ResizeAfterWrite{
+            fn sector_count(&self)->u64{self.geometry.get()}
+            fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+                ->Result<(),BlockError>{self.disk.read_sector(lba,out)}
+            fn write_sector(&mut self,lba:u64,bytes:&[u8;SECTOR_BYTES])
+                ->Result<(),BlockError>{
+                self.disk.write_sector(lba,bytes)?;
+                self.writes.set(self.writes.get()+1);
+                self.geometry.set(MIN_SECTORS+1);
+                Ok(())
+            }
+        }
+        let geometry=Rc::new(Cell::new(MIN_SECTORS));
+        let writes=Rc::new(Cell::new(0));
+        let disk=ResizeAfterWrite{
+            disk:blank(),geometry:geometry.clone(),writes:writes.clone()
+        };
+        assert!(matches!(DurableFs::format_blank(disk),
+            Err(FsError::InvalidVolume)));
+        assert_eq!(writes.get(),1);
     }
     #[test]fn m1_recovery_geometry_must_stay_stable_through_mount_health_and_format(){
         fn switching(disk:Disk)->ChangingGeometryDisk{
@@ -1492,5 +1963,246 @@ mod tests{
                 "ignored stage {stage}");
         }
     }
+
+    /// R090 F01: format blank creates two identical superblocks
+    #[test]fn r090_f01_format_blank_creates_two_identical_superblocks(){
+        let fs=DurableFs::format_blank(blank()).unwrap();let disk=fs.into_device();assert_eq!(disk.sectors[0],disk.sectors[1]);assert_eq!(&disk.sectors[0][..8],MAGIC);
+    }
+    /// R090 F02: mount rejects unformatted blank medium
+    #[test]fn r090_f02_mount_rejects_unformatted_blank_medium(){
+        assert!(matches!(DurableFs::mount(blank()),Err(FsError::InvalidVolume)));
+    }
+    /// R090 F03: format rejects data in last sector
+    #[test]fn r090_f03_format_rejects_data_in_last_sector(){
+        let mut disk=blank();disk.sectors[MIN_SECTORS as usize-1][511]=1;assert!(matches!(DurableFs::format_blank(disk),Err(FsError::InvalidVolume)));
+    }
+    /// R090 F04: create and remount preserves content
+    #[test]fn r090_f04_create_and_remount_preserves_content(){
+        let mut fs=DurableFs::format_blank(blank()).unwrap();fs.create_path("/note",b"hello").unwrap();let mut fs=DurableFs::mount(fs.into_device()).unwrap();assert_eq!(get(&mut fs,"/note"),b"hello");
+    }
+    /// R090 F05: create empty file survives remount
+    #[test]fn r090_f05_create_empty_file_survives_remount(){
+        let mut fs=DurableFs::format_blank(blank()).unwrap();fs.create_path("/empty",b"").unwrap();let mut fs=DurableFs::mount(fs.into_device()).unwrap();assert_eq!(get(&mut fs,"/empty"),b"");
+    }
+    /// R090 F06: maximum payload survives remount
+    #[test]fn r090_f06_maximum_payload_survives_remount(){
+        let mut fs=DurableFs::format_blank(blank()).unwrap();fs.create_path("/max",&[0x5a;MAX_FILE_BYTES]).unwrap();let mut fs=DurableFs::mount(fs.into_device()).unwrap();assert_eq!(get(&mut fs,"/max"),[0x5a;MAX_FILE_BYTES]);
+    }
+    /// R090 F07: oversize payload is not published
+    #[test]fn r090_f07_oversize_payload_is_not_published(){
+        let mut fs=DurableFs::format_blank(blank()).unwrap();assert_eq!(fs.create_path("/too-large",&[1;MAX_FILE_BYTES+1]),Err(FsError::TooLarge));assert_eq!(fs.read_path("/too-large",&mut[0;MAX_FILE_BYTES]),Err(FsError::NotFound));
+    }
+    /// R090 F08: duplicate create preserves original file
+    #[test]fn r090_f08_duplicate_create_preserves_original_file(){
+        let mut fs=DurableFs::format_blank(blank()).unwrap();fs.create_path("/same",b"first").unwrap();assert_eq!(fs.create_path("/same",b"second"),Err(FsError::Exists));assert_eq!(get(&mut fs,"/same"),b"first");
+    }
+    /// R090 F09: overwrite existing file survives remount
+    #[test]fn r090_f09_overwrite_existing_file_survives_remount(){
+        let mut fs=DurableFs::format_blank(blank()).unwrap();fs.create_path("/same",b"first").unwrap();fs.overwrite_path("/same",b"second").unwrap();let mut fs=DurableFs::mount(fs.into_device()).unwrap();assert_eq!(get(&mut fs,"/same"),b"second");
+    }
+    /// R090 F10: overwrite missing file fails without creating
+    #[test]fn r090_f10_overwrite_missing_file_fails_without_creating(){
+        let mut fs=DurableFs::format_blank(blank()).unwrap();assert_eq!(fs.overwrite_path("/missing",b"new"),Err(FsError::NotFound));assert_eq!(fs.read_path("/missing",&mut[0;MAX_FILE_BYTES]),Err(FsError::NotFound));
+    }
+    /// R090 F11: read missing file is not found
+    #[test]fn r090_f11_read_missing_file_is_not_found(){
+        let mut fs=DurableFs::format_blank(blank()).unwrap();let mut out=[0xa5;32];assert_eq!(fs.read_path("/missing",&mut out),Err(FsError::NotFound));assert_eq!(out,[0xa5;32]);
+    }
+    /// R090 F12: short read buffer is not partially published
+    #[test]fn r090_f12_short_read_buffer_is_not_partially_published(){
+        let mut fs=DurableFs::format_blank(blank()).unwrap();fs.create_path("/note",b"abc").unwrap();let mut out=[0xa5;2];assert_eq!(fs.read_path("/note",&mut out),Err(FsError::TooLarge));assert_eq!(out,[0xa5;2]);
+    }
+    /// R090 F13: deletion survives fresh mount
+    #[test]fn r090_f13_deletion_survives_fresh_mount(){
+        let mut fs=DurableFs::format_blank(blank()).unwrap();fs.create_path("/note",b"abc").unwrap();fs.delete_path("/note").unwrap();let mut fs=DurableFs::mount(fs.into_device()).unwrap();assert_eq!(fs.read_path("/note",&mut[0;10]),Err(FsError::NotFound));
+    }
+    /// R090 F14: delete missing does not create metadata
+    #[test]fn r090_f14_delete_missing_does_not_create_metadata(){
+        let mut fs=DurableFs::format_blank(blank()).unwrap();let before=fs.generation();assert_eq!(fs.delete_path("/absent"),Err(FsError::NotFound));assert_eq!(fs.generation(),before);
+    }
+    /// R090 F15: rename file survives fresh mount
+    #[test]fn r090_f15_rename_file_survives_fresh_mount(){
+        let mut fs=DurableFs::format_blank(blank()).unwrap();fs.create_path("/from",b"kept").unwrap();fs.rename_path("/from","/to").unwrap();let mut fs=DurableFs::mount(fs.into_device()).unwrap();assert_eq!(get(&mut fs,"/to"),b"kept");assert_eq!(fs.read_path("/from",&mut[0;16]),Err(FsError::NotFound));
+    }
+    /// R090 F16: create ignores no invalid parent escape
+    #[test]fn r090_f16_create_ignores_no_invalid_parent_escape(){
+        let mut fs=DurableFs::format_blank(blank()).unwrap();assert_eq!(fs.create_path("/../unsafe",b"x"),Err(FsError::InvalidName));assert_eq!(fs.read_path("/unsafe",&mut[0;16]),Err(FsError::NotFound));
+    }
+    /// R090 F17: create two files preserves both after overwrite
+    #[test]fn r090_f17_create_two_files_preserves_both_after_overwrite(){
+        let mut fs=DurableFs::format_blank(blank()).unwrap();fs.create_path("/one",b"first").unwrap();fs.create_path("/two",b"second").unwrap();fs.overwrite_path("/one",b"updated").unwrap();let mut fs=DurableFs::mount(fs.into_device()).unwrap();assert_eq!(get(&mut fs,"/one"),b"updated");assert_eq!(get(&mut fs,"/two"),b"second");
+    }
+    /// R090 F18: two corrupt superblocks refuse mount
+    #[test]fn r090_f18_two_corrupt_superblocks_refuse_mount(){
+        let fs=DurableFs::format_blank(blank()).unwrap();let mut disk=fs.into_device();disk.sectors[0][24]^=1;disk.sectors[1][24]^=1;assert!(matches!(DurableFs::mount(disk),Err(FsError::InvalidVolume)));
+    }
+    /// R090 F19: corrupt new payload cannot publish file on mount
+    #[test]fn r090_f19_corrupt_new_payload_cannot_publish_file_on_mount(){
+        let mut fs=DurableFs::format_blank(blank()).unwrap();fs.create_path("/new",b"content").unwrap();let bank=fs.meta.entries[0].bank;let mut disk=fs.into_device();disk.sectors[block_start(0,bank) as usize][0]^=1;let mut fs=DurableFs::mount(disk).unwrap();assert_eq!(fs.read_path("/new",&mut[0;MAX_FILE_BYTES]),Err(FsError::NotFound));
+    }
+    /// R090 F20: failing first overwrite preserves prior checkpoint
+    #[test]fn r090_f20_failing_first_overwrite_preserves_prior_checkpoint(){
+        let mut fs=DurableFs::format_blank(blank()).unwrap();fs.create_path("/note",b"old").unwrap();let mut disk=fs.into_device();disk.fail_at=Some(disk.writes);let mut fs=DurableFs::mount(disk).unwrap();assert_eq!(fs.overwrite_path("/note",b"new"),Err(FsError::Io));let mut disk=fs.into_device();disk.fail_at=None;let mut fs=DurableFs::mount(disk).unwrap();assert_eq!(get(&mut fs,"/note"),b"old");
+    }
+
+    #[test]fn r091_recovery_format_valid_disk_still_mounts(){
+        let disk=DurableFs::format_blank(blank()).unwrap().into_device();
+        assert!(DurableFs::mount(disk).is_ok());
+    }
+    #[test]fn r091_recovery_mount_rejects_media_removed_between_headers(){
+        let original=DurableFs::format_blank(blank()).unwrap().into_device();
+        let capacity=std::rc::Rc::new(std::cell::Cell::new(MIN_SECTORS));
+        let change=ChangingGeometryDisk{
+            disk:PowerCutDisk{disk:original,writes_left:0},
+            sectors:capacity,
+            switch_on_read:Some((0,MIN_SECTORS+1)),
+        };
+        assert!(matches!(DurableFs::mount(change),Err(FsError::InvalidVolume)));
+    }
+    #[test]fn r091_recovery_health_rejects_media_removed_between_headers(){
+        let original=DurableFs::format_blank(blank()).unwrap().into_device();
+        let mut change=ChangingGeometryDisk{
+            disk:PowerCutDisk{disk:original,writes_left:0},
+            sectors:std::rc::Rc::new(std::cell::Cell::new(MIN_SECTORS)),
+            switch_on_read:Some((0,MIN_SECTORS+1)),
+        };
+        assert_eq!(DurableFs::inspect_health(&mut change),Err(FsError::InvalidVolume));
+    }
+
+    /// R092 filesystem operation regression 01
+    #[test] fn r092_fs_01_verified_metadata_read(){
+        let mut fs=DurableFs::format_blank(blank()).unwrap();fs.create_path("/x",b"abc").unwrap();assert_eq!(fs.verified_len_path("/x"),Ok(3));assert_eq!(fs.verified_crc_path("/x"),Ok(crc(b"abc")));assert_eq!(fs.equals_path("/x",b"abc"),Ok(true));assert_eq!(fs.equals_path("/x",b"ab"),Ok(false));
+    }
+    /// R092 filesystem operation regression 02
+    #[test] fn r092_fs_02_append_survives_remount(){
+        let mut fs=DurableFs::format_blank(blank()).unwrap();fs.create_path("/x",b"one").unwrap();assert_eq!(fs.append_path("/x",b"two"),Ok(3));let mut fs=DurableFs::mount(fs.into_device()).unwrap();assert_eq!(get(&mut fs,"/x"),b"onetwo");
+    }
+    /// R092 filesystem operation regression 03
+    #[test] fn r092_fs_03_append_at_maximum_rolls_back(){
+        let mut fs=DurableFs::format_blank(blank()).unwrap();fs.create_path("/x",&[7;MAX_FILE_BYTES]).unwrap();let generation=fs.generation();assert_eq!(fs.append_path("/x",b"x"),Err(FsError::TooLarge));assert_eq!(fs.generation(),generation);assert_eq!(get(&mut fs,"/x"),[7;MAX_FILE_BYTES]);
+    }
+    /// R092 filesystem operation regression 04
+    #[test] fn r092_fs_04_resize_truncate_and_zero_extend(){
+        let mut fs=DurableFs::format_blank(blank()).unwrap();fs.create_path("/x",b"abc").unwrap();fs.resize_path("/x",1).unwrap();assert_eq!(get(&mut fs,"/x"),b"a");fs.resize_path("/x",4).unwrap();let mut fs=DurableFs::mount(fs.into_device()).unwrap();assert_eq!(get(&mut fs,"/x"),b"a\0\0\0");
+    }
+    /// R092 filesystem operation regression 05
+    #[test] fn r092_fs_05_fill_bounded_range(){
+        let mut fs=DurableFs::format_blank(blank()).unwrap();fs.create_path("/x",b"abcde").unwrap();assert_eq!(fs.fill_range_path("/x",1,3,b'x'),Ok(3));assert_eq!(get(&mut fs,"/x"),b"axxxe");
+    }
+    /// R092 filesystem operation regression 06
+    #[test] fn r092_fs_06_fill_invalid_offset_has_no_writes(){
+        let mut fs=DurableFs::format_blank(blank()).unwrap();fs.create_path("/x",b"abc").unwrap();let old=fs.disk.writes;assert_eq!(fs.fill_range_path("/x",2,2,0),Err(FsError::TooLarge));assert_eq!(fs.disk.writes,old);
+    }
+    /// R092 filesystem operation regression 07
+    #[test] fn r092_fs_07_insert_middle_with_shift(){
+        let mut fs=DurableFs::format_blank(blank()).unwrap();fs.create_path("/x",b"abcd").unwrap();assert_eq!(fs.insert_range_path("/x",2,b"XY"),Ok(2));assert_eq!(get(&mut fs,"/x"),b"abXYcd");
+    }
+    /// R092 filesystem operation regression 08
+    #[test] fn r092_fs_08_insert_overflow_no_mutation(){
+        let mut fs=DurableFs::format_blank(blank()).unwrap();fs.create_path("/x",&[1;MAX_FILE_BYTES]).unwrap();let old=fs.generation();assert_eq!(fs.insert_range_path("/x",0,b"x"),Err(FsError::TooLarge));assert_eq!(fs.generation(),old);
+    }
+    /// R092 filesystem operation regression 09
+    #[test] fn r092_fs_09_remove_middle_compacts_file(){
+        let mut fs=DurableFs::format_blank(blank()).unwrap();fs.create_path("/x",b"abcdef").unwrap();assert_eq!(fs.remove_range_path("/x",1,3),Ok(3));assert_eq!(get(&mut fs,"/x"),b"aef");
+    }
+    /// R092 filesystem operation regression 10
+    #[test] fn r092_fs_10_remove_all_yields_empty(){
+        let mut fs=DurableFs::format_blank(blank()).unwrap();fs.create_path("/x",b"hi").unwrap();assert_eq!(fs.remove_range_path("/x",0,2),Ok(2));assert_eq!(get(&mut fs,"/x"),b"");
+    }
+    /// R092 filesystem operation regression 11
+    #[test] fn r092_fs_11_splice_growth_and_shrink(){
+        let mut fs=DurableFs::format_blank(blank()).unwrap();fs.create_path("/x",b"123456").unwrap();assert_eq!(fs.splice_path("/x",2,2,b"LONG"),Ok(4));assert_eq!(get(&mut fs,"/x"),b"12LONG56");fs.splice_path("/x",2,4,b"y").unwrap();assert_eq!(get(&mut fs,"/x"),b"12y56");
+    }
+    /// R092 filesystem operation regression 12
+    #[test] fn r092_fs_12_clone_independent_file(){
+        let mut fs=DurableFs::format_blank(blank()).unwrap();fs.create_path("/x",b"first").unwrap();fs.copy_path("/x","/y").unwrap();fs.overwrite_path("/x",b"changed").unwrap();let mut fs=DurableFs::mount(fs.into_device()).unwrap();assert_eq!(get(&mut fs,"/x"),b"changed");assert_eq!(get(&mut fs,"/y"),b"first");
+    }
+    /// R092 filesystem operation regression 13
+    #[test] fn r092_fs_13_swap_names_single_generation(){
+        let mut fs=DurableFs::format_blank(blank()).unwrap();fs.create_path("/a",b"AA").unwrap();fs.create_path("/b",b"BB").unwrap();let gen=fs.generation();fs.swap_paths("/a","/b").unwrap();assert_eq!(fs.generation(),gen+1);let mut fs=DurableFs::mount(fs.into_device()).unwrap();assert_eq!(get(&mut fs,"/a"),b"BB");assert_eq!(get(&mut fs,"/b"),b"AA");
+    }
+    /// R092 filesystem operation regression 14
+    #[test] fn r092_fs_14_replace_destination_atomic_rename(){
+        let mut fs=DurableFs::format_blank(blank()).unwrap();fs.create_path("/a",b"new").unwrap();fs.create_path("/b",b"old").unwrap();let gen=fs.generation();fs.rename_overwrite_path("/a","/b").unwrap();assert_eq!(fs.generation(),gen+1);let mut fs=DurableFs::mount(fs.into_device()).unwrap();assert_eq!(fs.read_path("/a",&mut[0;16]),Err(FsError::NotFound));assert_eq!(get(&mut fs,"/b"),b"new");
+    }
+    /// R092 filesystem operation regression 15
+    #[test] fn r092_fs_15_compare_exchange_mismatch_no_mutation(){
+        let mut fs=DurableFs::format_blank(blank()).unwrap();fs.create_path("/x",b"old").unwrap();let gen=fs.generation();let writes=fs.disk.writes;assert_eq!(fs.compare_exchange_path("/x",b"wrong",b"new"),Ok(false));assert_eq!(fs.generation(),gen);assert_eq!(fs.disk.writes,writes);
+    }
+    /// R092 filesystem operation regression 16
+    #[test] fn r092_fs_16_compare_exchange_commit_survives_reboot(){
+        let mut fs=DurableFs::format_blank(blank()).unwrap();fs.create_path("/x",b"old").unwrap();assert_eq!(fs.compare_exchange_path("/x",b"old",b"new"),Ok(true));let mut fs=DurableFs::mount(fs.into_device()).unwrap();assert_eq!(get(&mut fs,"/x"),b"new");
+    }
+    /// R092 filesystem operation regression 17
+    #[test] fn r092_fs_17_delete_if_equal_guards_data(){
+        let mut fs=DurableFs::format_blank(blank()).unwrap();fs.create_path("/x",b"saved").unwrap();assert_eq!(fs.delete_if_equal_path("/x",b"wrong"),Ok(false));assert_eq!(fs.delete_if_equal_path("/x",b"saved"),Ok(true));assert_eq!(fs.read_path("/x",&mut[0;16]),Err(FsError::NotFound));
+    }
+    /// R092 filesystem operation regression 18
+    #[test] fn r092_fs_18_rename_if_equal_guarded(){
+        let mut fs=DurableFs::format_blank(blank()).unwrap();fs.create_path("/x",b"saved").unwrap();assert_eq!(fs.rename_if_equal_path("/x","/y",b"wrong"),Ok(false));assert_eq!(fs.rename_if_equal_path("/x","/y",b"saved"),Ok(true));assert_eq!(get(&mut fs,"/y"),b"saved");
+    }
+    /// R092 filesystem operation regression 19
+    #[test] fn r092_fs_19_copy_between_file_ranges(){
+        let mut fs=DurableFs::format_blank(blank()).unwrap();fs.create_path("/a",b"abcdef").unwrap();fs.create_path("/b",b"XY").unwrap();assert_eq!(fs.copy_range_into_path("/a",2,3,"/b",1),Ok(3));assert_eq!(get(&mut fs,"/b"),b"Xcde");
+    }
+    /// R092 filesystem operation regression 20
+    #[test] fn r092_fs_20_copy_overlap_uses_snapshot(){
+        let mut fs=DurableFs::format_blank(blank()).unwrap();fs.create_path("/a",b"abcdef").unwrap();assert_eq!(fs.copy_range_into_path("/a",0,3,"/a",2),Ok(3));assert_eq!(get(&mut fs,"/a"),b"ababcf");
+    }
+    /// R092 filesystem operation regression 21
+    #[test] fn r092_fs_21_replace_all_expanding(){
+        let mut fs=DurableFs::format_blank(blank()).unwrap();fs.create_path("/a",b"cat dog cat").unwrap();assert_eq!(fs.replace_all_path("/a",b"cat",b"tiger"),Ok(2));let mut fs=DurableFs::mount(fs.into_device()).unwrap();assert_eq!(get(&mut fs,"/a"),b"tiger dog tiger");
+    }
+    /// R092 filesystem operation regression 22
+    #[test] fn r092_fs_22_replace_all_shrinking(){
+        let mut fs=DurableFs::format_blank(blank()).unwrap();fs.create_path("/a",b"one one").unwrap();assert_eq!(fs.replace_all_path("/a",b"one",b"x"),Ok(2));assert_eq!(get(&mut fs,"/a"),b"x x");
+    }
+    /// R092 filesystem operation regression 23
+    #[test] fn r092_fs_23_replace_all_no_match_does_not_publish(){
+        let mut fs=DurableFs::format_blank(blank()).unwrap();fs.create_path("/a",b"abc").unwrap();let gen=fs.generation();let writes=fs.disk.writes;assert_eq!(fs.replace_all_path("/a",b"absent",b"y"),Ok(0));assert_eq!(fs.generation(),gen);assert_eq!(fs.disk.writes,writes);
+    }
+    /// R092 filesystem operation regression 24
+    #[test] fn r092_fs_24_copy_failed_source_corruption_never_mutates_target(){
+        let mut fs=DurableFs::format_blank(blank()).unwrap();fs.create_path("/a",b"old").unwrap();let b=fs.meta.entries[0].bank;fs.disk.sectors[block_start(0,b) as usize][0]^=1;let writes=fs.disk.writes;assert_eq!(fs.copy_path("/a","/b"),Err(FsError::InvalidVolume));assert_eq!(fs.disk.writes,writes);
+    }
+    /// R092 filesystem operation regression 25
+    #[test] fn r092_fs_25_rename_swap_torn_metadata_falls_back_to_previous_head(){
+        let mut fs=DurableFs::format_blank(blank()).unwrap();fs.create_path("/a",b"AAA").unwrap();fs.create_path("/b",b"BBB").unwrap();fs.disk.fail_at=Some(fs.disk.writes);assert_eq!(fs.swap_paths("/a","/b"),Err(FsError::Io));let mut disk=fs.into_device();disk.fail_at=None;let mut fs=DurableFs::mount(disk).unwrap();assert_eq!(get(&mut fs,"/a"),b"AAA");assert_eq!(get(&mut fs,"/b"),b"BBB");
+    }
+    /// R092 filesystem operation regression 26
+    #[test] fn r092_fs_26_insert_failed_bank_write_preserves_old_data(){
+        let mut fs=DurableFs::format_blank(blank()).unwrap();fs.create_path("/a",b"old").unwrap();fs.disk.fail_at=Some(fs.disk.writes);assert_eq!(fs.insert_range_path("/a",1,b"X"),Err(FsError::Io));let mut disk=fs.into_device();disk.fail_at=None;let mut fs=DurableFs::mount(disk).unwrap();assert_eq!(get(&mut fs,"/a"),b"old");
+    }
+
+    #[test] fn r095_097_01_prepend_and_drop_prefix(){let mut fs=DurableFs::format_blank(blank()).unwrap();fs.create_path("/x",b"ab").unwrap();assert_eq!(fs.prepend_path("/x",b"hi"),Ok(2));assert_eq!(get(&mut fs,"/x"),b"hiab");assert_eq!(fs.drop_prefix_path("/x",2),Ok(2));assert_eq!(get(&mut fs,"/x"),b"ab");}
+    #[test] fn r095_097_02_drop_suffix(){let mut fs=DurableFs::format_blank(blank()).unwrap();fs.create_path("/x",b"abc").unwrap();assert_eq!(fs.drop_suffix_path("/x",1),Ok(1));assert_eq!(get(&mut fs,"/x"),b"ab");}
+    #[test] fn r095_097_03_replace_prefix(){let mut fs=DurableFs::format_blank(blank()).unwrap();fs.create_path("/x",b"abc").unwrap();assert_eq!(fs.replace_prefix_path("/x",b"bad",b"z"),Ok(false));assert_eq!(fs.replace_prefix_path("/x",b"ab",b"xy"),Ok(true));assert_eq!(get(&mut fs,"/x"),b"xyc");}
+    #[test] fn r095_097_04_replace_suffix(){let mut fs=DurableFs::format_blank(blank()).unwrap();fs.create_path("/x",b"abc").unwrap();assert_eq!(fs.replace_suffix_path("/x",b"bc",b"Z"),Ok(true));assert_eq!(get(&mut fs,"/x"),b"aZ");}
+    #[test] fn r095_097_05_reverse_range(){let mut fs=DurableFs::format_blank(blank()).unwrap();fs.create_path("/x",b"abcdef").unwrap();assert_eq!(fs.reverse_range_path("/x",1,4),Ok(4));assert_eq!(get(&mut fs,"/x"),b"aedcbf");}
+    #[test] fn r095_097_06_rotate_left(){let mut fs=DurableFs::format_blank(blank()).unwrap();fs.create_path("/x",b"abcdef").unwrap();assert_eq!(fs.rotate_left_path("/x",1,4,1),Ok(4));assert_eq!(get(&mut fs,"/x"),b"acdebf");}
+    #[test] fn r095_097_07_rotate_right(){let mut fs=DurableFs::format_blank(blank()).unwrap();fs.create_path("/x",b"abcdef").unwrap();assert_eq!(fs.rotate_right_path("/x",1,4,1),Ok(4));assert_eq!(get(&mut fs,"/x"),b"aebcdf");}
+    #[test] fn r095_097_08_swap_ranges(){let mut fs=DurableFs::format_blank(blank()).unwrap();fs.create_path("/x",b"abcdef").unwrap();assert_eq!(fs.swap_ranges_path("/x",0,4,2),Ok(2));assert_eq!(get(&mut fs,"/x"),b"efcdab");}
+    #[test] fn r095_097_09_move_range(){let mut fs=DurableFs::format_blank(blank()).unwrap();fs.create_path("/x",b"abcdef").unwrap();assert_eq!(fs.move_range_path("/x",1,2,4),Ok(2));assert_eq!(get(&mut fs,"/x"),b"adefbc");}
+    #[test] fn r095_097_10_xor_range(){let mut fs=DurableFs::format_blank(blank()).unwrap();fs.create_path("/x",&[1,2,3]).unwrap();assert_eq!(fs.xor_range_path("/x",1,2,0xff),Ok(2));assert_eq!(get(&mut fs,"/x"),[1,253,252]);}
+    #[test] fn r095_097_11_uppercase_range(){let mut fs=DurableFs::format_blank(blank()).unwrap();fs.create_path("/x",b"abC123").unwrap();assert_eq!(fs.uppercase_ascii_range_path("/x",0,4),Ok(2));assert_eq!(get(&mut fs,"/x"),b"ABC123");}
+    #[test] fn r095_097_12_search_find(){let mut fs=DurableFs::format_blank(blank()).unwrap();fs.create_path("/x",b"abcabc").unwrap();assert_eq!(fs.find_bytes_path("/x",b"bc"),Ok(Some(1)));assert_eq!(fs.find_bytes_path("/x",b"xx"),Ok(None));}
+    #[test] fn r095_097_13_search_rfind(){let mut fs=DurableFs::format_blank(blank()).unwrap();fs.create_path("/x",b"abcabc").unwrap();assert_eq!(fs.rfind_bytes_path("/x",b"bc"),Ok(Some(4)));}
+    #[test] fn r095_097_14_search_count(){let mut fs=DurableFs::format_blank(blank()).unwrap();fs.create_path("/x",b"aaaaa").unwrap();assert_eq!(fs.count_bytes_path("/x",b"aa"),Ok(2));}
+    #[test] fn r095_097_15_search_prefix(){let mut fs=DurableFs::format_blank(blank()).unwrap();fs.create_path("/x",b"alpha").unwrap();assert_eq!(fs.has_prefix_path("/x",b"al"),Ok(true));assert_eq!(fs.has_prefix_path("/x",b"la"),Ok(false));}
+    #[test] fn r095_097_16_search_suffix(){let mut fs=DurableFs::format_blank(blank()).unwrap();fs.create_path("/x",b"alpha").unwrap();assert_eq!(fs.has_suffix_path("/x",b"ha"),Ok(true));assert_eq!(fs.has_suffix_path("/x",b"al"),Ok(false));}
+    #[test] fn r095_097_17_search_read_byte(){let mut fs=DurableFs::format_blank(blank()).unwrap();fs.create_path("/x",b"abc").unwrap();assert_eq!(fs.read_byte_path("/x",1),Ok(Some(b'b')));assert_eq!(fs.read_byte_path("/x",3),Ok(None));}
+    #[test] fn r095_097_18_search_read_head(){let mut fs=DurableFs::format_blank(blank()).unwrap();fs.create_path("/x",b"abcdef").unwrap();let mut out=[0xaa;3];assert_eq!(fs.read_head_path("/x",&mut out),Ok(3));assert_eq!(&out,b"abc");}
+    #[test] fn r095_097_19_search_read_tail(){let mut fs=DurableFs::format_blank(blank()).unwrap();fs.create_path("/x",b"abcdef").unwrap();let mut out=[0xaa;3];assert_eq!(fs.read_tail_path("/x",&mut out),Ok(3));assert_eq!(&out,b"def");}
+    #[test] fn r095_097_20_search_range_equal(){let mut fs=DurableFs::format_blank(blank()).unwrap();fs.create_path("/x",b"abcdef").unwrap();assert_eq!(fs.range_equals_path("/x",2,b"cde"),Ok(true));assert_eq!(fs.range_equals_path("/x",5,b"zzz"),Ok(false));}
+    #[test] fn r095_097_21_search_empty_verified(){let mut fs=DurableFs::format_blank(blank()).unwrap();fs.create_path("/x",b"").unwrap();assert_eq!(fs.verified_empty_path("/x"),Ok(true));fs.append_path("/x",b"x").unwrap();assert_eq!(fs.verified_empty_path("/x"),Ok(false));}
+    #[test] fn r095_097_22_gen_append(){let mut fs=DurableFs::format_blank(blank()).unwrap();fs.create_path("/x",b"one").unwrap();let g=fs.generation();assert_eq!(fs.append_if_generation_path("/x",g+1,b"x"),Err(FsError::InvalidVolume));assert_eq!(fs.append_if_generation_path("/x",g,b"x"),Ok(1));assert_eq!(get(&mut fs,"/x"),b"onex");}
+    #[test] fn r095_097_23_gen_insert(){let mut fs=DurableFs::format_blank(blank()).unwrap();fs.create_path("/x",b"ac").unwrap();let g=fs.generation();assert_eq!(fs.insert_if_generation_path("/x",g,1,b"b"),Ok(1));assert_eq!(get(&mut fs,"/x"),b"abc");}
+    #[test] fn r095_097_24_gen_remove(){let mut fs=DurableFs::format_blank(blank()).unwrap();fs.create_path("/x",b"abcd").unwrap();let g=fs.generation();assert_eq!(fs.remove_if_generation_path("/x",g,1,2),Ok(2));assert_eq!(get(&mut fs,"/x"),b"ad");}
+    #[test] fn r095_097_25_gen_splice(){let mut fs=DurableFs::format_blank(blank()).unwrap();fs.create_path("/x",b"abcd").unwrap();let g=fs.generation();assert_eq!(fs.splice_if_generation_path("/x",g,1,2,b"XX"),Ok(2));assert_eq!(get(&mut fs,"/x"),b"aXXd");}
+    #[test] fn r095_097_26_gen_fill(){let mut fs=DurableFs::format_blank(blank()).unwrap();fs.create_path("/x",b"abcd").unwrap();let g=fs.generation();assert_eq!(fs.fill_if_generation_path("/x",g,1,2,b'X'),Ok(2));assert_eq!(get(&mut fs,"/x"),b"aXXd");}
+    #[test] fn r095_097_27_gen_delete(){let mut fs=DurableFs::format_blank(blank()).unwrap();fs.create_path("/x",b"abcd").unwrap();let g=fs.generation();assert_eq!(fs.delete_if_generation_path("/x",g+1),Err(FsError::InvalidVolume));fs.delete_if_generation_path("/x",g).unwrap();assert_eq!(fs.read_path("/x",&mut[0;8]),Err(FsError::NotFound));}
+    #[test] fn r095_097_28_gen_swap(){let mut fs=DurableFs::format_blank(blank()).unwrap();fs.create_path("/a",b"left").unwrap();fs.create_path("/b",b"right").unwrap();let g=fs.generation();fs.swap_if_generation_path("/a","/b",g).unwrap();assert_eq!(get(&mut fs,"/a"),b"right");}
+    #[test] fn r095_097_29_gen_rename(){let mut fs=DurableFs::format_blank(blank()).unwrap();fs.create_path("/a",b"left").unwrap();let g=fs.generation();fs.rename_if_generation_path("/a","/b",g).unwrap();assert_eq!(get(&mut fs,"/b"),b"left");}
+    #[test] fn r095_097_30_gen_copy(){let mut fs=DurableFs::format_blank(blank()).unwrap();fs.create_path("/a",b"left").unwrap();let g=fs.generation();fs.copy_if_generation_path("/a","/b",g).unwrap();assert_eq!(get(&mut fs,"/b"),b"left");}
 
 }

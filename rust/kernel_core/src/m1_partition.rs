@@ -99,7 +99,9 @@ fn mbr<D:BlockDevice>(disk:&mut D,first:&[u8;SECTOR_BYTES])
   let kind=slot[4];let start=le32(&slot[8..12]) as u64;
   let count=le32(&slot[12..16]) as u64;
   if kind==0 {
-   if start!=0||count!=0{return Err(Error::Invalid);}
+   // Empty MBR slots must be entirely empty; a bootable flag or stale
+   // CHS geometry is ambiguous metadata, not an authorized partition.
+   if slot.iter().any(|&byte|byte!=0){return Err(Error::Invalid);}
    continue;
   }
   if matches!(kind,0x05|0x0f|0x85|0xee){return Err(Error::Unsupported);}
@@ -123,6 +125,9 @@ fn gpt<D:BlockDevice>(disk:&mut D)->Result<PartitionSet,Error>{
  if !(92..=SECTOR_BYTES).contains(&size)||hdr[20..24]!=[0;4]{
   return Err(Error::Invalid);
  }
+ // GPT reserved bytes after HeaderSize must be zero. A CRC covers only
+ // HeaderSize, so unvalidated trailing data cannot be silently accepted.
+ if hdr[size..].iter().any(|&byte|byte!=0){return Err(Error::Invalid);}
  let expected=le32(&hdr[16..20]);
  let mut check=hdr;
  check[16..20].fill(0);
@@ -161,6 +166,7 @@ fn gpt<D:BlockDevice>(disk:&mut D)->Result<PartitionSet,Error>{
     le32(&backup[8..12])!=0x0001_0000||
     le32(&backup[12..16]) as usize!=size||
     backup[20..24]!=[0;4]||
+    backup[size..].iter().any(|&byte|byte!=0)||
     le64(&backup[24..32])!=alternate||
     le64(&backup[32..40])!=1||
     le64(&backup[40..48])!=first||
@@ -596,6 +602,21 @@ mod m1_partition_tests{
   assert_eq!(disk.data[0][510..512],[0x55,0xaa]);
   assert_eq!(disk.data[9],[0;SECTOR_BYTES]);
   assert_eq!(disk.data[110],[0;SECTOR_BYTES]);
+ }
+ #[test]fn m1_r089_empty_mbr_entry_with_stale_metadata_is_never_selected(){
+  for (offset,value) in [(0usize,0x80u8),(1,0x11),(2,0x12),
+                         (5,0x13),(6,0x14),(7,0x15),(8,0x01),(12,0x01)]{
+   let mut disk=mbr_disk();
+   disk.data[0][462+offset]=value;
+   assert_eq!(inspect(&mut disk,0),Err(Error::Invalid),
+              "stale byte offset {offset}");
+   assert_eq!(disk.writes,0);
+  }
+  let mut clean=mbr_disk();
+  assert_eq!(inspect(&mut clean,0),Ok(Partition{
+   scheme:Scheme::Mbr,index:0,start:10,sectors:100
+  }));
+  assert_eq!(clean.writes,0);
  }
  #[test]fn m1_gpt_verified_header_table_and_bounded_remount(){
   let mut disk=gpt_disk();
@@ -2010,6 +2031,105 @@ mod m1_partition_tests{
   }
   assert_eq!(d.writes,before);
   assert_eq!(d.data[10],[0;SECTOR_BYTES]);
+ }
+
+ /// R090 P01: mbr rejects missing first signature byte
+ #[test]fn r090_p01_mbr_rejects_missing_first_signature_byte(){
+  let mut d=mbr_disk();d.data[0][510]=0;assert_eq!(inspect(&mut d,0),Err(Error::Invalid));assert_eq!(d.writes,0);
+ }
+ /// R090 P02: mbr rejects missing second signature byte
+ #[test]fn r090_p02_mbr_rejects_missing_second_signature_byte(){
+  let mut d=mbr_disk();d.data[0][511]=0;assert_eq!(inspect(&mut d,0),Err(Error::Invalid));assert_eq!(d.writes,0);
+ }
+ /// R090 P03: mbr rejects invalid boot indicator
+ #[test]fn r090_p03_mbr_rejects_invalid_boot_indicator(){
+  let mut d=mbr_disk();d.data[0][446]=0x40;assert_eq!(inspect(&mut d,0),Err(Error::Invalid));assert_eq!(d.writes,0);
+ }
+ /// R090 P04: mbr rejects start zero for live partition
+ #[test]fn r090_p04_mbr_rejects_start_zero_for_live_partition(){
+  let mut d=mbr_disk();d.data[0][454..458].fill(0);assert_eq!(inspect(&mut d,0),Err(Error::Invalid));assert_eq!(d.writes,0);
+ }
+ /// R090 P05: mbr rejects live partition zero sectors
+ #[test]fn r090_p05_mbr_rejects_live_partition_zero_sectors(){
+  let mut d=mbr_disk();d.data[0][458..462].fill(0);assert_eq!(inspect(&mut d,0),Err(Error::Invalid));assert_eq!(d.writes,0);
+ }
+ /// R090 P06: mbr rejects partition larger than disk
+ #[test]fn r090_p06_mbr_rejects_partition_larger_than_disk(){
+  let mut d=mbr_disk();d.data[0][458..462].copy_from_slice(&u32::MAX.to_le_bytes());assert_eq!(inspect(&mut d,0),Err(Error::OutOfRange));assert_eq!(d.writes,0);
+ }
+ /// R090 P07: mbr rejects overlapping second partition
+ #[test]fn r090_p07_mbr_rejects_overlapping_second_partition(){
+  let mut d=mbr_disk();let s=&mut d.data[0][462..478];s[4]=0x83;s[8..12].copy_from_slice(&50u32.to_le_bytes());s[12..16].copy_from_slice(&10u32.to_le_bytes());assert_eq!(inspect(&mut d,0),Err(Error::Overlap));assert_eq!(d.writes,0);
+ }
+ /// R090 P08: mbr supports noncontiguous partition ordinal
+ #[test]fn r090_p08_mbr_supports_noncontiguous_partition_ordinal(){
+  let mut d=mbr_disk();let s=&mut d.data[0][478..494];s[4]=0x83;s[8..12].copy_from_slice(&150u32.to_le_bytes());s[12..16].copy_from_slice(&20u32.to_le_bytes());let c=discover(&mut d).unwrap();assert_eq!(c.len(),2);assert!(c.get(1).is_none());assert_eq!(c.get(2).unwrap().start,150);assert_eq!(d.writes,0);
+ }
+ /// R090 P09: mbr rejects inactive empty slot marked bootable
+ #[test]fn r090_p09_mbr_rejects_inactive_empty_slot_marked_bootable(){
+  let mut d=mbr_disk();d.data[0][462]=0x80;assert_eq!(inspect(&mut d,0),Err(Error::Invalid));assert_eq!(d.writes,0);
+ }
+ /// R090 P10: mbr rejects empty slot nonzero chs
+ #[test]fn r090_p10_mbr_rejects_empty_slot_nonzero_chs(){
+  let mut d=mbr_disk();d.data[0][464]=1;assert_eq!(inspect(&mut d,0),Err(Error::Invalid));assert_eq!(d.writes,0);
+ }
+ /// R090 P11: mbr rejects extended partition not implemented
+ #[test]fn r090_p11_mbr_rejects_extended_partition_not_implemented(){
+  let mut d=mbr_disk();d.data[0][450]=0x05;assert_eq!(inspect(&mut d,0),Err(Error::Unsupported));assert_eq!(d.writes,0);
+ }
+ /// R090 P12: mbr missing requested ordinal does not write
+ #[test]fn r090_p12_mbr_missing_requested_ordinal_does_not_write(){
+  let mut d=mbr_disk();assert_eq!(inspect(&mut d,3),Err(Error::NotFound));assert_eq!(d.writes,0);
+ }
+ /// R090 P13: mbr copy to short output remains empty
+ #[test]fn r090_p13_mbr_copy_to_short_output_remains_empty(){
+  let mut d=mbr_disk();let c=discover(&mut d).unwrap();let mut out: [Partition;0]=[];assert_eq!(c.copy_to(&mut out),Err(Error::TooSmall));assert_eq!(d.writes,0);
+ }
+ /// R090 P14: gpt rejects bad primary signature
+ #[test]fn r090_p14_gpt_rejects_bad_primary_signature(){
+  let mut d=gpt_disk();d.data[1][0]^=0x01;assert_eq!(inspect(&mut d,0),Err(Error::Invalid));assert_eq!(d.writes,0);
+ }
+ /// R090 P15: gpt rejects bad primary header checksum
+ #[test]fn r090_p15_gpt_rejects_bad_primary_header_checksum(){
+  let mut d=gpt_disk();d.data[1][16]^=0x80;assert_eq!(inspect(&mut d,0),Err(Error::Invalid));assert_eq!(d.writes,0);
+ }
+ /// R090 P16: gpt rejects bad backup header checksum
+ #[test]fn r090_p16_gpt_rejects_bad_backup_header_checksum(){
+  let mut d=gpt_disk();d.data[255][16]^=0x80;assert_eq!(inspect(&mut d,0),Err(Error::Invalid));assert_eq!(d.writes,0);
+ }
+ /// R090 P17: gpt rejects mismatched backup entry data
+ #[test]fn r090_p17_gpt_rejects_mismatched_backup_entry_data(){
+  let mut d=gpt_disk();d.data[254][0]^=0x80;assert_eq!(inspect(&mut d,0),Err(Error::Invalid));assert_eq!(d.writes,0);
+ }
+ /// R090 P18: gpt rejects nil disk guid with valid checksums
+ #[test]fn r090_p18_gpt_rejects_nil_disk_guid_with_valid_checksums(){
+  let mut d=gpt_disk();d.data[1][56..72].fill(0);rechecksum_gpt(&mut d);assert_eq!(inspect(&mut d,0),Err(Error::Invalid));assert_eq!(d.writes,0);
+ }
+ /// R090 P19: gpt rejects nil unique guid with valid checksums
+ #[test]fn r090_p19_gpt_rejects_nil_unique_guid_with_valid_checksums(){
+  let mut d=gpt_disk();d.data[2][16..32].fill(0);rechecksum_gpt(&mut d);assert_eq!(inspect(&mut d,0),Err(Error::Invalid));assert_eq!(d.writes,0);
+ }
+ /// R090 P20: gpt rejects invalid partition last lba with valid crcs
+ #[test]fn r090_p20_gpt_rejects_invalid_partition_last_lba_with_valid_crcs(){
+  let mut d=gpt_disk();d.data[2][40..48].copy_from_slice(&223u64.to_le_bytes());rechecksum_gpt(&mut d);assert_eq!(inspect(&mut d,0),Err(Error::OutOfRange));assert_eq!(d.writes,0);
+ }
+
+ #[test]fn r091_gpt_primary_padding_must_be_zero_even_with_valid_crc(){
+  let mut disk=gpt_disk();
+  disk.data[1][300]=0x5a;
+  assert_eq!(inspect(&mut disk,0),Err(Error::Invalid));
+  assert_eq!(disk.writes,0);
+ }
+ #[test]fn r091_gpt_backup_padding_must_be_zero_even_with_valid_crc(){
+  let mut disk=gpt_disk();
+  disk.data[255][511]=0xa5;
+  assert_eq!(inspect(&mut disk,0),Err(Error::Invalid));
+  assert_eq!(disk.writes,0);
+ }
+ #[test]fn r091_gpt_canonical_padding_allows_unmodified_layout(){
+  let mut disk=gpt_disk();
+  assert!(inspect_gpt_selection(&mut disk,0).is_ok());
+  assert_eq!(disk.writes,0);
  }
 
 }
