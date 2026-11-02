@@ -42,6 +42,16 @@ pub struct NamespaceReceipt { owner:Identity, namespace_id:u64, revision:u64 }
 /// Kernel-minted alias scoped to a process incarnation and namespace revision.
 /// String path comparison alone is not an authority to access a mounted tree.
 #[derive(Clone,Copy)]
+/// A kernel-only, read-only proof of the exact mounted volume, root
+/// namespace and mount revision at the beginning of one selected-file call.
+/// This protects against cooperative remount/rebind paths; it is NOT an
+/// inter-CPU locking mechanism.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct SelectedOperationGuard{
+    namespace:NamespaceReceipt,
+    revision:u64,
+    selected_volume:Option<crate::m1_partition::PartitionReceipt>,
+}
 pub struct MountAlias {
     receipt:NamespaceReceipt, root:[u8;24], len:usize,
     // A kernel-selected physical mount is a different authority from its
@@ -222,6 +232,27 @@ impl FileHandles{
     pub fn last_syscall_namespace(&self)->Option<NamespaceReceipt>{
         self.last_syscall_namespace
     }
+    /// Freeze exact namespace and selected partition state, without disk I/O.
+    /// Callers must re-check after any fallible mount/recovery probe.
+    pub fn selected_operation_guard(
+        &self,owner:Identity
+    )->Result<SelectedOperationGuard,FsError>{
+        if self.selected_quarantined{return Err(FsError::InvalidVolume);}
+        Ok(SelectedOperationGuard{
+            namespace:self.namespace_receipt(owner)?,
+            revision:self.volume_revision,
+            selected_volume:self.selected_volume,
+        })
+    }
+    pub fn selected_operation_guard_is_current(
+        &self,guard:SelectedOperationGuard
+    )->bool{
+        !self.selected_quarantined &&
+        self.namespace_receipt_is_current(guard.namespace) &&
+        self.volume_revision==guard.revision &&
+        self.selected_volume==guard.selected_volume
+    }
+
     fn root_allows(&self,owner:Identity,path:&str)->bool{
         if owner.generation==0{return true;} // legacy non-authenticated compatibility path
         if !self.owns(owner){return false;}
@@ -1045,14 +1076,13 @@ pub fn operation_on_selected_volume<D:BlockDevice>(
     token:u64,argument:u64,path:&str,buffer:&mut[u8],
     disk:&mut D,receipt:crate::m1_partition::PartitionReceipt
 )->Result<u64,FsError>{
-    let namespace=table.namespace_receipt(owner)?;
+    let guard=table.selected_operation_guard(owner)?;
     table.preflight_selected(action,owner,token,argument,path,buffer)?;
-    if !table.namespace_receipt_is_current(namespace){
+    if !table.selected_operation_guard_is_current(guard){
         return Err(FsError::InvalidName);
     }
-    table.last_syscall_namespace=Some(namespace);
-    if table.selected_quarantined{return Err(FsError::InvalidVolume);}
-    let prior=table.selected_volume;
+    table.last_syscall_namespace=Some(guard.namespace);
+    let prior=guard.selected_volume;
     // Only a new file open/create may bind the service to a volume. Existing
     // handle actions on an unfamiliar partition fail BEFORE any disk reads.
     if prior!=Some(receipt){
@@ -1063,9 +1093,9 @@ pub fn operation_on_selected_volume<D:BlockDevice>(
     }
     let mut volume=crate::m1_partition::mount_partition_receipt_healthy(
        disk,receipt).map_err(|_|FsError::InvalidVolume)?;
-    // The mount may have performed physical I/O; do not dispatch a user
-    // operation against a namespace receipt retired during probing.
-    if !table.namespace_receipt_is_current(namespace){
+    // Revalidate the complete namespace, selected receipt, mount revision
+    // and quarantine state after the storage probe, not only the pathname.
+    if !table.selected_operation_guard_is_current(guard){
         return Err(FsError::InvalidName);
     }
     // A newly mounted physical volume rotates every outstanding namespace
@@ -2964,4 +2994,51 @@ mod r117_atomic_file_teardown_tests {
   assert_eq!(t.retire_process_batch_kernel(&[a]),Err(FsError::InvalidName));
   assert!(t.owns(b));
  }
+}
+
+
+#[cfg(test)]
+mod r117_selected_volume_guard_tests {
+    use super::*;
+    #[test]
+    fn initial_guard_rejects_root_narrowing_and_pid_reincarnation(){
+        let mut table=FileHandles::new();
+        let p2=table.bind_process(2).unwrap();
+        let initial=table.selected_operation_guard(p2).unwrap();
+        assert!(table.selected_operation_guard_is_current(initial));
+        table.narrow_root_kernel(p2,"/shared/docs").unwrap();
+        assert!(!table.selected_operation_guard_is_current(initial));
+        let newer=table.selected_operation_guard(p2).unwrap();
+        let recycled=table.bind_process(2).unwrap();
+        assert_ne!(recycled,p2);
+        assert!(!table.selected_operation_guard_is_current(newer));
+        assert!(table.selected_operation_guard_is_current(
+            table.selected_operation_guard(recycled).unwrap()));
+    }
+    #[test]
+    fn remount_revision_and_volume_identity_invalidate_old_guard(){
+        let mut table=FileHandles::new();
+        let p1=table.bind_process(1).unwrap();
+        let previous=table.selected_operation_guard(p1).unwrap();
+        table.volume_revision=table.volume_revision.checked_add(1).unwrap();
+        assert!(!table.selected_operation_guard_is_current(previous));
+        let current=table.selected_operation_guard(p1).unwrap();
+        assert!(table.selected_operation_guard_is_current(current));
+        table.selected_quarantined=true;
+        assert!(!table.selected_operation_guard_is_current(current));
+        assert!(matches!(table.selected_operation_guard(p1),
+                        Err(FsError::InvalidVolume)));
+    }
+    #[test]
+    fn failed_guard_request_does_not_modify_peer_process(){
+        let mut table=FileHandles::new();
+        let current=table.bind_process(2).unwrap();
+        let p1=table.bind_process(1).unwrap();
+        assert!(matches!(table.selected_operation_guard(
+            Identity{pid:2,generation:current.generation+1}),
+            Err(FsError::InvalidName)));
+        assert!(table.owns(current));assert!(table.owns(p1));
+        assert!(table.selected_operation_guard_is_current(
+            table.selected_operation_guard(current).unwrap()));
+    }
 }
