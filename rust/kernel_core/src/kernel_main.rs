@@ -497,7 +497,11 @@ pub extern "C" fn kmain()->!{
         let verified=saved.is_ok_and(|r|
             r.epoch==prior+1 &&
             r114_boot_epoch::recovery_receipt(
-                &mut region,&QemuFixture,r.epoch,0,slot,21)==Ok(r));
+                &mut region,&QemuFixture,r.epoch,0,slot,21)==Ok(r) &&
+            // A read-only journal observation must also authenticate the
+            // exact same trust fixture before printing the QEMU success.
+            r114_boot_epoch::observe_verified_epoch(
+                &mut region,&QemuFixture)==Ok(r));
         need(verified,b"IndianOS: FATAL R114 QEMU boot epoch persistence\n\0");
         log(b"IndianOS: R114 QEMU boot epoch advanced and recovery receipt verified\n\0");
     }

@@ -593,3 +593,83 @@ mod r114_leased_routing_tests{
   assert_eq!(r.len(),0);
  }
 }
+
+
+
+/// R115: network transmit callers with a trusted monotonic clock must use
+/// time-bounded receipts rather than the older epoch-only receipt. DHCP lease
+/// expiry invalidates tokens even if no background sweep has run.
+impl<const N: usize> FailoverRoutes<N> {
+    pub fn receipt_at(&self, destination: u32, now: u64) -> Option<RouteReceipt> {
+        self.resolve_at(destination, now)
+            .map(|selected| RouteReceipt { selected })
+    }
+
+    pub fn receipt_is_current_at(
+        &self, destination: u32, now: u64, token: RouteReceipt,
+    ) -> bool {
+        self.resolve_at(destination, now) == Some(token.selected)
+    }
+}
+
+#[cfg(test)]
+mod r115_lease_scoped_route_receipt_tests {
+    use super::*;
+    fn c(link: u16, metric: u16, epoch: u64) -> RouteCandidate {
+        RouteCandidate { route: Route { network: 0, prefix: 0, next_hop: 0 },
+            metric, link, epoch, healthy: true }
+    }
+
+    #[test]
+    fn expiration_at_exact_deadline_invalidates_without_sweep() {
+        let mut p = FailoverRoutes::<2>::new();
+        p.add(c(1, 20, 1)).unwrap();
+        p.add_dhcp_lease(c(2, 1, 1), 10, 20).unwrap();
+        let before = p.receipt_at(0x08080808, 19).unwrap();
+        assert_eq!(before.selected.link, 2);
+        assert!(p.receipt_is_current_at(0x08080808, 19, before));
+        assert!(!p.receipt_is_current_at(0x08080808, 20, before));
+        assert_eq!(p.receipt_at(0x08080808, 20).unwrap().selected.link, 1);
+        assert_eq!(p.len(), 2); // a read cannot mutate the table
+    }
+
+    #[test]
+    fn interface_quarantine_changes_the_best_route_receipt() {
+        let mut p = FailoverRoutes::<2>::new();
+        p.add(c(1, 1, 2)).unwrap();
+        p.add(c(2, 2, 3)).unwrap();
+        let before = p.receipt_at(22, 10).unwrap();
+        assert_eq!(before.selected.link, 1);
+        p.begin_link_reset(1, 2, 3).unwrap();
+        assert!(!p.receipt_is_current_at(22, 10, before));
+        assert_eq!(p.receipt_at(22, 10).unwrap().selected.link, 2);
+        p.end_link_reset(1, 3).unwrap();
+        assert!(!p.receipt_is_current_at(22, 10, before));
+        assert_eq!(p.receipt_at(22, 10).unwrap().selected.link, 1);
+    }
+
+    #[test]
+    fn lease_renewal_retains_receipt_only_until_new_expiry() {
+        let mut p = FailoverRoutes::<1>::new();
+        let route = c(4, 1, 9);
+        p.add_dhcp_lease(route, 10, 20).unwrap();
+        let receipt = p.receipt_at(77, 15).unwrap();
+        p.renew_dhcp_lease(route, 15, 30).unwrap();
+        assert!(p.receipt_is_current_at(77, 20, receipt));
+        assert!(p.receipt_is_current_at(77, 29, receipt));
+        assert!(!p.receipt_is_current_at(77, 30, receipt));
+        assert_eq!(p.len(), 1);
+    }
+
+    #[test]
+    fn absent_routes_zero_capacity_and_explicit_removal_fail_closed() {
+        let empty = FailoverRoutes::<0>::new();
+        assert_eq!(empty.receipt_at(1, 0), None);
+        let mut p = FailoverRoutes::<1>::new();
+        p.add(c(3, 1, 7)).unwrap();
+        let receipt = p.receipt_at(1, 1).unwrap();
+        assert_eq!(p.expire_link(3, 7), 1);
+        assert!(!p.receipt_is_current_at(1, 1, receipt));
+        assert_eq!(p.receipt_at(1, 1), None);
+    }
+}

@@ -76,6 +76,11 @@ static mut R114_FILE_EVENTS:crate::process_events::ProcessEvents<16>=
 #[cfg(feature="test-r031-files-gui")]
 static mut R114_LOCAL_UDP:crate::network::EpochUdpEndpoints<2,8>=
     crate::network::EpochUdpEndpoints::new();
+// The same kernel-only owner table is now consulted by real ring-3 local
+// socket syscalls, ingress authorization and process retirement.
+#[cfg(feature="test-r031-files-gui")]
+static mut R115_UDP_OWNERS:crate::udp_owner_epoch::Registry<2>=
+    crate::udp_owner_epoch::Registry::new();
 
 /// Kernel-only PID1 lifecycle event acknowledgement. A user-supplied PID or
 /// file descriptor cannot select a consumer; the current exact FileHandles
@@ -810,8 +815,20 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
     return BAD;
    }
    let handles=unsafe{&mut *ptr::addr_of_mut!(R031_HANDLES)};
-   let res=crate::fs_handles::operation_authenticated(handles,request.arg0,owner,
-           handle,argument,path,&mut data[..size]);
+   // R115: the real ring-3 PID2 Files OPEN always uses an alias minted
+   // from the CURRENT kernel process namespace. The user cannot provide
+   // an alias or choose a wider root; all other operations still authenticate
+   // their existing descriptor and incarnation before touching the device.
+   let res=if request.arg0==1 && owner.pid==2 {
+    match handles.mount_alias_for_current_root_kernel(owner) {
+     Ok(alias)=>crate::fs_handles::operation_authenticated_mount_alias(
+          handles,alias,request.arg0,owner,handle,argument,path,&mut data[..size]),
+     Err(err)=>Err(err),
+    }
+   }else {
+    crate::fs_handles::operation_authenticated(handles,request.arg0,owner,
+           handle,argument,path,&mut data[..size])
+   };
    let Ok(n)=res else{return BAD;};
    if request.arg0==2 && n>0{
     if n>size as u64|| !unsafe{indianos_user_copy_writable(
@@ -846,8 +863,10 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
     _=>return BAD
    }
    let socket=unsafe{&mut *ptr::addr_of_mut!(R114_LOCAL_UDP)};
+   let registry=unsafe{&mut *ptr::addr_of_mut!(R115_UDP_OWNERS)};
    match request.arg0{
-    1=>socket.bind(owner.pid,owner.generation,source).map_or(BAD,|_|0),
+    1=>socket.bind_registered(registry,owner.pid,owner.generation,source)
+       .map_or(BAD,|_|0),
     2=>socket.send_local(owner.pid,owner.generation,source,destination,
              &data[..count]).map_or(BAD,|_|0),
     3=>{
@@ -860,7 +879,11 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
                            data.as_ptr(),n)}{return BAD;}
      n as u64
     },
-    4=>socket.close(owner.pid,owner.generation,source).map_or(BAD,|_|0),
+    4=>{
+     let grant=crate::udp_owner_epoch::Grant{
+       pid:owner.pid,generation:owner.generation,port:source};
+     socket.close_registered_batch(registry,&[grant]).map_or(BAD,|_|0)
+    },
     _=>BAD
    }
   },
@@ -1289,8 +1312,14 @@ fn revoke_task_authority(task:&mut Task){
     let _=unsafe{&mut *ptr::addr_of_mut!(R114_FILE_EVENTS)}.enqueue(event);
    }
    #[cfg(feature="test-r031-files-gui")]
-   {let _=unsafe{&mut *ptr::addr_of_mut!(R114_LOCAL_UDP)}
-        .retire(owner.pid,owner.generation);}
+   {
+    // Mandatory exact-incarnation revocation on ordinary exit, fault and
+    // rollback. Network grants are retired before FileHandles, while the
+    // scheduler owns the only BSP mutator; no nested lock acquisition.
+    let sockets=unsafe{&mut *ptr::addr_of_mut!(R114_LOCAL_UDP)};
+    let registry=unsafe{&mut *ptr::addr_of_mut!(R115_UDP_OWNERS)};
+    let _=sockets.retire_registered(registry,owner.pid,owner.generation);
+   }
    unsafe{(&mut *ptr::addr_of_mut!(R031_HANDLES)).retire_process(owner);}
   }
   task.file_generation=0;
@@ -1331,7 +1360,8 @@ fn cleanup_session(backend:&CloneBackend,reclaim:bool)->bool{
  #[cfg(feature="test-r025")]
  unsafe{R025_SERVICES=None;}
  #[cfg(feature="test-r031-files-gui")]
- unsafe{R114_LOCAL_UDP=crate::network::EpochUdpEndpoints::new();}
+ unsafe{R114_LOCAL_UDP=crate::network::EpochUdpEndpoints::new();
+        R115_UDP_OWNERS=crate::udp_owner_epoch::Registry::new();}
  unsafe{SESSION_DIRTY=!complete;}
  complete
 }
@@ -1383,7 +1413,8 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
   log(b"IndianOS: M009 prior rollback still owns resources\n\0");return false;
  }
  #[cfg(feature="test-r031-files-gui")]
- unsafe{R114_LOCAL_UDP=crate::network::EpochUdpEndpoints::new();}
+ unsafe{R114_LOCAL_UDP=crate::network::EpochUdpEndpoints::new();
+        R115_UDP_OWNERS=crate::udp_owner_epoch::Registry::new();}
  let mut table=ProcessTable::empty();
  let mut scheduler=Scheduler::empty();
  if !unsafe{indianos_process_table_init(&mut table)}{return false;}

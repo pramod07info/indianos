@@ -267,3 +267,96 @@ mod r114_path_boundary_tests {
         assert_eq!(&utf8[..3], "/é".as_bytes());
     }
 }
+
+
+
+/// R115: translate a canonical path into a namespace-relative byte slice.
+/// This does not grant file access. Both paths are validated before touching
+/// output, and a sibling-prefix match is never considered in the namespace.
+pub fn copy_relative_under_root(
+    path: &str, root: &str, output: &mut [u8],
+) -> Result<Option<usize>, PathError> {
+    let mut candidate = [0u8; 256];
+    let mut boundary = [0u8; 256];
+    let n = normalize_absolute(path, &mut candidate)?;
+    let m = normalize_absolute(root, &mut boundary)?;
+    let inside = m == 1 || (n >= m && candidate[..m] == boundary[..m]
+        && (n == m || candidate[m] == b'/'));
+    if !inside { return Ok(None); }
+    let offset = if m == 1 { 1 } else if n == m { m } else { m + 1 };
+    let length = n - offset;
+    if output.len() < length { return Err(PathError::OutputTooSmall); }
+    output[..length].copy_from_slice(&candidate[offset..n]);
+    Ok(Some(length))
+}
+
+#[cfg(test)]
+mod r115_namespace_relative_tests {
+    use super::*;
+
+    #[test]
+    fn canonicalize_each_side_and_retain_byte_exact_relative_path() {
+        let mut out = [0xa5u8; 32];
+        assert_eq!(copy_relative_under_root("//shared/./docs//report", "/shared/",
+            &mut out), Ok(Some(11)));
+        assert_eq!(&out[..11], b"docs/report");
+        assert!(out[11..].iter().all(|b| *b == 0xa5));
+        assert_eq!(copy_relative_under_root("/shared", "/shared", &mut out),
+            Ok(Some(0)));
+        assert_eq!(copy_relative_under_root("/", "/", &mut out),
+            Ok(Some(0)));
+        assert_eq!(copy_relative_under_root("/a/b", "/", &mut out),
+            Ok(Some(3)));
+        assert_eq!(&out[..3], b"a/b");
+    }
+
+    #[test]
+    fn sibling_prefix_and_parent_namespace_denied_without_output_mutation() {
+        let mut out = [0x51u8; 20];
+        for (path, root) in [
+            ("/sharedness/private", "/shared"),
+            ("/share", "/shared"),
+            ("/sh", "/shared"),
+            ("/etc", "/shared"),
+            ("/a", "/a/b"),
+        ] {
+            assert_eq!(copy_relative_under_root(path, root, &mut out), Ok(None));
+            assert_eq!(out, [0x51; 20]);
+        }
+    }
+
+    #[test]
+    fn malformed_paths_roots_and_short_buffers_fail_atomically() {
+        let mut out = [0x33u8; 4];
+        for (path, root, error) in [
+            ("/shared/../etc", "/shared", PathError::ParentTraversal),
+            ("/shared/item", "/shared/..", PathError::ParentTraversal),
+            ("shared/item", "/shared", PathError::Relative),
+            ("/shared/item", "shared", PathError::Relative),
+            ("/shared/\0secret", "/shared", PathError::EmbeddedNul),
+            ("/shared/item", "/shared/\0", PathError::EmbeddedNul),
+            ("/shared/12345", "/shared", PathError::OutputTooSmall),
+        ] {
+            assert_eq!(copy_relative_under_root(path, root, &mut out),
+                Err(error));
+            assert_eq!(out, [0x33; 4]);
+        }
+    }
+
+    #[test]
+    fn exact_capacity_utf8_and_component_byte_limits() {
+        let mut exact = [0u8; 3];
+        assert_eq!(copy_relative_under_root("/αβ", "/", &mut exact),
+            Err(PathError::OutputTooSmall));
+        assert_eq!(exact, [0; 3]);
+        let mut utf8 = [0x77u8; 5];
+        assert_eq!(copy_relative_under_root("/αβ", "/", &mut utf8),
+            Ok(Some(4)));
+        assert_eq!(&utf8[..4], "αβ".as_bytes());
+        assert_eq!(utf8[4], 0x77);
+        let long = format!("/shared/{}", "a".repeat(MAX_COMPONENT_BYTES + 1));
+        assert_eq!(copy_relative_under_root(&long, "/shared", &mut utf8),
+            Err(PathError::ComponentTooLong));
+        assert_eq!(utf8[4], 0x77);
+    }
+}

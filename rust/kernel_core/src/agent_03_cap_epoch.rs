@@ -434,3 +434,102 @@ impl<const N:usize> LeaseTable<N>{
    TimedGrant{grant:stale,expires_at:20},5),Err(LeaseFault::Invalid));
  }
 }
+
+
+
+/// R115: revoke multiple time-limited grants as one exact-incarnation
+/// operation, without allowing a stale PID to evict its successor's lease.
+/// A caller must provide kernel-validated resource identities.
+impl<const N: usize> LeaseTable<N> {
+    pub fn revoke_batch(
+        &mut self, identities: &[(u32, u64, u32)],
+    ) -> Result<usize, LeaseFault> {
+        let mut candidate = *self;
+        for (i, &(pid, generation, resource)) in identities.iter().enumerate() {
+            if pid == 0 || generation == 0 {
+                return Err(LeaseFault::Invalid);
+            }
+            if identities[..i].contains(&(pid, generation, resource)) {
+                return Err(LeaseFault::Duplicate);
+            }
+            let at = candidate.entries.iter().position(|entry| entry.is_some_and(
+                |lease| lease.grant.owner == pid
+                    && lease.grant.generation == generation
+                    && lease.grant.resource == resource
+            )).ok_or(LeaseFault::Missing)?;
+            candidate.entries[at] = None;
+        }
+        *self = candidate;
+        Ok(identities.len())
+    }
+}
+
+#[cfg(test)]
+mod r115_atomic_capability_teardown_tests {
+    use super::*;
+    fn parent() -> Grant {
+        Grant { owner: 1, resource: 6, rights: 7, epoch: 4,
+            generation: 3, revoked: false }
+    }
+    fn request() -> Request {
+        Request { caller: 1, resource: 6, required_rights: 1,
+            current_epoch: 4, current_generation: 3 }
+    }
+    fn child(owner: u32, generation: u64) -> TimedGrant {
+        TimedGrant { grant: Grant { owner, resource: 6, rights: 1,
+            epoch: 4, generation, revoked: false }, expires_at: 100 }
+    }
+    fn setup() -> LeaseTable<3> {
+        let mut t = LeaseTable::<3>::new();
+        for (pid, generation) in [(10, 8), (11, 9), (12, 10)] {
+            t.delegate(parent(), request(), child(pid, generation), 1).unwrap();
+        }
+        t
+    }
+
+    #[test]
+    fn revokes_exact_identities_without_disturbing_a_peer() {
+        let mut t = setup();
+        assert_eq!(t.revoke_batch(&[(10, 8, 6), (12, 10, 6)]), Ok(2));
+        assert_eq!(t.len(), 1);
+        let c = |pid, gen| Request { caller: pid, resource: 6, required_rights: 1,
+            current_epoch: 4, current_generation: gen };
+        assert_eq!(t.check(c(10, 8), 2), Err(LeaseFault::Missing));
+        assert_eq!(t.check(c(12, 10), 2), Err(LeaseFault::Missing));
+        assert_eq!(t.check(c(11, 9), 2), Ok(()));
+    }
+
+    #[test]
+    fn stale_identity_and_missing_resource_are_fail_atomic() {
+        let mut t = setup();
+        for wrong in [(11, 8, 6), (11, 9, 99), (99, 9, 6)] {
+            assert_eq!(t.revoke_batch(&[(10, 8, 6), wrong]),
+                Err(LeaseFault::Missing));
+            assert_eq!(t.len(), 3);
+        }
+    }
+
+    #[test]
+    fn invalid_and_duplicate_requests_do_not_partially_revoke() {
+        let mut t = setup();
+        for invalid in [(0, 9, 6), (11, 0, 6)] {
+            assert_eq!(t.revoke_batch(&[(10, 8, 6), invalid]),
+                Err(LeaseFault::Invalid));
+            assert_eq!(t.len(), 3);
+        }
+        assert_eq!(t.revoke_batch(&[(10, 8, 6), (10, 8, 6)]),
+            Err(LeaseFault::Duplicate));
+        assert_eq!(t.len(), 3);
+    }
+
+    #[test]
+    fn empty_and_zero_capacity_never_mutate() {
+        let mut t = setup();
+        assert_eq!(t.revoke_batch(&[]), Ok(0));
+        assert_eq!(t.len(), 3);
+        let mut empty = LeaseTable::<0>::new();
+        assert_eq!(empty.revoke_batch(&[]), Ok(0));
+        assert_eq!(empty.revoke_batch(&[(1, 1, 6)]), Err(LeaseFault::Missing));
+        assert_eq!(empty.len(), 0);
+    }
+}

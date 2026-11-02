@@ -182,3 +182,87 @@ mod r114_udp_epoch_tests {
         assert_eq!(one.move_port(0,1,1,2),Err(Error::Invalid));
     }
 }
+
+
+
+/// R115: exact-owner, all-or-nothing UDP grant withdrawal. The scheduler must
+/// authenticate each PID/generation; this is a policy-table operation, not a
+/// network-device shutdown.
+impl<const N: usize> Registry<N> {
+    pub fn unbind_batch(&mut self, grants: &[Grant]) -> Result<usize, Error> {
+        let mut candidate = Self { entries: self.entries };
+        for (i, grant) in grants.iter().enumerate() {
+            if grant.pid == 0 || grant.generation == 0 || grant.port == 0 {
+                return Err(Error::Invalid);
+            }
+            if grants[..i].iter().any(|prior| prior.port == grant.port) {
+                return Err(Error::Duplicate);
+            }
+            candidate.unbind(grant.pid, grant.generation, grant.port)?;
+        }
+        self.entries = candidate.entries;
+        Ok(grants.len())
+    }
+}
+
+#[cfg(test)]
+mod r115_atomic_udp_release_tests {
+    use super::*;
+    fn g(pid: u32, generation: u64, port: u16) -> Grant {
+        Grant { pid, generation, port }
+    }
+
+    #[test]
+    fn exact_multi_owner_release_is_atomic_and_preserves_peer() {
+        let mut p = Registry::<4>::new();
+        for (pid, port) in [(1, 6001), (1, 6002), (2, 6003), (3, 6004)] {
+            p.bind(pid, 7, port).unwrap();
+        }
+        assert_eq!(p.unbind_batch(&[g(1, 7, 6001), g(2, 7, 6003)]),
+            Ok(2));
+        assert_eq!(p.active_count(), 2);
+        assert_eq!(p.authorize(1, 7, 6001), Err(Error::Denied));
+        assert_eq!(p.authorize(2, 7, 6003), Err(Error::Denied));
+        assert_eq!(p.authorize(1, 7, 6002), Ok(()));
+        assert_eq!(p.authorize(3, 7, 6004), Ok(()));
+    }
+
+    #[test]
+    fn stale_or_forged_owner_cannot_partially_withdraw() {
+        let mut p = Registry::<3>::new();
+        p.bind(1, 7, 6001).unwrap();
+        p.bind(2, 9, 6002).unwrap();
+        for bad in [g(2, 8, 6002), g(7, 9, 6002), g(2, 9, 65535)] {
+            assert_eq!(p.unbind_batch(&[g(1, 7, 6001), bad]),
+                Err(Error::Denied));
+            assert_eq!(p.authorize(1, 7, 6001), Ok(()));
+            assert_eq!(p.authorize(2, 9, 6002), Ok(()));
+        }
+    }
+
+    #[test]
+    fn duplicates_and_invalid_grants_preserve_existing_authority() {
+        let mut p = Registry::<2>::new();
+        p.bind(1, 1, 88).unwrap();
+        for invalid in [g(0, 1, 90), g(2, 0, 90), g(2, 1, 0)] {
+            assert_eq!(p.unbind_batch(&[g(1, 1, 88), invalid]),
+                Err(Error::Invalid));
+            assert_eq!(p.authorize(1, 1, 88), Ok(()));
+        }
+        assert_eq!(p.unbind_batch(&[g(1, 1, 88), g(1, 1, 88)]),
+            Err(Error::Duplicate));
+        assert_eq!(p.authorize(1, 1, 88), Ok(()));
+    }
+
+    #[test]
+    fn empty_and_zero_capacity_are_safe() {
+        let mut empty = Registry::<0>::new();
+        assert_eq!(empty.unbind_batch(&[]), Ok(0));
+        assert_eq!(empty.unbind_batch(&[g(1, 1, 1)]), Err(Error::Denied));
+        assert_eq!(empty.active_count(), 0);
+        let mut one = Registry::<1>::new();
+        one.bind(1, 1, 1).unwrap();
+        assert_eq!(one.unbind_batch(&[]), Ok(0));
+        assert_eq!(one.active_count(), 1);
+    }
+}

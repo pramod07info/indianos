@@ -148,12 +148,12 @@ pub fn advance_epoch<D:BlockDevice,T:TrustedBootMeasurement>(
 mod tests {
  use super::*;
  use crate::block::{BlockError,SECTOR_BYTES};
- struct Trusted([u8;32]);
+ pub(super) struct Trusted(pub(super) [u8;32]);
  impl TrustedBootMeasurement for Trusted {
   fn read_verified(&self)->Result<[u8;32],Error>{Ok(self.0)}
  }
- struct Disk {
-  sectors:[[u8;SECTOR_BYTES];2],writes:usize,flushed:bool,
+ pub(super) struct Disk {
+  pub(super) sectors:[[u8;SECTOR_BYTES];2],pub(super) writes:usize,pub(super) flushed:bool,
   fail_sync:bool,damage:bool,
  }
  impl BlockDevice for Disk {
@@ -173,8 +173,8 @@ mod tests {
    self.flushed=true;Ok(())
   }
  }
- fn slot()->Slot{Slot{valid_metadata:true,committed:true,version:9,attempts_remaining:2}}
- fn fixture()->Disk{
+ pub(super) fn slot()->Slot{Slot{valid_metadata:true,committed:true,version:9,attempts_remaining:2}}
+ pub(super) fn fixture()->Disk{
   let r=EpochRecord{epoch:4,journal_generation:20,selected_slot:0,slot_version:9,
     boot_measurement:[3;32],preceding_digest:[2;32]};
   let bytes=encode(r).unwrap();
@@ -233,4 +233,80 @@ mod tests {
   assert_eq!(recover(&mut d),Err(Error::Invalid));
   assert_eq!(d.writes,0);
  }
+}
+
+
+
+/// R115: read-only, cryptographically sourced epoch observation. A verified
+/// measurement must match the newest valid on-disk epoch and its two-sector
+/// predecessor chain. This is NOT TPM attestation or bootloader integration.
+pub fn observe_verified_epoch<D: BlockDevice, T: TrustedBootMeasurement>(
+    disk: &mut D, trusted: &T,
+) -> Result<EpochRecord, Error> {
+    let measurement = trusted.read_verified()?;
+    if measurement == [0; 32] { return Err(Error::Untrusted); }
+    let (latest, _, _) = recover(disk)?;
+    if latest.boot_measurement != measurement { return Err(Error::Stale); }
+    Ok(latest)
+}
+
+#[cfg(test)]
+mod r115_boot_observation_tests {
+    use super::*;
+
+    #[test]
+    fn verified_observation_does_not_mutate_media() {
+        let mut d = tests::fixture();
+        let record = observe_verified_epoch(&mut d, &tests::Trusted([3; 32]))
+            .unwrap();
+        assert_eq!(record.epoch, 4);
+        assert_eq!(record.journal_generation, 20);
+        assert_eq!(record.selected_slot, 0);
+        assert_eq!(record.slot_version, 9);
+        assert_eq!(record.boot_measurement, [3; 32]);
+        assert_eq!(d.writes, 0);
+        assert!(!d.flushed);
+    }
+
+    #[test]
+    fn mismatched_and_zero_measurements_never_authorize() {
+        let mut d = tests::fixture();
+        assert_eq!(observe_verified_epoch(&mut d, &tests::Trusted([4; 32])),
+            Err(Error::Stale));
+        assert_eq!(observe_verified_epoch(&mut d, &tests::Trusted([0; 32])),
+            Err(Error::Untrusted));
+        assert_eq!(d.writes, 0);
+    }
+
+    #[test]
+    fn forged_chain_and_divergent_copies_are_rejected() {
+        let mut d = tests::fixture();
+        let mut second = decode(&d.sectors[1]).unwrap();
+        second.epoch += 1;
+        second.preceding_digest = [7; 32];
+        d.sectors[1] = encode(second).unwrap();
+        assert_eq!(observe_verified_epoch(&mut d, &tests::Trusted([3; 32])),
+            Err(Error::Invalid));
+        assert_eq!(d.writes, 0);
+        let mut d = tests::fixture();
+        let mut second = decode(&d.sectors[1]).unwrap();
+        second.slot_version += 1;
+        d.sectors[1] = encode(second).unwrap();
+        assert_eq!(observe_verified_epoch(&mut d, &tests::Trusted([3; 32])),
+            Err(Error::Invalid));
+        assert_eq!(d.writes, 0);
+    }
+
+    #[test]
+    fn valid_next_epoch_becomes_observable_without_extra_writes() {
+        let mut d = tests::fixture();
+        let next = advance_epoch(&mut d, &tests::Trusted([5; 32]),
+            4, 0, tests::slot(), 21).unwrap();
+        let writes = d.writes;
+        assert_eq!(observe_verified_epoch(&mut d, &tests::Trusted([5; 32])),
+            Ok(next));
+        assert_eq!(d.writes, writes);
+        assert_eq!(observe_verified_epoch(&mut d, &tests::Trusted([3; 32])),
+            Err(Error::Stale));
+    }
 }

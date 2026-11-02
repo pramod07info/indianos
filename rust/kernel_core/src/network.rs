@@ -284,9 +284,12 @@ pub fn run_demo<D:EthernetDevice>(
     let mut alternatives=crate::agent_06_ipv4_route::FailoverRoutes::<2>::new();
     use crate::agent_06_ipv4_route::{RouteCandidate,Route};
     let r=Route{network:0x0a07_0000,prefix:24,next_hop:0};
-    alternatives.add(RouteCandidate{
+    // Trusted QEMU logical test clock only. Production must source now
+    // from the kernel monotonic timer, never ring-3 or packet headers.
+    let initial_clock=100u64;
+    alternatives.add_dhcp_lease(RouteCandidate{
         route:r,metric:1,link:1,epoch:1,healthy:true
-    }).map_err(|_|Error::Unexpected)?;
+    },initial_clock,120).map_err(|_|Error::Unexpected)?;
     alternatives.add(RouteCandidate{
         route:r,metric:10,link:2,epoch:1,healthy:true
     }).map_err(|_|Error::Unexpected)?;
@@ -294,11 +297,13 @@ pub fn run_demo<D:EthernetDevice>(
     if alternatives.resolve(destination).map(|r|r.link)!=Some(1){
         return Err(Error::Unexpected)
     }
-    transmit_owned_ipv4(dev,&routes,route_owner,1,PEER_IP,
+    transmit_leased_ipv4(dev,&routes,&alternatives,route_owner,1,
+        initial_clock+1,PEER_IP,
         |b,mac|udp_frame(b,mac,PEER_UDP_PORT,UDP_REQ,0x2803))?;
     let ingress=|frame:&[u8],mac:[u8;6]|{
         parse_udp(frame,mac,PEER_UDP_PORT).is_ok_and(|data|data==UDP_RESP)
-            && udp_endpoints.ingest_owned_frame(1,1,CLIENT_PORT,frame,mac).is_ok()
+            && udp_endpoints.ingest_registered_frame(
+                &registry,1,1,CLIENT_PORT,frame,mac).is_ok()
     };
     // Do not treat malformed network replies as successful failover evidence.
     // In the QEMU test the peer confirms packet reception but blackholes
@@ -313,11 +318,13 @@ pub fn run_demo<D:EthernetDevice>(
                 return Err(Error::Unexpected);
             }
             stage(b"IndianOS: R114 QEMU primary UDP path timed out and backup route selected\n\0");
-            transmit_owned_ipv4(dev,&routes,route_owner,1,PEER_IP,
+            transmit_leased_ipv4(dev,&routes,&alternatives,route_owner,1,
+                initial_clock+20,PEER_IP,
                 |b,mac|udp_frame(b,mac,PEER_UDP_PORT,UDP_REQ,0x2808))?;
             wait_for(dev,|frame,mac|{
                 parse_udp(frame,mac,PEER_UDP_PORT).is_ok_and(|data|data==UDP_RESP)
-                    && udp_endpoints.ingest_owned_frame(1,1,CLIENT_PORT,frame,mac).is_ok()
+                    && udp_endpoints.ingest_registered_frame(
+                &registry,1,1,CLIENT_PORT,frame,mac).is_ok()
             })?;
         },
         // The failure-injection acceptance requires the primary to become
@@ -329,10 +336,12 @@ pub fn run_demo<D:EthernetDevice>(
         .map_err(|_| Error::Unexpected)?;
     if &udp_reply[..bytes] != UDP_RESP { return Err(Error::Unexpected); }
     stage(b"IndianOS: R028 IPv4 UDP echo PASSED\n\0");
-    transmit_owned_ipv4(dev,&routes,route_owner,1,PEER_IP,dns_query)?;
+    transmit_leased_ipv4(dev,&routes,&alternatives,route_owner,1,
+        initial_clock+21,PEER_IP,dns_query)?;
     wait_for(dev,|frame,mac|{
         valid_dns(frame,mac) &&
-            udp_endpoints.ingest_owned_frame(1,1,CLIENT_PORT,frame,mac).is_ok()
+            udp_endpoints.ingest_registered_frame(
+                &registry,1,1,CLIENT_PORT,frame,mac).is_ok()
     })?;
     let mut dns_reply=[0u8;R033_UDP_BYTES];
     let dns_bytes=udp_endpoints.receive(1,1,CLIENT_PORT,&mut dns_reply)
@@ -1103,6 +1112,19 @@ impl<const PORTS:usize,const QUEUE:usize> EpochUdpEndpoints<PORTS,QUEUE> {
         }
         self.endpoints.ingest_ethernet_frame(frame,mac)
     }
+    /// R115: actual NIC ingress must check BOTH live port tables before
+    /// parsing or queueing the peer frame. The registry and endpoints must
+    /// be owned by the single-BSP kernel network supervisor.
+    pub fn ingest_registered_frame<const N:usize>(
+        &mut self,
+        registry:&crate::udp_owner_epoch::Registry<N>,
+        pid:u32,generation:u64,port:u16,
+        frame:&[u8],mac:[u8;6],
+    )->Result<(),IngressError>{
+        registry.authorize(pid,generation,port)
+            .map_err(|_|IngressError::Endpoint(SocketError::Denied))?;
+        self.ingest_owned_frame(pid,generation,port,frame,mac)
+    }
     pub fn pending_owned(&self,pid:u32,generation:u64)
         ->Result<usize,SocketError>{
         if !self.authenticated(pid,generation){return Err(SocketError::Denied);}
@@ -1381,4 +1403,295 @@ mod r114_dns_owner_reconnect_tests {
   assert!(!valid_dns(&bad[..n],mac));
   assert_eq!(endpoint.pending_owned(1,2),Ok(0));
  }
+}
+
+
+
+// R115: kernel-owned port withdrawal coordinates both policy registry and
+// actual live socket/queue state. Validate the whole batch before mutation;
+// only one serialized supervisor can call this with scheduler-issued identity.
+impl<const PORTS:usize,const QUEUE:usize> EpochUdpEndpoints<PORTS,QUEUE> {
+    pub fn close_registered_batch<const N:usize>(
+        &mut self,registry:&mut crate::udp_owner_epoch::Registry<N>,
+        grants:&[crate::udp_owner_epoch::Grant],
+    )->Result<usize,SocketError>{
+        use crate::udp_owner_epoch::Error as GrantError;
+        // Validate against the live registry and reject duplicate requests
+        // before touching either the registry or the socket queue.
+        for (i,grant) in grants.iter().enumerate(){
+            if grant.pid==0||grant.generation==0||grant.port==0{
+                return Err(SocketError::Invalid)
+            }
+            if grants[..i].iter().any(|g|g.port==grant.port){
+                return Err(SocketError::Duplicate)
+            }
+            if registry.authorize(grant.pid,grant.generation,grant.port).is_err()||
+               !self.authenticated(grant.pid,grant.generation)||
+               !self.endpoints.owns(grant.pid,grant.port){
+                return Err(SocketError::Denied)
+            }
+        }
+        // Kernel scheduler serializes this operation. The entire registry
+        // transaction is all-or-nothing; a failed batch cannot drop packets.
+        registry.unbind_batch(grants).map_err(|e|match e{
+            GrantError::Invalid=>SocketError::Invalid,
+            GrantError::Duplicate=>SocketError::Duplicate,
+            _=>SocketError::Denied,
+        })?;
+        for grant in grants {
+            // Preflight above proved this exact owner/port in the socket
+            // table; there is no fallible device I/O in close().
+            self.close(grant.pid,grant.generation,grant.port)?;
+        }
+        Ok(grants.len())
+    }
+}
+#[cfg(test)]
+mod r115_registered_socket_batch_tests{
+    use super::*;
+    use crate::udp_owner_epoch::{Registry,Grant};
+    fn g(pid:u32,generation:u64,port:u16)->Grant{
+        Grant{pid,generation,port}
+    }
+    #[test]
+    fn real_socket_close_rejects_stale_and_preserves_peer_traffic(){
+        let mut sockets=EpochUdpEndpoints::<4,6>::new();
+        let mut owners=Registry::<4>::new();
+        sockets.bind_registered(&mut owners,7,1,5001).unwrap();
+        sockets.bind_registered(&mut owners,7,1,5002).unwrap();
+        sockets.bind_registered(&mut owners,8,3,5003).unwrap();
+        sockets.send_local(8,3,5003,5001,b"obsolete").unwrap();
+        sockets.send_local(7,1,5002,5003,b"peer").unwrap();
+        assert_eq!(sockets.close_registered_batch(&mut owners,
+            &[g(7,1,5001),g(8,2,5003)]),Err(SocketError::Denied));
+        assert_eq!(owners.active_count(),3);
+        assert_eq!(sockets.pending_owned(7,1),Ok(1));
+        assert_eq!(sockets.pending_owned(8,3),Ok(1));
+        assert_eq!(sockets.close_registered_batch(&mut owners,
+            &[g(7,1,5001),g(7,1,5002)]),Ok(2));
+        assert_eq!(owners.active_count(),1);
+        assert_eq!(sockets.pending_owned(7,1),Err(SocketError::Denied));
+        let mut out=[0u8;8];
+        assert_eq!(sockets.receive(8,3,5003,&mut out),Ok(4));
+        assert_eq!(&out[..4],b"peer");
+        sockets.bind_registered(&mut owners,7,2,5001).unwrap();
+        assert_eq!(sockets.receive(7,2,5001,&mut out),Err(SocketError::Empty));
+    }
+    #[test]
+    fn malformed_duplicate_batch_is_transactional(){
+        let mut sockets=EpochUdpEndpoints::<2,2>::new();
+        let mut owners=Registry::<2>::new();
+        sockets.bind_registered(&mut owners,7,1,8000).unwrap();
+        assert_eq!(sockets.close_registered_batch(&mut owners,
+            &[g(7,1,8000),g(7,1,8000)]),Err(SocketError::Duplicate));
+        assert_eq!(owners.active_count(),1);
+        assert_eq!(sockets.close_registered_batch(&mut owners,
+            &[g(7,1,8000),g(0,1,8)]),Err(SocketError::Invalid));
+        assert_eq!(owners.authorize(7,1,8000),Ok(()));
+        assert_eq!(sockets.close_registered_batch(&mut owners,&[]),Ok(0));
+    }
+}
+
+
+
+/// R115: transmit a packet only while an authenticated route policy AND a
+/// time-scoped link receipt are current. The timestamp must be obtained from
+/// a trusted monotonic kernel clock; a user-supplied value is not authority.
+/// This QEMU-facing API checks the lease before writing to EthernetDevice.
+pub fn transmit_leased_ipv4<D:EthernetDevice,const N:usize,const M:usize>(
+    dev:&mut D,
+    routes:&crate::agent_06_ipv4_route::OwnerRoutes<N>,
+    links:&crate::agent_06_ipv4_route::FailoverRoutes<M>,
+    owner:crate::batch5_session::Identity,
+    owner_epoch:u64,now:u64,destination:[u8;4],
+    constructor:impl FnOnce(&mut [u8],[u8;6])->usize,
+)->Result<(),Error>{
+    let dest=u32::from_be_bytes(destination);
+    let receipt=links.receipt_at(dest,now).ok_or(Error::Unexpected)?;
+    if !links.receipt_is_current_at(dest,now,receipt){
+        return Err(Error::Unexpected)
+    }
+    let policy=routes.select(owner,owner_epoch,dest)
+        .map_err(|_|Error::Unexpected)?.ok_or(Error::Unexpected)?;
+    if policy!=receipt.selected.route{return Err(Error::Unexpected)}
+    transmit_owned_ipv4(dev,routes,owner,owner_epoch,destination,constructor)
+}
+#[cfg(test)]
+mod r115_transmit_lease_enforcement_tests {
+    use super::*;
+    use crate::agent_06_ipv4_route::{FailoverRoutes,OwnerRoutes,Route,RouteCandidate};
+    use crate::batch5_session::Identity;
+    struct Fake{sent:u32}
+    impl EthernetDevice for Fake {
+        fn mac(&self)->[u8;6]{[0x52,0x54,0,0x12,0x34,0x56]}
+        fn send(&mut self,_f:&[u8])->Result<(),Error>{self.sent+=1;Ok(())}
+        fn poll(&mut self,_o:&mut[u8])->Result<Option<usize>,Error>{Ok(None)}
+    }
+    #[test]
+    fn expired_link_cannot_send_and_fallback_can_send(){
+        let id=Identity{pid:1,generation:1};
+        let mut owned=OwnerRoutes::<1>::new();
+        owned.bind_kernel(id,1).unwrap();
+        let route=Route{network:0x0a07_0000,prefix:24,next_hop:0};
+        owned.publish(id,1,&[route]).unwrap();
+        let mut links=FailoverRoutes::<2>::new();
+        links.add_dhcp_lease(RouteCandidate{
+            route,metric:1,link:1,epoch:1,healthy:true},10,20).unwrap();
+        links.add(RouteCandidate{route,metric:10,link:2,epoch:1,healthy:true}).unwrap();
+        let mut nic=Fake{sent:0};
+        let send=|nic:&mut Fake, now, available:&FailoverRoutes<2>|transmit_leased_ipv4(
+            nic,&owned,available,id,1,now,PEER_IP,
+            |buf,mac|udp_frame(buf,mac,PEER_UDP_PORT,b"proof",1));
+        assert_eq!(send(&mut nic,19,&links),Ok(()));
+        assert_eq!(send(&mut nic,20,&links),Ok(())); // safe backup route
+        assert_eq!(nic.sent,2);
+        links.expire_link(2,1);
+        assert_eq!(send(&mut nic,20,&links),Err(Error::Unexpected));
+        assert_eq!(nic.sent,2);
+        assert_eq!(send(&mut nic,19,&links),Ok(())); // primary lease still live
+        assert_eq!(nic.sent,3);
+        links.expire_link(1,1);
+        assert_eq!(send(&mut nic,19,&links),Err(Error::Unexpected));
+        assert_eq!(nic.sent,3);
+    }
+    #[test]
+    fn denied_policy_or_wrong_route_cannot_write_to_nic(){
+        let id=Identity{pid:1,generation:1};
+        let mut owned=OwnerRoutes::<1>::new();
+        owned.bind_kernel(id,1).unwrap();
+        owned.publish(id,1,&[Route{
+            network:0x0a07_0000,prefix:24,next_hop:0
+        }]).unwrap();
+        let mut links=FailoverRoutes::<1>::new();
+        links.add(RouteCandidate{route:Route{
+            network:0,prefix:0,next_hop:0
+        },metric:1,link:2,epoch:1,healthy:true}).unwrap();
+        let mut nic=Fake{sent:0};
+        assert_eq!(transmit_leased_ipv4(&mut nic,&owned,&links,id,1,12,PEER_IP,
+            |buf,mac|udp_frame(buf,mac,PEER_UDP_PORT,b"proof",1)),
+            Err(Error::Unexpected));
+        assert_eq!(nic.sent,0);
+        assert_eq!(transmit_leased_ipv4(&mut nic,&owned,&links,
+            Identity{pid:1,generation:2},1,12,PEER_IP,
+            |buf,mac|udp_frame(buf,mac,PEER_UDP_PORT,b"proof",1)),
+            Err(Error::Unexpected));
+        assert_eq!(nic.sent,0);
+    }
+}
+
+
+#[cfg(test)]
+mod r115_scheduler_socket_lifecycle_tests {
+    use super::*;
+    use crate::udp_owner_epoch::{Error as OwnerError, Grant, Registry};
+
+    fn grant(pid:u32,generation:u64,port:u16)->Grant {
+        Grant{pid,generation,port}
+    }
+
+    #[test]
+    fn live_scheduler_exit_revokes_exact_generation_but_not_peer() {
+        let mut sockets=EpochUdpEndpoints::<3,6>::new();
+        let mut owners=Registry::<3>::new();
+        sockets.bind_registered(&mut owners,1,10,5501).unwrap();
+        sockets.bind_registered(&mut owners,2,20,5502).unwrap();
+        sockets.send_local(1,10,5501,5502,b"old").unwrap();
+        sockets.send_local(2,20,5502,5501,b"departing").unwrap();
+        assert_eq!(sockets.retire_registered(&mut owners,2,21),
+                   Err(SocketError::Denied));
+        assert_eq!(owners.authorize(2,20,5502),Ok(()));
+        assert_eq!(sockets.retire_registered(&mut owners,2,20),Ok(1));
+        assert_eq!(owners.authorize(2,20,5502),Err(OwnerError::Denied));
+        assert_eq!(sockets.receive(2,20,5502,&mut [0u8;16]),
+                   Err(SocketError::Denied));
+        assert_eq!(sockets.receive(1,10,5501,&mut [0u8;16]),Ok(9));
+        sockets.bind_registered(&mut owners,2,21,5502).unwrap();
+        assert_eq!(sockets.receive(2,21,5502,&mut [0u8;16]),
+                   Err(SocketError::Empty));
+        assert_eq!(owners.owner_of(5502),Some(grant(2,21,5502)));
+        assert_eq!(owners.owner_of(5501),Some(grant(1,10,5501)));
+    }
+
+    #[test]
+    fn syscall_close_releases_both_tables_and_blocks_replayed_generation() {
+        let mut sockets=EpochUdpEndpoints::<2,4>::new();
+        let mut owners=Registry::<2>::new();
+        sockets.bind_registered(&mut owners,1,4,5501).unwrap();
+        sockets.bind_registered(&mut owners,2,5,5502).unwrap();
+        sockets.send_local(2,5,5502,5501,b"discard").unwrap();
+        assert_eq!(sockets.close_registered_batch(&mut owners,
+                  &[grant(1,3,5501)]),Err(SocketError::Denied));
+        assert_eq!(owners.active_count(),2);
+        assert_eq!(sockets.close_registered_batch(&mut owners,
+                  &[grant(1,4,5501)]),Ok(1));
+        assert_eq!(owners.owner_of(5501),None);
+        assert_eq!(sockets.pending_owned(1,4),Err(SocketError::Denied));
+        sockets.bind_registered(&mut owners,1,6,5501).unwrap();
+        assert_eq!(sockets.receive(1,6,5501,&mut [0u8;16]),
+                   Err(SocketError::Empty));
+        assert_eq!(owners.authorize(1,4,5501),Err(OwnerError::Denied));
+        assert_eq!(owners.authorize(2,5,5502),Ok(()));
+    }
+}
+
+
+#[cfg(test)]
+mod r115_registered_ingress_authority_tests {
+    use super::*;
+    use crate::udp_owner_epoch::Registry;
+    const MAC:[u8;6]=[0x52,0x54,0,0x12,0x34,0x56];
+
+    fn packet(port:u16)->([u8;FRAME_CAP],usize){
+        let mut frame=[0u8;FRAME_CAP];
+        ethernet_header(&mut frame,MAC,PEER_MAC,0x0800);
+        ipv4_header(&mut frame[14..34],17,12,0x1234);
+        frame[26..30].copy_from_slice(&PEER_IP);
+        frame[30..34].copy_from_slice(&LOCAL_IP);
+        put16(&mut frame,24,0);
+        let cs=checksum(&frame[14..34]);
+        put16(&mut frame,24,cs);
+        let udp=&mut frame[34..46];
+        put16(udp,0,PEER_UDP_PORT);
+        put16(udp,2,port);
+        put16(udp,4,12);
+        udp[8..12].copy_from_slice(b"pass");
+        let check=transport_sum(&PEER_IP,&LOCAL_IP,17,udp);
+        put16(udp,6,if check==0{0xffff}else{check});
+        (frame,46)
+    }
+
+    #[test]
+    fn parser_never_queues_without_matching_kernel_port_registry() {
+        let mut sockets=EpochUdpEndpoints::<2,4>::new();
+        let mut registry=Registry::<2>::new();
+        sockets.bind(7,2,5000).unwrap();
+        let (p,n)=packet(5000);
+        assert_eq!(sockets.ingest_registered_frame(&registry,7,2,5000,&p[..n],MAC),
+          Err(IngressError::Endpoint(SocketError::Denied)));
+        assert_eq!(sockets.pending_owned(7,2),Ok(0));
+        registry.bind(7,2,5000).unwrap();
+        assert_eq!(sockets.ingest_registered_frame(&registry,7,1,5000,&p[..n],MAC),
+          Err(IngressError::Endpoint(SocketError::Denied)));
+        assert_eq!(sockets.ingest_registered_frame(&registry,7,2,5000,&p[..n],MAC),Ok(()));
+        registry.revoke_owner(7,2).unwrap();
+        assert_eq!(sockets.ingest_registered_frame(&registry,7,2,5000,&p[..n],MAC),
+          Err(IngressError::Endpoint(SocketError::Denied)));
+        assert_eq!(sockets.pending_owned(7,2),Ok(1)); // denied packet was not added
+    }
+
+    #[test]
+    fn valid_peer_survives_other_owner_epoch_retirement() {
+        let mut sockets=EpochUdpEndpoints::<2,4>::new();
+        let mut registry=Registry::<2>::new();
+        sockets.bind_registered(&mut registry,7,2,5000).unwrap();
+        sockets.bind_registered(&mut registry,8,9,5001).unwrap();
+        sockets.retire_registered(&mut registry,7,2).unwrap();
+        let (p,n)=packet(5001);
+        assert_eq!(sockets.ingest_registered_frame(&registry,7,2,5001,&p[..n],MAC),
+          Err(IngressError::Endpoint(SocketError::Denied)));
+        assert_eq!(sockets.ingest_registered_frame(&registry,8,9,5001,&p[..n],MAC),Ok(()));
+        let mut out=[0u8;8];
+        assert_eq!(sockets.receive(8,9,5001,&mut out),Ok(4));
+        assert_eq!(&out[..4],b"pass");
+    }
 }
