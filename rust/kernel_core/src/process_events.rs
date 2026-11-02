@@ -915,3 +915,65 @@ mod r116_exit_event_generation_tests{
   assert_eq!(e.len(),1);
  }
 }
+
+
+/// R117: only a byte-for-byte matching head may be acknowledged; a stale
+/// process-incarnation receipt cannot dequeue a peer message or successor.
+/// Authentication of the consumer itself remains in the runtime supervisor.
+impl<const N:usize> ProcessEvents<N>{
+ pub fn acknowledge_exact_head(
+  &mut self,expected:ProcessEvent
+ )->Option<ProcessEvent>{
+  if expected.pid==0 || self.peek()!=Some(expected){return None;}
+  self.dequeue().ok()
+ }
+}
+#[cfg(test)]
+mod r117_exact_event_ack_tests {
+ use super::*;
+ fn e(pid:u32,kind:EventKind,value:u64)->ProcessEvent{
+  ProcessEvent{pid,kind,value}
+ }
+ #[test]fn exact_head_only_and_duplicate_ack_is_idempotent(){
+  let mut q=ProcessEvents::<2>::new();
+  let first=e(1,EventKind::Exited,5);
+  assert_eq!(q.acknowledge_exact_head(first),None);
+  q.enqueue(first).unwrap();
+  assert_eq!(q.acknowledge_exact_head(e(1,EventKind::Exited,6)),None);
+  assert_eq!(q.len(),1);
+  assert_eq!(q.acknowledge_exact_head(first),Some(first));
+  assert_eq!(q.acknowledge_exact_head(first),None);
+ }
+ #[test]fn stale_pid_message_and_successor_remain_untouched(){
+  let mut q=ProcessEvents::<3>::new();
+  let old=e(2,EventKind::Exited,9);
+  let newest=e(2,EventKind::Exited,10);
+  let peer=e(1,EventKind::Message,77);
+  q.enqueue(newest).unwrap();q.enqueue(peer).unwrap();
+  assert_eq!(q.acknowledge_exact_head(old),None);
+  assert_eq!(q.acknowledge_exact_head(peer),None);
+  assert_eq!(q.len(),2);
+  assert_eq!(q.acknowledge_exact_head(newest),Some(newest));
+  assert_eq!(q.acknowledge_exact_head(peer),Some(peer));
+ }
+ #[test]fn wrapped_queue_ack_preserves_fifo_and_capacity(){
+  let mut q=ProcessEvents::<2>::new();
+  let a=e(1,EventKind::Started,1);
+  let b=e(2,EventKind::Exited,2);
+  let c=e(1,EventKind::Exited,3);
+  q.enqueue(a).unwrap();q.enqueue(b).unwrap();
+  assert_eq!(q.acknowledge_exact_head(a),Some(a));
+  q.enqueue(c).unwrap();
+  assert_eq!(q.acknowledge_exact_head(c),None);
+  assert_eq!(q.acknowledge_exact_head(b),Some(b));
+  assert_eq!(q.acknowledge_exact_head(c),Some(c));
+ }
+ #[test]fn zero_capacity_and_invalid_pid_fail_closed(){
+  let mut zero=ProcessEvents::<0>::new();
+  assert_eq!(zero.acknowledge_exact_head(e(1,EventKind::Exited,1)),None);
+  let mut q=ProcessEvents::<1>::new();
+  q.enqueue(e(1,EventKind::Exited,8)).unwrap();
+  assert_eq!(q.acknowledge_exact_head(e(0,EventKind::Exited,8)),None);
+  assert_eq!(q.len(),1);
+ }
+}

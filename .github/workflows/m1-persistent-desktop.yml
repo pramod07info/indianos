@@ -11,6 +11,13 @@ on:
       - 'tools/test_r031_files_gui_qemu.py'
       - 'rust/kernel_core/src/hier_vfs.rs'
       - 'rust/kernel_core/src/lib.rs'
+      # R117: runtime and selected-volume changes must exercise the actual
+      # ring-3 Files graphical persistence gate, not host-only tests.
+      - 'rust/kernel_core/src/fs_handles.rs'
+      - 'rust/kernel_core/src/user_runtime.rs'
+      - 'rust/kernel_core/src/user_image.rs'
+      - 'rust/kernel_core/src/agent_03_cap_epoch.rs'
+      - 'rust/kernel_core/src/process_events.rs'
       - 'rust/kernel_core/Cargo.toml'
       - '.github/workflows/m1-persistent-desktop.yml'
   pull_request:
@@ -23,6 +30,13 @@ on:
       - 'tools/test_r031_files_gui_qemu.py'
       - 'rust/kernel_core/src/hier_vfs.rs'
       - 'rust/kernel_core/src/lib.rs'
+      # R117: runtime and selected-volume changes must exercise the actual
+      # ring-3 Files graphical persistence gate, not host-only tests.
+      - 'rust/kernel_core/src/fs_handles.rs'
+      - 'rust/kernel_core/src/user_runtime.rs'
+      - 'rust/kernel_core/src/user_image.rs'
+      - 'rust/kernel_core/src/agent_03_cap_epoch.rs'
+      - 'rust/kernel_core/src/process_events.rs'
       - 'rust/kernel_core/Cargo.toml'
       - '.github/workflows/m1-persistent-desktop.yml'
   workflow_dispatch:
@@ -61,9 +75,23 @@ jobs:
           # The physical mouse module is feature-gated to graphical QEMU.
           # Explicitly test its AUX/keyboard isolation and packet resync.
           cargo test --offline --manifest-path rust/kernel_core/Cargo.toml --features test-r031-files-gui m1_r047_
+      # R117: every actual changed runtime/lease/volume path has matching
+      # named negative controls in addition to the existing M1 filters.
+      - name: R117 exact-generation retirement, delegation and mount guards
+        run: |
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --features test-r031-vfs r117_
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --features test-r031-files-gui r117_
+          # Require actual user-copy page-translation and guard-page tests
+          # used by ring-3 syscall 33. Host tests do not replace a real
+          # adversarial QEMU guest pointer test.
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --features test-r031-files-gui r117_guest_
       - name: Build M1 durable VFS service interfaces in no_std mode
         run: |
           cargo check --offline --manifest-path rust/kernel_core/Cargo.toml --no-default-features --features test-r031-vfs
+      - name: Install freestanding target for R117 release-mode verification
+        run: rustup target add x86_64-unknown-none
+      - name: Require optimized freestanding kernel-core build, not only cargo check
+        run: cargo build --release --locked --offline --manifest-path rust/kernel_core/Cargo.toml --no-default-features --target x86_64-unknown-none
       - name: Install emulator and UEFI dependencies for real graphical Files disk test
         run: |
           # Github-hosted mirrors can download QEMU slowly. Preserve the

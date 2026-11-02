@@ -686,6 +686,22 @@ fn files_shared_listing(data:&mut [u8;256])->usize{
     if call(34,1,desc.as_ptr() as u64)!=u64::MAX{exit(224);}
     if file_handle_call(1,b"/shared/readme",0,3,data,0)!=u64::MAX{exit(225);}
     if file_handle_call(1,b"/shared/../etc/big",0,1,data,0)!=u64::MAX{exit(226);}
+    // R117: these addresses are fixed by the kernel's ProgramPlan for
+    // this x86-64 user ABI. Exercise actual INT 0x80 file and directory
+    // descriptor copies, including the unmapped stack guard and a partial
+    // descriptor that crosses USER_TOP. All calls must fail before disk I/O.
+    const USER_TOP:u64=0x0000_7fff_f000_0000;
+    const STACK_BYTES:u64=64*1024;
+    const PAGE_BYTES:u64=4096;
+    let guard=USER_TOP-STACK_BYTES-PAGE_BYTES;
+    for address in [
+        guard,guard+PAGE_BYTES-32,USER_TOP-32,USER_TOP,
+        u64::MAX-31,
+    ]{
+        if call(33,1,address)!=u64::MAX{exit(243);}
+        if call(34,1,address)!=u64::MAX{exit(244);}
+    }
+    write(b"R117 QEMU PID2 stack guard and crossing descriptor pointers denied");
     write(b"R114 PID2 ring3 invalid pointer, private path and denied write blocked");
     9
 }
@@ -952,6 +968,12 @@ fn r031_shell()->!{
         let mut received=[0u8;64];
         let n=local_udp(3,1,5501,0,received.as_mut_ptr() as u64,64);
         if n!=4||&received[..4]!=b"PING"{exit(232);}
+        // R117 actual ring-3 two-process denial. PID1 cannot close PID2's
+        // bound port by claiming PID2's identity, nor by substituting a
+        // foreign source port while claiming itself. PONG must still arrive.
+        if local_udp(4,2,5502,0,0,0)!=u64::MAX{exit(239);}
+        if local_udp(4,1,5502,0,0,0)!=u64::MAX{exit(240);}
+        write(b"R117 QEMU PID1 foreign PID2 UDP close attempts denied");
         local_send(1,5501,5502,b"PONG");
         write(b"R114 PID1 received PID2 UDP PING and replied");
         // Cooperative scheduler: give the peer a real dispatch opportunity
@@ -1090,6 +1112,11 @@ fn r031_files()->!{
         if local_udp(1,2,5501,0,0,0)!=u64::MAX{exit(234);}
         local_send(2,5502,5501,b"PING");
         write(b"R114 PID2 forged UDP owner and source port denied");
+        // A live PID1 port exists here. A forged PID1 close, or an
+        // authenticated PID2 request naming PID1's port, must not evict it.
+        if local_udp(4,1,5501,0,0,0)!=u64::MAX{exit(241);}
+        if local_udp(4,2,5501,0,0,0)!=u64::MAX{exit(242);}
+        write(b"R117 QEMU PID2 foreign PID1 UDP close attempts denied");
     }
     suite_send(1,b"FILES");
     write(b"R031.1 Files service registered and running");

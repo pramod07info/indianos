@@ -401,3 +401,67 @@ mod r116_rollback_floor_tests{
       &mut disk,&tests::Trusted([3;32]),floor()),Err(Error::Invalid));
  }
 }
+
+
+/// R117: before advancing a durable boot epoch, require an independently
+/// provided sealed floor for the *current* journal. A trusted measurement
+/// mismatch, rollback or invalid signed slot must fail before any mutation.
+/// This API does not itself provision the physical trust anchor.
+pub fn advance_epoch_guarded<D:BlockDevice,T:TrustedBootMeasurement>(
+ disk:&mut D,trust:&T,old_epoch:u64,
+ selected:usize,slot:Slot,journal_generation:u64,
+ floor:SealedBootFloor,
+)->Result<EpochRecord,Error>{
+ let prior=observe_with_sealed_floor(disk,trust,floor)?;
+ if prior.epoch!=old_epoch || prior.selected_slot as usize!=selected ||
+    prior.slot_version!=slot.version ||
+    journal_generation<floor.minimum_journal_generation {
+    return Err(Error::Stale)
+ }
+ advance_epoch(disk,trust,old_epoch,selected,slot,journal_generation)
+}
+#[cfg(test)]
+mod r117_guarded_advance_tests{
+ use super::*;
+ fn floor()->SealedBootFloor{
+  SealedBootFloor{minimum_epoch:4,minimum_journal_generation:20,
+    expected_slot:0,minimum_slot_version:9,
+    expected_measurement:[3;32]}
+ }
+ #[test]fn correct_seal_allows_one_durable_next_epoch(){
+  let mut d=tests::fixture();
+  let next=advance_epoch_guarded(&mut d,&tests::Trusted([3;32]),
+    4,0,tests::slot(),21,floor()).unwrap();
+  assert_eq!(next.epoch,5);assert_eq!(d.writes,1);
+ }
+ #[test]fn independently_sealed_floor_refuses_journal_rollback(){
+  let mut d=tests::fixture();
+  for f in [
+    SealedBootFloor{minimum_epoch:5,..floor()},
+    SealedBootFloor{minimum_journal_generation:25,..floor()},
+    SealedBootFloor{minimum_slot_version:10,..floor()},
+    SealedBootFloor{expected_slot:1,..floor()},
+    SealedBootFloor{expected_measurement:[5;32],..floor()},
+  ]{
+   assert_eq!(advance_epoch_guarded(&mut d,&tests::Trusted([3;32]),
+     4,0,tests::slot(),21,f),Err(Error::Stale));
+  }
+  assert_eq!(d.writes,0);
+ }
+ #[test]fn forged_epoch_or_wrong_slot_never_changes_disk(){
+  let mut d=tests::fixture();
+  assert_eq!(advance_epoch_guarded(&mut d,&tests::Trusted([3;32]),
+    3,0,tests::slot(),21,floor()),Err(Error::Stale));
+  assert_eq!(advance_epoch_guarded(&mut d,&tests::Trusted([3;32]),
+    4,1,tests::slot(),21,floor()),Err(Error::Stale));
+  assert_eq!(advance_epoch_guarded(&mut d,&tests::Trusted([3;32]),
+    4,0,tests::slot(),19,floor()),Err(Error::Stale));
+  assert_eq!(d.writes,0);
+ }
+ #[test]fn absent_trusted_measurement_cannot_advance(){
+  let mut d=tests::fixture();
+  assert_eq!(advance_epoch_guarded(&mut d,&tests::Trusted([0;32]),
+    4,0,tests::slot(),21,floor()),Err(Error::Untrusted));
+  assert_eq!(d.writes,0);
+ }
+}

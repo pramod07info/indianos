@@ -128,8 +128,7 @@ pub(crate) fn consume_pid1_lifecycle_event(
         return Err(());
     }
     let queue=unsafe{&mut *ptr::addr_of_mut!(R114_FILE_EVENTS)};
-    if queue.peek()!=Some(expected){return Err(());}
-    queue.dequeue().map_err(|_|())
+    queue.acknowledge_exact_head(expected).ok_or(())
 }
 
 #[cfg(feature="test-r031-vfs")]
@@ -915,7 +914,7 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
     4=>{
      let grant=crate::udp_owner_epoch::Grant{
        pid:owner.pid,generation:owner.generation,port:source};
-     socket.close_registered_batch(registry,&[grant]).map_or(BAD,|_|0)
+     socket.close_claimed_registered(registry,owner,grant).map_or(BAD,|_|0)
     },
     _=>BAD
    }
@@ -1345,6 +1344,13 @@ fn revoke_task_authority(task:&mut Task){
   if !task.pcb.is_null(){
    let owner=crate::batch5_session::Identity{
     pid:unsafe{(*task.pcb).pid},generation:task.file_generation};
+   // Only a previously live trusted PID2 lease makes a teardown
+   // assertion meaningful. Missing/failed task preparation must not produce
+   // a false QEMU "revocation succeeded" marker.
+   #[cfg(feature="test-r031-files-gui")]
+   let had_live_directory_lease=owner.pid==2 &&
+      unsafe{(&*ptr::addr_of!(R116_SHARED_LEASES))}
+        .permits_shared_directory(owner);
    if unsafe{(&*ptr::addr_of!(R031_HANDLES)).owns(owner)} {
     // Deduplicate repeated exit/rollback notices for this exact incarnation;
     // PID reuse must never remove or confuse the next owner's events.
@@ -1363,7 +1369,24 @@ fn revoke_task_authority(task:&mut Task){
    #[cfg(feature="test-r031-files-gui")]
    {let _=unsafe{(&mut *ptr::addr_of_mut!(R116_SHARED_LEASES))}
           .revoke_identity(owner.pid,owner.generation);}
-   unsafe{(&mut *ptr::addr_of_mut!(R031_HANDLES)).retire_process(owner);}
+   // The same fail-atomic retirement preflight now services the actual
+   // scheduler teardown, not just host unit tests. One retiring task is
+   // supplied here; the supervisor can also retire multiple in one batch.
+   let _=unsafe{(&mut *ptr::addr_of_mut!(R031_HANDLES))}
+       .retire_process_batch_kernel(&[owner]);
+   #[cfg(feature="test-r031-files-gui")]
+   if had_live_directory_lease {
+     let lease_gone=!unsafe{(&*ptr::addr_of!(R116_SHARED_LEASES))}
+           .permits_shared_directory(owner);
+     let port_gone=unsafe{(&*ptr::addr_of!(R115_UDP_OWNERS))}
+           .owner_of(5502).is_none();
+     let file_gone=!unsafe{(&*ptr::addr_of!(R031_HANDLES))}.owns(owner);
+     if lease_gone && port_gone && file_gone {
+       log(b"R117 QEMU PID2 delegated directory and UDP authority revoked at scheduler exit\n\0");
+     }else{
+       log(b"IndianOS: FATAL R117 PID2 delegated authority retained after exit\n\0");
+     }
+   }
   }
   task.file_generation=0;
  }
@@ -1760,6 +1783,86 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
 #[cfg(test)]mod tests{
  use super::*;
  static LOCK:std::sync::Mutex<()>=std::sync::Mutex::new(());
+
+ #[cfg(feature="test-r031-files-gui")]
+ #[test]fn r117_real_scheduler_revoke_withdraws_shared_directory_and_udp(){
+  use core::mem::ManuallyDrop;
+  let _lock=LOCK.lock().unwrap();
+  // Save/restore all touched static service tables. The runtime tests own
+  // the single-BSP scheduler globals under one serialized host-test lock.
+  struct Restore{
+   tasks:ManuallyDrop<[MaybeUninit<Task>;TASKS]>,
+   handles:ManuallyDrop<crate::fs_handles::FileHandles>,
+   events:ManuallyDrop<crate::process_events::ProcessEvents<16>>,
+   sockets:ManuallyDrop<crate::network::EpochUdpEndpoints<2,8>>,
+   registry:ManuallyDrop<crate::udp_owner_epoch::Registry<2>>,
+   leases:ManuallyDrop<crate::agent_03_cap_epoch::LeaseTable<2>>,
+  }
+  impl Drop for Restore{
+   fn drop(&mut self){unsafe{
+    ptr::write(ptr::addr_of_mut!(M009_TASKS),ManuallyDrop::take(&mut self.tasks));
+    ptr::write(ptr::addr_of_mut!(R031_HANDLES),ManuallyDrop::take(&mut self.handles));
+    ptr::write(ptr::addr_of_mut!(R114_FILE_EVENTS),ManuallyDrop::take(&mut self.events));
+    ptr::write(ptr::addr_of_mut!(R114_LOCAL_UDP),ManuallyDrop::take(&mut self.sockets));
+    ptr::write(ptr::addr_of_mut!(R115_UDP_OWNERS),ManuallyDrop::take(&mut self.registry));
+    ptr::write(ptr::addr_of_mut!(R116_SHARED_LEASES),ManuallyDrop::take(&mut self.leases));
+   }}
+  }
+  let _restore=unsafe{Restore{
+   tasks:ManuallyDrop::new(ptr::read(ptr::addr_of!(M009_TASKS))),
+   handles:ManuallyDrop::new(ptr::read(ptr::addr_of!(R031_HANDLES))),
+   events:ManuallyDrop::new(ptr::read(ptr::addr_of!(R114_FILE_EVENTS))),
+   sockets:ManuallyDrop::new(ptr::read(ptr::addr_of!(R114_LOCAL_UDP))),
+   registry:ManuallyDrop::new(ptr::read(ptr::addr_of!(R115_UDP_OWNERS))),
+   leases:ManuallyDrop::new(ptr::read(ptr::addr_of!(R116_SHARED_LEASES))),
+  }};
+  let mut init=Process::empty();init.pid=1;init.state=2;
+  let mut guest=Process::empty();guest.pid=2;guest.state=2;
+  unsafe{
+   for i in 0..TASKS{ptr::write(task_ptr(i),core::mem::zeroed());}
+   R031_HANDLES=crate::fs_handles::FileHandles::new();
+   R114_FILE_EVENTS=crate::process_events::ProcessEvents::new();
+   R114_LOCAL_UDP=crate::network::EpochUdpEndpoints::new();
+   R115_UDP_OWNERS=crate::udp_owner_epoch::Registry::new();
+   R116_SHARED_LEASES=crate::agent_03_cap_epoch::LeaseTable::new();
+   let table=&mut *ptr::addr_of_mut!(R031_HANDLES);
+   let a=table.bind_process(1).unwrap();
+   let old=table.bind_process(2).unwrap();
+   let first=&mut *task_ptr(0);first.pcb=&mut init;
+   first.file_generation=a.generation;first.authority_live=true;
+   let second=&mut *task_ptr(1);second.pcb=&mut guest;
+   second.file_generation=old.generation;second.authority_live=true;
+   assert!(r116_prepare_shared_directory_lease(old));
+   assert!((&*ptr::addr_of!(R116_SHARED_LEASES))
+           .permits_shared_directory(old));
+   (&mut *ptr::addr_of_mut!(R114_LOCAL_UDP)).bind_registered(
+      &mut *ptr::addr_of_mut!(R115_UDP_OWNERS),
+      old.pid,old.generation,5502).unwrap();
+   revoke_task_authority(second);
+   assert!(!(&*ptr::addr_of!(R116_SHARED_LEASES))
+           .permits_shared_directory(old));
+   assert!(!(&*ptr::addr_of!(R031_HANDLES)).owns(old));
+   assert!((&*ptr::addr_of!(R031_HANDLES)).owns(a));
+   assert_eq!((&*ptr::addr_of!(R115_UDP_OWNERS)).owner_of(5502),None);
+   assert_eq!((&*ptr::addr_of!(R114_FILE_EVENTS)).len(),1);
+   let newest=(&mut *ptr::addr_of_mut!(R031_HANDLES))
+              .bind_process(2).unwrap();
+   second.file_generation=newest.generation;
+   second.authority_live=true;
+   assert!(r116_prepare_shared_directory_lease(newest));
+   assert!((&*ptr::addr_of!(R116_SHARED_LEASES))
+          .permits_shared_directory(newest));
+   // A delayed cleanup of the former generation cannot clear the new grant.
+   second.file_generation=old.generation;
+   second.authority_live=true;
+   revoke_task_authority(second);
+   assert!((&*ptr::addr_of!(R031_HANDLES)).owns(newest));
+   assert!((&*ptr::addr_of!(R116_SHARED_LEASES))
+          .permits_shared_directory(newest));
+   assert_eq!((&*ptr::addr_of!(R114_FILE_EVENTS)).len(),1);
+  }
+ }
+
  // Host tests link the real retirement/reclamation path; the serial hardware
  // boundary alone is supplied here because the kernel COM1 driver is assembly.
  #[export_name="serial_write"]

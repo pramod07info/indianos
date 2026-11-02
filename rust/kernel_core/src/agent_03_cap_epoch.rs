@@ -607,3 +607,105 @@ mod r116_process_bound_lease_tests {
   assert_eq!(t.check(request,0),Err(LeaseFault::Missing));
  }
 }
+
+
+/// R117: the trusted capability supervisor can extend a still-live grant
+/// without widening its rights, changing its principal, or reviving expiry.
+/// The entire mutation is fail-atomic, including generation and epoch checks.
+impl<const N:usize> LeaseTable<N> {
+ pub fn renew_exact_kernel(
+    &mut self,request:Request,now:u64,next_deadline:u64
+ )->Result<(),LeaseFault>{
+    if request.caller==0||request.current_generation==0||
+       request.required_rights==0||next_deadline<=now{
+        return Err(LeaseFault::Invalid)
+    }
+    let index=self.entries.iter().position(|entry|entry.is_some_and(|lease|
+       lease.grant.owner==request.caller&&
+       lease.grant.resource==request.resource))
+       .ok_or(LeaseFault::Missing)?;
+    let prior=self.entries[index].ok_or(LeaseFault::Missing)?;
+    if now>=prior.expires_at{return Err(LeaseFault::Expired);}
+    authorize(prior.grant,request).map_err(LeaseFault::Denied)?;
+    if next_deadline<=prior.expires_at{return Err(LeaseFault::Invalid);}
+    self.entries[index]=Some(TimedGrant{
+        grant:prior.grant,expires_at:next_deadline,
+    });
+    Ok(())
+ }
+}
+#[cfg(test)]
+mod r117_capability_renewal_tests {
+ use super::*;
+ fn pair()->(Grant,Request,TimedGrant){
+  let p=Grant{owner:1,resource:7,rights:3,epoch:4,
+       generation:9,revoked:false};
+  let issuer=Request{caller:1,resource:7,required_rights:1,
+       current_epoch:4,current_generation:9};
+  let child=TimedGrant{grant:Grant{owner:2,resource:7,rights:1,
+       epoch:4,generation:10,revoked:false},expires_at:30};
+  (p,issuer,child)
+ }
+ fn setup()->LeaseTable<2>{
+  let (p,issuer,child)=pair();let mut table=LeaseTable::new();
+  table.delegate(p,issuer,child,10).unwrap();table
+ }
+ fn req()->Request{
+  Request{caller:2,resource:7,required_rights:1,current_epoch:4,
+    current_generation:10}
+ }
+ #[test]fn only_current_live_generation_can_extend_exact_lease(){
+  let mut t=setup();assert_eq!(t.renew_exact_kernel(req(),20,40),Ok(()));
+  assert_eq!(t.check(req(),35),Ok(()));
+  assert_eq!(t.check(req(),40),Err(LeaseFault::Expired));
+  assert_eq!(t.len(),1);
+ }
+ #[test]fn stale_epoch_generation_and_foreign_rights_never_extend(){
+  let mut t=setup();
+  for bad in [
+   Request{caller:3,..req()},
+   Request{current_epoch:5,..req()},
+   Request{current_generation:11,..req()},
+   Request{resource:8,..req()},
+   Request{required_rights:2,..req()},
+  ]{assert!(t.renew_exact_kernel(bad,20,60).is_err());}
+  assert_eq!(t.check(req(),29),Ok(()));
+  assert_eq!(t.check(req(),30),Err(LeaseFault::Expired));
+ }
+ #[test]fn expired_grants_cannot_be_revived_or_shortened(){
+  let mut t=setup();
+  assert_eq!(t.renew_exact_kernel(req(),30,60),Err(LeaseFault::Expired));
+  assert_eq!(t.renew_exact_kernel(req(),20,30),Err(LeaseFault::Invalid));
+  assert_eq!(t.renew_exact_kernel(req(),20,29),Err(LeaseFault::Invalid));
+  assert_eq!(t.renew_exact_kernel(req(),20,20),Err(LeaseFault::Invalid));
+  assert_eq!(t.check(req(),30),Err(LeaseFault::Expired));
+ }
+ #[test]fn missing_revoked_and_zero_identity_are_rejected(){
+  let mut t=LeaseTable::<1>::new();
+  assert_eq!(t.renew_exact_kernel(req(),0,40),Err(LeaseFault::Missing));
+  t=setup_into_one();
+  for invalid in [
+   Request{caller:0,..req()},
+   Request{current_generation:0,..req()},
+   Request{required_rights:0,..req()},
+  ]{assert_eq!(t.renew_exact_kernel(invalid,20,40),Err(LeaseFault::Invalid));}
+  t.revoke_identity(2,10);
+  assert_eq!(t.renew_exact_kernel(req(),20,40),Err(LeaseFault::Missing));
+ }
+ fn setup_into_one()->LeaseTable<1>{
+  let (p,issuer,child)=pair();let mut t=LeaseTable::new();
+  t.delegate(p,issuer,child,10).unwrap();t
+ }
+ #[test]fn peer_lease_is_unchanged_by_renewal(){
+  let mut t=LeaseTable::<2>::new();let (p,issuer,child)=pair();
+  t.delegate(p,issuer,child,10).unwrap();
+  let second=TimedGrant{grant:Grant{owner:3,generation:11,..child.grant},
+    expires_at:50};
+  t.delegate(p,issuer,second,10).unwrap();
+  assert_eq!(t.renew_exact_kernel(req(),20,45),Ok(()));
+  let other=Request{caller:3,current_generation:11,..req()};
+  assert_eq!(t.check(other,49),Ok(()));
+  assert_eq!(t.check(other,50),Err(LeaseFault::Expired));
+  assert_eq!(t.check(req(),44),Ok(()));
+ }
+}
