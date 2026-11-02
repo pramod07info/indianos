@@ -222,3 +222,6 @@ The restored exact-generation validation intentionally refuses a delayed retirin
 
 ## R120 mixed-owner resource stress (additional source code)
 A new host regression exercises 32 deterministic three-process sessions crossing actual UDP socket registry and capability lease ownership, together with the two-process-only file handle table. Stale mid-batch PID generations deny the whole corresponding resource transaction; successful exact retire preserves a third peer, queued datagrams, and replacement PID. This is a single-BSP host stress scenario, **not** three physical cores or an all-subsystem atomic transaction. R118-026 and SMP gates remain OPEN until their actual QEMU/hardware acceptance is met.
+
+### Full MBR/GPT selected-mount receipt preflight
+The production `mount_partition_receipt_healthy` and read-only diagnostic path now reject invalid pinned parent capacity, partition bounds/index/scheme/MBR signature before any sector read. The complete two-pass on-disk GPT/MBR validation remains mandatory afterward. A regression counts zero reads on invalid receipts. This is not physical concurrent disk mutation or SMP qualification.

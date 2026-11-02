@@ -417,11 +417,37 @@ pub fn inspect_partition_receipt<D:BlockDevice>(
   table_crc32:digest,mbr_sector:final_mbr,
   gpt:final_catalog.get_gpt_selection(index)})
 }
+/// Preflight only the signed-off receipt SHAPE and parent capacity before
+/// reading any table or filesystem sector. True identity necessarily needs
+/// the full fresh GPT/MBR disk reads which follow; this check cannot replace
+/// on-media authentication. No device writes or mutable cached state.
+fn receipt_shape_preflight<D:BlockDevice>(
+ disk:&D,expected:PartitionReceipt
+)->Result<(),MountError>{
+ let partition=expected.partition;
+ let index_valid=match partition.scheme{
+  Scheme::Mbr=>partition.index<4 && expected.gpt.is_none(),
+  Scheme::Gpt=>partition.index<MAX_GPT_ENTRIES as u32 &&
+     expected.gpt.is_some_and(|selection|
+       selection.partition==partition),
+ };
+ if expected.device_sectors!=disk.sector_count() ||
+    expected.device_sectors<2 ||
+    partition.start==0 || partition.sectors<MIN_SECTORS ||
+    partition.start.checked_add(partition.sectors)
+       .is_none_or(|end|end>expected.device_sectors) ||
+    expected.mbr_sector[510..512]!=[0x55,0xaa] ||
+    !index_valid {
+  return Err(MountError::Partition(Error::Invalid));
+ }
+ Ok(())
+}
 /// Validated selected-mount session: reject any changed partition metadata
 /// before and after the filesystem head/payload reads. No autoformat.
 pub fn mount_partition_receipt_healthy<'a,D:BlockDevice>(
  disk:&'a mut D,expected:PartitionReceipt)
  ->Result<HierVfs<BlockWindow<'a,D>>,MountError>{
+ receipt_shape_preflight(disk,expected)?;
  let before=inspect_partition_receipt(disk,expected.partition.index)
   .map_err(MountError::Partition)?;
  if before!=expected{return Err(MountError::Partition(Error::Invalid));}
@@ -442,6 +468,7 @@ pub fn mount_partition_receipt_healthy<'a,D:BlockDevice>(
 /// diagnostic result; the function cannot repair, format or write.
 pub fn probe_selected_receipt_readonly<D:BlockDevice>(
  disk:&mut D,expected:PartitionReceipt)->Result<PartitionHealth,MountError>{
+ receipt_shape_preflight(disk,expected)?;
  let mut read_only=ReadOnlyDevice::new(disk);
  let before=inspect_partition_receipt(&mut read_only,expected.partition.index)
   .map_err(MountError::Partition)?;
@@ -604,6 +631,35 @@ mod m1_partition_tests{
    *self.data.get_mut(lba as usize).ok_or(BlockError::OutOfRange)?=*input;
    self.writes+=1;Ok(())
   }
+ }
+
+ #[test]fn r120_wrong_partition_receipt_rejected_before_any_sector_reads(){
+  struct Counting<'a>{inner:&'a mut Disk,reads:usize}
+  impl BlockDevice for Counting<'_>{
+   fn sector_count(&self)->u64{self.inner.sector_count()}
+   fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+       ->Result<(),BlockError>{self.reads+=1;self.inner.read_sector(lba,out)}
+   fn write_sector(&mut self,lba:u64,input:&[u8;SECTOR_BYTES])
+       ->Result<(),BlockError>{self.inner.write_sector(lba,input)}
+  }
+  let mut d=mbr_disk();
+  let receipt=inspect_partition_receipt(&mut d,0).unwrap();
+  let mut variant=receipt;
+  variant.partition.start=u64::MAX;
+  let mut invalid=receipt;
+  invalid.partition.sectors=1;
+  let mut signature=receipt;
+  signature.mbr_sector[510]=0;
+  let mut wrong_scheme=receipt;
+  wrong_scheme.partition.scheme=Scheme::Gpt;
+  let mut swapped=receipt;
+  swapped.device_sectors+=1;
+  let mut watch=Counting{inner:&mut d,reads:0};
+  for bad in [variant,invalid,signature,wrong_scheme,swapped]{
+   assert!(mount_partition_receipt_healthy(&mut watch,bad).is_err());
+   assert!(probe_selected_receipt_readonly(&mut watch,bad).is_err());
+  }
+  assert_eq!(watch.reads,0);
  }
  fn new()->Disk{Disk{data:[[0;SECTOR_BYTES];COUNT],writes:0,fail_at:None,fail_read:None}}
  fn mbr_disk()->Disk{
