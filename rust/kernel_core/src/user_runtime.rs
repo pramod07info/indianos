@@ -81,6 +81,38 @@ static mut R114_LOCAL_UDP:crate::network::EpochUdpEndpoints<2,8>=
 #[cfg(feature="test-r031-files-gui")]
 static mut R115_UDP_OWNERS:crate::udp_owner_epoch::Registry<2>=
     crate::udp_owner_epoch::Registry::new();
+// R116: trusted kernel issues PID2 a narrow read-only directory lease only
+// after both process incarnations have been authenticated by FileHandles.
+#[cfg(feature="test-r031-files-gui")]
+static mut R116_SHARED_LEASES:crate::agent_03_cap_epoch::LeaseTable<2>=
+    crate::agent_03_cap_epoch::LeaseTable::new();
+
+#[cfg(feature="test-r031-files-gui")]
+fn r116_prepare_shared_directory_lease(
+    owner:crate::batch5_session::Identity
+)->bool{
+    use crate::agent_03_cap_epoch::{
+        Grant,Request,TimedGrant,SHARED_DIRECTORY_RESOURCE,SHARED_DIRECTORY_READ
+    };
+    if owner.pid!=2||owner.generation==0{return false;}
+    let init_generation=unsafe{(*task_ptr(0)).file_generation};
+    let init=crate::batch5_session::Identity{pid:1,generation:init_generation};
+    let handles=unsafe{&*ptr::addr_of!(R031_HANDLES)};
+    if init_generation==0||!handles.owns(init)||!handles.owns(owner){
+        return false;
+    }
+    let parent=Grant{owner:1,resource:SHARED_DIRECTORY_RESOURCE,
+        rights:SHARED_DIRECTORY_READ,epoch:1,
+        generation:init_generation,revoked:false};
+    let issuer=Request{caller:1,resource:SHARED_DIRECTORY_RESOURCE,
+        required_rights:SHARED_DIRECTORY_READ,current_epoch:1,
+        current_generation:init_generation};
+    let child=TimedGrant{grant:Grant{owner:2,resource:SHARED_DIRECTORY_RESOURCE,
+        rights:SHARED_DIRECTORY_READ,epoch:1,
+        generation:owner.generation,revoked:false},expires_at:u64::MAX};
+    unsafe{(&mut *ptr::addr_of_mut!(R116_SHARED_LEASES))}
+        .delegate(parent,issuer,child,0).is_ok()
+}
 
 /// Kernel-only PID1 lifecycle event acknowledgement. A user-supplied PID or
 /// file descriptor cannot select a consumer; the current exact FileHandles
@@ -867,10 +899,11 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
    match request.arg0{
     1=>socket.bind_registered(registry,owner.pid,owner.generation,source)
        .map_or(BAD,|_|0),
-    2=>socket.send_local(owner.pid,owner.generation,source,destination,
-             &data[..count]).map_or(BAD,|_|0),
+    2=>socket.send_registered(registry,owner.pid,owner.generation,
+           source,destination,&data[..count]).map_or(BAD,|_|0),
     3=>{
-     let n=match socket.receive(owner.pid,owner.generation,source,&mut data){
+     let n=match socket.receive_registered(
+         registry,owner.pid,owner.generation,source,&mut data){
       Ok(n)=>n,
       Err(crate::network::SocketError::Empty)=>return 0,
       Err(_)=>return BAD
@@ -890,7 +923,11 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
   #[cfg(feature="test-r031-files-gui")]
   34=>{
    if request.arg0!=1||authenticated_file_pid()!=Some(2){return BAD;}
-   // READ-ONLY directory enumeration is limited to /shared.
+   let Some(owner)=authenticated_file_identity()else{return BAD;};
+   if !unsafe{(&*ptr::addr_of!(R116_SHARED_LEASES))}
+      .permits_shared_directory(owner){return BAD;}
+   // READ-ONLY directory enumeration is limited to /shared, AND a live
+   // delegated read lease bound to this exact kernel-issued incarnation.
    // PID2 never gains general traversal, mutation or a private path.
    let mut desc=[0u8;64];
    if !unsafe{indianos_user_copy_readonly(img,request.arg1,
@@ -1216,6 +1253,10 @@ fn prepare(t:*mut Task,p:*mut Process,elf:*const u8,size:usize,original:u64,
   let handles=unsafe{&mut *ptr::addr_of_mut!(R031_HANDLES)};
   let Ok(owner)=handles.bind_process(unsafe{(*p).pid})else{return false;};
   task.file_generation=owner.generation;
+  #[cfg(feature="test-r031-files-gui")]
+  if owner.pid==2 && !r116_prepare_shared_directory_lease(owner){
+    return false;
+  }
  }
  pid_log(unsafe{(*p).pid},b"READY\0");true
 }
@@ -1305,11 +1346,10 @@ fn revoke_task_authority(task:&mut Task){
    let owner=crate::batch5_session::Identity{
     pid:unsafe{(*task.pcb).pid},generation:task.file_generation};
    if unsafe{(&*ptr::addr_of!(R031_HANDLES)).owns(owner)} {
-    let event=crate::process_events::ProcessEvent {
-      pid:owner.pid,kind:crate::process_events::EventKind::Exited,
-      value:owner.generation};
-    // Never block mandatory teardown when a bounded diagnostics FIFO fills.
-    let _=unsafe{&mut *ptr::addr_of_mut!(R114_FILE_EVENTS)}.enqueue(event);
+    // Deduplicate repeated exit/rollback notices for this exact incarnation;
+    // PID reuse must never remove or confuse the next owner's events.
+    let _=unsafe{&mut *ptr::addr_of_mut!(R114_FILE_EVENTS)}
+        .enqueue_exit_once(owner.pid,owner.generation);
    }
    #[cfg(feature="test-r031-files-gui")]
    {
@@ -1320,6 +1360,9 @@ fn revoke_task_authority(task:&mut Task){
     let registry=unsafe{&mut *ptr::addr_of_mut!(R115_UDP_OWNERS)};
     let _=sockets.retire_registered(registry,owner.pid,owner.generation);
    }
+   #[cfg(feature="test-r031-files-gui")]
+   {let _=unsafe{(&mut *ptr::addr_of_mut!(R116_SHARED_LEASES))}
+          .revoke_identity(owner.pid,owner.generation);}
    unsafe{(&mut *ptr::addr_of_mut!(R031_HANDLES)).retire_process(owner);}
   }
   task.file_generation=0;
@@ -1361,7 +1404,8 @@ fn cleanup_session(backend:&CloneBackend,reclaim:bool)->bool{
  unsafe{R025_SERVICES=None;}
  #[cfg(feature="test-r031-files-gui")]
  unsafe{R114_LOCAL_UDP=crate::network::EpochUdpEndpoints::new();
-        R115_UDP_OWNERS=crate::udp_owner_epoch::Registry::new();}
+        R115_UDP_OWNERS=crate::udp_owner_epoch::Registry::new();
+        R116_SHARED_LEASES=crate::agent_03_cap_epoch::LeaseTable::new();}
  unsafe{SESSION_DIRTY=!complete;}
  complete
 }
@@ -1414,7 +1458,8 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
  }
  #[cfg(feature="test-r031-files-gui")]
  unsafe{R114_LOCAL_UDP=crate::network::EpochUdpEndpoints::new();
-        R115_UDP_OWNERS=crate::udp_owner_epoch::Registry::new();}
+        R115_UDP_OWNERS=crate::udp_owner_epoch::Registry::new();
+        R116_SHARED_LEASES=crate::agent_03_cap_epoch::LeaseTable::new();}
  let mut table=ProcessTable::empty();
  let mut scheduler=Scheduler::empty();
  if !unsafe{indianos_process_table_init(&mut table)}{return false;}

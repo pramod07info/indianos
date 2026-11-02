@@ -533,3 +533,77 @@ mod r115_atomic_capability_teardown_tests {
         assert_eq!(empty.len(), 0);
     }
 }
+
+
+/// R116: read-only filesystem-directory authority must be bound to the
+/// actual running PCB incarnation and a kernel-selected resource. No ring3
+/// code can mint a TimedGrant or choose a source PID.
+pub const SHARED_DIRECTORY_RESOURCE:u32=0x5348_5244;
+pub const SHARED_DIRECTORY_READ:u32=1;
+impl<const N:usize> LeaseTable<N>{
+ pub fn permits_shared_directory(&self,owner:crate::batch5_session::Identity)->bool{
+  owner.pid==2&&owner.generation!=0&&
+  self.check(Request{caller:owner.pid,resource:SHARED_DIRECTORY_RESOURCE,
+    required_rights:SHARED_DIRECTORY_READ,
+    current_epoch:1,current_generation:owner.generation},0)==Ok(())
+ }
+}
+#[cfg(test)]
+mod r116_process_bound_lease_tests {
+ use super::*;
+ use crate::batch5_session::Identity;
+ fn setup()->LeaseTable<3>{
+  let mut table=LeaseTable::new();
+  let parent=Grant{owner:1,resource:SHARED_DIRECTORY_RESOURCE,
+   rights:SHARED_DIRECTORY_READ,epoch:1,generation:3,revoked:false};
+  let issuer=Request{caller:1,resource:SHARED_DIRECTORY_RESOURCE,
+   required_rights:SHARED_DIRECTORY_READ,current_epoch:1,current_generation:3};
+  let child=TimedGrant{grant:Grant{owner:2,resource:SHARED_DIRECTORY_RESOURCE,
+   rights:SHARED_DIRECTORY_READ,epoch:1,generation:4,revoked:false},
+   expires_at:u64::MAX};
+  table.delegate(parent,issuer,child,0).unwrap();
+  table
+ }
+ #[test]fn exact_pid2_incarnation_can_enumerate_and_peer_cannot(){
+  let t=setup();
+  assert!(t.permits_shared_directory(Identity{pid:2,generation:4}));
+  for id in [Identity{pid:1,generation:3},
+             Identity{pid:2,generation:3},Identity{pid:2,generation:5},
+             Identity{pid:3,generation:4},Identity{pid:2,generation:0}]{
+   assert!(!t.permits_shared_directory(id));
+  }
+ }
+ #[test]fn exact_scheduler_teardown_revokes_old_generation(){
+  let mut t=setup();
+  assert_eq!(t.revoke_identity(2,5),0);
+  assert!(t.permits_shared_directory(Identity{pid:2,generation:4}));
+  assert_eq!(t.revoke_identity(2,4),1);
+  assert!(!t.permits_shared_directory(Identity{pid:2,generation:4}));
+  assert_eq!(t.revoke_identity(2,4),0);
+ }
+ #[test]fn wrong_resource_or_rights_cannot_be_delegated(){
+  let mut t=LeaseTable::<1>::new();
+  let p=Grant{owner:1,resource:SHARED_DIRECTORY_RESOURCE,
+    rights:SHARED_DIRECTORY_READ,epoch:1,generation:3,revoked:false};
+  let r=Request{caller:1,resource:SHARED_DIRECTORY_RESOURCE,
+    required_rights:1,current_epoch:1,current_generation:3};
+  for g in [
+   Grant{resource:8,..p},
+   Grant{rights:2,..p},
+   Grant{generation:0,..p},
+   Grant{revoked:true,..p},
+  ]{
+   assert!(t.delegate(p,r,TimedGrant{grant:Grant{owner:2,..g},
+       expires_at:30},0).is_err());
+   assert_eq!(t.len(),0);
+  }
+ }
+ #[test]fn capacity_and_expiry_do_not_revive_old_owner(){
+  let mut t=setup();
+  let request=Request{caller:2,resource:SHARED_DIRECTORY_RESOURCE,
+    required_rights:1,current_epoch:1,current_generation:4};
+  assert_eq!(t.check(request,u64::MAX),Err(LeaseFault::Expired));
+  t.revoke_identity(2,4);
+  assert_eq!(t.check(request,0),Err(LeaseFault::Missing));
+ }
+}

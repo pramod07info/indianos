@@ -2280,6 +2280,82 @@ mod r106_checked_partition_authenticated_file_api_tests{
   assert!(handles.mount_alias_allows(fresh,guest,"/shared/note"));
  }
 
+ #[test]fn r116_selected_alias_open_requires_authenticated_current_volume(){
+  let (mut disk,receipt)=disk();
+  let mut table=FileHandles::new();
+  let guest=table.bind_process(2).unwrap();
+  let before=disk.reads;
+  let unmounted=table.mount_alias_for_current_root_kernel(guest).unwrap();
+  assert_eq!(operation_on_selected_volume_alias(&mut table,unmounted,1,
+      guest,0,READ,"/shared/note",&mut[],&mut disk,receipt),
+      Err(FsError::InvalidName));
+  assert_eq!(disk.reads,before);
+  let init=table.bind_process(1).unwrap();
+  let first=operation_on_selected_volume(&mut table,1,init,0,READ,
+      "/shared/note",&mut[],&mut disk,receipt).unwrap();
+  operation_on_selected_volume(&mut table,5,init,first,0,"",
+      &mut[],&mut disk,receipt).unwrap();
+  let alias=table.mount_alias_for_current_root_kernel(guest).unwrap();
+  let fd=operation_on_selected_volume_alias(&mut table,alias,1,
+      guest,0,READ,"/shared/note",&mut[],&mut disk,receipt).unwrap();
+  assert!(fd>0);
+  let bytes=disk.reads;
+  for forbidden in ["/sharedness/file","/boot/keys",
+                    "/shared/../boot/keys","/shared","relative/file"]{
+    assert_eq!(operation_on_selected_volume_alias(&mut table,alias,1,
+       guest,0,READ,forbidden,&mut[],&mut disk,receipt),
+       Err(FsError::InvalidName));
+  }
+  assert_eq!(disk.reads,bytes);
+ }
+ #[test]fn r116_selected_mount_alias_rejects_retired_pid_and_quarantine_without_io(){
+  let (mut disk,receipt)=disk();
+  let mut table=FileHandles::new();
+  let admin=table.bind_process(1).unwrap();
+  let fd=operation_on_selected_volume(&mut table,1,admin,0,READ,
+      "/shared/note",&mut[],&mut disk,receipt).unwrap();
+  operation_on_selected_volume(&mut table,5,admin,fd,0,"",
+      &mut[],&mut disk,receipt).unwrap();
+  let guest=table.bind_process(2).unwrap();
+  let alias=table.mount_alias_for_current_root_kernel(guest).unwrap();
+  let newer=table.bind_process(2).unwrap();
+  let reads=disk.reads;
+  assert_eq!(operation_on_selected_volume_alias(&mut table,alias,1,
+      newer,0,READ,"/shared/note",&mut[],&mut disk,receipt),
+      Err(FsError::InvalidName));
+  assert_eq!(operation_on_selected_volume_alias(&mut table,alias,1,
+      guest,0,READ,"/shared/note",&mut[],&mut disk,receipt),
+      Err(FsError::InvalidName));
+  assert_eq!(disk.reads,reads);
+  let fresh=table.mount_alias_for_current_root_kernel(newer).unwrap();
+  table.selected_quarantined=true;
+  assert_eq!(operation_on_selected_volume_alias(&mut table,fresh,1,
+      newer,0,READ,"/shared/note",&mut[],&mut disk,receipt),
+      Err(FsError::InvalidName));
+  assert_eq!(disk.reads,reads);
+ }
+ #[test]fn r116_selected_mount_alias_denies_cross_identity_and_mutating_guest(){
+  let (mut disk,receipt)=disk();
+  let mut table=FileHandles::new();
+  let admin=table.bind_process(1).unwrap();
+  let fd=operation_on_selected_volume(&mut table,1,admin,0,READ,
+      "/shared/note",&mut[],&mut disk,receipt).unwrap();
+  operation_on_selected_volume(&mut table,5,admin,fd,0,"",
+      &mut[],&mut disk,receipt).unwrap();
+  let guest=table.bind_process(2).unwrap();
+  let alias=table.mount_alias_for_current_root_kernel(guest).unwrap();
+  let reads=disk.reads;let writes=disk.writes;
+  assert_eq!(operation_on_selected_volume_alias(&mut table,alias,1,
+      admin,0,READ,"/shared/note",&mut[],&mut disk,receipt),
+      Err(FsError::InvalidName));
+  assert_eq!(operation_on_selected_volume_alias(&mut table,alias,29,
+      guest,0,0,"/shared/new",&mut b"bad".to_vec(),&mut disk,receipt),
+      Err(FsError::InvalidName));
+  assert_eq!(operation_on_selected_volume_alias(&mut table,alias,1,
+      guest,0,WRITE,"/shared/note",&mut[],&mut disk,receipt),
+      Err(FsError::InvalidName));
+  assert_eq!((disk.reads,disk.writes),(reads,writes));
+ }
  #[test]fn r109_foreign_stale_and_unknown_tokens_never_probe_selected_media(){
   let (mut d,receipt)=disk();let mut table=FileHandles::new();
   let owner=table.bind_process(2).unwrap();
@@ -2792,4 +2868,32 @@ mod r115_live_namespace_open_security_tests {
             &mut files,narrow,1,replacement,0,READ,"/shared/docs/note",&mut []),
             Err(FsError::InvalidName));
     }
+}
+
+
+/// R116: authenticated alias open/create on a previously selected physical
+/// partition. The full disk/partition receipt and namespace mount epoch are
+/// checked BEFORE probing the disk. A first mount must be performed by the
+/// privileged volume service, never by an untrusted alias.
+pub fn operation_on_selected_volume_alias<D:BlockDevice>(
+    table:&mut FileHandles,alias:MountAlias,action:u64,owner:Identity,
+    token:u64,argument:u64,path:&str,buffer:&mut[u8],
+    disk:&mut D,receipt:crate::m1_partition::PartitionReceipt,
+)->Result<u64,FsError>{
+    if !matches!(action,1|29)||token!=0||
+       table.selected_quarantined||
+       table.selected_volume!=Some(receipt)||
+       alias.selected_volume!=Some(receipt)||
+       !table.mount_alias_allows(alias,owner,path){
+        return Err(FsError::InvalidName);
+    }
+    // Independent bounds and component validation; reject an exact root
+    // as a file open and never accept a sibling-prefix or traversal bypass.
+    let mut relative=[0u8;24];
+    let n=crate::vfs_path::copy_relative_under_root(path,alias.root(),&mut relative)
+        .map_err(|_|FsError::InvalidName)?
+        .ok_or(FsError::InvalidName)?;
+    if action==1 && n==0{return Err(FsError::InvalidName);}
+    operation_on_selected_volume(table,action,owner,token,argument,path,buffer,
+                                 disk,receipt)
 }

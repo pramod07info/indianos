@@ -501,7 +501,16 @@ pub extern "C" fn kmain()->!{
             // A read-only journal observation must also authenticate the
             // exact same trust fixture before printing the QEMU success.
             r114_boot_epoch::observe_verified_epoch(
-                &mut region,&QemuFixture)==Ok(r));
+                &mut region,&QemuFixture)==Ok(r) &&
+            r114_boot_epoch::observe_with_sealed_floor(
+                &mut region,&QemuFixture,
+                r114_boot_epoch::SealedBootFloor{
+                    minimum_epoch:r.epoch,
+                    minimum_journal_generation:21,
+                    expected_slot:0,
+                    minimum_slot_version:9,
+                    expected_measurement:[0x42;32],
+                })==Ok(r));
         need(verified,b"IndianOS: FATAL R114 QEMU boot epoch persistence\n\0");
         log(b"IndianOS: R114 QEMU boot epoch advanced and recovery receipt verified\n\0");
     }

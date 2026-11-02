@@ -294,7 +294,13 @@ pub fn run_demo<D:EthernetDevice>(
         route:r,metric:10,link:2,epoch:1,healthy:true
     }).map_err(|_|Error::Unexpected)?;
     let destination=u32::from_be_bytes(PEER_IP);
-    if alternatives.resolve(destination).map(|r|r.link)!=Some(1){
+    // The first outbound UDP frame uses a time-valid DHCP primary receipt.
+    // Carry that receipt across the QEMU peer's forced missing reply; it
+    // MUST be invalid exactly at the expiry deadline before retransmission.
+    let first_receipt=alternatives.receipt_at(destination,initial_clock+1)
+        .ok_or(Error::Unexpected)?;
+    if first_receipt.selected.link!=1||
+       alternatives.resolve(destination).map(|r|r.link)!=Some(1){
         return Err(Error::Unexpected)
     }
     transmit_leased_ipv4(dev,&routes,&alternatives,route_owner,1,
@@ -310,9 +316,20 @@ pub fn run_demo<D:EthernetDevice>(
     // this reply. Only a bounded timeout may quarantine the primary path.
     match wait_for_limit(dev,300_000,ingress){
         Err(Error::Timeout)=>{
+            // R116 physical QEMU packet acceptance: the original time
+            // receipt must have expired (not merely have timed out waiting
+            // for a reply). The static secondary route must be valid AT the
+            // expiry deadline before any new Ethernet frame is submitted.
+            let deadline=initial_clock+20;
+            if alternatives.receipt_is_current_at(destination,deadline,
+                first_receipt) ||
+                alternatives.receipt_at(destination,deadline)
+                    .is_none_or(|r|r.selected.link!=2){
+                return Err(Error::Unexpected);
+            }
             alternatives.begin_link_reset(1,1,2)
                 .map_err(|_|Error::Unexpected)?;
-            let backup=alternatives.resolve(destination)
+            let backup=alternatives.resolve_at(destination,deadline)
                 .ok_or(Error::Unexpected)?;
             if backup.link!=2||backup.epoch!=1||!backup.healthy{
                 return Err(Error::Unexpected);
@@ -326,6 +343,7 @@ pub fn run_demo<D:EthernetDevice>(
                     && udp_endpoints.ingest_registered_frame(
                 &registry,1,1,CLIENT_PORT,frame,mac).is_ok()
             })?;
+            stage(b"IndianOS: R116 QEMU DHCP lease expiry blocked primary UDP resend and backup succeeded\n\0");
         },
         // The failure-injection acceptance requires the primary to become
         // unreachable. A response before failover is not success.
@@ -1694,4 +1712,89 @@ mod r115_registered_ingress_authority_tests {
         assert_eq!(sockets.receive(8,9,5001,&mut out),Ok(4));
         assert_eq!(&out[..4],b"pass");
     }
+}
+
+
+// R116: all real ring-3 UDP actions, not merely bind and close, must require
+// authorization from BOTH the exact PID-generation registry and the socket
+// table. The serialized single-BSP kernel owns these two tables.
+impl<const PORTS:usize,const QUEUE:usize> EpochUdpEndpoints<PORTS,QUEUE> {
+ pub fn send_registered<const N:usize>(
+  &mut self,registry:&crate::udp_owner_epoch::Registry<N>,
+  pid:u32,generation:u64,source:u16,destination:u16,data:&[u8],
+ )->Result<(),SocketError>{
+  registry.authorize(pid,generation,source).map_err(|_|SocketError::Denied)?;
+  self.send_local(pid,generation,source,destination,data)
+ }
+ pub fn receive_registered<const N:usize>(
+  &mut self,registry:&crate::udp_owner_epoch::Registry<N>,
+  pid:u32,generation:u64,port:u16,out:&mut[u8],
+ )->Result<usize,SocketError>{
+  registry.authorize(pid,generation,port).map_err(|_|SocketError::Denied)?;
+  self.receive(pid,generation,port,out)
+ }
+}
+#[cfg(test)]
+mod r116_registered_ring3_udp_tests{
+ use super::*;
+ use crate::udp_owner_epoch::Registry;
+ #[test]fn every_action_requires_live_kernel_registry_and_socket(){
+  let mut s=EpochUdpEndpoints::<2,5>::new();
+  let mut r=Registry::<2>::new();
+  s.bind_registered(&mut r,1,3,5501).unwrap();
+  s.bind_registered(&mut r,2,8,5502).unwrap();
+  assert_eq!(s.send_registered(&r,1,3,5501,5502,b"hello"),Ok(()));
+  let mut output=[0xcc;12];
+  assert_eq!(s.receive_registered(&r,2,7,5502,&mut output),
+      Err(SocketError::Denied));
+  assert_eq!(s.receive_registered(&r,2,8,5502,&mut output),Ok(5));
+  assert_eq!(&output[..5],b"hello");
+  assert_eq!(s.send_registered(&r,1,4,5501,5502,b"forge"),
+      Err(SocketError::Denied));
+  assert_eq!(s.send_registered(&r,2,8,5501,5502,b"forge"),
+      Err(SocketError::Denied));
+  assert_eq!(s.pending_owned(2,8),Ok(0));
+ }
+ #[test]fn registry_revocation_blocks_send_receive_without_touching_queued_data(){
+  let mut s=EpochUdpEndpoints::<2,4>::new();let mut r=Registry::<2>::new();
+  s.bind_registered(&mut r,1,3,5501).unwrap();
+  s.bind_registered(&mut r,2,8,5502).unwrap();
+  s.send_registered(&r,1,3,5501,5502,b"old").unwrap();
+  r.revoke_owner(2,8).unwrap();
+  let mut output=[0x44;8];
+  assert_eq!(s.receive_registered(&r,2,8,5502,&mut output),
+    Err(SocketError::Denied));
+  assert_eq!(output,[0x44;8]);
+  assert_eq!(s.pending_owned(2,8),Ok(1));
+  s.retire(2,8).unwrap(); // single-BSP recovery after fault
+  s.bind_registered(&mut r,2,9,5502).unwrap();
+  assert_eq!(s.receive_registered(&r,2,9,5502,&mut output),
+    Err(SocketError::Empty));
+ }
+ #[test]fn retired_sender_cannot_inject_into_live_peer(){
+  let mut s=EpochUdpEndpoints::<2,4>::new();let mut r=Registry::<2>::new();
+  s.bind_registered(&mut r,1,3,5501).unwrap();
+  s.bind_registered(&mut r,2,8,5502).unwrap();
+  s.retire_registered(&mut r,1,3).unwrap();
+  assert_eq!(s.send_registered(&r,1,3,5501,5502,b"bad"),
+      Err(SocketError::Denied));
+  assert_eq!(s.pending_owned(2,8),Ok(0));
+  s.bind_registered(&mut r,1,4,5501).unwrap();
+  assert_eq!(s.send_registered(&r,1,4,5501,5502,b"new"),Ok(()));
+  let mut out=[0u8;8];
+  assert_eq!(s.receive_registered(&r,2,8,5502,&mut out),Ok(3));
+  assert_eq!(&out[..3],b"new");
+ }
+ #[test]fn no_owner_and_wrong_endpoint_are_denied_without_mutation(){
+  let mut s=EpochUdpEndpoints::<1,1>::new();let mut r=Registry::<1>::new();
+  assert_eq!(s.send_registered(&r,2,9,5502,5502,b"bad"),
+     Err(SocketError::Denied));
+  assert_eq!(s.receive_registered(&r,2,9,5502,&mut [0u8;0]),
+     Err(SocketError::Denied));
+  s.bind(2,9,5502).unwrap(); // deliberate dual-table divergence
+  assert_eq!(s.send_registered(&r,2,9,5502,5502,b"bad"),
+     Err(SocketError::Denied));
+  r.bind(2,9,5502).unwrap();
+  assert_eq!(s.send_registered(&r,2,9,5502,5502,b"ok"),Ok(()));
+ }
 }

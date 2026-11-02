@@ -833,3 +833,85 @@ mod r114_process_event_integrity {
         assert_eq!(q.count_pid(1), 0);
     }
 }
+
+
+// R116: exact-incarnation exit notices cannot be replayed into the PID1
+// lifecycle consumer, and stale delayed acknowledgements must never delete
+// a different generation's event. The value field is the generation ONLY
+// for the Exited kind; Message values remain opaque.
+impl<const N:usize> ProcessEvents<N>{
+ pub fn enqueue_exit_once(&mut self,pid:u32,generation:u64)
+   ->Result<bool,EventError>{
+  if pid==0||generation==0{return Err(EventError::InvalidPid)}
+  let found=(0..self.count).any(|index|{
+   self.entries[(self.head+index)%N].is_some_and(|entry|
+    entry.pid==pid&&entry.kind==EventKind::Exited&&
+    entry.value==generation)
+  });
+  if found{return Ok(false)}
+  self.enqueue(ProcessEvent{pid,kind:EventKind::Exited,value:generation})?;
+  Ok(true)
+ }
+ pub fn clear_exact_exit(&mut self,pid:u32,generation:u64)->usize{
+  if pid==0||generation==0||self.count==0{return 0}
+  let initial=self.count;let mut deleted=0;
+  for _ in 0..initial{
+   let event=self.dequeue().expect("validated ring invariant");
+   if event.pid==pid&&event.kind==EventKind::Exited&&
+      event.value==generation{deleted+=1}
+   else{self.enqueue(event).expect("ring capacity invariant")}
+  }
+  deleted
+ }
+}
+#[cfg(test)]
+mod r116_exit_event_generation_tests{
+ use super::*;
+ #[test]fn same_pid_generation_produces_exactly_one_exit_notice(){
+  let mut e=ProcessEvents::<3>::new();
+  assert_eq!(e.enqueue_exit_once(2,10),Ok(true));
+  assert_eq!(e.enqueue_exit_once(2,10),Ok(false));
+  assert_eq!(e.len(),1);
+  assert_eq!(e.enqueue_exit_once(2,11),Ok(true));
+  assert_eq!(e.len(),2);
+  assert_eq!(e.enqueue_exit_once(1,10),Ok(true));
+  assert_eq!(e.enqueue_exit_once(3,10),Err(EventError::Full));
+ }
+ #[test]fn old_pid_epoch_clear_never_steals_new_exit_or_messages(){
+  let mut e=ProcessEvents::<5>::new();
+  e.enqueue_exit_once(2,10).unwrap();
+  e.enqueue(ProcessEvent{pid:2,kind:EventKind::Message,value:10}).unwrap();
+  e.enqueue_exit_once(2,11).unwrap();
+  e.enqueue_exit_once(1,3).unwrap();
+  assert_eq!(e.clear_exact_exit(2,10),1);
+  assert_eq!(e.len(),3);
+  assert_eq!(e.dequeue().unwrap().kind,EventKind::Message);
+  assert_eq!(e.dequeue().unwrap().value,11);
+  assert_eq!(e.dequeue().unwrap().pid,1);
+ }
+ #[test]fn ring_wrap_and_duplicate_detect_only_live_entries(){
+  let mut e=ProcessEvents::<3>::new();
+  e.enqueue_exit_once(2,2).unwrap();
+  e.enqueue_exit_once(3,3).unwrap();
+  e.dequeue().unwrap();
+  e.enqueue_exit_once(4,4).unwrap();
+  e.enqueue_exit_once(2,2).unwrap();
+  assert_eq!(e.enqueue_exit_once(2,2),Ok(false));
+  assert_eq!(e.clear_exact_exit(3,3),1);
+  assert_eq!(e.dequeue().unwrap().pid,4);
+  assert_eq!(e.dequeue().unwrap().pid,2);
+ }
+ #[test]fn invalid_empty_and_zero_capacity_are_pure(){
+  let mut e=ProcessEvents::<0>::new();
+  assert_eq!(e.enqueue_exit_once(0,1),Err(EventError::InvalidPid));
+  assert_eq!(e.enqueue_exit_once(1,0),Err(EventError::InvalidPid));
+  assert_eq!(e.enqueue_exit_once(1,1),Err(EventError::Full));
+  assert_eq!(e.clear_exact_exit(1,1),0);
+  let mut e=ProcessEvents::<2>::new();
+  assert_eq!(e.clear_exact_exit(3,3),0);
+  assert_eq!(e.enqueue_exit_once(3,3),Ok(true));
+  assert_eq!(e.clear_exact_exit(0,3),0);
+  assert_eq!(e.clear_exact_exit(3,0),0);
+  assert_eq!(e.len(),1);
+ }
+}

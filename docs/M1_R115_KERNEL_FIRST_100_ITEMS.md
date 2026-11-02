@@ -106,8 +106,10 @@ Each workstream changes an existing kernel-core Rust module. Tests are host-side
 - [x] R115-079 — Reject packets queued across PID reincarnation  
   Evidence: Integrated: closing ports discards queued messages; PID-generation-reuse acceptance exercised in host tests
 - [ ] R115-080 — Prove two guest processes cannot release peer ports in QEMU
-- [ ] R115-081 — Wire lease batch revoke to scheduler PCB lifecycle
-- [ ] R115-082 — Bind lease table identity to real kernel process capability
+- [x] R115-081 — Wire lease batch revoke to scheduler PCB lifecycle
+  R116 source integration: Scheduler revoke_task_authority now revokes generation-specific LeaseTable entries before retiring FileHandles for every exit/fault/rollback. Exact-head CI required; this is not an SMP qualification.
+- [x] R115-082 — Bind lease table identity to real kernel process capability
+  R116 source integration: PID2 shared-directory lease is minted by the trusted scheduler only after both FileHandles process generations are live, and checked at actual ring3 syscall 34. Exact-head CI required; this is not an SMP qualification.
 - [ ] R115-083 — Exercise real ring3 delegated-handle revocation
 - [ ] R115-084 — Audit lock ordering of file/network lease teardown
 - [ ] R115-085 — Prove no scheduler teardown deadlock in SMP configuration
@@ -162,3 +164,7 @@ The existing QEMU virtio NIC demo now checks the same live UDP PID-generation re
 ## R115 selected-volume alias invalidation
 
 `fs_handles.rs` now binds `MountAlias` to the selected physical partition receipt and a monotonic mount revision. First verified selection and explicit healthy recovery rotate this revision; quarantine denies all aliases. Stale aliases fail before disk access even if the original path spelling remains valid. This is source/fixture verification; it is not physical hotplug or hardware media-swap qualification.
+
+## R116 continuity
+
+R115-081 and R115-082 now have production-path single-BSP source wiring in R116, described above. Remaining R115 unchecked items are preserved for testing, QEMU acceptance or physical hardware qualification. R116 is a distinct one-commit integration PR and will not be merged until mandatory exact-head checks pass.
