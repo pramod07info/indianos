@@ -1056,6 +1056,11 @@ pub fn revalidate_quarantined_selected_volume<D:BlockDevice>(
     table.entries.iter().any(|handle|handle.token!=0){
     return Err(FsError::InvalidName);
  }
+ // A capacity mismatch is an immediate device-identity failure, before
+ // attempting any partition-sector I/O during privileged recovery.
+ if disk.sector_count()!=receipt.device_sectors{
+    return Err(FsError::InvalidVolume);
+ }
  let next=table.volume_revision.checked_add(1).ok_or(FsError::Full)?;
  // The revision must be mintable before even reading a quarantined device.
  let _mounted=crate::m1_partition::mount_partition_receipt_healthy(
@@ -1088,7 +1093,11 @@ pub fn operation_on_selected_volume<D:BlockDevice>(
     // Reject a device swap before any sector read (and before publication of
     // a new last-admitted namespace). The full GPT/MBR proof is still
     // checked by mount_partition_receipt_healthy after this quick preflight.
-    if disk.sector_count()!=receipt.device_sectors{
+    if disk.sector_count()!=receipt.device_sectors ||
+       receipt.partition.start.checked_add(receipt.partition.sectors)
+         .is_none_or(|end|end>receipt.device_sectors) ||
+       receipt.partition.sectors<MIN_SECTORS ||
+       receipt.mbr_sector[510..512]!=[0x55,0xaa] {
         return Err(FsError::InvalidVolume);
     }
     let prior=guard.selected_volume;
@@ -2413,6 +2422,45 @@ mod r106_checked_partition_authenticated_file_api_tests{
   assert_eq!(revalidate_quarantined_selected_volume(&mut t,id,
       &mut watch,receipt),Err(FsError::Full));
   assert_eq!(watch.reads,0);assert!(t.selected_quarantined);
+ }
+
+ #[test]fn r120_partition_receipt_shape_denied_without_any_media_read(){
+  let (mut d,original)=disk();
+  let mut t=FileHandles::new();let owner=t.bind_process(1).unwrap();
+  let mut invalid=original;
+  invalid.partition.sectors=u64::MAX;
+  let bad=[invalid,
+    crate::m1_partition::PartitionReceipt{
+       mbr_sector:[0u8;SECTOR_BYTES],..original},
+    crate::m1_partition::PartitionReceipt{
+       device_sectors:original.device_sectors-1,..original}
+  ];
+  let reads=d.reads;let writes=d.writes;
+  for receipt in bad {
+    assert_eq!(operation_on_selected_volume(&mut t,1,owner,0,READ,
+      "/shared/note",&mut[],&mut d,receipt),Err(FsError::InvalidVolume));
+  }
+  assert_eq!((d.reads,d.writes),(reads,writes));
+  assert!(t.last_syscall_namespace().is_none());
+ }
+ #[test]fn r120_recovery_capacity_mismatch_rejects_before_sector_io(){
+  struct WrongCapacity<'a>{inner:&'a mut Disk,reads:usize}
+  impl BlockDevice for WrongCapacity<'_>{
+    fn sector_count(&self)->u64{COUNT as u64+1}
+    fn read_sector(&mut self,l:u64,out:&mut[u8;SECTOR_BYTES])
+       ->Result<(),BlockError>{self.reads+=1;self.inner.read_sector(l,out)}
+    fn write_sector(&mut self,l:u64,b:&[u8;SECTOR_BYTES])
+       ->Result<(),BlockError>{self.inner.write_sector(l,b)}
+  }
+  let (mut d,receipt)=disk();
+  let mut t=FileHandles::new();let id=t.bind_process(1).unwrap();
+  operation_on_selected_volume(&mut t,1,id,0,READ,
+    "/shared/note",&mut[],&mut d,receipt).unwrap();
+  t.selected_quarantined=true;t.entries.fill(Handle::EMPTY);
+  let mut wrong=WrongCapacity{inner:&mut d,reads:0};
+  assert_eq!(revalidate_quarantined_selected_volume(&mut t,id,
+    &mut wrong,receipt),Err(FsError::InvalidVolume));
+  assert_eq!(wrong.reads,0);assert!(t.selected_quarantined);
  }
  fn disk()->(Disk,PartitionReceipt){
   let mut d=Disk{sectors:[[0;SECTOR_BYTES];COUNT],reads:0,writes:0};

@@ -1651,6 +1651,11 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
     unsafe{indianos_process_fault(pcb,status,v,e,a)}
    }else{unsafe{indianos_process_exit(pcb,status)}};
    if !finished{ok=false;break;}
+   // Both a normal process exit and a ring-3 fault must revoke live network,
+   // file and delegated capability authority BEFORE potentially fallible
+   // user page-table / frame reclamation below. The rollback path still
+   // calls the same idempotent retirement when process termination fails.
+   revoke_task_authority(task);
    #[cfg(feature="test-r030-ondevice")]
    fault_hex(b"IndianOS: R030 scheduler exit status=0x\0",status);
    #[cfg(feature="test-r031-boot-desktop")]

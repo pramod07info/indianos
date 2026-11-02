@@ -213,3 +213,9 @@ Evidence discipline: cohort assignment is not task completion. The 60 originally
 
 ### CI correction: stale UDP retirement contract
 The restored exact-generation validation intentionally refuses a delayed retiring PID after replacement registration. Updated the pre-existing R118 regression to expect `Err(SocketError::Denied)`, rather than the former `Ok(0)`, with the newer owner’s registry and queue still intact. This is a security-preserving behavior change, not an API compilation workaround. Also marked R118-007 (cached handles remain stale after recovery) and R118-010 (write-time mount probe uncertainty quarantines service) as bounded source/test implementations; these are contingent on exact-final-head CI.
+
+## R118 continuation — production retirement and physical receipt preflight
+
+- Runtime scheduler: the real process exit/fault branch invokes `revoke_task_authority` immediately after successful PCB state transition and **before** fallible page reclamation. Existing `discard` and rollback invoke the same exact-generation idempotent path again. This covers source-level integration of both normal and fault retirement, without claiming that hardware SMP or arbitrary IRQ races are qualified.
+- File service: reject forged overflowed/undersized partition extents, missing pinned MBR signature, and changed parent capacity before disk I/O; privileged quarantined-volume recovery similarly checks capacity before probing. Regression tests assert zero reads/writes and preserved quarantine.
+- The inherited hardware gates remain OPEN. Exact-head CI regression evidence is required before marking additional source-level items completed.
