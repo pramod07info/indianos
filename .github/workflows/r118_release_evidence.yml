@@ -1,0 +1,21 @@
+name: R118 release evidence unit tests
+
+on:
+  pull_request:
+    paths:
+      - 'scripts/r118_release_gate.py'
+      - 'scripts/test_r118_release_gate.py'
+      - '.github/workflows/r118_release_evidence.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  exact-head-evidence-unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout selected PR commit
+        uses: actions/checkout@v4
+      - name: Verify Python evidence gate regressions
+        run: python3 -m unittest -v scripts/test_r118_release_gate.py

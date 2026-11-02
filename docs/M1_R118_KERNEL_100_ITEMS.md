@@ -15,10 +15,10 @@ Base: `90656c3261bb6c4007f39e2a7d4a5403dc561f74` (merged R117 PR #749).
 - [ ] R118-004 — Preflight partition identity before first disk read
 - [x] R118-005 — Guard selected-volume receipt after mount probe
 - [x] R118-006 — Fail closed when volume geometry changes
-- [ ] R118-007 — Reject cached handle after recovery revision
+- [x] R118-007 — Reject cached handle after recovery revision
 - [x] R118-008 — Preserve filesystem owner grants on failed process batch
 - [ ] R118-009 — Prove deterministic deadlock-free file-owner retirement
-- [ ] R118-010 — Propagate write uncertainty to quarantine
+- [x] R118-010 — Propagate write uncertainty to quarantine
 - [x] R118-011 — Keep revision monotonic across full remount
 - [x] R118-012 — Verify alias invalidation after PID reuse
 - [ ] R118-013 — Exercise selected-volume stale-token fuzz in QEMU
@@ -197,3 +197,19 @@ Cohort: R118-071, R118-072, R118-073, R118-074, R118-075, R118-076, R118-077, R1
 
 ## Six commits / cohort 5 — exact-SHA and reviewer verification
 Cohort: R118-081, R118-082, R118-083, R118-084, R118-085, R118-086, R118-087, R118-088, R118-089, R118-090. Hardened release verifier to reject outdated independent approvals and unresolved CHANGES_REQUESTED review; added seven Python stdlib tests for exact SHA, incomplete required CI, author self-review, stale approvals, blocking reviews and missing branch protection. Physical SMP, immutable firmware root, real power-loss, IOMMU and clock hardware gates remain OPEN. Tests are code-level until CI explicitly executes them.
+
+## Six commits / cohort 6 — final release and CI acceptance
+Cohort: R118-091, R118-092, R118-93, R118-94, R118-95, R118-96, R118-97, R118-98, R118-99, R118-100. Added read-only release evidence verifier unit tests to GitHub Actions, and a 10-gate hold matrix. **No final release gate is marked complete until exact final commit CI, QEMU acceptance, independent review, branch protection, verified main SHA, and hardware gap notes exist.**
+
+Six-commit batch record (each commit message contains exactly 10 assigned task IDs):
+1. `0acce6042807bedfa04918548c4afa8009956d01` — cohort 1/6
+2. `8f8620428cdc531b11b139d26fe0c0570cf89c0f` — cohort 2/6
+3. `c2b32bf52e1702ceb0bd043a9cd1318ca9cf5b12` — cohort 3/6
+4. `9f6721e578305276d2b5ff93dfafee8bde81b638` — cohort 4/6
+5. `0877f0e663129251503bbe0f425244131001114b` — cohort 5/6
+6. This final commit — cohort 6/6, exact SHA available in GitHub PR history.
+
+Evidence discipline: cohort assignment is not task completion. The 60 originally pending tasks are split into six verifiable groups, not claimed as implemented merely because a commit lists them. One documentation task (R118-069) was completed in batch 3; the remaining items retain their [ ] state.
+
+### CI correction: stale UDP retirement contract
+The restored exact-generation validation intentionally refuses a delayed retiring PID after replacement registration. Updated the pre-existing R118 regression to expect `Err(SocketError::Denied)`, rather than the former `Ok(0)`, with the newer owner’s registry and queue still intact. This is a security-preserving behavior change, not an API compilation workaround. Also marked R118-007 (cached handles remain stale after recovery) and R118-010 (write-time mount probe uncertainty quarantines service) as bounded source/test implementations; these are contingent on exact-final-head CI.

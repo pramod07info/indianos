@@ -2148,7 +2148,9 @@ mod r118_orphan_udp_and_ipv4_security_tests{
    Err(crate::udp_owner_epoch::Error::Denied));
   assert!(registry.authorize(8,2,5402).is_ok());
   sockets.bind_registered(&mut registry,7,2,5401).unwrap();
-  assert_eq!(sockets.retire_exact_kernel(&mut registry,7,1),Ok(0));
+  // A stale owner must fail closed once a newer PID incarnation exists.
+  assert_eq!(sockets.retire_exact_kernel(&mut registry,7,1),
+      Err(SocketError::Denied));
   assert!(registry.authorize(7,2,5401).is_ok());
   assert!(registry.authorize(8,2,5402).is_ok());
   assert_eq!(sockets.retire_exact_kernel(&mut registry,0,1),
