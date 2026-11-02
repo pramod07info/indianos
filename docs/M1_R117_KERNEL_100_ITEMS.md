@@ -92,7 +92,7 @@ Items 001–070 are 70 granular source-level behaviors implemented across five l
 - [x] R117-072 — Inherited R116-072 — Inherited R115-075 — Add adversarial ring3 namespace pointer QEMU boot test
 - [ ] R117-073 — Inherited R116-073 — Inherited R115-078 — Enforce port-generation checks at network ingress IRQ
 - [x] R117-074 — Inherited R116-074 — Inherited R115-080 — Prove two guest processes cannot release peer ports in QEMU
-- [ ] R117-075 — Inherited R116-075 — Inherited R115-083 — Exercise real ring3 delegated-handle revocation
+- [x] R117-075 — Inherited R116-075 — Inherited R115-083 — Exercise real ring3 delegated-handle revocation
 - [ ] R117-076 — Inherited R116-076 — Inherited R115-084 — Audit lock ordering of file/network lease teardown
 - [ ] R117-077 — Inherited R116-077 — Inherited R115-085 — Prove no scheduler teardown deadlock in SMP configuration
 - [ ] R117-078 — Inherited R116-078 — Inherited R115-086 — Use trusted boot observer in production PID1 boot path
@@ -115,7 +115,7 @@ Items 001–070 are 70 granular source-level behaviors implemented across five l
 - [ ] R117-095 — Inherited R116-099 — Complete independent review and branch protection before merge
 - [ ] R117-096 — Inherited R116-100 — Publish verified post-merge main SHA and record release evidence
 - [ ] R117-097 — Integrate a hardware-calibrated kernel monotonic clock into live NIC dispatch
-- [ ] R117-098 — Run real two-guest ring3 foreign-port-close and lease-revocation QEMU acceptance
+- [x] R117-098 — Run real two-guest ring3 foreign-port-close and lease-revocation QEMU acceptance
 - [ ] R117-099 — Complete a final exact-head persistent graphical Files reboot and release matrix
 - [ ] R117-100 — Publish independent review, protected merge SHA and hardware-vs-QEMU evidence
 
@@ -163,3 +163,11 @@ The following **six gates** have verified end-to-end or optimized-build evidence
 Source: https://github.com/pramod07info/indianos/pull/749/checks
 
 **Important:** This documentation-only reconciliation creates a new Git commit and must itself be reviewed. New exact-head CI is required before final merge. R117-085 (host tests on exact *final* SHA), R117-094 (complete final exact-head CI matrix), R117-099 (final release matrix), R117-087/095/096/100 (review/merge/release evidence), and all physical/SMP/firmware/IOMMU tests intentionally remain unchecked. The real scheduler directory-lease test passed on the previous source head, but R117-075 specifically asks for ring3 **delegated-handle revocation** acceptance, so it is not marked complete. R117-098 combines two-guest foreign port close and **ring3 lease revocation**; only the former was exercised in QEMU, so it remains open.
+
+
+## R117 kernel-observed scheduler revocation QEMU evidence
+
+- Source SHA `66b80722587087bda06fe3e98ae716b02db6278d` executed the actual PID2 ring-3 Files process, its delegated `/shared` directory lease, UDP port, and normal shutdown with kernel `revoke_task_authority`. The production kernel checks the grant is revoked, port 5502 is unbound and exact FileHandles owner retired before emitting `R117 QEMU PID2 delegated directory and UDP authority revoked at scheduler exit`; otherwise it emits a FATAL marker. Two real QEMU persistent Files boots passed this required assertion. This qualifies R117-075 within the single-BSP QEMU scope.
+- Both real guest processes independently attempted foreign UDP port closure via syscall 36, received denial, and still exchanged a valid PING/PONG. The same QEMU test enforced the kernel scheduler revocation marker after PID2 exit. Together they satisfy the specified R117-098 QEMU acceptance; they do not prove physically concurrent interrupt/SMP teardown.
+- Verified GitHub job: `durable-files-desktop` SUCCESS for source SHA `66b80722587087bda06fe3e98ae716b02db6278d` on PR #749. This reconciliation itself creates a documentation-only SHA; run exact-head CI again before merge.
+- Remaining hardware-only or production trust qualifications are NOT complete; especially R117-071's concurrent mount replacement under SMP, 073's physical NIC interrupt IRQ route, 076/077/090's multicore locks, 078/079/091's immutable measured boot and PID1 trusted observer, 080/081/092 physical power-loss recovery, 082/097 hardware monotonic clock and 083/093 IOMMU isolation.
