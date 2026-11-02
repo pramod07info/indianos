@@ -1056,11 +1056,10 @@ pub fn revalidate_quarantined_selected_volume<D:BlockDevice>(
     table.entries.iter().any(|handle|handle.token!=0){
     return Err(FsError::InvalidName);
  }
+ let next=table.volume_revision.checked_add(1).ok_or(FsError::Full)?;
+ // The revision must be mintable before even reading a quarantined device.
  let _mounted=crate::m1_partition::mount_partition_receipt_healthy(
      disk,receipt).map_err(|_|FsError::InvalidVolume)?;
- // Recovery itself changes mount authority, even when the selected
- // partition receipt identifies the same physical disk and GPT slot.
- let next=table.volume_revision.checked_add(1).ok_or(FsError::Full)?;
  table.volume_revision=next;
  table.selected_quarantined=false;
  Ok(())
@@ -1104,8 +1103,20 @@ pub fn operation_on_selected_volume<D:BlockDevice>(
         }
         Some(table.volume_revision.checked_add(1).ok_or(FsError::Full)?)
     }else{None};
-    let mut volume=crate::m1_partition::mount_partition_receipt_healthy(
-       disk,receipt).map_err(|_|FsError::InvalidVolume)?;
+    let mut volume=match crate::m1_partition::mount_partition_receipt_healthy(
+       disk,receipt){
+       Ok(volume)=>volume,
+       Err(_)=>{
+         // Existing selected volume failed verification on a write: media
+         // may be uncertain; revoke cached handles before the next syscall.
+         if prior==Some(receipt)&&
+            matches!(action,3|6|7..=13|16|24|26|27|28..=32){
+             table.selected_quarantined=true;
+             table.entries.fill(Handle::EMPTY);
+         }
+         return Err(FsError::InvalidVolume);
+       }
+    };
     // Revalidate the complete namespace, selected receipt, mount revision
     // and quarantine state after the storage probe, not only the pathname.
     if !table.selected_operation_guard_is_current(guard){
@@ -2359,6 +2370,49 @@ mod r106_checked_partition_authenticated_file_api_tests{
   let fresh=operation_on_selected_volume(&mut handles,1,replacement,0,READ,
       "/shared/note",&mut[],&mut disk,receipt).unwrap();
   assert_ne!(fresh,fd);
+ }
+
+ #[test]fn r119_failed_write_mount_verification_quarantines_selected_session(){
+  struct Broken<'a>(&'a mut Disk);
+  impl BlockDevice for Broken<'_>{
+   fn sector_count(&self)->u64{COUNT as u64}
+   fn read_sector(&mut self,_:u64,_:&mut[u8;SECTOR_BYTES])
+     ->Result<(),BlockError>{Err(BlockError::Io)}
+   fn write_sector(&mut self,l:u64,b:&[u8;SECTOR_BYTES])
+     ->Result<(),BlockError>{self.0.write_sector(l,b)}
+  }
+  let (mut d,receipt)=disk();let mut t=FileHandles::new();
+  let id=t.bind_process(1).unwrap();
+  let fd=operation_on_selected_volume(&mut t,1,id,0,READ|WRITE,
+      "/shared/note",&mut[],&mut d,receipt).unwrap();
+  assert_eq!(operation_on_selected_volume(&mut t,3,id,fd,0,"",
+      &mut b"x".to_vec(),&mut Broken(&mut d),receipt),Err(FsError::InvalidVolume));
+  assert!(t.selected_quarantined);
+  assert_eq!(operation_on_selected_volume(&mut t,2,id,fd,0,"",
+      &mut[0u8;8],&mut d,receipt),Err(FsError::InvalidName));
+  revalidate_quarantined_selected_volume(&mut t,id,&mut d,receipt).unwrap();
+  assert_eq!(operation_on_selected_volume(&mut t,2,id,fd,0,"",
+      &mut[0u8;8],&mut d,receipt),Err(FsError::InvalidName));
+ }
+ #[test]fn r119_full_revision_recovery_has_zero_disk_io(){
+  struct ReadCounter<'a>{disk:&'a mut Disk,reads:usize}
+  impl BlockDevice for ReadCounter<'_>{
+   fn sector_count(&self)->u64{COUNT as u64}
+   fn read_sector(&mut self,l:u64,out:&mut[u8;SECTOR_BYTES])
+      ->Result<(),BlockError>{self.reads+=1;self.disk.read_sector(l,out)}
+   fn write_sector(&mut self,l:u64,b:&[u8;SECTOR_BYTES])
+      ->Result<(),BlockError>{self.disk.write_sector(l,b)}
+  }
+  let (mut d,receipt)=disk();let mut t=FileHandles::new();
+  let id=t.bind_process(1).unwrap();
+  operation_on_selected_volume(&mut t,1,id,0,READ,
+      "/shared/note",&mut[],&mut d,receipt).unwrap();
+  t.selected_quarantined=true;t.entries.fill(Handle::EMPTY);
+  t.volume_revision=u64::MAX;
+  let mut watch=ReadCounter{disk:&mut d,reads:0};
+  assert_eq!(revalidate_quarantined_selected_volume(&mut t,id,
+      &mut watch,receipt),Err(FsError::Full));
+  assert_eq!(watch.reads,0);assert!(t.selected_quarantined);
  }
  fn disk()->(Disk,PartitionReceipt){
   let mut d=Disk{sectors:[[0;SECTOR_BYTES];COUNT],reads:0,writes:0};

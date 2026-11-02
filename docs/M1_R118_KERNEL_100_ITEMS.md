@@ -182,3 +182,6 @@ The additions below cover 19 **specific** ledger items with bounded new implemen
 - All recovery and power loss tests here are model-level. Actual abrupt physical power cut and immutable TPM/UEFI root remain **unverified**.
 
 **Honest acceptance:** 40/100 source/test/document items checked, 60 items open. The 22 inherited R117 gates and the eight final release gates remain unchecked. New exact-head host Rust, freestanding build and QEMU workflows must rerun; prior green checks do not authorize merge. Five workstreams are logical, not five deployed autonomous coding agents.
+
+## Six commits / cohort 1 — filesystem and scheduler admission
+Cohort R118-001, R118-003, R118-004, R118-007, R118-009, R118-010, R118-013, R118-014, R118-016, R118-017. Implemented source: a failed write-time mount verification on an already selected disk quarantines cached handles; recovery revision exhaustion rejects without disk reads. Two regression tests. This does not complete the ten-item cohort; the physical SMP and QEMU gates remain open.
