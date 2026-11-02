@@ -307,6 +307,154 @@ pub fn inspect_gpt_selection<D:BlockDevice>(disk:&mut D,index:u32)
  if catalog.scheme()!=Scheme::Gpt{return Err(Error::Unsupported);}
  catalog.get_gpt_selection(index).ok_or(Error::NotFound)
 }
+/// Exact MBR sector-0 fingerprint pins the caller's selected partition even
+/// if the LBA range and sector count are reused. Unlike GPT it does not
+/// provide a cryptographic or device-unique identity. Never autoformat.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct MbrSelection{
+ pub partition:Partition,
+ pub sector_zero:[u8;SECTOR_BYTES],
+}
+/// A media swap during the full catalog scan invalidates the selection.
+pub fn inspect_mbr_selection<D:BlockDevice>(
+ disk:&mut D,index:u32)->Result<MbrSelection,Error>{
+ let first=read(disk,0)?;
+ let catalog=discover(disk)?;
+ if catalog.scheme()!=Scheme::Mbr{return Err(Error::Unsupported);}
+ let partition=catalog.get(index).ok_or(Error::NotFound)?;
+ let second=read(disk,0)?;
+ if first!=second{return Err(Error::Invalid);}
+ Ok(MbrSelection{partition,sector_zero:second})
+}
+/// Strictly mount only the same exact validated MBR layout, then repeat the
+/// fingerprint check after filesystem metadata reads before returning a mount.
+pub fn mount_mbr_selected_healthy<'a,D:BlockDevice>(
+ disk:&'a mut D,expected:MbrSelection)
+ ->Result<HierVfs<BlockWindow<'a,D>>,MountError>{
+ let before=inspect_mbr_selection(disk,expected.partition.index)
+  .map_err(MountError::Partition)?;
+ if before!=expected{return Err(MountError::Partition(Error::Invalid));}
+ let mut volume=mount_checked_healthy(disk,expected.partition)?;
+ volume.validate_device(|window|window.validate_parent(|parent|{
+  let after=inspect_mbr_selection(parent,expected.partition.index)
+   .map_err(MountError::Partition)?;
+  if after!=expected{return Err(MountError::Partition(Error::Invalid));}
+  Ok(())
+ }, |_|MountError::Partition(Error::Invalid)))?;
+ Ok(volume)
+}
+
+
+/// A deterministic integrity receipt for a complete, selected MBR/GPT table.
+/// CRC32 is for accidental-media-change detection, NOT an authentication MAC.
+/// GPT also pins both on-disk unique GUID identities; MBR pins exact sector 0.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct PartitionReceipt {
+ pub partition:Partition,
+ /// Exact sector count pins the selected physical medium across remount.
+ /// MBR metadata alone cannot authenticate a same-layout larger disk.
+ pub device_sectors:u64,
+ pub table_crc32:u32,
+ pub mbr_sector:[u8;SECTOR_BYTES],
+ pub gpt:Option<GptSelection>,
+}
+/// Read every GPT table/header sector (both mirrored copies) under a fresh
+/// discovery validation. No parent-disk write is permitted through this path.
+fn table_digest<D:BlockDevice>(disk:&mut D,scheme:Scheme)->Result<u32,Error>{
+ let capacity=disk.sector_count();
+ if capacity<2{return Err(Error::Invalid);}
+ let mut sum=crc_update(!0,&read(disk,0)?);
+ if scheme==Scheme::Gpt{
+  let header=read(disk,1)?;
+  if &header[..8]!=b"EFI PART"{return Err(Error::Invalid);}
+  let entries=le32(&header[80..84]) as usize;
+  let size=le32(&header[84..88]) as usize;
+  if entries==0||entries>MAX_GPT_ENTRIES||size!=128{
+   return Err(Error::Unsupported);
+  }
+  let bytes=entries.checked_mul(size).ok_or(Error::OutOfRange)?;
+  let sectors=bytes.div_ceil(SECTOR_BYTES);
+  let primary=le64(&header[72..80]);
+  let backup_head=capacity-1;
+  let backup=read(disk,backup_head)?;
+  if &backup[..8]!=b"EFI PART"{return Err(Error::Invalid);}
+  let backup_start=le64(&backup[72..80]);
+  let primary_end=primary.checked_add(sectors as u64).ok_or(Error::OutOfRange)?;
+  let backup_end=backup_start.checked_add(sectors as u64).ok_or(Error::OutOfRange)?;
+  if primary<2||primary_end>=backup_start||backup_end>backup_head{
+   return Err(Error::OutOfRange);
+  }
+  sum=crc_update(sum,&header);
+  sum=crc_update(sum,&backup);
+  for i in 0..sectors{
+   sum=crc_update(sum,&read(disk,primary+i as u64)?);
+   sum=crc_update(sum,&read(disk,backup_start+i as u64)?);
+  }
+ }
+ if capacity!=disk.sector_count(){return Err(Error::Io);}
+ Ok(!sum)
+}
+/// Inspect twice to detect changes during digest acquisition. This is a
+/// fail-closed identity pin, not an SMP/device-wide mutation lock.
+pub fn inspect_partition_receipt<D:BlockDevice>(
+ disk:&mut D,index:u32)->Result<PartitionReceipt,Error>{
+ let device_sectors=disk.sector_count();
+ let first=discover(disk)?;
+ if device_sectors!=disk.sector_count(){return Err(Error::Io);}
+ let partition=first.get(index).ok_or(Error::NotFound)?;
+ let initial_mbr=read(disk,0)?;
+ let digest=table_digest(disk,first.scheme())?;
+ let final_catalog=discover(disk)?;
+ let final_mbr=read(disk,0)?;
+ let confirm=table_digest(disk,first.scheme())?;
+ if device_sectors!=disk.sector_count(){
+  return Err(Error::Io);
+ }
+ if first!=final_catalog||initial_mbr!=final_mbr||digest!=confirm{
+  return Err(Error::Invalid);
+ }
+ Ok(PartitionReceipt{partition,device_sectors,
+  table_crc32:digest,mbr_sector:final_mbr,
+  gpt:final_catalog.get_gpt_selection(index)})
+}
+/// Validated selected-mount session: reject any changed partition metadata
+/// before and after the filesystem head/payload reads. No autoformat.
+pub fn mount_partition_receipt_healthy<'a,D:BlockDevice>(
+ disk:&'a mut D,expected:PartitionReceipt)
+ ->Result<HierVfs<BlockWindow<'a,D>>,MountError>{
+ let before=inspect_partition_receipt(disk,expected.partition.index)
+  .map_err(MountError::Partition)?;
+ if before!=expected{return Err(MountError::Partition(Error::Invalid));}
+ let mut volume=mount_checked_healthy(disk,expected.partition)?;
+ volume.validate_device(|window|window.validate_parent(|parent|{
+  let after=inspect_partition_receipt(parent,expected.partition.index)
+   .map_err(MountError::Partition)?;
+  if after!=expected{return Err(MountError::Partition(Error::Invalid));}
+  Ok(())
+ }, |_|MountError::Partition(Error::Invalid)))?;
+ Ok(volume)
+}
+
+/// Strict diagnostic preflight on an explicit receipt. Apply a hardware
+/// read-only block capability to the WHOLE parent disk, not just the COW
+/// window, and recheck its full GPT/MBR receipt after filesystem health
+/// reads. A capacity or table change never yields an apparently healthy
+/// diagnostic result; the function cannot repair, format or write.
+pub fn probe_selected_receipt_readonly<D:BlockDevice>(
+ disk:&mut D,expected:PartitionReceipt)->Result<PartitionHealth,MountError>{
+ let mut read_only=ReadOnlyDevice::new(disk);
+ let before=inspect_partition_receipt(&mut read_only,expected.partition.index)
+  .map_err(MountError::Partition)?;
+ if before!=expected{return Err(MountError::Partition(Error::Invalid));}
+ let checked=probe_volume(&mut read_only,expected.partition.index)?;
+ if checked.partition!=expected.partition{
+  return Err(MountError::Partition(Error::Invalid));
+ }
+ let after=inspect_partition_receipt(&mut read_only,expected.partition.index)
+  .map_err(MountError::Partition)?;
+ if after!=expected{return Err(MountError::Partition(Error::Invalid));}
+ Ok(checked)
+}
 /// Read-only validated disk geometry and independent COW metadata health.
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 pub struct PartitionHealth{pub partition:Partition,pub volume:VolumeHealth}
@@ -331,14 +479,22 @@ pub fn probe_volume<D:BlockDevice>(disk:&mut D,index:u32)
 /// GUID token after the disk changes during its filesystem metadata reads.
 pub fn probe_gpt_identity_health<D:BlockDevice>(disk:&mut D,index:u32)
  ->Result<(GptSelection,VolumeHealth),MountError>{
- let before=inspect_gpt_selection(disk,index).map_err(MountError::Partition)?;
- let health=probe_volume(disk,index)?;
+ // A GPT entry's attributes or neighboring table records can change
+ // without changing either the disk GUID or selected partition GUID.
+ // Pin the full two-copy receipt, including both GPT header/entry arrays,
+ // protective MBR and device capacity. No parent write is permitted here.
+ let mut read_only=ReadOnlyDevice::new(disk);
+ let before=inspect_partition_receipt(&mut read_only,index)
+  .map_err(MountError::Partition)?;
+ let chosen=before.gpt.ok_or(MountError::Partition(Error::Unsupported))?;
+ let health=probe_volume(&mut read_only,index)?;
  if health.partition!=before.partition{
   return Err(MountError::Partition(Error::Invalid));
  }
- let after=inspect_gpt_selection(disk,index).map_err(MountError::Partition)?;
+ let after=inspect_partition_receipt(&mut read_only,index)
+  .map_err(MountError::Partition)?;
  if before!=after{return Err(MountError::Partition(Error::Invalid));}
- Ok((before,health.volume))
+ Ok((chosen,health.volume))
 }
 /// Mount a previously chosen partition only when its full on-disk geometry
 /// still matches a fresh complete read-only layout validation. This closes a
@@ -352,7 +508,15 @@ pub fn mount_checked<'a,D:BlockDevice>(disk:&'a mut D,
  }
  let bounded=BlockWindow::new(disk,actual.start,actual.sectors)
   .map_err(|_|MountError::Partition(Error::OutOfRange))?;
- HierVfs::mount(bounded).map_err(MountError::Filesystem)
+ let mut mounted=HierVfs::mount(bounded).map_err(MountError::Filesystem)?;
+ // The disk may be swapped while the filesystem is examining metadata.
+ // Validate the entire partition catalog again *inside the mounted borrow*.
+ mounted.validate_device(|window|window.validate_parent(|parent|{
+  let final_part=inspect(parent,expected.index).map_err(MountError::Partition)?;
+  if final_part!=expected{return Err(MountError::Partition(Error::Invalid));}
+  Ok(())
+ }, |_|MountError::Partition(Error::Invalid)))?;
+ Ok(mounted)
 }
 /// Strict preflight-selected mount. Refuse a changed GPT/MBR geometry or
 /// any degraded COW filesystem. No autoformat, recovery or disk writes.
@@ -369,7 +533,14 @@ pub fn mount_checked_healthy<'a,D:BlockDevice>(disk:&'a mut D,
  }
  let bounded=BlockWindow::new(disk,expected.start,expected.sectors)
   .map_err(|_|MountError::Partition(Error::OutOfRange))?;
- HierVfs::mount_healthy(bounded).map_err(MountError::Filesystem)
+ let mut mounted=HierVfs::mount_healthy(bounded).map_err(MountError::Filesystem)?;
+ // Strict healthy mounts also need post-mount identity validation.
+ mounted.validate_device(|window|window.validate_parent(|parent|{
+  let final_part=inspect(parent,expected.index).map_err(MountError::Partition)?;
+  if final_part!=expected{return Err(MountError::Partition(Error::Invalid));}
+  Ok(())
+ }, |_|MountError::Partition(Error::Invalid)))?;
+ Ok(mounted)
 }
 /// Mount previously provisioned IndianOS volume inside an explicitly chosen
 /// partition. The disk is borrowed; the view cannot access neighboring
@@ -378,29 +549,16 @@ pub fn mount_checked_healthy<'a,D:BlockDevice>(disk:&'a mut D,
 /// Caller must quiesce the block device between preflight and mounting.
 pub fn mount_gpt_selected_healthy<'a,D:BlockDevice>(disk:&'a mut D,
  expected:GptSelection)->Result<HierVfs<BlockWindow<'a,D>>,MountError>{
- // Reject a stale GUID selection BEFORE touching filesystem metadata,
- // preserving the strict no-foreign-volume-read boundary and its error.
- let initial=inspect_gpt_selection(disk,expected.partition.index)
+ // A GUID/geometry tuple is not enough: another valid table with the same
+ // GUIDs may change attributes or neighboring entries during COW health
+ // reads. Capture the full primary/secondary GPT + protective MBR receipt
+ // and pin it across all subsequent mounted filesystem reads.
+ let receipt=inspect_partition_receipt(disk,expected.partition.index)
   .map_err(MountError::Partition)?;
- if initial!=expected{return Err(MountError::Partition(Error::Invalid));}
- // Also revalidate both GUIDs AFTER COW health reads to catch a media swap
- // while the selected volume is being probed.
- let (actual,health)=probe_gpt_identity_health(disk,expected.partition.index)?;
- if actual!=expected{return Err(MountError::Partition(Error::Invalid));}
- if health.redundancy!=crate::durablefs::Redundancy::Healthy{
-  return Err(MountError::Filesystem(FsError::InvalidVolume));
+ if receipt.gpt!=Some(expected) || receipt.partition.scheme!=Scheme::Gpt {
+  return Err(MountError::Partition(Error::Invalid));
  }
- let mut mounted=mount_checked_healthy(disk,actual.partition)?;
- // The actual mount performs further filesystem reads after the earlier
- // GUID preflight. Revalidate while retaining the mounted device borrow;
- // dropping and remounting here would simply recreate the same gap.
- mounted.validate_device(|window|window.validate_parent(|parent|{
-  let final_selection=inspect_gpt_selection(parent,expected.partition.index)
-   .map_err(MountError::Partition)?;
-  if final_selection!=expected{return Err(MountError::Partition(Error::Invalid));}
-  Ok(())
- }, |_|MountError::Partition(Error::Invalid)))?;
- Ok(mounted)
+ mount_partition_receipt_healthy(disk,receipt)
 }
 /// Explicit recovery operation used by the authenticated Terminal service.
 /// Keep the original GUID/geometry binding while admitting one good COW head;
@@ -427,11 +585,8 @@ pub(crate) fn repair_gpt_selected<D:BlockDevice>(disk:&mut D,
 }
 pub fn mount<'a,D:BlockDevice>(disk:&'a mut D,index:u32)
  ->Result<HierVfs<BlockWindow<'a,D>>,MountError>{
- let part=inspect(disk,index).map_err(MountError::Partition)?;
- if part.sectors<MIN_SECTORS{return Err(MountError::Partition(Error::OutOfRange));}
- let bounded=BlockWindow::new(disk,part.start,part.sectors)
-  .map_err(|_|MountError::Partition(Error::OutOfRange))?;
- HierVfs::mount(bounded).map_err(MountError::Filesystem)
+ let expected=inspect(disk,index).map_err(MountError::Partition)?;
+ mount_checked(disk,expected)
 }
 #[cfg(test)]
 mod m1_partition_tests{
@@ -529,6 +684,262 @@ mod m1_partition_tests{
   fn write_sector(&mut self,lba:u64,input:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
    self.disk.write_sector(lba,input)
   }
+ }
+ #[test]fn r101_mbr_selection_rejects_changed_sector_zero_without_writes(){
+  let mut disk=mbr_disk();
+  let selection=inspect_mbr_selection(&mut disk,0).unwrap();
+  disk.data[0][440]^=0x45; // a still-valid MBR, same partition geometry
+  let writes=disk.writes;
+  assert!(matches!(mount_mbr_selected_healthy(&mut disk,selection),
+      Err(MountError::Partition(Error::Invalid))));
+  assert_eq!(disk.writes,writes);
+ }
+ #[test]fn r101_mbr_rejects_sparse_or_unavailable_selection(){
+  let mut disk=mbr_disk();
+  assert_eq!(inspect_mbr_selection(&mut disk,1),Err(Error::NotFound));
+  let mut gpt=gpt_disk();
+  assert_eq!(inspect_mbr_selection(&mut gpt,0),Err(Error::Unsupported));
+ }
+ #[test]fn r101_exact_mbr_mount_reads_existing_file_no_implicit_format(){
+  let mut disk=mbr_disk();
+  {
+   let window=BlockWindow::new(&mut disk,10,100).unwrap();
+   let mut fs=HierVfs::format_blank(window).unwrap();
+   fs.create("/hello",b"persist").unwrap();
+  }
+  let selected=inspect_mbr_selection(&mut disk,0).unwrap();
+  let writes=disk.writes;
+  {
+   let mut mounted=mount_mbr_selected_healthy(&mut disk,selected).unwrap();
+   let mut out=[0u8;32];
+   assert_eq!(mounted.read("/hello",&mut out),Ok(7));
+   assert_eq!(&out[..7],b"persist");
+  }
+  assert_eq!(disk.writes,writes);
+ }
+ struct R103SwapDuringMount{
+  disk:Disk,volume_reads:usize,flipped:bool
+ }
+ impl BlockDevice for R103SwapDuringMount{
+  fn sector_count(&self)->u64{self.disk.sector_count()}
+  fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+    ->Result<(),BlockError>{
+   if lba==10{
+     self.volume_reads+=1;
+     if self.volume_reads==3{
+       // Replace only one legal MBR boot-code byte: partition bounds remain
+       // identical, so geometry-only identity checks cannot detect this.
+       self.disk.data[0][440]^=0x40;
+       self.flipped=true;
+     }
+   }
+   self.disk.read_sector(lba,out)
+  }
+  fn write_sector(&mut self,lba:u64,bytes:&[u8;SECTOR_BYTES])
+    ->Result<(),BlockError>{self.disk.write_sector(lba,bytes)}
+ }
+ #[test]fn r103_post_mount_mbr_swap_is_detected_without_any_writes(){
+  let mut raw=mbr_disk();
+  {
+   let w=BlockWindow::new(&mut raw,10,100).unwrap();
+   let mut volume=HierVfs::format_blank(w).unwrap();
+   volume.create("/note",b"protected").unwrap();
+  }
+  let mut disk=R103SwapDuringMount{disk:raw,volume_reads:0,flipped:false};
+  let token=inspect_partition_receipt(&mut disk,0).unwrap();
+  let writes=disk.disk.writes;
+  let result=mount_partition_receipt_healthy(&mut disk,token);
+  assert!(matches!(result,Err(MountError::Partition(Error::Invalid))));
+  assert!(disk.flipped);
+  assert_eq!(disk.disk.writes,writes);
+ }
+ struct R109ChangedPhysicalCapacity{disk:Disk,advertised:u64}
+ impl BlockDevice for R109ChangedPhysicalCapacity{
+  fn sector_count(&self)->u64{self.advertised}
+  fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+    ->Result<(),BlockError>{self.disk.read_sector(lba,out)}
+  fn write_sector(&mut self,lba:u64,buf:&[u8;SECTOR_BYTES])
+    ->Result<(),BlockError>{self.disk.write_sector(lba,buf)}
+ }
+ struct R111GptAttributesChangeDuringProbe{
+  disk:Disk,changed:bool,
+ }
+ impl BlockDevice for R111GptAttributesChangeDuringProbe{
+  fn sector_count(&self)->u64{self.disk.sector_count()}
+  fn read_sector(&mut self,l:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   if l==40 && !self.changed{
+    // Change an unused attribute bit on the *selected* GPT entry,
+    // retaining disk GUID, partition GUID and original LBA geometry.
+    self.disk.data[2][48]^=0x01;
+    let entries_crc=crc(&self.disk.data[2]);
+    self.disk.data[1][88..92].copy_from_slice(&entries_crc.to_le_bytes());
+    self.disk.data[1][16..20].fill(0);
+    let header_crc=crc(&self.disk.data[1][..92]);
+    self.disk.data[1][16..20].copy_from_slice(&header_crc.to_le_bytes());
+    sync_backup(&mut self.disk);self.changed=true;
+   }
+   self.disk.read_sector(l,out)
+  }
+  fn write_sector(&mut self,l:u64,input:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   self.disk.write_sector(l,input)
+  }
+ }
+ #[test]fn r111_gpt_health_probe_rejects_valid_table_aba_with_same_guids(){
+  let mut disk=gpt_disk();
+  {let win=BlockWindow::new(&mut disk,40,100).unwrap();
+   let mut fs=HierVfs::format_blank(win).unwrap();
+   fs.create("/file",b"data").unwrap();
+  }
+  let writes=disk.writes;
+  let mut swapped=R111GptAttributesChangeDuringProbe{disk,changed:false};
+  assert!(matches!(probe_gpt_identity_health(&mut swapped,0),
+      Err(MountError::Partition(Error::Invalid))));
+  assert!(swapped.changed);
+  assert_eq!(swapped.disk.writes,writes);
+ }
+ #[test]fn r110_readonly_mbr_diagnostic_never_writes_and_reports_real_health(){
+  let mut disk=mbr_disk();
+  {let window=BlockWindow::new(&mut disk,10,100).unwrap();
+   let mut fs=HierVfs::format_blank(window).unwrap();
+   fs.create("/diagnostic",b"healthy").unwrap();
+  }
+  let receipt=inspect_partition_receipt(&mut disk,0).unwrap();
+  let writes=disk.writes;
+  let result=probe_selected_receipt_readonly(&mut disk,receipt).unwrap();
+  assert_eq!(result.partition,receipt.partition);
+  assert_eq!(result.volume.redundancy,crate::durablefs::Redundancy::Healthy);
+  assert_eq!(disk.writes,writes);
+ }
+ #[test]fn r110_readonly_diagnostic_rejects_replaced_disk_before_payload_probe(){
+  let mut disk=mbr_disk();
+  {let window=BlockWindow::new(&mut disk,10,100).unwrap();
+   let mut fs=HierVfs::format_blank(window).unwrap();
+   fs.create("/diagnostic",b"protected").unwrap();
+  }
+  let expected=inspect_partition_receipt(&mut disk,0).unwrap();
+  let writes=disk.writes;
+  disk.data[0][440]^=0x3a; // same bounds, changed table identity
+  assert!(matches!(probe_selected_receipt_readonly(&mut disk,expected),
+     Err(MountError::Partition(Error::Invalid))));
+  assert_eq!(disk.writes,writes);
+ }
+ #[test]fn r109_same_mbr_partition_on_different_capacity_cannot_mount(){
+  let mut raw=mbr_disk();
+  {let window=BlockWindow::new(&mut raw,10,100).unwrap();
+   let mut volume=HierVfs::format_blank(window).unwrap();
+   volume.create("/file",b"last-good").unwrap();
+  }
+  let mut device=R109ChangedPhysicalCapacity{
+   disk:raw,advertised:COUNT as u64
+  };
+  let old=inspect_partition_receipt(&mut device,0).unwrap();
+  assert_eq!(old.device_sectors,COUNT as u64);
+  let writes=device.disk.writes;
+  device.advertised+=1;
+  let changed=inspect_partition_receipt(&mut device,0).unwrap();
+  assert_eq!(changed.partition,old.partition);
+  assert_eq!(changed.mbr_sector,old.mbr_sector);
+  assert_ne!(changed,old);
+  assert!(matches!(mount_partition_receipt_healthy(&mut device,old),
+      Err(MountError::Partition(Error::Invalid))));
+  assert_eq!(device.disk.writes,writes);
+ }
+ #[test]fn r109_gpt_header_or_secondary_array_io_fault_never_writes(){
+  let mut disk=gpt_disk();
+  let old=inspect_partition_receipt(&mut disk,0).unwrap();
+  let before=disk.writes;
+  for lba in [1u64,2,254,255]{
+   disk.fail_read=Some(lba);
+   assert_eq!(inspect_partition_receipt(&mut disk,0),Err(Error::Io));
+   assert!(matches!(mount_partition_receipt_healthy(&mut disk,old),
+       Err(MountError::Partition(Error::Io))));
+   assert_eq!(disk.writes,before);
+  }
+  disk.fail_read=None;
+  assert_eq!(inspect_partition_receipt(&mut disk,0),Ok(old));
+ }
+ #[test]fn r102_receipt_mbr_metadata_change_rejects_same_geometry(){
+  let mut disk=mbr_disk();
+  let receipt=inspect_partition_receipt(&mut disk,0).unwrap();
+  disk.data[0][440]^=0x11; // MBR boot code, partition geometry unchanged
+  let writes=disk.writes;
+  assert!(matches!(mount_partition_receipt_healthy(&mut disk,receipt),
+    Err(MountError::Partition(Error::Invalid))));
+  assert_eq!(disk.writes,writes);
+ }
+ struct GptSwappedOnMountedRead{
+  disk:Disk,reads:u32,swapped:bool,
+ }
+ impl BlockDevice for GptSwappedOnMountedRead{
+  fn sector_count(&self)->u64{self.disk.sector_count()}
+  fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{
+    // A real controller may be replaced while COW data is being checked.
+    // GPT UUIDs, partition bounds and both GPT CRCs remain unchanged.
+    if (40..140).contains(&lba) {
+      self.reads+=1;
+      if self.reads==3 {
+        self.disk.data[0][430]^=0x42; // protective MBR code, still valid
+        self.swapped=true;
+      }
+    }
+    self.disk.read_sector(lba,out)
+  }
+  fn write_sector(&mut self,lba:u64,data:&[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{self.disk.write_sector(lba,data)}
+ }
+ #[test]fn r107_gpt_mount_rejects_mbr_change_during_cow_health_with_same_guids(){
+  let mut raw=gpt_disk();
+  {let window=BlockWindow::new(&mut raw,40,100).unwrap();
+   let mut volume=HierVfs::format_blank(window).unwrap();
+   volume.create("/note",b"committed").unwrap();
+  }
+  let expected=inspect_gpt_selection(&mut raw,0).unwrap();
+  let writes=raw.writes;
+  let mut device=GptSwappedOnMountedRead{disk:raw,reads:0,swapped:false};
+  let mount=mount_gpt_selected_healthy(&mut device,expected);
+  assert!(matches!(mount,Err(MountError::Partition(Error::Invalid))));
+  assert!(device.swapped);
+  assert_eq!(device.disk.writes,writes);
+ }
+ #[test]fn r107_gpt_mount_pins_full_table_and_reads_existing_file(){
+  let mut disk=gpt_disk();
+  {let window=BlockWindow::new(&mut disk,40,100).unwrap();
+   let mut volume=HierVfs::format_blank(window).unwrap();
+   volume.create("/note",b"persisted").unwrap();
+  }
+  let token=inspect_gpt_selection(&mut disk,0).unwrap();
+  let writes=disk.writes;
+  {let mut volume=mount_gpt_selected_healthy(&mut disk,token).unwrap();
+   let mut out=[0;32];
+   assert_eq!(volume.read("/note",&mut out),Ok(9));
+   assert_eq!(&out[..9],b"persisted");
+  }
+  assert_eq!(disk.writes,writes);
+ }
+ #[test]fn r102_receipt_gpt_two_copies_and_guid_are_in_digest(){
+  let mut disk=gpt_disk();
+  let original=inspect_partition_receipt(&mut disk,0).unwrap();
+  assert_eq!(original.partition.scheme,Scheme::Gpt);
+  assert_eq!(original.gpt.unwrap().disk_guid,[3u8;16]);
+  let writes=disk.writes;
+  disk.data[255][91]^=1; // secondary header corruption
+  assert!(inspect_partition_receipt(&mut disk,0).is_err());
+  assert_eq!(disk.writes,writes);
+ }
+ #[test]fn r102_receipt_strict_mount_reads_real_existing_mbr_file(){
+  let mut disk=mbr_disk();
+  {let window=BlockWindow::new(&mut disk,10,100).unwrap();
+   let mut fs=HierVfs::format_blank(window).unwrap();
+   fs.create("/note",b"remount").unwrap();
+  }
+  let token=inspect_partition_receipt(&mut disk,0).unwrap();
+  let before=disk.writes;
+  {let mut fs=mount_partition_receipt_healthy(&mut disk,token).unwrap();
+   let mut buf=[0u8;24];
+   assert_eq!(fs.read("/note",&mut buf),Ok(7));
+   assert_eq!(&buf[..7],b"remount");}
+  assert_eq!(disk.writes,before);
  }
  #[test]fn m1_gpt_selection_decodes_exact_crc_and_mirror_checked_bytes(){
   let mut disk=ChangingGpt::new(3,false);
