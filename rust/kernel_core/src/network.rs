@@ -2379,3 +2379,87 @@ mod r119_scheduler_udp_ingress_regression_tests {
   assert_eq!(registry.authorize(5,3,5101),Err(OwnerError::Denied));
  }
 }
+
+#[cfg(all(test,feature="test-r031-vfs"))]
+mod r120_three_process_mixed_resource_retirement {
+ use super::*;
+ use crate::agent_03_cap_epoch::{
+    LeaseTable,Grant as CapGrant,Request,TimedGrant,
+    LeaseFault,CapabilityError
+ };
+ use crate::batch5_session::Identity;
+ use crate::fs_handles::{FileHandles,READ};
+ use crate::udp_owner_epoch::{Registry,Error as OwnerError};
+
+ fn identity(pid:u32,generation:u64)->Identity{
+  Identity{pid,generation}
+ }
+ fn setup_leases()->LeaseTable<3>{
+  let mut table=LeaseTable::<3>::new();
+  let parent=CapGrant{owner:1,resource:8,rights:3,
+      epoch:4,generation:1,revoked:false};
+  let issuer=Request{caller:1,resource:8,required_rights:1,
+      current_epoch:4,current_generation:1};
+  for pid in 1..=3{
+   let child=TimedGrant{grant:CapGrant{
+      owner:pid,resource:8,rights:1,epoch:4,
+      generation:pid as u64,revoked:false},expires_at:100};
+   table.delegate(parent,issuer,child,1).unwrap();
+  }
+  table
+ }
+ fn cap_request(pid:u32)->Request{
+  Request{caller:pid,resource:8,required_rights:1,
+     current_epoch:4,current_generation:pid as u64}
+ }
+ #[test]
+ fn stale_three_process_network_batch_does_not_mutate_capabilities_or_files(){
+  for _round in 0..32{
+   let mut sockets=EpochUdpEndpoints::<3,4>::new();
+   let mut registry=Registry::<3>::new();
+   let mut leases=setup_leases();
+   let mut files=FileHandles::new();
+   let init=files.bind_process(1).unwrap();
+   let worker=files.bind_process(2).unwrap();
+   let init_alias=files.mount_alias_for_current_root_kernel(init).unwrap();
+   for pid in 1..=3{
+    sockets.bind_registered(&mut registry,pid,pid as u64,6100+pid as u16)
+      .unwrap();
+   }
+   sockets.send_local(1,1,6101,6103,b"old").unwrap();
+   let stale=[identity(1,1),identity(2,99),identity(3,3)];
+   assert_eq!(sockets.retire_exact_batch_kernel(&mut registry,&stale),
+       Err(SocketError::Denied));
+   assert_eq!(leases.revoke_identity_batch_kernel(&[(1,1),(2,99),(3,3)]),
+       Err(LeaseFault::Denied(CapabilityError::Stale)));
+   assert_eq!(files.retire_process_batch_kernel(&[
+       init,Identity{pid:2,generation:worker.generation+1}]),
+       Err(crate::durablefs::FsError::InvalidName));
+   assert!(files.mount_alias_allows(init_alias,init,"/boot/init"));
+   assert!(files.owns(worker));
+   assert_eq!(registry.active_count(),3);
+   assert_eq!(sockets.pending_owned(3,3),Ok(1));
+   assert_eq!(leases.check(cap_request(2),2),Ok(()));
+   assert_eq!(leases.check(cap_request(3),2),Ok(()));
+   assert_eq!(sockets.retire_exact_batch_kernel(&mut registry,&[
+       identity(1,1),identity(2,2)]),Ok(2));
+   assert_eq!(leases.revoke_identity_batch_kernel(&[(1,1),(2,2)]),Ok(2));
+   assert_eq!(files.retire_process_batch_kernel(&[init,worker]),Ok(2));
+   assert!(!files.owns(init)&&!files.owns(worker));
+   assert_eq!(registry.authorize(1,1,6101),Err(OwnerError::Denied));
+   assert_eq!(registry.authorize(2,2,6102),Err(OwnerError::Denied));
+   assert_eq!(registry.authorize(3,3,6103),Ok(()));
+   assert_eq!(leases.check(cap_request(3),2),Ok(()));
+   let mut out=[0u8;8];
+   assert_eq!(sockets.receive(3,3,6103,&mut out),Ok(3));
+   assert_eq!(&out[..3],b"old");
+   let new_worker=files.bind_process(2).unwrap();
+   assert_ne!(worker,new_worker);
+   assert!(!files.mount_alias_allows(init_alias,new_worker,"/boot/init"));
+   sockets.bind_registered(&mut registry,2,4,6102).unwrap();
+   assert_eq!(sockets.retire_exact_kernel(&mut registry,2,2),
+       Err(SocketError::Denied));
+   assert_eq!(registry.authorize(2,4,6102),Ok(()));
+  }
+ }
+}
