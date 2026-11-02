@@ -278,6 +278,206 @@ impl FileHandles{
         if !self.owns(owner){return Err(FsError::InvalidName);}
         self.dispatch_for(action,owner,token,argument,path,buffer,fs)
     }
+
+    /// R094 protected, kernel-issued handle mutations; this is reachable only
+    /// through an authenticated owner or a legacy generation-zero handle.
+    /// A failure that makes file identity uncertain permanently retires token.
+    fn r094_edit_for<D:BlockDevice>(&mut self,action:u64,owner:Identity,
+        token:u64,argument:u64,target:&str,buffer:&[u8],
+        fs:&mut HierVfs<D>)->Result<u64,FsError>{
+        let slot=self.index(owner,token)?;
+        let h=self.entries[slot];
+        if h.mode&WRITE==0 || h.filesystem_generation!=fs.generation(){
+            return Err(FsError::InvalidName);
+        }
+        // Validate all argument lengths before accounting or disk access.
+        let amount=match action{
+            7|8=>{if buffer.is_empty()||buffer.len()>256{
+                return Err(FsError::TooLarge);
+            }buffer.len()},
+            9=>{if !buffer.is_empty(){return Err(FsError::InvalidName);}
+                let n=usize::try_from(argument).map_err(|_|FsError::TooLarge)?;
+                if n==0||n>256{return Err(FsError::TooLarge);}n},
+            10=>{if buffer.len()!=1{return Err(FsError::InvalidName);}
+                let n=usize::try_from(argument).map_err(|_|FsError::TooLarge)?;
+                if n==0||n>256{return Err(FsError::TooLarge);}n},
+            11=>{let n=usize::try_from(argument).map_err(|_|FsError::TooLarge)?;
+                if n>buffer.len()||buffer.len()>256{return Err(FsError::TooLarge);}
+                buffer.len().max(1)},
+            12|13=>{if buffer.len()>256{return Err(FsError::TooLarge);}
+                buffer.len().max(1)},
+            16=>{if !buffer.is_empty(){return Err(FsError::InvalidName);}
+                1},
+            _=>return Err(FsError::InvalidName),
+        };
+        if matches!(action,13|16){
+            // A privileged source handle must not be used to bypass S0
+            // boot/recovery path protection when naming a different target.
+            if owner.pid!=1 || WriteGuard::allow_path(target).is_err(){
+                self.write_guard.deny();
+                return Err(FsError::InvalidName);
+            }
+        }
+        if self.write_guard.preflight(h.pathname(),amount).is_err(){
+            return Err(FsError::InvalidName);
+        }
+        let offset=usize::try_from(h.offset).map_err(|_|FsError::TooLarge)?;
+        let old_len=if action==7 {
+            match fs.file_len(h.pathname()){
+                Ok(len)=>len,
+                Err(error)=>{
+                    if matches!(error,FsError::Io|FsError::InvalidVolume){
+                        self.entries[slot]=Handle::EMPTY;
+                    }
+                    return Err(error);
+                }
+            }
+        }else{0};
+        // All mutations pass through HierVfs, which independently verifies
+        // the parent, file/directory alias, CRC, and COW generation.
+        let result:Result<u64,FsError>=match action{
+            7=>fs.append_file(h.pathname(),buffer).map(|n|n as u64),
+            8=>fs.insert_file_range(h.pathname(),offset,buffer).map(|n|n as u64),
+            9=>fs.remove_file_range(h.pathname(),offset,amount).map(|n|n as u64),
+            10=>fs.fill_file_range(h.pathname(),offset,amount,buffer[0]).map(|n|n as u64),
+            11=>{
+                let split=argument as usize;
+                fs.compare_exchange_file(h.pathname(),&buffer[..split],&buffer[split..])
+                  .map(|changed|u64::from(changed))
+            },
+            12=>fs.unlink_if_equal(h.pathname(),buffer).map(|changed|u64::from(changed)),
+            13=>fs.rename_file_if_equal(h.pathname(),target,buffer)
+                  .map(|changed|u64::from(changed)),
+            16=>fs.swap_file_names(h.pathname(),target).map(|_|1),
+            _=>Err(FsError::InvalidName),
+        };
+        let value=match result{
+            Ok(value)=>value,
+            Err(error)=>{
+                if matches!(error,FsError::Io|FsError::InvalidVolume){
+                    self.entries[slot]=Handle::EMPTY;
+                }
+                return Err(error);
+            }
+        };
+        // Conditional mismatches are read-only (no charge, no cursor move).
+        if matches!(action,11|12|13)&&value==0{return Ok(0);}
+        if action==11 {
+            let split=argument as usize;
+            if buffer[..split]==buffer[split..]{return Ok(value);}
+        }
+        self.write_guard.completed(amount);
+        if matches!(action,12|13|16){
+            // A removed or renamed object invalidates its original token.
+            self.entries[slot]=Handle::EMPTY;
+        }else{
+            let next=match action{
+                7=>old_len.checked_add(value as usize),
+                8|10=>offset.checked_add(value as usize),
+                _=>Some(offset),
+            }.ok_or(FsError::TooLarge)?;
+            self.entries[slot].filesystem_generation=fs.generation();
+            self.entries[slot].offset=next as u64;
+        }
+        Ok(value)
+    }
+    /// R094 read-only checks, bound to one authenticated live READ handle.
+    fn r094_read_check_for<D:BlockDevice>(&mut self,action:u64,
+        owner:Identity,token:u64,buffer:&[u8],
+        fs:&mut HierVfs<D>)->Result<u64,FsError>{
+        let slot=self.index(owner,token)?;
+        let h=self.entries[slot];
+        if h.mode&READ==0||h.filesystem_generation!=fs.generation(){
+            return Err(FsError::InvalidName);
+        }
+        if buffer.len()>256{return Err(FsError::TooLarge);}
+        let result=match action{
+            14=>{if !buffer.is_empty(){return Err(FsError::InvalidName);}
+                fs.crc32_file(h.pathname()).map(u64::from)},
+            15=>fs.file_equals_bytes(h.pathname(),buffer).map(|b|u64::from(b)),
+            _=>Err(FsError::InvalidName),
+        };
+        if matches!(result,Err(FsError::Io|FsError::InvalidVolume)){
+            self.entries[slot]=Handle::EMPTY;
+        }
+        result
+    }
+
+    /// R099: read-only search/peek operations are bound to the exact live
+    /// process incarnation and unchanged COW generation. No mutations or
+    /// cursor changes occur in these paths. Missing match uses u64::MAX.
+    fn r099_verified_read_for<D:BlockDevice>(&mut self,action:u64,owner:Identity,
+        token:u64,buffer:&mut[u8],fs:&mut HierVfs<D>)->Result<u64,FsError>{
+        let slot=self.index(owner,token)?;
+        let h=self.entries[slot];
+        if h.mode&READ==0||h.filesystem_generation!=fs.generation(){
+            return Err(FsError::InvalidName);
+        }
+        let len=buffer.len();
+        if len>256{return Err(FsError::TooLarge);}
+        let result=match action{
+            17|18|19=>{
+                if len==0{return Err(FsError::InvalidName);}
+                match action{
+                    17=>fs.find_bytes_file(h.pathname(),buffer)
+                       .map(|hit|hit.map(|i|i as u64).unwrap_or(u64::MAX)),
+                    18=>fs.rfind_bytes_file(h.pathname(),buffer)
+                       .map(|hit|hit.map(|i|i as u64).unwrap_or(u64::MAX)),
+                    _=>fs.count_bytes_file(h.pathname(),buffer).map(|n|n as u64),
+                }
+            },
+            20=>fs.has_prefix_file(h.pathname(),buffer).map(u64::from),
+            21=>fs.has_suffix_file(h.pathname(),buffer).map(u64::from),
+            22|23=>{
+                if len==0||len>72{return Err(FsError::TooLarge);}
+                // Keep caller's mutable buffer untouched if a physical
+                // read, checksum, or removable-media identity fails.
+                let mut staged=[0u8;72];
+                let read=if action==22{
+                    fs.read_head_file(h.pathname(),&mut staged[..len])
+                }else{
+                    fs.read_tail_file(h.pathname(),&mut staged[..len])
+                };
+                read.map(|n|{
+                    buffer[..n].copy_from_slice(&staged[..n]);
+                    n as u64
+                })
+            },
+            _=>Err(FsError::InvalidName),
+        };
+        if matches!(result,Err(FsError::Io|FsError::InvalidVolume)){
+            self.entries[slot]=Handle::EMPTY;
+        }
+        result
+    }
+    /// R099-08: append-at-front through an authenticated WRITE handle.
+    /// Successful COW publication consumes one service-wide write budget
+    /// and refreshes the handle generation. Cursor points after the prefix.
+    fn r099_prepend_for<D:BlockDevice>(&mut self,owner:Identity,token:u64,
+        buffer:&[u8],fs:&mut HierVfs<D>)->Result<u64,FsError>{
+        if buffer.is_empty()||buffer.len()>256{return Err(FsError::TooLarge);}
+        let slot=self.index(owner,token)?;
+        let h=self.entries[slot];
+        if h.mode&WRITE==0||h.filesystem_generation!=fs.generation(){
+            return Err(FsError::InvalidName);
+        }
+        if self.write_guard.preflight(h.pathname(),buffer.len()).is_err(){
+            return Err(FsError::InvalidName);
+        }
+        let n=match fs.prepend_file(h.pathname(),buffer){
+            Ok(n)=>n,
+            Err(error)=>{
+                if matches!(error,FsError::Io|FsError::InvalidVolume){
+                    self.entries[slot]=Handle::EMPTY;
+                }
+                return Err(error);
+            }
+        };
+        self.write_guard.completed(n);
+        self.entries[slot].filesystem_generation=fs.generation();
+        self.entries[slot].offset=n as u64;
+        Ok(n as u64)
+    }
     fn dispatch_for<D:BlockDevice>(&mut self,action:u64,owner:Identity,
                                    token:u64,argument:u64,path:&str,
                                    buffer:&mut [u8],fs:&mut HierVfs<D>)
@@ -289,6 +489,11 @@ impl FileHandles{
             4=>self.seek_for(owner,token,argument),
             5=>{self.close_for(owner,token)?;Ok(0)},
             6=>{self.truncate_for(owner,token,argument,fs)?;Ok(0)},
+            7|8|9|10|11|12|13|16=>self.r094_edit_for(
+                action,owner,token,argument,path,buffer,fs),
+            14|15=>self.r094_read_check_for(action,owner,token,buffer,fs),
+            17..=23=>self.r099_verified_read_for(action,owner,token,buffer,fs),
+            24=>self.r099_prepend_for(owner,token,buffer,fs),
             _=>Err(FsError::InvalidName)
         }
     }
@@ -971,4 +1176,153 @@ mod tests{
         assert_eq!(&data,b"safe");
     }
 
+}
+
+
+#[cfg(test)]
+mod r094_authenticated_cow_ops {
+ use super::*;
+ use crate::block::{BlockError,SECTOR_BYTES};
+ struct Disk([[u8;SECTOR_BYTES];100]);
+ impl BlockDevice for Disk {
+  fn sector_count(&self)->u64{100}
+  fn read_sector(&mut self,l:u64,b:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   *b=*self.0.get(l as usize).ok_or(BlockError::OutOfRange)?;Ok(())
+  }
+  fn write_sector(&mut self,l:u64,b:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   *self.0.get_mut(l as usize).ok_or(BlockError::OutOfRange)?=*b;Ok(())
+  }
+ }
+ fn volume()->HierVfs<Disk>{
+  let mut f=HierVfs::format_blank(Disk([[0;SECTOR_BYTES];100])).unwrap();
+  f.mkdir("/shared").unwrap();f.create("/shared/note",b"abc").unwrap();
+  f.create("/shared/other",b"xyz").unwrap();f
+ }
+ fn open(t:&mut FileHandles,fs:&mut HierVfs<Disk>,owner:Identity,mode:u64)->u64{
+  t.dispatch_authenticated(1,owner,0,mode,"/shared/note",&mut [],fs).unwrap()
+ }
+ fn read(fs:&mut HierVfs<Disk>,p:&str)->Vec<u8>{
+  let mut b=[0;MAX_FILE_BYTES];let n=fs.read(p,&mut b).unwrap();b[..n].to_vec()
+ }
+ #[test]fn r094_append_authenticated_persists_and_tracks_cursor(){
+  let mut fs=volume();let mut t=FileHandles::new();let owner=t.bind_process(1).unwrap();
+  let fd=open(&mut t,&mut fs,owner,READ|WRITE);
+  assert_eq!(t.dispatch_authenticated(7,owner,fd,0,"",&mut b"DE".to_vec(),&mut fs),Ok(2));
+  assert_eq!(read(&mut fs,"/shared/note"),b"abcDE");
+  assert_eq!(t.seek_for(owner,fd,MAX_FILE_BYTES as u64),Ok(MAX_FILE_BYTES as u64));
+  assert_eq!(t.dispatch_authenticated(14,owner,fd,0,"",&mut [],&mut fs).is_ok(),true);
+ }
+ #[test]fn r094_authenticated_insert_and_remove_range(){
+  let mut fs=volume();let mut t=FileHandles::new();let o=t.bind_process(1).unwrap();
+  let fd=open(&mut t,&mut fs,o,READ|WRITE);
+  t.seek_for(o,fd,1).unwrap();
+  assert_eq!(t.dispatch_authenticated(8,o,fd,0,"",&mut b"ZZ".to_vec(),&mut fs),Ok(2));
+  assert_eq!(read(&mut fs,"/shared/note"),b"aZZbc");
+  t.seek_for(o,fd,1).unwrap();
+  assert_eq!(t.dispatch_authenticated(9,o,fd,2,"",&mut [],&mut fs),Ok(2));
+  assert_eq!(read(&mut fs,"/shared/note"),b"abc");
+ }
+ #[test]fn r094_authenticated_fill_uses_one_byte_value_and_bounded_length(){
+  let mut fs=volume();let mut t=FileHandles::new();let o=t.bind_process(1).unwrap();
+  let fd=open(&mut t,&mut fs,o,WRITE);
+  t.seek_for(o,fd,1).unwrap();
+  assert_eq!(t.dispatch_authenticated(10,o,fd,2,"",&mut b"X".to_vec(),&mut fs),Ok(2));
+  assert_eq!(read(&mut fs,"/shared/note"),b"aXX");
+ }
+ #[test]fn r094_conditional_replace_denies_mismatch_without_quota_charge(){
+  let mut fs=volume();let mut t=FileHandles::new();let o=t.bind_process(1).unwrap();
+  let fd=open(&mut t,&mut fs,o,WRITE);let g=fs.generation();
+  assert_eq!(t.dispatch_authenticated(11,o,fd,3,"",&mut b"badNEW".to_vec(),&mut fs),Ok(0));
+  assert_eq!(fs.generation(),g);
+  assert_eq!(t.security_statistics().completed_writes,0);
+  assert_eq!(t.dispatch_authenticated(11,o,fd,3,"",&mut b"abcNEW".to_vec(),&mut fs),Ok(1));
+  assert_eq!(read(&mut fs,"/shared/note"),b"NEW");
+  assert_eq!(t.security_statistics().completed_writes,1);
+ }
+ #[test]fn r094_conditional_remove_retires_token(){
+  let mut fs=volume();let mut t=FileHandles::new();let o=t.bind_process(1).unwrap();
+  let fd=open(&mut t,&mut fs,o,WRITE);
+  assert_eq!(t.dispatch_authenticated(12,o,fd,0,"",&mut b"bad".to_vec(),&mut fs),Ok(0));
+  assert_eq!(t.dispatch_authenticated(12,o,fd,0,"",&mut b"abc".to_vec(),&mut fs),Ok(1));
+  assert_eq!(t.dispatch_authenticated(12,o,fd,0,"",&mut b"abc".to_vec(),&mut fs),Err(FsError::InvalidName));
+  assert_eq!(fs.read("/shared/note",&mut[0;16]),Err(FsError::NotFound));
+ }
+ #[test]fn r094_conditional_rename_requires_target_path_permission(){
+  let mut fs=volume();let mut t=FileHandles::new();let o=t.bind_process(1).unwrap();
+  let fd=open(&mut t,&mut fs,o,WRITE);
+  assert_eq!(t.dispatch_authenticated(13,o,fd,0,"/boot/kernel",&mut b"abc".to_vec(),&mut fs),Err(FsError::InvalidName));
+  assert_eq!(t.dispatch_authenticated(13,o,fd,0,"/shared/new",&mut b"abc".to_vec(),&mut fs),Ok(1));
+  assert_eq!(read(&mut fs,"/shared/new"),b"abc");
+  assert_eq!(t.dispatch_authenticated(8,o,fd,0,"",&mut b"x".to_vec(),&mut fs),Err(FsError::InvalidName));
+ }
+ #[test]fn r094_crc_and_exact_match_are_readonly_for_pid_two(){
+  let mut fs=volume();let mut t=FileHandles::new();let peer=t.bind_process(2).unwrap();
+  let fd=open(&mut t,&mut fs,peer,READ);let g=fs.generation();
+  assert!(t.dispatch_authenticated(14,peer,fd,0,"",&mut [],&mut fs).is_ok());
+  assert_eq!(t.dispatch_authenticated(15,peer,fd,0,"",&mut b"abc".to_vec(),&mut fs),Ok(1));
+  assert_eq!(t.dispatch_authenticated(15,peer,fd,0,"",&mut b"bad".to_vec(),&mut fs),Ok(0));
+  assert_eq!(t.dispatch_authenticated(7,peer,fd,0,"",&mut b"x".to_vec(),&mut fs),Err(FsError::InvalidName));
+  assert_eq!(fs.generation(),g);
+ }
+ #[test]fn r094_swap_names_retires_source_handle(){
+  let mut fs=volume();let mut t=FileHandles::new();let o=t.bind_process(1).unwrap();
+  let fd=open(&mut t,&mut fs,o,WRITE);
+  assert_eq!(t.dispatch_authenticated(16,o,fd,0,"/shared/other",&mut [],&mut fs),Ok(1));
+  assert_eq!(read(&mut fs,"/shared/note"),b"xyz");
+  assert_eq!(read(&mut fs,"/shared/other"),b"abc");
+  assert_eq!(t.dispatch_authenticated(16,o,fd,0,"/shared/other",&mut [],&mut fs),Err(FsError::InvalidName));
+ }
+ #[test]fn r094_forged_and_replaced_pid_cannot_mutate(){
+  let mut fs=volume();let mut t=FileHandles::new();let o=t.bind_process(1).unwrap();
+  let fd=open(&mut t,&mut fs,o,WRITE);let false_owner=Identity{pid:1,generation:o.generation+42};
+  assert_eq!(t.dispatch_authenticated(7,false_owner,fd,0,"",&mut b"x".to_vec(),&mut fs),Err(FsError::InvalidName));
+  let replacement=t.bind_process(1).unwrap();
+  assert_eq!(t.dispatch_authenticated(7,o,fd,0,"",&mut b"x".to_vec(),&mut fs),Err(FsError::InvalidName));
+  assert!(t.owns(replacement));
+  assert_eq!(read(&mut fs,"/shared/note"),b"abc");
+ }
+ #[test]fn r094_stale_handle_generation_stops_new_mutations(){
+  let mut fs=volume();let mut t=FileHandles::new();let o=t.bind_process(1).unwrap();
+  let fd=open(&mut t,&mut fs,o,WRITE);fs.overwrite("/shared/note",b"new").unwrap();
+  assert_eq!(t.dispatch_authenticated(8,o,fd,0,"",&mut b"x".to_vec(),&mut fs),Err(FsError::InvalidName));
+  assert_eq!(read(&mut fs,"/shared/note"),b"new");
+ }
+}
+
+#[cfg(test)]
+mod r099_authenticated_search {
+ use super::*;
+ use crate::block::{BlockError,SECTOR_BYTES};
+ struct Disk([[u8;SECTOR_BYTES];100]);
+ impl BlockDevice for Disk{
+  fn sector_count(&self)->u64{100}
+  fn read_sector(&mut self,l:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   *out=*self.0.get(l as usize).ok_or(BlockError::OutOfRange)?;Ok(())
+  }
+  fn write_sector(&mut self,l:u64,buf:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   *self.0.get_mut(l as usize).ok_or(BlockError::OutOfRange)?=*buf;Ok(())
+  }
+ }
+ fn volume()->HierVfs<Disk>{
+  let mut f=HierVfs::format_blank(Disk([[0;SECTOR_BYTES];100])).unwrap();
+  f.mkdir("/shared").unwrap();f.create("/shared/note",b"abc").unwrap();f
+ }
+ fn open(t:&mut FileHandles,fs:&mut HierVfs<Disk>,o:Identity,mode:u64)->u64{
+  t.dispatch_authenticated(1,o,0,mode,"/shared/note",&mut [],fs).unwrap()
+ }
+ fn read(fs:&mut HierVfs<Disk>,path:&str)->Vec<u8>{
+  let mut data=[0;MAX_FILE_BYTES];let n=fs.read(path,&mut data).unwrap();data[..n].to_vec()
+ }
+ #[test]fn r099_01_first_occurrence(){let mut fs=volume();let mut t=FileHandles::new();let o=t.bind_process(2).unwrap();let fd=open(&mut t,&mut fs,o,READ);let mut needle=b"bc".to_vec();assert_eq!(t.dispatch_authenticated(17,o,fd,0,"",&mut needle,&mut fs),Ok(1));}
+ #[test]fn r099_02_last_occurrence(){let mut fs=volume();fs.overwrite("/shared/note",b"abcabc").unwrap();let mut t=FileHandles::new();let o=t.bind_process(2).unwrap();let fd=open(&mut t,&mut fs,o,READ);let mut needle=b"bc".to_vec();assert_eq!(t.dispatch_authenticated(18,o,fd,0,"",&mut needle,&mut fs),Ok(4));}
+ #[test]fn r099_03_disjoint_occurrence_count(){let mut fs=volume();fs.overwrite("/shared/note",b"aaaaa").unwrap();let mut t=FileHandles::new();let o=t.bind_process(2).unwrap();let fd=open(&mut t,&mut fs,o,READ);let mut needle=b"aa".to_vec();assert_eq!(t.dispatch_authenticated(19,o,fd,0,"",&mut needle,&mut fs),Ok(2));}
+ #[test]fn r099_04_prefix_check(){let mut fs=volume();let mut t=FileHandles::new();let o=t.bind_process(2).unwrap();let fd=open(&mut t,&mut fs,o,READ);assert_eq!(t.dispatch_authenticated(20,o,fd,0,"",&mut b"ab".to_vec(),&mut fs),Ok(1));assert_eq!(t.dispatch_authenticated(20,o,fd,0,"",&mut b"bc".to_vec(),&mut fs),Ok(0));}
+ #[test]fn r099_05_suffix_check(){let mut fs=volume();let mut t=FileHandles::new();let o=t.bind_process(2).unwrap();let fd=open(&mut t,&mut fs,o,READ);assert_eq!(t.dispatch_authenticated(21,o,fd,0,"",&mut b"bc".to_vec(),&mut fs),Ok(1));}
+ #[test]fn r099_06_verified_head_peek(){let mut fs=volume();let mut t=FileHandles::new();let o=t.bind_process(2).unwrap();let fd=open(&mut t,&mut fs,o,READ);let mut out=[0xee;2];assert_eq!(t.dispatch_authenticated(22,o,fd,0,"",&mut out,&mut fs),Ok(2));assert_eq!(&out,b"ab");}
+ #[test]fn r099_07_verified_tail_peek(){let mut fs=volume();let mut t=FileHandles::new();let o=t.bind_process(2).unwrap();let fd=open(&mut t,&mut fs,o,READ);let mut out=[0xee;2];assert_eq!(t.dispatch_authenticated(23,o,fd,0,"",&mut out,&mut fs),Ok(2));assert_eq!(&out,b"bc");}
+ #[test]fn r099_08_authenticated_prepend(){let mut fs=volume();let mut t=FileHandles::new();let o=t.bind_process(1).unwrap();let fd=open(&mut t,&mut fs,o,WRITE);assert_eq!(t.dispatch_authenticated(24,o,fd,0,"",&mut b"X".to_vec(),&mut fs),Ok(1));assert_eq!(read(&mut fs,"/shared/note"),b"Xabc");assert_eq!(t.security_statistics().completed_writes,1);}
+ #[test]fn r099_09_readonly_peer_cannot_prepend(){let mut fs=volume();let mut t=FileHandles::new();let o=t.bind_process(2).unwrap();let fd=open(&mut t,&mut fs,o,READ);let g=fs.generation();assert_eq!(t.dispatch_authenticated(24,o,fd,0,"",&mut b"x".to_vec(),&mut fs),Err(FsError::InvalidName));assert_eq!(fs.generation(),g);}
+ #[test]fn r099_10_stale_process_cannot_query(){let mut fs=volume();let mut t=FileHandles::new();let o=t.bind_process(2).unwrap();let fd=open(&mut t,&mut fs,o,READ);let n=t.bind_process(2).unwrap();assert_eq!(t.dispatch_authenticated(17,o,fd,0,"",&mut b"a".to_vec(),&mut fs),Err(FsError::InvalidName));assert!(t.owns(n));}
+ #[test]fn r099_11_verified_peek_refuses_too_large(){let mut fs=volume();let mut t=FileHandles::new();let o=t.bind_process(2).unwrap();let fd=open(&mut t,&mut fs,o,READ);let mut out=[0x55;73];assert_eq!(t.dispatch_authenticated(22,o,fd,0,"",&mut out,&mut fs),Err(FsError::TooLarge));assert_eq!(out,[0x55;73]);}
+ #[test]fn r099_12_missing_match_sentinel(){let mut fs=volume();let mut t=FileHandles::new();let o=t.bind_process(2).unwrap();let fd=open(&mut t,&mut fs,o,READ);assert_eq!(t.dispatch_authenticated(17,o,fd,0,"",&mut b"not-found".to_vec(),&mut fs),Ok(u64::MAX));}
 }
