@@ -79,8 +79,15 @@ def main():
             login = review["user"]["login"]
             if login != author and review["state"] in ("APPROVED", "CHANGES_REQUESTED",
                                                        "DISMISSED"):
-                latest[login] = review["state"]
-        report["independent_approved"] = any(v == "APPROVED" for v in latest.values())
+                # Ignore approvals bound to an older PR commit. A new code
+                # revision needs a new independent review on the exact head.
+                state = review["state"]
+                latest[login] = (state if review.get("commit_id") == args.expected_head
+                                 else "OUTDATED")
+        report["independent_approved"] = (
+            any(v == "APPROVED" for v in latest.values()) and
+            not any(v == "CHANGES_REQUESTED" for v in latest.values()))
+        report["review_states"] = latest
         try:
             protected = get(prefix + "/branches/" + pr["base"]["ref"] + "/protection")
             report["branch_protection"] = (

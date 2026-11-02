@@ -194,3 +194,6 @@ Cohort: R118-056, R118-062, R118-063, R118-064, R118-065, R118-066, R118-067, R1
 
 ## Six commits / cohort 4 — inherited R117 hardware readiness
 Cohort: R118-071, R118-072, R118-073, R118-074, R118-075, R118-076, R118-077, R118-078, R118-079, R118-080. Added cooperative mount/namespace/reused-PID and UDP generation regressions plus physical qualification matrix. None of the ten inherited hardware and multi-core requirements is fully validated; all remain OPEN.
+
+## Six commits / cohort 5 — exact-SHA and reviewer verification
+Cohort: R118-081, R118-082, R118-083, R118-084, R118-085, R118-086, R118-087, R118-088, R118-089, R118-090. Hardened release verifier to reject outdated independent approvals and unresolved CHANGES_REQUESTED review; added seven Python stdlib tests for exact SHA, incomplete required CI, author self-review, stale approvals, blocking reviews and missing branch protection. Physical SMP, immutable firmware root, real power-loss, IOMMU and clock hardware gates remain OPEN. Tests are code-level until CI explicitly executes them.
