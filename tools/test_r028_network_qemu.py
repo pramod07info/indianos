@@ -33,6 +33,7 @@ MARKERS=(
     "IndianOS: R116 QEMU DHCP lease expiry blocked primary UDP resend and backup succeeded",
     "IndianOS: R028 IPv4 UDP echo PASSED",
     "IndianOS: R028 UDP DNS A query indianos.test PASSED",
+    "IndianOS: R124 QEMU permit-fenced kernel NIC UDP/DNS ingress PASSED",
     "IndianOS: M2 live NIC IPv4/UDP DNS verifier PASSED",
     "IndianOS: R028 TCP three-way handshake SYN-ACK verified",
     "IndianOS: R028 TCP client request-response PASSED",

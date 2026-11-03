@@ -295,6 +295,15 @@ pub fn run_demo<D:EthernetDevice>(
     let network_owner=live_owners.start(1).map_err(|_|Error::Unexpected)?;
     live_owners.bind_live_udp(&mut udp_endpoints,network_owner,CLIENT_PORT)
         .map_err(|_| Error::Unexpected)?;
+    // R118-072: the real virtio-net UDP/DNS receive route now takes the
+    // kernel's exact-generation, destination-port-derived NIC ingress path,
+    // with a non-Send permit held from RX snapshot through queue admission.
+    // CPU 0 and masked interrupts are trusted QEMU-only facts: the legacy
+    // virtio-net driver is POLLED and must never be called from a real IRQ.
+    let ingress_gate=crate::retirement_gate::RetirementGate::new();
+    ingress_gate.register_bsp(0,true).map_err(|_|Error::Unexpected)?;
+    let ingress_permit=ingress_gate.try_enter(0,true)
+        .map_err(|_|Error::Unexpected)?;
     let route_owner=crate::batch5_session::Identity{pid:1,generation:1};
     let mut routes=crate::agent_06_ipv4_route::OwnerRoutes::<1>::new();
     routes.bind_kernel(route_owner,1).map_err(|_|Error::Unexpected)?;
@@ -337,16 +346,16 @@ pub fn run_demo<D:EthernetDevice>(
     let ingress=|revision:crate::process_retirement_txn::IngressRevision,
                   frame:&[u8],mac:[u8;6]|{
         parse_udp(frame,mac,PEER_UDP_PORT).is_ok_and(|data|data==UDP_RESP)
-            && live_owners.ingest_polled_live_udp_fenced(
-                &mut udp_endpoints,revision,
-                network_owner,CLIENT_PORT,frame,mac).is_ok()
+            && live_owners.ingest_kernel_nic_frame(
+                &ingress_permit,&mut udp_endpoints,revision,frame,mac)
+                .is_ok_and(|owner|owner==network_owner)
     };
     // Do not treat malformed network replies as successful failover evidence.
     // In the QEMU test the peer confirms packet reception but blackholes
     // this reply. Only a bounded timeout may quarantine the primary path.
     match wait_for_limit_fenced(
         dev,300_000,
-        ||live_owners.capture_polled_ingress_revision(),ingress
+        ||live_owners.capture_ingress_revision(&ingress_permit),ingress
     ){
         Err(Error::Timeout)=>{
             // R116 physical QEMU packet acceptance: the original time
@@ -378,13 +387,13 @@ pub fn run_demo<D:EthernetDevice>(
             }
             wait_for_limit_fenced(
                 dev,MAX_POLL,
-                ||live_owners.capture_polled_ingress_revision(),
+                ||live_owners.capture_ingress_revision(&ingress_permit),
                 |revision,frame,mac|{
                     parse_udp(frame,mac,PEER_UDP_PORT)
                         .is_ok_and(|data|data==UDP_RESP)
-                        && live_owners.ingest_polled_live_udp_fenced(
-                            &mut udp_endpoints,revision,
-                            network_owner,CLIENT_PORT,frame,mac).is_ok()
+                        && live_owners.ingest_kernel_nic_frame(
+                            &ingress_permit,&mut udp_endpoints,revision,frame,mac)
+                            .is_ok_and(|owner|owner==network_owner)
                 }
             )?;
             stage(b"IndianOS: R116 QEMU DHCP lease expiry blocked primary UDP resend and backup succeeded\n\0");
@@ -403,12 +412,12 @@ pub fn run_demo<D:EthernetDevice>(
         PEER_IP,||initial_clock+21,dns_query)?;
     wait_for_limit_fenced(
         dev,MAX_POLL,
-        ||live_owners.capture_polled_ingress_revision(),
+        ||live_owners.capture_ingress_revision(&ingress_permit),
         |revision,frame,mac|{
             valid_dns(frame,mac) &&
-                live_owners.ingest_polled_live_udp_fenced(
-                    &mut udp_endpoints,revision,
-                    network_owner,CLIENT_PORT,frame,mac).is_ok()
+                live_owners.ingest_kernel_nic_frame(
+                    &ingress_permit,&mut udp_endpoints,revision,frame,mac)
+                    .is_ok_and(|owner|owner==network_owner)
         }
     )?;
     let mut dns_reply=[0u8;R033_UDP_BYTES];
@@ -425,6 +434,7 @@ pub fn run_demo<D:EthernetDevice>(
     }
     routes.retire(route_owner,1).map_err(|_|Error::Unexpected)?;
     stage(b"IndianOS: R028 UDP DNS A query indianos.test PASSED\n\0");
+    stage(b"IndianOS: R124 QEMU permit-fenced kernel NIC UDP/DNS ingress PASSED\n\0");
     stage(b"IndianOS: M2 live NIC IPv4/UDP DNS verifier PASSED\n\0");
     // Strict stop-and-wait TCP handshake and one request-response exchange.
     transmit(dev,|b,m|tcp_frame(b,m,TCP_SEQ,0,0x02,&[],0x2804))?;
