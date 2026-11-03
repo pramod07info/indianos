@@ -91,13 +91,18 @@ static mut R120_RETIREMENT:crate::process_retirement_txn::ProcessRetirement<2,2,
 static R120_GATE:crate::retirement_gate::RetirementGate=
     crate::retirement_gate::RetirementGate::new();
 #[cfg(feature="test-r031-files-gui")]
-fn r120_cpu_id()->u32{(unsafe{core::arch::x86_64::__cpuid(1)}.ebx>>24)&255}
+fn r120_cpu_id()->u32{
+    // Host test threads may migrate between CPUs; gate tests inject CPU IDs
+    // explicitly. The guest must use its trusted physical BSP identity.
+    #[cfg(test)]{0}
+    #[cfg(not(test))]{(unsafe{core::arch::x86_64::__cpuid(1)}.ebx>>24)&255}
+}
 #[cfg(feature="test-r031-files-gui")]
 fn r120_masked()->bool{
     #[cfg(test)]{true}
     #[cfg(not(test))]{
         let flags:u64;
-        unsafe{asm!("pushfq; pop {}",out(reg)flags,options(nomem,preserves_flags));}
+        unsafe{asm!("pushfq; pop {}",out(reg)flags,options(preserves_flags));}
         flags&(1<<9)==0
     }
 }
