@@ -143,6 +143,10 @@ def boot(qemu:str,iso:Path,ovmf:Path,disk:Path,folder:Path,index:int):
         session.until("IndianOS: PID 1 REAPED",15)
         session.until("IndianOS: PID 2 REAPED",15)
         session.until("IndianOS: PID 3 REAPED",15)
+        # R120: this marker is produced by the live Rust kernel scheduler
+        # only after authenticated PID1/PID2 ring-3 UDP traffic and exact
+        # generation retirement, never by the host or by a mocked policy.
+        session.until("IndianOS: R120 QEMU ring3 dual-PID UDP epoch retirement PASSED",15)
         session.until(PASS,15)
         print(f"R031.9 QEMU desktop boot {index+1}/2 passed")
     finally:

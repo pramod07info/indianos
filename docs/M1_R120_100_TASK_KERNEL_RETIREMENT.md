@@ -1,6 +1,6 @@
 # IndianOS R120 — bounded atomic process retirement, 100-item checklist
 
-**Baseline main:** `654a7a35a66307f25d7ed759a2a0ba5ee8f3cfcf`. **Delivery:** one source commit, five logical workstreams (not five independently launched AI agents).
+**Baseline main:** `654a7a35a66307f25d7ed759a2a0ba5ee8f3cfcf`. **Delivery:** one pull request with successive implementation/fix commits and five logical workstreams (not five independently launched AI agents).
 
 **Scope:** 70 new, individually named acceptance tasks plus 30 inherited R118 items in the primary 100 checklist. The remaining 21 inherited R118 items and 15 still-open R119 items are retained below. Each `[x]` means *source implementation or focused host test authored in this commit*, not CI pass, real scheduler integration, QEMU qualification, physical hardware acceptance, or merge.
 
@@ -210,3 +210,22 @@ acceptance or independent human review is implied.
 - **R120-056:** the existing ring-3 syscall 36 bind/send/receive/close operations now use the same actual `ProcessRetirement` coordinator and real `EpochUdpEndpoints` socket table. Exact authenticated scheduler exit and fault paths retire those registered incarnations transactionally before file-handle and page-table reclamation. An old delayed task cannot revoke a newer generation. Retiring policy receipts are separately drained; the preexisting FileHandles-authenticated PID1 notification queue is retained for userspace ABI compatibility.
 - Added generation allocator tests and live socket close/send/peer preservation tests. The test-created legacy registry fallback is only for synthetic host fixtures that do not register a coordinator owner; it is not the production ring-3 syscall path.
 - **Not evidence of SMP lock exclusion:** This runtime remains single-BSP; IRQ/SMP/physical hardware and actual multicore scheduler gates remain open. QEMU and no_std must pass at the final SHA before merging.
+
+## R120 real two-process QEMU acceptance enhancement
+
+The privileged ring-3 scheduler now caches the actual FileHandles-minted
+generations of PID1 and PID2 after successful process preparation. After both
+processes terminate, it verifies the lifecycle coordinator has no active
+generation for either PID, both real FileHandles owners have been revoked,
+neither old generation can access its UDP endpoint, and all live UDP socket
+bindings agree with the policy registry. Only then does it emit
+`IndianOS: R120 QEMU ring3 dual-PID UDP epoch retirement PASSED`.
+The existing **two-boot graphical Files** guest test now requires that
+kernel-emitted marker, in addition to existing real PID1/PID2 UDP PING/PONG,
+forged foreign-close denial, and actual keyboard, framebuffer, and disk-readback
+checks.
+
+R120-027 is **implemented but remains unchecked until the exact new SHA's
+graphical Files QEMU integration passes**. Host tests do not substitute for
+guest acceptance. The R120-013, -026, -028, -042 SMP/physical IRQ/IOMMU
+gates and -070 independent review/merge remain unqualified.

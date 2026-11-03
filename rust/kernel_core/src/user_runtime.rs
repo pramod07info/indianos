@@ -1599,6 +1599,14 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
   log(b"IndianOS: M009 FATAL cannot prepare two user contexts\n\0");
   return false;
  }
+ // Save the two genuine ring-3 PID epochs, before teardown clears the
+ // Task.file_generation fields. These are minted by the privileged
+ // FileHandles allocator, never derived from a guest syscall argument.
+ #[cfg(feature="test-r031-files-gui")]
+ let r120_expected=unsafe{[
+    (*task_ptr(0)).file_generation,
+    (*task_ptr(1)).file_generation
+ ]};
  #[cfg(feature="test-ipc")]
  {
   let Some(mut mailboxes)=IpcRouter::<4,8>::new().ok()else{return false;};
@@ -1839,6 +1847,33 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
   if ok {
    log(b"IndianOS: R025 capability IPC filesystem process services PASSED\n\0");
   }
+ }
+ #[cfg(feature="test-r031-files-gui")]
+ {
+   // R120: the real ring-3 GUI/QEMU acceptance fixture executes PID1 and
+   // PID2 UDP PING/PONG + forged foreign-close denial before this terminal
+   // state. Validate both trusted incarnations have lost *all* authority
+   // and the real socket queue agrees with its policy registry.
+   let coordinator=unsafe{&*ptr::addr_of!(R120_RETIREMENT)};
+   let sockets=unsafe{&*ptr::addr_of!(R114_LOCAL_UDP)};
+   let handles=unsafe{&*ptr::addr_of!(R031_HANDLES)};
+   let first=crate::batch5_session::Identity{
+       pid:1,generation:r120_expected[0]};
+   let second=crate::batch5_session::Identity{
+       pid:2,generation:r120_expected[1]};
+   let retired=r120_expected.iter().all(|&gen|gen!=0) &&
+       coordinator.active_generation(1).is_none() &&
+       coordinator.active_generation(2).is_none() &&
+       !handles.owns(first) && !handles.owns(second) &&
+       sockets.pending_owned(1,first.generation).is_err() &&
+       sockets.pending_owned(2,second.generation).is_err() &&
+       coordinator.live_sockets_consistent(sockets);
+   if !retired{
+      ok=false;
+      log(b"IndianOS: FATAL R120 ring3 dual-PID UDP epoch retirement mismatch\n\0");
+   }else if ok {
+      log(b"IndianOS: R120 QEMU ring3 dual-PID UDP epoch retirement PASSED\n\0");
+   }
  }
  if !ok{
   log(b"IndianOS: M009 FATAL scheduler or memory ownership verification\n\0");

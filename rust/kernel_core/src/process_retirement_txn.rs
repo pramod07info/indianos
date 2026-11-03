@@ -107,6 +107,14 @@ impl<const C: usize, const U: usize, const E: usize> ProcessRetirement<C, U, E> 
     }
 
     pub fn active_udp_ports(&self) -> usize { self.udp.active_count() }
+
+    /// Read-only postcondition for a privileged scheduler/QEMU acceptance
+    /// path; never treats a bare socket port as an authoritative PID epoch.
+    pub fn live_sockets_consistent<const P:usize,const Q:usize>(
+        &self,sockets:&EpochUdpEndpoints<P,Q>
+    )->bool{
+        sockets.matches_registry(&self.udp)
+    }
     pub fn queued_notices(&self) -> usize { self.events.len() }
     pub fn peek_notice(&self) -> Option<EventReceipt> { self.events.peek_receipt() }
 
