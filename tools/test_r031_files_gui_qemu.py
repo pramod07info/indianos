@@ -138,6 +138,7 @@ def boot(qemu:str,iso:Path,ovmf:Path,disk:Path,folder:Path,index:int):
         session.until("R031.1 Files service stopped and capabilities revoked",15)
         # This evidence is emitted by the kernel AFTER real PID2 scheduler
         # teardown, not by the ring-3 app's optimistic exit notice.
+        session.until("IndianOS: R123 QEMU retired PID2 file tokens denied before ATA probe",15)
         session.until("IndianOS: R122 QEMU stale PID2 mount alias and revision guard denied",15)
         session.until("R117 QEMU PID2 delegated directory and UDP authority revoked at scheduler exit",15)
         session.until("R031.1 session manager exiting after app services",15)

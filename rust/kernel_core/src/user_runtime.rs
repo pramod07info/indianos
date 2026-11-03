@@ -1438,6 +1438,54 @@ fn retire_file_owner_epoch<const E:usize>(
     Ok(true)
 }
 
+/// R118-013 source-level guest fuzz: retired PID2 authority, including
+/// random-looking and forged opaque descriptors, must be denied by the actual
+/// authenticated file syscall path BEFORE ATA discovery or disk mutation.
+/// QEMU's disposable disk and the real PID2 scheduler identity are used, not
+/// an in-memory fake BlockDevice. This cannot simulate hardware disk swaps.
+#[cfg(feature="test-r031-files-gui")]
+fn r123_retired_pid2_file_token_fuzz(
+    files:&mut crate::fs_handles::FileHandles,
+    owner:crate::batch5_session::Identity,
+    alias:crate::fs_handles::MountAlias,
+)->bool{
+    if files.owns(owner) || owner.pid!=2 || owner.generation==0 {
+        return false;
+    }
+    let before_stats=files.security_statistics();
+    let before_namespace=files.last_syscall_namespace();
+    let corpus=[
+        0u64,1,2,3,4,5,8,16,32,64,255,256,4095,4096,
+        owner.generation,owner.generation.wrapping_add(1),
+        owner.generation.rotate_left(19)^0x69f2_9371_3ab8_c4d5,
+        u64::MAX,1u64<<63,u64::MAX-1,
+    ];
+    let mut buffer=[0xa5u8;72];
+    for token in corpus{
+        // These all go through FileHandles::namespace_receipt first and
+        // must fail before the host-selected ATA disk is even probed.
+        for operation in [2u64,3,4,5,6]{
+            if crate::fs_handles::operation_authenticated(
+                files,operation,owner,token,0,"",&mut buffer).is_ok(){
+                return false;
+            }
+            if buffer!=[0xa5;72]{return false;}
+        }
+        // Reopening a retired alias also must fail, even if the physical
+        // scratch filesystem was remounted at the same pathname.
+        if crate::fs_handles::operation_authenticated_mount_alias(
+            files,alias,1,owner,token,crate::fs_handles::READ,
+            "/shared/readme",&mut buffer).is_ok(){
+            return false;
+        }
+        if buffer!=[0xa5;72]{return false;}
+    }
+    files.security_statistics()==before_stats &&
+        files.last_syscall_namespace()==before_namespace &&
+        !files.owns(owner) &&
+        !files.mount_alias_allows(alias,owner,"/shared/readme")
+}
+
 /// R118-009/027/073: a bounded, fail-atomic single-BSP transaction for
 /// multiple authenticated process incarnations. The real scheduler retains
 /// the non-spinning R120_GATE permit throughout staging and publication.
@@ -1711,6 +1759,14 @@ fn revoke_task_authority_with_kind(
        !fs.mount_alias_allows(alias,owner,"/shared/readme") &&
        !fs.selected_operation_guard_is_current(guard));
      if lease_gone && port_gone && file_gone && old_mount_denied {
+       if !old_pid2_mount.is_some_and(|(alias,_)|
+         r123_retired_pid2_file_token_fuzz(
+           unsafe{&mut *ptr::addr_of_mut!(R031_HANDLES)},owner,alias)
+       ){
+         log(b"IndianOS: FATAL R123 retired PID2 file descriptor fuzz escaped\n\0");
+         r120_halt();
+       }
+       log(b"IndianOS: R123 QEMU retired PID2 file tokens denied before ATA probe\n\0");
        log(b"IndianOS: R122 QEMU stale PID2 mount alias and revision guard denied\n\0");
        log(b"R117 QEMU PID2 delegated directory and UDP authority revoked at scheduler exit\n\0");
      }else{
