@@ -12,7 +12,7 @@ use core::sync::atomic::{fence,AtomicBool,AtomicU64,Ordering};
 #[derive(Debug,Clone,Copy,Eq,PartialEq)]
 pub enum FenceError {
     InvalidCpu, InvalidGeneration, StaleGeneration, Busy,
-    StaleReceipt, Overflow, NoProgress,
+    StaleReceipt, Overflow, NoProgress, IncompleteLocalWork,
 }
 
 #[derive(Debug,Clone,Copy,Eq,PartialEq)]
@@ -59,11 +59,19 @@ impl LifecycleFence {
         self.publishing.store(false,Ordering::Release);
         result
     }
-    /// AP only. The caller must use its actual verified hardware APIC ID.
-    /// An ack is NOT an IPI ack or a TLB invalidation; callers must complete
-    /// required local cleanup before using this release-store in production.
+    /// The compatibility protocol has no local side-effect. For real AP
+    /// lifecycle work prefer observe_and_ack_after, which validates completion
+    /// BEFORE issuing the release acknowledgement.
     pub fn observe_and_ack(
         &self,cpu:u32,last_seen:u64
+    )->Result<Option<Receipt>,FenceError>{
+        self.observe_and_ack_after(cpu,last_seen,|_|true)
+    }
+    /// AP only. Call the supplied (single-use) local proof before acking.
+    /// False means NO acknowledgement; BSP is still forbidden to recycle
+    /// the publication. This does not provide an actual IPI or TLB flush.
+    pub fn observe_and_ack_after(
+        &self,cpu:u32,last_seen:u64,local_complete:impl FnOnce(Receipt)->bool
     )->Result<Option<Receipt>,FenceError>{
         if cpu!=self.ap || self.bsp==self.ap{return Err(FenceError::InvalidCpu);}
         let seq=self.published.load(Ordering::Acquire);
@@ -83,6 +91,9 @@ impl LifecycleFence {
         let generation=self.generation.load(Ordering::Relaxed);
         if generation==0{return Err(FenceError::InvalidGeneration);}
         let receipt=Receipt{sequence:seq,generation};
+        // An AP can never claim completed cleanup from a receipt it has
+        // not actually validated or whose cleanup callback failed.
+        if !local_complete(receipt){return Err(FenceError::IncompleteLocalWork);}
         // One-time acknowledgement: even two AP threads claiming the same
         // trusted ID must never both emit a receipt for the same sequence.
         // Release ordering publishes the caller's local proof before BSP
@@ -295,6 +306,35 @@ mod tests{
         let next=f.publish(0,12).unwrap();
         assert_eq!(next.sequence,issued.sequence+1);
         assert_eq!(f.poll_ack_bounded(0,issued,1),Err(FenceError::StaleReceipt));
+    }
+
+    #[test]
+    fn r122_ap_rejects_local_cleanup_failure_without_acknowledging(){
+        let f=LifecycleFence::new(0,1);
+        let receipt=f.publish(0,22).unwrap();
+        let mut called=0u32;
+        assert_eq!(f.observe_and_ack_after(1,0,|r|{
+            called+=1;
+            assert_eq!(r,receipt);
+            false
+        }),Err(FenceError::IncompleteLocalWork));
+        assert_eq!(called,1);
+        assert_eq!(f.acknowledged(0,receipt),Ok(false));
+        assert_eq!(f.publish(0,24),Err(FenceError::Busy));
+        assert_eq!(f.observe_and_ack_after(1,0,|r|{
+            r.generation==23
+        }),Err(FenceError::IncompleteLocalWork));
+        assert_eq!(f.poll_ack_bounded(0,receipt,1),Err(FenceError::NoProgress));
+        assert_eq!(f.observe_and_ack_after(0,0,|_|{
+            panic!("wrong-CPU cleanup must never run")
+        }),Err(FenceError::InvalidCpu));
+        assert_eq!(f.observe_and_ack_after(1,0,|r|{
+            r.sequence==1 && r.generation==22
+        }),Ok(Some(receipt)));
+        assert_eq!(f.acknowledged(0,receipt),Ok(true));
+        assert_eq!(f.observe_and_ack_after(1,0,|_|{
+            panic!("replayed local cleanup must never run")
+        }),Err(FenceError::StaleReceipt));
     }
 
 }
