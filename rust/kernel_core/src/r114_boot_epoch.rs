@@ -761,3 +761,191 @@ mod r118_power_interruption_fault_matrix {
         }
     }
 }
+
+/// R118-075/076: hardware-attested PID1 launch contract. The platform
+/// implementor MUST source (1) the measurement from authenticated firmware,
+/// (2) the sealed epoch floor from rollback-resistant hardware and
+/// (3) the selected signed boot slot from a bootloader-verified policy.
+/// None of the three may be supplied by PID1, disk metadata, a QEMU test
+/// constant, a kernel command line or an ordinary writable EFI variable.
+///
+/// A platform that cannot supply all three CANNOT authorize PID1; this API
+/// does not pretend the absent UEFI/TPM driver is already implemented.
+pub trait AuthenticatedPid1Platform:TrustedBootMeasurement {
+    fn read_sealed_floor(&self)->Result<SealedBootFloor,Error>;
+    fn read_bootloader_selected_slot(&self)->Result<(usize,Slot),Error>;
+}
+
+/// Private fields mean an arbitrary raw epoch record or userland-supplied
+/// byte string is not itself a verified launch receipt.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct VerifiedPid1Admission {
+    epoch:EpochRecord,
+    selected:usize,
+}
+impl VerifiedPid1Admission {
+    pub fn epoch(&self)->u64{self.epoch.epoch}
+    pub fn journal_generation(&self)->u64{self.epoch.journal_generation}
+    pub fn slot_version(&self)->u64{self.epoch.slot_version}
+    pub fn selected_slot(&self)->usize{self.selected}
+}
+
+/// Read-only fail-closed gate immediately before launching PID1. Observe
+/// both durable journal copies, then recheck all hardware authority and the
+/// media. A trust-floor change, signer/slot swap, torn journal or power-cut
+/// read error must never return a boot receipt.
+///
+/// The privileged caller must serialize the verified boot source and the
+/// selected block device across this function and the PID1 launch. This
+/// remains a software contract until its real UEFI/TPM provider exists.
+pub fn authorize_verified_pid1<D:BlockDevice,P:AuthenticatedPid1Platform>(
+    disk:&mut D,platform:&P
+)->Result<VerifiedPid1Admission,Error>{
+    let floor=platform.read_sealed_floor()?;
+    let (selected,slot)=platform.read_bootloader_selected_slot()?;
+    if selected>1||selected!=floor.expected_slot as usize||
+       slot.version==0||!slot.valid_metadata||!slot.committed||
+       slot.attempts_remaining==0{
+        return Err(Error::Untrusted);
+    }
+    // Exactly one authenticated measurement is used for the two journal
+    // observations; a second hardware read checks that its authority did
+    // not change while storage was being accessed.
+    let measurement=platform.read_verified()?;
+    if measurement==[0;32]||measurement==[0xff;32]{
+        return Err(Error::Untrusted);
+    }
+    let frozen=MeasurementSnapshot(measurement);
+    let observed=observe_with_sealed_floor(disk,&frozen,floor)?;
+    if observed.selected_slot as usize!=selected ||
+       observed.slot_version!=slot.version{
+        return Err(Error::Stale);
+    }
+    if platform.read_sealed_floor()?!=floor ||
+       platform.read_bootloader_selected_slot()?!=(selected,slot) ||
+       platform.read_verified()?!=measurement{
+        return Err(Error::Stale);
+    }
+    if observe_with_sealed_floor(disk,&frozen,floor)?!=observed{
+        return Err(Error::Stale);
+    }
+    Ok(VerifiedPid1Admission{epoch:observed,selected})
+}
+
+#[cfg(test)]
+mod r118_authenticated_pid1_handoff_tests {
+    use super::*;
+    use std::cell::Cell;
+    use crate::block::{BlockDevice,BlockError,SECTOR_BYTES};
+
+    fn floor()->SealedBootFloor{
+        SealedBootFloor{minimum_epoch:4,minimum_journal_generation:20,
+            expected_slot:0,minimum_slot_version:9,
+            expected_measurement:[3;32]}
+    }
+    struct Platform{
+        digest:[u8;32],
+        floor:SealedBootFloor,
+        selected:usize,
+        slot:Slot,
+        reads:Cell<usize>,
+        mutate_on_second:bool,
+    }
+    impl Platform {
+        fn new()->Self{Self{digest:[3;32],floor:floor(),selected:0,
+            slot:tests::slot(),reads:Cell::new(0),
+            mutate_on_second:false}}
+    }
+    impl TrustedBootMeasurement for Platform {
+        fn read_verified(&self)->Result<[u8;32],Error>{
+            Ok(self.digest)
+        }
+    }
+    impl AuthenticatedPid1Platform for Platform {
+        fn read_sealed_floor(&self)->Result<SealedBootFloor,Error>{
+            let next=self.reads.get()+1;
+            self.reads.set(next);
+            if self.mutate_on_second&&next==2 {
+                return Ok(SealedBootFloor{
+                    minimum_epoch:5,..self.floor});
+            }
+            Ok(self.floor)
+        }
+        fn read_bootloader_selected_slot(&self)->Result<(usize,Slot),Error>{
+            Ok((self.selected,self.slot))
+        }
+    }
+    #[test]
+    fn preprovisioned_valid_journal_and_stable_hardware_authorize_once(){
+        let mut disk=tests::fixture();
+        let p=Platform::new();
+        let token=authorize_verified_pid1(&mut disk,&p).unwrap();
+        assert_eq!(token.epoch(),4);
+        assert_eq!(token.journal_generation(),20);
+        assert_eq!(token.slot_version(),9);
+        assert_eq!(token.selected_slot(),0);
+        assert_eq!(disk.writes,0);
+        assert_eq!(p.reads.get(),2);
+    }
+    #[test]
+    fn no_trusted_measurement_or_uncommitted_bootloader_slot_is_denied(){
+        let mut disk=tests::fixture();
+        let mut p=Platform::new();
+        p.digest=[0;32];
+        assert_eq!(authorize_verified_pid1(&mut disk,&p),Err(Error::Untrusted));
+        p.digest=[0xff;32];
+        assert_eq!(authorize_verified_pid1(&mut disk,&p),Err(Error::Untrusted));
+        p.digest=[3;32];
+        p.slot.committed=false;
+        assert_eq!(authorize_verified_pid1(&mut disk,&p),Err(Error::Untrusted));
+        p.slot.committed=true;p.slot.attempts_remaining=0;
+        assert_eq!(authorize_verified_pid1(&mut disk,&p),Err(Error::Untrusted));
+        p.slot.attempts_remaining=1;p.selected=1;
+        assert_eq!(authorize_verified_pid1(&mut disk,&p),Err(Error::Untrusted));
+        p.selected=0;p.slot.version=10;
+        assert_eq!(authorize_verified_pid1(&mut disk,&p),Err(Error::Stale));
+        assert_eq!(disk.writes,0);
+    }
+    #[test]
+    fn independently_sealed_floor_change_during_two_reads_is_denied(){
+        let mut disk=tests::fixture();
+        let mut p=Platform::new();p.mutate_on_second=true;
+        assert_eq!(authorize_verified_pid1(&mut disk,&p),Err(Error::Stale));
+        assert_eq!(disk.writes,0);
+    }
+
+    struct MediaSwap{
+        disk:tests::Disk,read_count:usize,
+        changed:[u8;SECTOR_BYTES],
+    }
+    impl BlockDevice for MediaSwap {
+        fn sector_count(&self)->u64{2}
+        fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+            ->Result<(),BlockError>{
+            self.read_count+=1;
+            if self.read_count==3 {
+                self.disk.sectors=[self.changed;2];
+            }
+            self.disk.read_sector(lba,out)
+        }
+        fn write_sector(&mut self,lba:u64,bytes:&[u8;SECTOR_BYTES])
+            ->Result<(),BlockError>{self.disk.write_sector(lba,bytes)}
+        fn sync(&mut self)->Result<(),BlockError>{self.disk.sync()}
+    }
+    #[test]
+    fn journal_swapped_between_attested_observations_is_denied(){
+        let original=tests::fixture();
+        let mut media=MediaSwap{changed:original.sectors[0],
+            disk:original,read_count:0};
+        // Same authenticated boot digest but different on-disk epoch/journal.
+        // Construct from a separate trusted fixture, not a shell-provided
+        // boot authority. The second observation detects the replacement.
+        let mut changed=decode(&media.changed).unwrap();
+        changed.epoch=5;
+        changed.journal_generation=21;
+        media.changed=encode(changed).unwrap();
+        assert_eq!(authorize_verified_pid1(&mut media,&Platform::new()),
+            Err(Error::Stale));
+        assert_eq!(media.disk.writes,0);
+    }
+}
