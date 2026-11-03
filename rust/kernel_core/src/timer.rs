@@ -564,6 +564,48 @@ pub unsafe extern "C" fn x86_64_xapic_eoi()->bool{
 pub extern "C" fn x86_64_xapic_timer_irq_count()->u64{
     XAPIC_IRQ_TICKS.load(Ordering::Relaxed)
 }
+/// Read an actual delivered 100 Hz BSP clock after the reference-calibrated
+/// xAPIC timer (or explicitly configured PIT) has started. These are
+/// session-relative ticks, not seconds since boot, TSC samples, or a trusted
+/// cross-CPU wall clock. An unconfigured/stopped timer has NO authority.
+/// A fresh session must not borrow the previous session's lease receipt.
+pub fn kernel_monotonic_100hz() -> Option<u64> {
+    let xapic_running=XAPIC_TIMER_RUNNING.load(Ordering::Acquire);
+    let pic_running=CONFIGURED.load(Ordering::Acquire);
+    let xapic_ticks=XAPIC_IRQ_TICKS.load(Ordering::Acquire);
+    let pic_ticks=TICKS.load(Ordering::Acquire);
+    calibrated_kernel_ticks(xapic_running,pic_running,xapic_ticks,pic_ticks)
+}
+
+/// Pure availability gate; 0 delivered IRQs must never authenticate an
+/// interval just because a timer was configured. xAPIC wins when active.
+pub const fn calibrated_kernel_ticks(
+    xapic_running:bool,pic_running:bool,xapic_ticks:u64,pic_ticks:u64
+)->Option<u64>{
+    if xapic_running {
+        if xapic_ticks>0 {Some(xapic_ticks)} else {None}
+    }else if pic_running {
+        if pic_ticks>0 {Some(pic_ticks)} else {None}
+    }else{None}
+}
+#[cfg(test)]
+mod r118_monotonic_hardware_tick_tests{
+    use super::calibrated_kernel_ticks;
+    #[test]fn unconfigured_or_missing_irq_progress_has_no_clock_authority(){
+        assert_eq!(calibrated_kernel_ticks(false,false,99,99),None);
+        assert_eq!(calibrated_kernel_ticks(true,false,0,99),None);
+        assert_eq!(calibrated_kernel_ticks(false,true,99,0),None);
+        assert_eq!(calibrated_kernel_ticks(true,false,8,99),Some(8));
+        assert_eq!(calibrated_kernel_ticks(false,true,0,13),Some(13));
+    }
+    #[test]fn calibrated_apic_precedence_and_saturated_counter_are_preserved(){
+        assert_eq!(calibrated_kernel_ticks(true,true,7,1000),Some(7));
+        assert_eq!(calibrated_kernel_ticks(true,true,0,1000),None);
+        assert_eq!(calibrated_kernel_ticks(false,true,0,u64::MAX),
+                   Some(u64::MAX));
+    }
+}
+
 /// Count successful ring-3 APIC preemptions independently of delivered IRQs.
 /// Called only after a validated user frame has been captured.
 pub fn xapic_record_preemption(){

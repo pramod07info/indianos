@@ -1906,6 +1906,40 @@ mod r116_registered_ring3_udp_tests{
 /// can supply two *trusted* readings. Re-check the same lease receipt at
 /// dispatch time so expiry between packet preparation and send cannot
 /// authorize the original route. No user-originated timestamp is accepted.
+fn transmit_leased_ipv4_checked_try_clock<
+ D:EthernetDevice,const N:usize,const M:usize
+>(
+ dev:&mut D,
+ routes:&crate::agent_06_ipv4_route::OwnerRoutes<N>,
+ links:&crate::agent_06_ipv4_route::FailoverRoutes<M>,
+ owner:crate::batch5_session::Identity,owner_epoch:u64,
+ destination:[u8;4],mut clock:impl FnMut()->Result<u64,Error>,
+ constructor:impl FnOnce(&mut[u8],[u8;6])->usize,
+)->Result<(),Error>{
+ let dest=u32::from_be_bytes(destination);
+ let before=clock()?;
+ let token=links.receipt_at(dest,before).ok_or(Error::Unexpected)?;
+ let policy=routes.select(owner,owner_epoch,dest)
+    .map_err(|_|Error::Unexpected)?.ok_or(Error::Unexpected)?;
+ if policy!=token.selected.route{return Err(Error::Unexpected);}
+ // Serialize and validate the IPv4 frame first. Only then take the second
+ // trusted clock sample, directly on the NIC dispatch boundary.
+ transmit_owned_ipv4_guarded(dev,routes,owner,owner_epoch,destination,
+    ||{
+        let at_dispatch=clock()?;
+        if at_dispatch<before||
+            !links.receipt_is_current_at(dest,at_dispatch,token){
+            return Err(Error::Unexpected);
+        }
+        let current=routes.select(owner,owner_epoch,dest)
+            .map_err(|_|Error::Unexpected)?.ok_or(Error::Unexpected)?;
+        if current!=token.selected.route{return Err(Error::Unexpected);}
+        Ok(())
+    },constructor)
+}
+
+/// QEMU policy clock fixture: caller supplies two trusted samples. The
+/// fallible production implementation below never accepts a missing timer.
 pub fn transmit_leased_ipv4_checked_clock<
  D:EthernetDevice,const N:usize,const M:usize
 >(
@@ -1916,26 +1950,32 @@ pub fn transmit_leased_ipv4_checked_clock<
  destination:[u8;4],mut clock:impl FnMut()->u64,
  constructor:impl FnOnce(&mut[u8],[u8;6])->usize,
 )->Result<(),Error>{
- let dest=u32::from_be_bytes(destination);
- let before=clock();
- let token=links.receipt_at(dest,before).ok_or(Error::Unexpected)?;
- let policy=routes.select(owner,owner_epoch,dest)
-    .map_err(|_|Error::Unexpected)?.ok_or(Error::Unexpected)?;
- if policy!=token.selected.route{return Err(Error::Unexpected);}
- // Serialize and validate the IPv4 frame first. Only then take the second
- // trusted clock sample, directly on the NIC dispatch boundary.
- transmit_owned_ipv4_guarded(dev,routes,owner,owner_epoch,destination,
-    ||{
-        let at_dispatch=clock();
-        if at_dispatch<before||
-            !links.receipt_is_current_at(dest,at_dispatch,token){
-            return Err(Error::Unexpected);
-        }
-        let current=routes.select(owner,owner_epoch,dest)
-            .map_err(|_|Error::Unexpected)?.ok_or(Error::Unexpected)?;
-        if current!=token.selected.route{return Err(Error::Unexpected);}
-        Ok(())
-    },constructor)
+ transmit_leased_ipv4_checked_try_clock(
+    dev,routes,links,owner,owner_epoch,destination,
+    ||Ok(clock()),constructor)
+}
+
+/// R118: actual kernel timer-backed link admission for callers that have
+/// enabled and calibrated the BSP timer. Every NIC transmit re-samples the
+/// delivered IRQ counter after frame construction. A stopped, uncalibrated,
+/// or zero-progress timer DENIES the frame. No fake test clock is accepted.
+/// This does not provide SMP TSC synchronization, NIC IRQ/IOMMU safety or
+/// multi-NIC physical qualification.
+#[cfg(feature="timer")]
+pub fn transmit_leased_ipv4_kernel_clock<
+ D:EthernetDevice,const N:usize,const M:usize
+>(
+ dev:&mut D,
+ routes:&crate::agent_06_ipv4_route::OwnerRoutes<N>,
+ links:&crate::agent_06_ipv4_route::FailoverRoutes<M>,
+ owner:crate::batch5_session::Identity,owner_epoch:u64,
+ destination:[u8;4],
+ constructor:impl FnOnce(&mut[u8],[u8;6])->usize,
+)->Result<(),Error>{
+ transmit_leased_ipv4_checked_try_clock(
+    dev,routes,links,owner,owner_epoch,destination,
+    ||crate::timer::kernel_monotonic_100hz().ok_or(Error::Unexpected),
+    constructor)
 }
 #[cfg(test)]
 mod r117_monotonic_route_clock_tests {
@@ -2496,4 +2536,47 @@ mod r120_three_process_mixed_resource_retirement {
    assert_eq!(registry.authorize(2,4,6102),Ok(()));
   }
  }
+}
+
+#[cfg(test)]
+mod r118_kernel_clock_dispatch_fail_closed_tests{
+    use super::*;
+    use crate::agent_06_ipv4_route::{OwnerRoutes,FailoverRoutes,Route,RouteCandidate};
+    use crate::batch5_session::Identity;
+    struct Fake{writes:usize}
+    impl EthernetDevice for Fake{
+        fn mac(&self)->[u8;6]{[0x52,0x54,0,0x12,0x34,0x56]}
+        fn send(&mut self,_frame:&[u8])->Result<(),Error>{self.writes+=1;Ok(())}
+        fn poll(&mut self,_out:&mut[u8])->Result<Option<usize>,Error>{Ok(None)}
+    }
+    #[test]
+    fn missing_hardware_tick_at_dispatch_never_writes_a_nic_frame(){
+        let owner=Identity{pid:1,generation:8};
+        let route=Route{network:0x0a07_0000,prefix:24,next_hop:0};
+        let mut routes=OwnerRoutes::<1>::new();
+        routes.bind_kernel(owner,3).unwrap();
+        routes.publish(owner,3,&[route]).unwrap();
+        let mut links=FailoverRoutes::<1>::new();
+        links.add(RouteCandidate{
+            route,metric:1,link:1,epoch:7,healthy:true
+        }).unwrap();
+        let mut nic=Fake{writes:0};
+        let mut samples=0;
+        let result=transmit_leased_ipv4_checked_try_clock(
+            &mut nic,&routes,&links,owner,3,PEER_IP,
+            ||{
+                samples+=1;
+                if samples==1{Ok(10)}else{Err(Error::Unexpected)}
+            },
+            |buf,mac|udp_frame(buf,mac,PEER_UDP_PORT,b"safe",6));
+        assert_eq!(result,Err(Error::Unexpected));
+        assert_eq!(samples,2);
+        assert_eq!(nic.writes,0);
+        assert_eq!(transmit_leased_ipv4_checked_try_clock(
+            &mut nic,&routes,&links,owner,3,PEER_IP,
+            ||Err(Error::Unexpected),
+            |buf,mac|udp_frame(buf,mac,PEER_UDP_PORT,b"safe",7)),
+            Err(Error::Unexpected));
+        assert_eq!(nic.writes,0);
+    }
 }
