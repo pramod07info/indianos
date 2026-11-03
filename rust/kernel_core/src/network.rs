@@ -481,10 +481,10 @@ pub fn run_demo<D:EthernetDevice>(
        udp_endpoints.pending_owned(replacement.pid,replacement.generation)!=Ok(0){
         return Err(Error::Unexpected);
     }
-    stage(b"IndianOS: R130 QEMU stale NIC frame denied after PID/UDP epoch recycle\n\0");
     routes.retire(route_owner,1).map_err(|_|Error::Unexpected)?;
     stage(b"IndianOS: R028 UDP DNS A query indianos.test PASSED\n\0");
     stage(b"IndianOS: R124 QEMU permit-fenced kernel NIC UDP/DNS ingress PASSED\n\0");
+    stage(b"IndianOS: R130 QEMU stale NIC frame denied after PID/UDP epoch recycle\n\0");
     stage(b"IndianOS: M2 live NIC IPv4/UDP DNS verifier PASSED\n\0");
     // Strict stop-and-wait TCP handshake and one request-response exchange.
     transmit(dev,|b,m|tcp_frame(b,m,TCP_SEQ,0,0x02,&[],0x2804))?;
