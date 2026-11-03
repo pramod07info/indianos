@@ -163,7 +163,11 @@ impl WriteGuard{
     /// a protected source may not be moved into an unprotected directory.
     pub fn preflight_rename(&mut self,source:&str,target:&str)->Result<(),Error>{
         if let Err(e)=Self::allow_path(source){self.deny();return Err(e);}
-        if source==target{self.deny();return Err(Error::InvalidPath);}
+        match Self::same_canonical_path(source,target){
+          Ok(true)|Err(Error::InvalidPath)=>{self.deny();return Err(Error::InvalidPath)}
+          Ok(false)=>{}
+          Err(e)=>{self.deny();return Err(e)}
+        }
         self.preflight(target,1)
     }
     /// Atomic preflight for multiple actual pending mutations, with exact
@@ -179,8 +183,13 @@ impl WriteGuard{
                 if length==0||length>u32::MAX as usize{
                     return Err(Error::RateLimited);
                 }
-                if operations[..i].iter().any(|(previous,_)|*previous==path){
-                    return Err(Error::RateLimited);
+                for &(previous,_) in &operations[..i]{
+                    // Preserve legacy quota semantics for an exact duplicate.
+                    if previous==path{return Err(Error::RateLimited);}
+                    // A differently-spelled alias violates namespace identity.
+                    if Self::same_canonical_path(previous,path)?{
+                        return Err(Error::InvalidPath);
+                    }
                 }
                 bytes=bytes.checked_add(length as u32).ok_or(Error::RateLimited)?;
             }
@@ -325,9 +334,14 @@ impl WriteGuard{
         if count>self.operations_left(){return Err(Error::RateLimited);}
         for (i,&(path,length)) in requests.iter().enumerate(){
             Self::allow_path(path)?;
-            if length==0||length>u32::MAX as usize||
-                requests[..i].iter().any(|(p,_)|*p==path){
+            if length==0||length>u32::MAX as usize{
                 return Err(Error::RateLimited);
+            }
+            for &(previous,_) in &requests[..i]{
+                if previous==path{return Err(Error::RateLimited);}
+                if Self::same_canonical_path(previous,path)?{
+                    return Err(Error::InvalidPath);
+                }
             }
             bytes=bytes.checked_add(length as u32).ok_or(Error::RateLimited)?;
             if bytes>self.bytes_left(){return Err(Error::RateLimited);}
@@ -341,7 +355,7 @@ impl WriteGuard{
     /// 7. Check protected source or target for a non-destructive preview.
     pub fn would_allow_rename(&self,from:&str,to:&str)->Result<(),Error>{
         Self::allow_path(from)?;
-        if from==to{return Err(Error::InvalidPath);}
+        if Self::same_canonical_path(from,to)?{return Err(Error::InvalidPath);}
         self.would_accept_write(to,1)
     }
     /// 8. Check a metadata-only deletion without decrementing budgets.
@@ -411,9 +425,16 @@ impl WriteGuard{
             let mut staged=[("",0usize);MAX_WRITE_OPERATIONS as usize];
             for (i,&(from,to)) in pairs.iter().enumerate(){
                 Self::allow_path(from)?;
-                if from==to||pairs[..i].iter().any(|(a,b)|
-                    *a==from||*b==to||*a==to||*b==from){
+                if Self::same_canonical_path(from,to)?{
                     return Err(Error::InvalidPath);
+                }
+                for &(old_from,old_to) in &pairs[..i]{
+                    if Self::same_canonical_path(old_from,from)?||
+                        Self::same_canonical_path(old_to,to)?||
+                        Self::same_canonical_path(old_from,to)?||
+                        Self::same_canonical_path(old_to,from)?{
+                        return Err(Error::InvalidPath);
+                    }
                 }
                 staged[i]=(to,1);
             }
@@ -1320,4 +1341,55 @@ mod r084_batch_vi_guard_tests{
         assert_eq!(g.statistics().completed_writes,0);
         assert!(g.validate_guard_accounting());
     }
+}
+
+#[cfg(test)]
+mod r119_canonical_write_identity_tests{
+ use super::*;
+ #[test]fn alias_self_renames_denied_without_committed_budget(){
+  let mut g=WriteGuard::new();
+  for (from,to) in [
+    ("/work/report","//work/./report"),
+    ("/work/report/","/work/report"),
+    ("//work//report","/work/./report/"),
+  ]{
+    assert_eq!(g.preflight_rename(from,to),Err(Error::InvalidPath));
+    assert_eq!(g.would_allow_rename(from,to),Err(Error::InvalidPath));
+  }
+  assert_eq!(g.statistics().completed_writes,0);
+  assert_eq!(g.statistics().denials,3);
+ }
+ #[test]fn write_batch_alias_collision_is_atomic(){
+  let mut g=WriteGuard::new();
+  let pair=[("/work/a",5),("//work/./a",7)];
+  assert_eq!(g.would_accept_batch(&pair),Err(Error::InvalidPath));
+  assert_eq!(g.preflight_batch(&pair),Err(Error::InvalidPath));
+  assert_eq!(g.statistics().completed_writes,0);
+  assert_eq!(g.statistics().changed_bytes,0);
+ }
+ #[test]fn rename_groups_refuse_cross_aliases(){
+  let mut g=WriteGuard::new();
+  for pairs in [
+   [("/work/a","/work/b"),("//work/./b","/work/c")],
+   [("/work/a","/work/b"),("/work/c","//work/./a")],
+   [("/work/a","/work/b"),("/work/c","//work/./b")],
+  ]{
+   assert_eq!(g.preflight_rename_batch(&pairs),Err(Error::InvalidPath));
+  }
+  assert_eq!(g.statistics().completed_writes,0);
+ }
+ #[test]fn malformed_alias_and_protected_target_fail_closed(){
+  let mut g=WriteGuard::new();
+  assert_eq!(g.would_allow_rename("/work/a","/work/../a"),Err(Error::InvalidPath));
+  assert_eq!(g.preflight_batch(&[("/work/a",1),("/work/../a",1)]),Err(Error::InvalidPath));
+  assert_eq!(g.preflight_rename("/work/a","//boot/./init"),Err(Error::Protected));
+  assert_eq!(g.statistics().completed_writes,0);
+ }
+ #[test]fn distinct_canonical_names_remain_writable(){
+  let mut g=WriteGuard::new();
+  assert_eq!(g.would_allow_rename("/work/a","/work/b"),Ok(()));
+  assert_eq!(g.preflight_rename_batch(&[("/work/a","/work/b"),("/work/c","/work/d")]),Ok(()));
+  assert_eq!(g.preflight_batch(&[("/work/a",5),("/work/b",7)]),Ok(()));
+  assert_eq!(g.statistics().completed_writes,0);
+ }
 }
