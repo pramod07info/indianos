@@ -162,8 +162,12 @@ pub extern "C" fn kmain()->!{
             match crate::limine_requests::r132_guest_status(){
                 0=>log(b"IndianOS: FATAL R132 before AP startup or CPUID\n\0"),
                 1|2=>log(b"IndianOS: FATAL R132 lifecycle mailbox exchange\n\0"),
-                3|20|21=>log(b"IndianOS: FATAL R132 AP x2APIC/IDT not ready\n\0"),
-                23|24=>log(b"IndianOS: FATAL R132 IPI handler/EOI acknowledgement\n\0"),
+                20=>log(b"IndianOS: FATAL R132 AP CPUID missing x2APIC\n\0"),
+                22=>log(b"IndianOS: FATAL R132 AP local APIC MSR disabled\n\0"),
+                30=>log(b"IndianOS: FATAL R132 AP interrupt IDT not ready\n\0"),
+                31=>log(b"IndianOS: FATAL R132 BSP x2APIC unavailable\n\0"),
+                23|24|32=>log(b"IndianOS: FATAL R132 IPI delivered without ISR/EOI acknowledgement\n\0"),
+                3|21=>log(b"IndianOS: FATAL R132 AP x2APIC/IDT readiness\n\0"),
                 _=>log(b"IndianOS: FATAL R132 unknown IPI stage\n\0"),
             }
             halt();

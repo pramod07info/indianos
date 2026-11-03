@@ -288,6 +288,9 @@ static R132_AP_DONE:core::sync::atomic::AtomicU32=
 static R132_STATUS:core::sync::atomic::AtomicU32=
     core::sync::atomic::AtomicU32::new(0);
 #[cfg(feature="test-r118-ap-ack")]
+static R132_AP_ERROR:core::sync::atomic::AtomicU32=
+    core::sync::atomic::AtomicU32::new(0);
+#[cfg(feature="test-r118-ap-ack")]
 pub(crate) fn r132_guest_status()->u32{
     R132_STATUS.load(core::sync::atomic::Ordering::Acquire)
 }
@@ -380,8 +383,12 @@ fn r132_enable_x2apic()->bool{
 #[cfg(feature="test-r118-ap-ack")]
 fn r132_ap_listen_for_ipi()->bool{
     use core::{arch::asm,mem::size_of,sync::atomic::Ordering};
+    if !r132_has_x2apic(){
+        R132_AP_ERROR.store(20,Ordering::Release);
+        return false;
+    }
     if !r132_enable_x2apic(){
-        R132_STATUS.store(20,Ordering::Release);
+        R132_AP_ERROR.store(22,Ordering::Release);
         return false;
     }
     let cs:u16;
@@ -421,8 +428,17 @@ fn r132_bsp_send_and_confirm()->bool{
         if R132_AP_READY.load(Ordering::Acquire)==1{break;}
         core::hint::spin_loop();
     }
-    if R132_AP_READY.load(Ordering::Acquire)!=1 ||
-       !r132_enable_x2apic(){return false;}
+    if R132_AP_READY.load(Ordering::Acquire)!=1{
+        let ap_error=R132_AP_ERROR.load(Ordering::Acquire);
+        R132_STATUS.store(if ap_error==20{20}
+                          else if ap_error==22{22}
+                          else{30},Ordering::Release);
+        return false;
+    }
+    if !r132_enable_x2apic(){
+        R132_STATUS.store(31,Ordering::Release);
+        return false;
+    }
     // ICR[63:32] is destination x2APIC ID; low byte is fixed vector.
     // Only the validated QEMU APIC ID 1 is addressed, never broadcasts.
     r132_wrmsr(0x830,(1u64<<32)|0xf1);
@@ -433,6 +449,7 @@ fn r132_bsp_send_and_confirm()->bool{
         }
         core::hint::spin_loop();
     }
+    R132_STATUS.store(32,Ordering::Release);
     false
 }
 
@@ -519,6 +536,7 @@ pub(crate) fn launch_one_parked_qemu_ap()->bool{
     R132_AP_DONE.store(0,Ordering::Release);
     R132_AP_ISR.store(0,Ordering::Release);
     R132_STATUS.store(0,Ordering::Release);
+    R132_AP_ERROR.store(0,Ordering::Release);
     fence(Ordering::Release);
     // The canonical Limine protocol wakes the AP only AFTER the BSP
     // publishes goto_address. No normal boot, userland or IRQ is enabled.
