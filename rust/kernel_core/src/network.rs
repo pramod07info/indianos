@@ -300,6 +300,9 @@ pub fn run_demo<D:EthernetDevice>(
     // with a non-Send permit held from RX snapshot through queue admission.
     // CPU 0 and masked interrupts are trusted QEMU-only facts: the legacy
     // virtio-net driver is POLLED and must never be called from a real IRQ.
+    // R135: distinct software RX admissions for this one real QEMU NIC.
+    // Physical IRQs remain masked; no claim of hardware DMA quiescence.
+    let nic_rx_fence=crate::nic_rx_fence::NicRxFence::new(1);
     let ingress_gate=crate::retirement_gate::RetirementGate::new();
     ingress_gate.register_bsp(0,true).map_err(|_|Error::Unexpected)?;
     let ingress_permit=ingress_gate.try_enter(0,true)
@@ -346,9 +349,11 @@ pub fn run_demo<D:EthernetDevice>(
     let ingress=|revision:crate::process_retirement_txn::IngressRevision,
                   frame:&[u8],mac:[u8;6]|{
         parse_udp(frame,mac,PEER_UDP_PORT).is_ok_and(|data|data==UDP_RESP)
-            && live_owners.ingest_kernel_nic_frame(
-                &ingress_permit,&mut udp_endpoints,revision,frame,mac)
-                .is_ok_and(|owner|owner==network_owner)
+            && nic_rx_fence.try_admit(1).is_ok_and(|rx|
+                live_owners.ingest_nic_frame_device_fenced(
+                    &nic_rx_fence,&rx,&ingress_permit,
+                    &mut udp_endpoints,revision,frame,mac)
+                .is_ok_and(|owner|owner==network_owner))
     };
     // Do not treat malformed network replies as successful failover evidence.
     // In the QEMU test the peer confirms packet reception but blackholes
@@ -405,8 +410,10 @@ pub fn run_demo<D:EthernetDevice>(
                             .is_ok_and(|data|data==UDP_RESP) {
                         return false;
                     }
-                    if live_owners.ingest_kernel_nic_frame(
-                        &ingress_permit,&mut udp_endpoints,revision,frame,mac)
+                    let Ok(rx)=nic_rx_fence.try_admit(1)else{return false;};
+                    if live_owners.ingest_nic_frame_device_fenced(
+                        &nic_rx_fence,&rx,&ingress_permit,
+                        &mut udp_endpoints,revision,frame,mac)
                         !=Ok(network_owner){
                         return false;
                     }
@@ -443,9 +450,11 @@ pub fn run_demo<D:EthernetDevice>(
         ||live_owners.capture_ingress_revision(&ingress_permit),
         |revision,frame,mac|{
             valid_dns(frame,mac) &&
-                live_owners.ingest_kernel_nic_frame(
-                    &ingress_permit,&mut udp_endpoints,revision,frame,mac)
-                    .is_ok_and(|owner|owner==network_owner)
+                nic_rx_fence.try_admit(1).is_ok_and(|rx|
+                    live_owners.ingest_nic_frame_device_fenced(
+                        &nic_rx_fence,&rx,&ingress_permit,
+                        &mut udp_endpoints,revision,frame,mac)
+                    .is_ok_and(|owner|owner==network_owner))
         }
     )?;
     let mut dns_reply=[0u8;R033_UDP_BYTES];
@@ -454,6 +463,15 @@ pub fn run_demo<D:EthernetDevice>(
         .map_err(|_|Error::Unexpected)?;
     if dns_bytes<12 || dns_reply[..2]!=[0x28,0x28] ||
        dns_reply[2]&0x80==0{return Err(Error::Unexpected);}
+    // Stop NEW software RX admission and prove no handler remains before
+    // revoking the old owner and reusing its PID and UDP port. The dedicated
+    // QEMU NIC is exclusively polled: no MSI/MSI-X or physical DMA stop is
+    // exercised by this isolated profile.
+    let stopped=nic_rx_fence.begin_quiesce(1)
+        .map_err(|_|Error::Unexpected)?;
+    if nic_rx_fence.drained(stopped)!=Ok(true){
+        return Err(Error::Unexpected);
+    }
     let retired=live_owners.retire_live_exited_batch(
         &mut udp_endpoints,&[network_owner]).map_err(|_|Error::Unexpected)?;
     if retired.udp_ports_released!=1 || retired.notices_enqueued!=1 ||
@@ -473,8 +491,13 @@ pub fn run_demo<D:EthernetDevice>(
     }
     live_owners.bind_live_udp(&mut udp_endpoints,replacement,CLIENT_PORT)
         .map_err(|_|Error::Unexpected)?;
-    if live_owners.ingest_kernel_nic_frame(
-        &ingress_permit,&mut udp_endpoints,stale_revision,
+    if nic_rx_fence.finish_rebind(stopped)!=Ok(2){
+        return Err(Error::Unexpected);
+    }
+    let rx=nic_rx_fence.try_admit(1).map_err(|_|Error::Unexpected)?;
+    if live_owners.ingest_nic_frame_device_fenced(
+        &nic_rx_fence,&rx,&ingress_permit,
+        &mut udp_endpoints,stale_revision,
         &saved_wire[..saved_len],saved_mac)
         !=Err(crate::process_retirement_txn::RetirementError::Sockets(
                 SocketError::Denied)) ||
@@ -485,6 +508,7 @@ pub fn run_demo<D:EthernetDevice>(
     stage(b"IndianOS: R028 UDP DNS A query indianos.test PASSED\n\0");
     stage(b"IndianOS: R124 QEMU permit-fenced kernel NIC UDP/DNS ingress PASSED\n\0");
     stage(b"IndianOS: R130 QEMU stale NIC frame denied after PID/UDP epoch recycle\n\0");
+    stage(b"IndianOS: R135 QEMU NIC RX drained before UDP owner recycle PASSED\n\0");
     stage(b"IndianOS: M2 live NIC IPv4/UDP DNS verifier PASSED\n\0");
     // Strict stop-and-wait TCP handshake and one request-response exchange.
     transmit(dev,|b,m|tcp_frame(b,m,TCP_SEQ,0,0x02,&[],0x2804))?;
@@ -2871,6 +2895,46 @@ mod r118_privileged_nic_ingress_tests{
         assert_eq!(out,[0xa5;8]);
     }
 
+
+    #[test]
+    fn r135_foreign_device_rx_permit_cannot_enqueue_and_quiesce_drains(){
+        let gate=RetirementGate::new();gate.register_bsp(0,true).unwrap();
+        let bsp=gate.try_enter(0,true).unwrap();
+        let mut sockets=EpochUdpEndpoints::<1,2>::new();
+        let mut k=ProcessRetirement::<1,1,2>::new();
+        let live=k.start(1).unwrap();
+        k.bind_live_udp(&mut sockets,live,5001).unwrap();
+        let revision=k.capture_ingress_revision(&bsp);
+        let rx_device=crate::nic_rx_fence::NicRxFence::new(7);
+        let other=crate::nic_rx_fence::NicRxFence::new(7);
+        let wrong=other.try_admit(7).unwrap();
+        let (frame,n)=reply(5001,b"valid");
+        assert_eq!(k.ingest_nic_frame_device_fenced(
+            &rx_device,&wrong,&bsp,&mut sockets,revision,&frame[..n],LOCAL),
+            Err(RetirementError::Sockets(SocketError::Denied)));
+        assert_eq!(sockets.pending_owned(live.pid,live.generation),Ok(0));
+        drop(wrong);
+        let valid=rx_device.try_admit(7).unwrap();
+        assert_eq!(k.ingest_nic_frame_device_fenced(
+            &rx_device,&valid,&bsp,&mut sockets,revision,&frame[..n],LOCAL),
+            Ok(live));
+        let quiesce=rx_device.begin_quiesce(7).unwrap();
+        assert_eq!(rx_device.drained(quiesce),Ok(false));
+        assert_eq!(k.ingest_nic_frame_device_fenced(
+            &rx_device,&valid,&bsp,&mut sockets,revision,&frame[..n],LOCAL),
+            Err(RetirementError::Sockets(SocketError::Denied)));
+        drop(valid);
+        assert_eq!(rx_device.drained(quiesce),Ok(true));
+        k.retire_live_exited_batch(&mut sockets,&[live]).unwrap();
+        let recycled=k.start(1).unwrap();
+        k.bind_live_udp(&mut sockets,recycled,5001).unwrap();
+        assert_eq!(rx_device.finish_rebind(quiesce),Ok(2));
+        let fresh=rx_device.try_admit(7).unwrap();
+        assert_eq!(k.ingest_nic_frame_device_fenced(
+            &rx_device,&fresh,&bsp,&mut sockets,revision,&frame[..n],LOCAL),
+            Err(RetirementError::Sockets(SocketError::Denied)));
+        assert_eq!(sockets.pending_owned(recycled.pid,recycled.generation),Ok(0));
+    }
 
     #[test]
     fn stale_polled_packet_cannot_cross_port_rebind_to_recycled_pid(){

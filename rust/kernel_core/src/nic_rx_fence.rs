@@ -71,7 +71,9 @@ impl NicRxFence {
         ->Result<u64,RxFenceError>{
         if !self.drained(receipt)?{return Err(RxFenceError::Busy);}
         let next=receipt.epoch.checked_add(1).ok_or(RxFenceError::EpochExhausted)?;
-        self.epoch.store(next,Ordering::Release);
+        self.epoch.compare_exchange(receipt.epoch,next,
+            Ordering::AcqRel,Ordering::Acquire)
+            .map_err(|_|RxFenceError::Stale)?;
         self.quiescing.store(false,Ordering::Release);
         Ok(next)
     }
