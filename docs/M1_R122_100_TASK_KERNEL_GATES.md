@@ -2,7 +2,7 @@
 
 **Base SHA:** `01f7755eab9a5059c58f11267df5f45eb00d41ae` (R121 merge #758). **Five logical workstreams**, **one source integration commit**, **one PR**. There are no independently launched autonomous coding agents.
 
-**Status:** 11/70 source-scoped new acceptance items authored; 59/70 new items still open; 0/30 inherited hardware/release obligations newly accepted. **Overall 11/100 authored at source/test scope**, 89/100 not newly accepted. The R122-008 checkbox means a bounded software no-progress failure path, not a physical IPI timeout or release acceptance. Checked items are fine-grained checks for ONE integrated NIC→UDP hardening change, not independent new OS features or proven hardware functionality.
+**Status:** 12/70 narrowly scoped new source/test acceptance items authored; 58/70 new items still open; 0/30 inherited hardware/release obligations newly accepted. **Overall 12/100 authored at source/test scope**, 88/100 not newly accepted. New source checks must still pass CI at this final head. Neither host probes nor QEMU two-vCPU proof establish physical hardware qualification. The R122-008 checkbox means a bounded software no-progress failure path, not a physical IPI timeout or release acceptance. Checked items are fine-grained checks for ONE integrated NIC→UDP hardening change, not independent new OS features or proven hardware functionality.
 
 ## What changed in executable kernel code
 
@@ -46,7 +46,7 @@
 
 ### Workstream 3 — Filesystem, VFS and persistence
 - [ ] R122-029 — Reject simultaneous mount replacement during path resolution
-- [ ] R122-030 — Enforce selected-volume token generation
+- [x] R122-030 — Enforce selected-volume token generation (authenticated PID generation plus canonical current-root check now rejects drift before disk I/O; host regression authored; exact-head CI pending)
 - [ ] R122-031 — Add mount stale-token mutation fuzz
 - [ ] R122-032 — Verify Files queue persists after power-safe reboot
 - [ ] R122-033 — Provide non-blocking retire-owner lock ordering
@@ -124,6 +124,18 @@
 - [ ] R122-I28 — R121 carry-forward: R119-041 — scheduler fault and normal-exit integration
 - [ ] R122-I29 — R121 carry-forward: R119-056 — cross-core IRQ scheduler delivery
 - [ ] R122-I30 — R121 carry-forward: R119-069 — all mandatory checks green on final source SHA
+
+## R122 continuation — multiple implementation commits (not five autonomous agents)
+
+The initial consolidated R122 source commit was expanded using **three additional, distinct implementation commits** at the user's request:
+
+1. **NIC ring lifetime and software receive gate:** `eb28e6b82c9192a24bc31db0138c9a9355e38f6c` introduces an opaque non-reusable ring/driver identity into every software RX permit and rejects foreign look-alike ring admission. Two focused Rust tests cover same-number NIC isolation, quiescence, and concurrent first admissions. No actual MSI-X/DMA stop is claimed.
+2. **Filesystem selected-volume preflight:** `804193208370b28a08ebff5f42ef666b50fcf373` independently checks the canonical file-handle pathname against the current process root before selected-volume disk probing. A negative regression simulates out-of-band root drift without proper descriptor revocation and proves zero disk reads/writes and unchanged user output.
+3. **AP QEMU cleanup-before-ack:** `76deee6521c0106380829d4c776fb1060dc4be0a` adds `observe_and_ack_after`. The real secondary QEMU vCPU now validates exact publication sequence/generation before AP acknowledgement; BSP uses bounded `poll_ack_bounded` and the serial test requires a new AP proof marker. An AP cleanup-denial regression proves no acknowledgement or reuse before successful proof. This remains an isolated two-vCPU protocol, NOT a production IPI or TLB shootdown.
+
+**CI caveat:** Historical green checks on the original R122 commit are not final-head evidence. Run the updated PR head's Rust host, optimized no_std, network QEMU, AP QEMU, kernel ELF/ISO, Files persistence, and security checks independently. Human kernel/security review and branch protection are not optional hardware substitutes.
+
+**Still not implemented/qualified:** physical APIC IPI and TLB shootdown, SMP scheduler/locking, real IRQ-driven NIC DMA mask/MSI-X + IOMMU isolation, physical SMP remount races, immutable firmware/TPM trust anchor, destructive hardware power cut and real boot sector restore. Retain all inherited items unchecked.
 
 ## Release checklist and unresolved blockers
 
