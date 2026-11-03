@@ -12,7 +12,7 @@ use core::sync::atomic::{fence,AtomicBool,AtomicU64,Ordering};
 #[derive(Debug,Clone,Copy,Eq,PartialEq)]
 pub enum FenceError {
     InvalidCpu, InvalidGeneration, StaleGeneration, Busy,
-    StaleReceipt, Overflow,
+    StaleReceipt, Overflow, NoProgress,
 }
 
 #[derive(Debug,Clone,Copy,Eq,PartialEq)]
@@ -92,6 +92,22 @@ impl LifecycleFence {
             last_seen,seq,Ordering::AcqRel,Ordering::Acquire
         ).map_err(|_|FenceError::StaleReceipt)?;
         Ok(Some(receipt))
+    }
+    /// BSP-side bounded software probe for a previously published AP receipt.
+    /// The budget counts polling probes, NOT wall-clock time. This MUST NOT
+    /// run in an interrupt handler or while holding an SMP scheduler lock.
+    /// An unresponsive AP leaves the publication outstanding (fail closed):
+    /// the caller must not recycle memory or issue another lifecycle receipt.
+    /// Actual IPI delivery, timeout clocks and TLB shootdown are NOT provided.
+    pub fn poll_ack_bounded(
+        &self,cpu:u32,receipt:Receipt,budget:u32
+    )->Result<(),FenceError>{
+        if self.acknowledged(cpu,receipt)?{return Ok(());}
+        for _ in 0..budget{
+            core::hint::spin_loop();
+            if self.acknowledged(cpu,receipt)?{return Ok(());}
+        }
+        Err(FenceError::NoProgress)
     }
     /// BSP cannot treat an ack for an earlier generation as the current one.
     pub fn acknowledged(
@@ -264,4 +280,21 @@ mod tests{
         }
         worker.join().unwrap();
     }
+    #[test]
+    fn r122_no_progress_does_not_recycle_outstanding_ap_receipt(){
+        let f=LifecycleFence::new(0,1);
+        let issued=f.publish(0,11).unwrap();
+        assert_eq!(f.poll_ack_bounded(0,issued,4),Err(FenceError::NoProgress));
+        assert_eq!(f.publish(0,12),Err(FenceError::Busy));
+        assert_eq!(f.poll_ack_bounded(0,Receipt{
+            sequence:issued.sequence,generation:12},1),Err(FenceError::StaleReceipt));
+        assert_eq!(f.poll_ack_bounded(1,issued,1),Err(FenceError::InvalidCpu));
+        assert_eq!(f.acknowledged(0,issued),Ok(false));
+        assert_eq!(f.observe_and_ack(1,0),Ok(Some(issued)));
+        assert_eq!(f.poll_ack_bounded(0,issued,1),Ok(()));
+        let next=f.publish(0,12).unwrap();
+        assert_eq!(next.sequence,issued.sequence+1);
+        assert_eq!(f.poll_ack_bounded(0,issued,1),Err(FenceError::StaleReceipt));
+    }
+
 }
