@@ -2695,14 +2695,16 @@ mod r118_privileged_nic_ingress_tests{
             Err(RetirementError::Sockets(SocketError::Denied)));
         assert_eq!(sockets.pending_owned(recycled.pid,recycled.generation),Ok(0));
         assert_eq!(sockets.pending_owned(peer.pid,peer.generation),Ok(0));
-        // A fresh RX descriptor timestamp can still deliver to the
-        // newly registered generation while preserving peer isolation.
+        // A NEW receive descriptor captured after the rebind may deliver
+        // fresh traffic. Physical NIC RX descriptors must be drained and
+        // retagged before such a descriptor is considered authoritative.
+        let (fresh,fresh_len)=reply(5001,b"fresh");
         let current_rx=k.capture_ingress_revision(&permit);
         assert_eq!(k.ingest_kernel_nic_frame(
-            &permit,&mut sockets,current_rx,&frame[..len],LOCAL),Ok(recycled));
+            &permit,&mut sockets,current_rx,&fresh[..fresh_len],LOCAL),Ok(recycled));
         let mut out=[0u8;16];
         assert_eq!(k.receive_live_udp(&mut sockets,recycled,5001,&mut out),Ok(5));
-        assert_eq!(&out[..5],b"stale");
+        assert_eq!(&out[..5],b"fresh");
     }
     #[test]
     fn stale_poll_token_is_rejected_even_for_unrelated_peer_port(){

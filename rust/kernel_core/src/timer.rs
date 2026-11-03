@@ -13,6 +13,16 @@ const PIT_DATA:u16=0x40;
 static TICKS:AtomicU64=AtomicU64::new(0);
 // Counts successfully acknowledged local APIC interrupts separately from PIC IRQ0.
 static XAPIC_IRQ_TICKS:AtomicU64=AtomicU64::new(0);
+/// Cumulative successfully delivered BSP timer interrupts. Unlike the
+/// diagnostic per-session counters, this NEVER resets on calibration or
+/// stop/restart; DHCP receipt timestamps must not roll backwards.
+static MONOTONIC_IRQ_TICKS:AtomicU64=AtomicU64::new(0);
+/// 0: no authoritative source, 1: programmed PIT/PIC, 2: calibrated xAPIC.
+static MONOTONIC_SOURCE:AtomicU8=AtomicU8::new(0);
+/// A restarted timer must deliver a NEW IRQ before its clock can be trusted.
+static MONOTONIC_SESSION_PROGRESS:AtomicBool=AtomicBool::new(false);
+/// A saturated u64 must never wrap back to an old lease timestamp.
+static MONOTONIC_EXHAUSTED:AtomicBool=AtomicBool::new(false);
 // Counts actual valid ring-3 context captures, not merely APIC EOI writes.
 static XAPIC_PREEMPTIONS:AtomicU64=AtomicU64::new(0);
 static CONFIGURED:AtomicBool=AtomicBool::new(false);
@@ -67,7 +77,16 @@ pub extern "C" fn x86_64_timer_start_100hz()->bool{
     outb(PIT_DATA,(DIVISOR&0xff) as u8);
     outb(PIT_DATA,(DIVISOR>>8) as u8);
     TICKS.store(0,Ordering::Relaxed);
-    CONFIGURED.store(true,Ordering::Relaxed);
+    CONFIGURED.store(true,Ordering::Release);
+    // Prefer an actively calibrated APIC, when one exists. Never let an
+    // uncalibrated second source silently produce double-counted time.
+    if !XAPIC_TIMER_RUNNING.load(Ordering::Acquire) {
+        MONOTONIC_SESSION_PROGRESS.store(false,Ordering::Release);
+        MONOTONIC_SOURCE.store(1,Ordering::Release);
+    }else{
+        MONOTONIC_SOURCE.store(0,Ordering::Release);
+        MONOTONIC_SESSION_PROGRESS.store(false,Ordering::Release);
+    }
     true
 }
 #[no_mangle]
@@ -76,6 +95,7 @@ pub extern "C" fn x86_64_timer_ack_irq0(){
     TICKS.fetch_update(Ordering::Relaxed,Ordering::Relaxed,|v|{
         v.checked_add(1)
     }).ok();
+    record_kernel_monotonic_tick(1);
     outb(PIC1_CMD,0x20);
 }
 #[no_mangle]
@@ -404,6 +424,8 @@ pub unsafe extern "C" fn x86_64_xapic_timer_start_calibrated(
     }
     XAPIC_CALIBRATING.store(false,Ordering::Release);
     XAPIC_TIMER_RUNNING.store(true,Ordering::Release);
+    MONOTONIC_SESSION_PROGRESS.store(false,Ordering::Release);
+    MONOTONIC_SOURCE.store(2,Ordering::Release);
     true
 }
 /// R019.8: begin a bounded masked one-shot measurement.
@@ -467,6 +489,10 @@ pub unsafe extern "C" fn x86_64_xapic_timer_stop()->bool{
     }
     XAPIC_CALIBRATING.store(false,Ordering::Release);
     XAPIC_TIMER_RUNNING.store(false,Ordering::Release);
+    if MONOTONIC_SOURCE.compare_exchange(
+        2,0,Ordering::AcqRel,Ordering::Acquire).is_ok(){
+        MONOTONIC_SESSION_PROGRESS.store(false,Ordering::Release);
+    }
     true
 }
 /// Quiesce every timer source owned by this single-BSP experimental
@@ -511,6 +537,10 @@ pub unsafe fn quiesce_for_shutdown() -> bool {
             outb(PIC1_DATA,new_mask);
             if inb(PIC1_DATA)&1==0 {return false;}
             CONFIGURED.store(false,Ordering::Release);
+            if MONOTONIC_SOURCE.compare_exchange(
+                1,0,Ordering::AcqRel,Ordering::Acquire).is_ok(){
+                MONOTONIC_SESSION_PROGRESS.store(false,Ordering::Release);
+            }
             true
         },
     );
@@ -557,6 +587,7 @@ pub unsafe extern "C" fn x86_64_xapic_eoi()->bool{
     let Some(eoi)=xapic_reg(XAPIC_EOI_OFFSET)else{return false;};
     unsafe{core::ptr::write_volatile(eoi,0);}
     XAPIC_IRQ_TICKS.fetch_update(Ordering::Relaxed,Ordering::Relaxed,|v|v.checked_add(1)).ok();
+    record_kernel_monotonic_tick(2);
     true
 }
 /// Read-only APIC IRQ delivery evidence, separate from legacy PIC IRQ0.
@@ -564,17 +595,50 @@ pub unsafe extern "C" fn x86_64_xapic_eoi()->bool{
 pub extern "C" fn x86_64_xapic_timer_irq_count()->u64{
     XAPIC_IRQ_TICKS.load(Ordering::Relaxed)
 }
-/// Read an actual delivered 100 Hz BSP clock after the reference-calibrated
-/// xAPIC timer (or explicitly configured PIT) has started. These are
-/// session-relative ticks, not seconds since boot, TSC samples, or a trusted
-/// cross-CPU wall clock. An unconfigured/stopped timer has NO authority.
-/// A fresh session must not borrow the previous session's lease receipt.
+/// Called by the actual configured PIC/APIC IRQ acknowledgement path only.
+/// Ignore unrelated or stopped sources, and reject irreversible overflow.
+fn record_kernel_monotonic_tick(source:u8){
+    if MONOTONIC_SOURCE.load(Ordering::Acquire)!=source {return;}
+    if MONOTONIC_IRQ_TICKS.fetch_update(
+        Ordering::AcqRel,Ordering::Acquire,|n|n.checked_add(1)
+    ).is_err(){
+        MONOTONIC_EXHAUSTED.store(true,Ordering::Release);
+    }else{
+        MONOTONIC_SESSION_PROGRESS.store(true,Ordering::Release);
+    }
+}
+
+/// Read a cumulative, delivered-IRQ clock across timer restarts. Its tick
+/// count is monotonically increasing across PIC/APIC session calibration;
+/// neither the PIC diagnostic count nor the APIC diagnostic count alone is
+/// suitable to authorize a lease after a timer stop/restart.
+/// This still is NOT a high-resolution cross-CPU clock and cannot account
+/// for elapsed time while all timer sources are stopped.
 pub fn kernel_monotonic_100hz() -> Option<u64> {
-    let xapic_running=XAPIC_TIMER_RUNNING.load(Ordering::Acquire);
-    let pic_running=CONFIGURED.load(Ordering::Acquire);
-    let xapic_ticks=XAPIC_IRQ_TICKS.load(Ordering::Acquire);
-    let pic_ticks=TICKS.load(Ordering::Acquire);
-    calibrated_kernel_ticks(xapic_running,pic_running,xapic_ticks,pic_ticks)
+    let source=MONOTONIC_SOURCE.load(Ordering::Acquire);
+    let sample=authoritative_monotonic_sample(
+        source,
+        MONOTONIC_SESSION_PROGRESS.load(Ordering::Acquire),
+        MONOTONIC_EXHAUSTED.load(Ordering::Acquire),
+        MONOTONIC_IRQ_TICKS.load(Ordering::Acquire),
+        XAPIC_TIMER_RUNNING.load(Ordering::Acquire),
+        CONFIGURED.load(Ordering::Acquire),
+    );
+    if MONOTONIC_SOURCE.load(Ordering::Acquire)!=source{return None;}
+    sample
+}
+
+/// Pure publication guard: no new IRQ in the current session, a stopped
+/// source, conflicting APIC/PIC authority or numeric overflow deny time.
+pub const fn authoritative_monotonic_sample(
+    source:u8,progress:bool,exhausted:bool,ticks:u64,
+    apic_running:bool,pic_running:bool,
+)->Option<u64>{
+    if !progress||exhausted||ticks==0{return None;}
+    if (source==2&&apic_running)||
+       (source==1&&pic_running&&!apic_running){
+        Some(ticks)
+    }else{None}
 }
 
 /// Pure availability gate; 0 delivered IRQs must never authenticate an
@@ -1060,5 +1124,30 @@ mod tests {
     fn counter_is_bounded(){
         assert_eq!(TICKS.load(Ordering::Relaxed),0);
         assert!(!CONFIGURED.load(Ordering::Relaxed));
+    }
+}
+
+#[cfg(test)]
+mod r118_cumulative_monotonic_regressions {
+    use super::authoritative_monotonic_sample as sample;
+    #[test]
+    fn rearmed_sources_need_new_irq_and_never_reuse_old_receipts(){
+        // Even with a large retained cumulative counter, a rearmed source
+        // without a current-session IRQ must refuse an old time receipt.
+        assert_eq!(sample(2,false,false,900,true,false),None);
+        assert_eq!(sample(2,true,false,901,true,false),Some(901));
+        assert_eq!(sample(0,true,false,901,false,false),None);
+        assert_eq!(sample(1,false,false,901,false,true),None);
+        assert_eq!(sample(1,true,false,902,false,true),Some(902));
+        assert_eq!(sample(2,true,false,903,true,true),Some(903));
+    }
+    #[test]
+    fn conflicting_sources_overflow_and_unconfigured_time_fail_closed(){
+        assert_eq!(sample(1,true,false,10,true,true),None);
+        assert_eq!(sample(1,true,false,10,false,false),None);
+        assert_eq!(sample(3,true,false,10,true,true),None);
+        assert_eq!(sample(2,true,true,u64::MAX,true,false),None);
+        assert_eq!(sample(2,true,false,0,true,false),None);
+        assert_eq!(sample(1,true,false,11,false,true),Some(11));
     }
 }
