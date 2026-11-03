@@ -1,7 +1,7 @@
 //! R120: allocation-free, non-spinning admission for single-BSP retirement.
 //! No IRQ-driven NIC, SMP scheduling, IPI delivery or hardware DMA safety is
 //! implied. An interrupted owner must never spin waiting for its own lock.
-use core::sync::atomic::{AtomicBool,AtomicU32,Ordering};
+use core::{marker::PhantomData,sync::atomic::{AtomicBool,AtomicU32,Ordering}};
 const UNBOUND:u32=u32::MAX;
 #[derive(Clone,Copy,Debug,Eq,PartialEq)]
 pub enum GateError { Unbound, WrongCpu, InterruptsEnabled, Reentrant, InvalidCpu }
@@ -30,12 +30,12 @@ impl RetirementGate {
         if bsp!=cpu{return Err(GateError::WrongCpu);}
         self.held.compare_exchange(false,true,Ordering::Acquire,Ordering::Relaxed)
             .map_err(|_|GateError::Reentrant)?;
-        Ok(Permit{gate:self})
+        Ok(Permit{gate:self,_not_send:PhantomData})
     }
 }
 impl Default for RetirementGate {fn default()->Self{Self::new()}}
 #[must_use="retain this permit during kernel table access"]
-pub struct Permit<'a>{gate:&'a RetirementGate}
+pub struct Permit<'a>{gate:&'a RetirementGate,_not_send:PhantomData<*mut ()>}
 impl Drop for Permit<'_>{
     fn drop(&mut self){self.gate.held.store(false,Ordering::Release);}
 }

@@ -92,10 +92,24 @@ static R120_GATE:crate::retirement_gate::RetirementGate=
     crate::retirement_gate::RetirementGate::new();
 #[cfg(feature="test-r031-files-gui")]
 fn r120_cpu_id()->u32{
-    // Host test threads may migrate between CPUs; gate tests inject CPU IDs
-    // explicitly. The guest must use its trusted physical BSP identity.
+    // A host test thread can migrate; tests use a stable synthetic BSP ID
+    // and separately verify wrong-core rejection with explicit IDs.
     #[cfg(test)]{0}
-    #[cfg(not(test))]{(unsafe{core::arch::x86_64::__cpuid(1)}.ebx>>24)&255}
+    #[cfg(not(test))]{
+        use core::arch::x86_64::{__cpuid,__cpuid_count};
+        let max=unsafe{__cpuid(0)}.eax;
+        // Use the full 32-bit x2APIC topology ID when exposed. A legacy
+        // 8-bit APIC ID cannot distinguish >255 hardware processor IDs.
+        if max>=0x1f {
+            let topology=unsafe{__cpuid_count(0x1f,0)};
+            if topology.ebx&0xffff!=0{return topology.edx;}
+        }
+        if max>=0xb {
+            let topology=unsafe{__cpuid_count(0xb,0)};
+            if topology.ebx&0xffff!=0{return topology.edx;}
+        }
+        (unsafe{__cpuid(1)}.ebx>>24)&255
+    }
 }
 #[cfg(feature="test-r031-files-gui")]
 fn r120_masked()->bool{
