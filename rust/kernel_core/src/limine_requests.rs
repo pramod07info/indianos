@@ -268,6 +268,12 @@ static R127_AP_DENIALS:core::sync::atomic::AtomicU32=
 #[cfg(feature="test-r118-ap-ack")]
 static R127_BSP_ADMISSIONS:core::sync::atomic::AtomicU32=
     core::sync::atomic::AtomicU32::new(0);
+#[cfg(feature="test-r118-ap-ack")]
+static R131_FENCE:crate::smp_lifecycle_fence::LifecycleFence=
+    crate::smp_lifecycle_fence::LifecycleFence::new(0,1);
+#[cfg(feature="test-r118-ap-ack")]
+static R131_AP_DONE:core::sync::atomic::AtomicU32=
+    core::sync::atomic::AtomicU32::new(0);
 
 #[cfg(feature="test-r118-ap-ack")]
 extern "C" fn r126_secondary_cpu_entry(info:*mut MpInfo)->!{
@@ -294,6 +300,25 @@ extern "C" fn r126_secondary_cpu_entry(info:*mut MpInfo)->!{
             if denied==8192 {
                 R126_AP_CPUID.store(actual,Ordering::Release);
                 R126_AP_ACK.store(1,Ordering::Release);
+                // Exact APID1 cross-CPU lifecycle protocol: no interrupt
+                // routing is claimed, and the AP never touches the live
+                // BSP-owned process or filesystem service tables.
+                let mut seen=0u64;
+                for seq in 1..=64u64{
+                    let mut got=false;
+                    for _ in 0..50_000_000u32{
+                        match R131_FENCE.observe_and_ack(actual,seen){
+                            Ok(Some(receipt)) if receipt.sequence==seq &&
+                                receipt.generation==seq*2 => {
+                                seen=seq;got=true;break;
+                            }
+                            Ok(None)=>core::hint::spin_loop(),
+                            _=>break,
+                        }
+                    }
+                    if !got{break;}
+                }
+                R131_AP_DONE.store(seen as u32,Ordering::Release);
             }
         }
     }
@@ -325,6 +350,7 @@ pub(crate) fn launch_one_parked_qemu_ap()->bool{
     R126_AP_CPUID.store(u32::MAX,Ordering::Release);
     R127_AP_DENIALS.store(0,Ordering::Release);
     R127_BSP_ADMISSIONS.store(0,Ordering::Release);
+    R131_AP_DONE.store(0,Ordering::Release);
     fence(Ordering::Release);
     // The canonical Limine protocol wakes the AP only AFTER the BSP
     // publishes goto_address. No normal boot, userland or IRQ is enabled.
@@ -332,6 +358,7 @@ pub(crate) fn launch_one_parked_qemu_ap()->bool{
         ptr::addr_of_mut!((*secondary).goto_address),
         r126_secondary_cpu_entry as *const c_void
     );}
+    let mut arrived=false;
     for _ in 0..50_000_000u32{
         // The BSP alone owns the gate. This loop executes concurrently
         // with the real AP's 8192 denied entry attempts. The AP may never
@@ -340,10 +367,31 @@ pub(crate) fn launch_one_parked_qemu_ap()->bool{
         R127_BSP_ADMISSIONS.fetch_add(1,Ordering::Relaxed);
         drop(permit);
         if R126_AP_ACK.load(Ordering::Acquire)==1 {
-            return R126_AP_CPUID.load(Ordering::Acquire)==1 &&
+            arrived=R126_AP_CPUID.load(Ordering::Acquire)==1 &&
                 R127_AP_DENIALS.load(Ordering::Acquire)==8192 &&
                 R127_BSP_ADMISSIONS.load(Ordering::Acquire)>0;
+            break;
         }
+        core::hint::spin_loop();
+    }
+    if !arrived{return false;}
+    for seq in 1..=64u64{
+        let receipt=match R131_FENCE.publish(0,seq*2){
+            Ok(receipt)=>receipt,
+            Err(_)=>return false,
+        };
+        let mut acknowledged=false;
+        for _ in 0..50_000_000u32{
+            match R131_FENCE.acknowledged(0,receipt){
+                Ok(true)=>{acknowledged=true;break;},
+                Ok(false)=>core::hint::spin_loop(),
+                Err(_)=>return false,
+            }
+        }
+        if !acknowledged{return false;}
+    }
+    for _ in 0..50_000_000u32{
+        if R131_AP_DONE.load(Ordering::Acquire)==64{return true;}
         core::hint::spin_loop();
     }
     false

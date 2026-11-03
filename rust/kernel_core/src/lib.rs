@@ -111,6 +111,8 @@ pub mod process_events;
 /// Scheduler, socket table, IRQ and SMP integration remain separately gated.
 pub mod process_retirement_txn;
 pub mod retirement_gate;
+/// R131 exact-generation one-AP release/acquire rendezvous (not APIC IPI).
+pub mod smp_lifecycle_fence;
 // M1: authenticated ring3-service policy using the already implemented
 // checksummed, sector-backed HierVfs; host remount integration acceptance.
 // Does not enable formatting or physical-device access in ordinary boot.

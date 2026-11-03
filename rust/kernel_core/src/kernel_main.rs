@@ -162,6 +162,7 @@ pub extern "C" fn kmain()->!{
             b"IndianOS: FATAL R126 QEMU AP arrival/CPUID mismatch\n\0");
         log(b"IndianOS: R126 QEMU secondary AP executed Rust and acknowledged BSP\n\0");
         log(b"IndianOS: R127 QEMU real AP denied BSP retirement gate 8192 times\n\0");
+        log(b"IndianOS: R131 QEMU 64 ordered cross-CPU lifecycle receipts acknowledged\n\0");
         halt();
     }
     // Issue #124 HD1: each x86-64 boot enumerates CPU and PCI-PCI bridge
