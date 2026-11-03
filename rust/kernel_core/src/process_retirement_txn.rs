@@ -15,6 +15,12 @@ use crate::network::{EpochUdpEndpoints, IngressError, SocketError};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Owner { pub pid: u32, pub generation: u64 }
 
+/// Opaque trusted NIC-receive snapshot taken BEFORE polling a DMA or
+/// software receive ring. A new process/port incarnation invalidates any
+/// earlier snapshot, even when the same destination port is rebound.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IngressRevision(u64);
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RetirementError {
     Capabilities(EpochError),
@@ -36,6 +42,7 @@ pub struct ProcessRetirement<const C: usize, const U: usize, const E: usize> {
     capabilities: EpochRegistry<C>,
     udp: UdpRegistry<U>,
     events: ProcessEvents<E>,
+    ingress_revision: u64,
 }
 
 impl<const C: usize, const U: usize, const E: usize> Default
@@ -47,13 +54,31 @@ impl<const C: usize, const U: usize, const E: usize> Default
 impl<const C: usize, const U: usize, const E: usize> ProcessRetirement<C, U, E> {
     pub const fn new() -> Self {
         Self { capabilities: EpochRegistry::new(),
-               udp: UdpRegistry::new(), events: ProcessEvents::new() }
+               udp: UdpRegistry::new(), events: ProcessEvents::new(),
+               ingress_revision: 1 }
     }
+
+    /// Wraparound could reuse a very old NIC ingress grant after enough
+    /// retire/rebind cycles. Fail closed rather than issue an old revision.
+    fn next_ingress_revision(&self)->Result<u64,RetirementError>{
+        self.ingress_revision.checked_add(1)
+            .ok_or(RetirementError::Sockets(SocketError::Invalid))
+    }
+
+    /// Only a kernel caller already holding the BSP admission permit can
+    /// snapshot an RX ring's ownership epoch. Capture BEFORE fetching the
+    /// frame, then present the same token for dispatch. The transport itself
+    /// supplies no PID, epoch or authorization evidence.
+    pub fn capture_ingress_revision(
+        &self,_permit:&crate::retirement_gate::Permit<'_>
+    )->IngressRevision{IngressRevision(self.ingress_revision)}
 
     /// Only the privileged scheduler may authenticate and start a PID.
     pub fn start(&mut self, pid: u32) -> Result<Owner, RetirementError> {
+        let next=self.next_ingress_revision()?;
         let generation = self.capabilities.start(pid)
             .map_err(RetirementError::Capabilities)?;
+        self.ingress_revision=next;
         Ok(Owner { pid, generation })
     }
 
@@ -62,8 +87,11 @@ impl<const C: usize, const U: usize, const E: usize> ProcessRetirement<C, U, E> 
     pub fn start_exact(&mut self, owner: Owner)
         -> Result<(), RetirementError>
     {
+        let next=self.next_ingress_revision()?;
         self.capabilities.start_exact(owner.pid,owner.generation)
-            .map_err(RetirementError::Capabilities)
+            .map_err(RetirementError::Capabilities)?;
+        self.ingress_revision=next;
+        Ok(())
     }
 
     pub fn active_generation(&self, pid: u32) -> Option<u64> {
@@ -96,7 +124,11 @@ impl<const C: usize, const U: usize, const E: usize> ProcessRetirement<C, U, E> 
 
     pub fn bind_udp(&mut self, owner: Owner, port: u16) -> Result<(), RetirementError> {
         self.require_active(owner)?;
-        self.udp.bind(owner.pid, owner.generation, port).map_err(RetirementError::Udp)
+        let next=self.next_ingress_revision()?;
+        self.udp.bind(owner.pid, owner.generation, port)
+            .map_err(RetirementError::Udp)?;
+        self.ingress_revision=next;
+        Ok(())
     }
 
     pub fn authorize_udp(&self, owner: Owner, port: u16)
@@ -173,9 +205,15 @@ impl<const C: usize, const U: usize, const E: usize> ProcessRetirement<C, U, E> 
     /// the exclusive polled-NIC supervisor only: NOT physical IRQ/IOMMU proof.
     pub fn ingest_kernel_nic_frame<const P:usize,const Q:usize>(
         &self,_permit:&crate::retirement_gate::Permit<'_>,
-        sockets:&mut EpochUdpEndpoints<P,Q>,
+        sockets:&mut EpochUdpEndpoints<P,Q>,rx_revision:IngressRevision,
         frame:&[u8],local_mac:[u8;6],
     )->Result<Owner,RetirementError>{
+        // A received frame might be queued when PID A exits and PID B binds
+        // the same UDP port. Such stale traffic must never inherit PID B's
+        // authority; deny before parser or datagram-queue mutation.
+        if rx_revision.0!=self.ingress_revision {
+            return Err(RetirementError::Sockets(SocketError::Denied));
+        }
         let (port,_payload)=crate::network::authenticated_udp_frame(frame,local_mac)
             .map_err(RetirementError::Ingress)?;
         let grant=self.udp.owner_of(port)
@@ -215,6 +253,7 @@ impl<const C: usize, const U: usize, const E: usize> ProcessRetirement<C, U, E> 
             .map_err(RetirementError::Udp)?;
         staged_sockets.close(owner.pid,owner.generation,port)
             .map_err(RetirementError::Sockets)?;
+        staged.ingress_revision=staged.next_ingress_revision()?;
         if !staged_sockets.matches_registry(&staged.udp){
             return Err(RetirementError::Sockets(SocketError::Denied));
         }
@@ -327,11 +366,15 @@ impl<const C: usize, const U: usize, const E: usize> ProcessRetirement<C, U, E> 
             if inserted { result.notices_enqueued += 1; }
         }
 
-        // Only this publication touches the live policy tables. The kernel
-        // caller must exclude competing mutators on all three tables.
+        // Only this publication touches the live policy tables. A network
+        // receive snapshot captured before retirement must be rejected
+        // even after the same port becomes bound to a different generation.
+        let revision=if owners.is_empty(){self.ingress_revision}
+            else{self.next_ingress_revision()?};
         self.capabilities = capabilities;
         self.udp = udp;
         self.events = events;
+        self.ingress_revision=revision;
         Ok(result)
     }
 }
@@ -633,5 +676,51 @@ mod r120_scheduler_network_boundary_tests{
         assert_eq!(k.receive_live_udp(&mut s,b,6002,&mut out),Ok(10));
         assert_eq!(&out[..10],b"still here");
         assert!(s.matches_registry(&k.udp));
+    }
+}
+
+#[cfg(test)]
+mod r118_ingress_revision_regressions {
+    use super::*;
+    use crate::retirement_gate::RetirementGate;
+
+    #[test]
+    fn failed_mutations_never_advance_epoch_but_real_transitions_do() {
+        let mut k=ProcessRetirement::<2,2,3>::new();
+        let gate=RetirementGate::new();gate.register_bsp(0,true).unwrap();
+        let permit=gate.try_enter(0,true).unwrap();
+        let initial=k.capture_ingress_revision(&permit);
+        assert!(k.start(0).is_err());
+        assert_eq!(k.capture_ingress_revision(&permit),initial);
+        let a=k.start(1).unwrap();
+        let after_start=k.capture_ingress_revision(&permit);
+        assert_ne!(after_start,initial);
+        assert!(k.bind_udp(a,0).is_err());
+        assert_eq!(k.capture_ingress_revision(&permit),after_start);
+        k.bind_udp(a,5101).unwrap();
+        let after_bind=k.capture_ingress_revision(&permit);
+        assert_ne!(after_bind,after_start);
+        assert!(k.retire_exited_batch(&[Owner{pid:1,generation:99}]).is_err());
+        assert_eq!(k.capture_ingress_revision(&permit),after_bind);
+        k.retire_exited_batch(&[a]).unwrap();
+        assert_ne!(k.capture_ingress_revision(&permit),after_bind);
+    }
+
+    #[test]
+    fn numeric_revision_exhaustion_never_publishes_a_new_owner() {
+        let mut k=ProcessRetirement::<2,2,2>::new();
+        let current=k.start(1).unwrap();
+        k.ingress_revision=u64::MAX;
+        assert_eq!(k.start(2),
+            Err(RetirementError::Sockets(SocketError::Invalid)));
+        assert_eq!(k.active_generation(2),None);
+        assert_eq!(k.active_generation(current.pid),Some(current.generation));
+        assert_eq!(k.bind_udp(current,5400),
+            Err(RetirementError::Sockets(SocketError::Invalid)));
+        assert_eq!(k.active_udp_ports(),0);
+        assert_eq!(k.retire_exited_batch(&[current]),
+            Err(RetirementError::Sockets(SocketError::Invalid)));
+        assert_eq!(k.active_generation(current.pid),Some(current.generation));
+        assert_eq!(k.queued_notices(),0);
     }
 }

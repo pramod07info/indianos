@@ -2628,7 +2628,7 @@ mod r118_privileged_nic_ingress_tests{
         let (f,n)=reply(5002,b"peer");
         let permit=gate.try_enter(0,true).unwrap();
         assert_eq!(k.ingest_kernel_nic_frame(
-            &permit,&mut sockets,&f[..n],LOCAL),Ok(b));
+            &permit,&mut sockets,k.capture_ingress_revision(&permit),&f[..n],LOCAL),Ok(b));
         let mut out=[0u8;8];
         assert_eq!(k.receive_live_udp(&mut sockets,a,5001,&mut out),
             Err(RetirementError::Sockets(SocketError::Empty)));
@@ -2638,7 +2638,7 @@ mod r118_privileged_nic_ingress_tests{
         k.retire_live_exited_batch(&mut sockets,&[b]).unwrap();
         let permit=gate.try_enter(0,true).unwrap();
         assert_eq!(k.ingest_kernel_nic_frame(
-            &permit,&mut sockets,&f[..n],LOCAL),
+            &permit,&mut sockets,k.capture_ingress_revision(&permit),&f[..n],LOCAL),
             Err(RetirementError::Udp(OwnerError::Denied)));
         assert_eq!(sockets.pending_owned(a.pid,a.generation),Ok(0));
         assert_eq!(k.active_generation(b.pid),None);
@@ -2658,11 +2658,11 @@ mod r118_privileged_nic_ingress_tests{
         let (f,n)=reply(6000,b"safe");
         let mut damaged=f;damaged[40]^=1;
         assert_eq!(k.ingest_kernel_nic_frame(
-            &permit,&mut sockets,&damaged[..n],LOCAL),
+            &permit,&mut sockets,k.capture_ingress_revision(&permit),&damaged[..n],LOCAL),
             Err(RetirementError::Ingress(IngressError::BadChecksum)));
         let (wrong,wn)=reply(6001,b"bad");
         assert_eq!(k.ingest_kernel_nic_frame(
-            &permit,&mut sockets,&wrong[..wn],LOCAL),
+            &permit,&mut sockets,k.capture_ingress_revision(&permit),&wrong[..wn],LOCAL),
             Err(RetirementError::Udp(OwnerError::Denied)));
         let mut out=[0xa5u8;8];
         assert_eq!(k.receive_live_udp(&mut sockets,a,6000,&mut out),
@@ -2670,6 +2670,62 @@ mod r118_privileged_nic_ingress_tests{
         assert_eq!(out,[0xa5;8]);
     }
 
+
+    #[test]
+    fn stale_polled_packet_cannot_cross_port_rebind_to_recycled_pid(){
+        let gate=RetirementGate::new();gate.register_bsp(0,true).unwrap();
+        let mut sockets=EpochUdpEndpoints::<2,4>::new();
+        let mut k=ProcessRetirement::<2,2,4>::new();
+        let old=k.start(1).unwrap();
+        let peer=k.start(2).unwrap();
+        k.bind_live_udp(&mut sockets,old,5001).unwrap();
+        k.bind_live_udp(&mut sockets,peer,5002).unwrap();
+        // The NIC begins polling while PID 1 still owns port 5001.
+        let permit=gate.try_enter(0,true).unwrap();
+        let old_rx=k.capture_ingress_revision(&permit);
+        drop(permit);
+        let (frame,len)=reply(5001,b"stale");
+        k.retire_live_exited_batch(&mut sockets,&[old]).unwrap();
+        let recycled=k.start(1).unwrap();
+        k.bind_live_udp(&mut sockets,recycled,5001).unwrap();
+        assert_ne!(old.generation,recycled.generation);
+        let permit=gate.try_enter(0,true).unwrap();
+        assert_eq!(k.ingest_kernel_nic_frame(
+            &permit,&mut sockets,old_rx,&frame[..len],LOCAL),
+            Err(RetirementError::Sockets(SocketError::Denied)));
+        assert_eq!(sockets.pending_owned(recycled.pid,recycled.generation),Ok(0));
+        assert_eq!(sockets.pending_owned(peer.pid,peer.generation),Ok(0));
+        // A fresh RX descriptor timestamp can still deliver to the
+        // newly registered generation while preserving peer isolation.
+        let current_rx=k.capture_ingress_revision(&permit);
+        assert_eq!(k.ingest_kernel_nic_frame(
+            &permit,&mut sockets,current_rx,&frame[..len],LOCAL),Ok(recycled));
+        let mut out=[0u8;16];
+        assert_eq!(k.receive_live_udp(&mut sockets,recycled,5001,&mut out),Ok(5));
+        assert_eq!(&out[..5],b"stale");
+    }
+    #[test]
+    fn stale_poll_token_is_rejected_even_for_unrelated_peer_port(){
+        let gate=RetirementGate::new();gate.register_bsp(0,true).unwrap();
+        let mut sockets=EpochUdpEndpoints::<2,4>::new();
+        let mut k=ProcessRetirement::<2,2,4>::new();
+        let a=k.start(1).unwrap();let peer=k.start(2).unwrap();
+        k.bind_live_udp(&mut sockets,a,5001).unwrap();
+        k.bind_live_udp(&mut sockets,peer,5002).unwrap();
+        let permit=gate.try_enter(0,true).unwrap();
+        let old_rx=k.capture_ingress_revision(&permit);
+        drop(permit);
+        k.close_live_udp(&mut sockets,a,5001).unwrap();
+        let (frame,n)=reply(5002,b"peer");
+        let permit=gate.try_enter(0,true).unwrap();
+        assert_eq!(k.ingest_kernel_nic_frame(
+            &permit,&mut sockets,old_rx,&frame[..n],LOCAL),
+            Err(RetirementError::Sockets(SocketError::Denied)));
+        assert_eq!(sockets.pending_owned(peer.pid,peer.generation),Ok(0));
+        let new_rx=k.capture_ingress_revision(&permit);
+        assert_eq!(k.ingest_kernel_nic_frame(
+            &permit,&mut sockets,new_rx,&frame[..n],LOCAL),Ok(peer));
+    }
     #[test]
     fn staged_teardown_revokes_old_generation_and_preserves_peer_traffic(){
         let gate=RetirementGate::new();
@@ -2683,7 +2739,7 @@ mod r118_privileged_nic_ingress_tests{
         let (frame,n)=reply(5002,b"live");
         let permit=gate.try_enter(0,true).unwrap();
         assert_eq!(k.ingest_kernel_nic_frame(
-            &permit,&mut sockets,&frame[..n],LOCAL),Ok(peer));
+            &permit,&mut sockets,k.capture_ingress_revision(&permit),&frame[..n],LOCAL),Ok(peer));
         drop(permit);
         k.retire_live_exited_batch(&mut sockets,&[old]).unwrap();
         let newer=k.start(1).unwrap();
