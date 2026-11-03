@@ -1401,6 +1401,52 @@ fn saved_valid(t:&Task)->bool{
 fn revoke_task_authority(task:&mut Task){
  revoke_task_authority_with_kind(task,crate::process_events::EventKind::Exited);
 }
+
+#[cfg(feature="test-r031-vfs")]
+#[derive(Clone,Copy,Debug,Eq,PartialEq)]
+enum FileRetireFailure { EventQueue, FileHandles }
+
+/// Atomic publication of the scheduler's *real* filesystem and PID1 event
+/// authorities. Stage an exit/fault notice before touching FileHandles;
+/// failure to enqueue must not orphan a live handle or publish a partial
+/// event. A valid single-owner FileHandles retirement cannot fail after
+/// ownership is checked under the BSP admission permit, but any unexpected
+/// error must be treated as fatal by the live scheduler.
+///
+/// A retired/replaced PID incarnation is a no-op: never revoke a new
+/// generation or emit a delayed duplicate notification.
+#[cfg(feature="test-r031-vfs")]
+fn retire_file_owner_epoch<const E:usize>(
+    files:&mut crate::fs_handles::FileHandles,
+    events:&mut crate::process_events::ProcessEvents<E>,
+    owner:crate::batch5_session::Identity,
+    kind:crate::process_events::EventKind,
+)->Result<bool,FileRetireFailure>{
+    if !files.owns(owner){return Ok(false);}
+    let mut staged=events.clone();
+    match kind {
+        crate::process_events::EventKind::Exited =>
+            staged.enqueue_exit_once(owner.pid,owner.generation),
+        crate::process_events::EventKind::Faulted =>
+            staged.enqueue_fault_once(owner.pid,owner.generation),
+        _=>return Err(FileRetireFailure::EventQueue),
+    }.map_err(|_|FileRetireFailure::EventQueue)?;
+    if files.retire_process_batch_kernel(&[owner])!=Ok(1){
+        return Err(FileRetireFailure::FileHandles);
+    }
+    *events=staged;
+    Ok(true)
+}
+
+#[cfg(feature="test-r031-vfs")]
+fn r118_file_retirement_fatal()->!{
+    log(b"IndianOS: FATAL R118 filesystem/event retirement incomplete\n\0");
+    #[cfg(feature="test-r031-files-gui")]
+    {r120_halt()}
+    #[cfg(not(feature="test-r031-files-gui"))]
+    {panic!("R118 live file/event retirement denied")}
+}
+
 fn revoke_task_authority_with_kind(
  task:&mut Task,kind:crate::process_events::EventKind
 ){
@@ -1441,16 +1487,9 @@ fn revoke_task_authority_with_kind(
    let had_live_directory_lease=owner.pid==2 &&
       unsafe{(&*ptr::addr_of!(R116_SHARED_LEASES))}
         .permits_shared_directory(owner);
-   if unsafe{(&*ptr::addr_of!(R031_HANDLES)).owns(owner)} {
-    // Deduplicate repeated exit/rollback notices for this exact incarnation;
-    // PID reuse must never remove or confuse the next owner's events.
-    let queue=unsafe{&mut *ptr::addr_of_mut!(R114_FILE_EVENTS)};
-    let _=if kind==crate::process_events::EventKind::Faulted {
-        queue.enqueue_fault_once(owner.pid,owner.generation)
-    }else{
-        queue.enqueue_exit_once(owner.pid,owner.generation)
-    };
-   }
+   // Do not advertise lifecycle exit/fault yet. The notice must be
+   // published atomically with FileHandles revocation AFTER the network,
+   // delegated capability and scheduler-resource teardown is verified.
    #[cfg(feature="test-r031-files-gui")]
    {
     // Mandatory exact-incarnation revocation on ordinary exit, fault and
@@ -1497,8 +1536,16 @@ fn revoke_task_authority_with_kind(
    // The same fail-atomic retirement preflight now services the actual
    // scheduler teardown, not just host unit tests. One retiring task is
    // supplied here; the supervisor can also retire multiple in one batch.
-   let _=unsafe{(&mut *ptr::addr_of_mut!(R031_HANDLES))}
-       .retire_process_batch_kernel(&[owner]);
+   // Both the authenticated file table and PID1 lifecycle queue are real
+   // kernel resources. Never ignore a failed batch retirement or full
+   // notification ring; such failure is fatal, not a successful exit.
+   let file_result=retire_file_owner_epoch(
+       unsafe{&mut *ptr::addr_of_mut!(R031_HANDLES)},
+       unsafe{&mut *ptr::addr_of_mut!(R114_FILE_EVENTS)},
+       owner,kind);
+   if file_result.is_err(){
+       r118_file_retirement_fatal();
+   }
    #[cfg(feature="test-r031-files-gui")]
    if had_live_directory_lease {
      let lease_gone=!unsafe{(&*ptr::addr_of!(R116_SHARED_LEASES))}
@@ -2329,4 +2376,70 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
   t.frame[17]=2;
   assert!(!saved_valid(&t));
  }
+}
+
+#[cfg(all(test,feature="test-r031-vfs"))]
+mod r118_scheduler_file_event_atomicity_tests {
+    use super::*;
+    use crate::process_events::{EventKind,ProcessEvents};
+    use crate::fs_handles::FileHandles;
+
+    #[test]
+    fn full_event_queue_denies_file_retirement_without_partial_notice() {
+        let mut files=FileHandles::new();
+        let init=files.bind_process(1).unwrap();
+        let worker=files.bind_process(2).unwrap();
+        let mut queue=ProcessEvents::<1>::new();
+        let original=files.mount_alias_for_current_root_kernel(worker).unwrap();
+
+        assert_eq!(retire_file_owner_epoch(
+            &mut files,&mut queue,init,EventKind::Exited),Ok(true));
+        let first=queue.peek_receipt().unwrap();
+        assert_eq!(first.event.pid,init.pid);
+        assert!(!files.owns(init));
+
+        assert_eq!(retire_file_owner_epoch(
+            &mut files,&mut queue,worker,EventKind::Faulted),
+            Err(FileRetireFailure::EventQueue));
+        assert!(files.owns(worker));
+        assert!(files.mount_alias_allows(original,worker,"/shared/note"));
+        assert_eq!(queue.peek_receipt(),Some(first));
+
+        assert_eq!(queue.acknowledge_receipt(first),Some(first.event));
+        assert_eq!(retire_file_owner_epoch(
+            &mut files,&mut queue,worker,EventKind::Faulted),Ok(true));
+        assert!(!files.owns(worker));
+        assert!(!files.mount_alias_allows(original,worker,"/shared/note"));
+        let final_notice=queue.peek_receipt().unwrap();
+        assert_eq!(final_notice.event.pid,worker.pid);
+        assert_eq!(final_notice.event.kind,EventKind::Faulted);
+    }
+
+    #[test]
+    fn empty_notice_queue_and_recycled_pid_do_not_discard_live_authority() {
+        let mut files=FileHandles::new();
+        let old=files.bind_process(1).unwrap();
+        let mut zero=ProcessEvents::<0>::new();
+        assert_eq!(retire_file_owner_epoch(
+            &mut files,&mut zero,old,EventKind::Exited),
+            Err(FileRetireFailure::EventQueue));
+        assert!(files.owns(old));
+        assert_eq!(zero.len(),0);
+
+        let mut events=ProcessEvents::<2>::new();
+        assert_eq!(retire_file_owner_epoch(
+            &mut files,&mut events,old,EventKind::Exited),Ok(true));
+        let fresh=files.bind_process(1).unwrap();
+        assert_ne!(fresh.generation,old.generation);
+        let before=events.peek_receipt();
+        assert_eq!(retire_file_owner_epoch(
+            &mut files,&mut events,old,EventKind::Faulted),Ok(false));
+        assert_eq!(events.peek_receipt(),before);
+        assert!(files.owns(fresh));
+        assert_eq!(retire_file_owner_epoch(
+            &mut files,&mut events,fresh,EventKind::Message),
+            Err(FileRetireFailure::EventQueue));
+        assert!(files.owns(fresh));
+        assert_eq!(events.peek_receipt(),before);
+    }
 }
