@@ -2273,6 +2273,63 @@ mod r106_checked_partition_authenticated_file_api_tests{
   }
  }
  
+
+ #[test]fn r118_selected_volume_stale_handle_fuzz_across_128_pid_recycles(){
+  // The *real* selected-volume API must deny stale tokens before any ATA
+  // read, including when a recycled PID happens to reuse the same path.
+  let (mut media,receipt)=disk();
+  let mut files=FileHandles::new();
+  let admin=files.bind_process(1).unwrap();
+  let mut guest=files.bind_process(2).unwrap();
+  for _ in 0..128{
+   let token=operation_on_selected_volume(&mut files,1,guest,0,READ,
+       "/shared/note",&mut [],&mut media,receipt).unwrap();
+   let guard=files.selected_operation_guard(guest).unwrap();
+   let alias=files.mount_alias_for_current_root_kernel(guest).unwrap();
+   let old=guest;
+   guest=files.bind_process(2).unwrap();
+   assert_ne!(old.generation,guest.generation);
+   assert!(!files.selected_operation_guard_is_current(guard));
+   let before=media.reads;
+   for caller in [old,guest]{
+    for action in [2u64,5u64]{
+     assert_eq!(operation_on_selected_volume(&mut files,action,caller,token,0,
+       "",&mut [0u8;16],&mut media,receipt),Err(FsError::InvalidName));
+    }
+    assert!(!files.mount_alias_allows(alias,caller,"/shared/note"));
+   }
+   assert_eq!(operation_on_selected_volume_alias(&mut files,alias,1,guest,
+      0,READ,"/shared/note",&mut [],&mut media,receipt),
+      Err(FsError::InvalidName));
+   assert_eq!(media.reads,before);
+   assert!(files.owns(admin));
+  }
+ }
+
+ #[test]fn r118_selected_mount_revision_swap_rejects_old_alias_before_disk_probe(){
+  let (mut media,receipt)=disk();
+  let mut files=FileHandles::new();
+  let admin=files.bind_process(1).unwrap();
+  let token=operation_on_selected_volume(&mut files,1,admin,0,READ,
+      "/shared/note",&mut [],&mut media,receipt).unwrap();
+  let alias=files.mount_alias_for_current_root_kernel(admin).unwrap();
+  let guard=files.selected_operation_guard(admin).unwrap();
+  assert!(files.mount_alias_allows(alias,admin,"/shared/note"));
+  // Model a serialized trusted remount revision transition. No claim of
+  // physical multicore remount contention is made by this host test.
+  files.volume_revision=files.volume_revision.checked_add(1).unwrap();
+  let before=(media.reads,media.writes);
+  assert!(!files.selected_operation_guard_is_current(guard));
+  assert!(!files.mount_alias_allows(alias,admin,"/shared/note"));
+  assert_eq!(operation_on_selected_volume_alias(&mut files,alias,1,admin,
+       0,READ,"/shared/note",&mut [],&mut media,receipt),
+       Err(FsError::InvalidName));
+  assert_eq!((media.reads,media.writes),before);
+  // An already-open token remains owned by the same PID generation; its
+  // lifetime is governed by the separately authenticated descriptor path.
+  assert!(token!=0 && files.owns(admin));
+ }
+
  #[test]fn r118_capacity_swap_rejected_before_any_selected_disk_reads(){
   struct Changed<'a>{inner:&'a mut Disk,reads:usize,writes:usize}
   impl BlockDevice for Changed<'_>{

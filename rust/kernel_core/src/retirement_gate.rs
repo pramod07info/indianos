@@ -61,3 +61,70 @@ mod r120_gate_tests {
         assert!(g.try_enter(7,true).is_ok());
     }
 }
+
+#[cfg(test)]
+mod r118_host_concurrency_regressions {
+    use super::*;
+    use std::sync::{
+        atomic::{AtomicUsize,Ordering as HostOrdering},
+        Arc,Barrier,
+    };
+    use std::thread;
+
+    #[test]
+    fn untrusted_cross_cpu_threads_cannot_enter_bsp_retirement() {
+        let gate=Arc::new(RetirementGate::new());
+        gate.register_bsp(0,true).unwrap();
+        let mut workers=std::vec::Vec::new();
+        for cpu in 1..=8 {
+            let gate=Arc::clone(&gate);
+            workers.push(thread::spawn(move || {
+                for _ in 0..1024 {
+                    assert!(matches!(gate.try_enter(cpu,true),
+                        Err(GateError::WrongCpu)));
+                }
+            }));
+        }
+        for thread in workers {thread.join().unwrap();}
+        let permit=gate.try_enter(0,true).unwrap();
+        assert!(matches!(gate.try_enter(0,true),Err(GateError::Reentrant)));
+        drop(permit);
+    }
+
+    #[test]
+    fn host_contention_never_admits_two_simultaneous_permits() {
+        // All host threads deliberately claim BSP ID 0; this tests the
+        // atomic admission primitive only, not true multiprocessor IDs,
+        // IRQ ordering or live scheduler IPI delivery.
+        let gate=Arc::new(RetirementGate::new());
+        gate.register_bsp(0,true).unwrap();
+        let start=Arc::new(Barrier::new(8));
+        let active=Arc::new(AtomicUsize::new(0));
+        let admitted=Arc::new(AtomicUsize::new(0));
+        let mut workers=std::vec::Vec::new();
+        for _ in 0..8 {
+            let (gate,start,active,admitted)=(
+                Arc::clone(&gate),Arc::clone(&start),
+                Arc::clone(&active),Arc::clone(&admitted));
+            workers.push(thread::spawn(move || {
+                start.wait();
+                for _ in 0..2048 {
+                    match gate.try_enter(0,true) {
+                        Ok(permit)=>{
+                            assert_eq!(active.fetch_add(1,HostOrdering::SeqCst),0);
+                            thread::yield_now();
+                            assert_eq!(active.fetch_sub(1,HostOrdering::SeqCst),1);
+                            admitted.fetch_add(1,HostOrdering::Relaxed);
+                            drop(permit);
+                        },
+                        Err(GateError::Reentrant)=>thread::yield_now(),
+                        Err(other)=>panic!("unexpected gate failure: {other:?}"),
+                    }
+                }
+            }));
+        }
+        for thread in workers {thread.join().unwrap();}
+        assert_eq!(active.load(HostOrdering::SeqCst),0);
+        assert!(admitted.load(HostOrdering::SeqCst)>0);
+    }
+}
