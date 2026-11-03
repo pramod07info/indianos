@@ -669,31 +669,38 @@ mod r033_udp_tests {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IngressError { Malformed, BadChecksum, Endpoint(SocketError) }
 
+/// Parse AND validate a NIC-delivered UDP packet before using its destination
+/// port to locate a privileged kernel owner. A packet may never select its PID
+/// or generation; those come only from the live registry. This parser never
+/// touches a socket or mutates the packet queue. No hardware IRQ is enabled.
+pub(crate) fn authenticated_udp_frame<'a>(
+    frame:&'a [u8],local_mac:[u8;6],
+)->Result<(u16,&'a [u8]),IngressError>{
+    let ip=validate_ipv4(frame,local_mac).map_err(|e|match e{
+        Error::Checksum=>IngressError::BadChecksum,
+        _=>IngressError::Malformed,
+    })?;
+    if ip.proto!=17||ip.body.len()<8{return Err(IngressError::Malformed);}
+    let udp=ip.body;
+    let source=be16(&udp[..2]);
+    let destination=be16(&udp[2..4]);
+    let length=be16(&udp[4..6]) as usize;
+    if source==0||destination==0||length!=udp.len()||
+        be16(&udp[6..8])==0{return Err(IngressError::Malformed);}
+    if transport_sum(&PEER_IP,&LOCAL_IP,17,udp)!=0 {
+        return Err(IngressError::BadChecksum);
+    }
+    Ok((destination,&udp[8..]))
+}
+
 impl<const PORTS: usize, const QUEUE: usize> UdpEndpoints<PORTS, QUEUE> {
     /// Single-peer QEMU ingress, not a general-purpose UDP socket service.
     /// The queue is not modified if any framing or checksum check fails.
     pub fn ingest_ethernet_frame(
         &mut self, frame: &[u8], local_mac: [u8; 6],
     ) -> Result<(), IngressError> {
-        let ip = validate_ipv4(frame, local_mac).map_err(|e| match e {
-            Error::Checksum => IngressError::BadChecksum,
-            _ => IngressError::Malformed,
-        })?;
-        if ip.proto != 17 || ip.body.len() < 8 {
-            return Err(IngressError::Malformed);
-        }
-        let udp = ip.body;
-        let source_port = be16(&udp[0..2]);
-        let destination_port = be16(&udp[2..4]);
-        let length = be16(&udp[4..6]) as usize;
-        if source_port == 0 || destination_port == 0 ||
-            length != udp.len() || be16(&udp[6..8]) == 0 {
-            return Err(IngressError::Malformed);
-        }
-        if transport_sum(&PEER_IP, &LOCAL_IP, 17, udp) != 0 {
-            return Err(IngressError::BadChecksum);
-        }
-        self.enqueue(destination_port, &udp[8..])
+        let (destination_port,payload)=authenticated_udp_frame(frame,local_mac)?;
+        self.enqueue(destination_port,payload)
             .map_err(IngressError::Endpoint)
     }
 }
@@ -1155,11 +1162,8 @@ impl<const PORTS:usize,const QUEUE:usize> EpochUdpEndpoints<PORTS,QUEUE> {
         if !self.authenticated(pid,generation)||!self.endpoints.owns(pid,port){
             return Err(IngressError::Endpoint(SocketError::Denied));
         }
-        let ip=validate_ipv4(frame,mac).map_err(|err|match err{
-            Error::Checksum=>IngressError::BadChecksum,_=>IngressError::Malformed,
-        })?;
-        if ip.proto!=17||ip.body.len()<8{return Err(IngressError::Malformed);}
-        if be16(&ip.body[2..4])!=port{
+        let (destination,_payload)=authenticated_udp_frame(frame,mac)?;
+        if destination!=port{
             return Err(IngressError::Endpoint(SocketError::Denied));
         }
         self.endpoints.ingest_ethernet_frame(frame,mac)
@@ -2578,5 +2582,117 @@ mod r118_kernel_clock_dispatch_fail_closed_tests{
             |buf,mac|udp_frame(buf,mac,PEER_UDP_PORT,b"safe",7)),
             Err(Error::Unexpected));
         assert_eq!(nic.writes,0);
+    }
+}
+
+// R118-072 source regression: real Ethernet/UDP validation must route via
+// trusted registry ownership without an untrusted packet-supplied PID.
+#[cfg(test)]
+mod r118_privileged_nic_ingress_tests{
+    use super::*;
+    use crate::process_retirement_txn::{ProcessRetirement,Owner,RetirementError};
+    use crate::retirement_gate::{RetirementGate,GateError};
+    use crate::udp_owner_epoch::Error as OwnerError;
+    const LOCAL:[u8;6]=[0x52,0x54,0,0x12,0x34,0x56];
+
+    fn reply(port:u16,payload:&[u8])->([u8;FRAME_CAP],usize){
+        let mut frame=[0u8;FRAME_CAP];
+        let len=8+payload.len();
+        ethernet_header(&mut frame,LOCAL,PEER_MAC,0x0800);
+        ipv4_header(&mut frame[14..34],17,len,0x2201);
+        frame[26..30].copy_from_slice(&PEER_IP);
+        frame[30..34].copy_from_slice(&LOCAL_IP);
+        put16(&mut frame,24,0);
+        let ip_sum=checksum(&frame[14..34]);
+        put16(&mut frame,24,ip_sum);
+        let udp=&mut frame[34..34+len];
+        put16(udp,0,PEER_UDP_PORT);
+        put16(udp,2,port);
+        put16(udp,4,len as u16);
+        udp[8..].copy_from_slice(payload);
+        let sum=transport_sum(&PEER_IP,&LOCAL_IP,17,udp);
+        put16(udp,6,if sum==0{0xffff}else{sum});
+        (frame,34+len)
+    }
+
+    #[test]
+    fn actual_wire_destination_selects_only_live_registered_process(){
+        let gate=RetirementGate::new();
+        gate.register_bsp(0,true).unwrap();
+        let mut sockets=EpochUdpEndpoints::<2,4>::new();
+        let mut k=ProcessRetirement::<2,2,4>::new();
+        let a=k.start(1).unwrap();
+        let b=k.start(2).unwrap();
+        k.bind_live_udp(&mut sockets,a,5001).unwrap();
+        k.bind_live_udp(&mut sockets,b,5002).unwrap();
+        let (f,n)=reply(5002,b"peer");
+        let permit=gate.try_enter(0,true).unwrap();
+        assert_eq!(k.ingest_kernel_nic_frame(
+            &permit,&mut sockets,&f[..n],LOCAL),Ok(b));
+        let mut out=[0u8;8];
+        assert_eq!(k.receive_live_udp(&mut sockets,a,5001,&mut out),
+            Err(RetirementError::Sockets(SocketError::Empty)));
+        assert_eq!(k.receive_live_udp(&mut sockets,b,5002,&mut out),Ok(4));
+        assert_eq!(&out[..4],b"peer");
+        drop(permit);
+        k.retire_live_exited_batch(&mut sockets,&[b]).unwrap();
+        let permit=gate.try_enter(0,true).unwrap();
+        assert_eq!(k.ingest_kernel_nic_frame(
+            &permit,&mut sockets,&f[..n],LOCAL),
+            Err(RetirementError::Udp(OwnerError::Denied)));
+        assert_eq!(sockets.pending_owned(a.pid,a.generation),Ok(0));
+        assert_eq!(k.active_generation(b.pid),None);
+    }
+
+    #[test]
+    fn malformed_checksum_unknown_port_and_wrong_cpu_never_enqueue(){
+        let gate=RetirementGate::new();
+        gate.register_bsp(0,true).unwrap();
+        let mut sockets=EpochUdpEndpoints::<1,2>::new();
+        let mut k=ProcessRetirement::<1,1,2>::new();
+        let a=k.start(9).unwrap();
+        k.bind_live_udp(&mut sockets,a,6000).unwrap();
+        assert!(matches!(gate.try_enter(1,true),Err(GateError::WrongCpu)));
+        assert!(matches!(gate.try_enter(0,false),Err(GateError::InterruptsEnabled)));
+        let permit=gate.try_enter(0,true).unwrap();
+        let (f,n)=reply(6000,b"safe");
+        let mut damaged=f;damaged[40]^=1;
+        assert_eq!(k.ingest_kernel_nic_frame(
+            &permit,&mut sockets,&damaged[..n],LOCAL),
+            Err(RetirementError::Ingress(IngressError::BadChecksum)));
+        let (wrong,wn)=reply(6001,b"bad");
+        assert_eq!(k.ingest_kernel_nic_frame(
+            &permit,&mut sockets,&wrong[..wn],LOCAL),
+            Err(RetirementError::Udp(OwnerError::Denied)));
+        let mut out=[0xa5u8;8];
+        assert_eq!(k.receive_live_udp(&mut sockets,a,6000,&mut out),
+            Err(RetirementError::Sockets(SocketError::Empty)));
+        assert_eq!(out,[0xa5;8]);
+    }
+
+    #[test]
+    fn staged_teardown_revokes_old_generation_and_preserves_peer_traffic(){
+        let gate=RetirementGate::new();
+        gate.register_bsp(0,true).unwrap();
+        let mut sockets=EpochUdpEndpoints::<2,4>::new();
+        let mut k=ProcessRetirement::<2,2,4>::new();
+        let old=k.start(1).unwrap();
+        let peer=k.start(2).unwrap();
+        k.bind_live_udp(&mut sockets,old,5001).unwrap();
+        k.bind_live_udp(&mut sockets,peer,5002).unwrap();
+        let (frame,n)=reply(5002,b"live");
+        let permit=gate.try_enter(0,true).unwrap();
+        assert_eq!(k.ingest_kernel_nic_frame(
+            &permit,&mut sockets,&frame[..n],LOCAL),Ok(peer));
+        drop(permit);
+        k.retire_live_exited_batch(&mut sockets,&[old]).unwrap();
+        let newer=k.start(1).unwrap();
+        k.bind_live_udp(&mut sockets,newer,5001).unwrap();
+        assert_ne!(newer.generation,old.generation);
+        assert!(k.ingest_live_udp(&mut sockets,old,5001,
+            &frame[..n],LOCAL).is_err());
+        let mut out=[0u8;8];
+        assert_eq!(k.receive_live_udp(&mut sockets,peer,5002,&mut out),Ok(4));
+        assert_eq!(&out[..4],b"live");
     }
 }

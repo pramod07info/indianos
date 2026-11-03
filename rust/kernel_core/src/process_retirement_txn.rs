@@ -165,6 +165,26 @@ impl<const C: usize, const U: usize, const E: usize> ProcessRetirement<C, U, E> 
             port,frame,mac).map_err(RetirementError::Ingress)
     }
 
+    /// Kernel NIC ingress dispatch: the packet is validated and its
+    /// destination port determines an exact currently live process generation.
+    /// No caller-supplied user PID or packet header is used as PID authority.
+    /// A non-Send BSP permit must cover the entire parser/queue transition.
+    /// This is ready for a future IRQ dispatcher, but is currently usable by
+    /// the exclusive polled-NIC supervisor only: NOT physical IRQ/IOMMU proof.
+    pub fn ingest_kernel_nic_frame<const P:usize,const Q:usize>(
+        &self,_permit:&crate::retirement_gate::Permit<'_>,
+        sockets:&mut EpochUdpEndpoints<P,Q>,
+        frame:&[u8],local_mac:[u8;6],
+    )->Result<Owner,RetirementError>{
+        let (port,_payload)=crate::network::authenticated_udp_frame(frame,local_mac)
+            .map_err(RetirementError::Ingress)?;
+        let grant=self.udp.owner_of(port)
+            .ok_or(RetirementError::Udp(UdpError::Denied))?;
+        let owner=Owner{pid:grant.pid,generation:grant.generation};
+        self.ingest_live_udp(sockets,owner,port,frame,local_mac)?;
+        Ok(owner)
+    }
+
     /// Authenticated dequeue also requires the process to remain live.
     /// A denied read must leave both the output and queued packets untouched.
     pub fn receive_live_udp<const P:usize,const Q:usize>(
