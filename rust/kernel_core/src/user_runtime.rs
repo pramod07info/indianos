@@ -867,6 +867,11 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
   },
   #[cfg(feature="test-r031-vfs")]
   33=>{
+   // Serialize real GUI-profile filesystem access with the same privileged
+   // admission permit as generation-owned UDP and scheduler retirement.
+   // A nested IRQ/core cannot remount or use a half-retired owner.
+   #[cfg(feature="test-r031-files-gui")]
+   let Ok(_filesystem_permit)=r120_enter()else{return BAD;};
    let Some(owner)=authenticated_file_identity()else{return BAD;};
    // Descriptor: path[24], opaque handle u64, argument u64,
    // pointer u64, length u64, reserved u64. Never dereference an
@@ -984,6 +989,7 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
   },
   #[cfg(feature="test-r031-files-gui")]
   34=>{
+   let Ok(_filesystem_permit)=r120_enter()else{return BAD;};
    if request.arg0!=1||authenticated_file_pid()!=Some(2){return BAD;}
    let Some(owner)=authenticated_file_identity()else{return BAD;};
    if !unsafe{(&*ptr::addr_of!(R116_SHARED_LEASES))}
@@ -1310,6 +1316,10 @@ fn prepare(t:*mut Task,p:*mut Process,elf:*const u8,size:usize,original:u64,
     !unsafe{indianos_process_bind(p,task.root.root)}{return false;}
  #[cfg(feature="test-r031-vfs")]
  if (1..=2).contains(&unsafe{(*p).pid}){
+  // Bind the real FileHandles owner and coordinator generation while holding
+  // one gate. No observer may see an owner that is only half-registered.
+  #[cfg(feature="test-r031-files-gui")]
+  let Ok(_registration_permit)=r120_enter()else{return false;};
   // Bind only fully prepared contexts. The table and epoch allocator survive
   // scheduler invocations; never reset them when PCB PIDs restart at one.
   let handles=unsafe{&mut *ptr::addr_of_mut!(R031_HANDLES)};
@@ -1320,7 +1330,6 @@ fn prepare(t:*mut Task,p:*mut Process,elf:*const u8,size:usize,original:u64,
    let live=crate::process_retirement_txn::Owner{
      pid:owner.pid,generation:owner.generation
    };
-   let Ok(_permit)=r120_enter()else{return false;};
    if unsafe{(&mut *ptr::addr_of_mut!(R120_RETIREMENT))}
       .start_exact(live).is_err(){return false;}
    if owner.pid==2 && !r116_prepare_shared_directory_lease(owner){
@@ -1418,6 +1427,11 @@ fn revoke_task_authority_with_kind(
   // Revoke before fallible page-table/frame reclamation. A retry or delayed
   // cleanup cannot revoke a replacement incarnation with the same PID.
   if !task.pcb.is_null(){
+   // One non-spinning permit covers event production, capability/UDP
+   // retirement, delegated leases and FileHandles revocation, including
+   // all postconditions. Do NOT reacquire inside this teardown path.
+   #[cfg(feature="test-r031-files-gui")]
+   let _retirement_permit=r120_enter().unwrap_or_else(|_|r120_halt());
    let owner=crate::batch5_session::Identity{
     pid:unsafe{(*task.pcb).pid},generation:task.file_generation};
    // Only a previously live trusted PID2 lease makes a teardown
@@ -1442,7 +1456,6 @@ fn revoke_task_authority_with_kind(
     // Mandatory exact-incarnation revocation on ordinary exit, fault and
     // rollback. Network grants are retired before FileHandles, while the
     // scheduler owns the only BSP mutator; no nested lock acquisition.
-    let _permit=r120_enter().unwrap_or_else(|_|r120_halt());
     let sockets=unsafe{&mut *ptr::addr_of_mut!(R114_LOCAL_UDP)};
     let coordinator=unsafe{&mut *ptr::addr_of_mut!(R120_RETIREMENT)};
     let live=crate::process_retirement_txn::Owner{
@@ -1492,7 +1505,6 @@ fn revoke_task_authority_with_kind(
            .permits_shared_directory(owner);
      // Independent post-condition: neither the real queue nor the
      // generation-bound policy may retain this incarnation after cleanup.
-     let _permit=r120_enter().unwrap_or_else(|_|r120_halt());
      let port_gone=unsafe{(&*ptr::addr_of!(R114_LOCAL_UDP))}
         .pending_owned(owner.pid,owner.generation).is_err() &&
         unsafe{(&*ptr::addr_of!(R120_RETIREMENT))}
