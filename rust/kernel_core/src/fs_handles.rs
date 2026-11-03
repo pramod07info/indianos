@@ -406,6 +406,14 @@ impl FileHandles{
             2..=28|30|31=>{
                 let slot=self.index(owner,token)?;
                 let handle=self.entries[slot];
+                // An old descriptor cannot survive an out-of-band namespace
+                // root change. Fail BEFORE selected ATA/media probing rather
+                // than trusting the pathname recorded at its original open.
+                // Normal narrow_root_kernel already revokes those handles;
+                // this is a second independent admission barrier.
+                if !self.root_allows(owner,handle.pathname()){
+                    return Err(FsError::InvalidName);
+                }
                 // Inspect only the kernel-issued token and its immutable
                 // access mode. Never trust user-supplied "requested" rights.
                 let needs_read=matches!(action,2|14|15|17..=23|25);
@@ -2350,6 +2358,34 @@ mod r106_checked_partition_authenticated_file_api_tests{
   }
  }
  
+
+ #[test]fn r122_selected_token_cannot_probe_disk_after_namespace_root_drift(){
+  let (mut disk,receipt)=disk();
+  let mut handles=FileHandles::new();
+  let owner=handles.bind_process(1).unwrap();
+  let token=operation_on_selected_volume(&mut handles,1,owner,0,READ,
+      "/shared/note",&mut [],&mut disk,receipt).unwrap();
+  let old=handles.selected_operation_guard(owner).unwrap();
+  assert!(handles.owns(owner));
+  // Simulate a faulty concurrent root publication that missed the ordinary
+  // narrow_root_kernel handle revocation. The independent selected-volume
+  // preflight must still reject before any ATA sector read or write.
+  let mut new_root=RootGrant::EMPTY;
+  new_root.epoch=owner.generation;
+  new_root.path[..8].copy_from_slice(b"/private");
+  new_root.len=8;
+  handles.roots[0]=new_root;
+  handles.root_revisions[0]+=1;
+  assert!(!handles.selected_operation_guard_is_current(old));
+  let before=(disk.reads,disk.writes);
+  let mut output=[0xa5u8;32];
+  assert_eq!(operation_on_selected_volume(
+      &mut handles,2,owner,token,0,"",&mut output,&mut disk,receipt),
+      Err(FsError::InvalidName));
+  assert_eq!((disk.reads,disk.writes),before);
+  assert_eq!(output,[0xa5;32]);
+  assert!(handles.owns(owner));
+ }
 
  #[test]fn r118_selected_volume_stale_handle_fuzz_across_128_pid_recycles(){
   // The *real* selected-volume API must deny stale tokens before any ATA
