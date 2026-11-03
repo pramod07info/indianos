@@ -1591,6 +1591,12 @@ fn revoke_task_authority_with_kind(
         r120_halt();
       }
       full_retirement_committed=true;
+      // Printed only after the active R120 incarnation has committed the
+      // unified FileHandles, UDP, capability, event and lease transaction.
+      // Host-side markers cannot satisfy this real guest scheduler proof.
+      if owner.pid==2 {
+        log(b"IndianOS: R121 QEMU five-table PID2 retirement transaction PASSED\n\0");
+      }
     }else if current.is_none(){
       // Compatibility path for host tests creating synthetic FileHandles
       // owners without initializing a full production scheduler session.
