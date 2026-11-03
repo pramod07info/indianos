@@ -353,6 +353,8 @@ pub fn run_demo<D:EthernetDevice>(
     // Do not treat malformed network replies as successful failover evidence.
     // In the QEMU test the peer confirms packet reception but blackholes
     // this reply. Only a bounded timeout may quarantine the primary path.
+    let mut captured_reply:Option<([u8;FRAME_CAP],usize,
+        crate::process_retirement_txn::IngressRevision,[u8;6])>=None;
     match wait_for_limit_fenced(
         dev,300_000,
         ||live_owners.capture_ingress_revision(&ingress_permit),ingress
@@ -385,17 +387,43 @@ pub fn run_demo<D:EthernetDevice>(
                retry_receipt.selected.epoch!=backup.epoch {
                 return Err(Error::Unexpected);
             }
+            // Retain the EXACT Ethernet frame received by the actual
+            // QEMU virtio NIC and its pre-poll owner revision. Replay this
+            // same descriptor only after process retirement + PID reuse.
+            // A synthetic host-generated packet could not prove the real
+            // NIC's receive path actually traversed the ingress authority.
+            let mut real_rx_frame=[0u8;FRAME_CAP];
+            let mut real_rx_len=0usize;
+            let mut real_rx_revision=None;
+            let mut real_rx_mac=[0u8;6];
             wait_for_limit_fenced(
                 dev,MAX_POLL,
                 ||live_owners.capture_ingress_revision(&ingress_permit),
                 |revision,frame,mac|{
-                    parse_udp(frame,mac,PEER_UDP_PORT)
-                        .is_ok_and(|data|data==UDP_RESP)
-                        && live_owners.ingest_kernel_nic_frame(
-                            &ingress_permit,&mut udp_endpoints,revision,frame,mac)
-                            .is_ok_and(|owner|owner==network_owner)
+                    if frame.len()>real_rx_frame.len() ||
+                       !parse_udp(frame,mac,PEER_UDP_PORT)
+                            .is_ok_and(|data|data==UDP_RESP) {
+                        return false;
+                    }
+                    if live_owners.ingest_kernel_nic_frame(
+                        &ingress_permit,&mut udp_endpoints,revision,frame,mac)
+                        !=Ok(network_owner){
+                        return false;
+                    }
+                    real_rx_frame[..frame.len()].copy_from_slice(frame);
+                    real_rx_len=frame.len();
+                    real_rx_revision=Some(revision);
+                    real_rx_mac=mac;
+                    true
                 }
             )?;
+            if real_rx_len==0 || real_rx_revision.is_none(){
+                return Err(Error::Unexpected);
+            }
+            // The saved frame and revision stay attached to the exclusive
+            // R028 guest's local stack, never published as user authority.
+            captured_reply=Some((real_rx_frame,real_rx_len,
+                                 real_rx_revision.unwrap(),real_rx_mac));
             stage(b"IndianOS: R116 QEMU DHCP lease expiry blocked primary UDP resend and backup succeeded\n\0");
         },
         // The failure-injection acceptance requires the primary to become
@@ -432,6 +460,28 @@ pub fn run_demo<D:EthernetDevice>(
         live_owners.active_generation(network_owner.pid).is_some(){
         return Err(Error::Unexpected);
     }
+    // R130: Recycle PID1 and the exact receiving UDP port. The actual
+    // Ethernet reply frame captured from the real NIC *before retirement*
+    // must NEVER be inherited by the new incarnation. The saved revision
+    // is checked before UDP parsing or any queue insertion.
+    let (saved_wire,saved_len,stale_revision,saved_mac)=
+        captured_reply.ok_or(Error::Unexpected)?;
+    let replacement=live_owners.start(network_owner.pid)
+        .map_err(|_|Error::Unexpected)?;
+    if replacement.generation==network_owner.generation {
+        return Err(Error::Unexpected);
+    }
+    live_owners.bind_live_udp(&mut udp_endpoints,replacement,CLIENT_PORT)
+        .map_err(|_|Error::Unexpected)?;
+    if live_owners.ingest_kernel_nic_frame(
+        &ingress_permit,&mut udp_endpoints,stale_revision,
+        &saved_wire[..saved_len],saved_mac)
+        !=Err(crate::process_retirement_txn::RetirementError::Sockets(
+                SocketError::Denied)) ||
+       udp_endpoints.pending_owned(replacement.pid,replacement.generation)!=Ok(0){
+        return Err(Error::Unexpected);
+    }
+    stage(b"IndianOS: R130 QEMU stale NIC frame denied after PID/UDP epoch recycle\n\0");
     routes.retire(route_owner,1).map_err(|_|Error::Unexpected)?;
     stage(b"IndianOS: R028 UDP DNS A query indianos.test PASSED\n\0");
     stage(b"IndianOS: R124 QEMU permit-fenced kernel NIC UDP/DNS ingress PASSED\n\0");
