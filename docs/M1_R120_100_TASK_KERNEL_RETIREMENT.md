@@ -39,7 +39,7 @@ The added Rust `no_std` coordinator stages and atomically commits capabilities, 
 - [x] R120-024 — Safely handle zero-capacity UDP registry
 - [x] R120-025 — Wire retired grants to actual network socket table
 - [ ] R120-026 — Enforce interrupt ingress generation ownership
-- [ ] R120-027 — Test two ring3 process isolation in QEMU
+- [x] R120-027 — Test two ring3 process isolation in QEMU
 - [ ] R120-028 — Qualify physical multi-NIC IRQ/IOMMU safety
 
 ### Workstream 3 — Exit/fault lifecycle receipts
@@ -88,9 +88,9 @@ The added Rust `no_std` coordinator stages and atomically commits capabilities, 
 - [x] R120-064 — Add invalid/zero fault receipt regression
 - [x] R120-065 — Retain a 100-task acceptance ledger
 - [x] R120-066 — Retain inherited pending hardware gates
-- [ ] R120-067 — Run exact-head Rust host regression CI
-- [ ] R120-068 — Run optimized freestanding no_std CI
-- [ ] R120-069 — Run graphical persistent Files and ring3 UDP QEMU
+- [x] R120-067 — Run exact-head Rust host regression CI
+- [x] R120-068 — Run optimized freestanding no_std CI
+- [x] R120-069 — Run graphical persistent Files and ring3 UDP QEMU
 - [ ] R120-070 — Obtain independent review and verified main merge
 
 ### Inherited 30 R118 items (unverified, not claimed complete)
@@ -172,7 +172,7 @@ The added Rust `no_std` coordinator stages and atomically commits capabilities, 
 
 ## Acceptance and explicit limitations
 
-- New source-scoped R120 checks: **61/70**, remaining **9/70**. These are granular API or regression acceptance items, not 57 separately deployable OS features.
+- New source-scoped R120 checks: **65/70**, remaining **5/70**. These are granular API or regression acceptance items, not 57 separately deployable OS features.
 - Inherited R118 hardware/CI/review gates: **0/51 validated here**; merged PR #754 also retained 15 R119 acceptance tasks that require live integration or evidence.
 - Added Rust tests: six coordinator tests and two fault-receipt tests; they must pass CI on the exact PR head.
 - Required release matrix: host Rust suite, optimized freestanding `no_std`, two-boot persistent graphical Files QEMU, ring3 two-process UDP QEMU, boot ELF/ISO, and independent kernel/security review. Verify checks against the exact final SHA and merge only when project policy allows.
@@ -229,3 +229,9 @@ R120-027 is **implemented but remains unchecked until the exact new SHA's
 graphical Files QEMU integration passes**. Host tests do not substitute for
 guest acceptance. The R120-013, -026, -028, -042 SMP/physical IRQ/IOMMU
 gates and -070 independent review/merge remain unqualified.
+
+## R120 exact-code-SHA CI acceptance (2026-11-03)
+
+Source commit `0883993c27cbceab596f82cad62ffd5e6cba4369` passed GitHub Actions **combined-regression** (including real runtime module host regressions), **durable-files-desktop**, and that workflow's explicit **optimized freestanding kernel-core build** and **real two-boot graphical Files, ring-3 UDP and persistent scratch disk QEMU** steps. The graphical guest harness required the new kernel-produced dual-PID exact-generation retirement marker, not merely a mocked or log-only unit test. The **network**, **security regression** and **SHA validation** checks also passed on this source commit.
+
+The four completed evidence gates R120-027, R120-067, R120-068 and R120-069 are checked against the referenced source SHA. **This ledger update creates a new commit SHA, so final-PR-head CI must run again before merge.** Any changed source would also require a fresh qualification. R120-013 (real SMP access control), R120-026 (NIC IRQ-driven ingress), R120-028 (physical multi-NIC IOMMU), R120-042 (cross-core lifecycle IPI), and R120-070 (independent human review, branch protection and merge SHA) remain open. Do not equate QEMU coverage with physical hardware qualification.
