@@ -1436,12 +1436,15 @@ fn revoke_task_authority_with_kind(
    if had_live_directory_lease {
      let lease_gone=!unsafe{(&*ptr::addr_of!(R116_SHARED_LEASES))}
            .permits_shared_directory(owner);
-     let port_gone=if current==Some(owner.generation) {
-       coordinator.authorize_udp(live,5502).is_err()
-     }else{
-       unsafe{(&*ptr::addr_of!(R115_UDP_OWNERS))}
-           .owner_of(5502).is_none()
-     };
+     // Independent post-condition: neither the real queue nor the
+     // generation-bound policy may retain this incarnation after cleanup.
+     let port_gone=unsafe{(&*ptr::addr_of!(R114_LOCAL_UDP))}
+        .pending_owned(owner.pid,owner.generation).is_err() &&
+        unsafe{(&*ptr::addr_of!(R120_RETIREMENT))}
+        .authorize_udp(crate::process_retirement_txn::Owner{
+           pid:owner.pid,generation:owner.generation},5502).is_err() &&
+        unsafe{(&*ptr::addr_of!(R115_UDP_OWNERS))}
+        .owner_of(5502).is_none();
      let file_gone=!unsafe{(&*ptr::addr_of!(R031_HANDLES))}.owns(owner);
      if lease_gone && port_gone && file_gone {
        log(b"R117 QEMU PID2 delegated directory and UDP authority revoked at scheduler exit\n\0");
