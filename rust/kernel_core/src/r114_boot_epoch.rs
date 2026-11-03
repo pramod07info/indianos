@@ -661,3 +661,103 @@ mod r118_sealed_floor_and_recovery_matrix_tests {
   // durability, even when one in-memory sector now looks newest.
  }
 }
+
+#[cfg(test)]
+mod r118_power_interruption_fault_matrix {
+    use super::*;
+    use crate::block::{BlockDevice,BlockError,SECTOR_BYTES};
+
+    /// Disposable two-sector in-memory media; these are NEVER real power
+    /// cuts or claims about storage-controller caches, FUA, or firmware.
+    struct InterruptedMedia {
+        disk:tests::Disk,
+        mode:u8,
+        reads:usize,
+        writes:usize,
+        flushes:usize,
+    }
+    impl InterruptedMedia {
+        fn new(mode:u8)->Self {
+            Self{disk:tests::fixture(),mode,reads:0,writes:0,flushes:0}
+        }
+    }
+    impl BlockDevice for InterruptedMedia {
+        fn sector_count(&self)->u64{2}
+        fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+            ->Result<(),BlockError>{
+            self.reads+=1;
+            // Guarded advance reads 2 sectors twice, then readback of new
+            // and old heads; reject completion if readback is lost.
+            if self.mode==5 && self.writes>0 && self.reads>=5 {
+                return Err(BlockError::Io);
+            }
+            self.disk.read_sector(lba,out)
+        }
+        fn write_sector(&mut self,lba:u64,bytes:&[u8;SECTOR_BYTES])
+            ->Result<(),BlockError>{
+            self.writes+=1;
+            if self.mode==1 {return Err(BlockError::Io);}
+            if self.mode==2 {
+                // Simulate a controller reporting failure after only 64 bytes.
+                self.disk.sectors[lba as usize][..64]
+                    .copy_from_slice(&bytes[..64]);
+                return Err(BlockError::Io);
+            }
+            self.disk.write_sector(lba,bytes)?;
+            if self.mode==3{return Err(BlockError::Io);}
+            Ok(())
+        }
+        fn sync(&mut self)->Result<(),BlockError>{
+            self.flushes+=1;
+            if self.mode==4 {return Err(BlockError::Io);}
+            self.disk.sync()
+        }
+    }
+    fn old_floor()->SealedBootFloor {
+        SealedBootFloor{
+            minimum_epoch:4,minimum_journal_generation:20,
+            expected_slot:0,minimum_slot_version:9,
+            expected_measurement:[3;32],
+        }
+    }
+    #[test]
+    fn every_interrupted_write_flush_or_readback_denies_commit_receipt(){
+        for failure in 1u8..=5 {
+            let mut media=InterruptedMedia::new(failure);
+            assert_eq!(
+                advance_epoch_guarded(&mut media,&tests::Trusted([3;32]),
+                    4,0,tests::slot(),21,old_floor()),
+                Err(Error::Io),"fault phase {failure}"
+            );
+            assert_eq!(media.writes,1,"fault phase {failure}");
+            // The *old* record lives in the untouched second sector.
+            // Neither failure may destroy the predecessor recovery copy.
+            assert!(decode(&media.disk.sectors[1]).is_some());
+            let snapshot=media.disk.sectors;
+            // No further writes occurred during rejected publish.
+            assert_eq!(media.disk.sectors,snapshot);
+        }
+    }
+    #[test]
+    fn torn_recovery_head_cannot_cross_a_sealed_epoch_floor(){
+        for damaged_bytes in [1usize,16,64,104,136,512] {
+            let mut media=InterruptedMedia::new(0);
+            let committed=advance_epoch_guarded(&mut media,&tests::Trusted([3;32]),
+                4,0,tests::slot(),21,old_floor()).unwrap();
+            assert_eq!(committed.epoch,5);
+            let floor5=SealedBootFloor{
+                minimum_epoch:5,minimum_journal_generation:21,..old_floor()
+            };
+            // Model incomplete sector replacement following a new attempt:
+            // a corruption of the new head cannot regress into an older
+            // (otherwise valid) sector under the sealed hardware floor.
+            for byte in 0..damaged_bytes {
+                media.disk.sectors[0][byte]^=0xa5;
+            }
+            let result=observe_with_sealed_floor(
+                &mut media.disk,&tests::Trusted([3;32]),floor5);
+            assert!(matches!(result,Err(Error::Stale)|Err(Error::Invalid)),
+                "torn length {damaged_bytes}");
+        }
+    }
+}
