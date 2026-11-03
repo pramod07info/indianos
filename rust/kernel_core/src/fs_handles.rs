@@ -3572,3 +3572,55 @@ mod r118_staged_file_retirement_tests {
         assert!(!draft.owns(next));
     }
 }
+
+#[cfg(test)]
+mod r121_pending_mount_and_owner_stress {
+    use super::*;
+
+    #[test]
+    fn sixty_four_mount_revisions_and_pid_recycles_reject_every_old_proof() {
+        let mut files=FileHandles::new();
+        let init=files.bind_process(1).unwrap();
+        let mut guest=files.bind_process(2).unwrap();
+        for _ in 0..64 {
+            let old_guard=files.selected_operation_guard(guest).unwrap();
+            let old_alias=files.mount_alias_for_current_root_kernel(guest).unwrap();
+            assert!(files.selected_operation_guard_is_current(old_guard));
+            assert!(files.mount_alias_allows(old_alias,guest,"/shared/note"));
+
+            // Emulate a trusted successful remount's commit-point revision
+            // change. This is NOT concurrent physical CPU or disk evidence.
+            files.volume_revision=files.volume_revision.checked_add(1).unwrap();
+            assert!(!files.selected_operation_guard_is_current(old_guard));
+            assert!(!files.mount_alias_allows(old_alias,guest,"/shared/note"));
+
+            let fresh_guard=files.selected_operation_guard(guest).unwrap();
+            let fresh_alias=files.mount_alias_for_current_root_kernel(guest).unwrap();
+            assert!(files.selected_operation_guard_is_current(fresh_guard));
+            assert!(files.mount_alias_allows(fresh_alias,guest,"/shared/note"));
+
+            let replaced=files.bind_process(2).unwrap();
+            assert!(!files.selected_operation_guard_is_current(fresh_guard));
+            assert!(!files.mount_alias_allows(fresh_alias,replaced,"/shared/note"));
+            assert!(!files.mount_alias_allows(old_alias,guest,"/shared/note"));
+            assert!(files.owns(init));
+            assert!(files.owns(replaced));
+            guest=replaced;
+        }
+    }
+
+    #[test]
+    fn late_wrong_owner_retirement_never_revokes_current_peer() {
+        let mut files=FileHandles::new();
+        let init=files.bind_process(1).unwrap();
+        let old=files.bind_process(2).unwrap();
+        let current=files.bind_process(2).unwrap();
+        let live=files.selected_operation_guard(current).unwrap();
+        assert_eq!(files.retire_process_batch_kernel(&[init,old]),
+                   Err(FsError::InvalidName));
+        assert!(files.owns(init) && files.owns(current));
+        assert!(files.selected_operation_guard_is_current(live));
+        assert_eq!(files.retire_process_batch_kernel(&[current,init]),Ok(2));
+        assert!(!files.selected_operation_guard_is_current(live));
+    }
+}

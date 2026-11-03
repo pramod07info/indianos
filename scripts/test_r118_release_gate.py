@@ -22,12 +22,15 @@ def fixture_reviews(state="APPROVED", commit=SHA, reviewer="independent"):
              "state": state, "commit_id": commit}]
 
 
-def evidence(checks=None, reviews=None, protection=None, actual_head=SHA):
+def evidence(checks=None, reviews=None, protection=None, actual_head=SHA,
+             draft=False, base_ref="main"):
     checks = gate.REQUIRED if checks is None else checks
     if reviews is None:
         reviews = fixture_reviews()
     pr = {"head": {"sha": actual_head}, "state": "open", "merged": False,
-          "user": {"login": "author", "type": "User"}, "base": {"ref": "main"}}
+          "draft": draft,
+          "user": {"login": "author", "type": "User"},
+          "base": {"ref": base_ref, "sha": "c" * 40}}
     data = [
         pr,
         {"total_count": len(checks), "check_runs": [
@@ -39,7 +42,8 @@ def evidence(checks=None, reviews=None, protection=None, actual_head=SHA):
                                     "contexts": list(gate.REQUIRED)},
          "required_pull_request_reviews": {"required_approving_review_count": 1}}
         if protection is None else protection,
-        {"head": {"sha": actual_head}, "state": "open"},
+        {"head": {"sha": actual_head}, "state": "open", "merged": False,
+         "draft": draft, "base": {"ref": base_ref, "sha": "c" * 40}},
     ]
     return iter(data)
 
@@ -57,6 +61,42 @@ class ReleaseGateTests(unittest.TestCase):
         exit_code, result = self.invoke(evidence())
         self.assertEqual(exit_code, 0)
         self.assertTrue(result["ready"])
+
+    def test_draft_pr_is_not_release_ready(self):
+        code, result = self.invoke(evidence(draft=True))
+        self.assertEqual(code, 1)
+        self.assertFalse(result["ready"])
+
+    def test_wrong_base_branch_is_not_release_ready(self):
+        code, result = self.invoke(evidence(base_ref="release-preview"))
+        self.assertEqual(code, 1)
+        self.assertFalse(result["ready"])
+
+    def test_base_branch_change_during_evidence_collection_is_denied(self):
+        records = list(evidence())
+        records[-1]["base"]["ref"] = "feature"
+        code, result = self.invoke(iter(records))
+        self.assertEqual(code, 1)
+        self.assertFalse(result["head_stable"])
+
+    def test_base_sha_advance_during_evidence_scan_invalidates_checks(self):
+        records = list(evidence())
+        records[-1]["base"]["sha"] = "d" * 40
+        code, result = self.invoke(iter(records))
+        self.assertEqual(code, 1)
+        self.assertFalse(result["head_stable"])
+
+    def test_base_sha_identity_is_recorded_in_successful_evidence(self):
+        code, result = self.invoke(evidence())
+        self.assertEqual(code, 0)
+        self.assertEqual(result["base_sha"], "c" * 40)
+
+    def test_draft_transition_during_evidence_collection_is_denied(self):
+        records = list(evidence())
+        records[-1]["draft"] = True
+        code, result = self.invoke(iter(records))
+        self.assertEqual(code, 1)
+        self.assertFalse(result["head_stable"])
 
     def test_old_pr_head_denied_before_check_queries(self):
         exit_code, result = self.invoke(evidence(actual_head="b" * 40))

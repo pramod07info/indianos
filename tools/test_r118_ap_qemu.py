@@ -17,6 +17,7 @@ MARKERS=(
     "IndianOS: R126 QEMU secondary AP executed Rust and acknowledged BSP",
     "IndianOS: R127 QEMU real AP denied BSP retirement gate 8192 times",
     "IndianOS: R131 QEMU 64 ordered cross-CPU lifecycle receipts acknowledged",
+    "IndianOS: R121 QEMU all 64 AP lifecycle receipt replays denied",
 )
 
 def main():

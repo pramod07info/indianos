@@ -9,11 +9,16 @@
 
 use core::{marker::PhantomData,ptr,sync::atomic::{AtomicBool,AtomicU32,AtomicU64,Ordering}};
 
+/// Every ring lifetime receives a distinct nonzero ID; fail closed at wrap.
+/// Pointer identity alone is unsafe when a driver is replaced at the same
+/// memory address with the same device number and initial epoch.
+static NEXT_RX_INSTANCE:AtomicU64=AtomicU64::new(1);
+
 #[derive(Clone,Copy,Debug,Eq,PartialEq)]
 pub enum RxFenceError {InvalidDevice,Quiescing,Busy,Capacity,Stale,EpochExhausted}
 
 #[derive(Clone,Copy,Debug,Eq,PartialEq)]
-pub struct QuiesceReceipt { device:u32, epoch:u64 }
+pub struct QuiesceReceipt { device:u32, epoch:u64, instance:u64 }
 
 /// One receive device/ring. At most one control-plane quiescer at a time.
 /// No allocations, lock spinning, or IRQ-side calls to a scheduler lock.
@@ -22,14 +27,30 @@ pub struct NicRxFence {
     epoch:AtomicU64,
     admitted:AtomicU32,
     quiescing:AtomicBool,
+    instance:AtomicU64,
 }
 impl NicRxFence {
     pub const fn new(device:u32)->Self{
         Self{device,epoch:AtomicU64::new(1),admitted:AtomicU32::new(0),
-             quiescing:AtomicBool::new(false)}
+             quiescing:AtomicBool::new(false),instance:AtomicU64::new(0)}
     }
     pub fn device(&self)->u32{self.device}
     pub fn epoch(&self)->u64{self.epoch.load(Ordering::Acquire)}
+
+    /// Assign once, lazily, so static const-initialized fences also work.
+    /// Unused IDs caused by contention are harmless; IDs are never reused.
+    fn instance_id(&self)->Result<u64,RxFenceError>{
+        let existing=self.instance.load(Ordering::Acquire);
+        if existing!=0{return Ok(existing);}
+        let candidate=NEXT_RX_INSTANCE.fetch_update(
+            Ordering::AcqRel,Ordering::Acquire,|next|next.checked_add(1)
+        ).map_err(|_|RxFenceError::EpochExhausted)?;
+        match self.instance.compare_exchange(0,candidate,
+            Ordering::AcqRel,Ordering::Acquire) {
+            Ok(_)=>Ok(candidate),
+            Err(winner)=>Ok(winner),
+        }
+    }
 
     /// IRQ may use this without waiting. If teardown races with admission,
     /// rechecking quiescing and the captured epoch forces fail-closed exit.
@@ -52,13 +73,19 @@ impl NicRxFence {
     /// permit before publishing a changed UDP-process owner generation.
     pub fn begin_quiesce(&self,device:u32)->Result<QuiesceReceipt,RxFenceError>{
         if device==0 || device!=self.device{return Err(RxFenceError::InvalidDevice);}
+        let instance=self.instance_id()?;
         self.quiescing.compare_exchange(false,true,Ordering::AcqRel,
             Ordering::Acquire).map_err(|_|RxFenceError::Busy)?;
-        Ok(QuiesceReceipt{device,epoch:self.epoch.load(Ordering::Acquire)})
+        // The opaque nonce survives neither driver replacement nor rollback
+        // of a NIC queue descriptor. Matching device+epoch is insufficient.
+        Ok(QuiesceReceipt{device,epoch:self.epoch.load(Ordering::Acquire),
+                          instance})
     }
     /// No busy waiting in an ISR; the BSP polls this after hardware is still.
     pub fn drained(&self,receipt:QuiesceReceipt)->Result<bool,RxFenceError>{
         if receipt.device!=self.device || self.device==0 ||
+           receipt.instance==0 ||
+           receipt.instance!=self.instance.load(Ordering::Acquire) ||
            !self.quiescing.load(Ordering::Acquire) ||
            receipt.epoch!=self.epoch.load(Ordering::Acquire) {
             return Err(RxFenceError::Stale);
@@ -129,6 +156,42 @@ mod tests{
         assert_eq!(a.finish_rebind(q),Ok(2));
         assert_eq!(a.finish_rebind(q),Err(RxFenceError::Stale));
         assert_eq!(a.try_admit(0).err(),Some(RxFenceError::InvalidDevice));
+    }
+    #[test]
+    fn r121_same_device_different_fence_receipt_is_not_transferable(){
+        let original=NicRxFence::new(9);
+        let replacement=NicRxFence::new(9);
+        let original_receipt=original.begin_quiesce(9).unwrap();
+        let replacement_receipt=replacement.begin_quiesce(9).unwrap();
+        // Both start at epoch one; ID+epoch alone is not authority.
+        assert_eq!(original.epoch(),replacement.epoch());
+        assert_eq!(replacement.drained(original_receipt),
+                   Err(RxFenceError::Stale));
+        assert_eq!(replacement.finish_rebind(original_receipt),
+                   Err(RxFenceError::Stale));
+        assert_eq!(original.drained(replacement_receipt),
+                   Err(RxFenceError::Stale));
+        assert_eq!(original.finish_rebind(replacement_receipt),
+                   Err(RxFenceError::Stale));
+        assert_eq!(original.finish_rebind(original_receipt),Ok(2));
+        assert_eq!(replacement.finish_rebind(replacement_receipt),Ok(2));
+    }
+    #[test]
+    fn r121_driver_replacement_at_same_address_rejects_old_receipt(){
+        let mut slot=std::boxed::Box::new(NicRxFence::new(9));
+        let stale=slot.begin_quiesce(9).unwrap();
+        let old_epoch=slot.epoch();
+        // Drop/recreate in the identical Box location after the old driver
+        // has stopped: pointer-based authority would incorrectly accept
+        // this stale receipt for the replacement at epoch one.
+        *slot=NicRxFence::new(9);
+        let fresh=slot.begin_quiesce(9).unwrap();
+        assert_eq!(slot.epoch(),old_epoch);
+        assert_ne!(fresh.instance,stale.instance);
+        assert_eq!(slot.drained(stale),Err(RxFenceError::Stale));
+        assert_eq!(slot.finish_rebind(stale),Err(RxFenceError::Stale));
+        assert_eq!(slot.drained(fresh),Ok(true));
+        assert_eq!(slot.finish_rebind(fresh),Ok(2));
     }
     #[test]
     fn cross_thread_inflight_admission_blocks_rebind_until_drop(){
