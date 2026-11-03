@@ -119,16 +119,26 @@ fn r116_prepare_shared_directory_lease(
 /// incarnation is required, and failed verification never dequeues events.
 /// This queue is single-BSP syscall context, NOT interrupt- or SMP-safe.
 #[cfg(feature="test-r031-vfs")]
-pub(crate) fn consume_pid1_lifecycle_event(
+pub(crate) fn peek_pid1_lifecycle_receipt(
     consumer:crate::batch5_session::Identity,
-    expected:crate::process_events::ProcessEvent,
+)->Result<crate::process_events::EventReceipt,()>{
+    if consumer.pid!=1 || consumer.generation==0 ||
+       !unsafe{(&*ptr::addr_of!(R031_HANDLES)).owns(consumer)}{
+        return Err(());
+    }
+    unsafe{(&*ptr::addr_of!(R114_FILE_EVENTS))}.peek_receipt().ok_or(())
+}
+#[cfg(feature="test-r031-vfs")]
+pub(crate) fn consume_pid1_lifecycle_receipt(
+    consumer:crate::batch5_session::Identity,
+    expected:crate::process_events::EventReceipt,
 )->Result<crate::process_events::ProcessEvent,()>{
     if consumer.pid!=1 || consumer.generation==0 ||
        !unsafe{(&*ptr::addr_of!(R031_HANDLES)).owns(consumer)}{
         return Err(());
     }
     let queue=unsafe{&mut *ptr::addr_of_mut!(R114_FILE_EVENTS)};
-    queue.acknowledge_exact_head(expected).ok_or(())
+    queue.acknowledge_receipt(expected).ok_or(())
 }
 
 #[cfg(feature="test-r031-vfs")]
@@ -1364,7 +1374,9 @@ fn revoke_task_authority(task:&mut Task){
     // scheduler owns the only BSP mutator; no nested lock acquisition.
     let sockets=unsafe{&mut *ptr::addr_of_mut!(R114_LOCAL_UDP)};
     let registry=unsafe{&mut *ptr::addr_of_mut!(R115_UDP_OWNERS)};
-    let _=sockets.retire_registered(registry,owner.pid,owner.generation);
+    if sockets.retire_exact_kernel(registry,owner.pid,owner.generation).is_err(){
+      log(b"IndianOS: FATAL R118 exact UDP authority retirement failed\n\0");
+    }
    }
    #[cfg(feature="test-r031-files-gui")]
    {let _=unsafe{(&mut *ptr::addr_of_mut!(R116_SHARED_LEASES))}
@@ -1639,6 +1651,11 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
     unsafe{indianos_process_fault(pcb,status,v,e,a)}
    }else{unsafe{indianos_process_exit(pcb,status)}};
    if !finished{ok=false;break;}
+   // Both a normal process exit and a ring-3 fault must revoke live network,
+   // file and delegated capability authority BEFORE potentially fallible
+   // user page-table / frame reclamation below. The rollback path still
+   // calls the same idempotent retirement when process termination fails.
+   revoke_task_authority(task);
    #[cfg(feature="test-r030-ondevice")]
    fault_hex(b"IndianOS: R030 scheduler exit status=0x\0",status);
    #[cfg(feature="test-r031-boot-desktop")]
@@ -2003,15 +2020,22 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
     assert!(replacement.generation>1);
     let expected=crate::process_events::ProcessEvent{pid:1,
       kind:crate::process_events::EventKind::Exited,value:1};
-    assert_eq!(consume_pid1_lifecycle_event(
-      crate::batch5_session::Identity{pid:1,generation:1},expected),Err(()));
-    assert_eq!(consume_pid1_lifecycle_event(
-      crate::batch5_session::Identity{pid:2,generation:2},expected),Err(()));
+    let receipt=peek_pid1_lifecycle_receipt(replacement).unwrap();
+    assert_eq!(receipt.event,expected);
+    assert_eq!(peek_pid1_lifecycle_receipt(
+      crate::batch5_session::Identity{pid:1,generation:1}),Err(()));
+    assert_eq!(consume_pid1_lifecycle_receipt(
+      crate::batch5_session::Identity{pid:1,generation:1},receipt),Err(()));
+    assert_eq!(consume_pid1_lifecycle_receipt(
+      crate::batch5_session::Identity{pid:2,generation:2},receipt),Err(()));
     assert_eq!((&*ptr::addr_of!(R114_FILE_EVENTS)).len(),1);
-    assert_eq!(consume_pid1_lifecycle_event(replacement,
-      crate::process_events::ProcessEvent{value:999,..expected}),Err(()));
-    assert_eq!(consume_pid1_lifecycle_event(replacement,expected),Ok(expected));
-    assert_eq!(consume_pid1_lifecycle_event(replacement,expected),Err(()));
+    assert_eq!(consume_pid1_lifecycle_receipt(replacement,
+      crate::process_events::EventReceipt{
+        event:crate::process_events::ProcessEvent{value:999,..expected},
+        ..receipt
+      }),Err(()));
+    assert_eq!(consume_pid1_lifecycle_receipt(replacement,receipt),Ok(expected));
+    assert_eq!(consume_pid1_lifecycle_receipt(replacement,receipt),Err(()));
     assert_eq!((&*ptr::addr_of!(R114_FILE_EVENTS)).len(),0);
    }
    #[cfg(feature="test-ipc")]{

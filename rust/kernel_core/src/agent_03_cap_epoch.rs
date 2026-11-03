@@ -709,3 +709,78 @@ mod r117_capability_renewal_tests {
   assert_eq!(t.check(req(),44),Ok(()));
  }
 }
+
+ 
+/// R118 single-BSP supervisor helper: fail-atomic retirement of all leases
+/// for several authenticated process incarnations. A stale generation or
+/// duplicate PID rejects the entire batch, leaving peer leases untouched.
+/// This does not create an inter-CPU lock or authenticate caller identity.
+impl<const N:usize> LeaseTable<N> {
+ pub fn revoke_identity_batch_kernel(
+   &mut self,identities:&[(u32,u64)]
+ )->Result<usize,LeaseFault>{
+   let mut staged=*self;
+   let mut count=0usize;
+   for (i,&(pid,generation)) in identities.iter().enumerate(){
+     if pid==0 || generation==0 {return Err(LeaseFault::Invalid);}
+     if identities[..i].iter().any(|&(existing,_)|existing==pid){
+       return Err(LeaseFault::Duplicate);
+     }
+     if staged.entries.iter().flatten().any(|v|
+         v.grant.owner==pid&&v.grant.generation!=generation){
+       return Err(LeaseFault::Denied(CapabilityError::Stale));
+     }
+     count+=staged.revoke_identity(pid,generation);
+   }
+   *self=staged;
+   Ok(count)
+ }
+}
+#[cfg(test)]
+mod r118_capability_supervisor_batch_tests {
+ use super::*;
+ fn setup()->LeaseTable<4>{
+   let parent=Grant{owner:1,resource:6,rights:7,epoch:4,
+     generation:3,revoked:false};
+   let issuer=Request{caller:1,resource:6,required_rights:1,
+     current_epoch:4,current_generation:3};
+   let mut leases=LeaseTable::new();
+   for (pid,generation) in [(2,8),(3,9),(4,10)]{
+     let child=TimedGrant{grant:Grant{
+         owner:pid,resource:6,rights:1,epoch:4,
+         generation,revoked:false},expires_at:100};
+     leases.delegate(parent,issuer,child,1).unwrap();
+   }
+   leases
+ }
+ fn read(pid:u32,generation:u64)->Request{
+   Request{caller:pid,resource:6,required_rights:1,
+     current_epoch:4,current_generation:generation}
+ }
+ #[test]
+ fn stale_mid_batch_cannot_revoke_other_process_capabilities(){
+   let mut leases=setup();
+   assert_eq!(leases.revoke_identity_batch_kernel(&[(2,8),(3,10)]),
+     Err(LeaseFault::Denied(CapabilityError::Stale)));
+   assert_eq!(leases.len(),3);
+   for (pid,generation) in [(2,8),(3,9),(4,10)]{
+     assert_eq!(leases.check(read(pid,generation),4),Ok(()));
+   }
+   assert_eq!(leases.revoke_identity_batch_kernel(&[(2,8),(2,8)]),
+     Err(LeaseFault::Duplicate));
+   assert_eq!(leases.revoke_identity_batch_kernel(&[(0,8)]),
+     Err(LeaseFault::Invalid));
+   assert_eq!(leases.len(),3);
+ }
+ #[test]
+ fn exact_batch_retires_only_requested_owners_and_preserves_peer(){
+   let mut leases=setup();
+   assert_eq!(leases.revoke_identity_batch_kernel(&[(2,8),(4,10)]),Ok(2));
+   assert_eq!(leases.check(read(2,8),4),Err(LeaseFault::Missing));
+   assert_eq!(leases.check(read(3,9),4),Ok(()));
+   assert_eq!(leases.check(read(4,10),4),Err(LeaseFault::Missing));
+   assert_eq!(leases.revoke_identity_batch_kernel(&[(2,8)]),Ok(0));
+   assert_eq!(leases.revoke_identity_batch_kernel(&[(3,9)]),Ok(1));
+   assert_eq!(leases.len(),0);
+ }
+}

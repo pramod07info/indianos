@@ -27,6 +27,13 @@ impl<const N:usize> Registry<N> {
         Ok(())
     }
 
+    /// Read-only exact-generation collision proof for a trusted teardown
+    /// coordinator. A stale task must never retire its successor's ports.
+    pub fn has_foreign_generation(&self,pid:u32,generation:u64)->bool{
+        self.entries.iter().flatten().any(|g|
+            g.pid==pid && g.generation!=generation)
+    }
+
     pub fn authorize(&self,pid:u32,generation:u64,port:u16)
         ->Result<(),Error> {
         if pid==0||generation==0||port==0 { return Err(Error::Invalid); }
@@ -265,4 +272,24 @@ mod r115_atomic_udp_release_tests {
         assert_eq!(one.unbind_batch(&[]), Ok(0));
         assert_eq!(one.active_count(), 1);
     }
+}
+
+#[cfg(test)]
+mod r119_inherited_port_generation_regressions{
+ use super::*;
+ #[test]
+ fn delayed_retirement_cannot_revoke_new_generation_owner(){
+  let mut r=Registry::<3>::new();
+  r.bind(2,41,5300).unwrap();
+  assert!(r.has_foreign_generation(2,40));
+  assert!(!r.has_foreign_generation(2,41));
+  assert_eq!(r.revoke_owner(2,40),Ok(0));
+  assert_eq!(r.authorize(2,41,5300),Ok(()));
+  r.revoke_owner(2,41).unwrap();
+  r.bind(2,42,5300).unwrap();
+  assert_eq!(r.authorize(2,41,5300),Err(Error::Denied));
+  assert!(r.has_foreign_generation(2,41));
+  assert_eq!(r.revoke_owner(2,41),Ok(0));
+  assert_eq!(r.authorize(2,42,5300),Ok(()));
+ }
 }
