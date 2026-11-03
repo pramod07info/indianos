@@ -317,6 +317,13 @@ extern "C" fn r126_secondary_cpu_entry(info:*mut MpInfo)->!{
                         }
                     }
                     if !got{break;}
+                    // Real AP must not acknowledge the same BSP retirement
+                    // receipt twice, even when BSP has already issued the
+                    // next sequence on its other QEMU vCPU.
+                    if R131_FENCE.observe_and_ack(actual,seq-1)
+                        !=Err(crate::smp_lifecycle_fence::FenceError::StaleReceipt){
+                        break;
+                    }
                 }
                 R131_AP_DONE.store(seen as u32,Ordering::Release);
             }

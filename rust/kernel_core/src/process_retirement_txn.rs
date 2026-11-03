@@ -769,3 +769,71 @@ mod r118_ingress_revision_regressions {
         assert_eq!(k.queued_notices(),0);
     }
 }
+
+// R121: exact-gate device ingress must reject a descriptor fetched before
+// PID restart even after the new process claims the same UDP port. These are
+// host tests of the live socket structures, not an interrupt-driven NIC.
+#[cfg(test)]
+mod r121_live_device_ingress_replay_tests {
+    use super::*;
+    use crate::nic_rx_fence::NicRxFence;
+    use crate::retirement_gate::RetirementGate;
+
+    #[test]
+    fn retired_pid_revision_is_denied_before_packet_parse_or_queue_mutation(){
+        let gate=RetirementGate::new();
+        gate.register_bsp(0,true).unwrap();
+        let permit=gate.try_enter(0,true).unwrap();
+        let nic=NicRxFence::new(9);
+        let rx=nic.try_admit(9).unwrap();
+        let mut kernel=ProcessRetirement::<2,2,3>::new();
+        let mut sockets=EpochUdpEndpoints::<2,3>::new();
+        let old=kernel.start(1).unwrap();
+        kernel.bind_live_udp(&mut sockets,old,6501).unwrap();
+        let stale=kernel.capture_ingress_revision(&permit);
+        kernel.retire_live_exited_batch(&mut sockets,&[old]).unwrap();
+        let replacement=kernel.start(1).unwrap();
+        kernel.bind_live_udp(&mut sockets,replacement,6501).unwrap();
+        assert_ne!(replacement.generation,old.generation);
+        // Intentionally malformed wire image: if stale admission reaches
+        // parsing rather than rejecting the revision, it returns Malformed.
+        let frame=[0u8;3];
+        assert_eq!(kernel.ingest_nic_frame_device_fenced(
+            &nic,&rx,&permit,&gate,&mut sockets,stale,&frame,[0;6]),
+            Err(RetirementError::Sockets(SocketError::Denied)));
+        assert_eq!(sockets.pending_owned(replacement.pid,replacement.generation),Ok(0));
+        let fresh=kernel.capture_ingress_revision(&permit);
+        assert_eq!(kernel.ingest_nic_frame_device_fenced(
+            &nic,&rx,&permit,&gate,&mut sockets,fresh,&frame,[0;6]),
+            Err(RetirementError::Ingress(IngressError::Malformed)));
+        assert!(sockets.matches_registry(&kernel.udp));
+    }
+
+    #[test]
+    fn unrelated_bsp_gate_and_quiesced_nic_both_deny_live_ingress(){
+        let trusted=RetirementGate::new();
+        trusted.register_bsp(0,true).unwrap();
+        let other=RetirementGate::new();
+        other.register_bsp(0,true).unwrap();
+        let other_permit=other.try_enter(0,true).unwrap();
+        let valid_permit=trusted.try_enter(0,true).unwrap();
+        let nic=NicRxFence::new(7);
+        let rx=nic.try_admit(7).unwrap();
+        let mut kernel=ProcessRetirement::<1,1,2>::new();
+        let mut sockets=EpochUdpEndpoints::<1,2>::new();
+        let owner=kernel.start(1).unwrap();
+        kernel.bind_live_udp(&mut sockets,owner,6500).unwrap();
+        let revision=kernel.capture_ingress_revision(&valid_permit);
+        assert_eq!(kernel.ingest_nic_frame_device_fenced(
+            &nic,&rx,&other_permit,&trusted,&mut sockets,revision,&[0;3],[0;6]),
+            Err(RetirementError::Sockets(SocketError::Denied)));
+        let stopped=nic.begin_quiesce(7).unwrap();
+        assert_eq!(kernel.ingest_nic_frame_device_fenced(
+            &nic,&rx,&valid_permit,&trusted,&mut sockets,revision,&[0;3],[0;6]),
+            Err(RetirementError::Sockets(SocketError::Denied)));
+        drop(rx);
+        assert_eq!(nic.drained(stopped),Ok(true));
+        assert_eq!(nic.finish_rebind(stopped),Ok(2));
+        assert_eq!(sockets.pending_owned(owner.pid,owner.generation),Ok(0));
+    }
+}

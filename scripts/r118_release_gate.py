@@ -114,10 +114,14 @@ def main():
     try:
         pr = get(prefix + "/pulls/" + str(args.pr))
         report["actual_head"] = pr["head"]["sha"]
+        report["base_sha"] = pr["base"]["sha"]
         report["state"] = pr["state"]
         report["merged"] = pr["merged"]
-        if pr["head"]["sha"] != args.expected_head or pr["state"] != "open":
-            report["reason"] = "PR head mismatch or PR is not open"
+        if (pr["head"]["sha"] != args.expected_head or
+                pr["state"] != "open" or pr.get("merged") is not False or
+                pr.get("draft") is True or
+                pr.get("base", {}).get("ref") != "main"):
+            report["reason"] = "PR head, state, draft or main target mismatch"
             print(json.dumps(report, indent=2))
             return 1
         checks, report["check_results_complete"] = exact_head_check_runs(
@@ -179,6 +183,10 @@ def main():
         current = get(prefix + "/pulls/" + str(args.pr))
         report["head_stable"] = (
             current.get("state") == "open" and
+            current.get("merged") is False and
+            current.get("draft") is not True and
+            current.get("base", {}).get("ref") == "main" and
+            current.get("base", {}).get("sha") == report["base_sha"] and
             current.get("head", {}).get("sha") == args.expected_head)
         report["ready"] = (
             report["head_stable"] and
