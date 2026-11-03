@@ -260,6 +260,16 @@ static R126_AP_CPUID:core::sync::atomic::AtomicU32=
     core::sync::atomic::AtomicU32::new(u32::MAX);
 
 #[cfg(feature="test-r118-ap-ack")]
+static R127_GATE:crate::retirement_gate::RetirementGate=
+    crate::retirement_gate::RetirementGate::new();
+#[cfg(feature="test-r118-ap-ack")]
+static R127_AP_DENIALS:core::sync::atomic::AtomicU32=
+    core::sync::atomic::AtomicU32::new(0);
+#[cfg(feature="test-r118-ap-ack")]
+static R127_BSP_ADMISSIONS:core::sync::atomic::AtomicU32=
+    core::sync::atomic::AtomicU32::new(0);
+
+#[cfg(feature="test-r118-ap-ack")]
 extern "C" fn r126_secondary_cpu_entry(info:*mut MpInfo)->!{
     use core::sync::atomic::Ordering;
     unsafe{core::arch::asm!("cli",options(nomem,nostack));}
@@ -269,8 +279,22 @@ extern "C" fn r126_secondary_cpu_entry(info:*mut MpInfo)->!{
         let expected=unsafe{ptr::read_volatile(ptr::addr_of!((*info).lapic_id))};
         let actual=(unsafe{core::arch::x86_64::__cpuid(1)}.ebx>>24)&255;
         if expected==actual && actual!=0 {
-            R126_AP_CPUID.store(actual,Ordering::Release);
-            R126_AP_ACK.store(1,Ordering::Release);
+            // R127: real AP repeatedly attempts kernel BSP admission while
+            // the BSP concurrently probes the same atomic gate. Every
+            // attempt MUST deny the foreign LAPIC ID without spinning.
+            let mut denied=0u32;
+            for _ in 0..8192 {
+                if !matches!(
+                    R127_GATE.try_enter(actual,true),
+                    Err(crate::retirement_gate::GateError::WrongCpu)
+                ){break;}
+                denied+=1;
+            }
+            R127_AP_DENIALS.store(denied,Ordering::Release);
+            if denied==8192 {
+                R126_AP_CPUID.store(actual,Ordering::Release);
+                R126_AP_ACK.store(1,Ordering::Release);
+            }
         }
     }
     // No IDT/TSS, scheduler, PMM, IPC or IPI is installed on this AP.
@@ -296,8 +320,11 @@ pub(crate) fn launch_one_parked_qemu_ap()->bool{
         }
     }
     if secondary.is_null(){return false;}
+    if R127_GATE.register_bsp(0,true).is_err(){return false;}
     R126_AP_ACK.store(0,Ordering::Release);
     R126_AP_CPUID.store(u32::MAX,Ordering::Release);
+    R127_AP_DENIALS.store(0,Ordering::Release);
+    R127_BSP_ADMISSIONS.store(0,Ordering::Release);
     fence(Ordering::Release);
     // The canonical Limine protocol wakes the AP only AFTER the BSP
     // publishes goto_address. No normal boot, userland or IRQ is enabled.
@@ -306,8 +333,16 @@ pub(crate) fn launch_one_parked_qemu_ap()->bool{
         r126_secondary_cpu_entry as *const c_void
     );}
     for _ in 0..50_000_000u32{
+        // The BSP alone owns the gate. This loop executes concurrently
+        // with the real AP's 8192 denied entry attempts. The AP may never
+        // acquire, mutate or retain any BSP process authority.
+        let Ok(permit)=R127_GATE.try_enter(0,true)else{return false;};
+        R127_BSP_ADMISSIONS.fetch_add(1,Ordering::Relaxed);
+        drop(permit);
         if R126_AP_ACK.load(Ordering::Acquire)==1 {
-            return R126_AP_CPUID.load(Ordering::Acquire)==1;
+            return R126_AP_CPUID.load(Ordering::Acquire)==1 &&
+                R127_AP_DENIALS.load(Ordering::Acquire)==8192 &&
+                R127_BSP_ADMISSIONS.load(Ordering::Acquire)>0;
         }
         core::hint::spin_loop();
     }
