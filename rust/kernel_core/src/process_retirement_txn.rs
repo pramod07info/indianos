@@ -10,7 +10,7 @@
 use crate::capability::{EpochError, EpochRegistry, EpochTicket};
 use crate::process_events::{EventError, EventKind, EventReceipt, ProcessEvent, ProcessEvents};
 use crate::udp_owner_epoch::{Error as UdpError, Registry as UdpRegistry};
-use crate::network::{EpochUdpEndpoints, SocketError};
+use crate::network::{EpochUdpEndpoints, IngressError, SocketError};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Owner { pub pid: u32, pub generation: u64 }
@@ -20,6 +20,7 @@ pub enum RetirementError {
     Capabilities(EpochError),
     Udp(UdpError),
     Sockets(SocketError),
+    Ingress(IngressError),
     Events(EventError),
 }
 
@@ -127,6 +128,38 @@ impl<const C: usize, const U: usize, const E: usize> ProcessRetirement<C, U, E> 
         *self=staged;
         *sockets=staged_sockets;
         Ok(())
+    }
+
+    /// The network receive path must validate the scheduler-supplied exact
+    /// owner epoch before frame parsing and UDP FIFO admission. A packet
+    /// cannot use a grant left behind by a retired or recycled PID.
+    /// This is a polled virtio-net guest path, not an IRQ/SMP hardware proof.
+    pub fn ingest_live_udp<const P:usize,const Q:usize>(
+        &self,sockets:&mut EpochUdpEndpoints<P,Q>,owner:Owner,port:u16,
+        frame:&[u8],mac:[u8;6]
+    )->Result<(),RetirementError>{
+        self.require_active(owner)?;
+        if !sockets.matches_registry(&self.udp){
+            return Err(RetirementError::Sockets(SocketError::Denied));
+        }
+        self.udp.authorize(owner.pid,owner.generation,port)
+            .map_err(RetirementError::Udp)?;
+        sockets.ingest_registered_frame(&self.udp,owner.pid,owner.generation,
+            port,frame,mac).map_err(RetirementError::Ingress)
+    }
+
+    /// Authenticated dequeue also requires the process to remain live.
+    /// A denied read must leave both the output and queued packets untouched.
+    pub fn receive_live_udp<const P:usize,const Q:usize>(
+        &self,sockets:&mut EpochUdpEndpoints<P,Q>,owner:Owner,port:u16,
+        out:&mut[u8]
+    )->Result<usize,RetirementError>{
+        self.require_active(owner)?;
+        if !sockets.matches_registry(&self.udp){
+            return Err(RetirementError::Sockets(SocketError::Denied));
+        }
+        sockets.receive_registered(&self.udp,owner.pid,owner.generation,port,out)
+            .map_err(RetirementError::Sockets)
     }
 
     pub fn retire_live_exited_batch<const P:usize,const Q:usize>(
@@ -434,5 +467,47 @@ mod r120_live_socket_integration_tests {
         assert_eq!(k.acknowledge_notice(event),Some(event.event));
         assert!(k.authorize_udp(a,7001).is_err());
         assert!(live.matches_registry(&k.udp));
+    }
+}
+
+#[cfg(test)]
+mod r120_polled_ingress_epoch_tests {
+    use super::*;
+
+    #[test]
+    fn stale_epoch_is_denied_before_frame_parse_or_queue_mutation(){
+        let mut k=ProcessRetirement::<2,2,3>::new();
+        let mut s=EpochUdpEndpoints::<2,3>::new();
+        let old=k.start(1).unwrap();
+        k.bind_live_udp(&mut s,old,6001).unwrap();
+        let stale=Owner{pid:old.pid,generation:old.generation+1};
+        let mut dest=[0x55u8;8];
+        assert_eq!(k.ingest_live_udp(&mut s,stale,6001,&[0u8;2],[0;6]),
+            Err(RetirementError::Capabilities(EpochError::NotActive)));
+        assert_eq!(k.receive_live_udp(&mut s,stale,6001,&mut dest),
+            Err(RetirementError::Capabilities(EpochError::NotActive)));
+        assert_eq!(dest,[0x55;8]);
+        assert_eq!(s.pending_owned(old.pid,old.generation),Ok(0));
+    }
+
+    #[test]
+    fn retired_udp_owner_cannot_reenter_network_queue_after_pid_recycle(){
+        let mut k=ProcessRetirement::<2,2,3>::new();
+        let mut s=EpochUdpEndpoints::<2,3>::new();
+        let first=k.start(1).unwrap();
+        k.bind_live_udp(&mut s,first,6001).unwrap();
+        k.retire_live_exited_batch(&mut s,&[first]).unwrap();
+        assert_eq!(k.ingest_live_udp(&mut s,first,6001,&[],[0;6]),
+            Err(RetirementError::Capabilities(EpochError::NotActive)));
+        let second=k.start(1).unwrap();
+        k.bind_live_udp(&mut s,second,6001).unwrap();
+        assert_eq!(k.ingest_live_udp(&mut s,first,6001,&[],[0;6]),
+            Err(RetirementError::Capabilities(EpochError::NotActive)));
+        assert!(matches!(
+            k.ingest_live_udp(&mut s,second,6001,&[],[0;6]),
+            Err(RetirementError::Ingress(IngressError::Malformed))
+        ));
+        assert_eq!(s.pending_owned(second.pid,second.generation),Ok(0));
+        assert!(s.matches_registry(&k.udp));
     }
 }

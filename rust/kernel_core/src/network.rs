@@ -264,8 +264,13 @@ pub fn run_demo<D:EthernetDevice>(
     // through the same registry/endpoint grant and validated owned ingress.
     // Synthetic PID1/epoch1 are trusted test fixtures, NOT user-supplied IDs.
     let mut udp_endpoints = EpochUdpEndpoints::<1, 2>::new();
-    let mut registry = crate::udp_owner_epoch::Registry::<1>::new();
-    udp_endpoints.bind_registered(&mut registry,1,1,CLIENT_PORT)
+    // R120: this physical QEMU virtio-net POLL path is owned by the same
+    // incarnation-aware coordinator that handles atomic process teardown.
+    // Do not treat a bare UDP grant as proof that the process remains alive.
+    let mut live_owners =
+        crate::process_retirement_txn::ProcessRetirement::<1,1,4>::new();
+    let network_owner=live_owners.start(1).map_err(|_|Error::Unexpected)?;
+    live_owners.bind_live_udp(&mut udp_endpoints,network_owner,CLIENT_PORT)
         .map_err(|_| Error::Unexpected)?;
     let route_owner=crate::batch5_session::Identity{pid:1,generation:1};
     let mut routes=crate::agent_06_ipv4_route::OwnerRoutes::<1>::new();
@@ -308,8 +313,8 @@ pub fn run_demo<D:EthernetDevice>(
         |b,mac|udp_frame(b,mac,PEER_UDP_PORT,UDP_REQ,0x2803))?;
     let ingress=|frame:&[u8],mac:[u8;6]|{
         parse_udp(frame,mac,PEER_UDP_PORT).is_ok_and(|data|data==UDP_RESP)
-            && udp_endpoints.ingest_registered_frame(
-                &registry,1,1,CLIENT_PORT,frame,mac).is_ok()
+            && live_owners.ingest_live_udp(&mut udp_endpoints,
+                network_owner,CLIENT_PORT,frame,mac).is_ok()
     };
     // Do not treat malformed network replies as successful failover evidence.
     // In the QEMU test the peer confirms packet reception but blackholes
@@ -340,8 +345,8 @@ pub fn run_demo<D:EthernetDevice>(
                 |b,mac|udp_frame(b,mac,PEER_UDP_PORT,UDP_REQ,0x2808))?;
             wait_for(dev,|frame,mac|{
                 parse_udp(frame,mac,PEER_UDP_PORT).is_ok_and(|data|data==UDP_RESP)
-                    && udp_endpoints.ingest_registered_frame(
-                &registry,1,1,CLIENT_PORT,frame,mac).is_ok()
+                    && live_owners.ingest_live_udp(&mut udp_endpoints,
+                network_owner,CLIENT_PORT,frame,mac).is_ok()
             })?;
             stage(b"IndianOS: R116 QEMU DHCP lease expiry blocked primary UDP resend and backup succeeded\n\0");
         },
@@ -350,7 +355,8 @@ pub fn run_demo<D:EthernetDevice>(
         _=>return Err(Error::Unexpected),
     }
     let mut udp_reply = [0u8; R033_UDP_BYTES];
-    let bytes = udp_endpoints.receive(1,1,CLIENT_PORT,&mut udp_reply)
+    let bytes = live_owners.receive_live_udp(&mut udp_endpoints,
+        network_owner,CLIENT_PORT,&mut udp_reply)
         .map_err(|_| Error::Unexpected)?;
     if &udp_reply[..bytes] != UDP_RESP { return Err(Error::Unexpected); }
     stage(b"IndianOS: R028 IPv4 UDP echo PASSED\n\0");
@@ -358,16 +364,21 @@ pub fn run_demo<D:EthernetDevice>(
         PEER_IP,||initial_clock+21,dns_query)?;
     wait_for(dev,|frame,mac|{
         valid_dns(frame,mac) &&
-            udp_endpoints.ingest_registered_frame(
-                &registry,1,1,CLIENT_PORT,frame,mac).is_ok()
+            live_owners.ingest_live_udp(&mut udp_endpoints,
+                network_owner,CLIENT_PORT,frame,mac).is_ok()
     })?;
     let mut dns_reply=[0u8;R033_UDP_BYTES];
-    let dns_bytes=udp_endpoints.receive(1,1,CLIENT_PORT,&mut dns_reply)
+    let dns_bytes=live_owners.receive_live_udp(&mut udp_endpoints,
+        network_owner,CLIENT_PORT,&mut dns_reply)
         .map_err(|_|Error::Unexpected)?;
     if dns_bytes<12 || dns_reply[..2]!=[0x28,0x28] ||
        dns_reply[2]&0x80==0{return Err(Error::Unexpected);}
-    udp_endpoints.retire_registered(&mut registry,1,1)
-        .map_err(|_|Error::Unexpected)?;
+    let retired=live_owners.retire_live_exited_batch(
+        &mut udp_endpoints,&[network_owner]).map_err(|_|Error::Unexpected)?;
+    if retired.udp_ports_released!=1 || retired.notices_enqueued!=1 ||
+        live_owners.active_generation(network_owner.pid).is_some(){
+        return Err(Error::Unexpected);
+    }
     routes.retire(route_owner,1).map_err(|_|Error::Unexpected)?;
     stage(b"IndianOS: R028 UDP DNS A query indianos.test PASSED\n\0");
     stage(b"IndianOS: M2 live NIC IPv4/UDP DNS verifier PASSED\n\0");

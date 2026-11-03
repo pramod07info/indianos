@@ -185,3 +185,21 @@ The added Rust `no_std` coordinator stages and atomically commits capabilities, 
 - **R120-025 source-implemented:** Real `network::EpochUdpEndpoints` now exposes an exact kernel registry consistency check; `ProcessRetirement` offers `bind_live_udp`, `retire_live_exited_batch` and `retire_live_faulted_batch` with copy/stage/commit atomicity across the real datagram queue, policy registry, capability epoch, and event FIFO. It checks exact PID-generation identity, prevents stale/foreign owner teardown, preserves peer messages, and denies divergent tables without mutations. Four added host regressions cover peer preservation, late stale members, full queue rollback, registry mismatch, and fault receipts. This new API is **not yet called from the production ring3 scheduler**; R120-056 remains open.
 - **R120-041 source-implemented:** The existing ring3 scheduler normal-exit and fault branch now selects precise `Exited` or `Faulted` event production. Rollback/retry paths still default to `Exited`; only authenticated completed faults produce `Faulted`. Existing real scheduler authority-retirement host test now checks fault receipt generation and replay safety. This does **not** qualify cross-core IPI delivery (R120-042).
 - Exact-head host unit tests, optimized `no_std`, QEMU, and independent review must rerun on the *new* head before merge. All R118/R119 physical and pending acceptance gates remain retained.
+
+## R120 polled virtio-net lifecycle ingress continuation
+
+The R028 QEMU `run_demo` kernel network path now obtains a generation-stamped
+owner from `ProcessRetirement` rather than constructing a standalone UDP
+registry. Its live UDP bind, polled receive ingress, read-back and retirement
+operations all run through coordinator APIs; the finished QEMU DNS/UDP test
+checks that the owner was retired and its grant was actually removed. Two Rust
+regressions reject fabricated/retired owners before frame parsing, prevent
+retired PID-grant reuse after restart, and preserve packet/output state.
+
+**Scope:** This is a genuine virtio-net *polled* guest receive path, not a
+production NIC interrupt handler. R120-026 (interrupt ingress ownership)
+therefore stays unchecked until an actual IRQ-driven path is wired and tested.
+R120-027 (two ring3 QEMU processes), R120-013/042 (SMP/IPI), and
+R120-014/056 (live scheduler coordinator integration) stay unchecked.
+Exact-head CI must be rerun on any resulting new commit. No physical hardware
+acceptance or independent human review is implied.
