@@ -274,6 +274,154 @@ static R131_FENCE:crate::smp_lifecycle_fence::LifecycleFence=
 #[cfg(feature="test-r118-ap-ack")]
 static R131_AP_DONE:core::sync::atomic::AtomicU32=
     core::sync::atomic::AtomicU32::new(0);
+#[cfg(all(feature="test-r118-ap-ack",target_arch="x86_64"))]
+#[no_mangle]
+pub static R132_AP_ISR:core::sync::atomic::AtomicU32=
+    core::sync::atomic::AtomicU32::new(0);
+#[cfg(feature="test-r118-ap-ack")]
+static R132_AP_READY:core::sync::atomic::AtomicU32=
+    core::sync::atomic::AtomicU32::new(0);
+#[cfg(feature="test-r118-ap-ack")]
+static R132_AP_DONE:core::sync::atomic::AtomicU32=
+    core::sync::atomic::AtomicU32::new(0);
+
+
+// Isolated R132 x2APIC fixed-vector IPI. This entry is never reached from
+// ordinary kernel boot: test-r118-ap-ack halts before PMM or user programs.
+// The handler is completely assembly-owned: save its clobbered registers,
+// atomically record actual interrupt execution, EOI to x2APIC, then IRETQ.
+// A shared-memory mailbox marker alone CANNOT make this handler run.
+#[cfg(all(feature="test-r118-ap-ack",target_arch="x86_64"))]
+core::arch::global_asm!(
+    ".global r132_ap_ipi_entry",
+    "r132_ap_ipi_entry:",
+    "push rax",
+    "push rcx",
+    "push rdx",
+    "lock inc dword ptr [rip + R132_AP_ISR]",
+    "mov ecx, 0x80b", // IA32_X2APIC_EOI
+    "xor eax, eax",
+    "xor edx, edx",
+    "wrmsr",
+    "pop rdx",
+    "pop rcx",
+    "pop rax",
+    "iretq",
+);
+#[cfg(feature="test-r118-ap-ack")]
+unsafe extern "C" {fn r132_ap_ipi_entry();}
+
+#[cfg(feature="test-r118-ap-ack")]
+#[repr(C,packed)]
+struct R132Idtr { limit:u16,base:u64 }
+#[cfg(feature="test-r118-ap-ack")]
+#[repr(C)]
+#[derive(Clone,Copy)]
+struct R132Gate {
+    offset_low:u16,selector:u16,ist:u8,attributes:u8,
+    offset_mid:u16,offset_high:u32,reserved:u32,
+}
+#[cfg(feature="test-r118-ap-ack")]
+impl R132Gate{
+    const EMPTY:Self=Self{offset_low:0,selector:0,ist:0,attributes:0,
+                           offset_mid:0,offset_high:0,reserved:0};
+    fn new(handler:u64,selector:u16)->Self{
+        Self{offset_low:handler as u16,selector,ist:0,attributes:0x8e,
+             offset_mid:(handler>>16) as u16,
+             offset_high:(handler>>32) as u32,reserved:0}
+    }
+}
+#[cfg(feature="test-r118-ap-ack")]
+#[repr(C,align(16))]
+struct R132Idt([R132Gate;256]);
+#[cfg(feature="test-r118-ap-ack")]
+static mut R132_AP_IDT:R132Idt=R132Idt([R132Gate::EMPTY;256]);
+
+#[cfg(feature="test-r118-ap-ack")]
+fn r132_has_x2apic()->bool{
+    (unsafe{core::arch::x86_64::__cpuid(1)}.ecx&(1<<21))!=0
+}
+#[cfg(feature="test-r118-ap-ack")]
+fn r132_rdmsr(reg:u32)->u64{
+    use core::arch::asm;
+    let lo:u32;let hi:u32;
+    unsafe{asm!("rdmsr",in("ecx")reg,out("eax")lo,out("edx")hi,
+                options(nostack,preserves_flags));}
+    ((hi as u64)<<32)|lo as u64
+}
+#[cfg(feature="test-r118-ap-ack")]
+fn r132_wrmsr(reg:u32,value:u64){
+    use core::arch::asm;
+    unsafe{asm!("wrmsr",in("ecx")reg,
+                in("eax")value as u32,in("edx")(value>>32) as u32,
+                options(nostack,preserves_flags));}
+}
+#[cfg(feature="test-r118-ap-ack")]
+fn r132_enable_x2apic()->bool{
+    // IA32_APIC_BASE global-enable is mandatory. Only the isolated
+    // QEMU opt-in test changes CPU-local APIC mode. Production does not.
+    if !r132_has_x2apic(){return false;}
+    let base=r132_rdmsr(0x1b);
+    if base&(1<<11)==0{return false;}
+    if base&(1<<10)==0{r132_wrmsr(0x1b,base|(1<<10));}
+    if r132_rdmsr(0x1b)&(1<<10)==0{return false;}
+    // Enable local APIC software mode with a legal spurious IRQ vector.
+    let svr=r132_rdmsr(0x80f);
+    r132_wrmsr(0x80f,(svr&!0xff)|0x1ff);
+    true
+}
+#[cfg(feature="test-r118-ap-ack")]
+fn r132_ap_listen_for_ipi()->bool{
+    use core::{arch::asm,mem::size_of,sync::atomic::Ordering};
+    if !r132_enable_x2apic(){return false;}
+    let cs:u16;
+    unsafe{asm!("mov {sel:x}, cs",sel=out(reg)cs,
+                options(nomem,nostack,preserves_flags));}
+    if cs==0{return false;}
+    let entry=r132_ap_ipi_entry as usize as u64;
+    unsafe{ptr::write_volatile(
+        ptr::addr_of_mut!(R132_AP_IDT.0).cast::<R132Gate>().add(0xf1),
+        R132Gate::new(entry,cs)
+    );}
+    let idtr=R132Idtr{
+        limit:(256*size_of::<R132Gate>()-1) as u16,
+        base:ptr::addr_of!(R132_AP_IDT.0) as usize as u64,
+    };
+    unsafe{asm!("lidt [{p}]",p=in(reg)&idtr,
+                options(readonly,nostack,preserves_flags));}
+    R132_AP_READY.store(1,Ordering::Release);
+    for _ in 0..10_000_000u32{
+        if R132_AP_ISR.load(Ordering::Acquire)==1{
+            unsafe{asm!("cli",options(nomem,nostack));}
+            R132_AP_DONE.store(1,Ordering::Release);
+            return true;
+        }
+        // STI + HLT has no lost wake when BSP sends before STI: x86
+        // interrupt shadow makes pending IPIs wake the subsequent HLT.
+        unsafe{asm!("sti; hlt",options(nomem,nostack));}
+    }
+    false
+}
+#[cfg(feature="test-r118-ap-ack")]
+fn r132_bsp_send_and_confirm()->bool{
+    use core::sync::atomic::Ordering;
+    for _ in 0..50_000_000u32{
+        if R132_AP_READY.load(Ordering::Acquire)==1{break;}
+        core::hint::spin_loop();
+    }
+    if R132_AP_READY.load(Ordering::Acquire)!=1 ||
+       !r132_enable_x2apic(){return false;}
+    // ICR[63:32] is destination x2APIC ID; low byte is fixed vector.
+    // Only the validated QEMU APIC ID 1 is addressed, never broadcasts.
+    r132_wrmsr(0x830,(1u64<<32)|0xf1);
+    for _ in 0..50_000_000u32{
+        if R132_AP_DONE.load(Ordering::Acquire)==1{
+            return R132_AP_ISR.load(Ordering::Acquire)==1;
+        }
+        core::hint::spin_loop();
+    }
+    false
+}
 
 #[cfg(feature="test-r118-ap-ack")]
 extern "C" fn r126_secondary_cpu_entry(info:*mut MpInfo)->!{
@@ -319,6 +467,9 @@ extern "C" fn r126_secondary_cpu_entry(info:*mut MpInfo)->!{
                     if !got{break;}
                 }
                 R131_AP_DONE.store(seen as u32,Ordering::Release);
+                if seen==64 {
+                    let _=r132_ap_listen_for_ipi();
+                }
             }
         }
     }
@@ -351,6 +502,9 @@ pub(crate) fn launch_one_parked_qemu_ap()->bool{
     R127_AP_DENIALS.store(0,Ordering::Release);
     R127_BSP_ADMISSIONS.store(0,Ordering::Release);
     R131_AP_DONE.store(0,Ordering::Release);
+    R132_AP_READY.store(0,Ordering::Release);
+    R132_AP_DONE.store(0,Ordering::Release);
+    R132_AP_ISR.store(0,Ordering::Release);
     fence(Ordering::Release);
     // The canonical Limine protocol wakes the AP only AFTER the BSP
     // publishes goto_address. No normal boot, userland or IRQ is enabled.
@@ -391,7 +545,9 @@ pub(crate) fn launch_one_parked_qemu_ap()->bool{
         if !acknowledged{return false;}
     }
     for _ in 0..50_000_000u32{
-        if R131_AP_DONE.load(Ordering::Acquire)==64{return true;}
+        if R131_AP_DONE.load(Ordering::Acquire)==64{
+            return r132_bsp_send_and_confirm();
+        }
         core::hint::spin_loop();
     }
     false

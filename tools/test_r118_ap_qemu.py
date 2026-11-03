@@ -17,6 +17,7 @@ MARKERS=(
     "IndianOS: R126 QEMU secondary AP executed Rust and acknowledged BSP",
     "IndianOS: R127 QEMU real AP denied BSP retirement gate 8192 times",
     "IndianOS: R131 QEMU 64 ordered cross-CPU lifecycle receipts acknowledged",
+    "IndianOS: R132 QEMU real x2APIC fixed-vector IPI delivered and EOI acknowledged",
 )
 
 def main():
@@ -28,7 +29,7 @@ def main():
     if not a.iso.is_file() or not a.ovmf.is_file():
         p.error("missing exact QEMU ISO/OVMF artifact")
     command=[
-        a.qemu,"-machine","pc","-m","256M","-smp","2",
+        a.qemu,"-machine","pc","-cpu","max","-m","256M","-smp","2",
         "-display","none","-monitor","none","-serial","stdio",
         "-no-reboot","-boot","d",
         "-drive",f"if=pflash,format=raw,readonly=on,file={a.ovmf.resolve()}",
