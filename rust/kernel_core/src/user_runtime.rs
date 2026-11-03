@@ -87,6 +87,36 @@ static mut R115_UDP_OWNERS:crate::udp_owner_epoch::Registry<2>=
 #[cfg(feature="test-r031-files-gui")]
 static mut R120_RETIREMENT:crate::process_retirement_txn::ProcessRetirement<2,2,16>=
     crate::process_retirement_txn::ProcessRetirement::new();
+#[cfg(feature="test-r031-files-gui")]
+static R120_GATE:crate::retirement_gate::RetirementGate=
+    crate::retirement_gate::RetirementGate::new();
+#[cfg(feature="test-r031-files-gui")]
+fn r120_cpu_id()->u32{(unsafe{core::arch::x86_64::__cpuid(1)}.ebx>>24)&255}
+#[cfg(feature="test-r031-files-gui")]
+fn r120_masked()->bool{
+    #[cfg(test)]{true}
+    #[cfg(not(test))]{
+        let flags:u64;
+        unsafe{asm!("pushfq; pop {}",out(reg)flags,options(nomem,preserves_flags));}
+        flags&(1<<9)==0
+    }
+}
+#[cfg(feature="test-r031-files-gui")]
+fn r120_setup()->bool{
+    R120_GATE.register_bsp(r120_cpu_id(),r120_masked()).is_ok()
+}
+#[cfg(feature="test-r031-files-gui")]
+fn r120_enter()->Result<crate::retirement_gate::Permit<'static>,
+                       crate::retirement_gate::GateError>{
+    #[cfg(test)]{let _=r120_setup();}
+    R120_GATE.try_enter(r120_cpu_id(),r120_masked())
+}
+#[cfg(feature="test-r031-files-gui")]
+fn r120_halt()->!{
+    log(b"IndianOS: FATAL R120 retirement contention, no frame reclamation\n\0");
+    #[cfg(test)]panic!("R120 retirement gate/transaction refused");
+    #[cfg(not(test))]loop{unsafe{asm!("cli; hlt",options(nomem,nostack));}}
+}
 // R116: trusted kernel issues PID2 a narrow read-only directory lease only
 // after both process incarnations have been authenticated by FileHandles.
 #[cfg(feature="test-r031-files-gui")]
@@ -909,6 +939,7 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
      unsafe{indianos_user_can_write(&*img,address,count)}=>{},
     _=>return BAD
    }
+   let Ok(_permit)=r120_enter()else{return BAD;};
    let socket=unsafe{&mut *ptr::addr_of_mut!(R114_LOCAL_UDP)};
    let coordinator=unsafe{&mut *ptr::addr_of_mut!(R120_RETIREMENT)};
    let live=crate::process_retirement_txn::Owner{
@@ -1270,6 +1301,7 @@ fn prepare(t:*mut Task,p:*mut Process,elf:*const u8,size:usize,original:u64,
    let live=crate::process_retirement_txn::Owner{
      pid:owner.pid,generation:owner.generation
    };
+   let Ok(_permit)=r120_enter()else{return false;};
    if unsafe{(&mut *ptr::addr_of_mut!(R120_RETIREMENT))}
       .start_exact(live).is_err(){return false;}
    if owner.pid==2 && !r116_prepare_shared_directory_lease(owner){
@@ -1391,6 +1423,7 @@ fn revoke_task_authority_with_kind(
     // Mandatory exact-incarnation revocation on ordinary exit, fault and
     // rollback. Network grants are retired before FileHandles, while the
     // scheduler owns the only BSP mutator; no nested lock acquisition.
+    let _permit=r120_enter().unwrap_or_else(|_|r120_halt());
     let sockets=unsafe{&mut *ptr::addr_of_mut!(R114_LOCAL_UDP)};
     let coordinator=unsafe{&mut *ptr::addr_of_mut!(R120_RETIREMENT)};
     let live=crate::process_retirement_txn::Owner{
@@ -1404,6 +1437,7 @@ fn revoke_task_authority_with_kind(
       };
       if result.is_err(){
         log(b"IndianOS: FATAL R120 atomic scheduler UDP retirement failed\n\0");
+        r120_halt();
       }else{
         // PID1 user-visible lifecycle events are delivered by the existing
         // FileHandles-authenticated queue above. Drain the internal policy
@@ -1418,6 +1452,7 @@ fn revoke_task_authority_with_kind(
       let registry=unsafe{&mut *ptr::addr_of_mut!(R115_UDP_OWNERS)};
       if sockets.retire_exact_kernel(registry,owner.pid,owner.generation).is_err(){
         log(b"IndianOS: FATAL R118 legacy UDP retirement failed\n\0");
+        r120_halt();
       }
     }else{
       // A delayed task for the same PID must not remove a new incarnation.
@@ -1438,6 +1473,7 @@ fn revoke_task_authority_with_kind(
            .permits_shared_directory(owner);
      // Independent post-condition: neither the real queue nor the
      // generation-bound policy may retain this incarnation after cleanup.
+     let _permit=r120_enter().unwrap_or_else(|_|r120_halt());
      let port_gone=unsafe{(&*ptr::addr_of!(R114_LOCAL_UDP))}
         .pending_owned(owner.pid,owner.generation).is_err() &&
         unsafe{(&*ptr::addr_of!(R120_RETIREMENT))}
@@ -1530,6 +1566,8 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
  if first.is_null()||second.is_null()||!active_image().is_null()||
     !active_task().is_null(){return false;}
  let Some((cpu,offset))=preflight()else{return false;};
+ #[cfg(feature="test-r031-files-gui")]
+ if !r120_setup(){log(b"IndianOS: R120 denied unsafe CPU/IRQ scheduler entry\n\0");return false;}
  let mut direct=DirectMap{offset};
  let vmm=vmm_backend(&mut direct);
  let backend=clone_backend(&mut direct);
@@ -1854,6 +1892,7 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
    // PID2 UDP PING/PONG + forged foreign-close denial before this terminal
    // state. Validate both trusted incarnations have lost *all* authority
    // and the real socket queue agrees with its policy registry.
+   let _permit=r120_enter().unwrap_or_else(|_|r120_halt());
    let coordinator=unsafe{&*ptr::addr_of!(R120_RETIREMENT)};
    let sockets=unsafe{&*ptr::addr_of!(R114_LOCAL_UDP)};
    let handles=unsafe{&*ptr::addr_of!(R031_HANDLES)};
@@ -1938,6 +1977,7 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
    R115_UDP_OWNERS=crate::udp_owner_epoch::Registry::new();
    R116_SHARED_LEASES=crate::agent_03_cap_epoch::LeaseTable::new();
    R120_RETIREMENT=crate::process_retirement_txn::ProcessRetirement::new();
+   assert!(r120_setup());
    // Raw pointers are converted to short-lived exclusive borrows only for
    // each operation; teardown itself re-enters these same kernel globals.
    let table=ptr::addr_of_mut!(R031_HANDLES);
