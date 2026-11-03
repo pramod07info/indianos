@@ -23,6 +23,8 @@ REQUIRED = (
     "runtime-qemu",
     "combined-regression",
     "durable-files-desktop",
+    "m2-native-and-guest",
+    "orbit-ui-preview",
     "Adversarial FS, signatures and no_std security regression",
     "Build ELF + ISO and verify serial boot",
 )

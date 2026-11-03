@@ -85,6 +85,16 @@ class ReleaseGateTests(unittest.TestCase):
         self.assertEqual(exit_code, 1)
         self.assertFalse(result["independent_approved"])
 
+    def test_m2_and_orbit_real_guest_jobs_are_mandatory(self):
+        self.assertIn("m2-native-and-guest",gate.REQUIRED)
+        self.assertIn("orbit-ui-preview",gate.REQUIRED)
+        for missing in ("m2-native-and-guest","orbit-ui-preview"):
+            checks=[name for name in gate.REQUIRED if name!=missing]
+            exit_code,result=self.invoke(evidence(checks=checks))
+            self.assertEqual(exit_code,1)
+            self.assertEqual(result["required_checks"][missing],"not-success")
+            self.assertFalse(result["ready"])
+
     def test_missing_branch_protection_denies_release(self):
         exit_code, result = self.invoke(evidence(protection={}))
         self.assertEqual(exit_code, 1)
