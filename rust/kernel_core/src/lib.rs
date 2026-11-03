@@ -110,6 +110,7 @@ pub mod process_events;
 /// Bounded atomic exit/fault retirement across three kernel-local policy tables.
 /// Scheduler, socket table, IRQ and SMP integration remain separately gated.
 pub mod process_retirement_txn;
+pub mod retirement_gate;
 // M1: authenticated ring3-service policy using the already implemented
 // checksummed, sector-backed HierVfs; host remount integration acceptance.
 // Does not enable formatting or physical-device access in ordinary boot.
