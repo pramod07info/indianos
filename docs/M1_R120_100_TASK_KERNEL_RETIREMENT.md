@@ -23,7 +23,7 @@ The added Rust `no_std` coordinator stages and atomically commits capabilities, 
 - [x] R120-011 — Keep grant rights enforcement
 - [x] R120-012 — Handle capability table capacity limits
 - [ ] R120-013 — Prevent lock-free access across cores
-- [ ] R120-014 — Wire lifecycle authority to live scheduler
+- [x] R120-014 — Wire lifecycle authority to live scheduler
 
 ### Workstream 2 — Generation-owned UDP policy
 
@@ -74,7 +74,7 @@ The added Rust `no_std` coordinator stages and atomically commits capabilities, 
 - [x] R120-053 — Rollback on late stale owner
 - [x] R120-054 — Rollback on stale UDP grant
 - [x] R120-055 — Rollback on event queue backpressure
-- [ ] R120-056 — Connect coordinator to production kernel scheduler
+- [x] R120-056 — Connect coordinator to production kernel scheduler
 
 ### Workstream 5 — CI, delivery and hardware gates
 
@@ -172,7 +172,7 @@ The added Rust `no_std` coordinator stages and atomically commits capabilities, 
 
 ## Acceptance and explicit limitations
 
-- New source-scoped R120 checks: **59/70**, remaining **11/70**. These are granular API or regression acceptance items, not 57 separately deployable OS features.
+- New source-scoped R120 checks: **61/70**, remaining **9/70**. These are granular API or regression acceptance items, not 57 separately deployable OS features.
 - Inherited R118 hardware/CI/review gates: **0/51 validated here**; merged PR #754 also retained 15 R119 acceptance tasks that require live integration or evidence.
 - Added Rust tests: six coordinator tests and two fault-receipt tests; they must pass CI on the exact PR head.
 - Required release matrix: host Rust suite, optimized freestanding `no_std`, two-boot persistent graphical Files QEMU, ring3 two-process UDP QEMU, boot ELF/ISO, and independent kernel/security review. Verify checks against the exact final SHA and merge only when project policy allows.
@@ -203,3 +203,10 @@ R120-027 (two ring3 QEMU processes), R120-013/042 (SMP/IPI), and
 R120-014/056 (live scheduler coordinator integration) stay unchecked.
 Exact-head CI must be rerun on any resulting new commit. No physical hardware
 acceptance or independent human review is implied.
+
+## R120 live scheduler integration implementation
+
+- **R120-014:** the privileged `user_runtime::prepare` path now registers the exact generation already minted by `FileHandles::bind_process` into the process-retirement policy. The globally monotonic filesystem generation must never be approximated by a per-PID counter; stale or repeated registrations are denied.
+- **R120-056:** the existing ring-3 syscall 36 bind/send/receive/close operations now use the same actual `ProcessRetirement` coordinator and real `EpochUdpEndpoints` socket table. Exact authenticated scheduler exit and fault paths retire those registered incarnations transactionally before file-handle and page-table reclamation. An old delayed task cannot revoke a newer generation. Retiring policy receipts are separately drained; the preexisting FileHandles-authenticated PID1 notification queue is retained for userspace ABI compatibility.
+- Added generation allocator tests and live socket close/send/peer preservation tests. The test-created legacy registry fallback is only for synthetic host fixtures that do not register a coordinator owner; it is not the production ring-3 syscall path.
+- **Not evidence of SMP lock exclusion:** This runtime remains single-BSP; IRQ/SMP/physical hardware and actual multicore scheduler gates remain open. QEMU and no_std must pass at the final SHA before merging.

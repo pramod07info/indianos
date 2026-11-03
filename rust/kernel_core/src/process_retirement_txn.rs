@@ -57,6 +57,15 @@ impl<const C: usize, const U: usize, const E: usize> ProcessRetirement<C, U, E> 
         Ok(Owner { pid, generation })
     }
 
+    /// Trust only the generation already bound by the privileged live PCB
+    /// and FileHandles service; never derive it from ring-3 syscall fields.
+    pub fn start_exact(&mut self, owner: Owner)
+        -> Result<(), RetirementError>
+    {
+        self.capabilities.start_exact(owner.pid,owner.generation)
+            .map_err(RetirementError::Capabilities)
+    }
+
     pub fn active_generation(&self, pid: u32) -> Option<u64> {
         self.capabilities.active_generation(pid)
     }
@@ -159,6 +168,45 @@ impl<const C: usize, const U: usize, const E: usize> ProcessRetirement<C, U, E> 
             return Err(RetirementError::Sockets(SocketError::Denied));
         }
         sockets.receive_registered(&self.udp,owner.pid,owner.generation,port,out)
+            .map_err(RetirementError::Sockets)
+    }
+
+    /// R120 ring-3 syscall: paired close is a transaction across policy and
+    /// the real socket endpoint / pending receive queue.
+    pub fn close_live_udp<const P:usize,const Q:usize>(
+        &mut self,sockets:&mut EpochUdpEndpoints<P,Q>,
+        owner:Owner,port:u16
+    )->Result<(),RetirementError>{
+        self.require_active(owner)?;
+        if !sockets.matches_registry(&self.udp){
+            return Err(RetirementError::Sockets(SocketError::Denied));
+        }
+        let mut staged=self.clone();
+        let mut staged_sockets=sockets.clone();
+        staged.udp.unbind(owner.pid,owner.generation,port)
+            .map_err(RetirementError::Udp)?;
+        staged_sockets.close(owner.pid,owner.generation,port)
+            .map_err(RetirementError::Sockets)?;
+        if !staged_sockets.matches_registry(&staged.udp){
+            return Err(RetirementError::Sockets(SocketError::Denied));
+        }
+        *self=staged; *sockets=staged_sockets;
+        Ok(())
+    }
+
+    /// R120 ring-3 syscall: sender port must belong to the exact live epoch,
+    /// with matching capability generation and registered endpoint state.
+    pub fn send_live_udp<const P:usize,const Q:usize>(
+        &self,sockets:&mut EpochUdpEndpoints<P,Q>,owner:Owner,
+        source:u16,destination:u16,data:&[u8]
+    )->Result<(),RetirementError>{
+        self.require_active(owner)?;
+        if !sockets.matches_registry(&self.udp){
+            return Err(RetirementError::Sockets(SocketError::Denied));
+        }
+        self.udp.authorize(owner.pid,owner.generation,source)
+            .map_err(RetirementError::Udp)?;
+        sockets.send_local(owner.pid,owner.generation,source,destination,data)
             .map_err(RetirementError::Sockets)
     }
 
@@ -508,6 +556,54 @@ mod r120_polled_ingress_epoch_tests {
             Err(RetirementError::Ingress(IngressError::Malformed))
         ));
         assert_eq!(s.pending_owned(second.pid,second.generation),Ok(0));
+        assert!(s.matches_registry(&k.udp));
+    }
+}
+
+/// R120: real-socket lifetime and generation closure regression.
+#[cfg(test)]
+mod r120_scheduler_network_boundary_tests{
+    use super::*;
+    #[test]fn global_file_generation_can_drive_scheduler_socket_lifecycle(){
+        let mut k=ProcessRetirement::<2,2,4>::new();
+        let mut s=EpochUdpEndpoints::<2,4>::new();
+        let a=Owner{pid:1,generation:1};
+        let b=Owner{pid:2,generation:2};
+        k.start_exact(a).unwrap();k.start_exact(b).unwrap();
+        k.bind_live_udp(&mut s,a,5501).unwrap();
+        k.bind_live_udp(&mut s,b,5502).unwrap();
+        assert_eq!(k.send_live_udp(&mut s,a,5501,5502,b"ping"),Ok(()));
+        let mut out=[0u8;8];
+        assert_eq!(k.receive_live_udp(&mut s,b,5502,&mut out),Ok(4));
+        assert_eq!(&out[..4],b"ping");
+        assert_eq!(k.send_live_udp(&mut s,b,5501,5502,b"forge"),
+            Err(RetirementError::Udp(UdpError::Denied)));
+        assert_eq!(k.close_live_udp(&mut s,a,5501),Ok(()));
+        assert!(k.authorize_udp(a,5501).is_err());
+        assert!(s.matches_registry(&k.udp));
+        assert_eq!(k.retire_live_faulted_batch(&mut s,&[b]).unwrap().notices_enqueued,1);
+        assert_eq!(k.peek_notice().unwrap().event.kind,EventKind::Faulted);
+        let next=Owner{pid:2,generation:4};
+        k.start_exact(next).unwrap();
+        assert_eq!(k.close_live_udp(&mut s,b,5502),
+            Err(RetirementError::Capabilities(EpochError::NotActive)));
+        k.bind_live_udp(&mut s,next,5502).unwrap();
+        assert_eq!(s.pending_owned(next.pid,next.generation),Ok(0));
+    }
+
+    #[test]fn stale_or_foreign_close_cannot_discard_peers_pending_packet(){
+        let mut k=ProcessRetirement::<2,2,4>::new();
+        let mut s=EpochUdpEndpoints::<2,4>::new();
+        let a=k.start(1).unwrap();let b=k.start(2).unwrap();
+        k.bind_live_udp(&mut s,a,6001).unwrap();
+        k.bind_live_udp(&mut s,b,6002).unwrap();
+        k.send_live_udp(&mut s,a,6001,6002,b"still here").unwrap();
+        assert!(k.close_live_udp(&mut s,a,6002).is_err());
+        assert_eq!(s.pending_owned(b.pid,b.generation),Ok(1));
+        assert!(k.close_live_udp(&mut s,Owner{pid:2,generation:2},6002).is_err());
+        let mut out=[0u8;16];
+        assert_eq!(k.receive_live_udp(&mut s,b,6002,&mut out),Ok(10));
+        assert_eq!(&out[..10],b"still here");
         assert!(s.matches_registry(&k.udp));
     }
 }
