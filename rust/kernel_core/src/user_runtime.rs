@@ -1438,11 +1438,104 @@ fn retire_file_owner_epoch<const E:usize>(
     Ok(true)
 }
 
-/// R118-009/073: all five kernel-owned retirement stores are staged before
-/// publishing ANY change. The scheduler holds its one-BSP non-spinning gate
-/// across this function, so a full event queue, stale file owner, inconsistent
-/// socket registry or exhausted policy sequence leaves every live table
-/// untouched. This is not an SMP/IPI implementation.
+/// R118-009/027/073: a bounded, fail-atomic single-BSP transaction for
+/// multiple authenticated process incarnations. The real scheduler retains
+/// the non-spinning R120_GATE permit throughout staging and publication.
+/// This does not implement physical APIC/IPI/SMP coordination.
+#[cfg(feature="test-r031-files-gui")]
+fn retire_full_owner_batch<
+    const C:usize,const U:usize,const K:usize,
+    const P:usize,const Q:usize,const E:usize,const L:usize
+>(
+    files:&mut crate::fs_handles::FileHandles,
+    events:&mut crate::process_events::ProcessEvents<E>,
+    coordinator:&mut crate::process_retirement_txn::ProcessRetirement<C,U,K>,
+    sockets:&mut crate::network::EpochUdpEndpoints<P,Q>,
+    leases:&mut crate::agent_03_cap_epoch::LeaseTable<L>,
+    owners:&[crate::batch5_session::Identity],
+    kind:crate::process_events::EventKind,
+)->Result<usize,()> {
+    use crate::process_events::EventKind;
+    if owners.is_empty(){return Ok(0);}
+    if owners.len()>2 || !matches!(kind,EventKind::Exited|EventKind::Faulted){
+        return Err(());
+    }
+    // Authenticate the WHOLE batch before taking any mutable live access.
+    // One stale or duplicate PID must not revoke a valid earlier member.
+    for (index,owner) in owners.iter().enumerate(){
+        if owner.pid==0 || owner.generation==0 ||
+           owners[..index].iter().any(|previous|previous.pid==owner.pid) ||
+           !files.owns(*owner) ||
+           coordinator.active_generation(owner.pid)!=Some(owner.generation) {
+            return Err(());
+        }
+    }
+
+    let mut candidate_files=files.staged_copy_kernel();
+    let mut candidate_events=events.clone();
+    let mut candidate_coordinator=coordinator.clone();
+    let mut candidate_sockets=sockets.clone();
+    let mut candidate_leases=*leases;
+    let mut policy_owners=[crate::process_retirement_txn::Owner{
+        pid:0,generation:0
+    };2];
+    let mut lease_owners=[(0u32,0u64);2];
+    for (index,owner) in owners.iter().enumerate(){
+        policy_owners[index]=crate::process_retirement_txn::Owner{
+            pid:owner.pid,generation:owner.generation
+        };
+        lease_owners[index]=(owner.pid,owner.generation);
+        match kind{
+            EventKind::Exited=>
+                candidate_events.enqueue_exit_once(owner.pid,owner.generation),
+            EventKind::Faulted=>
+                candidate_events.enqueue_fault_once(owner.pid,owner.generation),
+            _=>return Err(()),
+        }.map_err(|_|())?;
+    }
+    if candidate_files.retire_process_batch_kernel(owners)!=Ok(owners.len()){
+        return Err(());
+    }
+    let identities=&policy_owners[..owners.len()];
+    match kind{
+        EventKind::Exited=>candidate_coordinator.retire_live_exited_batch(
+            &mut candidate_sockets,identities),
+        EventKind::Faulted=>candidate_coordinator.retire_live_faulted_batch(
+            &mut candidate_sockets,identities),
+        _=>return Err(()),
+    }.map_err(|_|())?;
+    candidate_leases.revoke_identity_batch_kernel(
+        &lease_owners[..owners.len()]).map_err(|_|())?;
+
+    // Internal policy notices are not the user-visible PID1 queue. Drain
+    // only AFTER all live/public event notices have been staged successfully.
+    while let Some(receipt)=candidate_coordinator.peek_notice(){
+        if candidate_coordinator.acknowledge_notice(receipt).is_none(){
+            return Err(());
+        }
+    }
+    if !candidate_coordinator.live_sockets_consistent(&candidate_sockets){
+        return Err(());
+    }
+    for owner in owners{
+        if candidate_files.owns(*owner) ||
+           candidate_coordinator.active_generation(owner.pid).is_some() ||
+           candidate_sockets.pending_owned(owner.pid,owner.generation).is_ok(){
+            return Err(());
+        }
+    }
+    // No fallible operation follows. The original tables cannot be observed
+    // by an untrusted peer while the scheduler's BSP/IRQ permit is held.
+    *files=candidate_files;
+    *events=candidate_events;
+    *coordinator=candidate_coordinator;
+    *sockets=candidate_sockets;
+    *leases=candidate_leases;
+    Ok(owners.len())
+}
+
+/// Live scheduler single-owner convenience path, backed by the same
+/// multi-incarnation transaction as supervisor batch retirement.
 #[cfg(feature="test-r031-files-gui")]
 fn retire_full_owner_epoch<
     const C:usize,const U:usize,const K:usize,
@@ -1456,60 +1549,12 @@ fn retire_full_owner_epoch<
     owner:crate::batch5_session::Identity,
     kind:crate::process_events::EventKind,
 )->Result<bool,()> {
+    // A delayed scheduler task with a retired incarnation must never
+    // remove a newer PID's network rights or emit a duplicate event.
     if !files.owns(owner){return Ok(false);}
-    if coordinator.active_generation(owner.pid)!=Some(owner.generation) {
-        return Err(());
-    }
-    let mut candidate_files=files.staged_copy_kernel();
-    let mut candidate_events=events.clone();
-    let mut candidate_coordinator=coordinator.clone();
-    let mut candidate_sockets=sockets.clone();
-    let mut candidate_leases=*leases;
-
-    match kind {
-        crate::process_events::EventKind::Exited =>
-            candidate_events.enqueue_exit_once(owner.pid,owner.generation),
-        crate::process_events::EventKind::Faulted =>
-            candidate_events.enqueue_fault_once(owner.pid,owner.generation),
-        _=>return Err(()),
-    }.map_err(|_|())?;
-    if candidate_files.retire_process_batch_kernel(&[owner])!=Ok(1){
-        return Err(());
-    }
-    let retired=crate::process_retirement_txn::Owner{
-        pid:owner.pid,generation:owner.generation,
-    };
-    match kind {
-        crate::process_events::EventKind::Exited =>
-            candidate_coordinator.retire_live_exited_batch(
-                &mut candidate_sockets,&[retired]),
-        crate::process_events::EventKind::Faulted =>
-            candidate_coordinator.retire_live_faulted_batch(
-                &mut candidate_sockets,&[retired]),
-        _=>return Err(()),
-    }.map_err(|_|())?;
-    candidate_leases.revoke_identity(owner.pid,owner.generation);
-    // Clear the internal coordinator notification queue without changing the
-    // externally visible PID1 lifecycle receipts already staged above.
-    while let Some(receipt)=candidate_coordinator.peek_notice() {
-        if candidate_coordinator.acknowledge_notice(receipt).is_none(){
-            return Err(());
-        }
-    }
-    if candidate_files.owns(owner) ||
-       candidate_coordinator.active_generation(owner.pid).is_some() ||
-       !candidate_coordinator.live_sockets_consistent(&candidate_sockets) ||
-       candidate_sockets.pending_owned(owner.pid,owner.generation).is_ok(){
-        return Err(());
-    }
-    // Publication is one bounded, nonblocking BSP critical section. No
-    // fallible operation remains after this point.
-    *files=candidate_files;
-    *events=candidate_events;
-    *coordinator=candidate_coordinator;
-    *sockets=candidate_sockets;
-    *leases=candidate_leases;
-    Ok(true)
+    retire_full_owner_batch(
+        files,events,coordinator,sockets,leases,&[owner],kind
+    ).map(|count|count==1)
 }
 
 #[cfg(feature="test-r031-vfs")]
@@ -2617,5 +2662,87 @@ mod r118_full_owner_retirement_integration_tests {
             &mut coordinator,&mut sockets,&mut leases,owner,
             EventKind::Faulted),Ok(false));
         assert!(files.owns(next));
+    }
+}
+
+#[cfg(all(test,feature="test-r031-files-gui"))]
+mod r118_batched_real_scheduler_teardown_tests{
+    use super::*;
+    use crate::batch5_session::Identity;
+    use crate::fs_handles::FileHandles;
+    use crate::process_events::{EventKind,ProcessEvents};
+    use crate::process_retirement_txn::{Owner,ProcessRetirement};
+    use crate::network::EpochUdpEndpoints;
+    use crate::agent_03_cap_epoch::LeaseTable;
+
+    fn setup()->(
+        FileHandles,ProcessRetirement<2,2,4>,
+        EpochUdpEndpoints<2,4>,LeaseTable<2>,[Identity;2]
+    ){
+        let mut files=FileHandles::new();
+        let a=files.bind_process(1).unwrap();
+        let b=files.bind_process(2).unwrap();
+        let mut c=ProcessRetirement::<2,2,4>::new();
+        c.start_exact(Owner{pid:a.pid,generation:a.generation}).unwrap();
+        c.start_exact(Owner{pid:b.pid,generation:b.generation}).unwrap();
+        let mut sockets=EpochUdpEndpoints::<2,4>::new();
+        c.bind_live_udp(&mut sockets,
+            Owner{pid:a.pid,generation:a.generation},5501).unwrap();
+        c.bind_live_udp(&mut sockets,
+            Owner{pid:b.pid,generation:b.generation},5502).unwrap();
+        (files,c,sockets,LeaseTable::<2>::new(),[a,b])
+    }
+    #[test]
+    fn two_live_ring3_incarnations_retire_as_one_with_ordered_pid1_events(){
+        let (mut files,mut coordinator,mut sockets,mut leases,owners)=setup();
+        let mut notices=ProcessEvents::<3>::new();
+        let receipt=files.selected_operation_guard(owners[1]).unwrap();
+        assert_eq!(retire_full_owner_batch(
+            &mut files,&mut notices,&mut coordinator,&mut sockets,
+            &mut leases,&[owners[1],owners[0]],EventKind::Faulted),Ok(2));
+        assert!(!files.owns(owners[0]) && !files.owns(owners[1]));
+        assert!(!files.selected_operation_guard_is_current(receipt));
+        assert!(coordinator.live_sockets_consistent(&sockets));
+        assert_eq!(coordinator.active_udp_ports(),0);
+        assert_eq!(coordinator.queued_notices(),0);
+        assert_eq!(notices.len(),2);
+        for expected in [owners[1],owners[0]]{
+            let token=notices.peek_receipt().unwrap();
+            assert_eq!(token.event.pid,expected.pid);
+            assert_eq!(token.event.value,expected.generation);
+            assert_eq!(token.event.kind,EventKind::Faulted);
+            assert_eq!(notices.acknowledge_receipt(token),Some(token.event));
+        }
+    }
+    #[test]
+    fn late_stale_or_duplicate_owner_does_not_retire_any_live_peer(){
+        let (mut files,mut coordinator,mut sockets,mut leases,owners)=setup();
+        let mut notices=ProcessEvents::<2>::new();
+        let stale=Identity{generation:owners[1].generation+1,..owners[1]};
+        for batch in [
+            [owners[0],stale],
+            [owners[0],owners[0]],
+            [Identity{pid:0,..owners[0]},owners[1]],
+        ]{
+            assert_eq!(retire_full_owner_batch(
+                &mut files,&mut notices,&mut coordinator,&mut sockets,
+                &mut leases,&batch,EventKind::Exited),Err(()));
+            assert!(files.owns(owners[0])&&files.owns(owners[1]));
+            assert!(coordinator.live_sockets_consistent(&sockets));
+            assert_eq!(coordinator.active_udp_ports(),2);
+            assert_eq!(notices.len(),0);
+        }
+    }
+    #[test]
+    fn late_event_backpressure_does_not_publish_a_partial_two_owner_exit(){
+        let (mut files,mut coordinator,mut sockets,mut leases,owners)=setup();
+        let mut notices=ProcessEvents::<1>::new();
+        assert_eq!(retire_full_owner_batch(
+            &mut files,&mut notices,&mut coordinator,&mut sockets,
+            &mut leases,&owners,EventKind::Exited),Err(()));
+        assert!(files.owns(owners[0]) && files.owns(owners[1]));
+        assert!(coordinator.live_sockets_consistent(&sockets));
+        assert_eq!(coordinator.active_udp_ports(),2);
+        assert_eq!(notices.len(),0);
     }
 }
