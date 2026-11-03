@@ -29,7 +29,7 @@ def main():
     if not a.iso.is_file() or not a.ovmf.is_file():
         p.error("missing exact QEMU ISO/OVMF artifact")
     command=[
-        a.qemu,"-machine","pc","-cpu","max","-m","256M","-smp","2",
+        a.qemu,"-machine","pc","-cpu","qemu64,x2apic=on","-m","256M","-smp","2",
         "-display","none","-monitor","none","-serial","stdio",
         "-no-reboot","-boot","d",
         "-drive",f"if=pflash,format=raw,readonly=on,file={a.ovmf.resolve()}",
