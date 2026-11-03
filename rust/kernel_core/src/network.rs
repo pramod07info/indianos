@@ -351,7 +351,7 @@ pub fn run_demo<D:EthernetDevice>(
         parse_udp(frame,mac,PEER_UDP_PORT).is_ok_and(|data|data==UDP_RESP)
             && nic_rx_fence.try_admit(1).is_ok_and(|rx|
                 live_owners.ingest_nic_frame_device_fenced(
-                    &nic_rx_fence,&rx,&ingress_permit,
+                    &nic_rx_fence,&rx,&ingress_permit,&ingress_gate,
                     &mut udp_endpoints,revision,frame,mac)
                 .is_ok_and(|owner|owner==network_owner))
     };
@@ -412,7 +412,7 @@ pub fn run_demo<D:EthernetDevice>(
                     }
                     let Ok(rx)=nic_rx_fence.try_admit(1)else{return false;};
                     if live_owners.ingest_nic_frame_device_fenced(
-                        &nic_rx_fence,&rx,&ingress_permit,
+                        &nic_rx_fence,&rx,&ingress_permit,&ingress_gate,
                         &mut udp_endpoints,revision,frame,mac)
                         !=Ok(network_owner){
                         return false;
@@ -452,7 +452,7 @@ pub fn run_demo<D:EthernetDevice>(
             valid_dns(frame,mac) &&
                 nic_rx_fence.try_admit(1).is_ok_and(|rx|
                     live_owners.ingest_nic_frame_device_fenced(
-                        &nic_rx_fence,&rx,&ingress_permit,
+                        &nic_rx_fence,&rx,&ingress_permit,&ingress_gate,
                         &mut udp_endpoints,revision,frame,mac)
                     .is_ok_and(|owner|owner==network_owner))
         }
@@ -496,7 +496,7 @@ pub fn run_demo<D:EthernetDevice>(
     }
     let rx=nic_rx_fence.try_admit(1).map_err(|_|Error::Unexpected)?;
     if live_owners.ingest_nic_frame_device_fenced(
-        &nic_rx_fence,&rx,&ingress_permit,
+        &nic_rx_fence,&rx,&ingress_permit,&ingress_gate,
         &mut udp_endpoints,stale_revision,
         &saved_wire[..saved_len],saved_mac)
         !=Err(crate::process_retirement_txn::RetirementError::Sockets(
@@ -2910,18 +2910,31 @@ mod r118_privileged_nic_ingress_tests{
         let wrong=other.try_admit(7).unwrap();
         let (frame,n)=reply(5001,b"valid");
         assert_eq!(k.ingest_nic_frame_device_fenced(
-            &rx_device,&wrong,&bsp,&mut sockets,revision,&frame[..n],LOCAL),
+            &rx_device,&wrong,&bsp,&gate,&mut sockets,revision,&frame[..n],LOCAL),
             Err(RetirementError::Sockets(SocketError::Denied)));
         assert_eq!(sockets.pending_owned(live.pid,live.generation),Ok(0));
         drop(wrong);
+        // Even a correct device must reject a retirement permit from
+        // a DIFFERENT gate with the same numeric bootstrap CPU ID.
+        let foreign_gate=RetirementGate::new();
+        foreign_gate.register_bsp(0,true).unwrap();
+        let bogus_bsp=foreign_gate.try_enter(0,true).unwrap();
+        let rx=rx_device.try_admit(7).unwrap();
+        assert_eq!(k.ingest_nic_frame_device_fenced(
+            &rx_device,&rx,&bogus_bsp,&gate,&mut sockets,
+            revision,&frame[..n],LOCAL),
+            Err(RetirementError::Sockets(SocketError::Denied)));
+        assert_eq!(sockets.pending_owned(live.pid,live.generation),Ok(0));
+        drop(rx);
+        drop(bogus_bsp);
         let valid=rx_device.try_admit(7).unwrap();
         assert_eq!(k.ingest_nic_frame_device_fenced(
-            &rx_device,&valid,&bsp,&mut sockets,revision,&frame[..n],LOCAL),
+            &rx_device,&valid,&bsp,&gate,&mut sockets,revision,&frame[..n],LOCAL),
             Ok(live));
         let quiesce=rx_device.begin_quiesce(7).unwrap();
         assert_eq!(rx_device.drained(quiesce),Ok(false));
         assert_eq!(k.ingest_nic_frame_device_fenced(
-            &rx_device,&valid,&bsp,&mut sockets,revision,&frame[..n],LOCAL),
+            &rx_device,&valid,&bsp,&gate,&mut sockets,revision,&frame[..n],LOCAL),
             Err(RetirementError::Sockets(SocketError::Denied)));
         drop(valid);
         assert_eq!(rx_device.drained(quiesce),Ok(true));
@@ -2931,7 +2944,7 @@ mod r118_privileged_nic_ingress_tests{
         assert_eq!(rx_device.finish_rebind(quiesce),Ok(2));
         let fresh=rx_device.try_admit(7).unwrap();
         assert_eq!(k.ingest_nic_frame_device_fenced(
-            &rx_device,&fresh,&bsp,&mut sockets,revision,&frame[..n],LOCAL),
+            &rx_device,&fresh,&bsp,&gate,&mut sockets,revision,&frame[..n],LOCAL),
             Err(RetirementError::Sockets(SocketError::Denied)));
         assert_eq!(sockets.pending_owned(recycled.pid,recycled.generation),Ok(0));
     }

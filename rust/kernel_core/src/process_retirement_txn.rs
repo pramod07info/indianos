@@ -254,10 +254,15 @@ impl<const C: usize, const U: usize, const E: usize> ProcessRetirement<C, U, E> 
         device:&crate::nic_rx_fence::NicRxFence,
         rx:&crate::nic_rx_fence::RxPermit<'_>,
         bsp:&crate::retirement_gate::Permit<'_>,
+        expected_gate:&crate::retirement_gate::RetirementGate,
         sockets:&mut EpochUdpEndpoints<P,Q>,revision:IngressRevision,
         frame:&[u8],local_mac:[u8;6],
     )->Result<Owner,RetirementError>{
-        if !device.permit_is_current(rx){
+        // The RX permit AND the process-authority permit must originate
+        // from the two exact services this driver instance protects.
+        // Prevent unrelated/test-local gates from granting production
+        // network policy access, even when they share a BSP CPU number.
+        if !bsp.issued_by(expected_gate) || !device.permit_is_current(rx){
             return Err(RetirementError::Sockets(SocketError::Denied));
         }
         self.ingest_kernel_nic_frame(bsp,sockets,revision,frame,local_mac)
