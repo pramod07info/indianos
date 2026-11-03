@@ -29,6 +29,7 @@ pub struct EventReceipt {
 }
 
 /// A FIFO event ring. Zero capacity is valid but cannot store any events.
+#[derive(Clone)]
 pub struct ProcessEvents<const CAPACITY: usize> {
     entries: [Option<ProcessEvent>; CAPACITY],
     sequences: [u64; CAPACITY],
@@ -1159,4 +1160,51 @@ mod r119_atomic_exit_batch_tests{
   assert_eq!(q.acknowledge_receipt(fresh),Some(e(2,9)));
   assert_eq!(q.dequeue(),Ok(e(3,1)));
  }
+}
+
+/// R120: exact process-incarnation fault receipt, separate from normal Exited.
+/// The caller must authenticate the owner against the kernel scheduler.
+impl<const N: usize> ProcessEvents<N> {
+    pub fn enqueue_fault_once(&mut self, pid: u32, generation: u64)
+        -> Result<bool, EventError>
+    {
+        if pid == 0 || generation == 0 {
+            return Err(EventError::InvalidPid);
+        }
+        let duplicate = (0..self.count).any(|index| {
+            self.entries[(self.head + index) % N].is_some_and(|event|
+                event.pid == pid && event.kind == EventKind::Faulted &&
+                event.value == generation)
+        });
+        if duplicate { return Ok(false); }
+        self.enqueue(ProcessEvent { pid, kind: EventKind::Faulted, value: generation })?;
+        Ok(true)
+    }
+}
+#[cfg(test)]
+mod r120_fault_receipt_tests {
+    use super::*;
+    #[test]
+    fn fault_receipts_are_idempotent_and_distinguish_process_generations() {
+        let mut events = ProcessEvents::<3>::new();
+        assert_eq!(events.enqueue_fault_once(7, 1), Ok(true));
+        assert_eq!(events.enqueue_fault_once(7, 1), Ok(false));
+        assert_eq!(events.enqueue_fault_once(7, 2), Ok(true));
+        assert_eq!(events.len(), 2);
+        let old = events.peek_receipt().unwrap();
+        assert_eq!(old.event.kind, EventKind::Faulted);
+        assert_eq!(events.acknowledge_receipt(old), Some(old.event));
+        assert_eq!(events.acknowledge_receipt(old), None);
+        let new_receipt = events.peek_receipt().unwrap();
+        assert_ne!(old.sequence, new_receipt.sequence);
+        assert_eq!(new_receipt.event.value, 2);
+    }
+    #[test]
+    fn zero_capacity_and_bad_fault_identities_never_publish() {
+        let mut events = ProcessEvents::<0>::new();
+        assert_eq!(events.enqueue_fault_once(0, 1), Err(EventError::InvalidPid));
+        assert_eq!(events.enqueue_fault_once(1, 0), Err(EventError::InvalidPid));
+        assert_eq!(events.enqueue_fault_once(1, 1), Err(EventError::Full));
+        assert_eq!(events.len(), 0);
+    }
 }

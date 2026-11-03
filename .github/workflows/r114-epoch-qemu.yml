@@ -1,13 +1,8 @@
 name: R114 actual QEMU boot epoch persistence
 on:
+  # R118 inherited exact-head boot-epoch proof on every integration PR.
   pull_request:
     branches: [main]
-    paths:
-      - "rust/kernel_core/src/r114_boot_epoch.rs"
-      - "rust/kernel_core/src/kernel_main.rs"
-      - "tools/test_r114_epoch_qemu.py"
-      - "Makefile"
-      - ".github/workflows/r114-epoch-qemu.yml"
   workflow_dispatch:
 permissions:
   contents: read
@@ -17,6 +12,13 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: R118 assert exact integration head checkout
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: python3 tools/verify_ci_sha.py --expected "$EXPECTED_SHA" --observed "$(git rev-parse HEAD)"
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-none

@@ -107,6 +107,14 @@ pub mod capability;
 pub mod vfs_path;
 /// Allocation-free process event FIFO and teardown cleanup.
 pub mod process_events;
+/// Bounded atomic exit/fault retirement across three kernel-local policy tables.
+/// Scheduler, socket table, IRQ and SMP integration remain separately gated.
+pub mod process_retirement_txn;
+pub mod retirement_gate;
+/// R134 nonblocking per-NIC RX admission and explicit DMA quiescence boundary.
+pub mod nic_rx_fence;
+/// R131 exact-generation one-AP release/acquire rendezvous (not APIC IPI).
+pub mod smp_lifecycle_fence;
 // M1: authenticated ring3-service policy using the already implemented
 // checksummed, sector-backed HierVfs; host remount integration acceptance.
 // Does not enable formatting or physical-device access in ordinary boot.

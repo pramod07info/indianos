@@ -17,6 +17,8 @@ SIZE=64
 START=40
 MAGIC=b"IEPOCH01"
 PASS="IndianOS: R114 QEMU boot epoch advanced and recovery receipt verified"
+HANDOFF="IndianOS: R118 QEMU PID1 boot handoff contract PASSED"
+REJECTED="IndianOS: R118 QEMU PID1 boot authority negative controls PASSED"
 def record(epoch:int,prior:bytes,journal:int=21)->bytes:
     sector=bytearray(512)
     sector[:8]=MAGIC
@@ -56,7 +58,7 @@ def boot(qemu:str,iso:Path,ovmf:Path,disk:Path,negative:bool=False):
             text=out.decode("utf8","replace")
             if negative and "IndianOS: FATAL R114 epoch journal not preprovisioned" in text:
                 return
-            if not negative and PASS in text:
+            if not negative and PASS in text and HANDOFF in text and REJECTED in text:
                 return
             # Negative-control is SUPPOSED to emit FATAL. Serial stdout
             # arrives in short chunks; do not fail on a partially received

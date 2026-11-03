@@ -26,6 +26,7 @@ CLIENT_PORT=41280
 UDP_PORT=4040
 TCP_PORT=8080
 MARKERS=(
+    "IndianOS: R125 QEMU two-CPU Limine MP inventory validated; AP parked",
     "IndianOS: R028 legacy virtio-net DMA queues initialized",
     "IndianOS: R028 Ethernet ARP peer resolved",
     "IndianOS: R028 IPv4 ICMP echo ping PASSED",
@@ -33,6 +34,9 @@ MARKERS=(
     "IndianOS: R116 QEMU DHCP lease expiry blocked primary UDP resend and backup succeeded",
     "IndianOS: R028 IPv4 UDP echo PASSED",
     "IndianOS: R028 UDP DNS A query indianos.test PASSED",
+    "IndianOS: R124 QEMU permit-fenced kernel NIC UDP/DNS ingress PASSED",
+    "IndianOS: R130 QEMU stale NIC frame denied after PID/UDP epoch recycle",
+    "IndianOS: R135 QEMU NIC RX drained before UDP owner recycle PASSED",
     "IndianOS: M2 live NIC IPv4/UDP DNS verifier PASSED",
     "IndianOS: R028 TCP three-way handshake SYN-ACK verified",
     "IndianOS: R028 TCP client request-response PASSED",
@@ -176,7 +180,7 @@ def run(qemu:str,iso:pathlib.Path,ovmf:pathlib.Path)->None:
     listener.listen(1);listener.setblocking(False)
     port=listener.getsockname()[1]
     command=[
-        qemu,"-machine","pc","-m","256M","-smp","1",
+        qemu,"-machine","pc","-m","256M","-smp","2",
         "-display","none","-monitor","none","-serial","stdio",
         "-no-reboot","-no-shutdown","-boot","d",
         "-drive",f"if=pflash,format=raw,readonly=on,file={ovmf}",

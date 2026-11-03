@@ -60,6 +60,99 @@ static mut MODULES:ModuleRequest=ModuleRequest{
     revision:0,response:ptr::null(),
     internal_module_count:0,internal_modules:ptr::null(),
 };
+// Limine MP protocol: APs remain waiting in the bootloader because the
+// kernel never writes a goto_address. Reading CPU topology does NOT bring
+// up an AP, install per-AP IDTs or enable remote TLB shootdowns.
+#[repr(C)]
+struct MpRequest {
+    id:[u64;4],
+    revision:u64,
+    response:*const MpResponse,
+    flags:u64,
+}
+#[repr(C)]
+struct MpResponse {
+    revision:u64,
+    flags:u32,
+    bsp_lapic_id:u32,
+    cpu_count:u64,
+    cpus:*const *const MpInfo,
+}
+#[repr(C)]
+struct MpInfo {
+    processor_id:u32,
+    lapic_id:u32,
+    reserved:u64,
+    goto_address:*const c_void,
+    extra_argument:u64,
+}
+#[used]
+#[link_section=".limine_requests"]
+static mut MP:MpRequest=MpRequest {
+    id:[COMMON[0],COMMON[1],0x95a67b819a1b857e,0xa0b61b723b6a73e0],
+    revision:0,response:ptr::null(),flags:0,
+};
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub(crate) struct MpInventory {
+    pub cpus:u32,
+    pub bsp_lapic_id:u32,
+}
+const MAX_BOOT_CPUS:usize=64;
+
+/// R118-014/028 foundation: only validate Limine-supplied topology on
+/// the bootstrap processor. Bootloader owns every listed pointer, and all
+/// CPUs except the BSP MUST remain parked. No AP is started here.
+///
+/// SAFETY: the caller must be the BSP during initial Limine handoff, while
+/// response pages and CPU pointer arrays are valid and immutable. A corrupt
+/// bootloader pointer is not recoverable by a memory-safe parser.
+unsafe fn validate_mp_response(response:&MpResponse)->Option<MpInventory>{
+    let count=usize::try_from(response.cpu_count).ok()?;
+    if count==0 || count>MAX_BOOT_CPUS || response.cpus.is_null() ||
+       (response.cpus as usize)%core::mem::align_of::<*const MpInfo>()!=0 {
+        return None;
+    }
+    let mut lapic_ids=[0u32;MAX_BOOT_CPUS];
+    let mut processor_ids=[0u32;MAX_BOOT_CPUS];
+    let mut bsp_found=0usize;
+    for index in 0..count {
+        // Trusted Limine pointer table only: never use this on untrusted
+        // firmware bytes, from ring3, or after bootloader reclamation.
+        let info_ptr=unsafe{ptr::read_volatile(response.cpus.add(index))};
+        if info_ptr.is_null() ||
+           (info_ptr as usize)%core::mem::align_of::<MpInfo>()!=0 {
+            return None;
+        }
+        let info=unsafe{&*info_ptr};
+        if lapic_ids[..index].contains(&info.lapic_id) ||
+           processor_ids[..index].contains(&info.processor_id) {
+            return None;
+        }
+        // A bootloader-armed AP would execute without an IndianOS-owned
+        // GDT/IDT/TSS/stack. Reject such a handoff before treating it as
+        // a safe, parked secondary processor.
+        if info.lapic_id!=response.bsp_lapic_id &&
+           !unsafe{ptr::read_volatile(ptr::addr_of!(info.goto_address))}.is_null() {
+            return None;
+        }
+        bsp_found+=usize::from(info.lapic_id==response.bsp_lapic_id);
+        lapic_ids[index]=info.lapic_id;
+        processor_ids[index]=info.processor_id;
+    }
+    if bsp_found!=1{return None;}
+    Some(MpInventory{cpus:count as u32,bsp_lapic_id:response.bsp_lapic_id})
+}
+
+/// Read-only topology discovery. No AP startup and no concurrency claim.
+pub(crate) fn observed_mp_inventory()->Option<MpInventory>{
+    let response=unsafe{ptr::read_volatile(ptr::addr_of!(MP.response))};
+    if response.is_null() ||
+       (response as usize)%core::mem::align_of::<MpResponse>()!=0 {
+        return None;
+    }
+    unsafe{validate_mp_response(&*response)}
+}
+
 #[used]
 #[link_section=".limine_requests_end"]
 static mut END:[u64;2]=[0xadc0e0531bb10d03,0x9572709f31764c62];
@@ -97,4 +190,209 @@ mod tests{
         assert_eq!(BASE_REVISION_INIT,6);
     }
     const BASE_REVISION_INIT:u64=6;
+}
+
+#[cfg(test)]
+mod r125_mp_inventory_tests {
+    use super::*;
+    use core::mem::{offset_of,size_of};
+
+    fn info(processor_id:u32,lapic_id:u32)->MpInfo{
+        MpInfo{processor_id,lapic_id,reserved:0,
+               goto_address:ptr::null(),extra_argument:0}
+    }
+    fn response(table:&[*const MpInfo],count:u64,bsp:u32)->MpResponse{
+        MpResponse{revision:0,flags:0,bsp_lapic_id:bsp,
+                   cpu_count:count,cpus:table.as_ptr()}
+    }
+    #[test]
+    fn r125_mp_wire_layout_exact_limine_revision_six(){
+        assert_eq!(size_of::<MpRequest>(),56);
+        assert_eq!(size_of::<MpResponse>(),32);
+        assert_eq!(size_of::<MpInfo>(),32);
+        assert_eq!(offset_of!(MpRequest,response),40);
+        assert_eq!(offset_of!(MpRequest,flags),48);
+        assert_eq!(offset_of!(MpResponse,cpus),24);
+        assert_eq!(offset_of!(MpInfo,goto_address),16);
+    }
+    #[test]
+    fn r125_two_parked_cpus_have_one_authoritative_bsp(){
+        let cpus=[info(0,0),info(1,1)];
+        let table=[&cpus[0] as *const MpInfo,&cpus[1] as *const MpInfo];
+        let data=response(&table,2,0);
+        assert_eq!(unsafe{validate_mp_response(&data)},
+                   Some(MpInventory{cpus:2,bsp_lapic_id:0}));
+    }
+    #[test]
+    fn r125_duplicate_missing_bsp_and_invalid_count_fail_closed(){
+        let cpus=[info(0,0),info(1,1)];
+        let table=[&cpus[0] as *const MpInfo,&cpus[1] as *const MpInfo];
+        for (count,bsp) in [(0,0),(65,0),(u64::MAX,0),(2,3)] {
+            assert_eq!(unsafe{validate_mp_response(&response(&table,count,bsp))},None);
+        }
+        let duplicate=[&cpus[0] as *const MpInfo,&cpus[0] as *const MpInfo];
+        assert_eq!(unsafe{validate_mp_response(&response(&duplicate,2,0))},None);
+        let no_table=MpResponse{cpus:ptr::null(),..response(&table,2,0)};
+        assert_eq!(unsafe{validate_mp_response(&no_table)},None);
+        let same_id=[info(0,0),info(0,1)];
+        let same_ptr=[&same_id[0] as *const MpInfo,&same_id[1] as *const MpInfo];
+        assert_eq!(unsafe{validate_mp_response(&response(&same_ptr,2,0))},None);
+    }
+    #[test]
+    fn r125_prestarted_ap_is_not_qualified_as_parked(){
+        let bsp=info(0,0);
+        let mut ap=info(1,1);
+        ap.goto_address=1usize as *const c_void;
+        let table=[&bsp as *const MpInfo,&ap as *const MpInfo];
+        assert_eq!(unsafe{validate_mp_response(&response(&table,2,0))},None);
+    }
+}
+
+/// R126 QEMU-only experimental AP execution. Limine supplies the temporary
+/// AP stack/mappings. The BSP halts before bootloader memory reclamation, so
+/// no kernel task, interrupt, filesystem, timer or DMA work runs concurrently.
+/// Never call this from the normal production boot path.
+#[cfg(feature="test-r118-ap-ack")]
+static R126_AP_ACK:core::sync::atomic::AtomicU32=
+    core::sync::atomic::AtomicU32::new(0);
+#[cfg(feature="test-r118-ap-ack")]
+static R126_AP_CPUID:core::sync::atomic::AtomicU32=
+    core::sync::atomic::AtomicU32::new(u32::MAX);
+
+#[cfg(feature="test-r118-ap-ack")]
+static R127_GATE:crate::retirement_gate::RetirementGate=
+    crate::retirement_gate::RetirementGate::new();
+#[cfg(feature="test-r118-ap-ack")]
+static R127_AP_DENIALS:core::sync::atomic::AtomicU32=
+    core::sync::atomic::AtomicU32::new(0);
+#[cfg(feature="test-r118-ap-ack")]
+static R127_BSP_ADMISSIONS:core::sync::atomic::AtomicU32=
+    core::sync::atomic::AtomicU32::new(0);
+#[cfg(feature="test-r118-ap-ack")]
+static R131_FENCE:crate::smp_lifecycle_fence::LifecycleFence=
+    crate::smp_lifecycle_fence::LifecycleFence::new(0,1);
+#[cfg(feature="test-r118-ap-ack")]
+static R131_AP_DONE:core::sync::atomic::AtomicU32=
+    core::sync::atomic::AtomicU32::new(0);
+
+#[cfg(feature="test-r118-ap-ack")]
+extern "C" fn r126_secondary_cpu_entry(info:*mut MpInfo)->!{
+    use core::sync::atomic::Ordering;
+    unsafe{core::arch::asm!("cli",options(nomem,nostack));}
+    // This entry point is AP-only, authenticated by Limine. The AP reads
+    // its own real CPUID, not just the BSP-provided protocol record.
+    if !info.is_null(){
+        let expected=unsafe{ptr::read_volatile(ptr::addr_of!((*info).lapic_id))};
+        let actual=(unsafe{core::arch::x86_64::__cpuid(1)}.ebx>>24)&255;
+        if expected==actual && actual!=0 {
+            // R127: real AP repeatedly attempts kernel BSP admission while
+            // the BSP concurrently probes the same atomic gate. Every
+            // attempt MUST deny the foreign LAPIC ID without spinning.
+            let mut denied=0u32;
+            for _ in 0..8192 {
+                if !matches!(
+                    R127_GATE.try_enter(actual,true),
+                    Err(crate::retirement_gate::GateError::WrongCpu)
+                ){break;}
+                denied+=1;
+            }
+            R127_AP_DENIALS.store(denied,Ordering::Release);
+            if denied==8192 {
+                R126_AP_CPUID.store(actual,Ordering::Release);
+                R126_AP_ACK.store(1,Ordering::Release);
+                // Exact APID1 cross-CPU lifecycle protocol: no interrupt
+                // routing is claimed, and the AP never touches the live
+                // BSP-owned process or filesystem service tables.
+                let mut seen=0u64;
+                for seq in 1..=64u64{
+                    let mut got=false;
+                    for _ in 0..50_000_000u32{
+                        match R131_FENCE.observe_and_ack(actual,seen){
+                            Ok(Some(receipt)) if receipt.sequence==seq &&
+                                receipt.generation==seq*2 => {
+                                seen=seq;got=true;break;
+                            }
+                            Ok(None)=>core::hint::spin_loop(),
+                            _=>break,
+                        }
+                    }
+                    if !got{break;}
+                }
+                R131_AP_DONE.store(seen as u32,Ordering::Release);
+            }
+        }
+    }
+    // No IDT/TSS, scheduler, PMM, IPC or IPI is installed on this AP.
+    // It must not outlive the isolated QEMU test profile.
+    loop{unsafe{core::arch::asm!("cli; hlt",options(nostack,nomem));}}
+}
+
+#[cfg(feature="test-r118-ap-ack")]
+pub(crate) fn launch_one_parked_qemu_ap()->bool{
+    use core::sync::atomic::{fence,Ordering};
+    let Some(topology)=observed_mp_inventory() else{return false;};
+    if topology.cpus!=2 || topology.bsp_lapic_id!=0 {return false;}
+    let response=unsafe{ptr::read_volatile(ptr::addr_of!(MP.response))};
+    if response.is_null(){return false;}
+    let raw=unsafe{&*response};
+    let mut secondary=ptr::null_mut();
+    for index in 0..2{
+        let info=unsafe{ptr::read_volatile(raw.cpus.add(index))};
+        if info.is_null(){return false;}
+        let apic=unsafe{ptr::read_volatile(ptr::addr_of!((*info).lapic_id))};
+        if apic!=topology.bsp_lapic_id {
+            secondary=info as *mut MpInfo;
+        }
+    }
+    if secondary.is_null(){return false;}
+    if R127_GATE.register_bsp(0,true).is_err(){return false;}
+    R126_AP_ACK.store(0,Ordering::Release);
+    R126_AP_CPUID.store(u32::MAX,Ordering::Release);
+    R127_AP_DENIALS.store(0,Ordering::Release);
+    R127_BSP_ADMISSIONS.store(0,Ordering::Release);
+    R131_AP_DONE.store(0,Ordering::Release);
+    fence(Ordering::Release);
+    // The canonical Limine protocol wakes the AP only AFTER the BSP
+    // publishes goto_address. No normal boot, userland or IRQ is enabled.
+    unsafe{ptr::write_volatile(
+        ptr::addr_of_mut!((*secondary).goto_address),
+        r126_secondary_cpu_entry as *const c_void
+    );}
+    let mut arrived=false;
+    for _ in 0..50_000_000u32{
+        // The BSP alone owns the gate. This loop executes concurrently
+        // with the real AP's 8192 denied entry attempts. The AP may never
+        // acquire, mutate or retain any BSP process authority.
+        let Ok(permit)=R127_GATE.try_enter(0,true)else{return false;};
+        R127_BSP_ADMISSIONS.fetch_add(1,Ordering::Relaxed);
+        drop(permit);
+        if R126_AP_ACK.load(Ordering::Acquire)==1 {
+            arrived=R126_AP_CPUID.load(Ordering::Acquire)==1 &&
+                R127_AP_DENIALS.load(Ordering::Acquire)==8192 &&
+                R127_BSP_ADMISSIONS.load(Ordering::Acquire)>0;
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    if !arrived{return false;}
+    for seq in 1..=64u64{
+        let receipt=match R131_FENCE.publish(0,seq*2){
+            Ok(receipt)=>receipt,
+            Err(_)=>return false,
+        };
+        let mut acknowledged=false;
+        for _ in 0..50_000_000u32{
+            match R131_FENCE.acknowledged(0,receipt){
+                Ok(true)=>{acknowledged=true;break;},
+                Ok(false)=>core::hint::spin_loop(),
+                Err(_)=>return false,
+            }
+        }
+        if !acknowledged{return false;}
+    }
+    for _ in 0..50_000_000u32{
+        if R131_AP_DONE.load(Ordering::Acquire)==64{return true;}
+        core::hint::spin_loop();
+    }
+    false
 }

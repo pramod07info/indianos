@@ -19,6 +19,13 @@ jobs:
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: R118 assert exact integration head checkout
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: python3 tools/verify_ci_sha.py --expected "$EXPECTED_SHA" --observed "$(git rev-parse HEAD)"
       - name: Install x86-64 emulator and kernel toolchain
         run: |
           sudo apt-get update
@@ -28,6 +35,8 @@ jobs:
           targets: x86_64-unknown-none
       - name: Unit tests for Ethernet IPv4 checksum and protocol bounds
         run: cargo test --offline --manifest-path rust/kernel_core/Cargo.toml
+      - name: R125 validate bounded Limine multi-CPU wire protocol
+        run: cargo test --offline --manifest-path rust/kernel_core/Cargo.toml --features limine-requests r125_
       - name: Compile network-enabled freestanding kernel
         run: cargo build --offline --manifest-path rust/kernel_core/Cargo.toml --target x86_64-unknown-none --no-default-features --features cpu-entry,vmm,pmm,user-image,paging,paging-cpu,user-runtime,runtime,boot-staging,boot,interrupts,timer,kernel-main,limine-requests,test-r028-network
       - name: Rust kernel ownership and security audit

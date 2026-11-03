@@ -81,6 +81,61 @@ static mut R114_LOCAL_UDP:crate::network::EpochUdpEndpoints<2,8>=
 #[cfg(feature="test-r031-files-gui")]
 static mut R115_UDP_OWNERS:crate::udp_owner_epoch::Registry<2>=
     crate::udp_owner_epoch::Registry::new();
+/// The authenticated R120 ring-3 process and live-socket authority owner.
+/// FileHandles is the trusted globally monotonic PID-generation allocator.
+/// This is single-BSP state: interrupts and other CPUs must never mutate it.
+#[cfg(feature="test-r031-files-gui")]
+static mut R120_RETIREMENT:crate::process_retirement_txn::ProcessRetirement<2,2,16>=
+    crate::process_retirement_txn::ProcessRetirement::new();
+#[cfg(feature="test-r031-files-gui")]
+static R120_GATE:crate::retirement_gate::RetirementGate=
+    crate::retirement_gate::RetirementGate::new();
+#[cfg(feature="test-r031-files-gui")]
+fn r120_cpu_id()->u32{
+    // A host test thread can migrate; tests use a stable synthetic BSP ID
+    // and separately verify wrong-core rejection with explicit IDs.
+    #[cfg(test)]{0}
+    #[cfg(not(test))]{
+        use core::arch::x86_64::{__cpuid,__cpuid_count};
+        let max=unsafe{__cpuid(0)}.eax;
+        // Use the full 32-bit x2APIC topology ID when exposed. A legacy
+        // 8-bit APIC ID cannot distinguish >255 hardware processor IDs.
+        if max>=0x1f {
+            let topology=unsafe{__cpuid_count(0x1f,0)};
+            if topology.ebx&0xffff!=0{return topology.edx;}
+        }
+        if max>=0xb {
+            let topology=unsafe{__cpuid_count(0xb,0)};
+            if topology.ebx&0xffff!=0{return topology.edx;}
+        }
+        (unsafe{__cpuid(1)}.ebx>>24)&255
+    }
+}
+#[cfg(feature="test-r031-files-gui")]
+fn r120_masked()->bool{
+    #[cfg(test)]{true}
+    #[cfg(not(test))]{
+        let flags:u64;
+        unsafe{asm!("pushfq; pop {}",out(reg)flags,options(preserves_flags));}
+        flags&(1<<9)==0
+    }
+}
+#[cfg(feature="test-r031-files-gui")]
+fn r120_setup()->bool{
+    R120_GATE.register_bsp(r120_cpu_id(),r120_masked()).is_ok()
+}
+#[cfg(feature="test-r031-files-gui")]
+fn r120_enter()->Result<crate::retirement_gate::Permit<'static>,
+                       crate::retirement_gate::GateError>{
+    #[cfg(test)]{let _=r120_setup();}
+    R120_GATE.try_enter(r120_cpu_id(),r120_masked())
+}
+#[cfg(feature="test-r031-files-gui")]
+fn r120_halt()->!{
+    log(b"IndianOS: FATAL R120 retirement contention, no frame reclamation\n\0");
+    #[cfg(test)]panic!("R120 retirement gate/transaction refused");
+    #[cfg(not(test))]loop{unsafe{asm!("cli; hlt",options(nomem,nostack));}}
+}
 // R116: trusted kernel issues PID2 a narrow read-only directory lease only
 // after both process incarnations have been authenticated by FileHandles.
 #[cfg(feature="test-r031-files-gui")]
@@ -812,6 +867,11 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
   },
   #[cfg(feature="test-r031-vfs")]
   33=>{
+   // Serialize real GUI-profile filesystem access with the same privileged
+   // admission permit as generation-owned UDP and scheduler retirement.
+   // A nested IRQ/core cannot remount or use a half-retired owner.
+   #[cfg(feature="test-r031-files-gui")]
+   let Ok(_filesystem_permit)=r120_enter()else{return BAD;};
    let Some(owner)=authenticated_file_identity()else{return BAD;};
    // Descriptor: path[24], opaque handle u64, argument u64,
    // pointer u64, length u64, reserved u64. Never dereference an
@@ -903,34 +963,33 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
      unsafe{indianos_user_can_write(&*img,address,count)}=>{},
     _=>return BAD
    }
+   let Ok(_permit)=r120_enter()else{return BAD;};
    let socket=unsafe{&mut *ptr::addr_of_mut!(R114_LOCAL_UDP)};
-   let registry=unsafe{&mut *ptr::addr_of_mut!(R115_UDP_OWNERS)};
+   let coordinator=unsafe{&mut *ptr::addr_of_mut!(R120_RETIREMENT)};
+   let live=crate::process_retirement_txn::Owner{
+       pid:owner.pid,generation:owner.generation};
    match request.arg0{
-    1=>socket.bind_registered(registry,owner.pid,owner.generation,source)
-       .map_or(BAD,|_|0),
-    2=>socket.send_registered(registry,owner.pid,owner.generation,
+    1=>coordinator.bind_live_udp(socket,live,source).map_or(BAD,|_|0),
+    2=>coordinator.send_live_udp(socket,live,
            source,destination,&data[..count]).map_or(BAD,|_|0),
     3=>{
-     let n=match socket.receive_registered(
-         registry,owner.pid,owner.generation,source,&mut data){
+     let n=match coordinator.receive_live_udp(socket,live,source,&mut data){
       Ok(n)=>n,
-      Err(crate::network::SocketError::Empty)=>return 0,
+      Err(crate::process_retirement_txn::RetirementError::Sockets(
+          crate::network::SocketError::Empty))=>return 0,
       Err(_)=>return BAD
      };
      if n>0 && !unsafe{indianos_user_copy_writable(&*img,address,
                            data.as_ptr(),n)}{return BAD;}
      n as u64
     },
-    4=>{
-     let grant=crate::udp_owner_epoch::Grant{
-       pid:owner.pid,generation:owner.generation,port:source};
-     socket.close_claimed_registered(registry,owner,grant).map_or(BAD,|_|0)
-    },
+    4=>coordinator.close_live_udp(socket,live,source).map_or(BAD,|_|0),
     _=>BAD
    }
   },
   #[cfg(feature="test-r031-files-gui")]
   34=>{
+   let Ok(_filesystem_permit)=r120_enter()else{return BAD;};
    if request.arg0!=1||authenticated_file_pid()!=Some(2){return BAD;}
    let Some(owner)=authenticated_file_identity()else{return BAD;};
    if !unsafe{(&*ptr::addr_of!(R116_SHARED_LEASES))}
@@ -1257,14 +1316,25 @@ fn prepare(t:*mut Task,p:*mut Process,elf:*const u8,size:usize,original:u64,
     !unsafe{indianos_process_bind(p,task.root.root)}{return false;}
  #[cfg(feature="test-r031-vfs")]
  if (1..=2).contains(&unsafe{(*p).pid}){
+  // Bind the real FileHandles owner and coordinator generation while holding
+  // one gate. No observer may see an owner that is only half-registered.
+  #[cfg(feature="test-r031-files-gui")]
+  let Ok(_registration_permit)=r120_enter()else{return false;};
   // Bind only fully prepared contexts. The table and epoch allocator survive
   // scheduler invocations; never reset them when PCB PIDs restart at one.
   let handles=unsafe{&mut *ptr::addr_of_mut!(R031_HANDLES)};
   let Ok(owner)=handles.bind_process(unsafe{(*p).pid})else{return false;};
   task.file_generation=owner.generation;
   #[cfg(feature="test-r031-files-gui")]
-  if owner.pid==2 && !r116_prepare_shared_directory_lease(owner){
-    return false;
+  {
+   let live=crate::process_retirement_txn::Owner{
+     pid:owner.pid,generation:owner.generation
+   };
+   if unsafe{(&mut *ptr::addr_of_mut!(R120_RETIREMENT))}
+      .start_exact(live).is_err(){return false;}
+   if owner.pid==2 && !r116_prepare_shared_directory_lease(owner){
+     return false;
+   }
   }
  }
  pid_log(unsafe{(*p).pid},b"READY\0");true
@@ -1329,6 +1399,233 @@ fn saved_valid(t:&Task)->bool{
  map.permissions.user&&map.permissions.executable&&!map.permissions.writable
 }
 fn revoke_task_authority(task:&mut Task){
+ revoke_task_authority_with_kind(task,crate::process_events::EventKind::Exited);
+}
+
+#[cfg(feature="test-r031-vfs")]
+#[derive(Clone,Copy,Debug,Eq,PartialEq)]
+enum FileRetireFailure { EventQueue, FileHandles }
+
+/// Atomic publication of the scheduler's *real* filesystem and PID1 event
+/// authorities. Stage an exit/fault notice before touching FileHandles;
+/// failure to enqueue must not orphan a live handle or publish a partial
+/// event. A valid single-owner FileHandles retirement cannot fail after
+/// ownership is checked under the BSP admission permit, but any unexpected
+/// error must be treated as fatal by the live scheduler.
+///
+/// A retired/replaced PID incarnation is a no-op: never revoke a new
+/// generation or emit a delayed duplicate notification.
+#[cfg(feature="test-r031-vfs")]
+fn retire_file_owner_epoch<const E:usize>(
+    files:&mut crate::fs_handles::FileHandles,
+    events:&mut crate::process_events::ProcessEvents<E>,
+    owner:crate::batch5_session::Identity,
+    kind:crate::process_events::EventKind,
+)->Result<bool,FileRetireFailure>{
+    if !files.owns(owner){return Ok(false);}
+    let mut staged=events.clone();
+    match kind {
+        crate::process_events::EventKind::Exited =>
+            staged.enqueue_exit_once(owner.pid,owner.generation),
+        crate::process_events::EventKind::Faulted =>
+            staged.enqueue_fault_once(owner.pid,owner.generation),
+        _=>return Err(FileRetireFailure::EventQueue),
+    }.map_err(|_|FileRetireFailure::EventQueue)?;
+    if files.retire_process_batch_kernel(&[owner])!=Ok(1){
+        return Err(FileRetireFailure::FileHandles);
+    }
+    *events=staged;
+    Ok(true)
+}
+
+/// R118-013 source-level guest fuzz: retired PID2 authority, including
+/// random-looking and forged opaque descriptors, must be denied by the actual
+/// authenticated file syscall path BEFORE ATA discovery or disk mutation.
+/// QEMU's disposable disk and the real PID2 scheduler identity are used, not
+/// an in-memory fake BlockDevice. This cannot simulate hardware disk swaps.
+#[cfg(feature="test-r031-files-gui")]
+fn r123_retired_pid2_file_token_fuzz(
+    files:&mut crate::fs_handles::FileHandles,
+    owner:crate::batch5_session::Identity,
+    alias:crate::fs_handles::MountAlias,
+)->bool{
+    if files.owns(owner) || owner.pid!=2 || owner.generation==0 {
+        return false;
+    }
+    let before_stats=files.security_statistics();
+    let before_namespace=files.last_syscall_namespace();
+    let corpus=[
+        0u64,1,2,3,4,5,8,16,32,64,255,256,4095,4096,
+        owner.generation,owner.generation.wrapping_add(1),
+        owner.generation.rotate_left(19)^0x69f2_9371_3ab8_c4d5,
+        u64::MAX,1u64<<63,u64::MAX-1,
+    ];
+    let mut buffer=[0xa5u8;72];
+    for token in corpus{
+        // These all go through FileHandles::namespace_receipt first and
+        // must fail before the host-selected ATA disk is even probed.
+        for operation in [2u64,3,4,5,6]{
+            if crate::fs_handles::operation_authenticated(
+                files,operation,owner,token,0,"",&mut buffer).is_ok(){
+                return false;
+            }
+            if buffer!=[0xa5;72]{return false;}
+        }
+        // Reopening a retired alias also must fail, even if the physical
+        // scratch filesystem was remounted at the same pathname.
+        if crate::fs_handles::operation_authenticated_mount_alias(
+            files,alias,1,owner,token,crate::fs_handles::READ,
+            "/shared/readme",&mut buffer).is_ok(){
+            return false;
+        }
+        if buffer!=[0xa5;72]{return false;}
+    }
+    files.security_statistics()==before_stats &&
+        files.last_syscall_namespace()==before_namespace &&
+        !files.owns(owner) &&
+        !files.mount_alias_allows(alias,owner,"/shared/readme")
+}
+
+/// R118-009/027/073: a bounded, fail-atomic single-BSP transaction for
+/// multiple authenticated process incarnations. A non-Send retirement
+/// Permit is REQUIRED in the Rust signature of every 5-table publication.
+/// The real scheduler retains the R120_GATE permit through publication.
+/// This does not implement physical APIC/IPI/SMP coordination.
+#[cfg(feature="test-r031-files-gui")]
+fn retire_full_owner_batch<
+    const C:usize,const U:usize,const K:usize,
+    const P:usize,const Q:usize,const E:usize,const L:usize
+>(
+    permit:&crate::retirement_gate::Permit<'_>,
+    expected_gate:&crate::retirement_gate::RetirementGate,
+    files:&mut crate::fs_handles::FileHandles,
+    events:&mut crate::process_events::ProcessEvents<E>,
+    coordinator:&mut crate::process_retirement_txn::ProcessRetirement<C,U,K>,
+    sockets:&mut crate::network::EpochUdpEndpoints<P,Q>,
+    leases:&mut crate::agent_03_cap_epoch::LeaseTable<L>,
+    owners:&[crate::batch5_session::Identity],
+    kind:crate::process_events::EventKind,
+)->Result<usize,()> {
+    use crate::process_events::EventKind;
+    if owners.is_empty(){return Ok(0);}
+    if owners.len()>2 || !matches!(kind,EventKind::Exited|EventKind::Faulted){
+        return Err(());
+    }
+    // Prevent a seemingly valid token issued by a DIFFERENT gate from
+    // authorizing the single production file/UDP/lease/event state. This
+    // preflight happens before any staging, clone or mutable table access.
+    if !permit.issued_by(expected_gate){return Err(());}
+    // Authenticate the WHOLE batch before taking any mutable live access.
+    // One stale or duplicate PID must not revoke a valid earlier member.
+    for (index,owner) in owners.iter().enumerate(){
+        if owner.pid==0 || owner.generation==0 ||
+           owners[..index].iter().any(|previous|previous.pid==owner.pid) ||
+           !files.owns(*owner) ||
+           coordinator.active_generation(owner.pid)!=Some(owner.generation) {
+            return Err(());
+        }
+    }
+
+    let mut candidate_files=files.staged_copy_kernel();
+    let mut candidate_events=events.clone();
+    let mut candidate_coordinator=coordinator.clone();
+    let mut candidate_sockets=sockets.clone();
+    let mut candidate_leases=*leases;
+    let mut policy_owners=[crate::process_retirement_txn::Owner{
+        pid:0,generation:0
+    };2];
+    let mut lease_owners=[(0u32,0u64);2];
+    for (index,owner) in owners.iter().enumerate(){
+        policy_owners[index]=crate::process_retirement_txn::Owner{
+            pid:owner.pid,generation:owner.generation
+        };
+        lease_owners[index]=(owner.pid,owner.generation);
+        match kind{
+            EventKind::Exited=>
+                candidate_events.enqueue_exit_once(owner.pid,owner.generation),
+            EventKind::Faulted=>
+                candidate_events.enqueue_fault_once(owner.pid,owner.generation),
+            _=>return Err(()),
+        }.map_err(|_|())?;
+    }
+    if candidate_files.retire_process_batch_kernel(owners)!=Ok(owners.len()){
+        return Err(());
+    }
+    let identities=&policy_owners[..owners.len()];
+    match kind{
+        EventKind::Exited=>candidate_coordinator.retire_live_exited_batch(
+            &mut candidate_sockets,identities),
+        EventKind::Faulted=>candidate_coordinator.retire_live_faulted_batch(
+            &mut candidate_sockets,identities),
+        _=>return Err(()),
+    }.map_err(|_|())?;
+    candidate_leases.revoke_identity_batch_kernel(
+        &lease_owners[..owners.len()]).map_err(|_|())?;
+
+    // Internal policy notices are not the user-visible PID1 queue. Drain
+    // only AFTER all live/public event notices have been staged successfully.
+    while let Some(receipt)=candidate_coordinator.peek_notice(){
+        if candidate_coordinator.acknowledge_notice(receipt).is_none(){
+            return Err(());
+        }
+    }
+    if !candidate_coordinator.live_sockets_consistent(&candidate_sockets){
+        return Err(());
+    }
+    for owner in owners{
+        if candidate_files.owns(*owner) ||
+           candidate_coordinator.active_generation(owner.pid).is_some() ||
+           candidate_sockets.pending_owned(owner.pid,owner.generation).is_ok(){
+            return Err(());
+        }
+    }
+    // No fallible operation follows. The original tables cannot be observed
+    // by an untrusted peer while the scheduler's BSP/IRQ permit is held.
+    *files=candidate_files;
+    *events=candidate_events;
+    *coordinator=candidate_coordinator;
+    *sockets=candidate_sockets;
+    *leases=candidate_leases;
+    Ok(owners.len())
+}
+
+/// Live scheduler single-owner convenience path, backed by the same
+/// multi-incarnation transaction as supervisor batch retirement.
+#[cfg(feature="test-r031-files-gui")]
+fn retire_full_owner_epoch<
+    const C:usize,const U:usize,const K:usize,
+    const P:usize,const Q:usize,const E:usize,const L:usize
+>(
+    permit:&crate::retirement_gate::Permit<'_>,
+    expected_gate:&crate::retirement_gate::RetirementGate,
+    files:&mut crate::fs_handles::FileHandles,
+    events:&mut crate::process_events::ProcessEvents<E>,
+    coordinator:&mut crate::process_retirement_txn::ProcessRetirement<C,U,K>,
+    sockets:&mut crate::network::EpochUdpEndpoints<P,Q>,
+    leases:&mut crate::agent_03_cap_epoch::LeaseTable<L>,
+    owner:crate::batch5_session::Identity,
+    kind:crate::process_events::EventKind,
+)->Result<bool,()> {
+    // A delayed scheduler task with a retired incarnation must never
+    // remove a newer PID's network rights or emit a duplicate event.
+    if !files.owns(owner){return Ok(false);}
+    retire_full_owner_batch(
+        permit,expected_gate,files,events,coordinator,sockets,leases,&[owner],kind
+    ).map(|count|count==1)
+}
+
+#[cfg(feature="test-r031-vfs")]
+fn r118_file_retirement_fatal()->!{
+    log(b"IndianOS: FATAL R118 filesystem/event retirement incomplete\n\0");
+    #[cfg(feature="test-r031-files-gui")]
+    {r120_halt()}
+    #[cfg(not(feature="test-r031-files-gui"))]
+    {panic!("R118 live file/event retirement denied")}
+}
+
+fn revoke_task_authority_with_kind(
+ task:&mut Task,kind:crate::process_events::EventKind
+){
  // This runs before any fallible release, including scheduler-abort rollback.
  // Clear the continuation even when no PCB was bound during preparation.
  task.saved=false;task.frame=[0;WORDS];task.image.ready=false;
@@ -1352,6 +1649,11 @@ fn revoke_task_authority(task:&mut Task){
   // Revoke before fallible page-table/frame reclamation. A retry or delayed
   // cleanup cannot revoke a replacement incarnation with the same PID.
   if !task.pcb.is_null(){
+   // One non-spinning permit covers event production, capability/UDP
+   // retirement, delegated leases and FileHandles revocation, including
+   // all postconditions. Do NOT reacquire inside this teardown path.
+   #[cfg(feature="test-r031-files-gui")]
+   let _retirement_permit=r120_enter().unwrap_or_else(|_|r120_halt());
    let owner=crate::batch5_session::Identity{
     pid:unsafe{(*task.pcb).pid},generation:task.file_generation};
    // Only a previously live trusted PID2 lease makes a teardown
@@ -1361,39 +1663,133 @@ fn revoke_task_authority(task:&mut Task){
    let had_live_directory_lease=owner.pid==2 &&
       unsafe{(&*ptr::addr_of!(R116_SHARED_LEASES))}
         .permits_shared_directory(owner);
-   if unsafe{(&*ptr::addr_of!(R031_HANDLES)).owns(owner)} {
-    // Deduplicate repeated exit/rollback notices for this exact incarnation;
-    // PID reuse must never remove or confuse the next owner's events.
-    let _=unsafe{&mut *ptr::addr_of_mut!(R114_FILE_EVENTS)}
-        .enqueue_exit_once(owner.pid,owner.generation);
+   // Capture REAL, kernel-minted PID2 Files root and mounted-volume epoch
+   // proofs while its PCB incarnation is still alive. The same snapshot must
+   // be unusable immediately after five-table scheduler retirement, even
+   // if another process later reuses the original pathname.
+   #[cfg(feature="test-r031-files-gui")]
+   if had_live_directory_lease {
+     // Genuine live PID2 owns this service now. Reject future/unissued
+     // opaque handle guesses with *current* authority, before the later
+     // retired-owner denial corpus and before any five-table teardown.
+     if !unsafe{(&mut *ptr::addr_of_mut!(R031_HANDLES))}
+         .r128_audit_active_forged_handles(owner){
+       log(b"IndianOS: FATAL R128 active PID2 forged handle admission\n\0");
+       r120_halt();
+     }
+     log(b"IndianOS: R128 QEMU active PID2 forged file tokens denied before ATA probe\n\0");
    }
+   #[cfg(feature="test-r031-files-gui")]
+   let old_pid2_mount=if had_live_directory_lease {
+     let fs=unsafe{&*ptr::addr_of!(R031_HANDLES)};
+     match (
+       fs.mount_alias_for_current_root_kernel(owner),
+       fs.selected_operation_guard(owner)
+     ){
+       (Ok(alias),Ok(guard))=>Some((alias,guard)),
+       _=>{
+         log(b"IndianOS: FATAL R122 cannot snapshot PID2 mount authority\n\0");
+         r120_halt();
+       }
+     }
+   }else{None};
+   #[cfg(feature="test-r031-files-gui")]
+   let mut full_retirement_committed=false;
+   // Do not advertise lifecycle exit/fault yet. The notice must be
+   // published atomically with FileHandles revocation AFTER the network,
+   // delegated capability and scheduler-resource teardown is verified.
    #[cfg(feature="test-r031-files-gui")]
    {
     // Mandatory exact-incarnation revocation on ordinary exit, fault and
     // rollback. Network grants are retired before FileHandles, while the
     // scheduler owns the only BSP mutator; no nested lock acquisition.
     let sockets=unsafe{&mut *ptr::addr_of_mut!(R114_LOCAL_UDP)};
-    let registry=unsafe{&mut *ptr::addr_of_mut!(R115_UDP_OWNERS)};
-    if sockets.retire_exact_kernel(registry,owner.pid,owner.generation).is_err(){
-      log(b"IndianOS: FATAL R118 exact UDP authority retirement failed\n\0");
+    let coordinator=unsafe{&mut *ptr::addr_of_mut!(R120_RETIREMENT)};
+    let live=crate::process_retirement_txn::Owner{
+      pid:owner.pid,generation:owner.generation};
+    let current=coordinator.active_generation(owner.pid);
+    if current==Some(owner.generation){
+      // Preflight and stage UDP, exact-generation file handles, delegated
+      // directory grants and PID1 notice BEFORE modifying any live store.
+      // No peer can observe partial retirement through a failed event queue.
+      let staged=retire_full_owner_epoch(
+          &_retirement_permit,&R120_GATE,
+          unsafe{&mut *ptr::addr_of_mut!(R031_HANDLES)},
+          unsafe{&mut *ptr::addr_of_mut!(R114_FILE_EVENTS)},
+          coordinator,sockets,
+          unsafe{&mut *ptr::addr_of_mut!(R116_SHARED_LEASES)},
+          owner,kind);
+      if staged!=Ok(true){
+        log(b"IndianOS: FATAL R120 atomic file/network/lease retirement failed\n\0");
+        r120_halt();
+      }
+      full_retirement_committed=true;
+      // Printed only after the active R120 incarnation has committed the
+      // unified FileHandles, UDP, capability, event and lease transaction.
+      // Host-side markers cannot satisfy this real guest scheduler proof.
+      if owner.pid==2 {
+        log(b"IndianOS: R121 QEMU five-table PID2 retirement transaction PASSED\n\0");
+      }
+    }else if current.is_none(){
+      // Compatibility path for host tests creating synthetic FileHandles
+      // owners without initializing a full production scheduler session.
+      let registry=unsafe{&mut *ptr::addr_of_mut!(R115_UDP_OWNERS)};
+      if sockets.retire_exact_kernel(registry,owner.pid,owner.generation).is_err(){
+        log(b"IndianOS: FATAL R118 legacy UDP retirement failed\n\0");
+        r120_halt();
+      }
+    }else{
+      // A delayed task for the same PID must not remove a new incarnation.
+      log(b"IndianOS: R120 stale scheduler retirement ignored\n\0");
     }
    }
+   // Legacy/synthetic host setup without a live R120 owner still follows
+   // the old separately verified file path. A real active owner has already
+   // committed all five tables above and must not retire twice.
    #[cfg(feature="test-r031-files-gui")]
-   {let _=unsafe{(&mut *ptr::addr_of_mut!(R116_SHARED_LEASES))}
-          .revoke_identity(owner.pid,owner.generation);}
-   // The same fail-atomic retirement preflight now services the actual
-   // scheduler teardown, not just host unit tests. One retiring task is
-   // supplied here; the supervisor can also retire multiple in one batch.
-   let _=unsafe{(&mut *ptr::addr_of_mut!(R031_HANDLES))}
-       .retire_process_batch_kernel(&[owner]);
+   if !full_retirement_committed {
+     unsafe{(&mut *ptr::addr_of_mut!(R116_SHARED_LEASES))}
+        .revoke_identity(owner.pid,owner.generation);
+   }
+   #[cfg(feature="test-r031-files-gui")]
+   let needs_legacy_file_retire=!full_retirement_committed;
+   #[cfg(not(feature="test-r031-files-gui"))]
+   let needs_legacy_file_retire=true;
+   if needs_legacy_file_retire {
+     let result=retire_file_owner_epoch(
+         unsafe{&mut *ptr::addr_of_mut!(R031_HANDLES)},
+         unsafe{&mut *ptr::addr_of_mut!(R114_FILE_EVENTS)},
+         owner,kind);
+     if result.is_err(){r118_file_retirement_fatal();}
+   }
    #[cfg(feature="test-r031-files-gui")]
    if had_live_directory_lease {
      let lease_gone=!unsafe{(&*ptr::addr_of!(R116_SHARED_LEASES))}
            .permits_shared_directory(owner);
-     let port_gone=unsafe{(&*ptr::addr_of!(R115_UDP_OWNERS))}
-           .owner_of(5502).is_none();
-     let file_gone=!unsafe{(&*ptr::addr_of!(R031_HANDLES))}.owns(owner);
-     if lease_gone && port_gone && file_gone {
+     // Independent post-condition: neither the real queue nor the
+     // generation-bound policy may retain this incarnation after cleanup.
+     let port_gone=unsafe{(&*ptr::addr_of!(R114_LOCAL_UDP))}
+        .pending_owned(owner.pid,owner.generation).is_err() &&
+        unsafe{(&*ptr::addr_of!(R120_RETIREMENT))}
+        .authorize_udp(crate::process_retirement_txn::Owner{
+           pid:owner.pid,generation:owner.generation},5502).is_err() &&
+        unsafe{(&*ptr::addr_of!(R115_UDP_OWNERS))}
+        .owner_of(5502).is_none();
+     let fs=unsafe{&*ptr::addr_of!(R031_HANDLES)};
+     let file_gone=!fs.owns(owner);
+     let old_mount_denied=old_pid2_mount.is_some_and(|(alias,guard)|
+       !fs.mount_alias_allows(alias,owner,"/shared/readme") &&
+       !fs.selected_operation_guard_is_current(guard));
+     if lease_gone && port_gone && file_gone && old_mount_denied {
+       if !old_pid2_mount.is_some_and(|(alias,_)|
+         r123_retired_pid2_file_token_fuzz(
+           unsafe{&mut *ptr::addr_of_mut!(R031_HANDLES)},owner,alias)
+       ){
+         log(b"IndianOS: FATAL R123 retired PID2 file descriptor fuzz escaped\n\0");
+         r120_halt();
+       }
+       log(b"IndianOS: R123 QEMU retired PID2 file tokens denied before ATA probe\n\0");
+       log(b"IndianOS: R122 QEMU stale PID2 mount alias and revision guard denied\n\0");
        log(b"R117 QEMU PID2 delegated directory and UDP authority revoked at scheduler exit\n\0");
      }else{
        log(b"IndianOS: FATAL R117 PID2 delegated authority retained after exit\n\0");
@@ -1438,9 +1834,13 @@ fn cleanup_session(backend:&CloneBackend,reclaim:bool)->bool{
  #[cfg(feature="test-r025")]
  unsafe{R025_SERVICES=None;}
  #[cfg(feature="test-r031-files-gui")]
- unsafe{R114_LOCAL_UDP=crate::network::EpochUdpEndpoints::new();
-        R115_UDP_OWNERS=crate::udp_owner_epoch::Registry::new();
-        R116_SHARED_LEASES=crate::agent_03_cap_epoch::LeaseTable::new();}
+ {
+  // Release the permit before entering any scheduler or user code.
+  let Ok(_permit)=r120_enter()else{return false;};
+  unsafe{R114_LOCAL_UDP=crate::network::EpochUdpEndpoints::new();
+         R115_UDP_OWNERS=crate::udp_owner_epoch::Registry::new();
+         R116_SHARED_LEASES=crate::agent_03_cap_epoch::LeaseTable::new();}
+ }
  unsafe{SESSION_DIRTY=!complete;}
  complete
 }
@@ -1477,6 +1877,8 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
  if first.is_null()||second.is_null()||!active_image().is_null()||
     !active_task().is_null(){return false;}
  let Some((cpu,offset))=preflight()else{return false;};
+ #[cfg(feature="test-r031-files-gui")]
+ if !r120_setup(){log(b"IndianOS: R120 denied unsafe CPU/IRQ scheduler entry\n\0");return false;}
  let mut direct=DirectMap{offset};
  let vmm=vmm_backend(&mut direct);
  let backend=clone_backend(&mut direct);
@@ -1492,9 +1894,13 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
   log(b"IndianOS: M009 prior rollback still owns resources\n\0");return false;
  }
  #[cfg(feature="test-r031-files-gui")]
- unsafe{R114_LOCAL_UDP=crate::network::EpochUdpEndpoints::new();
-        R115_UDP_OWNERS=crate::udp_owner_epoch::Registry::new();
-        R116_SHARED_LEASES=crate::agent_03_cap_epoch::LeaseTable::new();}
+ {
+  // Release the permit before entering any scheduler or user code.
+  let Ok(_permit)=r120_enter()else{return false;};
+  unsafe{R114_LOCAL_UDP=crate::network::EpochUdpEndpoints::new();
+         R115_UDP_OWNERS=crate::udp_owner_epoch::Registry::new();
+         R116_SHARED_LEASES=crate::agent_03_cap_epoch::LeaseTable::new();}
+ }
  let mut table=ProcessTable::empty();
  let mut scheduler=Scheduler::empty();
  if !unsafe{indianos_process_table_init(&mut table)}{return false;}
@@ -1546,6 +1952,14 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
   log(b"IndianOS: M009 FATAL cannot prepare two user contexts\n\0");
   return false;
  }
+ // Save the two genuine ring-3 PID epochs, before teardown clears the
+ // Task.file_generation fields. These are minted by the privileged
+ // FileHandles allocator, never derived from a guest syscall argument.
+ #[cfg(feature="test-r031-files-gui")]
+ let r120_expected=unsafe{[
+    (*task_ptr(0)).file_generation,
+    (*task_ptr(1)).file_generation
+ ]};
  #[cfg(feature="test-ipc")]
  {
   let Some(mut mailboxes)=IpcRouter::<4,8>::new().ok()else{return false;};
@@ -1655,7 +2069,11 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
    // file and delegated capability authority BEFORE potentially fallible
    // user page-table / frame reclamation below. The rollback path still
    // calls the same idempotent retirement when process termination fails.
-   revoke_task_authority(task);
+   revoke_task_authority_with_kind(task,if v==0{
+     crate::process_events::EventKind::Exited
+   }else{
+     crate::process_events::EventKind::Faulted
+   });
    #[cfg(feature="test-r030-ondevice")]
    fault_hex(b"IndianOS: R030 scheduler exit status=0x\0",status);
    #[cfg(feature="test-r031-boot-desktop")]
@@ -1783,6 +2201,34 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
    log(b"IndianOS: R025 capability IPC filesystem process services PASSED\n\0");
   }
  }
+ #[cfg(feature="test-r031-files-gui")]
+ {
+   // R120: the real ring-3 GUI/QEMU acceptance fixture executes PID1 and
+   // PID2 UDP PING/PONG + forged foreign-close denial before this terminal
+   // state. Validate both trusted incarnations have lost *all* authority
+   // and the real socket queue agrees with its policy registry.
+   let _permit=r120_enter().unwrap_or_else(|_|r120_halt());
+   let coordinator=unsafe{&*ptr::addr_of!(R120_RETIREMENT)};
+   let sockets=unsafe{&*ptr::addr_of!(R114_LOCAL_UDP)};
+   let handles=unsafe{&*ptr::addr_of!(R031_HANDLES)};
+   let first=crate::batch5_session::Identity{
+       pid:1,generation:r120_expected[0]};
+   let second=crate::batch5_session::Identity{
+       pid:2,generation:r120_expected[1]};
+   let retired=r120_expected.iter().all(|&gen|gen!=0) &&
+       coordinator.active_generation(1).is_none() &&
+       coordinator.active_generation(2).is_none() &&
+       !handles.owns(first) && !handles.owns(second) &&
+       sockets.pending_owned(1,first.generation).is_err() &&
+       sockets.pending_owned(2,second.generation).is_err() &&
+       coordinator.live_sockets_consistent(sockets);
+   if !retired{
+      ok=false;
+      log(b"IndianOS: FATAL R120 ring3 dual-PID UDP epoch retirement mismatch\n\0");
+   }else if ok {
+      log(b"IndianOS: R120 QEMU ring3 dual-PID UDP epoch retirement PASSED\n\0");
+   }
+ }
  if !ok{
   log(b"IndianOS: M009 FATAL scheduler or memory ownership verification\n\0");
 
@@ -1814,6 +2260,7 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
    sockets:ManuallyDrop<crate::network::EpochUdpEndpoints<2,8>>,
    registry:ManuallyDrop<crate::udp_owner_epoch::Registry<2>>,
    leases:ManuallyDrop<crate::agent_03_cap_epoch::LeaseTable<2>>,
+   retirement:ManuallyDrop<crate::process_retirement_txn::ProcessRetirement<2,2,16>>,
   }
   impl Drop for Restore{
    fn drop(&mut self){unsafe{
@@ -1823,6 +2270,7 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
     ptr::write(ptr::addr_of_mut!(R114_LOCAL_UDP),ManuallyDrop::take(&mut self.sockets));
     ptr::write(ptr::addr_of_mut!(R115_UDP_OWNERS),ManuallyDrop::take(&mut self.registry));
     ptr::write(ptr::addr_of_mut!(R116_SHARED_LEASES),ManuallyDrop::take(&mut self.leases));
+    ptr::write(ptr::addr_of_mut!(R120_RETIREMENT),ManuallyDrop::take(&mut self.retirement));
    }}
   }
   let _restore=unsafe{Restore{
@@ -1832,6 +2280,7 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
    sockets:ManuallyDrop::new(ptr::read(ptr::addr_of!(R114_LOCAL_UDP))),
    registry:ManuallyDrop::new(ptr::read(ptr::addr_of!(R115_UDP_OWNERS))),
    leases:ManuallyDrop::new(ptr::read(ptr::addr_of!(R116_SHARED_LEASES))),
+   retirement:ManuallyDrop::new(ptr::read(ptr::addr_of!(R120_RETIREMENT))),
   }};
   let mut init=Process::empty();init.pid=1;init.state=2;
   let mut guest=Process::empty();guest.pid=2;guest.state=2;
@@ -1842,9 +2291,18 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
    R114_LOCAL_UDP=crate::network::EpochUdpEndpoints::new();
    R115_UDP_OWNERS=crate::udp_owner_epoch::Registry::new();
    R116_SHARED_LEASES=crate::agent_03_cap_epoch::LeaseTable::new();
-   let table=&mut *ptr::addr_of_mut!(R031_HANDLES);
-   let a=table.bind_process(1).unwrap();
-   let old=table.bind_process(2).unwrap();
+   R120_RETIREMENT=crate::process_retirement_txn::ProcessRetirement::new();
+   assert!(r120_setup());
+   // Raw pointers are converted to short-lived exclusive borrows only for
+   // each operation; teardown itself re-enters these same kernel globals.
+   let table=ptr::addr_of_mut!(R031_HANDLES);
+   let a=(&mut *table).bind_process(1).unwrap();
+   let old=(&mut *table).bind_process(2).unwrap();
+   let coordinator=ptr::addr_of_mut!(R120_RETIREMENT);
+   for id in [a,old]{
+     (&mut *coordinator).start_exact(crate::process_retirement_txn::Owner{
+       pid:id.pid,generation:id.generation}).unwrap();
+   }
    let first=&mut *task_ptr(0);first.pcb=&mut init;
    first.file_generation=a.generation;first.authority_live=true;
    let second=&mut *task_ptr(1);second.pcb=&mut guest;
@@ -1852,20 +2310,24 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
    assert!(r116_prepare_shared_directory_lease(old));
    assert!((&*ptr::addr_of!(R116_SHARED_LEASES))
            .permits_shared_directory(old));
-   (&mut *ptr::addr_of_mut!(R114_LOCAL_UDP)).bind_registered(
-      &mut *ptr::addr_of_mut!(R115_UDP_OWNERS),
-      old.pid,old.generation,5502).unwrap();
+   (&mut *coordinator).bind_live_udp(&mut *ptr::addr_of_mut!(R114_LOCAL_UDP),
+      crate::process_retirement_txn::Owner{
+       pid:old.pid,generation:old.generation},5502).unwrap();
    revoke_task_authority(second);
    assert!(!(&*ptr::addr_of!(R116_SHARED_LEASES))
            .permits_shared_directory(old));
    assert!(!(&*ptr::addr_of!(R031_HANDLES)).owns(old));
    assert!((&*ptr::addr_of!(R031_HANDLES)).owns(a));
-   assert_eq!((&*ptr::addr_of!(R115_UDP_OWNERS)).owner_of(5502),None);
+   assert!((&*ptr::addr_of!(R120_RETIREMENT))
+       .authorize_udp(crate::process_retirement_txn::Owner{
+           pid:old.pid,generation:old.generation},5502).is_err());
    assert_eq!((&*ptr::addr_of!(R114_FILE_EVENTS)).len(),1);
    let newest=(&mut *ptr::addr_of_mut!(R031_HANDLES))
               .bind_process(2).unwrap();
    second.file_generation=newest.generation;
    second.authority_live=true;
+   (&mut *coordinator).start_exact(crate::process_retirement_txn::Owner{
+      pid:newest.pid,generation:newest.generation}).unwrap();
    assert!(r116_prepare_shared_directory_lease(newest));
    assert!((&*ptr::addr_of!(R116_SHARED_LEASES))
           .permits_shared_directory(newest));
@@ -1877,6 +2339,23 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
    assert!((&*ptr::addr_of!(R116_SHARED_LEASES))
           .permits_shared_directory(newest));
    assert_eq!((&*ptr::addr_of!(R114_FILE_EVENTS)).len(),1);
+   // R120: this is the actual ring3 task-authenticating fault branch.
+   // Rebind an exact new generation and verify it is reported as Faulted
+   // rather than an ordinary Exited notice, without removing old receipts.
+   second.file_generation=newest.generation;
+   second.authority_live=true;
+   revoke_task_authority_with_kind(second,
+      crate::process_events::EventKind::Faulted);
+   let queue=&mut *ptr::addr_of_mut!(R114_FILE_EVENTS);
+   assert_eq!(queue.len(),2);
+   let old_receipt=queue.peek_receipt().unwrap();
+   assert_eq!(old_receipt.event.kind,crate::process_events::EventKind::Exited);
+   assert_eq!(queue.acknowledge_receipt(old_receipt),Some(old_receipt.event));
+   let fault_receipt=queue.peek_receipt().unwrap();
+   assert_eq!(fault_receipt.event.kind,crate::process_events::EventKind::Faulted);
+   assert_eq!(fault_receipt.event.value,newest.generation);
+   assert_eq!(queue.acknowledge_receipt(old_receipt),None);
+   assert!(!(&*ptr::addr_of!(R031_HANDLES)).owns(newest));
   }
  }
 
@@ -2126,4 +2605,285 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
   t.frame[17]=2;
   assert!(!saved_valid(&t));
  }
+}
+
+#[cfg(all(test,feature="test-r031-vfs"))]
+mod r118_scheduler_file_event_atomicity_tests {
+    use super::*;
+    use crate::process_events::{EventKind,ProcessEvents};
+    use crate::fs_handles::FileHandles;
+
+    #[test]
+    fn full_event_queue_denies_file_retirement_without_partial_notice() {
+        let mut files=FileHandles::new();
+        let init=files.bind_process(1).unwrap();
+        let worker=files.bind_process(2).unwrap();
+        let mut queue=ProcessEvents::<1>::new();
+        let original=files.mount_alias_for_current_root_kernel(worker).unwrap();
+
+        assert_eq!(retire_file_owner_epoch(
+            &mut files,&mut queue,init,EventKind::Exited),Ok(true));
+        let first=queue.peek_receipt().unwrap();
+        assert_eq!(first.event.pid,init.pid);
+        assert!(!files.owns(init));
+
+        assert_eq!(retire_file_owner_epoch(
+            &mut files,&mut queue,worker,EventKind::Faulted),
+            Err(FileRetireFailure::EventQueue));
+        assert!(files.owns(worker));
+        assert!(files.mount_alias_allows(original,worker,"/shared/note"));
+        assert_eq!(queue.peek_receipt(),Some(first));
+
+        assert_eq!(queue.acknowledge_receipt(first),Some(first.event));
+        assert_eq!(retire_file_owner_epoch(
+            &mut files,&mut queue,worker,EventKind::Faulted),Ok(true));
+        assert!(!files.owns(worker));
+        assert!(!files.mount_alias_allows(original,worker,"/shared/note"));
+        let final_notice=queue.peek_receipt().unwrap();
+        assert_eq!(final_notice.event.pid,worker.pid);
+        assert_eq!(final_notice.event.kind,EventKind::Faulted);
+    }
+
+    #[test]
+    fn empty_notice_queue_and_recycled_pid_do_not_discard_live_authority() {
+        let mut files=FileHandles::new();
+        let old=files.bind_process(1).unwrap();
+        let mut zero=ProcessEvents::<0>::new();
+        assert_eq!(retire_file_owner_epoch(
+            &mut files,&mut zero,old,EventKind::Exited),
+            Err(FileRetireFailure::EventQueue));
+        assert!(files.owns(old));
+        assert_eq!(zero.len(),0);
+
+        let mut events=ProcessEvents::<2>::new();
+        assert_eq!(retire_file_owner_epoch(
+            &mut files,&mut events,old,EventKind::Exited),Ok(true));
+        let fresh=files.bind_process(1).unwrap();
+        assert_ne!(fresh.generation,old.generation);
+        let before=events.peek_receipt();
+        assert_eq!(retire_file_owner_epoch(
+            &mut files,&mut events,old,EventKind::Faulted),Ok(false));
+        assert_eq!(events.peek_receipt(),before);
+        assert!(files.owns(fresh));
+        assert_eq!(retire_file_owner_epoch(
+            &mut files,&mut events,fresh,EventKind::Message),
+            Err(FileRetireFailure::EventQueue));
+        assert!(files.owns(fresh));
+        assert_eq!(events.peek_receipt(),before);
+    }
+}
+
+#[cfg(all(test,feature="test-r031-files-gui"))]
+mod r118_full_owner_retirement_integration_tests {
+    use super::*;
+    use crate::batch5_session::Identity;
+    use crate::process_events::{EventKind,ProcessEvents};
+    use crate::fs_handles::FileHandles;
+    use crate::network::EpochUdpEndpoints;
+    use crate::process_retirement_txn::{Owner,ProcessRetirement};
+    use crate::agent_03_cap_epoch::LeaseTable;
+
+    #[test]
+    fn full_external_notice_ring_rolls_back_real_udp_and_file_retirement() {
+        let gate=crate::retirement_gate::RetirementGate::new();
+        gate.register_bsp(0,true).unwrap();
+        let permit=gate.try_enter(0,true).unwrap();
+        let mut files=FileHandles::new();
+        let init=files.bind_process(1).unwrap();
+        let peer=files.bind_process(2).unwrap();
+        let mut notices=ProcessEvents::<1>::new();
+        notices.enqueue_exit_once(99,1).unwrap();
+        let old_receipt=notices.peek_receipt().unwrap();
+        let mut coordinator=ProcessRetirement::<2,2,4>::new();
+        coordinator.start_exact(Owner{
+            pid:init.pid,generation:init.generation}).unwrap();
+        coordinator.start_exact(Owner{
+            pid:peer.pid,generation:peer.generation}).unwrap();
+        let mut sockets=EpochUdpEndpoints::<2,4>::new();
+        coordinator.bind_live_udp(&mut sockets,Owner{
+            pid:init.pid,generation:init.generation},5501).unwrap();
+        coordinator.bind_live_udp(&mut sockets,Owner{
+            pid:peer.pid,generation:peer.generation},5502).unwrap();
+        let mut leases=LeaseTable::<2>::new();
+
+        assert_eq!(retire_full_owner_epoch(&permit,&gate,&mut files,&mut notices,
+            &mut coordinator,&mut sockets,&mut leases,init,
+            EventKind::Exited),Err(()));
+        assert!(files.owns(init));
+        assert!(files.owns(peer));
+        assert!(coordinator.authorize_udp(Owner{
+            pid:init.pid,generation:init.generation},5501).is_ok());
+        assert!(coordinator.authorize_udp(Owner{
+            pid:peer.pid,generation:peer.generation},5502).is_ok());
+        assert!(coordinator.live_sockets_consistent(&sockets));
+        assert_eq!(notices.peek_receipt(),Some(old_receipt));
+        assert_eq!(notices.acknowledge_receipt(old_receipt),
+                   Some(old_receipt.event));
+
+        assert_eq!(retire_full_owner_epoch(&permit,&gate,&mut files,&mut notices,
+            &mut coordinator,&mut sockets,&mut leases,init,
+            EventKind::Exited),Ok(true));
+        assert!(!files.owns(init));
+        assert!(files.owns(peer));
+        assert!(coordinator.authorize_udp(Owner{
+            pid:init.pid,generation:init.generation},5501).is_err());
+        assert!(coordinator.authorize_udp(Owner{
+            pid:peer.pid,generation:peer.generation},5502).is_ok());
+        assert!(coordinator.live_sockets_consistent(&sockets));
+        let new_notice=notices.peek_receipt().unwrap();
+        assert_eq!(new_notice.event.pid,init.pid);
+        assert_eq!(new_notice.event.value,init.generation);
+        assert_eq!(new_notice.event.kind,EventKind::Exited);
+    }
+    #[test]
+    fn mismatched_socket_registry_and_stale_pid_are_all_or_none() {
+        let gate=crate::retirement_gate::RetirementGate::new();
+        gate.register_bsp(0,true).unwrap();
+        let permit=gate.try_enter(0,true).unwrap();
+        let mut files=FileHandles::new();
+        let owner=files.bind_process(1).unwrap();
+        let mut notices=ProcessEvents::<2>::new();
+        let mut coordinator=ProcessRetirement::<2,2,4>::new();
+        let proof=Owner{pid:owner.pid,generation:owner.generation};
+        coordinator.start_exact(proof).unwrap();
+        let mut sockets=EpochUdpEndpoints::<2,2>::new();
+        coordinator.bind_live_udp(&mut sockets,proof,5501).unwrap();
+        let mut leases=LeaseTable::<2>::new();
+        // An unchecked endpoint bypassing its canonical policy registry
+        // must deny all five-table publication without touching FileHandles.
+        sockets.bind(owner.pid,owner.generation,5502).unwrap();
+        assert_eq!(retire_full_owner_epoch(&permit,&gate,&mut files,&mut notices,
+            &mut coordinator,&mut sockets,&mut leases,owner,
+            EventKind::Faulted),Err(()));
+        assert!(files.owns(owner));
+        assert_eq!(notices.len(),0);
+        assert_eq!(coordinator.active_generation(owner.pid),
+                   Some(owner.generation));
+        assert_eq!(sockets.pending_owned(owner.pid,owner.generation),Ok(0));
+        // A fresh service with a new incarnation cannot be retired by an old
+        // delayed scheduler notice.
+        files.retire_process_batch_kernel(&[owner]).unwrap();
+        let next=files.bind_process(1).unwrap();
+        assert_ne!(owner.generation,next.generation);
+        assert_eq!(retire_full_owner_epoch(&permit,&gate,&mut files,&mut notices,
+            &mut coordinator,&mut sockets,&mut leases,owner,
+            EventKind::Faulted),Ok(false));
+        assert!(files.owns(next));
+    }
+}
+
+#[cfg(all(test,feature="test-r031-files-gui"))]
+mod r118_batched_real_scheduler_teardown_tests{
+    use super::*;
+    use crate::batch5_session::Identity;
+    use crate::fs_handles::FileHandles;
+    use crate::process_events::{EventKind,ProcessEvents};
+    use crate::process_retirement_txn::{Owner,ProcessRetirement};
+    use crate::network::EpochUdpEndpoints;
+    use crate::agent_03_cap_epoch::LeaseTable;
+
+    fn setup()->(
+        FileHandles,ProcessRetirement<2,2,4>,
+        EpochUdpEndpoints<2,4>,LeaseTable<2>,[Identity;2]
+    ){
+        let mut files=FileHandles::new();
+        let a=files.bind_process(1).unwrap();
+        let b=files.bind_process(2).unwrap();
+        let mut c=ProcessRetirement::<2,2,4>::new();
+        c.start_exact(Owner{pid:a.pid,generation:a.generation}).unwrap();
+        c.start_exact(Owner{pid:b.pid,generation:b.generation}).unwrap();
+        let mut sockets=EpochUdpEndpoints::<2,4>::new();
+        c.bind_live_udp(&mut sockets,
+            Owner{pid:a.pid,generation:a.generation},5501).unwrap();
+        c.bind_live_udp(&mut sockets,
+            Owner{pid:b.pid,generation:b.generation},5502).unwrap();
+        (files,c,sockets,LeaseTable::<2>::new(),[a,b])
+    }
+    #[test]
+    fn two_live_ring3_incarnations_retire_as_one_with_ordered_pid1_events(){
+        let gate=crate::retirement_gate::RetirementGate::new();
+        gate.register_bsp(0,true).unwrap();
+        let permit=gate.try_enter(0,true).unwrap();
+        let (mut files,mut coordinator,mut sockets,mut leases,owners)=setup();
+        let mut notices=ProcessEvents::<3>::new();
+        let receipt=files.selected_operation_guard(owners[1]).unwrap();
+        assert_eq!(retire_full_owner_batch(
+            &permit,&gate,&mut files,&mut notices,&mut coordinator,&mut sockets,
+            &mut leases,&[owners[1],owners[0]],EventKind::Faulted),Ok(2));
+        assert!(!files.owns(owners[0]) && !files.owns(owners[1]));
+        assert!(!files.selected_operation_guard_is_current(receipt));
+        assert!(coordinator.live_sockets_consistent(&sockets));
+        assert_eq!(coordinator.active_udp_ports(),0);
+        assert_eq!(coordinator.queued_notices(),0);
+        assert_eq!(notices.len(),2);
+        for expected in [owners[1],owners[0]]{
+            let token=notices.peek_receipt().unwrap();
+            assert_eq!(token.event.pid,expected.pid);
+            assert_eq!(token.event.value,expected.generation);
+            assert_eq!(token.event.kind,EventKind::Faulted);
+            assert_eq!(notices.acknowledge_receipt(token),Some(token.event));
+        }
+    }
+    #[test]
+    fn late_stale_or_duplicate_owner_does_not_retire_any_live_peer(){
+        let gate=crate::retirement_gate::RetirementGate::new();
+        gate.register_bsp(0,true).unwrap();
+        let permit=gate.try_enter(0,true).unwrap();
+        let (mut files,mut coordinator,mut sockets,mut leases,owners)=setup();
+        let mut notices=ProcessEvents::<2>::new();
+        let stale=Identity{generation:owners[1].generation+1,..owners[1]};
+        for batch in [
+            [owners[0],stale],
+            [owners[0],owners[0]],
+            [Identity{pid:0,..owners[0]},owners[1]],
+        ]{
+            assert_eq!(retire_full_owner_batch(
+                &permit,&gate,&mut files,&mut notices,&mut coordinator,&mut sockets,
+                &mut leases,&batch,EventKind::Exited),Err(()));
+            assert!(files.owns(owners[0])&&files.owns(owners[1]));
+            assert!(coordinator.live_sockets_consistent(&sockets));
+            assert_eq!(coordinator.active_udp_ports(),2);
+            assert_eq!(notices.len(),0);
+        }
+    }
+    #[test]
+    fn unrelated_gate_cannot_authorize_atomic_five_store_retirement(){
+        let (mut files,mut coordinator,mut sockets,mut leases,owners)=setup();
+        let mut notices=ProcessEvents::<2>::new();
+        let right=crate::retirement_gate::RetirementGate::new();
+        let wrong=crate::retirement_gate::RetirementGate::new();
+        right.register_bsp(0,true).unwrap();
+        wrong.register_bsp(0,true).unwrap();
+        let permit=wrong.try_enter(0,true).unwrap();
+        assert!(!permit.issued_by(&right));
+        assert_eq!(retire_full_owner_batch(
+            &permit,&right,&mut files,&mut notices,&mut coordinator,&mut sockets,
+            &mut leases,&owners,EventKind::Exited),Err(()));
+        assert!(files.owns(owners[0]) && files.owns(owners[1]));
+        assert_eq!(notices.len(),0);
+        assert!(coordinator.live_sockets_consistent(&sockets));
+        assert_eq!(coordinator.active_udp_ports(),2);
+        drop(permit);
+        let real=right.try_enter(0,true).unwrap();
+        assert_eq!(retire_full_owner_batch(
+            &real,&right,&mut files,&mut notices,&mut coordinator,&mut sockets,
+            &mut leases,&owners,EventKind::Exited),Ok(2));
+        assert!(!files.owns(owners[0]) && !files.owns(owners[1]));
+    }
+
+    #[test]
+    fn late_event_backpressure_does_not_publish_a_partial_two_owner_exit(){
+        let gate=crate::retirement_gate::RetirementGate::new();
+        gate.register_bsp(0,true).unwrap();
+        let permit=gate.try_enter(0,true).unwrap();
+        let (mut files,mut coordinator,mut sockets,mut leases,owners)=setup();
+        let mut notices=ProcessEvents::<1>::new();
+        assert_eq!(retire_full_owner_batch(
+            &permit,&gate,&mut files,&mut notices,&mut coordinator,&mut sockets,
+            &mut leases,&owners,EventKind::Exited),Err(()));
+        assert!(files.owns(owners[0]) && files.owns(owners[1]));
+        assert!(coordinator.live_sockets_consistent(&sockets));
+        assert_eq!(coordinator.active_udp_ports(),2);
+        assert_eq!(notices.len(),0);
+    }
 }

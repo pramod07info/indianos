@@ -236,6 +236,29 @@ fn wait_for_limit<D:EthernetDevice>(dev:&mut D,limit:u32,
     }
     Err(Error::Timeout)
 }
+/// Poll a genuine NIC frame with the ownership revision sampled BEFORE
+/// each poll, not after a possibly delayed DMA completion. The Rust caller
+/// exclusively owns NIC, policy and socket tables on the experimental BSP.
+/// Physical IRQ-driven drivers need hardware quiescence and a BSP permit.
+fn wait_for_limit_fenced<D:EthernetDevice>(
+    dev:&mut D,limit:u32,
+    mut capture:impl FnMut()->crate::process_retirement_txn::IngressRevision,
+    mut matcher:impl FnMut(
+        crate::process_retirement_txn::IngressRevision,&[u8],[u8;6]
+    )->bool,
+)->Result<(),Error>{
+    let mut frame=[0u8;FRAME_CAP];
+    let mac=dev.mac();
+    for _ in 0..limit{
+        let pre_poll=capture();
+        if let Some(n)=dev.poll(&mut frame)?{
+            if n>frame.len(){return Err(Error::Invalid);}
+            if matcher(pre_poll,&frame[..n],mac){return Ok(());}
+        }
+        spin_loop();
+    }
+    Err(Error::Timeout)
+}
 fn wait_for<D:EthernetDevice>(dev:&mut D,
     matcher:impl FnMut(&[u8],[u8;6])->bool)->Result<(),Error>{
     wait_for_limit(dev,MAX_POLL,matcher)
@@ -264,9 +287,26 @@ pub fn run_demo<D:EthernetDevice>(
     // through the same registry/endpoint grant and validated owned ingress.
     // Synthetic PID1/epoch1 are trusted test fixtures, NOT user-supplied IDs.
     let mut udp_endpoints = EpochUdpEndpoints::<1, 2>::new();
-    let mut registry = crate::udp_owner_epoch::Registry::<1>::new();
-    udp_endpoints.bind_registered(&mut registry,1,1,CLIENT_PORT)
+    // R120: this physical QEMU virtio-net POLL path is owned by the same
+    // incarnation-aware coordinator that handles atomic process teardown.
+    // Do not treat a bare UDP grant as proof that the process remains alive.
+    let mut live_owners =
+        crate::process_retirement_txn::ProcessRetirement::<1,1,4>::new();
+    let network_owner=live_owners.start(1).map_err(|_|Error::Unexpected)?;
+    live_owners.bind_live_udp(&mut udp_endpoints,network_owner,CLIENT_PORT)
         .map_err(|_| Error::Unexpected)?;
+    // R118-072: the real virtio-net UDP/DNS receive route now takes the
+    // kernel's exact-generation, destination-port-derived NIC ingress path,
+    // with a non-Send permit held from RX snapshot through queue admission.
+    // CPU 0 and masked interrupts are trusted QEMU-only facts: the legacy
+    // virtio-net driver is POLLED and must never be called from a real IRQ.
+    // R135: distinct software RX admissions for this one real QEMU NIC.
+    // Physical IRQs remain masked; no claim of hardware DMA quiescence.
+    let nic_rx_fence=crate::nic_rx_fence::NicRxFence::new(1);
+    let ingress_gate=crate::retirement_gate::RetirementGate::new();
+    ingress_gate.register_bsp(0,true).map_err(|_|Error::Unexpected)?;
+    let ingress_permit=ingress_gate.try_enter(0,true)
+        .map_err(|_|Error::Unexpected)?;
     let route_owner=crate::batch5_session::Identity{pid:1,generation:1};
     let mut routes=crate::agent_06_ipv4_route::OwnerRoutes::<1>::new();
     routes.bind_kernel(route_owner,1).map_err(|_|Error::Unexpected)?;
@@ -306,15 +346,24 @@ pub fn run_demo<D:EthernetDevice>(
     transmit_leased_ipv4_checked_clock(dev,&routes,&alternatives,route_owner,1,
         PEER_IP,||initial_clock+1,
         |b,mac|udp_frame(b,mac,PEER_UDP_PORT,UDP_REQ,0x2803))?;
-    let ingress=|frame:&[u8],mac:[u8;6]|{
+    let ingress=|revision:crate::process_retirement_txn::IngressRevision,
+                  frame:&[u8],mac:[u8;6]|{
         parse_udp(frame,mac,PEER_UDP_PORT).is_ok_and(|data|data==UDP_RESP)
-            && udp_endpoints.ingest_registered_frame(
-                &registry,1,1,CLIENT_PORT,frame,mac).is_ok()
+            && nic_rx_fence.try_admit(1).is_ok_and(|rx|
+                live_owners.ingest_nic_frame_device_fenced(
+                    &nic_rx_fence,&rx,&ingress_permit,&ingress_gate,
+                    &mut udp_endpoints,revision,frame,mac)
+                .is_ok_and(|owner|owner==network_owner))
     };
     // Do not treat malformed network replies as successful failover evidence.
     // In the QEMU test the peer confirms packet reception but blackholes
     // this reply. Only a bounded timeout may quarantine the primary path.
-    match wait_for_limit(dev,300_000,ingress){
+    let mut captured_reply:Option<([u8;FRAME_CAP],usize,
+        crate::process_retirement_txn::IngressRevision,[u8;6])>=None;
+    match wait_for_limit_fenced(
+        dev,300_000,
+        ||live_owners.capture_ingress_revision(&ingress_permit),ingress
+    ){
         Err(Error::Timeout)=>{
             // R116 physical QEMU packet acceptance: the original time
             // receipt must have expired (not merely have timed out waiting
@@ -335,14 +384,53 @@ pub fn run_demo<D:EthernetDevice>(
                 return Err(Error::Unexpected);
             }
             stage(b"IndianOS: R114 QEMU primary UDP path timed out and backup route selected\n\0");
-            transmit_leased_ipv4_checked_clock(dev,&routes,&alternatives,route_owner,1,
-        PEER_IP,||initial_clock+20,
+            let retry_receipt=transmit_failover_ipv4_checked_clock(
+                dev,&routes,&alternatives,route_owner,1,PEER_IP,
+                first_receipt,initial_clock+1,||initial_clock+20,
                 |b,mac|udp_frame(b,mac,PEER_UDP_PORT,UDP_REQ,0x2808))?;
-            wait_for(dev,|frame,mac|{
-                parse_udp(frame,mac,PEER_UDP_PORT).is_ok_and(|data|data==UDP_RESP)
-                    && udp_endpoints.ingest_registered_frame(
-                &registry,1,1,CLIENT_PORT,frame,mac).is_ok()
-            })?;
+            if retry_receipt.selected.link!=2||
+               retry_receipt.selected.epoch!=backup.epoch {
+                return Err(Error::Unexpected);
+            }
+            // Retain the EXACT Ethernet frame received by the actual
+            // QEMU virtio NIC and its pre-poll owner revision. Replay this
+            // same descriptor only after process retirement + PID reuse.
+            // A synthetic host-generated packet could not prove the real
+            // NIC's receive path actually traversed the ingress authority.
+            let mut real_rx_frame=[0u8;FRAME_CAP];
+            let mut real_rx_len=0usize;
+            let mut real_rx_revision=None;
+            let mut real_rx_mac=[0u8;6];
+            wait_for_limit_fenced(
+                dev,MAX_POLL,
+                ||live_owners.capture_ingress_revision(&ingress_permit),
+                |revision,frame,mac|{
+                    if frame.len()>real_rx_frame.len() ||
+                       !parse_udp(frame,mac,PEER_UDP_PORT)
+                            .is_ok_and(|data|data==UDP_RESP) {
+                        return false;
+                    }
+                    let Ok(rx)=nic_rx_fence.try_admit(1)else{return false;};
+                    if live_owners.ingest_nic_frame_device_fenced(
+                        &nic_rx_fence,&rx,&ingress_permit,&ingress_gate,
+                        &mut udp_endpoints,revision,frame,mac)
+                        !=Ok(network_owner){
+                        return false;
+                    }
+                    real_rx_frame[..frame.len()].copy_from_slice(frame);
+                    real_rx_len=frame.len();
+                    real_rx_revision=Some(revision);
+                    real_rx_mac=mac;
+                    true
+                }
+            )?;
+            if real_rx_len==0 || real_rx_revision.is_none(){
+                return Err(Error::Unexpected);
+            }
+            // The saved frame and revision stay attached to the exclusive
+            // R028 guest's local stack, never published as user authority.
+            captured_reply=Some((real_rx_frame,real_rx_len,
+                                 real_rx_revision.unwrap(),real_rx_mac));
             stage(b"IndianOS: R116 QEMU DHCP lease expiry blocked primary UDP resend and backup succeeded\n\0");
         },
         // The failure-injection acceptance requires the primary to become
@@ -350,26 +438,77 @@ pub fn run_demo<D:EthernetDevice>(
         _=>return Err(Error::Unexpected),
     }
     let mut udp_reply = [0u8; R033_UDP_BYTES];
-    let bytes = udp_endpoints.receive(1,1,CLIENT_PORT,&mut udp_reply)
+    let bytes = live_owners.receive_live_udp(&mut udp_endpoints,
+        network_owner,CLIENT_PORT,&mut udp_reply)
         .map_err(|_| Error::Unexpected)?;
     if &udp_reply[..bytes] != UDP_RESP { return Err(Error::Unexpected); }
     stage(b"IndianOS: R028 IPv4 UDP echo PASSED\n\0");
     transmit_leased_ipv4_checked_clock(dev,&routes,&alternatives,route_owner,1,
         PEER_IP,||initial_clock+21,dns_query)?;
-    wait_for(dev,|frame,mac|{
-        valid_dns(frame,mac) &&
-            udp_endpoints.ingest_registered_frame(
-                &registry,1,1,CLIENT_PORT,frame,mac).is_ok()
-    })?;
+    wait_for_limit_fenced(
+        dev,MAX_POLL,
+        ||live_owners.capture_ingress_revision(&ingress_permit),
+        |revision,frame,mac|{
+            valid_dns(frame,mac) &&
+                nic_rx_fence.try_admit(1).is_ok_and(|rx|
+                    live_owners.ingest_nic_frame_device_fenced(
+                        &nic_rx_fence,&rx,&ingress_permit,&ingress_gate,
+                        &mut udp_endpoints,revision,frame,mac)
+                    .is_ok_and(|owner|owner==network_owner))
+        }
+    )?;
     let mut dns_reply=[0u8;R033_UDP_BYTES];
-    let dns_bytes=udp_endpoints.receive(1,1,CLIENT_PORT,&mut dns_reply)
+    let dns_bytes=live_owners.receive_live_udp(&mut udp_endpoints,
+        network_owner,CLIENT_PORT,&mut dns_reply)
         .map_err(|_|Error::Unexpected)?;
     if dns_bytes<12 || dns_reply[..2]!=[0x28,0x28] ||
        dns_reply[2]&0x80==0{return Err(Error::Unexpected);}
-    udp_endpoints.retire_registered(&mut registry,1,1)
+    // Stop NEW software RX admission and prove no handler remains before
+    // revoking the old owner and reusing its PID and UDP port. The dedicated
+    // QEMU NIC is exclusively polled: no MSI/MSI-X or physical DMA stop is
+    // exercised by this isolated profile.
+    let stopped=nic_rx_fence.begin_quiesce(1)
         .map_err(|_|Error::Unexpected)?;
+    if nic_rx_fence.drained(stopped)!=Ok(true){
+        return Err(Error::Unexpected);
+    }
+    let retired=live_owners.retire_live_exited_batch(
+        &mut udp_endpoints,&[network_owner]).map_err(|_|Error::Unexpected)?;
+    if retired.udp_ports_released!=1 || retired.notices_enqueued!=1 ||
+        live_owners.active_generation(network_owner.pid).is_some(){
+        return Err(Error::Unexpected);
+    }
+    // R130: Recycle PID1 and the exact receiving UDP port. The actual
+    // Ethernet reply frame captured from the real NIC *before retirement*
+    // must NEVER be inherited by the new incarnation. The saved revision
+    // is checked before UDP parsing or any queue insertion.
+    let (saved_wire,saved_len,stale_revision,saved_mac)=
+        captured_reply.ok_or(Error::Unexpected)?;
+    let replacement=live_owners.start(network_owner.pid)
+        .map_err(|_|Error::Unexpected)?;
+    if replacement.generation==network_owner.generation {
+        return Err(Error::Unexpected);
+    }
+    live_owners.bind_live_udp(&mut udp_endpoints,replacement,CLIENT_PORT)
+        .map_err(|_|Error::Unexpected)?;
+    if nic_rx_fence.finish_rebind(stopped)!=Ok(2){
+        return Err(Error::Unexpected);
+    }
+    let rx=nic_rx_fence.try_admit(1).map_err(|_|Error::Unexpected)?;
+    if live_owners.ingest_nic_frame_device_fenced(
+        &nic_rx_fence,&rx,&ingress_permit,&ingress_gate,
+        &mut udp_endpoints,stale_revision,
+        &saved_wire[..saved_len],saved_mac)
+        !=Err(crate::process_retirement_txn::RetirementError::Sockets(
+                SocketError::Denied)) ||
+       udp_endpoints.pending_owned(replacement.pid,replacement.generation)!=Ok(0){
+        return Err(Error::Unexpected);
+    }
     routes.retire(route_owner,1).map_err(|_|Error::Unexpected)?;
     stage(b"IndianOS: R028 UDP DNS A query indianos.test PASSED\n\0");
+    stage(b"IndianOS: R124 QEMU permit-fenced kernel NIC UDP/DNS ingress PASSED\n\0");
+    stage(b"IndianOS: R130 QEMU stale NIC frame denied after PID/UDP epoch recycle\n\0");
+    stage(b"IndianOS: R135 QEMU NIC RX drained before UDP owner recycle PASSED\n\0");
     stage(b"IndianOS: M2 live NIC IPv4/UDP DNS verifier PASSED\n\0");
     // Strict stop-and-wait TCP handshake and one request-response exchange.
     transmit(dev,|b,m|tcp_frame(b,m,TCP_SEQ,0,0x02,&[],0x2804))?;
@@ -517,6 +656,7 @@ struct QueuedUdp {
     destination_pid: u32, destination_port: u16, len: usize,
     bytes: [u8; R033_UDP_BYTES],
 }
+#[derive(Clone)]
 pub struct UdpEndpoints<const PORTS: usize, const QUEUE: usize> {
     ports: [Option<PortOwner>; PORTS],
     queue: [Option<QueuedUdp>; QUEUE],
@@ -657,31 +797,38 @@ mod r033_udp_tests {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IngressError { Malformed, BadChecksum, Endpoint(SocketError) }
 
+/// Parse AND validate a NIC-delivered UDP packet before using its destination
+/// port to locate a privileged kernel owner. A packet may never select its PID
+/// or generation; those come only from the live registry. This parser never
+/// touches a socket or mutates the packet queue. No hardware IRQ is enabled.
+pub(crate) fn authenticated_udp_frame<'a>(
+    frame:&'a [u8],local_mac:[u8;6],
+)->Result<(u16,&'a [u8]),IngressError>{
+    let ip=validate_ipv4(frame,local_mac).map_err(|e|match e{
+        Error::Checksum=>IngressError::BadChecksum,
+        _=>IngressError::Malformed,
+    })?;
+    if ip.proto!=17||ip.body.len()<8{return Err(IngressError::Malformed);}
+    let udp=ip.body;
+    let source=be16(&udp[..2]);
+    let destination=be16(&udp[2..4]);
+    let length=be16(&udp[4..6]) as usize;
+    if source==0||destination==0||length!=udp.len()||
+        be16(&udp[6..8])==0{return Err(IngressError::Malformed);}
+    if transport_sum(&PEER_IP,&LOCAL_IP,17,udp)!=0 {
+        return Err(IngressError::BadChecksum);
+    }
+    Ok((destination,&udp[8..]))
+}
+
 impl<const PORTS: usize, const QUEUE: usize> UdpEndpoints<PORTS, QUEUE> {
     /// Single-peer QEMU ingress, not a general-purpose UDP socket service.
     /// The queue is not modified if any framing or checksum check fails.
     pub fn ingest_ethernet_frame(
         &mut self, frame: &[u8], local_mac: [u8; 6],
     ) -> Result<(), IngressError> {
-        let ip = validate_ipv4(frame, local_mac).map_err(|e| match e {
-            Error::Checksum => IngressError::BadChecksum,
-            _ => IngressError::Malformed,
-        })?;
-        if ip.proto != 17 || ip.body.len() < 8 {
-            return Err(IngressError::Malformed);
-        }
-        let udp = ip.body;
-        let source_port = be16(&udp[0..2]);
-        let destination_port = be16(&udp[2..4]);
-        let length = be16(&udp[4..6]) as usize;
-        if source_port == 0 || destination_port == 0 ||
-            length != udp.len() || be16(&udp[6..8]) == 0 {
-            return Err(IngressError::Malformed);
-        }
-        if transport_sum(&PEER_IP, &LOCAL_IP, 17, udp) != 0 {
-            return Err(IngressError::BadChecksum);
-        }
-        self.enqueue(destination_port, &udp[8..])
+        let (destination_port,payload)=authenticated_udp_frame(frame,local_mac)?;
+        self.enqueue(destination_port,payload)
             .map_err(IngressError::Endpoint)
     }
 }
@@ -893,6 +1040,7 @@ mod r034_ingress_tests {
 /// Batch 1: generation-bound process endpoint adapter around the actual R034
 /// validated-ingress queue. Scheduler supplies trusted (PID,generation).
 /// A recycled PID must retire its old bindings before registering new ones.
+#[derive(Clone)]
 pub struct EpochUdpEndpoints<const PORTS: usize, const QUEUE: usize> {
     endpoints: UdpEndpoints<PORTS, QUEUE>,
     owners: [Option<(u32,u64)>; PORTS],
@@ -900,6 +1048,27 @@ pub struct EpochUdpEndpoints<const PORTS: usize, const QUEUE: usize> {
 impl<const PORTS: usize, const QUEUE: usize> EpochUdpEndpoints<PORTS, QUEUE> {
     pub const fn new() -> Self {
         Self { endpoints: UdpEndpoints::new(), owners: [None; PORTS] }
+    }
+
+    /// R120: prove that the actual socket/packet queue ownership has exactly
+    /// the same live port grants as the kernel generation registry. This is
+    /// required before a cross-table transaction may publish mutations.
+    /// The surrounding kernel caller must exclusively own both tables.
+    pub fn matches_registry<const N:usize>(
+        &self,registry:&crate::udp_owner_epoch::Registry<N>
+    )->bool{
+        let ports=self.endpoints.ports.iter().flatten().count();
+        if ports!=registry.active_count(){return false;}
+        self.endpoints.ports.iter().flatten().all(|binding|{
+            self.owners.iter().flatten().any(|&(pid,generation)|
+                pid==binding.pid &&
+                registry.owner_of(binding.port)==Some(
+                    crate::udp_owner_epoch::Grant{
+                        pid,generation,port:binding.port
+                    }
+                )
+            )
+        })
     }
     fn authenticated(&self, pid: u32, generation: u64) -> bool {
         pid != 0 && generation != 0 && self.owners.iter().flatten()
@@ -1121,11 +1290,8 @@ impl<const PORTS:usize,const QUEUE:usize> EpochUdpEndpoints<PORTS,QUEUE> {
         if !self.authenticated(pid,generation)||!self.endpoints.owns(pid,port){
             return Err(IngressError::Endpoint(SocketError::Denied));
         }
-        let ip=validate_ipv4(frame,mac).map_err(|err|match err{
-            Error::Checksum=>IngressError::BadChecksum,_=>IngressError::Malformed,
-        })?;
-        if ip.proto!=17||ip.body.len()<8{return Err(IngressError::Malformed);}
-        if be16(&ip.body[2..4])!=port{
+        let (destination,_payload)=authenticated_udp_frame(frame,mac)?;
+        if destination!=port{
             return Err(IngressError::Endpoint(SocketError::Denied));
         }
         self.endpoints.ingest_ethernet_frame(frame,mac)
@@ -1872,18 +2038,18 @@ mod r116_registered_ring3_udp_tests{
 /// can supply two *trusted* readings. Re-check the same lease receipt at
 /// dispatch time so expiry between packet preparation and send cannot
 /// authorize the original route. No user-originated timestamp is accepted.
-pub fn transmit_leased_ipv4_checked_clock<
+fn transmit_leased_ipv4_checked_try_clock<
  D:EthernetDevice,const N:usize,const M:usize
 >(
  dev:&mut D,
  routes:&crate::agent_06_ipv4_route::OwnerRoutes<N>,
  links:&crate::agent_06_ipv4_route::FailoverRoutes<M>,
  owner:crate::batch5_session::Identity,owner_epoch:u64,
- destination:[u8;4],mut clock:impl FnMut()->u64,
+ destination:[u8;4],mut clock:impl FnMut()->Result<u64,Error>,
  constructor:impl FnOnce(&mut[u8],[u8;6])->usize,
 )->Result<(),Error>{
  let dest=u32::from_be_bytes(destination);
- let before=clock();
+ let before=clock()?;
  let token=links.receipt_at(dest,before).ok_or(Error::Unexpected)?;
  let policy=routes.select(owner,owner_epoch,dest)
     .map_err(|_|Error::Unexpected)?.ok_or(Error::Unexpected)?;
@@ -1892,7 +2058,7 @@ pub fn transmit_leased_ipv4_checked_clock<
  // trusted clock sample, directly on the NIC dispatch boundary.
  transmit_owned_ipv4_guarded(dev,routes,owner,owner_epoch,destination,
     ||{
-        let at_dispatch=clock();
+        let at_dispatch=clock()?;
         if at_dispatch<before||
             !links.receipt_is_current_at(dest,at_dispatch,token){
             return Err(Error::Unexpected);
@@ -1903,6 +2069,143 @@ pub fn transmit_leased_ipv4_checked_clock<
         Ok(())
     },constructor)
 }
+
+/// QEMU policy clock fixture: caller supplies two trusted samples. The
+/// fallible production implementation below never accepts a missing timer.
+pub fn transmit_leased_ipv4_checked_clock<
+ D:EthernetDevice,const N:usize,const M:usize
+>(
+ dev:&mut D,
+ routes:&crate::agent_06_ipv4_route::OwnerRoutes<N>,
+ links:&crate::agent_06_ipv4_route::FailoverRoutes<M>,
+ owner:crate::batch5_session::Identity,owner_epoch:u64,
+ destination:[u8;4],mut clock:impl FnMut()->u64,
+ constructor:impl FnOnce(&mut[u8],[u8;6])->usize,
+)->Result<(),Error>{
+ transmit_leased_ipv4_checked_try_clock(
+    dev,routes,links,owner,owner_epoch,destination,
+    ||Ok(clock()),constructor)
+}
+
+/// R118: actual kernel timer-backed link admission for callers that have
+/// enabled and calibrated the BSP timer. Every NIC transmit re-samples the
+/// delivered IRQ counter after frame construction. A stopped, uncalibrated,
+/// or zero-progress timer DENIES the frame. No fake test clock is accepted.
+/// This does not provide SMP TSC synchronization, NIC IRQ/IOMMU safety or
+/// multi-NIC physical qualification.
+#[cfg(feature="timer")]
+pub fn transmit_leased_ipv4_kernel_clock<
+ D:EthernetDevice,const N:usize,const M:usize
+>(
+ dev:&mut D,
+ routes:&crate::agent_06_ipv4_route::OwnerRoutes<N>,
+ links:&crate::agent_06_ipv4_route::FailoverRoutes<M>,
+ owner:crate::batch5_session::Identity,owner_epoch:u64,
+ destination:[u8;4],
+ constructor:impl FnOnce(&mut[u8],[u8;6])->usize,
+)->Result<(),Error>{
+ transmit_leased_ipv4_checked_try_clock(
+    dev,routes,links,owner,owner_epoch,destination,
+    ||crate::timer::kernel_monotonic_100hz().ok_or(Error::Unexpected),
+    constructor)
+}
+/// R118-079: a RETRY must carry the previous, kernel-issued route receipt
+/// and dispatch tick. Every retry reads the trusted clock both before frame
+/// serialization and at the NIC dispatch boundary. This denies clock
+/// rollback, a nonprogressing retry deadline, same-link replay, a stale link
+/// generation and a renewed lease expiring while the frame is assembled.
+///
+/// The production entry point below derives clock time only from the BSP
+/// calibrated timer. The QEMU fixture uses a separately named synthetic
+/// source to test the real virtio-net failover network path.
+fn transmit_failover_ipv4_checked_try_clock<
+ D:EthernetDevice,const N:usize,const M:usize
+>(
+ dev:&mut D,
+ routes:&crate::agent_06_ipv4_route::OwnerRoutes<N>,
+ links:&crate::agent_06_ipv4_route::FailoverRoutes<M>,
+ owner:crate::batch5_session::Identity,owner_epoch:u64,
+ destination:[u8;4],
+ previous:crate::agent_06_ipv4_route::RouteReceipt,
+ previous_tick:u64,
+ mut clock:impl FnMut()->Result<u64,Error>,
+ constructor:impl FnOnce(&mut[u8],[u8;6])->usize,
+)->Result<crate::agent_06_ipv4_route::RouteReceipt,Error>{
+ let dest=u32::from_be_bytes(destination);
+ let before=clock()?;
+ // A retry without forward time progress cannot prove that a timeout
+ // elapsed; a source reset must not reauthorize the original route.
+ if before<=previous_tick{return Err(Error::Unexpected);}
+ let chosen=links.receipt_at(dest,before).ok_or(Error::Unexpected)?;
+ let selected=chosen.selected;
+ if selected.link==previous.selected.link ||
+    selected.route!=previous.selected.route {
+    // This call is specifically a same-destination failover, not ordinary
+    // retransmission. Never return to the primary during its reset window.
+    return Err(Error::Unexpected);
+ }
+ let policy=routes.select(owner,owner_epoch,dest)
+     .map_err(|_|Error::Unexpected)?.ok_or(Error::Unexpected)?;
+ if policy!=selected.route{return Err(Error::Unexpected);}
+ transmit_owned_ipv4_guarded(dev,routes,owner,owner_epoch,destination,
+     ||{
+         let dispatch=clock()?;
+         if dispatch<before ||
+            !links.receipt_is_current_at(dest,dispatch,chosen) {
+             return Err(Error::Unexpected);
+         }
+         let now_route=routes.select(owner,owner_epoch,dest)
+             .map_err(|_|Error::Unexpected)?.ok_or(Error::Unexpected)?;
+         if now_route!=selected.route{return Err(Error::Unexpected);}
+         Ok(())
+     },constructor)?;
+ Ok(chosen)
+}
+
+/// QEMU-only injectable clock fixture for the real guest's forced primary
+/// UDP timeout and live virtio-net backup. Production callers MUST use
+/// transmit_failover_ipv4_kernel_clock instead.
+pub fn transmit_failover_ipv4_checked_clock<
+ D:EthernetDevice,const N:usize,const M:usize
+>(
+ dev:&mut D,
+ routes:&crate::agent_06_ipv4_route::OwnerRoutes<N>,
+ links:&crate::agent_06_ipv4_route::FailoverRoutes<M>,
+ owner:crate::batch5_session::Identity,owner_epoch:u64,
+ destination:[u8;4],
+ previous:crate::agent_06_ipv4_route::RouteReceipt,
+ previous_tick:u64,
+ mut clock:impl FnMut()->u64,
+ constructor:impl FnOnce(&mut[u8],[u8;6])->usize,
+)->Result<crate::agent_06_ipv4_route::RouteReceipt,Error>{
+ transmit_failover_ipv4_checked_try_clock(
+     dev,routes,links,owner,owner_epoch,destination,previous,
+     previous_tick,||Ok(clock()),constructor)
+}
+
+/// Production-only BSP timer-backed failover. A missing/stopped or
+/// uncalibrated kernel timer refuses to retry without NIC submission.
+/// This is NOT physical multi-NIC, IRQ, IOMMU or SMP qualification.
+#[cfg(feature="timer")]
+pub fn transmit_failover_ipv4_kernel_clock<
+ D:EthernetDevice,const N:usize,const M:usize
+>(
+ dev:&mut D,
+ routes:&crate::agent_06_ipv4_route::OwnerRoutes<N>,
+ links:&crate::agent_06_ipv4_route::FailoverRoutes<M>,
+ owner:crate::batch5_session::Identity,owner_epoch:u64,
+ destination:[u8;4],
+ previous:crate::agent_06_ipv4_route::RouteReceipt,
+ previous_tick:u64,
+ constructor:impl FnOnce(&mut[u8],[u8;6])->usize,
+)->Result<crate::agent_06_ipv4_route::RouteReceipt,Error>{
+ transmit_failover_ipv4_checked_try_clock(
+     dev,routes,links,owner,owner_epoch,destination,previous,
+     previous_tick,
+     ||crate::timer::kernel_monotonic_100hz().ok_or(Error::Unexpected),
+     constructor)
+}
+
 #[cfg(test)]
 mod r117_monotonic_route_clock_tests {
  use super::*;
@@ -2462,4 +2765,377 @@ mod r120_three_process_mixed_resource_retirement {
    assert_eq!(registry.authorize(2,4,6102),Ok(()));
   }
  }
+}
+
+#[cfg(test)]
+mod r118_kernel_clock_dispatch_fail_closed_tests{
+    use super::*;
+    use crate::agent_06_ipv4_route::{OwnerRoutes,FailoverRoutes,Route,RouteCandidate};
+    use crate::batch5_session::Identity;
+    struct Fake{writes:usize}
+    impl EthernetDevice for Fake{
+        fn mac(&self)->[u8;6]{[0x52,0x54,0,0x12,0x34,0x56]}
+        fn send(&mut self,_frame:&[u8])->Result<(),Error>{self.writes+=1;Ok(())}
+        fn poll(&mut self,_out:&mut[u8])->Result<Option<usize>,Error>{Ok(None)}
+    }
+    #[test]
+    fn missing_hardware_tick_at_dispatch_never_writes_a_nic_frame(){
+        let owner=Identity{pid:1,generation:8};
+        let route=Route{network:0x0a07_0000,prefix:24,next_hop:0};
+        let mut routes=OwnerRoutes::<1>::new();
+        routes.bind_kernel(owner,3).unwrap();
+        routes.publish(owner,3,&[route]).unwrap();
+        let mut links=FailoverRoutes::<1>::new();
+        links.add(RouteCandidate{
+            route,metric:1,link:1,epoch:7,healthy:true
+        }).unwrap();
+        let mut nic=Fake{writes:0};
+        let mut samples=0;
+        let result=transmit_leased_ipv4_checked_try_clock(
+            &mut nic,&routes,&links,owner,3,PEER_IP,
+            ||{
+                samples+=1;
+                if samples==1{Ok(10)}else{Err(Error::Unexpected)}
+            },
+            |buf,mac|udp_frame(buf,mac,PEER_UDP_PORT,b"safe",6));
+        assert_eq!(result,Err(Error::Unexpected));
+        assert_eq!(samples,2);
+        assert_eq!(nic.writes,0);
+        assert_eq!(transmit_leased_ipv4_checked_try_clock(
+            &mut nic,&routes,&links,owner,3,PEER_IP,
+            ||Err(Error::Unexpected),
+            |buf,mac|udp_frame(buf,mac,PEER_UDP_PORT,b"safe",7)),
+            Err(Error::Unexpected));
+        assert_eq!(nic.writes,0);
+    }
+}
+
+// R118-072 source regression: real Ethernet/UDP validation must route via
+// trusted registry ownership without an untrusted packet-supplied PID.
+#[cfg(test)]
+mod r118_privileged_nic_ingress_tests{
+    use super::*;
+    use crate::process_retirement_txn::{ProcessRetirement,Owner,RetirementError};
+    use crate::retirement_gate::{RetirementGate,GateError};
+    use crate::udp_owner_epoch::Error as OwnerError;
+    const LOCAL:[u8;6]=[0x52,0x54,0,0x12,0x34,0x56];
+
+    fn reply(port:u16,payload:&[u8])->([u8;FRAME_CAP],usize){
+        let mut frame=[0u8;FRAME_CAP];
+        let len=8+payload.len();
+        ethernet_header(&mut frame,LOCAL,PEER_MAC,0x0800);
+        ipv4_header(&mut frame[14..34],17,len,0x2201);
+        frame[26..30].copy_from_slice(&PEER_IP);
+        frame[30..34].copy_from_slice(&LOCAL_IP);
+        put16(&mut frame,24,0);
+        let ip_sum=checksum(&frame[14..34]);
+        put16(&mut frame,24,ip_sum);
+        let udp=&mut frame[34..34+len];
+        put16(udp,0,PEER_UDP_PORT);
+        put16(udp,2,port);
+        put16(udp,4,len as u16);
+        udp[8..].copy_from_slice(payload);
+        let sum=transport_sum(&PEER_IP,&LOCAL_IP,17,udp);
+        put16(udp,6,if sum==0{0xffff}else{sum});
+        (frame,34+len)
+    }
+
+    #[test]
+    fn actual_wire_destination_selects_only_live_registered_process(){
+        let gate=RetirementGate::new();
+        gate.register_bsp(0,true).unwrap();
+        let mut sockets=EpochUdpEndpoints::<2,4>::new();
+        let mut k=ProcessRetirement::<2,2,4>::new();
+        let a=k.start(1).unwrap();
+        let b=k.start(2).unwrap();
+        k.bind_live_udp(&mut sockets,a,5001).unwrap();
+        k.bind_live_udp(&mut sockets,b,5002).unwrap();
+        let (f,n)=reply(5002,b"peer");
+        let permit=gate.try_enter(0,true).unwrap();
+        assert_eq!(k.ingest_kernel_nic_frame(
+            &permit,&mut sockets,k.capture_ingress_revision(&permit),&f[..n],LOCAL),Ok(b));
+        let mut out=[0u8;8];
+        assert_eq!(k.receive_live_udp(&mut sockets,a,5001,&mut out),
+            Err(RetirementError::Sockets(SocketError::Empty)));
+        assert_eq!(k.receive_live_udp(&mut sockets,b,5002,&mut out),Ok(4));
+        assert_eq!(&out[..4],b"peer");
+        drop(permit);
+        k.retire_live_exited_batch(&mut sockets,&[b]).unwrap();
+        let permit=gate.try_enter(0,true).unwrap();
+        assert_eq!(k.ingest_kernel_nic_frame(
+            &permit,&mut sockets,k.capture_ingress_revision(&permit),&f[..n],LOCAL),
+            Err(RetirementError::Udp(OwnerError::Denied)));
+        assert_eq!(sockets.pending_owned(a.pid,a.generation),Ok(0));
+        assert_eq!(k.active_generation(b.pid),None);
+    }
+
+    #[test]
+    fn malformed_checksum_unknown_port_and_wrong_cpu_never_enqueue(){
+        let gate=RetirementGate::new();
+        gate.register_bsp(0,true).unwrap();
+        let mut sockets=EpochUdpEndpoints::<1,2>::new();
+        let mut k=ProcessRetirement::<1,1,2>::new();
+        let a=k.start(9).unwrap();
+        k.bind_live_udp(&mut sockets,a,6000).unwrap();
+        assert!(matches!(gate.try_enter(1,true),Err(GateError::WrongCpu)));
+        assert!(matches!(gate.try_enter(0,false),Err(GateError::InterruptsEnabled)));
+        let permit=gate.try_enter(0,true).unwrap();
+        let (f,n)=reply(6000,b"safe");
+        let mut damaged=f;damaged[40]^=1;
+        assert_eq!(k.ingest_kernel_nic_frame(
+            &permit,&mut sockets,k.capture_ingress_revision(&permit),&damaged[..n],LOCAL),
+            Err(RetirementError::Ingress(IngressError::BadChecksum)));
+        let (wrong,wn)=reply(6001,b"bad");
+        assert_eq!(k.ingest_kernel_nic_frame(
+            &permit,&mut sockets,k.capture_ingress_revision(&permit),&wrong[..wn],LOCAL),
+            Err(RetirementError::Udp(OwnerError::Denied)));
+        let mut out=[0xa5u8;8];
+        assert_eq!(k.receive_live_udp(&mut sockets,a,6000,&mut out),
+            Err(RetirementError::Sockets(SocketError::Empty)));
+        assert_eq!(out,[0xa5;8]);
+    }
+
+
+    #[test]
+    fn r135_foreign_device_rx_permit_cannot_enqueue_and_quiesce_drains(){
+        let gate=RetirementGate::new();gate.register_bsp(0,true).unwrap();
+        let bsp=gate.try_enter(0,true).unwrap();
+        let mut sockets=EpochUdpEndpoints::<1,2>::new();
+        let mut k=ProcessRetirement::<1,1,2>::new();
+        let live=k.start(1).unwrap();
+        k.bind_live_udp(&mut sockets,live,5001).unwrap();
+        let revision=k.capture_ingress_revision(&bsp);
+        let rx_device=crate::nic_rx_fence::NicRxFence::new(7);
+        let other=crate::nic_rx_fence::NicRxFence::new(7);
+        let wrong=other.try_admit(7).unwrap();
+        let (frame,n)=reply(5001,b"valid");
+        assert_eq!(k.ingest_nic_frame_device_fenced(
+            &rx_device,&wrong,&bsp,&gate,&mut sockets,revision,&frame[..n],LOCAL),
+            Err(RetirementError::Sockets(SocketError::Denied)));
+        assert_eq!(sockets.pending_owned(live.pid,live.generation),Ok(0));
+        drop(wrong);
+        // Even a correct device must reject a retirement permit from
+        // a DIFFERENT gate with the same numeric bootstrap CPU ID.
+        let foreign_gate=RetirementGate::new();
+        foreign_gate.register_bsp(0,true).unwrap();
+        let bogus_bsp=foreign_gate.try_enter(0,true).unwrap();
+        let rx=rx_device.try_admit(7).unwrap();
+        assert_eq!(k.ingest_nic_frame_device_fenced(
+            &rx_device,&rx,&bogus_bsp,&gate,&mut sockets,
+            revision,&frame[..n],LOCAL),
+            Err(RetirementError::Sockets(SocketError::Denied)));
+        assert_eq!(sockets.pending_owned(live.pid,live.generation),Ok(0));
+        drop(rx);
+        drop(bogus_bsp);
+        let valid=rx_device.try_admit(7).unwrap();
+        assert_eq!(k.ingest_nic_frame_device_fenced(
+            &rx_device,&valid,&bsp,&gate,&mut sockets,revision,&frame[..n],LOCAL),
+            Ok(live));
+        let quiesce=rx_device.begin_quiesce(7).unwrap();
+        assert_eq!(rx_device.drained(quiesce),Ok(false));
+        assert_eq!(k.ingest_nic_frame_device_fenced(
+            &rx_device,&valid,&bsp,&gate,&mut sockets,revision,&frame[..n],LOCAL),
+            Err(RetirementError::Sockets(SocketError::Denied)));
+        drop(valid);
+        assert_eq!(rx_device.drained(quiesce),Ok(true));
+        k.retire_live_exited_batch(&mut sockets,&[live]).unwrap();
+        let recycled=k.start(1).unwrap();
+        k.bind_live_udp(&mut sockets,recycled,5001).unwrap();
+        assert_eq!(rx_device.finish_rebind(quiesce),Ok(2));
+        let fresh=rx_device.try_admit(7).unwrap();
+        assert_eq!(k.ingest_nic_frame_device_fenced(
+            &rx_device,&fresh,&bsp,&gate,&mut sockets,revision,&frame[..n],LOCAL),
+            Err(RetirementError::Sockets(SocketError::Denied)));
+        assert_eq!(sockets.pending_owned(recycled.pid,recycled.generation),Ok(0));
+    }
+
+    #[test]
+    fn stale_polled_packet_cannot_cross_port_rebind_to_recycled_pid(){
+        let gate=RetirementGate::new();gate.register_bsp(0,true).unwrap();
+        let mut sockets=EpochUdpEndpoints::<2,4>::new();
+        let mut k=ProcessRetirement::<2,2,4>::new();
+        let old=k.start(1).unwrap();
+        let peer=k.start(2).unwrap();
+        k.bind_live_udp(&mut sockets,old,5001).unwrap();
+        k.bind_live_udp(&mut sockets,peer,5002).unwrap();
+        // The NIC begins polling while PID 1 still owns port 5001.
+        let permit=gate.try_enter(0,true).unwrap();
+        let old_rx=k.capture_ingress_revision(&permit);
+        drop(permit);
+        let (frame,len)=reply(5001,b"stale");
+        k.retire_live_exited_batch(&mut sockets,&[old]).unwrap();
+        let recycled=k.start(1).unwrap();
+        k.bind_live_udp(&mut sockets,recycled,5001).unwrap();
+        assert_ne!(old.generation,recycled.generation);
+        let permit=gate.try_enter(0,true).unwrap();
+        assert_eq!(k.ingest_kernel_nic_frame(
+            &permit,&mut sockets,old_rx,&frame[..len],LOCAL),
+            Err(RetirementError::Sockets(SocketError::Denied)));
+        assert_eq!(sockets.pending_owned(recycled.pid,recycled.generation),Ok(0));
+        assert_eq!(sockets.pending_owned(peer.pid,peer.generation),Ok(0));
+        // A NEW receive descriptor captured after the rebind may deliver
+        // fresh traffic. Physical NIC RX descriptors must be drained and
+        // retagged before such a descriptor is considered authoritative.
+        let (fresh,fresh_len)=reply(5001,b"fresh");
+        let current_rx=k.capture_ingress_revision(&permit);
+        assert_eq!(k.ingest_kernel_nic_frame(
+            &permit,&mut sockets,current_rx,&fresh[..fresh_len],LOCAL),Ok(recycled));
+        let mut out=[0u8;16];
+        assert_eq!(k.receive_live_udp(&mut sockets,recycled,5001,&mut out),Ok(5));
+        assert_eq!(&out[..5],b"fresh");
+    }
+    #[test]
+    fn stale_poll_token_is_rejected_even_for_unrelated_peer_port(){
+        let gate=RetirementGate::new();gate.register_bsp(0,true).unwrap();
+        let mut sockets=EpochUdpEndpoints::<2,4>::new();
+        let mut k=ProcessRetirement::<2,2,4>::new();
+        let a=k.start(1).unwrap();let peer=k.start(2).unwrap();
+        k.bind_live_udp(&mut sockets,a,5001).unwrap();
+        k.bind_live_udp(&mut sockets,peer,5002).unwrap();
+        let permit=gate.try_enter(0,true).unwrap();
+        let old_rx=k.capture_ingress_revision(&permit);
+        drop(permit);
+        k.close_live_udp(&mut sockets,a,5001).unwrap();
+        let (frame,n)=reply(5002,b"peer");
+        let permit=gate.try_enter(0,true).unwrap();
+        assert_eq!(k.ingest_kernel_nic_frame(
+            &permit,&mut sockets,old_rx,&frame[..n],LOCAL),
+            Err(RetirementError::Sockets(SocketError::Denied)));
+        assert_eq!(sockets.pending_owned(peer.pid,peer.generation),Ok(0));
+        let new_rx=k.capture_ingress_revision(&permit);
+        assert_eq!(k.ingest_kernel_nic_frame(
+            &permit,&mut sockets,new_rx,&frame[..n],LOCAL),Ok(peer));
+    }
+    #[test]
+    fn staged_teardown_revokes_old_generation_and_preserves_peer_traffic(){
+        let gate=RetirementGate::new();
+        gate.register_bsp(0,true).unwrap();
+        let mut sockets=EpochUdpEndpoints::<2,4>::new();
+        let mut k=ProcessRetirement::<2,2,4>::new();
+        let old=k.start(1).unwrap();
+        let peer=k.start(2).unwrap();
+        k.bind_live_udp(&mut sockets,old,5001).unwrap();
+        k.bind_live_udp(&mut sockets,peer,5002).unwrap();
+        let (frame,n)=reply(5002,b"live");
+        let permit=gate.try_enter(0,true).unwrap();
+        assert_eq!(k.ingest_kernel_nic_frame(
+            &permit,&mut sockets,k.capture_ingress_revision(&permit),&frame[..n],LOCAL),Ok(peer));
+        drop(permit);
+        k.retire_live_exited_batch(&mut sockets,&[old]).unwrap();
+        let newer=k.start(1).unwrap();
+        k.bind_live_udp(&mut sockets,newer,5001).unwrap();
+        assert_ne!(newer.generation,old.generation);
+        assert!(k.ingest_live_udp(&mut sockets,old,5001,
+            &frame[..n],LOCAL).is_err());
+        let mut out=[0u8;8];
+        assert_eq!(k.receive_live_udp(&mut sockets,peer,5002,&mut out),Ok(4));
+        assert_eq!(&out[..4],b"live");
+    }
+}
+
+#[cfg(test)]
+mod r118_monotonic_failover_retry_tests {
+    use super::*;
+    use crate::agent_06_ipv4_route::{
+        OwnerRoutes,FailoverRoutes,Route,RouteCandidate,RouteReceipt
+    };
+    use crate::batch5_session::Identity;
+
+    struct Nic { sent:usize }
+    impl EthernetDevice for Nic {
+        fn mac(&self)->[u8;6]{[0x52,0x54,0,0x12,0x34,0x56]}
+        fn send(&mut self,_frame:&[u8])->Result<(),Error>{
+            self.sent+=1;Ok(())
+        }
+        fn poll(&mut self,_out:&mut[u8])->Result<Option<usize>,Error>{
+            Ok(None)
+        }
+    }
+    fn setup()->(OwnerRoutes<1>,FailoverRoutes<2>,Identity,RouteReceipt) {
+        let owner=Identity{pid:1,generation:7};
+        let route=Route{network:0x0a07_0000,prefix:24,next_hop:0};
+        let mut policy=OwnerRoutes::<1>::new();
+        policy.bind_kernel(owner,4).unwrap();
+        policy.publish(owner,4,&[route]).unwrap();
+        let mut links=FailoverRoutes::<2>::new();
+        links.add_dhcp_lease(RouteCandidate{
+            route,metric:1,link:1,epoch:1,healthy:true
+        },100,120).unwrap();
+        links.add(RouteCandidate{
+            route,metric:9,link:2,epoch:1,healthy:true
+        }).unwrap();
+        let initial=links.receipt_at(u32::from_be_bytes(PEER_IP),101).unwrap();
+        assert_eq!(initial.selected.link,1);
+        (policy,links,owner,initial)
+    }
+    fn retry(nic:&mut Nic,policy:&OwnerRoutes<1>,links:&FailoverRoutes<2>,
+             owner:Identity,prior:RouteReceipt,first_tick:u64,
+             times:[u64;2])->Result<RouteReceipt,Error>{
+        let mut i=0;
+        transmit_failover_ipv4_checked_clock(nic,policy,links,
+            owner,4,PEER_IP,prior,first_tick,
+            ||{let value=times[i];i+=1;value},
+            |bytes,mac|udp_frame(bytes,mac,PEER_UDP_PORT,b"retry",0x2911))
+    }
+    #[test]
+    fn real_failover_requires_new_link_and_forward_kernel_time() {
+        let (policy,mut links,owner,prior)=setup();
+        let mut nic=Nic{sent:0};
+        assert_eq!(retry(&mut nic,&policy,&links,owner,prior,101,[110,110]),
+                   Err(Error::Unexpected));
+        assert_eq!(nic.sent,0);
+        links.begin_link_reset(1,1,2).unwrap();
+        assert_eq!(retry(&mut nic,&policy,&links,owner,prior,120,[101,121]),
+                   Err(Error::Unexpected));
+        assert_eq!(retry(&mut nic,&policy,&links,owner,prior,121,[120,122]),
+                   Err(Error::Unexpected));
+        assert_eq!(nic.sent,0);
+        let new=retry(&mut nic,&policy,&links,owner,prior,101,[120,121]).unwrap();
+        assert_eq!(new.selected.link,2);
+        assert_eq!(nic.sent,1);
+    }
+    #[test]
+    fn reversed_clock_between_serialization_and_dispatch_denies_frame() {
+        let (policy,mut links,owner,prior)=setup();
+        links.begin_link_reset(1,1,2).unwrap();
+        let mut nic=Nic{sent:0};
+        assert_eq!(retry(&mut nic,&policy,&links,owner,prior,101,[121,120]),
+                   Err(Error::Unexpected));
+        assert_eq!(nic.sent,0);
+    }
+    #[test]
+    fn missing_kernel_time_and_wrong_process_cannot_retry() {
+        let (policy,mut links,owner,prior)=setup();
+        links.begin_link_reset(1,1,2).unwrap();
+        let mut nic=Nic{sent:0};
+        assert_eq!(transmit_failover_ipv4_checked_try_clock(
+            &mut nic,&policy,&links,owner,4,PEER_IP,prior,101,
+            ||Err(Error::Unexpected),
+            |bytes,mac|udp_frame(bytes,mac,PEER_UDP_PORT,b"retry",0x2911)),
+            Err(Error::Unexpected));
+        assert_eq!(retry(&mut nic,&policy,&links,
+            Identity{pid:owner.pid,generation:owner.generation+1},
+            prior,101,[120,121]),Err(Error::Unexpected));
+        assert_eq!(nic.sent,0);
+    }
+    #[test]
+    fn failover_packet_is_rechecked_after_live_link_expiry() {
+        let (policy,mut links,owner,prior)=setup();
+        links.begin_link_reset(1,1,2).unwrap();
+        // Release the quarantined primary candidate to free one route
+        // slot while retaining the healthy secondary as fallback.
+        assert_eq!(links.expire_link(1,2),1);
+        // Expire a newly leased best candidate between receive and send.
+        // Its expired receipt must not grant authority to fallback link 2.
+        let backup=links.resolve_at(u32::from_be_bytes(PEER_IP),120).unwrap();
+        links.add_dhcp_lease(RouteCandidate{
+            route:backup.route,metric:8,link:3,epoch:4,healthy:true
+        },120,121).unwrap();
+        let mut nic=Nic{sent:0};
+        // Link 3 wins at tick 120 and expires at tick 121, causing
+        // a route change to link 2 before frame dispatch.
+        assert_eq!(retry(&mut nic,&policy,&links,owner,prior,101,[120,121]),
+                   Err(Error::Unexpected));
+        assert_eq!(nic.sent,0);
+    }
 }

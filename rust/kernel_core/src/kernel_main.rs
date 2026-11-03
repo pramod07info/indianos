@@ -140,6 +140,31 @@ pub extern "C" fn kmain()->!{
     log(b"IndianOS: kernel entered\n\0");
     need(unsafe{boot_validate()},b"IndianOS: FATAL boot information invalid\n\0");
     log(b"IndianOS: boot information validated\n\0");
+    #[cfg(all(feature="limine-requests",target_arch="x86_64",target_os="none"))]
+    {
+        // R125 real bootloader MP handoff. The second QEMU virtual CPU is
+        // enumerated by Limine but remains PARKED. No AP GDT/IDT/TSS, IPI,
+        // scheduler concurrency, per-CPU timer or TLB shootdown is asserted.
+        match crate::limine_requests::observed_mp_inventory() {
+            Some(topology) if topology.cpus==2=>
+                log(b"IndianOS: R125 QEMU two-CPU Limine MP inventory validated; AP parked\n\0"),
+            Some(_)=>
+                log(b"IndianOS: R125 Limine MP topology available; AP startup disabled\n\0"),
+            None=>
+                log(b"IndianOS: R125 MP topology unavailable; AP startup disabled\n\0"),
+        }
+    }
+    #[cfg(feature="test-r118-ap-ack")]
+    {
+        // R126: genuine AP enters Rust, confirms its own CPUID and parks.
+        // The BSP immediately halts BEFORE PMM, user programs or recovery.
+        need(crate::limine_requests::launch_one_parked_qemu_ap(),
+            b"IndianOS: FATAL R126 QEMU AP arrival/CPUID mismatch\n\0");
+        log(b"IndianOS: R126 QEMU secondary AP executed Rust and acknowledged BSP\n\0");
+        log(b"IndianOS: R127 QEMU real AP denied BSP retirement gate 8192 times\n\0");
+        log(b"IndianOS: R131 QEMU 64 ordered cross-CPU lifecycle receipts acknowledged\n\0");
+        halt();
+    }
     // Issue #124 HD1: each x86-64 boot enumerates CPU and PCI-PCI bridge
     // topology before optional device drivers. No PCI command writes,
     // BAR mapping, device init or implicit quantum/cloud connection.
@@ -479,6 +504,31 @@ pub extern "C" fn kmain()->!{
                 Ok([0x42;32]) // test-only trust fixture, never production
             }
         }
+        // QEMU-only adapter to exercise the *same* three-authority
+        // PID1 launch verifier against a real, persistent IDE partition.
+        // Limine has not authenticated these constants, so this is NOT
+        // a production TPM/UEFI root or signed physical boot slot.
+        struct QemuBootPolicy {
+            floor:r114_boot_epoch::SealedBootFloor,
+            slot:Slot,
+            selected:usize,
+            measurement:[u8;32],
+        }
+        impl TrustedBootMeasurement for QemuBootPolicy {
+            fn read_verified(&self)->Result<[u8;32],r114_boot_epoch::Error>{
+                Ok(self.measurement)
+            }
+        }
+        impl r114_boot_epoch::AuthenticatedPid1Platform for QemuBootPolicy {
+            fn read_sealed_floor(&self)
+                ->Result<r114_boot_epoch::SealedBootFloor,r114_boot_epoch::Error>{
+                Ok(self.floor)
+            }
+            fn read_bootloader_selected_slot(&self)
+                ->Result<(usize,Slot),r114_boot_epoch::Error>{
+                Ok((self.selected,self.slot))
+            }
+        }
         let mut disk=unsafe{crate::ata_pio::AtaPio::probe()}.unwrap_or_else(|_|{
             log(b"IndianOS: FATAL R114 QEMU epoch disk not found\n\0");halt()
         });
@@ -519,8 +569,49 @@ pub extern "C" fn kmain()->!{
                     expected_slot:0,
                     minimum_slot_version:9,
                     expected_measurement:[0x42;32],
-                })==Ok(r));
-        need(verified,b"IndianOS: FATAL R114 QEMU boot epoch persistence\n\0");
+                })==Ok(r) &&
+            {
+                let trusted_floor=r114_boot_epoch::SealedBootFloor{
+                    minimum_epoch:r.epoch,
+                    minimum_journal_generation:21,
+                    expected_slot:0,
+                    minimum_slot_version:9,
+                    expected_measurement:[0x42;32],
+                };
+                let trusted=QemuBootPolicy{
+                    floor:trusted_floor,slot,selected:0,
+                    measurement:[0x42;32],
+                };
+                let admitted=r114_boot_epoch::authorize_verified_pid1(
+                    &mut region,&trusted)
+                    .is_ok_and(|proof|
+                        proof.epoch()==r.epoch &&
+                        proof.journal_generation()==r.journal_generation &&
+                        proof.selected_slot()==0 &&
+                        proof.slot_version()==slot.version);
+                // Actually execute the negative authority controls INSIDE
+                // the OVMF guest, against its pre-provisioned ATA journal.
+                // They must not modify any disk bytes, as the external
+                // QEMU harness verifies after every cold boot.
+                let rollback=QemuBootPolicy{
+                    floor:r114_boot_epoch::SealedBootFloor{
+                        minimum_epoch:r.epoch+1,..trusted_floor
+                    },..trusted};
+                let forged_slot=QemuBootPolicy{selected:1,..trusted};
+                let forged_measurement=QemuBootPolicy{
+                    measurement:[0x7f;32],..trusted};
+                admitted &&
+                r114_boot_epoch::authorize_verified_pid1(
+                    &mut region,&rollback).is_err() &&
+                r114_boot_epoch::authorize_verified_pid1(
+                    &mut region,&forged_slot).is_err() &&
+                r114_boot_epoch::authorize_verified_pid1(
+                    &mut region,&forged_measurement).is_err()
+            }
+        );
+        need(verified,b"IndianOS: FATAL R118 QEMU PID1 boot authority denied\n\0");
+        log(b"IndianOS: R118 QEMU PID1 boot authority negative controls PASSED\n\0");
+        log(b"IndianOS: R118 QEMU PID1 boot handoff contract PASSED\n\0");
         log(b"IndianOS: R114 QEMU boot epoch advanced and recovery receipt verified\n\0");
     }
     #[cfg(feature="test-r028-network")]

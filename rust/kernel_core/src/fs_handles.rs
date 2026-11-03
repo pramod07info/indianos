@@ -9,6 +9,7 @@ use crate::vfs_path::normalize_absolute;
 use crate::ata_pio::AtaPio;
 use crate::batch5_session::Identity;
 use crate::fs_write_guard::{WriteGuard,Statistics};
+use core::marker::PhantomData;
 
 pub const READ:u64=1;
 pub const WRITE:u64=2;
@@ -41,19 +42,23 @@ impl RootGrant {
 pub struct NamespaceReceipt { owner:Identity, namespace_id:u64, revision:u64 }
 /// A kernel-only, read-only proof of the exact mounted volume, root
 /// namespace and mount revision at the beginning of one selected-file call.
-/// This protects against cooperative remount/rebind paths; it is NOT an
-/// inter-CPU locking mechanism.
+/// This snapshot is deliberately !Send and !Sync: a local BSP filesystem
+/// proof must not be sent to an AP without real cross-core synchronization.
+/// This protects cooperative remount/rebind paths, NOT inter-CPU locking.
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 pub struct SelectedOperationGuard{
     namespace:NamespaceReceipt,
     revision:u64,
     selected_volume:Option<crate::m1_partition::PartitionReceipt>,
+    _single_bsp:PhantomData<*mut ()>,
 }
 /// Kernel-minted alias scoped to a process incarnation and namespace revision.
 /// String path comparison alone is not an authority to access a mounted tree.
 #[derive(Clone,Copy)]
 pub struct MountAlias {
     receipt:NamespaceReceipt, root:[u8;24], len:usize,
+    // This alias remains BSP-local, never implicitly sendable to an AP.
+    _single_bsp:PhantomData<*mut ()>,
     // A kernel-selected physical mount is a different authority from its
     // pathname. Every remount or recovery issues a new monotonic revision.
     volume_revision:u64,
@@ -84,6 +89,23 @@ pub struct FileHandles{
     volume_revision:u64,
 }
 impl FileHandles{
+    /// Private kernel staging copy for all-or-none retirement publication.
+    /// Do not publish two independent live copies of a FileHandles service:
+    /// the descriptor-token and write-budget counters must remain singular.
+    /// Callers must hold the same single-BSP scheduler admission permit for
+    /// snapshot, validation and publication.
+    pub(crate) fn staged_copy_kernel(&self)->Self{
+        Self{
+            entries:self.entries,next:self.next,
+            owners:self.owners,next_generation:self.next_generation,
+            roots:self.roots,root_revisions:self.root_revisions,
+            last_syscall_namespace:self.last_syscall_namespace,
+            write_guard:self.write_guard.clone(),
+            selected_volume:self.selected_volume,
+            selected_quarantined:self.selected_quarantined,
+            volume_revision:self.volume_revision,
+        }
+    }
     pub const fn new()->Self{
         Self{entries:[Handle::EMPTY;SLOTS],next:1,
             owners:[0;2],next_generation:1,
@@ -95,6 +117,58 @@ impl FileHandles{
     pub fn security_statistics(&self)->Statistics{
         self.write_guard.statistics()
     }
+
+    /// R128 guest audit: unlike retired-owner token tests, this exercises an
+    /// ACTIVE kernel-authenticated PID2 through the same file syscall service
+    /// while real live handles can exist. The candidate values start at the
+    /// next never-issued token, so not even a valid handle's cursor is used.
+    /// All 100 malformed calls must reject before ATA probing or mutation.
+    ///
+    /// SAFETY CONTRACT: only called while the kernel BSP's R120 filesystem
+    /// permit excludes scheduler retirement and other file-service writers.
+    #[cfg(feature="test-r031-files-gui")]
+    pub(crate) fn r128_audit_active_forged_handles(
+        &mut self,owner:Identity
+    )->bool{
+        if owner.pid!=2||!self.owns(owner)||self.selected_quarantined{
+            return false;
+        }
+        let prior=self.staged_copy_kernel();
+        let prior_statistics=self.security_statistics();
+        let prior_namespace=self.last_syscall_namespace;
+        let mut buffer=[0xa5u8;72];
+        for delta in 0..20u64 {
+            let Some(token)=self.next.checked_add(delta)else{return false;};
+            if token==0 || self.entries.iter().any(|h|h.token==token){
+                return false;
+            }
+            for action in [2u64,3,4,5,6]{
+                if operation_authenticated(self,action,owner,token,0,
+                    "",&mut buffer)!=Err(FsError::InvalidName){
+                    return false;
+                }
+                if buffer!=[0xa5u8;72] {return false;}
+            }
+        }
+        self.entries.iter().zip(prior.entries.iter()).all(|(a,b)|
+            a.token==b.token && a.pid==b.pid &&
+            a.generation==b.generation && a.mode==b.mode &&
+            a.offset==b.offset &&
+            a.filesystem_generation==b.filesystem_generation &&
+            a.path==b.path && a.len==b.len) &&
+        self.next==prior.next &&
+        self.owners==prior.owners &&
+        self.roots.iter().zip(prior.roots.iter()).all(|(a,b)|
+            a.epoch==b.epoch&&a.len==b.len&&a.path==b.path) &&
+        self.root_revisions==prior.root_revisions &&
+        self.last_syscall_namespace==prior_namespace &&
+        self.volume_revision==prior.volume_revision &&
+        self.selected_volume==prior.selected_volume &&
+        self.selected_quarantined==prior.selected_quarantined &&
+        self.security_statistics()==prior_statistics &&
+        self.owns(owner)
+    }
+
     /// Kernel-only tightening of the single mounted file service's write
     /// budget. A signed-in PID1 incarnation can REDUCE limits, never reset,
     /// widen or transfer consumed credits by closing descriptors or reusing
@@ -201,7 +275,8 @@ impl FileHandles{
         if !self.root_allows(owner,canonical){return Err(FsError::InvalidName);}
         Ok(MountAlias{receipt,root:path,len,
             volume_revision:self.volume_revision,
-            selected_volume:self.selected_volume})
+            selected_volume:self.selected_volume,
+            _single_bsp:PhantomData})
     }
     /// A trusted kernel entry point may mint only the caller's currently
     /// bound namespace root. It never accepts a ring-3 selected mount path.
@@ -214,7 +289,8 @@ impl FileHandles{
         }
         Ok(MountAlias{receipt,root:root.path,len:root.len,
             volume_revision:self.volume_revision,
-            selected_volume:self.selected_volume})
+            selected_volume:self.selected_volume,
+            _single_bsp:PhantomData})
     }
     /// Authenticate both the alias origin and the target for every operation.
     /// Any PID reuse or root revision revokes previously minted aliases.
@@ -242,6 +318,7 @@ impl FileHandles{
             namespace:self.namespace_receipt(owner)?,
             revision:self.volume_revision,
             selected_volume:self.selected_volume,
+            _single_bsp:PhantomData,
         })
     }
     pub fn selected_operation_guard_is_current(
@@ -2273,6 +2350,63 @@ mod r106_checked_partition_authenticated_file_api_tests{
   }
  }
  
+
+ #[test]fn r118_selected_volume_stale_handle_fuzz_across_128_pid_recycles(){
+  // The *real* selected-volume API must deny stale tokens before any ATA
+  // read, including when a recycled PID happens to reuse the same path.
+  let (mut media,receipt)=disk();
+  let mut files=FileHandles::new();
+  let admin=files.bind_process(1).unwrap();
+  let mut guest=files.bind_process(2).unwrap();
+  for _ in 0..128{
+   let token=operation_on_selected_volume(&mut files,1,guest,0,READ,
+       "/shared/note",&mut [],&mut media,receipt).unwrap();
+   let guard=files.selected_operation_guard(guest).unwrap();
+   let alias=files.mount_alias_for_current_root_kernel(guest).unwrap();
+   let old=guest;
+   guest=files.bind_process(2).unwrap();
+   assert_ne!(old.generation,guest.generation);
+   assert!(!files.selected_operation_guard_is_current(guard));
+   let before=media.reads;
+   for caller in [old,guest]{
+    for action in [2u64,5u64]{
+     assert_eq!(operation_on_selected_volume(&mut files,action,caller,token,0,
+       "",&mut [0u8;16],&mut media,receipt),Err(FsError::InvalidName));
+    }
+    assert!(!files.mount_alias_allows(alias,caller,"/shared/note"));
+   }
+   assert_eq!(operation_on_selected_volume_alias(&mut files,alias,1,guest,
+      0,READ,"/shared/note",&mut [],&mut media,receipt),
+      Err(FsError::InvalidName));
+   assert_eq!(media.reads,before);
+   assert!(files.owns(admin));
+  }
+ }
+
+ #[test]fn r118_selected_mount_revision_swap_rejects_old_alias_before_disk_probe(){
+  let (mut media,receipt)=disk();
+  let mut files=FileHandles::new();
+  let admin=files.bind_process(1).unwrap();
+  let token=operation_on_selected_volume(&mut files,1,admin,0,READ,
+      "/shared/note",&mut [],&mut media,receipt).unwrap();
+  let alias=files.mount_alias_for_current_root_kernel(admin).unwrap();
+  let guard=files.selected_operation_guard(admin).unwrap();
+  assert!(files.mount_alias_allows(alias,admin,"/shared/note"));
+  // Model a serialized trusted remount revision transition. No claim of
+  // physical multicore remount contention is made by this host test.
+  files.volume_revision=files.volume_revision.checked_add(1).unwrap();
+  let before=(media.reads,media.writes);
+  assert!(!files.selected_operation_guard_is_current(guard));
+  assert!(!files.mount_alias_allows(alias,admin,"/shared/note"));
+  assert_eq!(operation_on_selected_volume_alias(&mut files,alias,1,admin,
+       0,READ,"/shared/note",&mut [],&mut media,receipt),
+       Err(FsError::InvalidName));
+  assert_eq!((media.reads,media.writes),before);
+  // An already-open token remains owned by the same PID generation; its
+  // lifetime is governed by the separately authenticated descriptor path.
+  assert!(token!=0 && files.owns(admin));
+ }
+
  #[test]fn r118_capacity_swap_rejected_before_any_selected_disk_reads(){
   struct Changed<'a>{inner:&'a mut Disk,reads:usize,writes:usize}
   impl BlockDevice for Changed<'_>{
@@ -3168,10 +3302,15 @@ impl FileHandles {
                 return Err(FsError::InvalidName);
             }
         }
-        for owner in owners{
-            // Preflight established all exact incarnations while this
-            // single-BSP kernel supervisor holds exclusive table ownership.
-            if !self.retire_process(*owner){return Err(FsError::InvalidName);}
+        // Canonical PID order is independent of caller batching order.
+        // Today this runs under the single-BSP exclusive supervisor; keep the
+        // policy order explicit before adding per-table SMP/IRQ locks.
+        for pid in 1..=2u32 {
+            if let Some(owner)=owners.iter().find(|owner|owner.pid==pid) {
+                if !self.retire_process(*owner) {
+                    return Err(FsError::InvalidName);
+                }
+            }
         }
         Ok(owners.len())
     }
@@ -3311,4 +3450,125 @@ mod r119_inherited_mount_authority_regressions{
   assert!(!t.selected_operation_guard_is_current(guard));
   assert_eq!(t.selected_operation_guard(p),Err(FsError::InvalidVolume));
  }
+}
+
+
+#[cfg(test)]
+mod r120_inherited_r118_file_retirement_regressions {
+    use super::*;
+
+    #[test]
+    fn reversed_batch_order_revokes_exact_owners_and_preserves_generation_fence() {
+        for reversed in [false, true] {
+            let mut files=FileHandles::new();
+            let admin=files.bind_process(1).unwrap();
+            let guest=files.bind_process(2).unwrap();
+            let old_alias=files.mount_alias_for_current_root_kernel(guest).unwrap();
+            let owners=if reversed {[guest,admin]} else {[admin,guest]};
+            assert_eq!(files.retire_process_batch_kernel(&owners),Ok(2));
+            assert!(!files.owns(admin));
+            assert!(!files.owns(guest));
+            assert!(!files.mount_alias_allows(old_alias,guest,"/shared/note"));
+            let replacement=files.bind_process(2).unwrap();
+            assert!(replacement.generation>guest.generation);
+            assert!(!files.mount_alias_allows(old_alias,replacement,"/shared/note"));
+        }
+    }
+
+    #[test]
+    fn repeated_stale_pid_reuse_never_partially_retires_a_peer() {
+        let mut files=FileHandles::new();
+        let admin=files.bind_process(1).unwrap();
+        let admin_alias=files.mount_alias_for_current_root_kernel(admin).unwrap();
+        let mut previous=files.bind_process(2).unwrap();
+        for _ in 0..64 {
+            let current=files.bind_process(2).unwrap();
+            let current_alias=files.mount_alias_for_current_root_kernel(current).unwrap();
+            assert_eq!(
+                files.retire_process_batch_kernel(&[admin,previous]),
+                Err(FsError::InvalidName)
+            );
+            assert!(files.owns(admin)&&files.owns(current));
+            assert!(files.mount_alias_allows(admin_alias,admin,"/shared/readme"));
+            assert!(files.mount_alias_allows(current_alias,current,"/shared/note"));
+            previous=current;
+        }
+    }
+
+    #[test]
+    fn stale_mount_namespace_receipt_cannot_authorize_batch_replacement() {
+        let mut files=FileHandles::new();
+        let admin=files.bind_process(1).unwrap();
+        let guest=files.bind_process(2).unwrap();
+        let previous=files.selected_operation_guard(guest).unwrap();
+        let previous_alias=files.mount_alias_for_current_root_kernel(guest).unwrap();
+        files.narrow_root_kernel(guest,"/shared/docs").unwrap();
+        assert!(!files.selected_operation_guard_is_current(previous));
+        assert!(!files.mount_alias_allows(previous_alias,guest,"/shared/docs/a"));
+        let fresh=files.selected_operation_guard(guest).unwrap();
+        assert!(files.selected_operation_guard_is_current(fresh));
+        assert_eq!(files.retire_process_batch_kernel(&[admin,guest]),Ok(2));
+        assert!(!files.selected_operation_guard_is_current(fresh));
+    }
+}
+
+#[cfg(test)]
+mod r118_bsp_local_mount_proof_regressions {
+    use super::*;
+    #[test]
+    fn mount_proofs_reject_recycled_pid_even_with_same_root_spelling() {
+        let mut files=FileHandles::new();
+        let first=files.bind_process(1).unwrap();
+        let guard=files.selected_operation_guard(first).unwrap();
+        let alias=files.mount_alias_for_current_root_kernel(first).unwrap();
+        // Copyable within the BSP, but !Send and !Sync to other CPU threads.
+        let copy=guard;
+        assert!(files.selected_operation_guard_is_current(copy));
+        assert!(files.mount_alias_allows(alias,first,"/shared/note"));
+        assert_eq!(files.retire_process_batch_kernel(&[first]),Ok(1));
+        let next=files.bind_process(1).unwrap();
+        assert_ne!(next.generation,first.generation);
+        assert!(!files.selected_operation_guard_is_current(guard));
+        assert!(!files.mount_alias_allows(alias,next,"/shared/note"));
+        assert!(!files.mount_alias_allows(alias,first,"/shared/note"));
+        let fresh=files.selected_operation_guard(next).unwrap();
+        assert_ne!(fresh,guard);
+        assert!(files.selected_operation_guard_is_current(fresh));
+    }
+    #[test]
+    fn narrowing_a_root_revokes_old_mount_capability_and_guard() {
+        let mut files=FileHandles::new();
+        let owner=files.bind_process(1).unwrap();
+        let guard=files.selected_operation_guard(owner).unwrap();
+        let old=files.mount_alias_kernel(owner,"/shared").unwrap();
+        assert!(files.mount_alias_allows(old,owner,"/shared/note"));
+        files.narrow_root_kernel(owner,"/shared").unwrap();
+        assert!(!files.selected_operation_guard_is_current(guard));
+        assert!(!files.mount_alias_allows(old,owner,"/shared/note"));
+        let current=files.mount_alias_for_current_root_kernel(owner).unwrap();
+        assert!(files.mount_alias_allows(current,owner,"/shared/note"));
+    }
+}
+
+#[cfg(test)]
+mod r118_staged_file_retirement_tests {
+    use super::*;
+    #[test]
+    fn prepared_file_copy_never_alters_live_pid_or_monotonic_policy() {
+        let mut live=FileHandles::new();
+        let first=live.bind_process(1).unwrap();
+        let second=live.bind_process(2).unwrap();
+        let guard=live.selected_operation_guard(second).unwrap();
+        let mut draft=live.staged_copy_kernel();
+        assert_eq!(draft.retire_process_batch_kernel(&[first]),Ok(1));
+        assert!(!draft.owns(first));
+        // A failed transaction simply drops the draft. The live owners and
+        // their exact namespace capability remain unchanged.
+        assert!(live.owns(first));
+        assert!(live.owns(second));
+        assert!(live.selected_operation_guard_is_current(guard));
+        let next=live.bind_process(1).unwrap();
+        assert_ne!(next.generation,first.generation);
+        assert!(!draft.owns(next));
+    }
 }

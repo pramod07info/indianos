@@ -35,6 +35,7 @@ impl RegistryEntry {
 
 /// No heap, no global state, and no token reuse, including after revocation.
 /// Each Registry instance is owned and synchronized by its kernel caller.
+#[derive(Clone)]
 pub struct Registry<const CAPACITY: usize> {
     entries: [Option<RegistryEntry>; CAPACITY],
     next_token: u64,
@@ -204,6 +205,7 @@ pub enum EpochError {
 #[derive(Clone, Copy)]
 struct ProcessEpoch { pid: u32, generation: u64, active: bool }
 
+#[derive(Clone)]
 pub struct EpochRegistry<const N: usize> {
     epochs: [Option<ProcessEpoch>; N],
     grants: Registry<N>,
@@ -215,6 +217,32 @@ impl<const N: usize> EpochRegistry<N> {
     fn process(&self, pid: u32) -> Option<ProcessEpoch> {
         self.epochs.iter().flatten().copied().find(|entry| entry.pid == pid)
     }
+    /// Read-only authoritative incarnation of a currently active PID.
+    pub fn active_generation(&self, pid: u32) -> Option<u64> {
+        self.process(pid).and_then(|p| if p.active { Some(p.generation) } else { None })
+    }
+
+    /// Register an exact incarnation issued by the privileged file/scheduler
+    /// identity allocator. FileHandles increments generations globally, while
+    /// this registry normally increments each PID independently. Never
+    /// replace a live owner or accept a generation rollback.
+    pub fn start_exact(&mut self, pid: u32, generation: u64)
+        -> Result<(), EpochError>
+    {
+        if pid == 0 { return Err(EpochError::InvalidPid); }
+        if generation == 0 { return Err(EpochError::Denied); }
+        if let Some(entry) = self.epochs.iter_mut().flatten().find(|e| e.pid == pid) {
+            if entry.active { return Err(EpochError::AlreadyActive); }
+            if generation <= entry.generation { return Err(EpochError::Denied); }
+            entry.generation = generation;
+            entry.active = true;
+            return Ok(());
+        }
+        let slot = self.epochs.iter_mut().find(|e| e.is_none()).ok_or(EpochError::Full)?;
+        *slot = Some(ProcessEpoch { pid, generation, active: true });
+        Ok(())
+    }
+
     pub fn start(&mut self, pid: u32) -> Result<u64, EpochError> {
         if pid == 0 { return Err(EpochError::InvalidPid); }
         if let Some(entry) = self.epochs.iter_mut().flatten().find(|e| e.pid == pid) {
@@ -432,4 +460,23 @@ mod r119_capability_batch_tests{
   assert_eq!(r.retire_batch(&[]),Ok(0));
   assert_eq!(r.retire_batch(&[(1,1)]),Err(EpochError::NotActive));
  }
+}
+
+/// R120: real scheduler uses a global identity allocator, not a per-PID counter.
+#[cfg(test)]
+mod r120_exact_generation_registration_tests {
+    use super::*;
+    #[test]fn trusted_global_generation_must_advance_and_never_overwrite_live(){
+        let mut r=EpochRegistry::<2>::new();
+        assert_eq!(r.start_exact(1,1),Ok(()));
+        assert_eq!(r.start_exact(1,2),Err(EpochError::AlreadyActive));
+        assert_eq!(r.start_exact(2,9),Ok(()));
+        assert_eq!(r.active_generation(2),Some(9));
+        assert_eq!(r.retire(1,1),Ok(0));
+        assert_eq!(r.start_exact(1,1),Err(EpochError::Denied));
+        assert_eq!(r.start_exact(1,0),Err(EpochError::Denied));
+        assert_eq!(r.start_exact(1,12),Ok(()));
+        assert_eq!(r.active_generation(1),Some(12));
+        assert_eq!(r.start_exact(3,13),Err(EpochError::Full));
+    }
 }
