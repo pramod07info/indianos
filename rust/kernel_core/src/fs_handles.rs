@@ -2403,7 +2403,9 @@ mod r106_checked_partition_authenticated_file_api_tests{
         "/shared/note",&mut [],&mut disk,receipt).unwrap();
     let guard=files.selected_operation_guard(guest).unwrap();
     let alias=files.mount_alias_for_current_root_kernel(guest).unwrap();
-    stale[iteration%stale.len()]=token;
+    // Use the fixed bounded bank size instead of borrowing the array
+    // immutably while it is mutably indexed.
+    stale[iteration%16]=token;
     if iteration%2==0 {
       // Narrows/reissues the root revision even with the same spelling;
       // descriptor revocation must rely on the receipt, not the string.

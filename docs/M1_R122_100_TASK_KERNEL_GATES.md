@@ -1,8 +1,8 @@
 # IndianOS R122: 70 new development tasks + 30 inherited acceptance gates
 
-**Base SHA:** `01f7755eab9a5059c58f11267df5f45eb00d41ae` (R121 merge #758). **Five logical workstreams**, **one source integration commit**, **one PR**. There are no independently launched autonomous coding agents.
+**Base SHA:** `01f7755eab9a5059c58f11267df5f45eb00d41ae` (R121 merge #758). **Five logical workstreams**, **multiple source commits in PR #760**. There are no independently launched autonomous coding agents.
 
-**Status:** 12/70 narrowly scoped new source/test acceptance items authored; 58/70 new items still open; 0/30 inherited hardware/release obligations newly accepted. **Overall 12/100 authored at source/test scope**, 88/100 not newly accepted. New source checks must still pass CI at this final head. Neither host probes nor QEMU two-vCPU proof establish physical hardware qualification. The R122-008 checkbox means a bounded software no-progress failure path, not a physical IPI timeout or release acceptance. Checked items are fine-grained checks for ONE integrated NIC→UDP hardening change, not independent new OS features or proven hardware functionality.
+**Status:** 13/70 narrowly scoped new source/test acceptance items authored; 57/70 new items still open; 0/30 inherited hardware/release obligations newly accepted. **Overall 13/100 authored at source/test scope**, 87/100 not newly accepted. New source checks must still pass CI at this final head. Neither host probes nor QEMU two-vCPU proof establish physical hardware qualification. The R122-008 checkbox means a bounded software no-progress failure path, not a physical IPI timeout or release acceptance. Checked items are fine-grained checks for ONE integrated NIC→UDP hardening change, not independent new OS features or proven hardware functionality.
 
 ## What changed in executable kernel code
 
@@ -47,7 +47,7 @@
 ### Workstream 3 — Filesystem, VFS and persistence
 - [ ] R122-029 — Reject simultaneous mount replacement during path resolution
 - [x] R122-030 — Enforce selected-volume token generation (authenticated PID generation plus canonical current-root check now rejects drift before disk I/O; host regression authored; exact-head CI pending)
-- [ ] R122-031 — Add mount stale-token mutation fuzz
+- [x] R122-031 — Add mount stale-token mutation fuzz (128 real selected-volume revision/PID cycles with 16-token replay, ten stale actions each, stale alias denial and zero device I/O assertions; source/test authored, final SHA CI pending)
 - [ ] R122-032 — Verify Files queue persists after power-safe reboot
 - [ ] R122-033 — Provide non-blocking retire-owner lock ordering
 - [ ] R122-034 — Test filesystem and UDP teardown deadlocks
@@ -136,6 +136,14 @@ The initial consolidated R122 source commit was expanded using **three additiona
 **CI caveat:** Historical green checks on the original R122 commit are not final-head evidence. Run the updated PR head's Rust host, optimized no_std, network QEMU, AP QEMU, kernel ELF/ISO, Files persistence, and security checks independently. Human kernel/security review and branch protection are not optional hardware substitutes.
 
 **Still not implemented/qualified:** physical APIC IPI and TLB shootdown, SMP scheduler/locking, real IRQ-driven NIC DMA mask/MSI-X + IOMMU isolation, physical SMP remount races, immutable firmware/TPM trust anchor, destructive hardware power cut and real boot sector restore. Retain all inherited items unchecked.
+
+## R122 CI recovery and follow-on regression
+
+The previous `af911504038905ee81147107b4438964e3cdcf4d` head failed **three** required workflows (network unit test matrix, kernel boot early Rust tests, combined reliability host tests) because `r122_ap_rejects_local_cleanup_failure_without_acknowledging` invoked a cleanup callback again after the AP receipt had already been acknowledged. The logs showed 2411/2412 and 3382/3383 tests passing before that common failure. **Do not present those failed runs as green.**
+
+- `be47ef5608eefbcc5a7559966d1d8946784ebe3c`: source fix rejects duplicate or concurrently claimed AP receipts BEFORE invoking any cleanup callback. A software one-claim gate avoids duplicate execution and a host concurrent regression verifies it. Exact-head CI still required.
+- `79659d89b7c87cd7655b119a985453718825a87a`: adds actual selected-volume stale-handle mutation fuzz with revision/root and owner PID recycling, preserving user output and zero ATA I/O on stale attempts.
+- The next integration update fixes the constant-size stale-token bank indexing and updates this source/test checklist. This is not physical SMP, hardware DMA or independent human review acceptance.
 
 ## Release checklist and unresolved blockers
 
