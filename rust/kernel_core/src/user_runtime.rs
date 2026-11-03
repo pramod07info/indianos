@@ -1903,12 +1903,14 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
    R115_UDP_OWNERS=crate::udp_owner_epoch::Registry::new();
    R116_SHARED_LEASES=crate::agent_03_cap_epoch::LeaseTable::new();
    R120_RETIREMENT=crate::process_retirement_txn::ProcessRetirement::new();
-   let table=&mut *ptr::addr_of_mut!(R031_HANDLES);
-   let a=table.bind_process(1).unwrap();
-   let old=table.bind_process(2).unwrap();
-   let coordinator=&mut *ptr::addr_of_mut!(R120_RETIREMENT);
+   // Raw pointers are converted to short-lived exclusive borrows only for
+   // each operation; teardown itself re-enters these same kernel globals.
+   let table=ptr::addr_of_mut!(R031_HANDLES);
+   let a=(&mut *table).bind_process(1).unwrap();
+   let old=(&mut *table).bind_process(2).unwrap();
+   let coordinator=ptr::addr_of_mut!(R120_RETIREMENT);
    for id in [a,old]{
-     coordinator.start_exact(crate::process_retirement_txn::Owner{
+     (&mut *coordinator).start_exact(crate::process_retirement_txn::Owner{
        pid:id.pid,generation:id.generation}).unwrap();
    }
    let first=&mut *task_ptr(0);first.pcb=&mut init;
@@ -1918,7 +1920,7 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
    assert!(r116_prepare_shared_directory_lease(old));
    assert!((&*ptr::addr_of!(R116_SHARED_LEASES))
            .permits_shared_directory(old));
-   coordinator.bind_live_udp(&mut *ptr::addr_of_mut!(R114_LOCAL_UDP),
+   (&mut *coordinator).bind_live_udp(&mut *ptr::addr_of_mut!(R114_LOCAL_UDP),
       crate::process_retirement_txn::Owner{
        pid:old.pid,generation:old.generation},5502).unwrap();
    revoke_task_authority(second);
@@ -1934,7 +1936,7 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
               .bind_process(2).unwrap();
    second.file_generation=newest.generation;
    second.authority_live=true;
-   coordinator.start_exact(crate::process_retirement_txn::Owner{
+   (&mut *coordinator).start_exact(crate::process_retirement_txn::Owner{
       pid:newest.pid,generation:newest.generation}).unwrap();
    assert!(r116_prepare_shared_directory_lease(newest));
    assert!((&*ptr::addr_of!(R116_SHARED_LEASES))
