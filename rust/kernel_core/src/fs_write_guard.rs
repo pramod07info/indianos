@@ -24,6 +24,8 @@ pub struct Statistics{
 }
 /// Kernel-owned service-scoped counter, never stored in a user process.
 /// Caller must serialize access; existing file handle table is single-core.
+/// Clone is only used by a kernel-owned, BSP-serialized staging transaction.
+#[derive(Clone)]
 pub struct WriteGuard{
  completed:u32,bytes:u32,denials:u32,
  ops_limit:u32,bytes_limit:u32,locked:bool,

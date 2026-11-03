@@ -89,6 +89,23 @@ pub struct FileHandles{
     volume_revision:u64,
 }
 impl FileHandles{
+    /// Private kernel staging copy for all-or-none retirement publication.
+    /// Do not publish two independent live copies of a FileHandles service:
+    /// the descriptor-token and write-budget counters must remain singular.
+    /// Callers must hold the same single-BSP scheduler admission permit for
+    /// snapshot, validation and publication.
+    pub(crate) fn staged_copy_kernel(&self)->Self{
+        Self{
+            entries:self.entries,next:self.next,
+            owners:self.owners,next_generation:self.next_generation,
+            roots:self.roots,root_revisions:self.root_revisions,
+            last_syscall_namespace:self.last_syscall_namespace,
+            write_guard:self.write_guard.clone(),
+            selected_volume:self.selected_volume,
+            selected_quarantined:self.selected_quarantined,
+            volume_revision:self.volume_revision,
+        }
+    }
     pub const fn new()->Self{
         Self{entries:[Handle::EMPTY;SLOTS],next:1,
             owners:[0;2],next_generation:1,
@@ -3478,5 +3495,28 @@ mod r118_bsp_local_mount_proof_regressions {
         assert!(!files.mount_alias_allows(old,owner,"/shared/note"));
         let current=files.mount_alias_for_current_root_kernel(owner).unwrap();
         assert!(files.mount_alias_allows(current,owner,"/shared/note"));
+    }
+}
+
+#[cfg(test)]
+mod r118_staged_file_retirement_tests {
+    use super::*;
+    #[test]
+    fn prepared_file_copy_never_alters_live_pid_or_monotonic_policy() {
+        let mut live=FileHandles::new();
+        let first=live.bind_process(1).unwrap();
+        let second=live.bind_process(2).unwrap();
+        let guard=live.selected_operation_guard(second).unwrap();
+        let mut draft=live.staged_copy_kernel();
+        assert_eq!(draft.retire_process_batch_kernel(&[first]),Ok(1));
+        assert!(!draft.owns(first));
+        // A failed transaction simply drops the draft. The live owners and
+        // their exact namespace capability remain unchanged.
+        assert!(live.owns(first));
+        assert!(live.owns(second));
+        assert!(live.selected_operation_guard_is_current(guard));
+        let next=live.bind_process(1).unwrap();
+        assert_ne!(next.generation,first.generation);
+        assert!(!draft.owns(next));
     }
 }
