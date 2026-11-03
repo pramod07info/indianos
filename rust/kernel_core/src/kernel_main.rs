@@ -158,8 +158,16 @@ pub extern "C" fn kmain()->!{
     {
         // R126: genuine AP enters Rust, confirms its own CPUID and parks.
         // The BSP immediately halts BEFORE PMM, user programs or recovery.
-        need(crate::limine_requests::launch_one_parked_qemu_ap(),
-            b"IndianOS: FATAL R126 QEMU AP arrival/CPUID mismatch\n\0");
+        if !crate::limine_requests::launch_one_parked_qemu_ap(){
+            match crate::limine_requests::r132_guest_status(){
+                0=>log(b"IndianOS: FATAL R132 before AP startup or CPUID\n\0"),
+                1|2=>log(b"IndianOS: FATAL R132 lifecycle mailbox exchange\n\0"),
+                3|20|21=>log(b"IndianOS: FATAL R132 AP x2APIC/IDT not ready\n\0"),
+                23|24=>log(b"IndianOS: FATAL R132 IPI handler/EOI acknowledgement\n\0"),
+                _=>log(b"IndianOS: FATAL R132 unknown IPI stage\n\0"),
+            }
+            halt();
+        }
         log(b"IndianOS: R126 QEMU secondary AP executed Rust and acknowledged BSP\n\0");
         log(b"IndianOS: R127 QEMU real AP denied BSP retirement gate 8192 times\n\0");
         log(b"IndianOS: R131 QEMU 64 ordered cross-CPU lifecycle receipts acknowledged\n\0");
