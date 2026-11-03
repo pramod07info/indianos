@@ -36,6 +36,14 @@ impl RetirementGate {
 impl Default for RetirementGate {fn default()->Self{Self::new()}}
 #[must_use="retain this permit during kernel table access"]
 pub struct Permit<'a>{gate:&'a RetirementGate,_not_send:PhantomData<*mut ()>}
+impl Permit<'_>{
+    /// A caller must prove this permit was issued by the EXACT gate which
+    /// protects the mutable production tables. Holding a permit from a
+    /// separate, locally created gate is not sufficient admission.
+    pub fn issued_by(&self,expected:&RetirementGate)->bool{
+        core::ptr::eq(self.gate,expected)
+    }
+}
 impl Drop for Permit<'_>{
     fn drop(&mut self){self.gate.held.store(false,Ordering::Release);}
 }
@@ -55,7 +63,11 @@ mod r120_gate_tests {
     }
     #[test] fn nested_cannot_spin_and_drop_releases(){
         let g=RetirementGate::new();g.register_bsp(7,true).unwrap();
+        let other=RetirementGate::new();
+        other.register_bsp(7,true).unwrap();
         let a=g.try_enter(7,true).unwrap();
+        assert!(a.issued_by(&g));
+        assert!(!a.issued_by(&other));
         assert!(matches!(g.try_enter(7,true),Err(GateError::Reentrant)));
         drop(a);
         assert!(g.try_enter(7,true).is_ok());

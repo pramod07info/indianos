@@ -1496,7 +1496,8 @@ fn retire_full_owner_batch<
     const C:usize,const U:usize,const K:usize,
     const P:usize,const Q:usize,const E:usize,const L:usize
 >(
-    _permit:&crate::retirement_gate::Permit<'_>,
+    permit:&crate::retirement_gate::Permit<'_>,
+    expected_gate:&crate::retirement_gate::RetirementGate,
     files:&mut crate::fs_handles::FileHandles,
     events:&mut crate::process_events::ProcessEvents<E>,
     coordinator:&mut crate::process_retirement_txn::ProcessRetirement<C,U,K>,
@@ -1510,6 +1511,10 @@ fn retire_full_owner_batch<
     if owners.len()>2 || !matches!(kind,EventKind::Exited|EventKind::Faulted){
         return Err(());
     }
+    // Prevent a seemingly valid token issued by a DIFFERENT gate from
+    // authorizing the single production file/UDP/lease/event state. This
+    // preflight happens before any staging, clone or mutable table access.
+    if !permit.issued_by(expected_gate){return Err(());}
     // Authenticate the WHOLE batch before taking any mutable live access.
     // One stale or duplicate PID must not revoke a valid earlier member.
     for (index,owner) in owners.iter().enumerate(){
@@ -1592,6 +1597,7 @@ fn retire_full_owner_epoch<
     const P:usize,const Q:usize,const E:usize,const L:usize
 >(
     permit:&crate::retirement_gate::Permit<'_>,
+    expected_gate:&crate::retirement_gate::RetirementGate,
     files:&mut crate::fs_handles::FileHandles,
     events:&mut crate::process_events::ProcessEvents<E>,
     coordinator:&mut crate::process_retirement_txn::ProcessRetirement<C,U,K>,
@@ -1604,7 +1610,7 @@ fn retire_full_owner_epoch<
     // remove a newer PID's network rights or emit a duplicate event.
     if !files.owns(owner){return Ok(false);}
     retire_full_owner_batch(
-        permit,files,events,coordinator,sockets,leases,&[owner],kind
+        permit,expected_gate,files,events,coordinator,sockets,leases,&[owner],kind
     ).map(|count|count==1)
 }
 
@@ -1707,7 +1713,7 @@ fn revoke_task_authority_with_kind(
       // directory grants and PID1 notice BEFORE modifying any live store.
       // No peer can observe partial retirement through a failed event queue.
       let staged=retire_full_owner_epoch(
-          &_retirement_permit,
+          &_retirement_permit,&R120_GATE,
           unsafe{&mut *ptr::addr_of_mut!(R031_HANDLES)},
           unsafe{&mut *ptr::addr_of_mut!(R114_FILE_EVENTS)},
           coordinator,sockets,
@@ -2700,7 +2706,7 @@ mod r118_full_owner_retirement_integration_tests {
             pid:peer.pid,generation:peer.generation},5502).unwrap();
         let mut leases=LeaseTable::<2>::new();
 
-        assert_eq!(retire_full_owner_epoch(&permit,&mut files,&mut notices,
+        assert_eq!(retire_full_owner_epoch(&permit,&gate,&mut files,&mut notices,
             &mut coordinator,&mut sockets,&mut leases,init,
             EventKind::Exited),Err(()));
         assert!(files.owns(init));
@@ -2714,7 +2720,7 @@ mod r118_full_owner_retirement_integration_tests {
         assert_eq!(notices.acknowledge_receipt(old_receipt),
                    Some(old_receipt.event));
 
-        assert_eq!(retire_full_owner_epoch(&permit,&mut files,&mut notices,
+        assert_eq!(retire_full_owner_epoch(&permit,&gate,&mut files,&mut notices,
             &mut coordinator,&mut sockets,&mut leases,init,
             EventKind::Exited),Ok(true));
         assert!(!files.owns(init));
@@ -2746,7 +2752,7 @@ mod r118_full_owner_retirement_integration_tests {
         // An unchecked endpoint bypassing its canonical policy registry
         // must deny all five-table publication without touching FileHandles.
         sockets.bind(owner.pid,owner.generation,5502).unwrap();
-        assert_eq!(retire_full_owner_epoch(&permit,&mut files,&mut notices,
+        assert_eq!(retire_full_owner_epoch(&permit,&gate,&mut files,&mut notices,
             &mut coordinator,&mut sockets,&mut leases,owner,
             EventKind::Faulted),Err(()));
         assert!(files.owns(owner));
@@ -2759,7 +2765,7 @@ mod r118_full_owner_retirement_integration_tests {
         files.retire_process_batch_kernel(&[owner]).unwrap();
         let next=files.bind_process(1).unwrap();
         assert_ne!(owner.generation,next.generation);
-        assert_eq!(retire_full_owner_epoch(&permit,&mut files,&mut notices,
+        assert_eq!(retire_full_owner_epoch(&permit,&gate,&mut files,&mut notices,
             &mut coordinator,&mut sockets,&mut leases,owner,
             EventKind::Faulted),Ok(false));
         assert!(files.owns(next));
@@ -2802,7 +2808,7 @@ mod r118_batched_real_scheduler_teardown_tests{
         let mut notices=ProcessEvents::<3>::new();
         let receipt=files.selected_operation_guard(owners[1]).unwrap();
         assert_eq!(retire_full_owner_batch(
-            &permit,&mut files,&mut notices,&mut coordinator,&mut sockets,
+            &permit,&gate,&mut files,&mut notices,&mut coordinator,&mut sockets,
             &mut leases,&[owners[1],owners[0]],EventKind::Faulted),Ok(2));
         assert!(!files.owns(owners[0]) && !files.owns(owners[1]));
         assert!(!files.selected_operation_guard_is_current(receipt));
@@ -2832,7 +2838,7 @@ mod r118_batched_real_scheduler_teardown_tests{
             [Identity{pid:0,..owners[0]},owners[1]],
         ]{
             assert_eq!(retire_full_owner_batch(
-                &permit,&mut files,&mut notices,&mut coordinator,&mut sockets,
+                &permit,&gate,&mut files,&mut notices,&mut coordinator,&mut sockets,
                 &mut leases,&batch,EventKind::Exited),Err(()));
             assert!(files.owns(owners[0])&&files.owns(owners[1]));
             assert!(coordinator.live_sockets_consistent(&sockets));
@@ -2841,6 +2847,31 @@ mod r118_batched_real_scheduler_teardown_tests{
         }
     }
     #[test]
+    fn unrelated_gate_cannot_authorize_atomic_five_store_retirement(){
+        let (mut files,mut coordinator,mut sockets,mut leases,owners)=setup();
+        let mut notices=ProcessEvents::<2>::new();
+        let right=crate::retirement_gate::RetirementGate::new();
+        let wrong=crate::retirement_gate::RetirementGate::new();
+        right.register_bsp(0,true).unwrap();
+        wrong.register_bsp(0,true).unwrap();
+        let permit=wrong.try_enter(0,true).unwrap();
+        assert!(!permit.issued_by(&right));
+        assert_eq!(retire_full_owner_batch(
+            &permit,&right,&mut files,&mut notices,&mut coordinator,&mut sockets,
+            &mut leases,&owners,EventKind::Exited),Err(()));
+        assert!(files.owns(owners[0]) && files.owns(owners[1]));
+        assert_eq!(notices.len(),0);
+        assert!(coordinator.live_sockets_consistent(&sockets));
+        assert_eq!(coordinator.active_udp_ports(),2);
+        drop(permit);
+        let real=right.try_enter(0,true).unwrap();
+        assert_eq!(retire_full_owner_batch(
+            &real,&right,&mut files,&mut notices,&mut coordinator,&mut sockets,
+            &mut leases,&owners,EventKind::Exited),Ok(2));
+        assert!(!files.owns(owners[0]) && !files.owns(owners[1]));
+    }
+
+    #[test]
     fn late_event_backpressure_does_not_publish_a_partial_two_owner_exit(){
         let gate=crate::retirement_gate::RetirementGate::new();
         gate.register_bsp(0,true).unwrap();
@@ -2848,7 +2879,7 @@ mod r118_batched_real_scheduler_teardown_tests{
         let (mut files,mut coordinator,mut sockets,mut leases,owners)=setup();
         let mut notices=ProcessEvents::<1>::new();
         assert_eq!(retire_full_owner_batch(
-            &permit,&mut files,&mut notices,&mut coordinator,&mut sockets,
+            &permit,&gate,&mut files,&mut notices,&mut coordinator,&mut sockets,
             &mut leases,&owners,EventKind::Exited),Err(()));
         assert!(files.owns(owners[0]) && files.owns(owners[1]));
         assert!(coordinator.live_sockets_consistent(&sockets));
