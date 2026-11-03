@@ -245,6 +245,24 @@ impl<const C: usize, const U: usize, const E: usize> ProcessRetirement<C, U, E> 
         Ok(owner)
     }
 
+    /// A future IRQ-driven NIC and the current polled QEMU NIC both need
+    /// a device-specific in-flight guard AND the BSP policy permit.
+    /// A different NIC's permit, a quiescing ring or a reused RX generation
+    /// must reject BEFORE parser, UDP owner lookup or FIFO insertion.
+    pub fn ingest_nic_frame_device_fenced<const P:usize,const Q:usize>(
+        &self,
+        device:&crate::nic_rx_fence::NicRxFence,
+        rx:&crate::nic_rx_fence::RxPermit<'_>,
+        bsp:&crate::retirement_gate::Permit<'_>,
+        sockets:&mut EpochUdpEndpoints<P,Q>,revision:IngressRevision,
+        frame:&[u8],local_mac:[u8;6],
+    )->Result<Owner,RetirementError>{
+        if !device.permit_is_current(rx){
+            return Err(RetirementError::Sockets(SocketError::Denied));
+        }
+        self.ingest_kernel_nic_frame(bsp,sockets,revision,frame,local_mac)
+    }
+
     /// Authenticated dequeue also requires the process to remain live.
     /// A denied read must leave both the output and queued packets untouched.
     pub fn receive_live_udp<const P:usize,const Q:usize>(
