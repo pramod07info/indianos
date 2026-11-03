@@ -75,7 +75,12 @@ on:
 
 permissions:
   contents: read
-  statuses: write  # report QEMU ring-3 result for direct-to-main commits
+  statuses: write  # publish exact source commit checks, including PR heads
+
+# A pull_request event's GITHUB_SHA is the synthetic merge commit. Custom
+# commit statuses MUST attach to the actual source revision that was tested.
+env:
+  INDIANOS_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
 
 jobs:
   qemu-uefi:
@@ -259,7 +264,7 @@ jobs:
               "description": f"Rust VMM: original C tests={h}, user processes and scheduler QEMU={q}",
               "target_url": f"{os.environ['GITHUB_SERVER_URL']}/{repo}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
           }).encode()
-          request = Request(f"https://api.github.com/repos/{repo}/statuses/{os.environ['GITHUB_SHA']}",
+          request = Request(f"https://api.github.com/repos/{repo}/statuses/{os.environ['INDIANOS_SOURCE_SHA']}",
                             data=payload, method="POST",
                             headers={"Authorization": "Bearer " + os.environ["GH_TOKEN"],
                                      "Accept": "application/vnd.github+json",
@@ -312,7 +317,7 @@ jobs:
               "description": f"Rust PMM: original C tests={h}, user processes and scheduler QEMU={q}",
               "target_url": f"{os.environ['GITHUB_SERVER_URL']}/{repo}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
           }).encode()
-          request = Request(f"https://api.github.com/repos/{repo}/statuses/{os.environ['GITHUB_SHA']}",
+          request = Request(f"https://api.github.com/repos/{repo}/statuses/{os.environ['INDIANOS_SOURCE_SHA']}",
                             data=payload, method="POST",
                             headers={"Authorization": "Bearer " + os.environ["GH_TOKEN"],
                                      "Accept": "application/vnd.github+json",
@@ -365,7 +370,7 @@ jobs:
               "description": f"Rust ELF image staging/copy C ABI={h}; two user processes QEMU={q}",
               "target_url": f"{os.environ['GITHUB_SERVER_URL']}/{repo}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
           }).encode()
-          request = Request(f"https://api.github.com/repos/{repo}/statuses/{os.environ['GITHUB_SHA']}",
+          request = Request(f"https://api.github.com/repos/{repo}/statuses/{os.environ['INDIANOS_SOURCE_SHA']}",
                             data=payload, method="POST",
                             headers={"Authorization": "Bearer " + os.environ["GH_TOKEN"],
                                      "Accept": "application/vnd.github+json",
@@ -418,7 +423,7 @@ jobs:
               "description": f"Rust paging clone and preflight C ABI={h}; QEMU user/fault={q}",
               "target_url": f"{os.environ['GITHUB_SERVER_URL']}/{repo}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
           }).encode()
-          request = Request(f"https://api.github.com/repos/{repo}/statuses/{os.environ['GITHUB_SHA']}",
+          request = Request(f"https://api.github.com/repos/{repo}/statuses/{os.environ['INDIANOS_SOURCE_SHA']}",
                             data=payload, method="POST",
                             headers={"Authorization": "Bearer " + os.environ["GH_TOKEN"],
                                      "Accept": "application/vnd.github+json",
@@ -471,7 +476,7 @@ jobs:
               "description": f"Rust UART/mem* host C ABI={h}, QEMU normal+process={q}",
               "target_url": f"{os.environ['GITHUB_SERVER_URL']}/{repo}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
           }).encode()
-          request = Request(f"https://api.github.com/repos/{repo}/statuses/{os.environ['GITHUB_SHA']}",
+          request = Request(f"https://api.github.com/repos/{repo}/statuses/{os.environ['INDIANOS_SOURCE_SHA']}",
                             data=payload, method="POST",
                             headers={"Authorization": "Bearer " + os.environ["GH_TOKEN"],
                                      "Accept": "application/vnd.github+json",
@@ -517,7 +522,7 @@ jobs:
               "description": f"Rust HHDM boot staging: normal+two-process QEMU={outcome}",
               "target_url": f"{os.environ['GITHUB_SERVER_URL']}/{repo}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
           }).encode()
-          request = Request(f"https://api.github.com/repos/{repo}/statuses/{os.environ['GITHUB_SHA']}",
+          request = Request(f"https://api.github.com/repos/{repo}/statuses/{os.environ['INDIANOS_SOURCE_SHA']}",
                             data=payload, method="POST",
                             headers={"Authorization": "Bearer " + os.environ["GH_TOKEN"],
                                      "Accept": "application/vnd.github+json",
@@ -561,7 +566,7 @@ jobs:
               "description": f"Rust boot/FB with normal, processes and fault QEMU: {outcome}",
               "target_url": f"{os.environ['GITHUB_SERVER_URL']}/{repo}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
           }).encode()
-          request = Request(f"https://api.github.com/repos/{repo}/statuses/{os.environ['GITHUB_SHA']}",
+          request = Request(f"https://api.github.com/repos/{repo}/statuses/{os.environ['INDIANOS_SOURCE_SHA']}",
                             data=payload, method="POST",
                             headers={"Authorization": "Bearer " + os.environ["GH_TOKEN"],
                                      "Accept": "application/vnd.github+json",
@@ -605,7 +610,7 @@ jobs:
               "description": f"Rust IDT/TSS exception/syscall/fault/scheduler QEMU: {outcome}",
               "target_url": f"{os.environ['GITHUB_SERVER_URL']}/{repo}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
           }).encode()
-          request = Request(f"https://api.github.com/repos/{repo}/statuses/{os.environ['GITHUB_SHA']}",
+          request = Request(f"https://api.github.com/repos/{repo}/statuses/{os.environ['INDIANOS_SOURCE_SHA']}",
                             data=payload, method="POST",
                             headers={"Authorization": "Bearer " + os.environ["GH_TOKEN"],
                                      "Accept": "application/vnd.github+json",
@@ -648,7 +653,7 @@ jobs:
               "description": f"Rust-native syscall demos, worker, scheduler and fault probes: {os.getenv('USERLAND')}",
               "target_url": f"{os.environ['GITHUB_SERVER_URL']}/{repo}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
           }).encode()
-          req = Request(f"https://api.github.com/repos/{repo}/statuses/{os.environ['GITHUB_SHA']}",
+          req = Request(f"https://api.github.com/repos/{repo}/statuses/{os.environ['INDIANOS_SOURCE_SHA']}",
                         data=payload, method="POST",
                         headers={"Authorization": "Bearer " + os.environ["GH_TOKEN"],
                                  "Accept": "application/vnd.github+json",
@@ -688,7 +693,7 @@ jobs:
               "target_url": f"{os.environ['GITHUB_SERVER_URL']}/{repo}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
           }).encode()
           request=Request(
-              f"https://api.github.com/repos/{repo}/statuses/{os.environ['GITHUB_SHA']}",
+              f"https://api.github.com/repos/{repo}/statuses/{os.environ['INDIANOS_SOURCE_SHA']}",
               data=payload,method="POST",
               headers={"Authorization":"Bearer "+os.environ["GH_TOKEN"],
                        "Accept":"application/vnd.github+json",
@@ -732,7 +737,7 @@ jobs:
               "description": f"Rust PIT driver normal/ring3 boot only; not preemption: {outcome}",
               "target_url": f"{os.environ['GITHUB_SERVER_URL']}/{repo}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
           }).encode()
-          req=Request(f"https://api.github.com/repos/{repo}/statuses/{os.environ['GITHUB_SHA']}",
+          req=Request(f"https://api.github.com/repos/{repo}/statuses/{os.environ['INDIANOS_SOURCE_SHA']}",
               data=payload,method="POST",
               headers={"Authorization":"Bearer "+os.environ["GH_TOKEN"],
                        "Accept":"application/vnd.github+json",
@@ -775,7 +780,7 @@ jobs:
               "description":f"Native Rust QEMU runner normal+process tests: {outcome}",
               "target_url":f"{os.environ['GITHUB_SERVER_URL']}/{repo}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
           }).encode()
-          req=Request(f"https://api.github.com/repos/{repo}/statuses/{os.environ['GITHUB_SHA']}",
+          req=Request(f"https://api.github.com/repos/{repo}/statuses/{os.environ['INDIANOS_SOURCE_SHA']}",
               data=payload,method="POST",
               headers={"Authorization":"Bearer "+os.environ["GH_TOKEN"],
                        "Accept":"application/vnd.github+json",
@@ -818,7 +823,7 @@ jobs:
               "description":f"Rust kmain: normal+UD2+pagefault+process+sched+guard QEMU: {outcome}",
               "target_url":f"{os.environ['GITHUB_SERVER_URL']}/{repo}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
           }).encode()
-          req=Request(f"https://api.github.com/repos/{repo}/statuses/{os.environ['GITHUB_SHA']}",
+          req=Request(f"https://api.github.com/repos/{repo}/statuses/{os.environ['INDIANOS_SOURCE_SHA']}",
               data=payload,method="POST",
               headers={"Authorization":"Bearer "+os.environ["GH_TOKEN"],
                        "Accept":"application/vnd.github+json",
@@ -861,7 +866,7 @@ jobs:
               "description":f"Rust boot+IDT+timer+apps+tools, 4 QEMU modes: {outcome}",
               "target_url":f"{os.environ['GITHUB_SERVER_URL']}/{repo}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
           }).encode()
-          req=Request(f"https://api.github.com/repos/{repo}/statuses/{os.environ['GITHUB_SHA']}",
+          req=Request(f"https://api.github.com/repos/{repo}/statuses/{os.environ['INDIANOS_SOURCE_SHA']}",
               data=payload,method="POST",
               headers={"Authorization":"Bearer "+os.environ["GH_TOKEN"],
                        "Accept":"application/vnd.github+json",
@@ -948,7 +953,7 @@ jobs:
                       break
           description = (f"QEMU ring-3: {outcome}" + (f"; {tail}" if tail else ""))[:140]
           repo = os.environ["GITHUB_REPOSITORY"]
-          sha = os.environ["GITHUB_SHA"]
+          sha = os.environ["INDIANOS_SOURCE_SHA"]
           run_url = (f"{os.environ['GITHUB_SERVER_URL']}/{repo}/actions/runs/"
                      f"{os.environ['GITHUB_RUN_ID']}")
           payload = json.dumps({
@@ -993,7 +998,7 @@ jobs:
               "target_url": (f"{os.environ['GITHUB_SERVER_URL']}/{repo}/actions/runs/"
                              f"{os.environ['GITHUB_RUN_ID']}")
           }).encode()
-          req = Request(f"https://api.github.com/repos/{repo}/statuses/{os.environ['GITHUB_SHA']}",
+          req = Request(f"https://api.github.com/repos/{repo}/statuses/{os.environ['INDIANOS_SOURCE_SHA']}",
                         data=payload, method="POST",
                         headers={"Authorization": "Bearer " + os.environ["GH_TOKEN"],
                                  "Accept": "application/vnd.github+json",
@@ -1044,7 +1049,7 @@ jobs:
               "target_url": (f"{os.environ['GITHUB_SERVER_URL']}/{repo}/actions/runs/"
                              f"{os.environ['GITHUB_RUN_ID']}")
           }).encode()
-          req = Request(f"https://api.github.com/repos/{repo}/statuses/{os.environ['GITHUB_SHA']}",
+          req = Request(f"https://api.github.com/repos/{repo}/statuses/{os.environ['INDIANOS_SOURCE_SHA']}",
                         data=payload, method="POST",
                         headers={"Authorization": "Bearer " + os.environ["GH_TOKEN"],
                                  "Accept": "application/vnd.github+json",
@@ -1105,7 +1110,7 @@ jobs:
               "target_url": (f"{os.environ['GITHUB_SERVER_URL']}/{repo}/actions/runs/"
                              f"{os.environ['GITHUB_RUN_ID']}")
           }).encode()
-          request = Request(f"https://api.github.com/repos/{repo}/statuses/{os.environ['GITHUB_SHA']}",
+          request = Request(f"https://api.github.com/repos/{repo}/statuses/{os.environ['INDIANOS_SOURCE_SHA']}",
                             data=payload, method="POST",
                             headers={"Authorization": "Bearer " + os.environ["GH_TOKEN"],
                                      "Accept": "application/vnd.github+json",
@@ -1149,7 +1154,7 @@ jobs:
               "target_url": (f"{os.environ['GITHUB_SERVER_URL']}/{repo}/actions/runs/"
                              f"{os.environ['GITHUB_RUN_ID']}")
           }).encode()
-          request = Request(f"https://api.github.com/repos/{repo}/statuses/{os.environ['GITHUB_SHA']}",
+          request = Request(f"https://api.github.com/repos/{repo}/statuses/{os.environ['INDIANOS_SOURCE_SHA']}",
                             data=payload, method="POST",
                             headers={"Authorization": "Bearer " + os.environ["GH_TOKEN"],
                                      "Accept": "application/vnd.github+json",
@@ -1336,7 +1341,7 @@ jobs:
                              f"{os.environ['GITHUB_RUN_ID']}"),
           }).encode()
           request = Request(
-              f"https://api.github.com/repos/{repo}/statuses/{os.environ['GITHUB_SHA']}",
+              f"https://api.github.com/repos/{repo}/statuses/{os.environ['INDIANOS_SOURCE_SHA']}",
               data=payload, method="POST",
               headers={"Authorization": "Bearer " + os.environ["GH_TOKEN"],
                        "Accept": "application/vnd.github+json",
