@@ -1606,6 +1606,24 @@ fn revoke_task_authority_with_kind(
    let had_live_directory_lease=owner.pid==2 &&
       unsafe{(&*ptr::addr_of!(R116_SHARED_LEASES))}
         .permits_shared_directory(owner);
+   // Capture REAL, kernel-minted PID2 Files root and mounted-volume epoch
+   // proofs while its PCB incarnation is still alive. The same snapshot must
+   // be unusable immediately after five-table scheduler retirement, even
+   // if another process later reuses the original pathname.
+   #[cfg(feature="test-r031-files-gui")]
+   let old_pid2_mount=if had_live_directory_lease {
+     let fs=unsafe{&*ptr::addr_of!(R031_HANDLES)};
+     match (
+       fs.mount_alias_for_current_root_kernel(owner),
+       fs.selected_operation_guard(owner)
+     ){
+       (Ok(alias),Ok(guard))=>Some((alias,guard)),
+       _=>{
+         log(b"IndianOS: FATAL R122 cannot snapshot PID2 mount authority\n\0");
+         r120_halt();
+       }
+     }
+   }else{None};
    #[cfg(feature="test-r031-files-gui")]
    let mut full_retirement_committed=false;
    // Do not advertise lifecycle exit/fault yet. The notice must be
@@ -1687,8 +1705,13 @@ fn revoke_task_authority_with_kind(
            pid:owner.pid,generation:owner.generation},5502).is_err() &&
         unsafe{(&*ptr::addr_of!(R115_UDP_OWNERS))}
         .owner_of(5502).is_none();
-     let file_gone=!unsafe{(&*ptr::addr_of!(R031_HANDLES))}.owns(owner);
-     if lease_gone && port_gone && file_gone {
+     let fs=unsafe{&*ptr::addr_of!(R031_HANDLES)};
+     let file_gone=!fs.owns(owner);
+     let old_mount_denied=old_pid2_mount.is_some_and(|(alias,guard)|
+       !fs.mount_alias_allows(alias,owner,"/shared/readme") &&
+       !fs.selected_operation_guard_is_current(guard));
+     if lease_gone && port_gone && file_gone && old_mount_denied {
+       log(b"IndianOS: R122 QEMU stale PID2 mount alias and revision guard denied\n\0");
        log(b"R117 QEMU PID2 delegated directory and UDP authority revoked at scheduler exit\n\0");
      }else{
        log(b"IndianOS: FATAL R117 PID2 delegated authority retained after exit\n\0");
