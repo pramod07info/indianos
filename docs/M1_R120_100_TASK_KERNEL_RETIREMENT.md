@@ -309,3 +309,8 @@ The live ring-3 UDP syscalls, privileged process preparation, scheduler normal-e
 
 - The R114 QEMU guest now runs three additional **real OVMF guest** negative cases on the same disposable ATA journal: a protected floor above the observed epoch, a bootloader-selected slot mismatch, and a forged measurement digest. The guest only prints `R118 QEMU PID1 boot authority negative controls PASSED` if all reject; the external QEMU harness requires this marker in addition to the positive handoff and durable epoch markers on **every** cold boot.
 - The QEMU platform inputs are explicitly fixed fixtures, not physical firmware trust. These tests strengthen the source-level fail-closed path for R118-054/075/076 without claiming production UEFI/TPM root provisioning or independent security review.
+
+## R118 exact-head checkout across all mandatory integration jobs
+
+- Nine GitHub Actions workflows now checkout the `github.event.pull_request.head.sha || github.sha` commit instead of the default pull-request merge ref; each disables persisted Git credentials and runs `tools/verify_ci_sha.py` before building. The audit includes the kernel ELF/ISO boot, R114 OVMF journal, R028 virtio-net, graphical persistent Files, M1 combined Rust/QEMU regression (both jobs), M2 developer alpha, Orbit QEMU, S0 security and R118 evidence verifier.
+- This closes a **source-to-test identity gap** affecting R118-062/063/064/065/066/068: a success check now demonstrates that the exact requested source SHA was checked out, not just a synthetic PR merge SHA. `Roadmap SHA Validation` already checks the live PR head and all checks must still pass on the final integration commit. No QEMU test, no matter how many CPUs configured, qualifies real hardware/IOMMU/TPM/power-cut gates.

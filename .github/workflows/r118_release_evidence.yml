@@ -15,5 +15,12 @@ jobs:
     steps:
       - name: Checkout selected PR commit
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: R118 assert exact integration head checkout
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: python3 tools/verify_ci_sha.py --expected "$EXPECTED_SHA" --observed "$(git rev-parse HEAD)"
       - name: Verify Python evidence gate regressions
         run: python3 -m unittest -v scripts/test_r118_release_gate.py

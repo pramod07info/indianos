@@ -87,6 +87,13 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: R118 assert exact integration head checkout
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: python3 tools/verify_ci_sha.py --expected "$EXPECTED_SHA" --observed "$(git rev-parse HEAD)"
       - name: Verify exact-main screenshot SHA gate cannot be orphaned
         run: python3 -m unittest discover -s tests -p 'test_ci_screenshot_sha_gate.py' -v
       - name: Install emulator and image-building dependencies
