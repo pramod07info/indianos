@@ -73,6 +73,14 @@ impl<const C: usize, const U: usize, const E: usize> ProcessRetirement<C, U, E> 
         &self,_permit:&crate::retirement_gate::Permit<'_>
     )->IngressRevision{IngressRevision(self.ingress_revision)}
 
+    /// The *synchronous* QEMU virtio-net poll owner is single-BSP by
+    /// construction. A future interrupt-driven NIC MUST use the permit-
+    /// guarded variant and stop/drain RX DMA before epoch transitions.
+    /// No ring-3 syscall exposes this method.
+    pub fn capture_polled_ingress_revision(&self)->IngressRevision{
+        IngressRevision(self.ingress_revision)
+    }
+
     /// Only the privileged scheduler may authenticate and start a PID.
     pub fn start(&mut self, pid: u32) -> Result<Owner, RetirementError> {
         let next=self.next_ingress_revision()?;
@@ -197,6 +205,19 @@ impl<const C: usize, const U: usize, const E: usize> ProcessRetirement<C, U, E> 
             port,frame,mac).map_err(RetirementError::Ingress)
     }
 
+    /// The exclusive polled virtio NIC captures the revision before
+    /// device.poll() and checks it again before any data enters UDP queues.
+    /// R118: a delayed frame cannot inherit a later process-port owner.
+    pub fn ingest_polled_live_udp_fenced<const P:usize,const Q:usize>(
+        &self,sockets:&mut EpochUdpEndpoints<P,Q>,rx_revision:IngressRevision,
+        owner:Owner,port:u16,frame:&[u8],mac:[u8;6],
+    )->Result<(),RetirementError>{
+        if rx_revision.0!=self.ingress_revision{
+            return Err(RetirementError::Sockets(SocketError::Denied));
+        }
+        self.ingest_live_udp(sockets,owner,port,frame,mac)
+    }
+
     /// Kernel NIC ingress dispatch: the packet is validated and its
     /// destination port determines an exact currently live process generation.
     /// No caller-supplied user PID or packet header is used as PID authority.
@@ -219,7 +240,8 @@ impl<const C: usize, const U: usize, const E: usize> ProcessRetirement<C, U, E> 
         let grant=self.udp.owner_of(port)
             .ok_or(RetirementError::Udp(UdpError::Denied))?;
         let owner=Owner{pid:grant.pid,generation:grant.generation};
-        self.ingest_live_udp(sockets,owner,port,frame,local_mac)?;
+        self.ingest_polled_live_udp_fenced(
+            sockets,rx_revision,owner,port,frame,local_mac)?;
         Ok(owner)
     }
 

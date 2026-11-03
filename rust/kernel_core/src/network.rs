@@ -236,6 +236,29 @@ fn wait_for_limit<D:EthernetDevice>(dev:&mut D,limit:u32,
     }
     Err(Error::Timeout)
 }
+/// Poll a genuine NIC frame with the ownership revision sampled BEFORE
+/// each poll, not after a possibly delayed DMA completion. The Rust caller
+/// exclusively owns NIC, policy and socket tables on the experimental BSP.
+/// Physical IRQ-driven drivers need hardware quiescence and a BSP permit.
+fn wait_for_limit_fenced<D:EthernetDevice>(
+    dev:&mut D,limit:u32,
+    mut capture:impl FnMut()->crate::process_retirement_txn::IngressRevision,
+    mut matcher:impl FnMut(
+        crate::process_retirement_txn::IngressRevision,&[u8],[u8;6]
+    )->bool,
+)->Result<(),Error>{
+    let mut frame=[0u8;FRAME_CAP];
+    let mac=dev.mac();
+    for _ in 0..limit{
+        let pre_poll=capture();
+        if let Some(n)=dev.poll(&mut frame)?{
+            if n>frame.len(){return Err(Error::Invalid);}
+            if matcher(pre_poll,&frame[..n],mac){return Ok(());}
+        }
+        spin_loop();
+    }
+    Err(Error::Timeout)
+}
 fn wait_for<D:EthernetDevice>(dev:&mut D,
     matcher:impl FnMut(&[u8],[u8;6])->bool)->Result<(),Error>{
     wait_for_limit(dev,MAX_POLL,matcher)
@@ -311,15 +334,20 @@ pub fn run_demo<D:EthernetDevice>(
     transmit_leased_ipv4_checked_clock(dev,&routes,&alternatives,route_owner,1,
         PEER_IP,||initial_clock+1,
         |b,mac|udp_frame(b,mac,PEER_UDP_PORT,UDP_REQ,0x2803))?;
-    let ingress=|frame:&[u8],mac:[u8;6]|{
+    let ingress=|revision:crate::process_retirement_txn::IngressRevision,
+                  frame:&[u8],mac:[u8;6]|{
         parse_udp(frame,mac,PEER_UDP_PORT).is_ok_and(|data|data==UDP_RESP)
-            && live_owners.ingest_live_udp(&mut udp_endpoints,
+            && live_owners.ingest_polled_live_udp_fenced(
+                &mut udp_endpoints,revision,
                 network_owner,CLIENT_PORT,frame,mac).is_ok()
     };
     // Do not treat malformed network replies as successful failover evidence.
     // In the QEMU test the peer confirms packet reception but blackholes
     // this reply. Only a bounded timeout may quarantine the primary path.
-    match wait_for_limit(dev,300_000,ingress){
+    match wait_for_limit_fenced(
+        dev,300_000,
+        ||live_owners.capture_polled_ingress_revision(),ingress
+    ){
         Err(Error::Timeout)=>{
             // R116 physical QEMU packet acceptance: the original time
             // receipt must have expired (not merely have timed out waiting
@@ -343,11 +371,17 @@ pub fn run_demo<D:EthernetDevice>(
             transmit_leased_ipv4_checked_clock(dev,&routes,&alternatives,route_owner,1,
         PEER_IP,||initial_clock+20,
                 |b,mac|udp_frame(b,mac,PEER_UDP_PORT,UDP_REQ,0x2808))?;
-            wait_for(dev,|frame,mac|{
-                parse_udp(frame,mac,PEER_UDP_PORT).is_ok_and(|data|data==UDP_RESP)
-                    && live_owners.ingest_live_udp(&mut udp_endpoints,
-                network_owner,CLIENT_PORT,frame,mac).is_ok()
-            })?;
+            wait_for_limit_fenced(
+                dev,MAX_POLL,
+                ||live_owners.capture_polled_ingress_revision(),
+                |revision,frame,mac|{
+                    parse_udp(frame,mac,PEER_UDP_PORT)
+                        .is_ok_and(|data|data==UDP_RESP)
+                        && live_owners.ingest_polled_live_udp_fenced(
+                            &mut udp_endpoints,revision,
+                            network_owner,CLIENT_PORT,frame,mac).is_ok()
+                }
+            )?;
             stage(b"IndianOS: R116 QEMU DHCP lease expiry blocked primary UDP resend and backup succeeded\n\0");
         },
         // The failure-injection acceptance requires the primary to become
@@ -362,11 +396,16 @@ pub fn run_demo<D:EthernetDevice>(
     stage(b"IndianOS: R028 IPv4 UDP echo PASSED\n\0");
     transmit_leased_ipv4_checked_clock(dev,&routes,&alternatives,route_owner,1,
         PEER_IP,||initial_clock+21,dns_query)?;
-    wait_for(dev,|frame,mac|{
-        valid_dns(frame,mac) &&
-            live_owners.ingest_live_udp(&mut udp_endpoints,
-                network_owner,CLIENT_PORT,frame,mac).is_ok()
-    })?;
+    wait_for_limit_fenced(
+        dev,MAX_POLL,
+        ||live_owners.capture_polled_ingress_revision(),
+        |revision,frame,mac|{
+            valid_dns(frame,mac) &&
+                live_owners.ingest_polled_live_udp_fenced(
+                    &mut udp_endpoints,revision,
+                    network_owner,CLIENT_PORT,frame,mac).is_ok()
+        }
+    )?;
     let mut dns_reply=[0u8;R033_UDP_BYTES];
     let dns_bytes=live_owners.receive_live_udp(&mut udp_endpoints,
         network_owner,CLIENT_PORT,&mut dns_reply)
