@@ -35,6 +35,7 @@ impl RegistryEntry {
 
 /// No heap, no global state, and no token reuse, including after revocation.
 /// Each Registry instance is owned and synchronized by its kernel caller.
+#[derive(Clone)]
 pub struct Registry<const CAPACITY: usize> {
     entries: [Option<RegistryEntry>; CAPACITY],
     next_token: u64,
@@ -204,6 +205,7 @@ pub enum EpochError {
 #[derive(Clone, Copy)]
 struct ProcessEpoch { pid: u32, generation: u64, active: bool }
 
+#[derive(Clone)]
 pub struct EpochRegistry<const N: usize> {
     epochs: [Option<ProcessEpoch>; N],
     grants: Registry<N>,
@@ -215,6 +217,11 @@ impl<const N: usize> EpochRegistry<N> {
     fn process(&self, pid: u32) -> Option<ProcessEpoch> {
         self.epochs.iter().flatten().copied().find(|entry| entry.pid == pid)
     }
+    /// Read-only authoritative incarnation of a currently active PID.
+    pub fn active_generation(&self, pid: u32) -> Option<u64> {
+        self.process(pid).and_then(|p| if p.active { Some(p.generation) } else { None })
+    }
+
     pub fn start(&mut self, pid: u32) -> Result<u64, EpochError> {
         if pid == 0 { return Err(EpochError::InvalidPid); }
         if let Some(entry) = self.epochs.iter_mut().flatten().find(|e| e.pid == pid) {

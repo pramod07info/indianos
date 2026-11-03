@@ -7,6 +7,7 @@ pub struct Grant { pub pid:u32, pub generation:u64, pub port:u16 }
 
 /// Bounded UDP port ownership proposal; not yet wired to live sockets.
 /// PID+generation must come from authenticated kernel process state.
+#[derive(Clone)]
 pub struct Registry<const N:usize> { entries:[Option<Grant>;N] }
 impl<const N:usize> Registry<N> {
     pub const fn new()->Self { Self { entries:[None;N] } }
