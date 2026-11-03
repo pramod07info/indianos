@@ -27,6 +27,8 @@ REQUIRED = (
     "Build ELF + ISO and verify serial boot",
 )
 BASE = "https://api.github.com"
+PAGE_SIZE = 100
+MAX_PAGES = 10
 
 
 def get(path):
@@ -38,6 +40,56 @@ def get(path):
     request = urllib.request.Request(BASE + path, headers=headers)
     with urllib.request.urlopen(request, timeout=15) as response:
         return json.load(response)
+
+
+def exact_head_check_runs(prefix, sha):
+    """Bounded complete REST collection; deny missing/contradictory pages."""
+    items = []
+    total = None
+    for page in range(1, MAX_PAGES + 1):
+        payload = get(prefix + "/commits/" + sha +
+                      f"/check-runs?per_page={PAGE_SIZE}&page={page}")
+        if not isinstance(payload, dict) or not isinstance(payload.get("check_runs"), list):
+            return items, False
+        count = payload.get("total_count")
+        if type(count) is not int or count < 0 or count > PAGE_SIZE * MAX_PAGES:
+            return items, False
+        if total is None:
+            total = count
+        elif total != count:
+            # Check-runs changed while paginating: never accept a moving list.
+            return items, False
+        current = payload["check_runs"]
+        if len(current) > PAGE_SIZE or len(items) + len(current) > total:
+            return items, False
+        if not all(isinstance(item, dict) for item in current):
+            return items, False
+        items.extend(current)
+        if len(items) == total:
+            return items, True
+        if len(current) < PAGE_SIZE:
+            # An incomplete *short* page cannot hide extra results.
+            return items, False
+    return items, False
+
+
+def complete_review_history(prefix, number):
+    """Read review history through the first non-full page, or fail closed.
+
+    GitHub REST review arrays do not provide total_count; even an exactly
+    100-review history must be followed by an empty page.
+    """
+    items = []
+    for page in range(1, MAX_PAGES + 1):
+        current = get(prefix + "/pulls/" + str(number) +
+                      f"/reviews?per_page={PAGE_SIZE}&page={page}")
+        if not isinstance(current, list) or len(current) > PAGE_SIZE or not all(
+                isinstance(item, dict) for item in current):
+            return items, False
+        items.extend(current)
+        if len(current) < PAGE_SIZE:
+            return items, True
+    return items, False
 
 
 def main():
@@ -65,14 +117,8 @@ def main():
             report["reason"] = "PR head mismatch or PR is not open"
             print(json.dumps(report, indent=2))
             return 1
-        check_payload = get(prefix + "/commits/" + args.expected_head +
-                            "/check-runs?per_page=100")
-        checks = check_payload["check_runs"]
-        # Never silently ignore mandatory checks on a later API page.
-        report["check_results_complete"] = (
-            isinstance(check_payload.get("total_count", len(checks)), int)
-            and check_payload.get("total_count", len(checks)) == len(checks)
-        )
+        checks, report["check_results_complete"] = exact_head_check_runs(
+            prefix, args.expected_head)
         for name in REQUIRED:
             candidates = [check for check in checks if check.get("name") == name]
             report["required_checks"][name] = (
@@ -82,10 +128,9 @@ def main():
                     and check.get("conclusion") == "success"
                     for check in candidates
                 ) else "not-success")
-        reviews = get(prefix + "/pulls/" + str(args.pr) + "/reviews?per_page=100")
-        # GitHub REST reviews are paginated. Never accept an approval when
-        # a first full page may hide a newer change request on later pages.
-        report["review_history_complete"] = isinstance(reviews, list) and len(reviews) < 100
+        reviews, report["review_history_complete"] = complete_review_history(
+            prefix, args.pr)
+        # A later page can override an early approval with a change request.
         latest = {}
         author = pr["user"]["login"]
         if report["review_history_complete"]:

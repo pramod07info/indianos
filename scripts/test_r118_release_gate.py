@@ -151,12 +151,66 @@ class ReleaseGateTests(unittest.TestCase):
         self.assertEqual(exit_code,1)
         self.assertFalse(result["independent_approved"])
 
-    def test_exactly_one_hundred_reviews_is_ambiguous_not_approved(self):
+    def test_exactly_one_hundred_reviews_requires_the_empty_next_page(self):
         records=list(evidence())
         records[2]=fixture_reviews()*100
+        records.insert(3, [])
+        exit_code,result=self.invoke(iter(records))
+        self.assertEqual(exit_code,0)
+        self.assertTrue(result["review_history_complete"])
+        self.assertTrue(result["ready"])
+
+    def test_later_review_page_change_request_overrides_first_page(self):
+        records=list(evidence())
+        records[2]=fixture_reviews()*100
+        records.insert(3,fixture_reviews(state="CHANGES_REQUESTED"))
+        exit_code,result=self.invoke(iter(records))
+        self.assertEqual(exit_code,1)
+        self.assertTrue(result["review_history_complete"])
+        self.assertFalse(result["independent_approved"])
+
+    def test_review_page_above_cap_or_malformed_page_denies(self):
+        records=list(evidence())
+        records[2]=fixture_reviews()*100
+        records.insert(3,{"not":"a review list"})
         exit_code,result=self.invoke(iter(records))
         self.assertEqual(exit_code,1)
         self.assertFalse(result["review_history_complete"])
+
+    def test_check_runs_over_100_are_collected_at_exact_head(self):
+        records=list(evidence())
+        required=records[1]["check_runs"]
+        # One hundred successful exact-head checks plus the mandatory 9
+        # on page 2; a fake count/truncated result would never pass.
+        first=required + [{
+            "name":"nonmandatory", "head_sha":SHA,
+            "status":"completed", "conclusion":"success"
+        } for _ in range(100-len(required))]
+        records[1]={"total_count":101,"check_runs":first}
+        records.insert(2,{"total_count":101,"check_runs":[{
+            "name":"nonmandatory-2","head_sha":SHA,
+            "status":"completed","conclusion":"success"
+        }]})
+        exit_code,result=self.invoke(iter(records))
+        self.assertEqual(exit_code,0)
+        self.assertTrue(result["check_results_complete"])
+        self.assertTrue(result["ready"])
+
+    def test_moving_check_count_across_pages_is_denied(self):
+        records=list(evidence())
+        required=records[1]["check_runs"]
+        first=required + [{
+            "name":"other","head_sha":SHA,
+            "status":"completed","conclusion":"success"
+        } for _ in range(100-len(required))]
+        records[1]={"total_count":101,"check_runs":first}
+        records.insert(2,{"total_count":102,"check_runs":[{
+            "name":"other2","head_sha":SHA,
+            "status":"completed","conclusion":"success"
+        }]})
+        exit_code,result=self.invoke(iter(records))
+        self.assertEqual(exit_code,1)
+        self.assertFalse(result["check_results_complete"])
         self.assertFalse(result["ready"])
 
     def test_branch_protection_requires_strict_status_and_human_count(self):
