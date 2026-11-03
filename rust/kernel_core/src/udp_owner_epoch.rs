@@ -293,3 +293,63 @@ mod r119_inherited_port_generation_regressions{
   assert_eq!(r.authorize(2,42,5300),Ok(()));
  }
 }
+
+/// R119: atomic retirement of generation-authenticated UDP registry owners.
+/// The live socket table must be retired by the same kernel supervisor;
+/// this helper alone is not an IRQ or physical NIC safety proof.
+impl<const N:usize> Registry<N>{
+ pub fn revoke_owners_batch(&mut self,owners:&[(u32,u64)])
+     ->Result<usize,Error>{
+  let mut candidate=Self{entries:self.entries};
+  for (i,&(pid,generation)) in owners.iter().enumerate(){
+   if pid==0||generation==0{return Err(Error::Invalid);}
+   if owners[..i].iter().any(|&(previous,_)|previous==pid){
+    return Err(Error::Duplicate);
+   }
+   if candidate.has_foreign_generation(pid,generation){
+    return Err(Error::Denied);
+   }
+   candidate.revoke_owner(pid,generation)?;
+  }
+  let removed=self.active_count()-candidate.active_count();
+  self.entries=candidate.entries;
+  Ok(removed)
+ }
+}
+#[cfg(test)]
+mod r119_udp_owner_batch_tests{
+ use super::*;
+ #[test]fn exact_multi_owner_retirement_keeps_peer(){
+  let mut r=Registry::<4>::new();
+  r.bind(1,9,5001).unwrap();r.bind(1,9,5002).unwrap();
+  r.bind(2,9,5003).unwrap();r.bind(3,9,5004).unwrap();
+  assert_eq!(r.revoke_owners_batch(&[(1,9),(2,9)]),Ok(3));
+  assert_eq!(r.authorize(3,9,5004),Ok(()));
+  assert_eq!(r.active_count(),1);
+ }
+ #[test]fn recycled_pid_cannot_revoke_valid_earlier_owner(){
+  let mut r=Registry::<3>::new();
+  r.bind(1,2,5001).unwrap();r.bind(2,20,5002).unwrap();
+  assert_eq!(r.revoke_owners_batch(&[(1,2),(2,19)]),Err(Error::Denied));
+  assert_eq!(r.authorize(1,2,5001),Ok(()));
+  assert_eq!(r.authorize(2,20,5002),Ok(()));
+ }
+ #[test]fn invalid_and_duplicate_group_members_are_atomic(){
+  let mut r=Registry::<2>::new();r.bind(1,2,55).unwrap();
+  for bad in [(0,2),(1,0),(1,3)]{
+   assert!(r.revoke_owners_batch(&[(1,2),bad]).is_err());
+   assert_eq!(r.authorize(1,2,55),Ok(()));
+  }
+  assert_eq!(r.revoke_owners_batch(&[(1,2),(1,2)]),Err(Error::Duplicate));
+  assert_eq!(r.authorize(1,2,55),Ok(()));
+ }
+ #[test]fn empty_and_zero_capacity_retirement_are_safe(){
+  let mut zero=Registry::<0>::new();
+  assert_eq!(zero.revoke_owners_batch(&[]),Ok(0));
+  assert_eq!(zero.revoke_owners_batch(&[(1,2)]),Ok(0));
+  let mut r=Registry::<1>::new();r.bind(1,4,70).unwrap();
+  assert_eq!(r.revoke_owners_batch(&[]),Ok(0));
+  assert_eq!(r.revoke_owners_batch(&[(1,4)]),Ok(1));
+  assert_eq!(r.revoke_owners_batch(&[(1,4)]),Ok(0));
+ }
+}

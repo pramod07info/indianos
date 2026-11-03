@@ -365,3 +365,71 @@ mod batch1_resource_revocation_tests {
     }
 }
 
+
+/// R119: transactional retirement of authenticated process incarnations.
+/// A stale member cannot revoke an earlier valid member. The kernel caller
+/// serializes this table; this is not proof of SMP locking or IRQ safety.
+impl<const N:usize> EpochRegistry<N>{
+ pub fn retire_batch(&mut self,owners:&[(u32,u64)])
+    ->Result<usize,EpochError>{
+  for (i,&(pid,generation)) in owners.iter().enumerate(){
+   if pid==0{return Err(EpochError::InvalidPid);}
+   if generation==0{return Err(EpochError::NotActive);}
+   if owners[..i].iter().any(|&(previous,_)|previous==pid){
+    return Err(EpochError::Denied);
+   }
+   if self.process(pid).is_none_or(|epoch|
+       !epoch.active||epoch.generation!=generation){
+    return Err(EpochError::NotActive);
+   }
+  }
+  let mut revoked=0;
+  for &(pid,_) in owners{
+   let current=self.epochs.iter_mut().flatten()
+      .find(|epoch|epoch.pid==pid).expect("preflighted owner");
+   current.active=false;
+   revoked+=self.grants.revoke_all(pid);
+  }
+  Ok(revoked)
+ }
+}
+#[cfg(test)]
+mod r119_capability_batch_tests{
+ use super::*;
+ #[test]fn retire_exact_group_and_preserve_peer(){
+  let mut r=EpochRegistry::<5>::new();
+  for pid in [1,2,3]{r.start(pid).unwrap();}
+  let a=r.grant(1,100,1).unwrap();
+  let b=r.grant(2,200,1).unwrap();
+  let peer=r.grant(3,300,1).unwrap();
+  assert_eq!(r.retire_batch(&[(1,1),(2,1)]),Ok(2));
+  assert_eq!(r.authorize(1,1,a,100,1),Err(EpochError::NotActive));
+  assert_eq!(r.authorize(2,1,b,200,1),Err(EpochError::NotActive));
+  assert_eq!(r.authorize(3,1,peer,300,1),Ok(()));
+ }
+ #[test]fn stale_late_member_preserves_every_owner(){
+  let mut r=EpochRegistry::<3>::new();
+  r.start(1).unwrap();r.start(2).unwrap();
+  let a=r.grant(1,100,1).unwrap();let b=r.grant(2,200,1).unwrap();
+  assert_eq!(r.retire_batch(&[(1,1),(2,2)]),Err(EpochError::NotActive));
+  assert_eq!(r.authorize(1,1,a,100,1),Ok(()));
+  assert_eq!(r.authorize(2,1,b,200,1),Ok(()));
+ }
+ #[test]fn duplicated_invalid_and_replayed_groups_are_denied(){
+  let mut r=EpochRegistry::<2>::new();r.start(1).unwrap();
+  let a=r.grant(1,5,1).unwrap();
+  assert_eq!(r.retire_batch(&[(1,1),(1,1)]),Err(EpochError::Denied));
+  assert_eq!(r.retire_batch(&[(1,1),(0,1)]),Err(EpochError::InvalidPid));
+  assert_eq!(r.retire_batch(&[(1,1),(2,0)]),Err(EpochError::NotActive));
+  assert_eq!(r.authorize(1,1,a,5,1),Ok(()));
+  assert_eq!(r.retire_batch(&[(1,1)]),Ok(1));
+  assert_eq!(r.retire_batch(&[(1,1)]),Err(EpochError::NotActive));
+  assert_eq!(r.start(1),Ok(2));
+  assert_eq!(r.authorize(1,2,a,5,1),Err(EpochError::Denied));
+ }
+ #[test]fn zero_capacity_and_empty_batch_are_safe(){
+  let mut r=EpochRegistry::<0>::new();
+  assert_eq!(r.retire_batch(&[]),Ok(0));
+  assert_eq!(r.retire_batch(&[(1,1)]),Err(EpochError::NotActive));
+ }
+}

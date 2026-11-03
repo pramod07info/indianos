@@ -1093,3 +1093,70 @@ mod r118_sequence_bound_lifecycle_tests {
   assert_eq!(q.enqueue(item()),Err(EventError::Full));
  }
 }
+
+/// R119: issue exact-generation exit notices transactionally. Invalid
+/// members, capacity pressure and receipt exhaustion never publish a prefix.
+/// This bounded single-owner queue still requires external SMP synchronization.
+impl<const N:usize> ProcessEvents<N>{
+ pub fn enqueue_exit_batch_once(&mut self,owners:&[(u32,u64)])
+     ->Result<usize,EventError>{
+  let mut staged=Self{
+    entries:self.entries,sequences:self.sequences,
+    next_sequence:self.next_sequence,head:self.head,count:self.count
+  };
+  let mut inserted=0usize;
+  for &(pid,generation) in owners{
+   if staged.enqueue_exit_once(pid,generation)?{inserted+=1;}
+  }
+  *self=staged;
+  Ok(inserted)
+ }
+}
+#[cfg(test)]
+mod r119_atomic_exit_batch_tests{
+ use super::*;
+ fn e(pid:u32,g:u64)->ProcessEvent{
+  ProcessEvent{pid,kind:EventKind::Exited,value:g}
+ }
+ #[test]fn duplicate_and_prior_exit_are_idempotent(){
+  let mut q=ProcessEvents::<4>::new();q.enqueue_exit_once(1,1).unwrap();
+  let saved=q.peek_receipt().unwrap();
+  assert_eq!(q.enqueue_exit_batch_once(&[(1,1),(2,2),(2,2)]),Ok(1));
+  assert_eq!(q.len(),2);
+  assert_eq!(q.acknowledge_receipt(saved),Some(e(1,1)));
+  assert_eq!(q.dequeue(),Ok(e(2,2)));
+ }
+ #[test]fn invalid_or_full_late_member_never_adds_prefix(){
+  let mut q=ProcessEvents::<2>::new();
+  assert_eq!(q.enqueue_exit_batch_once(&[(1,1),(0,2)]),Err(EventError::InvalidPid));
+  assert_eq!(q.len(),0);
+  q.enqueue_exit_once(4,4).unwrap();
+  let original=q.peek_receipt().unwrap();
+  assert_eq!(q.enqueue_exit_batch_once(&[(1,1),(2,2)]),Err(EventError::Full));
+  assert_eq!(q.peek_receipt(),Some(original));
+  assert_eq!(q.len(),1);
+ }
+ #[test]fn sequence_exhaustion_and_zero_capacity_are_safe(){
+  let mut q=ProcessEvents::<3>::new();
+  q.enqueue_exit_once(3,3).unwrap();
+  let original=q.peek_receipt().unwrap();
+  q.next_sequence=u64::MAX-1;
+  assert_eq!(q.enqueue_exit_batch_once(&[(4,4),(5,5)]),Err(EventError::Full));
+  assert_eq!(q.peek_receipt(),Some(original));
+  assert_eq!(q.len(),1);
+  let mut zero=ProcessEvents::<0>::new();
+  assert_eq!(zero.enqueue_exit_batch_once(&[]),Ok(0));
+  assert_eq!(zero.enqueue_exit_batch_once(&[(1,1)]),Err(EventError::Full));
+ }
+ #[test]fn distinct_generations_keep_independent_receipts(){
+  let mut q=ProcessEvents::<4>::new();
+  assert_eq!(q.enqueue_exit_batch_once(&[(2,8),(2,9),(3,1)]),Ok(3));
+  let old=q.peek_receipt().unwrap();
+  assert_eq!(q.acknowledge_receipt(old),Some(e(2,8)));
+  let fresh=q.peek_receipt().unwrap();
+  assert_ne!(old.sequence,fresh.sequence);
+  assert_eq!(q.acknowledge_receipt(old),None);
+  assert_eq!(q.acknowledge_receipt(fresh),Some(e(2,9)));
+  assert_eq!(q.dequeue(),Ok(e(3,1)));
+ }
+}
