@@ -1659,6 +1659,18 @@ fn revoke_task_authority_with_kind(
    // be unusable immediately after five-table scheduler retirement, even
    // if another process later reuses the original pathname.
    #[cfg(feature="test-r031-files-gui")]
+   if had_live_directory_lease {
+     // Genuine live PID2 owns this service now. Reject future/unissued
+     // opaque handle guesses with *current* authority, before the later
+     // retired-owner denial corpus and before any five-table teardown.
+     if !unsafe{(&mut *ptr::addr_of_mut!(R031_HANDLES))}
+         .r128_audit_active_forged_handles(owner){
+       log(b"IndianOS: FATAL R128 active PID2 forged handle admission\n\0");
+       r120_halt();
+     }
+     log(b"IndianOS: R128 QEMU active PID2 forged file tokens denied before ATA probe\n\0");
+   }
+   #[cfg(feature="test-r031-files-gui")]
    let old_pid2_mount=if had_live_directory_lease {
      let fs=unsafe{&*ptr::addr_of!(R031_HANDLES)};
      match (

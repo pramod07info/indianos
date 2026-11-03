@@ -117,6 +117,58 @@ impl FileHandles{
     pub fn security_statistics(&self)->Statistics{
         self.write_guard.statistics()
     }
+
+    /// R128 guest audit: unlike retired-owner token tests, this exercises an
+    /// ACTIVE kernel-authenticated PID2 through the same file syscall service
+    /// while real live handles can exist. The candidate values start at the
+    /// next never-issued token, so not even a valid handle's cursor is used.
+    /// All 100 malformed calls must reject before ATA probing or mutation.
+    ///
+    /// SAFETY CONTRACT: only called while the kernel BSP's R120 filesystem
+    /// permit excludes scheduler retirement and other file-service writers.
+    #[cfg(feature="test-r031-files-gui")]
+    pub(crate) fn r128_audit_active_forged_handles(
+        &mut self,owner:Identity
+    )->bool{
+        if owner.pid!=2||!self.owns(owner)||self.selected_quarantined{
+            return false;
+        }
+        let prior=self.staged_copy_kernel();
+        let prior_statistics=self.security_statistics();
+        let prior_namespace=self.last_syscall_namespace;
+        let mut buffer=[0xa5u8;72];
+        for delta in 0..20u64 {
+            let Some(token)=self.next.checked_add(delta)else{return false;};
+            if token==0 || self.entries.iter().any(|h|h.token==token){
+                return false;
+            }
+            for action in [2u64,3,4,5,6]{
+                if operation_authenticated(self,action,owner,token,0,
+                    "",&mut buffer)!=Err(FsError::InvalidName){
+                    return false;
+                }
+                if buffer!=[0xa5u8;72] {return false;}
+            }
+        }
+        self.entries.iter().zip(prior.entries.iter()).all(|(a,b)|
+            a.token==b.token && a.pid==b.pid &&
+            a.generation==b.generation && a.mode==b.mode &&
+            a.offset==b.offset &&
+            a.filesystem_generation==b.filesystem_generation &&
+            a.path==b.path && a.len==b.len) &&
+        self.next==prior.next &&
+        self.owners==prior.owners &&
+        self.roots.iter().zip(prior.roots.iter()).all(|(a,b)|
+            a.epoch==b.epoch&&a.len==b.len&&a.path==b.path) &&
+        self.root_revisions==prior.root_revisions &&
+        self.last_syscall_namespace==prior_namespace &&
+        self.volume_revision==prior.volume_revision &&
+        self.selected_volume==prior.selected_volume &&
+        self.selected_quarantined==prior.selected_quarantined &&
+        self.security_statistics()==prior_statistics &&
+        self.owns(owner)
+    }
+
     /// Kernel-only tightening of the single mounted file service's write
     /// budget. A signed-in PID1 incarnation can REDUCE limits, never reset,
     /// widen or transfer consumed credits by closing descriptors or reusing
