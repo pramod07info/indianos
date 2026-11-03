@@ -486,10 +486,12 @@ pub extern "C" fn kmain()->!{
         struct QemuBootPolicy {
             floor:r114_boot_epoch::SealedBootFloor,
             slot:Slot,
+            selected:usize,
+            measurement:[u8;32],
         }
         impl TrustedBootMeasurement for QemuBootPolicy {
             fn read_verified(&self)->Result<[u8;32],r114_boot_epoch::Error>{
-                Ok([0x42;32])
+                Ok(self.measurement)
             }
         }
         impl r114_boot_epoch::AuthenticatedPid1Platform for QemuBootPolicy {
@@ -499,7 +501,7 @@ pub extern "C" fn kmain()->!{
             }
             fn read_bootloader_selected_slot(&self)
                 ->Result<(usize,Slot),r114_boot_epoch::Error>{
-                Ok((0,self.slot))
+                Ok((self.selected,self.slot))
             }
         }
         let mut disk=unsafe{crate::ata_pio::AtaPio::probe()}.unwrap_or_else(|_|{
@@ -543,24 +545,47 @@ pub extern "C" fn kmain()->!{
                     minimum_slot_version:9,
                     expected_measurement:[0x42;32],
                 })==Ok(r) &&
-            r114_boot_epoch::authorize_verified_pid1(
-                &mut region,&QemuBootPolicy{
+            {
+                let trusted_floor=r114_boot_epoch::SealedBootFloor{
+                    minimum_epoch:r.epoch,
+                    minimum_journal_generation:21,
+                    expected_slot:0,
+                    minimum_slot_version:9,
+                    expected_measurement:[0x42;32],
+                };
+                let trusted=QemuBootPolicy{
+                    floor:trusted_floor,slot,selected:0,
+                    measurement:[0x42;32],
+                };
+                let admitted=r114_boot_epoch::authorize_verified_pid1(
+                    &mut region,&trusted)
+                    .is_ok_and(|proof|
+                        proof.epoch()==r.epoch &&
+                        proof.journal_generation()==r.journal_generation &&
+                        proof.selected_slot()==0 &&
+                        proof.slot_version()==slot.version);
+                // Actually execute the negative authority controls INSIDE
+                // the OVMF guest, against its pre-provisioned ATA journal.
+                // They must not modify any disk bytes, as the external
+                // QEMU harness verifies after every cold boot.
+                let rollback=QemuBootPolicy{
                     floor:r114_boot_epoch::SealedBootFloor{
-                        minimum_epoch:r.epoch,
-                        minimum_journal_generation:21,
-                        expected_slot:0,
-                        minimum_slot_version:9,
-                        expected_measurement:[0x42;32],
-                    },
-                    slot,
-                }
-            ).is_ok_and(|proof|
-                proof.epoch()==r.epoch &&
-                proof.journal_generation()==r.journal_generation &&
-                proof.selected_slot()==0 &&
-                proof.slot_version()==slot.version)
+                        minimum_epoch:r.epoch+1,..trusted_floor
+                    },..trusted};
+                let forged_slot=QemuBootPolicy{selected:1,..trusted};
+                let forged_measurement=QemuBootPolicy{
+                    measurement:[0x7f;32],..trusted};
+                admitted &&
+                r114_boot_epoch::authorize_verified_pid1(
+                    &mut region,&rollback).is_err() &&
+                r114_boot_epoch::authorize_verified_pid1(
+                    &mut region,&forged_slot).is_err() &&
+                r114_boot_epoch::authorize_verified_pid1(
+                    &mut region,&forged_measurement).is_err()
+            }
         );
         need(verified,b"IndianOS: FATAL R118 QEMU PID1 boot authority denied\n\0");
+        log(b"IndianOS: R118 QEMU PID1 boot authority negative controls PASSED\n\0");
         log(b"IndianOS: R118 QEMU PID1 boot handoff contract PASSED\n\0");
         log(b"IndianOS: R114 QEMU boot epoch advanced and recovery receipt verified\n\0");
     }
