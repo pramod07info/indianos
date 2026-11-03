@@ -2387,6 +2387,52 @@ mod r106_checked_partition_authenticated_file_api_tests{
   assert!(handles.owns(owner));
  }
 
+ #[test]fn r122_selected_volume_mutation_fuzz_denies_stale_alias_before_disk(){
+  // R122-031 source-level negative mutation matrix using the ACTUAL
+  // selected-volume API, not a policy-only mock. Each round opens a real
+  // disk-backed file and invalidates the namespace through two distinct
+  // supported kernel paths. Neither old handle nor old mount alias may
+  // touch the selected block device after revocation.
+  let (mut disk,receipt)=disk();
+  let mut files=FileHandles::new();
+  let admin=files.bind_process(1).unwrap();
+  let mut guest=files.bind_process(2).unwrap();
+  let mut stale=[0u64;16];
+  for iteration in 0..128usize {
+    let token=operation_on_selected_volume(&mut files,1,guest,0,READ,
+        "/shared/note",&mut [],&mut disk,receipt).unwrap();
+    let guard=files.selected_operation_guard(guest).unwrap();
+    let alias=files.mount_alias_for_current_root_kernel(guest).unwrap();
+    stale[iteration%stale.len()]=token;
+    if iteration%2==0 {
+      // Narrows/reissues the root revision even with the same spelling;
+      // descriptor revocation must rely on the receipt, not the string.
+      files.narrow_root_kernel(guest,"/shared").unwrap();
+    }else{
+      // Recycle the exact PID, changing its trusted generation.
+      guest=files.bind_process(2).unwrap();
+    }
+    assert!(!files.selected_operation_guard_is_current(guard));
+    assert!(!files.mount_alias_allows(alias,guest,"/shared/note"));
+    let media_before=(disk.reads,disk.writes);
+    for &old in &stale{
+      if old==0{continue;}
+      let mut output=[0xa5u8;24];
+      for action in [2u64,3,4,5,6,26,27,28,30,31]{
+        assert_eq!(operation_on_selected_volume(
+            &mut files,action,guest,old,0,"",&mut output,&mut disk,receipt),
+            Err(FsError::InvalidName));
+        assert_eq!(output,[0xa5;24]);
+      }
+    }
+    assert_eq!(operation_on_selected_volume_alias(&mut files,alias,1,
+        guest,0,READ,"/shared/note",&mut [],&mut disk,receipt),
+        Err(FsError::InvalidName));
+    assert_eq!((disk.reads,disk.writes),media_before);
+    assert!(files.owns(admin)&&files.owns(guest));
+  }
+ }
+
  #[test]fn r118_selected_volume_stale_handle_fuzz_across_128_pid_recycles(){
   // The *real* selected-volume API must deny stale tokens before any ATA
   // read, including when a recycled PID happens to reuse the same path.
