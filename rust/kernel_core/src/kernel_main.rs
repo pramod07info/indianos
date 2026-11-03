@@ -154,6 +154,15 @@ pub extern "C" fn kmain()->!{
                 log(b"IndianOS: R125 MP topology unavailable; AP startup disabled\n\0"),
         }
     }
+    #[cfg(feature="test-r118-ap-ack")]
+    {
+        // R126: genuine AP enters Rust, confirms its own CPUID and parks.
+        // The BSP immediately halts BEFORE PMM, user programs or recovery.
+        need(crate::limine_requests::launch_one_parked_qemu_ap(),
+            b"IndianOS: FATAL R126 QEMU AP arrival/CPUID mismatch\n\0");
+        log(b"IndianOS: R126 QEMU secondary AP executed Rust and acknowledged BSP\n\0");
+        halt();
+    }
     // Issue #124 HD1: each x86-64 boot enumerates CPU and PCI-PCI bridge
     // topology before optional device drivers. No PCI command writes,
     // BAR mapping, device init or implicit quantum/cloud connection.

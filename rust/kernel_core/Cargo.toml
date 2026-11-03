@@ -36,6 +36,9 @@ limine-requests = ["boot"]
 test-ata-disk = []
 test-r027-durable = []
 test-r028-network = []
+# Isolated two-vCPU Limine AP entry/CPUID acknowledgement; stops before PMM.
+# NOT a real SMP scheduler, IPI/TLB shootdown, hardware NIC or production boot.
+test-r118-ap-ack = ["kernel-main", "limine-requests"]
 # Isolated, deliberately provisioned 64-sector QEMU boot-epoch evidence;
 # never enabled in normal boot and not a trusted firmware root.
 test-r114-epoch = ["kernel-main"]

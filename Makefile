@@ -22,6 +22,8 @@ R015_ATA_TEST ?= 0
 R027_DURABLE_TEST ?= 0
 # Explicit single-core QEMU virtio-net network smoke; disabled ordinarily.
 R028_NETWORK_TEST ?= 0
+# Only isolated QEMU two-vCPU AP entry, stops before PMM or userspace.
+R118_AP_ACK_TEST ?= 0
 # Only QEMU fixture; refuses all disks except exact disposable 64-sector image.
 R114_EPOCH_TEST ?= 0
 # Real QEMU Orbit UI only; zero changes to default boot.
@@ -194,6 +196,7 @@ RUST_SOURCE := $(wildcard rust/kernel_core/src/*.rs)
 RUST_LIB := $(BUILD)/libindianos_kernel_core.a
 RUST_FEATURES := $(if $(filter 1,$(PREEMPT_SELFTEST)),--features preempt,) $(if $(filter 1,$(RUST_VMM)),--features vmm,) $(if $(filter 1,$(RUST_PMM)),--features pmm,) $(if $(filter 1,$(RUST_USER_IMAGE)),--features user-image,) $(if $(filter 1,$(RUST_PAGING)),--features paging,) $(if $(filter 1,$(RUST_PAGING_CPU)),--features paging-cpu,) $(if $(filter 1,$(RUST_USER_RUNTIME)),--features user-runtime,) $(if $(filter 1,$(RUST_CPU_ENTRY)),--features cpu-entry,) $(if $(filter 1,$(RUST_RUNTIME)),--features runtime,) $(if $(filter 1,$(RUST_BOOT_STAGING)),--features boot-staging,) $(if $(filter 1,$(RUST_BOOT)),--features boot,) $(if $(filter 1,$(RUST_BOOT_PROTOCOL)),--features limine-requests,) $(if $(filter 1,$(RUST_INTERRUPTS)),--features interrupts,) $(if $(filter 1,$(RUST_TIMER)),--features timer,) $(if $(filter 1,$(RUST_MAIN)),--features kernel-main,)
 ifeq ($(RUST_MAIN),1)
+RUST_FEATURES += $(if $(filter 1,$(R118_AP_ACK_TEST)),--features test-r118-ap-ack,)
 RUST_FEATURES += $(if $(filter 1,$(EXCEPTION_SELFTEST)),--features test-ud2,) \
  $(if $(filter 1,$(PAGEFAULT_SELFTEST)),--features test-pagefault,) \
  $(if $(filter 1,$(PAGING_SWITCH_SELFTEST)),--features test-shadow,) \
@@ -1193,3 +1196,10 @@ test-normal-init-qemu:
 test-r114-epoch-qemu:
 	$(MAKE) image BUILD=build/r114-epoch RUST_CORE=1 R114_EPOCH_TEST=1
 	python3 tools/test_r114_epoch_qemu.py --iso build/r114-epoch/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)"
+
+.PHONY: test-r118-ap-qemu
+
+# Disposable read-only UEFI QEMU; no host disk and no production AP activation.
+test-r118-ap-qemu:
+	$(MAKE) image BUILD=build/r118-ap-qemu RUST_CORE=1 R118_AP_ACK_TEST=1
+	python3 tools/test_r118_ap_qemu.py --iso build/r118-ap-qemu/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)"

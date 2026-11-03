@@ -19,6 +19,7 @@ REQUIRED = (
     "verify-sha",
     "exact-head-evidence-unit-tests",
     "network",
+    "r118-two-cpu-ap-qemu",
     "qemu-epoch",
     "runtime-qemu",
     "combined-regression",

@@ -1,0 +1,48 @@
+name: R126 actual two-vCPU AP entry and acknowledgement
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+    paths:
+      - 'rust/kernel_core/src/limine_requests.rs'
+      - 'rust/kernel_core/src/kernel_main.rs'
+      - 'rust/kernel_core/Cargo.toml'
+      - 'Makefile'
+      - 'tools/test_r118_ap_qemu.py'
+      - '.github/workflows/verify-r118-ap-ack.yml'
+permissions:
+  contents: read
+jobs:
+  r118-two-cpu-ap-qemu:
+    name: r118-two-cpu-ap-qemu
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify exact source SHA
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: python3 tools/verify_ci_sha.py --expected "$EXPECTED_SHA" --observed "$(git rev-parse HEAD)"
+      - name: Install isolated QEMU and kernel toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld binutils xorriso qemu-system-x86 ovmf curl
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
+      - name: R125 validate Limine MP layout and fail-closed inventory
+        run: cargo test --offline --manifest-path rust/kernel_core/Cargo.toml --features limine-requests r125_
+      - name: R126 freestanding AP-ack profile and real two-vCPU QEMU execution
+        shell: bash
+        run: |
+          set -euo pipefail
+          OVMF_PATH=""
+          for f in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/edk2/ovmf/OVMF_CODE_4M.fd /usr/share/edk2/ovmf/OVMF_CODE.fd; do
+            if test -f "$f"; then OVMF_PATH="$f"; break; fi
+          done
+          test -n "$OVMF_PATH"
+          make test-r118-ap-qemu OVMF_CODE="$OVMF_PATH"

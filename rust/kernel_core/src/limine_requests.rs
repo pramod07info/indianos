@@ -247,3 +247,69 @@ mod r125_mp_inventory_tests {
         assert_eq!(unsafe{validate_mp_response(&response(&table,2,0))},None);
     }
 }
+
+/// R126 QEMU-only experimental AP execution. Limine supplies the temporary
+/// AP stack/mappings. The BSP halts before bootloader memory reclamation, so
+/// no kernel task, interrupt, filesystem, timer or DMA work runs concurrently.
+/// Never call this from the normal production boot path.
+#[cfg(feature="test-r118-ap-ack")]
+static R126_AP_ACK:core::sync::atomic::AtomicU32=
+    core::sync::atomic::AtomicU32::new(0);
+#[cfg(feature="test-r118-ap-ack")]
+static R126_AP_CPUID:core::sync::atomic::AtomicU32=
+    core::sync::atomic::AtomicU32::new(u32::MAX);
+
+#[cfg(feature="test-r118-ap-ack")]
+extern "C" fn r126_secondary_cpu_entry(info:*mut MpInfo)->!{
+    use core::sync::atomic::Ordering;
+    unsafe{core::arch::asm!("cli",options(nomem,nostack));}
+    // This entry point is AP-only, authenticated by Limine. The AP reads
+    // its own real CPUID, not just the BSP-provided protocol record.
+    if !info.is_null(){
+        let expected=unsafe{ptr::read_volatile(ptr::addr_of!((*info).lapic_id))};
+        let actual=(unsafe{core::arch::x86_64::__cpuid(1)}.ebx>>24)&255;
+        if expected==actual && actual!=0 {
+            R126_AP_CPUID.store(actual,Ordering::Release);
+            R126_AP_ACK.store(1,Ordering::Release);
+        }
+    }
+    // No IDT/TSS, scheduler, PMM, IPC or IPI is installed on this AP.
+    // It must not outlive the isolated QEMU test profile.
+    loop{unsafe{core::arch::asm!("cli; hlt",options(nostack,nomem));}}
+}
+
+#[cfg(feature="test-r118-ap-ack")]
+pub(crate) fn launch_one_parked_qemu_ap()->bool{
+    use core::sync::atomic::{fence,Ordering};
+    let Some(topology)=observed_mp_inventory() else{return false;};
+    if topology.cpus!=2 || topology.bsp_lapic_id!=0 {return false;}
+    let response=unsafe{ptr::read_volatile(ptr::addr_of!(MP.response))};
+    if response.is_null(){return false;}
+    let raw=unsafe{&*response};
+    let mut secondary=ptr::null_mut();
+    for index in 0..2{
+        let info=unsafe{ptr::read_volatile(raw.cpus.add(index))};
+        if info.is_null(){return false;}
+        let apic=unsafe{ptr::read_volatile(ptr::addr_of!((*info).lapic_id))};
+        if apic!=topology.bsp_lapic_id {
+            secondary=info as *mut MpInfo;
+        }
+    }
+    if secondary.is_null(){return false;}
+    R126_AP_ACK.store(0,Ordering::Release);
+    R126_AP_CPUID.store(u32::MAX,Ordering::Release);
+    fence(Ordering::Release);
+    // The canonical Limine protocol wakes the AP only AFTER the BSP
+    // publishes goto_address. No normal boot, userland or IRQ is enabled.
+    unsafe{ptr::write_volatile(
+        ptr::addr_of_mut!((*secondary).goto_address),
+        r126_secondary_cpu_entry as *const c_void
+    );}
+    for _ in 0..50_000_000u32{
+        if R126_AP_ACK.load(Ordering::Acquire)==1 {
+            return R126_AP_CPUID.load(Ordering::Acquire)==1;
+        }
+        core::hint::spin_loop();
+    }
+    false
+}

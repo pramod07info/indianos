@@ -85,6 +85,14 @@ class ReleaseGateTests(unittest.TestCase):
         self.assertEqual(exit_code, 1)
         self.assertFalse(result["independent_approved"])
 
+    def test_real_ap_entry_qemu_evidence_must_be_on_exact_head(self):
+        self.assertIn("r118-two-cpu-ap-qemu",gate.REQUIRED)
+        checks=[name for name in gate.REQUIRED if name!="r118-two-cpu-ap-qemu"]
+        code,report=self.invoke(evidence(checks=checks))
+        self.assertEqual(code,1)
+        self.assertEqual(report["required_checks"]["r118-two-cpu-ap-qemu"],
+                         "not-success")
+
     def test_m2_and_orbit_real_guest_jobs_are_mandatory(self):
         self.assertIn("m2-native-and-guest",gate.REQUIRED)
         self.assertIn("orbit-ui-preview",gate.REQUIRED)
