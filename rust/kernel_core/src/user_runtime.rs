@@ -1329,6 +1329,11 @@ fn saved_valid(t:&Task)->bool{
  map.permissions.user&&map.permissions.executable&&!map.permissions.writable
 }
 fn revoke_task_authority(task:&mut Task){
+ revoke_task_authority_with_kind(task,crate::process_events::EventKind::Exited);
+}
+fn revoke_task_authority_with_kind(
+ task:&mut Task,kind:crate::process_events::EventKind
+){
  // This runs before any fallible release, including scheduler-abort rollback.
  // Clear the continuation even when no PCB was bound during preparation.
  task.saved=false;task.frame=[0;WORDS];task.image.ready=false;
@@ -1364,8 +1369,12 @@ fn revoke_task_authority(task:&mut Task){
    if unsafe{(&*ptr::addr_of!(R031_HANDLES)).owns(owner)} {
     // Deduplicate repeated exit/rollback notices for this exact incarnation;
     // PID reuse must never remove or confuse the next owner's events.
-    let _=unsafe{&mut *ptr::addr_of_mut!(R114_FILE_EVENTS)}
-        .enqueue_exit_once(owner.pid,owner.generation);
+    let queue=unsafe{&mut *ptr::addr_of_mut!(R114_FILE_EVENTS)};
+    let _=if kind==crate::process_events::EventKind::Faulted {
+        queue.enqueue_fault_once(owner.pid,owner.generation)
+    }else{
+        queue.enqueue_exit_once(owner.pid,owner.generation)
+    };
    }
    #[cfg(feature="test-r031-files-gui")]
    {
@@ -1655,7 +1664,11 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
    // file and delegated capability authority BEFORE potentially fallible
    // user page-table / frame reclamation below. The rollback path still
    // calls the same idempotent retirement when process termination fails.
-   revoke_task_authority(task);
+   revoke_task_authority_with_kind(task,if v==0{
+     crate::process_events::EventKind::Exited
+   }else{
+     crate::process_events::EventKind::Faulted
+   });
    #[cfg(feature="test-r030-ondevice")]
    fault_hex(b"IndianOS: R030 scheduler exit status=0x\0",status);
    #[cfg(feature="test-r031-boot-desktop")]
@@ -1877,6 +1890,23 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
    assert!((&*ptr::addr_of!(R116_SHARED_LEASES))
           .permits_shared_directory(newest));
    assert_eq!((&*ptr::addr_of!(R114_FILE_EVENTS)).len(),1);
+   // R120: this is the actual ring3 task-authenticating fault branch.
+   // Rebind an exact new generation and verify it is reported as Faulted
+   // rather than an ordinary Exited notice, without removing old receipts.
+   second.file_generation=newest.generation;
+   second.authority_live=true;
+   revoke_task_authority_with_kind(second,
+      crate::process_events::EventKind::Faulted);
+   let queue=&mut *ptr::addr_of_mut!(R114_FILE_EVENTS);
+   assert_eq!(queue.len(),2);
+   let old_receipt=queue.peek_receipt().unwrap();
+   assert_eq!(old_receipt.event.kind,crate::process_events::EventKind::Exited);
+   assert_eq!(queue.acknowledge_receipt(old_receipt),Some(old_receipt.event));
+   let fault_receipt=queue.peek_receipt().unwrap();
+   assert_eq!(fault_receipt.event.kind,crate::process_events::EventKind::Faulted);
+   assert_eq!(fault_receipt.event.value,newest.generation);
+   assert_eq!(queue.acknowledge_receipt(old_receipt),None);
+   assert!(!(&*ptr::addr_of!(R031_HANDLES)).owns(newest));
   }
  }
 

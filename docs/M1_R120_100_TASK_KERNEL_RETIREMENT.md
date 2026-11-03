@@ -37,7 +37,7 @@ The added Rust `no_std` coordinator stages and atomically commits capabilities, 
 - [x] R120-022 — Reject duplicate PID in a retirement batch
 - [x] R120-023 — Prevent stale process from binding after restart
 - [x] R120-024 — Safely handle zero-capacity UDP registry
-- [ ] R120-025 — Wire retired grants to actual network socket table
+- [x] R120-025 — Wire retired grants to actual network socket table
 - [ ] R120-026 — Enforce interrupt ingress generation ownership
 - [ ] R120-027 — Test two ring3 process isolation in QEMU
 - [ ] R120-028 — Qualify physical multi-NIC IRQ/IOMMU safety
@@ -56,7 +56,7 @@ The added Rust `no_std` coordinator stages and atomically commits capabilities, 
 - [x] R120-038 — Prevent stale acknowledgement replay
 - [x] R120-039 — Preserve event FIFO across batch failure
 - [x] R120-040 — Reject full queue without publishing retirement
-- [ ] R120-041 — Wire actual scheduler fault production path
+- [x] R120-041 — Wire actual scheduler fault production path
 - [ ] R120-042 — Qualify cross-core lifecycle IPI ordering
 
 ### Workstream 4 — Cross-table transaction
@@ -172,10 +172,16 @@ The added Rust `no_std` coordinator stages and atomically commits capabilities, 
 
 ## Acceptance and explicit limitations
 
-- New source-scoped R120 checks: **57/70**, remaining **13/70**. These are granular API or regression acceptance items, not 57 separately deployable OS features.
+- New source-scoped R120 checks: **59/70**, remaining **11/70**. These are granular API or regression acceptance items, not 57 separately deployable OS features.
 - Inherited R118 hardware/CI/review gates: **0/51 validated here**; merged PR #754 also retained 15 R119 acceptance tasks that require live integration or evidence.
 - Added Rust tests: six coordinator tests and two fault-receipt tests; they must pass CI on the exact PR head.
 - Required release matrix: host Rust suite, optimized freestanding `no_std`, two-boot persistent graphical Files QEMU, ring3 two-process UDP QEMU, boot ELF/ISO, and independent kernel/security review. Verify checks against the exact final SHA and merge only when project policy allows.
 - Physical SMP, cross-core IPI, hardware IRQ ownership, DMA/IOMMU isolation, immutable firmware measurement root, actual unexpected power loss and disk repair remain unverified; QEMU passes cannot substitute for hardware.
 - Do not interpret this ledger as 70 completed tasks in one commit or 100 finished OS features. The source-correctness flags are intentionally narrower.
 
+
+## R120 pending-task continuation — actual code (same PR)
+
+- **R120-025 source-implemented:** Real `network::EpochUdpEndpoints` now exposes an exact kernel registry consistency check; `ProcessRetirement` offers `bind_live_udp`, `retire_live_exited_batch` and `retire_live_faulted_batch` with copy/stage/commit atomicity across the real datagram queue, policy registry, capability epoch, and event FIFO. It checks exact PID-generation identity, prevents stale/foreign owner teardown, preserves peer messages, and denies divergent tables without mutations. Four added host regressions cover peer preservation, late stale members, full queue rollback, registry mismatch, and fault receipts. This new API is **not yet called from the production ring3 scheduler**; R120-056 remains open.
+- **R120-041 source-implemented:** The existing ring3 scheduler normal-exit and fault branch now selects precise `Exited` or `Faulted` event production. Rollback/retry paths still default to `Exited`; only authenticated completed faults produce `Faulted`. Existing real scheduler authority-retirement host test now checks fault receipt generation and replay safety. This does **not** qualify cross-core IPI delivery (R120-042).
+- Exact-head host unit tests, optimized `no_std`, QEMU, and independent review must rerun on the *new* head before merge. All R118/R119 physical and pending acceptance gates remain retained.

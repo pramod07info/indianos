@@ -10,6 +10,7 @@
 use crate::capability::{EpochError, EpochRegistry, EpochTicket};
 use crate::process_events::{EventError, EventKind, EventReceipt, ProcessEvent, ProcessEvents};
 use crate::udp_owner_epoch::{Error as UdpError, Registry as UdpRegistry};
+use crate::network::{EpochUdpEndpoints, SocketError};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Owner { pub pid: u32, pub generation: u64 }
@@ -18,6 +19,7 @@ pub struct Owner { pub pid: u32, pub generation: u64 }
 pub enum RetirementError {
     Capabilities(EpochError),
     Udp(UdpError),
+    Sockets(SocketError),
     Events(EventError),
 }
 
@@ -28,6 +30,7 @@ pub struct RetirementReceipt {
     pub notices_enqueued: usize,
 }
 
+#[derive(Clone)]
 pub struct ProcessRetirement<const C: usize, const U: usize, const E: usize> {
     capabilities: EpochRegistry<C>,
     udp: UdpRegistry<U>,
@@ -102,6 +105,68 @@ impl<const C: usize, const U: usize, const E: usize> ProcessRetirement<C, U, E> 
         -> Option<ProcessEvent>
     {
         self.events.acknowledge_receipt(receipt)
+    }
+
+    /// R120: bind the actual kernel packet-queue/socket table and generation
+    /// registry as a single atomic update. This is not merely the policy
+    /// registry: real endpoint state and queued datagrams are included.
+    pub fn bind_live_udp<const P:usize,const Q:usize>(
+        &mut self,sockets:&mut EpochUdpEndpoints<P,Q>,owner:Owner,port:u16
+    )->Result<(),RetirementError>{
+        if !sockets.matches_registry(&self.udp){
+            return Err(RetirementError::Sockets(SocketError::Denied));
+        }
+        let mut staged=self.clone();
+        let mut staged_sockets=sockets.clone();
+        staged.bind_udp(owner,port)?;
+        staged_sockets.bind(owner.pid,owner.generation,port)
+            .map_err(RetirementError::Sockets)?;
+        if !staged_sockets.matches_registry(&staged.udp){
+            return Err(RetirementError::Sockets(SocketError::Denied));
+        }
+        *self=staged;
+        *sockets=staged_sockets;
+        Ok(())
+    }
+
+    pub fn retire_live_exited_batch<const P:usize,const Q:usize>(
+        &mut self,sockets:&mut EpochUdpEndpoints<P,Q>,owners:&[Owner]
+    )->Result<RetirementReceipt,RetirementError>{
+        self.retire_live_batch(sockets,owners,EventKind::Exited)
+    }
+
+    pub fn retire_live_faulted_batch<const P:usize,const Q:usize>(
+        &mut self,sockets:&mut EpochUdpEndpoints<P,Q>,owners:&[Owner]
+    )->Result<RetirementReceipt,RetirementError>{
+        self.retire_live_batch(sockets,owners,EventKind::Faulted)
+    }
+
+    fn retire_live_batch<const P:usize,const Q:usize>(
+        &mut self,sockets:&mut EpochUdpEndpoints<P,Q>,owners:&[Owner],
+        kind:EventKind
+    )->Result<RetirementReceipt,RetirementError>{
+        if !sockets.matches_registry(&self.udp){
+            return Err(RetirementError::Sockets(SocketError::Denied));
+        }
+        // Stage *all four* structures. A failed later owner, orphan grant,
+        // stale port, or full event queue must preserve every live authority.
+        let mut staged=self.clone();
+        let mut staged_sockets=sockets.clone();
+        let receipt=staged.retire_batch(owners,kind)?;
+        for owner in owners{
+            // Registry entries were staged as revoked above. This exact
+            // generation check also purges the physical in-kernel UDP
+            // endpoint table and its queued datagrams, never peer messages.
+            staged_sockets.retire_exact_kernel(
+                &mut staged.udp,owner.pid,owner.generation
+            ).map_err(RetirementError::Sockets)?;
+        }
+        if !staged_sockets.matches_registry(&staged.udp){
+            return Err(RetirementError::Sockets(SocketError::Denied));
+        }
+        *self=staged;
+        *sockets=staged_sockets;
+        Ok(receipt)
     }
 
     pub fn retire_exited_batch(&mut self, owners: &[Owner])
@@ -281,5 +346,93 @@ mod r120_atomic_coordinator_tests {
         let mut empty = ProcessRetirement::<0, 0, 0>::new();
         assert_eq!(empty.retire_exited_batch(&[]), Ok(RetirementReceipt::default()));
         assert_eq!(empty.start(1), Err(RetirementError::Capabilities(EpochError::Full)));
+    }
+}
+
+/// R120: integration regressions through the real in-kernel UDP endpoint
+/// table (not the simulated policy registry alone). Host tests do not prove
+/// physical NIC IRQ and IOMMU ownership.
+#[cfg(test)]
+mod r120_live_socket_integration_tests {
+    use super::*;
+    #[test]
+    fn atomic_exit_clears_actual_socket_queue_but_preserves_peer_traffic() {
+        let mut k=ProcessRetirement::<3,3,4>::new();
+        let mut live=EpochUdpEndpoints::<3,5>::new();
+        let a=k.start(7).unwrap();
+        let peer=k.start(8).unwrap();
+        k.bind_live_udp(&mut live,a,5001).unwrap();
+        k.bind_live_udp(&mut live,peer,5002).unwrap();
+        let ticket=k.grant(a,11,1).unwrap();
+        assert_eq!(live.send_local(7,a.generation,5001,5002,b"peer"),Ok(()));
+        assert_eq!(live.send_local(8,peer.generation,5002,5001,b"stale"),Ok(()));
+        assert_eq!(k.retire_live_exited_batch(&mut live,&[a]),
+            Ok(RetirementReceipt{
+                capabilities_revoked:1,udp_ports_released:1,notices_enqueued:1
+            }));
+        assert!(k.authorize_ticket(a,ticket,11,1).is_err());
+        assert_eq!(k.active_udp_ports(),1);
+        assert_eq!(live.receive(a.pid,a.generation,5001,&mut [0u8;8]),
+            Err(SocketError::Denied));
+        let mut out=[0u8;8];
+        assert_eq!(live.receive(peer.pid,peer.generation,5002,&mut out),Ok(4));
+        assert_eq!(&out[..4],b"peer");
+        let replacement=k.start(a.pid).unwrap();
+        assert!(k.bind_live_udp(&mut live,a,6001).is_err());
+        k.bind_live_udp(&mut live,replacement,5001).unwrap();
+        assert_eq!(live.receive(7,replacement.generation,5001,&mut out),
+            Err(SocketError::Empty));
+        assert_eq!(k.queued_notices(),1);
+    }
+
+    #[test]
+    fn second_stale_owner_or_event_full_cannot_retire_first_live_socket() {
+        let mut k=ProcessRetirement::<3,3,1>::new();
+        let mut live=EpochUdpEndpoints::<3,4>::new();
+        let a=k.start(1).unwrap();let b=k.start(2).unwrap();
+        k.bind_live_udp(&mut live,a,5501).unwrap();
+        k.bind_live_udp(&mut live,b,5502).unwrap();
+        let stale=Owner{pid:b.pid,generation:b.generation+1};
+        assert_eq!(k.retire_live_exited_batch(&mut live,&[a,stale]),
+            Err(RetirementError::Capabilities(EpochError::NotActive)));
+        assert_eq!(k.authorize_udp(a,5501),Ok(()));
+        assert!(live.matches_registry(&k.udp));
+        k.events.enqueue_exit_once(99,1).unwrap();
+        assert_eq!(k.retire_live_exited_batch(&mut live,&[a]),
+            Err(RetirementError::Events(EventError::Full)));
+        assert_eq!(k.authorize_udp(a,5501),Ok(()));
+        assert_eq!(live.send_local(a.pid,a.generation,5501,5502,b"alive"),Ok(()));
+    }
+
+    #[test]
+    fn direct_socket_divergence_is_denied_before_any_policy_mutation() {
+        let mut k=ProcessRetirement::<3,3,3>::new();
+        let mut live=EpochUdpEndpoints::<3,3>::new();
+        let a=k.start(1).unwrap();
+        k.bind_live_udp(&mut live,a,7001).unwrap();
+        // Simulate a mutation bypassing the paired authorized APIs.
+        live.bind(a.pid,a.generation,7002).unwrap();
+        assert!(!live.matches_registry(&k.udp));
+        assert_eq!(k.retire_live_faulted_batch(&mut live,&[a]),
+            Err(RetirementError::Sockets(SocketError::Denied)));
+        assert_eq!(k.authorize_udp(a,7001),Ok(()));
+        assert_eq!(k.active_generation(a.pid),Some(a.generation));
+    }
+    #[test]
+    fn live_fault_retirement_releases_ports_and_reports_fault_generation() {
+        let mut k=ProcessRetirement::<2,2,2>::new();
+        let mut live=EpochUdpEndpoints::<2,4>::new();
+        let a=k.start(1).unwrap();
+        k.bind_live_udp(&mut live,a,7001).unwrap();
+        assert_eq!(k.retire_live_faulted_batch(&mut live,&[a]),
+            Ok(RetirementReceipt{
+                capabilities_revoked:0,udp_ports_released:1,notices_enqueued:1
+            }));
+        let event=k.peek_notice().unwrap();
+        assert_eq!(event.event.kind,EventKind::Faulted);
+        assert_eq!(event.event.value,a.generation);
+        assert_eq!(k.acknowledge_notice(event),Some(event.event));
+        assert!(k.authorize_udp(a,7001).is_err());
+        assert!(live.matches_registry(&k.udp));
     }
 }

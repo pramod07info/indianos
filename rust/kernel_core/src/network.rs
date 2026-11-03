@@ -517,6 +517,7 @@ struct QueuedUdp {
     destination_pid: u32, destination_port: u16, len: usize,
     bytes: [u8; R033_UDP_BYTES],
 }
+#[derive(Clone)]
 pub struct UdpEndpoints<const PORTS: usize, const QUEUE: usize> {
     ports: [Option<PortOwner>; PORTS],
     queue: [Option<QueuedUdp>; QUEUE],
@@ -893,6 +894,7 @@ mod r034_ingress_tests {
 /// Batch 1: generation-bound process endpoint adapter around the actual R034
 /// validated-ingress queue. Scheduler supplies trusted (PID,generation).
 /// A recycled PID must retire its old bindings before registering new ones.
+#[derive(Clone)]
 pub struct EpochUdpEndpoints<const PORTS: usize, const QUEUE: usize> {
     endpoints: UdpEndpoints<PORTS, QUEUE>,
     owners: [Option<(u32,u64)>; PORTS],
@@ -900,6 +902,27 @@ pub struct EpochUdpEndpoints<const PORTS: usize, const QUEUE: usize> {
 impl<const PORTS: usize, const QUEUE: usize> EpochUdpEndpoints<PORTS, QUEUE> {
     pub const fn new() -> Self {
         Self { endpoints: UdpEndpoints::new(), owners: [None; PORTS] }
+    }
+
+    /// R120: prove that the actual socket/packet queue ownership has exactly
+    /// the same live port grants as the kernel generation registry. This is
+    /// required before a cross-table transaction may publish mutations.
+    /// The surrounding kernel caller must exclusively own both tables.
+    pub fn matches_registry<const N:usize>(
+        &self,registry:&crate::udp_owner_epoch::Registry<N>
+    )->bool{
+        let ports=self.endpoints.ports.iter().flatten().count();
+        if ports!=registry.active_count(){return false;}
+        self.endpoints.ports.iter().flatten().all(|binding|{
+            self.owners.iter().flatten().any(|&(pid,generation)|
+                pid==binding.pid &&
+                registry.owner_of(binding.port)==Some(
+                    crate::udp_owner_epoch::Grant{
+                        pid,generation,port:binding.port
+                    }
+                )
+            )
+        })
     }
     fn authenticated(&self, pid: u32, generation: u64) -> bool {
         pid != 0 && generation != 0 && self.owners.iter().flatten()
