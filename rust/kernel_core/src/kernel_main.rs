@@ -479,6 +479,29 @@ pub extern "C" fn kmain()->!{
                 Ok([0x42;32]) // test-only trust fixture, never production
             }
         }
+        // QEMU-only adapter to exercise the *same* three-authority
+        // PID1 launch verifier against a real, persistent IDE partition.
+        // Limine has not authenticated these constants, so this is NOT
+        // a production TPM/UEFI root or signed physical boot slot.
+        struct QemuBootPolicy {
+            floor:r114_boot_epoch::SealedBootFloor,
+            slot:Slot,
+        }
+        impl TrustedBootMeasurement for QemuBootPolicy {
+            fn read_verified(&self)->Result<[u8;32],r114_boot_epoch::Error>{
+                Ok([0x42;32])
+            }
+        }
+        impl r114_boot_epoch::AuthenticatedPid1Platform for QemuBootPolicy {
+            fn read_sealed_floor(&self)
+                ->Result<r114_boot_epoch::SealedBootFloor,r114_boot_epoch::Error>{
+                Ok(self.floor)
+            }
+            fn read_bootloader_selected_slot(&self)
+                ->Result<(usize,Slot),r114_boot_epoch::Error>{
+                Ok((0,self.slot))
+            }
+        }
         let mut disk=unsafe{crate::ata_pio::AtaPio::probe()}.unwrap_or_else(|_|{
             log(b"IndianOS: FATAL R114 QEMU epoch disk not found\n\0");halt()
         });
@@ -519,8 +542,26 @@ pub extern "C" fn kmain()->!{
                     expected_slot:0,
                     minimum_slot_version:9,
                     expected_measurement:[0x42;32],
-                })==Ok(r));
-        need(verified,b"IndianOS: FATAL R114 QEMU boot epoch persistence\n\0");
+                })==Ok(r) &&
+            r114_boot_epoch::authorize_verified_pid1(
+                &mut region,&QemuBootPolicy{
+                    floor:r114_boot_epoch::SealedBootFloor{
+                        minimum_epoch:r.epoch,
+                        minimum_journal_generation:21,
+                        expected_slot:0,
+                        minimum_slot_version:9,
+                        expected_measurement:[0x42;32],
+                    },
+                    slot,
+                }
+            ).is_ok_and(|proof|
+                proof.epoch()==r.epoch &&
+                proof.journal_generation()==r.journal_generation &&
+                proof.selected_slot()==0 &&
+                proof.slot_version()==slot.version)
+        );
+        need(verified,b"IndianOS: FATAL R118 QEMU PID1 boot authority denied\n\0");
+        log(b"IndianOS: R118 QEMU PID1 boot handoff contract PASSED\n\0");
         log(b"IndianOS: R114 QEMU boot epoch advanced and recovery receipt verified\n\0");
     }
     #[cfg(feature="test-r028-network")]
