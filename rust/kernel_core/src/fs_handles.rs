@@ -3168,10 +3168,15 @@ impl FileHandles {
                 return Err(FsError::InvalidName);
             }
         }
-        for owner in owners{
-            // Preflight established all exact incarnations while this
-            // single-BSP kernel supervisor holds exclusive table ownership.
-            if !self.retire_process(*owner){return Err(FsError::InvalidName);}
+        // Canonical PID order is independent of caller batching order.
+        // Today this runs under the single-BSP exclusive supervisor; keep the
+        // policy order explicit before adding per-table SMP/IRQ locks.
+        for pid in 1..=2u32 {
+            if let Some(owner)=owners.iter().find(|owner|owner.pid==pid) {
+                if !self.retire_process(*owner) {
+                    return Err(FsError::InvalidName);
+                }
+            }
         }
         Ok(owners.len())
     }
@@ -3311,4 +3316,64 @@ mod r119_inherited_mount_authority_regressions{
   assert!(!t.selected_operation_guard_is_current(guard));
   assert_eq!(t.selected_operation_guard(p),Err(FsError::InvalidVolume));
  }
+}
+
+
+#[cfg(test)]
+mod r120_inherited_r118_file_retirement_regressions {
+    use super::*;
+
+    #[test]
+    fn reversed_batch_order_revokes_exact_owners_and_preserves_generation_fence() {
+        for reversed in [false, true] {
+            let mut files=FileHandles::new();
+            let admin=files.bind_process(1).unwrap();
+            let guest=files.bind_process(2).unwrap();
+            let old_alias=files.mount_alias_for_current_root_kernel(guest).unwrap();
+            let owners=if reversed {[guest,admin]} else {[admin,guest]};
+            assert_eq!(files.retire_process_batch_kernel(&owners),Ok(2));
+            assert!(!files.owns(admin));
+            assert!(!files.owns(guest));
+            assert!(!files.mount_alias_allows(old_alias,guest,"/shared/note"));
+            let replacement=files.bind_process(2).unwrap();
+            assert!(replacement.generation>guest.generation);
+            assert!(!files.mount_alias_allows(old_alias,replacement,"/shared/note"));
+        }
+    }
+
+    #[test]
+    fn repeated_stale_pid_reuse_never_partially_retires_a_peer() {
+        let mut files=FileHandles::new();
+        let admin=files.bind_process(1).unwrap();
+        let admin_alias=files.mount_alias_for_current_root_kernel(admin).unwrap();
+        let mut previous=files.bind_process(2).unwrap();
+        for _ in 0..64 {
+            let current=files.bind_process(2).unwrap();
+            let current_alias=files.mount_alias_for_current_root_kernel(current).unwrap();
+            assert_eq!(
+                files.retire_process_batch_kernel(&[admin,previous]),
+                Err(FsError::InvalidName)
+            );
+            assert!(files.owns(admin)&&files.owns(current));
+            assert!(files.mount_alias_allows(admin_alias,admin,"/shared/readme"));
+            assert!(files.mount_alias_allows(current_alias,current,"/shared/note"));
+            previous=current;
+        }
+    }
+
+    #[test]
+    fn stale_mount_namespace_receipt_cannot_authorize_batch_replacement() {
+        let mut files=FileHandles::new();
+        let admin=files.bind_process(1).unwrap();
+        let guest=files.bind_process(2).unwrap();
+        let previous=files.selected_operation_guard(guest).unwrap();
+        let previous_alias=files.mount_alias_for_current_root_kernel(guest).unwrap();
+        files.narrow_root_kernel(guest,"/shared/docs").unwrap();
+        assert!(!files.selected_operation_guard_is_current(previous));
+        assert!(!files.mount_alias_allows(previous_alias,guest,"/shared/docs/a"));
+        let fresh=files.selected_operation_guard(guest).unwrap();
+        assert!(files.selected_operation_guard_is_current(fresh));
+        assert_eq!(files.retire_process_batch_kernel(&[admin,guest]),Ok(2));
+        assert!(!files.selected_operation_guard_is_current(fresh));
+    }
 }
