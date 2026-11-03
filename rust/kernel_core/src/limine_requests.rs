@@ -385,7 +385,7 @@ fn r132_ap_listen_for_ipi()->bool{
     );}
     let idtr=R132Idtr{
         limit:(256*size_of::<R132Gate>()-1) as u16,
-        base:ptr::addr_of!(R132_AP_IDT.0) as usize as u64,
+        base:unsafe{ptr::addr_of!(R132_AP_IDT.0)} as usize as u64,
     };
     unsafe{asm!("lidt [{p}]",p=in(reg)&idtr,
                 options(readonly,nostack,preserves_flags));}
