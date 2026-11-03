@@ -1,13 +1,8 @@
 name: R114 actual QEMU boot epoch persistence
 on:
+  # R118 inherited exact-head boot-epoch proof on every integration PR.
   pull_request:
     branches: [main]
-    paths:
-      - "rust/kernel_core/src/r114_boot_epoch.rs"
-      - "rust/kernel_core/src/kernel_main.rs"
-      - "tools/test_r114_epoch_qemu.py"
-      - "Makefile"
-      - ".github/workflows/r114-epoch-qemu.yml"
   workflow_dispatch:
 permissions:
   contents: read

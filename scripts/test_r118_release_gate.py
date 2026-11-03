@@ -28,10 +28,14 @@ def evidence(checks=None, reviews=None, protection=None, actual_head=SHA):
     data = [
         {"head": {"sha": actual_head}, "state": "open", "merged": False,
          "user": {"login": "author"}, "base": {"ref": "main"}},
-        {"check_runs": [{"name": name, "status": "completed",
-                         "conclusion": "success"} for name in checks]},
+        {"total_count": len(checks), "check_runs": [
+            {"name": name, "head_sha": SHA, "status": "completed",
+             "conclusion": "success"} for name in checks]},
         reviews,
-        {"url": "https://api.github.com/branches/main/protection"}
+        {"url": "https://api.github.com/branches/main/protection",
+         "required_status_checks": {"strict": True,
+                                    "contexts": list(gate.REQUIRED)},
+         "required_pull_request_reviews": {"required_approving_review_count": 1}}
         if protection is None else protection,
     ]
     return iter(data)
@@ -82,6 +86,52 @@ class ReleaseGateTests(unittest.TestCase):
         exit_code, result = self.invoke(evidence(protection={}))
         self.assertEqual(exit_code, 1)
         self.assertEqual(result["branch_protection"], "not-confirmed")
+
+
+    def test_untrusted_check_from_a_different_sha_fails_closed(self):
+        records = list(evidence())
+        records[1]["check_runs"][0]["head_sha"] = "b" * 40
+        exit_code, result = self.invoke(iter(records))
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(result["required_checks"][gate.REQUIRED[0]], "not-success")
+
+    def test_incomplete_check_pagination_cannot_pass(self):
+        records = list(evidence())
+        records[1]["total_count"] += 1
+        exit_code, result = self.invoke(iter(records))
+        self.assertEqual(exit_code, 1)
+        self.assertFalse(result["check_results_complete"])
+        self.assertFalse(result["ready"])
+
+    def test_one_failed_duplicate_check_blocks_reuse_of_an_old_success(self):
+        records = list(evidence())
+        original = records[1]["check_runs"][0].copy()
+        original["conclusion"] = "failure"
+        records[1]["check_runs"].append(original)
+        records[1]["total_count"] += 1
+        exit_code, result = self.invoke(iter(records))
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(result["required_checks"][gate.REQUIRED[0]], "not-success")
+
+    def test_protection_without_required_checks_or_reviews_is_not_enough(self):
+        for protection in (
+            {"url": "https://api.github.com/protected"},
+            {"url": "https://api.github.com/protected",
+             "required_status_checks": {"contexts": list(gate.REQUIRED)}},
+            {"url": "https://api.github.com/protected",
+             "required_pull_request_reviews": {},
+             "required_status_checks": {"contexts": list(gate.REQUIRED[:-1])}},
+        ):
+            exit_code, result = self.invoke(evidence(protection=protection))
+            self.assertEqual(exit_code, 1)
+            self.assertEqual(result["branch_protection"], "not-confirmed")
+
+    def test_latest_reviewer_change_request_overrides_earlier_approval(self):
+        reviews = fixture_reviews() + fixture_reviews(
+            state="CHANGES_REQUESTED", reviewer="independent")
+        exit_code, result = self.invoke(evidence(reviews=reviews))
+        self.assertEqual(exit_code, 1)
+        self.assertFalse(result["independent_approved"])
 
 
 if __name__ == "__main__":

@@ -5,7 +5,7 @@ Examples:
   GH_TOKEN=... python3 scripts/r118_release_gate.py \
     --repo pramod07info/indianos --pr 752 --expected-head FULL_SHA
 
-This program does not merge code, approve PRs, or certify physical hardware.
+This program does not merge code, approve PRs, or certify physical hardware.\nIt cannot qualify SMP, IOMMU, firmware trust or unsafe power-cut restoration.
 It never reports OK if a required check has not concluded successfully.
 """
 import argparse
@@ -64,14 +64,23 @@ def main():
             report["reason"] = "PR head mismatch or PR is not open"
             print(json.dumps(report, indent=2))
             return 1
-        checks = get(prefix + "/commits/" + args.expected_head +
-                     "/check-runs?per_page=100")["check_runs"]
+        check_payload = get(prefix + "/commits/" + args.expected_head +
+                            "/check-runs?per_page=100")
+        checks = check_payload["check_runs"]
+        # Never silently ignore mandatory checks on a later API page.
+        report["check_results_complete"] = (
+            isinstance(check_payload.get("total_count", len(checks)), int)
+            and check_payload.get("total_count", len(checks)) == len(checks)
+        )
         for name in REQUIRED:
-            candidates = [check for check in checks if check["name"] == name]
+            candidates = [check for check in checks if check.get("name") == name]
             report["required_checks"][name] = (
-                "success" if candidates and all(
-                    c["status"] == "completed" and c["conclusion"] == "success"
-                    for c in candidates) else "not-success")
+                "success" if report["check_results_complete"] and candidates and all(
+                    check.get("head_sha") == args.expected_head
+                    and check.get("status") == "completed"
+                    and check.get("conclusion") == "success"
+                    for check in candidates
+                ) else "not-success")
         reviews = get(prefix + "/pulls/" + str(args.pr) + "/reviews?per_page=100")
         latest = {}
         author = pr["user"]["login"]
@@ -90,11 +99,23 @@ def main():
         report["review_states"] = latest
         try:
             protected = get(prefix + "/branches/" + pr["base"]["ref"] + "/protection")
+            # A branch's protection endpoint existing is insufficient: it
+            # must require BOTH status checks and independent PR review.
+            status = protected.get("required_status_checks") or {}
+            reviews_required = protected.get("required_pull_request_reviews")
+            contexts = set(status.get("contexts") or [])
+            contexts.update(item.get("context") for item in status.get("checks", [])
+                            if isinstance(item, dict))
+            report["protected_required_checks"] = sorted(contexts)
             report["branch_protection"] = (
-                "enabled" if protected.get("url") else "not-confirmed")
+                "enabled" if protected.get("url") and
+                reviews_required is not None and
+                set(REQUIRED).issubset(contexts)
+                else "not-confirmed")
         except urllib.error.HTTPError:
             report["branch_protection"] = "unverifiable"
         report["ready"] = (
+            report["check_results_complete"] and
             all(value == "success" for value in report["required_checks"].values())
             and report["independent_approved"]
             and report["branch_protection"] == "enabled")

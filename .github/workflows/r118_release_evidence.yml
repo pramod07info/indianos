@@ -1,11 +1,9 @@
 name: R118 release evidence unit tests
 
+# Mandatory on every PR, not only when the Python gate changes.
 on:
   pull_request:
-    paths:
-      - 'scripts/r118_release_gate.py'
-      - 'scripts/test_r118_release_gate.py'
-      - '.github/workflows/r118_release_evidence.yml'
+    branches: [main]
   workflow_dispatch:
 
 permissions:
