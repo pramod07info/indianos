@@ -1527,9 +1527,13 @@ fn cleanup_session(backend:&CloneBackend,reclaim:bool)->bool{
  #[cfg(feature="test-r025")]
  unsafe{R025_SERVICES=None;}
  #[cfg(feature="test-r031-files-gui")]
- unsafe{R114_LOCAL_UDP=crate::network::EpochUdpEndpoints::new();
-        R115_UDP_OWNERS=crate::udp_owner_epoch::Registry::new();
-        R116_SHARED_LEASES=crate::agent_03_cap_epoch::LeaseTable::new();}
+ {
+  // Release the permit before entering any scheduler or user code.
+  let Ok(_permit)=r120_enter()else{return false;};
+  unsafe{R114_LOCAL_UDP=crate::network::EpochUdpEndpoints::new();
+         R115_UDP_OWNERS=crate::udp_owner_epoch::Registry::new();
+         R116_SHARED_LEASES=crate::agent_03_cap_epoch::LeaseTable::new();}
+ }
  unsafe{SESSION_DIRTY=!complete;}
  complete
 }
@@ -1583,9 +1587,13 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
   log(b"IndianOS: M009 prior rollback still owns resources\n\0");return false;
  }
  #[cfg(feature="test-r031-files-gui")]
- unsafe{R114_LOCAL_UDP=crate::network::EpochUdpEndpoints::new();
-        R115_UDP_OWNERS=crate::udp_owner_epoch::Registry::new();
-        R116_SHARED_LEASES=crate::agent_03_cap_epoch::LeaseTable::new();}
+ {
+  // Release the permit before entering any scheduler or user code.
+  let Ok(_permit)=r120_enter()else{return false;};
+  unsafe{R114_LOCAL_UDP=crate::network::EpochUdpEndpoints::new();
+         R115_UDP_OWNERS=crate::udp_owner_epoch::Registry::new();
+         R116_SHARED_LEASES=crate::agent_03_cap_epoch::LeaseTable::new();}
+ }
  let mut table=ProcessTable::empty();
  let mut scheduler=Scheduler::empty();
  if !unsafe{indianos_process_table_init(&mut table)}{return false;}
