@@ -18,16 +18,18 @@ SHA = "a" * 40
 
 
 def fixture_reviews(state="APPROVED", commit=SHA, reviewer="independent"):
-    return [{"user": {"login": reviewer}, "state": state, "commit_id": commit}]
+    return [{"user": {"login": reviewer, "type": "User"},
+             "state": state, "commit_id": commit}]
 
 
 def evidence(checks=None, reviews=None, protection=None, actual_head=SHA):
     checks = gate.REQUIRED if checks is None else checks
     if reviews is None:
         reviews = fixture_reviews()
+    pr = {"head": {"sha": actual_head}, "state": "open", "merged": False,
+          "user": {"login": "author", "type": "User"}, "base": {"ref": "main"}}
     data = [
-        {"head": {"sha": actual_head}, "state": "open", "merged": False,
-         "user": {"login": "author"}, "base": {"ref": "main"}},
+        pr,
         {"total_count": len(checks), "check_runs": [
             {"name": name, "head_sha": SHA, "status": "completed",
              "conclusion": "success"} for name in checks]},
@@ -37,6 +39,7 @@ def evidence(checks=None, reviews=None, protection=None, actual_head=SHA):
                                     "contexts": list(gate.REQUIRED)},
          "required_pull_request_reviews": {"required_approving_review_count": 1}}
         if protection is None else protection,
+        {"head": {"sha": actual_head}, "state": "open"},
     ]
     return iter(data)
 
@@ -132,6 +135,41 @@ class ReleaseGateTests(unittest.TestCase):
         exit_code, result = self.invoke(evidence(reviews=reviews))
         self.assertEqual(exit_code, 1)
         self.assertFalse(result["independent_approved"])
+
+    def test_pr_head_change_during_evidence_collection_fails_closed(self):
+        records=list(evidence())
+        records[-1]["head"]["sha"]="b"*40
+        exit_code,result=self.invoke(iter(records))
+        self.assertEqual(exit_code,1)
+        self.assertFalse(result["head_stable"])
+        self.assertFalse(result["ready"])
+
+    def test_bot_approval_is_not_independent_human_review(self):
+        records=list(evidence())
+        records[2][0]["user"]["type"]="Bot"
+        exit_code,result=self.invoke(iter(records))
+        self.assertEqual(exit_code,1)
+        self.assertFalse(result["independent_approved"])
+
+    def test_exactly_one_hundred_reviews_is_ambiguous_not_approved(self):
+        records=list(evidence())
+        records[2]=fixture_reviews()*100
+        exit_code,result=self.invoke(iter(records))
+        self.assertEqual(exit_code,1)
+        self.assertFalse(result["review_history_complete"])
+        self.assertFalse(result["ready"])
+
+    def test_branch_protection_requires_strict_status_and_human_count(self):
+        records=list(evidence())
+        records[3]["required_status_checks"]["strict"]=False
+        exit_code,result=self.invoke(iter(records))
+        self.assertEqual(exit_code,1)
+        self.assertEqual(result["branch_protection"],"not-confirmed")
+        records=list(evidence())
+        records[3]["required_pull_request_reviews"]["required_approving_review_count"]=0
+        exit_code,result=self.invoke(iter(records))
+        self.assertEqual(exit_code,1)
+        self.assertEqual(result["branch_protection"],"not-confirmed")
 
 
 if __name__ == "__main__":

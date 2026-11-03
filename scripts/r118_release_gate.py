@@ -17,6 +17,7 @@ import urllib.request
 
 REQUIRED = (
     "verify-sha",
+    "exact-head-evidence-unit-tests",
     "network",
     "qemu-epoch",
     "runtime-qemu",
@@ -82,18 +83,25 @@ def main():
                     for check in candidates
                 ) else "not-success")
         reviews = get(prefix + "/pulls/" + str(args.pr) + "/reviews?per_page=100")
+        # GitHub REST reviews are paginated. Never accept an approval when
+        # a first full page may hide a newer change request on later pages.
+        report["review_history_complete"] = isinstance(reviews, list) and len(reviews) < 100
         latest = {}
         author = pr["user"]["login"]
-        for review in reviews:
-            login = review["user"]["login"]
-            if login != author and review["state"] in ("APPROVED", "CHANGES_REQUESTED",
-                                                       "DISMISSED"):
-                # Ignore approvals bound to an older PR commit. A new code
-                # revision needs a new independent review on the exact head.
-                state = review["state"]
-                latest[login] = (state if review.get("commit_id") == args.expected_head
-                                 else "OUTDATED")
+        if report["review_history_complete"]:
+            for review in reviews:
+                user = review.get("user") or {}
+                login = user.get("login", "")
+                # A bot/unknown identity is not an independent human review.
+                if (not login or login == author or
+                        user.get("type") != "User"):
+                    continue
+                if review.get("state") in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED"):
+                    state = review["state"]
+                    latest[login] = (state if review.get("commit_id") == args.expected_head
+                                     else "OUTDATED")
         report["independent_approved"] = (
+            report["review_history_complete"] and
             any(v == "APPROVED" for v in latest.values()) and
             not any(v == "CHANGES_REQUESTED" for v in latest.values()))
         report["review_states"] = latest
@@ -102,19 +110,30 @@ def main():
             # A branch's protection endpoint existing is insufficient: it
             # must require BOTH status checks and independent PR review.
             status = protected.get("required_status_checks") or {}
-            reviews_required = protected.get("required_pull_request_reviews")
+            reviews_required = protected.get("required_pull_request_reviews") or {}
+            required_approval_count = reviews_required.get("required_approving_review_count", 0)
+            report["required_human_approvals"] = required_approval_count
             contexts = set(status.get("contexts") or [])
             contexts.update(item.get("context") for item in status.get("checks", [])
                             if isinstance(item, dict))
             report["protected_required_checks"] = sorted(contexts)
             report["branch_protection"] = (
                 "enabled" if protected.get("url") and
-                reviews_required is not None and
+                status.get("strict") is True and
+                isinstance(required_approval_count,int) and
+                required_approval_count>=1 and
                 set(REQUIRED).issubset(contexts)
                 else "not-confirmed")
         except urllib.error.HTTPError:
             report["branch_protection"] = "unverifiable"
+        # A PR may have advanced while network calls were in flight.
+        # Never use checks/reviews from an earlier head for a later one.
+        current = get(prefix + "/pulls/" + str(args.pr))
+        report["head_stable"] = (
+            current.get("state") == "open" and
+            current.get("head", {}).get("sha") == args.expected_head)
         report["ready"] = (
+            report["head_stable"] and
             report["check_results_complete"] and
             all(value == "success" for value in report["required_checks"].values())
             and report["independent_approved"]

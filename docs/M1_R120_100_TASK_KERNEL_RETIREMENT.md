@@ -269,3 +269,8 @@ The live ring-3 UDP syscalls, privileged process preparation, scheduler normal-e
 
 - Added `r118_power_interruption_fault_matrix` to the real two-sector epoch journal implementation. It injects returned-I/O failure *before write*, *after 64 partial bytes*, *after complete write without acknowledgement*, *at flush*, and *on readback*. Every interrupted commit is denied, preserving the untouched predecessor journal; another test corrupts 1/16/64/104/136/512 bytes of the newer head and verifies the externally sealed minimum epoch prevents rollback.
 - This advances source regression coverage for R118-055/077/056/078. **It is in-memory deterministic fault injection, not a real physical unexpected power interruption or boot-sector restoration.** Those hardware gates remain unaccepted and need independent hardware readback, persistent firmware roots and repeatable power-cut logs.
+
+## R118 exact-head review race and branch safety
+
+- `scripts/r118_release_gate.py` now includes its own exact-head evidence unit-test job as a required check, rejects partial review history (100-record first page), rejects bot/unknown approval identities, requires positive human review-count protection with strict status checks, and re-fetches the PR **after** reading checks/reviews to deny a head changed mid-validation. Four targeted Python regressions validate these negative cases.
+- This strengthens R118-067/068/070 policy tooling. It does **not** invent a real independent approval: a protected-branch response may be inaccessible to the GitHub app and no human review was recorded at this patch's baseline. Missing authorization and unavailable branch protection remain fail-closed.
