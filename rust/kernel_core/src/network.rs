@@ -368,9 +368,14 @@ pub fn run_demo<D:EthernetDevice>(
                 return Err(Error::Unexpected);
             }
             stage(b"IndianOS: R114 QEMU primary UDP path timed out and backup route selected\n\0");
-            transmit_leased_ipv4_checked_clock(dev,&routes,&alternatives,route_owner,1,
-        PEER_IP,||initial_clock+20,
+            let retry_receipt=transmit_failover_ipv4_checked_clock(
+                dev,&routes,&alternatives,route_owner,1,PEER_IP,
+                first_receipt,initial_clock+1,||initial_clock+20,
                 |b,mac|udp_frame(b,mac,PEER_UDP_PORT,UDP_REQ,0x2808))?;
+            if retry_receipt.selected.link!=2||
+               retry_receipt.selected.epoch!=backup.epoch {
+                return Err(Error::Unexpected);
+            }
             wait_for_limit_fenced(
                 dev,MAX_POLL,
                 ||live_owners.capture_polled_ingress_revision(),
@@ -2020,6 +2025,103 @@ pub fn transmit_leased_ipv4_kernel_clock<
     ||crate::timer::kernel_monotonic_100hz().ok_or(Error::Unexpected),
     constructor)
 }
+/// R118-079: a RETRY must carry the previous, kernel-issued route receipt
+/// and dispatch tick. Every retry reads the trusted clock both before frame
+/// serialization and at the NIC dispatch boundary. This denies clock
+/// rollback, a nonprogressing retry deadline, same-link replay, a stale link
+/// generation and a renewed lease expiring while the frame is assembled.
+///
+/// The production entry point below derives clock time only from the BSP
+/// calibrated timer. The QEMU fixture uses a separately named synthetic
+/// source to test the real virtio-net failover network path.
+fn transmit_failover_ipv4_checked_try_clock<
+ D:EthernetDevice,const N:usize,const M:usize
+>(
+ dev:&mut D,
+ routes:&crate::agent_06_ipv4_route::OwnerRoutes<N>,
+ links:&crate::agent_06_ipv4_route::FailoverRoutes<M>,
+ owner:crate::batch5_session::Identity,owner_epoch:u64,
+ destination:[u8;4],
+ previous:crate::agent_06_ipv4_route::RouteReceipt,
+ previous_tick:u64,
+ mut clock:impl FnMut()->Result<u64,Error>,
+ constructor:impl FnOnce(&mut[u8],[u8;6])->usize,
+)->Result<crate::agent_06_ipv4_route::RouteReceipt,Error>{
+ let dest=u32::from_be_bytes(destination);
+ let before=clock()?;
+ // A retry without forward time progress cannot prove that a timeout
+ // elapsed; a source reset must not reauthorize the original route.
+ if before<=previous_tick{return Err(Error::Unexpected);}
+ let chosen=links.receipt_at(dest,before).ok_or(Error::Unexpected)?;
+ let selected=chosen.selected;
+ if selected.link==previous.selected.link ||
+    selected.route!=previous.selected.route {
+    // This call is specifically a same-destination failover, not ordinary
+    // retransmission. Never return to the primary during its reset window.
+    return Err(Error::Unexpected);
+ }
+ let policy=routes.select(owner,owner_epoch,dest)
+     .map_err(|_|Error::Unexpected)?.ok_or(Error::Unexpected)?;
+ if policy!=selected.route{return Err(Error::Unexpected);}
+ transmit_owned_ipv4_guarded(dev,routes,owner,owner_epoch,destination,
+     ||{
+         let dispatch=clock()?;
+         if dispatch<before ||
+            !links.receipt_is_current_at(dest,dispatch,chosen) {
+             return Err(Error::Unexpected);
+         }
+         let now_route=routes.select(owner,owner_epoch,dest)
+             .map_err(|_|Error::Unexpected)?.ok_or(Error::Unexpected)?;
+         if now_route!=selected.route{return Err(Error::Unexpected);}
+         Ok(())
+     },constructor)?;
+ Ok(chosen)
+}
+
+/// QEMU-only injectable clock fixture for the real guest's forced primary
+/// UDP timeout and live virtio-net backup. Production callers MUST use
+/// transmit_failover_ipv4_kernel_clock instead.
+pub fn transmit_failover_ipv4_checked_clock<
+ D:EthernetDevice,const N:usize,const M:usize
+>(
+ dev:&mut D,
+ routes:&crate::agent_06_ipv4_route::OwnerRoutes<N>,
+ links:&crate::agent_06_ipv4_route::FailoverRoutes<M>,
+ owner:crate::batch5_session::Identity,owner_epoch:u64,
+ destination:[u8;4],
+ previous:crate::agent_06_ipv4_route::RouteReceipt,
+ previous_tick:u64,
+ mut clock:impl FnMut()->u64,
+ constructor:impl FnOnce(&mut[u8],[u8;6])->usize,
+)->Result<crate::agent_06_ipv4_route::RouteReceipt,Error>{
+ transmit_failover_ipv4_checked_try_clock(
+     dev,routes,links,owner,owner_epoch,destination,previous,
+     previous_tick,||Ok(clock()),constructor)
+}
+
+/// Production-only BSP timer-backed failover. A missing/stopped or
+/// uncalibrated kernel timer refuses to retry without NIC submission.
+/// This is NOT physical multi-NIC, IRQ, IOMMU or SMP qualification.
+#[cfg(feature="timer")]
+pub fn transmit_failover_ipv4_kernel_clock<
+ D:EthernetDevice,const N:usize,const M:usize
+>(
+ dev:&mut D,
+ routes:&crate::agent_06_ipv4_route::OwnerRoutes<N>,
+ links:&crate::agent_06_ipv4_route::FailoverRoutes<M>,
+ owner:crate::batch5_session::Identity,owner_epoch:u64,
+ destination:[u8;4],
+ previous:crate::agent_06_ipv4_route::RouteReceipt,
+ previous_tick:u64,
+ constructor:impl FnOnce(&mut[u8],[u8;6])->usize,
+)->Result<crate::agent_06_ipv4_route::RouteReceipt,Error>{
+ transmit_failover_ipv4_checked_try_clock(
+     dev,routes,links,owner,owner_epoch,destination,previous,
+     previous_tick,
+     ||crate::timer::kernel_monotonic_100hz().ok_or(Error::Unexpected),
+     constructor)
+}
+
 #[cfg(test)]
 mod r117_monotonic_route_clock_tests {
  use super::*;
@@ -2791,5 +2893,112 @@ mod r118_privileged_nic_ingress_tests{
         let mut out=[0u8;8];
         assert_eq!(k.receive_live_udp(&mut sockets,peer,5002,&mut out),Ok(4));
         assert_eq!(&out[..4],b"live");
+    }
+}
+
+#[cfg(test)]
+mod r118_monotonic_failover_retry_tests {
+    use super::*;
+    use crate::agent_06_ipv4_route::{
+        OwnerRoutes,FailoverRoutes,Route,RouteCandidate,RouteReceipt
+    };
+    use crate::batch5_session::Identity;
+
+    struct Nic { sent:usize }
+    impl EthernetDevice for Nic {
+        fn mac(&self)->[u8;6]{[0x52,0x54,0,0x12,0x34,0x56]}
+        fn send(&mut self,_frame:&[u8])->Result<(),Error>{
+            self.sent+=1;Ok(())
+        }
+        fn poll(&mut self,_out:&mut[u8])->Result<Option<usize>,Error>{
+            Ok(None)
+        }
+    }
+    fn setup()->(OwnerRoutes<1>,FailoverRoutes<2>,Identity,RouteReceipt) {
+        let owner=Identity{pid:1,generation:7};
+        let route=Route{network:0x0a07_0000,prefix:24,next_hop:0};
+        let mut policy=OwnerRoutes::<1>::new();
+        policy.bind_kernel(owner,4).unwrap();
+        policy.publish(owner,4,&[route]).unwrap();
+        let mut links=FailoverRoutes::<2>::new();
+        links.add_dhcp_lease(RouteCandidate{
+            route,metric:1,link:1,epoch:1,healthy:true
+        },100,120).unwrap();
+        links.add(RouteCandidate{
+            route,metric:9,link:2,epoch:1,healthy:true
+        }).unwrap();
+        let initial=links.receipt_at(u32::from_be_bytes(PEER_IP),101).unwrap();
+        assert_eq!(initial.selected.link,1);
+        (policy,links,owner,initial)
+    }
+    fn retry(nic:&mut Nic,policy:&OwnerRoutes<1>,links:&FailoverRoutes<2>,
+             owner:Identity,prior:RouteReceipt,first_tick:u64,
+             times:[u64;2])->Result<RouteReceipt,Error>{
+        let mut i=0;
+        transmit_failover_ipv4_checked_clock(nic,policy,links,
+            owner,4,PEER_IP,prior,first_tick,
+            ||{let value=times[i];i+=1;value},
+            |bytes,mac|udp_frame(bytes,mac,PEER_UDP_PORT,b"retry",0x2911))
+    }
+    #[test]
+    fn real_failover_requires_new_link_and_forward_kernel_time() {
+        let (policy,mut links,owner,prior)=setup();
+        let mut nic=Nic{sent:0};
+        assert_eq!(retry(&mut nic,&policy,&links,owner,prior,101,[110,110]),
+                   Err(Error::Unexpected));
+        assert_eq!(nic.sent,0);
+        links.begin_link_reset(1,1,2).unwrap();
+        assert_eq!(retry(&mut nic,&policy,&links,owner,prior,120,[101,121]),
+                   Err(Error::Unexpected));
+        assert_eq!(retry(&mut nic,&policy,&links,owner,prior,121,[120,122]),
+                   Err(Error::Unexpected));
+        assert_eq!(nic.sent,0);
+        let new=retry(&mut nic,&policy,&links,owner,prior,101,[120,121]).unwrap();
+        assert_eq!(new.selected.link,2);
+        assert_eq!(nic.sent,1);
+    }
+    #[test]
+    fn reversed_clock_between_serialization_and_dispatch_denies_frame() {
+        let (policy,mut links,owner,prior)=setup();
+        links.begin_link_reset(1,1,2).unwrap();
+        let mut nic=Nic{sent:0};
+        assert_eq!(retry(&mut nic,&policy,&links,owner,prior,101,[121,120]),
+                   Err(Error::Unexpected));
+        assert_eq!(nic.sent,0);
+    }
+    #[test]
+    fn missing_kernel_time_and_wrong_process_cannot_retry() {
+        let (policy,mut links,owner,prior)=setup();
+        links.begin_link_reset(1,1,2).unwrap();
+        let mut nic=Nic{sent:0};
+        assert_eq!(transmit_failover_ipv4_checked_try_clock(
+            &mut nic,&policy,&links,owner,4,PEER_IP,prior,101,
+            ||Err(Error::Unexpected),
+            |bytes,mac|udp_frame(bytes,mac,PEER_UDP_PORT,b"retry",0x2911)),
+            Err(Error::Unexpected));
+        assert_eq!(retry(&mut nic,&policy,&links,
+            Identity{pid:owner.pid,generation:owner.generation+1},
+            prior,101,[120,121]),Err(Error::Unexpected));
+        assert_eq!(nic.sent,0);
+    }
+    #[test]
+    fn failover_packet_is_rechecked_after_live_link_expiry() {
+        let (policy,mut links,owner,prior)=setup();
+        links.begin_link_reset(1,1,2).unwrap();
+        // Release the quarantined primary candidate to free one route
+        // slot while retaining the healthy secondary as fallback.
+        assert_eq!(links.expire_link(1,2),1);
+        // Expire a newly leased best candidate between receive and send.
+        // Its expired receipt must not grant authority to fallback link 2.
+        let backup=links.resolve_at(u32::from_be_bytes(PEER_IP),120).unwrap();
+        links.add_dhcp_lease(RouteCandidate{
+            route:backup.route,metric:8,link:3,epoch:4,healthy:true
+        },120,121).unwrap();
+        let mut nic=Nic{sent:0};
+        // Link 3 wins at tick 120 and expires at tick 121, causing
+        // a route change to link 2 before frame dispatch.
+        assert_eq!(retry(&mut nic,&policy,&links,owner,prior,101,[120,121]),
+                   Err(Error::Unexpected));
+        assert_eq!(nic.sent,0);
     }
 }
