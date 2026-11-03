@@ -60,6 +60,99 @@ static mut MODULES:ModuleRequest=ModuleRequest{
     revision:0,response:ptr::null(),
     internal_module_count:0,internal_modules:ptr::null(),
 };
+// Limine MP protocol: APs remain waiting in the bootloader because the
+// kernel never writes a goto_address. Reading CPU topology does NOT bring
+// up an AP, install per-AP IDTs or enable remote TLB shootdowns.
+#[repr(C)]
+struct MpRequest {
+    id:[u64;4],
+    revision:u64,
+    response:*const MpResponse,
+    flags:u64,
+}
+#[repr(C)]
+struct MpResponse {
+    revision:u64,
+    flags:u32,
+    bsp_lapic_id:u32,
+    cpu_count:u64,
+    cpus:*const *const MpInfo,
+}
+#[repr(C)]
+struct MpInfo {
+    processor_id:u32,
+    lapic_id:u32,
+    reserved:u64,
+    goto_address:*const c_void,
+    extra_argument:u64,
+}
+#[used]
+#[link_section=".limine_requests"]
+static mut MP:MpRequest=MpRequest {
+    id:[COMMON[0],COMMON[1],0x95a67b819a1b857e,0xa0b61b723b6a73e0],
+    revision:0,response:ptr::null(),flags:0,
+};
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub(crate) struct MpInventory {
+    pub cpus:u32,
+    pub bsp_lapic_id:u32,
+}
+const MAX_BOOT_CPUS:usize=64;
+
+/// R118-014/028 foundation: only validate Limine-supplied topology on
+/// the bootstrap processor. Bootloader owns every listed pointer, and all
+/// CPUs except the BSP MUST remain parked. No AP is started here.
+///
+/// SAFETY: the caller must be the BSP during initial Limine handoff, while
+/// response pages and CPU pointer arrays are valid and immutable. A corrupt
+/// bootloader pointer is not recoverable by a memory-safe parser.
+unsafe fn validate_mp_response(response:&MpResponse)->Option<MpInventory>{
+    let count=usize::try_from(response.cpu_count).ok()?;
+    if count==0 || count>MAX_BOOT_CPUS || response.cpus.is_null() ||
+       (response.cpus as usize)%core::mem::align_of::<*const MpInfo>()!=0 {
+        return None;
+    }
+    let mut lapic_ids=[0u32;MAX_BOOT_CPUS];
+    let mut processor_ids=[0u32;MAX_BOOT_CPUS];
+    let mut bsp_found=0usize;
+    for index in 0..count {
+        // Trusted Limine pointer table only: never use this on untrusted
+        // firmware bytes, from ring3, or after bootloader reclamation.
+        let info_ptr=unsafe{ptr::read_volatile(response.cpus.add(index))};
+        if info_ptr.is_null() ||
+           (info_ptr as usize)%core::mem::align_of::<MpInfo>()!=0 {
+            return None;
+        }
+        let info=unsafe{&*info_ptr};
+        if lapic_ids[..index].contains(&info.lapic_id) ||
+           processor_ids[..index].contains(&info.processor_id) {
+            return None;
+        }
+        // A bootloader-armed AP would execute without an IndianOS-owned
+        // GDT/IDT/TSS/stack. Reject such a handoff before treating it as
+        // a safe, parked secondary processor.
+        if info.lapic_id!=response.bsp_lapic_id &&
+           !unsafe{ptr::read_volatile(ptr::addr_of!(info.goto_address))}.is_null() {
+            return None;
+        }
+        bsp_found+=usize::from(info.lapic_id==response.bsp_lapic_id);
+        lapic_ids[index]=info.lapic_id;
+        processor_ids[index]=info.processor_id;
+    }
+    if bsp_found!=1{return None;}
+    Some(MpInventory{cpus:count as u32,bsp_lapic_id:response.bsp_lapic_id})
+}
+
+/// Read-only topology discovery. No AP startup and no concurrency claim.
+pub(crate) fn observed_mp_inventory()->Option<MpInventory>{
+    let response=unsafe{ptr::read_volatile(ptr::addr_of!(MP.response))};
+    if response.is_null() ||
+       (response as usize)%core::mem::align_of::<MpResponse>()!=0 {
+        return None;
+    }
+    unsafe{validate_mp_response(&*response)}
+}
+
 #[used]
 #[link_section=".limine_requests_end"]
 static mut END:[u64;2]=[0xadc0e0531bb10d03,0x9572709f31764c62];
@@ -97,4 +190,60 @@ mod tests{
         assert_eq!(BASE_REVISION_INIT,6);
     }
     const BASE_REVISION_INIT:u64=6;
+}
+
+#[cfg(test)]
+mod r125_mp_inventory_tests {
+    use super::*;
+    use core::mem::{offset_of,size_of};
+
+    fn info(processor_id:u32,lapic_id:u32)->MpInfo{
+        MpInfo{processor_id,lapic_id,reserved:0,
+               goto_address:ptr::null(),extra_argument:0}
+    }
+    fn response(table:&[*const MpInfo],count:u64,bsp:u32)->MpResponse{
+        MpResponse{revision:0,flags:0,bsp_lapic_id:bsp,
+                   cpu_count:count,cpus:table.as_ptr()}
+    }
+    #[test]
+    fn r125_mp_wire_layout_exact_limine_revision_six(){
+        assert_eq!(size_of::<MpRequest>(),56);
+        assert_eq!(size_of::<MpResponse>(),32);
+        assert_eq!(size_of::<MpInfo>(),32);
+        assert_eq!(offset_of!(MpRequest,response),40);
+        assert_eq!(offset_of!(MpRequest,flags),48);
+        assert_eq!(offset_of!(MpResponse,cpus),24);
+        assert_eq!(offset_of!(MpInfo,goto_address),16);
+    }
+    #[test]
+    fn r125_two_parked_cpus_have_one_authoritative_bsp(){
+        let cpus=[info(0,0),info(1,1)];
+        let table=[&cpus[0] as *const MpInfo,&cpus[1] as *const MpInfo];
+        let data=response(&table,2,0);
+        assert_eq!(unsafe{validate_mp_response(&data)},
+                   Some(MpInventory{cpus:2,bsp_lapic_id:0}));
+    }
+    #[test]
+    fn r125_duplicate_missing_bsp_and_invalid_count_fail_closed(){
+        let cpus=[info(0,0),info(1,1)];
+        let table=[&cpus[0] as *const MpInfo,&cpus[1] as *const MpInfo];
+        for (count,bsp) in [(0,0),(65,0),(u64::MAX,0),(2,3)] {
+            assert_eq!(unsafe{validate_mp_response(&response(&table,count,bsp))},None);
+        }
+        let duplicate=[&cpus[0] as *const MpInfo,&cpus[0] as *const MpInfo];
+        assert_eq!(unsafe{validate_mp_response(&response(&duplicate,2,0))},None);
+        let no_table=MpResponse{cpus:ptr::null(),..response(&table,2,0)};
+        assert_eq!(unsafe{validate_mp_response(&no_table)},None);
+        let same_id=[info(0,0),info(0,1)];
+        let same_ptr=[&same_id[0] as *const MpInfo,&same_id[1] as *const MpInfo];
+        assert_eq!(unsafe{validate_mp_response(&response(&same_ptr,2,0))},None);
+    }
+    #[test]
+    fn r125_prestarted_ap_is_not_qualified_as_parked(){
+        let bsp=info(0,0);
+        let mut ap=info(1,1);
+        ap.goto_address=1usize as *const c_void;
+        let table=[&bsp as *const MpInfo,&ap as *const MpInfo];
+        assert_eq!(unsafe{validate_mp_response(&response(&table,2,0))},None);
+    }
 }

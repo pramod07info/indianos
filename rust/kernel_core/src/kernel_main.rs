@@ -140,6 +140,20 @@ pub extern "C" fn kmain()->!{
     log(b"IndianOS: kernel entered\n\0");
     need(unsafe{boot_validate()},b"IndianOS: FATAL boot information invalid\n\0");
     log(b"IndianOS: boot information validated\n\0");
+    #[cfg(all(feature="limine-requests",target_arch="x86_64",target_os="none"))]
+    {
+        // R125 real bootloader MP handoff. The second QEMU virtual CPU is
+        // enumerated by Limine but remains PARKED. No AP GDT/IDT/TSS, IPI,
+        // scheduler concurrency, per-CPU timer or TLB shootdown is asserted.
+        match crate::limine_requests::observed_mp_inventory() {
+            Some(topology) if topology.cpus==2=>
+                log(b"IndianOS: R125 QEMU two-CPU Limine MP inventory validated; AP parked\n\0"),
+            Some(_)=>
+                log(b"IndianOS: R125 Limine MP topology available; AP startup disabled\n\0"),
+            None=>
+                log(b"IndianOS: R125 MP topology unavailable; AP startup disabled\n\0"),
+        }
+    }
     // Issue #124 HD1: each x86-64 boot enumerates CPU and PCI-PCI bridge
     // topology before optional device drivers. No PCI command writes,
     // BAR mapping, device init or implicit quantum/cloud connection.

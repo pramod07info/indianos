@@ -26,6 +26,7 @@ CLIENT_PORT=41280
 UDP_PORT=4040
 TCP_PORT=8080
 MARKERS=(
+    "IndianOS: R125 QEMU two-CPU Limine MP inventory validated; AP parked",
     "IndianOS: R028 legacy virtio-net DMA queues initialized",
     "IndianOS: R028 Ethernet ARP peer resolved",
     "IndianOS: R028 IPv4 ICMP echo ping PASSED",
@@ -177,7 +178,7 @@ def run(qemu:str,iso:pathlib.Path,ovmf:pathlib.Path)->None:
     listener.listen(1);listener.setblocking(False)
     port=listener.getsockname()[1]
     command=[
-        qemu,"-machine","pc","-m","256M","-smp","1",
+        qemu,"-machine","pc","-m","256M","-smp","2",
         "-display","none","-monitor","none","-serial","stdio",
         "-no-reboot","-no-shutdown","-boot","d",
         "-drive",f"if=pflash,format=raw,readonly=on,file={ovmf}",
