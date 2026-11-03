@@ -336,3 +336,9 @@ The live ring-3 UDP syscalls, privileged process preparation, scheduler normal-e
 
 - The release verifier now requires the exact-head `m2-native-and-guest` and `orbit-ui-preview` GitHub job contexts in addition to the original kernel, security, persistent Files, boot epoch, network, combined regression and SHA identity jobs. These job names were verified from live GitHub Actions for PR #756.
 - A separate Python regression proves a missing M2 or Orbit check must block release, regardless of other green results. This closes an evidence-coverage gap for R118-064/066/068; it cannot replace a full kernel boot, an actual independent review, or physical multicore/UEFI/TPM tests.
+
+## R118 BSP-local mount authority tokens
+
+- `fs_handles::SelectedOperationGuard` and `MountAlias` now hold private zero-sized `PhantomData<*mut ()>`, preventing safe Rust from transferring BSP-local filesystem authority proofs to an AP as `Send` or `Sync`. Existing local copies remain supported and revalidation is unchanged.
+- Two additional Rust regressions verify stale mount snapshots fail after an exact PID incarnation is retired and rebound, and an existing mount alias fails after kernel-only root narrowing even when its target pathname remains valid.
+- This advances the software guard boundary for R118-001/003/014/071, but does NOT implement or certify concurrent SMP remount locks, true two-BSP scheduling, IPI/TLB shootdown, DMA synchronization, or physical multicore tests.

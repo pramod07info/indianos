@@ -9,6 +9,7 @@ use crate::vfs_path::normalize_absolute;
 use crate::ata_pio::AtaPio;
 use crate::batch5_session::Identity;
 use crate::fs_write_guard::{WriteGuard,Statistics};
+use core::marker::PhantomData;
 
 pub const READ:u64=1;
 pub const WRITE:u64=2;
@@ -41,19 +42,23 @@ impl RootGrant {
 pub struct NamespaceReceipt { owner:Identity, namespace_id:u64, revision:u64 }
 /// A kernel-only, read-only proof of the exact mounted volume, root
 /// namespace and mount revision at the beginning of one selected-file call.
-/// This protects against cooperative remount/rebind paths; it is NOT an
-/// inter-CPU locking mechanism.
+/// This snapshot is deliberately !Send and !Sync: a local BSP filesystem
+/// proof must not be sent to an AP without real cross-core synchronization.
+/// This protects cooperative remount/rebind paths, NOT inter-CPU locking.
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 pub struct SelectedOperationGuard{
     namespace:NamespaceReceipt,
     revision:u64,
     selected_volume:Option<crate::m1_partition::PartitionReceipt>,
+    _single_bsp:PhantomData<*mut ()>,
 }
 /// Kernel-minted alias scoped to a process incarnation and namespace revision.
 /// String path comparison alone is not an authority to access a mounted tree.
 #[derive(Clone,Copy)]
 pub struct MountAlias {
     receipt:NamespaceReceipt, root:[u8;24], len:usize,
+    // This alias remains BSP-local, never implicitly sendable to an AP.
+    _single_bsp:PhantomData<*mut ()>,
     // A kernel-selected physical mount is a different authority from its
     // pathname. Every remount or recovery issues a new monotonic revision.
     volume_revision:u64,
@@ -201,7 +206,8 @@ impl FileHandles{
         if !self.root_allows(owner,canonical){return Err(FsError::InvalidName);}
         Ok(MountAlias{receipt,root:path,len,
             volume_revision:self.volume_revision,
-            selected_volume:self.selected_volume})
+            selected_volume:self.selected_volume,
+            _single_bsp:PhantomData})
     }
     /// A trusted kernel entry point may mint only the caller's currently
     /// bound namespace root. It never accepts a ring-3 selected mount path.
@@ -214,7 +220,8 @@ impl FileHandles{
         }
         Ok(MountAlias{receipt,root:root.path,len:root.len,
             volume_revision:self.volume_revision,
-            selected_volume:self.selected_volume})
+            selected_volume:self.selected_volume,
+            _single_bsp:PhantomData})
     }
     /// Authenticate both the alias origin and the target for every operation.
     /// Any PID reuse or root revision revokes previously minted aliases.
@@ -242,6 +249,7 @@ impl FileHandles{
             namespace:self.namespace_receipt(owner)?,
             revision:self.volume_revision,
             selected_volume:self.selected_volume,
+            _single_bsp:PhantomData,
         })
     }
     pub fn selected_operation_guard_is_current(
@@ -3432,5 +3440,43 @@ mod r120_inherited_r118_file_retirement_regressions {
         assert!(files.selected_operation_guard_is_current(fresh));
         assert_eq!(files.retire_process_batch_kernel(&[admin,guest]),Ok(2));
         assert!(!files.selected_operation_guard_is_current(fresh));
+    }
+}
+
+#[cfg(test)]
+mod r118_bsp_local_mount_proof_regressions {
+    use super::*;
+    #[test]
+    fn mount_proofs_reject_recycled_pid_even_with_same_root_spelling() {
+        let mut files=FileHandles::new();
+        let first=files.bind_process(1).unwrap();
+        let guard=files.selected_operation_guard(first).unwrap();
+        let alias=files.mount_alias_for_current_root_kernel(first).unwrap();
+        // Copyable within the BSP, but !Send and !Sync to other CPU threads.
+        let copy=guard;
+        assert!(files.selected_operation_guard_is_current(copy));
+        assert!(files.mount_alias_allows(alias,first,"/shared/note"));
+        assert_eq!(files.retire_process_batch_kernel(&[first]),Ok(1));
+        let next=files.bind_process(1).unwrap();
+        assert_ne!(next.generation,first.generation);
+        assert!(!files.selected_operation_guard_is_current(guard));
+        assert!(!files.mount_alias_allows(alias,next,"/shared/note"));
+        assert!(!files.mount_alias_allows(alias,first,"/shared/note"));
+        let fresh=files.selected_operation_guard(next).unwrap();
+        assert_ne!(fresh,guard);
+        assert!(files.selected_operation_guard_is_current(fresh));
+    }
+    #[test]
+    fn narrowing_a_root_revokes_old_mount_capability_and_guard() {
+        let mut files=FileHandles::new();
+        let owner=files.bind_process(1).unwrap();
+        let guard=files.selected_operation_guard(owner).unwrap();
+        let old=files.mount_alias_kernel(owner,"/shared").unwrap();
+        assert!(files.mount_alias_allows(old,owner,"/shared/note"));
+        files.narrow_root_kernel(owner,"/shared").unwrap();
+        assert!(!files.selected_operation_guard_is_current(guard));
+        assert!(!files.mount_alias_allows(old,owner,"/shared/note"));
+        let current=files.mount_alias_for_current_root_kernel(owner).unwrap();
+        assert!(files.mount_alias_allows(current,owner,"/shared/note"));
     }
 }
