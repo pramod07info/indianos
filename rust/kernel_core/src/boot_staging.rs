@@ -16,6 +16,15 @@ use crate::user_image::{
 };
 
 extern "C" { fn boot_hhdm_offset(out: *mut u64) -> bool; }
+
+/// A Limine higher-half direct-map base must be a canonical, page-aligned
+/// kernel address. This does not itself validate the boot memory map or
+/// firmware measurements; per-frame access still checks for overflow.
+fn valid_hhdm_offset(offset:u64)->bool {
+    offset & 4095 == 0 &&
+    (offset >> 48) == 0xffff &&
+    (offset & (1u64 << 47)) != 0
+}
 #[repr(C)]
 struct DirectMap { offset: u64 }
 unsafe extern "C" fn allocate(physical: *mut u64, _: *mut c_void) -> bool {
@@ -46,7 +55,9 @@ fn backend(map: &mut DirectMap) -> Backend {
 #[no_mangle]
 pub extern "C" fn vmm_boot_self_test() -> bool {
     let mut offset = 0;
-    if !unsafe { boot_hhdm_offset(&mut offset) } || offset == 0 { return false; }
+    if !unsafe { boot_hhdm_offset(&mut offset) } || !valid_hhdm_offset(offset) {
+        return false;
+    }
     let mut map = DirectMap { offset };
     let b = backend(&mut map);
     let mut space: Space = unsafe { core::mem::zeroed() };
@@ -86,7 +97,9 @@ pub unsafe extern "C" fn user_image_boot_stage_test(
 ) -> bool {
     if elf.is_null() || image_bytes == 0 { return false; }
     let mut offset = 0;
-    if !unsafe { boot_hhdm_offset(&mut offset) } || offset == 0 { return false; }
+    if !unsafe { boot_hhdm_offset(&mut offset) } || !valid_hhdm_offset(offset) {
+        return false;
+    }
     let mut map = DirectMap { offset };
     let b = backend(&mut map);
     let before = pmm_free_frames();
@@ -102,4 +115,18 @@ pub unsafe extern "C" fn user_image_boot_stage_test(
         !unsafe { vmm_query_page(&image.tables, image.plan.guard_begin, &mut query) };
     if !unsafe { indianos_user_image_destroy(&mut image) } { return false; }
     valid && pmm_free_frames() == before
+}
+
+#[cfg(test)]
+mod r123_hhdm_handoff_tests {
+    use super::*;
+    #[test]
+    fn deny_null_user_low_half_and_unaligned_hhdm_handoff() {
+        for invalid in [0,0x1000,0x7fff_ffff_f000,
+                        0xffff_7fff_ffff_f000,0xffff_8000_0000_0001] {
+            assert!(!valid_hhdm_offset(invalid));
+        }
+        assert!(valid_hhdm_offset(0xffff_8000_0000_0000));
+        assert!(valid_hhdm_offset(0xffff_ff00_0000_0000));
+    }
 }

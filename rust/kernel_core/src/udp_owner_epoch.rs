@@ -354,3 +354,70 @@ mod r119_udp_owner_batch_tests{
   assert_eq!(r.revoke_owners_batch(&[(1,4)]),Ok(0));
  }
 }
+
+/// R123: atomic replacement of authenticated *proposal-table* UDP grants
+/// during a PID generation transition. The live kernel socket table must
+/// separately perform the same fenced transaction under the BSP coordinator;
+/// this method is not an IRQ, NIC or device-side retirement guarantee.
+impl<const N:usize> Registry<N> {
+    pub fn replace_generation_ports(
+        &mut self, pid:u32, old_generation:u64,
+        new_generation:u64, ports:&[u16]
+    )->Result<usize,Error>{
+        if pid==0 || old_generation==0 || new_generation<=old_generation
+            || ports.is_empty() {
+            return Err(Error::Invalid);
+        }
+        let old_count=self.entries.iter().flatten().filter(|g|
+            g.pid==pid && g.generation==old_generation).count();
+        if old_count==0 || self.has_foreign_generation(pid,old_generation){
+            return Err(Error::Denied);
+        }
+        let mut candidate=self.clone();
+        candidate.revoke_owner(pid,old_generation)?;
+        for (i,&port) in ports.iter().enumerate(){
+            if port==0{return Err(Error::Invalid);}
+            if ports[..i].contains(&port){return Err(Error::Duplicate);}
+            candidate.bind(pid,new_generation,port)?;
+        }
+        self.entries=candidate.entries;
+        Ok(old_count)
+    }
+}
+
+#[cfg(test)]
+mod r123_udp_generation_replacement_tests {
+    use super::*;
+    #[test]
+    fn all_or_nothing_replacement_preserves_peer_and_rejects_stale_pid() {
+        let mut r=Registry::<4>::new();
+        r.bind(4,8,5000).unwrap();
+        r.bind(4,8,5001).unwrap();
+        r.bind(9,1,7000).unwrap();
+        assert_eq!(r.replace_generation_ports(4,8,9,&[6000,7000]),
+                   Err(Error::Duplicate));
+        assert_eq!(r.authorize(4,8,5000),Ok(()));
+        assert_eq!(r.replace_generation_ports(4,8,9,&[6000,6000]),
+                   Err(Error::Duplicate));
+        assert_eq!(r.replace_generation_ports(4,8,9,&[6000,6001]),Ok(2));
+        assert_eq!(r.authorize(4,8,5000),Err(Error::Denied));
+        assert_eq!(r.authorize(4,9,6000),Ok(()));
+        assert_eq!(r.authorize(9,1,7000),Ok(()));
+        assert_eq!(r.replace_generation_ports(4,8,10,&[9000]),Err(Error::Denied));
+        assert_eq!(r.authorize(4,9,6000),Ok(()));
+    }
+    #[test]
+    fn generation_capacity_duplicate_and_invalid_denials_are_atomic() {
+        let mut r=Registry::<2>::new();
+        r.bind(1,3,80).unwrap();
+        r.bind(2,3,81).unwrap();
+        assert_eq!(r.replace_generation_ports(1,3,4,&[90,91]),Err(Error::Full));
+        for (new,ports) in [(3,&[90][..]),(2,&[90][..]),(4,&[][..]),(4,&[0][..])] {
+            assert!(r.replace_generation_ports(1,3,new,ports).is_err());
+        }
+        assert_eq!(r.authorize(1,3,80),Ok(()));
+        assert_eq!(r.authorize(2,3,81),Ok(()));
+        assert_eq!(r.replace_generation_ports(1,3,4,&[90]),Ok(1));
+        assert_eq!(r.authorize(1,4,90),Ok(()));
+    }
+}

@@ -125,6 +125,28 @@ impl LifecycleFence {
         self.verifying.store(false,Ordering::Release);
         result
     }
+    /// Read-only BSP diagnostic for the one outstanding AP publication.
+    /// This is not an IPI delivery or completion guarantee: callers must
+    /// revalidate a returned receipt before recycling any kernel resource.
+    /// An in-progress publisher yields Busy instead of a mixed snapshot.
+    pub fn pending_receipt(&self,cpu:u32)->Result<Option<Receipt>,FenceError>{
+        if cpu!=self.bsp || self.bsp==self.ap{
+            return Err(FenceError::InvalidCpu);
+        }
+        if self.publishing.load(Ordering::Acquire){
+            return Err(FenceError::Busy);
+        }
+        let sequence=self.published.load(Ordering::Acquire);
+        let generation=self.generation.load(Ordering::Acquire);
+        let acknowledged=self.acknowledged.load(Ordering::Acquire);
+        if self.publishing.load(Ordering::Acquire) ||
+           self.published.load(Ordering::Acquire)!=sequence{
+            return Err(FenceError::Busy);
+        }
+        if sequence==0 || acknowledged==sequence{return Ok(None);}
+        if generation==0{return Err(FenceError::InvalidGeneration);}
+        Ok(Some(Receipt{sequence,generation}))
+    }
     /// BSP-side bounded software probe for a previously published AP receipt.
     /// The budget counts polling probes, NOT wall-clock time. This MUST NOT
     /// run in an interrupt handler or while holding an SMP scheduler lock.
@@ -393,4 +415,25 @@ mod tests{
         }),Err(FenceError::StaleReceipt));
     }
 
+}
+
+#[cfg(test)]
+mod r123_bsp_pending_receipt_tests {
+    use super::*;
+    #[test]
+    fn outstanding_receipt_is_observable_but_not_recyclable() {
+        let f=LifecycleFence::new(0,1);
+        assert_eq!(f.pending_receipt(0),Ok(None));
+        assert_eq!(f.pending_receipt(1),Err(FenceError::InvalidCpu));
+        let first=f.publish(0,51).unwrap();
+        assert_eq!(f.pending_receipt(0),Ok(Some(first)));
+        assert_eq!(f.poll_ack_bounded(0,first,0),Err(FenceError::NoProgress));
+        assert_eq!(f.publish(0,52),Err(FenceError::Busy));
+        assert_eq!(f.observe_and_ack_after(1,0,|receipt|receipt==first),
+                   Ok(Some(first)));
+        assert_eq!(f.pending_receipt(0),Ok(None));
+        let second=f.publish(0,52).unwrap();
+        assert_eq!(f.pending_receipt(0),Ok(Some(second)));
+        assert_eq!(f.acknowledged(0,first),Err(FenceError::StaleReceipt));
+    }
 }

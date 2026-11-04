@@ -169,12 +169,28 @@ def main():
             contexts.update(item.get("context") for item in status.get("checks", [])
                             if isinstance(item, dict))
             report["protected_required_checks"] = sorted(contexts)
+            # A required-check list alone is insufficient if admins can
+            # bypass it, force pushes can rewrite the evidence or unresolved
+            # review conversations can be ignored during a release merge.
+            security_controls = {
+                "enforce_admins": (
+                    (protected.get("enforce_admins") or {}).get("enabled") is True),
+                "conversation_resolution": (
+                    (protected.get("required_conversation_resolution") or {})
+                    .get("enabled") is True),
+                "force_pushes_blocked": (
+                    (protected.get("allow_force_pushes") or {}).get("enabled") is False),
+                "deletions_blocked": (
+                    (protected.get("allow_deletions") or {}).get("enabled") is False),
+            }
+            report["protection_controls"] = security_controls
             report["branch_protection"] = (
                 "enabled" if protected.get("url") and
                 status.get("strict") is True and
-                isinstance(required_approval_count,int) and
+                type(required_approval_count) is int and
                 required_approval_count>=1 and
-                set(REQUIRED).issubset(contexts)
+                set(REQUIRED).issubset(contexts) and
+                all(security_controls.values())
                 else "not-confirmed")
         except urllib.error.HTTPError:
             report["branch_protection"] = "unverifiable"
