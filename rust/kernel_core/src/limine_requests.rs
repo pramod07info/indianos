@@ -307,10 +307,17 @@ extern "C" fn r126_secondary_cpu_entry(info:*mut MpInfo)->!{
                 for seq in 1..=64u64{
                     let mut got=false;
                     for _ in 0..50_000_000u32{
-                        match R131_FENCE.observe_and_ack(actual,seen){
-                            Ok(Some(receipt)) if receipt.sequence==seq &&
-                                receipt.generation==seq*2 => {
-                                seen=seq;got=true;break;
+                        // Actual AP validates the BSP's generation and
+                        // completes its local proof BEFORE release-acking.
+                        // A failed proof leaves the BSP publication busy.
+                        match R131_FENCE.observe_and_ack_after(
+                            actual,seen,|receipt|{
+                                receipt.sequence==seq &&
+                                receipt.generation==seq*2
+                            }
+                        ){
+                            Ok(Some(receipt)) => {
+                                seen=receipt.sequence;got=true;break;
                             }
                             Ok(None)=>core::hint::spin_loop(),
                             _=>break,
@@ -387,15 +394,11 @@ pub(crate) fn launch_one_parked_qemu_ap()->bool{
             Ok(receipt)=>receipt,
             Err(_)=>return false,
         };
-        let mut acknowledged=false;
-        for _ in 0..50_000_000u32{
-            match R131_FENCE.acknowledged(0,receipt){
-                Ok(true)=>{acknowledged=true;break;},
-                Ok(false)=>core::hint::spin_loop(),
-                Err(_)=>return false,
-            }
+        // Use the actual bounded BSP receipt primitive. Failure leaves
+        // the old publication outstanding; no scheduler state is freed.
+        if R131_FENCE.poll_ack_bounded(0,receipt,50_000_000).is_err(){
+            return false;
         }
-        if !acknowledged{return false;}
     }
     for _ in 0..50_000_000u32{
         if R131_AP_DONE.load(Ordering::Acquire)==64{return true;}

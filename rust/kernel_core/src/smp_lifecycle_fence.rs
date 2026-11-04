@@ -12,7 +12,7 @@ use core::sync::atomic::{fence,AtomicBool,AtomicU64,Ordering};
 #[derive(Debug,Clone,Copy,Eq,PartialEq)]
 pub enum FenceError {
     InvalidCpu, InvalidGeneration, StaleGeneration, Busy,
-    StaleReceipt, Overflow,
+    StaleReceipt, Overflow, NoProgress, IncompleteLocalWork,
 }
 
 #[derive(Debug,Clone,Copy,Eq,PartialEq)]
@@ -25,12 +25,16 @@ pub struct LifecycleFence {
     acknowledged:AtomicU64,
     generation:AtomicU64,
     publishing:AtomicBool,
+    // A local AP cleanup must not run twice when two host threads claim
+    // the same published sequence. This software gate is NOT an IPI lock.
+    verifying:AtomicBool,
 }
 impl LifecycleFence {
     pub const fn new(bsp:u32,ap:u32)->Self{
         Self{bsp,ap,published:AtomicU64::new(0),
              acknowledged:AtomicU64::new(0),generation:AtomicU64::new(0),
-             publishing:AtomicBool::new(false)}
+             publishing:AtomicBool::new(false),
+             verifying:AtomicBool::new(false)}
     }
     /// BSP only; one outstanding publication at most.
     pub fn publish(&self,cpu:u32,generation:u64)->Result<Receipt,FenceError>{
@@ -59,11 +63,19 @@ impl LifecycleFence {
         self.publishing.store(false,Ordering::Release);
         result
     }
-    /// AP only. The caller must use its actual verified hardware APIC ID.
-    /// An ack is NOT an IPI ack or a TLB invalidation; callers must complete
-    /// required local cleanup before using this release-store in production.
+    /// The compatibility protocol has no local side-effect. For real AP
+    /// lifecycle work prefer observe_and_ack_after, which validates completion
+    /// BEFORE issuing the release acknowledgement.
     pub fn observe_and_ack(
         &self,cpu:u32,last_seen:u64
+    )->Result<Option<Receipt>,FenceError>{
+        self.observe_and_ack_after(cpu,last_seen,|_|true)
+    }
+    /// AP only. Call the supplied (single-use) local proof before acking.
+    /// False means NO acknowledgement; BSP is still forbidden to recycle
+    /// the publication. This does not provide an actual IPI or TLB flush.
+    pub fn observe_and_ack_after(
+        &self,cpu:u32,last_seen:u64,local_complete:impl FnOnce(Receipt)->bool
     )->Result<Option<Receipt>,FenceError>{
         if cpu!=self.ap || self.bsp==self.ap{return Err(FenceError::InvalidCpu);}
         let seq=self.published.load(Ordering::Acquire);
@@ -80,18 +92,54 @@ impl LifecycleFence {
         if seq!=last_seen.checked_add(1).ok_or(FenceError::Overflow)?{
             return Err(FenceError::StaleReceipt);
         }
-        let generation=self.generation.load(Ordering::Relaxed);
-        if generation==0{return Err(FenceError::InvalidGeneration);}
-        let receipt=Receipt{sequence:seq,generation};
-        // One-time acknowledgement: even two AP threads claiming the same
-        // trusted ID must never both emit a receipt for the same sequence.
-        // Release ordering publishes the caller's local proof before BSP
-        // observes the completion. No lock or spin in this primitive.
-        fence(Ordering::SeqCst);
-        self.acknowledged.compare_exchange(
-            last_seen,seq,Ordering::AcqRel,Ordering::Acquire
-        ).map_err(|_|FenceError::StaleReceipt)?;
-        Ok(Some(receipt))
+        // R122 CI regression: a replay must NOT run cleanup again. Merely
+        // checking the final acknowledgement after the callback is too late.
+        if self.acknowledged.load(Ordering::Acquire)!=last_seen{
+            return Err(FenceError::StaleReceipt);
+        }
+        // Two would-be AP claimants must not both execute kernel cleanup.
+        // The losing claimant may retry with fresh state; no spinning.
+        self.verifying.compare_exchange(false,true,
+            Ordering::AcqRel,Ordering::Acquire)
+            .map_err(|_|FenceError::StaleReceipt)?;
+        let result=(||{
+            // Re-check under the single-callback gate: publication may
+            // advance while the first claimant is already returning.
+            if self.published.load(Ordering::Acquire)!=seq ||
+               self.acknowledged.load(Ordering::Acquire)!=last_seen{
+                return Err(FenceError::StaleReceipt);
+            }
+            let generation=self.generation.load(Ordering::Relaxed);
+            if generation==0{return Err(FenceError::InvalidGeneration);}
+            let receipt=Receipt{sequence:seq,generation};
+            if !local_complete(receipt){
+                return Err(FenceError::IncompleteLocalWork);
+            }
+            // Only completed local proof becomes visible to the BSP.
+            fence(Ordering::SeqCst);
+            self.acknowledged.compare_exchange(
+                last_seen,seq,Ordering::AcqRel,Ordering::Acquire
+            ).map_err(|_|FenceError::StaleReceipt)?;
+            Ok(Some(receipt))
+        })();
+        self.verifying.store(false,Ordering::Release);
+        result
+    }
+    /// BSP-side bounded software probe for a previously published AP receipt.
+    /// The budget counts polling probes, NOT wall-clock time. This MUST NOT
+    /// run in an interrupt handler or while holding an SMP scheduler lock.
+    /// An unresponsive AP leaves the publication outstanding (fail closed):
+    /// the caller must not recycle memory or issue another lifecycle receipt.
+    /// Actual IPI delivery, timeout clocks and TLB shootdown are NOT provided.
+    pub fn poll_ack_bounded(
+        &self,cpu:u32,receipt:Receipt,budget:u32
+    )->Result<(),FenceError>{
+        if self.acknowledged(cpu,receipt)?{return Ok(());}
+        for _ in 0..budget{
+            core::hint::spin_loop();
+            if self.acknowledged(cpu,receipt)?{return Ok(());}
+        }
+        Err(FenceError::NoProgress)
     }
     /// BSP cannot treat an ack for an earlier generation as the current one.
     pub fn acknowledged(
@@ -264,4 +312,85 @@ mod tests{
         }
         worker.join().unwrap();
     }
+    #[test]
+    fn r122_no_progress_does_not_recycle_outstanding_ap_receipt(){
+        let f=LifecycleFence::new(0,1);
+        let issued=f.publish(0,11).unwrap();
+        assert_eq!(f.poll_ack_bounded(0,issued,4),Err(FenceError::NoProgress));
+        assert_eq!(f.publish(0,12),Err(FenceError::Busy));
+        assert_eq!(f.poll_ack_bounded(0,Receipt{
+            sequence:issued.sequence,generation:12},1),Err(FenceError::StaleReceipt));
+        assert_eq!(f.poll_ack_bounded(1,issued,1),Err(FenceError::InvalidCpu));
+        assert_eq!(f.acknowledged(0,issued),Ok(false));
+        assert_eq!(f.observe_and_ack(1,0),Ok(Some(issued)));
+        assert_eq!(f.poll_ack_bounded(0,issued,1),Ok(()));
+        let next=f.publish(0,12).unwrap();
+        assert_eq!(next.sequence,issued.sequence+1);
+        assert_eq!(f.poll_ack_bounded(0,issued,1),Err(FenceError::StaleReceipt));
+    }
+
+    #[test]
+    fn r122_two_claimants_cannot_run_duplicate_local_cleanup(){
+        use std::sync::{Arc,Barrier};
+        use std::sync::atomic::{AtomicU32,Ordering};
+        let fence=Arc::new(LifecycleFence::new(0,1));
+        let issued=fence.publish(0,44).unwrap();
+        let hit=Arc::new(AtomicU32::new(0));
+        let start=Arc::new(Barrier::new(2));
+        let mut threads=std::vec::Vec::new();
+        for _ in 0..2{
+            let f=Arc::clone(&fence);
+            let count=Arc::clone(&hit);
+            let gate=Arc::clone(&start);
+            threads.push(std::thread::spawn(move||{
+                gate.wait();
+                f.observe_and_ack_after(1,0,|r|{
+                    assert_eq!(r,issued);
+                    count.fetch_add(1,Ordering::AcqRel);
+                    true
+                })
+            }));
+        }
+        let results=threads.into_iter().map(|x|x.join().unwrap())
+            .collect::<std::vec::Vec<_>>();
+        assert_eq!(results.iter().filter(|x|**x==Ok(Some(issued))).count(),1);
+        assert_eq!(results.iter().filter(|x|
+            **x==Err(FenceError::StaleReceipt)).count(),1);
+        assert_eq!(hit.load(Ordering::Acquire),1);
+        assert_eq!(fence.acknowledged(0,issued),Ok(true));
+        // A successfully acknowledged packet never reruns the callback.
+        assert_eq!(fence.observe_and_ack_after(1,0,|_|{
+            panic!("duplicate AP cleanup after ACK")
+        }),Err(FenceError::StaleReceipt));
+    }
+
+    #[test]
+    fn r122_ap_rejects_local_cleanup_failure_without_acknowledging(){
+        let f=LifecycleFence::new(0,1);
+        let receipt=f.publish(0,22).unwrap();
+        let mut called=0u32;
+        assert_eq!(f.observe_and_ack_after(1,0,|r|{
+            called+=1;
+            assert_eq!(r,receipt);
+            false
+        }),Err(FenceError::IncompleteLocalWork));
+        assert_eq!(called,1);
+        assert_eq!(f.acknowledged(0,receipt),Ok(false));
+        assert_eq!(f.publish(0,24),Err(FenceError::Busy));
+        assert_eq!(f.observe_and_ack_after(1,0,|r|{
+            r.generation==23
+        }),Err(FenceError::IncompleteLocalWork));
+        assert_eq!(f.poll_ack_bounded(0,receipt,1),Err(FenceError::NoProgress));
+        assert_eq!(f.observe_and_ack_after(0,0,|_|{
+            panic!("wrong-CPU cleanup must never run")
+        }),Err(FenceError::InvalidCpu));
+        assert_eq!(f.observe_and_ack_after(1,0,|r|{
+            r.sequence==1 && r.generation==22
+        }),Ok(Some(receipt)));
+        assert_eq!(f.acknowledged(0,receipt),Ok(true));
+        assert_eq!(f.observe_and_ack_after(1,0,|_|{
+            panic!("replayed local cleanup must never run")
+        }),Err(FenceError::StaleReceipt));
+    }
+
 }

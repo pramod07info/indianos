@@ -57,10 +57,14 @@ impl NicRxFence {
     pub fn try_admit(&self,device:u32)->Result<RxPermit<'_>,RxFenceError>{
         if device==0 || device!=self.device {return Err(RxFenceError::InvalidDevice);}
         if self.quiescing.load(Ordering::Acquire){return Err(RxFenceError::Quiescing);}
+        // Bind every RX admission to the current driver/ring lifetime, not
+        // just to the device number and epoch. Device replacement may start
+        // at the same address with the same initial numeric epoch.
+        let instance=self.instance_id()?;
         let epoch=self.epoch.load(Ordering::Acquire);
         self.admitted.fetch_update(Ordering::AcqRel,Ordering::Acquire,
             |n|n.checked_add(1)).map_err(|_|RxFenceError::Capacity)?;
-        let permit=RxPermit{fence:self,epoch,_not_send:PhantomData};
+        let permit=RxPermit{fence:self,epoch,instance,_not_send:PhantomData};
         if self.quiescing.load(Ordering::Acquire) ||
            self.epoch.load(Ordering::Acquire)!=epoch {
             drop(permit);
@@ -106,6 +110,8 @@ impl NicRxFence {
     }
     pub fn permit_is_current(&self,permit:&RxPermit<'_>)->bool{
         ptr::eq(self,permit.fence) && self.device!=0 &&
+        permit.instance!=0 &&
+        self.instance.load(Ordering::Acquire)==permit.instance &&
         !self.quiescing.load(Ordering::Acquire) &&
         self.epoch.load(Ordering::Acquire)==permit.epoch
     }
@@ -115,7 +121,8 @@ impl NicRxFence {
 /// the receiving CPU must finish its own IRQ/packet ownership processing.
 #[must_use="hold through the guarded UDP ingress operation"]
 pub struct RxPermit<'a>{
-    fence:&'a NicRxFence,epoch:u64,_not_send:PhantomData<*mut ()>,
+    fence:&'a NicRxFence,epoch:u64,instance:u64,
+    _not_send:PhantomData<*mut ()>,
 }
 impl RxPermit<'_>{
     pub fn epoch(&self)->u64{self.epoch}
@@ -213,4 +220,52 @@ mod tests{
         t.join().unwrap();
         assert_eq!(f.finish_rebind(q),Ok(2));
     }
+    #[test]
+    fn r122_same_device_number_is_not_a_ring_lifetime_identity(){
+        let a=NicRxFence::new(19);
+        let b=NicRxFence::new(19);
+        let pa=a.try_admit(19).unwrap();
+        let pb=b.try_admit(19).unwrap();
+        assert_ne!(pa.instance,pb.instance);
+        assert_eq!(pa.epoch(),pb.epoch());
+        assert!(a.permit_is_current(&pa));
+        assert!(b.permit_is_current(&pb));
+        assert!(!a.permit_is_current(&pb));
+        assert!(!b.permit_is_current(&pa));
+        let q=a.begin_quiesce(19).unwrap();
+        assert!(!a.permit_is_current(&pa));
+        assert!(b.permit_is_current(&pb));
+        assert_eq!(a.drained(q),Ok(false));
+        drop(pa);
+        assert_eq!(a.drained(q),Ok(true));
+        assert_eq!(a.finish_rebind(q),Ok(2));
+        assert!(b.permit_is_current(&pb));
+    }
+    #[test]
+    fn r122_admissions_keep_same_lifetime_during_concurrent_start(){
+        use std::sync::{Arc,Barrier};
+        let f=Arc::new(NicRxFence::new(11));
+        let start=Arc::new(Barrier::new(6));
+        let threads:std::vec::Vec<_>=(0..6).map(|_|{
+            let f=Arc::clone(&f);let start=Arc::clone(&start);
+            std::thread::spawn(move||{
+                start.wait();
+                let p=f.try_admit(11).unwrap();
+                let identity=p.instance;
+                assert!(identity!=0);
+                assert!(f.permit_is_current(&p));
+                identity
+            })
+        }).collect();
+        let mut instance=0;
+        for t in threads {
+            let got=t.join().unwrap();
+            if instance==0 {instance=got;}
+            assert_eq!(got,instance);
+        }
+        let q=f.begin_quiesce(11).unwrap();
+        assert_eq!(f.drained(q),Ok(true));
+        assert_eq!(f.finish_rebind(q),Ok(2));
+    }
+
 }

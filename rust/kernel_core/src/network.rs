@@ -240,21 +240,36 @@ fn wait_for_limit<D:EthernetDevice>(dev:&mut D,limit:u32,
 /// each poll, not after a possibly delayed DMA completion. The Rust caller
 /// exclusively owns NIC, policy and socket tables on the experimental BSP.
 /// Physical IRQ-driven drivers need hardware quiescence and a BSP permit.
+/// R122: acquire a NON-SEND software RX permit before the actual virtio
+/// poll/descriptor handoff, and snapshot the owner revision before polling.
+/// Keep the same permit across queue admission; do not mint a new one only
+/// after observing a frame. This is polled QEMU software synchronization:
+/// physical NIC DMA must still be stopped and IRQs masked by its driver.
 fn wait_for_limit_fenced<D:EthernetDevice>(
     dev:&mut D,limit:u32,
+    device:&crate::nic_rx_fence::NicRxFence,device_id:u32,
     mut capture:impl FnMut()->crate::process_retirement_txn::IngressRevision,
     mut matcher:impl FnMut(
-        crate::process_retirement_txn::IngressRevision,&[u8],[u8;6]
+        crate::process_retirement_txn::IngressRevision,
+        &crate::nic_rx_fence::RxPermit<'_>,&[u8],[u8;6]
     )->bool,
 )->Result<(),Error>{
     let mut frame=[0u8;FRAME_CAP];
     let mac=dev.mac();
     for _ in 0..limit{
+        let rx=device.try_admit(device_id).map_err(|_|Error::Unexpected)?;
         let pre_poll=capture();
         if let Some(n)=dev.poll(&mut frame)?{
             if n>frame.len(){return Err(Error::Invalid);}
-            if matcher(pre_poll,&frame[..n],mac){return Ok(());}
+            if !device.permit_is_current(&rx){return Err(Error::Unexpected);}
+            let accepted=matcher(pre_poll,&rx,&frame[..n],mac);
+            // A quiesce which started inside the callback must not turn a
+            // completed software receive into a successful QEMU proof.
+            if !device.permit_is_current(&rx){return Err(Error::Unexpected);}
+            if accepted{return Ok(());}
         }
+        // RX RAII drops before the next poll; no long-lived in-flight permit.
+        drop(rx);
         spin_loop();
     }
     Err(Error::Timeout)
@@ -347,13 +362,13 @@ pub fn run_demo<D:EthernetDevice>(
         PEER_IP,||initial_clock+1,
         |b,mac|udp_frame(b,mac,PEER_UDP_PORT,UDP_REQ,0x2803))?;
     let ingress=|revision:crate::process_retirement_txn::IngressRevision,
+                  rx:&crate::nic_rx_fence::RxPermit<'_>,
                   frame:&[u8],mac:[u8;6]|{
         parse_udp(frame,mac,PEER_UDP_PORT).is_ok_and(|data|data==UDP_RESP)
-            && nic_rx_fence.try_admit(1).is_ok_and(|rx|
-                live_owners.ingest_nic_frame_device_fenced(
-                    &nic_rx_fence,&rx,&ingress_permit,&ingress_gate,
-                    &mut udp_endpoints,revision,frame,mac)
-                .is_ok_and(|owner|owner==network_owner))
+            && live_owners.ingest_nic_frame_device_fenced(
+                &nic_rx_fence,rx,&ingress_permit,&ingress_gate,
+                &mut udp_endpoints,revision,frame,mac)
+                .is_ok_and(|owner|owner==network_owner)
     };
     // Do not treat malformed network replies as successful failover evidence.
     // In the QEMU test the peer confirms packet reception but blackholes
@@ -361,7 +376,7 @@ pub fn run_demo<D:EthernetDevice>(
     let mut captured_reply:Option<([u8;FRAME_CAP],usize,
         crate::process_retirement_txn::IngressRevision,[u8;6])>=None;
     match wait_for_limit_fenced(
-        dev,300_000,
+        dev,300_000,&nic_rx_fence,1,
         ||live_owners.capture_ingress_revision(&ingress_permit),ingress
     ){
         Err(Error::Timeout)=>{
@@ -402,17 +417,16 @@ pub fn run_demo<D:EthernetDevice>(
             let mut real_rx_revision=None;
             let mut real_rx_mac=[0u8;6];
             wait_for_limit_fenced(
-                dev,MAX_POLL,
+                dev,MAX_POLL,&nic_rx_fence,1,
                 ||live_owners.capture_ingress_revision(&ingress_permit),
-                |revision,frame,mac|{
+                |revision,rx,frame,mac|{
                     if frame.len()>real_rx_frame.len() ||
                        !parse_udp(frame,mac,PEER_UDP_PORT)
                             .is_ok_and(|data|data==UDP_RESP) {
                         return false;
                     }
-                    let Ok(rx)=nic_rx_fence.try_admit(1)else{return false;};
                     if live_owners.ingest_nic_frame_device_fenced(
-                        &nic_rx_fence,&rx,&ingress_permit,&ingress_gate,
+                        &nic_rx_fence,rx,&ingress_permit,&ingress_gate,
                         &mut udp_endpoints,revision,frame,mac)
                         !=Ok(network_owner){
                         return false;
@@ -446,15 +460,14 @@ pub fn run_demo<D:EthernetDevice>(
     transmit_leased_ipv4_checked_clock(dev,&routes,&alternatives,route_owner,1,
         PEER_IP,||initial_clock+21,dns_query)?;
     wait_for_limit_fenced(
-        dev,MAX_POLL,
+        dev,MAX_POLL,&nic_rx_fence,1,
         ||live_owners.capture_ingress_revision(&ingress_permit),
-        |revision,frame,mac|{
+        |revision,rx,frame,mac|{
             valid_dns(frame,mac) &&
-                nic_rx_fence.try_admit(1).is_ok_and(|rx|
-                    live_owners.ingest_nic_frame_device_fenced(
-                        &nic_rx_fence,&rx,&ingress_permit,&ingress_gate,
-                        &mut udp_endpoints,revision,frame,mac)
-                    .is_ok_and(|owner|owner==network_owner))
+                live_owners.ingest_nic_frame_device_fenced(
+                    &nic_rx_fence,rx,&ingress_permit,&ingress_gate,
+                    &mut udp_endpoints,revision,frame,mac)
+                .is_ok_and(|owner|owner==network_owner)
         }
     )?;
     let mut dns_reply=[0u8;R033_UDP_BYTES];
@@ -3137,5 +3150,76 @@ mod r118_monotonic_failover_retry_tests {
         assert_eq!(retry(&mut nic,&policy,&links,owner,prior,101,[120,121]),
                    Err(Error::Unexpected));
         assert_eq!(nic.sent,0);
+    }
+}
+
+
+// R122: prove the actual polled device is covered by one NIC admission
+// from BEFORE the descriptor poll until callback completion. Host-only; this
+// must not be interpreted as hardware DMA or IRQ-driver qualification.
+#[cfg(test)]
+mod r122_pre_poll_nic_permit_tests{
+    use super::*;
+    use crate::nic_rx_fence::{NicRxFence,QuiesceReceipt};
+    use std::cell::Cell;
+
+    struct SafeProbe<'a>{nic:&'a NicRxFence,phase:&'a Cell<u8>}
+    impl EthernetDevice for SafeProbe<'_>{
+        fn mac(&self)->[u8;6]{[0;6]}
+        fn send(&mut self,_:&[u8])->Result<(),Error>{Ok(())}
+        fn poll(&mut self,_:&mut [u8])->Result<Option<usize>,Error>{
+            // The revision must have been read before hardware polling.
+            assert_eq!(self.phase.get(),1);
+            // An active RX permit blocks a zero-inflight quiesce claim.
+            let receipt=self.nic.begin_quiesce(7).unwrap();
+            assert_eq!(self.nic.drained(receipt),Ok(false));
+            self.phase.set(2);
+            Ok(Some(0))
+        }
+    }
+    #[test]
+    fn poll_holds_rx_permit_before_descriptor_and_drops_on_quiesce(){
+        let nic=NicRxFence::new(7);
+        let phase=Cell::new(0);
+        let mut dev=SafeProbe{nic:&nic,phase:&phase};
+        let owner=crate::process_retirement_txn::ProcessRetirement::<1,1,1>::new();
+        let mut callbacks=0u32;
+        assert_eq!(wait_for_limit_fenced(
+            &mut dev,1,&nic,7,
+            ||{phase.set(1);owner.capture_polled_ingress_revision()},
+            |_,_,_,_|{callbacks+=1;true}
+        ),Err(Error::Unexpected));
+        assert_eq!(phase.get(),2);
+        assert_eq!(callbacks,0); // quiescing permit never enters callback
+        assert!(matches!(nic.try_admit(7),Err(_)));
+    }
+
+    struct CleanProbe{polls:u32}
+    impl EthernetDevice for CleanProbe{
+        fn mac(&self)->[u8;6]{[0;6]}
+        fn send(&mut self,_:&[u8])->Result<(),Error>{Ok(())}
+        fn poll(&mut self,_:&mut[u8])->Result<Option<usize>,Error>{
+            self.polls+=1;Ok(Some(0))
+        }
+    }
+    #[test]
+    fn valid_pre_poll_permit_survives_callback_and_releases_after_success(){
+        let nic=NicRxFence::new(7);
+        let owner=crate::process_retirement_txn::ProcessRetirement::<1,1,1>::new();
+        let mut dev=CleanProbe{polls:0};
+        let mut matched=0;
+        let result=wait_for_limit_fenced(&mut dev,1,&nic,7,
+            ||owner.capture_polled_ingress_revision(),
+            |_,rx,_,_|{
+                assert!(nic.permit_is_current(rx));
+                matched+=1;true
+            });
+        assert_eq!(result,Ok(()));
+        assert_eq!(dev.polls,1);
+        assert_eq!(matched,1);
+        // Permit was dropped when helper returned, so quiesce can drain.
+        let r:QuiesceReceipt=nic.begin_quiesce(7).unwrap();
+        assert_eq!(nic.drained(r),Ok(true));
+        assert_eq!(nic.finish_rebind(r),Ok(2));
     }
 }

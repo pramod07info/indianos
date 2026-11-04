@@ -265,7 +265,19 @@ impl<const C: usize, const U: usize, const E: usize> ProcessRetirement<C, U, E> 
         if !bsp.issued_by(expected_gate) || !device.permit_is_current(rx){
             return Err(RetirementError::Sockets(SocketError::Denied));
         }
-        self.ingest_kernel_nic_frame(bsp,sockets,revision,frame,local_mac)
+        // Publish no live socket change until both receive authorities and
+        // the kernel owner revision survive parser/queue admission. The BSP
+        // lifecycle permit must also serialize NIC quiesce and owner rebind.
+        // This is bounded software staging, NOT physical IRQ/DMA isolation.
+        let mut candidate=sockets.clone();
+        let owner=self.ingest_kernel_nic_frame(
+            bsp,&mut candidate,revision,frame,local_mac)?;
+        if !bsp.issued_by(expected_gate) || !device.permit_is_current(rx) ||
+           revision.0!=self.ingress_revision {
+            return Err(RetirementError::Sockets(SocketError::Denied));
+        }
+        *sockets=candidate;
+        Ok(owner)
     }
 
     /// Authenticated dequeue also requires the process to remain live.
@@ -835,5 +847,133 @@ mod r121_live_device_ingress_replay_tests {
         assert_eq!(nic.drained(stopped),Ok(true));
         assert_eq!(nic.finish_rebind(stopped),Ok(2));
         assert_eq!(sockets.pending_owned(owner.pid,owner.generation),Ok(0));
+    }
+}
+
+
+// R122: production NIC policy authority and live socket queues are checked
+// together. Real Ethernet/IP/UDP wire fixtures; no physical DMA/IRQ claim.
+#[cfg(test)]
+mod r122_staged_device_ingress_tests {
+    use super::*;
+    use crate::nic_rx_fence::{NicRxFence,RxFenceError};
+    use crate::retirement_gate::RetirementGate;
+    fn sum(bytes:&[u8])->u16 {
+        let mut s=0u32;
+        for c in bytes.chunks(2){
+            s+=((c[0] as u32)<<8)|c.get(1).copied().unwrap_or(0) as u32;
+        }
+        while s>>16!=0 {s=(s&0xffff)+(s>>16);}
+        !(s as u16)
+    }
+    fn packet(port:u16,body:&[u8],mac:[u8;6])->std::vec::Vec<u8>{
+        let n=body.len()+8;
+        let mut f=std::vec![0u8;14+20+n];
+        f[..6].copy_from_slice(&mac);
+        f[6..12].copy_from_slice(&crate::network::PEER_MAC);
+        f[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+        f[14]=0x45;
+        f[16..18].copy_from_slice(&((20+n) as u16).to_be_bytes());
+        f[20..22].copy_from_slice(&0x4000u16.to_be_bytes());
+        f[22]=64;f[23]=17;
+        f[26..30].copy_from_slice(&crate::network::PEER_IP);
+        f[30..34].copy_from_slice(&crate::network::LOCAL_IP);
+        let ip_sum=sum(&f[14..34]);
+        f[24..26].copy_from_slice(&ip_sum.to_be_bytes());
+        f[34..36].copy_from_slice(&4040u16.to_be_bytes());
+        f[36..38].copy_from_slice(&port.to_be_bytes());
+        f[38..40].copy_from_slice(&(n as u16).to_be_bytes());
+        f[42..].copy_from_slice(body);
+        let mut pseudo=std::vec::Vec::new();
+        pseudo.extend_from_slice(&crate::network::PEER_IP);
+        pseudo.extend_from_slice(&crate::network::LOCAL_IP);
+        pseudo.extend_from_slice(&[0,17]);
+        pseudo.extend_from_slice(&(n as u16).to_be_bytes());
+        pseudo.extend_from_slice(&f[34..]);
+        let c=sum(&pseudo);
+        f[40..42].copy_from_slice(&(if c==0{0xffff}else{c}).to_be_bytes());
+        f
+    }
+    #[test]
+    fn verified_wire_ingress_commits_only_to_active_owner() {
+        let gate=RetirementGate::new();gate.register_bsp(0,true).unwrap();
+        let bsp=gate.try_enter(0,true).unwrap();
+        let nic=NicRxFence::new(9);let rx=nic.try_admit(9).unwrap();
+        let mut k=ProcessRetirement::<3,3,4>::new();
+        let mut q=EpochUdpEndpoints::<3,4>::new();
+        let owner=k.start(1).unwrap();let peer=k.start(2).unwrap();
+        k.bind_live_udp(&mut q,owner,6501).unwrap();
+        k.bind_live_udp(&mut q,peer,6502).unwrap();
+        let rev=k.capture_ingress_revision(&bsp);
+        let mac=[0x52,0x54,0,0x12,0x34,0x56];
+        let wire=packet(6501,b"R122",mac);
+        assert_eq!(k.ingest_nic_frame_device_fenced(
+            &nic,&rx,&bsp,&gate,&mut q,rev,&wire,mac),Ok(owner));
+        assert_eq!(q.pending_owned(owner.pid,owner.generation),Ok(1));
+        assert_eq!(q.pending_owned(peer.pid,peer.generation),Ok(0));
+        let mut buf=[0u8;8];
+        assert_eq!(k.receive_live_udp(&mut q,owner,6501,&mut buf),Ok(4));
+        assert_eq!(&buf[..4],b"R122");
+    }
+    #[test]
+    fn checksum_failure_and_quiesce_do_not_mutate_live_fifo() {
+        let gate=RetirementGate::new();gate.register_bsp(0,true).unwrap();
+        let bsp=gate.try_enter(0,true).unwrap();
+        let nic=NicRxFence::new(9);let rx=nic.try_admit(9).unwrap();
+        let mut k=ProcessRetirement::<2,2,3>::new();
+        let mut q=EpochUdpEndpoints::<2,3>::new();
+        let owner=k.start(1).unwrap();k.bind_live_udp(&mut q,owner,6503).unwrap();
+        let rev=k.capture_ingress_revision(&bsp);
+        let mac=[0x52,0x54,0,0x12,0x34,0x56];
+        let valid=packet(6503,b"safe",mac);
+        let mut corrupt=valid.clone();corrupt[42]^=0x10;
+        assert_eq!(k.ingest_nic_frame_device_fenced(
+            &nic,&rx,&bsp,&gate,&mut q,rev,&corrupt,mac),
+            Err(RetirementError::Ingress(IngressError::BadChecksum)));
+        assert_eq!(q.pending_owned(owner.pid,owner.generation),Ok(0));
+        let stop=nic.begin_quiesce(9).unwrap();
+        assert_eq!(k.ingest_nic_frame_device_fenced(
+            &nic,&rx,&bsp,&gate,&mut q,rev,&valid,mac),
+            Err(RetirementError::Sockets(SocketError::Denied)));
+        assert_eq!(q.pending_owned(owner.pid,owner.generation),Ok(0));
+        assert_eq!(nic.finish_rebind(stop),Err(RxFenceError::Busy));
+        drop(rx);
+        assert_eq!(nic.finish_rebind(stop),Ok(2));
+        let fresh=nic.try_admit(9).unwrap();
+        assert_eq!(k.ingest_nic_frame_device_fenced(
+            &nic,&fresh,&bsp,&gate,&mut q,rev,&valid,mac),Ok(owner));
+        assert_eq!(q.pending_owned(owner.pid,owner.generation),Ok(1));
+    }
+    #[test]
+    fn foreign_device_gate_and_pid_recycle_replay_never_queue_packet(){
+        let gate=RetirementGate::new();gate.register_bsp(0,true).unwrap();
+        let foreign_gate=RetirementGate::new();
+        foreign_gate.register_bsp(0,true).unwrap();
+        let bsp=gate.try_enter(0,true).unwrap();
+        let foreign_bsp=foreign_gate.try_enter(0,true).unwrap();
+        let nic=NicRxFence::new(9);let other=NicRxFence::new(9);
+        let rx=nic.try_admit(9).unwrap();let foreign_rx=other.try_admit(9).unwrap();
+        let mut k=ProcessRetirement::<2,2,3>::new();
+        let mut q=EpochUdpEndpoints::<2,3>::new();
+        let first=k.start(1).unwrap();k.bind_live_udp(&mut q,first,6504).unwrap();
+        let stale=k.capture_ingress_revision(&bsp);
+        k.retire_live_exited_batch(&mut q,&[first]).unwrap();
+        let second=k.start(1).unwrap();k.bind_live_udp(&mut q,second,6504).unwrap();
+        let fresh=k.capture_ingress_revision(&bsp);
+        let mac=[0x52,0x54,0,0x12,0x34,0x56];
+        let wire=packet(6504,b"owner",mac);
+        assert_eq!(k.ingest_nic_frame_device_fenced(
+            &nic,&rx,&bsp,&gate,&mut q,stale,&wire,mac),
+            Err(RetirementError::Sockets(SocketError::Denied)));
+        assert_eq!(k.ingest_nic_frame_device_fenced(
+            &nic,&foreign_rx,&bsp,&gate,&mut q,fresh,&wire,mac),
+            Err(RetirementError::Sockets(SocketError::Denied)));
+        assert_eq!(k.ingest_nic_frame_device_fenced(
+            &nic,&rx,&foreign_bsp,&gate,&mut q,fresh,&wire,mac),
+            Err(RetirementError::Sockets(SocketError::Denied)));
+        assert_eq!(q.pending_owned(second.pid,second.generation),Ok(0));
+        assert_eq!(k.ingest_nic_frame_device_fenced(
+            &nic,&rx,&bsp,&gate,&mut q,fresh,&wire,mac),Ok(second));
+        assert_eq!(q.pending_owned(second.pid,second.generation),Ok(1));
     }
 }
