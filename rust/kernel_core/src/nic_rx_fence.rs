@@ -86,7 +86,10 @@ impl NicRxFence {
                           instance})
     }
     /// No busy waiting in an ISR; the BSP polls this after hardware is still.
-    pub fn drained(&self,receipt:QuiesceReceipt)->Result<bool,RxFenceError>{
+    /// Control-plane visibility into software receive handlers still in
+    /// flight for this exact ring lifetime. This count does NOT include
+    /// hardware DMA completions; a driver must stop those independently.
+    pub fn admitted_in_flight(&self,receipt:QuiesceReceipt)->Result<u32,RxFenceError>{
         if receipt.device!=self.device || self.device==0 ||
            receipt.instance==0 ||
            receipt.instance!=self.instance.load(Ordering::Acquire) ||
@@ -94,7 +97,10 @@ impl NicRxFence {
            receipt.epoch!=self.epoch.load(Ordering::Acquire) {
             return Err(RxFenceError::Stale);
         }
-        Ok(self.admitted.load(Ordering::Acquire)==0)
+        Ok(self.admitted.load(Ordering::Acquire))
+    }
+    pub fn drained(&self,receipt:QuiesceReceipt)->Result<bool,RxFenceError>{
+        Ok(self.admitted_in_flight(receipt)?==0)
     }
     /// Resumption rejects an invalid/stale receipt and any in-flight
     /// handler; epoch never wraps and invalidates every former RxPermit.
@@ -268,4 +274,26 @@ mod tests{
         assert_eq!(f.finish_rebind(q),Ok(2));
     }
 
+}
+
+#[cfg(test)]
+mod r123_rx_drain_visibility_tests {
+    use super::*;
+    #[test]
+    fn in_flight_count_is_exact_ring_scoped_and_stale_after_rebind() {
+        let f=NicRxFence::new(23);
+        let foreign=NicRxFence::new(23);
+        let p1=f.try_admit(23).unwrap();
+        let p2=f.try_admit(23).unwrap();
+        let receipt=f.begin_quiesce(23).unwrap();
+        assert_eq!(f.admitted_in_flight(receipt),Ok(2));
+        assert_eq!(f.drained(receipt),Ok(false));
+        assert_eq!(foreign.admitted_in_flight(receipt),Err(RxFenceError::Stale));
+        drop(p1);
+        assert_eq!(f.admitted_in_flight(receipt),Ok(1));
+        drop(p2);
+        assert_eq!(f.admitted_in_flight(receipt),Ok(0));
+        assert_eq!(f.finish_rebind(receipt),Ok(2));
+        assert_eq!(f.admitted_in_flight(receipt),Err(RxFenceError::Stale));
+    }
 }

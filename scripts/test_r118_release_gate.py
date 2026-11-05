@@ -40,7 +40,11 @@ def evidence(checks=None, reviews=None, protection=None, actual_head=SHA,
         {"url": "https://api.github.com/branches/main/protection",
          "required_status_checks": {"strict": True,
                                     "contexts": list(gate.REQUIRED)},
-         "required_pull_request_reviews": {"required_approving_review_count": 1}}
+         "required_pull_request_reviews": {"required_approving_review_count": 1},
+         "enforce_admins": {"enabled": True},
+         "required_conversation_resolution": {"enabled": True},
+         "allow_force_pushes": {"enabled": False},
+         "allow_deletions": {"enabled": False}}
         if protection is None else protection,
         {"head": {"sha": actual_head}, "state": "open", "merged": False,
          "draft": draft, "base": {"ref": base_ref, "sha": "c" * 40}},
@@ -286,3 +290,29 @@ class ReleaseGateTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class R123ProtectionHardeningTests(ReleaseGateTests):
+    def test_admin_bypass_force_push_delete_and_open_threads_fail_closed(self):
+        for field, value in (
+            ("enforce_admins", False),
+            ("required_conversation_resolution", False),
+            ("allow_force_pushes", True),
+            ("allow_deletions", True),
+        ):
+            with self.subTest(field=field):
+                records=list(evidence())
+                records[3][field]["enabled"]=value
+                exit_code, report=self.invoke(iter(records))
+                self.assertEqual(exit_code,1)
+                self.assertEqual(report["branch_protection"],"not-confirmed")
+                self.assertFalse(report["ready"])
+
+    def test_missing_explicit_protection_flags_do_not_pass_as_defaults(self):
+        for missing in ("enforce_admins", "required_conversation_resolution",
+                        "allow_force_pushes", "allow_deletions"):
+            with self.subTest(missing=missing):
+                records=list(evidence())
+                del records[3][missing]
+                code, result=self.invoke(iter(records))
+                self.assertEqual(code,1)
+                self.assertFalse(result["ready"])

@@ -360,3 +360,53 @@ mod r115_namespace_relative_tests {
         assert_eq!(utf8[4], 0x77);
     }
 }
+
+/// R123: derive a canonical child within a caller-provided namespace boundary.
+/// This checks pathname spelling only, NOT the current mount revision or the
+/// caller's filesystem capability. A real VFS must revalidate mount identity
+/// when it resolves/opens the returned path.
+pub fn join_child_under_root(
+    root:&str,parent:&str,child:&str,output:&mut[u8]
+)->Result<Option<usize>,PathError>{
+    if !is_within_tree(parent,root)?{return Ok(None);}
+    let mut candidate=[0u8;256];
+    let written=join_child(parent,child,&mut candidate)?;
+    // Both inputs have already been checked; never expose an output until
+    // all boundary, traversal and capacity checks have succeeded.
+    let canonical=core::str::from_utf8(&candidate[..written])
+        .map_err(|_|PathError::EmbeddedNul)?;
+    if !is_within_tree(canonical,root)?{return Ok(None);}
+    if output.len()<written{return Err(PathError::OutputTooSmall);}
+    output[..written].copy_from_slice(&candidate[..written]);
+    Ok(Some(written))
+}
+
+#[cfg(test)]
+mod r123_namespace_child_tests {
+    use super::*;
+    #[test]
+    fn prefix_bypass_traversal_and_short_output_do_not_mutate_buffer() {
+        let mut out=[0xacu8;32];
+        assert_eq!(join_child_under_root("/team","/teammate","secret",&mut out),Ok(None));
+        assert_eq!(out,[0xac;32]);
+        assert_eq!(join_child_under_root("/team","/team","..",&mut out),
+                   Err(PathError::ParentTraversal));
+        assert_eq!(out,[0xac;32]);
+        let n=join_child_under_root("/team","//team/./docs","report",&mut out)
+            .unwrap().unwrap();
+        assert_eq!(&out[..n],b"/team/docs/report");
+        let mut small=[0x11u8;4];
+        assert_eq!(join_child_under_root("/team","/team","report",&mut small),
+                   Err(PathError::OutputTooSmall));
+        assert_eq!(small,[0x11;4]);
+    }
+    #[test]
+    fn root_boundary_and_utf8_names_are_byte_safe() {
+        let mut out=[0u8;32];
+        let n=join_child_under_root("/","/","alpha",&mut out).unwrap().unwrap();
+        assert_eq!(&out[..n],b"/alpha");
+        let n=join_child_under_root("/docs","/docs","é",&mut out).unwrap().unwrap();
+        assert_eq!(&out[..n],"/docs/é".as_bytes());
+        assert_eq!(join_child_under_root("/docs","/other","note",&mut out),Ok(None));
+    }
+}
