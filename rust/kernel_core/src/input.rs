@@ -1,6 +1,6 @@
 //! R014: bounded polling console input for single-core QEMU/OVMF.
 //! COM1 receives bytes from QEMU -serial stdio; legacy PS/2 set-1 keyboard
-//! is a best-effort secondary source. No keyboard IRQs or SMP yet.
+//! has a physical-only desktop ingress and an optional single-BSP IRQ1 path.
 //! No untrusted byte is interpreted as an escape sequence.
 use core::arch::asm;
 use core::sync::atomic::{AtomicU64,Ordering};
@@ -136,11 +136,39 @@ pub(crate) fn filter(b:u8)->Option<u8>{
         _=>None,
     }
 }
-static mut SCAN:ScanDecoder=ScanDecoder{
+/// A physical transfer was lost. Consumers must reject the current command,
+/// not interpret the remaining bytes as a shortened, valid request.
+pub(crate) const INPUT_LOST:u8=0;
+struct PhysicalDecoder{scan:ScanDecoder,quarantined:bool}
+impl PhysicalDecoder{
+    const fn new()->Self{Self{scan:ScanDecoder{
     shift_left:false,shift_right:false,caps:false,caps_down:false,extended:false,
     ctrl_left:false,ctrl_right:false,alt_left:false,alt_right:false,
     pause_remaining:0
-};
+    },quarantined:false}}
+    fn feed_transfer(&mut self,status:u8,code:u8)->Option<u8>{
+        if status&1==0||status&0x20!=0{return None;}
+        let byte=self.scan.feed_transfer(status,code);
+        if !valid_keyboard_status(status){
+            if self.quarantined{return None;}
+            self.quarantined=true;return Some(INPUT_LOST);
+        }
+        if self.quarantined{
+            if byte==Some(b'\n'){self.quarantined=false;return byte;}
+            return None;
+        }
+        byte
+    }
+}
+static mut PHYSICAL:PhysicalDecoder=PhysicalDecoder::new();
+/// Start a fresh trusted desktop input session with IF=0 on the single BSP.
+/// Discard software input from the old service without consuming AUX data or
+/// changing interrupt/controller configuration. Physical provenance stays live.
+pub(crate) fn reset_physical_session(){
+    unsafe{PHYSICAL=PhysicalDecoder::new();}
+    #[cfg(feature="test-irq-keyboard")]
+    unsafe{QUEUE=KeyboardQueue::new();}
+}
 /// Counts physical bytes AFTER a valid 8042 keyboard make-code has been
 /// consumed. Serial/UART input does not affect this counter.
 static PS2_KEYS_ACCEPTED:AtomicU64=AtomicU64::new(0);
@@ -167,14 +195,39 @@ fn mark_physical_key(byte:u8)->u8{
 fn valid_keyboard_status(status:u8)->bool{
     status&0x01!=0 && status&0xe0==0 // OBF, !AUX, !timeout, !parity
 }
-#[cfg(feature="test-irq-keyboard")]
+#[cfg(any(test,feature="test-irq-keyboard"))]
 const QUEUE_SIZE:usize=128;
+#[cfg(any(test,feature="test-irq-keyboard"))]
+struct KeyboardQueue{bytes:[u8;QUEUE_SIZE],read:usize,write:usize,quarantined:bool}
+#[cfg(any(test,feature="test-irq-keyboard"))]
+impl KeyboardQueue{
+    const fn new()->Self{Self{bytes:[0;QUEUE_SIZE],read:0,write:0,quarantined:false}}
+    fn push(&mut self,byte:u8){
+        if self.quarantined{
+            if byte!=b'\n'{return;}
+            // A loss marker occupies at most one slot while quarantined.
+            self.bytes[self.write]=byte;self.write=(self.write+1)%QUEUE_SIZE;
+            self.quarantined=false;return;
+        }
+        let next=(self.write+1)%QUEUE_SIZE;
+        if next==self.read{
+            // Never execute an old prefix after silently dropping its suffix
+            // or delimiter. Discard pending text and publish loss explicitly.
+            self.bytes.fill(0);self.read=0;self.write=1;
+            self.bytes[0]=INPUT_LOST;self.quarantined=true;
+            if byte==b'\n'{self.push(byte);}
+            return;
+        }
+        self.bytes[self.write]=byte;self.write=next;
+    }
+    fn pop(&mut self)->Option<u8>{
+        if self.read==self.write{return None;}
+        let byte=self.bytes[self.read];self.bytes[self.read]=0;
+        self.read=(self.read+1)%QUEUE_SIZE;Some(byte)
+    }
+}
 #[cfg(feature="test-irq-keyboard")]
-static mut QUEUE:[u8;QUEUE_SIZE]=[0;QUEUE_SIZE];
-#[cfg(feature="test-irq-keyboard")]
-static mut READ_INDEX:usize=0;
-#[cfg(feature="test-irq-keyboard")]
-static mut WRITE_INDEX:usize=0;
+static mut QUEUE:KeyboardQueue=KeyboardQueue::new();
 #[cfg(feature="test-irq-keyboard")]
 static IRQ_EVENTS:AtomicU64=AtomicU64::new(0);
 #[cfg(feature="test-irq-keyboard")]
@@ -186,22 +239,11 @@ static mut REPORTED_PS2_PENDING:bool=false;
 /// is IRQ1, queue consumer is the READ syscall's synchronous trap handler.
 #[cfg(feature="test-irq-keyboard")]
 fn enqueue(ch:u8) {
-    unsafe{
-        let next=(WRITE_INDEX+1)%QUEUE_SIZE;
-        if next!=READ_INDEX{
-            QUEUE[WRITE_INDEX]=ch;
-            WRITE_INDEX=next;
-        }
-    }
+    unsafe{(&mut *core::ptr::addr_of_mut!(QUEUE)).push(ch);}
 }
 #[cfg(feature="test-irq-keyboard")]
 fn dequeue()->Option<u8>{
-    unsafe{
-        if READ_INDEX==WRITE_INDEX{return None;}
-        let byte=QUEUE[READ_INDEX];
-        READ_INDEX=(READ_INDEX+1)%QUEUE_SIZE;
-        Some(byte)
-    }
+    unsafe{(&mut *core::ptr::addr_of_mut!(QUEUE)).pop()}
 }
 #[cfg(feature="test-irq-keyboard")]
 fn io_wait(){unsafe{outb(0x80,0)}}
@@ -329,7 +371,7 @@ pub(crate) fn enable_irq1()->bool{
         let _=unsafe{inb(PS2_DATA)};
     }
     // Scan codes arriving through the PS/2 controller must be read by IRQ1.
-    unsafe{READ_INDEX=0;WRITE_INDEX=0;IRQ_ACTIVE=true;}
+    unsafe{QUEUE=KeyboardQueue::new();PHYSICAL=PhysicalDecoder::new();IRQ_ACTIVE=true;}
     IRQ_EVENTS.store(0,Ordering::Relaxed);
     true
 }
@@ -345,7 +387,7 @@ pub extern "C" fn x86_64_keyboard_irq_dispatch(){
     let status=unsafe{inb(PS2_STATUS)};
     if status&1!=0&&status&0x20==0 {
         let code=unsafe{inb(PS2_DATA)};
-        if let Some(ch)=unsafe{(&mut *core::ptr::addr_of_mut!(SCAN)).feed_transfer(status,code)}{
+        if let Some(ch)=unsafe{(&mut *core::ptr::addr_of_mut!(PHYSICAL)).feed_transfer(status,code)}{
             enqueue(ch);
         }
     }
@@ -366,13 +408,24 @@ fn normal_uart_transfer(status:u8,byte:u8)->u8{
 }
 pub(crate) fn poll_byte()->Option<u8>{
     #[cfg(feature="test-irq-keyboard")]
-    if let Some(byte)=dequeue(){return Some(mark_physical_key(byte));}
+    if let Some(byte)=dequeue(){return Some(physical_delivery(byte));}
 
     // Bounded non-blocking UART polling; the shell performs its own wait.
     if unsafe{inb(COM1+5)}&1!=0{
         let b=unsafe{inb(COM1)};
         return filter(b);
     }
+    poll_physical_byte()
+}
+fn physical_delivery(byte:u8)->u8{
+    // Loss notification is not evidence of a successfully accepted make code.
+    if byte==INPUT_LOST{byte}else{mark_physical_key(byte)}
+}
+/// Normal desktop ingress never inspects COM1. Both sources retain their own
+/// byte ownership: AUX remains for Mouse, and an armed IRQ1 owns keyboard reads.
+pub(crate) fn poll_physical_byte()->Option<u8>{
+    #[cfg(feature="test-irq-keyboard")]
+    if let Some(byte)=dequeue(){return Some(physical_delivery(byte));}
     #[cfg(feature="test-irq-keyboard")]
     if unsafe{IRQ_ACTIVE}{
         let status=unsafe{inb(PS2_STATUS)};
@@ -411,8 +464,8 @@ pub(crate) fn poll_byte()->Option<u8>{
     // those bytes and must be able to consume a complete three-byte frame.
     if status&1!=0&&status&0x20==0{
         let code=unsafe{inb(PS2_DATA)};
-        return unsafe{(&mut *core::ptr::addr_of_mut!(SCAN)).feed_transfer(status,code)}
-            .map(mark_physical_key);
+        return unsafe{(&mut *core::ptr::addr_of_mut!(PHYSICAL)).feed_transfer(status,code)}
+            .map(physical_delivery);
     }
     None
 }
@@ -450,18 +503,81 @@ mod tests{
         assert_eq!(keys.feed(0x2a),None);
         assert_eq!(keys.feed(0x1e),Some(b'a'));
     }
-    #[cfg(feature="test-irq-keyboard")]
     #[test]
     fn irq_fifo_wraps_and_never_overwrites(){
-        unsafe{READ_INDEX=0;WRITE_INDEX=0;}
-        for ch in 0..128u8{enqueue(ch);}
+        let mut queue=KeyboardQueue::new();
+        for ch in 0..127u8{queue.push(ch);}
         let mut result=std::vec::Vec::new();
-        while let Some(ch)=dequeue(){result.push(ch);}
+        while let Some(ch)=queue.pop(){result.push(ch);}
         assert_eq!(result.len(),127);
         assert_eq!(result[0],0);
         assert_eq!(result[126],126);
-        assert_eq!(dequeue(),None);
-        enqueue(b'Z');assert_eq!(dequeue(),Some(b'Z'));
+        assert_eq!(queue.pop(),None);
+        queue.push(b'Z');assert_eq!(queue.pop(),Some(b'Z'));
+    }
+    #[test]
+    fn lost_irq_suffix_is_never_replayed_as_a_shortened_command(){
+        for delimiter_at_overflow in [false,true]{
+            let mut queue=KeyboardQueue::new();
+            for _ in 0..127{queue.push(b'x');}
+            queue.push(if delimiter_at_overflow{b'\n'}else{b'e'});
+            assert_eq!(queue.pop(),Some(INPUT_LOST));
+            if !delimiter_at_overflow{
+                for &byte in b"write forged\x08\t"{queue.push(byte);}
+                assert_eq!(queue.pop(),None);
+                queue.push(b'\n');
+            }
+            assert_eq!(queue.pop(),Some(b'\n'));
+            assert_eq!(queue.pop(),None);
+            for &byte in b"cat\n"{queue.push(byte);}
+            for &byte in b"cat\n"{assert_eq!(queue.pop(),Some(byte));}
+            assert_eq!(queue.pop(),None);
+        }
+    }
+    #[test]
+    fn queue_overflow_after_partial_consume_scrubs_old_and_new_fragments(){
+        let mut queue=KeyboardQueue::new();
+        for _ in 0..100{queue.push(b'a');}
+        for _ in 0..80{assert_eq!(queue.pop(),Some(b'a'));}
+        for _ in 0..108{queue.push(b'b');}
+        assert_eq!(queue.pop(),Some(INPUT_LOST));
+        assert_eq!(queue.pop(),None);
+        queue.push(b'\n');assert_eq!(queue.pop(),Some(b'\n'));
+        // A second loss, even before draining the new marker, stays bounded.
+        for _ in 0..256{queue.push(b'c');}
+        queue.push(b'\n');
+        assert_eq!(queue.pop(),Some(INPUT_LOST));
+        assert_eq!(queue.pop(),Some(b'\n'));assert_eq!(queue.pop(),None);
+    }
+    #[test]
+    fn physical_corruption_cancels_text_until_an_unmodified_enter(){
+        for bad in [0x41,0x81,0xc1]{
+            let mut decoder=PhysicalDecoder::new();
+            assert_eq!(decoder.feed_transfer(1,0x11),Some(b'w'));
+            assert_eq!(decoder.feed_transfer(bad,0x13),Some(INPUT_LOST));
+            assert_eq!(decoder.feed_transfer(bad,0x13),None);
+            for code in [0x17,0x14,0x12,0x39,0x10,0x0e,0x0f]{
+                assert_eq!(decoder.feed_transfer(1,code),None);
+            }
+            assert_eq!(decoder.feed_transfer(1,0x1d),None); // Ctrl press
+            assert_eq!(decoder.feed_transfer(1,0x1c),None); // modified Enter
+            assert_eq!(decoder.feed_transfer(1,0x9d),None);
+            assert_eq!(decoder.feed_transfer(1,0x1c),Some(b'\n'));
+            assert_eq!(decoder.feed_transfer(1,0x1e),Some(b'a'));
+        }
+    }
+    #[test]
+    fn auxiliary_or_empty_transfers_cannot_poison_or_end_keyboard_quarantine(){
+        let mut decoder=PhysicalDecoder::new();
+        for status in [0,0x40,0x80,0x21,0x61,0xa1,0xe1]{
+            assert_eq!(decoder.feed_transfer(status,0x1c),None);
+        }
+        assert_eq!(decoder.feed_transfer(1,0x1e),Some(b'a'));
+        assert_eq!(decoder.feed_transfer(0x81,0x1e),Some(INPUT_LOST));
+        for status in [0,0x21,0xe1]{assert_eq!(decoder.feed_transfer(status,0x1c),None);}
+        assert_eq!(decoder.feed_transfer(1,0x1e),None);
+        assert_eq!(decoder.feed_transfer(1,0x1c),Some(b'\n'));
+        assert_eq!(decoder.feed_transfer(1,0x1e),Some(b'a'));
     }
     #[test]
     fn m1_r047_ctrl_and_alt_cannot_inject_unmodified_desktop_hotkeys(){

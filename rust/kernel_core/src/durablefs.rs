@@ -393,6 +393,11 @@ impl<D:BlockDevice> DurableFs<D>{
     /// A degraded volume must be explicitly repaired instead of receiving
     /// a misleading 'synced' response. No automatic repair or format.
     pub fn sync(&mut self)->Result<(),FsError>{
+        let result=self.sync_verified();
+        if result.is_err(){self.retired.set(true);}
+        result
+    }
+    fn sync_verified(&mut self)->Result<(),FsError>{
         self.check_heads()?;
         let before=self.mounted_health()?;
         if before.redundancy!=Redundancy::Healthy{
@@ -1691,6 +1696,47 @@ mod tests{
         // An explicit new mount verifies the checkpoint before readback.
         let mut remounted=DurableFs::mount(fs.into_device()).unwrap();
         assert_eq!(get(&mut remounted,"/data"),b"persist");
+    }
+    #[test]fn storage_retirement_sync_verification_failures_revoke_every_io_boundary(){
+        struct FaultDisk{disk:Disk,reads:usize,fail_at:Option<usize>,flushes:usize}
+        impl BlockDevice for FaultDisk{
+            fn sector_count(&self)->u64{self.disk.sector_count()}
+            fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+             ->Result<(),BlockError>{
+                let index=self.reads;self.reads+=1;
+                if self.fail_at==Some(index){return Err(BlockError::Io);}
+                self.disk.read_sector(lba,out)
+            }
+            fn write_sector(&mut self,lba:u64,bytes:&[u8;SECTOR_BYTES])
+             ->Result<(),BlockError>{self.disk.write_sector(lba,bytes)}
+            fn sync(&mut self)->Result<(),BlockError>{self.flushes+=1;Ok(())}
+        }
+        let mut initial=DurableFs::format_blank(blank()).unwrap();
+        initial.create_path("/data",&[0x63;700]).unwrap();
+        let image=initial.into_device();
+        let make=||DurableFs::mount(FaultDisk{disk:image.clone(),reads:0,
+            fail_at:None,flushes:0}).unwrap();
+        let mut healthy=make();let start=healthy.disk.reads;
+        assert_eq!(healthy.sync(),Ok(()));
+        let boundaries=healthy.disk.reads-start;assert!(boundaries>4);
+        for offset in 0..boundaries{
+            let mut fs=make();let writes=fs.disk.disk.writes;
+            fs.disk.fail_at=Some(fs.disk.reads+offset);
+            assert_eq!(fs.sync(),Err(FsError::Io),"read boundary {offset}");
+            fs.disk.fail_at=None;
+            let reads=fs.disk.reads;let flushes=fs.disk.flushes;
+            let mut out=[0xa5;MAX_FILE_BYTES];
+            assert_eq!(fs.read_path("/data",&mut out),Err(FsError::InvalidVolume));
+            assert_eq!(fs.overwrite_path("/data",b"must not write"),Err(FsError::InvalidVolume));
+            assert_eq!(fs.sync(),Err(FsError::InvalidVolume));
+            assert_eq!(out,[0xa5;MAX_FILE_BYTES]);
+            assert_eq!((fs.disk.reads,fs.disk.disk.writes,fs.disk.flushes),
+                (reads,writes,flushes));
+            let mut remounted=DurableFs::mount(fs.into_device()).unwrap();
+            assert_eq!(remounted.read_path("/data",&mut out),Ok(700));
+            assert_eq!(&out[..700],&[0x63;700]);
+            assert_eq!(remounted.sync(),Ok(()));
+        }
     }
     #[test]fn m1_r088_sync_only_acknowledges_true_flush_and_preserves_content(){
         struct Flushable{disk:Disk,flushed:std::rc::Rc<std::cell::Cell<u32>>,fail:bool}

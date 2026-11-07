@@ -20,9 +20,9 @@ use crate::syscall::{SyscallRequest,indianos_syscall_validate,ring3_frame_valid,
 use crate::program::indianos_program_user_range;
 use crate::boot::Region;
 use crate::user_image::{indianos_user_can_write,indianos_user_copy_writable};
-#[cfg(any(feature="test-interactive",feature="normal-init"))]
+#[cfg(any(any(feature="test-interactive",feature="normal-desktop"),feature="normal-init"))]
 use crate::input;
-#[cfg(feature="test-ipc")]
+#[cfg(any(feature="test-ipc",feature="normal-desktop"))]
 use crate::ipc::{IpcRouter,IpcError};
 #[cfg(feature="test-r025")]
 use crate::r025_services::{R025Services,FILE_BASE,MAX_FILE_TRANSFER};
@@ -30,11 +30,11 @@ const PHYS:u64=0x000f_ffff_ffff_f000;
 const PAGE:u64=4096;
 const YIELD:u64=0x200;
 const WORDS:usize=20;
-#[cfg(feature="test-r031-supervisor")]
+#[cfg(any(feature="test-r031-supervisor",feature="normal-desktop"))]
 const TASKS:usize=4;
-#[cfg(all(feature="test-r029-desktop-suite",not(feature="test-r031-supervisor")))]
+#[cfg(all(any(feature="test-r029-desktop-suite",feature="normal-desktop"),not(any(feature="test-r031-supervisor",feature="normal-desktop"))))]
 const TASKS:usize=3;
-#[cfg(not(feature="test-r029-desktop-suite"))]
+#[cfg(not(any(feature="test-r029-desktop-suite",feature="normal-desktop")))]
 const TASKS:usize=2;
 const BAD:u64=u64::MAX;
 #[repr(C)]
@@ -44,53 +44,88 @@ struct Task{
  image:UserImage,root:CloneResult,pcb:*mut Process,
  frame:[u64;WORDS],saved:bool,attached:bool,timer_preemptions:u32,
  authority_live:bool,
- #[cfg(feature="test-r031-vfs")]
+ #[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
  file_generation:u64,
- #[cfg(feature="test-ipc")]
+ #[cfg(any(feature="test-ipc",feature="normal-desktop"))]
  ipc_wait:crate::ipc::ReceiveWait,
 }
-#[cfg(feature="test-r029-desktop-suite")]
+#[cfg(any(feature="test-r029-desktop-suite",feature="normal-desktop"))]
 static mut THIRD_ELF:(*const u8,usize)=(ptr::null(),0);
+#[cfg(feature="normal-desktop")]
+static mut COMPOSITOR_ELF:(*const u8,usize)=(ptr::null(),0);
 static mut ACTIVE_USER:*mut UserImage=ptr::null_mut();
 // R013: tightly gated and single-core. Only PID 1 can request worker 1.
-#[cfg(feature="test-shell")]
+#[cfg(any(feature="test-shell",feature="normal-desktop"))]
 static mut ACTIVE_PID:u32=0;
-#[cfg(feature="test-shell")]
+#[cfg(any(feature="test-shell",feature="normal-desktop"))]
 static mut PENDING_WORKER:bool=false;
-#[cfg(feature="test-shell")]
+#[cfg(any(feature="test-shell",feature="normal-desktop"))]
 #[no_mangle]
 pub extern "C" fn indianos_r013_take_worker_request()->bool {
  unsafe {let requested=PENDING_WORKER;PENDING_WORKER=false;requested}
 }
 static mut ACTIVE_TASK:*mut Task=ptr::null_mut();
 static mut ACTIVE_PROCESS:*mut Process=ptr::null_mut();
-#[cfg(feature="test-r031-vfs")]
+#[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
 static mut R031_HANDLES:crate::fs_handles::FileHandles=
     crate::fs_handles::FileHandles::new();
+/// Boot-only admission: the configuration carries exact GPT identity, never
+/// a request to select or format the first available disk.
+#[cfg(feature="normal-desktop")]
+pub(crate) fn runtime_prepare_selected_volume(expected:crate::m1_partition::GptSelection)->bool{
+ if !active_image().is_null()||unsafe{SESSION_DIRTY}{return false;}
+ let Ok(mut disk)=(unsafe{crate::ata_pio::AtaPio::probe()})else{return false;};
+ let Ok(receipt)=crate::m1_partition::inspect_partition_receipt(&mut disk,expected.partition.index)
+  else{return false;};
+ if receipt.gpt!=Some(expected){return false;}
+ crate::fs_handles::prepare_selected_volume_kernel(
+  unsafe{&mut *ptr::addr_of_mut!(R031_HANDLES)},&mut disk,receipt).is_ok()
+}
+/// A retry is issued only by a completed, verified rollback of a user
+/// service failure. Consuming it before I/O makes every other failure closed.
+#[cfg(feature="normal-desktop")]
+static mut DESKTOP_RESTART_SAFE:bool=false;
+#[cfg(feature="normal-desktop")]
+fn take_desktop_restart_permission()->bool{
+ let allowed=unsafe{core::mem::replace(&mut *ptr::addr_of_mut!(DESKTOP_RESTART_SAFE),false)};
+ allowed&&active_image().is_null()&&active_task().is_null()&&!unsafe{SESSION_DIRTY}
+}
+#[cfg(feature="normal-desktop")]
+pub(crate) fn runtime_revalidate_desktop_restart(
+ expected:crate::m1_partition::GptSelection)->bool{
+ if !take_desktop_restart_permission(){return false;}
+ let Ok(_permit)=r120_enter()else{return false;};
+ let Ok(mut disk)=(unsafe{crate::ata_pio::AtaPio::probe()})else{return false;};
+ let Ok(receipt)=crate::m1_partition::inspect_partition_receipt(&mut disk,expected.partition.index)
+  else{return false;};
+ if receipt.gpt!=Some(expected){return false;}
+ crate::fs_handles::revalidate_retired_selected_volume(
+  unsafe{&*ptr::addr_of!(R031_HANDLES)},&mut disk,receipt).is_ok()
+}
 /// Trusted process lifecycle events (single-core kernel context).
 /// Events carry the authenticated PCB PID and its current file incarnation.
-#[cfg(feature="test-r031-vfs")]
+#[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
 static mut R114_FILE_EVENTS:crate::process_events::ProcessEvents<16>=
     crate::process_events::ProcessEvents::new();
 /// One-BSP, exclusive INT 0x80 local transport. Reset on session rollback.
-#[cfg(feature="test-r031-files-gui")]
+#[cfg(any(feature="test-r031-files-gui",feature="normal-desktop"))]
 static mut R114_LOCAL_UDP:crate::network::EpochUdpEndpoints<2,8>=
     crate::network::EpochUdpEndpoints::new();
 // The same kernel-only owner table is now consulted by real ring-3 local
 // socket syscalls, ingress authorization and process retirement.
-#[cfg(feature="test-r031-files-gui")]
+#[cfg(any(feature="test-r031-files-gui",feature="normal-desktop"))]
 static mut R115_UDP_OWNERS:crate::udp_owner_epoch::Registry<2>=
     crate::udp_owner_epoch::Registry::new();
 /// The authenticated R120 ring-3 process and live-socket authority owner.
 /// FileHandles is the trusted globally monotonic PID-generation allocator.
 /// This is single-BSP state: interrupts and other CPUs must never mutate it.
-#[cfg(feature="test-r031-files-gui")]
+#[cfg(any(feature="test-r031-files-gui",feature="normal-desktop"))]
 static mut R120_RETIREMENT:crate::process_retirement_txn::ProcessRetirement<2,2,16>=
     crate::process_retirement_txn::ProcessRetirement::new();
-#[cfg(feature="test-r031-files-gui")]
+#[cfg(any(feature="test-r031-files-gui",feature="normal-desktop"))]
 static R120_GATE:crate::retirement_gate::RetirementGate=
     crate::retirement_gate::RetirementGate::new();
-#[cfg(feature="test-r031-files-gui")]
+#[cfg(any(feature="test-r031-files-gui",feature="normal-desktop"))]
 fn r120_cpu_id()->u32{
     // A host test thread can migrate; tests use a stable synthetic BSP ID
     // and separately verify wrong-core rejection with explicit IDs.
@@ -111,7 +146,7 @@ fn r120_cpu_id()->u32{
         (unsafe{__cpuid(1)}.ebx>>24)&255
     }
 }
-#[cfg(feature="test-r031-files-gui")]
+#[cfg(any(feature="test-r031-files-gui",feature="normal-desktop"))]
 fn r120_masked()->bool{
     #[cfg(test)]{true}
     #[cfg(not(test))]{
@@ -120,17 +155,17 @@ fn r120_masked()->bool{
         flags&(1<<9)==0
     }
 }
-#[cfg(feature="test-r031-files-gui")]
+#[cfg(any(feature="test-r031-files-gui",feature="normal-desktop"))]
 fn r120_setup()->bool{
     R120_GATE.register_bsp(r120_cpu_id(),r120_masked()).is_ok()
 }
-#[cfg(feature="test-r031-files-gui")]
+#[cfg(any(feature="test-r031-files-gui",feature="normal-desktop"))]
 fn r120_enter()->Result<crate::retirement_gate::Permit<'static>,
                        crate::retirement_gate::GateError>{
     #[cfg(test)]{let _=r120_setup();}
     R120_GATE.try_enter(r120_cpu_id(),r120_masked())
 }
-#[cfg(feature="test-r031-files-gui")]
+#[cfg(any(feature="test-r031-files-gui",feature="normal-desktop"))]
 fn r120_halt()->!{
     log(b"IndianOS: FATAL R120 retirement contention, no frame reclamation\n\0");
     #[cfg(test)]panic!("R120 retirement gate/transaction refused");
@@ -138,11 +173,11 @@ fn r120_halt()->!{
 }
 // R116: trusted kernel issues PID2 a narrow read-only directory lease only
 // after both process incarnations have been authenticated by FileHandles.
-#[cfg(feature="test-r031-files-gui")]
+#[cfg(any(feature="test-r031-files-gui",feature="normal-desktop"))]
 static mut R116_SHARED_LEASES:crate::agent_03_cap_epoch::LeaseTable<2>=
     crate::agent_03_cap_epoch::LeaseTable::new();
 
-#[cfg(feature="test-r031-files-gui")]
+#[cfg(any(feature="test-r031-files-gui",feature="normal-desktop"))]
 fn r116_prepare_shared_directory_lease(
     owner:crate::batch5_session::Identity
 )->bool{
@@ -173,7 +208,7 @@ fn r116_prepare_shared_directory_lease(
 /// file descriptor cannot select a consumer; the current exact FileHandles
 /// incarnation is required, and failed verification never dequeues events.
 /// This queue is single-BSP syscall context, NOT interrupt- or SMP-safe.
-#[cfg(feature="test-r031-vfs")]
+#[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
 pub(crate) fn peek_pid1_lifecycle_receipt(
     consumer:crate::batch5_session::Identity,
 )->Result<crate::process_events::EventReceipt,()>{
@@ -183,7 +218,7 @@ pub(crate) fn peek_pid1_lifecycle_receipt(
     }
     unsafe{(&*ptr::addr_of!(R114_FILE_EVENTS))}.peek_receipt().ok_or(())
 }
-#[cfg(feature="test-r031-vfs")]
+#[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
 pub(crate) fn consume_pid1_lifecycle_receipt(
     consumer:crate::batch5_session::Identity,
     expected:crate::process_events::EventReceipt,
@@ -196,7 +231,7 @@ pub(crate) fn consume_pid1_lifecycle_receipt(
     queue.acknowledge_receipt(expected).ok_or(())
 }
 
-#[cfg(feature="test-r031-vfs")]
+#[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
 fn authenticated_file_identity()->Option<crate::batch5_session::Identity>{
     let process=unsafe{ptr::read(ptr::addr_of!(ACTIVE_PROCESS))};
     let task=active_task();
@@ -212,22 +247,22 @@ fn authenticated_file_identity()->Option<crate::batch5_session::Identity>{
     let owner=crate::batch5_session::Identity{pid:p.pid,generation:t.file_generation};
     unsafe{(&*ptr::addr_of!(R031_HANDLES)).owns(owner)}.then_some(owner)
 }
-#[cfg(feature="test-r031-vfs")]
+#[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
 fn authenticated_file_pid()->Option<u32>{
     authenticated_file_identity().map(|owner|owner.pid)
 }
-#[cfg(feature="test-r026")]
+#[cfg(any(feature="test-r026",feature="normal-desktop"))]
 static mut R026_WORKER_REQUESTED:bool=false;
-#[cfg(feature="test-r026")]
+#[cfg(any(feature="test-r026",feature="normal-desktop"))]
 static mut R026_WORKER_REAPED:bool=false;
 // Quantum jobs belong to kernel-verified process IDs, not user-provided IDs.
 // Single-core runtime only; do not access this from interrupt context.
 static mut QUANTUM_JOBS:crate::quantum_service::QuantumService=
     crate::quantum_service::QuantumService::new();
 // Two scheduler-authenticated process mailboxes, off in normal boots.
-#[cfg(feature="test-ipc")]
+#[cfg(any(feature="test-ipc",feature="normal-desktop"))]
 static mut IPC_ROUTER:Option<IpcRouter<4,8>>=None;
-#[cfg(feature="test-ipc")]
+#[cfg(any(feature="test-ipc",feature="normal-desktop"))]
 fn router()->Option<&'static mut IpcRouter<4,8>>{
     // Single BSP; INT 0x80 interrupt gate masks CPU interrupts.
     // No SMP or nested use of this non-atomic router is permitted.
@@ -240,17 +275,17 @@ fn services()->Option<&'static mut R025Services>{
     // Single-BSP INT 0x80 interrupt gate. No IRQ/SMP caller.
     unsafe{(&mut *ptr::addr_of_mut!(R025_SERVICES)).as_mut()}
 }
-#[cfg(feature="test-r029-userspace")]
+#[cfg(any(feature="test-r029-userspace",feature="normal-desktop"))]
 fn authenticated_gui_pid()->Option<u32>{
     let process=unsafe{ptr::read(ptr::addr_of!(ACTIVE_PROCESS))};
     let p=unsafe{process.as_ref()}?;
     if p.state!=3||unsafe{ACTIVE_PID}!=p.pid{return None;}
-    #[cfg(feature="test-r029-multiprocess")]
+    #[cfg(any(feature="test-r029-multiprocess",feature="normal-desktop"))]
     {
         let task=active_task();
         let image=active_image();
-        if !(1..=if cfg!(feature="test-r031-supervisor"){4}
-                  else if cfg!(feature="test-r029-desktop-suite"){3}else{2})
+        if !(1..=if cfg!(any(feature="test-r031-supervisor",feature="normal-desktop")){4}
+                  else if cfg!(any(feature="test-r029-desktop-suite",feature="normal-desktop")){3}else{2})
             .contains(&p.pid)||task.is_null()||image.is_null(){
             return None;
         }
@@ -260,11 +295,11 @@ fn authenticated_gui_pid()->Option<u32>{
             return None;
         }
     }
-    #[cfg(not(feature="test-r029-multiprocess"))]
+    #[cfg(not(any(feature="test-r029-multiprocess",feature="normal-desktop")))]
     if p.pid!=1||!active_task().is_null(){return None;}
     Some(p.pid)
 }
-#[cfg(feature="test-ipc")]
+#[cfg(any(feature="test-ipc",feature="normal-desktop"))]
 fn authenticated_ipc_pid()->Option<u32>{
     let process=unsafe{ptr::read(ptr::addr_of!(ACTIVE_PROCESS))};
     let task=active_task();
@@ -278,7 +313,7 @@ fn authenticated_ipc_pid()->Option<u32>{
     }
     Some(p.pid)
 }
-#[cfg(feature="test-r026")]
+#[cfg(any(feature="test-r026",feature="normal-desktop"))]
 fn authenticated_r026_init()->bool{
     let pcb=unsafe{ptr::read(ptr::addr_of!(ACTIVE_PROCESS))};
     let task=active_task();
@@ -418,9 +453,9 @@ pub unsafe extern "C" fn x86_64_scheduler_apic_timer_dispatch(regs:*const u64){
 pub extern "C" fn x86_64_user_fault_handle(vector:u64,cs:u64,error:u64,cr2:u64){
  if !indianos_user_fault_eligible(vector,cs,error,!active_image().is_null()){return;}
  unsafe{LAST_VECTOR=vector;LAST_ERROR=error;LAST_ADDRESS=cr2;}
- fault_hex(b"IndianOS: fault vector=0x\\0",vector);
- fault_hex(b"IndianOS: fault error=0x\\0",error);
- fault_hex(b"IndianOS: fault CR2=0x\\0",cr2);
+ fault_hex(b"IndianOS: fault vector=0x\0",vector);
+ fault_hex(b"IndianOS: fault error=0x\0",error);
+ fault_hex(b"IndianOS: fault CR2=0x\0",cr2);
  match vector{
   14=>log(b"IndianOS: isolated ring-3 page fault\n\0"),
   13=>log(b"IndianOS: isolated ring-3 general protection fault\n\0"),
@@ -459,7 +494,7 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
  }
  if !unsafe{indianos_syscall_validate(ptr::addr_of!((*img).plan),request)}{return BAD;}
  match request.number{
-  #[cfg(feature="test-r029-userspace")]
+  #[cfg(any(feature="test-r029-userspace",feature="normal-desktop"))]
   18=>{
    let Some(pid)=authenticated_gui_pid()else{return BAD;};
    let mut command=[0u8;64];
@@ -467,12 +502,12 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
        command.as_mut_ptr().cast(),command.len())}{return BAD;}
    if crate::gui::user_surface_submit(pid,&command){0}else{BAD}
   },
-  #[cfg(feature="test-r029-userspace")]
+  #[cfg(all(feature="test-r029-userspace",not(feature="normal-desktop")))]
   19=>{
    let Some(pid)=authenticated_gui_pid()else{return BAD;};
    if crate::gui::user_surface_focus(pid,request.arg0 as u32){0}else{BAD}
   },
-  #[cfg(feature="test-r029-userspace")]
+  #[cfg(any(feature="test-r029-userspace",feature="normal-desktop"))]
   20=>{
    let Some(pid)=authenticated_gui_pid()else{return BAD;};
    crate::gui::user_surface_status(pid).unwrap_or(BAD)
@@ -484,27 +519,27 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
    let state=unsafe{SUPERVISED_TERMINAL.active_pid()};
    state.unwrap_or(0) as u64
   },
-  #[cfg(feature="test-r031-boot-desktop")]
+  #[cfg(any(feature="test-r031-boot-desktop",feature="normal-desktop"))]
   25=>{
    let Some(pid)=authenticated_gui_pid()else{return BAD;};
    crate::gui::user_desktop_pump(pid).unwrap_or(BAD)
   },
-  #[cfg(feature="test-r029-desktop-suite")]
+  #[cfg(all(feature="test-r029-desktop-suite",not(feature="normal-desktop")))]
   24=>{
    let Some(pid)=authenticated_gui_pid()else{return BAD;};
    if crate::gui::user_desktop_action(pid,request.arg0 as u32){0}else{BAD}
   },
-  #[cfg(feature="test-r029-frame-server")]
+  #[cfg(all(feature="test-r029-frame-server",not(feature="normal-desktop")))]
   22=>{
    let Some(pid)=authenticated_gui_pid()else{return BAD;};
    crate::gui::user_frame_state(pid).unwrap_or(BAD)
   },
-  #[cfg(feature="test-r029-frame-server")]
+  #[cfg(all(feature="test-r029-frame-server",not(feature="normal-desktop")))]
   23=>{
    let Some(pid)=authenticated_gui_pid()else{return BAD;};
    if crate::gui::user_frame_present(pid,request.arg0 as u32){0}else{BAD}
   },
-  #[cfg(feature="test-r029-userspace")]
+  #[cfg(any(feature="test-r029-userspace",feature="normal-desktop"))]
   21=>{
    let Some(pid)=authenticated_gui_pid()else{return BAD;};
    // Validate writable destination before peek; copy before acknowledge.
@@ -579,7 +614,7 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
     _=>BAD,
    }
   },
-  #[cfg(feature="test-ipc")]
+  #[cfg(any(feature="test-ipc",feature="normal-desktop"))]
   8=>{
    // Wire packet: destination u32 little-endian, then 0..64 payload bytes.
    // User cannot specify sender; we authenticate against the active PCB.
@@ -606,7 +641,7 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
     Ok(())=>0, Err(_)=>BAD,
    }
   },
-  #[cfg(feature="test-ipc")]
+  #[cfg(any(feature="test-ipc",feature="normal-desktop"))]
   9=>{
    // Out: sender u32 + payload length u32 + 64 zero-padded bytes.
    // Check *entire* writable buffer BEFORE removing any queued message.
@@ -626,7 +661,7 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
     Err(_)=>BAD,
    }
   },
-  #[cfg(feature="test-ipc")]
+  #[cfg(any(feature="test-ipc",feature="normal-desktop"))]
   35=>{
    let Some(receiver)=authenticated_ipc_pid()else{return BAD;};
    if !unsafe{indianos_user_can_write(&*img,request.arg0,
@@ -701,18 +736,42 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
    }
   },
   0=>1,
-  #[cfg(any(feature="test-interactive",feature="normal-init"))]
+  #[cfg(feature="normal-desktop")]
+  37=>{
+   let Some(pid)=authenticated_gui_pid()else{return BAD;};
+   if pid!=4{return BAD;}
+   match request.arg0{
+    0=>{
+     if !unsafe{indianos_user_can_write(&*img,request.arg1,64)}{return BAD;}
+     let Some(state)=crate::gui::desktop_window_query(pid)else{return BAD;};
+     if unsafe{indianos_user_copy_writable(&*img,request.arg1,state.as_ptr(),64)}{0}else{BAD}
+    },
+    1=>{
+     let mut state=[0u8;64];
+     if !unsafe{indianos_user_copy_readonly(img,request.arg1,state.as_mut_ptr().cast(),64)}{
+      return BAD;
+     }
+     if crate::gui::desktop_window_apply(pid,&state){0}else{BAD}
+    },
+    _=>BAD,
+   }
+  },
+  #[cfg(any(any(feature="test-interactive",feature="normal-desktop"),feature="normal-init"))]
   6=>{
-   #[cfg(feature="test-r029-multiprocess")]
+   #[cfg(feature="normal-desktop")]
+   if authenticated_gui_pid()!=Some(1){return BAD;}
+   #[cfg(any(feature="test-r029-multiprocess",feature="normal-desktop"))]
    if authenticated_gui_pid().is_none(){return BAD;}
-   #[cfg(all(not(feature="test-r029-multiprocess"),feature="test-shell"))]
+   #[cfg(all(not(any(feature="test-r029-multiprocess",feature="normal-desktop")),any(feature="test-shell",feature="normal-desktop")))]
    if unsafe{ACTIVE_PID}!=1{return BAD;}
-   #[cfg(all(feature="normal-init",not(feature="test-shell")))]
+   #[cfg(all(feature="normal-init",not(any(feature="test-shell",feature="normal-desktop"))))]
    if unsafe{ACTIVE_PROCESS.as_ref()}.is_none_or(|p|p.pid!=1||p.state!=3){return BAD;}
    if !unsafe{indianos_user_can_write(&*img,request.arg0,1)}{return BAD;}
-   #[cfg(feature="normal-init")]
+   #[cfg(all(feature="normal-init",not(feature="normal-desktop")))]
    let byte=input::normal_boot_byte();
-   #[cfg(not(feature="normal-init"))]
+   #[cfg(feature="normal-desktop")]
+   let byte=input::poll_physical_byte();
+   #[cfg(not(any(feature="normal-init",feature="normal-desktop")))]
    let byte=input::poll_byte();
    let Some(byte)=byte else{return 0;};
    if !unsafe{indianos_user_copy_writable(&*img,request.arg0,&byte,1)}{
@@ -722,13 +781,13 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
    input::echo(byte);
    1
   },
-  #[cfg(feature="test-shell")]
+  #[cfg(any(feature="test-shell",feature="normal-desktop"))]
   4=>unsafe{ACTIVE_PID as u64},
-  #[cfg(all(feature="test-ipc",not(feature="test-shell")))]
+  #[cfg(all(any(feature="test-ipc",feature="normal-desktop"),not(any(feature="test-shell",feature="normal-desktop"))))]
   4=>authenticated_ipc_pid().map_or(BAD,u64::from),
-  #[cfg(all(feature="normal-init",not(any(feature="test-shell",feature="test-ipc"))))]
+  #[cfg(all(feature="normal-init",not(any(any(feature="test-shell",feature="normal-desktop"),any(feature="test-ipc",feature="normal-desktop")))))]
   4=>unsafe{ACTIVE_PROCESS.as_ref()}.filter(|p|p.state==3).map_or(BAD,|p|p.pid as u64),
-  #[cfg(all(feature="test-shell",feature="test-r026"))]
+  #[cfg(all(any(feature="test-shell",feature="normal-desktop"),any(feature="test-r026",feature="normal-desktop")))]
   5=>{
    // PID1 is the only service manager. Grant exactly one worker lifetime.
    if unsafe{ACTIVE_PID}!=1 || !authenticated_r026_init(){return BAD;}
@@ -745,7 +804,7 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
    log(b"IndianOS: R026 /bin/worker launch granted to PID1\n\0");
    0
   },
-  #[cfg(all(feature="test-shell",not(feature="test-r026")))]
+  #[cfg(all(any(feature="test-shell",feature="normal-desktop"),not(any(feature="test-r026",feature="normal-desktop"))))]
   5=>{
    unsafe{
     if ACTIVE_PID!=1||PENDING_WORKER{return BAD;}
@@ -794,7 +853,7 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
     _=>BAD
    }
   },
-  #[cfg(feature="test-r031-vfs")]
+  #[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
   32=>{
    if !authenticated_r026_init(){return BAD;}
    // Descriptor: path[24], new_path[24], user_buffer u64, bytes u64.
@@ -804,7 +863,7 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
    if !unsafe{indianos_user_copy_readonly(img,request.arg1,
         desc.as_mut_ptr().cast(),desc.len())}{return BAD;}
    let Some(n1)=desc[..24].iter().position(|&b|b==0)else{return BAD;};
-   if (n1<2 && !(request.arg0==8 && n1==1 && desc[0]==b'/')) ||
+   if (n1<2 && !(matches!(request.arg0,8|12) && n1==1 && desc[0]==b'/')) ||
       desc[n1..24].iter().any(|&b|b!=0){return BAD;}
    let Ok(path)=core::str::from_utf8(&desc[..n1])else{return BAD;};
    let (target,offset)=if matches!(request.arg0,7|9){
@@ -826,6 +885,40 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
    let address=u64::from_le_bytes(desc[48..56].try_into().unwrap());
    let length=u64::from_le_bytes(desc[56..64].try_into().unwrap());
    let mut data=[0u8;crate::hier_vfs::MAX_TRANSFER];
+   #[cfg(feature="normal-desktop")]
+   {
+    let Ok(_filesystem_permit)=r120_enter()else{return BAD;};
+    let Some(owner)=authenticated_file_identity()else{return BAD;};
+    let table=unsafe{&mut *ptr::addr_of_mut!(R031_HANDLES)};
+    if request.arg0==12{
+     if path!="/"||!target.is_empty()||offset!=0||address!=0||length!=0{return BAD;}
+     return crate::fs_handles::selected_sync_authenticated(table,owner).map_or(BAD,|_|0);
+    }
+    if request.arg0==3&&length==0{
+     if address!=0{return BAD;}
+    }else if matches!(request.arg0,3|5|11){
+     if length==0||length>data.len() as u64||
+        !unsafe{indianos_user_copy_readonly(img,address,data.as_mut_ptr().cast(),length as usize)}{
+      return BAD;
+     }
+    }else if matches!(request.arg0,4|8|10){
+     if length==0||length>72||!unsafe{indianos_user_can_write(&*img,address,length as usize)}{
+      return BAD;
+     }
+    }else if address!=0||length!=0{return BAD;}
+    let used=if matches!(request.arg0,3|5|11){length as usize}else{0};
+    let buffer=if matches!(request.arg0,4|8|10){&mut data[..length as usize]}else{&mut data[..]};
+    let Ok(n)=crate::fs_handles::selected_path_operation_authenticated(
+      table,owner,request.arg0,path,target,offset,buffer,used)else{return BAD;};
+    if matches!(request.arg0,4|8|10){
+     if n>length as usize||n>72||!unsafe{indianos_user_copy_writable(&*img,address,data.as_ptr(),n)}{
+      return BAD;
+     }
+     return n as u64;
+    }
+    return if request.arg0==11{n as u64}else{0};
+   }
+   #[cfg(not(feature="normal-desktop"))]
    match request.arg0{
     3|5|11=>{
      if length==0||length>data.len() as u64||
@@ -865,12 +958,12 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
     _=>BAD
    }
   },
-  #[cfg(feature="test-r031-vfs")]
+  #[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
   33=>{
    // Serialize real GUI-profile filesystem access with the same privileged
    // admission permit as generation-owned UDP and scheduler retirement.
    // A nested IRQ/core cannot remount or use a half-retired owner.
-   #[cfg(feature="test-r031-files-gui")]
+   #[cfg(any(feature="test-r031-files-gui",feature="normal-desktop"))]
    let Ok(_filesystem_permit)=r120_enter()else{return BAD;};
    let Some(owner)=authenticated_file_identity()else{return BAD;};
    // Descriptor: path[24], opaque handle u64, argument u64,
@@ -937,7 +1030,7 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
    }
    n
   },
-  #[cfg(feature="test-r031-files-gui")]
+  #[cfg(any(feature="test-r031-files-gui",feature="normal-desktop"))]
   36=>{
    let Some(owner)=authenticated_file_identity()else{return BAD;};
    // Never derive authority from the claimed PID or user buffer. Source
@@ -987,7 +1080,7 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
     _=>BAD
    }
   },
-  #[cfg(feature="test-r031-files-gui")]
+  #[cfg(any(feature="test-r031-files-gui",feature="normal-desktop"))]
   34=>{
    let Ok(_filesystem_permit)=r120_enter()else{return BAD;};
    if request.arg0!=1||authenticated_file_pid()!=Some(2){return BAD;}
@@ -1009,7 +1102,12 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
     return BAD;
    }
    let mut data=[0u8;72];
-   let Ok(n)=crate::hier_vfs::operation(8,"/shared","",&mut data,0)
+   #[cfg(not(feature="normal-desktop"))]
+   let result=crate::hier_vfs::operation(8,"/shared","",&mut data,0);
+   #[cfg(feature="normal-desktop")]
+   let result=crate::fs_handles::selected_path_operation_authenticated(
+      unsafe{&mut *ptr::addr_of_mut!(R031_HANDLES)},owner,8,"/shared","",0,&mut data,0);
+   let Ok(n)=result
      else{return BAD;};
    if n>requested as usize{return BAD;}
    if n>0 && !unsafe{indianos_user_copy_writable(
@@ -1021,7 +1119,7 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
    if !authenticated_r026_init(){return BAD;}
    crate::r030_ondevice::package(request.arg0).unwrap_or(BAD)
   },
-  #[cfg(feature="test-r026")]
+  #[cfg(any(feature="test-r026",feature="normal-desktop"))]
   16=>{
    if !authenticated_r026_init(){return BAD;}
    let worker=unsafe{&*task_ptr(1)};
@@ -1029,7 +1127,7 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
    if p.pid!=2{return BAD;}
    p.state as u64
   },
-  #[cfg(feature="test-r026")]
+  #[cfg(any(feature="test-r026",feature="normal-desktop"))]
   17=>{
    // Non-blocking wait: 0 if not reaped yet; 1 after exit and cleanup.
    if !authenticated_r026_init(){return BAD;}
@@ -1118,7 +1216,46 @@ fn kernel_mapped(b:&CloneBackend,original:u64,clone:u64,va:u64)->bool{
 fn trap_mapped(b:&CloneBackend,original:u64,clone:u64)->bool{
  let mut trap=[0u64;5];
  if !unsafe{x86_64_user_trap_mapping_addresses(trap.as_mut_ptr())}{return false;}
- trap.iter().all(|&p|kernel_mapped(b,original,clone,p))
+ let mapped=trap.iter().all(|&p|kernel_mapped(b,original,clone,p));
+ #[cfg(feature="normal-desktop")]
+ {mapped&&kernel_stack_guards_valid(b,original)&&kernel_stack_guards_valid(b,clone)}
+ #[cfg(not(feature="normal-desktop"))]
+ {mapped}
+}
+#[cfg(feature="normal-desktop")]
+fn kernel_stack_guards_valid(b:&CloneBackend,root:u64)->bool{
+ for (guard,begin,end) in crate::interrupts::kernel_stack_layout(){
+  if guard&4095!=0||begin!=guard+PAGE||end<=begin||end&4095!=0||
+     lookup(b,root,guard).is_some(){return false;}
+  let mut address=begin;
+  while address<end{
+   let Some(flags)=(unsafe{crate::paging::kernel_stack_page_flags(b,root,address)})
+       else{return false;};
+   if flags&3!=3||flags&4!=0||flags&(1u64<<63)==0{return false;}
+   address+=PAGE;
+  }
+ }
+ true
+}
+#[cfg(feature="normal-desktop")]
+static mut DESKTOP_GUARD_RETAINED:[u64;2]=[0;2];
+#[cfg(feature="normal-desktop")]
+fn install_kernel_stack_guards(b:&CloneBackend,root:u64)->bool{
+ let flags:u64;
+ unsafe{asm!("pushfq","pop {}",out(reg)flags,options(nomem,preserves_flags));}
+ if flags&(1<<9)!=0||unsafe{DESKTOP_GUARD_RETAINED}.iter().any(|&frame|frame!=0){return false;}
+ for (guard,_,_) in crate::interrupts::kernel_stack_layout(){
+  if let Err(failure)=unsafe{crate::paging::guard_kernel_page(b,root,guard)}{
+   // A refused release must not lose ownership of unpublished split tables.
+   // Keep their frames quarantined until reboot and deny every later retry.
+   unsafe{DESKTOP_GUARD_RETAINED=failure.retained;}
+   return false;
+  }
+  // Single BSP only. Invalidate the former large/4KiB translation before
+  // the first user CR3 is cloned. The guard payload remains kernel-reserved.
+  unsafe{asm!("invlpg [{}]",in(reg)guard,options(nostack,preserves_flags));}
+ }
+ kernel_stack_guards_valid(b,root)
 }
 fn image_mapped(b:&CloneBackend,root:u64,img:&UserImage)->bool{
  if !img.ready||img.page_count==0||img.page_count as usize>img.pages.len()||
@@ -1169,7 +1306,7 @@ pub unsafe extern "C" fn x86_64_user_process_run(
  let Some(p)=(unsafe{process.as_ref()})else{return false};
  let pid=p.pid;
  if pid==0||p.state!=1||!active_image().is_null(){return false;}
- #[cfg(feature="test-shell")]
+ #[cfg(any(feature="test-shell",feature="normal-desktop"))]
  unsafe{
   if ACTIVE_PID!=0{return false;}
   if pid==1{PENDING_WORKER=false;}
@@ -1220,16 +1357,16 @@ pub unsafe extern "C" fn x86_64_user_process_run(
   if safe{
    pid_log(pid,b"RUNNING\0");clear_faults();
    unsafe{ACTIVE_USER=&mut staged;ACTIVE_PROCESS=process;}
-   #[cfg(feature="test-shell")]
+   #[cfg(any(feature="test-shell",feature="normal-desktop"))]
    unsafe{ACTIVE_PID=pid;}
    log(b"IndianOS: entering ring-3 /bin/init (QEMU experimental)\n\0");
    let status=unsafe{x86_64_enter_user(staged.plan.entry,staged.plan.stack_end-16,clone.root)};
    unsafe{ACTIVE_USER=ptr::null_mut();ACTIVE_PROCESS=ptr::null_mut();}
-   #[cfg(feature="test-shell")]
+   #[cfg(any(feature="test-shell",feature="normal-desktop"))]
    unsafe{ACTIVE_PID=0;}
    let (v,e,a)=last_fault();
    cleanup_quantum_jobs(pid);
-   #[cfg(feature="test-r029-userspace")]
+   #[cfg(any(feature="test-r029-userspace",feature="normal-desktop"))]
    crate::gui::user_surface_terminate(pid);
    let completed=if v==0{unsafe{indianos_process_exit(process,status)}}
    else{unsafe{indianos_process_fault(process,status,v,e,a)}};
@@ -1314,18 +1451,18 @@ fn prepare(t:*mut Task,p:*mut Process,elf:*const u8,size:usize,original:u64,
   image_mapped(b,task.root.root,&task.image);
  if !safe||!unsafe{indianos_process_ready(p)} ||
     !unsafe{indianos_process_bind(p,task.root.root)}{return false;}
- #[cfg(feature="test-r031-vfs")]
+ #[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
  if (1..=2).contains(&unsafe{(*p).pid}){
   // Bind the real FileHandles owner and coordinator generation while holding
   // one gate. No observer may see an owner that is only half-registered.
-  #[cfg(feature="test-r031-files-gui")]
+  #[cfg(any(feature="test-r031-files-gui",feature="normal-desktop"))]
   let Ok(_registration_permit)=r120_enter()else{return false;};
   // Bind only fully prepared contexts. The table and epoch allocator survive
   // scheduler invocations; never reset them when PCB PIDs restart at one.
   let handles=unsafe{&mut *ptr::addr_of_mut!(R031_HANDLES)};
   let Ok(owner)=handles.bind_process(unsafe{(*p).pid})else{return false;};
   task.file_generation=owner.generation;
-  #[cfg(feature="test-r031-files-gui")]
+  #[cfg(any(feature="test-r031-files-gui",feature="normal-desktop"))]
   {
    let live=crate::process_retirement_txn::Owner{
      pid:owner.pid,generation:owner.generation
@@ -1339,7 +1476,7 @@ fn prepare(t:*mut Task,p:*mut Process,elf:*const u8,size:usize,original:u64,
  }
  pid_log(unsafe{(*p).pid},b"READY\0");true
 }
-#[cfg(feature="test-ipc")]
+#[cfg(any(feature="test-ipc",feature="normal-desktop"))]
 fn service_ipc_waiters()->bool{
  use crate::ipc::WaitPoll;
  let Some(boxes)=router()else{return false;};
@@ -1368,7 +1505,7 @@ fn service_ipc_waiters()->bool{
  }
  true
 }
-#[cfg(feature="test-ipc")]
+#[cfg(any(feature="test-ipc",feature="normal-desktop"))]
 fn next_ipc_ready(scheduler:&mut Scheduler)->*mut Process{
  // Each pass is one cooperative selection round, not an IRQ or clock tick.
  // If every task sleeps, bounded empty passes expire all deadlines without
@@ -1402,7 +1539,7 @@ fn revoke_task_authority(task:&mut Task){
  revoke_task_authority_with_kind(task,crate::process_events::EventKind::Exited);
 }
 
-#[cfg(feature="test-r031-vfs")]
+#[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
 #[derive(Clone,Copy,Debug,Eq,PartialEq)]
 enum FileRetireFailure { EventQueue, FileHandles }
 
@@ -1415,7 +1552,7 @@ enum FileRetireFailure { EventQueue, FileHandles }
 ///
 /// A retired/replaced PID incarnation is a no-op: never revoke a new
 /// generation or emit a delayed duplicate notification.
-#[cfg(feature="test-r031-vfs")]
+#[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
 fn retire_file_owner_epoch<const E:usize>(
     files:&mut crate::fs_handles::FileHandles,
     events:&mut crate::process_events::ProcessEvents<E>,
@@ -1443,7 +1580,7 @@ fn retire_file_owner_epoch<const E:usize>(
 /// authenticated file syscall path BEFORE ATA discovery or disk mutation.
 /// QEMU's disposable disk and the real PID2 scheduler identity are used, not
 /// an in-memory fake BlockDevice. This cannot simulate hardware disk swaps.
-#[cfg(feature="test-r031-files-gui")]
+#[cfg(any(feature="test-r031-files-gui",feature="normal-desktop"))]
 fn r123_retired_pid2_file_token_fuzz(
     files:&mut crate::fs_handles::FileHandles,
     owner:crate::batch5_session::Identity,
@@ -1491,7 +1628,7 @@ fn r123_retired_pid2_file_token_fuzz(
 /// Permit is REQUIRED in the Rust signature of every 5-table publication.
 /// The real scheduler retains the R120_GATE permit through publication.
 /// This does not implement physical APIC/IPI/SMP coordination.
-#[cfg(feature="test-r031-files-gui")]
+#[cfg(any(feature="test-r031-files-gui",feature="normal-desktop"))]
 fn retire_full_owner_batch<
     const C:usize,const U:usize,const K:usize,
     const P:usize,const Q:usize,const E:usize,const L:usize
@@ -1591,7 +1728,7 @@ fn retire_full_owner_batch<
 
 /// Live scheduler single-owner convenience path, backed by the same
 /// multi-incarnation transaction as supervisor batch retirement.
-#[cfg(feature="test-r031-files-gui")]
+#[cfg(any(feature="test-r031-files-gui",feature="normal-desktop"))]
 fn retire_full_owner_epoch<
     const C:usize,const U:usize,const K:usize,
     const P:usize,const Q:usize,const E:usize,const L:usize
@@ -1614,12 +1751,12 @@ fn retire_full_owner_epoch<
     ).map(|count|count==1)
 }
 
-#[cfg(feature="test-r031-vfs")]
+#[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
 fn r118_file_retirement_fatal()->!{
     log(b"IndianOS: FATAL R118 filesystem/event retirement incomplete\n\0");
-    #[cfg(feature="test-r031-files-gui")]
+    #[cfg(any(feature="test-r031-files-gui",feature="normal-desktop"))]
     {r120_halt()}
-    #[cfg(not(feature="test-r031-files-gui"))]
+    #[cfg(not(any(feature="test-r031-files-gui",feature="normal-desktop")))]
     {panic!("R118 live file/event retirement denied")}
 }
 
@@ -1629,22 +1766,22 @@ fn revoke_task_authority_with_kind(
  // This runs before any fallible release, including scheduler-abort rollback.
  // Clear the continuation even when no PCB was bound during preparation.
  task.saved=false;task.frame=[0;WORDS];task.image.ready=false;
- #[cfg(feature="test-ipc")]
+ #[cfg(any(feature="test-ipc",feature="normal-desktop"))]
  task.ipc_wait.cancel();
  if !task.authority_live{return;}
  task.authority_live=false;
  if let Some(process)=unsafe{task.pcb.as_ref()}{
   let pid=process.pid;
   cleanup_quantum_jobs(pid);
-  #[cfg(feature="test-r029-multiprocess")]
+  #[cfg(any(feature="test-r029-multiprocess",feature="normal-desktop"))]
   crate::gui::user_surface_terminate(pid);
-  #[cfg(feature="test-ipc")]
+  #[cfg(any(feature="test-ipc",feature="normal-desktop"))]
   if let Some(boxes)=router(){let _=boxes.unregister(pid);}
   #[cfg(feature="test-r025")]
   if let Some(svc)=services(){let _=svc.terminate(pid);}
  }
 
- #[cfg(feature="test-r031-vfs")]
+ #[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
  if task.file_generation!=0{
   // Revoke before fallible page-table/frame reclamation. A retry or delayed
   // cleanup cannot revoke a replacement incarnation with the same PID.
@@ -1652,14 +1789,14 @@ fn revoke_task_authority_with_kind(
    // One non-spinning permit covers event production, capability/UDP
    // retirement, delegated leases and FileHandles revocation, including
    // all postconditions. Do NOT reacquire inside this teardown path.
-   #[cfg(feature="test-r031-files-gui")]
+   #[cfg(any(feature="test-r031-files-gui",feature="normal-desktop"))]
    let _retirement_permit=r120_enter().unwrap_or_else(|_|r120_halt());
    let owner=crate::batch5_session::Identity{
     pid:unsafe{(*task.pcb).pid},generation:task.file_generation};
    // Only a previously live trusted PID2 lease makes a teardown
    // assertion meaningful. Missing/failed task preparation must not produce
    // a false QEMU "revocation succeeded" marker.
-   #[cfg(feature="test-r031-files-gui")]
+   #[cfg(any(feature="test-r031-files-gui",feature="normal-desktop"))]
    let had_live_directory_lease=owner.pid==2 &&
       unsafe{(&*ptr::addr_of!(R116_SHARED_LEASES))}
         .permits_shared_directory(owner);
@@ -1679,7 +1816,7 @@ fn revoke_task_authority_with_kind(
      }
      log(b"IndianOS: R128 QEMU active PID2 forged file tokens denied before ATA probe\n\0");
    }
-   #[cfg(feature="test-r031-files-gui")]
+   #[cfg(any(feature="test-r031-files-gui",feature="normal-desktop"))]
    let old_pid2_mount=if had_live_directory_lease {
      let fs=unsafe{&*ptr::addr_of!(R031_HANDLES)};
      match (
@@ -1693,12 +1830,12 @@ fn revoke_task_authority_with_kind(
        }
      }
    }else{None};
-   #[cfg(feature="test-r031-files-gui")]
+   #[cfg(any(feature="test-r031-files-gui",feature="normal-desktop"))]
    let mut full_retirement_committed=false;
    // Do not advertise lifecycle exit/fault yet. The notice must be
    // published atomically with FileHandles revocation AFTER the network,
    // delegated capability and scheduler-resource teardown is verified.
-   #[cfg(feature="test-r031-files-gui")]
+   #[cfg(any(feature="test-r031-files-gui",feature="normal-desktop"))]
    {
     // Mandatory exact-incarnation revocation on ordinary exit, fault and
     // rollback. Network grants are retired before FileHandles, while the
@@ -1746,14 +1883,14 @@ fn revoke_task_authority_with_kind(
    // Legacy/synthetic host setup without a live R120 owner still follows
    // the old separately verified file path. A real active owner has already
    // committed all five tables above and must not retire twice.
-   #[cfg(feature="test-r031-files-gui")]
+   #[cfg(any(feature="test-r031-files-gui",feature="normal-desktop"))]
    if !full_retirement_committed {
      unsafe{(&mut *ptr::addr_of_mut!(R116_SHARED_LEASES))}
         .revoke_identity(owner.pid,owner.generation);
    }
-   #[cfg(feature="test-r031-files-gui")]
+   #[cfg(any(feature="test-r031-files-gui",feature="normal-desktop"))]
    let needs_legacy_file_retire=!full_retirement_committed;
-   #[cfg(not(feature="test-r031-files-gui"))]
+   #[cfg(not(any(feature="test-r031-files-gui",feature="normal-desktop")))]
    let needs_legacy_file_retire=true;
    if needs_legacy_file_retire {
      let result=retire_file_owner_epoch(
@@ -1762,7 +1899,7 @@ fn revoke_task_authority_with_kind(
          owner,kind);
      if result.is_err(){r118_file_retirement_fatal();}
    }
-   #[cfg(feature="test-r031-files-gui")]
+   #[cfg(any(feature="test-r031-files-gui",feature="normal-desktop"))]
    if had_live_directory_lease {
      let lease_gone=!unsafe{(&*ptr::addr_of!(R116_SHARED_LEASES))}
            .permits_shared_directory(owner);
@@ -1829,11 +1966,11 @@ fn cleanup_session(backend:&CloneBackend,reclaim:bool)->bool{
   // retain a pointer after that table's lifetime, including failed teardown.
   task.pcb=ptr::null_mut();
  }
- #[cfg(feature="test-ipc")]
+ #[cfg(any(feature="test-ipc",feature="normal-desktop"))]
  unsafe{IPC_ROUTER=None;}
  #[cfg(feature="test-r025")]
  unsafe{R025_SERVICES=None;}
- #[cfg(feature="test-r031-files-gui")]
+ #[cfg(any(feature="test-r031-files-gui",feature="normal-desktop"))]
  {
   // Release the permit before entering any scheduler or user code.
   let Ok(_permit)=r120_enter()else{return false;};
@@ -1861,7 +1998,7 @@ impl Drop for SessionRollback{
   }
  }
 }
-#[cfg(feature="test-r029-desktop-suite")]
+#[cfg(any(feature="test-r029-desktop-suite",feature="normal-desktop"))]
 #[no_mangle]
 pub unsafe extern "C" fn x86_64_r029_desktop_suite_run(
  a:*const u8,al:usize,b:*const u8,bl:usize,c:*const u8,cl:usize)->bool{
@@ -1871,13 +2008,28 @@ pub unsafe extern "C" fn x86_64_r029_desktop_suite_run(
  unsafe{THIRD_ELF=(ptr::null(),0);}
  result
 }
+/// Four independent, prevalidated ELF services. PID4 alone owns presentation;
+/// PID1 is the startup/input/file broker and cannot invoke frame presentation.
+#[cfg(feature="normal-desktop")]
+#[no_mangle]
+pub unsafe extern "C" fn x86_64_desktop_session_run(
+ a:*const u8,al:usize,b:*const u8,bl:usize,c:*const u8,cl:usize,
+ compositor:*const u8,compositor_len:usize)->bool{
+ unsafe{DESKTOP_RESTART_SAFE=false;}
+ if c.is_null()||cl==0||compositor.is_null()||compositor_len==0||
+    !active_image().is_null()||unsafe{SESSION_DIRTY}{return false;}
+ unsafe{THIRD_ELF=(c,cl);COMPOSITOR_ELF=(compositor,compositor_len);}
+ let result=unsafe{x86_64_m009_schedule_run(a,al,b,bl)};
+ unsafe{THIRD_ELF=(ptr::null(),0);COMPOSITOR_ELF=(ptr::null(),0);}
+ result
+}
 #[no_mangle]
 pub unsafe extern "C" fn x86_64_m009_schedule_run(
  first:*const u8,first_len:usize,second:*const u8,second_len:usize)->bool{
  if first.is_null()||second.is_null()||!active_image().is_null()||
     !active_task().is_null(){return false;}
  let Some((cpu,offset))=preflight()else{return false;};
- #[cfg(feature="test-r031-files-gui")]
+ #[cfg(any(feature="test-r031-files-gui",feature="normal-desktop"))]
  if !r120_setup(){log(b"IndianOS: R120 denied unsafe CPU/IRQ scheduler entry\n\0");return false;}
  let mut direct=DirectMap{offset};
  let vmm=vmm_backend(&mut direct);
@@ -1893,7 +2045,17 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
  if unsafe{SESSION_DIRTY} && (active_retained_root||!cleanup_session(&backend,true)){
   log(b"IndianOS: M009 prior rollback still owns resources\n\0");return false;
  }
- #[cfg(feature="test-r031-files-gui")]
+ #[cfg(feature="normal-desktop")]
+ {
+  // Guard-page split tables belong to the source CR3 for the rest of boot.
+  // Install before PMM baseline capture and before cloning *any* task root;
+  // process teardown must never release these source-owned tables.
+  if !install_kernel_stack_guards(&backend,cpu.cr3&PHYS){
+   log(b"IndianOS: desktop kernel stack guard installation failed\n\0");return false;
+  }
+  log(b"IndianOS: desktop kernel trap and double-fault stack guards verified\n\0");
+ }
+ #[cfg(any(feature="test-r031-files-gui",feature="normal-desktop"))]
  {
   // Release the permit before entering any scheduler or user code.
   let Ok(_permit)=r120_enter()else{return false;};
@@ -1907,10 +2069,14 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
  let p=unsafe{indianos_process_create(&mut table)};
  let q=unsafe{indianos_process_create(&mut table)};
  if p.is_null()||q.is_null()||unsafe{(*p).pid}!=1||unsafe{(*q).pid}!=2{return false;}
- #[cfg(feature="test-r029-desktop-suite")]
+ #[cfg(any(feature="test-r029-desktop-suite",feature="normal-desktop"))]
  let third=unsafe{indianos_process_create(&mut table)};
- #[cfg(feature="test-r029-desktop-suite")]
+ #[cfg(any(feature="test-r029-desktop-suite",feature="normal-desktop"))]
  if third.is_null()||unsafe{(*third).pid}!=3{return false;}
+ #[cfg(feature="normal-desktop")]
+ let compositor=unsafe{indianos_process_create(&mut table)};
+ #[cfg(feature="normal-desktop")]
+ if compositor.is_null()||unsafe{(*compositor).pid}!=4{return false;}
  #[cfg(feature="preempt")]
  {
   // Install UC xAPIC mapping before cloning any user CR3, otherwise
@@ -1931,22 +2097,29 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
   (*task_ptr(0)).pcb=p;(*task_ptr(0)).authority_live=true;
   (*task_ptr(1)).pcb=q;(*task_ptr(1)).authority_live=true;
  }
- #[cfg(feature="test-r029-desktop-suite")]
+ #[cfg(any(feature="test-r029-desktop-suite",feature="normal-desktop"))]
  unsafe{(*task_ptr(2)).pcb=third;(*task_ptr(2)).authority_live=true;}
+ #[cfg(feature="normal-desktop")]
+ unsafe{(*task_ptr(3)).pcb=compositor;(*task_ptr(3)).authority_live=true;}
  unsafe{SESSION_DIRTY=true;}
  let _rollback=SessionRollback{backend,kernel_root:cpu.cr3&PHYS};
  #[cfg(feature="test-r031-supervisor")]
  unsafe{SUPERVISED_TERMINAL=crate::service_supervisor::TerminalSupervisor::new();}
- #[cfg(feature="test-r026")]
+ #[cfg(any(feature="test-r026",feature="normal-desktop"))]
  unsafe{R026_WORKER_REQUESTED=false;R026_WORKER_REAPED=false;}
  let prepared_two=prepare(task_ptr(0),p,first,first_len,cpu.cr3&PHYS,&vmm,&backend,0)&&
   prepare(task_ptr(1),q,second,second_len,cpu.cr3&PHYS,&vmm,&backend,1);
- #[cfg(feature="test-r029-desktop-suite")]
+ #[cfg(any(feature="test-r029-desktop-suite",feature="normal-desktop"))]
  let prepared=prepared_two && {
   let (elf,len)=unsafe{THIRD_ELF};
   prepare(task_ptr(2),third,elf,len,cpu.cr3&PHYS,&vmm,&backend,2)
  };
- #[cfg(not(feature="test-r029-desktop-suite"))]
+ #[cfg(feature="normal-desktop")]
+ let prepared=prepared && {
+  let (elf,len)=unsafe{COMPOSITOR_ELF};
+  prepare(task_ptr(3),compositor,elf,len,cpu.cr3&PHYS,&vmm,&backend,3)
+ };
+ #[cfg(not(any(feature="test-r029-desktop-suite",feature="normal-desktop")))]
  let prepared=prepared_two;
  if !prepared||!unsafe{indianos_scheduler_init(&mut scheduler,&mut table)}{
   log(b"IndianOS: M009 FATAL cannot prepare two user contexts\n\0");
@@ -1955,17 +2128,19 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
  // Save the two genuine ring-3 PID epochs, before teardown clears the
  // Task.file_generation fields. These are minted by the privileged
  // FileHandles allocator, never derived from a guest syscall argument.
- #[cfg(feature="test-r031-files-gui")]
+ #[cfg(any(feature="test-r031-files-gui",feature="normal-desktop"))]
  let r120_expected=unsafe{[
     (*task_ptr(0)).file_generation,
     (*task_ptr(1)).file_generation
  ]};
- #[cfg(feature="test-ipc")]
+ #[cfg(any(feature="test-ipc",feature="normal-desktop"))]
  {
   let Some(mut mailboxes)=IpcRouter::<4,8>::new().ok()else{return false;};
   let registered=mailboxes.register(1).is_ok()&&mailboxes.register(2).is_ok();
-  #[cfg(feature="test-r029-desktop-suite")]
+  #[cfg(any(feature="test-r029-desktop-suite",feature="normal-desktop"))]
   let registered=registered&&mailboxes.register(3).is_ok();
+  #[cfg(feature="normal-desktop")]
+  let registered=registered&&mailboxes.register(4).is_ok();
   if !registered{
    return false;
   }
@@ -1978,7 +2153,7 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
   unsafe{R025_SERVICES=Some(svc);}
   log(b"IndianOS: R025 capability and isolated file services ready\n\0");
  }
- #[cfg(all(feature="test-r026",not(feature="test-r031-files-gui")))]
+ #[cfg(all(any(feature="test-r026",feature="normal-desktop"),not(any(feature="test-r031-files-gui",feature="normal-desktop"))))]
  {
   // Both ELF images have isolated mappings, but PID2 is not eligible
   // for dispatch until the init shell authorizes its launch.
@@ -1986,10 +2161,12 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
   unsafe{(*q).state=1;}
   log(b"IndianOS: R026 worker prepared but not yet runnable\n\0");
  }
- #[cfg(not(feature="test-r029-desktop-suite"))]
+ #[cfg(not(any(feature="test-r029-desktop-suite",feature="normal-desktop")))]
  log(b"IndianOS: M009 two simultaneous user address spaces ready\n\0");
- #[cfg(feature="test-r029-desktop-suite")]
+ #[cfg(any(feature="test-r029-desktop-suite",feature="normal-desktop"))]
  log(b"IndianOS: R029.5 three protected ring3 address spaces READY\n\0");
+ #[cfg(feature="normal-desktop")]
+ log(b"IndianOS: desktop four protected ring3 services READY; compositor PID4\n\0");
  #[cfg(feature="preempt")]
  {
   // Arm rollback before calibration: a partially failed start must also mask
@@ -2002,10 +2179,12 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
   log(b"IndianOS: R024 calibrated periodic xAPIC IRQ at 100 Hz\n\0");
  }
  let mut ok=true;
+ #[cfg(feature="normal-desktop")]
+ let mut user_service_failed=false;
  while ok&&!unsafe{indianos_scheduler_all_terminal(&scheduler)}{
-  #[cfg(feature="test-ipc")]
+  #[cfg(any(feature="test-ipc",feature="normal-desktop"))]
   let pcb=next_ipc_ready(&mut scheduler);
-  #[cfg(not(feature="test-ipc"))]
+  #[cfg(not(any(feature="test-ipc",feature="normal-desktop")))]
   let pcb=unsafe{indianos_scheduler_next(&mut scheduler)};
   if pcb.is_null(){ok=false;break;}
   let pid=unsafe{(*pcb).pid};
@@ -2020,7 +2199,7 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
   }else if !unsafe{indianos_process_start(pcb,task.root.root)}{ok=false;break;}
   pid_log(pid,b"DISPATCHED\0");clear_faults();
   unsafe{ACTIVE_USER=&mut task.image;ACTIVE_TASK=task as *mut Task;ACTIVE_PROCESS=pcb;}
-  #[cfg(any(feature="test-r026",feature="test-r029-multiprocess"))]
+  #[cfg(any(any(feature="test-r026",feature="normal-desktop"),any(feature="test-r029-multiprocess",feature="normal-desktop")))]
   unsafe{ACTIVE_PID=pid;}
   let status=if task.saved{
    unsafe{x86_64_resume_user(task.frame.as_ptr(),task.root.root)}
@@ -2029,7 +2208,7 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
                              task.image.plan.stack_end-16,task.root.root)}
   };
   unsafe{ACTIVE_TASK=ptr::null_mut();ACTIVE_USER=ptr::null_mut();ACTIVE_PROCESS=ptr::null_mut();}
-  #[cfg(any(feature="test-r026",feature="test-r029-multiprocess"))]
+  #[cfg(any(any(feature="test-r026",feature="normal-desktop"),any(feature="test-r029-multiprocess",feature="normal-desktop")))]
   unsafe{ACTIVE_PID=0;}
   let cr3:u64;
   unsafe{asm!("mov {}, cr3",out(reg)cr3,options(nostack,nomem,preserves_flags));}
@@ -2045,9 +2224,9 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
   }else{
    if status==YIELD{ok=false;break;}
    cleanup_quantum_jobs(pid);
-   #[cfg(feature="test-r029-multiprocess")]
+   #[cfg(any(feature="test-r029-multiprocess",feature="normal-desktop"))]
    crate::gui::user_surface_terminate(pid);
-   #[cfg(feature="test-ipc")]
+   #[cfg(any(feature="test-ipc",feature="normal-desktop"))]
    {
     // On process exit or fault all queued messages for that PID are gone.
     if router().is_none_or(|boxes|boxes.unregister(pid).is_err()){
@@ -2076,10 +2255,17 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
    });
    #[cfg(feature="test-r030-ondevice")]
    fault_hex(b"IndianOS: R030 scheduler exit status=0x\0",status);
-   #[cfg(feature="test-r031-boot-desktop")]
+   #[cfg(any(feature="test-r031-boot-desktop",feature="normal-desktop"))]
    fault_hex(b"IndianOS: R031 scheduler process exit=0x\0",status);
    pid_log(pid,if v==0{&b"EXITED\0"[..]}else{&b"FAULTED\0"[..]});
    if !discard(task as *mut Task,&backend,true){ok=false;break;}
+   #[cfg(feature="normal-desktop")]
+   if v!=0||status!=0{
+    // Restart eligibility is granted only after the rollback below proves
+    // every authority and frame gone; an error elsewhere cannot grant it.
+    user_service_failed=true;
+    ok=false;break;
+   }
    #[cfg(feature="test-r031-supervisor")]
    if pid==3{
      use crate::service_supervisor::Decision;
@@ -2114,7 +2300,7 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
      log(b"IndianOS: R031.2 FATAL replacement process failed (no second restart)\n\0");
      ok=false;break;
    }
-   #[cfg(feature="test-r026")]
+   #[cfg(any(feature="test-r026",feature="normal-desktop"))]
    if pid==2{
      unsafe{R026_WORKER_REAPED=true;}
      log(b"IndianOS: R026 worker exited and reaped while shell remains alive\n\0");
@@ -2126,9 +2312,11 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
       (*third).state==5 && (*third).resources_reclaimed &&
       indianos_process_success((*task_ptr(3)).pcb) &&
       SUPERVISED_TERMINAL.ready()};
- #[cfg(all(feature="test-r029-desktop-suite",not(feature="test-r031-supervisor")))]
+ #[cfg(all(any(feature="test-r029-desktop-suite",feature="normal-desktop"),not(feature="test-r031-supervisor")))]
  let third_ok=unsafe{indianos_process_success(third)};
- #[cfg(not(feature="test-r029-desktop-suite"))]
+ #[cfg(feature="normal-desktop")]
+ let third_ok=third_ok&&unsafe{indianos_process_success(compositor)};
+ #[cfg(not(any(feature="test-r029-desktop-suite",feature="normal-desktop")))]
  let third_ok=true;
  if ok&&(!unsafe{indianos_scheduler_all_terminal(&scheduler)} ||
          !unsafe{indianos_process_success(p)} ||
@@ -2148,20 +2336,20 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
      !crate::timer::xapic_preemption_evidence(irqs,captures){ok=false;}
   if ok{log(b"IndianOS: R024 APIC timer-preemptive round-robin PASSED\n\0");}
  }
- #[cfg(all(not(feature="preempt"),not(feature="test-r026"),not(feature="test-r029-desktop-suite")))]
+ #[cfg(all(not(feature="preempt"),not(any(feature="test-r026",feature="normal-desktop")),not(any(feature="test-r029-desktop-suite",feature="normal-desktop"))))]
  {
   if scheduler.dispatch_count!=6||scheduler.yield_count!=4||
      scheduler.tick_count!=4{ok=false;}
   if ok{log(b"IndianOS: M009 round-robin cooperative switching PASSED\n\0");}
  }
- #[cfg(all(feature="test-r026",not(feature="test-r031-files-gui")))]
+ #[cfg(all(any(feature="test-r026",feature="normal-desktop"),not(any(feature="test-r031-files-gui",feature="normal-desktop"))))]
  {
   if !unsafe{R026_WORKER_REQUESTED && R026_WORKER_REAPED} ||
      scheduler.dispatch_count<3 || scheduler.yield_count<1 ||
      scheduler.tick_count<1 {ok=false;}
   if ok{log(b"IndianOS: R026 persistent interactive worker lifecycle PASSED\n\0");}
  }
- #[cfg(feature="test-r029-desktop-suite")]
+ #[cfg(any(feature="test-r029-desktop-suite",feature="normal-desktop"))]
  {
   if scheduler.dispatch_count<5||scheduler.yield_count<2{ok=false;}
   if ok{log(b"IndianOS: R029.5 three process lifecycle PASSED\n\0");}
@@ -2171,16 +2359,18 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
   if scheduler.dispatch_count<8 || scheduler.yield_count<3{ok=false;}
   if ok{log(b"IndianOS: R031.2 bounded Terminal supervision and privileged isolation PASSED\n\0");}
  }
- #[cfg(feature="test-ipc")]
+ #[cfg(any(feature="test-ipc",feature="normal-desktop"))]
  {
   if let Some(boxes)=router(){
    #[cfg(feature="test-r031-supervisor")]
    let fourth_closed=boxes.pending(4)==Err(IpcError::UnknownReceiver);
-   #[cfg(not(feature="test-r031-supervisor"))]
+   #[cfg(all(not(feature="test-r031-supervisor"),not(feature="normal-desktop")))]
    let fourth_closed=true;
-   #[cfg(feature="test-r029-desktop-suite")]
+   #[cfg(all(feature="normal-desktop",not(feature="test-r031-supervisor")))]
+   let fourth_closed=boxes.pending(4)==Err(IpcError::UnknownReceiver);
+   #[cfg(any(feature="test-r029-desktop-suite",feature="normal-desktop"))]
    let third_closed=boxes.pending(3)==Err(IpcError::UnknownReceiver);
-   #[cfg(not(feature="test-r029-desktop-suite"))]
+   #[cfg(not(any(feature="test-r029-desktop-suite",feature="normal-desktop")))]
    let third_closed=true;
    if boxes.pending(1)!=Err(IpcError::UnknownReceiver)||
       boxes.pending(2)!=Err(IpcError::UnknownReceiver)||
@@ -2201,8 +2391,8 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
    log(b"IndianOS: R025 capability IPC filesystem process services PASSED\n\0");
   }
  }
- #[cfg(feature="test-r031-files-gui")]
- {
+ #[cfg(any(feature="test-r031-files-gui",feature="normal-desktop"))]
+ if ok {
    // R120: the real ring-3 GUI/QEMU acceptance fixture executes PID1 and
    // PID2 UDP PING/PONG + forged foreign-close denial before this terminal
    // state. Validate both trusted incarnations have lost *all* authority
@@ -2226,10 +2416,16 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
       ok=false;
       log(b"IndianOS: FATAL R120 ring3 dual-PID UDP epoch retirement mismatch\n\0");
    }else if ok {
+      #[cfg(not(feature="normal-desktop"))]
       log(b"IndianOS: R120 QEMU ring3 dual-PID UDP epoch retirement PASSED\n\0");
+      #[cfg(feature="normal-desktop")]
+      log(b"IndianOS: desktop file-service authority retired\n\0");
    }
  }
  if !ok{
+  #[cfg(feature="normal-desktop")]
+  log(b"IndianOS desktop: service failed; retiring session\n\0");
+  #[cfg(not(feature="normal-desktop"))]
   log(b"IndianOS: M009 FATAL scheduler or memory ownership verification\n\0");
 
  }
@@ -2238,16 +2434,67 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
  #[cfg(not(feature="preempt"))]
  let can_reclaim=true;
  let reclaimed=cleanup_session(&backend,can_reclaim);
+ #[cfg(feature="normal-desktop")]
+ if reclaimed{
+  // On service failure peers were still live when the loop stopped. Check
+  // retirement after rollback, rather than demanding it before cleanup ran.
+  let _permit=r120_enter().unwrap_or_else(|_|r120_halt());
+  let coordinator=unsafe{&*ptr::addr_of!(R120_RETIREMENT)};
+  let handles=unsafe{&*ptr::addr_of!(R031_HANDLES)};
+  for (index,generation) in r120_expected.iter().enumerate(){
+   let owner=crate::batch5_session::Identity{pid:index as u32+1,generation:*generation};
+   if coordinator.active_generation(owner.pid).is_some()||handles.owns(owner){
+    log(b"IndianOS: FATAL desktop rollback retained process authority\n\0");return false;
+   }
+  }
+ }
  if reclaimed && unsafe{pmm_free_frames()}!=before{
   log(b"IndianOS: M009 FATAL rollback frame count mismatch\n\0");return false;
+ }
+ #[cfg(feature="normal-desktop")]
+ if user_service_failed&&reclaimed{
+  unsafe{DESKTOP_RESTART_SAFE=true;}
+  log(b"IndianOS normal desktop: retired session verified restart-safe\n\0");
  }
  ok&&reclaimed
 }
 #[cfg(test)]mod tests{
  use super::*;
  static LOCK:std::sync::Mutex<()>=std::sync::Mutex::new(());
+ #[cfg(feature="normal-desktop")]
+ #[test]fn desktop_restart_permission_is_one_shot_and_rejects_uncertain_teardown(){
+  let _lock=LOCK.lock().unwrap();
+  struct Restore{safe:bool,dirty:bool,image:*mut UserImage,task:*mut Task}
+  impl Drop for Restore{
+   fn drop(&mut self){unsafe{
+    DESKTOP_RESTART_SAFE=self.safe;SESSION_DIRTY=self.dirty;
+    ACTIVE_USER=self.image;ACTIVE_TASK=self.task;
+   }}
+  }
+  let _restore=unsafe{Restore{safe:DESKTOP_RESTART_SAFE,dirty:SESSION_DIRTY,
+      image:ACTIVE_USER,task:ACTIVE_TASK}};
+  unsafe{ACTIVE_USER=ptr::null_mut();ACTIVE_TASK=ptr::null_mut();SESSION_DIRTY=false;
+      DESKTOP_RESTART_SAFE=false;}
+  assert!(!take_desktop_restart_permission());
+  unsafe{DESKTOP_RESTART_SAFE=true;}
+  assert!(take_desktop_restart_permission());
+  assert!(!take_desktop_restart_permission());
+  unsafe{DESKTOP_RESTART_SAFE=true;SESSION_DIRTY=true;}
+  assert!(!take_desktop_restart_permission());
+  unsafe{SESSION_DIRTY=false;}
+  assert!(!take_desktop_restart_permission());
+  unsafe{DESKTOP_RESTART_SAFE=true;ACTIVE_USER=ptr::NonNull::<UserImage>::dangling().as_ptr();}
+  assert!(!take_desktop_restart_permission());
+  unsafe{ACTIVE_USER=ptr::null_mut();}
+  assert!(!take_desktop_restart_permission());
+  unsafe{DESKTOP_RESTART_SAFE=true;ACTIVE_TASK=ptr::NonNull::<Task>::dangling().as_ptr();}
+  assert!(!take_desktop_restart_permission());
+  unsafe{ACTIVE_TASK=ptr::null_mut();}
+  assert!(!take_desktop_restart_permission());
+ }
 
- #[cfg(feature="test-r031-files-gui")]
+
+ #[cfg(any(feature="test-r031-files-gui",feature="normal-desktop"))]
  #[test]fn r117_real_scheduler_revoke_withdraws_shared_directory_and_udp(){
   use core::mem::ManuallyDrop;
   let _lock=LOCK.lock().unwrap();
@@ -2363,7 +2610,7 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
  // boundary alone is supplied here because the kernel COM1 driver is assembly.
  #[export_name="serial_write"]
  extern "C" fn host_serial_write(_: *const c_char){}
- #[cfg(feature="test-ipc")]
+ #[cfg(any(feature="test-ipc",feature="normal-desktop"))]
  #[test]fn all_waiting_tasks_expire_without_fabricated_ticks_or_dispatches(){
   use core::mem::ManuallyDrop;
   let _lock=LOCK.lock().unwrap();
@@ -2413,36 +2660,36 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
   let _lock=LOCK.lock().unwrap();
   struct Restore{
    tasks:ManuallyDrop<[MaybeUninit<Task>;TASKS]>,dirty:bool,
-   #[cfg(feature="test-ipc")]
+   #[cfg(any(feature="test-ipc",feature="normal-desktop"))]
    router:ManuallyDrop<Option<IpcRouter<4,8>>>,
    #[cfg(feature="test-r025")]
    services:ManuallyDrop<Option<R025Services>>,
-   #[cfg(feature="test-r031-vfs")]
+   #[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
    handles:ManuallyDrop<crate::fs_handles::FileHandles>,
-   #[cfg(feature="test-r031-vfs")]
+   #[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
    event_log:ManuallyDrop<crate::process_events::ProcessEvents<16>>,
   }
   impl Drop for Restore{fn drop(&mut self){unsafe{
    ptr::write(ptr::addr_of_mut!(M009_TASKS),ManuallyDrop::take(&mut self.tasks));
    SESSION_DIRTY=self.dirty;
-   #[cfg(feature="test-ipc")]
+   #[cfg(any(feature="test-ipc",feature="normal-desktop"))]
    ptr::write(ptr::addr_of_mut!(IPC_ROUTER),ManuallyDrop::take(&mut self.router));
    #[cfg(feature="test-r025")]
    ptr::write(ptr::addr_of_mut!(R025_SERVICES),ManuallyDrop::take(&mut self.services));
-   #[cfg(feature="test-r031-vfs")]
+   #[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
    ptr::write(ptr::addr_of_mut!(R031_HANDLES),ManuallyDrop::take(&mut self.handles));
-   #[cfg(feature="test-r031-vfs")]
+   #[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
    ptr::write(ptr::addr_of_mut!(R114_FILE_EVENTS),ManuallyDrop::take(&mut self.event_log));
   }}}
   let _restore=unsafe{Restore{
    tasks:ManuallyDrop::new(ptr::read(ptr::addr_of!(M009_TASKS))),dirty:SESSION_DIRTY,
-   #[cfg(feature="test-ipc")]
+   #[cfg(any(feature="test-ipc",feature="normal-desktop"))]
    router:ManuallyDrop::new(ptr::read(ptr::addr_of!(IPC_ROUTER))),
    #[cfg(feature="test-r025")]
    services:ManuallyDrop::new(ptr::read(ptr::addr_of!(R025_SERVICES))),
-   #[cfg(feature="test-r031-vfs")]
+   #[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
    handles:ManuallyDrop::new(ptr::read(ptr::addr_of!(R031_HANDLES))),
-   #[cfg(feature="test-r031-vfs")]
+   #[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
    event_log:ManuallyDrop::new(ptr::read(ptr::addr_of!(R114_FILE_EVENTS))),
   }};
   struct Memory{root:[u64;512],refuse:bool,releases:usize}
@@ -2467,7 +2714,7 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
    let task=&mut *task_ptr(0);task.pcb=&mut process;task.authority_live=true;
    task.saved=true;task.frame=[0x55;WORDS];task.image.ready=true;
    task.root=CloneResult{root:PAGE,table_count:1};
-   #[cfg(feature="test-ipc")]{
+   #[cfg(any(feature="test-ipc",feature="normal-desktop"))]{
     let mut boxes=IpcRouter::<4,8>::new().unwrap();
     boxes.register(1).unwrap();boxes.register(2).unwrap();
     boxes.send(1,2,b"stale outbound").unwrap();
@@ -2475,7 +2722,7 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
     IPC_ROUTER=Some(boxes);
    }
    #[cfg(feature="test-r025")]{R025_SERVICES=R025Services::new();}
-   #[cfg(feature="test-r031-vfs")]{
+   #[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]{
     R031_HANDLES=crate::fs_handles::FileHandles::new();
     R114_FILE_EVENTS=crate::process_events::ProcessEvents::new();
     task.file_generation=(&mut *ptr::addr_of_mut!(R031_HANDLES)).bind_process(1).unwrap().generation;
@@ -2485,11 +2732,11 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
    assert!(SESSION_DIRTY);assert!((*task_ptr(0)).pcb.is_null());
    assert!(!(*task_ptr(0)).authority_live);assert!(!(*task_ptr(0)).saved);
    assert_eq!((*task_ptr(0)).frame,[0;WORDS]);assert!(!(*task_ptr(0)).image.ready);
-   #[cfg(feature="test-ipc")]{
+   #[cfg(any(feature="test-ipc",feature="normal-desktop"))]{
     assert!(!(*task_ptr(0)).ipc_wait.active());assert!(router().is_none());
    }
    #[cfg(feature="test-r025")]{assert!(services().is_none());}
-   #[cfg(feature="test-r031-vfs")]{
+   #[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]{
     assert!(!(&*ptr::addr_of!(R031_HANDLES)).owns(crate::batch5_session::Identity{pid:1,generation:1}));
     assert_eq!((&*ptr::addr_of!(R114_FILE_EVENTS)).peek(),Some(
       crate::process_events::ProcessEvent{pid:1,
@@ -2517,16 +2764,16 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
     assert_eq!(consume_pid1_lifecycle_receipt(replacement,receipt),Err(()));
     assert_eq!((&*ptr::addr_of!(R114_FILE_EVENTS)).len(),0);
    }
-   #[cfg(feature="test-ipc")]{
+   #[cfg(any(feature="test-ipc",feature="normal-desktop"))]{
     let mut replacement=IpcRouter::<4,8>::new().unwrap();
     replacement.register(1).unwrap();replacement.register(2).unwrap();
     replacement.send(2,1,b"new incarnation").unwrap();IPC_ROUTER=Some(replacement);
    }
    // A delayed per-task retry cannot revoke a replacement PID's mailbox.
    assert!(!discard(task_ptr(0),&backend,false));
-   #[cfg(feature="test-r031-vfs")]
+   #[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
    assert_eq!((&*ptr::addr_of!(R114_FILE_EVENTS)).len(),0);
-   #[cfg(feature="test-ipc")]{assert_eq!(router().unwrap().pending(1),Ok(1));}
+   #[cfg(any(feature="test-ipc",feature="normal-desktop"))]{assert_eq!(router().unwrap().pending(1),Ok(1));}
    // Release refusal preserves physical ownership for a later retry.
    assert!(!cleanup_session(&backend,true));
    assert_eq!((*task_ptr(0)).root.root,PAGE);assert_eq!(memory.releases,0);
@@ -2534,7 +2781,7 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
    assert!(cleanup_session(&backend,true));assert!(!SESSION_DIRTY);
    assert_eq!((*task_ptr(0)).root.root,0);assert_eq!(memory.releases,1);
    assert!(cleanup_session(&backend,true));assert_eq!(memory.releases,1);
-   #[cfg(feature="test-r031-vfs")]{
+   #[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]{
     assert!((&*ptr::addr_of!(R031_HANDLES)).owns(crate::batch5_session::Identity{pid:1,generation:2}));
    }
   }
@@ -2597,8 +2844,8 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
  }
  #[test]fn saved_frame_requires_correct_privileges(){
   assert_eq!(WORDS,20);
-  assert_eq!(TASKS,if cfg!(feature="test-r031-supervisor"){4}
-      else if cfg!(feature="test-r029-desktop-suite"){3}else{2});
+  assert_eq!(TASKS,if cfg!(any(feature="test-r031-supervisor",feature="normal-desktop")){4}
+      else if cfg!(any(feature="test-r029-desktop-suite",feature="normal-desktop")){3}else{2});
   assert_eq!(core::mem::align_of::<Task>(),16);
   let mut t:Task=unsafe{core::mem::zeroed()};
   t.saved=true;t.frame[16]=0x2b;t.frame[19]=0x33;
@@ -2607,7 +2854,7 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
  }
 }
 
-#[cfg(all(test,feature="test-r031-vfs"))]
+#[cfg(all(test,any(feature="test-r031-vfs",feature="normal-desktop")))]
 mod r118_scheduler_file_event_atomicity_tests {
     use super::*;
     use crate::process_events::{EventKind,ProcessEvents};
@@ -2673,7 +2920,7 @@ mod r118_scheduler_file_event_atomicity_tests {
     }
 }
 
-#[cfg(all(test,feature="test-r031-files-gui"))]
+#[cfg(all(test,any(feature="test-r031-files-gui",feature="normal-desktop")))]
 mod r118_full_owner_retirement_integration_tests {
     use super::*;
     use crate::batch5_session::Identity;
@@ -2772,7 +3019,7 @@ mod r118_full_owner_retirement_integration_tests {
     }
 }
 
-#[cfg(all(test,feature="test-r031-files-gui"))]
+#[cfg(all(test,any(feature="test-r031-files-gui",feature="normal-desktop")))]
 mod r118_batched_real_scheduler_teardown_tests{
     use super::*;
     use crate::batch5_session::Identity;

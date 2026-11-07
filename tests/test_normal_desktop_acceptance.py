@@ -1,0 +1,307 @@
+"""Negative controls for actual normal desktop QEMU evidence, not a guest mock."""
+from pathlib import Path
+import struct
+import sys
+import unittest
+import zlib
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "tools"))
+try:
+    import test_normal_desktop_qemu as harness
+finally:
+    sys.path.pop(0)
+
+
+class NormalDesktopControls(unittest.TestCase):
+    def test_stopped_root_requires_one_real_physical_cr3(self):
+        class Monitor:
+            def __init__(self, response):
+                self.response = response
+            def hmp(self, command):
+                assert command == "info registers"
+                return self.response
+        self.assertEqual(harness.stopped_root(Monitor("CR2=0 CR3=0000000000123000 CR4=20")), 0x123000)
+        for response in ("", "CR3=garbage", "CR3=0", "CR3=123000 CR3=456000"):
+            with self.subTest(response=response), self.assertRaises(AssertionError):
+                harness.stopped_root(Monitor(response))
+
+    def test_kernel_guard_symbols_require_aligned_nonoverlapping_complete_objects(self):
+        symbols = ("ffff800000100000 0000000000005000 b indianos_kernel_core::interrupts::DF_STACK\n"
+                   "ffff800000200000 0000000000084000 b indianos_kernel_core::interrupts::USER_STACKS\n")
+        layout = harness.stack_guard_records(symbols)
+        self.assertEqual(len(layout), 5)
+        self.assertEqual(layout[0], (0xffff800000100000, 0xffff800000101000, 0xffff800000105000))
+        self.assertEqual(layout[-1][2] - layout[-1][1], 128 * 1024)
+        for bad in (symbols + symbols.splitlines()[0], symbols.splitlines()[0],
+                    symbols.replace("00084000", "00084004"),
+                    symbols.replace("ffff800000200000", "ffff800000100000"),
+                    symbols.replace("ffff800000100000", "ffff800000100001"),
+                    symbols.replace("ffff800000100000", "0000000000100000"),
+                    symbols.replace("ffff800000100000", "fffffffffffff000")):
+            with self.subTest(symbols=bad), self.assertRaises(AssertionError):
+                harness.stack_guard_records(bad)
+
+    def test_guest_guard_probe_requires_unreadable_guards_and_readable_stack_neighbors(self):
+        records = [(0xffff800000100000, 0xffff800000101000, 0xffff800000105000)]
+        class Debugger:
+            mapped_guard = False
+            missing_stack = False
+            def command(self, request):
+                self.request = request
+                return "00" if self.mapped_guard else "E14"
+            def memory(self, address, count):
+                if self.missing_stack:
+                    raise AssertionError("stack memory missing")
+                assert count == 1 and address in (records[0][1], records[0][2] - 1)
+                return b"\0"
+        debugger = Debugger()
+        evidence = []
+        harness.verify_debug_stack_guards(debugger, records, evidence, "test")
+        self.assertEqual(len(evidence), 1)
+        debugger.mapped_guard = True
+        with self.assertRaises(AssertionError):
+            harness.verify_debug_stack_guards(debugger, records, [], "test")
+        debugger.mapped_guard = False
+        debugger.missing_stack = True
+        with self.assertRaises(AssertionError):
+            harness.verify_debug_stack_guards(debugger, records, [], "test")
+
+    def transient_trace(self):
+        old = harness.READY.encode() + b"\n"
+        lines = ["IndianOS: fault vector=0x000000000000000e",
+                 "IndianOS: fault CR2=0x0000000060000000",
+                 "IndianOS: PID 4 FAULTED", "IndianOS: PID 4 REAPED",
+                 "IndianOS normal desktop: retired session verified restart-safe",
+                 "IndianOS normal desktop: restarting retired service session"]
+        lines += [f"IndianOS: PID {pid} {state}" for pid in (1, 2, 3, 4)
+                  for state in ("READY", "DISPATCHED")]
+        lines += ["desktop compositor denied input and filesystem authority",
+                  harness.COMPOSITOR, harness.READY]
+        return old + ("\n".join(lines) + "\n").encode(), len(old)
+
+    def test_transient_restart_accepts_fresh_execution_and_later_clean_reap(self):
+        trace, since = self.transient_trace()
+        harness.verify_transient_restart(trace, since)
+        clean = b"IndianOS: PID 4 REAPED\n" + harness.STOPPED.encode() + b"\n"
+        harness.verify_transient_restart(trace + clean, since)
+
+    def test_transient_restart_rejects_stale_missing_duplicate_and_wrong_fault_evidence(self):
+        trace, since = self.transient_trace()
+        for bad in (trace.replace(b"0000000060000000", b"0000000060001000"),
+                    trace.replace(b"fault vector=0x000000000000000e", b"fault vector=0x0000000000000006"),
+                    trace.replace(b"PID 4 FAULTED", b"PID 3 FAULTED"),
+                    trace.replace(b"PID 4 REAPED", b"PID 3 REAPED"),
+                    trace.replace(b"retired session verified restart-safe", b"unverified"),
+                    trace.replace(b"PID 2 DISPATCHED", b"PID 2 waiting"),
+                    trace.replace(harness.COMPOSITOR.encode(), b""),
+                    trace + b"IndianOS: PID 4 FAULTED\n",
+                    trace + harness.READY.encode(), trace + b"FATAL",
+                    trace + b"restart budget exhausted", trace + b"reason=desktop-session-failed",
+                    trace + b"IndianOS: PID 4 REAPED\n",
+                    trace + b"IndianOS: PID 4 REAPED\nIndianOS: PID 4 REAPED\n" + harness.STOPPED.encode()):
+            with self.subTest(trace=bad), self.assertRaises(AssertionError):
+                harness.verify_transient_restart(bad, since)
+        for stale in (0, len(trace), len(trace) + 1, -1):
+            with self.subTest(since=stale), self.assertRaises(AssertionError):
+                harness.verify_transient_restart(trace, stale)
+
+    def test_transient_restart_rejects_reordered_fault_and_readiness(self):
+        trace, since = self.transient_trace()
+        restart = b"IndianOS normal desktop: restarting retired service session\n"
+        wrong = trace[:since] + restart + trace[since:].replace(restart, b"")
+        with self.assertRaises(AssertionError):
+            harness.verify_transient_restart(wrong, since)
+        with self.assertRaises(AssertionError):
+            harness.verify_transient_restart(trace[:since] + harness.STOPPED.encode() + trace[since:], since)
+
+    def test_debugger_inspects_only_file_backed_executable_bytes(self):
+        elf = bytearray(4098)
+        elf[:7] = b"\x7fELF\x02\x01\x01"
+        struct.pack_into("<Q", elf, 32, 64)
+        struct.pack_into("<HH", elf, 54, 56, 1)
+        struct.pack_into("<IIQQQQQQ", elf, 64, 1, 5, 4096, 0x400000, 0x400000, 2, 2, 4096)
+        elf[-2:] = b"\x90\xc3"
+        self.assertEqual(harness.executable_bytes(elf, 0x400000, 2), b"\x90\xc3")
+        for source, address, count in ((elf, 0x400001, 2), (elf, 0x400000, 0),
+                                       (elf[:100], 0x400000, 1), (b"bad", 0, 1)):
+            with self.assertRaises(AssertionError):
+                harness.executable_bytes(source, address, count)
+        struct.pack_into("<I", elf, 68, 4)
+        with self.assertRaises(AssertionError):
+            harness.executable_bytes(elf, 0x400000, 1)
+
+    def test_debugger_protocol_rejects_wrong_checksums_disconnects_and_oversized_packets(self):
+        class Wire:
+            def __init__(self, data):
+                self.data = data
+                self.sent = []
+            def recv(self, count):
+                result, self.data = self.data[:count], self.data[count:]
+                return result
+            def sendall(self, data):
+                self.sent.append(data)
+        debugger = harness.GuestDebugger.__new__(harness.GuestDebugger)
+        debugger.sock = Wire(b"+$OK#9a")
+        self.assertEqual(debugger.command("?"), "OK")
+        self.assertEqual(debugger.sock.sent, [b"$?#3f", b"+"])
+        for invalid in (b"-$OK#9a", b"+$OK#00", b"", b"$" + b"x" * 16385):
+            debugger.sock = Wire(invalid)
+            with self.subTest(packet=invalid[:32]), self.assertRaises(AssertionError):
+                debugger.response()
+
+    def test_service_restart_requires_two_ordered_faults_and_exactly_one_retry(self):
+        fault = (b"IndianOS: PID 4 FAULTED\nIndianOS: PID 4 REAPED\n"
+                 b"IndianOS normal desktop: retired session verified restart-safe\n")
+        restart = b"IndianOS normal desktop: restarting retired service session\n"
+        exhausted = b"IndianOS normal desktop: restart budget exhausted\n"
+        recovery = b"IndianOS recovery: reason=desktop-session-failed\n"
+        trace = fault + restart + fault + exhausted + recovery
+        harness.verify_bounded_restart(trace)
+        for bad in (fault + recovery, trace + fault, trace + restart,
+                    restart + fault + fault + exhausted + recovery,
+                    trace.replace(exhausted, b""), trace + harness.READY.encode(),
+                    trace + b"FATAL", trace.replace(b"PID 4 REAPED", b"PID 3 REAPED", 1)):
+            with self.subTest(trace=bad), self.assertRaises(AssertionError):
+                harness.verify_bounded_restart(bad)
+
+    def test_fault_fixture_changes_only_executable_entry_bytes(self):
+        elf = bytearray(4098)
+        elf[:7] = b"\x7fELF\x02\x01\x01"
+        struct.pack_into("<HHIQQ", elf, 16, 2, 62, 1, 0x400000, 64)
+        struct.pack_into("<HHH", elf, 52, 64, 56, 1)
+        struct.pack_into("<IIQQQQQQ", elf, 64, 1, 5, 4096, 0x400000, 0x400000, 2, 2, 4096)
+        elf[4096:] = b"\x90\xc3"
+        name = b"/bin/compositor"
+        entry = struct.pack("<HHI", len(name), 0, len(elf)) + name + elf
+        archive = b"INDRAM01" + struct.pack("<II", 1, 16 + len(entry)) + entry
+        changed = harness.faulting_service(archive, name)
+        self.assertEqual(changed[:-2], elf[:-2])
+        self.assertEqual(changed[-2:], b"\x0f\x0b")
+        self.assertEqual(len(changed), len(elf))
+        with self.assertRaisesRegex(AssertionError, "missing"):
+            harness.faulting_service(archive, b"/bin/absent")
+        bad = archive.replace(b"\x7fELF", b"FAIL", 1)
+        with self.assertRaisesRegex(AssertionError, "not a native ELF"):
+            harness.faulting_service(bad, name)
+
+    def test_named_listing_requires_fresh_complete_exact_records(self):
+        line = b"IndianOS user: R055 Terminal directory: f:readme f:a d:docs\r\n"
+        harness.verify_listing(line, 0, {"f:readme", "f:a", "d:docs"})
+        for output, since in ((line, len(line)), (line.rstrip(b"\r\n"), 0),
+                              (line.replace(b"f:a", b"f:b"), 0),
+                              (line.replace(b"d:docs", b"f:a"), 0)):
+            with self.assertRaises(AssertionError):
+                harness.verify_listing(output, since, {"f:readme", "f:a", "d:docs"})
+
+    def test_named_input_rejects_unsafe_tokens_before_any_injection(self):
+        class Session:
+            def hmp(self, command):
+                raise AssertionError("unsafe input reached HMP")
+        for command in ("", "cat ../a", "put a=x;quit", "cat a\n", "cat A"):
+            with self.assertRaisesRegex(AssertionError, "unsupported physical"):
+                harness.type_named_command(Session(), command)
+
+    def trace(self):
+        lines = [f"IndianOS: PID {pid} {state}" for pid in (1, 2, 3, 4)
+                 for state in ("READY", "DISPATCHED")]
+        prefix = ("\n".join(lines + [harness.COMPOSITOR, harness.READY]) + "\n").encode()
+        tail = ("desktop selected volume synchronized\n" + harness.SHUTDOWN + "\n" +
+                "\n".join(f"IndianOS: PID {pid} REAPED" for pid in (1, 2, 3, 4)) +
+                "\n" + harness.STOPPED + "\n").encode()
+        return prefix + tail, len(prefix)
+
+    def test_actual_four_process_execution_sync_and_reaping_are_required(self):
+        trace, shutdown_at = self.trace()
+        harness.verify_runtime(trace, shutdown_at)
+        for pid in (1, 2, 3, 4):
+            for state in ("READY", "DISPATCHED", "REAPED"):
+                missing = trace.replace(f"IndianOS: PID {pid} {state}".encode(), b"absent")
+                with self.subTest(pid=pid, state=state), self.assertRaises(AssertionError):
+                    harness.verify_runtime(missing, shutdown_at)
+
+    def test_late_compositor_stale_sync_and_reordered_shutdown_are_rejected(self):
+        trace, offset = self.trace()
+        # Evidence received only after shutdown cannot establish startup.
+        moved = trace.replace(harness.COMPOSITOR.encode(), b"") + harness.COMPOSITOR.encode()
+        with self.assertRaises(AssertionError):
+            harness.verify_runtime(moved, offset)
+        for bad in (trace.replace(b"desktop selected volume synchronized", b"no barrier"),
+                    trace.replace(b"desktop selected volume synchronized\n" + harness.SHUTDOWN.encode(),
+                                  harness.SHUTDOWN.encode() + b"\ndesktop selected volume synchronized")):
+            with self.assertRaises(AssertionError):
+                harness.verify_runtime(bad, offset)
+        # A valid older trace cannot authorize a later empty shutdown attempt.
+        with self.assertRaises(AssertionError):
+            harness.verify_runtime(trace, len(trace))
+
+    def test_provisioning_console_and_fatal_routes_do_not_count_as_desktop(self):
+        trace, offset = self.trace()
+        for marker in (*harness.FORBIDDEN, b"FATAL",
+                       b"restarting retired service session", b"restart budget exhausted"):
+            with self.subTest(marker=marker), self.assertRaises(AssertionError):
+                harness.verify_runtime(trace + marker, offset)
+
+    def test_uart_cannot_masquerade_as_physical_input_or_visual_action(self):
+        frame = (640, 480, bytes(640 * 480 * 3))
+        harness.verify_uart_ignored(frame, frame, b"old physical marker", 19)
+        for marker in harness.UART_ACTIONS:
+            with self.assertRaises(AssertionError):
+                harness.verify_uart_ignored(frame, frame, marker, 0)
+        changed = bytearray(frame[2]); changed[0] = 1
+        with self.assertRaises(AssertionError):
+            harness.verify_uart_ignored(frame, (640, 480, bytes(changed)), b"", 0)
+
+    def test_only_explicit_partition_bytes_may_change(self):
+        original = bytes(harness.TOTAL * 512)
+        changed = bytearray(original); changed[harness.START * 512] = 1
+        harness.verify_guard(original, bytes(changed))
+        for offset in (0, harness.START * 512 - 1,
+                       (harness.START + harness.COUNT) * 512, len(original) - 1):
+            bad = bytearray(original); bad[offset] = 1
+            with self.subTest(offset=offset), self.assertRaises(AssertionError):
+                harness.verify_guard(original, bytes(bad))
+        with self.assertRaises(AssertionError):
+            harness.verify_guard(original, original[:-1])
+
+    def test_rotated_guid_fixture_has_valid_header_checksums_and_unchanged_neighbors(self):
+        original = bytes(harness.TOTAL * 512)
+        changed = harness.rotate_guid(original)
+        for lba in (1, 255):
+            header = bytearray(changed[lba * 512:lba * 512 + 92])
+            self.assertEqual(header[56:72], bytes([0x99]) * 16)
+            checksum = int.from_bytes(header[16:20], "little")
+            header[16:20] = bytes(4)
+            self.assertEqual(checksum, zlib.crc32(header))
+        for lba in range(harness.TOTAL):
+            if lba not in (1, 255):
+                self.assertEqual(changed[lba * 512:(lba + 1) * 512], bytes(512))
+
+    @staticmethod
+    def archive(entries):
+        body = b"".join(struct.pack("<HHI", len(name), 0, len(payload)) + name + payload
+                        for name, payload in entries)
+        return b"INDRAM01" + struct.pack("<II", len(entries), 16 + len(body)) + body
+
+    def test_failure_fixture_changes_only_requested_archive_entry(self):
+        entries = [(b"/bin/init", b"init bytes"), (b"/bin/compositor", b"ELF compositor"),
+                   (b"/etc/desktop-volume", bytes(64))]
+        original = self.archive(entries)
+        self.assertEqual(harness.rewrite_initramfs(original, b"/bin/compositor", None),
+                         self.archive([entries[0], entries[2]]))
+        self.assertEqual(harness.rewrite_initramfs(original, b"/bin/compositor", b"bad"),
+                         self.archive([entries[0], (b"/bin/compositor", b"bad"), entries[2]]))
+        with self.assertRaises(AssertionError):
+            harness.rewrite_initramfs(original, b"/bin/missing", None)
+
+    def test_invalid_source_archive_is_not_used_to_produce_false_failure_evidence(self):
+        valid = self.archive([(b"/bin/init", b"payload")])
+        for bad in (b"", valid + b"trailing", valid[:-1],
+                    b"BROKEN!!" + valid[8:], self.archive([(b"/bin/init", b"one"),
+                                                          (b"/bin/init", b"two")])):
+            with self.assertRaises(AssertionError):
+                harness.rewrite_initramfs(bad, b"/bin/init", b"new")
+
+
+if __name__ == "__main__":
+    unittest.main()
