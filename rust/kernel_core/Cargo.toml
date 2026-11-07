@@ -18,6 +18,8 @@ default = ["std"]
 std = []
 # Production single-process bootstrap, separate from experimental desktop profiles.
 normal-init = ["user-runtime"]
+# Native four-service desktop; never enables a disposable-media test profile.
+normal-desktop = ["user-runtime", "kernel-main", "pmm", "limine-requests"]
 preempt = []
 cpu-entry = []
 vmm = []

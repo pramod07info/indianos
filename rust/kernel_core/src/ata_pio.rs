@@ -158,7 +158,7 @@ fn capacity(words:&[u16;256])->Option<u64>{
     if sectors==0{return None;}
     Some(sectors.min(MAX_LBA28))
 }
-pub struct AtaPio { sectors:u64, last_stage:AtaStage }
+pub struct AtaPio { sectors:u64, last_stage:AtaStage, retired:bool }
 impl AtaPio {
     /// # Safety
     /// Only call on a single-core x86-64 guest with QEMU IDE primary master.
@@ -179,7 +179,29 @@ impl AtaPio {
         for word in &mut words{*word=unsafe{inw(DATA)};}
         complete()?;
         let sectors=capacity(&words).ok_or(BlockError::Io)?;
-        Ok(Self{sectors,last_stage:AtaStage::Idle})
+        Ok(Self{sectors,last_stage:AtaStage::Idle,retired:false})
+    }
+    /// A failed transfer may have consumed data or partially changed media.
+    /// Do not issue another command on that uncertain session. Recovery owns
+    /// explicit device reprobe; this driver never resets/retries a command.
+    fn run_io(&mut self,operation:impl FnOnce(&mut Self)->Result<(),BlockError>)
+        ->Result<(),BlockError>{
+        if self.retired{return Err(BlockError::Io);}
+        self.retired=true;
+        operation(self)?;
+        self.retired=false;
+        Ok(())
+    }
+    fn flush_cache(&mut self)->Result<(),BlockError>{
+        self.last_stage=AtaStage::WaitIdle;
+        complete()?;
+        self.last_stage=AtaStage::FlushCommand;
+        unsafe{outb(STATUS,0xe7);} // ATA FLUSH CACHE
+        settle();
+        self.last_stage=AtaStage::FlushDone;
+        complete()?;
+        self.last_stage=AtaStage::Idle;
+        Ok(())
     }
     /// Capture the last failed phase and live ATA task-file status.
     /// This does not reset or retry a possibly partially committed write.
@@ -214,11 +236,13 @@ impl AtaPio {
 impl BlockDevice for AtaPio {
     fn sector_count(&self)->u64{self.sectors}
     fn read_sector(&mut self,lba:u64,out:&mut [u8;SECTOR_BYTES])->Result<(),BlockError>{
-        self.select(lba,0x20)?;
-        self.last_stage=AtaStage::ReadWords;
+        check_range(self.sectors,lba,1)?;
+        self.run_io(|device|{
+        device.select(lba,0x20)?;
+        device.last_stage=AtaStage::ReadWords;
         // All 256 words must be consumed and DRQ deasserted before
         // publishing bytes or issuing the next command.
-        let last_stage=&mut self.last_stage;
+        let last_stage=&mut device.last_stage;
         read_words_staged(out,||unsafe{inw(DATA)},||{
             *last_stage=AtaStage::ReadDone;
             // ATA requires a 400ns settle after the last PIO word before
@@ -226,12 +250,15 @@ impl BlockDevice for AtaPio {
             settle();
             complete()
         })?;
-        self.last_stage=AtaStage::Idle;
+        device.last_stage=AtaStage::Idle;
         Ok(())
+        })
     }
     fn write_sector(&mut self,lba:u64,data:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
-        self.select(lba,0x30)?;
-        self.last_stage=AtaStage::WriteWords;
+        check_range(self.sectors,lba,1)?;
+        self.run_io(|device|{
+        device.select(lba,0x30)?;
+        device.last_stage=AtaStage::WriteWords;
         for pair in data.chunks_exact(2){
             unsafe{outw(DATA,u16::from_le_bytes([pair[0],pair[1]]));}
         }
@@ -239,27 +266,50 @@ impl BlockDevice for AtaPio {
         // polling too soon is especially unreliable under QEMU TCG.
         settle();
         // Do not issue FLUSH while the drive still has DRQ asserted.
-        self.last_stage=AtaStage::WriteDone;
+        device.last_stage=AtaStage::WriteDone;
         complete()?;
-        self.sync()
+        device.flush_cache()
+        })
     }
     fn sync(&mut self)->Result<(),BlockError>{
         // Physical ATA FLUSH CACHE is an explicit durability barrier; do
         // not acknowledge filesystem fsync before the controller completes.
-        self.last_stage=AtaStage::WaitIdle;
-        complete()?;
-        self.last_stage=AtaStage::FlushCommand;
-        unsafe{outb(STATUS,0xe7);} // ATA FLUSH CACHE
-        settle();
-        self.last_stage=AtaStage::FlushDone;
-        complete()?;
-        self.last_stage=AtaStage::Idle;
-        Ok(())
+        self.run_io(Self::flush_cache)
     }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn storage_retirement_rejects_followup_hardware_commands_after_uncertain_io(){
+        for stage in [AtaStage::ReadDone,AtaStage::WriteDone,AtaStage::FlushDone]{
+            let mut disk=AtaPio{sectors:16,last_stage:AtaStage::Idle,retired:false};
+            let mut commands=0;
+            assert_eq!(disk.run_io(|device|{
+                commands+=1;device.last_stage=stage;Err(BlockError::Io)
+            }),Err(BlockError::Io));
+            assert!(disk.retired);assert_eq!(disk.last_stage,stage);
+            assert_eq!(disk.run_io(|_|{commands+=1;Ok(())}),Err(BlockError::Io));
+            // These are the actual hardware entrypoints. On a retired session
+            // they must return before any privileged port instruction executes.
+            let mut out=[0xa5;SECTOR_BYTES];
+            assert_eq!(disk.read_sector(0,&mut out),Err(BlockError::Io));
+            assert_eq!(disk.write_sector(0,&[7;SECTOR_BYTES]),Err(BlockError::Io));
+            assert_eq!(disk.sync(),Err(BlockError::Io));
+            assert_eq!(out,[0xa5;SECTOR_BYTES]);assert_eq!(commands,1);
+        }
+    }
+    #[test]
+    fn storage_retirement_success_and_range_errors_do_not_revoke_live_device(){
+        let mut disk=AtaPio{sectors:16,last_stage:AtaStage::Idle,retired:false};
+        for _ in 0..2{
+            assert_eq!(disk.run_io(|_|Ok(())),Ok(()));assert!(!disk.retired);
+        }
+        assert_eq!(disk.read_sector(16,&mut[0;SECTOR_BYTES]),Err(BlockError::OutOfRange));
+        assert_eq!(disk.write_sector(u64::MAX,&[0;SECTOR_BYTES]),Err(BlockError::OutOfRange));
+        assert!(!disk.retired);
+    }
 
     #[test]
     fn m1_r088_staged_pio_read_exposes_no_bytes_on_completion_error(){

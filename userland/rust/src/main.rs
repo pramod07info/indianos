@@ -13,8 +13,12 @@ use core::panic::PanicInfo;
 mod bootstrap;
 #[cfg(any(feature="shell",feature="interactive",feature="r026-shell"))]
 mod shell;
-#[cfg(any(feature="r031-files-shell",feature="r031-files-terminal"))]
+#[cfg(any(any(feature="r031-files-shell",feature="desktop-init"),any(feature="r031-files-terminal",feature="desktop-terminal")))]
 mod terminal_line;
+#[cfg(any(feature="r031-files-shell",feature="desktop-init",feature="r031-files-terminal",feature="desktop-terminal"))]
+mod terminal_fs;
+#[cfg(feature="desktop-compositor")]
+mod desktop_window;
 
 #[panic_handler]
 fn panic(_info: &PanicInfo<'_>) -> ! { exit(125) }
@@ -235,7 +239,7 @@ fn interactive_shell()->!{
           feature="r029-frame-server",feature="r029-frame-client",
           feature="r029-suite-shell",feature="r029-suite-files",feature="r029-suite-terminal",
           feature="r031-shell",feature="r031-files",feature="r031-terminal",
-          feature="r031-files-shell",feature="r031-files-app",feature="r031-files-terminal",
+          any(feature="r031-files-shell",feature="desktop-init"),any(feature="r031-files-app",feature="desktop-files"),any(feature="r031-files-terminal",feature="desktop-terminal"),
           feature="r031-supervisor-shell",feature="r031-supervisor-files",feature="r031-supervisor-terminal"))]
 fn r029_command(window:u32,kind:u32,x:u16,y:u16,width:u16,height:u16,
     rgb:u32,text:&[u8])->[u8;64]
@@ -257,7 +261,7 @@ fn r029_command(window:u32,kind:u32,x:u16,y:u16,width:u16,height:u16,
           feature="r029-frame-server",feature="r029-frame-client",
           feature="r029-suite-shell",feature="r029-suite-files",feature="r029-suite-terminal",
           feature="r031-shell",feature="r031-files",feature="r031-terminal",
-          feature="r031-files-shell",feature="r031-files-app",feature="r031-files-terminal",
+          any(feature="r031-files-shell",feature="desktop-init"),any(feature="r031-files-app",feature="desktop-files"),any(feature="r031-files-terminal",feature="desktop-terminal"),
           feature="r031-supervisor-shell",feature="r031-supervisor-files",feature="r031-supervisor-terminal"))]
 fn r029_draw(cmd:&[u8;64]){
     if call(18,cmd.as_ptr() as u64,64)!=0{exit(91);}
@@ -266,7 +270,7 @@ fn r029_draw(cmd:&[u8;64]){
           feature="r029-frame-server",feature="r029-frame-client",
           feature="r029-suite-shell",feature="r029-suite-files",feature="r029-suite-terminal",
           feature="r031-shell",feature="r031-files",feature="r031-terminal",
-          feature="r031-files-shell",feature="r031-files-app",feature="r031-files-terminal",
+          any(feature="r031-files-shell",feature="desktop-init"),any(feature="r031-files-app",feature="desktop-files"),any(feature="r031-files-terminal",feature="desktop-terminal"),
           feature="r031-supervisor-shell",feature="r031-supervisor-files",feature="r031-supervisor-terminal"))]
 fn r029_wait_for_host(){
     let mut byte=[0u8;1];
@@ -487,9 +491,9 @@ fn r029_frame_client()->!{
 }
 // Integrated R029.5-7: PID1 desktop controller, PID2 Files, PID3 Terminal.
 // All clients are distinct protected x86-64 ELF64 images.
-#[cfg(any(feature="r029-suite-shell",feature="r029-suite-files",feature="r029-suite-terminal",
+#[cfg(any(feature="desktop-compositor",feature="r029-suite-shell",feature="r029-suite-files",feature="r029-suite-terminal",
           feature="r031-shell",feature="r031-files",feature="r031-terminal",
-          feature="r031-files-shell",feature="r031-files-app",feature="r031-files-terminal",
+          any(feature="r031-files-shell",feature="desktop-init"),any(feature="r031-files-app",feature="desktop-files"),any(feature="r031-files-terminal",feature="desktop-terminal"),
           feature="r031-supervisor-shell",feature="r031-supervisor-files",feature="r031-supervisor-terminal"))]
 fn suite_send(dst:u32,bytes:&[u8]){
     if bytes.len()>64{exit(140);}
@@ -498,9 +502,9 @@ fn suite_send(dst:u32,bytes:&[u8]){
     packet[4..4+bytes.len()].copy_from_slice(bytes);
     if call(8,packet.as_ptr() as u64,(bytes.len()+4) as u64)!=0{exit(141);}
 }
-#[cfg(any(feature="r029-suite-shell",feature="r029-suite-files",feature="r029-suite-terminal",
+#[cfg(any(feature="desktop-compositor",feature="r029-suite-shell",feature="r029-suite-files",feature="r029-suite-terminal",
           feature="r031-shell",feature="r031-files",feature="r031-terminal",
-          feature="r031-files-shell",feature="r031-files-app",feature="r031-files-terminal",
+          any(feature="r031-files-shell",feature="desktop-init"),any(feature="r031-files-app",feature="desktop-files"),any(feature="r031-files-terminal",feature="desktop-terminal"),
           feature="r031-supervisor-shell",feature="r031-supervisor-files",feature="r031-supervisor-terminal"))]
 fn suite_receive(sender:u32,payload:&[u8]){
     let mut response=[0u8;72];
@@ -659,14 +663,18 @@ fn r030_exec()->!{
 // R031.9 Files runs in its own PID2; it cannot enumerate /etc or
 // access raw storage. A narrow read-only syscall lists /shared; file
 // data is read using the existing process-owned file capability ABI.
-#[cfg(feature="r031-files-app")]
+#[cfg(any(feature="r031-files-app",feature="desktop-files"))]
 fn files_shared_listing(data:&mut [u8;256])->usize{
     let mut desc=[0u8;64];
     desc[..7].copy_from_slice(b"/shared");
     desc[48..56].copy_from_slice(&(data.as_mut_ptr() as u64).to_le_bytes());
     desc[56..64].copy_from_slice(&72u64.to_le_bytes());
     let count=call(34,1,desc.as_ptr() as u64);
+    #[cfg(not(feature="desktop-files"))]
     if count!=9||&data[..9]!=b"f:readme\n"{exit(200);}
+    #[cfg(feature="desktop-files")]
+    if count>72||data[..count as usize].iter().any(|b|*b!=b'\n'&&!(0x20..=0x7e).contains(b))||
+       (count>0&&data[count as usize-1]!=b'\n'){exit(200);}
     // PID2 cannot enumerate any private location.
     desc[..8].copy_from_slice(b"/etc\0\0\0\0");
     if call(34,1,desc.as_ptr() as u64)!=u64::MAX{exit(201);}
@@ -703,14 +711,18 @@ fn files_shared_listing(data:&mut [u8;256])->usize{
     }
     write(b"R117 QEMU PID2 stack guard and crossing descriptor pointers denied");
     write(b"R114 PID2 ring3 invalid pointer, private path and denied write blocked");
-    9
+    count as usize
 }
-#[cfg(feature="r031-files-app")]
+#[cfg(any(feature="r031-files-app",feature="desktop-files"))]
 fn files_shared_content(data:&mut [u8;256])->usize{
     let token=file_handle_call(1,b"/shared/readme",0,1,data,0);
+    #[cfg(feature="desktop-files")]
+    if token==u64::MAX||token==0{data[..18].copy_from_slice(b"README UNAVAILABLE");return 18;}
     if token==u64::MAX||token==0{exit(202);}
     let count=file_handle_call(2,b"",token,0,data,72);
     if file_handle_call(5,b"",token,0,data,0)!=0{exit(203);}
+    #[cfg(feature="desktop-files")]
+    if count==0{data[..10].copy_from_slice(b"EMPTY FILE");return 10;}
     if count==0||count>20{exit(204);}
     let bytes=&data[..count as usize];
     if bytes.iter().any(|b|!(0x20..=0x7e).contains(b)){exit(205);}
@@ -721,26 +733,42 @@ fn files_shared_content(data:&mut [u8;256])->usize{
     }else{b"R051 Files rendered persisted Terminal content"});
     count as usize
 }
-#[cfg(feature="r031-files-app")]
+#[cfg(feature="desktop-files")]
+fn files_directory_field(data:&[u8],operation:u32){
+    let mut text=[0u8;22];
+    let len=if data.is_empty(){text[..5].copy_from_slice(b"EMPTY");5}else{
+        let len=data.len().min(22);
+        for (out,byte) in text[..len].iter_mut().zip(data){*out=if *byte==b'\n'{b' '}else{*byte};}
+        if data.len()>22{text[19..22].copy_from_slice(b"...");}len
+    };
+    r029_draw(&r029_command(1,operation,18,163,264,14,0x00ffffff,&text[..len]));
+}
+#[cfg(any(feature="r031-files-app",feature="desktop-files"))]
 fn files_gui_initial(){
     let mut data=[0u8;256];
-    files_shared_listing(&mut data);
+    let listing=files_shared_listing(&mut data);
     r029_draw(&r029_command(1,2,18,140,204,14,0x00ffffff,b"/shared"));
+    #[cfg(not(feature="desktop-files"))]
     r029_draw(&r029_command(1,2,18,163,156,14,0x00ffffff,b"f:readme"));
+    #[cfg(feature="desktop-files")]
+    files_directory_field(&data[..listing],2);
+    #[cfg(not(feature="desktop-files"))]let _=listing;
     let len=files_shared_content(&mut data);
     r029_draw(&r029_command(1,2,18,190,240,14,0x00ffffff,&data[..len]));
     write(b"R031.9 real file and directory contents rendered into Files window");
 }
-#[cfg(feature="r031-files-app")]
+#[cfg(any(feature="r031-files-app",feature="desktop-files"))]
 fn files_gui_refresh(){
     let mut data=[0u8;256];
-    files_shared_listing(&mut data);
+    let listing=files_shared_listing(&mut data);
+    #[cfg(feature="desktop-files")]files_directory_field(&data[..listing],3);
+    #[cfg(not(feature="desktop-files"))]let _=listing;
     let len=files_shared_content(&mut data);
     // Replace the existing field; repeated saves do not consume new slots.
     r029_draw(&r029_command(1,3,18,190,240,14,0x00ffffff,&data[..len]));
     write(b"R031.9 Files refreshed on-disk content after desktop IPC");
 }
-#[cfg(feature="r031-files-shell")]
+#[cfg(any(feature="r031-files-shell",feature="desktop-init"))]
 fn shell_prepare_shared_data(){
     let mut data=[0u8;256];
     let count=vfs_call(4,b"/shared/readme",b"",&mut data,0);
@@ -758,7 +786,7 @@ fn shell_prepare_shared_data(){
     if vfs_call(8,b"/shared",b"",&mut data,0)!=9||
        &data[..9]!=b"f:readme\n"{exit(210);}
 }
-#[cfg(any(feature="r031-files-shell",feature="r031-files-terminal"))]
+#[cfg(any(any(feature="r031-files-shell",feature="desktop-init"),any(feature="r031-files-terminal",feature="desktop-terminal")))]
 fn terminal_receive(sender:u32,out:&mut[u8;72])->usize{
     loop{
         // Authenticated cooperative wait, not an unbounded userland poll loop.
@@ -771,7 +799,54 @@ fn terminal_receive(sender:u32,out:&mut[u8;72])->usize{
         return size;
     }
 }
-#[cfg(feature="r031-files-shell")]
+#[cfg(feature="desktop-init")]
+fn desktop_child_kind(name:&terminal_fs::Name)->Option<u8>{
+    let mut data=[0u8;256];let n=vfs_call(8,b"/shared",b"",&mut data,0);
+    if n>64{return None;}
+    for record in data[..n as usize].split(|b|*b==b'\n'){
+        if record.len()>=3&&record[1]==b':'&&&record[2..]==name.as_bytes(){
+            return match record[0]{b'f'=>Some(b'f'),b'd'=>Some(b'd'),_=>None};
+        }
+    }
+    None
+}
+#[cfg(feature="desktop-init")]
+fn desktop_named_command(command:terminal_fs::Command){
+    use terminal_fs::Command;
+    let mut path=[0u8;24];let mut target=[0u8;24];let mut data=[0u8;256];
+    let result=match command{
+        Command::Read(name)=>{
+            let len=name.path(&mut path);let n=vfs_call(4,&path[..len],b"",&mut data,0);
+            if n>20||data[..n as usize].iter().any(|b|!(0x20..=0x7e).contains(b)){
+                suite_send(3,b"E");return;
+            }
+            let mut reply=[0u8;21];reply[0]=b'D';reply[1..1+n as usize].copy_from_slice(&data[..n as usize]);
+            suite_send(3,&reply[..1+n as usize]);write(b"desktop broker read named selected-volume file");return;
+        },
+        Command::Touch(name)=>{let len=name.path(&mut path);vfs_call(3,&path[..len],b"",&mut data,0)},
+        Command::Mkdir(name)=>{let len=name.path(&mut path);vfs_call(1,&path[..len],b"",&mut data,0)},
+        Command::Remove(name)=>{
+            let Some(kind)=desktop_child_kind(&name)else{suite_send(3,b"E");return;};
+            let len=name.path(&mut path);vfs_call(if kind==b'd'{2}else{6},&path[..len],b"",&mut data,0)
+        },
+        Command::Move{from,to}=>{
+            let Some(kind)=desktop_child_kind(&from)else{suite_send(3,b"E");return;};
+            let len=from.path(&mut path);let target_len=to.path(&mut target);
+            vfs_call(if kind==b'd'{9}else{7},&path[..len],&target[..target_len],&mut data,0)
+        },
+        Command::Put{name,bytes,len}=>{
+            let path_len=name.path(&mut path);data[..len as usize].copy_from_slice(&bytes[..len as usize]);
+            vfs_call(5,&path[..path_len],b"",&mut data,len as usize)
+        },
+    };
+    if result!=0{suite_send(3,b"E");return;}
+    // Publication is complete before any redraw; a failed syscall is never
+    // retried or turned into a different mutation based on a generic error.
+    suite_send(2,b"REFRESH");let mut updated=[0u8;72];let n=terminal_receive(2,&mut updated);
+    if &updated[8..8+n]!=b"UPDATED"{exit(218);}
+    suite_send(3,b"O");write(b"desktop broker committed named selected-volume mutation and refreshed Files");
+}
+#[cfg(any(feature="r031-files-shell",feature="desktop-init"))]
 fn terminal_exchange(byte:u8,begin:bool)->bool{
     if begin{suite_send(3,b"B");}else{suite_send(3,&[b'K',byte]);}
     let mut response=[0u8;72];
@@ -808,6 +883,13 @@ fn terminal_exchange(byte:u8,begin:bool)->bool{
                     write(b"R055 PID1 measured persistent note through bounded broker");
                 }
             },
+            message if message.first()==Some(&b'F')=>{
+                #[cfg(feature="desktop-init")]
+                if let Some(command)=terminal_fs::decode(message){desktop_named_command(command);}
+                else{suite_send(3,b"E");}
+                #[cfg(not(feature="desktop-init"))]
+                suite_send(3,b"E");
+            },
             b"R"=>{
                 let mut data=[0u8;256];
                 let n=vfs_call(4,b"/shared/readme",b"",&mut data,0);
@@ -840,11 +922,11 @@ fn terminal_exchange(byte:u8,begin:bool)->bool{
         }
     }
 }
-#[cfg(feature="r031-files-terminal")]
+#[cfg(any(feature="r031-files-terminal",feature="desktop-terminal"))]
 fn terminal_field(text:&[u8]){
     r029_draw(&r029_command(2,3,24,181,270,14,0x00ffffff,text));
 }
-#[cfg(feature="r031-files-terminal")]
+#[cfg(any(feature="r031-files-terminal",feature="desktop-terminal"))]
 fn terminal_service(){
     use terminal_line::{Action,Line};
     let mut line=Line::new();let mut editing=false;
@@ -873,6 +955,16 @@ fn terminal_service(){
                             Action::Read=>suite_send(1,b"R"),
                             Action::List=>suite_send(1,b"L"),
                             Action::Stat=>suite_send(1,b"S"),
+                            Action::Filesystem(command)=>{
+                                #[cfg(feature="desktop-terminal")]
+                                {
+                                    let mut request=[0u8;64];
+                                    let Some(n)=terminal_fs::encode(command,&mut request)else{exit(220);};
+                                    suite_send(1,&request[..n]);
+                                }
+                                #[cfg(not(feature="desktop-terminal"))]
+                                {let _=command;terminal_field(b"INVALID COMMAND");suite_send(1,b"A");continue;}
+                            },
                             Action::Write{bytes,len}=>{
                                 let mut request=[0u8;21];request[0]=b'W';
                                 request[1..1+len].copy_from_slice(&bytes[..len]);
@@ -900,9 +992,9 @@ fn terminal_service(){
                                 let mut report=*b"R055 Terminal stat: 00 BYTES";
                                 report[20..22].copy_from_slice(&data[1..]);write(&report);
                             },
-                            data if (2..=21).contains(&data.len())&&data[0]==b'D'&&
+                            data if (1..=21).contains(&data.len())&&data[0]==b'D'&&
                                 data[1..].iter().all(|b|(0x20..=0x7e).contains(b))=>{
-                                terminal_field(&data[1..]);
+                                terminal_field(if data.len()==1{b"EMPTY FILE"}else{&data[1..]});
                                 write(b"R051 Terminal displayed brokered persistent note");
                                 let prefix=b"R051 Terminal readback: ";
                                 let mut readback=[0u8;64];
@@ -923,7 +1015,7 @@ fn terminal_service(){
 }
 // Guest-visible local UDP syscall 36. The claim is intentionally supplied
 // from userspace and must be compared to the independently authenticated PCB.
-#[cfg(any(feature="r031-files-shell",feature="r031-files-app",feature="r031-files-terminal"))]
+#[cfg(any(any(feature="r031-files-shell",feature="desktop-init"),any(feature="r031-files-app",feature="desktop-files"),any(feature="r031-files-terminal",feature="desktop-terminal")))]
 fn local_udp(op:u64,claimed:u32,source:u16,destination:u16,
              address:u64,length:usize)->u64 {
  let mut descriptor=[0u8;64];
@@ -934,21 +1026,77 @@ fn local_udp(op:u64,claimed:u32,source:u16,destination:u16,
  descriptor[16..24].copy_from_slice(&address.to_le_bytes());
  call(36,op,descriptor.as_ptr() as u64)
 }
-#[cfg(any(feature="r031-files-shell",feature="r031-files-app"))]
+#[cfg(any(any(feature="r031-files-shell",feature="desktop-init"),any(feature="r031-files-app",feature="desktop-files")))]
 fn local_bind(pid:u32,source:u16){
  if local_udp(1,pid,source,0,0,0)!=0{exit(229);}
 }
-#[cfg(any(feature="r031-files-shell",feature="r031-files-app"))]
+#[cfg(any(any(feature="r031-files-shell",feature="desktop-init"),any(feature="r031-files-app",feature="desktop-files")))]
 fn local_send(pid:u32,source:u16,destination:u16,payload:&[u8]){
  if local_udp(2,pid,source,destination,payload.as_ptr() as u64,
               payload.len())!=0{exit(230);}
 }
+// The normal session routes policy to PID4 through authenticated IPC.
+#[cfg(any(feature="desktop-init",feature="desktop-compositor"))]
+fn desktop_receive(sender:u32,out:&mut[u8;72])->usize{
+    loop{
+        let n=call(35,out.as_mut_ptr() as u64,32);
+        if n==0{continue;}
+        if !(8..=72).contains(&n)||u32::from_le_bytes(out[..4].try_into().unwrap())!=sender{exit(244);}
+        let len=u32::from_le_bytes(out[4..8].try_into().unwrap()) as usize;
+        if len>64||n!=len as u64+8{exit(245);}
+        return len;
+    }
+}
+#[cfg(feature="desktop-init")]
+fn desktop_control(request:&[u8])->u32{
+    suite_send(4,request);
+    let mut reply=[0u8;72];let n=desktop_receive(4,&mut reply);
+    if n!=2||reply[8]!=b'A'||!matches!(reply[9],1|2){exit(246);}
+    reply[9] as u32
+}
+#[cfg(any(feature="r031-shell",feature="r031-supervisor-shell",feature="r031-files-shell",feature="desktop-init"))]
+fn desktop_present(front:u32)->u64{
+    #[cfg(feature="desktop-init")]{if !(1..=2).contains(&front){return u64::MAX;}desktop_control(&[b'P',front as u8]);0}
+    #[cfg(not(feature="desktop-init"))]{call(23,front as u64,0)}
+}
+#[cfg(any(feature="r031-shell",feature="r031-supervisor-shell",feature="r031-files-shell",feature="desktop-init"))]
+fn desktop_key(key:u8)->u64{
+    #[cfg(feature="desktop-init")]{desktop_control(&[b'K',key]);0}
+    #[cfg(not(feature="desktop-init"))]{let action=match key{b'1'=>1,b'2'=>2,b'h'=>3,b'm'=>4,b'r'=>5,b'a'=>6,_=>return u64::MAX};call(24,action,0)}
+}
+#[cfg(feature="desktop-compositor")]
+fn desktop_compositor()->!{
+    if call(4,0,0)!=4||call(6,0,1)!=u64::MAX||call(22,0,0)!=u64::MAX||
+       call(23,1,0)!=u64::MAX||call(24,1,0)!=u64::MAX{exit(247);}
+    let mut denied=[0u8;64];denied[..14].copy_from_slice(b"/shared/readme");
+    let mut byte=0u8;
+    if call(6,core::ptr::addr_of_mut!(byte) as u64,1)!=u64::MAX||
+       call(32,4,denied.as_ptr() as u64)!=u64::MAX||call(33,1,denied.as_ptr() as u64)!=u64::MAX{exit(247);}
+    write(b"desktop compositor denied input and filesystem authority");
+    let mut state=[0u8;64];
+    if call(37,0,state.as_mut_ptr() as u64)!=0{exit(248);}
+    let Some(mut manager)=desktop_window::Manager::new(&state)else{exit(249);};
+    suite_send(1,b"COMPOSITOR");write(b"desktop compositor PID4 ready");
+    loop{
+        let mut request=[0u8;72];let len=desktop_receive(1,&mut request);
+        if &request[8..8+len]==b"EXIT"{
+            suite_send(1,b"STOPPED");
+            // Let the waiting broker receive its acknowledgement before the
+            // router revokes all outbound messages on process termination.
+            yield_now();write(b"desktop compositor PID4 stopped");exit(0);
+        }
+        if manager.control(&request[8..8+len]).is_none(){exit(250);}
+        let state=manager.wire();
+        if call(37,1,state.as_ptr() as u64)!=0{exit(251);}
+        suite_send(1,&[b'A',manager.front()]);
+    }
+}
 // R031.1: automatic boot-to-desktop QEMU session, real ring-3 PID1
 // system-service policy. PID2 Files and PID3 Terminal are independent ELF
 // images, never framebuffer-mapped; all chrome changes are capability checked.
-#[cfg(any(feature="r031-shell",feature="r031-supervisor-shell",feature="r031-files-shell"))]
+#[cfg(any(feature="r031-shell",feature="r031-supervisor-shell",any(feature="r031-files-shell",feature="desktop-init")))]
 fn r031_shell()->!{
-    if call(4,0,0)!=1 ||call(22,0,0)!=0||
+    if call(4,0,0)!=1 ||call(22,0,0)!=(if cfg!(feature="desktop-init"){u64::MAX}else{0})||
        call(25,0,1)!=u64::MAX ||call(24,0,0)!=u64::MAX{exit(171);}
     #[cfg(feature="r031-supervisor-shell")]
     if call(26,0,0)!=0{exit(193);}
@@ -959,6 +1107,13 @@ fn r031_shell()->!{
         local_bind(1,5501);
         if local_udp(1,2,5501,0,0,0)!=u64::MAX{exit(231);}
         write(b"R114 PID1 ring3 forged UDP owner denied");
+    }
+    #[cfg(feature="desktop-init")]
+    {
+        let mut state=[0u8;64];
+        if call(37,0,state.as_mut_ptr() as u64)!=u64::MAX||
+           call(37,1,state.as_ptr() as u64)!=u64::MAX{exit(252);}
+        write(b"desktop PID1 denied compositor window authority");
     }
     write(b"R031.1 init launching GUI services without test-driver keystrokes");
     yield_now();
@@ -989,9 +1144,15 @@ fn r031_shell()->!{
     }
     #[cfg(not(feature="r031-supervisor-shell"))]
     suite_receive(3,b"TERMINAL");
-    let expected_commands=if cfg!(feature="r031-files-shell"){5|(2<<8)}
+    let expected_commands=if cfg!(any(feature="r031-files-shell",feature="desktop-init")){5|(2<<8)}
                           else{2|(2<<8)};
-    if call(22,0,0)!=expected_commands||call(23,1,0)!=0{exit(172);}
+    #[cfg(not(feature="desktop-init"))]
+    if call(22,0,0)!=expected_commands{exit(172);}
+    #[cfg(feature="desktop-init")]
+    suite_receive(4,b"COMPOSITOR");
+    if desktop_present(1)!=0{exit(172);}
+    #[cfg(feature="desktop-init")]
+    write(b"normal desktop READY: PID1 broker PID2 Files PID3 Terminal PID4 compositor");
     #[cfg(feature="r031-supervisor-shell")]
     write(b"R031.2 RESTORED DESKTOP READY: PID1 PID2 Files PID4 Terminal");
     #[cfg(not(feature="r031-supervisor-shell"))]
@@ -1000,16 +1161,26 @@ fn r031_shell()->!{
     let mut launcher=false;
     let mut saw_pointer=false;
     let mut count=0u32;
-    #[cfg(feature="r031-files-shell")]
+    #[cfg(any(feature="r031-files-shell",feature="desktop-init"))]
     let mut terminal_edit=false;
-    for _ in 0..300_000_000u32{
+    let mut iterations=0u32;
+    loop{
+        if !cfg!(feature="desktop-init") && iterations==300_000_000{exit(186);}
+        iterations=iterations.saturating_add(1);
         let pointer=call(25,0,0);
         if pointer==u64::MAX{exit(173);}
+        #[cfg(feature="desktop-init")]
+        if pointer&(1u64<<33)!=0{
+            front=desktop_control(&[b'M',pointer as u8,(pointer>>8) as u8,
+                (pointer>>16) as u8,(pointer>>24) as u8,(pointer>>32) as u8]);
+            if !saw_pointer{write(b"R031.1 physical PS2 mouse event reached desktop service");saw_pointer=true;}
+        }
+        #[cfg(not(feature="desktop-init"))]
         if pointer&0x100!=0{
             let focused=(pointer&0xff) as u32;
             if focused==1||focused==2{
                 front=focused;
-                if call(23,front as u64,0)!=0{exit(174);}
+                if desktop_present(front)!=0{exit(174);}
             }
             if !saw_pointer{
                 write(b"R031.1 physical PS2 mouse event reached desktop service");
@@ -1022,46 +1193,46 @@ fn r031_shell()->!{
             1=>{},
             _=>exit(175),
         }
-        #[cfg(feature="r031-files-shell")]
+        #[cfg(any(feature="r031-files-shell",feature="desktop-init"))]
         if terminal_edit || (front==2&&byte[0]==b'\n'){
             let begin=!terminal_edit;
             terminal_edit=terminal_exchange(byte[0],begin);
-            if call(23,2,0)!=0{exit(216);}
+            if desktop_present(2)!=0{exit(216);}
             write(b"R051 Terminal physical input acknowledged");
             continue;
         }
         match byte[0]{
             b'a'=>{
-                if call(24,6,0)!=0{exit(176);}
+                if desktop_key(b'a')!=0{exit(176);}
                 launcher=!launcher;
                 write(if launcher{b"R031.1 application launcher OPEN"}
                       else{b"R031.1 application launcher CLOSED"});
             }
             b'1'=>{
-                if call(24,1,0)!=0{exit(177);}
+                if desktop_key(b'1')!=0{exit(177);}
                 front=1;
                 write(b"R031.1 user switched to Files app");
             }
             b'2'=>{
-                if call(24,2,0)!=0{exit(178);}
+                if desktop_key(b'2')!=0{exit(178);}
                 front=2;
                 write(b"R031.1 user switched to Terminal app");
             }
             b'h'=>{
-                if call(24,3,0)!=0{exit(179);}
+                if desktop_key(b'h')!=0{exit(179);}
                 write(b"R031.1 Files window moved");
             }
             b'm'=>{
-                if call(24,4,0)!=0{exit(180);}
+                if desktop_key(b'm')!=0{exit(180);}
                 front=1;
                 write(b"R031.1 Terminal minimized");
             }
             b'r'=>{
-                if call(24,5,0)!=0{exit(181);}
+                if desktop_key(b'r')!=0{exit(181);}
                 front=2;
                 write(b"R031.1 Terminal restored");
             }
-            #[cfg(feature="r031-files-shell")]
+            #[cfg(any(feature="r031-files-shell",feature="desktop-init"))]
             b'f'=>{
                 let mut data=[0u8;256];
                 data[..12].copy_from_slice(b"FILE UPDATED");
@@ -1070,20 +1241,35 @@ fn r031_shell()->!{
                 yield_now();
                 suite_receive(2,b"UPDATED");
                 write(b"R031.9 desktop requested Files reload from persistent volume");
-                if call(23,1,0)!=0{exit(212);}
+                if desktop_present(1)!=0{exit(212);}
             }
             b'q'=> {
-                if !saw_pointer ||count<6{exit(182);}
+                if !cfg!(feature="desktop-init") && (!saw_pointer||count<6){exit(182);}
+                #[cfg(feature="desktop-init")]
+                {
+                    let mut sync=[0u8;256];
+                    if vfs_call(12,b"/",b"",&mut sync,0)!=0{
+                        write(b"desktop shutdown refused: selected volume sync failed");continue;
+                    }
+                    write(b"desktop selected volume synchronized");
+                }
                 if launcher{
-                    if call(24,6,0)!=0{exit(183);}
+                    if desktop_key(b'a')!=0{exit(183);}
                     launcher=false;
                 }
-                if call(24,2,0)!=0||call(23,2,0)!=0{exit(184);}
+                if desktop_key(b'2')!=0||desktop_present(2)!=0{exit(184);}
                 suite_send(2,b"EXIT");
                 #[cfg(feature="r031-supervisor-shell")]
                 suite_send(4,b"EXIT");
                 #[cfg(not(feature="r031-supervisor-shell"))]
                 suite_send(3,b"EXIT");
+                #[cfg(feature="desktop-init")]
+                {
+                    suite_send(4,b"EXIT");
+                    let mut stopped=[0u8;72];
+                    let size=desktop_receive(4,&mut stopped);
+                    if &stopped[8..8+size]!=b"STOPPED"{exit(243);}
+                }
                 write(b"R031.1 shutdown requested: notifying Files and Terminal");
                 yield_now();
                 write(b"R031.1 session manager exiting after app services");
@@ -1091,22 +1277,31 @@ fn r031_shell()->!{
             }
             _=>continue,
         }
-        if call(23,front as u64,0)!=0{exit(185);}
-        count+=1;
+        if desktop_present(front)!=0{exit(185);}
+        count=count.saturating_add(1);
     }
-    exit(186);
 }
-#[cfg(any(feature="r031-files",feature="r031-supervisor-files",feature="r031-files-app"))]
+#[cfg(any(feature="r031-files",feature="r031-supervisor-files",any(feature="r031-files-app",feature="desktop-files")))]
 fn r031_files()->!{
     if call(4,0,0)!=2||call(22,0,0)!=u64::MAX||
        call(24,6,0)!=u64::MAX||call(25,0,0)!=u64::MAX{exit(187);}
+    #[cfg(feature="desktop-files")]
+    {
+        let mut state=[0u8;64];let mut byte=0u8;
+        if call(37,0,state.as_mut_ptr() as u64)!=u64::MAX||
+           call(37,1,state.as_ptr() as u64)!=u64::MAX||
+           call(6,core::ptr::addr_of_mut!(byte) as u64,1)!=u64::MAX{exit(253);}
+        write(b"desktop app denied compositor and physical input authority");
+    }
     let foreign=r029_command(2,1,20,80,200,32,0x00ff0000,&[]);
     if call(18,foreign.as_ptr() as u64,64)!=u64::MAX{exit(188);}
     r029_draw(&r029_command(1,1,15,102,264,32,0x0045967c,&[]));
     r029_draw(&r029_command(1,2,18,109,240,14,0x00ffffff,b"FILES SERVICE PID2"));
-    #[cfg(feature="r031-files-app")]
+    #[cfg(any(feature="r031-files-app",feature="desktop-files"))]
     {
         files_gui_initial();
+        #[cfg(not(feature="desktop-files"))]
+        {
         local_bind(2,5502);
         if local_udp(1,1,5502,0,0,0)!=u64::MAX{exit(233);}
         if local_udp(1,2,5501,0,0,0)!=u64::MAX{exit(234);}
@@ -1117,6 +1312,7 @@ fn r031_files()->!{
         if local_udp(4,1,5501,0,0,0)!=u64::MAX{exit(241);}
         if local_udp(4,2,5501,0,0,0)!=u64::MAX{exit(242);}
         write(b"R117 QEMU PID2 foreign PID1 UDP close attempts denied");
+        }
     }
     suite_send(1,b"FILES");
     write(b"R031.1 Files service registered and running");
@@ -1135,9 +1331,9 @@ fn r031_files()->!{
         write(b"R114 PID2 received isolated UDP PONG from PID1");
     }
     #[cfg(all(not(feature="r031-supervisor-files"),
-              not(feature="r031-files-app")))]
+              not(any(feature="r031-files-app",feature="desktop-files"))))]
     suite_receive(1,b"EXIT");
-    #[cfg(feature="r031-files-app")]
+    #[cfg(any(feature="r031-files-app",feature="desktop-files"))]
     {
         loop {
             let mut response=[0u8;72];
@@ -1175,7 +1371,7 @@ fn r031_files()->!{
     write(b"R031.1 Files service stopped and capabilities revoked");
     exit(0);
 }
-#[cfg(any(feature="r031-terminal",feature="r031-supervisor-terminal",feature="r031-files-terminal"))]
+#[cfg(any(feature="r031-terminal",feature="r031-supervisor-terminal",any(feature="r031-files-terminal",feature="desktop-terminal")))]
 fn r031_terminal()->!{
     let pid=call(4,0,0);
     #[cfg(feature="r031-supervisor-terminal")]
@@ -1184,6 +1380,14 @@ fn r031_terminal()->!{
     if pid!=3{exit(197);}
     if call(22,0,0)!=u64::MAX||
        call(24,6,0)!=u64::MAX||call(25,0,0)!=u64::MAX{exit(190);}
+    #[cfg(feature="desktop-terminal")]
+    {
+        let mut state=[0u8;64];let mut byte=0u8;
+        if call(37,0,state.as_mut_ptr() as u64)!=u64::MAX||
+           call(37,1,state.as_ptr() as u64)!=u64::MAX||
+           call(6,core::ptr::addr_of_mut!(byte) as u64,1)!=u64::MAX{exit(253);}
+        write(b"desktop app denied compositor and physical input authority");
+    }
     let foreign=r029_command(1,1,20,80,200,32,0x00ff0000,&[]);
     if call(18,foreign.as_ptr() as u64,64)!=u64::MAX{exit(191);}
     #[cfg(feature="r031-supervisor-terminal")]
@@ -1204,7 +1408,7 @@ fn r031_terminal()->!{
     suite_send(1,b"TERMINAL");
     #[cfg(feature="r031-supervisor-terminal")]
     write(b"R031.2 replacement PID4 registered IPC and window after crash");
-    #[cfg(feature="r031-files-terminal")]
+    #[cfg(any(feature="r031-files-terminal",feature="desktop-terminal"))]
     {
         // The actual PID3 process has no Files capability even when it can
         // draw its own window or send requests to the PID1 file broker.
@@ -1226,10 +1430,12 @@ fn r031_terminal()->!{
     #[cfg(not(feature="r031-supervisor-terminal"))]
     write(b"R031.1 Terminal service registered and running");
     yield_now();
-    #[cfg(feature="r031-files-terminal")]
+    #[cfg(any(feature="r031-files-terminal",feature="desktop-terminal"))]
     terminal_service();
-    #[cfg(not(feature="r031-files-terminal"))]
+    #[cfg(not(any(feature="r031-files-terminal",feature="desktop-terminal")))]
     suite_receive(1,b"EXIT");
+    #[cfg(not(feature="desktop-terminal"))]
+    {
     let mut event=[0u8;16];
     let n=call(21,event.as_mut_ptr() as u64,16);
     if n!=16 ||
@@ -1239,21 +1445,22 @@ fn r031_terminal()->!{
     write(b"R031.2 replacement PID4 received owned PS2 focus");
     #[cfg(not(feature="r031-supervisor-terminal"))]
     write(b"R031.1 Terminal received owned physical focus notification");
+    }
     exit(0);
 }
 // R031.3-R031.5: bounded VFS, five real QEMU boots and persistent range I/O.
 // reuse the exact same scratch disk; step 3 deliberately corrupts its newest
 // metadata copy, and step 4 verifies recovery from the older valid generation.
-#[cfg(any(feature="r031-vfs-init",feature="r031-files-shell"))]
+#[cfg(any(feature="r031-vfs-init",any(feature="r031-files-shell",feature="desktop-init")))]
 fn vfs_call(action:u64,path:&[u8],target:&[u8],data:&mut [u8;256],used:usize)->u64{
     if path.is_empty()||path.len()>23||target.len()>23||used>data.len(){exit(230);}
     let mut descriptor=[0u8;64];
     descriptor[..path.len()].copy_from_slice(path);
     descriptor[24..24+target.len()].copy_from_slice(target);
-    if matches!(action,3|4|5|8){
+    if matches!(action,3|4|5|8)&&!(action==3&&used==0){
         descriptor[48..56].copy_from_slice(&(data.as_mut_ptr() as u64).to_le_bytes());
         descriptor[56..64].copy_from_slice(&((if action==8{64}
-               else if action==4{data.len()}else{used}) as u64).to_le_bytes());
+               else if action==4{if cfg!(feature="desktop-init"){72}else{data.len()}}else{used}) as u64).to_le_bytes());
     }
     call(32,action,descriptor.as_ptr() as u64)
 }
@@ -1272,7 +1479,7 @@ fn vfs_call_at(action:u64,path:&[u8],offset:u64,
     call(32,action,desc.as_ptr() as u64)
 }
 // R031.6-8: 64-byte descriptor-based native file manager API.
-#[cfg(any(feature="r031-vfs-init",feature="r031-files-app"))]
+#[cfg(any(feature="r031-vfs-init",any(feature="r031-files-app",feature="desktop-files")))]
 fn file_handle_call(action:u64,path:&[u8],handle:u64,argument:u64,
                     data:&mut [u8;256],size:usize)->u64{
     if path.len()>23 || size>256{exit(205);}
@@ -1481,13 +1688,15 @@ fn vfs_guest()->!{
 }
 #[no_mangle]
 pub extern "C" fn _start()->!{
+    #[cfg(feature="desktop-compositor")]
+    desktop_compositor();
     #[cfg(feature="r031-vfs-init")]
     vfs_guest();
-    #[cfg(any(feature="r031-shell",feature="r031-supervisor-shell",feature="r031-files-shell"))]
+    #[cfg(any(feature="r031-shell",feature="r031-supervisor-shell",any(feature="r031-files-shell",feature="desktop-init")))]
     r031_shell();
-    #[cfg(any(feature="r031-files",feature="r031-supervisor-files",feature="r031-files-app"))]
+    #[cfg(any(feature="r031-files",feature="r031-supervisor-files",any(feature="r031-files-app",feature="desktop-files")))]
     r031_files();
-    #[cfg(any(feature="r031-terminal",feature="r031-supervisor-terminal",feature="r031-files-terminal"))]
+    #[cfg(any(feature="r031-terminal",feature="r031-supervisor-terminal",any(feature="r031-files-terminal",feature="desktop-terminal")))]
     r031_terminal();
     #[cfg(feature="r030-ondevice-init")]
     r030_exec();

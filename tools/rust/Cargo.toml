@@ -9,3 +9,18 @@ name = "indianos-tools"
 path = "src/main.rs"
 
 [dependencies]
+indianos-kernel-core = { path = "../../rust/kernel_core", features = ["test-r031-vfs"], optional = true }
+
+[features]
+desktop-fixture = ["dep:indianos-kernel-core"]
+desktop-volume = ["dep:indianos-kernel-core"]
+
+[[bin]]
+name = "indianos-desktop-volume"
+path = "src/desktop_volume.rs"
+required-features = ["desktop-volume"]
+
+[[bin]]
+name = "indianos-desktop-fixture"
+path = "src/desktop_fixture.rs"
+required-features = ["desktop-fixture"]

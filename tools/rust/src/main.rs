@@ -127,14 +127,24 @@ fn command(args:&[String])->Result<(),String>{
                 fs::read(path).map_err(|e|e.to_string())).transpose()?;
             let third=option(args,"--extra2-elf").map(|p|
                 fs::read(p).map_err(|e|e.to_string())).transpose()?;
+            let fourth=option(args,"--extra3-elf").map(|p|
+                fs::read(p).map_err(|e|e.to_string())).transpose()?;
+            let fifth=option(args,"--extra4-elf").map(|p|
+                fs::read(p).map_err(|e|e.to_string())).transpose()?;
             let n2=option(args,"--extra-name").unwrap_or_else(||"/bin/worker".into());
             let n3=option(args,"--extra2-name").unwrap_or_else(||"/bin/terminal".into());
-            let archive=match(extra.as_ref(),third.as_ref()){
-                (Some(a),Some(b))=>pack(&[(&name,&data),(&n2,a),(&n3,b)])?,
-                (Some(a),None)=>pack(&[(&name,&data),(&n2,a)])?,
-                (None,None)=>pack(&[(&name,&data)])?,
-                (None,Some(_))=>return Err("third ELF requires second ELF".into())
-            };
+            let n4=option(args,"--extra3-name").unwrap_or_else(||"/bin/compositor".into());
+            let n5=option(args,"--extra4-name").unwrap_or_else(||"/etc/desktop-volume".into());
+            if (third.is_some()&&extra.is_none()) || (fourth.is_some()&&third.is_none()) ||
+               (fifth.is_some()&&fourth.is_none()){
+                return Err("service ELF arguments must be contiguous".into());
+            }
+            let mut entries=vec![(name.as_str(),data.as_slice())];
+            if let Some(a)=extra.as_ref(){entries.push((&n2,a));}
+            if let Some(a)=third.as_ref(){entries.push((&n3,a));}
+            if let Some(a)=fourth.as_ref(){entries.push((&n4,a));}
+            if let Some(a)=fifth.as_ref(){entries.push((&n5,a));}
+            let archive=pack(&entries)?;
             let dest=Path::new(&output);
             if let Some(dir)=dest.parent(){fs::create_dir_all(dir).map_err(|e|e.to_string())?}
             fs::write(dest,&archive).map_err(|e|e.to_string())?;
@@ -185,6 +195,33 @@ mod tests{
         for path in ["bin/a","/../a","/a/./b","/a//b","/a/","/a\\b","/a b","/"] {
             assert!(pack(&[(path,b"")]).is_err(),"invalid: {}",path);
         }
+    }
+    #[test]
+    fn desktop_pack_preserves_four_services_and_binary_selection_fail_atomically(){
+        let root=env::temp_dir().join(format!("indianos-five-pack-{}",std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let service=root.join("service");let selection=root.join("selection");
+        let output=root.join("initramfs");
+        fs::write(&service,b"ELF bytes").unwrap();
+        fs::write(&selection,[0u8;64]).unwrap();
+        let mut args=vec!["pack".into(),"--elf".into(),service.display().to_string(),
+            "--output".into(),output.display().to_string(),"--extra-elf".into(),
+            service.display().to_string(),"--extra-name".into(),"/bin/files".into(),
+            "--extra2-elf".into(),service.display().to_string(),"--extra3-elf".into(),
+            service.display().to_string(),"--extra4-elf".into(),selection.display().to_string()];
+        command(&args).unwrap();
+        let bytes=fs::read(&output).unwrap();
+        assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()),5);
+        for name in ["/bin/init","/bin/files","/bin/terminal","/bin/compositor","/etc/desktop-volume"]{
+            assert!(bytes.windows(name.len()).any(|part|part==name.as_bytes()));
+        }
+        args.extend(["--extra4-name".into(),"/bin/files".into()]);
+        assert!(command(&args).is_err());assert_eq!(fs::read(&output).unwrap(),bytes);
+        let gap=vec!["pack".into(),"--elf".into(),service.display().to_string(),
+            "--output".into(),output.display().to_string(),"--extra3-elf".into(),
+            service.display().to_string()];
+        assert!(command(&gap).is_err());assert_eq!(fs::read(&output).unwrap(),bytes);
+        fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn elf_rejects_empty_files(){

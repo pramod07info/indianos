@@ -10,6 +10,53 @@ pub const TEXT:u32=2;
 /// This never allocates another retained command or changes window ownership.
 pub const REPLACE_TEXT:u32=3;
 pub const MAX_TEXT:usize=24;
+/// Canonical state transferred between the isolated window manager and the
+/// clipped raster backend. It contains no address, PID or surface capability.
+#[derive(Clone,Copy,Debug,Eq,PartialEq)]
+pub struct WindowFrame{pub x:u16,pub y:u16,pub width:u16,pub height:u16,pub minimized:bool}
+#[derive(Clone,Copy,Debug,Eq,PartialEq)]
+pub struct DesktopFrame{
+ pub width:u16,pub height:u16,pub front:u8,pub launcher:bool,
+ pub windows:[WindowFrame;2],pub pointer_x:u16,pub pointer_y:u16,
+}
+impl DesktopFrame{
+ pub fn parse(bytes:&[u8;64])->Option<Self>{
+  let get=|i|u16::from_le_bytes([bytes[i],bytes[i+1]]);
+  if &bytes[..4]!=b"IWM1"||bytes[4..8]!=1u32.to_le_bytes()||
+     !matches!(bytes[12],1|2)||bytes[13]>1||bytes[14..16]!=[0;2]||
+     bytes[52..].iter().any(|b|*b!=0){return None;}
+  let width=get(8);let height=get(10);
+  if width<640||height<480||get(48)>=width||get(50)>=height{return None;}
+  let mut windows=[WindowFrame{x:0,y:0,width:0,height:0,minimized:false};2];
+  for (index,window) in windows.iter_mut().enumerate(){
+   let at=16+16*index;let flags=bytes[at+8];
+   if !matches!(flags,1|2)||bytes[at+9..at+16].iter().any(|b|*b!=0){return None;}
+   *window=WindowFrame{x:get(at),y:get(at+2),width:get(at+4),height:get(at+6),minimized:flags==2};
+   if window.width<100||window.height<80||window.y<48||
+      window.x as u32+window.width as u32>width as u32||
+      window.y as u32+window.height as u32>height as u32-42{return None;}
+  }
+  if windows[bytes[12] as usize-1].minimized{return None;}
+  Some(Self{width,height,front:bytes[12],launcher:bytes[13]==1,
+   windows,pointer_x:get(48),pointer_y:get(50)})
+ }
+ pub fn wire(self)->[u8;64]{
+  let mut bytes=[0u8;64];bytes[..4].copy_from_slice(b"IWM1");
+  bytes[4..8].copy_from_slice(&1u32.to_le_bytes());
+  bytes[8..10].copy_from_slice(&self.width.to_le_bytes());
+  bytes[10..12].copy_from_slice(&self.height.to_le_bytes());
+  bytes[12]=self.front;bytes[13]=self.launcher as u8;
+  for (index,w) in self.windows.iter().enumerate(){
+   let at=16+index*16;
+   for (offset,value) in [(0,w.x),(2,w.y),(4,w.width),(6,w.height)]{
+    bytes[at+offset..at+offset+2].copy_from_slice(&value.to_le_bytes());
+   }
+   bytes[at+8]=if w.minimized{2}else{1};
+  }
+  bytes[48..50].copy_from_slice(&self.pointer_x.to_le_bytes());
+  bytes[50..52].copy_from_slice(&self.pointer_y.to_le_bytes());bytes
+ }
+}
 #[derive(Clone,Copy,Debug,Eq,PartialEq)]
 pub enum Error{Version,Operation,Window,Bounds,Color,Text,Reserved}
 #[derive(Clone,Copy,Debug,Eq,PartialEq)]

@@ -759,7 +759,7 @@ mod r114_two_phase_sector_recovery_tests {
 /// receipt. Boot-slot metadata is separately stored in two reserved sectors
 /// OUTSIDE the selected filesystem. The trusted installer must allocate them
 /// and authenticate the image; this helper never writes, formats or loads it.
-#[cfg(feature="test-r031-vfs")]
+#[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
 pub fn select_recovery_slot_readonly<D:crate::block::BlockDevice>(
     disk:&mut D,
     partition:crate::m1_partition::PartitionReceipt,

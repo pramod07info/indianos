@@ -91,59 +91,62 @@ pub unsafe extern "C" fn indianos_syscall_validate(
             user_range(plan, request.arg0, 32, false), // QUANTUM descriptor
         2 => request.arg1 == 0, // EXIT
         3 => request.arg0 == 0 && request.arg1 == 0, // YIELD
-        #[cfg(any(feature = "test-shell", feature = "test-ipc",feature="normal-init"))]
+        #[cfg(any(feature="test-shell",feature="test-ipc",feature="normal-init",feature="normal-desktop"))]
         4 => request.arg0 == 0 && request.arg1 == 0, // GETPID
         #[cfg(feature = "test-shell")]
         5 => request.arg0 == 1 && request.arg1 == 0, // allowlisted /bin/worker
-        #[cfg(feature="test-r029-userspace")]
+        #[cfg(any(feature="test-r029-userspace",feature="normal-desktop"))]
         18 => request.arg1==64 && user_range(plan,request.arg0,64,false),
-        #[cfg(feature="test-r029-userspace")]
+        #[cfg(all(feature="test-r029-userspace",not(feature="normal-desktop")))]
         19 => (1..=2).contains(&request.arg0) && request.arg1==0,
-        #[cfg(feature="test-r029-userspace")]
+        #[cfg(any(feature="test-r029-userspace",feature="normal-desktop"))]
         20 => request.arg0==0 && request.arg1==0,
-        #[cfg(feature="test-r029-userspace")]
+        #[cfg(any(feature="test-r029-userspace",feature="normal-desktop"))]
         21 => request.arg1==16 && user_range(plan,request.arg0,16,true),
         #[cfg(feature="test-r031-supervisor")]
         26 => request.arg0==0 && request.arg1==0, // supervisor state PID1 only
-        #[cfg(feature="test-r031-boot-desktop")]
+        #[cfg(any(feature="test-r031-boot-desktop",feature="normal-desktop"))]
         25 => request.arg0==0 && request.arg1==0, // PID1 physical mouse pump
-        #[cfg(feature="test-r029-desktop-suite")]
+        #[cfg(all(feature="test-r029-desktop-suite",not(feature="normal-desktop")))]
         24 => (1..=6).contains(&request.arg0) && request.arg1==0,
-        #[cfg(feature="test-r029-frame-server")]
+        #[cfg(all(feature="test-r029-frame-server",not(feature="normal-desktop")))]
         22 => request.arg0==0 && request.arg1==0, // FRAME_QUERY
-        #[cfg(feature="test-r029-frame-server")]
+        #[cfg(all(feature="test-r029-frame-server",not(feature="normal-desktop")))]
         23 => (1..=2).contains(&request.arg0) && request.arg1==0, // FRAME_PRESENT
+        #[cfg(feature="normal-desktop")]
+        37 => request.arg0<=1 &&
+              user_range(plan,request.arg1,64,request.arg0==0), // compositor state query/apply
         #[cfg(feature="test-r030-ondevice")]
         30 => (1..=4).contains(&request.arg0) &&
               user_range(plan,request.arg1,48,false), // filesystem descriptor
         #[cfg(feature="test-r030-ondevice")]
         31 => request.arg0<=4 && request.arg1==0,
-        #[cfg(feature="test-r031-vfs")]
-        32 => (1..=11).contains(&request.arg0) &&
+        #[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
+        32 => (1..=if cfg!(feature="normal-desktop"){12}else{11}).contains(&request.arg0) &&
               user_range(plan,request.arg1,64,false), // installed native app
-        #[cfg(feature="test-r031-vfs")]
+        #[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
         33 => (1..=6).contains(&request.arg0) &&
               user_range(plan,request.arg1,64,false), // R031.6 handles
         #[cfg(feature="test-r031-files-gui")]
         36 => (1..=4).contains(&request.arg0) &&
               user_range(plan,request.arg1,64,false), // ring3 local UDP descriptor
-        #[cfg(feature="test-r031-files-gui")]
+        #[cfg(any(feature="test-r031-files-gui",feature="normal-desktop"))]
         34 => request.arg0==1 &&
               user_range(plan,request.arg1,64,false), // PID2 shared dir listing
         #[cfg(feature = "test-r026")]
         16 | 17 => request.arg0 == 2 && request.arg1 == 0, // worker status/reap query
-        #[cfg(any(feature="test-interactive",feature="normal-init"))]
+        #[cfg(any(feature="test-interactive",feature="normal-init",feature="normal-desktop"))]
         6 => request.arg1 == 1 && user_range(plan,request.arg0,1,true),
-        #[cfg(all(feature="test-ipc",not(feature="test-r025")))]
+        #[cfg(all(any(feature="test-ipc",feature="normal-desktop"),not(feature="test-r025")))]
         8 => (4..=68).contains(&request.arg1) &&
             user_range(plan,request.arg0,request.arg1,false), // IPC_SEND (R025.1)
         #[cfg(feature="test-r025")]
         8 => (12..=76).contains(&request.arg1) &&
             user_range(plan,request.arg0,request.arg1,false), // Cap-authorized SEND
-        #[cfg(feature="test-ipc")]
+        #[cfg(any(feature="test-ipc",feature="normal-desktop"))]
         9 => request.arg1 == 72 &&
             user_range(plan,request.arg0,72,true), // IPC_RECEIVE
-        #[cfg(feature="test-ipc")]
+        #[cfg(any(feature="test-ipc",feature="normal-desktop"))]
         35 => (1..=crate::ipc::MAX_WAIT_ROUNDS as u64).contains(&request.arg1) &&
             user_range(plan,request.arg0,crate::ipc::RECEIVE_BYTES as u64,true),
         #[cfg(feature="test-r025")]
@@ -209,7 +212,32 @@ mod tests {
     use super::*;
     use core::mem::{align_of, offset_of, size_of};
 
-    #[cfg(feature="test-r031-vfs")]
+    #[cfg(feature="normal-desktop")]
+    #[test]
+    fn desktop_profile_exposes_bounded_compositor_state_without_legacy_control(){
+        let mut plan=ProgramPlan{entry:USER_MIN,stack_begin:USER_TOP-STACK_BYTES,
+            stack_end:USER_TOP,guard_begin:USER_TOP-STACK_BYTES-PAGE_BYTES,
+            segment_count:1,segments:[ProgramSegment::empty();MAX_SEGMENTS]};
+        plan.segments[0]=ProgramSegment{page_begin:USER_MIN,
+            page_end:USER_MIN+PAGE_BYTES,writable:false,executable:true,
+            ..ProgramSegment::empty()};
+        let check=|number,arg0,arg1|unsafe{indianos_syscall_validate(&plan,
+            SyscallRequest{number,arg0,arg1})};
+        assert!(check(37,0,plan.stack_end-64));
+        assert!(check(37,1,USER_MIN));
+        assert!(!check(37,0,USER_MIN));
+        assert!(!check(37,2,plan.stack_begin));
+        assert!(!check(37,0,plan.stack_end-63));
+        assert!(!check(37,1,plan.guard_begin));
+        for (number,arg0,arg1) in [(5,1,0),(19,1,0),(22,0,0),(23,1,0),
+            (24,1,0),(30,1,plan.stack_begin),(31,1,0),(36,1,plan.stack_begin)]{
+            assert!(!check(number,arg0,arg1),"legacy control {number}");
+        }
+        assert!(check(32,12,plan.stack_begin));
+        assert!(!check(32,13,plan.stack_begin));
+    }
+
+    #[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
     #[test]
     fn native_truncate_ingress_accepts_only_known_actions_and_complete_descriptors(){
         let plan=ProgramPlan{entry:USER_MIN,stack_begin:USER_TOP-STACK_BYTES,
@@ -255,7 +283,7 @@ mod tests {
         assert!(!check(SyscallRequest { number: 3, arg0: 1, arg1: 0 }));
     }
 
-    #[cfg(feature="test-r029-userspace")]
+    #[cfg(any(feature="test-r029-userspace",feature="normal-desktop"))]
     #[test]
     fn ring3_graphics_syscall_rejects_bad_identity_buffer_and_lengths(){
         let plan=ProgramPlan{
@@ -272,15 +300,15 @@ mod tests {
         assert!(!check(18,plan.guard_begin,64));
         assert!(!check(18,USER_TOP-63,64));
         assert!(!check(18,u64::MAX-10,64));
-        assert!(check(19,1,0));
-        assert!(check(19,2,0));
+        assert_eq!(check(19,1,0),!cfg!(feature="normal-desktop"));
+        assert_eq!(check(19,2,0),!cfg!(feature="normal-desktop"));
         assert!(!check(19,3,0));
         assert!(!check(19,1,1));
         assert!(check(20,0,0));
         assert!(!check(20,1,0));
         assert!(!check(20,0,1));
     }
-    #[cfg(feature = "test-shell")]
+    #[cfg(any(feature = "test-shell",feature="normal-desktop"))]
     #[test]
     fn shell_abi_rejects_invalid_program_ids_and_arguments() {
         let plan = ProgramPlan {
@@ -293,11 +321,11 @@ mod tests {
         };
         assert!(valid(4,0,0));
         assert!(!valid(4,1,0));
-        assert!(valid(5,1,0));
+        assert_eq!(valid(5,1,0),!cfg!(feature="normal-desktop"));
         assert!(!valid(5,2,0));
         assert!(!valid(5,1,1));
     }
-    #[cfg(feature="test-interactive")]
+    #[cfg(any(feature="test-interactive",feature="normal-desktop"))]
     #[test]
     fn read_syscall_rejects_nonwritable_ranges(){
         let mut plan=ProgramPlan{
@@ -317,7 +345,7 @@ mod tests {
         assert!(!check(USER_MIN,1));
         assert!(!check(plan.stack_end-1,2));
     }
-    #[cfg(feature="test-ipc")]
+    #[cfg(any(feature="test-ipc",feature="normal-desktop"))]
     #[test]
     fn ipc_abi_checks_exact_lengths_memory_and_readonly_pages() {
         let mut plan=ProgramPlan{
@@ -418,7 +446,7 @@ mod tests {
             assert!(!valid(syscall,2,1));
         }
     }
-    #[cfg(feature="test-ipc")]
+    #[cfg(any(feature="test-ipc",feature="normal-desktop"))]
     #[test]
     fn ipc_wait_validates_full_destination_and_bounded_cooperative_budget(){
         let plan=ProgramPlan{

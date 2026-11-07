@@ -65,9 +65,13 @@ impl<D:BlockDevice> HierVfs<D>{
   Ok(volume)
  }
  /// Strict Desktop/installer mount: refuse volume media with only a single
- /// surviving verified metadata head; caller can inspect the health first.
+ /// surviving verified metadata head or an inconsistent hierarchical namespace.
+ /// COW checksums authenticate bytes, not directory/alias/link relationships.
+ /// All admission checks are read-only; recovery never happens implicitly.
  pub fn mount_healthy(disk:D)->Result<Self,FsError>{
-  Ok(Self{fs:DurableFs::mount_healthy(disk)?})
+  let mut volume=Self{fs:DurableFs::mount_healthy(disk)?};
+  volume.listing_integrity()?;
+  Ok(volume)
  }
  /// Re-read the mounted device and validate all file checksums plus both
  /// metadata copies without causing a write or automatic repair.
@@ -467,6 +471,63 @@ mod tests{
  }
  fn fresh()->HierVfs<Disk>{
   HierVfs::format_blank(Disk{blocks:[[0;SECTOR_BYTES];COUNT],writes:0,tear:None}).unwrap()
+ }
+ #[test]fn healthy_admission_rejects_checksummed_inconsistent_namespaces_without_writes(){
+  struct Inspect<'a>(&'a mut Disk);
+  impl BlockDevice for Inspect<'_>{
+   fn sector_count(&self)->u64{self.0.sector_count()}
+   fn read_sector(&mut self,l:u64,b:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{self.0.read_sector(l,b)}
+   fn write_sector(&mut self,_:u64,_:&[u8;SECTOR_BYTES])->Result<(),BlockError>{panic!("mount attempted repair")}
+  }
+  for case in 0..7{
+   let mut fs=fresh();
+   match case{
+    0=>{fs.fs.create_path("/~dmissing~child",DIR_MARKER).unwrap();},
+    1=>{fs.fs.create_path("/~dbad",b"BAD DIR!").unwrap();},
+    2=>{fs.mkdir("/same").unwrap();fs.fs.create_path("/~fsame",b"alias").unwrap();},
+    3=>{fs.fs.create_path("/~fmissing~leaf",b"orphan").unwrap();},
+    4=>{fs.fs.create_path("/~da~~b",DIR_MARKER).unwrap();},
+    5=>{fs.fs.create_path("/~llink",b"relative").unwrap();},
+    _=>{fs.fs.create_path("/~llink",b"/a//b").unwrap();},
+   }
+   let mut disk=fs.into_device();
+   assert_eq!(DurableFs::inspect_health(&mut disk).unwrap().redundancy,
+       crate::durablefs::Redundancy::Healthy);
+   let before=disk.blocks;let writes=disk.writes;
+   assert!(matches!(HierVfs::mount_healthy(Inspect(&mut disk)),Err(FsError::InvalidVolume)),"case {case}");
+   assert_eq!(disk.blocks,before);assert_eq!(disk.writes,writes);
+  }
+ }
+ #[test]fn healthy_admission_preserves_valid_nested_links_legacy_keys_and_generation(){
+  let mut fs=fresh();fs.mkdir("/a").unwrap();fs.mkdir("/a/b").unwrap();
+  fs.create("/a/b/n",b"saved").unwrap();fs.symlink("/a/link","/a/b/n").unwrap();
+  fs.fs.create_path("/~x-legacy",b"opaque").unwrap();
+  let generation=fs.generation();let disk=fs.into_device();
+  let before=disk.blocks;let writes=disk.writes;
+  let mut mounted=HierVfs::mount_healthy(disk).unwrap();
+  assert_eq!(mounted.generation(),generation);
+  let mut bytes=[0;16];assert_eq!(mounted.read("/a/b/n",&mut bytes),Ok(5));
+  assert_eq!(&bytes[..5],b"saved");
+  assert_eq!(mounted.readlink("/a/link",&mut bytes),Ok(6));
+  assert_eq!(&bytes[..6],b"/a/b/n");
+  let disk=mounted.into_device();assert_eq!(disk.blocks,before);assert_eq!(disk.writes,writes);
+ }
+ #[test]fn healthy_admission_propagates_namespace_read_failure_after_cow_health_verification(){
+  struct Reads<'a>{disk:&'a mut Disk,count:usize,fail:Option<usize>}
+  impl BlockDevice for Reads<'_>{
+   fn sector_count(&self)->u64{self.disk.sector_count()}
+   fn read_sector(&mut self,l:u64,b:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+    let current=self.count;self.count+=1;
+    if self.fail==Some(current){return Err(BlockError::Io);}
+    self.disk.read_sector(l,b)
+   }
+   fn write_sector(&mut self,_:u64,_:&[u8;SECTOR_BYTES])->Result<(),BlockError>{panic!("mount wrote")}
+  }
+  let mut fs=fresh();fs.mkdir("/a").unwrap();fs.create("/a/n",b"saved").unwrap();
+  let mut disk=fs.into_device();let reads=Reads{disk:&mut disk,count:0,fail:None};
+  let mut reads=DurableFs::mount_healthy(reads).unwrap().into_device();
+  let health_reads=reads.count;reads.count=0;reads.fail=Some(health_reads);
+  assert!(matches!(HierVfs::mount_healthy(reads),Err(FsError::Io)));
  }
  #[test]fn r114_durable_links_never_follow_across_vfs_or_mounts(){
   let mut fs=fresh();
