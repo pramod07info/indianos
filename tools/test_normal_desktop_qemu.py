@@ -39,6 +39,84 @@ UART_ACTIONS = (PHYSICAL.encode(), SHUTDOWN.encode(), b"application launcher",
                 b"user switched to", b"Terminal physical input acknowledged")
 NAMED_COMMIT = "desktop broker committed named selected-volume mutation and refreshed Files"
 NAMED_READBACK = "IndianOS user: R051 Terminal readback: saved"
+G1_PAYLOAD = "violet"  # Visually distinct from the success status SAVED.
+G1_READBACK = "IndianOS user: R051 Terminal readback: " + G1_PAYLOAD
+TERMINAL_AUTHORITY = (
+    b"IndianOS user: R117 QEMU PID2 stack guard and crossing descriptor pointers denied",
+    b"IndianOS user: R114 PID2 ring3 invalid pointer, private path and denied write blocked",
+    b"IndianOS user: R114 Terminal PID3 denied direct Files handles and directory syscall",
+    b"IndianOS user: desktop PID1 denied compositor window authority",
+    b"IndianOS user: desktop app denied compositor and physical input authority",
+    b"IndianOS user: desktop compositor denied input and filesystem authority",
+)
+
+# Independent expected raster contract for the qualified normal desktop.
+# Do not import the production renderer: a shared rendering bug must not make
+# the image and its oracle agree. Lowercase intentionally uses uppercase glyphs.
+GLYPHS = {
+    "A": (14,17,17,31,17,17,17), "B": (30,17,17,30,17,17,30),
+    "C": (14,17,16,16,16,17,14), "D": (30,17,17,17,17,17,30),
+    "E": (31,16,16,30,16,16,31), "F": (31,16,16,30,16,16,16),
+    "G": (14,17,16,23,17,17,14), "H": (17,17,17,31,17,17,17),
+    "I": (31,4,4,4,4,4,31), "J": (7,2,2,2,18,18,12),
+    "K": (17,18,20,24,20,18,17), "L": (16,16,16,16,16,16,31),
+    "M": (17,27,21,21,17,17,17), "N": (17,25,21,19,17,17,17),
+    "O": (14,17,17,17,17,17,14), "P": (30,17,17,30,16,16,16),
+    "Q": (14,17,17,17,21,18,13), "R": (30,17,17,30,20,18,17),
+    "S": (15,16,16,14,1,1,30), "T": (31,4,4,4,4,4,4),
+    "U": (17,17,17,17,17,17,14), "V": (17,17,17,17,17,10,4),
+    "W": (17,17,17,21,21,21,10), "X": (17,17,10,4,10,17,17),
+    "Y": (17,17,10,4,4,4,4), "Z": (31,1,2,4,8,16,31),
+    "0": (14,17,19,21,25,17,14), "1": (4,12,4,4,4,4,14),
+    "2": (14,17,1,2,4,8,31), "3": (30,1,1,14,1,1,30),
+    "4": (2,6,10,18,31,2,2), "5": (31,16,30,1,1,17,14),
+    "6": (6,8,16,30,17,17,14), "7": (31,1,2,4,8,8,8),
+    "8": (14,17,17,14,17,17,14), "9": (14,17,17,15,1,2,12),
+    " ": (0,0,0,0,0,0,0), ":": (0,4,4,0,4,4,0),
+}
+
+
+def text_field_bounds(image: tuple[int, int, bytes], field: str) -> tuple[int, int, int]:
+    width, height, pixels = image
+    if width < 640 or height < 480 or len(pixels) != width * height * 3:
+        raise AssertionError("invalid qualified framebuffer geometry")
+    window_width = min(max(width * 49 // 100, 320), width - 80)
+    window_height = min(max(height * 50 // 100, 240), height - 110)
+    if field == "terminal":
+        x, y, count = width - window_width - 36 + 9 + 24, height - window_height - 65 + 44 + 181, 270
+    elif field == "files-directory":
+        x, y, count = 45 + 9 + 18, 75 + 44 + 163, 264
+    elif field == "files-note":
+        x, y, count = 45 + 9 + 18, 75 + 44 + 190, 240
+    else:
+        raise AssertionError("unknown graphical text field")
+    if x < 0 or y < 0 or x + count > width or y + 14 > height:
+        raise AssertionError("graphical text field exceeds framebuffer")
+    return x, y, count
+
+
+def verify_text_pixels(image: tuple[int, int, bytes], field: str, expected: str) -> None:
+    """Require exact glyph pixels and cleared trailing cells in a fresh shot.
+
+    Callers acquire the shot only after a fresh physical-key acknowledgement.
+    Comparing just changed pixels or a SAVED label cannot prove file readback.
+    """
+    x, y, count = text_field_bounds(image, field)
+    if not expected or not expected.isascii() or len(expected) * 12 > count:
+        raise AssertionError("unsupported graphical text expectation")
+    text = expected.upper()
+    if any(char not in GLYPHS for char in text):
+        raise AssertionError("unsupported graphical glyph expectation")
+    width, _, pixels = image
+    for row in range(14):
+        for column in range(count):
+            character, inside = divmod(column, 12)
+            ink = (character < len(text) and inside < 10 and
+                   GLYPHS[text[character]][row // 2] & (1 << (4 - inside // 2)) != 0)
+            offset = ((y + row) * width + x + column) * 3
+            white = pixels[offset:offset + 3] == b"\xff\xff\xff"
+            if white != ink:
+                raise AssertionError(f"{field} pixels do not display exact {expected!r}")
 
 
 def type_named_command(session: QemuSession, command: str) -> None:
@@ -88,6 +166,9 @@ def verify_runtime(output: bytes, shutdown_at: int) -> None:
     if (COMPOSITOR.encode() not in prefix or READY.encode() not in prefix or
             prefix.find(COMPOSITOR.encode()) > prefix.find(READY.encode())):
         raise AssertionError("desktop advertised ready before compositor service")
+    startup = prefix[:prefix.find(READY.encode())]
+    if any(marker not in startup for marker in TERMINAL_AUTHORITY):
+        raise AssertionError("Terminal startup lacks actual syscall authority negative controls")
     for pid in (1, 2, 3, 4):
         for state in ("READY", "DISPATCHED"):
             if f"IndianOS: PID {pid} {state}".encode() not in prefix:
@@ -113,15 +194,16 @@ def verify_uart_ignored(before: tuple[int, int, bytes], after: tuple[int, int, b
 
 
 def spawn(qemu: str, iso: Path, ovmf: Path, disk: Path, folder: Path, name: str,
-          debugger: Path | None = None):
+          debugger: Path | None = None, *, write_fault: Path | None = None):
     monitor = folder / f"{name}.sock"
+    image = f"blkdebug:{write_fault}:{disk}" if write_fault is not None else str(disk)
     command = [qemu, "-machine", "pc", "-m", "256M", "-smp", "1",
                "-display", "none", "-vga", "std", "-serial", "stdio",
                "-monitor", f"unix:{monitor},server=on,wait=off", "-no-reboot",
                "-no-shutdown", "-boot", "d",
                "-drive", f"if=pflash,format=raw,readonly=on,file={ovmf}",
                "-cdrom", str(iso),
-               "-drive", f"if=ide,index=0,media=disk,format=raw,file={disk}"]
+               "-drive", f"if=ide,index=0,media=disk,format=raw,file={image}"]
     if debugger is not None:
         command.extend(["-gdb", f"unix:{debugger},server=on,wait=off"])
     process = subprocess.Popen(command, stdin=subprocess.PIPE,
@@ -161,6 +243,9 @@ def boot(qemu: str, iso: Path, ovmf: Path, disk: Path, folder: Path, index: int)
         session.until("R031.9 real file and directory contents rendered into Files window", 20)
         frame = session.shot(folder / f"desktop-{index}-initial.ppm")
         check_two_windows(frame)
+        verify_text_pixels(frame, "files-directory",
+                           "f:readme " if index == 0 else "f:readme f:a d:docs ")
+        verify_text_pixels(frame, "files-note", "HELLO INDIANOS" if index == 0 else PAYLOAD)
         if PHYSICAL.encode() in session.output:
             raise AssertionError("physical-origin evidence appeared before physical input")
         # Real UART bytes must not be accepted as physical desktop commands.
@@ -204,6 +289,8 @@ def boot(qemu: str, iso: Path, ovmf: Path, disk: Path, folder: Path, index: int)
             exact_terminal_line(bytes(session.output), start, READBACK)
         result = session.shot(folder / f"desktop-{index}-result.ppm")
         changed(typed, result, "selected-volume Terminal result")
+        verify_text_pixels(result, "terminal", "SAVED" if index == 0 else PAYLOAD)
+        verify_text_pixels(result, "files-note", PAYLOAD)
         if index == 0:
             files_repainted(typed, result)
         for text, expected in (("ls", "IndianOS user: R055 Terminal directory: "),
@@ -221,17 +308,33 @@ def boot(qemu: str, iso: Path, ovmf: Path, disk: Path, folder: Path, index: int)
             result = session.shot(folder / f"desktop-{index}-{text}-result.ppm")
             changed(typed, result, "selected-volume " + text)
         if index == 0:
-            for command in ("touch tmp", "put tmp=saved", "mv tmp a",
-                            "touch gone", "rm gone", "mkdir docs"):
+            for step, (command, listing, structural) in enumerate((
+                    ("touch tmp", "f:readme f:tmp ", True),
+                    ("put tmp=" + G1_PAYLOAD, "f:readme f:tmp ", False),
+                    ("mv tmp a", "f:readme f:a ", True),
+                    ("touch gone", "f:readme f:a f:gone ", True),
+                    ("rm gone", "f:readme f:a ", True),
+                    ("mkdir docs", "f:readme f:a d:docs ", True))):
                 type_named_command(session, command)
+                before = session.shot(folder / f"desktop-{index}-named-{step}-typed.ppm")
                 submitted = acknowledged_key(session, "ret")
                 session.until(NAMED_COMMIT, 20, since=submitted)
+                result = session.shot(folder / f"desktop-{index}-named-{step}-result.ppm")
+                verify_text_pixels(result, "terminal", "SAVED")
+                verify_text_pixels(result, "files-directory", listing)
+                verify_text_pixels(result, "files-note", PAYLOAD)
+                if structural:
+                    files_repainted(before, result)
         type_named_command(session, "cat a")
+        typed = session.shot(folder / f"desktop-{index}-named-readback-typed.ppm")
         submitted = acknowledged_key(session, "ret")
-        session.until(NAMED_READBACK, 20, since=submitted)
+        session.until(G1_READBACK, 20, since=submitted)
         session.drain_serial(0.1)
-        exact_terminal_line(bytes(session.output), submitted, NAMED_READBACK)
+        exact_terminal_line(bytes(session.output), submitted, G1_READBACK)
         result = session.shot(folder / f"desktop-{index}-named-readback.ppm")
+        changed(typed, result, "named persistent-file graphical readback")
+        verify_text_pixels(result, "terminal", G1_PAYLOAD)
+        verify_text_pixels(result, "files-directory", "f:readme f:a d:docs ")
         acknowledged_key(session, "tab")
         shutdown_at = len(session.output)
         physical_key(session, "q", SHUTDOWN, folder, index, 9, result, False)
@@ -277,7 +380,9 @@ def abrupt_reboot(qemu: str, iso: Path, ovmf: Path, disk: Path, folder: Path) ->
                 if attempt == 1:
                     session.drain_serial(0.1)
                     exact_terminal_line(bytes(session.output), submitted, NAMED_READBACK)
-            session.shot(folder / f"abrupt-{attempt}-terminal.ppm")
+            frame = session.shot(folder / f"abrupt-{attempt}-terminal.ppm")
+            verify_text_pixels(frame, "terminal", "SAVED" if attempt == 0 else "saved")
+            verify_text_pixels(frame, "files-directory", "f:readme f:cut ")
             if SHUTDOWN.encode() in session.output or STOPPED.encode() in session.output:
                 raise AssertionError("unclean reboot accidentally used clean session shutdown")
             # SIGKILL prevents QEMU's orderly shutdown handler from providing
@@ -293,9 +398,9 @@ def abrupt_reboot(qemu: str, iso: Path, ovmf: Path, disk: Path, folder: Path) ->
 
 
 def denied_boot(qemu: str, iso: Path, ovmf: Path, disk: Path, folder: Path, name: str,
-                reason: str = RECOVERY) -> None:
+                reason: str = RECOVERY, *, write_fault: Path | None = None) -> None:
     before = hashlib.sha256(disk.read_bytes()).digest()
-    process, sock, session = spawn(qemu, iso, ovmf, disk, folder, name)
+    process, sock, session = spawn(qemu, iso, ovmf, disk, folder, name, write_fault=write_fault)
     try:
         session.until(reason, 45)
         session.until("IndianOS recovery: read-only serial console ready", 10)
@@ -320,6 +425,67 @@ def rejected_namespaces(qemu: str, iso: Path, ovmf: Path, fixture_tool: Path,
         checked_run([str(fixture_tool), "--namespace-fault", kind, "--output", str(disk)])
         verify_guard(original, disk.read_bytes())
         denied_boot(qemu, iso, ovmf, disk, folder, f"namespace-{kind}")
+
+
+def write_failure_config(folder: Path) -> Path:
+    path = folder / "reject-storage-writes.ini"
+    path.write_text('[inject-error]\nevent = "write_aio"\nerrno = "5"\n'
+                    'once = "off"\nimmediately = "on"\n')
+    return path
+
+
+def rejected_partitions(qemu: str, iso: Path, ovmf: Path, fixture_tool: Path,
+                        folder: Path) -> None:
+    fault = write_failure_config(folder)
+    for kind in ("overlap", "duplicate-id", "protective-overflow"):
+        disk = folder / f"partition-{kind}.raw"
+        checked_run([str(fixture_tool), "--partition-fault", kind, "--output", str(disk)])
+        # The protected backend prevents firmware from normalizing malformed
+        # metadata before the kernel can inspect it. A valid-device positive
+        # control uses the same backend in failed_write_boot below.
+        denied_boot(qemu, iso, ovmf, disk, folder, f"partition-{kind}", write_fault=fault)
+
+
+def verify_failed_write(output: bytes, since: int) -> None:
+    if not 0 <= since < len(output):
+        raise AssertionError("invalid failed-write evidence boundary")
+    tail = output[since:]
+    if b"desktop shutdown refused: selected volume sync failed" not in tail:
+        raise AssertionError("uncertain storage did not refuse shutdown sync")
+    if any(marker in tail for marker in (NAMED_COMMIT.encode(), COMMITTED.encode(),
+                                         SHUTDOWN.encode(), STOPPED.encode())):
+        raise AssertionError("failed storage mutation was advertised as durable")
+
+
+def failed_write_boot(qemu: str, iso: Path, ovmf: Path, disk: Path, folder: Path) -> None:
+    before = disk.read_bytes()
+    fault = write_failure_config(folder)
+    process, sock, session = spawn(qemu, iso, ovmf, disk, folder, "failed-ata-write",
+                                   write_fault=fault)
+    try:
+        # This positive control proves the backend permits IDENTIFY, GPT/COW
+        # reads and a genuine ring3 desktop; rejection is not a missing drive.
+        session.until(READY, 45)
+        acknowledged_key(session, "2", "R031.1 user switched to Terminal app")
+        acknowledged_key(session, "ret")
+        since = len(session.output)
+        type_named_command(session, "put readme=blocked")
+        acknowledged_key(session, "ret")
+        verify_text_pixels(session.shot(folder / "failed-ata-write-error.ppm"), "terminal", "IO ERROR")
+        # Reads would succeed on the underlying device. Refusing this read
+        # shows the uncertain selected mount was retired rather than retried.
+        type_named_command(session, "cat readme")
+        acknowledged_key(session, "ret")
+        verify_text_pixels(session.shot(folder / "failed-ata-read-retired.ppm"), "terminal", "IO ERROR")
+        acknowledged_key(session, "tab")
+        acknowledged_key(session, "q", "desktop shutdown refused: selected volume sync failed")
+        session.drain_serial(0.1)
+        verify_failed_write(bytes(session.output), since)
+    finally:
+        close(process, sock, session, folder / "failed-ata-write.serial.log")
+    if disk.read_bytes() != before:
+        raise AssertionError("failed ATA write or shutdown changed selected media")
+    print("Normal desktop actual ATA write failure: IO pixels, retired mount, refused sync and unchanged media PASS")
 
 
 
@@ -738,7 +904,9 @@ def transient_service_boot(qemu: str, iso: Path, ovmf: Path, disk: Path,
             if command.startswith("cat "):
                 session.drain_serial(0.1)
                 exact_terminal_line(bytes(session.output), submitted, marker)
-        session.shot(folder / "transient-saved-readback.ppm")
+        readback = session.shot(folder / "transient-saved-readback.ppm")
+        verify_text_pixels(readback, "terminal", "saved")
+        verify_text_pixels(readback, "files-directory", "f:readme f:revived ")
         acknowledged_key(session, "tab")
         shutdown_at = len(session.output)
         acknowledged_key(session, "q", SHUTDOWN)
@@ -850,6 +1018,10 @@ def main() -> None:
                                artifacts, args.xorriso, args.nm)
         rejected_namespaces(args.qemu, args.iso.resolve(), args.ovmf.resolve(),
                             args.fixture_tool.resolve(), original, artifacts)
+        rejected_partitions(args.qemu, args.iso.resolve(), args.ovmf.resolve(),
+                            args.fixture_tool.resolve(), artifacts)
+        disk.write_bytes(original)
+        failed_write_boot(args.qemu, args.iso.resolve(), args.ovmf.resolve(), disk, artifacts)
         corrupt = bytearray(original)
         # OVMF can repair one bad GPT header from its valid mirror before the
         # kernel starts. Corrupt both CRCs to test kernel fail-closed admission

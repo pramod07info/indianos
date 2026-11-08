@@ -37,9 +37,27 @@ name/root escape rejection, every length-byte value, noncanonical wire padding,
 forged payload controls, overflow and transport-loss poisoning. Together with
 the existing editor tests, the actual parser/codec module suite passed 13 tests.
 
-This change provides userland parsing and wire validation, not completed guest
-execution by itself. The coordinator must connect the broker, check filesystem
-results without blindly retrying uncertain writes, display recoverable errors,
-and verify named create/read/write/rename/delete plus reboot in real QEMU.
+The native Desktop broker connects these commands to the live authenticated
+selected-volume APIs. A successful mutation finishes before Files is asked to
+refresh; the broker waits for its reply before sending the Terminal success
+result. Failed operations report an error without retrying an uncertain write or
+substituting a different operation. The Terminal handles that error and remains
+interactive. Sender/namespace/process-generation authority remains kernel-owned.
+
+The G1 acceptance scenario types real PS/2 commands to create a file, overwrite
+it with `violet`, rename it, create/delete a second file and create a directory.
+It checks the exact Files directory glyphs after each operation, and requires
+actual visible Files damage for structural changes. A fresh `cat` must display
+the exact `violet` glyphs; the success label `SAVED` cannot satisfy that check.
+After cold QEMU reboot, Files must display the committed directory and note,
+and a newly typed `cat` must display the renamed file's exact content. Bytewise
+serial readback is checked separately from the framebuffer proof. Glyph
+expectations are independently pinned in the harness and include blank trailing
+cells so stale suffixes, longer notes, wrong fields and mere changed pixels fail.
+
+Every normal startup additionally requires actual pre-readiness negative syscall
+controls from Files, Terminal, broker and compositor. Removing a permission probe
+or moving its evidence after readiness fails acceptance. Exact-SHA CI and the
+gate ledger determine completion; parsing or this document alone does not.
 Subdirectories, navigation, multiword filenames, general shells and POSIX file
 semantics are outside this bounded command interface.

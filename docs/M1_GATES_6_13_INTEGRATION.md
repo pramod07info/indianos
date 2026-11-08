@@ -52,8 +52,8 @@ outside this bounded verification.
 
 | Position / gate | Source and current evidence | State / remaining exit work |
 |---|---|---|
-| 6 / G1 | Live selected-volume commands, named CRUD/mkdir/mv, GUI refresh; two QEMU boots read the saved named file | IN PROGRESS: final-head CI and complete acceptance batch |
-| 7 / G2 | Explicit GUID/bounds pinning, strict namespace admission, neighbor guards, checksummed semantic-corruption rejection and selected-volume reboot | IN PROGRESS: exact-head CI and physical qualification |
+| 6 / G1 | Authenticated native named CRUD/mkdir/mv; exact Files damage/listing and distinct VIOLET GUI readback across two real boots | Local exits verified; exact-head CI/review required for acceptance |
+| 7 / G2 | Exact protective-MBR bounds, both GPT mirrors, selected-window guards, actual semantic rejection/write-failure and reboot evidence | Local exits verified; exact-head CI/review required for acceptance; physical qualification is G8 |
 | 8 / G3 | Four-service native Desktop edition entry, preflight, one bounded verified restart and recovery | IN PROGRESS: installation and final-head qualification |
 | 9 / G4 | Independent PID4 window manager, PID1 input broker, authenticated syscall37, isolated app command streams and fault-loop acceptance | IN PROGRESS: broader stress and guarded surface/service qualification |
 | 10 / G5 | Actual emulated PS/2 keys/mouse, focus/actions and screenshots; UART negative control | IN PROGRESS: final acceptance matrix and IRQ/hardware qualification |

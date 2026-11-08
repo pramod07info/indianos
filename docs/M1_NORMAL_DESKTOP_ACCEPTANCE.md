@@ -22,6 +22,25 @@ all four PCB reaps. Read-only commands on the second boot may not mutate media.
 Neighbor sectors, GPT metadata and every byte outside the selected partition
 must remain unchanged throughout both boots.
 
+The G1 Terminal contract also creates a named file, writes `violet`, renames it,
+deletes another file and creates a directory through the actual ring-3 broker.
+Every structural mutation must change visible Files pixels and produce the exact
+expected directory glyphs. After cold reboot, Files must show the persisted
+directory and note; a freshly typed named `cat` must render exact `violet` glyphs.
+The payload deliberately differs from the status label `SAVED`, since the font
+renders lowercase in uppercase and a `saved` payload would be visually ambiguous.
+Exact serial content and exact framebuffer text are independent requirements.
+
+The raster oracle pins the qualified normal window geometry and 5x7 doubled font
+contract independently of the production renderer. It checks every foreground
+and background/spacing pixel in the bounded field, including cleared trailing
+cells. Stale success labels, wrong payloads, prefix-only matches, leftover text
+or output in another window cannot satisfy it. Normal acceptance performs no
+window moves/resizes; an unqualified geometry fails rather than searching the
+screen for a convenient matching string. Fresh physical key acknowledgements
+precede result screenshots. Missing pre-readiness negative syscall controls from
+Files/Terminal/broker/compositor also fail the normal runtime verifier.
+
 Negative guests receive a corrupt GPT checksum, validly checksummed changed disk
 GUID, or two corrupt COW metadata heads. Each must enter read-only recovery
 without process startup, formatting or any disk change. Fresh ISO fault fixtures

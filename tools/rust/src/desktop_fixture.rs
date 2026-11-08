@@ -114,6 +114,32 @@ fn namespace_fault(kind:&str)->Result<Image,String>{
     }
     Ok(disk)
 }
+fn refresh_partition_table(disk:&mut Image){
+    let table=disk.sectors[2];
+    disk.sectors[254]=table;
+    disk.sectors[1]=header(1,255,2,crc(&table));
+    disk.sectors[255]=header(255,1,254,crc(&table));
+}
+// Each case preserves the selected partition's filesystem and valid GPT
+// header/array checksums. The rejection must come from the named layout fault.
+fn partition_fault(kind:&str)->Result<Image,String>{
+    if !matches!(kind,"overlap"|"duplicate-id"|"protective-overflow"){
+        return Err("unknown partition fault (overlap, duplicate-id, protective-overflow)".into());
+    }
+    let mut disk=image()?;
+    if kind=="protective-overflow"{
+        disk.sectors[0][458..462].copy_from_slice(&(SECTORS as u32).to_le_bytes());
+    }else{
+        let entry=&mut disk.sectors[2][128..256];
+        entry[..16].copy_from_slice(b"IndianOS-COW-VFS");
+        entry[16..32].copy_from_slice(if kind=="duplicate-id"{&PARTITION_GUID}else{&[0x7d;16]});
+        let (begin,end)=if kind=="overlap"{(START+10,START+20)}else{(150,199)};
+        entry[32..40].copy_from_slice(&begin.to_le_bytes());
+        entry[40..48].copy_from_slice(&end.to_le_bytes());
+        refresh_partition_table(&mut disk);
+    }
+    Ok(disk)
+}
 fn selection()->[u8;64]{
     let mut bytes=[0u8;64];bytes[..8].copy_from_slice(b"INDVOL01");
     bytes[16..32].copy_from_slice(&DISK_GUID);
@@ -134,11 +160,55 @@ fn main(){
     }else if args.len()==5&&args[1]=="--namespace-fault"&&args[3]=="--output"{
         args[2].to_str().ok_or_else(||"invalid fault name".to_string())
             .and_then(namespace_fault).and_then(|disk|write_image(Path::new(&args[4]),disk))
-    }else{Err("usage: indianos-desktop-fixture --output NEW.raw --selection-output NEW.bin; or --namespace-fault KIND --output NEW.raw".into())};
+    }else if args.len()==5&&args[1]=="--partition-fault"&&args[3]=="--output"{
+        args[2].to_str().ok_or_else(||"invalid fault name".to_string())
+            .and_then(partition_fault).and_then(|disk|write_image(Path::new(&args[4]),disk))
+    }else{Err("usage: indianos-desktop-fixture --output NEW.raw --selection-output NEW.bin; or --namespace-fault KIND --output NEW.raw; or --partition-fault KIND --output NEW.raw".into())};
     if let Err(error)=result{eprintln!("desktop fixture: {error}");std::process::exit(1);}
 }
 #[cfg(test)]mod tests{
     use super::*;
+    #[test]fn partition_faults_are_crc_valid_isolated_and_rejected_for_the_named_reason(){
+        use indianos_kernel_core::m1_partition::{discover,Error};
+        let original=image().unwrap();
+        for (kind,error) in [("overlap",Error::Overlap),("duplicate-id",Error::Invalid),
+            ("protective-overflow",Error::Invalid)]{
+            let mut disk=partition_fault(kind).unwrap();
+            for lba in 0..SECTORS{
+                if ![0,1,2,254,255].contains(&lba){assert_eq!(disk.sectors[lba],original.sectors[lba]);}
+            }
+            assert_eq!(disk.sectors[2],disk.sectors[254]);
+            let table_crc=crc(&disk.sectors[2]);
+            for lba in [1,255]{
+                let mut h=disk.sectors[lba];
+                let header_crc=u32::from_le_bytes(h[16..20].try_into().unwrap());
+                h[16..20].fill(0);assert_eq!(crc(&h[..92]),header_crc);
+                assert_eq!(u32::from_le_bytes(h[88..92].try_into().unwrap()),table_crc);
+            }
+            let mut bounded=BlockWindow::new(&mut disk,START,COUNT).unwrap();
+            assert_eq!(DurableFs::inspect_health(&mut bounded).unwrap().redundancy,
+                indianos_kernel_core::durablefs::Redundancy::Healthy);
+            drop(bounded);
+            let before=disk.sectors.clone();
+            assert_eq!(discover(&mut disk),Err(error),"{kind}");
+            assert_eq!(disk.sectors,before);
+            // Repair only this fixture's named fault as a positive control.
+            match kind{
+                "overlap"=>{
+                    disk.sectors[2][160..168].copy_from_slice(&150u64.to_le_bytes());
+                    disk.sectors[2][168..176].copy_from_slice(&199u64.to_le_bytes());
+                    refresh_partition_table(&mut disk);
+                },
+                "duplicate-id"=>{
+                    disk.sectors[2][144..160].fill(0x7d);
+                    refresh_partition_table(&mut disk);
+                },
+                _=>disk.sectors[0][458..462].copy_from_slice(&255u32.to_le_bytes()),
+            }
+            assert_eq!(discover(&mut disk).unwrap().len(),if kind=="protective-overflow"{1}else{2});
+        }
+        assert!(partition_fault("unknown").is_err());
+    }
     #[test]fn namespace_faults_keep_partition_and_cow_health_but_fail_strict_admission(){
         let original=image().unwrap();
         for kind in ["orphan","alias","marker","link"]{

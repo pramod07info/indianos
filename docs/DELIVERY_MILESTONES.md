@@ -37,10 +37,15 @@ Files and Terminal, and integration/QA.
 - [ ] **M1.1 current slice**: authenticated Terminal commands connected to
       checksummed block-backed HierVfs with real read/write/mkdir/rename,
       UI damage and read-after-remount acceptance (Rust test); then
-      prove the same live ring-3 GUI commands on QEMU.
+      prove the same live ring-3 GUI commands on QEMU. Implementation and local
+      runtime exits are exercised by PR765's exact-glyph two-boot scenario;
+      final acceptance awaits its new exact-head CI/review. See
+      [positions 6–7 evidence](M1_GATES_6_7_ACCEPTANCE.md).
 - [ ] **M1 partition work**: defensive MBR/GPT header/entry checksum checks,
       bounds and overlap rejection, selected-partition read/write window,
-      actual HierVfs remount tests. Physical disk qualification pending.
+      actual HierVfs remount tests. The PR765 candidate includes semantic GPT
+      rejection and actual ATA write-failure acceptance; final exact-head
+      CI/review remains required. Physical qualification is tracked under G8.
 - [ ] Production normal boot starts PID1, user compositor, Files and Terminal
       without test-only kernel feature flags.
 - [ ] Move full compositor and input broker from ring0 to independent ring3

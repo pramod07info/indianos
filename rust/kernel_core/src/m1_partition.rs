@@ -290,7 +290,10 @@ fn discover_verified<D:BlockDevice>(disk:&mut D)->Result<PartitionSet,Error>{
    }
   }
   let covered=le32(&first[458..462]) as u64;
-  if covered<(disk.sector_count()-1).min(u32::MAX as u64){
+  // The protective entry describes every sector after LBA0, saturating
+  // only when the disk exceeds the 32-bit MBR field. An oversized entry on
+  // a small disk is out-of-device geometry, not valid GPT protection.
+  if covered!=(disk.sector_count()-1).min(u32::MAX as u64){
    return Err(Error::Invalid);
   }
   gpt(disk)
@@ -1183,6 +1186,47 @@ mod m1_partition_tests{
   disk.data[0][458..462].copy_from_slice(&10u32.to_le_bytes());
   assert_eq!(inspect(&mut disk,0),Err(Error::Invalid));
   assert_eq!(disk.writes,0);
+ }
+ #[test]fn m1_gpt_protective_mbr_requires_exact_capacity_without_writes(){
+  for covered in [0,1,254,256,u32::MAX]{
+   let mut disk=gpt_disk();
+   disk.data[0][458..462].copy_from_slice(&covered.to_le_bytes());
+   let before=disk.data;
+   assert_eq!(discover(&mut disk),Err(Error::Invalid),"coverage {covered}");
+   assert_eq!(disk.data,before);assert_eq!(disk.writes,0);
+  }
+  let mut disk=gpt_disk();
+  assert_eq!(le32(&disk.data[0][458..462]),255);
+  assert_eq!(discover(&mut disk).unwrap().len(),1);
+  assert_eq!(disk.writes,0);
+ }
+ #[test]fn m1_gpt_protective_mbr_saturates_only_beyond_32bit_capacity(){
+  struct LargeDisk{disk:Disk,capacity:u64}
+  impl BlockDevice for LargeDisk{
+   fn sector_count(&self)->u64{self.capacity}
+   fn read_sector(&mut self,l:u64,b:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+    let source=if l==self.capacity-1{255}else if l==self.capacity-2{254}
+      else if l<254{l as usize}else{return Err(BlockError::OutOfRange)};
+    *b=self.disk.data[source];Ok(())
+   }
+   fn write_sector(&mut self,_:u64,_:&[u8;SECTOR_BYTES])->Result<(),BlockError>{panic!("discovery wrote")}
+  }
+  let capacity=u32::MAX as u64+4096;
+  let mut disk=gpt_disk();
+  disk.data[0][458..462].copy_from_slice(&u32::MAX.to_le_bytes());
+  for (lba,current,alternate,table) in [(1,1,capacity-1,2),
+      (255,capacity-1,1,capacity-2)]{
+   let header=&mut disk.data[lba];
+   header[24..32].copy_from_slice(&current.to_le_bytes());
+   header[32..40].copy_from_slice(&alternate.to_le_bytes());
+   header[72..80].copy_from_slice(&table.to_le_bytes());
+   header[16..20].fill(0);let checksum=crc(&header[..92]);
+   header[16..20].copy_from_slice(&checksum.to_le_bytes());
+  }
+  let mut device=LargeDisk{disk,capacity};
+  assert_eq!(discover(&mut device).unwrap().len(),1);
+  device.disk.data[0][458..462].copy_from_slice(&(u32::MAX-1).to_le_bytes());
+  assert_eq!(discover(&mut device),Err(Error::Invalid));
  }
  #[test]fn m1_gpt_rejects_data_claiming_backup_metadata_sectors(){
   let mut disk=gpt_disk();

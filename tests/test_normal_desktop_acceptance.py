@@ -14,6 +14,81 @@ finally:
 
 
 class NormalDesktopControls(unittest.TestCase):
+    def test_failed_write_requires_fresh_sync_refusal_and_no_success_or_shutdown(self):
+        refusal = b"desktop shutdown refused: selected volume sync failed\n"
+        stale = harness.NAMED_COMMIT.encode() + b"\n"
+        harness.verify_failed_write(stale + refusal, len(stale))
+        for bad in (b"", b"no sync proof", refusal + harness.NAMED_COMMIT.encode(),
+                    refusal + harness.COMMITTED.encode(), refusal + harness.SHUTDOWN.encode(),
+                    refusal + harness.STOPPED.encode()):
+            with self.subTest(output=bad), self.assertRaises(AssertionError):
+                harness.verify_failed_write(bad, 0)
+        with self.assertRaises(AssertionError):
+            harness.verify_failed_write(refusal, len(refusal))
+
+    def graphical_field(self, text="A", field="terminal"):
+        width, height = 1024, 768
+        pixels = bytearray([31, 50, 73]) * (width * height)
+        frame = (width, height, pixels)
+        x, y, _ = harness.text_field_bounds(frame, field)
+        # Independent pinned A glyph, sufficient for the oracle controls.
+        rows_by_char = {
+            "A": (14, 17, 17, 31, 17, 17, 17),
+            "S": (15, 16, 16, 14, 1, 1, 30),
+            "V": (17, 17, 17, 17, 17, 10, 4),
+            "E": (31, 16, 16, 30, 16, 16, 31),
+            "D": (30, 17, 17, 17, 17, 17, 30),
+        }
+        for index, char in enumerate(text):
+            rows = rows_by_char[char]
+            for row, bits in enumerate(rows):
+                for column in range(5):
+                    if bits & (1 << (4 - column)):
+                        for dy in range(2):
+                            for dx in range(2):
+                                offset = ((y + row * 2 + dy) * width + x + index * 12 + column * 2 + dx) * 3
+                                pixels[offset:offset + 3] = b"\xff\xff\xff"
+        return width, height, bytes(pixels)
+
+    def test_graphical_readback_requires_exact_glyphs_and_cleared_trailing_cells(self):
+        image = self.graphical_field()
+        harness.verify_text_pixels(image, "terminal", "a")
+        with self.assertRaises(AssertionError):
+            harness.verify_text_pixels(image, "terminal", "B")
+        with self.assertRaises(AssertionError):
+            harness.verify_text_pixels(self.graphical_field("AA"), "terminal", "A")
+        with self.assertRaises(AssertionError):
+            harness.verify_text_pixels(self.graphical_field(""), "terminal", "A")
+        # The success label cannot masquerade as the named file's content.
+        # The real two-boot scenario deliberately uses VIOLET, not SAVED.
+        with self.assertRaises(AssertionError):
+            harness.verify_text_pixels(self.graphical_field("SAVED"), "terminal", harness.G1_PAYLOAD)
+        # Even one corrupted foreground/background pixel invalidates readback;
+        # a changed frame or a UART success message cannot replace the glyph.
+        x, y, _ = harness.text_field_bounds(image, "terminal")
+        for dx in (0, 2):
+            corrupt = bytearray(image[2])
+            at = (y * image[0] + x + dx) * 3
+            corrupt[at:at + 3] = b"\xff\xff\xff" if dx == 0 else b"\x80\x80\x80"
+            with self.subTest(dx=dx), self.assertRaises(AssertionError):
+                harness.verify_text_pixels((image[0], image[1], bytes(corrupt)), "terminal", "A")
+
+    def test_graphical_fields_use_qualified_window_geometry_and_reject_wrong_regions(self):
+        image = self.graphical_field(field="files-directory")
+        self.assertEqual(harness.text_field_bounds(image, "terminal"), (520, 544, 270))
+        self.assertEqual(harness.text_field_bounds(image, "files-directory"), (72, 282, 264))
+        self.assertEqual(harness.text_field_bounds(image, "files-note"), (72, 309, 240))
+        harness.verify_text_pixels(image, "files-directory", "A")
+        with self.assertRaises(AssertionError):
+            harness.verify_text_pixels(image, "terminal", "A")
+        for field, expected in (("unknown", "A"), ("terminal", ""),
+                                ("terminal", "é"), ("terminal", "?"),
+                                ("terminal", "A" * 23)):
+            with self.subTest(field=field, expected=expected), self.assertRaises(AssertionError):
+                harness.verify_text_pixels(image, field, expected)
+        with self.assertRaises(AssertionError):
+            harness.verify_text_pixels((1024, 768, image[2][:-1]), "files-directory", "A")
+
     def test_stopped_root_requires_one_real_physical_cr3(self):
         class Monitor:
             def __init__(self, response):
@@ -205,7 +280,8 @@ class NormalDesktopControls(unittest.TestCase):
     def trace(self):
         lines = [f"IndianOS: PID {pid} {state}" for pid in (1, 2, 3, 4)
                  for state in ("READY", "DISPATCHED")]
-        prefix = ("\n".join(lines + [harness.COMPOSITOR, harness.READY]) + "\n").encode()
+        prefix = ("\n".join(lines + [marker.decode("ascii") for marker in harness.TERMINAL_AUTHORITY] +
+                            [harness.COMPOSITOR, harness.READY]) + "\n").encode()
         tail = ("desktop selected volume synchronized\n" + harness.SHUTDOWN + "\n" +
                 "\n".join(f"IndianOS: PID {pid} REAPED" for pid in (1, 2, 3, 4)) +
                 "\n" + harness.STOPPED + "\n").encode()
@@ -219,6 +295,14 @@ class NormalDesktopControls(unittest.TestCase):
                 missing = trace.replace(f"IndianOS: PID {pid} {state}".encode(), b"absent")
                 with self.subTest(pid=pid, state=state), self.assertRaises(AssertionError):
                     harness.verify_runtime(missing, shutdown_at)
+
+    def test_terminal_authority_controls_must_execute_before_fresh_readiness(self):
+        trace, shutdown_at = self.trace()
+        for marker in harness.TERMINAL_AUTHORITY:
+            for bad in (trace.replace(marker, b"missing"),
+                        trace.replace(marker, b"missing") + marker):
+                with self.subTest(marker=marker), self.assertRaises(AssertionError):
+                    harness.verify_runtime(bad, shutdown_at)
 
     def test_late_compositor_stale_sync_and_reordered_shutdown_are_rejected(self):
         trace, offset = self.trace()
