@@ -194,8 +194,13 @@ def verify_uart_ignored(before: tuple[int, int, bytes], after: tuple[int, int, b
 
 
 def spawn(qemu: str, iso: Path, ovmf: Path, disk: Path, folder: Path, name: str,
-          debugger: Path | None = None, *, write_fault: Path | None = None):
-    monitor = folder / f"{name}.sock"
+          debugger: bool = False, *, write_fault: Path | None = None):
+    # AF_UNIX paths include the whole checkout/artifact prefix. GitHub's
+    # longer prefix made partition-protective-overflow.sock exceed 108 bytes.
+    # Keep both sockets private and short, independent of artifact names.
+    socket_directory = tempfile.TemporaryDirectory(prefix="indianos-qemu-", dir="/tmp")
+    monitor = Path(socket_directory.name) / "monitor.sock"
+    debugger_path = Path(socket_directory.name) / "gdb.sock"
     image = f"blkdebug:{write_fault}:{disk}" if write_fault is not None else str(disk)
     command = [qemu, "-machine", "pc", "-m", "256M", "-smp", "1",
                "-display", "none", "-vga", "std", "-serial", "stdio",
@@ -204,34 +209,53 @@ def spawn(qemu: str, iso: Path, ovmf: Path, disk: Path, folder: Path, name: str,
                "-drive", f"if=pflash,format=raw,readonly=on,file={ovmf}",
                "-cdrom", str(iso),
                "-drive", f"if=ide,index=0,media=disk,format=raw,file={image}"]
-    if debugger is not None:
-        command.extend(["-gdb", f"unix:{debugger},server=on,wait=off"])
-    process = subprocess.Popen(command, stdin=subprocess.PIPE,
-                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0)
+    if debugger:
+        command.extend(["-gdb", f"unix:{debugger_path},server=on,wait=off"])
+    process = None
+    sock = None
     try:
+        process = subprocess.Popen(command, stdin=subprocess.PIPE,
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0)
         sock = open_monitor(monitor, process)
-        return process, sock, QemuSession(process, sock)
-    except BaseException:
-        process.kill()
-        process.communicate(timeout=5)
+        session = QemuSession(process, sock)
+        session.socket_directory = socket_directory
+        session.debugger_path = debugger_path
+        return process, sock, session
+    except BaseException as error:
+        output = b""
+        try:
+            if sock is not None:
+                sock.close()
+            if process is not None:
+                if process.poll() is None:
+                    process.kill()
+                output, _ = process.communicate(timeout=5)
+            # Startup diagnostics used to disappear behind the generic
+            # monitor assertion. Preserve QEMU's actual error even here.
+            (folder / f"{name}.serial.log").write_bytes(
+                output or f"QEMU startup failed: {error}\n".encode())
+        finally:
+            socket_directory.cleanup()
         raise
 
 
 def close(process, sock, session: QemuSession, output: Path) -> None:
-    session.selector.close()
-    sock.close()
-    if process.poll() is None:
-        process.terminate()
     try:
-        remaining, _ = process.communicate(timeout=3)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        remaining, _ = process.communicate(timeout=3)
-    if remaining:
-        session.output.extend(remaining)
-    # Preserve the rest of a fault diagnostic even when its first UART chunk
-    # caused the acceptance loop to reject the guest immediately.
-    output.write_bytes(session.output)
+        session.selector.close()
+        sock.close()
+        if process.poll() is None:
+            process.terminate()
+        try:
+            remaining, _ = process.communicate(timeout=3)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            remaining, _ = process.communicate(timeout=3)
+        if remaining:
+            session.output.extend(remaining)
+        # Preserve trailing fault diagnostics before removing socket files.
+        output.write_bytes(session.output)
+    finally:
+        session.socket_directory.cleanup()
 
 
 def boot(qemu: str, iso: Path, ovmf: Path, disk: Path, folder: Path, index: int) -> None:
@@ -816,8 +840,8 @@ def transient_service_boot(qemu: str, iso: Path, ovmf: Path, disk: Path,
     guards = stack_guard_records(symbols.stdout.decode("ascii"))
     unmapped = 0x60000000
     original = disk.read_bytes()
-    path = folder / "transient-gdb.sock"
-    process, sock, session = spawn(qemu, iso, ovmf, disk, folder, "transient-compositor", path)
+    process, sock, session = spawn(qemu, iso, ovmf, disk, folder, "transient-compositor", debugger=True)
+    path = session.debugger_path
     debugger = None
     evidence = [f"kernel ACTIVE_PROCESS={active:#x}; compositor wire={target:#x}",
                 f"expected code={expected.hex()}; injection RIP={unmapped:#x}"]

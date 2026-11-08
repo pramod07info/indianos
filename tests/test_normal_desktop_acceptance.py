@@ -2,7 +2,10 @@
 from pathlib import Path
 import struct
 import sys
+import tempfile
+from types import SimpleNamespace
 import unittest
+from unittest.mock import Mock, patch
 import zlib
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -14,6 +17,74 @@ finally:
 
 
 class NormalDesktopControls(unittest.TestCase):
+    def test_qemu_sockets_stay_short_with_long_artifact_paths_and_cleanup_after_close(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary) / ("long-checkout-" * 8) / ("artifacts-" * 8)
+            folder.mkdir(parents=True)
+            process = Mock()
+            process.poll.return_value = None
+            process.communicate.return_value = (b"tail diagnostic\n", None)
+            sock = Mock()
+            session = SimpleNamespace(selector=Mock(), output=bytearray(b"boot\n"))
+            with patch.object(harness.subprocess, "Popen", return_value=process) as popen, \
+                    patch.object(harness, "open_monitor", return_value=sock) as monitor, \
+                    patch.object(harness, "QemuSession", return_value=session):
+                actual_process, actual_sock, actual_session = harness.spawn(
+                    "qemu", Path("system.iso"), Path("OVMF.fd"), Path("disk.raw"),
+                    folder, "partition-protective-overflow", debugger=True)
+            monitor_path = monitor.call_args.args[0]
+            self.assertLess(len(str(monitor_path).encode()), 108)
+            self.assertLess(len(str(session.debugger_path).encode()), 108)
+            self.assertEqual(monitor_path.parent, session.debugger_path.parent)
+            self.assertEqual(monitor_path.parent.parent, Path("/tmp"))
+            self.assertNotIn(str(folder), str(monitor_path))
+            command = popen.call_args.args[0]
+            self.assertIn(f"unix:{monitor_path},server=on,wait=off", command)
+            self.assertIn(f"unix:{session.debugger_path},server=on,wait=off", command)
+            # Only socket files are temporary; diagnostics retain their requested
+            # long artifact path and the entire already-read/trailing stream.
+            directory = monitor_path.parent
+            output = folder / "partition-protective-overflow.serial.log"
+            harness.close(actual_process, actual_sock, actual_session, output)
+            self.assertFalse(directory.exists())
+            self.assertEqual(output.read_bytes(), b"boot\ntail diagnostic\n")
+            sock.close.assert_called_once()
+            process.terminate.assert_called_once()
+
+    def test_qemu_startup_failure_preserves_stderr_and_removes_socket_directory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            process = Mock()
+            process.poll.return_value = 1
+            diagnostic = b"qemu-system-x86_64: could not open monitor socket\n"
+            process.communicate.return_value = (diagnostic, None)
+            captured = []
+            def refuse_monitor(path, unused_process):
+                captured.append(path)
+                raise AssertionError("QEMU boot exited before monitor opened")
+            with patch.object(harness.subprocess, "Popen", return_value=process), \
+                    patch.object(harness, "open_monitor", side_effect=refuse_monitor):
+                with self.assertRaisesRegex(AssertionError, "before monitor"):
+                    harness.spawn("qemu", Path("system.iso"), Path("OVMF.fd"),
+                                  Path("disk.raw"), folder, "failed-start")
+            self.assertEqual((folder / "failed-start.serial.log").read_bytes(), diagnostic)
+            self.assertFalse(captured[0].parent.exists())
+            process.kill.assert_not_called()
+
+    def test_qemu_process_launch_error_still_releases_socket_directory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            directory = tempfile.TemporaryDirectory(prefix="indianos-qemu-", dir="/tmp")
+            tracked = SimpleNamespace(name=directory.name, cleanup=Mock(side_effect=directory.cleanup))
+            with patch.object(harness.tempfile, "TemporaryDirectory", return_value=tracked), \
+                    patch.object(harness.subprocess, "Popen", side_effect=OSError("missing QEMU")):
+                with self.assertRaisesRegex(OSError, "missing QEMU"):
+                    harness.spawn("qemu", Path("system.iso"), Path("OVMF.fd"),
+                                  Path("disk.raw"), folder, "failed-launch")
+            tracked.cleanup.assert_called_once()
+            self.assertFalse(Path(tracked.name).exists())
+            self.assertIn(b"missing QEMU", (folder / "failed-launch.serial.log").read_bytes())
+
     def test_failed_write_requires_fresh_sync_refusal_and_no_success_or_shutdown(self):
         refusal = b"desktop shutdown refused: selected volume sync failed\n"
         stale = harness.NAMED_COMMIT.encode() + b"\n"
