@@ -791,6 +791,12 @@ INITRAMFS_EXTRA_DEPS += $(THIRD_ELF)
 INITRAMFS_EXTRA_ARGS += --extra2-elf $(THIRD_ELF) --extra2-name /bin/terminal
 endif
 ifeq ($(DESKTOP_SESSION),1)
+# GNU Make command-line and -e environment variables supersede ordinary :=/+=
+# assignments. Refuse overrides of derived product inputs rather than reporting
+# Desktop while building console services or silently omitting its trusted pin.
+DESKTOP_DERIVED_OPTIONS := RUST_FEATURES RUST_INIT_FEATURE RUST_WORKER_FEATURE \
+    RUST_THIRD_FEATURE INITRAMFS_EXTRA_ARGS INITRAMFS_EXTRA_DEPS
+$(foreach option,$(DESKTOP_DERIVED_OPTIONS),$(if $(filter-out file undefined,$(origin $(option))),$(error DESKTOP_SESSION derives $(option); configure EDITION and documented native options instead)))
 DESKTOP_NATIVE_OPTIONS := RUST_CORE RUST_USERLAND RUST_TOOLS RUST_MAIN \
     RUST_USER_RUNTIME RUST_CPU_ENTRY RUST_BOOT RUST_BOOT_PROTOCOL \
     RUST_PAGING RUST_PAGING_CPU RUST_INTERRUPTS RUST_TIMER RUST_PMM \

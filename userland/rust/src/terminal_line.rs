@@ -3,6 +3,12 @@
 //! validates every resulting request before its existing file syscall.
 pub const CAPACITY:usize=32;
 pub const MAX_NOTE:usize=20;
+/// PID1 must apply current compositor focus even when an editor session is
+/// suspended. Keeping a line open grants no authority over another window's
+/// physical keyboard input. Enter starts editing only in the Terminal.
+pub fn accepts_input(front:u32,editing:bool,key:u8)->bool{
+ front==2&&(editing||key==b'\n')
+}
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 pub enum Action{Changed,Read,List,Stat,Write{bytes:[u8;MAX_NOTE],len:usize},
  Filesystem(crate::terminal_fs::Command),Invalid,Leave}

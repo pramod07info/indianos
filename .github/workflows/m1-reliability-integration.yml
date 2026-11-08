@@ -139,6 +139,10 @@ jobs:
           cargo check --locked --offline --manifest-path rust/kernel_core/Cargo.toml --no-default-features --target x86_64-unknown-none --features normal-desktop 2>&1 | tee build/normal-desktop-logs/no-std.log
           python3 -m unittest discover -s tests -p 'test_normal_desktop_acceptance.py' -v 2>&1 | tee build/normal-desktop-logs/harness.log
           python3 -m unittest discover -s tests -p 'test_desktop_boot_profile.py' -v 2>&1 | tee build/normal-desktop-logs/profile.log
+          rustc --edition=2021 --test userland/rust/tests/desktop_window.rs -o build/normal-desktop-logs/desktop-window-tests
+          build/normal-desktop-logs/desktop-window-tests 2>&1 | tee build/normal-desktop-logs/window-policy.log
+          rustc --edition=2021 --test userland/rust/tests/desktop_startup.rs -o build/normal-desktop-logs/desktop-startup-tests
+          build/normal-desktop-logs/desktop-startup-tests 2>&1 | tee build/normal-desktop-logs/startup-protocol.log
           cargo test --locked --offline --manifest-path tools/rust/Cargo.toml --features desktop-volume,desktop-fixture --bin indianos-desktop-volume --test desktop_volume_cli 2>&1 | tee build/normal-desktop-logs/volume-tool.log
       - name: Explicitly provision new disposable GPT media with the actual filesystem
         run: |

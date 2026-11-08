@@ -129,6 +129,34 @@ missing payload mappings, premature readiness and incomplete lifecycle cleanup.
 The harness source and its negative controls must run in GitHub Actions at the
 integrated revision before these new criteria can be accepted. No local QEMU or
 test execution is implied by this update.
+
+The normal two-boot path also keeps a `cat` command pending in Terminal, clicks
+Files through the emulated PS/2 mouse, and sends a physical `z`. It requires a
+fresh suspension acknowledgment, no Terminal input acknowledgment and an
+unchanged framebuffer. A physical click back into Terminal must change focus
+visually; Enter must read the exact original file contents both in serial and
+in rendered glyphs. This detects accidental keyboard delivery to an unfocused
+editor and proves that its pending command survives focus changes. Mouse motion
+uses relative deltas from the known initial pointer, not absolute HMP arguments.
+
+Healthy lifecycle evidence now requires each readiness/shutdown transition
+exactly once as a complete record, compositor startup before kernel readiness,
+and every real process exit followed by its reap after durable shutdown arming
+and before final session reclamation. The single physical console echo before
+the arm acknowledgment is accepted explicitly; arbitrary containing diagnostics
+or partial/replayed records cannot satisfy this evidence.
+
+Verified upstream result for `6b261b5a16b963fec89fadcc668ee164b395b418`:
+[M1 run 42510705119](https://github.com/pramod07info/indianos/actions/runs/42510705119)
+passed combined regressions and the runtime QEMU job. The normal-desktop job
+passed its host/build checks and the healthy boots, reboot, transient guard/fault
+recovery, media rejection, write-failure, invalid service, repeated fault and
+premature zero-exit scenarios. It failed the final unready-compositor criterion:
+the retained guest serial log shows PID1 exiting with status 142 before the
+startup dispatch budget, because its startup receive treated an absent compositor
+handshake as an immediate error. The blocking-startup-receive correction and
+new pointer/lifecycle checks require a fresh exact-revision CI run; this result
+does not close either high-level gate.
 See `M1_NAMESPACE_ADMISSION.md` and `M1_KERNEL_STACK_GUARDS.md` for limits.
 
 Run the combined normal-desktop workflow only after source integration. No new

@@ -31,3 +31,22 @@ fn pointer(x:u16,y:u16,left:bool)->[u8;6]{[b'M',x as u8,(x>>8) as u8,y as u8,(y>
  }
  let mut bad=initial();bad[14]=1;assert!(Manager::new(&bad).is_none());
 }
+#[test]fn explicit_policy_transitions_cancel_drag_until_a_new_physical_press(){
+ for control in [&b"P1"[..],b"K1",b"K2",b"Km",b"Kr",b"Ka",b"Kh"]{
+  let mut m=Manager::new(&initial()).unwrap();
+  assert_eq!(m.control(&pointer(370,270,true)),Some(2));
+  assert!(m.control(control).is_some());
+  let policy=m.wire();
+  assert!(m.control(&pointer(710,540,true)).is_some());
+  assert_eq!(&m.wire()[16..48],&policy[16..48],"stale drag after {:?}",control);
+  assert_eq!(m.front(),policy[12]);
+ }
+ let mut m=Manager::new(&initial()).unwrap();
+ m.control(&pointer(370,270,true)).unwrap();m.control(b"P1").unwrap();
+ m.control(&pointer(370,270,false)).unwrap();
+ assert_eq!(m.control(&pointer(370,270,true)),Some(2));
+ m.control(&pointer(400,300,true)).unwrap();
+ let moved=m.wire();
+ assert_eq!(u16::from_le_bytes([moved[32],moved[33]]),390);
+ assert_eq!(u16::from_le_bytes([moved[34],moved[35]]),290);
+}

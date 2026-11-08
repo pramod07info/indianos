@@ -17,6 +17,21 @@ finally:
 
 
 class NormalDesktopControls(unittest.TestCase):
+    def test_suspended_editor_requires_fresh_exact_refusal_and_no_visual_change(self):
+        frame = (640, 480, bytes(640 * 480 * 3))
+        marker = b"IndianOS user: desktop Terminal editor suspended outside keyboard focus\n"
+        stale = b"older input\n"
+        harness.verify_suspended_editor(frame, frame, stale + marker, len(stale))
+        harness.verify_suspended_editor(frame, frame, b"z" + marker, 0)
+        for output, since in ((stale, len(stale)), (marker, len(marker)),
+                              (marker[:-1], 0), (marker + marker, 0),
+                              (marker + harness.ACK.encode(), 0),
+                              (marker + harness.SHUTDOWN.encode(), 0)):
+            with self.subTest(output=output), self.assertRaises(AssertionError):
+                harness.verify_suspended_editor(frame, frame, output, since)
+        with self.assertRaises(AssertionError):
+            harness.verify_suspended_editor(frame, (640, 480, b"changed"), marker, 0)
+
     def test_surface_geometry_and_actual_debugger_guard_probes(self):
         records = [(base, base + 4096, base + 8192, base + 8192)
                    for base in (0xffff800010000000, 0xffff800010004000)]
@@ -429,10 +444,12 @@ class NormalDesktopControls(unittest.TestCase):
     def trace(self):
         lines = [f"IndianOS: PID {pid} {state}" for pid in (1, 2, 3, 4)
                  for state in ("READY", "DISPATCHED")]
-        prefix = ("\n".join(lines + [marker.decode("ascii") for marker in harness.TERMINAL_AUTHORITY] +
-                            [harness.COMPOSITOR, harness.READY]) + "\n").encode()
+        prefix = ("\n".join(lines + [harness.COMPOSITOR] +
+                            [marker.decode("ascii") for marker in harness.TERMINAL_AUTHORITY] +
+                            [harness.READY]) + "\n").encode()
         tail = (harness.DURABLE_SHUTDOWN + "\ndesktop selected volume synchronized\n" + harness.SHUTDOWN + "\n" +
-                "\n".join(f"IndianOS: PID {pid} REAPED" for pid in (1, 2, 3, 4)) +
+                "\n".join(f"IndianOS: PID {pid} {state}" for pid in (1, 2, 3, 4)
+                          for state in ("EXITED", "REAPED")) +
                 "\n" + harness.STOPPED + "\n").encode()
         return prefix + tail, len(prefix)
 
@@ -440,10 +457,30 @@ class NormalDesktopControls(unittest.TestCase):
         trace, shutdown_at = self.trace()
         harness.verify_runtime(trace, shutdown_at)
         for pid in (1, 2, 3, 4):
-            for state in ("READY", "DISPATCHED", "REAPED"):
+            for state in ("READY", "DISPATCHED", "EXITED", "REAPED"):
                 missing = trace.replace(f"IndianOS: PID {pid} {state}".encode(), b"absent")
                 with self.subTest(pid=pid, state=state), self.assertRaises(AssertionError):
                     harness.verify_runtime(missing, shutdown_at)
+
+    def test_healthy_lifecycle_rejects_replays_partial_records_and_premature_retirement(self):
+        trace, shutdown_at = self.trace()
+        harness.verify_runtime(trace.replace(harness.DURABLE_SHUTDOWN.encode(),
+                                            b"q" + harness.DURABLE_SHUTDOWN.encode()), shutdown_at)
+        for marker in (harness.COMPOSITOR, harness.LIFECYCLE_READY, harness.READY,
+                       harness.DURABLE_SHUTDOWN, harness.STOPPED):
+            for bad in (trace + marker.encode() + b"\n",
+                        trace.replace(marker.encode(), b"containing " + marker.encode()),
+                        trace.replace(marker.encode() + b"\n", marker.encode() + b" incomplete\n")):
+                with self.subTest(marker=marker), self.assertRaises(AssertionError):
+                    harness.verify_runtime(bad, shutdown_at)
+        for marker in (b"IndianOS: PID 2 EXITED", b"IndianOS: PID 2 REAPED"):
+            moved = marker + b"\n" + trace.replace(marker + b"\n", b"")
+            with self.assertRaises(AssertionError):
+                harness.verify_runtime(moved, shutdown_at + len(marker) + 1)
+        for suffix in (b"IndianOS: PID 2 FAULTED\n",
+                       b"IndianOS normal desktop: service exited before durable shutdown\n"):
+            with self.assertRaises(AssertionError):
+                harness.verify_runtime(trace + suffix, shutdown_at)
 
     def test_terminal_authority_controls_must_execute_before_fresh_readiness(self):
         trace, shutdown_at = self.trace()

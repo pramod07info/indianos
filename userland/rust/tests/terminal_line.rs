@@ -6,6 +6,25 @@ use terminal_line::{Action,Line,MAX_NOTE};
 fn enter(line:&mut Line,bytes:&[u8])->Action{
  for &byte in bytes{line.feed(byte);}line.feed(b'\n')
 }
+#[test]fn suspended_editor_cannot_capture_another_windows_physical_keys(){
+ let mut line=Line::new();
+ assert!(!terminal_line::accepts_input(1,false,b'\n'));
+ assert!(terminal_line::accepts_input(2,false,b'\n'));
+ assert!(!terminal_line::accepts_input(2,false,b'z'));
+ for &byte in b"write kept"{
+  assert!(terminal_line::accepts_input(2,true,byte));line.feed(byte);
+ }
+ // Physical focus switches to Files while the editor remains open. No key,
+ // including Enter/Tab/backspace, reaches the suspended Terminal parser.
+ for front in [0,1,3,u32::MAX]{
+  for byte in [b'z',b'\n',b'\t',8]{
+   assert!(!terminal_line::accepts_input(front,true,byte));
+  }
+ }
+ assert!(terminal_line::accepts_input(2,true,b'\n'));
+ let Action::Write{bytes,len}=line.feed(b'\n')else{panic!("lost suspended line")};
+ assert_eq!(&bytes[..len],b"kept");
+}
 #[test]fn named_file_commands_roundtrip_without_changing_legacy_commands(){
  use terminal_fs::{Command,Name};
  let name=Name::parse(b"note").unwrap();

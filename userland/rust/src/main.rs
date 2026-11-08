@@ -19,6 +19,8 @@ mod terminal_line;
 mod terminal_fs;
 #[cfg(feature="desktop-compositor")]
 mod desktop_window;
+#[cfg(feature="desktop-init")]
+mod desktop_startup;
 
 #[panic_handler]
 fn panic(_info: &PanicInfo<'_>) -> ! { exit(125) }
@@ -1036,6 +1038,21 @@ fn local_send(pid:u32,source:u16,destination:u16,payload:&[u8]){
               payload.len())!=0{exit(230);}
 }
 // The normal session routes policy to PID4 through authenticated IPC.
+#[cfg(feature="desktop-init")]
+fn desktop_startup_handshakes(){
+    let mut startup=desktop_startup::Startup::default();
+    loop{
+        let mut packet=[0u8;72];
+        // Cooperative receive lets a delayed service run. The kernel's
+        // startup budget owns timeout/recovery, not an empty nonblocking read.
+        let n=call(35,packet.as_mut_ptr() as u64,32);
+        if n==0{continue;}
+        if n>72{exit(142);}
+        match startup.observe(&packet[..n as usize]){
+            Ok(true)=>return,Ok(false)=>{},Err(())=>exit(142),
+        }
+    }
+}
 #[cfg(any(feature="desktop-init",feature="desktop-compositor"))]
 fn desktop_receive(sender:u32,out:&mut[u8;72])->usize{
     loop{
@@ -1121,6 +1138,7 @@ fn r031_shell()->!{
     }
     write(b"R031.1 init launching GUI services without test-driver keystrokes");
     yield_now();
+    #[cfg(not(feature="desktop-init"))]
     suite_receive(2,b"FILES");
     #[cfg(feature="r031-files-shell")]
     {
@@ -1146,14 +1164,14 @@ fn r031_shell()->!{
         yield_now();
         suite_receive(4,b"TERMINAL");
     }
-    #[cfg(not(feature="r031-supervisor-shell"))]
+    #[cfg(not(any(feature="r031-supervisor-shell",feature="desktop-init")))]
     suite_receive(3,b"TERMINAL");
     let expected_commands=if cfg!(any(feature="r031-files-shell",feature="desktop-init")){5|(2<<8)}
                           else{2|(2<<8)};
     #[cfg(not(feature="desktop-init"))]
     if call(22,0,0)!=expected_commands{exit(172);}
     #[cfg(feature="desktop-init")]
-    suite_receive(4,b"COMPOSITOR");
+    desktop_startup_handshakes();
     if desktop_present(1)!=0{exit(172);}
     #[cfg(feature="desktop-init")]
     {
@@ -1178,8 +1196,13 @@ fn r031_shell()->!{
         if pointer==u64::MAX{exit(173);}
         #[cfg(feature="desktop-init")]
         if pointer&(1u64<<33)!=0{
+            let previous=front;
             front=desktop_control(&[b'M',pointer as u8,(pointer>>8) as u8,
                 (pointer>>16) as u8,(pointer>>24) as u8,(pointer>>32) as u8]);
+            if front!=previous{
+                write(if front==1{b"desktop physical focus: Files"}
+                      else{b"desktop physical focus: Terminal"});
+            }
             if !saw_pointer{write(b"R031.1 physical PS2 mouse event reached desktop service");saw_pointer=true;}
         }
         #[cfg(not(feature="desktop-init"))]
@@ -1200,8 +1223,14 @@ fn r031_shell()->!{
             1=>{},
             _=>exit(175),
         }
+        #[cfg(feature="desktop-init")]
+        if terminal_edit&&front!=2{
+            write(b"desktop Terminal editor suspended outside keyboard focus");
+        }
         #[cfg(any(feature="r031-files-shell",feature="desktop-init"))]
-        if terminal_edit || (front==2&&byte[0]==b'\n'){
+        if if cfg!(feature="desktop-init"){
+            terminal_line::accepts_input(front,terminal_edit,byte[0])
+        }else{terminal_edit || (front==2&&byte[0]==b'\n')}{
             let begin=!terminal_edit;
             terminal_edit=terminal_exchange(byte[0],begin);
             if desktop_present(2)!=0{exit(216);}

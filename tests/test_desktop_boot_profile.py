@@ -2,6 +2,7 @@
 from pathlib import Path
 import subprocess
 import tempfile
+import os
 import tomllib
 import unittest
 
@@ -109,6 +110,33 @@ class DesktopBootProfile(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(option + "=1", result.stderr)
 
+    def test_desktop_cannot_be_replaced_by_command_line_derived_inputs(self):
+        for override in ("RUST_FEATURES=", "RUST_FEATURES=--features normal-init",
+                         "RUST_INIT_FEATURE=normal-init", "RUST_WORKER_FEATURE=normal-init",
+                         "RUST_THIRD_FEATURE=normal-init", "INITRAMFS_EXTRA_ARGS=",
+                         "INITRAMFS_EXTRA_DEPS="):
+            with self.subTest(override=override):
+                result = profile("EDITION=desktop", "DESKTOP_VOLUME_CONFIG=selected-volume.bin", override)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("derives " + override.split("=", 1)[0], result.stderr)
+
+    def test_environment_override_cannot_replace_native_desktop_roles(self):
+        for option in ("RUST_FEATURES", "RUST_INIT_FEATURE", "RUST_WORKER_FEATURE",
+                       "RUST_THIRD_FEATURE", "INITRAMFS_EXTRA_ARGS", "INITRAMFS_EXTRA_DEPS"):
+            with self.subTest(option=option):
+                environment = dict(os.environ, **{option: ""})
+                result = subprocess.run(["make", "-e", "-s", "--eval", RULE, "profile",
+                                         "EDITION=desktop", "DESKTOP_VOLUME_CONFIG=selected-volume.bin"],
+                                        cwd=ROOT, text=True, capture_output=True, check=False,
+                                        env=environment)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("derives " + option, result.stderr)
+
+    def test_explicit_console_preserves_advanced_profile_overrides(self):
+        result = profile("EDITION=console", "RUST_INIT_FEATURE=normal-init", "RUST_FEATURES=")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines()[0], "normal-init")
+
     def test_personality_changes_invalidate_artifacts_in_a_reused_build_tree(self):
         with tempfile.TemporaryDirectory() as directory:
             build = Path(directory)
@@ -125,7 +153,6 @@ class DesktopBootProfile(unittest.TestCase):
             self.assertEqual(stamp.stat().st_mtime_ns, first)
             self.assertEqual(artifact.read_text().splitlines(), ["console"])
             # A deliberately older artifact makes this independent of clock precision.
-            import os
             os.utime(artifact, (1, 1))
             choose("DESKTOP_VOLUME_CONFIG=selected-volume.bin")
             self.assertEqual(artifact.read_text().splitlines(), ["console", "desktop"])

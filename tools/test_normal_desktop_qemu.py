@@ -160,6 +160,17 @@ def verify_guard(original: bytes, actual: bytes) -> None:
 
 
 def verify_runtime(output: bytes, shutdown_at: int) -> None:
+    if not 0 < shutdown_at < len(output):
+        raise AssertionError("invalid normal-desktop shutdown evidence boundary")
+    # Require complete records: a truncated line or a containing diagnostic is
+    # not evidence that a native service actually reached the transition.
+    lines = output.replace(b"\r", b"").split(b"\n")[:-1]
+    # The physical console echoes Q before the shutdown syscall logs its
+    # result. Accept that single known echo, never an arbitrary log prefix.
+    lines = [line[1:] if line == b"q" + DURABLE_SHUTDOWN.encode() else line for line in lines]
+    for marker in (COMPOSITOR, LIFECYCLE_READY, READY, DURABLE_SHUTDOWN, STOPPED):
+        if lines.count(marker.encode()) != 1:
+            raise AssertionError("desktop lifecycle lacks an exact one-shot transition")
     if b"FATAL" in output or any(marker in output for marker in FORBIDDEN):
         raise AssertionError("normal desktop used a provisioning or console profile")
     if (b"restarting retired service session" in output or
@@ -172,12 +183,17 @@ def verify_runtime(output: bytes, shutdown_at: int) -> None:
             prefix.find(COMPOSITOR.encode()) > prefix.find(READY.encode())):
         raise AssertionError("desktop advertised ready before compositor service")
     startup = prefix[:prefix.find(READY.encode())]
+    lifecycle = startup.find(LIFECYCLE_READY.encode())
+    if not 0 <= startup.find(COMPOSITOR.encode()) < lifecycle:
+        raise AssertionError("kernel readiness preceded compositor readiness")
     if any(marker not in startup for marker in TERMINAL_AUTHORITY):
         raise AssertionError("Terminal startup lacks actual syscall authority negative controls")
     for pid in (1, 2, 3, 4):
         for state in ("READY", "DISPATCHED"):
             if f"IndianOS: PID {pid} {state}".encode() not in prefix:
                 raise AssertionError("desktop readiness lacks actual process execution")
+        if startup.find(f"IndianOS: PID {pid} DISPATCHED".encode()) > lifecycle:
+            raise AssertionError("kernel readiness preceded actual service execution")
     tail = output[shutdown_at:]
     synced = tail.find(b"desktop selected volume synchronized")
     armed = tail.find(DURABLE_SHUTDOWN.encode())
@@ -185,10 +201,72 @@ def verify_runtime(output: bytes, shutdown_at: int) -> None:
     if armed < 0 or synced < 0 or shutdown < 0 or not armed < synced < shutdown:
         raise AssertionError("desktop shutdown preceded a verified storage barrier")
     for pid in (1, 2, 3, 4):
-        if f"IndianOS: PID {pid} REAPED".encode() not in tail:
+        exited = f"IndianOS: PID {pid} EXITED".encode()
+        reaped = f"IndianOS: PID {pid} REAPED".encode()
+        if lines.count(exited) != 1 or lines.count(reaped) != 1:
             raise AssertionError("normal desktop did not reclaim every service")
-    if STOPPED.encode() not in tail:
-        raise AssertionError("normal desktop did not return cleanly to recovery")
+        if not armed < tail.find(exited) < tail.find(reaped) < tail.find(STOPPED.encode()):
+            raise AssertionError("normal desktop exited outside its durable shutdown sequence")
+    if b"FAULTED" in output or b"service exited before durable shutdown" in output:
+        raise AssertionError("healthy desktop contained a critical service failure")
+
+
+def verify_suspended_editor(before: tuple[int, int, bytes], after: tuple[int, int, bytes],
+                            output: bytes, since: int) -> None:
+    marker = b"IndianOS user: desktop Terminal editor suspended outside keyboard focus"
+    if not 0 <= since < len(output):
+        raise AssertionError("invalid suspended-editor evidence boundary")
+    lines = output[since:].replace(b"\r", b"").split(b"\n")[:-1]
+    lines = [line[1:] if line == b"z" + marker else line for line in lines]
+    if lines.count(marker) != 1:
+        raise AssertionError("Files focus did not suspend Terminal keyboard delivery")
+    if ACK.encode() in output[since:] or SHUTDOWN.encode() in output[since:]:
+        raise AssertionError("unfocused editor received a key or initiated shutdown")
+    if before != after:
+        raise AssertionError("unfocused editor input changed the framebuffer")
+
+
+def physical_focus(session: QemuSession, previous: tuple[int, int], target: tuple[int, int],
+                   app: str) -> tuple[int, int]:
+    # HMP relative motion enters the emulated 8042 auxiliary port. The guest
+    # must route it through PID1 IPC and PID4's hit testing before acknowledging.
+    start = len(session.output)
+    session.hmp(f"mouse_move {target[0] - previous[0]} {target[1] - previous[1]}")
+    session.drain_serial(0.2)
+    session.hmp("mouse_button 1")
+    session.drain_serial(0.2)
+    session.hmp("mouse_button 0")
+    session.until("IndianOS user: desktop physical focus: " + app, 20, since=start)
+    return target
+
+
+def pointer_focus_acceptance(session: QemuSession, folder: Path, index: int,
+                             editing: tuple[int, int, bytes]) -> tuple[int, int, bytes]:
+    # Keep CAT pending while Files owns focus. An erroneously delivered Z
+    # changes the command to CATZ and cannot produce the exact readback below.
+    type_command(session, "cat")
+    width, height = editing[:2]
+    pointer = physical_focus(session, (width // 2, height // 2), (100, 135), "Files")
+    focused = session.shot(folder / f"desktop-{index}-pointer-files.ppm")
+    changed(editing, focused, "physical pointer Files focus")
+    since = len(session.output)
+    session.hmp("sendkey z 80")
+    session.until("desktop Terminal editor suspended outside keyboard focus", 20, since=since)
+    blocked = session.shot(folder / f"desktop-{index}-pointer-key-blocked.ppm")
+    verify_suspended_editor(focused, blocked, bytes(session.output), since)
+    physical_focus(session, pointer, (width - 100, height - 150), "Terminal")
+    restored = session.shot(folder / f"desktop-{index}-pointer-terminal.ppm")
+    changed(blocked, restored, "physical pointer Terminal focus")
+    submitted = acknowledged_key(session, "ret")
+    expected = "HELLO INDIANOS" if index == 0 else PAYLOAD
+    readback = "IndianOS user: R051 Terminal readback: " + expected
+    session.until(readback, 20, since=submitted)
+    session.drain_serial(0.1)
+    exact_terminal_line(bytes(session.output), submitted, readback)
+    result = session.shot(folder / f"desktop-{index}-pointer-pending-readback.ppm")
+    verify_text_pixels(result, "terminal", expected)
+    verify_text_pixels(result, "files-note", expected)
+    return result
 
 
 def verify_uart_ignored(before: tuple[int, int, bytes], after: tuple[int, int, bytes],
@@ -291,13 +369,6 @@ def boot(qemu: str, iso: Path, ovmf: Path, disk: Path, folder: Path, index: int)
                    ("2", "R031.1 user switched to Terminal app")]
         for step, (key, marker) in enumerate(actions):
             frame = physical_key(session, key, marker, folder, index, step, frame, step == 0)
-        pointer_at = len(session.output)
-        session.hmp("mouse_move 100 135")
-        session.drain_serial(0.2)
-        session.hmp("mouse_button 1")
-        session.drain_serial(0.2)
-        session.hmp("mouse_button 0")
-        session.until("R031.1 physical PS2 mouse event reached desktop service", 20, since=pointer_at)
         acknowledged_key(session, "1", "R031.1 user switched to Files app")
         frame = session.shot(folder / f"desktop-{index}-files-focus.ppm")
         frame = physical_key(session, "2", "R031.1 user switched to Terminal app",
@@ -305,6 +376,7 @@ def boot(qemu: str, iso: Path, ovmf: Path, disk: Path, folder: Path, index: int)
         acknowledged_key(session, "ret")
         editing = session.shot(folder / f"desktop-{index}-editor.ppm")
         changed(frame, editing, "normal Terminal activation")
+        pointer_focus_acceptance(session, folder, index, editing)
         type_command(session, "write " + PAYLOAD if index == 0 else "cat")
         typed = session.shot(folder / f"desktop-{index}-typed.ppm")
         changed(editing, typed, "physical normal Terminal command", 1)

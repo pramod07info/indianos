@@ -51,6 +51,15 @@ native boot, paging, interrupt or runtime component is also rejected. Both image
 routes validate the selection before compiling native kernel or service code.
 Without a trusted selection, ordinary image builds remain console builds.
 
+Desktop also rejects externally supplied `RUST_FEATURES`, service-role features
+and initramfs extra-argument/dependency variables. GNU Make command-line and
+`-e` environment overrides otherwise supersede product assignments, permitting
+a Desktop-labelled image to contain console services or omit its selected-volume
+configuration. Use the documented edition/native options for product builds;
+advanced derived-profile overrides remain available to explicit console builds.
+This protects the supported product configuration contract, not an untrusted
+host build environment or arbitrary replacement compiler/Makefile.
+
 Each build directory records its resolved edition, selection path, boot entry,
 kernel feature graph, service roles and compilation/link inputs in
 `boot-profile.state`. An unchanged profile preserves its timestamp; changed

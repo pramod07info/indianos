@@ -90,12 +90,22 @@ static mut DESKTOP_RESTART_SAFE:bool=false;
 #[cfg(feature="normal-desktop")]
 const DESKTOP_STARTUP_DISPATCH_LIMIT:u32=256;
 #[cfg(feature="normal-desktop")]
+const DESKTOP_SHUTDOWN_DISPATCH_LIMIT:u32=256;
+#[cfg(feature="normal-desktop")]
 #[derive(Clone,Copy)]
-struct DesktopLifecycle{ready:bool,shutdown_armed:bool,startup_dispatches:u32}
+struct DesktopLifecycle{
+ ready:bool,shutdown_armed:bool,startup_dispatches:u32,shutdown_dispatches:u32,
+}
 #[cfg(feature="normal-desktop")]
 impl DesktopLifecycle{
- const fn new()->Self{Self{ready:false,shutdown_armed:false,startup_dispatches:0}}
+ const fn new()->Self{
+  Self{ready:false,shutdown_armed:false,startup_dispatches:0,shutdown_dispatches:0}
+ }
  fn dispatch(&mut self)->bool{
+  if self.shutdown_armed{
+   if self.shutdown_dispatches>=DESKTOP_SHUTDOWN_DISPATCH_LIMIT{return false;}
+   self.shutdown_dispatches+=1;return true;
+  }
   if self.ready{return true;}
   if self.startup_dispatches>=DESKTOP_STARTUP_DISPATCH_LIMIT{return false;}
   self.startup_dispatches+=1;true
@@ -111,6 +121,17 @@ impl DesktopLifecycle{
  }
  fn unexpected_exit(&self,fault:u64,status:u64)->bool{
   !self.shutdown_armed||fault!=0||status!=0
+ }
+ fn allows_storage_request(&self,number:u64,operation:u64)->bool{
+  if !self.shutdown_armed{return true;}
+  match number{
+   // Read/list/range-read and an additional flush cannot dirty the volume.
+   32=>matches!(operation,4|8|10|12),
+   // Existing descriptors may read, seek and close. OPEN can create/truncate
+   // and is deliberately refused even when its user flags claim read-only.
+   33=>matches!(operation,2|4|5),
+   _=>true,
+  }
  }
 }
 #[cfg(feature="normal-desktop")]
@@ -539,6 +560,12 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
   }
  }
  if !unsafe{indianos_syscall_validate(ptr::addr_of!((*img).plan),request)}{return BAD;}
+ #[cfg(feature="normal-desktop")]
+ if !unsafe{DESKTOP_LIFECYCLE}.allows_storage_request(request.number,request.arg0){
+  // The single BSP cannot interleave this check with ARM_SHUTDOWN. Once
+  // the flush has succeeded, no peer may create post-barrier dirty state.
+  return BAD;
+ }
  match request.number{
   #[cfg(feature="normal-desktop")]
   38=>{
@@ -2301,7 +2328,11 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
  while ok&&!unsafe{indianos_scheduler_all_terminal(&scheduler)}{
   #[cfg(feature="normal-desktop")]
   if !unsafe{(&mut *ptr::addr_of_mut!(DESKTOP_LIFECYCLE)).dispatch()}{
-   log(b"IndianOS normal desktop: startup dispatch budget exhausted\n\0");
+   if unsafe{DESKTOP_LIFECYCLE}.shutdown_armed{
+    log(b"IndianOS normal desktop: shutdown dispatch budget exhausted\n\0");
+   }else{
+    log(b"IndianOS normal desktop: startup dispatch budget exhausted\n\0");
+   }
    user_service_failed=true;ok=false;break;
   }
   #[cfg(any(feature="test-ipc",feature="normal-desktop"))]
@@ -2441,6 +2472,11 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
  let third_ok=unsafe{indianos_process_success(third)};
  #[cfg(feature="normal-desktop")]
  let third_ok=third_ok&&unsafe{indianos_process_success(compositor)};
+ #[cfg(feature="normal-desktop")]
+ if ok&&!crate::gui::user_surface_verified(){
+  log(b"IndianOS normal desktop: surface retirement verification failed\n\0");
+  ok=false;
+ }
  #[cfg(not(any(feature="test-r029-desktop-suite",feature="normal-desktop")))]
  let third_ok=true;
  if ok&&(!unsafe{indianos_scheduler_all_terminal(&scheduler)} ||
@@ -2612,6 +2648,41 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
   assert!(!state.unexpected_exit(0,0));
   assert!(state.unexpected_exit(14,0));
   assert!(state.unexpected_exit(0,1));
+ }
+ #[cfg(feature="normal-desktop")]
+ #[test]fn desktop_shutdown_dispatches_are_bounded_only_after_successful_sync(){
+  let mut state=DesktopLifecycle::new();
+  assert!(state.ready(true));
+  assert!(!state.complete_sync(false));
+  for _ in 0..1024{assert!(state.dispatch());}
+  assert_eq!(state.shutdown_dispatches,0);
+  assert!(state.complete_sync(true));
+  for _ in 0..DESKTOP_SHUTDOWN_DISPATCH_LIMIT{assert!(state.dispatch());}
+  assert!(!state.dispatch());
+  assert!(!state.dispatch());
+  assert_eq!(state.shutdown_dispatches,DESKTOP_SHUTDOWN_DISPATCH_LIMIT);
+ }
+ #[cfg(feature="normal-desktop")]
+ #[test]fn desktop_durable_shutdown_fences_all_storage_mutations(){
+  let mut state=DesktopLifecycle::new();
+  for number in [32,33]{
+   for operation in 0..=32{assert!(state.allows_storage_request(number,operation));}
+  }
+  assert!(state.ready(true));
+  assert!(!state.complete_sync(false));
+  assert!(state.allows_storage_request(32,11));
+  assert!(state.allows_storage_request(33,3));
+  assert!(state.complete_sync(true));
+  for operation in 0..=32{
+   assert_eq!(state.allows_storage_request(32,operation),matches!(operation,4|8|10|12));
+   assert_eq!(state.allows_storage_request(33,operation),matches!(operation,2|4|5));
+  }
+  assert!(!state.allows_storage_request(32,u64::MAX));
+  assert!(!state.allows_storage_request(33,u64::MAX));
+  // IPC, compositor final redraw, logging and termination remain available.
+  for number in [1,2,3,9,18,34,35,37]{
+   assert!(state.allows_storage_request(number,0));
+  }
  }
  #[cfg(feature="normal-desktop")]
  #[test]fn private_surface_geometry_requires_two_disjoint_guarded_pages(){

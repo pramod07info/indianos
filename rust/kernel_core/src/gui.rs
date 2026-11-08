@@ -269,6 +269,8 @@ struct UserSurfaceService{
     broker:Broker<2,8>,
     #[cfg(any(feature="test-r029-frame-server",feature="normal-desktop"))]
     frames_presented:u32,
+    #[cfg(feature="normal-desktop")]
+    retired_streams:u8,
     #[cfg(any(feature="test-r029-desktop-suite",feature="normal-desktop"))]
     launcher_visible:bool,
     #[cfg(any(feature="test-r029-desktop-suite",feature="normal-desktop"))]
@@ -282,6 +284,11 @@ struct UserSurfaceService{
 static mut USER_SURFACE_SERVICE:Option<UserSurfaceService>=None;
 #[cfg(any(feature="test-r029-userspace",feature="normal-desktop"))]
 impl UserSurfaceService{
+    #[cfg(feature="normal-desktop")]
+    fn retirement_verified(&self)->bool{
+        self.frames_presented>0&&self.retired_streams==3&&self.counts==[0,0]&&
+        (1..=4).all(|pid|!self.broker.known(pid))
+    }
     #[cfg(feature="normal-desktop")]
     fn window_frame(&self,pid:u32)->Option<crate::gui_protocol::DesktopFrame>{
         use crate::gui_protocol::{DesktopFrame,WindowFrame};
@@ -357,6 +364,8 @@ impl UserSurfaceService{
             counts:[0,0],focused:0,broker,
             #[cfg(any(feature="test-r029-frame-server",feature="normal-desktop"))]
             frames_presented:0,
+            #[cfg(feature="normal-desktop")]
+            retired_streams:0,
             #[cfg(any(feature="test-r029-desktop-suite",feature="normal-desktop"))]
             launcher_visible:false,
             #[cfg(any(feature="test-r029-desktop-suite",feature="normal-desktop"))]
@@ -374,6 +383,7 @@ impl UserSurfaceService{
         self.session=next.session;self.counts=next.counts;
         self.focused=next.focused;self.broker=next.broker;
         self.frames_presented=next.frames_presented;
+        self.retired_streams=0;
         self.launcher_visible=next.launcher_visible;
         self.desktop_actions=next.desktop_actions;
         self.mouse=next.mouse;
@@ -529,6 +539,9 @@ impl UserSurfaceService{
         #[cfg(feature="normal-desktop")]
         for window in 1..=2{
             if self.broker.owns(pid,window){
+                if self.counts[window as usize-1]>0{
+                    self.retired_streams|=1<<(window-1);
+                }
                 self.commands.clear_slot(window as usize-1);
                 self.counts[window as usize-1]=0;
             }
@@ -744,8 +757,7 @@ pub(crate) fn user_frame_present(pid:u32,front:u32)->bool{
 pub(crate) fn user_surface_verified()->bool{
     user_service().is_some_and(|svc|{
         #[cfg(feature="normal-desktop")]
-        {svc.frames_presented>0&&svc.counts[0]>0&&svc.counts[1]>0&&
-         !svc.broker.known(1)&&!svc.broker.known(2)&&!svc.broker.known(3)&&!svc.broker.known(4)}
+        {svc.retirement_verified()}
         #[cfg(not(feature="normal-desktop"))]
         {
         #[cfg(any(feature="test-r031-boot-desktop",feature="normal-desktop"))]
@@ -968,6 +980,7 @@ mod tests{
         UserSurfaceService{session:Session::new(800,600).unwrap(),
             commands:CommandStore::new(),counts:[0,0],focused:0,broker,
             frames_presented:0,launcher_visible:false,desktop_actions:0,
+            retired_streams:0,
             #[cfg(feature="test-r031-supervisor")]restart_count:0,
             // State-only fixture; no hardware initialization is invoked.
             mouse:unsafe{core::mem::zeroed()},}
@@ -1002,16 +1015,33 @@ mod tests{
             surface.lower.fill(0xa5);surface.upper.fill(0x5a);
             surface.padding.fill(0xcc);surface.entries[0].rgb=0x123456;
         }
-        svc.counts=[1,1];svc.frames_presented=23;svc.launcher_visible=true;
+        svc.counts=[1,1];svc.frames_presented=23;svc.launcher_visible=true;svc.retired_streams=3;
         svc.reset_in_place(isolated_service());
         assert_eq!(svc.commands.layout(),layout);assert_eq!(svc.counts,[0,0]);
         assert_eq!(svc.commands.snapshot(),[[UserCommand::EMPTY;COMMAND_LIMIT];2]);
         assert_eq!(svc.frames_presented,0);assert!(!svc.launcher_visible);
+        assert_eq!(svc.retired_streams,0);assert!(!svc.retirement_verified());
         for surface in &svc.commands.surfaces{
             assert!(surface.lower.iter().all(|&b|b==0xa5));
             assert!(surface.upper.iter().all(|&b|b==0x5a));
             assert!(surface.padding.iter().all(|&b|b==0));
         }
+    }
+    #[cfg(feature="normal-desktop")]
+    #[test]fn teardown_evidence_survives_scrubbing_but_requires_both_live_streams(){
+        let mut svc=isolated_service();svc.frames_presented=1;
+        svc.counts=[1,1];
+        assert!(!svc.retirement_verified());
+        svc.retire_client(99);assert_eq!(svc.retired_streams,0);
+        svc.retire_client(2);assert_eq!(svc.retired_streams,1);
+        assert!(!svc.retirement_verified());
+        svc.retire_client(2);assert_eq!(svc.retired_streams,1);
+        svc.retire_client(3);
+        assert_eq!(svc.counts,[0,0]);assert!(svc.retirement_verified());
+        assert_eq!(svc.commands.snapshot(),[[UserCommand::EMPTY;COMMAND_LIMIT];2]);
+        let mut empty=isolated_service();empty.frames_presented=1;
+        empty.retire_client(2);empty.retire_client(3);
+        assert!(!empty.retirement_verified());
     }
     #[cfg(feature="normal-desktop")]
     #[test]fn command_owner_and_retirement_isolate_backings_and_failed_submission_rolls_back(){
@@ -1039,6 +1069,7 @@ mod tests{
         let mut svc=UserSurfaceService{session:Session::new(800,600).unwrap(),
             commands:CommandStore::new(),counts:[0,0],
             focused:0,broker,frames_presented:0,launcher_visible:false,desktop_actions:0,
+            retired_streams:0,
             #[cfg(feature="test-r031-supervisor")]restart_count:0,
             mouse:unsafe{core::mem::zeroed()},};
         let before=svc.window_frame(4).unwrap().wire();
@@ -1065,6 +1096,7 @@ mod tests{
             session:Session::new(800,600).unwrap(),
             commands:CommandStore::new(),counts:[0,0],
             focused:0,broker,frames_presented:0,launcher_visible:false,desktop_actions:0,
+            #[cfg(feature="normal-desktop")]retired_streams:0,
             #[cfg(feature="test-r031-supervisor")]
             restart_count:0,
             mouse:unsafe{core::mem::zeroed()},
@@ -1129,6 +1161,7 @@ mod tests{
             session:Session::new(800,600).unwrap(),
             commands:CommandStore::new(),counts:[0,0],
             focused:0,broker,frames_presented:0,launcher_visible:false,
+            #[cfg(feature="normal-desktop")]retired_streams:0,
             desktop_actions:0,
             #[cfg(feature="test-r031-supervisor")]
             restart_count:0,

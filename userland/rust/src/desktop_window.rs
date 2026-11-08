@@ -48,6 +48,10 @@ impl Manager{
    },
    _=>return None,
   }
+  // An explicit keyboard/presentation transition invalidates the old drag
+  // anchor. Preserve the physical button latch: a held button cannot capture
+  // another window until a release and a fresh press arrive.
+  if request[0]!=b'M'{next.drag=None;}
   // Preserve a valid full state even when dimensions/flags evolve later.
   DesktopFrame::parse(&next.wire())?;
   let front=next.front();*self=next;Some(front)
