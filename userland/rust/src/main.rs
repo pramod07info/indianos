@@ -1067,7 +1067,8 @@ fn desktop_key(key:u8)->u64{
 #[cfg(feature="desktop-compositor")]
 fn desktop_compositor()->!{
     if call(4,0,0)!=4||call(6,0,1)!=u64::MAX||call(22,0,0)!=u64::MAX||
-       call(23,1,0)!=u64::MAX||call(24,1,0)!=u64::MAX{exit(247);}
+       call(23,1,0)!=u64::MAX||call(24,1,0)!=u64::MAX||
+       call(38,0,0)!=u64::MAX||call(38,1,0)!=u64::MAX{exit(247);}
     let mut denied=[0u8;64];denied[..14].copy_from_slice(b"/shared/readme");
     let mut byte=0u8;
     if call(6,core::ptr::addr_of_mut!(byte) as u64,1)!=u64::MAX||
@@ -1114,6 +1115,9 @@ fn r031_shell()->!{
         if call(37,0,state.as_mut_ptr() as u64)!=u64::MAX||
            call(37,1,state.as_ptr() as u64)!=u64::MAX{exit(252);}
         write(b"desktop PID1 denied compositor window authority");
+        if call(38,1,0)!=u64::MAX||call(38,0,1)!=u64::MAX||
+           call(38,2,0)!=u64::MAX{exit(254);}
+        write(b"desktop PID1 denied premature and malformed lifecycle requests");
     }
     write(b"R031.1 init launching GUI services without test-driver keystrokes");
     yield_now();
@@ -1152,7 +1156,10 @@ fn r031_shell()->!{
     suite_receive(4,b"COMPOSITOR");
     if desktop_present(1)!=0{exit(172);}
     #[cfg(feature="desktop-init")]
-    write(b"normal desktop READY: PID1 broker PID2 Files PID3 Terminal PID4 compositor");
+    {
+        if call(38,0,0)!=0||call(38,0,0)!=u64::MAX{exit(254);}
+        write(b"normal desktop READY: PID1 broker PID2 Files PID3 Terminal PID4 compositor");
+    }
     #[cfg(feature="r031-supervisor-shell")]
     write(b"R031.2 RESTORED DESKTOP READY: PID1 PID2 Files PID4 Terminal");
     #[cfg(not(feature="r031-supervisor-shell"))]
@@ -1247,8 +1254,9 @@ fn r031_shell()->!{
                 if !cfg!(feature="desktop-init") && (!saw_pointer||count<6){exit(182);}
                 #[cfg(feature="desktop-init")]
                 {
-                    let mut sync=[0u8;256];
-                    if vfs_call(12,b"/",b"",&mut sync,0)!=0{
+                    // Only a successful kernel-owned barrier can permit
+                    // clean service exits; userland cannot forge the flag.
+                    if call(38,1,0)!=0{
                         write(b"desktop shutdown refused: selected volume sync failed");continue;
                     }
                     write(b"desktop selected volume synchronized");
@@ -1290,7 +1298,8 @@ fn r031_files()->!{
         let mut state=[0u8;64];let mut byte=0u8;
         if call(37,0,state.as_mut_ptr() as u64)!=u64::MAX||
            call(37,1,state.as_ptr() as u64)!=u64::MAX||
-           call(6,core::ptr::addr_of_mut!(byte) as u64,1)!=u64::MAX{exit(253);}
+           call(6,core::ptr::addr_of_mut!(byte) as u64,1)!=u64::MAX||
+           call(38,0,0)!=u64::MAX||call(38,1,0)!=u64::MAX{exit(253);}
         write(b"desktop app denied compositor and physical input authority");
     }
     let foreign=r029_command(2,1,20,80,200,32,0x00ff0000,&[]);
@@ -1385,7 +1394,8 @@ fn r031_terminal()->!{
         let mut state=[0u8;64];let mut byte=0u8;
         if call(37,0,state.as_mut_ptr() as u64)!=u64::MAX||
            call(37,1,state.as_ptr() as u64)!=u64::MAX||
-           call(6,core::ptr::addr_of_mut!(byte) as u64,1)!=u64::MAX{exit(253);}
+           call(6,core::ptr::addr_of_mut!(byte) as u64,1)!=u64::MAX||
+           call(38,0,0)!=u64::MAX||call(38,1,0)!=u64::MAX{exit(253);}
         write(b"desktop app denied compositor and physical input authority");
     }
     let foreign=r029_command(1,1,20,80,200,32,0x00ff0000,&[]);

@@ -1,4 +1,4 @@
-# Explicit native desktop boot profile
+# Native desktop product boot profile
 
 The Desktop edition now has a dedicated product entry:
 
@@ -11,7 +11,8 @@ builds in `build/desktop-edition` (override `DESKTOP_BUILD`), and installs an
 `IndianOS Desktop (experimental)` Limine entry that starts the four-service
 desktop automatically. This target pins the native desktop personality and its
 boot configuration; it cannot silently become the console edition. The generic
-`make image` route stays unchanged. This creates bootable emulator media, not
+`make image DESKTOP_VOLUME_CONFIG=/absolute/path/selected-volume.bin` route now
+also selects this normal desktop profile and its automatic boot entry. This creates bootable emulator media, not
 a physical-disk installer or a signed release.
 
 To select an **existing regular raw image** with a healthy IndianOS filesystem:
@@ -31,13 +32,32 @@ an exclusive host lock or authentication of a disk owner. Kernel admission
 revalidates the selected medium on every boot. MBR, damaged GPT, unhealthy COW
 metadata and absent entries fail before writing any selection output.
 
-`make image DESKTOP_SESSION=1 DESKTOP_VOLUME_CONFIG=selected-volume.bin` builds
+`EDITION=auto` is the default: a supplied trusted selection selects Desktop;
+without one, existing console and experimental profiles retain their selection.
+Use `EDITION=desktop` to require Desktop explicitly; an absent selection is an
+error before compilation. `EDITION=console` explicitly retains console behavior
+even when a desktop selection is supplied, and does not package that selection.
+Contradictory edition/session flags and unknown editions are rejected. Selection
+paths must be whitespace-free for the Make dependency graph; no image path or
+partition is inferred. The host volume tool still accepts ordinary quoted paths.
+
+`make image DESKTOP_SESSION=1 DESKTOP_VOLUME_CONFIG=selected-volume.bin` remains
+a supported explicit route to
 the native Rust desktop profile. Its kernel feature is `normal-desktop`; none
 of the `test-*` features or disposable-media bootstrap profiles are enabled.
 Mixing this profile with a test profile, C reference kernel, reference userland
-or Python archive fallback is rejected before compilation. Ordinary console and
-existing test profiles retain their original selection. This product profile is
-explicit until full normal-desktop qualification permits making it the default.
+or Python archive fallback is rejected before compilation. Disabling any required
+native boot, paging, interrupt or runtime component is also rejected. Both image
+routes validate the selection before compiling native kernel or service code.
+Without a trusted selection, ordinary image builds remain console builds.
+
+Each build directory records its resolved edition, selection path, boot entry,
+kernel feature graph, service roles and compilation/link inputs in
+`boot-profile.state`. An unchanged profile preserves its timestamp; changed
+inputs invalidate kernel, service, archive and ISO artifacts. Reusing a build
+directory after switching editions therefore cannot silently reuse console
+executables in a Desktop image. This does not permit simultaneous builds of
+different personalities in the same directory; use distinct `BUILD` roots.
 
 The boot archive carries four independently compiled services: `/bin/init`,
 `/bin/files`, `/bin/terminal`, `/bin/compositor`. Boot validates the complete
@@ -60,7 +80,8 @@ The host QEMU fixture provisions only disposable media outside the guest.
 
 After admission, the kernel initializes clipped display hardware and invokes
 the four-service runtime. A clean shutdown returns to read-only recovery. An
-unexpected service fault or nonzero exit permits **one whole-session restart
+unexpected service exit (including status zero before durable shutdown), fault
+or exhausted cooperative startup budget permits **one whole-session restart
 per boot**, only after rollback verifies process authority retirement and the
 original free-frame count. The retry consumes a one-shot kernel permission,
 revalidates the original complete GPT receipt and healthy non-quarantined
@@ -74,7 +95,9 @@ This adds no ACPI poweroff or retry over uncertain resource state. Full hardware
 qualification and exact-SHA end-to-end evidence remain necessary. No M1 gate is
 closed by the profile alone.
 
-Tests exercise the actual Make profile matrix and reject unsafe combinations.
+Tests exercise the actual Make profile matrix, reject unsafe combinations and
+cover profile invalidation in a reused build directory. These added tests have
+not been executed locally in this source-only batch.
 The host volume-tool integration test provisions the existing disposable
 fixture through the actual kernel filesystem, derives the same selection, and
 checks byte-for-byte unchanged media on success, GPT corruption and damaged

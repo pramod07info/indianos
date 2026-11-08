@@ -17,6 +17,83 @@ finally:
 
 
 class NormalDesktopControls(unittest.TestCase):
+    def test_surface_geometry_and_actual_debugger_guard_probes(self):
+        records = [(base, base + 4096, base + 8192, base + 8192)
+                   for base in (0xffff800010000000, 0xffff800010004000)]
+        raw = struct.pack("<8Q", *(word for record in records for word in record))
+        self.assertEqual(harness.surface_guard_records(raw), records)
+        malformed = [raw[:-1], bytes(64), raw[:32] + raw[:32]]
+        words = list(struct.unpack("<8Q", raw))
+        words[3] += 4096
+        malformed.append(struct.pack("<8Q", *words))
+        for bad in malformed:
+            with self.subTest(raw=bad), self.assertRaises(AssertionError):
+                harness.surface_guard_records(bad)
+        debugger = Mock()
+        debugger.command.return_value = "E14"
+        debugger.memory.return_value = b"\0"
+        evidence = []
+        harness.verify_debug_surface_guards(debugger, records, evidence, "PID4")
+        self.assertEqual(debugger.command.call_count, 4)
+        self.assertEqual(debugger.memory.call_count, 4)
+        self.assertEqual(len(evidence), 2)
+        debugger.command.return_value = "00"
+        with self.assertRaises(AssertionError):
+            harness.verify_debug_surface_guards(debugger, records, [], "PID4")
+        debugger.command.return_value = "E14"
+        debugger.memory.side_effect = AssertionError("payload unmapped")
+        with self.assertRaises(AssertionError):
+            harness.verify_debug_surface_guards(debugger, records, [], "PID4")
+
+    def test_unready_services_require_actual_ordered_cleanup_and_bounded_recovery(self):
+        verified = b"IndianOS normal desktop: retired session verified restart-safe\n"
+        restart = b"IndianOS normal desktop: restarting retired service session\n"
+        exhausted = b"IndianOS normal desktop: restart budget exhausted\n"
+        recovery = b"IndianOS recovery: reason=desktop-session-failed\n"
+        sessions = {
+            "premature-compositor": (
+                b"IndianOS: R031 scheduler process exit=0x0000000000000000\n"
+                b"IndianOS: PID 4 EXITED\nIndianOS: PID 4 REAPED\n"
+                b"IndianOS normal desktop: service exited before durable shutdown\n"),
+            "unready-compositor": b"IndianOS normal desktop: startup dispatch budget exhausted\n",
+        }
+        for name, session in sessions.items():
+            trace = session + verified + restart + session + verified + exhausted + recovery
+            harness.verify_unready_recovery(trace, name)
+            for bad in (trace.replace(verified, b"", 1), trace + restart,
+                        restart + trace.replace(restart, b"", 1),
+                        trace.replace(exhausted, b""), trace + harness.READY.encode(),
+                        trace + harness.LIFECYCLE_READY.encode(),
+                        trace + harness.DURABLE_SHUTDOWN.encode(), trace + b"FATAL"):
+                with self.subTest(name=name, trace=bad), self.assertRaises(AssertionError):
+                    harness.verify_unready_recovery(bad, name)
+            if name == "premature-compositor":
+                with self.assertRaises(AssertionError):
+                    harness.verify_unready_recovery(trace + b"PID 4 FAULTED", name)
+
+    def test_valid_unready_elf_fixtures_preserve_all_other_bytes(self):
+        elf = bytearray(4160)
+        elf[:7] = b"\x7fELF\x02\x01\x01"
+        struct.pack_into("<HHIQQ", elf, 16, 2, 62, 1, 0x400000, 64)
+        struct.pack_into("<HHH", elf, 52, 64, 56, 1)
+        struct.pack_into("<IIQQQQQQ", elf, 64, 1, 5, 4096, 0x400000, 0x400000, 64, 64, 4096)
+        name = b"/bin/compositor"
+        entry = struct.pack("<HHI", len(name), 0, len(elf)) + name + elf
+        archive = b"INDRAM01" + struct.pack("<II", 1, 16 + len(entry)) + entry
+        for code in (harness.PREMATURE_EXIT, harness.UNREADY_YIELD):
+            changed = harness.service_entry_code(archive, name, code)
+            self.assertEqual(changed[:4096], elf[:4096])
+            self.assertEqual(changed[4096:4096 + len(code)], code)
+            self.assertEqual(changed[4096 + len(code):], elf[4096 + len(code):])
+        duplicate = b"INDRAM01" + struct.pack("<II", 2, 16 + 2 * len(entry)) + entry + entry
+        trailing = bytearray(archive + b"x")
+        struct.pack_into("<I", trailing, 12, len(trailing))
+        for source, code in ((archive, b""), (archive, bytes(33)),
+                             (duplicate, harness.PREMATURE_EXIT),
+                             (bytes(trailing), harness.UNREADY_YIELD)):
+            with self.assertRaises(AssertionError):
+                harness.service_entry_code(source, name, code)
+
     def test_qemu_sockets_stay_short_with_long_artifact_paths_and_cleanup_after_close(self):
         with tempfile.TemporaryDirectory() as temporary:
             folder = Path(temporary) / ("long-checkout-" * 8) / ("artifacts-" * 8)
@@ -222,8 +299,9 @@ class NormalDesktopControls(unittest.TestCase):
                  "IndianOS normal desktop: restarting retired service session"]
         lines += [f"IndianOS: PID {pid} {state}" for pid in (1, 2, 3, 4)
                   for state in ("READY", "DISPATCHED")]
-        lines += ["desktop compositor denied input and filesystem authority",
-                  harness.COMPOSITOR, harness.READY]
+        lines += [harness.SURFACES_GUARDED,
+                  "desktop compositor denied input and filesystem authority",
+                  harness.COMPOSITOR, harness.LIFECYCLE_READY, harness.READY]
         return old + ("\n".join(lines) + "\n").encode(), len(old)
 
     def test_transient_restart_accepts_fresh_execution_and_later_clean_reap(self):
@@ -353,7 +431,7 @@ class NormalDesktopControls(unittest.TestCase):
                  for state in ("READY", "DISPATCHED")]
         prefix = ("\n".join(lines + [marker.decode("ascii") for marker in harness.TERMINAL_AUTHORITY] +
                             [harness.COMPOSITOR, harness.READY]) + "\n").encode()
-        tail = ("desktop selected volume synchronized\n" + harness.SHUTDOWN + "\n" +
+        tail = (harness.DURABLE_SHUTDOWN + "\ndesktop selected volume synchronized\n" + harness.SHUTDOWN + "\n" +
                 "\n".join(f"IndianOS: PID {pid} REAPED" for pid in (1, 2, 3, 4)) +
                 "\n" + harness.STOPPED + "\n").encode()
         return prefix + tail, len(prefix)
@@ -382,6 +460,7 @@ class NormalDesktopControls(unittest.TestCase):
         with self.assertRaises(AssertionError):
             harness.verify_runtime(moved, offset)
         for bad in (trace.replace(b"desktop selected volume synchronized", b"no barrier"),
+                    trace.replace(harness.DURABLE_SHUTDOWN.encode(), b"not armed"),
                     trace.replace(b"desktop selected volume synchronized\n" + harness.SHUTDOWN.encode(),
                                   harness.SHUTDOWN.encode() + b"\ndesktop selected volume synchronized")):
             with self.assertRaises(AssertionError):

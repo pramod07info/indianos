@@ -85,6 +85,52 @@ pub(crate) fn runtime_prepare_selected_volume(expected:crate::m1_partition::GptS
 /// service failure. Consuming it before I/O makes every other failure closed.
 #[cfg(feature="normal-desktop")]
 static mut DESKTOP_RESTART_SAFE:bool=false;
+/// Cooperative startup is bounded in dispatches, not elapsed time. A task
+/// which never traps still requires a preemptive scheduler to contain it.
+#[cfg(feature="normal-desktop")]
+const DESKTOP_STARTUP_DISPATCH_LIMIT:u32=256;
+#[cfg(feature="normal-desktop")]
+#[derive(Clone,Copy)]
+struct DesktopLifecycle{ready:bool,shutdown_armed:bool,startup_dispatches:u32}
+#[cfg(feature="normal-desktop")]
+impl DesktopLifecycle{
+ const fn new()->Self{Self{ready:false,shutdown_armed:false,startup_dispatches:0}}
+ fn dispatch(&mut self)->bool{
+  if self.ready{return true;}
+  if self.startup_dispatches>=DESKTOP_STARTUP_DISPATCH_LIMIT{return false;}
+  self.startup_dispatches+=1;true
+ }
+ fn ready(&mut self,live:bool)->bool{
+  if !live||self.ready||self.shutdown_armed{return false;}
+  self.ready=true;true
+ }
+ fn may_arm(&self)->bool{self.ready&&!self.shutdown_armed}
+ fn complete_sync(&mut self,succeeded:bool)->bool{
+  if !succeeded||!self.may_arm(){return false;}
+  self.shutdown_armed=true;true
+ }
+ fn unexpected_exit(&self,fault:u64,status:u64)->bool{
+  !self.shutdown_armed||fault!=0||status!=0
+ }
+}
+#[cfg(feature="normal-desktop")]
+static mut DESKTOP_LIFECYCLE:DesktopLifecycle=DesktopLifecycle::new();
+#[cfg(feature="normal-desktop")]
+fn desktop_services_live()->bool{
+ for slot in 0..TASKS{
+  let task=unsafe{&*task_ptr(slot)};
+  let Some(process)=(unsafe{task.pcb.as_ref()})else{return false;};
+  if process.pid!=slot as u32+1||!matches!(process.state,2|3)||
+     process.resources_reclaimed||!task.authority_live||!task.attached||
+     !task.image.ready||task.root.root==0||process.address_space_root!=task.root.root||
+     (slot!=0&&!task.saved){return false;}
+  if slot<2&&!unsafe{(&*ptr::addr_of!(R031_HANDLES)).owns(
+      crate::batch5_session::Identity{pid:process.pid,generation:task.file_generation})}{
+   return false;
+  }
+ }
+ true
+}
 #[cfg(feature="normal-desktop")]
 fn take_desktop_restart_permission()->bool{
  let allowed=unsafe{core::mem::replace(&mut *ptr::addr_of_mut!(DESKTOP_RESTART_SAFE),false)};
@@ -494,6 +540,24 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
  }
  if !unsafe{indianos_syscall_validate(ptr::addr_of!((*img).plan),request)}{return BAD;}
  match request.number{
+  #[cfg(feature="normal-desktop")]
+  38=>{
+   if !authenticated_r026_init(){return BAD;}
+   let Ok(_permit)=r120_enter()else{return BAD;};
+   let Some(owner)=authenticated_file_identity()else{return BAD;};
+   if owner.pid!=1||!desktop_services_live(){return BAD;}
+   let lifecycle=unsafe{&mut *ptr::addr_of_mut!(DESKTOP_LIFECYCLE)};
+   if request.arg0==0{
+    if !lifecycle.ready(true){return BAD;}
+    log(b"IndianOS normal desktop: lifecycle READY verified\n\0");0
+   }else{
+    if !lifecycle.may_arm(){return BAD;}
+    let synced=crate::fs_handles::selected_sync_authenticated(
+        unsafe{&mut *ptr::addr_of_mut!(R031_HANDLES)},owner).is_ok();
+    if !lifecycle.complete_sync(synced){return BAD;}
+    log(b"IndianOS normal desktop: durable shutdown armed\n\0");0
+   }
+  },
   #[cfg(any(feature="test-r029-userspace",feature="normal-desktop"))]
   18=>{
    let Some(pid)=authenticated_gui_pid()else{return BAD;};
@@ -1218,7 +1282,8 @@ fn trap_mapped(b:&CloneBackend,original:u64,clone:u64)->bool{
  if !unsafe{x86_64_user_trap_mapping_addresses(trap.as_mut_ptr())}{return false;}
  let mapped=trap.iter().all(|&p|kernel_mapped(b,original,clone,p));
  #[cfg(feature="normal-desktop")]
- {mapped&&kernel_stack_guards_valid(b,original)&&kernel_stack_guards_valid(b,clone)}
+ {mapped&&kernel_stack_guards_valid(b,original)&&kernel_stack_guards_valid(b,clone)&&
+    desktop_surface_guards_valid(b,original)&&desktop_surface_guards_valid(b,clone)}
  #[cfg(not(feature="normal-desktop"))]
  {mapped}
 }
@@ -1239,6 +1304,53 @@ fn kernel_stack_guards_valid(b:&CloneBackend,root:u64)->bool{
 }
 #[cfg(feature="normal-desktop")]
 static mut DESKTOP_GUARD_RETAINED:[u64;2]=[0;2];
+/// Frozen geometry of the real private command stores. Source CR3 owns the
+/// split page tables for the whole boot, including verified service retries.
+#[cfg(feature="normal-desktop")]
+#[no_mangle]
+pub(crate) static mut DESKTOP_SURFACE_LAYOUT:[(u64,u64,u64,u64);2]=[(0,0,0,0);2];
+#[cfg(feature="normal-desktop")]
+fn surface_layout_valid(layout:&[(u64,u64,u64,u64);2])->bool{
+ for &(lower,begin,end,upper) in layout{
+  if lower==0||lower&4095!=0||lower.checked_add(PAGE)!=Some(begin)||
+     begin.checked_add(PAGE)!=Some(end)||upper!=end||upper.checked_add(PAGE).is_none(){
+   return false;
+  }
+ }
+ let (a,_,_,az)=layout[0];let (b,_,_,bz)=layout[1];
+ az+PAGE<=b||bz+PAGE<=a
+}
+#[cfg(feature="normal-desktop")]
+fn desktop_surface_guards_valid(b:&CloneBackend,root:u64)->bool{
+ let layout=unsafe{DESKTOP_SURFACE_LAYOUT};
+ if !surface_layout_valid(&layout){return false;}
+ for (lower,begin,_,upper) in layout{
+  if lookup(b,root,lower).is_some()||lookup(b,root,upper).is_some(){return false;}
+  let Some(flags)=(unsafe{crate::paging::kernel_stack_page_flags(b,root,begin)})
+      else{return false;};
+  if flags&3!=3||flags&4!=0||flags&(1u64<<63)==0{return false;}
+ }
+ true
+}
+#[cfg(feature="normal-desktop")]
+fn install_desktop_surface_guards(b:&CloneBackend,root:u64)->bool{
+ let Some(layout)=crate::gui::surface_guard_layout()else{return false;};
+ if !surface_layout_valid(&layout){return false;}
+ let previous=unsafe{DESKTOP_SURFACE_LAYOUT};
+ if previous!=[(0,0,0,0);2]&&previous!=layout{return false;}
+ // Freeze before publishing any missing mapping. Never silently retarget a
+ // retry to freshly allocated stores while earlier source guards remain.
+ unsafe{DESKTOP_SURFACE_LAYOUT=layout;}
+ for (lower,_,_,upper) in layout{
+  for guard in [lower,upper]{
+   if let Err(failure)=unsafe{crate::paging::guard_kernel_page(b,root,guard)}{
+    unsafe{DESKTOP_GUARD_RETAINED=failure.retained;}return false;
+   }
+   unsafe{asm!("invlpg [{}]",in(reg)guard,options(nostack,preserves_flags));}
+  }
+ }
+ desktop_surface_guards_valid(b,root)
+}
 #[cfg(feature="normal-desktop")]
 fn install_kernel_stack_guards(b:&CloneBackend,root:u64)->bool{
  let flags:u64;
@@ -2054,6 +2166,11 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
    log(b"IndianOS: desktop kernel stack guard installation failed\n\0");return false;
   }
   log(b"IndianOS: desktop kernel trap and double-fault stack guards verified\n\0");
+  if !install_desktop_surface_guards(&backend,cpu.cr3&PHYS){
+   log(b"IndianOS: desktop private surface guard installation failed\n\0");return false;
+  }
+  log(b"IndianOS: desktop private surface guards verified\n\0");
+  unsafe{DESKTOP_LIFECYCLE=DesktopLifecycle::new();}
  }
  #[cfg(any(feature="test-r031-files-gui",feature="normal-desktop"))]
  {
@@ -2182,6 +2299,11 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
  #[cfg(feature="normal-desktop")]
  let mut user_service_failed=false;
  while ok&&!unsafe{indianos_scheduler_all_terminal(&scheduler)}{
+  #[cfg(feature="normal-desktop")]
+  if !unsafe{(&mut *ptr::addr_of_mut!(DESKTOP_LIFECYCLE)).dispatch()}{
+   log(b"IndianOS normal desktop: startup dispatch budget exhausted\n\0");
+   user_service_failed=true;ok=false;break;
+  }
   #[cfg(any(feature="test-ipc",feature="normal-desktop"))]
   let pcb=next_ipc_ready(&mut scheduler);
   #[cfg(not(any(feature="test-ipc",feature="normal-desktop")))]
@@ -2260,7 +2382,10 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
    pid_log(pid,if v==0{&b"EXITED\0"[..]}else{&b"FAULTED\0"[..]});
    if !discard(task as *mut Task,&backend,true){ok=false;break;}
    #[cfg(feature="normal-desktop")]
-   if v!=0||status!=0{
+   if unsafe{DESKTOP_LIFECYCLE}.unexpected_exit(v,status){
+    if !unsafe{DESKTOP_LIFECYCLE}.shutdown_armed{
+     log(b"IndianOS normal desktop: service exited before durable shutdown\n\0");
+    }
     // Restart eligibility is granted only after the rollback below proves
     // every authority and frame gone; an error elsewhere cannot grant it.
     user_service_failed=true;
@@ -2461,6 +2586,45 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
 #[cfg(test)]mod tests{
  use super::*;
  static LOCK:std::sync::Mutex<()>=std::sync::Mutex::new(());
+ #[cfg(feature="normal-desktop")]
+ #[test]fn desktop_startup_budget_is_cooperative_and_readiness_is_one_shot(){
+  let mut state=DesktopLifecycle::new();
+  assert!(!state.ready(false));
+  assert!(!state.complete_sync(true));
+  for _ in 0..DESKTOP_STARTUP_DISPATCH_LIMIT{assert!(state.dispatch());}
+  assert!(!state.dispatch());
+  assert_eq!(state.startup_dispatches,DESKTOP_STARTUP_DISPATCH_LIMIT);
+  assert!(state.ready(true));
+  assert!(!state.ready(true));
+  for _ in 0..1024{assert!(state.dispatch());}
+  assert_eq!(state.startup_dispatches,DESKTOP_STARTUP_DISPATCH_LIMIT);
+ }
+ #[cfg(feature="normal-desktop")]
+ #[test]fn desktop_zero_exit_requires_successful_durable_shutdown(){
+  let mut state=DesktopLifecycle::new();
+  assert!(state.unexpected_exit(0,0));
+  assert!(state.ready(true));
+  assert!(!state.complete_sync(false));
+  assert!(!state.shutdown_armed);
+  assert!(state.unexpected_exit(0,0));
+  assert!(state.complete_sync(true));
+  assert!(!state.complete_sync(true));
+  assert!(!state.unexpected_exit(0,0));
+  assert!(state.unexpected_exit(14,0));
+  assert!(state.unexpected_exit(0,1));
+ }
+ #[cfg(feature="normal-desktop")]
+ #[test]fn private_surface_geometry_requires_two_disjoint_guarded_pages(){
+  let good=[(0x1000,0x2000,0x3000,0x3000),(0x4000,0x5000,0x6000,0x6000)];
+  assert!(surface_layout_valid(&good));
+  assert!(surface_layout_valid(&[good[1],good[0]]));
+  assert!(!surface_layout_valid(&[(0,0,0,0);2]));
+  assert!(!surface_layout_valid(&[good[0],good[0]]));
+  assert!(!surface_layout_valid(&[(0x1001,0x2001,0x3001,0x3001),good[1]]));
+  assert!(!surface_layout_valid(&[(0x1000,0x2000,0x4000,0x4000),good[1]]));
+  assert!(!surface_layout_valid(&[(0x1000,0x2000,0x3000,0x4000),good[1]]));
+  assert!(!surface_layout_valid(&[(u64::MAX-4095,0,0,0),good[1]]));
+ }
  #[cfg(feature="normal-desktop")]
  #[test]fn desktop_restart_permission_is_one_shot_and_rejects_uncertain_teardown(){
   let _lock=LOCK.lock().unwrap();

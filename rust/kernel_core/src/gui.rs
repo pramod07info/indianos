@@ -187,10 +187,83 @@ impl Surface{
 use crate::gui_protocol::{Command as UserCommand,FILL,TEXT,REPLACE_TEXT,COMMAND_LIMIT};
 #[cfg(any(feature="test-r029-userspace",feature="normal-desktop"))]
 use crate::gui_broker::{Broker,Event as GuiEvent};
+// The canonical retained streams are kernel-private, not pixel pointers or
+// app-selected addresses. Normal Desktop gives each stream a whole payload
+// page bracketed by unmapped pages; neither snapshots nor reset may touch them.
+#[cfg(feature="normal-desktop")]
+const COMMAND_PAGE:usize=4096;
+#[cfg(feature="normal-desktop")]
+#[repr(C,align(4096))]
+struct GuardedCommands{
+    lower:[u8;COMMAND_PAGE],
+    entries:[UserCommand;COMMAND_LIMIT],
+    padding:[u8;COMMAND_PAGE-core::mem::size_of::<UserCommand>()*COMMAND_LIMIT],
+    upper:[u8;COMMAND_PAGE],
+}
+#[cfg(feature="normal-desktop")]
+impl GuardedCommands{
+    const fn new()->Self{Self{lower:[0;COMMAND_PAGE],
+        entries:[UserCommand::EMPTY;COMMAND_LIMIT],
+        padding:[0;COMMAND_PAGE-core::mem::size_of::<UserCommand>()*COMMAND_LIMIT],
+        upper:[0;COMMAND_PAGE]}}
+    fn layout(&self)->(u64,u64,u64,u64){
+        let lower=core::ptr::addr_of!(self.lower) as usize as u64;
+        let begin=core::ptr::addr_of!(self.entries) as usize as u64;
+        let upper=core::ptr::addr_of!(self.upper) as usize as u64;
+        (lower,begin,begin+COMMAND_PAGE as u64,upper)
+    }
+}
+#[cfg(any(feature="test-r029-userspace",feature="normal-desktop"))]
+struct CommandStore{
+    #[cfg(feature="normal-desktop")]
+    surfaces:[GuardedCommands;2],
+    #[cfg(not(feature="normal-desktop"))]
+    entries:[[UserCommand;COMMAND_LIMIT];2],
+}
+#[cfg(any(feature="test-r029-userspace",feature="normal-desktop"))]
+impl CommandStore{
+    const fn new()->Self{Self{
+        #[cfg(feature="normal-desktop")]
+        surfaces:[GuardedCommands::new(),GuardedCommands::new()],
+        #[cfg(not(feature="normal-desktop"))]
+        entries:[[UserCommand::EMPTY;COMMAND_LIMIT];2],
+    }}
+    fn clear_slot(&mut self,slot:usize){
+        self[slot].fill(UserCommand::EMPTY);
+        #[cfg(feature="normal-desktop")]
+        self.surfaces[slot].padding.fill(0);
+    }
+    fn clear(&mut self){for slot in 0..2{self.clear_slot(slot);}}
+    #[cfg(test)]
+    fn snapshot(&self)->[[UserCommand;COMMAND_LIMIT];2]{[self[0],self[1]]}
+    #[cfg(feature="normal-desktop")]
+    fn layout(&self)->[(u64,u64,u64,u64);2]{
+        [self.surfaces[0].layout(),self.surfaces[1].layout()]
+    }
+}
+#[cfg(any(feature="test-r029-userspace",feature="normal-desktop"))]
+impl core::ops::Index<usize> for CommandStore{
+    type Output=[UserCommand;COMMAND_LIMIT];
+    fn index(&self,slot:usize)->&Self::Output{
+        #[cfg(feature="normal-desktop")]
+        {&self.surfaces[slot].entries}
+        #[cfg(not(feature="normal-desktop"))]
+        {&self.entries[slot]}
+    }
+}
+#[cfg(any(feature="test-r029-userspace",feature="normal-desktop"))]
+impl core::ops::IndexMut<usize> for CommandStore{
+    fn index_mut(&mut self,slot:usize)->&mut Self::Output{
+        #[cfg(feature="normal-desktop")]
+        {&mut self.surfaces[slot].entries}
+        #[cfg(not(feature="normal-desktop"))]
+        {&mut self.entries[slot]}
+    }
+}
 #[cfg(any(feature="test-r029-userspace",feature="normal-desktop"))]
 struct UserSurfaceService{
     session:Session,
-    commands:[[UserCommand;COMMAND_LIMIT];2],
+    commands:CommandStore,
     counts:[usize;2],
     focused:u32,
     broker:Broker<2,8>,
@@ -280,7 +353,7 @@ impl UserSurfaceService{
         #[cfg(any(feature="test-r029-physical-events",feature="normal-desktop"))]
         let mouse=Mouse::init()?;
         Some(Self{session,
-            commands:[[UserCommand::EMPTY;COMMAND_LIMIT];2],
+            commands:CommandStore::new(),
             counts:[0,0],focused:0,broker,
             #[cfg(any(feature="test-r029-frame-server",feature="normal-desktop"))]
             frames_presented:0,
@@ -292,6 +365,18 @@ impl UserSurfaceService{
             restart_count:0,
             #[cfg(any(feature="test-r029-physical-events",feature="normal-desktop"))]
             mouse})
+    }
+    #[cfg(feature="normal-desktop")]
+    fn reset_in_place(&mut self,next:Self){
+        // The existing guard pages are already unmapped. Move live metadata
+        // field-by-field and clear only the payload, never copy/drop guards.
+        self.commands.clear();
+        self.session=next.session;self.counts=next.counts;
+        self.focused=next.focused;self.broker=next.broker;
+        self.frames_presented=next.frames_presented;
+        self.launcher_visible=next.launcher_visible;
+        self.desktop_actions=next.desktop_actions;
+        self.mouse=next.mouse;
     }
     fn window(&self,id:u32)->Option<crate::desktop::Window>{
         self.session.desktop.windows().find(|w|w.id==id).copied()
@@ -439,6 +524,15 @@ impl UserSurfaceService{
             self.session.dragging=None;
             self.session.was_down=false;
         }
+        // Scrub the canonical backing before withdrawing its authority.
+        // Peers retain their own stream and no stale command can replay.
+        #[cfg(feature="normal-desktop")]
+        for window in 1..=2{
+            if self.broker.owns(pid,window){
+                self.commands.clear_slot(window as usize-1);
+                self.counts[window as usize-1]=0;
+            }
+        }
         self.broker.revoke(pid);
     }
     #[cfg(feature="test-r031-supervisor")]
@@ -563,9 +657,20 @@ pub(crate) fn user_surface_start()->bool{
     let Some(f)=Surface::from_boot()else{return false;};
     let Some(svc)=UserSurfaceService::new(f.width as u32,f.height as u32)else{return false;};
     if !svc.redraw(){return false;}
+    #[cfg(feature="normal-desktop")]
+    unsafe{
+        let service=&mut *ptr::addr_of_mut!(USER_SURFACE_SERVICE);
+        if let Some(current)=service.as_mut(){current.reset_in_place(svc);}
+        else{*service=Some(svc);}
+    }
+    #[cfg(not(feature="normal-desktop"))]
     unsafe{USER_SURFACE_SERVICE=Some(svc);}
     log(b"IndianOS: R029 ring3 surface server shows two framebuffer windows\n\0");
     true
+}
+#[cfg(feature="normal-desktop")]
+pub(crate) fn surface_guard_layout()->Option<[(u64,u64,u64,u64);2]>{
+    Some(user_service()?.commands.layout())
 }
 #[cfg(feature="normal-desktop")]
 pub(crate) fn desktop_window_query(pid:u32)->Option<[u8;64]>{
@@ -858,10 +963,81 @@ pub(crate) fn run()->bool{
 mod tests{
     use super::*;
     #[cfg(feature="normal-desktop")]
+    fn isolated_service()->UserSurfaceService{
+        let mut broker=Broker::new();broker.grant(2,1).unwrap();broker.grant(3,2).unwrap();
+        UserSurfaceService{session:Session::new(800,600).unwrap(),
+            commands:CommandStore::new(),counts:[0,0],focused:0,broker,
+            frames_presented:0,launcher_visible:false,desktop_actions:0,
+            #[cfg(feature="test-r031-supervisor")]restart_count:0,
+            // State-only fixture; no hardware initialization is invoked.
+            mouse:unsafe{core::mem::zeroed()},}
+    }
+    #[cfg(feature="normal-desktop")]
+    #[test]fn command_pages_have_two_real_guard_slots_and_clear_payload_only(){
+        let mut store=CommandStore::new();
+        let layout=store.layout();
+        assert_eq!(core::mem::size_of::<GuardedCommands>(),3*COMMAND_PAGE);
+        for (index,(lower,begin,end,upper)) in layout.iter().copied().enumerate(){
+            assert_eq!(lower&4095,0);assert_eq!(begin,lower+4096);
+            assert_eq!(end,begin+4096);assert_eq!(upper,end);
+            store.surfaces[index].lower.fill(0xa5);
+            store.surfaces[index].upper.fill(0x5a);
+            store.surfaces[index].padding.fill(0xcc);
+            store[index][0].rgb=index as u32+1;
+        }
+        assert_eq!(layout[1].0,layout[0].3+4096);
+        let peer=store[1];store.clear_slot(0);
+        assert_eq!(store[0],[UserCommand::EMPTY;COMMAND_LIMIT]);assert_eq!(store[1],peer);
+        assert!(store.surfaces[0].padding.iter().all(|&b|b==0));
+        assert!(store.surfaces[1].padding.iter().all(|&b|b==0xcc));
+        for surface in &store.surfaces{
+            assert!(surface.lower.iter().all(|&b|b==0xa5));
+            assert!(surface.upper.iter().all(|&b|b==0x5a));
+        }
+    }
+    #[cfg(feature="normal-desktop")]
+    #[test]fn service_restart_preserves_guard_addresses_and_scrubs_payload_without_guard_access(){
+        let mut svc=isolated_service();let layout=svc.commands.layout();
+        for surface in &mut svc.commands.surfaces{
+            surface.lower.fill(0xa5);surface.upper.fill(0x5a);
+            surface.padding.fill(0xcc);surface.entries[0].rgb=0x123456;
+        }
+        svc.counts=[1,1];svc.frames_presented=23;svc.launcher_visible=true;
+        svc.reset_in_place(isolated_service());
+        assert_eq!(svc.commands.layout(),layout);assert_eq!(svc.counts,[0,0]);
+        assert_eq!(svc.commands.snapshot(),[[UserCommand::EMPTY;COMMAND_LIMIT];2]);
+        assert_eq!(svc.frames_presented,0);assert!(!svc.launcher_visible);
+        for surface in &svc.commands.surfaces{
+            assert!(surface.lower.iter().all(|&b|b==0xa5));
+            assert!(surface.upper.iter().all(|&b|b==0x5a));
+            assert!(surface.padding.iter().all(|&b|b==0));
+        }
+    }
+    #[cfg(feature="normal-desktop")]
+    #[test]fn command_owner_and_retirement_isolate_backings_and_failed_submission_rolls_back(){
+        fn fill(window:u32)->[u8;64]{
+            let mut b=[0;64];b[..4].copy_from_slice(b"R29U");
+            b[4..8].copy_from_slice(&1u32.to_le_bytes());b[8..12].copy_from_slice(&window.to_le_bytes());
+            b[12..16].copy_from_slice(&FILL.to_le_bytes());
+            b[20..22].copy_from_slice(&1u16.to_le_bytes());b[22..24].copy_from_slice(&1u16.to_le_bytes());b
+        }
+        let mut svc=isolated_service();
+        assert!(svc.submit_with(2,&fill(1),|_|true));assert!(svc.submit_with(3,&fill(2),|_|true));
+        let snapshot=svc.commands.snapshot();let counts=svc.counts;
+        assert!(!svc.submit_with(3,&fill(1),|_|panic!("foreign owner painted")));
+        assert!(!svc.submit_with(2,&fill(2),|_|panic!("foreign owner painted")));
+        assert!(!svc.submit_with(2,&fill(1),|_|false));
+        assert_eq!(svc.commands.snapshot(),snapshot);assert_eq!(svc.counts,counts);
+        svc.retire_client(3);
+        assert_eq!(svc.commands[0],snapshot[0]);
+        assert_eq!(svc.commands[1],[UserCommand::EMPTY;COMMAND_LIMIT]);assert_eq!(svc.counts,[1,0]);
+        assert!(!svc.submit_with(3,&fill(2),|_|panic!("retired owner painted")));
+    }
+    #[cfg(feature="normal-desktop")]
     #[test]fn compositor_state_requires_current_app_grants_and_rolls_back_failed_paint(){
         let mut broker=Broker::new();broker.grant(2,1).unwrap();broker.grant(3,2).unwrap();
         let mut svc=UserSurfaceService{session:Session::new(800,600).unwrap(),
-            commands:[[UserCommand::EMPTY;COMMAND_LIMIT];2],counts:[0,0],
+            commands:CommandStore::new(),counts:[0,0],
             focused:0,broker,frames_presented:0,launcher_visible:false,desktop_actions:0,
             #[cfg(feature="test-r031-supervisor")]restart_count:0,
             mouse:unsafe{core::mem::zeroed()},};
@@ -887,7 +1063,7 @@ mod tests{
         let mut broker=Broker::new();broker.grant(2,1).unwrap();broker.grant(3,2).unwrap();
         let mut svc=UserSurfaceService{
             session:Session::new(800,600).unwrap(),
-            commands:[[UserCommand::EMPTY;COMMAND_LIMIT];2],counts:[0,0],
+            commands:CommandStore::new(),counts:[0,0],
             focused:0,broker,frames_presented:0,launcher_visible:false,desktop_actions:0,
             #[cfg(feature="test-r031-supervisor")]
             restart_count:0,
@@ -908,12 +1084,12 @@ mod tests{
         let replace=text(REPLACE_TEXT,b"A");
         assert!(!svc.submit(3,&replace)); // No existing field.
         assert!(svc.submit(3,&text(TEXT,b"LONGER")));
-        let original=svc.commands;
+        let original=svc.commands.snapshot();
         assert!(!svc.submit(2,&replace));
         let mut moved=replace;moved[16]=25;
         assert!(!svc.submit(3,&moved));
         assert!(!svc.submit_with(3,&replace,|_|false));
-        assert_eq!(svc.commands,original);assert_eq!(svc.counts,[0,1]);
+        assert_eq!(svc.commands.snapshot(),original);assert_eq!(svc.counts,[0,1]);
         let p=Palette{bg:2,top:3,bar:4,title:5,unfocused:6,light:7,dark:8,panel:9,white:10,accent:11};
         const PITCH:usize=804;const GUARD:u32=0xfeedface;
         let mut pixels=std::vec![GUARD;PITCH*600+16];
@@ -951,7 +1127,7 @@ mod tests{
         broker.grant(2,1).unwrap();broker.grant(3,2).unwrap();
         let mut svc=UserSurfaceService{
             session:Session::new(800,600).unwrap(),
-            commands:[[UserCommand::EMPTY;COMMAND_LIMIT];2],counts:[0,0],
+            commands:CommandStore::new(),counts:[0,0],
             focused:0,broker,frames_presented:0,launcher_visible:false,
             desktop_actions:0,
             #[cfg(feature="test-r031-supervisor")]
@@ -995,7 +1171,7 @@ mod tests{
         // Files-GUI presents require the real client startup threshold.
         #[cfg(any(feature="test-r031-files-gui",feature="normal-desktop"))]
         for _ in 0..3{assert!(svc.submit(2,&wire(1,FILL,FILES)));}
-        let retained=svc.commands;
+        let retained=svc.commands.snapshot();
         let retained_counts=svc.counts;
         let p=Palette{bg:2,top:3,bar:4,title:5,unfocused:6,
             light:7,dark:8,panel:9,white:10,accent:11};
@@ -1027,7 +1203,7 @@ mod tests{
         assert!(!present(&mut svc,presenter,99,&mut out));
         assert_eq!(pixels,before);assert_eq!(svc.frames_presented,frame);
         assert!(svc.window(2).unwrap().minimized);
-        assert_eq!(svc.commands,retained);assert_eq!(svc.counts,retained_counts);
+        assert_eq!(svc.commands.snapshot(),retained);assert_eq!(svc.counts,retained_counts);
         assert!(present(&mut svc,presenter,1,&mut out));
         assert_eq!(pixel(&pixels,115,105),p.title);
         assert_eq!(pixel(&pixels,115,160),FILES);
@@ -1048,7 +1224,10 @@ mod tests{
         assert!(!svc.session.was_down);
         assert!(svc.paint(&mut out));
         assert!(!pixels.contains(&TERMINAL));
+        #[cfg(not(feature="normal-desktop"))]
         assert_eq!(svc.counts,retained_counts);
+        #[cfg(feature="normal-desktop")]
+        assert_eq!(svc.counts,[retained_counts[0],0]);
         svc.session.desktop.close(2).unwrap();
         assert!(!svc.submit(3,&wire(2,FILL,0xff0000)));
         #[cfg(not(feature="normal-desktop"))]
@@ -1056,7 +1235,10 @@ mod tests{
         #[cfg(feature="normal-desktop")]
         {assert!(!present(&mut svc,presenter,1,&mut out));assert!(svc.paint(&mut out));}
         assert!(!pixels.contains(&TERMINAL));
-        assert_eq!(svc.commands,retained);
+        #[cfg(not(feature="normal-desktop"))]
+        assert_eq!(svc.commands.snapshot(),retained);
+        #[cfg(feature="normal-desktop")]
+        assert_eq!(svc.commands.snapshot(),[retained[0],[UserCommand::EMPTY;COMMAND_LIMIT]]);
         assert_eq!(&pixels[PITCH*600..],&[GUARD;16]);
         for row in 0..600{assert_eq!(&pixels[row*PITCH+800..(row+1)*PITCH],&[GUARD;4]);}
     }

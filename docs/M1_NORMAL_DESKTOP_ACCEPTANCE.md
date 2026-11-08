@@ -102,7 +102,33 @@ Four additional boots use healthy-checksum COW images containing orphan entries,
 contradictory aliases, malformed directory markers or invalid symlink targets.
 The real COW fixture writer generates each explicitly; no secondary checksum
 encoder is used. Every image must fail storage admission with no service startup
-or disk modification. The complete matrix now comprises sixteen actual VM boots.
+or disk modification. The configured matrix now comprises twenty-two actual VM
+boots, including the partition and write-failure cases and the two lifecycle
+failures below. Configuring these checks does not establish a passing run.
+
+Normal startup additionally requires the kernel's PID1 lifecycle-ready handshake
+after the service and authority checks. Clean shutdown requires the kernel's
+durable-shutdown handshake before the userland synchronization acknowledgment;
+service exit status zero alone cannot authorize shutdown. Two disposable,
+otherwise valid compositor ELFs exercise this distinction: one immediately
+invokes the real exit syscall with status zero, and one invokes the real yield
+syscall forever without becoming ready. Each must trigger verified teardown,
+one bounded restart, a second verified teardown and read-only recovery, with no
+desktop READY or durable-shutdown acknowledgment and no disk changes. The latter
+tests the 256-dispatch cooperative startup budget, not a CPU-hog watchdog.
+
+The transient recovery debugger also reads the production
+`DESKTOP_SURFACE_LAYOUT` ownership ledger from the exact kernel ELF. It verifies
+both private one-page surface payloads are readable and all four flanking guard
+pages are unreadable under PID4's cloned root, then repeats those probes under
+the reclaimed recovery-kernel root and requires unchanged ownership geometry.
+These probes inspect real page mappings without writing page tables or payloads.
+Host negative controls reject malformed/overlapping ledgers, readable guards,
+missing payload mappings, premature readiness and incomplete lifecycle cleanup.
+
+The harness source and its negative controls must run in GitHub Actions at the
+integrated revision before these new criteria can be accepted. No local QEMU or
+test execution is implied by this update.
 See `M1_NAMESPACE_ADMISSION.md` and `M1_KERNEL_STACK_GUARDS.md` for limits.
 
 Run the combined normal-desktop workflow only after source integration. No new

@@ -114,6 +114,8 @@ pub unsafe extern "C" fn indianos_syscall_validate(
         #[cfg(all(feature="test-r029-frame-server",not(feature="normal-desktop")))]
         23 => (1..=2).contains(&request.arg0) && request.arg1==0, // FRAME_PRESENT
         #[cfg(feature="normal-desktop")]
+        38 => request.arg0<=1 && request.arg1==0, // PID1 lifecycle; authority checked at trap
+        #[cfg(feature="normal-desktop")]
         37 => request.arg0<=1 &&
               user_range(plan,request.arg1,64,request.arg0==0), // compositor state query/apply
         #[cfg(feature="test-r030-ondevice")]
@@ -229,6 +231,11 @@ mod tests {
         assert!(!check(37,2,plan.stack_begin));
         assert!(!check(37,0,plan.stack_end-63));
         assert!(!check(37,1,plan.guard_begin));
+        assert!(check(38,0,0));
+        assert!(check(38,1,0));
+        assert!(!check(38,2,0));
+        assert!(!check(38,0,1));
+        assert!(!check(38,1,u64::MAX));
         for (number,arg0,arg1) in [(5,1,0),(19,1,0),(22,0,0),(23,1,0),
             (24,1,0),(30,1,plan.stack_begin),(31,1,0),(36,1,plan.stack_begin)]{
             assert!(!check(number,arg0,arg1),"legacy control {number}");

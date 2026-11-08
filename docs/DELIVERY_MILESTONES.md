@@ -65,10 +65,17 @@ read back after reboot; process isolation, screenshot/keyboard/mouse,
 filesystem corruption and recovery acceptance all pass at exact commit SHA.
 
 Latest bounded implementation evidence: [normal startup and ownership
-integration](M1_MAJOR_INTEGRATION.md). Normal boot now executes a ring-3 PID1
-serial bootstrap console; graphical normal startup remains open. This batch
-adds live Terminal listing/size, descriptor truncation and ownership/recovery
-hardening. It accepts no additional high-level M1 gate.
+integration](M1_MAJOR_INTEGRATION.md), [native Desktop boot selection](M1_NATIVE_DESKTOP_BOOT.md),
+[lifecycle verification](DESKTOP_LIFECYCLE_BOUNDARY.md) and
+[guarded command surfaces](M1_GUARDED_COMMAND_SURFACES.md). Checklist positions
+8–9 (G3/G4 in issue #616) remain **IN PROGRESS**: the normal four-service
+desktop now has trusted build selection, kernel-verified readiness and durable
+shutdown, plus two private command payloads with guard mappings preserved on
+restart. The independent ring-3 compositor owns window policy; privileged
+clipping/rasterization and input hardware access remain kernel primitives.
+This batch adds source and positive/negative acceptance tests without local
+execution, as requested. Exact-head GitHub Actions, actual QEMU evidence and
+review are still required; no additional high-level M1 gate is accepted here.
 
 ## M2 — Developer Alpha
 

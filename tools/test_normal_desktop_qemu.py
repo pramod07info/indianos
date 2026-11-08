@@ -33,6 +33,9 @@ TOTAL = 256
 READY = "IndianOS user: normal desktop READY: PID1 broker PID2 Files PID3 Terminal PID4 compositor"
 COMPOSITOR = "IndianOS user: desktop compositor PID4 ready"
 STOPPED = "IndianOS normal desktop: services stopped and resources reclaimed"
+LIFECYCLE_READY = "IndianOS normal desktop: lifecycle READY verified"
+DURABLE_SHUTDOWN = "IndianOS normal desktop: durable shutdown armed"
+SURFACES_GUARDED = "IndianOS: desktop private surface guards verified"
 RECOVERY = "IndianOS recovery: reason=desktop-storage-unavailable"
 FORBIDDEN = (b"PID1 provisioned", b"R027 blank disk", b"normal PID1 ready:")
 UART_ACTIONS = (PHYSICAL.encode(), SHUTDOWN.encode(), b"application launcher",
@@ -48,6 +51,8 @@ TERMINAL_AUTHORITY = (
     b"IndianOS user: desktop PID1 denied compositor window authority",
     b"IndianOS user: desktop app denied compositor and physical input authority",
     b"IndianOS user: desktop compositor denied input and filesystem authority",
+    LIFECYCLE_READY.encode(),
+    SURFACES_GUARDED.encode(),
 )
 
 # Independent expected raster contract for the qualified normal desktop.
@@ -175,8 +180,9 @@ def verify_runtime(output: bytes, shutdown_at: int) -> None:
                 raise AssertionError("desktop readiness lacks actual process execution")
     tail = output[shutdown_at:]
     synced = tail.find(b"desktop selected volume synchronized")
+    armed = tail.find(DURABLE_SHUTDOWN.encode())
     shutdown = tail.find(SHUTDOWN.encode())
-    if synced < 0 or shutdown < 0 or synced > shutdown:
+    if armed < 0 or synced < 0 or shutdown < 0 or not armed < synced < shutdown:
         raise AssertionError("desktop shutdown preceded a verified storage barrier")
     for pid in (1, 2, 3, 4):
         if f"IndianOS: PID {pid} REAPED".encode() not in tail:
@@ -551,33 +557,63 @@ def rewrite_initramfs(raw: bytes, target: bytes, payload: bytes | None) -> bytes
 
 def faulting_service(raw: bytes, target: bytes) -> bytes:
     """Keep a valid ELF and replace its actual entry instructions with UD2."""
+    return service_entry_code(raw, target, b"\x0f\x0b")
+
+
+def service_entry_code(raw: bytes, target: bytes, code: bytes) -> bytes:
+    """Patch only executable entry bytes of an otherwise unchanged native ELF.
+
+    These are disposable adversarial service images, not kernel test hooks.
+    Every archive bound and duplicate is checked before using an entry.
+    """
+    if len(raw) < 16 or raw[:8] != b"INDRAM01" or not 1 <= len(code) <= 32:
+        raise AssertionError("invalid executable fault source")
+    count, total = struct.unpack_from("<II", raw, 8)
+    if not 1 <= count <= 8 or total != len(raw):
+        raise AssertionError("invalid executable fault archive bounds")
     offset = 16
-    for _ in range(struct.unpack_from("<I", raw, 8)[0]):
+    entries = {}
+    for _ in range(count):
+        if offset + 8 > len(raw):
+            raise AssertionError("truncated executable fault archive")
         size, _, length = struct.unpack_from("<HHI", raw, offset)
+        reserved = struct.unpack_from("<H", raw, offset + 2)[0]
         offset += 8
+        if reserved or not 1 <= size <= 63 or offset + size + length > len(raw):
+            raise AssertionError("invalid executable fault entry bounds")
         name = raw[offset:offset + size]
-        data = bytearray(raw[offset + size:offset + size + length])
+        if name in entries:
+            raise AssertionError("duplicate executable fault entry")
+        entries[name] = raw[offset + size:offset + size + length]
         offset += size + length
-        if name != target:
-            continue
-        if data[:7] != b"\x7fELF\x02\x01\x01" or len(data) < 64:
-            raise AssertionError("fault source is not a native ELF")
-        entry, phoff = struct.unpack_from("<QQ", data, 24)
-        stride, count = struct.unpack_from("<HH", data, 54)
-        if stride != 56 or phoff + count * stride > len(data):
-            raise AssertionError("fault source program headers are malformed")
-        for index in range(count):
-            at = phoff + index * stride
-            kind, flags, file_offset, virtual = struct.unpack_from("<IIQQ", data, at)
-            size = struct.unpack_from("<Q", data, at + 32)[0]
-            if kind == 1 and flags & 1 and virtual <= entry and entry + 2 <= virtual + size:
-                start = file_offset + entry - virtual
-                if start + 2 > len(data):
-                    raise AssertionError("fault entry exceeds the ELF file")
-                data[start:start + 2] = b"\x0f\x0b"
-                return bytes(data)
-        raise AssertionError("fault source has no file-backed executable entry")
-    raise AssertionError("fault service is missing")
+    if offset != len(raw) or target not in entries:
+        raise AssertionError("fault service is missing or source has trailing bytes")
+    data = bytearray(entries[target])
+    if data[:7] != b"\x7fELF\x02\x01\x01" or len(data) < 64:
+        raise AssertionError("fault source is not a native ELF")
+    entry, phoff = struct.unpack_from("<QQ", data, 24)
+    stride, count = struct.unpack_from("<HH", data, 54)
+    if stride != 56 or not 1 <= count <= 64 or phoff + count * stride > len(data):
+        raise AssertionError("fault source program headers are malformed")
+    for index in range(count):
+        at = phoff + index * stride
+        kind, flags, file_offset, virtual = struct.unpack_from("<IIQQ", data, at)
+        size = struct.unpack_from("<Q", data, at + 32)[0]
+        if kind == 1 and flags & 1 and virtual <= entry and entry + len(code) <= virtual + size:
+            start = file_offset + entry - virtual
+            if start + len(code) > len(data):
+                raise AssertionError("fault entry exceeds the ELF file")
+            data[start:start + len(code)] = code
+            return bytes(data)
+    raise AssertionError("fault source has no file-backed executable entry")
+
+
+# Syscall2 exits with status0. UD2 catches an erroneous kernel return instead
+# of allowing unpatched original entry code to advertise readiness.
+PREMATURE_EXIT = b"\xb8\x02\x00\x00\x00\x31\xff\x31\xf6\xcd\x80\x0f\x0b"
+# Syscall3 cooperatively yields forever. Reset RAX each turn because the
+# successful yield return is0; the short branch loops all13 instructions bytes.
+UNREADY_YIELD = b"\xb8\x03\x00\x00\x00\x31\xff\x31\xf6\xcd\x80\xeb\xf3"
 
 
 class GuestDebugger:
@@ -716,6 +752,33 @@ def verify_debug_stack_guards(debugger: GuestDebugger, records: list[tuple[int, 
         evidence.append(f"{phase}: guard {guard:#x} unreadable; usable {begin:#x}..{end:#x} readable")
 
 
+def surface_guard_records(raw: bytes) -> list[tuple[int, int, int, int]]:
+    if len(raw) != 64:
+        raise AssertionError("surface guard ownership ledger is not 64 bytes")
+    words = struct.unpack("<8Q", raw)
+    records = [tuple(words[start:start + 4]) for start in (0, 4)]
+    for lower, begin, end, upper in records:
+        if (lower < 0xffff800000000000 or lower % 4096 or
+                begin != lower + 4096 or end != begin + 4096 or
+                upper != end or upper + 4096 > 1 << 64):
+            raise AssertionError("invalid private surface guard geometry")
+    ordered = sorted(records)
+    if ordered[0][3] + 4096 > ordered[1][0]:
+        raise AssertionError("private surface guard objects overlap")
+    return records
+
+
+def verify_debug_surface_guards(debugger: GuestDebugger, records: list[tuple[int, int, int, int]],
+                                evidence: list[str], phase: str) -> None:
+    for index, (lower, begin, end, upper) in enumerate(records):
+        for guard in (lower, upper):
+            if not debugger.command(f"m{guard:x},1").startswith("E"):
+                raise AssertionError("private app surface guard remains readable")
+        debugger.memory(begin, 1)
+        debugger.memory(end - 1, 1)
+        evidence.append(f"{phase}: surface{index + 1} guards {lower:#x}/{upper:#x} unreadable; payload {begin:#x}..{end:#x} readable")
+
+
 def stopped_root(session: QemuSession) -> int:
     roots = re.findall(r"\bCR3=([0-9a-fA-F]{1,16})\b", session.hmp("info registers"))
     if len(roots) != 1:
@@ -735,8 +798,9 @@ def verify_transient_restart(output: bytes, injection_at: int) -> None:
                b"IndianOS: PID 4 FAULTED", b"IndianOS: PID 4 REAPED",
                b"IndianOS normal desktop: retired session verified restart-safe",
                b"IndianOS normal desktop: restarting retired service session",
+               SURFACES_GUARDED.encode(),
                b"desktop compositor denied input and filesystem authority",
-               COMPOSITOR.encode(), READY.encode())
+               COMPOSITOR.encode(), LIFECYCLE_READY.encode(), READY.encode())
     ready = tail.find(READY.encode())
     if ready < 0:
         raise AssertionError("transient restart lacks fresh desktop readiness")
@@ -807,6 +871,56 @@ def crashed_service_boot(qemu: str, iso: Path, ovmf: Path, disk: Path,
     print("Normal desktop compositor #UD: two actual faults, one bounded restart and read-only recovery PASS")
 
 
+def verify_unready_recovery(output: bytes, name: str) -> None:
+    if name == "premature-compositor":
+        failure = b"IndianOS normal desktop: service exited before durable shutdown"
+        session = (b"IndianOS: R031 scheduler process exit=0x0000000000000000",
+                   b"IndianOS: PID 4 EXITED", b"IndianOS: PID 4 REAPED", failure)
+        for marker in session:
+            if output.count(marker) != 2:
+                raise AssertionError("premature clean-exit scenario lacks exact actual lifecycle")
+        if b"PID 4 FAULTED" in output:
+            raise AssertionError("premature exit returned to UD2 instead of exiting")
+    elif name == "unready-compositor":
+        failure = b"IndianOS normal desktop: startup dispatch budget exhausted"
+        session = (failure,)
+        if output.count(failure) != 2:
+            raise AssertionError("unready service did not exhaust both startup budgets")
+    else:
+        raise AssertionError("unknown unready-service scenario")
+    verified = b"IndianOS normal desktop: retired session verified restart-safe"
+    restart = b"IndianOS normal desktop: restarting retired service session"
+    exhausted = b"IndianOS normal desktop: restart budget exhausted"
+    recovery = b"IndianOS recovery: reason=desktop-session-failed"
+    for marker, count in ((verified, 2), (restart, 1), (exhausted, 1), (recovery, 1)):
+        if output.count(marker) != count:
+            raise AssertionError("unready service bypassed bounded rollback/recovery")
+    cursor = 0
+    for marker in (*session, verified, restart, *session, verified, exhausted, recovery):
+        position = output.find(marker, cursor)
+        if position < 0:
+            raise AssertionError("unready-service lifecycle is out of order")
+        cursor = position + len(marker)
+    if any(marker in output for marker in (READY.encode(), LIFECYCLE_READY.encode(),
+                                           DURABLE_SHUTDOWN.encode(), b"FATAL")):
+        raise AssertionError("unready service was accepted or escaped controlled recovery")
+
+
+def unready_service_boot(qemu: str, iso: Path, ovmf: Path, disk: Path,
+                         folder: Path, name: str) -> None:
+    before = disk.read_bytes()
+    process, sock, session = spawn(qemu, iso, ovmf, disk, folder, name)
+    try:
+        session.until("IndianOS recovery: reason=desktop-session-failed", 45)
+        session.until("IndianOS recovery: read-only serial console ready", 10)
+        verify_unready_recovery(bytes(session.output), name)
+    finally:
+        close(process, sock, session, folder / f"{name}.serial.log")
+    if disk.read_bytes() != before:
+        raise AssertionError("unready-service recovery modified selected storage")
+    print(f"Normal desktop {name}: bounded actual failure, complete retirement and unchanged recovery PASS")
+
+
 def transient_service_boot(qemu: str, iso: Path, ovmf: Path, disk: Path,
                            folder: Path, xorriso: str, nm: str = "nm") -> None:
     sources = folder / "transient-sources"
@@ -835,6 +949,7 @@ def transient_service_boot(qemu: str, iso: Path, ovmf: Path, disk: Path,
     active = unique_symbol(nm, kernel, ("user_runtime::ACTIVE_PROCESS",))
     target = unique_symbol(nm, service, ("desktop_window::Manager", "::wire"))
     expected = executable_bytes(compositor, target, 8)
+    surface_ledger = unique_symbol(nm, kernel, ("DESKTOP_SURFACE_LAYOUT",))
     symbols = subprocess.run([nm, "-S", "-n", "-C", str(kernel)], check=True,
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15)
     guards = stack_guard_records(symbols.stdout.decode("ascii"))
@@ -893,6 +1008,9 @@ def transient_service_boot(qemu: str, iso: Path, ovmf: Path, disk: Path,
         else:
             raise AssertionError("bounded debugger search did not find ring3 PID4")
         verify_debug_stack_guards(debugger, guards, evidence, "PID4 cloned root")
+        surface_layout = debugger.memory(surface_ledger, 64)
+        surfaces = surface_guard_records(surface_layout)
+        verify_debug_surface_guards(debugger, surfaces, evidence, "PID4 cloned root")
         cloned_root = stopped_root(session)
         evidence.append(f"PID4 cloned CR3={cloned_root:#x}")
         if not debugger.command(f"m{unmapped:x},1").startswith("E"):
@@ -960,6 +1078,9 @@ def transient_service_boot(qemu: str, iso: Path, ovmf: Path, disk: Path,
             raise AssertionError("reclaimed kernel still uses the retired user root")
         evidence.append(f"reclaimed kernel CR3={kernel_root:#x}")
         verify_debug_stack_guards(debugger, guards, evidence, "reclaimed recovery kernel")
+        if debugger.memory(surface_ledger, 64) != surface_layout:
+            raise AssertionError("desktop restart changed source-owned private surface identity")
+        verify_debug_surface_guards(debugger, surfaces, evidence, "reclaimed recovery kernel")
         if debugger.command("D") != "OK":
             raise AssertionError("kernel guard debugger failed to detach")
         debugger.close()
@@ -986,6 +1107,10 @@ def bad_service_images(iso: Path, folder: Path, xorriso: str):
              ("invalid-compositor", b"/bin/compositor", b"not an ELF", "desktop-service-invalid"),
              ("invalid-selection", b"/etc/desktop-volume", bytes(64), "desktop-volume-selection-invalid"),
              ("crashed-compositor", b"/bin/compositor", faulting_service(original, b"/bin/compositor"),
+              "desktop-session-failed"),
+             ("premature-compositor", b"/bin/compositor", service_entry_code(original, b"/bin/compositor", PREMATURE_EXIT),
+              "desktop-session-failed"),
+             ("unready-compositor", b"/bin/compositor", service_entry_code(original, b"/bin/compositor", UNREADY_YIELD),
               "desktop-session-failed"))
     for name, target, payload, reason in cases:
         modified = folder / f"{name}.iso"
@@ -1065,6 +1190,8 @@ def main() -> None:
         for name, modified, reason in bad_service_images(args.iso.resolve(), Path(temporary), args.xorriso):
             if name == "crashed-compositor":
                 crashed_service_boot(args.qemu, modified, args.ovmf.resolve(), disk, artifacts)
+            elif name in ("premature-compositor", "unready-compositor"):
+                unready_service_boot(args.qemu, modified, args.ovmf.resolve(), disk, artifacts, name)
             else:
                 denied_boot(args.qemu, modified, args.ovmf.resolve(), disk, artifacts, name, reason)
     print("PASS: normal four-service desktop, selected GPT persistence, physical input, guarded shutdown and corruption recovery")
