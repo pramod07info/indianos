@@ -353,6 +353,19 @@ impl FileHandles{
             _=>false,
         }
     }
+    /// Destination authority is independent of the source descriptor. A
+    /// writable source inside a narrowed root never grants rename/swap access
+    /// to a sibling tree or a globally writable but foreign namespace.
+    fn write_destination<'a>(&self,owner:Identity,target:&str,
+        output:&'a mut[u8;24])->Result<&'a str,FsError>{
+        let len=normalize_absolute(target,&mut output[..23])
+            .map_err(|_|FsError::InvalidName)?;
+        let target=core::str::from_utf8(&output[..len])
+            .map_err(|_|FsError::InvalidName)?;
+        if !Self::policy(owner.pid,target,WRITE)||!self.root_allows(owner,target)||
+           WriteGuard::allow_path(target).is_err(){return Err(FsError::InvalidName);}
+        Ok(target)
+    }
     // The current COW identity is volume-wide. Every mutation changes its
     // generation, including descriptor edits to an unrelated file. Preserve
     // foreign open descriptors rather than turning them into stale tokens.
@@ -431,6 +444,10 @@ impl FileHandles{
                 if (needs_read&&handle.mode&READ==0) ||
                    (needs_write&&handle.mode&WRITE==0){
                     return Err(FsError::InvalidName);
+                }
+                if matches!(action,13|16|31){
+                    let mut target=[0u8;24];
+                    self.write_destination(owner,path,&mut target)?;
                 }
             },
             _=>return Err(FsError::InvalidName),
@@ -680,14 +697,15 @@ impl FileHandles{
                 1},
             _=>return Err(FsError::InvalidName),
         };
-        if matches!(action,13|16){
+        let mut canonical_target=[0u8;24];
+        let target=if matches!(action,13|16){
             // A privileged source handle must not be used to bypass S0
-            // boot/recovery path protection when naming a different target.
-            if owner.pid!=1 || WriteGuard::allow_path(target).is_err(){
-                self.write_guard.deny();
-                return Err(FsError::InvalidName);
+            // protection OR the current process's narrower namespace root.
+            match self.write_destination(owner,target,&mut canonical_target){
+                Ok(target)=>target,
+                Err(error)=>{self.write_guard.deny();return Err(error);}
             }
-        }
+        }else{target};
         if self.write_guard.preflight(h.pathname(),amount).is_err(){
             return Err(FsError::InvalidName);
         }
@@ -2240,6 +2258,43 @@ mod r094_authenticated_cow_ops {
   assert_eq!(read(&mut fs,"/shared/other"),b"abc");
   assert_eq!(t.dispatch_authenticated(16,o,fd,0,"/shared/other",&mut [],&mut fs),Err(FsError::InvalidName));
  }
+ #[test]fn narrowed_root_confines_conditional_rename_and_swap_destinations(){
+  for action in [13,16]{
+   let mut fs=volume();
+   fs.mkdir("/shared/docs").unwrap();fs.create("/shared/docs/src",b"abc").unwrap();
+   fs.mkdir("/shared/docs2").unwrap();fs.create("/shared/docs2/out",b"foreign").unwrap();
+   if action==16{fs.create("/shared/docs/dst",b"inside").unwrap();}
+   let mut table=FileHandles::new();let owner=table.bind_process(1).unwrap();
+   table.narrow_root_kernel(owner,"/shared/docs").unwrap();
+   let token=table.dispatch_authenticated(1,owner,0,WRITE,"/shared/docs/src",
+     &mut[],&mut fs).unwrap();
+   let generation=fs.generation();let stats=table.security_statistics();
+   for target in ["/shared/docs2/out","/shared/other","/boot/kernel",
+                  "/shared/docs/../out","relative",""]{
+    let mut data=if action==13{b"abc".to_vec()}else{Vec::new()};
+    assert_eq!(table.dispatch_authenticated(action,owner,token,0,target,
+      &mut data,&mut fs),Err(FsError::InvalidName),"action {action}: {target}");
+    assert_eq!(fs.generation(),generation);
+    assert_eq!(read(&mut fs,"/shared/docs/src"),b"abc");
+    assert_eq!(read(&mut fs,"/shared/docs2/out"),b"foreign");
+    assert!(table.index(owner,token).is_ok());
+    assert_eq!(table.security_statistics().completed_writes,stats.completed_writes);
+    assert_eq!(table.security_statistics().changed_bytes,stats.changed_bytes);
+   }
+   if action==13{
+    assert_eq!(table.dispatch_authenticated(13,owner,token,0,"/shared/docs/dst",
+      &mut b"mismatch".to_vec(),&mut fs),Ok(0));
+    assert_eq!(fs.generation(),generation);
+   }
+   let mut data=if action==13{b"abc".to_vec()}else{Vec::new()};
+   assert_eq!(table.dispatch_authenticated(action,owner,token,0,"/shared/docs/./dst",
+     &mut data,&mut fs),Ok(1));
+   assert_eq!(read(&mut fs,"/shared/docs/dst"),b"abc");
+   assert!(table.index(owner,token).is_err());
+   assert_eq!(table.security_statistics().completed_writes,stats.completed_writes+1);
+   if action==16{assert_eq!(read(&mut fs,"/shared/docs/src"),b"inside");}
+  }
+ }
  #[test]fn r094_forged_and_replaced_pid_cannot_mutate(){
   let mut fs=volume();let mut t=FileHandles::new();let o=t.bind_process(1).unwrap();
   let fd=open(&mut t,&mut fs,o,WRITE);let false_owner=Identity{pid:1,generation:o.generation+42};
@@ -2656,6 +2711,39 @@ mod r106_checked_partition_authenticated_file_api_tests{
   assert_eq!(operation_on_selected_volume(&mut table,3,admin,writer,0,"",
     &mut[b'X'],&mut disk,receipt),Ok(1));
   assert_eq!(table.security_statistics().completed_writes,stats.completed_writes+1);
+ }
+ #[test]fn selected_rename_destinations_fail_namespace_preflight_before_media(){
+  let (mut disk,receipt)=disk();
+  {
+   let mut volume=crate::m1_partition::mount_partition_receipt_healthy(&mut disk,receipt).unwrap();
+   volume.mkdir("/shared/docs").unwrap();volume.create("/shared/docs/src",b"abc").unwrap();
+  }
+  let mut table=FileHandles::new();
+  prepare_selected_volume_kernel(&mut table,&mut disk,receipt).unwrap();
+  let owner=table.bind_process(1).unwrap();
+  table.narrow_root_kernel(owner,"/shared/docs").unwrap();
+  let token=operation_on_selected_volume(&mut table,1,owner,0,WRITE,
+    "/shared/docs/src",&mut[],&mut disk,receipt).unwrap();
+  let slot=table.index(owner,token).unwrap();let handle=table.entries[slot];
+  let stats=table.security_statistics();let namespace=table.last_syscall_namespace;
+  for action in [13,16,31]{
+   for target in ["/shared/note","/shared/docs2/item","/boot/kernel",
+                  "/shared/docs/../out","relative",""]{
+    let mut data=if action==13{b"abc".to_vec()}else{Vec::new()};
+    assert_eq!(operation_on_selected_volume(&mut table,action,owner,token,0,
+      target,&mut data,&mut OfflineDescriptorDevice,receipt),Err(FsError::InvalidName));
+    // The native runtime adapter must also reject before AtaPio::probe.
+    assert_eq!(operation_authenticated(&mut table,action,owner,token,0,
+      target,&mut data),Err(FsError::InvalidName));
+   }
+   let data=if action==13{b"abc".as_slice()}else{b"".as_slice()};
+   assert_eq!(table.preflight_selected(action,owner,token,0,"/shared/docs/dst",data),Ok(()));
+  }
+  assert_eq!(table.security_statistics(),stats);
+  assert_eq!(table.last_syscall_namespace,namespace);
+  assert_eq!((table.entries[slot].token,table.entries[slot].offset,
+    table.entries[slot].filesystem_generation),
+    (handle.token,handle.offset,handle.filesystem_generation));
  }
 
  #[test]fn selected_cached_descriptor_denies_foreign_stale_and_malformed_requests(){

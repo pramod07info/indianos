@@ -152,6 +152,22 @@ fn verify_metadata<D:BlockDevice>(disk:&mut D,meta:&Metadata)->Result<bool,FsErr
     }
     Ok(true)
 }
+/// Payload verification may perform many reads between the two headers.
+/// Reject a mixed checkpoint snapshot before exposing admission results.
+/// The volume owner still must serialize operations; this is not an atomic
+/// snapshot against concurrent DMA writers or same-geometry media swaps.
+fn recheck_heads<D:BlockDevice>(disk:&mut D,sectors:u64,
+    expected:&[[u8;SECTOR_BYTES];2])->Result<(),FsError>{
+    for (index,head) in expected.iter().enumerate(){
+        if disk.sector_count()!=sectors{return Err(FsError::InvalidVolume);}
+        let mut observed=[0u8;SECTOR_BYTES];
+        disk.read_sector(index as u64,&mut observed)?;
+        if disk.sector_count()!=sectors||observed!=*head{
+            return Err(FsError::InvalidVolume);
+        }
+    }
+    Ok(())
+}
 fn canonical_path(path:&str)->Result<[u8;NAME_BYTES],FsError>{
     let mut normalized=[0u8;NAME_BYTES];
     let size=normalize_absolute(path,&mut normalized).map_err(|_|FsError::InvalidName)?;
@@ -274,6 +290,7 @@ impl<D:BlockDevice> DurableFs<D>{
             (None,Some(b))=>(1,b,None),
             (None,None)=>return Err(FsError::InvalidVolume),
         };
+        recheck_heads(&mut disk,sectors,&heads)?;
         Ok(Self{disk,sectors,meta,active,previous,heads,retired:core::cell::Cell::new(false)})
     }
     /// Verify both superblocks and all referenced COW payload checksums
@@ -285,15 +302,18 @@ impl<D:BlockDevice> DurableFs<D>{
             return Err(FsError::InvalidVolume);
         }
         let mut copies=[None,None];
+        let mut heads=[[0u8;SECTOR_BYTES];2];
         for index in 0..2{
             let mut header=[0u8;SECTOR_BYTES];
             disk.read_sector(index as u64,&mut header)?;
             if disk.sector_count()!=sectors{return Err(FsError::InvalidVolume);}
+            heads[index]=header;
             if let Some(meta)=decode(&header,sectors){
                 if verify_metadata(disk,&meta)?{copies[index]=Some(meta);}
             }
         }
         if disk.sector_count()!=sectors{return Err(FsError::InvalidVolume);}
+        recheck_heads(disk,sectors,&heads)?;
         let (latest,previous,valid_copies)=match (copies[0],copies[1]){
             (Some(a),Some(b))=>{
                 if a.generation.abs_diff(b.generation)>1 ||
@@ -320,23 +340,23 @@ impl<D:BlockDevice> DurableFs<D>{
     /// Refuse a degraded or internally inconsistent mount for operations
     /// requiring two independently verified COW metadata copies. Read-only
     /// preflight still uses inspect_health to explain the specific condition.
-    pub fn mount_healthy(mut disk:D)->Result<Self,FsError>{
-        let health=Self::inspect_health(&mut disk)?;
+    pub fn mount_healthy(disk:D)->Result<Self,FsError>{
+        let mut mounted=Self::mount(disk)?;
+        // Apply the strict policy to the mount actually returned. Checking
+        // health before a separate mount can admit a newly degraded volume.
+        let health=mounted.mounted_health()?;
         if health.redundancy!=Redundancy::Healthy{
             return Err(FsError::InvalidVolume);
         }
-        Self::mount(disk)
+        Ok(mounted)
     }
     /// Re-probe actual disk sectors, not cached metadata. Fail if a different
-    /// process changed the current head while this filesystem was mounted.
+    /// process changed either recorded head while this filesystem was mounted.
     pub fn mounted_health(&mut self)->Result<VolumeHealth,FsError>{
-        self.check_geometry()?;
+        self.check_heads()?;
         let report=Self::inspect_health(&mut self.disk)?;
-        let mut active=[0u8;SECTOR_BYTES];
-        self.disk.read_sector(self.active,&mut active)?;
-        self.check_geometry()?;
-        if active!=encode(&self.meta,self.sectors) ||
-           report.current_generation!=self.meta.generation{
+        self.check_heads()?;
+        if report.current_generation!=self.meta.generation{
             return Err(FsError::InvalidVolume);
         }
         Ok(report)
@@ -1359,6 +1379,65 @@ mod tests{
         let mut out=[0u8;16];
         assert_eq!(fresh.read_path("/note",&mut out),Ok(4));
         assert_eq!(&out[..4],b"good");
+    }
+    #[test]fn mount_and_health_reject_headers_changed_during_payload_admission(){
+        struct ChangingHeads{disk:SharedDisk,visits:usize,trigger:usize,fail:bool}
+        impl BlockDevice for ChangingHeads{
+            fn sector_count(&self)->u64{self.disk.sector_count()}
+            fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+             ->Result<(),BlockError>{
+                self.disk.read_sector(lba,out)?;
+                if lba==1{
+                    self.visits+=1;
+                    if self.visits==self.trigger{
+                        if self.fail{self.disk.0.borrow_mut().fail_read_lba=Some(0);}
+                        else{self.disk.0.borrow_mut().sectors[0][0]^=1;}
+                    }
+                }
+                Ok(())
+            }
+            fn write_sector(&mut self,_:u64,_:&[u8;SECTOR_BYTES])
+             ->Result<(),BlockError>{panic!("admission attempted a write")}
+        }
+        for (operation,trigger) in [(0,1),(1,1),(2,2)]{
+            for fail in [false,true]{
+                let mut initial=DurableFs::format_blank(blank()).unwrap();
+                initial.create_path("/note",b"committed").unwrap();
+                let disk=SharedDisk(std::rc::Rc::new(std::cell::RefCell::new(initial.into_device())));
+                let writes=disk.0.borrow().writes;
+                let mut device=ChangingHeads{disk:disk.clone(),visits:0,trigger,fail};
+                let result=match operation{
+                    0=>DurableFs::mount(device).map(|_|()),
+                    1=>DurableFs::inspect_health(&mut device).map(|_|()),
+                    _=>DurableFs::mount_healthy(device).map(|_|()),
+                };
+                assert_eq!(result,Err(if fail{FsError::Io}else{FsError::InvalidVolume}));
+                assert_eq!(disk.0.borrow().writes,writes);
+                disk.0.borrow_mut().fail_read_lba=None;
+                let mut recovery=DurableFs::mount(disk).unwrap();
+                let mut out=[0u8;16];
+                assert_eq!(recovery.read_path("/note",&mut out),Ok(9));
+                assert_eq!(&out[..9],b"committed");
+            }
+        }
+    }
+    #[test]fn mounted_health_retires_changed_inactive_head_without_repair(){
+        let disk=SharedDisk(std::rc::Rc::new(std::cell::RefCell::new(blank())));
+        let mut fs=DurableFs::format_blank(disk.clone()).unwrap();
+        fs.create_path("/note",b"committed").unwrap();
+        let inactive=(1-fs.active) as usize;
+        let original=disk.0.borrow().sectors[inactive];
+        disk.0.borrow_mut().sectors[inactive][0]^=1;
+        let writes=disk.0.borrow().writes;
+        assert_eq!(fs.mounted_health(),Err(FsError::InvalidVolume));
+        disk.0.borrow_mut().sectors[inactive]=original;
+        assert_eq!(fs.mounted_health(),Err(FsError::InvalidVolume));
+        assert_eq!(fs.create_path("/next",b"deny"),Err(FsError::InvalidVolume));
+        assert_eq!(disk.0.borrow().writes,writes);
+        let mut fresh=DurableFs::mount_healthy(disk).unwrap();
+        let mut out=[0u8;16];
+        assert_eq!(fresh.read_path("/note",&mut out),Ok(9));
+        assert_eq!(&out[..9],b"committed");
     }
     #[test]fn checkpoint_publication_rejects_corrupt_unchanged_payload_before_writing(){
         let mut fs=DurableFs::format_blank(blank()).unwrap();

@@ -5,6 +5,66 @@ for published links. All six remain **IN PROGRESS** until required checks, exact
 artifacts and review satisfy their exit criteria. Source changes alone do not
 accept a gate.
 
+## Scope of acceptance
+
+Issue #616's high-level gates and the binding [99-task phase ledger](M1_PHASE_SCOPE.md)
+must both be considered. In particular, P9 explicitly requires **per-process
+private pixel surfaces**. The current guarded command payloads and clipped
+kernel raster backend establish a narrower isolation mechanism; they do not
+implement those pixel surfaces. Passing the command-guard QEMU probes therefore
+cannot close the complete G4/GUI milestone. P9 also retains physical IRQ input,
+display qualification and the other listed desktop requirements.
+
+Similarly, killing QEMU after an acknowledged commit proves reboot readback
+after unclean guest loss, while host write-cut tests cover publication fault
+boundaries in the storage model. Neither is evidence that a real guest rebooted
+after interruption inside an ATA publication. G6's directories, flush ordering,
+locking and per-user isolation remain separate acceptance obligations. G7's
+current normal-desktop evidence distinguishes PID1's authenticated mutations,
+PID2's authenticated reads and PID3's broker requests; it does not imply every
+process has independent writable filesystem authority. G8 requires selected
+physical-device evidence in addition to emulator coverage.
+
+The original 5/13 accepted foundation count is unchanged until the complete
+required outcomes have exact-revision acceptance and review. No filesystem,
+compositor, input or driver milestone is accepted merely by a green host test.
+
+## Verified baseline: `638ad434f4955596edf0853d7c676f662b462700`
+
+The [normal-desktop job](https://github.com/pramod07info/indianos/actions/runs/42512759106/job/128829200749)
+completed **SUCCESS** at this exact checkout. Its retained log confirms:
+
+- 3,400 kernel host tests, 36 harness controls, 16 boot-profile controls, seven
+  compositor policy tests, two startup tests and two broker tests passed;
+  freestanding compilation and the native four-service image build passed.
+- The complete configured **22 VM boots** passed: two normal graphical boots,
+  two abrupt-loss/reboot boots, one transient compositor-recovery boot, four
+  namespace rejection boots, three partition rejection boots, one ATA write-error
+  boot, three corrupt-media/identity boots and six service/configuration boots.
+- The normal boots exercised actual PS/2 drag/release/capture cancellation,
+  minimize/restore, focus and suspended-editor isolation; exact file glyphs and
+  named file/directory state survived reboot. Actual unsolicited Terminal mutation
+  denial, durable shutdown arming and all four service reaps were required.
+- The transient debugger path verified real trap/surface guard mappings under
+  PID4 and the reclaimed kernel, injected an actual user instruction-fetch fault,
+  and required a fresh interactive desktop and successful durable shutdown.
+- The service cases included repeated actual faults, premature status-zero exit
+  and a compositor that yields without becoming ready, with verified retirement,
+  exactly one retry and controlled recovery. No failing criterion was skipped.
+
+[Artifact 13630277012](https://github.com/pramod07info/indianos/actions/runs/42512759106/artifacts/13630277012)
+retains the serial logs, debugger evidence and screenshots. Frame settlement
+used three retained samples for both sides of each strict editor comparison.
+The [combined regression job](https://github.com/pramod07info/indianos/actions/runs/42512759106/job/128829200787)
+and [durable-files desktop workflow](https://github.com/pramod07info/indianos/actions/runs/42512759190)
+also completed **SUCCESS**. These are verified GitHub executions, not local runs.
+
+This evidence establishes the bounded emulator outcomes above, while all six
+full G3–G8/phase-ledger acceptance states remain **IN PROGRESS** for their
+documented broader obligations. Subsequent integration source changes require
+new checks on their own exact commit. A prior successful run must not be used
+as the new integration revision's merge evidence.
+
 | Position | Required behavior | Implementation and remaining acceptance |
 | --- | --- | --- |
 | 8 / G3 | Automatic normal boot to isolated PID1, Files, Terminal and compositor; recovery for missing/bad services or media | Trusted Desktop edition selection, native role/feature enforcement, strict service startup join, kernel readiness, bounded cooperative startup and one verified restart are implemented. Require final-head normal boot, invalid-service/media and withheld-readiness QEMU results. |

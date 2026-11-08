@@ -29,6 +29,18 @@ failure, permanent session retirement and remount outcomes. Existing ordered
 barrier success tests continue to cover healthy creation and overwrite.
 Tests were added but not executed locally in this source-only batch.
 
+Admission also rereads both exact metadata sectors after payload verification.
+If either differs from the scanned header, or the reread fails, mount and health
+inspection reject the mixed snapshot without writing. Strict healthy mounting
+checks the filesystem instance it actually returns, rather than trusting a
+healthy preflight followed by a separate potentially degraded mount. Live health
+checks compare both recorded heads before and after inspection; a changed
+inactive rollback head retires the session even if its active head is intact.
+Regression coverage injects header corruption and transport failure during
+admission, checks strict-mount scan changes and verifies permanent retirement
+after an inactive-head replacement. Read-only recovery still permits an
+explicit fresh mount of a stable volume with one valid checkpoint.
+
 This bounded filesystem still has eight objects, a 2 KiB per-file limit,
 CRC-based accidental-corruption detection and a single serialized volume owner.
 Verification cannot prove that a malicious controller has actually persisted
