@@ -132,6 +132,14 @@ fn complete()->Result<(),BlockError>{wait_status(false)}
 /// Optional IDENTIFY words use bit 14 set and bit 15 clear as their
 /// validity signature. Other patterns mean "not reported", not zero support.
 fn identify_word_valid(word:u16)->bool { word&0xc000==0x4000 }
+/// Optional ATA IDENTIFY integrity word: low byte A5 declares an eight-bit
+/// checksum across the complete 512-byte response. Never authorize geometry
+/// from a response which advertises integrity but fails that check.
+fn identify_integrity_valid(words:&[u16;256])->bool{
+    if words[255] as u8!=0xa5{return true;}
+    words.iter().fold(0u8,|sum,word|
+        sum.wrapping_add(*word as u8).wrapping_add((word>>8) as u8))==0
+}
 fn logical_sector_words(words:&[u16;256])->Option<u32>{
     if !identify_word_valid(words[106]) || words[106]&(1<<12)==0 {
         return Some(256);
@@ -142,6 +150,7 @@ fn logical_sector_words(words:&[u16;256])->Option<u32>{
     if size<=256 {None} else {Some(size)}
 }
 fn capacity(words:&[u16;256])->Option<u64>{
+    if !identify_integrity_valid(words){return None;}
     // Word 0 bit 15 identifies a non-ATA device; bit 2 means that the
     // IDENTIFY response is incomplete (e.g. requires spin-up first).
     if words[0]&0x8004!=0 {return None;}
@@ -359,6 +368,38 @@ mod tests {
         let mut words=[0;256];
         words[49]=1<<9;words[60]=1024;
         words
+    }
+    #[test]
+    fn identify_declared_checksum_protects_geometry_and_all_response_words(){
+        let mut words=identify_512();
+        words[255]=0xa5;
+        let sum=words.iter().fold(0u8,|sum,word|
+            sum.wrapping_add(*word as u8).wrapping_add((word>>8) as u8));
+        words[255]|=(sum.wrapping_neg() as u16)<<8;
+        assert!(identify_integrity_valid(&words));
+        assert_eq!(capacity(&words),Some(1024));
+        for index in 0..256{
+            let mut corrupt=words;
+            // Preserve the optional signature while corrupting its checksum.
+            corrupt[index]^=if index==255{0x100}else{1};
+            assert!(!identify_integrity_valid(&corrupt),"word {index}");
+            assert_eq!(capacity(&corrupt),None);
+        }
+        // Complete response bytes, not only the geometry fields, contribute.
+        let mut corrupt=words;corrupt[100]^=0x8000;
+        assert_eq!(capacity(&corrupt),None);
+    }
+    #[test]
+    fn identify_legacy_optional_checksum_absence_preserves_supported_devices(){
+        let mut words=identify_512();
+        for unreported in [0,0xffff,0x5aa4,0xa500]{
+            words[255]=unreported;
+            assert!(identify_integrity_valid(&words));
+            assert_eq!(capacity(&words),Some(1024));
+        }
+        words[255]=0x00a5;
+        assert!(!identify_integrity_valid(&words));
+        assert_eq!(capacity(&words),None);
     }
     #[test]
     fn identify_rejects_4kn_and_malformed_long_sector_declarations(){

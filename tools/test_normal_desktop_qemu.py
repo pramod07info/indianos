@@ -230,6 +230,19 @@ def verify_suspended_editor(before: tuple[int, int, bytes], after: tuple[int, in
         raise AssertionError("unfocused editor input changed the framebuffer")
 
 
+def verify_editor_authority(output: bytes, since: int) -> None:
+    if not 0 <= since < len(output):
+        raise AssertionError("invalid editor-authority evidence boundary")
+    tail = output[since:]
+    lines = tail.replace(b"\r", b"").split(b"\n")[:-1]
+    for marker in (b"IndianOS user: desktop Terminal unsolicited filesystem mutation denied",
+                   b"IndianOS user: desktop broker denied filesystem request outside submitted Enter"):
+        if lines.count(marker) != 1:
+            raise AssertionError("editor startup lacks fresh unsolicited-mutation denial")
+    if any(marker in tail for marker in (COMMITTED.encode(), NAMED_COMMIT.encode(), PERSISTED.encode())):
+        raise AssertionError("unsolicited editor startup mutation was committed")
+
+
 def physical_focus(session: QemuSession, previous: tuple[int, int], target: tuple[int, int],
                    app: str) -> tuple[int, int]:
     # HMP relative motion enters the emulated 8042 auxiliary port. The guest
@@ -489,7 +502,8 @@ def boot(qemu: str, iso: Path, ovmf: Path, disk: Path, folder: Path, index: int)
         frame = session.shot(folder / f"desktop-{index}-files-focus.ppm")
         frame = physical_key(session, "2", "R031.1 user switched to Terminal app",
                              folder, index, 8, frame, False)
-        acknowledged_key(session, "ret")
+        editing_at = acknowledged_key(session, "ret")
+        verify_editor_authority(bytes(session.output), editing_at)
         editing = session.shot(folder / f"desktop-{index}-editor.ppm")
         changed(frame, editing, "normal Terminal activation")
         pointer_focus_acceptance(session, folder, index, editing)

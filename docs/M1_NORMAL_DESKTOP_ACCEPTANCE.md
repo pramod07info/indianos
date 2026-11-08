@@ -201,6 +201,15 @@ framebuffer, fresh suspension evidence, no Terminal acknowledgment and exact
 pending-command readback after refocus. No pixel tolerance, region exclusion or
 acceptance requirement was removed. The corrected harness and any accompanying
 production changes still require a fresh exact-SHA CI run.
+
+The first real Terminal editor activation must also produce fresh, complete
+acknowledgments from both the broker and Terminal that an unsolicited filesystem
+mutation was denied. No durable-note, named-mutation or Files-refresh commit may
+occur in that activation interval. The following physical pending-`cat` scenario
+must still read the original content exactly, proving the rejected request did
+not replace the selected file. Missing, stale, truncated or duplicate refusal
+records and any unsolicited commit fail the host evidence controls. This checks
+the real PID1/PID3 IPC transaction boundary, rather than malformed pointers alone.
 See `M1_NAMESPACE_ADMISSION.md` and `M1_KERNEL_STACK_GUARDS.md` for limits.
 
 Run the combined normal-desktop workflow only after source integration. No new

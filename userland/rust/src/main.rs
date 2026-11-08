@@ -17,6 +17,8 @@ mod shell;
 mod terminal_line;
 #[cfg(any(feature="r031-files-shell",feature="desktop-init",feature="r031-files-terminal",feature="desktop-terminal"))]
 mod terminal_fs;
+#[cfg(feature="desktop-init")]
+mod terminal_broker;
 #[cfg(feature="desktop-compositor")]
 mod desktop_window;
 #[cfg(feature="desktop-init")]
@@ -850,11 +852,27 @@ fn desktop_named_command(command:terminal_fs::Command){
 }
 #[cfg(any(feature="r031-files-shell",feature="desktop-init"))]
 fn terminal_exchange(byte:u8,begin:bool)->bool{
+    #[cfg(feature="desktop-init")]
+    let mut exchange=terminal_broker::Exchange::new(byte,begin);
     if begin{suite_send(3,b"B");}else{suite_send(3,&[b'K',byte]);}
     let mut response=[0u8;72];
     loop{
         let len=terminal_receive(3,&mut response);
         let message=&response[8..8+len];
+        #[cfg(feature="desktop-init")]
+        match exchange.observe(message){
+            Ok(terminal_broker::Decision::Complete(editing))=>return editing,
+            Ok(terminal_broker::Decision::Dispatch)=>{},
+            Ok(terminal_broker::Decision::Denied)=>{
+                suite_send(3,b"E");
+                write(b"desktop broker denied filesystem request outside submitted Enter");
+                continue;
+            },
+            Err(())=>{
+                write(b"desktop broker rejected duplicate or invalid transaction reply");
+                exit(219);
+            },
+        }
         match message{
             b"A"=>return true,
             b"C"=>return false,
@@ -932,12 +950,25 @@ fn terminal_field(text:&[u8]){
 fn terminal_service(){
     use terminal_line::{Action,Line};
     let mut line=Line::new();let mut editing=false;
+    #[cfg(feature="desktop-terminal")]
+    let mut admission_probed=false;
     let mut response=[0u8;72];
     loop{
         let len=terminal_receive(1,&mut response);
         match &response[8..8+len]{
             b"EXIT"=>break,
             b"B"=>{
+                #[cfg(feature="desktop-terminal")]
+                if !admission_probed{
+                    // Authenticated PID3 still has no submitted command on B.
+                    // Probe the real broker with a mutation before allowing
+                    // ordinary editing; it must reject without touching disk.
+                    suite_send(1,b"WUNAUTHORIZED");
+                    let n=terminal_receive(1,&mut response);
+                    if &response[8..8+n]!=b"E"{exit(223);}
+                    write(b"desktop Terminal unsolicited filesystem mutation denied");
+                    admission_probed=true;
+                }
                 line.clear();editing=true;terminal_field(b"> ");suite_send(1,b"A");
             },
             message if message.len()==2&&message[0]==b'K'&&editing=>{

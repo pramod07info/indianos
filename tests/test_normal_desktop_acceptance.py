@@ -17,6 +17,19 @@ finally:
 
 
 class NormalDesktopControls(unittest.TestCase):
+    def test_editor_authority_requires_fresh_denial_and_no_unsolicited_commit(self):
+        broker = b"IndianOS user: desktop broker denied filesystem request outside submitted Enter\n"
+        app = b"IndianOS user: desktop Terminal unsolicited filesystem mutation denied\n"
+        trace = broker + app
+        harness.verify_editor_authority(trace, 0)
+        for output, since in ((trace, len(trace)), (broker, 0), (app, 0),
+                              (trace[:-1], 0), (trace + app, 0),
+                              (trace + harness.COMMITTED.encode(), 0),
+                              (trace + harness.NAMED_COMMIT.encode(), 0),
+                              (trace + harness.PERSISTED.encode(), 0)):
+            with self.subTest(output=output), self.assertRaises(AssertionError):
+                harness.verify_editor_authority(output, since)
+
     def test_frame_settlement_requires_identical_real_samples_with_bounded_wait(self):
         partial = (640, 480, b"partial repaint")
         complete = (640, 480, b"complete repaint")

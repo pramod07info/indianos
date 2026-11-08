@@ -538,10 +538,26 @@ impl<D:BlockDevice> DurableFs<D>{
         }
         Ok(())
     }
+    /// A checkpoint is usable only when every referenced file verifies.
+    /// Metadata-only operations must not overwrite the rollback head while
+    /// carrying forward payload corruption discovered since mount.
+    fn check_payloads(&mut self,meta:Metadata)->Result<(),FsError>{
+        self.check_geometry()?;
+        let result=match verify_metadata(&mut self.disk,&meta){
+            Ok(true)=>Ok(()),
+            Ok(false)=>Err(FsError::InvalidVolume),
+            Err(error)=>Err(error),
+        };
+        if result.is_err(){self.retired.set(true);}
+        result?;
+        self.check_geometry()
+    }
     fn publish(&mut self,mut proposed:Metadata)->Result<(),FsError>{
         self.check_heads()?;
         proposed.generation=self.meta.generation.checked_add(1)
             .ok_or(FsError::InvalidVolume)?;
+        self.check_payloads(proposed)?;
+        self.check_heads()?;
         let inactive=1-self.active;
         let bytes=encode(&proposed,self.sectors);
         self.check_geometry()?;
@@ -559,6 +575,9 @@ impl<D:BlockDevice> DurableFs<D>{
         if observed!=bytes{
             self.retired.set(true);return Err(FsError::InvalidVolume);
         }
+        // A successful metadata write can still damage a referenced bank.
+        // Do not acknowledge a checkpoint whose payloads no longer verify.
+        self.check_payloads(proposed)?;
         self.previous=Some(self.meta);
         self.meta=proposed;
         self.active=inactive;
@@ -664,6 +683,11 @@ impl<D:BlockDevice> DurableFs<D>{
         if let Err(e)=self.disk.sync(){
             self.retired.set(true);return Err(e.into());
         }
+        self.check_heads()?;
+        // The final metadata barrier is another device operation: payload
+        // integrity checked before it is not sufficient to acknowledge a
+        // durable transaction. Keep uncertain sessions permanently retired.
+        self.check_payloads(self.meta)?;
         self.check_heads()
     }
     /// Opt-in, flush-verified creation; a missing flush driver is an error.
@@ -1335,6 +1359,90 @@ mod tests{
         let mut out=[0u8;16];
         assert_eq!(fresh.read_path("/note",&mut out),Ok(4));
         assert_eq!(&out[..4],b"good");
+    }
+    #[test]fn checkpoint_publication_rejects_corrupt_unchanged_payload_before_writing(){
+        let mut fs=DurableFs::format_blank(blank()).unwrap();
+        fs.create_path("/note",b"committed").unwrap();
+        let head=fs.heads;
+        let generation=fs.generation();
+        let lba=block_start(0,fs.meta.entries[0].bank) as usize;
+        fs.disk.sectors[lba][0]^=1;
+        let writes=fs.disk.writes;
+        assert_eq!(fs.rename_path("/note","/renamed"),Err(FsError::InvalidVolume));
+        assert_eq!(fs.generation(),generation);
+        assert_eq!(fs.disk.writes,writes);
+        assert_eq!([fs.disk.sectors[0],fs.disk.sectors[1]],head);
+        fs.disk.sectors[lba][0]^=1; // even restored bytes cannot revive the session
+        assert_eq!(fs.rename_path("/note","/renamed"),Err(FsError::InvalidVolume));
+        let mut fresh=DurableFs::mount(fs.into_device()).unwrap();
+        fresh.rename_path("/note","/renamed").unwrap();
+        assert_eq!(get(&mut fresh,"/renamed"),b"committed");
+    }
+    #[test]fn checkpoint_publication_refuses_payload_transport_failure_without_mutation(){
+        let mut fs=DurableFs::format_blank(blank()).unwrap();
+        fs.create_path("/note",b"committed").unwrap();
+        let lba=block_start(0,fs.meta.entries[0].bank);
+        fs.disk.fail_read_lba=Some(lba);
+        let writes=fs.disk.writes;
+        assert_eq!(fs.rename_path("/note","/renamed"),Err(FsError::Io));
+        assert_eq!(fs.disk.writes,writes);
+        fs.disk.fail_read_lba=None;
+        assert_eq!(fs.rename_path("/note","/renamed"),Err(FsError::InvalidVolume));
+        let mut fresh=DurableFs::mount(fs.into_device()).unwrap();
+        assert_eq!(get(&mut fresh,"/note"),b"committed");
+    }
+    #[test]fn publication_and_final_barrier_failures_never_acknowledge_bad_checkpoints(){
+        struct FaultDisk{disk:Disk,target:Option<u64>,stage:u8,syncs:u8}
+        impl BlockDevice for FaultDisk{
+            fn sector_count(&self)->u64{self.disk.sector_count()}
+            fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+             ->Result<(),BlockError>{self.disk.read_sector(lba,out)}
+            fn write_sector(&mut self,lba:u64,data:&[u8;SECTOR_BYTES])
+             ->Result<(),BlockError>{
+                self.disk.write_sector(lba,data)?;
+                if lba<2&&self.stage==0{
+                    if let Some(target)=self.target{
+                        self.disk.sectors[target as usize][0]^=1;
+                    }
+                }
+                Ok(())
+            }
+            fn sync(&mut self)->Result<(),BlockError>{
+                self.syncs+=1;
+                if self.syncs==2{
+                    if let Some(target)=self.target{
+                        match self.stage{
+                            1=>self.disk.sectors[target as usize][0]^=1,
+                            2=>self.disk.fail_read_lba=Some(target),
+                            3=>return Err(BlockError::Io),
+                            _=>{},
+                        }
+                    }
+                }
+                Ok(())
+            }
+        }
+        for stage in 0..4{
+            let device=FaultDisk{disk:blank(),target:None,stage,syncs:0};
+            let mut fs=DurableFs::format_blank(device).unwrap();
+            fs.create_path("/note",b"previous").unwrap();
+            let bank=fs.available_bank(0).unwrap();
+            fs.disk.target=Some(block_start(0,bank));
+            let expected=if stage<2{FsError::InvalidVolume}else{FsError::Io};
+            assert_eq!(fs.overwrite_durable_path("/note",b"replacement"),Err(expected));
+            let writes=fs.disk.disk.writes;
+            let mut out=[0xa5;16];
+            assert_eq!(fs.read_path("/note",&mut out),Err(FsError::InvalidVolume));
+            assert_eq!(out,[0xa5;16]);
+            assert_eq!(fs.overwrite_path("/note",b"retry"),Err(FsError::InvalidVolume));
+            assert_eq!(fs.disk.disk.writes,writes);
+            let mut disk=fs.into_device().disk;
+            disk.fail_read_lba=None;
+            let mut recovery=DurableFs::mount(disk).unwrap();
+            let recovered=get(&mut recovery,"/note");
+            if stage<2{assert_eq!(recovered,b"previous");}
+            else{assert_eq!(recovered,b"replacement");}
+        }
     }
     #[test]fn r103_strict_durable_overwrite_rejects_controller_lost_data_at_flush(){
         struct LieFlush{

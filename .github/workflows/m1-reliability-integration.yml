@@ -143,6 +143,8 @@ jobs:
           build/normal-desktop-logs/desktop-window-tests 2>&1 | tee build/normal-desktop-logs/window-policy.log
           rustc --edition=2021 --test userland/rust/tests/desktop_startup.rs -o build/normal-desktop-logs/desktop-startup-tests
           build/normal-desktop-logs/desktop-startup-tests 2>&1 | tee build/normal-desktop-logs/startup-protocol.log
+          rustc --edition=2021 --test userland/rust/tests/terminal_broker.rs -o build/normal-desktop-logs/terminal-broker-tests
+          build/normal-desktop-logs/terminal-broker-tests 2>&1 | tee build/normal-desktop-logs/terminal-broker.log
           cargo test --locked --offline --manifest-path tools/rust/Cargo.toml --features desktop-volume,desktop-fixture --bin indianos-desktop-volume --test desktop_volume_cli 2>&1 | tee build/normal-desktop-logs/volume-tool.log
       - name: Explicitly provision new disposable GPT media with the actual filesystem
         run: |
