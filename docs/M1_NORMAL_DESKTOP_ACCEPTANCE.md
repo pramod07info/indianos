@@ -180,6 +180,27 @@ test `explicit_policy_transitions_cancel_drag_until_a_new_physical_press` failed
 at its accepted-control assertion (six other policy tests passed). A corrected
 production/test contract and the new physical scenarios require new exact-SHA
 CI evidence; positions 8–10 remain unaccepted here.
+
+At `f641f55ec7a8121b75d1dec9cf662456891ddc3e`,
+[M1 run 42512047977](https://github.com/pramod07info/indianos/actions/runs/42512047977)
+passed host checks, freestanding/image builds and the first complete normal
+desktop boot, including physical drag, capture cancellation, focus, filesystem
+operations and clean reclamation. The second boot failed the strict unfocused
+editor framebuffer-identity assertion. Retained artifact `13630310128` shows
+the first capture's pixel zero as desktop background `(16,28,55)` and the next
+as top-bar background `(12,20,43)`: the first screenshot captured the raster
+backend between its full background fill and top-bar repaint. The focus press
+acknowledgment did not fence the queued physical release packet's repaint.
+
+The harness now drains pending device input and requires three consecutive
+identical real screenshots, separated by serial-drain intervals, before each
+side of this strict comparison. Sampling is bounded to eleven frames; every
+sample remains in the artifacts and the accepted sample count is logged.
+The unfocused-key test still requires exact equality of the complete settled
+framebuffer, fresh suspension evidence, no Terminal acknowledgment and exact
+pending-command readback after refocus. No pixel tolerance, region exclusion or
+acceptance requirement was removed. The corrected harness and any accompanying
+production changes still require a fresh exact-SHA CI run.
 See `M1_NAMESPACE_ADMISSION.md` and `M1_KERNEL_STACK_GUARDS.md` for limits.
 
 Run the combined normal-desktop workflow only after source integration. No new

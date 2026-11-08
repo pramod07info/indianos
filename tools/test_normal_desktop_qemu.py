@@ -335,12 +335,12 @@ def pointer_focus_acceptance(session: QemuSession, folder: Path, index: int,
     type_command(session, "cat")
     width, height = editing[:2]
     pointer = physical_focus(session, (width // 2, height // 2), (100, 135), "Files")
-    focused = session.shot(folder / f"desktop-{index}-pointer-files.ppm")
+    focused = settled_frame(session, folder / f"desktop-{index}-pointer-files.ppm")
     changed(editing, focused, "physical pointer Files focus")
     since = len(session.output)
     session.hmp("sendkey z 80")
     session.until("desktop Terminal editor suspended outside keyboard focus", 20, since=since)
-    blocked = session.shot(folder / f"desktop-{index}-pointer-key-blocked.ppm")
+    blocked = settled_frame(session, folder / f"desktop-{index}-pointer-key-blocked.ppm")
     verify_suspended_editor(focused, blocked, bytes(session.output), since)
     physical_focus(session, pointer, (width - 100, height - 150), "Terminal")
     restored = session.shot(folder / f"desktop-{index}-pointer-terminal.ppm")
@@ -355,6 +355,29 @@ def pointer_focus_acceptance(session: QemuSession, folder: Path, index: int,
     verify_text_pixels(result, "terminal", expected)
     verify_text_pixels(result, "files-note", expected)
     return result
+
+
+def settled_frame(session: QemuSession, path: Path) -> tuple[int, int, bytes]:
+    """Capture identical consecutive real frames before a strict identity check.
+
+    PS/2 press and release are distinct packets. The focus acknowledgment can
+    precede repaint for the queued release; QEMU screendump does not fence the
+    guest's CPU stores. Retain every sample so a timeout remains diagnosable.
+    This never permits changed pixels in verify_suspended_editor.
+    """
+    session.drain_serial(0.2)
+    previous = session.shot(path)
+    equal = 0
+    for attempt in range(1, 11):
+        session.drain_serial(0.15)
+        sample = path.with_name(f"{path.stem}.settle-{attempt:02d}{path.suffix}")
+        current = session.shot(sample)
+        equal = equal + 1 if current == previous else 0
+        if equal == 2:
+            print(f"Stable framebuffer {path.name}: {attempt + 1} retained samples", flush=True)
+            return current
+        previous = current
+    raise AssertionError("framebuffer did not settle before strict editor isolation comparison")
 
 
 def verify_uart_ignored(before: tuple[int, int, bytes], after: tuple[int, int, bytes],

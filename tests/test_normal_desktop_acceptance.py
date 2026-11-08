@@ -17,6 +17,22 @@ finally:
 
 
 class NormalDesktopControls(unittest.TestCase):
+    def test_frame_settlement_requires_identical_real_samples_with_bounded_wait(self):
+        partial = (640, 480, b"partial repaint")
+        complete = (640, 480, b"complete repaint")
+        session = Mock()
+        session.shot.side_effect = [partial, complete, complete, complete]
+        self.assertEqual(harness.settled_frame(session, Path("focus.ppm")), complete)
+        self.assertEqual(session.shot.call_count, 4)
+        self.assertEqual(session.drain_serial.call_count, 4)
+        self.assertEqual(session.shot.call_args.args[0], Path("focus.settle-03.ppm"))
+        session = Mock()
+        session.shot.side_effect = [(640, 480, bytes([index])) for index in range(11)]
+        with self.assertRaisesRegex(AssertionError, "did not settle"):
+            harness.settled_frame(session, Path("focus.ppm"))
+        self.assertEqual(session.shot.call_count, 11)
+        self.assertEqual(session.drain_serial.call_count, 11)
+
     def test_minimize_requires_hidden_client_and_exact_restored_retained_pixels(self):
         frame = (640, 480, bytes(640 * 480 * 3))
         pixels = bytearray(frame[2])
