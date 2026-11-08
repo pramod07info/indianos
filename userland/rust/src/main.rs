@@ -1224,6 +1224,17 @@ fn r031_shell()->!{
             _=>exit(175),
         }
         #[cfg(feature="desktop-init")]
+        if byte[0]==0{
+            // Integrity loss invalidates a suspended editor too, without
+            // granting it focus or forwarding any remaining key suffix.
+            if terminal_edit{
+                terminal_edit=terminal_exchange(0,false);
+                if desktop_present(front)!=0{exit(216);}
+            }
+            write(b"desktop input loss invalidated pending Terminal command");
+            continue;
+        }
+        #[cfg(feature="desktop-init")]
         if terminal_edit&&front!=2{
             write(b"desktop Terminal editor suspended outside keyboard focus");
         }

@@ -566,18 +566,10 @@ impl UserSurfaceService{
         if pid!=1{return None;}
         #[cfg(feature="normal-desktop")]
         {
-            let before=(self.session.mouse_x,self.session.mouse_y,self.session.was_down);
-            for _ in 0..4{
-                let Some(packet)=self.mouse.poll()else{break;};
-                self.session.mouse_x=(self.session.mouse_x+packet.dx as i32)
-                    .clamp(0,self.session.desktop.width as i32-1);
-                self.session.mouse_y=(self.session.mouse_y-packet.dy as i32)
-                    .clamp(0,self.session.desktop.height as i32-1);
-                self.session.was_down=packet.left;
-            }
-            let changed=before!=(self.session.mouse_x,self.session.mouse_y,self.session.was_down);
-            return Some(self.session.mouse_x as u64|((self.session.mouse_y as u64)<<16)|
-                ((self.session.was_down as u64)<<32)|((changed as u64)<<33));
+            // Preserve every button edge. Collapsing several complete
+            // packets loses a quick press/release before ring-3 sees it.
+            let packet=self.mouse.poll();
+            return Some(self.desktop_pointer_packet(packet));
         }
         #[cfg(not(feature="normal-desktop"))]
         if self.frame_state(pid).is_none(){return None;}
@@ -595,6 +587,20 @@ impl UserSurfaceService{
         }
         #[cfg(not(any(feature="test-r029-physical-events",feature="normal-desktop")))]
         {Some(self.session.desktop.focused()? as u64)}
+    }
+    #[cfg(feature="normal-desktop")]
+    fn desktop_pointer_packet(&mut self,packet:Option<Packet>)->u64{
+        let before=(self.session.mouse_x,self.session.mouse_y,self.session.was_down);
+        if let Some(packet)=packet{
+            self.session.mouse_x=(self.session.mouse_x+packet.dx as i32)
+                .clamp(0,self.session.desktop.width as i32-1);
+            self.session.mouse_y=(self.session.mouse_y-packet.dy as i32)
+                .clamp(0,self.session.desktop.height as i32-1);
+            self.session.was_down=packet.left;
+        }
+        let changed=before!=(self.session.mouse_x,self.session.mouse_y,self.session.was_down);
+        self.session.mouse_x as u64|((self.session.mouse_y as u64)<<16)|
+            ((self.session.was_down as u64)<<32)|((changed as u64)<<33)
     }
     #[cfg(any(feature="test-r029-desktop-suite",feature="normal-desktop"))]
     fn desktop_action(&mut self,pid:u32,action:u32)->bool{
@@ -984,6 +990,27 @@ mod tests{
             #[cfg(feature="test-r031-supervisor")]restart_count:0,
             // State-only fixture; no hardware initialization is invoked.
             mouse:unsafe{core::mem::zeroed()},}
+    }
+    #[cfg(feature="normal-desktop")]
+    #[test]fn desktop_pointer_preserves_press_and_release_as_individual_events(){
+        let mut svc=isolated_service();
+        let idle=svc.desktop_pointer_packet(None);assert_eq!(idle>>32,0);
+        let pressed=svc.desktop_pointer_packet(Some(Packet{dx:0,dy:0,left:true}));
+        let released=svc.desktop_pointer_packet(Some(Packet{dx:0,dy:0,left:false}));
+        assert_eq!((pressed>>32)&3,3);assert_eq!((released>>32)&3,2);
+        assert_eq!(pressed&0xffff_ffff,released&0xffff_ffff);
+        // Holding with no motion is not another press. A later release still
+        // survives a stationary packet and an idle poll.
+        svc.desktop_pointer_packet(Some(Packet{dx:0,dy:0,left:true}));
+        assert_eq!(svc.desktop_pointer_packet(Some(Packet{dx:0,dy:0,left:true}))>>32,1);
+        assert_eq!(svc.desktop_pointer_packet(None)>>32,1);
+        assert_eq!(svc.desktop_pointer_packet(Some(Packet{dx:0,dy:0,left:false}))>>32,2);
+        for (dx,dy,x,y) in [(i16::MAX,i16::MIN,799u64,599u64),
+                            (i16::MIN,i16::MAX,0,0)]{
+            let event=svc.desktop_pointer_packet(Some(Packet{dx,dy,left:false}));
+            assert_eq!(event&0xffff,x);assert_eq!((event>>16)&0xffff,y);
+            assert_eq!(event>>32,2);
+        }
     }
     #[cfg(feature="normal-desktop")]
     #[test]fn command_pages_have_two_real_guard_slots_and_clear_payload_only(){

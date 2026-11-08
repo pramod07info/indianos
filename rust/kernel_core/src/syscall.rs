@@ -236,6 +236,19 @@ mod tests {
         assert!(!check(38,2,0));
         assert!(!check(38,0,1));
         assert!(!check(38,1,u64::MAX));
+        // Hardware input preflights every destination before the runtime can
+        // consume a physical byte; guard/kernel/overflow addresses cannot
+        // drain the trusted broker's input stream.
+        assert!(check(6,plan.stack_end-1,1));
+        for address in [0,plan.guard_begin,USER_TOP,u64::MAX]{
+            assert!(!check(6,address,1));
+            assert!(!check(21,address,16));
+        }
+        assert!(!check(6,plan.stack_begin,0));
+        assert!(!check(6,plan.stack_begin,2));
+        assert!(!check(21,plan.stack_end-15,16));
+        assert!(!check(25,1,0));
+        assert!(!check(25,0,1));
         for (number,arg0,arg1) in [(5,1,0),(19,1,0),(22,0,0),(23,1,0),
             (24,1,0),(30,1,plan.stack_begin),(31,1,0),(36,1,plan.stack_begin)]{
             assert!(!check(number,arg0,arg1),"legacy control {number}");

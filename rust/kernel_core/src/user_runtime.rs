@@ -133,6 +133,17 @@ impl DesktopLifecycle{
    _=>true,
   }
  }
+ fn allows_input_request(&self,number:u64,pid:u32)->bool{
+  match number{
+   // Hardware consumption belongs to the live ready broker only. Refuse
+   // before touching controller ports, software queues or user buffers.
+   6|25=>pid==1&&self.ready&&!self.shutdown_armed,
+   // App event queues may be used during startup, but neither the broker
+   // nor the compositor owns a client queue. Shutdown withdraws delivery.
+   21=>matches!(pid,2|3)&&!self.shutdown_armed,
+   _=>true,
+  }
+ }
 }
 #[cfg(feature="normal-desktop")]
 static mut DESKTOP_LIFECYCLE:DesktopLifecycle=DesktopLifecycle::new();
@@ -565,6 +576,11 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
   // The single BSP cannot interleave this check with ARM_SHUTDOWN. Once
   // the flush has succeeded, no peer may create post-barrier dirty state.
   return BAD;
+ }
+ #[cfg(feature="normal-desktop")]
+ if matches!(request.number,6|21|25){
+  let Some(pid)=authenticated_gui_pid()else{return BAD;};
+  if !unsafe{DESKTOP_LIFECYCLE}.allows_input_request(request.number,pid){return BAD;}
  }
  match request.number{
   #[cfg(feature="normal-desktop")]
@@ -2682,6 +2698,32 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
   // IPC, compositor final redraw, logging and termination remain available.
   for number in [1,2,3,9,18,34,35,37]{
    assert!(state.allows_storage_request(number,0));
+  }
+ }
+ #[cfg(feature="normal-desktop")]
+ #[test]fn desktop_hardware_input_requires_live_ready_broker_and_stops_at_shutdown(){
+  let mut state=DesktopLifecycle::new();
+  for number in [6,25]{
+   for pid in 0..=5{assert!(!state.allows_input_request(number,pid));}
+  }
+  for pid in 0..=5{
+   assert_eq!(state.allows_input_request(21,pid),matches!(pid,2|3));
+  }
+  assert!(state.ready(true));
+  for number in [6,25]{
+   for pid in 0..=5{assert_eq!(state.allows_input_request(number,pid),pid==1);}
+  }
+  assert!(!state.complete_sync(false));
+  assert!(state.allows_input_request(6,1));
+  assert!(state.allows_input_request(25,1));
+  assert!(state.allows_input_request(21,2));
+  assert!(state.complete_sync(true));
+  for number in [6,21,25]{
+   for pid in 0..=5{assert!(!state.allows_input_request(number,pid));}
+  }
+  // Shutdown still needs peer IPC and the compositor's final frame commit.
+  for number in [1,2,3,9,18,34,35,37]{
+   assert!(state.allows_input_request(number,1));
   }
  }
  #[cfg(feature="normal-desktop")]

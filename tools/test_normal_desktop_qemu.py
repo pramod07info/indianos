@@ -100,13 +100,17 @@ def text_field_bounds(image: tuple[int, int, bytes], field: str) -> tuple[int, i
     return x, y, count
 
 
-def verify_text_pixels(image: tuple[int, int, bytes], field: str, expected: str) -> None:
+def verify_text_pixels(image: tuple[int, int, bytes], field: str, expected: str,
+                       offset: tuple[int, int] = (0, 0)) -> None:
     """Require exact glyph pixels and cleared trailing cells in a fresh shot.
 
     Callers acquire the shot only after a fresh physical-key acknowledgement.
     Comparing just changed pixels or a SAVED label cannot prove file readback.
     """
     x, y, count = text_field_bounds(image, field)
+    x, y = x + offset[0], y + offset[1]
+    if x < 0 or y < 0 or x + count > image[0] or y + 14 > image[1]:
+        raise AssertionError("translated graphical text field exceeds framebuffer")
     if not expected or not expected.isascii() or len(expected) * 12 > count:
         raise AssertionError("unsupported graphical text expectation")
     text = expected.upper()
@@ -240,6 +244,90 @@ def physical_focus(session: QemuSession, previous: tuple[int, int], target: tupl
     return target
 
 
+def frame_region(image: tuple[int, int, bytes], bounds: tuple[int, int, int, int]) -> bytes:
+    width, height, pixels = image
+    left, top, right, bottom = bounds
+    if (len(pixels) != width * height * 3 or
+            not 0 <= left < right <= width or not 0 <= top < bottom <= height):
+        raise AssertionError("invalid framebuffer evidence region")
+    return b"".join(pixels[(y * width + left) * 3:(y * width + right) * 3]
+                    for y in range(top, bottom))
+
+
+def verify_minimize_restore(before: tuple[int, int, bytes], minimized: tuple[int, int, bytes],
+                            restored: tuple[int, int, bytes]) -> None:
+    if before[:2] != minimized[:2] or before[:2] != restored[:2]:
+        raise AssertionError("window lifecycle changed framebuffer dimensions")
+    width, height = before[:2]
+    # This client strip is outside Files, titlebars and the stationary pointer.
+    bounds = (width - 160, height - 180, width - 80, height - 100)
+    original = frame_region(before, bounds)
+    if frame_region(minimized, bounds) == original:
+        raise AssertionError("minimized Terminal still occupies its client region")
+    if frame_region(restored, bounds) != original:
+        raise AssertionError("restored Terminal did not recover its retained client pixels")
+
+
+def pointer_window_acceptance(session: QemuSession, folder: Path, index: int,
+                              initial: tuple[int, int, bytes]) -> None:
+    width, height = initial[:2]
+    expected = "HELLO INDIANOS" if index == 0 else PAYLOAD
+    physical_key(session, "2", "R031.1 user switched to Terminal app",
+                 folder, index, 20, initial, True)
+    # Capture Files' titlebar, move it, release, then move without a press.
+    # Exact translated file glyphs prove window movement rather than cursor
+    # repaint; their stable position after release proves capture ended.
+    physical_focus(session, (width // 2, height // 2), (100, 90), "Files")
+    session.hmp("mouse_button 1")
+    session.drain_serial(0.2)
+    session.hmp("mouse_move 40 20")
+    session.drain_serial(0.3)
+    session.hmp("mouse_button 0")
+    session.drain_serial(0.2)
+    moved = session.shot(folder / f"desktop-{index}-pointer-drag.ppm")
+    verify_text_pixels(moved, "files-note", expected, (40, 20))
+    session.hmp("mouse_move 40 40")
+    session.drain_serial(0.3)
+    released = session.shot(folder / f"desktop-{index}-pointer-release.ppm")
+    verify_text_pixels(released, "files-note", expected, (40, 20))
+    session.hmp("mouse_move -40 -40")
+    session.drain_serial(0.2)
+    session.hmp("mouse_button 1")
+    session.drain_serial(0.2)
+    session.hmp("mouse_move -40 -20")
+    session.drain_serial(0.3)
+    session.hmp("mouse_button 0")
+    session.drain_serial(0.2)
+    # Restore the initial pointer so subsequent focus tests have one known
+    # relative-coordinate origin, without bypassing the real mouse device.
+    session.hmp(f"mouse_move {width // 2 - 100} {height // 2 - 90}")
+    session.drain_serial(0.3)
+    restored = session.shot(folder / f"desktop-{index}-pointer-drag-restored.ppm")
+    verify_text_pixels(restored, "files-note", expected)
+    acknowledged_key(session, "2", "R031.1 user switched to Terminal app")
+    visible = session.shot(folder / f"desktop-{index}-before-minimize.ppm")
+    terminal_height = min(max(height * 50 // 100, 240), height - 110)
+    title = (width - 100, height - terminal_height - 50)
+    session.hmp(f"mouse_move {title[0] - width // 2} {title[1] - height // 2}")
+    session.drain_serial(0.2)
+    session.hmp("mouse_button 1")
+    session.drain_serial(0.2)
+    acknowledged_key(session, "m", "R031.1 Terminal minimized")
+    # Minimize cancels the captured title drag. A still-held motion cannot
+    # transfer that capture to Files or restore/move the hidden Terminal.
+    session.hmp("mouse_move 40 20")
+    session.drain_serial(0.3)
+    minimized = session.shot(folder / f"desktop-{index}-minimized.ppm")
+    verify_text_pixels(minimized, "files-note", expected)
+    session.hmp("mouse_button 0")
+    session.drain_serial(0.2)
+    acknowledged_key(session, "r", "R031.1 Terminal restored")
+    restored = session.shot(folder / f"desktop-{index}-restored.ppm")
+    verify_minimize_restore(visible, minimized, restored)
+    session.hmp(f"mouse_move {width // 2 - title[0] - 40} {height // 2 - title[1] - 20}")
+    session.drain_serial(0.3)
+
+
 def pointer_focus_acceptance(session: QemuSession, folder: Path, index: int,
                              editing: tuple[int, int, bytes]) -> tuple[int, int, bytes]:
     # Keep CAT pending while Files owns focus. An erroneously delivered Z
@@ -362,13 +450,18 @@ def boot(qemu: str, iso: Path, ovmf: Path, disk: Path, folder: Path, index: int)
         session.drain_serial(0.5)
         serial_frame = session.shot(folder / f"desktop-{index}-uart-negative.ppm")
         verify_uart_ignored(frame, serial_frame, bytes(session.output), serial_at)
+        pointer_window_acceptance(session, folder, index, frame)
+        # The window lifecycle scenario leaves Terminal active. Restore Files
+        # so each existing keyboard transition has an observable focus change.
+        acknowledged_key(session, "1", "R031.1 user switched to Files app")
+        frame = session.shot(folder / f"desktop-{index}-window-lifecycle-complete.ppm")
         actions = [("a", "R031.1 application launcher OPEN"),
                    ("a", "R031.1 application launcher CLOSED"),
                    ("2", "R031.1 user switched to Terminal app"),
                    ("1", "R031.1 user switched to Files app"),
                    ("2", "R031.1 user switched to Terminal app")]
         for step, (key, marker) in enumerate(actions):
-            frame = physical_key(session, key, marker, folder, index, step, frame, step == 0)
+            frame = physical_key(session, key, marker, folder, index, step, frame, False)
         acknowledged_key(session, "1", "R031.1 user switched to Files app")
         frame = session.shot(folder / f"desktop-{index}-files-focus.ppm")
         frame = physical_key(session, "2", "R031.1 user switched to Terminal app",

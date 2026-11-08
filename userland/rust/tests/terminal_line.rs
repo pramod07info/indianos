@@ -3,6 +3,21 @@ mod terminal_fs;
 #[path="../src/terminal_line.rs"]
 mod terminal_line;
 use terminal_line::{Action,Line,MAX_NOTE};
+#[test]fn integrity_loss_poison_survives_focus_loss_and_rejects_truncated_commands(){
+ for front in [1,2]{
+  let mut line=Line::new();
+  for &byte in b"write secret"{line.feed(byte);}
+  // Ordinary keys are focus-gated, but the broker forwards transport loss
+  // independently, even while this editor is suspended in Files.
+  assert_eq!(terminal_line::accepts_input(front,true,b'x'),front==2);
+  assert_eq!(line.feed(0),Action::Invalid);
+  for &byte in b"write injected"{line.feed(byte);}
+  assert_eq!(line.feed(b'\n'),Action::Invalid);
+  for &byte in b"write recovered"{line.feed(byte);}
+  let Action::Write{bytes,len}=line.feed(b'\n')else{panic!("failed to recover after loss")};
+  assert_eq!(&bytes[..len],b"recovered");
+ }
+}
 fn enter(line:&mut Line,bytes:&[u8])->Action{
  for &byte in bytes{line.feed(byte);}line.feed(b'\n')
 }

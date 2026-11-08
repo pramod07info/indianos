@@ -17,6 +17,22 @@ finally:
 
 
 class NormalDesktopControls(unittest.TestCase):
+    def test_minimize_requires_hidden_client_and_exact_restored_retained_pixels(self):
+        frame = (640, 480, bytes(640 * 480 * 3))
+        pixels = bytearray(frame[2])
+        at = (320 * 640 + 500) * 3
+        pixels[at:at + 3] = b"\xff\xff\xff"
+        hidden = (640, 480, bytes(pixels))
+        harness.verify_minimize_restore(frame, hidden, frame)
+        for minimized, restored in ((frame, frame), (hidden, hidden),
+                                     (hidden, (640, 480, b"truncated")),
+                                     ((800, 600, hidden[2]), frame)):
+            with self.subTest(minimized=minimized[:2]), self.assertRaises(AssertionError):
+                harness.verify_minimize_restore(frame, minimized, restored)
+        for bounds in ((-1, 0, 2, 2), (2, 2, 1, 3), (0, 0, 641, 1), (0, 0, 1, 481)):
+            with self.assertRaises(AssertionError):
+                harness.frame_region(frame, bounds)
+
     def test_suspended_editor_requires_fresh_exact_refusal_and_no_visual_change(self):
         frame = (640, 480, bytes(640 * 480 * 3))
         marker = b"IndianOS user: desktop Terminal editor suspended outside keyboard focus\n"
@@ -189,11 +205,12 @@ class NormalDesktopControls(unittest.TestCase):
         with self.assertRaises(AssertionError):
             harness.verify_failed_write(refusal, len(refusal))
 
-    def graphical_field(self, text="A", field="terminal"):
+    def graphical_field(self, text="A", field="terminal", offset=(0, 0)):
         width, height = 1024, 768
         pixels = bytearray([31, 50, 73]) * (width * height)
         frame = (width, height, pixels)
         x, y, _ = harness.text_field_bounds(frame, field)
+        x, y = x + offset[0], y + offset[1]
         # Independent pinned A glyph, sufficient for the oracle controls.
         rows_by_char = {
             "A": (14, 17, 17, 31, 17, 17, 17),
@@ -212,6 +229,15 @@ class NormalDesktopControls(unittest.TestCase):
                                 offset = ((y + row * 2 + dy) * width + x + index * 12 + column * 2 + dx) * 3
                                 pixels[offset:offset + 3] = b"\xff\xff\xff"
         return width, height, bytes(pixels)
+
+    def test_drag_requires_exact_glyph_translation_not_cursor_or_stale_content(self):
+        moved = self.graphical_field("A", "files-note", (40, 20))
+        harness.verify_text_pixels(moved, "files-note", "A", (40, 20))
+        for image, offset in ((moved, (0, 0)),
+                              (self.graphical_field("A", "files-note"), (40, 20)),
+                              (moved, (40, 21)), (moved, (2000, 0))):
+            with self.subTest(offset=offset), self.assertRaises(AssertionError):
+                harness.verify_text_pixels(image, "files-note", "A", offset)
 
     def test_graphical_readback_requires_exact_glyphs_and_cleared_trailing_cells(self):
         image = self.graphical_field()

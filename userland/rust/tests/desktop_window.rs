@@ -32,7 +32,7 @@ fn pointer(x:u16,y:u16,left:bool)->[u8;6]{[b'M',x as u8,(x>>8) as u8,y as u8,(y>
  let mut bad=initial();bad[14]=1;assert!(Manager::new(&bad).is_none());
 }
 #[test]fn explicit_policy_transitions_cancel_drag_until_a_new_physical_press(){
- for control in [&b"P1"[..],b"K1",b"K2",b"Km",b"Kr",b"Ka",b"Kh"]{
+ for control in [&[b'P',1][..],b"K1",b"K2",b"Km",b"Kr",b"Ka",b"Kh"]{
   let mut m=Manager::new(&initial()).unwrap();
   assert_eq!(m.control(&pointer(370,270,true)),Some(2));
   assert!(m.control(control).is_some());
@@ -42,7 +42,7 @@ fn pointer(x:u16,y:u16,left:bool)->[u8;6]{[b'M',x as u8,(x>>8) as u8,y as u8,(y>
   assert_eq!(m.front(),policy[12]);
  }
  let mut m=Manager::new(&initial()).unwrap();
- m.control(&pointer(370,270,true)).unwrap();m.control(b"P1").unwrap();
+ m.control(&pointer(370,270,true)).unwrap();m.control(&[b'P',1]).unwrap();
  m.control(&pointer(370,270,false)).unwrap();
  assert_eq!(m.control(&pointer(370,270,true)),Some(2));
  m.control(&pointer(400,300,true)).unwrap();

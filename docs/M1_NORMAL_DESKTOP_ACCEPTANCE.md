@@ -157,6 +157,29 @@ startup dispatch budget, because its startup receive treated an absent composito
 handshake as an immediate error. The blocking-startup-receive correction and
 new pointer/lifecycle checks require a fresh exact-revision CI run; this result
 does not close either high-level gate.
+
+Checklist position 10 physical-input acceptance now also captures Files by its
+titlebar using the real PS/2 mouse, drags it by 40 by 20 pixels, and requires the
+exact file-content glyphs at the translated position. Motion after release must
+leave those glyphs stationary; a second physical drag restores the initial
+geometry before the existing filesystem scenarios. The test then captures the
+Terminal titlebar, minimizes it with a physical key while the button remains
+held, and moves the pointer. Files must retain its original content position and
+Terminal must stay hidden. Release and restore must reproduce Terminal's retained
+client pixels in a region outside Files and the pointer. This exercises drag
+capture, release, capture cancellation and minimize/restore through actual
+guest IPC/policy/rendering rather than accepting cursor movement or log markers
+as proof of window behavior. Host negative controls reject untranslated glyphs,
+missing hiding, altered restored pixels, malformed regions and stale content.
+
+At `615c3ccc6cebd068bdb78296700fbe32ff5abe58`,
+[M1 run 42511425101](https://github.com/pramod07info/indianos/actions/runs/42511425101)
+passed all 32 harness controls, all 16 boot-profile controls and the combined
+regression job. Normal desktop QEMU was skipped because the window-policy host
+test `explicit_policy_transitions_cancel_drag_until_a_new_physical_press` failed
+at its accepted-control assertion (six other policy tests passed). A corrected
+production/test contract and the new physical scenarios require new exact-SHA
+CI evidence; positions 8–10 remain unaccepted here.
 See `M1_NAMESPACE_ADMISSION.md` and `M1_KERNEL_STACK_GUARDS.md` for limits.
 
 Run the combined normal-desktop workflow only after source integration. No new

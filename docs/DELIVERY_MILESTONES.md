@@ -68,11 +68,15 @@ Latest bounded implementation evidence: [normal startup and ownership
 integration](M1_MAJOR_INTEGRATION.md), [native Desktop boot selection](M1_NATIVE_DESKTOP_BOOT.md),
 [lifecycle verification](DESKTOP_LIFECYCLE_BOUNDARY.md) and
 [guarded command surfaces](M1_GUARDED_COMMAND_SURFACES.md). Checklist positions
-8–9 (G3/G4 in issue #616) remain **IN PROGRESS**: the normal four-service
+8–10 (G3/G4/G5 in issue #616) remain **IN PROGRESS**; see their consolidated
+[implementation and acceptance mapping](M1_GATES_8_10_ACCEPTANCE.md). The normal four-service
 desktop now has trusted build selection, kernel-verified readiness and durable
 shutdown, plus two private command payloads with guard mappings preserved on
 restart. The independent ring-3 compositor owns window policy; privileged
 clipping/rasterization and input hardware access remain kernel primitives.
+Physical-input delivery preserves mouse button edges, quarantines keyboard
+device overruns and invalidates suspended Terminal commands on transport loss.
+Raw input is restricted to the ready broker and withdrawn on shutdown arming.
 This batch adds source and positive/negative acceptance tests without local
 execution, as requested. Exact-head GitHub Actions, actual QEMU evidence and
 review are still required; no additional high-level M1 gate is accepted here.

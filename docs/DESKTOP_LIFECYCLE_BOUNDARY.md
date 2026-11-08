@@ -23,6 +23,16 @@ fence prevents a peer from dirtying the selected volume after the successful
 shutdown barrier. IPC, logging, compositor redraw and process exit remain usable
 to finish the shutdown handshake.
 
+Physical keyboard reads (syscall 6) and pointer polling (syscall 25) require the
+authenticated PID1 broker after verified readiness and before armed shutdown.
+Client event delivery (syscall 21) belongs only to Files/PID2 and Terminal/PID3,
+including their startup notifications, and is refused after arming. These
+admission checks precede port polling, event peek/acknowledgement and user
+copy-out. A refusal cannot consume physical input or acknowledge a queued
+client notification. Queue revocation remains part of trusted process
+retirement on both ordinary exit and rollback. Compositor frame commits and
+IPC shutdown acknowledgements remain usable after input delivery is withdrawn.
+
 Any critical service exit before shutdown is armed, including status zero,
 aborts the session. Faults and nonzero exits always abort. Restart permission is
 issued only by the existing verified authority retirement and frame rollback;
@@ -47,6 +57,9 @@ failed flush state, premature zero exits, fault/nonzero exits after arming,
 malformed syscall arguments and overlapping/overflowed surface layouts.
 Additional regression source covers every storage action at the armed fence,
 unknown action values, failed-sync behavior and shutdown dispatch exhaustion.
+Input regression source checks each principal before readiness, during a live
+session, after failed sync and after armed shutdown, plus malformed destinations
+and lengths that must fail before hardware or queue consumption.
 These tests were added without local execution at the user's request. Passing
 host tests alone would not establish working boot, flush durability, page-fault
 containment or hardware support; GitHub/QEMU acceptance remains required.

@@ -60,7 +60,7 @@ impl ScanDecoder{
     /// multi-byte state. The discarded byte never produces input.
     fn feed_transfer(&mut self,status:u8,code:u8)->Option<u8>{
         if status&1==0 || status&0x20!=0{return None;}
-        if !valid_keyboard_status(status){
+        if lost_keyboard_transfer(status,code){
             let caps=self.caps;
             *self=Self::default();
             self.caps=caps;
@@ -149,7 +149,7 @@ impl PhysicalDecoder{
     fn feed_transfer(&mut self,status:u8,code:u8)->Option<u8>{
         if status&1==0||status&0x20!=0{return None;}
         let byte=self.scan.feed_transfer(status,code);
-        if !valid_keyboard_status(status){
+        if lost_keyboard_transfer(status,code){
             if self.quarantined{return None;}
             self.quarantined=true;return Some(INPUT_LOST);
         }
@@ -194,6 +194,13 @@ fn mark_physical_key(byte:u8)->u8{
 /// Read only error-free set-1 bytes from the primary PS/2 controller port.
 fn valid_keyboard_status(status:u8)->bool{
     status&0x01!=0 && status&0xe0==0 // OBF, !AUX, !timeout, !parity
+}
+/// Set-1 devices report an overrun/key-detection error with 00 or FF even
+/// when the controller itself reports a clean transfer. A lost scan code can
+/// splice a command or strand a modifier, so this has the same cancellation
+/// contract as parity/timeout. AUX payload bytes are never keyboard errors.
+fn lost_keyboard_transfer(status:u8,code:u8)->bool{
+    status&0x21==0x01&&(!valid_keyboard_status(status)||matches!(code,0x00|0xff))
 }
 #[cfg(any(test,feature="test-irq-keyboard"))]
 const QUEUE_SIZE:usize=128;
@@ -565,6 +572,62 @@ mod tests{
             assert_eq!(decoder.feed_transfer(1,0x1c),Some(b'\n'));
             assert_eq!(decoder.feed_transfer(1,0x1e),Some(b'a'));
         }
+    }
+    #[test]
+    fn device_overrun_cancels_partial_commands_and_requires_a_fresh_delimiter(){
+        for overrun in [0x00,0xff]{
+            let mut decoder=PhysicalDecoder::new();
+            for code in [0x11,0x13,0x17]{
+                assert!(decoder.feed_transfer(1,code).is_some()); // "wri"
+            }
+            assert_eq!(decoder.feed_transfer(1,overrun),Some(INPUT_LOST));
+            assert_eq!(decoder.feed_transfer(1,overrun),None); // one marker per loss episode
+            for code in [0x14,0x12,0x39,0x10,0x0e,0x0f]{
+                assert_eq!(decoder.feed_transfer(1,code),None);
+            }
+            assert_eq!(decoder.feed_transfer(1,0x1d),None);
+            assert_eq!(decoder.feed_transfer(1,0x1c),None); // Ctrl+Enter is not recovery
+            assert_eq!(decoder.feed_transfer(1,0x9d),None);
+            assert_eq!(decoder.feed_transfer(1,0x1c),Some(b'\n'));
+            assert_eq!(decoder.feed_transfer(1,0x1e),Some(b'a'));
+            assert_eq!(decoder.feed_transfer(1,overrun),Some(INPUT_LOST));
+        }
+    }
+    #[test]
+    fn device_error_resets_held_and_multibyte_state_but_preserves_caps_lock(){
+        for overrun in [0x00,0xff]{
+            for prefix in [0x2a,0x36,0x1d,0x38,0xe0,0xe1]{
+                let mut decoder=PhysicalDecoder::new();
+                assert_eq!(decoder.feed_transfer(1,0x3a),None);
+                assert_eq!(decoder.feed_transfer(1,prefix),None);
+                assert_eq!(decoder.feed_transfer(1,overrun),Some(INPUT_LOST));
+                assert_eq!(decoder.feed_transfer(1,0x1c),Some(b'\n'));
+                assert_eq!(decoder.feed_transfer(1,0x1e),Some(b'A'));
+                // Lost CapsLock break cannot suppress the next genuine toggle.
+                assert_eq!(decoder.feed_transfer(1,0x3a),None);
+                assert_eq!(decoder.feed_transfer(1,0x1e),Some(b'a'));
+            }
+        }
+    }
+    #[test]
+    fn device_error_classification_preserves_auxiliary_ownership(){
+        for status in 0u8..=u8::MAX{
+            for overrun in [0x00,0xff]{
+                assert_eq!(lost_keyboard_transfer(status,overrun),status&0x21==1);
+                if status&0x21!=1{
+                    let mut decoder=PhysicalDecoder::new();
+                    assert_eq!(decoder.feed_transfer(1,0x2a),None);
+                    assert_eq!(decoder.feed_transfer(status,overrun),None);
+                    assert_eq!(decoder.feed_transfer(1,0x1e),Some(b'A'));
+                }
+            }
+        }
+        // A valid Shift break shares the keyboard BAT-success byte; it is not
+        // an overrun and must retain its ordinary Set-1 interpretation.
+        let mut decoder=PhysicalDecoder::new();
+        assert_eq!(decoder.feed_transfer(1,0x2a),None);
+        assert_eq!(decoder.feed_transfer(1,0xaa),None);
+        assert_eq!(decoder.feed_transfer(1,0x1e),Some(b'a'));
     }
     #[test]
     fn auxiliary_or_empty_transfers_cannot_poison_or_end_keyboard_quarantine(){
