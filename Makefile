@@ -134,6 +134,53 @@ RUST_BOOT_PROTOCOL ?= $(RUST_CORE)
 RUST_INTERRUPTS ?= $(RUST_CORE)
 RUST_TIMER ?= $(RUST_CORE)
 RUST_MAIN ?= $(RUST_CORE)
+DESKTOP_SESSION ?= 0
+# Explicit trusted initramfs selection, never an implicit disk/partition pick.
+DESKTOP_VOLUME_CONFIG ?=
+# A trusted Desktop selection opts the ordinary product build into Desktop.
+# Existing unconfigured console/test invocations retain their established mode.
+EDITION ?= auto
+ifneq ($(filter-out auto desktop console,$(EDITION)),)
+$(error EDITION must be exactly auto, desktop or console)
+endif
+ifneq ($(words $(EDITION)),1)
+$(error EDITION must be exactly auto, desktop or console)
+endif
+ifeq ($(EDITION),desktop)
+ifeq ($(origin DESKTOP_SESSION),command line)
+ifneq ($(DESKTOP_SESSION),1)
+$(error EDITION=desktop conflicts with DESKTOP_SESSION=$(DESKTOP_SESSION))
+endif
+endif
+override DESKTOP_SESSION := 1
+else ifeq ($(EDITION),console)
+ifeq ($(DESKTOP_SESSION),1)
+$(error EDITION=console conflicts with DESKTOP_SESSION=1)
+endif
+override DESKTOP_SESSION := 0
+else ifneq ($(strip $(DESKTOP_VOLUME_CONFIG)),)
+ifeq ($(origin DESKTOP_SESSION),command line)
+ifneq ($(DESKTOP_SESSION),1)
+$(error EDITION=auto with DESKTOP_VOLUME_CONFIG requires DESKTOP_SESSION=1; use EDITION=console for an explicit console build)
+endif
+endif
+override DESKTOP_SESSION := 1
+endif
+ifeq ($(DESKTOP_SESSION),1)
+ifeq ($(strip $(DESKTOP_VOLUME_CONFIG)),)
+$(error DESKTOP_SESSION requires DESKTOP_VOLUME_CONFIG; no disk selection is invented)
+endif
+ifneq ($(words $(DESKTOP_VOLUME_CONFIG)),1)
+$(error DESKTOP_VOLUME_CONFIG must be one whitespace-free selection-file path)
+endif
+RESOLVED_EDITION := desktop
+else
+RESOLVED_EDITION := console
+endif
+# The dedicated product target also retains its own output tree.
+DESKTOP_BUILD ?= build/desktop-edition
+BOOT_CONFIG ?= $(if $(filter desktop,$(RESOLVED_EDITION)),boot/limine-desktop.conf,boot/limine.conf)
+BOOT_PROFILE := $(BUILD)/boot-profile.state
 ifeq ($(RUST_MAIN),1)
 ifneq ($(RUST_CORE),1)
 $(error RUST_MAIN requires RUST_CORE=1)
@@ -323,6 +370,28 @@ LDFLAGS := -target x86_64-unknown-none-elf -fuse-ld=lld -nostdlib -static \
 .PHONY: test-r026-interactive-qemu test-r025-complete-qemu test-rust-ipc-qemu test-rust-keyboard-host test-rust-keyboard-qemu test-rust-interactive-host test-rust-interactive-qemu test-rust-shell-host test-rust-shell-qemu test-rust-hardening test-rust-entry-abi test-rust-link-audit test-rust-source-audit-negative test-rust-source-audit test-rust-default-qemu test-rust-tools test-rust-userland-qemu test-rust-interrupts-qemu test-rust-boot-qemu test-rust-vmm-host test-rust-vmm-qemu test-rust-pmm-host test-rust-pmm-qemu test-rust-user-image-host test-rust-user-image-qemu test-rust-paging-host test-rust-paging-qemu test-rust-runtime-host test-rust-runtime-qemu test-rust-boot-staging-qemu test-rust-host-abi test-rust-processes test-rust-scheduler rust-core all kernel user-elf test-user-elf test-ring3-elf initramfs test-initramfs image run run-bios test-boot test-exception test-pagefault test-shadow test-usermode test-userfault-supervisor test-userfault-guard test-processes test-scheduler test-preempt test-host toolchain-check clean
 all: image
 kernel: $(KERNEL_ELF)
+
+# Command-line personality changes are otherwise invisible to Make's timestamp
+# graph. Record the personality inputs before reusing kernel/userland/archive
+# files; changing edition in one BUILD must not reuse the previous console ELF.
+profile_quote = '$(subst ','"'"',$(1))'
+.PHONY: force-boot-profile
+force-boot-profile:
+$(BOOT_PROFILE): force-boot-profile
+	@mkdir -p $(@D)
+	@printf '%s\n' $(call profile_quote,edition=$(RESOLVED_EDITION)) \
+	    $(call profile_quote,selection=$(DESKTOP_VOLUME_CONFIG)) \
+	    $(call profile_quote,boot=$(BOOT_CONFIG)) \
+	    $(call profile_quote,rust=$(RUST_FEATURES)) \
+	    $(call profile_quote,core=$(RUST_CORE) userland=$(RUST_USERLAND) tools=$(RUST_TOOLS)) \
+	    $(call profile_quote,objects=$(OBJECTS)) \
+	    $(call profile_quote,init=$(RUST_INIT_FEATURE)) \
+	    $(call profile_quote,files=$(RUST_WORKER_FEATURE)) \
+	    $(call profile_quote,terminal=$(RUST_THIRD_FEATURE)) \
+	    $(call profile_quote,cflags=$(CFLAGS)) \
+	    $(call profile_quote,ldflags=$(LDFLAGS)) > "$@.tmp"
+	@cmp -s "$@.tmp" "$@" || mv "$@.tmp" "$@"
+	@rm -f "$@.tmp"
 
 # Freestanding Rust: no_std, no allocator and no crates.io dependencies.
 # A separate Cargo output root is used per build variant. RUST_LIB is last
@@ -721,11 +790,41 @@ THIRD_ELF := $(BUILD)/userland/terminal.elf
 INITRAMFS_EXTRA_DEPS += $(THIRD_ELF)
 INITRAMFS_EXTRA_ARGS += --extra2-elf $(THIRD_ELF) --extra2-name /bin/terminal
 endif
+ifeq ($(DESKTOP_SESSION),1)
+# GNU Make command-line and -e environment variables supersede ordinary :=/+=
+# assignments. Refuse overrides of derived product inputs rather than reporting
+# Desktop while building console services or silently omitting its trusted pin.
+DESKTOP_DERIVED_OPTIONS := RUST_FEATURES RUST_INIT_FEATURE RUST_WORKER_FEATURE \
+    RUST_THIRD_FEATURE INITRAMFS_EXTRA_ARGS INITRAMFS_EXTRA_DEPS
+$(foreach option,$(DESKTOP_DERIVED_OPTIONS),$(if $(filter-out file undefined,$(origin $(option))),$(error DESKTOP_SESSION derives $(option); configure EDITION and documented native options instead)))
+DESKTOP_NATIVE_OPTIONS := RUST_CORE RUST_USERLAND RUST_TOOLS RUST_MAIN \
+    RUST_USER_RUNTIME RUST_CPU_ENTRY RUST_BOOT RUST_BOOT_PROTOCOL \
+    RUST_PAGING RUST_PAGING_CPU RUST_INTERRUPTS RUST_TIMER RUST_PMM \
+    RUST_VMM RUST_USER_IMAGE RUST_RUNTIME RUST_BOOT_STAGING
+$(foreach option,$(DESKTOP_NATIVE_OPTIONS),$(if $(filter-out x1,x$($(option))),$(error DESKTOP_SESSION requires $(option)=1)))
+ifneq ($(strip $(filter test-%,$(RUST_FEATURES))),)
+$(error DESKTOP_SESSION cannot be combined with experimental test profiles)
+endif
+RUST_FEATURES += --features normal-desktop
+THIRD_ELF := $(BUILD)/userland/terminal.elf
+FOURTH_ELF := $(BUILD)/userland/compositor.elf
+INITRAMFS_EXTRA_DEPS := $(WORKER_ELF) $(THIRD_ELF) $(FOURTH_ELF) $(DESKTOP_VOLUME_CONFIG)
+INITRAMFS_EXTRA_ARGS := --extra-elf $(WORKER_ELF) --extra-name /bin/files \
+    --extra2-elf $(THIRD_ELF) --extra2-name /bin/terminal \
+    --extra3-elf $(FOURTH_ELF) --extra3-name /bin/compositor
+ifneq ($(strip $(DESKTOP_VOLUME_CONFIG)),)
+INITRAMFS_EXTRA_ARGS += --extra4-elf $(DESKTOP_VOLUME_CONFIG) --extra4-name /etc/desktop-volume
+endif
+endif
 
 ifeq ($(RUST_USERLAND),1)
 # Identical expected serial messages and syscall ABI; no C/assembly
 # objects are linked into the Rust native user executable.
-ifeq ($(R030_PACKAGE_V1),1)
+ifeq ($(DESKTOP_SESSION),1)
+RUST_INIT_FEATURE := desktop-init
+RUST_WORKER_FEATURE := desktop-files
+RUST_THIRD_FEATURE := desktop-terminal
+else ifeq ($(R030_PACKAGE_V1),1)
 RUST_INIT_FEATURE := r030-demo-v1
 else ifeq ($(R030_PACKAGE_V2),1)
 RUST_INIT_FEATURE := r030-demo-v2
@@ -811,7 +910,7 @@ $(USER_ELF): $(wildcard userland/rust/src/*.rs) userland/rust/Cargo.toml userlan
 	cp $(BUILD)/rust-user-init-target/x86_64-unknown-none/release/indianos-user $@
 	@readelf -h $@ | grep -q 'Type:.*EXEC'
 
-ifeq ($(R029_DESKTOP_SUITE_TEST),1)
+ifneq ($(filter 1,$(R029_DESKTOP_SUITE_TEST) $(DESKTOP_SESSION)),)
 $(THIRD_ELF): $(wildcard userland/rust/src/*.rs) userland/rust/Cargo.toml userland/rust/Cargo.lock userland/demo/linker.ld Makefile
 	@mkdir -p $(@D)
 	CARGO_TARGET_DIR=$(BUILD)/rust-user-third-target \
@@ -820,6 +919,18 @@ $(THIRD_ELF): $(wildcard userland/rust/src/*.rs) userland/rust/Cargo.toml userla
 	    --target x86_64-unknown-none --release --offline --no-default-features \
 	    --features $(RUST_THIRD_FEATURE)
 	cp $(BUILD)/rust-user-third-target/x86_64-unknown-none/release/indianos-user $@
+	@readelf -h $@ | grep -q 'Type:.*EXEC'
+endif
+
+ifeq ($(DESKTOP_SESSION),1)
+$(FOURTH_ELF): $(wildcard userland/rust/src/*.rs) userland/rust/Cargo.toml userland/rust/Cargo.lock userland/demo/linker.ld Makefile
+	@mkdir -p $(@D)
+	CARGO_TARGET_DIR=$(BUILD)/rust-user-compositor-target \
+	    RUSTFLAGS="$(RUST_APP_FLAGS)" \
+	    $(CARGO) build --manifest-path userland/rust/Cargo.toml \
+	    --target x86_64-unknown-none --release --offline --no-default-features \
+	    --features desktop-compositor
+	cp $(BUILD)/rust-user-compositor-target/x86_64-unknown-none/release/indianos-user $@
 	@readelf -h $@ | grep -q 'Type:.*EXEC'
 endif
 
@@ -921,6 +1032,19 @@ endif
 
 initramfs: $(INITRAMFS)
 
+# Append these after source prerequisites so recipes using $< retain their source.
+$(OBJECTS) $(KERNEL_ELF) $(USER_OBJ) $(WORKER_OBJ) $(USER_ELF) $(WORKER_ELF) $(THIRD_ELF) $(FOURTH_ELF) $(INITRAMFS) $(ISO): $(BOOT_PROFILE)
+
+ifeq ($(DESKTOP_SESSION),1)
+# Run once per invocation before native compilation, including generic image.
+# The host validator never chooses, formats or repairs any storage device.
+.PHONY: desktop-volume-preflight
+desktop-volume-preflight:
+	$(CARGO) run --locked --offline --release --manifest-path tools/rust/Cargo.toml --features desktop-volume --bin indianos-desktop-volume -- --check-selection $(call profile_quote,$(DESKTOP_VOLUME_CONFIG))
+
+$(OBJECTS) $(KERNEL_ELF) $(USER_ELF) $(WORKER_ELF) $(THIRD_ELF) $(FOURTH_ELF) $(INITRAMFS) $(ISO): | desktop-volume-preflight
+endif
+
 $(BUILD)/inspect_archive: tests/inspect_archive.c kernel/src/initramfs.c kernel/src/program.c $(HEADERS) Makefile
 	@mkdir -p $(@D)
 	$(CC) -std=c11 -O2 -g -Wall -Wextra -Werror -I kernel/include \
@@ -951,13 +1075,13 @@ $(LIMINE_BINARY)/limine.c: $(LIMINE_TARBALL)
 $(LIMINE_BINARY)/limine: $(LIMINE_BINARY)/limine.c
 	$(MAKE) -C $(LIMINE_BINARY) limine
 
-$(ISO): $(KERNEL_ELF) $(INITRAMFS) $(LIMINE_BINARY)/limine boot/limine.conf
+$(ISO): $(KERNEL_ELF) $(INITRAMFS) $(LIMINE_BINARY)/limine $(BOOT_CONFIG)
 	@command -v xorriso >/dev/null || (echo 'Missing xorriso: install package xorriso' >&2; exit 1)
 	@rm -rf $(ISO_ROOT)
 	@mkdir -p $(ISO_ROOT)/boot/limine $(ISO_ROOT)/EFI/BOOT
 	@cp $(KERNEL_ELF) $(ISO_ROOT)/boot/indianos.elf
 	@cp $(INITRAMFS) $(ISO_ROOT)/boot/initramfs.img
-	@cp boot/limine.conf $(ISO_ROOT)/boot/limine/limine.conf
+	@cp $(BOOT_CONFIG) $(ISO_ROOT)/boot/limine/limine.conf
 	@cp $(LIMINE_BINARY)/limine-bios.sys $(LIMINE_BINARY)/limine-bios-cd.bin \
 	    $(LIMINE_BINARY)/limine-uefi-cd.bin $(ISO_ROOT)/boot/limine/
 	@cp $(LIMINE_BINARY)/BOOTX64.EFI $(ISO_ROOT)/EFI/BOOT/
@@ -969,6 +1093,14 @@ $(ISO): $(KERNEL_ELF) $(INITRAMFS) $(LIMINE_BINARY)/limine boot/limine.conf
 	@echo 'Bootable image: $(ISO) (EMULATOR TESTING ONLY)'
 
 image: $(ISO)
+
+# Validate before entering the recursive compilation. A Desktop image can never
+# silently omit its selection and fall back to the console personality.
+.PHONY: desktop-image
+desktop-image:
+	@test "$(EDITION)" != console || (echo 'desktop-image conflicts with EDITION=console' >&2; exit 1)
+	@test -n "$(DESKTOP_VOLUME_CONFIG)" || (echo 'desktop-image requires DESKTOP_VOLUME_CONFIG=/absolute/path/selection.bin' >&2; exit 1)
+	$(MAKE) image BUILD=$(call profile_quote,$(DESKTOP_BUILD)) EDITION=desktop DESKTOP_SESSION=1 DESKTOP_VOLUME_CONFIG=$(call profile_quote,$(abspath $(DESKTOP_VOLUME_CONFIG))) BOOT_CONFIG=boot/limine-desktop.conf
 
 run: $(ISO)
 	@test -f "$(OVMF_CODE)" || (echo 'Cannot find OVMF firmware; set OVMF_CODE=/path/to/OVMF_CODE*.fd' >&2; exit 1)

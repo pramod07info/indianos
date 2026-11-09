@@ -7,12 +7,18 @@
 use core::{arch::asm, ffi::c_char, mem::{size_of}, ptr};
 
 const TRAP_COUNT:usize=5;
-#[cfg(feature="test-r031-supervisor")]
+#[cfg(any(feature="test-r031-supervisor",feature="normal-desktop"))]
 const USER_STACK_COUNT:usize=4;
-#[cfg(all(feature="test-r029-desktop-suite",not(feature="test-r031-supervisor")))]
+#[cfg(all(feature="test-r029-desktop-suite",not(any(feature="test-r031-supervisor",feature="normal-desktop"))))]
 const USER_STACK_COUNT:usize=3;
-#[cfg(not(feature="test-r029-desktop-suite"))]
+#[cfg(not(any(feature="test-r029-desktop-suite",feature="normal-desktop")))]
 const USER_STACK_COUNT:usize=2;
+// The selected-volume syscall validates both GPT copies and COW heads before
+// publishing. Its bounded nested stack frames exceed the old demo's 32 KiB
+// budget (real QEMU save faulted while pushing an ATA call return address).
+#[cfg(feature="normal-desktop")]
+const STACK_BYTES:usize=128*1024;
+#[cfg(not(feature="normal-desktop"))]
 const STACK_BYTES:usize=32768;
 const DF_STACK_BYTES:usize=16384;
 const CODE:u16=0x08;
@@ -64,29 +70,57 @@ struct AlignedGdt([u64;7]);
 struct AlignedIdt([IdtGate;256]);
 #[repr(C,align(16))]
 struct AlignedTss(Tss);
-#[repr(C,align(16))]
-struct AlignedStack<const SIZE:usize>([u8;SIZE]);
+#[repr(C)]
+#[cfg_attr(feature="normal-desktop",repr(align(4096)))]
+#[cfg_attr(not(feature="normal-desktop"),repr(align(16)))]
+struct AlignedStack<const SIZE:usize>{
+    #[cfg(feature="normal-desktop")]
+    guard:[u8;4096],
+    bytes:[u8;SIZE],
+}
+impl<const SIZE:usize> AlignedStack<SIZE>{
+    const fn zero()->Self{Self{
+        #[cfg(feature="normal-desktop")]
+        guard:[0;4096],bytes:[0;SIZE],
+    }}
+}
 static mut GDT:AlignedGdt=AlignedGdt([
     0,0x00af9a000000ffff,0x00cf92000000ffff,0,0,
     0x00affa000000ffff,0x00cff2000000ffff
 ]);
 static mut IDT:AlignedIdt=AlignedIdt([IdtGate::zero();256]);
 static mut TSS:AlignedTss=AlignedTss(Tss::empty());
-static mut DF_STACK:AlignedStack<DF_STACK_BYTES>=AlignedStack([0;DF_STACK_BYTES]);
-#[cfg(not(feature="test-r029-desktop-suite"))]
+static mut DF_STACK:AlignedStack<DF_STACK_BYTES>=AlignedStack::zero();
+#[cfg(not(any(feature="test-r029-desktop-suite",feature="normal-desktop")))]
 static mut USER_STACKS:[AlignedStack<STACK_BYTES>;USER_STACK_COUNT]=[
-    AlignedStack([0;STACK_BYTES]),AlignedStack([0;STACK_BYTES])
+    AlignedStack::zero(),AlignedStack::zero()
 ];
-#[cfg(all(feature="test-r029-desktop-suite",not(feature="test-r031-supervisor")))]
+#[cfg(all(feature="test-r029-desktop-suite",not(any(feature="test-r031-supervisor",feature="normal-desktop"))))]
 static mut USER_STACKS:[AlignedStack<STACK_BYTES>;USER_STACK_COUNT]=[
-    AlignedStack([0;STACK_BYTES]),AlignedStack([0;STACK_BYTES]),
-    AlignedStack([0;STACK_BYTES])
+    AlignedStack::zero(),AlignedStack::zero(),AlignedStack::zero()
 ];
-#[cfg(feature="test-r031-supervisor")]
+#[cfg(any(feature="test-r031-supervisor",feature="normal-desktop"))]
 static mut USER_STACKS:[AlignedStack<STACK_BYTES>;USER_STACK_COUNT]=[
-    AlignedStack([0;STACK_BYTES]),AlignedStack([0;STACK_BYTES]),
-    AlignedStack([0;STACK_BYTES]),AlignedStack([0;STACK_BYTES])
+    AlignedStack::zero(),AlignedStack::zero(),
+    AlignedStack::zero(),AlignedStack::zero()
 ];
+
+/// Guard, usable beginning and exclusive top for the dedicated double-fault
+/// stack and each ring-3 trap stack. Only the normal desktop layout reserves
+/// these pages; the runtime must unmap them before any user-root clone.
+#[cfg(feature="normal-desktop")]
+pub(crate) fn kernel_stack_layout()->[(u64,u64,u64);5]{
+    let mut result=[(0,0,0);5];
+    let base=unsafe{ptr::addr_of!(DF_STACK)} as usize as u64;
+    result[0]=(base,base+4096,base+size_of::<AlignedStack<DF_STACK_BYTES>>() as u64);
+    let base=unsafe{ptr::addr_of!(USER_STACKS)} as usize as u64;
+    let stride=size_of::<AlignedStack<STACK_BYTES>>() as u64;
+    for slot in 0..USER_STACK_COUNT{
+        let guard=base+slot as u64*stride;
+        result[slot+1]=(guard,guard+4096,guard+stride);
+    }
+    result
+}
 
 unsafe extern "C" {
     fn x86_64_load_gdt(descriptor:*const DescriptorPtr);
@@ -122,7 +156,7 @@ fn tss_descriptor(base:u64,limit:u64)->u64{
 #[no_mangle]
 pub unsafe extern "C" fn x86_64_exceptions_init()->bool{
     let tss=unsafe {ptr::addr_of_mut!(TSS.0)};
-    let df_top=(unsafe {ptr::addr_of!(DF_STACK.0)} as usize)+DF_STACK_BYTES;
+    let df_top=unsafe{ptr::addr_of!(DF_STACK)} as usize+size_of::<AlignedStack<DF_STACK_BYTES>>();
     unsafe{
         ptr::write_unaligned(ptr::addr_of_mut!((*tss).ist1),df_top as u64);
         ptr::write_unaligned(ptr::addr_of_mut!((*tss).iomap_base),size_of::<Tss>() as u16);
@@ -240,6 +274,41 @@ pub unsafe extern "C" fn x86_64_exception_dispatch(context:*const ExceptionConte
 #[cfg(test)]
 mod tests{
     use super::*;
+    #[cfg(feature="normal-desktop")]
+    #[test]
+    fn four_desktop_processes_select_distinct_owned_trap_stacks(){
+        let layout=kernel_stack_layout();
+        for (slot,(guard,begin,end)) in layout.iter().copied().enumerate(){
+            assert_eq!(guard&4095,0);
+            assert_eq!(begin,guard+4096);
+            assert_eq!(end-begin,if slot==0{DF_STACK_BYTES}else{STACK_BYTES} as u64);
+            assert_eq!(end&4095,0);
+        }
+        struct Restore{rsp:u64,ist:u64}
+        impl Drop for Restore{fn drop(&mut self){unsafe{
+            let tss=ptr::addr_of_mut!(TSS.0);
+            ptr::write_unaligned(ptr::addr_of_mut!((*tss).rsp0),self.rsp);
+            ptr::write_unaligned(ptr::addr_of_mut!((*tss).ist1),self.ist);
+        }}}
+        unsafe{
+            let tss=ptr::addr_of_mut!(TSS.0);
+            let _restore=Restore{rsp:ptr::read_unaligned(ptr::addr_of!((*tss).rsp0)),
+                ist:ptr::read_unaligned(ptr::addr_of!((*tss).ist1))};
+            // Only metadata is exercised; the host never loads TR or IDTR.
+            ptr::write_unaligned(ptr::addr_of_mut!((*tss).ist1),0x8000);
+            let mut tops=[0u64;4];
+            for slot in 0..4{
+                assert!(x86_64_user_interrupt_stack_select(slot));
+                tops[slot as usize]=ptr::read_unaligned(ptr::addr_of!((*tss).rsp0));
+                assert_eq!(tops[slot as usize],layout[slot as usize+1].2);
+            }
+            for pair in tops.windows(2){
+                assert_eq!(pair[1]-pair[0],size_of::<AlignedStack<STACK_BYTES>>() as u64);
+            }
+            assert!(!x86_64_user_interrupt_stack_select(4));
+            assert_eq!(ptr::read_unaligned(ptr::addr_of!((*tss).rsp0)),tops[3]);
+        }
+    }
     #[test]
     fn cpu_layout_is_compatible(){
         assert_eq!(size_of::<Tss>(),104);

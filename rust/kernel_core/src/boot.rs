@@ -208,7 +208,7 @@ pub unsafe extern "C" fn boot_draw_status(){
 }
 /// An optional and bounded framebuffer view for the R014.2 VGA console.
 /// This view borrows Limine framebuffer mappings for the lifetime of boot.
-#[cfg(any(feature="test-irq-keyboard",feature="test-r029-desktop"))]
+#[cfg(any(feature="test-irq-keyboard",feature="test-r029-desktop",feature="normal-desktop"))]
 pub(crate) struct ConsoleFramebuffer {
     pub address:*mut u8,
     pub width:usize,
@@ -217,7 +217,7 @@ pub(crate) struct ConsoleFramebuffer {
     pub fg:u32,
     pub bg:u32,
 }
-#[cfg(any(feature="test-irq-keyboard",feature="test-r029-desktop"))]
+#[cfg(any(feature="test-irq-keyboard",feature="test-r029-desktop",feature="normal-desktop"))]
 pub(crate) fn console_framebuffer()->Option<ConsoleFramebuffer>{
     let resp=unsafe{boot_limine_framebuffers().as_ref()}?;
     if resp.count==0||resp.framebuffers.is_null(){return None;}
@@ -231,7 +231,7 @@ pub(crate) fn console_framebuffer()->Option<ConsoleFramebuffer>{
     })
 }
 
-#[cfg(feature="test-r029-desktop")]
+#[cfg(any(feature="test-r029-desktop",feature="normal-desktop"))]
 pub(crate) fn desktop_rgb(r:u8,g:u8,b:u8)->Option<u32>{
     let resp=unsafe{boot_limine_framebuffers().as_ref()}?;
     if resp.count==0||resp.framebuffers.is_null(){return None;}

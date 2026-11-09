@@ -128,13 +128,11 @@ impl Mouse{
         let [flags,x,y]=self.packet;
         self.packet=[0;3]; // discard stale packet bytes after every frame
         if flags&0xc0!=0{return None;} // overflow: ignore entire packet.
-        // Standard PS/2 packet sign flags must agree with the high bit of
-        // their respective motion bytes. An inconsistent frame cannot
-        // produce a forged jump or a button transition in the desktop.
-        if ((x&0x80!=0)!=(flags&0x10!=0)) ||
-           ((y&0x80!=0)!=(flags&0x20!=0)){
-            return None;
-        }
+        // The sign flags are the ninth bits of signed motion counters,
+        // not redundant copies of payload bit 7. For example 0x80 with
+        // X-sign clear is +128, while 0x01 with X-sign set is -255.
+        // Overflow flags above still reject an unrepresentable packet;
+        // the desktop clips all accepted coordinates to its framebuffer.
         let dx=if flags&0x10!=0{(x as i16)-256}else{x as i16};
         let dy=if flags&0x20!=0{(y as i16)-256}else{y as i16};
         let left=flags&1!=0;
@@ -209,14 +207,15 @@ mod tests{
     }
 
     #[test]
-    fn m1_r088_mouse_rejects_inconsistent_signs_before_button_update(){
+    fn m1_r088_mouse_accepts_ninth_sign_bits_independent_of_payload_high_bit(){
         let mut mouse=Mouse{packet:[0;3],received:0,last_left:false};
-        for [header,x,y] in [[0x09,0x80,0],[0x19,0x01,0],
-                             [0x09,0,0x80],[0x29,0,0x01]]{
+        for ([header,x,y],dx,dy) in [([0x09,0x80,0],128,0),
+             ([0x19,0x01,0],-255,0),([0x09,0,0x80],0,128),
+             ([0x29,0,0x01],0,-255)]{
             assert_eq!(mouse.feed(header),None);
             assert_eq!(mouse.feed(x),None);
-            assert_eq!(mouse.feed(y),None);
-            assert!(!mouse.last_left);
+            assert_eq!(mouse.feed(y),Some(Packet{dx,dy,left:true}));
+            assert!(mouse.last_left);
             assert_eq!(mouse.received,0);
             assert_eq!(mouse.packet,[0;3]);
         }
@@ -224,6 +223,39 @@ mod tests{
         assert_eq!(mouse.feed(1),None);
         assert_eq!(mouse.feed(2),Some(Packet{dx:1,dy:2,left:true}));
         assert!(mouse.last_left);
+    }
+    #[test]
+    fn m1_r088_mouse_exhausts_all_nine_bit_motion_values_and_button_states(){
+        let mut mouse=Mouse{packet:[0;3],received:0,last_left:false};
+        for value in 0u16..512{
+            let other=511-value;
+            let left=value&1!=0;
+            let flags=8|if value&256!=0{0x10}else{0}|
+                if other&256!=0{0x20}else{0}|u8::from(left);
+            assert_eq!(mouse.feed(flags),None);
+            assert_eq!(mouse.feed(value as u8),None);
+            let signed=|v:u16|if v&256!=0{v as i16-512}else{v as i16};
+            assert_eq!(mouse.feed(other as u8),Some(Packet{
+                dx:signed(value),dy:signed(other),left}));
+            assert_eq!(mouse.last_left,left);
+            assert_eq!(mouse.packet,[0;3]);assert_eq!(mouse.received,0);
+        }
+    }
+    #[test]
+    fn m1_r088_mouse_overflow_cannot_release_a_button_or_leak_partial_motion(){
+        let mut mouse=Mouse{packet:[0;3],received:0,last_left:true};
+        for overflow in [0x40,0x80,0xc0]{
+            for signs in [0,0x10,0x20,0x30]{
+                assert_eq!(mouse.feed(8|overflow|signs),None);
+                assert_eq!(mouse.feed(255),None);assert_eq!(mouse.feed(1),None);
+                assert!(mouse.last_left);assert_eq!(mouse.packet,[0;3]);
+                assert_eq!(mouse.received,0);
+            }
+        }
+        // A clean packet after all rejected overflows releases the button.
+        assert_eq!(mouse.feed(8),None);assert_eq!(mouse.feed(255),None);
+        assert_eq!(mouse.feed(128),Some(Packet{dx:255,dy:128,left:false}));
+        assert!(!mouse.last_left);
     }
     #[test]
     fn m1_r088_mouse_valid_negative_axes_and_overflow_resynchronize(){

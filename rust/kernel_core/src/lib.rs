@@ -8,6 +8,25 @@
 #![cfg_attr(not(any(test, feature = "std")), no_std)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
+// A production desktop cannot inherit console UART ingress or experimental
+// disk provisioning through a manually combined Cargo personality.
+#[cfg(all(feature="normal-desktop",any(feature="normal-init",
+    feature="test-r031-files-gui",feature="test-r031-boot-desktop",
+    feature="test-r031-supervisor",feature="test-r031-vfs",
+    feature="test-r030-ondevice",feature="test-r026",feature="test-r025",
+    feature="test-interactive",feature="test-shell",feature="test-ipc",
+    feature="test-scheduler",feature="test-processes",feature="test-ring3",
+    feature="test-r029-desktop",feature="test-r029-userspace",
+    feature="test-r029-physical-events",feature="test-r029-multiprocess",
+    feature="test-r029-frame-server",feature="test-r029-desktop-suite",
+    feature="test-r028-network",feature="test-r027-durable",feature="test-ata-disk",
+    feature="test-m2-disk-exec",feature="test-r114-epoch",feature="test-r118-ap-ack",
+    feature="test-r041-workspace",feature="test-ud2",feature="test-pagefault",
+    feature="test-shadow",feature="test-fault-guard",feature="test-fault-supervisor",
+    feature="test-irq-keyboard",feature="test-m2-developer-alpha"
+)))]
+compile_error!("normal-desktop must be built without console or experimental personalities");
+
 use core::ptr;
 
 #[cfg(feature="orbit-ui-preview")]
@@ -118,19 +137,19 @@ pub mod smp_lifecycle_fence;
 // M1: authenticated ring3-service policy using the already implemented
 // checksummed, sector-backed HierVfs; host remount integration acceptance.
 // Does not enable formatting or physical-device access in ordinary boot.
-#[cfg(feature="test-r031-vfs")]
+#[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
 pub mod m1_input;
-#[cfg(feature="test-r031-vfs")]
+#[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
 pub mod m1_partition;
-#[cfg(feature="test-r031-vfs")]
+#[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
 pub mod m1_persistent_terminal;
-#[cfg(feature="test-r031-vfs")]
+#[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
 pub mod m1_persistent_desktop;
 /// R019: real durable source editor service, guarded by M1 auth and volume generations.
-#[cfg(feature="test-r031-vfs")]
+#[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
 pub mod m1_disk_editor;
 /// R019 WS01/WS03: authenticated project tree over durable HierVfs.
-#[cfg(feature="test-r031-vfs")]
+#[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
 pub mod m1_project_workspace;
 // M2 Developer Alpha integrated host-testable foundations. The guest must
 // wire actual network, signature-verifier, ELF loader and UI services later.
@@ -250,11 +269,11 @@ mod batch2_acceptance;
 pub mod tinyfs;
 /// R027 opt-in checksummed copy-on-write persistent sector filesystem.
 pub mod durablefs;
-#[cfg(feature="test-r030-ondevice")]
+#[cfg(any(feature="test-r030-ondevice",feature="normal-desktop"))]
 pub mod r030_ondevice;
-#[cfg(feature="test-r031-vfs")]
+#[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
 pub mod hier_vfs;
-#[cfg(feature="test-r031-vfs")]
+#[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
 pub mod fs_handles;
 /// Security milestone S0: immutable system namespaces and bounded
 /// write bursts for the existing process file-handle ABI.
@@ -277,15 +296,15 @@ pub mod ai_inference;
 pub mod quantum_abi;
 pub mod quantum_dispatch;
 pub mod desktop;
-#[cfg(feature="test-r029-userspace")]
+#[cfg(any(feature="test-r029-userspace",feature="normal-desktop"))]
 pub mod gui_protocol;
 /// R029.1 authenticated per-process window grants and bounded event queue.
 pub mod gui_broker;
 #[cfg(feature="test-r031-supervisor")]
 pub mod service_supervisor;
-#[cfg(feature="test-r029-desktop")]
+#[cfg(any(feature="test-r029-desktop",feature="normal-desktop"))]
 mod gui;
-#[cfg(feature="test-r029-desktop")]
+#[cfg(any(feature="test-r029-desktop",feature="normal-desktop"))]
 mod ps2_mouse;
 #[cfg(target_arch = "x86_64")]
 pub mod ata_pio;
@@ -301,9 +320,9 @@ mod paging;
 mod paging_cpu;
 #[cfg(feature = "user-runtime")]
 mod user_runtime;
-#[cfg(any(feature = "test-interactive",feature="normal-init"))]
+#[cfg(any(any(feature = "test-interactive",feature="normal-desktop"),feature="normal-init"))]
 mod input;
-#[cfg(any(feature = "test-irq-keyboard", feature="test-r029-desktop"))]
+#[cfg(any(feature = "test-irq-keyboard", any(feature="test-r029-desktop",feature="normal-desktop")))]
 mod console;
 #[cfg(feature = "runtime")]
 mod runtime;
@@ -323,7 +342,8 @@ mod limine_requests;
 mod cpu_entry;
 
 pub const MAX_PROCESSES: usize = 4;
-pub const MAX_DISPATCHES: u32 = if cfg!(feature = "preempt") { 2048 }
+pub const MAX_DISPATCHES: u32 = if cfg!(feature="normal-desktop") { u32::MAX }
+    else if cfg!(feature = "preempt") { 2048 }
     else if cfg!(feature = "test-r031-files-gui") { 256 } else { 32 };
 
 const EMPTY: i32 = 0;
@@ -713,11 +733,18 @@ mod tests {
             assert_eq!((scheduler.dispatch_count,scheduler.cursor,scheduler.tick_count),(0,0,0));
             assert_eq!(scheduler_next_matching(&mut scheduler,|p|p.pid==2),b);
             assert_eq!(scheduler_next_matching(&mut scheduler,|_|true),a);
-            for _ in 2..MAX_DISPATCHES{assert!(!indianos_scheduler_next(&mut scheduler).is_null());}
+            if cfg!(feature="normal-desktop"){
+                // Exercise the checked boundary without billions of dispatches.
+                scheduler.dispatch_count=MAX_DISPATCHES-2;
+                for _ in 0..2{assert!(!indianos_scheduler_next(&mut scheduler).is_null());}
+            }else{
+                for _ in 2..MAX_DISPATCHES{assert!(!indianos_scheduler_next(&mut scheduler).is_null());}
+            }
             assert_eq!(scheduler.dispatch_count,MAX_DISPATCHES);
             assert!(indianos_scheduler_next(&mut scheduler).is_null());
             assert_eq!(scheduler.dispatch_count,MAX_DISPATCHES);
-            let expected=if cfg!(feature="preempt"){2048}
+            let expected=if cfg!(feature="normal-desktop"){u32::MAX}
+                else if cfg!(feature="preempt"){2048}
                 else if cfg!(feature="test-r031-files-gui"){256}else{32};
             assert_eq!(MAX_DISPATCHES,expected);
         }

@@ -183,64 +183,210 @@ impl Surface{
 // R029 second acceptance: independently mapped ring-3 /bin/init owns surface
 // *commands*, never the framebuffer mapping. The kernel alone clips, paints,
 // validates privilege, and keeps a replayable eight-command backing store.
-#[cfg(feature="test-r029-userspace")]
+#[cfg(any(feature="test-r029-userspace",feature="normal-desktop"))]
 use crate::gui_protocol::{Command as UserCommand,FILL,TEXT,REPLACE_TEXT,COMMAND_LIMIT};
-#[cfg(feature="test-r029-userspace")]
+#[cfg(any(feature="test-r029-userspace",feature="normal-desktop"))]
 use crate::gui_broker::{Broker,Event as GuiEvent};
-#[cfg(feature="test-r029-userspace")]
+// The canonical retained streams are kernel-private, not pixel pointers or
+// app-selected addresses. Normal Desktop gives each stream a whole payload
+// page bracketed by unmapped pages; neither snapshots nor reset may touch them.
+#[cfg(feature="normal-desktop")]
+const COMMAND_PAGE:usize=4096;
+#[cfg(feature="normal-desktop")]
+#[repr(C,align(4096))]
+struct GuardedCommands{
+    lower:[u8;COMMAND_PAGE],
+    entries:[UserCommand;COMMAND_LIMIT],
+    padding:[u8;COMMAND_PAGE-core::mem::size_of::<UserCommand>()*COMMAND_LIMIT],
+    upper:[u8;COMMAND_PAGE],
+}
+#[cfg(feature="normal-desktop")]
+impl GuardedCommands{
+    const fn new()->Self{Self{lower:[0;COMMAND_PAGE],
+        entries:[UserCommand::EMPTY;COMMAND_LIMIT],
+        padding:[0;COMMAND_PAGE-core::mem::size_of::<UserCommand>()*COMMAND_LIMIT],
+        upper:[0;COMMAND_PAGE]}}
+    fn layout(&self)->(u64,u64,u64,u64){
+        let lower=core::ptr::addr_of!(self.lower) as usize as u64;
+        let begin=core::ptr::addr_of!(self.entries) as usize as u64;
+        let upper=core::ptr::addr_of!(self.upper) as usize as u64;
+        (lower,begin,begin+COMMAND_PAGE as u64,upper)
+    }
+}
+#[cfg(any(feature="test-r029-userspace",feature="normal-desktop"))]
+struct CommandStore{
+    #[cfg(feature="normal-desktop")]
+    surfaces:[GuardedCommands;2],
+    #[cfg(not(feature="normal-desktop"))]
+    entries:[[UserCommand;COMMAND_LIMIT];2],
+}
+#[cfg(any(feature="test-r029-userspace",feature="normal-desktop"))]
+impl CommandStore{
+    const fn new()->Self{Self{
+        #[cfg(feature="normal-desktop")]
+        surfaces:[GuardedCommands::new(),GuardedCommands::new()],
+        #[cfg(not(feature="normal-desktop"))]
+        entries:[[UserCommand::EMPTY;COMMAND_LIMIT];2],
+    }}
+    fn clear_slot(&mut self,slot:usize){
+        self[slot].fill(UserCommand::EMPTY);
+        #[cfg(feature="normal-desktop")]
+        self.surfaces[slot].padding.fill(0);
+    }
+    fn clear(&mut self){for slot in 0..2{self.clear_slot(slot);}}
+    #[cfg(test)]
+    fn snapshot(&self)->[[UserCommand;COMMAND_LIMIT];2]{[self[0],self[1]]}
+    #[cfg(feature="normal-desktop")]
+    fn layout(&self)->[(u64,u64,u64,u64);2]{
+        [self.surfaces[0].layout(),self.surfaces[1].layout()]
+    }
+}
+#[cfg(any(feature="test-r029-userspace",feature="normal-desktop"))]
+impl core::ops::Index<usize> for CommandStore{
+    type Output=[UserCommand;COMMAND_LIMIT];
+    fn index(&self,slot:usize)->&Self::Output{
+        #[cfg(feature="normal-desktop")]
+        {&self.surfaces[slot].entries}
+        #[cfg(not(feature="normal-desktop"))]
+        {&self.entries[slot]}
+    }
+}
+#[cfg(any(feature="test-r029-userspace",feature="normal-desktop"))]
+impl core::ops::IndexMut<usize> for CommandStore{
+    fn index_mut(&mut self,slot:usize)->&mut Self::Output{
+        #[cfg(feature="normal-desktop")]
+        {&mut self.surfaces[slot].entries}
+        #[cfg(not(feature="normal-desktop"))]
+        {&mut self.entries[slot]}
+    }
+}
+#[cfg(any(feature="test-r029-userspace",feature="normal-desktop"))]
 struct UserSurfaceService{
     session:Session,
-    commands:[[UserCommand;COMMAND_LIMIT];2],
+    commands:CommandStore,
     counts:[usize;2],
     focused:u32,
     broker:Broker<2,8>,
-    #[cfg(feature="test-r029-frame-server")]
+    #[cfg(any(feature="test-r029-frame-server",feature="normal-desktop"))]
     frames_presented:u32,
-    #[cfg(feature="test-r029-desktop-suite")]
+    #[cfg(feature="normal-desktop")]
+    retired_streams:u8,
+    #[cfg(any(feature="test-r029-desktop-suite",feature="normal-desktop"))]
     launcher_visible:bool,
-    #[cfg(feature="test-r029-desktop-suite")]
+    #[cfg(any(feature="test-r029-desktop-suite",feature="normal-desktop"))]
     desktop_actions:u32,
     #[cfg(feature="test-r031-supervisor")]
     restart_count:u32,
-    #[cfg(feature="test-r029-physical-events")]
+    #[cfg(any(feature="test-r029-physical-events",feature="normal-desktop"))]
     mouse:Mouse,
 }
-#[cfg(feature="test-r029-userspace")]
+#[cfg(any(feature="test-r029-userspace",feature="normal-desktop"))]
 static mut USER_SURFACE_SERVICE:Option<UserSurfaceService>=None;
-#[cfg(feature="test-r029-userspace")]
+#[cfg(any(feature="test-r029-userspace",feature="normal-desktop"))]
 impl UserSurfaceService{
+    #[cfg(feature="normal-desktop")]
+    fn retirement_verified(&self)->bool{
+        self.frames_presented>0&&self.retired_streams==3&&self.counts==[0,0]&&
+        (1..=4).all(|pid|!self.broker.known(pid))
+    }
+    #[cfg(feature="normal-desktop")]
+    fn window_frame(&self,pid:u32)->Option<crate::gui_protocol::DesktopFrame>{
+        use crate::gui_protocol::{DesktopFrame,WindowFrame};
+        if pid!=4{return None;}
+        let mut windows=[WindowFrame{x:0,y:0,width:0,height:0,minimized:false};2];
+        for (index,slot) in windows.iter_mut().enumerate(){
+            let w=self.window(index as u32+1)?;
+            *slot=WindowFrame{x:w.bounds.x as u16,y:w.bounds.y as u16,
+                width:w.bounds.width as u16,height:w.bounds.height as u16,
+                minimized:w.minimized};
+        }
+        Some(DesktopFrame{width:self.session.desktop.width as u16,
+            height:self.session.desktop.height as u16,
+            front:self.session.desktop.focused()? as u8,launcher:self.launcher_visible,
+            windows,pointer_x:self.session.mouse_x as u16,pointer_y:self.session.mouse_y as u16})
+    }
+    #[cfg(feature="normal-desktop")]
+    fn apply_window_frame(&mut self,pid:u32,bytes:&[u8;64],
+        paint:impl FnOnce(&Self)->bool)->bool{
+        if pid!=4||!self.broker.owns(2,1)||!self.broker.owns(3,2){return false;}
+        let Some(state)=crate::gui_protocol::DesktopFrame::parse(bytes)else{return false;};
+        if state.width as u32!=self.session.desktop.width||state.height as u32!=self.session.desktop.height{
+            return false;
+        }
+        let Ok(mut layout)=Desktop::new(state.width as u32,state.height as u32)else{return false;};
+        for (index,window) in state.windows.iter().enumerate(){
+            let Some(old)=self.window(index as u32+1)else{return false;};
+            // Retained app streams remain attached to immutable client extents.
+            if window.width as u32!=old.bounds.width||window.height as u32!=old.bounds.height{
+                return false;
+            }
+            if layout.open(old.app,Rect::new(window.x as i32,window.y as i32,
+                window.width as u32,window.height as u32)).ok()!=Some(index as u32+1){return false;}
+        }
+        for (index,window) in state.windows.iter().enumerate(){
+            if window.minimized&&layout.minimize(index as u32+1).is_err(){return false;}
+        }
+        if layout.focus(state.front as u32).is_err(){return false;}
+        let old=core::mem::replace(&mut self.session.desktop,layout);
+        let launcher=self.launcher_visible;
+        let pointer=(self.session.mouse_x,self.session.mouse_y);
+        self.launcher_visible=state.launcher;
+        self.session.mouse_x=state.pointer_x as i32;self.session.mouse_y=state.pointer_y as i32;
+        if !paint(self){
+            self.session.desktop=old;self.launcher_visible=launcher;
+            (self.session.mouse_x,self.session.mouse_y)=pointer;return false;
+        }
+        self.session.active=state.front as u32;
+        self.frames_presented=self.frames_presented.saturating_add(1);
+        true
+    }
     fn new(w:u32,h:u32)->Option<Self>{
         let session=Session::new(w,h)?;
         if session.files!=1||session.terminal!=2{return None;}
         let mut broker=Broker::new();
-        #[cfg(feature="test-r029-desktop-suite")]
+        #[cfg(any(feature="test-r029-desktop-suite",feature="normal-desktop"))]
         {
             broker.grant(2,session.files).ok()?;
             broker.grant(3,session.terminal).ok()?;
         }
-        #[cfg(not(feature="test-r029-desktop-suite"))]
+        #[cfg(not(any(feature="test-r029-desktop-suite",feature="normal-desktop")))]
         {
             broker.grant(1,session.files).ok()?;
-            #[cfg(feature="test-r029-multiprocess")]
+            #[cfg(any(feature="test-r029-multiprocess",feature="normal-desktop"))]
             broker.grant(2,session.terminal).ok()?;
-            #[cfg(not(feature="test-r029-multiprocess"))]
+            #[cfg(not(any(feature="test-r029-multiprocess",feature="normal-desktop")))]
             broker.grant(1,session.terminal).ok()?;
         }
-        #[cfg(feature="test-r029-physical-events")]
+        #[cfg(any(feature="test-r029-physical-events",feature="normal-desktop"))]
         let mouse=Mouse::init()?;
         Some(Self{session,
-            commands:[[UserCommand::EMPTY;COMMAND_LIMIT];2],
+            commands:CommandStore::new(),
             counts:[0,0],focused:0,broker,
-            #[cfg(feature="test-r029-frame-server")]
+            #[cfg(any(feature="test-r029-frame-server",feature="normal-desktop"))]
             frames_presented:0,
-            #[cfg(feature="test-r029-desktop-suite")]
+            #[cfg(feature="normal-desktop")]
+            retired_streams:0,
+            #[cfg(any(feature="test-r029-desktop-suite",feature="normal-desktop"))]
             launcher_visible:false,
-            #[cfg(feature="test-r029-desktop-suite")]
+            #[cfg(any(feature="test-r029-desktop-suite",feature="normal-desktop"))]
             desktop_actions:0,
             #[cfg(feature="test-r031-supervisor")]
             restart_count:0,
-            #[cfg(feature="test-r029-physical-events")]
+            #[cfg(any(feature="test-r029-physical-events",feature="normal-desktop"))]
             mouse})
+    }
+    #[cfg(feature="normal-desktop")]
+    fn reset_in_place(&mut self,next:Self){
+        // The existing guard pages are already unmapped. Move live metadata
+        // field-by-field and clear only the payload, never copy/drop guards.
+        self.commands.clear();
+        self.session=next.session;self.counts=next.counts;
+        self.focused=next.focused;self.broker=next.broker;
+        self.frames_presented=next.frames_presented;
+        self.retired_streams=0;
+        self.launcher_visible=next.launcher_visible;
+        self.desktop_actions=next.desktop_actions;
+        self.mouse=next.mouse;
     }
     fn window(&self,id:u32)->Option<crate::desktop::Window>{
         self.session.desktop.windows().find(|w|w.id==id).copied()
@@ -296,7 +442,7 @@ impl UserSurfaceService{
                 }
             }
         }
-        #[cfg(feature="test-r029-desktop-suite")]
+        #[cfg(any(feature="test-r029-desktop-suite",feature="normal-desktop"))]
         if self.launcher_visible{
             out.fill(20,(out.height-225) as i32,340,183,palette.top);
             out.fill(26,(out.height-215) as i32,328,30,palette.title);
@@ -312,9 +458,9 @@ impl UserSurfaceService{
     }
     fn submit(&mut self,pid:u32,bytes:&[u8;64])->bool{
         // Frame-server clients stage commands; authenticated PID1 presents.
-        #[cfg(feature="test-r029-frame-server")]
+        #[cfg(any(feature="test-r029-frame-server",feature="normal-desktop"))]
         {self.submit_with(pid,bytes,|_|true)}
-        #[cfg(not(feature="test-r029-frame-server"))]
+        #[cfg(not(any(feature="test-r029-frame-server",feature="normal-desktop")))]
         {self.submit_with(pid,bytes,Self::redraw)}
     }
     fn submit_with(&mut self,pid:u32,bytes:&[u8;64],paint:impl FnOnce(&Self)->bool)->bool{
@@ -342,12 +488,12 @@ impl UserSurfaceService{
     fn focus(&mut self,pid:u32,id:u32)->bool{
         if !self.broker.can_post(pid,id){return false;}
         if !self.session.focus(id){return false;}
-        #[cfg(not(feature="test-r029-frame-server"))]
+        #[cfg(not(any(feature="test-r029-frame-server",feature="normal-desktop")))]
         if !self.redraw(){return false;}
         if self.broker.post_focus(pid,id).is_err(){return false;}
         self.focused+=1;true
     }
-    #[cfg(feature="test-r029-physical-events")]
+    #[cfg(any(feature="test-r029-physical-events",feature="normal-desktop"))]
     fn pump_mouse(&mut self){
         // Read physical emulated 8042 packets only in a serialized ring-0
         // syscall; never trust a client-supplied event owner.
@@ -372,9 +518,9 @@ impl UserSurfaceService{
                     log(b"IndianOS: R029.2 physical mouse focus event queued\n\0");
                 }
             }
-            #[cfg(not(feature="test-r029-frame-server"))]
+            #[cfg(not(any(feature="test-r029-frame-server",feature="normal-desktop")))]
             if changed{let _=self.redraw();}
-            #[cfg(feature="test-r029-frame-server")]
+            #[cfg(any(feature="test-r029-frame-server",feature="normal-desktop"))]
             let _=changed;
         }
     }
@@ -387,6 +533,18 @@ impl UserSurfaceService{
            self.broker.owns(pid,window)){
             self.session.dragging=None;
             self.session.was_down=false;
+        }
+        // Scrub the canonical backing before withdrawing its authority.
+        // Peers retain their own stream and no stale command can replay.
+        #[cfg(feature="normal-desktop")]
+        for window in 1..=2{
+            if self.broker.owns(pid,window){
+                if self.counts[window as usize-1]>0{
+                    self.retired_streams|=1<<(window-1);
+                }
+                self.commands.clear_slot(window as usize-1);
+                self.counts[window as usize-1]=0;
+            }
         }
         self.broker.revoke(pid);
     }
@@ -403,10 +561,19 @@ impl UserSurfaceService{
         self.restart_count=1;
         true
     }
-    #[cfg(feature="test-r031-boot-desktop")]
+    #[cfg(any(feature="test-r031-boot-desktop",feature="normal-desktop"))]
     fn pump_desktop(&mut self,pid:u32)->Option<u64>{
-        if pid!=1 || self.frame_state(pid).is_none(){return None;}
-        #[cfg(feature="test-r029-physical-events")]
+        if pid!=1{return None;}
+        #[cfg(feature="normal-desktop")]
+        {
+            // Preserve every button edge. Collapsing several complete
+            // packets loses a quick press/release before ring-3 sees it.
+            let packet=self.mouse.poll();
+            return Some(self.desktop_pointer_packet(packet));
+        }
+        #[cfg(not(feature="normal-desktop"))]
+        if self.frame_state(pid).is_none(){return None;}
+        #[cfg(any(feature="test-r029-physical-events",feature="normal-desktop"))]
         {
             let before=(self.session.mouse_x,self.session.mouse_y,
                         self.session.desktop.focused());
@@ -418,10 +585,24 @@ impl UserSurfaceService{
             // window. No raw kernel pointers or forged mouse packets.
             return Some((focus as u64)|if before!=after{0x100}else{0});
         }
-        #[cfg(not(feature="test-r029-physical-events"))]
+        #[cfg(not(any(feature="test-r029-physical-events",feature="normal-desktop")))]
         {Some(self.session.desktop.focused()? as u64)}
     }
-    #[cfg(feature="test-r029-desktop-suite")]
+    #[cfg(feature="normal-desktop")]
+    fn desktop_pointer_packet(&mut self,packet:Option<Packet>)->u64{
+        let before=(self.session.mouse_x,self.session.mouse_y,self.session.was_down);
+        if let Some(packet)=packet{
+            self.session.mouse_x=(self.session.mouse_x+packet.dx as i32)
+                .clamp(0,self.session.desktop.width as i32-1);
+            self.session.mouse_y=(self.session.mouse_y-packet.dy as i32)
+                .clamp(0,self.session.desktop.height as i32-1);
+            self.session.was_down=packet.left;
+        }
+        let changed=before!=(self.session.mouse_x,self.session.mouse_y,self.session.was_down);
+        self.session.mouse_x as u64|((self.session.mouse_y as u64)<<16)|
+            ((self.session.was_down as u64)<<32)|((changed as u64)<<33)
+    }
+    #[cfg(any(feature="test-r029-desktop-suite",feature="normal-desktop"))]
     fn desktop_action(&mut self,pid:u32,action:u32)->bool{
         if pid!=1||self.frame_state(pid).is_none(){return false;}
         let result=match action{
@@ -441,30 +622,32 @@ impl UserSurfaceService{
         if result{self.desktop_actions+=1;}
         result
     }
-    #[cfg(feature="test-r029-frame-server")]
+    #[cfg(any(feature="test-r029-frame-server",feature="normal-desktop"))]
     fn frame_state(&self,pid:u32)->Option<u64>{
+        #[cfg(feature="normal-desktop")]
+        {let _=pid;return None;}
         // The frame server is an explicit kernel-granted identity. PID2
         // cannot read or present the combined display even though it owns
         // its own drawing stream.
-        #[cfg(feature="test-r029-desktop-suite")]
+        #[cfg(any(feature="test-r029-desktop-suite",feature="normal-desktop"))]
         if pid!=1{return None;}
-        #[cfg(not(feature="test-r029-desktop-suite"))]
+        #[cfg(not(any(feature="test-r029-desktop-suite",feature="normal-desktop")))]
         if pid!=1 || !self.broker.owns(pid,self.session.files){return None;}
         Some(self.counts[0] as u64 |
              ((self.counts[1] as u64)<<8) |
              ((self.frames_presented as u64)<<16))
     }
-    #[cfg(feature="test-r029-frame-server")]
+    #[cfg(any(feature="test-r029-frame-server",feature="normal-desktop"))]
     fn present_frame(&mut self,pid:u32,front:u32)->bool{
         self.present_with(pid,front,Self::redraw)
     }
-    #[cfg(feature="test-r029-frame-server")]
+    #[cfg(any(feature="test-r029-frame-server",feature="normal-desktop"))]
     fn present_with(&mut self,pid:u32,front:u32,paint:impl FnOnce(&Self)->bool)->bool{
-        let limit=if cfg!(feature="test-r031-boot-desktop"){64}
-                  else if cfg!(feature="test-r029-desktop-suite"){5}else{2};
+        let limit=if cfg!(any(feature="test-r031-boot-desktop",feature="normal-desktop")){64}
+                  else if cfg!(any(feature="test-r029-desktop-suite",feature="normal-desktop")){5}else{2};
         if self.frame_state(pid).is_none() ||
            !matches!(front,1|2) ||
-           !(if cfg!(feature="test-r031-files-gui"){
+           !(if cfg!(any(feature="test-r031-files-gui",feature="normal-desktop")){
                // PID2's protected Files client may submit 3 initial
                // entries and 2 refresh operations, but never exceed the
                // same bounded command backing store.
@@ -481,29 +664,50 @@ impl UserSurfaceService{
         true
     }
 }
-#[cfg(feature="test-r029-userspace")]
+#[cfg(any(feature="test-r029-userspace",feature="normal-desktop"))]
 fn user_service()->Option<&'static mut UserSurfaceService>{
     // Single BSP, interrupt masked, and no recursive caller permitted.
     unsafe{(&mut *ptr::addr_of_mut!(USER_SURFACE_SERVICE)).as_mut()}
 }
-#[cfg(feature="test-r029-userspace")]
+#[cfg(any(feature="test-r029-userspace",feature="normal-desktop"))]
 pub(crate) fn user_surface_start()->bool{
+    #[cfg(feature="normal-desktop")]
+    input::reset_physical_session();
     let Some(f)=Surface::from_boot()else{return false;};
     let Some(svc)=UserSurfaceService::new(f.width as u32,f.height as u32)else{return false;};
     if !svc.redraw(){return false;}
+    #[cfg(feature="normal-desktop")]
+    unsafe{
+        let service=&mut *ptr::addr_of_mut!(USER_SURFACE_SERVICE);
+        if let Some(current)=service.as_mut(){current.reset_in_place(svc);}
+        else{*service=Some(svc);}
+    }
+    #[cfg(not(feature="normal-desktop"))]
     unsafe{USER_SURFACE_SERVICE=Some(svc);}
     log(b"IndianOS: R029 ring3 surface server shows two framebuffer windows\n\0");
     true
 }
-#[cfg(feature="test-r029-userspace")]
+#[cfg(feature="normal-desktop")]
+pub(crate) fn surface_guard_layout()->Option<[(u64,u64,u64,u64);2]>{
+    Some(user_service()?.commands.layout())
+}
+#[cfg(feature="normal-desktop")]
+pub(crate) fn desktop_window_query(pid:u32)->Option<[u8;64]>{
+    user_service()?.window_frame(pid).map(|frame|frame.wire())
+}
+#[cfg(feature="normal-desktop")]
+pub(crate) fn desktop_window_apply(pid:u32,bytes:&[u8;64])->bool{
+    user_service().is_some_and(|svc|svc.apply_window_frame(pid,bytes,UserSurfaceService::redraw))
+}
+#[cfg(any(feature="test-r029-userspace",feature="normal-desktop"))]
 pub(crate) fn user_surface_submit(pid:u32,bytes:&[u8;64])->bool{
     user_service().is_some_and(|svc|svc.submit(pid,bytes))
 }
-#[cfg(feature="test-r029-userspace")]
+#[cfg(any(feature="test-r029-userspace",feature="normal-desktop"))]
 pub(crate) fn user_surface_focus(pid:u32,id:u32)->bool{
     user_service().is_some_and(|svc|svc.focus(pid,id))
 }
-#[cfg(feature="test-r029-userspace")]
+#[cfg(any(feature="test-r029-userspace",feature="normal-desktop"))]
 pub(crate) fn user_surface_status(pid:u32)->Option<u64>{
     let svc=user_service()?;
     if !svc.broker.known(pid){return None;}
@@ -512,18 +716,18 @@ pub(crate) fn user_surface_status(pid:u32)->Option<u64>{
          ((svc.focused as u64)<<16) |
          ((svc.session.desktop.focused()? as u64)<<24))
 }
-#[cfg(feature="test-r029-userspace")]
+#[cfg(any(feature="test-r029-userspace",feature="normal-desktop"))]
 pub(crate) fn user_surface_peek(pid:u32)->Option<GuiEvent>{
     let svc=user_service()?;
-    #[cfg(feature="test-r029-physical-events")]
+    #[cfg(all(feature="test-r029-physical-events",not(feature="normal-desktop")))]
     svc.pump_mouse();
     svc.broker.peek(pid).ok()
 }
-#[cfg(feature="test-r029-userspace")]
+#[cfg(any(feature="test-r029-userspace",feature="normal-desktop"))]
 pub(crate) fn user_surface_terminate(pid:u32){
     if let Some(svc)=user_service(){
         svc.retire_client(pid);
-        #[cfg(feature="test-r029-physical-events")]
+        #[cfg(any(feature="test-r029-physical-events",feature="normal-desktop"))]
         if !svc.broker.known(1) && !svc.broker.known(2)
             && !svc.broker.known(3)
             && !(cfg!(feature="test-r031-supervisor") && svc.broker.known(4)){
@@ -531,7 +735,7 @@ pub(crate) fn user_surface_terminate(pid:u32){
         }
     }
 }
-#[cfg(feature="test-r029-userspace")]
+#[cfg(any(feature="test-r029-userspace",feature="normal-desktop"))]
 pub(crate) fn user_surface_ack(pid:u32,sequence:u32)->bool{
     user_service().is_some_and(|svc|svc.broker.ack(pid,sequence).is_ok())
 }
@@ -539,50 +743,55 @@ pub(crate) fn user_surface_ack(pid:u32,sequence:u32)->bool{
 pub(crate) fn user_surface_restart_terminal(pid:u32)->bool{
     user_service().is_some_and(|svc|svc.rotate_terminal(pid))
 }
-#[cfg(feature="test-r031-boot-desktop")]
+#[cfg(any(feature="test-r031-boot-desktop",feature="normal-desktop"))]
 pub(crate) fn user_desktop_pump(pid:u32)->Option<u64>{
     user_service()?.pump_desktop(pid)
 }
-#[cfg(feature="test-r029-desktop-suite")]
+#[cfg(any(feature="test-r029-desktop-suite",feature="normal-desktop"))]
 pub(crate) fn user_desktop_action(pid:u32,action:u32)->bool{
     user_service().is_some_and(|svc|svc.desktop_action(pid,action))
 }
-#[cfg(feature="test-r029-frame-server")]
+#[cfg(any(feature="test-r029-frame-server",feature="normal-desktop"))]
 pub(crate) fn user_frame_state(pid:u32)->Option<u64>{
     user_service()?.frame_state(pid)
 }
-#[cfg(feature="test-r029-frame-server")]
+#[cfg(any(feature="test-r029-frame-server",feature="normal-desktop"))]
 pub(crate) fn user_frame_present(pid:u32,front:u32)->bool{
     user_service().is_some_and(|svc|svc.present_frame(pid,front))
 }
-#[cfg(feature="test-r029-userspace")]
+#[cfg(any(feature="test-r029-userspace",feature="normal-desktop"))]
 pub(crate) fn user_surface_verified()->bool{
     user_service().is_some_and(|svc|{
-        #[cfg(feature="test-r031-boot-desktop")]
+        #[cfg(feature="normal-desktop")]
+        {svc.retirement_verified()}
+        #[cfg(not(feature="normal-desktop"))]
+        {
+        #[cfg(any(feature="test-r031-boot-desktop",feature="normal-desktop"))]
         let frames_ok=svc.frames_presented>=5 && svc.frames_presented<=64 &&
            svc.desktop_actions>=5 && !svc.launcher_visible &&
            !svc.broker.known(3);
         #[cfg(feature="test-r031-supervisor")]
         let frames_ok=frames_ok && svc.restart_count==1 &&
             !svc.broker.known(4);
-        #[cfg(all(feature="test-r029-desktop-suite",not(feature="test-r031-boot-desktop")))]
+        #[cfg(all(any(feature="test-r029-desktop-suite",feature="normal-desktop"),not(any(feature="test-r031-boot-desktop",feature="normal-desktop"))))]
         let frames_ok=svc.frames_presented==5 && svc.desktop_actions==6 &&
            !svc.launcher_visible && !svc.broker.known(3);
-        #[cfg(all(feature="test-r029-frame-server",not(feature="test-r029-desktop-suite")))]
+        #[cfg(all(any(feature="test-r029-frame-server",feature="normal-desktop"),not(any(feature="test-r029-desktop-suite",feature="normal-desktop"))))]
         let frames_ok=svc.frames_presented==2;
-        #[cfg(not(feature="test-r029-frame-server"))]
+        #[cfg(not(any(feature="test-r029-frame-server",feature="normal-desktop")))]
         let frames_ok=svc.focused>=1;
-        (if cfg!(feature="test-r031-files-gui"){
+        (if cfg!(any(feature="test-r031-files-gui",feature="normal-desktop")){
             // Initial persistent directory/file view is 5 commands;
             // the single IPC refresh adds 2 more before shutdown.
             matches!(svc.counts,[5,2]|[7,2])
         }else{svc.counts==[2,2]}) && frames_ok &&
         !svc.broker.known(1) && !svc.broker.known(2) &&
         svc.session.desktop.focused()==Some(
-            if cfg!(feature="test-r029-physical-events") {
+            if cfg!(any(feature="test-r029-physical-events",feature="normal-desktop")) {
                 svc.session.terminal
             }else{svc.session.files}
         )
+        }
     })
 }
 pub(crate) struct Session{
@@ -771,13 +980,150 @@ pub(crate) fn run()->bool{
 #[cfg(test)]
 mod tests{
     use super::*;
-    #[cfg(feature="test-r029-desktop-suite")]
+    #[cfg(feature="normal-desktop")]
+    fn isolated_service()->UserSurfaceService{
+        let mut broker=Broker::new();broker.grant(2,1).unwrap();broker.grant(3,2).unwrap();
+        UserSurfaceService{session:Session::new(800,600).unwrap(),
+            commands:CommandStore::new(),counts:[0,0],focused:0,broker,
+            frames_presented:0,launcher_visible:false,desktop_actions:0,
+            retired_streams:0,
+            #[cfg(feature="test-r031-supervisor")]restart_count:0,
+            // State-only fixture; no hardware initialization is invoked.
+            mouse:unsafe{core::mem::zeroed()},}
+    }
+    #[cfg(feature="normal-desktop")]
+    #[test]fn desktop_pointer_preserves_press_and_release_as_individual_events(){
+        let mut svc=isolated_service();
+        let idle=svc.desktop_pointer_packet(None);assert_eq!(idle>>32,0);
+        let pressed=svc.desktop_pointer_packet(Some(Packet{dx:0,dy:0,left:true}));
+        let released=svc.desktop_pointer_packet(Some(Packet{dx:0,dy:0,left:false}));
+        assert_eq!((pressed>>32)&3,3);assert_eq!((released>>32)&3,2);
+        assert_eq!(pressed&0xffff_ffff,released&0xffff_ffff);
+        // Holding with no motion is not another press. A later release still
+        // survives a stationary packet and an idle poll.
+        svc.desktop_pointer_packet(Some(Packet{dx:0,dy:0,left:true}));
+        assert_eq!(svc.desktop_pointer_packet(Some(Packet{dx:0,dy:0,left:true}))>>32,1);
+        assert_eq!(svc.desktop_pointer_packet(None)>>32,1);
+        assert_eq!(svc.desktop_pointer_packet(Some(Packet{dx:0,dy:0,left:false}))>>32,2);
+        for (dx,dy,x,y) in [(i16::MAX,i16::MIN,799u64,599u64),
+                            (i16::MIN,i16::MAX,0,0)]{
+            let event=svc.desktop_pointer_packet(Some(Packet{dx,dy,left:false}));
+            assert_eq!(event&0xffff,x);assert_eq!((event>>16)&0xffff,y);
+            assert_eq!(event>>32,2);
+        }
+    }
+    #[cfg(feature="normal-desktop")]
+    #[test]fn command_pages_have_two_real_guard_slots_and_clear_payload_only(){
+        let mut store=CommandStore::new();
+        let layout=store.layout();
+        assert_eq!(core::mem::size_of::<GuardedCommands>(),3*COMMAND_PAGE);
+        for (index,(lower,begin,end,upper)) in layout.iter().copied().enumerate(){
+            assert_eq!(lower&4095,0);assert_eq!(begin,lower+4096);
+            assert_eq!(end,begin+4096);assert_eq!(upper,end);
+            store.surfaces[index].lower.fill(0xa5);
+            store.surfaces[index].upper.fill(0x5a);
+            store.surfaces[index].padding.fill(0xcc);
+            store[index][0].rgb=index as u32+1;
+        }
+        assert_eq!(layout[1].0,layout[0].3+4096);
+        let peer=store[1];store.clear_slot(0);
+        assert_eq!(store[0],[UserCommand::EMPTY;COMMAND_LIMIT]);assert_eq!(store[1],peer);
+        assert!(store.surfaces[0].padding.iter().all(|&b|b==0));
+        assert!(store.surfaces[1].padding.iter().all(|&b|b==0xcc));
+        for surface in &store.surfaces{
+            assert!(surface.lower.iter().all(|&b|b==0xa5));
+            assert!(surface.upper.iter().all(|&b|b==0x5a));
+        }
+    }
+    #[cfg(feature="normal-desktop")]
+    #[test]fn service_restart_preserves_guard_addresses_and_scrubs_payload_without_guard_access(){
+        let mut svc=isolated_service();let layout=svc.commands.layout();
+        for surface in &mut svc.commands.surfaces{
+            surface.lower.fill(0xa5);surface.upper.fill(0x5a);
+            surface.padding.fill(0xcc);surface.entries[0].rgb=0x123456;
+        }
+        svc.counts=[1,1];svc.frames_presented=23;svc.launcher_visible=true;svc.retired_streams=3;
+        svc.reset_in_place(isolated_service());
+        assert_eq!(svc.commands.layout(),layout);assert_eq!(svc.counts,[0,0]);
+        assert_eq!(svc.commands.snapshot(),[[UserCommand::EMPTY;COMMAND_LIMIT];2]);
+        assert_eq!(svc.frames_presented,0);assert!(!svc.launcher_visible);
+        assert_eq!(svc.retired_streams,0);assert!(!svc.retirement_verified());
+        for surface in &svc.commands.surfaces{
+            assert!(surface.lower.iter().all(|&b|b==0xa5));
+            assert!(surface.upper.iter().all(|&b|b==0x5a));
+            assert!(surface.padding.iter().all(|&b|b==0));
+        }
+    }
+    #[cfg(feature="normal-desktop")]
+    #[test]fn teardown_evidence_survives_scrubbing_but_requires_both_live_streams(){
+        let mut svc=isolated_service();svc.frames_presented=1;
+        svc.counts=[1,1];
+        assert!(!svc.retirement_verified());
+        svc.retire_client(99);assert_eq!(svc.retired_streams,0);
+        svc.retire_client(2);assert_eq!(svc.retired_streams,1);
+        assert!(!svc.retirement_verified());
+        svc.retire_client(2);assert_eq!(svc.retired_streams,1);
+        svc.retire_client(3);
+        assert_eq!(svc.counts,[0,0]);assert!(svc.retirement_verified());
+        assert_eq!(svc.commands.snapshot(),[[UserCommand::EMPTY;COMMAND_LIMIT];2]);
+        let mut empty=isolated_service();empty.frames_presented=1;
+        empty.retire_client(2);empty.retire_client(3);
+        assert!(!empty.retirement_verified());
+    }
+    #[cfg(feature="normal-desktop")]
+    #[test]fn command_owner_and_retirement_isolate_backings_and_failed_submission_rolls_back(){
+        fn fill(window:u32)->[u8;64]{
+            let mut b=[0;64];b[..4].copy_from_slice(b"R29U");
+            b[4..8].copy_from_slice(&1u32.to_le_bytes());b[8..12].copy_from_slice(&window.to_le_bytes());
+            b[12..16].copy_from_slice(&FILL.to_le_bytes());
+            b[20..22].copy_from_slice(&1u16.to_le_bytes());b[22..24].copy_from_slice(&1u16.to_le_bytes());b
+        }
+        let mut svc=isolated_service();
+        assert!(svc.submit_with(2,&fill(1),|_|true));assert!(svc.submit_with(3,&fill(2),|_|true));
+        let snapshot=svc.commands.snapshot();let counts=svc.counts;
+        assert!(!svc.submit_with(3,&fill(1),|_|panic!("foreign owner painted")));
+        assert!(!svc.submit_with(2,&fill(2),|_|panic!("foreign owner painted")));
+        assert!(!svc.submit_with(2,&fill(1),|_|false));
+        assert_eq!(svc.commands.snapshot(),snapshot);assert_eq!(svc.counts,counts);
+        svc.retire_client(3);
+        assert_eq!(svc.commands[0],snapshot[0]);
+        assert_eq!(svc.commands[1],[UserCommand::EMPTY;COMMAND_LIMIT]);assert_eq!(svc.counts,[1,0]);
+        assert!(!svc.submit_with(3,&fill(2),|_|panic!("retired owner painted")));
+    }
+    #[cfg(feature="normal-desktop")]
+    #[test]fn compositor_state_requires_current_app_grants_and_rolls_back_failed_paint(){
+        let mut broker=Broker::new();broker.grant(2,1).unwrap();broker.grant(3,2).unwrap();
+        let mut svc=UserSurfaceService{session:Session::new(800,600).unwrap(),
+            commands:CommandStore::new(),counts:[0,0],
+            focused:0,broker,frames_presented:0,launcher_visible:false,desktop_actions:0,
+            retired_streams:0,
+            #[cfg(feature="test-r031-supervisor")]restart_count:0,
+            mouse:unsafe{core::mem::zeroed()},};
+        let before=svc.window_frame(4).unwrap().wire();
+        for pid in [0,1,2,3,5,u32::MAX]{
+            assert!(svc.window_frame(pid).is_none());
+            assert!(!svc.apply_window_frame(pid,&before,|_|panic!("foreign owner painted")));
+        }
+        let mut requested=crate::gui_protocol::DesktopFrame::parse(&before).unwrap();
+        requested.windows[0].x+=10;requested.front=1;requested.launcher=true;
+        assert!(!svc.apply_window_frame(4,&requested.wire(),|_|false));
+        assert_eq!(svc.window_frame(4).unwrap().wire(),before);assert_eq!(svc.frames_presented,0);
+        assert!(svc.apply_window_frame(4,&requested.wire(),|_|true));
+        assert_eq!(svc.window_frame(4).unwrap(),requested);assert_eq!(svc.frames_presented,1);
+        let good=requested.wire();requested.windows[0].width+=1;
+        assert!(!svc.apply_window_frame(4,&requested.wire(),|_|panic!("resized backing painted")));
+        assert_eq!(svc.window_frame(4).unwrap().wire(),good);
+        svc.broker.revoke(3);
+        assert!(!svc.apply_window_frame(4,&good,|_|panic!("retired app painted")));
+    }
+    #[cfg(any(feature="test-r029-desktop-suite",feature="normal-desktop"))]
     #[test]fn owned_text_replacement_is_bounded_transactional_and_erases_shortened_glyphs(){
         let mut broker=Broker::new();broker.grant(2,1).unwrap();broker.grant(3,2).unwrap();
         let mut svc=UserSurfaceService{
             session:Session::new(800,600).unwrap(),
-            commands:[[UserCommand::EMPTY;COMMAND_LIMIT];2],counts:[0,0],
+            commands:CommandStore::new(),counts:[0,0],
             focused:0,broker,frames_presented:0,launcher_visible:false,desktop_actions:0,
+            #[cfg(feature="normal-desktop")]retired_streams:0,
             #[cfg(feature="test-r031-supervisor")]
             restart_count:0,
             mouse:unsafe{core::mem::zeroed()},
@@ -797,12 +1143,12 @@ mod tests{
         let replace=text(REPLACE_TEXT,b"A");
         assert!(!svc.submit(3,&replace)); // No existing field.
         assert!(svc.submit(3,&text(TEXT,b"LONGER")));
-        let original=svc.commands;
+        let original=svc.commands.snapshot();
         assert!(!svc.submit(2,&replace));
         let mut moved=replace;moved[16]=25;
         assert!(!svc.submit(3,&moved));
         assert!(!svc.submit_with(3,&replace,|_|false));
-        assert_eq!(svc.commands,original);assert_eq!(svc.counts,[0,1]);
+        assert_eq!(svc.commands.snapshot(),original);assert_eq!(svc.counts,[0,1]);
         let p=Palette{bg:2,top:3,bar:4,title:5,unfocused:6,light:7,dark:8,panel:9,white:10,accent:11};
         const PITCH:usize=804;const GUARD:u32=0xfeedface;
         let mut pixels=std::vec![GUARD;PITCH*600+16];
@@ -832,7 +1178,7 @@ mod tests{
         assert_eq!(svc.broker.grant_epoch_for(2,1),Ok(last_peer));
         assert!(!svc.submit(3,&replace));
     }
-    #[cfg(feature="test-r029-desktop-suite")]
+    #[cfg(any(feature="test-r029-desktop-suite",feature="normal-desktop"))]
     #[test]fn retained_clients_obey_visibility_through_authenticated_present(){
         // No firmware mapping or PS/2 I/O: only the destination and RGB packing
         // differ from boot. present_with and paint are the production paths.
@@ -840,8 +1186,9 @@ mod tests{
         broker.grant(2,1).unwrap();broker.grant(3,2).unwrap();
         let mut svc=UserSurfaceService{
             session:Session::new(800,600).unwrap(),
-            commands:[[UserCommand::EMPTY;COMMAND_LIMIT];2],counts:[0,0],
+            commands:CommandStore::new(),counts:[0,0],
             focused:0,broker,frames_presented:0,launcher_visible:false,
+            #[cfg(feature="normal-desktop")]retired_streams:0,
             desktop_actions:0,
             #[cfg(feature="test-r031-supervisor")]
             restart_count:0,
@@ -863,6 +1210,18 @@ mod tests{
             if operation==TEXT{b[32]=b'X';}
             b
         }
+        let presenter=if cfg!(feature="normal-desktop"){4}else{1};
+        fn present(svc:&mut UserSurfaceService,pid:u32,front:u32,out:&mut Surface)->bool{
+            #[cfg(feature="normal-desktop")]
+            {
+                let Some(mut frame)=svc.window_frame(pid)else{return false;};
+                if !(1..=2).contains(&front){return false;}
+                frame.front=front as u8;frame.windows[front as usize-1].minimized=false;
+                svc.apply_window_frame(pid,&frame.wire(),|s|s.paint(out))
+            }
+            #[cfg(not(feature="normal-desktop"))]
+            {svc.present_with(pid,front,|s|s.paint(out))}
+        }
         const FILES:u32=0x123456;
         const TERMINAL:u32=0xabcdef;
         for (pid,id,color) in [(2,1,FILES),(3,2,TERMINAL)]{
@@ -870,9 +1229,9 @@ mod tests{
             assert!(svc.submit(pid,&wire(id,TEXT,color)));
         }
         // Files-GUI presents require the real client startup threshold.
-        #[cfg(feature="test-r031-files-gui")]
+        #[cfg(any(feature="test-r031-files-gui",feature="normal-desktop"))]
         for _ in 0..3{assert!(svc.submit(2,&wire(1,FILL,FILES)));}
-        let retained=svc.commands;
+        let retained=svc.commands.snapshot();
         let retained_counts=svc.counts;
         let p=Palette{bg:2,top:3,bar:4,title:5,unfocused:6,
             light:7,dark:8,panel:9,white:10,accent:11};
@@ -883,7 +1242,7 @@ mod tests{
             pitch:PITCH*4,palette:p,
             rgb:|r,g,b|Some(((r as u32)<<16)|((g as u32)<<8)|b as u32)};
         let pixel=|data:&[u32],x:usize,y:usize|data[y*PITCH+x];
-        assert!(svc.present_with(1,2,|s|s.paint(&mut out)));
+        assert!(present(&mut svc,presenter,2,&mut out));
         // Terminal content overlaps Files' titlebar while Terminal is in front.
         assert_eq!(pixel(&pixels,115,105),TERMINAL);
         svc.session.desktop.minimize(2).unwrap();
@@ -899,21 +1258,21 @@ mod tests{
         // trigger composition or restore its hidden window via frame present.
         assert!(!svc.submit(2,&wire(2,FILL,0xff0000)));
         for pid in [0,2,3,99]{
-            assert!(!svc.present_with(pid,2,|s|s.paint(&mut out)));
+            assert!(!present(&mut svc,pid,2,&mut out));
         }
-        assert!(!svc.present_with(1,99,|s|s.paint(&mut out)));
+        assert!(!present(&mut svc,presenter,99,&mut out));
         assert_eq!(pixels,before);assert_eq!(svc.frames_presented,frame);
         assert!(svc.window(2).unwrap().minimized);
-        assert_eq!(svc.commands,retained);assert_eq!(svc.counts,retained_counts);
-        assert!(svc.present_with(1,1,|s|s.paint(&mut out)));
+        assert_eq!(svc.commands.snapshot(),retained);assert_eq!(svc.counts,retained_counts);
+        assert!(present(&mut svc,presenter,1,&mut out));
         assert_eq!(pixel(&pixels,115,105),p.title);
         assert_eq!(pixel(&pixels,115,160),FILES);
         assert!(!pixels.contains(&TERMINAL));
         // An explicit server-selected focus restores the independent backing.
-        assert!(svc.present_with(1,2,|s|s.paint(&mut out)));
+        assert!(present(&mut svc,presenter,2,&mut out));
         assert_eq!(pixel(&pixels,115,105),TERMINAL);
         // With both visible, back-to-front replay preserves peer chrome too.
-        assert!(svc.present_with(1,1,|s|s.paint(&mut out)));
+        assert!(present(&mut svc,presenter,1,&mut out));
         assert_eq!(pixel(&pixels,115,105),p.title);
         assert_eq!(pixel(&pixels,115,160),FILES);
         // Even with its desktop window still visible, a process that
@@ -925,12 +1284,21 @@ mod tests{
         assert!(!svc.session.was_down);
         assert!(svc.paint(&mut out));
         assert!(!pixels.contains(&TERMINAL));
+        #[cfg(not(feature="normal-desktop"))]
         assert_eq!(svc.counts,retained_counts);
+        #[cfg(feature="normal-desktop")]
+        assert_eq!(svc.counts,[retained_counts[0],0]);
         svc.session.desktop.close(2).unwrap();
         assert!(!svc.submit(3,&wire(2,FILL,0xff0000)));
-        assert!(svc.present_with(1,1,|s|s.paint(&mut out)));
+        #[cfg(not(feature="normal-desktop"))]
+        assert!(present(&mut svc,presenter,1,&mut out));
+        #[cfg(feature="normal-desktop")]
+        {assert!(!present(&mut svc,presenter,1,&mut out));assert!(svc.paint(&mut out));}
         assert!(!pixels.contains(&TERMINAL));
-        assert_eq!(svc.commands,retained);
+        #[cfg(not(feature="normal-desktop"))]
+        assert_eq!(svc.commands.snapshot(),retained);
+        #[cfg(feature="normal-desktop")]
+        assert_eq!(svc.commands.snapshot(),[retained[0],[UserCommand::EMPTY;COMMAND_LIMIT]]);
         assert_eq!(&pixels[PITCH*600..],&[GUARD;16]);
         for row in 0..600{assert_eq!(&pixels[row*PITCH+800..(row+1)*PITCH],&[GUARD;4]);}
     }

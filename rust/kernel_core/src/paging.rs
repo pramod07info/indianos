@@ -174,6 +174,151 @@ pub unsafe extern "C" fn paging_clone_kernel_half(
 ) -> bool {
     unsafe { clone_root(backend, source, result, true) }
 }
+
+// Build the replacement for one huge leaf privately. Only after every table
+// and the guard hole are ready is its parent entry published. The surrounding
+// data frames remain borrowed and must never be passed to release().
+#[derive(Debug,Default)]
+pub(crate) struct GuardFailure{pub retained:[u64;2]}
+impl GuardFailure{
+    unsafe fn release_or_retain(&mut self,b:&Backend,frame:u64){
+        if !unsafe{release(b,frame)}{
+            // A split has at most two private tables (1GiB -> 2MiB -> 4KiB).
+            let slot=if self.retained[0]==0{0}else{1};
+            self.retained[slot]=frame;
+        }
+    }
+}
+unsafe fn split_guard_leaf(b:&Backend,entry:u64,level:u8,va:u64,
+    forbidden:&[u64])->Result<u64,GuardFailure>{
+    if !(2..=3).contains(&level)||entry&(PRESENT|HUGE)!=(PRESENT|HUGE){return Err(GuardFailure::default());}
+    let size=1u64<<(12+9*(level as u32-1));
+    // Bit12 is PAT in a huge leaf; the remaining low physical-address bits
+    // are reserved. Reject malformed leaves instead of rounding them down.
+    if entry&PHYS&(size-1)&!(1<<12)!=0{return Err(GuardFailure::default());}
+    let mut physical=0;
+    if !unsafe{(b.allocate.unwrap())(&mut physical,b.context)}{return Err(GuardFailure::default());}
+    if !valid_frame(physical)||forbidden.contains(&physical){return Err(GuardFailure::default());}
+    let table=unsafe{at(b,physical)};
+    if !unsafe{table_clear(table)}{
+        let mut failure=GuardFailure::default();
+        unsafe{failure.release_or_retain(b,physical)};return Err(failure);
+    }
+    let base=entry&PHYS&!(size-1);
+    let child_size=size/512;
+    let mut flags=entry&!PHYS;
+    if level==2{
+        // Huge PDE PS(bit7) disappears; its PAT(bit12) moves to PTE bit7.
+        flags&=!HUGE;
+        if entry&(1<<12)!=0{flags|=1<<7;}
+    }else{
+        // Child PDEs remain huge and keep their huge-leaf PAT bit12.
+        flags|=entry&(1<<12);
+    }
+    for i in 0..512{
+        unsafe{ptr::write_volatile(table.add(i),base+i as u64*child_size|flags);}
+    }
+    let selected=((va>>(12+9*(level as u32-2)))&511) as usize;
+    if level==2{
+        unsafe{ptr::write_volatile(table.add(selected),0);}
+    }else{
+        let mut ancestors=[0u64;6];
+        if forbidden.len()>=ancestors.len(){
+            let mut failure=GuardFailure::default();
+            unsafe{failure.release_or_retain(b,physical)};return Err(failure);
+        }
+        ancestors[..forbidden.len()].copy_from_slice(forbidden);
+        ancestors[forbidden.len()]=physical;
+        let child=unsafe{ptr::read(table.add(selected))};
+        let replacement=match unsafe{split_guard_leaf(b,child,2,va,
+            &ancestors[..forbidden.len()+1])}{
+            Ok(replacement)=>replacement,
+            Err(mut failure)=>{
+                unsafe{failure.release_or_retain(b,physical)};return Err(failure);
+            }
+        };
+        unsafe{ptr::write_volatile(table.add(selected),replacement);}
+    }
+    // Cache/PAT/global/dirty/protection-key leaf attributes stay in children;
+    // these are table pointers, not data mappings. Preserve RW/U/NX limits.
+    Ok(physical|PRESENT|(entry&(2|4|(1u64<<63))))
+}
+
+/// Remove one upper-half 4KiB guard mapping without reclaiming its borrowed
+/// data frame. Huge leaves are split privately and published with one store;
+/// allocation/access failures leave the original mapping intact. Newly
+/// installed table frames belong permanently to this source root, so callers
+/// must not include them in a transient process rollback baseline.
+/// Failed releases are returned as retained frame ownership; callers must keep
+/// that record live and refuse re-entry rather than forget or reuse the frames.
+///
+/// # Safety
+/// The caller exclusively owns this root and its tables, supplies a backend
+/// that allocates fresh non-aliasing frames, and serializes all access. For an
+/// active root, mask interrupts on the BSP and invalidate the guard VA's TLB
+/// translation before using the root or cloning it. No SMP shootdown occurs.
+pub(crate) unsafe fn guard_kernel_page(b:&Backend,root:u64,va:u64)->Result<(),GuardFailure>{
+    if !backend_valid(b)||!valid_frame(root)||!canonical(va)||
+       va&(1<<47)==0||va&4095!=0{return Err(GuardFailure::default());}
+    let mut frame=root;
+    let mut ancestors=[0u64;4];
+    for level in (1u8..=4).rev(){
+        ancestors[(4-level) as usize]=frame;
+        let table=unsafe{at(b,frame)};
+        if table.is_null(){return Err(GuardFailure::default());}
+        let index=((va>>(12+9*(level as u32-1)))&511) as usize;
+        let entry=unsafe{ptr::read(table.add(index))};
+        if entry&PRESENT==0{
+            return if entry==0{Ok(())}else{Err(GuardFailure::default())};
+        }
+        if level==1{
+            unsafe{ptr::write_volatile(table.add(index),0);}
+            return Ok(());
+        }
+        if entry&HUGE!=0{
+            let replacement=unsafe{split_guard_leaf(b,entry,level,va,
+                &ancestors[..(5-level) as usize])}?;
+            unsafe{ptr::write_volatile(table.add(index),replacement);}
+            return Ok(());
+        }
+        frame=entry&PHYS;
+        if !valid_frame(frame){return Err(GuardFailure::default());}
+    }
+    Err(GuardFailure::default())
+}
+
+/// Effective hardware permissions for one kernel stack page. Unlike the
+/// historical paging_lookup ABI (which returns leaf attributes), RW and U/S
+/// are ANDed across the entire walk and NX is ORed across it. The caller has
+/// already established CR0.WP/NXE in the CPU paging preflight.
+///
+/// # Safety
+/// The root and its readable backend remain live and are exclusively held or
+/// otherwise protected against modification for the duration of this query.
+pub(crate) unsafe fn kernel_stack_page_flags(b:&Backend,root:u64,va:u64)->Option<u64>{
+    if !backend_valid(b)||!valid_frame(root)||!canonical(va)||
+       va&(1<<47)==0||va&4095!=0{return None;}
+    let mut frame=root;
+    let(mut writable,mut user,mut nx)=(true,true,false);
+    for level in (1u8..=4).rev(){
+        let table=unsafe{at(b,frame)};
+        if table.is_null(){return None;}
+        let shift=12+9*(level as u32-1);
+        let entry=unsafe{ptr::read(table.add(((va>>shift)&511) as usize))};
+        if entry&PRESENT==0||(level==4&&entry&HUGE!=0){return None;}
+        writable&=entry&2!=0;
+        user&=entry&4!=0;
+        nx|=entry&(1u64<<63)!=0;
+        if level==1||entry&HUGE!=0{
+            if level>1&&entry&PHYS&((1u64<<shift)-1)&!(1<<12)!=0{return None;}
+            return Some(PRESENT|if writable{2}else{0}|if user{4}else{0}|
+                if nx{1u64<<63}else{0});
+        }
+        frame=entry&PHYS;
+        if !valid_frame(frame){return None;}
+    }
+    None
+}
 unsafe fn graft(
     backend: *const Backend, kernel_root: u64, user_root: u64, attach: bool,
 ) -> bool {
@@ -287,6 +432,186 @@ mod tests {
         assert!(valid_frame(0x1000));
         assert!(!valid_frame(0x1234));
     }
+}
+
+#[cfg(test)]
+mod kernel_guard_tests{
+ use super::*;
+ const VA:u64=0xffff800000205000;
+ const NX:u64=1<<63;
+ struct Memory{
+  tables:[[u64;512];12],live:[bool;12],allocations:usize,releases:usize,
+  fail_allocation:usize,deny_access:u64,fail_release:bool,
+ }
+ impl Memory{
+  fn huge(level:u8,flags:u64)->Self{
+   let mut m=Self{tables:[[0;512];12],live:[false;12],allocations:0,
+    releases:0,fail_allocation:usize::MAX,deny_access:0,fail_release:false};
+   m.live[0]=true;m.live[1]=true;
+   m.tables[0][256]=0x2000|3;
+   if level==3{m.tables[1][0]=0x40000000|flags|PRESENT|HUGE;}
+   else{
+    m.live[2]=true;m.tables[1][0]=0x3000|3;
+    m.tables[2][1]=0x600000|flags|PRESENT|HUGE;
+   }
+   m
+  }
+  fn backend(&mut self)->Backend{
+   Backend{allocate:Some(allocate),release:Some(free),access:Some(access),
+    context:(self as *mut Self).cast()}
+  }
+ }
+ unsafe extern "C" fn allocate(out:*mut u64,context:*mut c_void)->bool{
+  let m=unsafe{&mut*(context as *mut Memory)};
+  m.allocations+=1;
+  if m.allocations==m.fail_allocation{return false;}
+  let Some(slot)=m.live.iter().position(|&live|!live)else{return false;};
+  m.live[slot]=true;
+  unsafe{ptr::write(out,(slot as u64+1)*4096)};true
+ }
+ unsafe extern "C" fn free(frame:u64,context:*mut c_void)->bool{
+  let m=unsafe{&mut*(context as *mut Memory)};
+  let index=(frame/4096-1) as usize;
+  if m.fail_release||!m.live[index]{return false;}
+  m.live[index]=false;m.releases+=1;true
+ }
+ unsafe extern "C" fn access(frame:u64,context:*mut c_void)->*mut u64{
+  let m=unsafe{&mut*(context as *mut Memory)};
+  if frame==m.deny_access||!valid_frame(frame){return ptr::null_mut();}
+  let i=(frame/4096-1) as usize;
+  if i>=m.live.len()||!m.live[i]{return ptr::null_mut();}
+  m.tables[i].as_mut_ptr()
+ }
+ fn translated(b:&Backend,va:u64)->Option<(u64,u64)>{
+  let(mut physical,mut flags)=(0,0);
+  unsafe{paging_lookup(b,0x1000,va,&mut physical,&mut flags)}
+    .then_some((physical,flags))
+ }
+ #[test]fn kernel_stack_effective_rw_rejects_readonly_pml4_pdpt_pd_and_pt(){
+  for (table,index) in [(0,256),(1,0),(2,1),(3,5)]{
+   let mut m=Memory::huge(2,2|NX);
+   m.tables[2][1]=0x4000|3;m.live[3]=true;
+   m.tables[3][5]=0x900000|3|NX;
+   m.tables[table][index]&=!2;
+   let b=m.backend();
+   let flags=unsafe{kernel_stack_page_flags(&b,0x1000,VA)}.unwrap();
+   assert_eq!(flags&3,1,"readonly level table {table}");
+   assert_eq!(flags&NX,NX);
+   // The previous leaf-only query is intentionally unchanged, and would
+   // report a writable leaf under any of the three readonly ancestors.
+   if table!=3{assert_eq!(translated(&b,VA).unwrap().1&2,2);}
+   assert_eq!(m.allocations,0);assert_eq!(m.releases,0);
+  }
+ }
+ #[test]fn kernel_stack_effective_rw_applies_to_two_megabyte_and_one_gigabyte_leaves(){
+  for level in [2,3]{
+   let leaf=if level==3{(1,0)}else{(2,1)};
+   let paths=if level==3{&[(0,256),(1,0)][..]}else{&[(0,256),(1,0),(2,1)][..]};
+   for &(table,index) in paths{
+    let mut m=Memory::huge(level,2|NX|(1<<12));
+    let b=m.backend();
+    assert_eq!(unsafe{kernel_stack_page_flags(&b,0x1000,VA)}.unwrap()&3,3);
+    m.tables[table][index]&=!2;
+    assert_eq!(unsafe{kernel_stack_page_flags(&b,0x1000,VA)}.unwrap()&3,1);
+    if (table,index)!=leaf{assert_eq!(translated(&b,VA).unwrap().1&2,2);}
+   }
+  }
+ }
+ #[test]fn kernel_stack_effective_nx_and_supervisor_permissions_include_ancestors(){
+  let mut m=Memory::huge(2,2|4);let b=m.backend();
+  m.tables[0][256]|=NX;
+  // Leaf NX is clear and its U/S flag is set. The supervisor PML4 and NX
+  // ancestor still make this a nonexecutable supervisor mapping on hardware.
+  assert_eq!(translated(&b,VA).unwrap().1&NX,0);
+  assert_eq!(unsafe{kernel_stack_page_flags(&b,0x1000,VA)},Some(3|NX));
+  m.tables[0][256]|=4;m.tables[1][0]|=4;
+  assert_eq!(unsafe{kernel_stack_page_flags(&b,0x1000,VA)},Some(7|NX));
+  m.tables[2][1]=2;
+  assert!(unsafe{kernel_stack_page_flags(&b,0x1000,VA)}.is_none());
+  m.tables[2][1]=0x602000|3|NX|HUGE;
+  assert!(unsafe{kernel_stack_page_flags(&b,0x1000,VA)}.is_none());
+  m.tables[0][256]|=HUGE;
+  assert!(unsafe{kernel_stack_page_flags(&b,0x1000,VA)}.is_none());
+ }
+ #[test]fn kernel_guard_splits_two_megabyte_leaf_and_preserves_pat_and_neighbors(){
+  for pat in [false,true]{
+   let mut m=Memory::huge(2,2|NX|0x100|0x40|if pat{1<<12}else{0});
+   let b=m.backend();let before=translated(&b,VA+4096).unwrap().0;
+   assert!(unsafe{guard_kernel_page(&b,0x1000,VA)}.is_ok());
+   assert!(translated(&b,VA).is_none());
+   let (physical,flags)=translated(&b,VA+4096).unwrap();
+   assert_eq!(physical,before);
+   assert_eq!(flags&3,3);assert_eq!(flags&NX,NX);
+   assert_eq!(flags&0x100,0x100);assert_eq!(flags&0x40,0x40);
+   assert_eq!(flags&(1<<7),if pat{1<<7}else{0});
+   assert_eq!(m.allocations,1);assert_eq!(m.releases,0);
+   assert!(unsafe{guard_kernel_page(&b,0x1000,VA)}.is_ok());
+   assert_eq!(m.allocations,1);
+  }
+ }
+ #[test]fn kernel_guard_splits_one_gigabyte_leaf_without_changing_other_huge_ranges(){
+  let mut m=Memory::huge(3,2|NX|(1<<12)|0x100);
+  let b=m.backend();let distant=translated(&b,VA+0x200000).unwrap().0;
+  let near=translated(&b,VA-4096).unwrap().0;
+  assert!(unsafe{guard_kernel_page(&b,0x1000,VA)}.is_ok());
+  assert!(translated(&b,VA).is_none());
+  assert_eq!(translated(&b,VA-4096).unwrap().0,near);
+  assert_eq!(translated(&b,VA+0x200000).unwrap().0,distant);
+  let (physical,flags)=translated(&b,VA+4096).unwrap();
+  assert_eq!(physical,0x40206000);assert_ne!(flags&(1<<7),0);
+  assert_eq!(m.allocations,2);assert_eq!(m.releases,0);
+ }
+ #[test]fn kernel_guard_split_allocation_failure_never_publishes_partial_mapping(){
+  for failed in [1,2]{
+   let mut m=Memory::huge(3,2|NX|(1<<12));
+   let original=m.tables[1][0];let live=m.live;
+   m.fail_allocation=failed;
+   let b=m.backend();let before=translated(&b,VA).unwrap();
+   assert!(unsafe{guard_kernel_page(&b,0x1000,VA)}.is_err());
+   assert_eq!(m.tables[1][0],original);assert_eq!(m.live,live);
+   assert_eq!(translated(&b,VA),Some(before));
+  }
+ }
+ #[test]fn kernel_guard_split_inaccessible_table_reclaims_private_allocation(){
+  let mut m=Memory::huge(2,2|NX);m.deny_access=0x4000;
+  let original=m.tables[2][1];let live=m.live;
+  let b=m.backend();
+  assert!(unsafe{guard_kernel_page(&b,0x1000,VA)}.is_err());
+  assert_eq!(m.tables[2][1],original);assert_eq!(m.live,live);
+  assert_eq!(m.releases,1);
+ }
+ #[test]fn kernel_guard_failed_cleanup_retains_both_private_frame_owners(){
+  let mut m=Memory::huge(3,2|NX);m.deny_access=0x4000;m.fail_release=true;
+  let original=m.tables[1][0];let b=m.backend();
+  let failure=unsafe{guard_kernel_page(&b,0x1000,VA)}.unwrap_err();
+  assert_eq!(failure.retained,[0x4000,0x3000]);
+  assert_eq!(m.tables[1][0],original);
+  assert!(m.live[2]&&m.live[3]);assert_eq!(m.releases,0);
+  assert!(translated(&b,VA).is_some());
+ }
+ #[test]fn kernel_guard_rejects_low_unaligned_and_reserved_huge_entries_before_allocation(){
+  let mut m=Memory::huge(2,2|NX);let b=m.backend();
+  for va in [0x400000,VA+1,0x0000800000000000]{
+   assert!(unsafe{guard_kernel_page(&b,0x1000,va)}.is_err());
+  }
+  m.tables[2][1]|=1<<13;
+  assert!(unsafe{guard_kernel_page(&b,0x1000,VA)}.is_err());
+  m.tables[2][1]=2; // non-present software state is not a reserved guard hole
+  assert!(unsafe{guard_kernel_page(&b,0x1000,VA)}.is_err());
+  m.tables[0][256]|=HUGE; // a PML4 entry cannot be a huge leaf
+  assert!(unsafe{guard_kernel_page(&b,0x1000,VA)}.is_err());
+  assert_eq!(m.allocations,0);
+ }
+ #[test]fn kernel_guard_removes_four_kib_leaf_without_allocating_or_freeing_payload(){
+  let mut m=Memory::huge(2,2|NX);m.tables[2][1]=0x4000|3;
+  m.live[3]=true;m.tables[3][5]=0x900000|3|NX;
+  m.tables[3][6]=0x901000|3|NX;
+  let b=m.backend();
+  assert!(unsafe{guard_kernel_page(&b,0x1000,VA)}.is_ok());
+  assert!(translated(&b,VA).is_none());
+  assert_eq!(translated(&b,VA+4096).unwrap().0,0x901000);
+  assert_eq!(m.allocations,0);assert_eq!(m.releases,0);
+ }
 }
 
 #[cfg(test)]

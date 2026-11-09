@@ -37,10 +37,15 @@ Files and Terminal, and integration/QA.
 - [ ] **M1.1 current slice**: authenticated Terminal commands connected to
       checksummed block-backed HierVfs with real read/write/mkdir/rename,
       UI damage and read-after-remount acceptance (Rust test); then
-      prove the same live ring-3 GUI commands on QEMU.
+      prove the same live ring-3 GUI commands on QEMU. Implementation and local
+      runtime exits are exercised by PR765's exact-glyph two-boot scenario;
+      final acceptance awaits its new exact-head CI/review. See
+      [positions 6–7 evidence](M1_GATES_6_7_ACCEPTANCE.md).
 - [ ] **M1 partition work**: defensive MBR/GPT header/entry checksum checks,
       bounds and overlap rejection, selected-partition read/write window,
-      actual HierVfs remount tests. Physical disk qualification pending.
+      actual HierVfs remount tests. The PR765 candidate includes semantic GPT
+      rejection and actual ATA write-failure acceptance; final exact-head
+      CI/review remains required. Physical qualification is tracked under G8.
 - [ ] Production normal boot starts PID1, user compositor, Files and Terminal
       without test-only kernel feature flags.
 - [ ] Move full compositor and input broker from ring0 to independent ring3
@@ -60,10 +65,24 @@ read back after reboot; process isolation, screenshot/keyboard/mouse,
 filesystem corruption and recovery acceptance all pass at exact commit SHA.
 
 Latest bounded implementation evidence: [normal startup and ownership
-integration](M1_MAJOR_INTEGRATION.md). Normal boot now executes a ring-3 PID1
-serial bootstrap console; graphical normal startup remains open. This batch
-adds live Terminal listing/size, descriptor truncation and ownership/recovery
-hardening. It accepts no additional high-level M1 gate.
+integration](M1_MAJOR_INTEGRATION.md), [native Desktop boot selection](M1_NATIVE_DESKTOP_BOOT.md),
+[lifecycle verification](DESKTOP_LIFECYCLE_BOUNDARY.md) and
+[guarded command surfaces](M1_GUARDED_COMMAND_SURFACES.md). Checklist positions
+8–13 (G3–G8 in issue #616) remain **IN PROGRESS**; see their consolidated
+[implementation and acceptance mapping](M1_GATES_8_10_ACCEPTANCE.md). The normal four-service
+desktop now has trusted build selection, kernel-verified readiness and durable
+shutdown, plus two private command payloads with guard mappings preserved on
+restart. The independent ring-3 compositor owns window policy; privileged
+clipping/rasterization and input hardware access remain kernel primitives.
+Physical-input delivery preserves mouse button edges, quarantines keyboard
+device overruns and invalidates suspended Terminal commands on transport loss.
+Raw input is restricted to the ready broker and withdrawn on shutdown arming.
+Checkpoint publication verifies referenced payloads across metadata writes and
+durability barriers. Cross-process Terminal requests are bound to submitted
+commands; ATA geometry admission validates declared IDENTIFY checksums.
+This batch adds source and positive/negative acceptance tests without local
+execution, as requested. Exact-head GitHub Actions, actual QEMU evidence and
+review are still required; no additional high-level M1 gate is accepted here.
 
 ## M2 — Developer Alpha
 

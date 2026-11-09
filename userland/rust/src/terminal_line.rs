@@ -3,8 +3,15 @@
 //! validates every resulting request before its existing file syscall.
 pub const CAPACITY:usize=32;
 pub const MAX_NOTE:usize=20;
+/// PID1 must apply current compositor focus even when an editor session is
+/// suspended. Keeping a line open grants no authority over another window's
+/// physical keyboard input. Enter starts editing only in the Terminal.
+pub fn accepts_input(front:u32,editing:bool,key:u8)->bool{
+ front==2&&(editing||key==b'\n')
+}
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
-pub enum Action{Changed,Read,List,Stat,Write{bytes:[u8;MAX_NOTE],len:usize},Invalid,Leave}
+pub enum Action{Changed,Read,List,Stat,Write{bytes:[u8;MAX_NOTE],len:usize},
+ Filesystem(crate::terminal_fs::Command),Invalid,Leave}
 pub struct Line{bytes:[u8;CAPACITY],len:usize,overflow:bool}
 impl Line{
  pub const fn new()->Self{Self{bytes:[0;CAPACITY],len:0,overflow:false}}
@@ -30,6 +37,8 @@ impl Line{
        let mut bytes=[0;MAX_NOTE];bytes[..data.len()].copy_from_slice(data);
        Action::Write{bytes,len:data.len()}
       }
+     }else if let Some(command)=crate::terminal_fs::parse(&self.bytes[..self.len]){
+      Action::Filesystem(command)
      }else{Action::Invalid};
     self.clear();action
    },
@@ -38,7 +47,11 @@ impl Line{
     else{self.overflow=true;}
     Action::Changed
    },
-   _=>Action::Invalid,
+   _=>{
+    // A transport loss/control byte cannot splice a valid command. Keep the
+    // entire line poisoned until Enter or an explicit editor cancellation.
+    self.bytes.fill(0);self.len=0;self.overflow=true;Action::Invalid
+   },
   }
  }
 }

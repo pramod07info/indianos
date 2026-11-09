@@ -6,6 +6,7 @@ on:
     paths:
       - "rust/kernel_core/**"
       - "userland/rust/**"
+      - "tools/rust/**"
       - "tools/test_*.py"
       - "tests/test_*.py"
       - "Makefile"
@@ -15,6 +16,7 @@ on:
     paths:
       - "rust/kernel_core/**"
       - "userland/rust/**"
+      - "tools/rust/**"
       - "tools/test_*.py"
       - "tests/test_*.py"
       - "Makefile"
@@ -106,5 +108,75 @@ jobs:
         with:
           name: m1-runtime-acceptance-${{ github.sha }}
           path: build/acceptance-logs/
+          if-no-files-found: error
+          retention-days: 14
+
+
+  normal-desktop-qemu:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify exact source revision
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: python3 tools/verify_ci_sha.py --expected "$EXPECTED_SHA" --observed "$(git rev-parse HEAD)"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
+      - name: Install disposable GPT and OVMF acceptance dependencies
+        run: |
+          sudo apt-get update -o Acquire::Retries=3
+          sudo apt-get install -y --no-install-recommends clang lld binutils xorriso qemu-system-x86 ovmf curl
+      - name: Normal desktop host, freestanding and harness regression checks
+        run: |
+          set -euo pipefail
+          mkdir -p build/normal-desktop-logs
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features normal-desktop 2>&1 | tee build/normal-desktop-logs/host.log
+          cargo check --locked --offline --manifest-path rust/kernel_core/Cargo.toml --no-default-features --target x86_64-unknown-none --features normal-desktop 2>&1 | tee build/normal-desktop-logs/no-std.log
+          python3 -m unittest discover -s tests -p 'test_normal_desktop_acceptance.py' -v 2>&1 | tee build/normal-desktop-logs/harness.log
+          python3 -m unittest discover -s tests -p 'test_desktop_boot_profile.py' -v 2>&1 | tee build/normal-desktop-logs/profile.log
+          rustc --edition=2021 --test userland/rust/tests/desktop_window.rs -o build/normal-desktop-logs/desktop-window-tests
+          build/normal-desktop-logs/desktop-window-tests 2>&1 | tee build/normal-desktop-logs/window-policy.log
+          rustc --edition=2021 --test userland/rust/tests/desktop_startup.rs -o build/normal-desktop-logs/desktop-startup-tests
+          build/normal-desktop-logs/desktop-startup-tests 2>&1 | tee build/normal-desktop-logs/startup-protocol.log
+          rustc --edition=2021 --test userland/rust/tests/terminal_broker.rs -o build/normal-desktop-logs/terminal-broker-tests
+          build/normal-desktop-logs/terminal-broker-tests 2>&1 | tee build/normal-desktop-logs/terminal-broker.log
+          cargo test --locked --offline --manifest-path tools/rust/Cargo.toml --features desktop-volume,desktop-fixture --bin indianos-desktop-volume --test desktop_volume_cli 2>&1 | tee build/normal-desktop-logs/volume-tool.log
+      - name: Explicitly provision new disposable GPT media with the actual filesystem
+        run: |
+          set -euo pipefail
+          mkdir -p build/normal-desktop-fixture
+          cargo run --locked --offline --release --manifest-path tools/rust/Cargo.toml --features desktop-fixture --bin indianos-desktop-fixture -- \
+            --output "$PWD/build/normal-desktop-fixture/volume.raw" \
+            --selection-output "$PWD/build/normal-desktop-fixture/volume.bin" 2>&1 | tee build/normal-desktop-logs/fixture.log
+      - name: Build the normal four-service desktop without experimental feature flags
+        run: |
+          set -euo pipefail
+          make desktop-image DESKTOP_BUILD=build/normal-desktop RUST_CORE=1 \
+            DESKTOP_VOLUME_CONFIG="$PWD/build/normal-desktop-fixture/volume.bin" 2>&1 | tee build/normal-desktop-logs/image.log
+      - name: Actual physical input, selected GPT reboot, compositor and recovery evidence
+        run: |
+          set -euo pipefail
+          OVMF_PATH=""
+          for path in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/edk2/ovmf/OVMF_CODE_4M.fd /usr/share/edk2/ovmf/OVMF_CODE.fd; do
+            if test -f "$path"; then OVMF_PATH="$path"; break; fi
+          done
+          test -n "$OVMF_PATH"
+          python3 tools/test_normal_desktop_qemu.py --iso build/normal-desktop/indianos.iso \
+            --disk build/normal-desktop-fixture/volume.raw --qemu qemu-system-x86_64 \
+            --ovmf "$OVMF_PATH" --artifact-dir build/normal-desktop-artifacts \
+            2>&1 | tee build/normal-desktop-logs/qemu.log
+      - name: Retain real screenshots and serial evidence even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: normal-desktop-acceptance-${{ github.event.pull_request.head.sha || github.sha }}
+          path: |
+            build/normal-desktop-logs/
+            build/normal-desktop-artifacts/
           if-no-files-found: error
           retention-days: 14

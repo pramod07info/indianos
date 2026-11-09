@@ -31,6 +31,9 @@ unsafe extern "C" {
     fn x86_64_m009_schedule_run(a:*const u8,asize:usize,b:*const u8,bsize:usize)->bool;
     #[cfg(feature="test-r029-desktop-suite")]
     fn x86_64_r029_desktop_suite_run(a:*const u8,al:usize,b:*const u8,bl:usize,c:*const u8,cl:usize)->bool;
+    #[cfg(feature="normal-desktop")]
+    fn x86_64_desktop_session_run(a:*const u8,al:usize,b:*const u8,bl:usize,
+        c:*const u8,cl:usize,d:*const u8,dl:usize)->bool;
     #[cfg(feature="test-shell")]
     fn indianos_r013_take_worker_request()->bool;
 }
@@ -132,6 +135,33 @@ fn module(name:&'static [u8])->Option<(*const u8,usize)>{
         return None;
     }
     Some((data,len))
+}
+/// Selection is supplied by the boot image, never inferred from the first disk
+/// or a userspace pathname. It is an integrity pin, not a firmware trust root.
+#[cfg(feature="normal-desktop")]
+fn desktop_volume_selection(bytes:&[u8])->Option<crate::m1_partition::GptSelection>{
+    use crate::m1_partition::{GptSelection,Partition,Scheme};
+    if bytes.len()!=64 || &bytes[..8]!=b"INDVOL01" || bytes[12..16]!=[0;4]{
+        return None;
+    }
+    let index=u32::from_le_bytes(bytes[8..12].try_into().ok()?);
+    let disk_guid=bytes[16..32].try_into().ok()?;
+    let unique_partition_guid=bytes[32..48].try_into().ok()?;
+    let start=u64::from_le_bytes(bytes[48..56].try_into().ok()?);
+    let sectors=u64::from_le_bytes(bytes[56..64].try_into().ok()?);
+    if index>=crate::m1_partition::MAX_GPT_ENTRIES as u32 ||
+       disk_guid==[0;16] || unique_partition_guid==[0;16] || start==0 ||
+       sectors<crate::durablefs::MIN_SECTORS || start.checked_add(sectors).is_none(){
+        return None;
+    }
+    Some(GptSelection{partition:Partition{scheme:Scheme::Gpt,index,start,sectors},
+        disk_guid,unique_partition_guid})
+}
+#[cfg(feature="normal-desktop")]
+fn desktop_service_images_valid(images:[&[u8];4])->bool{
+    // Validate the entire dependency set before installing GUI grants, opening
+    // selected storage, allocating a PCB or dispatching the first service.
+    images.iter().all(|image|crate::program::plan_elf64(image).is_some())
 }
 #[no_mangle]
 pub extern "C" fn kmain()->!{
@@ -695,6 +725,54 @@ pub extern "C" fn kmain()->!{
     }
     log(b"IndianOS: initramfs /bin/init staged and released safely\n\0");
 
+    #[cfg(feature="normal-desktop")]
+    {
+        let files=module(b"/bin/files\0").unwrap_or_else(||
+            recover_init(b"IndianOS recovery: reason=desktop-service-unavailable\n\0"));
+        let terminal=module(b"/bin/terminal\0").unwrap_or_else(||
+            recover_init(b"IndianOS recovery: reason=desktop-service-unavailable\n\0"));
+        let compositor=module(b"/bin/compositor\0").unwrap_or_else(||
+            recover_init(b"IndianOS recovery: reason=desktop-service-unavailable\n\0"));
+        let images=[(init,init_size),files,terminal,compositor];
+        // The initramfs parser supplies validated, live boot-module slices.
+        let bytes=images.map(|(address,length)|unsafe{
+            core::slice::from_raw_parts(address,length)});
+        if !desktop_service_images_valid(bytes){
+            recover_init(b"IndianOS recovery: reason=desktop-service-invalid\n\0")
+        }
+        log(b"IndianOS normal desktop: service images validated\n\0");
+        let selection=module(b"/etc/desktop-volume\0").and_then(|(address,length)|{
+            desktop_volume_selection(unsafe{core::slice::from_raw_parts(address,length)})
+        }).unwrap_or_else(||recover_init(
+            b"IndianOS recovery: reason=desktop-volume-selection-invalid\n\0"));
+        if !crate::user_runtime::runtime_prepare_selected_volume(selection){
+            recover_init(b"IndianOS recovery: reason=desktop-storage-unavailable\n\0")
+        }
+        log(b"IndianOS normal desktop: selected storage admitted\n\0");
+        // One retry per boot, without resetting selected-volume identity,
+        // quotas, file tokens or monotonic process generations. A clean
+        // shutdown never restarts; uncertain I/O or teardown fails closed.
+        for attempt in 0..=1 {
+            if !crate::gui::user_surface_start(){
+                recover_init(b"IndianOS recovery: reason=desktop-display-unavailable\n\0")
+            }
+            log(b"IndianOS normal desktop: starting four ring3 services\n\0");
+            let clean=unsafe{x86_64_desktop_session_run(init,init_size,files.0,files.1,
+                terminal.0,terminal.1,compositor.0,compositor.1)};
+            if clean{break;}
+            if attempt==1 {
+                log(b"IndianOS normal desktop: restart budget exhausted\n\0");
+                recover_init(b"IndianOS recovery: reason=desktop-session-failed\n\0")
+            }
+            if !crate::user_runtime::runtime_revalidate_desktop_restart(selection){
+                recover_init(b"IndianOS recovery: reason=desktop-session-failed\n\0")
+            }
+            log(b"IndianOS normal desktop: restarting retired service session\n\0");
+        }
+        log(b"IndianOS normal desktop: services stopped and resources reclaimed\n\0");
+        recover_init(b"IndianOS recovery: reason=desktop-session-stopped\n\0")
+    }
+
     #[cfg(all(feature="test-shell",not(feature="test-r026"),not(feature="test-r029-userspace")))]
     {
         // Scripted ring-3 init -> validated spawn -> distinct worker lifetime.
@@ -883,6 +961,67 @@ pub extern "C" fn kmain()->!{
 #[cfg(test)]
 mod recovery_tests{
     use super::*;
+    #[cfg(feature="normal-desktop")]
+    fn desktop_config()->[u8;64]{
+        let mut config=[0;64];config[..8].copy_from_slice(b"INDVOL01");
+        config[16..32].fill(1);config[32..48].fill(2);
+        config[48..56].copy_from_slice(&40u64.to_le_bytes());
+        config[56..64].copy_from_slice(&100u64.to_le_bytes());config
+    }
+    #[cfg(feature="normal-desktop")]
+    #[test]fn desktop_selection_requires_complete_canonical_explicit_identity(){
+        let config=desktop_config();let selection=desktop_volume_selection(&config).unwrap();
+        assert_eq!(selection.partition.index,0);assert_eq!(selection.partition.start,40);
+        assert_eq!(selection.partition.sectors,100);assert_eq!(selection.disk_guid,[1;16]);
+        assert_eq!(selection.unique_partition_guid,[2;16]);
+        assert!(desktop_volume_selection(&config[..63]).is_none());
+        let mut long=config.to_vec();long.push(0);
+        assert!(desktop_volume_selection(&long).is_none());
+        for offset in [0,12]{
+            let mut invalid=config;invalid[offset]^=0xff;
+            assert!(desktop_volume_selection(&invalid).is_none());
+        }
+        for range in [16..32,32..48,48..56,56..64]{
+            let mut invalid=config;invalid[range].fill(0);
+            assert!(desktop_volume_selection(&invalid).is_none());
+        }
+        let mut invalid=config;invalid[8..12].copy_from_slice(&128u32.to_le_bytes());
+        assert!(desktop_volume_selection(&invalid).is_none());
+        let mut invalid=config;invalid[48..56].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(desktop_volume_selection(&invalid).is_none());
+    }
+    #[cfg(feature="normal-desktop")]
+    fn desktop_elf()->std::vec::Vec<u8>{
+        let mut image=std::vec![0;4097];
+        image[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+        image[16..18].copy_from_slice(&2u16.to_le_bytes());
+        image[18..20].copy_from_slice(&62u16.to_le_bytes());
+        image[20..24].copy_from_slice(&1u32.to_le_bytes());
+        image[24..32].copy_from_slice(&crate::syscall::USER_MIN.to_le_bytes());
+        image[32..40].copy_from_slice(&64u64.to_le_bytes());
+        image[52..54].copy_from_slice(&64u16.to_le_bytes());
+        image[54..56].copy_from_slice(&56u16.to_le_bytes());
+        image[56..58].copy_from_slice(&1u16.to_le_bytes());
+        image[64..68].copy_from_slice(&1u32.to_le_bytes());
+        image[68..72].copy_from_slice(&5u32.to_le_bytes());
+        image[72..80].copy_from_slice(&4096u64.to_le_bytes());
+        image[80..88].copy_from_slice(&crate::syscall::USER_MIN.to_le_bytes());
+        image[96..104].copy_from_slice(&1u64.to_le_bytes());
+        image[104..112].copy_from_slice(&4096u64.to_le_bytes());
+        image[112..120].copy_from_slice(&4096u64.to_le_bytes());image[4096]=0xc3;image
+    }
+    #[cfg(feature="normal-desktop")]
+    #[test]fn desktop_preflight_validates_all_four_services_before_admission(){
+        let valid=desktop_elf();assert!(desktop_service_images_valid([&valid;4]));
+        let invalid=[0u8;64];
+        for slot in 0..4{
+            let mut services=[valid.as_slice();4];services[slot]=&invalid;
+            assert!(!desktop_service_images_valid(services));
+        }
+        let mut writable_code=valid.clone();writable_code[68]=7;
+        assert!(!desktop_service_images_valid([&valid,&valid,&valid,&writable_code]));
+        assert!(!desktop_service_images_valid([&valid,&valid,&valid,&valid[..4096]]));
+    }
     fn feed(line:&mut RecoveryLine,bytes:&[u8])->std::vec::Vec<RecoveryCommand>{
         bytes.iter().filter_map(|b|line.feed(*b)).collect()
     }

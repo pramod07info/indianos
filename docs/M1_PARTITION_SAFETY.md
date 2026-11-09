@@ -24,3 +24,31 @@ test-r031-vfs passed. Combined reboot/mount tests run on the integration SHA.
 cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml \
   --features test-r031-vfs m1_partition::
 ```
+
+## Protective-MBR geometry and QEMU fault media
+
+The GPT protective MBR must start at LBA1 and cover exactly the remaining disk
+capacity, saturated at `u32::MAX` only when the disk is larger than that field.
+An oversized protective entry on a small disk is rejected before GPT selection,
+just like a truncated entry. Regressions include zero/short/long coverage and a
+bounded virtual large disk that proves valid saturation remains supported.
+
+The host-only disposable fixture tool can create valid-checksum layout faults:
+
+```
+indianos-desktop-fixture --partition-fault overlap --output NEW.raw
+indianos-desktop-fixture --partition-fault duplicate-id --output NEW.raw
+indianos-desktop-fixture --partition-fault protective-overflow --output NEW.raw
+```
+
+Both GPT headers and entry arrays retain valid matching CRCs, the first selected
+entry remains unchanged, and the selected COW filesystem remains healthy. The
+overlap case introduces a second overlapping entry; the duplicate-ID case uses
+separate in-range extents with the same unique GUID. Only partition metadata
+changes. Tests verify each precise rejection and repair only the named fixture
+fault as a positive control. Existing files, symlinks and physical devices cannot
+be overwritten because output uses the same new-file-only `.raw` writer.
+
+These fixtures support actual QEMU admission/rejection evidence. Their presence
+does not itself close G2: combined exact-SHA host, boot/remount, failure and CI
+evidence must still pass before the coordinator updates its acceptance ledger.
