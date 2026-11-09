@@ -77,6 +77,11 @@ clipping/rasterization and input hardware access remain kernel primitives.
 Physical-input delivery preserves mouse button edges, quarantines keyboard
 device overruns and invalidates suspended Terminal commands on transport loss.
 Raw input is restricted to the ready broker and withdrawn on shutdown arming.
+The next integration adds real retained app pixel planes and authenticated
+range locks with filesystem ABI discovery; see
+[implementation and limits](M1_PIXEL_PLANES_AND_RANGE_LOCKS.md). These remain
+kernel-private planes and bounded nonblocking locks, not full app-mapped
+graphics, general blocking locks or physical hardware qualification.
 Checkpoint publication verifies referenced payloads across metadata writes and
 durability barriers. Cross-process Terminal requests are bound to submitted
 commands; ATA geometry admission validates declared IDENTIFY checksums.

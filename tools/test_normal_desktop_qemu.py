@@ -53,6 +53,8 @@ TERMINAL_AUTHORITY = (
     b"IndianOS user: desktop compositor denied input and filesystem authority",
     LIFECYCLE_READY.encode(),
     SURFACES_GUARDED.encode(),
+    b"IndianOS: desktop retained pixel surface guards verified",
+    b"IndianOS user: desktop Files verified filesystem ABI and owned range-lock lifecycle",
 )
 
 # Independent expected raster contract for the qualified normal desktop.
@@ -954,14 +956,14 @@ def verify_debug_stack_guards(debugger: GuestDebugger, records: list[tuple[int, 
         evidence.append(f"{phase}: guard {guard:#x} unreadable; usable {begin:#x}..{end:#x} readable")
 
 
-def surface_guard_records(raw: bytes) -> list[tuple[int, int, int, int]]:
-    if len(raw) != 64:
+def surface_guard_records(raw: bytes, payload_pages: int = 1) -> list[tuple[int, int, int, int]]:
+    if len(raw) != 64 or payload_pages not in (1, 594):
         raise AssertionError("surface guard ownership ledger is not 64 bytes")
     words = struct.unpack("<8Q", raw)
     records = [tuple(words[start:start + 4]) for start in (0, 4)]
     for lower, begin, end, upper in records:
         if (lower < 0xffff800000000000 or lower % 4096 or
-                begin != lower + 4096 or end != begin + 4096 or
+                begin != lower + 4096 or end != begin + payload_pages * 4096 or
                 upper != end or upper + 4096 > 1 << 64):
             raise AssertionError("invalid private surface guard geometry")
     ordered = sorted(records)
@@ -1152,6 +1154,7 @@ def transient_service_boot(qemu: str, iso: Path, ovmf: Path, disk: Path,
     target = unique_symbol(nm, service, ("desktop_window::Manager", "::wire"))
     expected = executable_bytes(compositor, target, 8)
     surface_ledger = unique_symbol(nm, kernel, ("DESKTOP_SURFACE_LAYOUT",))
+    pixel_ledger = unique_symbol(nm, kernel, ("DESKTOP_PIXEL_SURFACE_LAYOUT",))
     symbols = subprocess.run([nm, "-S", "-n", "-C", str(kernel)], check=True,
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15)
     guards = stack_guard_records(symbols.stdout.decode("ascii"))
@@ -1213,6 +1216,9 @@ def transient_service_boot(qemu: str, iso: Path, ovmf: Path, disk: Path,
         surface_layout = debugger.memory(surface_ledger, 64)
         surfaces = surface_guard_records(surface_layout)
         verify_debug_surface_guards(debugger, surfaces, evidence, "PID4 cloned root")
+        pixel_layout = debugger.memory(pixel_ledger, 64)
+        pixel_surfaces = surface_guard_records(pixel_layout, 594)
+        verify_debug_surface_guards(debugger, pixel_surfaces, evidence, "PID4 retained pixels")
         cloned_root = stopped_root(session)
         evidence.append(f"PID4 cloned CR3={cloned_root:#x}")
         if not debugger.command(f"m{unmapped:x},1").startswith("E"):
@@ -1283,6 +1289,9 @@ def transient_service_boot(qemu: str, iso: Path, ovmf: Path, disk: Path,
         if debugger.memory(surface_ledger, 64) != surface_layout:
             raise AssertionError("desktop restart changed source-owned private surface identity")
         verify_debug_surface_guards(debugger, surfaces, evidence, "reclaimed recovery kernel")
+        if debugger.memory(pixel_ledger, 64) != pixel_layout:
+            raise AssertionError("desktop restart relocated private pixel backing")
+        verify_debug_surface_guards(debugger, pixel_surfaces, evidence, "reclaimed retained pixels")
         if debugger.command("D") != "OK":
             raise AssertionError("kernel guard debugger failed to detach")
         debugger.close()

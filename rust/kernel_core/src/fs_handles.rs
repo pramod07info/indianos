@@ -13,6 +13,12 @@ use core::marker::PhantomData;
 
 pub const READ:u64=1;
 pub const WRITE:u64=2;
+/// Versioned descriptor ABI query, returned by filesystem operation 37.
+pub const FS_ABI_VERSION:u16=1;
+pub const FS_ABI_DESCRIPTOR_BYTES:u16=64;
+pub const FS_ABI_FEATURES:u32=3; // basic descriptors, nonblocking range locks
+pub const FS_ABI_INFO:u64=FS_ABI_VERSION as u64|
+    ((FS_ABI_DESCRIPTOR_BYTES as u64)<<16)|((FS_ABI_FEATURES as u64)<<32);
 const SLOTS:usize=4;
 #[derive(Clone,Copy)]
 struct Handle {
@@ -22,10 +28,12 @@ struct Handle {
     // could otherwise redirect this handle to unrelated content.
     filesystem_generation:u64,
     path:[u8;24], len:usize,
+    lock_kind:u8,lock_start:u64,lock_end:u64,
 }
 impl Handle{
     const EMPTY:Self=Self{token:0,pid:0,generation:0,mode:0,offset:0,
-        filesystem_generation:0,path:[0;24],len:0};
+        filesystem_generation:0,path:[0;24],len:0,
+        lock_kind:0,lock_start:0,lock_end:0};
     fn pathname(&self)->&str{
         core::str::from_utf8(&self.path[..self.len]).unwrap()
     }
@@ -376,6 +384,49 @@ impl FileHandles{
     fn descriptor_action_mutates(action:u64)->bool{
         matches!(action,3|6..=13|16|24|26|28..=32)
     }
+    fn lock_range(argument:u64)->Result<(u64,u64),FsError>{
+        let start=argument&0xffff_ffff;let length=argument>>32;
+        let end=if length==0{MAX_FILE_BYTES as u64}
+            else{start.checked_add(length).ok_or(FsError::TooLarge)?};
+        if start>=end||end>MAX_FILE_BYTES as u64{return Err(FsError::TooLarge);}
+        Ok((start,end))
+    }
+    fn conflicting_lock(&self,owner:Identity,path:&str,start:u64,end:u64,write:bool)->bool{
+        self.entries.iter().any(|peer|peer.token!=0&&peer.lock_kind!=0&&
+            (peer.pid!=owner.pid||peer.generation!=owner.generation)&&
+            peer.pathname()==path&&start<peer.lock_end&&peer.lock_start<end&&
+            (write||peer.lock_kind==2))
+    }
+    /// Locks are cached capabilities, owned by the descriptor's authenticated
+    /// process incarnation. Closing/revoking a handle removes its lock too.
+    fn descriptor_control(&mut self,action:u64,owner:Identity,token:u64,
+        argument:u64,path:&str,buffer:&[u8])->Result<u64,FsError>{
+        if !self.owns(owner)||!path.is_empty()||!buffer.is_empty(){
+            return Err(FsError::InvalidName);
+        }
+        if self.selected_volume.is_some(){self.selected_operation_guard(owner)?;}
+        if action==37{
+            if token!=0||argument!=0{return Err(FsError::InvalidName);}
+            return Ok(FS_ABI_INFO);
+        }
+        let slot=self.index(owner,token)?;let handle=self.entries[slot];
+        if !self.root_allows(owner,handle.pathname()){return Err(FsError::InvalidName);}
+        if action==36{
+            if argument!=0{return Err(FsError::InvalidName);}
+            self.entries[slot].lock_kind=0;
+            self.entries[slot].lock_start=0;self.entries[slot].lock_end=0;
+            return Ok(0);
+        }
+        if !matches!(action,34|35)||(action==34&&handle.mode&READ==0)||
+            (action==35&&handle.mode&WRITE==0){return Err(FsError::InvalidName);}
+        let (start,end)=Self::lock_range(argument)?;
+        if self.conflicting_lock(owner,handle.pathname(),start,end,action==35){
+            return Ok(1); // contention preserves the caller's prior lock
+        }
+        self.entries[slot].lock_kind=if action==34{1}else{2};
+        self.entries[slot].lock_start=start;self.entries[slot].lock_end=end;
+        Ok(0)
+    }
     /// Trusted preflight on a selected physical volume: refuse forged
     /// handles, foreign process epochs and protected namespace requests
     /// BEFORE disk discovery, mount, filesystem reads or any DMA-backed I/O.
@@ -384,6 +435,17 @@ impl FileHandles{
                           argument:u64,path:&str,buffer:&[u8])
                           ->Result<(),FsError>{
         if !self.owns(owner){return Err(FsError::InvalidName);}
+        if matches!(action,34..=37){
+            if !path.is_empty()||!buffer.is_empty(){return Err(FsError::InvalidName);}
+            if action==37{return if token==0&&argument==0{Ok(())}else{Err(FsError::InvalidName)};}
+            let handle=self.entries[self.index(owner,token)?];
+            if !self.root_allows(owner,handle.pathname())||
+                (action==34&&handle.mode&READ==0)||(action==35&&handle.mode&WRITE==0){
+                return Err(FsError::InvalidName);
+            }
+            if action==36{return if argument==0{Ok(())}else{Err(FsError::InvalidName)};}
+            Self::lock_range(argument)?;return Ok(());
+        }
         match action{
             1|29=>{
                 if token!=0{return Err(FsError::InvalidName);}
@@ -493,7 +555,8 @@ impl FileHandles{
         let token=self.next;
         self.next=self.next.checked_add(1).ok_or(FsError::Full)?;
         self.entries[slot]=Handle{token,pid:owner.pid,generation:owner.generation,
-            mode,offset:0,filesystem_generation:fs.generation(),path:bytes,len};
+            mode,offset:0,filesystem_generation:fs.generation(),path:bytes,len,
+            lock_kind:0,lock_start:0,lock_end:0};
         Ok(token)
     }
     pub fn read<D:BlockDevice>(&mut self,pid:u32,token:u64,
@@ -514,6 +577,8 @@ impl FileHandles{
             // closing and reopening the handle.
             return Err(FsError::InvalidName);
         }
+        let end=h.offset.checked_add(out.len() as u64).ok_or(FsError::TooLarge)?;
+        if self.conflicting_lock(owner,h.pathname(),h.offset,end,false){return Err(FsError::Full);}
         // Stage the read into a bounded private buffer. The underlying
         // filesystem may return an I/O error after touching its destination:
         // no prefix or corrupt device bytes may leak to the caller.
@@ -552,6 +617,8 @@ impl FileHandles{
             // volume snapshot; require explicit fresh object selection.
             return Err(FsError::InvalidName);
         }
+        let end=h.offset.checked_add(input.len() as u64).ok_or(FsError::TooLarge)?;
+        if self.conflicting_lock(owner,h.pathname(),h.offset,end,true){return Err(FsError::Full);}
         // Authorize immediately before mutation, not only on open.
         // The budget is shared by all handles and survives close/reopen.
         if self.write_guard.preflight(h.pathname(),input.len()).is_err(){
@@ -1096,6 +1163,19 @@ impl FileHandles{
                                    token:u64,argument:u64,path:&str,
                                    buffer:&mut [u8],fs:&mut HierVfs<D>)
                                    ->Result<u64,FsError>{
+        if matches!(action,34..=37){
+            return self.descriptor_control(action,owner,token,argument,path,buffer);
+        }
+        if !matches!(action,1..=5){
+            if let Ok(slot)=self.index(owner,token){
+                let h=self.entries[slot];
+                let read=matches!(action,2|14|15|17..=23|25);
+                if (read||Self::descriptor_action_mutates(action))&&
+                    self.conflicting_lock(owner,h.pathname(),0,MAX_FILE_BYTES as u64,!read){
+                    return Err(FsError::Full);
+                }
+            }
+        }
         if self.selected_volume.is_some()&&matches!(action,4|5){
             return self.cached_selected_descriptor_operation(
                 action,owner,token,argument,path,buffer);
@@ -1180,6 +1260,9 @@ pub fn operation_authenticated(table:&mut FileHandles,action:u64,owner:Identity,
 fn operation_for(table:&mut FileHandles,action:u64,owner:Identity,
                  token:u64,argument:u64,path:&str,buffer:&mut [u8])
                  ->Result<u64,FsError>{
+    if matches!(action,34..=37){
+        return table.descriptor_control(action,owner,token,argument,path,buffer);
+    }
     if let Some(receipt)=table.selected_volume{
         table.selected_operation_guard(owner)?;
         if matches!(action,4|5){
@@ -1430,6 +1513,10 @@ pub fn operation_on_selected_volume<D:BlockDevice>(
     let guard=table.selected_operation_guard(owner)?;
     if !table.selected_operation_guard_is_current(guard){
         return Err(FsError::InvalidName);
+    }
+    if matches!(action,34..=37){
+        if guard.selected_volume!=Some(receipt){return Err(FsError::InvalidVolume);}
+        return table.descriptor_control(action,owner,token,argument,path,buffer);
     }
     if matches!(action,4|5){
         // This route accepts an explicit receipt, unlike the runtime adapter.
@@ -2294,6 +2381,38 @@ mod r094_authenticated_cow_ops {
    assert_eq!(table.security_statistics().completed_writes,stats.completed_writes+1);
    if action==16{assert_eq!(read(&mut fs,"/shared/docs/src"),b"inside");}
   }
+ }
+ #[test]fn range_locks_preserve_disjoint_reads_conflicts_and_retirement(){
+  let mut fs=volume();let mut table=FileHandles::new();
+  let owner=table.bind_process(1).unwrap();let peer=table.bind_process(2).unwrap();
+  let fd=table.dispatch_authenticated(1,owner,0,READ|WRITE,"/shared/note",&mut[],&mut fs).unwrap();
+  let other=table.dispatch_authenticated(1,peer,0,READ,"/shared/note",&mut[],&mut fs).unwrap();
+  let range=|start:u64,len:u64|start|(len<<32);
+  assert_eq!(table.dispatch_authenticated(35,owner,fd,range(0,1),"",&mut[],&mut fs),Ok(0));
+  let mut byte=[0xa5];
+  assert_eq!(table.dispatch_authenticated(2,peer,other,0,"",&mut byte,&mut fs),Err(FsError::Full));
+  assert_eq!(byte,[0xa5]);
+  table.dispatch_authenticated(4,peer,other,1,"",&mut[],&mut fs).unwrap();
+  assert_eq!(table.dispatch_authenticated(2,peer,other,0,"",&mut byte,&mut fs),Ok(1));
+  assert_eq!(table.dispatch_authenticated(34,peer,other,range(1,1),"",&mut[],&mut fs),Ok(0));
+  assert_eq!(table.dispatch_authenticated(35,owner,fd,range(1,1),"",&mut[],&mut fs),Ok(1));
+  assert_eq!(table.entries[table.index(owner,fd).unwrap()].lock_start,0);
+  assert_eq!(table.dispatch_authenticated(34,peer,other,range(0,1),"",&mut[],&mut fs),Ok(1));
+  assert!(table.retire_process(owner));
+  assert_eq!(table.dispatch_authenticated(34,peer,other,range(0,1),"",&mut[],&mut fs),Ok(0));
+  assert_eq!(table.dispatch_authenticated(36,owner,fd,0,"",&mut[],&mut fs),Err(FsError::InvalidName));
+  assert_eq!(table.dispatch_authenticated(36,peer,other,0,"",&mut[],&mut fs),Ok(0));
+ }
+ #[test]fn filesystem_abi_and_lock_control_authenticate_without_native_device_probe(){
+  let mut table=FileHandles::new();let owner=table.bind_process(1).unwrap();
+  assert_eq!(operation_authenticated(&mut table,37,owner,0,0,"",&mut[]),Ok(FS_ABI_INFO));
+  assert_eq!(FS_ABI_INFO&0xffff,1);assert_eq!((FS_ABI_INFO>>16)&0xffff,64);
+  assert_eq!(operation_authenticated(&mut table,37,owner,1,0,"",&mut[]),Err(FsError::InvalidName));
+  assert_eq!(operation_authenticated(&mut table,37,owner,0,1,"",&mut[]),Err(FsError::InvalidName));
+  assert_eq!(FileHandles::lock_range(u64::MAX),Err(FsError::TooLarge));
+  assert_eq!(FileHandles::lock_range(MAX_FILE_BYTES as u64),Err(FsError::TooLarge));
+  let replacement=table.bind_process(1).unwrap();assert_ne!(owner,replacement);
+  assert_eq!(operation_authenticated(&mut table,37,owner,0,0,"",&mut[]),Err(FsError::InvalidName));
  }
  #[test]fn r094_forged_and_replaced_pid_cannot_mutate(){
   let mut fs=volume();let mut t=FileHandles::new();let o=t.bind_process(1).unwrap();

@@ -17,6 +17,17 @@ finally:
 
 
 class NormalDesktopControls(unittest.TestCase):
+    def test_pixel_ledger_requires_full_guarded_planes(self):
+        records = [(base, base + 4096, base + 595 * 4096, base + 595 * 4096)
+                   for base in (0xffff800010000000, 0xffff800020000000)]
+        raw = struct.pack("<8Q", *(word for record in records for word in record))
+        self.assertEqual(harness.surface_guard_records(raw, 594), records)
+        with self.assertRaises(AssertionError):
+            harness.surface_guard_records(raw)
+        with self.assertRaises(AssertionError):
+            harness.surface_guard_records(raw, 593)
+        with self.assertRaises(AssertionError):
+            harness.surface_guard_records(raw[:32] + raw[:32], 594)
     def test_editor_authority_requires_fresh_denial_and_no_unsolicited_commit(self):
         broker = b"IndianOS user: desktop broker denied filesystem request outside submitted Enter\n"
         app = b"IndianOS user: desktop Terminal unsolicited filesystem mutation denied\n"

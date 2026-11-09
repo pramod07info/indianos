@@ -7,6 +7,9 @@
 use core::ptr;
 use crate::desktop::{App,Desktop,Rect};
 use crate::{boot,console,input,ps2_mouse::{Mouse,Packet}};
+#[cfg(feature="normal-desktop")]
+#[path="app_pixels.rs"]
+mod app_pixels;
 
 const WIDTH_MIN:usize=640;
 const HEIGHT_MIN:usize=480;
@@ -271,6 +274,8 @@ struct UserSurfaceService{
     frames_presented:u32,
     #[cfg(feature="normal-desktop")]
     retired_streams:u8,
+    #[cfg(feature="normal-desktop")]
+    pixels:app_pixels::PixelCache,
     #[cfg(any(feature="test-r029-desktop-suite",feature="normal-desktop"))]
     launcher_visible:bool,
     #[cfg(any(feature="test-r029-desktop-suite",feature="normal-desktop"))]
@@ -366,6 +371,8 @@ impl UserSurfaceService{
             frames_presented:0,
             #[cfg(feature="normal-desktop")]
             retired_streams:0,
+            #[cfg(feature="normal-desktop")]
+            pixels:app_pixels::PixelCache::new(),
             #[cfg(any(feature="test-r029-desktop-suite",feature="normal-desktop"))]
             launcher_visible:false,
             #[cfg(any(feature="test-r029-desktop-suite",feature="normal-desktop"))]
@@ -380,6 +387,7 @@ impl UserSurfaceService{
         // The existing guard pages are already unmapped. Move live metadata
         // field-by-field and clear only the payload, never copy/drop guards.
         self.commands.clear();
+        self.pixels.clear();
         self.session=next.session;self.counts=next.counts;
         self.focused=next.focused;self.broker=next.broker;
         self.frames_presented=next.frames_presented;
@@ -422,12 +430,21 @@ impl UserSurfaceService{
             // Keep backing commands intact so an explicit focus can restore them.
             if !window.visible||window.minimized{continue;}
             out.draw_window(*window,self.session.desktop.focused()==Some(window.id));
-            let Some((origin_x,origin_y,_,_))=self.client_bounds(window.id)
+            let Some((origin_x,origin_y,client_width,client_height))=self.client_bounds(window.id)
                 else{return false;};
             let slot=window.id as usize-1;
             // A revoked client must never replay old raster commands,
             // even when its window remains visible until teardown.
             if self.broker.owner(window.id).is_none(){continue;}
+            #[cfg(feature="normal-desktop")]
+            {
+                let rgb=out.rgb;
+                if !self.pixels.blit(slot,client_width as usize,client_height as usize,
+                    &self.commands[slot][..self.counts[slot]],rgb,|x,y,color|{
+                        out.fill(origin_x+x as i32,origin_y+y as i32,1,1,color);
+                    }){return false;}
+            }
+            #[cfg(not(feature="normal-desktop"))]
             for command in &self.commands[slot][..self.counts[slot]]{
                 let rgb=command.rgb;
                 let Some(color)=(out.rgb)(
@@ -543,6 +560,7 @@ impl UserSurfaceService{
                     self.retired_streams|=1<<(window-1);
                 }
                 self.commands.clear_slot(window as usize-1);
+                self.pixels.clear_slot(window as usize-1);
                 self.counts[window as usize-1]=0;
             }
         }
@@ -690,6 +708,10 @@ pub(crate) fn user_surface_start()->bool{
 #[cfg(feature="normal-desktop")]
 pub(crate) fn surface_guard_layout()->Option<[(u64,u64,u64,u64);2]>{
     Some(user_service()?.commands.layout())
+}
+#[cfg(feature="normal-desktop")]
+pub(crate) fn pixel_surface_guard_layout()->[(u64,u64,u64,u64);2]{
+    app_pixels::guard_layout()
 }
 #[cfg(feature="normal-desktop")]
 pub(crate) fn desktop_window_query(pid:u32)->Option<[u8;64]>{
@@ -986,7 +1008,7 @@ mod tests{
         UserSurfaceService{session:Session::new(800,600).unwrap(),
             commands:CommandStore::new(),counts:[0,0],focused:0,broker,
             frames_presented:0,launcher_visible:false,desktop_actions:0,
-            retired_streams:0,
+            retired_streams:0,pixels:app_pixels::PixelCache::new(),
             #[cfg(feature="test-r031-supervisor")]restart_count:0,
             // State-only fixture; no hardware initialization is invoked.
             mouse:unsafe{core::mem::zeroed()},}
@@ -1096,7 +1118,7 @@ mod tests{
         let mut svc=UserSurfaceService{session:Session::new(800,600).unwrap(),
             commands:CommandStore::new(),counts:[0,0],
             focused:0,broker,frames_presented:0,launcher_visible:false,desktop_actions:0,
-            retired_streams:0,
+            retired_streams:0,pixels:app_pixels::PixelCache::new(),
             #[cfg(feature="test-r031-supervisor")]restart_count:0,
             mouse:unsafe{core::mem::zeroed()},};
         let before=svc.window_frame(4).unwrap().wire();
@@ -1124,6 +1146,7 @@ mod tests{
             commands:CommandStore::new(),counts:[0,0],
             focused:0,broker,frames_presented:0,launcher_visible:false,desktop_actions:0,
             #[cfg(feature="normal-desktop")]retired_streams:0,
+            #[cfg(feature="normal-desktop")]pixels:app_pixels::PixelCache::new(),
             #[cfg(feature="test-r031-supervisor")]
             restart_count:0,
             mouse:unsafe{core::mem::zeroed()},
@@ -1189,6 +1212,7 @@ mod tests{
             commands:CommandStore::new(),counts:[0,0],
             focused:0,broker,frames_presented:0,launcher_visible:false,
             #[cfg(feature="normal-desktop")]retired_streams:0,
+            #[cfg(feature="normal-desktop")]pixels:app_pixels::PixelCache::new(),
             desktop_actions:0,
             #[cfg(feature="test-r031-supervisor")]
             restart_count:0,
