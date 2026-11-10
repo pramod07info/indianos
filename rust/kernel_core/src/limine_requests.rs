@@ -17,6 +17,23 @@ struct Request {
     response:*const c_void,
 }
 #[repr(C)]
+struct StackSizeRequest{id:[u64;4],revision:u64,response:*const c_void,stack_size:u64}
+/// The optimized normal boot path exceeds the protocol's 64-KiB default:
+/// kmain plus nested authenticated GPT discovery alone need over 85 KiB.
+pub(crate) const BOOT_STACK_BYTES:u64=256*1024;
+#[used]
+#[link_section=".limine_requests"]
+static mut STACK_SIZE:StackSizeRequest=StackSizeRequest{
+    id:[COMMON[0],COMMON[1],0x224ef0460a8e8926,0xe1cb0fc25f46ea3d],
+    revision:0,response:ptr::null(),stack_size:BOOT_STACK_BYTES,
+};
+pub(crate) fn boot_stack_request_accepted()->bool{
+    // The protocol response acknowledges the requested size, not a new size
+    // chosen by the kernel. No allocation or stack relocation occurs here.
+    stack_response_accepted(unsafe{ptr::read_volatile(ptr::addr_of!(STACK_SIZE.response))})
+}
+fn stack_response_accepted(response:*const c_void)->bool{!response.is_null()}
+#[repr(C)]
 struct ModuleRequest {
     id:[u64;4],
     revision:u64,
@@ -188,6 +205,19 @@ mod tests{
         assert_eq!(offset_of!(Request,response),40);
         assert_eq!(offset_of!(ModuleRequest,internal_module_count),48);
         assert_eq!(BASE_REVISION_INIT,6);
+    }
+    #[test]
+    fn explicit_stack_request_matches_protocol_and_refuses_missing_acknowledgment(){
+        assert_eq!(size_of::<StackSizeRequest>(),56);
+        assert_eq!(offset_of!(StackSizeRequest,response),40);
+        assert_eq!(offset_of!(StackSizeRequest,stack_size),48);
+        assert_eq!(BOOT_STACK_BYTES%4096,0);
+        // The retained optimized boot artifact needs >85 KiB in its GPT path;
+        // leave headroom for data validation, diagnostics and compiler changes.
+        assert!(BOOT_STACK_BYTES>=128*1024);
+        assert!(!stack_response_accepted(ptr::null()));
+        let revision=0u64;
+        assert!(stack_response_accepted(ptr::addr_of!(revision).cast()));
     }
     const BASE_REVISION_INIT:u64=6;
 }

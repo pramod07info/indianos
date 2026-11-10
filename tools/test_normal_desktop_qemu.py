@@ -53,6 +53,7 @@ TERMINAL_AUTHORITY = (
     b"IndianOS user: desktop compositor denied input and filesystem authority",
     LIFECYCLE_READY.encode(),
     SURFACES_GUARDED.encode(),
+    b"IndianOS normal desktop: explicit 256 KiB boot stack acknowledged",
     b"IndianOS: desktop retained pixel surface guards verified",
     b"IndianOS user: desktop Files verified filesystem ABI and owned range-lock lifecycle",
 )
