@@ -269,6 +269,7 @@ mod batch2_acceptance;
 pub mod tinyfs;
 /// R027 opt-in checksummed copy-on-write persistent sector filesystem.
 pub mod durablefs;
+pub mod fs_permissions;
 #[cfg(any(feature="test-r030-ondevice",feature="normal-desktop"))]
 pub mod r030_ondevice;
 #[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]

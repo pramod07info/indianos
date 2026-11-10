@@ -1113,6 +1113,7 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
    };
    if matches!(request.arg0,2|3|5|36|37) && argument!=0{return BAD;}
    if request.arg0==37&&handle!=0{return BAD;}
+   if request.arg0==38&&argument>0o777{return BAD;}
    if matches!(request.arg0,4|6) && argument>crate::durablefs::MAX_FILE_BYTES as u64{
     return BAD;
    }

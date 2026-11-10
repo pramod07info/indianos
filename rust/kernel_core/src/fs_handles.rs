@@ -16,7 +16,7 @@ pub const WRITE:u64=2;
 /// Versioned descriptor ABI query, returned by filesystem operation 37.
 pub const FS_ABI_VERSION:u16=1;
 pub const FS_ABI_DESCRIPTOR_BYTES:u16=64;
-pub const FS_ABI_FEATURES:u32=3; // basic descriptors, nonblocking range locks
+pub const FS_ABI_FEATURES:u32=7; // descriptors, range locks, persistent mode permissions
 pub const FS_ABI_INFO:u64=FS_ABI_VERSION as u64|
     ((FS_ABI_DESCRIPTOR_BYTES as u64)<<16)|((FS_ABI_FEATURES as u64)<<32);
 const SLOTS:usize=4;
@@ -80,6 +80,7 @@ impl MountAlias {
 pub struct FileHandles{
     entries:[Handle;SLOTS],next:u64,
     owners:[u64;2],next_generation:u64,
+    credentials:[crate::fs_permissions::Credentials;2],
     roots:[RootGrant;2],
     root_revisions:[u64;2],
     last_syscall_namespace:Option<NamespaceReceipt>,
@@ -106,6 +107,7 @@ impl FileHandles{
         Self{
             entries:self.entries,next:self.next,
             owners:self.owners,next_generation:self.next_generation,
+            credentials:self.credentials,
             roots:self.roots,root_revisions:self.root_revisions,
             last_syscall_namespace:self.last_syscall_namespace,
             write_guard:self.write_guard.clone(),
@@ -117,6 +119,7 @@ impl FileHandles{
     pub const fn new()->Self{
         Self{entries:[Handle::EMPTY;SLOTS],next:1,
             owners:[0;2],next_generation:1,
+            credentials:[crate::fs_permissions::Credentials::kernel(0,0);2],
             roots:[RootGrant::EMPTY;2],
             root_revisions:[0;2],last_syscall_namespace:None,
             write_guard:WriteGuard::new(),selected_volume:None,
@@ -200,6 +203,9 @@ impl FileHandles{
             if h.pid==pid{*h=Handle::EMPTY;}
         }
         self.owners[(pid-1) as usize]=generation;
+        self.credentials[(pid-1) as usize]=if pid==1{
+            crate::fs_permissions::Credentials::kernel(0,0)
+        }else{crate::fs_permissions::Credentials::kernel(1000,1000)};
         // Default roots are minted only by the trusted kernel process bind.
         // PID2 is read-only and cannot escape the /shared namespace.
         let mut grant=RootGrant::EMPTY;
@@ -215,6 +221,24 @@ impl FileHandles{
     pub fn owns(&self,owner:Identity)->bool{
         (1..=2).contains(&owner.pid)&&owner.generation!=0&&
             self.owners[(owner.pid-1) as usize]==owner.generation
+    }
+    /// Trusted credential admission, never a userspace UID claim. Revoke old
+    /// handles before changing identity; rebinding starts from role defaults.
+    pub(crate) fn set_credentials_kernel(&mut self,owner:Identity,uid:u16,gid:u16)
+        ->Result<(),FsError>{
+        if !self.owns(owner){return Err(FsError::InvalidName);}
+        let revision=self.root_revisions[(owner.pid-1) as usize].checked_add(1)
+            .ok_or(FsError::Full)?;
+        for handle in &mut self.entries{
+            if handle.pid==owner.pid&&handle.generation==owner.generation{*handle=Handle::EMPTY;}
+        }
+        self.credentials[(owner.pid-1) as usize]=crate::fs_permissions::Credentials::kernel(uid,gid);
+        self.root_revisions[(owner.pid-1) as usize]=revision;
+        Ok(())
+    }
+    fn credentials_for(&self,owner:Identity)->Result<crate::fs_permissions::Credentials,FsError>{
+        if !self.owns(owner){return Err(FsError::InvalidName);}
+        Ok(self.credentials[(owner.pid-1) as usize])
     }
     /// Delayed/repeated teardown cannot retire a replacement with the same PID.
     pub fn retire_process(&mut self,owner:Identity)->bool{
@@ -382,7 +406,7 @@ impl FileHandles{
             (handle.pid!=owner.pid||handle.generation!=owner.generation))
     }
     fn descriptor_action_mutates(action:u64)->bool{
-        matches!(action,3|6..=13|16|24|26|28..=32)
+        matches!(action,3|6..=13|16|24|26|28..=32|38)
     }
     fn lock_range(argument:u64)->Result<(u64,u64),FsError>{
         let start=argument&0xffff_ffff;let length=argument>>32;
@@ -435,6 +459,15 @@ impl FileHandles{
                           argument:u64,path:&str,buffer:&[u8])
                           ->Result<(),FsError>{
         if !self.owns(owner){return Err(FsError::InvalidName);}
+        if action==38{
+            let handle=self.entries[self.index(owner,token)?];
+            if owner.pid!=1||!path.is_empty()||!buffer.is_empty()||argument>0o777||
+               !self.root_allows(owner,handle.pathname())||
+               WriteGuard::allow_path(handle.pathname()).is_err()||self.has_foreign_descriptors(owner){
+                return Err(FsError::InvalidName);
+            }
+            return Ok(());
+        }
         if matches!(action,34..=37){
             if !path.is_empty()||!buffer.is_empty(){return Err(FsError::InvalidName);}
             if action==37{return if token==0&&argument==0{Ok(())}else{Err(FsError::InvalidName)};}
@@ -1038,7 +1071,8 @@ impl FileHandles{
         if self.write_guard.preflight(canonical,amount).is_err(){
             return Err(FsError::InvalidName);
         }
-        fs.create(canonical,data)?;
+        if owner.generation!=0{fs.create_as(self.credentials_for(owner)?,canonical,data,0o644)?;}
+        else{fs.create(canonical,data)?;}
         self.write_guard.completed(amount);
         Ok(data.len() as u64)
     }
@@ -1165,6 +1199,34 @@ impl FileHandles{
                                    ->Result<u64,FsError>{
         if matches!(action,34..=37){
             return self.descriptor_control(action,owner,token,argument,path,buffer);
+        }
+        if owner.generation!=0{
+            let credentials=self.credentials_for(owner)?;
+            if action==1{
+                let access=(if argument&WRITE!=0{2}else{0})|(if argument&READ!=0{4}else{0});
+                fs.authorize_access(credentials,path,access)?;
+            }else if matches!(action,29|32){
+                fs.authorize_parent(credentials,path)?;
+            }else if !matches!(action,4|5){
+                let handle=self.entries[self.index(owner,token)?];
+                let access=if Self::descriptor_action_mutates(action){2}else{4};
+                fs.authorize_access(credentials,handle.pathname(),if matches!(action,27|38){0}else{access})?;
+                if matches!(action,13|16|30|31){
+                    fs.authorize_parent(credentials,handle.pathname())?;
+                    if matches!(action,13|16|31){fs.authorize_parent(credentials,path)?;}
+                }
+            }
+        }
+        if action==38{
+            self.preflight_selected(action,owner,token,argument,path,buffer)?;
+            let handle=self.entries[self.index(owner,token)?];
+            if handle.filesystem_generation!=fs.generation(){return Err(FsError::InvalidName);}
+            self.write_guard.preflight(handle.pathname(),1).map_err(|_|FsError::InvalidName)?;
+            fs.chmod_as(self.credentials_for(owner)?,handle.pathname(),argument as u16)?;
+            fs.sync()?;
+            self.write_guard.completed(1);
+            self.entries.fill(Handle::EMPTY);
+            return Ok(0);
         }
         if !matches!(action,1..=5){
             if let Ok(slot)=self.index(owner,token){
@@ -1386,9 +1448,22 @@ pub fn selected_path_operation_on_device<D:BlockDevice>(
         }
     };
     if !table.selected_operation_guard_is_current(guard){return Err(FsError::InvalidName);}
+    let credentials=table.credentials_for(owner)?;
+    match action{
+        1|3=>volume.authorize_parent(credentials,path)?,
+        2|6=>{volume.authorize_parent(credentials,path)?;volume.authorize_access(credentials,path,0)?;},
+        7|9=>{volume.authorize_parent(credentials,path)?;volume.authorize_parent(credentials,target)?;
+               volume.authorize_access(credentials,path,0)?;},
+        4|10=>volume.authorize_access(credentials,path,crate::fs_permissions::READ)?,
+        8=>volume.authorize_access(credentials,path,crate::fs_permissions::READ|crate::fs_permissions::SEARCH)?,
+        5|11=>volume.authorize_access(credentials,path,crate::fs_permissions::WRITE)?,
+        _=>return Err(FsError::InvalidName),
+    }
     let mut scratch=[0u8;crate::hier_vfs::MAX_TRANSFER];
     if matches!(action,3|5|11){scratch[..used].copy_from_slice(&buffer[..used]);}
     let outcome=match action{
+        1=>volume.mkdir_as(credentials,path,0o755).map(|_|0),
+        3=>volume.create_as(credentials,path,&scratch[..used],0o644).map(|_|0),
         10=>volume.read_at(path,offset,&mut scratch[..buffer.len()]),
         11=>volume.write_at(path,offset,&scratch[..used]),
         _=>volume.dispatch(action,path,target,&mut scratch[..buffer.len()],used),
@@ -1556,7 +1631,7 @@ pub fn operation_on_selected_volume<D:BlockDevice>(
          // Existing selected volume failed verification on a write: media
          // may be uncertain; revoke cached handles before the next syscall.
          if prior==Some(receipt)&&
-            matches!(action,3|6|7..=13|16|24|26|27|28..=32){
+            matches!(action,3|6|7..=13|16|24|26|27|28..=32|38){
              table.selected_quarantined=true;
              table.entries.fill(Handle::EMPTY);
          }
@@ -1588,7 +1663,7 @@ pub fn operation_on_selected_volume<D:BlockDevice>(
     // explicitly reprobes the exact same receipt with two healthy heads.
     // Closing a handle, process rebinding, or reopening never resets this.
     if matches!(outcome,Err(FsError::Io|FsError::InvalidVolume)) &&
-       matches!(action,3|6|7..=13|16|24|26|27|28..=32){
+       matches!(action,3|6|7..=13|16|24|26|27|28..=32|38){
         table.selected_quarantined=true;
         table.entries.fill(Handle::EMPTY);
     }
@@ -2413,6 +2488,56 @@ mod r094_authenticated_cow_ops {
   assert_eq!(FileHandles::lock_range(MAX_FILE_BYTES as u64),Err(FsError::TooLarge));
   let replacement=table.bind_process(1).unwrap();assert_ne!(owner,replacement);
   assert_eq!(operation_authenticated(&mut table,37,owner,0,0,"",&mut[]),Err(FsError::InvalidName));
+ }
+ #[test]fn persistent_permissions_enforce_kernel_credentials_and_native_chmod(){
+  struct FlushDisk(Disk);
+  impl BlockDevice for FlushDisk{
+   fn sector_count(&self)->u64{self.0.sector_count()}
+   fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{self.0.read_sector(lba,out)}
+   fn write_sector(&mut self,lba:u64,data:&[u8;SECTOR_BYTES])->Result<(),BlockError>{self.0.write_sector(lba,data)}
+   fn sync(&mut self)->Result<(),BlockError>{Ok(())}
+  }
+  let mut fs=HierVfs::mount_healthy(FlushDisk(volume().into_device())).unwrap();
+  let mut table=FileHandles::new();
+  let owner=table.bind_process(1).unwrap();let peer=table.bind_process(2).unwrap();
+  table.set_credentials_kernel(owner,1000,1000).unwrap();
+  table.set_credentials_kernel(peer,2000,2000).unwrap();
+  let creds=table.credentials_for(owner).unwrap();
+  fs.create_as(creds,"/shared/private",b"secret",0o600).unwrap();
+  let fd=table.dispatch_authenticated(1,owner,0,READ|WRITE,"/shared/private",&mut[],&mut fs).unwrap();
+  assert_eq!(table.dispatch_authenticated(1,peer,0,READ,"/shared/private",&mut[],&mut fs),Err(FsError::InvalidName));
+  assert_eq!(table.dispatch_authenticated(38,owner,fd,0o644,"",&mut[],&mut fs),Ok(0));
+  assert!(table.index(owner,fd).is_err());
+  let mut fs=HierVfs::mount_healthy(fs.into_device()).unwrap();
+  let mode=fs.permissions("/shared/private").unwrap();
+  assert_eq!((mode.owner,mode.group,mode.mode),(1000,1000,0o644));
+  let readable=table.dispatch_authenticated(1,peer,0,READ,"/shared/private",&mut[],&mut fs).unwrap();
+  let mut output=[0xa5;6];
+  assert_eq!(table.dispatch_authenticated(2,peer,readable,0,"",&mut output,&mut fs),Ok(6));
+  assert_eq!(&output,b"secret");
+  assert_eq!(table.dispatch_authenticated(38,peer,readable,0o777,"",&mut[],&mut fs),Err(FsError::InvalidName));
+  table.set_credentials_kernel(peer,3000,3000).unwrap();
+  assert!(table.index(peer,readable).is_err());
+  assert_eq!(table.credentials_for(peer).unwrap().uid(),3000);
+  let fresh=table.bind_process(2).unwrap();
+  assert_eq!(table.credentials_for(fresh).unwrap().uid(),1000);
+  assert_eq!(table.set_credentials_kernel(peer,0,0),Err(FsError::InvalidName));
+ }
+ #[test]fn directory_search_and_parent_write_permissions_survive_remount(){
+  let mut fs=volume();
+  let owner=crate::fs_permissions::Credentials::kernel(1000,1000);
+  let other=crate::fs_permissions::Credentials::kernel(2000,2000);
+  fs.mkdir_as(owner,"/shared/private",0o700).unwrap();
+  fs.create_as(owner,"/shared/private/n",b"hidden",0o644).unwrap();
+  let mut fs=HierVfs::mount_healthy(fs.into_device()).unwrap();
+  let mut output=[0xa5;6];
+  assert_eq!(fs.read_as(other,"/shared/private/n",&mut output),Err(FsError::InvalidName));
+  assert_eq!(output,[0xa5;6]);
+  assert_eq!(fs.create_as(other,"/shared/private/x",b"bad",0o777),Err(FsError::InvalidName));
+  assert_eq!(fs.chmod_as(other,"/shared/private",0o777),Err(FsError::InvalidName));
+  fs.chmod_as(owner,"/shared/private",0o755).unwrap();
+  assert_eq!(fs.read_as(other,"/shared/private/n",&mut output),Ok(6));
+  assert_eq!(&output,b"hidden");
  }
  #[test]fn r094_forged_and_replaced_pid_cannot_mutate(){
   let mut fs=volume();let mut t=FileHandles::new();let o=t.bind_process(1).unwrap();

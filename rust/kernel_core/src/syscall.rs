@@ -127,7 +127,7 @@ pub unsafe extern "C" fn indianos_syscall_validate(
         32 => (1..=if cfg!(feature="normal-desktop"){12}else{11}).contains(&request.arg0) &&
               user_range(plan,request.arg1,64,false), // installed native app
         #[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
-        33 => (matches!(request.arg0,1..=6|34..=37)) &&
+        33 => (matches!(request.arg0,1..=6|34..=38)) &&
               user_range(plan,request.arg1,64,false), // versioned handles/range locks
         #[cfg(feature="test-r031-files-gui")]
         36 => (1..=4).contains(&request.arg0) &&
@@ -241,7 +241,8 @@ mod tests {
             assert!(!check(33,operation,plan.stack_end-63));
         }
         assert!(!check(33,33,plan.stack_begin));
-        assert!(!check(33,38,plan.stack_begin));
+        assert!(check(33,38,plan.stack_begin));
+        assert!(!check(33,39,plan.stack_begin));
         // Hardware input preflights every destination before the runtime can
         // consume a physical byte; guard/kernel/overflow addresses cannot
         // drain the trusted broker's input stream.

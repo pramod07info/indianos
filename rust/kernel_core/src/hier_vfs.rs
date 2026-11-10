@@ -7,6 +7,7 @@ use crate::block::{BlockDevice,BlockWindow};
 use crate::durablefs::{DurableFs,FsError,VolumeHealth,MIN_SECTORS,MAX_FILE_BYTES};
 use crate::vfs_path::normalize_absolute;
 use crate::ata_pio::AtaPio;
+use crate::fs_permissions::{Credentials,Permissions,READ,WRITE,SEARCH};
 pub const MAX_TRANSFER:usize=256;
 const DIR_MARKER:&[u8;8]=b"INDDIR31";
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
@@ -97,6 +98,99 @@ impl<D:BlockDevice> HierVfs<D>{
  /// An actual persistence barrier, forwarded to the selected block device.
  /// Unsupported storage MUST return an error instead of false success.
  pub fn sync(&mut self)->Result<(),FsError>{self.fs.sync()}
+ /// Metadata-only authorization for a kernel-issued process credential.
+ /// Every directory in the path must be searchable. Symlinks are not followed.
+ pub fn authorize_access(&mut self,credentials:Credentials,path:&str,access:u16)
+  ->Result<(),FsError>{
+  if access&!7!=0{return Err(FsError::InvalidName);}
+  if path=="/"{
+   return if (Permissions{owner:0,group:0,mode:0o755}).allows(credentials,access){Ok(())}
+       else{Err(FsError::InvalidName)};
+  }
+  let p=checked(path,Kind::File)?;let name=p.path();
+  for (offset,&byte) in name.as_bytes().iter().enumerate().skip(1){
+   if byte!=b'/'{continue;}
+   let ancestor=checked(&name[..offset],Kind::Directory)?;
+   let permission=self.fs.permissions_path(ancestor.name())?;
+   if !permission.allows(credentials,SEARCH){return Err(FsError::InvalidName);}
+   self.directory(ancestor.path())?;
+  }
+  self.access_object(credentials,p.path(),access)
+ }
+ fn access_object(&mut self,credentials:Credentials,path:&str,access:u16)
+  ->Result<(),FsError>{
+  let mut found=None;
+  for kind in [Kind::File,Kind::Directory,Kind::Symlink]{
+   let key=checked(path,kind)?;
+   match self.fs.permissions_path(key.name()){
+    Ok(permission)=>{
+     if found.is_some(){return Err(FsError::InvalidVolume);}
+     found=Some(permission);
+    },Err(FsError::NotFound)=>{},Err(error)=>return Err(error),
+   }
+  }
+  let permission=found.ok_or(FsError::NotFound)?;
+  if permission.allows(credentials,access){Ok(())}else{Err(FsError::InvalidName)}
+ }
+ /// Creating, removing and renaming names requires parent write+search,
+ /// independently of permission on the existing file's data.
+ pub fn authorize_parent(&mut self,credentials:Credentials,path:&str)
+  ->Result<(),FsError>{
+  let p=checked(path,Kind::File)?;
+  let end=p.path().rfind('/').ok_or(FsError::InvalidName)?;
+  if end==0{return self.authorize_access(credentials,"/",WRITE|SEARCH);}
+  let parent=&p.path()[..end];
+  self.authorize_access(credentials,parent,WRITE|SEARCH)?;
+  self.directory(parent)
+ }
+ pub fn permissions(&mut self,path:&str)->Result<Permissions,FsError>{
+  for kind in [Kind::File,Kind::Directory,Kind::Symlink]{
+   let p=checked(path,kind)?;
+   match self.fs.permissions_path(p.name()){
+    Ok(permission)=>return Ok(permission),
+    Err(FsError::NotFound)=>{},Err(error)=>return Err(error),
+   }
+  }
+  Err(FsError::NotFound)
+ }
+ pub fn chmod_as(&mut self,credentials:Credentials,path:&str,mode:u16)
+  ->Result<(),FsError>{
+  self.authorize_access(credentials,path,0)?;
+  for kind in [Kind::File,Kind::Directory,Kind::Symlink]{
+   let p=checked(path,kind)?;
+   match self.fs.permissions_path(p.name()){
+    Ok(_)=>return self.fs.chmod_path(p.name(),credentials,mode),
+    Err(FsError::NotFound)=>{},Err(error)=>return Err(error),
+   }
+  }
+  Err(FsError::NotFound)
+ }
+ pub fn create_as(&mut self,credentials:Credentials,path:&str,data:&[u8],mode:u16)
+  ->Result<(),FsError>{
+  self.authorize_parent(credentials,path)?;
+  let p=checked(path,Kind::File)?;self.parents(&p)?;
+  if self.conflicting(p.path(),Kind::File)?{return Err(FsError::Exists);}
+  self.fs.create_owned_path(p.name(),data,credentials,mode)
+ }
+ pub fn mkdir_as(&mut self,credentials:Credentials,path:&str,mode:u16)
+  ->Result<(),FsError>{
+  self.authorize_parent(credentials,path)?;
+  let p=checked(path,Kind::Directory)?;self.parents(&p)?;
+  if self.conflicting(p.path(),Kind::Directory)?{return Err(FsError::Exists);}
+  self.fs.create_owned_path(p.name(),DIR_MARKER,credentials,mode)
+ }
+ pub fn read_as(&mut self,credentials:Credentials,path:&str,out:&mut[u8])
+  ->Result<usize,FsError>{self.authorize_access(credentials,path,READ)?;self.read(path,out)}
+ pub fn write_at_as(&mut self,credentials:Credentials,path:&str,offset:u64,data:&[u8])
+  ->Result<usize,FsError>{self.authorize_access(credentials,path,WRITE)?;self.write_at(path,offset,data)}
+ pub fn unlink_as(&mut self,credentials:Credentials,path:&str)->Result<(),FsError>{
+  self.authorize_parent(credentials,path)?;self.authorize_access(credentials,path,0)?;self.unlink(path)
+ }
+ pub fn rename_file_as(&mut self,credentials:Credentials,source:&str,target:&str)
+  ->Result<(),FsError>{
+  self.authorize_parent(credentials,source)?;self.authorize_parent(credentials,target)?;
+  self.authorize_access(credentials,source,0)?;self.rename_file(source,target)
+ }
  fn contradictory_alias(&self,p:&Path)->bool{
   let mut own=false;let mut other=false;
   for ty in [b'd',b'f',b'l'] {

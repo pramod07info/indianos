@@ -36,6 +36,7 @@ STOPPED = "IndianOS normal desktop: services stopped and resources reclaimed"
 LIFECYCLE_READY = "IndianOS normal desktop: lifecycle READY verified"
 DURABLE_SHUTDOWN = "IndianOS normal desktop: durable shutdown armed"
 SURFACES_GUARDED = "IndianOS: desktop private surface guards verified"
+BOOT_STACK = b"IndianOS normal desktop: explicit 256 KiB boot stack acknowledged"
 RECOVERY = "IndianOS recovery: reason=desktop-storage-unavailable"
 FORBIDDEN = (b"PID1 provisioned", b"R027 blank disk", b"normal PID1 ready:")
 UART_ACTIONS = (PHYSICAL.encode(), SHUTDOWN.encode(), b"application launcher",
@@ -53,9 +54,9 @@ TERMINAL_AUTHORITY = (
     b"IndianOS user: desktop compositor denied input and filesystem authority",
     LIFECYCLE_READY.encode(),
     SURFACES_GUARDED.encode(),
-    b"IndianOS normal desktop: explicit 256 KiB boot stack acknowledged",
     b"IndianOS: desktop retained pixel surface guards verified",
     b"IndianOS user: desktop Files verified filesystem ABI and owned range-lock lifecycle",
+    b"IndianOS user: desktop Files denied unauthorized permission mutation",
 )
 
 # Independent expected raster contract for the qualified normal desktop.
@@ -164,6 +165,12 @@ def verify_guard(original: bytes, actual: bytes) -> None:
     begin, end = START * 512, (START + COUNT) * 512
     if actual[:begin] != original[:begin] or actual[end:] != original[end:]:
         raise AssertionError("desktop wrote outside the explicitly selected partition")
+
+
+def verify_boot_stack(output: bytes) -> None:
+    lines = output.replace(b"\r", b"").split(b"\n")[:-1]
+    if lines.count(BOOT_STACK) != 1:
+        raise AssertionError("boot lacks one complete stack-request acknowledgment")
 
 
 def verify_runtime(output: bytes, shutdown_at: int) -> None:
@@ -475,6 +482,7 @@ def boot(qemu: str, iso: Path, ovmf: Path, disk: Path, folder: Path, index: int)
         session.until("IndianOS normal desktop: selected storage admitted", 45)
         session.until(COMPOSITOR, 20)
         session.until(READY, 20)
+        verify_boot_stack(bytes(session.output))
         session.until("R031.9 real file and directory contents rendered into Files window", 20)
         frame = session.shot(folder / f"desktop-{index}-initial.ppm")
         check_two_windows(frame)
@@ -639,6 +647,7 @@ def denied_boot(qemu: str, iso: Path, ovmf: Path, disk: Path, folder: Path, name
     try:
         session.until(reason, 45)
         session.until("IndianOS recovery: read-only serial console ready", 10)
+        verify_boot_stack(bytes(session.output))
         if b"starting four ring3 services" in session.output or READY.encode() in session.output:
             raise AssertionError("invalid/unselected storage started desktop processes")
         if any(marker in session.output for marker in FORBIDDEN):
@@ -1168,6 +1177,7 @@ def transient_service_boot(qemu: str, iso: Path, ovmf: Path, disk: Path,
                 f"expected code={expected.hex()}; injection RIP={unmapped:#x}"]
     try:
         session.until(READY, 45)
+        verify_boot_stack(bytes(session.output))
         initial = session.shot(folder / "transient-initial.ppm")
         check_two_windows(initial)
         injection_at = len(session.output)

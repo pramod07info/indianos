@@ -41,7 +41,8 @@ Empty/overflowed ranges reject. Path and data pointer/length must be zero.
 Acquisition returns 0 on success, 1 on contention without changing the prior
 lock, and `u64::MAX` for invalid/unauthorized requests. ABI query requires
 handle/argument/path/data zero; it reports version1, 64 bytes, feature bits0
-(basic descriptors) and1 (range locks). Unknown operation numbers reject.
+(basic descriptors),1 (range locks) and, in the following permissions batch,
+2 (persistent mode permissions). Unknown operation numbers reject.
 
 Locks belong to descriptor tokens and kernel-issued process generations.
 Close, retirement, root revocation and I/O token invalidation remove them.
@@ -54,8 +55,10 @@ on its real read-only native handle before displaying file contents.
 This is bounded nonblocking locking on the existing single-BSP file service.
 It does not add POSIX blocking/fair waits or SMP synchronization. The existing
 conservative volume-generation writer exclusion remains: range locks do not
-permit mutation behind another process's live snapshot. Persistent per-user
+permit mutation behind another process's live snapshot. Named-user extended
 ACLs and a general multiwriter filesystem remain unfinished.
+The follow-up [persistent permissions](M1_PERSISTENT_PERMISSIONS.md) adds
+kernel-issued credentials, stored owner/group/other bits and native chmod38.
 
 ## Validation boundary
 
@@ -68,6 +71,7 @@ Only exact-head GitHub Actions can validate the integrated source.
 
 Four worker sessions started, but execution usage limits stopped them. The
 coordinator completed this bounded pixel/lock integration directly. Unfinished
-ACL format changes and ACPI firmware/power code remain outside this PR; they
-are not advertised as functioning features. Physical multicore, NIC IRQ/DMA,
+ACPI firmware/power code remains outside this PR. The permission format was
+subsequently completed in the linked permissions batch; full extended ACLs
+remain open. Physical multicore, NIC IRQ/DMA,
 storage power-loss and ACPI qualification still require selected real hardware.
