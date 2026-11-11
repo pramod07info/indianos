@@ -10,9 +10,11 @@
 //! Normal boot must never format arbitrary, existing host disks.
 use crate::block::{BlockDevice,BlockError,SECTOR_BYTES};
 use crate::vfs_path::normalize_absolute;
+use crate::fs_permissions::{Credentials,Permissions};
 
 const MAGIC:&[u8;8]=b"INDR027!";
 const FORMAT_VERSION:u32=1;
+const PERMISSION_VERSION:u32=2;
 const ENTRIES:usize=8;
 const ENTRY_SIZE:usize=40;
 const HEADER_SIZE:usize=32;
@@ -34,13 +36,14 @@ struct Entry{
     checksum:u32,
     bank:u8,
     used:bool,
+    permissions:Permissions,
 }
 impl Entry{
-    const EMPTY:Self=Self{name:[0;NAME_BYTES],len:0,checksum:0,bank:0,used:false};
+    const EMPTY:Self=Self{name:[0;NAME_BYTES],len:0,checksum:0,bank:0,used:false,permissions:Permissions::LEGACY};
 }
 #[derive(Clone,Copy)]
-struct Metadata{generation:u64,entries:[Entry;ENTRIES]}
-impl Metadata{fn empty()->Self{Self{generation:1,entries:[Entry::EMPTY;ENTRIES]}}}
+struct Metadata{generation:u64,entries:[Entry;ENTRIES],format:u32}
+impl Metadata{fn empty()->Self{Self{generation:1,entries:[Entry::EMPTY;ENTRIES],format:FORMAT_VERSION}}}
 
 fn crc_state(mut crc:u32,data:&[u8])->u32{
     for &byte in data{
@@ -58,7 +61,7 @@ fn read_u64(s:&[u8])->u64{u64::from_le_bytes(s.try_into().unwrap())}
 fn encode(meta:&Metadata,sectors:u64)->[u8;SECTOR_BYTES]{
     let mut output=[0u8;SECTOR_BYTES];
     output[..8].copy_from_slice(MAGIC);
-    output[8..12].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
+    output[8..12].copy_from_slice(&meta.format.to_le_bytes());
     output[12..16].copy_from_slice(&(sectors as u32).to_le_bytes());
     output[16..24].copy_from_slice(&meta.generation.to_le_bytes());
     for (i,e) in meta.entries.iter().enumerate(){
@@ -69,6 +72,11 @@ fn encode(meta:&Metadata,sectors:u64)->[u8;SECTOR_BYTES]{
         output[offset+28..offset+32].copy_from_slice(&e.checksum.to_le_bytes());
         output[offset+32]=e.bank;
         output[offset+33]=1;
+        if meta.format==PERMISSION_VERSION{
+            output[offset+34..offset+36].copy_from_slice(&e.permissions.owner.to_le_bytes());
+            output[offset+36..offset+38].copy_from_slice(&e.permissions.group.to_le_bytes());
+            output[offset+38..offset+40].copy_from_slice(&e.permissions.mode.to_le_bytes());
+        }
     }
     // CRC field is zero while computing checksum of the whole metadata sector.
     let sum=crc(&output);
@@ -76,7 +84,8 @@ fn encode(meta:&Metadata,sectors:u64)->[u8;SECTOR_BYTES]{
     output
 }
 fn decode(sector:&[u8;SECTOR_BYTES],capacity:u64)->Option<Metadata>{
-    if &sector[..8]!=MAGIC || read_u32(&sector[8..12])!=FORMAT_VERSION ||
+    let format=read_u32(&sector[8..12]);
+    if &sector[..8]!=MAGIC || !matches!(format,FORMAT_VERSION|PERMISSION_VERSION) ||
        read_u32(&sector[12..16]) as u64!=capacity ||
        sector[28..32]!=[0;4] || sector[HEADER_SIZE+ENTRIES*ENTRY_SIZE..].iter().any(|&b|b!=0){
        return None;
@@ -87,12 +96,12 @@ fn decode(sector:&[u8;SECTOR_BYTES],capacity:u64)->Option<Metadata>{
     let mut copy=*sector;
     copy[24..28].fill(0);
     if crc(&copy)!=saved{return None;}
-    let mut result=Metadata{generation,entries:[Entry::EMPTY;ENTRIES]};
+    let mut result=Metadata{generation,entries:[Entry::EMPTY;ENTRIES],format};
     for index in 0..ENTRIES{
         let offset=HEADER_SIZE+index*ENTRY_SIZE;
         let entry=&sector[offset..offset+ENTRY_SIZE];
         if entry.iter().all(|&b|b==0){continue;}
-        if entry[33]!=1 || entry[34..].iter().any(|&b|b!=0) ||
+        if entry[33]!=1 || (format==FORMAT_VERSION&&entry[34..].iter().any(|&b|b!=0)) ||
            entry[32]>=BANK_COUNT{return None;}
         let name_len=entry[..NAME_BYTES].iter().position(|&b|b==0)?;
         if name_len==0 || entry[name_len..NAME_BYTES].iter().any(|&b|b!=0){return None;}
@@ -106,9 +115,14 @@ fn decode(sector:&[u8;SECTOR_BYTES],capacity:u64)->Option<Metadata>{
         if len as usize>MAX_FILE_BYTES{return None;}
         let mut name=[0u8;NAME_BYTES];
         name.copy_from_slice(&entry[..NAME_BYTES]);
+        let permissions=if format==FORMAT_VERSION{Permissions::LEGACY}else{
+            Permissions::new(u16::from_le_bytes(entry[34..36].try_into().ok()?),
+                u16::from_le_bytes(entry[36..38].try_into().ok()?),
+                u16::from_le_bytes(entry[38..40].try_into().ok()?))?
+        };
         result.entries[index]=Entry{
             name,len,checksum:read_u32(&entry[28..32]),
-            bank:entry[32],used:true
+            bank:entry[32],used:true,permissions
         };
     }
     Some(result)
@@ -441,6 +455,37 @@ impl<D:BlockDevice> DurableFs<D>{
             if let Ok(name)=core::str::from_utf8(&entry.name[..len]){visit(name);}
         }
     }
+    /// Read checksummed discretionary metadata without exposing file bytes.
+    pub fn permissions_path(&mut self,path:&str)->Result<Permissions,FsError>{
+        self.check_heads()?;
+        let name=canonical_path(path)?;
+        let slot=self.find(name).ok_or(FsError::NotFound)?;
+        Ok(self.meta.entries[slot].permissions)
+    }
+    /// Create data and its credentials in one COW checkpoint, never a window
+    /// with an unrestricted newly created object followed by chmod.
+    pub(crate) fn create_owned_path(&mut self,path:&str,data:&[u8],
+        credentials:Credentials,mode:u16)->Result<(),FsError>{
+        let permissions=Permissions::new(credentials.uid(),credentials.gid(),mode)
+            .ok_or(FsError::InvalidName)?;
+        self.put_permissions(path,data,false,Some(permissions))
+    }
+    pub(crate) fn chmod_path(&mut self,path:&str,credentials:Credentials,
+        mode:u16)->Result<(),FsError>{
+        self.check_heads()?;
+        let name=canonical_path(path)?;
+        let slot=self.find(name).ok_or(FsError::NotFound)?;
+        let previous=self.meta.entries[slot].permissions;
+        if credentials.uid()!=0&&credentials.uid()!=previous.owner{
+            return Err(FsError::InvalidName);
+        }
+        let permissions=Permissions::new(previous.owner,previous.group,mode)
+            .ok_or(FsError::InvalidName)?;
+        if permissions==previous&&self.meta.format==PERMISSION_VERSION{return Ok(());}
+        let mut next=self.meta;next.format=PERMISSION_VERSION;
+        next.entries[slot].permissions=permissions;
+        self.publish(next)
+    }
     /// Rename a single file by atomically publishing ONE metadata generation.
     /// Its data extents remain untouched, preserving both checkpoint copies.
     pub fn rename_path(&mut self,source:&str,target:&str)->Result<(),FsError>{
@@ -631,6 +676,10 @@ impl<D:BlockDevice> DurableFs<D>{
         Ok(())
     }
     fn put(&mut self,path:&str,data:&[u8],replace:bool)->Result<(),FsError>{
+        self.put_permissions(path,data,replace,None)
+    }
+    fn put_permissions(&mut self,path:&str,data:&[u8],replace:bool,
+        permissions:Option<Permissions>)->Result<(),FsError>{
         let name=canonical_path(path)?;
         if data.len()>MAX_FILE_BYTES{return Err(FsError::TooLarge);}
         let index=if replace{
@@ -646,8 +695,12 @@ impl<D:BlockDevice> DurableFs<D>{
         let bank=self.available_bank(index).ok_or(FsError::Full)?;
         self.write_bank(index,bank,data)?;
         let mut next=self.meta;
+        let permissions=permissions.unwrap_or(if replace{
+            self.meta.entries[index].permissions
+        }else{Permissions::LEGACY});
+        if permissions!=Permissions::LEGACY{next.format=PERMISSION_VERSION;}
         next.entries[index]=Entry{
-            name,len:data.len() as u32,checksum:crc(data),bank,used:true
+            name,len:data.len() as u32,checksum:crc(data),bank,used:true,permissions
         };
         self.publish(next)
     }
@@ -698,7 +751,9 @@ impl<D:BlockDevice> DurableFs<D>{
         self.check_heads()?;
         let mut next=self.meta;
         next.entries[index]=Entry{name,len:data.len() as u32,
-             checksum:crc(data),bank,used:true};
+             checksum:crc(data),bank,used:true,permissions:if replace{
+                 self.meta.entries[index].permissions
+             }else{Permissions::LEGACY}};
         self.publish(next)?;
         if let Err(e)=self.disk.sync(){
             self.retired.set(true);return Err(e.into());
@@ -1420,6 +1475,25 @@ mod tests{
                 assert_eq!(&out[..9],b"committed");
             }
         }
+    }
+    #[test]fn permission_metadata_survives_overwrite_and_rejects_invalid_modes_with_valid_crc(){
+        let mut fs=DurableFs::format_blank(blank()).unwrap();
+        let owner=Credentials::kernel(1000,42);
+        fs.create_owned_path("/owned",b"secret",owner,0o640).unwrap();
+        assert_eq!(fs.meta.format,PERMISSION_VERSION);
+        fs.overwrite_path("/owned",b"updated").unwrap();
+        let mut fs=DurableFs::mount(fs.into_device()).unwrap();
+        let permission=fs.permissions_path("/owned").unwrap();
+        assert_eq!((permission.owner,permission.group,permission.mode),(1000,42,0o640));
+        assert_eq!(fs.chmod_path("/owned",Credentials::kernel(2000,42),0o777),Err(FsError::InvalidName));
+        assert_eq!(fs.chmod_path("/owned",owner,0o1000),Err(FsError::InvalidName));
+        let mut disk=fs.into_device();
+        for header in 0..2{
+            let mut metadata=decode(&disk.sectors[header],disk.sector_count()).unwrap();
+            metadata.entries[0].permissions.mode=0o1000;
+            disk.sectors[header]=encode(&metadata,disk.sector_count());
+        }
+        assert!(matches!(DurableFs::mount(disk),Err(FsError::InvalidVolume)));
     }
     #[test]fn mounted_health_retires_changed_inactive_head_without_repair(){
         let disk=SharedDisk(std::rc::Rc::new(std::cell::RefCell::new(blank())));

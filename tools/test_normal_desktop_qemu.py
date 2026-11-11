@@ -36,6 +36,7 @@ STOPPED = "IndianOS normal desktop: services stopped and resources reclaimed"
 LIFECYCLE_READY = "IndianOS normal desktop: lifecycle READY verified"
 DURABLE_SHUTDOWN = "IndianOS normal desktop: durable shutdown armed"
 SURFACES_GUARDED = "IndianOS: desktop private surface guards verified"
+BOOT_STACK = b"IndianOS normal desktop: explicit 256 KiB boot stack acknowledged"
 RECOVERY = "IndianOS recovery: reason=desktop-storage-unavailable"
 FORBIDDEN = (b"PID1 provisioned", b"R027 blank disk", b"normal PID1 ready:")
 UART_ACTIONS = (PHYSICAL.encode(), SHUTDOWN.encode(), b"application launcher",
@@ -53,6 +54,9 @@ TERMINAL_AUTHORITY = (
     b"IndianOS user: desktop compositor denied input and filesystem authority",
     LIFECYCLE_READY.encode(),
     SURFACES_GUARDED.encode(),
+    b"IndianOS: desktop retained pixel surface guards verified",
+    b"IndianOS user: desktop Files verified filesystem ABI and owned range-lock lifecycle",
+    b"IndianOS user: desktop Files denied unauthorized permission mutation",
 )
 
 # Independent expected raster contract for the qualified normal desktop.
@@ -161,6 +165,12 @@ def verify_guard(original: bytes, actual: bytes) -> None:
     begin, end = START * 512, (START + COUNT) * 512
     if actual[:begin] != original[:begin] or actual[end:] != original[end:]:
         raise AssertionError("desktop wrote outside the explicitly selected partition")
+
+
+def verify_boot_stack(output: bytes) -> None:
+    lines = output.replace(b"\r", b"").split(b"\n")[:-1]
+    if lines.count(BOOT_STACK) != 1:
+        raise AssertionError("boot lacks one complete stack-request acknowledgment")
 
 
 def verify_runtime(output: bytes, shutdown_at: int) -> None:
@@ -472,6 +482,7 @@ def boot(qemu: str, iso: Path, ovmf: Path, disk: Path, folder: Path, index: int)
         session.until("IndianOS normal desktop: selected storage admitted", 45)
         session.until(COMPOSITOR, 20)
         session.until(READY, 20)
+        verify_boot_stack(bytes(session.output))
         session.until("R031.9 real file and directory contents rendered into Files window", 20)
         frame = session.shot(folder / f"desktop-{index}-initial.ppm")
         check_two_windows(frame)
@@ -636,6 +647,7 @@ def denied_boot(qemu: str, iso: Path, ovmf: Path, disk: Path, folder: Path, name
     try:
         session.until(reason, 45)
         session.until("IndianOS recovery: read-only serial console ready", 10)
+        verify_boot_stack(bytes(session.output))
         if b"starting four ring3 services" in session.output or READY.encode() in session.output:
             raise AssertionError("invalid/unselected storage started desktop processes")
         if any(marker in session.output for marker in FORBIDDEN):
@@ -954,14 +966,14 @@ def verify_debug_stack_guards(debugger: GuestDebugger, records: list[tuple[int, 
         evidence.append(f"{phase}: guard {guard:#x} unreadable; usable {begin:#x}..{end:#x} readable")
 
 
-def surface_guard_records(raw: bytes) -> list[tuple[int, int, int, int]]:
-    if len(raw) != 64:
+def surface_guard_records(raw: bytes, payload_pages: int = 1) -> list[tuple[int, int, int, int]]:
+    if len(raw) != 64 or payload_pages not in (1, 594):
         raise AssertionError("surface guard ownership ledger is not 64 bytes")
     words = struct.unpack("<8Q", raw)
     records = [tuple(words[start:start + 4]) for start in (0, 4)]
     for lower, begin, end, upper in records:
         if (lower < 0xffff800000000000 or lower % 4096 or
-                begin != lower + 4096 or end != begin + 4096 or
+                begin != lower + 4096 or end != begin + payload_pages * 4096 or
                 upper != end or upper + 4096 > 1 << 64):
             raise AssertionError("invalid private surface guard geometry")
     ordered = sorted(records)
@@ -1152,6 +1164,7 @@ def transient_service_boot(qemu: str, iso: Path, ovmf: Path, disk: Path,
     target = unique_symbol(nm, service, ("desktop_window::Manager", "::wire"))
     expected = executable_bytes(compositor, target, 8)
     surface_ledger = unique_symbol(nm, kernel, ("DESKTOP_SURFACE_LAYOUT",))
+    pixel_ledger = unique_symbol(nm, kernel, ("DESKTOP_PIXEL_SURFACE_LAYOUT",))
     symbols = subprocess.run([nm, "-S", "-n", "-C", str(kernel)], check=True,
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15)
     guards = stack_guard_records(symbols.stdout.decode("ascii"))
@@ -1164,6 +1177,7 @@ def transient_service_boot(qemu: str, iso: Path, ovmf: Path, disk: Path,
                 f"expected code={expected.hex()}; injection RIP={unmapped:#x}"]
     try:
         session.until(READY, 45)
+        verify_boot_stack(bytes(session.output))
         initial = session.shot(folder / "transient-initial.ppm")
         check_two_windows(initial)
         injection_at = len(session.output)
@@ -1213,6 +1227,9 @@ def transient_service_boot(qemu: str, iso: Path, ovmf: Path, disk: Path,
         surface_layout = debugger.memory(surface_ledger, 64)
         surfaces = surface_guard_records(surface_layout)
         verify_debug_surface_guards(debugger, surfaces, evidence, "PID4 cloned root")
+        pixel_layout = debugger.memory(pixel_ledger, 64)
+        pixel_surfaces = surface_guard_records(pixel_layout, 594)
+        verify_debug_surface_guards(debugger, pixel_surfaces, evidence, "PID4 retained pixels")
         cloned_root = stopped_root(session)
         evidence.append(f"PID4 cloned CR3={cloned_root:#x}")
         if not debugger.command(f"m{unmapped:x},1").startswith("E"):
@@ -1283,6 +1300,9 @@ def transient_service_boot(qemu: str, iso: Path, ovmf: Path, disk: Path,
         if debugger.memory(surface_ledger, 64) != surface_layout:
             raise AssertionError("desktop restart changed source-owned private surface identity")
         verify_debug_surface_guards(debugger, surfaces, evidence, "reclaimed recovery kernel")
+        if debugger.memory(pixel_ledger, 64) != pixel_layout:
+            raise AssertionError("desktop restart relocated private pixel backing")
+        verify_debug_surface_guards(debugger, pixel_surfaces, evidence, "reclaimed retained pixels")
         if debugger.command("D") != "OK":
             raise AssertionError("kernel guard debugger failed to detach")
         debugger.close()

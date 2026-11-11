@@ -168,6 +168,13 @@ pub extern "C" fn kmain()->!{
     unsafe{asm!("cli",options(nomem,nostack,preserves_flags))};
     unsafe{serial_init();}
     log(b"IndianOS: kernel entered\n\0");
+    #[cfg(all(feature="normal-desktop",feature="limine-requests"))]
+    {
+        if !crate::limine_requests::boot_stack_request_accepted(){
+            recover_init(b"IndianOS recovery: reason=boot-stack-request-unavailable\n\0")
+        }
+        log(b"IndianOS normal desktop: explicit 256 KiB boot stack acknowledged\n\0");
+    }
     need(unsafe{boot_validate()},b"IndianOS: FATAL boot information invalid\n\0");
     log(b"IndianOS: boot information validated\n\0");
     #[cfg(all(feature="limine-requests",target_arch="x86_64",target_os="none"))]

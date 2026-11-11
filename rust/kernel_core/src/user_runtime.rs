@@ -129,7 +129,7 @@ impl DesktopLifecycle{
    32=>matches!(operation,4|8|10|12),
    // Existing descriptors may read, seek and close. OPEN can create/truncate
    // and is deliberately refused even when its user flags claim read-only.
-   33=>matches!(operation,2|4|5),
+   33=>matches!(operation,2|4|5|36|37),
    _=>true,
   }
  }
@@ -1111,7 +1111,9 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
     if address!=0||length!=0{return BAD;}
     0
    };
-   if matches!(request.arg0,2|3|5) && argument!=0{return BAD;}
+   if matches!(request.arg0,2|3|5|36|37) && argument!=0{return BAD;}
+   if request.arg0==37&&handle!=0{return BAD;}
+   if request.arg0==38&&argument>0o777{return BAD;}
    if matches!(request.arg0,4|6) && argument>crate::durablefs::MAX_FILE_BYTES as u64{
     return BAD;
    }
@@ -1326,7 +1328,8 @@ fn trap_mapped(b:&CloneBackend,original:u64,clone:u64)->bool{
  let mapped=trap.iter().all(|&p|kernel_mapped(b,original,clone,p));
  #[cfg(feature="normal-desktop")]
  {mapped&&kernel_stack_guards_valid(b,original)&&kernel_stack_guards_valid(b,clone)&&
-    desktop_surface_guards_valid(b,original)&&desktop_surface_guards_valid(b,clone)}
+    desktop_surface_guards_valid(b,original)&&desktop_surface_guards_valid(b,clone)&&
+    desktop_pixel_guards_valid(b,original)&&desktop_pixel_guards_valid(b,clone)}
  #[cfg(not(feature="normal-desktop"))]
  {mapped}
 }
@@ -1352,6 +1355,62 @@ static mut DESKTOP_GUARD_RETAINED:[u64;2]=[0;2];
 #[cfg(feature="normal-desktop")]
 #[no_mangle]
 pub(crate) static mut DESKTOP_SURFACE_LAYOUT:[(u64,u64,u64,u64);2]=[(0,0,0,0);2];
+/// Source-owned retained pixel planes and coverage masks. Never expose these
+/// kernel addresses through the app syscall ABI or relocate them on restart.
+#[cfg(feature="normal-desktop")]
+#[no_mangle]
+pub(crate) static mut DESKTOP_PIXEL_SURFACE_LAYOUT:[(u64,u64,u64,u64);2]=[(0,0,0,0);2];
+#[cfg(feature="normal-desktop")]
+const PIXEL_SURFACE_PAGES:u64=594;
+#[cfg(feature="normal-desktop")]
+fn pixel_surface_layout_valid(layout:&[(u64,u64,u64,u64);2])->bool{
+ for &(lower,begin,end,upper) in layout{
+  if lower==0||lower&4095!=0||lower.checked_add(PAGE)!=Some(begin)||
+     begin.checked_add(PIXEL_SURFACE_PAGES*PAGE)!=Some(end)||
+     upper!=end||upper.checked_add(PAGE).is_none(){return false;}
+ }
+ layout[0].3+PAGE<=layout[1].0||layout[1].3+PAGE<=layout[0].0
+}
+#[cfg(feature="normal-desktop")]
+fn desktop_pixel_guards_valid(b:&CloneBackend,root:u64)->bool{
+ let layout=unsafe{DESKTOP_PIXEL_SURFACE_LAYOUT};
+ if !pixel_surface_layout_valid(&layout){return false;}
+ for (lower,begin,end,upper) in layout{
+  if lookup(b,root,lower).is_some()||lookup(b,root,upper).is_some(){return false;}
+  let mut address=begin;
+  while address<end{
+   let Some(flags)=(unsafe{crate::paging::kernel_stack_page_flags(b,root,address)})
+       else{return false;};
+   if flags&3!=3||flags&4!=0||flags&(1u64<<63)==0{return false;}
+   address+=PAGE;
+  }
+ }
+ true
+}
+#[cfg(feature="normal-desktop")]
+fn install_desktop_pixel_guards(b:&CloneBackend,root:u64)->bool{
+ let layout=crate::gui::pixel_surface_guard_layout();
+ if !pixel_surface_layout_valid(&layout){return false;}
+ let commands=unsafe{DESKTOP_SURFACE_LAYOUT};
+ if !surface_layout_valid(&commands){return false;}
+ for &(lower,_,_,upper) in &layout{
+  for &(other,_,_,other_end) in &commands{
+   if !(upper+PAGE<=other||other_end+PAGE<=lower){return false;}
+  }
+ }
+ let previous=unsafe{DESKTOP_PIXEL_SURFACE_LAYOUT};
+ if previous!=[(0,0,0,0);2]&&previous!=layout{return false;}
+ unsafe{DESKTOP_PIXEL_SURFACE_LAYOUT=layout;}
+ for (lower,_,_,upper) in layout{
+  for guard in [lower,upper]{
+   if let Err(failure)=unsafe{crate::paging::guard_kernel_page(b,root,guard)}{
+    unsafe{DESKTOP_GUARD_RETAINED=failure.retained;}return false;
+   }
+   unsafe{asm!("invlpg [{}]",in(reg)guard,options(nostack,preserves_flags));}
+  }
+ }
+ desktop_pixel_guards_valid(b,root)
+}
 #[cfg(feature="normal-desktop")]
 fn surface_layout_valid(layout:&[(u64,u64,u64,u64);2])->bool{
  for &(lower,begin,end,upper) in layout{
@@ -2213,6 +2272,10 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
    log(b"IndianOS: desktop private surface guard installation failed\n\0");return false;
   }
   log(b"IndianOS: desktop private surface guards verified\n\0");
+  if !install_desktop_pixel_guards(&backend,cpu.cr3&PHYS){
+   log(b"IndianOS: desktop pixel surface guard installation failed\n\0");return false;
+  }
+  log(b"IndianOS: desktop retained pixel surface guards verified\n\0");
   unsafe{DESKTOP_LIFECYCLE=DesktopLifecycle::new();}
  }
  #[cfg(any(feature="test-r031-files-gui",feature="normal-desktop"))]
@@ -2682,16 +2745,16 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
  #[test]fn desktop_durable_shutdown_fences_all_storage_mutations(){
   let mut state=DesktopLifecycle::new();
   for number in [32,33]{
-   for operation in 0..=32{assert!(state.allows_storage_request(number,operation));}
+   for operation in 0..=40{assert!(state.allows_storage_request(number,operation));}
   }
   assert!(state.ready(true));
   assert!(!state.complete_sync(false));
   assert!(state.allows_storage_request(32,11));
   assert!(state.allows_storage_request(33,3));
   assert!(state.complete_sync(true));
-  for operation in 0..=32{
+  for operation in 0..=40{
    assert_eq!(state.allows_storage_request(32,operation),matches!(operation,4|8|10|12));
-   assert_eq!(state.allows_storage_request(33,operation),matches!(operation,2|4|5));
+   assert_eq!(state.allows_storage_request(33,operation),matches!(operation,2|4|5|36|37));
   }
   assert!(!state.allows_storage_request(32,u64::MAX));
   assert!(!state.allows_storage_request(33,u64::MAX));
@@ -2724,6 +2787,20 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
   // Shutdown still needs peer IPC and the compositor's final frame commit.
   for number in [1,2,3,9,18,34,35,37]{
    assert!(state.allows_input_request(number,1));
+  }
+ }
+ #[cfg(feature="normal-desktop")]
+ #[test]fn retained_pixel_geometry_requires_complete_bounded_nonoverlapping_planes(){
+  let end=0x2000+PIXEL_SURFACE_PAGES*PAGE;
+  let second=end+2*PAGE;
+  let good=[(0x1000,0x2000,end,end),
+      (second-PAGE,second,second+PIXEL_SURFACE_PAGES*PAGE,second+PIXEL_SURFACE_PAGES*PAGE)];
+  assert!(pixel_surface_layout_valid(&good));
+  assert!(!pixel_surface_layout_valid(&[good[0],good[0]]));
+  assert!(!pixel_surface_layout_valid(&[(0,0,0,0);2]));
+  for pages in [0,1,PIXEL_SURFACE_PAGES-1,PIXEL_SURFACE_PAGES+1]{
+   let bad=(0x1000,0x2000,0x2000+pages*PAGE,0x2000+pages*PAGE);
+   assert!(!pixel_surface_layout_valid(&[bad,good[1]]));
   }
  }
  #[cfg(feature="normal-desktop")]

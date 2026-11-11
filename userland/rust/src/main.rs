@@ -723,6 +723,17 @@ fn files_shared_content(data:&mut [u8;256])->usize{
     #[cfg(feature="desktop-files")]
     if token==u64::MAX||token==0{data[..18].copy_from_slice(b"README UNAVAILABLE");return 18;}
     if token==u64::MAX||token==0{exit(202);}
+    #[cfg(feature="desktop-files")]
+    {
+        let abi=file_handle_call(37,b"",0,0,data,0);
+        if abi&0xffff!=1||(abi>>16)&0xffff!=64||(abi>>32)&3!=3{exit(254);}
+        if file_handle_call(34,b"",token,0,data,0)!=0||
+           file_handle_call(35,b"",token,0,data,0)!=u64::MAX||
+           file_handle_call(36,b"",token,0,data,0)!=0{exit(254);}
+        write(b"desktop Files verified filesystem ABI and owned range-lock lifecycle");
+        if (abi>>32)&4==0||file_handle_call(38,b"",token,0o777,data,0)!=u64::MAX{exit(254);}
+        write(b"desktop Files denied unauthorized permission mutation");
+    }
     let count=file_handle_call(2,b"",token,0,data,72);
     if file_handle_call(5,b"",token,0,data,0)!=0{exit(203);}
     #[cfg(feature="desktop-files")]

@@ -9,9 +9,11 @@ accept a gate.
 
 Issue #616's high-level gates and the binding [99-task phase ledger](M1_PHASE_SCOPE.md)
 must both be considered. In particular, P9 explicitly requires **per-process
-private pixel surfaces**. The current guarded command payloads and clipped
-kernel raster backend establish a narrower isolation mechanism; they do not
-implement those pixel surfaces. Passing the command-guard QEMU probes therefore
+private pixel surfaces**. The prior baseline's guarded command payloads and
+clipped raster backend establish a narrower isolation mechanism. The new
+[retained pixel-plane integration](M1_PIXEL_PLANES_AND_RANGE_LOCKS.md) adds real
+kernel-private app pixel storage, while app-mapped surfaces and complete
+userspace raster composition remain unfinished. Passing guard QEMU probes therefore
 cannot close the complete G4/GUI milestone. P9 also retains physical IRQ input,
 display qualification and the other listed desktop requirements.
 
