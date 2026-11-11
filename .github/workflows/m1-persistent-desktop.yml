@@ -19,6 +19,7 @@ on:
       - 'rust/kernel_core/src/agent_03_cap_epoch.rs'
       - 'rust/kernel_core/src/process_events.rs'
       - 'rust/kernel_core/Cargo.toml'
+      - 'tools/ci/install-qemu-deps.sh'
       - '.github/workflows/m1-persistent-desktop.yml'
   pull_request:
     paths:
@@ -38,13 +39,14 @@ on:
       - 'rust/kernel_core/src/agent_03_cap_epoch.rs'
       - 'rust/kernel_core/src/process_events.rs'
       - 'rust/kernel_core/Cargo.toml'
+      - 'tools/ci/install-qemu-deps.sh'
       - '.github/workflows/m1-persistent-desktop.yml'
   workflow_dispatch:
 permissions:
   contents: read
 jobs:
   durable-files-desktop:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
@@ -99,12 +101,14 @@ jobs:
         run: rustup target add x86_64-unknown-none
       - name: Require optimized freestanding kernel-core build, not only cargo check
         run: cargo build --release --locked --offline --manifest-path rust/kernel_core/Cargo.toml --no-default-features --target x86_64-unknown-none
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b
+        with:
+          github_access_token: ${{ github.token }}
       - name: Install emulator and UEFI dependencies for real graphical Files disk test
         run: |
           # Github-hosted mirrors can download QEMU slowly. Preserve the
           # mandatory emulator test; avoid optional GUI packages and retry.
-          sudo timeout 300s apt-get update -o Acquire::Retries=3 -o Acquire::http::Timeout=40
-          sudo timeout 600s apt-get install -y --no-install-recommends -o Acquire::Retries=3 -o Acquire::http::Timeout=40 clang lld binutils xorriso qemu-system-x86 ovmf curl openssl
+          bash tools/ci/install-qemu-deps.sh
       - name: Install freestanding target for guest verification
         run: rustup target add x86_64-unknown-none
       # R047 upgrades the same disposable-drive QEMU smoke to require real

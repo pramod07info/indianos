@@ -49,6 +49,7 @@ on:
       - "tests/test_usermode_fixture.py"
       - "tests/inspect_elf.c"
       - "userland/**"
+      - "tools/ci/install-qemu-deps.sh"
       - ".github/workflows/kernel-boot.yml"
       - ".github/workflows/agent-x-local-model.yml"
       - ".github/workflows/agent-ci-handoff.yml"
@@ -87,7 +88,7 @@ env:
 jobs:
   qemu-uefi:
     name: Build ELF + ISO and verify serial boot
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Full Rust migration + R024-R029 QEMU checks exceeded the previous
     # 30-minute job limit on 2026-10-23 (run 39942078879), despite all
     # mandatory test steps passing. Allow the complete suite to finish.
@@ -105,10 +106,12 @@ jobs:
         run: python3 tools/verify_ci_sha.py --expected "$EXPECTED_SHA" --observed "$(git rev-parse HEAD)"
       - name: Verify exact-main screenshot SHA gate cannot be orphaned
         run: python3 -m unittest discover -s tests -p 'test_ci_screenshot_sha_gate.py' -v
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b
+        with:
+          github_access_token: ${{ github.token }}
       - name: Install emulator and image-building dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y clang lld binutils xorriso qemu-system-x86 ovmf curl
+          bash tools/ci/install-qemu-deps.sh
       - name: Install Rust toolchain for no_std kernel build
         uses: dtolnay/rust-toolchain@stable
         with:

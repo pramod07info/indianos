@@ -57,7 +57,13 @@ class ScreenshotMainShaGateTests(unittest.TestCase):
         self.assertIn("Verify exact-main screenshot SHA gate cannot be orphaned", kernel)
         self.assertIn("test_ci_screenshot_sha_gate.py", kernel)
         self.assertIn("Build ELF + ISO and verify serial boot", kernel)
-        self.assertIn("qemu-system-x86", kernel)
+        # The workflow delegates provisioning to a fail-closed shared script.
+        # Check both the invocation and the actual emulator dependency.
+        installer_path = ROOT / "tools" / "ci" / "install-qemu-deps.sh"
+        installer = installer_path.read_text("utf-8")
+        self.assertIn("bash tools/ci/install-qemu-deps.sh", kernel)
+        self.assertIn("qemu-system-x86_64", installer)
+        self.assertIn("exit 1", installer)
 
 
 if __name__ == "__main__":

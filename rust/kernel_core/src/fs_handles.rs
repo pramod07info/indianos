@@ -1202,6 +1202,15 @@ impl FileHandles{
         }
         if owner.generation!=0{
             let credentials=self.credentials_for(owner)?;
+            // Check immutable namespace and S0 destination policy before
+            // probing the target's durable parent. Otherwise /boot/... and
+            // an out-of-root destination may report NotFound instead of
+            // the mandated authorization denial, leaking lookup results.
+            // This validation is read-only and never charges write quota.
+            if matches!(action,13|16|29|31){
+                let mut destination=[0u8;24];
+                self.write_destination(owner,path,&mut destination)?;
+            }
             if action==1{
                 let access=(if argument&WRITE!=0{2}else{0})|(if argument&READ!=0{4}else{0});
                 fs.authorize_access(credentials,path,access)?;
