@@ -702,7 +702,13 @@ impl<D:BlockDevice> DurableFs<D>{
         next.entries[index]=Entry{
             name,len:data.len() as u32,checksum:crc(data),bank,used:true,permissions
         };
-        self.publish(next)
+        // A data bank has been written even when the following metadata
+        // publication fails before touching either header. A transient
+        // header-read failure is therefore NOT safe to retry through the
+        // current mount: revalidate the media from a fresh mount first.
+        let published=self.publish(next);
+        if published.is_err(){self.retired.set(true);}
+        published
     }
     /// Strict atomic COW publication: first flush the new data bank, then
     /// publish the metadata head, then flush the head. Unlike legacy
@@ -2964,5 +2970,44 @@ mod tests{
         let mut readback=[0u8;32];
         let count=recovered.read_path("/note",&mut readback).unwrap();
         assert_eq!(&readback[..count],b"committed");
+    }
+
+    #[test]
+    fn g6_transient_header_read_after_data_bank_write_requires_new_mount(){
+        struct FailFirstPostWriteHeader{
+            disk:Disk,fail_when_writes:usize,failed:bool
+        }
+        impl BlockDevice for FailFirstPostWriteHeader{
+            fn sector_count(&self)->u64{self.disk.sector_count()}
+            fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+                ->Result<(),BlockError>{
+                if lba<2&&!self.failed&&self.disk.writes==self.fail_when_writes{
+                    self.failed=true;
+                    return Err(BlockError::Io);
+                }
+                self.disk.read_sector(lba,out)
+            }
+            fn write_sector(&mut self,lba:u64,data:&[u8;SECTOR_BYTES])
+                ->Result<(),BlockError>{self.disk.write_sector(lba,data)}
+        }
+        let mut fs=DurableFs::format_blank(FailFirstPostWriteHeader{
+            disk:blank(),fail_when_writes:usize::MAX,failed:false
+        }).unwrap();
+        fs.create_path("/note",b"old").unwrap();
+        fs.disk.fail_when_writes=fs.disk.disk.writes+SECTORS_PER_BANK;
+        assert_eq!(fs.overwrite_path("/note",b"new"),Err(FsError::Io));
+        assert!(fs.disk.failed); // fault reached publication, not a write
+        assert!(fs.retired.get()); // do not silently retry the same bank
+        let writes=fs.disk.disk.writes;
+        let mut output=[0xa5u8;32];
+        assert_eq!(fs.read_path("/note",&mut output),Err(FsError::InvalidVolume));
+        assert_eq!(fs.overwrite_path("/note",b"retry"),Err(FsError::InvalidVolume));
+        assert_eq!(fs.disk.disk.writes,writes);
+        assert_eq!(output,[0xa5;32]);
+        let disk=fs.into_device();
+        let mut mounted=DurableFs::mount(disk).unwrap();
+        let mut bytes=[0u8;32];
+        let len=mounted.read_path("/note",&mut bytes).unwrap();
+        assert_eq!(&bytes[..len],b"old");
     }
 }
