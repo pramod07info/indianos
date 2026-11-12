@@ -80,6 +80,20 @@ fn mouse_command(byte:u8)->bool{
 fn valid_mouse_status(status:u8)->bool{
     status&0x21==0x21&&status&0xc0==0
 }
+/// Stop firmware-drain after a finite number of AUX bytes. An overflowing
+/// stream is not an idle controller: initialization must fail closed instead
+/// of issuing D4 commands into a still-busy keyboard/mouse transport.
+/// Pure callbacks let host tests verify byte ownership without port I/O.
+fn drain_aux_with<S,R>(mut status:S,mut read:R)->bool
+where S:FnMut()->u8,R:FnMut(){
+    for _ in 0..64 {
+        let current=status();
+        if current&1==0{return true;}
+        if !valid_mouse_status(current){return false;}
+        read();
+    }
+    false
+}
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 pub(crate) struct Packet{pub dx:i16,pub dy:i16,pub left:bool}
 pub(crate) struct Mouse {
@@ -90,12 +104,9 @@ impl Mouse{
         // Drain AUX firmware leftovers only. Never consume a pending
         // primary keyboard byte just to initialize a test-only mouse.
         // If keyboard output is waiting, leave it intact and abort init.
-        for _ in 0..64{
-            let status=unsafe{input(CTRL)};
-            if status&1==0{break;}
-            if !valid_mouse_status(status){return None;}
+        if !drain_aux_with(||unsafe{input(CTRL)},||{
             let _=unsafe{input(DATA)};
-        }
+        }){return None;}
         if !command(0xa8) || !command(0x20){return None;}
         let config=read_reply()?;
         if !command(0x60) || !payload((config&!0x22)|0x00){return None;}
@@ -144,6 +155,26 @@ impl Mouse{
 #[cfg(test)]
 mod tests{
     use super::*;
+    #[test]fn g8_aux_drain_never_steals_keyboard_or_trusts_unbounded_firmware(){
+        use core::cell::Cell;
+        let consumed=Cell::new(0usize);
+        let mut statuses=[0x21u8,0x21,0x00].into_iter();
+        assert!(drain_aux_with(||statuses.next().unwrap_or(0),
+             ||consumed.set(consumed.get()+1)));
+        assert_eq!(consumed.get(),2);
+        let mut keyboard=[0x21u8,0x01].into_iter();
+        assert!(!drain_aux_with(||keyboard.next().unwrap_or(0),
+             ||consumed.set(consumed.get()+1)));
+        assert_eq!(consumed.get(),3); // primary byte remains untouched
+        let mut bad=[0x61u8].into_iter();
+        assert!(!drain_aux_with(||bad.next().unwrap_or(0),
+             ||consumed.set(consumed.get()+1)));
+        assert_eq!(consumed.get(),3);
+        let mut polls=0;
+        let mut reads=0;
+        assert!(!drain_aux_with(||{polls+=1;0x21},||reads+=1));
+        assert_eq!((polls,reads),(64,64));
+    }
     #[test]fn m1_r047_primary_keyboard_status_never_claimed_by_mouse(){
         for status in [0x00,0x01,0x03,0x11,0x80,0x81,0xff]{
             assert!(!valid_mouse_status(status));
