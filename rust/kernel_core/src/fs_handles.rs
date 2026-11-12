@@ -3296,6 +3296,52 @@ mod r106_checked_partition_authenticated_file_api_tests{
   assert_eq!(&bytes[..n],b"f:saved\n");
  }
 
+
+ #[test]fn g7_selected_authentication_io_failure_revokes_handles_and_quarantines_volume(){
+  // First measure only the healthy mount's reads. Trigger a disk error on
+  // the very next metadata read, which is performed by VFS authorization.
+  // It must not escape through an early '?' without quarantining the mount.
+  struct DelayedRead<'a>{disk:&'a mut Disk,reads:usize,fail_at:Option<usize>}
+  impl BlockDevice for DelayedRead<'_>{
+   fn sector_count(&self)->u64{COUNT as u64}
+   fn read_sector(&mut self,l:u64,b:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+    let index=self.reads;self.reads+=1;
+    if self.fail_at==Some(index){return Err(BlockError::Io);}
+    self.disk.read_sector(l,b)
+   }
+   fn write_sector(&mut self,l:u64,b:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+    self.disk.write_sector(l,b)
+   }
+  }
+  let (mut disk,receipt)=disk();let mut table=FileHandles::new();
+  prepare_selected_volume_kernel(&mut table,&mut disk,receipt).unwrap();
+  let guest=table.bind_process(2).unwrap();
+  let token=operation_on_selected_volume(&mut table,1,guest,0,READ,
+      "/shared/note",&mut[],&mut disk,receipt).unwrap();
+  let mount_reads={
+   let mut measured=DelayedRead{disk:&mut disk,reads:0,fail_at:None};
+   let mounted=crate::m1_partition::mount_partition_receipt_healthy(&mut measured,receipt).unwrap();
+   drop(mounted);
+   measured.reads
+  };
+  assert!(mount_reads>0);
+  let writes=disk.writes;
+  let mut failing=DelayedRead{disk:&mut disk,reads:0,fail_at:Some(mount_reads)};
+  let mut output=[0xa5u8;16];
+  assert_eq!(selected_path_operation_on_device(&mut table,guest,4,
+      "/shared/note","",0,&mut output,0,&mut failing),Err(FsError::Io));
+  assert_eq!(output,[0xa5;16]);
+  assert!(table.selected_quarantined);
+  assert!(table.entries.iter().all(|h|h.token==0));
+  assert_eq!(table.index(guest,token),Err(FsError::InvalidName));
+  assert_eq!(failing.disk.writes,writes);
+  let reads=failing.reads;
+  assert_eq!(selected_path_operation_on_device(&mut table,guest,4,
+      "/shared/note","",0,&mut output,0,&mut failing),Err(FsError::InvalidVolume));
+  assert_eq!(failing.reads,reads); // second attempt cannot even probe media
+  assert_eq!(output,[0xa5;16]);
+ }
+
  #[test]fn desktop_selected_path_read_lease_blocks_mutations_before_io(){
   let (mut disk,receipt)=disk();let mut table=FileHandles::new();
   prepare_selected_volume_kernel(&mut table,&mut disk,receipt).unwrap();
