@@ -754,16 +754,26 @@ impl<D:BlockDevice> DurableFs<D>{
              checksum:crc(data),bank,used:true,permissions:if replace{
                  self.meta.entries[index].permissions
              }else{Permissions::LEGACY}};
-        self.publish(next)?;
+        // The new data bank has already been modified. Even if checkpoint
+        // publication fails before it changes a metadata head, its outcome
+        // is not safe to retry through this mount without revalidation.
+        if let Err(error)=self.publish(next){
+            self.retired.set(true);
+            return Err(error);
+        }
         if let Err(e)=self.disk.sync(){
             self.retired.set(true);return Err(e.into());
         }
-        self.check_heads()?;
-        // The final metadata barrier is another device operation: payload
-        // integrity checked before it is not sufficient to acknowledge a
-        // durable transaction. Keep uncertain sessions permanently retired.
-        self.check_payloads(self.meta)?;
-        self.check_heads()
+        // The final metadata barrier is another device operation. A failed
+        // header read after publication is just as uncertain as a failed
+        // payload read: do not keep using this mount on any error.
+        let verified=(||{
+            self.check_heads()?;
+            self.check_payloads(self.meta)?;
+            self.check_heads()
+        })();
+        if verified.is_err(){self.retired.set(true);}
+        verified
     }
     /// Opt-in, flush-verified creation; a missing flush driver is an error.
     pub fn create_durable_path(&mut self,path:&str,data:&[u8])
