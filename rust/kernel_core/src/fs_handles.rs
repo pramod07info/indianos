@@ -582,8 +582,18 @@ impl FileHandles{
         }
         let slot=self.entries.iter().position(|e|e.token==0)
             .ok_or(FsError::Full)?;
-        // A zero-byte range read validates path, parent directories and the
-        // complete data checksum before creating a usable handle.
+        // Persistent owner/group/mode permission checks are separate from
+        // PID/namespace capabilities. Never mint an authenticated handle
+        // solely because a path is within a process's permitted namespace.
+        // Perform the ACL check BEFORE reading its contents for verification.
+        // The generation-zero adapter intentionally retains its legacy
+        // behavior; native selected-volume callers have real generations.
+        if owner.generation!=0{
+            let access=((if mode&READ!=0{crate::fs_permissions::READ}else{0}) |
+                        (if mode&WRITE!=0{crate::fs_permissions::WRITE}else{0}));
+            fs.authorize_access(self.credentials_for(owner)?,path,access)?;
+        }
+        // Validate the whole file checksum before exposing a new handle.
         fs.read_at(path,0,&mut [])?;
         let token=self.next;
         self.next=self.next.checked_add(1).ok_or(FsError::Full)?;
