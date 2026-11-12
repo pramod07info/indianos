@@ -2922,4 +2922,45 @@ mod tests{
                    Err(FsError::InvalidVolume));
     }
 
+
+    #[test]
+    fn g6_post_publish_header_read_failure_retires_mount_until_remount(){
+        // Fail only after both ordered COW persistence barriers returned.
+        // The metadata publication may have succeeded, but its subsequent
+        // verification is uncertain and must not allow an in-place retry.
+        struct DelayedHeaderFailure{disk:Disk,barriers:usize,unreadable:bool}
+        impl BlockDevice for DelayedHeaderFailure{
+            fn sector_count(&self)->u64{self.disk.sector_count()}
+            fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+                ->Result<(),BlockError>{
+                if self.unreadable&&lba<2{return Err(BlockError::Io);}
+                self.disk.read_sector(lba,out)
+            }
+            fn write_sector(&mut self,lba:u64,data:&[u8;SECTOR_BYTES])
+                ->Result<(),BlockError>{self.disk.write_sector(lba,data)}
+            fn sync(&mut self)->Result<(),BlockError>{
+                self.barriers+=1;
+                if self.barriers==2{self.unreadable=true;}
+                Ok(())
+            }
+        }
+        let mut fs=DurableFs::format_blank(DelayedHeaderFailure{
+            disk:blank(),barriers:0,unreadable:false
+        }).unwrap();
+        assert_eq!(fs.create_durable_path("/note",b"committed"),Err(FsError::Io));
+        assert_eq!(fs.disk.barriers,2);
+        assert!(fs.retired.get());
+        let writes=fs.disk.disk.writes;
+        let mut output=[0xa5;32];
+        assert_eq!(fs.read_path("/note",&mut output),Err(FsError::InvalidVolume));
+        assert_eq!(fs.create_path("/retry",b"unsafe"),Err(FsError::InvalidVolume));
+        assert_eq!(fs.disk.disk.writes,writes);
+        assert_eq!(output,[0xa5;32]);
+        // Freshly opened media must be examined again; the last published
+        // checkpoint is valid once the header read fault is gone.
+        let mut disk=fs.into_device();
+        disk.unreadable=false;
+        let mut recovered=DurableFs::mount(disk).unwrap();
+        assert_eq!(get(&mut recovered,"/note"),b"committed");
+    }
 }
