@@ -702,7 +702,13 @@ impl<D:BlockDevice> DurableFs<D>{
         next.entries[index]=Entry{
             name,len:data.len() as u32,checksum:crc(data),bank,used:true,permissions
         };
-        self.publish(next)
+        // A data bank has been written even when the following metadata
+        // publication fails before touching either header. A transient
+        // header-read failure is therefore NOT safe to retry through the
+        // current mount: revalidate the media from a fresh mount first.
+        let published=self.publish(next);
+        if published.is_err(){self.retired.set(true);}
+        published
     }
     /// Strict atomic COW publication: first flush the new data bank, then
     /// publish the metadata head, then flush the head. Unlike legacy
