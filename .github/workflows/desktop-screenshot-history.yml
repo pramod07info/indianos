@@ -15,6 +15,7 @@ on:
       - 'rust/kernel_core/Cargo.toml'
       - 'tools/test_r029_user_surfaces_qemu.py'
       - 'tools/archive_qemu_desktop.py'
+      - 'tools/ci/install-qemu-deps.sh'
       - '.github/workflows/desktop-screenshot-history.yml'
   workflow_dispatch:
     inputs:
@@ -37,7 +38,7 @@ concurrency:
 
 jobs:
   capture:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
       - name: Checkout screenshot capture tools
@@ -80,12 +81,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-none
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b
+        with:
+          github_access_token: ${{ github.token }}
       - name: Install actual QEMU, OVMF and ISO dependencies
         shell: bash
         run: |
           set -euo pipefail
-          sudo timeout 300s apt-get update -o Acquire::Retries=3 -o Acquire::http::Timeout=40
-          sudo timeout 600s apt-get install -y --no-install-recommends -o Acquire::Retries=3 -o Acquire::http::Timeout=40 clang lld binutils xorriso qemu-system-x86 ovmf curl openssl
+          bash tools/ci/install-qemu-deps.sh
       - name: Render real screenshot from exact source commit (not a mockup)
         working-directory: historical-source
         shell: bash

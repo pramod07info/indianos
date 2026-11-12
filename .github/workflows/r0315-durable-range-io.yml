@@ -9,20 +9,28 @@ on:
       - 'rust/kernel_core/src/user_runtime.rs'
       - 'userland/rust/src/main.rs'
       - 'tools/test_r031_vfs_qemu.py'
+      - 'tools/ci/install-qemu-deps.sh'
       - '.github/workflows/r0315-durable-range-io.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/r0315-durable-range-io.yml'
+      - 'tools/ci/install-qemu-deps.sh'
   workflow_dispatch:
 permissions:
   contents: read
 jobs:
   r0315-range-io:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b
+        with:
+          github_access_token: ${{ github.token }}
       - name: Install isolated QEMU and linker dependencies
         run: |
-          sudo timeout 120s apt-get update -o Acquire::Retries=0 -o Acquire::http::Timeout=30
-          sudo timeout 120s apt-get install -y clang lld binutils xorriso qemu-system-x86 ovmf curl openssl
+          bash tools/ci/install-qemu-deps.sh
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-none

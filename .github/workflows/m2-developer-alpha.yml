@@ -12,6 +12,7 @@ on:
       - 'tools/test_m2_phase5c_vectors.py'
       - 'Makefile'
       - 'tools/test_m2_disk_exec_qemu.py'
+      - 'tools/ci/install-qemu-deps.sh'
       - '.github/workflows/m2-developer-alpha.yml'
   pull_request:
     branches: [main]
@@ -25,13 +26,14 @@ on:
       - 'tools/test_m2_phase5c_vectors.py'
       - 'Makefile'
       - 'tools/test_m2_disk_exec_qemu.py'
+      - 'tools/ci/install-qemu-deps.sh'
       - '.github/workflows/m2-developer-alpha.yml'
   workflow_dispatch:
 permissions:
   contents: read
 jobs:
   m2-native-and-guest:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
@@ -100,12 +102,14 @@ jobs:
       - name: Real Ed25519 developer SDK validation on host
         run: |
           python3 -m unittest discover -s tests -p 'test_r030_pkg.py' -v
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b
+        with:
+          github_access_token: ${{ github.token }}
       - name: Install QEMU OVMF clang and native package prerequisites
         run: |
           # Github-hosted mirrors can download QEMU slowly. Preserve the
           # mandatory emulator test; avoid optional GUI packages and retry.
-          sudo timeout 300s apt-get update -o Acquire::Retries=3 -o Acquire::http::Timeout=40
-          sudo timeout 600s apt-get install -y --no-install-recommends -o Acquire::Retries=3 -o Acquire::http::Timeout=40 clang lld binutils xorriso qemu-system-x86 ovmf curl openssl
+          bash tools/ci/install-qemu-deps.sh
       - name: Independently verify three QEMU Ed25519 signature vectors with OpenSSL
         run: |
           python3 tools/test_m2_phase4c_vectors.py

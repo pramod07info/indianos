@@ -11,20 +11,28 @@ on:
       - 'userland/rust/src/main.rs'
       - 'Makefile'
       - 'tools/test_r031_files_gui_qemu.py'
+      - 'tools/ci/install-qemu-deps.sh'
       - '.github/workflows/r0319-files-gui.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/r0319-files-gui.yml'
+      - 'tools/ci/install-qemu-deps.sh'
   workflow_dispatch:
 permissions:
   contents: read
 jobs:
   persistent-files-gui:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b
+        with:
+          github_access_token: ${{ github.token }}
       - name: Install QEMU and UEFI development dependencies
         run: |
-          sudo timeout 300s apt-get update -o Acquire::Retries=3 -o Acquire::http::Timeout=40
-          sudo timeout 600s apt-get install -y --no-install-recommends -o Acquire::Retries=3 -o Acquire::http::Timeout=40 clang lld binutils xorriso qemu-system-x86 ovmf curl openssl
+          bash tools/ci/install-qemu-deps.sh
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-none

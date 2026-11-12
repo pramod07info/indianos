@@ -10,6 +10,7 @@ on:
       - "tools/test_*.py"
       - "tests/test_*.py"
       - "Makefile"
+      - "tools/ci/install-qemu-deps.sh"
       - ".github/workflows/m1-reliability-integration.yml"
   push:
     branches: [main]
@@ -20,6 +21,7 @@ on:
       - "tools/test_*.py"
       - "tests/test_*.py"
       - "Makefile"
+      - "tools/ci/install-qemu-deps.sh"
       - ".github/workflows/m1-reliability-integration.yml"
   workflow_dispatch:
 
@@ -28,7 +30,7 @@ permissions:
 
 jobs:
   combined-regression:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -57,7 +59,7 @@ jobs:
           cargo check --locked --offline --manifest-path rust/kernel_core/Cargo.toml --no-default-features --target x86_64-unknown-none --features normal-init
 
   runtime-qemu:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -71,10 +73,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-none
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b
+        with:
+          github_access_token: ${{ github.token }}
       - name: Install disposable QEMU/UEFI test dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y clang lld binutils xorriso qemu-system-x86 ovmf curl
+          bash tools/ci/install-qemu-deps.sh
       - name: Terminal parser and recovery harness regressions
         run: |
           set -euo pipefail
@@ -113,7 +117,7 @@ jobs:
 
 
   normal-desktop-qemu:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
@@ -127,10 +131,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-none
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b
+        with:
+          github_access_token: ${{ github.token }}
       - name: Install disposable GPT and OVMF acceptance dependencies
         run: |
-          sudo apt-get update -o Acquire::Retries=3
-          sudo apt-get install -y --no-install-recommends clang lld binutils xorriso qemu-system-x86 ovmf curl
+          bash tools/ci/install-qemu-deps.sh
       - name: Normal desktop host, freestanding and harness regression checks
         run: |
           set -euo pipefail
