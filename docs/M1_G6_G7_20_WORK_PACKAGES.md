@@ -1,6 +1,6 @@
 # M1 G6 + G7: 20 engineering work packages (not 20 executing agents)
 
-Baseline: main `db553c8b5c447efe88f523435533d9421020d552`, 2026-11-12.
+Refreshed after PR #770 and #771 merged on 2026-11-12; next development base: main `b6c719e3751a3ff26af8687c1d0ee14216084aa4`.
 Scope: G6 = persistent VFS / power-loss safety; G7 = live authenticated ring-3 file ABI.
 The 20 entries below are independently reviewable assignments. **This
 integration used one coordinator, not 20 independently launched coding agents.**
@@ -13,7 +13,7 @@ Physical power-loss and multicore/hardware certification remain open.
 | --- | --- | --- |
 | G6-01 | Pin immutable selected-media identity across remount; reject changed GPT token before filesystem reads | Open |
 | G6-02 | Audit flush ordering for new COW data banks and both metadata copies; test dropped acknowledgements | Open |
-| G6-03 | Quarantine the mounted session on any post-publication verification failure; remount before retry | Candidate in PR #770; not accepted |
+| G6-03 | Quarantine the mounted session on any post-publication verification failure; remount before retry | Source merged via PR #770; full G6 acceptance still open |
 | G6-04 | Inject torn metadata-head writes during a real QEMU guest power interruption; recover old or new valid state | Open |
 | G6-05 | Inject data-write loss and stale-sector readback; require checksum rejection and no user-visible success | Open |
 | G6-06 | Validate interrupted rename, unlink and directory COW transactions on two consecutive cold boots | Open |
@@ -28,14 +28,24 @@ Physical power-loss and multicore/hardware certification remain open.
 | --- | --- | --- |
 | G7-11 | Require exact kernel-authenticated process incarnation on every file ABI operation | Open |
 | G7-12 | Bind path operations and descriptors to namespace, mount receipt and current revision | Open |
-| G7-13 | Quarantine selected volume on storage faults during VFS authorization, not just payload I/O | Candidate in companion G7 PR; not accepted |
+| G7-13 | Quarantine selected volume on storage faults during VFS authorization, not just payload I/O | Source merged via PR #771; full G7 acceptance still open |
 | G7-14 | Revoke all stale descriptors on mount rollback, PID recycle and failed publication | Open |
 | G7-15 | Verify foreign-reader lease prevents cross-process mutations before device probe, then releases on close | Open |
 | G7-16 | Enforce write grant and quota across every descriptor edit/rename/truncate, including failures | Open |
-| G7-17 | Enforce ancestor-search, target owner and destination-directory authorization without TOCTOU bypass | Open |
+| G7-17 | Enforce ancestor-search, target owner and destination-directory authorization without TOCTOU bypass | Private-file and directory ACL enforcement candidate in PR #773; broader acceptance open |
 | G7-18 | Run independent actual ring-3 clients through syscall create/read/write/rename in QEMU (no host adapter substitute) | Open |
 | G7-19 | Stress concurrent process exit, reuse, open handle close, permission revocation and namespace changes | Open |
 | G7-20 | Verify two-process persistent disk round-trip across two real QEMU cold boots at the exact merged SHA | Open |
+
+## November 12 next batch — bounded COW metadata-read uncertainty
+
+The new G6 candidate hardens the legacy COW path against a specific
+fault boundary: all four new data-bank sectors can be written successfully,
+yet the following header read can fail before metadata publication.
+The live mount must retire even though the old checkpoint remains
+readable after a fresh verification/remount. This is a bounded
+synthetic-fault regression, **not** actual QEMU power interruption,
+all-stage power-loss coverage or physical storage qualification.
 
 ## Dependency / integration strategy
 
