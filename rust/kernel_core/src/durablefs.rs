@@ -2961,6 +2961,8 @@ mod tests{
         let mut disk=fs.into_device();
         disk.unreadable=false;
         let mut recovered=DurableFs::mount(disk).unwrap();
-        assert_eq!(get(&mut recovered,"/note"),b"committed");
+        let mut readback=[0u8;32];
+        let count=recovered.read_path("/note",&mut readback).unwrap();
+        assert_eq!(&readback[..count],b"committed");
     }
 }
