@@ -582,8 +582,18 @@ impl FileHandles{
         }
         let slot=self.entries.iter().position(|e|e.token==0)
             .ok_or(FsError::Full)?;
-        // A zero-byte range read validates path, parent directories and the
-        // complete data checksum before creating a usable handle.
+        // Persistent owner/group/mode permission checks are separate from
+        // PID/namespace capabilities. Never mint an authenticated handle
+        // solely because a path is within a process's permitted namespace.
+        // Perform the ACL check BEFORE reading its contents for verification.
+        // The generation-zero adapter intentionally retains its legacy
+        // behavior; native selected-volume callers have real generations.
+        if owner.generation!=0{
+            let access=((if mode&READ!=0{crate::fs_permissions::READ}else{0}) |
+                        (if mode&WRITE!=0{crate::fs_permissions::WRITE}else{0}));
+            fs.authorize_access(self.credentials_for(owner)?,path,access)?;
+        }
+        // Validate the whole file checksum before exposing a new handle.
         fs.read_at(path,0,&mut [])?;
         let token=self.next;
         self.next=self.next.checked_add(1).ok_or(FsError::Full)?;
@@ -3873,6 +3883,54 @@ mod r106_checked_partition_authenticated_file_api_tests{
   let receipt=inspect_partition_receipt(&mut d,0).unwrap();
   (d,receipt)
  }
+ #[test]fn g7_private_selected_file_denies_guest_open_before_checksum_read(){
+  let (mut media,receipt)=disk();
+  {
+   let mut mounted=crate::m1_partition::mount_partition_receipt_healthy(&mut media,receipt).unwrap();
+   let root=crate::fs_permissions::Credentials::kernel(0,0);
+   mounted.chmod_as(root,"/shared/note",0o600).unwrap();
+  }
+  let mut files=FileHandles::new();
+  prepare_selected_volume_kernel(&mut files,&mut media,receipt).unwrap();
+  let admin=files.bind_process(1).unwrap();
+  let guest=files.bind_process(2).unwrap();
+  let writes=media.writes;
+  assert_eq!(operation_on_selected_volume(&mut files,1,guest,0,READ,
+      "/shared/note",&mut[],&mut media,receipt),Err(FsError::InvalidName));
+  assert_eq!(media.writes,writes);
+  assert!(files.entries.iter().all(|entry|entry.token==0));
+  assert!(!files.selected_quarantined); // ACL denial isn't corrupt media
+  // Kernel-bound root credentials may still inspect the protected file.
+  let fd=operation_on_selected_volume(&mut files,1,admin,0,READ,
+      "/shared/note",&mut[],&mut media,receipt).unwrap();
+  let mut out=[0u8;9];
+  assert_eq!(operation_on_selected_volume(&mut files,2,admin,fd,0,"",
+      &mut out,&mut media,receipt),Ok(9));
+  assert_eq!(&out,b"persisted");
+ }
+
+ #[test]fn g7_private_ancestor_denies_guest_even_when_file_is_readable(){
+  let (mut media,receipt)=disk();
+  {
+   let mut mounted=crate::m1_partition::mount_partition_receipt_healthy(&mut media,receipt).unwrap();
+   let root=crate::fs_permissions::Credentials::kernel(0,0);
+   mounted.chmod_as(root,"/shared",0o700).unwrap();
+   mounted.chmod_as(root,"/shared/note",0o644).unwrap();
+  }
+  let mut files=FileHandles::new();
+  prepare_selected_volume_kernel(&mut files,&mut media,receipt).unwrap();
+  let root=files.bind_process(1).unwrap();
+  let guest=files.bind_process(2).unwrap();
+  let writes=media.writes;
+  assert_eq!(operation_on_selected_volume(&mut files,1,guest,0,READ,
+      "/shared/note",&mut[],&mut media,receipt),Err(FsError::InvalidName));
+  assert_eq!(media.writes,writes);
+  assert!(!files.selected_quarantined);
+  let fd=operation_on_selected_volume(&mut files,1,root,0,READ,
+      "/shared/note",&mut[],&mut media,receipt).unwrap();
+  assert!(fd>0);
+ }
+
  #[test]fn r109_pid2_and_protected_namespace_reject_before_device_io(){
   let (mut d,receipt)=disk();let mut table=FileHandles::new();
   let guest=table.bind_process(2).unwrap();
