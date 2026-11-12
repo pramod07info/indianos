@@ -754,16 +754,26 @@ impl<D:BlockDevice> DurableFs<D>{
              checksum:crc(data),bank,used:true,permissions:if replace{
                  self.meta.entries[index].permissions
              }else{Permissions::LEGACY}};
-        self.publish(next)?;
+        // The new data bank has already been modified. Even if checkpoint
+        // publication fails before it changes a metadata head, its outcome
+        // is not safe to retry through this mount without revalidation.
+        if let Err(error)=self.publish(next){
+            self.retired.set(true);
+            return Err(error);
+        }
         if let Err(e)=self.disk.sync(){
             self.retired.set(true);return Err(e.into());
         }
-        self.check_heads()?;
-        // The final metadata barrier is another device operation: payload
-        // integrity checked before it is not sufficient to acknowledge a
-        // durable transaction. Keep uncertain sessions permanently retired.
-        self.check_payloads(self.meta)?;
-        self.check_heads()
+        // The final metadata barrier is another device operation. A failed
+        // header read after publication is just as uncertain as a failed
+        // payload read: do not keep using this mount on any error.
+        let verified=(||{
+            self.check_heads()?;
+            self.check_payloads(self.meta)?;
+            self.check_heads()
+        })();
+        if verified.is_err(){self.retired.set(true);}
+        verified
     }
     /// Opt-in, flush-verified creation; a missing flush driver is an error.
     pub fn create_durable_path(&mut self,path:&str,data:&[u8])
@@ -2912,4 +2922,47 @@ mod tests{
                    Err(FsError::InvalidVolume));
     }
 
+
+    #[test]
+    fn g6_post_publish_header_read_failure_retires_mount_until_remount(){
+        // Fail only after both ordered COW persistence barriers returned.
+        // The metadata publication may have succeeded, but its subsequent
+        // verification is uncertain and must not allow an in-place retry.
+        struct DelayedHeaderFailure{disk:Disk,barriers:usize,unreadable:bool}
+        impl BlockDevice for DelayedHeaderFailure{
+            fn sector_count(&self)->u64{self.disk.sector_count()}
+            fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+                ->Result<(),BlockError>{
+                if self.unreadable&&lba<2{return Err(BlockError::Io);}
+                self.disk.read_sector(lba,out)
+            }
+            fn write_sector(&mut self,lba:u64,data:&[u8;SECTOR_BYTES])
+                ->Result<(),BlockError>{self.disk.write_sector(lba,data)}
+            fn sync(&mut self)->Result<(),BlockError>{
+                self.barriers+=1;
+                if self.barriers==2{self.unreadable=true;}
+                Ok(())
+            }
+        }
+        let mut fs=DurableFs::format_blank(DelayedHeaderFailure{
+            disk:blank(),barriers:0,unreadable:false
+        }).unwrap();
+        assert_eq!(fs.create_durable_path("/note",b"committed"),Err(FsError::Io));
+        assert_eq!(fs.disk.barriers,2);
+        assert!(fs.retired.get());
+        let writes=fs.disk.disk.writes;
+        let mut output=[0xa5;32];
+        assert_eq!(fs.read_path("/note",&mut output),Err(FsError::InvalidVolume));
+        assert_eq!(fs.create_path("/retry",b"unsafe"),Err(FsError::InvalidVolume));
+        assert_eq!(fs.disk.disk.writes,writes);
+        assert_eq!(output,[0xa5;32]);
+        // Freshly opened media must be examined again; the last published
+        // checkpoint is valid once the header read fault is gone.
+        let mut disk=fs.into_device();
+        disk.unreadable=false;
+        let mut recovered=DurableFs::mount(disk).unwrap();
+        let mut readback=[0u8;32];
+        let count=recovered.read_path("/note",&mut readback).unwrap();
+        assert_eq!(&readback[..count],b"committed");
+    }
 }
