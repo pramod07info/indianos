@@ -164,8 +164,10 @@ fn capacity(words:&[u16;256])->Option<u64>{
     // remain test-only candidates; successful command completion is required.
     if identify_word_valid(words[83]) && words[83]&(1<<12)==0 {return None;}
     let sectors=((words[61] as u64)<<16)|(words[60] as u64);
-    if sectors==0{return None;}
-    Some(sectors.min(MAX_LBA28))
+    // An impossible LBA28 count is not permission to silently clamp a
+    // mismatched IDENTIFY geometry and mount media under false bounds.
+    if sectors==0||sectors>MAX_LBA28{return None;}
+    Some(sectors)
 }
 pub struct AtaPio { sectors:u64, last_stage:AtaStage, retired:bool }
 impl AtaPio {
@@ -362,7 +364,7 @@ mod tests {
         words[60]=0x1234;words[61]=1;
         assert_eq!(capacity(&words),Some(0x11234));
         words[60]=0xffff;words[61]=0xffff;
-        assert_eq!(capacity(&words),Some(MAX_LBA28));
+        assert_eq!(capacity(&words),None);
     }
     fn identify_512()->[u16;256] {
         let mut words=[0;256];
@@ -446,7 +448,9 @@ mod tests {
         let mut words=identify_512();
         for sectors in [1,MAX_LBA28-1,MAX_LBA28,MAX_LBA28+1,u32::MAX as u64] {
             words[60]=sectors as u16;words[61]=(sectors>>16) as u16;
-            assert_eq!(capacity(&words),Some(sectors.min(MAX_LBA28)));
+            assert_eq!(capacity(&words),
+                if sectors<=MAX_LBA28{Some(sectors)}else{None},
+                "declared sectors={sectors}");
         }
     }
     #[test]
@@ -518,8 +522,15 @@ mod r090_ata_acceptance {
  #[test]fn r090_a11_identify_rejects_missing_lba_capability(){let mut id=base();id[49]=0;assert_eq!(capacity(&id),None);}
  /// R090 A12: identify rejects zero sector capacity
  #[test]fn r090_a12_identify_rejects_zero_sector_capacity(){let mut id=base();id[60]=0;id[61]=0;assert_eq!(capacity(&id),None);}
- /// R090 A13: identify limits capacity to lba28
- #[test]fn r090_a13_identify_limits_capacity_to_lba28(){let mut id=base();id[60]=0xffff;id[61]=0xffff;assert_eq!(capacity(&id),Some(MAX_LBA28));}
+ /// R090 A13: an out-of-range IDENTIFY count cannot be silently clamped
+ #[test]fn r090_a13_identify_rejects_capacity_above_lba28(){
+  let mut id=base();
+  id[60]=0xffff;id[61]=0xffff;
+  assert_eq!(capacity(&id),None);
+  id[60]=(MAX_LBA28-1) as u16;
+  id[61]=((MAX_LBA28-1)>>16) as u16;
+  assert_eq!(capacity(&id),Some(MAX_LBA28-1));
+ }
  /// R090 A14: identify rejects non ata device
  #[test]fn r090_a14_identify_rejects_non_ata_device(){let mut id=base();id[0]=0x8000;assert_eq!(capacity(&id),None);}
  /// R090 A15: identify rejects incomplete response
