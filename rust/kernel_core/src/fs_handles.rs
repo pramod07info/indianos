@@ -1458,15 +1458,29 @@ pub fn selected_path_operation_on_device<D:BlockDevice>(
     };
     if !table.selected_operation_guard_is_current(guard){return Err(FsError::InvalidName);}
     let credentials=table.credentials_for(owner)?;
-    match action{
-        1|3=>volume.authorize_parent(credentials,path)?,
-        2|6=>{volume.authorize_parent(credentials,path)?;volume.authorize_access(credentials,path,0)?;},
-        7|9=>{volume.authorize_parent(credentials,path)?;volume.authorize_parent(credentials,target)?;
-               volume.authorize_access(credentials,path,0)?;},
-        4|10=>volume.authorize_access(credentials,path,crate::fs_permissions::READ)?,
-        8=>volume.authorize_access(credentials,path,crate::fs_permissions::READ|crate::fs_permissions::SEARCH)?,
-        5|11=>volume.authorize_access(credentials,path,crate::fs_permissions::WRITE)?,
-        _=>return Err(FsError::InvalidName),
+    // Authorization can itself perform metadata and directory reads on the
+    // selected device. A transport failure or corrupt mount at this stage
+    // is NOT a normal permission denial: quarantine the entire selected
+    // volume and revoke cached handles before returning to ring 3.
+    let authorization=(|| -> Result<(),FsError>{
+        match action{
+            1|3=>volume.authorize_parent(credentials,path)?,
+            2|6=>{volume.authorize_parent(credentials,path)?;volume.authorize_access(credentials,path,0)?;},
+            7|9=>{volume.authorize_parent(credentials,path)?;volume.authorize_parent(credentials,target)?;
+                   volume.authorize_access(credentials,path,0)?;},
+            4|10=>volume.authorize_access(credentials,path,crate::fs_permissions::READ)?,
+            8=>volume.authorize_access(credentials,path,crate::fs_permissions::READ|crate::fs_permissions::SEARCH)?,
+            5|11=>volume.authorize_access(credentials,path,crate::fs_permissions::WRITE)?,
+            _=>return Err(FsError::InvalidName),
+        }
+        Ok(())
+    })();
+    if let Err(error)=authorization{
+        if matches!(error,FsError::Io|FsError::InvalidVolume){
+            table.selected_quarantined=true;
+            table.entries.fill(Handle::EMPTY);
+        }
+        return Err(error);
     }
     let mut scratch=[0u8;crate::hier_vfs::MAX_TRANSFER];
     if matches!(action,3|5|11){scratch[..used].copy_from_slice(&buffer[..used]);}
