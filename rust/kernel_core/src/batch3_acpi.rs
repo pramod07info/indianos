@@ -20,11 +20,17 @@ pub fn parse_rsdp(bytes:&[u8])->Result<Rsdp,AcpiError>{
         if length<36||length>4096{return Err(AcpiError::Malformed);}
         if bytes.len()<length as usize{return Err(AcpiError::Truncated);}
         if !checksum_ok(&bytes[..length as usize]){return Err(AcpiError::Checksum);}
+        // ACPI 2+ reserves the final three RSDP bytes. Reject a malformed
+        // firmware handoff before ever interpreting a physical table address.
+        if bytes[33..36].iter().any(|&byte|byte!=0){return Err(AcpiError::Malformed);}
         let xsdt=u64::from_le_bytes(bytes[24..32].try_into().map_err(|_|AcpiError::Truncated)?);
-        if xsdt!=0{return Ok(Rsdp{revision,root_address:xsdt,xsdt:true});}
+        if xsdt!=0{
+            if xsdt&7!=0{return Err(AcpiError::Malformed);}
+            return Ok(Rsdp{revision,root_address:xsdt,xsdt:true});
+        }
     }
     let rsdt=u32::from_le_bytes(bytes[16..20].try_into().map_err(|_|AcpiError::Truncated)?);
-    if rsdt==0{return Err(AcpiError::Malformed);}
+    if rsdt==0||rsdt&3!=0{return Err(AcpiError::Malformed);}
     Ok(Rsdp{revision,root_address:rsdt as u64,xsdt:false})
 }
 pub fn parse_sdt(bytes:&[u8])->Result<Table,AcpiError>{
@@ -60,6 +66,37 @@ mod tests{
         b[4..8].copy_from_slice(&100u32.to_le_bytes());
         assert_eq!(parse_sdt(&b),Err(AcpiError::Truncated));
         assert_eq!(parse_rsdp(&[0u8;5]),Err(AcpiError::Truncated));
+    }
+    #[test]fn g8_firmware_rsdp_v2_rejects_reserved_bytes_and_bad_root_alignment(){
+        fn fix_crc(bytes:&mut[u8],index:usize){
+            bytes[index]=0;
+            let sum=bytes.iter().fold(0u8,|s,&byte|s.wrapping_add(byte));
+            bytes[index]=0u8.wrapping_sub(sum);
+        }
+        let mut v2=[0u8;36];
+        v2[..8].copy_from_slice(b"RSD PTR ");
+        v2[15]=2;
+        v2[16..20].copy_from_slice(&0x1000u32.to_le_bytes());
+        v2[20..24].copy_from_slice(&36u32.to_le_bytes());
+        v2[24..32].copy_from_slice(&0x2000u64.to_le_bytes());
+        fix_crc(&mut v2[..20],8);
+        fix_crc(&mut v2[..],32);
+        assert_eq!(parse_rsdp(&v2),Ok(Rsdp{
+            revision:2,root_address:0x2000,xsdt:true
+        }));
+        let mut bad_reserved=v2;bad_reserved[33]=1;
+        fix_crc(&mut bad_reserved[..],32);
+        assert_eq!(parse_rsdp(&bad_reserved),Err(AcpiError::Malformed));
+        let mut unaligned=v2;
+        unaligned[24..32].copy_from_slice(&0x2004u64.to_le_bytes());
+        fix_crc(&mut unaligned[..],32);
+        assert_eq!(parse_rsdp(&unaligned),Err(AcpiError::Malformed));
+        let mut bad_rsdt=v2;
+        bad_rsdt[24..32].fill(0);
+        bad_rsdt[16..20].copy_from_slice(&0x1002u32.to_le_bytes());
+        fix_crc(&mut bad_rsdt[..20],8);
+        fix_crc(&mut bad_rsdt[..],32);
+        assert_eq!(parse_rsdp(&bad_rsdt),Err(AcpiError::Malformed));
     }
     #[test]fn accepts_valid_sdt_header(){
         let mut b=[0u8;36];

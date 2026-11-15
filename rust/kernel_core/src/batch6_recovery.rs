@@ -15,7 +15,11 @@ impl<const N:usize> Recovery<N>{
  }
  pub fn fault(&mut self,owner:Identity,vector:u16,code:u32,uptime:u64)
   ->Result<bool,Error>{
-  if owner.pid==0||owner.generation==0{return Err(Error::Invalid);}
+  // Hardware IRQ vectors are not process exceptions and must never
+  // consume a service-restart slot or be logged as a process crash.
+  if owner.pid==0||owner.generation==0||vector>=32{
+   return Err(Error::Invalid);
+  }
   self.faults.record(owner.pid,owner.generation,vector,code,uptime)
    .map_err(Error::Crash)?;
   if self.remaining==0{return Ok(false);}
@@ -32,6 +36,19 @@ impl<const N:usize> Recovery<N>{
 }
 #[cfg(test)]mod tests{
  use super::*;
+ #[test]fn g8_irq_or_invalid_owner_cannot_consume_crash_retry_budget(){
+  let mut r=Recovery::<2>::new(1);
+  let owner=Identity{pid:5,generation:9};
+  for irq in [32u16,33,48,255,256]{
+   assert_eq!(r.fault(owner,irq,0,5),Err(Error::Invalid));
+  }
+  assert_eq!(r.fault(Identity{pid:0,generation:1},14,0,5),
+             Err(Error::Invalid));
+  assert_eq!(r.faults.count(),0);
+  assert_eq!(r.fault(owner,14,0,10),Ok(true));
+  assert_eq!(r.fault(owner,13,0,11),Ok(false));
+  assert_eq!(r.faults.count(),2);
+ }
  #[test]fn bounded_crash_restarts_then_degrade(){
   let mut r=Recovery::<2>::new(1);let a=Identity{pid:2,generation:1};
   assert_eq!(r.fault(a,14,0,100),Ok(true));

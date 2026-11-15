@@ -1805,7 +1805,12 @@ impl<const N:usize> ServiceTable<N>{
  /// forged shutdown cannot terminate an unrelated service or leave some
  /// services stopped because of a later authorization error.
  pub fn shutdown_all_exact(&mut self,requests:&[(u32,u32,u32)])->bool{
-  if requests.len()!=self.active_services()||!self.all_active_exact(requests){
+  // A process in Pending may still acquire grants after prepared(). Do not
+  // declare an all-services shutdown while an unprepared replacement exists.
+  // The trusted coordinator must cancel/retire that replacement first or
+  // complete preparation and include its exact PID + generation.
+  if self.phases.iter().any(|phase|*phase==ServicePhase::Pending)||
+     requests.len()!=self.active_services()||!self.all_active_exact(requests){
    return false;
   }
   self.stop_batch_exact(requests)
@@ -1832,6 +1837,21 @@ mod r101_boot_and_shutdown_checks{
   assert!(!s.shutdown_all_exact(&[(1,10,1),(2,20,2)]));
   assert!(s.all_active_exact(&[(1,10,1),(2,20,1)]));
   assert!(s.shutdown_all_exact(&[(1,10,1),(2,20,1)]));
+  assert_eq!(s.active_services(),0);
+ }
+ #[test]fn g8_shutdown_cannot_complete_with_unprepared_restart_reservation(){
+  let mut s=ServiceTable::<2>::new();
+  assert!(s.configure(1,10,1));assert!(s.configure(2,20,1));
+  assert_eq!(s.start(1),ServiceAction::Start{pid:10,generation:1});
+  assert_eq!(s.start(2),ServiceAction::Start{pid:20,generation:1});
+  assert_eq!(s.crash_exact(2,20,1,21),
+             ServiceAction::Restart{pid:21,generation:2});
+  assert!(!s.shutdown_all_exact(&[(1,10,1)]));
+  assert!(s.is_active_exact(1,10,1));
+  assert!(!s.snapshot(2).unwrap().active);
+  assert!(!s.prepared(2,20,1));
+  assert!(s.prepared(2,21,2));
+  assert!(s.shutdown_all_exact(&[(1,10,1),(2,21,2)]));
   assert_eq!(s.active_services(),0);
  }
  #[test]fn stale_shutdown_request_cannot_stop_replacement(){
