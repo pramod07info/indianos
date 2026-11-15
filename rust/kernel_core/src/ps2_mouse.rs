@@ -114,19 +114,20 @@ impl Mouse{
         Some(Self{packet:[0;3],received:0,last_left:false})
     }
     pub(crate) fn poll(&mut self)->Option<Packet>{
+        self.poll_aux_with(||unsafe{input(CTRL)},||unsafe{input(DATA)})
+    }
+    /// Host-testable AUX ownership: primary keyboard bytes are never read.
+    fn poll_aux_with<S,R>(&mut self,mut status:S,mut read:R)->Option<Packet>
+    where S:FnMut()->u8,R:FnMut()->u8 {
         for _ in 0..3{
-            let status=unsafe{input(CTRL)};
-            // Never steal primary keyboard bytes; they must reach the
-            // independent Set-1 driver even while a partial mouse packet
-            // is queued. Discard and resync only broken AUX transfers.
-            if status&1==0||status&0x20==0{return None;}
-            let byte=unsafe{input(DATA)};
-            if !valid_mouse_status(status){
-                self.packet=[0;3];
-                self.received=0;
+            let state=status();
+            if state&1==0||state&0x20==0{return None;}
+            if !valid_mouse_status(state){
+                let _=read(); // drain only this corrupted AUX byte
+                self.packet=[0;3];self.received=0;
                 return None;
             }
-            if let Some(packet)=self.feed(byte){return Some(packet);}
+            if let Some(packet)=self.feed(read()){return Some(packet);}
         }
         None
     }
@@ -312,4 +313,54 @@ mod tests{
         assert_eq!(m.feed(1),None);
         assert_eq!(m.feed(1),None);
     }
+}
+
+#[cfg(test)]
+mod g5_mouse_transport_tests {
+ use super::*;
+ use core::cell::Cell;
+ fn fresh_mouse()->Mouse{Mouse{packet:[0;3],received:0,last_left:false}}
+ #[test] fn primary_keyboard_bytes_cannot_be_consumed_by_mouse() {
+  let reads=Cell::new(0usize);let mut mouse=fresh_mouse();
+  let mut status=[0x01,0x21].into_iter();
+  assert_eq!(mouse.poll_aux_with(||status.next().unwrap_or(0),
+    ||{reads.set(reads.get()+1);0x09}),None);
+  assert_eq!(reads.get(),0);assert_eq!(mouse.received,0);
+ }
+ #[test] fn pending_mouse_frame_yields_to_keyboard_and_resumes() {
+  let reads=Cell::new(0usize);let mut mouse=fresh_mouse();
+  let mut status=[0x21,0x01].into_iter();
+  assert_eq!(mouse.poll_aux_with(||status.next().unwrap_or(0),
+    ||{reads.set(reads.get()+1);0x09}),None);
+  assert_eq!(reads.get(),1);assert_eq!(mouse.received,1);
+  let mut status=[0x21,0x21].into_iter();
+  let mut data=[7u8,3].into_iter();
+  assert_eq!(mouse.poll_aux_with(||status.next().unwrap_or(0),
+    ||data.next().unwrap_or(0)),Some(Packet{dx:7,dy:3,left:true}));
+ }
+ #[test] fn corrupted_aux_frames_reset_without_forging_clicks() {
+  for bad in [0x61,0xa1,0xe1] {
+   let mut mouse=fresh_mouse();let reads=Cell::new(0usize);
+   let mut status=[0x21,bad].into_iter();
+   let mut data=[0x09,0xff].into_iter();
+   assert_eq!(mouse.poll_aux_with(||status.next().unwrap_or(0),||{
+    reads.set(reads.get()+1);data.next().unwrap_or(0)
+   }),None);
+   assert_eq!(reads.get(),2);assert_eq!(mouse.received,0);
+   assert_eq!(mouse.packet,[0;3]);assert!(!mouse.last_left);
+  }
+ }
+ #[test] fn valid_packet_and_poll_bound_remain_intact() {
+  let mut mouse=fresh_mouse();
+  let polls=Cell::new(0usize);let reads=Cell::new(0usize);
+  let mut bytes=[0x09,5,3].into_iter();
+  assert_eq!(mouse.poll_aux_with(||{polls.set(polls.get()+1);0x21},
+    ||{reads.set(reads.get()+1);bytes.next().unwrap_or(0)}),
+    Some(Packet{dx:5,dy:3,left:true}));
+  assert_eq!((polls.get(),reads.get()),(3,3));
+  let mut mouse=fresh_mouse();let polls=Cell::new(0usize);let reads=Cell::new(0usize);
+  assert_eq!(mouse.poll_aux_with(||{polls.set(polls.get()+1);0x21},
+    ||{reads.set(reads.get()+1);0x00}),None);
+  assert_eq!((polls.get(),reads.get()),(3,3));
+ }
 }

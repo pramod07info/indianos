@@ -71,6 +71,12 @@ pub fn decode(bytes:&[u8],out:&mut[Option<Window>])
 /// must separately authorize and map it before actual PCIe accesses.
 pub fn config_address(window:Window,segment:u16,bus:u8,
  device:u8,function:u8,offset:u16)->Result<u64,Error>{
+ // Public Window values can bypass the checked MCFG decoder.
+ if window.base==0||window.base%ECAM_BUS_SIZE!=0||
+    window.start_bus>window.end_bus{return Err(Error::Address);}
+ let span=(u64::from(window.end_bus)-u64::from(window.start_bus)+1)
+    *ECAM_BUS_SIZE;
+ if window.base.checked_add(span).is_none(){return Err(Error::Address);}
  if window.segment!=segment||bus<window.start_bus||
   bus>window.end_bus||device>=32||function>=8||offset>=4096{
   return Err(Error::Address);
@@ -155,5 +161,26 @@ mod tests{
    assert_eq!(config_address(a(),segment,bus,slot,function,offset),
     Err(Error::Address));
   }
+ }
+}
+#[cfg(test)]
+mod g8_untrusted_ecam_tests {
+ use super::*;
+ fn good()->Window{Window{base:0x8000_0000,segment:0,start_bus:0,end_bus:7}}
+ #[test] fn forged_windows_never_yield_numeric_ecam_authority() {
+  for bad in [Window{base:0,..good()},Window{base:0x8000_0001,..good()},
+              Window{start_bus:17,end_bus:16,..good()},
+              Window{base:u64::MAX-0xfffff,start_bus:0,end_bus:0,..good()}]{
+   assert_eq!(config_address(bad,0,0,0,0,0),Err(Error::Address));
+  }
+ }
+ #[test] fn valid_ecam_edges_and_untrusted_device_parameters() {
+  assert_eq!(config_address(good(),0,7,31,7,4095),
+   Ok(0x8000_0000+7*0x100000+31*0x8000+7*0x1000+4095));
+  for (bus,dev,fun,off) in [(8,0,0,0),(0,32,0,0),
+                              (0,0,8,0),(0,0,0,4096)]{
+   assert_eq!(config_address(good(),0,bus,dev,fun,off),Err(Error::Address));
+  }
+  assert_eq!(config_address(good(),1,0,0,0,0),Err(Error::Address));
  }
 }

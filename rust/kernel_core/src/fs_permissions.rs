@@ -34,9 +34,38 @@ impl Permissions{
   if mode&!0o777!=0{None}else{Some(Self{owner,group,mode})}
  }
  pub fn allows(self,credentials:Credentials,access:u16)->bool{
-  if access&!7!=0{return false;}
+  // Corrupt persisted modes must never grant access, even to root.
+  if self.mode&!0o777!=0||access&!7!=0{return false;}
   if credentials.uid==0{return true;}
   let shift=if credentials.uid==self.owner{6}else if credentials.gid==self.group{3}else{0};
   ((self.mode>>shift)&access)==access
+ }
+}
+
+#[cfg(test)]
+mod g7_acl_integrity_tests {
+ use super::*;
+ #[test] fn forged_modes_fail_closed_even_for_root() {
+  for mode in [0o1000,0o1777,0o7777,u16::MAX] {
+   assert!(Permissions::new(1000,77,mode).is_none());
+   let forged=Permissions{owner:1000,group:77,mode};
+   for who in [Credentials::kernel(0,0),Credentials::kernel(1000,9),
+               Credentials::kernel(99,77),Credentials::kernel(99,8)] {
+    for access in [0,READ,WRITE,SEARCH,READ|WRITE|SEARCH] {
+     assert!(!forged.allows(who,access));
+    }
+   }
+  }
+ }
+ #[test] fn valid_acl_and_unknown_access_flags_preserved() {
+  let p=Permissions::new(1000,77,0o750).unwrap();
+  assert!(p.allows(Credentials::kernel(1000,8),READ|WRITE|SEARCH));
+  assert!(p.allows(Credentials::kernel(33,77),READ|SEARCH));
+  assert!(!p.allows(Credentials::kernel(33,77),WRITE));
+  assert!(!p.allows(Credentials::kernel(33,8),SEARCH));
+  assert!(p.allows(Credentials::kernel(0,8),READ|WRITE|SEARCH));
+  for who in [Credentials::kernel(0,0),Credentials::kernel(1000,77)] {
+   assert!(!p.allows(who,8));
+  }
  }
 }
