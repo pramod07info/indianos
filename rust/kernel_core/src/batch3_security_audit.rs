@@ -58,3 +58,28 @@ mod tests{
         assert_eq!(audit(&checks,[1;20],true),Err(AuditError::Failed));
     }
 }
+
+/// Final release gate after the protected branch merge. CI/reviewer evidence
+/// must match BOTH the candidate revision and the observed main head; callers
+/// must obtain the main SHA and approvals from trusted GitHub records.
+pub fn audit_merged_main(findings:&[Finding],candidate_sha:[u8;20],
+ observed_main_head:[u8;20],independent_review:bool)->Result<(),AuditError>{
+ if candidate_sha==[0;20]||observed_main_head!=candidate_sha{
+  return Err(AuditError::InvalidRevision);
+ }
+ audit(findings,candidate_sha,independent_review)
+}
+#[cfg(test)]
+mod ws30_exact_main_release_gate_tests{
+ use super::*;
+ #[test]fn green_pr_results_cannot_certify_unmerged_or_stale_main(){
+  let controls=[Control::MemorySafety,Control::ProcessIsolation,
+    Control::PackageTrust,Control::DriverIsolation,
+    Control::UpdateRollback,Control::DependencyPolicy,Control::MainQemuBuild];
+  let items=core::array::from_fn::<Finding,7,_>(|i|Finding{
+    control:controls[i],revision:[7;20],state:ResultState::Passed});
+  assert_eq!(audit_merged_main(&items,[7;20],[6;20],true),Err(AuditError::InvalidRevision));
+  assert_eq!(audit_merged_main(&items,[7;20],[7;20],false),Err(AuditError::Unreviewed));
+  assert_eq!(audit_merged_main(&items,[7;20],[7;20],true),Ok(()));
+ }
+}

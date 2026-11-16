@@ -30,10 +30,19 @@ pub fn parse_lease(address:[u8;4],options:&[u8])->Result<Lease,NetworkError>{
             _=>{}
         }
     }
-    if !end_seen{return Err(NetworkError::Malformed);}
+    if !end_seen||options[pos..].iter().any(|&byte|byte!=0){
+        return Err(NetworkError::Malformed);
+    }
     let ttl=seconds.ok_or(NetworkError::Missing)?;
     if ttl==0{return Err(NetworkError::Expired);}
-    Ok(Lease{address,subnet:subnet.ok_or(NetworkError::Missing)?,
+    let subnet=subnet.ok_or(NetworkError::Missing)?;
+    let host_bits=!u32::from_be_bytes(subnet);
+    // A normal IPv4 netmask is a one-run followed by a zero-run.
+    if host_bits==u32::MAX||
+        host_bits&(host_bits.wrapping_add(1))!=0{
+        return Err(NetworkError::Malformed);
+    }
+    Ok(Lease{address,subnet,
         gateway:gateway.ok_or(NetworkError::Missing)?,lease_seconds:ttl})
 }
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
@@ -195,4 +204,18 @@ mod tests{
             Err(NetworkError::Unverified));
         assert_eq!(tls_peer_gate(&Deny,b"",b"cert"),Err(NetworkError::Malformed));
     }
+}
+
+#[cfg(test)]
+mod ws26_dhcp_untrusted_options_tests{
+ use super::*;
+ #[test]fn rejects_bad_netmask_and_post_end_payload(){
+  let mut options=[99,130,83,99,1,4,255,255,255,0,3,4,10,0,0,1,
+      51,4,0,0,0,30,255,0,0];
+  assert!(parse_lease([10,0,0,2],&options).is_ok());
+  options[24]=42;
+  assert_eq!(parse_lease([10,0,0,2],&options),Err(NetworkError::Malformed));
+  options[24]=0;options[9]=0xf5;
+  assert_eq!(parse_lease([10,0,0,2],&options),Err(NetworkError::Malformed));
+ }
 }

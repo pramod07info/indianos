@@ -157,3 +157,41 @@ mod m1_ws05_crash_cursor_tests {
   assert_eq!(log.inspect_owner_since(0,1,0,&mut out),Err(CrashError::Invalid));
  }
 }
+
+impl<const N:usize> CrashLog<N>{
+ /// Page a retained per-generation history without requiring a buffer as
+ /// large as the whole ring. The sequence cursor is kernel-owned metadata.
+ pub fn page_owner_after(&self,pid:u32,generation:u64,after:u64,
+  out:&mut[Crash])->Result<(usize,Option<u64>),CrashError>{
+  if pid==0||generation==0{return Err(CrashError::Invalid);}
+  if out.is_empty(){return Err(CrashError::Exhausted);}
+  let mut count=0usize;let mut cursor=None;
+  for i in 0..self.count{
+   if let Some(c)=self.get(i){
+    if c.pid==pid&&c.generation==generation&&c.sequence>after{
+     out[count]=c;count+=1;cursor=Some(c.sequence);
+     if count==out.len(){break;}
+    }
+   }
+  }
+  Ok((count,cursor))
+ }
+}
+#[cfg(test)]
+mod ws27_crash_cursor_page_tests{
+ use super::*;
+ #[test]fn paged_crash_history_filters_pid_epochs_and_preserves_order(){
+  let mut log=CrashLog::<4>::new();
+  log.record(1,1,14,0,10).unwrap();log.record(2,1,14,0,11).unwrap();
+  log.record(1,1,13,0,12).unwrap();log.record(1,2,14,0,13).unwrap();
+  let empty=Crash{sequence:0,pid:0,generation:0,vector:0,code:0,uptime:0};
+  let mut out=[empty;1];
+  let (n,last)=log.page_owner_after(1,1,0,&mut out).unwrap();
+  assert_eq!((n,last,out[0].sequence),(1,Some(1),1));
+  let (n,last)=log.page_owner_after(1,1,last.unwrap(),&mut out).unwrap();
+  assert_eq!((n,last,out[0].sequence),(1,Some(3),3));
+  assert_eq!(log.page_owner_after(1,1,3,&mut out),Ok((0,None)));
+  assert_eq!(log.page_owner_after(1,1,0,&mut []),Err(CrashError::Exhausted));
+  assert_eq!(log.page_owner_after(0,1,0,&mut out),Err(CrashError::Invalid));
+ }
+}

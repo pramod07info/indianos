@@ -90,3 +90,37 @@ mod m1_ws03_virtio_ring_tests {
   assert_eq!(validate_ring(&[good[0];3],0,false),Err(VirtError::OutOfBounds));
  }
 }
+
+/// Reject overlapping DMA buffers inside an otherwise valid split chain.
+/// This preflight is intentionally separate from the historical validator:
+/// real DMA pinning, IOMMU and ownership checks remain mandatory.
+pub fn validate_disjoint_chain(descriptors:&[Descriptor],head:usize,
+ device_writes:bool)->Result<u64,VirtError>{
+ let bytes=validate_ring(descriptors,head,device_writes)?;
+ let mut visited=[(0u64,0u64);MAX_CHAIN];
+ let mut count=0usize;let mut current=head;
+ loop{
+  let item=descriptors[current];
+  let end=item.address.checked_add(u64::from(item.length))
+      .ok_or(VirtError::Invalid)?;
+  for &(start,stop) in &visited[..count]{
+   if item.address<stop&&start<end{return Err(VirtError::Invalid);}
+  }
+  visited[count]=(item.address,end);count+=1;
+  if item.flags&NEXT==0{break;}
+  current=item.next as usize;
+ }
+ Ok(bytes)
+}
+#[cfg(test)]
+mod ws24_virtio_alias_tests{
+ use super::*;
+ #[test]fn overlapping_split_descriptors_do_not_pass_strict_preflight(){
+  let first=Descriptor{address:0x1000,length:512,flags:NEXT,next:1};
+  let overlap=Descriptor{address:0x1100,length:512,flags:0,next:0};
+  assert_eq!(validate_disjoint_chain(&[first,overlap],0,false),Err(VirtError::Invalid));
+  let separated=Descriptor{address:0x1200,..overlap};
+  assert_eq!(validate_disjoint_chain(&[first,separated],0,false),Ok(1024));
+  assert_eq!(validate_disjoint_chain(&[first,separated],0,true),Err(VirtError::Unsupported));
+ }
+}

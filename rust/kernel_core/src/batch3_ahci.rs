@@ -73,3 +73,37 @@ mod m1_ws01_ahci_dma_tests {
     Region{dma_address:0x4000,byte_count:4096}]),Ok(8192));
  }
 }
+
+/// Requires both structurally safe PRDT geometry and externally verified
+/// DMA buffer ownership. A trusted IOMMU allocator supplies the callback;
+/// a software predicate alone does NOT establish physical DMA isolation.
+pub fn validate_mapped_command<F>(lba:u64,sectors:u16,disk_sectors:u64,
+ regions:&[Region],mut mapped:F)->Result<u64,AhciError>
+where F:FnMut(u64,u64)->bool{
+ let bytes=validate_command(lba,sectors,disk_sectors,regions)?;
+ for region in regions {
+  if !mapped(region.dma_address,u64::from(region.byte_count)){
+   return Err(AhciError::InvalidBuffer);
+  }
+ }
+ Ok(bytes)
+}
+#[cfg(test)]
+mod ws22_ahci_owned_buffer_tests{
+ use super::*;
+ use core::cell::Cell;
+ #[test]fn geometry_failure_precedes_mapping_and_unowned_page_denies(){
+  let regions=[Region{dma_address:0x1000,byte_count:4096},
+               Region{dma_address:0x3000,byte_count:4096}];
+  let calls=Cell::new(0u32);
+  assert_eq!(validate_mapped_command(0,17,16,&regions,|_,_|{
+   calls.set(calls.get()+1);true
+  }),Err(AhciError::InvalidRange));
+  assert_eq!(calls.get(),0);
+  assert_eq!(validate_mapped_command(0,16,100,&regions,|addr,_|addr==0x1000),
+    Err(AhciError::InvalidBuffer));
+  assert_eq!(validate_mapped_command(0,16,100,&regions,|addr,size|{
+    calls.set(calls.get()+1);size==4096&&addr>=0x1000
+  }),Ok(8192));
+ }
+}

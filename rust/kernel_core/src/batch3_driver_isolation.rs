@@ -15,7 +15,8 @@ impl<const N:usize> Drivers<N>{
         let end=start.checked_add(length).ok_or(DriverError::Invalid)?;
         if self.entries.iter().flatten().any(|e|e.driver==driver){return Err(DriverError::Duplicate);}
         if self.entries.iter().flatten().any(|e|e.irq==irq ||
-            start<e.region_start+e.region_length && e.region_start<end){
+            e.region_start.checked_add(e.region_length).is_some_and(|prior_end|
+                start<prior_end && e.region_start<end)){
             return Err(DriverError::Overlap);
         }
         let free=self.entries.iter_mut().find(|s|s.is_none()).ok_or(DriverError::Full)?;
@@ -29,12 +30,28 @@ impl<const N:usize> Drivers<N>{
         if !e.active{return Err(DriverError::Quarantined);}
         if e.generation!=generation||bytes==0{return Err(DriverError::Stale);}
         let end=address.checked_add(bytes).ok_or(DriverError::Invalid)?;
-        if address<e.region_start||end>e.region_start+e.region_length{
+        if address<e.region_start||e.region_start.checked_add(e.region_length)
+            .is_none_or(|bound|end>bound){
             return Err(DriverError::Invalid);
         }
         Ok(())
     }
     /// Trusted fault handler only; no user-mode caller can reset a quarantine.
+    /// Reuse a quarantined software slot ONLY after privileged hardware code
+    /// has disabled DMA/bus mastering, drained IRQs and unmapped MMIO.
+    /// The boolean must never be derived from userspace or a mere timer.
+    pub fn retire_quarantined(&mut self,driver:u32,generation:u64,
+        hardware_quiesced:bool)->Result<(),DriverError>{
+        if driver==0||generation==0{return Err(DriverError::Invalid);}
+        let slot=self.entries.iter_mut().find(|slot|slot.as_ref().is_some_and(
+            |grant|grant.driver==driver&&grant.generation==generation))
+            .ok_or(DriverError::Stale)?;
+        if !hardware_quiesced||slot.as_ref().is_some_and(|g|g.active){
+            return Err(DriverError::Quarantined);
+        }
+        *slot=None;
+        Ok(())
+    }
     pub fn quarantine(&mut self,driver:u32,generation:u64)->Result<(),DriverError>{
         let e=self.entries.iter_mut().flatten().find(|e|e.driver==driver&&driver!=0)
             .ok_or(DriverError::Stale)?;
@@ -64,4 +81,19 @@ mod tests{
         assert_eq!(t.validate(1,2,0x1000,1),Err(DriverError::Stale));
         assert_eq!(t.validate(1,3,u64::MAX,9),Err(DriverError::Invalid));
     }
+}
+
+#[cfg(test)]
+mod ws21_driver_quarantine_tests{
+ use super::*;
+ #[test]fn retired_slot_requires_matching_generation_and_hardware_quiesce(){
+  let mut d=Drivers::<1>::new();d.allocate(3,7,0x2000,0x1000,5).unwrap();
+  assert_eq!(d.retire_quarantined(3,7,true),Err(DriverError::Quarantined));
+  d.quarantine(3,7).unwrap();
+  assert_eq!(d.retire_quarantined(3,8,true),Err(DriverError::Stale));
+  assert_eq!(d.retire_quarantined(3,7,false),Err(DriverError::Quarantined));
+  assert_eq!(d.retire_quarantined(3,7,true),Ok(()));
+  d.allocate(4,9,0x4000,0x1000,6).unwrap();
+  assert_eq!(d.validate(4,9,0x4fff,2),Err(DriverError::Invalid));
+ }
 }

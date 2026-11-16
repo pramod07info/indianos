@@ -34,6 +34,19 @@ impl<const N:usize> Queue<N>{
             .ok_or(NvmeError::NotFound)?;
         slot.take().ok_or(NvmeError::NotFound)
     }
+    /// Reject a completion carrying stale namespace/LBA/DMA identity without
+    /// consuming an unrelated live request with the same numeric command ID.
+    pub fn complete_exact(&mut self,epoch:u64,id:u16,namespace_id:u32,
+        lba:u64,dma_address:u64)->Result<Request,NvmeError>{
+        if epoch==0||epoch!=self.epoch{return Err(NvmeError::Stale);}
+        let slot=self.active.iter_mut().find(|entry|
+            entry.is_some_and(|req|req.command_id==id))
+            .ok_or(NvmeError::NotFound)?;
+        if slot.as_ref().is_none_or(|req|
+            req.namespace_id!=namespace_id||req.lba!=lba||
+            req.dma_address!=dma_address){return Err(NvmeError::Stale);}
+        slot.take().ok_or(NvmeError::NotFound)
+    }
     /// Count only live commands for an authenticated controller epoch.
     pub fn outstanding(&self,epoch:u64)->Result<usize,NvmeError>{
         if epoch==0||epoch!=self.epoch{return Err(NvmeError::Stale);}
@@ -87,5 +100,21 @@ mod m1_ws02_nvme_dma_tests {
   assert_eq!(q.outstanding(6),Err(NvmeError::Stale));
   assert_eq!(q.complete(7,1),Ok(valid));
   assert_eq!(q.outstanding(7),Ok(0));
+ }
+}
+
+#[cfg(test)]
+mod ws23_nvme_exact_completion_tests{
+ use super::*;
+ #[test]fn mismatched_namespace_or_dma_cannot_pop_live_command(){
+  let mut q=Queue::<1>::new(12);
+  let request=Request{command_id:7,namespace_id:2,lba:10,blocks:8,dma_address:0x4000};
+  q.submit(12,request,100).unwrap();
+  assert_eq!(q.complete_exact(12,7,1,10,0x4000),Err(NvmeError::Stale));
+  assert_eq!(q.complete_exact(12,7,2,10,0x8000),Err(NvmeError::Stale));
+  assert_eq!(q.complete_exact(11,7,2,10,0x4000),Err(NvmeError::Stale));
+  assert_eq!(q.outstanding(12),Ok(1));
+  assert_eq!(q.complete_exact(12,7,2,10,0x4000),Ok(request));
+  assert_eq!(q.outstanding(12),Ok(0));
  }
 }

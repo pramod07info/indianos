@@ -125,3 +125,60 @@ mod m1_ws04_acpi_revision_tests {
    revision:0,root_address:0x1000,xsdt:false}));
  }
 }
+
+/// Decode RSDT/XSDT child addresses without touching physical firmware memory.
+/// A trusted mapper must separately validate every referenced SDT aperture.
+/// The entire caller buffer is preserved on invalid entries or capacity.
+pub fn parse_root_addresses(bytes:&[u8],out:&mut[u64])->Result<usize,AcpiError>{
+ let table=parse_sdt(bytes)?;
+ let width=if table.signature==*b"XSDT"{8}
+    else if table.signature==*b"RSDT"{4}
+    else{return Err(AcpiError::Signature)};
+ let len=table.length as usize;
+ if len<=36||(len-36)%width!=0{return Err(AcpiError::Malformed);}
+ let count=(len-36)/width;
+ if count>out.len()||count>256{return Err(AcpiError::Malformed);}
+ let read=|index:usize|->Result<u64,AcpiError>{
+  let start=36+index*width;
+  if width==8{Ok(u64::from_le_bytes(bytes[start..start+8]
+      .try_into().map_err(|_|AcpiError::Truncated)?))}
+  else{Ok(u64::from(u32::from_le_bytes(bytes[start..start+4]
+      .try_into().map_err(|_|AcpiError::Truncated)?)))}
+ };
+ for i in 0..count{
+  let addr=read(i)?;
+  if addr==0||addr%(width as u64)!=0{return Err(AcpiError::Malformed);}
+  for j in 0..i{if read(j)?==addr{return Err(AcpiError::Malformed);}}
+ }
+ for (i,slot) in out[..count].iter_mut().enumerate(){*slot=read(i)?;}
+ Ok(count)
+}
+#[cfg(test)]
+mod ws25_acpi_root_table_tests{
+ use super::*;
+ fn fixture()->[u8;52]{
+  let mut t=[0u8;52];t[..4].copy_from_slice(b"XSDT");
+  t[4..8].copy_from_slice(&(52u32).to_le_bytes());
+  t[36..44].copy_from_slice(&0x1000u64.to_le_bytes());
+  t[44..52].copy_from_slice(&0x2000u64.to_le_bytes());
+  let sum=t.iter().fold(0u8,|sum,&b|sum.wrapping_add(b));
+  t[9]=0u8.wrapping_sub(sum);t
+ }
+ fn fix(t:&mut[u8]){t[9]=0;let sum=t.iter().fold(0u8,|s,&b|s.wrapping_add(b));
+  t[9]=0u8.wrapping_sub(sum);}
+ #[test]fn rejects_ambiguous_and_invalid_root_entries_transactionally(){
+  let t=fixture();let mut out=[7u64;2];
+  assert_eq!(parse_root_addresses(&t,&mut out),Ok(2));
+  assert_eq!(out,[0x1000,0x2000]);
+  let mut short=[9u64;1];
+  assert_eq!(parse_root_addresses(&t,&mut short),Err(AcpiError::Malformed));
+  assert_eq!(short,[9]);
+  let mut duplicate=t;duplicate[44..52].copy_from_slice(&0x1000u64.to_le_bytes());
+  fix(&mut duplicate);let mut unchanged=[9u64;2];
+  assert_eq!(parse_root_addresses(&duplicate,&mut unchanged),Err(AcpiError::Malformed));
+  assert_eq!(unchanged,[9;2]);
+  duplicate[44..52].copy_from_slice(&0x2001u64.to_le_bytes());fix(&mut duplicate);
+  assert_eq!(parse_root_addresses(&duplicate,&mut unchanged),Err(AcpiError::Malformed));
+  assert_eq!(unchanged,[9;2]);
+ }
+}

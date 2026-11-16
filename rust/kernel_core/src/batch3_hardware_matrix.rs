@@ -19,8 +19,11 @@ pub fn qualify(record:Evidence,requested:Platform,commit:[u8;20])
     ->Result<(),MatrixError>{
     if record.platform!=requested{return Err(MatrixError::WrongPlatform);}
     if commit==[0;20]||record.commit!=commit{return Err(MatrixError::WrongCommit);}
-    if record.failed&REQUIRED!=0{return Err(MatrixError::Failed);}
-    if record.skipped&REQUIRED!=0{return Err(MatrixError::Skipped);}
+    if record.passed&record.failed!=0||record.failed&record.skipped!=0||
+        record.failed&REQUIRED!=0{return Err(MatrixError::Failed);}
+    if record.passed&record.skipped!=0||record.skipped&REQUIRED!=0{
+        return Err(MatrixError::Skipped);
+    }
     if record.passed&REQUIRED!=REQUIRED{return Err(MatrixError::Missing);}
     Ok(())
 }
@@ -44,4 +47,18 @@ mod tests{
         assert_eq!(qualify(r,Platform::QemuX86_64,[1;20]),
             Err(MatrixError::Skipped));
     }
+}
+
+#[cfg(test)]
+mod ws28_hardware_evidence_consistency_tests{
+ use super::*;
+ #[test]fn conflicting_evidence_bits_cannot_certify_hardware(){
+  let base=Evidence{platform:Platform::QemuX86_64,commit:[3;20],
+      passed:REQUIRED,failed:0,skipped:0};
+  assert_eq!(qualify(base,Platform::QemuX86_64,[3;20]),Ok(()));
+  assert_eq!(qualify(Evidence{failed:BOOT,..base},Platform::QemuX86_64,[3;20]),
+      Err(MatrixError::Failed));
+  assert_eq!(qualify(Evidence{skipped:BLOCK,..base},Platform::QemuX86_64,[3;20]),
+      Err(MatrixError::Skipped));
+ }
 }
