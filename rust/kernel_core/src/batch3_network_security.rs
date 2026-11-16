@@ -338,3 +338,128 @@ mod pr782_ws45_47_tests {
   assert_eq!(h.state(),TcpState::Established);
  }
 }
+
+
+// PR782 WS111-115: strict bounded network ingress framing and lease
+// maintenance. No raw sockets, TCP state machine, or cryptographic TLS.
+/// WS111: Reject unspecified, loopback, broadcast, multicast and reserved
+/// IPv4 endpoints before using them as an externally verified peer tuple.
+pub fn require_ipv4_unicast(address:[u8;4])->Result<(),NetworkError>{
+ let first=address[0];
+ if first==0||first==127||first>=224||
+   address==[255;4]||address==[0;4]{
+  return Err(NetworkError::Malformed);
+ }
+ Ok(())
+}
+/// WS112: Verify a fixed IPv4 header, total length and one's-complement
+/// checksum. Fragmented datagrams are rejected rather than reassembled.
+pub fn strict_ipv4_header(packet:&[u8])->Result<u8,NetworkError>{
+ if packet.len()<20||packet.len()>65535||packet[0]!=0x45||
+  packet[1]&0x03!=0{return Err(NetworkError::Malformed);}
+ let total=u16::from_be_bytes([packet[2],packet[3]]) as usize;
+ if total!=packet.len()||packet[8]==0||
+  !matches!(packet[9],6|17){return Err(NetworkError::Malformed);}
+ let flags=u16::from_be_bytes([packet[6],packet[7]]);
+ if flags&0xbfff!=0{return Err(NetworkError::Malformed);}
+ require_ipv4_unicast(packet[12..16].try_into().map_err(|_|NetworkError::Malformed)?)?;
+ require_ipv4_unicast(packet[16..20].try_into().map_err(|_|NetworkError::Malformed)?)?;
+ let mut sum=0u32;
+ for i in (0..20).step_by(2){
+  sum+=u32::from(u16::from_be_bytes([packet[i],packet[i+1]]));
+ }
+ while sum>>16!=0{sum=(sum&65535)+(sum>>16);}
+ if sum!=65535{return Err(NetworkError::Malformed);}
+ Ok(packet[9])
+}
+/// WS113: Strict zero-allocation UDP payload-bounds check. Nonzero checksum
+/// is mandatory for our ingress policy; authenticating the UDP pseudoheader
+/// remains the job of the real IP transport layer.
+pub fn strict_udp_datagram(packet:&[u8],dest_port:u16)
+ ->Result<&[u8],NetworkError>{
+ if strict_ipv4_header(packet)?!=17||packet.len()<28||dest_port==0{
+  return Err(NetworkError::Malformed);
+ }
+ let src=u16::from_be_bytes([packet[20],packet[21]]);
+ let dst=u16::from_be_bytes([packet[22],packet[23]]);
+ let size=u16::from_be_bytes([packet[24],packet[25]]) as usize;
+ let check=u16::from_be_bytes([packet[26],packet[27]]);
+ if src==0||dst!=dest_port||check==0||size<8||size!=packet.len()-20{
+  return Err(NetworkError::Malformed);
+ }
+ Ok(&packet[28..])
+}
+/// WS114: Checked finite retry schedule for a trusted socket manager. An
+/// overflow/invalid attempt may never silently wrap into a short retry.
+pub fn bounded_retransmit_ms(base:u32,attempt:u8,cap:u32)
+ ->Result<u32,NetworkError>{
+ if base==0||cap==0||cap>60000||base>cap||attempt>8{
+  return Err(NetworkError::State);
+ }
+ let mut delay=base;
+ for _ in 0..attempt{delay=delay.checked_mul(2).ok_or(NetworkError::State)?.min(cap);}
+ Ok(delay)
+}
+/// WS115: Compute DHCP T1/T2 from an externally verified on-link lease,
+/// preserving the renewal-before-rebind-before-expiry invariant.
+pub fn renewal_schedule(lease:Lease)->Result<(u32,u32,u32),NetworkError>{
+ require_onlink_gateway(lease)?;
+ let expires=lease.lease_seconds;
+ if expires<8{return Err(NetworkError::Expired);}
+ let t1=expires/2;let t2=expires-expires/8;
+ if t1==0||t1>=t2||t2>=expires{return Err(NetworkError::Expired);}
+ Ok((t1,t2,expires))
+}
+#[cfg(test)]
+mod pr782_ws111_115_tests{
+ use super::*;
+ fn datagram()->[u8;28]{
+  let mut p=[0u8;28];p[0]=0x45;p[2..4].copy_from_slice(&28u16.to_be_bytes());
+  p[8]=64;p[9]=17;p[12..16].copy_from_slice(&[10,0,0,1]);
+  p[16..20].copy_from_slice(&[10,0,0,2]);
+  p[20..22].copy_from_slice(&1234u16.to_be_bytes());
+  p[22..24].copy_from_slice(&8080u16.to_be_bytes());
+  p[24..26].copy_from_slice(&8u16.to_be_bytes());
+  p[26..28].copy_from_slice(&1u16.to_be_bytes());
+  let mut sum=0u32;
+  for i in (0..20).step_by(2){sum+=u32::from(
+    u16::from_be_bytes([p[i],p[i+1]]));}
+  while sum>>16!=0{sum=(sum&65535)+(sum>>16);}
+  p[10..12].copy_from_slice(&(!(sum as u16)).to_be_bytes());p
+ }
+ #[test]fn ws111_multicast_and_loopback_are_not_unicast(){
+  assert_eq!(require_ipv4_unicast([10,0,0,1]),Ok(()));
+  for ip in [[0,0,0,0],[127,0,0,1],[224,0,0,1],[255;4]]{
+   assert_eq!(require_ipv4_unicast(ip),Err(NetworkError::Malformed));
+  }
+ }
+ #[test]fn ws112_checksum_length_and_fragments_fail_closed(){
+  let p=datagram();assert_eq!(strict_ipv4_header(&p),Ok(17));
+  let mut bad=p;bad[10]^=1;
+  assert_eq!(strict_ipv4_header(&bad),Err(NetworkError::Malformed));
+  let mut fragment=p;fragment[6]=0x20;
+  assert_eq!(strict_ipv4_header(&fragment),Err(NetworkError::Malformed));
+  assert_eq!(strict_ipv4_header(&p[..27]),Err(NetworkError::Malformed));
+ }
+ #[test]fn ws113_udp_destination_and_length_are_exact(){
+  let p=datagram();assert_eq!(strict_udp_datagram(&p,8080),Ok(&b""[..]));
+  assert_eq!(strict_udp_datagram(&p,53),Err(NetworkError::Malformed));
+  let mut bad=p;bad[25]=7;
+  assert_eq!(strict_udp_datagram(&bad,8080),Err(NetworkError::Malformed));
+ }
+ #[test]fn ws114_bounded_backoff_saturates_without_wrapping(){
+  assert_eq!(bounded_retransmit_ms(100,0,1000),Ok(100));
+  assert_eq!(bounded_retransmit_ms(100,4,1000),Ok(1000));
+  assert_eq!(bounded_retransmit_ms(100,9,1000),Err(NetworkError::State));
+  assert_eq!(bounded_retransmit_ms(0,1,1000),Err(NetworkError::State));
+ }
+ #[test]fn ws115_renewal_schedule_precedes_rebinding_and_expiry(){
+  let lease=Lease{address:[10,0,0,2],subnet:[255,255,255,0],
+   gateway:[10,0,0,1],lease_seconds:80};
+  assert_eq!(renewal_schedule(lease),Ok((40,70,80)));
+  assert_eq!(renewal_schedule(Lease{lease_seconds:7,..lease}),
+   Err(NetworkError::Expired));
+  assert_eq!(renewal_schedule(Lease{gateway:[10,0,1,1],..lease}),
+   Err(NetworkError::Malformed));
+ }
+}

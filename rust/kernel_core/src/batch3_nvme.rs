@@ -213,3 +213,103 @@ mod pr782_ws35_38_tests{
   assert_eq!(q.outstanding(4),Ok(0));
  }
 }
+
+
+// PR782 WS96-100: transactional queue operations on the trusted controller
+// command table. Still does not issue PCIe commands or pin DMA buffers.
+impl<const N:usize> Queue<N>{
+ /// WS96: Batch-submit after a full dry-run on a private fixed-size staging
+ /// copy. Duplicate command IDs, out-of-range DMA or capacity deny all.
+ pub fn submit_batch(&mut self,epoch:u64,requests:&[(Request,u64)])
+  ->Result<usize,NvmeError>{
+  if epoch==0||epoch!=self.epoch{return Err(NvmeError::Stale);}
+  if requests.is_empty(){return Err(NvmeError::Invalid);}
+  let mut stage=Queue::<N>{active:self.active,epoch:self.epoch};
+  for &(request,blocks) in requests{
+   stage.submit(epoch,request,blocks)?;
+  }
+  self.active=stage.active;Ok(requests.len())
+ }
+ /// WS97: A batch of exact acknowledgements must match every complete
+ /// command before any CIDs are freed. All failures preserve queue state.
+ pub fn complete_batch(&mut self,epoch:u64,expected:&[Request])
+  ->Result<usize,NvmeError>{
+  if epoch==0||epoch!=self.epoch{return Err(NvmeError::Stale);}
+  if expected.is_empty(){return Err(NvmeError::Invalid);}
+  let mut stage=Queue::<N>{active:self.active,epoch:self.epoch};
+  for &request in expected{stage.complete_request(epoch,request)?;}
+  self.active=stage.active;Ok(expected.len())
+ }
+ /// WS98: Count one exact namespace's in-flight work for admission limits.
+ pub fn namespace_outstanding(&self,epoch:u64,namespace:u32)
+  ->Result<usize,NvmeError>{
+  if epoch==0||epoch!=self.epoch{return Err(NvmeError::Stale);}
+  if namespace==0{return Err(NvmeError::Invalid);}
+  Ok(self.active.iter().flatten().filter(|r|r.namespace_id==namespace).count())
+ }
+ /// WS99: Copy the complete in-flight request table in stable slot order,
+ /// preserving the output array on insufficient caller capacity.
+ pub fn snapshot_requests(&self,epoch:u64,out:&mut[Request])
+  ->Result<usize,NvmeError>{
+  if epoch==0||epoch!=self.epoch{return Err(NvmeError::Stale);}
+  let count=self.outstanding(epoch)?;
+  if count>out.len(){return Err(NvmeError::Full);}
+  let mut i=0;
+  for request in self.active.iter().flatten(){out[i]=*request;i+=1;}
+  Ok(i)
+ }
+ /// WS100: Do not reset until no software request is in flight and trusted
+ /// hardware shutdown is proved; this avoids silently dropping live IO.
+ pub fn reset_drained(&mut self,new_epoch:u64,hardware_stopped:bool)
+  ->Result<(),NvmeError>{
+  if !hardware_stopped{return Err(NvmeError::Stale);}
+  if self.outstanding(self.epoch)?!=0{return Err(NvmeError::Full);}
+  self.reset_quiesced(new_epoch,true)
+ }
+}
+#[cfg(test)]
+mod pr782_ws96_100_tests{
+ use super::*;
+ fn r(id:u16)->Request{Request{command_id:id,namespace_id:3,
+  lba:10,blocks:8,dma_address:0x4000}}
+ #[test]fn ws96_submit_batch_rolls_back_every_partial_request(){
+  let mut q=Queue::<2>::new(4);
+  assert_eq!(q.submit_batch(4,&[(r(1),100),(r(1),100)]),Err(NvmeError::Duplicate));
+  assert_eq!(q.outstanding(4),Ok(0));
+  assert_eq!(q.submit_batch(4,&[(r(1),100),(r(2),100)]),Ok(2));
+  assert_eq!(q.outstanding(4),Ok(2));
+  assert_eq!(q.submit_batch(3,&[(r(3),100)]),Err(NvmeError::Stale));
+ }
+ #[test]fn ws97_complete_batch_requires_every_matching_full_request(){
+  let mut q=Queue::<2>::new(4);q.submit_batch(4,&[(r(1),100),(r(2),100)]).unwrap();
+  assert_eq!(q.complete_batch(4,&[r(1),Request{blocks:7,..r(2)}]),
+   Err(NvmeError::Stale));assert_eq!(q.outstanding(4),Ok(2));
+  assert_eq!(q.complete_batch(4,&[r(1),r(2)]),Ok(2));
+  assert_eq!(q.outstanding(4),Ok(0));
+ }
+ #[test]fn ws98_exact_namespace_count_excludes_others(){
+  let mut q=Queue::<2>::new(4);let foreign=Request{namespace_id:5,..r(2)};
+  q.submit_batch(4,&[(r(1),100),(foreign,100)]).unwrap();
+  assert_eq!(q.namespace_outstanding(4,3),Ok(1));
+  assert_eq!(q.namespace_outstanding(4,5),Ok(1));
+  assert_eq!(q.namespace_outstanding(4,0),Err(NvmeError::Invalid));
+ }
+ #[test]fn ws99_short_snapshot_is_atomic(){
+  let mut q=Queue::<2>::new(4);
+  q.submit_batch(4,&[(r(1),100),(r(2),100)]).unwrap();
+  let mut short=[r(9)];
+  assert_eq!(q.snapshot_requests(4,&mut short),Err(NvmeError::Full));
+  assert_eq!(short,[r(9)]);
+  let mut out=[r(9);2];
+  assert_eq!(q.snapshot_requests(4,&mut out),Ok(2));
+  assert_eq!(out,[r(1),r(2)]);
+ }
+ #[test]fn ws100_reset_requires_both_hardware_and_software_quiescence(){
+  let mut q=Queue::<1>::new(4);q.submit(4,r(1),100).unwrap();
+  assert_eq!(q.reset_drained(5,true),Err(NvmeError::Full));
+  q.complete_request(4,r(1)).unwrap();
+  assert_eq!(q.reset_drained(5,false),Err(NvmeError::Stale));
+  assert_eq!(q.reset_drained(5,true),Ok(()));
+  assert_eq!(q.outstanding(5),Ok(0));
+ }
+}

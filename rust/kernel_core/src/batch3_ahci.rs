@@ -243,3 +243,118 @@ mod pr782_ws31_34_tests {
   assert!(fence.durable(8,91));assert!(!fence.durable(8,92));
  }
 }
+
+
+// PR782 WS91-95: deterministic SATA command planning and completion proof.
+// Never mistake a software receipt for an issued FLUSH CACHE or real DMA.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct TransferChunk{pub lba:u64,pub sectors:u16}
+/// WS91: Plan a large in-range disk operation as bounded commands with no
+/// output mutation until full disk bounds and capacity are verified.
+pub fn plan_transfer(lba:u64,sectors:u64,disk_sectors:u64,
+ out:&mut[TransferChunk])->Result<usize,AhciError>{
+ if sectors==0||lba>=disk_sectors||sectors>disk_sectors-lba{
+  return Err(AhciError::InvalidRange);
+ }
+ const MAX_SECTORS:u64=MAX_TRANSFER_BYTES/SECTOR_BYTES;
+ let count=sectors/MAX_SECTORS+u64::from(sectors%MAX_SECTORS!=0);
+ if count>out.len() as u64{return Err(AhciError::TooMany);}
+ let mut left=sectors;let mut current=lba;
+ for slot in out.iter_mut().take(count as usize){
+  let n=left.min(MAX_SECTORS);
+  *slot=TransferChunk{lba:current,sectors:n as u16};
+  current+=n;left-=n;
+ }
+ Ok(count as usize)
+}
+/// WS92: Require an independently verified controller flush capability
+/// when write-back is enabled. FUA is not inferred from an ordinary write.
+pub fn require_write_persistence(direction:IoDirection,write_cache:bool,
+ fua_supported:bool,flush_supported:bool)->Result<(),AhciError>{
+ if direction==IoDirection::Write&&write_cache&&
+    !fua_supported&&!flush_supported{return Err(AhciError::InvalidRange);}
+ Ok(())
+}
+/// WS93: Controller-specific segment boundary preflight. A PRDT item
+/// cannot straddle its negotiated 64KiB DMA aperture.
+pub fn enforce_prdt_boundary(lba:u64,sectors:u16,disk_sectors:u64,
+ regions:&[Region])->Result<u64,AhciError>{
+ let bytes=validate_command(lba,sectors,disk_sectors,regions)?;
+ for r in regions{
+  let end=r.dma_address.checked_add(u64::from(r.byte_count))
+      .ok_or(AhciError::Overflow)?;
+  if r.byte_count>65536||
+    r.dma_address/65536!=(end-1)/65536{return Err(AhciError::InvalidBuffer);}
+ }
+ Ok(bytes)
+}
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct CompletionProof{pub epoch:u64,pub ticket:u64,pub lba:u64,
+ pub sectors:u16,pub bytes:u64,pub status_ok:bool}
+/// WS94: A completion belongs to the exact caller-submitted write and
+/// controller generation, including count and successful device status.
+pub fn verify_completion(lease:MediaLease,expected_ticket:u64,lba:u64,
+ sectors:u16,proof:CompletionProof)->Result<(),AhciError>{
+ if lease.issued_epoch==0||lease.issued_epoch!=lease.live_epoch||
+  expected_ticket==0||sectors==0||!proof.status_ok||
+  proof.epoch!=lease.live_epoch||proof.ticket!=expected_ticket||
+  proof.lba!=lba||proof.sectors!=sectors||
+  proof.bytes!=u64::from(sectors)*SECTOR_BYTES{
+  return Err(AhciError::InvalidRange);
+ }
+ Ok(())
+}
+impl WriteFlushFence{
+ /// WS95: Forbid reuse of a completed flush ticket in one media epoch.
+ /// A fresh ticket must be strictly greater than the previous issuance.
+ pub fn begin_next(&mut self,epoch:u64,ticket:u64)->Result<(),AhciError>{
+  if ticket<=self.ticket{return Err(AhciError::InvalidRange);}
+  self.begin(epoch,ticket)
+ }
+}
+#[cfg(test)]
+mod pr782_ws91_95_tests{
+ use super::*;
+ const EMPTY:TransferChunk=TransferChunk{lba:0,sectors:0};
+ fn lease()->MediaLease{MediaLease{issued_epoch:3,live_epoch:3,read_only:false}}
+ #[test]fn ws91_multi_chunk_plan_is_atomic(){
+  let mut out=[EMPTY;2];
+  assert_eq!(plan_transfer(10,300,400,&mut out),Ok(2));
+  assert_eq!(out,[TransferChunk{lba:10,sectors:256},
+   TransferChunk{lba:266,sectors:44}]);
+  let old=out;
+  assert_eq!(plan_transfer(10,391,400,&mut out),Err(AhciError::InvalidRange));
+  assert_eq!(plan_transfer(10,600,1000,&mut out),Err(AhciError::TooMany));
+  assert_eq!(out,old);
+ }
+ #[test]fn ws92_writeback_requires_real_persistence_option(){
+  assert_eq!(require_write_persistence(IoDirection::Write,true,false,false),
+   Err(AhciError::InvalidRange));
+  assert_eq!(require_write_persistence(IoDirection::Write,true,false,true),Ok(()));
+  assert_eq!(require_write_persistence(IoDirection::Read,true,false,false),Ok(()));
+ }
+ #[test]fn ws93_prdt_segments_cannot_cross_64k_boundary(){
+  let good=[Region{dma_address:0x10000,byte_count:4096}];
+  assert_eq!(enforce_prdt_boundary(0,8,100,&good),Ok(4096));
+  let cross=[Region{dma_address:0xf000,byte_count:8192}];
+  assert_eq!(enforce_prdt_boundary(0,16,100,&cross),
+   Err(AhciError::InvalidBuffer));
+ }
+ #[test]fn ws94_stale_or_short_device_completion_does_not_succeed(){
+  let p=CompletionProof{epoch:3,ticket:7,lba:10,sectors:8,
+   bytes:4096,status_ok:true};
+  assert_eq!(verify_completion(lease(),7,10,8,p),Ok(()));
+  assert_eq!(verify_completion(lease(),7,10,8,CompletionProof{bytes:512,..p}),
+   Err(AhciError::InvalidRange));
+  assert_eq!(verify_completion(lease(),7,10,8,CompletionProof{epoch:2,..p}),
+   Err(AhciError::InvalidRange));
+ }
+ #[test]fn ws95_completed_ticket_replay_is_denied(){
+  let mut f=WriteFlushFence::new(3);
+  f.begin_next(3,7).unwrap();f.submitted_flush(3,7).unwrap();
+  f.acknowledge_flush(3,7).unwrap();
+  assert_eq!(f.begin_next(3,7),Err(AhciError::InvalidRange));
+  f.begin_next(3,8).unwrap();
+  assert!(!f.durable(3,8));
+ }
+}

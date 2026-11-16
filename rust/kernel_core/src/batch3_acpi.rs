@@ -274,3 +274,171 @@ mod pr782_ws42_44_tests{
    Err(AcpiError::Malformed));
  }
 }
+
+
+// PR782 WS106-110: bounded ACPI topology decoding. Physical MADT/HPET/FADT
+// pointers remain untrusted until separately mapped by the boot memory owner.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct EnabledCpu{pub apic_id:u32,pub x2apic:bool}
+/// WS106: Return only enabled, unique LAPIC/x2APIC identities from a
+/// checksum-verified MADT. No AP startup, IPI, or IRQ topology is performed.
+pub fn parse_enabled_apics(bytes:&[u8],out:&mut[EnabledCpu])
+ ->Result<usize,AcpiError>{
+ count_madt_records(bytes)?;
+ let end=parse_sdt(bytes)?.length as usize;
+ let mut staged=[EnabledCpu{apic_id:0,x2apic:false};256];
+ let(mut at,mut count)=(44usize,0usize);
+ while at<end{
+  let kind=bytes[at];let len=bytes[at+1] as usize;
+  let candidate=if kind==0{
+   let flags=u32::from_le_bytes(bytes[at+4..at+8].try_into()
+      .map_err(|_|AcpiError::Malformed)?);
+   if flags&1!=0{Some(EnabledCpu{apic_id:bytes[at+3] as u32,x2apic:false})}
+   else{None}
+  }else if kind==9{
+   let flags=u32::from_le_bytes(bytes[at+8..at+12].try_into()
+      .map_err(|_|AcpiError::Malformed)?);
+   if flags&1!=0{Some(EnabledCpu{apic_id:u32::from_le_bytes(
+    bytes[at+4..at+8].try_into().map_err(|_|AcpiError::Malformed)?),x2apic:true})}
+   else{None}
+  }else{None};
+  if let Some(cpu)=candidate{
+   if staged[..count].iter().any(|previous|previous.apic_id==cpu.apic_id){
+    return Err(AcpiError::Malformed);
+   }
+   staged[count]=cpu;count+=1;
+  }
+  at+=len;
+ }
+ if count>out.len(){return Err(AcpiError::Malformed);}
+ out[..count].copy_from_slice(&staged[..count]);Ok(count)
+}
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct IoApic{pub id:u8,pub address:u32,pub gsi_base:u32}
+/// WS107: Collect unique mapped IOAPIC declarations. Firmware can still
+/// lie: the supplied physical aperture must be checked before MMIO access.
+pub fn parse_ioapics(bytes:&[u8],out:&mut[IoApic])->Result<usize,AcpiError>{
+ count_madt_records(bytes)?;
+ let end=parse_sdt(bytes)?.length as usize;
+ let mut stage=[IoApic{id:0,address:0,gsi_base:0};256];
+ let(mut at,mut count)=(44usize,0usize);
+ while at<end{
+  let kind=bytes[at];let len=bytes[at+1] as usize;
+  if kind==1{
+   let v=IoApic{id:bytes[at+2],address:u32::from_le_bytes(
+    bytes[at+4..at+8].try_into().map_err(|_|AcpiError::Malformed)?),
+    gsi_base:u32::from_le_bytes(bytes[at+8..at+12].try_into()
+    .map_err(|_|AcpiError::Malformed)?)};
+   if v.address==0||v.address&4095!=0||
+    stage[..count].iter().any(|p|p.id==v.id||p.address==v.address||
+      p.gsi_base==v.gsi_base){return Err(AcpiError::Malformed);}
+   stage[count]=v;count+=1;
+  }
+  at+=len;
+ }
+ if count>out.len(){return Err(AcpiError::Malformed);}
+ out[..count].copy_from_slice(&stage[..count]);Ok(count)
+}
+/// WS108: Validate the HPET timer's generic address structure without
+/// mapping the register or enabling timer interrupts.
+pub fn hpet_mmio_address(bytes:&[u8])->Result<u64,AcpiError>{
+ let table=parse_sdt(bytes)?;
+ if table.signature!=*b"HPET"{return Err(AcpiError::Signature);}
+ if table.length!=56||bytes[40]!=0||bytes[41]!=64||
+    bytes[42]!=0||!matches!(bytes[43],0|4){
+  return Err(AcpiError::Malformed);
+ }
+ let address=u64::from_le_bytes(bytes[44..52].try_into()
+  .map_err(|_|AcpiError::Malformed)?);
+ let minimum_tick=u16::from_le_bytes(bytes[53..55].try_into()
+  .map_err(|_|AcpiError::Malformed)?);
+ if address==0||address&7!=0||minimum_tick==0{return Err(AcpiError::Malformed);}
+ Ok(address)
+}
+/// WS109: Validate ACPI FADT reset GAS before exposing a numeric reset
+/// register. The caller must validate privileges and perform the actual write.
+pub fn fadt_reset_io(bytes:&[u8])->Result<(u64,u8),AcpiError>{
+ let table=parse_sdt(bytes)?;
+ if table.signature!=*b"FACP"{return Err(AcpiError::Signature);}
+ if table.length<129||!matches!(bytes[116],0|1)||
+    bytes[117]!=8||bytes[118]!=0||!matches!(bytes[119],0|1){
+  return Err(AcpiError::Malformed);
+ }
+ let address=u64::from_le_bytes(bytes[120..128].try_into()
+   .map_err(|_|AcpiError::Malformed)?);
+ if address==0||bytes[128]==0{return Err(AcpiError::Malformed);}
+ Ok((address,bytes[128]))
+}
+/// WS110: A MADT may carry one LAPIC address override, never two or an
+/// unaligned/zero address. An absent override is reported as None.
+pub fn madt_lapic_override(bytes:&[u8])->Result<Option<u64>,AcpiError>{
+ count_madt_records(bytes)?;
+ let end=parse_sdt(bytes)?.length as usize;
+ let mut at=44usize;let mut result=None;
+ while at<end{
+  let kind=bytes[at];let len=bytes[at+1] as usize;
+  if kind==5{
+   if len!=12||result.is_some(){return Err(AcpiError::Malformed);}
+   let addr=u64::from_le_bytes(bytes[at+4..at+12].try_into()
+    .map_err(|_|AcpiError::Malformed)?);
+   if addr==0||addr&4095!=0{return Err(AcpiError::Malformed);}
+   result=Some(addr);
+  }
+  at+=len;
+ }
+ Ok(result)
+}
+#[cfg(test)]
+mod pr782_ws106_110_tests{
+ use super::*;
+ use std::vec::Vec;
+ fn fixed(mut t:Vec<u8>)->Vec<u8>{
+  let len=t.len() as u32;t[4..8].copy_from_slice(&len.to_le_bytes());
+  t[9]=0;let sum=t.iter().fold(0u8,|s,&b|s.wrapping_add(b));
+  t[9]=0u8.wrapping_sub(sum);t
+ }
+ fn madt(records:&[u8])->Vec<u8>{
+  let mut t=std::vec![0u8;44];t[..4].copy_from_slice(b"APIC");
+  t.extend_from_slice(records);fixed(t)
+ }
+ #[test]fn ws106_cpu_apic_ids_are_unique_and_enabled(){
+  let t=madt(&[0,8,0,2,1,0,0,0,0,8,0,3,0,0,0,0]);
+  let mut out=[EnabledCpu{apic_id:99,x2apic:false};2];
+  assert_eq!(parse_enabled_apics(&t,&mut out),Ok(1));
+  assert_eq!(out[0].apic_id,2);
+  let duplicate=madt(&[0,8,0,2,1,0,0,0,0,8,0,2,1,0,0,0]);
+  assert_eq!(parse_enabled_apics(&duplicate,&mut out),Err(AcpiError::Malformed));
+  assert_eq!(out[0].apic_id,2);
+ }
+ #[test]fn ws107_ioapic_geometry_and_duplicate_ownership(){
+  let t=madt(&[1,12,3,0,0,0,0xc0,0xfe,0,0,0,0]);
+  let mut out=[IoApic{id:0,address:0,gsi_base:0};1];
+  assert_eq!(parse_ioapics(&t,&mut out),Ok(1));
+  assert_eq!(out[0].address,0xfec0_0000);
+  let bad=madt(&[1,12,3,0,1,0,0xc0,0xfe,0,0,0,0]);
+  assert_eq!(parse_ioapics(&bad,&mut out),Err(AcpiError::Malformed));
+ }
+ #[test]fn ws108_hpet_unmapped_and_bad_gas_are_rejected(){
+  let mut t=std::vec![0u8;56];t[..4].copy_from_slice(b"HPET");
+  t[41]=64;t[43]=4;t[44..52].copy_from_slice(&0xfed0_0000u64.to_le_bytes());
+  t[53..55].copy_from_slice(&1u16.to_le_bytes());let t=fixed(t);
+  assert_eq!(hpet_mmio_address(&t),Ok(0xfed0_0000));
+  let mut bad=t.clone();bad[40]=1;
+  assert_eq!(hpet_mmio_address(&fixed(bad)),Err(AcpiError::Malformed));
+ }
+ #[test]fn ws109_fadt_reset_io_is_structurally_checked(){
+  let mut t=std::vec![0u8;129];t[..4].copy_from_slice(b"FACP");
+  t[116]=1;t[117]=8;t[119]=1;t[120..128].copy_from_slice(&0xcf9u64.to_le_bytes());
+  t[128]=6;let t=fixed(t);
+  assert_eq!(fadt_reset_io(&t),Ok((0xcf9,6)));
+  let mut bad=t.clone();bad[128]=0;
+  assert_eq!(fadt_reset_io(&fixed(bad)),Err(AcpiError::Malformed));
+ }
+ #[test]fn ws110_duplicate_or_invalid_lapic_override_is_rejected(){
+  let single=madt(&[5,12,0,0,0,0,0xe0,0xfe,0,0,0,0]);
+  assert_eq!(madt_lapic_override(&single),Ok(Some(0xfee0_0000)));
+  let duplicate=madt(&[5,12,0,0,0,0,0xe0,0xfe,0,0,0,0,
+    5,12,0,0,0,0,0xe0,0xfe,0,0,0,0]);
+  assert_eq!(madt_lapic_override(&duplicate),Err(AcpiError::Malformed));
+ }
+}

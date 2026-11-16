@@ -171,3 +171,138 @@ mod pr782_ws48_50_tests{
   assert_eq!(d.validate(1,4,0x6000,4),Ok(()));
  }
 }
+
+
+// PR782 WS116-120: transactional trusted-device reclamation and MMIO
+// resource auditing. Privileged callers still must really stop device DMA.
+impl<const N:usize> Drivers<N>{
+ /// WS116: Snapshot all active grants in slot order, preserving the
+ /// destination on short capacity or a forged zero-sized device aperture.
+ pub fn snapshot_active(&self,out:&mut[Grant])->Result<usize,DriverError>{
+  let count=self.entries.iter().flatten().filter(|g|g.active).count();
+  if count>out.len(){return Err(DriverError::Full);}
+  for g in self.entries.iter().flatten(){
+   if g.driver==0||g.generation==0||g.region_length==0||
+    g.region_start.checked_add(g.region_length).is_none(){
+    return Err(DriverError::Invalid);
+   }
+  }
+  let mut index=0;
+  for g in self.entries.iter().flatten(){
+   if g.active{out[index]=*g;index+=1;}
+  }
+  Ok(index)
+ }
+ /// WS117: Quarantine a batch only if every exact grant generation is live.
+ /// Invalid, repeated or foreign members leave all grants active.
+ pub fn quarantine_batch(&mut self,owners:&[(u32,u64)])
+  ->Result<usize,DriverError>{
+  if owners.is_empty(){return Err(DriverError::Invalid);}
+  let mut staging=Drivers::<N>{entries:self.entries};
+  for (i,&(driver,generation)) in owners.iter().enumerate(){
+   if driver==0||generation==0{return Err(DriverError::Invalid);}
+   if owners[..i].contains(&(driver,generation))||
+    owners[..i].iter().any(|&(id,_)|id==driver){
+    return Err(DriverError::Duplicate);
+   }
+   let grant=staging.entries.iter().flatten()
+    .find(|g|g.driver==driver).ok_or(DriverError::Stale)?;
+   if grant.generation!=generation||!grant.active{return Err(DriverError::Stale);}
+   staging.quarantine(driver,generation)?;
+  }
+  self.entries=staging.entries;Ok(owners.len())
+ }
+ /// WS118: The trusted fault coordinator may retire a whole quarantined
+ /// group only after hardware quiescence. No partial slot freeing is allowed.
+ pub fn retire_batch_quiesced(&mut self,owners:&[(u32,u64)],
+  hardware_stopped:bool)->Result<usize,DriverError>{
+  if !hardware_stopped{return Err(DriverError::Quarantined);}
+  if owners.is_empty(){return Err(DriverError::Invalid);}
+  let mut staging=Drivers::<N>{entries:self.entries};
+  for (i,&(driver,generation)) in owners.iter().enumerate(){
+   if owners[..i].iter().any(|&(id,_)|id==driver){return Err(DriverError::Duplicate);}
+   staging.retire_quarantined(driver,generation,true)?;
+  }
+  self.entries=staging.entries;Ok(owners.len())
+ }
+ /// WS119: An IRQ can only be claimed by one active exact-generation driver
+ /// and cannot be inherited by a stale or quarantined grant.
+ pub fn authorize_irq(&self,driver:u32,generation:u64,irq:u16)
+  ->Result<(),DriverError>{
+  if driver==0||generation==0||irq==0{return Err(DriverError::Invalid);}
+  let grant=self.entries.iter().flatten().find(|g|g.driver==driver)
+   .ok_or(DriverError::Stale)?;
+  if grant.generation!=generation||grant.irq!=irq{return Err(DriverError::Stale);}
+  if !grant.active{return Err(DriverError::Quarantined);}
+  Ok(())
+ }
+ /// WS120: A driver MMIO subrange must lie inside its current whole-page
+ /// grant and outside every trusted reserved physical memory aperture.
+ pub fn authorize_mmio_outside_reserved(&self,driver:u32,generation:u64,
+  address:u64,bytes:u64,reserved:&[(u64,u64)])
+  ->Result<(),DriverError>{
+  self.validate_whole_pages(driver,generation,address,bytes)?;
+  let end=address.checked_add(bytes).ok_or(DriverError::Invalid)?;
+  for &(start,length) in reserved{
+   if length==0{return Err(DriverError::Invalid);}
+   let stop=start.checked_add(length).ok_or(DriverError::Invalid)?;
+   if address<stop&&start<end{return Err(DriverError::Overlap);}
+  }
+  Ok(())
+ }
+}
+#[cfg(test)]
+mod pr782_ws116_120_tests{
+ use super::*;
+ fn table()->Drivers<3>{
+  let mut d=Drivers::<3>::new();
+  d.allocate(1,3,0x1000,0x2000,4).unwrap();
+  d.allocate(2,5,0x5000,0x1000,5).unwrap();d
+ }
+ #[test]fn ws116_bounded_active_snapshot_does_not_partially_write(){
+  let d=table();let sentinel=Grant{driver:9,generation:1,
+   region_start:0x9000,region_length:4096,irq:9,active:true};
+  let mut short=[sentinel];
+  assert_eq!(d.snapshot_active(&mut short),Err(DriverError::Full));
+  assert_eq!(short,[sentinel]);
+  let mut out=[sentinel;2];
+  assert_eq!(d.snapshot_active(&mut out),Ok(2));
+  assert_eq!([out[0].driver,out[1].driver],[1,2]);
+ }
+ #[test]fn ws117_quarantine_batch_is_all_or_nothing(){
+  let mut d=table();
+  assert_eq!(d.quarantine_batch(&[(1,3),(2,4)]),Err(DriverError::Stale));
+  assert_eq!(d.validate(1,3,0x1000,4096),Ok(()));
+  assert_eq!(d.quarantine_batch(&[(1,3),(1,3)]),Err(DriverError::Duplicate));
+  assert_eq!(d.quarantine_batch(&[(1,3),(2,5)]),Ok(2));
+  assert_eq!(d.validate(1,3,0x1000,4096),Err(DriverError::Quarantined));
+ }
+ #[test]fn ws118_retirement_keeps_quarantine_on_failed_batch(){
+  let mut d=table();d.quarantine(1,3).unwrap();
+  assert_eq!(d.retire_batch_quiesced(&[(1,3),(2,5)],true),
+   Err(DriverError::Quarantined));
+  assert_eq!(d.validate(1,3,0x1000,4096),Err(DriverError::Quarantined));
+  d.quarantine(2,5).unwrap();
+  assert_eq!(d.retire_batch_quiesced(&[(1,3),(2,5)],false),
+   Err(DriverError::Quarantined));
+  assert_eq!(d.retire_batch_quiesced(&[(1,3),(2,5)],true),Ok(2));
+  assert_eq!(d.validate(1,3,0x1000,4096),Err(DriverError::Stale));
+ }
+ #[test]fn ws119_irq_identity_requires_live_exact_owner(){
+  let mut d=table();
+  assert_eq!(d.authorize_irq(1,3,4),Ok(()));
+  assert_eq!(d.authorize_irq(1,3,5),Err(DriverError::Stale));
+  assert_eq!(d.authorize_irq(1,2,4),Err(DriverError::Stale));
+  d.quarantine(1,3).unwrap();
+  assert_eq!(d.authorize_irq(1,3,4),Err(DriverError::Quarantined));
+ }
+ #[test]fn ws120_mmio_grant_rejects_firmware_reservations(){
+  let d=table();
+  assert_eq!(d.authorize_mmio_outside_reserved(1,3,0x1000,4096,
+   &[(0x3000,4096)]),Ok(()));
+  assert_eq!(d.authorize_mmio_outside_reserved(1,3,0x1000,4096,
+   &[(0x1800,256)]),Err(DriverError::Overlap));
+  assert_eq!(d.authorize_mmio_outside_reserved(1,3,0x1001,4096,&[]),
+   Err(DriverError::Invalid));
+ }
+}

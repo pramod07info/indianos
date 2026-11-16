@@ -208,3 +208,145 @@ mod pr782_ws39_41_tests{
   assert_eq!(cursor.advance(5,1,3),Err(VirtError::OutOfBounds));
  }
 }
+
+
+// PR782 WS101-105: split-ring layout, available/used ownership and
+// checked mixed-direction buffers. These perform no DMA or transport writes.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct RingLayout{pub descriptors:u64,pub available:u64,pub used:u64,
+ pub entries:u16}
+/// WS101: Verify all three physical ring apertures are aligned, bounded,
+/// disjoint and non-wrapping before the trusted mapper pins any pages.
+pub fn validate_ring_layout(layout:RingLayout)->Result<(),VirtError>{
+ let n=validate_ring_size(layout.entries)? as u64;
+ if layout.descriptors==0||layout.available==0||layout.used==0||
+  layout.descriptors%16!=0||layout.available%2!=0||layout.used%4!=0{
+  return Err(VirtError::Invalid);
+ }
+ let start=[layout.descriptors,layout.available,layout.used];
+ let lengths=[n*16,6+n*2,6+n*8];
+ let mut ends=[0u64;3];
+ for i in 0..3{
+  ends[i]=start[i].checked_add(lengths[i]).ok_or(VirtError::Invalid)?;
+  for j in 0..i{
+   if start[i]<ends[j]&&start[j]<ends[i]{return Err(VirtError::Invalid);}
+  }
+ }
+ Ok(())
+}
+/// WS102: Before consuming an available batch, deny duplicate/reused heads,
+/// invalid descriptor indices or over-capacity device notifications.
+pub fn validate_available_heads(entries:u16,heads:&[u16])
+ ->Result<usize,VirtError>{
+ let n=validate_ring_size(entries)?;
+ if heads.is_empty()||heads.len()>n{return Err(VirtError::OutOfBounds);}
+ for (i,&head) in heads.iter().enumerate(){
+  if usize::from(head)>=n{return Err(VirtError::OutOfBounds);}
+  if heads[..i].contains(&head){return Err(VirtError::Cycle);}
+ }
+ Ok(heads.len())
+}
+/// WS103: Device-used length must never exceed an exact known, structurally
+/// valid descriptor chain, and a completion ID is never an arbitrary pointer.
+pub fn validate_used_element(descriptors:&[Descriptor],head:u16,
+ device_writes:bool,written:u32)->Result<(),VirtError>{
+ let total=validate_disjoint_chain(descriptors,usize::from(head),device_writes)?;
+ if u64::from(written)>total{return Err(VirtError::OutOfBounds);}
+ if !device_writes&&written!=0{return Err(VirtError::Unsupported);}
+ Ok(())
+}
+impl UsedRingCursor{
+ /// WS104: A caller budget bounds accepted used entries even if a malicious
+ /// guest supplies a geometrically valid but unexpected ring-sized delta.
+ pub fn advance_budgeted(&mut self,epoch:u64,next:u16,ring_size:u16,
+  budget:u16)->Result<u16,VirtError>{
+  let n=validate_ring_size(ring_size)? as u16;
+  let delta=next.wrapping_sub(self.used);
+  if budget==0||budget>n||delta==0||delta>budget{
+   return Err(VirtError::OutOfBounds);
+  }
+  self.advance(epoch,next,ring_size)
+ }
+}
+/// WS105: A mixed-direction VirtIO request has READ-only headers first,
+/// then WRITE-only response buffers. No read descriptor may follow a write.
+pub fn validate_mixed_chain(descriptors:&[Descriptor],head:usize)
+ ->Result<(u64,u64),VirtError>{
+ let entries=u16::try_from(descriptors.len()).map_err(|_|VirtError::OutOfBounds)?;
+ validate_ring_size(entries)?;
+ if head>=descriptors.len(){return Err(VirtError::OutOfBounds);}
+ let mut seen=[false;256];let mut regions=[(0u64,0u64);MAX_CHAIN];
+ let(mut current,mut count,mut reads,mut writes)=(head,0usize,0u64,0u64);
+ let mut writing=false;
+ loop{
+  if current>=descriptors.len(){return Err(VirtError::OutOfBounds);}
+  if seen[current]{return Err(VirtError::Cycle);}
+  seen[current]=true;
+  if count>=MAX_CHAIN{return Err(VirtError::TooLong);}
+  let d=descriptors[current];
+  if d.flags&!(NEXT|WRITE)!=0||d.address==0||d.length==0{
+   return Err(VirtError::Invalid);
+  }
+  let end=d.address.checked_add(u64::from(d.length)).ok_or(VirtError::Invalid)?;
+  for &(a,b) in &regions[..count]{
+   if d.address<b&&a<end{return Err(VirtError::Invalid);}
+  }
+  regions[count]=(d.address,end);count+=1;
+  if d.flags&WRITE!=0{
+   writing=true;
+   writes=writes.checked_add(u64::from(d.length)).ok_or(VirtError::TooLong)?;
+  }else{
+   if writing{return Err(VirtError::Unsupported);}
+   reads=reads.checked_add(u64::from(d.length)).ok_or(VirtError::TooLong)?;
+  }
+  if reads.checked_add(writes).is_none_or(|n|n>MAX_BYTES){
+   return Err(VirtError::TooLong);
+  }
+  if d.flags&NEXT==0{break;}
+  current=usize::from(d.next);
+ }
+ if reads==0||writes==0{return Err(VirtError::Unsupported);}
+ Ok((reads,writes))
+}
+#[cfg(test)]
+mod pr782_ws101_105_tests{
+ use super::*;
+ fn d(addr:u64,flags:u16,next:u16)->Descriptor{
+  Descriptor{address:addr,length:512,flags,next}
+ }
+ #[test]fn ws101_ring_aperture_geometry_and_overlap(){
+  let layout=RingLayout{descriptors:0x1000,available:0x2000,used:0x3000,entries:8};
+  assert_eq!(validate_ring_layout(layout),Ok(()));
+  assert_eq!(validate_ring_layout(RingLayout{used:0x1010,..layout}),
+   Err(VirtError::Invalid));
+  assert_eq!(validate_ring_layout(RingLayout{descriptors:u64::MAX-15,..layout}),
+   Err(VirtError::Invalid));
+ }
+ #[test]fn ws102_duplicated_or_outside_available_heads_rejected(){
+  assert_eq!(validate_available_heads(4,&[0,3]),Ok(2));
+  assert_eq!(validate_available_heads(4,&[0,0]),Err(VirtError::Cycle));
+  assert_eq!(validate_available_heads(4,&[4]),Err(VirtError::OutOfBounds));
+  assert_eq!(validate_available_heads(3,&[0]),Err(VirtError::OutOfBounds));
+ }
+ #[test]fn ws103_malformed_used_element_rejected(){
+  let ds=[d(0x1000,WRITE,0)];
+  assert_eq!(validate_used_element(&ds,0,true,512),Ok(()));
+  assert_eq!(validate_used_element(&ds,0,true,513),Err(VirtError::OutOfBounds));
+  assert_eq!(validate_used_element(&ds,0,false,0),Err(VirtError::Unsupported));
+ }
+ #[test]fn ws104_cursor_budget_blocks_oversized_completion(){
+  let mut c=UsedRingCursor::new(3,10);
+  assert_eq!(c.advance_budgeted(3,13,8,2),Err(VirtError::OutOfBounds));
+  assert_eq!(c.used(),10);
+  assert_eq!(c.advance_budgeted(3,12,8,2),Ok(2));
+  assert_eq!(c.advance_budgeted(4,13,8,2),Err(VirtError::Invalid));
+ }
+ #[test]fn ws105_mixed_chain_allows_header_then_response_only(){
+  let ok=[d(0x1000,NEXT,1),d(0x2000,WRITE,0)];
+  assert_eq!(validate_mixed_chain(&ok,0),Ok((512,512)));
+  let inverted=[d(0x1000,NEXT|WRITE,1),d(0x2000,0,0)];
+  assert_eq!(validate_mixed_chain(&inverted,0),Err(VirtError::Unsupported));
+  let aliased=[d(0x1000,NEXT,1),d(0x1000,WRITE,0)];
+  assert_eq!(validate_mixed_chain(&aliased,0),Err(VirtError::Invalid));
+ }
+}
