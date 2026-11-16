@@ -195,3 +195,94 @@ mod ws27_crash_cursor_page_tests{
   assert_eq!(log.page_owner_after(0,1,0,&mut out),Err(CrashError::Invalid));
  }
 }
+
+
+// PR782 WS82-84: exact-generation crash diagnostics for an authenticated
+// supervisor only; not global log reads by untrusted applications.
+impl<const N:usize> CrashLog<N>{
+ /// WS82: Event-vector filtered copy that cannot partially overwrite a short
+ /// destination buffer. Reject invalid vector numbers and unbound owners.
+ pub fn inspect_owner_vector(&self,pid:u32,generation:u64,vector:u16,
+  out:&mut[Crash])->Result<usize,CrashError>{
+  if pid==0||generation==0||vector>255{return Err(CrashError::Invalid);}
+  let count=(0..self.count).filter(|&i|self.get(i).is_some_and(|c|
+   c.pid==pid&&c.generation==generation&&c.vector==vector)).count();
+  if count>out.len(){return Err(CrashError::Exhausted);}
+  let mut written=0;
+  for i in 0..self.count{
+   if let Some(c)=self.get(i){
+    if c.pid==pid&&c.generation==generation&&c.vector==vector{
+     out[written]=c;written+=1;
+    }
+   }
+  }
+  Ok(written)
+ }
+ /// WS83: Count the retained sequence interval for one process generation.
+ /// This is not a lifetime counter: overwritten older ring entries are gone.
+ pub fn count_owner_between(&self,pid:u32,generation:u64,
+  first_exclusive:u64,last_inclusive:u64)->Result<usize,CrashError>{
+  if pid==0||generation==0||first_exclusive>last_inclusive{
+   return Err(CrashError::Invalid);
+  }
+  Ok((0..self.count).filter(|&i|self.get(i).is_some_and(|c|
+    c.pid==pid&&c.generation==generation&&
+    c.sequence>first_exclusive&&c.sequence<=last_inclusive)).count())
+ }
+ /// WS84: A full time-window snapshot is atomic and ignores all peer
+ /// generations. Monotonic uptime is supplied by the trusted kernel timer.
+ pub fn inspect_owner_uptime(&self,pid:u32,generation:u64,
+  since:u64,until:u64,out:&mut[Crash])->Result<usize,CrashError>{
+  if pid==0||generation==0||since>until{return Err(CrashError::Invalid);}
+  let matching=(0..self.count).filter(|&i|self.get(i).is_some_and(|c|
+   c.pid==pid&&c.generation==generation&&
+   c.uptime>=since&&c.uptime<=until)).count();
+  if matching>out.len(){return Err(CrashError::Exhausted);}
+  let mut written=0;
+  for i in 0..self.count{
+   if let Some(c)=self.get(i){
+    if c.pid==pid&&c.generation==generation&&c.uptime>=since&&c.uptime<=until{
+     out[written]=c;written+=1;
+    }
+   }
+  }
+  Ok(written)
+ }
+}
+#[cfg(test)]
+mod pr782_ws82_84_tests{
+ use super::*;
+ const EMPTY:Crash=Crash{sequence:0,pid:0,generation:0,vector:0,code:0,uptime:0};
+ fn log()->CrashLog<4>{
+  let mut l=CrashLog::<4>::new();
+  l.record(1,1,14,1,10).unwrap();
+  l.record(2,1,14,2,20).unwrap();
+  l.record(1,1,13,3,30).unwrap();
+  l.record(1,2,14,4,40).unwrap();l
+ }
+ #[test]fn ws82_vector_snapshot_respects_owner_and_capacity(){
+  let l=log();let mut out=[EMPTY;1];
+  assert_eq!(l.inspect_owner_vector(1,1,14,&mut out),Ok(1));
+  assert_eq!(out[0].sequence,1);
+  assert_eq!(l.inspect_owner_vector(1,1,256,&mut out),Err(CrashError::Invalid));
+  assert_eq!(l.inspect_owner_vector(2,1,13,&mut out),Ok(0));
+  assert_eq!(l.inspect_owner_vector(1,1,13,&mut []),Err(CrashError::Exhausted));
+ }
+ #[test]fn ws83_sequence_interval_counts_exact_generation(){
+  let l=log();
+  assert_eq!(l.count_owner_between(1,1,0,3),Ok(2));
+  assert_eq!(l.count_owner_between(1,1,1,2),Ok(0));
+  assert_eq!(l.count_owner_between(1,2,0,4),Ok(1));
+  assert_eq!(l.count_owner_between(1,1,5,4),Err(CrashError::Invalid));
+ }
+ #[test]fn ws84_time_window_output_is_all_or_nothing(){
+  let l=log();let mut short=[EMPTY;1];
+  assert_eq!(l.inspect_owner_uptime(1,1,0,100,&mut short),
+   Err(CrashError::Exhausted));assert_eq!(short,[EMPTY]);
+  let mut out=[EMPTY;2];
+  assert_eq!(l.inspect_owner_uptime(1,1,30,40,&mut out),Ok(1));
+  assert_eq!(out[0].uptime,30);assert_eq!(out[1],EMPTY);
+  assert_eq!(l.inspect_owner_uptime(1,1,40,30,&mut out),
+   Err(CrashError::Invalid));
+ }
+}
