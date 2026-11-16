@@ -37,11 +37,15 @@ unsafe extern "C" fn access(physical: u64, context: *mut c_void) -> *mut c_void 
     let Some(map) = (unsafe { (context as *const DirectMap).as_ref() }) else {
         return ptr::null_mut();
     };
-    if physical == 0 || physical & 4095 != 0 { return ptr::null_mut(); }
+    if !valid_hhdm_offset(map.offset) || physical == 0 || physical & 4095 != 0 {
+        return ptr::null_mut();
+    }
     let Some(address) = physical.checked_add(map.offset) else {
         return ptr::null_mut();
     };
-    if address >> 48 != 0xffff || (address & (1u64 << 47)) == 0 {
+    let Some(last) = address.checked_add(4095) else { return ptr::null_mut(); };
+    if address >> 48 != 0xffff || (address & (1u64 << 47)) == 0 ||
+        last >> 48 != 0xffff || (last & (1u64 << 47)) == 0 {
         return ptr::null_mut();
     }
     address as usize as *mut c_void
@@ -129,4 +133,18 @@ mod r123_hhdm_handoff_tests {
         assert!(valid_hhdm_offset(0xffff_8000_0000_0000));
         assert!(valid_hhdm_offset(0xffff_ff00_0000_0000));
     }
+}
+
+#[cfg(test)]
+mod m1_ws06_boot_map_tests {
+ use super::*;
+ #[test] fn forged_mapping_and_wrapping_page_never_expose_a_pointer() {
+  let mut map=DirectMap{offset:0x1000};
+  let context=(&mut map as *mut DirectMap).cast();
+  assert!(unsafe{access(0x1000,context)}.is_null());
+  map.offset=0xffff_8000_0000_0000;
+  assert_eq!(unsafe{access(0x1000,context)} as u64,0xffff_8000_0000_1000);
+  map.offset=0xffff_ffff_ffff_f000;
+  assert!(unsafe{access(0x1000,context)}.is_null());
+ }
 }

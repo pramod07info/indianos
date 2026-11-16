@@ -110,6 +110,20 @@ impl<const CAPACITY: usize> Registry<CAPACITY> {
         Ok(())
     }
 
+    /// Revoke just the matching authenticated owner's resource tickets.
+    /// A peer's grants for the same resource are never modified.
+    pub fn revoke_owner_resource(&mut self,owner:u32,resource:u64)
+        ->Result<usize,CapabilityError>{
+        if owner==0{return Err(CapabilityError::InvalidOwner);}
+        let mut count=0;
+        for slot in &mut self.entries{
+            if slot.as_ref().is_some_and(|e|e.owner==owner&&e.resource==resource){
+                *slot=None;
+                count+=1;
+            }
+        }
+        Ok(count)
+    }
     /// Drop all capabilities for a terminated process without touching peers.
     pub fn revoke_all(&mut self, owner: u32) -> usize {
         if owner == 0 { return 0; }
@@ -478,5 +492,127 @@ mod r120_exact_generation_registration_tests {
         assert_eq!(r.start_exact(1,12),Ok(()));
         assert_eq!(r.active_generation(1),Some(12));
         assert_eq!(r.start_exact(3,13),Err(EpochError::Full));
+    }
+}
+
+#[cfg(test)]
+mod m1_ws12_exact_resource_revoke_tests {
+ use super::*;
+ #[test] fn revoke_one_resource_is_owner_scoped_and_tokens_never_reused() {
+  let mut r=Registry::<4>::new();
+  let a=r.grant(1,7,1).unwrap();
+  let b=r.grant(1,8,1).unwrap();
+  let peer=r.grant(2,7,1).unwrap();
+  assert_eq!(r.revoke_owner_resource(0,7),Err(CapabilityError::InvalidOwner));
+  assert_eq!(r.revoke_owner_resource(1,7),Ok(1));
+  assert_eq!(r.revoke_owner_resource(1,7),Ok(0));
+  assert_eq!(r.lookup(a),None);
+  assert_eq!(r.authorize(1,b,8,1),Ok(()));
+  assert_eq!(r.authorize(2,peer,7,1),Ok(()));
+  assert!(r.grant(1,7,1).unwrap()>peer);
+ }
+}
+
+
+// PR782 WS55-58: kernel-owned capability delegation and atomic revocation.
+// Authenticated owner/recipient PIDs MUST come from scheduler identity.
+// Numeric tokens are not cryptographic bearer secrets.
+impl<const CAPACITY:usize> Registry<CAPACITY>{
+    /// WS55: Drop rights in place; no operation may increase the authority
+    /// of an existing owner/resource/token tuple.
+    pub fn attenuate(&mut self,owner:u32,token:u64,resource:u64,
+        rights:u32)->Result<(),CapabilityError>{
+        if rights==0{return Err(CapabilityError::InvalidRights);}
+        self.authorize(owner,token,resource,rights)?;
+        let slot=self.entries.iter_mut().flatten()
+            .find(|e|e.token==token).ok_or(CapabilityError::UnknownToken)?;
+        slot.rights=rights;
+        Ok(())
+    }
+    /// WS56: Issue a fresh token for a validated subset of rights to a
+    /// *trusted* recipient. The grant operation is non-mutating on failure.
+    pub fn delegate_scoped(&mut self,authenticated_owner:u32,token:u64,
+        resource:u64,recipient:u32,rights:u32)->Result<u64,CapabilityError>{
+        if recipient==0||recipient==authenticated_owner{
+            return Err(CapabilityError::InvalidOwner);
+        }
+        self.authorize(authenticated_owner,token,resource,rights)?;
+        self.grant(recipient,resource,rights)
+    }
+    /// WS57: Require all independently scoped operations to authorize
+    /// before a kernel transaction proceeds; no partial privilege granted.
+    pub fn authorize_all(&self,owner:u32,operations:&[(u64,u64,u32)])
+        ->Result<(),CapabilityError>{
+        if owner==0{return Err(CapabilityError::InvalidOwner);}
+        if operations.is_empty(){return Err(CapabilityError::InvalidRights);}
+        for &(token,resource,rights) in operations{
+            self.authorize(owner,token,resource,rights)?;
+        }
+        Ok(())
+    }
+    /// WS58: Revoke an exact set of same-owner tickets in one serialized
+    /// kernel operation. Missing, repeated or peer-owned tokens do not
+    /// partially revoke the preceding validated entries.
+    pub fn revoke_batch_exact(&mut self,owner:u32,tokens:&[u64])
+        ->Result<usize,CapabilityError>{
+        if owner==0{return Err(CapabilityError::InvalidOwner);}
+        if tokens.is_empty(){return Err(CapabilityError::InvalidToken);}
+        for (i,&token) in tokens.iter().enumerate(){
+            if token==0{return Err(CapabilityError::InvalidToken);}
+            if tokens[..i].contains(&token){return Err(CapabilityError::Denied);}
+            let entry=self.lookup(token).ok_or(CapabilityError::UnknownToken)?;
+            if entry.owner!=owner{return Err(CapabilityError::Denied);}
+        }
+        for slot in &mut self.entries{
+            if slot.as_ref().is_some_and(|e|tokens.contains(&e.token)){
+                *slot=None;
+            }
+        }
+        Ok(tokens.len())
+    }
+}
+#[cfg(test)]
+mod pr782_ws55_58_tests{
+    use super::*;
+    #[test]fn ws55_attenuation_never_widens_authority(){
+        let mut r=Registry::<2>::new();
+        let t=r.grant(1,7,0b111).unwrap();
+        r.attenuate(1,t,7,0b011).unwrap();
+        assert_eq!(r.authorize(1,t,7,0b011),Ok(()));
+        assert_eq!(r.authorize(1,t,7,0b100),Err(CapabilityError::Denied));
+        assert_eq!(r.attenuate(1,t,7,0b111),Err(CapabilityError::Denied));
+        assert_eq!(r.attenuate(1,t,7,0),Err(CapabilityError::InvalidRights));
+        assert_eq!(r.attenuate(2,t,7,1),Err(CapabilityError::Denied));
+    }
+    #[test]fn ws56_delegation_uses_distinct_never_reused_token(){
+        let mut r=Registry::<3>::new();
+        let source=r.grant(1,88,0b111).unwrap();
+        assert_eq!(r.delegate_scoped(1,source,88,2,0b1000),Err(CapabilityError::Denied));
+        assert_eq!(r.len(),1);
+        let delegated=r.delegate_scoped(1,source,88,2,0b011).unwrap();
+        assert_ne!(source,delegated);
+        assert_eq!(r.authorize(2,delegated,88,0b011),Ok(()));
+        assert_eq!(r.authorize(2,delegated,88,0b100),Err(CapabilityError::Denied));
+        assert_eq!(r.authorize(1,source,88,0b111),Ok(()));
+        assert_eq!(r.delegate_scoped(1,source,88,0,1),Err(CapabilityError::InvalidOwner));
+    }
+    #[test]fn ws57_authorize_batch_must_check_each_resource(){
+        let mut r=Registry::<2>::new();
+        let a=r.grant(1,10,3).unwrap();let b=r.grant(1,20,1).unwrap();
+        assert_eq!(r.authorize_all(1,&[(a,10,1),(b,20,1)]),Ok(()));
+        assert_eq!(r.authorize_all(1,&[(a,10,1),(b,20,2)]),Err(CapabilityError::Denied));
+        assert_eq!(r.authorize_all(1,&[]),Err(CapabilityError::InvalidRights));
+        assert_eq!(r.len(),2);
+    }
+    #[test]fn ws58_forged_batch_cannot_partially_revoke(){
+        let mut r=Registry::<3>::new();
+        let a=r.grant(1,11,1).unwrap();let b=r.grant(1,12,1).unwrap();
+        let peer=r.grant(2,11,1).unwrap();
+        assert_eq!(r.revoke_batch_exact(1,&[a,peer]),Err(CapabilityError::Denied));
+        assert_eq!(r.revoke_batch_exact(1,&[a,a]),Err(CapabilityError::Denied));
+        assert_eq!(r.len(),3);
+        assert_eq!(r.revoke_batch_exact(1,&[a,b]),Ok(2));
+        assert_eq!(r.authorize(2,peer,11,1),Ok(()));
+        assert_eq!(r.len(),1);
     }
 }

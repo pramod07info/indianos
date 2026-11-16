@@ -102,6 +102,17 @@ impl NicRxFence {
     pub fn drained(&self,receipt:QuiesceReceipt)->Result<bool,RxFenceError>{
         Ok(self.admitted_in_flight(receipt)?==0)
     }
+    /// BSP-only bounded software drain probe. Polls never authorize DMA
+    /// shutdown; driver must mask interrupts and stop hardware independently.
+    pub fn wait_drained_bounded(&self,receipt:QuiesceReceipt,probes:u32)
+        ->Result<(),RxFenceError>{
+        if self.drained(receipt)?{return Ok(());}
+        for _ in 0..probes{
+            core::hint::spin_loop();
+            if self.drained(receipt)?{return Ok(());}
+        }
+        Err(RxFenceError::Busy)
+    }
     /// Resumption rejects an invalid/stale receipt and any in-flight
     /// handler; epoch never wraps and invalidates every former RxPermit.
     pub fn finish_rebind(&self,receipt:QuiesceReceipt)
@@ -295,5 +306,91 @@ mod r123_rx_drain_visibility_tests {
         assert_eq!(f.admitted_in_flight(receipt),Ok(0));
         assert_eq!(f.finish_rebind(receipt),Ok(2));
         assert_eq!(f.admitted_in_flight(receipt),Err(RxFenceError::Stale));
+    }
+}
+
+#[cfg(test)]
+mod m1_ws16_bounded_nic_drain_tests {
+ use super::*;
+ #[test] fn busy_ring_stays_quiesced_until_software_permit_drops() {
+  let nic=NicRxFence::new(10);
+  let pending=nic.try_admit(10).unwrap();
+  let receipt=nic.begin_quiesce(10).unwrap();
+  assert_eq!(nic.wait_drained_bounded(receipt,0),Err(RxFenceError::Busy));
+  assert_eq!(nic.wait_drained_bounded(receipt,2),Err(RxFenceError::Busy));
+  drop(pending);
+  assert_eq!(nic.wait_drained_bounded(receipt,0),Ok(()));
+  assert_eq!(nic.finish_rebind(receipt),Ok(2));
+  assert_eq!(nic.wait_drained_bounded(receipt,0),Err(RxFenceError::Stale));
+ }
+}
+
+
+// PR782 WS65-67: bind NIC reuse to software drain AND trusted hardware
+// shutdown evidence, then preserve the exact permit identity across ingress.
+#[derive(Clone,Copy,Debug,Eq,PartialEq)]
+pub struct RxRevision { device:u32, epoch:u64, instance:u64 }
+impl NicRxFence{
+    /// WS65: Driver control plane must independently establish that IRQs are
+    /// masked and DMA is halted. Booleans MUST originate in trusted driver
+    /// hardware state, never a guest claim or elapsed-time heuristic.
+    pub fn require_hardware_drained(&self,receipt:QuiesceReceipt,
+        irqs_masked:bool,dma_stopped:bool)->Result<(),RxFenceError>{
+        if !irqs_masked||!dma_stopped{return Err(RxFenceError::Busy);}
+        if !self.drained(receipt)?{return Err(RxFenceError::Busy);}
+        Ok(())
+    }
+    /// WS66: Never increment queue generation and resume ingress until all
+    /// three boundaries hold: software drain, stopped DMA, masked interrupts.
+    pub fn finish_rebind_checked(&self,receipt:QuiesceReceipt,
+        irqs_masked:bool,dma_stopped:bool)->Result<u64,RxFenceError>{
+        self.require_hardware_drained(receipt,irqs_masked,dma_stopped)?;
+        self.finish_rebind(receipt)
+    }
+    /// WS67: Capture the *live* admission identity, but only with a matching
+    /// still-held permit. An epoch number by itself is not a security token.
+    pub fn revision_for(&self,permit:&RxPermit<'_>)
+        ->Result<RxRevision,RxFenceError>{
+        if !self.permit_is_current(permit){return Err(RxFenceError::Stale);}
+        Ok(RxRevision{device:self.device,epoch:permit.epoch,instance:permit.instance})
+    }
+    /// Validate a saved revision only while the exact original live permit
+    /// continues to own its device handler slot.
+    pub fn revision_is_current(&self,permit:&RxPermit<'_>,revision:RxRevision)->bool{
+        self.permit_is_current(permit) &&
+        revision==RxRevision{device:self.device,epoch:permit.epoch,instance:permit.instance}
+    }
+}
+#[cfg(test)]
+mod pr782_ws65_67_tests{
+    use super::*;
+    #[test]fn ws65_hardware_proof_and_software_drain_are_both_required(){
+        let nic=NicRxFence::new(5);
+        let p=nic.try_admit(5).unwrap();let q=nic.begin_quiesce(5).unwrap();
+        assert_eq!(nic.require_hardware_drained(q,true,true),Err(RxFenceError::Busy));
+        drop(p);
+        assert_eq!(nic.require_hardware_drained(q,false,true),Err(RxFenceError::Busy));
+        assert_eq!(nic.require_hardware_drained(q,true,false),Err(RxFenceError::Busy));
+        assert_eq!(nic.require_hardware_drained(q,true,true),Ok(()));
+    }
+    #[test]fn ws66_checked_rebind_denies_untrusted_resume(){
+        let nic=NicRxFence::new(5);let q=nic.begin_quiesce(5).unwrap();
+        assert_eq!(nic.finish_rebind_checked(q,false,true),Err(RxFenceError::Busy));
+        assert_eq!(nic.try_admit(5).err(),Some(RxFenceError::Quiescing));
+        assert_eq!(nic.finish_rebind_checked(q,true,true),Ok(2));
+        assert_eq!(nic.finish_rebind_checked(q,true,true),Err(RxFenceError::Stale));
+    }
+    #[test]fn ws67_revoked_or_foreign_permit_cannot_authorize_ingress(){
+        let a=NicRxFence::new(5);let b=NicRxFence::new(5);
+        let pa=a.try_admit(5).unwrap();let pb=b.try_admit(5).unwrap();
+        let rev=a.revision_for(&pa).unwrap();
+        assert!(a.revision_is_current(&pa,rev));
+        assert!(!b.revision_is_current(&pb,rev));
+        let q=a.begin_quiesce(5).unwrap();
+        assert_eq!(a.revision_for(&pa),Err(RxFenceError::Stale));
+        assert!(!a.revision_is_current(&pa,rev));
+        drop(pa);a.finish_rebind_checked(q,true,true).unwrap();
+        let fresh=a.try_admit(5).unwrap();
+        assert!(!a.revision_is_current(&fresh,rev));
     }
 }

@@ -28,6 +28,23 @@ impl<const N:usize> View<N>{
         self.entries[self.count]=Some(Entry{name:buf,name_len:name.len() as u8,bytes,directory});
         self.count+=1;Ok(())
     }
+    /// Only a trusted VFS result for this exact process incarnation may
+    /// update an existing displayed entry. Denied mutations are atomic.
+    pub fn update_metadata(&mut self,pid:u32,generation:u64,name:&[u8],
+        bytes:u64,directory:bool)->Result<(),FilesError>{
+        if pid!=self.pid||generation!=self.generation{
+            return Err(FilesError::Denied);
+        }
+        if name.is_empty()||name.len()>MAX_NAME||
+            name.iter().any(|b|!b.is_ascii_graphic()||matches!(*b,b'/'|b'\\')){
+            return Err(FilesError::Invalid);
+        }
+        let entry=self.entries[..self.count].iter_mut().flatten().find(|e|
+            e.name_len as usize==name.len() && &e.name[..name.len()]==name)
+            .ok_or(FilesError::Invalid)?;
+        entry.bytes=bytes;entry.directory=directory;
+        Ok(())
+    }
     pub fn page(&self,pid:u32,generation:u64,start:usize,
         output:&mut[Option<Entry>])->Result<usize,FilesError>{
         if self.pid!=pid||self.generation!=generation{
@@ -74,4 +91,21 @@ mod tests{
         view.clear(1,2).unwrap();
         assert_eq!(view.page(1,2,0,&mut[None;1]),Ok(0));
     }
+}
+
+#[cfg(test)]
+mod ws29_files_metadata_auth_tests{
+ use super::*;
+ #[test]fn only_current_incarnation_updates_trusted_vfs_entry(){
+  let mut view=View::<2>::new(8,4).unwrap();
+  view.add_from_vfs(b"project.rs",11,false).unwrap();
+  assert_eq!(view.update_metadata(8,3,b"project.rs",99,false),Err(FilesError::Denied));
+  assert_eq!(view.update_metadata(9,4,b"project.rs",99,false),Err(FilesError::Denied));
+  assert_eq!(view.update_metadata(8,4,b"../path",99,false),Err(FilesError::Invalid));
+  let mut page=[None;1];view.page(8,4,0,&mut page).unwrap();
+  assert_eq!(page[0].unwrap().bytes,11);
+  assert_eq!(view.update_metadata(8,4,b"project.rs",99,false),Ok(()));
+  view.page(8,4,0,&mut page).unwrap();
+  assert_eq!(page[0].unwrap().bytes,99);
+ }
 }

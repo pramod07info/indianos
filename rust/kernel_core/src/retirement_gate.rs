@@ -23,6 +23,11 @@ impl RetirementGate {
     }
     /// No spinning or nested ownership. Lifetime of returned permit scopes
     /// exclusive coordinator and UDP-queue access.
+    /// Validate an exact live BSP permit before touching protected tables.
+    /// A same-CPU permit issued by a distinct gate is never authority.
+    pub fn permit_is_current(&self,permit:&Permit<'_>)->bool{
+        core::ptr::eq(self,permit.gate)&&self.held.load(Ordering::Acquire)
+    }
     pub fn try_enter(&self,cpu:u32,masked:bool)->Result<Permit<'_>,GateError>{
         if !masked{return Err(GateError::InterruptsEnabled);}
         let bsp=self.bsp.load(Ordering::Acquire);
@@ -139,4 +144,79 @@ mod r118_host_concurrency_regressions {
         assert_eq!(active.load(HostOrdering::SeqCst),0);
         assert!(admitted.load(HostOrdering::SeqCst)>0);
     }
+}
+
+#[cfg(test)]
+mod m1_ws15_gate_identity_tests {
+ use super::*;
+ #[test] fn permit_never_transfers_to_foreign_gate_on_same_cpu() {
+  let a=RetirementGate::new();let b=RetirementGate::new();
+  a.register_bsp(3,true).unwrap();b.register_bsp(3,true).unwrap();
+  let permit=a.try_enter(3,true).unwrap();
+  assert!(a.permit_is_current(&permit));
+  assert!(!b.permit_is_current(&permit));
+  assert!(matches!(a.try_enter(3,true),Err(GateError::Reentrant)));
+ }
+}
+
+
+// PR782 WS88-90: small BSP-only critical-section policy adapters.
+// No locks, real interrupt masking, IPI or NIC DMA control are performed.
+impl RetirementGate{
+ /// WS88: Expose an immutable registered BSP identity for trusted kernel
+ /// lifecycle assertions. An unbound gate never reports CPU 0 as the owner.
+ pub fn registered_bsp(&self)->Result<u32,GateError>{
+  let cpu=self.bsp.load(Ordering::Acquire);
+  if cpu==UNBOUND{return Err(GateError::Unbound);}
+  Ok(cpu)
+ }
+ /// WS89: Scope exclusive access to a single caller operation. The
+ /// permit is automatically released on return or early error.
+ pub fn with_bsp_exclusive<R,F:FnOnce(&Permit<'_>)->R>(&self,
+  cpu:u32,masked:bool,operation:F)->Result<R,GateError>{
+  let permit=self.try_enter(cpu,masked)?;
+  let value=operation(&permit);
+  Ok(value)
+ }
+ /// WS90: Enforce both the currently active permit and exact BSP/interrupt
+ /// preconditions at the protected-table access boundary.
+ pub fn require_active_permit(&self,permit:&Permit<'_>,cpu:u32,
+  interrupts_masked:bool)->Result<(),GateError>{
+  if !interrupts_masked{return Err(GateError::InterruptsEnabled);}
+  if self.registered_bsp()?!=cpu{return Err(GateError::WrongCpu);}
+  if !self.permit_is_current(permit){return Err(GateError::Reentrant);}
+  Ok(())
+ }
+}
+#[cfg(test)]
+mod pr782_ws88_90_tests{
+ use super::*;
+ #[test]fn ws88_bsp_identity_is_never_implicitly_zero(){
+  let g=RetirementGate::new();
+  assert_eq!(g.registered_bsp(),Err(GateError::Unbound));
+  g.register_bsp(9,true).unwrap();
+  assert_eq!(g.registered_bsp(),Ok(9));
+ }
+ #[test]fn ws89_scoped_permit_prevents_reentrant_access_and_releases(){
+  let gate=RetirementGate::new();gate.register_bsp(3,true).unwrap();
+  let result=gate.with_bsp_exclusive(3,true,|permit|{
+   assert!(gate.permit_is_current(permit));
+   assert!(matches!(gate.try_enter(3,true),Err(GateError::Reentrant)));
+   42
+  });
+  assert_eq!(result,Ok(42));
+  assert!(gate.try_enter(3,true).is_ok());
+  assert_eq!(gate.with_bsp_exclusive(3,false,|_|1),
+   Err(GateError::InterruptsEnabled));
+ }
+ #[test]fn ws90_foreign_gate_cpu_or_unmasked_access_is_denied(){
+  let a=RetirementGate::new();let b=RetirementGate::new();
+  a.register_bsp(1,true).unwrap();b.register_bsp(1,true).unwrap();
+  let permit=a.try_enter(1,true).unwrap();
+  assert_eq!(a.require_active_permit(&permit,1,true),Ok(()));
+  assert_eq!(a.require_active_permit(&permit,1,false),
+   Err(GateError::InterruptsEnabled));
+  assert_eq!(a.require_active_permit(&permit,2,true),Err(GateError::WrongCpu));
+  assert_eq!(b.require_active_permit(&permit,1,true),Err(GateError::Reentrant));
+ }
 }

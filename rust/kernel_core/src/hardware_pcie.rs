@@ -89,7 +89,14 @@ pub fn scan<C:CpuProbe,P:BridgeProbe>(
        .read_bridge_buses(bus,slot,function).map_err(Error::Pci)?;
      // A PCI bridge can be physically present but unconfigured; bus 0
      // means no subordinate is reachable yet. Do not crash early boot.
-     if secondary==0{continue;}
+     if secondary==0{
+      // Only a genuinely disabled bridge (no secondary/subordinate range)
+      // may be skipped; inconsistent routing registers are malformed.
+      if subordinate!=0 || (primary!=0 && primary!=bus) {
+       return Err(Error::MalformedBridge);
+      }
+      continue;
+     }
      if primary!=bus||secondary<=bus||subordinate<secondary
       ||subordinate>ceilings[current]{
       return Err(Error::MalformedBridge);
@@ -243,6 +250,17 @@ mod tests{
    }
    Ok(self.devices[bus as usize][slot as usize].1)
   }
+ }
+ #[test]fn disabled_bridge_must_not_publish_a_partial_bus_window(){
+  let mut bad=Mock::new();
+  bad.add(0,1,6,4,1,(0,0,2));
+  assert!(matches!(scan(&Cpu,&mut bad),Err(Error::MalformedBridge)));
+  let mut bad=Mock::new();
+  bad.add(0,1,6,4,1,(9,0,0));
+  assert!(matches!(scan(&Cpu,&mut bad),Err(Error::MalformedBridge)));
+  let mut disabled=Mock::new();
+  disabled.add(0,1,6,4,1,(0,0,0));
+  assert!(scan(&Cpu,&mut disabled).is_ok());
  }
  #[test]fn hd1_gpu_on_secondary_bus_and_npu_on_nested_bus(){
   let mut mock=Mock::new();
@@ -412,4 +430,111 @@ mod tests{
   assert_eq!(p.reads[1],0);
  }
 
+}
+
+// PR782 WS75-77: revalidate externally supplied summary metadata before a
+// privileged kernel consumer trusts PCI enumeration. Read-only; not drivers.
+/// WS75: A public Topology can be forged without running scan(). Enforce
+/// exact accounting, unique BDF addresses, and sane bridge/CPU metadata.
+pub fn validate_topology(state:&Topology)->Result<(),Error>{
+ let inv=&state.inventory;
+ if state.abi!=TOPOLOGY_ABI||inv.abi!=PROFILE_ABI||
+  !inv.cpu.supported()||state.scanned_buses==0||
+  usize::from(state.scanned_buses)>MAX_DISCOVERED_BUSES||
+  state.discovered_bridges>=u16::from(state.scanned_buses)||
+  state.pcie_ecam_active||inv.physical_qpu_available||
+  !inv.cpu_software_fallback{return Err(Error::MalformedBridge);}
+ let count=usize::from(inv.count);
+ if count>MAX_ACCELERATORS{return Err(Error::TooManyAccelerators);}
+ let mut gpu=0usize;let mut npu=0usize;
+ for i in 0..MAX_ACCELERATORS{
+  let slot=inv.accelerators[i];
+  if i>=count{
+   if slot.is_some(){return Err(Error::MalformedBridge);}
+   continue;
+  }
+  let device=slot.ok_or(Error::MalformedBridge)?;
+  if device.slot>=32||device.function>=8||
+    hw::classify_pci(device.header)!=Some(device.kind){
+   return Err(Error::MalformedBridge);
+  }
+  for prior in inv.accelerators[..i].iter().flatten(){
+   if prior.bus==device.bus&&prior.slot==device.slot
+    &&prior.function==device.function{return Err(Error::AmbiguousBus);}
+  }
+  match device.kind{
+   Accelerator::Gpu=>gpu+=1,Accelerator::Npu=>npu+=1
+  }
+ }
+ if gpu!=usize::from(inv.gpu_count)||npu!=usize::from(inv.npu_count)||
+  gpu+npu!=count{return Err(Error::MalformedBridge);}
+ Ok(())
+}
+/// WS76: Exact BDF lookup has no trust in caller-supplied accelerator counts.
+pub fn find_device_exact(state:&Topology,bus:u8,slot:u8,function:u8)
+ ->Result<Option<Device>,Error>{
+ validate_topology(state)?;
+ if slot>=32||function>=8{return Err(Error::MalformedBridge);}
+ Ok(state.inventory.accelerators[..usize::from(state.inventory.count)]
+  .iter().flatten().copied().find(|d|
+   d.bus==bus&&d.slot==slot&&d.function==function))
+}
+/// WS77: Copy a bus-filtered device snapshot atomically, with no partial
+/// output on capacity errors or a forged public summary.
+pub fn snapshot_bus_devices(state:&Topology,bus:u8,out:&mut[Device])
+ ->Result<usize,Error>{
+ validate_topology(state)?;
+ let count=state.inventory.accelerators[..usize::from(state.inventory.count)]
+  .iter().flatten().filter(|dev|dev.bus==bus).count();
+ if count>out.len(){return Err(Error::OutputTooSmall);}
+ let mut written=0;
+ for dev in state.inventory.accelerators[..usize::from(state.inventory.count)]
+  .iter().flatten(){
+  if dev.bus==bus{out[written]=*dev;written+=1;}
+ }
+ Ok(written)
+}
+#[cfg(test)]
+mod pr782_ws75_77_tests{
+ use super::*;
+ fn valid()->Topology{
+  let cpu=hw::Cpu{vendor:*b"TestTestTest",family:6,model:1,stepping:0,
+   features:hw::CPU_REQUIRED,max_basic:7,max_extended:0x8000_0001};
+  let header=PciHeader{vendor:0x1234,device:1,class:3,subclass:0,
+    prog_if:0,header_type:0};
+  let dev=Device{bus:0,slot:2,function:0,header,kind:Accelerator::Gpu};
+  let mut accelerators=[None;MAX_ACCELERATORS];accelerators[0]=Some(dev);
+  Topology{abi:TOPOLOGY_ABI,inventory:Inventory{
+    abi:PROFILE_ABI,cpu,accelerators,count:1,gpu_count:1,npu_count:0,
+    physical_qpu_available:false,cpu_software_fallback:true,
+   },scanned_buses:1,discovered_bridges:0,pcie_ecam_active:false}
+ }
+ #[test]fn ws75_forged_summary_and_duplicate_bdf_are_rejected(){
+  let good=valid();assert_eq!(validate_topology(&good),Ok(()));
+  let mut forged=good;forged.inventory.gpu_count=0;
+  assert_eq!(validate_topology(&forged),Err(Error::MalformedBridge));
+  let mut forged=good;forged.inventory.count=2;
+  forged.inventory.accelerators[1]=forged.inventory.accelerators[0];
+  forged.inventory.gpu_count=2;
+  assert_eq!(validate_topology(&forged),Err(Error::AmbiguousBus));
+  let mut forged=good;forged.pcie_ecam_active=true;
+  assert_eq!(validate_topology(&forged),Err(Error::MalformedBridge));
+ }
+ #[test]fn ws76_exact_bdf_match_and_invalid_slot_denied(){
+  let t=valid();
+  assert_eq!(find_device_exact(&t,0,2,0),Ok(t.inventory.accelerators[0]));
+  assert_eq!(find_device_exact(&t,0,2,1),Ok(None));
+  assert_eq!(find_device_exact(&t,0,32,0),Err(Error::MalformedBridge));
+ }
+ #[test]fn ws77_snapshot_is_transactional(){
+  let t=valid();let sentinel=t.inventory.accelerators[0].unwrap();
+  let mut empty:[Device;0]=[];
+  assert_eq!(snapshot_bus_devices(&t,0,&mut empty),Err(Error::OutputTooSmall));
+  let mut out=[sentinel;2];
+  assert_eq!(snapshot_bus_devices(&t,0,&mut out),Ok(1));
+  assert_eq!(out[0],sentinel);
+  let mut forged=t;forged.inventory.count=2;
+  assert_eq!(snapshot_bus_devices(&forged,0,&mut out),Err(Error::MalformedBridge));
+  assert_eq!(out,[sentinel;2]);
+ }
 }

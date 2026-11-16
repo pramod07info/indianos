@@ -73,6 +73,20 @@ impl<const C: usize, const U: usize, const E: usize> ProcessRetirement<C, U, E> 
         &self,_permit:&crate::retirement_gate::Permit<'_>
     )->IngressRevision{IngressRevision(self.ingress_revision)}
 
+    /// New IRQ/NIC-safe snapshot API: both the exact BSP retirement gate
+    /// and the live physical/software ring generation must authenticate.
+    /// The old polled path is retained for single-BSP QEMU compatibility.
+    pub fn capture_device_ingress_revision(
+        &self,permit:&crate::retirement_gate::Permit<'_>,
+        expected_gate:&crate::retirement_gate::RetirementGate,
+        device:&crate::nic_rx_fence::NicRxFence,
+        rx:&crate::nic_rx_fence::RxPermit<'_>
+    )->Option<IngressRevision>{
+        if !expected_gate.permit_is_current(permit)||!device.permit_is_current(rx){
+            return None;
+        }
+        Some(IngressRevision(self.ingress_revision))
+    }
     /// The *synchronous* QEMU virtio-net poll owner is single-BSP by
     /// construction. A future interrupt-driven NIC MUST use the permit-
     /// guarded variant and stop/drain RX DMA before epoch transitions.
@@ -976,4 +990,26 @@ mod r122_staged_device_ingress_tests {
             &nic,&rx,&bsp,&gate,&mut q,fresh,&wire,mac),Ok(second));
         assert_eq!(q.pending_owned(second.pid,second.generation),Ok(1));
     }
+}
+
+#[cfg(test)]
+mod m1_ws20_exact_ingress_snapshot_tests {
+ use super::*;
+ use crate::retirement_gate::RetirementGate;
+ use crate::nic_rx_fence::NicRxFence;
+ #[test] fn only_matching_live_bsp_and_nic_permits_can_capture_ingress() {
+  let kernel=ProcessRetirement::<2,2,2>::new();
+  let gate=RetirementGate::new();let foreign=RetirementGate::new();
+  gate.register_bsp(0,true).unwrap();foreign.register_bsp(0,true).unwrap();
+  let bsp=gate.try_enter(0,true).unwrap();
+  let nic=NicRxFence::new(4);let replacement=NicRxFence::new(4);
+  let rx=nic.try_admit(4).unwrap();
+  assert!(kernel.capture_device_ingress_revision(&bsp,&gate,&nic,&rx).is_some());
+  assert_eq!(kernel.capture_device_ingress_revision(&bsp,&foreign,&nic,&rx),None);
+  assert_eq!(kernel.capture_device_ingress_revision(&bsp,&gate,&replacement,&rx),None);
+  let quiesce=nic.begin_quiesce(4).unwrap();
+  assert_eq!(kernel.capture_device_ingress_revision(&bsp,&gate,&nic,&rx),None);
+  drop(rx);
+  assert_eq!(nic.finish_rebind(quiesce),Ok(2));
+ }
 }

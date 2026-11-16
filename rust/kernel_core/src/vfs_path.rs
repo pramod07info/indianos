@@ -410,3 +410,114 @@ mod r123_namespace_child_tests {
         assert_eq!(join_child_under_root("/docs","/other","note",&mut out),Ok(None));
     }
 }
+
+/// Copy the final canonical component; root has no basename. This helper
+/// returns a byte count and never changes output on a rejected pathname.
+pub fn copy_basename(path:&str,out:&mut[u8])->Result<usize,PathError>{
+ let mut normalized=[0u8;256];
+ let n=normalize_absolute(path,&mut normalized)?;
+ if n==1{return Err(PathError::Empty);}
+ let start=normalized[..n].iter().rposition(|&b|b==b'/')
+     .ok_or(PathError::Relative)?+1;
+ let len=n-start;
+ if len>out.len(){return Err(PathError::OutputTooSmall);}
+ out[..len].copy_from_slice(&normalized[start..n]);
+ Ok(len)
+}
+#[cfg(test)]
+mod m1_ws13_basename_tests {
+ use super::*;
+ #[test] fn basename_is_canonical_and_output_atomic() {
+  let mut out=[0xa5;16];
+  assert_eq!(copy_basename("//a///./notes/",&mut out),Ok(5));
+  assert_eq!(&out[..5],b"notes");
+  let before=out;
+  assert_eq!(copy_basename("/",&mut out),Err(PathError::Empty));
+  assert_eq!(copy_basename("/a/../secret",&mut out),Err(PathError::ParentTraversal));
+  assert_eq!(out,before);
+  let mut small=[0x55;2];
+  assert_eq!(copy_basename("/abc",&mut small),Err(PathError::OutputTooSmall));
+  assert_eq!(small,[0x55;2]);
+ }
+}
+
+
+// PR782 WS68-70: transactional, allocation-free path operations for M1 Files.
+// These APIs validate path spelling only; scheduler ACLs are still mandatory.
+/// WS68: Obtain both parent and basename atomically: a too-short output
+/// buffer cannot leave either partially rewritten.
+pub fn split_parent_basename(path:&str,parent:&mut[u8],name:&mut[u8])
+    ->Result<(usize,usize),PathError>{
+    let mut canonical=[0u8;256];
+    let n=normalize_absolute(path,&mut canonical)?;
+    if n==1{return Err(PathError::Empty);}
+    let slash=canonical[..n].iter().rposition(|&b|b==b'/')
+        .ok_or(PathError::Relative)?;
+    let p=slash.max(1);
+    let b=n-slash-1;
+    if parent.len()<p||name.len()<b{return Err(PathError::OutputTooSmall);}
+    parent[..p].copy_from_slice(&canonical[..p]);
+    name[..b].copy_from_slice(&canonical[slash+1..n]);
+    Ok((p,b))
+}
+/// WS69: A guarded rename must keep *both* normalized names in a trusted
+/// directory tree; it cannot rename the root itself or use separator aliases.
+pub fn rename_stays_within_tree(source:&str,destination:&str,root:&str)
+    ->Result<bool,PathError>{
+    if source.contains('\\')||destination.contains('\\')||root.contains('\\'){
+        return Err(PathError::Relative);
+    }
+    if !is_within_tree(source,root)?||!is_within_tree(destination,root)?{
+        return Ok(false);
+    }
+    let mut original=[0u8;256];let mut target=[0u8;256];
+    let a=normalize_absolute(source,&mut original)?;
+    let b=normalize_absolute(destination,&mut target)?;
+    Ok(a>1&&b>1&&original[..a]!=target[..b])
+}
+/// WS70: Replace a canonical basename without flattening ancestors.
+/// The existing validated parent and proposed child must both fit, and
+/// errors preserve the destination buffer.
+pub fn replace_basename(path:&str,new_name:&str,out:&mut[u8])
+    ->Result<usize,PathError>{
+    let mut parent=[0u8;256];let mut old=[0u8;MAX_COMPONENT_BYTES];
+    let (p,_)=split_parent_basename(path,&mut parent,&mut old)?;
+    let parent=core::str::from_utf8(&parent[..p]).map_err(|_|PathError::Relative)?;
+    join_child(parent,new_name,out)
+}
+#[cfg(test)]
+mod pr782_ws68_70_tests{
+    use super::*;
+    #[test]fn ws68_short_buffer_does_not_modify_either_output(){
+        let mut p=[9u8;16];let mut name=[8u8;2];
+        assert_eq!(split_parent_basename("//shared/./note",&mut p,&mut name),
+            Err(PathError::OutputTooSmall));
+        assert_eq!(p,[9;16]);assert_eq!(name,[8;2]);
+        let mut basename=[0u8;16];
+        assert_eq!(split_parent_basename("//shared/./note",&mut p,&mut basename),
+            Ok((7,4)));
+        assert_eq!(&p[..7],b"/shared");assert_eq!(&basename[..4],b"note");
+    }
+    #[test]fn ws69_rename_stays_inside_canonical_tree(){
+        assert_eq!(rename_stays_within_tree("//shared/one","/shared/two","/shared"),Ok(true));
+        assert_eq!(rename_stays_within_tree("/shared/one","/shared/./one","/shared"),Ok(false));
+        assert_eq!(rename_stays_within_tree("/shared/one","/sharedness/two","/shared"),Ok(false));
+        assert_eq!(rename_stays_within_tree("/shared/one","/shared/../system/x","/shared"),
+            Err(PathError::ParentTraversal));
+        assert_eq!(rename_stays_within_tree("/shared/one","/shared\\bad","/shared"),
+            Err(PathError::Relative));
+    }
+    #[test]fn ws70_basename_replacement_is_atomic_and_bounded(){
+        let mut out=[0x77u8;32];
+        assert_eq!(replace_basename("/a//b","c",&mut out),Ok(4));
+        assert_eq!(&out[..4],b"/a/c");
+        let before=out;
+        assert_eq!(replace_basename("/a/b","../keys",&mut out),Err(PathError::Relative));
+        assert_eq!(out,before);
+        assert_eq!(replace_basename("/","c",&mut out),Err(PathError::Empty));
+        assert_eq!(out,before);
+        let mut short=[0xa5u8;3];
+        assert_eq!(replace_basename("/a/b","c",&mut short),Err(PathError::OutputTooSmall));
+        assert_eq!(short,[0xa5;3]);
+    }
+}

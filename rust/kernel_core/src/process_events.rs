@@ -90,6 +90,24 @@ impl<const CAPACITY: usize> ProcessEvents<CAPACITY> {
         self.dequeue().ok()
     }
 
+    /// Copy an ordered, immutable receipt snapshot without consuming events.
+    /// Insufficient space or a malformed entry leaves the caller buffer intact.
+    pub fn snapshot_receipts(&self,out:&mut[EventReceipt])
+        ->Result<usize,EventError>{
+        if out.len()<self.count{return Err(EventError::Full);}
+        for i in 0..self.count{
+            let index=(self.head+i)%CAPACITY;
+            if self.entries[index].is_none()||self.sequences[index]==0{
+                return Err(EventError::Empty);
+            }
+        }
+        for i in 0..self.count{
+            let index=(self.head+i)%CAPACITY;
+            out[i]=EventReceipt{sequence:self.sequences[index],
+                event:self.entries[index].ok_or(EventError::Empty)?};
+        }
+        Ok(self.count)
+    }
     pub fn dequeue(&mut self) -> Result<ProcessEvent, EventError> {
         if self.count == 0 { return Err(EventError::Empty); }
         let event = self.entries[self.head].take().ok_or(EventError::Empty)?;
@@ -1206,5 +1224,147 @@ mod r120_fault_receipt_tests {
         assert_eq!(events.enqueue_fault_once(1, 0), Err(EventError::InvalidPid));
         assert_eq!(events.enqueue_fault_once(1, 1), Err(EventError::Full));
         assert_eq!(events.len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod m1_ws14_receipt_snapshot_tests {
+ use super::*;
+ #[test] fn snapshot_preserves_fifo_identity_after_wrap_and_capacity_failure() {
+  let mut q=ProcessEvents::<2>::new();
+  let e=|pid|ProcessEvent{pid,kind:EventKind::Message,value:pid as u64};
+  q.enqueue(e(1)).unwrap();q.enqueue(e(2)).unwrap();
+  let first=q.peek_receipt().unwrap();
+  q.dequeue().unwrap();q.enqueue(e(3)).unwrap();
+  let sentinel=EventReceipt{sequence:0,event:e(99)};
+  let mut short=[sentinel;1];
+  assert_eq!(q.snapshot_receipts(&mut short),Err(EventError::Full));
+  assert_eq!(short,[sentinel]);
+  let mut all=[sentinel;2];
+  assert_eq!(q.snapshot_receipts(&mut all),Ok(2));
+  assert_eq!((all[0].event.pid,all[1].event.pid),(2,3));
+  assert!(all[0].sequence>first.sequence);
+  assert_eq!(q.acknowledge_receipt(first),None);
+  assert_eq!(q.acknowledge_receipt(all[0]),Some(e(2)));
+  assert_eq!(q.peek_receipt(),Some(all[1]));
+  let none=ProcessEvents::<0>::new();
+  assert_eq!(none.snapshot_receipts(&mut []),Ok(0));
+ }
+}
+
+
+// PR782 WS59-61: process-scoped FIFO observation and exact consumption.
+// The scheduler must supply an authenticated PID: this is not a guest API.
+impl<const CAPACITY:usize> ProcessEvents<CAPACITY>{
+    /// WS59: Read only a given process's receipts, preserving order and
+    /// destination on short capacity or a malformed kernel ring.
+    pub fn snapshot_pid_receipts(&self,pid:u32,out:&mut[EventReceipt])
+        ->Result<usize,EventError>{
+        if pid==0{return Err(EventError::InvalidPid);}
+        let mut count=0;
+        for i in 0..self.count{
+            let at=(self.head+i)%CAPACITY;
+            let event=self.entries[at].ok_or(EventError::Empty)?;
+            if self.sequences[at]==0{return Err(EventError::Empty);}
+            if event.pid==pid{count+=1;}
+        }
+        if count>out.len(){return Err(EventError::Full);}
+        let mut index=0;
+        for i in 0..self.count{
+            let at=(self.head+i)%CAPACITY;
+            if let Some(event)=self.entries[at]{
+                if event.pid==pid{
+                    out[index]=EventReceipt{sequence:self.sequences[at],event};
+                    index+=1;
+                }
+            }
+        }
+        Ok(index)
+    }
+    /// WS60: Require both an authenticated owner and exact, single-use head
+    /// receipt before removing an event. A peer's matching payload is not
+    /// sufficient to drain a FIFO item.
+    pub fn acknowledge_pid_head(&mut self,pid:u32,receipt:EventReceipt)
+        ->Result<ProcessEvent,EventError>{
+        if pid==0{return Err(EventError::InvalidPid);}
+        if receipt.event.pid!=pid||self.peek_receipt()!=Some(receipt){
+            return Err(EventError::Empty);
+        }
+        self.dequeue()
+    }
+    /// WS61: Bounded cursor paging never consumes events. An empty page means
+    /// no retained matching events after cursor; external callers should not
+    /// infer that earlier ring data is still available after eviction.
+    pub fn page_pid_after(&self,pid:u32,after:u64,
+        out:&mut[EventReceipt])->Result<(usize,Option<u64>),EventError>{
+        if pid==0{return Err(EventError::InvalidPid);}
+        if out.is_empty(){return Err(EventError::Full);}
+        // Complete validation before exposing any paged data.
+        for i in 0..self.count{
+            let at=(self.head+i)%CAPACITY;
+            if self.entries[at].is_none()||self.sequences[at]==0{
+                return Err(EventError::Empty);
+            }
+        }
+        let mut written=0;let mut last=None;
+        for i in 0..self.count{
+            let at=(self.head+i)%CAPACITY;
+            if let Some(event)=self.entries[at]{
+                let seq=self.sequences[at];
+                if event.pid==pid&&seq>after{
+                    out[written]=EventReceipt{sequence:seq,event};
+                    last=Some(seq);written+=1;
+                    if written==out.len(){break;}
+                }
+            }
+        }
+        Ok((written,last))
+    }
+}
+#[cfg(test)]
+mod pr782_ws59_61_tests{
+    use super::*;
+    fn e(pid:u32,value:u64)->ProcessEvent{
+        ProcessEvent{pid,kind:EventKind::Message,value}
+    }
+    fn empty()->EventReceipt{
+        EventReceipt{sequence:0,event:e(99,999)}
+    }
+    #[test]fn ws59_owner_snapshot_is_atomic_and_fifo_ordered(){
+        let mut q=ProcessEvents::<3>::new();
+        q.enqueue(e(1,10)).unwrap();q.enqueue(e(2,20)).unwrap();
+        q.enqueue(e(1,30)).unwrap();
+        let mut small=[empty();1];
+        assert_eq!(q.snapshot_pid_receipts(1,&mut small),Err(EventError::Full));
+        assert_eq!(small,[empty();1]);
+        let mut out=[empty();2];
+        assert_eq!(q.snapshot_pid_receipts(1,&mut out),Ok(2));
+        assert_eq!([out[0].event.value,out[1].event.value],[10,30]);
+        assert!(out[0].sequence<out[1].sequence);
+    }
+    #[test]fn ws60_peer_or_replayed_receipt_cannot_consume_head(){
+        let mut q=ProcessEvents::<2>::new();q.enqueue(e(1,10)).unwrap();
+        let receipt=q.peek_receipt().unwrap();
+        assert_eq!(q.acknowledge_pid_head(2,receipt),Err(EventError::Empty));
+        assert_eq!(q.len(),1);
+        assert_eq!(q.acknowledge_pid_head(1,receipt),Ok(e(1,10)));
+        q.enqueue(e(1,10)).unwrap();
+        assert_eq!(q.acknowledge_pid_head(1,receipt),Err(EventError::Empty));
+        assert_eq!(q.len(),1);
+    }
+    #[test]fn ws61_pages_skip_peer_events_with_stable_sequence_cursor(){
+        let mut q=ProcessEvents::<4>::new();
+        for (p,v) in [(1,1),(2,2),(1,3),(1,4)]{
+            q.enqueue(e(p,v)).unwrap();
+        }
+        let mut out=[empty();1];
+        let (n,last)=q.page_pid_after(1,0,&mut out).unwrap();
+        assert_eq!((n,out[0].event.value),(1,1));
+        let (_,last2)=q.page_pid_after(1,last.unwrap(),&mut out).unwrap();
+        assert_eq!(out[0].event.value,3);
+        let (_,last3)=q.page_pid_after(1,last2.unwrap(),&mut out).unwrap();
+        assert_eq!(out[0].event.value,4);
+        assert_eq!(q.page_pid_after(1,last3.unwrap(),&mut out),Ok((0,None)));
+        assert_eq!(q.len(),4);
     }
 }

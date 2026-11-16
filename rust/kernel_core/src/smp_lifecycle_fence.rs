@@ -163,6 +163,13 @@ impl LifecycleFence {
         }
         Err(FenceError::NoProgress)
     }
+    /// Fail closed unless the exact AP generation has acknowledged cleanup.
+    /// Caller must still arrange real TLB shootdown/IPI where required.
+    pub fn require_ack_for_reclaim(&self,cpu:u32,receipt:Receipt)
+        ->Result<(),FenceError>{
+        if self.acknowledged(cpu,receipt)?{Ok(())}
+        else{Err(FenceError::NoProgress)}
+    }
     /// BSP cannot treat an ack for an earlier generation as the current one.
     pub fn acknowledged(
         &self,cpu:u32,receipt:Receipt
@@ -435,5 +442,94 @@ mod r123_bsp_pending_receipt_tests {
         let second=f.publish(0,52).unwrap();
         assert_eq!(f.pending_receipt(0),Ok(Some(second)));
         assert_eq!(f.acknowledged(0,first),Err(FenceError::StaleReceipt));
+    }
+}
+
+#[cfg(test)]
+mod m1_ws17_reclaim_ack_tests {
+ use super::*;
+ #[test] fn memory_reclaim_never_accepts_pending_or_replayed_ap_ack() {
+  let fence=LifecycleFence::new(0,1);
+  assert_eq!(fence.require_ack_for_reclaim(0,Receipt{sequence:0,generation:0}),
+      Err(FenceError::StaleReceipt));
+  let r=fence.publish(0,5).unwrap();
+  assert_eq!(fence.require_ack_for_reclaim(0,r),Err(FenceError::NoProgress));
+  assert_eq!(fence.require_ack_for_reclaim(1,r),Err(FenceError::InvalidCpu));
+  fence.observe_and_ack(1,0).unwrap();
+  assert_eq!(fence.require_ack_for_reclaim(0,r),Ok(()));
+  let next=fence.publish(0,6).unwrap();
+  assert_eq!(fence.require_ack_for_reclaim(0,r),Err(FenceError::StaleReceipt));
+  assert_eq!(fence.require_ack_for_reclaim(0,next),Err(FenceError::NoProgress));
+ }
+}
+
+
+// PR782 WS62-64: exact-generation kernel reclaim coordination.
+// These are software barriers only, not physical IPIs or TLB shootdown.
+impl LifecycleFence{
+    /// WS62: Inspect the BSP's *currently pending* publication and require
+    /// its complete identity. An already acknowledged receipt is not pending.
+    pub fn require_pending_exact(&self,cpu:u32,expected:Receipt)
+        ->Result<(),FenceError>{
+        if expected.sequence==0||expected.generation==0{
+            return Err(FenceError::InvalidGeneration);
+        }
+        match self.pending_receipt(cpu)? {
+            Some(live) if live==expected=>Ok(()),
+            _=>Err(FenceError::StaleReceipt)
+        }
+    }
+    /// WS64: A next publication must depend on the explicitly verified
+    /// previous generation, not just a numeric monotonic generation increase.
+    pub fn publish_after_exact_ack(&self,cpu:u32,previous:Receipt,
+        next_generation:u64)->Result<Receipt,FenceError>{
+        self.require_ack_for_reclaim(cpu,previous)?;
+        self.publish(cpu,next_generation)
+    }
+}
+/// WS63: Software admission gate for two independent AP lifecycle receipts.
+/// Caller must still execute real CPU-local invalidations and verify hardware.
+pub fn require_dual_ack_for_reclaim(
+    first:&LifecycleFence,first_bsp:u32,first_receipt:Receipt,
+    second:&LifecycleFence,second_bsp:u32,second_receipt:Receipt
+)->Result<(),FenceError>{
+    first.require_ack_for_reclaim(first_bsp,first_receipt)?;
+    second.require_ack_for_reclaim(second_bsp,second_receipt)?;
+    Ok(())
+}
+#[cfg(test)]
+mod pr782_ws62_64_tests{
+    use super::*;
+    #[test]fn ws62_only_live_exact_pending_receipt_is_admitted(){
+        let f=LifecycleFence::new(0,1);
+        let receipt=f.publish(0,4).unwrap();
+        assert_eq!(f.require_pending_exact(0,receipt),Ok(()));
+        assert_eq!(f.require_pending_exact(0,Receipt{generation:5,..receipt}),
+            Err(FenceError::StaleReceipt));
+        assert_eq!(f.require_pending_exact(2,receipt),Err(FenceError::InvalidCpu));
+        f.observe_and_ack_after(1,0,|_|true).unwrap();
+        assert_eq!(f.require_pending_exact(0,receipt),Err(FenceError::StaleReceipt));
+    }
+    #[test]fn ws63_dual_ack_denies_either_unacknowledged_generation(){
+        let a=LifecycleFence::new(0,1);let b=LifecycleFence::new(2,3);
+        let ra=a.publish(0,7).unwrap();let rb=b.publish(2,8).unwrap();
+        a.observe_and_ack_after(1,0,|_|true).unwrap();
+        assert_eq!(require_dual_ack_for_reclaim(&a,0,ra,&b,2,rb),
+            Err(FenceError::NoProgress));
+        b.observe_and_ack_after(3,0,|_|true).unwrap();
+        assert_eq!(require_dual_ack_for_reclaim(&a,0,ra,&b,2,rb),Ok(()));
+        assert_eq!(require_dual_ack_for_reclaim(&a,0,ra,&b,2,
+            Receipt{generation:9,..rb}),Err(FenceError::StaleReceipt));
+    }
+    #[test]fn ws64_previous_ack_must_match_before_advancing(){
+        let f=LifecycleFence::new(0,1);
+        let one=f.publish(0,7).unwrap();
+        assert_eq!(f.publish_after_exact_ack(0,one,8),Err(FenceError::NoProgress));
+        f.observe_and_ack_after(1,0,|_|true).unwrap();
+        assert_eq!(f.publish_after_exact_ack(0,Receipt{generation:6,..one},8),
+            Err(FenceError::StaleReceipt));
+        let two=f.publish_after_exact_ack(0,one,8).unwrap();
+        assert_eq!(two.generation,8);
+        assert_eq!(f.require_pending_exact(0,two),Ok(()));
     }
 }
