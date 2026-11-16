@@ -182,3 +182,95 @@ mod ws25_acpi_root_table_tests{
   assert_eq!(unchanged,[9;2]);
  }
 }
+
+
+// PR #782 WS42-44: mapped ACPI roots and bounded firmware structure checks.
+/// WS42: Transactionally copy root entries only when an external boot-memory
+/// mapping authority verifies each full SDT header. No physical dereference.
+pub fn parse_mapped_root_addresses<F>(bytes:&[u8],out:&mut[u64],
+ mut mapped:F)->Result<usize,AcpiError> where F:FnMut(u64,u64)->bool{
+ let mut staged=[0u64;256];
+ let n=parse_root_addresses(bytes,&mut staged)?;
+ if n>out.len(){return Err(AcpiError::Malformed);}
+ for &address in &staged[..n]{
+  if !mapped(address,36){return Err(AcpiError::Malformed);}
+ }
+ out[..n].copy_from_slice(&staged[..n]);Ok(n)
+}
+/// WS43: Validate the entire MADT variable-record chain without trusting
+/// firmware-provided entry lengths or silently accepting zero-size records.
+pub fn count_madt_records(bytes:&[u8])->Result<usize,AcpiError>{
+ let table=parse_sdt(bytes)?;
+ if table.signature!=*b"APIC"{return Err(AcpiError::Signature);}
+ if table.length<44{return Err(AcpiError::Malformed);}
+ let mut at=44usize;let end=table.length as usize;let mut count=0;
+ while at<end{
+  if end-at<2{return Err(AcpiError::Truncated);}
+  let kind=bytes[at];let len=usize::from(bytes[at+1]);
+  if len<2||len>end-at{return Err(AcpiError::Malformed);}
+  let expected=match kind{
+   0=>Some(8),1=>Some(12),2=>Some(10),9=>Some(16),_=>None
+  };
+  if expected.is_some_and(|n|n!=len){return Err(AcpiError::Malformed);}
+  count+=1;
+  if count>256{return Err(AcpiError::Malformed);}
+  at+=len;
+ }
+ Ok(count)
+}
+/// WS44: Check the mapped SDT physical aperture against a supplied trusted
+/// boot-memory allocation [start,start+length), without computing unchecked
+/// virtual pointers or reading unmapped memory.
+pub fn validate_sdt_aperture(bytes:&[u8],address:u64,
+ mapped_start:u64,mapped_length:u64)->Result<Table,AcpiError>{
+ let table=parse_sdt(bytes)?;
+ if address==0||address&3!=0||mapped_length==0 {
+  return Err(AcpiError::Malformed);
+ }
+ let mapped_end=mapped_start.checked_add(mapped_length).ok_or(AcpiError::Malformed)?;
+ let table_end=address.checked_add(u64::from(table.length))
+  .ok_or(AcpiError::Malformed)?;
+ if address<mapped_start||table_end>mapped_end{return Err(AcpiError::Malformed);}
+ Ok(table)
+}
+#[cfg(test)]
+mod pr782_ws42_44_tests{
+ use super::*;
+ fn fix(t:&mut[u8]){
+  t[9]=0;let sum=t.iter().fold(0u8,|s,&v|s.wrapping_add(v));
+  t[9]=0u8.wrapping_sub(sum);
+ }
+ fn xsdt()->[u8;52]{
+  let mut t=[0u8;52];t[..4].copy_from_slice(b"XSDT");
+  t[4..8].copy_from_slice(&52u32.to_le_bytes());
+  t[36..44].copy_from_slice(&0x1000u64.to_le_bytes());
+  t[44..52].copy_from_slice(&0x2000u64.to_le_bytes());fix(&mut t);t
+ }
+ #[test]fn ws42_unowned_root_leaves_output_unchanged(){
+  let t=xsdt();let mut out=[99u64;2];
+  assert_eq!(parse_mapped_root_addresses(&t,&mut out,|addr,_|addr==0x1000),
+   Err(AcpiError::Malformed));
+  assert_eq!(out,[99;2]);
+  assert_eq!(parse_mapped_root_addresses(&t,&mut out,|_,n|n==36),Ok(2));
+  assert_eq!(out,[0x1000,0x2000]);
+ }
+ #[test]fn ws43_madt_records_have_bounded_nonzero_lengths(){
+  let mut t=[0u8;52];t[..4].copy_from_slice(b"APIC");
+  t[4..8].copy_from_slice(&52u32.to_le_bytes());
+  t[44]=0;t[45]=8;fix(&mut t);
+  assert_eq!(count_madt_records(&t),Ok(1));
+  t[45]=0;fix(&mut t);
+  assert_eq!(count_madt_records(&t),Err(AcpiError::Malformed));
+  t[45]=9;fix(&mut t);
+  assert_eq!(count_madt_records(&t),Err(AcpiError::Malformed));
+ }
+ #[test]fn ws44_table_span_must_fit_the_trusted_mapping(){
+  let t=xsdt();
+  assert_eq!(validate_sdt_aperture(&t,0x1000,0x1000,52),
+   Ok(Table{signature:*b"XSDT",length:52,revision:0}));
+  assert_eq!(validate_sdt_aperture(&t,0x1000,0x1000,51),
+   Err(AcpiError::Malformed));
+  assert_eq!(validate_sdt_aperture(&t,0x1000,u64::MAX-5,16),
+   Err(AcpiError::Malformed));
+ }
+}

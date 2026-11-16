@@ -219,3 +219,122 @@ mod ws26_dhcp_untrusted_options_tests{
   assert_eq!(parse_lease([10,0,0,2],&options),Err(NetworkError::Malformed));
  }
 }
+
+
+// PR #782 WS45-47: bounded DHCP ACK, on-link lease and peer-bound TCP policy.
+/// WS45: Reject a configured gateway outside the verified DHCP address's
+/// subnet, or a self-gateway. Does not claim packet-origin authentication.
+pub fn require_onlink_gateway(lease:Lease)->Result<Lease,NetworkError>{
+ let mask=u32::from_be_bytes(lease.subnet);
+ let host=u32::from_be_bytes(lease.address);
+ let router=u32::from_be_bytes(lease.gateway);
+ if mask==0||router==0||host==router||(host&mask)!=(router&mask){
+  return Err(NetworkError::Malformed);
+ }
+ Ok(lease)
+}
+/// WS46: Verify fixed BOOTP identity and exactly one DHCP ACK/server-ID
+/// option before accepting the existing option parser's lease.
+pub fn parse_verified_ack(packet:&[u8],expected_xid:u32,
+ expected_mac:[u8;6])->Result<Lease,NetworkError>{
+ if packet.len()<241||packet[0]!=2||packet[1]!=1||packet[2]!=6||
+  expected_xid==0||&packet[4..8]!=expected_xid.to_be_bytes().as_slice()||
+  &packet[28..34]!=expected_mac.as_slice()||expected_mac==[0;6]{
+  return Err(NetworkError::Malformed);
+ }
+ let addr:[u8;4]=packet[16..20].try_into().map_err(|_|NetworkError::Malformed)?;
+ let options=&packet[236..];
+ let lease=parse_lease(addr,options)?;
+ let mut at=4;let mut ack=false;let mut server=false;
+ while at<options.len(){
+  let kind=options[at];at+=1;
+  if kind==255{break;}
+  if kind==0{continue;}
+  if at>=options.len(){return Err(NetworkError::Malformed);}
+  let size=usize::from(options[at]);at+=1;
+  if size>options.len()-at{return Err(NetworkError::Malformed);}
+  if kind==53 {
+   if ack||size!=1||options[at]!=5{return Err(NetworkError::Malformed);}
+   ack=true;
+  }
+  if kind==54 {
+   if server||size!=4||&options[at..at+4]==[0u8;4].as_slice(){
+    return Err(NetworkError::Malformed);
+   }
+   server=true;
+  }
+  at+=size;
+ }
+ if !ack||!server{return Err(NetworkError::Missing);}
+ require_onlink_gateway(lease)
+}
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct PeerTuple{
+ pub source_ip:[u8;4],pub source_port:u16,pub destination_port:u16
+}
+pub struct BoundTcpHandshake{
+ expected:PeerTuple, inner:TcpHandshake
+}
+/// WS47: A SYN-ACK must match the same verified peer 4-tuple identity as
+/// the outbound SYN; packet checksums, routing and peer validation are
+/// the responsibility of the actual transport.
+impl BoundTcpHandshake{
+ pub const fn new(expected:PeerTuple)->Self{
+  Self{expected,inner:TcpHandshake::new()}
+ }
+ pub fn syn(&mut self,sequence:u32)->Result<(),NetworkError>{
+  if self.expected.source_ip==[0;4]||self.expected.source_port==0||
+    self.expected.destination_port==0{return Err(NetworkError::State);}
+  self.inner.syn(sequence)
+ }
+ pub fn syn_ack(&mut self,peer:PeerTuple,ack:u32,syn:bool,ack_flag:bool)
+  ->Result<(),NetworkError>{
+  if peer!=self.expected{return Err(NetworkError::State);}
+  self.inner.syn_ack(ack,syn,ack_flag)
+ }
+ pub fn state(&self)->TcpState{self.inner.state()}
+}
+#[cfg(test)]
+mod pr782_ws45_47_tests {
+ use super::*;
+ #[test]fn ws45_rejects_offlink_and_self_gateway(){
+  let l=Lease{address:[192,168,1,10],subnet:[255,255,255,0],
+   gateway:[192,168,1,1],lease_seconds:60};
+  assert_eq!(require_onlink_gateway(l),Ok(l));
+  assert_eq!(require_onlink_gateway(Lease{gateway:[192,168,2,1],..l}),
+   Err(NetworkError::Malformed));
+  assert_eq!(require_onlink_gateway(Lease{gateway:l.address,..l}),
+   Err(NetworkError::Malformed));
+ }
+ fn ack()->[u8;268]{
+  let mut p=[0u8;268];p[0]=2;p[1]=1;p[2]=6;
+  p[4..8].copy_from_slice(&42u32.to_be_bytes());
+  p[16..20].copy_from_slice(&[10,0,0,10]);
+  p[28..34].copy_from_slice(&[1,2,3,4,5,6]);
+  p[236..].copy_from_slice(&[
+   99,130,83,99,
+   53,1,5,54,4,10,0,0,1,
+   1,4,255,255,255,0,
+   3,4,10,0,0,1,
+   51,4,0,0,0,60,255
+  ]);p
+ }
+ #[test]fn ws46_rejects_wrong_transaction_and_duplicate_ack(){
+  let packet=ack();
+  assert!(parse_verified_ack(&packet,42,[1,2,3,4,5,6]).is_ok());
+  assert_eq!(parse_verified_ack(&packet,43,[1,2,3,4,5,6]),
+   Err(NetworkError::Malformed));
+  let mut invalid=packet;invalid[242]=3;
+  assert_eq!(parse_verified_ack(&invalid,42,[1,2,3,4,5,6]),
+   Err(NetworkError::Malformed));
+ }
+ #[test]fn ws47_wrong_peer_cannot_establish_connection(){
+  let tuple=PeerTuple{source_ip:[10,0,0,1],source_port:443,destination_port:1234};
+  let mut h=BoundTcpHandshake::new(tuple);h.syn(5).unwrap();
+  let other=PeerTuple{source_port:444,..tuple};
+  assert_eq!(h.syn_ack(other,6,true,true),Err(NetworkError::State));
+  assert_eq!(h.state(),TcpState::SynSent);
+  assert_eq!(h.syn_ack(tuple,6,true,true),Ok(()));
+  assert_eq!(h.state(),TcpState::Established);
+ }
+}

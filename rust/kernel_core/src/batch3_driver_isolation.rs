@@ -97,3 +97,77 @@ mod ws21_driver_quarantine_tests{
   assert_eq!(d.validate(4,9,0x4fff,2),Err(DriverError::Invalid));
  }
 }
+
+
+// PR #782 WS48-50: privileged, generation-bound driver resource lifecycle.
+impl<const N:usize> Drivers<N>{
+ /// WS48: Do not quarantine an unrelated device by recycling an IRQ number.
+ pub fn quarantine_exact_irq(&mut self,driver:u32,generation:u64,
+  expected_irq:u16)->Result<(),DriverError>{
+  if driver==0||generation==0||expected_irq==0{return Err(DriverError::Invalid);}
+  let grant=self.entries.iter_mut().flatten().find(|g|g.driver==driver)
+   .ok_or(DriverError::Stale)?;
+  if grant.generation!=generation||grant.irq!=expected_irq{
+   return Err(DriverError::Stale);
+  }
+  grant.active=false;Ok(())
+ }
+ /// WS49: Require complete page ownership, not just a matching byte within
+ /// the grant, before a trusted driver obtains an MMIO page mapping.
+ pub fn validate_whole_pages(&self,driver:u32,generation:u64,
+  address:u64,bytes:u64)->Result<(),DriverError>{
+  if address&4095!=0||bytes==0||bytes&4095!=0{
+   return Err(DriverError::Invalid);
+  }
+  self.validate(driver,generation,address,bytes)
+ }
+ /// WS50: Rebind an already quarantined driver transactionally. The old
+ /// quarantine is preserved if reallocation fails (including IRQ conflicts).
+ /// Caller must independently prove hardware DMA/IRQ quiescence.
+ pub fn rebind_after_quiescence(&mut self,driver:u32,old_epoch:u64,
+  new_epoch:u64,start:u64,length:u64,irq:u16,hardware_quiesced:bool)
+  ->Result<(),DriverError>{
+  if driver==0||old_epoch==0||new_epoch<=old_epoch||!hardware_quiesced{
+   return Err(DriverError::Stale);
+  }
+  let mut candidate=Drivers::<N>{entries:self.entries};
+  candidate.retire_quarantined(driver,old_epoch,true)?;
+  candidate.allocate(driver,new_epoch,start,length,irq)?;
+  self.entries=candidate.entries;Ok(())
+ }
+}
+#[cfg(test)]
+mod pr782_ws48_50_tests{
+ use super::*;
+ #[test]fn ws48_quarantine_requires_exact_device_and_irq_identity(){
+  let mut d=Drivers::<2>::new();
+  d.allocate(1,3,0x1000,0x1000,4).unwrap();
+  d.allocate(2,5,0x3000,0x1000,5).unwrap();
+  assert_eq!(d.quarantine_exact_irq(1,3,5),Err(DriverError::Stale));
+  assert_eq!(d.validate(1,3,0x1000,4),Ok(()));
+  d.quarantine_exact_irq(1,3,4).unwrap();
+  assert_eq!(d.validate(1,3,0x1000,4),Err(DriverError::Quarantined));
+  assert_eq!(d.validate(2,5,0x3000,4),Ok(()));
+ }
+ #[test]fn ws49_whole_pages_rejects_unaligned_and_overbound_mmio(){
+  let mut d=Drivers::<1>::new();d.allocate(1,3,0x1000,0x2000,4).unwrap();
+  assert_eq!(d.validate_whole_pages(1,3,0x1000,4096),Ok(()));
+  assert_eq!(d.validate_whole_pages(1,3,0x1001,4096),
+   Err(DriverError::Invalid));
+  assert_eq!(d.validate_whole_pages(1,3,0x2000,8192),
+   Err(DriverError::Invalid));
+ }
+ #[test]fn ws50_failed_rebind_never_drops_quarantine(){
+  let mut d=Drivers::<2>::new();
+  d.allocate(1,3,0x1000,0x1000,4).unwrap();
+  d.allocate(2,3,0x4000,0x1000,5).unwrap();
+  d.quarantine_exact_irq(1,3,4).unwrap();
+  assert_eq!(d.rebind_after_quiescence(1,3,4,0x6000,0x1000,5,true),
+   Err(DriverError::Overlap));
+  assert_eq!(d.validate(1,3,0x1000,4),Err(DriverError::Quarantined));
+  assert_eq!(d.rebind_after_quiescence(1,3,4,0x6000,0x1000,6,false),
+   Err(DriverError::Stale));
+  d.rebind_after_quiescence(1,3,4,0x6000,0x1000,6,true).unwrap();
+  assert_eq!(d.validate(1,4,0x6000,4),Ok(()));
+ }
+}

@@ -124,3 +124,87 @@ mod ws24_virtio_alias_tests{
   assert_eq!(validate_disjoint_chain(&[first,separated],0,true),Err(VirtError::Unsupported));
  }
 }
+
+
+// PR #782 WS39-41: strict split-queue ownership and completion cursor gates.
+pub fn validate_owned_disjoint_chain<F>(descriptors:&[Descriptor],head:usize,
+ device_writes:bool,mut owns_page:F)->Result<u64,VirtError>
+ where F:FnMut(u64,u64)->bool{
+ // WS39: reject cycles/aliasing first, before consulting an IOMMU owner.
+ let total=validate_disjoint_chain(descriptors,head,device_writes)?;
+ let mut current=head;
+ loop{
+  let desc=descriptors[current];
+  let end=desc.address.checked_add(u64::from(desc.length))
+   .ok_or(VirtError::Invalid)?;
+  let mut page=desc.address&!4095;
+  while page<end{
+   if !owns_page(page,4096){return Err(VirtError::Invalid);}
+   page=page.checked_add(4096).ok_or(VirtError::Invalid)?;
+  }
+  if desc.flags&NEXT==0{break;}
+  current=usize::from(desc.next);
+ }
+ Ok(total)
+}
+/// WS40: Force every ring segment within the device-negotiated per-buffer
+/// budget. A descriptor cannot evade the limit by chain total alone.
+pub fn validate_bounded_segments(descriptors:&[Descriptor],head:usize,
+ device_writes:bool,max_segment:u32)->Result<u64,VirtError>{
+ let total=validate_disjoint_chain(descriptors,head,device_writes)?;
+ if max_segment==0{return Err(VirtError::Invalid);}
+ let mut current=head;
+ loop{
+  let d=descriptors[current];
+  if d.length>max_segment{return Err(VirtError::TooLong);}
+  if d.flags&NEXT==0{break;}
+  current=usize::from(d.next);
+ }
+ Ok(total)
+}
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct UsedRingCursor{epoch:u64,used:u16}
+impl UsedRingCursor{
+ pub const fn new(epoch:u64,used:u16)->Self{Self{epoch,used}}
+ /// WS41: A completion batch cannot exceed negotiated ring capacity, repeat
+ /// an old index, or cross a retired queue generation. Handles u16 wrap.
+ pub fn advance(&mut self,epoch:u64,next:u16,ring_size:u16)
+  ->Result<u16,VirtError>{
+  let limit=validate_ring_size(ring_size)? as u16;
+  if epoch==0||epoch!=self.epoch{return Err(VirtError::Invalid);}
+  let delta=next.wrapping_sub(self.used);
+  if delta==0||delta>limit{return Err(VirtError::OutOfBounds);}
+  self.used=next;Ok(delta)
+ }
+ pub fn used(&self)->u16{self.used}
+}
+#[cfg(test)]
+mod pr782_ws39_41_tests{
+ use super::*;
+ fn ring()->[Descriptor;2]{[
+  Descriptor{address:0x1000,length:4096,flags:NEXT,next:1},
+  Descriptor{address:0x2000,length:512,flags:0,next:0},
+ ]}
+ #[test]fn ws39_deny_unowned_dma_without_mutating_queue(){
+  let mut pages=0;
+  assert_eq!(validate_owned_disjoint_chain(&ring(),0,false,|a,n|{
+   pages+=1;n==4096&&a==0x1000
+  }),Err(VirtError::Invalid));
+  assert_eq!(pages,2);
+  assert_eq!(validate_owned_disjoint_chain(&ring(),0,false,|_,_|true),Ok(4608));
+ }
+ #[test]fn ws40_per_descriptor_budget_is_enforced(){
+  assert_eq!(validate_bounded_segments(&ring(),0,false,2048),Err(VirtError::TooLong));
+  assert_eq!(validate_bounded_segments(&ring(),0,false,4096),Ok(4608));
+  assert_eq!(validate_bounded_segments(&ring(),0,false,0),Err(VirtError::Invalid));
+ }
+ #[test]fn ws41_rejects_stale_and_oversized_used_index_delta(){
+  let mut cursor=UsedRingCursor::new(5,u16::MAX);
+  assert_eq!(cursor.advance(4,0,2),Err(VirtError::Invalid));
+  assert_eq!(cursor.advance(5,2,2),Err(VirtError::OutOfBounds));
+  assert_eq!(cursor.used(),u16::MAX);
+  assert_eq!(cursor.advance(5,0,2),Ok(1));
+  assert_eq!(cursor.advance(5,0,2),Err(VirtError::OutOfBounds));
+  assert_eq!(cursor.advance(5,1,3),Err(VirtError::OutOfBounds));
+ }
+}
