@@ -252,3 +252,126 @@ mod tests {
         assert_eq!(fs.read("missing",&mut [0;512]),Err(FsError::NotFound));
     }
 }
+
+
+// PR782 WS51-54: bounded directory/metadata operations on the legacy
+// one-sector TinyFS. This is NOT a journaled or crash-consistent filesystem.
+impl<D:BlockDevice> TinyFs<D> {
+    /// WS51: Enumerate validated live directory names. An insufficient output
+    /// buffer cannot leak a partial listing.
+    pub fn list_names(&mut self,out:&mut [[u8;NAME_BYTES]])->Result<usize,FsError>{
+        self.validate_directory()?;
+        let dir=self.directory()?;
+        let count=(0..ENTRIES).filter(|&i|dir[i*ENTRY_BYTES]!=0).count();
+        if count>out.len(){return Err(FsError::TooLarge);}
+        let mut written=0;
+        for i in 0..ENTRIES{
+            if dir[i*ENTRY_BYTES]!=0{
+                out[written].copy_from_slice(&dir[i*ENTRY_BYTES..i*ENTRY_BYTES+NAME_BYTES]);
+                written+=1;
+            }
+        }
+        Ok(written)
+    }
+    /// WS52: Return validated file size without reading its data block.
+    pub fn file_size(&mut self,name:&str)->Result<usize,FsError>{
+        let name=Self::name(name)?;
+        self.validate_directory()?;
+        let dir=self.directory()?;
+        let slot=Self::slot(&dir,name).ok_or(FsError::NotFound)?;
+        let e=&dir[slot*ENTRY_BYTES..(slot+1)*ENTRY_BYTES];
+        let size=u32::from_le_bytes(e[NAME_BYTES..NAME_BYTES+4]
+            .try_into().map_err(|_|FsError::InvalidVolume)?) as usize;
+        if size>SECTOR_BYTES{return Err(FsError::InvalidVolume);}
+        Ok(size)
+    }
+    /// WS53: A checked subrange read leaves the output untouched on invalid
+    /// range, short output, I/O failure, or a forged nonzero after-EOF tail.
+    pub fn read_verified_range(&mut self,name:&str,offset:usize,
+        count:usize,out:&mut[u8])->Result<usize,FsError>{
+        let name=Self::name(name)?;
+        self.validate_directory()?;
+        let dir=self.directory()?;
+        let slot=Self::slot(&dir,name).ok_or(FsError::NotFound)?;
+        let e=&dir[slot*ENTRY_BYTES..(slot+1)*ENTRY_BYTES];
+        let length=u32::from_le_bytes(e[NAME_BYTES..NAME_BYTES+4]
+            .try_into().map_err(|_|FsError::InvalidVolume)?) as usize;
+        let end=offset.checked_add(count).ok_or(FsError::TooLarge)?;
+        if length>SECTOR_BYTES||end>length||count>out.len(){
+            return Err(FsError::TooLarge);
+        }
+        let mut block=[0u8;SECTOR_BYTES];
+        self.disk.read_sector(slot as u64+2,&mut block)?;
+        if block[length..].iter().any(|&byte|byte!=0){
+            return Err(FsError::InvalidVolume);
+        }
+        out[..count].copy_from_slice(&block[offset..end]);
+        Ok(count)
+    }
+    /// WS54: Rename one file in a single metadata-sector write. No data
+    /// sectors move. Caller must not claim power-loss atomicity from this.
+    pub fn rename_file(&mut self,old:&str,new:&str)->Result<(),FsError>{
+        let old=Self::name(old)?;let new=Self::name(new)?;
+        self.validate_directory()?;
+        let mut dir=self.directory()?;
+        let slot=Self::slot(&dir,old).ok_or(FsError::NotFound)?;
+        if Self::slot(&dir,new).is_some(){return Err(FsError::Exists);}
+        let e=&mut dir[slot*ENTRY_BYTES..(slot+1)*ENTRY_BYTES];
+        e[..NAME_BYTES].fill(0);
+        e[..new.len()].copy_from_slice(new);
+        self.disk.write_sector(1,&dir)?;
+        Ok(())
+    }
+}
+#[cfg(test)]
+mod pr782_ws51_54_tests{
+    use super::*;
+    struct Disk{data:[[u8;SECTOR_BYTES];5]}
+    impl BlockDevice for Disk {
+        fn sector_count(&self)->u64{5}
+        fn read_sector(&mut self,lba:u64,out:&mut [u8;SECTOR_BYTES])->Result<(),BlockError>{
+            *out=*self.data.get(lba as usize).ok_or(BlockError::OutOfRange)?;Ok(())
+        }
+        fn write_sector(&mut self,lba:u64,src:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+            *self.data.get_mut(lba as usize).ok_or(BlockError::OutOfRange)?=*src;Ok(())
+        }
+    }
+    fn fs()->TinyFs<Disk>{
+        TinyFs::format(Disk{data:[[0u8;SECTOR_BYTES];5]}).unwrap()
+    }
+    #[test]fn ws51_listing_is_atomic_on_capacity(){
+        let mut fs=fs();fs.create("one",b"a").unwrap();fs.create("two",b"b").unwrap();
+        let mut small=[[9u8;NAME_BYTES];1];
+        assert_eq!(fs.list_names(&mut small),Err(FsError::TooLarge));
+        assert_eq!(small,[[9u8;NAME_BYTES];1]);
+        let mut names=[[0u8;NAME_BYTES];2];
+        assert_eq!(fs.list_names(&mut names),Ok(2));
+        assert_eq!(&names[0][..4],b"one\0");
+        assert_eq!(&names[1][..4],b"two\0");
+    }
+    #[test]fn ws52_size_metadata_no_data_block_read(){
+        let mut fs=fs();fs.create("one",b"hello").unwrap();
+        assert_eq!(fs.file_size("one"),Ok(5));
+        assert_eq!(fs.file_size("missing"),Err(FsError::NotFound));
+    }
+    #[test]fn ws53_verified_subrange_and_corruption_are_fail_closed(){
+        let mut fs=fs();fs.create("one",b"hello").unwrap();
+        let mut out=[99u8;3];
+        assert_eq!(fs.read_verified_range("one",1,3,&mut out),Ok(3));
+        assert_eq!(&out,b"ell");
+        assert_eq!(fs.read_verified_range("one",4,3,&mut out),Err(FsError::TooLarge));
+        assert_eq!(&out,b"ell");
+        fs.disk.data[2][6]=1;
+        assert_eq!(fs.read_verified_range("one",0,3,&mut out),Err(FsError::InvalidVolume));
+        assert_eq!(&out,b"ell");
+    }
+    #[test]fn ws54_rename_preserves_data_and_denies_collision(){
+        let mut fs=fs();fs.create("old",b"ok").unwrap();fs.create("taken",b"x").unwrap();
+        assert_eq!(fs.rename_file("old","taken"),Err(FsError::Exists));
+        assert_eq!(fs.file_size("old"),Ok(2));
+        fs.rename_file("old","new").unwrap();
+        assert_eq!(fs.file_size("old"),Err(FsError::NotFound));
+        let mut out=[0u8;2];
+        assert_eq!(fs.read("new",&mut out),Ok(2));assert_eq!(&out,b"ok");
+    }
+}
