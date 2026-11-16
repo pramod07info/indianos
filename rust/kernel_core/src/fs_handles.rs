@@ -1496,7 +1496,13 @@ pub fn selected_path_operation_on_device<D:BlockDevice>(
     if matches!(action,3|5|11){scratch[..used].copy_from_slice(&buffer[..used]);}
     let outcome=match action{
         1=>volume.mkdir_as(credentials,path,0o755).map(|_|0),
+        2=>volume.rmdir_as(credentials,path).map(|_|0),
         3=>volume.create_as(credentials,path,&scratch[..used],0o644).map(|_|0),
+        // Run the credential checks at the VFS operation boundary as well
+        // as selected-mount admission; no raw dispatch bypass for names.
+        7=>volume.rename_file_as(credentials,path,target).map(|_|0),
+        8=>volume.list_dir_as(credentials,path,&mut scratch[..buffer.len()]),
+        9=>volume.rename_dir_as(credentials,path,target).map(|_|0),
         10=>volume.read_at(path,offset,&mut scratch[..buffer.len()]),
         11=>volume.write_at(path,offset,&scratch[..used]),
         _=>volume.dispatch(action,path,target,&mut scratch[..buffer.len()],used),
@@ -3307,6 +3313,39 @@ mod r106_checked_partition_authenticated_file_api_tests{
  }
 
 
+ #[test]fn m1_gate12_selected_syscall_dir_rename_and_reboot_is_owner_scoped(){
+  let (mut disk,receipt)=disk();
+  let mut table=FileHandles::new();
+  prepare_selected_volume_kernel(&mut table,&mut disk,receipt).unwrap();
+  let admin=table.bind_process(1).unwrap();
+  let guest=table.bind_process(2).unwrap();
+  selected_path_operation_on_device(&mut table,admin,1,"/shared/tmp",
+    "",0,&mut[],0,&mut disk).unwrap();
+  selected_path_operation_on_device(&mut table,admin,3,"/shared/tmp/file",
+    "",0,&mut b"saved".to_vec(),5,&mut disk).unwrap();
+  let before=(disk.reads,disk.writes);
+  assert_eq!(selected_path_operation_on_device(&mut table,guest,9,
+    "/shared/tmp","/shared/new",0,&mut[],0,&mut disk),
+    Err(FsError::InvalidName));
+  assert_eq!((disk.reads,disk.writes),before);
+  assert_eq!(selected_path_operation_on_device(&mut table,admin,9,
+    "/shared/tmp","/shared/new",0,&mut[],0,&mut disk),Ok(0));
+  let mut out=[0u8;32];
+  assert_eq!(selected_path_operation_on_device(&mut table,guest,4,
+    "/shared/new/file","",0,&mut out,0,&mut disk),Ok(5));
+  assert_eq!(&out[..5],b"saved");
+  assert_eq!(selected_path_operation_on_device(&mut table,guest,4,
+    "/shared/tmp/file","",0,&mut out,0,&mut disk),Err(FsError::NotFound));
+  let mut reboot=FileHandles::new();
+  prepare_selected_volume_kernel(&mut reboot,&mut disk,receipt).unwrap();
+  let guest_after=reboot.bind_process(2).unwrap();
+  assert_eq!(selected_path_operation_on_device(&mut reboot,guest_after,4,
+    "/shared/new/file","",0,&mut out,0,&mut disk),Ok(5));
+  assert_eq!(&out[..5],b"saved");
+  assert_eq!(selected_path_operation_on_device(&mut reboot,guest_after,8,
+    "/shared/new","",0,&mut out,0,&mut disk),Ok(7));
+  assert_eq!(&out[..7],b"f:file\n");
+ }
  #[test]fn g7_selected_authentication_io_failure_revokes_handles_and_quarantines_volume(){
   // First measure only the healthy mount's reads. Trigger a disk error on
   // the very next metadata read, which is performed by VFS authorization.

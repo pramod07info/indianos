@@ -231,6 +231,16 @@ pub fn require_onlink_gateway(lease:Lease)->Result<Lease,NetworkError>{
  if mask==0||router==0||host==router||(host&mask)!=(router&mask){
   return Err(NetworkError::Malformed);
  }
+ // Ordinary subnets (three or more addresses) reserve all-zero and
+ // all-one host identifiers. /31 point-to-point subnets are different.
+ let host_mask=!mask;
+ if host_mask>1 {
+  let network=host&mask;
+  let broadcast=network|host_mask;
+  if host==network||host==broadcast||router==network||router==broadcast{
+   return Err(NetworkError::Malformed);
+  }
+ }
  Ok(lease)
 }
 /// WS46: Verify fixed BOOTP identity and exactly one DHCP ACK/server-ID
@@ -243,6 +253,8 @@ pub fn parse_verified_ack(packet:&[u8],expected_xid:u32,
   return Err(NetworkError::Malformed);
  }
  let addr:[u8;4]=packet[16..20].try_into().map_err(|_|NetworkError::Malformed)?;
+ // yiaddr is untrusted DHCP input; reject loopback/multicast/reserved leases.
+ require_ipv4_unicast(addr)?;
  let options=&packet[236..];
  let lease=parse_lease(addr,options)?;
  let mut at=4;let mut ack=false;let mut server=false;
@@ -258,9 +270,10 @@ pub fn parse_verified_ack(packet:&[u8],expected_xid:u32,
    ack=true;
   }
   if kind==54 {
-   if server||size!=4||&options[at..at+4]==[0u8;4].as_slice(){
-    return Err(NetworkError::Malformed);
-   }
+   if server||size!=4{return Err(NetworkError::Malformed);}
+   let server_id:[u8;4]=options[at..at+4].try_into()
+    .map_err(|_|NetworkError::Malformed)?;
+   require_ipv4_unicast(server_id)?;
    server=true;
   }
   at+=size;
@@ -305,6 +318,12 @@ mod pr782_ws45_47_tests {
    Err(NetworkError::Malformed));
   assert_eq!(require_onlink_gateway(Lease{gateway:l.address,..l}),
    Err(NetworkError::Malformed));
+  assert_eq!(require_onlink_gateway(Lease{address:[192,168,1,0],..l}),
+   Err(NetworkError::Malformed));
+  assert_eq!(require_onlink_gateway(Lease{address:[192,168,1,255],..l}),
+   Err(NetworkError::Malformed));
+  assert_eq!(require_onlink_gateway(Lease{gateway:[192,168,1,255],..l}),
+   Err(NetworkError::Malformed));
  }
  fn ack()->[u8;268]{
   let mut p=[0u8;268];p[0]=2;p[1]=1;p[2]=6;
@@ -326,6 +345,12 @@ mod pr782_ws45_47_tests {
    Err(NetworkError::Malformed));
   let mut invalid=packet;invalid[242]=3;
   assert_eq!(parse_verified_ack(&invalid,42,[1,2,3,4,5,6]),
+   Err(NetworkError::Malformed));
+  let mut bad_yiaddr=packet;bad_yiaddr[16..20].copy_from_slice(&[224,0,0,1]);
+  assert_eq!(parse_verified_ack(&bad_yiaddr,42,[1,2,3,4,5,6]),
+   Err(NetworkError::Malformed));
+  let mut bad_server=packet;bad_server[245..249].copy_from_slice(&[127,0,0,1]);
+  assert_eq!(parse_verified_ack(&bad_server,42,[1,2,3,4,5,6]),
    Err(NetworkError::Malformed));
  }
  #[test]fn ws47_wrong_peer_cannot_establish_connection(){

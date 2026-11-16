@@ -471,9 +471,16 @@ pub fn rename_stays_within_tree(source:&str,destination:&str,root:&str)
         return Ok(false);
     }
     let mut original=[0u8;256];let mut target=[0u8;256];
+    let mut boundary=[0u8;256];
     let a=normalize_absolute(source,&mut original)?;
     let b=normalize_absolute(destination,&mut target)?;
-    Ok(a>1&&b>1&&original[..a]!=target[..b])
+    let r=normalize_absolute(root,&mut boundary)?;
+    // Containment is not sufficient for rename: the namespace's own
+    // directory must never be moved or replaced by a child pathname.
+    let source_is_root=a==r&&original[..a]==boundary[..r];
+    let target_is_root=b==r&&target[..b]==boundary[..r];
+    Ok(a>1&&b>1&&!source_is_root&&!target_is_root&&
+        original[..a]!=target[..b])
 }
 /// WS70: Replace a canonical basename without flattening ancestors.
 /// The existing validated parent and proposed child must both fit, and
@@ -502,6 +509,10 @@ mod pr782_ws68_70_tests{
         assert_eq!(rename_stays_within_tree("//shared/one","/shared/two","/shared"),Ok(true));
         assert_eq!(rename_stays_within_tree("/shared/one","/shared/./one","/shared"),Ok(false));
         assert_eq!(rename_stays_within_tree("/shared/one","/sharedness/two","/shared"),Ok(false));
+        assert_eq!(rename_stays_within_tree("/shared","/shared/one","/shared"),Ok(false));
+        assert_eq!(rename_stays_within_tree("/shared/one","/shared","/shared"),Ok(false));
+        assert_eq!(rename_stays_within_tree("//shared/./","/shared/one","/shared"),Ok(false));
+        assert_eq!(rename_stays_within_tree("/","/shared/one","/"),Ok(false));
         assert_eq!(rename_stays_within_tree("/shared/one","/shared/../system/x","/shared"),
             Err(PathError::ParentTraversal));
         assert_eq!(rename_stays_within_tree("/shared/one","/shared\\bad","/shared"),

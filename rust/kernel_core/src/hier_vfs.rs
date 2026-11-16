@@ -181,6 +181,19 @@ impl<D:BlockDevice> HierVfs<D>{
  }
  pub fn read_as(&mut self,credentials:Credentials,path:&str,out:&mut[u8])
   ->Result<usize,FsError>{self.authorize_access(credentials,path,READ)?;self.read(path,out)}
+ /// Listing a directory requires read+search at the selected directory
+ /// and search on all ancestors. Caller credentials come from the kernel.
+ pub fn list_dir_as(&mut self,credentials:Credentials,path:&str,out:&mut[u8])
+  ->Result<usize,FsError>{
+  self.authorize_access(credentials,path,READ|SEARCH)?;
+  self.list_dir(path,out)
+ }
+ /// Read an authenticated symlink's text without resolving the target.
+ pub fn readlink_as(&mut self,credentials:Credentials,path:&str,out:&mut[u8])
+  ->Result<usize,FsError>{
+  self.authorize_access(credentials,path,READ)?;
+  self.readlink(path,out)
+ }
  pub fn write_at_as(&mut self,credentials:Credentials,path:&str,offset:u64,data:&[u8])
   ->Result<usize,FsError>{self.authorize_access(credentials,path,WRITE)?;self.write_at(path,offset,data)}
  pub fn unlink_as(&mut self,credentials:Credentials,path:&str)->Result<(),FsError>{
@@ -190,6 +203,47 @@ impl<D:BlockDevice> HierVfs<D>{
   ->Result<(),FsError>{
   self.authorize_parent(credentials,source)?;self.authorize_parent(credentials,target)?;
   self.authorize_access(credentials,source,0)?;self.rename_file(source,target)
+ }
+ /// Authenticated directory rename. Both source and destination parent
+ /// directories must be writable/searchable, including their ancestors.
+ /// Existing no-follow directory and subtree-cycle checks remain mandatory.
+ pub fn rename_dir_as(&mut self,credentials:Credentials,source:&str,target:&str)
+  ->Result<(),FsError>{
+  self.authorize_parent(credentials,source)?;
+  self.authorize_parent(credentials,target)?;
+  self.authorize_access(credentials,source,0)?;
+  self.rename_dir(source,target)
+ }
+ /// Refuse directory removal unless the caller controls its parent.
+ pub fn rmdir_as(&mut self,credentials:Credentials,path:&str)
+  ->Result<(),FsError>{
+  self.authorize_parent(credentials,path)?;
+  self.authorize_access(credentials,path,0)?;
+  self.rmdir(path)
+ }
+ /// Publish a symlink with the creator's trusted credential in the same
+ /// COW checkpoint as its payload, never via an unrestricted legacy entry.
+ /// Symlinks are never resolved automatically during authorization.
+ pub fn symlink_as(&mut self,credentials:Credentials,path:&str,target:&str)
+  ->Result<(),FsError>{
+  self.authorize_parent(credentials,path)?;
+  let link=checked(path,Kind::Symlink)?;
+  self.parents(&link)?;
+  if self.conflicting(link.path(),Kind::Symlink)?{return Err(FsError::Exists);}
+  let mut canonical=[0u8;MAX_TRANSFER];
+  let n=normalize_absolute(target,&mut canonical).map_err(|_|FsError::InvalidName)?;
+  if canonical[..n]!=target.as_bytes()[..]||link.path()==target{
+   return Err(FsError::InvalidName);
+  }
+  self.fs.create_owned_path(link.name(),&canonical[..n],credentials,0o777)
+ }
+ /// Removing a symlink checks its own directory permissions. The linked
+ /// target is never followed, inspected or modified by this operation.
+ pub fn unlink_symlink_as(&mut self,credentials:Credentials,path:&str)
+  ->Result<(),FsError>{
+  self.authorize_parent(credentials,path)?;
+  self.authorize_access(credentials,path,0)?;
+  self.unlink_symlink(path)
  }
  fn contradictory_alias(&self,p:&Path)->bool{
   let mut own=false;let mut other=false;
@@ -565,6 +619,88 @@ mod tests{
  }
  fn fresh()->HierVfs<Disk>{
   HierVfs::format_blank(Disk{blocks:[[0;SECTOR_BYTES];COUNT],writes:0,tear:None}).unwrap()
+ }
+ #[test]
+ fn m1_gate12_authenticated_listing_and_readlink_isolate_owner_and_remount(){
+  let root=Credentials::kernel(0,0);
+  let alice=Credentials::kernel(100,7);
+  let bob=Credentials::kernel(200,8);
+  let mut fs=fresh();
+  fs.mkdir_as(root,"/home",0o777).unwrap();
+  fs.mkdir_as(alice,"/home/alice",0o700).unwrap();
+  fs.create_as(alice,"/home/alice/n",b"payload",0o600).unwrap();
+  fs.symlink_as(alice,"/home/alice/link","/private").unwrap();
+  let original_generation=fs.generation();
+  let mut out=[0x5au8;MAX_TRANSFER];
+  assert!(fs.list_dir_as(bob,"/home/alice",&mut out).is_err());
+  assert_eq!(out,[0x5a;MAX_TRANSFER]);
+  assert!(fs.readlink_as(bob,"/home/alice/link",&mut out).is_err());
+  assert_eq!(out,[0x5a;MAX_TRANSFER]);
+  let n=fs.list_dir_as(alice,"/home/alice",&mut out).unwrap();
+  assert_eq!(n,11);
+  assert!(out[..n].windows(4).any(|line|line==b"f:n\n"));
+  assert!(out[..n].windows(7).any(|line|line==b"l:link\n"));
+  let n=fs.readlink_as(alice,"/home/alice/link",&mut out).unwrap();
+  assert_eq!(&out[..n],b"/private");
+  assert_eq!(fs.generation(),original_generation);
+  let mut reboot=HierVfs::mount_consistent_recovery(fs.into_device()).unwrap();
+  assert_eq!(reboot.readlink_as(alice,"/home/alice/link",&mut out),Ok(8));
+  assert_eq!(&out[..8],b"/private");
+  assert!(reboot.list_dir_as(bob,"/home/alice",&mut out).is_err());
+ }
+ #[test]
+ fn m1_gate11_authenticated_directory_move_persists_and_blocks_cross_owner(){
+  let root=Credentials::kernel(0,0);
+  let alice=Credentials::kernel(100,7);
+  let bob=Credentials::kernel(200,8);
+  let mut fs=fresh();
+  fs.mkdir_as(root,"/home",0o777).unwrap();
+  fs.mkdir_as(root,"/private",0o700).unwrap();
+  fs.mkdir_as(alice,"/home/work",0o700).unwrap();
+  fs.mkdir_as(alice,"/home/work/docs",0o700).unwrap();
+  fs.create_as(alice,"/home/work/docs/a",b"saved",0o600).unwrap();
+  let generation=fs.generation();
+  assert!(fs.rename_dir_as(bob,"/home/work/docs","/private/docs").is_err());
+  assert!(fs.rename_dir_as(alice,"/home/work/docs","/private/docs").is_err());
+  assert!(fs.rename_dir_as(alice,"/home/work","/home/work/loop").is_err());
+  assert_eq!(fs.generation(),generation);
+  fs.rename_dir_as(alice,"/home/work/docs","/home/work/new").unwrap();
+  let mut out=[0u8;16];
+  assert_eq!(fs.read_as(alice,"/home/work/new/a",&mut out),Ok(5));
+  assert_eq!(&out[..5],b"saved");
+  assert_eq!(fs.read_as(alice,"/home/work/docs/a",&mut out),Err(FsError::NotFound));
+  let mut reboot=HierVfs::mount_consistent_recovery(fs.into_device()).unwrap();
+  assert_eq!(reboot.read_as(alice,"/home/work/new/a",&mut out),Ok(5));
+  assert_eq!(&out[..5],b"saved");
+  assert_eq!(reboot.rmdir_as(alice,"/home/work/new"),Err(FsError::Full));
+  assert_eq!(reboot.unlink_as(alice,"/home/work/new/a"),Ok(()));
+  assert_eq!(reboot.rmdir_as(alice,"/home/work/new"),Ok(()));
+ }
+ #[test]
+ fn m1_gate11_owned_symlink_never_traverses_target_and_denies_cross_owner(){
+  let root=Credentials::kernel(0,0);
+  let alice=Credentials::kernel(100,7);
+  let bob=Credentials::kernel(200,8);
+  let mut fs=fresh();
+  fs.mkdir_as(root,"/home",0o777).unwrap();
+  fs.mkdir_as(root,"/private",0o700).unwrap();
+  fs.mkdir_as(alice,"/home/work",0o700).unwrap();
+  let generation=fs.generation();
+  assert!(fs.symlink_as(bob,"/home/work/link","/private").is_err());
+  assert_eq!(fs.symlink_as(alice,"/home/work/link","/private/../keys"),
+   Err(FsError::InvalidName));
+  assert_eq!(fs.generation(),generation);
+  fs.symlink_as(alice,"/home/work/link","/private").unwrap();
+  let permission=fs.permissions("/home/work/link").unwrap();
+  assert_eq!((permission.owner,permission.group),(100,7));
+  assert_eq!(fs.read_as(alice,"/home/work/link",&mut [0u8;16]),
+   Err(FsError::NotFound));
+  assert!(fs.unlink_symlink_as(bob,"/home/work/link").is_err());
+  assert_eq!(fs.unlink_symlink_as(alice,"/home/work/link"),Ok(()));
+  let mut reboot=HierVfs::mount_consistent_recovery(fs.into_device()).unwrap();
+  assert_eq!(reboot.readlink("/home/work/link",&mut [0u8;16]),
+   Err(FsError::NotFound));
+  assert_eq!(reboot.permissions("/private").unwrap().owner,0);
  }
  #[test]fn healthy_admission_rejects_checksummed_inconsistent_namespaces_without_writes(){
   struct Inspect<'a>(&'a mut Disk);
