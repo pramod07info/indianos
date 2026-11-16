@@ -89,7 +89,14 @@ pub fn scan<C:CpuProbe,P:BridgeProbe>(
        .read_bridge_buses(bus,slot,function).map_err(Error::Pci)?;
      // A PCI bridge can be physically present but unconfigured; bus 0
      // means no subordinate is reachable yet. Do not crash early boot.
-     if secondary==0{continue;}
+     if secondary==0{
+      // Only a genuinely disabled bridge (no secondary/subordinate range)
+      // may be skipped; inconsistent routing registers are malformed.
+      if subordinate!=0 || (primary!=0 && primary!=bus) {
+       return Err(Error::MalformedBridge);
+      }
+      continue;
+     }
      if primary!=bus||secondary<=bus||subordinate<secondary
       ||subordinate>ceilings[current]{
       return Err(Error::MalformedBridge);
@@ -243,6 +250,17 @@ mod tests{
    }
    Ok(self.devices[bus as usize][slot as usize].1)
   }
+ }
+ #[test]fn disabled_bridge_must_not_publish_a_partial_bus_window(){
+  let mut bad=Mock::new();
+  bad.add(0,1,6,4,1,(0,0,2));
+  assert!(matches!(scan(&Cpu,&mut bad),Err(Error::MalformedBridge)));
+  let mut bad=Mock::new();
+  bad.add(0,1,6,4,1,(9,0,0));
+  assert!(matches!(scan(&Cpu,&mut bad),Err(Error::MalformedBridge)));
+  let mut disabled=Mock::new();
+  disabled.add(0,1,6,4,1,(0,0,0));
+  assert!(scan(&Cpu,&mut disabled).is_ok());
  }
  #[test]fn hd1_gpu_on_secondary_bus_and_npu_on_nested_bus(){
   let mut mock=Mock::new();

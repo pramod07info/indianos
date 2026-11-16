@@ -102,6 +102,17 @@ impl NicRxFence {
     pub fn drained(&self,receipt:QuiesceReceipt)->Result<bool,RxFenceError>{
         Ok(self.admitted_in_flight(receipt)?==0)
     }
+    /// BSP-only bounded software drain probe. Polls never authorize DMA
+    /// shutdown; driver must mask interrupts and stop hardware independently.
+    pub fn wait_drained_bounded(&self,receipt:QuiesceReceipt,probes:u32)
+        ->Result<(),RxFenceError>{
+        if self.drained(receipt)?{return Ok(());}
+        for _ in 0..probes{
+            core::hint::spin_loop();
+            if self.drained(receipt)?{return Ok(());}
+        }
+        Err(RxFenceError::Busy)
+    }
     /// Resumption rejects an invalid/stale receipt and any in-flight
     /// handler; epoch never wraps and invalidates every former RxPermit.
     pub fn finish_rebind(&self,receipt:QuiesceReceipt)
@@ -296,4 +307,20 @@ mod r123_rx_drain_visibility_tests {
         assert_eq!(f.finish_rebind(receipt),Ok(2));
         assert_eq!(f.admitted_in_flight(receipt),Err(RxFenceError::Stale));
     }
+}
+
+#[cfg(test)]
+mod m1_ws16_bounded_nic_drain_tests {
+ use super::*;
+ #[test] fn busy_ring_stays_quiesced_until_software_permit_drops() {
+  let nic=NicRxFence::new(10);
+  let pending=nic.try_admit(10).unwrap();
+  let receipt=nic.begin_quiesce(10).unwrap();
+  assert_eq!(nic.wait_drained_bounded(receipt,0),Err(RxFenceError::Busy));
+  assert_eq!(nic.wait_drained_bounded(receipt,2),Err(RxFenceError::Busy));
+  drop(pending);
+  assert_eq!(nic.wait_drained_bounded(receipt,0),Ok(()));
+  assert_eq!(nic.finish_rebind(receipt),Ok(2));
+  assert_eq!(nic.wait_drained_bounded(receipt,0),Err(RxFenceError::Stale));
+ }
 }

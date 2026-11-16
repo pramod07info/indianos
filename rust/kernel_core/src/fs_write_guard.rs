@@ -46,6 +46,9 @@ impl WriteGuard{
   let mut canonical=[0u8;64];
   let n=normalize_absolute(path,&mut canonical).map_err(|_|Error::InvalidPath)?;
   let name=&canonical[..n];
+  // Some compatibility surfaces treat backslash as a separator; deny it
+  // here rather than accidentally permitting a protected-directory alias.
+  if name.contains(&b'\\'){return Err(Error::InvalidPath);}
   if PROTECTED.iter().any(|p|{
    name==*p||(name.starts_with(p)&&name.get(p.len())==Some(&b'/'))
   }){
@@ -97,7 +100,7 @@ mod security_tests{
  }
  #[test]fn security_traversal_nul_and_invalid_names_fail_closed(){
   for path in ["/system/../etc/note","/etc/../../system",
-   "system/file","/etc/\0evil",""]{
+   "system/file","/etc/\0evil","/shared\\..\\boot\\file",""]{
    assert_eq!(WriteGuard::allow_path(path),Err(Error::InvalidPath));
   }
  }

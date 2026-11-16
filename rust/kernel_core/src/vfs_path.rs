@@ -410,3 +410,33 @@ mod r123_namespace_child_tests {
         assert_eq!(join_child_under_root("/docs","/other","note",&mut out),Ok(None));
     }
 }
+
+/// Copy the final canonical component; root has no basename. This helper
+/// returns a byte count and never changes output on a rejected pathname.
+pub fn copy_basename(path:&str,out:&mut[u8])->Result<usize,PathError>{
+ let mut normalized=[0u8;256];
+ let n=normalize_absolute(path,&mut normalized)?;
+ if n==1{return Err(PathError::Empty);}
+ let start=normalized[..n].iter().rposition(|&b|b==b'/')
+     .ok_or(PathError::Relative)?+1;
+ let len=n-start;
+ if len>out.len(){return Err(PathError::OutputTooSmall);}
+ out[..len].copy_from_slice(&normalized[start..n]);
+ Ok(len)
+}
+#[cfg(test)]
+mod m1_ws13_basename_tests {
+ use super::*;
+ #[test] fn basename_is_canonical_and_output_atomic() {
+  let mut out=[0xa5;16];
+  assert_eq!(copy_basename("//a///./notes/",&mut out),Ok(5));
+  assert_eq!(&out[..5],b"notes");
+  let before=out;
+  assert_eq!(copy_basename("/",&mut out),Err(PathError::Empty));
+  assert_eq!(copy_basename("/a/../secret",&mut out),Err(PathError::ParentTraversal));
+  assert_eq!(out,before);
+  let mut small=[0x55;2];
+  assert_eq!(copy_basename("/abc",&mut small),Err(PathError::OutputTooSmall));
+  assert_eq!(small,[0x55;2]);
+ }
+}

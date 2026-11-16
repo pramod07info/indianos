@@ -29,7 +29,39 @@ impl<D:BlockDevice> TinyFs<D> {
         if &header[..8]!=MAGIC || disk.sector_count()<3 ||
             u32::from_le_bytes(header[8..12].try_into().unwrap()) as u64 != disk.sector_count() ||
             header[12..].iter().any(|&v|v!=0) {return Err(FsError::InvalidVolume);}
-        Ok(Self{disk})
+        let mut fs=Self{disk};
+        fs.validate_directory()?;
+        Ok(fs)
+    }
+    /// Reject malformed persisted metadata before exposing any directory entries.
+    /// This prototype still has no journal or power-loss atomicity.
+    fn validate_directory(&mut self)->Result<(),FsError>{
+        let dir=self.directory()?;
+        for i in 0..ENTRIES{
+            let e=&dir[i*ENTRY_BYTES..(i+1)*ENTRY_BYTES];
+            if e[0]==0{
+                if e.iter().any(|&v|v!=0){return Err(FsError::InvalidVolume);}
+                continue;
+            }
+            let len=e[..NAME_BYTES].iter().position(|&v|v==0)
+                .ok_or(FsError::InvalidVolume)?;
+            if len==0 || core::str::from_utf8(&e[..len]).is_err() ||
+                e[..len].iter().any(|&v|v<0x20||v==b'/'||v==b'\\') ||
+                e[NAME_BYTES+4..].iter().any(|&v|v!=0) ||
+                (i as u64+2)>=self.disk.sector_count(){
+                return Err(FsError::InvalidVolume);
+            }
+            let size=u32::from_le_bytes(e[NAME_BYTES..NAME_BYTES+4]
+                .try_into().map_err(|_|FsError::InvalidVolume)?);
+            if size as usize>SECTOR_BYTES {return Err(FsError::InvalidVolume);}
+            for earlier in 0..i{
+                let other=&dir[earlier*ENTRY_BYTES..(earlier+1)*ENTRY_BYTES];
+                if other[0]!=0&&other[..NAME_BYTES]==e[..NAME_BYTES]{
+                    return Err(FsError::InvalidVolume);
+                }
+            }
+        }
+        Ok(())
     }
     fn name(name:&str)->Result<&[u8],FsError>{
         let bytes=name.as_bytes();
@@ -134,6 +166,22 @@ mod tests {
         }
     }
     fn disk()->Disk{Disk{sectors:[[0;SECTOR_BYTES];5]}}
+    #[test] fn corrupt_directory_and_duplicate_name_deny_mount(){
+        let mut fs=TinyFs::format(disk()).unwrap();
+        fs.create("a",b"data").unwrap();
+        fs.disk.sectors[1][NAME_BYTES..NAME_BYTES+4]
+            .copy_from_slice(&(513u32).to_le_bytes());
+        assert!(matches!(TinyFs::mount(fs.into_device()),Err(FsError::InvalidVolume)));
+        let mut fs=TinyFs::format(disk()).unwrap();
+        fs.create("a",b"x").unwrap();fs.create("b",b"y").unwrap();
+        fs.disk.sectors[1][ENTRY_BYTES..ENTRY_BYTES+NAME_BYTES]
+            .copy_from_slice(&{let mut name=[0u8;NAME_BYTES];name[0]=b'a';name});
+        assert!(matches!(TinyFs::mount(fs.into_device()),Err(FsError::InvalidVolume)));
+        let mut fs=TinyFs::format(disk()).unwrap();
+        fs.create("a",b"x").unwrap();
+        fs.disk.sectors[1][0]=b'/';
+        assert!(matches!(TinyFs::mount(fs.into_device()),Err(FsError::InvalidVolume)));
+    }
     #[test] fn lifecycle_and_remount(){
         assert!(matches!(TinyFs::mount(disk()),Err(FsError::InvalidVolume)));
         let mut fs=TinyFs::format(disk()).unwrap();

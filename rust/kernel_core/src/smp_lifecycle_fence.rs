@@ -163,6 +163,13 @@ impl LifecycleFence {
         }
         Err(FenceError::NoProgress)
     }
+    /// Fail closed unless the exact AP generation has acknowledged cleanup.
+    /// Caller must still arrange real TLB shootdown/IPI where required.
+    pub fn require_ack_for_reclaim(&self,cpu:u32,receipt:Receipt)
+        ->Result<(),FenceError>{
+        if self.acknowledged(cpu,receipt)?{Ok(())}
+        else{Err(FenceError::NoProgress)}
+    }
     /// BSP cannot treat an ack for an earlier generation as the current one.
     pub fn acknowledged(
         &self,cpu:u32,receipt:Receipt
@@ -436,4 +443,22 @@ mod r123_bsp_pending_receipt_tests {
         assert_eq!(f.pending_receipt(0),Ok(Some(second)));
         assert_eq!(f.acknowledged(0,first),Err(FenceError::StaleReceipt));
     }
+}
+
+#[cfg(test)]
+mod m1_ws17_reclaim_ack_tests {
+ use super::*;
+ #[test] fn memory_reclaim_never_accepts_pending_or_replayed_ap_ack() {
+  let fence=LifecycleFence::new(0,1);
+  assert_eq!(fence.require_ack_for_reclaim(0,Receipt{sequence:0,generation:0}),
+      Err(FenceError::StaleReceipt));
+  let r=fence.publish(0,5).unwrap();
+  assert_eq!(fence.require_ack_for_reclaim(0,r),Err(FenceError::NoProgress));
+  assert_eq!(fence.require_ack_for_reclaim(1,r),Err(FenceError::InvalidCpu));
+  fence.observe_and_ack(1,0).unwrap();
+  assert_eq!(fence.require_ack_for_reclaim(0,r),Ok(()));
+  let next=fence.publish(0,6).unwrap();
+  assert_eq!(fence.require_ack_for_reclaim(0,r),Err(FenceError::StaleReceipt));
+  assert_eq!(fence.require_ack_for_reclaim(0,next),Err(FenceError::NoProgress));
+ }
 }

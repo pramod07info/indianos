@@ -110,6 +110,20 @@ impl<const CAPACITY: usize> Registry<CAPACITY> {
         Ok(())
     }
 
+    /// Revoke just the matching authenticated owner's resource tickets.
+    /// A peer's grants for the same resource are never modified.
+    pub fn revoke_owner_resource(&mut self,owner:u32,resource:u64)
+        ->Result<usize,CapabilityError>{
+        if owner==0{return Err(CapabilityError::InvalidOwner);}
+        let mut count=0;
+        for slot in &mut self.entries{
+            if slot.as_ref().is_some_and(|e|e.owner==owner&&e.resource==resource){
+                *slot=None;
+                count+=1;
+            }
+        }
+        Ok(count)
+    }
     /// Drop all capabilities for a terminated process without touching peers.
     pub fn revoke_all(&mut self, owner: u32) -> usize {
         if owner == 0 { return 0; }
@@ -479,4 +493,22 @@ mod r120_exact_generation_registration_tests {
         assert_eq!(r.active_generation(1),Some(12));
         assert_eq!(r.start_exact(3,13),Err(EpochError::Full));
     }
+}
+
+#[cfg(test)]
+mod m1_ws12_exact_resource_revoke_tests {
+ use super::*;
+ #[test] fn revoke_one_resource_is_owner_scoped_and_tokens_never_reused() {
+  let mut r=Registry::<4>::new();
+  let a=r.grant(1,7,1).unwrap();
+  let b=r.grant(1,8,1).unwrap();
+  let peer=r.grant(2,7,1).unwrap();
+  assert_eq!(r.revoke_owner_resource(0,7),Err(CapabilityError::InvalidOwner));
+  assert_eq!(r.revoke_owner_resource(1,7),Ok(1));
+  assert_eq!(r.revoke_owner_resource(1,7),Ok(0));
+  assert_eq!(r.lookup(a),None);
+  assert_eq!(r.authorize(1,b,8,1),Ok(()));
+  assert_eq!(r.authorize(2,peer,7,1),Ok(()));
+  assert!(r.grant(1,7,1).unwrap()>peer);
+ }
 }

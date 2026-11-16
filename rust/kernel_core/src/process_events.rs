@@ -90,6 +90,24 @@ impl<const CAPACITY: usize> ProcessEvents<CAPACITY> {
         self.dequeue().ok()
     }
 
+    /// Copy an ordered, immutable receipt snapshot without consuming events.
+    /// Insufficient space or a malformed entry leaves the caller buffer intact.
+    pub fn snapshot_receipts(&self,out:&mut[EventReceipt])
+        ->Result<usize,EventError>{
+        if out.len()<self.count{return Err(EventError::Full);}
+        for i in 0..self.count{
+            let index=(self.head+i)%CAPACITY;
+            if self.entries[index].is_none()||self.sequences[index]==0{
+                return Err(EventError::Empty);
+            }
+        }
+        for i in 0..self.count{
+            let index=(self.head+i)%CAPACITY;
+            out[i]=EventReceipt{sequence:self.sequences[index],
+                event:self.entries[index].ok_or(EventError::Empty)?};
+        }
+        Ok(self.count)
+    }
     pub fn dequeue(&mut self) -> Result<ProcessEvent, EventError> {
         if self.count == 0 { return Err(EventError::Empty); }
         let event = self.entries[self.head].take().ok_or(EventError::Empty)?;
@@ -1207,4 +1225,29 @@ mod r120_fault_receipt_tests {
         assert_eq!(events.enqueue_fault_once(1, 1), Err(EventError::Full));
         assert_eq!(events.len(), 0);
     }
+}
+
+#[cfg(test)]
+mod m1_ws14_receipt_snapshot_tests {
+ use super::*;
+ #[test] fn snapshot_preserves_fifo_identity_after_wrap_and_capacity_failure() {
+  let mut q=ProcessEvents::<2>::new();
+  let e=|pid|ProcessEvent{pid,kind:EventKind::Message,value:pid as u64};
+  q.enqueue(e(1)).unwrap();q.enqueue(e(2)).unwrap();
+  let first=q.peek_receipt().unwrap();
+  q.dequeue().unwrap();q.enqueue(e(3)).unwrap();
+  let sentinel=EventReceipt{sequence:0,event:e(99)};
+  let mut short=[sentinel;1];
+  assert_eq!(q.snapshot_receipts(&mut short),Err(EventError::Full));
+  assert_eq!(short,[sentinel]);
+  let mut all=[sentinel;2];
+  assert_eq!(q.snapshot_receipts(&mut all),Ok(2));
+  assert_eq!((all[0].event.pid,all[1].event.pid),(2,3));
+  assert!(all[0].sequence>first.sequence);
+  assert_eq!(q.acknowledge_receipt(first),None);
+  assert_eq!(q.acknowledge_receipt(all[0]),Some(e(2)));
+  assert_eq!(q.peek_receipt(),Some(all[1]));
+  let none=ProcessEvents::<0>::new();
+  assert_eq!(none.snapshot_receipts(&mut []),Ok(0));
+ }
 }

@@ -23,6 +23,11 @@ impl RetirementGate {
     }
     /// No spinning or nested ownership. Lifetime of returned permit scopes
     /// exclusive coordinator and UDP-queue access.
+    /// Validate an exact live BSP permit before touching protected tables.
+    /// A same-CPU permit issued by a distinct gate is never authority.
+    pub fn permit_is_current(&self,permit:&Permit<'_>)->bool{
+        core::ptr::eq(self,permit.gate)&&self.held.load(Ordering::Acquire)
+    }
     pub fn try_enter(&self,cpu:u32,masked:bool)->Result<Permit<'_>,GateError>{
         if !masked{return Err(GateError::InterruptsEnabled);}
         let bsp=self.bsp.load(Ordering::Acquire);
@@ -139,4 +144,17 @@ mod r118_host_concurrency_regressions {
         assert_eq!(active.load(HostOrdering::SeqCst),0);
         assert!(admitted.load(HostOrdering::SeqCst)>0);
     }
+}
+
+#[cfg(test)]
+mod m1_ws15_gate_identity_tests {
+ use super::*;
+ #[test] fn permit_never_transfers_to_foreign_gate_on_same_cpu() {
+  let a=RetirementGate::new();let b=RetirementGate::new();
+  a.register_bsp(3,true).unwrap();b.register_bsp(3,true).unwrap();
+  let permit=a.try_enter(3,true).unwrap();
+  assert!(a.permit_is_current(&permit));
+  assert!(!b.permit_is_current(&permit));
+  assert!(matches!(a.try_enter(3,true),Err(GateError::Reentrant)));
+ }
 }
