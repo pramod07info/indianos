@@ -13,7 +13,10 @@ impl<const N:usize> Queue<N>{
         ->Result<(),NvmeError>{
         if epoch==0||epoch!=self.epoch{return Err(NvmeError::Stale);}
         if N>MAX_QUEUE_DEPTH||req.namespace_id==0||req.blocks==0||
-            req.dma_address==0||req.dma_address%4096!=0{return Err(NvmeError::Invalid);}
+            req.dma_address==0||req.dma_address%4096!=0||
+            req.dma_address.checked_add(u64::from(req.blocks)*512).is_none(){
+            return Err(NvmeError::Invalid);
+        }
         if req.lba>=namespace_blocks||
             u64::from(req.blocks)>namespace_blocks-req.lba{
             return Err(NvmeError::OutOfBounds);
@@ -30,6 +33,11 @@ impl<const N:usize> Queue<N>{
             e.is_some_and(|request|request.command_id==id))
             .ok_or(NvmeError::NotFound)?;
         slot.take().ok_or(NvmeError::NotFound)
+    }
+    /// Count only live commands for an authenticated controller epoch.
+    pub fn outstanding(&self,epoch:u64)->Result<usize,NvmeError>{
+        if epoch==0||epoch!=self.epoch{return Err(NvmeError::Stale);}
+        Ok(self.active.iter().filter(|slot|slot.is_some()).count())
     }
     /// Changing a controller epoch invalidates every old command ID.
     pub fn reset(&mut self,new_epoch:u64)->Result<(),NvmeError>{
@@ -62,4 +70,22 @@ mod tests{
         let mut r=req();r.namespace_id=0;
         assert_eq!(q.submit(2,r,100),Err(NvmeError::Invalid));
     }
+}
+
+#[cfg(test)]
+mod m1_ws02_nvme_dma_tests {
+ use super::*;
+ #[test] fn dma_span_does_not_wrap_and_epoch_count_is_authorized() {
+  let mut q=Queue::<2>::new(7);
+  let request=Request{command_id:1,namespace_id:1,lba:0,blocks:16,
+   dma_address:u64::MAX & !4095};
+  assert_eq!(q.submit(7,request,1024),Err(NvmeError::Invalid));
+  assert_eq!(q.outstanding(7),Ok(0));
+  let valid=Request{dma_address:0x4000,..request};
+  assert_eq!(q.submit(7,valid,1024),Ok(()));
+  assert_eq!(q.outstanding(7),Ok(1));
+  assert_eq!(q.outstanding(6),Err(NvmeError::Stale));
+  assert_eq!(q.complete(7,1),Ok(valid));
+  assert_eq!(q.outstanding(7),Ok(0));
+ }
 }

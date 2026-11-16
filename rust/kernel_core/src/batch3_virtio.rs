@@ -59,3 +59,34 @@ mod tests{
             Err(VirtError::Unsupported));
     }
 }
+
+/// Enforce negotiated VirtIO split-queue capacity before mapping the ring.
+/// This validates metadata only; the DMA owner must separately pin the memory.
+pub fn validate_ring_size(entries:u16)->Result<usize,VirtError>{
+ let size=usize::from(entries);
+ if size==0||size>256||!size.is_power_of_two(){
+  return Err(VirtError::OutOfBounds);
+ }
+ Ok(size)
+}
+/// Strict ring-level entry point; requires a legitimate negotiated queue size.
+pub fn validate_ring(descriptors:&[Descriptor],head:usize,device_writes:bool)
+ ->Result<u64,VirtError>{
+ let count=u16::try_from(descriptors.len()).map_err(|_|VirtError::OutOfBounds)?;
+ validate_ring_size(count)?;
+ validate_chain(descriptors,head,device_writes)
+}
+#[cfg(test)]
+mod m1_ws03_virtio_ring_tests {
+ use super::*;
+ #[test] fn ring_sizes_must_be_nonzero_bounded_powers_of_two() {
+  for n in [1,2,4,8,16,32,64,128,256]{assert_eq!(validate_ring_size(n),Ok(n as usize));}
+  for n in [0,3,5,63,255,257,u16::MAX]{
+   assert_eq!(validate_ring_size(n),Err(VirtError::OutOfBounds));
+  }
+  let good=[Descriptor{address:0x1000,length:512,flags:0,next:0}];
+  assert_eq!(validate_ring(&good,0,false),Ok(512));
+  assert_eq!(validate_ring(&good,1,false),Err(VirtError::OutOfBounds));
+  assert_eq!(validate_ring(&[good[0];3],0,false),Err(VirtError::OutOfBounds));
+ }
+}

@@ -184,3 +184,25 @@ mod g8_untrusted_ecam_tests {
   assert_eq!(config_address(good(),1,0,0,0,0),Err(Error::Address));
  }
 }
+
+/// Validate width and alignment of a numeric PCIe configuration register access.
+/// This never authorizes a BAR, MMIO mapping, bus master or DMA transaction.
+pub fn config_access(window:Window,segment:u16,bus:u8,
+ device:u8,function:u8,offset:u16,width:u8)->Result<u64,Error>{
+ if !matches!(width,1|2|4)||offset%u16::from(width)!=0||
+    u32::from(offset)+u32::from(width)>4096{return Err(Error::Address);}
+ config_address(window,segment,bus,device,function,offset)
+}
+#[cfg(test)]
+mod m1_ws08_ecam_width_tests {
+ use super::*;
+ #[test] fn config_register_width_cannot_cross_or_misalign_a_function() {
+  let window=Window{base:0x8000_0000,segment:2,start_bus:8,end_bus:8};
+  assert_eq!(config_access(window,2,8,0,0,4092,4),Ok(0x8000_0ffc));
+  assert_eq!(config_access(window,2,8,0,0,4095,1),Ok(0x8000_0fff));
+  for (off,width) in [(0,0),(0,3),(0,8),(1,2),(2,4),(4093,4),(4095,2)]{
+   assert_eq!(config_access(window,2,8,0,0,off,width),Err(Error::Address));
+  }
+  assert_eq!(config_access(window,1,8,0,0,0,4),Err(Error::Address));
+ }
+}

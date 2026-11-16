@@ -33,6 +33,13 @@ impl Permissions{
  pub fn new(owner:u16,group:u16,mode:u16)->Option<Self>{
   if mode&!0o777!=0{None}else{Some(Self{owner,group,mode})}
  }
+ /// Restrict or update mode only through a validated kernel-issued owner/root
+ /// credential; a forged public mode must not be laundered into a valid ACL.
+ pub fn with_mode(self,credentials:Credentials,mode:u16)->Option<Self>{
+  if self.mode&!0o777!=0||mode&!0o777!=0||
+    (credentials.uid!=0&&credentials.uid!=self.owner){return None;}
+  Some(Self{mode,..self})
+ }
  pub fn allows(self,credentials:Credentials,access:u16)->bool{
   // Corrupt persisted modes must never grant access, even to root.
   if self.mode&!0o777!=0||access&!7!=0{return false;}
@@ -67,5 +74,20 @@ mod g7_acl_integrity_tests {
   for who in [Credentials::kernel(0,0),Credentials::kernel(1000,77)] {
    assert!(!p.allows(who,8));
   }
+ }
+}
+
+#[cfg(test)]
+mod m1_ws07_acl_mutation_tests {
+ use super::*;
+ #[test] fn only_owner_or_root_can_change_valid_discretionary_modes() {
+  let p=Permissions::new(100,7,0o640).unwrap();
+  let owner=Credentials::kernel(100,1);
+  let group=Credentials::kernel(101,7);
+  assert_eq!(p.with_mode(owner,0o600),Some(Permissions{mode:0o600,..p}));
+  assert_eq!(p.with_mode(Credentials::kernel(0,5),0o400),Some(Permissions{mode:0o400,..p}));
+  assert_eq!(p.with_mode(group,0o777),None);
+  assert_eq!(p.with_mode(owner,0o1000),None);
+  assert_eq!(Permissions{mode:0o1777,..p}.with_mode(owner,0o600),None);
  }
 }

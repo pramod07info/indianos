@@ -116,3 +116,44 @@ impl<const N:usize> CrashLog<N>{
   assert_eq!(out,[empty]);
  }
 }
+
+impl<const N:usize> CrashLog<N>{
+ /// Return only this PID generation's crashes after a monotonic sequence.
+ /// Capacity failure leaves the caller's buffer unchanged, permitting retries.
+ pub fn inspect_owner_since(&self,pid:u32,generation:u64,after:u64,
+  out:&mut[Crash])->Result<usize,CrashError>{
+  if pid==0||generation==0{return Err(CrashError::Invalid);}
+  let matching=(0..self.count).filter(|&i|self.get(i).is_some_and(
+   |c|c.pid==pid&&c.generation==generation&&c.sequence>after)).count();
+  if matching>out.len(){return Err(CrashError::Exhausted);}
+  let mut written=0;
+  for i in 0..self.count{
+   if let Some(c)=self.get(i){
+    if c.pid==pid&&c.generation==generation&&c.sequence>after{
+     out[written]=c;written+=1;
+    }
+   }
+  }
+  Ok(written)
+ }
+}
+#[cfg(test)]
+mod m1_ws05_crash_cursor_tests {
+ use super::*;
+ #[test] fn cursor_excludes_other_owners_and_never_partially_writes() {
+  let mut log=CrashLog::<3>::new();
+  log.record(3,1,14,0,1).unwrap();
+  log.record(9,1,14,0,2).unwrap();
+  log.record(3,1,14,0,3).unwrap();
+  let empty=Crash{sequence:0,pid:0,generation:0,vector:0,code:0,uptime:0};
+  let mut too_small=[empty;1];
+  assert_eq!(log.inspect_owner_since(3,1,0,&mut too_small),Err(CrashError::Exhausted));
+  assert_eq!(too_small,[empty]);
+  let mut out=[empty;2];
+  assert_eq!(log.inspect_owner_since(3,1,1,&mut out),Ok(1));
+  assert_eq!((out[0].sequence,out[0].pid),(3,3));
+  assert_eq!(out[1],empty);
+  assert_eq!(log.inspect_owner_since(3,2,0,&mut out),Ok(0));
+  assert_eq!(log.inspect_owner_since(0,1,0,&mut out),Err(CrashError::Invalid));
+ }
+}

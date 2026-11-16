@@ -14,6 +14,8 @@ pub fn parse_rsdp(bytes:&[u8])->Result<Rsdp,AcpiError>{
     if &bytes[..8]!=b"RSD PTR "{return Err(AcpiError::Signature);}
     if !checksum_ok(&bytes[..20]){return Err(AcpiError::Checksum);}
     let revision=bytes[15];
+    // ACPI RSDP revision 1 is reserved; v1 is 0 and extended RSDP is >=2.
+    if revision==1{return Err(AcpiError::Malformed);}
     if revision>0{
         if bytes.len()<36{return Err(AcpiError::Truncated);}
         let length=u32::from_le_bytes(bytes[20..24].try_into().map_err(|_|AcpiError::Truncated)?);
@@ -106,4 +108,20 @@ mod tests{
         b[9]=0u8.wrapping_sub(sum);
         assert_eq!(parse_sdt(&b),Ok(Table{signature:*b"APIC",length:36,revision:0}));
     }
+}
+
+#[cfg(test)]
+mod m1_ws04_acpi_revision_tests {
+ use super::*;
+ #[test] fn reject_reserved_revision_without_interpreting_extended_length() {
+  let mut rsdp=[0u8;20];rsdp[..8].copy_from_slice(b"RSD PTR ");
+  rsdp[15]=1;rsdp[16..20].copy_from_slice(&0x1000u32.to_le_bytes());
+  let sum=rsdp.iter().fold(0u8,|s,&b|s.wrapping_add(b));
+  rsdp[8]=rsdp[8].wrapping_sub(sum);
+  assert_eq!(parse_rsdp(&rsdp),Err(AcpiError::Malformed));
+  rsdp[15]=0;let sum=rsdp.iter().fold(0u8,|s,&b|s.wrapping_add(b));
+  rsdp[8]=rsdp[8].wrapping_sub(sum);
+  assert_eq!(parse_rsdp(&rsdp),Ok(Rsdp{
+   revision:0,root_address:0x1000,xsdt:false}));
+ }
 }

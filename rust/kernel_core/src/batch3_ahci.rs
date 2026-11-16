@@ -18,14 +18,15 @@ pub fn validate_command(lba:u64,sectors:u16,disk_sectors:u64,
     if bytes>MAX_TRANSFER_BYTES{return Err(AhciError::WrongSize);}
     let mut total=0u64;
     for (i,region) in regions.iter().enumerate(){
-        if region.byte_count==0||region.dma_address%4096!=0 ||
+        if region.byte_count==0||region.dma_address==0||region.dma_address%4096!=0 ||
             region.byte_count%SECTOR_BYTES as u32!=0{
             return Err(AhciError::InvalidBuffer);
         }
         let end=region.dma_address.checked_add(u64::from(region.byte_count))
             .ok_or(AhciError::Overflow)?;
         for prev in &regions[..i]{
-            let prev_end=prev.dma_address+u64::from(prev.byte_count);
+            let prev_end=prev.dma_address.checked_add(u64::from(prev.byte_count))
+                .ok_or(AhciError::Overflow)?;
             if region.dma_address<prev_end&&prev.dma_address<end{
                 return Err(AhciError::Overlap);
             }
@@ -57,4 +58,18 @@ mod tests{
             dma_address:0x2000,byte_count:512}]),Err(AhciError::WrongSize));
         assert_eq!(validate_command(1,1,100,&[]),Err(AhciError::TooMany));
     }
+}
+
+#[cfg(test)]
+mod m1_ws01_ahci_dma_tests {
+ use super::*;
+ #[test] fn rejects_unowned_zero_and_wrapping_dma_ranges() {
+  assert_eq!(validate_command(0,8,64,&[Region{dma_address:0,byte_count:4096}]),
+   Err(AhciError::InvalidBuffer));
+  assert_eq!(validate_command(0,16,64,&[Region{
+    dma_address:u64::MAX & !4095,byte_count:8192}]),Err(AhciError::Overflow));
+  assert_eq!(validate_command(0,16,64,&[
+    Region{dma_address:0x1000,byte_count:4096},
+    Region{dma_address:0x4000,byte_count:4096}]),Ok(8192));
+ }
 }

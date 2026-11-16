@@ -52,18 +52,26 @@ fn in_region(frame:u64,r:&Region)->Option<bool>{
  Some(frame>=r.base&&frame.checked_add(PAGE).is_some_and(|e|e<=end)
       &&matches!(r.kind,0|5|6|8))
 }
+/// 0: not present, 1: fully permitted, 2: overlaps prohibited/partial range.
+fn frame_region_gate(frame:u64,r:&Region)->Option<u8>{
+ let end=r.base.checked_add(r.length)?;
+ let frame_end=frame.checked_add(PAGE)?;
+ if frame>=end||r.base>=frame_end{return Some(0);}
+ Some(if in_region(frame,r)?{1}else{2})
+}
 unsafe fn valid_frame(frame:u64)->bool{
  if frame==0||frame&(PAGE-1)!=0||frame.checked_add(PAGE).is_none(){return false;}
  let count=unsafe{boot_memory_region_count()};
  if count==0||count>4096{return false;}
+ let mut allowed=false;
  for i in 0..count{
   let mut r=Region{base:0,length:0,kind:0};
   if !unsafe{boot_memory_region_at(i,&mut r,ptr::null_mut())}{return false;}
-  let Some(allowed)=in_region(frame,&r) else{return false};
-  let Some(end)=r.base.checked_add(r.length) else{return false};
-  if frame>=r.base&&frame.checked_add(PAGE).is_some_and(|e|e<=end){return allowed;}
+  match frame_region_gate(frame,&r){
+   Some(0)=>{},Some(1)=>allowed=true,_=>return false,
+  }
  }
- false
+ allowed
 }
 unsafe extern "C" fn allocate(p:*mut u64,_:*mut c_void)->bool{
  unsafe{pmm_allocate_frame(p)}
@@ -146,5 +154,20 @@ mod g8_hhdm_geometry_tests {
                  0xffff_ffff_ffff_f000] {
    assert!(valid_hhdm_offset(offset));
   }
+ }
+}
+
+#[cfg(test)]
+mod m1_ws09_memory_map_tests {
+ use super::*;
+ #[test] fn overlapping_reserved_or_partial_region_is_a_veto() {
+  let usable=Region{base:0x1000,length:0x4000,kind:0};
+  let reserved=Region{base:0x1000,length:0x1000,kind:1};
+  let partial=Region{base:0x1800,length:0x1000,kind:0};
+  assert_eq!(frame_region_gate(0x1000,&usable),Some(1));
+  assert_eq!(frame_region_gate(0x1000,&reserved),Some(2));
+  assert_eq!(frame_region_gate(0x1000,&partial),Some(2));
+  assert_eq!(frame_region_gate(0x6000,&usable),Some(0));
+  assert_eq!(frame_region_gate(0x1000,&Region{base:u64::MAX,length:10,kind:0}),None);
  }
 }

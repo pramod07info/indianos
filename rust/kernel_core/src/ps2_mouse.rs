@@ -51,16 +51,20 @@ fn decode_aux_reply(byte:u8)->AuxReply{
     match byte{0xfa=>AuxReply::Ack,0xfe=>AuxReply::Resend,
         _=>AuxReply::Invalid}
 }
-fn mouse_ack()->Option<AuxReply>{
+fn mouse_ack_with<S,R>(mut status:S,mut read:R)->Option<AuxReply>
+where S:FnMut()->u8,R:FnMut()->u8 {
     for _ in 0..MAX_WAIT{
-        let status=unsafe{input(CTRL)};
-        if status&1!=0{
+        let state=status();
+        if state&1!=0{
             // Do not steal a primary keyboard byte while waiting for AUX.
-            if !valid_mouse_status(status){return None;}
-            return Some(decode_aux_reply(unsafe{input(DATA)}));
+            if !valid_mouse_status(state){return None;}
+            return Some(decode_aux_reply(read()));
         }
     }
     None
+}
+fn mouse_ack()->Option<AuxReply>{
+    mouse_ack_with(||unsafe{input(CTRL)},||unsafe{input(DATA)})
 }
 fn mouse_command(byte:u8)->bool{
     // 8042 devices may request a resend; retry the *whole* D4+DATA
@@ -362,5 +366,23 @@ mod g5_mouse_transport_tests {
   assert_eq!(mouse.poll_aux_with(||{polls.set(polls.get()+1);0x21},
     ||{reads.set(reads.get()+1);0x00}),None);
   assert_eq!((polls.get(),reads.get()),(3,3));
+ }
+}
+
+#[cfg(test)]
+mod m1_ws10_aux_ack_tests {
+ use super::*;
+ use core::cell::Cell;
+ #[test] fn valid_ack_and_resend_require_aux_status_not_primary_or_corrupted() {
+  for status in [0x01,0x61,0xa1,0xe1]{
+   let reads=Cell::new(0usize);
+   assert_eq!(mouse_ack_with(||status,||{reads.set(reads.get()+1);0xfa}),None);
+   assert_eq!(reads.get(),0);
+  }
+  let reads=Cell::new(0usize);
+  assert_eq!(mouse_ack_with(||0x21,||{reads.set(reads.get()+1);0xfa}),Some(AuxReply::Ack));
+  assert_eq!(reads.get(),1);
+  assert_eq!(mouse_ack_with(||0x21,||0xfe),Some(AuxReply::Resend));
+  assert_eq!(mouse_ack_with(||0x21,||0xfc),Some(AuxReply::Invalid));
  }
 }
