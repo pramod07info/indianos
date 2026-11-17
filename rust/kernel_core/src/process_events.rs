@@ -1368,3 +1368,32 @@ mod pr782_ws59_61_tests{
         assert_eq!(q.len(),4);
     }
 }
+
+/// A non-starving scheduler selection primitive: prefer authenticated
+/// priority-threshold work when it exists, but fall back to ordinary round
+/// robin rather than leaving a runnable low-priority task behind forever.
+/// Policy-only until wired to actual per-CPU timer dispatch.
+impl<const C:usize,const N:usize> CoreRunQueues<C,N>{
+ pub fn next_with_priority_fallback(&mut self,cpu:usize,minimum:u8)
+    ->Result<(Runnable,bool),DispatchError>{
+  match self.next_eligible(cpu,minimum){
+   Ok(task)=>Ok((task,false)),
+   Err(DispatchError::Empty)=>self.next(cpu).map(|task|(task,true)),
+   Err(error)=>Err(error),
+  }
+ }
+}
+#[cfg(test)]
+mod m1_gate20_w5_next_dispatch_tests{
+ use super::*;
+ #[test]fn priority_fallback_can_run_low_priority_peer_without_starvation(){
+  let mut q=CoreRunQueues::<1,2>::new();
+  let low=Runnable{pid:5,generation:1,priority:1};
+  let high=Runnable{pid:6,generation:1,priority:9};
+  q.enqueue(0,low).unwrap();
+  assert_eq!(q.next_with_priority_fallback(0,8),Ok((low,true)));
+  q.enqueue(0,high).unwrap();
+  assert_eq!(q.next_with_priority_fallback(0,8),Ok((high,false)));
+  assert_eq!(q.next_with_priority_fallback(3,8),Err(DispatchError::InvalidCpu));
+ }
+}

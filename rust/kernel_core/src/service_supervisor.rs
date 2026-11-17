@@ -2534,3 +2534,58 @@ mod m1_gate20_w2_service_tests{
   assert_eq!(s.snapshot(2).unwrap().generation,0);
  }
 }
+/// Start an ordered PID1 service cohort transactionally. Earlier cohort
+/// members may satisfy later dependencies, but duplicates, cycles, a stale
+/// generation or pending restart invalidate the WHOLE batch. The caller
+/// publishes returned start actions only after the transaction succeeds.
+impl<const N:usize> ServiceTable<N>{
+ pub fn start_ordered_dependencies_exact(
+   &mut self,requests:&[(u32,u32,&[(u32,u32,u32)])],
+   output:&mut[ServiceAction])->bool{
+   if requests.is_empty()||requests.len()>N||output.len()<requests.len(){
+     return false;
+   }
+   let mut shadow=Self{slots:self.slots,phases:self.phases};
+   let mut actions=[ServiceAction::Deny;N];
+   for (i,&(service,generation,deps)) in requests.iter().enumerate(){
+     if requests[..i].iter().any(|&(earlier,_,_)|earlier==service){
+       return false;
+     }
+     let action=shadow.start_with_dependencies_exact(service,generation,deps);
+     if action==ServiceAction::Deny{return false;}
+     actions[i]=action;
+   }
+   self.slots=shadow.slots;self.phases=shadow.phases;
+   output[..requests.len()].copy_from_slice(&actions[..requests.len()]);
+   true
+ }
+}
+#[cfg(test)]
+mod m1_gate20_w2_next_service_tests{
+ use super::*;
+ #[test]fn dependency_cohort_starts_in_order_with_exact_epoch(){
+   let mut s=ServiceTable::<3>::new();
+   assert!(s.configure(1,101,1));assert!(s.configure(2,202,1));
+   let first=[(1,0,&[][..]),(2,0,&[(1,101,1)][..])];
+   let mut out=[ServiceAction::Deny;2];
+   assert!(s.start_ordered_dependencies_exact(&first,&mut out));
+   assert_eq!(out,[ServiceAction::Start{pid:101,generation:1},
+                   ServiceAction::Start{pid:202,generation:1}]);
+   assert!(s.is_active_exact(2,202,1));
+ }
+ #[test]fn invalid_tail_and_cycles_leave_all_service_state_unmodified(){
+   let mut s=ServiceTable::<3>::new();
+   assert!(s.configure(1,101,1));assert!(s.configure(2,202,1));
+   let mut out=[ServiceAction::Restart{pid:9,generation:9};2];
+   let bad=[(1,0,&[][..]),(2,0,&[(1,101,99)][..])];
+   assert!(!s.start_ordered_dependencies_exact(&bad,&mut out));
+   assert_eq!(s.snapshot(1).unwrap().generation,0);
+   assert_eq!(s.snapshot(2).unwrap().generation,0);
+   assert_eq!(out,[ServiceAction::Restart{pid:9,generation:9};2]);
+   let cycle=[(1,0,&[(2,202,1)][..]),(2,0,&[(1,101,1)][..])];
+   assert!(!s.start_ordered_dependencies_exact(&cycle,&mut out));
+   let duplicate=[(1,0,&[][..]),(1,0,&[][..])];
+   assert!(!s.start_ordered_dependencies_exact(&duplicate,&mut out));
+   assert_eq!(s.snapshot(1).unwrap().generation,0);
+ }
+}

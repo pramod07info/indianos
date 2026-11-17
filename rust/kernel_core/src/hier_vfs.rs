@@ -174,6 +174,15 @@ impl<D:BlockDevice> HierVfs<D>{
  }
  pub fn create_as(&mut self,credentials:Credentials,path:&str,data:&[u8],mode:u16)
   ->Result<(),FsError>{
+  self.create_as_with_limit(credentials,path,data,mode,MAX_FILE_BYTES)
+ }
+ /// Enforce a kernel-issued logical file cap before any filesystem mutation.
+ /// This is a per-file ceiling, not yet a persisted per-user volume quota.
+ pub fn create_as_with_limit(&mut self,credentials:Credentials,path:&str,
+  data:&[u8],mode:u16,limit:usize)->Result<(),FsError>{
+  if limit==0||limit>MAX_FILE_BYTES||data.len()>limit{
+   return Err(FsError::Full);
+  }
   self.authorize_parent(credentials,path)?;
   let p=checked(path,Kind::File)?;self.parents(&p)?;
   if self.conflicting(p.path(),Kind::File)?{return Err(FsError::Exists);}
@@ -202,7 +211,23 @@ impl<D:BlockDevice> HierVfs<D>{
   self.readlink(path,out)
  }
  pub fn write_at_as(&mut self,credentials:Credentials,path:&str,offset:u64,data:&[u8])
-  ->Result<usize,FsError>{self.authorize_access(credentials,path,WRITE)?;self.write_at(path,offset,data)}
+  ->Result<usize,FsError>{
+  self.write_at_as_with_limit(credentials,path,offset,data,MAX_FILE_BYTES)
+ }
+ /// Authenticated, quota-capped write. Preflight existing CRC-verified
+ /// length, prevent sparse holes/overflow and refuse expansion past limit
+ /// BEFORE the durable COW write. Mount/volume-wide quotas remain pending.
+ pub fn write_at_as_with_limit(&mut self,credentials:Credentials,path:&str,
+  offset:u64,data:&[u8],limit:usize)->Result<usize,FsError>{
+  if limit==0||limit>MAX_FILE_BYTES{return Err(FsError::Full);}
+  self.authorize_access(credentials,path,WRITE)?;
+  let current=self.file_len(path)?;
+  let start=usize::try_from(offset).map_err(|_|FsError::TooLarge)?;
+  if start>current{return Err(FsError::TooLarge);}
+  let end=start.checked_add(data.len()).ok_or(FsError::TooLarge)?;
+  if current.max(end)>limit{return Err(FsError::Full);}
+  self.write_at(path,offset,data)
+ }
  pub fn unlink_as(&mut self,credentials:Credentials,path:&str)->Result<(),FsError>{
   self.authorize_parent(credentials,path)?;self.authorize_access(credentials,path,0)?;self.unlink(path)
  }
@@ -630,6 +655,20 @@ mod tests{
  }
  fn fresh()->HierVfs<Disk>{
   HierVfs::format_blank(Disk{blocks:[[0;SECTOR_BYTES];COUNT],writes:0,tear:None}).unwrap()
+ }
+ #[test]fn m1_gate20_w3_next_quota_enforced_before_metadata_mutation(){
+  let root=Credentials::kernel(0,0);
+  let mut fs=fresh();
+  fs.create_as_with_limit(root,"/test",b"abc",0o600,4).unwrap();
+  assert_eq!(fs.write_at_as_with_limit(root,"/test",3,b"x",4),Ok(1));
+  let before=fs.generation();
+  assert_eq!(fs.write_at_as_with_limit(root,"/test",4,b"y",4),Err(FsError::Full));
+  assert_eq!(fs.create_as_with_limit(root,"/other",b"abcde",0o600,4),Err(FsError::Full));
+  assert_eq!(fs.generation(),before);
+  let mut out=[0u8;4];
+  let mut remounted=HierVfs::mount_consistent_recovery(fs.into_device()).unwrap();
+  assert_eq!(remounted.read_as(root,"/test",&mut out),Ok(4));
+  assert_eq!(&out,b"abcx");
  }
  #[test]
  fn m1_gate12_authenticated_listing_and_readlink_isolate_owner_and_remount(){

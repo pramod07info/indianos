@@ -801,3 +801,61 @@ mod tests {
  }
 
 }
+
+/// Generation-aware, all-or-nothing delivery of a FIFO prefix to a trusted
+/// copy sink. A failed user-copy leaves both the queue and output untouched.
+/// Caller is responsible for validating the destination user address first.
+impl<const M:usize,const D:usize> ScopedRouter<M,D>{
+ pub fn receive_batch_exact_with(&mut self,receiver:Identity,limit:usize,
+  deliver:impl FnOnce(&[TaggedMessage])->bool)->Result<usize,IpcError>{
+  if limit==0||limit>D{return Err(IpcError::InvalidConfiguration);}
+  let b=self.boxes.iter_mut().flatten().find(|b|b.owner==receiver)
+    .ok_or(IpcError::UnknownReceiver)?;
+  if b.count==0{return Err(IpcError::Empty);}
+  let take=limit.min(b.count);
+  let empty=TaggedMessage{sender:Identity{pid:0,generation:0},
+    length:0,bytes:[0;MAX_PAYLOAD]};
+  let mut staged=[empty;D];
+  for (i,item) in staged[..take].iter_mut().enumerate(){
+    *item=b.queue[i].ok_or(IpcError::Empty)?;
+  }
+  if !deliver(&staged[..take]){return Err(IpcError::CopyFailed);}
+  for i in take..b.count{b.queue[i-take]=b.queue[i];}
+  for i in b.count-take..b.count{b.queue[i]=None;}
+  b.count-=take;
+  Ok(take)
+ }
+}
+#[cfg(test)]
+mod m1_gate20_w4_next_ipc_tests{
+ use super::*;
+ #[test]fn scoped_batch_copy_failure_preserves_fifo_and_generation(){
+  let mut router=ScopedRouter::<2,3>::new().unwrap();
+  let a=Identity{pid:1,generation:1};
+  let b=Identity{pid:2,generation:2};
+  router.register(a).unwrap();router.register(b).unwrap();
+  router.send(a,b,b"one").unwrap();
+  router.send(a,b,b"two").unwrap();
+  assert_eq!(router.receive_batch_exact_with(b,2,|_|false),
+             Err(IpcError::CopyFailed));
+  assert_eq!(router.pending(b),Ok(2));
+  assert_eq!(router.receive_batch_exact_with(Identity{generation:1,..b},2,|_|true),
+             Err(IpcError::UnknownReceiver));
+  let mut seen=[0usize;2];
+  assert_eq!(router.receive_batch_exact_with(b,2,|items|{
+    seen[0]=items[0].payload().len();seen[1]=items[1].payload().len();true
+  }),Ok(2));
+  assert_eq!(seen,[3,3]);assert_eq!(router.pending(b),Ok(0));
+ }
+ #[test]fn zero_or_oversized_batch_keeps_original_message(){
+  let mut router=ScopedRouter::<2,2>::new().unwrap();
+  let a=Identity{pid:1,generation:1};let b=Identity{pid:2,generation:1};
+  router.register(a).unwrap();router.register(b).unwrap();
+  router.send(a,b,b"ok").unwrap();
+  assert_eq!(router.receive_batch_exact_with(b,0,|_|true),
+             Err(IpcError::InvalidConfiguration));
+  assert_eq!(router.receive_batch_exact_with(b,3,|_|true),
+             Err(IpcError::InvalidConfiguration));
+  assert_eq!(router.receive(b).unwrap().payload(),b"ok");
+ }
+}

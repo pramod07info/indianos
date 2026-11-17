@@ -43,6 +43,14 @@ unsafe fn memory_map() -> Option<&'static MemoryMap> {
 fn valid_region(r:&Region)->bool{
     r.length!=0 && r.base.checked_add(r.length).is_some()
 }
+/// A firmware-provided direct-map base must be a canonical high-half page
+/// boundary and leave room for at least one mapped page without overflow.
+/// This is a numeric guard, not proof of a valid mapped physical page.
+fn hhdm_offset_sane(offset:u64)->bool{
+    offset>=0xffff_8000_0000_0000 &&
+    offset&0xfff==0 &&
+    offset.checked_add(4096).is_some()
+}
 fn validate_ranges(regions:&[Region]) -> bool {
     let mut usable=false;
     for r in regions {
@@ -92,7 +100,7 @@ pub unsafe extern "C" fn boot_memory_region_count() -> u64 {
 pub unsafe extern "C" fn boot_memory_region_at(index:u64,out:*mut Region,_context:*mut c_void)->bool {
     if out.is_null(){return false}
     let Some(m)=(unsafe {memory_map()}) else {return false};
-    if m.entries.is_null() || index>=m.count || m.count>4096 {return false}
+    if validated_map_count(m).is_none() || index>=m.count {return false}
     let item=unsafe {ptr::read_volatile(m.entries.add(index as usize))};
     let Some(region)=(unsafe {item.as_ref()}) else {return false};
     if !valid_region(region) {return false;}
@@ -105,6 +113,7 @@ pub unsafe extern "C" fn boot_memory_region_at(index:u64,out:*mut Region,_contex
 pub unsafe extern "C" fn boot_hhdm_offset(out:*mut u64)->bool {
     if out.is_null(){return false}
     let Some(h)=(unsafe {boot_limine_hhdm().as_ref()}) else {return false};
+    if !hhdm_offset_sane(h.offset){return false;}
     unsafe {ptr::write(out,h.offset);}
     true
 }
@@ -348,5 +357,27 @@ mod m1_gate20_w1_boot_tests {
   let good_entries=[&ok as *const Region];
   let good=MemoryMap{revision:0,count:1,entries:good_entries.as_ptr()};
   assert_eq!(validated_map_count(&good),Some(1));
+ }
+}
+
+#[cfg(test)]
+mod m1_gate20_w1_next_boot_tests{
+ use super::*;
+ #[test]fn complete_memory_map_preflight_blocks_late_corruption(){
+   let good=Region{base:0x1000,length:0x2000,kind:0};
+   let bad=Region{base:u64::MAX-1,length:4,kind:1};
+   let refs=[&good as *const Region,&bad as *const Region];
+   let map=MemoryMap{revision:0,count:2,entries:refs.as_ptr()};
+   assert_eq!(validated_map_count(&map),None);
+   let refs=[&good as *const Region];
+   let map=MemoryMap{revision:0,count:1,entries:refs.as_ptr()};
+   assert_eq!(validated_map_count(&map),Some(1));
+ }
+ #[test]fn direct_map_must_be_canonical_aligned_and_nonwrapping(){
+   assert!(hhdm_offset_sane(0xffff_8000_0000_0000));
+   assert!(!hhdm_offset_sane(0));
+   assert!(!hhdm_offset_sane(0x8000_0000));
+   assert!(!hhdm_offset_sane(0xffff_8000_0000_0001));
+   assert!(!hhdm_offset_sane(0xffff_ffff_ffff_f000));
  }
 }
