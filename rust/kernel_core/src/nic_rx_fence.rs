@@ -456,3 +456,46 @@ mod kernel_p0_w5_nic_teardown_tests{
   assert_eq!(nic.try_admit(11).err(),Some(RxFenceError::Quiescing));
  }
 }
+
+
+/// P0 follow-up W5: no packet bytes or a parsed result may escape the NIC
+/// receive admission epoch if IRQ teardown races with decoding. The closure
+/// must parse into private scratch and perform NO externally visible effects;
+/// a later caller still needs an authenticated socket/UDP policy decision.
+impl NicRxFence{
+ pub fn parse_packet_at_live_epoch<R>(&self,device:u32,
+  parse:impl FnOnce()->Option<R>)->Result<R,RxFenceError>{
+  let permit=self.try_admit(device)?;
+  let revision=self.revision_for(&permit)?;
+  let decoded=parse().ok_or(RxFenceError::Stale)?;
+  if !self.revision_is_current(&permit,revision){
+   return Err(RxFenceError::Stale);
+  }
+  Ok(decoded)
+ }
+}
+#[cfg(test)]
+mod kernel_p0_next_w5_rx_admission_tests{
+ use super::*;
+ #[test]fn packet_validation_result_cannot_cross_quiescing_transition(){
+  let nic=NicRxFence::new(13);
+  assert_eq!(nic.parse_packet_at_live_epoch(13,||Some(25u32)),Ok(25));
+  assert_eq!(nic.parse_packet_at_live_epoch(12,||Some(25u32)),
+   Err(RxFenceError::InvalidDevice));
+  assert_eq!(nic.parse_packet_at_live_epoch(13,||{
+   nic.begin_quiesce(13).unwrap();
+   Some(25u32)
+  }),Err(RxFenceError::Stale));
+  assert_eq!(nic.parse_packet_at_live_epoch(13,||Some(25u32)),
+   Err(RxFenceError::Quiescing));
+ }
+ #[test]fn failed_decoder_does_not_hold_a_software_completion_permit(){
+  let nic=NicRxFence::new(14);
+  assert_eq!(nic.parse_packet_at_live_epoch::<u32>(14,||None),
+   Err(RxFenceError::Stale));
+  let r=nic.begin_quiesce(14).unwrap();
+  assert_eq!(nic.drained(r),Ok(true));
+  assert_eq!(nic.finish_rebind_checked(r,true,true),Ok(2));
+  assert_eq!(nic.parse_packet_at_live_epoch(14,||Some(4u8)),Ok(4));
+ }
+}

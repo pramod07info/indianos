@@ -332,6 +332,7 @@ impl TaggedMessage{
  pub fn sender(&self)->Identity{self.sender}
  pub fn payload(&self)->&[u8]{&self.bytes[..self.length as usize]}
 }
+#[derive(Clone,Copy)]
 struct ScopedMailbox<const D:usize>{
  owner:Identity,queue:[Option<TaggedMessage>;D],count:usize,
 }
@@ -924,5 +925,85 @@ mod kernel_p0_w3_authenticated_ipc_tests{
   assert_eq!(r.send_batch_to_owner(a,b,&[b"valid",&big]),
      Err(IpcError::PayloadTooLarge));
   assert_eq!(r.pending(b),Ok(0));
+ }
+}
+
+
+/// P0 follow-up W3: two or more process incarnations retire atomically
+/// from kernel-owned IPC mailboxes and pending messages. No live SMP lock
+/// is provided by this single-owner transaction.
+impl<const M:usize,const D:usize> ScopedRouter<M,D>{
+ pub fn reap_group_exact(&mut self,owners:&[Identity])->Result<usize,IpcError>{
+  if owners.is_empty()||owners.len()>M{return Err(IpcError::InvalidPid);}
+  for (i,&owner) in owners.iter().enumerate(){
+   if owner.pid==0||owner.generation==0{return Err(IpcError::InvalidPid);}
+   if owners[..i].iter().any(|prior|prior.pid==owner.pid){
+    return Err(IpcError::DuplicateReceiver);
+   }
+   if !self.boxes.iter().flatten().any(|b|b.owner==owner){
+    return Err(IpcError::UnknownReceiver);
+   }
+  }
+  let mut staged=Self{boxes:self.boxes};
+  for &owner in owners{staged.reap(owner)?;}
+  self.boxes=staged.boxes;Ok(owners.len())
+ }
+ /// Require that the FIFO prefix was sent by one still-live exact sender
+ /// incarnation. Wrong sender or a user-copy fault cannot consume an event.
+ pub fn receive_prefix_from_exact(&mut self,receiver:Identity,
+  sender:Identity,limit:usize,
+  deliver:impl FnOnce(&[TaggedMessage])->bool)->Result<usize,IpcError>{
+  if sender.pid==0||sender.generation==0{return Err(IpcError::InvalidPid);}
+  if !self.boxes.iter().flatten().any(|b|b.owner==sender){
+   return Err(IpcError::UnknownSender);
+  }
+  if limit==0||limit>D{return Err(IpcError::InvalidConfiguration);}
+  let target=self.boxes.iter().flatten().find(|b|b.owner==receiver)
+    .ok_or(IpcError::UnknownReceiver)?;
+  if target.count==0{return Err(IpcError::Empty);}
+  let count=limit.min(target.count);
+  if target.queue[..count].iter().any(|msg|
+     !msg.is_some_and(|m|m.sender==sender)){
+   return Err(IpcError::UnknownSender);
+  }
+  self.receive_batch_exact_with(receiver,limit,deliver)
+ }
+}
+#[cfg(test)]
+mod kernel_p0_next_w3_ipc_retire_tests{
+ use super::*;
+ #[test]fn stale_second_process_does_not_reap_first_or_its_messages(){
+  let a=Identity{pid:1,generation:4};
+  let b=Identity{pid:2,generation:7};
+  let c=Identity{pid:3,generation:9};
+  let mut r=ScopedRouter::<3,3>::new().unwrap();
+  r.register(a).unwrap();r.register(b).unwrap();r.register(c).unwrap();
+  r.send(a,c,b"a").unwrap();r.send(b,c,b"b").unwrap();
+  assert_eq!(r.reap_group_exact(&[a,Identity{generation:6,..b}]),
+   Err(IpcError::UnknownReceiver));
+  assert_eq!(r.pending(c),Ok(2));
+  assert_eq!(r.reap_group_exact(&[a,b]),Ok(2));
+  assert_eq!(r.pending(c),Ok(0));
+  assert_eq!(r.pending(a),Err(IpcError::UnknownReceiver));
+ }
+ #[test]fn delivery_refuses_stale_sender_mixed_prefix_and_failed_copy(){
+  let a=Identity{pid:1,generation:2};
+  let b=Identity{pid:2,generation:3};
+  let c=Identity{pid:3,generation:4};
+  let mut r=ScopedRouter::<3,3>::new().unwrap();
+  r.register(a).unwrap();r.register(b).unwrap();r.register(c).unwrap();
+  r.send(a,c,b"first").unwrap();r.send(b,c,b"second").unwrap();
+  assert_eq!(r.receive_prefix_from_exact(c,a,2,|_|true),
+   Err(IpcError::UnknownSender));
+  assert_eq!(r.receive_prefix_from_exact(c,a,1,|_|false),
+   Err(IpcError::CopyFailed));
+  assert_eq!(r.pending(c),Ok(2));
+  assert_eq!(r.receive_prefix_from_exact(c,a,1,|v|v[0].payload()==b"first"),
+   Ok(1));
+  assert_eq!(r.receive_prefix_from_exact(c,Identity{generation:2,..b},1,|_|true),
+   Err(IpcError::UnknownSender));
+  assert_eq!(r.receive_prefix_from_exact(c,b,1,|v|v[0].payload()==b"second"),
+   Ok(1));
+  assert_eq!(r.pending(c),Ok(0));
  }
 }

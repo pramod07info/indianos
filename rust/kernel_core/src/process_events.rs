@@ -1637,3 +1637,68 @@ mod kernel_p0_w2_scheduler_tests{
   assert_eq!(q.total_runnable(),2);
  }
 }
+
+
+/// P0 follow-up W1: exact process-identity and affinity-checked atomic
+/// multi-core migration. The trusted caller still owns actual scheduler
+/// locks, IPI, TLB shootdown and CPU-local saved contexts.
+impl<const C:usize,const N:usize> CoreRunQueues<C,N>{
+ pub fn migrate_group_exact(&mut self,
+  requests:&[(usize,usize,Runnable,u64)])->Result<usize,DispatchError>{
+  if requests.is_empty()||requests.len()>64||
+     requests.len()>C.saturating_mul(N){return Err(DispatchError::InvalidTask);}
+  let mut staged=Self{queues:self.queues,length:self.length,cursor:self.cursor};
+  for (i,&(from,to,task,allowed)) in requests.iter().enumerate(){
+   if from>=C||to>=C{return Err(DispatchError::InvalidCpu);}
+   if from==to||to>=64||task.pid<=1||task.generation==0||
+      allowed&(1u64<<to)==0||
+      requests[..i].iter().any(|&(_,_,other,_)|
+        other.pid==task.pid&&other.generation==task.generation){
+    return Err(DispatchError::InvalidTask);
+   }
+   if !staged.queues[from][..staged.length[from]]
+       .iter().any(|slot|slot.is_some_and(|known|known==task)){
+    return Err(DispatchError::InvalidTask);
+   }
+   staged.migrate(from,to,task.pid,task.generation)?;
+  }
+  staged.validate_queues()?;
+  *self=staged;Ok(requests.len())
+ }
+}
+#[cfg(test)]
+mod kernel_p0_next_w1_migration_tests{
+ use super::*;
+ fn t(pid:u32,epoch:u64)->Runnable{Runnable{pid,generation:epoch,priority:2}}
+ #[test]fn four_cross_cpu_migrations_are_atomic_across_late_capacity_fault(){
+  let mut q=CoreRunQueues::<2,3>::new();
+  q.enqueue(0,t(2,1)).unwrap();q.enqueue(0,t(3,1)).unwrap();
+  q.enqueue(1,t(4,1)).unwrap();q.enqueue(1,t(5,1)).unwrap();
+  let before=q.total_runnable();
+  let bad=[(0,1,t(2,1),2),(0,1,t(3,1),2)];
+  assert_eq!(q.migrate_group_exact(&bad),Err(DispatchError::Full));
+  assert_eq!(q.total_runnable(),before);
+  assert!(q.contains_epoch(2,1));assert!(q.contains_epoch(3,1));
+  let good=[(0,1,t(2,1),2),(1,0,t(4,1),1)];
+  assert_eq!(q.migrate_group_exact(&good),Ok(2));
+  let mut first=[t(99,99);3];let mut second=[t(99,99);3];
+  assert_eq!(q.snapshot_core(0,&mut first),Ok(2));
+  assert_eq!(&first[..2],&[t(3,1),t(4,1)]);
+  assert_eq!(q.snapshot_core(1,&mut second),Ok(2));
+  assert_eq!(&second[..2],&[t(5,1),t(2,1)]);
+ }
+ #[test]fn pid1_recycling_affinity_and_stale_generation_all_fail_closed(){
+  let mut q=CoreRunQueues::<2,2>::new();
+  q.enqueue(0,t(1,4)).unwrap();q.enqueue(0,t(2,4)).unwrap();
+  assert_eq!(q.migrate_group_exact(&[(0,1,t(1,4),2)]),
+    Err(DispatchError::InvalidTask));
+  assert_eq!(q.migrate_group_exact(&[(0,1,t(2,3),2)]),
+    Err(DispatchError::InvalidTask));
+  assert_eq!(q.migrate_group_exact(&[(0,1,t(2,4),1)]),
+    Err(DispatchError::InvalidTask));
+  assert_eq!(q.migrate_group_exact(&[(0,1,t(2,4),2),(0,1,t(2,4),2)]),
+    Err(DispatchError::InvalidTask));
+  assert_eq!(q.queue_len(0),Ok(2));
+  assert_eq!(q.queue_len(1),Ok(0));
+ }
+}

@@ -1050,3 +1050,66 @@ mod kernel_p0_w6_boot_handoff_tests{
     Err(Error::Stale));
  }
 }
+
+
+/// P0 follow-up W6: volatile, single-use launch authorization in the
+/// privileged boot coordinator. Persistent rollback resistance still comes
+/// from the external sealed-floor provider; this does NOT program TPM/UEFI.
+pub struct BootLaunchGate{last_epoch:u64,last_journal:u64}
+impl BootLaunchGate{
+ pub const fn new()->Self{Self{last_epoch:0,last_journal:0}}
+ /// Check trusted roots, signed selection and both COW boot journal copies
+ /// before issuing one in-memory PID1 launch receipt for a newer boot epoch.
+ pub fn authorize_once<D:BlockDevice,P:AuthenticatedPid1Platform>(
+  &mut self,disk:&mut D,platform:&P)->Result<VerifiedPid1Admission,Error>{
+  let accepted=authorize_verified_pid1(disk,platform)?;
+  if accepted.epoch()<=self.last_epoch||
+     accepted.journal_generation()<self.last_journal{
+   return Err(Error::Stale);
+  }
+  revalidate_verified_pid1_at_launch(disk,platform,accepted)?;
+  self.last_epoch=accepted.epoch();
+  self.last_journal=accepted.journal_generation();
+  Ok(accepted)
+ }
+ pub fn last_admitted_epoch(&self)->u64{self.last_epoch}
+}
+#[cfg(test)]
+mod kernel_p0_next_w6_boot_replay_tests{
+ use super::*;
+ struct Platform;
+ impl TrustedBootMeasurement for Platform{
+  fn read_verified(&self)->Result<[u8;32],Error>{Ok([3;32])}
+ }
+ impl AuthenticatedPid1Platform for Platform{
+  fn read_sealed_floor(&self)->Result<SealedBootFloor,Error>{
+   Ok(SealedBootFloor{minimum_epoch:4,minimum_journal_generation:20,
+    expected_slot:0,minimum_slot_version:9,expected_measurement:[3;32]})
+  }
+  fn read_bootloader_selected_slot(&self)->Result<(usize,Slot),Error>{
+   Ok((0,tests::slot()))
+  }
+ }
+ #[test]fn duplicated_pid1_launch_from_same_boot_journal_fails_closed(){
+  let mut disk=tests::fixture();let mut gate=BootLaunchGate::new();
+  assert_eq!(gate.authorize_once(&mut disk,&Platform).unwrap().epoch(),4);
+  assert_eq!(gate.last_admitted_epoch(),4);
+  assert_eq!(gate.authorize_once(&mut disk,&Platform),Err(Error::Stale));
+  assert_eq!(gate.last_admitted_epoch(),4);
+  assert_eq!(disk.writes,0);
+ }
+ #[test]fn untrusted_boot_does_not_consume_one_shot_gate(){
+  let mut disk=tests::fixture();let mut gate=BootLaunchGate::new();
+  struct Untrusted;
+  impl TrustedBootMeasurement for Untrusted{
+   fn read_verified(&self)->Result<[u8;32],Error>{Err(Error::Untrusted)}
+  }
+  impl AuthenticatedPid1Platform for Untrusted{
+   fn read_sealed_floor(&self)->Result<SealedBootFloor,Error>{Err(Error::Untrusted)}
+   fn read_bootloader_selected_slot(&self)->Result<(usize,Slot),Error>{Err(Error::Untrusted)}
+  }
+  assert_eq!(gate.authorize_once(&mut disk,&Untrusted),Err(Error::Untrusted));
+  assert_eq!(gate.last_admitted_epoch(),0);
+  assert_eq!(gate.authorize_once(&mut disk,&Platform).unwrap().epoch(),4);
+ }
+}

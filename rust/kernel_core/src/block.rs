@@ -1346,3 +1346,58 @@ mod m1_batch04_w2_block_tests{
   assert_eq!(d.reads,before);
  }
 }
+
+
+/// P0 follow-up W4: require two identical bounded disk observations before
+/// publishing metadata bytes. Detects geometry changes, torn driver output
+/// and reads that change between probes. This is not cryptographic media
+/// authentication or a substitute for a COW journal and durable flush.
+pub fn read_stable_sectors<D:BlockDevice>(device:&mut D,start:u64,
+ out:&mut[u8])->Result<(),BlockError>{
+ if out.is_empty()||out.len()%SECTOR_BYTES!=0||
+    out.len()>MAX_STAGED_READ_SECTORS*SECTOR_BYTES{
+  return Err(BlockError::OutOfRange);
+ }
+ let mut first=[0u8;MAX_STAGED_READ_SECTORS*SECTOR_BYTES];
+ let mut second=[0u8;MAX_STAGED_READ_SECTORS*SECTOR_BYTES];
+ let n=out.len();
+ read_sectors_atomic(device,start,&mut first[..n])?;
+ read_sectors_atomic(device,start,&mut second[..n])?;
+ if first[..n]!=second[..n]{return Err(BlockError::Io);}
+ out.copy_from_slice(&first[..n]);Ok(())
+}
+#[cfg(test)]
+mod kernel_p0_next_w4_storage_tests{
+ use super::*;
+ struct Disk{reads:u8,change:bool,fail:bool}
+ impl BlockDevice for Disk{
+  fn sector_count(&self)->u64{4}
+  fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   self.reads+=1;
+   if self.fail&&self.reads==2{return Err(BlockError::Io);}
+   out.fill(lba as u8+if self.change&&self.reads>=2{2}else{1});
+   Ok(())
+  }
+  fn write_sector(&mut self,_:u64,_:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   Err(BlockError::ReadOnly)
+  }
+ }
+ #[test]fn unchanging_read_produces_full_sector_and_detects_torn_second_pass(){
+  let mut good=Disk{reads:0,change:false,fail:false};
+  let mut out=[9u8;SECTOR_BYTES];
+  assert_eq!(read_stable_sectors(&mut good,1,&mut out),Ok(()));
+  assert_eq!(out,[2u8;SECTOR_BYTES]);
+  let mut bad=Disk{reads:0,change:true,fail:false};out.fill(17);
+  assert_eq!(read_stable_sectors(&mut bad,1,&mut out),Err(BlockError::Io));
+  assert_eq!(out,[17u8;SECTOR_BYTES]);
+ }
+ #[test]fn second_pass_io_failure_invalid_length_and_bounds_preserve_caller_bytes(){
+  let mut d=Disk{reads:0,change:false,fail:true};
+  let mut out=[4u8;SECTOR_BYTES];
+  assert_eq!(read_stable_sectors(&mut d,0,&mut out),Err(BlockError::Io));
+  assert_eq!(out,[4u8;SECTOR_BYTES]);
+  assert_eq!(read_stable_sectors(&mut d,4,&mut out),Err(BlockError::OutOfRange));
+  assert_eq!(out,[4u8;SECTOR_BYTES]);
+  assert_eq!(read_stable_sectors(&mut d,0,&mut out[..7]),Err(BlockError::OutOfRange));
+ }
+}
