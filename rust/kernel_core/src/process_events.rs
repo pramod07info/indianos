@@ -1397,3 +1397,50 @@ mod m1_gate20_w5_next_dispatch_tests{
   assert_eq!(q.next_with_priority_fallback(3,8),Err(DispatchError::InvalidCpu));
  }
 }
+
+impl<const C:usize,const N:usize> CoreRunQueues<C,N>{
+ /// Bounded protected-PID OOM candidate selection, without killing tasks.
+ pub fn lowest_priority_victim(&self,protected_pid:u32)
+  ->Option<(usize,Runnable)>{
+  let mut chosen:Option<(usize,Runnable)>=None;
+  for cpu in 0..C{
+   for &task in self.queues[cpu][..self.length[cpu]].iter().flatten(){
+    if task.pid==0||task.generation==0||task.pid==protected_pid{continue;}
+    if chosen.is_none_or(|(_,prior)|task.priority<prior.priority){
+     chosen=Some((cpu,task));
+    }
+   }
+  }
+  chosen
+ }
+ /// Exact authenticated incarnation only; no physical frame reclaim here.
+ pub fn evict_pressure_victim_exact(&mut self,cpu:usize,pid:u32,epoch:u64)
+  ->Result<Runnable,DispatchError>{
+  if cpu>=C{return Err(DispatchError::InvalidCpu);}
+  let chosen=self.queues[cpu][..self.length[cpu]].iter().flatten()
+   .find(|task|task.pid==pid&&task.generation==epoch)
+   .copied().ok_or(DispatchError::InvalidTask)?;
+  if self.evict(pid,epoch)!=1{return Err(DispatchError::InvalidTask);}
+  Ok(chosen)
+ }
+}
+#[cfg(test)]mod m1_batch03_w4_cpu_tests{
+ use super::*;
+ #[test]fn memory_pressure_protects_pid1_and_generation(){
+  let mut q=CoreRunQueues::<2,2>::new();
+  let protected=Runnable{pid:1,generation:1,priority:0};
+  let low=Runnable{pid:2,generation:3,priority:1};
+  q.enqueue(0,protected).unwrap();q.enqueue(0,low).unwrap();
+  q.enqueue(1,Runnable{pid:3,generation:2,priority:9}).unwrap();
+  assert_eq!(q.lowest_priority_victim(1),Some((0,low)));
+  assert_eq!(q.evict_pressure_victim_exact(0,2,2),Err(DispatchError::InvalidTask));
+  assert_eq!(q.evict_pressure_victim_exact(0,2,3),Ok(low));
+  assert!(q.contains_epoch(1,1));
+ }
+ #[test]fn pressure_denies_unowned_cpu(){
+  let mut q=CoreRunQueues::<1,1>::new();
+  let r=Runnable{pid:5,generation:8,priority:1};q.enqueue(0,r).unwrap();
+  assert_eq!(q.evict_pressure_victim_exact(1,5,8),Err(DispatchError::InvalidCpu));
+  assert_eq!(q.next(0),Ok(r));
+ }
+}

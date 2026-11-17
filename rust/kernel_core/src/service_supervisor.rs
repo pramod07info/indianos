@@ -2589,3 +2589,37 @@ mod m1_gate20_w2_next_service_tests{
    assert_eq!(s.snapshot(1).unwrap().generation,0);
  }
 }
+
+impl<const N:usize> ServiceTable<N>{
+ /// Scheduler-authenticated, all-or-none shutdown intent at exact epochs.
+ /// Dependents-first sequencing and physical suspend remain caller duties.
+ pub fn stop_group_exact(&mut self,requests:&[(u32,u32,u32)])->bool{
+  if requests.is_empty()||requests.len()>N{return false;}
+  let mut staged=Self{slots:self.slots,phases:self.phases};
+  for (i,&(id,pid,epoch)) in requests.iter().enumerate(){
+   if requests[..i].iter().any(|&(prior,_,_)|prior==id)||
+      !staged.stop_exact(id,pid,epoch){return false;}
+  }
+  self.slots=staged.slots;self.phases=staged.phases;true
+ }
+}
+#[cfg(test)]mod m1_batch03_w2_service_tests{
+ use super::*;
+ #[test]fn stale_tail_rolls_back_every_active_service(){
+  let mut s=ServiceTable::<3>::new();
+  assert!(s.configure(1,11,2));assert!(s.configure(2,22,2));
+  s.start(1);s.start(2);
+  assert!(!s.stop_group_exact(&[(2,22,1),(1,11,2)]));
+  assert!(s.is_active_exact(1,11,1));assert!(s.is_active_exact(2,22,1));
+  assert!(s.stop_group_exact(&[(2,22,1),(1,11,1)]));
+  assert!(!s.is_active_exact(1,11,1));assert!(!s.is_active_exact(2,22,1));
+ }
+ #[test]fn pending_restart_cannot_be_stopped_as_active(){
+  let mut s=ServiceTable::<2>::new();
+  s.configure(1,11,2);s.configure(2,22,2);s.start(1);s.start(2);
+  assert_eq!(s.crash(22,23),ServiceAction::Restart{pid:23,generation:2});
+  assert!(!s.stop_group_exact(&[(1,11,1),(2,23,2)]));
+  assert!(s.is_active_exact(1,11,1));
+  assert!(!s.stop_group_exact(&[(1,11,1),(1,11,1)]));
+ }
+}
