@@ -1291,3 +1291,58 @@ mod m1_gate20_w4_partition_tests {
   assert_eq!(check_range(u64::MAX,u64::MAX-2,4),Err(BlockError::OutOfRange));
  }
 }
+
+
+/// Bounded all-or-nothing read for critical disk/partition metadata.
+/// A driver can dirty its sector buffer before returning an error: stage all
+/// transfers privately and publish none until every capacity check succeeds.
+pub const MAX_STAGED_READ_SECTORS:usize=8;
+pub fn read_sectors_atomic<D:BlockDevice>(
+ device:&mut D,start:u64,out:&mut[u8])->Result<(),BlockError>{
+ if out.is_empty()||out.len()%SECTOR_BYTES!=0||
+    out.len()/SECTOR_BYTES>MAX_STAGED_READ_SECTORS{
+  return Err(BlockError::OutOfRange);
+ }
+ let count=(out.len()/SECTOR_BYTES) as u64;
+ let capacity=device.sector_count();
+ check_range(capacity,start,count)?;
+ let mut bytes=[0u8;SECTOR_BYTES*MAX_STAGED_READ_SECTORS];
+ for i in 0..count as usize{
+  if device.sector_count()!=capacity{return Err(BlockError::Io);}
+  let mut sector=[0u8;SECTOR_BYTES];
+  device.read_sector(start+i as u64,&mut sector)?;
+  if device.sector_count()!=capacity{return Err(BlockError::Io);}
+  let off=i*SECTOR_BYTES;bytes[off..off+SECTOR_BYTES].copy_from_slice(&sector);
+ }
+ out.copy_from_slice(&bytes[..out.len()]);
+ Ok(())
+}
+#[cfg(test)]
+mod m1_batch04_w2_block_tests{
+ use super::*;
+ struct Disk{fail:Option<u64>,reads:u32}
+ impl BlockDevice for Disk{
+  fn sector_count(&self)->u64{3}
+  fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   self.reads+=1;out.fill(lba as u8+1);
+   if self.fail==Some(lba){return Err(BlockError::Io);}
+   Ok(())
+  }
+  fn write_sector(&mut self,_:u64,_:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   Err(BlockError::ReadOnly)
+  }
+ }
+ #[test]fn staging_never_exposes_second_sector_driver_failure(){
+  let mut d=Disk{fail:Some(1),reads:0};
+  let mut output=[55u8;SECTOR_BYTES*2];
+  assert_eq!(read_sectors_atomic(&mut d,0,&mut output),Err(BlockError::Io));
+  assert_eq!(output,[55u8;SECTOR_BYTES*2]);
+  d.fail=None;
+  assert_eq!(read_sectors_atomic(&mut d,0,&mut output),Ok(()));
+  assert_eq!(&output[..SECTOR_BYTES],[1u8;SECTOR_BYTES]);
+  assert_eq!(&output[SECTOR_BYTES..],[2u8;SECTOR_BYTES]);
+  let before=d.reads;
+  assert_eq!(read_sectors_atomic(&mut d,2,&mut output),Err(BlockError::OutOfRange));
+  assert_eq!(d.reads,before);
+ }
+}

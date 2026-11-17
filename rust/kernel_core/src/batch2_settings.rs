@@ -70,3 +70,36 @@ mod tests{
         store.retire(1,2);assert_eq!(store.read(1,2),Err(SettingsError::NotFound));
     }
 }
+
+
+/// Authenticated all-or-none appearance/settings change across a managed
+/// service cohort, rather than a partially applied theme at lock/restart.
+impl<const N:usize> Store<N>{
+ pub fn update_batch_exact(&mut self,updates:&[(u32,u64,Settings)])
+   ->Result<usize,SettingsError>{
+  if updates.is_empty()||updates.len()>N{return Err(SettingsError::Invalid);}
+  let mut staged=Self{slots:self.slots};
+  for (i,&(pid,epoch,setting)) in updates.iter().enumerate(){
+   if updates[..i].iter().any(|&(previous,_,_)|previous==pid){
+    return Err(SettingsError::Denied);
+   }
+   staged.update(pid,epoch,setting)?;
+  }
+  self.slots=staged.slots;Ok(updates.len())
+ }
+}
+#[cfg(test)]
+mod m1_batch04_w5_theme_tests{
+ use super::*;
+ #[test]fn stale_second_epoch_preserves_all_previous_themes(){
+  let first=Settings{theme:Theme::Light,pointer_speed:5,key_repeat:10};
+  let next=Settings{theme:Theme::Dark,..first};
+  let mut s=Store::<2>::new();
+  s.register(1,1,first).unwrap();s.register(2,4,first).unwrap();
+  assert_eq!(s.update_batch_exact(&[(1,1,next),(2,3,next)]),
+             Err(SettingsError::Denied));
+  assert_eq!(s.read(1,1),Ok(first));assert_eq!(s.read(2,4),Ok(first));
+  assert_eq!(s.update_batch_exact(&[(1,1,next),(2,4,next)]),Ok(2));
+  assert_eq!(s.read(1,1),Ok(next));assert_eq!(s.read(2,4),Ok(next));
+ }
+}

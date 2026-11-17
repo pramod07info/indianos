@@ -2228,3 +2228,73 @@ mod r098_integrated_namespace_tests {
  #[test]fn r098_11_disallow_missing_parents(){let mut fs=volume();let g=fs.generation();assert_eq!(fs.find_bytes_file("/missing/a",b"x"),Err(FsError::NotFound));assert!(fs.prepend_file("/dir",b"x").is_err());assert_eq!(fs.generation(),g);}
  #[test]fn r098_12_input_limit_guard(){let mut fs=volume();let g=fs.generation();assert_eq!(fs.find_bytes_file("/dir/a",&[1;MAX_TRANSFER+1]),Err(FsError::TooLarge));assert_eq!(fs.prepend_file("/dir/a",&[1;MAX_TRANSFER+1]),Err(FsError::TooLarge));assert_eq!(fs.generation(),g);}
 }
+
+
+// M1 batch 4: durable authenticated Files/Terminal/editor operations.
+// These are actual persistent VFS methods; GUI and ring3 syscall wiring remain separate.
+impl<D:BlockDevice> HierVfs<D>{
+ /// Source and destination are authenticated independently. The newly
+ /// committed destination receives the creator's persistent owner/ACL.
+ pub fn copy_file_as_at_generation(&mut self,owner:Credentials,
+  source:&str,destination:&str,mode:u16,expected:u64)->Result<(),FsError>{
+  if self.generation()!=expected||source==destination{return Err(FsError::InvalidVolume);}
+  self.authorize_access(owner,source,READ)?;
+  self.authorize_parent(owner,destination)?;
+  let mut bytes=[0u8;MAX_FILE_BYTES];
+  let count=self.read(source,&mut bytes)?;
+  if self.generation()!=expected{return Err(FsError::InvalidVolume);}
+  self.create_as(owner,destination,&bytes[..count],mode)
+ }
+ /// An editor may replace one existing file only while its exact COW
+ /// generation remains current and both source read and target write hold.
+ /// Existing target permissions/ownership remain unchanged.
+ pub fn replace_file_as_at_generation(&mut self,owner:Credentials,
+  source:&str,target:&str,expected:u64)->Result<(),FsError>{
+  if self.generation()!=expected||source==target{return Err(FsError::InvalidVolume);}
+  self.authorize_access(owner,source,READ)?;
+  self.authorize_access(owner,target,WRITE)?;
+  let mut content=[0u8;MAX_FILE_BYTES];
+  let size=self.read(source,&mut content)?;
+  if self.generation()!=expected{return Err(FsError::InvalidVolume);}
+  self.overwrite(target,&content[..size])
+ }
+}
+#[cfg(test)]
+mod m1_batch04_w1_vfs_tests{
+ use super::*;
+ use crate::block::{BlockError,SECTOR_BYTES};
+ const COUNT:usize=100;
+ struct Disk([[u8;SECTOR_BYTES];COUNT]);
+ impl BlockDevice for Disk{
+  fn sector_count(&self)->u64{COUNT as u64}
+  fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   *out=*self.0.get(lba as usize).ok_or(BlockError::OutOfRange)?;Ok(())
+  }
+  fn write_sector(&mut self,lba:u64,bytes:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   *self.0.get_mut(lba as usize).ok_or(BlockError::OutOfRange)?=*bytes;Ok(())
+  }
+ }
+ #[test]fn authenticated_copy_and_replace_survive_cold_remount(){
+  let root=Credentials::kernel(0,0);
+  let alice=Credentials::kernel(100,7);
+  let bob=Credentials::kernel(200,8);
+  let mut fs=HierVfs::format_blank(Disk([[0;SECTOR_BYTES];COUNT])).unwrap();
+  fs.mkdir_as(root,"/home",0o777).unwrap();
+  fs.create_as(alice,"/home/in",b"alpha",0o600).unwrap();
+  let generation=fs.generation();
+  assert!(fs.copy_file_as_at_generation(bob,"/home/in","/home/bad",0o600,generation).is_err());
+  assert_eq!(fs.generation(),generation);
+  fs.copy_file_as_at_generation(alice,"/home/in","/home/out",0o600,generation).unwrap();
+  let after=fs.generation();
+  assert!(fs.replace_file_as_at_generation(bob,"/home/in","/home/out",after).is_err());
+  assert_eq!(fs.generation(),after);
+  assert!(fs.replace_file_as_at_generation(alice,"/home/in","/home/out",generation).is_err());
+  fs.replace_file_as_at_generation(alice,"/home/in","/home/out",after).unwrap();
+  let mut recovered=HierVfs::mount_consistent_recovery(fs.into_device()).unwrap();
+  let mut output=[0u8;16];
+  assert_eq!(recovered.read_as(alice,"/home/out",&mut output),Ok(5));
+  assert_eq!(&output[..5],b"alpha");
+  assert_eq!(recovered.permissions("/home/out").unwrap().owner,100);
+  assert!(recovered.read_as(bob,"/home/out",&mut output).is_err());
+ }
+}

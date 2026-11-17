@@ -222,8 +222,7 @@ impl AtaPio {
         describe_failure(self.last_stage,status,error)
     }
     fn select(&mut self,lba:u64,command:u8)->Result<(),BlockError>{
-        check_range(self.sectors,lba,1)?;
-        if lba>=MAX_LBA28{return Err(BlockError::OutOfRange);}
+        validate_lba28_request(self.sectors,lba)?;
         // A preceding PIO read may have deasserted BSY before its final
         // DRQ transition. Never program a new command until DRQ clears.
         self.last_stage=AtaStage::WaitIdle;
@@ -559,5 +558,24 @@ mod r091_ata_staging {
   let mut out=[0;SECTOR_BYTES];
   assert_eq!(read_words_staged(&mut out,||0x55aa,||Ok(())),Ok(()));
   assert_eq!(&out[..4],&[0xaa,0x55,0xaa,0x55]);
+ }
+}
+
+
+/// Used by the actual ATA command selector before programming task-file
+/// registers. No LBA28 wrapping into an unrelated partition is permitted.
+fn validate_lba28_request(capacity:u64,lba:u64)->Result<(),BlockError>{
+ if lba>=MAX_LBA28{return Err(BlockError::OutOfRange);}
+ check_range(capacity,lba,1)
+}
+#[cfg(test)]
+mod m1_batch04_w2_ata_tests{
+ use super::*;
+ #[test]fn selected_lba_must_fit_media_and_twenty_eight_bit_controller(){
+  assert_eq!(validate_lba28_request(100,99),Ok(()));
+  assert_eq!(validate_lba28_request(100,100),Err(BlockError::OutOfRange));
+  assert_eq!(validate_lba28_request(MAX_LBA28+1,MAX_LBA28),
+             Err(BlockError::OutOfRange));
+  assert_eq!(validate_lba28_request(0,0),Err(BlockError::OutOfRange));
  }
 }

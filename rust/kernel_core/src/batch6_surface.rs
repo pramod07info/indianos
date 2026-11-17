@@ -1709,3 +1709,53 @@ mod r084_batch_vi_compositor_tests{
         assert!(q.validate_live_queue(&windows));
     }
 }
+
+
+/// Trusted compositor's complete scoped dirty-frame transfer. Either ALL
+/// requested frames translate through current per-owner geometry, or neither
+/// caller output nor queue advances. Stale/recycled owner frames fail closed.
+impl<const N:usize> Surfaces<N>{
+ pub fn drain_screen_batch<const W:usize>(&mut self,windows:&Windows<W>,
+  limit:usize,out:&mut[(Damage,Rect)])->Result<usize,Error>{
+  if limit==0||limit>N{return Err(Error::Invalid);}
+  let needed=limit.min(self.count);
+  if needed==0{return Err(Error::Empty);}
+  if out.len()<needed{return Err(Error::Full);}
+  let mut staged=Self{messages:self.messages,count:self.count,next:self.next};
+  let mut translated=[None;N];
+  for entry in &mut translated[..needed]{
+   let (damage,screen)=staged.next_live(windows)?;
+   *entry=Some((damage,screen));
+  }
+  for (dst,item) in out[..needed].iter_mut().zip(translated[..needed].iter()){
+   *dst=item.ok_or(Error::Empty)?;
+  }
+  *self=staged;Ok(needed)
+ }
+}
+#[cfg(test)]
+mod m1_batch04_w3_surface_tests{
+ use super::*;
+ use crate::batch2_windows::Window;
+ #[test]fn scoped_damage_drain_uses_live_window_and_rollback(){
+  let mut w=Windows::<2>::new();
+  let caller=Identity{pid:8,generation:1};
+  w.create(Window{pid:8,generation:1,id:10,
+    rect:Rect{x:20,y:30,w:50,h:40}}).unwrap();
+  let mut s=Surfaces::<3>::new();
+  s.submit(&w,caller,10,Rect{x:2,y:3,w:4,h:5}).unwrap();
+  let init=Damage{owner:caller,window:10,
+    rect:Rect{x:1,y:1,w:1,h:1},serial:999};
+  let mut out=[(init,Rect{x:1,y:1,w:1,h:1});1];
+  assert_eq!(s.drain_screen_batch(&w,1,&mut[]),Err(Error::Full));
+  assert_eq!(s.pending_total(),1);
+  assert_eq!(s.drain_screen_batch(&w,1,&mut out),Ok(1));
+  assert_eq!(out[0].1,Rect{x:22,y:33,w:4,h:5});
+  assert_eq!(s.pending_total(),0);
+  s.submit(&w,caller,10,Rect{x:2,y:3,w:4,h:5}).unwrap();
+  w.close_exact(8,1,10).unwrap();
+  assert_eq!(s.drain_screen_batch(&w,1,&mut out),Err(Error::Empty));
+  assert_eq!(s.pending_total(),1);
+  assert_eq!(out[0].1,Rect{x:22,y:33,w:4,h:5});
+ }
+}

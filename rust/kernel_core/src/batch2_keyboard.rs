@@ -611,3 +611,46 @@ impl<const Q:usize> Router<Q>{
         assert_eq!(k.receive_up_to(3,5,1,&mut [EMPTY;1]),Ok(1));
     }
 }
+
+
+/// Trusted PS/2 IRQ adapter's exact focus-receipt admission. Reject
+/// stale focus, invalid scan-sets and duplicate events before queueing ANY
+/// event. Physical port ownership remains in the native PS/2 driver.
+impl<const Q:usize> Router<Q>{
+ pub fn physical_set1_batch_at_focus<const W:usize>(&mut self,
+  windows:&Windows<W>,expected:Focus,events:&[(u16,bool)])
+  ->Result<usize,InputError>{
+  if expected.pid==0||expected.generation==0||expected.window==0||
+     self.focus!=Some(expected)||
+     !windows.owns(expected.pid,expected.generation,expected.window){
+    return Err(InputError::Unauthorized);
+  }
+  if events.is_empty()||events.iter().any(|&(scan,_)|
+    scan==0||scan>0x58){
+    return Err(InputError::Invalid);
+  }
+  self.physical_unique_batch(windows,events)
+ }
+}
+#[cfg(test)]
+mod m1_batch04_w6_keyboard_tests{
+ use super::*;
+ use crate::batch2_windows::{Window,Rect};
+ #[test]fn hardware_focus_receipt_blocks_stale_keys_and_queues_atomically(){
+  let mut w=Windows::<2>::new();
+  w.create(Window{pid:1,generation:2,id:8,
+   rect:Rect{x:0,y:0,w:40,h:40}}).unwrap();
+  let mut r=Router::<3>::new();
+  let focus=Focus{pid:1,generation:2,window:8};
+  r.set_focus(&w,focus).unwrap();
+  assert_eq!(r.physical_set1_batch_at_focus(&w,
+    Focus{generation:1,..focus},&[(0x1e,true)]),Err(InputError::Unauthorized));
+  assert_eq!(r.physical_set1_batch_at_focus(&w,focus,
+    &[(0x1e,true),(0x60,false)]),Err(InputError::Invalid));
+  assert_eq!(r.pending_total(),0);
+  assert_eq!(r.physical_set1_batch_at_focus(&w,focus,
+    &[(0x1e,true),(0x1e,false)]),Ok(2));
+  assert_eq!(r.receive(1,2).unwrap().scan_code,0x1e);
+  assert_eq!(r.receive(1,2).unwrap().pressed,false);
+ }
+}
