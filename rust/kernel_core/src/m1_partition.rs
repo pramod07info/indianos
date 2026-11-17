@@ -3019,3 +3019,66 @@ mod m1_partition_tests{
   assert_eq!(&out[..4],b"safe");
  }
 }
+
+
+/// Read-only, two-pass selection of several partitions. An unexpected change
+/// anywhere in the MBR/GPT layout, GUID catalog, or checksum metadata rejects
+/// the entire request without modifying the caller's output buffer.
+pub fn inspect_batch_readonly<D:BlockDevice>(disk:&mut D,indices:&[u32],
+ out:&mut[Partition])->Result<usize,Error>{
+ if indices.is_empty()||indices.len()>MAX_GPT_ENTRIES||out.len()<indices.len(){
+  return Err(Error::TooSmall);
+ }
+ for (i,&index) in indices.iter().enumerate(){
+  if indices[..i].contains(&index){return Err(Error::Invalid);}
+ }
+ let first=discover(disk)?;
+ for &index in indices{first.get(index).ok_or(Error::NotFound)?;}
+ let next=discover(disk)?;
+ if first.scheme!=next.scheme||first.count!=next.count||
+    first.slots!=next.slots||first.disk_guid!=next.disk_guid||
+    first.gpt_guids!=next.gpt_guids||
+    first.gpt_metadata_crc32!=next.gpt_metadata_crc32{
+  return Err(Error::Invalid);
+ }
+ for (i,&index) in indices.iter().enumerate(){
+  out[i]=next.get(index).ok_or(Error::NotFound)?;
+ }
+ Ok(indices.len())
+}
+#[cfg(test)]
+mod m1_batch04_w1_partition_tests{
+ use super::*;
+ struct Disk{mbr:[u8;SECTOR_BYTES],writes:usize}
+ impl BlockDevice for Disk{
+  fn sector_count(&self)->u64{256}
+  fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   if lba>=256{return Err(BlockError::OutOfRange);}
+   if lba==0{*out=self.mbr;}else{out.fill(0);}
+   Ok(())
+  }
+  fn write_sector(&mut self,_:u64,_:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   self.writes+=1;Err(BlockError::ReadOnly)
+  }
+ }
+ fn disk()->Disk{
+  let mut mbr=[0u8;SECTOR_BYTES];
+  mbr[510]=0x55;mbr[511]=0xaa;
+  mbr[450]=0x83;
+  mbr[454..458].copy_from_slice(&10u32.to_le_bytes());
+  mbr[458..462].copy_from_slice(&100u32.to_le_bytes());
+  Disk{mbr,writes:0}
+ }
+ #[test]fn multiple_selection_is_readonly_and_output_atomic(){
+  let mut d=disk();
+  let sentinel=Partition{scheme:Scheme::Gpt,index:99,start:99,sectors:1};
+  let mut out=[sentinel;2];
+  assert_eq!(inspect_batch_readonly(&mut d,&[0,1],&mut out),Err(Error::NotFound));
+  assert_eq!(out,[sentinel;2]);
+  assert_eq!(inspect_batch_readonly(&mut d,&[0,0],&mut out),Err(Error::Invalid));
+  assert_eq!(out,[sentinel;2]);
+  assert_eq!(inspect_batch_readonly(&mut d,&[0],&mut out),Ok(1));
+  assert_eq!((out[0].start,out[0].sectors),(10,100));
+  assert_eq!(d.writes,0);
+ }
+}

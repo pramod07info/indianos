@@ -1,0 +1,90 @@
+name: M1 gates 8, 11, 12 and 13 - six validation workstations
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'rust/kernel_core/src/**'
+      - '.github/workflows/m1-gates-six-workstations.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  six-workstation-checks:
+    name: ${{ matrix.workstation }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - workstation: W1-boot-initramfs
+            filter: m1_gate20_w1
+            next_filter: m1_batch03_w1
+            batch4_filter: m1_batch04_w1
+            batch5_filter: m1_batch05_w1
+            features: normal-desktop
+          - workstation: W2-PID1-runtime
+            filter: m1_gate20_w2
+            next_filter: m1_batch03_w2
+            batch4_filter: m1_batch04_w2
+            batch5_filter: m1_batch05_w2
+            features: test-r031-supervisor
+          - workstation: W3-VFS-integrity
+            filter: m1_gate20_w3
+            next_filter: m1_batch03_w3
+            batch4_filter: m1_batch04_w3
+            batch5_filter: m1_batch05_w3
+            features: test-r031-vfs
+          - workstation: W4-filesystem-handles
+            filter: m1_gate20_w4
+            next_filter: m1_batch03_w4
+            batch4_filter: m1_batch04_w4
+            batch5_filter: m1_batch05_w4
+            features: test-r031-vfs
+          - workstation: W5-syscalls-capabilities
+            filter: m1_gate20_w5
+            next_filter: m1_batch03_w5
+            batch4_filter: m1_batch04_w5
+            batch5_filter: m1_batch05_w5
+            features: test-r031-vfs
+          - workstation: W6-traps-hardware
+            filter: m1_gate20_w6
+            next_filter: m1_batch03_w6
+            batch4_filter: m1_batch04_w6
+            batch5_filter: m1_batch05_w6
+            features: normal-desktop
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify exact PR head revision
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: python3 tools/verify_ci_sha.py --expected "$EXPECTED_SHA" --observed "$(git rev-parse HEAD)"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
+      - name: Assert this workstation owns real tests and execute them
+        env:
+          FILTER: ${{ matrix.filter }}
+          NEXT_FILTER: ${{ matrix.next_filter }}
+          BATCH4_FILTER: ${{ matrix.batch4_filter }}
+          BATCH5_FILTER: ${{ matrix.batch5_filter }}
+          FEATURES: ${{ matrix.features }}
+        run: |
+          set -euo pipefail
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$FILTER" -- --list | grep -F "$FILTER"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$FILTER"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$NEXT_FILTER" -- --list | grep -F "$NEXT_FILTER"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$NEXT_FILTER"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$BATCH4_FILTER" -- --list | grep -F "$BATCH4_FILTER"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$BATCH4_FILTER"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$BATCH5_FILTER" -- --list | grep -F "$BATCH5_FILTER"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$BATCH5_FILTER"
+      - name: Compile freestanding kernel feature profile
+        env:
+          FEATURES: ${{ matrix.features }}
+        run: >-
+          cargo check --locked --offline --manifest-path rust/kernel_core/Cargo.toml
+          --no-default-features --target x86_64-unknown-none --features "$FEATURES"

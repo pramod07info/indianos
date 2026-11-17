@@ -538,3 +538,49 @@ mod pr782_ws75_77_tests{
   assert_eq!(out,[sentinel;2]);
  }
 }
+
+/// Read-only exact-BDF diagnostic snapshot: reject duplicate/unknown bus
+/// functions before publishing any output. Never maps BARs or enables DMA.
+pub fn snapshot_exact_devices(state:&Topology,requests:&[(u8,u8,u8)],
+    out:&mut[Device])->Result<usize,Error>{
+    validate_topology(state)?;
+    if requests.is_empty()||requests.len()>MAX_ACCELERATORS{
+        return Err(Error::MalformedBridge);
+    }
+    if out.len()<requests.len(){return Err(Error::OutputTooSmall);}
+    for (i,&(bus,slot,function)) in requests.iter().enumerate(){
+        if requests[..i].contains(&(bus,slot,function)){
+            return Err(Error::AmbiguousBus);
+        }
+        if find_device_exact(state,bus,slot,function)?.is_none(){
+            return Err(Error::MalformedBridge);
+        }
+    }
+    for (i,&(bus,slot,function)) in requests.iter().enumerate(){
+        out[i]=find_device_exact(state,bus,slot,function)?
+            .ok_or(Error::MalformedBridge)?;
+    }
+    Ok(requests.len())
+}
+#[cfg(test)]
+mod m1_gate20_w6_pci_tests {
+ use super::*;
+ #[test]fn diagnostic_bdf_batch_is_atomic_for_unknown_or_duplicate_identity(){
+  let cpu=hw::Cpu{vendor:*b"TestTestTest",family:6,model:1,stepping:0,
+   features:hw::CPU_REQUIRED,max_basic:7,max_extended:0x8000_0001};
+  let hdr=PciHeader{vendor:0x1234,device:1,class:3,subclass:0,prog_if:0,header_type:0};
+  let dev=Device{bus:0,slot:2,function:0,header:hdr,kind:Accelerator::Gpu};
+  let mut accelerators=[None;MAX_ACCELERATORS];accelerators[0]=Some(dev);
+  let state=Topology{abi:TOPOLOGY_ABI,inventory:Inventory{
+   abi:PROFILE_ABI,cpu,accelerators,count:1,gpu_count:1,npu_count:0,
+   physical_qpu_available:false,cpu_software_fallback:true},
+   scanned_buses:1,discovered_bridges:0,pcie_ecam_active:false};
+  let mut out=[dev;2];
+  assert_eq!(snapshot_exact_devices(&state,&[(0,2,0),(0,3,0)],&mut out),
+             Err(Error::MalformedBridge));
+  assert_eq!(out,[dev;2]);
+  assert_eq!(snapshot_exact_devices(&state,&[(0,2,0),(0,2,0)],&mut out),
+             Err(Error::AmbiguousBus));
+  assert_eq!(snapshot_exact_devices(&state,&[(0,2,0)],&mut out),Ok(1));
+ }
+}

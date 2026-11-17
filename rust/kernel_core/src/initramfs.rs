@@ -77,7 +77,9 @@ fn walk(bytes: &[u8], wanted: Option<&[u8]>) -> Option<Option<Ramfile>> {
         if flags != 0 { return None; }
         cursor += ENTRY_HEADER;
         let name = bytes.get(cursor..cursor.checked_add(name_len)?)?;
-        if !path_valid(name) { return None; }
+        if !path_valid(name) || (name == b"/bin/init" && content_len == 0) {
+            return None;
+        }
         for &(previous_start, previous_size) in &seen[..index] {
             if previous_size == name.len() &&
                bytes.get(previous_start..previous_start + previous_size)? == name {
@@ -190,4 +192,17 @@ mod tests {
         }
         assert!(walk(&valid, Some(b"../../secret")).is_none());
     }
+}
+
+#[cfg(test)]
+mod m1_gate20_w1_archive_tests{
+ use super::*;
+ #[test]fn empty_pid1_image_is_rejected_at_full_archive_validation(){
+  let mut out=std::vec::Vec::from(&b"INDRAM01"[..]);
+  out.extend_from_slice(&1u32.to_le_bytes());out.extend_from_slice(&0u32.to_le_bytes());
+  out.extend_from_slice(&9u16.to_le_bytes());out.extend_from_slice(&0u16.to_le_bytes());
+  out.extend_from_slice(&0u32.to_le_bytes());out.extend_from_slice(b"/bin/init");
+  let size=out.len() as u32;out[12..16].copy_from_slice(&size.to_le_bytes());
+  assert!(walk(&out,None).is_none());
+ }
 }

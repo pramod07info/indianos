@@ -327,3 +327,32 @@ mod pr782_ws71_74_tests{
    Err(Error::Address));
  }
 }
+
+/// Preflight the complete firmware MCFG window set before publishing one
+/// selected read-only ECAM register address. Reserved physical apertures and
+/// ambiguous segment ownership fail closed, with no MMIO dereference.
+pub fn config_access_checked_windows(windows:&[Window],
+ reserved:&[(u64,u64)],segment:u16,bus:u8,request:RegisterAccess)
+ ->Result<u64,Error>{
+ let window=find_unique_window(windows,segment,bus)?;
+ reject_reserved_apertures(windows,reserved)?;
+ config_access(window,segment,bus,request.device,request.function,
+               request.offset,request.width)
+}
+#[cfg(test)]
+mod m1_gate20_w6_next_acpi_tests{
+ use super::*;
+ #[test]fn selected_ecam_access_checks_all_windows_and_reserved_memory(){
+  let first=Window{base:0x8000_0000,segment:0,start_bus:0,end_bus:1};
+  let peer=Window{base:0x9000_0000,segment:1,start_bus:4,end_bus:4};
+  let access=RegisterAccess{device:2,function:0,offset:4,width:4};
+  assert_eq!(config_access_checked_windows(&[first,peer],&[],0,0,access),
+             Ok(0x8001_0004));
+  assert_eq!(config_access_checked_windows(&[first,first],&[],0,0,access),
+             Err(Error::Overlap));
+  assert_eq!(config_access_checked_windows(&[first,peer],
+             &[(0x8000_0000,4096)],0,0,access),Err(Error::Overlap));
+  assert_eq!(config_access_checked_windows(&[first,peer],&[],0,0,
+             RegisterAccess{offset:3,..access}),Err(Error::Address));
+ }
+}

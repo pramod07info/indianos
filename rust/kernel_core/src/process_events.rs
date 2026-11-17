@@ -1368,3 +1368,113 @@ mod pr782_ws59_61_tests{
         assert_eq!(q.len(),4);
     }
 }
+
+/// A non-starving scheduler selection primitive: prefer authenticated
+/// priority-threshold work when it exists, but fall back to ordinary round
+/// robin rather than leaving a runnable low-priority task behind forever.
+/// Policy-only until wired to actual per-CPU timer dispatch.
+impl<const C:usize,const N:usize> CoreRunQueues<C,N>{
+ pub fn next_with_priority_fallback(&mut self,cpu:usize,minimum:u8)
+    ->Result<(Runnable,bool),DispatchError>{
+  match self.next_eligible(cpu,minimum){
+   Ok(task)=>Ok((task,false)),
+   Err(DispatchError::Empty)=>self.next(cpu).map(|task|(task,true)),
+   Err(error)=>Err(error),
+  }
+ }
+}
+#[cfg(test)]
+mod m1_gate20_w5_next_dispatch_tests{
+ use super::*;
+ #[test]fn priority_fallback_can_run_low_priority_peer_without_starvation(){
+  let mut q=CoreRunQueues::<1,2>::new();
+  let low=Runnable{pid:5,generation:1,priority:1};
+  let high=Runnable{pid:6,generation:1,priority:9};
+  q.enqueue(0,low).unwrap();
+  assert_eq!(q.next_with_priority_fallback(0,8),Ok((low,true)));
+  q.enqueue(0,high).unwrap();
+  assert_eq!(q.next_with_priority_fallback(0,8),Ok((high,false)));
+  assert_eq!(q.next_with_priority_fallback(3,8),Err(DispatchError::InvalidCpu));
+ }
+}
+
+impl<const C:usize,const N:usize> CoreRunQueues<C,N>{
+ /// Bounded protected-PID OOM candidate selection, without killing tasks.
+ pub fn lowest_priority_victim(&self,protected_pid:u32)
+  ->Option<(usize,Runnable)>{
+  let mut chosen:Option<(usize,Runnable)>=None;
+  for cpu in 0..C{
+   for &task in self.queues[cpu][..self.length[cpu]].iter().flatten(){
+    if task.pid==0||task.generation==0||task.pid==protected_pid{continue;}
+    if chosen.is_none_or(|(_,prior)|task.priority<prior.priority){
+     chosen=Some((cpu,task));
+    }
+   }
+  }
+  chosen
+ }
+ /// Exact authenticated incarnation only; no physical frame reclaim here.
+ pub fn evict_pressure_victim_exact(&mut self,cpu:usize,pid:u32,epoch:u64)
+  ->Result<Runnable,DispatchError>{
+  if cpu>=C{return Err(DispatchError::InvalidCpu);}
+  let chosen=self.queues[cpu][..self.length[cpu]].iter().flatten()
+   .find(|task|task.pid==pid&&task.generation==epoch)
+   .copied().ok_or(DispatchError::InvalidTask)?;
+  if self.evict(pid,epoch)!=1{return Err(DispatchError::InvalidTask);}
+  Ok(chosen)
+ }
+}
+#[cfg(test)]mod m1_batch03_w4_cpu_tests{
+ use super::*;
+ #[test]fn memory_pressure_protects_pid1_and_generation(){
+  let mut q=CoreRunQueues::<2,2>::new();
+  let protected=Runnable{pid:1,generation:1,priority:0};
+  let low=Runnable{pid:2,generation:3,priority:1};
+  q.enqueue(0,protected).unwrap();q.enqueue(0,low).unwrap();
+  q.enqueue(1,Runnable{pid:3,generation:2,priority:9}).unwrap();
+  assert_eq!(q.lowest_priority_victim(1),Some((0,low)));
+  assert_eq!(q.evict_pressure_victim_exact(0,2,2),Err(DispatchError::InvalidTask));
+  assert_eq!(q.evict_pressure_victim_exact(0,2,3),Ok(low));
+  assert!(q.contains_epoch(1,1));
+ }
+ #[test]fn pressure_denies_unowned_cpu(){
+  let mut q=CoreRunQueues::<1,1>::new();
+  let r=Runnable{pid:5,generation:8,priority:1};q.enqueue(0,r).unwrap();
+  assert_eq!(q.evict_pressure_victim_exact(1,5,8),Err(DispatchError::InvalidCpu));
+  assert_eq!(q.next(0),Ok(r));
+ }
+}
+
+
+/// Task Manager: snapshot only from scheduler-authenticated PID1 epoch.
+/// It does NOT expose task control or a kill syscall to an untrusted GUI.
+impl<const C:usize,const N:usize> CoreRunQueues<C,N>{
+ pub fn snapshot_pid1_task_manager(&self,authenticated:Runnable,
+  out:&mut[(usize,Runnable)])->Result<usize,DispatchError>{
+  if authenticated.pid!=1||authenticated.generation==0||
+     !self.contains_epoch(1,authenticated.generation){
+   return Err(DispatchError::InvalidTask);
+  }
+  self.snapshot_runnable(out)
+ }
+}
+#[cfg(test)]
+mod m1_batch05_w1_task_manager_tests{
+ use super::*;
+ #[test]fn only_current_pid1_may_snapshot_bounded_task_inventory(){
+  let mut s=CoreRunQueues::<2,2>::new();
+  let pid1=Runnable{pid:1,generation:10,priority:0};
+  let peer=Runnable{pid:2,generation:4,priority:1};
+  s.enqueue(0,pid1).unwrap();s.enqueue(1,peer).unwrap();
+  let sentinel=(7,Runnable{pid:9,generation:9,priority:9});
+  let mut output=[sentinel;2];
+  assert_eq!(s.snapshot_pid1_task_manager(Runnable{generation:9,..pid1},
+    &mut output),Err(DispatchError::InvalidTask));
+  assert_eq!(output,[sentinel;2]);
+  assert_eq!(s.snapshot_pid1_task_manager(pid1,&mut output[..1]),
+    Err(DispatchError::Full));
+  assert_eq!(output,[sentinel;2]);
+  assert_eq!(s.snapshot_pid1_task_manager(pid1,&mut output),Ok(2));
+  assert_eq!(output,[(0,pid1),(1,peer)]);
+ }
+}

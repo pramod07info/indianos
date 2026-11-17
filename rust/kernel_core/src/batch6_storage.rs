@@ -146,3 +146,76 @@ mod r085_storage_acceptance{
     b"new",&mut backend),Err(Error::Corrupt));
  }
 }
+
+
+/// Removable-media mount receipt returned by a TRUSTED kernel driver.
+/// These values are not cryptographic evidence if invented by userspace.
+/// A secure storage backend must implement its own authenticated encryption
+/// and crash-durable commit; no plaintext fallback is authorized here.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct EncryptedMediaReceipt{pub device:[u8;16],pub generation:u64,
+ pub authenticated_encryption:bool}
+pub trait EncryptedRemovableBackend{
+ fn observed_media(&mut self)->Result<EncryptedMediaReceipt,()>;
+ fn encrypted_atomic_write(&mut self,path:&[u8],data:&[u8])->Result<(),()>;
+}
+pub fn write_encrypted_removable<B:EncryptedRemovableBackend,const N:usize>(
+ auth:&Access<N>,owner:Identity,now:u64,expected:EncryptedMediaReceipt,
+ path:&str,data:&[u8],backend:&mut B)->Result<(),Error>{
+ auth.require(owner,FILE_WRITE,now).map_err(|_|Error::Unauthorized)?;
+ if data.is_empty()||data.len()>MAX_WRITE{return Err(Error::TooLarge);}
+ if expected.device==[0;16]||expected.generation==0||
+    !expected.authenticated_encryption{return Err(Error::Unauthorized);}
+ let mut canonical=[0u8;PATH_CAP];
+ let len=normalize_absolute(path,&mut canonical).map_err(|_|Error::Invalid)?;
+ if len<2{return Err(Error::Invalid);}
+ let path=core::str::from_utf8(&canonical[..len]).map_err(|_|Error::Invalid)?;
+ crate::fs_write_guard::WriteGuard::allow_path(path)
+   .map_err(|_|Error::Unauthorized)?;
+ if backend.observed_media().map_err(|_|Error::Storage)?!=expected{
+  return Err(Error::Unauthorized);
+ }
+ // The only permitted backend entry point is explicitly encrypted.
+ backend.encrypted_atomic_write(&canonical[..len],data)
+   .map_err(|_|Error::Storage)?;
+ if backend.observed_media().map_err(|_|Error::Storage)?!=expected{
+  return Err(Error::Storage); // uncertain media change; do not claim durability
+ }
+ Ok(())
+}
+#[cfg(test)]
+mod m1_batch05_w6_encrypted_removable_tests{
+ use super::*;
+ struct Mock{receipt:EncryptedMediaReceipt,writes:usize,swap_after_write:bool}
+ impl EncryptedRemovableBackend for Mock{
+  fn observed_media(&mut self)->Result<EncryptedMediaReceipt,()>{
+   Ok(self.receipt)
+  }
+  fn encrypted_atomic_write(&mut self,_:&[u8],_:&[u8])->Result<(),()>{
+   self.writes+=1;
+   if self.swap_after_write{self.receipt.generation+=1;}
+   Ok(())
+  }
+ }
+ #[test]fn stale_or_unencrypted_media_is_rejected_before_any_write(){
+  let id=Identity{pid:5,generation:2};
+  let mut acl=Access::<1>::new();acl.grant(id,FILE_WRITE,100).unwrap();
+  let receipt=EncryptedMediaReceipt{device:[7;16],generation:9,
+     authenticated_encryption:true};
+  let mut backend=Mock{receipt,writes:0,swap_after_write:false};
+  let mut wrong=receipt;wrong.authenticated_encryption=false;
+  assert_eq!(write_encrypted_removable(&acl,id,2,wrong,
+     "/documents",b"data",&mut backend),Err(Error::Unauthorized));
+  assert_eq!(backend.writes,0);
+  assert_eq!(write_encrypted_removable(&acl,Identity{generation:4,..id},
+     2,receipt,"/documents",b"data",&mut backend),
+     Err(Error::Unauthorized));
+  assert_eq!(write_encrypted_removable(&acl,id,2,receipt,
+     "/documents",b"data",&mut backend),Ok(()));
+  assert_eq!(backend.writes,1);
+  backend.swap_after_write=true;
+  assert_eq!(write_encrypted_removable(&acl,id,2,receipt,
+     "/documents",b"data",&mut backend),Err(Error::Storage));
+  assert_eq!(backend.writes,2);
+ }
+}

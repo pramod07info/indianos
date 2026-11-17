@@ -40,13 +40,37 @@ fn log(s: &'static [u8]) { unsafe { serial_write(s.as_ptr().cast()) }; }
 unsafe fn memory_map() -> Option<&'static MemoryMap> {
     unsafe { boot_limine_memmap().as_ref() }
 }
+fn valid_region(r:&Region)->bool{
+    r.length!=0 && r.base.checked_add(r.length).is_some()
+}
+/// A firmware-provided direct-map base must be a canonical high-half page
+/// boundary and leave room for at least one mapped page without overflow.
+/// This is a numeric guard, not proof of a valid mapped physical page.
+fn hhdm_offset_sane(offset:u64)->bool{
+    offset>=0xffff_8000_0000_0000 &&
+    offset&0xfff==0 &&
+    offset.checked_add(4096).is_some()
+}
 fn validate_ranges(regions:&[Region]) -> bool {
     let mut usable=false;
     for r in regions {
-        if r.length==0 || r.base.checked_add(r.length).is_none() { return false; }
+        if !valid_region(r) { return false; }
         usable |= r.kind==0;
     }
     usable
+}
+/// Preflight the complete Limine memory map before exporting its count.
+/// An invalid late entry must never let the PMM consume a partial map.
+fn validated_map_count(map:&MemoryMap)->Option<u64>{
+    if map.entries.is_null()||!(1..=4096).contains(&map.count){return None;}
+    let mut usable=false;
+    for i in 0..map.count as usize{
+        let item=unsafe{ptr::read_volatile(map.entries.add(i))};
+        let region=unsafe{item.as_ref()}?;
+        if !valid_region(region){return None;}
+        usable |= region.kind==0;
+    }
+    if usable{Some(map.count)}else{None}
 }
 /// # Safety
 /// Called while Limine response pointers are valid (before bootloader
@@ -59,27 +83,15 @@ pub unsafe extern "C" fn boot_validate() -> bool {
     let Some(map) = (unsafe { memory_map() }) else {
         log(b"IndianOS: missing or oversized memory map\n\0"); return false;
     };
-    if map.entries.is_null() || !(1..=4096).contains(&map.count) {
-        log(b"IndianOS: missing or oversized memory map\n\0"); return false;
+    if validated_map_count(map).is_none(){
+        log(b"IndianOS: invalid or unusable memory map\n\0");return false;
     }
-    let mut usable=false;
-    for i in 0..map.count as usize {
-        let item=unsafe { ptr::read_volatile(map.entries.add(i)) };
-        let Some(region)=(unsafe { item.as_ref() }) else {
-            log(b"IndianOS: invalid memory region\n\0"); return false;
-        };
-        if region.length==0 || region.base.checked_add(region.length).is_none() {
-            log(b"IndianOS: invalid memory region\n\0"); return false;
-        }
-        usable |= region.kind==0;
-    }
-    if !usable { log(b"IndianOS: no usable RAM in memory map\n\0"); }
-    usable
+    true
 }
 #[no_mangle]
 pub unsafe extern "C" fn boot_memory_region_count() -> u64 {
     let Some(m)=(unsafe { memory_map() }) else {return 0};
-    m.count
+    validated_map_count(m).unwrap_or(0)
 }
 /// # Safety
 /// Valid writable C region output or null. The context parameter is ignored.
@@ -88,9 +100,10 @@ pub unsafe extern "C" fn boot_memory_region_count() -> u64 {
 pub unsafe extern "C" fn boot_memory_region_at(index:u64,out:*mut Region,_context:*mut c_void)->bool {
     if out.is_null(){return false}
     let Some(m)=(unsafe {memory_map()}) else {return false};
-    if m.entries.is_null() || index>=m.count || m.count>4096 {return false}
+    if validated_map_count(m).is_none() || index>=m.count {return false}
     let item=unsafe {ptr::read_volatile(m.entries.add(index as usize))};
     let Some(region)=(unsafe {item.as_ref()}) else {return false};
+    if !valid_region(region) {return false;}
     unsafe {ptr::write(out,*region);}
     true
 }
@@ -100,6 +113,7 @@ pub unsafe extern "C" fn boot_memory_region_at(index:u64,out:*mut Region,_contex
 pub unsafe extern "C" fn boot_hhdm_offset(out:*mut u64)->bool {
     if out.is_null(){return false}
     let Some(h)=(unsafe {boot_limine_hhdm().as_ref()}) else {return false};
+    if !hhdm_offset_sane(h.offset){return false;}
     unsafe {ptr::write(out,h.offset);}
     true
 }
@@ -312,4 +326,58 @@ mod tests{
         assert_eq!(core::mem::size_of::<Region>(),24);
         assert_eq!(core::mem::offset_of!(LimineFile,size),16);
     }
+}
+
+
+#[cfg(test)]
+mod m1_batch01_w3_boot_tests{
+ use super::*;
+ #[test]fn b01_08_valid_ram_entry_is_accepted(){
+  assert!(valid_region(&Region{base:0x1000,length:0x2000,kind:0}));
+ }
+ #[test]fn b01_09_zero_length_memory_entry_is_rejected(){
+  assert!(!valid_region(&Region{base:0,length:0,kind:0}));
+ }
+ #[test]fn b01_10_wrapping_boot_region_is_rejected(){
+  assert!(!valid_region(&Region{base:u64::MAX-1,length:3,kind:0}));
+ }
+ #[test]fn b01_11_nonusable_only_map_is_rejected(){
+  assert!(!validate_ranges(&[Region{base:0x1000,length:0x1000,kind:1}]));
+ }
+}
+#[cfg(test)]
+mod m1_gate20_w1_boot_tests {
+ use super::*;
+ #[test]fn exported_map_count_fails_closed_on_corrupt_tail(){
+  let ok=Region{base:0x1000,length:0x1000,kind:0};
+  let bad=Region{base:u64::MAX,length:2,kind:1};
+  let entries=[&ok as *const Region,&bad as *const Region];
+  let map=MemoryMap{revision:0,count:2,entries:entries.as_ptr()};
+  assert_eq!(validated_map_count(&map),None);
+  let good_entries=[&ok as *const Region];
+  let good=MemoryMap{revision:0,count:1,entries:good_entries.as_ptr()};
+  assert_eq!(validated_map_count(&good),Some(1));
+ }
+}
+
+#[cfg(test)]
+mod m1_gate20_w1_next_boot_tests{
+ use super::*;
+ #[test]fn complete_memory_map_preflight_blocks_late_corruption(){
+   let good=Region{base:0x1000,length:0x2000,kind:0};
+   let bad=Region{base:u64::MAX-1,length:4,kind:1};
+   let refs=[&good as *const Region,&bad as *const Region];
+   let map=MemoryMap{revision:0,count:2,entries:refs.as_ptr()};
+   assert_eq!(validated_map_count(&map),None);
+   let refs=[&good as *const Region];
+   let map=MemoryMap{revision:0,count:1,entries:refs.as_ptr()};
+   assert_eq!(validated_map_count(&map),Some(1));
+ }
+ #[test]fn direct_map_must_be_canonical_aligned_and_nonwrapping(){
+   assert!(hhdm_offset_sane(0xffff_8000_0000_0000));
+   assert!(!hhdm_offset_sane(0));
+   assert!(!hhdm_offset_sane(0x8000_0000));
+   assert!(!hhdm_offset_sane(0xffff_8000_0000_0001));
+   assert!(!hhdm_offset_sane(0xffff_ffff_ffff_f000));
+ }
 }

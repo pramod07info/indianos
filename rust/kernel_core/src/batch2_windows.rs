@@ -597,3 +597,49 @@ impl<const N:usize> Windows<N>{
         assert_eq!(ws.get(1).unwrap().rect.x,0);
     }
 }
+
+
+/// Read-only hit-test for multiple physical-pointer positions. No partial
+/// destination writes on an invalid coordinate; respects current stacking.
+impl<const N:usize> Windows<N>{
+ pub fn hit_test_batch(&self,points:&[(u32,u32)],
+  out:&mut[Option<Window>])->Result<usize,WindowError>{
+  if points.is_empty()||points.len()>N||out.len()<points.len(){
+   return Err(WindowError::Full);
+  }
+  if points.iter().any(|&(x,y)|x>=WIDTH||y>=HEIGHT){
+   return Err(WindowError::Invalid);
+  }
+  for (slot,&(x,y)) in out.iter_mut().zip(points){
+   *slot=self.hit_test(x,y);
+  }
+  Ok(points.len())
+ }
+ /// Physical window activation uses the validated exact owner identity.
+ /// Unauthorized/recycled windows cannot raise or alter future hit-tests.
+ pub fn activate_at_exact(&mut self,pid:u32,epoch:u64,id:u32,
+  x:u32,y:u32)->Result<Option<Window>,WindowError>{
+  if x>=WIDTH||y>=HEIGHT{return Err(WindowError::Invalid);}
+  self.raise_exact(pid,epoch,id)?;
+  Ok(self.hit_test(x,y))
+ }
+}
+#[cfg(test)]
+mod m1_batch04_w4_windows_tests{
+ use super::*;
+ #[test]fn hit_test_respects_z_order_and_rejects_bad_activation(){
+  let mut w=Windows::<3>::new();
+  let rect=Rect{x:0,y:0,w:100,h:100};
+  w.create(Window{pid:1,generation:1,id:5,rect}).unwrap();
+  w.create(Window{pid:2,generation:1,id:6,rect}).unwrap();
+  let mut hits=[None;2];
+  assert_eq!(w.hit_test_batch(&[(20,20),(110,110)],&mut hits),Ok(2));
+  assert_eq!(hits[0].unwrap().id,6);
+  assert_eq!(w.activate_at_exact(1,2,5,20,20),Err(WindowError::Denied));
+  assert_eq!(w.hit_test(20,20).unwrap().id,6);
+  assert_eq!(w.activate_at_exact(1,1,5,20,20).unwrap().unwrap().id,5);
+  let before=hits;
+  assert_eq!(w.hit_test_batch(&[(0,0),(WIDTH,0)],&mut hits),Err(WindowError::Invalid));
+  assert_eq!(hits,before);
+ }
+}

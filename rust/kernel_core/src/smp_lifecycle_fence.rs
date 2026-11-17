@@ -533,3 +533,28 @@ mod pr782_ws62_64_tests{
         assert_eq!(f.require_pending_exact(0,two),Ok(()));
     }
 }
+
+/// BSP-only multi-AP reclaim barrier: every independently owned receipt
+/// must be acknowledged at its exact generation. This does not issue IPIs.
+pub fn require_all_acks_for_reclaim(receipts:&[(&LifecycleFence,u32,Receipt)])
+ ->Result<(),FenceError>{
+ if receipts.is_empty(){return Err(FenceError::NoProgress);}
+ for &(fence,cpu,receipt) in receipts{
+  fence.require_ack_for_reclaim(cpu,receipt)?;
+ }
+ Ok(())
+}
+#[cfg(test)]
+mod m1_gate20_w5_next_smp_tests{
+ use super::*;
+ #[test]fn reclaim_requires_both_ap_acknowledgements(){
+  let a=LifecycleFence::new(0,1);let b=LifecycleFence::new(2,3);
+  let one=a.publish(0,10).unwrap();let two=b.publish(2,12).unwrap();
+  a.observe_and_ack_after(1,0,|_|true).unwrap();
+  assert_eq!(require_all_acks_for_reclaim(&[(&a,0,one),(&b,2,two)]),
+      Err(FenceError::NoProgress));
+  b.observe_and_ack_after(3,0,|_|true).unwrap();
+  assert_eq!(require_all_acks_for_reclaim(&[(&a,0,one),(&b,2,two)]),Ok(()));
+  assert_eq!(require_all_acks_for_reclaim(&[]),Err(FenceError::NoProgress));
+ }
+}

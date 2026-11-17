@@ -57,7 +57,16 @@ pub struct SyscallRequest {
 
 pub(crate) fn user_range(plan: &ProgramPlan, address: u64, length: u64, write: bool) -> bool {
     if length == 0 || address < USER_MIN || address >= USER_TOP ||
-        length > USER_TOP - address {
+        length > USER_TOP - address ||
+        plan.segment_count as usize > MAX_SEGMENTS {
+        return false;
+    }
+    // A malformed overlapping segment cannot reauthorize the protected
+    // user guard page, even if the segment itself is marked writable.
+    let end=address+length;
+    if plan.guard_begin>=USER_MIN &&
+        plan.guard_begin.checked_add(PAGE_BYTES).is_some_and(|guard_end|
+            address<guard_end&&plan.guard_begin<end){
         return false;
     }
     if address >= plan.stack_begin &&
@@ -529,4 +538,67 @@ mod tests {
         regs[17] &= !2;
         assert!(!ring3_frame_valid(&regs, &plan, true));
     }
+}
+
+#[cfg(test)]
+mod m1_gate20_w5_usercopy_tests{
+ use super::*;
+ #[test]fn malicious_segment_overlap_cannot_expose_guard_or_overrun_plan(){
+  let mut p=ProgramPlan{entry:USER_MIN,stack_begin:USER_TOP-STACK_BYTES,
+   stack_end:USER_TOP,guard_begin:USER_MIN+PAGE_BYTES,
+   segment_count:1,segments:[ProgramSegment::empty();MAX_SEGMENTS]};
+  p.segments[0]=ProgramSegment{page_begin:USER_MIN,page_end:USER_MIN+3*PAGE_BYTES,
+   writable:true,executable:false,..ProgramSegment::empty()};
+  assert!(user_range(&p,USER_MIN+32,16,true));
+  assert!(!user_range(&p,p.guard_begin+32,16,true));
+  assert!(!user_range(&p,p.guard_begin-4,16,true));
+  p.segment_count=(MAX_SEGMENTS+1) as u32;
+  assert!(!user_range(&p,USER_MIN+32,16,false));
+ }
+}
+
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub(crate) struct CopySpan{pub address:u64,pub length:u64,pub writable:bool}
+/// Preflight every scatter/gather user transfer without reading any user
+/// pointer; writable alias, overflow, guard and partial admission fail closed.
+pub(crate) fn user_copy_batch_valid(plan:&ProgramPlan,spans:&[CopySpan])->bool{
+ if spans.is_empty()||spans.len()>MAX_SEGMENTS{return false;}
+ for (i,&span) in spans.iter().enumerate(){
+  if !user_range(plan,span.address,span.length,span.writable){return false;}
+  let Some(end)=span.address.checked_add(span.length)else{return false};
+  for prior in &spans[..i]{
+   let Some(other_end)=prior.address.checked_add(prior.length)
+    else{return false};
+   if (span.writable||prior.writable)&&span.address<other_end&&
+     prior.address<end{return false;}
+  }
+ }
+ true
+}
+#[cfg(test)]mod m1_batch03_w3_memory_tests{
+ use super::*;
+ fn plan()->ProgramPlan{
+  let mut s=[ProgramSegment::empty();MAX_SEGMENTS];
+  s[0]=ProgramSegment{page_begin:USER_MIN,page_end:USER_MIN+2*PAGE_BYTES,
+    writable:true,..ProgramSegment::empty()};
+  ProgramPlan{entry:USER_MIN,stack_begin:USER_TOP-STACK_BYTES,
+   stack_end:USER_TOP,guard_begin:USER_TOP-STACK_BYTES-PAGE_BYTES,
+   segment_count:1,segments:s}
+ }
+ #[test]fn good_scatter_copy_bad_writable_alias_and_guard(){
+  let p=plan();let read=CopySpan{address:USER_MIN,length:16,writable:false};
+  assert!(user_copy_batch_valid(&p,&[read,CopySpan{
+    address:USER_MIN+32,length:16,writable:true}]));
+  assert!(!user_copy_batch_valid(&p,&[read,CopySpan{
+    address:USER_MIN+8,length:16,writable:true}]));
+  assert!(!user_copy_batch_valid(&p,&[read,CopySpan{
+    address:p.guard_begin,length:16,writable:true}]));
+ }
+ #[test]fn overflow_zero_and_oversized_batch_denied(){
+  let p=plan();let bad=CopySpan{address:u64::MAX-1,length:4,writable:true};
+  assert!(!user_copy_batch_valid(&p,&[bad]));
+  assert!(!user_copy_batch_valid(&p,&[]));
+  assert!(!user_copy_batch_valid(&p,&[CopySpan{
+    address:USER_MIN,length:1,writable:false};MAX_SEGMENTS+1]));
+ }
 }

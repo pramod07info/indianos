@@ -152,3 +152,56 @@ mod pr782_ws85_87_tests{
     q.platform,[7;20],BOOT),Err(MatrixError::Failed));
  }
 }
+
+
+/// Physical PC qualification records must be independently signed and
+/// captured by a protected external verifier. A struct literal is NOT proof
+/// that firmware or measured boot exists; this gate merely rejects missing,
+/// reused, mixed-SHA and incomplete evidence before release acceptance.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct PhysicalUefiEvidence{
+ pub machine_id:[u8;16],
+ pub record:Evidence,
+ pub trusted_uefi_report:bool,
+ pub verified_boot_measurement:bool,
+}
+pub fn validate_physical_uefi_matrix(records:&[PhysicalUefiEvidence],
+ commit:[u8;20])->Result<(),MatrixError>{
+ if records.len()<2||records.len()>8{return Err(MatrixError::Missing);}
+ for (i,current) in records.iter().enumerate(){
+  if current.machine_id==[0;16]||
+     records[..i].iter().any(|other|other.machine_id==current.machine_id){
+   return Err(MatrixError::WrongPlatform);
+  }
+  if !current.trusted_uefi_report||!current.verified_boot_measurement{
+   return Err(MatrixError::Missing);
+  }
+  qualify_exact_bits(current.record,Platform::BareMetalX86_64,commit)?;
+ }
+ Ok(())
+}
+#[cfg(test)]
+mod m1_batch05_w4_physical_pc_tests{
+ use super::*;
+ fn record(id:u8)->PhysicalUefiEvidence{
+  PhysicalUefiEvidence{machine_id:[id;16],record:Evidence{
+    platform:Platform::BareMetalX86_64,commit:[7;20],
+    passed:REQUIRED,failed:0,skipped:0},
+    trusted_uefi_report:true,verified_boot_measurement:true}
+ }
+ #[test]fn two_distinct_physical_pcs_and_same_sha_are_required(){
+  assert_eq!(validate_physical_uefi_matrix(&[record(1),record(2)],[7;20]),Ok(()));
+  assert_eq!(validate_physical_uefi_matrix(&[record(1),record(1)],[7;20]),
+    Err(MatrixError::WrongPlatform));
+  assert_eq!(validate_physical_uefi_matrix(&[record(1)],[7;20]),
+    Err(MatrixError::Missing));
+  let mut wrong=record(2);wrong.record.platform=Platform::QemuX86_64;
+  assert_eq!(validate_physical_uefi_matrix(&[record(1),wrong],[7;20]),
+    Err(MatrixError::WrongPlatform));
+  let mut unsigned=record(2);unsigned.verified_boot_measurement=false;
+  assert_eq!(validate_physical_uefi_matrix(&[record(1),unsigned],[7;20]),
+    Err(MatrixError::Missing));
+  assert_eq!(validate_physical_uefi_matrix(&[record(1),record(2)],[8;20]),
+    Err(MatrixError::WrongCommit));
+ }
+}

@@ -442,3 +442,46 @@ mod pr782_ws106_110_tests{
   assert_eq!(madt_lapic_override(&duplicate),Err(AcpiError::Malformed));
  }
 }
+
+
+/// Software suspension image receipt, NOT a sleep/resume operation.
+/// The trusted memory manager supplies an exact page-aligned image and
+/// kernel/firmware device epochs. A resume path must authenticate the image
+/// and rebuild actual page tables/IRQs separately before runnable tasks.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct ResumeImageReceipt{
+ pub epoch:u64,pub cpu_epoch:u64,pub device_epoch:u64,
+ pub pages:u32,pub digest:[u8;32],
+}
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum ResumeImageError{Invalid,Stale,Corrupt}
+pub fn snapshot_resume_pages(data:&[u8],epoch:u64,cpu:u64,device:u64)
+ ->Result<ResumeImageReceipt,ResumeImageError>{
+ if epoch==0||cpu==0||device==0||data.is_empty()||
+    data.len()>4*4096||data.len()%4096!=0{return Err(ResumeImageError::Invalid);}
+ Ok(ResumeImageReceipt{epoch,cpu_epoch:cpu,device_epoch:device,
+   pages:(data.len()/4096) as u32,digest:crate::m2_sha256::digest(data)})
+}
+pub fn validate_resume_pages(data:&[u8],expected:ResumeImageReceipt,
+ epoch:u64,cpu:u64,device:u64)->Result<(),ResumeImageError>{
+ if epoch!=expected.epoch||cpu!=expected.cpu_epoch||device!=expected.device_epoch{
+  return Err(ResumeImageError::Stale);
+ }
+ let current=snapshot_resume_pages(data,epoch,cpu,device)?;
+ if current!=expected{return Err(ResumeImageError::Corrupt);}
+ Ok(())
+}
+#[cfg(test)]
+mod m1_batch05_w5_resume_tests{
+ use super::*;
+ #[test]fn exact_epoch_and_content_required_before_memory_restore(){
+  let mut bytes=[0x55u8;4096];
+  let r=snapshot_resume_pages(&bytes,9,2,7).unwrap();
+  assert_eq!(validate_resume_pages(&bytes,r,9,2,7),Ok(()));
+  assert_eq!(validate_resume_pages(&bytes,r,9,2,8),Err(ResumeImageError::Stale));
+  bytes[2048]^=1;
+  assert_eq!(validate_resume_pages(&bytes,r,9,2,7),Err(ResumeImageError::Corrupt));
+  assert_eq!(snapshot_resume_pages(&bytes[..4095],9,2,7),
+    Err(ResumeImageError::Invalid));
+ }
+}

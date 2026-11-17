@@ -2473,3 +2473,153 @@ mod r114_kernel_desktop_reap_tests{
         assert_eq!(d.pending(),1);
     }
 }
+
+
+#[cfg(test)]
+mod m1_batch01_w4_service_tests{
+ use super::*;
+ #[test]fn b01_15_wrong_generation_cannot_start_service(){
+  let mut s=ServiceTable::<2>::new();
+  assert!(s.configure(1,50,1));
+  assert_eq!(s.start_if_generation(1,1),ServiceAction::Deny);
+  assert_eq!(s.start_if_generation(1,0),ServiceAction::Start{pid:50,generation:1});
+ }
+ #[test]fn b01_16_pending_replacement_requires_preparation(){
+  let mut s=ServiceTable::<2>::new();
+  assert!(s.configure(1,50,1));
+  assert_eq!(s.start(1),ServiceAction::Start{pid:50,generation:1});
+  assert_eq!(s.crash(50,51),ServiceAction::Restart{pid:51,generation:2});
+  assert_eq!(s.start(1),ServiceAction::Deny);
+  assert!(s.pending_exact(1,51,2));
+ }
+}
+
+impl<const N:usize> ServiceTable<N>{
+    /// Kernel-owned PID1 dependency-ordered start. Every prerequisite must
+    /// be active at its exact authenticated PID/generation; pending restart
+    /// candidates do not inherit authority.
+    pub fn start_with_dependencies_exact(&mut self,service:u32,
+        generation:u32,deps:&[(u32,u32,u32)])->ServiceAction{
+        if service==0||deps.len()>N{return ServiceAction::Deny;}
+        for (i,&(id,pid,epoch)) in deps.iter().enumerate(){
+            if id==service||id==0||pid==0||epoch==0||
+                deps[..i].iter().any(|&(other,_,_)|other==id)||
+                !self.is_active_exact(id,pid,epoch){
+                return ServiceAction::Deny;
+            }
+        }
+        self.start_if_generation(service,generation)
+    }
+}
+#[cfg(test)]
+mod m1_gate20_w2_service_tests{
+ use super::*;
+ #[test]fn required_service_must_be_active_at_exact_epoch(){
+  let mut s=ServiceTable::<3>::new();
+  assert!(s.configure(1,100,1));assert!(s.configure(2,200,1));
+  assert_eq!(s.start_with_dependencies_exact(2,0,&[(1,100,1)]),ServiceAction::Deny);
+  assert_eq!(s.start(1),ServiceAction::Start{pid:100,generation:1});
+  assert_eq!(s.start_with_dependencies_exact(2,0,&[(1,100,2)]),ServiceAction::Deny);
+  assert_eq!(s.start_with_dependencies_exact(2,0,&[(1,100,1)]),
+    ServiceAction::Start{pid:200,generation:1});
+ }
+ #[test]fn cycles_duplicates_and_pending_replacements_are_denied(){
+  let mut s=ServiceTable::<3>::new();
+  assert!(s.configure(1,100,1));assert!(s.configure(2,200,1));
+  assert_eq!(s.start(1),ServiceAction::Start{pid:100,generation:1});
+  assert_eq!(s.start_with_dependencies_exact(2,0,&[(2,200,1)]),ServiceAction::Deny);
+  assert_eq!(s.start_with_dependencies_exact(2,0,&[(1,100,1),(1,100,1)]),ServiceAction::Deny);
+  assert_eq!(s.crash(100,101),ServiceAction::Restart{pid:101,generation:2});
+  assert_eq!(s.start_with_dependencies_exact(2,0,&[(1,100,1)]),ServiceAction::Deny);
+  assert_eq!(s.snapshot(2).unwrap().generation,0);
+ }
+}
+/// Start an ordered PID1 service cohort transactionally. Earlier cohort
+/// members may satisfy later dependencies, but duplicates, cycles, a stale
+/// generation or pending restart invalidate the WHOLE batch. The caller
+/// publishes returned start actions only after the transaction succeeds.
+impl<const N:usize> ServiceTable<N>{
+ pub fn start_ordered_dependencies_exact(
+   &mut self,requests:&[(u32,u32,&[(u32,u32,u32)])],
+   output:&mut[ServiceAction])->bool{
+   if requests.is_empty()||requests.len()>N||output.len()<requests.len(){
+     return false;
+   }
+   let mut shadow=Self{slots:self.slots,phases:self.phases};
+   let mut actions=[ServiceAction::Deny;N];
+   for (i,&(service,generation,deps)) in requests.iter().enumerate(){
+     if requests[..i].iter().any(|&(earlier,_,_)|earlier==service){
+       return false;
+     }
+     let action=shadow.start_with_dependencies_exact(service,generation,deps);
+     if action==ServiceAction::Deny{return false;}
+     actions[i]=action;
+   }
+   self.slots=shadow.slots;self.phases=shadow.phases;
+   output[..requests.len()].copy_from_slice(&actions[..requests.len()]);
+   true
+ }
+}
+#[cfg(test)]
+mod m1_gate20_w2_next_service_tests{
+ use super::*;
+ #[test]fn dependency_cohort_starts_in_order_with_exact_epoch(){
+   let mut s=ServiceTable::<3>::new();
+   assert!(s.configure(1,101,1));assert!(s.configure(2,202,1));
+   let first=[(1,0,&[][..]),(2,0,&[(1,101,1)][..])];
+   let mut out=[ServiceAction::Deny;2];
+   assert!(s.start_ordered_dependencies_exact(&first,&mut out));
+   assert_eq!(out,[ServiceAction::Start{pid:101,generation:1},
+                   ServiceAction::Start{pid:202,generation:1}]);
+   assert!(s.is_active_exact(2,202,1));
+ }
+ #[test]fn invalid_tail_and_cycles_leave_all_service_state_unmodified(){
+   let mut s=ServiceTable::<3>::new();
+   assert!(s.configure(1,101,1));assert!(s.configure(2,202,1));
+   let mut out=[ServiceAction::Restart{pid:9,generation:9};2];
+   let bad=[(1,0,&[][..]),(2,0,&[(1,101,99)][..])];
+   assert!(!s.start_ordered_dependencies_exact(&bad,&mut out));
+   assert_eq!(s.snapshot(1).unwrap().generation,0);
+   assert_eq!(s.snapshot(2).unwrap().generation,0);
+   assert_eq!(out,[ServiceAction::Restart{pid:9,generation:9};2]);
+   let cycle=[(1,0,&[(2,202,1)][..]),(2,0,&[(1,101,1)][..])];
+   assert!(!s.start_ordered_dependencies_exact(&cycle,&mut out));
+   let duplicate=[(1,0,&[][..]),(1,0,&[][..])];
+   assert!(!s.start_ordered_dependencies_exact(&duplicate,&mut out));
+   assert_eq!(s.snapshot(1).unwrap().generation,0);
+ }
+}
+
+impl<const N:usize> ServiceTable<N>{
+ /// Scheduler-authenticated, all-or-none shutdown intent at exact epochs.
+ /// Dependents-first sequencing and physical suspend remain caller duties.
+ pub fn stop_group_exact(&mut self,requests:&[(u32,u32,u32)])->bool{
+  if requests.is_empty()||requests.len()>N{return false;}
+  let mut staged=Self{slots:self.slots,phases:self.phases};
+  for (i,&(id,pid,epoch)) in requests.iter().enumerate(){
+   if requests[..i].iter().any(|&(prior,_,_)|prior==id)||
+      !staged.stop_exact(id,pid,epoch){return false;}
+  }
+  self.slots=staged.slots;self.phases=staged.phases;true
+ }
+}
+#[cfg(test)]mod m1_batch03_w2_service_tests{
+ use super::*;
+ #[test]fn stale_tail_rolls_back_every_active_service(){
+  let mut s=ServiceTable::<3>::new();
+  assert!(s.configure(1,11,2));assert!(s.configure(2,22,2));
+  s.start(1);s.start(2);
+  assert!(!s.stop_group_exact(&[(2,22,1),(1,11,2)]));
+  assert!(s.is_active_exact(1,11,1));assert!(s.is_active_exact(2,22,1));
+  assert!(s.stop_group_exact(&[(2,22,1),(1,11,1)]));
+  assert!(!s.is_active_exact(1,11,1));assert!(!s.is_active_exact(2,22,1));
+ }
+ #[test]fn pending_restart_cannot_be_stopped_as_active(){
+  let mut s=ServiceTable::<2>::new();
+  s.configure(1,11,2);s.configure(2,22,2);s.start(1);s.start(2);
+  assert_eq!(s.crash(22,23),ServiceAction::Restart{pid:23,generation:2});
+  assert!(!s.stop_group_exact(&[(1,11,1),(2,23,2)]));
+  assert!(s.is_active_exact(1,11,1));
+  assert!(!s.stop_group_exact(&[(1,11,1),(1,11,1)]));
+ }
+}

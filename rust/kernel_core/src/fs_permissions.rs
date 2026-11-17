@@ -166,3 +166,81 @@ mod pr782_ws78_81_tests{
     leaf,Credentials::kernel(0,0),READ));
  }
 }
+
+
+// M1 gate 11 / G6: permission guard for a cross-directory rename.
+// The caller MUST separately pin namespace, mount and file generations.
+// This checks both parent directories and every ancestor without allocating;
+// it is a policy primitive until the live VFS rename entrypoint uses it.
+impl Permissions {
+ pub fn authorize_rename(
+  source_ancestors:&[Permissions],source_parent:Permissions,
+  destination_ancestors:&[Permissions],destination_parent:Permissions,
+  caller:Credentials,
+ )->bool {
+  source_ancestors.iter().all(|dir|dir.allows(caller,SEARCH)) &&
+  destination_ancestors.iter().all(|dir|dir.allows(caller,SEARCH)) &&
+  source_parent.allows(caller,WRITE|SEARCH) &&
+  destination_parent.allows(caller,WRITE|SEARCH)
+ }
+}
+#[cfg(test)]
+mod m1_gate11_rename_acl_tests {
+ use super::*;
+ #[test]fn rename_checks_both_parents_and_all_ancestors() {
+  let user=Credentials::kernel(100,7);
+  let writable=Permissions::new(100,7,0o700).unwrap();
+  let searchable=Permissions::new(100,7,0o500).unwrap();
+  let denied=Permissions::new(200,8,0o700).unwrap();
+  assert!(Permissions::authorize_rename(&[searchable],writable,
+    &[searchable],writable,user));
+  assert!(!Permissions::authorize_rename(&[denied],writable,
+    &[searchable],writable,user));
+  assert!(!Permissions::authorize_rename(&[searchable],writable,
+    &[denied],writable,user));
+  assert!(!Permissions::authorize_rename(&[searchable],searchable,
+    &[searchable],writable,user));
+  assert!(!Permissions::authorize_rename(&[searchable],writable,
+    &[searchable],searchable,user));
+  assert!(!Permissions::authorize_rename(&[searchable],writable,
+    &[Permissions{mode:0o1777,..searchable}],writable,
+    Credentials::kernel(0,0)));
+ }
+}
+
+
+#[cfg(test)]
+mod m1_batch01_w5_acl_tests{
+ use super::*;
+ #[test]fn b01_12_rename_checks_both_writable_parent_directories(){
+  let u=Credentials::kernel(5,5);
+  let rw=Permissions::new(5,5,0o700).unwrap();
+  let ro=Permissions::new(5,5,0o500).unwrap();
+  assert!(Permissions::authorize_rename(&[],rw,&[],rw,u));
+  assert!(!Permissions::authorize_rename(&[],rw,&[],ro,u));
+ }
+ #[test]fn b01_13_rename_denies_unsearchable_ancestor(){
+  let u=Credentials::kernel(5,5);
+  let rw=Permissions::new(5,5,0o700).unwrap();
+  let nox=Permissions::new(5,5,0o600).unwrap();
+  assert!(!Permissions::authorize_rename(&[nox],rw,&[],rw,u));
+ }
+ #[test]fn b01_14_invalid_persisted_mode_denies_root(){
+  let bad=Permissions{owner:5,group:5,mode:0o1000};
+  assert!(!bad.allows(Credentials::kernel(0,0),WRITE|SEARCH));
+ }
+}
+#[cfg(test)]
+mod m1_gate20_w3_acl_tests {
+ use super::*;
+ #[test]fn rename_requires_search_and_write_on_both_parents(){
+  let parent=Permissions::new(1,1,0o700).unwrap();
+  let ancestor=Permissions::new(1,1,0o500).unwrap();
+  let peer=Credentials::kernel(2,2);
+  let owner=Credentials::kernel(1,1);
+  assert!(!Permissions::authorize_rename(&[ancestor],parent,&[],parent,peer));
+  assert!(Permissions::authorize_rename(&[ancestor],parent,&[],parent,owner));
+  assert!(!Permissions::authorize_rename(&[Permissions::new(1,1,0o400).unwrap()],
+   parent,&[],parent,owner));
+ }
+}

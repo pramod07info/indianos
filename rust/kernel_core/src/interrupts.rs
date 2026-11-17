@@ -207,8 +207,9 @@ pub unsafe extern "C" fn x86_64_user_interrupt_stack_select(slot:u32)->bool{
     if ist==0{return false}
     let bottom=unsafe {ptr::addr_of!(USER_STACKS)}.cast::<AlignedStack<STACK_BYTES>>();
     let top=unsafe{bottom.add(slot as usize)} as usize+size_of::<AlignedStack<STACK_BYTES>>();
+    if top==0||top&15!=0{return false;}
     unsafe{ptr::write_unaligned(ptr::addr_of_mut!((*tss).rsp0),top as u64);}
-    top!=0
+    true
 }
 #[no_mangle]
 pub unsafe extern "C" fn x86_64_user_interrupt_stack_enable()->bool{
@@ -217,17 +218,24 @@ pub unsafe extern "C" fn x86_64_user_interrupt_stack_enable()->bool{
 /// # Safety
 /// \`result\` points to 5 writable u64s and will be used only after IDTR
 /// initialization and selecting an active kernel stack.
+/// Stack-top offsets must be within the aligned, kernel-owned stack. Never
+/// publish wrapped or unaligned mapping addresses to the page-table caller.
+fn validated_trap_stack_tops(rsp:u64,ist:u64)->Option<(u64,u64)>{
+    if rsp&15!=0||ist&15!=0{return None;}
+    Some((rsp.checked_sub(8)?,ist.checked_sub(8)?))
+}
 #[no_mangle]
 pub unsafe extern "C" fn x86_64_user_trap_mapping_addresses(result:*mut u64)->bool{
     if result.is_null(){return false}
     let tss=unsafe {ptr::addr_of!(TSS.0)};
     let ist=unsafe{ptr::read_unaligned(ptr::addr_of!((*tss).ist1))};
     let rsp=unsafe{ptr::read_unaligned(ptr::addr_of!((*tss).rsp0))};
-    if ist==0 || rsp==0 {return false}
+    let Some((rsp_last,ist_last))=validated_trap_stack_tops(rsp,ist)
+        else{return false;};
     let values=[
         unsafe {ptr::addr_of!(GDT.0)} as usize as u64,
         unsafe {ptr::addr_of!(IDT.0)} as usize as u64,
-        tss as usize as u64,rsp-8,ist-8
+        tss as usize as u64,rsp_last,ist_last
     ];
     for (i,value) in values.iter().enumerate(){
         unsafe{ptr::write(result.add(i),*value);}
@@ -322,4 +330,17 @@ mod tests{
         let low=IdtGate::new(0x1234,1,0x8e).low;
         assert_eq!(low,0x1234);
     }
+}
+
+#[cfg(test)]
+mod m1_gate20_w6_interrupt_tests {
+ use super::*;
+ #[test]fn trap_mapping_cannot_underflow_or_use_unaligned_stack(){
+  assert_eq!(validated_trap_stack_tops(0,16),None);
+  assert_eq!(validated_trap_stack_tops(16,0),None);
+  assert_eq!(validated_trap_stack_tops(8,16),None);
+  assert_eq!(validated_trap_stack_tops(16,24),None);
+  assert_eq!(validated_trap_stack_tops(0x4000,0x5000),
+   Some((0x3ff8,0x4ff8)));
+ }
 }

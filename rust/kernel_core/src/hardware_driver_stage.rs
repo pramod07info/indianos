@@ -466,3 +466,61 @@ mod hd3_crypto_tests{
   assert_eq!(state.metadata(),None);
  }
 }
+
+/// Recheck a numeric driver proposal against the exact signed-image owner,
+/// PCI identity and CURRENT IOMMU evidence before a privileged manager
+/// attempts any resource binding. Does not enable hardware.
+pub fn revalidate_resource_plan(plan:ResourcePlan,staged:Staged,
+ actor:Identity,platform:PlatformEvidence)->Result<(),Error>{
+ if actor.pid==0||actor.generation==0||staged.abi!=STAGE_ABI||
+  staged.owner!=actor||plan.owner!=actor||staged.bdf!=plan.bdf||
+  staged.driver_id==0||plan.driver_id!=staged.driver_id||
+  plan.activated{return Err(Error::Denied);}
+ if plan.mmio.is_none()&&plan.dma.is_none(){return Err(Error::Invalid);}
+ if plan.mmio.is_some()!=(staged.requested&hd2::WANT_MMIO!=0)||
+    plan.dma.is_some()!=(staged.requested&hd2::WANT_DMA!=0){
+  return Err(Error::Unrequested);
+ }
+ if let Some(mmio)=plan.mmio{inside(mmio,platform.mmio_allowed)?;}
+ if let Some(dma)=plan.dma{
+  if !platform.iommu_ready||platform.iommu_domain==0||
+    platform.iommu_domain!=plan.iommu_domain{return Err(Error::NotIsolated);}
+  inside(dma,platform.dma_allowed)?;
+ }else if plan.iommu_domain!=0{return Err(Error::NotIsolated);}
+ if let (Some(a),Some(b))=(plan.mmio,plan.dma){
+  if overlaps(a,b){return Err(Error::Overlap);}
+ }
+ Ok(())
+}
+#[cfg(test)]mod m1_batch03_w5_driver_tests{
+ use super::*;
+ fn ap(base:u64)->Aperture{Aperture{base,length:4096}}
+ fn actor()->Identity{Identity{pid:7,generation:9}}
+ fn bdf()->Bdf{Bdf{bus:2,slot:3,function:0}}
+ fn stage()->Staged{Staged{abi:STAGE_ABI,owner:actor(),bdf:bdf(),
+  driver_id:5,version:1,generation:2,digest:[0;32],image_len:128,
+  requested:hd2::WANT_MMIO|hd2::WANT_DMA}}
+ fn platform()->PlatformEvidence{PlatformEvidence{
+  mmio_allowed:ap(0x1000_0000),dma_allowed:ap(0x2000_0000),
+  iommu_domain:9,iommu_ready:true}}
+ fn plan()->ResourcePlan{ResourcePlan{owner:actor(),bdf:bdf(),driver_id:5,
+  mmio:Some(ap(0x1000_0000)),dma:Some(ap(0x2000_0000)),
+  iommu_domain:9,activated:false}}
+ #[test]fn exact_owner_and_iommu_evidence_required(){
+  assert_eq!(revalidate_resource_plan(plan(),stage(),actor(),platform()),Ok(()));
+  assert_eq!(revalidate_resource_plan(plan(),stage(),
+    Identity{generation:10,..actor()},platform()),Err(Error::Denied));
+  let mut bad=platform();bad.iommu_domain=10;
+  assert_eq!(revalidate_resource_plan(plan(),stage(),actor(),bad),
+   Err(Error::NotIsolated));
+ }
+ #[test]fn mismatched_bdf_and_aliasing_dma_denied(){
+  let mut bad=plan();bad.bdf.slot=4;
+  assert_eq!(revalidate_resource_plan(bad,stage(),actor(),platform()),
+             Err(Error::Denied));
+  let mut alias=plan();alias.dma=Some(ap(0x1000_0000));
+  let mut same=platform();same.dma_allowed=ap(0x1000_0000);
+  assert_eq!(revalidate_resource_plan(alias,stage(),actor(),same),
+             Err(Error::Overlap));
+ }
+}

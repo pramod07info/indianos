@@ -286,3 +286,67 @@ mod r085_m1_lifecycle_integration_tests{
   assert_eq!(s.next_service(),Err(InitError::MissingDependency));
  }
 }
+
+impl<const P:usize,const E:usize,const W:usize,const K:usize> Session<P,E,W,K>{
+ /// Authenticated verified launch cohort; rollback of newly staged PIDs.
+ /// This does not implement a graphical login or running service daemon.
+ pub fn stage_verified_group(&mut self,requests:&[(Launch,Settings)])
+   ->Result<usize,SessionError>{
+  if requests.is_empty()||requests.len()>P{return Err(SessionError::Full);}
+  for (i,&(launch,_)) in requests.iter().enumerate(){
+   if launch.pid==0||launch.generation==0{return Err(SessionError::Invalid);}
+   if requests[..i].iter().any(|(old,_)|old.pid==launch.pid){
+    return Err(SessionError::Duplicate);
+   }
+  }
+  let mut done=0usize;
+  for &(launch,settings) in requests{
+   if let Err(error)=self.stage(launch,settings){
+    for &(accepted,_) in &requests[..done]{
+     let _=self.retire(Identity{pid:accepted.pid,generation:accepted.generation});
+    }
+    return Err(error);
+   }
+   done+=1;
+  }
+  Ok(done)
+ }
+ pub fn snapshot_owned_sessions(&self,out:&mut[Identity])
+   ->Result<usize,SessionError>{
+  let count=self.owners.iter().flatten().count();
+  if out.len()<count{return Err(SessionError::Full);}
+  for (i,&id) in self.owners.iter().flatten().enumerate(){out[i]=id;}
+  Ok(count)
+ }
+}
+#[cfg(test)]mod m1_batch03_w1_session_tests{
+ use super::*;
+ use crate::batch2_launcher::Image;
+ use crate::batch2_settings::Theme;
+ fn req(pid:u32,gen:u64)->(Launch,Settings){
+  (Launch{pid,generation:gen,image:Image{image_id:8,entry:0x1000,
+      mapped_end:0x2000,verified:true}},
+   Settings{theme:Theme::Light,pointer_speed:5,key_repeat:10})
+ }
+ #[test]fn entire_cohort_rolls_back_on_unsigned_second_image(){
+  let mut s=Session::<2,2,2,2>::new();
+  let first=req(1,1);let mut second=req(2,1);second.0.image.verified=false;
+  assert_eq!(s.stage_verified_group(&[first,second]),
+     Err(SessionError::Launch(LaunchError::Unverified)));
+  assert!(!s.owns(Identity{pid:1,generation:1}));
+  assert_eq!(s.launches.pending(),0);
+  assert_eq!(s.stage_verified_group(&[first,req(2,1)]),Ok(2));
+  let mut out=[Identity{pid:0,generation:0};2];
+  assert_eq!(s.snapshot_owned_sessions(&mut out),Ok(2));
+  assert_eq!(out[1],Identity{pid:2,generation:1});
+ }
+ #[test]fn generation_reuse_and_short_output_do_not_publish(){
+  let mut s=Session::<2,2,2,2>::new();
+  assert_eq!(s.stage_verified_group(&[req(1,1),req(1,2)]),
+    Err(SessionError::Duplicate));
+  s.stage_verified_group(&[req(1,1)]).unwrap();
+  assert_eq!(s.snapshot_owned_sessions(&mut []),Err(SessionError::Full));
+  assert_eq!(s.stage_verified_group(&[req(1,2)]),Err(SessionError::Duplicate));
+  assert!(s.owns(Identity{pid:1,generation:1}));
+ }
+}

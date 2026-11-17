@@ -2938,3 +2938,35 @@ mod r091_empty_history_reset {
   assert_eq!(input.clipboard_bytes(),b"clipboard");
  }
 }
+
+
+/// Validate bounded UTF-8 text and return character starts for a future
+/// userspace font renderer. This does NOT draw glyphs, fonts or Unicode
+/// shaping. All offsets are committed only after complete validation.
+pub fn utf8_scalar_offsets(text:&[u8],out:&mut[usize])->Result<usize,Error>{
+ if text.is_empty()||text.len()>MAX_LINE{return Err(Error::Invalid);}
+ let value=core::str::from_utf8(text).map_err(|_|Error::Invalid)?;
+ if value.chars().any(|c|c.is_control()){return Err(Error::Invalid);}
+ let count=value.chars().count();
+ if out.len()<count{return Err(Error::TooSmall);}
+ for (slot,(offset,_)) in out.iter_mut().zip(value.char_indices()){
+  *slot=offset;
+ }
+ Ok(count)
+}
+#[cfg(test)]
+mod m1_batch04_w5_unicode_tests{
+ use super::*;
+ #[test]fn utf8_offsets_are_atomic_for_broken_text_and_short_buffer(){
+  let mut pos=[99usize;3];
+  let text="A✓é".as_bytes();
+  assert_eq!(utf8_scalar_offsets(text,&mut pos),Ok(3));
+  assert_eq!(pos,[0,1,4]);
+  let before=pos;
+  assert_eq!(utf8_scalar_offsets(&[0xff,0x80],&mut pos),Err(Error::Invalid));
+  assert_eq!(utf8_scalar_offsets(b"a\nb",&mut pos),Err(Error::Invalid));
+  assert_eq!(pos,before);
+  assert_eq!(utf8_scalar_offsets(text,&mut pos[..2]),Err(Error::TooSmall));
+  assert_eq!(pos,before);
+ }
+}

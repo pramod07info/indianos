@@ -334,4 +334,29 @@ mod hd3b2_tests{
   assert_eq!(q.submit(owner(),ap(u64::MAX-3,64),ap(0x2000_4000,64)),
              Err(Error::Range));
  }
+ #[test]fn m1_batch03_w6_hotplug_quiesces_exact_owner_only(){
+  let mut q=QueueModel::<2>::new(staged()).unwrap();
+  q.submit(owner(),ap(0x2000_4000,64),ap(0x2000_5000,64)).unwrap();
+  assert_eq!(q.quiesce_on_hotplug_exact(
+    Identity{generation:4,..owner()},bdf(),None),Err(Error::Denied));
+  assert_eq!(q.inflight(),1);
+  assert_eq!(q.quiesce_on_hotplug_exact(owner(),bdf(),Some(bdf())),
+             Err(Error::Invalid));
+  assert_eq!(q.inflight(),1);
+  assert_eq!(q.quiesce_on_hotplug_exact(owner(),bdf(),
+   Some(Bdf{slot:4,..bdf()})),Ok(1));
+  assert_eq!(q.inflight(),0);
+ }
+
+}
+impl<const N:usize> QueueModel<N>{
+ /// Trusted inventory's BDF replacement/hot removal causes NUMERIC queue
+ /// quiescence. Real IRQ/DMA drain and physical hotplug remain unimplemented.
+ pub fn quiesce_on_hotplug_exact(&mut self,actor:Identity,
+  expected:Bdf,replacement:Option<Bdf>)->Result<usize,Error>{
+  if actor.pid==0||actor.generation==0||actor!=self.staged.owner||
+    expected!=self.staged.bdf{return Err(Error::Denied);}
+  if replacement==Some(expected){return Err(Error::Invalid);}
+  let count=self.inflight();self.retire(actor)?;Ok(count)
+ }
 }
