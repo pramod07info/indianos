@@ -20,26 +20,32 @@ jobs:
           - workstation: W1-SMP-retirement
             filter: kernel_p0_w1
             next_filter: kernel_p0_next_w1
+            batch3_filter: kernel_p0_batch3_w1
             features: normal-desktop
           - workstation: W2-scheduler-fairness
             filter: kernel_p0_w2
             next_filter: kernel_p0_next_w2
+            batch3_filter: kernel_p0_batch3_w2
             features: normal-desktop
           - workstation: W3-authenticated-IPC
             filter: kernel_p0_w3
             next_filter: kernel_p0_next_w3
+            batch3_filter: kernel_p0_batch3_w3
             features: normal-desktop
           - workstation: W4-durable-VFS
             filter: kernel_p0_w4
             next_filter: kernel_p0_next_w4
+            batch3_filter: kernel_p0_batch3_w4
             features: test-r031-vfs
           - workstation: W5-NIC-quiescence
             filter: kernel_p0_w5
             next_filter: kernel_p0_next_w5
+            batch3_filter: kernel_p0_batch3_w5
             features: normal-desktop
           - workstation: W6-boot-handoff
             filter: kernel_p0_w6
             next_filter: kernel_p0_next_w6
+            batch3_filter: kernel_p0_batch3_w6
             features: normal-desktop
     steps:
       - uses: actions/checkout@v4
@@ -57,6 +63,7 @@ jobs:
         env:
           FILTER: ${{ matrix.filter }}
           NEXT_FILTER: ${{ matrix.next_filter }}
+          BATCH3_FILTER: ${{ matrix.batch3_filter }}
           FEATURES: ${{ matrix.features }}
         run: |
           set -euo pipefail
@@ -64,6 +71,8 @@ jobs:
           cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$FILTER"
           cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$NEXT_FILTER" -- --list | grep -F "$NEXT_FILTER"
           cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$NEXT_FILTER"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$BATCH3_FILTER" -- --list | grep -F "$BATCH3_FILTER"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$BATCH3_FILTER"
       - name: Compile freestanding no_std kernel profile
         env:
           FEATURES: ${{ matrix.features }}

@@ -499,3 +499,55 @@ mod kernel_p0_next_w5_rx_admission_tests{
   assert_eq!(nic.parse_packet_at_live_epoch(14,||Some(4u8)),Ok(4));
  }
 }
+
+
+/// P0 batch three W5: a separately owned quiescence receipt allows a
+/// privileged control-plane retry after a late software receive handler
+/// exits. The REAL NIC driver must successfully stop IRQ/DMA on each attempt.
+/// The opaque receipt must come from begin_quiesce on this exact fence.
+impl NicRxFence{
+ pub fn complete_quiesced_rebind_with_driver<D:NicHardwareQuiesce>(
+  &self,receipt:QuiesceReceipt,driver:&mut D,probes:u32)
+  ->Result<u64,RxFenceError>{
+  self.admitted_in_flight(receipt)?;
+  driver.stop_irq_dma_and_drain(self.device)?;
+  self.wait_drained_bounded(receipt,probes)?;
+  self.finish_rebind_checked(receipt,true,true)
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch3_w5_nic_retry_tests{
+ use super::*;
+ struct Driver{count:usize,stopped:bool}
+ impl NicHardwareQuiesce for Driver{
+  fn stop_irq_dma_and_drain(&mut self,_:u32)->Result<(),RxFenceError>{
+   self.count+=1;
+   if self.stopped{Ok(())}else{Err(RxFenceError::Busy)}
+  }
+ }
+ #[test]fn retry_cannot_resume_while_handler_live_or_hardware_not_stopped(){
+  let f=NicRxFence::new(21);
+  let handler=f.try_admit(21).unwrap();
+  let receipt=f.begin_quiesce(21).unwrap();
+  let mut d=Driver{count:0,stopped:true};
+  assert_eq!(f.complete_quiesced_rebind_with_driver(receipt,&mut d,0),
+   Err(RxFenceError::Busy));
+  assert_eq!(f.try_admit(21).err(),Some(RxFenceError::Quiescing));
+  drop(handler);d.stopped=false;
+  assert_eq!(f.complete_quiesced_rebind_with_driver(receipt,&mut d,0),
+   Err(RxFenceError::Busy));
+  d.stopped=true;
+  assert_eq!(f.complete_quiesced_rebind_with_driver(receipt,&mut d,0),Ok(2));
+  assert_eq!(f.complete_quiesced_rebind_with_driver(receipt,&mut d,0),
+   Err(RxFenceError::Stale));
+  assert_eq!(f.try_admit(21).unwrap().epoch(),2);
+ }
+ #[test]fn foreign_ring_receipt_does_not_invoke_wrong_hardware_driver(){
+  let a=NicRxFence::new(24);let b=NicRxFence::new(24);
+  let receipt=a.begin_quiesce(24).unwrap();
+  let mut d=Driver{count:0,stopped:true};
+  assert_eq!(b.complete_quiesced_rebind_with_driver(receipt,&mut d,0),
+   Err(RxFenceError::Stale));
+  assert_eq!(d.count,0);
+ }
+}

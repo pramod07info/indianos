@@ -1007,3 +1007,66 @@ mod kernel_p0_next_w3_ipc_retire_tests{
   assert_eq!(r.pending(c),Ok(0));
  }
 }
+
+
+/// P0 batch three W3: all-or-nothing delivery of distinct payloads to
+/// distinct exact-generation IPC mailboxes. A stale receiver, duplicate PID,
+/// full later queue or malformed payload must leave every mailbox untouched.
+/// A privileged kernel owns the single-owner router mutation boundary.
+impl<const M:usize,const D:usize> ScopedRouter<M,D>{
+ pub fn fanout_distinct_exact(&mut self,sender:Identity,
+  deliveries:&[(Identity,&[u8])])->Result<usize,IpcError>{
+  if sender.pid==0||sender.generation==0||deliveries.is_empty()||
+     deliveries.len()>M{return Err(IpcError::InvalidPid);}
+  if !self.boxes.iter().flatten().any(|b|b.owner==sender){
+   return Err(IpcError::UnknownSender);
+  }
+  let mut staged=Self{boxes:self.boxes};
+  for (i,&(recipient,payload)) in deliveries.iter().enumerate(){
+   if recipient.pid==0||recipient.generation==0{
+    return Err(IpcError::InvalidPid);
+   }
+   if deliveries[..i].iter().any(|(other,_)|other.pid==recipient.pid){
+    return Err(IpcError::DuplicateReceiver);
+   }
+   staged.send(sender,recipient,payload)?;
+  }
+  self.boxes=staged.boxes;
+  Ok(deliveries.len())
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch3_w3_fanout_tests{
+ use super::*;
+ #[test]fn distinct_messages_commit_to_distinct_recipients_only_after_full_validation(){
+  let a=Identity{pid:1,generation:3};
+  let b=Identity{pid:2,generation:4};
+  let c=Identity{pid:3,generation:5};
+  let mut router=ScopedRouter::<3,1>::new().unwrap();
+  router.register(a).unwrap();router.register(b).unwrap();router.register(c).unwrap();
+  router.send(a,c,b"taken").unwrap();
+  assert_eq!(router.fanout_distinct_exact(a,&[(b,b"one"),(c,b"two")]),
+    Err(IpcError::Full));
+  assert_eq!(router.pending(b),Ok(0));assert_eq!(router.pending(c),Ok(1));
+  assert_eq!(router.receive(c).unwrap().payload(),b"taken");
+  assert_eq!(router.fanout_distinct_exact(a,&[(b,b"one"),(c,b"two")]),Ok(2));
+  assert_eq!(router.receive(b).unwrap().payload(),b"one");
+  assert_eq!(router.receive(c).unwrap().payload(),b"two");
+ }
+ #[test]fn duplicate_pid_stale_generation_or_bad_second_payload_is_atomic(){
+  let a=Identity{pid:1,generation:3};
+  let b=Identity{pid:2,generation:4};
+  let c=Identity{pid:3,generation:5};
+  let mut r=ScopedRouter::<3,2>::new().unwrap();
+  r.register(a).unwrap();r.register(b).unwrap();r.register(c).unwrap();
+  let oversized=[0u8;MAX_PAYLOAD+1];
+  assert_eq!(r.fanout_distinct_exact(a,&[(b,b"one"),(c,&oversized)]),
+    Err(IpcError::PayloadTooLarge));
+  assert_eq!(r.pending(b),Ok(0));
+  assert_eq!(r.fanout_distinct_exact(a,&[(b,b"one"),(Identity{generation:1,..c},b"two")]),
+    Err(IpcError::UnknownReceiver));
+  assert_eq!(r.fanout_distinct_exact(a,&[(b,b"one"),(b,b"two")]),
+    Err(IpcError::DuplicateReceiver));
+  assert_eq!(r.pending(b),Ok(0));
+ }
+}

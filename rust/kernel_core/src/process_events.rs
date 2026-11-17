@@ -1702,3 +1702,74 @@ mod kernel_p0_next_w1_migration_tests{
   assert_eq!(q.queue_len(1),Ok(0));
  }
 }
+
+
+/// P0 batch three W2: atomic runqueue + exact-once process-exit publication.
+/// The privileged scheduler must hold the same exclusive retirement lock
+/// while staging, publishing, and revoking the corresponding PCB/handles.
+/// Hardware IPIs/TLB acknowledgement are checked by the prior gate.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum ExitPublicationError{
+ Reclaim(ReclaimError),
+ Notice(EventError),
+ DuplicateNotice,
+}
+impl<const C:usize,const N:usize> CoreRunQueues<C,N>{
+ pub fn retire_and_notify_exact<const E:usize>(&mut self,
+  supervisor:Runnable,victims:&[(u32,u64)],
+  receipts:&[(&crate::smp_lifecycle_fence::LifecycleFence,
+             u32,crate::smp_lifecycle_fence::Receipt)],
+  notices:&mut ProcessEvents<E>)
+  ->Result<usize,ExitPublicationError>{
+  let mut scheduled=Self{queues:self.queues,length:self.length,cursor:self.cursor};
+  let mut staged_notices=notices.clone();
+  let removed=scheduled.retire_after_ap_reclaim_barrier(
+    supervisor,victims,receipts).map_err(ExitPublicationError::Reclaim)?;
+  let count=staged_notices.enqueue_exit_batch_once(victims)
+     .map_err(ExitPublicationError::Notice)?;
+  if count!=victims.len(){return Err(ExitPublicationError::DuplicateNotice);}
+  crate::smp_lifecycle_fence::require_all_acks_for_reclaim(receipts)
+    .map_err(|error|ExitPublicationError::Reclaim(ReclaimError::Ap(error)))?;
+  *self=scheduled;
+  *notices=staged_notices;
+  Ok(removed)
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch3_w2_exit_publication_tests{
+ use super::*;
+ use crate::smp_lifecycle_fence::{LifecycleFence,FenceError};
+ fn t(pid:u32,epoch:u64)->Runnable{Runnable{pid,generation:epoch,priority:5}}
+ #[test]fn full_exit_queue_rolls_back_actual_runqueue_retirement(){
+  let mut q=CoreRunQueues::<1,3>::new();
+  q.enqueue(0,t(1,4)).unwrap();q.enqueue(0,t(2,6)).unwrap();
+  let mut events=ProcessEvents::<1>::new();
+  events.enqueue(ProcessEvent{pid:9,kind:EventKind::Message,value:99}).unwrap();
+  let ap=LifecycleFence::new(0,1);let receipt=ap.publish(0,7).unwrap();
+  ap.observe_and_ack_after(1,0,|_|true).unwrap();
+  assert_eq!(q.retire_and_notify_exact(t(1,4),&[(2,6)],&[(&ap,0,receipt)],
+    &mut events),Err(ExitPublicationError::Notice(EventError::Full)));
+  assert!(q.contains_epoch(2,6));
+  assert_eq!(events.count_pid(9),1);
+ }
+ #[test]fn missing_ap_ack_or_duplicate_exit_receipt_never_retires_process(){
+  let mut q=CoreRunQueues::<1,3>::new();
+  q.enqueue(0,t(1,4)).unwrap();q.enqueue(0,t(2,6)).unwrap();
+  let mut events=ProcessEvents::<3>::new();
+  let ap=LifecycleFence::new(0,1);let receipt=ap.publish(0,7).unwrap();
+  let refs=[(&ap,0,receipt)];
+  assert_eq!(q.retire_and_notify_exact(t(1,4),&[(2,6)],&refs,&mut events),
+    Err(ExitPublicationError::Reclaim(ReclaimError::Ap(FenceError::NoProgress))));
+  assert_eq!(events.count_pid(2),0);
+  ap.observe_and_ack_after(1,0,|_|true).unwrap();
+  events.enqueue_exit_once(2,6).unwrap();
+  assert_eq!(q.retire_and_notify_exact(t(1,4),&[(2,6)],&refs,&mut events),
+    Err(ExitPublicationError::DuplicateNotice));
+  assert!(q.contains_epoch(2,6));
+  assert_eq!(events.count_pid(2),1);
+  events.clear_exact_exit(2,6);
+  assert_eq!(q.retire_and_notify_exact(t(1,4),&[(2,6)],&refs,&mut events),Ok(1));
+  assert!(!q.contains_epoch(2,6));assert!(q.contains_epoch(1,4));
+  assert_eq!(events.count_pid(2),1);
+ }
+}

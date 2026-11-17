@@ -1113,3 +1113,58 @@ mod kernel_p0_next_w6_boot_replay_tests{
   assert_eq!(gate.authorize_once(&mut disk,&Platform).unwrap().epoch(),4);
  }
 }
+
+
+/// P0 batch three W6: the verified handoff callback is the only point
+/// where a trusted coordinator can launch PID1. The one-shot record is
+/// consumed BEFORE invoking the potentially side-effectful callback so a
+/// failed/partial launch cannot replay the same boot epoch.
+impl BootLaunchGate{
+ pub fn launch_once<D:BlockDevice,P:AuthenticatedPid1Platform,R>(
+  &mut self,disk:&mut D,platform:&P,
+  launch:impl FnOnce(VerifiedPid1Admission)->Result<R,Error>)
+   ->Result<R,Error>{
+  let receipt=self.authorize_once(disk,platform)?;
+  launch(receipt)
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch3_w6_pid1_launch_tests{
+ use super::*;
+ struct Platform;
+ impl TrustedBootMeasurement for Platform{
+  fn read_verified(&self)->Result<[u8;32],Error>{Ok([3;32])}
+ }
+ impl AuthenticatedPid1Platform for Platform{
+  fn read_sealed_floor(&self)->Result<SealedBootFloor,Error>{
+   Ok(SealedBootFloor{minimum_epoch:4,minimum_journal_generation:20,
+     expected_slot:0,minimum_slot_version:9,expected_measurement:[3;32]})
+  }
+  fn read_bootloader_selected_slot(&self)->Result<(usize,Slot),Error>{
+   Ok((0,tests::slot()))
+  }
+ }
+ #[test]fn pid1_callback_runs_only_once_for_one_authenticated_epoch(){
+  let mut d=tests::fixture();let mut gate=BootLaunchGate::new();
+  let mut calls=0u32;
+  assert_eq!(gate.launch_once(&mut d,&Platform,|receipt|{
+   calls+=1;Ok(receipt.epoch())
+  }),Ok(4));
+  assert_eq!(gate.launch_once(&mut d,&Platform,|_|{
+   calls+=1;Ok(5)
+  }),Err(Error::Stale));
+  assert_eq!(calls,1);
+  assert_eq!(gate.last_admitted_epoch(),4);
+ }
+ #[test]fn failed_launch_still_consumes_receipt_to_prevent_double_start(){
+  let mut d=tests::fixture();let mut gate=BootLaunchGate::new();
+  let mut calls=0;
+  assert_eq!(gate.launch_once(&mut d,&Platform,|_|{
+   calls+=1;Err::<(),Error>(Error::Io)
+  }),Err(Error::Io));
+  assert_eq!(gate.launch_once(&mut d,&Platform,|_|{
+   calls+=1;Ok(())
+  }),Err(Error::Stale));
+  assert_eq!(calls,1);
+ }
+}

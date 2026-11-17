@@ -558,3 +558,75 @@ mod m1_gate20_w5_next_smp_tests{
   assert_eq!(require_all_acks_for_reclaim(&[]),Err(FenceError::NoProgress));
  }
 }
+
+
+/// P0 batch three W1. A privileged CPU driver publishes the exact lifecycle
+/// receipt BEFORE delivering an IPI. A failed send leaves the receipt pending,
+/// forbidding the BSP from recycling frames. Only the real xAPIC/x2APIC
+/// implementation may satisfy this trait in production.
+pub trait LifecycleIpiSender {
+ fn send_exact(&mut self,from_apic_id:u32,to_apic_id:u32,
+  receipt:Receipt)->Result<(),FenceError>;
+}
+impl LifecycleFence {
+ pub fn publish_and_signal<I:LifecycleIpiSender>(
+  &self,cpu:u32,ap:u32,generation:u64,sender:&mut I)
+  ->Result<Receipt,FenceError>{
+  if cpu!=self.bsp||ap!=self.ap||self.bsp==self.ap {
+   return Err(FenceError::InvalidCpu);
+  }
+  let receipt=self.publish(cpu,generation)?;
+  sender.send_exact(cpu,ap,receipt)?;
+  // No return-path acknowledgement is accepted: the AP must call the local
+  // completion path and the BSP must inspect the exact subsequent receipt.
+  Ok(receipt)
+ }
+ /// AP-side completion ordering for a privileged local CPU operation. This
+ /// callback MUST execute the actual TLB invalidation or teardown and report
+ /// success only after serializing it. A callback error never produces an ack.
+ pub fn acknowledge_after_local_invalidate(
+  &self,ap:u32,previous:u64,
+  invalidate:impl FnOnce(Receipt)->Result<(),FenceError>)
+   ->Result<Option<Receipt>,FenceError>{
+  self.observe_and_ack_after(ap,previous,|receipt|
+    invalidate(receipt).is_ok())
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch3_w1_ipi_delivery_tests{
+ use super::*;
+ struct Sender{fails:bool,sent:usize,last:Option<Receipt>}
+ impl LifecycleIpiSender for Sender{
+  fn send_exact(&mut self,_:u32,_:u32,receipt:Receipt)
+   ->Result<(),FenceError>{
+   self.sent+=1;self.last=Some(receipt);
+   if self.fails{Err(FenceError::NoProgress)}else{Ok(())}
+  }
+ }
+ #[test]fn delivery_failure_cannot_fabricate_ack_or_publish_another_generation(){
+  let fence=LifecycleFence::new(0,7);
+  let mut sender=Sender{fails:true,sent:0,last:None};
+  assert_eq!(fence.publish_and_signal(0,7,4,&mut sender),Err(FenceError::NoProgress));
+  let pending=sender.last.unwrap();
+  assert_eq!(fence.require_pending_exact(0,pending),Ok(()));
+  assert_eq!(fence.require_ack_for_reclaim(0,pending),Err(FenceError::NoProgress));
+  assert_eq!(fence.publish_and_signal(0,7,5,&mut sender),Err(FenceError::Busy));
+  assert_eq!(sender.sent,1);
+ }
+ #[test]fn cpu_id_exact_delivery_and_local_completion_are_required(){
+  let fence=LifecycleFence::new(0,7);
+  let mut sender=Sender{fails:false,sent:0,last:None};
+  assert_eq!(fence.publish_and_signal(0,8,4,&mut sender),Err(FenceError::InvalidCpu));
+  assert_eq!(sender.sent,0);
+  let receipt=fence.publish_and_signal(0,7,4,&mut sender).unwrap();
+  assert_eq!(fence.acknowledge_after_local_invalidate(7,0,|_|Err(FenceError::NoProgress)),
+    Err(FenceError::IncompleteLocalWork));
+  assert_eq!(fence.require_ack_for_reclaim(0,receipt),Err(FenceError::NoProgress));
+  assert_eq!(fence.acknowledge_after_local_invalidate(7,0,|r|{
+   assert_eq!(r,receipt);Ok(())
+  }),Ok(Some(receipt)));
+  assert_eq!(fence.require_ack_for_reclaim(0,receipt),Ok(()));
+  assert_eq!(fence.acknowledge_after_local_invalidate(7,0,|_|Ok(())),
+    Err(FenceError::StaleReceipt));
+ }
+}
