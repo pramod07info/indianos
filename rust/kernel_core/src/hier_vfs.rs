@@ -77,11 +77,15 @@ impl<D:BlockDevice> HierVfs<D>{
  /// Re-read the mounted device and validate all file checksums plus both
  /// metadata copies without causing a write or automatic repair.
  pub fn mounted_health(&mut self)->Result<VolumeHealth,FsError>{
-  self.fs.mounted_health()
+  let health=self.fs.mounted_health()?;
+  self.listing_integrity()?;
+  Ok(health)
  }
- /// Opt-in metadata-only recovery, for an authorized kernel Desktop route.
- /// Unlike a destructive filesystem format, it never overwrites file banks.
+ /// Explicit recovery only after the whole hierarchical namespace passes
+ /// integrity checks; otherwise a CRC-valid corrupted graph could be copied
+ /// into both COW metadata heads and become unrecoverable.
  pub fn repair_redundancy(&mut self)->Result<bool,FsError>{
+  self.listing_integrity()?;
   self.fs.repair_redundancy()
  }
  pub fn format_blank(disk:D)->Result<Self,FsError>{
@@ -97,7 +101,10 @@ impl<D:BlockDevice> HierVfs<D>{
  pub fn generation(&self)->u64{self.fs.generation()}
  /// An actual persistence barrier, forwarded to the selected block device.
  /// Unsupported storage MUST return an error instead of false success.
- pub fn sync(&mut self)->Result<(),FsError>{self.fs.sync()}
+ pub fn sync(&mut self)->Result<(),FsError>{
+  self.listing_integrity()?;
+  self.fs.sync()
+ }
  /// Metadata-only authorization for a kernel-issued process credential.
  /// Every directory in the path must be searchable. Symlinks are not followed.
  pub fn authorize_access(&mut self,credentials:Credentials,path:&str,access:u16)

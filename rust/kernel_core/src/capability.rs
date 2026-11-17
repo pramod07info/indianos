@@ -616,3 +616,54 @@ mod pr782_ws55_58_tests{
         assert_eq!(r.len(),1);
     }
 }
+
+impl<const N:usize> Registry<N> {
+    /// Issue an exact set of delegated tickets as one kernel transaction.
+    /// A failed authority check, token exhaustion or capacity error leaves
+    /// both the original registry and caller output unchanged.
+    pub fn delegate_batch_exact(&mut self,owner:u32,
+        grants:&[(u64,u64,u32,u32)],out:&mut[u64])
+        ->Result<usize,CapabilityError>{
+        if owner==0{return Err(CapabilityError::InvalidOwner);}
+        if grants.is_empty(){return Err(CapabilityError::InvalidRights);}
+        if grants.len()>N||out.len()<grants.len(){return Err(CapabilityError::Full);}
+        let mut shadow=self.clone();
+        let mut minted=[0u64;N];
+        for (i,&(token,resource,recipient,rights)) in grants.iter().enumerate(){
+            if grants[..i].contains(&(token,resource,recipient,rights)){
+                return Err(CapabilityError::Denied);
+            }
+            minted[i]=shadow.delegate_scoped(owner,token,resource,recipient,rights)?;
+        }
+        self.entries=shadow.entries;self.next_token=shadow.next_token;
+        out[..grants.len()].copy_from_slice(&minted[..grants.len()]);
+        Ok(grants.len())
+    }
+}
+#[cfg(test)]
+mod m1_gate20_w5_caps_tests {
+ use super::*;
+ #[test]fn delegation_batch_is_atomic_for_bad_second_right(){
+  let mut r=Registry::<4>::new();
+  let src=r.grant(1,99,0b011).unwrap();
+  let mut out=[77u64;2];
+  assert_eq!(r.delegate_batch_exact(1,&[(src,99,2,1),(src,99,3,4)],&mut out),
+   Err(CapabilityError::Denied));
+  assert_eq!(r.len(),1);assert_eq!(out,[77;2]);
+  assert_eq!(r.delegate_batch_exact(1,&[(src,99,2,1),(src,99,3,2)],&mut out),Ok(2));
+  assert_eq!(r.authorize(2,out[0],99,1),Ok(()));
+  assert_eq!(r.authorize(3,out[1],99,2),Ok(()));
+ }
+ #[test]fn duplicate_and_capacity_errors_never_consume_tokens(){
+  let mut r=Registry::<2>::new();
+  let src=r.grant(1,99,1).unwrap();
+  let mut out=[77u64;2];
+  assert_eq!(r.delegate_batch_exact(1,&[(src,99,2,1),(src,99,2,1)],&mut out),
+   Err(CapabilityError::Denied));
+  assert_eq!(r.delegate_batch_exact(1,&[(src,99,2,1),(src,99,3,1)],&mut out),
+   Err(CapabilityError::Full));
+  assert_eq!(r.len(),1);assert_eq!(out,[77;2]);
+  assert_eq!(r.delegate_batch_exact(1,&[(src,99,2,1)],&mut out),Ok(1));
+  assert_eq!(out[0],src+1);
+ }
+}

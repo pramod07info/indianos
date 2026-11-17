@@ -230,3 +230,17 @@ mod m1_batch01_w5_acl_tests{
   assert!(!bad.allows(Credentials::kernel(0,0),WRITE|SEARCH));
  }
 }
+#[cfg(test)]
+mod m1_gate20_w3_acl_tests {
+ use super::*;
+ #[test]fn rename_requires_search_and_write_on_both_parents(){
+  let parent=Permissions::new(1,1,0o700).unwrap();
+  let ancestor=Permissions::new(1,1,0o500).unwrap();
+  let peer=Credentials::kernel(2,2);
+  let owner=Credentials::kernel(1,1);
+  assert!(!Permissions::authorize_rename(&[ancestor],parent,&[],parent,peer));
+  assert!(Permissions::authorize_rename(&[ancestor],parent,&[],parent,owner));
+  assert!(!Permissions::authorize_rename(&[Permissions::new(1,1,0o400).unwrap()],
+   parent,&[],parent,owner));
+ }
+}

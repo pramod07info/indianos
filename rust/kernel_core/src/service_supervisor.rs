@@ -2493,3 +2493,44 @@ mod m1_batch01_w4_service_tests{
   assert!(s.pending_exact(1,51,2));
  }
 }
+
+impl<const N:usize> ServiceTable<N>{
+    /// Kernel-owned PID1 dependency-ordered start. Every prerequisite must
+    /// be active at its exact authenticated PID/generation; pending restart
+    /// candidates do not inherit authority.
+    pub fn start_with_dependencies_exact(&mut self,service:u32,
+        generation:u32,deps:&[(u32,u32,u32)])->ServiceAction{
+        if service==0||deps.len()>N{return ServiceAction::Deny;}
+        for (i,&(id,pid,epoch)) in deps.iter().enumerate(){
+            if id==service||id==0||pid==0||epoch==0||
+                deps[..i].iter().any(|&(other,_,_)|other==id)||
+                !self.is_active_exact(id,pid,epoch){
+                return ServiceAction::Deny;
+            }
+        }
+        self.start_if_generation(service,generation)
+    }
+}
+#[cfg(test)]
+mod m1_gate20_w2_service_tests{
+ use super::*;
+ #[test]fn required_service_must_be_active_at_exact_epoch(){
+  let mut s=ServiceTable::<3>::new();
+  assert!(s.configure(1,100,1));assert!(s.configure(2,200,1));
+  assert_eq!(s.start_with_dependencies_exact(2,0,&[(1,100,1)]),ServiceAction::Deny);
+  assert_eq!(s.start(1),ServiceAction::Start{pid:100,generation:1});
+  assert_eq!(s.start_with_dependencies_exact(2,0,&[(1,100,2)]),ServiceAction::Deny);
+  assert_eq!(s.start_with_dependencies_exact(2,0,&[(1,100,1)]),
+    ServiceAction::Start{pid:200,generation:1});
+ }
+ #[test]fn cycles_duplicates_and_pending_replacements_are_denied(){
+  let mut s=ServiceTable::<3>::new();
+  assert!(s.configure(1,100,1));assert!(s.configure(2,200,1));
+  assert_eq!(s.start(1),ServiceAction::Start{pid:100,generation:1});
+  assert_eq!(s.start_with_dependencies_exact(2,0,&[(2,200,1)]),ServiceAction::Deny);
+  assert_eq!(s.start_with_dependencies_exact(2,0,&[(1,100,1),(1,100,1)]),ServiceAction::Deny);
+  assert_eq!(s.crash(100,101),ServiceAction::Restart{pid:101,generation:2});
+  assert_eq!(s.start_with_dependencies_exact(2,0,&[(1,100,1)]),ServiceAction::Deny);
+  assert_eq!(s.snapshot(2).unwrap().generation,0);
+ }
+}

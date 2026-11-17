@@ -1281,3 +1281,13 @@ mod m1_batch01_w2_block_tests{
   assert_eq!(check_range(u64::MAX,u64::MAX-1,3),Err(BlockError::OutOfRange));
  }
 }
+#[cfg(test)]
+mod m1_gate20_w4_partition_tests {
+ use super::*;
+ #[test]fn exact_lba_window_boundary_and_overflow_fail_closed(){
+  assert_eq!(check_range(128,127,1),Ok(()));
+  assert_eq!(check_range(128,127,2),Err(BlockError::OutOfRange));
+  assert_eq!(check_range(128,128,1),Err(BlockError::OutOfRange));
+  assert_eq!(check_range(u64::MAX,u64::MAX-2,4),Err(BlockError::OutOfRange));
+ }
+}

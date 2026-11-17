@@ -51,6 +51,19 @@ fn validate_ranges(regions:&[Region]) -> bool {
     }
     usable
 }
+/// Preflight the complete Limine memory map before exporting its count.
+/// An invalid late entry must never let the PMM consume a partial map.
+fn validated_map_count(map:&MemoryMap)->Option<u64>{
+    if map.entries.is_null()||!(1..=4096).contains(&map.count){return None;}
+    let mut usable=false;
+    for i in 0..map.count as usize{
+        let item=unsafe{ptr::read_volatile(map.entries.add(i))};
+        let region=unsafe{item.as_ref()}?;
+        if !valid_region(region){return None;}
+        usable |= region.kind==0;
+    }
+    if usable{Some(map.count)}else{None}
+}
 /// # Safety
 /// Called while Limine response pointers are valid (before bootloader
 /// memory reclamation) and only after Limine has prepared the x86-64 kernel.
@@ -62,28 +75,15 @@ pub unsafe extern "C" fn boot_validate() -> bool {
     let Some(map) = (unsafe { memory_map() }) else {
         log(b"IndianOS: missing or oversized memory map\n\0"); return false;
     };
-    if map.entries.is_null() || !(1..=4096).contains(&map.count) {
-        log(b"IndianOS: missing or oversized memory map\n\0"); return false;
+    if validated_map_count(map).is_none(){
+        log(b"IndianOS: invalid or unusable memory map\n\0");return false;
     }
-    let mut usable=false;
-    for i in 0..map.count as usize {
-        let item=unsafe { ptr::read_volatile(map.entries.add(i)) };
-        let Some(region)=(unsafe { item.as_ref() }) else {
-            log(b"IndianOS: invalid memory region\n\0"); return false;
-        };
-        if !valid_region(region) {
-            log(b"IndianOS: invalid memory region\n\0"); return false;
-        }
-        usable |= region.kind==0;
-    }
-    if !usable { log(b"IndianOS: no usable RAM in memory map\n\0"); }
-    usable
+    true
 }
 #[no_mangle]
 pub unsafe extern "C" fn boot_memory_region_count() -> u64 {
     let Some(m)=(unsafe { memory_map() }) else {return 0};
-    if m.entries.is_null() || !(1..=4096).contains(&m.count){return 0;}
-    m.count
+    validated_map_count(m).unwrap_or(0)
 }
 /// # Safety
 /// Valid writable C region output or null. The context parameter is ignored.
@@ -334,5 +334,19 @@ mod m1_batch01_w3_boot_tests{
  }
  #[test]fn b01_11_nonusable_only_map_is_rejected(){
   assert!(!validate_ranges(&[Region{base:0x1000,length:0x1000,kind:1}]));
+ }
+}
+#[cfg(test)]
+mod m1_gate20_w1_boot_tests {
+ use super::*;
+ #[test]fn exported_map_count_fails_closed_on_corrupt_tail(){
+  let ok=Region{base:0x1000,length:0x1000,kind:0};
+  let bad=Region{base:u64::MAX,length:2,kind:1};
+  let entries=[&ok as *const Region,&bad as *const Region];
+  let map=MemoryMap{revision:0,count:2,entries:entries.as_ptr()};
+  assert_eq!(validated_map_count(&map),None);
+  let good_entries=[&ok as *const Region];
+  let good=MemoryMap{revision:0,count:1,entries:good_entries.as_ptr()};
+  assert_eq!(validated_map_count(&good),Some(1));
  }
 }

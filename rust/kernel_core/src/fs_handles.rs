@@ -1439,6 +1439,11 @@ fn selected_path_preflight(table:&FileHandles,owner:Identity,action:u64,
         if !table.root_allows(owner,second)||WriteGuard::allow_path(second).is_err(){
             return Err(FsError::InvalidName);
         }
+        // Action 9 moves an entire directory subtree. Deny self/root and
+        // descendant cycles before physical ATA discovery or I/O. The live
+        // HierVfs repeats this guard after mount as a second trust boundary.
+        if action==9 && crate::vfs_path::rename_stays_within_tree(canonical,second,"/")
+            !=Ok(true){return Err(FsError::InvalidName);}
     }else if !target.is_empty(){return Err(FsError::InvalidName);}
     if !matches!(action,10|11)&&offset!=0{return Err(FsError::InvalidName);}
     if !matches!(action,3|5|11)&&used!=0{return Err(FsError::InvalidName);}
