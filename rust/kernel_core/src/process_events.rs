@@ -1444,3 +1444,37 @@ impl<const C:usize,const N:usize> CoreRunQueues<C,N>{
   assert_eq!(q.next(0),Ok(r));
  }
 }
+
+
+/// Task Manager: snapshot only from scheduler-authenticated PID1 epoch.
+/// It does NOT expose task control or a kill syscall to an untrusted GUI.
+impl<const C:usize,const N:usize> CoreRunQueues<C,N>{
+ pub fn snapshot_pid1_task_manager(&self,authenticated:Runnable,
+  out:&mut[(usize,Runnable)])->Result<usize,DispatchError>{
+  if authenticated.pid!=1||authenticated.generation==0||
+     !self.contains_epoch(1,authenticated.generation){
+   return Err(DispatchError::InvalidTask);
+  }
+  self.snapshot_runnable(out)
+ }
+}
+#[cfg(test)]
+mod m1_batch05_w1_task_manager_tests{
+ use super::*;
+ #[test]fn only_current_pid1_may_snapshot_bounded_task_inventory(){
+  let mut s=CoreRunQueues::<2,2>::new();
+  let pid1=Runnable{pid:1,generation:10,priority:0};
+  let peer=Runnable{pid:2,generation:4,priority:1};
+  s.enqueue(0,pid1).unwrap();s.enqueue(1,peer).unwrap();
+  let sentinel=(7,Runnable{pid:9,generation:9,priority:9});
+  let mut output=[sentinel;2];
+  assert_eq!(s.snapshot_pid1_task_manager(Runnable{generation:9,..pid1},
+    &mut output),Err(DispatchError::InvalidTask));
+  assert_eq!(output,[sentinel;2]);
+  assert_eq!(s.snapshot_pid1_task_manager(pid1,&mut output[..1]),
+    Err(DispatchError::Full));
+  assert_eq!(output,[sentinel;2]);
+  assert_eq!(s.snapshot_pid1_task_manager(pid1,&mut output),Ok(2));
+  assert_eq!(output,[(0,pid1),(1,peer)]);
+ }
+}

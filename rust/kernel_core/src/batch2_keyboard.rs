@@ -654,3 +654,99 @@ mod m1_batch04_w6_keyboard_tests{
   assert_eq!(r.receive(1,2).unwrap().pressed,false);
  }
 }
+
+
+/// USB HID boot-keyboard *report decoder*, not an xHCI/HID transport.
+/// Only a small keyboard-safe usage subset maps to trusted Set-1 input.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum UsbBootError{Invalid,Unsupported}
+pub fn decode_usb_boot_keyboard(report:[u8;8],
+ output:&mut[u16;6])->Result<usize,UsbBootError>{
+ if report[1]!=0{return Err(UsbBootError::Invalid);}
+ let mut staged=[0u16;6];let mut count=0usize;
+ for &usage in &report[2..]{
+  if usage==0{continue;}
+  if report[2..].iter().filter(|&&u|u==usage).count()!=1{
+   return Err(UsbBootError::Invalid);
+  }
+  let scan=match usage{
+   0x04=>0x1e,0x05=>0x30,0x06=>0x2e,0x07=>0x20,
+   0x08=>0x12,0x09=>0x21,0x0a=>0x22,0x2c=>0x39,
+   0x28=>0x1c,0x2a=>0x0e,_=>return Err(UsbBootError::Unsupported),
+  };
+  staged[count]=scan;count+=1;
+ }
+ output.copy_from_slice(&staged);Ok(count)
+}
+impl<const Q:usize> Router<Q>{
+ /// Exact authenticated focus receipt for a trusted USB host controller's
+ /// already validated report. No USB controller, DMA or IRQ is driven here.
+ pub fn route_usb_boot_pressed<const W:usize>(&mut self,windows:&Windows<W>,
+  focus:Focus,report:[u8;8])->Result<usize,InputError>{
+  if self.focus!=Some(focus)||!windows.owns(focus.pid,focus.generation,focus.window){
+   return Err(InputError::Unauthorized);
+  }
+  let mut keys=[0u16;6];
+  let count=decode_usb_boot_keyboard(report,&mut keys)
+   .map_err(|_|InputError::Invalid)?;
+  if count==0{return Ok(0);}
+  let mut events=[(0u16,true);6];
+  for i in 0..count{events[i]=(keys[i],true);}
+  self.physical_set1_batch_at_focus(windows,focus,&events[..count])
+ }
+ /// A trusted pointer IRQ supplies screen coordinates. Focus transfer and
+ /// all physical keyboard events commit atomically, or neither changes.
+ pub fn physical_irq_focus_and_keys<const W:usize>(&mut self,
+  windows:&Windows<W>,x:u32,y:u32,keys:&[(u16,bool)])
+   ->Result<Focus,InputError>{
+  let window=windows.hit_test(x,y).ok_or(InputError::NoFocus)?;
+  let next=Focus{pid:window.pid,generation:window.generation,window:window.id};
+  let mut staged=Self{focus:self.focus,queue:self.queue,len:self.len};
+  staged.switch_focus_drop_pending(windows,next)?;
+  staged.physical_set1_batch_at_focus(windows,next,keys)?;
+  *self=staged;Ok(next)
+ }
+}
+#[cfg(test)]
+mod m1_batch05_w3_usb_irq_tests{
+ use super::*;
+ use crate::batch2_windows::{Window,Rect};
+ #[test]fn hid_rollover_duplicates_and_stale_focus_fail_closed(){
+  let mut keys=[99u16;6];
+  assert_eq!(decode_usb_boot_keyboard([0,0,4,4,0,0,0,0],&mut keys),
+             Err(UsbBootError::Invalid));
+  assert_eq!(keys,[99u16;6]);
+  assert_eq!(decode_usb_boot_keyboard([0,0,4,5,0,0,0,0],&mut keys),Ok(2));
+  assert_eq!(&keys[..2],&[0x1e,0x30]);
+  let mut windows=Windows::<2>::new();
+  windows.create(Window{pid:3,generation:2,id:4,
+   rect:Rect{x:0,y:0,w:100,h:100}}).unwrap();
+  let f=Focus{pid:3,generation:2,window:4};
+  let mut r=Router::<3>::new();r.set_focus(&windows,f).unwrap();
+  assert_eq!(r.route_usb_boot_pressed(&windows,Focus{generation:1,..f},
+   [0,0,4,0,0,0,0,0]),Err(InputError::Unauthorized));
+  assert_eq!(r.route_usb_boot_pressed(&windows,f,
+   [0,0,4,5,0,0,0,0]),Ok(2));
+  assert_eq!(r.receive(3,2).unwrap().scan_code,0x1e);
+ }
+ #[test]fn pointer_irq_does_not_switch_focus_if_any_key_invalid(){
+  let mut w=Windows::<2>::new();
+  w.create(Window{pid:2,generation:1,id:2,
+    rect:Rect{x:0,y:0,w:20,h:20}}).unwrap();
+  w.create(Window{pid:3,generation:8,id:3,
+    rect:Rect{x:30,y:0,w:20,h:20}}).unwrap();
+  let mut r=Router::<3>::new();
+  let old=Focus{pid:2,generation:1,window:2};
+  r.set_focus(&w,old).unwrap();
+  r.physical_key(&w,0x1e,true).unwrap();
+  assert_eq!(r.physical_irq_focus_and_keys(&w,35,5,
+    &[(0x1e,true),(0x59,true)]),Err(InputError::Invalid));
+  assert_eq!(r.focused(),Some(old));
+  assert_eq!(r.pending_total(),1);
+  let next=r.physical_irq_focus_and_keys(&w,35,5,&[(0x1e,true)]).unwrap();
+  assert_eq!(next,Focus{pid:3,generation:8,window:3});
+  assert_eq!(r.pending_total(),1);
+  assert_eq!(r.receive(2,1),Err(InputError::Empty));
+  assert_eq!(r.receive(3,8).unwrap().scan_code,0x1e);
+ }
+}

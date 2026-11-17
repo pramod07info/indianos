@@ -949,3 +949,56 @@ mod r118_authenticated_pid1_handoff_tests {
         assert_eq!(media.disk.writes,0);
     }
 }
+
+
+/// G8 verified UEFI boot extension: the firmware implementation must check
+/// enforced Secure Boot, authenticated boot image and protected TPM/ROM roots.
+/// No implementation of this trait exists for ordinary production boot;
+/// caller-provided flags are NEVER accepted as firmware attestation.
+pub trait AuthenticatedSecureUefi:AuthenticatedPid1Platform{
+ fn require_firmware_secure_boot_chain(&self)->Result<(),Error>;
+}
+pub fn authorize_secure_uefi_pid1<D:BlockDevice,P:AuthenticatedSecureUefi>(
+ disk:&mut D,platform:&P)->Result<VerifiedPid1Admission,Error>{
+ platform.require_firmware_secure_boot_chain()?;
+ let admitted=authorize_verified_pid1(disk,platform)?;
+ // Firmware and boot source may change during a disk observation.
+ platform.require_firmware_secure_boot_chain()?;
+ Ok(admitted)
+}
+#[cfg(test)]
+mod m1_batch05_w4_uefi_tests{
+ use super::*;
+ struct Unavailable{secure:bool}
+ impl TrustedBootMeasurement for Unavailable{
+  fn read_verified(&self)->Result<[u8;32],Error>{Err(Error::Untrusted)}
+ }
+ impl AuthenticatedPid1Platform for Unavailable{
+  fn read_sealed_floor(&self)->Result<SealedBootFloor,Error>{Err(Error::Untrusted)}
+  fn read_bootloader_selected_slot(&self)->Result<(usize,Slot),Error>{
+   Err(Error::Untrusted)
+  }
+ }
+ impl AuthenticatedSecureUefi for Unavailable{
+  fn require_firmware_secure_boot_chain(&self)->Result<(),Error>{
+   if self.secure{Ok(())}else{Err(Error::Untrusted)}
+  }
+ }
+ struct Unreadable;
+ impl BlockDevice for Unreadable{
+  fn sector_count(&self)->u64{0}
+  fn read_sector(&mut self,_:u64,_:&mut[u8;SECTOR_BYTES])->Result<(),crate::block::BlockError>{
+   panic!("untrusted boot must fail before device I/O")
+  }
+  fn write_sector(&mut self,_:u64,_:&[u8;SECTOR_BYTES])->Result<(),crate::block::BlockError>{
+   panic!("authorization never writes")
+  }
+ }
+ #[test]fn no_firmware_secure_boot_and_missing_tpm_never_authorize_pid1(){
+  let mut disk=Unreadable;
+  assert_eq!(authorize_secure_uefi_pid1(&mut disk,&Unavailable{secure:false}),
+   Err(Error::Untrusted));
+  assert_eq!(authorize_secure_uefi_pid1(&mut disk,&Unavailable{secure:true}),
+   Err(Error::Untrusted));
+ }
+}

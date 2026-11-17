@@ -103,3 +103,31 @@ mod m1_batch04_w5_theme_tests{
   assert_eq!(s.read(1,1),Ok(next));assert_eq!(s.read(2,4),Ok(next));
  }
 }
+
+
+/// Settings GUI's guarded compare-and-set. The kernel authenticates the
+/// caller PID/generation before exposing this service to a graphical client.
+/// A stale settings dialog cannot replace another session's newer choice.
+impl<const N:usize> Store<N>{
+ pub fn update_if_current(&mut self,pid:u32,epoch:u64,
+  expected:Settings,replacement:Settings)->Result<(),SettingsError>{
+  if pid==0||epoch==0{return Err(SettingsError::Denied);}
+  let current=self.read(pid,epoch)?;
+  if current!=expected{return Err(SettingsError::Denied);}
+  self.update(pid,epoch,replacement)
+ }
+}
+#[cfg(test)]
+mod m1_batch05_w1_settings_tests{
+ use super::*;
+ #[test]fn stale_settings_dialog_cannot_overwrite_newer_theme(){
+  let first=Settings{theme:Theme::Light,pointer_speed:5,key_repeat:8};
+  let newer=Settings{theme:Theme::Dark,..first};
+  let mut store=Store::<2>::new();
+  store.register(7,3,first).unwrap();
+  assert_eq!(store.update_if_current(7,4,first,newer),Err(SettingsError::Denied));
+  assert_eq!(store.update_if_current(7,3,first,newer),Ok(()));
+  assert_eq!(store.update_if_current(7,3,first,first),Err(SettingsError::Denied));
+  assert_eq!(store.read(7,3),Ok(newer));
+ }
+}
