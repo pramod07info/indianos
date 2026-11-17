@@ -1478,3 +1478,162 @@ mod m1_batch05_w1_task_manager_tests{
   assert_eq!(output,[(0,pid1),(1,peer)]);
  }
 }
+
+
+// P0 kernel workstream W1: exact AP acknowledgement gates a real, atomic
+// scheduler runqueue eviction. These are the existing software runqueues,
+// not a substitute for physical IPI delivery or MMU TLB invalidation.
+#[derive(Debug,Clone,Copy,Eq,PartialEq)]
+pub enum ReclaimError{
+ InvalidOwner,
+ Ap(crate::smp_lifecycle_fence::FenceError),
+ Queue(DispatchError),
+}
+impl<const C:usize,const N:usize> CoreRunQueues<C,N>{
+ pub fn retire_after_ap_reclaim_barrier(&mut self,supervisor:Runnable,
+  victims:&[(u32,u64)],
+  acknowledgements:&[(&crate::smp_lifecycle_fence::LifecycleFence,
+                      u32,crate::smp_lifecycle_fence::Receipt)])
+  ->Result<usize,ReclaimError>{
+  if supervisor.pid!=1||supervisor.generation==0||
+     !self.contains_epoch(supervisor.pid,supervisor.generation)||
+     victims.is_empty()||acknowledgements.is_empty()||
+     acknowledgements.len()>64||
+     victims.iter().any(|&(pid,epoch)|pid==1||pid==0||epoch==0){
+    return Err(ReclaimError::InvalidOwner);
+  }
+  // One AP receipt must not masquerade as several independent CPUs.
+  for (i,&(fence,_,_)) in acknowledgements.iter().enumerate(){
+   if acknowledgements[..i].iter().any(|&(prior,_,_)|
+     core::ptr::eq(prior,fence)){return Err(ReclaimError::InvalidOwner);}
+  }
+  crate::smp_lifecycle_fence::require_all_acks_for_reclaim(acknowledgements)
+   .map_err(ReclaimError::Ap)?;
+  // Build a private scheduler snapshot. Invalid later process generations
+  // leave the real queues, cursors, and all other tasks unchanged.
+  let mut staged=Self{queues:self.queues,length:self.length,cursor:self.cursor};
+  let removed=staged.evict_epochs_atomic(victims).map_err(ReclaimError::Queue)?;
+  // Recheck before publishing after fallible staging. The caller must
+  // serialize the actual scheduler and AP publication under SMP locks.
+  crate::smp_lifecycle_fence::require_all_acks_for_reclaim(acknowledgements)
+   .map_err(ReclaimError::Ap)?;
+  *self=staged;
+  Ok(removed)
+ }
+}
+
+/// P0 W2: starvation-bounded priority quantum for the existing per-core
+/// software runqueues. Timer-ISR and preemptive context-switch wiring is
+/// separately required for a genuinely preemptive SMP scheduler.
+#[derive(Clone,Copy,Debug,Eq,PartialEq)]
+pub struct FairQuantum{priority_streak:u8,maximum_streak:u8}
+impl FairQuantum{
+ pub const fn new(maximum_streak:u8)->Self{
+  Self{priority_streak:0,maximum_streak}
+ }
+ pub fn high_streak(&self)->u8{self.priority_streak}
+ pub fn reset(&mut self){self.priority_streak=0;}
+}
+impl<const C:usize,const N:usize> CoreRunQueues<C,N>{
+ pub fn select_fair_quantum(&mut self,cpu:usize,high_threshold:u8,
+  quantum:&mut FairQuantum)->Result<Runnable,DispatchError>{
+  if cpu>=C{return Err(DispatchError::InvalidCpu);}
+  if quantum.maximum_streak==0{return Err(DispatchError::InvalidTask);}
+  let count=self.length[cpu];
+  if count==0{return Err(DispatchError::Empty);}
+  if quantum.priority_streak>=quantum.maximum_streak{
+   // Prefer the oldest next low-priority slot in this CPU's circular order.
+   for offset in 0..count{
+    let index=(self.cursor[cpu]+offset)%count;
+    if let Some(task)=self.queues[cpu][index]{
+     if task.priority<high_threshold{
+      self.cursor[cpu]=(index+1)%count;
+      quantum.priority_streak=0;
+      return Ok(task);
+     }
+    }
+   }
+  }
+  match self.next_eligible(cpu,high_threshold){
+   Ok(task)=>{
+    quantum.priority_streak=quantum.priority_streak.saturating_add(1);
+    Ok(task)
+   },
+   Err(DispatchError::Empty)=>{
+    let task=self.next(cpu)?;
+    quantum.priority_streak=0;
+    Ok(task)
+   },
+   Err(err)=>Err(err),
+  }
+ }
+}
+#[cfg(test)]
+mod kernel_p0_w1_smp_reclaim_tests{
+ use super::*;
+ use crate::smp_lifecycle_fence::{LifecycleFence,FenceError};
+ fn t(pid:u32,generation:u64)->Runnable{
+  Runnable{pid,generation,priority:3}
+ }
+ #[test]fn two_ap_acknowledgements_are_required_before_exact_process_reclaim(){
+  let mut queues=CoreRunQueues::<2,3>::new();
+  queues.enqueue(0,t(1,4)).unwrap();
+  queues.enqueue(1,t(2,7)).unwrap();
+  let first=LifecycleFence::new(0,1);
+  let second=LifecycleFence::new(2,3);
+  let a=first.publish(0,10).unwrap();
+  let b=second.publish(2,10).unwrap();
+  first.observe_and_ack_after(1,0,|_|true).unwrap();
+  let receipts=[(&first,0,a),(&second,2,b)];
+  assert_eq!(queues.retire_after_ap_reclaim_barrier(t(1,4),&[(2,7)],&receipts),
+   Err(ReclaimError::Ap(FenceError::NoProgress)));
+  assert!(queues.contains_epoch(2,7));
+  second.observe_and_ack_after(3,0,|_|true).unwrap();
+  assert_eq!(queues.retire_after_ap_reclaim_barrier(t(1,4),&[(2,8)],&receipts),
+   Err(ReclaimError::Queue(DispatchError::InvalidTask)));
+  assert!(queues.contains_epoch(2,7));
+  assert_eq!(queues.retire_after_ap_reclaim_barrier(t(1,4),&[(2,7)],&receipts),Ok(1));
+  assert!(queues.contains_epoch(1,4));assert!(!queues.contains_epoch(2,7));
+ }
+ #[test]fn no_reclaim_of_pid1_or_repeated_ap_receipts(){
+  let mut q=CoreRunQueues::<1,2>::new();
+  q.enqueue(0,t(1,3)).unwrap();q.enqueue(0,t(2,4)).unwrap();
+  let fence=LifecycleFence::new(0,1);
+  let token=fence.publish(0,4).unwrap();
+  fence.observe_and_ack_after(1,0,|_|true).unwrap();
+  let once=[(&fence,0,token)];
+  assert_eq!(q.retire_after_ap_reclaim_barrier(t(1,3),&[(1,3)],&once),
+    Err(ReclaimError::InvalidOwner));
+  assert_eq!(q.retire_after_ap_reclaim_barrier(t(1,3),&[(2,4)],&[once[0],once[0]]),
+    Err(ReclaimError::InvalidOwner));
+  assert_eq!(q.total_runnable(),2);
+ }
+}
+#[cfg(test)]
+mod kernel_p0_w2_scheduler_tests{
+ use super::*;
+ #[test]fn low_priority_makes_progress_with_continuous_high_priority_work(){
+  let mut q=CoreRunQueues::<1,3>::new();
+  let high=Runnable{pid:2,generation:2,priority:10};
+  let low=Runnable{pid:3,generation:2,priority:1};
+  q.enqueue(0,high).unwrap();q.enqueue(0,low).unwrap();
+  let mut budget=FairQuantum::new(2);
+  assert_eq!(q.select_fair_quantum(0,5,&mut budget),Ok(high));
+  assert_eq!(q.select_fair_quantum(0,5,&mut budget),Ok(high));
+  assert_eq!(q.select_fair_quantum(0,5,&mut budget),Ok(low));
+  assert_eq!(budget.high_streak(),0);
+  assert_eq!(q.select_fair_quantum(99,5,&mut budget),
+     Err(DispatchError::InvalidCpu));
+  assert_eq!(q.total_runnable(),2);
+ }
+ #[test]fn invalid_quantum_does_not_change_cursor_or_process_state(){
+  let mut q=CoreRunQueues::<1,2>::new();
+  let a=Runnable{pid:2,generation:4,priority:1};
+  let b=Runnable{pid:3,generation:4,priority:9};
+  q.enqueue(0,a).unwrap();q.enqueue(0,b).unwrap();
+  let mut zero=FairQuantum::new(0);
+  assert_eq!(q.select_fair_quantum(0,5,&mut zero),Err(DispatchError::InvalidTask));
+  assert_eq!(q.next(0),Ok(a));
+  assert_eq!(q.total_runnable(),2);
+ }
+}

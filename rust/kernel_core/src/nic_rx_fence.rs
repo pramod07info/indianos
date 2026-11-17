@@ -394,3 +394,65 @@ mod pr782_ws65_67_tests{
         assert!(!a.revision_is_current(&fresh,rev));
     }
 }
+
+
+/// P0 W5: kernel-owned NIC controller shutdown callback. The driver must
+/// actually mask MSI/MSI-X, stop bus mastering and drain DMA descriptors
+/// BEFORE returning success. This type cannot establish the physical fact;
+/// a hardware driver implementor and independent qualification are required.
+pub trait NicHardwareQuiesce{
+ fn stop_irq_dma_and_drain(&mut self,device:u32)->Result<(),RxFenceError>;
+}
+impl NicRxFence{
+ /// Keep the RX fence quiescing on all errors. No caller may fabricate a
+ /// success boolean to reopen ingress through this driver-facing operation.
+ pub fn quiesce_and_rebind_with_driver<D:NicHardwareQuiesce>(&self,
+  driver:&mut D,device:u32,software_probes:u32)->Result<u64,RxFenceError>{
+  let receipt=self.begin_quiesce(device)?;
+  driver.stop_irq_dma_and_drain(device)?;
+  self.wait_drained_bounded(receipt,software_probes)?;
+  self.finish_rebind_checked(receipt,true,true)
+ }
+}
+#[cfg(test)]
+mod kernel_p0_w5_nic_teardown_tests{
+ use super::*;
+ struct Driver{stops:u32,fail:bool}
+ impl NicHardwareQuiesce for Driver{
+  fn stop_irq_dma_and_drain(&mut self,_:u32)->Result<(),RxFenceError>{
+   self.stops+=1;
+   if self.fail{Err(RxFenceError::Busy)}else{Ok(())}
+  }
+ }
+ #[test]fn software_handler_must_drain_and_failed_driver_never_reopens_queue(){
+  let nic=NicRxFence::new(9);
+  let pending=nic.try_admit(9).unwrap();
+  let mut d=Driver{stops:0,fail:false};
+  assert_eq!(nic.quiesce_and_rebind_with_driver(&mut d,9,0),
+     Err(RxFenceError::Busy));
+  assert_eq!(nic.try_admit(9).err(),Some(RxFenceError::Quiescing));
+  assert_eq!(d.stops,1);
+  drop(pending);
+  // The separate privileged control plane can resume ONLY after it has
+  // independently checked the actual hardware stopped and the software
+  // admission count drained. No auto-resume occurs on the busy path.
+  assert_eq!(nic.epoch(),1);
+ }
+ #[test]fn successful_driver_halt_invalidates_prior_ring_epoch(){
+  let nic=NicRxFence::new(10);
+  let mut d=Driver{stops:0,fail:false};
+  assert_eq!(nic.quiesce_and_rebind_with_driver(&mut d,10,1),Ok(2));
+  assert_eq!(d.stops,1);
+  assert_eq!(nic.epoch(),2);
+  let p=nic.try_admit(10).unwrap();
+  assert_eq!(p.epoch(),2);
+ }
+ #[test]fn driver_halt_failure_never_claims_new_generation(){
+  let nic=NicRxFence::new(11);
+  let mut d=Driver{stops:0,fail:true};
+  assert_eq!(nic.quiesce_and_rebind_with_driver(&mut d,11,1),
+    Err(RxFenceError::Busy));
+  assert_eq!(nic.epoch(),1);
+  assert_eq!(nic.try_admit(11).err(),Some(RxFenceError::Quiescing));
+ }
+}

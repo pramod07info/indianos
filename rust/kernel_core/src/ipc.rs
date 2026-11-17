@@ -859,3 +859,70 @@ mod m1_gate20_w4_next_ipc_tests{
   assert_eq!(router.receive(b).unwrap().payload(),b"ok");
  }
 }
+
+
+/// P0 W3: transactional ordered messages from one authenticated process to
+/// one exact recipient incarnation. No partial publication on capacity or
+/// payload faults. The kernel still owns synchronization around the router.
+impl<const M:usize,const D:usize> ScopedRouter<M,D>{
+ pub fn send_batch_to_owner(&mut self,sender:Identity,receiver:Identity,
+  payloads:&[&[u8]])->Result<usize,IpcError>{
+  if sender.pid==0||sender.generation==0||
+     receiver.pid==0||receiver.generation==0||
+     payloads.is_empty()||payloads.len()>D{
+    return Err(IpcError::InvalidPid);
+  }
+  if !self.boxes.iter().flatten().any(|box_|box_.owner==sender){
+   return Err(IpcError::UnknownSender);
+  }
+  let target=self.boxes.iter_mut().flatten().find(|box_|box_.owner==receiver)
+    .ok_or(IpcError::UnknownReceiver)?;
+  if target.count.checked_add(payloads.len()).is_none_or(|sum|sum>D){
+   return Err(IpcError::Full);
+  }
+  let mut staged=[None;D];
+  for (i,data) in payloads.iter().enumerate(){
+   if data.len()>MAX_PAYLOAD{return Err(IpcError::PayloadTooLarge);}
+   let mut bytes=[0u8;MAX_PAYLOAD];
+   bytes[..data.len()].copy_from_slice(data);
+   staged[i]=Some(TaggedMessage{
+    sender,length:data.len() as u8,bytes
+   });
+  }
+  for (i,msg) in staged[..payloads.len()].iter().enumerate(){
+   target.queue[target.count+i]=*msg;
+  }
+  target.count+=payloads.len();
+  Ok(payloads.len())
+ }
+}
+#[cfg(test)]
+mod kernel_p0_w3_authenticated_ipc_tests{
+ use super::*;
+ #[test]fn full_second_message_never_publishes_first_or_leaks_stale_epoch(){
+  let a=Identity{pid:2,generation:4};
+  let b=Identity{pid:3,generation:9};
+  let mut router=ScopedRouter::<2,2>::new().unwrap();
+  router.register(a).unwrap();router.register(b).unwrap();
+  router.send(a,b,b"existing").unwrap();
+  assert_eq!(router.send_batch_to_owner(a,b,&[b"one",b"two"]),Err(IpcError::Full));
+  assert_eq!(router.pending(b),Ok(1));
+  assert_eq!(router.send_batch_to_owner(Identity{generation:3,..a},b,&[b"x"]),
+    Err(IpcError::UnknownSender));
+  assert_eq!(router.send_batch_to_owner(a,Identity{generation:8,..b},&[b"x"]),
+    Err(IpcError::UnknownReceiver));
+  assert_eq!(router.receive(b).unwrap().payload(),b"existing");
+  assert_eq!(router.send_batch_to_owner(a,b,&[b"one",b"two"]),Ok(2));
+  assert_eq!(router.receive(b).unwrap().payload(),b"one");
+  assert_eq!(router.receive(b).unwrap().payload(),b"two");
+ }
+ #[test]fn oversize_payload_keeps_fifo_empty(){
+  let a=Identity{pid:1,generation:3};let b=Identity{pid:2,generation:3};
+  let mut r=ScopedRouter::<2,2>::new().unwrap();
+  r.register(a).unwrap();r.register(b).unwrap();
+  let big=[0u8;MAX_PAYLOAD+1];
+  assert_eq!(r.send_batch_to_owner(a,b,&[b"valid",&big]),
+     Err(IpcError::PayloadTooLarge));
+  assert_eq!(r.pending(b),Ok(0));
+ }
+}

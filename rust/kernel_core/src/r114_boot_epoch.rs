@@ -1002,3 +1002,51 @@ mod m1_batch05_w4_uefi_tests{
    Err(Error::Untrusted));
  }
 }
+
+
+/// P0 W6: independently re-check the full signed-slot, protected floor and
+/// persistent two-copy epoch immediately before PID1's final handoff.
+/// Returns no new authority. The trusted boot coordinator MUST serialize
+/// the disk and hardware token between this check and executable launch.
+pub fn revalidate_verified_pid1_at_launch<D:BlockDevice,P:AuthenticatedPid1Platform>(
+ disk:&mut D,platform:&P,original:VerifiedPid1Admission
+)->Result<(),Error>{
+ let fresh=authorize_verified_pid1(disk,platform)?;
+ if fresh!=original{return Err(Error::Stale);}
+ Ok(())
+}
+#[cfg(test)]
+mod kernel_p0_w6_boot_handoff_tests{
+ use super::*;
+ struct Platform{measurement:[u8;32],floor:SealedBootFloor,slot:Slot}
+ impl TrustedBootMeasurement for Platform{
+  fn read_verified(&self)->Result<[u8;32],Error>{Ok(self.measurement)}
+ }
+ impl AuthenticatedPid1Platform for Platform{
+  fn read_sealed_floor(&self)->Result<SealedBootFloor,Error>{Ok(self.floor)}
+  fn read_bootloader_selected_slot(&self)->Result<(usize,Slot),Error>{
+   Ok((0,self.slot))
+  }
+ }
+ fn platform()->Platform{
+  Platform{
+   measurement:[3;32],
+   floor:SealedBootFloor{minimum_epoch:4,minimum_journal_generation:20,
+     expected_slot:0,minimum_slot_version:9,expected_measurement:[3;32]},
+   slot:tests::slot(),
+  }
+ }
+ #[test]fn launch_receipt_is_invalidated_by_new_trusted_root_or_slot_revision(){
+  let mut disk=tests::fixture();
+  let mut p=platform();
+  let original=authorize_verified_pid1(&mut disk,&p).unwrap();
+  assert_eq!(revalidate_verified_pid1_at_launch(&mut disk,&p,original),Ok(()));
+  p.measurement=[7;32];
+  assert_eq!(revalidate_verified_pid1_at_launch(&mut disk,&p,original),
+    Err(Error::Stale));
+  p.measurement=[3;32];
+  p.slot.version+=1;
+  assert_eq!(revalidate_verified_pid1_at_launch(&mut disk,&p,original),
+    Err(Error::Stale));
+ }
+}
