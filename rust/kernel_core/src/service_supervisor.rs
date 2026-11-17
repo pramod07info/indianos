@@ -2473,3 +2473,23 @@ mod r114_kernel_desktop_reap_tests{
         assert_eq!(d.pending(),1);
     }
 }
+
+
+#[cfg(test)]
+mod m1_batch01_w4_service_tests{
+ use super::*;
+ #[test]fn b01_15_wrong_generation_cannot_start_service(){
+  let mut s=ServiceTable::<2>::new();
+  assert!(s.configure(1,50,1));
+  assert_eq!(s.start_if_generation(1,1),ServiceAction::Deny);
+  assert_eq!(s.start_if_generation(1,0),ServiceAction::Start{pid:50,generation:1});
+ }
+ #[test]fn b01_16_pending_replacement_requires_preparation(){
+  let mut s=ServiceTable::<2>::new();
+  assert!(s.configure(1,50,1));
+  assert_eq!(s.start(1),ServiceAction::Start{pid:50,generation:1});
+  assert_eq!(s.crash(50,51),ServiceAction::Restart{pid:51,generation:2});
+  assert_eq!(s.start(1),ServiceAction::Deny);
+  assert!(s.pending_exact(1,51,2));
+ }
+}

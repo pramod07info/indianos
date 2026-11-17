@@ -40,10 +40,13 @@ fn log(s: &'static [u8]) { unsafe { serial_write(s.as_ptr().cast()) }; }
 unsafe fn memory_map() -> Option<&'static MemoryMap> {
     unsafe { boot_limine_memmap().as_ref() }
 }
+fn valid_region(r:&Region)->bool{
+    r.length!=0 && r.base.checked_add(r.length).is_some()
+}
 fn validate_ranges(regions:&[Region]) -> bool {
     let mut usable=false;
     for r in regions {
-        if r.length==0 || r.base.checked_add(r.length).is_none() { return false; }
+        if !valid_region(r) { return false; }
         usable |= r.kind==0;
     }
     usable
@@ -68,7 +71,7 @@ pub unsafe extern "C" fn boot_validate() -> bool {
         let Some(region)=(unsafe { item.as_ref() }) else {
             log(b"IndianOS: invalid memory region\n\0"); return false;
         };
-        if region.length==0 || region.base.checked_add(region.length).is_none() {
+        if !valid_region(region) {
             log(b"IndianOS: invalid memory region\n\0"); return false;
         }
         usable |= region.kind==0;
@@ -79,6 +82,7 @@ pub unsafe extern "C" fn boot_validate() -> bool {
 #[no_mangle]
 pub unsafe extern "C" fn boot_memory_region_count() -> u64 {
     let Some(m)=(unsafe { memory_map() }) else {return 0};
+    if m.entries.is_null() || !(1..=4096).contains(&m.count){return 0;}
     m.count
 }
 /// # Safety
@@ -91,6 +95,7 @@ pub unsafe extern "C" fn boot_memory_region_at(index:u64,out:*mut Region,_contex
     if m.entries.is_null() || index>=m.count || m.count>4096 {return false}
     let item=unsafe {ptr::read_volatile(m.entries.add(index as usize))};
     let Some(region)=(unsafe {item.as_ref()}) else {return false};
+    if !valid_region(region) {return false;}
     unsafe {ptr::write(out,*region);}
     true
 }
@@ -312,4 +317,22 @@ mod tests{
         assert_eq!(core::mem::size_of::<Region>(),24);
         assert_eq!(core::mem::offset_of!(LimineFile,size),16);
     }
+}
+
+
+#[cfg(test)]
+mod m1_batch01_w3_boot_tests{
+ use super::*;
+ #[test]fn b01_08_valid_ram_entry_is_accepted(){
+  assert!(valid_region(&Region{base:0x1000,length:0x2000,kind:0}));
+ }
+ #[test]fn b01_09_zero_length_memory_entry_is_rejected(){
+  assert!(!valid_region(&Region{base:0,length:0,kind:0}));
+ }
+ #[test]fn b01_10_wrapping_boot_region_is_rejected(){
+  assert!(!valid_region(&Region{base:u64::MAX-1,length:3,kind:0}));
+ }
+ #[test]fn b01_11_nonusable_only_map_is_rejected(){
+  assert!(!validate_ranges(&[Region{base:0x1000,length:0x1000,kind:1}]));
+ }
 }

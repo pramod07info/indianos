@@ -1266,3 +1266,18 @@ mod r091_parent_identity_retirement {
   assert_eq!(d.reads,1);
  }
 }
+
+
+#[cfg(test)]
+mod m1_batch01_w2_block_tests{
+ use super::*;
+ #[test]fn b01_05_single_last_sector_is_in_bounds(){
+  assert_eq!(check_range(8,7,1),Ok(()));
+ }
+ #[test]fn b01_06_zero_sector_window_is_denied(){
+  assert_eq!(check_range(8,4,0),Err(BlockError::OutOfRange));
+ }
+ #[test]fn b01_07_overflowing_partition_window_is_denied(){
+  assert_eq!(check_range(u64::MAX,u64::MAX-1,3),Err(BlockError::OutOfRange));
+ }
+}

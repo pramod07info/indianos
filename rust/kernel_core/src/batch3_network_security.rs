@@ -249,7 +249,8 @@ pub fn parse_verified_ack(packet:&[u8],expected_xid:u32,
  expected_mac:[u8;6])->Result<Lease,NetworkError>{
  if packet.len()<241||packet[0]!=2||packet[1]!=1||packet[2]!=6||
   expected_xid==0||&packet[4..8]!=expected_xid.to_be_bytes().as_slice()||
-  &packet[28..34]!=expected_mac.as_slice()||expected_mac==[0;6]{
+  &packet[28..34]!=expected_mac.as_slice()||expected_mac==[0;6]||
+  expected_mac[0]&1!=0{
   return Err(NetworkError::Malformed);
  }
  let addr:[u8;4]=packet[16..20].try_into().map_err(|_|NetworkError::Malformed)?;
@@ -296,8 +297,10 @@ impl BoundTcpHandshake{
   Self{expected,inner:TcpHandshake::new()}
  }
  pub fn syn(&mut self,sequence:u32)->Result<(),NetworkError>{
-  if self.expected.source_ip==[0;4]||self.expected.source_port==0||
-    self.expected.destination_port==0{return Err(NetworkError::State);}
+  if require_ipv4_unicast(self.expected.source_ip).is_err()||
+    self.expected.source_port==0||self.expected.destination_port==0{
+    return Err(NetworkError::State);
+  }
   self.inner.syn(sequence)
  }
  pub fn syn_ack(&mut self,peer:PeerTuple,ack:u32,syn:bool,ack_flag:bool)
@@ -329,7 +332,7 @@ mod pr782_ws45_47_tests {
   let mut p=[0u8;268];p[0]=2;p[1]=1;p[2]=6;
   p[4..8].copy_from_slice(&42u32.to_be_bytes());
   p[16..20].copy_from_slice(&[10,0,0,10]);
-  p[28..34].copy_from_slice(&[1,2,3,4,5,6]);
+  p[28..34].copy_from_slice(&[2,2,3,4,5,6]);
   p[236..].copy_from_slice(&[
    99,130,83,99,
    53,1,5,54,4,10,0,0,1,
@@ -340,17 +343,20 @@ mod pr782_ws45_47_tests {
  }
  #[test]fn ws46_rejects_wrong_transaction_and_duplicate_ack(){
   let packet=ack();
-  assert!(parse_verified_ack(&packet,42,[1,2,3,4,5,6]).is_ok());
-  assert_eq!(parse_verified_ack(&packet,43,[1,2,3,4,5,6]),
+  assert!(parse_verified_ack(&packet,42,[2,2,3,4,5,6]).is_ok());
+  assert_eq!(parse_verified_ack(&packet,43,[2,2,3,4,5,6]),
    Err(NetworkError::Malformed));
   let mut invalid=packet;invalid[242]=3;
-  assert_eq!(parse_verified_ack(&invalid,42,[1,2,3,4,5,6]),
+  assert_eq!(parse_verified_ack(&invalid,42,[2,2,3,4,5,6]),
+   Err(NetworkError::Malformed));
+  let mut multicast_client=packet;multicast_client[28]=1;
+  assert_eq!(parse_verified_ack(&multicast_client,42,[1,2,3,4,5,6]),
    Err(NetworkError::Malformed));
   let mut bad_yiaddr=packet;bad_yiaddr[16..20].copy_from_slice(&[224,0,0,1]);
-  assert_eq!(parse_verified_ack(&bad_yiaddr,42,[1,2,3,4,5,6]),
+  assert_eq!(parse_verified_ack(&bad_yiaddr,42,[2,2,3,4,5,6]),
    Err(NetworkError::Malformed));
   let mut bad_server=packet;bad_server[245..249].copy_from_slice(&[127,0,0,1]);
-  assert_eq!(parse_verified_ack(&bad_server,42,[1,2,3,4,5,6]),
+  assert_eq!(parse_verified_ack(&bad_server,42,[2,2,3,4,5,6]),
    Err(NetworkError::Malformed));
  }
  #[test]fn ws47_wrong_peer_cannot_establish_connection(){
@@ -486,5 +492,31 @@ mod pr782_ws111_115_tests{
    Err(NetworkError::Expired));
   assert_eq!(renewal_schedule(Lease{gateway:[10,0,1,1],..lease}),
    Err(NetworkError::Malformed));
+ }
+}
+
+
+#[cfg(test)]
+mod m1_batch01_w6_transport_tests{
+ use super::*;
+ #[test]fn b01_17_unicast_peer_can_start_syn(){
+  let mut tcp=BoundTcpHandshake::new(PeerTuple{
+   source_ip:[192,168,1,8],source_port:443,destination_port:40000});
+  assert_eq!(tcp.syn(7),Ok(()));
+ }
+ #[test]fn b01_18_multicast_peer_cannot_start_syn(){
+  let mut tcp=BoundTcpHandshake::new(PeerTuple{
+   source_ip:[239,1,2,3],source_port:443,destination_port:40000});
+  assert_eq!(tcp.syn(7),Err(NetworkError::State));
+ }
+ #[test]fn b01_19_loopback_peer_cannot_start_syn(){
+  let mut tcp=BoundTcpHandshake::new(PeerTuple{
+   source_ip:[127,0,0,1],source_port:443,destination_port:40000});
+  assert_eq!(tcp.syn(7),Err(NetworkError::State));
+ }
+ #[test]fn b01_20_invalid_port_peer_cannot_start_syn(){
+  let mut tcp=BoundTcpHandshake::new(PeerTuple{
+   source_ip:[10,0,0,1],source_port:0,destination_port:40000});
+  assert_eq!(tcp.syn(7),Err(NetworkError::State));
  }
 }

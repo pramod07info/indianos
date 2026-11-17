@@ -207,3 +207,26 @@ mod m1_gate11_rename_acl_tests {
     Credentials::kernel(0,0)));
  }
 }
+
+
+#[cfg(test)]
+mod m1_batch01_w5_acl_tests{
+ use super::*;
+ #[test]fn b01_12_rename_checks_both_writable_parent_directories(){
+  let u=Credentials::kernel(5,5);
+  let rw=Permissions::new(5,5,0o700).unwrap();
+  let ro=Permissions::new(5,5,0o500).unwrap();
+  assert!(Permissions::authorize_rename(&[],rw,&[],rw,u));
+  assert!(!Permissions::authorize_rename(&[],rw,&[],ro,u));
+ }
+ #[test]fn b01_13_rename_denies_unsearchable_ancestor(){
+  let u=Credentials::kernel(5,5);
+  let rw=Permissions::new(5,5,0o700).unwrap();
+  let nox=Permissions::new(5,5,0o600).unwrap();
+  assert!(!Permissions::authorize_rename(&[nox],rw,&[],rw,u));
+ }
+ #[test]fn b01_14_invalid_persisted_mode_denies_root(){
+  let bad=Permissions{owner:5,group:5,mode:0o1000};
+  assert!(!bad.allows(Credentials::kernel(0,0),WRITE|SEARCH));
+ }
+}

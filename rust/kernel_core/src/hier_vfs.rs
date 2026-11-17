@@ -209,6 +209,10 @@ impl<D:BlockDevice> HierVfs<D>{
  /// Existing no-follow directory and subtree-cycle checks remain mandatory.
  pub fn rename_dir_as(&mut self,credentials:Credentials,source:&str,target:&str)
   ->Result<(),FsError>{
+  // Refuse a self-descendant or namespace-root rename *before* disk I/O,
+  // preserving the authenticated no-follow checks and durable transaction.
+  if !crate::vfs_path::rename_stays_within_tree(source,target,"/")
+    .map_err(|_|FsError::InvalidName)? {return Err(FsError::InvalidName);}
   self.authorize_parent(credentials,source)?;
   self.authorize_parent(credentials,target)?;
   self.authorize_access(credentials,source,0)?;

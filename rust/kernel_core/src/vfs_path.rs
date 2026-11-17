@@ -479,8 +479,12 @@ pub fn rename_stays_within_tree(source:&str,destination:&str,root:&str)
     // directory must never be moved or replaced by a child pathname.
     let source_is_root=a==r&&original[..a]==boundary[..r];
     let target_is_root=b==r&&target[..b]==boundary[..r];
+    // A directory rename must never make an object its own ancestor.
+    // Compare component boundaries, not string prefixes (a vs ab).
+    let moves_into_descendant=b>a &&
+        target[..a]==original[..a] && target[a]==b'/';
     Ok(a>1&&b>1&&!source_is_root&&!target_is_root&&
-        original[..a]!=target[..b])
+        !moves_into_descendant&&original[..a]!=target[..b])
 }
 /// WS70: Replace a canonical basename without flattening ancestors.
 /// The existing validated parent and proposed child must both fit, and
@@ -531,4 +535,23 @@ mod pr782_ws68_70_tests{
         assert_eq!(replace_basename("/a/b","c",&mut short),Err(PathError::OutputTooSmall));
         assert_eq!(short,[0xa5;3]);
     }
+}
+
+
+#[cfg(test)]
+mod m1_batch01_w1_rename_tests{
+ use super::*;
+ #[test]fn b01_01_descendant_move_is_denied(){
+  assert_eq!(rename_stays_within_tree("/files/a","/files/a/sub","/files"),Ok(false));
+ }
+ #[test]fn b01_02_canonical_descendant_alias_is_denied(){
+  assert_eq!(rename_stays_within_tree("//files/./a","/files/a//nested","/files"),Ok(false));
+ }
+ #[test]fn b01_03_sibling_prefix_is_not_descendant(){
+  assert_eq!(rename_stays_within_tree("/files/a","/files/ab","/files"),Ok(true));
+ }
+ #[test]fn b01_04_namespace_root_and_self_are_protected(){
+  assert_eq!(rename_stays_within_tree("/files","/files/new","/files"),Ok(false));
+  assert_eq!(rename_stays_within_tree("/files/a","/files/./a","/files"),Ok(false));
+ }
 }
