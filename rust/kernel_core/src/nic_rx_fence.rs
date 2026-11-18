@@ -587,3 +587,49 @@ mod kernel_p0_batch4_w5_packet_limits_tests{
    Err(RxFenceError::Quiescing));
  }
 }
+
+/// P0-96..97: parse only a bounded Ethernet IPv4 payload, supporting one
+/// 802.1Q VLAN tag and rejecting malformed/truncated or nested tags.
+/// Parser closure is side-effect-free; admission remains tied to RX lifetime.
+impl NicRxFence{
+ pub fn parse_ipv4_ethernet<R>(&self,device:u32,frame:&[u8],
+  maximum:usize,parse:impl FnOnce(&[u8])->Option<R>)
+  ->Result<R,RxFenceError>{
+  if frame.len()<14{return Err(RxFenceError::Capacity);}
+  let vlan=frame[12]==0x81&&frame[13]==0x00;
+  let header=if vlan{18}else{14};
+  if frame.len()<=header{return Err(RxFenceError::Capacity);}
+  let ether_type=if vlan{&frame[16..18]}else{&frame[12..14]};
+  if ether_type!=[0x08,0x00]{return Err(RxFenceError::Capacity);}
+  self.parse_bounded_frame(device,frame,maximum,|_|parse(&frame[header..]))
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch5_w5_ipv4_ethernet_tests{
+ use super::*;
+ #[test] fn valid_ethernet_and_single_vlan_frames_are_epoch_guarded(){
+  let nic=NicRxFence::new(7);
+  let mut untagged=[0u8;16];untagged[12]=8;untagged[15]=42;
+  assert_eq!(nic.parse_ipv4_ethernet(7,&untagged,64,|payload|
+    Some((payload.len(),payload[1]))),Ok((2,42)));
+  let mut tagged=[0u8;20];
+  tagged[12]=0x81;tagged[13]=0;tagged[16]=8;tagged[19]=9;
+  assert_eq!(nic.parse_ipv4_ethernet(7,&tagged,64,|payload|
+    Some((payload.len(),payload[1]))),Ok((2,9)));
+ }
+ #[test] fn truncated_non_ipv4_and_quiescing_frames_are_rejected(){
+  let nic=NicRxFence::new(7);let mut calls=0;
+  assert_eq!(nic.parse_ipv4_ethernet(7,&[0u8;13],64,|_|{
+   calls+=1;Some(1)
+  }),Err(RxFenceError::Capacity));
+  let mut bad=[0u8;16];bad[12]=0x86;bad[13]=0xdd;
+  assert_eq!(nic.parse_ipv4_ethernet(7,&bad,64,|_|{
+   calls+=1;Some(1)
+  }),Err(RxFenceError::Capacity));
+  assert_eq!(calls,0);
+  bad[12]=8;bad[13]=0;
+  assert_eq!(nic.parse_ipv4_ethernet(7,&bad,16,|_|{
+   nic.begin_quiesce(7).unwrap();Some(1)
+  }),Err(RxFenceError::Stale));
+ }
+}

@@ -1221,3 +1221,67 @@ mod kernel_p0_batch4_w6_final_boot_tests{
   assert!(!called);
  }
 }
+
+/// P0-98..100: enforce trusted Secure Boot state both before and after
+/// consuming a single-use PID1 launch authorization, and at final handoff.
+/// The platform trait MUST be backed by a real authenticated firmware/TPM
+/// provider before this is a production secure-boot guarantee.
+impl BootLaunchGate{
+ pub fn launch_secure_uefi_checked<D:BlockDevice,P:AuthenticatedSecureUefi,R>(
+  &mut self,disk:&mut D,platform:&P,
+  launch:impl FnOnce(VerifiedPid1Admission)->Result<R,Error>)
+  ->Result<R,Error>{
+  platform.require_firmware_secure_boot_chain()?;
+  let receipt=self.authorize_once(disk,platform)?;
+  platform.require_firmware_secure_boot_chain()?;
+  revalidate_verified_pid1_at_launch(disk,platform,receipt)?;
+  platform.require_firmware_secure_boot_chain()?;
+  launch(receipt)
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch5_w6_secure_boot_handoff_tests{
+ use super::*;
+ use std::cell::Cell;
+ struct Platform{checks:Cell<usize>,reject_on:usize}
+ impl TrustedBootMeasurement for Platform{
+  fn read_verified(&self)->Result<[u8;32],Error>{Ok([3;32])}
+ }
+ impl AuthenticatedPid1Platform for Platform{
+  fn read_sealed_floor(&self)->Result<SealedBootFloor,Error>{
+   Ok(SealedBootFloor{minimum_epoch:4,minimum_journal_generation:20,
+    expected_slot:0,minimum_slot_version:9,expected_measurement:[3;32]})
+  }
+  fn read_bootloader_selected_slot(&self)->Result<(usize,Slot),Error>{
+   Ok((0,tests::slot()))
+  }
+ }
+ impl AuthenticatedSecureUefi for Platform{
+  fn require_firmware_secure_boot_chain(&self)->Result<(),Error>{
+   let n=self.checks.get()+1;self.checks.set(n);
+   if n==self.reject_on{Err(Error::Untrusted)}else{Ok(())}
+  }
+ }
+ #[test] fn secure_chain_is_checked_three_times_before_exact_pid1_launch(){
+  let mut disk=tests::fixture();let mut gate=BootLaunchGate::new();
+  let p=Platform{checks:Cell::new(0),reject_on:usize::MAX};
+  assert_eq!(gate.launch_secure_uefi_checked(&mut disk,&p,
+   |receipt|Ok(receipt.epoch())),Ok(4));
+  assert_eq!(p.checks.get(),3);
+  assert_eq!(gate.launch_secure_uefi_checked(&mut disk,&p,|_|Ok(5)),
+   Err(Error::Stale));
+ }
+ #[test] fn late_firmware_downgrade_denies_callback_and_consumes_receipt(){
+  let mut disk=tests::fixture();let mut gate=BootLaunchGate::new();
+  let p=Platform{checks:Cell::new(0),reject_on:2};
+  let mut called=false;
+  assert_eq!(gate.launch_secure_uefi_checked(&mut disk,&p,|_|{
+   called=true;Ok(())
+  }),Err(Error::Untrusted));
+  assert!(!called);assert_eq!(gate.last_admitted_epoch(),4);
+  assert_eq!(gate.launch_secure_uefi_checked(&mut disk,&p,|_|{
+   called=true;Ok(())
+  }),Err(Error::Stale));
+  assert!(!called);
+ }
+}

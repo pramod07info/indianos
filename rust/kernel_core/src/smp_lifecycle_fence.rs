@@ -638,6 +638,8 @@ pub fn require_distinct_acks_for_reclaim(receipts:&[(&LifecycleFence,u32,Receipt
  if receipts.is_empty()||receipts.len()>64{return Err(FenceError::NoProgress);}
  for (i,&(fence,cpu,r)) in receipts.iter().enumerate(){
   if r.sequence==0||r.generation==0{return Err(FenceError::InvalidGeneration);}
+  // A reclaim transaction is scoped to one BSP ownership domain.
+  if fence.bsp != receipts[0].0.bsp {return Err(FenceError::InvalidCpu);}
   if receipts[..i].iter().any(|&(prior,_,_)|
      core::ptr::eq(prior,fence)||prior.ap==fence.ap){
    return Err(FenceError::StaleReceipt);
@@ -672,5 +674,25 @@ mod kernel_p0_batch4_w1_distinct_aps_tests{
   assert_eq!(require_distinct_acks_for_reclaim(&[(&a,0,x),(&b,0,y)]),Ok(()));
   assert_eq!(require_distinct_acks_for_reclaim(&[(&a,0,x),
    (&b,0,Receipt{generation:9,..y})]),Err(FenceError::StaleReceipt));
+ }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch5_w1_coherent_bsp_tests {
+ use super::*;
+ #[test] fn two_distinct_aps_of_one_bsp_authorize_one_barrier(){
+  let a=LifecycleFence::new(0,1);let b=LifecycleFence::new(0,2);
+  let x=a.publish(0,5).unwrap();let y=b.publish(0,6).unwrap();
+  a.observe_and_ack_after(1,0,|_|true).unwrap();
+  b.observe_and_ack_after(2,0,|_|true).unwrap();
+  assert_eq!(require_distinct_acks_for_reclaim(&[(&a,0,x),(&b,0,y)]),Ok(()));
+ }
+ #[test] fn separate_bsp_domains_cannot_be_merged_into_one_reclaim(){
+  let a=LifecycleFence::new(0,1);let b=LifecycleFence::new(3,4);
+  let x=a.publish(0,5).unwrap();let y=b.publish(3,6).unwrap();
+  a.observe_and_ack_after(1,0,|_|true).unwrap();
+  b.observe_and_ack_after(4,0,|_|true).unwrap();
+  assert_eq!(require_distinct_acks_for_reclaim(&[(&a,0,x),(&b,3,y)]),
+   Err(FenceError::InvalidCpu));
  }
 }

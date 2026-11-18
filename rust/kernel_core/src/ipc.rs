@@ -1124,3 +1124,81 @@ mod kernel_p0_batch4_w3_forward_tests{
   assert_eq!(r.receive(b).unwrap().payload(),b"keep");
  }
 }
+
+/// P0-89..92: forward one queued message to each distinct authenticated
+/// recipient as one serialized, all-or-nothing router transaction.
+/// This is a kernel software IPC operation; caller supplies the SMP lock.
+impl<const M:usize,const D:usize> ScopedRouter<M,D>{
+ pub fn forward_distinct_prefix_exact(&mut self,relay:Identity,
+  recipients:&[Identity])->Result<usize,IpcError>{
+  if relay.pid==0||relay.generation==0||recipients.is_empty()||
+     recipients.len()>D||recipients.len()>M{
+   return Err(IpcError::InvalidConfiguration);
+  }
+  for (i,&recipient) in recipients.iter().enumerate(){
+   if recipient.pid==0||recipient.generation==0{
+    return Err(IpcError::InvalidPid);
+   }
+   if recipient.pid==relay.pid||recipients[..i].iter().any(|x|x.pid==recipient.pid){
+    return Err(IpcError::DuplicateReceiver);
+   }
+  }
+  let mut staged=Self{boxes:self.boxes};
+  if staged.pending(relay)?<recipients.len(){return Err(IpcError::Empty);}
+  let blank=TaggedMessage{sender:Identity{pid:0,generation:0},
+   length:0,bytes:[0;MAX_PAYLOAD]};
+  let mut messages=[blank;D];
+  let n=staged.receive_batch_exact_with(relay,recipients.len(),|values|{
+   messages[..values.len()].copy_from_slice(values);
+   true
+  })?;
+  if n!=recipients.len(){return Err(IpcError::Empty);}
+  for (i,&recipient) in recipients.iter().enumerate(){
+   staged.send(relay,recipient,messages[i].payload())?;
+  }
+  self.boxes=staged.boxes;
+  Ok(n)
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch5_w3_distinct_relay_tests{
+ use super::*;
+ fn id(pid:u32,generation:u64)->Identity{Identity{pid,generation}}
+ #[test] fn ordered_prefix_goes_to_independent_exact_owner_mailboxes(){
+  let (source,relay,a,b)=(id(1,2),id(2,3),id(3,4),id(4,5));
+  let mut r=ScopedRouter::<4,2>::new().unwrap();
+  for x in [source,relay,a,b]{r.register(x).unwrap();}
+  r.send(source,relay,b"first").unwrap();
+  r.send(source,relay,b"second").unwrap();
+  assert_eq!(r.forward_distinct_prefix_exact(relay,&[a,b]),Ok(2));
+  assert_eq!(r.pending(relay),Ok(0));
+  let first=r.receive(a).unwrap();
+  assert_eq!(first.sender(),relay);assert_eq!(first.payload(),b"first");
+  assert_eq!(r.receive(b).unwrap().payload(),b"second");
+ }
+ #[test] fn full_target_and_stale_generation_do_not_consume_the_relay(){
+  let (source,relay,a,b)=(id(1,2),id(2,3),id(3,4),id(4,5));
+  let mut r=ScopedRouter::<4,1>::new().unwrap();
+  for x in [source,relay,a,b]{r.register(x).unwrap();}
+  r.send(source,relay,b"first").unwrap();
+  r.send(source,b,b"occupied").unwrap();
+  assert_eq!(r.forward_distinct_prefix_exact(relay,&[b]),Err(IpcError::Full));
+  assert_eq!(r.forward_distinct_prefix_exact(relay,&[id(4,6)]),
+   Err(IpcError::UnknownReceiver));
+  assert_eq!(r.pending(relay),Ok(1));
+  assert_eq!(r.receive(b).unwrap().payload(),b"occupied");
+  assert_eq!(r.forward_distinct_prefix_exact(relay,&[a]),Ok(1));
+  assert_eq!(r.receive(a).unwrap().payload(),b"first");
+ }
+ #[test] fn insufficient_prefix_or_repeated_pid_is_never_partially_delivered(){
+  let (source,relay,a,b)=(id(1,2),id(2,3),id(3,4),id(4,5));
+  let mut r=ScopedRouter::<4,2>::new().unwrap();
+  for x in [source,relay,a,b]{r.register(x).unwrap();}
+  r.send(source,relay,b"one").unwrap();
+  assert_eq!(r.forward_distinct_prefix_exact(relay,&[a,b]),Err(IpcError::Empty));
+  assert_eq!(r.forward_distinct_prefix_exact(relay,&[a,id(3,99)]),
+   Err(IpcError::DuplicateReceiver));
+  assert_eq!(r.pending(relay),Ok(1));
+  assert_eq!(r.pending(a),Ok(0));
+ }
+}

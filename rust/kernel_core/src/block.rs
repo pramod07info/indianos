@@ -1551,3 +1551,64 @@ mod kernel_p0_batch4_w4_range_tests{
   assert_eq!(bytes,[88;SECTOR_BYTES]);
  }
 }
+
+/// P0-93..95: safely extract an unaligned sub-sector metadata field while
+/// verifying the full one- or two-sector span in private staging. Never
+/// mutate the caller's destination after a fault, torn read or invalid span.
+impl<D:BlockDevice> StableReadOnlyWindow<'_,D>{
+ pub fn read_verified_bytes(&mut self,lba:u64,offset:usize,
+  out:&mut[u8])->Result<(),BlockError>{
+  if offset>=SECTOR_BYTES||out.is_empty(){return Err(BlockError::OutOfRange);}
+  let end=offset.checked_add(out.len()).ok_or(BlockError::OutOfRange)?;
+  if end>SECTOR_BYTES*2{return Err(BlockError::OutOfRange);}
+  let sectors=(end+SECTOR_BYTES-1)/SECTOR_BYTES;
+  let mut staged=[0u8;SECTOR_BYTES*2];
+  self.read_verified_range(lba,&mut staged[..sectors*SECTOR_BYTES])?;
+  out.copy_from_slice(&staged[offset..end]);
+  Ok(())
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch5_w4_unaligned_metadata_tests{
+ use super::*;
+ struct Disk{reads:usize,fail_at:usize}
+ impl BlockDevice for Disk{
+  fn sector_count(&self)->u64{4}
+  fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{
+   self.reads+=1;
+   if self.reads==self.fail_at{return Err(BlockError::Io);}
+   out.fill(lba as u8);Ok(())
+  }
+  fn write_sector(&mut self,_:u64,_:&[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{Err(BlockError::ReadOnly)}
+ }
+ #[test] fn cross_sector_metadata_is_verified_before_publishing(){
+  let mut disk=Disk{reads:0,fail_at:0};
+  let mut view=StableReadOnlyWindow::new(&mut disk).unwrap();
+  let mut out=[99u8;4];
+  assert_eq!(view.read_verified_bytes(1,SECTOR_BYTES-2,&mut out),Ok(()));
+  assert_eq!(out,[1,1,2,2]);
+  assert!(!view.is_retired());
+ }
+ #[test] fn late_fault_keeps_destination_untouched_and_permanently_retires(){
+  let mut disk=Disk{reads:0,fail_at:6};
+  let mut view=StableReadOnlyWindow::new(&mut disk).unwrap();
+  let mut out=[77u8;4];
+  assert_eq!(view.read_verified_bytes(1,SECTOR_BYTES-2,&mut out),
+   Err(BlockError::Io));
+  assert_eq!(out,[77u8;4]);assert!(view.is_retired());
+  assert_eq!(view.read_verified_bytes(1,SECTOR_BYTES-2,&mut out),
+   Err(BlockError::Io));
+ }
+ #[test] fn invalid_offset_or_oversized_span_never_reads_media(){
+  let mut disk=Disk{reads:0,fail_at:0};
+  let mut view=StableReadOnlyWindow::new(&mut disk).unwrap();
+  let mut out=[10u8;SECTOR_BYTES*2];
+  assert_eq!(view.read_verified_bytes(0,1,&mut out),Err(BlockError::OutOfRange));
+  assert_eq!(view.read_verified_bytes(0,SECTOR_BYTES,&mut out[..1]),
+   Err(BlockError::OutOfRange));
+  assert_eq!(view.device.reads,0);
+  assert_eq!(out,[10u8;SECTOR_BYTES*2]);
+ }
+}

@@ -1782,6 +1782,13 @@ impl<const C:usize,const N:usize> CoreRunQueues<C,N>{
   receipts:&[(&crate::smp_lifecycle_fence::LifecycleFence,u32,
    crate::smp_lifecycle_fence::Receipt)],notices:&mut ProcessEvents<E>)
   ->Result<usize,ExitPublicationError>{
+  // Never retire two incarnations of one PID in a single transaction:
+  // a recycled PID cannot inherit the first generation's exit authority.
+  for (i,&(pid,_)) in victims.iter().enumerate(){
+   if victims[..i].iter().any(|&(previous,_)|previous==pid){
+    return Err(ExitPublicationError::Reclaim(ReclaimError::InvalidOwner));
+   }
+  }
   crate::smp_lifecycle_fence::require_distinct_acks_for_reclaim(receipts)
    .map_err(|e|ExitPublicationError::Reclaim(ReclaimError::Ap(e)))?;
   self.retire_and_notify_exact(supervisor,victims,receipts,notices)
@@ -1821,5 +1828,40 @@ mod kernel_p0_batch4_w2_retirement_tests{
   e.dequeue().unwrap();
   assert_eq!(q.retire_and_notify_distinct_aps(t(1),&[(2,7)],&proof,&mut e),Ok(1));
   assert!(!q.contains_epoch(2,7));assert_eq!(e.count_pid(2),1);
+ }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch5_w2_generation_teardown_tests {
+ use super::*;
+ use crate::smp_lifecycle_fence::{LifecycleFence,FenceError};
+ fn t(pid:u32,generation:u64)->Runnable{Runnable{pid,generation,priority:3}}
+ #[test] fn mixed_incarnations_are_rejected_without_queue_or_notice_change(){
+  let mut q=CoreRunQueues::<1,4>::new();
+  for x in [t(1,7),t(2,8),t(2,9)]{q.enqueue(0,x).unwrap();}
+  let mut notices=ProcessEvents::<3>::new();
+  let ap=LifecycleFence::new(0,1);
+  let proof=ap.publish(0,15).unwrap();
+  ap.observe_and_ack_after(1,0,|_|true).unwrap();
+  assert_eq!(q.retire_and_notify_distinct_aps(t(1,7),
+   &[(2,8),(2,9)],&[(&ap,0,proof)],&mut notices),
+   Err(ExitPublicationError::Reclaim(ReclaimError::InvalidOwner)));
+  assert_eq!(q.total_runnable(),3);
+  assert!(q.contains_epoch(2,8)&&q.contains_epoch(2,9));
+  assert_eq!(notices.count_pid(2),0);
+ }
+ #[test] fn foreign_bsp_barrier_does_not_remove_live_victim(){
+  let mut q=CoreRunQueues::<1,3>::new();
+  q.enqueue(0,t(1,7)).unwrap();q.enqueue(0,t(2,8)).unwrap();
+  let mut notices=ProcessEvents::<3>::new();
+  let a=LifecycleFence::new(0,1);let b=LifecycleFence::new(3,4);
+  let x=a.publish(0,5).unwrap();let y=b.publish(3,6).unwrap();
+  a.observe_and_ack_after(1,0,|_|true).unwrap();
+  b.observe_and_ack_after(4,0,|_|true).unwrap();
+  assert_eq!(q.retire_and_notify_distinct_aps(t(1,7),
+   &[(2,8)],&[(&a,0,x),(&b,3,y)],&mut notices),
+   Err(ExitPublicationError::Reclaim(ReclaimError::Ap(FenceError::InvalidCpu))));
+  assert!(q.contains_epoch(2,8));
+  assert_eq!(notices.count_pid(2),0);
  }
 }
