@@ -1070,3 +1070,57 @@ mod kernel_p0_batch3_w3_fanout_tests{
   assert_eq!(r.pending(b),Ok(0));
  }
 }
+
+/// P0-69..72: exact-generation IPC relay, FIFO and all-or-nothing across
+/// source and target. Relay, not original sender, owns the forwarded traffic.
+/// Privileged caller authenticates the relay and serializes this router.
+impl<const M:usize,const D:usize> ScopedRouter<M,D>{
+ pub fn forward_prefix_as_exact(&mut self,relay:Identity,
+  destination:Identity,limit:usize)->Result<usize,IpcError>{
+  if relay.pid==0||relay.generation==0||destination.pid==0||
+    destination.generation==0{return Err(IpcError::InvalidPid);}
+  if relay.pid==destination.pid{return Err(IpcError::DuplicateReceiver);}
+  if limit==0||limit>D{return Err(IpcError::InvalidConfiguration);}
+  let mut staged=Self{boxes:self.boxes};
+  let blank=TaggedMessage{sender:Identity{pid:0,generation:0},
+    length:0,bytes:[0;MAX_PAYLOAD]};
+  let mut captured=[blank;D];
+  let count=staged.receive_batch_exact_with(relay,limit,|msgs|{
+   captured[..msgs.len()].copy_from_slice(msgs);true
+  })?;
+  for msg in &captured[..count]{staged.send(relay,destination,msg.payload())?;}
+  self.boxes=staged.boxes;Ok(count)
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch4_w3_forward_tests{
+ use super::*;
+ fn id(pid:u32,generation:u64)->Identity{Identity{pid,generation}}
+ #[test]fn successful_relay_preserves_fifo_and_adopts_sender_identity(){
+  let (a,b,c)=(id(1,3),id(2,4),id(3,5));
+  let mut r=ScopedRouter::<3,3>::new().unwrap();
+  for x in [a,b,c]{r.register(x).unwrap();}
+  r.send(a,b,b"first").unwrap();r.send(a,b,b"second").unwrap();
+  assert_eq!(r.forward_prefix_as_exact(b,c,2),Ok(2));
+  assert_eq!(r.pending(b),Ok(0));
+  let first=r.receive(c).unwrap();
+  assert_eq!(first.sender(),b);assert_eq!(first.payload(),b"first");
+  assert_eq!(r.receive(c).unwrap().payload(),b"second");
+ }
+ #[test]fn full_or_stale_mailbox_rejects_without_dropping_source(){
+  let (a,b,c)=(id(1,3),id(2,4),id(3,5));
+  let mut r=ScopedRouter::<3,2>::new().unwrap();
+  for x in [a,b,c]{r.register(x).unwrap();}
+  r.send(a,b,b"keep").unwrap();
+  r.send(a,c,b"busy").unwrap();r.send(a,c,b"full").unwrap();
+  assert_eq!(r.forward_prefix_as_exact(b,c,1),Err(IpcError::Full));
+  assert_eq!(r.forward_prefix_as_exact(id(2,3),c,1),
+   Err(IpcError::UnknownReceiver));
+  assert_eq!(r.forward_prefix_as_exact(b,id(3,6),1),
+   Err(IpcError::UnknownReceiver));
+  assert_eq!(r.forward_prefix_as_exact(b,b,1),Err(IpcError::DuplicateReceiver));
+  assert_eq!(r.forward_prefix_as_exact(b,c,0),Err(IpcError::InvalidConfiguration));
+  assert_eq!(r.pending(b),Ok(1));
+  assert_eq!(r.receive(b).unwrap().payload(),b"keep");
+ }
+}

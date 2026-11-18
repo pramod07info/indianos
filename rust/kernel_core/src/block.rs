@@ -1493,3 +1493,61 @@ mod kernel_p0_batch3_w4_block_window_tests{
   assert_eq!(view.read_sector(0,&mut output),Err(BlockError::Io));
  }
 }
+
+/// P0-73..75: two full-range observations inside the permanently retiring
+/// read-only sector view. No torn or failed read exposes partial output.
+impl<D:BlockDevice> StableReadOnlyWindow<'_,D>{
+ pub fn read_verified_range(&mut self,start:u64,out:&mut[u8])
+  ->Result<(),BlockError>{
+  let result=read_stable_sectors(self,start,out);
+  // A torn whole-range observation is just as fatal as an individual
+  // sector fault: never accept the same window again after mismatch.
+  if result==Err(BlockError::Io){self.invalidated=true;}
+  result
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch4_w4_range_tests{
+ use super::*;
+ struct Disk{reads:usize,change_after:usize,fail_at:usize}
+ impl BlockDevice for Disk{
+  fn sector_count(&self)->u64{8}
+  fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{
+   self.reads+=1;
+   if self.reads==self.fail_at{return Err(BlockError::Io);}
+   out.fill(lba as u8+if self.reads>=self.change_after{2}else{1});
+   Ok(())
+  }
+  fn write_sector(&mut self,_:u64,_:&[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{Err(BlockError::ReadOnly)}
+ }
+ #[test]fn double_range_observation_publishes_complete_read(){
+  let mut d=Disk{reads:0,change_after:usize::MAX,fail_at:0};
+  let mut w=StableReadOnlyWindow::new(&mut d).unwrap();
+  let mut bytes=[9u8;SECTOR_BYTES*2];
+  assert_eq!(w.read_verified_range(2,&mut bytes),Ok(()));
+  assert_eq!(&bytes[..SECTOR_BYTES],&[3;SECTOR_BYTES]);
+  assert_eq!(&bytes[SECTOR_BYTES..],&[4;SECTOR_BYTES]);
+  assert!(!w.is_retired());
+ }
+ #[test]fn late_fault_poison_is_sticky_and_does_not_publish(){
+  let mut d=Disk{reads:0,change_after:usize::MAX,fail_at:4};
+  let mut w=StableReadOnlyWindow::new(&mut d).unwrap();
+  let mut bytes=[77u8;SECTOR_BYTES*2];
+  assert_eq!(w.read_verified_range(1,&mut bytes),Err(BlockError::Io));
+  assert_eq!(bytes,[77;SECTOR_BYTES*2]);assert!(w.is_retired());
+  assert_eq!(w.read_verified_range(1,&mut bytes),Err(BlockError::Io));
+ }
+ #[test]fn changed_second_pass_and_out_of_bounds_fail_closed(){
+  let mut d=Disk{reads:0,change_after:3,fail_at:0};
+  let mut w=StableReadOnlyWindow::new(&mut d).unwrap();
+  let mut bytes=[88u8;SECTOR_BYTES];
+  assert_eq!(w.read_verified_range(0,&mut bytes),Err(BlockError::Io));
+  assert_eq!(bytes,[88;SECTOR_BYTES]);assert!(w.is_retired());
+  let mut d=Disk{reads:0,change_after:usize::MAX,fail_at:0};
+  let mut w=StableReadOnlyWindow::new(&mut d).unwrap();
+  assert_eq!(w.read_verified_range(8,&mut bytes),Err(BlockError::OutOfRange));
+  assert_eq!(bytes,[88;SECTOR_BYTES]);
+ }
+}

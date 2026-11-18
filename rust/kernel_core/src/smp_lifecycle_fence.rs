@@ -630,3 +630,47 @@ mod kernel_p0_batch3_w1_ipi_delivery_tests{
     Err(FenceError::StaleReceipt));
  }
 }
+
+/// P0-61..64: each AP must independently acknowledge one exact, bounded
+/// nonzero generation before reclaim. Software proof, NOT actual TLB IPIs.
+pub fn require_distinct_acks_for_reclaim(receipts:&[(&LifecycleFence,u32,Receipt)])
+ ->Result<(),FenceError>{
+ if receipts.is_empty()||receipts.len()>64{return Err(FenceError::NoProgress);}
+ for (i,&(fence,cpu,r)) in receipts.iter().enumerate(){
+  if r.sequence==0||r.generation==0{return Err(FenceError::InvalidGeneration);}
+  if receipts[..i].iter().any(|&(prior,_,_)|
+     core::ptr::eq(prior,fence)||prior.ap==fence.ap){
+   return Err(FenceError::StaleReceipt);
+  }
+  fence.require_ack_for_reclaim(cpu,r)?;
+ }
+ Ok(())
+}
+#[cfg(test)]
+mod kernel_p0_batch4_w1_distinct_aps_tests{
+ use super::*;
+ #[test]fn cannot_count_one_cpu_twice(){
+  let a=LifecycleFence::new(0,1);let b=LifecycleFence::new(0,1);
+  let x=a.publish(0,4).unwrap();let y=b.publish(0,5).unwrap();
+  a.observe_and_ack_after(1,0,|_|true).unwrap();
+  b.observe_and_ack_after(1,0,|_|true).unwrap();
+  assert_eq!(require_distinct_acks_for_reclaim(&[(&a,0,x),(&a,0,x)]),
+   Err(FenceError::StaleReceipt));
+  assert_eq!(require_distinct_acks_for_reclaim(&[(&a,0,x),(&b,0,y)]),
+   Err(FenceError::StaleReceipt));
+ }
+ #[test]fn missing_stale_and_zero_receipts_cannot_unlock_reclaim(){
+  let a=LifecycleFence::new(0,1);let b=LifecycleFence::new(0,2);
+  let x=a.publish(0,4).unwrap();let y=b.publish(0,5).unwrap();
+  assert_eq!(require_distinct_acks_for_reclaim(&[]),Err(FenceError::NoProgress));
+  assert_eq!(require_distinct_acks_for_reclaim(&[(&a,0,Receipt{sequence:0,..x})]),
+   Err(FenceError::InvalidGeneration));
+  a.observe_and_ack_after(1,0,|_|true).unwrap();
+  assert_eq!(require_distinct_acks_for_reclaim(&[(&a,0,x),(&b,0,y)]),
+   Err(FenceError::NoProgress));
+  b.observe_and_ack_after(2,0,|_|true).unwrap();
+  assert_eq!(require_distinct_acks_for_reclaim(&[(&a,0,x),(&b,0,y)]),Ok(()));
+  assert_eq!(require_distinct_acks_for_reclaim(&[(&a,0,x),
+   (&b,0,Receipt{generation:9,..y})]),Err(FenceError::StaleReceipt));
+ }
+}

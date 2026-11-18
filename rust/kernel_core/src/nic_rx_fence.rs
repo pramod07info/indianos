@@ -551,3 +551,39 @@ mod kernel_p0_batch3_w5_nic_retry_tests{
   assert_eq!(d.count,0);
  }
 }
+
+/// P0-76..77: parser runs only for a bounded nonempty frame, while an exact
+/// RX revision stays live. Parser must be side-effect-free until final check.
+impl NicRxFence{
+ pub fn parse_bounded_frame<R>(&self,device:u32,frame:&[u8],
+  maximum:usize,parse:impl FnOnce(&[u8])->Option<R>)
+  ->Result<R,RxFenceError>{
+  if frame.is_empty()||maximum==0||frame.len()>maximum{
+   return Err(RxFenceError::Capacity);
+  }
+  self.parse_packet_at_live_epoch(device,||parse(frame))
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch4_w5_packet_limits_tests{
+ use super::*;
+ #[test]fn malformed_size_cannot_invoke_parser(){
+  let f=NicRxFence::new(8);let mut calls=0;
+  assert_eq!(f.parse_bounded_frame(8,&[],128,|_|{calls+=1;Some(1)}),
+   Err(RxFenceError::Capacity));
+  assert_eq!(f.parse_bounded_frame(8,&[1,2],1,|_|{calls+=1;Some(1)}),
+   Err(RxFenceError::Capacity));
+  assert_eq!(calls,0);
+  assert_eq!(f.parse_bounded_frame(8,&[1,2],2,|b|Some(b.len())),Ok(2));
+ }
+ #[test]fn invalid_device_or_teardown_race_disallows_result(){
+  let f=NicRxFence::new(8);
+  assert_eq!(f.parse_bounded_frame(9,&[4],4,|_|Some(3u8)),
+   Err(RxFenceError::InvalidDevice));
+  assert_eq!(f.parse_bounded_frame(8,&[4],4,|_|{
+   f.begin_quiesce(8).unwrap();Some(3u8)
+  }),Err(RxFenceError::Stale));
+  assert_eq!(f.parse_bounded_frame(8,&[4],4,|_|Some(3u8)),
+   Err(RxFenceError::Quiescing));
+ }
+}

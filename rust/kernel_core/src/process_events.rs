@@ -1773,3 +1773,53 @@ mod kernel_p0_batch3_w2_exit_publication_tests{
   assert_eq!(events.count_pid(2),1);
  }
 }
+
+/// P0-65..68: process-eviction+exit-notification transaction requires a
+/// distinct acknowledged AP proof before mutating either owned queue.
+impl<const C:usize,const N:usize> CoreRunQueues<C,N>{
+ pub fn retire_and_notify_distinct_aps<const E:usize>(&mut self,
+  supervisor:Runnable,victims:&[(u32,u64)],
+  receipts:&[(&crate::smp_lifecycle_fence::LifecycleFence,u32,
+   crate::smp_lifecycle_fence::Receipt)],notices:&mut ProcessEvents<E>)
+  ->Result<usize,ExitPublicationError>{
+  crate::smp_lifecycle_fence::require_distinct_acks_for_reclaim(receipts)
+   .map_err(|e|ExitPublicationError::Reclaim(ReclaimError::Ap(e)))?;
+  self.retire_and_notify_exact(supervisor,victims,receipts,notices)
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch4_w2_retirement_tests{
+ use super::*;
+ use crate::smp_lifecycle_fence::{LifecycleFence,FenceError};
+ fn t(pid:u32)->Runnable{Runnable{pid,generation:7,priority:3}}
+ #[test]fn duplicate_or_pending_ack_never_evicts_a_live_process(){
+  let mut q=CoreRunQueues::<1,3>::new();
+  q.enqueue(0,t(1)).unwrap();q.enqueue(0,t(2)).unwrap();
+  let mut e=ProcessEvents::<2>::new();
+  let a=LifecycleFence::new(0,1);let x=a.publish(0,8).unwrap();
+  let same=[(&a,0,x),(&a,0,x)];
+  assert_eq!(q.retire_and_notify_distinct_aps(t(1),&[(2,7)],&same,&mut e),
+   Err(ExitPublicationError::Reclaim(ReclaimError::Ap(FenceError::NoProgress))));
+  a.observe_and_ack_after(1,0,|_|true).unwrap();
+  assert_eq!(q.retire_and_notify_distinct_aps(t(1),&[(2,7)],&same,&mut e),
+   Err(ExitPublicationError::Reclaim(ReclaimError::Ap(FenceError::StaleReceipt))));
+  assert!(q.contains_epoch(2,7));assert_eq!(e.count_pid(2),0);
+ }
+ #[test]fn full_event_queue_rolls_back_and_success_notifies_once(){
+  let mut q=CoreRunQueues::<1,3>::new();
+  q.enqueue(0,t(1)).unwrap();q.enqueue(0,t(2)).unwrap();
+  let mut e=ProcessEvents::<1>::new();
+  let a=LifecycleFence::new(0,1);let b=LifecycleFence::new(0,2);
+  let x=a.publish(0,8).unwrap();let y=b.publish(0,9).unwrap();
+  a.observe_and_ack_after(1,0,|_|true).unwrap();
+  b.observe_and_ack_after(2,0,|_|true).unwrap();
+  e.enqueue(ProcessEvent{pid:9,kind:EventKind::Message,value:1}).unwrap();
+  let proof=[(&a,0,x),(&b,0,y)];
+  assert_eq!(q.retire_and_notify_distinct_aps(t(1),&[(2,7)],&proof,&mut e),
+   Err(ExitPublicationError::Notice(EventError::Full)));
+  assert!(q.contains_epoch(2,7));assert_eq!(e.count_pid(9),1);
+  e.dequeue().unwrap();
+  assert_eq!(q.retire_and_notify_distinct_aps(t(1),&[(2,7)],&proof,&mut e),Ok(1));
+  assert!(!q.contains_epoch(2,7));assert_eq!(e.count_pid(2),1);
+ }
+}

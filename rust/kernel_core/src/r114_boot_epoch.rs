@@ -1168,3 +1168,56 @@ mod kernel_p0_batch3_w6_pid1_launch_tests{
   assert_eq!(calls,1);
  }
 }
+
+/// P0-78..80: after consuming the trusted one-shot PID1 authorization,
+/// make a final independent measurement/slot/floor/journal observation.
+/// A late trust failure blocks callback and cannot resurrect launch token.
+impl BootLaunchGate{
+ pub fn launch_with_last_chance_recheck<D:BlockDevice,P:AuthenticatedPid1Platform,R>(
+  &mut self,disk:&mut D,platform:&P,
+  launch:impl FnOnce(VerifiedPid1Admission)->Result<R,Error>)
+  ->Result<R,Error>{
+  let receipt=self.authorize_once(disk,platform)?;
+  revalidate_verified_pid1_at_launch(disk,platform,receipt)?;
+  launch(receipt)
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch4_w6_final_boot_tests{
+ use super::*;
+ use std::cell::Cell;
+ struct Platform{reads:Cell<usize>,change_at:usize}
+ impl TrustedBootMeasurement for Platform{
+  fn read_verified(&self)->Result<[u8;32],Error>{Ok([3;32])}
+ }
+ impl AuthenticatedPid1Platform for Platform{
+  fn read_sealed_floor(&self)->Result<SealedBootFloor,Error>{
+   let count=self.reads.get()+1;self.reads.set(count);
+   Ok(SealedBootFloor{minimum_epoch:if count>=self.change_at{5}else{4},
+    minimum_journal_generation:20,expected_slot:0,
+    minimum_slot_version:9,expected_measurement:[3;32]})
+  }
+  fn read_bootloader_selected_slot(&self)->Result<(usize,Slot),Error>{
+   Ok((0,tests::slot()))
+  }
+ }
+ #[test]fn one_time_accepted_launch_denies_replay(){
+  let mut disk=tests::fixture();let mut gate=BootLaunchGate::new();
+  let p=Platform{reads:Cell::new(0),change_at:usize::MAX};
+  assert_eq!(gate.launch_with_last_chance_recheck(&mut disk,&p,
+   |receipt|Ok(receipt.epoch())),Ok(4));
+  assert_eq!(gate.launch_with_last_chance_recheck(&mut disk,&p,|_|Ok(5)),
+   Err(Error::Stale));
+ }
+ #[test]fn late_changed_floor_blocks_pid1_and_consumes_launch_receipt(){
+  let mut disk=tests::fixture();let mut gate=BootLaunchGate::new();
+  let p=Platform{reads:Cell::new(0),change_at:5};
+  let mut called=false;
+  assert_eq!(gate.launch_with_last_chance_recheck(&mut disk,&p,
+   |_|{called=true;Ok(())}),Err(Error::Stale));
+  assert!(!called);assert_eq!(gate.last_admitted_epoch(),4);
+  assert_eq!(gate.launch_with_last_chance_recheck(&mut disk,&p,
+   |_|{called=true;Ok(())}),Err(Error::Stale));
+  assert!(!called);
+ }
+}
