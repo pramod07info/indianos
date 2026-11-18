@@ -87,10 +87,10 @@ jobs:
           cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$NEXT_FILTER"
           cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$BATCH3_FILTER" -- --list | grep -F "$BATCH3_FILTER"
           cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$BATCH3_FILTER"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$BATCH4_FILTER" -- --list | grep -F "$BATCH4_FILTER"
           cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$BATCH4_FILTER"
           cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$BATCH5_FILTER" -- --list | grep -F "$BATCH5_FILTER"
-          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$BATCH5_FILTER" -- --list | grep -F "$BATCH4_FILTER"
-          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$BATCH4_FILTER"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$BATCH5_FILTER"
       - name: Compile freestanding no_std kernel profile
         env:
           FEATURES: ${{ matrix.features }}
