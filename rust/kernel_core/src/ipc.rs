@@ -1252,3 +1252,72 @@ mod kernel_p0_batch6_w3_allowed_relay_tests{
   assert_eq!(r.receive(a).unwrap().payload(),b"first");
  }
 }
+
+
+/// P0-129..132: enforce sender ownership on every queued FIFO item BEFORE
+/// forwarding its prefix. Authorizations are exact (PID, generation) pairs.
+/// The staging snapshot is private: failures never consume source messages
+/// or partially publish destination traffic. Kernel caller holds IPC lock.
+impl<const M:usize,const D:usize> ScopedRouter<M,D>{
+ pub fn forward_sender_authorized_prefix_exact(&mut self,relay:Identity,
+  recipients:&[Identity],allowed_receivers:&[Identity],
+  allowed_senders:&[Identity])->Result<usize,IpcError>{
+  if recipients.is_empty()||recipients.len()>D||recipients.len()>M||
+     allowed_senders.is_empty()||allowed_senders.len()>M{
+   return Err(IpcError::InvalidConfiguration);
+  }
+  for (i,&sender) in allowed_senders.iter().enumerate(){
+   if sender.pid==0||sender.generation==0{return Err(IpcError::InvalidPid);}
+   if allowed_senders[..i].iter().any(|earlier|earlier.pid==sender.pid){
+    return Err(IpcError::DuplicateReceiver);
+   }
+  }
+  let mut preview=Self{boxes:self.boxes};
+  if preview.pending(relay)?<recipients.len(){return Err(IpcError::Empty);}
+  let empty=TaggedMessage{sender:Identity{pid:0,generation:0},
+   length:0,bytes:[0;MAX_PAYLOAD]};
+  let mut queued=[empty;D];
+  let count=preview.receive_batch_exact_with(relay,recipients.len(),|messages|{
+   queued[..messages.len()].copy_from_slice(messages);true
+  })?;
+  if count!=recipients.len(){return Err(IpcError::Empty);}
+  if queued[..count].iter().any(|m|!allowed_senders.contains(&m.sender())){
+   return Err(IpcError::UnknownSender);
+  }
+  self.forward_allowed_prefix_exact(relay,recipients,allowed_receivers)
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch7_w3_sender_allowlist_tests{
+ use super::*;
+ fn id(pid:u32,generation:u64)->Identity{Identity{pid,generation}}
+ #[test]fn exact_sender_and_receiver_allowlists_preserve_fifo(){
+  let (a,relay,x,y)=(id(1,5),id(2,6),id(3,7),id(4,8));
+  let mut router=ScopedRouter::<4,3>::new().unwrap();
+  for identity in [a,relay,x,y]{router.register(identity).unwrap();}
+  router.send(a,relay,b"one").unwrap();
+  router.send(a,relay,b"two").unwrap();
+  assert_eq!(router.forward_sender_authorized_prefix_exact(relay,
+   &[x,y],&[y,x],&[a]),Ok(2));
+  assert_eq!(router.pending(relay),Ok(0));
+  assert_eq!(router.receive(x).unwrap().payload(),b"one");
+  let second=router.receive(y).unwrap();
+  assert_eq!(second.sender(),relay);assert_eq!(second.payload(),b"two");
+ }
+ #[test]fn untrusted_sender_or_full_destination_rolls_back_everything(){
+  let (a,relay,x,y)=(id(1,5),id(2,6),id(3,7),id(4,8));
+  let mut router=ScopedRouter::<4,2>::new().unwrap();
+  for identity in [a,relay,x,y]{router.register(identity).unwrap();}
+  router.send(a,relay,b"one").unwrap();router.send(y,relay,b"two").unwrap();
+  assert_eq!(router.forward_sender_authorized_prefix_exact(relay,
+   &[x,y],&[x,y],&[a]),Err(IpcError::UnknownSender));
+  assert_eq!(router.pending(relay),Ok(2));
+  assert_eq!(router.pending(x),Ok(0));
+  router.send(a,x,b"busy").unwrap();router.send(a,x,b"full").unwrap();
+  assert_eq!(router.forward_sender_authorized_prefix_exact(relay,
+   &[x,y],&[x,y],&[a,y]),Err(IpcError::Full));
+  assert_eq!(router.pending(relay),Ok(2));
+  assert_eq!(router.receive(relay).unwrap().payload(),b"one");
+  assert_eq!(router.receive(relay).unwrap().payload(),b"two");
+ }
+}

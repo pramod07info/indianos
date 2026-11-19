@@ -1670,3 +1670,84 @@ mod kernel_p0_batch6_w4_partition_metadata_tests{
    Err(BlockError::Io));
  }
 }
+
+
+/// P0-133..135: read two independent authenticated partition metadata fields
+/// with FOUR verified observations per field (two per full paired pass).
+/// Publish both outputs together only if every read succeeds and both paired
+/// passes agree. Device faults/torn snapshots retire the read-only view.
+impl<D:BlockDevice> StableReadOnlyWindow<'_,D>{
+ pub fn read_partition_metadata_pair(&mut self,
+  partition_start:u64,partition_sectors:u64,
+  first:(u64,usize),first_out:&mut[u8],
+  second:(u64,usize),second_out:&mut[u8])->Result<(),BlockError>{
+  if first_out.is_empty()||second_out.is_empty()||
+     first_out.len()>2*SECTOR_BYTES||second_out.len()>2*SECTOR_BYTES{
+   return Err(BlockError::OutOfRange);
+  }
+  let mut a=[0u8;2*SECTOR_BYTES];let mut b=[0u8;2*SECTOR_BYTES];
+  let mut later_a=[0u8;2*SECTOR_BYTES];
+  let mut later_b=[0u8;2*SECTOR_BYTES];
+  for (left,right) in [
+   (&mut a[..first_out.len()],&mut b[..second_out.len()]),
+   (&mut later_a[..first_out.len()],&mut later_b[..second_out.len()])
+  ]{
+   self.read_partition_metadata_bytes(partition_start,partition_sectors,
+    first.0,first.1,left)?;
+   self.read_partition_metadata_bytes(partition_start,partition_sectors,
+    second.0,second.1,right)?;
+  }
+  if a[..first_out.len()]!=later_a[..first_out.len()]||
+     b[..second_out.len()]!=later_b[..second_out.len()]{
+   self.invalidated=true;
+   return Err(BlockError::Io);
+  }
+  first_out.copy_from_slice(&a[..first_out.len()]);
+  second_out.copy_from_slice(&b[..second_out.len()]);
+  Ok(())
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch7_w4_atomic_pair_tests{
+ use super::*;
+ struct Disk{reads:usize,fail_at:usize,change_after:usize}
+ impl BlockDevice for Disk{
+  fn sector_count(&self)->u64{8}
+  fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{
+   self.reads+=1;
+   if self.reads==self.fail_at{return Err(BlockError::Io);}
+   let added=if self.reads>=self.change_after{5}else{0};
+   out.fill(lba as u8+added);Ok(())
+  }
+  fn write_sector(&mut self,_:u64,_:&[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{Err(BlockError::ReadOnly)}
+ }
+ #[test]fn successful_pair_copies_both_fields_together(){
+  let mut disk=Disk{reads:0,fail_at:0,change_after:usize::MAX};
+  let mut view=StableReadOnlyWindow::new(&mut disk).unwrap();
+  let mut a=[9u8;4];let mut b=[9u8;4];
+  assert_eq!(view.read_partition_metadata_pair(2,3,(0,SECTOR_BYTES-2),
+   &mut a,(1,0),&mut b),Ok(()));
+  assert_eq!(a,[2,2,3,3]);assert_eq!(b,[3,3,3,3]);
+  assert!(!view.is_retired());
+ }
+ #[test]fn late_io_fault_and_changed_snapshot_never_partially_publish(){
+  for (fault,change) in [(7,usize::MAX),(0,7)]{
+   let mut disk=Disk{reads:0,fail_at:fault,change_after:change};
+   let mut view=StableReadOnlyWindow::new(&mut disk).unwrap();
+   let mut a=[7u8;4];let mut b=[8u8;4];
+   assert_eq!(view.read_partition_metadata_pair(2,3,(0,SECTOR_BYTES-2),
+    &mut a,(1,0),&mut b),Err(BlockError::Io));
+   assert_eq!(a,[7;4]);assert_eq!(b,[8;4]);assert!(view.is_retired());
+  }
+ }
+ #[test]fn invalid_partition_span_never_writes_caller_buffers(){
+  let mut disk=Disk{reads:0,fail_at:0,change_after:usize::MAX};
+  let mut view=StableReadOnlyWindow::new(&mut disk).unwrap();
+  let mut a=[7u8;4];let mut b=[8u8;4];
+  assert_eq!(view.read_partition_metadata_pair(2,1,(0,SECTOR_BYTES-2),
+   &mut a,(1,0),&mut b),Err(BlockError::OutOfRange));
+  assert_eq!(a,[7;4]);assert_eq!(b,[8;4]);
+ }
+}

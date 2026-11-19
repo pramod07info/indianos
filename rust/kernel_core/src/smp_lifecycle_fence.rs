@@ -768,3 +768,49 @@ mod kernel_p0_batch6_w1_zero_apic_id_tests{
    Err(FenceError::StaleReceipt));
  }
 }
+
+
+/// P0-121..124: generation-coherent complete AP topology proof. A collection
+/// of individually valid acknowledgements from DIFFERENT release epochs is
+/// not one teardown barrier. Caller pins the authenticated topology and holds
+/// the kernel's SMP lifecycle lock until the protected reclaim completes.
+pub fn require_epoch_topology_acks_for_reclaim(
+ receipts:&[(&LifecycleFence,u32,Receipt)],expected_aps:&[u32],
+ expected_generation:u64
+)->Result<(),FenceError>{
+ if expected_generation==0{return Err(FenceError::InvalidGeneration);}
+ if receipts.iter().any(|&(_,_,receipt)|receipt.generation!=expected_generation){
+  return Err(FenceError::StaleReceipt);
+ }
+ require_topology_acks_for_reclaim(receipts,expected_aps)
+}
+#[cfg(test)]
+mod kernel_p0_batch7_w1_epoch_coherence_tests{
+ use super::*;
+ #[test]fn exact_epoch_and_complete_topology_authorize_reclaim(){
+  let a=LifecycleFence::new(9,1);let b=LifecycleFence::new(9,2);
+  let x=a.publish(9,40).unwrap();let y=b.publish(9,40).unwrap();
+  a.observe_and_ack_after(1,0,|_|true).unwrap();
+  b.observe_and_ack_after(2,0,|_|true).unwrap();
+  let refs=[(&a,9,x),(&b,9,y)];
+  assert_eq!(require_epoch_topology_acks_for_reclaim(&refs,&[2,1],40),Ok(()));
+  assert_eq!(require_epoch_topology_acks_for_reclaim(&refs,&[1,2],0),
+   Err(FenceError::InvalidGeneration));
+  assert_eq!(require_epoch_topology_acks_for_reclaim(&refs,&[1],40),
+   Err(FenceError::NoProgress));
+ }
+ #[test]fn mixed_epochs_pending_and_recycled_acks_are_rejected(){
+  let a=LifecycleFence::new(9,1);let b=LifecycleFence::new(9,2);
+  let x=a.publish(9,40).unwrap();let y=b.publish(9,41).unwrap();
+  a.observe_and_ack_after(1,0,|_|true).unwrap();
+  b.observe_and_ack_after(2,0,|_|true).unwrap();
+  let refs=[(&a,9,x),(&b,9,y)];
+  assert_eq!(require_epoch_topology_acks_for_reclaim(&refs,&[1,2],40),
+   Err(FenceError::StaleReceipt));
+  assert_eq!(require_epoch_topology_acks_for_reclaim(
+   &[(&a,9,x),(&a,9,x)],&[1,2],40),Err(FenceError::StaleReceipt));
+  let c=LifecycleFence::new(9,3);let z=c.publish(9,40).unwrap();
+  assert_eq!(require_epoch_topology_acks_for_reclaim(&[(&a,9,x),(&c,9,z)],
+   &[1,3],40),Err(FenceError::NoProgress));
+ }
+}

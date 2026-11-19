@@ -24,6 +24,7 @@ jobs:
             batch4_filter: kernel_p0_batch4_w1
             batch5_filter: kernel_p0_batch5_w1
             batch6_filter: kernel_p0_batch6_w1
+            batch7_filter: kernel_p0_batch7_w1
             features: normal-desktop
           - workstation: W2-scheduler-fairness
             filter: kernel_p0_w2
@@ -32,6 +33,7 @@ jobs:
             batch4_filter: kernel_p0_batch4_w2
             batch5_filter: kernel_p0_batch5_w2
             batch6_filter: kernel_p0_batch6_w2
+            batch7_filter: kernel_p0_batch7_w2
             features: normal-desktop
           - workstation: W3-authenticated-IPC
             filter: kernel_p0_w3
@@ -40,6 +42,7 @@ jobs:
             batch4_filter: kernel_p0_batch4_w3
             batch5_filter: kernel_p0_batch5_w3
             batch6_filter: kernel_p0_batch6_w3
+            batch7_filter: kernel_p0_batch7_w3
             features: normal-desktop
           - workstation: W4-durable-VFS
             filter: kernel_p0_w4
@@ -48,6 +51,7 @@ jobs:
             batch4_filter: kernel_p0_batch4_w4
             batch5_filter: kernel_p0_batch5_w4
             batch6_filter: kernel_p0_batch6_w4
+            batch7_filter: kernel_p0_batch7_w4
             features: test-r031-vfs
           - workstation: W5-NIC-quiescence
             filter: kernel_p0_w5
@@ -56,6 +60,7 @@ jobs:
             batch4_filter: kernel_p0_batch4_w5
             batch5_filter: kernel_p0_batch5_w5
             batch6_filter: kernel_p0_batch6_w5
+            batch7_filter: kernel_p0_batch7_w5
             features: normal-desktop
           - workstation: W6-boot-handoff
             filter: kernel_p0_w6
@@ -64,6 +69,7 @@ jobs:
             batch4_filter: kernel_p0_batch4_w6
             batch5_filter: kernel_p0_batch5_w6
             batch6_filter: kernel_p0_batch6_w6
+            batch7_filter: kernel_p0_batch7_w6
             features: normal-desktop
     steps:
       - uses: actions/checkout@v4
@@ -85,6 +91,7 @@ jobs:
           BATCH4_FILTER: ${{ matrix.batch4_filter }}
           BATCH5_FILTER: ${{ matrix.batch5_filter }}
           BATCH6_FILTER: ${{ matrix.batch6_filter }}
+          BATCH7_FILTER: ${{ matrix.batch7_filter }}
           FEATURES: ${{ matrix.features }}
         run: |
           set -euo pipefail
@@ -100,6 +107,8 @@ jobs:
           cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$BATCH5_FILTER"
           cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$BATCH6_FILTER" -- --list | grep -F "$BATCH6_FILTER"
           cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$BATCH6_FILTER"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$BATCH7_FILTER" -- --list | grep -F "$BATCH7_FILTER"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$BATCH7_FILTER"
       - name: Compile freestanding no_std kernel profile
         env:
           FEATURES: ${{ matrix.features }}

@@ -1921,3 +1921,65 @@ mod kernel_p0_batch6_w2_topology_exit_tests{
   assert_eq!(notices.count_pid(8),1);assert_eq!(notices.count_pid(2),0);
  }
 }
+
+
+/// P0-125..128: make the exact AP topology AND the release epoch part of
+/// the process exit transaction's authority. Atomic runqueue/notice changes
+/// are delegated to the existing staging transaction; a stale topology or
+/// failed notice publication must not evict any incarnation.
+impl<const C:usize,const N:usize> CoreRunQueues<C,N>{
+ pub fn retire_and_notify_epoch_topology<const E:usize>(&mut self,
+  supervisor:Runnable,victims:&[(u32,u64)],
+  receipts:&[(&crate::smp_lifecycle_fence::LifecycleFence,u32,
+    crate::smp_lifecycle_fence::Receipt)],
+  expected_aps:&[u32],expected_generation:u64,
+  notices:&mut ProcessEvents<E>)->Result<usize,ExitPublicationError>{
+  crate::smp_lifecycle_fence::require_epoch_topology_acks_for_reclaim(
+   receipts,expected_aps,expected_generation)
+   .map_err(|e|ExitPublicationError::Reclaim(ReclaimError::Ap(e)))?;
+  self.retire_and_notify_required_topology(supervisor,victims,
+   receipts,expected_aps,notices)
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch7_w2_exit_epoch_tests{
+ use super::*;
+ use crate::smp_lifecycle_fence::{FenceError,LifecycleFence};
+ fn task(pid:u32,generation:u64)->Runnable{
+  Runnable{pid,generation,priority:5}
+ }
+ #[test]fn mixing_valid_receipts_of_different_epochs_cannot_retire(){
+  let mut q=CoreRunQueues::<1,4>::new();
+  q.enqueue(0,task(1,8)).unwrap();q.enqueue(0,task(2,9)).unwrap();
+  let mut events=ProcessEvents::<2>::new();
+  let a=LifecycleFence::new(0,1);let b=LifecycleFence::new(0,2);
+  let x=a.publish(0,20).unwrap();let y=b.publish(0,21).unwrap();
+  a.observe_and_ack_after(1,0,|_|true).unwrap();
+  b.observe_and_ack_after(2,0,|_|true).unwrap();
+  let refs=[(&a,0,x),(&b,0,y)];
+  assert_eq!(q.retire_and_notify_epoch_topology(task(1,8),
+   &[(2,9)],&refs,&[1,2],20,&mut events),
+   Err(ExitPublicationError::Reclaim(ReclaimError::Ap(FenceError::StaleReceipt))));
+  assert!(q.contains_epoch(2,9));assert_eq!(events.len(),0);
+ }
+ #[test]fn matching_epoch_still_obeys_atomic_event_capacity_and_pid1_guard(){
+  let mut q=CoreRunQueues::<1,4>::new();
+  q.enqueue(0,task(1,8)).unwrap();q.enqueue(0,task(2,9)).unwrap();
+  let mut events=ProcessEvents::<1>::new();
+  let a=LifecycleFence::new(0,1);let x=a.publish(0,20).unwrap();
+  a.observe_and_ack_after(1,0,|_|true).unwrap();
+  let refs=[(&a,0,x)];
+  events.enqueue(ProcessEvent{pid:7,kind:EventKind::Message,value:1}).unwrap();
+  assert_eq!(q.retire_and_notify_epoch_topology(task(1,8),
+   &[(2,9)],&refs,&[1],20,&mut events),
+   Err(ExitPublicationError::Notice(EventError::Full)));
+  assert!(q.contains_epoch(2,9));assert_eq!(events.count_pid(7),1);
+  events.dequeue().unwrap();
+  assert!(q.retire_and_notify_epoch_topology(task(1,8),
+   &[(1,8)],&refs,&[1],20,&mut events).is_err());
+  assert!(q.contains_epoch(1,8));
+  assert_eq!(q.retire_and_notify_epoch_topology(task(1,8),
+   &[(2,9)],&refs,&[1],20,&mut events),Ok(1));
+  assert!(!q.contains_epoch(2,9));assert_eq!(events.count_pid(2),1);
+ }
+}

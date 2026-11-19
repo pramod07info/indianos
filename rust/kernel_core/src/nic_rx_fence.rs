@@ -708,3 +708,73 @@ mod kernel_p0_batch6_w5_ipv4_integrity_tests{
   assert_eq!(calls,0);
  }
 }
+
+
+/// P0-136..137: strict UDP delivery from a checked nonfragmented IPv4
+/// Ethernet frame. The UDP length and requested destination port must match
+/// before any driver-independent payload parser runs; epoch revocation still
+/// invalidates the result. UDP checksum offload is NOT authenticated here.
+impl NicRxFence{
+ pub fn parse_checked_udp_ipv4<R>(&self,device:u32,frame:&[u8],
+  maximum:usize,destination_port:u16,
+  parse:impl FnOnce(&[u8])->Option<R>)->Result<R,RxFenceError>{
+  if destination_port==0{return Err(RxFenceError::Capacity);}
+  // Syntactic rejection precedes the live-epoch parser. The underlying
+  // admission primitive uses Stale for an empty parse result, so do not
+  // accidentally report a bad destination port as a revoked NIC ring.
+  if frame.len()<14{return Err(RxFenceError::Capacity);}
+  let ip_offset=if frame[12..14]==[0x81,0x00]{18}else{14};
+  if frame.len()<ip_offset+20{return Err(RxFenceError::Capacity);}
+  let ip=&frame[ip_offset..];
+  let ihl=((ip[0]&15) as usize)*4;
+  if ihl<20||ihl>60||ihl>ip.len(){return Err(RxFenceError::Capacity);}
+  let total=u16::from_be_bytes([ip[2],ip[3]]) as usize;
+  if total<ihl+8||total>ip.len()||ip[9]!=17{
+   return Err(RxFenceError::Capacity);
+  }
+  let udp=&ip[ihl..total];
+  let length=u16::from_be_bytes([udp[4],udp[5]]) as usize;
+  let port=u16::from_be_bytes([udp[2],udp[3]]);
+  if port!=destination_port||length<8||length!=udp.len(){
+   return Err(RxFenceError::Capacity);
+  }
+  self.parse_checked_ipv4_ethernet(device,frame,maximum,|_|parse(&udp[8..length]))
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch7_w5_udp_ingress_tests{
+ use super::*;
+ fn packet()->[u8;46]{
+  let mut bytes=[0u8;46];bytes[12]=8;bytes[13]=0;
+  let p=&mut bytes[14..];
+  p[0]=0x45;p[2]=0;p[3]=32;p[8]=64;p[9]=17;
+  p[20..22].copy_from_slice(&8000u16.to_be_bytes());
+  p[22..24].copy_from_slice(&9000u16.to_be_bytes());
+  p[24..26].copy_from_slice(&12u16.to_be_bytes());
+  p[28..32].copy_from_slice(b"ping");
+  let mut sum=0u32;
+  for word in p[..20].chunks_exact(2){
+   sum+=u16::from_be_bytes([word[0],word[1]]) as u32;
+  }
+  while sum>>16!=0{sum=(sum&65535)+(sum>>16);}
+  p[10..12].copy_from_slice(&(!(sum as u16)).to_be_bytes());
+  bytes
+ }
+ #[test]fn only_complete_port_matched_payload_is_delivered(){
+  let nic=NicRxFence::new(6);let p=packet();
+  assert_eq!(nic.parse_checked_udp_ipv4(6,&p,128,9000,
+   |payload|Some((payload.len(),payload[0]))),Ok((4,b'p')));
+  assert_eq!(nic.parse_checked_udp_ipv4(6,&p,128,9001,
+   |_|Some(1)),Err(RxFenceError::Capacity));
+ }
+ #[test]fn bad_udp_length_and_epoch_change_revoke_delivery(){
+  let nic=NicRxFence::new(6);let mut p=packet();
+  p[25]=13;
+  assert_eq!(nic.parse_checked_udp_ipv4(6,&p,128,9000,
+   |_|Some(1)),Err(RxFenceError::Capacity));
+  p=packet();
+  assert_eq!(nic.parse_checked_udp_ipv4(6,&p,128,9000,|_|{
+   nic.begin_quiesce(6).unwrap();Some(1)
+  }),Err(RxFenceError::Stale));
+ }
+}

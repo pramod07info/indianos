@@ -1346,3 +1346,78 @@ mod kernel_p0_batch6_w6_image_manifest_tests{
   assert_eq!(starts,0);
  }
 }
+
+
+/// P0-138..140: hash the actual caller-pinned PID1 image bytes inside the
+/// consumed trusted admission, rather than taking an unrelated hash callback.
+/// Validate bounded image and initial stack geometry before launch. The
+/// trusted loader still must pin immutable executable pages and prove ELF
+/// segment permissions; this is NOT itself a production TPM/UEFI provider.
+impl BootLaunchGate{
+ pub fn launch_secure_uefi_pinned_bytes<D:BlockDevice,P:AuthenticatedSecureUefi,R>(
+  &mut self,disk:&mut D,platform:&P,manifest_digest:[u8;32],
+  image:&[u8],entry_offset:usize,stack_pages:usize,
+  launch:impl FnOnce(VerifiedPid1Admission)->Result<R,Error>
+ )->Result<R,Error>{
+  self.launch_secure_uefi_manifest_image(disk,platform,manifest_digest,
+   |_|{
+    if image.is_empty()||image.len()>16*1024*1024||
+       entry_offset>=image.len()||!(2..=256).contains(&stack_pages)||
+       stack_pages.checked_mul(4096).is_none(){
+      return Err(Error::Invalid);
+    }
+    Ok(crate::m2_sha256::digest(image))
+   },launch)
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch7_w6_pinned_image_tests{
+ use super::*;
+ struct Platform;
+ impl TrustedBootMeasurement for Platform{
+  fn read_verified(&self)->Result<[u8;32],Error>{Ok([3;32])}
+ }
+ impl AuthenticatedPid1Platform for Platform{
+  fn read_sealed_floor(&self)->Result<SealedBootFloor,Error>{
+   Ok(SealedBootFloor{minimum_epoch:4,minimum_journal_generation:20,
+    expected_slot:0,minimum_slot_version:9,expected_measurement:[3;32]})
+  }
+  fn read_bootloader_selected_slot(&self)->Result<(usize,Slot),Error>{
+   Ok((0,tests::slot()))
+  }
+ }
+ impl AuthenticatedSecureUefi for Platform{
+  fn require_firmware_secure_boot_chain(&self)->Result<(),Error>{Ok(())}
+ }
+ #[test]fn real_image_bytes_hash_is_bound_to_one_use_admission(){
+  let mut disk=tests::fixture();let mut gate=BootLaunchGate::new();
+  let image=b"pinned-test-image";
+  let expected=crate::m2_sha256::digest(image);
+  let mut launched=0;
+  assert_eq!(gate.launch_secure_uefi_pinned_bytes(&mut disk,&Platform,
+   expected,image,0,2,|receipt|{
+    launched+=1;Ok(receipt.epoch())
+   }),Ok(4));
+  assert_eq!(launched,1);
+  assert_eq!(gate.launch_secure_uefi_pinned_bytes(&mut disk,&Platform,
+   expected,image,0,2,|_|{launched+=1;Ok(5)}),Err(Error::Stale));
+  assert_eq!(launched,1);
+ }
+ #[test]fn mismatch_and_invalid_image_geometry_fail_closed_and_burn_receipt(){
+  let bytes=b"pinned-test-image";let correct=crate::m2_sha256::digest(bytes);
+  for (digest,entry,stack,error) in [
+   ([9;32],0,2,Error::Untrusted),
+   (correct,bytes.len(),2,Error::Invalid),
+   (correct,0,1,Error::Invalid)
+  ]{
+   let mut disk=tests::fixture();let mut gate=BootLaunchGate::new();
+   let mut called=false;
+   assert_eq!(gate.launch_secure_uefi_pinned_bytes(&mut disk,&Platform,
+    digest,bytes,entry,stack,|_|{called=true;Ok(())}),Err(error));
+   assert!(!called);assert_eq!(gate.last_admitted_epoch(),4);
+   assert_eq!(gate.launch_secure_uefi_pinned_bytes(&mut disk,&Platform,
+    correct,bytes,0,2,|_|{called=true;Ok(())}),Err(Error::Stale));
+   assert!(!called);
+  }
+ }
+}
