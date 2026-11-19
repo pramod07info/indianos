@@ -1285,3 +1285,64 @@ mod kernel_p0_batch5_w6_secure_boot_handoff_tests{
   assert!(!called);
  }
 }
+/// P0-118..120: bind the one-shot authenticated firmware handoff to an
+/// image hash supplied by an independently verified signed boot manifest.
+/// The image verifier MUST hash actual immutable executable bytes under the
+/// same trusted boot lock. This is not a TPM provider or live ELF loader.
+/// A missing/incorrect image verification consumes the one-shot receipt.
+impl BootLaunchGate{
+ pub fn launch_secure_uefi_manifest_image<D:BlockDevice,P:AuthenticatedSecureUefi,R>(
+  &mut self,disk:&mut D,platform:&P,expected_image:[u8;32],
+  verify_image:impl FnOnce(VerifiedPid1Admission)->Result<[u8;32],Error>,
+  launch:impl FnOnce(VerifiedPid1Admission)->Result<R,Error>
+ )->Result<R,Error>{
+  self.launch_secure_uefi_checked(disk,platform,|receipt|{
+   let found=verify_image(receipt)?;
+   if expected_image==[0;32]||found!=expected_image{
+    return Err(Error::Untrusted);
+   }
+   launch(receipt)
+  })
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch6_w6_image_manifest_tests{
+ use super::*;
+ struct Platform;
+ impl TrustedBootMeasurement for Platform{
+  fn read_verified(&self)->Result<[u8;32],Error>{Ok([3;32])}
+ }
+ impl AuthenticatedPid1Platform for Platform{
+  fn read_sealed_floor(&self)->Result<SealedBootFloor,Error>{
+   Ok(SealedBootFloor{minimum_epoch:4,minimum_journal_generation:20,
+    expected_slot:0,minimum_slot_version:9,expected_measurement:[3;32]})
+  }
+  fn read_bootloader_selected_slot(&self)->Result<(usize,Slot),Error>{
+   Ok((0,tests::slot()))
+  }
+ }
+ impl AuthenticatedSecureUefi for Platform{
+  fn require_firmware_secure_boot_chain(&self)->Result<(),Error>{Ok(())}
+ }
+ #[test] fn signed_manifest_digest_is_checked_before_single_pid1_callback(){
+  let mut disk=tests::fixture();let mut gate=BootLaunchGate::new();
+  let mut starts=0;
+  assert_eq!(gate.launch_secure_uefi_manifest_image(&mut disk,&Platform,
+   [7;32],|r|{assert_eq!(r.epoch(),4);Ok([7;32])},
+   |_|{starts+=1;Ok(10u8)}),Ok(10));
+  assert_eq!(starts,1);
+  assert_eq!(gate.launch_secure_uefi_manifest_image(&mut disk,&Platform,
+   [7;32],|_|Ok([7;32]),|_|{starts+=1;Ok(12u8)}),Err(Error::Stale));
+  assert_eq!(starts,1);
+ }
+ #[test] fn failed_image_verification_consumes_receipt_without_launch(){
+  let mut disk=tests::fixture();let mut gate=BootLaunchGate::new();
+  let mut starts=0;
+  assert_eq!(gate.launch_secure_uefi_manifest_image(&mut disk,&Platform,
+   [7;32],|_|Ok([9;32]),|_|{starts+=1;Ok(())}),Err(Error::Untrusted));
+  assert_eq!(starts,0);assert_eq!(gate.last_admitted_epoch(),4);
+  assert_eq!(gate.launch_secure_uefi_manifest_image(&mut disk,&Platform,
+   [7;32],|_|Ok([7;32]),|_|{starts+=1;Ok(())}),Err(Error::Stale));
+  assert_eq!(starts,0);
+ }
+}

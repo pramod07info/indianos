@@ -633,3 +633,78 @@ mod kernel_p0_batch5_w5_ipv4_ethernet_tests{
   }),Err(RxFenceError::Stale));
  }
 }
+/// P0-116..117: verify IPv4 version, header length, total length, header
+/// checksum and fragmentation policy before allowing a trusted L3 parser.
+/// Deliver only IP length, never Ethernet padding. Hardware RX teardown is
+/// still governed by the exact software ring epoch in parse_ipv4_ethernet.
+/// Deliberately reject fragments until a bounded reassembly service exists.
+impl NicRxFence{
+ pub fn parse_checked_ipv4_ethernet<R>(&self,device:u32,frame:&[u8],
+  maximum:usize,parse:impl FnOnce(&[u8])->Option<R>)
+  ->Result<R,RxFenceError>{
+  if frame.len()<14{return Err(RxFenceError::Capacity);}
+  let vlan=frame[12..14]==[0x81,0x00];
+  let offset=if vlan{18}else{14};
+  if frame.len()<offset+20{return Err(RxFenceError::Capacity);}
+  let ip=&frame[offset..];
+  if ip[0]>>4!=4{return Err(RxFenceError::Capacity);}
+  let ihl=((ip[0]&15) as usize)*4;
+  if ihl<20||ihl>60||ihl>ip.len(){return Err(RxFenceError::Capacity);}
+  let total=u16::from_be_bytes([ip[2],ip[3]]) as usize;
+  if total<ihl||total>ip.len(){return Err(RxFenceError::Capacity);}
+  let fragment=u16::from_be_bytes([ip[6],ip[7]]);
+  if fragment&0x3fff!=0{return Err(RxFenceError::Capacity);}
+  let mut sum=0u32;
+  for pair in ip[..ihl].chunks_exact(2){
+   sum+=u16::from_be_bytes([pair[0],pair[1]]) as u32;
+  }
+  while sum>>16!=0{sum=(sum&0xffff)+(sum>>16);}
+  if sum!=0xffff{return Err(RxFenceError::Capacity);}
+  self.parse_ipv4_ethernet(device,frame,maximum,|_|parse(&ip[..total]))
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch6_w5_ipv4_integrity_tests{
+ use super::*;
+ fn packet()->[u8;38]{
+  let mut bytes=[0u8;38];
+  bytes[12]=8;bytes[13]=0;
+  let p=&mut bytes[14..];
+  p[0]=0x45;p[2]=0;p[3]=24;p[8]=64;p[9]=17;
+  p[20..24].copy_from_slice(b"data");
+  let mut sum=0u32;
+  for word in p[..20].chunks_exact(2){
+   sum+=u16::from_be_bytes([word[0],word[1]]) as u32;
+  }
+  while sum>>16!=0{sum=(sum&0xffff)+(sum>>16);}
+  p[10..12].copy_from_slice(&(!(sum as u16)).to_be_bytes());
+  bytes
+ }
+ #[test] fn valid_header_and_payload_are_epoch_guarded(){
+  let nic=NicRxFence::new(7);
+  let p=packet();
+  assert_eq!(nic.parse_checked_ipv4_ethernet(7,&p,64,
+   |ip|Some((ip.len(),ip[20]))),Ok((24,b'd')));
+  assert_eq!(nic.parse_checked_ipv4_ethernet(8,&p,64,|_|Some(1u8)),
+   Err(RxFenceError::InvalidDevice));
+  assert_eq!(nic.parse_checked_ipv4_ethernet(7,&p,64,|_|{
+   nic.begin_quiesce(7).unwrap();Some(1u8)
+  }),Err(RxFenceError::Stale));
+ }
+ #[test] fn corrupt_length_checksum_or_fragments_never_reach_parser(){
+  let nic=NicRxFence::new(7);let mut p=packet();let mut calls=0;
+  p[16]=0xff;p[17]=0xff;
+  assert_eq!(nic.parse_checked_ipv4_ethernet(7,&p,64,|_|{
+   calls+=1;Some(1)
+  }),Err(RxFenceError::Capacity));
+  p=packet();p[24]^=1;
+  assert_eq!(nic.parse_checked_ipv4_ethernet(7,&p,64,|_|{
+   calls+=1;Some(1)
+  }),Err(RxFenceError::Capacity));
+  p=packet();p[20]=0x20;
+  assert_eq!(nic.parse_checked_ipv4_ethernet(7,&p,64,|_|{
+   calls+=1;Some(1)
+  }),Err(RxFenceError::Capacity));
+  assert_eq!(calls,0);
+ }
+}

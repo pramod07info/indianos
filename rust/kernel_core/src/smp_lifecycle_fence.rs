@@ -696,3 +696,75 @@ mod kernel_p0_batch5_w1_coherent_bsp_tests {
    Err(FenceError::InvalidCpu));
  }
 }
+/// P0-101..104: an authenticated kernel topology snapshot names the EXACT
+/// set of APs that must finish local teardown. A partial or extra collection
+/// cannot authorize reclaim, even when each supplied receipt is authentic.
+/// Caller holds the SMP topology lock across this check and actual reclaim.
+pub fn require_topology_acks_for_reclaim(
+ receipts:&[(&LifecycleFence,u32,Receipt)], expected_aps:&[u32]
+)->Result<(),FenceError>{
+ if expected_aps.is_empty()||expected_aps.len()>64||
+    expected_aps.len()!=receipts.len(){return Err(FenceError::NoProgress);}
+ for (i,&ap) in expected_aps.iter().enumerate(){
+  if expected_aps[..i].contains(&ap){
+   return Err(FenceError::InvalidCpu);
+  }
+  if !receipts.iter().any(|&(fence,_,_)|fence.ap==ap){
+   return Err(FenceError::StaleReceipt);
+  }
+ }
+ for &(fence,cpu,_) in receipts {
+  if !expected_aps.contains(&fence.ap)||fence.bsp!=receipts[0].0.bsp||
+     cpu!=fence.bsp || fence.ap==fence.bsp {
+   return Err(FenceError::InvalidCpu);
+  }
+ }
+ require_distinct_acks_for_reclaim(receipts)
+}
+#[cfg(test)]
+mod kernel_p0_batch6_w1_topology_tests{
+ use super::*;
+ #[test] fn entire_authenticated_topology_required_not_merely_some_acks(){
+  let a=LifecycleFence::new(9,1);let b=LifecycleFence::new(9,2);
+  let ra=a.publish(9,4).unwrap();let rb=b.publish(9,5).unwrap();
+  a.observe_and_ack_after(1,0,|_|true).unwrap();
+  b.observe_and_ack_after(2,0,|_|true).unwrap();
+  let proof=[(&a,9,ra),(&b,9,rb)];
+  assert_eq!(require_topology_acks_for_reclaim(&proof,&[2,1]),Ok(()));
+  assert_eq!(require_topology_acks_for_reclaim(&proof,&[1]),
+   Err(FenceError::NoProgress));
+  assert_eq!(require_topology_acks_for_reclaim(&proof,&[1,3]),
+   Err(FenceError::StaleReceipt));
+  assert_eq!(require_topology_acks_for_reclaim(&proof,&[1,1]),
+   Err(FenceError::InvalidCpu));
+ }
+ #[test] fn stale_or_pending_or_foreign_bsp_receipts_never_pass(){
+  let a=LifecycleFence::new(9,1);let b=LifecycleFence::new(9,2);
+  let ra=a.publish(9,4).unwrap();let rb=b.publish(9,5).unwrap();
+  a.observe_and_ack_after(1,0,|_|true).unwrap();
+  assert_eq!(require_topology_acks_for_reclaim(&[(&a,9,ra),(&b,9,rb)],
+   &[1,2]),Err(FenceError::NoProgress));
+  b.observe_and_ack_after(2,0,|_|true).unwrap();
+  assert_eq!(require_topology_acks_for_reclaim(&[(&a,9,ra),
+   (&b,9,Receipt{generation:6,..rb})],&[1,2]),Err(FenceError::StaleReceipt));
+  let foreign=LifecycleFence::new(3,4);
+  let rf=foreign.publish(3,7).unwrap();
+  foreign.observe_and_ack_after(4,0,|_|true).unwrap();
+  assert_eq!(require_topology_acks_for_reclaim(&[(&a,9,ra),(&foreign,3,rf)],
+   &[1,4]),Err(FenceError::InvalidCpu));
+ }
+}
+
+
+#[cfg(test)]
+mod kernel_p0_batch6_w1_zero_apic_id_tests{
+ use super::*;
+ #[test] fn physical_apic_id_zero_is_valid_for_an_ap_when_bsp_is_nonzero(){
+  let f=LifecycleFence::new(9,0);
+  let r=f.publish(9,3).unwrap();
+  f.observe_and_ack_after(0,0,|_|true).unwrap();
+  assert_eq!(require_topology_acks_for_reclaim(&[(&f,9,r)],&[0]),Ok(()));
+  assert_eq!(require_topology_acks_for_reclaim(&[(&f,9,r)],&[9]),
+   Err(FenceError::StaleReceipt));
+ }
+}

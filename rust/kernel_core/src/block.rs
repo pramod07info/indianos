@@ -1612,3 +1612,61 @@ mod kernel_p0_batch5_w4_unaligned_metadata_tests{
   assert_eq!(out,[10u8;SECTOR_BYTES*2]);
  }
 }
+/// P0-113..115: authenticated partition bounds are checked BEFORE reading
+/// any unaligned boot metadata. The two-pass permanently retiring media view
+/// still performs the real read and prevents partial destination publication.
+impl<D:BlockDevice> StableReadOnlyWindow<'_,D>{
+ pub fn read_partition_metadata_bytes(&mut self,
+  partition_start:u64,partition_sectors:u64,relative_lba:u64,
+  byte_offset:usize,out:&mut[u8])->Result<(),BlockError>{
+  check_range(self.capacity,partition_start,partition_sectors)?;
+  if byte_offset>=SECTOR_BYTES||out.is_empty(){return Err(BlockError::OutOfRange);}
+  let end=byte_offset.checked_add(out.len()).ok_or(BlockError::OutOfRange)?;
+  if end>2*SECTOR_BYTES{return Err(BlockError::OutOfRange);}
+  let sectors=((end+SECTOR_BYTES-1)/SECTOR_BYTES) as u64;
+  check_range(partition_sectors,relative_lba,sectors)?;
+  let actual_lba=partition_start.checked_add(relative_lba)
+   .ok_or(BlockError::OutOfRange)?;
+  self.read_verified_bytes(actual_lba,byte_offset,out)
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch6_w4_partition_metadata_tests{
+ use super::*;
+ struct Disk{reads:usize,fail_on:usize}
+ impl BlockDevice for Disk{
+  fn sector_count(&self)->u64{8}
+  fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{
+   self.reads+=1;
+   if self.reads==self.fail_on{return Err(BlockError::Io);}
+   out.fill(lba as u8);Ok(())
+  }
+  fn write_sector(&mut self,_:u64,_:&[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{Err(BlockError::ReadOnly)}
+ }
+ #[test] fn cross_sector_metadata_stays_within_authenticated_partition(){
+  let mut d=Disk{reads:0,fail_on:0};
+  let mut w=StableReadOnlyWindow::new(&mut d).unwrap();
+  let mut value=[88u8;4];
+  assert_eq!(w.read_partition_metadata_bytes(2,2,0,SECTOR_BYTES-2,&mut value),Ok(()));
+  assert_eq!(value,[2,2,3,3]);
+  let prior=w.device.reads;
+  value.fill(55);
+  assert_eq!(w.read_partition_metadata_bytes(2,2,1,SECTOR_BYTES-2,&mut value),
+   Err(BlockError::OutOfRange));
+  assert_eq!(w.read_partition_metadata_bytes(u64::MAX-1,3,0,0,&mut value),
+   Err(BlockError::OutOfRange));
+  assert_eq!(value,[55u8;4]);assert_eq!(w.device.reads,prior);
+ }
+ #[test] fn late_media_failure_poison_is_sticky_and_does_not_publish(){
+  let mut d=Disk{reads:0,fail_on:4};
+  let mut w=StableReadOnlyWindow::new(&mut d).unwrap();
+  let mut value=[77u8;4];
+  assert_eq!(w.read_partition_metadata_bytes(2,2,0,SECTOR_BYTES-2,&mut value),
+   Err(BlockError::Io));
+  assert_eq!(value,[77u8;4]);assert!(w.is_retired());
+  assert_eq!(w.read_partition_metadata_bytes(2,2,0,SECTOR_BYTES-2,&mut value),
+   Err(BlockError::Io));
+ }
+}

@@ -1202,3 +1202,53 @@ mod kernel_p0_batch5_w3_distinct_relay_tests{
   assert_eq!(r.pending(a),Ok(0));
  }
 }
+/// P0-109..112: caller-authenticated destination allowlist is generation
+/// exact. No forwarding is attempted until every recipient is authorized;
+/// existing clone-and-publish provides atomic FIFO delivery under router lock.
+impl<const M:usize,const D:usize> ScopedRouter<M,D>{
+ pub fn forward_allowed_prefix_exact(&mut self,relay:Identity,
+  recipients:&[Identity],allowed:&[Identity])->Result<usize,IpcError>{
+  if allowed.is_empty()||allowed.len()>M{return Err(IpcError::InvalidConfiguration);}
+  for (i,&identity) in allowed.iter().enumerate(){
+   if identity.pid==0||identity.generation==0{return Err(IpcError::InvalidPid);}
+   if allowed[..i].iter().any(|prior|prior.pid==identity.pid){
+    return Err(IpcError::DuplicateReceiver);
+   }
+  }
+  for &recipient in recipients{
+   if !allowed.contains(&recipient){return Err(IpcError::UnknownReceiver);}
+  }
+  self.forward_distinct_prefix_exact(relay,recipients)
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch6_w3_allowed_relay_tests{
+ use super::*;
+ fn id(pid:u32,generation:u64)->Identity{Identity{pid,generation}}
+ #[test] fn authorized_exact_generation_relay_preserves_order_and_sender(){
+  let (source,relay,a,b)=(id(1,2),id(2,3),id(3,4),id(4,5));
+  let mut r=ScopedRouter::<4,2>::new().unwrap();
+  for x in [source,relay,a,b]{r.register(x).unwrap();}
+  r.send(source,relay,b"alpha").unwrap();r.send(source,relay,b"beta").unwrap();
+  assert_eq!(r.forward_allowed_prefix_exact(relay,&[a,b],&[b,a]),Ok(2));
+  assert_eq!(r.pending(relay),Ok(0));
+  let first=r.receive(a).unwrap();
+  assert_eq!(first.sender(),relay);assert_eq!(first.payload(),b"alpha");
+  assert_eq!(r.receive(b).unwrap().payload(),b"beta");
+ }
+ #[test] fn stale_or_unlisted_recipient_does_not_consume_source_prefix(){
+  let (source,relay,a,b)=(id(1,2),id(2,3),id(3,4),id(4,5));
+  let mut r=ScopedRouter::<4,2>::new().unwrap();
+  for x in [source,relay,a,b]{r.register(x).unwrap();}
+  r.send(source,relay,b"first").unwrap();
+  assert_eq!(r.forward_allowed_prefix_exact(relay,&[a,b],&[a]),
+   Err(IpcError::UnknownReceiver));
+  assert_eq!(r.forward_allowed_prefix_exact(relay,
+   &[Identity{generation:9,..a}],&[a,b]),Err(IpcError::UnknownReceiver));
+  assert_eq!(r.forward_allowed_prefix_exact(relay,&[a],&[a,a]),
+   Err(IpcError::DuplicateReceiver));
+  assert_eq!(r.pending(relay),Ok(1));assert_eq!(r.pending(a),Ok(0));
+  assert_eq!(r.forward_allowed_prefix_exact(relay,&[a],&[a,b]),Ok(1));
+  assert_eq!(r.receive(a).unwrap().payload(),b"first");
+ }
+}
