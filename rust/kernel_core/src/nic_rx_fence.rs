@@ -949,3 +949,98 @@ mod kernel_p0_batch9_w5_ip_peer_tests{
   assert_eq!(calls,0);
  }
 }
+
+
+/// P0-196..197: authenticate an ingress *flow*, not only the destination
+/// UDP port and IP pair. Require unicast Ethernet endpoints, exact source
+/// and destination UDP ports, nonzero IPv4 TTL and a live fenced NIC epoch.
+/// DMA ownership/IOMMU attestation and device IRQ quiescence remain external.
+impl NicRxFence{
+ pub fn parse_udp_ipv4_authenticated_flow<R>(
+  &self,device:u32,frame:&[u8],maximum:usize,
+  source_ip:[u8;4],destination_ip:[u8;4],
+  source_port:u16,destination_port:u16,
+  parse:impl FnOnce(&[u8])->Option<R>
+ )->Result<R,RxFenceError>{
+  if frame.len()<14||source_port==0||destination_port==0{
+   return Err(RxFenceError::Capacity);
+  }
+  // Ethernet source/destination MACs cannot be broadcast, multicast or zero.
+  let src=&frame[6..12];let dst=&frame[..6];
+  if src.iter().all(|b|*b==0)||dst.iter().all(|b|*b==0)||
+     src[0]&1!=0||dst[0]&1!=0{
+   return Err(RxFenceError::Capacity);
+  }
+  let offset=if frame[12..14]==[0x81,0x00]{18}else{14};
+  if frame.len()<offset+20{return Err(RxFenceError::Capacity);}
+  let ip=&frame[offset..];
+  let ihl=((ip[0]&15) as usize)*4;
+  if ip[0]>>4!=4||ihl<20||ihl>60||ip.len()<ihl+8||
+     ip[8]==0{return Err(RxFenceError::Capacity);}
+  if u16::from_be_bytes([ip[ihl],ip[ihl+1]])!=source_port{
+   return Err(RxFenceError::Capacity);
+  }
+  self.parse_udp_ipv4_unicast_peer(device,frame,maximum,
+   source_ip,destination_ip,destination_port,parse)
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch10_w5_flow_binding_tests{
+ use super::*;
+ fn packet()->[u8;47]{
+  let mut bytes=[0u8;47];
+  bytes[0..6].copy_from_slice(&[2,0,0,0,0,2]);
+  bytes[6..12].copy_from_slice(&[2,0,0,0,0,1]);
+  bytes[12..14].copy_from_slice(&[8,0]);
+  let ip=&mut bytes[14..];
+  ip[0]=0x45;ip[2..4].copy_from_slice(&33u16.to_be_bytes());
+  ip[8]=64;ip[9]=17;
+  ip[12..16].copy_from_slice(&[10,0,0,1]);
+  ip[16..20].copy_from_slice(&[10,0,0,2]);
+  ip[20..22].copy_from_slice(&8000u16.to_be_bytes());
+  ip[22..24].copy_from_slice(&9000u16.to_be_bytes());
+  ip[24..26].copy_from_slice(&13u16.to_be_bytes());
+  ip[28..33].copy_from_slice(b"hello");
+  let mut sum=17u32+13;
+  for word in ip[12..20].chunks_exact(2){
+   sum+=u16::from_be_bytes([word[0],word[1]]) as u32;
+  }
+  for word in ip[20..33].chunks_exact(2){
+   sum+=u16::from_be_bytes([word[0],word[1]]) as u32;
+  }
+  sum+=(ip[32] as u32)<<8;
+  while sum>>16!=0{sum=(sum&65535)+(sum>>16);}
+  ip[26..28].copy_from_slice(&(!(sum as u16)).to_be_bytes());
+  let mut header=0u32;
+  for word in ip[..20].chunks_exact(2){
+   header+=u16::from_be_bytes([word[0],word[1]]) as u32;
+  }
+  while header>>16!=0{header=(header&65535)+(header>>16);}
+  ip[10..12].copy_from_slice(&(!(header as u16)).to_be_bytes());
+  bytes
+ }
+ #[test]fn exact_flow_and_live_epoch_required(){
+  let nic=NicRxFence::new(6);let p=packet();
+  assert_eq!(nic.parse_udp_ipv4_authenticated_flow(6,&p,128,
+   [10,0,0,1],[10,0,0,2],8000,9000,|d|Some(d.len())),Ok(5));
+  assert_eq!(nic.parse_udp_ipv4_authenticated_flow(6,&p,128,
+   [10,0,0,1],[10,0,0,2],8000,9000,|_|{
+    nic.begin_quiesce(6).unwrap();Some(1)
+   }),Err(RxFenceError::Stale));
+ }
+ #[test]fn spoofed_mac_port_and_expired_packet_cannot_call_parser(){
+  let nic=NicRxFence::new(6);let mut p=packet();let mut calls=0;
+  assert_eq!(nic.parse_udp_ipv4_authenticated_flow(6,&p,128,
+   [10,0,0,1],[10,0,0,2],8001,9000,|_|{calls+=1;Some(1)}),
+   Err(RxFenceError::Capacity));
+  p[0]=0xff;
+  assert_eq!(nic.parse_udp_ipv4_authenticated_flow(6,&p,128,
+   [10,0,0,1],[10,0,0,2],8000,9000,|_|{calls+=1;Some(1)}),
+   Err(RxFenceError::Capacity));
+  p=packet();p[22]=0;
+  assert_eq!(nic.parse_udp_ipv4_authenticated_flow(6,&p,128,
+   [10,0,0,1],[10,0,0,2],8000,9000,|_|{calls+=1;Some(1)}),
+   Err(RxFenceError::Capacity));
+  assert_eq!(calls,0);
+ }
+}

@@ -2137,3 +2137,83 @@ mod kernel_p0_batch9_w2_exit_ipc_atomic_tests{
   assert_eq!(ipc.pending(id(2,4)),Ok(0));
  }
 }
+
+
+/// P0-185..188: prevent phantom process exits and PID-reuse confusion before
+/// an all-or-none scheduler/event/IPC retirement. Every victim must have
+/// exactly one runnable incarnation, no other generation of that PID can be
+/// running, and PID1 is immutable. Caller serializes the three stores.
+impl<const C:usize,const N:usize> CoreRunQueues<C,N>{
+ pub fn retire_notify_and_reap_live_exact<
+  const E:usize,const M:usize,const D:usize>(
+  &mut self,supervisor:Runnable,victims:&[(u32,u64)],
+  receipts:&[(&crate::smp_lifecycle_fence::LifecycleFence,u32,
+   crate::smp_lifecycle_fence::Receipt)],
+  expected_aps:&[u32],epoch:u64,
+  events:&mut ProcessEvents<E>,router:&mut crate::ipc::ScopedRouter<M,D>
+ )->Result<usize,ExitReapError>{
+  let invalid=ExitReapError::Exit(
+   ExitPublicationError::Reclaim(ReclaimError::InvalidOwner));
+  if victims.is_empty()||victims.len()>M||
+     supervisor.pid!=1||supervisor.generation==0||
+     !self.contains_epoch(supervisor.pid,supervisor.generation){
+   return Err(invalid);
+  }
+  for (index,&(pid,generation)) in victims.iter().enumerate(){
+   if pid<=1||generation==0||
+      victims[..index].iter().any(|&(old,_)|old==pid){
+    return Err(invalid);
+   }
+   let mut exact=0usize;
+   for task in self.queues.iter().flatten().flatten(){
+    if task.pid==pid{
+     if task.generation!=generation{return Err(invalid);}
+     exact+=1;
+    }
+   }
+   if exact!=1{return Err(invalid);}
+  }
+  self.retire_notify_and_reap_ipc(supervisor,victims,receipts,
+   expected_aps,epoch,events,router)
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch10_w2_live_exit_tests{
+ use super::*;
+ use crate::batch5_session::Identity;
+ use crate::ipc::ScopedRouter;
+ use crate::smp_lifecycle_fence::LifecycleFence;
+ fn task(pid:u32,generation:u64)->Runnable{Runnable{pid,generation,priority:2}}
+ fn owner(pid:u32,generation:u64)->Identity{Identity{pid,generation}}
+ #[test]fn phantom_or_recycled_victim_cannot_publish_exit_or_reap_messages(){
+  let mut q=CoreRunQueues::<2,3>::new();
+  q.enqueue(0,task(1,1)).unwrap();q.enqueue(1,task(2,8)).unwrap();
+  let mut events=ProcessEvents::<3>::new();
+  let mut ipc=ScopedRouter::<2,2>::new().unwrap();
+  ipc.register(owner(1,1)).unwrap();ipc.register(owner(2,8)).unwrap();
+  let f=LifecycleFence::new(0,7);let r=f.publish(0,9).unwrap();
+  f.observe_and_ack_after(7,0,|_|true).unwrap();
+  for victims in [&[(3,2)][..],&[(2,7)][..],&[(1,1)][..],
+    &[(2,8),(2,8)][..]]{
+   assert_eq!(q.retire_notify_and_reap_live_exact(
+    task(1,1),victims,&[(&f,0,r)],&[7],9,&mut events,&mut ipc),
+    Err(ExitReapError::Exit(ExitPublicationError::Reclaim(
+     ReclaimError::InvalidOwner))));
+   assert!(q.contains_epoch(2,8));assert_eq!(events.len(),0);
+   assert_eq!(ipc.pending(owner(2,8)),Ok(0));
+  }
+ }
+ #[test]fn one_real_incarnation_exits_all_three_stores(){
+  let mut q=CoreRunQueues::<2,3>::new();
+  q.enqueue(0,task(1,1)).unwrap();q.enqueue(1,task(2,8)).unwrap();
+  let mut events=ProcessEvents::<3>::new();
+  let mut ipc=ScopedRouter::<2,2>::new().unwrap();
+  ipc.register(owner(1,1)).unwrap();ipc.register(owner(2,8)).unwrap();
+  let f=LifecycleFence::new(0,7);let r=f.publish(0,9).unwrap();
+  f.observe_and_ack_after(7,0,|_|true).unwrap();
+  assert_eq!(q.retire_notify_and_reap_live_exact(task(1,1),&[(2,8)],
+   &[(&f,0,r)],&[7],9,&mut events,&mut ipc),Ok(1));
+  assert!(!q.contains_epoch(2,8));assert_eq!(events.count_pid(2),1);
+  assert_eq!(ipc.pending(owner(2,8)),Err(crate::ipc::IpcError::UnknownReceiver));
+ }
+}

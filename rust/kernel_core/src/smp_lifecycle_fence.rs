@@ -950,3 +950,95 @@ mod kernel_p0_batch9_w1_topology_publish_tests{
    &[(&a,1)],0,9,&mut sender,&mut issued),Err(FenceError::Busy));
  }
 }
+
+
+/// P0-181..184: resume an interrupted multi-AP IPI fanout without creating
+/// new lifecycle receipts. Preflight the ENTIRE authenticated AP inventory
+/// before attempting any send, and expose attempted sends to the coordinator.
+/// Re-sends are safe only for an idempotent exact-receipt APIC protocol.
+/// The caller holds the topology lock; actual APIC/TLB work remains external.
+pub fn retry_incomplete_epoch_topology<I:LifecycleIpiSender>(
+ receipts:&[(&LifecycleFence,u32,Receipt)],bsp:u32,
+ expected_aps:&[u32],epoch:u64,sender:&mut I,attempted:&mut[bool]
+)->Result<usize,FenceError>{
+ if epoch==0{return Err(FenceError::InvalidGeneration);}
+ if receipts.is_empty()||receipts.len()>64||
+    receipts.len()!=expected_aps.len()||attempted.len()!=receipts.len(){
+  return Err(FenceError::NoProgress);
+ }
+ if attempted.iter().any(|value|*value){return Err(FenceError::Busy);}
+ for (i,&(fence,ap,receipt)) in receipts.iter().enumerate(){
+  if bsp!=fence.bsp||ap!=fence.ap||ap==bsp||
+     !expected_aps.contains(&ap)||
+     receipts[..i].iter().any(|&(prior,old,_)|
+      old==ap||core::ptr::eq(prior,fence)){
+   return Err(FenceError::InvalidCpu);
+  }
+  if receipt.generation!=epoch{return Err(FenceError::StaleReceipt);}
+  if !fence.acknowledged(bsp,receipt)?{
+   fence.require_pending_exact(bsp,receipt)?;
+  }
+ }
+ for (i,&ap) in expected_aps.iter().enumerate(){
+  if expected_aps[..i].contains(&ap){
+   return Err(FenceError::InvalidCpu);
+  }
+ }
+ let mut sends=0;
+ for (i,&(fence,ap,receipt)) in receipts.iter().enumerate(){
+  if fence.acknowledged(bsp,receipt)?{continue;}
+  fence.require_pending_exact(bsp,receipt)?;
+  attempted[i]=true;
+  sender.send_exact(bsp,ap,receipt)?;
+  sends+=1;
+ }
+ Ok(sends)
+}
+#[cfg(test)]
+mod kernel_p0_batch10_w1_exact_ipi_resume_tests{
+ use super::*;
+ struct Driver{calls:usize,fail_at:usize}
+ impl LifecycleIpiSender for Driver{
+  fn send_exact(&mut self,_:u32,_:u32,_:Receipt)->Result<(),FenceError>{
+   self.calls+=1;
+   if self.calls==self.fail_at{Err(FenceError::NoProgress)}else{Ok(())}
+  }
+ }
+ #[test]fn preflight_rejects_foreign_duplicate_and_stale_without_ipi(){
+  let a=LifecycleFence::new(0,1);let b=LifecycleFence::new(0,2);
+  let x=a.publish(0,55).unwrap();let y=b.publish(0,55).unwrap();
+  let mut d=Driver{calls:0,fail_at:0};let mut attempted=[false;2];
+  assert_eq!(retry_incomplete_epoch_topology(
+   &[(&a,1,x),(&b,2,y)],0,&[1,3],55,&mut d,&mut attempted),
+   Err(FenceError::InvalidCpu));
+  assert_eq!(retry_incomplete_epoch_topology(
+   &[(&a,1,x),(&b,2,y)],0,&[1,1],55,&mut d,&mut attempted),
+   Err(FenceError::InvalidCpu));
+  assert_eq!(retry_incomplete_epoch_topology(
+   &[(&a,1,x),(&b,2,y)],0,&[1,2],56,&mut d,&mut attempted),
+   Err(FenceError::StaleReceipt));
+  assert_eq!(d.calls,0);assert_eq!(attempted,[false;2]);
+ }
+ #[test]fn partial_hardware_send_preserves_exact_pending_receipts(){
+  let a=LifecycleFence::new(0,1);let b=LifecycleFence::new(0,2);
+  let x=a.publish(0,55).unwrap();let y=b.publish(0,55).unwrap();
+  let mut d=Driver{calls:0,fail_at:2};let mut attempted=[false;2];
+  assert_eq!(retry_incomplete_epoch_topology(
+   &[(&a,1,x),(&b,2,y)],0,&[1,2],55,&mut d,&mut attempted),
+   Err(FenceError::NoProgress));
+  assert_eq!(attempted,[true,true]);
+  assert_eq!(a.require_ack_for_reclaim(0,x),Err(FenceError::NoProgress));
+  assert_eq!(b.require_ack_for_reclaim(0,y),Err(FenceError::NoProgress));
+  a.observe_and_ack_after(1,0,|_|true).unwrap();
+  d.fail_at=usize::MAX;attempted=[false;2];
+  assert_eq!(retry_incomplete_epoch_topology(
+   &[(&a,1,x),(&b,2,y)],0,&[1,2],55,&mut d,&mut attempted),Ok(1));
+  assert_eq!(attempted,[false,true]);
+  b.observe_and_ack_after(2,0,|_|true).unwrap();
+  attempted=[false;2];
+  assert_eq!(retry_incomplete_epoch_topology(
+   &[(&a,1,x),(&b,2,y)],0,&[1,2],55,&mut d,&mut attempted),Ok(0));
+  assert_eq!(require_epoch_topology_acks_for_reclaim(
+   &[(&a,0,x),(&b,0,y)],&[1,2],55),Ok(()));
+ }
+}

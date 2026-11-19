@@ -1918,3 +1918,74 @@ mod kernel_p0_batch9_w4_domain_metadata_tests{
   }
  }
 }
+
+
+/// P0-193..195: independently authenticated partition metadata fields must
+/// never alias each other, even across a sector boundary. A malformed pair is
+/// rejected before media I/O; successful copies remain all-or-nothing and a
+/// changed/torn/digest-mismatched view is permanently retired by the delegate.
+/// The trusted caller provides digests from a signed manifest, never disk.
+impl<D:BlockDevice> StableReadOnlyWindow<'_,D>{
+ pub fn read_disjoint_partition_domain_pair(
+  &mut self,start:u64,count:u64,
+  first:(u64,usize),first_out:&mut[u8],first_digest:[u8;32],
+  second:(u64,usize),second_out:&mut[u8],second_digest:[u8;32]
+ )->Result<(),BlockError>{
+  check_range(self.capacity,start,count)?;
+  if first_out.is_empty()||second_out.is_empty()||
+     first_out.len()>2*SECTOR_BYTES||second_out.len()>2*SECTOR_BYTES||
+     first.1>=SECTOR_BYTES||second.1>=SECTOR_BYTES{
+   return Err(BlockError::OutOfRange);
+  }
+  let size=SECTOR_BYTES as u128;
+  let a=(first.0 as u128)*size+(first.1 as u128);
+  let b=(second.0 as u128)*size+(second.1 as u128);
+  let a_end=a+(first_out.len() as u128);
+  let b_end=b+(second_out.len() as u128);
+  if a<b_end&&b<a_end{return Err(BlockError::OutOfRange);}
+  self.read_partition_domain_bound_pair(start,count,
+   first,first_out,first_digest,second,second_out,second_digest)
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch10_w4_disjoint_manifest_tests{
+ use super::*;
+ struct Disk{reads:usize,changed:bool}
+ impl BlockDevice for Disk{
+  fn sector_count(&self)->u64{8}
+  fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{
+   self.reads+=1;out.fill(lba as u8);
+   if self.changed&&self.reads==4{out[0]^=1;}
+   Ok(())
+  }
+  fn write_sector(&mut self,_:u64,_:&[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{Err(BlockError::ReadOnly)}
+ }
+ #[test]fn cross_sector_alias_is_denied_before_read(){
+  let mut disk=Disk{reads:0,changed:false};
+  let mut window=StableReadOnlyWindow::new(&mut disk).unwrap();
+  let mut a=[9;4];let mut b=[8;4];
+  assert_eq!(window.read_disjoint_partition_domain_pair(
+   2,3,(0,SECTOR_BYTES-2),&mut a,[1;32],
+   (1,0),&mut b,[2;32]),Err(BlockError::OutOfRange));
+  assert_eq!(window.device.reads,0);
+  assert_eq!(a,[9;4]);assert_eq!(b,[8;4]);
+ }
+ #[test]fn disjoint_signed_fields_commit_only_if_both_stable(){
+  let first=domain_bound_metadata_sha256(2,3,0,0,&[2;4]).unwrap();
+  let second=domain_bound_metadata_sha256(2,3,1,0,&[3;4]).unwrap();
+  let mut disk=Disk{reads:0,changed:false};
+  let mut window=StableReadOnlyWindow::new(&mut disk).unwrap();
+  let mut a=[9;4];let mut b=[8;4];
+  assert_eq!(window.read_disjoint_partition_domain_pair(
+   2,3,(0,0),&mut a,first,(1,0),&mut b,second),Ok(()));
+  assert_eq!(a,[2;4]);assert_eq!(b,[3;4]);
+  let mut disk=Disk{reads:0,changed:true};
+  let mut window=StableReadOnlyWindow::new(&mut disk).unwrap();
+  let mut a=[9;4];let mut b=[8;4];
+  assert_eq!(window.read_disjoint_partition_domain_pair(
+   2,3,(0,0),&mut a,first,(1,0),&mut b,second),Err(BlockError::Io));
+  assert_eq!(a,[9;4]);assert_eq!(b,[8;4]);assert!(window.is_retired());
+ }
+}

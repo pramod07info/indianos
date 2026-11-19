@@ -1466,3 +1466,80 @@ mod kernel_p0_batch9_w3_authenticated_receive_tests{
   assert_eq!(ipc.receive(receiver).unwrap().payload(),b"defg");
  }
 }
+
+
+/// P0-189..192: pin a complete FIFO prefix to an exact, ORDERED sequence
+/// of live sender incarnations before any user copy. A stale sender, reordered
+/// head, too few messages, or aggregate quota fault must not consume a byte.
+/// Kernel caller owns PCB authentication and serializes this router.
+impl<const M:usize,const D:usize> ScopedRouter<M,D>{
+ pub fn receive_live_ordered_prefix_with(
+  &mut self,receiver:Identity,expected_senders:&[Identity],
+  max_total_bytes:usize,deliver:impl FnOnce(&[TaggedMessage])->bool
+ )->Result<usize,IpcError>{
+  if expected_senders.is_empty()||expected_senders.len()>D||
+     max_total_bytes==0||max_total_bytes>D.saturating_mul(MAX_PAYLOAD){
+   return Err(IpcError::InvalidConfiguration);
+  }
+  for sender in expected_senders{
+   if sender.pid==0||sender.generation==0{return Err(IpcError::InvalidPid);}
+   if !self.boxes.iter().flatten().any(|box_|box_.owner==*sender){
+    return Err(IpcError::UnknownSender);
+   }
+  }
+  let target=self.boxes.iter().flatten().find(|box_|box_.owner==receiver)
+   .ok_or(IpcError::UnknownReceiver)?;
+  let count=expected_senders.len();
+  if target.count<count{return Err(IpcError::Empty);}
+  let mut bytes=0usize;
+  for (index,&sender) in expected_senders.iter().enumerate(){
+   let message=target.queue[index].ok_or(IpcError::Empty)?;
+   if message.sender()!=sender{return Err(IpcError::UnknownSender);}
+   bytes=bytes.checked_add(message.payload().len())
+    .ok_or(IpcError::PayloadTooLarge)?;
+  }
+  if bytes>max_total_bytes{return Err(IpcError::PayloadTooLarge);}
+  self.receive_batch_exact_with(receiver,count,deliver)
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch10_w3_ordered_live_ipc_tests{
+ use super::*;
+ fn who(pid:u32,generation:u64)->Identity{Identity{pid,generation}}
+ #[test]fn fifo_sequence_quota_and_failed_copy_preserve_all_messages(){
+  let (a,b,dest)=(who(1,2),who(2,3),who(3,4));
+  let mut router=ScopedRouter::<3,3>::new().unwrap();
+  for owner in [a,b,dest]{router.register(owner).unwrap();}
+  router.send(a,dest,b"abc").unwrap();
+  router.send(b,dest,b"defg").unwrap();
+  let mut copies=0;
+  assert_eq!(router.receive_live_ordered_prefix_with(
+   dest,&[b,a],7,|_|{copies+=1;true}),Err(IpcError::UnknownSender));
+  assert_eq!(router.receive_live_ordered_prefix_with(
+   dest,&[a,b],6,|_|{copies+=1;true}),Err(IpcError::PayloadTooLarge));
+  assert_eq!(router.receive_live_ordered_prefix_with(
+   dest,&[a,who(2,8)],7,|_|{copies+=1;true}),Err(IpcError::UnknownSender));
+  assert_eq!(router.receive_live_ordered_prefix_with(
+   dest,&[a,b,b],8,|_|{copies+=1;true}),Err(IpcError::Empty));
+  assert_eq!(copies,0);assert_eq!(router.pending(dest),Ok(2));
+  assert_eq!(router.receive_live_ordered_prefix_with(
+   dest,&[a,b],7,|_|{copies+=1;false}),Err(IpcError::CopyFailed));
+  assert_eq!(router.pending(dest),Ok(2));
+  assert_eq!(router.receive_live_ordered_prefix_with(
+   dest,&[a,b],7,|messages|{
+    copies+=1;
+    messages[0].payload()==b"abc"&&messages[1].payload()==b"defg"
+   }),Ok(2));
+  assert_eq!(copies,2);assert_eq!(router.pending(dest),Ok(0));
+ }
+ #[test]fn retired_sender_rejected_before_calling_user_memory(){
+  let a=who(1,2);let dest=who(3,4);
+  let mut router=ScopedRouter::<2,3>::new().unwrap();
+  router.register(a).unwrap();router.register(dest).unwrap();
+  router.send(a,dest,b"data").unwrap();router.reap(a).unwrap();
+  let mut copied=false;
+  assert_eq!(router.receive_live_ordered_prefix_with(
+   dest,&[a],4,|_|{copied=true;true}),Err(IpcError::UnknownSender));
+  assert!(!copied);assert_eq!(router.pending(dest),Ok(0));
+ }
+}

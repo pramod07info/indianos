@@ -1711,3 +1711,123 @@ mod kernel_p0_batch9_w6_page_isolation_tests{
    Err(Error::Invalid));
  }
 }
+
+
+/// P0-198..200: bound the number of page frames a verified PID1 executable
+/// can demand before committing any page-table mappings. In addition to
+/// existing ELF W^X / guard-page / shared-PTE checks, reject ELF64 PT_LOAD
+/// allocations exceeding a fixed early-boot memory budget (including BSS).
+/// This prepares a plan; it neither maps pages nor installs hardware NX bits.
+pub fn verify_pid1_elf64_bounded_mapping(
+ image:&[u8],stack_top:u64,stack_pages:usize
+)->Result<u64,Error>{
+ let entry=verify_pid1_elf64_page_isolation(image,stack_top,stack_pages)?;
+ const PAGE:u64=4096;
+ const MAX_TOTAL_PAGES:u64=16384;
+ let phoff=u64::from_le_bytes(image[32..40].try_into()
+  .map_err(|_|Error::Invalid)?) as usize;
+ let phnum=u16::from_le_bytes(image[56..58].try_into()
+  .map_err(|_|Error::Invalid)?) as usize;
+ let mut mapped=stack_pages as u64;
+ for index in 0..phnum{
+  let at=phoff+index*56;
+  let kind=u32::from_le_bytes(image[at..at+4].try_into()
+   .map_err(|_|Error::Invalid)?);
+  if kind!=1{continue;}
+  let start=u64::from_le_bytes(image[at+16..at+24].try_into()
+   .map_err(|_|Error::Invalid)?);
+  let length=u64::from_le_bytes(image[at+40..at+48].try_into()
+   .map_err(|_|Error::Invalid)?);
+  let begin=start/PAGE;
+  let end=start.checked_add(length)
+   .and_then(|size|size.checked_add(PAGE-1))
+   .ok_or(Error::Invalid)?/PAGE;
+  mapped=mapped.checked_add(end.checked_sub(begin)
+   .ok_or(Error::Invalid)?).ok_or(Error::Invalid)?;
+  if mapped>MAX_TOTAL_PAGES{return Err(Error::Invalid);}
+ }
+ Ok(entry)
+}
+impl BootLaunchGate{
+ /// Even an invalid oversized image consumes its authenticated one-shot
+ /// admission. A live loader must use the exact pinned image and mapping plan.
+ pub fn launch_secure_uefi_bounded_elf64<D:BlockDevice,P:AuthenticatedSecureUefi,R>(
+  &mut self,disk:&mut D,platform:&P,manifest_digest:[u8;32],
+  image:&[u8],stack_top:u64,stack_pages:usize,
+  launch:impl FnOnce(VerifiedPid1Admission,u64)->Result<R,Error>
+ )->Result<R,Error>{
+  let checked=verify_pid1_elf64_bounded_mapping(image,stack_top,stack_pages);
+  self.launch_secure_uefi_manifest_image(disk,platform,manifest_digest,
+   |_|{
+    checked?;
+    Ok(crate::m2_sha256::digest(image))
+   },|receipt|launch(receipt,checked?))
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch10_w6_pid1_mapping_budget_tests{
+ use super::*;
+ struct Platform;
+ impl TrustedBootMeasurement for Platform{
+  fn read_verified(&self)->Result<[u8;32],Error>{Ok([3;32])}
+ }
+ impl AuthenticatedPid1Platform for Platform{
+  fn read_sealed_floor(&self)->Result<SealedBootFloor,Error>{
+   Ok(SealedBootFloor{minimum_epoch:4,minimum_journal_generation:20,
+    expected_slot:0,minimum_slot_version:9,expected_measurement:[3;32]})
+  }
+  fn read_bootloader_selected_slot(&self)->Result<(usize,Slot),Error>{
+   Ok((0,tests::slot()))
+  }
+ }
+ impl AuthenticatedSecureUefi for Platform{
+  fn require_firmware_secure_boot_chain(&self)->Result<(),Error>{Ok(())}
+ }
+ fn elf()->[u8;256]{
+  let mut image=[0u8;256];image[..4].copy_from_slice(b"\x7fELF");
+  image[4]=2;image[5]=1;image[6]=1;
+  image[16..18].copy_from_slice(&2u16.to_le_bytes());
+  image[18..20].copy_from_slice(&62u16.to_le_bytes());
+  image[20..24].copy_from_slice(&1u32.to_le_bytes());
+  image[24..32].copy_from_slice(&0x400000u64.to_le_bytes());
+  image[32..40].copy_from_slice(&64u64.to_le_bytes());
+  image[52..54].copy_from_slice(&64u16.to_le_bytes());
+  image[54..56].copy_from_slice(&56u16.to_le_bytes());
+  image[56..58].copy_from_slice(&1u16.to_le_bytes());
+  image[64..68].copy_from_slice(&1u32.to_le_bytes());
+  image[68..72].copy_from_slice(&5u32.to_le_bytes());
+  image[72..80].copy_from_slice(&128u64.to_le_bytes());
+  image[80..88].copy_from_slice(&0x400000u64.to_le_bytes());
+  image[96..104].copy_from_slice(&4u64.to_le_bytes());
+  image[104..112].copy_from_slice(&4096u64.to_le_bytes());
+  image[112..120].copy_from_slice(&1u64.to_le_bytes());
+  image[128..132].copy_from_slice(&[0x90,0x90,0x90,0xc3]);
+  image
+ }
+ #[test]fn tiny_static_pid1_fits_bounded_mapping(){
+  assert_eq!(verify_pid1_elf64_bounded_mapping(&elf(),0x800000,8),
+   Ok(0x400000));
+ }
+ #[test]fn huge_bss_is_denied_without_page_allocation(){
+  let mut image=elf();
+  image[104..112].copy_from_slice(&(96u64*1024*1024).to_le_bytes());
+  assert_eq!(verify_pid1_elf64_bounded_mapping(&image,0x80000000,8),
+   Err(Error::Invalid));
+ }
+ #[test]fn malformed_mapping_burns_one_shot_boot_admission(){
+  let mut disk=tests::fixture();let mut gate=BootLaunchGate::new();
+  let mut image=elf();
+  image[104..112].copy_from_slice(&(96u64*1024*1024).to_le_bytes());
+  let hash=crate::m2_sha256::digest(&image);let mut launched=false;
+  assert_eq!(gate.launch_secure_uefi_bounded_elf64(
+   &mut disk,&Platform,hash,&image,0x80000000,8,|_,_|{
+    launched=true;Ok(())
+   }),Err(Error::Invalid));
+  assert!(!launched);assert_eq!(gate.last_admitted_epoch(),4);
+  assert_eq!(gate.launch_secure_uefi_bounded_elf64(
+   &mut disk,&Platform,hash,&image,0x80000000,8,|_,_|{
+    launched=true;Ok(())
+   }),Err(Error::Stale));
+  assert!(!launched);
+ }
+}
