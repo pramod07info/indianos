@@ -1192,3 +1192,103 @@ mod kernel_p0_batch12_w2_atomic_exit_ipc_tests{
   assert_eq!(policy.queued_notices(),0);
  }
 }
+
+
+
+/// P0-256..260: faulted PCB teardown must use the same atomic four-store
+/// transaction as graceful exit. The active owner, IPC mailbox and UDP
+/// generation are never mutated when late-stage IPC reaping fails.
+/// Caller retains the exclusive scheduler/socket/IPC lock throughout.
+impl<const C:usize,const U:usize,const E:usize> ProcessRetirement<C,U,E>{
+ pub fn retire_pinned_faulted_with_ipc<
+  const P:usize,const Q:usize,const M:usize,const D:usize
+ >(
+  &mut self,sockets:&mut EpochUdpEndpoints<P,Q>,
+  ipc:&mut crate::ipc::ScopedRouter<M,D>,snapshot:IngressRevision,
+  owners:&[Owner]
+ )->Result<RetirementReceipt,ExitWithIpcError>{
+  if snapshot.0!=self.ingress_revision{
+   return Err(ExitWithIpcError::Retirement(
+    RetirementError::Sockets(SocketError::Denied)));
+  }
+  if owners.is_empty()||owners.len()>C{
+   return Err(ExitWithIpcError::Retirement(
+    RetirementError::Capabilities(EpochError::Denied)));
+  }
+  for (i,owner) in owners.iter().enumerate(){
+   if owner.pid<=1||owner.generation==0||
+      owners[..i].iter().any(|old|old.pid==owner.pid){
+    return Err(ExitWithIpcError::Retirement(
+     RetirementError::Capabilities(EpochError::Denied)));
+   }
+   self.require_active(*owner).map_err(ExitWithIpcError::Retirement)?;
+  }
+  let mut staged_self=self.clone();
+  let mut staged_sockets=sockets.clone();
+  let mut staged_ipc=ipc.clone();
+  let receipt=staged_self.retire_live_faulted_batch(
+   &mut staged_sockets,owners).map_err(ExitWithIpcError::Retirement)?;
+  for owner in owners{
+   staged_ipc.reap(crate::batch5_session::Identity{
+    pid:owner.pid,generation:owner.generation,
+   }).map_err(ExitWithIpcError::Ipc)?;
+  }
+  *self=staged_self;*sockets=staged_sockets;*ipc=staged_ipc;
+  Ok(receipt)
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch13_w2_faulted_retirement_tests{
+ use super::*;
+ use crate::ipc::{IpcError,ScopedRouter};
+ use crate::batch5_session::Identity;
+ fn identity(o:Owner)->Identity{Identity{pid:o.pid,generation:o.generation}}
+ #[test]fn faulted_exit_reaps_socket_ipc_and_enqueues_one_notice(){
+  let mut policy=ProcessRetirement::<4,4,4>::new();
+  let mut sockets=EpochUdpEndpoints::<4,4>::new();
+  let mut ipc=ScopedRouter::<4,2>::new().unwrap();
+  let victim=policy.start(2).unwrap();let live=policy.start(3).unwrap();
+  ipc.register(identity(victim)).unwrap();
+  ipc.register(identity(live)).unwrap();
+  ipc.send(identity(victim),identity(live),b"old").unwrap();
+  policy.bind_live_udp(&mut sockets,victim,3400).unwrap();
+  let revision=policy.capture_polled_ingress_revision();
+  let receipt=policy.retire_pinned_faulted_with_ipc(
+   &mut sockets,&mut ipc,revision,&[victim]).unwrap();
+  assert_eq!(receipt.notices_enqueued,1);
+  assert_eq!(receipt.udp_ports_released,1);
+  assert_eq!(policy.queued_notices(),1);
+  assert_eq!(policy.active_udp_ports(),0);
+  assert_eq!(ipc.pending(identity(victim)),Err(IpcError::UnknownReceiver));
+  assert_eq!(ipc.pending(identity(live)),Ok(0));
+ }
+ #[test]fn missing_ipc_owner_aborts_capabilities_and_udp_and_notices(){
+  let mut policy=ProcessRetirement::<4,4,4>::new();
+  let mut sockets=EpochUdpEndpoints::<4,4>::new();
+  let mut ipc=ScopedRouter::<4,2>::new().unwrap();
+  let victim=policy.start(2).unwrap();
+  policy.bind_live_udp(&mut sockets,victim,3400).unwrap();
+  let revision=policy.capture_polled_ingress_revision();
+  assert_eq!(policy.retire_pinned_faulted_with_ipc(
+   &mut sockets,&mut ipc,revision,&[victim]),
+   Err(ExitWithIpcError::Ipc(IpcError::UnknownReceiver)));
+  assert_eq!(policy.active_udp_ports(),1);
+  assert_eq!(policy.queued_notices(),0);
+  assert_eq!(policy.active_generation(victim.pid),Some(victim.generation));
+ }
+ #[test]fn invalid_snapshot_and_pid1_protection_fail_without_mutation(){
+  let mut policy=ProcessRetirement::<4,4,4>::new();
+  let mut sockets=EpochUdpEndpoints::<4,4>::new();
+  let mut ipc=ScopedRouter::<4,2>::new().unwrap();
+  let victim=policy.start(2).unwrap();
+  ipc.register(identity(victim)).unwrap();
+  let stale=policy.capture_polled_ingress_revision();policy.start(3).unwrap();
+  assert!(policy.retire_pinned_faulted_with_ipc(
+   &mut sockets,&mut ipc,stale,&[victim]).is_err());
+  let fresh=policy.capture_polled_ingress_revision();
+  assert!(policy.retire_pinned_faulted_with_ipc(
+   &mut sockets,&mut ipc,fresh,&[Owner{pid:1,generation:1}]).is_err());
+  assert_eq!(ipc.pending(identity(victim)),Ok(0));
+  assert_eq!(policy.queued_notices(),0);
+ }
+}

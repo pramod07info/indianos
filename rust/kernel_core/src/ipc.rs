@@ -1730,3 +1730,112 @@ mod kernel_p0_batch12_w3_multisender_transaction_tests{
   assert_eq!(r.pending(x),Ok(0));
  }
 }
+
+
+
+/// P0-261..265: authenticated relay from distinct source mailboxes to
+/// specified target mailboxes, all-or-none. The relay becomes the visible
+/// sender at the target; it must be a registered, trusted service identity.
+/// Every incoming origin must still be explicitly allowlisted and live.
+/// A later full destination or empty source preserves all earlier FIFOs.
+/// The kernel caller serializes the router across CPUs.
+impl<const M:usize,const D:usize> ScopedRouter<M,D>{
+ pub fn relay_distinct_mailboxes_atomic(
+  &mut self,relay:Identity,sources:&[Identity],destinations:&[Identity],
+  allowed_origins:&[Identity],max_total_bytes:usize
+ )->Result<usize,IpcError>{
+  if sources.is_empty()||sources.len()>M||
+     sources.len()!=destinations.len()||allowed_origins.is_empty()||
+     allowed_origins.len()>M||max_total_bytes==0||
+     max_total_bytes>M.saturating_mul(MAX_PAYLOAD){
+   return Err(IpcError::InvalidConfiguration);
+  }
+  if !self.boxes.iter().flatten().any(|b|b.owner==relay){
+   return Err(IpcError::UnknownSender);
+  }
+  for (i,source) in sources.iter().enumerate(){
+   if source.pid==0||source.generation==0{return Err(IpcError::InvalidPid);}
+   if sources[..i].iter().any(|old|old.pid==source.pid){
+    return Err(IpcError::DuplicateReceiver);
+   }
+  }
+  for (i,sender) in allowed_origins.iter().enumerate(){
+   if sender.pid==0||sender.generation==0{return Err(IpcError::InvalidPid);}
+   if allowed_origins[..i].iter().any(|old|old.pid==sender.pid){
+    return Err(IpcError::DuplicateReceiver);
+   }
+   if !self.boxes.iter().flatten().any(|b|b.owner==*sender){
+    return Err(IpcError::UnknownSender);
+   }
+  }
+  let mut staged=self.clone();
+  let mut total=0usize;
+  for (&source,&destination) in sources.iter().zip(destinations){
+   let packet=staged.receive(source)?;
+   if !allowed_origins.contains(&packet.sender()){
+    return Err(IpcError::UnknownSender);
+   }
+   total=total.checked_add(packet.payload().len())
+     .ok_or(IpcError::PayloadTooLarge)?;
+   if total>max_total_bytes{return Err(IpcError::PayloadTooLarge);}
+   staged.send(relay,destination,packet.payload())?;
+  }
+  *self=staged;
+  Ok(sources.len())
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch13_w3_atomic_cross_mailbox_relay_tests{
+ use super::*;
+ fn id(pid:u32,generation:u64)->Identity{Identity{pid,generation}}
+ #[test]fn distinct_sources_relay_without_losing_fifo_order(){
+  let relay=id(1,1);let a=id(2,2);let b=id(3,3);
+  let in_a=id(4,4);let in_b=id(5,5);let out=id(6,6);
+  let mut router=ScopedRouter::<6,3>::new().unwrap();
+  for id in [relay,a,b,in_a,in_b,out]{router.register(id).unwrap();}
+  router.send(a,in_a,b"first").unwrap();
+  router.send(b,in_b,b"second").unwrap();
+  assert_eq!(router.relay_distinct_mailboxes_atomic(
+   relay,&[in_a,in_b],&[out,out],&[a,b],11),Ok(2));
+  assert_eq!(router.pending(in_a),Ok(0));
+  assert_eq!(router.pending(in_b),Ok(0));
+  let first=router.receive(out).unwrap();
+  let second=router.receive(out).unwrap();
+  assert_eq!(first.sender(),relay);
+  assert_eq!(first.payload(),b"first");
+  assert_eq!(second.sender(),relay);
+  assert_eq!(second.payload(),b"second");
+ }
+ #[test]fn late_full_target_or_empty_source_preserves_original_messages(){
+  let relay=id(1,1);let a=id(2,2);let b=id(3,3);
+  let in_a=id(4,4);let in_b=id(5,5);let out=id(6,6);
+  let mut router=ScopedRouter::<6,2>::new().unwrap();
+  for id in [relay,a,b,in_a,in_b,out]{router.register(id).unwrap();}
+  router.send(a,in_a,b"abc").unwrap();
+  assert_eq!(router.relay_distinct_mailboxes_atomic(
+   relay,&[in_a,in_b],&[out,out],&[a,b],10),Err(IpcError::Empty));
+  assert_eq!(router.pending(in_a),Ok(1));
+  router.send(b,in_b,b"def").unwrap();
+  router.send(a,out,b"old").unwrap();
+  assert_eq!(router.relay_distinct_mailboxes_atomic(
+   relay,&[in_a,in_b],&[out,out],&[a,b],10),Err(IpcError::Full));
+  assert_eq!(router.pending(in_a),Ok(1));
+  assert_eq!(router.pending(in_b),Ok(1));
+  assert_eq!(router.pending(out),Ok(1));
+ }
+ #[test]fn stale_sender_quota_and_duplicate_source_fail_closed(){
+  let relay=id(1,1);let a=id(2,2);let source=id(3,3);let dest=id(4,4);
+  let mut router=ScopedRouter::<4,2>::new().unwrap();
+  for id in [relay,a,source,dest]{router.register(id).unwrap();}
+  router.send(a,source,b"four").unwrap();
+  assert_eq!(router.relay_distinct_mailboxes_atomic(
+   relay,&[source,source],&[dest,dest],&[a],10),
+   Err(IpcError::DuplicateReceiver));
+  assert_eq!(router.relay_distinct_mailboxes_atomic(
+   relay,&[source],&[dest],&[a],3),Err(IpcError::PayloadTooLarge));
+  assert_eq!(router.relay_distinct_mailboxes_atomic(
+   relay,&[source],&[dest],&[id(2,3)],8),Err(IpcError::UnknownSender));
+  assert_eq!(router.pending(source),Ok(1));
+  assert_eq!(router.pending(dest),Ok(0));
+ }
+}

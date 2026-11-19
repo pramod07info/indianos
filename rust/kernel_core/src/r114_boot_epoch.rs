@@ -2037,6 +2037,11 @@ impl BootLaunchGate{
     if let Err(err)=mapper.stage_guarded_stack(stack_top,stack_pages){
      mapper.abort();return Err(err);
     }
+    // Admission is one-shot. Recheck authenticated platform authority
+    // AFTER staging but BEFORE making its page tables executable.
+    if let Err(err)=revalidate_pid1_platform_at_publish(platform,receipt){
+     mapper.abort();return Err(err);
+    }
     if let Err(err)=mapper.publish_entry(entry){
      mapper.abort();return Err(err);
     }
@@ -2147,5 +2152,132 @@ mod kernel_p0_batch12_w6_staged_pid1_mapper_tests{
    Err(Error::Invalid));
   assert_eq!((mapper.loads,mapper.publishes,mapper.aborts),(0,0,0));
   assert_eq!(gate.last_admitted_epoch(),4);
+ }
+}
+
+
+
+/// P0-276..280: final hardware authority observation immediately before
+/// publishing the staged PID1 entry. This cannot reread the journal while
+/// its mutable media reference is held by the outer one-shot launcher:
+/// the boot coordinator MUST pin the disk and serialize the handoff.
+/// Re-observing authenticated firmware floor, signed slot and measurement
+/// still prevents a staging-time authority switch from going unnoticed.
+pub fn revalidate_pid1_platform_at_publish<P:AuthenticatedSecureUefi>(
+ platform:&P,original:VerifiedPid1Admission
+)->Result<(),Error>{
+ platform.require_firmware_secure_boot_chain()?;
+ let floor=platform.read_sealed_floor()?;
+ let (selected,slot)=platform.read_bootloader_selected_slot()?;
+ let measurement=platform.read_verified()?;
+ if measurement!=original.epoch.boot_measurement||
+    floor.expected_measurement!=measurement||
+    floor.expected_slot as usize!=original.selected||
+    selected!=original.selected||
+    slot.version!=original.epoch.slot_version||
+    !slot.valid_metadata||!slot.committed||slot.attempts_remaining==0||
+    floor.minimum_epoch>original.epoch.epoch||
+    floor.minimum_journal_generation>original.epoch.journal_generation||
+    floor.minimum_slot_version>original.epoch.slot_version{
+  return Err(Error::Stale);
+ }
+ Ok(())
+}
+#[cfg(test)]
+mod kernel_p0_batch13_w6_handoff_recheck_tests{
+ use super::*;
+ use core::cell::Cell;
+ struct Platform{
+  changed:Cell<bool>,
+  mode:u8,
+ }
+ impl TrustedBootMeasurement for Platform{
+  fn read_verified(&self)->Result<[u8;32],Error>{
+   if self.changed.get()&&self.mode==2{Ok([9;32])}
+   else{Ok([3;32])}
+  }
+ }
+ impl AuthenticatedPid1Platform for Platform{
+  fn read_sealed_floor(&self)->Result<SealedBootFloor,Error>{
+   Ok(SealedBootFloor{
+    minimum_epoch:if self.changed.get()&&self.mode==1{5}else{4},
+    minimum_journal_generation:20,
+    expected_slot:0,minimum_slot_version:9,
+    expected_measurement:[3;32],
+   })
+  }
+  fn read_bootloader_selected_slot(&self)->Result<(usize,Slot),Error>{
+   Ok((0,tests::slot()))
+  }
+ }
+ impl AuthenticatedSecureUefi for Platform{
+  fn require_firmware_secure_boot_chain(&self)->Result<(),Error>{
+   if self.changed.get()&&self.mode==3{Err(Error::Untrusted)}
+   else{Ok(())}
+  }
+ }
+ struct Mapper<'a>{
+  changed:&'a Cell<bool>,published:usize,aborted:usize,
+ }
+ impl Pid1StagedMapper for Mapper<'_>{
+  fn stage_load(&mut self,_:u64,_:&[u8],_:u64,_:u32)
+   ->Result<(),Error>{
+   self.changed.set(true);Ok(())
+  }
+  fn stage_guarded_stack(&mut self,_:u64,_:usize)->Result<(),Error>{
+   Ok(())
+  }
+  fn publish_entry(&mut self,_:u64)->Result<(),Error>{
+   self.published+=1;Ok(())
+  }
+  fn abort(&mut self){self.aborted+=1;}
+ }
+ fn executable()->[u8;256]{
+  let mut image=[0u8;256];image[..4].copy_from_slice(b"\x7fELF");
+  image[4]=2;image[5]=1;image[6]=1;
+  image[16..18].copy_from_slice(&2u16.to_le_bytes());
+  image[18..20].copy_from_slice(&62u16.to_le_bytes());
+  image[20..24].copy_from_slice(&1u32.to_le_bytes());
+  image[24..32].copy_from_slice(&0x400000u64.to_le_bytes());
+  image[32..40].copy_from_slice(&64u64.to_le_bytes());
+  image[52..54].copy_from_slice(&64u16.to_le_bytes());
+  image[54..56].copy_from_slice(&56u16.to_le_bytes());
+  image[56..58].copy_from_slice(&1u16.to_le_bytes());
+  image[64..68].copy_from_slice(&1u32.to_le_bytes());
+  image[68..72].copy_from_slice(&5u32.to_le_bytes());
+  image[72..80].copy_from_slice(&128u64.to_le_bytes());
+  image[80..88].copy_from_slice(&0x400000u64.to_le_bytes());
+  image[96..104].copy_from_slice(&4u64.to_le_bytes());
+  image[104..112].copy_from_slice(&4096u64.to_le_bytes());
+  image[112..120].copy_from_slice(&1u64.to_le_bytes());
+  image[128..132].copy_from_slice(&[0x90,0x90,0x90,0xc3]);
+  image
+ }
+ #[test]fn staging_time_firmware_measurement_or_floor_changes_abort(){
+  for mode in [1u8,2,3]{
+   let platform=Platform{changed:Cell::new(false),mode};
+   let mut mapper=Mapper{changed:&platform.changed,published:0,aborted:0};
+   let image=executable();let hash=crate::m2_sha256::digest(&image);
+   let mut disk=tests::fixture();let mut gate=BootLaunchGate::new();
+   assert!(gate.launch_secure_uefi_staged_pid1(
+    &mut disk,&platform,hash,&image,0x800000,8,&mut mapper).is_err());
+   assert_eq!(mapper.published,0);
+   assert_eq!(mapper.aborted,1);
+   assert_eq!(gate.last_admitted_epoch(),4);
+   // Restoring the trusted platform must not permit reusing a consumed epoch.
+   platform.changed.set(false);
+   assert_eq!(gate.launch_secure_uefi_staged_pid1(
+    &mut disk,&platform,hash,&image,0x800000,8,&mut mapper),
+    Err(Error::Stale));
+   assert_eq!(mapper.aborted,1);
+  }
+ }
+ #[test]fn no_staging_change_permits_positive_recheck(){
+  let platform=Platform{changed:Cell::new(false),mode:0};
+  let mut disk=tests::fixture();
+  let admission=authorize_secure_uefi_pid1(&mut disk,&platform).unwrap();
+  assert_eq!(revalidate_pid1_platform_at_publish(&platform,admission),Ok(()));
+  platform.changed.set(true);
+  assert_eq!(revalidate_pid1_platform_at_publish(&platform,admission),Ok(()));
  }
 }

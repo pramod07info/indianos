@@ -2130,7 +2130,9 @@ impl<D:BlockDevice> StableReadOnlyWindow<'_,D>{
    return Err(BlockError::OutOfRange);
   }
   if self.invalidated{return Err(BlockError::Io);}
-  if media_revision()!=expected_revision{return Err(BlockError::Io);}
+  if media_revision()!=expected_revision{
+   self.invalidated=true;return Err(BlockError::Io);
+  }
   let lengths=outputs.each_ref().map(|out|out.len());
   let mut one=[[0u8;MAX_FIELD];3];
   let mut two=[[0u8;MAX_FIELD];3];
@@ -2217,5 +2219,111 @@ mod kernel_p0_batch12_w4_revision_pinned_storage_tests{
    [&mut a,&mut b,&mut c]),Err(BlockError::Io));
   assert_eq!(a,[9;4]);assert_eq!(b,[9;4]);assert_eq!(c,[9;4]);
   assert!(view.is_retired());
+ }
+}
+
+
+
+/// P0-266..270: exact media revision and authenticated metadata identity
+/// give a bounded diagnostic receipt for a complete stable triple. The
+/// fingerprint is SHA-256 of the expected domain-bound digests and geometry;
+/// it is NOT a signature or hardware durability attestation.
+#[derive(Clone,Copy,Debug,Eq,PartialEq)]
+pub struct StableMetadataReceipt{
+ pub media_revision:u64,
+ pub fingerprint:[u8;32],
+}
+pub fn metadata_snapshot_fingerprint(
+ partition_start:u64,partition_sectors:u64,
+ positions:[(u64,usize);3],digests:[[u8;32];3],
+ media_revision:u64
+)->Result<StableMetadataReceipt,BlockError>{
+ if media_revision==0||partition_sectors==0||
+    partition_start.checked_add(partition_sectors).is_none()||
+    digests.iter().any(|d|*d==[0;32]){
+  return Err(BlockError::OutOfRange);
+ }
+ let mut transcript=[0u8;176];
+ transcript[0..8].copy_from_slice(b"P0MDv013");
+ transcript[8..16].copy_from_slice(&partition_start.to_le_bytes());
+ transcript[16..24].copy_from_slice(&partition_sectors.to_le_bytes());
+ transcript[24..32].copy_from_slice(&media_revision.to_le_bytes());
+ for i in 0..3{
+  if positions[i].0>=partition_sectors||positions[i].1>=SECTOR_BYTES{
+   return Err(BlockError::OutOfRange);
+  }
+  let at=32+i*48;
+  transcript[at..at+8].copy_from_slice(&positions[i].0.to_le_bytes());
+  transcript[at+8..at+16].copy_from_slice(&(positions[i].1 as u64).to_le_bytes());
+  transcript[at+16..at+48].copy_from_slice(&digests[i]);
+ }
+ Ok(StableMetadataReceipt{
+  media_revision,
+  fingerprint:crate::m2_sha256::digest(&transcript),
+ })
+}
+impl<D:BlockDevice> StableReadOnlyWindow<'_,D>{
+ pub fn read_revision_receipted_metadata_triple(
+  &mut self,start:u64,count:u64,positions:[(u64,usize);3],
+  digests:[[u8;32];3],expected_revision:u64,
+  media_revision:impl FnMut()->u64,outputs:[&mut[u8];3]
+ )->Result<StableMetadataReceipt,BlockError>{
+  let receipt=metadata_snapshot_fingerprint(
+   start,count,positions,digests,expected_revision)?;
+  self.read_revision_pinned_metadata_triple(
+   start,count,positions,digests,expected_revision,media_revision,outputs)?;
+  Ok(receipt)
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch13_w4_stable_metadata_receipt_tests{
+ use super::*;
+ struct Disk{reads:usize}
+ impl BlockDevice for Disk{
+  fn sector_count(&self)->u64{9}
+  fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{
+   self.reads+=1;out.fill(lba as u8);Ok(())
+  }
+  fn write_sector(&mut self,_:u64,_:&[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{Err(BlockError::ReadOnly)}
+ }
+ fn positions()->[(u64,usize);3]{[(0,0),(1,0),(2,0)]}
+ fn digests()->[[u8;32];3]{
+  [0u64,1,2].map(|lba|domain_bound_metadata_sha256(
+   2,4,lba,0,&[(lba+2) as u8;4]).unwrap())
+ }
+ #[test]fn stable_signed_triple_emits_exact_domain_and_revision_receipt(){
+  let mut d=Disk{reads:0};
+  let mut view=StableReadOnlyWindow::new(&mut d).unwrap();
+  let mut a=[9;4];let mut b=[9;4];let mut c=[9;4];
+  let receipt=view.read_revision_receipted_metadata_triple(
+   2,4,positions(),digests(),88,||88,[&mut a,&mut b,&mut c]).unwrap();
+  assert_eq!(a,[2;4]);assert_eq!(b,[3;4]);assert_eq!(c,[4;4]);
+  assert_eq!(receipt,metadata_snapshot_fingerprint(
+   2,4,positions(),digests(),88).unwrap());
+  assert_ne!(receipt,metadata_snapshot_fingerprint(
+   2,4,positions(),digests(),89).unwrap());
+  assert_ne!(receipt,metadata_snapshot_fingerprint(
+   2,4,[(1,0),(0,0),(2,0)],digests(),88).unwrap());
+ }
+ #[test]fn changed_revision_before_io_retires_view_without_output(){
+  let mut d=Disk{reads:0};
+  let mut view=StableReadOnlyWindow::new(&mut d).unwrap();
+  let mut a=[9;4];let mut b=[9;4];let mut c=[9;4];
+  assert_eq!(view.read_revision_receipted_metadata_triple(
+   2,4,positions(),digests(),88,||89,[&mut a,&mut b,&mut c]),
+   Err(BlockError::Io));
+  assert!(view.is_retired());assert_eq!(view.device.reads,0);
+  assert_eq!(a,[9;4]);assert_eq!(b,[9;4]);assert_eq!(c,[9;4]);
+ }
+ #[test]fn invalid_geometry_has_no_device_access(){
+  let mut d=Disk{reads:0};
+  let mut view=StableReadOnlyWindow::new(&mut d).unwrap();
+  let mut a=[9;4];let mut b=[9;4];let mut c=[9;4];
+  assert_eq!(view.read_revision_receipted_metadata_triple(
+   2,4,[(0,0),(4,0),(2,0)],digests(),88,||88,
+   [&mut a,&mut b,&mut c]),Err(BlockError::OutOfRange));
+  assert_eq!(view.device.reads,0);
  }
 }

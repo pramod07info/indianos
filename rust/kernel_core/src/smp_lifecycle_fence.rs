@@ -1226,3 +1226,79 @@ mod kernel_p0_batch12_w1_bound_tlb_tests{
   assert_eq!(invalidated,1);
  }
 }
+
+
+
+/// P0-251..255: caller-provided local per-page TLB invalidator. AP cleanup
+/// must cover EVERY page in the exact range before the lifecycle receipt is
+/// acknowledged. The concrete x86 INVLPG implementation remains a hardware
+/// integration requirement; mock callbacks cannot substitute for it.
+pub trait LocalUserTlbInvalidator{
+ fn invalidate_page(&mut self,page:u64)->Result<(),FenceError>;
+}
+pub fn acknowledge_all_tlb_pages<I:LocalUserTlbInvalidator>(
+ fence:&LifecycleFence,ap:u32,previous_sequence:u64,
+ receipt:Receipt,range:TlbShootdownRange,driver:&mut I
+)->Result<(),FenceError>{
+ acknowledge_exact_tlb_range(fence,ap,previous_sequence,receipt,range,|request|{
+  for i in 0..request.pages{
+   let address=request.first_page+(i as u64)*4096;
+   driver.invalidate_page(address)?;
+  }
+  Ok(())
+ })
+}
+#[cfg(test)]
+mod kernel_p0_batch13_w1_page_ack_tests{
+ use super::*;
+ struct Flush{addresses:[u64;8],calls:usize,fail_at:usize}
+ impl LocalUserTlbInvalidator for Flush{
+  fn invalidate_page(&mut self,at:u64)->Result<(),FenceError>{
+   if self.calls>=self.addresses.len(){return Err(FenceError::NoProgress);}
+   self.addresses[self.calls]=at;self.calls+=1;
+   if self.calls==self.fail_at{Err(FenceError::IncompleteLocalWork)}
+   else{Ok(())}
+  }
+ }
+ fn request()->TlbShootdownRange{
+  TlbShootdownRange{first_page:0x3000,pages:3,epoch:31}
+ }
+ #[test]fn all_pages_flush_before_single_exact_ap_ack(){
+  let f=LifecycleFence::new(0,2);
+  let receipt=f.publish(0,31).unwrap();
+  let mut flush=Flush{addresses:[0;8],calls:0,fail_at:0};
+  assert_eq!(acknowledge_all_tlb_pages(&f,2,0,receipt,request(),&mut flush),Ok(()));
+  assert_eq!(flush.calls,3);
+  assert_eq!(&flush.addresses[..3],&[0x3000,0x4000,0x5000]);
+  assert_eq!(f.require_ack_for_reclaim(0,receipt),Ok(()));
+  assert_eq!(acknowledge_all_tlb_pages(&f,2,0,receipt,request(),&mut flush),
+   Err(FenceError::StaleReceipt));
+  assert_eq!(flush.calls,3);
+ }
+ #[test]fn failed_partial_flush_retains_pending_receipt(){
+  let f=LifecycleFence::new(0,2);
+  let receipt=f.publish(0,31).unwrap();
+  let mut flush=Flush{addresses:[0;8],calls:0,fail_at:2};
+  assert_eq!(acknowledge_all_tlb_pages(&f,2,0,receipt,request(),&mut flush),
+   Err(FenceError::IncompleteLocalWork));
+  assert_eq!(flush.calls,2);
+  assert_eq!(f.require_ack_for_reclaim(0,receipt),Err(FenceError::NoProgress));
+  flush.fail_at=0;flush.calls=0;
+  assert_eq!(acknowledge_all_tlb_pages(&f,2,0,receipt,request(),&mut flush),Ok(()));
+  assert_eq!(flush.calls,3);
+ }
+ #[test]fn wrong_cpu_epoch_and_zero_page_never_touch_driver(){
+  let f=LifecycleFence::new(0,2);
+  let receipt=f.publish(0,31).unwrap();
+  let mut flush=Flush{addresses:[0;8],calls:0,fail_at:0};
+  assert_eq!(acknowledge_all_tlb_pages(&f,3,0,receipt,request(),&mut flush),
+   Err(FenceError::InvalidCpu));
+  assert_eq!(acknowledge_all_tlb_pages(&f,2,0,receipt,
+   TlbShootdownRange{epoch:32,..request()},&mut flush),
+   Err(FenceError::StaleReceipt));
+  assert_eq!(acknowledge_all_tlb_pages(&f,2,0,receipt,
+   TlbShootdownRange{pages:0,..request()},&mut flush),
+   Err(FenceError::InvalidGeneration));
+  assert_eq!(flush.calls,0);
+ }
+}

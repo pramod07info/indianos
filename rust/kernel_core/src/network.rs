@@ -89,13 +89,24 @@ fn arp_request(out:&mut [u8],local_mac:[u8;6])->usize{
     out[38..42].copy_from_slice(&PEER_IP);
     42
 }
+/// P0-271..275: harden the ACTUAL polled virtio-net ARP handshake,
+/// not just a separately tested policy parser. An unsupported VLAN or
+/// unexpected trailing nonzero bytes cannot certify a gateway neighbor.
+/// The driver may report the unpadded 42-byte frame or a padded >=60-byte
+/// Ethernet frame (up to 64 bytes). Larger payloads are rejected.
 fn valid_arp(frame:&[u8],mac:[u8;6])->bool{
-    frame.len()>=42 && frame[..6]==mac && frame[6..12]==PEER_MAC &&
+    if frame.len()!=42 && !(60..=64).contains(&frame.len()) {
+        return false;
+    }
+    // The polled QEMU NIC is currently configured for untagged ingress.
+    // Do not silently treat an arbitrary VLAN as this trusted LAN.
+    frame[..6]==mac && frame[6..12]==PEER_MAC &&
     be16(&frame[12..14])==0x0806 &&
     be16(&frame[14..16])==1 && be16(&frame[16..18])==0x800 &&
     frame[18]==6 && frame[19]==4 && be16(&frame[20..22])==2 &&
     frame[22..28]==PEER_MAC && frame[28..32]==PEER_IP &&
-    frame[32..38]==mac && frame[38..42]==LOCAL_IP
+    frame[32..38]==mac && frame[38..42]==LOCAL_IP &&
+    frame[42..].iter().all(|&byte|byte==0)
 }
 fn icmp_request(out:&mut [u8],mac:[u8;6])->usize{
     ethernet_header(out,PEER_MAC,mac,0x0800);
@@ -3222,4 +3233,49 @@ mod r122_pre_poll_nic_permit_tests{
         assert_eq!(nic.drained(r),Ok(true));
         assert_eq!(nic.finish_rebind(r),Ok(2));
     }
+}
+
+
+
+#[cfg(test)]
+mod kernel_p0_batch13_w5_live_arp_handshake_tests{
+ use super::*;
+ const LOCAL_MAC:[u8;6]=[2,8,9,10,11,12];
+ fn packet()->[u8;60]{
+  let mut frame=[0u8;60];
+  frame[..6].copy_from_slice(&LOCAL_MAC);
+  frame[6..12].copy_from_slice(&PEER_MAC);
+  frame[12..14].copy_from_slice(&[8,6]);
+  frame[14..16].copy_from_slice(&[0,1]);
+  frame[16..18].copy_from_slice(&[8,0]);
+  frame[18]=6;frame[19]=4;
+  frame[20..22].copy_from_slice(&[0,2]);
+  frame[22..28].copy_from_slice(&PEER_MAC);
+  frame[28..32].copy_from_slice(&PEER_IP);
+  frame[32..38].copy_from_slice(&LOCAL_MAC);
+  frame[38..42].copy_from_slice(&LOCAL_IP);
+  frame
+ }
+ #[test]fn accepts_exact_unpadded_or_zero_padded_gateway_reply(){
+  let reply=packet();
+  assert!(valid_arp(&reply,LOCAL_MAC));
+  assert!(valid_arp(&reply[..42],LOCAL_MAC));
+  assert!(!valid_arp(&reply[..50],LOCAL_MAC));
+ }
+ #[test]fn malicious_trailing_payload_is_not_ignored_by_live_gateway_handshake(){
+  let mut reply=packet();reply[54]=7;
+  assert!(!valid_arp(&reply,LOCAL_MAC));
+  let mut extra=[0u8;65];extra[..60].copy_from_slice(&packet());
+  assert!(!valid_arp(&extra,LOCAL_MAC));
+ }
+ #[test]fn foreign_vlan_or_mac_or_arp_target_never_resolves_peer(){
+  let mut reply=packet();reply[12..14].copy_from_slice(&[0x81,0]);
+  assert!(!valid_arp(&reply,LOCAL_MAC));
+  let mut reply=packet();reply[6]^=0x04;
+  assert!(!valid_arp(&reply,LOCAL_MAC));
+  let mut reply=packet();reply[41]^=1;
+  assert!(!valid_arp(&reply,LOCAL_MAC));
+  let mut reply=packet();reply[20..22].copy_from_slice(&[0,1]);
+  assert!(!valid_arp(&reply,LOCAL_MAC));
+ }
 }
