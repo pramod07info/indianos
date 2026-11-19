@@ -1839,3 +1839,86 @@ mod kernel_p0_batch13_w3_atomic_cross_mailbox_relay_tests{
   assert_eq!(router.pending(dest),Ok(0));
  }
 }
+
+
+/// P0-288..291: a service forwards exactly pinned FIFO heads from distinct
+/// mailboxes, preserving the original origin check at every hop. The trusted
+/// relay is the new visible sender. Entire dequeue + enqueue rolls back on
+/// stale origin, late destination capacity or aggregate byte-budget failure.
+/// Must be called under the kernel's exclusive IPC ownership lock.
+impl<const M:usize,const D:usize> ScopedRouter<M,D>{
+ pub fn relay_pinned_heads_atomic(
+  &mut self,relay:Identity,
+  hops:&[(Identity,Identity,Identity)],max_bytes:usize
+ )->Result<usize,IpcError>{
+  if hops.is_empty()||hops.len()>M||max_bytes==0||
+     max_bytes>M.saturating_mul(MAX_PAYLOAD){
+   return Err(IpcError::InvalidConfiguration);
+  }
+  if !self.boxes.iter().flatten().any(|b|b.owner==relay){
+   return Err(IpcError::UnknownSender);
+  }
+  for (i,&(source,origin,destination)) in hops.iter().enumerate(){
+   if source.pid==0||origin.pid==0||destination.pid==0||
+      source.generation==0||origin.generation==0||destination.generation==0{
+    return Err(IpcError::InvalidPid);
+   }
+   if hops[..i].iter().any(|&(prior,_,_)|prior.pid==source.pid){
+    return Err(IpcError::DuplicateReceiver);
+   }
+   if !self.boxes.iter().flatten().any(|b|b.owner==origin){
+    return Err(IpcError::UnknownSender);
+   }
+  }
+  let mut staged=self.clone();
+  let mut total=0usize;
+  for &(source,origin,destination) in hops{
+   let message=staged.receive(source)?;
+   if message.sender()!=origin{return Err(IpcError::UnknownSender);}
+   total=total.checked_add(message.payload().len())
+     .ok_or(IpcError::PayloadTooLarge)?;
+   if total>max_bytes{return Err(IpcError::PayloadTooLarge);}
+   staged.send(relay,destination,message.payload())?;
+  }
+  *self=staged;
+  Ok(hops.len())
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch14_w3_pinned_head_tests{
+ use super::*;
+ fn id(pid:u32)->Identity{Identity{pid,generation:1}}
+ #[test]fn two_mailbox_hops_retain_origin_check_and_fifo_order(){
+  let mut r=ScopedRouter::<5,3>::new().unwrap();
+  for pid in 1..=5{r.register(id(pid)).unwrap();}
+  r.send(id(2),id(4),b"first").unwrap();
+  r.send(id(3),id(5),b"second").unwrap();
+  assert_eq!(r.relay_pinned_heads_atomic(id(1),
+   &[(id(4),id(2),id(1)),(id(5),id(3),id(1))],11),Ok(2));
+  assert_eq!(r.pending(id(4)),Ok(0));assert_eq!(r.pending(id(5)),Ok(0));
+  let a=r.receive(id(1)).unwrap();let b=r.receive(id(1)).unwrap();
+  assert_eq!(a.sender(),id(1));
+  assert_eq!(a.payload(),b"first");
+  assert_eq!(b.payload(),b"second");
+ }
+ #[test]fn invalid_late_head_or_capacity_restores_all_queues(){
+  let mut r=ScopedRouter::<5,2>::new().unwrap();
+  for pid in 1..=5{r.register(id(pid)).unwrap();}
+  r.send(id(2),id(4),b"abc").unwrap();
+  r.send(id(3),id(5),b"def").unwrap();
+  assert_eq!(r.relay_pinned_heads_atomic(id(1),
+   &[(id(4),id(2),id(1)),(id(5),id(2),id(1))],10),
+   Err(IpcError::UnknownSender));
+  assert_eq!(r.pending(id(4)),Ok(1));assert_eq!(r.pending(id(5)),Ok(1));
+  assert_eq!(r.relay_pinned_heads_atomic(id(1),
+   &[(id(4),id(2),id(1)),(id(5),id(3),id(1))],5),
+   Err(IpcError::PayloadTooLarge));
+  assert_eq!(r.pending(id(4)),Ok(1));assert_eq!(r.pending(id(5)),Ok(1));
+  r.send(id(2),id(1),b"old").unwrap();
+  assert_eq!(r.relay_pinned_heads_atomic(id(1),
+   &[(id(4),id(2),id(1)),(id(5),id(3),id(1))],6),
+   Err(IpcError::Full));
+  assert_eq!(r.pending(id(1)),Ok(1));
+  assert_eq!(r.pending(id(4)),Ok(1));assert_eq!(r.pending(id(5)),Ok(1));
+ }
+}

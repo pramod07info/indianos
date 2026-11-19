@@ -1302,3 +1302,63 @@ mod kernel_p0_batch13_w1_page_ack_tests{
   assert_eq!(flush.calls,0);
  }
 }
+
+
+/// P0-281..284: turn an unaligned user byte span into one canonical,
+/// overflow-checked page shootdown contract. No receipt may be acknowledged
+/// for a different byte span, even if its epoch is identical.
+pub fn tlb_range_for_bytes(start:u64,length:u64,epoch:u64)
+ ->Result<TlbShootdownRange,FenceError>{
+ if length==0||start<4096{return Err(FenceError::InvalidGeneration);}
+ let end=start.checked_add(length).ok_or(FenceError::InvalidGeneration)?;
+ let first=start & !4095u64;
+ let rounded=end.checked_add(4095).ok_or(FenceError::InvalidGeneration)? & !4095u64;
+ let bytes=rounded.checked_sub(first).ok_or(FenceError::InvalidGeneration)?;
+ let pages=u32::try_from(bytes/4096).map_err(|_|FenceError::InvalidGeneration)?;
+ let span=TlbShootdownRange{first_page:first,pages,epoch};
+ span.validate()?;
+ Ok(span)
+}
+pub fn acknowledge_tlb_byte_span<I:LocalUserTlbInvalidator>(
+ fence:&LifecycleFence,ap:u32,previous_sequence:u64,receipt:Receipt,
+ first_byte:u64,length:u64,pinned:TlbShootdownRange,invalidator:&mut I
+)->Result<(),FenceError>{
+ let actual=tlb_range_for_bytes(first_byte,length,receipt.generation)?;
+ if actual!=pinned{return Err(FenceError::StaleReceipt);}
+ acknowledge_all_tlb_pages(fence,ap,previous_sequence,receipt,pinned,invalidator)
+}
+#[cfg(test)]
+mod kernel_p0_batch14_w1_byte_span_tests{
+ use super::*;
+ struct Sink{pages:[u64;4],count:usize}
+ impl LocalUserTlbInvalidator for Sink{
+  fn invalidate_page(&mut self,page:u64)->Result<(),FenceError>{
+   self.pages[self.count]=page;self.count+=1;Ok(())
+  }
+ }
+ #[test]fn unaligned_byte_span_covers_each_exact_page_once(){
+  let span=tlb_range_for_bytes(0x3ffe,4,71).unwrap();
+  assert_eq!((span.first_page,span.pages),(0x3000,2));
+  let fence=LifecycleFence::new(0,3);
+  let receipt=fence.publish(0,71).unwrap();
+  let mut sink=Sink{pages:[0;4],count:0};
+  assert_eq!(acknowledge_tlb_byte_span(&fence,3,0,receipt,0x3ffe,4,
+    span,&mut sink),Ok(()));
+  assert_eq!(&sink.pages[..sink.count],&[0x3000,0x4000]);
+  assert_eq!(fence.require_ack_for_reclaim(0,receipt),Ok(()));
+ }
+ #[test]fn changed_extent_and_invalid_ranges_never_invalidate(){
+  for (start,len) in [(0,1),(4096,0),(u64::MAX-2,8),
+   (0x0000_7fff_ffff_f000,8192),(4096,4096*4097)]{
+   assert_eq!(tlb_range_for_bytes(start,len,71),Err(FenceError::InvalidGeneration));
+  }
+  let span=tlb_range_for_bytes(0x5001,1,71).unwrap();
+  let fence=LifecycleFence::new(0,3);
+  let receipt=fence.publish(0,71).unwrap();
+  let mut sink=Sink{pages:[0;4],count:0};
+  assert_eq!(acknowledge_tlb_byte_span(&fence,3,0,receipt,
+    0x5001,4097,span,&mut sink),Err(FenceError::StaleReceipt));
+  assert_eq!(sink.count,0);
+  assert_eq!(fence.require_ack_for_reclaim(0,receipt),Err(FenceError::NoProgress));
+ }
+}

@@ -2327,3 +2327,86 @@ mod kernel_p0_batch13_w4_stable_metadata_receipt_tests{
   assert_eq!(view.device.reads,0);
  }
 }
+
+
+/// P0-292..294: a revision-pinned, byte-identical redundant sector read.
+/// Neither unverified media copy nor a stale receipt can reach caller memory.
+/// Unlike a signed-file verifier this only checks two independent LBAs against
+/// one another; a trusted manifest must authenticate the resulting digest.
+#[derive(Clone,Copy,Debug,Eq,PartialEq)]
+pub struct MirroredSectorReceipt{
+ pub revision:u64,pub primary_lba:u64,pub secondary_lba:u64,
+ pub digest:[u8;32],
+}
+impl<D:BlockDevice> StableReadOnlyWindow<'_,D>{
+ pub fn read_mirrored_sector_at_revision(
+  &mut self,primary:u64,secondary:u64,expected_revision:u64,
+  mut observe_revision:impl FnMut()->u64,out:&mut[u8;SECTOR_BYTES]
+ )->Result<MirroredSectorReceipt,BlockError>{
+  if self.invalidated{return Err(BlockError::Io);}
+  if primary==secondary||expected_revision==0||
+     check_range(self.capacity,primary,1).is_err()||
+     check_range(self.capacity,secondary,1).is_err(){
+   return Err(BlockError::OutOfRange);
+  }
+  if observe_revision()!=expected_revision{
+   self.invalidated=true;return Err(BlockError::Io);
+  }
+  let mut first=[0u8;SECTOR_BYTES];
+  let mut second=[0u8;SECTOR_BYTES];
+  self.read_sector(primary,&mut first)?;
+  if observe_revision()!=expected_revision{
+   self.invalidated=true;return Err(BlockError::Io);
+  }
+  self.read_sector(secondary,&mut second)?;
+  if observe_revision()!=expected_revision||first!=second{
+   self.invalidated=true;return Err(BlockError::Io);
+  }
+  let receipt=MirroredSectorReceipt{revision:expected_revision,
+   primary_lba:primary,secondary_lba:secondary,
+   digest:crate::m2_sha256::digest(&first)};
+  out.copy_from_slice(&first);
+  Ok(receipt)
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch14_w4_mirrored_sector_tests{
+ use super::*;
+ struct Disk{reads:usize,changing:bool}
+ impl BlockDevice for Disk{
+  fn sector_count(&self)->u64{8}
+  fn read_sector(&mut self,_lba:u64,out:&mut[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{
+   self.reads+=1;out.fill(if self.changing&&self.reads>=3{7}else{2});
+   Ok(())
+  }
+  fn write_sector(&mut self,_:u64,_:&[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{Err(BlockError::ReadOnly)}
+ }
+ #[test]fn identical_mirrors_publish_one_authenticated_snapshot_candidate(){
+  let mut disk=Disk{reads:0,changing:false};
+  let mut view=StableReadOnlyWindow::new(&mut disk).unwrap();
+  let mut out=[0;SECTOR_BYTES];
+  let receipt=view.read_mirrored_sector_at_revision(1,5,19,||19,&mut out)
+   .unwrap();
+  assert_eq!(out,[2;SECTOR_BYTES]);assert_eq!(receipt.revision,19);
+  assert_eq!(receipt.primary_lba,1);assert_eq!(receipt.secondary_lba,5);
+  assert_eq!(receipt.digest,crate::m2_sha256::digest(&out));
+  assert_eq!(view.device.reads,4);
+ }
+ #[test]fn modified_copy_or_revision_retires_without_partial_output(){
+  let mut disk=Disk{reads:0,changing:true};
+  let mut view=StableReadOnlyWindow::new(&mut disk).unwrap();
+  let mut out=[9;SECTOR_BYTES];
+  assert_eq!(view.read_mirrored_sector_at_revision(1,5,19,||19,&mut out),
+   Err(BlockError::Io));
+  assert!(view.is_retired());assert_eq!(out,[9;SECTOR_BYTES]);
+  assert_eq!(view.read_mirrored_sector_at_revision(1,5,19,||19,&mut out),
+   Err(BlockError::Io));
+  let mut disk=Disk{reads:0,changing:false};
+  let mut view=StableReadOnlyWindow::new(&mut disk).unwrap();
+  assert_eq!(view.read_mirrored_sector_at_revision(1,5,19,||20,&mut out),
+   Err(BlockError::Io));
+  assert_eq!(view.device.reads,0);assert!(view.is_retired());
+ }
+}

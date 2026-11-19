@@ -2217,3 +2217,59 @@ mod kernel_p0_batch10_w2_live_exit_tests{
   assert_eq!(ipc.pending(owner(2,8)),Err(crate::ipc::IpcError::UnknownReceiver));
  }
 }
+
+
+/// P0-285..287: a supervisor may acknowledge an exact ordered prefix of
+/// event receipts atomically. A stale, duplicated or out-of-order receipt
+/// cannot partially drain the lifecycle FIFO. Caller owns the event lock.
+impl<const C:usize> ProcessEvents<C>{
+ pub fn acknowledge_exact_prefix(&mut self,receipts:&[EventReceipt])
+  ->Result<usize,EventError>{
+  if receipts.is_empty()||receipts.len()>self.count{
+   return Err(EventError::Empty);
+  }
+  let mut staged=self.clone();
+  for &receipt in receipts{
+   if receipt.sequence==0||staged.peek_receipt()!=Some(receipt){
+    return Err(EventError::Empty);
+   }
+   staged.dequeue()?;
+  }
+  *self=staged;
+  Ok(receipts.len())
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch14_w2_atomic_event_ack_tests{
+ use super::*;
+ fn event(pid:u32)->ProcessEvent{
+  ProcessEvent{pid,kind:EventKind::Exited,value:1}
+ }
+ #[test]fn exact_receipt_prefix_is_single_use_and_fifo(){
+  let mut q=ProcessEvents::<3>::new();
+  q.enqueue(event(2)).unwrap();q.enqueue(event(2)).unwrap();
+  q.enqueue(event(3)).unwrap();
+  let mut receipts=[EventReceipt{sequence:0,event:event(1)};3];
+  assert_eq!(q.snapshot_receipts(&mut receipts),Ok(3));
+  assert_ne!(receipts[0].sequence,receipts[1].sequence);
+  assert_eq!(q.acknowledge_exact_prefix(&receipts[..2]),Ok(2));
+  assert_eq!(q.peek_receipt(),Some(receipts[2]));
+  assert_eq!(q.acknowledge_exact_prefix(&receipts[..1]),Err(EventError::Empty));
+  assert_eq!(q.acknowledge_exact_prefix(&receipts[2..3]),Ok(1));
+ }
+ #[test]fn later_stale_receipt_cannot_consume_valid_prefix(){
+  let mut q=ProcessEvents::<3>::new();
+  q.enqueue(event(2)).unwrap();q.enqueue(event(3)).unwrap();
+  let mut receipts=[EventReceipt{sequence:0,event:event(1)};2];
+  q.snapshot_receipts(&mut receipts).unwrap();
+  let mut bad=receipts;
+  bad[1].sequence+=10;
+  assert_eq!(q.acknowledge_exact_prefix(&bad),Err(EventError::Empty));
+  assert_eq!(q.len(),2);
+  assert_eq!(q.peek_receipt(),Some(receipts[0]));
+  assert_eq!(q.acknowledge_exact_prefix(&[receipts[0],receipts[0]]),
+   Err(EventError::Empty));
+  assert_eq!(q.len(),2);
+  assert_eq!(q.acknowledge_exact_prefix(&[]),Err(EventError::Empty));
+ }
+}

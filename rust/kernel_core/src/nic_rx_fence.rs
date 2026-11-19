@@ -1225,3 +1225,112 @@ mod kernel_p0_batch12_w5_padded_vlan_arp_tests{
    }),Err(RxFenceError::Stale));
  }
 }
+
+
+/// P0-295..297: independently verify the full Ethernet+IPv4+ICMP echo
+/// reply before allowing a decode result to escape a live NIC RX generation.
+/// Only a pinned unicast peer, exact echo identifier/sequence and valid
+/// Internet checksums may pass. Packet parsing has no neighbor-table effects.
+fn internet_checksum_valid(bytes:&[u8])->bool{
+ let mut sum=0u32;
+ for word in bytes.chunks(2){
+  let hi=word[0] as u32;
+  let lo=if word.len()==2{word[1] as u32}else{0};
+  sum+=hi*256+lo;
+ }
+ while sum>>16!=0{sum=(sum&0xffff)+(sum>>16);}
+ sum==0xffff
+}
+impl NicRxFence{
+ pub fn parse_authenticated_icmp_echo_reply<R>(
+  &self,device:u32,frame:&[u8],max_frame:usize,
+  peer_mac:[u8;6],local_mac:[u8;6],
+  peer_ip:[u8;4],local_ip:[u8;4],id:u16,sequence:u16,
+  parse:impl FnOnce()->Option<R>
+ )->Result<R,RxFenceError>{
+  if frame.len()<42||frame.len()>max_frame||max_frame>1518||
+     frame[..6]!=local_mac||frame[6..12]!=peer_mac||
+     peer_mac[0]&1!=0||local_mac[0]&1!=0||
+     peer_mac==local_mac||peer_ip==local_ip||
+     peer_ip[0]==0||local_ip[0]==0||
+     peer_ip[0]>=224||local_ip[0]>=224||
+     frame[12..14]!=[8,0]||frame[14]!=0x45||
+     frame[15]!=0||frame[22]==0||frame[23]!=1||
+     frame[26..30]!=peer_ip||frame[30..34]!=local_ip||
+     u16::from_be_bytes([frame[20],frame[21]])&0xbfff!=0||
+     !internet_checksum_valid(&frame[14..34]){
+   return Err(RxFenceError::Capacity);
+  }
+  let total=u16::from_be_bytes([frame[16],frame[17]]) as usize;
+  if total<28||total>1500{return Err(RxFenceError::Capacity);}
+  let end=14+total;
+  if end>frame.len()||frame[end..].iter().any(|&b|b!=0){
+   return Err(RxFenceError::Capacity);
+  }
+  let icmp=&frame[34..end];
+  if icmp[0]!=0||icmp[1]!=0||
+     icmp[4..6]!=id.to_be_bytes()||
+     icmp[6..8]!=sequence.to_be_bytes()||
+     !internet_checksum_valid(icmp){
+   return Err(RxFenceError::Capacity);
+  }
+  self.parse_packet_at_live_epoch(device,parse)
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch14_w5_icmp_epoch_tests{
+ use super::*;
+ const PEER:[u8;6]=[2,3,4,5,6,7];
+ const LOCAL:[u8;6]=[2,8,9,10,11,12];
+ const PEER_IP:[u8;4]=[10,0,0,1];
+ const LOCAL_IP:[u8;4]=[10,0,0,2];
+ fn set_checksum(bytes:&mut[u8],offset:usize){
+  bytes[offset]=0;bytes[offset+1]=0;
+  let mut sum=0u32;
+  for word in bytes.chunks(2){
+   sum+=(word[0] as u32)*256+
+    if word.len()==2{word[1] as u32}else{0};
+  }
+  while sum>>16!=0{sum=(sum&0xffff)+(sum>>16);}
+  let c=!(sum as u16);
+  bytes[offset..offset+2].copy_from_slice(&c.to_be_bytes());
+ }
+ fn packet()->[u8;60]{
+  let mut frame=[0u8;60];
+  frame[..6].copy_from_slice(&LOCAL);frame[6..12].copy_from_slice(&PEER);
+  frame[12..14].copy_from_slice(&[8,0]);
+  frame[14]=0x45;frame[16..18].copy_from_slice(&28u16.to_be_bytes());
+  frame[22]=64;frame[23]=1;
+  frame[26..30].copy_from_slice(&PEER_IP);
+  frame[30..34].copy_from_slice(&LOCAL_IP);
+  set_checksum(&mut frame[14..34],10);
+  frame[34]=0;frame[35]=0;
+  frame[38..40].copy_from_slice(&42u16.to_be_bytes());
+  frame[40..42].copy_from_slice(&7u16.to_be_bytes());
+  set_checksum(&mut frame[34..42],2);
+  frame
+ }
+ #[test]fn checksum_and_exact_echo_peer_accept_under_live_epoch(){
+  let f=NicRxFence::new(17);let p=packet();
+  assert_eq!(f.parse_authenticated_icmp_echo_reply(17,&p,64,
+   PEER,LOCAL,PEER_IP,LOCAL_IP,42,7,||Some(2)),Ok(2));
+  assert_eq!(f.parse_authenticated_icmp_echo_reply(17,&p,64,
+   PEER,LOCAL,PEER_IP,LOCAL_IP,42,7,||{
+    f.begin_quiesce(17).unwrap();Some(3)
+   }),Err(RxFenceError::Stale));
+ }
+ #[test]fn spoofed_checksum_payload_and_echo_sequence_do_not_enter_decoder(){
+  let f=NicRxFence::new(17);let mut p=packet();let mut calls=0;
+  for index in [6usize,26,36,40,59]{
+   let before=p[index];p[index]^=1;
+   assert_eq!(f.parse_authenticated_icmp_echo_reply(17,&p,64,
+     PEER,LOCAL,PEER_IP,LOCAL_IP,42,7,||{calls+=1;Some(1)}),
+     Err(RxFenceError::Capacity));
+   p[index]=before;
+  }
+  assert_eq!(f.parse_authenticated_icmp_echo_reply(17,&p,64,
+   PEER,LOCAL,PEER_IP,LOCAL_IP,42,8,||{calls+=1;Some(1)}),
+   Err(RxFenceError::Capacity));
+  assert_eq!(calls,0);
+ }
+}

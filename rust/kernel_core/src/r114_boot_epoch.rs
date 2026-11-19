@@ -2281,3 +2281,119 @@ mod kernel_p0_batch13_w6_handoff_recheck_tests{
   assert_eq!(revalidate_pid1_platform_at_publish(&platform,admission),Ok(()));
  }
 }
+
+
+/// P0-298..300: a real mapper must independently audit its private PTE
+/// staging before entry publication. The audit must read back exact segment
+/// permissions/bytes, guard-page absence and executable entry mapping.
+/// There is deliberately NO permissive default implementation.
+pub trait Pid1AuditedMapper:Pid1StagedMapper{
+ fn audit_unpublished(&mut self,entry:u64)->Result<(),Error>;
+}
+impl BootLaunchGate{
+ pub fn launch_secure_uefi_audited_pid1<
+  D:BlockDevice,P:AuthenticatedSecureUefi,T:Pid1AuditedMapper
+ >(
+  &mut self,disk:&mut D,platform:&P,manifest_digest:[u8;32],
+  image:&[u8],stack_top:u64,stack_pages:usize,mapper:&mut T
+ )->Result<VerifiedPid1Admission,Error>{
+  struct Audited<'a,T>(&'a mut T);
+  impl<T:Pid1AuditedMapper> Pid1StagedMapper for Audited<'_,T>{
+   fn stage_load(&mut self,address:u64,bytes:&[u8],zero:u64,flags:u32)
+    ->Result<(),Error>{
+    self.0.stage_load(address,bytes,zero,flags)
+   }
+   fn stage_guarded_stack(&mut self,top:u64,pages:usize)->Result<(),Error>{
+    self.0.stage_guarded_stack(top,pages)
+   }
+   fn publish_entry(&mut self,entry:u64)->Result<(),Error>{
+    self.0.audit_unpublished(entry)?;
+    self.0.publish_entry(entry)
+   }
+   fn abort(&mut self){self.0.abort();}
+  }
+  self.launch_secure_uefi_staged_pid1(disk,platform,manifest_digest,image,
+   stack_top,stack_pages,&mut Audited(mapper))
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch14_w6_audited_pid1_tests{
+ use super::*;
+ struct Platform;
+ impl TrustedBootMeasurement for Platform{
+  fn read_verified(&self)->Result<[u8;32],Error>{Ok([3;32])}
+ }
+ impl AuthenticatedPid1Platform for Platform{
+  fn read_sealed_floor(&self)->Result<SealedBootFloor,Error>{
+   Ok(SealedBootFloor{minimum_epoch:4,minimum_journal_generation:20,
+    expected_slot:0,minimum_slot_version:9,expected_measurement:[3;32]})
+  }
+  fn read_bootloader_selected_slot(&self)->Result<(usize,Slot),Error>{
+   Ok((0,tests::slot()))
+  }
+ }
+ impl AuthenticatedSecureUefi for Platform{
+  fn require_firmware_secure_boot_chain(&self)->Result<(),Error>{Ok(())}
+ }
+ struct Mapper{fail:bool,staged:usize,audits:usize,published:usize,aborts:usize}
+ impl Pid1StagedMapper for Mapper{
+  fn stage_load(&mut self,_:u64,_:&[u8],_:u64,_:u32)
+   ->Result<(),Error>{self.staged+=1;Ok(())}
+  fn stage_guarded_stack(&mut self,_:u64,_:usize)
+   ->Result<(),Error>{Ok(())}
+  fn publish_entry(&mut self,_:u64)->Result<(),Error>{
+   self.published+=1;Ok(())
+  }
+  fn abort(&mut self){self.aborts+=1;}
+ }
+ impl Pid1AuditedMapper for Mapper{
+  fn audit_unpublished(&mut self,entry:u64)->Result<(),Error>{
+   self.audits+=1;
+   if self.fail||entry!=0x400000||self.staged==0{
+    Err(Error::Invalid)
+   }else{Ok(())}
+  }
+ }
+ fn image()->[u8;256]{
+  let mut image=[0u8;256];image[..4].copy_from_slice(b"\x7fELF");
+  image[4]=2;image[5]=1;image[6]=1;
+  image[16..18].copy_from_slice(&2u16.to_le_bytes());
+  image[18..20].copy_from_slice(&62u16.to_le_bytes());
+  image[20..24].copy_from_slice(&1u32.to_le_bytes());
+  image[24..32].copy_from_slice(&0x400000u64.to_le_bytes());
+  image[32..40].copy_from_slice(&64u64.to_le_bytes());
+  image[52..54].copy_from_slice(&64u16.to_le_bytes());
+  image[54..56].copy_from_slice(&56u16.to_le_bytes());
+  image[56..58].copy_from_slice(&1u16.to_le_bytes());
+  image[64..68].copy_from_slice(&1u32.to_le_bytes());
+  image[68..72].copy_from_slice(&5u32.to_le_bytes());
+  image[72..80].copy_from_slice(&128u64.to_le_bytes());
+  image[80..88].copy_from_slice(&0x400000u64.to_le_bytes());
+  image[96..104].copy_from_slice(&4u64.to_le_bytes());
+  image[104..112].copy_from_slice(&4096u64.to_le_bytes());
+  image[112..120].copy_from_slice(&1u64.to_le_bytes());
+  image[128..132].copy_from_slice(&[0x90,0x90,0x90,0xc3]);
+  image
+ }
+ #[test]fn successful_audit_is_required_before_entry_publication(){
+  let image=image();let digest=crate::m2_sha256::digest(&image);
+  let mut disk=tests::fixture();let mut gate=BootLaunchGate::new();
+  let mut mapper=Mapper{fail:false,staged:0,audits:0,published:0,aborts:0};
+  assert!(gate.launch_secure_uefi_audited_pid1(&mut disk,&Platform,
+   digest,&image,0x800000,8,&mut mapper).is_ok());
+  assert_eq!((mapper.staged,mapper.audits,mapper.published,mapper.aborts),
+   (1,1,1,0));
+ }
+ #[test]fn failed_mapper_audit_aborts_and_consumes_one_shot_admission(){
+  let image=image();let digest=crate::m2_sha256::digest(&image);
+  let mut disk=tests::fixture();let mut gate=BootLaunchGate::new();
+  let mut mapper=Mapper{fail:true,staged:0,audits:0,published:0,aborts:0};
+  assert_eq!(gate.launch_secure_uefi_audited_pid1(&mut disk,&Platform,
+   digest,&image,0x800000,8,&mut mapper),Err(Error::Invalid));
+  assert_eq!((mapper.audits,mapper.published,mapper.aborts),(1,0,1));
+  mapper.fail=false;
+  assert_eq!(gate.launch_secure_uefi_audited_pid1(&mut disk,&Platform,
+   digest,&image,0x800000,8,&mut mapper),Err(Error::Stale));
+  assert_eq!(mapper.published,0);
+ }
+}
