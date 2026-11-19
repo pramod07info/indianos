@@ -1984,3 +1984,168 @@ mod kernel_p0_batch11_w6_pid1_plan_tests{
   assert_eq!(launches,1);
  }
 }
+
+
+
+/// P0-246..250: the trusted PID1 loader now has an explicit, auditable
+/// stage/abort/commit boundary. The implementor MUST keep mappings private
+/// until publish_entry and MUST make publish_entry atomic or reversible by
+/// abort. No physical page-table implementation is supplied by this trait.
+pub trait Pid1StagedMapper{
+ /// Stage exact ELF file bytes and zero-fill BSS with checked user PTE flags.
+ fn stage_load(&mut self,virtual_address:u64,file_bytes:&[u8],
+  zero_fill:u64,permission_bits:u32)->Result<(),Error>;
+ /// Stage mapped user stack pages, leaving exactly one guard page unmapped.
+ fn stage_guarded_stack(&mut self,stack_top:u64,pages:usize)->Result<(),Error>;
+ /// Make validated mappings visible and install entry; must be atomic.
+ fn publish_entry(&mut self,entry:u64)->Result<(),Error>;
+ /// Roll back ANY previously staged or partially published resources.
+ fn abort(&mut self);
+}
+impl BootLaunchGate{
+ pub fn launch_secure_uefi_staged_pid1<
+  D:BlockDevice,P:AuthenticatedSecureUefi,T:Pid1StagedMapper
+ >(
+  &mut self,disk:&mut D,platform:&P,manifest_digest:[u8;32],
+  image:&[u8],stack_top:u64,stack_pages:usize,mapper:&mut T
+ )->Result<VerifiedPid1Admission,Error>{
+  self.launch_secure_uefi_planned_elf64(
+   disk,platform,manifest_digest,image,stack_top,stack_pages,
+   |receipt,entry,segments|{
+    // Second bounded preflight before touching any page-table state.
+    for segment in segments{
+     let offset=usize::try_from(segment.file_offset).map_err(|_|Error::Invalid)?;
+     let length=usize::try_from(segment.file_bytes).map_err(|_|Error::Invalid)?;
+     let end=offset.checked_add(length).ok_or(Error::Invalid)?;
+     if end>image.len()||segment.permission_bits&!7!=0||
+        segment.permission_bits&3==3{
+      return Err(Error::Invalid);
+     }
+     segment.virtual_address.checked_add(segment.file_bytes)
+      .and_then(|v|v.checked_add(segment.zero_fill_bytes))
+      .ok_or(Error::Invalid)?;
+    }
+    for segment in segments{
+     let begin=segment.file_offset as usize;
+     let end=begin+segment.file_bytes as usize;
+     if let Err(err)=mapper.stage_load(
+      segment.virtual_address,&image[begin..end],
+      segment.zero_fill_bytes,segment.permission_bits){
+      mapper.abort();return Err(err);
+     }
+    }
+    if let Err(err)=mapper.stage_guarded_stack(stack_top,stack_pages){
+     mapper.abort();return Err(err);
+    }
+    if let Err(err)=mapper.publish_entry(entry){
+     mapper.abort();return Err(err);
+    }
+    Ok(receipt)
+   })
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch12_w6_staged_pid1_mapper_tests{
+ use super::*;
+ struct Platform;
+ impl TrustedBootMeasurement for Platform{
+  fn read_verified(&self)->Result<[u8;32],Error>{Ok([3;32])}
+ }
+ impl AuthenticatedPid1Platform for Platform{
+  fn read_sealed_floor(&self)->Result<SealedBootFloor,Error>{
+   Ok(SealedBootFloor{minimum_epoch:4,minimum_journal_generation:20,
+    expected_slot:0,minimum_slot_version:9,expected_measurement:[3;32]})
+  }
+  fn read_bootloader_selected_slot(&self)->Result<(usize,Slot),Error>{
+   Ok((0,tests::slot()))
+  }
+ }
+ impl AuthenticatedSecureUefi for Platform{
+  fn require_firmware_secure_boot_chain(&self)->Result<(),Error>{Ok(())}
+ }
+ struct Mapper{
+  loads:usize,stacks:usize,publishes:usize,aborts:usize,fail_step:u8,
+ }
+ impl Pid1StagedMapper for Mapper{
+  fn stage_load(&mut self,address:u64,data:&[u8],zero:u64,flags:u32)
+    ->Result<(),Error>{
+   self.loads+=1;
+   assert_eq!(address,0x400000);assert_eq!(data,&[0x90,0x90,0x90,0xc3]);
+   assert_eq!(zero,4092);assert_eq!(flags,5);
+   if self.fail_step==1{Err(Error::Io)}else{Ok(())}
+  }
+  fn stage_guarded_stack(&mut self,top:u64,pages:usize)
+    ->Result<(),Error>{
+   self.stacks+=1;
+   assert_eq!(top,0x800000);assert_eq!(pages,8);
+   if self.fail_step==2{Err(Error::Io)}else{Ok(())}
+  }
+  fn publish_entry(&mut self,entry:u64)->Result<(),Error>{
+   self.publishes+=1;assert_eq!(entry,0x400000);
+   if self.fail_step==3{Err(Error::Io)}else{Ok(())}
+  }
+  fn abort(&mut self){self.aborts+=1;}
+ }
+ fn elf()->[u8;256]{
+  let mut image=[0u8;256];image[..4].copy_from_slice(b"\x7fELF");
+  image[4]=2;image[5]=1;image[6]=1;
+  image[16..18].copy_from_slice(&2u16.to_le_bytes());
+  image[18..20].copy_from_slice(&62u16.to_le_bytes());
+  image[20..24].copy_from_slice(&1u32.to_le_bytes());
+  image[24..32].copy_from_slice(&0x400000u64.to_le_bytes());
+  image[32..40].copy_from_slice(&64u64.to_le_bytes());
+  image[52..54].copy_from_slice(&64u16.to_le_bytes());
+  image[54..56].copy_from_slice(&56u16.to_le_bytes());
+  image[56..58].copy_from_slice(&1u16.to_le_bytes());
+  image[64..68].copy_from_slice(&1u32.to_le_bytes());
+  image[68..72].copy_from_slice(&5u32.to_le_bytes());
+  image[72..80].copy_from_slice(&128u64.to_le_bytes());
+  image[80..88].copy_from_slice(&0x400000u64.to_le_bytes());
+  image[96..104].copy_from_slice(&4u64.to_le_bytes());
+  image[104..112].copy_from_slice(&4096u64.to_le_bytes());
+  image[112..120].copy_from_slice(&1u64.to_le_bytes());
+  image[128..132].copy_from_slice(&[0x90,0x90,0x90,0xc3]);
+  image
+ }
+ #[test]fn successful_staged_load_commits_one_authenticated_pid1_admission(){
+  let mut disk=tests::fixture();let mut gate=BootLaunchGate::new();
+  let image=elf();let hash=crate::m2_sha256::digest(&image);
+  let mut mapper=Mapper{loads:0,stacks:0,publishes:0,aborts:0,fail_step:0};
+  assert!(gate.launch_secure_uefi_staged_pid1(
+   &mut disk,&Platform,hash,&image,0x800000,8,&mut mapper).is_ok());
+  assert_eq!((mapper.loads,mapper.stacks,mapper.publishes,mapper.aborts),
+    (1,1,1,0));
+  assert_eq!(gate.launch_secure_uefi_staged_pid1(
+   &mut disk,&Platform,hash,&image,0x800000,8,&mut mapper),
+   Err(Error::Stale));
+  assert_eq!(mapper.publishes,1);
+ }
+ #[test]fn stage_failure_and_commit_failure_abort_once_and_cannot_replay(){
+  for fail in [1,2,3]{
+   let mut disk=tests::fixture();let mut gate=BootLaunchGate::new();
+   let image=elf();let hash=crate::m2_sha256::digest(&image);
+   let mut mapper=Mapper{loads:0,stacks:0,publishes:0,aborts:0,fail_step:fail};
+   assert_eq!(gate.launch_secure_uefi_staged_pid1(
+    &mut disk,&Platform,hash,&image,0x800000,8,&mut mapper),
+    Err(Error::Io));
+   assert_eq!(mapper.aborts,1);
+   assert_eq!(gate.last_admitted_epoch(),4);
+   assert_eq!(gate.launch_secure_uefi_staged_pid1(
+    &mut disk,&Platform,hash,&image,0x800000,8,&mut mapper),
+    Err(Error::Stale));
+   assert_eq!(mapper.aborts,1);
+  }
+ }
+ #[test]fn invalid_pinned_executable_never_invokes_mapper(){
+  let mut disk=tests::fixture();let mut gate=BootLaunchGate::new();
+  let mut image=elf();
+  image[104..112].copy_from_slice(&(96u64*1024*1024).to_le_bytes());
+  let hash=crate::m2_sha256::digest(&image);
+  let mut mapper=Mapper{loads:0,stacks:0,publishes:0,aborts:0,fail_step:0};
+  assert_eq!(gate.launch_secure_uefi_staged_pid1(
+   &mut disk,&Platform,hash,&image,0x800000,8,&mut mapper),
+   Err(Error::Invalid));
+  assert_eq!((mapper.loads,mapper.publishes,mapper.aborts),(0,0,0));
+  assert_eq!(gate.last_admitted_epoch(),4);
+ }
+}

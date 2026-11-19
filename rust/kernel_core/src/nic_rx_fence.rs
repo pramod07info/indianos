@@ -1114,3 +1114,114 @@ mod kernel_p0_batch11_w5_arp_epoch_tests{
   assert_eq!(calls,0);
  }
 }
+
+
+
+/// P0-241..245: production Ethernet ARP frames are usually padded to the
+/// 60-byte minimum, unlike a 42-byte synthetic parser fixture. Normalize at
+/// most one authenticated 802.1Q VLAN header, require exact VLAN ID, exact
+/// peer/local identities and zero-only trailing padding, then delegate the
+/// actual live NIC ring/epoch admission to the existing strict ARP parser.
+/// The caller commits its neighbor table only AFTER this method succeeds.
+impl NicRxFence{
+ pub fn parse_padded_vlan_arp_reply<R>(
+  &self,device:u32,frame:&[u8],max_frame:usize,
+  expected_vlan:Option<u16>,
+  peer_mac:[u8;6],local_mac:[u8;6],
+  peer_ip:[u8;4],local_ip:[u8;4],
+  parse:impl FnOnce()->Option<R>
+ )->Result<R,RxFenceError>{
+  if frame.len()<42||frame.len()>64||frame.len()>max_frame{
+   return Err(RxFenceError::Capacity);
+  }
+  let data=match expected_vlan{
+   Some(vlan)=>{
+    if vlan==0||vlan>=4095||frame.len()<46||
+       frame[12..14]!=[0x81,0x00]||frame[16..18]!=[0x08,0x06]{
+     return Err(RxFenceError::Capacity);
+    }
+    let tag=u16::from_be_bytes([frame[14],frame[15]]);
+    // Reject unexpected priority and DEI bits as well as a foreign VLAN.
+    if tag!=vlan{return Err(RxFenceError::Capacity);}
+    18
+   },
+   None=>{
+    if frame[12..14]!=[0x08,0x06]{return Err(RxFenceError::Capacity);}
+    14
+   }
+  };
+  if frame[data+28..].iter().any(|&byte|byte!=0){
+   return Err(RxFenceError::Capacity);
+  }
+  let mut normalized=[0u8;42];
+  normalized[..12].copy_from_slice(&frame[..12]);
+  normalized[12..14].copy_from_slice(&[0x08,0x06]);
+  normalized[14..].copy_from_slice(&frame[data..data+28]);
+  self.parse_authenticated_arp_reply(
+   device,&normalized,max_frame,peer_mac,local_mac,peer_ip,local_ip,parse)
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch12_w5_padded_vlan_arp_tests{
+ use super::*;
+ const PEER:[u8;6]=[2,3,4,5,6,7];
+ const LOCAL:[u8;6]=[2,8,9,10,11,12];
+ const PEER_IP:[u8;4]=[10,0,0,1];
+ const LOCAL_IP:[u8;4]=[10,0,0,2];
+ fn plain()->[u8;60]{
+  let mut out=[0u8;60];
+  out[..6].copy_from_slice(&LOCAL);
+  out[6..12].copy_from_slice(&PEER);
+  out[12..14].copy_from_slice(&[8,6]);
+  out[14..16].copy_from_slice(&[0,1]);
+  out[16..18].copy_from_slice(&[8,0]);
+  out[18]=6;out[19]=4;
+  out[20..22].copy_from_slice(&[0,2]);
+  out[22..28].copy_from_slice(&PEER);
+  out[28..32].copy_from_slice(&PEER_IP);
+  out[32..38].copy_from_slice(&LOCAL);
+  out[38..42].copy_from_slice(&LOCAL_IP);
+  out
+ }
+ fn vlan()->[u8;60]{
+  let p=plain();let mut out=[0u8;60];
+  out[..12].copy_from_slice(&p[..12]);
+  out[12..14].copy_from_slice(&[0x81,0]);
+  out[14..16].copy_from_slice(&100u16.to_be_bytes());
+  out[16..18].copy_from_slice(&[8,6]);
+  out[18..46].copy_from_slice(&p[14..42]);
+  out
+ }
+ #[test]fn padded_ethernet_and_one_trusted_vlan_both_admit(){
+  let f=NicRxFence::new(5);
+  assert_eq!(f.parse_padded_vlan_arp_reply(
+   5,&plain(),64,None,PEER,LOCAL,PEER_IP,LOCAL_IP,||Some(3)),Ok(3));
+  assert_eq!(f.parse_padded_vlan_arp_reply(
+   5,&vlan(),64,Some(100),PEER,LOCAL,PEER_IP,LOCAL_IP,||Some(4)),Ok(4));
+ }
+ #[test]fn foreign_vlan_dirty_padding_and_peer_spoof_fail_before_callback(){
+  let f=NicRxFence::new(5);let mut calls=0;
+  let mut p=plain();p[56]=99;
+  assert_eq!(f.parse_padded_vlan_arp_reply(
+   5,&p,64,None,PEER,LOCAL,PEER_IP,LOCAL_IP,
+   ||{calls+=1;Some(1)}),Err(RxFenceError::Capacity));
+  let mut p=vlan();p[14]=0x10;
+  assert_eq!(f.parse_padded_vlan_arp_reply(
+   5,&p,64,Some(100),PEER,LOCAL,PEER_IP,LOCAL_IP,
+   ||{calls+=1;Some(1)}),Err(RxFenceError::Capacity));
+  assert_eq!(f.parse_padded_vlan_arp_reply(
+   5,&vlan(),64,Some(101),PEER,LOCAL,PEER_IP,LOCAL_IP,
+   ||{calls+=1;Some(1)}),Err(RxFenceError::Capacity));
+  assert_eq!(f.parse_padded_vlan_arp_reply(
+   5,&plain(),64,None,PEER,LOCAL,[10,0,0,3],LOCAL_IP,
+   ||{calls+=1;Some(1)}),Err(RxFenceError::Capacity));
+  assert_eq!(calls,0);
+ }
+ #[test]fn ring_teardown_during_parse_revokes_arp_result(){
+  let f=NicRxFence::new(5);
+  assert_eq!(f.parse_padded_vlan_arp_reply(
+   5,&plain(),64,None,PEER,LOCAL,PEER_IP,LOCAL_IP,||{
+    f.begin_quiesce(5).unwrap();Some(1)
+   }),Err(RxFenceError::Stale));
+ }
+}

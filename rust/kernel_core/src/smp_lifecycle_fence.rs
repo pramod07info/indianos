@@ -1105,3 +1105,124 @@ mod kernel_p0_batch11_w1_tlb_dispatch_tests{
   assert_eq!(b.require_ack_for_reclaim(0,y),Ok(()));
  }
 }
+
+
+
+/// P0-221..225: bind a canonical page range to every exact AP IPI receipt.
+/// Only a trusted APIC driver may implement this protocol. Publication and
+/// acknowledgements alone do not perform the hardware TLB invalidation.
+#[derive(Debug,Clone,Copy,Eq,PartialEq)]
+pub struct TlbShootdownRange{
+ pub first_page:u64,
+ pub pages:u32,
+ pub epoch:u64,
+}
+impl TlbShootdownRange{
+ pub fn validate(self)->Result<(),FenceError>{
+  const USER_TOP:u64=0x0000_8000_0000_0000;
+  if self.epoch==0||self.first_page<4096||
+    self.first_page%4096!=0||self.pages==0||self.pages>4096||
+    self.first_page.checked_add((self.pages as u64)*4096)
+     .is_none_or(|end|end>USER_TOP){
+   return Err(FenceError::InvalidGeneration);
+  }
+  Ok(())
+ }
+}
+pub trait TlbRangeIpiSender{
+ fn send_range_exact(&mut self,bsp:u32,ap:u32,
+  receipt:Receipt,range:TlbShootdownRange)->Result<(),FenceError>;
+}
+pub fn dispatch_exact_tlb_range<I:TlbRangeIpiSender>(
+ topology:&[(&LifecycleFence,u32)],bsp:u32,
+ range:TlbShootdownRange,driver:&mut I,issued:&mut[Option<Receipt>]
+)->Result<usize,FenceError>{
+ range.validate()?;
+ struct Bridge<'a,I>{driver:&'a mut I,range:TlbShootdownRange}
+ impl<I:TlbRangeIpiSender> LifecycleIpiSender for Bridge<'_,I>{
+  fn send_exact(&mut self,bsp:u32,ap:u32,receipt:Receipt)
+   ->Result<(),FenceError>{
+   if receipt.generation!=self.range.epoch{
+    return Err(FenceError::StaleReceipt);
+   }
+   self.driver.send_range_exact(bsp,ap,receipt,self.range)
+  }
+ }
+ publish_and_signal_epoch_topology(
+  topology,bsp,range.epoch,&mut Bridge{driver,range},issued)
+}
+pub fn acknowledge_exact_tlb_range(
+ fence:&LifecycleFence,ap:u32,previous_sequence:u64,
+ expected:Receipt,range:TlbShootdownRange,
+ invalidate:impl FnOnce(TlbShootdownRange)->Result<(),FenceError>
+)->Result<(),FenceError>{
+ range.validate()?;
+ if range.epoch!=expected.generation{return Err(FenceError::StaleReceipt);}
+ fence.require_pending_exact(fence.bsp,expected)?;
+ let observed=fence.acknowledge_after_local_invalidate(
+  ap,previous_sequence,|receipt|{
+   if receipt!=expected{return Err(FenceError::StaleReceipt);}
+   invalidate(range)
+  })?;
+ if observed==Some(expected){Ok(())}else{Err(FenceError::StaleReceipt)}
+}
+#[cfg(test)]
+mod kernel_p0_batch12_w1_bound_tlb_tests{
+ use super::*;
+ struct Driver{calls:usize,fail_at:usize,observed:Option<TlbShootdownRange>}
+ impl TlbRangeIpiSender for Driver{
+  fn send_range_exact(&mut self,_:u32,_:u32,_:Receipt,range:TlbShootdownRange)
+   ->Result<(),FenceError>{
+   self.calls+=1;self.observed=Some(range);
+   if self.calls==self.fail_at{Err(FenceError::NoProgress)}else{Ok(())}
+  }
+ }
+ fn range()->TlbShootdownRange{
+  TlbShootdownRange{first_page:0x4000,pages:2,epoch:17}
+ }
+ #[test]fn malformed_range_cannot_publish_or_call_driver(){
+  let f=LifecycleFence::new(0,1);
+  let mut driver=Driver{calls:0,fail_at:0,observed:None};
+  let mut issued=[None];
+  for invalid in [
+   TlbShootdownRange{epoch:0,..range()},
+   TlbShootdownRange{first_page:0x4001,..range()},
+   TlbShootdownRange{pages:0,..range()},
+   TlbShootdownRange{pages:4097,..range()},
+   TlbShootdownRange{first_page:0x0000_8000_0000_0000,..range()},
+  ]{
+   assert_eq!(dispatch_exact_tlb_range(
+    &[(&f,1)],0,invalid,&mut driver,&mut issued),
+    Err(FenceError::InvalidGeneration));
+  }
+  assert_eq!(driver.calls,0);
+  assert_eq!(issued,[None]);
+ }
+ #[test]fn partial_ipi_requires_exact_range_and_actual_local_callback(){
+  let a=LifecycleFence::new(0,1);let b=LifecycleFence::new(0,2);
+  let mut d=Driver{calls:0,fail_at:2,observed:None};
+  let mut issued=[None;2];let range=range();
+  assert_eq!(dispatch_exact_tlb_range(
+   &[(&a,1),(&b,2)],0,range,&mut d,&mut issued),
+   Err(FenceError::NoProgress));
+  assert_eq!(d.observed,Some(range));
+  let x=issued[0].unwrap();let y=issued[1].unwrap();
+  assert_eq!(a.require_ack_for_reclaim(0,x),Err(FenceError::NoProgress));
+  assert_eq!(acknowledge_exact_tlb_range(&a,1,0,x,
+   TlbShootdownRange{epoch:18,..range},|_|Ok(())),
+   Err(FenceError::StaleReceipt));
+  assert_eq!(acknowledge_exact_tlb_range(&a,1,0,x,range,
+   |_|Err(FenceError::IncompleteLocalWork)),
+   Err(FenceError::IncompleteLocalWork));
+  assert_eq!(a.require_ack_for_reclaim(0,x),Err(FenceError::NoProgress));
+  let mut invalidated=0;
+  assert_eq!(acknowledge_exact_tlb_range(&a,1,0,x,range,
+   |actual|{assert_eq!(actual,range);invalidated+=1;Ok(())}),Ok(()));
+  assert_eq!(invalidated,1);
+  assert_eq!(a.require_ack_for_reclaim(0,x),Ok(()));
+  assert_eq!(b.require_ack_for_reclaim(0,y),Err(FenceError::NoProgress));
+  assert_eq!(acknowledge_exact_tlb_range(&a,1,0,x,range,
+   |_|{invalidated+=1;Ok(())}),Err(FenceError::StaleReceipt));
+  assert_eq!(invalidated,1);
+ }
+}

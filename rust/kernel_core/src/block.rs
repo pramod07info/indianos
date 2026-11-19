@@ -2108,3 +2108,114 @@ mod kernel_p0_batch11_w4_triple_metadata_tests{
   assert_eq!(a,[9;4]);assert_eq!(b,[9;4]);assert_eq!(c,[9;4]);
  }
 }
+
+
+
+/// P0-236..240: a real boot metadata read must be tied to an externally
+/// managed media revision, not only to identical sector contents. Read each
+/// of three disjoint authenticated fields TWICE (including the third) with a
+/// driver-owned revision observation before, between and after both reads.
+/// No caller output is modified until all observations agree. This does not
+/// replace a real drive power-loss / flush ordering qualification.
+impl<D:BlockDevice> StableReadOnlyWindow<'_,D>{
+ pub fn read_revision_pinned_metadata_triple(
+  &mut self,start:u64,count:u64,positions:[(u64,usize);3],
+  digests:[[u8;32];3],expected_revision:u64,
+  mut media_revision:impl FnMut()->u64,
+  outputs:[&mut[u8];3]
+ )->Result<(),BlockError>{
+  const MAX_FIELD:usize=256;
+  if expected_revision==0||outputs.iter().any(|out|
+    out.is_empty()||out.len()>MAX_FIELD){
+   return Err(BlockError::OutOfRange);
+  }
+  if self.invalidated{return Err(BlockError::Io);}
+  if media_revision()!=expected_revision{return Err(BlockError::Io);}
+  let lengths=outputs.each_ref().map(|out|out.len());
+  let mut one=[[0u8;MAX_FIELD];3];
+  let mut two=[[0u8;MAX_FIELD];3];
+  let [a,b,c]=&mut one;
+  self.read_disjoint_partition_domain_triple(
+   start,count,positions,digests,
+   [&mut a[..lengths[0]],&mut b[..lengths[1]],&mut c[..lengths[2]]])?;
+  if media_revision()!=expected_revision{
+   self.invalidated=true;return Err(BlockError::Io);
+  }
+  let [a,b,c]=&mut two;
+  self.read_disjoint_partition_domain_triple(
+   start,count,positions,digests,
+   [&mut a[..lengths[0]],&mut b[..lengths[1]],&mut c[..lengths[2]]])?;
+  if media_revision()!=expected_revision{
+   self.invalidated=true;return Err(BlockError::Io);
+  }
+  if (0..3).any(|i|one[i][..lengths[i]]!=two[i][..lengths[i]]){
+   self.invalidated=true;return Err(BlockError::Io);
+  }
+  let [out_a,out_b,out_c]=outputs;
+  out_a.copy_from_slice(&one[0][..lengths[0]]);
+  out_b.copy_from_slice(&one[1][..lengths[1]]);
+  out_c.copy_from_slice(&one[2][..lengths[2]]);
+  Ok(())
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch12_w4_revision_pinned_storage_tests{
+ use super::*;
+ use core::cell::Cell;
+ struct Disk{reads:usize,fail_at:usize}
+ impl BlockDevice for Disk{
+  fn sector_count(&self)->u64{9}
+  fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{
+   self.reads+=1;
+   if self.reads==self.fail_at{return Err(BlockError::Io);}
+   out.fill(lba as u8);Ok(())
+  }
+  fn write_sector(&mut self,_:u64,_:&[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{Err(BlockError::ReadOnly)}
+ }
+ fn hashes()->[[u8;32];3]{
+  [0u64,1,2].map(|n|domain_bound_metadata_sha256(
+   2,4,n,0,&[(2+n) as u8;4]).unwrap())
+ }
+ #[test]fn two_complete_triples_commit_under_unchanged_media_revision(){
+  let mut d=Disk{reads:0,fail_at:0};
+  let mut view=StableReadOnlyWindow::new(&mut d).unwrap();
+  let mut a=[9;4];let mut b=[9;4];let mut c=[9;4];
+  let mut observations=0;
+  assert_eq!(view.read_revision_pinned_metadata_triple(
+   2,4,[(0,0),(1,0),(2,0)],hashes(),17,
+   ||{observations+=1;17},[&mut a,&mut b,&mut c]),Ok(()));
+  assert_eq!(observations,3);
+  assert_eq!(a,[2;4]);assert_eq!(b,[3;4]);assert_eq!(c,[4;4]);
+  assert!(!view.is_retired());
+ }
+ #[test]fn media_rebind_between_passes_poisoned_and_no_partial_output(){
+  let mut d=Disk{reads:0,fail_at:0};
+  let mut view=StableReadOnlyWindow::new(&mut d).unwrap();
+  let calls=Cell::new(0usize);
+  let mut a=[9;4];let mut b=[9;4];let mut c=[9;4];
+  assert_eq!(view.read_revision_pinned_metadata_triple(
+   2,4,[(0,0),(1,0),(2,0)],hashes(),17,
+   ||{calls.set(calls.get()+1);if calls.get()<3{17}else{18}},
+   [&mut a,&mut b,&mut c]),Err(BlockError::Io));
+  assert!(view.is_retired());
+  assert_eq!(a,[9;4]);assert_eq!(b,[9;4]);assert_eq!(c,[9;4]);
+ }
+ #[test]fn stale_before_io_and_io_error_do_not_publish(){
+  let mut d=Disk{reads:0,fail_at:0};
+  let mut view=StableReadOnlyWindow::new(&mut d).unwrap();
+  let mut a=[9;4];let mut b=[9;4];let mut c=[9;4];
+  assert_eq!(view.read_revision_pinned_metadata_triple(
+   2,4,[(0,0),(1,0),(2,0)],hashes(),17,||18,
+   [&mut a,&mut b,&mut c]),Err(BlockError::Io));
+  assert_eq!(view.device.reads,0);
+  let mut d=Disk{reads:0,fail_at:5};
+  let mut view=StableReadOnlyWindow::new(&mut d).unwrap();
+  assert_eq!(view.read_revision_pinned_metadata_triple(
+   2,4,[(0,0),(1,0),(2,0)],hashes(),17,||17,
+   [&mut a,&mut b,&mut c]),Err(BlockError::Io));
+  assert_eq!(a,[9;4]);assert_eq!(b,[9;4]);assert_eq!(c,[9;4]);
+  assert!(view.is_retired());
+ }
+}

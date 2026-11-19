@@ -1642,3 +1642,91 @@ mod kernel_p0_batch11_w3_multi_owner_receive_tests{
   assert_eq!(r.pending(x),Ok(0));assert_eq!(r.pending(y),Ok(0));
  }
 }
+
+
+
+/// P0-231..235: independently authenticated MULTI-SENDER IPC batch, not a
+/// single-sender fanout. Every destination and every source generation is
+/// checked against the live router before atomic FIFO publication. Staging
+/// handles multiple writes to the same receiver (including late queue-full)
+/// and checked aggregate byte cost without any partial delivery.
+/// Caller holds the exclusive multicore router lock.
+impl<const M:usize,const D:usize> ScopedRouter<M,D>{
+ pub fn send_multi_sender_atomic(
+  &mut self,entries:&[(Identity,Identity,&[u8])],
+  allowed_senders:&[Identity],max_total_bytes:usize
+ )->Result<usize,IpcError>{
+  if entries.is_empty()||entries.len()>M.saturating_mul(D)||
+     allowed_senders.is_empty()||allowed_senders.len()>M||
+     max_total_bytes==0||
+     max_total_bytes>M.saturating_mul(D).saturating_mul(MAX_PAYLOAD){
+   return Err(IpcError::InvalidConfiguration);
+  }
+  for (i,sender) in allowed_senders.iter().enumerate(){
+   if sender.pid==0||sender.generation==0{return Err(IpcError::InvalidPid);}
+   if allowed_senders[..i].iter().any(|prior|prior.pid==sender.pid){
+    return Err(IpcError::DuplicateReceiver);
+   }
+   if !self.boxes.iter().flatten().any(|b|b.owner==*sender){
+    return Err(IpcError::UnknownSender);
+   }
+  }
+  let mut total=0usize;
+  let mut staged=self.clone();
+  for &(sender,receiver,payload) in entries{
+   if !allowed_senders.contains(&sender){
+    return Err(IpcError::UnknownSender);
+   }
+   total=total.checked_add(payload.len())
+     .ok_or(IpcError::PayloadTooLarge)?;
+   if total>max_total_bytes{return Err(IpcError::PayloadTooLarge);}
+   staged.send(sender,receiver,payload)?;
+  }
+  *self=staged;
+  Ok(entries.len())
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch12_w3_multisender_transaction_tests{
+ use super::*;
+ fn id(p:u32,g:u64)->Identity{Identity{pid:p,generation:g}}
+ #[test]fn two_live_senders_publish_ordered_messages_atomically(){
+  let a=id(1,1);let b=id(2,2);let x=id(3,3);
+  let mut r=ScopedRouter::<3,3>::new().unwrap();
+  for owner in [a,b,x]{r.register(owner).unwrap();}
+  assert_eq!(r.send_multi_sender_atomic(
+   &[(a,x,b"first"),(b,x,b"second")],&[a,b],11),Ok(2));
+  assert_eq!(r.pending(x),Ok(2));
+  assert_eq!(r.receive(x).unwrap().sender(),a);
+  let msg=r.receive(x).unwrap();
+  assert_eq!(msg.sender(),b);
+  assert_eq!(msg.payload(),b"second");
+ }
+ #[test]fn late_queue_full_and_byte_quota_never_publish_prefix(){
+  let a=id(1,1);let b=id(2,2);let x=id(3,3);
+  let mut r=ScopedRouter::<3,2>::new().unwrap();
+  for owner in [a,b,x]{r.register(owner).unwrap();}
+  r.send(a,x,b"seed").unwrap();
+  assert_eq!(r.send_multi_sender_atomic(
+   &[(b,x,b"ok"),(a,x,b"last")],&[a,b],6),Err(IpcError::Full));
+  assert_eq!(r.pending(x),Ok(1));
+  assert_eq!(r.receive(x).unwrap().payload(),b"seed");
+  assert_eq!(r.send_multi_sender_atomic(
+   &[(a,x,b"abc"),(b,x,b"def")],&[a,b],5),
+   Err(IpcError::PayloadTooLarge));
+  assert_eq!(r.pending(x),Ok(0));
+ }
+ #[test]fn stale_identity_or_forged_allowlist_never_delivers(){
+  let a=id(1,1);let b=id(2,2);let x=id(3,3);
+  let mut r=ScopedRouter::<3,3>::new().unwrap();
+  for owner in [a,b,x]{r.register(owner).unwrap();}
+  assert_eq!(r.send_multi_sender_atomic(
+   &[(id(1,2),x,b"bad")],&[a,b],4),Err(IpcError::UnknownSender));
+  assert_eq!(r.send_multi_sender_atomic(
+   &[(a,x,b"ok")],&[a,id(1,2)],4),Err(IpcError::DuplicateReceiver));
+  assert_eq!(r.send_multi_sender_atomic(
+   &[(a,id(3,4),b"bad")],&[a,b],4),
+   Err(IpcError::UnknownReceiver));
+  assert_eq!(r.pending(x),Ok(0));
+ }
+}
