@@ -1983,3 +1983,67 @@ mod kernel_p0_batch7_w2_exit_epoch_tests{
   assert!(!q.contains_epoch(2,9));assert_eq!(events.count_pid(2),1);
  }
 }
+
+
+/// P0-145..148: a running process may migrate to another CPU only after
+/// the entire trusted AP inventory acknowledged the same local lifecycle
+/// epoch. Stage every scheduler edit privately and recheck the barrier before
+/// publication. Actual runtime must hold scheduler/topology locks throughout.
+impl<const C:usize,const N:usize> CoreRunQueues<C,N>{
+ pub fn migrate_group_after_epoch_acks(
+  &mut self,requests:&[(usize,usize,Runnable,u64)],
+  receipts:&[(&crate::smp_lifecycle_fence::LifecycleFence,u32,
+   crate::smp_lifecycle_fence::Receipt)],
+  expected_aps:&[u32],expected_generation:u64
+ )->Result<usize,ReclaimError>{
+  crate::smp_lifecycle_fence::require_epoch_topology_acks_for_reclaim(
+   receipts,expected_aps,expected_generation).map_err(ReclaimError::Ap)?;
+  let mut staged=Self{queues:self.queues,length:self.length,cursor:self.cursor};
+  let count=staged.migrate_group_exact(requests).map_err(ReclaimError::Queue)?;
+  crate::smp_lifecycle_fence::require_epoch_topology_acks_for_reclaim(
+   receipts,expected_aps,expected_generation).map_err(ReclaimError::Ap)?;
+  *self=staged;
+  Ok(count)
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch8_w2_topology_migration_tests{
+ use super::*;
+ use crate::smp_lifecycle_fence::{FenceError,LifecycleFence};
+ fn task(pid:u32,g:u64)->Runnable{Runnable{pid,generation:g,priority:2}}
+ #[test]fn acknowledged_same_epoch_topology_permits_atomic_cross_core_migration(){
+  let mut queues=CoreRunQueues::<2,3>::new();
+  queues.enqueue(0,task(1,1)).unwrap();
+  queues.enqueue(0,task(2,3)).unwrap();queues.enqueue(1,task(3,4)).unwrap();
+  let a=LifecycleFence::new(9,1);let b=LifecycleFence::new(9,2);
+  let x=a.publish(9,20).unwrap();let y=b.publish(9,20).unwrap();
+  a.observe_and_ack_after(1,0,|_|true).unwrap();
+  b.observe_and_ack_after(2,0,|_|true).unwrap();
+  let proofs=[(&a,9,x),(&b,9,y)];
+  assert_eq!(queues.migrate_group_after_epoch_acks(
+   &[(0,1,task(2,3),2),(1,0,task(3,4),1)],
+   &proofs,&[2,1],20),Ok(2));
+  let mut cpu0=[task(99,99);3];let mut cpu1=[task(99,99);3];
+  assert_eq!(queues.snapshot_core(0,&mut cpu0),Ok(2));
+  assert_eq!(&cpu0[..2],&[task(1,1),task(3,4)]);
+  assert_eq!(queues.snapshot_core(1,&mut cpu1),Ok(1));
+  assert_eq!(cpu1[0],task(2,3));
+ }
+ #[test]fn pending_mixed_epoch_or_invalid_affinity_never_changes_queue(){
+  let mut queues=CoreRunQueues::<2,2>::new();
+  queues.enqueue(0,task(1,1)).unwrap();queues.enqueue(0,task(2,3)).unwrap();
+  let a=LifecycleFence::new(9,1);let b=LifecycleFence::new(9,2);
+  let x=a.publish(9,20).unwrap();let y=b.publish(9,21).unwrap();
+  a.observe_and_ack_after(1,0,|_|true).unwrap();
+  let proofs=[(&a,9,x),(&b,9,y)];
+  let moves=[(0,1,task(2,3),2)];
+  assert_eq!(queues.migrate_group_after_epoch_acks(&moves,&proofs,&[1,2],20),
+   Err(ReclaimError::Ap(FenceError::StaleReceipt)));
+  assert_eq!(queues.queue_len(0),Ok(2));assert_eq!(queues.queue_len(1),Ok(0));
+  let proof=[(&a,9,x)];
+  assert_eq!(queues.migrate_group_after_epoch_acks(
+   &[(0,1,task(2,3),1)],&proof,&[1],20),
+   Err(ReclaimError::Queue(DispatchError::InvalidTask)));
+  assert_eq!(queues.queue_len(0),Ok(2));assert_eq!(queues.queue_len(1),Ok(0));
+ }
+}

@@ -778,3 +778,94 @@ mod kernel_p0_batch7_w5_udp_ingress_tests{
   }),Err(RxFenceError::Stale));
  }
 }
+
+
+/// P0-156..157: opt-in full UDP checksum verification including source and
+/// destination IPv4 pseudoheader, datagram length and odd trailing byte.
+/// A zero UDP checksum (legal in IPv4) is deliberately rejected by this
+/// *strict* ingress policy. Never accept a parser result after RX revocation.
+impl NicRxFence{
+ pub fn parse_udp_ipv4_verified_checksum<R>(&self,device:u32,frame:&[u8],
+  maximum:usize,destination_port:u16,
+  parse:impl FnOnce(&[u8])->Option<R>)->Result<R,RxFenceError>{
+  if frame.len()<14{return Err(RxFenceError::Capacity);}
+  let offset=if frame[12..14]==[0x81,0x00]{18}else{14};
+  if frame.len()<offset+20{return Err(RxFenceError::Capacity);}
+  let ip=&frame[offset..];
+  let ihl=((ip[0]&15) as usize)*4;
+  if ihl<20||ihl>60||ip.len()<ihl+8{
+   return Err(RxFenceError::Capacity);
+  }
+  let total=u16::from_be_bytes([ip[2],ip[3]]) as usize;
+  if ip[0]>>4!=4||ip[9]!=17||total<ihl+8||total>ip.len(){
+   return Err(RxFenceError::Capacity);
+  }
+  let udp=&ip[ihl..total];
+  if u16::from_be_bytes([udp[6],udp[7]])==0{
+   return Err(RxFenceError::Capacity);
+  }
+  let mut sum=17u32+udp.len() as u32;
+  for word in ip[12..20].chunks_exact(2){
+   sum+=u16::from_be_bytes([word[0],word[1]]) as u32;
+  }
+  for word in udp.chunks_exact(2){
+   sum+=u16::from_be_bytes([word[0],word[1]]) as u32;
+  }
+  if udp.len()%2!=0{sum+=(udp[udp.len()-1] as u32)<<8;}
+  while sum>>16!=0{sum=(sum&0xffff)+(sum>>16);}
+  if sum!=0xffff{return Err(RxFenceError::Capacity);}
+  self.parse_checked_udp_ipv4(device,frame,maximum,destination_port,parse)
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch8_w5_udp_checksum_tests{
+ use super::*;
+ fn packet()->[u8;47]{
+  let mut bytes=[0u8;47];bytes[12]=8;bytes[13]=0;
+  let ip=&mut bytes[14..];ip[0]=0x45;ip[2..4].copy_from_slice(&33u16.to_be_bytes());
+  ip[8]=64;ip[9]=17;
+  ip[12..16].copy_from_slice(&[10,0,0,1]);
+  ip[16..20].copy_from_slice(&[10,0,0,2]);
+  ip[20..22].copy_from_slice(&8000u16.to_be_bytes());
+  ip[22..24].copy_from_slice(&9000u16.to_be_bytes());
+  ip[24..26].copy_from_slice(&13u16.to_be_bytes());
+  ip[28..33].copy_from_slice(b"hello");
+  let mut sum=17u32+13;
+  for word in ip[12..20].chunks_exact(2){
+   sum+=u16::from_be_bytes([word[0],word[1]]) as u32;
+  }
+  for word in ip[20..33].chunks_exact(2){
+   sum+=u16::from_be_bytes([word[0],word[1]]) as u32;
+  }
+  sum+=(ip[32] as u32)<<8;
+  while sum>>16!=0{sum=(sum&65535)+(sum>>16);}
+  ip[26..28].copy_from_slice(&(!(sum as u16)).to_be_bytes());
+  let mut ip_sum=0u32;
+  for word in ip[..20].chunks_exact(2){
+   ip_sum+=u16::from_be_bytes([word[0],word[1]]) as u32;
+  }
+  while ip_sum>>16!=0{ip_sum=(ip_sum&65535)+(ip_sum>>16);}
+  ip[10..12].copy_from_slice(&(!(ip_sum as u16)).to_be_bytes());
+  bytes
+ }
+ #[test]fn real_pseudoheader_checksum_allows_valid_odd_length_udp(){
+  let nic=NicRxFence::new(6);let p=packet();
+  assert_eq!(nic.parse_udp_ipv4_verified_checksum(6,&p,128,9000,
+   |data|Some((data.len(),data[4]))),Ok((5,b'o')));
+ }
+ #[test]fn tampered_checksum_and_disabled_checksum_are_rejected(){
+  let nic=NicRxFence::new(6);let mut p=packet();
+  p[46]^=1;
+  assert_eq!(nic.parse_udp_ipv4_verified_checksum(6,&p,128,9000,
+   |_|Some(1)),Err(RxFenceError::Capacity));
+  p=packet();p[40]=0;p[41]=0;
+  assert_eq!(nic.parse_udp_ipv4_verified_checksum(6,&p,128,9000,
+   |_|Some(1)),Err(RxFenceError::Capacity));
+ }
+ #[test]fn live_nic_ring_revoke_denies_checked_packet(){
+  let nic=NicRxFence::new(6);let p=packet();
+  assert_eq!(nic.parse_udp_ipv4_verified_checksum(6,&p,128,9000,|_|{
+   nic.begin_quiesce(6).unwrap();Some(1)
+  }),Err(RxFenceError::Stale));
+ }
+}

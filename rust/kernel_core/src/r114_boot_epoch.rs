@@ -1421,3 +1421,183 @@ mod kernel_p0_batch7_w6_pinned_image_tests{
   }
  }
 }
+
+
+/// P0-158..160: bounded, no-heap ELF64 x86-64 ET_EXEC preflight for pinned
+/// PID1 image bytes. Reject ELF interpreters/dynamic loaders, W+X mappings,
+/// executable stack, overlaps, bad offsets, and entry outside file-backed
+/// executable bytes. This does NOT create page tables or map ELF segments.
+pub fn verify_pid1_elf64(image:&[u8])->Result<u64,Error>{
+ fn u16le(bytes:&[u8],at:usize)->Result<u16,Error>{
+  let s=bytes.get(at..at.checked_add(2).ok_or(Error::Invalid)?)
+   .ok_or(Error::Invalid)?;
+  Ok(u16::from_le_bytes([s[0],s[1]]))
+ }
+ fn u32le(bytes:&[u8],at:usize)->Result<u32,Error>{
+  let s=bytes.get(at..at.checked_add(4).ok_or(Error::Invalid)?)
+   .ok_or(Error::Invalid)?;
+  Ok(u32::from_le_bytes([s[0],s[1],s[2],s[3]]))
+ }
+ fn u64le(bytes:&[u8],at:usize)->Result<u64,Error>{
+  let s=bytes.get(at..at.checked_add(8).ok_or(Error::Invalid)?)
+   .ok_or(Error::Invalid)?;
+  Ok(u64::from_le_bytes([s[0],s[1],s[2],s[3],s[4],s[5],s[6],s[7]]))
+ }
+ if image.len()<64||image.len()>16*1024*1024||
+    image.get(..4)!=Some(&b"\x7fELF"[..])||
+    image[4]!=2||image[5]!=1||image[6]!=1||
+    u16le(image,16)?!=2||u16le(image,18)?!=62||
+    u32le(image,20)?!=1||u16le(image,52)?!=64||
+    u16le(image,54)?!=56{
+  return Err(Error::Invalid);
+ }
+ let entry=u64le(image,24)?;
+ let phoff=usize::try_from(u64le(image,32)?).map_err(|_|Error::Invalid)?;
+ let phnum=u16le(image,56)? as usize;
+ if phnum==0||phnum>64||phoff<64||
+    phoff.checked_add(phnum*56).is_none_or(|end|end>image.len()){
+  return Err(Error::Invalid);
+ }
+ const USER_END:u64=0x0000_8000_0000_0000;
+ if !(0x10000..USER_END).contains(&entry){return Err(Error::Invalid);}
+ let mut executable_entry_count=0usize;
+ let mut load_count=0usize;
+ for index in 0..phnum{
+  let at=phoff+index*56;
+  let kind=u32le(image,at)?;
+  let flags=u32le(image,at+4)?;
+  if kind==2||kind==3{return Err(Error::Invalid);} // dynamic / interpreter
+  if kind==0x6474e551 && flags&1!=0{return Err(Error::Invalid);} // exec stack
+  if kind!=1{continue;}
+  load_count+=1;
+  if flags&!7!=0||flags&3==3{return Err(Error::Invalid);}
+  let file_offset=u64le(image,at+8)?;
+  let virtual_address=u64le(image,at+16)?;
+  let file_size=u64le(image,at+32)?;
+  let memory_size=u64le(image,at+40)?;
+  let align=u64le(image,at+48)?;
+  if memory_size==0||file_size>memory_size||
+     virtual_address<0x10000||virtual_address>=USER_END||
+     virtual_address.checked_add(memory_size).is_none_or(|end|end>USER_END)||
+     file_offset.checked_add(file_size).is_none_or(|end|end>image.len() as u64)||
+     (align>1&&(!align.is_power_of_two()||
+         virtual_address%align!=file_offset%align)){
+   return Err(Error::Invalid);
+  }
+  // Reject every overlap in the fully validated list of earlier PT_LOADs.
+  let end=virtual_address+memory_size;
+  for earlier in 0..index{
+   let prior=phoff+earlier*56;
+   if u32le(image,prior)?!=1{continue;}
+   let prev_start=u64le(image,prior+16)?;
+   let prev_len=u64le(image,prior+40)?;
+   let prev_end=prev_start.checked_add(prev_len).ok_or(Error::Invalid)?;
+   if virtual_address<prev_end&&prev_start<end{return Err(Error::Invalid);}
+  }
+  if flags&1!=0&&entry>=virtual_address&&
+     entry<virtual_address+file_size{
+   executable_entry_count+=1;
+  }
+ }
+ if load_count==0||executable_entry_count!=1{return Err(Error::Invalid);}
+ Ok(entry)
+}
+impl BootLaunchGate{
+ /// Consume one authenticated admission before accepting or rejecting this
+ /// pinned image; a bad ELF or digest cannot be retried under the same epoch.
+ pub fn launch_secure_uefi_elf64<D:BlockDevice,P:AuthenticatedSecureUefi,R>(
+  &mut self,disk:&mut D,platform:&P,manifest_digest:[u8;32],
+  pinned_image:&[u8],
+  launch:impl FnOnce(VerifiedPid1Admission,u64)->Result<R,Error>
+ )->Result<R,Error>{
+  let checked_entry=verify_pid1_elf64(pinned_image);
+  self.launch_secure_uefi_manifest_image(disk,platform,manifest_digest,
+   |_|{
+    checked_entry?;
+    Ok(crate::m2_sha256::digest(pinned_image))
+   },|receipt|launch(receipt,checked_entry?))
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch8_w6_elf64_tests{
+ use super::*;
+ struct Platform;
+ impl TrustedBootMeasurement for Platform{
+  fn read_verified(&self)->Result<[u8;32],Error>{Ok([3;32])}
+ }
+ impl AuthenticatedPid1Platform for Platform{
+  fn read_sealed_floor(&self)->Result<SealedBootFloor,Error>{
+   Ok(SealedBootFloor{minimum_epoch:4,minimum_journal_generation:20,
+    expected_slot:0,minimum_slot_version:9,expected_measurement:[3;32]})
+  }
+  fn read_bootloader_selected_slot(&self)->Result<(usize,Slot),Error>{
+   Ok((0,tests::slot()))
+  }
+ }
+ impl AuthenticatedSecureUefi for Platform{
+  fn require_firmware_secure_boot_chain(&self)->Result<(),Error>{Ok(())}
+ }
+ fn executable()->[u8;256]{
+  let mut image=[0u8;256];
+  image[..4].copy_from_slice(b"\x7fELF");
+  image[4]=2;image[5]=1;image[6]=1;
+  image[16..18].copy_from_slice(&2u16.to_le_bytes());
+  image[18..20].copy_from_slice(&62u16.to_le_bytes());
+  image[20..24].copy_from_slice(&1u32.to_le_bytes());
+  image[24..32].copy_from_slice(&0x400000u64.to_le_bytes());
+  image[32..40].copy_from_slice(&64u64.to_le_bytes());
+  image[52..54].copy_from_slice(&64u16.to_le_bytes());
+  image[54..56].copy_from_slice(&56u16.to_le_bytes());
+  image[56..58].copy_from_slice(&1u16.to_le_bytes());
+  image[64..68].copy_from_slice(&1u32.to_le_bytes());
+  image[68..72].copy_from_slice(&5u32.to_le_bytes()); // R|X, not W
+  image[72..80].copy_from_slice(&128u64.to_le_bytes());
+  image[80..88].copy_from_slice(&0x400000u64.to_le_bytes());
+  image[96..104].copy_from_slice(&4u64.to_le_bytes());
+  image[104..112].copy_from_slice(&4096u64.to_le_bytes());
+  image[112..120].copy_from_slice(&1u64.to_le_bytes());
+  image[128..132].copy_from_slice(&[0x90,0x90,0x90,0xc3]);
+  image
+ }
+ #[test]fn hash_verified_elf_file_backed_entry_is_handed_to_loader_once(){
+  let mut disk=tests::fixture();let mut gate=BootLaunchGate::new();
+  let image=executable();let expected=crate::m2_sha256::digest(&image);
+  assert_eq!(verify_pid1_elf64(&image),Ok(0x400000));
+  let mut count=0;
+  assert_eq!(gate.launch_secure_uefi_elf64(&mut disk,&Platform,
+   expected,&image,|receipt,entry|{
+    count+=1;Ok((receipt.epoch(),entry))
+   }),Ok((4,0x400000)));
+  assert_eq!(count,1);
+  assert_eq!(gate.launch_secure_uefi_elf64(&mut disk,&Platform,
+   expected,&image,|_,_|{count+=1;Ok((9,0))}),Err(Error::Stale));
+  assert_eq!(count,1);
+ }
+ #[test]fn write_execute_entry_bss_and_truncated_headers_are_not_runnable(){
+  let mut elf=executable();
+  elf[68..72].copy_from_slice(&7u32.to_le_bytes());
+  assert_eq!(verify_pid1_elf64(&elf),Err(Error::Invalid));
+  elf=executable();elf[24..32].copy_from_slice(&0x400100u64.to_le_bytes());
+  assert_eq!(verify_pid1_elf64(&elf),Err(Error::Invalid));
+  elf=executable();elf[32..40].copy_from_slice(&250u64.to_le_bytes());
+  assert_eq!(verify_pid1_elf64(&elf),Err(Error::Invalid));
+  elf=executable();elf[72..80].copy_from_slice(&u64::MAX.to_le_bytes());
+  assert_eq!(verify_pid1_elf64(&elf),Err(Error::Invalid));
+ }
+ #[test]fn invalid_elf_or_wrong_image_hash_burns_authenticated_admission(){
+  let mut disk=tests::fixture();let mut gate=BootLaunchGate::new();
+  let mut elf=executable();let correct=crate::m2_sha256::digest(&elf);
+  elf[68..72].copy_from_slice(&7u32.to_le_bytes());
+  let mut starts=0;
+  assert_eq!(gate.launch_secure_uefi_elf64(&mut disk,&Platform,correct,
+   &elf,|_,_|{starts+=1;Ok(())}),Err(Error::Invalid));
+  assert_eq!(starts,0);assert_eq!(gate.last_admitted_epoch(),4);
+  assert_eq!(gate.launch_secure_uefi_elf64(&mut disk,&Platform,correct,
+   &executable(),|_,_|{starts+=1;Ok(())}),Err(Error::Stale));
+  assert_eq!(starts,0);
+  let mut disk=tests::fixture();let mut gate=BootLaunchGate::new();
+  assert_eq!(gate.launch_secure_uefi_elf64(&mut disk,&Platform,[9;32],
+   &executable(),|_,_|{starts+=1;Ok(())}),Err(Error::Untrusted));
+  assert_eq!(starts,0);
+ }
+}

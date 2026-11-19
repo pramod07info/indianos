@@ -814,3 +814,65 @@ mod kernel_p0_batch7_w1_epoch_coherence_tests{
    &[1,3],40),Err(FenceError::NoProgress));
  }
 }
+
+
+/// P0-141..144: retry the SAME outstanding IPI publication after transient
+/// hardware send failure, never issue a second release generation or forge
+/// an AP acknowledgement. Only the trusted APIC driver may satisfy sender.
+impl LifecycleFence{
+ pub fn retry_pending_ipi_exact<I:LifecycleIpiSender>(
+  &self,bsp:u32,ap:u32,receipt:Receipt,sender:&mut I
+ )->Result<(),FenceError>{
+  if bsp!=self.bsp||ap!=self.ap||bsp==ap{
+   return Err(FenceError::InvalidCpu);
+  }
+  self.require_pending_exact(bsp,receipt)?;
+  sender.send_exact(bsp,ap,receipt)
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch8_w1_ipi_retry_tests{
+ use super::*;
+ struct Sender{fail:bool,attempts:usize,last:Option<Receipt>}
+ impl LifecycleIpiSender for Sender{
+  fn send_exact(&mut self,_:u32,_:u32,receipt:Receipt)->Result<(),FenceError>{
+   self.attempts+=1;self.last=Some(receipt);
+   if self.fail{Err(FenceError::NoProgress)}else{Ok(())}
+  }
+ }
+ #[test]fn failed_first_send_can_retransmit_exact_pending_receipt_once(){
+  let fence=LifecycleFence::new(3,7);
+  let mut ipi=Sender{fail:true,attempts:0,last:None};
+  assert_eq!(fence.publish_and_signal(3,7,12,&mut ipi),
+   Err(FenceError::NoProgress));
+  let receipt=ipi.last.unwrap();
+  assert_eq!(ipi.attempts,1);
+  ipi.fail=false;
+  assert_eq!(fence.retry_pending_ipi_exact(3,7,receipt,&mut ipi),Ok(()));
+  assert_eq!(ipi.attempts,2);assert_eq!(ipi.last,Some(receipt));
+  assert_eq!(fence.require_ack_for_reclaim(3,receipt),
+   Err(FenceError::NoProgress));
+  assert_eq!(fence.acknowledge_after_local_invalidate(7,0,|_|Ok(())),
+   Ok(Some(receipt)));
+  assert_eq!(fence.require_ack_for_reclaim(3,receipt),Ok(()));
+  assert_eq!(fence.retry_pending_ipi_exact(3,7,receipt,&mut ipi),
+   Err(FenceError::StaleReceipt));
+  assert_eq!(ipi.attempts,2);
+ }
+ #[test]fn forged_or_foreign_retry_does_not_touch_apic_sender(){
+  let fence=LifecycleFence::new(3,7);let receipt=fence.publish(3,14).unwrap();
+  let mut sender=Sender{fail:false,attempts:0,last:None};
+  assert_eq!(fence.retry_pending_ipi_exact(3,8,receipt,&mut sender),
+   Err(FenceError::InvalidCpu));
+  assert_eq!(fence.retry_pending_ipi_exact(2,7,receipt,&mut sender),
+   Err(FenceError::InvalidCpu));
+  assert_eq!(fence.retry_pending_ipi_exact(3,7,Receipt{
+   generation:15,..receipt},&mut sender),Err(FenceError::StaleReceipt));
+  assert_eq!(sender.attempts,0);
+  sender.fail=true;
+  assert_eq!(fence.retry_pending_ipi_exact(3,7,receipt,&mut sender),
+   Err(FenceError::NoProgress));
+  assert_eq!(fence.require_ack_for_reclaim(3,receipt),
+   Err(FenceError::NoProgress));
+ }
+}

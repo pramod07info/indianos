@@ -1751,3 +1751,83 @@ mod kernel_p0_batch7_w4_atomic_pair_tests{
   assert_eq!(a,[7;4]);assert_eq!(b,[8;4]);
  }
 }
+
+
+/// P0-153..155: bind both partition metadata fields to independently pinned
+/// SHA-256 digests, while preserving all-or-none caller output. The digest
+/// must come from authenticated boot metadata, NOT the same untrusted disk.
+/// Mismatch permanently retires this view. Physical power-loss is separate.
+impl<D:BlockDevice> StableReadOnlyWindow<'_,D>{
+ pub fn read_partition_metadata_pair_sha256(
+  &mut self,partition_start:u64,partition_sectors:u64,
+  first:(u64,usize),first_out:&mut[u8],first_digest:[u8;32],
+  second:(u64,usize),second_out:&mut[u8],second_digest:[u8;32]
+ )->Result<(),BlockError>{
+  if first_out.is_empty()||second_out.is_empty()||
+     first_out.len()>2*SECTOR_BYTES||second_out.len()>2*SECTOR_BYTES{
+   return Err(BlockError::OutOfRange);
+  }
+  if first_digest==[0;32]||second_digest==[0;32]{
+   return Err(BlockError::OutOfRange);
+  }
+  let mut first_staged=[0u8;2*SECTOR_BYTES];
+  let mut second_staged=[0u8;2*SECTOR_BYTES];
+  self.read_partition_metadata_pair(
+   partition_start,partition_sectors,first,&mut first_staged[..first_out.len()],
+   second,&mut second_staged[..second_out.len()])?;
+  if crate::m2_sha256::digest(&first_staged[..first_out.len()])!=first_digest||
+     crate::m2_sha256::digest(&second_staged[..second_out.len()])!=second_digest{
+   self.invalidated=true;
+   return Err(BlockError::Io);
+  }
+  first_out.copy_from_slice(&first_staged[..first_out.len()]);
+  second_out.copy_from_slice(&second_staged[..second_out.len()]);
+  Ok(())
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch8_w4_metadata_hash_tests{
+ use super::*;
+ struct Disk{reads:usize,fail_at:usize}
+ impl BlockDevice for Disk{
+  fn sector_count(&self)->u64{8}
+  fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{
+   self.reads+=1;
+   if self.reads==self.fail_at{return Err(BlockError::Io);}
+   out.fill(lba as u8);Ok(())
+  }
+  fn write_sector(&mut self,_:u64,_:&[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{Err(BlockError::ReadOnly)}
+ }
+ #[test]fn authenticated_hashes_cover_both_real_metadata_outputs(){
+  let mut disk=Disk{reads:0,fail_at:0};
+  let mut view=StableReadOnlyWindow::new(&mut disk).unwrap();
+  let mut a=[9u8;4];let mut b=[9u8;4];
+  let a_hash=crate::m2_sha256::digest(&[2,2,3,3]);
+  let b_hash=crate::m2_sha256::digest(&[3,3,3,3]);
+  assert_eq!(view.read_partition_metadata_pair_sha256(
+   2,3,(0,SECTOR_BYTES-2),&mut a,a_hash,(1,0),&mut b,b_hash),Ok(()));
+  assert_eq!(a,[2,2,3,3]);assert_eq!(b,[3,3,3,3]);
+ }
+ #[test]fn changed_digest_or_fault_never_publishes_partial_values(){
+  let mut disk=Disk{reads:0,fail_at:0};
+  let mut view=StableReadOnlyWindow::new(&mut disk).unwrap();
+  let good=crate::m2_sha256::digest(&[2,2,3,3]);
+  let bad=crate::m2_sha256::digest(&[9,9,9,9]);
+  let mut a=[8u8;4];let mut b=[7u8;4];
+  assert_eq!(view.read_partition_metadata_pair_sha256(
+   2,3,(0,SECTOR_BYTES-2),&mut a,good,(1,0),&mut b,bad),
+   Err(BlockError::Io));
+  assert!(view.is_retired());assert_eq!(a,[8;4]);assert_eq!(b,[7;4]);
+  assert_eq!(view.read_partition_metadata_pair_sha256(
+   2,3,(0,SECTOR_BYTES-2),&mut a,good,(1,0),&mut b,bad),
+   Err(BlockError::Io));
+  let mut disk=Disk{reads:0,fail_at:5};
+  let mut view=StableReadOnlyWindow::new(&mut disk).unwrap();
+  assert_eq!(view.read_partition_metadata_pair_sha256(
+   2,3,(0,SECTOR_BYTES-2),&mut a,good,(1,0),&mut b,good),
+   Err(BlockError::Io));
+  assert_eq!(a,[8;4]);assert_eq!(b,[7;4]);
+ }
+}

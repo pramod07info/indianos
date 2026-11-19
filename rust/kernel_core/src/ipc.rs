@@ -1321,3 +1321,69 @@ mod kernel_p0_batch7_w3_sender_allowlist_tests{
   assert_eq!(router.receive(relay).unwrap().payload(),b"two");
  }
 }
+
+
+/// P0-149..152: owner-authenticated relay additionally enforces a bounded
+/// byte quota for the *entire* source prefix before any mailbox mutation.
+/// This caps one IPC forwarding transaction independently of message count,
+/// and keeps every source/destination FIFO unchanged on quota or ACL failure.
+impl<const M:usize,const D:usize> ScopedRouter<M,D>{
+ pub fn forward_budgeted_sender_prefix_exact(&mut self,relay:Identity,
+  recipients:&[Identity],allowed_receivers:&[Identity],
+  allowed_senders:&[Identity],max_total_bytes:usize
+ )->Result<usize,IpcError>{
+  if recipients.is_empty()||recipients.len()>D||recipients.len()>M||
+     max_total_bytes==0||max_total_bytes>D.saturating_mul(MAX_PAYLOAD){
+   return Err(IpcError::InvalidConfiguration);
+  }
+  let mut preview=Self{boxes:self.boxes};
+  if preview.pending(relay)?<recipients.len(){return Err(IpcError::Empty);}
+  let mut bytes=0usize;
+  preview.receive_batch_exact_with(relay,recipients.len(),|items|{
+   for message in items{
+    bytes=bytes.saturating_add(message.payload().len());
+   }
+   true
+  })?;
+  if bytes>max_total_bytes{return Err(IpcError::PayloadTooLarge);}
+  self.forward_sender_authorized_prefix_exact(
+   relay,recipients,allowed_receivers,allowed_senders)
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch8_w3_byte_budget_tests{
+ use super::*;
+ fn id(pid:u32,g:u64)->Identity{Identity{pid,generation:g}}
+ #[test]fn permitted_prefix_under_byte_budget_keeps_order_and_identity(){
+  let (source,relay,a,b)=(id(1,1),id(2,2),id(3,3),id(4,4));
+  let mut router=ScopedRouter::<4,2>::new().unwrap();
+  for who in [source,relay,a,b]{router.register(who).unwrap();}
+  router.send(source,relay,b"first").unwrap();
+  router.send(source,relay,b"two").unwrap();
+  assert_eq!(router.forward_budgeted_sender_prefix_exact(
+   relay,&[a,b],&[a,b],&[source],8),Ok(2));
+  assert_eq!(router.pending(relay),Ok(0));
+  assert_eq!(router.receive(a).unwrap().payload(),b"first");
+  let second=router.receive(b).unwrap();
+  assert_eq!(second.sender(),relay);assert_eq!(second.payload(),b"two");
+ }
+ #[test]fn budget_sender_acl_and_full_target_leave_source_fifo_intact(){
+  let (source,relay,a,b)=(id(1,1),id(2,2),id(3,3),id(4,4));
+  let mut router=ScopedRouter::<4,2>::new().unwrap();
+  for who in [source,relay,a,b]{router.register(who).unwrap();}
+  router.send(source,relay,b"first").unwrap();
+  router.send(b,relay,b"two").unwrap();
+  assert_eq!(router.forward_budgeted_sender_prefix_exact(
+   relay,&[a,b],&[a,b],&[source,b],7),
+   Err(IpcError::PayloadTooLarge));
+  assert_eq!(router.forward_budgeted_sender_prefix_exact(
+   relay,&[a,b],&[a,b],&[source],8),
+   Err(IpcError::UnknownSender));
+  router.send(source,a,b"full").unwrap();router.send(source,a,b"busy").unwrap();
+  assert_eq!(router.forward_budgeted_sender_prefix_exact(
+   relay,&[a,b],&[a,b],&[source,b],8),Err(IpcError::Full));
+  assert_eq!(router.pending(relay),Ok(2));
+  assert_eq!(router.receive(relay).unwrap().payload(),b"first");
+  assert_eq!(router.receive(relay).unwrap().payload(),b"two");
+ }
+}
