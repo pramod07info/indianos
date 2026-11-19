@@ -1831,3 +1831,156 @@ mod kernel_p0_batch10_w6_pid1_mapping_budget_tests{
   assert!(!launched);
  }
 }
+
+
+
+/// P0-218..220: preflight explicit, bounded user PT_LOAD copy/zero-fill
+/// descriptors before the trusted loader can map anything. Descriptors
+/// describe exact caller-pinned file bytes and BSS zero-fill; no live PTEs
+/// are written here. Invalid output capacity never publishes a partial plan.
+#[derive(Clone,Copy,Debug,Eq,PartialEq)]
+pub struct Pid1SegmentPlan{
+ pub file_offset:u64,
+ pub virtual_address:u64,
+ pub file_bytes:u64,
+ pub zero_fill_bytes:u64,
+ pub permission_bits:u32,
+}
+const EMPTY_PID1_SEGMENT:Pid1SegmentPlan=Pid1SegmentPlan{
+ file_offset:0,virtual_address:0,file_bytes:0,zero_fill_bytes:0,
+ permission_bits:0,
+};
+pub fn plan_pid1_elf64_segments(
+ image:&[u8],stack_top:u64,stack_pages:usize,
+ output:&mut[Pid1SegmentPlan]
+)->Result<(u64,usize),Error>{
+ let entry=verify_pid1_elf64_bounded_mapping(image,stack_top,stack_pages)?;
+ let phoff=u64::from_le_bytes(image[32..40].try_into()
+   .map_err(|_|Error::Invalid)?) as usize;
+ let phnum=u16::from_le_bytes(image[56..58].try_into()
+   .map_err(|_|Error::Invalid)?) as usize;
+ let mut staged=[EMPTY_PID1_SEGMENT;64];
+ let mut count=0usize;
+ for i in 0..phnum{
+  let at=phoff+i*56;
+  if u32::from_le_bytes(image[at..at+4].try_into()
+    .map_err(|_|Error::Invalid)?)!=1{continue;}
+  let flags=u32::from_le_bytes(image[at+4..at+8].try_into()
+    .map_err(|_|Error::Invalid)?);
+  let file_offset=u64::from_le_bytes(image[at+8..at+16].try_into()
+    .map_err(|_|Error::Invalid)?);
+  let virtual_address=u64::from_le_bytes(image[at+16..at+24].try_into()
+    .map_err(|_|Error::Invalid)?);
+  let file_bytes=u64::from_le_bytes(image[at+32..at+40].try_into()
+    .map_err(|_|Error::Invalid)?);
+  let memory_bytes=u64::from_le_bytes(image[at+40..at+48].try_into()
+    .map_err(|_|Error::Invalid)?);
+  let zero_fill_bytes=memory_bytes.checked_sub(file_bytes)
+    .ok_or(Error::Invalid)?;
+  staged[count]=Pid1SegmentPlan{
+   file_offset,virtual_address,file_bytes,zero_fill_bytes,
+   permission_bits:flags,
+  };
+  count+=1;
+ }
+ if output.len()<count{return Err(Error::Invalid);}
+ output[..count].copy_from_slice(&staged[..count]);
+ Ok((entry,count))
+}
+impl BootLaunchGate{
+ /// Authenticated one-shot launch: even malformed descriptors consume the
+ /// exact signed-UEFI admission. The caller must map only the provided
+ /// checked regions, zero BSS, preserve permissions and keep guard unmapped.
+ pub fn launch_secure_uefi_planned_elf64<D:BlockDevice,P:AuthenticatedSecureUefi,R>(
+  &mut self,disk:&mut D,platform:&P,manifest_digest:[u8;32],
+  image:&[u8],stack_top:u64,stack_pages:usize,
+  launch:impl FnOnce(VerifiedPid1Admission,u64,&[Pid1SegmentPlan])->Result<R,Error>
+ )->Result<R,Error>{
+  let mut segments=[EMPTY_PID1_SEGMENT;64];
+  let checked=plan_pid1_elf64_segments(
+   image,stack_top,stack_pages,&mut segments);
+  self.launch_secure_uefi_manifest_image(disk,platform,manifest_digest,
+   |_|{checked?;Ok(crate::m2_sha256::digest(image))},
+   |receipt|{
+    let (entry,count)=checked?;
+    launch(receipt,entry,&segments[..count])
+   })
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch11_w6_pid1_plan_tests{
+ use super::*;
+ struct Platform;
+ impl TrustedBootMeasurement for Platform{
+  fn read_verified(&self)->Result<[u8;32],Error>{Ok([3;32])}
+ }
+ impl AuthenticatedPid1Platform for Platform{
+  fn read_sealed_floor(&self)->Result<SealedBootFloor,Error>{
+   Ok(SealedBootFloor{minimum_epoch:4,minimum_journal_generation:20,
+    expected_slot:0,minimum_slot_version:9,expected_measurement:[3;32]})
+  }
+  fn read_bootloader_selected_slot(&self)->Result<(usize,Slot),Error>{
+   Ok((0,tests::slot()))
+  }
+ }
+ impl AuthenticatedSecureUefi for Platform{
+  fn require_firmware_secure_boot_chain(&self)->Result<(),Error>{Ok(())}
+ }
+ fn elf()->[u8;256]{
+  let mut image=[0u8;256];image[..4].copy_from_slice(b"\x7fELF");
+  image[4]=2;image[5]=1;image[6]=1;
+  image[16..18].copy_from_slice(&2u16.to_le_bytes());
+  image[18..20].copy_from_slice(&62u16.to_le_bytes());
+  image[20..24].copy_from_slice(&1u32.to_le_bytes());
+  image[24..32].copy_from_slice(&0x400000u64.to_le_bytes());
+  image[32..40].copy_from_slice(&64u64.to_le_bytes());
+  image[52..54].copy_from_slice(&64u16.to_le_bytes());
+  image[54..56].copy_from_slice(&56u16.to_le_bytes());
+  image[56..58].copy_from_slice(&1u16.to_le_bytes());
+  image[64..68].copy_from_slice(&1u32.to_le_bytes());
+  image[68..72].copy_from_slice(&5u32.to_le_bytes());
+  image[72..80].copy_from_slice(&128u64.to_le_bytes());
+  image[80..88].copy_from_slice(&0x400000u64.to_le_bytes());
+  image[96..104].copy_from_slice(&4u64.to_le_bytes());
+  image[104..112].copy_from_slice(&4096u64.to_le_bytes());
+  image[112..120].copy_from_slice(&1u64.to_le_bytes());
+  image[128..132].copy_from_slice(&[0x90,0x90,0x90,0xc3]);
+  image
+ }
+ #[test]fn checked_plan_contains_exact_copy_zero_and_permission_ranges(){
+  let image=elf();let mut plan=[EMPTY_PID1_SEGMENT;2];
+  assert_eq!(plan_pid1_elf64_segments(&image,0x800000,8,&mut plan),
+   Ok((0x400000,1)));
+  assert_eq!(plan[0],Pid1SegmentPlan{
+   file_offset:128,virtual_address:0x400000,file_bytes:4,
+   zero_fill_bytes:4092,permission_bits:5,
+  });
+  let mut output=[Pid1SegmentPlan{file_offset:99,..EMPTY_PID1_SEGMENT};1];
+  let mut bad=elf();
+  bad[104..112].copy_from_slice(&(96u64*1024*1024).to_le_bytes());
+  assert_eq!(plan_pid1_elf64_segments(&bad,0x80000000,8,&mut output),
+    Err(Error::Invalid));
+  assert_eq!(output[0].file_offset,99);
+  let mut nothing:[Pid1SegmentPlan;0]=[];
+  assert_eq!(plan_pid1_elf64_segments(&image,0x800000,8,&mut nothing),
+   Err(Error::Invalid));
+ }
+ #[test]fn one_use_boot_admission_survives_success_and_rejects_replay(){
+  let image=elf();let hash=crate::m2_sha256::digest(&image);
+  let mut disk=tests::fixture();let mut gate=BootLaunchGate::new();
+  let mut launches=0;
+  assert_eq!(gate.launch_secure_uefi_planned_elf64(
+    &mut disk,&Platform,hash,&image,0x800000,8,|_,entry,segments|{
+      launches+=1;
+      assert_eq!(entry,0x400000);
+      assert_eq!(segments.len(),1);
+      Ok(())
+    }),Ok(()));
+  assert_eq!(launches,1);
+  assert_eq!(gate.launch_secure_uefi_planned_elf64(
+    &mut disk,&Platform,hash,&image,0x800000,8,|_,_,_|{
+      launches+=1;Ok(())
+    }),Err(Error::Stale));
+  assert_eq!(launches,1);
+ }
+}

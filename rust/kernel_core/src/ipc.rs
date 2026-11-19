@@ -1543,3 +1543,102 @@ mod kernel_p0_batch10_w3_ordered_live_ipc_tests{
   assert!(!copied);assert_eq!(router.pending(dest),Ok(0));
  }
 }
+
+
+
+/// P0-209..212: receive exactly one message from each distinct authenticated
+/// mailbox as ONE transaction. Validate all identities, sender allowlist and
+/// aggregate payload budget on a private copy. A failed copy, stale sender
+/// or empty later mailbox must leave ALL earlier receiver FIFOs unchanged.
+/// Caller serializes the router across CPUs and pins the user destination.
+impl<const M:usize,const D:usize> ScopedRouter<M,D>{
+ pub fn receive_multi_owner_atomic(
+  &mut self,receivers:&[Identity],allowed_senders:&[Identity],
+  max_total_bytes:usize,deliver:impl FnOnce(&[TaggedMessage])->bool
+ )->Result<usize,IpcError>{
+  if receivers.is_empty()||receivers.len()>M||allowed_senders.is_empty()||
+    allowed_senders.len()>M||max_total_bytes==0||
+    max_total_bytes>M.saturating_mul(MAX_PAYLOAD){
+   return Err(IpcError::InvalidConfiguration);
+  }
+  for (i,receiver) in receivers.iter().enumerate(){
+   if receiver.pid==0||receiver.generation==0{
+    return Err(IpcError::InvalidPid);
+   }
+   if receivers[..i].iter().any(|old|old.pid==receiver.pid){
+    return Err(IpcError::DuplicateReceiver);
+   }
+  }
+  for (i,sender) in allowed_senders.iter().enumerate(){
+   if sender.pid==0||sender.generation==0{return Err(IpcError::InvalidPid);}
+   if allowed_senders[..i].iter().any(|old|old.pid==sender.pid){
+    return Err(IpcError::DuplicateReceiver);
+   }
+  }
+  let mut staged=self.clone();
+  let mut records=[TaggedMessage{sender:receivers[0],length:0,
+    bytes:[0u8;MAX_PAYLOAD]};M];
+  let mut bytes=0usize;
+  for (i,receiver) in receivers.iter().enumerate(){
+   let message=staged.receive(*receiver)?;
+   if !allowed_senders.contains(&message.sender())||
+      !staged.boxes.iter().flatten().any(|b|b.owner==message.sender()){
+    return Err(IpcError::UnknownSender);
+   }
+   bytes=bytes.checked_add(message.payload().len())
+     .ok_or(IpcError::PayloadTooLarge)?;
+   if bytes>max_total_bytes{return Err(IpcError::PayloadTooLarge);}
+   records[i]=message;
+  }
+  if !deliver(&records[..receivers.len()]){return Err(IpcError::CopyFailed);}
+  *self=staged;
+  Ok(receivers.len())
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch11_w3_multi_owner_receive_tests{
+ use super::*;
+ fn id(p:u32,g:u64)->Identity{Identity{pid:p,generation:g}}
+ #[test]fn atomic_receive_is_ordered_and_rollback_safe(){
+  let a=id(1,1);let b=id(2,2);let x=id(3,3);let y=id(4,4);
+  let mut r=ScopedRouter::<4,2>::new().unwrap();
+  for who in [a,b,x,y]{r.register(who).unwrap();}
+  r.send(a,x,b"abc").unwrap();
+  let mut calls=0;
+  assert_eq!(r.receive_multi_owner_atomic(&[x,y],&[a,b],10,|_|{
+   calls+=1;true
+  }),Err(IpcError::Empty));
+  assert_eq!(calls,0);assert_eq!(r.pending(x),Ok(1));
+  r.send(b,y,b"xyz").unwrap();
+  assert_eq!(r.receive_multi_owner_atomic(&[x,y],&[a,b],5,|_|{
+   calls+=1;true
+  }),Err(IpcError::PayloadTooLarge));
+  assert_eq!(r.receive_multi_owner_atomic(&[x,y],&[a],6,|_|{
+   calls+=1;true
+  }),Err(IpcError::UnknownSender));
+  assert_eq!(calls,0);
+  assert_eq!(r.receive_multi_owner_atomic(&[x,y],&[a,b],6,|_|{
+   calls+=1;false
+  }),Err(IpcError::CopyFailed));
+  assert_eq!(r.pending(x),Ok(1));assert_eq!(r.pending(y),Ok(1));
+  assert_eq!(r.receive_multi_owner_atomic(&[y,x],&[b,a],6,|msgs|{
+   calls+=1;msgs[0].sender()==b&&msgs[1].sender()==a
+  }),Ok(2));
+  assert_eq!(r.pending(x),Ok(0));assert_eq!(r.pending(y),Ok(0));
+  assert_eq!(calls,2);
+ }
+ #[test]fn duplicates_and_retired_sender_cannot_dequeue(){
+  let a=id(1,1);let x=id(2,1);let y=id(3,1);
+  let mut r=ScopedRouter::<3,2>::new().unwrap();
+  for who in [a,x,y]{r.register(who).unwrap();}
+  r.send(a,x,b"hello").unwrap();r.send(a,y,b"world").unwrap();
+  assert_eq!(r.receive_multi_owner_atomic(&[x,x],&[a],12,|_|true),
+   Err(IpcError::DuplicateReceiver));
+  assert_eq!(r.receive_multi_owner_atomic(&[x,y],&[a,id(1,2)],12,|_|true),
+   Err(IpcError::DuplicateReceiver));
+  r.reap(a).unwrap();
+  assert_eq!(r.receive_multi_owner_atomic(&[x,y],&[a],12,|_|true),
+   Err(IpcError::Empty));
+  assert_eq!(r.pending(x),Ok(0));assert_eq!(r.pending(y),Ok(0));
+ }
+}

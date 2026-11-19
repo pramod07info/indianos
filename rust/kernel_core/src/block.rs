@@ -1989,3 +1989,122 @@ mod kernel_p0_batch10_w4_disjoint_manifest_tests{
   assert_eq!(a,[9;4]);assert_eq!(b,[8;4]);assert!(window.is_retired());
  }
 }
+
+
+
+/// P0-213..215: read three separately signed, disjoint partition metadata
+/// fields, with one complete repeat of the first two after the third has
+/// been observed. Preflight all ranges before I/O; never publish a partial
+/// caller buffer. A changed digest or read fault retires this media session.
+impl<D:BlockDevice> StableReadOnlyWindow<'_,D>{
+ pub fn read_disjoint_partition_domain_triple(
+  &mut self,start:u64,count:u64,
+  positions:[(u64,usize);3],digests:[[u8;32];3],
+  outputs:[&mut[u8];3]
+ )->Result<(),BlockError>{
+  check_range(self.capacity,start,count)?;
+  let mut lens=[0usize;3];
+  let mut begins=[0u128;3];
+  let mut ends=[0u128;3];
+  for i in 0..3{
+   lens[i]=outputs[i].len();
+   if lens[i]==0||lens[i]>2*SECTOR_BYTES||positions[i].1>=SECTOR_BYTES||
+      digests[i]==[0u8;32]{
+    return Err(BlockError::OutOfRange);
+   }
+   begins[i]=(positions[i].0 as u128)*SECTOR_BYTES as u128+
+     positions[i].1 as u128;
+   ends[i]=begins[i]+lens[i] as u128;
+   if ends[i]>(count as u128)*SECTOR_BYTES as u128{
+    return Err(BlockError::OutOfRange);
+   }
+   for j in 0..i{
+    if begins[i]<ends[j]&&begins[j]<ends[i]{
+     return Err(BlockError::OutOfRange);
+    }
+   }
+  }
+  let mut a=[0u8;2*SECTOR_BYTES];
+  let mut b=[0u8;2*SECTOR_BYTES];
+  let mut c=[0u8;2*SECTOR_BYTES];
+  self.read_partition_domain_bound_pair(start,count,
+   positions[0],&mut a[..lens[0]],digests[0],
+   positions[1],&mut b[..lens[1]],digests[1])?;
+  self.read_partition_metadata_bytes(start,count,positions[2].0,
+   positions[2].1,&mut c[..lens[2]])?;
+  if domain_bound_metadata_sha256(start,count,positions[2].0,
+     positions[2].1,&c[..lens[2]])?!=digests[2]{
+   self.invalidated=true;return Err(BlockError::Io);
+  }
+  let mut re_a=[0u8;2*SECTOR_BYTES];
+  let mut re_b=[0u8;2*SECTOR_BYTES];
+  self.read_partition_domain_bound_pair(start,count,
+   positions[0],&mut re_a[..lens[0]],digests[0],
+   positions[1],&mut re_b[..lens[1]],digests[1])?;
+  if a[..lens[0]]!=re_a[..lens[0]]||b[..lens[1]]!=re_b[..lens[1]]{
+   self.invalidated=true;return Err(BlockError::Io);
+  }
+  let [out_a,out_b,out_c]=outputs;
+  out_a.copy_from_slice(&a[..lens[0]]);
+  out_b.copy_from_slice(&b[..lens[1]]);
+  out_c.copy_from_slice(&c[..lens[2]]);
+  Ok(())
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch11_w4_triple_metadata_tests{
+ use super::*;
+ struct Disk{reads:usize,fail_at:usize,flip_after:usize}
+ impl BlockDevice for Disk{
+  fn sector_count(&self)->u64{9}
+  fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{
+   self.reads+=1;
+   if self.reads==self.fail_at{return Err(BlockError::Io);}
+   out.fill(lba as u8+if self.reads>=self.flip_after{1}else{0});
+   Ok(())
+  }
+  fn write_sector(&mut self,_:u64,_:&[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{Err(BlockError::ReadOnly)}
+ }
+ fn digests()->[[u8;32];3]{
+  [2u8,3,4].map(|v|domain_bound_metadata_sha256(
+   2,4,(v-2) as u64,0,&[v;4]).unwrap())
+ }
+ #[test]fn three_fields_publish_together_after_repeated_observation(){
+  let mut disk=Disk{reads:0,fail_at:0,flip_after:usize::MAX};
+  let mut view=StableReadOnlyWindow::new(&mut disk).unwrap();
+  let mut a=[9;4];let mut b=[9;4];let mut c=[9;4];
+  assert_eq!(view.read_disjoint_partition_domain_triple(
+   2,4,[(0,0),(1,0),(2,0)],digests(),
+   [&mut a,&mut b,&mut c]),Ok(()));
+  assert_eq!(a,[2;4]);assert_eq!(b,[3;4]);assert_eq!(c,[4;4]);
+  assert!(!view.is_retired());
+ }
+ #[test]fn overlap_and_fault_prevent_all_publication(){
+  let mut disk=Disk{reads:0,fail_at:0,flip_after:usize::MAX};
+  let mut view=StableReadOnlyWindow::new(&mut disk).unwrap();
+  let mut a=[9;4];let mut b=[9;4];let mut c=[9;4];
+  assert_eq!(view.read_disjoint_partition_domain_triple(
+   2,4,[(0,0),(0,2),(2,0)],digests(),
+   [&mut a,&mut b,&mut c]),Err(BlockError::OutOfRange));
+  assert_eq!(view.device.reads,0);
+  let mut disk=Disk{reads:0,fail_at:5,flip_after:usize::MAX};
+  let mut view=StableReadOnlyWindow::new(&mut disk).unwrap();
+  assert_eq!(view.read_disjoint_partition_domain_triple(
+   2,4,[(0,0),(1,0),(2,0)],digests(),
+   [&mut a,&mut b,&mut c]),Err(BlockError::Io));
+  assert_eq!(a,[9;4]);assert_eq!(b,[9;4]);assert_eq!(c,[9;4]);
+  assert!(view.is_retired());
+ }
+ #[test]fn altered_signed_third_field_poisoned_forever(){
+  let mut disk=Disk{reads:0,fail_at:0,flip_after:5};
+  let mut view=StableReadOnlyWindow::new(&mut disk).unwrap();
+  let mut a=[9;4];let mut b=[9;4];let mut c=[9;4];
+  assert_eq!(view.read_disjoint_partition_domain_triple(
+   2,4,[(0,0),(1,0),(2,0)],digests(),
+   [&mut a,&mut b,&mut c]),Err(BlockError::Io));
+  assert!(view.is_retired());
+  assert_eq!(a,[9;4]);assert_eq!(b,[9;4]);assert_eq!(c,[9;4]);
+ }
+}

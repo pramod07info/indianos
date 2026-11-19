@@ -1013,3 +1013,72 @@ mod m1_ws20_exact_ingress_snapshot_tests {
   assert_eq!(nic.finish_rebind(quiesce),Ok(2));
  }
 }
+
+
+
+/// P0-205..208: bind process teardown to the ingress epoch captured
+/// before the trusted scheduler chose its victims. A rebind/start occurring
+/// after capture invalidates the whole batch, including live socket cleanup.
+/// The caller holds the exclusive PCB/socket scheduler lock throughout.
+impl<const C:usize,const U:usize,const E:usize> ProcessRetirement<C,U,E>{
+ pub fn retire_ingress_pinned_exited_batch<const P:usize,const Q:usize>(
+  &mut self,sockets:&mut EpochUdpEndpoints<P,Q>,snapshot:IngressRevision,
+  owners:&[Owner]
+ )->Result<RetirementReceipt,RetirementError>{
+  if snapshot.0!=self.ingress_revision{
+   return Err(RetirementError::Sockets(SocketError::Denied));
+  }
+  if owners.is_empty()||owners.len()>C{
+   return Err(RetirementError::Capabilities(EpochError::Denied));
+  }
+  for (i,owner) in owners.iter().enumerate(){
+   if owner.pid<=1||owner.generation==0||
+      owners[..i].iter().any(|previous|previous.pid==owner.pid){
+    return Err(RetirementError::Capabilities(EpochError::Denied));
+   }
+   self.require_active(*owner)?;
+  }
+  self.retire_live_exited_batch(sockets,owners)
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch11_w2_ingress_retirement_tests{
+ use super::*;
+ #[test]fn stale_ingress_snapshot_does_not_retire_or_notify(){
+  let mut k=ProcessRetirement::<4,4,4>::new();
+  let mut sockets=EpochUdpEndpoints::<4,4>::new();
+  let a=k.start(2).unwrap();
+  k.bind_live_udp(&mut sockets,a,3202).unwrap();
+  let old=k.capture_polled_ingress_revision();
+  let b=k.start(3).unwrap();
+  assert_eq!(k.retire_ingress_pinned_exited_batch(
+   &mut sockets,old,&[a]),Err(RetirementError::Sockets(SocketError::Denied)));
+  assert_eq!(k.active_generation(a.pid),Some(a.generation));
+  assert_eq!(k.queued_notices(),0);
+  assert_eq!(k.active_udp_ports(),1);
+  let fresh=k.capture_polled_ingress_revision();
+  assert_eq!(k.retire_ingress_pinned_exited_batch(
+   &mut sockets,fresh,&[a,a]),Err(RetirementError::Capabilities(EpochError::Denied)));
+  assert_eq!(k.retire_ingress_pinned_exited_batch(
+   &mut sockets,fresh,&[Owner{pid:1,generation:1}]),
+   Err(RetirementError::Capabilities(EpochError::Denied)));
+  assert_eq!(k.active_generation(b.pid),Some(b.generation));
+  assert_eq!(k.queued_notices(),0);
+ }
+ #[test]fn exact_epoch_retirement_commits_socket_and_notice_together(){
+  let mut k=ProcessRetirement::<4,4,4>::new();
+  let mut sockets=EpochUdpEndpoints::<4,4>::new();
+  let a=k.start(2).unwrap();
+  k.bind_live_udp(&mut sockets,a,3202).unwrap();
+  let snapshot=k.capture_polled_ingress_revision();
+  let receipt=k.retire_ingress_pinned_exited_batch(
+   &mut sockets,snapshot,&[a]).unwrap();
+  assert_eq!(receipt.udp_ports_released,1);
+  assert_eq!(receipt.notices_enqueued,1);
+  assert_eq!(k.active_udp_ports(),0);
+  assert_eq!(k.queued_notices(),1);
+  assert_ne!(k.capture_polled_ingress_revision(),snapshot);
+  assert_eq!(k.retire_ingress_pinned_exited_batch(
+   &mut sockets,snapshot,&[a]),Err(RetirementError::Sockets(SocketError::Denied)));
+ }
+}

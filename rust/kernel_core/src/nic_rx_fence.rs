@@ -1044,3 +1044,73 @@ mod kernel_p0_batch10_w5_flow_binding_tests{
   assert_eq!(calls,0);
  }
 }
+
+
+
+/// P0-216..217: accept an exact Ethernet/IPv4 ARP reply only for the
+/// kernel-pinned peer and local interface identities. No user-controlled
+/// MAC, IP, gratuitous request or spoofed target may update a neighbor table.
+/// Caller must stage its neighbor update until this live-RX-epoch guard returns.
+impl NicRxFence{
+ pub fn parse_authenticated_arp_reply<R>(
+  &self,device:u32,frame:&[u8],max_frame:usize,
+  peer_mac:[u8;6],local_mac:[u8;6],peer_ip:[u8;4],local_ip:[u8;4],
+  parse:impl FnOnce()->Option<R>
+ )->Result<R,RxFenceError>{
+  if max_frame<42||frame.len()!=42||frame.len()>max_frame||
+     peer_mac==local_mac||peer_mac==[0;6]||local_mac==[0;6]||
+     peer_mac[0]&1!=0||local_mac[0]&1!=0||
+     peer_ip==local_ip||peer_ip[0]==0||local_ip[0]==0||
+     peer_ip[0]>=224||local_ip[0]>=224||
+     frame[..6]!=local_mac||frame[6..12]!=peer_mac||
+     frame[12..14]!=[0x08,0x06]||
+     frame[14..16]!=[0,1]||frame[16..18]!=[8,0]||
+     frame[18]!=6||frame[19]!=4||frame[20..22]!=[0,2]||
+     frame[22..28]!=peer_mac||frame[28..32]!=peer_ip||
+     frame[32..38]!=local_mac||frame[38..42]!=local_ip{
+    return Err(RxFenceError::Capacity);
+  }
+  self.parse_packet_at_live_epoch(device,parse)
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch11_w5_arp_epoch_tests{
+ use super::*;
+ const PEER:[u8;6]=[2,3,4,5,6,7];
+ const LOCAL:[u8;6]=[2,8,9,10,11,12];
+ fn reply()->[u8;42]{
+  let mut b=[0u8;42];
+  b[..6].copy_from_slice(&LOCAL);
+  b[6..12].copy_from_slice(&PEER);
+  b[12..14].copy_from_slice(&[8,6]);
+  b[14..16].copy_from_slice(&[0,1]);
+  b[16..18].copy_from_slice(&[8,0]);
+  b[18]=6;b[19]=4;b[20..22].copy_from_slice(&[0,2]);
+  b[22..28].copy_from_slice(&PEER);
+  b[28..32].copy_from_slice(&[10,0,0,1]);
+  b[32..38].copy_from_slice(&LOCAL);
+  b[38..42].copy_from_slice(&[10,0,0,2]);
+  b
+ }
+ #[test]fn valid_reply_needs_live_nic_epoch(){
+  let nic=NicRxFence::new(7);let packet=reply();
+  assert_eq!(nic.parse_authenticated_arp_reply(7,&packet,64,
+   PEER,LOCAL,[10,0,0,1],[10,0,0,2],||Some(5)),Ok(5));
+  assert_eq!(nic.parse_authenticated_arp_reply(7,&packet,64,
+   PEER,LOCAL,[10,0,0,1],[10,0,0,2],||{
+    nic.begin_quiesce(7).unwrap();Some(5)
+   }),Err(RxFenceError::Stale));
+ }
+ #[test]fn spoofing_and_wrong_opcode_rejected_before_callback(){
+  let nic=NicRxFence::new(7);let mut packet=reply();let mut calls=0;
+  for index in [6,20,26,32,41]{
+   let original=packet[index];packet[index]^=1;
+   assert_eq!(nic.parse_authenticated_arp_reply(7,&packet,64,
+    PEER,LOCAL,[10,0,0,1],[10,0,0,2],||{
+     calls+=1;Some(1)
+    }),Err(RxFenceError::Capacity));
+   packet[index]=original;
+  }
+  assert_eq!(calls,0);
+ }
+}

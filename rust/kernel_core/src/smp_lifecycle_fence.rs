@@ -1042,3 +1042,66 @@ mod kernel_p0_batch10_w1_exact_ipi_resume_tests{
    &[(&a,0,x),(&b,0,y)],&[1,2],55),Ok(()));
  }
 }
+
+
+
+/// P0-201..204: refuse malformed user-space TLB shootdown ranges BEFORE
+/// publishing any AP lifecycle receipt. Every attempted hardware IPI remains
+/// visible in issued[] after a partial failure. The trusted AP handler must
+/// invalidate the specified pages before acknowledging its exact receipt.
+/// This function dispatches receipts; it does NOT itself invalidate a TLB.
+pub fn dispatch_user_tlb_invalidation<I:LifecycleIpiSender>(
+ topology:&[(&LifecycleFence,u32)],bsp:u32,epoch:u64,
+ first_page:u64,page_count:u32,sender:&mut I,
+ issued:&mut[Option<Receipt>]
+)->Result<usize,FenceError>{
+ const PAGE:u64=4096;
+ const USER_END:u64=0x0000_8000_0000_0000;
+ if first_page<PAGE||first_page%PAGE!=0||page_count==0||
+    page_count>4096||first_page.checked_add((page_count as u64)*PAGE)
+      .is_none_or(|end|end>USER_END){
+  return Err(FenceError::InvalidGeneration);
+ }
+ publish_and_signal_epoch_topology(topology,bsp,epoch,sender,issued)
+}
+#[cfg(test)]
+mod kernel_p0_batch11_w1_tlb_dispatch_tests{
+ use super::*;
+ struct Ipi{calls:usize,fail_on:usize}
+ impl LifecycleIpiSender for Ipi{
+  fn send_exact(&mut self,_:u32,_:u32,_:Receipt)->Result<(),FenceError>{
+   self.calls+=1;
+   if self.calls==self.fail_on{Err(FenceError::NoProgress)}else{Ok(())}
+  }
+ }
+ #[test]fn invalid_pages_cannot_publish_or_send(){
+  let a=LifecycleFence::new(0,1);let mut issued=[None];
+  let mut ipi=Ipi{calls:0,fail_on:usize::MAX};
+  for (at,n) in [(0,1),(1,1),(4096,0),(4096,4097),
+                 (0x0000_8000_0000_0000,1),(u64::MAX-4095,2)]{
+   assert_eq!(dispatch_user_tlb_invalidation(
+    &[(&a,1)],0,9,at,n,&mut ipi,&mut issued),
+    Err(FenceError::InvalidGeneration));
+  }
+  assert_eq!(ipi.calls,0);
+  assert_eq!(issued,[None]);
+ }
+ #[test]fn attempted_ipis_never_count_as_local_invalidation(){
+  let a=LifecycleFence::new(0,1);let b=LifecycleFence::new(0,2);
+  let mut issued=[None;2];let mut ipi=Ipi{calls:0,fail_on:2};
+  assert_eq!(dispatch_user_tlb_invalidation(
+    &[(&a,1),(&b,2)],0,19,0x4000,3,&mut ipi,&mut issued),
+    Err(FenceError::NoProgress));
+  assert_eq!(ipi.calls,2);
+  let x=issued[0].unwrap();let y=issued[1].unwrap();
+  assert_eq!(a.require_ack_for_reclaim(0,x),Err(FenceError::NoProgress));
+  assert_eq!(b.require_ack_for_reclaim(0,y),Err(FenceError::NoProgress));
+  assert_eq!(a.acknowledge_after_local_invalidate(1,0,|_|Err(FenceError::IncompleteLocalWork)),
+    Err(FenceError::IncompleteLocalWork));
+  assert_eq!(a.require_ack_for_reclaim(0,x),Err(FenceError::NoProgress));
+  a.acknowledge_after_local_invalidate(1,0,|_|Ok(())).unwrap();
+  b.acknowledge_after_local_invalidate(2,0,|_|Ok(())).unwrap();
+  assert_eq!(a.require_ack_for_reclaim(0,x),Ok(()));
+  assert_eq!(b.require_ack_for_reclaim(0,y),Ok(()));
+ }
+}
