@@ -1601,3 +1601,113 @@ mod kernel_p0_batch8_w6_elf64_tests{
   assert_eq!(starts,0);
  }
 }
+
+
+/// P0-178..180: page-granular ELF64 mapping preflight with bounded user
+/// stack and a completely unmapped guard page. Two byte-disjoint PT_LOAD
+/// segments may share one PTE; reject any such permissions ambiguity.
+/// This verifies a mapping plan but does not actually create page tables.
+pub fn verify_pid1_elf64_page_isolation(image:&[u8],
+ stack_top:u64,stack_pages:usize)->Result<u64,Error>{
+ let entry=verify_pid1_elf64(image)?;
+ const PAGE:u64=4096;
+ const USER_END:u64=0x0000_8000_0000_0000;
+ if !(2..=256).contains(&stack_pages)||stack_top%PAGE!=0||
+    stack_top>USER_END||stack_top<0x10000+PAGE{
+  return Err(Error::Invalid);
+ }
+ let guarded_bytes=(stack_pages as u64+1)*PAGE;
+ let guard_start=stack_top.checked_sub(guarded_bytes).ok_or(Error::Invalid)?;
+ if guard_start<0x10000{return Err(Error::Invalid);}
+ let phoff=u64::from_le_bytes(image[32..40].try_into().map_err(|_|Error::Invalid)?) as usize;
+ let phnum=u16::from_le_bytes(image[56..58].try_into().map_err(|_|Error::Invalid)?) as usize;
+ for i in 0..phnum{
+  let base=phoff+i*56;
+  if u32::from_le_bytes(image[base..base+4].try_into().map_err(|_|Error::Invalid)?)!=1{
+   continue;
+  }
+  let start=u64::from_le_bytes(image[base+16..base+24].try_into().map_err(|_|Error::Invalid)?);
+  let len=u64::from_le_bytes(image[base+40..base+48].try_into().map_err(|_|Error::Invalid)?);
+  let page_start=start&!(PAGE-1);
+  let page_end=start.checked_add(len).and_then(|v|v.checked_add(PAGE-1))
+   .ok_or(Error::Invalid)?&!(PAGE-1);
+  if page_start<stack_top&&guard_start<page_end{return Err(Error::Invalid);}
+  for j in 0..i{
+   let other=phoff+j*56;
+   if u32::from_le_bytes(image[other..other+4].try_into().map_err(|_|Error::Invalid)?)!=1{
+    continue;
+   }
+   let before=u64::from_le_bytes(image[other+16..other+24].try_into().map_err(|_|Error::Invalid)?);
+   let size=u64::from_le_bytes(image[other+40..other+48].try_into().map_err(|_|Error::Invalid)?);
+   let before_end=before.checked_add(size).and_then(|v|v.checked_add(PAGE-1))
+    .ok_or(Error::Invalid)?&!(PAGE-1);
+   if page_start<before_end&&(before&!(PAGE-1))<page_end{
+    return Err(Error::Invalid);
+   }
+  }
+ }
+ Ok(entry)
+}
+impl BootLaunchGate{
+ pub fn launch_secure_uefi_elf64_isolated<D:BlockDevice,P:AuthenticatedSecureUefi,R>(
+  &mut self,disk:&mut D,platform:&P,manifest_digest:[u8;32],
+  image:&[u8],stack_top:u64,stack_pages:usize,
+  launch:impl FnOnce(VerifiedPid1Admission,u64)->Result<R,Error>
+ )->Result<R,Error>{
+  let isolated=verify_pid1_elf64_page_isolation(image,stack_top,stack_pages);
+  self.launch_secure_uefi_manifest_image(disk,platform,manifest_digest,
+   |_|{
+    isolated?;
+    Ok(crate::m2_sha256::digest(image))
+   },|receipt|launch(receipt,isolated?))
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch9_w6_page_isolation_tests{
+ use super::*;
+ fn elf()->[u8;256]{
+  let mut image=[0u8;256];image[..4].copy_from_slice(b"\x7fELF");
+  image[4]=2;image[5]=1;image[6]=1;
+  image[16..18].copy_from_slice(&2u16.to_le_bytes());
+  image[18..20].copy_from_slice(&62u16.to_le_bytes());
+  image[20..24].copy_from_slice(&1u32.to_le_bytes());
+  image[24..32].copy_from_slice(&0x400000u64.to_le_bytes());
+  image[32..40].copy_from_slice(&64u64.to_le_bytes());
+  image[52..54].copy_from_slice(&64u16.to_le_bytes());
+  image[54..56].copy_from_slice(&56u16.to_le_bytes());
+  image[56..58].copy_from_slice(&1u16.to_le_bytes());
+  image[64..68].copy_from_slice(&1u32.to_le_bytes());
+  image[68..72].copy_from_slice(&5u32.to_le_bytes());
+  image[72..80].copy_from_slice(&128u64.to_le_bytes());
+  image[80..88].copy_from_slice(&0x400000u64.to_le_bytes());
+  image[96..104].copy_from_slice(&4u64.to_le_bytes());
+  image[104..112].copy_from_slice(&4096u64.to_le_bytes());
+  image[112..120].copy_from_slice(&1u64.to_le_bytes());
+  image[128..132].copy_from_slice(&[0x90,0x90,0x90,0xc3]);
+  image
+ }
+ #[test]fn isolated_stack_and_guard_validate_before_mapping(){
+  let image=elf();
+  assert_eq!(verify_pid1_elf64_page_isolation(&image,0x800000,8),
+   Ok(0x400000));
+  assert_eq!(verify_pid1_elf64_page_isolation(&image,0x401000,2),
+   Err(Error::Invalid));
+  assert_eq!(verify_pid1_elf64_page_isolation(&image,0x800000,0),
+   Err(Error::Invalid));
+ }
+ #[test]fn byte_disjoint_loads_sharing_one_pte_must_fail(){
+  let mut image=elf();image[56..58].copy_from_slice(&2u16.to_le_bytes());
+  // Small first segment (not a full-page BSS): byte ranges are disjoint,
+  // but both load permissions still target the same 4 KiB page.
+  image[104..112].copy_from_slice(&4u64.to_le_bytes());
+  image[120..124].copy_from_slice(&1u32.to_le_bytes());
+  image[124..128].copy_from_slice(&6u32.to_le_bytes());
+  image[128..136].copy_from_slice(&0u64.to_le_bytes());
+  image[136..144].copy_from_slice(&0x400100u64.to_le_bytes());
+  image[152..160].copy_from_slice(&1u64.to_le_bytes());
+  image[160..168].copy_from_slice(&1u64.to_le_bytes());
+  assert_eq!(verify_pid1_elf64(&image),Ok(0x400000));
+  assert_eq!(verify_pid1_elf64_page_isolation(&image,0x800000,4),
+   Err(Error::Invalid));
+ }
+}

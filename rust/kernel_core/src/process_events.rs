@@ -2047,3 +2047,93 @@ mod kernel_p0_batch8_w2_topology_migration_tests{
   assert_eq!(queues.queue_len(0),Ok(2));assert_eq!(queues.queue_len(1),Ok(0));
  }
 }
+
+
+/// P0-165..168: one kernel-locked transaction for process scheduler exit,
+/// exact-generation event publication and IPC mailbox/sent-message revocation.
+/// A failing IPC generation or full event ring leaves ALL structures intact.
+/// Real runtime must hold scheduler, IPC and topology locks in fixed order.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum ExitReapError{
+ Exit(ExitPublicationError),
+ Ipc(crate::ipc::IpcError),
+}
+impl<const C:usize,const N:usize> CoreRunQueues<C,N>{
+ pub fn retire_notify_and_reap_ipc<const E:usize,const M:usize,const D:usize>(
+  &mut self,supervisor:Runnable,victims:&[(u32,u64)],
+  receipts:&[(&crate::smp_lifecycle_fence::LifecycleFence,u32,
+   crate::smp_lifecycle_fence::Receipt)],
+  expected_aps:&[u32],epoch:u64,
+  events:&mut ProcessEvents<E>,router:&mut crate::ipc::ScopedRouter<M,D>
+ )->Result<usize,ExitReapError>{
+  if victims.is_empty()||victims.len()>M{
+   return Err(ExitReapError::Ipc(crate::ipc::IpcError::InvalidConfiguration));
+  }
+  let mut ids=[crate::batch5_session::Identity{pid:0,generation:0};M];
+  for (i,&(pid,generation)) in victims.iter().enumerate(){
+   ids[i]=crate::batch5_session::Identity{pid,generation};
+  }
+  let mut staged=Self{queues:self.queues,length:self.length,cursor:self.cursor};
+  let mut notices=events.clone();
+  let mut mailboxes=router.clone();
+  let n=staged.retire_and_notify_epoch_topology(
+   supervisor,victims,receipts,expected_aps,epoch,&mut notices)
+   .map_err(ExitReapError::Exit)?;
+  mailboxes.reap_group_exact(&ids[..victims.len()])
+   .map_err(ExitReapError::Ipc)?;
+  crate::smp_lifecycle_fence::require_epoch_topology_acks_for_reclaim(
+   receipts,expected_aps,epoch)
+   .map_err(|e|ExitReapError::Exit(
+    ExitPublicationError::Reclaim(ReclaimError::Ap(e))))?;
+  *self=staged;
+  *events=notices;
+  *router=mailboxes;
+  Ok(n)
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch9_w2_exit_ipc_atomic_tests{
+ use super::*;
+ use crate::batch5_session::Identity;
+ use crate::ipc::{IpcError,ScopedRouter};
+ use crate::smp_lifecycle_fence::LifecycleFence;
+ fn t(pid:u32,g:u64)->Runnable{Runnable{pid,generation:g,priority:3}}
+ fn id(pid:u32,g:u64)->Identity{Identity{pid,generation:g}}
+ #[test]fn successful_exit_reaps_outgoing_ipc_and_publishes_one_notice(){
+  let mut q=CoreRunQueues::<1,3>::new();
+  q.enqueue(0,t(1,1)).unwrap();q.enqueue(0,t(2,4)).unwrap();
+  let mut events=ProcessEvents::<2>::new();
+  let mut ipc=ScopedRouter::<3,2>::new().unwrap();
+  for x in [id(1,1),id(2,4),id(3,2)]{ipc.register(x).unwrap();}
+  ipc.send(id(2,4),id(3,2),b"stale").unwrap();
+  let f=LifecycleFence::new(0,7);let r=f.publish(0,10).unwrap();
+  f.observe_and_ack_after(7,0,|_|true).unwrap();
+  assert_eq!(q.retire_notify_and_reap_ipc(t(1,1),&[(2,4)],
+   &[(&f,0,r)],&[7],10,&mut events,&mut ipc),Ok(1));
+  assert!(!q.contains_epoch(2,4));
+  assert_eq!(events.count_pid(2),1);
+  assert_eq!(ipc.pending(id(2,4)),Err(IpcError::UnknownReceiver));
+  assert_eq!(ipc.pending(id(3,2)),Ok(0));
+ }
+ #[test]fn stale_mailbox_or_full_event_ring_rolls_back_everything(){
+  let mut q=CoreRunQueues::<1,3>::new();
+  q.enqueue(0,t(1,1)).unwrap();q.enqueue(0,t(2,4)).unwrap();
+  let mut events=ProcessEvents::<1>::new();
+  let mut ipc=ScopedRouter::<2,2>::new().unwrap();
+  ipc.register(id(1,1)).unwrap();ipc.register(id(2,5)).unwrap();
+  let f=LifecycleFence::new(0,7);let r=f.publish(0,10).unwrap();
+  f.observe_and_ack_after(7,0,|_|true).unwrap();
+  assert_eq!(q.retire_notify_and_reap_ipc(t(1,1),&[(2,4)],
+   &[(&f,0,r)],&[7],10,&mut events,&mut ipc),
+   Err(ExitReapError::Ipc(IpcError::UnknownReceiver)));
+  assert!(q.contains_epoch(2,4));assert_eq!(events.len(),0);
+  assert_eq!(ipc.pending(id(2,5)),Ok(0));
+  ipc.reap(id(2,5)).unwrap();ipc.register(id(2,4)).unwrap();
+  events.enqueue(ProcessEvent{pid:8,kind:EventKind::Message,value:1}).unwrap();
+  assert_eq!(q.retire_notify_and_reap_ipc(t(1,1),&[(2,4)],
+   &[(&f,0,r)],&[7],10,&mut events,&mut ipc),
+   Err(ExitReapError::Exit(ExitPublicationError::Notice(EventError::Full))));
+  assert!(q.contains_epoch(2,4));assert_eq!(events.count_pid(8),1);
+  assert_eq!(ipc.pending(id(2,4)),Ok(0));
+ }
+}

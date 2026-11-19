@@ -876,3 +876,77 @@ mod kernel_p0_batch8_w1_ipi_retry_tests{
    Err(FenceError::NoProgress));
  }
 }
+
+
+/// P0-161..164: publish complete trusted AP topology for one teardown epoch.
+/// Expose each published receipt before attempting its hardware IPI send.
+/// After a partial failure, every issued AP fence remains pending; never
+/// reclaim, fabricate acknowledgements or silently reuse the receipt.
+pub fn publish_and_signal_epoch_topology<I:LifecycleIpiSender>(
+ topology:&[(&LifecycleFence,u32)],bsp:u32,epoch:u64,
+ sender:&mut I,issued:&mut[Option<Receipt>]
+)->Result<usize,FenceError>{
+ if topology.is_empty()||topology.len()>64||issued.len()<topology.len(){
+  return Err(FenceError::NoProgress);
+ }
+ if epoch==0{return Err(FenceError::InvalidGeneration);}
+ for (i,&(fence,ap)) in topology.iter().enumerate(){
+  if fence.bsp!=bsp||fence.ap!=ap||ap==bsp{return Err(FenceError::InvalidCpu);}
+  if topology[..i].iter().any(|&(prior,id)|
+   core::ptr::eq(prior,fence)||id==ap){return Err(FenceError::InvalidCpu);}
+ }
+ if issued.iter().any(Option::is_some){return Err(FenceError::Busy);}
+ for (i,&(fence,ap)) in topology.iter().enumerate(){
+  let receipt=fence.publish(bsp,epoch)?;
+  issued[i]=Some(receipt);
+  sender.send_exact(bsp,ap,receipt)?;
+ }
+ Ok(topology.len())
+}
+#[cfg(test)]
+mod kernel_p0_batch9_w1_topology_publish_tests{
+ use super::*;
+ struct Sender{fail_at:usize,attempts:usize}
+ impl LifecycleIpiSender for Sender{
+  fn send_exact(&mut self,_:u32,_:u32,_:Receipt)->Result<(),FenceError>{
+   self.attempts+=1;
+   if self.attempts==self.fail_at{Err(FenceError::NoProgress)}else{Ok(())}
+  }
+ }
+ #[test]fn partial_send_cannot_hide_any_issued_ap_fence(){
+  let a=LifecycleFence::new(0,1);let b=LifecycleFence::new(0,2);
+  let c=LifecycleFence::new(0,3);let mut issued=[None;3];
+  let mut sender=Sender{fail_at:2,attempts:0};
+  assert_eq!(publish_and_signal_epoch_topology(
+   &[(&a,1),(&b,2),(&c,3)],0,27,&mut sender,&mut issued),
+   Err(FenceError::NoProgress));
+  assert_eq!(sender.attempts,2);
+  assert!(issued[0].is_some()&&issued[1].is_some()&&issued[2].is_none());
+  let x=issued[0].unwrap();let y=issued[1].unwrap();
+  assert_eq!(a.require_ack_for_reclaim(0,x),Err(FenceError::NoProgress));
+  assert_eq!(b.require_ack_for_reclaim(0,y),Err(FenceError::NoProgress));
+  assert_eq!(a.publish(0,28),Err(FenceError::Busy));
+  sender.fail_at=usize::MAX;
+  assert_eq!(b.retry_pending_ipi_exact(0,2,y,&mut sender),Ok(()));
+  b.acknowledge_after_local_invalidate(2,0,|_|Ok(())).unwrap();
+  a.acknowledge_after_local_invalidate(1,0,|_|Ok(())).unwrap();
+  assert_eq!(a.require_ack_for_reclaim(0,x),Ok(()));
+  assert_eq!(b.require_ack_for_reclaim(0,y),Ok(()));
+ }
+ #[test]fn duplicate_and_foreign_topology_is_rejected_before_publication(){
+  let a=LifecycleFence::new(0,1);let b=LifecycleFence::new(0,1);
+  let foreign=LifecycleFence::new(4,5);
+  let mut issued=[None;2];let mut sender=Sender{fail_at:usize::MAX,attempts:0};
+  assert_eq!(publish_and_signal_epoch_topology(
+   &[(&a,1),(&b,1)],0,8,&mut sender,&mut issued),Err(FenceError::InvalidCpu));
+  assert_eq!(publish_and_signal_epoch_topology(
+   &[(&a,1),(&foreign,5)],0,8,&mut sender,&mut issued),
+   Err(FenceError::InvalidCpu));
+  assert_eq!(sender.attempts,0);assert_eq!(issued,[None,None]);
+  assert_eq!(publish_and_signal_epoch_topology(
+   &[(&a,1)],0,8,&mut sender,&mut issued),Ok(1));
+  assert_eq!(sender.attempts,1);
+  assert_eq!(publish_and_signal_epoch_topology(
+   &[(&a,1)],0,9,&mut sender,&mut issued),Err(FenceError::Busy));
+ }
+}

@@ -336,6 +336,7 @@ impl TaggedMessage{
 struct ScopedMailbox<const D:usize>{
  owner:Identity,queue:[Option<TaggedMessage>;D],count:usize,
 }
+#[derive(Clone)]
 pub struct ScopedRouter<const M:usize,const D:usize>{
  boxes:[Option<ScopedMailbox<D>>;M],
 }
@@ -1385,5 +1386,83 @@ mod kernel_p0_batch8_w3_byte_budget_tests{
   assert_eq!(router.pending(relay),Ok(2));
   assert_eq!(router.receive(relay).unwrap().payload(),b"first");
   assert_eq!(router.receive(relay).unwrap().payload(),b"two");
+ }
+}
+
+
+/// P0-169..172: authenticated receive checks sender generation and aggregate
+/// byte budget BEFORE invoking the user-copy callback. No FIFO dequeue on a
+/// stale sender, quota violation or failed copy. Caller pins live PCBs and
+/// serializes all router operations across CPUs.
+impl<const M:usize,const D:usize> ScopedRouter<M,D>{
+ pub fn receive_sender_allowlisted_batch_with(
+  &mut self,receiver:Identity,limit:usize,allowed:&[Identity],
+  max_total_bytes:usize,deliver:impl FnOnce(&[TaggedMessage])->bool
+ )->Result<usize,IpcError>{
+  if limit==0||limit>D||allowed.is_empty()||allowed.len()>M||
+     max_total_bytes==0||max_total_bytes>D.saturating_mul(MAX_PAYLOAD){
+   return Err(IpcError::InvalidConfiguration);
+  }
+  for (i,owner) in allowed.iter().enumerate(){
+   if owner.pid==0||owner.generation==0{return Err(IpcError::InvalidPid);}
+   if allowed[..i].iter().any(|old|old.pid==owner.pid){
+    return Err(IpcError::DuplicateReceiver);
+   }
+  }
+  if !self.boxes.iter().flatten().any(|b|b.owner==receiver){
+   return Err(IpcError::UnknownReceiver);
+  }
+  let mut preview=Self{boxes:self.boxes};
+  let mut count=0usize;let mut bytes=0usize;let mut permitted=true;
+  preview.receive_batch_exact_with(receiver,limit,|items|{
+   count=items.len();
+   for msg in items{
+    if !allowed.contains(&msg.sender){permitted=false;}
+    bytes=bytes.saturating_add(msg.payload().len());
+   }
+   true
+  })?;
+  if !permitted{return Err(IpcError::UnknownSender);}
+  if bytes>max_total_bytes{return Err(IpcError::PayloadTooLarge);}
+  self.receive_batch_exact_with(receiver,count,deliver)
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch9_w3_authenticated_receive_tests{
+ use super::*;
+ fn id(pid:u32,g:u64)->Identity{Identity{pid,generation:g}}
+ #[test]fn authenticated_receive_publishes_fifo_only_after_successful_copy(){
+  let (a,b,receiver)=(id(1,1),id(2,2),id(3,3));
+  let mut ipc=ScopedRouter::<3,3>::new().unwrap();
+  for who in [a,b,receiver]{ipc.register(who).unwrap();}
+  ipc.send(a,receiver,b"alpha").unwrap();ipc.send(b,receiver,b"beta").unwrap();
+  assert_eq!(ipc.receive_sender_allowlisted_batch_with(
+   receiver,2,&[a,b],9,|_|false),Err(IpcError::CopyFailed));
+  assert_eq!(ipc.pending(receiver),Ok(2));
+  let mut output=[0u8;2];let mut observed=0;
+  assert_eq!(ipc.receive_sender_allowlisted_batch_with(
+   receiver,2,&[b,a],9,|msgs|{
+    observed=msgs.len();
+    output.copy_from_slice(&[msgs[0].payload()[0],msgs[1].payload()[0]]);
+    true
+   }),Ok(2));
+  assert_eq!(observed,2);assert_eq!(output,*b"ab");
+  assert_eq!(ipc.pending(receiver),Ok(0));
+ }
+ #[test]fn denied_sender_and_quota_leave_exact_fifo_unchanged(){
+  let (a,b,receiver)=(id(1,1),id(2,2),id(3,3));
+  let mut ipc=ScopedRouter::<3,2>::new().unwrap();
+  for who in [a,b,receiver]{ipc.register(who).unwrap();}
+  ipc.send(a,receiver,b"abc").unwrap();
+  ipc.send(b,receiver,b"defg").unwrap();
+  assert_eq!(ipc.receive_sender_allowlisted_batch_with(
+   receiver,2,&[a],8,|_|true),Err(IpcError::UnknownSender));
+  assert_eq!(ipc.receive_sender_allowlisted_batch_with(
+   receiver,2,&[a,b],6,|_|true),Err(IpcError::PayloadTooLarge));
+  assert_eq!(ipc.receive_sender_allowlisted_batch_with(
+   receiver,2,&[a,id(2,9)],8,|_|true),Err(IpcError::UnknownSender));
+  assert_eq!(ipc.pending(receiver),Ok(2));
+  assert_eq!(ipc.receive(receiver).unwrap().payload(),b"abc");
+  assert_eq!(ipc.receive(receiver).unwrap().payload(),b"defg");
  }
 }

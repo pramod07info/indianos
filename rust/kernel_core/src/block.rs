@@ -1831,3 +1831,90 @@ mod kernel_p0_batch8_w4_metadata_hash_tests{
   assert_eq!(a,[8;4]);assert_eq!(b,[7;4]);
  }
 }
+
+
+/// P0-173..175: bind metadata digest to partition identity and field location,
+/// not merely to unscoped value bytes. Only a separately authenticated signed
+/// manifest may supply expected hashes. Mismatch poisons the read-only view.
+pub fn domain_bound_metadata_sha256(partition_start:u64,
+ partition_sectors:u64,relative_lba:u64,byte_offset:usize,
+ value:&[u8])->Result<[u8;32],BlockError>{
+ if value.is_empty()||value.len()>2*SECTOR_BYTES||
+    byte_offset>=SECTOR_BYTES{
+  return Err(BlockError::OutOfRange);
+ }
+ let mut message=[0u8;40+2*SECTOR_BYTES];
+ message[..8].copy_from_slice(b"P0MDv009");
+ message[8..16].copy_from_slice(&partition_start.to_le_bytes());
+ message[16..24].copy_from_slice(&partition_sectors.to_le_bytes());
+ message[24..32].copy_from_slice(&relative_lba.to_le_bytes());
+ message[32..40].copy_from_slice(&(byte_offset as u64).to_le_bytes());
+ message[40..40+value.len()].copy_from_slice(value);
+ Ok(crate::m2_sha256::digest(&message[..40+value.len()]))
+}
+impl<D:BlockDevice> StableReadOnlyWindow<'_,D>{
+ pub fn read_partition_domain_bound_pair(
+  &mut self,start:u64,count:u64,
+  first:(u64,usize),first_out:&mut[u8],first_digest:[u8;32],
+  second:(u64,usize),second_out:&mut[u8],second_digest:[u8;32]
+ )->Result<(),BlockError>{
+  if first_out.is_empty()||second_out.is_empty()||
+     first_out.len()>2*SECTOR_BYTES||second_out.len()>2*SECTOR_BYTES||
+     first_digest==[0;32]||second_digest==[0;32]{
+   return Err(BlockError::OutOfRange);
+  }
+  let mut a=[0u8;2*SECTOR_BYTES];let mut b=[0u8;2*SECTOR_BYTES];
+  self.read_partition_metadata_pair(start,count,first,
+   &mut a[..first_out.len()],second,&mut b[..second_out.len()])?;
+  let da=domain_bound_metadata_sha256(start,count,first.0,first.1,
+   &a[..first_out.len()])?;
+  let db=domain_bound_metadata_sha256(start,count,second.0,second.1,
+   &b[..second_out.len()])?;
+  if da!=first_digest||db!=second_digest{
+   self.invalidated=true;return Err(BlockError::Io);
+  }
+  first_out.copy_from_slice(&a[..first_out.len()]);
+  second_out.copy_from_slice(&b[..second_out.len()]);
+  Ok(())
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch9_w4_domain_metadata_tests{
+ use super::*;
+ struct Disk{reads:usize,fail:usize}
+ impl BlockDevice for Disk{
+  fn sector_count(&self)->u64{8}
+  fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{
+   self.reads+=1;
+   if self.reads==self.fail{return Err(BlockError::Io);}
+   out.fill(lba as u8);Ok(())
+  }
+  fn write_sector(&mut self,_:u64,_:&[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{Err(BlockError::ReadOnly)}
+ }
+ #[test]fn signed_location_and_field_hash_are_bound_to_disk_read(){
+  let mut disk=Disk{reads:0,fail:0};
+  let mut view=StableReadOnlyWindow::new(&mut disk).unwrap();
+  let ad=domain_bound_metadata_sha256(2,3,0,SECTOR_BYTES-2,&[2,2,3,3]).unwrap();
+  let bd=domain_bound_metadata_sha256(2,3,1,0,&[3,3,3,3]).unwrap();
+  let mut a=[7u8;4];let mut b=[8u8;4];
+  assert_eq!(view.read_partition_domain_bound_pair(
+   2,3,(0,SECTOR_BYTES-2),&mut a,ad,(1,0),&mut b,bd),Ok(()));
+  assert_eq!(a,[2,2,3,3]);assert_eq!(b,[3,3,3,3]);
+  assert_ne!(ad,domain_bound_metadata_sha256(2,3,1,SECTOR_BYTES-2,
+   &[2,2,3,3]).unwrap());
+ }
+ #[test]fn foreign_partition_digest_and_io_fault_do_not_publish(){
+  let valid=domain_bound_metadata_sha256(2,3,0,SECTOR_BYTES-2,&[2,2,3,3]).unwrap();
+  let bad=domain_bound_metadata_sha256(2,4,1,0,&[3,3,3,3]).unwrap();
+  for fail in [0,5]{
+   let mut disk=Disk{reads:0,fail};
+   let mut view=StableReadOnlyWindow::new(&mut disk).unwrap();
+   let mut a=[7u8;4];let mut b=[8u8;4];
+   assert_eq!(view.read_partition_domain_bound_pair(
+    2,3,(0,SECTOR_BYTES-2),&mut a,valid,(1,0),&mut b,bad),Err(BlockError::Io));
+   assert_eq!(a,[7;4]);assert_eq!(b,[8;4]);assert!(view.is_retired());
+  }
+ }
+}

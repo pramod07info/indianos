@@ -869,3 +869,83 @@ mod kernel_p0_batch8_w5_udp_checksum_tests{
   }),Err(RxFenceError::Stale));
  }
 }
+
+
+/// P0-176..177: strict IPv4 unicast peer binding before checksum-protected
+/// UDP delivery. Excludes unspecified, loopback, multicast, broadcast, and
+/// link-local endpoints; the NIC RX epoch must remain live through callback.
+impl NicRxFence{
+ pub fn parse_udp_ipv4_unicast_peer<R>(&self,device:u32,frame:&[u8],
+  maximum:usize,source:[u8;4],destination:[u8;4],port:u16,
+  parse:impl FnOnce(&[u8])->Option<R>)->Result<R,RxFenceError>{
+  fn valid(ip:[u8;4])->bool{
+   ip[0]!=0&&ip[0]!=127&&ip[0]<224&&ip!=[255;4]&&
+   !(ip[0]==169&&ip[1]==254)
+  }
+  if !valid(source)||!valid(destination)||source==destination{
+   return Err(RxFenceError::Capacity);
+  }
+  if frame.len()<14{return Err(RxFenceError::Capacity);}
+  let offset=if frame[12..14]==[0x81,0x00]{18}else{14};
+  if frame.len()<offset+20{return Err(RxFenceError::Capacity);}
+  if frame[offset+12..offset+16]!=source||
+     frame[offset+16..offset+20]!=destination{
+   return Err(RxFenceError::Capacity);
+  }
+  self.parse_udp_ipv4_verified_checksum(device,frame,maximum,port,parse)
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch9_w5_ip_peer_tests{
+ use super::*;
+ fn packet()->[u8;47]{
+  let mut bytes=[0u8;47];bytes[12]=8;bytes[13]=0;
+  let ip=&mut bytes[14..];
+  ip[0]=0x45;ip[2..4].copy_from_slice(&33u16.to_be_bytes());
+  ip[8]=64;ip[9]=17;
+  ip[12..16].copy_from_slice(&[10,0,0,1]);
+  ip[16..20].copy_from_slice(&[10,0,0,2]);
+  ip[20..22].copy_from_slice(&8000u16.to_be_bytes());
+  ip[22..24].copy_from_slice(&9000u16.to_be_bytes());
+  ip[24..26].copy_from_slice(&13u16.to_be_bytes());
+  ip[28..33].copy_from_slice(b"hello");
+  let mut sum=17u32+13;
+  for word in ip[12..20].chunks_exact(2){
+   sum+=u16::from_be_bytes([word[0],word[1]]) as u32;
+  }
+  for word in ip[20..33].chunks_exact(2){
+   sum+=u16::from_be_bytes([word[0],word[1]]) as u32;
+  }
+  sum+=(ip[32] as u32)<<8;
+  while sum>>16!=0{sum=(sum&65535)+(sum>>16);}
+  ip[26..28].copy_from_slice(&(!(sum as u16)).to_be_bytes());
+  let mut ip_sum=0u32;
+  for word in ip[..20].chunks_exact(2){
+   ip_sum+=u16::from_be_bytes([word[0],word[1]]) as u32;
+  }
+  while ip_sum>>16!=0{ip_sum=(ip_sum&65535)+(ip_sum>>16);}
+  ip[10..12].copy_from_slice(&(!(ip_sum as u16)).to_be_bytes());
+  bytes
+ }
+ #[test]fn exact_unicast_peer_is_checksum_and_epoch_guarded(){
+  let nic=NicRxFence::new(6);let p=packet();
+  assert_eq!(nic.parse_udp_ipv4_unicast_peer(6,&p,128,
+   [10,0,0,1],[10,0,0,2],9000,|data|Some(data.len())),Ok(5));
+  assert_eq!(nic.parse_udp_ipv4_unicast_peer(6,&p,128,
+   [10,0,0,1],[10,0,0,2],9000,|_|{
+    nic.begin_quiesce(6).unwrap();Some(1)
+   }),Err(RxFenceError::Stale));
+ }
+ #[test]fn reserved_or_foreign_peer_denied_before_delivery(){
+  let nic=NicRxFence::new(6);let p=packet();let mut calls=0;
+  for source in [[10,0,0,3],[127,0,0,1],[224,0,0,1],[0,0,0,0]]{
+   assert_eq!(nic.parse_udp_ipv4_unicast_peer(6,&p,128,
+    source,[10,0,0,2],9000,|_|{calls+=1;Some(1)}),
+    Err(RxFenceError::Capacity));
+  }
+  assert_eq!(nic.parse_udp_ipv4_unicast_peer(6,&p,128,
+   [10,0,0,1],[255,255,255,255],9000,|_|{calls+=1;Some(1)}),
+   Err(RxFenceError::Capacity));
+  assert_eq!(calls,0);
+ }
+}
