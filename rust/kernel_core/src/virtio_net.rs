@@ -296,6 +296,11 @@ fn receive_payload_len(used_len:usize,capacity:usize)->Result<usize,Error>{
     if payload>capacity {return Err(Error::Invalid);}
     Ok(payload)
 }
+/// The device owns the used-ring length. It cannot report bytes beyond
+/// the actual submitted header and Ethernet frame.
+fn tx_completion_length_valid(reported:usize,frame_length:usize)->bool {
+    (14..=1514).contains(&frame_length) && reported<=frame_length+10
+}
 impl EthernetDevice for VirtioNet{
     fn mac(&self)->[u8;6]{self.mac}
     fn send(&mut self,frame:&[u8])->Result<(),Error>{
@@ -313,7 +318,8 @@ impl EthernetDevice for VirtioNet{
         unsafe{outw(self.port+0x10,QUEUE_TX);}
         for _ in 0..TIMEOUT{
             if self.tx.complete(){
-                if !matches!(self.tx.consume(),Ok(Some(_))){
+                if !matches!(self.tx.consume(),Ok(Some(n))
+                    if tx_completion_length_valid(n,frame.len())){
                     self.faulted=true;
                     return Err(Error::Device);
                 }
@@ -461,4 +467,22 @@ mod tests{
         assert_eq!(receive_payload_len(usize::MAX,usize::MAX),Err(Error::Invalid));
     }
 
+}
+
+
+// P0-469: DMA used-ring lengths must not exceed submitted transmit bytes.
+#[cfg(test)]
+mod kernel_p0_batch19_w5_tests {
+    use super::*;
+    #[test]
+    fn kernel_p0_batch19_w5_rejects_forged_tx_completion_lengths(){
+        assert!(tx_completion_length_valid(0,14));
+        assert!(tx_completion_length_valid(24,14));
+        assert!(tx_completion_length_valid(1524,1514));
+        assert!(!tx_completion_length_valid(25,14));
+        assert!(!tx_completion_length_valid(1525,1514));
+        assert!(!tx_completion_length_valid(0,13));
+        assert!(!tx_completion_length_valid(0,1515));
+        assert!(!tx_completion_length_valid(usize::MAX,1514));
+    }
 }

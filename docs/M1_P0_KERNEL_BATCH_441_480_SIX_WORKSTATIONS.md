@@ -116,3 +116,15 @@ Dependencies: P0-435–440 (boot trust and release gates), plus W2/W3/W4 integra
 | **Total** | **441–480** | **40** |
 
 **Note:** 480 numbered P0 ledger entries are not 480 implemented or accepted features. Completion statistics must be evidence-based.
+
+## Initial source implementation checkpoint (not final acceptance)
+
+These three **production-path hardening slices** have been authored within the same PR integration commit. The 40 umbrella task acceptance gates remain **OPEN** until end-to-end evidence supports completion.
+
+| Related task | Changed production path | Added regression | Still outstanding |
+|---|---|---|---|
+| P0-441, P0-446 | `pmm.rs` refuses accidental reinitialization after allocating frames and fails closed on inconsistent allocation/free counters | `kernel_p0_batch19_w1` | Real owner generations, PMM exhaust/recovery stress, cross-core synchronization |
+| P0-469 | `virtio_net.rs` validates real TX used-ring completion length against submitted header and payload | `kernel_p0_batch19_w5` | Generation-checked TX DMA, device reset, QEMU evidence |
+| P0-475 | `boot.rs` validates full Limine map for overlapping usable/reserved regions and malformed late entries | `kernel_p0_batch19_w6` | Real guest boot evidence, trust anchor and bootloader map consistency audit |
+
+The dedicated CI source-regression checks are three named jobs in the existing six-workstation workflow. **Those test jobs do not represent implemented tasks in the other three workstreams, six autonomous coding agents, or hardware release qualification.** Every remaining task P0-441–480 is still OPEN pending implementation and acceptance.

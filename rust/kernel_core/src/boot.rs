@@ -51,11 +51,20 @@ fn hhdm_offset_sane(offset:u64)->bool{
     offset&0xfff==0 &&
     offset.checked_add(4096).is_some()
 }
+fn spans_overlap(a:&Region,b:&Region)->bool {
+    // Numeric overflow has been rejected for both regions by callers.
+    a.base < b.base+b.length && b.base < a.base+a.length
+}
 fn validate_ranges(regions:&[Region]) -> bool {
     let mut usable=false;
-    for r in regions {
-        if !valid_region(r) { return false; }
-        usable |= r.kind==0;
+    for (i,r) in regions.iter().enumerate() {
+        if !valid_region(r) {return false;}
+        if r.kind==0 {
+            usable=true;
+            for (j,other) in regions.iter().enumerate() {
+                if i!=j && (!valid_region(other)||spans_overlap(r,other)){return false;}
+            }
+        }
     }
     usable
 }
@@ -68,7 +77,17 @@ fn validated_map_count(map:&MemoryMap)->Option<u64>{
         let item=unsafe{ptr::read_volatile(map.entries.add(i))};
         let region=unsafe{item.as_ref()}?;
         if !valid_region(region){return None;}
-        usable |= region.kind==0;
+        // Inspect actual Limine memory-map pointers. Any usable byte
+        // overlapping another firmware/reserved region denies boot.
+        if region.kind==0 {
+            usable=true;
+            for j in 0..map.count as usize {
+                if i==j {continue;}
+                let ptr=unsafe{ptr::read_volatile(map.entries.add(j))};
+                let other=unsafe{ptr.as_ref()}?;
+                if !valid_region(other)||spans_overlap(region,other){return None;}
+            }
+        }
     }
     if usable{Some(map.count)}else{None}
 }
@@ -380,4 +399,33 @@ mod m1_gate20_w1_next_boot_tests{
    assert!(!hhdm_offset_sane(0xffff_8000_0000_0001));
    assert!(!hhdm_offset_sane(0xffff_ffff_ffff_f000));
  }
+}
+
+
+// P0-475: exercise the production Limine memory-map preflight.
+#[cfg(test)]
+mod kernel_p0_batch19_w6_tests {
+    use super::*;
+    fn observed(a:Region,b:Region)->Option<u64> {
+        let regions=[a,b];
+        let pointers:[*const Region;2]=[&regions[0],&regions[1]];
+        let map=MemoryMap{revision:0,count:2,entries:pointers.as_ptr()};
+        validated_map_count(&map)
+    }
+    #[test]
+    fn kernel_p0_batch19_w6_rejects_reserved_and_usable_overlap() {
+        let ram=Region{base:0x2000,length:0x3000,kind:0};
+        assert_eq!(observed(ram,Region{base:0x4001,length:1,kind:1}),None);
+        assert_eq!(observed(ram,Region{base:0x2000,length:0x1000,kind:0}),None);
+        assert_eq!(observed(ram,Region{base:0x5000,length:0x1000,kind:1}),Some(2));
+    }
+    #[test]
+    fn kernel_p0_batch19_w6_rejects_corrupted_reserved_tail() {
+        let ram=Region{base:0x2000,length:0x2000,kind:0};
+        assert_eq!(observed(ram,Region{base:u64::MAX,length:3,kind:1}),None);
+        assert_eq!(observed(ram,Region{base:0x5000,length:0,kind:1}),None);
+        assert_eq!(observed(Region{kind:1,..ram},
+            Region{base:0x5000,length:0x1000,kind:1}),None);
+        assert!(!validate_ranges(&[ram,Region{base:0x3fff,length:1,kind:2}]));
+    }
 }

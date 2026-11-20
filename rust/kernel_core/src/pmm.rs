@@ -97,7 +97,15 @@ pub unsafe extern "C" fn pmm_initialize(
     region_count: u64, reader: RegionReader, context: *mut c_void,
 ) -> bool {
     let s = unsafe { state() };
-    unsafe { initialize(s, region_count, reader, context) }
+    unsafe { initialize_once(s, region_count, reader, context) }
+}
+
+/// Never reset a live PMM while callers may own allocated frames.
+/// # Safety: reader/context satisfy pmm_initialize's kernel-only contract.
+unsafe fn initialize_once(s:&mut State,region_count:u64,reader:RegionReader,
+    context:*mut c_void)->bool {
+    if s.initialized {return false;}
+    unsafe {initialize(s,region_count,reader,context)}
 }
 
 // Separate state permits adversarial map tests without racing the ABI global.
@@ -161,7 +169,7 @@ unsafe fn initialize(s: &mut State, region_count: u64, reader: RegionReader,
 pub unsafe extern "C" fn pmm_allocate_frame(physical: *mut u64) -> bool {
     if physical.is_null() { return false; }
     let s = unsafe { state() };
-    if !s.initialized || s.used == s.total { return false; }
+    if !s.initialized || s.used >= s.total { return false; }
     for scanned in 0..s.total {
         let mut bit = s.cursor + scanned;
         if bit >= s.total { bit -= s.total; }
@@ -217,7 +225,7 @@ pub unsafe extern "C" fn pmm_release_frame(physical: u64) -> bool {
         let diff = physical - span.base;
         if diff / PAGE >= span.count { continue; }
         let bit = span.bit_offset + diff / PAGE;
-        if !s.allocated(bit) { return false; }
+        if !s.allocated(bit) || s.used == 0 { return false; }
         s.set_bit(bit, false);
         s.used -= 1;
         s.cursor = bit;
@@ -1577,5 +1585,42 @@ mod r084_batch_vi_pmm_tests{
         assert!(s.verify_allocator_layout());
         assert!(!s.claim_run(9*PAGE,2));
         assert_eq!(s.used,4);
+    }
+}
+
+
+// P0 batch19 W1: live PMM must be one-shot; failed initial boot can retry.
+#[cfg(test)]
+mod kernel_p0_batch19_w1_tests {
+    use super::*;
+    unsafe extern "C" fn read(i:u64,out:*mut Region,ctx:*mut c_void)->bool {
+        if i!=0 || out.is_null() || ctx.is_null() {return false;}
+        unsafe {out.write(*(ctx.cast::<Region>()));}
+        true
+    }
+    #[test]
+    fn kernel_p0_batch19_w1_reinitialize_keeps_owned_frames() {
+        let mut s=State::empty();
+        let mut region=Region{base:PAGE,length:PAGE*4,kind:0};
+        let context=(&mut region as *mut Region).cast();
+        assert!(unsafe {initialize_once(&mut s,1,Some(read),context)});
+        assert!(s.claim_run(PAGE,2));
+        let before=(s.total,s.used,s.cursor);
+        assert!(!unsafe {initialize_once(&mut s,1,Some(read),context)});
+        assert_eq!((s.total,s.used,s.cursor),before);
+        assert_eq!(s.is_frame_busy(PAGE),Some(true));
+        assert_eq!(s.is_frame_busy(2*PAGE),Some(true));
+        assert!(s.verify_frame_accounting());
+    }
+    #[test]
+    fn kernel_p0_batch19_w1_invalid_boot_map_allows_safe_retry() {
+        let mut s=State::empty();
+        let mut region=Region{base:PAGE,length:0,kind:0};
+        let context=(&mut region as *mut Region).cast();
+        assert!(!unsafe {initialize_once(&mut s,1,Some(read),context)});
+        assert!(!s.initialized);
+        region.length=PAGE;
+        assert!(unsafe {initialize_once(&mut s,1,Some(read),context)});
+        assert_eq!(s.total,1);
     }
 }
