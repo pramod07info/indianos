@@ -15,6 +15,9 @@ pub trait BlockDevice {
     /// it supports durable flushes; a caller may require fsync semantics.
     /// Existing write_sector() contracts still mandate durable completion.
     fn sync(&mut self) -> Result<(), BlockError> { Err(BlockError::Io) }
+    /// Driver-provided media generation, when available. Drivers must
+    /// increment it after hot swap or reset. Unknown providers return None.
+    fn media_generation(&self)->Option<u64>{None}
 }
 
 /// A hard read-only capability. Even if a future discovery or diagnostic
@@ -25,16 +28,19 @@ pub struct ReadOnlyDevice<'a,D:BlockDevice>{
  // A read-only probe is bound to one geometry snapshot. Once a change
  // has been observed, resetting the size cannot resurrect a stale probe.
  parent_capacity:u64,
+ parent_generation:Option<u64>,
  invalidated:bool,
 }
 impl<'a,D:BlockDevice> ReadOnlyDevice<'a,D>{
  pub fn new(device:&'a mut D)->Self{
   let parent_capacity=device.sector_count();
-  Self{device,parent_capacity,invalidated:false}
+  let parent_generation=device.media_generation();
+  Self{device,parent_capacity,parent_generation,invalidated:false}
  }
  fn check_capacity(&mut self)->Result<(),BlockError>{
   if self.invalidated{return Err(BlockError::Io);}
-  if self.device.sector_count()!=self.parent_capacity{
+  if self.device.sector_count()!=self.parent_capacity ||
+     self.device.media_generation()!=self.parent_generation{
    self.invalidated=true;
    return Err(BlockError::Io);
   }
@@ -61,6 +67,7 @@ impl<D:BlockDevice> BlockDevice for ReadOnlyDevice<'_,D>{
  fn write_sector(&mut self,_lba:u64,_bytes:&[u8;SECTOR_BYTES])
   ->Result<(),BlockError>{Err(BlockError::ReadOnly)}
  fn sync(&mut self)->Result<(),BlockError>{Err(BlockError::ReadOnly)}
+ fn media_generation(&self)->Option<u64>{self.parent_generation}
 }
 /// Restrict access to a validated block-device window; no I/O occurs on construction.
 /// Destructive formatting is still an explicit responsibility of the caller.
@@ -72,6 +79,7 @@ pub struct BlockWindow<'a, D: BlockDevice> {
     // This is not a full device identity token: GPT mounts additionally
     // pin and recheck disk and partition GUIDs.
     parent_capacity: u64,
+    parent_generation: Option<u64>,
     // Once a capacity change is observed, never reauthorize this window
     // merely because a later capacity reading happens to match again.
     invalidated: bool,
@@ -79,17 +87,20 @@ pub struct BlockWindow<'a, D: BlockDevice> {
 impl<'a, D: BlockDevice> BlockWindow<'a, D> {
     pub fn new(device: &'a mut D, start: u64, count: u64) -> Result<Self, BlockError> {
         let parent_capacity = device.sector_count();
+        let parent_generation = device.media_generation();
         check_range(parent_capacity, start, count)?;
         // Capacity may change while validating the requested geometry.
         // Never authorize a new mount window from two inconsistent reads.
-        if device.sector_count() != parent_capacity { return Err(BlockError::Io); }
-        Ok(Self { device, start, count, parent_capacity, invalidated: false })
+        if device.sector_count() != parent_capacity ||
+           device.media_generation()!=parent_generation{return Err(BlockError::Io);}
+        Ok(Self { device, start, count, parent_capacity, parent_generation, invalidated: false })
     }
     pub fn sector_start(&self) -> u64 { self.start }
 
     fn check_parent_capacity(&mut self) -> Result<(), BlockError> {
         if self.invalidated { return Err(BlockError::Io); }
-        if self.device.sector_count() != self.parent_capacity {
+        if self.device.sector_count() != self.parent_capacity ||
+           self.device.media_generation()!=self.parent_generation {
             self.invalidated = true;
             return Err(BlockError::Io);
         }
@@ -120,6 +131,7 @@ impl<'a, D: BlockDevice> BlockWindow<'a, D> {
 }
 impl<D: BlockDevice> BlockDevice for BlockWindow<'_, D> {
     fn sector_count(&self) -> u64 { self.count }
+    fn media_generation(&self)->Option<u64>{self.parent_generation}
     fn read_sector(&mut self, lba: u64, out: &mut [u8; SECTOR_BYTES])
         -> Result<(), BlockError>
     {
@@ -2761,5 +2773,44 @@ mod kernel_p0_batch20_w4_tests{
         assert_eq!(read_stable_sectors(&mut d,0,&mut out),Ok(()));
         assert_eq!(out,[0x7b;SECTOR_BYTES]);
         assert_eq!(d.reads,2);
+    }
+}
+
+
+// P0-542: same-capacity media replacement revokes kernel block views when
+// the actual driver supplies a generation token (None remains unqualified).
+#[cfg(test)]
+mod kernel_p0_batch21_w4_tests{
+    use super::*;use core::cell::Cell;
+    struct Disk<'a>{generation:&'a Cell<u64>}
+    impl BlockDevice for Disk<'_>{
+        fn sector_count(&self)->u64{8}
+        fn media_generation(&self)->Option<u64>{Some(self.generation.get())}
+        fn read_sector(&mut self,_:u64,out:&mut[u8;SECTOR_BYTES])
+            ->Result<(),BlockError>{out.fill(0x54);Ok(())}
+        fn write_sector(&mut self,_:u64,_:&[u8;SECTOR_BYTES])
+            ->Result<(),BlockError>{Ok(())}
+        fn sync(&mut self)->Result<(),BlockError>{Ok(())}
+    }
+    #[test]fn kernel_p0_batch21_w4_window_stays_revoked_after_media_reverts(){
+        let token=Cell::new(7u64);let mut disk=Disk{generation:&token};
+        let mut volume=BlockWindow::new(&mut disk,2,3).unwrap();
+        let mut out=[0x21;SECTOR_BYTES];
+        assert_eq!(volume.media_generation(),Some(7));
+        assert_eq!(volume.read_sector(0,&mut out),Ok(()));
+        token.set(8);
+        assert_eq!(volume.write_sector(1,&[2;SECTOR_BYTES]),Err(BlockError::Io));
+        token.set(7);
+        assert_eq!(volume.read_sector(0,&mut out),Err(BlockError::Io));
+        assert_eq!(volume.sync(),Err(BlockError::Io));
+    }
+    #[test]fn kernel_p0_batch21_w4_read_only_generation_denies_reuse(){
+        let token=Cell::new(1u64);let mut disk=Disk{generation:&token};
+        let mut view=ReadOnlyDevice::new(&mut disk);let mut out=[0x11;SECTOR_BYTES];
+        token.set(2);
+        assert_eq!(view.read_sector(1,&mut out),Err(BlockError::Io));
+        assert_eq!(out,[0x11;SECTOR_BYTES]);
+        token.set(1);
+        assert_eq!(view.read_sector(1,&mut out),Err(BlockError::Io));
     }
 }

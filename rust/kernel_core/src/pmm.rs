@@ -54,6 +54,11 @@ impl State {
         let mask = 1u8 << (bit % 8);
         if value { *slot |= mask; } else { *slot &= !mask; }
     }
+    /// Corrupt allocator accounting must never report fabricated free frames.
+    fn checked_free(&self)->u64 {
+        if !self.initialized {return 0;}
+        self.total.checked_sub(self.used).unwrap_or(0)
+    }
     fn physical_at(&self, bit: u64) -> Option<u64> {
         for span in &self.spans[..self.count] {
             if bit >= span.bit_offset && bit - span.bit_offset < span.count {
@@ -218,7 +223,7 @@ pub unsafe extern "C" fn pmm_allocate_contiguous_frames(count:u32,out:*mut u64)-
 #[no_mangle]
 pub unsafe extern "C" fn pmm_release_frame(physical: u64) -> bool {
     let s = unsafe { state() };
-    if !s.initialized || physical & (PAGE - 1) != 0 { return false; }
+    if !s.initialized || s.used>s.total || physical & (PAGE - 1) != 0 { return false; }
     for i in 0..s.count {
         let span = s.spans[i];
         if physical < span.base { continue; }
@@ -241,7 +246,7 @@ pub extern "C" fn pmm_total_frames() -> u64 {
 #[no_mangle]
 pub extern "C" fn pmm_free_frames() -> u64 {
     let s = unsafe { state() };
-    if s.initialized { s.total - s.used } else { 0 }
+    s.checked_free()
 }
 #[no_mangle]
 pub extern "C" fn pmm_self_test() -> bool {
@@ -1671,5 +1676,34 @@ mod kernel_p0_batch20_w1_tests{
         assert!(!s.release_run(PAGE,4));
         assert_eq!(s.used,0);
         assert!(s.verify_frame_accounting());
+    }
+}
+
+
+// P0-521: actual PMM C API free-count and frame retirement fail closed
+// on impossible allocator counters. This remains BSP-only, not SMP safe.
+#[cfg(test)]
+mod kernel_p0_batch21_w1_tests {
+    use super::*;
+    unsafe extern "C" fn read(i:u64,out:*mut Region,ctx:*mut c_void)->bool {
+        if i!=0||out.is_null()||ctx.is_null(){return false;}
+        unsafe{out.write(*(ctx.cast::<Region>()));}true
+    }
+    fn fresh()->State{
+        let mut s=State::empty();
+        let mut r=Region{base:PAGE,length:PAGE*3,kind:0};
+        assert!(unsafe{initialize_once(&mut s,1,Some(read),(&mut r as *mut Region).cast())});
+        s
+    }
+    #[test]fn kernel_p0_batch21_w1_checked_free_never_underflows(){
+        let mut s=fresh();
+        assert_eq!(s.checked_free(),3);
+        assert!(s.claim_run(PAGE,2));
+        assert_eq!(s.checked_free(),1);
+        s.used=4;
+        assert_eq!(s.checked_free(),0);
+        assert!(!s.release_run(PAGE,1));
+        assert!(!s.claim_run(PAGE*3,1));
+        assert_eq!(s.is_frame_busy(PAGE),Some(true));
     }
 }

@@ -58,7 +58,10 @@ pub struct SyscallRequest {
 pub(crate) fn user_range(plan: &ProgramPlan, address: u64, length: u64, write: bool) -> bool {
     if length == 0 || address < USER_MIN || address >= USER_TOP ||
         length > USER_TOP - address ||
-        plan.segment_count as usize > MAX_SEGMENTS {
+        plan.segment_count as usize > MAX_SEGMENTS ||
+        plan.stack_begin < USER_MIN ||
+        plan.stack_end > USER_TOP ||
+        plan.stack_begin >= plan.stack_end {
         return false;
     }
     // A malformed overlapping segment cannot reauthorize the protected
@@ -76,7 +79,7 @@ pub(crate) fn user_range(plan: &ProgramPlan, address: u64, length: u64, write: b
     for seg in plan.segments.iter().take((plan.segment_count as usize).min(MAX_SEGMENTS)) {
         if address >= seg.page_begin && address < seg.page_end &&
             seg.page_end.checked_sub(address).is_some_and(|available| length <= available) &&
-            (!write || seg.writable) {
+            (!write || (seg.writable && !seg.executable)) {
             return true;
         }
     }
@@ -733,5 +736,40 @@ mod kernel_p0_batch20_w3_tests{
         assert!(!ring3_frame_valid(&f,&p,true));
         f[18]=p.stack_end-8;
         assert!(ring3_frame_valid(&f,&p,true));
+    }
+}
+
+
+// P0-535: user memory transfers reject malformed stack extents and
+// writable+executable segment aliases at actual syscall admission.
+#[cfg(test)]
+mod kernel_p0_batch21_w3_tests{
+    use super::*;
+    fn plan()->ProgramPlan{
+        let mut segments=[ProgramSegment::empty();MAX_SEGMENTS];
+        segments[0]=ProgramSegment{
+            page_begin:USER_MIN,page_end:USER_MIN+PAGE_BYTES,
+            writable:true,executable:false,..ProgramSegment::empty()};
+        ProgramPlan{entry:USER_MIN,stack_begin:USER_TOP-STACK_BYTES,
+            stack_end:USER_TOP,guard_begin:USER_TOP-STACK_BYTES-PAGE_BYTES,
+            segment_count:1,segments}
+    }
+    #[test]fn kernel_p0_batch21_w3_malformed_stack_cannot_authorize_segment(){
+        let mut p=plan();
+        assert!(user_range(&p,USER_MIN,1,true));
+        p.stack_end=USER_TOP+PAGE_BYTES;
+        assert!(!user_range(&p,USER_MIN,1,false));
+        p=plan();p.stack_begin=USER_MIN-1;
+        assert!(!user_range(&p,USER_MIN,1,true));
+        p=plan();p.stack_end=p.stack_begin;
+        assert!(!user_range(&p,USER_MIN,1,true));
+    }
+    #[test]fn kernel_p0_batch21_w3_reject_writable_executable_alias(){
+        let mut p=plan();
+        p.segments[0].executable=true;
+        assert!(!user_range(&p,USER_MIN,16,true));
+        assert!(user_range(&p,USER_MIN,16,false));
+        p.segments[0].executable=false;
+        assert!(user_range(&p,USER_MIN,16,true));
     }
 }

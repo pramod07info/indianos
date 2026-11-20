@@ -299,10 +299,17 @@ fn nic_dma_retired(reset:u8,before:u32,after:u32,command:u32)->bool{
 }
 /// Validate used length without untrusted DMA length subtraction/overflow.
 fn receive_payload_len(used_len:usize,capacity:usize)->Result<usize,Error>{
-    if used_len<10 || used_len>1514+10 {return Err(Error::Invalid);}
+    // A complete Ethernet frame needs a 14-byte destination/source/type
+    // header after the ten-byte legacy virtio transport header.
+    if used_len<10+14 || used_len>1514+10 {return Err(Error::Invalid);}
     let payload=used_len-10;
     if payload>capacity {return Err(Error::Invalid);}
     Ok(payload)
+}
+/// Without negotiated checksum/GSO features a legacy device must not
+/// inject offload metadata that would bypass the kernel's checksum checks.
+fn rx_offload_header_valid(header:&[u8])->bool {
+    header.len()>=10 && header[..10].iter().all(|&byte|byte==0)
 }
 /// The device owns the used-ring length. It cannot report bytes beyond
 /// the actual submitted header and Ethernet frame.
@@ -359,6 +366,16 @@ impl EthernetDevice for VirtioNet{
             }
         };
         compiler_fence(Ordering::Acquire);
+        // Offload bits may not be trusted unless features were negotiated.
+        // Drop rather than publish a frame if the NIC claims unsupported GSO
+        // or checksum work. Return no caller bytes on rejection.
+        let header=unsafe{core::slice::from_raw_parts(self.rx.buffer,10)};
+        if !rx_offload_header_valid(header){
+            self.rx.offer();
+            compiler_fence(Ordering::Release);
+            unsafe{outw(self.port+0x10,QUEUE_RX);}
+            return Err(Error::Invalid);
+        }
         unsafe{ptr::copy_nonoverlapping(self.rx.buffer.add(10),out.as_mut_ptr(),n);}
         self.rx.offer();
         compiler_fence(Ordering::Release);
@@ -509,5 +526,24 @@ mod kernel_p0_batch20_w5_tests{
         assert!(!nic_dma_retired(0,u32::MAX,id,0x0001));
         assert!(!nic_dma_retired(0,id,id,0x0005));
         assert!(!nic_dma_retired(0,id,id,0));
+    }
+}
+
+
+// P0-549: malformed RX packets/offload flags cannot enter the actual
+// R028 virtio Ethernet receive path while checksum offload is disabled.
+#[cfg(test)]
+mod kernel_p0_batch21_w5_tests {
+    use super::*;
+    #[test]fn kernel_p0_batch21_w5_short_frames_and_offload_flags_denied(){
+        assert_eq!(receive_payload_len(23,2048),Err(Error::Invalid));
+        assert_eq!(receive_payload_len(24,2048),Ok(14));
+        assert_eq!(receive_payload_len(1524,1514),Ok(1514));
+        assert!(rx_offload_header_valid(&[0;10]));
+        for i in 0..10{
+            let mut forged=[0u8;10];forged[i]=1;
+            assert!(!rx_offload_header_valid(&forged));
+        }
+        assert!(!rx_offload_header_valid(&[0;9]));
     }
 }

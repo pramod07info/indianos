@@ -611,13 +611,23 @@ pub extern "C" fn x86_64_xapic_timer_irq_count()->u64{
 }
 /// Called by the actual configured PIC/APIC IRQ acknowledgement path only.
 /// Ignore unrelated or stopped sources, and reject irreversible overflow.
+fn current_irq_session(start_epoch:u64,end_epoch:u64,
+    expected_source:u8,observed_source:u8)->bool{
+    (expected_source==1||expected_source==2)&&
+       same_timer_session(start_epoch,end_epoch,expected_source,observed_source)
+}
 fn record_kernel_monotonic_tick(source:u8){
+    let epoch=MONOTONIC_SESSION_EPOCH.load(Ordering::Acquire);
+    if source!=1&&source!=2{return;}
     if MONOTONIC_SOURCE.load(Ordering::Acquire)!=source {return;}
     if MONOTONIC_IRQ_TICKS.fetch_update(
         Ordering::AcqRel,Ordering::Acquire,|n|n.checked_add(1)
     ).is_err(){
         MONOTONIC_EXHAUSTED.store(true,Ordering::Release);
-    }else{
+    }else if current_irq_session(epoch,
+        MONOTONIC_SESSION_EPOCH.load(Ordering::Acquire),source,
+        MONOTONIC_SOURCE.load(Ordering::Acquire)){
+        // No stale tick may arm the newly restarted same-source timer.
         MONOTONIC_SESSION_PROGRESS.store(true,Ordering::Release);
     }
 }
@@ -1187,5 +1197,21 @@ mod kernel_p0_batch20_w2_tests{
         assert_eq!(authoritative_monotonic_sample(2,false,false,9,true,false),None);
         assert_eq!(authoritative_monotonic_sample(1,true,false,9,true,true),None);
         assert_eq!(authoritative_monotonic_sample(2,true,false,10,true,false),Some(10));
+    }
+}
+
+
+// P0-528: actual delivered-IRQ receipt must belong to the live
+// calibrated session, not a previous APIC/PIC instance.
+#[cfg(test)]
+mod kernel_p0_batch21_w2_tests{
+    use super::*;
+    #[test]fn kernel_p0_batch21_w2_stale_irq_cannot_authorize_rearm(){
+        assert!(current_irq_session(42,42,2,2));
+        assert!(current_irq_session(42,42,1,1));
+        assert!(!current_irq_session(42,43,2,2));
+        assert!(!current_irq_session(42,42,2,1));
+        assert!(!current_irq_session(42,42,0,0));
+        assert!(!current_irq_session(u64::MAX,0,2,2));
     }
 }

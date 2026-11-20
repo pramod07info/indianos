@@ -162,11 +162,26 @@ pub unsafe extern "C" fn boot_initramfs_file(
     if !unsafe {indianos_initramfs_lookup(file.address,file.size as usize,path,&mut found)} {
         return false
     }
+    // Only borrow file contents from the validated Limine module. A future
+    // archive decoder regression must not return supervisor memory outside
+    // that module through the ordinary initramfs API.
+    if !borrowed_ramfile_span_ok(file.address as usize,file.size as usize,
+        found.bytes,found.length as usize){return false;}
     unsafe {
         ptr::write(data,found.bytes);
         ptr::write(size,found.length as usize);
     }
     true
+}
+/// Numeric boundary check; the caller is still responsible for validated
+/// mapped Limine module lifetime. Allows a zero-length file at archive end.
+fn borrowed_ramfile_span_ok(module:usize,size:usize,
+    bytes:*const u8,length:usize)->bool {
+    if module==0 || size<16 || bytes.is_null(){return false;}
+    let Some(limit)=module.checked_add(size)else{return false;};
+    let start=bytes as usize;
+    start>=module && start<=limit &&
+       start.checked_add(length).is_some_and(|end|end<=limit)
 }
 fn mask(size:u8,shift:u8)->Option<u32>{
     if size==0 || size>8 || shift>=32 || (size as u32)+(shift as u32)>32 {return None}
@@ -450,5 +465,24 @@ mod kernel_p0_batch20_w6_tests{
         assert!(!hhdm_offset_sane(0xffff_7fff_ffff_f000));
         assert!(!hhdm_offset_sane(0xffff_8000_0000_0001));
         assert!(!hhdm_offset_sane(0xffff_ffff_ffff_f000));
+    }
+}
+
+
+// P0-555: validated initramfs lookup cannot hand an external supervisor
+// pointer to the ring3 ELF loader or native startup path.
+#[cfg(test)]
+mod kernel_p0_batch21_w6_tests {
+    use super::*;
+    #[test]fn kernel_p0_batch21_w6_archive_file_must_stay_in_boot_module(){
+        let base=0x2000usize;
+        assert!(borrowed_ramfile_span_ok(base,256,(base+16) as *const u8,240));
+        assert!(borrowed_ramfile_span_ok(base,256,(base+256) as *const u8,0));
+        assert!(!borrowed_ramfile_span_ok(base,256,(base-1) as *const u8,1));
+        assert!(!borrowed_ramfile_span_ok(base,256,(base+250) as *const u8,7));
+        assert!(!borrowed_ramfile_span_ok(0,256,base as *const u8,8));
+        assert!(!borrowed_ramfile_span_ok(base,256,core::ptr::null(),8));
+        assert!(!borrowed_ramfile_span_ok(usize::MAX-4,32,
+            (usize::MAX-4) as *const u8,1));
     }
 }
