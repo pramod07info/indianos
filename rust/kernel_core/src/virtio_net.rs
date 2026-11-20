@@ -311,6 +311,15 @@ fn receive_payload_len(used_len:usize,capacity:usize)->Result<usize,Error>{
 fn rx_offload_header_valid(header:&[u8])->bool {
     header.len()>=10 && header[..10].iter().all(|&byte|byte==0)
 }
+/// The R028 stack accepts untagged Ethernet-II ingress only. An invalid
+/// source address or 802.3 length field must not reach higher-level parsers.
+fn ethernet_ingress_valid(frame:&[u8])->bool{
+    if frame.len()<14{return false;}
+    let source=&frame[6..12];
+    if source[0]&1!=0 || source.iter().all(|&x|x==0){return false;}
+    let ethertype=u16::from_be_bytes([frame[12],frame[13]]);
+    ethertype>=0x0600
+}
 /// The device owns the used-ring length. It cannot report bytes beyond
 /// the actual submitted header and Ethernet frame.
 fn tx_completion_length_valid(reported:usize,frame_length:usize)->bool {
@@ -376,7 +385,14 @@ impl EthernetDevice for VirtioNet{
             unsafe{outw(self.port+0x10,QUEUE_RX);}
             return Err(Error::Invalid);
         }
-        unsafe{ptr::copy_nonoverlapping(self.rx.buffer.add(10),out.as_mut_ptr(),n);}
+        let frame=unsafe{core::slice::from_raw_parts(self.rx.buffer.add(10),n)};
+        if !ethernet_ingress_valid(frame){
+            self.rx.offer();
+            compiler_fence(Ordering::Release);
+            unsafe{outw(self.port+0x10,QUEUE_RX);}
+            return Err(Error::Invalid);
+        }
+        unsafe{ptr::copy_nonoverlapping(frame.as_ptr(),out.as_mut_ptr(),n);}
         self.rx.offer();
         compiler_fence(Ordering::Release);
         unsafe{outw(self.port+0x10,QUEUE_RX);}
@@ -545,5 +561,39 @@ mod kernel_p0_batch21_w5_tests {
             assert!(!rx_offload_header_valid(&forged));
         }
         assert!(!rx_offload_header_valid(&[0;9]));
+    }
+}
+
+
+// Batch22 W5 P0-575..577: NIC DMA bytes are filtered by the actual
+// VirtioNet::poll ingress path, before user-visible Ethernet buffers.
+#[cfg(test)]
+mod kernel_p0_batch22_w5_tests{
+    use super::*;
+    fn ipv4()->[u8;60]{
+        let mut f=[0u8;60];
+        f[..6].copy_from_slice(&[0x52,0x54,0,0x01,0x02,0x03]);
+        f[6..12].copy_from_slice(&[0x52,0x54,0,0xab,0xcd,0xef]);
+        f[12..14].copy_from_slice(&[0x08,0x00]);
+        f
+    }
+    #[test]fn kernel_p0_batch22_w5_575_multicast_source_rejected(){
+        let mut f=ipv4();assert!(ethernet_ingress_valid(&f));
+        f[6]=0x53;assert!(!ethernet_ingress_valid(&f));
+        f[6]=0xff;assert!(!ethernet_ingress_valid(&f));
+    }
+    #[test]fn kernel_p0_batch22_w5_576_zero_source_rejected(){
+        let mut f=ipv4();f[6..12].fill(0);
+        assert!(!ethernet_ingress_valid(&f));
+        assert!(!ethernet_ingress_valid(&f[..13]));
+    }
+    #[test]fn kernel_p0_batch22_w5_577_length_coded_frames_rejected(){
+        let mut f=ipv4();
+        f[12..14].copy_from_slice(&[0x05,0xdc]);
+        assert!(!ethernet_ingress_valid(&f));
+        f[12..14].copy_from_slice(&[0x08,0x06]);
+        assert!(ethernet_ingress_valid(&f));
+        f[12..14].copy_from_slice(&[0x08,0x00]);
+        assert!(ethernet_ingress_valid(&f));
     }
 }

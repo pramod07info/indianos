@@ -26,6 +26,11 @@ static MONOTONIC_EXHAUSTED:AtomicBool=AtomicBool::new(false);
 /// Session changes invalidate concurrent time samples, including same-source
 /// stop/restart (source ID alone is vulnerable to an ABA race).
 static MONOTONIC_SESSION_EPOCH:AtomicU64=AtomicU64::new(0);
+/// Only an IRQ stamped with the *current* timer epoch may authorize time.
+static MONOTONIC_PROGRESS_EPOCH:AtomicU64=AtomicU64::new(0);
+fn irq_receipt_valid(epoch:u64,receipt_epoch:u64,progress:bool)->bool{
+    epoch!=0 && epoch==receipt_epoch && progress
+}
 fn invalidate_monotonic_session(){
     if MONOTONIC_SESSION_EPOCH.fetch_update(
         Ordering::AcqRel,Ordering::Acquire,|n|n.checked_add(1)
@@ -33,6 +38,7 @@ fn invalidate_monotonic_session(){
         MONOTONIC_EXHAUSTED.store(true,Ordering::Release);
     }
     MONOTONIC_SESSION_PROGRESS.store(false,Ordering::Release);
+    MONOTONIC_PROGRESS_EPOCH.store(0,Ordering::Release);
 }
 fn same_timer_session(start:u64,end:u64,source_before:u8,source_after:u8)->bool{
     start==end&&source_before==source_after
@@ -627,7 +633,9 @@ fn record_kernel_monotonic_tick(source:u8){
     }else if current_irq_session(epoch,
         MONOTONIC_SESSION_EPOCH.load(Ordering::Acquire),source,
         MONOTONIC_SOURCE.load(Ordering::Acquire)){
-        // No stale tick may arm the newly restarted same-source timer.
+        // Stamp first, then publish: a callback that lost a reset race
+        // carries the OLD stamp and cannot authorize the new session.
+        MONOTONIC_PROGRESS_EPOCH.store(epoch,Ordering::Release);
         MONOTONIC_SESSION_PROGRESS.store(true,Ordering::Release);
     }
 }
@@ -641,9 +649,12 @@ fn record_kernel_monotonic_tick(source:u8){
 pub fn kernel_monotonic_100hz() -> Option<u64> {
     let epoch=MONOTONIC_SESSION_EPOCH.load(Ordering::Acquire);
     let source=MONOTONIC_SOURCE.load(Ordering::Acquire);
+    let receipt=MONOTONIC_PROGRESS_EPOCH.load(Ordering::Acquire);
+    let progress=irq_receipt_valid(epoch,receipt,
+        MONOTONIC_SESSION_PROGRESS.load(Ordering::Acquire));
     let sample=authoritative_monotonic_sample(
         source,
-        MONOTONIC_SESSION_PROGRESS.load(Ordering::Acquire),
+        progress,
         MONOTONIC_EXHAUSTED.load(Ordering::Acquire),
         MONOTONIC_IRQ_TICKS.load(Ordering::Acquire),
         XAPIC_TIMER_RUNNING.load(Ordering::Acquire),
@@ -1213,5 +1224,33 @@ mod kernel_p0_batch21_w2_tests{
         assert!(!current_irq_session(42,42,2,1));
         assert!(!current_irq_session(42,42,0,0));
         assert!(!current_irq_session(u64::MAX,0,2,2));
+    }
+}
+
+
+// Batch22 W2 P0-564..566: no IRQ from a stale session, false source
+// or never-progressing timer may authorize DHCP/scheduler time.
+#[cfg(test)]
+mod kernel_p0_batch22_w2_tests{
+    use super::*;
+    #[test]fn kernel_p0_batch22_w2_564_current_irq_receipt_authorizes(){
+        assert!(irq_receipt_valid(7,7,true));
+        assert_eq!(authoritative_monotonic_sample(2,
+            irq_receipt_valid(7,7,true),false,9,true,false),Some(9));
+    }
+    #[test]fn kernel_p0_batch22_w2_565_same_source_rearm_denies_old_receipt(){
+        assert!(!irq_receipt_valid(8,7,true));
+        assert!(!irq_receipt_valid(0,0,true));
+        assert!(!irq_receipt_valid(8,8,false));
+        assert_eq!(authoritative_monotonic_sample(2,
+            irq_receipt_valid(8,7,true),false,9,true,false),None);
+    }
+    #[test]fn kernel_p0_batch22_w2_566_switch_or_exhaustion_denies(){
+        assert_eq!(authoritative_monotonic_sample(1,
+            irq_receipt_valid(9,9,true),false,12,true,true),None);
+        assert_eq!(authoritative_monotonic_sample(2,
+            irq_receipt_valid(9,9,true),true,12,true,false),None);
+        assert_eq!(authoritative_monotonic_sample(2,
+            irq_receipt_valid(9,9,true),false,12,false,true),None);
     }
 }

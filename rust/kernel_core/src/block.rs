@@ -187,6 +187,12 @@ pub fn check_range(capacity: u64, start: u64, count: u64) -> Result<(), BlockErr
     Ok(())
 }
 
+/// A driver that provides a generation token must retain the SAME media
+/// through a complete transfer; unchanged sector count alone is insufficient.
+fn media_snapshot_matches<D:BlockDevice>(device:&D,
+    capacity:u64,generation:Option<u64>)->bool{
+    device.sector_count()==capacity && device.media_generation()==generation
+}
 pub fn read_sectors<D: BlockDevice>(
     device: &mut D, start: u64, out: &mut [u8],
 ) -> Result<(), BlockError> {
@@ -195,12 +201,13 @@ pub fn read_sectors<D: BlockDevice>(
     }
     let count = (out.len() / SECTOR_BYTES) as u64;
     let capacity = device.sector_count();
+    let generation=device.media_generation();
     check_range(capacity, start, count)?;
     // Reject mid-transfer geometry changes instead of silently combining
     // data from different devices. A failed transfer clears all output.
     let mut sector = [0u8; SECTOR_BYTES];
     for index in 0..(count as usize) {
-        if device.sector_count() != capacity {
+        if !media_snapshot_matches(device,capacity,generation) {
             out.fill(0);
             return Err(BlockError::Io);
         }
@@ -208,7 +215,7 @@ pub fn read_sectors<D: BlockDevice>(
             out.fill(0);
             return Err(error);
         }
-        if device.sector_count() != capacity {
+        if !media_snapshot_matches(device,capacity,generation) {
             out.fill(0);
             return Err(BlockError::Io);
         }
@@ -226,14 +233,15 @@ pub fn write_sectors<D: BlockDevice>(
     }
     let count = (data.len() / SECTOR_BYTES) as u64;
     let capacity = device.sector_count();
+    let generation=device.media_generation();
     check_range(capacity, start, count)?;
     for (index, chunk) in data.chunks_exact(SECTOR_BYTES).enumerate() {
-        if device.sector_count() != capacity { return Err(BlockError::Io); }
+        if !media_snapshot_matches(device,capacity,generation) { return Err(BlockError::Io); }
         let sector: &[u8; SECTOR_BYTES] = chunk.try_into().map_err(|_| BlockError::Io)?;
         device.write_sector(start + index as u64, sector)?;
         // Previously completed sectors cannot be rolled back after a
         // capacity change: stop here and surface uncertain I/O to caller.
-        if device.sector_count() != capacity { return Err(BlockError::Io); }
+        if !media_snapshot_matches(device,capacity,generation) { return Err(BlockError::Io); }
     }
     Ok(())
 }
@@ -1317,13 +1325,14 @@ pub fn read_sectors_atomic<D:BlockDevice>(
  }
  let count=(out.len()/SECTOR_BYTES) as u64;
  let capacity=device.sector_count();
+ let generation=device.media_generation();
  check_range(capacity,start,count)?;
  let mut bytes=[0u8;SECTOR_BYTES*MAX_STAGED_READ_SECTORS];
  for i in 0..count as usize{
-  if device.sector_count()!=capacity{return Err(BlockError::Io);}
+  if !media_snapshot_matches(device,capacity,generation){return Err(BlockError::Io);}
   let mut sector=[0u8;SECTOR_BYTES];
   device.read_sector(start+i as u64,&mut sector)?;
-  if device.sector_count()!=capacity{return Err(BlockError::Io);}
+  if !media_snapshot_matches(device,capacity,generation){return Err(BlockError::Io);}
   let off=i*SECTOR_BYTES;bytes[off..off+SECTOR_BYTES].copy_from_slice(&sector);
  }
  out.copy_from_slice(&bytes[..out.len()]);
@@ -1371,15 +1380,16 @@ pub fn read_stable_sectors<D:BlockDevice>(device:&mut D,start:u64,
   return Err(BlockError::OutOfRange);
  }
  let capacity=device.sector_count();
+ let generation=device.media_generation();
  check_range(capacity,start,(out.len()/SECTOR_BYTES) as u64)?;
  let mut first=[0u8;MAX_STAGED_READ_SECTORS*SECTOR_BYTES];
  let mut second=[0u8;MAX_STAGED_READ_SECTORS*SECTOR_BYTES];
  let n=out.len();
  read_sectors_atomic(device,start,&mut first[..n])?;
  // Both observations must come from one selected device geometry.
- if device.sector_count()!=capacity{return Err(BlockError::Io);}
+ if !media_snapshot_matches(device,capacity,generation){return Err(BlockError::Io);}
  read_sectors_atomic(device,start,&mut second[..n])?;
- if device.sector_count()!=capacity || first[..n]!=second[..n]{
+ if !media_snapshot_matches(device,capacity,generation) || first[..n]!=second[..n]{
     return Err(BlockError::Io);
  }
  out.copy_from_slice(&first[..n]);Ok(())
@@ -2812,5 +2822,65 @@ mod kernel_p0_batch21_w4_tests{
         assert_eq!(out,[0x11;SECTOR_BYTES]);
         token.set(1);
         assert_eq!(view.read_sector(1,&mut out),Err(BlockError::Io));
+    }
+}
+
+
+// Batch22 W4 P0-571..574: real bulk read/write/metadata operations must
+// reject same-capacity removable-media swaps when driver reports an epoch.
+#[cfg(test)]
+mod kernel_p0_batch22_w4_tests {
+    use super::*;use core::cell::Cell;
+    struct Disk{epoch:Cell<u64>,reads:u32,writes:u32,flip_read:u32,flip_write:u32}
+    impl Disk{
+        fn new()->Self{
+            Self{epoch:Cell::new(1),reads:0,writes:0,flip_read:0,flip_write:0}
+        }
+    }
+    impl BlockDevice for Disk{
+        fn sector_count(&self)->u64{8}
+        fn media_generation(&self)->Option<u64>{Some(self.epoch.get())}
+        fn read_sector(&mut self,_:u64,out:&mut [u8;SECTOR_BYTES])
+            ->Result<(),BlockError>{
+            self.reads+=1;out.fill(0x71);
+            if self.reads==self.flip_read{self.epoch.set(2);}
+            Ok(())
+        }
+        fn write_sector(&mut self,_:u64,_:&[u8;SECTOR_BYTES])
+            ->Result<(),BlockError>{
+            self.writes+=1;
+            if self.writes==self.flip_write{self.epoch.set(2);}
+            Ok(())
+        }
+    }
+    #[test]fn kernel_p0_batch22_w4_571_bulk_read_discards_mixed_media(){
+        let mut disk=Disk::new();disk.flip_read=1;
+        let mut output=[0xaau8;SECTOR_BYTES*2];
+        assert_eq!(read_sectors(&mut disk,0,&mut output),Err(BlockError::Io));
+        assert_eq!(disk.reads,1);
+        assert_eq!(output,[0u8;SECTOR_BYTES*2]);
+    }
+    #[test]fn kernel_p0_batch22_w4_572_write_stops_after_media_replacement(){
+        let mut disk=Disk::new();disk.flip_write=1;
+        assert_eq!(write_sectors(&mut disk,0,&[2u8;SECTOR_BYTES*2]),
+            Err(BlockError::Io));
+        assert_eq!(disk.writes,1);
+    }
+    #[test]fn kernel_p0_batch22_w4_573_atomic_read_preserves_output(){
+        let mut disk=Disk::new();disk.flip_read=1;
+        let mut output=[0xaau8;SECTOR_BYTES*2];
+        assert_eq!(read_sectors_atomic(&mut disk,0,&mut output),
+            Err(BlockError::Io));
+        assert_eq!(output,[0xaau8;SECTOR_BYTES*2]);
+    }
+    #[test]fn kernel_p0_batch22_w4_574_stable_probe_denies_epoch_change(){
+        let mut disk=Disk::new();disk.flip_read=2;
+        let mut output=[0xaau8;SECTOR_BYTES];
+        assert_eq!(read_stable_sectors(&mut disk,0,&mut output),
+            Err(BlockError::Io));
+        assert_eq!(output,[0xaau8;SECTOR_BYTES]);
+        disk=Disk::new();
+        assert_eq!(read_stable_sectors(&mut disk,0,&mut output),Ok(()));
+        assert_eq!(output,[0x71u8;SECTOR_BYTES]);
     }
 }

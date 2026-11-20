@@ -190,11 +190,14 @@ pub(crate) fn ring3_frame_valid(
     // x86-64 IRETQ must not import reserved high RFLAGS from a user
     // snapshot. Bit 1 is fixed; bits 3, 5, 15 and 22..63 are reserved.
     const RESERVED:u64=(1<<3)|(1<<5)|(1<<15)|(!0u64<<22);
+    // Reject user snapshots requiring unimplemented debug/alignment and
+    // direction-flag trap semantics. Ordinary IRQ-enabled ring3 is allowed.
+    const UNSUPPORTED:u64=(1<<8)|(1<<10)|(1<<16)|(1<<18);
     let (rip, cs, flags, rsp, ss) =
         (frame[15], frame[16], frame[17], frame[18], frame[19]);
     cs == 0x2b && ss == 0x33 &&
         flags & FIXED != 0 &&
-        flags & (IOPL | NT | VM | RESERVED) == 0 &&
+        flags & (IOPL | NT | VM | RESERVED | UNSUPPORTED) == 0 &&
         (flags & IF != 0) == irq_enabled &&
         (USER_MIN..USER_TOP).contains(&rip) &&
         plan.stack_begin >= USER_MIN && plan.stack_end <= USER_TOP &&
@@ -771,5 +774,46 @@ mod kernel_p0_batch21_w3_tests{
         assert!(user_range(&p,USER_MIN,16,false));
         p.segments[0].executable=false;
         assert!(user_range(&p,USER_MIN,16,true));
+    }
+}
+
+
+// Batch22 W3: strict IRETQ trap policy for currently unsupported user
+// snapshot flags. No claim about actual PTE-based ring3 isolation.
+#[cfg(test)]
+mod kernel_p0_batch22_w3_tests{
+    use super::*;
+    fn plan()->ProgramPlan{
+        ProgramPlan{entry:USER_MIN,
+            stack_begin:USER_TOP-STACK_BYTES,stack_end:USER_TOP,
+            guard_begin:USER_TOP-STACK_BYTES-PAGE_BYTES,
+            segment_count:0,segments:[ProgramSegment::empty();MAX_SEGMENTS]}
+    }
+    fn frame()->[u64;20]{
+        let p=plan();
+        let mut f=[0u64;20];
+        f[15]=USER_MIN;f[16]=0x2b;f[17]=2;
+        f[18]=p.stack_end-16;f[19]=0x33;f
+    }
+    #[test]fn kernel_p0_batch22_w3_567_reject_direction_flag_on_trap(){
+        let p=plan();let mut f=frame();
+        assert!(ring3_frame_valid(&f,&p,false));
+        f[17]|=1<<10;
+        assert!(!ring3_frame_valid(&f,&p,false));
+    }
+    #[test]fn kernel_p0_batch22_w3_568_reject_trap_flag_without_debug_facility(){
+        let p=plan();let mut f=frame();f[17]|=1<<8;
+        assert!(!ring3_frame_valid(&f,&p,false));
+    }
+    #[test]fn kernel_p0_batch22_w3_569_reject_alignment_check(){
+        let p=plan();let mut f=frame();f[17]|=1<<18;
+        assert!(!ring3_frame_valid(&f,&p,false));
+    }
+    #[test]fn kernel_p0_batch22_w3_570_reject_resume_flag_allow_standard_interrupts(){
+        let p=plan();let mut f=frame();f[17]|=1<<16;
+        assert!(!ring3_frame_valid(&f,&p,false));
+        f[17]=0x202;
+        assert!(ring3_frame_valid(&f,&p,true));
+        assert!(!ring3_frame_valid(&f,&p,false));
     }
 }

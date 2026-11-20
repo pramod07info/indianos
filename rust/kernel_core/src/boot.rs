@@ -40,6 +40,11 @@ fn log(s: &'static [u8]) { unsafe { serial_write(s.as_ptr().cast()) }; }
 unsafe fn memory_map() -> Option<&'static MemoryMap> {
     unsafe { boot_limine_memmap().as_ref() }
 }
+/// Reject misaligned Limine pointers before constructing Rust references
+/// or issuing aligned volatile loads. Firmware must also guarantee validity.
+fn limine_pointer_aligned<T>(p:*const T)->bool {
+    !p.is_null() && (p as usize)%core::mem::align_of::<T>()==0
+}
 fn valid_region(r:&Region)->bool{
     r.length!=0 && r.base.checked_add(r.length).is_some()
 }
@@ -71,10 +76,12 @@ fn validate_ranges(regions:&[Region]) -> bool {
 /// Preflight the complete Limine memory map before exporting its count.
 /// An invalid late entry must never let the PMM consume a partial map.
 fn validated_map_count(map:&MemoryMap)->Option<u64>{
-    if map.entries.is_null()||!(1..=4096).contains(&map.count){return None;}
+    if !limine_pointer_aligned(map.entries) ||
+       !(1..=4096).contains(&map.count){return None;}
     let mut usable=false;
     for i in 0..map.count as usize{
         let item=unsafe{ptr::read_volatile(map.entries.add(i))};
+        if !limine_pointer_aligned(item){return None;}
         let region=unsafe{item.as_ref()}?;
         if !valid_region(region){return None;}
         // Inspect actual Limine memory-map pointers. Any usable byte
@@ -84,12 +91,31 @@ fn validated_map_count(map:&MemoryMap)->Option<u64>{
             for j in 0..map.count as usize {
                 if i==j {continue;}
                 let ptr=unsafe{ptr::read_volatile(map.entries.add(j))};
+                if !limine_pointer_aligned(ptr){return None;}
                 let other=unsafe{ptr.as_ref()}?;
                 if !valid_region(other)||spans_overlap(region,other){return None;}
             }
         }
     }
     if usable{Some(map.count)}else{None}
+}
+/// Every usable physical span must fit within the chosen direct-map
+/// high-half range. This is an arithmetic preflight, not proof of PTE mapping.
+fn hhdm_covers_usable_map(map:&MemoryMap,offset:u64)->bool{
+    if !hhdm_offset_sane(offset) ||
+        validated_map_count(map).is_none(){return false;}
+    for i in 0..map.count as usize{
+        let region_pointer=unsafe{ptr::read_volatile(map.entries.add(i))};
+        if !limine_pointer_aligned(region_pointer){return false;}
+        let region=unsafe{&*region_pointer};
+        if region.kind!=0{continue;}
+        let Some(end)=region.base.checked_add(region.length)
+            .and_then(|last|last.checked_sub(1))
+            .and_then(|last|offset.checked_add(last))else{return false;};
+        // Four-level 48-bit canonical high-half addresses only.
+        if end<0xffff_8000_0000_0000{return false;}
+    }
+    true
 }
 /// # Safety
 /// Called while Limine response pointers are valid (before bootloader
@@ -110,7 +136,7 @@ pub unsafe extern "C" fn boot_validate() -> bool {
     let Some(hhdm)=(unsafe {boot_limine_hhdm().as_ref()}) else {
         log(b"IndianOS: missing HHDM handoff\n\0");return false;
     };
-    if !hhdm_offset_sane(hhdm.offset){
+    if !hhdm_covers_usable_map(map,hhdm.offset){
         log(b"IndianOS: invalid HHDM mapping\n\0");return false;
     }
     true
@@ -129,6 +155,7 @@ pub unsafe extern "C" fn boot_memory_region_at(index:u64,out:*mut Region,_contex
     let Some(m)=(unsafe {memory_map()}) else {return false};
     if validated_map_count(m).is_none() || index>=m.count {return false}
     let item=unsafe {ptr::read_volatile(m.entries.add(index as usize))};
+    if !limine_pointer_aligned(item){return false;}
     let Some(region)=(unsafe {item.as_ref()}) else {return false};
     if !valid_region(region) {return false;}
     unsafe {ptr::write(out,*region);}
@@ -484,5 +511,39 @@ mod kernel_p0_batch21_w6_tests {
         assert!(!borrowed_ramfile_span_ok(base,256,core::ptr::null(),8));
         assert!(!borrowed_ramfile_span_ok(usize::MAX-4,32,
             (usize::MAX-4) as *const u8,1));
+    }
+}
+
+
+// Batch22 W6 P0-578..580: validate Limine pointer alignment and high-half
+// arithmetic on the actual boot memory-map consumer.
+#[cfg(test)]
+mod kernel_p0_batch22_w6_tests{
+    use super::*;
+    #[test]fn kernel_p0_batch22_w6_578_reject_misaligned_entry_table(){
+        let region=Region{base:0x1000,length:0x2000,kind:0};
+        let entry:[*const Region;1]=[&region];
+        let valid=MemoryMap{revision:0,count:1,entries:entry.as_ptr()};
+        assert_eq!(validated_map_count(&valid),Some(1));
+        let invalid=MemoryMap{entries:((entry.as_ptr() as usize)+1) as *const *const Region,
+            ..valid};
+        assert_eq!(validated_map_count(&invalid),None);
+    }
+    #[test]fn kernel_p0_batch22_w6_579_reject_misaligned_region_pointer(){
+        let invalid_pointer=0x1001usize as *const Region;
+        let entries=[invalid_pointer];
+        let map=MemoryMap{revision:0,count:1,entries:entries.as_ptr()};
+        assert_eq!(validated_map_count(&map),None);
+    }
+    #[test]fn kernel_p0_batch22_w6_580_direct_map_must_cover_usable_span(){
+        let region=Region{base:0x1000,length:0x2000,kind:0};
+        let entries:[*const Region;1]=[&region];
+        let map=MemoryMap{revision:0,count:1,entries:entries.as_ptr()};
+        assert!(hhdm_covers_usable_map(&map,0xffff_8000_0000_0000));
+        assert!(!hhdm_covers_usable_map(&map,0));
+        let huge=Region{base:0x1_0000_0000,length:0x1000,kind:0};
+        let huge_entries:[*const Region;1]=[&huge];
+        let huge_map=MemoryMap{revision:0,count:1,entries:huge_entries.as_ptr()};
+        assert!(!hhdm_covers_usable_map(&huge_map,0xffff_ffff_0000_0000));
     }
 }

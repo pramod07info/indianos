@@ -340,3 +340,61 @@ jobs:
           cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$FILTER" -- --list | grep -F "$FILTER"
           cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$FILTER"
           cargo check --locked --offline --manifest-path rust/kernel_core/Cargo.toml --no-default-features --target x86_64-unknown-none --features "$FEATURES"
+
+  p0-batch22-implemented:
+    name: Batch22 implemented ${{ matrix.workstation }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - workstation: W1-PMM-rollback
+            filter: kernel_p0_batch22_w1
+            expected: 3
+            features: normal-desktop
+          - workstation: W2-IRQ-epoch
+            filter: kernel_p0_batch22_w2
+            expected: 3
+            features: normal-desktop
+          - workstation: W3-IRET-flags
+            filter: kernel_p0_batch22_w3
+            expected: 4
+            features: normal-desktop
+          - workstation: W4-media-snapshot
+            filter: kernel_p0_batch22_w4
+            expected: 4
+            features: test-r031-vfs
+          - workstation: W5-Ethernet-ingress
+            filter: kernel_p0_batch22_w5
+            expected: 3
+            features: test-r028-network
+          - workstation: W6-Limine-HHDM
+            filter: kernel_p0_batch22_w6
+            expected: 3
+            features: normal-desktop
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify exact PR head
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: python3 tools/verify_ci_sha.py --expected "$EXPECTED_SHA" --observed "$(git rev-parse HEAD)"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
+      - name: Assert all 20 new cases run and compile freestanding kernel
+        env:
+          FILTER: ${{ matrix.filter }}
+          FEATURES: ${{ matrix.features }}
+          EXPECTED_COUNT: ${{ matrix.expected }}
+        run: |
+          set -euo pipefail
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$FILTER" -- --list > /tmp/batch22-tests.txt
+          count=$(grep -c "$FILTER" /tmp/batch22-tests.txt || true)
+          echo "Found $count tests, expected $EXPECTED_COUNT for $FILTER"
+          test "$count" -eq "$EXPECTED_COUNT"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$FILTER"
+          cargo check --locked --offline --manifest-path rust/kernel_core/Cargo.toml --no-default-features --target x86_64-unknown-none --features "$FEATURES"

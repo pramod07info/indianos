@@ -248,20 +248,48 @@ pub extern "C" fn pmm_free_frames() -> u64 {
     let s = unsafe { state() };
     s.checked_free()
 }
+/// Allocate two distinct frames, recycle one and always attempt cleanup
+/// of live owners after an intermediate failure. The caller's allocation
+/// backend owns the generation and must not return a borrowed frame.
+fn pmm_self_test_roundtrip<T>(
+    context:&mut T,
+    mut allocate:impl FnMut(&mut T)->Option<u64>,
+    mut release:impl FnMut(&mut T,u64)->bool,
+)->bool{
+    let Some(first)=allocate(context)else{return false;};
+    if first==0 {
+        let _=release(context,first);
+        return false;
+    }
+    let Some(second)=allocate(context)else{
+        let _=release(context,first);
+        return false;
+    };
+    if second==0 || second==first{
+        if second!=first && second!=0 {let _=release(context,second);}
+        let _=release(context,first);
+        return false;
+    }
+    if !release(context,second){
+        let _=release(context,first);
+        return false;
+    }
+    let recycled=allocate(context);
+    let correct=recycled==Some(second);
+    let recycled_released=if let Some(frame)=recycled{
+        if frame!=first && frame!=0 {release(context,frame)}else{false}
+    }else{false};
+    let first_released=release(context,first);
+    correct && recycled_released && first_released
+}
 #[no_mangle]
 pub extern "C" fn pmm_self_test() -> bool {
     if pmm_free_frames() < 2 { return false; }
-    let before = pmm_free_frames();
-    let (mut first, mut second, mut recycled) = (0, 0, 0);
-    let worked = unsafe {
-        pmm_allocate_frame(&mut first) &&
-        pmm_allocate_frame(&mut second) &&
-        first != second && first != 0 && second != 0 &&
-        pmm_release_frame(second) &&
-        pmm_allocate_frame(&mut recycled) && recycled == second &&
-        pmm_release_frame(first) && pmm_release_frame(recycled)
-    };
-    worked && pmm_free_frames() == before
+    let before=pmm_free_frames();
+    let success=pmm_self_test_roundtrip(&mut (),
+        |_|{let mut frame=0; if unsafe{pmm_allocate_frame(&mut frame)}{Some(frame)}else{None}},
+        |_,frame|unsafe{pmm_release_frame(frame)});
+    success && pmm_free_frames()==before
 }
 #[cfg(test)]
 mod tests {
@@ -1705,5 +1733,47 @@ mod kernel_p0_batch21_w1_tests {
         assert!(!s.release_run(PAGE,1));
         assert!(!s.claim_run(PAGE*3,1));
         assert_eq!(s.is_frame_busy(PAGE),Some(true));
+    }
+}
+
+
+// Batch22 W1 P0-561..563: exercise the actual PMM self-test algorithm
+// with failure injection, alias rejection and balanced frame reclamation.
+#[cfg(test)]
+mod kernel_p0_batch22_w1_tests{
+    use super::*;
+    #[derive(Default)]
+    struct Frames{used:[bool;3],fail_after:Option<usize>,calls:usize,alias:bool}
+    fn alloc(s:&mut Frames)->Option<u64>{
+        s.calls+=1;
+        if s.fail_after.is_some_and(|limit|s.calls>limit){return None;}
+        if s.alias&&s.calls==2{return Some(PAGE);}
+        for i in 0..3{
+            if !s.used[i]{s.used[i]=true;return Some((i as u64+1)*PAGE);}
+        }
+        None
+    }
+    fn free(s:&mut Frames,frame:u64)->bool{
+        if frame<PAGE||frame%PAGE!=0{return false;}
+        let i=(frame/PAGE-1) as usize;
+        if i>=s.used.len()||!s.used[i]{return false;}
+        s.used[i]=false;true
+    }
+    #[test]fn kernel_p0_batch22_w1_561_cleanup_after_second_allocation_failure(){
+        let mut s=Frames{fail_after:Some(1),..Default::default()};
+        assert!(!pmm_self_test_roundtrip(&mut s,alloc,free));
+        assert_eq!(s.used,[false;3]);
+    }
+    #[test]fn kernel_p0_batch22_w1_562_duplicate_address_never_double_freed(){
+        let mut s=Frames{alias:true,..Default::default()};
+        assert!(!pmm_self_test_roundtrip(&mut s,alloc,free));
+        assert_eq!(s.used,[false;3]);
+    }
+    #[test]fn kernel_p0_batch22_w1_563_roundtrip_reclaims_every_frame(){
+        let mut s=Frames::default();
+        assert!(pmm_self_test_roundtrip(&mut s,alloc,free));
+        assert_eq!(s.used,[false;3]);
+        assert!(pmm_self_test_roundtrip(&mut s,alloc,free));
+        assert_eq!(s.used,[false;3]);
     }
 }
