@@ -1362,3 +1362,66 @@ mod kernel_p0_batch14_w1_byte_span_tests{
   assert_eq!(fence.require_ack_for_reclaim(0,receipt),Err(FenceError::NoProgress));
  }
 }
+
+
+
+/// P0-301..305: build an exact, bounded, disjoint TLB invalidation plan
+/// before publishing any AP IPI. These are preflight contracts, NOT
+/// proof of hardware INVLPG or cross-core completion.
+pub fn plan_disjoint_user_tlb_spans<const N:usize>(
+ spans:&[(u64,u64)],epoch:u64
+)->Result<([TlbShootdownRange;N],usize),FenceError>{
+ if epoch==0||spans.is_empty()||spans.len()>N||spans.len()>64{
+  return Err(FenceError::InvalidGeneration);
+ }
+ let empty=TlbShootdownRange{first_page:4096,pages:1,epoch};
+ let mut plan=[empty;N];
+ for (i,&(begin,length)) in spans.iter().enumerate(){
+  let range=tlb_range_for_bytes(begin,length,epoch)?;
+  let end=range.first_page+(range.pages as u64)*4096;
+  for previous in plan[..i].iter(){
+   let previous_end=previous.first_page+(previous.pages as u64)*4096;
+   if range.first_page<previous_end&&previous.first_page<end{
+    return Err(FenceError::InvalidGeneration);
+   }
+  }
+  plan[i]=range;
+ }
+ Ok((plan,spans.len()))
+}
+#[cfg(test)]
+mod kernel_p0_batch15_w1_tlb_plan_tests{
+ use super::*;
+ #[test]fn canonical_unaligned_spans_are_disjoint_and_preserve_request_order(){
+  let (plan,count)=plan_disjoint_user_tlb_spans::<3>(
+   &[(0x1001,4096),(0x5002,1)],31).unwrap();
+  assert_eq!(count,2);
+  assert_eq!((plan[0].first_page,plan[0].pages,plan[0].epoch),(0x1000,2,31));
+  assert_eq!((plan[1].first_page,plan[1].pages),(0x5000,1));
+ }
+ #[test]fn aliasing_subpages_and_zero_or_overlong_spans_fail_preflight(){
+  assert!(plan_disjoint_user_tlb_spans::<2>(
+   &[(0x1001,1),(0x1002,1)],31).is_err());
+  assert!(plan_disjoint_user_tlb_spans::<2>(
+   &[(0x1000,0)],31).is_err());
+  assert!(plan_disjoint_user_tlb_spans::<2>(
+   &[(0x1000,4096*4097)],31).is_err());
+ }
+ #[test]fn plan_capacity_epoch_and_user_boundary_are_strict(){
+  assert!(plan_disjoint_user_tlb_spans::<1>(
+   &[(0x1000,1),(0x3000,1)],31).is_err());
+  assert!(plan_disjoint_user_tlb_spans::<0>(&[],31).is_err());
+  assert!(plan_disjoint_user_tlb_spans::<1>(&[(0x1000,1)],0).is_err());
+  assert!(plan_disjoint_user_tlb_spans::<1>(
+   &[(0x0000_7fff_ffff_f000,8192)],31).is_err());
+  assert!(plan_disjoint_user_tlb_spans::<1>(
+   &[(u64::MAX-2,8)],31).is_err());
+ }
+ #[test]fn adjacent_full_pages_are_legal_without_silent_coalescing(){
+  let (plan,n)=plan_disjoint_user_tlb_spans::<2>(
+   &[(0x3000,4096),(0x4000,4096)],8).unwrap();
+  assert_eq!(n,2);
+  assert_eq!(plan[0].first_page,0x3000);
+  assert_eq!(plan[1].first_page,0x4000);
+ }
+}

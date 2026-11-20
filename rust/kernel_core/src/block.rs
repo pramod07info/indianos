@@ -2410,3 +2410,83 @@ mod kernel_p0_batch14_w4_mirrored_sector_tests{
   assert_eq!(view.device.reads,0);assert!(view.is_retired());
  }
 }
+
+
+
+/// P0-316..320: redundant sector equality alone is not authenticity.
+/// Require a trusted manifest SHA-256 digest before releasing either copy
+/// to the caller; digest mismatch permanently retires this media view.
+/// The caller must authenticate the manifest out of band.
+impl<D:BlockDevice> StableReadOnlyWindow<'_,D>{
+ pub fn read_manifest_authenticated_mirrors(
+  &mut self,primary:u64,secondary:u64,revision:u64,
+  expected_sha256:[u8;32],media_revision:impl FnMut()->u64,
+  out:&mut[u8;SECTOR_BYTES]
+ )->Result<MirroredSectorReceipt,BlockError>{
+  if expected_sha256==[0;32]{return Err(BlockError::OutOfRange);}
+  let mut scratch=[0u8;SECTOR_BYTES];
+  let receipt=self.read_mirrored_sector_at_revision(
+   primary,secondary,revision,media_revision,&mut scratch)?;
+  if receipt.digest!=expected_sha256{
+   self.invalidated=true;
+   return Err(BlockError::Io);
+  }
+  out.copy_from_slice(&scratch);
+  Ok(receipt)
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch15_w4_manifest_mirrors_tests{
+ use super::*;
+ struct Device{reads:u32,alter:bool}
+ impl BlockDevice for Device{
+  fn sector_count(&self)->u64{8}
+  fn read_sector(&mut self,_:u64,out:&mut[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{
+   self.reads+=1;out.fill(if self.alter&&self.reads==3{8}else{7});
+   Ok(())
+  }
+  fn write_sector(&mut self,_:u64,_:&[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{Err(BlockError::ReadOnly)}
+ }
+ fn good()->[u8;32]{crate::m2_sha256::digest(&[7;SECTOR_BYTES])}
+ #[test]fn matching_mirrors_and_manifest_release_authenticated_bytes(){
+  let mut device=Device{reads:0,alter:false};
+  let mut view=StableReadOnlyWindow::new(&mut device).unwrap();
+  let mut out=[0;SECTOR_BYTES];
+  let receipt=view.read_manifest_authenticated_mirrors(
+   1,5,27,good(),||27,&mut out).unwrap();
+  assert_eq!(receipt.digest,good());
+  assert_eq!(out,[7;SECTOR_BYTES]);assert_eq!(view.device.reads,4);
+ }
+ #[test]fn matching_but_untrusted_mirrors_do_not_reach_caller(){
+  let mut device=Device{reads:0,alter:false};
+  let mut view=StableReadOnlyWindow::new(&mut device).unwrap();
+  let mut out=[9;SECTOR_BYTES];
+  assert_eq!(view.read_manifest_authenticated_mirrors(
+   1,5,27,crate::m2_sha256::digest(&[8;SECTOR_BYTES]),
+   ||27,&mut out),Err(BlockError::Io));
+  assert_eq!(out,[9;SECTOR_BYTES]);assert!(view.is_retired());
+  assert_eq!(view.read_manifest_authenticated_mirrors(
+   1,5,27,good(),||27,&mut out),Err(BlockError::Io));
+ }
+ #[test]fn unequal_disk_copies_never_release_partial_content(){
+  let mut device=Device{reads:0,alter:true};
+  let mut view=StableReadOnlyWindow::new(&mut device).unwrap();
+  let mut out=[9;SECTOR_BYTES];
+  assert_eq!(view.read_manifest_authenticated_mirrors(
+   1,5,27,good(),||27,&mut out),Err(BlockError::Io));
+  assert!(view.is_retired());assert_eq!(out,[9;SECTOR_BYTES]);
+ }
+ #[test]fn stale_revision_and_bad_geometry_reject_without_publication(){
+  let mut device=Device{reads:0,alter:false};
+  let mut view=StableReadOnlyWindow::new(&mut device).unwrap();
+  let mut out=[9;SECTOR_BYTES];
+  assert_eq!(view.read_manifest_authenticated_mirrors(
+   1,1,27,good(),||27,&mut out),Err(BlockError::OutOfRange));
+  assert_eq!(view.device.reads,0);
+  assert_eq!(view.read_manifest_authenticated_mirrors(
+   1,5,27,good(),||28,&mut out),Err(BlockError::Io));
+  assert_eq!(out,[9;SECTOR_BYTES]);assert!(view.is_retired());
+ }
+}

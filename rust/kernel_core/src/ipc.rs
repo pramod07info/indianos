@@ -1922,3 +1922,94 @@ mod kernel_p0_batch14_w3_pinned_head_tests{
   assert_eq!(r.pending(id(4)),Ok(1));assert_eq!(r.pending(id(5)),Ok(1));
  }
 }
+
+
+
+/// P0-311..315: content-address each authenticated IPC FIFO head before
+/// trusted relay. A changed payload or sender fails before ANY mailbox is
+/// committed; the existing scoped routing rules still enforce capacity,
+/// sender generations, duplicate sources, and total byte quota.
+impl<const M:usize,const D:usize> ScopedRouter<M,D>{
+ pub fn relay_digested_heads_atomic(
+  &mut self,relay:Identity,
+  hops:&[(Identity,Identity,Identity,[u8;32])],max_bytes:usize
+ )->Result<usize,IpcError>{
+  if hops.is_empty()||hops.len()>M{return Err(IpcError::InvalidConfiguration);}
+  for (index,&(source,_,_,_)) in hops.iter().enumerate(){
+   if hops[..index].iter().any(|old|old.0.pid==source.pid){
+    return Err(IpcError::DuplicateReceiver);
+   }
+  }
+  let mut preview=self.clone();
+  let mut plain=[(relay,relay,relay);M];
+  for (index,&(source,origin,destination,digest)) in hops.iter().enumerate(){
+   let message=preview.receive(source)?;
+   if message.sender()!=origin||
+      crate::m2_sha256::digest(message.payload())!=digest{
+    return Err(IpcError::UnknownSender);
+   }
+   plain[index]=(source,origin,destination);
+  }
+  let mut staged=self.clone();
+  let moved=staged.relay_pinned_heads_atomic(relay,&plain[..hops.len()],max_bytes)?;
+  *self=staged;
+  Ok(moved)
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch15_w3_digested_relay_tests{
+ use super::*;
+ fn id(pid:u32)->Identity{Identity{pid,generation:1}}
+ fn digest(bytes:&[u8])->[u8;32]{crate::m2_sha256::digest(bytes)}
+ fn ready()->ScopedRouter<5,2>{
+  let mut r=ScopedRouter::<5,2>::new().unwrap();
+  for pid in 1..=5{r.register(id(pid)).unwrap();}
+  r.send(id(2),id(4),b"alpha").unwrap();
+  r.send(id(3),id(5),b"beta").unwrap();
+  r
+ }
+ #[test]fn authenticated_digests_pin_ordered_fifo_heads(){
+  let mut r=ready();
+  let hops=[(id(4),id(2),id(1),digest(b"alpha")),
+   (id(5),id(3),id(1),digest(b"beta"))];
+  assert_eq!(r.relay_digested_heads_atomic(id(1),&hops,9),Ok(2));
+  assert_eq!(r.pending(id(4)),Ok(0));
+  assert_eq!(r.pending(id(5)),Ok(0));
+  assert_eq!(r.receive(id(1)).unwrap().payload(),b"alpha");
+  assert_eq!(r.receive(id(1)).unwrap().payload(),b"beta");
+ }
+ #[test]fn payload_substitution_and_stale_origin_never_consume(){
+  let mut r=ready();
+  assert_eq!(r.relay_digested_heads_atomic(id(1),
+   &[(id(4),id(2),id(1),digest(b"wrong"))],10),
+   Err(IpcError::UnknownSender));
+  assert_eq!(r.relay_digested_heads_atomic(id(1),
+   &[(id(4),id(3),id(1),digest(b"alpha"))],10),
+   Err(IpcError::UnknownSender));
+  assert_eq!(r.pending(id(4)),Ok(1));
+  assert_eq!(r.pending(id(1)),Ok(0));
+ }
+ #[test]fn later_quota_failure_rolls_back_all_relay_publication(){
+  let mut r=ready();
+  let hops=[(id(4),id(2),id(1),digest(b"alpha")),
+   (id(5),id(3),id(1),digest(b"beta"))];
+  assert_eq!(r.relay_digested_heads_atomic(id(1),&hops,8),
+   Err(IpcError::PayloadTooLarge));
+  assert_eq!(r.pending(id(4)),Ok(1));
+  assert_eq!(r.pending(id(5)),Ok(1));assert_eq!(r.pending(id(1)),Ok(0));
+ }
+ #[test]fn duplicate_sources_and_full_destination_are_atomic(){
+  let mut r=ready();
+  assert_eq!(r.relay_digested_heads_atomic(id(1),
+   &[(id(4),id(2),id(1),digest(b"alpha")),
+     (id(4),id(2),id(1),digest(b"alpha"))],10),
+   Err(IpcError::DuplicateReceiver));
+  r.send(id(2),id(1),b"existing").unwrap();
+  assert_eq!(r.relay_digested_heads_atomic(id(1),
+   &[(id(4),id(2),id(1),digest(b"alpha")),
+     (id(5),id(3),id(1),digest(b"beta"))],9),
+   Err(IpcError::Full));
+  assert_eq!(r.pending(id(1)),Ok(1));
+  assert_eq!(r.pending(id(4)),Ok(1));assert_eq!(r.pending(id(5)),Ok(1));
+ }
+}

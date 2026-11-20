@@ -3279,3 +3279,70 @@ mod kernel_p0_batch13_w5_live_arp_handshake_tests{
   assert!(!valid_arp(&reply,LOCAL_MAC));
  }
 }
+
+
+
+/// P0-321..325: an ARP reply is admissible only during one exact NIC
+/// software receive ring admission. Check the concrete permit before and
+/// after parsing to reject teardown races; hardware IRQ/DMA still requires
+/// driver-specific quiescence and IOMMU fencing.
+pub fn validate_gateway_arp_under_rx_permit(
+ frame:&[u8],local_mac:[u8;6],
+ nic:&crate::nic_rx_fence::NicRxFence,
+ permit:&crate::nic_rx_fence::RxPermit<'_>,pinned_epoch:u64
+)->bool{
+ if pinned_epoch==0||permit.epoch()!=pinned_epoch||
+    !nic.permit_is_current(permit){return false;}
+ let valid=valid_arp(frame,local_mac);
+ valid&&nic.permit_is_current(permit)
+}
+#[cfg(test)]
+mod kernel_p0_batch15_w5_epoch_arp_tests{
+ use super::*;
+ use crate::nic_rx_fence::NicRxFence;
+ const MAC:[u8;6]=[2,8,9,10,11,12];
+ fn reply()->[u8;60]{
+  let mut f=[0u8;60];
+  f[..6].copy_from_slice(&MAC);
+  f[6..12].copy_from_slice(&PEER_MAC);
+  f[12..14].copy_from_slice(&[8,6]);
+  f[14..16].copy_from_slice(&[0,1]);
+  f[16..18].copy_from_slice(&[8,0]);
+  f[18]=6;f[19]=4;
+  f[20..22].copy_from_slice(&[0,2]);
+  f[22..28].copy_from_slice(&PEER_MAC);
+  f[28..32].copy_from_slice(&PEER_IP);
+  f[32..38].copy_from_slice(&MAC);
+  f[38..42].copy_from_slice(&LOCAL_IP);
+  f
+ }
+ #[test]fn exact_live_permit_accepts_only_valid_padded_gateway_reply(){
+  let nic=NicRxFence::new(9);let p=nic.try_admit(9).unwrap();
+  assert!(validate_gateway_arp_under_rx_permit(&reply(),MAC,&nic,&p,p.epoch()));
+  let mut corrupted=reply();corrupted[55]=5;
+  assert!(!validate_gateway_arp_under_rx_permit(
+   &corrupted,MAC,&nic,&p,p.epoch()));
+ }
+ #[test]fn wrong_epoch_and_foreign_ring_permit_are_denied(){
+  let a=NicRxFence::new(9);let b=NicRxFence::new(10);
+  let p=a.try_admit(9).unwrap();
+  assert!(!validate_gateway_arp_under_rx_permit(
+   &reply(),MAC,&a,&p,p.epoch()+1));
+  assert!(!validate_gateway_arp_under_rx_permit(
+   &reply(),MAC,&b,&p,p.epoch()));
+  assert!(!validate_gateway_arp_under_rx_permit(&reply(),MAC,&a,&p,0));
+ }
+ #[test]fn quiescence_revokes_inflight_response_before_ingress(){
+  let nic=NicRxFence::new(9);let p=nic.try_admit(9).unwrap();
+  let q=nic.begin_quiesce(9).unwrap();
+  assert!(!validate_gateway_arp_under_rx_permit(
+   &reply(),MAC,&nic,&p,p.epoch()));
+  assert_eq!(nic.drained(q),Ok(false));
+  drop(p);
+  assert_eq!(nic.drained(q),Ok(true));
+  assert_eq!(nic.finish_rebind(q),Ok(2));
+  let fresh=nic.try_admit(9).unwrap();
+  assert!(validate_gateway_arp_under_rx_permit(
+   &reply(),MAC,&nic,&fresh,2));
+ }
+}

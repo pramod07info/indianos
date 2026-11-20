@@ -2273,3 +2273,76 @@ mod kernel_p0_batch14_w2_atomic_event_ack_tests{
   assert_eq!(q.acknowledge_exact_prefix(&[]),Err(EventError::Empty));
  }
 }
+
+
+
+/// P0-306..310: deliver the same exact receipt prefix into supervisor
+/// memory atomically with dequeuing. On any replay, short buffer or
+/// malformed prefix BOTH destination and lifecycle FIFO remain unchanged.
+impl<const C:usize> ProcessEvents<C>{
+ pub fn acknowledge_exact_prefix_into(
+  &mut self,receipts:&[EventReceipt],out:&mut[ProcessEvent]
+ )->Result<usize,EventError>{
+  if receipts.is_empty(){return Err(EventError::Empty);}
+  if out.len()<receipts.len(){return Err(EventError::Full);}
+  let mut staged=self.clone();
+  staged.acknowledge_exact_prefix(receipts)?;
+  for (destination,receipt) in out.iter_mut().zip(receipts.iter()){
+   *destination=receipt.event;
+  }
+  *self=staged;
+  Ok(receipts.len())
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch15_w2_atomic_delivery_tests{
+ use super::*;
+ fn event(pid:u32)->ProcessEvent{
+  ProcessEvent{pid,kind:EventKind::Exited,value:pid as u64}
+ }
+ fn receipt()->EventReceipt{EventReceipt{sequence:0,event:event(9)}}
+ #[test]fn all_receipts_copy_and_dequeue_together(){
+  let mut q=ProcessEvents::<3>::new();
+  q.enqueue(event(2)).unwrap();q.enqueue(event(3)).unwrap();
+  let mut receipts=[receipt();2];
+  assert_eq!(q.snapshot_receipts(&mut receipts),Ok(2));
+  let mut out=[event(9);2];
+  assert_eq!(q.acknowledge_exact_prefix_into(&receipts,&mut out),Ok(2));
+  assert_eq!(out,[event(2),event(3)]);
+  assert_eq!(q.len(),0);
+  assert_eq!(q.acknowledge_exact_prefix_into(&receipts,&mut out),
+   Err(EventError::Empty));
+ }
+ #[test]fn late_stale_receipt_cannot_publish_even_first_event(){
+  let mut q=ProcessEvents::<3>::new();
+  q.enqueue(event(2)).unwrap();q.enqueue(event(3)).unwrap();
+  let mut r=[receipt();2];q.snapshot_receipts(&mut r).unwrap();
+  let mut wrong=r;wrong[1].sequence+=1;
+  let mut out=[event(9);2];
+  assert_eq!(q.acknowledge_exact_prefix_into(&wrong,&mut out),
+   Err(EventError::Empty));
+  assert_eq!(out,[event(9);2]);
+  assert_eq!(q.len(),2);
+  assert_eq!(q.peek_receipt(),Some(r[0]));
+ }
+ #[test]fn short_destination_and_empty_prefix_never_drain(){
+  let mut q=ProcessEvents::<1>::new();q.enqueue(event(2)).unwrap();
+  let mut r=[receipt();1];q.snapshot_receipts(&mut r).unwrap();
+  let mut no_output:[ProcessEvent;0]=[];
+  assert_eq!(q.acknowledge_exact_prefix_into(&r,&mut no_output),
+   Err(EventError::Full));
+  let mut output=[event(9);1];
+  assert_eq!(q.acknowledge_exact_prefix_into(&[],&mut output),
+   Err(EventError::Empty));
+  assert_eq!(output,[event(9)]);
+  assert_eq!(q.len(),1);
+ }
+ #[test]fn duplicate_receipts_are_not_a_valid_prefix(){
+  let mut q=ProcessEvents::<2>::new();
+  q.enqueue(event(2)).unwrap();q.enqueue(event(2)).unwrap();
+  let r=q.peek_receipt().unwrap();let mut out=[event(9);2];
+  assert_eq!(q.acknowledge_exact_prefix_into(&[r,r],&mut out),
+   Err(EventError::Empty));
+  assert_eq!(q.len(),2);assert_eq!(out,[event(9);2]);
+ }
+}
