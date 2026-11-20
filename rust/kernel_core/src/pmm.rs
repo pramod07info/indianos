@@ -170,24 +170,33 @@ unsafe fn initialize(s: &mut State, region_count: u64, reader: RegionReader,
 
 /// # Safety
 /// \`physical\` is a valid writable pointer or null; single-CPU caller.
+// The C ABI and tests use one allocator path. Corrupt cursor/counters
+// fail before bitmap mutation. Global usage remains BSP+IRQs-disabled.
+impl State {
+    fn claim_single_frame(&mut self)->Option<u64>{
+        if !self.initialized||self.total==0||self.used>=self.total||
+           self.cursor>=self.total{return None;}
+        for scanned in 0..self.total{
+            let mut bit=self.cursor+scanned;
+            if bit>=self.total{bit-=self.total;}
+            if !self.allocated(bit){
+                let address=self.physical_at(bit)?;
+                self.set_bit(bit,true);
+                self.used+=1;
+                self.cursor=if bit+1==self.total{0}else{bit+1};
+                return Some(address);
+            }
+        }
+        None
+    }
+}
 #[no_mangle]
 pub unsafe extern "C" fn pmm_allocate_frame(physical: *mut u64) -> bool {
     if physical.is_null() { return false; }
     let s = unsafe { state() };
-    if !s.initialized || s.used >= s.total { return false; }
-    for scanned in 0..s.total {
-        let mut bit = s.cursor + scanned;
-        if bit >= s.total { bit -= s.total; }
-        if !s.allocated(bit) {
-            let Some(address) = s.physical_at(bit) else { return false; };
-            s.set_bit(bit, true);
-            s.used += 1;
-            s.cursor = if bit + 1 == s.total { 0 } else { bit + 1 };
-            unsafe { ptr::write(physical, address); }
-            return true;
-        }
-    }
-    false
+    let Some(address)=s.claim_single_frame()else{return false;};
+    unsafe{ptr::write(physical,address);}
+    true
 }
 
 /// Acquire N physically contiguous 4 KiB frames from ONE usable RAM span.
@@ -657,7 +666,10 @@ impl State{
     }
     /// 17. Allocate a discontiguous exact frame set as one transaction.
     fn claim_exact_frame_set(&mut self,addresses:&[u64])->bool{
-        if addresses.is_empty()||addresses.len()>16||!self.initialized{return false;}
+        if addresses.is_empty()||addresses.len()>16||!self.initialized||
+           self.used>self.total||addresses.len() as u64>self.total-self.used{
+            return false;
+        }
         let mut bits=[0u64;16];
         for (i,&physical) in addresses.iter().enumerate(){
             let Some(bit)=self.bit_for_physical(physical)else{return false;};
@@ -670,7 +682,10 @@ impl State{
     }
     /// 18. Release a discontiguous exact set without partial free.
     fn release_exact_frame_set(&mut self,addresses:&[u64])->bool{
-        if addresses.is_empty()||addresses.len()>16||!self.initialized{return false;}
+        if addresses.is_empty()||addresses.len()>16||!self.initialized||
+           self.used>self.total||self.used<addresses.len() as u64 {
+            return false;
+        }
         let mut bits=[0u64;16];
         for (i,&physical) in addresses.iter().enumerate(){
             let Some(bit)=self.bit_for_physical(physical)else{return false;};
@@ -1775,5 +1790,93 @@ mod kernel_p0_batch22_w1_tests{
         assert_eq!(s.used,[false;3]);
         assert!(pmm_self_test_roundtrip(&mut s,alloc,free));
         assert_eq!(s.used,[false;3]);
+    }
+}
+
+
+// Batch23 W1 P0-581..584: real discontiguous PMM claim/release paths
+// cannot overrun or underflow the bitmap-owner accounting transaction.
+#[cfg(test)]
+mod kernel_p0_batch23_w1_tests{
+    use super::*;
+    unsafe extern "C" fn map(i:u64,out:*mut Region,ctx:*mut c_void)->bool{
+        if i!=0||out.is_null()||ctx.is_null(){return false;}
+        unsafe{out.write(*(ctx.cast::<Region>()));}true
+    }
+    fn state()->State{
+        let mut s=State::empty();
+        let mut r=Region{base:PAGE,length:PAGE*4,kind:0};
+        assert!(unsafe{initialize_once(&mut s,1,Some(map),(&mut r as *mut Region).cast())});
+        s
+    }
+    #[test]fn kernel_p0_batch23_w1_581_claim_fails_on_corrupt_used_overflow(){
+        let mut s=state();s.used=s.total+1;
+        assert!(!s.claim_exact_frame_set(&[PAGE]));
+        assert!(!s.allocated(0));assert_eq!(s.used,5);
+    }
+    #[test]fn kernel_p0_batch23_w1_582_claim_budget_has_no_partial_effect(){
+        let mut s=state();s.used=3;
+        assert!(!s.claim_exact_frame_set(&[PAGE,2*PAGE]));
+        assert!(!s.allocated(0));assert!(!s.allocated(1));
+    }
+    #[test]fn kernel_p0_batch23_w1_583_release_underflow_preserves_bitmap(){
+        let mut s=state();assert!(s.claim_exact_frame_set(&[PAGE,2*PAGE]));
+        s.used=1;
+        assert!(!s.release_exact_frame_set(&[PAGE,2*PAGE]));
+        assert!(s.allocated(0));assert!(s.allocated(1));
+    }
+    #[test]fn kernel_p0_batch23_w1_584_good_claim_release_reuses_frames(){
+        let mut s=state();
+        assert!(s.claim_exact_frame_set(&[PAGE,3*PAGE]));
+        assert!(!s.claim_exact_frame_set(&[PAGE]));
+        assert!(s.release_exact_frame_set(&[PAGE,3*PAGE]));
+        assert!(!s.release_exact_frame_set(&[PAGE,3*PAGE]));
+        assert_eq!(s.used,0);assert!(s.verify_frame_accounting());
+    }
+}
+
+
+// Batch24 W1 P0-606..609: one-shot C ABI compatibility and allocator
+// counter/cursor guards exercise State::claim_single_frame, not a mock.
+#[cfg(test)]
+mod kernel_p0_batch24_w1_tests{
+    use super::*;
+    unsafe extern "C" fn map(i:u64,out:*mut Region,ctx:*mut c_void)->bool{
+        if i!=0||out.is_null()||ctx.is_null(){return false;}
+        unsafe{out.write(*(ctx.cast::<Region>()));}true
+    }
+    fn fresh()->State{
+        let mut s=State::empty();let mut r=Region{base:PAGE,length:PAGE*3,kind:0};
+        assert!(unsafe{initialize_once(&mut s,1,Some(map),(&mut r as *mut Region).cast())});
+        s
+    }
+    #[test]fn kernel_p0_batch24_w1_606_one_shot_reinit_preserves_live_frames(){
+        let mut s=fresh();
+        let first=s.claim_single_frame().unwrap();
+        let mut alternate=Region{base:PAGE*100,length:PAGE,kind:0};
+        assert!(!unsafe{initialize_once(&mut s,1,Some(map),(&mut alternate as *mut Region).cast())});
+        assert_eq!(s.total,3);assert_eq!(s.used,1);
+        assert_eq!(s.is_frame_busy(first),Some(true));
+        assert!(s.release_run(first,1));assert!(s.verify_frame_accounting());
+    }
+    #[test]fn kernel_p0_batch24_w1_607_corrupt_cursor_refuses_allocation(){
+        let mut s=fresh();s.cursor=s.total;
+        assert_eq!(s.claim_single_frame(),None);
+        assert_eq!(s.used,0);assert!(s.verify_frame_accounting());
+    }
+    #[test]fn kernel_p0_batch24_w1_608_corrupt_count_refuses_allocation(){
+        let mut s=fresh();s.used=s.total+1;
+        assert_eq!(s.claim_single_frame(),None);
+        assert_eq!(s.used,4);assert!(!s.allocated(0));
+    }
+    #[test]fn kernel_p0_batch24_w1_609_exhaustion_recycle_is_one_owner(){
+        let mut s=fresh();
+        let a=s.claim_single_frame().unwrap();let b=s.claim_single_frame().unwrap();
+        let c=s.claim_single_frame().unwrap();
+        assert_ne!(a,b);assert_ne!(b,c);
+        assert_eq!(s.claim_single_frame(),None);
+        assert!(s.release_run(b,1));
+        assert_eq!(s.claim_single_frame(),Some(b));
+        assert!(s.verify_frame_accounting());
     }
 }

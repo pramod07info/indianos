@@ -67,7 +67,7 @@ impl<D:BlockDevice> BlockDevice for ReadOnlyDevice<'_,D>{
  fn write_sector(&mut self,_lba:u64,_bytes:&[u8;SECTOR_BYTES])
   ->Result<(),BlockError>{Err(BlockError::ReadOnly)}
  fn sync(&mut self)->Result<(),BlockError>{Err(BlockError::ReadOnly)}
- fn media_generation(&self)->Option<u64>{self.parent_generation}
+ fn media_generation(&self)->Option<u64>{if self.invalidated{None}else{self.parent_generation}}
 }
 /// Restrict access to a validated block-device window; no I/O occurs on construction.
 /// Destructive formatting is still an explicit responsibility of the caller.
@@ -131,7 +131,7 @@ impl<'a, D: BlockDevice> BlockWindow<'a, D> {
 }
 impl<D: BlockDevice> BlockDevice for BlockWindow<'_, D> {
     fn sector_count(&self) -> u64 { self.count }
-    fn media_generation(&self)->Option<u64>{self.parent_generation}
+    fn media_generation(&self)->Option<u64>{if self.invalidated{None}else{self.parent_generation}}
     fn read_sector(&mut self, lba: u64, out: &mut [u8; SECTOR_BYTES])
         -> Result<(), BlockError>
     {
@@ -865,6 +865,7 @@ pub struct ExtentReader<'a, D: BlockDevice> {
     extents: &'a [crate::agent_01_fs_extents::Extent],
     logical_sectors: u64,
     parent_capacity:u64,
+    parent_generation:Option<u64>,
     invalidated:bool,
 }
 impl<'a, D: BlockDevice> ExtentReader<'a, D> {
@@ -872,16 +873,21 @@ impl<'a, D: BlockDevice> ExtentReader<'a, D> {
         -> Result<Self, BlockError>
     {
         let parent_capacity=device.sector_count();
+        let parent_generation=device.media_generation();
         let count = crate::agent_01_fs_extents::validate_extents(
             extents,parent_capacity
         ).map_err(|_| BlockError::OutOfRange)?;
         if count == 0 { return Err(BlockError::OutOfRange); }
+        if !media_snapshot_matches(device,parent_capacity,parent_generation){
+            return Err(BlockError::Io);
+        }
         Ok(Self { device, extents, logical_sectors: count,
-                  parent_capacity,invalidated:false })
+                  parent_capacity,parent_generation,invalidated:false })
     }
     fn check_parent(&mut self)->Result<(),BlockError>{
         if self.invalidated{return Err(BlockError::Io);}
-        if self.device.sector_count()!=self.parent_capacity{
+        if !media_snapshot_matches(self.device,self.parent_capacity,
+            self.parent_generation){
             self.invalidated=true;
             return Err(BlockError::Io);
         }
@@ -897,6 +903,7 @@ impl<'a, D: BlockDevice> ExtentReader<'a, D> {
 }
 impl<D: BlockDevice> BlockDevice for ExtentReader<'_, D> {
     fn sector_count(&self) -> u64 { self.logical_sectors }
+    fn media_generation(&self)->Option<u64>{if self.invalidated{None}else{self.parent_generation}}
 
     fn read_sector(&mut self, lba: u64, out: &mut [u8; SECTOR_BYTES])
         -> Result<(), BlockError>
@@ -904,6 +911,7 @@ impl<D: BlockDevice> BlockDevice for ExtentReader<'_, D> {
         let mapped = self.physical_lba(lba)?;
         let mut staged=[0u8;SECTOR_BYTES];
         let transferred=self.device.read_sector(mapped,&mut staged);
+        if transferred.is_err(){self.invalidated=true;}
         self.check_parent()?;
         transferred?;
         out.copy_from_slice(&staged);
@@ -2882,5 +2890,117 @@ mod kernel_p0_batch22_w4_tests {
         disk=Disk::new();
         assert_eq!(read_stable_sectors(&mut disk,0,&mut output),Ok(()));
         assert_eq!(output,[0x71u8;SECTOR_BYTES]);
+    }
+}
+
+
+// Batch23 W4 P0-593..597: stale extent mounts never resume I/O after
+// media change or failed driver read. Physical driver epoch still required.
+#[cfg(test)]
+mod kernel_p0_batch23_w4_tests{
+ use super::*;
+ use crate::agent_01_fs_extents::Extent;
+ use core::cell::Cell;
+ struct Disk<'a>{epoch:&'a Cell<u64>,fail_read:bool}
+ impl BlockDevice for Disk<'_>{
+    fn sector_count(&self)->u64{8}
+    fn media_generation(&self)->Option<u64>{Some(self.epoch.get())}
+    fn read_sector(&mut self,_:u64,out:&mut[u8;SECTOR_BYTES])
+      ->Result<(),BlockError>{
+       out.fill(0x42);
+       if self.fail_read{Err(BlockError::Io)}else{Ok(())}
+    }
+    fn write_sector(&mut self,_:u64,_:&[u8;SECTOR_BYTES])
+      ->Result<(),BlockError>{Err(BlockError::ReadOnly)}
+ }
+ fn extents()->[Extent;1]{[Extent{start:2,blocks:2}]}
+ #[test]fn kernel_p0_batch23_w4_593_pins_generation_when_mounted(){
+    let token=Cell::new(4);let mut disk=Disk{epoch:&token,fail_read:false};
+    let list=extents();let mut view=ExtentReader::new(&mut disk,&list).unwrap();
+    assert_eq!(view.media_generation(),Some(4));
+    let mut out=[0u8;SECTOR_BYTES];assert_eq!(view.read_sector(0,&mut out),Ok(()));
+    assert_eq!(out,[0x42;SECTOR_BYTES]);
+ }
+ #[test]fn kernel_p0_batch23_w4_594_replacement_denies_output(){
+    let token=Cell::new(4);let mut disk=Disk{epoch:&token,fail_read:false};
+    let list=extents();let mut view=ExtentReader::new(&mut disk,&list).unwrap();
+    token.set(5);
+    let mut out=[0x71;SECTOR_BYTES];
+    assert_eq!(view.read_sector(0,&mut out),Err(BlockError::Io));
+    assert_eq!(out,[0x71;SECTOR_BYTES]);
+ }
+ #[test]fn kernel_p0_batch23_w4_595_restoring_generation_does_not_revive(){
+    let token=Cell::new(4);let mut disk=Disk{epoch:&token,fail_read:false};
+    let list=extents();let mut view=ExtentReader::new(&mut disk,&list).unwrap();
+    token.set(5);let mut out=[0u8;SECTOR_BYTES];
+    assert_eq!(view.read_sector(0,&mut out),Err(BlockError::Io));
+    token.set(4);
+    assert_eq!(view.read_sector(0,&mut out),Err(BlockError::Io));
+ }
+ #[test]fn kernel_p0_batch23_w4_596_failed_read_retires_extent(){
+    let token=Cell::new(4);let mut disk=Disk{epoch:&token,fail_read:true};
+    let list=extents();let mut view=ExtentReader::new(&mut disk,&list).unwrap();
+    let mut out=[0x70;SECTOR_BYTES];
+    assert_eq!(view.read_sector(0,&mut out),Err(BlockError::Io));
+    assert_eq!(out,[0x70;SECTOR_BYTES]);
+    assert_eq!(view.read_sector(0,&mut out),Err(BlockError::Io));
+ }
+ #[test]fn kernel_p0_batch23_w4_597_extent_is_read_only(){
+    let token=Cell::new(4);let mut disk=Disk{epoch:&token,fail_read:false};
+    let list=extents();let mut view=ExtentReader::new(&mut disk,&list).unwrap();
+    assert_eq!(view.write_sector(0,&[0;SECTOR_BYTES]),Err(BlockError::ReadOnly));
+    assert_eq!(view.sync(),Err(BlockError::ReadOnly));
+ }
+}
+
+
+// Batch24 W4 P0-616..619: a revoked bounded/read-only/extent mount may
+// no longer advertise a stale driver generation as a valid capability.
+// A None token on an otherwise healthy legacy driver remains unqualified.
+#[cfg(test)]
+mod kernel_p0_batch24_w4_tests{
+    use super::*;
+    use crate::agent_01_fs_extents::Extent;
+    use core::cell::Cell;
+    struct Disk<'a>{epoch:&'a Cell<u64>,fail_write:bool}
+    impl BlockDevice for Disk<'_>{
+        fn sector_count(&self)->u64{8}
+        fn media_generation(&self)->Option<u64>{Some(self.epoch.get())}
+        fn read_sector(&mut self,_:u64,out:&mut[u8;SECTOR_BYTES])
+           ->Result<(),BlockError>{out.fill(0x51);Ok(())}
+        fn write_sector(&mut self,_:u64,_:&[u8;SECTOR_BYTES])
+           ->Result<(),BlockError>{
+           if self.fail_write{Err(BlockError::Io)}else{Ok(())}}
+    }
+    #[test]fn kernel_p0_batch24_w4_616_readonly_revoke_hides_token(){
+        let epoch=Cell::new(3);let mut disk=Disk{epoch:&epoch,fail_write:false};
+        let mut view=ReadOnlyDevice::new(&mut disk);assert_eq!(view.media_generation(),Some(3));
+        epoch.set(4);let mut out=[0u8;SECTOR_BYTES];
+        assert_eq!(view.read_sector(0,&mut out),Err(BlockError::Io));
+        assert_eq!(view.media_generation(),None);
+    }
+    #[test]fn kernel_p0_batch24_w4_617_window_write_fault_hides_token(){
+        let epoch=Cell::new(3);let mut disk=Disk{epoch:&epoch,fail_write:true};
+        let mut view=BlockWindow::new(&mut disk,1,3).unwrap();
+        assert_eq!(view.media_generation(),Some(3));
+        assert_eq!(view.write_sector(0,&[1;SECTOR_BYTES]),Err(BlockError::Io));
+        assert_eq!(view.media_generation(),None);
+    }
+    #[test]fn kernel_p0_batch24_w4_618_extent_replacement_hides_token(){
+        let epoch=Cell::new(3);let mut disk=Disk{epoch:&epoch,fail_write:false};
+        let list=[Extent{start:1,blocks:2}];
+        let mut view=ExtentReader::new(&mut disk,&list).unwrap();
+        epoch.set(4);let mut out=[0u8;SECTOR_BYTES];
+        assert_eq!(view.read_sector(0,&mut out),Err(BlockError::Io));
+        epoch.set(3);assert_eq!(view.media_generation(),None);
+        assert_eq!(view.read_sector(0,&mut out),Err(BlockError::Io));
+    }
+    #[test]fn kernel_p0_batch24_w4_619_healthy_view_keeps_pinned_epoch(){
+        let epoch=Cell::new(9);let mut disk=Disk{epoch:&epoch,fail_write:false};
+        let mut view=BlockWindow::new(&mut disk,1,3).unwrap();
+        let mut out=[0u8;SECTOR_BYTES];
+        assert_eq!(view.read_sector(0,&mut out),Ok(()));
+        assert_eq!(view.media_generation(),Some(9));
+        assert_eq!(out,[0x51;SECTOR_BYTES]);
     }
 }

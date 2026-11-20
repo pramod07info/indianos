@@ -622,17 +622,37 @@ fn current_irq_session(start_epoch:u64,end_epoch:u64,
     (expected_source==1||expected_source==2)&&
        same_timer_session(start_epoch,end_epoch,expected_source,observed_source)
 }
+/// Only an actually armed interrupt controller can authenticate a receipt.
+/// The APIC wins over PIC if both remain configured during switchover.
+fn source_irq_ready(source:u8,pic_armed:bool,apic_running:bool)->bool{
+    (source==1 && pic_armed && !apic_running) ||
+    (source==2 && apic_running)
+}
+fn tick_session_authorized(epoch:u64,current_epoch:u64,
+    source:u8,current_source:u8,pic_armed:bool,apic_running:bool,
+    exhausted:bool)->bool{
+    epoch!=0 && !exhausted &&
+    current_irq_session(epoch,current_epoch,source,current_source) &&
+    source_irq_ready(source,pic_armed,apic_running)
+}
 fn record_kernel_monotonic_tick(source:u8){
     let epoch=MONOTONIC_SESSION_EPOCH.load(Ordering::Acquire);
-    if source!=1&&source!=2{return;}
-    if MONOTONIC_SOURCE.load(Ordering::Acquire)!=source {return;}
+    if !tick_session_authorized(epoch,
+        MONOTONIC_SESSION_EPOCH.load(Ordering::Acquire),source,
+        MONOTONIC_SOURCE.load(Ordering::Acquire),
+        CONFIGURED.load(Ordering::Acquire),
+        XAPIC_TIMER_RUNNING.load(Ordering::Acquire),
+        MONOTONIC_EXHAUSTED.load(Ordering::Acquire)){return;}
     if MONOTONIC_IRQ_TICKS.fetch_update(
         Ordering::AcqRel,Ordering::Acquire,|n|n.checked_add(1)
     ).is_err(){
         MONOTONIC_EXHAUSTED.store(true,Ordering::Release);
-    }else if current_irq_session(epoch,
+    }else if tick_session_authorized(epoch,
         MONOTONIC_SESSION_EPOCH.load(Ordering::Acquire),source,
-        MONOTONIC_SOURCE.load(Ordering::Acquire)){
+        MONOTONIC_SOURCE.load(Ordering::Acquire),
+        CONFIGURED.load(Ordering::Acquire),
+        XAPIC_TIMER_RUNNING.load(Ordering::Acquire),
+        MONOTONIC_EXHAUSTED.load(Ordering::Acquire)){
         // Stamp first, then publish: a callback that lost a reset race
         // carries the OLD stamp and cannot authorize the new session.
         MONOTONIC_PROGRESS_EPOCH.store(epoch,Ordering::Release);
@@ -1252,5 +1272,58 @@ mod kernel_p0_batch22_w2_tests{
             irq_receipt_valid(9,9,true),true,12,true,false),None);
         assert_eq!(authoritative_monotonic_sample(2,
             irq_receipt_valid(9,9,true),false,12,false,true),None);
+    }
+}
+
+
+// Batch23 W2 P0-585..588: actual IRQ tick receipt is authorized by
+// controller state, not merely by stale monotonic source metadata.
+#[cfg(test)]
+mod kernel_p0_batch23_w2_tests{
+ use super::*;
+ #[test]fn kernel_p0_batch23_w2_585_pic_needs_active_irq0(){
+   assert!(source_irq_ready(1,true,false));
+   assert!(!source_irq_ready(1,false,false));
+ }
+ #[test]fn kernel_p0_batch23_w2_586_pic_cannot_override_running_apic(){
+   assert!(!source_irq_ready(1,true,true));
+   assert!(source_irq_ready(2,true,true));
+ }
+ #[test]fn kernel_p0_batch23_w2_587_apic_requires_running_timer(){
+   assert!(!source_irq_ready(2,true,false));
+   assert!(!source_irq_ready(2,false,false));
+   assert!(source_irq_ready(2,false,true));
+ }
+ #[test]fn kernel_p0_batch23_w2_588_untrusted_source_ids_denied(){
+   for invalid in [0,3,127,255]{
+     assert!(!source_irq_ready(invalid,true,true));
+   }
+   assert!(!source_irq_ready(0,false,false));
+ }
+}
+
+
+// Batch24 W2 P0-610..612: the actual IRQ monotonic increment and progress
+// publication both require one live authorized session. This is a bounded
+// BSP-source check, not an SMP-calibrated high-resolution clock.
+#[cfg(test)]
+mod kernel_p0_batch24_w2_tests{
+    use super::*;
+    #[test]fn kernel_p0_batch24_w2_610_pic_epoch_switch_and_apic_priority(){
+        assert!(tick_session_authorized(10,10,1,1,true,false,false));
+        assert!(!tick_session_authorized(10,11,1,1,true,false,false));
+        assert!(!tick_session_authorized(10,10,1,1,true,true,false));
+        assert!(tick_session_authorized(11,11,2,2,true,true,false));
+    }
+    #[test]fn kernel_p0_batch24_w2_611_stopped_and_wrong_source_denied(){
+        assert!(!tick_session_authorized(4,4,1,1,false,false,false));
+        assert!(!tick_session_authorized(4,4,2,2,true,false,false));
+        assert!(!tick_session_authorized(4,4,2,1,true,true,false));
+        assert!(!tick_session_authorized(0,0,1,1,true,false,false));
+    }
+    #[test]fn kernel_p0_batch24_w2_612_saturated_clock_never_rearms(){
+        assert!(!tick_session_authorized(4,4,2,2,false,true,true));
+        assert!(!tick_session_authorized(u64::MAX,0,2,2,false,true,false));
+        assert!(tick_session_authorized(4,4,2,2,false,true,false));
     }
 }

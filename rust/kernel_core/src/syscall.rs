@@ -55,13 +55,26 @@ pub struct SyscallRequest {
     pub(crate) arg1: u64,
 }
 
+/// Pure user-memory layout preflight, before either syscall numeric policy
+/// or ring3 trap-frame admission. A malformed guard must not be bypassed.
+fn user_stack_layout_valid(plan:&ProgramPlan)->bool{
+    plan.stack_begin>=USER_MIN && plan.stack_end<=USER_TOP &&
+    plan.stack_begin<plan.stack_end &&
+    plan.stack_begin%PAGE_BYTES==0 &&
+    plan.stack_end%PAGE_BYTES==0 &&
+    // A zero guard means this plan is not yet given a numeric guard
+    // (e.g. staged test images); actual page-table validation remains
+    // mandatory. Once present, a guard must be aligned and non-overlapping.
+    (plan.guard_begin==0 ||
+      (plan.guard_begin>=USER_MIN && plan.guard_begin%PAGE_BYTES==0 &&
+       plan.guard_begin.checked_add(PAGE_BYTES)
+          .is_some_and(|end|end<=plan.stack_begin)))
+}
 pub(crate) fn user_range(plan: &ProgramPlan, address: u64, length: u64, write: bool) -> bool {
     if length == 0 || address < USER_MIN || address >= USER_TOP ||
         length > USER_TOP - address ||
         plan.segment_count as usize > MAX_SEGMENTS ||
-        plan.stack_begin < USER_MIN ||
-        plan.stack_end > USER_TOP ||
-        plan.stack_begin >= plan.stack_end {
+        !user_stack_layout_valid(plan) {
         return false;
     }
     // A malformed overlapping segment cannot reauthorize the protected
@@ -78,6 +91,10 @@ pub(crate) fn user_range(plan: &ProgramPlan, address: u64, length: u64, write: b
     }
     for seg in plan.segments.iter().take((plan.segment_count as usize).min(MAX_SEGMENTS)) {
         if address >= seg.page_begin && address < seg.page_end &&
+            seg.page_begin>=USER_MIN && seg.page_end<=USER_TOP &&
+            seg.page_begin<seg.page_end &&
+            seg.page_begin%PAGE_BYTES==0 && seg.page_end%PAGE_BYTES==0 &&
+            !(seg.page_begin<plan.stack_end && plan.stack_begin<seg.page_end) &&
             seg.page_end.checked_sub(address).is_some_and(|available| length <= available) &&
             (!write || (seg.writable && !seg.executable)) {
             return true;
@@ -179,6 +196,19 @@ pub unsafe extern "C" fn indianos_syscall_validate(
 /// Validate the CPU-generated ring-3 IRET frame before honoring syscalls or
 /// saving user context. 15 saved GPRs are followed by RIP, CS, RFLAGS, RSP, SS.
 /// This is a numeric policy check: it never dereferences user addresses.
+/// Never authorize IRET directly into the user stack or guard, even
+/// when a stale PTE could otherwise still mark that page executable.
+/// The installed page table has an independent and mandatory NX check.
+fn ring3_instruction_span_valid(plan:&ProgramPlan,rip:u64)->bool {
+    if !(USER_MIN..USER_TOP).contains(&rip) ||
+       (plan.stack_begin..plan.stack_end).contains(&rip){return false;}
+    if plan.guard_begin>=USER_MIN &&
+       plan.guard_begin.checked_add(PAGE_BYTES)
+         .is_some_and(|end|(plan.guard_begin..end).contains(&rip)){
+        return false;
+    }
+    true
+}
 pub(crate) fn ring3_frame_valid(
     frame: &[u64; 20], plan: &ProgramPlan, irq_enabled: bool,
 ) -> bool {
@@ -199,9 +229,8 @@ pub(crate) fn ring3_frame_valid(
         flags & FIXED != 0 &&
         flags & (IOPL | NT | VM | RESERVED | UNSUPPORTED) == 0 &&
         (flags & IF != 0) == irq_enabled &&
-        (USER_MIN..USER_TOP).contains(&rip) &&
-        plan.stack_begin >= USER_MIN && plan.stack_end <= USER_TOP &&
-        plan.stack_begin < plan.stack_end &&
+        ring3_instruction_span_valid(plan,rip) &&
+        user_stack_layout_valid(plan) &&
         rsp >= plan.stack_begin && rsp <= plan.stack_end
 }
 
@@ -815,5 +844,87 @@ mod kernel_p0_batch22_w3_tests{
         f[17]=0x202;
         assert!(ring3_frame_valid(&f,&p,true));
         assert!(!ring3_frame_valid(&f,&p,false));
+    }
+}
+
+
+// Batch23 W3 P0-589..592: live syscall and ring3 numeric gates reject
+// malformed user guard and segment layout before supervisor may copy bytes.
+#[cfg(test)]
+mod kernel_p0_batch23_w3_tests{
+ use super::*;
+ fn plan()->ProgramPlan{
+    let mut p=ProgramPlan{entry:USER_MIN,stack_begin:USER_TOP-STACK_BYTES,
+      stack_end:USER_TOP,guard_begin:USER_TOP-STACK_BYTES-PAGE_BYTES,
+      segment_count:1,segments:[ProgramSegment::empty();MAX_SEGMENTS]};
+    p.segments[0]=ProgramSegment{page_begin:USER_MIN,page_end:USER_MIN+PAGE_BYTES,
+      writable:true,..ProgramSegment::empty()};p
+ }
+ #[test]fn kernel_p0_batch23_w3_589_malformed_guard_denied_but_staged_compat(){
+    let mut p=plan();p.guard_begin=USER_MIN+1;
+    assert!(!user_stack_layout_valid(&p));
+    assert!(!user_range(&p,USER_MIN,8,true));
+    // Zero-guard staging is permitted; live PTE checks still gate copies.
+    p.guard_begin=0;
+    assert!(user_stack_layout_valid(&p));
+    assert!(user_range(&p,USER_MIN,8,true));
+ }
+ #[test]fn kernel_p0_batch23_w3_590_overlapping_guard_stack_denied(){
+    let mut p=plan();p.guard_begin=p.stack_begin;
+    assert!(!user_range(&p,p.stack_begin,8,true));
+    p=plan();p.guard_begin=p.stack_begin-PAGE_BYTES+1;
+    assert!(!user_range(&p,USER_MIN,8,false));
+ }
+ #[test]fn kernel_p0_batch23_w3_591_malformed_segment_denied(){
+    let mut p=plan();
+    assert!(user_range(&p,USER_MIN,8,true));
+    p.segments[0].page_begin=USER_MIN+1;
+    assert!(!user_range(&p,USER_MIN+1,8,true));
+    p=plan();p.segments[0].page_end=USER_MIN+PAGE_BYTES-1;
+    assert!(!user_range(&p,USER_MIN,8,true));
+ }
+ #[test]fn kernel_p0_batch23_w3_592_valid_stack_and_segment_preserved(){
+    let p=plan();
+    assert!(user_stack_layout_valid(&p));
+    assert!(user_range(&p,USER_MIN,16,true));
+    assert!(user_range(&p,p.stack_begin,16,true));
+    assert!(!user_range(&p,p.guard_begin,16,false));
+ }
+}
+
+
+// Batch24 W3 P0-613..615: numeric ring3 IRET never lands on stack or
+// guard and rejects unaligned stack top. Live installed PTE checks remain
+// required independently of this preflight.
+#[cfg(test)]
+mod kernel_p0_batch24_w3_tests {
+    use super::*;
+    fn plan()->ProgramPlan {
+       ProgramPlan{entry:USER_MIN,stack_begin:USER_TOP-STACK_BYTES,
+          stack_end:USER_TOP,guard_begin:USER_TOP-STACK_BYTES-PAGE_BYTES,
+          segment_count:0,segments:[ProgramSegment::empty();MAX_SEGMENTS]}
+    }
+    fn frame(p:&ProgramPlan)->[u64;20] {
+       let mut f=[0;20];f[15]=USER_MIN;f[16]=0x2b;
+       f[17]=2;f[18]=p.stack_end-16;f[19]=0x33;f
+    }
+    #[test]fn kernel_p0_batch24_w3_613_non_page_aligned_stack_top_denied(){
+       let mut p=plan();let f=frame(&p);
+       assert!(ring3_frame_valid(&f,&p,false));
+       p.stack_end-=8;
+       assert!(!ring3_frame_valid(&f,&p,false));
+    }
+    #[test]fn kernel_p0_batch24_w3_614_stack_rip_denied(){
+       let p=plan();let mut f=frame(&p);
+       f[15]=p.stack_begin+8;
+       assert!(!ring3_frame_valid(&f,&p,false));
+       f[15]=USER_MIN;assert!(ring3_frame_valid(&f,&p,false));
+    }
+    #[test]fn kernel_p0_batch24_w3_615_guard_rip_denied(){
+       let mut p=plan();let mut f=frame(&p);
+       f[15]=p.guard_begin;
+       assert!(!ring3_frame_valid(&f,&p,false));
+       p.guard_begin=0;
+       assert!(ring3_frame_valid(&f,&p,false));
     }
 }
