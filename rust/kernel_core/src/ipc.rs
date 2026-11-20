@@ -2013,3 +2013,104 @@ mod kernel_p0_batch15_w3_digested_relay_tests{
   assert_eq!(r.pending(id(4)),Ok(1));assert_eq!(r.pending(id(5)),Ok(1));
  }
 }
+
+
+
+/// P0-341..345: authenticated, digest-pinned multi-inbox RECEIVE (not relay).
+/// Dequeues distinct mailbox heads and publishes a complete caller buffer
+/// only after all generation, digest and aggregate byte checks succeed.
+/// Exclusive kernel IPC ownership and copy-to-userspace validation are
+/// separate requirements; do not call with an unvalidated ring-3 pointer.
+impl<const M:usize,const D:usize> ScopedRouter<M,D>{
+ pub fn receive_digest_pinned_batch(
+  &mut self,requests:&[(Identity,Identity,[u8;32])],
+  max_bytes:usize,out:&mut[TaggedMessage]
+ )->Result<usize,IpcError>{
+  if requests.is_empty()||requests.len()>M||max_bytes==0||
+     max_bytes>M.saturating_mul(MAX_PAYLOAD){
+   return Err(IpcError::InvalidConfiguration);
+  }
+  if out.len()<requests.len(){return Err(IpcError::Full);}
+  let mut staged=self.clone();
+  let mut pending=[None;M];
+  let mut total=0usize;
+  for (index,&(receiver,sender,digest)) in requests.iter().enumerate(){
+   if receiver.pid==0||receiver.generation==0||
+      sender.pid==0||sender.generation==0{return Err(IpcError::InvalidPid);}
+   if requests[..index].iter().any(|(prior,_,_)|prior.pid==receiver.pid){
+    return Err(IpcError::DuplicateReceiver);
+   }
+   let message=staged.receive(receiver)?;
+   if message.sender()!=sender||
+      crate::m2_sha256::digest(message.payload())!=digest{
+    return Err(IpcError::UnknownSender);
+   }
+   total=total.checked_add(message.payload().len())
+    .ok_or(IpcError::PayloadTooLarge)?;
+   if total>max_bytes{return Err(IpcError::PayloadTooLarge);}
+   pending[index]=Some(message);
+  }
+  for (slot,source) in out.iter_mut().zip(pending.iter().take(requests.len())){
+   *slot=source.ok_or(IpcError::Empty)?;
+  }
+  *self=staged;
+  Ok(requests.len())
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch16_w3_pinned_receive_tests{
+ use super::*;
+ fn id(pid:u32)->Identity{Identity{pid,generation:1}}
+ fn digest(s:&[u8])->[u8;32]{crate::m2_sha256::digest(s)}
+ fn setup()->ScopedRouter<4,2>{
+  let mut r=ScopedRouter::<4,2>::new().unwrap();
+  for p in 1..=4{r.register(id(p)).unwrap();}
+  r.send(id(1),id(3),b"first").unwrap();
+  r.send(id(2),id(4),b"second").unwrap();
+  r
+ }
+ fn requests()->[(Identity,Identity,[u8;32]);2]{
+  [(id(3),id(1),digest(b"first")),(id(4),id(2),digest(b"second"))]
+ }
+ fn sentinel()->TaggedMessage{TaggedMessage{
+  sender:id(1),length:0,bytes:[0;MAX_PAYLOAD]}}
+ #[test]fn authentic_batch_delivery_and_replay_protection(){
+  let mut r=setup();let mut out=[sentinel();2];
+  assert_eq!(r.receive_digest_pinned_batch(&requests(),11,&mut out),Ok(2));
+  assert_eq!(out[0].sender(),id(1));assert_eq!(out[0].payload(),b"first");
+  assert_eq!(out[1].payload(),b"second");
+  assert_eq!(r.pending(id(3)),Ok(0));assert_eq!(r.pending(id(4)),Ok(0));
+  assert_eq!(r.receive_digest_pinned_batch(&requests(),11,&mut out),
+   Err(IpcError::Empty));
+ }
+ #[test]fn late_digest_or_sender_failure_keeps_original_fifo_and_buffer(){
+  let mut r=setup();let mut out=[sentinel();2];
+  let mut q=requests();q[1].2=digest(b"forged");
+  assert_eq!(r.receive_digest_pinned_batch(&q,11,&mut out),
+   Err(IpcError::UnknownSender));
+  q=requests();q[1].1=id(1);
+  assert_eq!(r.receive_digest_pinned_batch(&q,11,&mut out),
+   Err(IpcError::UnknownSender));
+  assert_eq!(out,[sentinel();2]);
+  assert_eq!(r.pending(id(3)),Ok(1));assert_eq!(r.pending(id(4)),Ok(1));
+ }
+ #[test]fn late_quota_failure_and_short_buffer_have_no_partial_copy(){
+  let mut r=setup();let mut out=[sentinel();2];
+  assert_eq!(r.receive_digest_pinned_batch(&requests(),10,&mut out),
+   Err(IpcError::PayloadTooLarge));
+  assert_eq!(r.receive_digest_pinned_batch(&requests(),11,&mut out[..1]),
+   Err(IpcError::Full));
+  assert_eq!(r.pending(id(3)),Ok(1));assert_eq!(r.pending(id(4)),Ok(1));
+  assert_eq!(out,[sentinel();2]);
+ }
+ #[test]fn duplicate_inboxes_and_stale_receiver_generation_are_rejected(){
+  let mut r=setup();let mut out=[sentinel();2];
+  let q=[requests()[0],requests()[0]];
+  assert_eq!(r.receive_digest_pinned_batch(&q,11,&mut out),
+   Err(IpcError::DuplicateReceiver));
+  let stale=[(Identity{pid:3,generation:2},id(1),digest(b"first"))];
+  assert_eq!(r.receive_digest_pinned_batch(&stale,11,&mut out),
+   Err(IpcError::UnknownReceiver));
+  assert_eq!(r.pending(id(3)),Ok(1));assert_eq!(out,[sentinel();2]);
+ }
+}

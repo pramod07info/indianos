@@ -2346,3 +2346,96 @@ mod kernel_p0_batch15_w2_atomic_delivery_tests{
   assert_eq!(q.len(),2);assert_eq!(out,[event(9);2]);
  }
 }
+
+
+
+/// P0-336..340: transfer an exact lifecycle notification prefix into a
+/// supervisor event queue. Both source dequeue and destination enqueue are
+/// staged and committed together; forwarding creates new destination receipt
+/// sequence IDs, preventing a source receipt replay from removing a peer.
+/// The kernel caller must hold exclusive ownership of BOTH queues.
+impl<const C:usize> ProcessEvents<C>{
+ pub fn forward_receipt_prefix_to<const N:usize>(
+  &mut self,destination:&mut ProcessEvents<N>,
+  receipts:&[EventReceipt],allowed_pids:&[u32]
+ )->Result<usize,EventError>{
+  if receipts.is_empty(){return Err(EventError::Empty);}
+  if allowed_pids.is_empty()||allowed_pids.contains(&0){
+   return Err(EventError::InvalidPid);
+  }
+  let mut source_stage=self.clone();
+  let mut target_stage=destination.clone();
+  source_stage.acknowledge_exact_prefix(receipts)?;
+  for item in receipts{
+   if !allowed_pids.contains(&item.event.pid){return Err(EventError::InvalidPid);}
+   target_stage.enqueue(item.event)?;
+  }
+  *self=source_stage;
+  *destination=target_stage;
+  Ok(receipts.len())
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch16_w2_supervisor_forward_tests{
+ use super::*;
+ fn event(pid:u32)->ProcessEvent{
+  ProcessEvent{pid,kind:EventKind::Exited,value:pid as u64}
+ }
+ fn prefix<const N:usize>(events:&ProcessEvents<N>,count:usize)->[EventReceipt;2]{
+  let mut r=[EventReceipt{sequence:0,event:event(9)};2];
+  assert_eq!(events.snapshot_receipts(&mut r),Ok(count));r
+ }
+ #[test]fn forwarded_notifications_get_new_destination_sequence(){
+  let mut from=ProcessEvents::<2>::new();
+  let mut to=ProcessEvents::<3>::new();
+  from.enqueue(event(2)).unwrap();from.enqueue(event(3)).unwrap();
+  to.enqueue(event(7)).unwrap();
+  let receipt=prefix(&from,2);
+  assert_eq!(from.forward_receipt_prefix_to(&mut to,&receipt,&[2,3]),Ok(2));
+  assert_eq!(from.len(),0);assert_eq!(to.len(),3);
+  let mut delivered=[EventReceipt{sequence:0,event:event(9)};3];
+  to.snapshot_receipts(&mut delivered).unwrap();
+  assert_eq!(delivered[0].event,event(7));
+  assert_eq!(delivered[1].event,event(2));
+  assert_eq!(delivered[2].event,event(3));
+  // Sequence spaces are independent; test fresh destination progression.
+  assert_eq!(delivered[1].sequence,delivered[0].sequence+1);
+  assert_eq!(delivered[2].sequence,delivered[1].sequence+1);
+  assert_ne!(delivered[2].sequence,receipt[1].sequence);
+  assert_eq!(from.forward_receipt_prefix_to(&mut to,&receipt,&[2,3]),
+   Err(EventError::Empty));
+ }
+ #[test]fn late_capacity_failure_keeps_both_rings_unchanged(){
+  let mut from=ProcessEvents::<2>::new();let mut to=ProcessEvents::<2>::new();
+  from.enqueue(event(2)).unwrap();from.enqueue(event(3)).unwrap();
+  to.enqueue(event(7)).unwrap();
+  let r=prefix(&from,2);
+  assert_eq!(from.forward_receipt_prefix_to(&mut to,&r,&[2,3]),
+   Err(EventError::Full));
+  assert_eq!(from.len(),2);assert_eq!(to.len(),1);
+  assert_eq!(from.peek_receipt(),Some(r[0]));
+  assert_eq!(to.peek(),Some(event(7)));
+ }
+ #[test]fn unauthorized_or_stale_second_receipt_is_all_or_none(){
+  let mut from=ProcessEvents::<2>::new();let mut to=ProcessEvents::<2>::new();
+  from.enqueue(event(2)).unwrap();from.enqueue(event(3)).unwrap();
+  let r=prefix(&from,2);
+  assert_eq!(from.forward_receipt_prefix_to(&mut to,&r,&[2]),
+   Err(EventError::InvalidPid));
+  let mut wrong=r;wrong[1].sequence+=1;
+  assert_eq!(from.forward_receipt_prefix_to(&mut to,&wrong,&[2,3]),
+   Err(EventError::Empty));
+  assert_eq!(from.len(),2);assert_eq!(to.len(),0);
+  assert_eq!(from.peek_receipt(),Some(r[0]));
+ }
+ #[test]fn duplicate_receipts_and_empty_allowlist_are_denied(){
+  let mut from=ProcessEvents::<2>::new();let mut to=ProcessEvents::<2>::new();
+  from.enqueue(event(2)).unwrap();from.enqueue(event(3)).unwrap();
+  let r=prefix(&from,2);
+  assert_eq!(from.forward_receipt_prefix_to(&mut to,&[r[0],r[0]],&[2,3]),
+   Err(EventError::Empty));
+  assert_eq!(from.forward_receipt_prefix_to(&mut to,&r,&[]),
+   Err(EventError::InvalidPid));
+  assert_eq!(from.len(),2);assert_eq!(to.len(),0);
+ }
+}

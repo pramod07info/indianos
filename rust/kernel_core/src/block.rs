@@ -2490,3 +2490,108 @@ mod kernel_p0_batch15_w4_manifest_mirrors_tests{
   assert_eq!(out,[9;SECTOR_BYTES]);assert!(view.is_retired());
  }
 }
+
+
+
+/// P0-346..350: atomically read TWO separately manifest-authenticated
+/// redundant metadata sectors at one media revision. Four physical LBAs
+/// must be distinct; neither output receives bytes until both records pass
+/// all duplicate observations, digests and final media-revision probe.
+impl<D:BlockDevice> StableReadOnlyWindow<'_,D>{
+ pub fn read_authenticated_mirror_pair(
+  &mut self,lbas:[(u64,u64);2],revision:u64,
+  expected:[[u8;32];2],mut observe_revision:impl FnMut()->u64,
+  outputs:[&mut[u8;SECTOR_BYTES];2]
+ )->Result<[MirroredSectorReceipt;2],BlockError>{
+  let indices=[lbas[0].0,lbas[0].1,lbas[1].0,lbas[1].1];
+  if self.invalidated||revision==0||
+     expected.iter().any(|digest|*digest==[0;32]){
+   return Err(BlockError::OutOfRange);
+  }
+  for (i,&lba) in indices.iter().enumerate(){
+   if indices[..i].contains(&lba)||check_range(self.capacity,lba,1).is_err(){
+    return Err(BlockError::OutOfRange);
+   }
+  }
+  let mut first=[0u8;SECTOR_BYTES];
+  let mut second=[0u8;SECTOR_BYTES];
+  let first_receipt=self.read_manifest_authenticated_mirrors(
+   lbas[0].0,lbas[0].1,revision,expected[0],&mut observe_revision,&mut first)?;
+  let second_receipt=self.read_manifest_authenticated_mirrors(
+   lbas[1].0,lbas[1].1,revision,expected[1],&mut observe_revision,&mut second)?;
+  if observe_revision()!=revision{
+   self.invalidated=true;return Err(BlockError::Io);
+  }
+  let [first_out,second_out]=outputs;
+  first_out.copy_from_slice(&first);
+  second_out.copy_from_slice(&second);
+  Ok([first_receipt,second_receipt])
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch16_w4_two_mirror_records_tests{
+ use super::*;
+ use core::cell::Cell;
+ struct Disk{read_count:u32,damage_late:bool}
+ impl BlockDevice for Disk{
+  fn sector_count(&self)->u64{8}
+  fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{
+   self.read_count+=1;
+   let mut byte=if lba==1||lba==4{7}else{8};
+   if self.damage_late&&self.read_count>=7{byte=9;}
+   out.fill(byte);Ok(())
+  }
+  fn write_sector(&mut self,_:u64,_:&[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{Err(BlockError::ReadOnly)}
+ }
+ fn expectations()->[[u8;32];2]{
+  [crate::m2_sha256::digest(&[7;SECTOR_BYTES]),
+   crate::m2_sha256::digest(&[8;SECTOR_BYTES])]
+ }
+ #[test]fn both_mirror_pairs_publish_only_after_all_eight_reads(){
+  let mut d=Disk{read_count:0,damage_late:false};
+  let mut view=StableReadOnlyWindow::new(&mut d).unwrap();
+  let mut one=[0;SECTOR_BYTES];let mut two=[0;SECTOR_BYTES];
+  let receipts=view.read_authenticated_mirror_pair(
+   [(1,4),(2,5)],55,expectations(),||55,[&mut one,&mut two]).unwrap();
+  assert_eq!(one,[7;SECTOR_BYTES]);assert_eq!(two,[8;SECTOR_BYTES]);
+  assert_eq!(receipts[0].digest,expectations()[0]);
+  assert_eq!(receipts[1].digest,expectations()[1]);
+  assert_eq!(view.device.read_count,8);
+ }
+ #[test]fn late_corruption_of_second_record_preserves_both_callers(){
+  let mut d=Disk{read_count:0,damage_late:true};
+  let mut view=StableReadOnlyWindow::new(&mut d).unwrap();
+  let mut one=[9;SECTOR_BYTES];let mut two=[9;SECTOR_BYTES];
+  assert_eq!(view.read_authenticated_mirror_pair(
+   [(1,4),(2,5)],55,expectations(),||55,[&mut one,&mut two]),
+   Err(BlockError::Io));
+  assert!(view.is_retired());
+  assert_eq!(one,[9;SECTOR_BYTES]);assert_eq!(two,[9;SECTOR_BYTES]);
+ }
+ #[test]fn duplicate_lbas_and_bad_geometry_reject_before_io(){
+  let mut d=Disk{read_count:0,damage_late:false};
+  let mut view=StableReadOnlyWindow::new(&mut d).unwrap();
+  let mut one=[9;SECTOR_BYTES];let mut two=[9;SECTOR_BYTES];
+  for pairs in [[(1,4),(4,5)],[(1,4),(2,9)],[(1,1),(2,5)]]{
+   assert_eq!(view.read_authenticated_mirror_pair(
+    pairs,55,expectations(),||55,[&mut one,&mut two]),
+    Err(BlockError::OutOfRange));
+  }
+  assert_eq!(view.device.read_count,0);
+ }
+ #[test]fn media_revision_change_after_reads_never_exposes_bytes(){
+  let mut d=Disk{read_count:0,damage_late:false};
+  let mut view=StableReadOnlyWindow::new(&mut d).unwrap();
+  let mut one=[9;SECTOR_BYTES];let mut two=[9;SECTOR_BYTES];
+  let calls=Cell::new(0u32);
+  let result=view.read_authenticated_mirror_pair(
+   [(1,4),(2,5)],55,expectations(),||{
+    calls.set(calls.get()+1);
+    if calls.get()>6{56}else{55}
+   },[&mut one,&mut two]);
+  assert_eq!(result,Err(BlockError::Io));assert!(view.is_retired());
+  assert_eq!(one,[9;SECTOR_BYTES]);assert_eq!(two,[9;SECTOR_BYTES]);
+ }
+}

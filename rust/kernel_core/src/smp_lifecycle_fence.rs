@@ -1425,3 +1425,90 @@ mod kernel_p0_batch15_w1_tlb_plan_tests{
   assert_eq!(plan[1].first_page,0x4000);
  }
 }
+
+
+
+/// P0-331..335: complete a disjoint ordered TLB plan as ONE AP receipt.
+/// Preflight every range and aggregate page bound before any callback.
+/// This callback is not the real x86 INVLPG implementation.
+pub fn acknowledge_disjoint_tlb_plan<I:LocalUserTlbInvalidator>(
+ fence:&LifecycleFence,ap:u32,last_seen:u64,receipt:Receipt,
+ plan:&[TlbShootdownRange],driver:&mut I
+)->Result<(),FenceError>{
+ if plan.is_empty()||plan.len()>64||receipt.generation==0{
+  return Err(FenceError::InvalidGeneration);
+ }
+ let mut previous_end=0u64;
+ let mut total=0u32;
+ for range in plan{
+  range.validate()?;
+  if range.epoch!=receipt.generation{return Err(FenceError::StaleReceipt);}
+  if range.first_page<previous_end{return Err(FenceError::InvalidGeneration);}
+  previous_end=range.first_page+(range.pages as u64)*4096;
+  total=total.checked_add(range.pages).ok_or(FenceError::InvalidGeneration)?;
+  if total>4096{return Err(FenceError::InvalidGeneration);}
+ }
+ fence.require_pending_exact(fence.bsp,receipt)?;
+ let observed=fence.acknowledge_after_local_invalidate(
+  ap,last_seen,|actual|{
+   if actual!=receipt{return Err(FenceError::StaleReceipt);}
+   for range in plan{
+    for offset in 0..range.pages{
+     driver.invalidate_page(range.first_page+(offset as u64)*4096)?;
+    }
+   }
+   Ok(())
+  })?;
+ if observed==Some(receipt){Ok(())}else{Err(FenceError::StaleReceipt)}
+}
+#[cfg(test)]
+mod kernel_p0_batch16_w1_disjoint_tlb_ack_tests{
+ use super::*;
+ struct Flush{pages:[u64;8],count:usize,fail_at:usize}
+ impl LocalUserTlbInvalidator for Flush{
+  fn invalidate_page(&mut self,page:u64)->Result<(),FenceError>{
+   if self.count==self.fail_at{return Err(FenceError::IncompleteLocalWork);}
+   self.pages[self.count]=page;self.count+=1;Ok(())
+  }
+ }
+ fn plan()->[TlbShootdownRange;2]{[
+  TlbShootdownRange{first_page:0x1000,pages:2,epoch:42},
+  TlbShootdownRange{first_page:0x9000,pages:1,epoch:42}
+ ]}
+ #[test]fn every_disjoint_page_flushes_before_one_ap_receipt(){
+  let f=LifecycleFence::new(0,3);let receipt=f.publish(0,42).unwrap();
+  let mut driver=Flush{pages:[0;8],count:0,fail_at:8};
+  assert_eq!(acknowledge_disjoint_tlb_plan(&f,3,0,receipt,&plan(),&mut driver),Ok(()));
+  assert_eq!(&driver.pages[..3],&[0x1000,0x2000,0x9000]);
+  assert_eq!(f.require_ack_for_reclaim(0,receipt),Ok(()));
+  assert_eq!(acknowledge_disjoint_tlb_plan(&f,3,0,receipt,&plan(),&mut driver),
+   Err(FenceError::StaleReceipt));
+  assert_eq!(driver.count,3);
+ }
+ #[test]fn failed_local_page_flush_cannot_ack_or_release_memory(){
+  let f=LifecycleFence::new(0,3);let receipt=f.publish(0,42).unwrap();
+  let mut driver=Flush{pages:[0;8],count:0,fail_at:1};
+  assert_eq!(acknowledge_disjoint_tlb_plan(&f,3,0,receipt,&plan(),&mut driver),
+   Err(FenceError::IncompleteLocalWork));
+  assert_eq!(f.require_ack_for_reclaim(0,receipt),Err(FenceError::NoProgress));
+  let mut retry=Flush{pages:[0;8],count:0,fail_at:8};
+  assert_eq!(acknowledge_disjoint_tlb_plan(&f,3,0,receipt,&plan(),&mut retry),Ok(()));
+  assert_eq!(retry.count,3);
+ }
+ #[test]fn bad_order_overlap_epoch_and_total_limit_have_no_callback(){
+  let f=LifecycleFence::new(0,3);let receipt=f.publish(0,42).unwrap();
+  let mut driver=Flush{pages:[0;8],count:0,fail_at:8};
+  let mut backward=plan();backward.swap(0,1);
+  assert!(acknowledge_disjoint_tlb_plan(&f,3,0,receipt,&backward,&mut driver).is_err());
+  let mut overlap=plan();overlap[1].first_page=0x2000;
+  assert!(acknowledge_disjoint_tlb_plan(&f,3,0,receipt,&overlap,&mut driver).is_err());
+  let mut stale=plan();stale[1].epoch=43;
+  assert_eq!(acknowledge_disjoint_tlb_plan(&f,3,0,receipt,&stale,&mut driver),
+   Err(FenceError::StaleReceipt));
+  let huge=[TlbShootdownRange{first_page:0x1000,pages:4096,epoch:42},
+   TlbShootdownRange{first_page:0x1001000,pages:1,epoch:42}];
+  assert!(acknowledge_disjoint_tlb_plan(&f,3,0,receipt,&huge,&mut driver).is_err());
+  assert_eq!(driver.count,0);
+  assert_eq!(f.require_ack_for_reclaim(0,receipt),Err(FenceError::NoProgress));
+ }
+}

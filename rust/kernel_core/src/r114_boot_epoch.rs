@@ -2534,3 +2534,144 @@ mod kernel_p0_batch15_w6_revision_audit_tests{
   }
  }
 }
+
+
+
+/// P0-356..360: require a trusted expected digest of unpublished PID1
+/// page-table mappings. The mapper must measure actual staged PTEs/stack
+/// from its private kernel state, NOT merely echo the expected manifest.
+/// This additional software interface is not a physical TPM quote.
+pub trait Pid1MeasuredMapper:Pid1RevisionedMapper{
+ fn measure_unpublished_mappings(&mut self)->Result<[u8;32],Error>;
+}
+impl BootLaunchGate{
+ pub fn launch_secure_uefi_measured_pid1<
+  D:BlockDevice,P:AuthenticatedSecureUefi,T:Pid1MeasuredMapper
+ >(
+  &mut self,disk:&mut D,platform:&P,manifest_digest:[u8;32],
+  image:&[u8],stack_top:u64,stack_pages:usize,
+  trusted_pte_digest:[u8;32],mapper:&mut T
+ )->Result<VerifiedPid1Admission,Error>{
+  if trusted_pte_digest==[0;32]{return Err(Error::Invalid);}
+  struct Measured<'a,T>{mapper:&'a mut T,expected:[u8;32]}
+  impl<T:Pid1MeasuredMapper> Pid1StagedMapper for Measured<'_,T>{
+   fn stage_load(&mut self,at:u64,bytes:&[u8],zero:u64,flags:u32)
+    ->Result<(),Error>{self.mapper.stage_load(at,bytes,zero,flags)}
+   fn stage_guarded_stack(&mut self,top:u64,pages:usize)
+    ->Result<(),Error>{self.mapper.stage_guarded_stack(top,pages)}
+   fn publish_entry(&mut self,entry:u64)->Result<(),Error>{
+    let first_revision=self.mapper.staged_mapping_revision()?;
+    if first_revision==0{return Err(Error::Stale);}
+    let first=self.mapper.measure_unpublished_mappings()?;
+    if first!=self.expected{return Err(Error::Invalid);}
+    self.mapper.audit_unpublished(entry)?;
+    if self.mapper.staged_mapping_revision()?!=first_revision||
+       self.mapper.measure_unpublished_mappings()?!=self.expected{
+     return Err(Error::Stale);
+    }
+    self.mapper.publish_entry(entry)
+   }
+   fn abort(&mut self){self.mapper.abort();}
+  }
+  self.launch_secure_uefi_staged_pid1(disk,platform,manifest_digest,image,
+   stack_top,stack_pages,&mut Measured{mapper,expected:trusted_pte_digest})
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch16_w6_measured_pid1_tests{
+ use super::*;
+ struct Platform;
+ impl TrustedBootMeasurement for Platform{
+  fn read_verified(&self)->Result<[u8;32],Error>{Ok([3;32])}
+ }
+ impl AuthenticatedPid1Platform for Platform{
+  fn read_sealed_floor(&self)->Result<SealedBootFloor,Error>{
+   Ok(SealedBootFloor{minimum_epoch:4,minimum_journal_generation:20,
+    expected_slot:0,minimum_slot_version:9,expected_measurement:[3;32]})
+  }
+  fn read_bootloader_selected_slot(&self)->Result<(usize,Slot),Error>{
+   Ok((0,tests::slot()))
+  }
+ }
+ impl AuthenticatedSecureUefi for Platform{
+  fn require_firmware_secure_boot_chain(&self)->Result<(),Error>{Ok(())}
+ }
+ struct Mapper{digest:[u8;32],revision:u64,drift:bool,staged:u32,
+   published:u32,aborts:u32}
+ impl Pid1StagedMapper for Mapper{
+  fn stage_load(&mut self,_:u64,_:&[u8],_:u64,_:u32)
+   ->Result<(),Error>{self.staged+=1;Ok(())}
+  fn stage_guarded_stack(&mut self,_:u64,_:usize)->Result<(),Error>{Ok(())}
+  fn publish_entry(&mut self,_:u64)->Result<(),Error>{
+   self.published+=1;Ok(())
+  }
+  fn abort(&mut self){self.aborts+=1;}
+ }
+ impl Pid1AuditedMapper for Mapper{
+  fn audit_unpublished(&mut self,entry:u64)->Result<(),Error>{
+   if entry!=0x400000||self.staged==0{return Err(Error::Invalid);}
+   if self.drift{self.digest[0]^=1;self.revision+=1;}
+   Ok(())
+  }
+ }
+ impl Pid1RevisionedMapper for Mapper{
+  fn staged_mapping_revision(&mut self)->Result<u64,Error>{Ok(self.revision)}
+ }
+ impl Pid1MeasuredMapper for Mapper{
+  fn measure_unpublished_mappings(&mut self)->Result<[u8;32],Error>{
+   Ok(self.digest)
+  }
+ }
+ fn image()->[u8;256]{
+  let mut image=[0u8;256];image[..4].copy_from_slice(b"\x7fELF");
+  image[4]=2;image[5]=1;image[6]=1;
+  image[16..18].copy_from_slice(&2u16.to_le_bytes());
+  image[18..20].copy_from_slice(&62u16.to_le_bytes());
+  image[20..24].copy_from_slice(&1u32.to_le_bytes());
+  image[24..32].copy_from_slice(&0x400000u64.to_le_bytes());
+  image[32..40].copy_from_slice(&64u64.to_le_bytes());
+  image[52..54].copy_from_slice(&64u16.to_le_bytes());
+  image[54..56].copy_from_slice(&56u16.to_le_bytes());
+  image[56..58].copy_from_slice(&1u16.to_le_bytes());
+  image[64..68].copy_from_slice(&1u32.to_le_bytes());
+  image[68..72].copy_from_slice(&5u32.to_le_bytes());
+  image[72..80].copy_from_slice(&128u64.to_le_bytes());
+  image[80..88].copy_from_slice(&0x400000u64.to_le_bytes());
+  image[96..104].copy_from_slice(&4u64.to_le_bytes());
+  image[104..112].copy_from_slice(&4096u64.to_le_bytes());
+  image[112..120].copy_from_slice(&1u64.to_le_bytes());
+  image[128..132].copy_from_slice(&[0x90,0x90,0x90,0xc3]);
+  image
+ }
+ fn mapper()->Mapper{Mapper{digest:[7;32],revision:1,drift:false,
+  staged:0,published:0,aborts:0}}
+ fn run(gate:&mut BootLaunchGate,mapper:&mut Mapper,expected:[u8;32])
+  ->Result<VerifiedPid1Admission,Error>{
+  let image=image();let digest=crate::m2_sha256::digest(&image);
+  let mut disk=tests::fixture();
+  gate.launch_secure_uefi_measured_pid1(
+   &mut disk,&Platform,digest,&image,0x800000,8,expected,mapper)
+ }
+ #[test]fn trusted_stable_mapping_digest_allows_exactly_one_publish(){
+  let mut gate=BootLaunchGate::new();let mut m=mapper();
+  assert!(run(&mut gate,&mut m,[7;32]).is_ok());
+  assert_eq!((m.staged,m.published,m.aborts),(1,1,0));
+  assert_eq!(run(&mut gate,&mut m,[7;32]),Err(Error::Stale));
+ }
+ #[test]fn mismatched_mapping_digest_aborts_and_permanently_denies_replay(){
+  let mut gate=BootLaunchGate::new();let mut m=mapper();
+  assert_eq!(run(&mut gate,&mut m,[8;32]),Err(Error::Invalid));
+  assert_eq!((m.published,m.aborts),(0,1));
+  assert_eq!(run(&mut gate,&mut m,[7;32]),Err(Error::Stale));
+ }
+ #[test]fn mapping_mutation_during_audit_aborts_before_publication(){
+  let mut gate=BootLaunchGate::new();let mut m=mapper();m.drift=true;
+  assert_eq!(run(&mut gate,&mut m,[7;32]),Err(Error::Stale));
+  assert_eq!((m.published,m.aborts),(0,1));
+ }
+ #[test]fn zero_expected_digest_is_rejected_before_any_staging(){
+  let mut gate=BootLaunchGate::new();let mut m=mapper();
+  assert_eq!(run(&mut gate,&mut m,[0;32]),Err(Error::Invalid));
+  assert_eq!((m.staged,m.published,m.aborts),(0,0,0));
+ }
+}
