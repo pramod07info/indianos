@@ -40,6 +40,11 @@ fn log(s: &'static [u8]) { unsafe { serial_write(s.as_ptr().cast()) }; }
 unsafe fn memory_map() -> Option<&'static MemoryMap> {
     unsafe { boot_limine_memmap().as_ref() }
 }
+/// Reject misaligned Limine pointers before constructing Rust references
+/// or issuing aligned volatile loads. Firmware must also guarantee validity.
+fn limine_pointer_aligned<T>(p:*const T)->bool {
+    !p.is_null() && (p as usize)%core::mem::align_of::<T>()==0
+}
 fn valid_region(r:&Region)->bool{
     r.length!=0 && r.base.checked_add(r.length).is_some()
 }
@@ -51,26 +56,66 @@ fn hhdm_offset_sane(offset:u64)->bool{
     offset&0xfff==0 &&
     offset.checked_add(4096).is_some()
 }
+fn spans_overlap(a:&Region,b:&Region)->bool {
+    // Numeric overflow has been rejected for both regions by callers.
+    a.base < b.base+b.length && b.base < a.base+a.length
+}
 fn validate_ranges(regions:&[Region]) -> bool {
     let mut usable=false;
-    for r in regions {
-        if !valid_region(r) { return false; }
-        usable |= r.kind==0;
+    for (i,r) in regions.iter().enumerate() {
+        if !valid_region(r) {return false;}
+        if r.kind==0 {
+            usable=true;
+            for (j,other) in regions.iter().enumerate() {
+                if i!=j && (!valid_region(other)||spans_overlap(r,other)){return false;}
+            }
+        }
     }
     usable
 }
 /// Preflight the complete Limine memory map before exporting its count.
 /// An invalid late entry must never let the PMM consume a partial map.
 fn validated_map_count(map:&MemoryMap)->Option<u64>{
-    if map.entries.is_null()||!(1..=4096).contains(&map.count){return None;}
+    if !limine_pointer_aligned(map.entries) ||
+       !(1..=4096).contains(&map.count){return None;}
     let mut usable=false;
     for i in 0..map.count as usize{
         let item=unsafe{ptr::read_volatile(map.entries.add(i))};
+        if !limine_pointer_aligned(item){return None;}
         let region=unsafe{item.as_ref()}?;
         if !valid_region(region){return None;}
-        usable |= region.kind==0;
+        // Inspect actual Limine memory-map pointers. Any usable byte
+        // overlapping another firmware/reserved region denies boot.
+        if region.kind==0 {
+            usable=true;
+            for j in 0..map.count as usize {
+                if i==j {continue;}
+                let ptr=unsafe{ptr::read_volatile(map.entries.add(j))};
+                if !limine_pointer_aligned(ptr){return None;}
+                let other=unsafe{ptr.as_ref()}?;
+                if !valid_region(other)||spans_overlap(region,other){return None;}
+            }
+        }
     }
     if usable{Some(map.count)}else{None}
+}
+/// Every usable physical span must fit within the chosen direct-map
+/// high-half range. This is an arithmetic preflight, not proof of PTE mapping.
+fn hhdm_covers_usable_map(map:&MemoryMap,offset:u64)->bool{
+    if !hhdm_offset_sane(offset) ||
+        validated_map_count(map).is_none(){return false;}
+    for i in 0..map.count as usize{
+        let region_pointer=unsafe{ptr::read_volatile(map.entries.add(i))};
+        if !limine_pointer_aligned(region_pointer){return false;}
+        let region=unsafe{&*region_pointer};
+        if region.kind!=0{continue;}
+        let Some(end)=region.base.checked_add(region.length)
+            .and_then(|last|last.checked_sub(1))
+            .and_then(|last|offset.checked_add(last))else{return false;};
+        // Four-level 48-bit canonical high-half addresses only.
+        if end<0xffff_8000_0000_0000{return false;}
+    }
+    true
 }
 /// # Safety
 /// Called while Limine response pointers are valid (before bootloader
@@ -85,6 +130,14 @@ pub unsafe extern "C" fn boot_validate() -> bool {
     };
     if validated_map_count(map).is_none(){
         log(b"IndianOS: invalid or unusable memory map\n\0");return false;
+    }
+    // The allocator and ELF loader depend on this direct mapping. Refuse
+    // boot *before* other initialization if the Limine handoff omitted it.
+    let Some(hhdm)=(unsafe {boot_limine_hhdm().as_ref()}) else {
+        log(b"IndianOS: missing HHDM handoff\n\0");return false;
+    };
+    if !hhdm_covers_usable_map(map,hhdm.offset){
+        log(b"IndianOS: invalid HHDM mapping\n\0");return false;
     }
     true
 }
@@ -102,6 +155,7 @@ pub unsafe extern "C" fn boot_memory_region_at(index:u64,out:*mut Region,_contex
     let Some(m)=(unsafe {memory_map()}) else {return false};
     if validated_map_count(m).is_none() || index>=m.count {return false}
     let item=unsafe {ptr::read_volatile(m.entries.add(index as usize))};
+    if !limine_pointer_aligned(item){return false;}
     let Some(region)=(unsafe {item.as_ref()}) else {return false};
     if !valid_region(region) {return false;}
     unsafe {ptr::write(out,*region);}
@@ -135,11 +189,26 @@ pub unsafe extern "C" fn boot_initramfs_file(
     if !unsafe {indianos_initramfs_lookup(file.address,file.size as usize,path,&mut found)} {
         return false
     }
+    // Only borrow file contents from the validated Limine module. A future
+    // archive decoder regression must not return supervisor memory outside
+    // that module through the ordinary initramfs API.
+    if !borrowed_ramfile_span_ok(file.address as usize,file.size as usize,
+        found.bytes,found.length as usize){return false;}
     unsafe {
         ptr::write(data,found.bytes);
         ptr::write(size,found.length as usize);
     }
     true
+}
+/// Numeric boundary check; the caller is still responsible for validated
+/// mapped Limine module lifetime. Allows a zero-length file at archive end.
+fn borrowed_ramfile_span_ok(module:usize,size:usize,
+    bytes:*const u8,length:usize)->bool {
+    if module==0 || size<16 || bytes.is_null(){return false;}
+    let Some(limit)=module.checked_add(size)else{return false;};
+    let start=bytes as usize;
+    start>=module && start<=limit &&
+       start.checked_add(length).is_some_and(|end|end<=limit)
 }
 fn mask(size:u8,shift:u8)->Option<u32>{
     if size==0 || size>8 || shift>=32 || (size as u32)+(shift as u32)>32 {return None}
@@ -380,4 +449,101 @@ mod m1_gate20_w1_next_boot_tests{
    assert!(!hhdm_offset_sane(0xffff_8000_0000_0001));
    assert!(!hhdm_offset_sane(0xffff_ffff_ffff_f000));
  }
+}
+
+
+// P0-475: exercise the production Limine memory-map preflight.
+#[cfg(test)]
+mod kernel_p0_batch19_w6_tests {
+    use super::*;
+    fn observed(a:Region,b:Region)->Option<u64> {
+        let regions=[a,b];
+        let pointers:[*const Region;2]=[&regions[0],&regions[1]];
+        let map=MemoryMap{revision:0,count:2,entries:pointers.as_ptr()};
+        validated_map_count(&map)
+    }
+    #[test]
+    fn kernel_p0_batch19_w6_rejects_reserved_and_usable_overlap() {
+        let ram=Region{base:0x2000,length:0x3000,kind:0};
+        assert_eq!(observed(ram,Region{base:0x4001,length:1,kind:1}),None);
+        assert_eq!(observed(ram,Region{base:0x2000,length:0x1000,kind:0}),None);
+        assert_eq!(observed(ram,Region{base:0x5000,length:0x1000,kind:1}),Some(2));
+    }
+    #[test]
+    fn kernel_p0_batch19_w6_rejects_corrupted_reserved_tail() {
+        let ram=Region{base:0x2000,length:0x2000,kind:0};
+        assert_eq!(observed(ram,Region{base:u64::MAX,length:3,kind:1}),None);
+        assert_eq!(observed(ram,Region{base:0x5000,length:0,kind:1}),None);
+        assert_eq!(observed(Region{kind:1,..ram},
+            Region{base:0x5000,length:0x1000,kind:1}),None);
+        assert!(!validate_ranges(&[ram,Region{base:0x3fff,length:1,kind:2}]));
+    }
+}
+
+
+// P0-515–520: numeric HHDM sanity is mandatory for production boot preflight.
+#[cfg(test)]
+mod kernel_p0_batch20_w6_tests{
+    use super::*;
+    #[test]
+    fn kernel_p0_batch20_w6_hhdm_rejects_unmapped_aliases(){
+        assert!(hhdm_offset_sane(0xffff_8000_0000_0000));
+        assert!(!hhdm_offset_sane(0));
+        assert!(!hhdm_offset_sane(0xffff_7fff_ffff_f000));
+        assert!(!hhdm_offset_sane(0xffff_8000_0000_0001));
+        assert!(!hhdm_offset_sane(0xffff_ffff_ffff_f000));
+    }
+}
+
+
+// P0-555: validated initramfs lookup cannot hand an external supervisor
+// pointer to the ring3 ELF loader or native startup path.
+#[cfg(test)]
+mod kernel_p0_batch21_w6_tests {
+    use super::*;
+    #[test]fn kernel_p0_batch21_w6_archive_file_must_stay_in_boot_module(){
+        let base=0x2000usize;
+        assert!(borrowed_ramfile_span_ok(base,256,(base+16) as *const u8,240));
+        assert!(borrowed_ramfile_span_ok(base,256,(base+256) as *const u8,0));
+        assert!(!borrowed_ramfile_span_ok(base,256,(base-1) as *const u8,1));
+        assert!(!borrowed_ramfile_span_ok(base,256,(base+250) as *const u8,7));
+        assert!(!borrowed_ramfile_span_ok(0,256,base as *const u8,8));
+        assert!(!borrowed_ramfile_span_ok(base,256,core::ptr::null(),8));
+        assert!(!borrowed_ramfile_span_ok(usize::MAX-4,32,
+            (usize::MAX-4) as *const u8,1));
+    }
+}
+
+
+// Batch22 W6 P0-578..580: validate Limine pointer alignment and high-half
+// arithmetic on the actual boot memory-map consumer.
+#[cfg(test)]
+mod kernel_p0_batch22_w6_tests{
+    use super::*;
+    #[test]fn kernel_p0_batch22_w6_578_reject_misaligned_entry_table(){
+        let region=Region{base:0x1000,length:0x2000,kind:0};
+        let entry:[*const Region;1]=[&region];
+        let valid=MemoryMap{revision:0,count:1,entries:entry.as_ptr()};
+        assert_eq!(validated_map_count(&valid),Some(1));
+        let invalid=MemoryMap{entries:((entry.as_ptr() as usize)+1) as *const *const Region,
+            ..valid};
+        assert_eq!(validated_map_count(&invalid),None);
+    }
+    #[test]fn kernel_p0_batch22_w6_579_reject_misaligned_region_pointer(){
+        let invalid_pointer=0x1001usize as *const Region;
+        let entries=[invalid_pointer];
+        let map=MemoryMap{revision:0,count:1,entries:entries.as_ptr()};
+        assert_eq!(validated_map_count(&map),None);
+    }
+    #[test]fn kernel_p0_batch22_w6_580_direct_map_must_cover_usable_span(){
+        let region=Region{base:0x1000,length:0x2000,kind:0};
+        let entries:[*const Region;1]=[&region];
+        let map=MemoryMap{revision:0,count:1,entries:entries.as_ptr()};
+        assert!(hhdm_covers_usable_map(&map,0xffff_8000_0000_0000));
+        assert!(!hhdm_covers_usable_map(&map,0));
+        let huge=Region{base:0x1_0000_0000,length:0x1000,kind:0};
+        let huge_entries:[*const Region;1]=[&huge];
+        let huge_map=MemoryMap{revision:0,count:1,entries:huge_entries.as_ptr()};
+        assert!(!hhdm_covers_usable_map(&huge_map,0xffff_ffff_0000_0000));
+    }
 }

@@ -1,0 +1,400 @@
+name: Kernel P0 - six independent validation workstations
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'rust/kernel_core/src/**'
+      - '.github/workflows/kernel-p0-six-workstations.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  six-kernel-workstations:
+    name: ${{ matrix.workstation }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - workstation: W1-SMP-retirement
+            filter: kernel_p0_w1
+            next_filter: kernel_p0_next_w1
+            batch3_filter: kernel_p0_batch3_w1
+            batch4_filter: kernel_p0_batch4_w1
+            batch5_filter: kernel_p0_batch5_w1
+            batch6_filter: kernel_p0_batch6_w1
+            batch7_filter: kernel_p0_batch7_w1
+            batch8_filter: kernel_p0_batch8_w1
+            batch9_filter: kernel_p0_batch9_w1
+            batch10_filter: kernel_p0_batch10_w1
+            batch11_filter: kernel_p0_batch11_w1
+            batch12_filter: kernel_p0_batch12_w1
+            batch13_filter: kernel_p0_batch13_w1
+            batch14_filter: kernel_p0_batch14_w1
+            batch15_filter: kernel_p0_batch15_w1
+            batch16_filter: kernel_p0_batch16_w1
+            batch17_filter: kernel_p0_batch17_w1
+            features: normal-desktop
+          - workstation: W2-scheduler-fairness
+            filter: kernel_p0_w2
+            next_filter: kernel_p0_next_w2
+            batch3_filter: kernel_p0_batch3_w2
+            batch4_filter: kernel_p0_batch4_w2
+            batch5_filter: kernel_p0_batch5_w2
+            batch6_filter: kernel_p0_batch6_w2
+            batch7_filter: kernel_p0_batch7_w2
+            batch8_filter: kernel_p0_batch8_w2
+            batch9_filter: kernel_p0_batch9_w2
+            batch10_filter: kernel_p0_batch10_w2
+            batch11_filter: kernel_p0_batch11_w2
+            batch12_filter: kernel_p0_batch12_w2
+            batch13_filter: kernel_p0_batch13_w2
+            batch14_filter: kernel_p0_batch14_w2
+            batch15_filter: kernel_p0_batch15_w2
+            batch16_filter: kernel_p0_batch16_w2
+            batch17_filter: kernel_p0_batch17_w2
+            features: normal-desktop
+          - workstation: W3-authenticated-IPC
+            filter: kernel_p0_w3
+            next_filter: kernel_p0_next_w3
+            batch3_filter: kernel_p0_batch3_w3
+            batch4_filter: kernel_p0_batch4_w3
+            batch5_filter: kernel_p0_batch5_w3
+            batch6_filter: kernel_p0_batch6_w3
+            batch7_filter: kernel_p0_batch7_w3
+            batch8_filter: kernel_p0_batch8_w3
+            batch9_filter: kernel_p0_batch9_w3
+            batch10_filter: kernel_p0_batch10_w3
+            batch11_filter: kernel_p0_batch11_w3
+            batch12_filter: kernel_p0_batch12_w3
+            batch13_filter: kernel_p0_batch13_w3
+            batch14_filter: kernel_p0_batch14_w3
+            batch15_filter: kernel_p0_batch15_w3
+            batch16_filter: kernel_p0_batch16_w3
+            batch17_filter: kernel_p0_batch17_w3
+            features: normal-desktop
+          - workstation: W4-durable-VFS
+            filter: kernel_p0_w4
+            next_filter: kernel_p0_next_w4
+            batch3_filter: kernel_p0_batch3_w4
+            batch4_filter: kernel_p0_batch4_w4
+            batch5_filter: kernel_p0_batch5_w4
+            batch6_filter: kernel_p0_batch6_w4
+            batch7_filter: kernel_p0_batch7_w4
+            batch8_filter: kernel_p0_batch8_w4
+            batch9_filter: kernel_p0_batch9_w4
+            batch10_filter: kernel_p0_batch10_w4
+            batch11_filter: kernel_p0_batch11_w4
+            batch12_filter: kernel_p0_batch12_w4
+            batch13_filter: kernel_p0_batch13_w4
+            batch14_filter: kernel_p0_batch14_w4
+            batch15_filter: kernel_p0_batch15_w4
+            batch16_filter: kernel_p0_batch16_w4
+            batch17_filter: kernel_p0_batch17_w4
+            features: test-r031-vfs
+          - workstation: W5-NIC-quiescence
+            filter: kernel_p0_w5
+            next_filter: kernel_p0_next_w5
+            batch3_filter: kernel_p0_batch3_w5
+            batch4_filter: kernel_p0_batch4_w5
+            batch5_filter: kernel_p0_batch5_w5
+            batch6_filter: kernel_p0_batch6_w5
+            batch7_filter: kernel_p0_batch7_w5
+            batch8_filter: kernel_p0_batch8_w5
+            batch9_filter: kernel_p0_batch9_w5
+            batch10_filter: kernel_p0_batch10_w5
+            batch11_filter: kernel_p0_batch11_w5
+            batch12_filter: kernel_p0_batch12_w5
+            batch13_filter: kernel_p0_batch13_w5
+            batch14_filter: kernel_p0_batch14_w5
+            batch15_filter: kernel_p0_batch15_w5
+            batch16_filter: kernel_p0_batch16_w5
+            batch17_filter: kernel_p0_batch17_w5
+            features: normal-desktop
+          - workstation: W6-boot-handoff
+            filter: kernel_p0_w6
+            next_filter: kernel_p0_next_w6
+            batch3_filter: kernel_p0_batch3_w6
+            batch4_filter: kernel_p0_batch4_w6
+            batch5_filter: kernel_p0_batch5_w6
+            batch6_filter: kernel_p0_batch6_w6
+            batch7_filter: kernel_p0_batch7_w6
+            batch8_filter: kernel_p0_batch8_w6
+            batch9_filter: kernel_p0_batch9_w6
+            batch10_filter: kernel_p0_batch10_w6
+            batch11_filter: kernel_p0_batch11_w6
+            batch12_filter: kernel_p0_batch12_w6
+            batch13_filter: kernel_p0_batch13_w6
+            batch14_filter: kernel_p0_batch14_w6
+            batch15_filter: kernel_p0_batch15_w6
+            batch16_filter: kernel_p0_batch16_w6
+            batch17_filter: kernel_p0_batch17_w6
+            features: normal-desktop
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify exact PR head SHA
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: python3 tools/verify_ci_sha.py --expected "$EXPECTED_SHA" --observed "$(git rev-parse HEAD)"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
+      - name: Compile and run actual workstation regression tests
+        env:
+          FILTER: ${{ matrix.filter }}
+          NEXT_FILTER: ${{ matrix.next_filter }}
+          BATCH3_FILTER: ${{ matrix.batch3_filter }}
+          BATCH4_FILTER: ${{ matrix.batch4_filter }}
+          BATCH5_FILTER: ${{ matrix.batch5_filter }}
+          BATCH6_FILTER: ${{ matrix.batch6_filter }}
+          BATCH7_FILTER: ${{ matrix.batch7_filter }}
+          BATCH8_FILTER: ${{ matrix.batch8_filter }}
+          BATCH9_FILTER: ${{ matrix.batch9_filter }}
+          BATCH10_FILTER: ${{ matrix.batch10_filter }}
+          BATCH11_FILTER: ${{ matrix.batch11_filter }}
+          BATCH12_FILTER: ${{ matrix.batch12_filter }}
+          BATCH13_FILTER: ${{ matrix.batch13_filter }}
+          BATCH14_FILTER: ${{ matrix.batch14_filter }}
+          BATCH15_FILTER: ${{ matrix.batch15_filter }}
+          BATCH16_FILTER: ${{ matrix.batch16_filter }}
+          BATCH17_FILTER: ${{ matrix.batch17_filter }}
+          FEATURES: ${{ matrix.features }}
+        run: |
+          set -euo pipefail
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$FILTER" -- --list | grep -F "$FILTER"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$FILTER"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$NEXT_FILTER" -- --list | grep -F "$NEXT_FILTER"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$NEXT_FILTER"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$BATCH3_FILTER" -- --list | grep -F "$BATCH3_FILTER"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$BATCH3_FILTER"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$BATCH4_FILTER" -- --list | grep -F "$BATCH4_FILTER"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$BATCH4_FILTER"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$BATCH5_FILTER" -- --list | grep -F "$BATCH5_FILTER"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$BATCH5_FILTER"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$BATCH6_FILTER" -- --list | grep -F "$BATCH6_FILTER"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$BATCH6_FILTER"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$BATCH7_FILTER" -- --list | grep -F "$BATCH7_FILTER"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$BATCH7_FILTER"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$BATCH8_FILTER" -- --list | grep -F "$BATCH8_FILTER"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$BATCH8_FILTER"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$BATCH9_FILTER" -- --list | grep -F "$BATCH9_FILTER"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$BATCH9_FILTER"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$BATCH10_FILTER" -- --list | grep -F "$BATCH10_FILTER"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$BATCH10_FILTER"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$BATCH11_FILTER" -- --list | grep -F "$BATCH11_FILTER"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$BATCH11_FILTER"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$BATCH12_FILTER" -- --list | grep -F "$BATCH12_FILTER"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$BATCH12_FILTER"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$BATCH13_FILTER" -- --list | grep -F "$BATCH13_FILTER"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$BATCH13_FILTER"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$BATCH14_FILTER" -- --list | grep -F "$BATCH14_FILTER"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$BATCH14_FILTER"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$BATCH15_FILTER" -- --list | grep -F "$BATCH15_FILTER"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$BATCH15_FILTER"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$BATCH16_FILTER" -- --list | grep -F "$BATCH16_FILTER"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$BATCH16_FILTER"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$BATCH17_FILTER" -- --list | grep -F "$BATCH17_FILTER"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$BATCH17_FILTER"
+      - name: Compile freestanding no_std kernel profile
+        env:
+          FEATURES: ${{ matrix.features }}
+        run: >-
+          cargo check --locked --offline --manifest-path rust/kernel_core/Cargo.toml
+          --no-default-features --target x86_64-unknown-none --features "$FEATURES"
+
+  p0-batch19-implemented:
+    name: Batch19 implemented ${{ matrix.workstation }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - workstation: W1-PMM-one-shot
+            filter: kernel_p0_batch19_w1
+            features: normal-desktop
+          - workstation: W5-NIC-TX-completion
+            filter: kernel_p0_batch19_w5
+            features: test-r028-network
+          - workstation: W6-boot-memory-map
+            filter: kernel_p0_batch19_w6
+            features: normal-desktop
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify exact PR head
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: python3 tools/verify_ci_sha.py --expected "$EXPECTED_SHA" --observed "$(git rev-parse HEAD)"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
+      - name: Compile and run implemented source regressions
+        env:
+          FILTER: ${{ matrix.filter }}
+          FEATURES: ${{ matrix.features }}
+        run: |
+          set -euo pipefail
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$FILTER" -- --list | grep -F "$FILTER"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$FILTER"
+          cargo check --locked --offline --manifest-path rust/kernel_core/Cargo.toml --no-default-features --target x86_64-unknown-none --features "$FEATURES"
+
+  p0-batch20-implemented:
+    name: Batch20 implemented ${{ matrix.workstation }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - workstation: W1-PMM-accounting
+            filter: kernel_p0_batch20_w1
+            features: normal-desktop
+          - workstation: W2-timer-session
+            filter: kernel_p0_batch20_w2
+            features: normal-desktop
+          - workstation: W3-iret-privilege
+            filter: kernel_p0_batch20_w3
+            features: normal-desktop
+          - workstation: W4-media-geometry
+            filter: kernel_p0_batch20_w4
+            features: test-r031-vfs
+          - workstation: W5-NIC-reset
+            filter: kernel_p0_batch20_w5
+            features: test-r028-network
+          - workstation: W6-HHDM-handoff
+            filter: kernel_p0_batch20_w6
+            features: normal-desktop
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Confirm exact head SHA
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: python3 tools/verify_ci_sha.py --expected "$EXPECTED_SHA" --observed "$(git rev-parse HEAD)"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
+      - name: Verify implemented production-path regressions
+        env:
+          FILTER: ${{ matrix.filter }}
+          FEATURES: ${{ matrix.features }}
+        run: |
+          set -euo pipefail
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$FILTER" -- --list | grep -F "$FILTER"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$FILTER"
+          cargo check --locked --offline --manifest-path rust/kernel_core/Cargo.toml --no-default-features --target x86_64-unknown-none --features "$FEATURES"
+
+  p0-batch21-implemented:
+    name: Batch21 implemented ${{ matrix.workstation }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - workstation: W1-PMM-checked-accounting
+            filter: kernel_p0_batch21_w1
+            features: normal-desktop
+          - workstation: W2-IRQ-session-receipt
+            filter: kernel_p0_batch21_w2
+            features: normal-desktop
+          - workstation: W3-user-memory-WX
+            filter: kernel_p0_batch21_w3
+            features: normal-desktop
+          - workstation: W4-media-generation
+            filter: kernel_p0_batch21_w4
+            features: test-r031-vfs
+          - workstation: W5-virtio-RX-offload
+            filter: kernel_p0_batch21_w5
+            features: test-r028-network
+          - workstation: W6-initramfs-bounds
+            filter: kernel_p0_batch21_w6
+            features: normal-desktop
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify exact PR head SHA
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: python3 tools/verify_ci_sha.py --expected "$EXPECTED_SHA" --observed "$(git rev-parse HEAD)"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
+      - name: Run implemented production regressions
+        env:
+          FILTER: ${{ matrix.filter }}
+          FEATURES: ${{ matrix.features }}
+        run: |
+          set -euo pipefail
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$FILTER" -- --list | grep -F "$FILTER"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$FILTER"
+          cargo check --locked --offline --manifest-path rust/kernel_core/Cargo.toml --no-default-features --target x86_64-unknown-none --features "$FEATURES"
+
+  p0-batch22-implemented:
+    name: Batch22 implemented ${{ matrix.workstation }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - workstation: W1-PMM-rollback
+            filter: kernel_p0_batch22_w1
+            expected: 3
+            features: normal-desktop
+          - workstation: W2-IRQ-epoch
+            filter: kernel_p0_batch22_w2
+            expected: 3
+            features: normal-desktop
+          - workstation: W3-IRET-flags
+            filter: kernel_p0_batch22_w3
+            expected: 4
+            features: normal-desktop
+          - workstation: W4-media-snapshot
+            filter: kernel_p0_batch22_w4
+            expected: 4
+            features: test-r031-vfs
+          - workstation: W5-Ethernet-ingress
+            filter: kernel_p0_batch22_w5
+            expected: 3
+            features: test-r028-network
+          - workstation: W6-Limine-HHDM
+            filter: kernel_p0_batch22_w6
+            expected: 3
+            features: normal-desktop
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify exact PR head
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: python3 tools/verify_ci_sha.py --expected "$EXPECTED_SHA" --observed "$(git rev-parse HEAD)"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
+      - name: Assert all 20 new cases run and compile freestanding kernel
+        env:
+          FILTER: ${{ matrix.filter }}
+          FEATURES: ${{ matrix.features }}
+          EXPECTED_COUNT: ${{ matrix.expected }}
+        run: |
+          set -euo pipefail
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$FILTER" -- --list > /tmp/batch22-tests.txt
+          count=$(grep -c "$FILTER" /tmp/batch22-tests.txt || true)
+          echo "Found $count tests, expected $EXPECTED_COUNT for $FILTER"
+          test "$count" -eq "$EXPECTED_COUNT"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$FILTER"
+          cargo check --locked --offline --manifest-path rust/kernel_core/Cargo.toml --no-default-features --target x86_64-unknown-none --features "$FEATURES"

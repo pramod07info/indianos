@@ -54,6 +54,11 @@ impl State {
         let mask = 1u8 << (bit % 8);
         if value { *slot |= mask; } else { *slot &= !mask; }
     }
+    /// Corrupt allocator accounting must never report fabricated free frames.
+    fn checked_free(&self)->u64 {
+        if !self.initialized {return 0;}
+        self.total.checked_sub(self.used).unwrap_or(0)
+    }
     fn physical_at(&self, bit: u64) -> Option<u64> {
         for span in &self.spans[..self.count] {
             if bit >= span.bit_offset && bit - span.bit_offset < span.count {
@@ -97,7 +102,15 @@ pub unsafe extern "C" fn pmm_initialize(
     region_count: u64, reader: RegionReader, context: *mut c_void,
 ) -> bool {
     let s = unsafe { state() };
-    unsafe { initialize(s, region_count, reader, context) }
+    unsafe { initialize_once(s, region_count, reader, context) }
+}
+
+/// Never reset a live PMM while callers may own allocated frames.
+/// # Safety: reader/context satisfy pmm_initialize's kernel-only contract.
+unsafe fn initialize_once(s:&mut State,region_count:u64,reader:RegionReader,
+    context:*mut c_void)->bool {
+    if s.initialized {return false;}
+    unsafe {initialize(s,region_count,reader,context)}
 }
 
 // Separate state permits adversarial map tests without racing the ABI global.
@@ -161,7 +174,7 @@ unsafe fn initialize(s: &mut State, region_count: u64, reader: RegionReader,
 pub unsafe extern "C" fn pmm_allocate_frame(physical: *mut u64) -> bool {
     if physical.is_null() { return false; }
     let s = unsafe { state() };
-    if !s.initialized || s.used == s.total { return false; }
+    if !s.initialized || s.used >= s.total { return false; }
     for scanned in 0..s.total {
         let mut bit = s.cursor + scanned;
         if bit >= s.total { bit -= s.total; }
@@ -186,7 +199,7 @@ pub unsafe extern "C" fn pmm_allocate_contiguous_frames(count:u32,out:*mut u64)-
     if out.is_null() || count==0 || count>16{return false;}
     let s=unsafe{state()};
     let want=count as u64;
-    if !s.initialized || want>s.total-s.used{return false;}
+    if !s.initialized || s.used>s.total || want>s.total-s.used{return false;}
     for span_index in 0..s.count{
         let span=s.spans[span_index];
         if span.count<want{continue;}
@@ -210,14 +223,14 @@ pub unsafe extern "C" fn pmm_allocate_contiguous_frames(count:u32,out:*mut u64)-
 #[no_mangle]
 pub unsafe extern "C" fn pmm_release_frame(physical: u64) -> bool {
     let s = unsafe { state() };
-    if !s.initialized || physical & (PAGE - 1) != 0 { return false; }
+    if !s.initialized || s.used>s.total || physical & (PAGE - 1) != 0 { return false; }
     for i in 0..s.count {
         let span = s.spans[i];
         if physical < span.base { continue; }
         let diff = physical - span.base;
         if diff / PAGE >= span.count { continue; }
         let bit = span.bit_offset + diff / PAGE;
-        if !s.allocated(bit) { return false; }
+        if !s.allocated(bit) || s.used == 0 { return false; }
         s.set_bit(bit, false);
         s.used -= 1;
         s.cursor = bit;
@@ -233,22 +246,50 @@ pub extern "C" fn pmm_total_frames() -> u64 {
 #[no_mangle]
 pub extern "C" fn pmm_free_frames() -> u64 {
     let s = unsafe { state() };
-    if s.initialized { s.total - s.used } else { 0 }
+    s.checked_free()
+}
+/// Allocate two distinct frames, recycle one and always attempt cleanup
+/// of live owners after an intermediate failure. The caller's allocation
+/// backend owns the generation and must not return a borrowed frame.
+fn pmm_self_test_roundtrip<T>(
+    context:&mut T,
+    mut allocate:impl FnMut(&mut T)->Option<u64>,
+    mut release:impl FnMut(&mut T,u64)->bool,
+)->bool{
+    let Some(first)=allocate(context)else{return false;};
+    if first==0 {
+        let _=release(context,first);
+        return false;
+    }
+    let Some(second)=allocate(context)else{
+        let _=release(context,first);
+        return false;
+    };
+    if second==0 || second==first{
+        if second!=first && second!=0 {let _=release(context,second);}
+        let _=release(context,first);
+        return false;
+    }
+    if !release(context,second){
+        let _=release(context,first);
+        return false;
+    }
+    let recycled=allocate(context);
+    let correct=recycled==Some(second);
+    let recycled_released=if let Some(frame)=recycled{
+        if frame!=first && frame!=0 {release(context,frame)}else{false}
+    }else{false};
+    let first_released=release(context,first);
+    correct && recycled_released && first_released
 }
 #[no_mangle]
 pub extern "C" fn pmm_self_test() -> bool {
     if pmm_free_frames() < 2 { return false; }
-    let before = pmm_free_frames();
-    let (mut first, mut second, mut recycled) = (0, 0, 0);
-    let worked = unsafe {
-        pmm_allocate_frame(&mut first) &&
-        pmm_allocate_frame(&mut second) &&
-        first != second && first != 0 && second != 0 &&
-        pmm_release_frame(second) &&
-        pmm_allocate_frame(&mut recycled) && recycled == second &&
-        pmm_release_frame(first) && pmm_release_frame(recycled)
-    };
-    worked && pmm_free_frames() == before
+    let before=pmm_free_frames();
+    let success=pmm_self_test_roundtrip(&mut (),
+        |_|{let mut frame=0; if unsafe{pmm_allocate_frame(&mut frame)}{Some(frame)}else{None}},
+        |_,frame|unsafe{pmm_release_frame(frame)});
+    success && pmm_free_frames()==before
 }
 #[cfg(test)]
 mod tests {
@@ -397,6 +438,8 @@ impl State {
     }
     /// Reserve a specific frame run only when ALL frames are free.
     fn claim_run(&mut self,physical:u64,count:u32)->bool{
+        if !self.initialized||self.used>self.total||
+            count as u64>self.total-self.used{return false;}
         let Some(first)=self.validate_run(physical,count,false)else{return false;};
         for i in 0..count as u64{self.set_bit(first+i,true);}
         self.used+=count as u64;
@@ -405,6 +448,8 @@ impl State {
     }
     /// Release a complete frame run atomically or none of its frames.
     fn release_run(&mut self,physical:u64,count:u32)->bool{
+        if !self.initialized||self.used>self.total||
+            self.used<count as u64{return false;}
         let Some(first)=self.validate_run(physical,count,true)else{return false;};
         for i in 0..count as u64{self.set_bit(first+i,false);}
         self.used-=count as u64;self.cursor=first;
@@ -1577,5 +1622,158 @@ mod r084_batch_vi_pmm_tests{
         assert!(s.verify_allocator_layout());
         assert!(!s.claim_run(9*PAGE,2));
         assert_eq!(s.used,4);
+    }
+}
+
+
+// P0 batch19 W1: live PMM must be one-shot; failed initial boot can retry.
+#[cfg(test)]
+mod kernel_p0_batch19_w1_tests {
+    use super::*;
+    unsafe extern "C" fn read(i:u64,out:*mut Region,ctx:*mut c_void)->bool {
+        if i!=0 || out.is_null() || ctx.is_null() {return false;}
+        unsafe {out.write(*(ctx.cast::<Region>()));}
+        true
+    }
+    #[test]
+    fn kernel_p0_batch19_w1_reinitialize_keeps_owned_frames() {
+        let mut s=State::empty();
+        let mut region=Region{base:PAGE,length:PAGE*4,kind:0};
+        let context=(&mut region as *mut Region).cast();
+        assert!(unsafe {initialize_once(&mut s,1,Some(read),context)});
+        assert!(s.claim_run(PAGE,2));
+        let before=(s.total,s.used,s.cursor);
+        assert!(!unsafe {initialize_once(&mut s,1,Some(read),context)});
+        assert_eq!((s.total,s.used,s.cursor),before);
+        assert_eq!(s.is_frame_busy(PAGE),Some(true));
+        assert_eq!(s.is_frame_busy(2*PAGE),Some(true));
+        assert!(s.verify_frame_accounting());
+    }
+    #[test]
+    fn kernel_p0_batch19_w1_invalid_boot_map_allows_safe_retry() {
+        let mut s=State::empty();
+        let mut region=Region{base:PAGE,length:0,kind:0};
+        let context=(&mut region as *mut Region).cast();
+        assert!(!unsafe {initialize_once(&mut s,1,Some(read),context)});
+        assert!(!s.initialized);
+        region.length=PAGE;
+        assert!(unsafe {initialize_once(&mut s,1,Some(read),context)});
+        assert_eq!(s.total,1);
+    }
+}
+
+
+// P0-481–487: release/claim corruption must not mutate live bitmap ownership.
+#[cfg(test)]
+mod kernel_p0_batch20_w1_tests{
+    use super::*;
+    unsafe extern "C" fn reader(i:u64,out:*mut Region,ctx:*mut c_void)->bool{
+        if i!=0||out.is_null()||ctx.is_null(){return false;}
+        unsafe{out.write(*(ctx.cast::<Region>()));}
+        true
+    }
+    fn fresh()->State{
+        let mut state=State::empty();
+        let mut region=Region{base:PAGE,length:4*PAGE,kind:0};
+        assert!(unsafe{initialize_once(&mut state,1,Some(reader),
+            (&mut region as *mut Region).cast())});
+        state
+    }
+    #[test]
+    fn kernel_p0_batch20_w1_reject_corrupt_underflow_and_overflow(){
+        let mut s=fresh();
+        assert!(s.claim_run(PAGE,2));
+        assert_eq!(s.used,2);
+        s.used=1;
+        let bitmap=s.bitmap[..2].to_vec();
+        assert!(!s.release_run(PAGE,2));
+        assert_eq!(&s.bitmap[..2],bitmap.as_slice());
+        s.used=5;
+        assert!(!s.claim_run(PAGE*3,1));
+        assert!(!s.release_run(PAGE,1));
+        assert_eq!(&s.bitmap[..2],bitmap.as_slice());
+        assert_eq!(s.used,5);
+    }
+    #[test]
+    fn kernel_p0_batch20_w1_preserves_normal_contiguous_lifecycle(){
+        let mut s=fresh();
+        assert!(s.claim_run(PAGE,4));
+        assert_eq!(s.used,4);
+        assert!(!s.claim_run(PAGE,1));
+        assert!(s.release_run(PAGE,4));
+        assert!(!s.release_run(PAGE,4));
+        assert_eq!(s.used,0);
+        assert!(s.verify_frame_accounting());
+    }
+}
+
+
+// P0-521: actual PMM C API free-count and frame retirement fail closed
+// on impossible allocator counters. This remains BSP-only, not SMP safe.
+#[cfg(test)]
+mod kernel_p0_batch21_w1_tests {
+    use super::*;
+    unsafe extern "C" fn read(i:u64,out:*mut Region,ctx:*mut c_void)->bool {
+        if i!=0||out.is_null()||ctx.is_null(){return false;}
+        unsafe{out.write(*(ctx.cast::<Region>()));}true
+    }
+    fn fresh()->State{
+        let mut s=State::empty();
+        let mut r=Region{base:PAGE,length:PAGE*3,kind:0};
+        assert!(unsafe{initialize_once(&mut s,1,Some(read),(&mut r as *mut Region).cast())});
+        s
+    }
+    #[test]fn kernel_p0_batch21_w1_checked_free_never_underflows(){
+        let mut s=fresh();
+        assert_eq!(s.checked_free(),3);
+        assert!(s.claim_run(PAGE,2));
+        assert_eq!(s.checked_free(),1);
+        s.used=4;
+        assert_eq!(s.checked_free(),0);
+        assert!(!s.release_run(PAGE,1));
+        assert!(!s.claim_run(PAGE*3,1));
+        assert_eq!(s.is_frame_busy(PAGE),Some(true));
+    }
+}
+
+
+// Batch22 W1 P0-561..563: exercise the actual PMM self-test algorithm
+// with failure injection, alias rejection and balanced frame reclamation.
+#[cfg(test)]
+mod kernel_p0_batch22_w1_tests{
+    use super::*;
+    #[derive(Default)]
+    struct Frames{used:[bool;3],fail_after:Option<usize>,calls:usize,alias:bool}
+    fn alloc(s:&mut Frames)->Option<u64>{
+        s.calls+=1;
+        if s.fail_after.is_some_and(|limit|s.calls>limit){return None;}
+        if s.alias&&s.calls==2{return Some(PAGE);}
+        for i in 0..3{
+            if !s.used[i]{s.used[i]=true;return Some((i as u64+1)*PAGE);}
+        }
+        None
+    }
+    fn free(s:&mut Frames,frame:u64)->bool{
+        if frame<PAGE||frame%PAGE!=0{return false;}
+        let i=(frame/PAGE-1) as usize;
+        if i>=s.used.len()||!s.used[i]{return false;}
+        s.used[i]=false;true
+    }
+    #[test]fn kernel_p0_batch22_w1_561_cleanup_after_second_allocation_failure(){
+        let mut s=Frames{fail_after:Some(1),..Default::default()};
+        assert!(!pmm_self_test_roundtrip(&mut s,alloc,free));
+        assert_eq!(s.used,[false;3]);
+    }
+    #[test]fn kernel_p0_batch22_w1_562_duplicate_address_never_double_freed(){
+        let mut s=Frames{alias:true,..Default::default()};
+        assert!(!pmm_self_test_roundtrip(&mut s,alloc,free));
+        assert_eq!(s.used,[false;3]);
+    }
+    #[test]fn kernel_p0_batch22_w1_563_roundtrip_reclaims_every_frame(){
+        let mut s=Frames::default();
+        assert!(pmm_self_test_roundtrip(&mut s,alloc,free));
+        assert_eq!(s.used,[false;3]);
+        assert!(pmm_self_test_roundtrip(&mut s,alloc,free));
+        assert_eq!(s.used,[false;3]);
     }
 }

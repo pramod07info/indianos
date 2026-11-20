@@ -270,31 +270,60 @@ impl VirtioNet{
     pub fn close(self)->bool{
         unsafe{outb(self.port+0x12,0);}
         compiler_fence(Ordering::SeqCst);
-        // Re-read actual device STATUS, then deny further PCI bus-master DMA.
-        // Reads of PCI command are trusted only with unchanged device identity.
-        // Reset uncertainty or hot-unplug must retain buffers, NOT release
-        // frames still potentially reachable by the DMA engine.
-        if unsafe{inb(self.port+0x12)}!=0{return false;}
-        if pciread(self.bus,self.slot,self.function,0) !=
-             ((DEVICE as u32)<<16 | VENDOR as u32){return false;}
+        // A removed/replaced device may return all-ones PCI identity,
+        // and a device may change after we disable bus mastering.
+        let reset=unsafe{inb(self.port+0x12)};
+        let identity_before=pciread(self.bus,self.slot,self.function,0);
+        if reset!=0 || identity_before!=legacy_nic_identity(){return false;}
         let command=pciread(self.bus,self.slot,self.function,0x04);
-        // Write only COMMAND[15:0]: status bits are W1C and must not be
-        // accidentally acknowledged while quarantining the controller.
+        // Preserve status W1C bits by writing only COMMAND[15:0].
         let disabled=(command & 0xffff) & !0x0004;
         pciwrite(self.bus,self.slot,self.function,0x04,disabled);
         compiler_fence(Ordering::SeqCst);
         let observed=pciread(self.bus,self.slot,self.function,0x04);
-        if observed & 0x0004 != 0 || (observed & 1)==0{return false;}
+        let identity_after=pciread(self.bus,self.slot,self.function,0);
+        if !nic_dma_retired(reset,identity_before,identity_after,observed){
+            return false;
+        }
         self.rx.release();self.tx.release();
         true
     }
 }
+/// Exact expected PCI device ID, not an arbitrary substituted controller.
+fn legacy_nic_identity()->u32{((DEVICE as u32)<<16)|VENDOR as u32}
+/// Only an unchanged, reset, IO-decodable and bus-master-disabled device
+/// permits releasing ring memory. Physical IOMMU qualification is separate.
+fn nic_dma_retired(reset:u8,before:u32,after:u32,command:u32)->bool{
+    reset==0 && before==legacy_nic_identity() &&
+       after==before && (command&0x0004)==0 && (command&0x0001)!=0
+}
 /// Validate used length without untrusted DMA length subtraction/overflow.
 fn receive_payload_len(used_len:usize,capacity:usize)->Result<usize,Error>{
-    if used_len<10 || used_len>1514+10 {return Err(Error::Invalid);}
+    // A complete Ethernet frame needs a 14-byte destination/source/type
+    // header after the ten-byte legacy virtio transport header.
+    if used_len<10+14 || used_len>1514+10 {return Err(Error::Invalid);}
     let payload=used_len-10;
     if payload>capacity {return Err(Error::Invalid);}
     Ok(payload)
+}
+/// Without negotiated checksum/GSO features a legacy device must not
+/// inject offload metadata that would bypass the kernel's checksum checks.
+fn rx_offload_header_valid(header:&[u8])->bool {
+    header.len()>=10 && header[..10].iter().all(|&byte|byte==0)
+}
+/// The R028 stack accepts untagged Ethernet-II ingress only. An invalid
+/// source address or 802.3 length field must not reach higher-level parsers.
+fn ethernet_ingress_valid(frame:&[u8])->bool{
+    if frame.len()<14{return false;}
+    let source=&frame[6..12];
+    if source[0]&1!=0 || source.iter().all(|&x|x==0){return false;}
+    let ethertype=u16::from_be_bytes([frame[12],frame[13]]);
+    ethertype>=0x0600
+}
+/// The device owns the used-ring length. It cannot report bytes beyond
+/// the actual submitted header and Ethernet frame.
+fn tx_completion_length_valid(reported:usize,frame_length:usize)->bool {
+    (14..=1514).contains(&frame_length) && reported<=frame_length+10
 }
 impl EthernetDevice for VirtioNet{
     fn mac(&self)->[u8;6]{self.mac}
@@ -313,7 +342,8 @@ impl EthernetDevice for VirtioNet{
         unsafe{outw(self.port+0x10,QUEUE_TX);}
         for _ in 0..TIMEOUT{
             if self.tx.complete(){
-                if !matches!(self.tx.consume(),Ok(Some(_))){
+                if !matches!(self.tx.consume(),Ok(Some(n))
+                    if tx_completion_length_valid(n,frame.len())){
                     self.faulted=true;
                     return Err(Error::Device);
                 }
@@ -345,7 +375,24 @@ impl EthernetDevice for VirtioNet{
             }
         };
         compiler_fence(Ordering::Acquire);
-        unsafe{ptr::copy_nonoverlapping(self.rx.buffer.add(10),out.as_mut_ptr(),n);}
+        // Offload bits may not be trusted unless features were negotiated.
+        // Drop rather than publish a frame if the NIC claims unsupported GSO
+        // or checksum work. Return no caller bytes on rejection.
+        let header=unsafe{core::slice::from_raw_parts(self.rx.buffer,10)};
+        if !rx_offload_header_valid(header){
+            self.rx.offer();
+            compiler_fence(Ordering::Release);
+            unsafe{outw(self.port+0x10,QUEUE_RX);}
+            return Err(Error::Invalid);
+        }
+        let frame=unsafe{core::slice::from_raw_parts(self.rx.buffer.add(10),n)};
+        if !ethernet_ingress_valid(frame){
+            self.rx.offer();
+            compiler_fence(Ordering::Release);
+            unsafe{outw(self.port+0x10,QUEUE_RX);}
+            return Err(Error::Invalid);
+        }
+        unsafe{ptr::copy_nonoverlapping(frame.as_ptr(),out.as_mut_ptr(),n);}
         self.rx.offer();
         compiler_fence(Ordering::Release);
         unsafe{outw(self.port+0x10,QUEUE_RX);}
@@ -461,4 +508,92 @@ mod tests{
         assert_eq!(receive_payload_len(usize::MAX,usize::MAX),Err(Error::Invalid));
     }
 
+}
+
+
+// P0-469: DMA used-ring lengths must not exceed submitted transmit bytes.
+#[cfg(test)]
+mod kernel_p0_batch19_w5_tests {
+    use super::*;
+    #[test]
+    fn kernel_p0_batch19_w5_rejects_forged_tx_completion_lengths(){
+        assert!(tx_completion_length_valid(0,14));
+        assert!(tx_completion_length_valid(24,14));
+        assert!(tx_completion_length_valid(1524,1514));
+        assert!(!tx_completion_length_valid(25,14));
+        assert!(!tx_completion_length_valid(1525,1514));
+        assert!(!tx_completion_length_valid(0,13));
+        assert!(!tx_completion_length_valid(0,1515));
+        assert!(!tx_completion_length_valid(usize::MAX,1514));
+    }
+}
+
+
+// P0-509–514: deny DMA page recycling after a changing PCI identity.
+#[cfg(test)]
+mod kernel_p0_batch20_w5_tests{
+    use super::*;
+    #[test]
+    fn kernel_p0_batch20_w5_quiesced_nic_requires_stable_device_id(){
+        let id=legacy_nic_identity();
+        assert!(nic_dma_retired(0,id,id,0x0001));
+        assert!(!nic_dma_retired(0xff,id,id,0x0001));
+        assert!(!nic_dma_retired(0,id,u32::MAX,0x0001));
+        assert!(!nic_dma_retired(0,u32::MAX,id,0x0001));
+        assert!(!nic_dma_retired(0,id,id,0x0005));
+        assert!(!nic_dma_retired(0,id,id,0));
+    }
+}
+
+
+// P0-549: malformed RX packets/offload flags cannot enter the actual
+// R028 virtio Ethernet receive path while checksum offload is disabled.
+#[cfg(test)]
+mod kernel_p0_batch21_w5_tests {
+    use super::*;
+    #[test]fn kernel_p0_batch21_w5_short_frames_and_offload_flags_denied(){
+        assert_eq!(receive_payload_len(23,2048),Err(Error::Invalid));
+        assert_eq!(receive_payload_len(24,2048),Ok(14));
+        assert_eq!(receive_payload_len(1524,1514),Ok(1514));
+        assert!(rx_offload_header_valid(&[0;10]));
+        for i in 0..10{
+            let mut forged=[0u8;10];forged[i]=1;
+            assert!(!rx_offload_header_valid(&forged));
+        }
+        assert!(!rx_offload_header_valid(&[0;9]));
+    }
+}
+
+
+// Batch22 W5 P0-575..577: NIC DMA bytes are filtered by the actual
+// VirtioNet::poll ingress path, before user-visible Ethernet buffers.
+#[cfg(test)]
+mod kernel_p0_batch22_w5_tests{
+    use super::*;
+    fn ipv4()->[u8;60]{
+        let mut f=[0u8;60];
+        f[..6].copy_from_slice(&[0x52,0x54,0,0x01,0x02,0x03]);
+        f[6..12].copy_from_slice(&[0x52,0x54,0,0xab,0xcd,0xef]);
+        f[12..14].copy_from_slice(&[0x08,0x00]);
+        f
+    }
+    #[test]fn kernel_p0_batch22_w5_575_multicast_source_rejected(){
+        let mut f=ipv4();assert!(ethernet_ingress_valid(&f));
+        f[6]=0x53;assert!(!ethernet_ingress_valid(&f));
+        f[6]=0xff;assert!(!ethernet_ingress_valid(&f));
+    }
+    #[test]fn kernel_p0_batch22_w5_576_zero_source_rejected(){
+        let mut f=ipv4();f[6..12].fill(0);
+        assert!(!ethernet_ingress_valid(&f));
+        assert!(!ethernet_ingress_valid(&f[..13]));
+    }
+    #[test]fn kernel_p0_batch22_w5_577_length_coded_frames_rejected(){
+        let mut f=ipv4();
+        f[12..14].copy_from_slice(&[0x05,0xdc]);
+        assert!(!ethernet_ingress_valid(&f));
+        f[12..14].copy_from_slice(&[0x08,0x06]);
+        assert!(ethernet_ingress_valid(&f));
+        f[12..14].copy_from_slice(&[0x08,0x00]);
+        assert!(ethernet_ingress_valid(&f));
+    }
 }

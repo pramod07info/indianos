@@ -394,3 +394,943 @@ mod pr782_ws65_67_tests{
         assert!(!a.revision_is_current(&fresh,rev));
     }
 }
+
+
+/// P0 W5: kernel-owned NIC controller shutdown callback. The driver must
+/// actually mask MSI/MSI-X, stop bus mastering and drain DMA descriptors
+/// BEFORE returning success. This type cannot establish the physical fact;
+/// a hardware driver implementor and independent qualification are required.
+pub trait NicHardwareQuiesce{
+ fn stop_irq_dma_and_drain(&mut self,device:u32)->Result<(),RxFenceError>;
+}
+impl NicRxFence{
+ /// Keep the RX fence quiescing on all errors. No caller may fabricate a
+ /// success boolean to reopen ingress through this driver-facing operation.
+ pub fn quiesce_and_rebind_with_driver<D:NicHardwareQuiesce>(&self,
+  driver:&mut D,device:u32,software_probes:u32)->Result<u64,RxFenceError>{
+  let receipt=self.begin_quiesce(device)?;
+  driver.stop_irq_dma_and_drain(device)?;
+  self.wait_drained_bounded(receipt,software_probes)?;
+  self.finish_rebind_checked(receipt,true,true)
+ }
+}
+#[cfg(test)]
+mod kernel_p0_w5_nic_teardown_tests{
+ use super::*;
+ struct Driver{stops:u32,fail:bool}
+ impl NicHardwareQuiesce for Driver{
+  fn stop_irq_dma_and_drain(&mut self,_:u32)->Result<(),RxFenceError>{
+   self.stops+=1;
+   if self.fail{Err(RxFenceError::Busy)}else{Ok(())}
+  }
+ }
+ #[test]fn software_handler_must_drain_and_failed_driver_never_reopens_queue(){
+  let nic=NicRxFence::new(9);
+  let pending=nic.try_admit(9).unwrap();
+  let mut d=Driver{stops:0,fail:false};
+  assert_eq!(nic.quiesce_and_rebind_with_driver(&mut d,9,0),
+     Err(RxFenceError::Busy));
+  assert_eq!(nic.try_admit(9).err(),Some(RxFenceError::Quiescing));
+  assert_eq!(d.stops,1);
+  drop(pending);
+  // The separate privileged control plane can resume ONLY after it has
+  // independently checked the actual hardware stopped and the software
+  // admission count drained. No auto-resume occurs on the busy path.
+  assert_eq!(nic.epoch(),1);
+ }
+ #[test]fn successful_driver_halt_invalidates_prior_ring_epoch(){
+  let nic=NicRxFence::new(10);
+  let mut d=Driver{stops:0,fail:false};
+  assert_eq!(nic.quiesce_and_rebind_with_driver(&mut d,10,1),Ok(2));
+  assert_eq!(d.stops,1);
+  assert_eq!(nic.epoch(),2);
+  let p=nic.try_admit(10).unwrap();
+  assert_eq!(p.epoch(),2);
+ }
+ #[test]fn driver_halt_failure_never_claims_new_generation(){
+  let nic=NicRxFence::new(11);
+  let mut d=Driver{stops:0,fail:true};
+  assert_eq!(nic.quiesce_and_rebind_with_driver(&mut d,11,1),
+    Err(RxFenceError::Busy));
+  assert_eq!(nic.epoch(),1);
+  assert_eq!(nic.try_admit(11).err(),Some(RxFenceError::Quiescing));
+ }
+}
+
+
+/// P0 follow-up W5: no packet bytes or a parsed result may escape the NIC
+/// receive admission epoch if IRQ teardown races with decoding. The closure
+/// must parse into private scratch and perform NO externally visible effects;
+/// a later caller still needs an authenticated socket/UDP policy decision.
+impl NicRxFence{
+ pub fn parse_packet_at_live_epoch<R>(&self,device:u32,
+  parse:impl FnOnce()->Option<R>)->Result<R,RxFenceError>{
+  let permit=self.try_admit(device)?;
+  let revision=self.revision_for(&permit)?;
+  let decoded=parse().ok_or(RxFenceError::Stale)?;
+  if !self.revision_is_current(&permit,revision){
+   return Err(RxFenceError::Stale);
+  }
+  Ok(decoded)
+ }
+}
+#[cfg(test)]
+mod kernel_p0_next_w5_rx_admission_tests{
+ use super::*;
+ #[test]fn packet_validation_result_cannot_cross_quiescing_transition(){
+  let nic=NicRxFence::new(13);
+  assert_eq!(nic.parse_packet_at_live_epoch(13,||Some(25u32)),Ok(25));
+  assert_eq!(nic.parse_packet_at_live_epoch(12,||Some(25u32)),
+   Err(RxFenceError::InvalidDevice));
+  assert_eq!(nic.parse_packet_at_live_epoch(13,||{
+   nic.begin_quiesce(13).unwrap();
+   Some(25u32)
+  }),Err(RxFenceError::Stale));
+  assert_eq!(nic.parse_packet_at_live_epoch(13,||Some(25u32)),
+   Err(RxFenceError::Quiescing));
+ }
+ #[test]fn failed_decoder_does_not_hold_a_software_completion_permit(){
+  let nic=NicRxFence::new(14);
+  assert_eq!(nic.parse_packet_at_live_epoch::<u32>(14,||None),
+   Err(RxFenceError::Stale));
+  let r=nic.begin_quiesce(14).unwrap();
+  assert_eq!(nic.drained(r),Ok(true));
+  assert_eq!(nic.finish_rebind_checked(r,true,true),Ok(2));
+  assert_eq!(nic.parse_packet_at_live_epoch(14,||Some(4u8)),Ok(4));
+ }
+}
+
+
+/// P0 batch three W5: a separately owned quiescence receipt allows a
+/// privileged control-plane retry after a late software receive handler
+/// exits. The REAL NIC driver must successfully stop IRQ/DMA on each attempt.
+/// The opaque receipt must come from begin_quiesce on this exact fence.
+impl NicRxFence{
+ pub fn complete_quiesced_rebind_with_driver<D:NicHardwareQuiesce>(
+  &self,receipt:QuiesceReceipt,driver:&mut D,probes:u32)
+  ->Result<u64,RxFenceError>{
+  self.admitted_in_flight(receipt)?;
+  driver.stop_irq_dma_and_drain(self.device)?;
+  self.wait_drained_bounded(receipt,probes)?;
+  self.finish_rebind_checked(receipt,true,true)
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch3_w5_nic_retry_tests{
+ use super::*;
+ struct Driver{count:usize,stopped:bool}
+ impl NicHardwareQuiesce for Driver{
+  fn stop_irq_dma_and_drain(&mut self,_:u32)->Result<(),RxFenceError>{
+   self.count+=1;
+   if self.stopped{Ok(())}else{Err(RxFenceError::Busy)}
+  }
+ }
+ #[test]fn retry_cannot_resume_while_handler_live_or_hardware_not_stopped(){
+  let f=NicRxFence::new(21);
+  let handler=f.try_admit(21).unwrap();
+  let receipt=f.begin_quiesce(21).unwrap();
+  let mut d=Driver{count:0,stopped:true};
+  assert_eq!(f.complete_quiesced_rebind_with_driver(receipt,&mut d,0),
+   Err(RxFenceError::Busy));
+  assert_eq!(f.try_admit(21).err(),Some(RxFenceError::Quiescing));
+  drop(handler);d.stopped=false;
+  assert_eq!(f.complete_quiesced_rebind_with_driver(receipt,&mut d,0),
+   Err(RxFenceError::Busy));
+  d.stopped=true;
+  assert_eq!(f.complete_quiesced_rebind_with_driver(receipt,&mut d,0),Ok(2));
+  assert_eq!(f.complete_quiesced_rebind_with_driver(receipt,&mut d,0),
+   Err(RxFenceError::Stale));
+  assert_eq!(f.try_admit(21).unwrap().epoch(),2);
+ }
+ #[test]fn foreign_ring_receipt_does_not_invoke_wrong_hardware_driver(){
+  let a=NicRxFence::new(24);let b=NicRxFence::new(24);
+  let receipt=a.begin_quiesce(24).unwrap();
+  let mut d=Driver{count:0,stopped:true};
+  assert_eq!(b.complete_quiesced_rebind_with_driver(receipt,&mut d,0),
+   Err(RxFenceError::Stale));
+  assert_eq!(d.count,0);
+ }
+}
+
+/// P0-76..77: parser runs only for a bounded nonempty frame, while an exact
+/// RX revision stays live. Parser must be side-effect-free until final check.
+impl NicRxFence{
+ pub fn parse_bounded_frame<R>(&self,device:u32,frame:&[u8],
+  maximum:usize,parse:impl FnOnce(&[u8])->Option<R>)
+  ->Result<R,RxFenceError>{
+  if frame.is_empty()||maximum==0||frame.len()>maximum{
+   return Err(RxFenceError::Capacity);
+  }
+  self.parse_packet_at_live_epoch(device,||parse(frame))
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch4_w5_packet_limits_tests{
+ use super::*;
+ #[test]fn malformed_size_cannot_invoke_parser(){
+  let f=NicRxFence::new(8);let mut calls=0;
+  assert_eq!(f.parse_bounded_frame(8,&[],128,|_|{calls+=1;Some(1)}),
+   Err(RxFenceError::Capacity));
+  assert_eq!(f.parse_bounded_frame(8,&[1,2],1,|_|{calls+=1;Some(1)}),
+   Err(RxFenceError::Capacity));
+  assert_eq!(calls,0);
+  assert_eq!(f.parse_bounded_frame(8,&[1,2],2,|b|Some(b.len())),Ok(2));
+ }
+ #[test]fn invalid_device_or_teardown_race_disallows_result(){
+  let f=NicRxFence::new(8);
+  assert_eq!(f.parse_bounded_frame(9,&[4],4,|_|Some(3u8)),
+   Err(RxFenceError::InvalidDevice));
+  assert_eq!(f.parse_bounded_frame(8,&[4],4,|_|{
+   f.begin_quiesce(8).unwrap();Some(3u8)
+  }),Err(RxFenceError::Stale));
+  assert_eq!(f.parse_bounded_frame(8,&[4],4,|_|Some(3u8)),
+   Err(RxFenceError::Quiescing));
+ }
+}
+
+/// P0-96..97: parse only a bounded Ethernet IPv4 payload, supporting one
+/// 802.1Q VLAN tag and rejecting malformed/truncated or nested tags.
+/// Parser closure is side-effect-free; admission remains tied to RX lifetime.
+impl NicRxFence{
+ pub fn parse_ipv4_ethernet<R>(&self,device:u32,frame:&[u8],
+  maximum:usize,parse:impl FnOnce(&[u8])->Option<R>)
+  ->Result<R,RxFenceError>{
+  if frame.len()<14{return Err(RxFenceError::Capacity);}
+  let vlan=frame[12]==0x81&&frame[13]==0x00;
+  let header=if vlan{18}else{14};
+  if frame.len()<=header{return Err(RxFenceError::Capacity);}
+  let ether_type=if vlan{&frame[16..18]}else{&frame[12..14]};
+  if ether_type!=[0x08,0x00]{return Err(RxFenceError::Capacity);}
+  self.parse_bounded_frame(device,frame,maximum,|_|parse(&frame[header..]))
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch5_w5_ipv4_ethernet_tests{
+ use super::*;
+ #[test] fn valid_ethernet_and_single_vlan_frames_are_epoch_guarded(){
+  let nic=NicRxFence::new(7);
+  let mut untagged=[0u8;16];untagged[12]=8;untagged[15]=42;
+  assert_eq!(nic.parse_ipv4_ethernet(7,&untagged,64,|payload|
+    Some((payload.len(),payload[1]))),Ok((2,42)));
+  let mut tagged=[0u8;20];
+  tagged[12]=0x81;tagged[13]=0;tagged[16]=8;tagged[19]=9;
+  assert_eq!(nic.parse_ipv4_ethernet(7,&tagged,64,|payload|
+    Some((payload.len(),payload[1]))),Ok((2,9)));
+ }
+ #[test] fn truncated_non_ipv4_and_quiescing_frames_are_rejected(){
+  let nic=NicRxFence::new(7);let mut calls=0;
+  assert_eq!(nic.parse_ipv4_ethernet(7,&[0u8;13],64,|_|{
+   calls+=1;Some(1)
+  }),Err(RxFenceError::Capacity));
+  let mut bad=[0u8;16];bad[12]=0x86;bad[13]=0xdd;
+  assert_eq!(nic.parse_ipv4_ethernet(7,&bad,64,|_|{
+   calls+=1;Some(1)
+  }),Err(RxFenceError::Capacity));
+  assert_eq!(calls,0);
+  bad[12]=8;bad[13]=0;
+  assert_eq!(nic.parse_ipv4_ethernet(7,&bad,16,|_|{
+   nic.begin_quiesce(7).unwrap();Some(1)
+  }),Err(RxFenceError::Stale));
+ }
+}
+/// P0-116..117: verify IPv4 version, header length, total length, header
+/// checksum and fragmentation policy before allowing a trusted L3 parser.
+/// Deliver only IP length, never Ethernet padding. Hardware RX teardown is
+/// still governed by the exact software ring epoch in parse_ipv4_ethernet.
+/// Deliberately reject fragments until a bounded reassembly service exists.
+impl NicRxFence{
+ pub fn parse_checked_ipv4_ethernet<R>(&self,device:u32,frame:&[u8],
+  maximum:usize,parse:impl FnOnce(&[u8])->Option<R>)
+  ->Result<R,RxFenceError>{
+  if frame.len()<14{return Err(RxFenceError::Capacity);}
+  let vlan=frame[12..14]==[0x81,0x00];
+  let offset=if vlan{18}else{14};
+  if frame.len()<offset+20{return Err(RxFenceError::Capacity);}
+  let ip=&frame[offset..];
+  if ip[0]>>4!=4{return Err(RxFenceError::Capacity);}
+  let ihl=((ip[0]&15) as usize)*4;
+  if ihl<20||ihl>60||ihl>ip.len(){return Err(RxFenceError::Capacity);}
+  let total=u16::from_be_bytes([ip[2],ip[3]]) as usize;
+  if total<ihl||total>ip.len(){return Err(RxFenceError::Capacity);}
+  let fragment=u16::from_be_bytes([ip[6],ip[7]]);
+  if fragment&0x3fff!=0{return Err(RxFenceError::Capacity);}
+  let mut sum=0u32;
+  for pair in ip[..ihl].chunks_exact(2){
+   sum+=u16::from_be_bytes([pair[0],pair[1]]) as u32;
+  }
+  while sum>>16!=0{sum=(sum&0xffff)+(sum>>16);}
+  if sum!=0xffff{return Err(RxFenceError::Capacity);}
+  self.parse_ipv4_ethernet(device,frame,maximum,|_|parse(&ip[..total]))
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch6_w5_ipv4_integrity_tests{
+ use super::*;
+ fn packet()->[u8;38]{
+  let mut bytes=[0u8;38];
+  bytes[12]=8;bytes[13]=0;
+  let p=&mut bytes[14..];
+  p[0]=0x45;p[2]=0;p[3]=24;p[8]=64;p[9]=17;
+  p[20..24].copy_from_slice(b"data");
+  let mut sum=0u32;
+  for word in p[..20].chunks_exact(2){
+   sum+=u16::from_be_bytes([word[0],word[1]]) as u32;
+  }
+  while sum>>16!=0{sum=(sum&0xffff)+(sum>>16);}
+  p[10..12].copy_from_slice(&(!(sum as u16)).to_be_bytes());
+  bytes
+ }
+ #[test] fn valid_header_and_payload_are_epoch_guarded(){
+  let nic=NicRxFence::new(7);
+  let p=packet();
+  assert_eq!(nic.parse_checked_ipv4_ethernet(7,&p,64,
+   |ip|Some((ip.len(),ip[20]))),Ok((24,b'd')));
+  assert_eq!(nic.parse_checked_ipv4_ethernet(8,&p,64,|_|Some(1u8)),
+   Err(RxFenceError::InvalidDevice));
+  assert_eq!(nic.parse_checked_ipv4_ethernet(7,&p,64,|_|{
+   nic.begin_quiesce(7).unwrap();Some(1u8)
+  }),Err(RxFenceError::Stale));
+ }
+ #[test] fn corrupt_length_checksum_or_fragments_never_reach_parser(){
+  let nic=NicRxFence::new(7);let mut p=packet();let mut calls=0;
+  p[16]=0xff;p[17]=0xff;
+  assert_eq!(nic.parse_checked_ipv4_ethernet(7,&p,64,|_|{
+   calls+=1;Some(1)
+  }),Err(RxFenceError::Capacity));
+  p=packet();p[24]^=1;
+  assert_eq!(nic.parse_checked_ipv4_ethernet(7,&p,64,|_|{
+   calls+=1;Some(1)
+  }),Err(RxFenceError::Capacity));
+  p=packet();p[20]=0x20;
+  assert_eq!(nic.parse_checked_ipv4_ethernet(7,&p,64,|_|{
+   calls+=1;Some(1)
+  }),Err(RxFenceError::Capacity));
+  assert_eq!(calls,0);
+ }
+}
+
+
+/// P0-136..137: strict UDP delivery from a checked nonfragmented IPv4
+/// Ethernet frame. The UDP length and requested destination port must match
+/// before any driver-independent payload parser runs; epoch revocation still
+/// invalidates the result. UDP checksum offload is NOT authenticated here.
+impl NicRxFence{
+ pub fn parse_checked_udp_ipv4<R>(&self,device:u32,frame:&[u8],
+  maximum:usize,destination_port:u16,
+  parse:impl FnOnce(&[u8])->Option<R>)->Result<R,RxFenceError>{
+  if destination_port==0{return Err(RxFenceError::Capacity);}
+  // Syntactic rejection precedes the live-epoch parser. The underlying
+  // admission primitive uses Stale for an empty parse result, so do not
+  // accidentally report a bad destination port as a revoked NIC ring.
+  if frame.len()<14{return Err(RxFenceError::Capacity);}
+  let ip_offset=if frame[12..14]==[0x81,0x00]{18}else{14};
+  if frame.len()<ip_offset+20{return Err(RxFenceError::Capacity);}
+  let ip=&frame[ip_offset..];
+  let ihl=((ip[0]&15) as usize)*4;
+  if ihl<20||ihl>60||ihl>ip.len(){return Err(RxFenceError::Capacity);}
+  let total=u16::from_be_bytes([ip[2],ip[3]]) as usize;
+  if total<ihl+8||total>ip.len()||ip[9]!=17{
+   return Err(RxFenceError::Capacity);
+  }
+  let udp=&ip[ihl..total];
+  let length=u16::from_be_bytes([udp[4],udp[5]]) as usize;
+  let port=u16::from_be_bytes([udp[2],udp[3]]);
+  if port!=destination_port||length<8||length!=udp.len(){
+   return Err(RxFenceError::Capacity);
+  }
+  self.parse_checked_ipv4_ethernet(device,frame,maximum,|_|parse(&udp[8..length]))
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch7_w5_udp_ingress_tests{
+ use super::*;
+ fn packet()->[u8;46]{
+  let mut bytes=[0u8;46];bytes[12]=8;bytes[13]=0;
+  let p=&mut bytes[14..];
+  p[0]=0x45;p[2]=0;p[3]=32;p[8]=64;p[9]=17;
+  p[20..22].copy_from_slice(&8000u16.to_be_bytes());
+  p[22..24].copy_from_slice(&9000u16.to_be_bytes());
+  p[24..26].copy_from_slice(&12u16.to_be_bytes());
+  p[28..32].copy_from_slice(b"ping");
+  let mut sum=0u32;
+  for word in p[..20].chunks_exact(2){
+   sum+=u16::from_be_bytes([word[0],word[1]]) as u32;
+  }
+  while sum>>16!=0{sum=(sum&65535)+(sum>>16);}
+  p[10..12].copy_from_slice(&(!(sum as u16)).to_be_bytes());
+  bytes
+ }
+ #[test]fn only_complete_port_matched_payload_is_delivered(){
+  let nic=NicRxFence::new(6);let p=packet();
+  assert_eq!(nic.parse_checked_udp_ipv4(6,&p,128,9000,
+   |payload|Some((payload.len(),payload[0]))),Ok((4,b'p')));
+  assert_eq!(nic.parse_checked_udp_ipv4(6,&p,128,9001,
+   |_|Some(1)),Err(RxFenceError::Capacity));
+ }
+ #[test]fn bad_udp_length_and_epoch_change_revoke_delivery(){
+  let nic=NicRxFence::new(6);let mut p=packet();
+  p[25]=13;
+  assert_eq!(nic.parse_checked_udp_ipv4(6,&p,128,9000,
+   |_|Some(1)),Err(RxFenceError::Capacity));
+  p=packet();
+  assert_eq!(nic.parse_checked_udp_ipv4(6,&p,128,9000,|_|{
+   nic.begin_quiesce(6).unwrap();Some(1)
+  }),Err(RxFenceError::Stale));
+ }
+}
+
+
+/// P0-156..157: opt-in full UDP checksum verification including source and
+/// destination IPv4 pseudoheader, datagram length and odd trailing byte.
+/// A zero UDP checksum (legal in IPv4) is deliberately rejected by this
+/// *strict* ingress policy. Never accept a parser result after RX revocation.
+impl NicRxFence{
+ pub fn parse_udp_ipv4_verified_checksum<R>(&self,device:u32,frame:&[u8],
+  maximum:usize,destination_port:u16,
+  parse:impl FnOnce(&[u8])->Option<R>)->Result<R,RxFenceError>{
+  if frame.len()<14{return Err(RxFenceError::Capacity);}
+  let offset=if frame[12..14]==[0x81,0x00]{18}else{14};
+  if frame.len()<offset+20{return Err(RxFenceError::Capacity);}
+  let ip=&frame[offset..];
+  let ihl=((ip[0]&15) as usize)*4;
+  if ihl<20||ihl>60||ip.len()<ihl+8{
+   return Err(RxFenceError::Capacity);
+  }
+  let total=u16::from_be_bytes([ip[2],ip[3]]) as usize;
+  if ip[0]>>4!=4||ip[9]!=17||total<ihl+8||total>ip.len(){
+   return Err(RxFenceError::Capacity);
+  }
+  let udp=&ip[ihl..total];
+  if u16::from_be_bytes([udp[6],udp[7]])==0{
+   return Err(RxFenceError::Capacity);
+  }
+  let mut sum=17u32+udp.len() as u32;
+  for word in ip[12..20].chunks_exact(2){
+   sum+=u16::from_be_bytes([word[0],word[1]]) as u32;
+  }
+  for word in udp.chunks_exact(2){
+   sum+=u16::from_be_bytes([word[0],word[1]]) as u32;
+  }
+  if udp.len()%2!=0{sum+=(udp[udp.len()-1] as u32)<<8;}
+  while sum>>16!=0{sum=(sum&0xffff)+(sum>>16);}
+  if sum!=0xffff{return Err(RxFenceError::Capacity);}
+  self.parse_checked_udp_ipv4(device,frame,maximum,destination_port,parse)
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch8_w5_udp_checksum_tests{
+ use super::*;
+ fn packet()->[u8;47]{
+  let mut bytes=[0u8;47];bytes[12]=8;bytes[13]=0;
+  let ip=&mut bytes[14..];ip[0]=0x45;ip[2..4].copy_from_slice(&33u16.to_be_bytes());
+  ip[8]=64;ip[9]=17;
+  ip[12..16].copy_from_slice(&[10,0,0,1]);
+  ip[16..20].copy_from_slice(&[10,0,0,2]);
+  ip[20..22].copy_from_slice(&8000u16.to_be_bytes());
+  ip[22..24].copy_from_slice(&9000u16.to_be_bytes());
+  ip[24..26].copy_from_slice(&13u16.to_be_bytes());
+  ip[28..33].copy_from_slice(b"hello");
+  let mut sum=17u32+13;
+  for word in ip[12..20].chunks_exact(2){
+   sum+=u16::from_be_bytes([word[0],word[1]]) as u32;
+  }
+  for word in ip[20..33].chunks_exact(2){
+   sum+=u16::from_be_bytes([word[0],word[1]]) as u32;
+  }
+  sum+=(ip[32] as u32)<<8;
+  while sum>>16!=0{sum=(sum&65535)+(sum>>16);}
+  ip[26..28].copy_from_slice(&(!(sum as u16)).to_be_bytes());
+  let mut ip_sum=0u32;
+  for word in ip[..20].chunks_exact(2){
+   ip_sum+=u16::from_be_bytes([word[0],word[1]]) as u32;
+  }
+  while ip_sum>>16!=0{ip_sum=(ip_sum&65535)+(ip_sum>>16);}
+  ip[10..12].copy_from_slice(&(!(ip_sum as u16)).to_be_bytes());
+  bytes
+ }
+ #[test]fn real_pseudoheader_checksum_allows_valid_odd_length_udp(){
+  let nic=NicRxFence::new(6);let p=packet();
+  assert_eq!(nic.parse_udp_ipv4_verified_checksum(6,&p,128,9000,
+   |data|Some((data.len(),data[4]))),Ok((5,b'o')));
+ }
+ #[test]fn tampered_checksum_and_disabled_checksum_are_rejected(){
+  let nic=NicRxFence::new(6);let mut p=packet();
+  p[46]^=1;
+  assert_eq!(nic.parse_udp_ipv4_verified_checksum(6,&p,128,9000,
+   |_|Some(1)),Err(RxFenceError::Capacity));
+  p=packet();p[40]=0;p[41]=0;
+  assert_eq!(nic.parse_udp_ipv4_verified_checksum(6,&p,128,9000,
+   |_|Some(1)),Err(RxFenceError::Capacity));
+ }
+ #[test]fn live_nic_ring_revoke_denies_checked_packet(){
+  let nic=NicRxFence::new(6);let p=packet();
+  assert_eq!(nic.parse_udp_ipv4_verified_checksum(6,&p,128,9000,|_|{
+   nic.begin_quiesce(6).unwrap();Some(1)
+  }),Err(RxFenceError::Stale));
+ }
+}
+
+
+/// P0-176..177: strict IPv4 unicast peer binding before checksum-protected
+/// UDP delivery. Excludes unspecified, loopback, multicast, broadcast, and
+/// link-local endpoints; the NIC RX epoch must remain live through callback.
+impl NicRxFence{
+ pub fn parse_udp_ipv4_unicast_peer<R>(&self,device:u32,frame:&[u8],
+  maximum:usize,source:[u8;4],destination:[u8;4],port:u16,
+  parse:impl FnOnce(&[u8])->Option<R>)->Result<R,RxFenceError>{
+  fn valid(ip:[u8;4])->bool{
+   ip[0]!=0&&ip[0]!=127&&ip[0]<224&&ip!=[255;4]&&
+   !(ip[0]==169&&ip[1]==254)
+  }
+  if !valid(source)||!valid(destination)||source==destination{
+   return Err(RxFenceError::Capacity);
+  }
+  if frame.len()<14{return Err(RxFenceError::Capacity);}
+  let offset=if frame[12..14]==[0x81,0x00]{18}else{14};
+  if frame.len()<offset+20{return Err(RxFenceError::Capacity);}
+  if frame[offset+12..offset+16]!=source||
+     frame[offset+16..offset+20]!=destination{
+   return Err(RxFenceError::Capacity);
+  }
+  self.parse_udp_ipv4_verified_checksum(device,frame,maximum,port,parse)
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch9_w5_ip_peer_tests{
+ use super::*;
+ fn packet()->[u8;47]{
+  let mut bytes=[0u8;47];bytes[12]=8;bytes[13]=0;
+  let ip=&mut bytes[14..];
+  ip[0]=0x45;ip[2..4].copy_from_slice(&33u16.to_be_bytes());
+  ip[8]=64;ip[9]=17;
+  ip[12..16].copy_from_slice(&[10,0,0,1]);
+  ip[16..20].copy_from_slice(&[10,0,0,2]);
+  ip[20..22].copy_from_slice(&8000u16.to_be_bytes());
+  ip[22..24].copy_from_slice(&9000u16.to_be_bytes());
+  ip[24..26].copy_from_slice(&13u16.to_be_bytes());
+  ip[28..33].copy_from_slice(b"hello");
+  let mut sum=17u32+13;
+  for word in ip[12..20].chunks_exact(2){
+   sum+=u16::from_be_bytes([word[0],word[1]]) as u32;
+  }
+  for word in ip[20..33].chunks_exact(2){
+   sum+=u16::from_be_bytes([word[0],word[1]]) as u32;
+  }
+  sum+=(ip[32] as u32)<<8;
+  while sum>>16!=0{sum=(sum&65535)+(sum>>16);}
+  ip[26..28].copy_from_slice(&(!(sum as u16)).to_be_bytes());
+  let mut ip_sum=0u32;
+  for word in ip[..20].chunks_exact(2){
+   ip_sum+=u16::from_be_bytes([word[0],word[1]]) as u32;
+  }
+  while ip_sum>>16!=0{ip_sum=(ip_sum&65535)+(ip_sum>>16);}
+  ip[10..12].copy_from_slice(&(!(ip_sum as u16)).to_be_bytes());
+  bytes
+ }
+ #[test]fn exact_unicast_peer_is_checksum_and_epoch_guarded(){
+  let nic=NicRxFence::new(6);let p=packet();
+  assert_eq!(nic.parse_udp_ipv4_unicast_peer(6,&p,128,
+   [10,0,0,1],[10,0,0,2],9000,|data|Some(data.len())),Ok(5));
+  assert_eq!(nic.parse_udp_ipv4_unicast_peer(6,&p,128,
+   [10,0,0,1],[10,0,0,2],9000,|_|{
+    nic.begin_quiesce(6).unwrap();Some(1)
+   }),Err(RxFenceError::Stale));
+ }
+ #[test]fn reserved_or_foreign_peer_denied_before_delivery(){
+  let nic=NicRxFence::new(6);let p=packet();let mut calls=0;
+  for source in [[10,0,0,3],[127,0,0,1],[224,0,0,1],[0,0,0,0]]{
+   assert_eq!(nic.parse_udp_ipv4_unicast_peer(6,&p,128,
+    source,[10,0,0,2],9000,|_|{calls+=1;Some(1)}),
+    Err(RxFenceError::Capacity));
+  }
+  assert_eq!(nic.parse_udp_ipv4_unicast_peer(6,&p,128,
+   [10,0,0,1],[255,255,255,255],9000,|_|{calls+=1;Some(1)}),
+   Err(RxFenceError::Capacity));
+  assert_eq!(calls,0);
+ }
+}
+
+
+/// P0-196..197: authenticate an ingress *flow*, not only the destination
+/// UDP port and IP pair. Require unicast Ethernet endpoints, exact source
+/// and destination UDP ports, nonzero IPv4 TTL and a live fenced NIC epoch.
+/// DMA ownership/IOMMU attestation and device IRQ quiescence remain external.
+impl NicRxFence{
+ pub fn parse_udp_ipv4_authenticated_flow<R>(
+  &self,device:u32,frame:&[u8],maximum:usize,
+  source_ip:[u8;4],destination_ip:[u8;4],
+  source_port:u16,destination_port:u16,
+  parse:impl FnOnce(&[u8])->Option<R>
+ )->Result<R,RxFenceError>{
+  if frame.len()<14||source_port==0||destination_port==0{
+   return Err(RxFenceError::Capacity);
+  }
+  // Ethernet source/destination MACs cannot be broadcast, multicast or zero.
+  let src=&frame[6..12];let dst=&frame[..6];
+  if src.iter().all(|b|*b==0)||dst.iter().all(|b|*b==0)||
+     src[0]&1!=0||dst[0]&1!=0{
+   return Err(RxFenceError::Capacity);
+  }
+  let offset=if frame[12..14]==[0x81,0x00]{18}else{14};
+  if frame.len()<offset+20{return Err(RxFenceError::Capacity);}
+  let ip=&frame[offset..];
+  let ihl=((ip[0]&15) as usize)*4;
+  if ip[0]>>4!=4||ihl<20||ihl>60||ip.len()<ihl+8||
+     ip[8]==0{return Err(RxFenceError::Capacity);}
+  if u16::from_be_bytes([ip[ihl],ip[ihl+1]])!=source_port{
+   return Err(RxFenceError::Capacity);
+  }
+  self.parse_udp_ipv4_unicast_peer(device,frame,maximum,
+   source_ip,destination_ip,destination_port,parse)
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch10_w5_flow_binding_tests{
+ use super::*;
+ fn packet()->[u8;47]{
+  let mut bytes=[0u8;47];
+  bytes[0..6].copy_from_slice(&[2,0,0,0,0,2]);
+  bytes[6..12].copy_from_slice(&[2,0,0,0,0,1]);
+  bytes[12..14].copy_from_slice(&[8,0]);
+  let ip=&mut bytes[14..];
+  ip[0]=0x45;ip[2..4].copy_from_slice(&33u16.to_be_bytes());
+  ip[8]=64;ip[9]=17;
+  ip[12..16].copy_from_slice(&[10,0,0,1]);
+  ip[16..20].copy_from_slice(&[10,0,0,2]);
+  ip[20..22].copy_from_slice(&8000u16.to_be_bytes());
+  ip[22..24].copy_from_slice(&9000u16.to_be_bytes());
+  ip[24..26].copy_from_slice(&13u16.to_be_bytes());
+  ip[28..33].copy_from_slice(b"hello");
+  let mut sum=17u32+13;
+  for word in ip[12..20].chunks_exact(2){
+   sum+=u16::from_be_bytes([word[0],word[1]]) as u32;
+  }
+  for word in ip[20..33].chunks_exact(2){
+   sum+=u16::from_be_bytes([word[0],word[1]]) as u32;
+  }
+  sum+=(ip[32] as u32)<<8;
+  while sum>>16!=0{sum=(sum&65535)+(sum>>16);}
+  ip[26..28].copy_from_slice(&(!(sum as u16)).to_be_bytes());
+  let mut header=0u32;
+  for word in ip[..20].chunks_exact(2){
+   header+=u16::from_be_bytes([word[0],word[1]]) as u32;
+  }
+  while header>>16!=0{header=(header&65535)+(header>>16);}
+  ip[10..12].copy_from_slice(&(!(header as u16)).to_be_bytes());
+  bytes
+ }
+ #[test]fn exact_flow_and_live_epoch_required(){
+  let nic=NicRxFence::new(6);let p=packet();
+  assert_eq!(nic.parse_udp_ipv4_authenticated_flow(6,&p,128,
+   [10,0,0,1],[10,0,0,2],8000,9000,|d|Some(d.len())),Ok(5));
+  assert_eq!(nic.parse_udp_ipv4_authenticated_flow(6,&p,128,
+   [10,0,0,1],[10,0,0,2],8000,9000,|_|{
+    nic.begin_quiesce(6).unwrap();Some(1)
+   }),Err(RxFenceError::Stale));
+ }
+ #[test]fn spoofed_mac_port_and_expired_packet_cannot_call_parser(){
+  let nic=NicRxFence::new(6);let mut p=packet();let mut calls=0;
+  assert_eq!(nic.parse_udp_ipv4_authenticated_flow(6,&p,128,
+   [10,0,0,1],[10,0,0,2],8001,9000,|_|{calls+=1;Some(1)}),
+   Err(RxFenceError::Capacity));
+  p[0]=0xff;
+  assert_eq!(nic.parse_udp_ipv4_authenticated_flow(6,&p,128,
+   [10,0,0,1],[10,0,0,2],8000,9000,|_|{calls+=1;Some(1)}),
+   Err(RxFenceError::Capacity));
+  p=packet();p[22]=0;
+  assert_eq!(nic.parse_udp_ipv4_authenticated_flow(6,&p,128,
+   [10,0,0,1],[10,0,0,2],8000,9000,|_|{calls+=1;Some(1)}),
+   Err(RxFenceError::Capacity));
+  assert_eq!(calls,0);
+ }
+}
+
+
+
+/// P0-216..217: accept an exact Ethernet/IPv4 ARP reply only for the
+/// kernel-pinned peer and local interface identities. No user-controlled
+/// MAC, IP, gratuitous request or spoofed target may update a neighbor table.
+/// Caller must stage its neighbor update until this live-RX-epoch guard returns.
+impl NicRxFence{
+ pub fn parse_authenticated_arp_reply<R>(
+  &self,device:u32,frame:&[u8],max_frame:usize,
+  peer_mac:[u8;6],local_mac:[u8;6],peer_ip:[u8;4],local_ip:[u8;4],
+  parse:impl FnOnce()->Option<R>
+ )->Result<R,RxFenceError>{
+  if max_frame<42||frame.len()!=42||frame.len()>max_frame||
+     peer_mac==local_mac||peer_mac==[0;6]||local_mac==[0;6]||
+     peer_mac[0]&1!=0||local_mac[0]&1!=0||
+     peer_ip==local_ip||peer_ip[0]==0||local_ip[0]==0||
+     peer_ip[0]>=224||local_ip[0]>=224||
+     frame[..6]!=local_mac||frame[6..12]!=peer_mac||
+     frame[12..14]!=[0x08,0x06]||
+     frame[14..16]!=[0,1]||frame[16..18]!=[8,0]||
+     frame[18]!=6||frame[19]!=4||frame[20..22]!=[0,2]||
+     frame[22..28]!=peer_mac||frame[28..32]!=peer_ip||
+     frame[32..38]!=local_mac||frame[38..42]!=local_ip{
+    return Err(RxFenceError::Capacity);
+  }
+  self.parse_packet_at_live_epoch(device,parse)
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch11_w5_arp_epoch_tests{
+ use super::*;
+ const PEER:[u8;6]=[2,3,4,5,6,7];
+ const LOCAL:[u8;6]=[2,8,9,10,11,12];
+ fn reply()->[u8;42]{
+  let mut b=[0u8;42];
+  b[..6].copy_from_slice(&LOCAL);
+  b[6..12].copy_from_slice(&PEER);
+  b[12..14].copy_from_slice(&[8,6]);
+  b[14..16].copy_from_slice(&[0,1]);
+  b[16..18].copy_from_slice(&[8,0]);
+  b[18]=6;b[19]=4;b[20..22].copy_from_slice(&[0,2]);
+  b[22..28].copy_from_slice(&PEER);
+  b[28..32].copy_from_slice(&[10,0,0,1]);
+  b[32..38].copy_from_slice(&LOCAL);
+  b[38..42].copy_from_slice(&[10,0,0,2]);
+  b
+ }
+ #[test]fn valid_reply_needs_live_nic_epoch(){
+  let nic=NicRxFence::new(7);let packet=reply();
+  assert_eq!(nic.parse_authenticated_arp_reply(7,&packet,64,
+   PEER,LOCAL,[10,0,0,1],[10,0,0,2],||Some(5)),Ok(5));
+  assert_eq!(nic.parse_authenticated_arp_reply(7,&packet,64,
+   PEER,LOCAL,[10,0,0,1],[10,0,0,2],||{
+    nic.begin_quiesce(7).unwrap();Some(5)
+   }),Err(RxFenceError::Stale));
+ }
+ #[test]fn spoofing_and_wrong_opcode_rejected_before_callback(){
+  let nic=NicRxFence::new(7);let mut packet=reply();let mut calls=0;
+  for index in [6,20,26,32,41]{
+   let original=packet[index];packet[index]^=1;
+   assert_eq!(nic.parse_authenticated_arp_reply(7,&packet,64,
+    PEER,LOCAL,[10,0,0,1],[10,0,0,2],||{
+     calls+=1;Some(1)
+    }),Err(RxFenceError::Capacity));
+   packet[index]=original;
+  }
+  assert_eq!(calls,0);
+ }
+}
+
+
+
+/// P0-241..245: production Ethernet ARP frames are usually padded to the
+/// 60-byte minimum, unlike a 42-byte synthetic parser fixture. Normalize at
+/// most one authenticated 802.1Q VLAN header, require exact VLAN ID, exact
+/// peer/local identities and zero-only trailing padding, then delegate the
+/// actual live NIC ring/epoch admission to the existing strict ARP parser.
+/// The caller commits its neighbor table only AFTER this method succeeds.
+impl NicRxFence{
+ pub fn parse_padded_vlan_arp_reply<R>(
+  &self,device:u32,frame:&[u8],max_frame:usize,
+  expected_vlan:Option<u16>,
+  peer_mac:[u8;6],local_mac:[u8;6],
+  peer_ip:[u8;4],local_ip:[u8;4],
+  parse:impl FnOnce()->Option<R>
+ )->Result<R,RxFenceError>{
+  if frame.len()<42||frame.len()>64||frame.len()>max_frame{
+   return Err(RxFenceError::Capacity);
+  }
+  let data=match expected_vlan{
+   Some(vlan)=>{
+    if vlan==0||vlan>=4095||frame.len()<46||
+       frame[12..14]!=[0x81,0x00]||frame[16..18]!=[0x08,0x06]{
+     return Err(RxFenceError::Capacity);
+    }
+    let tag=u16::from_be_bytes([frame[14],frame[15]]);
+    // Reject unexpected priority and DEI bits as well as a foreign VLAN.
+    if tag!=vlan{return Err(RxFenceError::Capacity);}
+    18
+   },
+   None=>{
+    if frame[12..14]!=[0x08,0x06]{return Err(RxFenceError::Capacity);}
+    14
+   }
+  };
+  if frame[data+28..].iter().any(|&byte|byte!=0){
+   return Err(RxFenceError::Capacity);
+  }
+  let mut normalized=[0u8;42];
+  normalized[..12].copy_from_slice(&frame[..12]);
+  normalized[12..14].copy_from_slice(&[0x08,0x06]);
+  normalized[14..].copy_from_slice(&frame[data..data+28]);
+  self.parse_authenticated_arp_reply(
+   device,&normalized,max_frame,peer_mac,local_mac,peer_ip,local_ip,parse)
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch12_w5_padded_vlan_arp_tests{
+ use super::*;
+ const PEER:[u8;6]=[2,3,4,5,6,7];
+ const LOCAL:[u8;6]=[2,8,9,10,11,12];
+ const PEER_IP:[u8;4]=[10,0,0,1];
+ const LOCAL_IP:[u8;4]=[10,0,0,2];
+ fn plain()->[u8;60]{
+  let mut out=[0u8;60];
+  out[..6].copy_from_slice(&LOCAL);
+  out[6..12].copy_from_slice(&PEER);
+  out[12..14].copy_from_slice(&[8,6]);
+  out[14..16].copy_from_slice(&[0,1]);
+  out[16..18].copy_from_slice(&[8,0]);
+  out[18]=6;out[19]=4;
+  out[20..22].copy_from_slice(&[0,2]);
+  out[22..28].copy_from_slice(&PEER);
+  out[28..32].copy_from_slice(&PEER_IP);
+  out[32..38].copy_from_slice(&LOCAL);
+  out[38..42].copy_from_slice(&LOCAL_IP);
+  out
+ }
+ fn vlan()->[u8;60]{
+  let p=plain();let mut out=[0u8;60];
+  out[..12].copy_from_slice(&p[..12]);
+  out[12..14].copy_from_slice(&[0x81,0]);
+  out[14..16].copy_from_slice(&100u16.to_be_bytes());
+  out[16..18].copy_from_slice(&[8,6]);
+  out[18..46].copy_from_slice(&p[14..42]);
+  out
+ }
+ #[test]fn padded_ethernet_and_one_trusted_vlan_both_admit(){
+  let f=NicRxFence::new(5);
+  assert_eq!(f.parse_padded_vlan_arp_reply(
+   5,&plain(),64,None,PEER,LOCAL,PEER_IP,LOCAL_IP,||Some(3)),Ok(3));
+  assert_eq!(f.parse_padded_vlan_arp_reply(
+   5,&vlan(),64,Some(100),PEER,LOCAL,PEER_IP,LOCAL_IP,||Some(4)),Ok(4));
+ }
+ #[test]fn foreign_vlan_dirty_padding_and_peer_spoof_fail_before_callback(){
+  let f=NicRxFence::new(5);let mut calls=0;
+  let mut p=plain();p[56]=99;
+  assert_eq!(f.parse_padded_vlan_arp_reply(
+   5,&p,64,None,PEER,LOCAL,PEER_IP,LOCAL_IP,
+   ||{calls+=1;Some(1)}),Err(RxFenceError::Capacity));
+  let mut p=vlan();p[14]=0x10;
+  assert_eq!(f.parse_padded_vlan_arp_reply(
+   5,&p,64,Some(100),PEER,LOCAL,PEER_IP,LOCAL_IP,
+   ||{calls+=1;Some(1)}),Err(RxFenceError::Capacity));
+  assert_eq!(f.parse_padded_vlan_arp_reply(
+   5,&vlan(),64,Some(101),PEER,LOCAL,PEER_IP,LOCAL_IP,
+   ||{calls+=1;Some(1)}),Err(RxFenceError::Capacity));
+  assert_eq!(f.parse_padded_vlan_arp_reply(
+   5,&plain(),64,None,PEER,LOCAL,[10,0,0,3],LOCAL_IP,
+   ||{calls+=1;Some(1)}),Err(RxFenceError::Capacity));
+  assert_eq!(calls,0);
+ }
+ #[test]fn ring_teardown_during_parse_revokes_arp_result(){
+  let f=NicRxFence::new(5);
+  assert_eq!(f.parse_padded_vlan_arp_reply(
+   5,&plain(),64,None,PEER,LOCAL,PEER_IP,LOCAL_IP,||{
+    f.begin_quiesce(5).unwrap();Some(1)
+   }),Err(RxFenceError::Stale));
+ }
+}
+
+
+/// P0-295..297: independently verify the full Ethernet+IPv4+ICMP echo
+/// reply before allowing a decode result to escape a live NIC RX generation.
+/// Only a pinned unicast peer, exact echo identifier/sequence and valid
+/// Internet checksums may pass. Packet parsing has no neighbor-table effects.
+fn internet_checksum_valid(bytes:&[u8])->bool{
+ let mut sum=0u32;
+ for word in bytes.chunks(2){
+  let hi=word[0] as u32;
+  let lo=if word.len()==2{word[1] as u32}else{0};
+  sum+=hi*256+lo;
+ }
+ while sum>>16!=0{sum=(sum&0xffff)+(sum>>16);}
+ sum==0xffff
+}
+impl NicRxFence{
+ pub fn parse_authenticated_icmp_echo_reply<R>(
+  &self,device:u32,frame:&[u8],max_frame:usize,
+  peer_mac:[u8;6],local_mac:[u8;6],
+  peer_ip:[u8;4],local_ip:[u8;4],id:u16,sequence:u16,
+  parse:impl FnOnce()->Option<R>
+ )->Result<R,RxFenceError>{
+  if frame.len()<42||frame.len()>max_frame||max_frame>1518||
+     frame[..6]!=local_mac||frame[6..12]!=peer_mac||
+     peer_mac[0]&1!=0||local_mac[0]&1!=0||
+     peer_mac==local_mac||peer_ip==local_ip||
+     peer_ip[0]==0||local_ip[0]==0||
+     peer_ip[0]>=224||local_ip[0]>=224||
+     frame[12..14]!=[8,0]||frame[14]!=0x45||
+     frame[15]!=0||frame[22]==0||frame[23]!=1||
+     frame[26..30]!=peer_ip||frame[30..34]!=local_ip||
+     u16::from_be_bytes([frame[20],frame[21]])&0xbfff!=0||
+     !internet_checksum_valid(&frame[14..34]){
+   return Err(RxFenceError::Capacity);
+  }
+  let total=u16::from_be_bytes([frame[16],frame[17]]) as usize;
+  if total<28||total>1500{return Err(RxFenceError::Capacity);}
+  let end=14+total;
+  if end>frame.len()||frame[end..].iter().any(|&b|b!=0){
+   return Err(RxFenceError::Capacity);
+  }
+  let icmp=&frame[34..end];
+  if icmp[0]!=0||icmp[1]!=0||
+     icmp[4..6]!=id.to_be_bytes()||
+     icmp[6..8]!=sequence.to_be_bytes()||
+     !internet_checksum_valid(icmp){
+   return Err(RxFenceError::Capacity);
+  }
+  self.parse_packet_at_live_epoch(device,parse)
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch14_w5_icmp_epoch_tests{
+ use super::*;
+ const PEER:[u8;6]=[2,3,4,5,6,7];
+ const LOCAL:[u8;6]=[2,8,9,10,11,12];
+ const PEER_IP:[u8;4]=[10,0,0,1];
+ const LOCAL_IP:[u8;4]=[10,0,0,2];
+ fn set_checksum(bytes:&mut[u8],offset:usize){
+  bytes[offset]=0;bytes[offset+1]=0;
+  let mut sum=0u32;
+  for word in bytes.chunks(2){
+   sum+=(word[0] as u32)*256+
+    if word.len()==2{word[1] as u32}else{0};
+  }
+  while sum>>16!=0{sum=(sum&0xffff)+(sum>>16);}
+  let c=!(sum as u16);
+  bytes[offset..offset+2].copy_from_slice(&c.to_be_bytes());
+ }
+ fn packet()->[u8;60]{
+  let mut frame=[0u8;60];
+  frame[..6].copy_from_slice(&LOCAL);frame[6..12].copy_from_slice(&PEER);
+  frame[12..14].copy_from_slice(&[8,0]);
+  frame[14]=0x45;frame[16..18].copy_from_slice(&28u16.to_be_bytes());
+  frame[22]=64;frame[23]=1;
+  frame[26..30].copy_from_slice(&PEER_IP);
+  frame[30..34].copy_from_slice(&LOCAL_IP);
+  set_checksum(&mut frame[14..34],10);
+  frame[34]=0;frame[35]=0;
+  frame[38..40].copy_from_slice(&42u16.to_be_bytes());
+  frame[40..42].copy_from_slice(&7u16.to_be_bytes());
+  set_checksum(&mut frame[34..42],2);
+  frame
+ }
+ #[test]fn checksum_and_exact_echo_peer_accept_under_live_epoch(){
+  let f=NicRxFence::new(17);let p=packet();
+  assert_eq!(f.parse_authenticated_icmp_echo_reply(17,&p,64,
+   PEER,LOCAL,PEER_IP,LOCAL_IP,42,7,||Some(2)),Ok(2));
+  assert_eq!(f.parse_authenticated_icmp_echo_reply(17,&p,64,
+   PEER,LOCAL,PEER_IP,LOCAL_IP,42,7,||{
+    f.begin_quiesce(17).unwrap();Some(3)
+   }),Err(RxFenceError::Stale));
+ }
+ #[test]fn spoofed_checksum_payload_and_echo_sequence_do_not_enter_decoder(){
+  let f=NicRxFence::new(17);let mut p=packet();let mut calls=0;
+  for index in [6usize,26,36,40,59]{
+   let before=p[index];p[index]^=1;
+   assert_eq!(f.parse_authenticated_icmp_echo_reply(17,&p,64,
+     PEER,LOCAL,PEER_IP,LOCAL_IP,42,7,||{calls+=1;Some(1)}),
+     Err(RxFenceError::Capacity));
+   p[index]=before;
+  }
+  assert_eq!(f.parse_authenticated_icmp_echo_reply(17,&p,64,
+   PEER,LOCAL,PEER_IP,LOCAL_IP,42,8,||{calls+=1;Some(1)}),
+   Err(RxFenceError::Capacity));
+  assert_eq!(calls,0);
+ }
+}

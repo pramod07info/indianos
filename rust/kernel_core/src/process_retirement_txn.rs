@@ -1013,3 +1013,282 @@ mod m1_ws20_exact_ingress_snapshot_tests {
   assert_eq!(nic.finish_rebind(quiesce),Ok(2));
  }
 }
+
+
+
+/// P0-205..208: bind process teardown to the ingress epoch captured
+/// before the trusted scheduler chose its victims. A rebind/start occurring
+/// after capture invalidates the whole batch, including live socket cleanup.
+/// The caller holds the exclusive PCB/socket scheduler lock throughout.
+impl<const C:usize,const U:usize,const E:usize> ProcessRetirement<C,U,E>{
+ pub fn retire_ingress_pinned_exited_batch<const P:usize,const Q:usize>(
+  &mut self,sockets:&mut EpochUdpEndpoints<P,Q>,snapshot:IngressRevision,
+  owners:&[Owner]
+ )->Result<RetirementReceipt,RetirementError>{
+  if snapshot.0!=self.ingress_revision{
+   return Err(RetirementError::Sockets(SocketError::Denied));
+  }
+  if owners.is_empty()||owners.len()>C{
+   return Err(RetirementError::Capabilities(EpochError::Denied));
+  }
+  for (i,owner) in owners.iter().enumerate(){
+   if owner.pid<=1||owner.generation==0||
+      owners[..i].iter().any(|previous|previous.pid==owner.pid){
+    return Err(RetirementError::Capabilities(EpochError::Denied));
+   }
+   self.require_active(*owner)?;
+  }
+  self.retire_live_exited_batch(sockets,owners)
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch11_w2_ingress_retirement_tests{
+ use super::*;
+ #[test]fn stale_ingress_snapshot_does_not_retire_or_notify(){
+  let mut k=ProcessRetirement::<4,4,4>::new();
+  let mut sockets=EpochUdpEndpoints::<4,4>::new();
+  let a=k.start(2).unwrap();
+  k.bind_live_udp(&mut sockets,a,3202).unwrap();
+  let old=k.capture_polled_ingress_revision();
+  let b=k.start(3).unwrap();
+  assert_eq!(k.retire_ingress_pinned_exited_batch(
+   &mut sockets,old,&[a]),Err(RetirementError::Sockets(SocketError::Denied)));
+  assert_eq!(k.active_generation(a.pid),Some(a.generation));
+  assert_eq!(k.queued_notices(),0);
+  assert_eq!(k.active_udp_ports(),1);
+  let fresh=k.capture_polled_ingress_revision();
+  assert_eq!(k.retire_ingress_pinned_exited_batch(
+   &mut sockets,fresh,&[a,a]),Err(RetirementError::Capabilities(EpochError::Denied)));
+  assert_eq!(k.retire_ingress_pinned_exited_batch(
+   &mut sockets,fresh,&[Owner{pid:1,generation:1}]),
+   Err(RetirementError::Capabilities(EpochError::Denied)));
+  assert_eq!(k.active_generation(b.pid),Some(b.generation));
+  assert_eq!(k.queued_notices(),0);
+ }
+ #[test]fn exact_epoch_retirement_commits_socket_and_notice_together(){
+  let mut k=ProcessRetirement::<4,4,4>::new();
+  let mut sockets=EpochUdpEndpoints::<4,4>::new();
+  let a=k.start(2).unwrap();
+  k.bind_live_udp(&mut sockets,a,3202).unwrap();
+  let snapshot=k.capture_polled_ingress_revision();
+  let receipt=k.retire_ingress_pinned_exited_batch(
+   &mut sockets,snapshot,&[a]).unwrap();
+  assert_eq!(receipt.udp_ports_released,1);
+  assert_eq!(receipt.notices_enqueued,1);
+  assert_eq!(k.active_udp_ports(),0);
+  assert_eq!(k.queued_notices(),1);
+  assert_ne!(k.capture_polled_ingress_revision(),snapshot);
+  assert_eq!(k.retire_ingress_pinned_exited_batch(
+   &mut sockets,snapshot,&[a]),Err(RetirementError::Sockets(SocketError::Denied)));
+ }
+}
+
+
+
+/// P0-226..230: one exclusive scheduler transaction can retire live socket
+/// ownership, kernel grants, event notices AND generation-tagged IPC.
+/// The trusted caller must hold its PCB, router and socket locks across this
+/// method. All stores are staged so late IPC failure cannot half-retire a PID.
+#[derive(Debug,Clone,Copy,PartialEq,Eq)]
+pub enum ExitWithIpcError{
+ Retirement(RetirementError),
+ Ipc(crate::ipc::IpcError),
+}
+impl<const C:usize,const U:usize,const E:usize> ProcessRetirement<C,U,E>{
+ pub fn retire_pinned_exited_with_ipc<
+  const P:usize,const Q:usize,const M:usize,const D:usize
+ >(
+  &mut self,sockets:&mut EpochUdpEndpoints<P,Q>,
+  ipc:&mut crate::ipc::ScopedRouter<M,D>,snapshot:IngressRevision,
+  owners:&[Owner]
+ )->Result<RetirementReceipt,ExitWithIpcError>{
+  let mut staged_self=self.clone();
+  let mut staged_sockets=sockets.clone();
+  let mut staged_ipc=ipc.clone();
+  let receipt=staged_self.retire_ingress_pinned_exited_batch(
+   &mut staged_sockets,snapshot,owners)
+   .map_err(ExitWithIpcError::Retirement)?;
+  for owner in owners{
+   // IPC's exact generation prevents reincarnated PIDs inheriting messages.
+   let identity=crate::batch5_session::Identity{
+    pid:owner.pid,generation:owner.generation,
+   };
+   staged_ipc.reap(identity).map_err(ExitWithIpcError::Ipc)?;
+  }
+  *self=staged_self;
+  *sockets=staged_sockets;
+  *ipc=staged_ipc;
+  Ok(receipt)
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch12_w2_atomic_exit_ipc_tests{
+ use super::*;
+ use crate::ipc::{IpcError,ScopedRouter};
+ use crate::batch5_session::Identity;
+ fn ident(o:Owner)->Identity{
+  Identity{pid:o.pid,generation:o.generation}
+ }
+ #[test]fn successful_retirement_cleans_sender_and_receiver_mailboxes(){
+  let mut policy=ProcessRetirement::<4,4,4>::new();
+  let mut sockets=EpochUdpEndpoints::<4,4>::new();
+  let mut ipc=ScopedRouter::<4,3>::new().unwrap();
+  let victim=policy.start(2).unwrap();
+  let survivor=policy.start(3).unwrap();
+  policy.bind_live_udp(&mut sockets,victim,3212).unwrap();
+  ipc.register(ident(victim)).unwrap();
+  ipc.register(ident(survivor)).unwrap();
+  ipc.send(ident(victim),ident(survivor),b"old").unwrap();
+  ipc.send(ident(survivor),ident(victim),b"pending").unwrap();
+  let rev=policy.capture_polled_ingress_revision();
+  let result=policy.retire_pinned_exited_with_ipc(
+   &mut sockets,&mut ipc,rev,&[victim]).unwrap();
+  assert_eq!(result.notices_enqueued,1);
+  assert_eq!(result.udp_ports_released,1);
+  assert_eq!(policy.active_udp_ports(),0);
+  assert_eq!(policy.queued_notices(),1);
+  assert_eq!(ipc.pending(ident(victim)),Err(IpcError::UnknownReceiver));
+  assert_eq!(ipc.pending(ident(survivor)),Ok(0));
+  assert_eq!(policy.active_generation(survivor.pid),Some(survivor.generation));
+ }
+ #[test]fn late_missing_ipc_mailbox_rolls_back_other_three_stores(){
+  let mut policy=ProcessRetirement::<4,4,4>::new();
+  let mut sockets=EpochUdpEndpoints::<4,4>::new();
+  let mut ipc=ScopedRouter::<4,3>::new().unwrap();
+  let victim=policy.start(2).unwrap();
+  let survivor=policy.start(3).unwrap();
+  policy.bind_live_udp(&mut sockets,victim,3212).unwrap();
+  ipc.register(ident(survivor)).unwrap();
+  let rev=policy.capture_polled_ingress_revision();
+  assert_eq!(policy.retire_pinned_exited_with_ipc(
+   &mut sockets,&mut ipc,rev,&[victim]),
+   Err(ExitWithIpcError::Ipc(IpcError::UnknownReceiver)));
+  assert_eq!(policy.active_generation(victim.pid),Some(victim.generation));
+  assert_eq!(policy.queued_notices(),0);
+  assert_eq!(policy.active_udp_ports(),1);
+  assert_eq!(ipc.pending(ident(survivor)),Ok(0));
+  ipc.register(ident(victim)).unwrap();
+  assert_eq!(policy.retire_pinned_exited_with_ipc(
+   &mut sockets,&mut ipc,rev,&[victim,victim]),
+   Err(ExitWithIpcError::Retirement(
+    RetirementError::Capabilities(EpochError::Denied))));
+  assert_eq!(policy.active_udp_ports(),1);
+  assert_eq!(policy.queued_notices(),0);
+ }
+ #[test]fn retired_snapshot_never_mutates_live_ipc_or_sockets(){
+  let mut policy=ProcessRetirement::<4,4,4>::new();
+  let mut sockets=EpochUdpEndpoints::<4,4>::new();
+  let mut ipc=ScopedRouter::<4,3>::new().unwrap();
+  let victim=policy.start(2).unwrap();
+  ipc.register(ident(victim)).unwrap();
+  let stale=policy.capture_polled_ingress_revision();
+  policy.start(3).unwrap();
+  assert_eq!(policy.retire_pinned_exited_with_ipc(
+   &mut sockets,&mut ipc,stale,&[victim]),
+   Err(ExitWithIpcError::Retirement(
+    RetirementError::Sockets(SocketError::Denied))));
+  assert_eq!(ipc.pending(ident(victim)),Ok(0));
+  assert_eq!(policy.active_generation(victim.pid),Some(victim.generation));
+  assert_eq!(policy.queued_notices(),0);
+ }
+}
+
+
+
+/// P0-256..260: faulted PCB teardown must use the same atomic four-store
+/// transaction as graceful exit. The active owner, IPC mailbox and UDP
+/// generation are never mutated when late-stage IPC reaping fails.
+/// Caller retains the exclusive scheduler/socket/IPC lock throughout.
+impl<const C:usize,const U:usize,const E:usize> ProcessRetirement<C,U,E>{
+ pub fn retire_pinned_faulted_with_ipc<
+  const P:usize,const Q:usize,const M:usize,const D:usize
+ >(
+  &mut self,sockets:&mut EpochUdpEndpoints<P,Q>,
+  ipc:&mut crate::ipc::ScopedRouter<M,D>,snapshot:IngressRevision,
+  owners:&[Owner]
+ )->Result<RetirementReceipt,ExitWithIpcError>{
+  if snapshot.0!=self.ingress_revision{
+   return Err(ExitWithIpcError::Retirement(
+    RetirementError::Sockets(SocketError::Denied)));
+  }
+  if owners.is_empty()||owners.len()>C{
+   return Err(ExitWithIpcError::Retirement(
+    RetirementError::Capabilities(EpochError::Denied)));
+  }
+  for (i,owner) in owners.iter().enumerate(){
+   if owner.pid<=1||owner.generation==0||
+      owners[..i].iter().any(|old|old.pid==owner.pid){
+    return Err(ExitWithIpcError::Retirement(
+     RetirementError::Capabilities(EpochError::Denied)));
+   }
+   self.require_active(*owner).map_err(ExitWithIpcError::Retirement)?;
+  }
+  let mut staged_self=self.clone();
+  let mut staged_sockets=sockets.clone();
+  let mut staged_ipc=ipc.clone();
+  let receipt=staged_self.retire_live_faulted_batch(
+   &mut staged_sockets,owners).map_err(ExitWithIpcError::Retirement)?;
+  for owner in owners{
+   staged_ipc.reap(crate::batch5_session::Identity{
+    pid:owner.pid,generation:owner.generation,
+   }).map_err(ExitWithIpcError::Ipc)?;
+  }
+  *self=staged_self;*sockets=staged_sockets;*ipc=staged_ipc;
+  Ok(receipt)
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch13_w2_faulted_retirement_tests{
+ use super::*;
+ use crate::ipc::{IpcError,ScopedRouter};
+ use crate::batch5_session::Identity;
+ fn identity(o:Owner)->Identity{Identity{pid:o.pid,generation:o.generation}}
+ #[test]fn faulted_exit_reaps_socket_ipc_and_enqueues_one_notice(){
+  let mut policy=ProcessRetirement::<4,4,4>::new();
+  let mut sockets=EpochUdpEndpoints::<4,4>::new();
+  let mut ipc=ScopedRouter::<4,2>::new().unwrap();
+  let victim=policy.start(2).unwrap();let live=policy.start(3).unwrap();
+  ipc.register(identity(victim)).unwrap();
+  ipc.register(identity(live)).unwrap();
+  ipc.send(identity(victim),identity(live),b"old").unwrap();
+  policy.bind_live_udp(&mut sockets,victim,3400).unwrap();
+  let revision=policy.capture_polled_ingress_revision();
+  let receipt=policy.retire_pinned_faulted_with_ipc(
+   &mut sockets,&mut ipc,revision,&[victim]).unwrap();
+  assert_eq!(receipt.notices_enqueued,1);
+  assert_eq!(receipt.udp_ports_released,1);
+  assert_eq!(policy.queued_notices(),1);
+  assert_eq!(policy.active_udp_ports(),0);
+  assert_eq!(ipc.pending(identity(victim)),Err(IpcError::UnknownReceiver));
+  assert_eq!(ipc.pending(identity(live)),Ok(0));
+ }
+ #[test]fn missing_ipc_owner_aborts_capabilities_and_udp_and_notices(){
+  let mut policy=ProcessRetirement::<4,4,4>::new();
+  let mut sockets=EpochUdpEndpoints::<4,4>::new();
+  let mut ipc=ScopedRouter::<4,2>::new().unwrap();
+  let victim=policy.start(2).unwrap();
+  policy.bind_live_udp(&mut sockets,victim,3400).unwrap();
+  let revision=policy.capture_polled_ingress_revision();
+  assert_eq!(policy.retire_pinned_faulted_with_ipc(
+   &mut sockets,&mut ipc,revision,&[victim]),
+   Err(ExitWithIpcError::Ipc(IpcError::UnknownReceiver)));
+  assert_eq!(policy.active_udp_ports(),1);
+  assert_eq!(policy.queued_notices(),0);
+  assert_eq!(policy.active_generation(victim.pid),Some(victim.generation));
+ }
+ #[test]fn invalid_snapshot_and_pid1_protection_fail_without_mutation(){
+  let mut policy=ProcessRetirement::<4,4,4>::new();
+  let mut sockets=EpochUdpEndpoints::<4,4>::new();
+  let mut ipc=ScopedRouter::<4,2>::new().unwrap();
+  let victim=policy.start(2).unwrap();
+  ipc.register(identity(victim)).unwrap();
+  let stale=policy.capture_polled_ingress_revision();policy.start(3).unwrap();
+  assert!(policy.retire_pinned_faulted_with_ipc(
+   &mut sockets,&mut ipc,stale,&[victim]).is_err());
+  let fresh=policy.capture_polled_ingress_revision();
+  assert!(policy.retire_pinned_faulted_with_ipc(
+   &mut sockets,&mut ipc,fresh,&[Owner{pid:1,generation:1}]).is_err());
+  assert_eq!(ipc.pending(identity(victim)),Ok(0));
+  assert_eq!(policy.queued_notices(),0);
+ }
+}

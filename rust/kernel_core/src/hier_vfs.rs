@@ -2298,3 +2298,66 @@ mod m1_batch04_w1_vfs_tests{
   assert!(recovered.read_as(bob,"/home/out",&mut output).is_err());
  }
 }
+
+
+/// P0 W4: two independent authenticated durable reads from one exact
+/// COW generation, with no partial output on a late bad path or disk error.
+/// The real mount owner must serialize this operation against concurrent
+/// writers/remounts; this is not a cross-BSP mount lock.
+impl<D:BlockDevice> HierVfs<D>{
+ pub fn read_pair_as_at_generation(&mut self,owner:Credentials,
+  first:&str,second:&str,expected_generation:u64,
+  out_first:&mut[u8],out_second:&mut[u8])->Result<(usize,usize),FsError>{
+  if expected_generation==0||self.generation()!=expected_generation||
+    first==second{return Err(FsError::InvalidName);}
+  let mut a=[0u8;MAX_FILE_BYTES];
+  let mut b=[0u8;MAX_FILE_BYTES];
+  let na=self.read_as(owner,first,&mut a)?;
+  let nb=self.read_as(owner,second,&mut b)?;
+  if self.generation()!=expected_generation{return Err(FsError::InvalidVolume);}
+  if out_first.len()<na||out_second.len()<nb{return Err(FsError::TooLarge);}
+  out_first[..na].copy_from_slice(&a[..na]);
+  out_second[..nb].copy_from_slice(&b[..nb]);
+  Ok((na,nb))
+ }
+}
+#[cfg(test)]
+mod kernel_p0_w4_cow_snapshot_tests{
+ use super::*;
+ use crate::block::{BlockError,SECTOR_BYTES};
+ const COUNT:usize=100;
+ struct Disk([[u8;SECTOR_BYTES];COUNT]);
+ impl BlockDevice for Disk{
+  fn sector_count(&self)->u64{COUNT as u64}
+  fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   *out=*self.0.get(lba as usize).ok_or(BlockError::OutOfRange)?;Ok(())
+  }
+  fn write_sector(&mut self,lba:u64,bytes:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   *self.0.get_mut(lba as usize).ok_or(BlockError::OutOfRange)?=*bytes;Ok(())
+  }
+ }
+ #[test]fn two_files_read_after_cold_remount_without_partial_publication(){
+  let root=Credentials::kernel(0,0);
+  let alice=Credentials::kernel(17,7);
+  let bob=Credentials::kernel(18,8);
+  let mut fs=HierVfs::format_blank(Disk([[0u8;SECTOR_BYTES];COUNT])).unwrap();
+  fs.mkdir_as(root,"/home",0o777).unwrap();
+  fs.create_as(alice,"/home/one",b"123",0o600).unwrap();
+  fs.create_as(alice,"/home/two",b"4567",0o600).unwrap();
+  let mut fs=HierVfs::mount_consistent_recovery(fs.into_device()).unwrap();
+  let generation=fs.generation();
+  let mut first=[91u8;8];let mut second=[92u8;8];
+  assert_eq!(fs.read_pair_as_at_generation(alice,"/home/one",
+    "/home/missing",generation,&mut first,&mut second),Err(FsError::NotFound));
+  assert_eq!(first,[91;8]);assert_eq!(second,[92;8]);
+  assert!(fs.read_pair_as_at_generation(bob,"/home/one","/home/two",
+    generation,&mut first,&mut second).is_err());
+  assert_eq!(first,[91;8]);assert_eq!(second,[92;8]);
+  assert!(fs.read_pair_as_at_generation(alice,"/home/one","/home/two",
+    generation+1,&mut first,&mut second).is_err());
+  assert_eq!(fs.read_pair_as_at_generation(alice,"/home/one","/home/two",
+    generation,&mut first,&mut second),Ok((3,4)));
+  assert_eq!(&first[..3],b"123");
+  assert_eq!(&second[..4],b"4567");
+ }
+}

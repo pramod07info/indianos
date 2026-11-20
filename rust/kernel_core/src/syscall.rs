@@ -58,7 +58,10 @@ pub struct SyscallRequest {
 pub(crate) fn user_range(plan: &ProgramPlan, address: u64, length: u64, write: bool) -> bool {
     if length == 0 || address < USER_MIN || address >= USER_TOP ||
         length > USER_TOP - address ||
-        plan.segment_count as usize > MAX_SEGMENTS {
+        plan.segment_count as usize > MAX_SEGMENTS ||
+        plan.stack_begin < USER_MIN ||
+        plan.stack_end > USER_TOP ||
+        plan.stack_begin >= plan.stack_end {
         return false;
     }
     // A malformed overlapping segment cannot reauthorize the protected
@@ -76,7 +79,7 @@ pub(crate) fn user_range(plan: &ProgramPlan, address: u64, length: u64, write: b
     for seg in plan.segments.iter().take((plan.segment_count as usize).min(MAX_SEGMENTS)) {
         if address >= seg.page_begin && address < seg.page_end &&
             seg.page_end.checked_sub(address).is_some_and(|available| length <= available) &&
-            (!write || seg.writable) {
+            (!write || (seg.writable && !seg.executable)) {
             return true;
         }
     }
@@ -184,11 +187,17 @@ pub(crate) fn ring3_frame_valid(
     const IOPL: u64 = 3 << 12;
     const NT: u64 = 1 << 14;
     const VM: u64 = 1 << 17;
+    // x86-64 IRETQ must not import reserved high RFLAGS from a user
+    // snapshot. Bit 1 is fixed; bits 3, 5, 15 and 22..63 are reserved.
+    const RESERVED:u64=(1<<3)|(1<<5)|(1<<15)|(!0u64<<22);
+    // Reject user snapshots requiring unimplemented debug/alignment and
+    // direction-flag trap semantics. Ordinary IRQ-enabled ring3 is allowed.
+    const UNSUPPORTED:u64=(1<<8)|(1<<10)|(1<<16)|(1<<18);
     let (rip, cs, flags, rsp, ss) =
         (frame[15], frame[16], frame[17], frame[18], frame[19]);
     cs == 0x2b && ss == 0x33 &&
         flags & FIXED != 0 &&
-        flags & (IOPL | NT | VM) == 0 &&
+        flags & (IOPL | NT | VM | RESERVED | UNSUPPORTED) == 0 &&
         (flags & IF != 0) == irq_enabled &&
         (USER_MIN..USER_TOP).contains(&rip) &&
         plan.stack_begin >= USER_MIN && plan.stack_end <= USER_TOP &&
@@ -601,4 +610,210 @@ pub(crate) fn user_copy_batch_valid(plan:&ProgramPlan,spans:&[CopySpan])->bool{
   assert!(!user_copy_batch_valid(&p,&[CopySpan{
     address:USER_MIN,length:1,writable:false};MAX_SEGMENTS+1]));
  }
+}
+
+
+/// P0 follow-up W2: opt-in strict ring-3 executable-page admission.
+/// The live trap path still uses ring3_frame_valid and MUST be upgraded
+/// before this strict policy can count as a production NX/W^X guarantee.
+/// No hardware page tables are changed by this numeric check.
+pub(crate) fn ring3_frame_strict_execution(
+ frame:&[u64;20],plan:&ProgramPlan,irq_enabled:bool)->bool{
+ if !ring3_frame_valid(frame,plan,irq_enabled)||
+    plan.segment_count==0||plan.segment_count as usize>MAX_SEGMENTS||
+    plan.guard_begin.checked_add(PAGE_BYTES)!=Some(plan.stack_begin)||
+    frame[18]>=plan.stack_end{
+  return false;
+ }
+ let rip=frame[15];
+ let mut entry_executable=false;let mut rip_executable=false;
+ let count=plan.segment_count as usize;
+ for (i,segment) in plan.segments[..count].iter().enumerate(){
+  if segment.page_begin<USER_MIN||segment.page_end>USER_TOP||
+     segment.page_begin>=segment.page_end||
+     segment.page_begin%PAGE_BYTES!=0||segment.page_end%PAGE_BYTES!=0||
+     segment.virtual_address<segment.page_begin||
+     segment.memory_size==0||segment.file_size>segment.memory_size||
+     segment.virtual_address.checked_add(segment.memory_size)
+        .is_none_or(|end|end>segment.page_end)||
+     (segment.executable&&segment.writable)||
+     (segment.page_begin<plan.stack_end&&plan.stack_begin<segment.page_end)||
+     (segment.page_begin<plan.guard_begin+PAGE_BYTES&&
+      plan.guard_begin<segment.page_end){
+   return false;
+  }
+  for other in &plan.segments[..i]{
+   if segment.page_begin<other.page_end&&other.page_begin<segment.page_end{
+    return false; // shared pages cannot silently override NX/guard rights
+   }
+  }
+  if segment.executable{
+   if let Some(end)=segment.virtual_address.checked_add(segment.memory_size){
+    if (segment.virtual_address..end).contains(&rip){rip_executable=true;}
+    if (segment.virtual_address..end).contains(&plan.entry){
+     entry_executable=true;
+    }
+   }
+  }
+ }
+ entry_executable&&rip_executable
+}
+#[cfg(test)]
+mod kernel_p0_next_w2_userexec_tests{
+ use super::*;
+ fn base()->ProgramPlan{
+  let mut p=ProgramPlan{entry:USER_MIN,
+   stack_begin:USER_TOP-STACK_BYTES,stack_end:USER_TOP,
+   guard_begin:USER_TOP-STACK_BYTES-PAGE_BYTES,
+   segment_count:1,segments:[ProgramSegment::empty();MAX_SEGMENTS]};
+  p.segments[0]=ProgramSegment{
+   virtual_address:USER_MIN,file_offset:0,file_size:16,
+   memory_size:PAGE_BYTES,page_begin:USER_MIN,page_end:USER_MIN+PAGE_BYTES,
+   writable:false,executable:true};
+  p
+ }
+ fn frame(p:&ProgramPlan)->[u64;20]{
+  let mut f=[0u64;20];
+  f[15]=USER_MIN;f[16]=0x2b;f[17]=0x2;f[18]=p.stack_end-8;f[19]=0x33;f
+ }
+ #[test]fn executable_segment_admitted_but_nx_or_writable_code_denied(){
+  let mut p=base();let f=frame(&p);
+  assert!(ring3_frame_strict_execution(&f,&p,false));
+  p.segments[0].executable=false;
+  assert!(!ring3_frame_strict_execution(&f,&p,false));
+  p.segments[0].executable=true;p.segments[0].writable=true;
+  assert!(!ring3_frame_strict_execution(&f,&p,false));
+ }
+ #[test]fn overlapping_segment_guard_and_widened_rip_are_denied(){
+  let mut p=base();let f=frame(&p);
+  p.segment_count=2;p.segments[1]=ProgramSegment{
+   virtual_address:USER_MIN+PAGE_BYTES/2,
+   page_begin:USER_MIN,page_end:USER_MIN+PAGE_BYTES,
+   memory_size:PAGE_BYTES/2,executable:false,writable:true,
+   ..ProgramSegment::empty()};
+  assert!(!ring3_frame_strict_execution(&f,&p,false));
+  p=base();p.guard_begin=p.stack_begin;
+  assert!(!ring3_frame_strict_execution(&f,&p,false));
+  p=base();let mut wrong=f;wrong[15]=USER_MIN+PAGE_BYTES*2;
+  assert!(!ring3_frame_strict_execution(&wrong,&p,false));
+  wrong=f;wrong[18]=p.stack_end;
+  assert!(!ring3_frame_strict_execution(&wrong,&p,false));
+ }
+}
+
+
+// P0-495–501: numeric trap admission must reject reserved CPU flags
+// before a later IRET, even without touching user virtual-memory bytes.
+#[cfg(test)]
+mod kernel_p0_batch20_w3_tests{
+    use super::*;
+    fn state()->(ProgramPlan,[u64;20]){
+        let plan=ProgramPlan{
+            entry:USER_MIN,stack_begin:USER_TOP-STACK_BYTES,stack_end:USER_TOP,
+            guard_begin:USER_TOP-STACK_BYTES-PAGE_BYTES,segment_count:0,
+            segments:[ProgramSegment::empty();MAX_SEGMENTS],
+        };
+        let mut regs=[0u64;20];
+        regs[15]=USER_MIN;regs[16]=0x2b;regs[17]=0x2;
+        regs[18]=plan.stack_end-8;regs[19]=0x33;
+        (plan,regs)
+    }
+    #[test]
+    fn kernel_p0_batch20_w3_blocks_reserved_iretq_flags(){
+        let (p,mut f)=state();
+        assert!(ring3_frame_valid(&f,&p,false));
+        for bit in [3,5,15,22,31,63]{
+            f[17]=2u64|(1u64<<bit);
+            assert!(!ring3_frame_valid(&f,&p,false));
+        }
+        f[17]=2;
+        assert!(ring3_frame_valid(&f,&p,false));
+    }
+    #[test]
+    fn kernel_p0_batch20_w3_preserves_interrupt_profile_and_stack(){
+        let (p,mut f)=state();
+        f[17]=0x202;
+        assert!(ring3_frame_valid(&f,&p,true));
+        assert!(!ring3_frame_valid(&f,&p,false));
+        f[18]=p.guard_begin;
+        assert!(!ring3_frame_valid(&f,&p,true));
+        f[18]=p.stack_end-8;
+        assert!(ring3_frame_valid(&f,&p,true));
+    }
+}
+
+
+// P0-535: user memory transfers reject malformed stack extents and
+// writable+executable segment aliases at actual syscall admission.
+#[cfg(test)]
+mod kernel_p0_batch21_w3_tests{
+    use super::*;
+    fn plan()->ProgramPlan{
+        let mut segments=[ProgramSegment::empty();MAX_SEGMENTS];
+        segments[0]=ProgramSegment{
+            page_begin:USER_MIN,page_end:USER_MIN+PAGE_BYTES,
+            writable:true,executable:false,..ProgramSegment::empty()};
+        ProgramPlan{entry:USER_MIN,stack_begin:USER_TOP-STACK_BYTES,
+            stack_end:USER_TOP,guard_begin:USER_TOP-STACK_BYTES-PAGE_BYTES,
+            segment_count:1,segments}
+    }
+    #[test]fn kernel_p0_batch21_w3_malformed_stack_cannot_authorize_segment(){
+        let mut p=plan();
+        assert!(user_range(&p,USER_MIN,1,true));
+        p.stack_end=USER_TOP+PAGE_BYTES;
+        assert!(!user_range(&p,USER_MIN,1,false));
+        p=plan();p.stack_begin=USER_MIN-1;
+        assert!(!user_range(&p,USER_MIN,1,true));
+        p=plan();p.stack_end=p.stack_begin;
+        assert!(!user_range(&p,USER_MIN,1,true));
+    }
+    #[test]fn kernel_p0_batch21_w3_reject_writable_executable_alias(){
+        let mut p=plan();
+        p.segments[0].executable=true;
+        assert!(!user_range(&p,USER_MIN,16,true));
+        assert!(user_range(&p,USER_MIN,16,false));
+        p.segments[0].executable=false;
+        assert!(user_range(&p,USER_MIN,16,true));
+    }
+}
+
+
+// Batch22 W3: strict IRETQ trap policy for currently unsupported user
+// snapshot flags. No claim about actual PTE-based ring3 isolation.
+#[cfg(test)]
+mod kernel_p0_batch22_w3_tests{
+    use super::*;
+    fn plan()->ProgramPlan{
+        ProgramPlan{entry:USER_MIN,
+            stack_begin:USER_TOP-STACK_BYTES,stack_end:USER_TOP,
+            guard_begin:USER_TOP-STACK_BYTES-PAGE_BYTES,
+            segment_count:0,segments:[ProgramSegment::empty();MAX_SEGMENTS]}
+    }
+    fn frame()->[u64;20]{
+        let p=plan();
+        let mut f=[0u64;20];
+        f[15]=USER_MIN;f[16]=0x2b;f[17]=2;
+        f[18]=p.stack_end-16;f[19]=0x33;f
+    }
+    #[test]fn kernel_p0_batch22_w3_567_reject_direction_flag_on_trap(){
+        let p=plan();let mut f=frame();
+        assert!(ring3_frame_valid(&f,&p,false));
+        f[17]|=1<<10;
+        assert!(!ring3_frame_valid(&f,&p,false));
+    }
+    #[test]fn kernel_p0_batch22_w3_568_reject_trap_flag_without_debug_facility(){
+        let p=plan();let mut f=frame();f[17]|=1<<8;
+        assert!(!ring3_frame_valid(&f,&p,false));
+    }
+    #[test]fn kernel_p0_batch22_w3_569_reject_alignment_check(){
+        let p=plan();let mut f=frame();f[17]|=1<<18;
+        assert!(!ring3_frame_valid(&f,&p,false));
+    }
+    #[test]fn kernel_p0_batch22_w3_570_reject_resume_flag_allow_standard_interrupts(){
+        let p=plan();let mut f=frame();f[17]|=1<<16;
+        assert!(!ring3_frame_valid(&f,&p,false));
+        f[17]=0x202;
+        assert!(ring3_frame_valid(&f,&p,true));
+        assert!(!ring3_frame_valid(&f,&p,false));
+    }
 }

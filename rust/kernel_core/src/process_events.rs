@@ -1478,3 +1478,1062 @@ mod m1_batch05_w1_task_manager_tests{
   assert_eq!(output,[(0,pid1),(1,peer)]);
  }
 }
+
+
+// P0 kernel workstream W1: exact AP acknowledgement gates a real, atomic
+// scheduler runqueue eviction. These are the existing software runqueues,
+// not a substitute for physical IPI delivery or MMU TLB invalidation.
+#[derive(Debug,Clone,Copy,Eq,PartialEq)]
+pub enum ReclaimError{
+ InvalidOwner,
+ Ap(crate::smp_lifecycle_fence::FenceError),
+ Queue(DispatchError),
+}
+impl<const C:usize,const N:usize> CoreRunQueues<C,N>{
+ pub fn retire_after_ap_reclaim_barrier(&mut self,supervisor:Runnable,
+  victims:&[(u32,u64)],
+  acknowledgements:&[(&crate::smp_lifecycle_fence::LifecycleFence,
+                      u32,crate::smp_lifecycle_fence::Receipt)])
+  ->Result<usize,ReclaimError>{
+  if supervisor.pid!=1||supervisor.generation==0||
+     !self.contains_epoch(supervisor.pid,supervisor.generation)||
+     victims.is_empty()||acknowledgements.is_empty()||
+     acknowledgements.len()>64||
+     victims.iter().any(|&(pid,epoch)|pid==1||pid==0||epoch==0){
+    return Err(ReclaimError::InvalidOwner);
+  }
+  // One AP receipt must not masquerade as several independent CPUs.
+  for (i,&(fence,_,_)) in acknowledgements.iter().enumerate(){
+   if acknowledgements[..i].iter().any(|&(prior,_,_)|
+     core::ptr::eq(prior,fence)){return Err(ReclaimError::InvalidOwner);}
+  }
+  crate::smp_lifecycle_fence::require_all_acks_for_reclaim(acknowledgements)
+   .map_err(ReclaimError::Ap)?;
+  // Build a private scheduler snapshot. Invalid later process generations
+  // leave the real queues, cursors, and all other tasks unchanged.
+  let mut staged=Self{queues:self.queues,length:self.length,cursor:self.cursor};
+  let removed=staged.evict_epochs_atomic(victims).map_err(ReclaimError::Queue)?;
+  // Recheck before publishing after fallible staging. The caller must
+  // serialize the actual scheduler and AP publication under SMP locks.
+  crate::smp_lifecycle_fence::require_all_acks_for_reclaim(acknowledgements)
+   .map_err(ReclaimError::Ap)?;
+  *self=staged;
+  Ok(removed)
+ }
+}
+
+/// P0 W2: starvation-bounded priority quantum for the existing per-core
+/// software runqueues. Timer-ISR and preemptive context-switch wiring is
+/// separately required for a genuinely preemptive SMP scheduler.
+#[derive(Clone,Copy,Debug,Eq,PartialEq)]
+pub struct FairQuantum{priority_streak:u8,maximum_streak:u8}
+impl FairQuantum{
+ pub const fn new(maximum_streak:u8)->Self{
+  Self{priority_streak:0,maximum_streak}
+ }
+ pub fn high_streak(&self)->u8{self.priority_streak}
+ pub fn reset(&mut self){self.priority_streak=0;}
+}
+impl<const C:usize,const N:usize> CoreRunQueues<C,N>{
+ pub fn select_fair_quantum(&mut self,cpu:usize,high_threshold:u8,
+  quantum:&mut FairQuantum)->Result<Runnable,DispatchError>{
+  if cpu>=C{return Err(DispatchError::InvalidCpu);}
+  if quantum.maximum_streak==0{return Err(DispatchError::InvalidTask);}
+  let count=self.length[cpu];
+  if count==0{return Err(DispatchError::Empty);}
+  if quantum.priority_streak>=quantum.maximum_streak{
+   // Prefer the oldest next low-priority slot in this CPU's circular order.
+   for offset in 0..count{
+    let index=(self.cursor[cpu]+offset)%count;
+    if let Some(task)=self.queues[cpu][index]{
+     if task.priority<high_threshold{
+      self.cursor[cpu]=(index+1)%count;
+      quantum.priority_streak=0;
+      return Ok(task);
+     }
+    }
+   }
+  }
+  match self.next_eligible(cpu,high_threshold){
+   Ok(task)=>{
+    quantum.priority_streak=quantum.priority_streak.saturating_add(1);
+    Ok(task)
+   },
+   Err(DispatchError::Empty)=>{
+    let task=self.next(cpu)?;
+    quantum.priority_streak=0;
+    Ok(task)
+   },
+   Err(err)=>Err(err),
+  }
+ }
+}
+#[cfg(test)]
+mod kernel_p0_w1_smp_reclaim_tests{
+ use super::*;
+ use crate::smp_lifecycle_fence::{LifecycleFence,FenceError};
+ fn t(pid:u32,generation:u64)->Runnable{
+  Runnable{pid,generation,priority:3}
+ }
+ #[test]fn two_ap_acknowledgements_are_required_before_exact_process_reclaim(){
+  let mut queues=CoreRunQueues::<2,3>::new();
+  queues.enqueue(0,t(1,4)).unwrap();
+  queues.enqueue(1,t(2,7)).unwrap();
+  let first=LifecycleFence::new(0,1);
+  let second=LifecycleFence::new(2,3);
+  let a=first.publish(0,10).unwrap();
+  let b=second.publish(2,10).unwrap();
+  first.observe_and_ack_after(1,0,|_|true).unwrap();
+  let receipts=[(&first,0,a),(&second,2,b)];
+  assert_eq!(queues.retire_after_ap_reclaim_barrier(t(1,4),&[(2,7)],&receipts),
+   Err(ReclaimError::Ap(FenceError::NoProgress)));
+  assert!(queues.contains_epoch(2,7));
+  second.observe_and_ack_after(3,0,|_|true).unwrap();
+  assert_eq!(queues.retire_after_ap_reclaim_barrier(t(1,4),&[(2,8)],&receipts),
+   Err(ReclaimError::Queue(DispatchError::InvalidTask)));
+  assert!(queues.contains_epoch(2,7));
+  assert_eq!(queues.retire_after_ap_reclaim_barrier(t(1,4),&[(2,7)],&receipts),Ok(1));
+  assert!(queues.contains_epoch(1,4));assert!(!queues.contains_epoch(2,7));
+ }
+ #[test]fn no_reclaim_of_pid1_or_repeated_ap_receipts(){
+  let mut q=CoreRunQueues::<1,2>::new();
+  q.enqueue(0,t(1,3)).unwrap();q.enqueue(0,t(2,4)).unwrap();
+  let fence=LifecycleFence::new(0,1);
+  let token=fence.publish(0,4).unwrap();
+  fence.observe_and_ack_after(1,0,|_|true).unwrap();
+  let once=[(&fence,0,token)];
+  assert_eq!(q.retire_after_ap_reclaim_barrier(t(1,3),&[(1,3)],&once),
+    Err(ReclaimError::InvalidOwner));
+  assert_eq!(q.retire_after_ap_reclaim_barrier(t(1,3),&[(2,4)],&[once[0],once[0]]),
+    Err(ReclaimError::InvalidOwner));
+  assert_eq!(q.total_runnable(),2);
+ }
+}
+#[cfg(test)]
+mod kernel_p0_w2_scheduler_tests{
+ use super::*;
+ #[test]fn low_priority_makes_progress_with_continuous_high_priority_work(){
+  let mut q=CoreRunQueues::<1,3>::new();
+  let high=Runnable{pid:2,generation:2,priority:10};
+  let low=Runnable{pid:3,generation:2,priority:1};
+  q.enqueue(0,high).unwrap();q.enqueue(0,low).unwrap();
+  let mut budget=FairQuantum::new(2);
+  assert_eq!(q.select_fair_quantum(0,5,&mut budget),Ok(high));
+  assert_eq!(q.select_fair_quantum(0,5,&mut budget),Ok(high));
+  assert_eq!(q.select_fair_quantum(0,5,&mut budget),Ok(low));
+  assert_eq!(budget.high_streak(),0);
+  assert_eq!(q.select_fair_quantum(99,5,&mut budget),
+     Err(DispatchError::InvalidCpu));
+  assert_eq!(q.total_runnable(),2);
+ }
+ #[test]fn invalid_quantum_does_not_change_cursor_or_process_state(){
+  let mut q=CoreRunQueues::<1,2>::new();
+  let a=Runnable{pid:2,generation:4,priority:1};
+  let b=Runnable{pid:3,generation:4,priority:9};
+  q.enqueue(0,a).unwrap();q.enqueue(0,b).unwrap();
+  let mut zero=FairQuantum::new(0);
+  assert_eq!(q.select_fair_quantum(0,5,&mut zero),Err(DispatchError::InvalidTask));
+  assert_eq!(q.next(0),Ok(a));
+  assert_eq!(q.total_runnable(),2);
+ }
+}
+
+
+/// P0 follow-up W1: exact process-identity and affinity-checked atomic
+/// multi-core migration. The trusted caller still owns actual scheduler
+/// locks, IPI, TLB shootdown and CPU-local saved contexts.
+impl<const C:usize,const N:usize> CoreRunQueues<C,N>{
+ pub fn migrate_group_exact(&mut self,
+  requests:&[(usize,usize,Runnable,u64)])->Result<usize,DispatchError>{
+  if requests.is_empty()||requests.len()>64||
+     requests.len()>C.saturating_mul(N){return Err(DispatchError::InvalidTask);}
+  let mut staged=Self{queues:self.queues,length:self.length,cursor:self.cursor};
+  for (i,&(from,to,task,allowed)) in requests.iter().enumerate(){
+   if from>=C||to>=C{return Err(DispatchError::InvalidCpu);}
+   if from==to||to>=64||task.pid<=1||task.generation==0||
+      allowed&(1u64<<to)==0||
+      requests[..i].iter().any(|&(_,_,other,_)|
+        other.pid==task.pid&&other.generation==task.generation){
+    return Err(DispatchError::InvalidTask);
+   }
+   if !staged.queues[from][..staged.length[from]]
+       .iter().any(|slot|slot.is_some_and(|known|known==task)){
+    return Err(DispatchError::InvalidTask);
+   }
+   staged.migrate(from,to,task.pid,task.generation)?;
+  }
+  staged.validate_queues()?;
+  *self=staged;Ok(requests.len())
+ }
+}
+#[cfg(test)]
+mod kernel_p0_next_w1_migration_tests{
+ use super::*;
+ fn t(pid:u32,epoch:u64)->Runnable{Runnable{pid,generation:epoch,priority:2}}
+ #[test]fn four_cross_cpu_migrations_are_atomic_across_late_capacity_fault(){
+  let mut q=CoreRunQueues::<2,3>::new();
+  q.enqueue(0,t(2,1)).unwrap();q.enqueue(0,t(3,1)).unwrap();
+  q.enqueue(1,t(4,1)).unwrap();q.enqueue(1,t(5,1)).unwrap();
+  let before=q.total_runnable();
+  let bad=[(0,1,t(2,1),2),(0,1,t(3,1),2)];
+  assert_eq!(q.migrate_group_exact(&bad),Err(DispatchError::Full));
+  assert_eq!(q.total_runnable(),before);
+  assert!(q.contains_epoch(2,1));assert!(q.contains_epoch(3,1));
+  let good=[(0,1,t(2,1),2),(1,0,t(4,1),1)];
+  assert_eq!(q.migrate_group_exact(&good),Ok(2));
+  let mut first=[t(99,99);3];let mut second=[t(99,99);3];
+  assert_eq!(q.snapshot_core(0,&mut first),Ok(2));
+  assert_eq!(&first[..2],&[t(3,1),t(4,1)]);
+  assert_eq!(q.snapshot_core(1,&mut second),Ok(2));
+  assert_eq!(&second[..2],&[t(5,1),t(2,1)]);
+ }
+ #[test]fn pid1_recycling_affinity_and_stale_generation_all_fail_closed(){
+  let mut q=CoreRunQueues::<2,2>::new();
+  q.enqueue(0,t(1,4)).unwrap();q.enqueue(0,t(2,4)).unwrap();
+  assert_eq!(q.migrate_group_exact(&[(0,1,t(1,4),2)]),
+    Err(DispatchError::InvalidTask));
+  assert_eq!(q.migrate_group_exact(&[(0,1,t(2,3),2)]),
+    Err(DispatchError::InvalidTask));
+  assert_eq!(q.migrate_group_exact(&[(0,1,t(2,4),1)]),
+    Err(DispatchError::InvalidTask));
+  assert_eq!(q.migrate_group_exact(&[(0,1,t(2,4),2),(0,1,t(2,4),2)]),
+    Err(DispatchError::InvalidTask));
+  assert_eq!(q.queue_len(0),Ok(2));
+  assert_eq!(q.queue_len(1),Ok(0));
+ }
+}
+
+
+/// P0 batch three W2: atomic runqueue + exact-once process-exit publication.
+/// The privileged scheduler must hold the same exclusive retirement lock
+/// while staging, publishing, and revoking the corresponding PCB/handles.
+/// Hardware IPIs/TLB acknowledgement are checked by the prior gate.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum ExitPublicationError{
+ Reclaim(ReclaimError),
+ Notice(EventError),
+ DuplicateNotice,
+}
+impl<const C:usize,const N:usize> CoreRunQueues<C,N>{
+ pub fn retire_and_notify_exact<const E:usize>(&mut self,
+  supervisor:Runnable,victims:&[(u32,u64)],
+  receipts:&[(&crate::smp_lifecycle_fence::LifecycleFence,
+             u32,crate::smp_lifecycle_fence::Receipt)],
+  notices:&mut ProcessEvents<E>)
+  ->Result<usize,ExitPublicationError>{
+  let mut scheduled=Self{queues:self.queues,length:self.length,cursor:self.cursor};
+  let mut staged_notices=notices.clone();
+  let removed=scheduled.retire_after_ap_reclaim_barrier(
+    supervisor,victims,receipts).map_err(ExitPublicationError::Reclaim)?;
+  let count=staged_notices.enqueue_exit_batch_once(victims)
+     .map_err(ExitPublicationError::Notice)?;
+  if count!=victims.len(){return Err(ExitPublicationError::DuplicateNotice);}
+  crate::smp_lifecycle_fence::require_all_acks_for_reclaim(receipts)
+    .map_err(|error|ExitPublicationError::Reclaim(ReclaimError::Ap(error)))?;
+  *self=scheduled;
+  *notices=staged_notices;
+  Ok(removed)
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch3_w2_exit_publication_tests{
+ use super::*;
+ use crate::smp_lifecycle_fence::{LifecycleFence,FenceError};
+ fn t(pid:u32,epoch:u64)->Runnable{Runnable{pid,generation:epoch,priority:5}}
+ #[test]fn full_exit_queue_rolls_back_actual_runqueue_retirement(){
+  let mut q=CoreRunQueues::<1,3>::new();
+  q.enqueue(0,t(1,4)).unwrap();q.enqueue(0,t(2,6)).unwrap();
+  let mut events=ProcessEvents::<1>::new();
+  events.enqueue(ProcessEvent{pid:9,kind:EventKind::Message,value:99}).unwrap();
+  let ap=LifecycleFence::new(0,1);let receipt=ap.publish(0,7).unwrap();
+  ap.observe_and_ack_after(1,0,|_|true).unwrap();
+  assert_eq!(q.retire_and_notify_exact(t(1,4),&[(2,6)],&[(&ap,0,receipt)],
+    &mut events),Err(ExitPublicationError::Notice(EventError::Full)));
+  assert!(q.contains_epoch(2,6));
+  assert_eq!(events.count_pid(9),1);
+ }
+ #[test]fn missing_ap_ack_or_duplicate_exit_receipt_never_retires_process(){
+  let mut q=CoreRunQueues::<1,3>::new();
+  q.enqueue(0,t(1,4)).unwrap();q.enqueue(0,t(2,6)).unwrap();
+  let mut events=ProcessEvents::<3>::new();
+  let ap=LifecycleFence::new(0,1);let receipt=ap.publish(0,7).unwrap();
+  let refs=[(&ap,0,receipt)];
+  assert_eq!(q.retire_and_notify_exact(t(1,4),&[(2,6)],&refs,&mut events),
+    Err(ExitPublicationError::Reclaim(ReclaimError::Ap(FenceError::NoProgress))));
+  assert_eq!(events.count_pid(2),0);
+  ap.observe_and_ack_after(1,0,|_|true).unwrap();
+  events.enqueue_exit_once(2,6).unwrap();
+  assert_eq!(q.retire_and_notify_exact(t(1,4),&[(2,6)],&refs,&mut events),
+    Err(ExitPublicationError::DuplicateNotice));
+  assert!(q.contains_epoch(2,6));
+  assert_eq!(events.count_pid(2),1);
+  events.clear_exact_exit(2,6);
+  assert_eq!(q.retire_and_notify_exact(t(1,4),&[(2,6)],&refs,&mut events),Ok(1));
+  assert!(!q.contains_epoch(2,6));assert!(q.contains_epoch(1,4));
+  assert_eq!(events.count_pid(2),1);
+ }
+}
+
+/// P0-65..68: process-eviction+exit-notification transaction requires a
+/// distinct acknowledged AP proof before mutating either owned queue.
+impl<const C:usize,const N:usize> CoreRunQueues<C,N>{
+ pub fn retire_and_notify_distinct_aps<const E:usize>(&mut self,
+  supervisor:Runnable,victims:&[(u32,u64)],
+  receipts:&[(&crate::smp_lifecycle_fence::LifecycleFence,u32,
+   crate::smp_lifecycle_fence::Receipt)],notices:&mut ProcessEvents<E>)
+  ->Result<usize,ExitPublicationError>{
+  // Never retire two incarnations of one PID in a single transaction:
+  // a recycled PID cannot inherit the first generation's exit authority.
+  for (i,&(pid,_)) in victims.iter().enumerate(){
+   if victims[..i].iter().any(|&(previous,_)|previous==pid){
+    return Err(ExitPublicationError::Reclaim(ReclaimError::InvalidOwner));
+   }
+  }
+  crate::smp_lifecycle_fence::require_distinct_acks_for_reclaim(receipts)
+   .map_err(|e|ExitPublicationError::Reclaim(ReclaimError::Ap(e)))?;
+  self.retire_and_notify_exact(supervisor,victims,receipts,notices)
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch4_w2_retirement_tests{
+ use super::*;
+ use crate::smp_lifecycle_fence::{LifecycleFence,FenceError};
+ fn t(pid:u32)->Runnable{Runnable{pid,generation:7,priority:3}}
+ #[test]fn duplicate_or_pending_ack_never_evicts_a_live_process(){
+  let mut q=CoreRunQueues::<1,3>::new();
+  q.enqueue(0,t(1)).unwrap();q.enqueue(0,t(2)).unwrap();
+  let mut e=ProcessEvents::<2>::new();
+  let a=LifecycleFence::new(0,1);let x=a.publish(0,8).unwrap();
+  let same=[(&a,0,x),(&a,0,x)];
+  assert_eq!(q.retire_and_notify_distinct_aps(t(1),&[(2,7)],&same,&mut e),
+   Err(ExitPublicationError::Reclaim(ReclaimError::Ap(FenceError::NoProgress))));
+  a.observe_and_ack_after(1,0,|_|true).unwrap();
+  assert_eq!(q.retire_and_notify_distinct_aps(t(1),&[(2,7)],&same,&mut e),
+   Err(ExitPublicationError::Reclaim(ReclaimError::Ap(FenceError::StaleReceipt))));
+  assert!(q.contains_epoch(2,7));assert_eq!(e.count_pid(2),0);
+ }
+ #[test]fn full_event_queue_rolls_back_and_success_notifies_once(){
+  let mut q=CoreRunQueues::<1,3>::new();
+  q.enqueue(0,t(1)).unwrap();q.enqueue(0,t(2)).unwrap();
+  let mut e=ProcessEvents::<1>::new();
+  let a=LifecycleFence::new(0,1);let b=LifecycleFence::new(0,2);
+  let x=a.publish(0,8).unwrap();let y=b.publish(0,9).unwrap();
+  a.observe_and_ack_after(1,0,|_|true).unwrap();
+  b.observe_and_ack_after(2,0,|_|true).unwrap();
+  e.enqueue(ProcessEvent{pid:9,kind:EventKind::Message,value:1}).unwrap();
+  let proof=[(&a,0,x),(&b,0,y)];
+  assert_eq!(q.retire_and_notify_distinct_aps(t(1),&[(2,7)],&proof,&mut e),
+   Err(ExitPublicationError::Notice(EventError::Full)));
+  assert!(q.contains_epoch(2,7));assert_eq!(e.count_pid(9),1);
+  e.dequeue().unwrap();
+  assert_eq!(q.retire_and_notify_distinct_aps(t(1),&[(2,7)],&proof,&mut e),Ok(1));
+  assert!(!q.contains_epoch(2,7));assert_eq!(e.count_pid(2),1);
+ }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch5_w2_generation_teardown_tests {
+ use super::*;
+ use crate::smp_lifecycle_fence::{LifecycleFence,FenceError};
+ fn t(pid:u32,generation:u64)->Runnable{Runnable{pid,generation,priority:3}}
+ #[test] fn mixed_incarnations_are_rejected_without_queue_or_notice_change(){
+  let mut q=CoreRunQueues::<1,4>::new();
+  for x in [t(1,7),t(2,8),t(2,9)]{q.enqueue(0,x).unwrap();}
+  let mut notices=ProcessEvents::<3>::new();
+  let ap=LifecycleFence::new(0,1);
+  let proof=ap.publish(0,15).unwrap();
+  ap.observe_and_ack_after(1,0,|_|true).unwrap();
+  assert_eq!(q.retire_and_notify_distinct_aps(t(1,7),
+   &[(2,8),(2,9)],&[(&ap,0,proof)],&mut notices),
+   Err(ExitPublicationError::Reclaim(ReclaimError::InvalidOwner)));
+  assert_eq!(q.total_runnable(),3);
+  assert!(q.contains_epoch(2,8)&&q.contains_epoch(2,9));
+  assert_eq!(notices.count_pid(2),0);
+ }
+ #[test] fn foreign_bsp_barrier_does_not_remove_live_victim(){
+  let mut q=CoreRunQueues::<1,3>::new();
+  q.enqueue(0,t(1,7)).unwrap();q.enqueue(0,t(2,8)).unwrap();
+  let mut notices=ProcessEvents::<3>::new();
+  let a=LifecycleFence::new(0,1);let b=LifecycleFence::new(3,4);
+  let x=a.publish(0,5).unwrap();let y=b.publish(3,6).unwrap();
+  a.observe_and_ack_after(1,0,|_|true).unwrap();
+  b.observe_and_ack_after(4,0,|_|true).unwrap();
+  assert_eq!(q.retire_and_notify_distinct_aps(t(1,7),
+   &[(2,8)],&[(&a,0,x),(&b,3,y)],&mut notices),
+   Err(ExitPublicationError::Reclaim(ReclaimError::Ap(FenceError::InvalidCpu))));
+  assert!(q.contains_epoch(2,8));
+  assert_eq!(notices.count_pid(2),0);
+ }
+}
+/// P0-105..108: the scheduler may publish a group exit only if the
+/// privileged topology inventory is covered by distinct AP receipts.
+/// Performs all checks before the existing transactional queue/notice swap.
+impl<const C:usize,const N:usize> CoreRunQueues<C,N>{
+ pub fn retire_and_notify_required_topology<const E:usize>(&mut self,
+  supervisor:Runnable,victims:&[(u32,u64)],
+  receipts:&[(&crate::smp_lifecycle_fence::LifecycleFence,
+              u32,crate::smp_lifecycle_fence::Receipt)],
+  expected_aps:&[u32],notices:&mut ProcessEvents<E>)
+  ->Result<usize,ExitPublicationError>{
+  crate::smp_lifecycle_fence::require_topology_acks_for_reclaim(
+   receipts,expected_aps)
+   .map_err(|e|ExitPublicationError::Reclaim(ReclaimError::Ap(e)))?;
+  self.retire_and_notify_distinct_aps(supervisor,victims,receipts,notices)
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch6_w2_topology_exit_tests{
+ use super::*;
+ use crate::smp_lifecycle_fence::{FenceError,LifecycleFence};
+ fn t(pid:u32,g:u64)->Runnable{Runnable{pid,generation:g,priority:4}}
+ #[test] fn missing_topology_ack_keeps_exiting_process_and_events_intact(){
+  let mut queues=CoreRunQueues::<1,4>::new();
+  queues.enqueue(0,t(1,1)).unwrap();queues.enqueue(0,t(2,2)).unwrap();
+  let mut events=ProcessEvents::<2>::new();
+  let a=LifecycleFence::new(0,1);let b=LifecycleFence::new(0,2);
+  let ra=a.publish(0,8).unwrap();let rb=b.publish(0,9).unwrap();
+  a.observe_and_ack_after(1,0,|_|true).unwrap();
+  let receipts=[(&a,0,ra),(&b,0,rb)];
+  assert_eq!(queues.retire_and_notify_required_topology(t(1,1),
+   &[(2,2)],&receipts,&[1,2],&mut events),
+   Err(ExitPublicationError::Reclaim(ReclaimError::Ap(FenceError::NoProgress))));
+  assert!(queues.contains_epoch(2,2));assert_eq!(events.len(),0);
+  b.observe_and_ack_after(2,0,|_|true).unwrap();
+  assert_eq!(queues.retire_and_notify_required_topology(t(1,1),
+   &[(2,2)],&receipts,&[1,3],&mut events),
+   Err(ExitPublicationError::Reclaim(ReclaimError::Ap(FenceError::StaleReceipt))));
+  assert!(queues.contains_epoch(2,2));assert_eq!(events.len(),0);
+  assert_eq!(queues.retire_and_notify_required_topology(t(1,1),
+   &[(2,2)],&receipts,&[2,1],&mut events),Ok(1));
+  assert!(!queues.contains_epoch(2,2));assert_eq!(events.count_pid(2),1);
+ }
+ #[test] fn capacity_failure_still_rolls_back_after_full_topology_proof(){
+  let mut queues=CoreRunQueues::<1,4>::new();
+  queues.enqueue(0,t(1,1)).unwrap();queues.enqueue(0,t(2,2)).unwrap();
+  let mut notices=ProcessEvents::<1>::new();
+  notices.enqueue(ProcessEvent{pid:8,kind:EventKind::Message,value:5}).unwrap();
+  let a=LifecycleFence::new(0,1);let r=a.publish(0,3).unwrap();
+  a.observe_and_ack_after(1,0,|_|true).unwrap();
+  assert_eq!(queues.retire_and_notify_required_topology(t(1,1),
+   &[(2,2)],&[(&a,0,r)],&[1],&mut notices),
+   Err(ExitPublicationError::Notice(EventError::Full)));
+  assert!(queues.contains_epoch(2,2));
+  assert_eq!(notices.count_pid(8),1);assert_eq!(notices.count_pid(2),0);
+ }
+}
+
+
+/// P0-125..128: make the exact AP topology AND the release epoch part of
+/// the process exit transaction's authority. Atomic runqueue/notice changes
+/// are delegated to the existing staging transaction; a stale topology or
+/// failed notice publication must not evict any incarnation.
+impl<const C:usize,const N:usize> CoreRunQueues<C,N>{
+ pub fn retire_and_notify_epoch_topology<const E:usize>(&mut self,
+  supervisor:Runnable,victims:&[(u32,u64)],
+  receipts:&[(&crate::smp_lifecycle_fence::LifecycleFence,u32,
+    crate::smp_lifecycle_fence::Receipt)],
+  expected_aps:&[u32],expected_generation:u64,
+  notices:&mut ProcessEvents<E>)->Result<usize,ExitPublicationError>{
+  crate::smp_lifecycle_fence::require_epoch_topology_acks_for_reclaim(
+   receipts,expected_aps,expected_generation)
+   .map_err(|e|ExitPublicationError::Reclaim(ReclaimError::Ap(e)))?;
+  self.retire_and_notify_required_topology(supervisor,victims,
+   receipts,expected_aps,notices)
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch7_w2_exit_epoch_tests{
+ use super::*;
+ use crate::smp_lifecycle_fence::{FenceError,LifecycleFence};
+ fn task(pid:u32,generation:u64)->Runnable{
+  Runnable{pid,generation,priority:5}
+ }
+ #[test]fn mixing_valid_receipts_of_different_epochs_cannot_retire(){
+  let mut q=CoreRunQueues::<1,4>::new();
+  q.enqueue(0,task(1,8)).unwrap();q.enqueue(0,task(2,9)).unwrap();
+  let mut events=ProcessEvents::<2>::new();
+  let a=LifecycleFence::new(0,1);let b=LifecycleFence::new(0,2);
+  let x=a.publish(0,20).unwrap();let y=b.publish(0,21).unwrap();
+  a.observe_and_ack_after(1,0,|_|true).unwrap();
+  b.observe_and_ack_after(2,0,|_|true).unwrap();
+  let refs=[(&a,0,x),(&b,0,y)];
+  assert_eq!(q.retire_and_notify_epoch_topology(task(1,8),
+   &[(2,9)],&refs,&[1,2],20,&mut events),
+   Err(ExitPublicationError::Reclaim(ReclaimError::Ap(FenceError::StaleReceipt))));
+  assert!(q.contains_epoch(2,9));assert_eq!(events.len(),0);
+ }
+ #[test]fn matching_epoch_still_obeys_atomic_event_capacity_and_pid1_guard(){
+  let mut q=CoreRunQueues::<1,4>::new();
+  q.enqueue(0,task(1,8)).unwrap();q.enqueue(0,task(2,9)).unwrap();
+  let mut events=ProcessEvents::<1>::new();
+  let a=LifecycleFence::new(0,1);let x=a.publish(0,20).unwrap();
+  a.observe_and_ack_after(1,0,|_|true).unwrap();
+  let refs=[(&a,0,x)];
+  events.enqueue(ProcessEvent{pid:7,kind:EventKind::Message,value:1}).unwrap();
+  assert_eq!(q.retire_and_notify_epoch_topology(task(1,8),
+   &[(2,9)],&refs,&[1],20,&mut events),
+   Err(ExitPublicationError::Notice(EventError::Full)));
+  assert!(q.contains_epoch(2,9));assert_eq!(events.count_pid(7),1);
+  events.dequeue().unwrap();
+  assert!(q.retire_and_notify_epoch_topology(task(1,8),
+   &[(1,8)],&refs,&[1],20,&mut events).is_err());
+  assert!(q.contains_epoch(1,8));
+  assert_eq!(q.retire_and_notify_epoch_topology(task(1,8),
+   &[(2,9)],&refs,&[1],20,&mut events),Ok(1));
+  assert!(!q.contains_epoch(2,9));assert_eq!(events.count_pid(2),1);
+ }
+}
+
+
+/// P0-145..148: a running process may migrate to another CPU only after
+/// the entire trusted AP inventory acknowledged the same local lifecycle
+/// epoch. Stage every scheduler edit privately and recheck the barrier before
+/// publication. Actual runtime must hold scheduler/topology locks throughout.
+impl<const C:usize,const N:usize> CoreRunQueues<C,N>{
+ pub fn migrate_group_after_epoch_acks(
+  &mut self,requests:&[(usize,usize,Runnable,u64)],
+  receipts:&[(&crate::smp_lifecycle_fence::LifecycleFence,u32,
+   crate::smp_lifecycle_fence::Receipt)],
+  expected_aps:&[u32],expected_generation:u64
+ )->Result<usize,ReclaimError>{
+  crate::smp_lifecycle_fence::require_epoch_topology_acks_for_reclaim(
+   receipts,expected_aps,expected_generation).map_err(ReclaimError::Ap)?;
+  let mut staged=Self{queues:self.queues,length:self.length,cursor:self.cursor};
+  let count=staged.migrate_group_exact(requests).map_err(ReclaimError::Queue)?;
+  crate::smp_lifecycle_fence::require_epoch_topology_acks_for_reclaim(
+   receipts,expected_aps,expected_generation).map_err(ReclaimError::Ap)?;
+  *self=staged;
+  Ok(count)
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch8_w2_topology_migration_tests{
+ use super::*;
+ use crate::smp_lifecycle_fence::{FenceError,LifecycleFence};
+ fn task(pid:u32,g:u64)->Runnable{Runnable{pid,generation:g,priority:2}}
+ #[test]fn acknowledged_same_epoch_topology_permits_atomic_cross_core_migration(){
+  let mut queues=CoreRunQueues::<2,3>::new();
+  queues.enqueue(0,task(1,1)).unwrap();
+  queues.enqueue(0,task(2,3)).unwrap();queues.enqueue(1,task(3,4)).unwrap();
+  let a=LifecycleFence::new(9,1);let b=LifecycleFence::new(9,2);
+  let x=a.publish(9,20).unwrap();let y=b.publish(9,20).unwrap();
+  a.observe_and_ack_after(1,0,|_|true).unwrap();
+  b.observe_and_ack_after(2,0,|_|true).unwrap();
+  let proofs=[(&a,9,x),(&b,9,y)];
+  assert_eq!(queues.migrate_group_after_epoch_acks(
+   &[(0,1,task(2,3),2),(1,0,task(3,4),1)],
+   &proofs,&[2,1],20),Ok(2));
+  let mut cpu0=[task(99,99);3];let mut cpu1=[task(99,99);3];
+  assert_eq!(queues.snapshot_core(0,&mut cpu0),Ok(2));
+  assert_eq!(&cpu0[..2],&[task(1,1),task(3,4)]);
+  assert_eq!(queues.snapshot_core(1,&mut cpu1),Ok(1));
+  assert_eq!(cpu1[0],task(2,3));
+ }
+ #[test]fn pending_mixed_epoch_or_invalid_affinity_never_changes_queue(){
+  let mut queues=CoreRunQueues::<2,2>::new();
+  queues.enqueue(0,task(1,1)).unwrap();queues.enqueue(0,task(2,3)).unwrap();
+  let a=LifecycleFence::new(9,1);let b=LifecycleFence::new(9,2);
+  let x=a.publish(9,20).unwrap();let y=b.publish(9,21).unwrap();
+  a.observe_and_ack_after(1,0,|_|true).unwrap();
+  let proofs=[(&a,9,x),(&b,9,y)];
+  let moves=[(0,1,task(2,3),2)];
+  assert_eq!(queues.migrate_group_after_epoch_acks(&moves,&proofs,&[1,2],20),
+   Err(ReclaimError::Ap(FenceError::StaleReceipt)));
+  assert_eq!(queues.queue_len(0),Ok(2));assert_eq!(queues.queue_len(1),Ok(0));
+  let proof=[(&a,9,x)];
+  assert_eq!(queues.migrate_group_after_epoch_acks(
+   &[(0,1,task(2,3),1)],&proof,&[1],20),
+   Err(ReclaimError::Queue(DispatchError::InvalidTask)));
+  assert_eq!(queues.queue_len(0),Ok(2));assert_eq!(queues.queue_len(1),Ok(0));
+ }
+}
+
+
+/// P0-165..168: one kernel-locked transaction for process scheduler exit,
+/// exact-generation event publication and IPC mailbox/sent-message revocation.
+/// A failing IPC generation or full event ring leaves ALL structures intact.
+/// Real runtime must hold scheduler, IPC and topology locks in fixed order.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum ExitReapError{
+ Exit(ExitPublicationError),
+ Ipc(crate::ipc::IpcError),
+}
+impl<const C:usize,const N:usize> CoreRunQueues<C,N>{
+ pub fn retire_notify_and_reap_ipc<const E:usize,const M:usize,const D:usize>(
+  &mut self,supervisor:Runnable,victims:&[(u32,u64)],
+  receipts:&[(&crate::smp_lifecycle_fence::LifecycleFence,u32,
+   crate::smp_lifecycle_fence::Receipt)],
+  expected_aps:&[u32],epoch:u64,
+  events:&mut ProcessEvents<E>,router:&mut crate::ipc::ScopedRouter<M,D>
+ )->Result<usize,ExitReapError>{
+  if victims.is_empty()||victims.len()>M{
+   return Err(ExitReapError::Ipc(crate::ipc::IpcError::InvalidConfiguration));
+  }
+  let mut ids=[crate::batch5_session::Identity{pid:0,generation:0};M];
+  for (i,&(pid,generation)) in victims.iter().enumerate(){
+   ids[i]=crate::batch5_session::Identity{pid,generation};
+  }
+  let mut staged=Self{queues:self.queues,length:self.length,cursor:self.cursor};
+  let mut notices=events.clone();
+  let mut mailboxes=router.clone();
+  let n=staged.retire_and_notify_epoch_topology(
+   supervisor,victims,receipts,expected_aps,epoch,&mut notices)
+   .map_err(ExitReapError::Exit)?;
+  mailboxes.reap_group_exact(&ids[..victims.len()])
+   .map_err(ExitReapError::Ipc)?;
+  crate::smp_lifecycle_fence::require_epoch_topology_acks_for_reclaim(
+   receipts,expected_aps,epoch)
+   .map_err(|e|ExitReapError::Exit(
+    ExitPublicationError::Reclaim(ReclaimError::Ap(e))))?;
+  *self=staged;
+  *events=notices;
+  *router=mailboxes;
+  Ok(n)
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch9_w2_exit_ipc_atomic_tests{
+ use super::*;
+ use crate::batch5_session::Identity;
+ use crate::ipc::{IpcError,ScopedRouter};
+ use crate::smp_lifecycle_fence::LifecycleFence;
+ fn t(pid:u32,g:u64)->Runnable{Runnable{pid,generation:g,priority:3}}
+ fn id(pid:u32,g:u64)->Identity{Identity{pid,generation:g}}
+ #[test]fn successful_exit_reaps_outgoing_ipc_and_publishes_one_notice(){
+  let mut q=CoreRunQueues::<1,3>::new();
+  q.enqueue(0,t(1,1)).unwrap();q.enqueue(0,t(2,4)).unwrap();
+  let mut events=ProcessEvents::<2>::new();
+  let mut ipc=ScopedRouter::<3,2>::new().unwrap();
+  for x in [id(1,1),id(2,4),id(3,2)]{ipc.register(x).unwrap();}
+  ipc.send(id(2,4),id(3,2),b"stale").unwrap();
+  let f=LifecycleFence::new(0,7);let r=f.publish(0,10).unwrap();
+  f.observe_and_ack_after(7,0,|_|true).unwrap();
+  assert_eq!(q.retire_notify_and_reap_ipc(t(1,1),&[(2,4)],
+   &[(&f,0,r)],&[7],10,&mut events,&mut ipc),Ok(1));
+  assert!(!q.contains_epoch(2,4));
+  assert_eq!(events.count_pid(2),1);
+  assert_eq!(ipc.pending(id(2,4)),Err(IpcError::UnknownReceiver));
+  assert_eq!(ipc.pending(id(3,2)),Ok(0));
+ }
+ #[test]fn stale_mailbox_or_full_event_ring_rolls_back_everything(){
+  let mut q=CoreRunQueues::<1,3>::new();
+  q.enqueue(0,t(1,1)).unwrap();q.enqueue(0,t(2,4)).unwrap();
+  let mut events=ProcessEvents::<1>::new();
+  let mut ipc=ScopedRouter::<2,2>::new().unwrap();
+  ipc.register(id(1,1)).unwrap();ipc.register(id(2,5)).unwrap();
+  let f=LifecycleFence::new(0,7);let r=f.publish(0,10).unwrap();
+  f.observe_and_ack_after(7,0,|_|true).unwrap();
+  assert_eq!(q.retire_notify_and_reap_ipc(t(1,1),&[(2,4)],
+   &[(&f,0,r)],&[7],10,&mut events,&mut ipc),
+   Err(ExitReapError::Ipc(IpcError::UnknownReceiver)));
+  assert!(q.contains_epoch(2,4));assert_eq!(events.len(),0);
+  assert_eq!(ipc.pending(id(2,5)),Ok(0));
+  ipc.reap(id(2,5)).unwrap();ipc.register(id(2,4)).unwrap();
+  events.enqueue(ProcessEvent{pid:8,kind:EventKind::Message,value:1}).unwrap();
+  assert_eq!(q.retire_notify_and_reap_ipc(t(1,1),&[(2,4)],
+   &[(&f,0,r)],&[7],10,&mut events,&mut ipc),
+   Err(ExitReapError::Exit(ExitPublicationError::Notice(EventError::Full))));
+  assert!(q.contains_epoch(2,4));assert_eq!(events.count_pid(8),1);
+  assert_eq!(ipc.pending(id(2,4)),Ok(0));
+ }
+}
+
+
+/// P0-185..188: prevent phantom process exits and PID-reuse confusion before
+/// an all-or-none scheduler/event/IPC retirement. Every victim must have
+/// exactly one runnable incarnation, no other generation of that PID can be
+/// running, and PID1 is immutable. Caller serializes the three stores.
+impl<const C:usize,const N:usize> CoreRunQueues<C,N>{
+ pub fn retire_notify_and_reap_live_exact<
+  const E:usize,const M:usize,const D:usize>(
+  &mut self,supervisor:Runnable,victims:&[(u32,u64)],
+  receipts:&[(&crate::smp_lifecycle_fence::LifecycleFence,u32,
+   crate::smp_lifecycle_fence::Receipt)],
+  expected_aps:&[u32],epoch:u64,
+  events:&mut ProcessEvents<E>,router:&mut crate::ipc::ScopedRouter<M,D>
+ )->Result<usize,ExitReapError>{
+  let invalid=ExitReapError::Exit(
+   ExitPublicationError::Reclaim(ReclaimError::InvalidOwner));
+  if victims.is_empty()||victims.len()>M||
+     supervisor.pid!=1||supervisor.generation==0||
+     !self.contains_epoch(supervisor.pid,supervisor.generation){
+   return Err(invalid);
+  }
+  for (index,&(pid,generation)) in victims.iter().enumerate(){
+   if pid<=1||generation==0||
+      victims[..index].iter().any(|&(old,_)|old==pid){
+    return Err(invalid);
+   }
+   let mut exact=0usize;
+   for task in self.queues.iter().flatten().flatten(){
+    if task.pid==pid{
+     if task.generation!=generation{return Err(invalid);}
+     exact+=1;
+    }
+   }
+   if exact!=1{return Err(invalid);}
+  }
+  self.retire_notify_and_reap_ipc(supervisor,victims,receipts,
+   expected_aps,epoch,events,router)
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch10_w2_live_exit_tests{
+ use super::*;
+ use crate::batch5_session::Identity;
+ use crate::ipc::ScopedRouter;
+ use crate::smp_lifecycle_fence::LifecycleFence;
+ fn task(pid:u32,generation:u64)->Runnable{Runnable{pid,generation,priority:2}}
+ fn owner(pid:u32,generation:u64)->Identity{Identity{pid,generation}}
+ #[test]fn phantom_or_recycled_victim_cannot_publish_exit_or_reap_messages(){
+  let mut q=CoreRunQueues::<2,3>::new();
+  q.enqueue(0,task(1,1)).unwrap();q.enqueue(1,task(2,8)).unwrap();
+  let mut events=ProcessEvents::<3>::new();
+  let mut ipc=ScopedRouter::<2,2>::new().unwrap();
+  ipc.register(owner(1,1)).unwrap();ipc.register(owner(2,8)).unwrap();
+  let f=LifecycleFence::new(0,7);let r=f.publish(0,9).unwrap();
+  f.observe_and_ack_after(7,0,|_|true).unwrap();
+  for victims in [&[(3,2)][..],&[(2,7)][..],&[(1,1)][..],
+    &[(2,8),(2,8)][..]]{
+   assert_eq!(q.retire_notify_and_reap_live_exact(
+    task(1,1),victims,&[(&f,0,r)],&[7],9,&mut events,&mut ipc),
+    Err(ExitReapError::Exit(ExitPublicationError::Reclaim(
+     ReclaimError::InvalidOwner))));
+   assert!(q.contains_epoch(2,8));assert_eq!(events.len(),0);
+   assert_eq!(ipc.pending(owner(2,8)),Ok(0));
+  }
+ }
+ #[test]fn one_real_incarnation_exits_all_three_stores(){
+  let mut q=CoreRunQueues::<2,3>::new();
+  q.enqueue(0,task(1,1)).unwrap();q.enqueue(1,task(2,8)).unwrap();
+  let mut events=ProcessEvents::<3>::new();
+  let mut ipc=ScopedRouter::<2,2>::new().unwrap();
+  ipc.register(owner(1,1)).unwrap();ipc.register(owner(2,8)).unwrap();
+  let f=LifecycleFence::new(0,7);let r=f.publish(0,9).unwrap();
+  f.observe_and_ack_after(7,0,|_|true).unwrap();
+  assert_eq!(q.retire_notify_and_reap_live_exact(task(1,1),&[(2,8)],
+   &[(&f,0,r)],&[7],9,&mut events,&mut ipc),Ok(1));
+  assert!(!q.contains_epoch(2,8));assert_eq!(events.count_pid(2),1);
+  assert_eq!(ipc.pending(owner(2,8)),Err(crate::ipc::IpcError::UnknownReceiver));
+ }
+}
+
+
+/// P0-285..287: a supervisor may acknowledge an exact ordered prefix of
+/// event receipts atomically. A stale, duplicated or out-of-order receipt
+/// cannot partially drain the lifecycle FIFO. Caller owns the event lock.
+impl<const C:usize> ProcessEvents<C>{
+ pub fn acknowledge_exact_prefix(&mut self,receipts:&[EventReceipt])
+  ->Result<usize,EventError>{
+  if receipts.is_empty()||receipts.len()>self.count{
+   return Err(EventError::Empty);
+  }
+  let mut staged=self.clone();
+  for &receipt in receipts{
+   if receipt.sequence==0||staged.peek_receipt()!=Some(receipt){
+    return Err(EventError::Empty);
+   }
+   staged.dequeue()?;
+  }
+  *self=staged;
+  Ok(receipts.len())
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch14_w2_atomic_event_ack_tests{
+ use super::*;
+ fn event(pid:u32)->ProcessEvent{
+  ProcessEvent{pid,kind:EventKind::Exited,value:1}
+ }
+ #[test]fn exact_receipt_prefix_is_single_use_and_fifo(){
+  let mut q=ProcessEvents::<3>::new();
+  q.enqueue(event(2)).unwrap();q.enqueue(event(2)).unwrap();
+  q.enqueue(event(3)).unwrap();
+  let mut receipts=[EventReceipt{sequence:0,event:event(1)};3];
+  assert_eq!(q.snapshot_receipts(&mut receipts),Ok(3));
+  assert_ne!(receipts[0].sequence,receipts[1].sequence);
+  assert_eq!(q.acknowledge_exact_prefix(&receipts[..2]),Ok(2));
+  assert_eq!(q.peek_receipt(),Some(receipts[2]));
+  assert_eq!(q.acknowledge_exact_prefix(&receipts[..1]),Err(EventError::Empty));
+  assert_eq!(q.acknowledge_exact_prefix(&receipts[2..3]),Ok(1));
+ }
+ #[test]fn later_stale_receipt_cannot_consume_valid_prefix(){
+  let mut q=ProcessEvents::<3>::new();
+  q.enqueue(event(2)).unwrap();q.enqueue(event(3)).unwrap();
+  let mut receipts=[EventReceipt{sequence:0,event:event(1)};2];
+  q.snapshot_receipts(&mut receipts).unwrap();
+  let mut bad=receipts;
+  bad[1].sequence+=10;
+  assert_eq!(q.acknowledge_exact_prefix(&bad),Err(EventError::Empty));
+  assert_eq!(q.len(),2);
+  assert_eq!(q.peek_receipt(),Some(receipts[0]));
+  assert_eq!(q.acknowledge_exact_prefix(&[receipts[0],receipts[0]]),
+   Err(EventError::Empty));
+  assert_eq!(q.len(),2);
+  assert_eq!(q.acknowledge_exact_prefix(&[]),Err(EventError::Empty));
+ }
+}
+
+
+
+/// P0-306..310: deliver the same exact receipt prefix into supervisor
+/// memory atomically with dequeuing. On any replay, short buffer or
+/// malformed prefix BOTH destination and lifecycle FIFO remain unchanged.
+impl<const C:usize> ProcessEvents<C>{
+ pub fn acknowledge_exact_prefix_into(
+  &mut self,receipts:&[EventReceipt],out:&mut[ProcessEvent]
+ )->Result<usize,EventError>{
+  if receipts.is_empty(){return Err(EventError::Empty);}
+  if out.len()<receipts.len(){return Err(EventError::Full);}
+  let mut staged=self.clone();
+  staged.acknowledge_exact_prefix(receipts)?;
+  for (destination,receipt) in out.iter_mut().zip(receipts.iter()){
+   *destination=receipt.event;
+  }
+  *self=staged;
+  Ok(receipts.len())
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch15_w2_atomic_delivery_tests{
+ use super::*;
+ fn event(pid:u32)->ProcessEvent{
+  ProcessEvent{pid,kind:EventKind::Exited,value:pid as u64}
+ }
+ fn receipt()->EventReceipt{EventReceipt{sequence:0,event:event(9)}}
+ #[test]fn all_receipts_copy_and_dequeue_together(){
+  let mut q=ProcessEvents::<3>::new();
+  q.enqueue(event(2)).unwrap();q.enqueue(event(3)).unwrap();
+  let mut receipts=[receipt();2];
+  assert_eq!(q.snapshot_receipts(&mut receipts),Ok(2));
+  let mut out=[event(9);2];
+  assert_eq!(q.acknowledge_exact_prefix_into(&receipts,&mut out),Ok(2));
+  assert_eq!(out,[event(2),event(3)]);
+  assert_eq!(q.len(),0);
+  assert_eq!(q.acknowledge_exact_prefix_into(&receipts,&mut out),
+   Err(EventError::Empty));
+ }
+ #[test]fn late_stale_receipt_cannot_publish_even_first_event(){
+  let mut q=ProcessEvents::<3>::new();
+  q.enqueue(event(2)).unwrap();q.enqueue(event(3)).unwrap();
+  let mut r=[receipt();2];q.snapshot_receipts(&mut r).unwrap();
+  let mut wrong=r;wrong[1].sequence+=1;
+  let mut out=[event(9);2];
+  assert_eq!(q.acknowledge_exact_prefix_into(&wrong,&mut out),
+   Err(EventError::Empty));
+  assert_eq!(out,[event(9);2]);
+  assert_eq!(q.len(),2);
+  assert_eq!(q.peek_receipt(),Some(r[0]));
+ }
+ #[test]fn short_destination_and_empty_prefix_never_drain(){
+  let mut q=ProcessEvents::<1>::new();q.enqueue(event(2)).unwrap();
+  let mut r=[receipt();1];q.snapshot_receipts(&mut r).unwrap();
+  let mut no_output:[ProcessEvent;0]=[];
+  assert_eq!(q.acknowledge_exact_prefix_into(&r,&mut no_output),
+   Err(EventError::Full));
+  let mut output=[event(9);1];
+  assert_eq!(q.acknowledge_exact_prefix_into(&[],&mut output),
+   Err(EventError::Empty));
+  assert_eq!(output,[event(9)]);
+  assert_eq!(q.len(),1);
+ }
+ #[test]fn duplicate_receipts_are_not_a_valid_prefix(){
+  let mut q=ProcessEvents::<2>::new();
+  q.enqueue(event(2)).unwrap();q.enqueue(event(2)).unwrap();
+  let r=q.peek_receipt().unwrap();let mut out=[event(9);2];
+  assert_eq!(q.acknowledge_exact_prefix_into(&[r,r],&mut out),
+   Err(EventError::Empty));
+  assert_eq!(q.len(),2);assert_eq!(out,[event(9);2]);
+ }
+}
+
+
+
+/// P0-336..340: transfer an exact lifecycle notification prefix into a
+/// supervisor event queue. Both source dequeue and destination enqueue are
+/// staged and committed together; forwarding creates new destination receipt
+/// sequence IDs, preventing a source receipt replay from removing a peer.
+/// The kernel caller must hold exclusive ownership of BOTH queues.
+impl<const C:usize> ProcessEvents<C>{
+ pub fn forward_receipt_prefix_to<const N:usize>(
+  &mut self,destination:&mut ProcessEvents<N>,
+  receipts:&[EventReceipt],allowed_pids:&[u32]
+ )->Result<usize,EventError>{
+  if receipts.is_empty(){return Err(EventError::Empty);}
+  if allowed_pids.is_empty()||allowed_pids.contains(&0){
+   return Err(EventError::InvalidPid);
+  }
+  let mut source_stage=self.clone();
+  let mut target_stage=destination.clone();
+  source_stage.acknowledge_exact_prefix(receipts)?;
+  for item in receipts{
+   if !allowed_pids.contains(&item.event.pid){return Err(EventError::InvalidPid);}
+   target_stage.enqueue(item.event)?;
+  }
+  *self=source_stage;
+  *destination=target_stage;
+  Ok(receipts.len())
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch16_w2_supervisor_forward_tests{
+ use super::*;
+ fn event(pid:u32)->ProcessEvent{
+  ProcessEvent{pid,kind:EventKind::Exited,value:pid as u64}
+ }
+ fn prefix<const N:usize>(events:&ProcessEvents<N>,count:usize)->[EventReceipt;2]{
+  let mut r=[EventReceipt{sequence:0,event:event(9)};2];
+  assert_eq!(events.snapshot_receipts(&mut r),Ok(count));r
+ }
+ #[test]fn forwarded_notifications_get_new_destination_sequence(){
+  let mut from=ProcessEvents::<2>::new();
+  let mut to=ProcessEvents::<3>::new();
+  from.enqueue(event(2)).unwrap();from.enqueue(event(3)).unwrap();
+  to.enqueue(event(7)).unwrap();
+  let receipt=prefix(&from,2);
+  assert_eq!(from.forward_receipt_prefix_to(&mut to,&receipt,&[2,3]),Ok(2));
+  assert_eq!(from.len(),0);assert_eq!(to.len(),3);
+  let mut delivered=[EventReceipt{sequence:0,event:event(9)};3];
+  to.snapshot_receipts(&mut delivered).unwrap();
+  assert_eq!(delivered[0].event,event(7));
+  assert_eq!(delivered[1].event,event(2));
+  assert_eq!(delivered[2].event,event(3));
+  // Sequence spaces are independent; test fresh destination progression.
+  assert_eq!(delivered[1].sequence,delivered[0].sequence+1);
+  assert_eq!(delivered[2].sequence,delivered[1].sequence+1);
+  assert_ne!(delivered[2].sequence,receipt[1].sequence);
+  assert_eq!(from.forward_receipt_prefix_to(&mut to,&receipt,&[2,3]),
+   Err(EventError::Empty));
+ }
+ #[test]fn late_capacity_failure_keeps_both_rings_unchanged(){
+  let mut from=ProcessEvents::<2>::new();let mut to=ProcessEvents::<2>::new();
+  from.enqueue(event(2)).unwrap();from.enqueue(event(3)).unwrap();
+  to.enqueue(event(7)).unwrap();
+  let r=prefix(&from,2);
+  assert_eq!(from.forward_receipt_prefix_to(&mut to,&r,&[2,3]),
+   Err(EventError::Full));
+  assert_eq!(from.len(),2);assert_eq!(to.len(),1);
+  assert_eq!(from.peek_receipt(),Some(r[0]));
+  assert_eq!(to.peek(),Some(event(7)));
+ }
+ #[test]fn unauthorized_or_stale_second_receipt_is_all_or_none(){
+  let mut from=ProcessEvents::<2>::new();let mut to=ProcessEvents::<2>::new();
+  from.enqueue(event(2)).unwrap();from.enqueue(event(3)).unwrap();
+  let r=prefix(&from,2);
+  assert_eq!(from.forward_receipt_prefix_to(&mut to,&r,&[2]),
+   Err(EventError::InvalidPid));
+  let mut wrong=r;wrong[1].sequence+=1;
+  assert_eq!(from.forward_receipt_prefix_to(&mut to,&wrong,&[2,3]),
+   Err(EventError::Empty));
+  assert_eq!(from.len(),2);assert_eq!(to.len(),0);
+  assert_eq!(from.peek_receipt(),Some(r[0]));
+ }
+ #[test]fn duplicate_receipts_and_empty_allowlist_are_denied(){
+  let mut from=ProcessEvents::<2>::new();let mut to=ProcessEvents::<2>::new();
+  from.enqueue(event(2)).unwrap();from.enqueue(event(3)).unwrap();
+  let r=prefix(&from,2);
+  assert_eq!(from.forward_receipt_prefix_to(&mut to,&[r[0],r[0]],&[2,3]),
+   Err(EventError::Empty));
+  assert_eq!(from.forward_receipt_prefix_to(&mut to,&r,&[]),
+   Err(EventError::InvalidPid));
+  assert_eq!(from.len(),2);assert_eq!(to.len(),0);
+ }
+}
+
+
+
+/// P0-368..374: exact-incarnation exit notice forwarding. Exited.value
+/// MUST be the process generation; arbitrary Message/Faulted values are NOT
+/// treated as generations. Preflight receipt ID, PID1 protection, unique
+/// incarnations and already-delivered notices before moving either ring.
+impl<const C:usize> ProcessEvents<C>{
+ pub fn forward_exact_exit_batch<const N:usize>(
+  &mut self,destination:&mut ProcessEvents<N>,
+  receipts:&[EventReceipt],owners:&[(u32,u64)]
+ )->Result<usize,EventError>{
+  if receipts.is_empty()||receipts.len()!=owners.len(){
+   return Err(EventError::Empty);
+  }
+  for (i,(&receipt,&(pid,generation))) in
+   receipts.iter().zip(owners).enumerate(){
+   if pid<=1||generation==0||receipt.event.pid!=pid||
+      receipt.event.kind!=EventKind::Exited||
+      receipt.event.value!=generation{
+    return Err(EventError::InvalidPid);
+   }
+   if owners[..i].contains(&(pid,generation)){
+    return Err(EventError::InvalidPid);
+   }
+   if (0..destination.count).any(|at|{
+    destination.entries[(destination.head+at)%N].is_some_and(|event|
+     event.pid==pid&&event.kind==EventKind::Exited&&
+      event.value==generation)
+   }){
+    return Err(EventError::InvalidPid);
+   }
+  }
+  let mut source=self.clone();
+  let mut target=destination.clone();
+  source.acknowledge_exact_prefix(receipts)?;
+  for &(pid,generation) in owners{
+   if !target.enqueue_exit_once(pid,generation)?{
+    return Err(EventError::InvalidPid);
+   }
+  }
+  *self=source;*destination=target;
+  Ok(owners.len())
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch17_w2_exact_exit_forward_tests{
+ use super::*;
+ fn event(pid:u32,gen:u64)->ProcessEvent{
+  ProcessEvent{pid,kind:EventKind::Exited,value:gen}
+ }
+ fn setup()->(ProcessEvents<3>,[EventReceipt;2]){
+  let mut src=ProcessEvents::<3>::new();
+  src.enqueue(event(2,9)).unwrap();src.enqueue(event(3,7)).unwrap();
+  let mut r=[EventReceipt{sequence:0,event:event(2,9)};2];
+  src.snapshot_receipts(&mut r).unwrap();(src,r)
+ }
+ #[test]fn forwards_exact_two_exits_and_denies_duplicate_delivery(){
+  let (mut src,r)=setup();let mut dst=ProcessEvents::<3>::new();
+  assert_eq!(src.forward_exact_exit_batch(&mut dst,&r,&[(2,9),(3,7)]),Ok(2));
+  assert!(src.is_empty());assert_eq!(dst.len(),2);
+  assert_eq!(dst.peek(),Some(event(2,9)));
+  assert_eq!(src.forward_exact_exit_batch(&mut dst,&r,&[(2,9),(3,7)]),
+   Err(EventError::InvalidPid));
+ }
+ #[test]fn late_destination_capacity_rolls_back_both_queues(){
+  let (mut src,r)=setup();let mut dst=ProcessEvents::<2>::new();
+  dst.enqueue(event(8,2)).unwrap();
+  assert_eq!(src.forward_exact_exit_batch(&mut dst,&r,&[(2,9),(3,7)]),
+   Err(EventError::Full));
+  assert_eq!(src.len(),2);assert_eq!(dst.len(),1);
+  assert_eq!(src.peek_receipt(),Some(r[0]));
+ }
+ #[test]fn reused_pid_generation_and_wrong_kind_fail_without_mutation(){
+  let (mut src,r)=setup();let mut dst=ProcessEvents::<3>::new();
+  assert_eq!(src.forward_exact_exit_batch(&mut dst,&r,&[(2,10),(3,7)]),
+   Err(EventError::InvalidPid));
+  let mut other=r;other[1].event.kind=EventKind::Message;
+  assert_eq!(src.forward_exact_exit_batch(&mut dst,&other,&[(2,9),(3,7)]),
+   Err(EventError::InvalidPid));
+  assert_eq!(src.len(),2);assert_eq!(dst.len(),0);
+ }
+ #[test]fn replayed_receipt_or_pid1_exit_is_not_published(){
+  let (mut src,r)=setup();let mut dst=ProcessEvents::<3>::new();
+  assert_eq!(src.forward_exact_exit_batch(&mut dst,&[r[0],r[0]],
+   &[(2,9),(2,9)]),Err(EventError::InvalidPid));
+  assert_eq!(src.forward_exact_exit_batch(&mut dst,&r,&[(1,9),(3,7)]),
+   Err(EventError::InvalidPid));
+  assert_eq!(src.len(),2);
+ }
+ #[test]fn existing_target_generation_blocks_duplicate_source_exit(){
+  let (mut src,r)=setup();let mut dst=ProcessEvents::<3>::new();
+  dst.enqueue_exit_once(3,7).unwrap();
+  assert_eq!(src.forward_exact_exit_batch(&mut dst,&r,&[(2,9),(3,7)]),
+   Err(EventError::InvalidPid));
+  assert_eq!(src.len(),2);assert_eq!(dst.len(),1);
+ }
+}

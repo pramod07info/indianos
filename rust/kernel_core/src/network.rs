@@ -89,13 +89,24 @@ fn arp_request(out:&mut [u8],local_mac:[u8;6])->usize{
     out[38..42].copy_from_slice(&PEER_IP);
     42
 }
+/// P0-271..275: harden the ACTUAL polled virtio-net ARP handshake,
+/// not just a separately tested policy parser. An unsupported VLAN or
+/// unexpected trailing nonzero bytes cannot certify a gateway neighbor.
+/// The driver may report the unpadded 42-byte frame or a padded >=60-byte
+/// Ethernet frame (up to 64 bytes). Larger payloads are rejected.
 fn valid_arp(frame:&[u8],mac:[u8;6])->bool{
-    frame.len()>=42 && frame[..6]==mac && frame[6..12]==PEER_MAC &&
+    if frame.len()!=42 && !(60..=64).contains(&frame.len()) {
+        return false;
+    }
+    // The polled QEMU NIC is currently configured for untagged ingress.
+    // Do not silently treat an arbitrary VLAN as this trusted LAN.
+    frame[..6]==mac && frame[6..12]==PEER_MAC &&
     be16(&frame[12..14])==0x0806 &&
     be16(&frame[14..16])==1 && be16(&frame[16..18])==0x800 &&
     frame[18]==6 && frame[19]==4 && be16(&frame[20..22])==2 &&
     frame[22..28]==PEER_MAC && frame[28..32]==PEER_IP &&
-    frame[32..38]==mac && frame[38..42]==LOCAL_IP
+    frame[32..38]==mac && frame[38..42]==LOCAL_IP &&
+    frame[42..].iter().all(|&byte|byte==0)
 }
 fn icmp_request(out:&mut [u8],mac:[u8;6])->usize{
     ethernet_header(out,PEER_MAC,mac,0x0800);
@@ -292,11 +303,12 @@ pub fn run_demo<D:EthernetDevice>(
     dev:&mut D,mut stage:impl FnMut(&'static [u8])
 )->Result<(),Error>
 {
+    let nic_rx_fence=crate::nic_rx_fence::NicRxFence::new(1);
     transmit(dev,arp_request)?;
-    wait_for(dev,valid_arp)?;
+    wait_for_gateway_arp_fenced(dev,MAX_POLL,&nic_rx_fence,1)?;
     stage(b"IndianOS: R028 Ethernet ARP peer resolved\n\0");
     transmit(dev,icmp_request)?;
-    wait_for(dev,valid_icmp)?;
+    wait_for_icmp_echo_fenced(dev,MAX_POLL,&nic_rx_fence,1)?;
     stage(b"IndianOS: R028 IPv4 ICMP echo ping PASSED\n\0");
     // R114: the real QEMU NIC UDP receive route is now generation-bound
     // through the same registry/endpoint grant and validated owned ingress.
@@ -317,7 +329,7 @@ pub fn run_demo<D:EthernetDevice>(
     // virtio-net driver is POLLED and must never be called from a real IRQ.
     // R135: distinct software RX admissions for this one real QEMU NIC.
     // Physical IRQs remain masked; no claim of hardware DMA quiescence.
-    let nic_rx_fence=crate::nic_rx_fence::NicRxFence::new(1);
+    // R028 poll, including the initial ARP reply, shares this NIC lifetime.
     let ingress_gate=crate::retirement_gate::RetirementGate::new();
     ingress_gate.register_bsp(0,true).map_err(|_|Error::Unexpected)?;
     let ingress_permit=ingress_gate.try_enter(0,true)
@@ -3222,4 +3234,286 @@ mod r122_pre_poll_nic_permit_tests{
         assert_eq!(nic.drained(r),Ok(true));
         assert_eq!(nic.finish_rebind(r),Ok(2));
     }
+}
+
+
+
+#[cfg(test)]
+mod kernel_p0_batch13_w5_live_arp_handshake_tests{
+ use super::*;
+ const LOCAL_MAC:[u8;6]=[2,8,9,10,11,12];
+ fn packet()->[u8;60]{
+  let mut frame=[0u8;60];
+  frame[..6].copy_from_slice(&LOCAL_MAC);
+  frame[6..12].copy_from_slice(&PEER_MAC);
+  frame[12..14].copy_from_slice(&[8,6]);
+  frame[14..16].copy_from_slice(&[0,1]);
+  frame[16..18].copy_from_slice(&[8,0]);
+  frame[18]=6;frame[19]=4;
+  frame[20..22].copy_from_slice(&[0,2]);
+  frame[22..28].copy_from_slice(&PEER_MAC);
+  frame[28..32].copy_from_slice(&PEER_IP);
+  frame[32..38].copy_from_slice(&LOCAL_MAC);
+  frame[38..42].copy_from_slice(&LOCAL_IP);
+  frame
+ }
+ #[test]fn accepts_exact_unpadded_or_zero_padded_gateway_reply(){
+  let reply=packet();
+  assert!(valid_arp(&reply,LOCAL_MAC));
+  assert!(valid_arp(&reply[..42],LOCAL_MAC));
+  assert!(!valid_arp(&reply[..50],LOCAL_MAC));
+ }
+ #[test]fn malicious_trailing_payload_is_not_ignored_by_live_gateway_handshake(){
+  let mut reply=packet();reply[54]=7;
+  assert!(!valid_arp(&reply,LOCAL_MAC));
+  let mut extra=[0u8;65];extra[..60].copy_from_slice(&packet());
+  assert!(!valid_arp(&extra,LOCAL_MAC));
+ }
+ #[test]fn foreign_vlan_or_mac_or_arp_target_never_resolves_peer(){
+  let mut reply=packet();reply[12..14].copy_from_slice(&[0x81,0]);
+  assert!(!valid_arp(&reply,LOCAL_MAC));
+  let mut reply=packet();reply[6]^=0x04;
+  assert!(!valid_arp(&reply,LOCAL_MAC));
+  let mut reply=packet();reply[41]^=1;
+  assert!(!valid_arp(&reply,LOCAL_MAC));
+  let mut reply=packet();reply[20..22].copy_from_slice(&[0,1]);
+  assert!(!valid_arp(&reply,LOCAL_MAC));
+ }
+}
+
+
+
+/// P0-321..325: an ARP reply is admissible only during one exact NIC
+/// software receive ring admission. Check the concrete permit before and
+/// after parsing to reject teardown races; hardware IRQ/DMA still requires
+/// driver-specific quiescence and IOMMU fencing.
+pub fn validate_gateway_arp_under_rx_permit(
+ frame:&[u8],local_mac:[u8;6],
+ nic:&crate::nic_rx_fence::NicRxFence,
+ permit:&crate::nic_rx_fence::RxPermit<'_>,pinned_epoch:u64
+)->bool{
+ if pinned_epoch==0||permit.epoch()!=pinned_epoch||
+    !nic.permit_is_current(permit){return false;}
+ let valid=valid_arp(frame,local_mac);
+ valid&&nic.permit_is_current(permit)
+}
+#[cfg(test)]
+mod kernel_p0_batch15_w5_epoch_arp_tests{
+ use super::*;
+ use crate::nic_rx_fence::NicRxFence;
+ const MAC:[u8;6]=[2,8,9,10,11,12];
+ fn reply()->[u8;60]{
+  let mut f=[0u8;60];
+  f[..6].copy_from_slice(&MAC);
+  f[6..12].copy_from_slice(&PEER_MAC);
+  f[12..14].copy_from_slice(&[8,6]);
+  f[14..16].copy_from_slice(&[0,1]);
+  f[16..18].copy_from_slice(&[8,0]);
+  f[18]=6;f[19]=4;
+  f[20..22].copy_from_slice(&[0,2]);
+  f[22..28].copy_from_slice(&PEER_MAC);
+  f[28..32].copy_from_slice(&PEER_IP);
+  f[32..38].copy_from_slice(&MAC);
+  f[38..42].copy_from_slice(&LOCAL_IP);
+  f
+ }
+ #[test]fn exact_live_permit_accepts_only_valid_padded_gateway_reply(){
+  let nic=NicRxFence::new(9);let p=nic.try_admit(9).unwrap();
+  assert!(validate_gateway_arp_under_rx_permit(&reply(),MAC,&nic,&p,p.epoch()));
+  let mut corrupted=reply();corrupted[55]=5;
+  assert!(!validate_gateway_arp_under_rx_permit(
+   &corrupted,MAC,&nic,&p,p.epoch()));
+ }
+ #[test]fn wrong_epoch_and_foreign_ring_permit_are_denied(){
+  let a=NicRxFence::new(9);let b=NicRxFence::new(10);
+  let p=a.try_admit(9).unwrap();
+  assert!(!validate_gateway_arp_under_rx_permit(
+   &reply(),MAC,&a,&p,p.epoch()+1));
+  assert!(!validate_gateway_arp_under_rx_permit(
+   &reply(),MAC,&b,&p,p.epoch()));
+  assert!(!validate_gateway_arp_under_rx_permit(&reply(),MAC,&a,&p,0));
+ }
+ #[test]fn quiescence_revokes_inflight_response_before_ingress(){
+  let nic=NicRxFence::new(9);let p=nic.try_admit(9).unwrap();
+  let q=nic.begin_quiesce(9).unwrap();
+  assert!(!validate_gateway_arp_under_rx_permit(
+   &reply(),MAC,&nic,&p,p.epoch()));
+  assert_eq!(nic.drained(q),Ok(false));
+  drop(p);
+  assert_eq!(nic.drained(q),Ok(true));
+  assert_eq!(nic.finish_rebind(q),Ok(2));
+  let fresh=nic.try_admit(9).unwrap();
+  assert!(validate_gateway_arp_under_rx_permit(
+   &reply(),MAC,&nic,&fresh,2));
+ }
+}
+
+
+
+/// P0-351..355: gate the REAL QEMU ARP receive phase with an RX permit
+/// acquired before virtio descriptor polling. This hardens the actual
+/// R028 handshake instead of only unit testing a separate packet parser.
+/// The QEMU polled NIC has no live hardware IRQ/DMA shutdown qualification.
+pub fn wait_for_gateway_arp_fenced<D:EthernetDevice>(
+ dev:&mut D,limit:u32,nic:&crate::nic_rx_fence::NicRxFence,device_id:u32
+)->Result<(),Error>{
+ if limit==0||limit>MAX_POLL{return Err(Error::Invalid);}
+ let pinned_epoch=nic.epoch();
+ let owner_observation=crate::process_retirement_txn::ProcessRetirement::<1,1,1>::new();
+ wait_for_limit_fenced(dev,limit,nic,device_id,
+  ||owner_observation.capture_polled_ingress_revision(),
+  |_,permit,frame,mac|{
+   validate_gateway_arp_under_rx_permit(frame,mac,nic,permit,pinned_epoch)
+  })
+}
+#[cfg(test)]
+mod kernel_p0_batch16_w5_live_fenced_arp_tests{
+ use super::*;
+ use crate::nic_rx_fence::NicRxFence;
+ const MAC:[u8;6]=[2,8,9,10,11,12];
+ fn reply()->[u8;60]{
+  let mut f=[0u8;60];
+  f[..6].copy_from_slice(&MAC);f[6..12].copy_from_slice(&PEER_MAC);
+  f[12..14].copy_from_slice(&[8,6]);f[14..16].copy_from_slice(&[0,1]);
+  f[16..18].copy_from_slice(&[8,0]);f[18]=6;f[19]=4;
+  f[20..22].copy_from_slice(&[0,2]);
+  f[22..28].copy_from_slice(&PEER_MAC);f[28..32].copy_from_slice(&PEER_IP);
+  f[32..38].copy_from_slice(&MAC);f[38..42].copy_from_slice(&LOCAL_IP);
+  f
+ }
+ struct Device<'a>{calls:u32,frame:[u8;60],fence:Option<&'a NicRxFence>,
+  quiesce_on_poll:bool}
+ impl EthernetDevice for Device<'_>{
+  fn mac(&self)->[u8;6]{MAC}
+  fn send(&mut self,_:&[u8])->Result<(),Error>{Ok(())}
+  fn poll(&mut self,out:&mut[u8])->Result<Option<usize>,Error>{
+   self.calls+=1;
+   if self.quiesce_on_poll{
+    self.fence.unwrap().begin_quiesce(1).unwrap();
+   }
+   out[..60].copy_from_slice(&self.frame);
+   Ok(Some(60))
+  }
+ }
+ fn device<'a>(nic:&'a NicRxFence)->Device<'a>{
+  Device{calls:0,frame:reply(),fence:Some(nic),quiesce_on_poll:false}
+ }
+ #[test]fn actual_polled_arp_path_requires_live_receive_permit(){
+  let nic=NicRxFence::new(1);let mut dev=device(&nic);
+  assert_eq!(wait_for_gateway_arp_fenced(&mut dev,2,&nic,1),Ok(()));
+  assert_eq!(dev.calls,1);
+  let receipt=nic.begin_quiesce(1).unwrap();
+  assert_eq!(nic.drained(receipt),Ok(true));
+ }
+ #[test]fn malformed_gateway_is_not_confirmed_and_poll_budget_is_bounded(){
+  let nic=NicRxFence::new(1);let mut dev=device(&nic);
+  dev.frame[55]=9;
+  assert_eq!(wait_for_gateway_arp_fenced(&mut dev,2,&nic,1),
+   Err(Error::Timeout));
+  assert_eq!(dev.calls,2);
+  assert_eq!(wait_for_gateway_arp_fenced(&mut dev,0,&nic,1),
+   Err(Error::Invalid));
+ }
+ #[test]fn qemu_poll_teardown_race_revokes_reply_before_callback(){
+  let nic=NicRxFence::new(1);let mut dev=device(&nic);
+  dev.quiesce_on_poll=true;
+  assert_eq!(wait_for_gateway_arp_fenced(&mut dev,1,&nic,1),
+   Err(Error::Unexpected));
+  assert_eq!(dev.calls,1);
+  let receipt=nic.begin_quiesce(1);
+  assert!(receipt.is_err()); // teardown is already in progress
+ }
+ #[test]fn a_foreign_device_or_quiesced_ring_never_polls_authoritatively(){
+  let nic=NicRxFence::new(1);let mut dev=device(&nic);
+  assert_eq!(wait_for_gateway_arp_fenced(&mut dev,1,&nic,2),
+   Err(Error::Unexpected));
+  assert_eq!(dev.calls,0);
+  let receipt=nic.begin_quiesce(1).unwrap();
+  assert_eq!(wait_for_gateway_arp_fenced(&mut dev,1,&nic,1),
+   Err(Error::Unexpected));
+  assert_eq!(nic.drained(receipt),Ok(true));
+ }
+}
+
+
+
+/// P0-389..394: protect the actual R028 QEMU ICMP receive stage with
+/// the same pre-poll RX lifetime used for ARP/UDP. This is a software NIC
+/// protocol only; it cannot prove physical PCI DMA or IRQ remapping.
+pub fn wait_for_icmp_echo_fenced<D:EthernetDevice>(
+ dev:&mut D,limit:u32,nic:&crate::nic_rx_fence::NicRxFence,device_id:u32
+)->Result<(),Error>{
+ if limit==0||limit>MAX_POLL{return Err(Error::Invalid);}
+ let pinned=nic.epoch();
+ let observer=crate::process_retirement_txn::ProcessRetirement::<1,1,1>::new();
+ wait_for_limit_fenced(dev,limit,nic,device_id,
+  ||observer.capture_polled_ingress_revision(),
+  |_,permit,frame,mac|{
+   permit.epoch()==pinned&&nic.permit_is_current(permit)&&
+   valid_icmp(frame,mac)&&nic.permit_is_current(permit)
+  })
+}
+#[cfg(test)]
+mod kernel_p0_batch17_w5_real_icmp_fence_tests{
+ use super::*;
+ use crate::nic_rx_fence::NicRxFence;
+ const MAC:[u8;6]=[2,8,9,10,11,12];
+ fn echo()->([u8;FRAME_CAP],usize){
+  let mut f=[0u8;FRAME_CAP];let len=icmp_request(&mut f,MAC);
+  f[..6].copy_from_slice(&MAC);f[6..12].copy_from_slice(&PEER_MAC);
+  f[26..30].copy_from_slice(&PEER_IP);
+  f[30..34].copy_from_slice(&LOCAL_IP);
+  f[34]=0;put16(&mut f,36,0);
+  let icmp_sum=checksum(&f[34..len]);put16(&mut f,36,icmp_sum);
+  put16(&mut f,24,0);
+  let ip_sum=checksum(&f[14..34]);put16(&mut f,24,ip_sum);
+  (f,len)
+ }
+ struct Device<'a>{nic:&'a NicRxFence,count:usize,
+  frame:[u8;FRAME_CAP],len:usize,quiesce:bool}
+ impl EthernetDevice for Device<'_>{
+  fn mac(&self)->[u8;6]{MAC}
+  fn send(&mut self,_:&[u8])->Result<(),Error>{Ok(())}
+  fn poll(&mut self,out:&mut[u8])->Result<Option<usize>,Error>{
+   self.count+=1;
+   if self.quiesce{self.nic.begin_quiesce(5).unwrap();}
+   out[..self.len].copy_from_slice(&self.frame[..self.len]);
+   Ok(Some(self.len))
+  }
+ }
+ fn device(nic:&NicRxFence)->Device<'_>{
+  let (frame,len)=echo();
+  Device{nic,count:0,frame,len,quiesce:false}
+ }
+ #[test]fn valid_peer_echo_requires_actual_pre_poll_admission(){
+  let nic=NicRxFence::new(5);let mut d=device(&nic);
+  assert_eq!(wait_for_icmp_echo_fenced(&mut d,2,&nic,5),Ok(()));
+  assert_eq!(d.count,1);
+  let q=nic.begin_quiesce(5).unwrap();assert_eq!(nic.drained(q),Ok(true));
+ }
+ #[test]fn corrupt_echo_checksum_and_sequence_do_not_pass(){
+  let nic=NicRxFence::new(5);let mut d=device(&nic);
+  d.frame[41]^=1;
+  assert_eq!(wait_for_icmp_echo_fenced(&mut d,2,&nic,5),
+   Err(Error::Timeout));assert_eq!(d.count,2);
+  let mut other=device(&nic);other.frame[41]=2;
+  put16(&mut other.frame,36,0);
+  let new_checksum=checksum(&other.frame[34..other.len]);
+  put16(&mut other.frame,36,new_checksum);
+  assert_eq!(wait_for_icmp_echo_fenced(&mut other,1,&nic,5),
+   Err(Error::Timeout));
+ }
+ #[test]fn quiesce_race_between_poll_and_parser_denies_success(){
+  let nic=NicRxFence::new(5);let mut d=device(&nic);d.quiesce=true;
+  assert_eq!(wait_for_icmp_echo_fenced(&mut d,1,&nic,5),
+   Err(Error::Unexpected));
+  assert_eq!(d.count,1);
+ }
+ #[test]fn wrong_device_or_zero_budget_cannot_ack_an_echo(){
+  let nic=NicRxFence::new(5);let mut d=device(&nic);
+  assert_eq!(wait_for_icmp_echo_fenced(&mut d,1,&nic,6),
+   Err(Error::Unexpected));
+  assert_eq!(d.count,0);
+  assert_eq!(wait_for_icmp_echo_fenced(&mut d,0,&nic,5),Err(Error::Invalid));
+ }
 }

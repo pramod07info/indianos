@@ -15,6 +15,9 @@ pub trait BlockDevice {
     /// it supports durable flushes; a caller may require fsync semantics.
     /// Existing write_sector() contracts still mandate durable completion.
     fn sync(&mut self) -> Result<(), BlockError> { Err(BlockError::Io) }
+    /// Driver-provided media generation, when available. Drivers must
+    /// increment it after hot swap or reset. Unknown providers return None.
+    fn media_generation(&self)->Option<u64>{None}
 }
 
 /// A hard read-only capability. Even if a future discovery or diagnostic
@@ -25,16 +28,19 @@ pub struct ReadOnlyDevice<'a,D:BlockDevice>{
  // A read-only probe is bound to one geometry snapshot. Once a change
  // has been observed, resetting the size cannot resurrect a stale probe.
  parent_capacity:u64,
+ parent_generation:Option<u64>,
  invalidated:bool,
 }
 impl<'a,D:BlockDevice> ReadOnlyDevice<'a,D>{
  pub fn new(device:&'a mut D)->Self{
   let parent_capacity=device.sector_count();
-  Self{device,parent_capacity,invalidated:false}
+  let parent_generation=device.media_generation();
+  Self{device,parent_capacity,parent_generation,invalidated:false}
  }
  fn check_capacity(&mut self)->Result<(),BlockError>{
   if self.invalidated{return Err(BlockError::Io);}
-  if self.device.sector_count()!=self.parent_capacity{
+  if self.device.sector_count()!=self.parent_capacity ||
+     self.device.media_generation()!=self.parent_generation{
    self.invalidated=true;
    return Err(BlockError::Io);
   }
@@ -61,6 +67,7 @@ impl<D:BlockDevice> BlockDevice for ReadOnlyDevice<'_,D>{
  fn write_sector(&mut self,_lba:u64,_bytes:&[u8;SECTOR_BYTES])
   ->Result<(),BlockError>{Err(BlockError::ReadOnly)}
  fn sync(&mut self)->Result<(),BlockError>{Err(BlockError::ReadOnly)}
+ fn media_generation(&self)->Option<u64>{self.parent_generation}
 }
 /// Restrict access to a validated block-device window; no I/O occurs on construction.
 /// Destructive formatting is still an explicit responsibility of the caller.
@@ -72,6 +79,7 @@ pub struct BlockWindow<'a, D: BlockDevice> {
     // This is not a full device identity token: GPT mounts additionally
     // pin and recheck disk and partition GUIDs.
     parent_capacity: u64,
+    parent_generation: Option<u64>,
     // Once a capacity change is observed, never reauthorize this window
     // merely because a later capacity reading happens to match again.
     invalidated: bool,
@@ -79,17 +87,20 @@ pub struct BlockWindow<'a, D: BlockDevice> {
 impl<'a, D: BlockDevice> BlockWindow<'a, D> {
     pub fn new(device: &'a mut D, start: u64, count: u64) -> Result<Self, BlockError> {
         let parent_capacity = device.sector_count();
+        let parent_generation = device.media_generation();
         check_range(parent_capacity, start, count)?;
         // Capacity may change while validating the requested geometry.
         // Never authorize a new mount window from two inconsistent reads.
-        if device.sector_count() != parent_capacity { return Err(BlockError::Io); }
-        Ok(Self { device, start, count, parent_capacity, invalidated: false })
+        if device.sector_count() != parent_capacity ||
+           device.media_generation()!=parent_generation{return Err(BlockError::Io);}
+        Ok(Self { device, start, count, parent_capacity, parent_generation, invalidated: false })
     }
     pub fn sector_start(&self) -> u64 { self.start }
 
     fn check_parent_capacity(&mut self) -> Result<(), BlockError> {
         if self.invalidated { return Err(BlockError::Io); }
-        if self.device.sector_count() != self.parent_capacity {
+        if self.device.sector_count() != self.parent_capacity ||
+           self.device.media_generation()!=self.parent_generation {
             self.invalidated = true;
             return Err(BlockError::Io);
         }
@@ -120,6 +131,7 @@ impl<'a, D: BlockDevice> BlockWindow<'a, D> {
 }
 impl<D: BlockDevice> BlockDevice for BlockWindow<'_, D> {
     fn sector_count(&self) -> u64 { self.count }
+    fn media_generation(&self)->Option<u64>{self.parent_generation}
     fn read_sector(&mut self, lba: u64, out: &mut [u8; SECTOR_BYTES])
         -> Result<(), BlockError>
     {
@@ -175,6 +187,12 @@ pub fn check_range(capacity: u64, start: u64, count: u64) -> Result<(), BlockErr
     Ok(())
 }
 
+/// A driver that provides a generation token must retain the SAME media
+/// through a complete transfer; unchanged sector count alone is insufficient.
+fn media_snapshot_matches<D:BlockDevice>(device:&D,
+    capacity:u64,generation:Option<u64>)->bool{
+    device.sector_count()==capacity && device.media_generation()==generation
+}
 pub fn read_sectors<D: BlockDevice>(
     device: &mut D, start: u64, out: &mut [u8],
 ) -> Result<(), BlockError> {
@@ -183,12 +201,13 @@ pub fn read_sectors<D: BlockDevice>(
     }
     let count = (out.len() / SECTOR_BYTES) as u64;
     let capacity = device.sector_count();
+    let generation=device.media_generation();
     check_range(capacity, start, count)?;
     // Reject mid-transfer geometry changes instead of silently combining
     // data from different devices. A failed transfer clears all output.
     let mut sector = [0u8; SECTOR_BYTES];
     for index in 0..(count as usize) {
-        if device.sector_count() != capacity {
+        if !media_snapshot_matches(device,capacity,generation) {
             out.fill(0);
             return Err(BlockError::Io);
         }
@@ -196,7 +215,7 @@ pub fn read_sectors<D: BlockDevice>(
             out.fill(0);
             return Err(error);
         }
-        if device.sector_count() != capacity {
+        if !media_snapshot_matches(device,capacity,generation) {
             out.fill(0);
             return Err(BlockError::Io);
         }
@@ -214,14 +233,15 @@ pub fn write_sectors<D: BlockDevice>(
     }
     let count = (data.len() / SECTOR_BYTES) as u64;
     let capacity = device.sector_count();
+    let generation=device.media_generation();
     check_range(capacity, start, count)?;
     for (index, chunk) in data.chunks_exact(SECTOR_BYTES).enumerate() {
-        if device.sector_count() != capacity { return Err(BlockError::Io); }
+        if !media_snapshot_matches(device,capacity,generation) { return Err(BlockError::Io); }
         let sector: &[u8; SECTOR_BYTES] = chunk.try_into().map_err(|_| BlockError::Io)?;
         device.write_sector(start + index as u64, sector)?;
         // Previously completed sectors cannot be rolled back after a
         // capacity change: stop here and surface uncertain I/O to caller.
-        if device.sector_count() != capacity { return Err(BlockError::Io); }
+        if !media_snapshot_matches(device,capacity,generation) { return Err(BlockError::Io); }
     }
     Ok(())
 }
@@ -1305,13 +1325,14 @@ pub fn read_sectors_atomic<D:BlockDevice>(
  }
  let count=(out.len()/SECTOR_BYTES) as u64;
  let capacity=device.sector_count();
+ let generation=device.media_generation();
  check_range(capacity,start,count)?;
  let mut bytes=[0u8;SECTOR_BYTES*MAX_STAGED_READ_SECTORS];
  for i in 0..count as usize{
-  if device.sector_count()!=capacity{return Err(BlockError::Io);}
+  if !media_snapshot_matches(device,capacity,generation){return Err(BlockError::Io);}
   let mut sector=[0u8;SECTOR_BYTES];
   device.read_sector(start+i as u64,&mut sector)?;
-  if device.sector_count()!=capacity{return Err(BlockError::Io);}
+  if !media_snapshot_matches(device,capacity,generation){return Err(BlockError::Io);}
   let off=i*SECTOR_BYTES;bytes[off..off+SECTOR_BYTES].copy_from_slice(&sector);
  }
  out.copy_from_slice(&bytes[..out.len()]);
@@ -1345,4 +1366,1521 @@ mod m1_batch04_w2_block_tests{
   assert_eq!(read_sectors_atomic(&mut d,2,&mut output),Err(BlockError::OutOfRange));
   assert_eq!(d.reads,before);
  }
+}
+
+
+/// P0 follow-up W4: require two identical bounded disk observations before
+/// publishing metadata bytes. Detects geometry changes, torn driver output
+/// and reads that change between probes. This is not cryptographic media
+/// authentication or a substitute for a COW journal and durable flush.
+pub fn read_stable_sectors<D:BlockDevice>(device:&mut D,start:u64,
+ out:&mut[u8])->Result<(),BlockError>{
+ if out.is_empty()||out.len()%SECTOR_BYTES!=0||
+    out.len()>MAX_STAGED_READ_SECTORS*SECTOR_BYTES{
+  return Err(BlockError::OutOfRange);
+ }
+ let capacity=device.sector_count();
+ let generation=device.media_generation();
+ check_range(capacity,start,(out.len()/SECTOR_BYTES) as u64)?;
+ let mut first=[0u8;MAX_STAGED_READ_SECTORS*SECTOR_BYTES];
+ let mut second=[0u8;MAX_STAGED_READ_SECTORS*SECTOR_BYTES];
+ let n=out.len();
+ read_sectors_atomic(device,start,&mut first[..n])?;
+ // Both observations must come from one selected device geometry.
+ if !media_snapshot_matches(device,capacity,generation){return Err(BlockError::Io);}
+ read_sectors_atomic(device,start,&mut second[..n])?;
+ if !media_snapshot_matches(device,capacity,generation) || first[..n]!=second[..n]{
+    return Err(BlockError::Io);
+ }
+ out.copy_from_slice(&first[..n]);Ok(())
+}
+#[cfg(test)]
+mod kernel_p0_next_w4_storage_tests{
+ use super::*;
+ struct Disk{reads:u8,change:bool,fail:bool}
+ impl BlockDevice for Disk{
+  fn sector_count(&self)->u64{4}
+  fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   self.reads+=1;
+   if self.fail&&self.reads==2{return Err(BlockError::Io);}
+   out.fill(lba as u8+if self.change&&self.reads>=2{2}else{1});
+   Ok(())
+  }
+  fn write_sector(&mut self,_:u64,_:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   Err(BlockError::ReadOnly)
+  }
+ }
+ #[test]fn unchanging_read_produces_full_sector_and_detects_torn_second_pass(){
+  let mut good=Disk{reads:0,change:false,fail:false};
+  let mut out=[9u8;SECTOR_BYTES];
+  assert_eq!(read_stable_sectors(&mut good,1,&mut out),Ok(()));
+  assert_eq!(out,[2u8;SECTOR_BYTES]);
+  let mut bad=Disk{reads:0,change:true,fail:false};out.fill(17);
+  assert_eq!(read_stable_sectors(&mut bad,1,&mut out),Err(BlockError::Io));
+  assert_eq!(out,[17u8;SECTOR_BYTES]);
+ }
+ #[test]fn second_pass_io_failure_invalid_length_and_bounds_preserve_caller_bytes(){
+  let mut d=Disk{reads:0,change:false,fail:true};
+  let mut out=[4u8;SECTOR_BYTES];
+  assert_eq!(read_stable_sectors(&mut d,0,&mut out),Err(BlockError::Io));
+  assert_eq!(out,[4u8;SECTOR_BYTES]);
+  assert_eq!(read_stable_sectors(&mut d,4,&mut out),Err(BlockError::OutOfRange));
+  assert_eq!(out,[4u8;SECTOR_BYTES]);
+  assert_eq!(read_stable_sectors(&mut d,0,&mut out[..7]),Err(BlockError::OutOfRange));
+ }
+}
+
+
+/// P0 batch three W4: a permanently retiring, read-only, twice-observed
+/// block window for boot and partition metadata inspection. The disk is read
+/// through a capacity-pinned immutable logical window; mismatch, transport
+/// failure or media resize retires this view even if geometry later returns.
+pub struct StableReadOnlyWindow<'a,D:BlockDevice>{
+ device:&'a mut D,capacity:u64,invalidated:bool,
+}
+impl<'a,D:BlockDevice> StableReadOnlyWindow<'a,D>{
+ pub fn new(device:&'a mut D)->Result<Self,BlockError>{
+  let capacity=device.sector_count();
+  if capacity==0||capacity!=device.sector_count(){
+   return Err(BlockError::Io);
+  }
+  Ok(Self{device,capacity,invalidated:false})
+ }
+ pub fn is_retired(&self)->bool{self.invalidated}
+}
+impl<D:BlockDevice> BlockDevice for StableReadOnlyWindow<'_,D>{
+ fn sector_count(&self)->u64{self.capacity}
+ fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+  ->Result<(),BlockError>{
+  if self.invalidated{return Err(BlockError::Io);}
+  check_range(self.capacity,lba,1)?;
+  if self.device.sector_count()!=self.capacity{
+   self.invalidated=true;return Err(BlockError::Io);
+  }
+  let mut first=[0u8;SECTOR_BYTES];
+  let mut second=[0u8;SECTOR_BYTES];
+  let observed=(||{
+   self.device.read_sector(lba,&mut first)?;
+   if self.device.sector_count()!=self.capacity{return Err(BlockError::Io);}
+   self.device.read_sector(lba,&mut second)?;
+   if self.device.sector_count()!=self.capacity{return Err(BlockError::Io);}
+   if first!=second{return Err(BlockError::Io);}
+   Ok(())
+  })();
+  if observed.is_err(){self.invalidated=true;return observed;}
+  out.copy_from_slice(&first);Ok(())
+ }
+ fn write_sector(&mut self,_:u64,_:&[u8;SECTOR_BYTES])
+  ->Result<(),BlockError>{Err(BlockError::ReadOnly)}
+ fn sync(&mut self)->Result<(),BlockError>{Err(BlockError::ReadOnly)}
+}
+#[cfg(test)]
+mod kernel_p0_batch3_w4_block_window_tests{
+ use super::*;
+ struct Device{reads:usize,changing:bool,fail_at:usize,capacity:u64}
+ impl BlockDevice for Device{
+  fn sector_count(&self)->u64{self.capacity}
+  fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{
+   self.reads+=1;
+   if self.reads==self.fail_at{return Err(BlockError::Io);}
+   out.fill(lba as u8+if self.changing&&self.reads%2==0{2}else{1});
+   Ok(())
+  }
+  fn write_sector(&mut self,_:u64,_:&[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{Err(BlockError::ReadOnly)}
+ }
+ #[test]fn stable_sector_delivers_data_and_never_permits_mutations(){
+  let mut disk=Device{reads:0,changing:false,fail_at:0,capacity:8};
+  let mut view=StableReadOnlyWindow::new(&mut disk).unwrap();
+  let mut output=[99u8;SECTOR_BYTES];
+  assert_eq!(view.read_sector(2,&mut output),Ok(()));
+  assert_eq!(output,[3;SECTOR_BYTES]);
+  assert_eq!(view.write_sector(2,&output),Err(BlockError::ReadOnly));
+  assert_eq!(view.sync(),Err(BlockError::ReadOnly));
+ }
+ #[test]fn torn_second_read_retires_window_without_exposing_bytes(){
+  let mut disk=Device{reads:0,changing:true,fail_at:0,capacity:8};
+  let mut view=StableReadOnlyWindow::new(&mut disk).unwrap();
+  let mut output=[19u8;SECTOR_BYTES];
+  assert_eq!(view.read_sector(1,&mut output),Err(BlockError::Io));
+  assert_eq!(output,[19;SECTOR_BYTES]);assert!(view.is_retired());
+  assert_eq!(view.read_sector(1,&mut output),Err(BlockError::Io));
+ }
+ #[test]fn failed_second_read_and_new_media_geometry_both_revoke(){
+  let mut disk=Device{reads:0,changing:false,fail_at:2,capacity:8};
+  let mut view=StableReadOnlyWindow::new(&mut disk).unwrap();
+  let mut output=[33u8;SECTOR_BYTES];
+  assert_eq!(view.read_sector(1,&mut output),Err(BlockError::Io));
+  assert!(view.is_retired());assert_eq!(output,[33;SECTOR_BYTES]);
+  let mut disk=Device{reads:0,changing:false,fail_at:0,capacity:8};
+  let mut view=StableReadOnlyWindow::new(&mut disk).unwrap();
+  view.device.capacity=9;
+  assert_eq!(view.read_sector(0,&mut output),Err(BlockError::Io));
+  view.device.capacity=8;
+  assert_eq!(view.read_sector(0,&mut output),Err(BlockError::Io));
+ }
+}
+
+/// P0-73..75: two full-range observations inside the permanently retiring
+/// read-only sector view. No torn or failed read exposes partial output.
+impl<D:BlockDevice> StableReadOnlyWindow<'_,D>{
+ pub fn read_verified_range(&mut self,start:u64,out:&mut[u8])
+  ->Result<(),BlockError>{
+  let result=read_stable_sectors(self,start,out);
+  // A torn whole-range observation is just as fatal as an individual
+  // sector fault: never accept the same window again after mismatch.
+  if result==Err(BlockError::Io){self.invalidated=true;}
+  result
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch4_w4_range_tests{
+ use super::*;
+ struct Disk{reads:usize,change_after:usize,fail_at:usize}
+ impl BlockDevice for Disk{
+  fn sector_count(&self)->u64{8}
+  fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{
+   self.reads+=1;
+   if self.reads==self.fail_at{return Err(BlockError::Io);}
+   out.fill(lba as u8+if self.reads>=self.change_after{2}else{1});
+   Ok(())
+  }
+  fn write_sector(&mut self,_:u64,_:&[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{Err(BlockError::ReadOnly)}
+ }
+ #[test]fn double_range_observation_publishes_complete_read(){
+  let mut d=Disk{reads:0,change_after:usize::MAX,fail_at:0};
+  let mut w=StableReadOnlyWindow::new(&mut d).unwrap();
+  let mut bytes=[9u8;SECTOR_BYTES*2];
+  assert_eq!(w.read_verified_range(2,&mut bytes),Ok(()));
+  assert_eq!(&bytes[..SECTOR_BYTES],&[3;SECTOR_BYTES]);
+  assert_eq!(&bytes[SECTOR_BYTES..],&[4;SECTOR_BYTES]);
+  assert!(!w.is_retired());
+ }
+ #[test]fn late_fault_poison_is_sticky_and_does_not_publish(){
+  let mut d=Disk{reads:0,change_after:usize::MAX,fail_at:4};
+  let mut w=StableReadOnlyWindow::new(&mut d).unwrap();
+  let mut bytes=[77u8;SECTOR_BYTES*2];
+  assert_eq!(w.read_verified_range(1,&mut bytes),Err(BlockError::Io));
+  assert_eq!(bytes,[77;SECTOR_BYTES*2]);assert!(w.is_retired());
+  assert_eq!(w.read_verified_range(1,&mut bytes),Err(BlockError::Io));
+ }
+ #[test]fn changed_second_pass_and_out_of_bounds_fail_closed(){
+  let mut d=Disk{reads:0,change_after:3,fail_at:0};
+  let mut w=StableReadOnlyWindow::new(&mut d).unwrap();
+  let mut bytes=[88u8;SECTOR_BYTES];
+  assert_eq!(w.read_verified_range(0,&mut bytes),Err(BlockError::Io));
+  assert_eq!(bytes,[88;SECTOR_BYTES]);assert!(w.is_retired());
+  let mut d=Disk{reads:0,change_after:usize::MAX,fail_at:0};
+  let mut w=StableReadOnlyWindow::new(&mut d).unwrap();
+  assert_eq!(w.read_verified_range(8,&mut bytes),Err(BlockError::OutOfRange));
+  assert_eq!(bytes,[88;SECTOR_BYTES]);
+ }
+}
+
+/// P0-93..95: safely extract an unaligned sub-sector metadata field while
+/// verifying the full one- or two-sector span in private staging. Never
+/// mutate the caller's destination after a fault, torn read or invalid span.
+impl<D:BlockDevice> StableReadOnlyWindow<'_,D>{
+ pub fn read_verified_bytes(&mut self,lba:u64,offset:usize,
+  out:&mut[u8])->Result<(),BlockError>{
+  if offset>=SECTOR_BYTES||out.is_empty(){return Err(BlockError::OutOfRange);}
+  let end=offset.checked_add(out.len()).ok_or(BlockError::OutOfRange)?;
+  if end>SECTOR_BYTES*2{return Err(BlockError::OutOfRange);}
+  let sectors=(end+SECTOR_BYTES-1)/SECTOR_BYTES;
+  let mut staged=[0u8;SECTOR_BYTES*2];
+  self.read_verified_range(lba,&mut staged[..sectors*SECTOR_BYTES])?;
+  out.copy_from_slice(&staged[offset..end]);
+  Ok(())
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch5_w4_unaligned_metadata_tests{
+ use super::*;
+ struct Disk{reads:usize,fail_at:usize}
+ impl BlockDevice for Disk{
+  fn sector_count(&self)->u64{4}
+  fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{
+   self.reads+=1;
+   if self.reads==self.fail_at{return Err(BlockError::Io);}
+   out.fill(lba as u8);Ok(())
+  }
+  fn write_sector(&mut self,_:u64,_:&[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{Err(BlockError::ReadOnly)}
+ }
+ #[test] fn cross_sector_metadata_is_verified_before_publishing(){
+  let mut disk=Disk{reads:0,fail_at:0};
+  let mut view=StableReadOnlyWindow::new(&mut disk).unwrap();
+  let mut out=[99u8;4];
+  assert_eq!(view.read_verified_bytes(1,SECTOR_BYTES-2,&mut out),Ok(()));
+  assert_eq!(out,[1,1,2,2]);
+  assert!(!view.is_retired());
+ }
+ #[test] fn late_fault_keeps_destination_untouched_and_permanently_retires(){
+  let mut disk=Disk{reads:0,fail_at:6};
+  let mut view=StableReadOnlyWindow::new(&mut disk).unwrap();
+  let mut out=[77u8;4];
+  assert_eq!(view.read_verified_bytes(1,SECTOR_BYTES-2,&mut out),
+   Err(BlockError::Io));
+  assert_eq!(out,[77u8;4]);assert!(view.is_retired());
+  assert_eq!(view.read_verified_bytes(1,SECTOR_BYTES-2,&mut out),
+   Err(BlockError::Io));
+ }
+ #[test] fn invalid_offset_or_oversized_span_never_reads_media(){
+  let mut disk=Disk{reads:0,fail_at:0};
+  let mut view=StableReadOnlyWindow::new(&mut disk).unwrap();
+  let mut out=[10u8;SECTOR_BYTES*2];
+  assert_eq!(view.read_verified_bytes(0,1,&mut out),Err(BlockError::OutOfRange));
+  assert_eq!(view.read_verified_bytes(0,SECTOR_BYTES,&mut out[..1]),
+   Err(BlockError::OutOfRange));
+  assert_eq!(view.device.reads,0);
+  assert_eq!(out,[10u8;SECTOR_BYTES*2]);
+ }
+}
+/// P0-113..115: authenticated partition bounds are checked BEFORE reading
+/// any unaligned boot metadata. The two-pass permanently retiring media view
+/// still performs the real read and prevents partial destination publication.
+impl<D:BlockDevice> StableReadOnlyWindow<'_,D>{
+ pub fn read_partition_metadata_bytes(&mut self,
+  partition_start:u64,partition_sectors:u64,relative_lba:u64,
+  byte_offset:usize,out:&mut[u8])->Result<(),BlockError>{
+  check_range(self.capacity,partition_start,partition_sectors)?;
+  if byte_offset>=SECTOR_BYTES||out.is_empty(){return Err(BlockError::OutOfRange);}
+  let end=byte_offset.checked_add(out.len()).ok_or(BlockError::OutOfRange)?;
+  if end>2*SECTOR_BYTES{return Err(BlockError::OutOfRange);}
+  let sectors=((end+SECTOR_BYTES-1)/SECTOR_BYTES) as u64;
+  check_range(partition_sectors,relative_lba,sectors)?;
+  let actual_lba=partition_start.checked_add(relative_lba)
+   .ok_or(BlockError::OutOfRange)?;
+  self.read_verified_bytes(actual_lba,byte_offset,out)
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch6_w4_partition_metadata_tests{
+ use super::*;
+ struct Disk{reads:usize,fail_on:usize}
+ impl BlockDevice for Disk{
+  fn sector_count(&self)->u64{8}
+  fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{
+   self.reads+=1;
+   if self.reads==self.fail_on{return Err(BlockError::Io);}
+   out.fill(lba as u8);Ok(())
+  }
+  fn write_sector(&mut self,_:u64,_:&[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{Err(BlockError::ReadOnly)}
+ }
+ #[test] fn cross_sector_metadata_stays_within_authenticated_partition(){
+  let mut d=Disk{reads:0,fail_on:0};
+  let mut w=StableReadOnlyWindow::new(&mut d).unwrap();
+  let mut value=[88u8;4];
+  assert_eq!(w.read_partition_metadata_bytes(2,2,0,SECTOR_BYTES-2,&mut value),Ok(()));
+  assert_eq!(value,[2,2,3,3]);
+  let prior=w.device.reads;
+  value.fill(55);
+  assert_eq!(w.read_partition_metadata_bytes(2,2,1,SECTOR_BYTES-2,&mut value),
+   Err(BlockError::OutOfRange));
+  assert_eq!(w.read_partition_metadata_bytes(u64::MAX-1,3,0,0,&mut value),
+   Err(BlockError::OutOfRange));
+  assert_eq!(value,[55u8;4]);assert_eq!(w.device.reads,prior);
+ }
+ #[test] fn late_media_failure_poison_is_sticky_and_does_not_publish(){
+  let mut d=Disk{reads:0,fail_on:4};
+  let mut w=StableReadOnlyWindow::new(&mut d).unwrap();
+  let mut value=[77u8;4];
+  assert_eq!(w.read_partition_metadata_bytes(2,2,0,SECTOR_BYTES-2,&mut value),
+   Err(BlockError::Io));
+  assert_eq!(value,[77u8;4]);assert!(w.is_retired());
+  assert_eq!(w.read_partition_metadata_bytes(2,2,0,SECTOR_BYTES-2,&mut value),
+   Err(BlockError::Io));
+ }
+}
+
+
+/// P0-133..135: read two independent authenticated partition metadata fields
+/// with FOUR verified observations per field (two per full paired pass).
+/// Publish both outputs together only if every read succeeds and both paired
+/// passes agree. Device faults/torn snapshots retire the read-only view.
+impl<D:BlockDevice> StableReadOnlyWindow<'_,D>{
+ pub fn read_partition_metadata_pair(&mut self,
+  partition_start:u64,partition_sectors:u64,
+  first:(u64,usize),first_out:&mut[u8],
+  second:(u64,usize),second_out:&mut[u8])->Result<(),BlockError>{
+  if first_out.is_empty()||second_out.is_empty()||
+     first_out.len()>2*SECTOR_BYTES||second_out.len()>2*SECTOR_BYTES{
+   return Err(BlockError::OutOfRange);
+  }
+  let mut a=[0u8;2*SECTOR_BYTES];let mut b=[0u8;2*SECTOR_BYTES];
+  let mut later_a=[0u8;2*SECTOR_BYTES];
+  let mut later_b=[0u8;2*SECTOR_BYTES];
+  for (left,right) in [
+   (&mut a[..first_out.len()],&mut b[..second_out.len()]),
+   (&mut later_a[..first_out.len()],&mut later_b[..second_out.len()])
+  ]{
+   self.read_partition_metadata_bytes(partition_start,partition_sectors,
+    first.0,first.1,left)?;
+   self.read_partition_metadata_bytes(partition_start,partition_sectors,
+    second.0,second.1,right)?;
+  }
+  if a[..first_out.len()]!=later_a[..first_out.len()]||
+     b[..second_out.len()]!=later_b[..second_out.len()]{
+   self.invalidated=true;
+   return Err(BlockError::Io);
+  }
+  first_out.copy_from_slice(&a[..first_out.len()]);
+  second_out.copy_from_slice(&b[..second_out.len()]);
+  Ok(())
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch7_w4_atomic_pair_tests{
+ use super::*;
+ struct Disk{reads:usize,fail_at:usize,change_after:usize}
+ impl BlockDevice for Disk{
+  fn sector_count(&self)->u64{8}
+  fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{
+   self.reads+=1;
+   if self.reads==self.fail_at{return Err(BlockError::Io);}
+   let added=if self.reads>=self.change_after{5}else{0};
+   out.fill(lba as u8+added);Ok(())
+  }
+  fn write_sector(&mut self,_:u64,_:&[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{Err(BlockError::ReadOnly)}
+ }
+ #[test]fn successful_pair_copies_both_fields_together(){
+  let mut disk=Disk{reads:0,fail_at:0,change_after:usize::MAX};
+  let mut view=StableReadOnlyWindow::new(&mut disk).unwrap();
+  let mut a=[9u8;4];let mut b=[9u8;4];
+  assert_eq!(view.read_partition_metadata_pair(2,3,(0,SECTOR_BYTES-2),
+   &mut a,(1,0),&mut b),Ok(()));
+  assert_eq!(a,[2,2,3,3]);assert_eq!(b,[3,3,3,3]);
+  assert!(!view.is_retired());
+ }
+ #[test]fn late_io_fault_and_changed_snapshot_never_partially_publish(){
+  for (fault,change) in [(7,usize::MAX),(0,7)]{
+   let mut disk=Disk{reads:0,fail_at:fault,change_after:change};
+   let mut view=StableReadOnlyWindow::new(&mut disk).unwrap();
+   let mut a=[7u8;4];let mut b=[8u8;4];
+   assert_eq!(view.read_partition_metadata_pair(2,3,(0,SECTOR_BYTES-2),
+    &mut a,(1,0),&mut b),Err(BlockError::Io));
+   assert_eq!(a,[7;4]);assert_eq!(b,[8;4]);assert!(view.is_retired());
+  }
+ }
+ #[test]fn invalid_partition_span_never_writes_caller_buffers(){
+  let mut disk=Disk{reads:0,fail_at:0,change_after:usize::MAX};
+  let mut view=StableReadOnlyWindow::new(&mut disk).unwrap();
+  let mut a=[7u8;4];let mut b=[8u8;4];
+  assert_eq!(view.read_partition_metadata_pair(2,1,(0,SECTOR_BYTES-2),
+   &mut a,(1,0),&mut b),Err(BlockError::OutOfRange));
+  assert_eq!(a,[7;4]);assert_eq!(b,[8;4]);
+ }
+}
+
+
+/// P0-153..155: bind both partition metadata fields to independently pinned
+/// SHA-256 digests, while preserving all-or-none caller output. The digest
+/// must come from authenticated boot metadata, NOT the same untrusted disk.
+/// Mismatch permanently retires this view. Physical power-loss is separate.
+impl<D:BlockDevice> StableReadOnlyWindow<'_,D>{
+ pub fn read_partition_metadata_pair_sha256(
+  &mut self,partition_start:u64,partition_sectors:u64,
+  first:(u64,usize),first_out:&mut[u8],first_digest:[u8;32],
+  second:(u64,usize),second_out:&mut[u8],second_digest:[u8;32]
+ )->Result<(),BlockError>{
+  if first_out.is_empty()||second_out.is_empty()||
+     first_out.len()>2*SECTOR_BYTES||second_out.len()>2*SECTOR_BYTES{
+   return Err(BlockError::OutOfRange);
+  }
+  if first_digest==[0;32]||second_digest==[0;32]{
+   return Err(BlockError::OutOfRange);
+  }
+  let mut first_staged=[0u8;2*SECTOR_BYTES];
+  let mut second_staged=[0u8;2*SECTOR_BYTES];
+  self.read_partition_metadata_pair(
+   partition_start,partition_sectors,first,&mut first_staged[..first_out.len()],
+   second,&mut second_staged[..second_out.len()])?;
+  if crate::m2_sha256::digest(&first_staged[..first_out.len()])!=first_digest||
+     crate::m2_sha256::digest(&second_staged[..second_out.len()])!=second_digest{
+   self.invalidated=true;
+   return Err(BlockError::Io);
+  }
+  first_out.copy_from_slice(&first_staged[..first_out.len()]);
+  second_out.copy_from_slice(&second_staged[..second_out.len()]);
+  Ok(())
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch8_w4_metadata_hash_tests{
+ use super::*;
+ struct Disk{reads:usize,fail_at:usize}
+ impl BlockDevice for Disk{
+  fn sector_count(&self)->u64{8}
+  fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{
+   self.reads+=1;
+   if self.reads==self.fail_at{return Err(BlockError::Io);}
+   out.fill(lba as u8);Ok(())
+  }
+  fn write_sector(&mut self,_:u64,_:&[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{Err(BlockError::ReadOnly)}
+ }
+ #[test]fn authenticated_hashes_cover_both_real_metadata_outputs(){
+  let mut disk=Disk{reads:0,fail_at:0};
+  let mut view=StableReadOnlyWindow::new(&mut disk).unwrap();
+  let mut a=[9u8;4];let mut b=[9u8;4];
+  let a_hash=crate::m2_sha256::digest(&[2,2,3,3]);
+  let b_hash=crate::m2_sha256::digest(&[3,3,3,3]);
+  assert_eq!(view.read_partition_metadata_pair_sha256(
+   2,3,(0,SECTOR_BYTES-2),&mut a,a_hash,(1,0),&mut b,b_hash),Ok(()));
+  assert_eq!(a,[2,2,3,3]);assert_eq!(b,[3,3,3,3]);
+ }
+ #[test]fn changed_digest_or_fault_never_publishes_partial_values(){
+  let mut disk=Disk{reads:0,fail_at:0};
+  let mut view=StableReadOnlyWindow::new(&mut disk).unwrap();
+  let good=crate::m2_sha256::digest(&[2,2,3,3]);
+  let bad=crate::m2_sha256::digest(&[9,9,9,9]);
+  let mut a=[8u8;4];let mut b=[7u8;4];
+  assert_eq!(view.read_partition_metadata_pair_sha256(
+   2,3,(0,SECTOR_BYTES-2),&mut a,good,(1,0),&mut b,bad),
+   Err(BlockError::Io));
+  assert!(view.is_retired());assert_eq!(a,[8;4]);assert_eq!(b,[7;4]);
+  assert_eq!(view.read_partition_metadata_pair_sha256(
+   2,3,(0,SECTOR_BYTES-2),&mut a,good,(1,0),&mut b,bad),
+   Err(BlockError::Io));
+  let mut disk=Disk{reads:0,fail_at:5};
+  let mut view=StableReadOnlyWindow::new(&mut disk).unwrap();
+  assert_eq!(view.read_partition_metadata_pair_sha256(
+   2,3,(0,SECTOR_BYTES-2),&mut a,good,(1,0),&mut b,good),
+   Err(BlockError::Io));
+  assert_eq!(a,[8;4]);assert_eq!(b,[7;4]);
+ }
+}
+
+
+/// P0-173..175: bind metadata digest to partition identity and field location,
+/// not merely to unscoped value bytes. Only a separately authenticated signed
+/// manifest may supply expected hashes. Mismatch poisons the read-only view.
+pub fn domain_bound_metadata_sha256(partition_start:u64,
+ partition_sectors:u64,relative_lba:u64,byte_offset:usize,
+ value:&[u8])->Result<[u8;32],BlockError>{
+ if value.is_empty()||value.len()>2*SECTOR_BYTES||
+    byte_offset>=SECTOR_BYTES{
+  return Err(BlockError::OutOfRange);
+ }
+ let mut message=[0u8;40+2*SECTOR_BYTES];
+ message[..8].copy_from_slice(b"P0MDv009");
+ message[8..16].copy_from_slice(&partition_start.to_le_bytes());
+ message[16..24].copy_from_slice(&partition_sectors.to_le_bytes());
+ message[24..32].copy_from_slice(&relative_lba.to_le_bytes());
+ message[32..40].copy_from_slice(&(byte_offset as u64).to_le_bytes());
+ message[40..40+value.len()].copy_from_slice(value);
+ Ok(crate::m2_sha256::digest(&message[..40+value.len()]))
+}
+impl<D:BlockDevice> StableReadOnlyWindow<'_,D>{
+ pub fn read_partition_domain_bound_pair(
+  &mut self,start:u64,count:u64,
+  first:(u64,usize),first_out:&mut[u8],first_digest:[u8;32],
+  second:(u64,usize),second_out:&mut[u8],second_digest:[u8;32]
+ )->Result<(),BlockError>{
+  if first_out.is_empty()||second_out.is_empty()||
+     first_out.len()>2*SECTOR_BYTES||second_out.len()>2*SECTOR_BYTES||
+     first_digest==[0;32]||second_digest==[0;32]{
+   return Err(BlockError::OutOfRange);
+  }
+  let mut a=[0u8;2*SECTOR_BYTES];let mut b=[0u8;2*SECTOR_BYTES];
+  self.read_partition_metadata_pair(start,count,first,
+   &mut a[..first_out.len()],second,&mut b[..second_out.len()])?;
+  let da=domain_bound_metadata_sha256(start,count,first.0,first.1,
+   &a[..first_out.len()])?;
+  let db=domain_bound_metadata_sha256(start,count,second.0,second.1,
+   &b[..second_out.len()])?;
+  if da!=first_digest||db!=second_digest{
+   self.invalidated=true;return Err(BlockError::Io);
+  }
+  first_out.copy_from_slice(&a[..first_out.len()]);
+  second_out.copy_from_slice(&b[..second_out.len()]);
+  Ok(())
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch9_w4_domain_metadata_tests{
+ use super::*;
+ struct Disk{reads:usize,fail:usize}
+ impl BlockDevice for Disk{
+  fn sector_count(&self)->u64{8}
+  fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{
+   self.reads+=1;
+   if self.reads==self.fail{return Err(BlockError::Io);}
+   out.fill(lba as u8);Ok(())
+  }
+  fn write_sector(&mut self,_:u64,_:&[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{Err(BlockError::ReadOnly)}
+ }
+ #[test]fn signed_location_and_field_hash_are_bound_to_disk_read(){
+  let mut disk=Disk{reads:0,fail:0};
+  let mut view=StableReadOnlyWindow::new(&mut disk).unwrap();
+  let ad=domain_bound_metadata_sha256(2,3,0,SECTOR_BYTES-2,&[2,2,3,3]).unwrap();
+  let bd=domain_bound_metadata_sha256(2,3,1,0,&[3,3,3,3]).unwrap();
+  let mut a=[7u8;4];let mut b=[8u8;4];
+  assert_eq!(view.read_partition_domain_bound_pair(
+   2,3,(0,SECTOR_BYTES-2),&mut a,ad,(1,0),&mut b,bd),Ok(()));
+  assert_eq!(a,[2,2,3,3]);assert_eq!(b,[3,3,3,3]);
+  assert_ne!(ad,domain_bound_metadata_sha256(2,3,1,SECTOR_BYTES-2,
+   &[2,2,3,3]).unwrap());
+ }
+ #[test]fn foreign_partition_digest_and_io_fault_do_not_publish(){
+  let valid=domain_bound_metadata_sha256(2,3,0,SECTOR_BYTES-2,&[2,2,3,3]).unwrap();
+  let bad=domain_bound_metadata_sha256(2,4,1,0,&[3,3,3,3]).unwrap();
+  for fail in [0,5]{
+   let mut disk=Disk{reads:0,fail};
+   let mut view=StableReadOnlyWindow::new(&mut disk).unwrap();
+   let mut a=[7u8;4];let mut b=[8u8;4];
+   assert_eq!(view.read_partition_domain_bound_pair(
+    2,3,(0,SECTOR_BYTES-2),&mut a,valid,(1,0),&mut b,bad),Err(BlockError::Io));
+   assert_eq!(a,[7;4]);assert_eq!(b,[8;4]);assert!(view.is_retired());
+  }
+ }
+}
+
+
+/// P0-193..195: independently authenticated partition metadata fields must
+/// never alias each other, even across a sector boundary. A malformed pair is
+/// rejected before media I/O; successful copies remain all-or-nothing and a
+/// changed/torn/digest-mismatched view is permanently retired by the delegate.
+/// The trusted caller provides digests from a signed manifest, never disk.
+impl<D:BlockDevice> StableReadOnlyWindow<'_,D>{
+ pub fn read_disjoint_partition_domain_pair(
+  &mut self,start:u64,count:u64,
+  first:(u64,usize),first_out:&mut[u8],first_digest:[u8;32],
+  second:(u64,usize),second_out:&mut[u8],second_digest:[u8;32]
+ )->Result<(),BlockError>{
+  check_range(self.capacity,start,count)?;
+  if first_out.is_empty()||second_out.is_empty()||
+     first_out.len()>2*SECTOR_BYTES||second_out.len()>2*SECTOR_BYTES||
+     first.1>=SECTOR_BYTES||second.1>=SECTOR_BYTES{
+   return Err(BlockError::OutOfRange);
+  }
+  let size=SECTOR_BYTES as u128;
+  let a=(first.0 as u128)*size+(first.1 as u128);
+  let b=(second.0 as u128)*size+(second.1 as u128);
+  let a_end=a+(first_out.len() as u128);
+  let b_end=b+(second_out.len() as u128);
+  if a<b_end&&b<a_end{return Err(BlockError::OutOfRange);}
+  self.read_partition_domain_bound_pair(start,count,
+   first,first_out,first_digest,second,second_out,second_digest)
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch10_w4_disjoint_manifest_tests{
+ use super::*;
+ struct Disk{reads:usize,changed:bool}
+ impl BlockDevice for Disk{
+  fn sector_count(&self)->u64{8}
+  fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{
+   self.reads+=1;out.fill(lba as u8);
+   if self.changed&&self.reads==4{out[0]^=1;}
+   Ok(())
+  }
+  fn write_sector(&mut self,_:u64,_:&[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{Err(BlockError::ReadOnly)}
+ }
+ #[test]fn cross_sector_alias_is_denied_before_read(){
+  let mut disk=Disk{reads:0,changed:false};
+  let mut window=StableReadOnlyWindow::new(&mut disk).unwrap();
+  let mut a=[9;4];let mut b=[8;4];
+  assert_eq!(window.read_disjoint_partition_domain_pair(
+   2,3,(0,SECTOR_BYTES-2),&mut a,[1;32],
+   (1,0),&mut b,[2;32]),Err(BlockError::OutOfRange));
+  assert_eq!(window.device.reads,0);
+  assert_eq!(a,[9;4]);assert_eq!(b,[8;4]);
+ }
+ #[test]fn disjoint_signed_fields_commit_only_if_both_stable(){
+  let first=domain_bound_metadata_sha256(2,3,0,0,&[2;4]).unwrap();
+  let second=domain_bound_metadata_sha256(2,3,1,0,&[3;4]).unwrap();
+  let mut disk=Disk{reads:0,changed:false};
+  let mut window=StableReadOnlyWindow::new(&mut disk).unwrap();
+  let mut a=[9;4];let mut b=[8;4];
+  assert_eq!(window.read_disjoint_partition_domain_pair(
+   2,3,(0,0),&mut a,first,(1,0),&mut b,second),Ok(()));
+  assert_eq!(a,[2;4]);assert_eq!(b,[3;4]);
+  let mut disk=Disk{reads:0,changed:true};
+  let mut window=StableReadOnlyWindow::new(&mut disk).unwrap();
+  let mut a=[9;4];let mut b=[8;4];
+  assert_eq!(window.read_disjoint_partition_domain_pair(
+   2,3,(0,0),&mut a,first,(1,0),&mut b,second),Err(BlockError::Io));
+  assert_eq!(a,[9;4]);assert_eq!(b,[8;4]);assert!(window.is_retired());
+ }
+}
+
+
+
+/// P0-213..215: read three separately signed, disjoint partition metadata
+/// fields, with one complete repeat of the first two after the third has
+/// been observed. Preflight all ranges before I/O; never publish a partial
+/// caller buffer. A changed digest or read fault retires this media session.
+impl<D:BlockDevice> StableReadOnlyWindow<'_,D>{
+ pub fn read_disjoint_partition_domain_triple(
+  &mut self,start:u64,count:u64,
+  positions:[(u64,usize);3],digests:[[u8;32];3],
+  outputs:[&mut[u8];3]
+ )->Result<(),BlockError>{
+  check_range(self.capacity,start,count)?;
+  let mut lens=[0usize;3];
+  let mut begins=[0u128;3];
+  let mut ends=[0u128;3];
+  for i in 0..3{
+   lens[i]=outputs[i].len();
+   if lens[i]==0||lens[i]>2*SECTOR_BYTES||positions[i].1>=SECTOR_BYTES||
+      digests[i]==[0u8;32]{
+    return Err(BlockError::OutOfRange);
+   }
+   begins[i]=(positions[i].0 as u128)*SECTOR_BYTES as u128+
+     positions[i].1 as u128;
+   ends[i]=begins[i]+lens[i] as u128;
+   if ends[i]>(count as u128)*SECTOR_BYTES as u128{
+    return Err(BlockError::OutOfRange);
+   }
+   for j in 0..i{
+    if begins[i]<ends[j]&&begins[j]<ends[i]{
+     return Err(BlockError::OutOfRange);
+    }
+   }
+  }
+  let mut a=[0u8;2*SECTOR_BYTES];
+  let mut b=[0u8;2*SECTOR_BYTES];
+  let mut c=[0u8;2*SECTOR_BYTES];
+  self.read_partition_domain_bound_pair(start,count,
+   positions[0],&mut a[..lens[0]],digests[0],
+   positions[1],&mut b[..lens[1]],digests[1])?;
+  self.read_partition_metadata_bytes(start,count,positions[2].0,
+   positions[2].1,&mut c[..lens[2]])?;
+  if domain_bound_metadata_sha256(start,count,positions[2].0,
+     positions[2].1,&c[..lens[2]])?!=digests[2]{
+   self.invalidated=true;return Err(BlockError::Io);
+  }
+  let mut re_a=[0u8;2*SECTOR_BYTES];
+  let mut re_b=[0u8;2*SECTOR_BYTES];
+  self.read_partition_domain_bound_pair(start,count,
+   positions[0],&mut re_a[..lens[0]],digests[0],
+   positions[1],&mut re_b[..lens[1]],digests[1])?;
+  if a[..lens[0]]!=re_a[..lens[0]]||b[..lens[1]]!=re_b[..lens[1]]{
+   self.invalidated=true;return Err(BlockError::Io);
+  }
+  let [out_a,out_b,out_c]=outputs;
+  out_a.copy_from_slice(&a[..lens[0]]);
+  out_b.copy_from_slice(&b[..lens[1]]);
+  out_c.copy_from_slice(&c[..lens[2]]);
+  Ok(())
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch11_w4_triple_metadata_tests{
+ use super::*;
+ struct Disk{reads:usize,fail_at:usize,flip_after:usize}
+ impl BlockDevice for Disk{
+  fn sector_count(&self)->u64{9}
+  fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{
+   self.reads+=1;
+   if self.reads==self.fail_at{return Err(BlockError::Io);}
+   out.fill(lba as u8+if self.reads>=self.flip_after{1}else{0});
+   Ok(())
+  }
+  fn write_sector(&mut self,_:u64,_:&[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{Err(BlockError::ReadOnly)}
+ }
+ fn digests()->[[u8;32];3]{
+  [2u8,3,4].map(|v|domain_bound_metadata_sha256(
+   2,4,(v-2) as u64,0,&[v;4]).unwrap())
+ }
+ #[test]fn three_fields_publish_together_after_repeated_observation(){
+  let mut disk=Disk{reads:0,fail_at:0,flip_after:usize::MAX};
+  let mut view=StableReadOnlyWindow::new(&mut disk).unwrap();
+  let mut a=[9;4];let mut b=[9;4];let mut c=[9;4];
+  assert_eq!(view.read_disjoint_partition_domain_triple(
+   2,4,[(0,0),(1,0),(2,0)],digests(),
+   [&mut a,&mut b,&mut c]),Ok(()));
+  assert_eq!(a,[2;4]);assert_eq!(b,[3;4]);assert_eq!(c,[4;4]);
+  assert!(!view.is_retired());
+ }
+ #[test]fn overlap_and_fault_prevent_all_publication(){
+  let mut disk=Disk{reads:0,fail_at:0,flip_after:usize::MAX};
+  let mut view=StableReadOnlyWindow::new(&mut disk).unwrap();
+  let mut a=[9;4];let mut b=[9;4];let mut c=[9;4];
+  assert_eq!(view.read_disjoint_partition_domain_triple(
+   2,4,[(0,0),(0,2),(2,0)],digests(),
+   [&mut a,&mut b,&mut c]),Err(BlockError::OutOfRange));
+  assert_eq!(view.device.reads,0);
+  let mut disk=Disk{reads:0,fail_at:5,flip_after:usize::MAX};
+  let mut view=StableReadOnlyWindow::new(&mut disk).unwrap();
+  assert_eq!(view.read_disjoint_partition_domain_triple(
+   2,4,[(0,0),(1,0),(2,0)],digests(),
+   [&mut a,&mut b,&mut c]),Err(BlockError::Io));
+  assert_eq!(a,[9;4]);assert_eq!(b,[9;4]);assert_eq!(c,[9;4]);
+  assert!(view.is_retired());
+ }
+ #[test]fn altered_signed_third_field_poisoned_forever(){
+  let mut disk=Disk{reads:0,fail_at:0,flip_after:5};
+  let mut view=StableReadOnlyWindow::new(&mut disk).unwrap();
+  let mut a=[9;4];let mut b=[9;4];let mut c=[9;4];
+  assert_eq!(view.read_disjoint_partition_domain_triple(
+   2,4,[(0,0),(1,0),(2,0)],digests(),
+   [&mut a,&mut b,&mut c]),Err(BlockError::Io));
+  assert!(view.is_retired());
+  assert_eq!(a,[9;4]);assert_eq!(b,[9;4]);assert_eq!(c,[9;4]);
+ }
+}
+
+
+
+/// P0-236..240: a real boot metadata read must be tied to an externally
+/// managed media revision, not only to identical sector contents. Read each
+/// of three disjoint authenticated fields TWICE (including the third) with a
+/// driver-owned revision observation before, between and after both reads.
+/// No caller output is modified until all observations agree. This does not
+/// replace a real drive power-loss / flush ordering qualification.
+impl<D:BlockDevice> StableReadOnlyWindow<'_,D>{
+ pub fn read_revision_pinned_metadata_triple(
+  &mut self,start:u64,count:u64,positions:[(u64,usize);3],
+  digests:[[u8;32];3],expected_revision:u64,
+  mut media_revision:impl FnMut()->u64,
+  outputs:[&mut[u8];3]
+ )->Result<(),BlockError>{
+  const MAX_FIELD:usize=256;
+  if expected_revision==0||outputs.iter().any(|out|
+    out.is_empty()||out.len()>MAX_FIELD){
+   return Err(BlockError::OutOfRange);
+  }
+  if self.invalidated{return Err(BlockError::Io);}
+  if media_revision()!=expected_revision{
+   self.invalidated=true;return Err(BlockError::Io);
+  }
+  let lengths=outputs.each_ref().map(|out|out.len());
+  let mut one=[[0u8;MAX_FIELD];3];
+  let mut two=[[0u8;MAX_FIELD];3];
+  let [a,b,c]=&mut one;
+  self.read_disjoint_partition_domain_triple(
+   start,count,positions,digests,
+   [&mut a[..lengths[0]],&mut b[..lengths[1]],&mut c[..lengths[2]]])?;
+  if media_revision()!=expected_revision{
+   self.invalidated=true;return Err(BlockError::Io);
+  }
+  let [a,b,c]=&mut two;
+  self.read_disjoint_partition_domain_triple(
+   start,count,positions,digests,
+   [&mut a[..lengths[0]],&mut b[..lengths[1]],&mut c[..lengths[2]]])?;
+  if media_revision()!=expected_revision{
+   self.invalidated=true;return Err(BlockError::Io);
+  }
+  if (0..3).any(|i|one[i][..lengths[i]]!=two[i][..lengths[i]]){
+   self.invalidated=true;return Err(BlockError::Io);
+  }
+  let [out_a,out_b,out_c]=outputs;
+  out_a.copy_from_slice(&one[0][..lengths[0]]);
+  out_b.copy_from_slice(&one[1][..lengths[1]]);
+  out_c.copy_from_slice(&one[2][..lengths[2]]);
+  Ok(())
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch12_w4_revision_pinned_storage_tests{
+ use super::*;
+ use core::cell::Cell;
+ struct Disk{reads:usize,fail_at:usize}
+ impl BlockDevice for Disk{
+  fn sector_count(&self)->u64{9}
+  fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{
+   self.reads+=1;
+   if self.reads==self.fail_at{return Err(BlockError::Io);}
+   out.fill(lba as u8);Ok(())
+  }
+  fn write_sector(&mut self,_:u64,_:&[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{Err(BlockError::ReadOnly)}
+ }
+ fn hashes()->[[u8;32];3]{
+  [0u64,1,2].map(|n|domain_bound_metadata_sha256(
+   2,4,n,0,&[(2+n) as u8;4]).unwrap())
+ }
+ #[test]fn two_complete_triples_commit_under_unchanged_media_revision(){
+  let mut d=Disk{reads:0,fail_at:0};
+  let mut view=StableReadOnlyWindow::new(&mut d).unwrap();
+  let mut a=[9;4];let mut b=[9;4];let mut c=[9;4];
+  let mut observations=0;
+  assert_eq!(view.read_revision_pinned_metadata_triple(
+   2,4,[(0,0),(1,0),(2,0)],hashes(),17,
+   ||{observations+=1;17},[&mut a,&mut b,&mut c]),Ok(()));
+  assert_eq!(observations,3);
+  assert_eq!(a,[2;4]);assert_eq!(b,[3;4]);assert_eq!(c,[4;4]);
+  assert!(!view.is_retired());
+ }
+ #[test]fn media_rebind_between_passes_poisoned_and_no_partial_output(){
+  let mut d=Disk{reads:0,fail_at:0};
+  let mut view=StableReadOnlyWindow::new(&mut d).unwrap();
+  let calls=Cell::new(0usize);
+  let mut a=[9;4];let mut b=[9;4];let mut c=[9;4];
+  assert_eq!(view.read_revision_pinned_metadata_triple(
+   2,4,[(0,0),(1,0),(2,0)],hashes(),17,
+   ||{calls.set(calls.get()+1);if calls.get()<3{17}else{18}},
+   [&mut a,&mut b,&mut c]),Err(BlockError::Io));
+  assert!(view.is_retired());
+  assert_eq!(a,[9;4]);assert_eq!(b,[9;4]);assert_eq!(c,[9;4]);
+ }
+ #[test]fn stale_before_io_and_io_error_do_not_publish(){
+  let mut d=Disk{reads:0,fail_at:0};
+  let mut view=StableReadOnlyWindow::new(&mut d).unwrap();
+  let mut a=[9;4];let mut b=[9;4];let mut c=[9;4];
+  assert_eq!(view.read_revision_pinned_metadata_triple(
+   2,4,[(0,0),(1,0),(2,0)],hashes(),17,||18,
+   [&mut a,&mut b,&mut c]),Err(BlockError::Io));
+  assert_eq!(view.device.reads,0);
+  let mut d=Disk{reads:0,fail_at:5};
+  let mut view=StableReadOnlyWindow::new(&mut d).unwrap();
+  assert_eq!(view.read_revision_pinned_metadata_triple(
+   2,4,[(0,0),(1,0),(2,0)],hashes(),17,||17,
+   [&mut a,&mut b,&mut c]),Err(BlockError::Io));
+  assert_eq!(a,[9;4]);assert_eq!(b,[9;4]);assert_eq!(c,[9;4]);
+  assert!(view.is_retired());
+ }
+}
+
+
+
+/// P0-266..270: exact media revision and authenticated metadata identity
+/// give a bounded diagnostic receipt for a complete stable triple. The
+/// fingerprint is SHA-256 of the expected domain-bound digests and geometry;
+/// it is NOT a signature or hardware durability attestation.
+#[derive(Clone,Copy,Debug,Eq,PartialEq)]
+pub struct StableMetadataReceipt{
+ pub media_revision:u64,
+ pub fingerprint:[u8;32],
+}
+pub fn metadata_snapshot_fingerprint(
+ partition_start:u64,partition_sectors:u64,
+ positions:[(u64,usize);3],digests:[[u8;32];3],
+ media_revision:u64
+)->Result<StableMetadataReceipt,BlockError>{
+ if media_revision==0||partition_sectors==0||
+    partition_start.checked_add(partition_sectors).is_none()||
+    digests.iter().any(|d|*d==[0;32]){
+  return Err(BlockError::OutOfRange);
+ }
+ let mut transcript=[0u8;176];
+ transcript[0..8].copy_from_slice(b"P0MDv013");
+ transcript[8..16].copy_from_slice(&partition_start.to_le_bytes());
+ transcript[16..24].copy_from_slice(&partition_sectors.to_le_bytes());
+ transcript[24..32].copy_from_slice(&media_revision.to_le_bytes());
+ for i in 0..3{
+  if positions[i].0>=partition_sectors||positions[i].1>=SECTOR_BYTES{
+   return Err(BlockError::OutOfRange);
+  }
+  let at=32+i*48;
+  transcript[at..at+8].copy_from_slice(&positions[i].0.to_le_bytes());
+  transcript[at+8..at+16].copy_from_slice(&(positions[i].1 as u64).to_le_bytes());
+  transcript[at+16..at+48].copy_from_slice(&digests[i]);
+ }
+ Ok(StableMetadataReceipt{
+  media_revision,
+  fingerprint:crate::m2_sha256::digest(&transcript),
+ })
+}
+impl<D:BlockDevice> StableReadOnlyWindow<'_,D>{
+ pub fn read_revision_receipted_metadata_triple(
+  &mut self,start:u64,count:u64,positions:[(u64,usize);3],
+  digests:[[u8;32];3],expected_revision:u64,
+  media_revision:impl FnMut()->u64,outputs:[&mut[u8];3]
+ )->Result<StableMetadataReceipt,BlockError>{
+  let receipt=metadata_snapshot_fingerprint(
+   start,count,positions,digests,expected_revision)?;
+  self.read_revision_pinned_metadata_triple(
+   start,count,positions,digests,expected_revision,media_revision,outputs)?;
+  Ok(receipt)
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch13_w4_stable_metadata_receipt_tests{
+ use super::*;
+ struct Disk{reads:usize}
+ impl BlockDevice for Disk{
+  fn sector_count(&self)->u64{9}
+  fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{
+   self.reads+=1;out.fill(lba as u8);Ok(())
+  }
+  fn write_sector(&mut self,_:u64,_:&[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{Err(BlockError::ReadOnly)}
+ }
+ fn positions()->[(u64,usize);3]{[(0,0),(1,0),(2,0)]}
+ fn digests()->[[u8;32];3]{
+  [0u64,1,2].map(|lba|domain_bound_metadata_sha256(
+   2,4,lba,0,&[(lba+2) as u8;4]).unwrap())
+ }
+ #[test]fn stable_signed_triple_emits_exact_domain_and_revision_receipt(){
+  let mut d=Disk{reads:0};
+  let mut view=StableReadOnlyWindow::new(&mut d).unwrap();
+  let mut a=[9;4];let mut b=[9;4];let mut c=[9;4];
+  let receipt=view.read_revision_receipted_metadata_triple(
+   2,4,positions(),digests(),88,||88,[&mut a,&mut b,&mut c]).unwrap();
+  assert_eq!(a,[2;4]);assert_eq!(b,[3;4]);assert_eq!(c,[4;4]);
+  assert_eq!(receipt,metadata_snapshot_fingerprint(
+   2,4,positions(),digests(),88).unwrap());
+  assert_ne!(receipt,metadata_snapshot_fingerprint(
+   2,4,positions(),digests(),89).unwrap());
+  assert_ne!(receipt,metadata_snapshot_fingerprint(
+   2,4,[(1,0),(0,0),(2,0)],digests(),88).unwrap());
+ }
+ #[test]fn changed_revision_before_io_retires_view_without_output(){
+  let mut d=Disk{reads:0};
+  let mut view=StableReadOnlyWindow::new(&mut d).unwrap();
+  let mut a=[9;4];let mut b=[9;4];let mut c=[9;4];
+  assert_eq!(view.read_revision_receipted_metadata_triple(
+   2,4,positions(),digests(),88,||89,[&mut a,&mut b,&mut c]),
+   Err(BlockError::Io));
+  assert!(view.is_retired());assert_eq!(view.device.reads,0);
+  assert_eq!(a,[9;4]);assert_eq!(b,[9;4]);assert_eq!(c,[9;4]);
+ }
+ #[test]fn invalid_geometry_has_no_device_access(){
+  let mut d=Disk{reads:0};
+  let mut view=StableReadOnlyWindow::new(&mut d).unwrap();
+  let mut a=[9;4];let mut b=[9;4];let mut c=[9;4];
+  assert_eq!(view.read_revision_receipted_metadata_triple(
+   2,4,[(0,0),(4,0),(2,0)],digests(),88,||88,
+   [&mut a,&mut b,&mut c]),Err(BlockError::OutOfRange));
+  assert_eq!(view.device.reads,0);
+ }
+}
+
+
+/// P0-292..294: a revision-pinned, byte-identical redundant sector read.
+/// Neither unverified media copy nor a stale receipt can reach caller memory.
+/// Unlike a signed-file verifier this only checks two independent LBAs against
+/// one another; a trusted manifest must authenticate the resulting digest.
+#[derive(Clone,Copy,Debug,Eq,PartialEq)]
+pub struct MirroredSectorReceipt{
+ pub revision:u64,pub primary_lba:u64,pub secondary_lba:u64,
+ pub digest:[u8;32],
+}
+impl<D:BlockDevice> StableReadOnlyWindow<'_,D>{
+ pub fn read_mirrored_sector_at_revision(
+  &mut self,primary:u64,secondary:u64,expected_revision:u64,
+  mut observe_revision:impl FnMut()->u64,out:&mut[u8;SECTOR_BYTES]
+ )->Result<MirroredSectorReceipt,BlockError>{
+  if self.invalidated{return Err(BlockError::Io);}
+  if primary==secondary||expected_revision==0||
+     check_range(self.capacity,primary,1).is_err()||
+     check_range(self.capacity,secondary,1).is_err(){
+   return Err(BlockError::OutOfRange);
+  }
+  if observe_revision()!=expected_revision{
+   self.invalidated=true;return Err(BlockError::Io);
+  }
+  let mut first=[0u8;SECTOR_BYTES];
+  let mut second=[0u8;SECTOR_BYTES];
+  self.read_sector(primary,&mut first)?;
+  if observe_revision()!=expected_revision{
+   self.invalidated=true;return Err(BlockError::Io);
+  }
+  self.read_sector(secondary,&mut second)?;
+  if observe_revision()!=expected_revision||first!=second{
+   self.invalidated=true;return Err(BlockError::Io);
+  }
+  let receipt=MirroredSectorReceipt{revision:expected_revision,
+   primary_lba:primary,secondary_lba:secondary,
+   digest:crate::m2_sha256::digest(&first)};
+  out.copy_from_slice(&first);
+  Ok(receipt)
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch14_w4_mirrored_sector_tests{
+ use super::*;
+ struct Disk{reads:usize,changing:bool}
+ impl BlockDevice for Disk{
+  fn sector_count(&self)->u64{8}
+  fn read_sector(&mut self,_lba:u64,out:&mut[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{
+   self.reads+=1;out.fill(if self.changing&&self.reads>=3{7}else{2});
+   Ok(())
+  }
+  fn write_sector(&mut self,_:u64,_:&[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{Err(BlockError::ReadOnly)}
+ }
+ #[test]fn identical_mirrors_publish_one_authenticated_snapshot_candidate(){
+  let mut disk=Disk{reads:0,changing:false};
+  let mut view=StableReadOnlyWindow::new(&mut disk).unwrap();
+  let mut out=[0;SECTOR_BYTES];
+  let receipt=view.read_mirrored_sector_at_revision(1,5,19,||19,&mut out)
+   .unwrap();
+  assert_eq!(out,[2;SECTOR_BYTES]);assert_eq!(receipt.revision,19);
+  assert_eq!(receipt.primary_lba,1);assert_eq!(receipt.secondary_lba,5);
+  assert_eq!(receipt.digest,crate::m2_sha256::digest(&out));
+  assert_eq!(view.device.reads,4);
+ }
+ #[test]fn modified_copy_or_revision_retires_without_partial_output(){
+  let mut disk=Disk{reads:0,changing:true};
+  let mut view=StableReadOnlyWindow::new(&mut disk).unwrap();
+  let mut out=[9;SECTOR_BYTES];
+  assert_eq!(view.read_mirrored_sector_at_revision(1,5,19,||19,&mut out),
+   Err(BlockError::Io));
+  assert!(view.is_retired());assert_eq!(out,[9;SECTOR_BYTES]);
+  assert_eq!(view.read_mirrored_sector_at_revision(1,5,19,||19,&mut out),
+   Err(BlockError::Io));
+  let mut disk=Disk{reads:0,changing:false};
+  let mut view=StableReadOnlyWindow::new(&mut disk).unwrap();
+  assert_eq!(view.read_mirrored_sector_at_revision(1,5,19,||20,&mut out),
+   Err(BlockError::Io));
+  assert_eq!(view.device.reads,0);assert!(view.is_retired());
+ }
+}
+
+
+
+/// P0-316..320: redundant sector equality alone is not authenticity.
+/// Require a trusted manifest SHA-256 digest before releasing either copy
+/// to the caller; digest mismatch permanently retires this media view.
+/// The caller must authenticate the manifest out of band.
+impl<D:BlockDevice> StableReadOnlyWindow<'_,D>{
+ pub fn read_manifest_authenticated_mirrors(
+  &mut self,primary:u64,secondary:u64,revision:u64,
+  expected_sha256:[u8;32],media_revision:impl FnMut()->u64,
+  out:&mut[u8;SECTOR_BYTES]
+ )->Result<MirroredSectorReceipt,BlockError>{
+  if expected_sha256==[0;32]{return Err(BlockError::OutOfRange);}
+  let mut scratch=[0u8;SECTOR_BYTES];
+  let receipt=self.read_mirrored_sector_at_revision(
+   primary,secondary,revision,media_revision,&mut scratch)?;
+  if receipt.digest!=expected_sha256{
+   self.invalidated=true;
+   return Err(BlockError::Io);
+  }
+  out.copy_from_slice(&scratch);
+  Ok(receipt)
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch15_w4_manifest_mirrors_tests{
+ use super::*;
+ struct Device{reads:u32,alter:bool}
+ impl BlockDevice for Device{
+  fn sector_count(&self)->u64{8}
+  fn read_sector(&mut self,_:u64,out:&mut[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{
+   self.reads+=1;out.fill(if self.alter&&self.reads==3{8}else{7});
+   Ok(())
+  }
+  fn write_sector(&mut self,_:u64,_:&[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{Err(BlockError::ReadOnly)}
+ }
+ fn good()->[u8;32]{crate::m2_sha256::digest(&[7;SECTOR_BYTES])}
+ #[test]fn matching_mirrors_and_manifest_release_authenticated_bytes(){
+  let mut device=Device{reads:0,alter:false};
+  let mut view=StableReadOnlyWindow::new(&mut device).unwrap();
+  let mut out=[0;SECTOR_BYTES];
+  let receipt=view.read_manifest_authenticated_mirrors(
+   1,5,27,good(),||27,&mut out).unwrap();
+  assert_eq!(receipt.digest,good());
+  assert_eq!(out,[7;SECTOR_BYTES]);assert_eq!(view.device.reads,4);
+ }
+ #[test]fn matching_but_untrusted_mirrors_do_not_reach_caller(){
+  let mut device=Device{reads:0,alter:false};
+  let mut view=StableReadOnlyWindow::new(&mut device).unwrap();
+  let mut out=[9;SECTOR_BYTES];
+  assert_eq!(view.read_manifest_authenticated_mirrors(
+   1,5,27,crate::m2_sha256::digest(&[8;SECTOR_BYTES]),
+   ||27,&mut out),Err(BlockError::Io));
+  assert_eq!(out,[9;SECTOR_BYTES]);assert!(view.is_retired());
+  assert_eq!(view.read_manifest_authenticated_mirrors(
+   1,5,27,good(),||27,&mut out),Err(BlockError::Io));
+ }
+ #[test]fn unequal_disk_copies_never_release_partial_content(){
+  let mut device=Device{reads:0,alter:true};
+  let mut view=StableReadOnlyWindow::new(&mut device).unwrap();
+  let mut out=[9;SECTOR_BYTES];
+  assert_eq!(view.read_manifest_authenticated_mirrors(
+   1,5,27,good(),||27,&mut out),Err(BlockError::Io));
+  assert!(view.is_retired());assert_eq!(out,[9;SECTOR_BYTES]);
+ }
+ #[test]fn stale_revision_and_bad_geometry_reject_without_publication(){
+  let mut device=Device{reads:0,alter:false};
+  let mut view=StableReadOnlyWindow::new(&mut device).unwrap();
+  let mut out=[9;SECTOR_BYTES];
+  assert_eq!(view.read_manifest_authenticated_mirrors(
+   1,1,27,good(),||27,&mut out),Err(BlockError::OutOfRange));
+  assert_eq!(view.device.reads,0);
+  assert_eq!(view.read_manifest_authenticated_mirrors(
+   1,5,27,good(),||28,&mut out),Err(BlockError::Io));
+  assert_eq!(out,[9;SECTOR_BYTES]);assert!(view.is_retired());
+ }
+}
+
+
+
+/// P0-346..350: atomically read TWO separately manifest-authenticated
+/// redundant metadata sectors at one media revision. Four physical LBAs
+/// must be distinct; neither output receives bytes until both records pass
+/// all duplicate observations, digests and final media-revision probe.
+impl<D:BlockDevice> StableReadOnlyWindow<'_,D>{
+ pub fn read_authenticated_mirror_pair(
+  &mut self,lbas:[(u64,u64);2],revision:u64,
+  expected:[[u8;32];2],mut observe_revision:impl FnMut()->u64,
+  outputs:[&mut[u8;SECTOR_BYTES];2]
+ )->Result<[MirroredSectorReceipt;2],BlockError>{
+  let indices=[lbas[0].0,lbas[0].1,lbas[1].0,lbas[1].1];
+  if self.invalidated||revision==0||
+     expected.iter().any(|digest|*digest==[0;32]){
+   return Err(BlockError::OutOfRange);
+  }
+  for (i,&lba) in indices.iter().enumerate(){
+   if indices[..i].contains(&lba)||check_range(self.capacity,lba,1).is_err(){
+    return Err(BlockError::OutOfRange);
+   }
+  }
+  let mut first=[0u8;SECTOR_BYTES];
+  let mut second=[0u8;SECTOR_BYTES];
+  let first_receipt=self.read_manifest_authenticated_mirrors(
+   lbas[0].0,lbas[0].1,revision,expected[0],&mut observe_revision,&mut first)?;
+  let second_receipt=self.read_manifest_authenticated_mirrors(
+   lbas[1].0,lbas[1].1,revision,expected[1],&mut observe_revision,&mut second)?;
+  if observe_revision()!=revision{
+   self.invalidated=true;return Err(BlockError::Io);
+  }
+  let [first_out,second_out]=outputs;
+  first_out.copy_from_slice(&first);
+  second_out.copy_from_slice(&second);
+  Ok([first_receipt,second_receipt])
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch16_w4_two_mirror_records_tests{
+ use super::*;
+ use core::cell::Cell;
+ struct Disk{read_count:u32,damage_late:bool}
+ impl BlockDevice for Disk{
+  fn sector_count(&self)->u64{8}
+  fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{
+   self.read_count+=1;
+   let mut byte=if lba==1||lba==4{7}else{8};
+   if self.damage_late&&self.read_count>=7{byte=9;}
+   out.fill(byte);Ok(())
+  }
+  fn write_sector(&mut self,_:u64,_:&[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{Err(BlockError::ReadOnly)}
+ }
+ fn expectations()->[[u8;32];2]{
+  [crate::m2_sha256::digest(&[7;SECTOR_BYTES]),
+   crate::m2_sha256::digest(&[8;SECTOR_BYTES])]
+ }
+ #[test]fn both_mirror_pairs_publish_only_after_all_eight_reads(){
+  let mut d=Disk{read_count:0,damage_late:false};
+  let mut view=StableReadOnlyWindow::new(&mut d).unwrap();
+  let mut one=[0;SECTOR_BYTES];let mut two=[0;SECTOR_BYTES];
+  let receipts=view.read_authenticated_mirror_pair(
+   [(1,4),(2,5)],55,expectations(),||55,[&mut one,&mut two]).unwrap();
+  assert_eq!(one,[7;SECTOR_BYTES]);assert_eq!(two,[8;SECTOR_BYTES]);
+  assert_eq!(receipts[0].digest,expectations()[0]);
+  assert_eq!(receipts[1].digest,expectations()[1]);
+  assert_eq!(view.device.read_count,8);
+ }
+ #[test]fn late_corruption_of_second_record_preserves_both_callers(){
+  let mut d=Disk{read_count:0,damage_late:true};
+  let mut view=StableReadOnlyWindow::new(&mut d).unwrap();
+  let mut one=[9;SECTOR_BYTES];let mut two=[9;SECTOR_BYTES];
+  assert_eq!(view.read_authenticated_mirror_pair(
+   [(1,4),(2,5)],55,expectations(),||55,[&mut one,&mut two]),
+   Err(BlockError::Io));
+  assert!(view.is_retired());
+  assert_eq!(one,[9;SECTOR_BYTES]);assert_eq!(two,[9;SECTOR_BYTES]);
+ }
+ #[test]fn duplicate_lbas_and_bad_geometry_reject_before_io(){
+  let mut d=Disk{read_count:0,damage_late:false};
+  let mut view=StableReadOnlyWindow::new(&mut d).unwrap();
+  let mut one=[9;SECTOR_BYTES];let mut two=[9;SECTOR_BYTES];
+  for pairs in [[(1,4),(4,5)],[(1,4),(2,9)],[(1,1),(2,5)]]{
+   assert_eq!(view.read_authenticated_mirror_pair(
+    pairs,55,expectations(),||55,[&mut one,&mut two]),
+    Err(BlockError::OutOfRange));
+  }
+  assert_eq!(view.device.read_count,0);
+ }
+ #[test]fn media_revision_change_after_reads_never_exposes_bytes(){
+  let mut d=Disk{read_count:0,damage_late:false};
+  let mut view=StableReadOnlyWindow::new(&mut d).unwrap();
+  let mut one=[9;SECTOR_BYTES];let mut two=[9;SECTOR_BYTES];
+  let calls=Cell::new(0u32);
+  let result=view.read_authenticated_mirror_pair(
+   [(1,4),(2,5)],55,expectations(),||{
+    calls.set(calls.get()+1);
+    if calls.get()>6{56}else{55}
+   },[&mut one,&mut two]);
+  assert_eq!(result,Err(BlockError::Io));assert!(view.is_retired());
+  assert_eq!(one,[9;SECTOR_BYTES]);assert_eq!(two,[9;SECTOR_BYTES]);
+ }
+}
+
+
+
+/// P0-382..388: recover one corrupt copy in a *three*-replica read-only
+/// metadata quorum. All physical replicas are independent LBAs, each is
+/// observed twice at the same trusted media revision. Only two replicas
+/// that individually match the authenticated manifest can authorize output.
+/// No repairing write or physical power-loss qualification is implied.
+#[derive(Clone,Copy,Debug,Eq,PartialEq)]
+pub struct MetadataQuorumReceipt{
+ pub revision:u64,pub accepted_replicas:u8,pub digest:[u8;32],
+}
+impl<D:BlockDevice> StableReadOnlyWindow<'_,D>{
+ pub fn read_manifest_triple_quorum(
+  &mut self,lbas:[u64;3],revision:u64,expected:[u8;32],
+  mut observe_revision:impl FnMut()->u64,
+  out:&mut[u8;SECTOR_BYTES]
+ )->Result<MetadataQuorumReceipt,BlockError>{
+  if self.invalidated{return Err(BlockError::Io);}
+  if revision==0||expected==[0;32]{
+   return Err(BlockError::OutOfRange);
+  }
+  for i in 0..3{
+   if lbas[..i].contains(&lbas[i])||
+      check_range(self.capacity,lbas[i],1).is_err(){
+    return Err(BlockError::OutOfRange);
+   }
+  }
+  let mut accepted=0u8;
+  let mut trusted=[0u8;SECTOR_BYTES];
+  for &lba in &lbas{
+   if observe_revision()!=revision{
+    self.invalidated=true;return Err(BlockError::Io);
+   }
+   let mut first=[0u8;SECTOR_BYTES];
+   let mut second=[0u8;SECTOR_BYTES];
+   self.read_sector(lba,&mut first)?;
+   if observe_revision()!=revision{
+    self.invalidated=true;return Err(BlockError::Io);
+   }
+   self.read_sector(lba,&mut second)?;
+   if observe_revision()!=revision{
+    self.invalidated=true;return Err(BlockError::Io);
+   }
+   if first==second&&crate::m2_sha256::digest(&first)==expected{
+    trusted=first;accepted+=1;
+   }
+  }
+  if observe_revision()!=revision{
+   self.invalidated=true;return Err(BlockError::Io);
+  }
+  if accepted<2{
+   self.invalidated=true;return Err(BlockError::Io);
+  }
+  out.copy_from_slice(&trusted);
+  Ok(MetadataQuorumReceipt{revision,accepted_replicas:accepted,
+   digest:expected})
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch17_w4_three_copy_quorum_tests{
+ use super::*;
+ use core::cell::Cell;
+ struct Disk{reads:usize,bad:[bool;3],different_on_second:bool}
+ impl BlockDevice for Disk{
+  fn sector_count(&self)->u64{9}
+  fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{
+   self.reads+=1;
+   let idx=if lba==1{0}else if lba==3{1}else{2};
+   let corrupt=self.bad[idx]||(self.different_on_second&&self.reads==8);
+   out.fill(if corrupt{9}else{7});
+   Ok(())
+  }
+  fn write_sector(&mut self,_:u64,_:&[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{Err(BlockError::ReadOnly)}
+ }
+ fn sig()->[u8;32]{crate::m2_sha256::digest(&[7;SECTOR_BYTES])}
+ #[test]fn one_bad_replica_is_tolerated_only_with_two_authenticated_copies(){
+  let mut d=Disk{reads:0,bad:[true,false,false],different_on_second:false};
+  let mut view=StableReadOnlyWindow::new(&mut d).unwrap();
+  let mut out=[0;SECTOR_BYTES];
+  let proof=view.read_manifest_triple_quorum([1,3,5],23,sig(),||23,&mut out).unwrap();
+  assert_eq!(proof.accepted_replicas,2);
+  assert_eq!(out,[7;SECTOR_BYTES]);assert_eq!(view.device.reads,12);
+  assert!(!view.is_retired());
+ }
+ #[test]fn two_bad_copies_reject_and_retire_without_output(){
+  let mut d=Disk{reads:0,bad:[true,true,false],different_on_second:false};
+  let mut view=StableReadOnlyWindow::new(&mut d).unwrap();
+  let mut out=[4;SECTOR_BYTES];
+  assert_eq!(view.read_manifest_triple_quorum([1,3,5],23,sig(),||23,&mut out),
+   Err(BlockError::Io));
+  assert_eq!(out,[4;SECTOR_BYTES]);assert!(view.is_retired());
+ }
+ #[test]fn unstable_single_copy_cannot_count_as_an_accepted_quorum_member(){
+  let mut d=Disk{reads:0,bad:[true,false,false],different_on_second:true};
+  let mut view=StableReadOnlyWindow::new(&mut d).unwrap();
+  let mut out=[4;SECTOR_BYTES];
+  assert_eq!(view.read_manifest_triple_quorum([1,3,5],23,sig(),||23,&mut out),
+   Err(BlockError::Io));
+  assert!(view.is_retired());assert_eq!(out,[4;SECTOR_BYTES]);
+ }
+ #[test]fn stale_media_revision_after_last_read_aborts_publish(){
+  let mut d=Disk{reads:0,bad:[false,false,false],different_on_second:false};
+  let mut view=StableReadOnlyWindow::new(&mut d).unwrap();
+  let mut out=[4;SECTOR_BYTES];
+  let seen=Cell::new(0u32);
+  assert_eq!(view.read_manifest_triple_quorum([1,3,5],23,sig(),||{
+   seen.set(seen.get()+1);if seen.get()>9{24}else{23}
+  },&mut out),Err(BlockError::Io));
+  assert_eq!(out,[4;SECTOR_BYTES]);assert!(view.is_retired());
+ }
+ #[test]fn repeated_and_out_of_range_sector_ids_preflight_without_reads(){
+  let mut d=Disk{reads:0,bad:[false,false,false],different_on_second:false};
+  let mut view=StableReadOnlyWindow::new(&mut d).unwrap();
+  let mut out=[4;SECTOR_BYTES];
+  assert_eq!(view.read_manifest_triple_quorum([1,1,5],23,sig(),||23,&mut out),
+   Err(BlockError::OutOfRange));
+  assert_eq!(view.read_manifest_triple_quorum([1,3,10],23,sig(),||23,&mut out),
+   Err(BlockError::OutOfRange));
+  assert_eq!(view.device.reads,0);assert_eq!(out,[4;SECTOR_BYTES]);
+ }
+}
+
+
+// P0-502–508: reject media swap between two internally stable observations.
+#[cfg(test)]
+mod kernel_p0_batch20_w4_tests{
+    use super::*;
+    use core::cell::Cell;
+    struct ChangingGeometry { reads:u32, geometry_calls:Cell<u32>, changed:bool }
+    impl BlockDevice for ChangingGeometry{
+        fn sector_count(&self)->u64{
+            let calls=self.geometry_calls.get()+1;
+            self.geometry_calls.set(calls);
+            if self.changed && calls>=6 { 6 } else { 4 }
+        }
+        fn read_sector(&mut self,_:u64,out:&mut[u8;SECTOR_BYTES])
+            ->Result<(),BlockError>{
+            self.reads+=1;out.fill(0x7b);Ok(())
+        }
+        fn write_sector(&mut self,_:u64,_:&[u8;SECTOR_BYTES])
+            ->Result<(),BlockError>{Err(BlockError::ReadOnly)}
+    }
+    #[test]
+    fn kernel_p0_batch20_w4_two_consistent_but_foreign_media_denied(){
+        let mut d=ChangingGeometry{reads:0,geometry_calls:Cell::new(0),changed:true};
+        let mut out=[0x55u8;SECTOR_BYTES];
+        assert_eq!(read_stable_sectors(&mut d,0,&mut out),Err(BlockError::Io));
+        assert_eq!(out,[0x55;SECTOR_BYTES]);
+        assert_eq!(d.reads,2);
+    }
+    #[test]
+    fn kernel_p0_batch20_w4_stable_media_publishes_only_after_both_reads(){
+        let mut d=ChangingGeometry{reads:0,geometry_calls:Cell::new(0),changed:false};
+        let mut out=[0x55u8;SECTOR_BYTES];
+        assert_eq!(read_stable_sectors(&mut d,0,&mut out),Ok(()));
+        assert_eq!(out,[0x7b;SECTOR_BYTES]);
+        assert_eq!(d.reads,2);
+    }
+}
+
+
+// P0-542: same-capacity media replacement revokes kernel block views when
+// the actual driver supplies a generation token (None remains unqualified).
+#[cfg(test)]
+mod kernel_p0_batch21_w4_tests{
+    use super::*;use core::cell::Cell;
+    struct Disk<'a>{generation:&'a Cell<u64>}
+    impl BlockDevice for Disk<'_>{
+        fn sector_count(&self)->u64{8}
+        fn media_generation(&self)->Option<u64>{Some(self.generation.get())}
+        fn read_sector(&mut self,_:u64,out:&mut[u8;SECTOR_BYTES])
+            ->Result<(),BlockError>{out.fill(0x54);Ok(())}
+        fn write_sector(&mut self,_:u64,_:&[u8;SECTOR_BYTES])
+            ->Result<(),BlockError>{Ok(())}
+        fn sync(&mut self)->Result<(),BlockError>{Ok(())}
+    }
+    #[test]fn kernel_p0_batch21_w4_window_stays_revoked_after_media_reverts(){
+        let token=Cell::new(7u64);let mut disk=Disk{generation:&token};
+        let mut volume=BlockWindow::new(&mut disk,2,3).unwrap();
+        let mut out=[0x21;SECTOR_BYTES];
+        assert_eq!(volume.media_generation(),Some(7));
+        assert_eq!(volume.read_sector(0,&mut out),Ok(()));
+        token.set(8);
+        assert_eq!(volume.write_sector(1,&[2;SECTOR_BYTES]),Err(BlockError::Io));
+        token.set(7);
+        assert_eq!(volume.read_sector(0,&mut out),Err(BlockError::Io));
+        assert_eq!(volume.sync(),Err(BlockError::Io));
+    }
+    #[test]fn kernel_p0_batch21_w4_read_only_generation_denies_reuse(){
+        let token=Cell::new(1u64);let mut disk=Disk{generation:&token};
+        let mut view=ReadOnlyDevice::new(&mut disk);let mut out=[0x11;SECTOR_BYTES];
+        token.set(2);
+        assert_eq!(view.read_sector(1,&mut out),Err(BlockError::Io));
+        assert_eq!(out,[0x11;SECTOR_BYTES]);
+        token.set(1);
+        assert_eq!(view.read_sector(1,&mut out),Err(BlockError::Io));
+    }
+}
+
+
+// Batch22 W4 P0-571..574: real bulk read/write/metadata operations must
+// reject same-capacity removable-media swaps when driver reports an epoch.
+#[cfg(test)]
+mod kernel_p0_batch22_w4_tests {
+    use super::*;use core::cell::Cell;
+    struct Disk{epoch:Cell<u64>,reads:u32,writes:u32,flip_read:u32,flip_write:u32}
+    impl Disk{
+        fn new()->Self{
+            Self{epoch:Cell::new(1),reads:0,writes:0,flip_read:0,flip_write:0}
+        }
+    }
+    impl BlockDevice for Disk{
+        fn sector_count(&self)->u64{8}
+        fn media_generation(&self)->Option<u64>{Some(self.epoch.get())}
+        fn read_sector(&mut self,_:u64,out:&mut [u8;SECTOR_BYTES])
+            ->Result<(),BlockError>{
+            self.reads+=1;out.fill(0x71);
+            if self.reads==self.flip_read{self.epoch.set(2);}
+            Ok(())
+        }
+        fn write_sector(&mut self,_:u64,_:&[u8;SECTOR_BYTES])
+            ->Result<(),BlockError>{
+            self.writes+=1;
+            if self.writes==self.flip_write{self.epoch.set(2);}
+            Ok(())
+        }
+    }
+    #[test]fn kernel_p0_batch22_w4_571_bulk_read_discards_mixed_media(){
+        let mut disk=Disk::new();disk.flip_read=1;
+        let mut output=[0xaau8;SECTOR_BYTES*2];
+        assert_eq!(read_sectors(&mut disk,0,&mut output),Err(BlockError::Io));
+        assert_eq!(disk.reads,1);
+        assert_eq!(output,[0u8;SECTOR_BYTES*2]);
+    }
+    #[test]fn kernel_p0_batch22_w4_572_write_stops_after_media_replacement(){
+        let mut disk=Disk::new();disk.flip_write=1;
+        assert_eq!(write_sectors(&mut disk,0,&[2u8;SECTOR_BYTES*2]),
+            Err(BlockError::Io));
+        assert_eq!(disk.writes,1);
+    }
+    #[test]fn kernel_p0_batch22_w4_573_atomic_read_preserves_output(){
+        let mut disk=Disk::new();disk.flip_read=1;
+        let mut output=[0xaau8;SECTOR_BYTES*2];
+        assert_eq!(read_sectors_atomic(&mut disk,0,&mut output),
+            Err(BlockError::Io));
+        assert_eq!(output,[0xaau8;SECTOR_BYTES*2]);
+    }
+    #[test]fn kernel_p0_batch22_w4_574_stable_probe_denies_epoch_change(){
+        let mut disk=Disk::new();disk.flip_read=2;
+        let mut output=[0xaau8;SECTOR_BYTES];
+        assert_eq!(read_stable_sectors(&mut disk,0,&mut output),
+            Err(BlockError::Io));
+        assert_eq!(output,[0xaau8;SECTOR_BYTES]);
+        disk=Disk::new();
+        assert_eq!(read_stable_sectors(&mut disk,0,&mut output),Ok(()));
+        assert_eq!(output,[0x71u8;SECTOR_BYTES]);
+    }
 }
