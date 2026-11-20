@@ -2675,3 +2675,162 @@ mod kernel_p0_batch16_w6_measured_pid1_tests{
   assert_eq!((m.staged,m.published,m.aborts),(0,0,0));
  }
 }
+
+
+
+/// P0-395..400: derive the trusted *logical* PID1 mapping digest from
+/// validated ELF segment bytes, permission bits, BSS and guarded stack.
+/// The live mapper must independently measure ACTUAL unpublished PTE state
+/// into the same domain transcript. A matching mock digest is not proof of
+/// hardware PTE contents, NX enforcement or TPM boot attestation.
+pub fn derive_pid1_mapping_layout_digest(
+ image:&[u8],stack_top:u64,stack_pages:usize
+)->Result<[u8;32],Error>{
+ let mut segments=[EMPTY_PID1_SEGMENT;64];
+ let (entry,count)=plan_pid1_elf64_segments(image,stack_top,stack_pages,
+  &mut segments)?;
+ if count==0||count>64{return Err(Error::Invalid);}
+ const PREFIX:usize=80;
+ const RECORD:usize=72;
+ let mut transcript=[0u8;PREFIX+RECORD*64];
+ transcript[..8].copy_from_slice(b"PID1PTE1");
+ transcript[8..16].copy_from_slice(&entry.to_le_bytes());
+ transcript[16..24].copy_from_slice(&stack_top.to_le_bytes());
+ transcript[24..32].copy_from_slice(&(stack_pages as u64).to_le_bytes());
+ transcript[32..40].copy_from_slice(&(count as u64).to_le_bytes());
+ transcript[40..72].copy_from_slice(&crate::m2_sha256::digest(image));
+ for (index,segment) in segments[..count].iter().enumerate(){
+  let at=PREFIX+index*RECORD;
+  let begin=usize::try_from(segment.file_offset).map_err(|_|Error::Invalid)?;
+  let bytes=usize::try_from(segment.file_bytes).map_err(|_|Error::Invalid)?;
+  let end=begin.checked_add(bytes).ok_or(Error::Invalid)?;
+  if end>image.len(){return Err(Error::Invalid);}
+  transcript[at..at+8].copy_from_slice(&segment.virtual_address.to_le_bytes());
+  transcript[at+8..at+16].copy_from_slice(&segment.file_bytes.to_le_bytes());
+  transcript[at+16..at+24].copy_from_slice(&segment.zero_fill_bytes.to_le_bytes());
+  transcript[at+24..at+28].copy_from_slice(&segment.permission_bits.to_le_bytes());
+  transcript[at+32..at+64].copy_from_slice(
+   &crate::m2_sha256::digest(&image[begin..end]));
+  transcript[at+64..at+72].copy_from_slice(&segment.file_offset.to_le_bytes());
+ }
+ Ok(crate::m2_sha256::digest(&transcript[..PREFIX+count*RECORD]))
+}
+impl BootLaunchGate{
+ pub fn launch_secure_uefi_layout_bound_pid1<
+  D:BlockDevice,P:AuthenticatedSecureUefi,T:Pid1MeasuredMapper
+ >(
+  &mut self,disk:&mut D,platform:&P,manifest_digest:[u8;32],
+  image:&[u8],stack_top:u64,stack_pages:usize,mapper:&mut T
+ )->Result<VerifiedPid1Admission,Error>{
+  // For malformed images, still traverse the secure one-shot admission
+  // pipeline rather than returning before it can consume the attempted boot.
+  let expected=match derive_pid1_mapping_layout_digest(
+   image,stack_top,stack_pages){
+   Ok(digest)=>digest,
+   Err(_)=>return self.launch_secure_uefi_planned_elf64(
+    disk,platform,manifest_digest,image,stack_top,stack_pages,
+    |_,_,_|Err(Error::Invalid)),
+  };
+  self.launch_secure_uefi_measured_pid1(
+   disk,platform,manifest_digest,image,stack_top,stack_pages,expected,mapper)
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch17_w6_layout_bound_pid1_tests{
+ use super::*;
+ struct Platform;
+ impl TrustedBootMeasurement for Platform{
+  fn read_verified(&self)->Result<[u8;32],Error>{Ok([3;32])}
+ }
+ impl AuthenticatedPid1Platform for Platform{
+  fn read_sealed_floor(&self)->Result<SealedBootFloor,Error>{
+   Ok(SealedBootFloor{minimum_epoch:4,minimum_journal_generation:20,
+    expected_slot:0,minimum_slot_version:9,expected_measurement:[3;32]})
+  }
+  fn read_bootloader_selected_slot(&self)->Result<(usize,Slot),Error>{
+   Ok((0,tests::slot()))
+  }
+ }
+ impl AuthenticatedSecureUefi for Platform{
+  fn require_firmware_secure_boot_chain(&self)->Result<(),Error>{Ok(())}
+ }
+ struct Mapper{digest:[u8;32],revision:u64,staged:usize,published:usize,aborted:usize}
+ impl Pid1StagedMapper for Mapper{
+  fn stage_load(&mut self,_:u64,_:&[u8],_:u64,_:u32)->Result<(),Error>{
+   self.staged+=1;Ok(())
+  }
+  fn stage_guarded_stack(&mut self,_:u64,_:usize)->Result<(),Error>{Ok(())}
+  fn publish_entry(&mut self,_:u64)->Result<(),Error>{self.published+=1;Ok(())}
+  fn abort(&mut self){self.aborted+=1;}
+ }
+ impl Pid1AuditedMapper for Mapper{
+  fn audit_unpublished(&mut self,_:u64)->Result<(),Error>{Ok(())}
+ }
+ impl Pid1RevisionedMapper for Mapper{
+  fn staged_mapping_revision(&mut self)->Result<u64,Error>{Ok(self.revision)}
+ }
+ impl Pid1MeasuredMapper for Mapper{
+  fn measure_unpublished_mappings(&mut self)->Result<[u8;32],Error>{
+   Ok(self.digest)
+  }
+ }
+ fn image()->[u8;256]{
+  let mut image=[0u8;256];image[..4].copy_from_slice(b"\x7fELF");
+  image[4]=2;image[5]=1;image[6]=1;
+  image[16..18].copy_from_slice(&2u16.to_le_bytes());
+  image[18..20].copy_from_slice(&62u16.to_le_bytes());
+  image[20..24].copy_from_slice(&1u32.to_le_bytes());
+  image[24..32].copy_from_slice(&0x400000u64.to_le_bytes());
+  image[32..40].copy_from_slice(&64u64.to_le_bytes());
+  image[52..54].copy_from_slice(&64u16.to_le_bytes());
+  image[54..56].copy_from_slice(&56u16.to_le_bytes());
+  image[56..58].copy_from_slice(&1u16.to_le_bytes());
+  image[64..68].copy_from_slice(&1u32.to_le_bytes());
+  image[68..72].copy_from_slice(&5u32.to_le_bytes());
+  image[72..80].copy_from_slice(&128u64.to_le_bytes());
+  image[80..88].copy_from_slice(&0x400000u64.to_le_bytes());
+  image[96..104].copy_from_slice(&4u64.to_le_bytes());
+  image[104..112].copy_from_slice(&4096u64.to_le_bytes());
+  image[112..120].copy_from_slice(&1u64.to_le_bytes());
+  image[128..132].copy_from_slice(&[0x90,0x90,0x90,0xc3]);image
+ }
+ #[test]fn validated_layout_hash_changes_with_stack_content_and_permission(){
+  let image=image();
+  let original=derive_pid1_mapping_layout_digest(&image,0x800000,8).unwrap();
+  assert_ne!(original,[0;32]);
+  assert_ne!(original,derive_pid1_mapping_layout_digest(&image,0x900000,8).unwrap());
+  assert_ne!(original,derive_pid1_mapping_layout_digest(&image,0x800000,9).unwrap());
+  let mut altered=image;altered[128]^=1;
+  assert_ne!(original,derive_pid1_mapping_layout_digest(
+   &altered,0x800000,8).unwrap());
+ }
+ #[test]fn verified_image_mapped_to_matching_digest_publishes_once(){
+  let image=image();let layout=derive_pid1_mapping_layout_digest(
+   &image,0x800000,8).unwrap();
+  let manifest=crate::m2_sha256::digest(&image);
+  let mut gate=BootLaunchGate::new();let mut disk=tests::fixture();
+  let mut mapper=Mapper{digest:layout,revision:1,staged:0,published:0,aborted:0};
+  assert!(gate.launch_secure_uefi_layout_bound_pid1(&mut disk,&Platform,
+   manifest,&image,0x800000,8,&mut mapper).is_ok());
+  assert_eq!(mapper.published,1);
+  assert_eq!(gate.launch_secure_uefi_layout_bound_pid1(&mut disk,&Platform,
+   manifest,&image,0x800000,8,&mut mapper),Err(Error::Stale));
+ }
+ #[test]fn forged_mapping_digest_aborts_before_pid1_publication(){
+  let image=image();let manifest=crate::m2_sha256::digest(&image);
+  let mut gate=BootLaunchGate::new();let mut disk=tests::fixture();
+  let mut mapper=Mapper{digest:[3;32],revision:1,staged:0,published:0,aborted:0};
+  assert_eq!(gate.launch_secure_uefi_layout_bound_pid1(&mut disk,&Platform,
+   manifest,&image,0x800000,8,&mut mapper),Err(Error::Invalid));
+  assert_eq!((mapper.published,mapper.aborted),(0,1));
+ }
+ #[test]fn invalid_elf_fails_without_mapping_publication(){
+  let mut bad=image();bad[0]=0;
+  assert!(derive_pid1_mapping_layout_digest(&bad,0x800000,8).is_err());
+  let mut gate=BootLaunchGate::new();let mut disk=tests::fixture();
+  let mut mapper=Mapper{digest:[7;32],revision:1,staged:0,published:0,aborted:0};
+  assert!(gate.launch_secure_uefi_layout_bound_pid1(&mut disk,&Platform,
+   crate::m2_sha256::digest(&bad),&bad,0x800000,8,&mut mapper).is_err());
+  assert_eq!(mapper.published,0);
+ }
+}

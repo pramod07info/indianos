@@ -1512,3 +1512,127 @@ mod kernel_p0_batch16_w1_disjoint_tlb_ack_tests{
   assert_eq!(f.require_ack_for_reclaim(0,receipt),Err(FenceError::NoProgress));
  }
 }
+
+
+
+/// P0-361..367: dispatch ONE immutable disjoint page plan to an authenticated
+/// AP topology. An attempted IPI is not an AP ack; partial dispatch leaves
+/// all issued receipts exposed to the BSP for recovery, never fabricated.
+pub trait TlbPlanIpiSender {
+ fn send_exact_plan(&mut self,bsp:u32,ap:u32,receipt:Receipt,
+  plan:&[TlbShootdownRange])->Result<(),FenceError>;
+}
+pub fn validate_user_tlb_plan(plan:&[TlbShootdownRange],epoch:u64)
+ ->Result<u32,FenceError>{
+ if plan.is_empty()||plan.len()>64||epoch==0{
+  return Err(FenceError::InvalidGeneration);
+ }
+ let mut end=0u64;let mut pages=0u32;
+ for range in plan{
+  range.validate()?;
+  if range.epoch!=epoch{return Err(FenceError::StaleReceipt);}
+  if range.first_page<end{return Err(FenceError::InvalidGeneration);}
+  end=range.first_page+(range.pages as u64)*4096;
+  pages=pages.checked_add(range.pages).ok_or(FenceError::InvalidGeneration)?;
+  if pages>4096{return Err(FenceError::InvalidGeneration);}
+ }
+ Ok(pages)
+}
+pub fn dispatch_user_tlb_plan<I:TlbPlanIpiSender>(
+ topology:&[(&LifecycleFence,u32)],bsp:u32,
+ plan:&[TlbShootdownRange],driver:&mut I,
+ issued:&mut[Option<Receipt>]
+)->Result<usize,FenceError>{
+ let epoch=plan.first().map(|r|r.epoch)
+  .ok_or(FenceError::InvalidGeneration)?;
+ validate_user_tlb_plan(plan,epoch)?;
+ struct Driver<'a,I>{inner:&'a mut I,plan:&'a [TlbShootdownRange]}
+ impl<I:TlbPlanIpiSender> LifecycleIpiSender for Driver<'_,I>{
+  fn send_exact(&mut self,bsp:u32,ap:u32,receipt:Receipt)
+   ->Result<(),FenceError>{
+   if receipt.generation!=self.plan[0].epoch{
+    return Err(FenceError::StaleReceipt);
+   }
+   self.inner.send_exact_plan(bsp,ap,receipt,self.plan)
+  }
+ }
+ publish_and_signal_epoch_topology(topology,bsp,epoch,
+  &mut Driver{inner:driver,plan},issued)
+}
+#[cfg(test)]
+mod kernel_p0_batch17_w1_tlb_multicore_plan_tests{
+ use super::*;
+ struct Sender{attempts:usize,fail_on:usize,seen:[u32;3]}
+ impl TlbPlanIpiSender for Sender{
+  fn send_exact_plan(&mut self,bsp:u32,ap:u32,receipt:Receipt,
+   plan:&[TlbShootdownRange])->Result<(),FenceError>{
+   assert_eq!(bsp,0);assert_eq!(receipt.generation,77);
+   assert_eq!((plan.len(),plan[0].first_page),(2,0x2000));
+   self.seen[self.attempts]=ap;self.attempts+=1;
+   if self.attempts==self.fail_on{Err(FenceError::NoProgress)}else{Ok(())}
+  }
+ }
+ fn plan()->[TlbShootdownRange;2]{[
+  TlbShootdownRange{first_page:0x2000,pages:2,epoch:77},
+  TlbShootdownRange{first_page:0x8000,pages:1,epoch:77},
+ ]}
+ struct Flush{count:usize}
+ impl LocalUserTlbInvalidator for Flush{
+  fn invalidate_page(&mut self,_:u64)->Result<(),FenceError>{
+   self.count+=1;Ok(())
+  }
+ }
+ #[test]fn two_distinct_aps_must_flush_full_plan_before_reclaim(){
+  let a=LifecycleFence::new(0,1);let b=LifecycleFence::new(0,2);
+  let mut send=Sender{attempts:0,fail_on:0,seen:[0;3]};
+  let mut issued=[None;2];
+  assert_eq!(dispatch_user_tlb_plan(&[(&a,1),(&b,2)],0,&plan(),
+   &mut send,&mut issued),Ok(2));
+  assert_eq!(send.seen[..2],[1,2]);
+  let x=issued[0].unwrap();let y=issued[1].unwrap();
+  assert_eq!(a.require_ack_for_reclaim(0,x),Err(FenceError::NoProgress));
+  let mut first=Flush{count:0};let mut second=Flush{count:0};
+  assert_eq!(acknowledge_disjoint_tlb_plan(&a,1,0,x,&plan(),&mut first),Ok(()));
+  assert_eq!(acknowledge_disjoint_tlb_plan(&b,2,0,y,&plan(),&mut second),Ok(()));
+  assert_eq!((first.count,second.count),(3,3));
+  assert_eq!(require_epoch_topology_acks_for_reclaim(
+   &[(&a,0,x),(&b,0,y)],&[1,2],77),Ok(()));
+ }
+ #[test]fn partial_ipi_send_exposes_both_unacked_receipts(){
+  let a=LifecycleFence::new(0,1);let b=LifecycleFence::new(0,2);
+  let mut driver=Sender{attempts:0,fail_on:2,seen:[0;3]};
+  let mut issued=[None;2];
+  assert_eq!(dispatch_user_tlb_plan(&[(&a,1),(&b,2)],0,&plan(),
+   &mut driver,&mut issued),Err(FenceError::NoProgress));
+  assert!(issued.iter().all(Option::is_some));
+  assert_eq!(a.require_ack_for_reclaim(0,issued[0].unwrap()),
+   Err(FenceError::NoProgress));
+  assert_eq!(b.require_ack_for_reclaim(0,issued[1].unwrap()),
+   Err(FenceError::NoProgress));
+ }
+ #[test]fn invalid_plan_or_duplicate_topology_never_signals(){
+  let a=LifecycleFence::new(0,1);let mut driver=Sender{attempts:0,
+   fail_on:0,seen:[0;3]};let mut issued=[None;2];
+  let mut overlap=plan();overlap[1].first_page=0x3000;
+  assert!(dispatch_user_tlb_plan(&[(&a,1)],0,&overlap,
+   &mut driver,&mut issued).is_err());
+  assert_eq!(dispatch_user_tlb_plan(&[(&a,1),(&a,1)],0,&plan(),
+   &mut driver,&mut issued),Err(FenceError::InvalidCpu));
+  let mut stale=plan();stale[1].epoch=78;
+  assert_eq!(validate_user_tlb_plan(&stale,77),Err(FenceError::StaleReceipt));
+  assert_eq!(driver.attempts,0);assert_eq!(issued,[None,None]);
+ }
+ #[test]fn page_budget_and_unsorted_spans_fail_before_any_ipi(){
+  let a=LifecycleFence::new(0,1);
+  let mut driver=Sender{attempts:0,fail_on:0,seen:[0;3]};
+  let mut issued=[None;1];
+  let huge=[
+   TlbShootdownRange{first_page:0x1000,pages:4096,epoch:77},
+   TlbShootdownRange{first_page:0x1001000,pages:1,epoch:77}
+  ];
+  assert!(dispatch_user_tlb_plan(&[(&a,1)],0,&huge,&mut driver,&mut issued).is_err());
+  let mut backward=plan();backward.swap(0,1);
+  assert!(dispatch_user_tlb_plan(&[(&a,1)],0,&backward,&mut driver,&mut issued).is_err());
+  assert_eq!(driver.attempts,0);assert_eq!(issued,[None]);
+ }
+}

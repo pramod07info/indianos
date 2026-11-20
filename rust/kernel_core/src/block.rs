@@ -2595,3 +2595,127 @@ mod kernel_p0_batch16_w4_two_mirror_records_tests{
   assert_eq!(one,[9;SECTOR_BYTES]);assert_eq!(two,[9;SECTOR_BYTES]);
  }
 }
+
+
+
+/// P0-382..388: recover one corrupt copy in a *three*-replica read-only
+/// metadata quorum. All physical replicas are independent LBAs, each is
+/// observed twice at the same trusted media revision. Only two replicas
+/// that individually match the authenticated manifest can authorize output.
+/// No repairing write or physical power-loss qualification is implied.
+#[derive(Clone,Copy,Debug,Eq,PartialEq)]
+pub struct MetadataQuorumReceipt{
+ pub revision:u64,pub accepted_replicas:u8,pub digest:[u8;32],
+}
+impl<D:BlockDevice> StableReadOnlyWindow<'_,D>{
+ pub fn read_manifest_triple_quorum(
+  &mut self,lbas:[u64;3],revision:u64,expected:[u8;32],
+  mut observe_revision:impl FnMut()->u64,
+  out:&mut[u8;SECTOR_BYTES]
+ )->Result<MetadataQuorumReceipt,BlockError>{
+  if self.invalidated{return Err(BlockError::Io);}
+  if revision==0||expected==[0;32]{
+   return Err(BlockError::OutOfRange);
+  }
+  for i in 0..3{
+   if lbas[..i].contains(&lbas[i])||
+      check_range(self.capacity,lbas[i],1).is_err(){
+    return Err(BlockError::OutOfRange);
+   }
+  }
+  let mut accepted=0u8;
+  let mut trusted=[0u8;SECTOR_BYTES];
+  for &lba in &lbas{
+   if observe_revision()!=revision{
+    self.invalidated=true;return Err(BlockError::Io);
+   }
+   let mut first=[0u8;SECTOR_BYTES];
+   let mut second=[0u8;SECTOR_BYTES];
+   self.read_sector(lba,&mut first)?;
+   if observe_revision()!=revision{
+    self.invalidated=true;return Err(BlockError::Io);
+   }
+   self.read_sector(lba,&mut second)?;
+   if observe_revision()!=revision{
+    self.invalidated=true;return Err(BlockError::Io);
+   }
+   if first==second&&crate::m2_sha256::digest(&first)==expected{
+    trusted=first;accepted+=1;
+   }
+  }
+  if observe_revision()!=revision{
+   self.invalidated=true;return Err(BlockError::Io);
+  }
+  if accepted<2{
+   self.invalidated=true;return Err(BlockError::Io);
+  }
+  out.copy_from_slice(&trusted);
+  Ok(MetadataQuorumReceipt{revision,accepted_replicas:accepted,
+   digest:expected})
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch17_w4_three_copy_quorum_tests{
+ use super::*;
+ use core::cell::Cell;
+ struct Disk{reads:usize,bad:[bool;3],different_on_second:bool}
+ impl BlockDevice for Disk{
+  fn sector_count(&self)->u64{9}
+  fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{
+   self.reads+=1;
+   let idx=if lba==1{0}else if lba==3{1}else{2};
+   let corrupt=self.bad[idx]||(self.different_on_second&&self.reads==8);
+   out.fill(if corrupt{9}else{7});
+   Ok(())
+  }
+  fn write_sector(&mut self,_:u64,_:&[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{Err(BlockError::ReadOnly)}
+ }
+ fn sig()->[u8;32]{crate::m2_sha256::digest(&[7;SECTOR_BYTES])}
+ #[test]fn one_bad_replica_is_tolerated_only_with_two_authenticated_copies(){
+  let mut d=Disk{reads:0,bad:[true,false,false],different_on_second:false};
+  let mut view=StableReadOnlyWindow::new(&mut d).unwrap();
+  let mut out=[0;SECTOR_BYTES];
+  let proof=view.read_manifest_triple_quorum([1,3,5],23,sig(),||23,&mut out).unwrap();
+  assert_eq!(proof.accepted_replicas,2);
+  assert_eq!(out,[7;SECTOR_BYTES]);assert_eq!(view.device.reads,12);
+  assert!(!view.is_retired());
+ }
+ #[test]fn two_bad_copies_reject_and_retire_without_output(){
+  let mut d=Disk{reads:0,bad:[true,true,false],different_on_second:false};
+  let mut view=StableReadOnlyWindow::new(&mut d).unwrap();
+  let mut out=[4;SECTOR_BYTES];
+  assert_eq!(view.read_manifest_triple_quorum([1,3,5],23,sig(),||23,&mut out),
+   Err(BlockError::Io));
+  assert_eq!(out,[4;SECTOR_BYTES]);assert!(view.is_retired());
+ }
+ #[test]fn unstable_single_copy_cannot_count_as_an_accepted_quorum_member(){
+  let mut d=Disk{reads:0,bad:[true,false,false],different_on_second:true};
+  let mut view=StableReadOnlyWindow::new(&mut d).unwrap();
+  let mut out=[4;SECTOR_BYTES];
+  assert_eq!(view.read_manifest_triple_quorum([1,3,5],23,sig(),||23,&mut out),
+   Err(BlockError::Io));
+  assert!(view.is_retired());assert_eq!(out,[4;SECTOR_BYTES]);
+ }
+ #[test]fn stale_media_revision_after_last_read_aborts_publish(){
+  let mut d=Disk{reads:0,bad:[false,false,false],different_on_second:false};
+  let mut view=StableReadOnlyWindow::new(&mut d).unwrap();
+  let mut out=[4;SECTOR_BYTES];
+  let seen=Cell::new(0u32);
+  assert_eq!(view.read_manifest_triple_quorum([1,3,5],23,sig(),||{
+   seen.set(seen.get()+1);if seen.get()>9{24}else{23}
+  },&mut out),Err(BlockError::Io));
+  assert_eq!(out,[4;SECTOR_BYTES]);assert!(view.is_retired());
+ }
+ #[test]fn repeated_and_out_of_range_sector_ids_preflight_without_reads(){
+  let mut d=Disk{reads:0,bad:[false,false,false],different_on_second:false};
+  let mut view=StableReadOnlyWindow::new(&mut d).unwrap();
+  let mut out=[4;SECTOR_BYTES];
+  assert_eq!(view.read_manifest_triple_quorum([1,1,5],23,sig(),||23,&mut out),
+   Err(BlockError::OutOfRange));
+  assert_eq!(view.read_manifest_triple_quorum([1,3,10],23,sig(),||23,&mut out),
+   Err(BlockError::OutOfRange));
+  assert_eq!(view.device.reads,0);assert_eq!(out,[4;SECTOR_BYTES]);
+ }
+}

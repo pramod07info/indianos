@@ -308,7 +308,7 @@ pub fn run_demo<D:EthernetDevice>(
     wait_for_gateway_arp_fenced(dev,MAX_POLL,&nic_rx_fence,1)?;
     stage(b"IndianOS: R028 Ethernet ARP peer resolved\n\0");
     transmit(dev,icmp_request)?;
-    wait_for(dev,valid_icmp)?;
+    wait_for_icmp_echo_fenced(dev,MAX_POLL,&nic_rx_fence,1)?;
     stage(b"IndianOS: R028 IPv4 ICMP echo ping PASSED\n\0");
     // R114: the real QEMU NIC UDP receive route is now generation-bound
     // through the same registry/endpoint grant and validated owned ingress.
@@ -3432,5 +3432,88 @@ mod kernel_p0_batch16_w5_live_fenced_arp_tests{
   assert_eq!(wait_for_gateway_arp_fenced(&mut dev,1,&nic,1),
    Err(Error::Unexpected));
   assert_eq!(nic.drained(receipt),Ok(true));
+ }
+}
+
+
+
+/// P0-389..394: protect the actual R028 QEMU ICMP receive stage with
+/// the same pre-poll RX lifetime used for ARP/UDP. This is a software NIC
+/// protocol only; it cannot prove physical PCI DMA or IRQ remapping.
+pub fn wait_for_icmp_echo_fenced<D:EthernetDevice>(
+ dev:&mut D,limit:u32,nic:&crate::nic_rx_fence::NicRxFence,device_id:u32
+)->Result<(),Error>{
+ if limit==0||limit>MAX_POLL{return Err(Error::Invalid);}
+ let pinned=nic.epoch();
+ let observer=crate::process_retirement_txn::ProcessRetirement::<1,1,1>::new();
+ wait_for_limit_fenced(dev,limit,nic,device_id,
+  ||observer.capture_polled_ingress_revision(),
+  |_,permit,frame,mac|{
+   permit.epoch()==pinned&&nic.permit_is_current(permit)&&
+   valid_icmp(frame,mac)&&nic.permit_is_current(permit)
+  })
+}
+#[cfg(test)]
+mod kernel_p0_batch17_w5_real_icmp_fence_tests{
+ use super::*;
+ use crate::nic_rx_fence::NicRxFence;
+ const MAC:[u8;6]=[2,8,9,10,11,12];
+ fn echo()->([u8;FRAME_CAP],usize){
+  let mut f=[0u8;FRAME_CAP];let len=icmp_request(&mut f,MAC);
+  f[..6].copy_from_slice(&MAC);f[6..12].copy_from_slice(&PEER_MAC);
+  f[26..30].copy_from_slice(&PEER_IP);
+  f[30..34].copy_from_slice(&LOCAL_IP);
+  f[34]=0;put16(&mut f,36,0);
+  let icmp_sum=checksum(&f[34..len]);put16(&mut f,36,icmp_sum);
+  put16(&mut f,24,0);
+  let ip_sum=checksum(&f[14..34]);put16(&mut f,24,ip_sum);
+  (f,len)
+ }
+ struct Device<'a>{nic:&'a NicRxFence,count:usize,
+  frame:[u8;FRAME_CAP],len:usize,quiesce:bool}
+ impl EthernetDevice for Device<'_>{
+  fn mac(&self)->[u8;6]{MAC}
+  fn send(&mut self,_:&[u8])->Result<(),Error>{Ok(())}
+  fn poll(&mut self,out:&mut[u8])->Result<Option<usize>,Error>{
+   self.count+=1;
+   if self.quiesce{self.nic.begin_quiesce(5).unwrap();}
+   out[..self.len].copy_from_slice(&self.frame[..self.len]);
+   Ok(Some(self.len))
+  }
+ }
+ fn device(nic:&NicRxFence)->Device<'_>{
+  let (frame,len)=echo();
+  Device{nic,count:0,frame,len,quiesce:false}
+ }
+ #[test]fn valid_peer_echo_requires_actual_pre_poll_admission(){
+  let nic=NicRxFence::new(5);let mut d=device(&nic);
+  assert_eq!(wait_for_icmp_echo_fenced(&mut d,2,&nic,5),Ok(()));
+  assert_eq!(d.count,1);
+  let q=nic.begin_quiesce(5).unwrap();assert_eq!(nic.drained(q),Ok(true));
+ }
+ #[test]fn corrupt_echo_checksum_and_sequence_do_not_pass(){
+  let nic=NicRxFence::new(5);let mut d=device(&nic);
+  d.frame[41]^=1;
+  assert_eq!(wait_for_icmp_echo_fenced(&mut d,2,&nic,5),
+   Err(Error::Timeout));assert_eq!(d.count,2);
+  let mut other=device(&nic);other.frame[41]=2;
+  put16(&mut other.frame,36,0);
+  let new_checksum=checksum(&other.frame[34..other.len]);
+  put16(&mut other.frame,36,new_checksum);
+  assert_eq!(wait_for_icmp_echo_fenced(&mut other,1,&nic,5),
+   Err(Error::Timeout));
+ }
+ #[test]fn quiesce_race_between_poll_and_parser_denies_success(){
+  let nic=NicRxFence::new(5);let mut d=device(&nic);d.quiesce=true;
+  assert_eq!(wait_for_icmp_echo_fenced(&mut d,1,&nic,5),
+   Err(Error::Unexpected));
+  assert_eq!(d.count,1);
+ }
+ #[test]fn wrong_device_or_zero_budget_cannot_ack_an_echo(){
+  let nic=NicRxFence::new(5);let mut d=device(&nic);
+  assert_eq!(wait_for_icmp_echo_fenced(&mut d,1,&nic,6),
+   Err(Error::Unexpected));
+  assert_eq!(d.count,0);
+  assert_eq!(wait_for_icmp_echo_fenced(&mut d,0,&nic,5),Err(Error::Invalid));
  }
 }

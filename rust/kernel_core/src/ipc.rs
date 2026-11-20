@@ -2114,3 +2114,111 @@ mod kernel_p0_batch16_w3_pinned_receive_tests{
   assert_eq!(r.pending(id(3)),Ok(1));assert_eq!(out,[sentinel();2]);
  }
 }
+
+
+
+/// P0-375..381: the receiver explicitly pins the mailbox occupancy at
+/// observation time, sender incarnation and payload digest before a grouped
+/// read. This prevents stale queue-size snapshots from consuming changed
+/// queues. This is NOT a unique message-sequence receipt: identical future
+/// payloads need a separate monotonic per-mailbox sequence mechanism.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct AuthenticatedIpcHead{
+ pub receiver:Identity,pub sender:Identity,
+ pub expected_pending:usize,pub sha256:[u8;32],
+}
+impl<const M:usize,const D:usize> ScopedRouter<M,D>{
+ pub fn receive_observed_heads_atomic(
+  &mut self,heads:&[AuthenticatedIpcHead],max_total:usize,
+  out:&mut[TaggedMessage]
+ )->Result<usize,IpcError>{
+  if heads.is_empty()||heads.len()>M||max_total==0||
+     max_total>M.saturating_mul(MAX_PAYLOAD){
+   return Err(IpcError::InvalidConfiguration);
+  }
+  if out.len()<heads.len(){return Err(IpcError::Full);}
+  let mut requests=[(heads[0].receiver,heads[0].sender,heads[0].sha256);M];
+  for (i,item) in heads.iter().enumerate(){
+   if item.expected_pending==0||item.expected_pending>D{
+    return Err(IpcError::InvalidConfiguration);
+   }
+   if heads[..i].iter().any(|prior|prior.receiver.pid==item.receiver.pid){
+    return Err(IpcError::DuplicateReceiver);
+   }
+   if self.pending(item.receiver)?!=item.expected_pending{
+    return Err(IpcError::Empty);
+   }
+   requests[i]=(item.receiver,item.sender,item.sha256);
+  }
+  self.receive_digest_pinned_batch(&requests[..heads.len()],max_total,out)
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch17_w3_ipc_snapshot_tests{
+ use super::*;
+ fn id(p:u32,g:u64)->Identity{Identity{pid:p,generation:g}}
+ fn sig(s:&[u8])->[u8;32]{crate::m2_sha256::digest(s)}
+ fn init()->ScopedRouter<4,3>{
+  let mut r=ScopedRouter::<4,3>::new().unwrap();
+  for p in 1..=4{r.register(id(p,1)).unwrap();}
+  r.send(id(1,1),id(3,1),b"first").unwrap();
+  r.send(id(2,1),id(4,1),b"second").unwrap();r
+ }
+ fn heads()->[AuthenticatedIpcHead;2]{[
+  AuthenticatedIpcHead{receiver:id(3,1),sender:id(1,1),
+   expected_pending:1,sha256:sig(b"first")},
+  AuthenticatedIpcHead{receiver:id(4,1),sender:id(2,1),
+   expected_pending:1,sha256:sig(b"second")}
+ ]}
+ fn sentinel()->TaggedMessage{TaggedMessage{
+  sender:id(1,1),length:0,bytes:[0;MAX_PAYLOAD]
+ }}
+ #[test]fn observed_exact_owner_heads_transfer_atomically(){
+  let mut r=init();let mut out=[sentinel();2];
+  assert_eq!(r.receive_observed_heads_atomic(&heads(),11,&mut out),Ok(2));
+  assert_eq!((out[0].payload(),out[1].payload()),
+   (b"first".as_slice(),b"second".as_slice()));
+  assert_eq!(r.pending(id(3,1)),Ok(0));assert_eq!(r.pending(id(4,1)),Ok(0));
+ }
+ #[test]fn stale_occupancy_or_rebound_owner_cannot_consume(){
+  let mut r=init();let mut out=[sentinel();2];let mut h=heads();
+  h[1].expected_pending=2;
+  assert_eq!(r.receive_observed_heads_atomic(&h,11,&mut out),
+   Err(IpcError::Empty));
+  h=heads();h[1].receiver.generation=2;
+  assert_eq!(r.receive_observed_heads_atomic(&h,11,&mut out),
+   Err(IpcError::UnknownReceiver));
+  assert_eq!(out,[sentinel();2]);assert_eq!(r.pending(id(3,1)),Ok(1));
+ }
+ #[test]fn digest_spoof_sender_swap_and_quota_preserve_both(){
+  let mut r=init();let mut out=[sentinel();2];let mut h=heads();
+  h[1].sha256=sig(b"wrong");
+  assert_eq!(r.receive_observed_heads_atomic(&h,11,&mut out),
+   Err(IpcError::UnknownSender));
+  h=heads();h[1].sender=id(1,1);
+  assert_eq!(r.receive_observed_heads_atomic(&h,11,&mut out),
+   Err(IpcError::UnknownSender));
+  assert_eq!(r.receive_observed_heads_atomic(&heads(),10,&mut out),
+   Err(IpcError::PayloadTooLarge));
+  assert_eq!(r.pending(id(3,1)),Ok(1));assert_eq!(r.pending(id(4,1)),Ok(1));
+  assert_eq!(out,[sentinel();2]);
+ }
+ #[test]fn duplicate_mailbox_and_short_output_fail_closed(){
+  let mut r=init();let mut out=[sentinel();2];
+  let mut h=heads();h[1].receiver=h[0].receiver;
+  assert_eq!(r.receive_observed_heads_atomic(&h,11,&mut out),
+   Err(IpcError::DuplicateReceiver));
+  assert_eq!(r.receive_observed_heads_atomic(&heads(),11,&mut out[..1]),
+   Err(IpcError::Full));
+  assert_eq!(r.pending(id(3,1)),Ok(1));assert_eq!(out,[sentinel();2]);
+ }
+ #[test]fn zero_occupancy_and_bad_budget_are_invalid(){
+  let mut r=init();let mut out=[sentinel();2];let mut h=heads();
+  h[0].expected_pending=0;
+  assert_eq!(r.receive_observed_heads_atomic(&h,11,&mut out),
+   Err(IpcError::InvalidConfiguration));
+  assert_eq!(r.receive_observed_heads_atomic(&heads(),0,&mut out),
+   Err(IpcError::InvalidConfiguration));
+  assert_eq!(r.pending(id(3,1)),Ok(1));
+ }
+}

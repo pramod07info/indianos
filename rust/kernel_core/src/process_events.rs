@@ -2439,3 +2439,101 @@ mod kernel_p0_batch16_w2_supervisor_forward_tests{
   assert_eq!(from.len(),2);assert_eq!(to.len(),0);
  }
 }
+
+
+
+/// P0-368..374: exact-incarnation exit notice forwarding. Exited.value
+/// MUST be the process generation; arbitrary Message/Faulted values are NOT
+/// treated as generations. Preflight receipt ID, PID1 protection, unique
+/// incarnations and already-delivered notices before moving either ring.
+impl<const C:usize> ProcessEvents<C>{
+ pub fn forward_exact_exit_batch<const N:usize>(
+  &mut self,destination:&mut ProcessEvents<N>,
+  receipts:&[EventReceipt],owners:&[(u32,u64)]
+ )->Result<usize,EventError>{
+  if receipts.is_empty()||receipts.len()!=owners.len(){
+   return Err(EventError::Empty);
+  }
+  for (i,(&receipt,&(pid,generation))) in
+   receipts.iter().zip(owners).enumerate(){
+   if pid<=1||generation==0||receipt.event.pid!=pid||
+      receipt.event.kind!=EventKind::Exited||
+      receipt.event.value!=generation{
+    return Err(EventError::InvalidPid);
+   }
+   if owners[..i].contains(&(pid,generation)){
+    return Err(EventError::InvalidPid);
+   }
+   if (0..destination.count).any(|at|{
+    destination.entries[(destination.head+at)%N].is_some_and(|event|
+     event.pid==pid&&event.kind==EventKind::Exited&&
+      event.value==generation)
+   }){
+    return Err(EventError::InvalidPid);
+   }
+  }
+  let mut source=self.clone();
+  let mut target=destination.clone();
+  source.acknowledge_exact_prefix(receipts)?;
+  for &(pid,generation) in owners{
+   if !target.enqueue_exit_once(pid,generation)?{
+    return Err(EventError::InvalidPid);
+   }
+  }
+  *self=source;*destination=target;
+  Ok(owners.len())
+ }
+}
+#[cfg(test)]
+mod kernel_p0_batch17_w2_exact_exit_forward_tests{
+ use super::*;
+ fn event(pid:u32,gen:u64)->ProcessEvent{
+  ProcessEvent{pid,kind:EventKind::Exited,value:gen}
+ }
+ fn setup()->(ProcessEvents<3>,[EventReceipt;2]){
+  let mut src=ProcessEvents::<3>::new();
+  src.enqueue(event(2,9)).unwrap();src.enqueue(event(3,7)).unwrap();
+  let mut r=[EventReceipt{sequence:0,event:event(2,9)};2];
+  src.snapshot_receipts(&mut r).unwrap();(src,r)
+ }
+ #[test]fn forwards_exact_two_exits_and_denies_duplicate_delivery(){
+  let (mut src,r)=setup();let mut dst=ProcessEvents::<3>::new();
+  assert_eq!(src.forward_exact_exit_batch(&mut dst,&r,&[(2,9),(3,7)]),Ok(2));
+  assert!(src.is_empty());assert_eq!(dst.len(),2);
+  assert_eq!(dst.peek(),Some(event(2,9)));
+  assert_eq!(src.forward_exact_exit_batch(&mut dst,&r,&[(2,9),(3,7)]),
+   Err(EventError::InvalidPid));
+ }
+ #[test]fn late_destination_capacity_rolls_back_both_queues(){
+  let (mut src,r)=setup();let mut dst=ProcessEvents::<2>::new();
+  dst.enqueue(event(8,2)).unwrap();
+  assert_eq!(src.forward_exact_exit_batch(&mut dst,&r,&[(2,9),(3,7)]),
+   Err(EventError::Full));
+  assert_eq!(src.len(),2);assert_eq!(dst.len(),1);
+  assert_eq!(src.peek_receipt(),Some(r[0]));
+ }
+ #[test]fn reused_pid_generation_and_wrong_kind_fail_without_mutation(){
+  let (mut src,r)=setup();let mut dst=ProcessEvents::<3>::new();
+  assert_eq!(src.forward_exact_exit_batch(&mut dst,&r,&[(2,10),(3,7)]),
+   Err(EventError::InvalidPid));
+  let mut other=r;other[1].event.kind=EventKind::Message;
+  assert_eq!(src.forward_exact_exit_batch(&mut dst,&other,&[(2,9),(3,7)]),
+   Err(EventError::InvalidPid));
+  assert_eq!(src.len(),2);assert_eq!(dst.len(),0);
+ }
+ #[test]fn replayed_receipt_or_pid1_exit_is_not_published(){
+  let (mut src,r)=setup();let mut dst=ProcessEvents::<3>::new();
+  assert_eq!(src.forward_exact_exit_batch(&mut dst,&[r[0],r[0]],
+   &[(2,9),(2,9)]),Err(EventError::InvalidPid));
+  assert_eq!(src.forward_exact_exit_batch(&mut dst,&r,&[(1,9),(3,7)]),
+   Err(EventError::InvalidPid));
+  assert_eq!(src.len(),2);
+ }
+ #[test]fn existing_target_generation_blocks_duplicate_source_exit(){
+  let (mut src,r)=setup();let mut dst=ProcessEvents::<3>::new();
+  dst.enqueue_exit_once(3,7).unwrap();
+  assert_eq!(src.forward_exact_exit_batch(&mut dst,&r,&[(2,9),(3,7)]),
+   Err(EventError::InvalidPid));
+  assert_eq!(src.len(),2);assert_eq!(dst.len(),1);
+ }
+}
