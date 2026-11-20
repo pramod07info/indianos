@@ -194,7 +194,7 @@ pub unsafe extern "C" fn pmm_allocate_contiguous_frames(count:u32,out:*mut u64)-
     if out.is_null() || count==0 || count>16{return false;}
     let s=unsafe{state()};
     let want=count as u64;
-    if !s.initialized || want>s.total-s.used{return false;}
+    if !s.initialized || s.used>s.total || want>s.total-s.used{return false;}
     for span_index in 0..s.count{
         let span=s.spans[span_index];
         if span.count<want{continue;}
@@ -405,6 +405,8 @@ impl State {
     }
     /// Reserve a specific frame run only when ALL frames are free.
     fn claim_run(&mut self,physical:u64,count:u32)->bool{
+        if !self.initialized||self.used>self.total||
+            count as u64>self.total-self.used{return false;}
         let Some(first)=self.validate_run(physical,count,false)else{return false;};
         for i in 0..count as u64{self.set_bit(first+i,true);}
         self.used+=count as u64;
@@ -413,6 +415,8 @@ impl State {
     }
     /// Release a complete frame run atomically or none of its frames.
     fn release_run(&mut self,physical:u64,count:u32)->bool{
+        if !self.initialized||self.used>self.total||
+            self.used<count as u64{return false;}
         let Some(first)=self.validate_run(physical,count,true)else{return false;};
         for i in 0..count as u64{self.set_bit(first+i,false);}
         self.used-=count as u64;self.cursor=first;
@@ -1622,5 +1626,50 @@ mod kernel_p0_batch19_w1_tests {
         region.length=PAGE;
         assert!(unsafe {initialize_once(&mut s,1,Some(read),context)});
         assert_eq!(s.total,1);
+    }
+}
+
+
+// P0-481–487: release/claim corruption must not mutate live bitmap ownership.
+#[cfg(test)]
+mod kernel_p0_batch20_w1_tests{
+    use super::*;
+    unsafe extern "C" fn reader(i:u64,out:*mut Region,ctx:*mut c_void)->bool{
+        if i!=0||out.is_null()||ctx.is_null(){return false;}
+        unsafe{out.write(*(ctx.cast::<Region>()));}
+        true
+    }
+    fn fresh()->State{
+        let mut state=State::empty();
+        let mut region=Region{base:PAGE,length:4*PAGE,kind:0};
+        assert!(unsafe{initialize_once(&mut state,1,Some(reader),
+            (&mut region as *mut Region).cast())});
+        state
+    }
+    #[test]
+    fn kernel_p0_batch20_w1_reject_corrupt_underflow_and_overflow(){
+        let mut s=fresh();
+        assert!(s.claim_run(PAGE,2));
+        assert_eq!(s.used,2);
+        s.used=1;
+        let bitmap=s.bitmap[..2].to_vec();
+        assert!(!s.release_run(PAGE,2));
+        assert_eq!(&s.bitmap[..2],bitmap.as_slice());
+        s.used=5;
+        assert!(!s.claim_run(PAGE*3,1));
+        assert!(!s.release_run(PAGE,1));
+        assert_eq!(&s.bitmap[..2],bitmap.as_slice());
+        assert_eq!(s.used,5);
+    }
+    #[test]
+    fn kernel_p0_batch20_w1_preserves_normal_contiguous_lifecycle(){
+        let mut s=fresh();
+        assert!(s.claim_run(PAGE,4));
+        assert_eq!(s.used,4);
+        assert!(!s.claim_run(PAGE,1));
+        assert!(s.release_run(PAGE,4));
+        assert!(!s.release_run(PAGE,4));
+        assert_eq!(s.used,0);
+        assert!(s.verify_frame_accounting());
     }
 }

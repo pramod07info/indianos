@@ -23,6 +23,20 @@ static MONOTONIC_SOURCE:AtomicU8=AtomicU8::new(0);
 static MONOTONIC_SESSION_PROGRESS:AtomicBool=AtomicBool::new(false);
 /// A saturated u64 must never wrap back to an old lease timestamp.
 static MONOTONIC_EXHAUSTED:AtomicBool=AtomicBool::new(false);
+/// Session changes invalidate concurrent time samples, including same-source
+/// stop/restart (source ID alone is vulnerable to an ABA race).
+static MONOTONIC_SESSION_EPOCH:AtomicU64=AtomicU64::new(0);
+fn invalidate_monotonic_session(){
+    if MONOTONIC_SESSION_EPOCH.fetch_update(
+        Ordering::AcqRel,Ordering::Acquire,|n|n.checked_add(1)
+    ).is_err(){
+        MONOTONIC_EXHAUSTED.store(true,Ordering::Release);
+    }
+    MONOTONIC_SESSION_PROGRESS.store(false,Ordering::Release);
+}
+fn same_timer_session(start:u64,end:u64,source_before:u8,source_after:u8)->bool{
+    start==end&&source_before==source_after
+}
 // Counts actual valid ring-3 context captures, not merely APIC EOI writes.
 static XAPIC_PREEMPTIONS:AtomicU64=AtomicU64::new(0);
 static CONFIGURED:AtomicBool=AtomicBool::new(false);
@@ -81,11 +95,11 @@ pub extern "C" fn x86_64_timer_start_100hz()->bool{
     // Prefer an actively calibrated APIC, when one exists. Never let an
     // uncalibrated second source silently produce double-counted time.
     if !XAPIC_TIMER_RUNNING.load(Ordering::Acquire) {
-        MONOTONIC_SESSION_PROGRESS.store(false,Ordering::Release);
+        invalidate_monotonic_session();
         MONOTONIC_SOURCE.store(1,Ordering::Release);
     }else{
         MONOTONIC_SOURCE.store(0,Ordering::Release);
-        MONOTONIC_SESSION_PROGRESS.store(false,Ordering::Release);
+        invalidate_monotonic_session();
     }
     true
 }
@@ -424,7 +438,7 @@ pub unsafe extern "C" fn x86_64_xapic_timer_start_calibrated(
     }
     XAPIC_CALIBRATING.store(false,Ordering::Release);
     XAPIC_TIMER_RUNNING.store(true,Ordering::Release);
-    MONOTONIC_SESSION_PROGRESS.store(false,Ordering::Release);
+    invalidate_monotonic_session();
     MONOTONIC_SOURCE.store(2,Ordering::Release);
     true
 }
@@ -491,7 +505,7 @@ pub unsafe extern "C" fn x86_64_xapic_timer_stop()->bool{
     XAPIC_TIMER_RUNNING.store(false,Ordering::Release);
     if MONOTONIC_SOURCE.compare_exchange(
         2,0,Ordering::AcqRel,Ordering::Acquire).is_ok(){
-        MONOTONIC_SESSION_PROGRESS.store(false,Ordering::Release);
+        invalidate_monotonic_session();
     }
     true
 }
@@ -539,7 +553,7 @@ pub unsafe fn quiesce_for_shutdown() -> bool {
             CONFIGURED.store(false,Ordering::Release);
             if MONOTONIC_SOURCE.compare_exchange(
                 1,0,Ordering::AcqRel,Ordering::Acquire).is_ok(){
-                MONOTONIC_SESSION_PROGRESS.store(false,Ordering::Release);
+                invalidate_monotonic_session();
             }
             true
         },
@@ -615,6 +629,7 @@ fn record_kernel_monotonic_tick(source:u8){
 /// This still is NOT a high-resolution cross-CPU clock and cannot account
 /// for elapsed time while all timer sources are stopped.
 pub fn kernel_monotonic_100hz() -> Option<u64> {
+    let epoch=MONOTONIC_SESSION_EPOCH.load(Ordering::Acquire);
     let source=MONOTONIC_SOURCE.load(Ordering::Acquire);
     let sample=authoritative_monotonic_sample(
         source,
@@ -624,7 +639,9 @@ pub fn kernel_monotonic_100hz() -> Option<u64> {
         XAPIC_TIMER_RUNNING.load(Ordering::Acquire),
         CONFIGURED.load(Ordering::Acquire),
     );
-    if MONOTONIC_SOURCE.load(Ordering::Acquire)!=source{return None;}
+    if !same_timer_session(epoch,
+        MONOTONIC_SESSION_EPOCH.load(Ordering::Acquire),source,
+        MONOTONIC_SOURCE.load(Ordering::Acquire)){return None;}
     sample
 }
 
@@ -1149,5 +1166,26 @@ mod r118_cumulative_monotonic_regressions {
         assert_eq!(sample(2,true,true,u64::MAX,true,false),None);
         assert_eq!(sample(2,true,false,0,true,false),None);
         assert_eq!(sample(1,true,false,11,false,true),Some(11));
+    }
+}
+
+
+// P0-488–494: same-source timer rearm must not authenticate stale ticks.
+#[cfg(test)]
+mod kernel_p0_batch20_w2_tests{
+    use super::*;
+    #[test]
+    fn kernel_p0_batch20_w2_disallows_same_source_session_aba(){
+        assert!(same_timer_session(100,100,2,2));
+        assert!(!same_timer_session(100,101,2,2));
+        assert!(!same_timer_session(101,102,1,1));
+        assert!(!same_timer_session(100,100,1,2));
+        assert!(!same_timer_session(u64::MAX,0,2,2));
+    }
+    #[test]
+    fn kernel_p0_batch20_w2_rejects_uncalibrated_or_conflicting_source(){
+        assert_eq!(authoritative_monotonic_sample(2,false,false,9,true,false),None);
+        assert_eq!(authoritative_monotonic_sample(1,true,false,9,true,true),None);
+        assert_eq!(authoritative_monotonic_sample(2,true,false,10,true,false),Some(10));
     }
 }

@@ -270,24 +270,32 @@ impl VirtioNet{
     pub fn close(self)->bool{
         unsafe{outb(self.port+0x12,0);}
         compiler_fence(Ordering::SeqCst);
-        // Re-read actual device STATUS, then deny further PCI bus-master DMA.
-        // Reads of PCI command are trusted only with unchanged device identity.
-        // Reset uncertainty or hot-unplug must retain buffers, NOT release
-        // frames still potentially reachable by the DMA engine.
-        if unsafe{inb(self.port+0x12)}!=0{return false;}
-        if pciread(self.bus,self.slot,self.function,0) !=
-             ((DEVICE as u32)<<16 | VENDOR as u32){return false;}
+        // A removed/replaced device may return all-ones PCI identity,
+        // and a device may change after we disable bus mastering.
+        let reset=unsafe{inb(self.port+0x12)};
+        let identity_before=pciread(self.bus,self.slot,self.function,0);
+        if reset!=0 || identity_before!=legacy_nic_identity(){return false;}
         let command=pciread(self.bus,self.slot,self.function,0x04);
-        // Write only COMMAND[15:0]: status bits are W1C and must not be
-        // accidentally acknowledged while quarantining the controller.
+        // Preserve status W1C bits by writing only COMMAND[15:0].
         let disabled=(command & 0xffff) & !0x0004;
         pciwrite(self.bus,self.slot,self.function,0x04,disabled);
         compiler_fence(Ordering::SeqCst);
         let observed=pciread(self.bus,self.slot,self.function,0x04);
-        if observed & 0x0004 != 0 || (observed & 1)==0{return false;}
+        let identity_after=pciread(self.bus,self.slot,self.function,0);
+        if !nic_dma_retired(reset,identity_before,identity_after,observed){
+            return false;
+        }
         self.rx.release();self.tx.release();
         true
     }
+}
+/// Exact expected PCI device ID, not an arbitrary substituted controller.
+fn legacy_nic_identity()->u32{((DEVICE as u32)<<16)|VENDOR as u32}
+/// Only an unchanged, reset, IO-decodable and bus-master-disabled device
+/// permits releasing ring memory. Physical IOMMU qualification is separate.
+fn nic_dma_retired(reset:u8,before:u32,after:u32,command:u32)->bool{
+    reset==0 && before==legacy_nic_identity() &&
+       after==before && (command&0x0004)==0 && (command&0x0001)!=0
 }
 /// Validate used length without untrusted DMA length subtraction/overflow.
 fn receive_payload_len(used_len:usize,capacity:usize)->Result<usize,Error>{
@@ -484,5 +492,22 @@ mod kernel_p0_batch19_w5_tests {
         assert!(!tx_completion_length_valid(0,13));
         assert!(!tx_completion_length_valid(0,1515));
         assert!(!tx_completion_length_valid(usize::MAX,1514));
+    }
+}
+
+
+// P0-509–514: deny DMA page recycling after a changing PCI identity.
+#[cfg(test)]
+mod kernel_p0_batch20_w5_tests{
+    use super::*;
+    #[test]
+    fn kernel_p0_batch20_w5_quiesced_nic_requires_stable_device_id(){
+        let id=legacy_nic_identity();
+        assert!(nic_dma_retired(0,id,id,0x0001));
+        assert!(!nic_dma_retired(0xff,id,id,0x0001));
+        assert!(!nic_dma_retired(0,id,u32::MAX,0x0001));
+        assert!(!nic_dma_retired(0,u32::MAX,id,0x0001));
+        assert!(!nic_dma_retired(0,id,id,0x0005));
+        assert!(!nic_dma_retired(0,id,id,0));
     }
 }

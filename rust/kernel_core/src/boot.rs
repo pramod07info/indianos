@@ -105,6 +105,14 @@ pub unsafe extern "C" fn boot_validate() -> bool {
     if validated_map_count(map).is_none(){
         log(b"IndianOS: invalid or unusable memory map\n\0");return false;
     }
+    // The allocator and ELF loader depend on this direct mapping. Refuse
+    // boot *before* other initialization if the Limine handoff omitted it.
+    let Some(hhdm)=(unsafe {boot_limine_hhdm().as_ref()}) else {
+        log(b"IndianOS: missing HHDM handoff\n\0");return false;
+    };
+    if !hhdm_offset_sane(hhdm.offset){
+        log(b"IndianOS: invalid HHDM mapping\n\0");return false;
+    }
     true
 }
 #[no_mangle]
@@ -427,5 +435,20 @@ mod kernel_p0_batch19_w6_tests {
         assert_eq!(observed(Region{kind:1,..ram},
             Region{base:0x5000,length:0x1000,kind:1}),None);
         assert!(!validate_ranges(&[ram,Region{base:0x3fff,length:1,kind:2}]));
+    }
+}
+
+
+// P0-515–520: numeric HHDM sanity is mandatory for production boot preflight.
+#[cfg(test)]
+mod kernel_p0_batch20_w6_tests{
+    use super::*;
+    #[test]
+    fn kernel_p0_batch20_w6_hhdm_rejects_unmapped_aliases(){
+        assert!(hhdm_offset_sane(0xffff_8000_0000_0000));
+        assert!(!hhdm_offset_sane(0));
+        assert!(!hhdm_offset_sane(0xffff_7fff_ffff_f000));
+        assert!(!hhdm_offset_sane(0xffff_8000_0000_0001));
+        assert!(!hhdm_offset_sane(0xffff_ffff_ffff_f000));
     }
 }

@@ -1358,12 +1358,18 @@ pub fn read_stable_sectors<D:BlockDevice>(device:&mut D,start:u64,
     out.len()>MAX_STAGED_READ_SECTORS*SECTOR_BYTES{
   return Err(BlockError::OutOfRange);
  }
+ let capacity=device.sector_count();
+ check_range(capacity,start,(out.len()/SECTOR_BYTES) as u64)?;
  let mut first=[0u8;MAX_STAGED_READ_SECTORS*SECTOR_BYTES];
  let mut second=[0u8;MAX_STAGED_READ_SECTORS*SECTOR_BYTES];
  let n=out.len();
  read_sectors_atomic(device,start,&mut first[..n])?;
+ // Both observations must come from one selected device geometry.
+ if device.sector_count()!=capacity{return Err(BlockError::Io);}
  read_sectors_atomic(device,start,&mut second[..n])?;
- if first[..n]!=second[..n]{return Err(BlockError::Io);}
+ if device.sector_count()!=capacity || first[..n]!=second[..n]{
+    return Err(BlockError::Io);
+ }
  out.copy_from_slice(&first[..n]);Ok(())
 }
 #[cfg(test)]
@@ -2718,4 +2724,42 @@ mod kernel_p0_batch17_w4_three_copy_quorum_tests{
    Err(BlockError::OutOfRange));
   assert_eq!(view.device.reads,0);assert_eq!(out,[4;SECTOR_BYTES]);
  }
+}
+
+
+// P0-502–508: reject media swap between two internally stable observations.
+#[cfg(test)]
+mod kernel_p0_batch20_w4_tests{
+    use super::*;
+    use core::cell::Cell;
+    struct ChangingGeometry { reads:u32, geometry_calls:Cell<u32>, changed:bool }
+    impl BlockDevice for ChangingGeometry{
+        fn sector_count(&self)->u64{
+            let calls=self.geometry_calls.get()+1;
+            self.geometry_calls.set(calls);
+            if self.changed && calls>=6 { 6 } else { 4 }
+        }
+        fn read_sector(&mut self,_:u64,out:&mut[u8;SECTOR_BYTES])
+            ->Result<(),BlockError>{
+            self.reads+=1;out.fill(0x7b);Ok(())
+        }
+        fn write_sector(&mut self,_:u64,_:&[u8;SECTOR_BYTES])
+            ->Result<(),BlockError>{Err(BlockError::ReadOnly)}
+    }
+    #[test]
+    fn kernel_p0_batch20_w4_two_consistent_but_foreign_media_denied(){
+        let mut d=ChangingGeometry{reads:0,geometry_calls:Cell::new(0),changed:true};
+        let mut out=[0x55u8;SECTOR_BYTES];
+        assert_eq!(read_stable_sectors(&mut d,0,&mut out),Err(BlockError::Io));
+        assert_eq!(out,[0x55;SECTOR_BYTES]);
+        assert_eq!(d.reads,2);
+    }
+    #[test]
+    fn kernel_p0_batch20_w4_stable_media_publishes_only_after_both_reads(){
+        let mut d=ChangingGeometry{reads:0,geometry_calls:Cell::new(0),changed:false};
+        let mut out=[0x55u8;SECTOR_BYTES];
+        assert_eq!(read_stable_sectors(&mut d,0,&mut out),Ok(()));
+        assert_eq!(out,[0x7b;SECTOR_BYTES]);
+        assert_eq!(d.reads,2);
+    }
 }

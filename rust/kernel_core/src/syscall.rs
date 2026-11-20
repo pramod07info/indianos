@@ -184,11 +184,14 @@ pub(crate) fn ring3_frame_valid(
     const IOPL: u64 = 3 << 12;
     const NT: u64 = 1 << 14;
     const VM: u64 = 1 << 17;
+    // x86-64 IRETQ must not import reserved high RFLAGS from a user
+    // snapshot. Bit 1 is fixed; bits 3, 5, 15 and 22..63 are reserved.
+    const RESERVED:u64=(1<<3)|(1<<5)|(1<<15)|(!0u64<<22);
     let (rip, cs, flags, rsp, ss) =
         (frame[15], frame[16], frame[17], frame[18], frame[19]);
     cs == 0x2b && ss == 0x33 &&
         flags & FIXED != 0 &&
-        flags & (IOPL | NT | VM) == 0 &&
+        flags & (IOPL | NT | VM | RESERVED) == 0 &&
         (flags & IF != 0) == irq_enabled &&
         (USER_MIN..USER_TOP).contains(&rip) &&
         plan.stack_begin >= USER_MIN && plan.stack_end <= USER_TOP &&
@@ -690,4 +693,45 @@ mod kernel_p0_next_w2_userexec_tests{
   wrong=f;wrong[18]=p.stack_end;
   assert!(!ring3_frame_strict_execution(&wrong,&p,false));
  }
+}
+
+
+// P0-495–501: numeric trap admission must reject reserved CPU flags
+// before a later IRET, even without touching user virtual-memory bytes.
+#[cfg(test)]
+mod kernel_p0_batch20_w3_tests{
+    use super::*;
+    fn state()->(ProgramPlan,[u64;20]){
+        let plan=ProgramPlan{
+            entry:USER_MIN,stack_begin:USER_TOP-STACK_BYTES,stack_end:USER_TOP,
+            guard_begin:USER_TOP-STACK_BYTES-PAGE_BYTES,segment_count:0,
+            segments:[ProgramSegment::empty();MAX_SEGMENTS],
+        };
+        let mut regs=[0u64;20];
+        regs[15]=USER_MIN;regs[16]=0x2b;regs[17]=0x2;
+        regs[18]=plan.stack_end-8;regs[19]=0x33;
+        (plan,regs)
+    }
+    #[test]
+    fn kernel_p0_batch20_w3_blocks_reserved_iretq_flags(){
+        let (p,mut f)=state();
+        assert!(ring3_frame_valid(&f,&p,false));
+        for bit in [3,5,15,22,31,63]{
+            f[17]=2u64|(1u64<<bit);
+            assert!(!ring3_frame_valid(&f,&p,false));
+        }
+        f[17]=2;
+        assert!(ring3_frame_valid(&f,&p,false));
+    }
+    #[test]
+    fn kernel_p0_batch20_w3_preserves_interrupt_profile_and_stack(){
+        let (p,mut f)=state();
+        f[17]=0x202;
+        assert!(ring3_frame_valid(&f,&p,true));
+        assert!(!ring3_frame_valid(&f,&p,false));
+        f[18]=p.guard_begin;
+        assert!(!ring3_frame_valid(&f,&p,true));
+        f[18]=p.stack_end-8;
+        assert!(ring3_frame_valid(&f,&p,true));
+    }
 }
