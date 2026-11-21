@@ -278,6 +278,19 @@ fn framebuffer_ok(f:&Framebuffer)->bool {
     let Some(b)=mask(f.blue_size,f.blue_shift) else {return false};
     (r&g)==0 && (r&b)==0 && (g&b)==0
 }
+fn framebuffer_status_rect_valid(
+    f:&Framebuffer,x:u64,y:u64,width:u64,height:u64
+)->bool {
+    if !framebuffer_ok(f)||width==0||height==0{return false;}
+    let Some(x_end)=x.checked_add(width)else{return false;};
+    let Some(y_end)=y.checked_add(height)else{return false;};
+    if x_end>f.width||y_end>f.height{return false;}
+    let Some(end)=y_end.checked_sub(1)
+        .and_then(|row|row.checked_mul(f.pitch))
+        .and_then(|at|x_end.checked_mul(4).and_then(|pix|at.checked_add(pix)))
+        else{return false;};
+    f.pitch.checked_mul(f.height).is_some_and(|size|end<=size)
+}
 fn chan(c:u8,bits:u8,shift:u8)->u32 {
     (((c as u32)*((1u32<<bits)-1)/255)<<shift)
 }
@@ -310,6 +323,10 @@ pub unsafe extern "C" fn boot_draw_status(){
     let h=f.height.min(120);
     let x0=(f.width-w)/2;
     let y0=(f.height-h)/2;
+    if !framebuffer_status_rect_valid(f,x0,y0,w,h){
+        log(b"IndianOS: framebuffer rectangle unsafe (serial mode)\n\0");
+        return;
+    }
     let saffron=pixel(f,255,153,51);
     let white=pixel(f,255,255,255);
     let green=pixel(f,19,136,8);
@@ -849,5 +866,34 @@ mod kernel_p0_batch33_w6 {
             &Region{base:0x2000,length:0x1000,kind:0},0xffff_ffff_ffff_f000));
         assert!(!hhdm_usable_region_valid(
             &Region{base:u64::MAX-0xfff,length:0x1000,kind:0},HHDM));
+    }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch34_w6 {
+    use super::*;
+    fn fb()->Framebuffer {
+        Framebuffer{address:0x1000 as *mut u8,width:80,height:30,
+            pitch:80*4,bpp:32,model:1,
+            red_size:8,red_shift:16,green_size:8,green_shift:8,
+            blue_size:8,blue_shift:0}
+    }
+    #[test] fn kernel_p0_batch34_w6_843_center_and_full_frame_rects_fit(){
+        let f=fb();
+        assert!(framebuffer_status_rect_valid(&f,10,10,60,10));
+        assert!(framebuffer_status_rect_valid(&f,0,0,80,30));
+    }
+    #[test] fn kernel_p0_batch34_w6_844_outside_or_wrapping_rect_denied(){
+        let f=fb();
+        assert!(!framebuffer_status_rect_valid(&f,79,0,2,1));
+        assert!(!framebuffer_status_rect_valid(&f,0,29,1,2));
+        assert!(!framebuffer_status_rect_valid(&f,u64::MAX,0,2,1));
+        assert!(!framebuffer_status_rect_valid(&f,0,0,0,2));
+    }
+    #[test] fn kernel_p0_batch34_w6_845_invalid_pitch_or_mask_denies_render(){
+        let mut f=fb();f.pitch=79*4;
+        assert!(!framebuffer_status_rect_valid(&f,0,0,1,1));
+        f=fb();f.green_shift=16;
+        assert!(!framebuffer_status_rect_valid(&f,0,0,1,1));
     }
 }

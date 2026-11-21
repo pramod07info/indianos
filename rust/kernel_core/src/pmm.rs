@@ -744,13 +744,18 @@ impl State{
     /// 20. Publish a complete per-span occupancy snapshot or nothing.
     fn snapshot_span_usage(&self,out:&mut[FrameSpanUsage])->Option<usize>{
         if !self.verify_frame_accounting()||out.len()<self.count{return None;}
+        // Build the complete ownership snapshot before publishing even one
+        // descriptor. An invalid late span cannot leak a partial view.
+        let blank=FrameSpanUsage{base:0,frames:0,busy:0,longest_free:0};
+        let mut staged=[blank;MAX_SPANS];
         for (i,s) in self.spans[..self.count].iter().enumerate(){
-            out[i]=FrameSpanUsage{
+            staged[i]=FrameSpanUsage{
                 base:s.base,frames:s.count,
                 busy:self.busy_in_span(i)?,
                 longest_free:self.longest_free_in_span(i)?,
             };
         }
+        out[..self.count].copy_from_slice(&staged[..self.count]);
         Some(self.count)
     }
 }
@@ -2244,5 +2249,51 @@ mod p0_hhdm_zero_page_allocator_regression {
         assert!(!s.is_managed_frame(0));
         assert_eq!(s.claim_single_frame(),Some(PAGE));
         assert!(s.verify_frame_accounting());
+    }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch34_w1 {
+    use super::*;
+    unsafe extern "C" fn read(i:u64,out:*mut Region,ctx:*mut c_void)->bool {
+        let regions=unsafe{&*(ctx.cast::<Vec<Region>>())};
+        if let Some(v)=regions.get(i as usize){unsafe{out.write(*v)};true}else{false}
+    }
+    fn setup()->State{
+        let mut s=State::empty();
+        let mut map=vec![Region{base:PAGE,length:4*PAGE,kind:0},
+            Region{base:20*PAGE,length:3*PAGE,kind:0}];
+        assert!(unsafe{initialize(&mut s,2,Some(read),
+            (&mut map as *mut Vec<Region>).cast())});
+        s
+    }
+    const SENTINEL:FrameSpanUsage=FrameSpanUsage{
+        base:0xfeed,frames:0xfeed,busy:0xfeed,longest_free:0xfeed,
+    };
+    #[test] fn kernel_p0_batch34_w1_826_two_span_snapshot_matches_ownership(){
+        let mut s=setup();assert!(s.claim_run(PAGE*2,2));
+        let mut out=[SENTINEL;3];
+        assert_eq!(s.snapshot_span_usage(&mut out),Some(2));
+        assert_eq!(out[0],FrameSpanUsage{base:PAGE,frames:4,busy:2,longest_free:1});
+        assert_eq!(out[1],FrameSpanUsage{base:20*PAGE,frames:3,busy:0,longest_free:3});
+        assert_eq!(out[2],SENTINEL);
+    }
+    #[test] fn kernel_p0_batch34_w1_827_short_snapshot_has_no_partial_publication(){
+        let s=setup();let mut out=[SENTINEL;1];
+        assert_eq!(s.snapshot_span_usage(&mut out),None);
+        assert_eq!(out,[SENTINEL;1]);
+    }
+    #[test] fn kernel_p0_batch34_w1_828_corrupt_bitmap_denies_snapshot_without_writes(){
+        let mut s=setup();s.set_bit(0,true); // bookkeeping still reports zero
+        let mut out=[SENTINEL;2];
+        assert_eq!(s.snapshot_span_usage(&mut out),None);
+        assert_eq!(out,[SENTINEL;2]);
+    }
+    #[test] fn kernel_p0_batch34_w1_829_release_updates_snapshot_without_losing_span(){
+        let mut s=setup();assert!(s.claim_run(20*PAGE,2));
+        assert!(s.release_run(20*PAGE,2));
+        let mut out=[SENTINEL;2];
+        assert_eq!(s.snapshot_span_usage(&mut out),Some(2));
+        assert_eq!(out[1].busy,0);assert_eq!(out[1].longest_free,3);
     }
 }

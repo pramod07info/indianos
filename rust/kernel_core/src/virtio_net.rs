@@ -365,11 +365,21 @@ fn ethernet_egress_valid(frame:&[u8],local_mac:[u8;6])->bool{
      // foreign unicast destinations; TX cannot require dst == local MAC.
      (dst[0]&1==0 && dst.iter().any(|&byte|byte!=0)))
 }
+fn rx_l3_header_fits(frame:&[u8])->bool{
+    if frame.len()<14{return false;}
+    // IPv4 requires its fixed 20-byte header; Ethernet+ARP for IPv4
+    // requires 28 protocol bytes before the network stack can inspect it.
+    match u16::from_be_bytes([frame[12],frame[13]]){
+        0x0800=>frame.len()>=34,
+        0x0806=>frame.len()>=42,
+        _=>false,
+    }
+}
 fn rx_frame_authorized(used:usize,capacity:usize,header:&[u8],
     frame:&[u8],local:[u8;6])->Result<usize,Error>{
     let n=receive_payload_len(used,capacity)?;
     if frame.len()!=n || !rx_offload_header_valid(header) ||
-       !ethernet_ingress_valid(frame) ||
+       !rx_l3_header_fits(frame) || !ethernet_ingress_valid(frame) ||
        !ethernet_destination_allowed(frame,local){return Err(Error::Invalid);}
     Ok(n)
 }
@@ -988,6 +998,37 @@ mod kernel_p0_batch33_w5 {
             Err(Error::Invalid));
         f[6..12].fill(0);
         assert_eq!(rx_frame_authorized(70,60,&[0;10],&f,MAC),
+            Err(Error::Invalid));
+    }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch34_w5 {
+    use super::*;
+    const LOCAL:[u8;6]=[2,3,4,5,6,7];
+    fn ethernet(proto:u16,n:usize)->[u8;60]{
+        let mut f=[0;60];f[..6].copy_from_slice(&LOCAL);
+        f[6..12].copy_from_slice(&[2,9,8,7,6,5]);
+        f[12..14].copy_from_slice(&proto.to_be_bytes());
+        assert!(n<=f.len());f
+    }
+    #[test] fn kernel_p0_batch34_w5_840_ipv4_minimum_header_required(){
+        let f=ethernet(0x0800,60);
+        assert!(!rx_l3_header_fits(&f[..33]));
+        assert!(rx_l3_header_fits(&f[..34]));
+        assert_eq!(rx_frame_authorized(70,60,&[0;10],&f,LOCAL),Ok(60));
+    }
+    #[test] fn kernel_p0_batch34_w5_841_arp_minimum_header_required(){
+        let f=ethernet(0x0806,60);
+        assert!(!rx_l3_header_fits(&f[..41]));
+        assert!(rx_l3_header_fits(&f[..42]));
+        assert_eq!(rx_frame_authorized(70,60,&[0;10],&f,LOCAL),Ok(60));
+    }
+    #[test] fn kernel_p0_batch34_w5_842_non_ip_arp_and_short_l2_denied(){
+        assert!(!rx_l3_header_fits(&[0;13]));
+        let f=ethernet(0x8100,60);
+        assert!(!rx_l3_header_fits(&f));
+        assert_eq!(rx_frame_authorized(70,60,&[0;10],&f,LOCAL),
             Err(Error::Invalid));
     }
 }

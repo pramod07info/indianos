@@ -775,19 +775,29 @@ fn apic_preemption_receipt_valid(before:u64,after:u64,first:u64,last:u64,
     source_before==2 && source_after==2 &&
     preemption_delivery_receipt_valid(before,after,first,last,captured,running)
 }
+fn apic_preemption_receipt_authorized(
+    before_epoch:u64,after_epoch:u64,first_irq:u64,last_irq:u64,
+    captured:u64,running:bool,source_before:u8,source_after:u8,
+    exhausted_before:bool,exhausted_after:bool
+)->bool {
+    !exhausted_before && !exhausted_after &&
+    apic_preemption_receipt_valid(before_epoch,after_epoch,first_irq,
+        last_irq,captured,running,source_before,source_after)
+}
 pub fn xapic_record_preemption(){
-    // APIC EOI is recorded before user frame capture; require live
-    // delivery budget AND the same authoritative APIC source at publication.
+    // Carry both exhaustion observations across the IRQ accounting
+    // transaction, not only the publication side.
     let epoch=MONOTONIC_SESSION_EPOCH.load(Ordering::Acquire);
     let source=MONOTONIC_SOURCE.load(Ordering::Acquire);
+    let exhausted=MONOTONIC_EXHAUSTED.load(Ordering::Acquire);
     let delivered=XAPIC_IRQ_TICKS.load(Ordering::Acquire);
     XAPIC_PREEMPTIONS.fetch_update(Ordering::AcqRel,Ordering::Acquire,|v|{
-        if !MONOTONIC_EXHAUSTED.load(Ordering::Acquire) &&
-           apic_preemption_receipt_valid(epoch,
+        if apic_preemption_receipt_authorized(epoch,
             MONOTONIC_SESSION_EPOCH.load(Ordering::Acquire),delivered,
             XAPIC_IRQ_TICKS.load(Ordering::Acquire),v,
             XAPIC_TIMER_RUNNING.load(Ordering::Acquire),
-            source,MONOTONIC_SOURCE.load(Ordering::Acquire)
+            source,MONOTONIC_SOURCE.load(Ordering::Acquire),
+            exhausted,MONOTONIC_EXHAUSTED.load(Ordering::Acquire)
         ){v.checked_add(1)}else{None}
     }).ok();
 }
@@ -1559,5 +1569,28 @@ mod kernel_p0_batch33_w2 {
         for source in [0,1,3]{assert!(!apic_preemption_authorized(true,source,23,false));}
         assert!(!apic_preemption_receipt_valid(23,23,3,4,3,true,2,2));
         assert!(!apic_preemption_receipt_valid(23,24,3,4,2,true,2,2));
+    }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch34_w2 {
+    use super::*;
+    #[test] fn kernel_p0_batch34_w2_830_live_receipt_without_exhaustion_admitted(){
+        assert!(apic_preemption_receipt_authorized(
+            9,9,5,6,2,true,2,2,false,false));
+    }
+    #[test] fn kernel_p0_batch34_w2_831_early_or_late_exhaustion_denied(){
+        assert!(!apic_preemption_receipt_authorized(
+            9,9,5,6,2,true,2,2,true,false));
+        assert!(!apic_preemption_receipt_authorized(
+            9,9,5,6,2,true,2,2,false,true));
+    }
+    #[test] fn kernel_p0_batch34_w2_832_cross_epoch_and_apic_source_handover_denied(){
+        assert!(!apic_preemption_receipt_authorized(
+            9,10,5,6,2,true,2,2,false,false));
+        assert!(!apic_preemption_receipt_authorized(
+            9,9,5,6,2,true,2,1,false,false));
+        assert!(!apic_preemption_receipt_authorized(
+            9,9,5,6,2,false,2,2,false,false));
     }
 }

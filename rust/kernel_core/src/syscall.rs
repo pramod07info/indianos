@@ -703,7 +703,15 @@ pub(crate) fn user_copy_batch_valid(plan:&ProgramPlan,spans:&[CopySpan])->bool{
 /// The live trap path still uses ring3_frame_valid and MUST be upgraded
 /// before this strict policy can count as a production NX/W^X guarantee.
 /// No hardware page tables are changed by this numeric check.
-pub(crate) fn ring3_frame_strict_execution(
+pub(crate) fn strict_file_backed_instruction(segment:&ProgramSegment,address:u64)->bool {
+ if !segment.executable || segment.writable ||
+    segment.file_size==0 || segment.file_size>segment.memory_size{
+  return false;
+ }
+ segment.virtual_address.checked_add(segment.file_size)
+   .is_some_and(|end|address>=segment.virtual_address && address<end)
+}
+fn ring3_frame_strict_execution(
  frame:&[u64;20],plan:&ProgramPlan,irq_enabled:bool)->bool{
  if !ring3_frame_valid(frame,plan,irq_enabled)||
     plan.segment_count==0||plan.segment_count as usize>MAX_SEGMENTS||
@@ -739,11 +747,9 @@ pub(crate) fn ring3_frame_strict_execution(
    // The strict path requires *file-backed* code, not merely executable
    // reserved/zero-filled pages from p_memsz beyond p_filesz.
    if segment.file_size==0{return false;}
-   if let Some(end)=segment.virtual_address.checked_add(segment.file_size){
-    if (segment.virtual_address..end).contains(&rip){rip_executable=true;}
-    if (segment.virtual_address..end).contains(&plan.entry){
-     entry_executable=true;
-    }
+   if strict_file_backed_instruction(segment,rip){rip_executable=true;}
+   if strict_file_backed_instruction(segment,plan.entry){
+    entry_executable=true;
    }
   }
  }
@@ -1276,5 +1282,39 @@ mod kernel_p0_batch33_w3 {
         assert!(!ring3_frame_strict_execution(&f,&p,false));
         p.guard_begin=0;
         assert!(!ring3_frame_strict_execution(&saved(&p),&p,false));
+    }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch34_w3 {
+    use super::*;
+    fn code()->ProgramSegment{
+        ProgramSegment{virtual_address:USER_MIN+128,file_offset:4096,
+            file_size:16,memory_size:128,page_begin:USER_MIN,
+            page_end:USER_MIN+PAGE_BYTES,writable:false,executable:true}
+    }
+    #[test] fn kernel_p0_batch34_w3_833_start_and_last_real_code_byte_admitted(){
+        let c=code();
+        assert!(strict_file_backed_instruction(&c,USER_MIN+128));
+        assert!(strict_file_backed_instruction(&c,USER_MIN+143));
+    }
+    #[test] fn kernel_p0_batch34_w3_834_bss_and_presegment_bytes_denied(){
+        let c=code();
+        assert!(!strict_file_backed_instruction(&c,USER_MIN+144));
+        assert!(!strict_file_backed_instruction(&c,USER_MIN+127));
+    }
+    #[test] fn kernel_p0_batch34_w3_835_writable_or_nonexec_code_denied(){
+        let mut c=code();c.writable=true;
+        assert!(!strict_file_backed_instruction(&c,USER_MIN+128));
+        c.writable=false;c.executable=false;
+        assert!(!strict_file_backed_instruction(&c,USER_MIN+128));
+    }
+    #[test] fn kernel_p0_batch34_w3_836_elf_file_overflow_and_unbacked_code_denied(){
+        let mut c=code();c.virtual_address=u64::MAX-4;
+        assert!(!strict_file_backed_instruction(&c,u64::MAX-3));
+        c=code();c.file_size=0;
+        assert!(!strict_file_backed_instruction(&c,USER_MIN+128));
+        c=code();c.file_size=129;
+        assert!(!strict_file_backed_instruction(&c,USER_MIN+128));
     }
 }
