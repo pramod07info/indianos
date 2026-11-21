@@ -743,3 +743,4 @@ mod kernel_p0_batch29_w6{
  #[test] fn kernel_p0_batch29_w6_743_high_canonical_pointer(){assert!(limine_pointer_aligned(0xffff_8000_0000_1000usize as *const Region));}
  #[test] fn kernel_p0_batch29_w6_744_noncanonical_pointer_denied(){assert!(!limine_pointer_aligned(0x0000_8000_0000_0000usize as *const Region));assert!(!limine_pointer_aligned(0xffff_7fff_ffff_f000usize as *const Region));}
  #[test] fn kernel_p0_batch29_w6_745_null_misaligned_pointer_denied(){assert!(!limine_pointer_aligned(core::ptr::null::<Region>()));assert!(!limine_pointer_aligned(0x1001usize as *const Region));}
+}
