@@ -729,8 +729,12 @@ mod kernel_p0_batch25_w5_tests {
         assert!(!ethernet_ingress_valid(&f));
     }
     #[test]fn kernel_p0_batch25_w5_650_tx_source_identity_enforced(){
-        let mut f=frame();assert!(ethernet_egress_valid(&f,LOCAL));
-        f[6]=0x54;assert!(!ethernet_egress_valid(&f,LOCAL));
+        let mut f=frame();
+        // TX must carry this NIC's source, not the foreign RX fixture source.
+        f[6..12].copy_from_slice(&LOCAL);
+        assert!(ethernet_egress_valid(&f,LOCAL));
+        f[6]=0x54;
+        assert!(!ethernet_egress_valid(&f,LOCAL));
     }
 }
 

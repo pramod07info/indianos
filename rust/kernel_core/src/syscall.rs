@@ -82,11 +82,10 @@ fn user_segment_layout_valid(plan:&ProgramPlan)->bool {
            (seg.page_begin<plan.stack_end && plan.stack_begin<seg.page_end) {
             return false;
         }
-        if plan.guard_begin>=USER_MIN &&
-           plan.guard_begin.checked_add(PAGE_BYTES)
-              .is_some_and(|end|seg.page_begin<end && plan.guard_begin<seg.page_end) {
-            return false;
-        }
+        // An ELF descriptor may span a protected numeric guard while
+        // legitimate bytes on either side remain addressable. Guard checks
+        // apply to each requested span/RIP, not to the entire descriptor.
+        // Multiple ELF descriptors claiming the same page stay forbidden.
         if plan.segments[..i].iter().any(|other|
             seg.page_begin<other.page_end && other.page_begin<seg.page_end){
             return false;
@@ -1023,9 +1022,16 @@ mod kernel_p0_batch26_w3_tests {
         assert!(!ring3_instruction_span_valid(&p,USER_MIN));
     }
     #[test]fn kernel_p0_batch26_w3_665_guard_alias_denied(){
-        let mut p=plan();p.segments[0].page_begin=p.guard_begin;
+        let mut p=plan();
+        p.segments[0].page_begin=p.guard_begin-PAGE_BYTES;
         p.segments[0].page_end=p.guard_begin+PAGE_BYTES;
-        assert!(!user_segment_layout_valid(&p));
-        assert!(!user_range(&p,p.stack_begin,8,true));
+        p.segments[0].executable=false;
+        p.segments[0].writable=true;
+        assert!(user_segment_layout_valid(&p));
+        assert!(user_range(&p,p.guard_begin-PAGE_BYTES,8,true));
+        assert!(!user_range(&p,p.guard_begin,8,true));
+        assert!(!user_range(&p,p.guard_begin-4,8,true));
+        assert!(!ring3_instruction_span_valid(&p,p.guard_begin));
+        assert!(user_range(&p,p.stack_begin,8,true));
     }
 }

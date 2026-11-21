@@ -650,8 +650,10 @@ mod kernel_p0_batch25_w6_tests {
     #[test]fn kernel_p0_batch25_w6_653_crossing_physical_limit_denied(){
         assert!(!check(Region{base:(1u64<<52)-4096,length:8192,kind:0},HHDM));
     }
-    #[test]fn kernel_p0_batch25_w6_654_final_physical_page_allowed(){
-        assert!(check(Region{base:(1u64<<52)-4096,length:4096,kind:0},HHDM));
+    #[test]fn kernel_p0_batch25_w6_654_last_physical_page_requires_addressable_hhdm(){
+        // Physical MAXPHYADDR does not imply direct-map addressability:
+        // HHDM + (2^52 - 1) overflows the four-level high-half window.
+        assert!(!check(Region{base:(1u64<<52)-4096,length:4096,kind:0},HHDM));
     }
     #[test]fn kernel_p0_batch25_w6_655_invalid_direct_map_offset_denied(){
         assert!(!check(Region{base:4096,length:4096,kind:0},0));

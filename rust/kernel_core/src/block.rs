@@ -2790,7 +2790,9 @@ mod kernel_p0_batch20_w4_tests{
         let mut out=[0x55u8;SECTOR_BYTES];
         assert_eq!(read_stable_sectors(&mut d,0,&mut out),Err(BlockError::Io));
         assert_eq!(out,[0x55;SECTOR_BYTES]);
-        assert_eq!(d.reads,2);
+        // The double-sampled geometry fence aborts *before* a second I/O.
+        // Refusing the stale media sooner is safer than reading it twice.
+        assert_eq!(d.reads,1);
     }
     #[test]
     fn kernel_p0_batch20_w4_stable_media_publishes_only_after_both_reads(){
