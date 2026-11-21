@@ -235,7 +235,7 @@ pub unsafe extern "C" fn pmm_allocate_frame(physical: *mut u64) -> bool {
 impl State {
     /// Only a verified span table may authorize multi-frame DMA runs.
     fn claim_contiguous_run(&mut self,count:u32)->Option<u64>{
-        if !(1..=16).contains(&count) || !self.single_frame_geometry_valid(){return None;}
+        if !(1..=16).contains(&count) || !self.verify_frame_accounting(){return None;}
         let want=count as u64;
         if want>self.total-self.used{return None;}
         for span_index in 0..self.count {
@@ -484,7 +484,7 @@ impl State {
     }
     /// Reserve a specific frame run only when ALL frames are free.
     fn claim_run(&mut self,physical:u64,count:u32)->bool{
-        if !self.initialized||self.used>self.total||
+        if !self.verify_frame_accounting()||
             count as u64>self.total-self.used{return false;}
         let Some(first)=self.validate_run(physical,count,false)else{return false;};
         for i in 0..count as u64{self.set_bit(first+i,true);}
@@ -494,7 +494,7 @@ impl State {
     }
     /// Release a complete frame run atomically or none of its frames.
     fn release_run(&mut self,physical:u64,count:u32)->bool{
-        if !self.initialized||self.used>self.total||
+        if !self.verify_frame_accounting()||
             self.used<count as u64{return false;}
         let Some(first)=self.validate_run(physical,count,true)else{return false;};
         for i in 0..count as u64{self.set_bit(first+i,false);}
@@ -2182,5 +2182,42 @@ mod kernel_p0_batch32_w1 {
         assert!(!s.can_release_frames(&[PAGE]));
         s.used=1;assert!(s.can_claim_frames(&[2*PAGE]));
         assert!(s.can_release_frames(&[PAGE]));
+    }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch33_w1 {
+    use super::*;
+    fn state()->State{
+        let mut s=State::empty();
+        s.initialized=true;s.count=1;s.total=8;
+        s.spans[0]=Span{base:PAGE,count:8,bit_offset:0};s
+    }
+    #[test] fn kernel_p0_batch33_w1_806_corrupted_accounting_denies_exact_dma_claim(){
+        let mut s=state();s.used=1;
+        assert!(!s.claim_run(PAGE,2));assert_eq!(s.bitmap[0],0);
+        assert_eq!(s.used,1);
+    }
+    #[test] fn kernel_p0_batch33_w1_807_corrupted_accounting_denies_release(){
+        let mut s=state();assert!(s.claim_run(PAGE,2));
+        s.used=1;assert!(!s.release_run(PAGE,2));
+        assert!(s.allocated(0));assert!(s.allocated(1));assert_eq!(s.used,1);
+        s.used=2;assert!(s.release_run(PAGE,2));
+    }
+    #[test] fn kernel_p0_batch33_w1_808_corrupted_accounting_denies_contiguous_claim(){
+        let mut s=state();s.used=1;
+        assert_eq!(s.claim_contiguous_run(2),None);
+        assert_eq!(s.bitmap[0],0);
+    }
+    #[test] fn kernel_p0_batch33_w1_809_valid_aligned_highest_and_contiguous_runs(){
+        let mut s=state();
+        assert_eq!(s.claim_aligned_run(2,2),Some(2*PAGE));
+        assert_eq!(s.claim_highest_run(2),Some(7*PAGE));
+        assert_eq!(s.claim_contiguous_run(2),Some(4*PAGE));
+        assert_eq!(s.used,6);assert!(s.verify_frame_accounting());
+        assert!(s.release_run(2*PAGE,2));
+        assert!(s.release_run(7*PAGE,2));
+        assert!(s.release_run(4*PAGE,2));
+        assert_eq!(s.used,0);assert!(s.verify_frame_accounting());
     }
 }

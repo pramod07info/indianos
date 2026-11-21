@@ -241,14 +241,22 @@ pub fn read_sectors<D: BlockDevice>(
 /// not qualify for this revision-pinned publication API.
 /// Read only when the caller's previously selected device revision still owns
 /// both observations. No caller bytes escape on stale media, torn data or I/O.
+/// Require both capacity and media revision from a previously validated mount.
+pub fn read_expected_media_snapshot_sectors<D:BlockDevice>(
+    device:&mut D,start:u64,expected_capacity:u64,expected_revision:u64,
+    out:&mut[u8]
+)->Result<(),BlockError>{
+    if !media_snapshot_matches(device,expected_capacity,Some(expected_revision)){
+        return Err(BlockError::Io);
+    }
+    read_stable_sectors_verified(device,start,out,
+        Some((expected_capacity,expected_revision)))
+}
 pub fn read_expected_generation_sectors<D:BlockDevice>(
     device:&mut D,start:u64,expected:u64,out:&mut[u8]
 )->Result<(),BlockError>{
     let capacity=device.sector_count();
-    if !media_snapshot_matches(device,capacity,Some(expected)){
-        return Err(BlockError::Io);
-    }
-    read_stable_sectors_verified(device,start,out,Some((capacity,expected)))
+    read_expected_media_snapshot_sectors(device,start,capacity,expected,out)
 }
 pub fn read_generation_pinned_sectors<D:BlockDevice>(
     device:&mut D,start:u64,out:&mut[u8]
@@ -3372,6 +3380,42 @@ mod kernel_p0_batch32_w4 {
     #[test] fn kernel_p0_batch32_w4_799_swap_during_second_pass_preserves_bytes(){
         let mut d=disk(2);let mut out=[0x31;SECTOR_BYTES];
         assert_eq!(read_expected_generation_sectors(&mut d,0,7,&mut out),
+            Err(BlockError::Io));
+        assert_eq!(d.reads,2);assert_eq!(out,[0x31;SECTOR_BYTES]);
+    }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch33_w4 {
+    use super::*;
+    struct Disk{capacity:u64,revision:u64,reads:u32,shrink_on:u32}
+    impl BlockDevice for Disk {
+        fn sector_count(&self)->u64{self.capacity}
+        fn media_generation(&self)->Option<u64>{Some(self.revision)}
+        fn read_sector(&mut self,_:u64,out:&mut[u8;SECTOR_BYTES])
+            ->Result<(),BlockError>{
+            self.reads+=1;out.fill(0x55);
+            if self.reads==self.shrink_on{self.capacity=3;}
+            Ok(())
+        }
+        fn write_sector(&mut self,_:u64,_:&[u8;SECTOR_BYTES])
+            ->Result<(),BlockError>{Err(BlockError::ReadOnly)}
+    }
+    fn disk(shrink_on:u32)->Disk{Disk{capacity:4,revision:9,reads:0,shrink_on}}
+    #[test] fn kernel_p0_batch33_w4_817_exact_snapshot_yields_two_pass_verified_sector(){
+        let mut d=disk(0);let mut out=[0;SECTOR_BYTES];
+        assert_eq!(read_expected_media_snapshot_sectors(&mut d,1,4,9,&mut out),Ok(()));
+        assert_eq!(d.reads,2);assert_eq!(out,[0x55;SECTOR_BYTES]);
+    }
+    #[test] fn kernel_p0_batch33_w4_818_stale_capacity_preflight_has_no_read_or_publish(){
+        let mut d=disk(0);let mut out=[0x31;SECTOR_BYTES];
+        assert_eq!(read_expected_media_snapshot_sectors(&mut d,1,5,9,&mut out),
+            Err(BlockError::Io));
+        assert_eq!(d.reads,0);assert_eq!(out,[0x31;SECTOR_BYTES]);
+    }
+    #[test] fn kernel_p0_batch33_w4_819_capacity_swap_second_pass_retains_caller_bytes(){
+        let mut d=disk(2);let mut out=[0x31;SECTOR_BYTES];
+        assert_eq!(read_expected_media_snapshot_sectors(&mut d,1,4,9,&mut out),
             Err(BlockError::Io));
         assert_eq!(d.reads,2);assert_eq!(out,[0x31;SECTOR_BYTES]);
     }

@@ -782,7 +782,8 @@ pub fn xapic_record_preemption(){
     let source=MONOTONIC_SOURCE.load(Ordering::Acquire);
     let delivered=XAPIC_IRQ_TICKS.load(Ordering::Acquire);
     XAPIC_PREEMPTIONS.fetch_update(Ordering::AcqRel,Ordering::Acquire,|v|{
-        if apic_preemption_receipt_valid(epoch,
+        if !MONOTONIC_EXHAUSTED.load(Ordering::Acquire) &&
+           apic_preemption_receipt_valid(epoch,
             MONOTONIC_SESSION_EPOCH.load(Ordering::Acquire),delivered,
             XAPIC_IRQ_TICKS.load(Ordering::Acquire),v,
             XAPIC_TIMER_RUNNING.load(Ordering::Acquire),
@@ -810,11 +811,15 @@ fn apic_preemption_ready(running:bool,source:u8,epoch:u64)->bool {
 }
 /// An APIC timer interrupt may preempt only with live timer-source authority.
 #[no_mangle]
+fn apic_preemption_authorized(running:bool,source:u8,epoch:u64,exhausted:bool)->bool {
+    !exhausted && apic_preemption_ready(running,source,epoch)
+}
 pub extern "C" fn x86_64_xapic_timer_preemption_ready()->bool{
-    apic_preemption_ready(
+    apic_preemption_authorized(
         XAPIC_TIMER_RUNNING.load(Ordering::Acquire),
         MONOTONIC_SOURCE.load(Ordering::Acquire),
-        MONOTONIC_SESSION_EPOCH.load(Ordering::Acquire)
+        MONOTONIC_SESSION_EPOCH.load(Ordering::Acquire),
+        MONOTONIC_EXHAUSTED.load(Ordering::Acquire)
     )
 }
 
@@ -1536,5 +1541,23 @@ mod kernel_p0_batch32_w2 {
         assert!(!apic_preemption_ready(false,2,42));
         assert!(!apic_preemption_ready(true,2,0));
         assert!(!apic_preemption_ready(true,2,u64::MAX));
+    }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch33_w2 {
+    use super::*;
+    #[test] fn kernel_p0_batch33_w2_810_active_xapic_session_admitted(){
+        assert!(apic_preemption_authorized(true,2,23,false));
+        assert!(apic_preemption_receipt_valid(23,23,3,4,2,true,2,2));
+    }
+    #[test] fn kernel_p0_batch33_w2_811_sticky_exhaustion_revokes_preemption(){
+        assert!(!apic_preemption_authorized(true,2,23,true));
+        assert!(!apic_preemption_authorized(true,2,u64::MAX,false));
+    }
+    #[test] fn kernel_p0_batch33_w2_812_foreign_source_and_exhausted_irq_budget_denied(){
+        for source in [0,1,3]{assert!(!apic_preemption_authorized(true,source,23,false));}
+        assert!(!apic_preemption_receipt_valid(23,23,3,4,3,true,2,2));
+        assert!(!apic_preemption_receipt_valid(23,24,3,4,2,true,2,2));
     }
 }

@@ -365,6 +365,14 @@ fn ethernet_egress_valid(frame:&[u8],local_mac:[u8;6])->bool{
      // foreign unicast destinations; TX cannot require dst == local MAC.
      (dst[0]&1==0 && dst.iter().any(|&byte|byte!=0)))
 }
+fn rx_frame_authorized(used:usize,capacity:usize,header:&[u8],
+    frame:&[u8],local:[u8;6])->Result<usize,Error>{
+    let n=receive_payload_len(used,capacity)?;
+    if frame.len()!=n || !rx_offload_header_valid(header) ||
+       !ethernet_ingress_valid(frame) ||
+       !ethernet_destination_allowed(frame,local){return Err(Error::Invalid);}
+    Ok(n)
+}
 fn tx_completion_length_valid(reported:usize,frame_length:usize)->bool {
     // Virtio legacy TX may report zero, or the entire submitted frame.
     // A nonzero partial length is not an authenticated complete packet.
@@ -425,15 +433,8 @@ impl EthernetDevice for VirtioNet{
         // Drop rather than publish a frame if the NIC claims unsupported GSO
         // or checksum work. Return no caller bytes on rejection.
         let header=unsafe{core::slice::from_raw_parts(self.rx.buffer,10)};
-        if !rx_offload_header_valid(header){
-            self.rx.offer();
-            compiler_fence(Ordering::Release);
-            unsafe{outw(self.port+0x10,QUEUE_RX);}
-            return Err(Error::Invalid);
-        }
         let frame=unsafe{core::slice::from_raw_parts(self.rx.buffer.add(10),n)};
-        if !ethernet_ingress_valid(frame) ||
-           !ethernet_destination_allowed(frame,self.mac){
+        if rx_frame_authorized(length,out.len(),header,frame,self.mac).is_err(){
             self.rx.offer();
             compiler_fence(Ordering::Release);
             unsafe{outw(self.port+0x10,QUEUE_RX);}
@@ -959,5 +960,34 @@ mod kernel_p0_batch32_w5 {
         assert!(!tx_completion_length_valid(10,60));
         assert!(!tx_completion_length_valid(69,60));
         assert!(!tx_completion_length_valid(71,60));
+    }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch33_w5 {
+    use super::*;
+    const MAC:[u8;6]=[2,1,2,3,4,5];
+    fn frame()->[u8;60] {
+        let mut f=[0u8;60];f[..6].copy_from_slice(&MAC);
+        f[6..12].copy_from_slice(&MAC);
+        f[12..14].copy_from_slice(&0x0800u16.to_be_bytes());f
+    }
+    #[test] fn kernel_p0_batch33_w5_820_complete_no_offload_ipv4_frame_authorized(){
+        let f=frame();
+        assert_eq!(rx_frame_authorized(70,60,&[0;10],&f,MAC),Ok(60));
+    }
+    #[test] fn kernel_p0_batch33_w5_821_invalid_offload_or_reported_length_denied(){
+        let f=frame();let mut hdr=[0u8;10];hdr[2]=1;
+        assert_eq!(rx_frame_authorized(70,60,&hdr,&f,MAC),Err(Error::Invalid));
+        assert_eq!(rx_frame_authorized(69,60,&[0;10],&f,MAC),Err(Error::Invalid));
+        assert_eq!(rx_frame_authorized(70,59,&[0;10],&f,MAC),Err(Error::Invalid));
+    }
+    #[test] fn kernel_p0_batch33_w5_822_foreign_or_malformed_ingress_denied(){
+        let mut f=frame();
+        assert_eq!(rx_frame_authorized(70,60,&[0;10],&f,[2,9,8,7,6,5]),
+            Err(Error::Invalid));
+        f[6..12].fill(0);
+        assert_eq!(rx_frame_authorized(70,60,&[0;10],&f,MAC),
+            Err(Error::Invalid));
     }
 }

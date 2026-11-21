@@ -121,6 +121,19 @@ fn validated_map_count(map:&MemoryMap)->Option<u64>{
 fn usable_ram_page_aligned(region:&Region)->bool {
     (region.base|region.length)&0xfff==0
 }
+fn hhdm_usable_region_valid(region:&Region,offset:u64)->bool {
+    const MAX_PHYSICAL_EXCLUSIVE:u64=1u64<<52;
+    if region.kind!=0 || !valid_region(region) ||
+       region.base<4096 || !usable_ram_page_aligned(region) ||
+       region.base>=MAX_PHYSICAL_EXCLUSIVE ||
+       region.base.checked_add(region.length)
+           .is_none_or(|end|end>MAX_PHYSICAL_EXCLUSIVE) ||
+       !hhdm_offset_sane(offset) {return false;}
+    let Some(first)=offset.checked_add(region.base)else{return false;};
+    let Some(last)=region.base.checked_add(region.length-1)
+        .and_then(|p|offset.checked_add(p))else{return false;};
+    first>=0xffff_8000_0000_0000 && last>=first
+}
 fn hhdm_covers_usable_map(map:&MemoryMap,offset:u64)->bool{
     if !hhdm_offset_sane(offset) ||
         validated_map_count(map).is_none(){return false;}
@@ -129,18 +142,7 @@ fn hhdm_covers_usable_map(map:&MemoryMap,offset:u64)->bool{
         if !limine_pointer_aligned(region_pointer){return false;}
         let region=unsafe{&*region_pointer};
         if region.kind!=0{continue;}
-        if !usable_ram_page_aligned(region){return false;}
-        // This four-level x86-64 boot path cannot address usable physical
-        // memory beyond the architectural 52-bit MAXPHYADDR ceiling.
-        const MAX_PHYSICAL_EXCLUSIVE:u64=1u64<<52;
-        if region.base>=MAX_PHYSICAL_EXCLUSIVE ||
-           region.base.checked_add(region.length)
-                .is_none_or(|end|end>MAX_PHYSICAL_EXCLUSIVE){return false;}
-        let Some(end)=region.base.checked_add(region.length)
-            .and_then(|last|last.checked_sub(1))
-            .and_then(|last|offset.checked_add(last))else{return false;};
-        // Four-level 48-bit canonical high-half addresses only.
-        if end<0xffff_8000_0000_0000{return false;}
+        if !hhdm_usable_region_valid(region,offset){return false;}
     }
     true
 }
@@ -811,5 +813,33 @@ mod kernel_p0_batch32_w6 {
         assert!(!limine_pointer_table_valid(p,2,4096));
         assert!(!limine_pointer_table_valid(
             0x1001usize as *const *const Region,1,4096));
+    }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch33_w6 {
+    use super::*;
+    const HHDM:u64=0xffff_8000_0000_0000;
+    #[test] fn kernel_p0_batch33_w6_823_valid_usable_phys_region_maps_high_half(){
+        assert!(hhdm_usable_region_valid(
+            &Region{base:0x1000,length:0x2000,kind:0},HHDM));
+        assert!(hhdm_usable_region_valid(
+            &Region{base:0x1_0000_0000,length:0x1000,kind:0},HHDM));
+    }
+    #[test] fn kernel_p0_batch33_w6_824_zero_frame_reserved_or_excess_phys_denied(){
+        assert!(!hhdm_usable_region_valid(
+            &Region{base:0,length:0x2000,kind:0},HHDM));
+        assert!(!hhdm_usable_region_valid(
+            &Region{base:0x1000,length:0x1000,kind:1},HHDM));
+        assert!(!hhdm_usable_region_valid(
+            &Region{base:1u64<<52,length:0x1000,kind:0},HHDM));
+    }
+    #[test] fn kernel_p0_batch33_w6_825_misaligned_overflowing_hhdm_region_denied(){
+        assert!(!hhdm_usable_region_valid(
+            &Region{base:0x1001,length:0x1000,kind:0},HHDM));
+        assert!(!hhdm_usable_region_valid(
+            &Region{base:0x2000,length:0x1000,kind:0},0xffff_ffff_ffff_f000));
+        assert!(!hhdm_usable_region_valid(
+            &Region{base:u64::MAX-0xfff,length:0x1000,kind:0},HHDM));
     }
 }

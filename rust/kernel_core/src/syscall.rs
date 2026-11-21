@@ -708,7 +708,8 @@ pub(crate) fn ring3_frame_strict_execution(
  if !ring3_frame_valid(frame,plan,irq_enabled)||
     plan.segment_count==0||plan.segment_count as usize>MAX_SEGMENTS||
     plan.guard_begin.checked_add(PAGE_BYTES)!=Some(plan.stack_begin)||
-    frame[18]>=plan.stack_end{
+    plan.stack_end.checked_sub(plan.stack_begin)!=Some(STACK_BYTES)||
+    frame[18]>=plan.stack_end||frame[18]&7!=0{
   return false;
  }
  let rip=frame[15];
@@ -1231,5 +1232,49 @@ mod kernel_p0_batch32_w3 {
         p.segments[1].file_size=0;
         assert!(!ring3_frame_strict_execution(
             &frame(&p,USER_MIN+PAGE_BYTES+65),&p,false));
+    }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch33_w3 {
+    use super::*;
+    fn plan()->ProgramPlan {
+        let mut segments=[ProgramSegment::empty();MAX_SEGMENTS];
+        segments[0]=ProgramSegment{virtual_address:USER_MIN+64,file_offset:0,
+            file_size:24,memory_size:128,page_begin:USER_MIN,
+            page_end:USER_MIN+PAGE_BYTES,writable:false,executable:true};
+        ProgramPlan{entry:USER_MIN+64,stack_begin:USER_TOP-STACK_BYTES,
+            stack_end:USER_TOP,guard_begin:USER_TOP-STACK_BYTES-PAGE_BYTES,
+            segment_count:1,segments}
+    }
+    fn saved(p:&ProgramPlan)->[u64;20]{
+        let mut f=[0;20];f[15]=p.entry;f[16]=0x2b;f[17]=0x2;
+        f[18]=p.stack_end-8;f[19]=0x33;f
+    }
+    #[test] fn kernel_p0_batch33_w3_813_strict_stack_valid_iret_frame(){
+        let p=plan();assert!(ring3_frame_strict_execution(&saved(&p),&p,false));
+    }
+    #[test] fn kernel_p0_batch33_w3_814_widened_or_shrunk_stack_denied(){
+        let mut p=plan();p.stack_begin-=PAGE_BYTES;
+        p.guard_begin-=PAGE_BYTES;
+        assert!(!ring3_frame_strict_execution(&saved(&p),&p,false));
+        p=plan();p.stack_begin+=PAGE_BYTES;
+        p.guard_begin+=PAGE_BYTES;
+        assert!(!ring3_frame_strict_execution(&saved(&p),&p,false));
+    }
+    #[test] fn kernel_p0_batch33_w3_815_unaligned_saved_stack_denied(){
+        let p=plan();let mut f=saved(&p);
+        f[18]-=1;
+        assert!(ring3_frame_valid(&f,&p,false)); // staged numeric ABI remains
+        assert!(!ring3_frame_strict_execution(&f,&p,false));
+    }
+    #[test] fn kernel_p0_batch33_w3_816_stack_lower_boundary_admitted_guard_denied(){
+        let mut p=plan();let mut f=saved(&p);
+        f[18]=p.stack_begin;
+        assert!(ring3_frame_strict_execution(&f,&p,false));
+        f[18]=p.stack_begin-8;
+        assert!(!ring3_frame_strict_execution(&f,&p,false));
+        p.guard_begin=0;
+        assert!(!ring3_frame_strict_execution(&saved(&p),&p,false));
     }
 }
