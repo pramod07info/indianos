@@ -268,29 +268,44 @@ pub fn read_generation_pinned_sectors<D:BlockDevice>(
 
 /// Write to a previously selected volume only if BOTH geometry and media
 /// revision still match. Already-written sectors cannot be rolled back.
+#[derive(Clone,Copy,Debug,Eq,PartialEq)]
+pub struct MediaWriteFailure {
+ pub error:BlockError,
+ /// Number of successful sector writes. This does NOT certify fsync durability.
+ pub completed_sectors:usize,
+}
+pub fn write_expected_media_snapshot_with_progress<D:BlockDevice>(
+ device:&mut D,start:u64,capacity:u64,revision:u64,data:&[u8]
+)->Result<usize,MediaWriteFailure>{
+ let fault=|error,completed_sectors|MediaWriteFailure{error,completed_sectors};
+ if data.is_empty()||data.len()%SECTOR_BYTES!=0{
+  return Err(fault(BlockError::OutOfRange,0));
+ }
+ check_range(capacity,start,(data.len()/SECTOR_BYTES) as u64)
+  .map_err(|e|fault(e,0))?;
+ if !media_snapshot_matches(device,capacity,Some(revision)){
+  return Err(fault(BlockError::Io,0));
+ }
+ let mut completed=0;
+ for (i,chunk) in data.chunks_exact(SECTOR_BYTES).enumerate(){
+  if !media_snapshot_matches(device,capacity,Some(revision)){
+   return Err(fault(BlockError::Io,completed));
+  }
+  let sector:&[u8;SECTOR_BYTES]=chunk.try_into()
+   .map_err(|_|fault(BlockError::Io,completed))?;
+  device.write_sector(start+i as u64,sector).map_err(|e|fault(e,completed))?;
+  completed+=1;
+  if !media_snapshot_matches(device,capacity,Some(revision)){
+   return Err(fault(BlockError::Io,completed));
+  }
+ }
+ Ok(completed)
+}
 pub fn write_expected_media_snapshot_sectors<D:BlockDevice>(
-    device:&mut D,start:u64,expected_capacity:u64,expected_revision:u64,
-    data:&[u8]
+ device:&mut D,start:u64,capacity:u64,revision:u64,data:&[u8]
 )->Result<(),BlockError>{
-    if data.is_empty()||data.len()%SECTOR_BYTES!=0{
-        return Err(BlockError::OutOfRange);
-    }
-    check_range(expected_capacity,start,(data.len()/SECTOR_BYTES) as u64)?;
-    if !media_snapshot_matches(device,expected_capacity,Some(expected_revision)){
-        return Err(BlockError::Io);
-    }
-    for (i,chunk) in data.chunks_exact(SECTOR_BYTES).enumerate(){
-        if !media_snapshot_matches(device,expected_capacity,Some(expected_revision)){
-            return Err(BlockError::Io);
-        }
-        let sector:&[u8;SECTOR_BYTES]=chunk.try_into()
-            .map_err(|_|BlockError::Io)?;
-        device.write_sector(start+i as u64,sector)?;
-        if !media_snapshot_matches(device,expected_capacity,Some(expected_revision)){
-            return Err(BlockError::Io);
-        }
-    }
-    Ok(())
+ write_expected_media_snapshot_with_progress(device,start,capacity,revision,data)
+  .map(|_|()).map_err(|f|f.error)
 }
 pub fn write_sectors<D: BlockDevice>(
     device: &mut D, start: u64, data: &[u8],
@@ -3484,4 +3499,44 @@ mod kernel_p0_batch34_w4 {
             &mut d,1,5,10,&[0x20;SECTOR_BYTES*2]),Err(BlockError::Io));
         assert_eq!(d.writes,1);
     }
+}
+
+#[cfg(test)] mod kernel_p0_batch35_w4 {
+ use super::*;
+ struct Disk{capacity:u64,revision:u64,writes:usize,swap_after:usize}
+ impl BlockDevice for Disk{
+  fn sector_count(&self)->u64{self.capacity}
+  fn media_generation(&self)->Option<u64>{Some(self.revision)}
+  fn read_sector(&mut self,_:u64,_:&mut[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{Err(BlockError::ReadOnly)}
+  fn write_sector(&mut self,_:u64,_:&[u8;SECTOR_BYTES])
+   ->Result<(),BlockError>{
+   self.writes+=1;
+   if self.writes==self.swap_after{self.revision+=1;}
+   Ok(())
+  }
+ }
+ fn disk(n:usize)->Disk{Disk{capacity:5,revision:3,writes:0,swap_after:n}}
+ #[test] fn kernel_p0_batch35_w4_857_success_counts_all_writes(){
+  let mut d=disk(0);
+  assert_eq!(write_expected_media_snapshot_with_progress(
+   &mut d,1,5,3,&[0xaa;SECTOR_BYTES*2]),Ok(2));
+ }
+ #[test] fn kernel_p0_batch35_w4_858_stale_capacity_zero_writes(){
+  let mut d=disk(0);
+  assert_eq!(write_expected_media_snapshot_with_progress(
+   &mut d,1,4,3,&[0xaa;SECTOR_BYTES]),
+   Err(MediaWriteFailure{error:BlockError::Io,completed_sectors:0}));
+  assert_eq!(d.writes,0);
+ }
+ #[test] fn kernel_p0_batch35_w4_859_swap_reports_partial_completion(){
+  let mut d=disk(1);
+  assert_eq!(write_expected_media_snapshot_with_progress(
+   &mut d,1,5,3,&[0xaa;SECTOR_BYTES*2]),
+   Err(MediaWriteFailure{error:BlockError::Io,completed_sectors:1}));
+  assert_eq!(d.writes,1);
+  d=disk(1);
+  assert_eq!(write_expected_media_snapshot_sectors(
+   &mut d,1,5,3,&[0xaa;SECTOR_BYTES*2]),Err(BlockError::Io));
+ }
 }

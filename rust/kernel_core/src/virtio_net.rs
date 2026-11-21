@@ -365,13 +365,19 @@ fn ethernet_egress_valid(frame:&[u8],local_mac:[u8;6])->bool{
      // foreign unicast destinations; TX cannot require dst == local MAC.
      (dst[0]&1==0 && dst.iter().any(|&byte|byte!=0)))
 }
+fn rx_ipv4_arp_header_valid(frame:&[u8])->bool{
+ if frame.len()<42{return false;}
+ frame[14..16]==[0,1] && frame[16..18]==[0x08,0x00] &&
+ frame[18]==6 && frame[19]==4 &&
+ matches!(u16::from_be_bytes([frame[20],frame[21]]),1|2)
+}
 fn rx_l3_header_fits(frame:&[u8])->bool{
     if frame.len()<14{return false;}
     // IPv4 requires its fixed 20-byte header; Ethernet+ARP for IPv4
     // requires 28 protocol bytes before the network stack can inspect it.
     match u16::from_be_bytes([frame[12],frame[13]]){
         0x0800=>frame.len()>=34,
-        0x0806=>frame.len()>=42,
+        0x0806=>rx_ipv4_arp_header_valid(frame),
         _=>false,
     }
 }
@@ -1019,7 +1025,8 @@ mod kernel_p0_batch34_w5 {
         assert_eq!(rx_frame_authorized(70,60,&[0;10],&f,LOCAL),Ok(60));
     }
     #[test] fn kernel_p0_batch34_w5_841_arp_minimum_header_required(){
-        let f=ethernet(0x0806,60);
+        let mut f=ethernet(0x0806,60);
+        f[14..22].copy_from_slice(&[0,1,8,0,6,4,0,1]);
         assert!(!rx_l3_header_fits(&f[..41]));
         assert!(rx_l3_header_fits(&f[..42]));
         assert_eq!(rx_frame_authorized(70,60,&[0;10],&f,LOCAL),Ok(60));
@@ -1031,4 +1038,32 @@ mod kernel_p0_batch34_w5 {
         assert_eq!(rx_frame_authorized(70,60,&[0;10],&f,LOCAL),
             Err(Error::Invalid));
     }
+}
+
+#[cfg(test)] mod kernel_p0_batch35_w5 {
+ use super::*;
+ fn arp(op:u16)->[u8;60]{
+  let mut f=[0;60];f[..6].fill(0xff);
+  f[6..12].copy_from_slice(&[2,1,2,3,4,5]);
+  f[12..14].copy_from_slice(&0x0806u16.to_be_bytes());
+  f[14..22].copy_from_slice(&[0,1,8,0,6,4,(op>>8) as u8,op as u8]);f
+ }
+ const LOCAL:[u8;6]=[2,3,4,5,6,7];
+ #[test] fn kernel_p0_batch35_w5_860_request_reply_admitted(){
+  for op in [1,2]{
+   let f=arp(op);
+   assert!(rx_ipv4_arp_header_valid(&f));
+   assert_eq!(rx_frame_authorized(70,60,&[0;10],&f,LOCAL),Ok(60));
+  }
+ }
+ #[test] fn kernel_p0_batch35_w5_861_opcode_and_address_width_denied(){
+  let mut f=arp(3);assert!(!rx_ipv4_arp_header_valid(&f));
+  f=arp(1);f[18]=7;assert!(!rx_ipv4_arp_header_valid(&f));
+  f=arp(1);f[19]=16;assert!(!rx_ipv4_arp_header_valid(&f));
+ }
+ #[test] fn kernel_p0_batch35_w5_862_wrong_hardware_protocol_or_short_packet_denied(){
+  let mut f=arp(1);f[15]=2;assert!(!rx_ipv4_arp_header_valid(&f));
+  f=arp(1);f[17]=6;assert!(!rx_ipv4_arp_header_valid(&f));
+  f=arp(1);assert!(!rx_ipv4_arp_header_valid(&f[..41]));
+ }
 }

@@ -810,10 +810,20 @@ pub extern "C" fn x86_64_xapic_timer_preemption_count()->u64{
 pub const fn xapic_preemption_evidence(irq:u64,preemptions:u64)->bool{
     irq>0 && preemptions>0 && preemptions<=irq
 }
+fn apic_live_progress_valid(
+ irq:u64,captured:u64,running:bool,source:u8,epoch:u64,exhausted:bool
+)->bool {
+ apic_preemption_authorized(running,source,epoch,exhausted) &&
+ xapic_preemption_evidence(irq,captured)
+}
 pub fn xapic_preemption_progress()->bool{
-    xapic_preemption_evidence(
-        x86_64_xapic_timer_irq_count(),x86_64_xapic_timer_preemption_count()
-    )
+ apic_live_progress_valid(
+  x86_64_xapic_timer_irq_count(),x86_64_xapic_timer_preemption_count(),
+  XAPIC_TIMER_RUNNING.load(Ordering::Acquire),
+  MONOTONIC_SOURCE.load(Ordering::Acquire),
+  MONOTONIC_SESSION_EPOCH.load(Ordering::Acquire),
+  MONOTONIC_EXHAUSTED.load(Ordering::Acquire)
+ )
 }
 /// A running bit alone is insufficient after controller handover or session exhaustion.
 fn apic_preemption_ready(running:bool,source:u8,epoch:u64)->bool {
@@ -1593,4 +1603,22 @@ mod kernel_p0_batch34_w2 {
         assert!(!apic_preemption_receipt_authorized(
             9,9,5,6,2,false,2,2,false,false));
     }
+}
+
+#[cfg(test)] mod kernel_p0_batch35_w2 {
+ use super::*;
+ #[test] fn kernel_p0_batch35_w2_850_live_apic_progress_admitted(){
+  assert!(apic_live_progress_valid(9,3,true,2,8,false));
+ }
+ #[test] fn kernel_p0_batch35_w2_851_source_stop_and_exhaustion_revoked(){
+  assert!(!apic_live_progress_valid(9,3,true,1,8,false));
+  assert!(!apic_live_progress_valid(9,3,true,2,8,true));
+  assert!(!apic_live_progress_valid(9,3,false,2,8,false));
+ }
+ #[test] fn kernel_p0_batch35_w2_852_bad_epoch_or_irq_evidence_denied(){
+  assert!(!apic_live_progress_valid(9,3,true,2,0,false));
+  assert!(!apic_live_progress_valid(9,3,true,2,u64::MAX,false));
+  assert!(!apic_live_progress_valid(3,4,true,2,8,false));
+  assert!(!apic_live_progress_valid(9,0,true,2,8,false));
+ }
 }

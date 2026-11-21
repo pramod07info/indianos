@@ -127,6 +127,12 @@ pub(crate) fn user_range(plan: &ProgramPlan, address: u64, length: u64, write: b
             seg.page_begin%PAGE_BYTES==0 && seg.page_end%PAGE_BYTES==0 &&
             !(seg.page_begin<plan.stack_end && plan.stack_begin<seg.page_end) &&
             seg.page_end.checked_sub(address).is_some_and(|available| length <= available) &&
+            // ELF p_memsz bounds user copies; no page-tail slack disclosure.
+            // Legacy zero-sized staged numeric ABI plans remain supported.
+            (seg.memory_size==0 ||
+             seg.virtual_address.checked_add(seg.memory_size)
+               .is_some_and(|memory_end|
+                   address>=seg.virtual_address && end<=memory_end)) &&
             (!write || (seg.writable && !seg.executable)) {
             return true;
         }
@@ -1317,4 +1323,40 @@ mod kernel_p0_batch34_w3 {
         c=code();c.file_size=129;
         assert!(!strict_file_backed_instruction(&c,USER_MIN+128));
     }
+}
+
+#[cfg(test)] mod kernel_p0_batch35_w3 {
+ use super::*;
+ fn plan()->ProgramPlan{
+  let mut s=[ProgramSegment::empty();MAX_SEGMENTS];
+  s[0]=ProgramSegment{virtual_address:USER_MIN+32,file_offset:0,
+   file_size:16,memory_size:64,page_begin:USER_MIN,
+   page_end:USER_MIN+PAGE_BYTES,writable:true,executable:false};
+  ProgramPlan{entry:USER_MIN+32,stack_begin:USER_TOP-STACK_BYTES,
+   stack_end:USER_TOP,guard_begin:USER_TOP-STACK_BYTES-PAGE_BYTES,
+   segment_count:1,segments:s}
+ }
+ #[test] fn kernel_p0_batch35_w3_853_loaded_data_and_bss_admitted(){
+  let p=plan();
+  assert!(user_range(&p,USER_MIN+32,16,false));
+  assert!(user_range(&p,USER_MIN+64,32,true));
+ }
+ #[test] fn kernel_p0_batch35_w3_854_page_padding_outside_elf_denied(){
+  let p=plan();
+  assert!(!user_range(&p,USER_MIN,1,false));
+  assert!(!user_range(&p,USER_MIN+96,1,false));
+ }
+ #[test] fn kernel_p0_batch35_w3_855_cross_memory_end_denied(){
+  let p=plan();
+  assert!(user_range(&p,USER_MIN+88,8,true));
+  assert!(!user_range(&p,USER_MIN+88,9,true));
+  assert!(!user_range(&p,USER_MIN+32,u64::MAX,false));
+ }
+ #[test] fn kernel_p0_batch35_w3_856_legacy_empty_descriptor_compatible(){
+  let mut p=plan();
+  p.segments[0].memory_size=0;p.segments[0].file_size=0;
+  assert!(user_range(&p,USER_MIN,16,true));
+  p.segments[0].writable=false;
+  assert!(!user_range(&p,USER_MIN,16,true));
+ }
 }

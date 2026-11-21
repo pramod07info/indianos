@@ -264,6 +264,16 @@ fn buffer_span_ok(start:usize,length:u64,alignment:usize)->bool {
     let last_half=((end-1) as u64)>>47;
     (first_half==0 || first_half==0x1ffff) && first_half==last_half
 }
+fn limine_framebuffer_table_valid(resp:&Framebuffers)->bool{
+ if !limine_pointer_table_valid(resp.framebuffers,resp.count,4096){
+  return false;
+ }
+ for i in 0..resp.count as usize{
+  let entry=unsafe{ptr::read_volatile(resp.framebuffers.add(i))};
+  if !limine_pointer_aligned(entry){return false;}
+ }
+ true
+}
 fn framebuffer_ok(f:&Framebuffer)->bool {
     if f.width==0 || f.height==0 || f.model!=1 || f.bpp!=32 ||
        f.pitch%4!=0 || f.width>u64::MAX/4 || f.pitch<f.width*4 {
@@ -306,7 +316,7 @@ pub unsafe extern "C" fn boot_draw_status(){
     let Some(resp)=(unsafe {limine_response(boot_limine_framebuffers())}) else {
         log(b"IndianOS: framebuffer unavailable (serial mode)\n\0");return
     };
-    if !limine_pointer_table_valid(resp.framebuffers,resp.count,4096){
+    if !limine_framebuffer_table_valid(resp){
         log(b"IndianOS: framebuffer unavailable (serial mode)\n\0");return
     }
     let first=unsafe {ptr::read_volatile(resp.framebuffers)};
@@ -360,7 +370,7 @@ pub(crate) fn console_framebuffer()->Option<ConsoleFramebuffer>{
     let response=unsafe{boot_limine_framebuffers()};
     if !limine_pointer_aligned(response){return None;}
     let resp=unsafe{&*response};
-    if resp.count==0||!limine_pointer_aligned(resp.framebuffers){return None;}
+    if !limine_framebuffer_table_valid(resp){return None;}
     let first=unsafe{ptr::read_volatile(resp.framebuffers)};
     if !limine_pointer_aligned(first){return None;}
     let f=unsafe{&*first};
@@ -377,7 +387,7 @@ pub(crate) fn desktop_rgb(r:u8,g:u8,b:u8)->Option<u32>{
     let response=unsafe{boot_limine_framebuffers()};
     if !limine_pointer_aligned(response){return None;}
     let resp=unsafe{&*response};
-    if resp.count==0||!limine_pointer_aligned(resp.framebuffers){return None;}
+    if !limine_framebuffer_table_valid(resp){return None;}
     let first=unsafe{ptr::read_volatile(resp.framebuffers)};
     if !limine_pointer_aligned(first){return None;}
     let framebuffer=unsafe{&*first};
@@ -896,4 +906,35 @@ mod kernel_p0_batch34_w6 {
         f=fb();f.green_shift=16;
         assert!(!framebuffer_status_rect_valid(&f,0,0,1,1));
     }
+}
+
+#[cfg(test)] mod kernel_p0_batch35_w6 {
+ use super::*;
+ fn fb()->Framebuffer{
+  Framebuffer{address:0x1000 as *mut u8,width:80,height:30,
+   pitch:320,bpp:32,model:1,
+   red_size:8,red_shift:16,green_size:8,green_shift:8,
+   blue_size:8,blue_shift:0}
+ }
+ #[test] fn kernel_p0_batch35_w6_863_two_valid_limine_framebuffers(){
+  let a=fb();let b=fb();
+  let slots=[&a as *const Framebuffer,&b as *const Framebuffer];
+  let table=Framebuffers{revision:0,count:2,framebuffers:slots.as_ptr()};
+  assert!(limine_framebuffer_table_valid(&table));
+ }
+ #[test] fn kernel_p0_batch35_w6_864_late_misaligned_pointer_denied(){
+  let a=fb();
+  let slots=[&a as *const Framebuffer,0x1001usize as *const Framebuffer];
+  let table=Framebuffers{revision:0,count:2,framebuffers:slots.as_ptr()};
+  assert!(!limine_framebuffer_table_valid(&table));
+ }
+ #[test] fn kernel_p0_batch35_w6_865_empty_null_and_oversize_denied(){
+  let a=fb();let slots=[&a as *const Framebuffer];
+  let mut table=Framebuffers{revision:0,count:0,framebuffers:slots.as_ptr()};
+  assert!(!limine_framebuffer_table_valid(&table));
+  table.count=1;table.framebuffers=core::ptr::null();
+  assert!(!limine_framebuffer_table_valid(&table));
+  table.count=4097;table.framebuffers=slots.as_ptr();
+  assert!(!limine_framebuffer_table_valid(&table));
+ }
 }

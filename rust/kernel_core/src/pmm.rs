@@ -666,7 +666,7 @@ impl State{
     fn find_aligned_run(&self,count:u32,align_frames:u32)->Option<u64>{
         if count==0||count>16||align_frames==0||
           !align_frames.is_power_of_two()||align_frames>4096{return None;}
-        if !self.initialized{return None;}
+        if !self.verify_frame_accounting(){return None;}
         for s in &self.spans[..self.count]{
             if s.count<count as u64{continue;}
             for i in 0..=s.count-count as u64{
@@ -684,7 +684,7 @@ impl State{
     }
     /// 15. Find the highest physical free run without crossing spans.
     fn highest_available_run(&self,count:u32)->Option<u64>{
-        if count==0||count>16||!self.initialized{return None;}
+        if count==0||count>16||!self.verify_frame_accounting(){return None;}
         let mut best=None;
         for s in &self.spans[..self.count]{
             if s.count<count as u64{continue;}
@@ -2296,4 +2296,33 @@ mod kernel_p0_batch34_w1 {
         assert_eq!(s.snapshot_span_usage(&mut out),Some(2));
         assert_eq!(out[1].busy,0);assert_eq!(out[1].longest_free,3);
     }
+}
+
+#[cfg(test)] mod kernel_p0_batch35_w1 {
+ use super::*;
+ fn state()->State {
+  let mut s=State::empty();s.initialized=true;s.count=1;s.total=8;
+  s.spans[0]=Span{base:PAGE,count:8,bit_offset:0};s
+ }
+ #[test] fn kernel_p0_batch35_w1_846_corrupt_accounting_rejects_aligned_search(){
+  let mut s=state();s.used=1;
+  assert_eq!(s.find_aligned_run(2,2),None);assert_eq!(s.bitmap[0],0);
+ }
+ #[test] fn kernel_p0_batch35_w1_847_corrupt_bitmap_rejects_highest_search(){
+  let mut s=state();s.set_bit(0,true);
+  assert_eq!(s.highest_available_run(2),None);assert_eq!(s.used,0);
+ }
+ #[test] fn kernel_p0_batch35_w1_848_valid_aligned_and_highest_disjoint(){
+  let mut s=state();assert_eq!(s.find_aligned_run(2,2),Some(2*PAGE));
+  assert!(s.claim_run(2*PAGE,2));
+  assert_eq!(s.highest_available_run(2),Some(7*PAGE));
+  assert!(s.claim_run(7*PAGE,2));assert_eq!(s.used,4);
+ }
+ #[test] fn kernel_p0_batch35_w1_849_release_makes_highest_run_available_again(){
+  let mut s=state();assert!(s.claim_run(7*PAGE,2));
+  assert_eq!(s.highest_available_run(2),Some(5*PAGE));
+  assert!(s.release_run(7*PAGE,2));
+  assert_eq!(s.highest_available_run(2),Some(7*PAGE));
+  assert!(s.verify_frame_accounting());
+ }
 }
