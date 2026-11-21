@@ -70,11 +70,35 @@ fn user_stack_layout_valid(plan:&ProgramPlan)->bool{
        plan.guard_begin.checked_add(PAGE_BYTES)
           .is_some_and(|end|end<=plan.stack_begin)))
 }
+/// Refuse ambiguous ELF page ownership before any numeric user-copy or IRET.
+/// The installed PTE user/supervisor and NX flags still require live checks.
+fn user_segment_layout_valid(plan:&ProgramPlan)->bool {
+    let count=plan.segment_count as usize;
+    if count>MAX_SEGMENTS{return false;}
+    for (i,seg) in plan.segments[..count].iter().enumerate() {
+        if seg.page_begin<USER_MIN || seg.page_end>USER_TOP ||
+           seg.page_begin>=seg.page_end ||
+           seg.page_begin%PAGE_BYTES!=0 || seg.page_end%PAGE_BYTES!=0 ||
+           (seg.page_begin<plan.stack_end && plan.stack_begin<seg.page_end) {
+            return false;
+        }
+        if plan.guard_begin>=USER_MIN &&
+           plan.guard_begin.checked_add(PAGE_BYTES)
+              .is_some_and(|end|seg.page_begin<end && plan.guard_begin<seg.page_end) {
+            return false;
+        }
+        if plan.segments[..i].iter().any(|other|
+            seg.page_begin<other.page_end && other.page_begin<seg.page_end){
+            return false;
+        }
+    }
+    true
+}
 pub(crate) fn user_range(plan: &ProgramPlan, address: u64, length: u64, write: bool) -> bool {
     if length == 0 || address < USER_MIN || address >= USER_TOP ||
         length > USER_TOP - address ||
         plan.segment_count as usize > MAX_SEGMENTS ||
-        !user_stack_layout_valid(plan) {
+        !user_stack_layout_valid(plan) || !user_segment_layout_valid(plan) {
         return false;
     }
     // A malformed overlapping segment cannot reauthorize the protected
@@ -207,7 +231,7 @@ fn ring3_instruction_span_valid(plan:&ProgramPlan,rip:u64)->bool {
          .is_some_and(|end|(plan.guard_begin..end).contains(&rip)){
         return false;
     }
-    if plan.segment_count as usize>MAX_SEGMENTS{return false;}
+    if !user_segment_layout_valid(plan){return false;}
     // Staged ABI self-tests have no ELF segments. A loaded ELF cannot
     // restore RIP into a writable, unmapped or non-executable segment.
     if plan.segment_count!=0 {
@@ -971,5 +995,37 @@ mod kernel_p0_batch25_w3_tests {
     #[test]fn kernel_p0_batch25_w3_640_corrupt_segment_count_denied(){
         let mut p=plan();p.segment_count=MAX_SEGMENTS as u32+1;
         assert!(!ring3_instruction_span_valid(&p,USER_MIN));
+    }
+}
+
+// P0-663..665: user-space pages must have one unambiguous ELF owner.
+#[cfg(test)]
+mod kernel_p0_batch26_w3_tests {
+    use super::*;
+    fn plan()->ProgramPlan {
+        let mut p=ProgramPlan{entry:USER_MIN,stack_begin:USER_TOP-STACK_BYTES,
+            stack_end:USER_TOP,guard_begin:USER_TOP-STACK_BYTES-PAGE_BYTES,
+            segment_count:1,segments:[ProgramSegment::empty();MAX_SEGMENTS]};
+        p.segments[0].page_begin=USER_MIN;
+        p.segments[0].page_end=USER_MIN+PAGE_BYTES;
+        p.segments[0].executable=true;p
+    }
+    #[test]fn kernel_p0_batch26_w3_663_readonly_code_and_stack_survive(){
+        let p=plan();assert!(user_segment_layout_valid(&p));
+        assert!(ring3_instruction_span_valid(&p,USER_MIN+8));
+        assert!(user_range(&p,p.stack_begin,8,true));
+    }
+    #[test]fn kernel_p0_batch26_w3_664_overlapping_page_owners_denied(){
+        let mut p=plan();p.segment_count=2;p.segments[1].page_begin=USER_MIN;
+        p.segments[1].page_end=USER_MIN+PAGE_BYTES;p.segments[1].writable=true;
+        assert!(!user_segment_layout_valid(&p));
+        assert!(!user_range(&p,USER_MIN,8,false));
+        assert!(!ring3_instruction_span_valid(&p,USER_MIN));
+    }
+    #[test]fn kernel_p0_batch26_w3_665_guard_alias_denied(){
+        let mut p=plan();p.segments[0].page_begin=p.guard_begin;
+        p.segments[0].page_end=p.guard_begin+PAGE_BYTES;
+        assert!(!user_segment_layout_valid(&p));
+        assert!(!user_range(&p,p.stack_begin,8,true));
     }
 }

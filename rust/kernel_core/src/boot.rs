@@ -107,6 +107,9 @@ fn validated_map_count(map:&MemoryMap)->Option<u64>{
 }
 /// Every usable physical span must fit within the chosen direct-map
 /// high-half range. This is an arithmetic preflight, not proof of PTE mapping.
+fn usable_ram_page_aligned(region:&Region)->bool {
+    (region.base|region.length)&0xfff==0
+}
 fn hhdm_covers_usable_map(map:&MemoryMap,offset:u64)->bool{
     if !hhdm_offset_sane(offset) ||
         validated_map_count(map).is_none(){return false;}
@@ -115,6 +118,7 @@ fn hhdm_covers_usable_map(map:&MemoryMap,offset:u64)->bool{
         if !limine_pointer_aligned(region_pointer){return false;}
         let region=unsafe{&*region_pointer};
         if region.kind!=0{continue;}
+        if !usable_ram_page_aligned(region){return false;}
         // This four-level x86-64 boot path cannot address usable physical
         // memory beyond the architectural 52-bit MAXPHYADDR ceiling.
         const MAX_PHYSICAL_EXCLUSIVE:u64=1u64<<52;
@@ -652,5 +656,26 @@ mod kernel_p0_batch25_w6_tests {
     #[test]fn kernel_p0_batch25_w6_655_invalid_direct_map_offset_denied(){
         assert!(!check(Region{base:4096,length:4096,kind:0},0));
         assert!(!check(Region{base:4096,length:4096,kind:0},HHDM+1));
+    }
+}
+
+// P0-673..675: PMM sees only page-aligned usable RAM from Limine.
+#[cfg(test)]
+mod kernel_p0_batch26_w6_tests {
+    use super::*;
+    const HHDM:u64=0xffff_8000_0000_0000;
+    fn check(region:Region)->bool {
+        let entries=[&region as *const Region];
+        let map=MemoryMap{revision:0,count:1,entries:entries.as_ptr()};
+        hhdm_covers_usable_map(&map,HHDM)
+    }
+    #[test]fn kernel_p0_batch26_w6_673_aligned_usable_ram_accepted(){
+        assert!(check(Region{base:0x2000,length:0x3000,kind:0}));
+    }
+    #[test]fn kernel_p0_batch26_w6_674_unaligned_usable_base_denied(){
+        assert!(!check(Region{base:0x2001,length:0x3000,kind:0}));
+    }
+    #[test]fn kernel_p0_batch26_w6_675_partial_last_page_denied(){
+        assert!(!check(Region{base:0x2000,length:0x3001,kind:0}));
     }
 }

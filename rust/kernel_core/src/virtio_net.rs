@@ -313,16 +313,19 @@ fn rx_offload_header_valid(header:&[u8])->bool {
 }
 /// The R028 stack accepts untagged Ethernet-II ingress only. An invalid
 /// source address or 802.3 length field must not reach higher-level parsers.
+fn unsupported_vlan_tag(ethertype:u16)->bool {
+    matches!(ethertype,0x8100|0x88a8|0x9100)
+}
 fn ethernet_ingress_valid(frame:&[u8])->bool{
     if !(14..=1514).contains(&frame.len()){return false;}
     let source=&frame[6..12];
     if source[0]&1!=0 || source.iter().all(|&x|x==0){return false;}
     let ethertype=u16::from_be_bytes([frame[12],frame[13]]);
-    ethertype>=0x0600
+    ethertype>=0x0600 && !unsupported_vlan_tag(ethertype)
 }
 /// Filter foreign unicast before returning a frame to the guest stack.
 /// Broadcast and multicast remain eligible for ARP/DHCP discovery; the
-/// upper network stack still validates protocol, VLAN and destination IP.
+/// upper network stack still validates protocol and destination IP.
 fn ethernet_destination_allowed(frame:&[u8],local:[u8;6])->bool{
     if !(14..=1514).contains(&frame.len()) ||
        local[0]&1!=0 || local.iter().all(|&x|x==0){
@@ -342,7 +345,8 @@ fn ethernet_egress_valid(frame:&[u8],local_mac:[u8;6])->bool{
     let src=&frame[6..12];
     let dst=&frame[..6];
     let protocol=u16::from_be_bytes([frame[12],frame[13]]);
-    src==local_mac.as_slice() && !dst.iter().all(|&x|x==0) && protocol>=0x0600
+    src==local_mac.as_slice() && !dst.iter().all(|&x|x==0) &&
+    protocol>=0x0600 && !unsupported_vlan_tag(protocol)
 }
 fn tx_completion_length_valid(reported:usize,frame_length:usize)->bool {
     (14..=1514).contains(&frame_length) && reported<=frame_length+10
@@ -727,5 +731,34 @@ mod kernel_p0_batch25_w5_tests {
     #[test]fn kernel_p0_batch25_w5_650_tx_source_identity_enforced(){
         let mut f=frame();assert!(ethernet_egress_valid(&f,LOCAL));
         f[6]=0x54;assert!(!ethernet_egress_valid(&f,LOCAL));
+    }
+}
+
+// P0-670..672: no VLAN tag is admitted by the untagged-only R028 ABI.
+#[cfg(test)]
+mod kernel_p0_batch26_w5_tests {
+    use super::*;
+    const MAC:[u8;6]=[0x52,0x54,0,1,2,3];
+    fn frame(ethertype:u16)->[u8;60] {
+        let mut f=[0u8;60];f[..6].copy_from_slice(&MAC);
+        f[6..12].copy_from_slice(&MAC);
+        f[12..14].copy_from_slice(&ethertype.to_be_bytes());f
+    }
+    #[test]fn kernel_p0_batch26_w5_670_untagged_ipv4_arp_retained(){
+        for kind in [0x0800,0x0806] {
+            let f=frame(kind);
+            assert!(ethernet_ingress_valid(&f));
+            assert!(ethernet_egress_valid(&f,MAC));
+        }
+    }
+    #[test]fn kernel_p0_batch26_w5_671_vlan_encapsulation_denied_on_rx(){
+        for tag in [0x8100,0x88a8,0x9100] {
+            assert!(!ethernet_ingress_valid(&frame(tag)));
+        }
+    }
+    #[test]fn kernel_p0_batch26_w5_672_vlan_encapsulation_denied_on_tx(){
+        for tag in [0x8100,0x88a8,0x9100] {
+            assert!(!ethernet_egress_valid(&frame(tag),MAC));
+        }
     }
 }

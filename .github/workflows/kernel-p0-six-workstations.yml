@@ -584,3 +584,70 @@ jobs:
           clang -std=c11 -O2 -g -Wall -Wextra -Werror -I kernel/include \
             tests/test_pmm.c kernel/src/pmm.c -o /tmp/indianos-pmm-c-test
           /tmp/indianos-pmm-c-test
+
+  p0-batch26-implemented:
+    name: Batch26 implemented ${{ matrix.workstation }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - workstation: W1-PMM-contiguous-geometry
+            filter: kernel_p0_batch26_w1
+            expected: 4
+            features: normal-desktop
+          - workstation: W2-timer-final-controller
+            filter: kernel_p0_batch26_w2
+            expected: 3
+            features: normal-desktop
+          - workstation: W3-ELF-page-ownership
+            filter: kernel_p0_batch26_w3
+            expected: 3
+            features: normal-desktop
+          - workstation: W4-readonly-media-probe
+            filter: kernel_p0_batch26_w4
+            expected: 4
+            features: test-r031-vfs
+          - workstation: W5-untagged-ethernet
+            filter: kernel_p0_batch26_w5
+            expected: 3
+            features: test-r028-network
+          - workstation: W6-boot-usable-RAM-alignment
+            filter: kernel_p0_batch26_w6
+            expected: 3
+            features: normal-desktop
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify exact PR head
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: python3 tools/verify_ci_sha.py --expected "$EXPECTED_SHA" --observed "$(git rev-parse HEAD)"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
+      - name: Verify 20 Rust cases and freestanding kernel target
+        env:
+          FILTER: ${{ matrix.filter }}
+          FEATURES: ${{ matrix.features }}
+          EXPECTED_COUNT: ${{ matrix.expected }}
+        run: |
+          set -euo pipefail
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$FILTER" -- --list > /tmp/batch26-tests.txt
+          count=$(grep -c "$FILTER" /tmp/batch26-tests.txt || true)
+          echo "Found $count; expected $EXPECTED_COUNT"
+          test "$count" -eq "$EXPECTED_COUNT"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$FILTER"
+          cargo check --locked --offline --manifest-path rust/kernel_core/Cargo.toml --no-default-features --target x86_64-unknown-none --features "$FEATURES"
+      - name: Verify inherited PMM host ABI
+        if: matrix.workstation == 'W1-PMM-geometry-and-C-host'
+        run: |
+          set -euo pipefail
+          make test-rust-pmm-host
+          # Also test the C fallback allocator that broke the full boot job.
+          clang -std=c11 -O2 -g -Wall -Wextra -Werror -I kernel/include \
+            tests/test_pmm.c kernel/src/pmm.c -o /tmp/indianos-pmm-c-test
+          /tmp/indianos-pmm-c-test

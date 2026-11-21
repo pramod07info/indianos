@@ -35,7 +35,10 @@ impl<'a,D:BlockDevice> ReadOnlyDevice<'a,D>{
  pub fn new(device:&'a mut D)->Self{
   let parent_capacity=device.sector_count();
   let parent_generation=device.media_generation();
-  Self{device,parent_capacity,parent_generation,invalidated:false}
+  // An unstable first probe must not be reauthorized by a later
+  // coincidentally matching capacity or generation.
+  let invalidated=!media_snapshot_matches(device,parent_capacity,parent_generation);
+  Self{device,parent_capacity,parent_generation,invalidated}
  }
  fn check_capacity(&mut self)->Result<(),BlockError>{
   if self.invalidated{return Err(BlockError::Io);}
@@ -3065,5 +3068,63 @@ mod kernel_p0_batch25_w4_tests {
         assert_eq!(v.read_sector(0,&mut out),Err(BlockError::Io));
         assert_eq!(out,[0xcc;SECTOR_BYTES]);
         assert_eq!(v.media_generation(),None);
+    }
+}
+
+// P0-666..669: first read-only discovery session pins media geometry.
+#[cfg(test)]
+mod kernel_p0_batch26_w4_tests {
+    use super::*;
+    use core::cell::Cell;
+    struct Probe {
+        capacity_calls:Cell<u32>,generation_calls:Cell<u32>,
+        capacity_flap:bool,generation_flap:bool,reads:u32,
+    }
+    impl Probe {
+        fn new()->Self {Self{capacity_calls:Cell::new(0),
+            generation_calls:Cell::new(0),capacity_flap:false,
+            generation_flap:false,reads:0}}
+    }
+    impl BlockDevice for Probe {
+        fn sector_count(&self)->u64 {
+            let n=self.capacity_calls.get();self.capacity_calls.set(n+1);
+            if self.capacity_flap && n%2==1{9}else{8}
+        }
+        fn media_generation(&self)->Option<u64> {
+            let n=self.generation_calls.get();self.generation_calls.set(n+1);
+            Some(if self.generation_flap && n%2==1{8}else{7})
+        }
+        fn read_sector(&mut self,_:u64,out:&mut[u8;SECTOR_BYTES])
+            ->Result<(),BlockError>{
+            self.reads+=1;out.fill(0x5a);Ok(())
+        }
+        fn write_sector(&mut self,_:u64,_:&[u8;SECTOR_BYTES])
+            ->Result<(),BlockError>{Err(BlockError::ReadOnly)}
+    }
+    #[test]fn kernel_p0_batch26_w4_666_stable_probe_read_succeeds(){
+        let mut d=Probe::new();let mut v=ReadOnlyDevice::new(&mut d);
+        let mut buf=[0;SECTOR_BYTES];
+        assert_eq!(v.read_sector(0,&mut buf),Ok(()));
+        assert_eq!(buf,[0x5a;SECTOR_BYTES]);
+    }
+    #[test]fn kernel_p0_batch26_w4_667_capacity_flap_revokes_before_read(){
+        let mut d=Probe::new();d.capacity_flap=true;
+        let mut v=ReadOnlyDevice::new(&mut d);let mut buf=[0xcc;SECTOR_BYTES];
+        assert_eq!(v.read_sector(0,&mut buf),Err(BlockError::Io));
+        assert_eq!(buf,[0xcc;SECTOR_BYTES]);drop(v);assert_eq!(d.reads,0);
+    }
+    #[test]fn kernel_p0_batch26_w4_668_generation_flap_revokes_before_read(){
+        let mut d=Probe::new();d.generation_flap=true;
+        let v=ReadOnlyDevice::new(&mut d);assert_eq!(v.media_generation(),None);
+    }
+    #[test]fn kernel_p0_batch26_w4_669_revoked_probe_never_resurrects(){
+        let mut d=Probe::new();d.capacity_flap=true;
+        let mut v=ReadOnlyDevice::new(&mut d);
+        for _ in 0..2 {
+            let mut buf=[0xee;SECTOR_BYTES];
+            assert_eq!(v.read_sector(0,&mut buf),Err(BlockError::Io));
+            assert_eq!(buf,[0xee;SECTOR_BYTES]);
+        }
+        drop(v);assert_eq!(d.reads,0);
     }
 }

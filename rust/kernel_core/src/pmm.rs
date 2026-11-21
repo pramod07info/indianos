@@ -224,27 +224,35 @@ pub unsafe extern "C" fn pmm_allocate_frame(physical: *mut u64) -> bool {
 /// Required for legacy virtio vrings which do not support scattered ring pages.
 /// # Safety
 /// Single BSP with interrupts disabled; out is exclusive, aligned and writable.
+impl State {
+    /// Only a verified span table may authorize multi-frame DMA runs.
+    fn claim_contiguous_run(&mut self,count:u32)->Option<u64>{
+        if !(1..=16).contains(&count) || !self.single_frame_geometry_valid(){return None;}
+        let want=count as u64;
+        if want>self.total-self.used{return None;}
+        for span_index in 0..self.count {
+            let span=self.spans[span_index];
+            if span.count<want{continue;}
+            for offset in 0..=span.count-want {
+                let first_bit=span.bit_offset+offset;
+                if (0..want).any(|i|self.allocated(first_bit+i)){continue;}
+                let first=span.base.checked_add(offset.checked_mul(PAGE)?)?;
+                for i in 0..want{self.set_bit(first_bit+i,true);}
+                self.used+=want;
+                self.cursor=(first_bit+want)%self.total;
+                return Some(first);
+            }
+        }
+        None
+    }
+}
 #[no_mangle]
 pub unsafe extern "C" fn pmm_allocate_contiguous_frames(count:u32,out:*mut u64)->bool{
-    if out.is_null() || count==0 || count>16{return false;}
+    if out.is_null(){return false;}
     let s=unsafe{state()};
-    let want=count as u64;
-    if !s.initialized || s.used>s.total || want>s.total-s.used{return false;}
-    for span_index in 0..s.count{
-        let span=s.spans[span_index];
-        if span.count<want{continue;}
-        for offset in 0..=span.count-want{
-            let first_bit=span.bit_offset+offset;
-            if (0..want).any(|i|s.allocated(first_bit+i)){continue;}
-            let Some(first)=span.base.checked_add(offset*PAGE)else{continue;};
-            for i in 0..want{s.set_bit(first_bit+i,true);}
-            s.used+=want;
-            s.cursor=(first_bit+want)%s.total;
-            unsafe{ptr::write(out,first);}
-            return true;
-        }
-    }
-    false
+    let Some(first)=s.claim_contiguous_run(count)else{return false;};
+    unsafe{ptr::write(out,first);}
+    true
 }
 
 /// # Safety
@@ -253,7 +261,7 @@ pub unsafe extern "C" fn pmm_allocate_contiguous_frames(count:u32,out:*mut u64)-
 #[no_mangle]
 pub unsafe extern "C" fn pmm_release_frame(physical: u64) -> bool {
     let s = unsafe { state() };
-    if !s.initialized || s.used>s.total || physical & (PAGE - 1) != 0 { return false; }
+    if !s.single_frame_geometry_valid() || physical & (PAGE - 1) != 0 { return false; }
     for i in 0..s.count {
         let span = s.spans[i];
         if physical < span.base { continue; }
@@ -1941,5 +1949,40 @@ mod kernel_p0_batch25_w1_tests {
         assert_eq!(s.claim_single_frame(),None);
         s.spans[0].base=u64::MAX-PAGE+1;
         assert_eq!(s.claim_single_frame(),None);assert_eq!(s.used,0);
+    }
+}
+
+// P0-656..659: contiguous PMM shares the one-frame geometry/ownership gate.
+#[cfg(test)]
+mod kernel_p0_batch26_w1_tests {
+    use super::*;
+    unsafe extern "C" fn reader(i:u64,out:*mut Region,ctx:*mut c_void)->bool {
+        if i!=0||out.is_null()||ctx.is_null(){return false;}
+        unsafe{out.write(*(ctx.cast::<Region>()));}true
+    }
+    fn fresh()->State {
+        let mut s=State::empty();
+        let mut r=Region{base:PAGE,length:4*PAGE,kind:0};
+        assert!(unsafe{initialize_once(&mut s,1,Some(reader),(&mut r as *mut Region).cast())});
+        s
+    }
+    #[test]fn kernel_p0_batch26_w1_656_contiguous_allocates_exact_run(){
+        let mut s=fresh();assert_eq!(s.claim_contiguous_run(2),Some(PAGE));
+        assert_eq!(s.used,2);assert!(s.verify_frame_accounting());
+    }
+    #[test]fn kernel_p0_batch26_w1_657_corrupt_span_never_mutates_bitmap(){
+        let mut s=fresh();s.spans[0].bit_offset=1;
+        assert_eq!(s.claim_contiguous_run(2),None);
+        assert_eq!(s.used,0);assert_eq!(s.bitmap[0],0);
+    }
+    #[test]fn kernel_p0_batch26_w1_658_impossible_accounting_denies_run(){
+        let mut s=fresh();s.used=s.total+1;
+        assert_eq!(s.claim_contiguous_run(2),None);
+        assert_eq!(s.bitmap[0],0);
+    }
+    #[test]fn kernel_p0_batch26_w1_659_occupied_page_skips_to_free_run(){
+        let mut s=fresh();assert_eq!(s.claim_single_frame(),Some(PAGE));
+        assert_eq!(s.claim_contiguous_run(2),Some(PAGE*2));
+        assert_eq!(s.used,3);assert!(s.verify_frame_accounting());
     }
 }

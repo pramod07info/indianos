@@ -683,10 +683,12 @@ pub fn kernel_monotonic_100hz() -> Option<u64> {
     let end_epoch=MONOTONIC_SESSION_EPOCH.load(Ordering::Acquire);
     let end_source=MONOTONIC_SOURCE.load(Ordering::Acquire);
     let end_receipt=MONOTONIC_PROGRESS_EPOCH.load(Ordering::Acquire);
-    if !monotonic_snapshot_fenced(epoch,end_epoch,source,end_source,
+    if !monotonic_final_authorized(epoch,end_epoch,source,end_source,
         receipt,end_receipt,
         MONOTONIC_SESSION_PROGRESS.load(Ordering::Acquire),
-        MONOTONIC_EXHAUSTED.load(Ordering::Acquire)){return None;}
+        MONOTONIC_EXHAUSTED.load(Ordering::Acquire),
+        CONFIGURED.load(Ordering::Acquire),
+        XAPIC_TIMER_RUNNING.load(Ordering::Acquire)){return None;}
     sample
 }
 
@@ -696,6 +698,15 @@ fn monotonic_snapshot_fenced(start:u64,end:u64,source:u8,end_source:u8,
     !exhausted && progress && same_timer_session(start,end,source,end_source) &&
     irq_receipt_valid(start,receipt,progress) &&
     irq_receipt_valid(end,end_receipt,progress)
+}
+/// Recheck timer-controller ownership after the final IRQ receipt; stopping a
+/// PIC or promoting an APIC must not publish a stale PIC sample.
+fn monotonic_final_authorized(start:u64,end:u64,source:u8,end_source:u8,
+    receipt:u64,end_receipt:u64,progress:bool,exhausted:bool,
+    pic_armed:bool,apic_running:bool)->bool {
+    monotonic_snapshot_fenced(start,end,source,end_source,receipt,end_receipt,
+        progress,exhausted) &&
+    source_irq_ready(source,pic_armed,apic_running)
 }
 /// Pure publication guard: no new IRQ in the current session, a stopped
 /// source, conflicting APIC/PIC authority or numeric overflow deny time.
@@ -1359,5 +1370,21 @@ mod kernel_p0_batch25_w2_tests {
     #[test]fn kernel_p0_batch25_w2_635_stopped_and_exhausted_denied(){
         assert!(!monotonic_snapshot_fenced(8,8,2,2,8,8,false,false));
         assert!(!monotonic_snapshot_fenced(8,8,2,2,8,8,true,true));
+    }
+}
+
+// P0-660..662: timer shutdown/switchover cannot publish stale time.
+#[cfg(test)]
+mod kernel_p0_batch26_w2_tests {
+    use super::*;
+    #[test]fn kernel_p0_batch26_w2_660_live_pic_final_receipt(){
+        assert!(monotonic_final_authorized(7,7,1,1,7,7,true,false,true,false));
+    }
+    #[test]fn kernel_p0_batch26_w2_661_disarmed_pic_denies_publication(){
+        assert!(!monotonic_final_authorized(7,7,1,1,7,7,true,false,false,false));
+    }
+    #[test]fn kernel_p0_batch26_w2_662_apic_takeover_revokes_pic(){
+        assert!(!monotonic_final_authorized(7,7,1,1,7,7,true,false,true,true));
+        assert!(monotonic_final_authorized(8,8,2,2,8,8,true,false,false,true));
     }
 }
