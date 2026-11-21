@@ -681,3 +681,30 @@ mod kernel_p0_batch26_w6_tests {
         assert!(!check(Region{base:0x2000,length:0x3001,kind:0}));
     }
 }
+
+#[cfg(test)]
+mod kernel_p0_batch27_w6_tests {
+    use super::*;
+    const HHDM:u64=0xffff_8000_0000_0000;
+    fn two(a:Region,b:Region)->bool {
+        let pointers=[&a as *const Region,&b as *const Region];
+        let map=MemoryMap{revision:0,count:2,entries:pointers.as_ptr()};
+        hhdm_covers_usable_map(&map,HHDM)
+    }
+    #[test]fn kernel_p0_batch27_w6_697_two_disjoint_usable_spans(){
+        assert!(two(Region{base:0x1000,length:0x3000,kind:0},
+                    Region{base:0x9000,length:0x1000,kind:0}));
+    }
+    #[test]fn kernel_p0_batch27_w6_698_reserved_overlap_prevents_pmm_handoff(){
+        assert!(!two(Region{base:0x1000,length:0x3000,kind:0},
+                     Region{base:0x2000,length:0x1000,kind:1}));
+    }
+    #[test]fn kernel_p0_batch27_w6_699_malformed_reserved_tail_fails_closed(){
+        assert!(!two(Region{base:0x1000,length:0x1000,kind:0},
+                     Region{base:u64::MAX-1,length:0x1000,kind:1}));
+    }
+    #[test]fn kernel_p0_batch27_w6_700_unaddressable_high_ram_denied(){
+        assert!(!two(Region{base:0x1000,length:0x1000,kind:0},
+                     Region{base:(1u64<<52)-4096,length:4096,kind:0}));
+    }
+}

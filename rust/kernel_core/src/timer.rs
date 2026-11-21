@@ -752,10 +752,18 @@ mod r118_monotonic_hardware_tick_tests{
 
 /// Count successful ring-3 APIC preemptions independently of delivered IRQs.
 /// Called only after a validated user frame has been captured.
+fn preemption_capture_budget(delivered:u64,captured:u64,running:bool)->bool {
+    running && captured<delivered
+}
 pub fn xapic_record_preemption(){
-    // Ignore late captures after a timer has been stopped or masked.
-    if !XAPIC_TIMER_RUNNING.load(Ordering::Acquire){return;}
-    XAPIC_PREEMPTIONS.fetch_update(Ordering::Relaxed,Ordering::Relaxed,|v|v.checked_add(1)).ok();
+    // The APIC EOI is recorded before task capture. A software path may not
+    // mint more validated user preemptions than real delivered interrupts.
+    let delivered=XAPIC_IRQ_TICKS.load(Ordering::Acquire);
+    XAPIC_PREEMPTIONS.fetch_update(Ordering::AcqRel,Ordering::Acquire,|v|{
+        if preemption_capture_budget(
+            delivered,v,XAPIC_TIMER_RUNNING.load(Ordering::Acquire)
+        ){v.checked_add(1)}else{None}
+    }).ok();
 }
 #[no_mangle]
 pub extern "C" fn x86_64_xapic_timer_preemption_count()->u64{
@@ -1386,5 +1394,28 @@ mod kernel_p0_batch26_w2_tests {
     #[test]fn kernel_p0_batch26_w2_662_apic_takeover_revokes_pic(){
         assert!(!monotonic_final_authorized(7,7,1,1,7,7,true,false,true,true));
         assert!(monotonic_final_authorized(8,8,2,2,8,8,true,false,false,true));
+    }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch27_w2_tests {
+    use super::*;
+    #[test]fn kernel_p0_batch27_w2_680_first_delivered_irq_authorizes_capture(){
+        assert!(preemption_capture_budget(1,0,true));
+        assert!(preemption_capture_budget(20,19,true));
+    }
+    #[test]fn kernel_p0_batch27_w2_681_capture_cannot_exceed_irq_receipts(){
+        assert!(!preemption_capture_budget(1,1,true));
+        assert!(!preemption_capture_budget(1,2,true));
+    }
+    #[test]fn kernel_p0_batch27_w2_682_zero_delivery_never_mints_preemption(){
+        assert!(!preemption_capture_budget(0,0,true));
+        assert!(!xapic_preemption_evidence(0,0));
+    }
+    #[test]fn kernel_p0_batch27_w2_683_stopped_or_exhausted_cannot_mint(){
+        assert!(!preemption_capture_budget(3,0,false));
+        assert!(!preemption_capture_budget(u64::MAX,u64::MAX,true));
+        assert!(xapic_preemption_evidence(3,3));
+        assert!(!xapic_preemption_evidence(3,4));
     }
 }

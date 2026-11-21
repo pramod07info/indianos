@@ -243,6 +243,13 @@ fn ring3_instruction_span_valid(plan:&ProgramPlan,rip:u64)->bool {
     }
     true
 }
+/// CPU interrupts can supply the resume-flag bit in the stacked RFLAGS.
+/// It is not an authorization request from user mode. Clear only RF when
+/// saving a real timer-IRQ frame; raw syscall frames remain strictly checked.
+/// Do not clear TF, DF, AC, IOPL or any reserved bits.
+pub(crate) const fn canonical_hardware_irq_rflags(flags:u64)->u64{
+    flags & !(1u64<<16)
+}
 pub(crate) fn ring3_frame_valid(
     frame: &[u64; 20], plan: &ProgramPlan, irq_enabled: bool,
 ) -> bool {

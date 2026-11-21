@@ -509,10 +509,17 @@ fn capture(regs:*const u64,via_timer:bool)->bool{
 fn capture_frame(task:&mut Task,src:&[u64;WORDS],via_timer:bool)->bool{
  let Some(pcb)=(unsafe{task.pcb.as_ref()})else{return false};
  if pcb.state!=3{return false;}
+ // R024: a real hardware IRQ can stack RF=1 as a CPU resume hint.
+ // A raw user-supplied syscall/IRET frame cannot request RF. Normalize
+ // only the trusted CPU timer path and still reject every other unsafe flag.
+ let mut checked=*src;
+ if via_timer{
+  checked[17]=crate::syscall::canonical_hardware_irq_rflags(checked[17]);
+ }
  // User IF is a property of the runtime profile, including INT 0x80
  // continuations; it does not depend on whether this capture came from IRQ.
- if !ring3_frame_valid(src,&task.image.plan,USER_INTERRUPTS_ENABLED){return false;}
- task.frame.copy_from_slice(src);
+ if !ring3_frame_valid(&checked,&task.image.plan,USER_INTERRUPTS_ENABLED){return false;}
+ task.frame.copy_from_slice(&checked);
  if !via_timer{task.frame[14]=0;}
  task.saved=true;
  true
@@ -3569,5 +3576,61 @@ mod r118_batched_real_scheduler_teardown_tests{
         assert!(coordinator.live_sockets_consistent(&sockets));
         assert_eq!(coordinator.active_udp_ports(),2);
         assert_eq!(notices.len(),0);
+    }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch27_w3_tests {
+    use super::*;
+    fn task(p:&mut Process)->Task {
+        p.pid=1;p.state=3;
+        let mut t:Task=unsafe{core::mem::zeroed()};
+        t.pcb=p;
+        t.image.plan.stack_begin=USER_TOP-STACK_BYTES;
+        t.image.plan.stack_end=USER_TOP;
+        t
+    }
+    fn frame()->[u64;WORDS] {
+        let mut f=[0u64;WORDS];
+        f[14]=42;f[15]=crate::syscall::USER_MIN+5;f[16]=0x2b;
+        f[17]=2|if USER_INTERRUPTS_ENABLED{0x200}else{0};
+        f[18]=USER_TOP-16;f[19]=0x33;f
+    }
+    #[test]fn kernel_p0_batch27_w3_684_real_timer_rf_capture_admitted(){
+        let mut p=Process::empty();let mut t=task(&mut p);
+        let mut f=frame();f[17]|=1<<16;
+        assert!(capture_frame(&mut t,&f,true));
+        assert!(t.saved);
+    }
+    #[test]fn kernel_p0_batch27_w3_685_cpu_rf_cleared_but_interrupt_policy_preserved(){
+        let mut p=Process::empty();let mut t=task(&mut p);
+        let mut f=frame();f[17]|=1<<16;
+        assert!(capture_frame(&mut t,&f,true));
+        assert_eq!(t.frame[17],f[17]&!(1<<16));
+        assert_eq!(t.frame[14],42);
+        assert_eq!(t.frame[17]&0x200,f[17]&0x200);
+    }
+    #[test]fn kernel_p0_batch27_w3_686_syscall_rf_injection_still_denied(){
+        let mut p=Process::empty();let mut t=task(&mut p);
+        let mut f=frame();f[17]|=1<<16;
+        assert!(!capture_frame(&mut t,&f,false));
+        assert!(!t.saved);
+    }
+    #[test]fn kernel_p0_batch27_w3_687_other_unsafe_flags_still_denied(){
+        let mut p=Process::empty();let mut t=task(&mut p);
+        for mask in [1u64<<8,1u64<<10,1u64<<18,3u64<<12] {
+            let mut f=frame();f[17]|=(1<<16)|mask;
+            assert!(!capture_frame(&mut t,&f,true));
+        }
+        assert!(!t.saved);
+    }
+    #[test]fn kernel_p0_batch27_w3_688_rejected_timer_frame_cannot_mutate_context(){
+        let mut p=Process::empty();let mut t=task(&mut p);
+        let mut good=frame();good[17]|=1<<16;
+        assert!(capture_frame(&mut t,&good,true));
+        let saved=t.frame;
+        let mut bad=good;bad[16]=0x08;
+        assert!(!capture_frame(&mut t,&bad,true));
+        assert_eq!(t.frame,saved);assert!(t.saved);
     }
 }

@@ -766,3 +766,42 @@ mod kernel_p0_batch26_w5_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod kernel_p0_batch27_w5_tests {
+    use super::*;
+    const LOCAL:[u8;6]=[0x52,0x54,0,1,2,3];
+    const PEER:[u8;6]=[0x52,0x54,0,4,5,6];
+    fn frame(ethertype:u16)->[u8;60]{
+        let mut f=[0u8;60];f[..6].copy_from_slice(&LOCAL);
+        f[6..12].copy_from_slice(&PEER);
+        f[12..14].copy_from_slice(&ethertype.to_be_bytes());f
+    }
+    #[test]fn kernel_p0_batch27_w5_693_valid_ipv4_arp_still_ingress(){
+        for ethertype in [0x0800,0x0806] {
+            let f=frame(ethertype);
+            assert!(ethernet_ingress_valid(&f));
+            assert!(ethernet_destination_allowed(&f,LOCAL));
+        }
+    }
+    #[test]fn kernel_p0_batch27_w5_694_foreign_unicast_denied(){
+        let mut f=frame(0x0800);
+        f[..6].copy_from_slice(&PEER);
+        assert!(ethernet_ingress_valid(&f));
+        assert!(!ethernet_destination_allowed(&f,LOCAL));
+    }
+    #[test]fn kernel_p0_batch27_w5_695_multicast_and_zero_source_denied(){
+        let mut f=frame(0x0806);f[6]=1;
+        assert!(!ethernet_ingress_valid(&f));
+        f[6..12].fill(0);
+        assert!(!ethernet_ingress_valid(&f));
+    }
+    #[test]fn kernel_p0_batch27_w5_696_8023_and_vlan_bypass_denied(){
+        for proto in [0x0001,0x05ff,0x8100,0x88a8,0x9100] {
+            let mut f=frame(proto);
+            assert!(!ethernet_ingress_valid(&f));
+            f[6..12].copy_from_slice(&LOCAL);
+            assert!(!ethernet_egress_valid(&f,LOCAL));
+        }
+    }
+}

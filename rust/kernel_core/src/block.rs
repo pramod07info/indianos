@@ -3130,3 +3130,54 @@ mod kernel_p0_batch26_w4_tests {
         drop(v);assert_eq!(d.reads,0);
     }
 }
+
+#[cfg(test)]
+mod kernel_p0_batch27_w4_tests {
+    use super::*;
+    use core::cell::Cell;
+    struct Disk {
+        revision:Cell<u64>,reads:u32,writes:u32,
+        swap_first:bool,fail_second:bool,
+    }
+    impl Disk {
+        fn new()->Self{Self{revision:Cell::new(7),reads:0,writes:0,
+            swap_first:false,fail_second:false}}
+    }
+    impl BlockDevice for Disk {
+        fn sector_count(&self)->u64{2}
+        fn media_generation(&self)->Option<u64>{Some(self.revision.get())}
+        fn read_sector(&mut self,_:u64,out:&mut[u8;SECTOR_BYTES])
+            ->Result<(),BlockError>{
+            self.reads+=1;
+            out.fill(0x30+self.reads as u8);
+            if self.swap_first && self.reads==1 {self.revision.set(8);}
+            if self.fail_second && self.reads==2 {return Err(BlockError::Io);}
+            Ok(())
+        }
+        fn write_sector(&mut self,_:u64,_:&[u8;SECTOR_BYTES])
+            ->Result<(),BlockError>{self.writes+=1;Ok(())}
+    }
+    #[test]fn kernel_p0_batch27_w4_689_stable_two_sector_read(){
+        let mut d=Disk::new();let mut out=[0xcc;2*SECTOR_BYTES];
+        assert_eq!(read_sectors(&mut d,0,&mut out),Ok(()));
+        assert_eq!(&out[..SECTOR_BYTES],[0x31;SECTOR_BYTES].as_slice());
+        assert_eq!(&out[SECTOR_BYTES..],[0x32;SECTOR_BYTES].as_slice());
+    }
+    #[test]fn kernel_p0_batch27_w4_690_media_swap_does_not_publish_partial_bytes(){
+        let mut d=Disk::new();d.swap_first=true;
+        let mut out=[0xcc;2*SECTOR_BYTES];
+        assert_eq!(read_sectors(&mut d,0,&mut out),Err(BlockError::Io));
+        assert_eq!(out,[0;2*SECTOR_BYTES]);assert_eq!(d.reads,1);
+    }
+    #[test]fn kernel_p0_batch27_w4_691_second_read_failure_scrubs_first_sector(){
+        let mut d=Disk::new();d.fail_second=true;
+        let mut out=[0xcc;2*SECTOR_BYTES];
+        assert_eq!(read_sectors(&mut d,0,&mut out),Err(BlockError::Io));
+        assert_eq!(out,[0;2*SECTOR_BYTES]);assert_eq!(d.reads,2);
+    }
+    #[test]fn kernel_p0_batch27_w4_692_out_of_range_write_never_mutates_disk(){
+        let mut d=Disk::new();let data=[0xaa;2*SECTOR_BYTES];
+        assert_eq!(write_sectors(&mut d,1,&data),Err(BlockError::OutOfRange));
+        assert_eq!(d.writes,0);
+    }
+}

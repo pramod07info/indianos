@@ -60,9 +60,13 @@ impl State {
         self.total.checked_sub(self.used).unwrap_or(0)
     }
     fn physical_at(&self, bit: u64) -> Option<u64> {
-        for span in &self.spans[..self.count] {
-            if bit >= span.bit_offset && bit - span.bit_offset < span.count {
-                return Some(span.base + (bit - span.bit_offset) * PAGE);
+        // Corrupt span metadata must never panic or wrap a physical frame
+        // address into another owner's page, even in recovery paths.
+        for span in self.spans.get(..self.count)? {
+            let Some(index) = bit.checked_sub(span.bit_offset) else { continue; };
+            if index < span.count {
+                return index.checked_mul(PAGE)
+                    .and_then(|distance| span.base.checked_add(distance));
             }
         }
         None
@@ -1984,5 +1988,33 @@ mod kernel_p0_batch26_w1_tests {
         let mut s=fresh();assert_eq!(s.claim_single_frame(),Some(PAGE));
         assert_eq!(s.claim_contiguous_run(2),Some(PAGE*2));
         assert_eq!(s.used,3);assert!(s.verify_frame_accounting());
+    }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch27_w1_tests {
+    use super::*;
+    fn with_span()->State {
+        let mut state=State::empty();
+        state.count=1;
+        state.spans[0]=Span{base:PAGE,count:3,bit_offset:2};
+        state
+    }
+    #[test]fn kernel_p0_batch27_w1_676_valid_owned_first_frame(){
+        let s=with_span();assert_eq!(s.physical_at(2),Some(PAGE));
+    }
+    #[test]fn kernel_p0_batch27_w1_677_respects_span_end_and_offset(){
+        let s=with_span();assert_eq!(s.physical_at(4),Some(3*PAGE));
+        assert_eq!(s.physical_at(1),None);assert_eq!(s.physical_at(5),None);
+    }
+    #[test]fn kernel_p0_batch27_w1_678_rejects_physical_address_overflow(){
+        let mut s=with_span();s.spans[0].base=u64::MAX-PAGE+1;
+        assert_eq!(s.physical_at(3),None);
+    }
+    #[test]fn kernel_p0_batch27_w1_679_rejects_corrupt_metadata_without_panic(){
+        let mut s=with_span();s.count=MAX_SPANS+1;
+        assert_eq!(s.physical_at(2),None);
+        s.count=1;s.spans[0]=Span{base:PAGE,count:u64::MAX,bit_offset:0};
+        assert_eq!(s.physical_at(u64::MAX),None);
     }
 }
