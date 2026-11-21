@@ -768,16 +768,25 @@ fn preemption_delivery_receipt_valid(a:u64,b:u64,first:u64,last:u64,
     first!=u64::MAX && last!=u64::MAX && last>=first &&
     preemption_session_valid(a,b,first,captured,running)
 }
+// A PIC takeover or timer-source revocation cannot mint APIC preemption
+// evidence from stale but still-readable hardware IRQ counters.
+fn apic_preemption_receipt_valid(before:u64,after:u64,first:u64,last:u64,
+    captured:u64,running:bool,source_before:u8,source_after:u8)->bool {
+    source_before==2 && source_after==2 &&
+    preemption_delivery_receipt_valid(before,after,first,last,captured,running)
+}
 pub fn xapic_record_preemption(){
-    // APIC EOI is recorded before user frame capture; require both a live
-    // delivery budget and the same timer session at publication.
+    // APIC EOI is recorded before user frame capture; require live
+    // delivery budget AND the same authoritative APIC source at publication.
     let epoch=MONOTONIC_SESSION_EPOCH.load(Ordering::Acquire);
+    let source=MONOTONIC_SOURCE.load(Ordering::Acquire);
     let delivered=XAPIC_IRQ_TICKS.load(Ordering::Acquire);
     XAPIC_PREEMPTIONS.fetch_update(Ordering::AcqRel,Ordering::Acquire,|v|{
-        if preemption_delivery_receipt_valid(epoch,
+        if apic_preemption_receipt_valid(epoch,
             MONOTONIC_SESSION_EPOCH.load(Ordering::Acquire),delivered,
             XAPIC_IRQ_TICKS.load(Ordering::Acquire),v,
-            XAPIC_TIMER_RUNNING.load(Ordering::Acquire)
+            XAPIC_TIMER_RUNNING.load(Ordering::Acquire),
+            source,MONOTONIC_SOURCE.load(Ordering::Acquire)
         ){v.checked_add(1)}else{None}
     }).ok();
 }
@@ -1482,5 +1491,23 @@ mod kernel_p0_batch30_w2 {
         assert!(!preemption_delivery_receipt_valid(u64::MAX,u64::MAX,5,5,4,true));
         assert!(!preemption_delivery_receipt_valid(9,9,6,5,4,true));
         assert!(!preemption_delivery_receipt_valid(9,10,5,5,4,true));
+    }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch31_w2 {
+    use super::*;
+    #[test]fn kernel_p0_batch31_w2_770_live_apic_capture_preserves_irq_budget(){
+        assert!(apic_preemption_receipt_valid(4,4,5,6,4,true,2,2));
+    }
+    #[test]fn kernel_p0_batch31_w2_771_pic_or_ambiguous_source_denied(){
+        for (a,b) in [(0,2),(1,2),(2,1),(2,0),(1,1)]{
+            assert!(!apic_preemption_receipt_valid(4,4,5,6,4,true,a,b));
+        }
+    }
+    #[test]fn kernel_p0_batch31_w2_772_stopped_or_saturated_timer_denied(){
+        assert!(!apic_preemption_receipt_valid(4,5,5,6,4,true,2,2));
+        assert!(!apic_preemption_receipt_valid(4,4,5,6,4,false,2,2));
+        assert!(!apic_preemption_receipt_valid(4,4,u64::MAX,u64::MAX,0,true,2,2));
     }
 }

@@ -592,6 +592,7 @@ pub struct FrameSpanUsage{
 impl State{
     /// 1. Physical frame → owning usable firmware span.
     fn frame_span_index(&self,physical:u64)->Option<usize>{
+        if !self.single_frame_geometry_valid(){return None;}
         self.bit_for_physical(physical)?;
         self.spans[..self.count].iter().position(|s|
             physical>=s.base&&physical-s.base<s.count*PAGE)
@@ -742,7 +743,7 @@ impl State{
     }
     /// 20. Publish a complete per-span occupancy snapshot or nothing.
     fn snapshot_span_usage(&self,out:&mut[FrameSpanUsage])->Option<usize>{
-        if !self.single_frame_geometry_valid()||out.len()<self.count{return None;}
+        if !self.verify_frame_accounting()||out.len()<self.count{return None;}
         for (i,s) in self.spans[..self.count].iter().enumerate(){
             out[i]=FrameSpanUsage{
                 base:s.base,frames:s.count,
@@ -1370,7 +1371,8 @@ impl State {
     }
     /// Validate all exact owner allocations before releasing a batch.
     fn can_release_frames(&self,addresses:&[u64])->bool{
-        if !self.initialized||addresses.is_empty()||addresses.len()>16{return false;}
+        if !self.single_frame_geometry_valid()||
+           addresses.is_empty()||addresses.len()>16{return false;}
         for (i,&addr) in addresses.iter().enumerate(){
             if !self.is_busy_physical(addr)||addresses[..i].contains(&addr){return false;}
         }
@@ -1378,7 +1380,8 @@ impl State {
     }
     /// Validate the whole atomic claim set; never claim managed RAM holes.
     fn can_claim_frames(&self,addresses:&[u64])->bool{
-        if !self.initialized||addresses.is_empty()||addresses.len()>16{return false;}
+        if !self.single_frame_geometry_valid()||
+           addresses.is_empty()||addresses.len()>16{return false;}
         for (i,&addr) in addresses.iter().enumerate(){
             if !self.is_free_physical(addr)||addresses[..i].contains(&addr){return false;}
         }
@@ -1901,7 +1904,8 @@ mod kernel_p0_batch24_w1_tests{
     #[test]fn kernel_p0_batch24_w1_607_corrupt_cursor_refuses_allocation(){
         let mut s=fresh();s.cursor=s.total;
         assert_eq!(s.claim_single_frame(),None);
-        assert_eq!(s.used,0);assert!(s.verify_frame_accounting());
+        assert_eq!(s.used,0);assert!(!s.verify_frame_accounting());
+        s.cursor=0;assert!(s.verify_frame_accounting());
     }
     #[test]fn kernel_p0_batch24_w1_608_corrupt_count_refuses_allocation(){
         let mut s=fresh();s.used=s.total+1;
@@ -2103,5 +2107,42 @@ mod kernel_p0_batch30_w1 {
         assert!(!s.verify_frame_accounting());
         assert_eq!(s.snapshot_span_usage(&mut out),None);
         assert_eq!(out,[sentinel;2]);
+    }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch31_w1 {
+    use super::*;
+    fn fresh()->State {
+        let mut s=State::empty();s.initialized=true;s.count=2;s.total=4;
+        s.spans[0]=Span{base:PAGE,count:2,bit_offset:0};
+        s.spans[1]=Span{base:10*PAGE,count:2,bit_offset:2};s
+    }
+    #[test]fn kernel_p0_batch31_w1_766_corrupt_cursor_fails_closed_and_recovers(){
+        let mut s=fresh();s.cursor=s.total;
+        assert_eq!(s.claim_single_frame(),None);
+        assert!(!s.verify_frame_accounting());assert_eq!(s.bitmap[0],0);
+        s.cursor=0;assert!(s.verify_frame_accounting());
+    }
+    #[test]fn kernel_p0_batch31_w1_767_claim_candidates_reject_aliased_spans(){
+        let mut s=fresh();assert!(s.can_claim_frames(&[PAGE,10*PAGE]));
+        s.spans[1].base=2*PAGE;
+        assert!(!s.can_claim_frames(&[PAGE,2*PAGE]));
+        assert_eq!(s.frame_span_index(PAGE),None);assert_eq!(s.bitmap[0],0);
+    }
+    #[test]fn kernel_p0_batch31_w1_768_release_candidates_reject_corrupt_offsets(){
+        let mut s=fresh();assert!(s.claim_exact_frame_set(&[PAGE]));
+        assert!(s.can_release_frames(&[PAGE]));s.spans[1].bit_offset=1;
+        assert!(!s.can_release_frames(&[PAGE]));
+        assert!(!s.release_selected(&[PAGE]));assert!(s.allocated(0));assert_eq!(s.used,1);
+    }
+    #[test]fn kernel_p0_batch31_w1_769_snapshot_requires_exact_accounting(){
+        let mut s=fresh();assert!(s.claim_exact_frame_set(&[PAGE]));
+        let sentinel=FrameSpanUsage{base:77,frames:7,busy:7,longest_free:7};
+        let mut out=[sentinel;2];
+        assert_eq!(s.snapshot_span_usage(&mut out),Some(2));assert_eq!(out[0].busy,1);
+        s.used=0;let mut unchanged=[sentinel;2];
+        assert_eq!(s.snapshot_span_usage(&mut unchanged),None);
+        assert_eq!(unchanged,[sentinel;2]);
     }
 }

@@ -226,7 +226,8 @@ pub unsafe extern "C" fn boot_initramfs_file(
 /// mapped Limine module lifetime. Allows a zero-length file at archive end.
 fn borrowed_ramfile_span_ok(module:usize,size:usize,
     bytes:*const u8,length:usize)->bool {
-    if module==0 || size<16 || bytes.is_null(){return false;}
+    if module==0 || size<16 || bytes.is_null() ||
+       !buffer_span_ok(module,size as u64,1){return false;}
     let Some(limit)=module.checked_add(size)else{return false;};
     let start=bytes as usize;
     start>=module && start<=limit &&
@@ -761,5 +762,23 @@ mod kernel_p0_batch30_w6 {
         assert!(!limine_pointer_aligned(0xffff_ffff_ffff_fff8usize as *const Region));
         assert!(!limine_pointer_aligned(0x1001usize as *const Region));
         assert!(!limine_pointer_aligned(core::ptr::null::<Region>()));
+    }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch31_w6 {
+    use super::*;
+    #[test]fn kernel_p0_batch31_w6_783_canonical_module_subset_allowed(){
+        assert!(borrowed_ramfile_span_ok(0x1000,64,0x1010usize as *const u8,8));
+        assert!(borrowed_ramfile_span_ok(0x1000,64,0x1040usize as *const u8,0));
+    }
+    #[test]fn kernel_p0_batch31_w6_784_module_crossing_canonical_gap_denied(){
+        let base=0x0000_7fff_ffff_fff0usize;
+        assert!(!borrowed_ramfile_span_ok(base,64,(base+8) as *const u8,1));
+    }
+    #[test]fn kernel_p0_batch31_w6_785_module_wrap_and_outside_denied(){
+        assert!(!borrowed_ramfile_span_ok(usize::MAX-15,64,usize::MAX as *const u8,1));
+        assert!(!borrowed_ramfile_span_ok(0x1000,64,0x1040usize as *const u8,1));
+        assert!(!borrowed_ramfile_span_ok(0x1000,64,0x1008usize as *const u8,64));
     }
 }

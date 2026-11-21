@@ -242,18 +242,20 @@ fn ring3_instruction_span_valid(plan:&ProgramPlan,rip:u64)->bool {
     // Staged ABI self-tests have no ELF segments. A loaded ELF cannot
     // restore RIP into a writable, unmapped or non-executable segment.
     if plan.segment_count!=0 {
-        return plan.segments.iter().take(plan.segment_count as usize).any(|s|
+        let executable_at=|address:u64|plan.segments.iter().take(plan.segment_count as usize).any(|s|
             s.executable && !s.writable &&
             s.page_begin>=USER_MIN && s.page_end<=USER_TOP &&
             s.page_begin<s.page_end &&
             s.page_begin%PAGE_BYTES==0 && s.page_end%PAGE_BYTES==0 &&
-            (s.page_begin..s.page_end).contains(&rip) &&
-             // When ELF memory bounds are present, page padding is not code.
-             // Segment-less/zero-size staged numeric plans preserve their
-             // historical ABI until live PTE/NX validation is wired.
-             (s.memory_size==0 ||
-              s.virtual_address.checked_add(s.memory_size)
-                .is_some_and(|end|(s.virtual_address..end).contains(&rip))));
+            (s.page_begin..s.page_end).contains(&address) &&
+            // Zero-size staged plans retain numeric ABI compatibility;
+            // actual installed PTE/NX protection remains separately required.
+            (s.memory_size==0 ||
+             s.virtual_address.checked_add(s.memory_size)
+               .is_some_and(|end|(s.virtual_address..end).contains(&address))));
+        // Both the original ELF entry and saved RIP must have an unambiguous
+        // executable owner; an entry in padding cannot authorize IRET.
+        return executable_at(plan.entry) && executable_at(rip);
     }
     true
 }
@@ -1139,5 +1141,42 @@ mod kernel_p0_batch30_w3 {
         frame[18]=p.stack_end-8;frame[19]=0x33;
         assert!(ring3_frame_valid(&frame,&p,false));
         frame[15]=USER_MIN+96;assert!(!ring3_frame_valid(&frame,&p,false));
+    }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch31_w3 {
+    use super::*;
+    fn plan()->ProgramPlan{
+        let mut segments=[ProgramSegment::empty();MAX_SEGMENTS];
+        segments[0]=ProgramSegment{
+            virtual_address:USER_MIN+64,file_offset:0,file_size:32,memory_size:64,
+            page_begin:USER_MIN,page_end:USER_MIN+PAGE_BYTES,
+            writable:false,executable:true};
+        ProgramPlan{entry:USER_MIN+64,stack_begin:USER_TOP-STACK_BYTES,
+            stack_end:USER_TOP,guard_begin:USER_TOP-STACK_BYTES-PAGE_BYTES,
+            segment_count:1,segments}
+    }
+    #[test]fn kernel_p0_batch31_w3_773_valid_entry_and_resume_bytes(){
+        let p=plan();assert!(ring3_instruction_span_valid(&p,USER_MIN+80));
+    }
+    #[test]fn kernel_p0_batch31_w3_774_entry_in_page_padding_denied(){
+        let mut p=plan();p.entry=USER_MIN+128;
+        assert!(!ring3_instruction_span_valid(&p,USER_MIN+80));
+    }
+    #[test]fn kernel_p0_batch31_w3_775_entry_outside_all_segments_denied(){
+        let mut p=plan();p.entry=USER_MIN+2*PAGE_BYTES;
+        assert!(!ring3_instruction_span_valid(&p,USER_MIN+80));
+    }
+    #[test]fn kernel_p0_batch31_w3_776_disjoint_executable_sections_supported(){
+        let mut p=plan();p.segment_count=2;
+        p.segments[1]=ProgramSegment{
+            virtual_address:USER_MIN+PAGE_BYTES,file_offset:64,
+            file_size:8,memory_size:32,
+            page_begin:USER_MIN+PAGE_BYTES,page_end:USER_MIN+2*PAGE_BYTES,
+            executable:true,writable:false};
+        assert!(ring3_instruction_span_valid(&p,USER_MIN+PAGE_BYTES+8));
+        p.entry=USER_MIN+PAGE_BYTES+32;
+        assert!(!ring3_instruction_span_valid(&p,USER_MIN+80));
     }
 }

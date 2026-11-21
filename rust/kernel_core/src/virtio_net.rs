@@ -330,17 +330,22 @@ fn ethernet_ingress_valid(frame:&[u8])->bool{
 /// Filter foreign unicast before returning a frame to the guest stack.
 /// Broadcast and multicast remain eligible for ARP/DHCP discovery; the
 /// upper network stack still validates protocol and destination IP.
+// IPv4 multicast MAC destinations are specific to IPv4. ARP must use
+// local unicast or the all-ones Ethernet broadcast destination.
+fn r028_destination_for_protocol(dest:&[u8],local:[u8;6],proto:u16)->bool{
+    dest==local.as_slice() || dest==[0xff;6].as_slice() ||
+    (proto==0x0800 && dest[0]==0x01 && dest[1]==0x00 &&
+     dest[2]==0x5e && dest[3]&0x80==0)
+}
 fn ethernet_destination_allowed(frame:&[u8],local:[u8;6])->bool{
     if !(14..=1514).contains(&frame.len()) ||
        local[0]&1!=0 || local.iter().all(|&x|x==0){
         return false;
     }
     let dest=&frame[..6];
-    // R028 has IPv4/ARP only: arbitrary odd-first-byte destinations are not
-    // broadcast or an authorized IPv4 multicast group (01:00:5e:0xxxxxxx).
-    dest==local.as_slice() || dest==[0xff;6].as_slice() ||
-    (dest[0]==0x01 && dest[1]==0x00 && dest[2]==0x5e &&
-     dest[3]&0x80==0)
+    let protocol=u16::from_be_bytes([frame[12],frame[13]]);
+    supported_r028_ethertype(protocol) &&
+    r028_destination_for_protocol(dest,local,protocol)
 }
 /// The device owns the used-ring length. It cannot report bytes beyond
 /// the actual submitted header and Ethernet frame.
@@ -353,8 +358,12 @@ fn ethernet_egress_valid(frame:&[u8],local_mac:[u8;6])->bool{
     let src=&frame[6..12];
     let dst=&frame[..6];
     let protocol=u16::from_be_bytes([frame[12],frame[13]]);
-    src==local_mac.as_slice() && !dst.iter().all(|&x|x==0) &&
-    supported_r028_ethertype(protocol) && !unsupported_vlan_tag(protocol)
+    src==local_mac.as_slice() &&
+    supported_r028_ethertype(protocol) && !unsupported_vlan_tag(protocol) &&
+    (r028_destination_for_protocol(dst,local_mac,protocol) ||
+     // Outbound peer-directed unicast is valid. Only RX must reject
+     // foreign unicast destinations; TX cannot require dst == local MAC.
+     (dst[0]&1==0 && dst.iter().any(|&byte|byte!=0)))
 }
 fn tx_completion_length_valid(reported:usize,frame_length:usize)->bool {
     (14..=1514).contains(&frame_length) && reported<=frame_length+10
@@ -699,6 +708,9 @@ mod kernel_p0_batch24_w5_tests{
     #[test]fn kernel_p0_batch24_w5_622_discovery_broadcast_and_multicast_retained(){
         let mut f=frame();f[..6].fill(0xff);
         assert!(ethernet_destination_allowed(&f,LOCAL));
+        // IPv4 multicast is valid; ARP multicast is not. Update this
+        // inherited fixture to describe an actual IPv4 discovery packet.
+        f[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
         f[..6].copy_from_slice(&[0x01,0x00,0x5e,0,0,1]);
         assert!(ethernet_destination_allowed(&f,LOCAL));
         assert!(!ethernet_destination_allowed(&f[..13],LOCAL));
@@ -875,5 +887,41 @@ mod kernel_p0_batch30_w5 {
         for mac in [[1,0,0x5e,0x80,0,1],[2,9,9,9,9,9]]{
             let f=packet(mac);assert!(!ethernet_destination_allowed(&f,LOCAL));
         }
+    }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch31_w5 {
+    use super::*;
+    const LOCAL:[u8;6]=[2,1,2,3,4,5];
+    fn frame(proto:u16,dest:[u8;6])->[u8;60]{
+        let mut f=[0u8;60];f[..6].copy_from_slice(&dest);
+        f[6..12].copy_from_slice(&LOCAL);
+        f[12..14].copy_from_slice(&proto.to_be_bytes());f
+    }
+    #[test]fn kernel_p0_batch31_w5_780_ipv4_multicast_ingress_and_egress(){
+        let f=frame(0x0800,[1,0,0x5e,0,0,1]);
+        assert!(ethernet_ingress_valid(&f));
+        assert!(ethernet_destination_allowed(&f,LOCAL));
+        assert!(ethernet_egress_valid(&f,LOCAL));
+    }
+    #[test]fn kernel_p0_batch31_w5_781_arp_multicast_denied_broadcast_allowed(){
+        let multicast=frame(0x0806,[1,0,0x5e,0,0,1]);
+        assert!(!ethernet_destination_allowed(&multicast,LOCAL));
+        assert!(!ethernet_egress_valid(&multicast,LOCAL));
+        let broadcast=frame(0x0806,[0xff;6]);
+        assert!(ethernet_destination_allowed(&broadcast,LOCAL));
+        assert!(ethernet_egress_valid(&broadcast,LOCAL));
+    }
+    #[test]fn kernel_p0_batch31_w5_782_multicast_denied_but_peer_unicast_tx_valid(){
+        for dest in [[0x33,0x33,0,0,0,1],[1,0,0x5e,0x80,0,1]] {
+            let f=frame(0x0800,dest);
+            assert!(!ethernet_destination_allowed(&f,LOCAL));
+            assert!(!ethernet_egress_valid(&f,LOCAL));
+        }
+        let peer=frame(0x0800,[2,9,8,7,6,5]);
+        assert!(!ethernet_destination_allowed(&peer,LOCAL));
+        assert!(ethernet_egress_valid(&peer,LOCAL));
+        assert!(ethernet_destination_allowed(&frame(0x0800,LOCAL),LOCAL));
     }
 }

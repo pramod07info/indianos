@@ -247,11 +247,10 @@ pub fn read_generation_pinned_sectors<D:BlockDevice>(
     if !media_snapshot_matches(device,capacity,Some(generation)){
         return Err(BlockError::Io);
     }
-    read_stable_sectors(device,start,out)?;
-    // A swap after the second observation must not publish stale bytes.
-    if !media_snapshot_matches(device,capacity,Some(generation)){
-        out.fill(0);return Err(BlockError::Io);
-    }
+    // The selected revision must remain valid THROUGH the final publication
+    // check; rejecting only after an ordinary read copies output can expose
+    // stale media bytes to the caller.
+    read_stable_sectors_verified(device,start,out,Some((capacity,generation)))?;
     Ok(generation)
 }
 
@@ -1413,6 +1412,10 @@ mod m1_batch04_w2_block_tests{
 /// authentication or a substitute for a COW journal and durable flush.
 pub fn read_stable_sectors<D:BlockDevice>(device:&mut D,start:u64,
  out:&mut[u8])->Result<(),BlockError>{
+ read_stable_sectors_verified(device,start,out,None)
+}
+fn read_stable_sectors_verified<D:BlockDevice>(device:&mut D,start:u64,
+ out:&mut[u8],pinned:Option<(u64,u64)>)->Result<(),BlockError>{
  if out.is_empty()||out.len()%SECTOR_BYTES!=0||
     out.len()>MAX_STAGED_READ_SECTORS*SECTOR_BYTES{
   return Err(BlockError::OutOfRange);
@@ -1420,6 +1423,12 @@ pub fn read_stable_sectors<D:BlockDevice>(device:&mut D,start:u64,
  let capacity=device.sector_count();
  let generation=device.media_generation();
  check_range(capacity,start,(out.len()/SECTOR_BYTES) as u64)?;
+ if let Some((selected_capacity,selected_revision))=pinned{
+    if selected_capacity!=capacity || generation!=Some(selected_revision) ||
+       !media_snapshot_matches(device,capacity,generation){
+        return Err(BlockError::Io);
+    }
+ }
  let mut first=[0u8;MAX_STAGED_READ_SECTORS*SECTOR_BYTES];
  let mut second=[0u8;MAX_STAGED_READ_SECTORS*SECTOR_BYTES];
  let n=out.len();
@@ -1427,9 +1436,13 @@ pub fn read_stable_sectors<D:BlockDevice>(device:&mut D,start:u64,
  // Both observations must come from one selected device geometry.
  if !media_snapshot_matches(device,capacity,generation){return Err(BlockError::Io);}
  read_sectors_atomic(device,start,&mut second[..n])?;
- if !media_snapshot_matches(device,capacity,generation) || first[..n]!=second[..n]{
+ if !media_snapshot_matches(device,capacity,generation) || first[..n]!=second[..n] ||
+    pinned.is_some_and(|(selected_capacity,selected_revision)|
+        capacity!=selected_capacity || generation!=Some(selected_revision)){
     return Err(BlockError::Io);
  }
+ // Both physical observations and the selected token are authenticated
+ // before ANY caller byte is published.
  out.copy_from_slice(&first[..n]);Ok(())
 }
 #[cfg(test)]
@@ -3287,5 +3300,39 @@ mod kernel_p0_batch30_w4 {
         let mut d=disk(Some(7),2);let mut out=[0xcc;SECTOR_BYTES];
         assert_eq!(read_generation_pinned_sectors(&mut d,0,&mut out),Err(BlockError::Io));
         assert_eq!(d.reads,2);assert_eq!(out,[0xcc;SECTOR_BYTES]);
+    }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch31_w4 {
+    use super::*;
+    struct Disk{generation:Option<u64>,reads:u32,swap_at:u32}
+    impl BlockDevice for Disk{
+        fn sector_count(&self)->u64{3}
+        fn media_generation(&self)->Option<u64>{self.generation}
+        fn read_sector(&mut self,_:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+            self.reads+=1;out.fill(0x77);
+            if self.reads==self.swap_at{self.generation=Some(20);}
+            Ok(())
+        }
+        fn write_sector(&mut self,_:u64,_:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+            Err(BlockError::ReadOnly)
+        }
+    }
+    fn disk(swap_at:u32)->Disk{Disk{generation:Some(19),reads:0,swap_at}}
+    #[test]fn kernel_p0_batch31_w4_777_stable_pinned_read_publishes_receipt(){
+        let mut d=disk(0);let mut out=[0x31;SECTOR_BYTES];
+        assert_eq!(read_generation_pinned_sectors(&mut d,1,&mut out),Ok(19));
+        assert_eq!(out,[0x77;SECTOR_BYTES]);assert_eq!(d.reads,2);
+    }
+    #[test]fn kernel_p0_batch31_w4_778_second_read_media_swap_preserves_caller(){
+        let mut d=disk(2);let mut out=[0x31;SECTOR_BYTES];
+        assert_eq!(read_generation_pinned_sectors(&mut d,1,&mut out),Err(BlockError::Io));
+        assert_eq!(out,[0x31;SECTOR_BYTES]);assert_eq!(d.reads,2);
+    }
+    #[test]fn kernel_p0_batch31_w4_779_out_of_range_read_never_touches_disk(){
+        let mut d=disk(0);let mut out=[0x31;SECTOR_BYTES];
+        assert_eq!(read_generation_pinned_sectors(&mut d,3,&mut out),Err(BlockError::OutOfRange));
+        assert_eq!(d.reads,0);assert_eq!(out,[0x31;SECTOR_BYTES]);
     }
 }

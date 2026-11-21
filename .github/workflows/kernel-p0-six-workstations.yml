@@ -847,3 +847,43 @@ jobs:
           test "$count" -eq "$EXPECTED_COUNT"
           cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$FILTER"
           cargo check --locked --offline --manifest-path rust/kernel_core/Cargo.toml --no-default-features --target x86_64-unknown-none --features "$FEATURES"
+
+  p0-batch31-implemented:
+    name: Batch31 P0-766..785 ${{ matrix.workstation }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { workstation: W1-PMM-accounting-ownership, filter: kernel_p0_batch31_w1, expected: 4, features: 'normal-desktop' }
+          - { workstation: W2-APIC-authority, filter: kernel_p0_batch31_w2, expected: 3, features: 'normal-desktop,preempt' }
+          - { workstation: W3-ELF-entry-resume, filter: kernel_p0_batch31_w3, expected: 4, features: 'normal-desktop,preempt' }
+          - { workstation: W4-media-atomic-read, filter: kernel_p0_batch31_w4, expected: 3, features: 'test-r031-vfs' }
+          - { workstation: W5-R028-protocol-MAC, filter: kernel_p0_batch31_w5, expected: 3, features: 'test-r028-network' }
+          - { workstation: W6-boot-module-span, filter: kernel_p0_batch31_w6, expected: 3, features: 'normal-desktop' }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify exact PR SHA
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: python3 tools/verify_ci_sha.py --expected "$EXPECTED_SHA" --observed "$(git rev-parse HEAD)"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
+      - name: Verify 20 Rust cases and freestanding build
+        env:
+          FILTER: ${{ matrix.filter }}
+          FEATURES: ${{ matrix.features }}
+          EXPECTED_COUNT: ${{ matrix.expected }}
+        run: |
+          set -euo pipefail
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$FILTER" -- --list > /tmp/batch31-tests.txt
+          count=$(grep -c "$FILTER" /tmp/batch31-tests.txt || true)
+          echo "Found $count; expected $EXPECTED_COUNT"
+          test "$count" -eq "$EXPECTED_COUNT"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$FILTER"
+          cargo check --locked --offline --manifest-path rust/kernel_core/Cargo.toml --no-default-features --target x86_64-unknown-none --features "$FEATURES"

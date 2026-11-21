@@ -3270,6 +3270,9 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
   };
   task.image.plan.stack_begin=USER_TOP-STACK_BYTES;task.image.plan.stack_end=USER_TOP;
   task.image.plan.segment_count=1;
+  // A loaded executable has a real entry, unlike a zeroed staging task.
+  // The stricter IRET validator must check entry AND saved RIP ownership.
+  task.image.plan.entry=0x400000;
   task.image.plan.segments[0].virtual_address=0x400000;
   task.image.plan.segments[0].memory_size=PAGE;
   task.image.plan.segments[0].page_begin=0x400000;
