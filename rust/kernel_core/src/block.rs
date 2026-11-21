@@ -39,8 +39,7 @@ impl<'a,D:BlockDevice> ReadOnlyDevice<'a,D>{
  }
  fn check_capacity(&mut self)->Result<(),BlockError>{
   if self.invalidated{return Err(BlockError::Io);}
-  if self.device.sector_count()!=self.parent_capacity ||
-     self.device.media_generation()!=self.parent_generation{
+  if !media_snapshot_matches(self.device,self.parent_capacity,self.parent_generation){
    self.invalidated=true;
    return Err(BlockError::Io);
   }
@@ -99,8 +98,7 @@ impl<'a, D: BlockDevice> BlockWindow<'a, D> {
 
     fn check_parent_capacity(&mut self) -> Result<(), BlockError> {
         if self.invalidated { return Err(BlockError::Io); }
-        if self.device.sector_count() != self.parent_capacity ||
-           self.device.media_generation()!=self.parent_generation {
+        if !media_snapshot_matches(self.device,self.parent_capacity,self.parent_generation) {
             self.invalidated = true;
             return Err(BlockError::Io);
         }
@@ -191,7 +189,14 @@ pub fn check_range(capacity: u64, start: u64, count: u64) -> Result<(), BlockErr
 /// through a complete transfer; unchanged sector count alone is insufficient.
 fn media_snapshot_matches<D:BlockDevice>(device:&D,
     capacity:u64,generation:Option<u64>)->bool{
-    device.sector_count()==capacity && device.media_generation()==generation
+    // Double-observe to reject a provider whose geometry or generation
+    // changes while its identity is being validated.
+    let first_capacity=device.sector_count();
+    let first_generation=device.media_generation();
+    let second_capacity=device.sector_count();
+    let second_generation=device.media_generation();
+    first_capacity==capacity && first_generation==generation &&
+    second_capacity==capacity && second_generation==generation
 }
 pub fn read_sectors<D: BlockDevice>(
     device: &mut D, start: u64, out: &mut [u8],
@@ -3002,5 +3007,63 @@ mod kernel_p0_batch24_w4_tests{
         assert_eq!(view.read_sector(0,&mut out),Ok(()));
         assert_eq!(view.media_generation(),Some(9));
         assert_eq!(out,[0x51;SECTOR_BYTES]);
+    }
+}
+
+// P0-641..645: production block views double-check media identity.
+#[cfg(test)]
+mod kernel_p0_batch25_w4_tests {
+    use super::*;
+    use core::cell::Cell;
+    struct Disk {
+        cap_calls:Cell<u32>, gen_calls:Cell<u32>,
+        flap_capacity:bool,flap_generation:bool,swap_on_read:bool,
+        revision:Cell<u64>,
+    }
+    impl Disk {
+        fn new()->Self{Self{cap_calls:Cell::new(0),gen_calls:Cell::new(0),
+            flap_capacity:false,flap_generation:false,swap_on_read:false,
+            revision:Cell::new(7)}}
+    }
+    impl BlockDevice for Disk {
+        fn sector_count(&self)->u64{
+            let n=self.cap_calls.get();self.cap_calls.set(n+1);
+            if self.flap_capacity && n%2==1{9}else{8}
+        }
+        fn media_generation(&self)->Option<u64>{
+            let n=self.gen_calls.get();self.gen_calls.set(n+1);
+            if self.flap_generation && n%2==1{Some(8)}else{Some(self.revision.get())}
+        }
+        fn read_sector(&mut self,_:u64,out:&mut[u8;SECTOR_BYTES])
+            ->Result<(),BlockError>{
+            out.fill(0x5a);
+            if self.swap_on_read{self.revision.set(8);}
+            Ok(())
+        }
+        fn write_sector(&mut self,_:u64,_:&[u8;SECTOR_BYTES])
+            ->Result<(),BlockError>{Ok(())}
+    }
+    #[test]fn kernel_p0_batch25_w4_641_stable_identity_accepted(){
+        let d=Disk::new();assert!(media_snapshot_matches(&d,8,Some(7)));
+    }
+    #[test]fn kernel_p0_batch25_w4_642_capacity_flap_denied(){
+        let mut d=Disk::new();d.flap_capacity=true;
+        assert!(!media_snapshot_matches(&d,8,Some(7)));
+    }
+    #[test]fn kernel_p0_batch25_w4_643_generation_flap_denied(){
+        let mut d=Disk::new();d.flap_generation=true;
+        assert!(!media_snapshot_matches(&d,8,Some(7)));
+    }
+    #[test]fn kernel_p0_batch25_w4_644_window_rejects_unstable_geometry(){
+        let mut d=Disk::new();d.flap_capacity=true;
+        assert!(matches!(BlockWindow::new(&mut d,1,2),Err(BlockError::Io)));
+    }
+    #[test]fn kernel_p0_batch25_w4_645_readonly_swap_retains_caller_bytes(){
+        let mut d=Disk::new();d.swap_on_read=true;
+        let mut v=ReadOnlyDevice::new(&mut d);
+        let mut out=[0xcc;SECTOR_BYTES];
+        assert_eq!(v.read_sector(0,&mut out),Err(BlockError::Io));
+        assert_eq!(out,[0xcc;SECTOR_BYTES]);
+        assert_eq!(v.media_generation(),None);
     }
 }

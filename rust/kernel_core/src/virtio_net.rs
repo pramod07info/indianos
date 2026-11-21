@@ -309,12 +309,12 @@ fn receive_payload_len(used_len:usize,capacity:usize)->Result<usize,Error>{
 /// Without negotiated checksum/GSO features a legacy device must not
 /// inject offload metadata that would bypass the kernel's checksum checks.
 fn rx_offload_header_valid(header:&[u8])->bool {
-    header.len()>=10 && header[..10].iter().all(|&byte|byte==0)
+    header.len()==10 && header.iter().all(|&byte|byte==0)
 }
 /// The R028 stack accepts untagged Ethernet-II ingress only. An invalid
 /// source address or 802.3 length field must not reach higher-level parsers.
 fn ethernet_ingress_valid(frame:&[u8])->bool{
-    if frame.len()<14{return false;}
+    if !(14..=1514).contains(&frame.len()){return false;}
     let source=&frame[6..12];
     if source[0]&1!=0 || source.iter().all(|&x|x==0){return false;}
     let ethertype=u16::from_be_bytes([frame[12],frame[13]]);
@@ -324,7 +324,8 @@ fn ethernet_ingress_valid(frame:&[u8])->bool{
 /// Broadcast and multicast remain eligible for ARP/DHCP discovery; the
 /// upper network stack still validates protocol, VLAN and destination IP.
 fn ethernet_destination_allowed(frame:&[u8],local:[u8;6])->bool{
-    if frame.len()<14 || local[0]&1!=0 || local.iter().all(|&x|x==0){
+    if !(14..=1514).contains(&frame.len()) ||
+       local[0]&1!=0 || local.iter().all(|&x|x==0){
         return false;
     }
     let dest=&frame[..6];
@@ -689,5 +690,42 @@ mod kernel_p0_batch24_w5_tests{
         f[..6].copy_from_slice(&[0x01,0x00,0x5e,0,0,1]);
         assert!(ethernet_destination_allowed(&f,LOCAL));
         assert!(!ethernet_destination_allowed(&f[..13],LOCAL));
+    }
+}
+
+// P0-646..650: bounded raw virtio input before guest-visible buffers.
+#[cfg(test)]
+mod kernel_p0_batch25_w5_tests {
+    use super::*;
+    const LOCAL:[u8;6]=[0x52,0x54,0,1,2,3];
+    fn frame()->[u8;60]{
+        let mut f=[0u8;60];
+        f[..6].copy_from_slice(&LOCAL);
+        f[6..12].copy_from_slice(&[0x52,0x54,0,4,5,6]);
+        f[12..14].copy_from_slice(&[8,6]);f
+    }
+    #[test]fn kernel_p0_batch25_w5_646_exact_virtio_header(){
+        assert!(rx_offload_header_valid(&[0;10]));
+        assert!(!rx_offload_header_valid(&[0;11]));
+        assert!(!rx_offload_header_valid(&[0;9]));
+    }
+    #[test]fn kernel_p0_batch25_w5_647_oversized_frame_denied(){
+        let mut packet=[0u8;1515];packet[..14].copy_from_slice(&frame()[..14]);
+        assert!(!ethernet_ingress_valid(&packet));
+        assert!(!ethernet_destination_allowed(&packet,LOCAL));
+    }
+    #[test]fn kernel_p0_batch25_w5_648_minimum_ethernet_frame(){
+        let sample=frame();
+        let short=&sample[..14];
+        assert!(ethernet_ingress_valid(short));
+        assert!(ethernet_destination_allowed(short,LOCAL));
+    }
+    #[test]fn kernel_p0_batch25_w5_649_multicast_source_denied(){
+        let mut f=frame();f[6]=0x01;
+        assert!(!ethernet_ingress_valid(&f));
+    }
+    #[test]fn kernel_p0_batch25_w5_650_tx_source_identity_enforced(){
+        let mut f=frame();assert!(ethernet_egress_valid(&f,LOCAL));
+        f[6]=0x54;assert!(!ethernet_egress_valid(&f,LOCAL));
     }
 }

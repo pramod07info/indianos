@@ -115,6 +115,12 @@ fn hhdm_covers_usable_map(map:&MemoryMap,offset:u64)->bool{
         if !limine_pointer_aligned(region_pointer){return false;}
         let region=unsafe{&*region_pointer};
         if region.kind!=0{continue;}
+        // This four-level x86-64 boot path cannot address usable physical
+        // memory beyond the architectural 52-bit MAXPHYADDR ceiling.
+        const MAX_PHYSICAL_EXCLUSIVE:u64=1u64<<52;
+        if region.base>=MAX_PHYSICAL_EXCLUSIVE ||
+           region.base.checked_add(region.length)
+                .is_none_or(|end|end>MAX_PHYSICAL_EXCLUSIVE){return false;}
         let Some(end)=region.base.checked_add(region.length)
             .and_then(|last|last.checked_sub(1))
             .and_then(|last|offset.checked_add(last))else{return false;};
@@ -617,5 +623,34 @@ mod kernel_p0_batch24_w6_tests{
         let map=MemoryMap{revision:0,count:0,entries:ptr::null()};
         let found=unsafe{limine_response(&map as *const MemoryMap)}.unwrap();
         assert_eq!(found.count,0);
+    }
+}
+
+// P0-651..655: reject unaddressable physical RAM before constructing HHDM.
+#[cfg(test)]
+mod kernel_p0_batch25_w6_tests {
+    use super::*;
+    const HHDM:u64=0xffff_8000_0000_0000;
+    fn check(region:Region,offset:u64)->bool{
+        let pointer=&region as *const Region;
+        let entries=[pointer];
+        let map=MemoryMap{revision:0,count:1,entries:entries.as_ptr()};
+        hhdm_covers_usable_map(&map,offset)
+    }
+    #[test]fn kernel_p0_batch25_w6_651_low_ram_hhdm_valid(){
+        assert!(check(Region{base:4096,length:8192,kind:0},HHDM));
+    }
+    #[test]fn kernel_p0_batch25_w6_652_unaddressable_start_denied(){
+        assert!(!check(Region{base:1u64<<52,length:4096,kind:0},HHDM));
+    }
+    #[test]fn kernel_p0_batch25_w6_653_crossing_physical_limit_denied(){
+        assert!(!check(Region{base:(1u64<<52)-4096,length:8192,kind:0},HHDM));
+    }
+    #[test]fn kernel_p0_batch25_w6_654_final_physical_page_allowed(){
+        assert!(check(Region{base:(1u64<<52)-4096,length:4096,kind:0},HHDM));
+    }
+    #[test]fn kernel_p0_batch25_w6_655_invalid_direct_map_offset_denied(){
+        assert!(!check(Region{base:4096,length:4096,kind:0},0));
+        assert!(!check(Region{base:4096,length:4096,kind:0},HHDM+1));
     }
 }

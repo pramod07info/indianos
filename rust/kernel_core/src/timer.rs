@@ -680,12 +680,23 @@ pub fn kernel_monotonic_100hz() -> Option<u64> {
         XAPIC_TIMER_RUNNING.load(Ordering::Acquire),
         CONFIGURED.load(Ordering::Acquire),
     );
-    if !same_timer_session(epoch,
-        MONOTONIC_SESSION_EPOCH.load(Ordering::Acquire),source,
-        MONOTONIC_SOURCE.load(Ordering::Acquire)){return None;}
+    let end_epoch=MONOTONIC_SESSION_EPOCH.load(Ordering::Acquire);
+    let end_source=MONOTONIC_SOURCE.load(Ordering::Acquire);
+    let end_receipt=MONOTONIC_PROGRESS_EPOCH.load(Ordering::Acquire);
+    if !monotonic_snapshot_fenced(epoch,end_epoch,source,end_source,
+        receipt,end_receipt,
+        MONOTONIC_SESSION_PROGRESS.load(Ordering::Acquire),
+        MONOTONIC_EXHAUSTED.load(Ordering::Acquire)){return None;}
     sample
 }
 
+// The final receipt prevents stop/rearm races from publishing stale time.
+fn monotonic_snapshot_fenced(start:u64,end:u64,source:u8,end_source:u8,
+    receipt:u64,end_receipt:u64,progress:bool,exhausted:bool)->bool{
+    !exhausted && progress && same_timer_session(start,end,source,end_source) &&
+    irq_receipt_valid(start,receipt,progress) &&
+    irq_receipt_valid(end,end_receipt,progress)
+}
 /// Pure publication guard: no new IRQ in the current session, a stopped
 /// source, conflicting APIC/PIC authority or numeric overflow deny time.
 pub const fn authoritative_monotonic_sample(
@@ -1325,5 +1336,28 @@ mod kernel_p0_batch24_w2_tests{
         assert!(!tick_session_authorized(4,4,2,2,false,true,true));
         assert!(!tick_session_authorized(u64::MAX,0,2,2,false,true,false));
         assert!(tick_session_authorized(4,4,2,2,false,true,false));
+    }
+}
+
+// P0-631..635: source/epoch/receipt survive final time publication.
+#[cfg(test)]
+mod kernel_p0_batch25_w2_tests {
+    use super::*;
+    #[test]fn kernel_p0_batch25_w2_631_valid_pic_receipt(){
+        assert!(monotonic_snapshot_fenced(8,8,1,1,8,8,true,false));
+    }
+    #[test]fn kernel_p0_batch25_w2_632_missing_initial_receipt(){
+        assert!(!monotonic_snapshot_fenced(8,8,1,1,0,8,true,false));
+    }
+    #[test]fn kernel_p0_batch25_w2_633_invalidated_final_receipt(){
+        assert!(!monotonic_snapshot_fenced(8,8,2,2,8,0,true,false));
+    }
+    #[test]fn kernel_p0_batch25_w2_634_epoch_and_source_aba_denied(){
+        assert!(!monotonic_snapshot_fenced(8,9,2,2,8,9,true,false));
+        assert!(!monotonic_snapshot_fenced(8,8,1,2,8,8,true,false));
+    }
+    #[test]fn kernel_p0_batch25_w2_635_stopped_and_exhausted_denied(){
+        assert!(!monotonic_snapshot_fenced(8,8,2,2,8,8,false,false));
+        assert!(!monotonic_snapshot_fenced(8,8,2,2,8,8,true,true));
     }
 }

@@ -173,9 +173,30 @@ unsafe fn initialize(s: &mut State, region_count: u64, reader: RegionReader,
 // The C ABI and tests use one allocator path. Corrupt cursor/counters
 // fail before bitmap mutation. Global usage remains BSP+IRQs-disabled.
 impl State {
+    // Reject a corrupt span table before indexing the fixed-size bitmap.
+    fn single_frame_geometry_valid(&self)->bool{
+        if !self.initialized || self.total==0 ||
+           self.total>MAX_FRAMES as u64 || self.used>self.total ||
+           self.cursor>=self.total || self.count==0 || self.count>MAX_SPANS {
+            return false;
+        }
+        let mut offset=0u64;
+        for span in &self.spans[..self.count] {
+            if span.count==0 || span.bit_offset!=offset ||
+               span.base<PAGE || span.base%PAGE!=0 ||
+               span.count.checked_mul(PAGE)
+                   .and_then(|len|span.base.checked_add(len)).is_none() {
+                return false;
+            }
+            let Some(end)=offset.checked_add(span.count)else{return false;};
+            if end>self.total{return false;}
+            offset=end;
+        }
+        offset==self.total
+    }
     fn claim_single_frame(&mut self)->Option<u64>{
-        if !self.initialized||self.total==0||self.used>=self.total||
-           self.cursor>=self.total{return None;}
+        if !self.single_frame_geometry_valid() ||
+           self.used>=self.total {return None;}
         for scanned in 0..self.total{
             let mut bit=self.cursor+scanned;
             if bit>=self.total{bit-=self.total;}
@@ -1878,5 +1899,47 @@ mod kernel_p0_batch24_w1_tests{
         assert!(s.release_run(b,1));
         assert_eq!(s.claim_single_frame(),Some(b));
         assert!(s.verify_frame_accounting());
+    }
+}
+
+// P0-626..630: real bitmap geometry gates before any single-frame mutation.
+#[cfg(test)]
+mod kernel_p0_batch25_w1_tests {
+    use super::*;
+    unsafe extern "C" fn reader(i:u64,out:*mut Region,ctx:*mut c_void)->bool{
+        if i!=0||out.is_null()||ctx.is_null(){return false;}
+        unsafe{out.write(*(ctx.cast::<Region>()));}true
+    }
+    fn fresh()->State{
+        let mut s=State::empty();
+        let mut r=Region{base:PAGE,length:3*PAGE,kind:0};
+        assert!(unsafe{initialize_once(&mut s,1,Some(reader),(&mut r as *mut Region).cast())});
+        s
+    }
+    #[test]fn kernel_p0_batch25_w1_626_healthy_geometry_allocates_exact_owner(){
+        let mut s=fresh();assert!(s.single_frame_geometry_valid());
+        assert_eq!(s.claim_single_frame(),Some(PAGE));
+        assert_eq!(s.used,1);assert!(s.verify_frame_accounting());
+    }
+    #[test]fn kernel_p0_batch25_w1_627_oversized_total_never_indexes_bitmap(){
+        let mut s=fresh();s.total=MAX_FRAMES as u64+1;
+        assert!(!s.single_frame_geometry_valid());
+        assert_eq!(s.claim_single_frame(),None);assert_eq!(s.used,0);
+    }
+    #[test]fn kernel_p0_batch25_w1_628_span_count_overflow_denied(){
+        let mut s=fresh();s.count=MAX_SPANS+1;
+        assert_eq!(s.claim_single_frame(),None);
+        assert_eq!(s.used,0);assert_eq!(s.bitmap[0],0);
+    }
+    #[test]fn kernel_p0_batch25_w1_629_bit_offset_gap_denied_atomically(){
+        let mut s=fresh();s.spans[0].bit_offset=1;
+        assert_eq!(s.claim_single_frame(),None);
+        assert_eq!(s.used,0);assert_eq!(s.bitmap[0],0);
+    }
+    #[test]fn kernel_p0_batch25_w1_630_bad_alignment_and_overflow_denied(){
+        let mut s=fresh();s.spans[0].base=PAGE+1;
+        assert_eq!(s.claim_single_frame(),None);
+        s.spans[0].base=u64::MAX-PAGE+1;
+        assert_eq!(s.claim_single_frame(),None);assert_eq!(s.used,0);
     }
 }

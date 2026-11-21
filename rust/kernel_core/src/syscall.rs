@@ -207,6 +207,17 @@ fn ring3_instruction_span_valid(plan:&ProgramPlan,rip:u64)->bool {
          .is_some_and(|end|(plan.guard_begin..end).contains(&rip)){
         return false;
     }
+    if plan.segment_count as usize>MAX_SEGMENTS{return false;}
+    // Staged ABI self-tests have no ELF segments. A loaded ELF cannot
+    // restore RIP into a writable, unmapped or non-executable segment.
+    if plan.segment_count!=0 {
+        return plan.segments.iter().take(plan.segment_count as usize).any(|s|
+            s.executable && !s.writable &&
+            s.page_begin>=USER_MIN && s.page_end<=USER_TOP &&
+            s.page_begin<s.page_end &&
+            s.page_begin%PAGE_BYTES==0 && s.page_end%PAGE_BYTES==0 &&
+            (s.page_begin..s.page_end).contains(&rip));
+    }
     true
 }
 pub(crate) fn ring3_frame_valid(
@@ -926,5 +937,39 @@ mod kernel_p0_batch24_w3_tests {
        assert!(!ring3_frame_valid(&f,&p,false));
        p.guard_begin=0;
        assert!(ring3_frame_valid(&f,&p,false));
+    }
+}
+
+// P0-636..640: live IRET RIP must belong to executable ELF pages.
+#[cfg(test)]
+mod kernel_p0_batch25_w3_tests {
+    use super::*;
+    fn plan()->ProgramPlan{
+        let mut p=ProgramPlan{entry:USER_MIN,stack_begin:USER_TOP-STACK_BYTES,
+            stack_end:USER_TOP,guard_begin:USER_TOP-STACK_BYTES-PAGE_BYTES,
+            segment_count:1,segments:[ProgramSegment::empty();MAX_SEGMENTS]};
+        p.segments[0].page_begin=USER_MIN;
+        p.segments[0].page_end=USER_MIN+PAGE_BYTES;
+        p.segments[0].executable=true;
+        p
+    }
+    #[test]fn kernel_p0_batch25_w3_636_valid_code_page(){
+        assert!(ring3_instruction_span_valid(&plan(),USER_MIN+16));
+    }
+    #[test]fn kernel_p0_batch25_w3_637_nonexecuting_segment_denied(){
+        let mut p=plan();p.segments[0].executable=false;
+        assert!(!ring3_instruction_span_valid(&p,USER_MIN+16));
+    }
+    #[test]fn kernel_p0_batch25_w3_638_writable_executable_denied(){
+        let mut p=plan();p.segments[0].writable=true;
+        assert!(!ring3_instruction_span_valid(&p,USER_MIN+16));
+    }
+    #[test]fn kernel_p0_batch25_w3_639_foreign_code_page_denied(){
+        let p=plan();assert!(!ring3_instruction_span_valid(&p,USER_MIN+PAGE_BYTES));
+        assert!(!ring3_instruction_span_valid(&p,p.stack_begin));
+    }
+    #[test]fn kernel_p0_batch25_w3_640_corrupt_segment_count_denied(){
+        let mut p=plan();p.segment_count=MAX_SEGMENTS as u32+1;
+        assert!(!ring3_instruction_span_valid(&p,USER_MIN));
     }
 }

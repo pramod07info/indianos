@@ -517,3 +517,70 @@ jobs:
       - name: Verify host PMM C ABI preserves one-shot allocator ownership
         if: matrix.workstation == 'W1-PMM-one-shot-host'
         run: make test-rust-pmm-host
+
+  p0-batch25-implemented:
+    name: Batch25 implemented ${{ matrix.workstation }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - workstation: W1-PMM-geometry-and-C-host
+            filter: kernel_p0_batch25_w1
+            expected: 5
+            features: normal-desktop
+          - workstation: W2-IRQ-publication-fence
+            filter: kernel_p0_batch25_w2
+            expected: 5
+            features: normal-desktop
+          - workstation: W3-ring3-executable-pages
+            filter: kernel_p0_batch25_w3
+            expected: 5
+            features: normal-desktop
+          - workstation: W4-media-double-snapshot
+            filter: kernel_p0_batch25_w4
+            expected: 5
+            features: test-r031-vfs
+          - workstation: W5-virtio-frame-boundaries
+            filter: kernel_p0_batch25_w5
+            expected: 5
+            features: test-r028-network
+          - workstation: W6-52-bit-physical-RAM
+            filter: kernel_p0_batch25_w6
+            expected: 5
+            features: normal-desktop
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify exact PR head
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: python3 tools/verify_ci_sha.py --expected "$EXPECTED_SHA" --observed "$(git rev-parse HEAD)"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
+      - name: Verify 30 Rust cases and freestanding kernel target
+        env:
+          FILTER: ${{ matrix.filter }}
+          FEATURES: ${{ matrix.features }}
+          EXPECTED_COUNT: ${{ matrix.expected }}
+        run: |
+          set -euo pipefail
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$FILTER" -- --list > /tmp/batch25-tests.txt
+          count=$(grep -c "$FILTER" /tmp/batch25-tests.txt || true)
+          echo "Found $count; expected $EXPECTED_COUNT"
+          test "$count" -eq "$EXPECTED_COUNT"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$FILTER"
+          cargo check --locked --offline --manifest-path rust/kernel_core/Cargo.toml --no-default-features --target x86_64-unknown-none --features "$FEATURES"
+      - name: Verify host PMM C ABI preserves one-shot allocator ownership
+        if: matrix.workstation == 'W1-PMM-geometry-and-C-host'
+        run: |
+          set -euo pipefail
+          make test-rust-pmm-host
+          # Also test the C fallback allocator that broke the full boot job.
+          clang -std=c11 -O2 -g -Wall -Wextra -Werror -I kernel/include \
+            tests/test_pmm.c kernel/src/pmm.c -o /tmp/indianos-pmm-c-test
+          /tmp/indianos-pmm-c-test
