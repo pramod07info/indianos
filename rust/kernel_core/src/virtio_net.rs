@@ -309,19 +309,49 @@ fn receive_payload_len(used_len:usize,capacity:usize)->Result<usize,Error>{
 /// Without negotiated checksum/GSO features a legacy device must not
 /// inject offload metadata that would bypass the kernel's checksum checks.
 fn rx_offload_header_valid(header:&[u8])->bool {
-    header.len()>=10 && header[..10].iter().all(|&byte|byte==0)
+    header.len()==10 && header.iter().all(|&byte|byte==0)
 }
 /// The R028 stack accepts untagged Ethernet-II ingress only. An invalid
 /// source address or 802.3 length field must not reach higher-level parsers.
+// R028 implements Ethernet-II IPv4 and ARP; do not route other protocols.
+fn supported_r028_ethertype(p:u16)->bool{matches!(p,0x0800|0x0806)}
+fn unsupported_vlan_tag(ethertype:u16)->bool {
+    matches!(ethertype,0x8100|0x88a8|0x9100)
+}
 fn ethernet_ingress_valid(frame:&[u8])->bool{
-    if frame.len()<14{return false;}
+    if !(14..=1514).contains(&frame.len()){return false;}
     let source=&frame[6..12];
-    if source[0]&1!=0 || source.iter().all(|&x|x==0){return false;}
+    // A null destination can never be an Ethernet-II recipient.
+    if frame[..6].iter().all(|&x|x==0) ||
+       source[0]&1!=0 || source.iter().all(|&x|x==0){return false;}
     let ethertype=u16::from_be_bytes([frame[12],frame[13]]);
-    ethertype>=0x0600
+    supported_r028_ethertype(ethertype) && !unsupported_vlan_tag(ethertype)
+}
+/// Filter foreign unicast before returning a frame to the guest stack.
+/// Broadcast and multicast remain eligible for ARP/DHCP discovery; the
+/// upper network stack still validates protocol and destination IP.
+fn ethernet_destination_allowed(frame:&[u8],local:[u8;6])->bool{
+    if !(14..=1514).contains(&frame.len()) ||
+       local[0]&1!=0 || local.iter().all(|&x|x==0){
+        return false;
+    }
+    let dest=&frame[..6];
+    dest==local.as_slice() || dest==[0xff;6].as_slice() || dest[0]&1!=0
 }
 /// The device owns the used-ring length. It cannot report bytes beyond
 /// the actual submitted header and Ethernet frame.
+/// In R028 the sole supported TX caller is the kernel's Ethernet stack.
+fn ethernet_egress_valid(frame:&[u8],local_mac:[u8;6])->bool{
+    if !(14..=1514).contains(&frame.len()) ||
+       local_mac[0]&1!=0 || local_mac.iter().all(|&x|x==0){
+        return false;
+    }
+    let src=&frame[6..12];
+    let dst=&frame[..6];
+    let protocol=u16::from_be_bytes([frame[12],frame[13]]);
+    src==local_mac.as_slice() && !dst.iter().all(|&x|x==0) &&
+    supported_r028_ethertype(protocol) && !unsupported_vlan_tag(protocol)
+}
 fn tx_completion_length_valid(reported:usize,frame_length:usize)->bool {
     (14..=1514).contains(&frame_length) && reported<=frame_length+10
 }
@@ -329,7 +359,7 @@ impl EthernetDevice for VirtioNet{
     fn mac(&self)->[u8;6]{self.mac}
     fn send(&mut self,frame:&[u8])->Result<(),Error>{
         if self.faulted{return Err(Error::Device);}
-        if frame.len()<14 || frame.len()>1514{return Err(Error::Invalid);}
+        if !ethernet_egress_valid(frame,self.mac){return Err(Error::Invalid);}
         // A legacy virtio-net frame has a ten-byte header with all
         // segmentation/checksum offload fields clear.
         unsafe{
@@ -386,7 +416,8 @@ impl EthernetDevice for VirtioNet{
             return Err(Error::Invalid);
         }
         let frame=unsafe{core::slice::from_raw_parts(self.rx.buffer.add(10),n)};
-        if !ethernet_ingress_valid(frame){
+        if !ethernet_ingress_valid(frame) ||
+           !ethernet_destination_allowed(frame,self.mac){
             self.rx.offer();
             compiler_fence(Ordering::Release);
             unsafe{outw(self.port+0x10,QUEUE_RX);}
@@ -596,4 +627,223 @@ mod kernel_p0_batch22_w5_tests{
         f[12..14].copy_from_slice(&[0x08,0x00]);
         assert!(ethernet_ingress_valid(&f));
     }
+}
+
+
+// Batch23 W5 P0-598..601: reject forged TX source addresses and unsupported
+// frame formats before handing any bytes to the live virtio DMA queue.
+#[cfg(test)]
+mod kernel_p0_batch23_w5_tests{
+ use super::*;
+ fn packet()->([u8;60],[u8;6]){
+    let mac=[0x52,0x54,0,0xaa,0xbb,0xcc];
+    let mut packet=[0u8;60];packet[..6].fill(0xff);
+    packet[6..12].copy_from_slice(&mac);
+    packet[12..14].copy_from_slice(&[0x08,0x06]);
+    (packet,mac)
+ }
+ #[test]fn kernel_p0_batch23_w5_598_valid_arp_ethernet_passes(){
+    let (packet,mac)=packet();
+    assert!(ethernet_egress_valid(&packet,mac));
+ }
+ #[test]fn kernel_p0_batch23_w5_599_spoofed_source_denied(){
+    let (mut packet,mac)=packet();packet[11]^=1;
+    assert!(!ethernet_egress_valid(&packet,mac));
+    assert!(!ethernet_egress_valid(&packet,[0;6]));
+ }
+ #[test]fn kernel_p0_batch23_w5_600_invalid_destination_denied(){
+    let (mut packet,mac)=packet();packet[..6].fill(0);
+    assert!(!ethernet_egress_valid(&packet,mac));
+    packet[..6].copy_from_slice(&[0x52,0x54,0,1,2,3]);
+    assert!(ethernet_egress_valid(&packet,mac));
+ }
+ #[test]fn kernel_p0_batch23_w5_601_length_coded_short_frame_denied(){
+    let (mut packet,mac)=packet();packet[12..14].copy_from_slice(&[5,0xdc]);
+    assert!(!ethernet_egress_valid(&packet,mac));
+    packet[12..14].copy_from_slice(&[0x08,0x00]);
+    assert!(ethernet_egress_valid(&packet,mac));
+    assert!(!ethernet_egress_valid(&packet[..13],mac));
+ }
+}
+
+
+// Batch24 W5 P0-620..622: actual R028 virtio receive ownership checks
+// reject foreign unicast before caller-visible bytes are copied.
+#[cfg(test)]
+mod kernel_p0_batch24_w5_tests{
+    use super::*;
+    const LOCAL:[u8;6]=[0x52,0x54,0,0x11,0x22,0x33];
+    fn frame()->[u8;60] {
+        let mut f=[0u8;60];
+        f[..6].copy_from_slice(&LOCAL);
+        f[6..12].copy_from_slice(&[0x52,0x54,0,0x44,0x55,0x66]);
+        f[12..14].copy_from_slice(&[0x08,0x06]);
+        f
+    }
+    #[test]fn kernel_p0_batch24_w5_620_local_unicast_retained(){
+        let f=frame();
+        assert!(ethernet_ingress_valid(&f));
+        assert!(ethernet_destination_allowed(&f,LOCAL));
+    }
+    #[test]fn kernel_p0_batch24_w5_621_foreign_unicast_rejected(){
+        let mut f=frame();
+        f[..6].copy_from_slice(&[0x52,0x54,0,0xaa,0xbb,0xcc]);
+        assert!(ethernet_ingress_valid(&f));
+        assert!(!ethernet_destination_allowed(&f,LOCAL));
+        assert!(!ethernet_destination_allowed(&f,[0;6]));
+    }
+    #[test]fn kernel_p0_batch24_w5_622_discovery_broadcast_and_multicast_retained(){
+        let mut f=frame();f[..6].fill(0xff);
+        assert!(ethernet_destination_allowed(&f,LOCAL));
+        f[..6].copy_from_slice(&[0x01,0x00,0x5e,0,0,1]);
+        assert!(ethernet_destination_allowed(&f,LOCAL));
+        assert!(!ethernet_destination_allowed(&f[..13],LOCAL));
+    }
+}
+
+// P0-646..650: bounded raw virtio input before guest-visible buffers.
+#[cfg(test)]
+mod kernel_p0_batch25_w5_tests {
+    use super::*;
+    const LOCAL:[u8;6]=[0x52,0x54,0,1,2,3];
+    fn frame()->[u8;60]{
+        let mut f=[0u8;60];
+        f[..6].copy_from_slice(&LOCAL);
+        f[6..12].copy_from_slice(&[0x52,0x54,0,4,5,6]);
+        f[12..14].copy_from_slice(&[8,6]);f
+    }
+    #[test]fn kernel_p0_batch25_w5_646_exact_virtio_header(){
+        assert!(rx_offload_header_valid(&[0;10]));
+        assert!(!rx_offload_header_valid(&[0;11]));
+        assert!(!rx_offload_header_valid(&[0;9]));
+    }
+    #[test]fn kernel_p0_batch25_w5_647_oversized_frame_denied(){
+        let mut packet=[0u8;1515];packet[..14].copy_from_slice(&frame()[..14]);
+        assert!(!ethernet_ingress_valid(&packet));
+        assert!(!ethernet_destination_allowed(&packet,LOCAL));
+    }
+    #[test]fn kernel_p0_batch25_w5_648_minimum_ethernet_frame(){
+        let sample=frame();
+        let short=&sample[..14];
+        assert!(ethernet_ingress_valid(short));
+        assert!(ethernet_destination_allowed(short,LOCAL));
+    }
+    #[test]fn kernel_p0_batch25_w5_649_multicast_source_denied(){
+        let mut f=frame();f[6]=0x01;
+        assert!(!ethernet_ingress_valid(&f));
+    }
+    #[test]fn kernel_p0_batch25_w5_650_tx_source_identity_enforced(){
+        let mut f=frame();
+        // TX must carry this NIC's source, not the foreign RX fixture source.
+        f[6..12].copy_from_slice(&LOCAL);
+        assert!(ethernet_egress_valid(&f,LOCAL));
+        f[6]=0x54;
+        assert!(!ethernet_egress_valid(&f,LOCAL));
+    }
+}
+
+// P0-670..672: no VLAN tag is admitted by the untagged-only R028 ABI.
+#[cfg(test)]
+mod kernel_p0_batch26_w5_tests {
+    use super::*;
+    const MAC:[u8;6]=[0x52,0x54,0,1,2,3];
+    fn frame(ethertype:u16)->[u8;60] {
+        let mut f=[0u8;60];f[..6].copy_from_slice(&MAC);
+        f[6..12].copy_from_slice(&MAC);
+        f[12..14].copy_from_slice(&ethertype.to_be_bytes());f
+    }
+    #[test]fn kernel_p0_batch26_w5_670_untagged_ipv4_arp_retained(){
+        for kind in [0x0800,0x0806] {
+            let f=frame(kind);
+            assert!(ethernet_ingress_valid(&f));
+            assert!(ethernet_egress_valid(&f,MAC));
+        }
+    }
+    #[test]fn kernel_p0_batch26_w5_671_vlan_encapsulation_denied_on_rx(){
+        for tag in [0x8100,0x88a8,0x9100] {
+            assert!(!ethernet_ingress_valid(&frame(tag)));
+        }
+    }
+    #[test]fn kernel_p0_batch26_w5_672_vlan_encapsulation_denied_on_tx(){
+        for tag in [0x8100,0x88a8,0x9100] {
+            assert!(!ethernet_egress_valid(&frame(tag),MAC));
+        }
+    }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch27_w5_tests {
+    use super::*;
+    const LOCAL:[u8;6]=[0x52,0x54,0,1,2,3];
+    const PEER:[u8;6]=[0x52,0x54,0,4,5,6];
+    fn frame(ethertype:u16)->[u8;60]{
+        let mut f=[0u8;60];f[..6].copy_from_slice(&LOCAL);
+        f[6..12].copy_from_slice(&PEER);
+        f[12..14].copy_from_slice(&ethertype.to_be_bytes());f
+    }
+    #[test]fn kernel_p0_batch27_w5_693_valid_ipv4_arp_still_ingress(){
+        for ethertype in [0x0800,0x0806] {
+            let f=frame(ethertype);
+            assert!(ethernet_ingress_valid(&f));
+            assert!(ethernet_destination_allowed(&f,LOCAL));
+        }
+    }
+    #[test]fn kernel_p0_batch27_w5_694_foreign_unicast_denied(){
+        let mut f=frame(0x0800);
+        f[..6].copy_from_slice(&PEER);
+        assert!(ethernet_ingress_valid(&f));
+        assert!(!ethernet_destination_allowed(&f,LOCAL));
+    }
+    #[test]fn kernel_p0_batch27_w5_695_multicast_and_zero_source_denied(){
+        let mut f=frame(0x0806);f[6]=1;
+        assert!(!ethernet_ingress_valid(&f));
+        f[6..12].fill(0);
+        assert!(!ethernet_ingress_valid(&f));
+    }
+    #[test]fn kernel_p0_batch27_w5_696_8023_and_vlan_bypass_denied(){
+        for proto in [0x0001,0x05ff,0x8100,0x88a8,0x9100] {
+            let mut f=frame(proto);
+            assert!(!ethernet_ingress_valid(&f));
+            f[6..12].copy_from_slice(&LOCAL);
+            assert!(!ethernet_egress_valid(&f,LOCAL));
+        }
+    }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch28_w5 {
+ use super::*;
+ fn frame()->[u8;60]{
+  let mut f=[0u8;60];f[..6].copy_from_slice(&[0x02,1,2,3,4,5]);
+  f[6..12].copy_from_slice(&[0x02,9,8,7,6,5]);
+  f[12..14].copy_from_slice(&[0x08,0x00]);f
+ }
+ #[test]fn kernel_p0_batch28_w5_715_null_destination_rejected_at_ingress(){
+  let mut f=frame();f[..6].fill(0);
+  assert!(!ethernet_ingress_valid(&f));
+  assert!(!ethernet_destination_allowed(&f,[0x02,1,2,3,4,5]));
+ }
+ #[test]fn kernel_p0_batch28_w5_716_local_unicast_and_broadcast_retained(){
+  let local=[0x02,1,2,3,4,5];let mut f=frame();
+  assert!(ethernet_ingress_valid(&f));
+  assert!(ethernet_destination_allowed(&f,local));
+  f[..6].fill(0xff);
+  assert!(ethernet_ingress_valid(&f));
+  assert!(ethernet_destination_allowed(&f,local));
+ }
+ #[test]fn kernel_p0_batch28_w5_717_foreign_unicast_dropped(){
+  let f=frame();assert!(ethernet_ingress_valid(&f));
+  assert!(!ethernet_destination_allowed(&f,[0x02,5,4,3,2,1]));
+ }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch29_w5{
+ use super::*;
+ const MAC:[u8;6]=[2,1,2,3,4,5];
+ fn frame(proto:u16)->[u8;60]{let mut f=[0u8;60];f[..6].copy_from_slice(&MAC);f[6..12].copy_from_slice(&MAC);f[12..14].copy_from_slice(&proto.to_be_bytes());f}
+ #[test] fn kernel_p0_batch29_w5_738_ipv4_arp_valid(){for p in [0x0800,0x0806]{let f=frame(p);assert!(ethernet_ingress_valid(&f));assert!(ethernet_egress_valid(&f,MAC));}}
+ #[test] fn kernel_p0_batch29_w5_739_ipv6_ingress_rejected(){assert!(!ethernet_ingress_valid(&frame(0x86dd)));}
+ #[test] fn kernel_p0_batch29_w5_740_unknown_egress_rejected(){for p in [0x86dd,0x88cc,0x88b5]{assert!(!ethernet_egress_valid(&frame(p),MAC));}}
+ #[test] fn kernel_p0_batch29_w5_741_vlan_8023_rejected(){for p in [1,0x05ff,0x8100,0x88a8,0x9100]{let f=frame(p);assert!(!ethernet_ingress_valid(&f));assert!(!ethernet_egress_valid(&f,MAC));}}
 }
