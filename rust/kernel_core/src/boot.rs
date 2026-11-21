@@ -49,9 +49,11 @@ unsafe fn memory_map() -> Option<&'static MemoryMap> {
 /// Reject misaligned Limine pointers before constructing Rust references
 /// or issuing aligned volatile loads. Firmware must also guarantee validity.
 fn limine_pointer_aligned<T>(p:*const T)->bool {
-    !p.is_null() &&
-    (((p as usize as u64)>>47)==0 || ((p as usize as u64)>>47)==0x1ffff) &&
-    (p as usize)%core::mem::align_of::<T>()==0
+    // Validate the entire referenced descriptor, not only its start address:
+    // a canonical/aligned pointer near the 48-bit boundary can still straddle
+    // the noncanonical hole. Mapping/provenance remains Limine's obligation.
+    buffer_span_ok(p as usize,core::mem::size_of::<T>() as u64,
+                   core::mem::align_of::<T>())
 }
 fn valid_region(r:&Region)->bool{
     r.length!=0 && r.base.checked_add(r.length).is_some()
@@ -743,4 +745,21 @@ mod kernel_p0_batch29_w6{
  #[test] fn kernel_p0_batch29_w6_743_high_canonical_pointer(){assert!(limine_pointer_aligned(0xffff_8000_0000_1000usize as *const Region));}
  #[test] fn kernel_p0_batch29_w6_744_noncanonical_pointer_denied(){assert!(!limine_pointer_aligned(0x0000_8000_0000_0000usize as *const Region));assert!(!limine_pointer_aligned(0xffff_7fff_ffff_f000usize as *const Region));}
  #[test] fn kernel_p0_batch29_w6_745_null_misaligned_pointer_denied(){assert!(!limine_pointer_aligned(core::ptr::null::<Region>()));assert!(!limine_pointer_aligned(0x1001usize as *const Region));}
+}
+
+#[cfg(test)]
+mod kernel_p0_batch30_w6 {
+    use super::*;
+    #[test] fn kernel_p0_batch30_w6_763_normal_canonical_descriptor_allowed(){
+        assert!(limine_pointer_aligned(0x1000usize as *const Region));
+        assert!(limine_pointer_aligned(0xffff_8000_0000_1000usize as *const Region));
+    }
+    #[test] fn kernel_p0_batch30_w6_764_descriptor_crossing_canonical_gap_denied(){
+        assert!(!limine_pointer_aligned(0x0000_7fff_ffff_fff0usize as *const Region));
+    }
+    #[test] fn kernel_p0_batch30_w6_765_pointer_wrap_and_misalignment_denied(){
+        assert!(!limine_pointer_aligned(0xffff_ffff_ffff_fff8usize as *const Region));
+        assert!(!limine_pointer_aligned(0x1001usize as *const Region));
+        assert!(!limine_pointer_aligned(core::ptr::null::<Region>()));
+    }
 }

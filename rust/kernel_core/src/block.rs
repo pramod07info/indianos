@@ -235,6 +235,26 @@ pub fn read_sectors<D: BlockDevice>(
     Ok(())
 }
 
+/// Strong read variant for boot-critical metadata: require a driver-owned
+/// media generation, two consistent observations, and a final postflight.
+/// Legacy devices returning None stay usable through read_sectors, but do
+/// not qualify for this revision-pinned publication API.
+pub fn read_generation_pinned_sectors<D:BlockDevice>(
+    device:&mut D,start:u64,out:&mut[u8]
+)->Result<u64,BlockError>{
+    let Some(generation)=device.media_generation()else{return Err(BlockError::Io)};
+    let capacity=device.sector_count();
+    if !media_snapshot_matches(device,capacity,Some(generation)){
+        return Err(BlockError::Io);
+    }
+    read_stable_sectors(device,start,out)?;
+    // A swap after the second observation must not publish stale bytes.
+    if !media_snapshot_matches(device,capacity,Some(generation)){
+        out.fill(0);return Err(BlockError::Io);
+    }
+    Ok(generation)
+}
+
 pub fn write_sectors<D: BlockDevice>(
     device: &mut D, start: u64, data: &[u8],
 ) -> Result<(), BlockError> {
@@ -3232,4 +3252,40 @@ mod kernel_p0_batch29_w4{
  #[test] fn kernel_p0_batch29_w4_735_swap_before_io_revokes(){let mut d=disk();let mut w=StableReadOnlyWindow::new(&mut d).unwrap();w.device.generation=8;let mut out=[0xee;SECTOR_BYTES];assert_eq!(w.read_sector(0,&mut out),Err(BlockError::Io));assert_eq!(out,[0xee;SECTOR_BYTES]);assert!(w.is_retired());assert_eq!(w.device.reads,0);}
  #[test] fn kernel_p0_batch29_w4_736_mid_read_swap_revokes(){let mut d=disk();d.swap_at=1;let mut w=StableReadOnlyWindow::new(&mut d).unwrap();let mut out=[0xee;SECTOR_BYTES];assert_eq!(w.read_sector(0,&mut out),Err(BlockError::Io));assert_eq!(out,[0xee;SECTOR_BYTES]);assert!(w.is_retired());assert_eq!(w.device.reads,1);}
  #[test] fn kernel_p0_batch29_w4_737_aba_does_not_unretire(){let mut d=disk();let mut w=StableReadOnlyWindow::new(&mut d).unwrap();w.device.generation=8;let mut out=[0xcc;SECTOR_BYTES];assert_eq!(w.read_sector(0,&mut out),Err(BlockError::Io));w.device.generation=7;assert_eq!(w.read_sector(0,&mut out),Err(BlockError::Io));assert_eq!(out,[0xcc;SECTOR_BYTES]);}
+}
+
+#[cfg(test)]
+mod kernel_p0_batch30_w4 {
+    use super::*;
+    struct Disk{generation:Option<u64>,reads:u32,swap_at:u32}
+    impl BlockDevice for Disk{
+        fn sector_count(&self)->u64{4}
+        fn media_generation(&self)->Option<u64>{self.generation}
+        fn read_sector(&mut self,_:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+            self.reads+=1;out.fill(0x65);
+            if self.reads==self.swap_at{self.generation=Some(8);}
+            Ok(())
+        }
+        fn write_sector(&mut self,_:u64,_:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+            Err(BlockError::ReadOnly)
+        }
+    }
+    fn disk(generation:Option<u64>,swap_at:u32)->Disk{
+        Disk{generation,reads:0,swap_at}
+    }
+    #[test] fn kernel_p0_batch30_w4_757_missing_revision_denies_critical_read(){
+        let mut d=disk(None,0);let mut out=[0xcc;SECTOR_BYTES];
+        assert_eq!(read_generation_pinned_sectors(&mut d,0,&mut out),Err(BlockError::Io));
+        assert_eq!(d.reads,0);assert_eq!(out,[0xcc;SECTOR_BYTES]);
+    }
+    #[test] fn kernel_p0_batch30_w4_758_stable_revision_releases_exact_bytes(){
+        let mut d=disk(Some(7),0);let mut out=[0;SECTOR_BYTES];
+        assert_eq!(read_generation_pinned_sectors(&mut d,0,&mut out),Ok(7));
+        assert_eq!(d.reads,2);assert_eq!(out,[0x65;SECTOR_BYTES]);
+    }
+    #[test] fn kernel_p0_batch30_w4_759_swap_during_validation_preserves_caller(){
+        let mut d=disk(Some(7),2);let mut out=[0xcc;SECTOR_BYTES];
+        assert_eq!(read_generation_pinned_sectors(&mut d,0,&mut out),Err(BlockError::Io));
+        assert_eq!(d.reads,2);assert_eq!(out,[0xcc;SECTOR_BYTES]);
+    }
 }

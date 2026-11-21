@@ -336,7 +336,11 @@ fn ethernet_destination_allowed(frame:&[u8],local:[u8;6])->bool{
         return false;
     }
     let dest=&frame[..6];
-    dest==local.as_slice() || dest==[0xff;6].as_slice() || dest[0]&1!=0
+    // R028 has IPv4/ARP only: arbitrary odd-first-byte destinations are not
+    // broadcast or an authorized IPv4 multicast group (01:00:5e:0xxxxxxx).
+    dest==local.as_slice() || dest==[0xff;6].as_slice() ||
+    (dest[0]==0x01 && dest[1]==0x00 && dest[2]==0x5e &&
+     dest[3]&0x80==0)
 }
 /// The device owns the used-ring length. It cannot report bytes beyond
 /// the actual submitted header and Ethernet frame.
@@ -846,4 +850,30 @@ mod kernel_p0_batch29_w5{
  #[test] fn kernel_p0_batch29_w5_739_ipv6_ingress_rejected(){assert!(!ethernet_ingress_valid(&frame(0x86dd)));}
  #[test] fn kernel_p0_batch29_w5_740_unknown_egress_rejected(){for p in [0x86dd,0x88cc,0x88b5]{assert!(!ethernet_egress_valid(&frame(p),MAC));}}
  #[test] fn kernel_p0_batch29_w5_741_vlan_8023_rejected(){for p in [1,0x05ff,0x8100,0x88a8,0x9100]{let f=frame(p);assert!(!ethernet_ingress_valid(&f));assert!(!ethernet_egress_valid(&f,MAC));}}
+}
+
+#[cfg(test)]
+mod kernel_p0_batch30_w5 {
+    use super::*;
+    const LOCAL:[u8;6]=[2,1,2,3,4,5];
+    fn packet(dest:[u8;6])->[u8;60]{
+        let mut f=[0u8;60];f[..6].copy_from_slice(&dest);
+        f[6..12].copy_from_slice(&LOCAL);f[12..14].copy_from_slice(&0x0800u16.to_be_bytes());f
+    }
+    #[test] fn kernel_p0_batch30_w5_760_ipv4_multicast_and_broadcast_allowed(){
+        for mac in [[1,0,0x5e,0,0,1],[0xff;6]]{
+            let f=packet(mac);assert!(ethernet_ingress_valid(&f));
+            assert!(ethernet_destination_allowed(&f,LOCAL));
+        }
+    }
+    #[test] fn kernel_p0_batch30_w5_761_arbitrary_multicast_prefix_rejected(){
+        for mac in [[3,0,0,0,0,1],[0x33,0x33,0,0,0,1],[0xff,0,0,0,0,1]]{
+            let f=packet(mac);assert!(!ethernet_destination_allowed(&f,LOCAL));
+        }
+    }
+    #[test] fn kernel_p0_batch30_w5_762_invalid_multicast_high_bit_and_foreign_unicast(){
+        for mac in [[1,0,0x5e,0x80,0,1],[2,9,9,9,9,9]]{
+            let f=packet(mac);assert!(!ethernet_destination_allowed(&f,LOCAL));
+        }
+    }
 }

@@ -759,13 +759,14 @@ fn preemption_capture_budget(delivered:u64,captured:u64,running:bool)->bool {
 // even when its source ID remains the same.
 fn preemption_session_valid(before:u64,after:u64,
     delivered:u64,captured:u64,running:bool)->bool {
-    before!=0 && before==after &&
+    before!=0 && before!=u64::MAX && before==after &&
     preemption_capture_budget(delivered,captured,running)
 }
 // Reject IRQ count rewind while a live user preemption is published.
 fn preemption_delivery_receipt_valid(a:u64,b:u64,first:u64,last:u64,
     captured:u64,running:bool)->bool{
-    last>=first && preemption_session_valid(a,b,first,captured,running)
+    first!=u64::MAX && last!=u64::MAX && last>=first &&
+    preemption_session_valid(a,b,first,captured,running)
 }
 pub fn xapic_record_preemption(){
     // APIC EOI is recorded before user frame capture; require both a live
@@ -1465,4 +1466,21 @@ mod kernel_p0_batch29_w2{
   assert!(!preemption_delivery_receipt_valid(4,4,5,5,0,false));
   assert!(!preemption_delivery_receipt_valid(4,4,5,5,5,true));
  }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch30_w2 {
+    use super::*;
+    #[test] fn kernel_p0_batch30_w2_750_live_delivery_window_preserved(){
+        assert!(preemption_delivery_receipt_valid(9,9,5,6,4,true));
+    }
+    #[test] fn kernel_p0_batch30_w2_751_saturated_irq_never_mints_capture(){
+        assert!(!preemption_delivery_receipt_valid(9,9,u64::MAX,u64::MAX,0,true));
+        assert!(!preemption_delivery_receipt_valid(9,9,u64::MAX-1,u64::MAX,0,true));
+    }
+    #[test] fn kernel_p0_batch30_w2_752_epoch_wrap_and_rewind_rejected(){
+        assert!(!preemption_delivery_receipt_valid(u64::MAX,u64::MAX,5,5,4,true));
+        assert!(!preemption_delivery_receipt_valid(9,9,6,5,4,true));
+        assert!(!preemption_delivery_receipt_valid(9,10,5,5,4,true));
+    }
 }

@@ -247,7 +247,13 @@ fn ring3_instruction_span_valid(plan:&ProgramPlan,rip:u64)->bool {
             s.page_begin>=USER_MIN && s.page_end<=USER_TOP &&
             s.page_begin<s.page_end &&
             s.page_begin%PAGE_BYTES==0 && s.page_end%PAGE_BYTES==0 &&
-            (s.page_begin..s.page_end).contains(&rip));
+            (s.page_begin..s.page_end).contains(&rip) &&
+             // When ELF memory bounds are present, page padding is not code.
+             // Segment-less/zero-size staged numeric plans preserve their
+             // historical ABI until live PTE/NX validation is wired.
+             (s.memory_size==0 ||
+              s.virtual_address.checked_add(s.memory_size)
+                .is_some_and(|end|(s.virtual_address..end).contains(&rip))));
     }
     true
 }
@@ -1101,4 +1107,37 @@ mod kernel_p0_batch29_w3{
  #[test] fn kernel_p0_batch29_w3_731_elf_offset_overflow(){let mut p=plan();p.segments[0].file_offset=u64::MAX-15;assert!(!user_segment_layout_valid(&p));}
  #[test] fn kernel_p0_batch29_w3_732_exact_arithmetic_boundary(){let mut p=plan();p.segments[0].file_offset=u64::MAX-16;assert!(user_segment_layout_valid(&p));}
  #[test] fn kernel_p0_batch29_w3_733_malformed_elf_denies_user_read_iret(){let mut p=plan();p.segments[0].file_offset=u64::MAX;assert!(!user_range(&p,USER_MIN+16,1,false));assert!(!ring3_instruction_span_valid(&p,USER_MIN+16));}
+}
+
+#[cfg(test)]
+mod kernel_p0_batch30_w3 {
+    use super::*;
+    fn plan()->ProgramPlan {
+        let mut segments=[ProgramSegment::empty();MAX_SEGMENTS];
+        segments[0]=ProgramSegment{
+            virtual_address:USER_MIN+64,file_offset:0,file_size:16,memory_size:32,
+            page_begin:USER_MIN,page_end:USER_MIN+PAGE_BYTES,
+            writable:false,executable:true};
+        ProgramPlan{entry:USER_MIN+64,
+            stack_begin:USER_TOP-STACK_BYTES,stack_end:USER_TOP,
+            guard_begin:USER_TOP-STACK_BYTES-PAGE_BYTES,
+            segment_count:1,segments}
+    }
+    #[test] fn kernel_p0_batch30_w3_753_elf_loaded_instruction_is_admitted(){
+        let p=plan();assert!(ring3_instruction_span_valid(&p,USER_MIN+64));
+    }
+    #[test] fn kernel_p0_batch30_w3_754_prefix_padding_is_not_executable(){
+        let p=plan();assert!(!ring3_instruction_span_valid(&p,USER_MIN+63));
+    }
+    #[test] fn kernel_p0_batch30_w3_755_suffix_padding_is_not_executable(){
+        let p=plan();assert!(ring3_instruction_span_valid(&p,USER_MIN+95));
+        assert!(!ring3_instruction_span_valid(&p,USER_MIN+96));
+    }
+    #[test] fn kernel_p0_batch30_w3_756_numeric_iret_cannot_restore_into_padding(){
+        let p=plan();let mut frame=[0u64;20];
+        frame[15]=USER_MIN+64;frame[16]=0x2b;frame[17]=0x2;
+        frame[18]=p.stack_end-8;frame[19]=0x33;
+        assert!(ring3_frame_valid(&frame,&p,false));
+        frame[15]=USER_MIN+96;assert!(!ring3_frame_valid(&frame,&p,false));
+    }
 }

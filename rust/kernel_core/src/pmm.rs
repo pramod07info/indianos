@@ -703,8 +703,9 @@ impl State{
     }
     /// 17. Allocate a discontiguous exact frame set as one transaction.
     fn claim_exact_frame_set(&mut self,addresses:&[u64])->bool{
-        if addresses.is_empty()||addresses.len()>16||!self.initialized||
-           self.used>self.total||addresses.len() as u64>self.total-self.used{
+        if addresses.is_empty()||addresses.len()>16||
+           !self.single_frame_geometry_valid()||
+           addresses.len() as u64>self.total-self.used{
             return false;
         }
         let mut bits=[0u64;16];
@@ -719,8 +720,9 @@ impl State{
     }
     /// 18. Release a discontiguous exact set without partial free.
     fn release_exact_frame_set(&mut self,addresses:&[u64])->bool{
-        if addresses.is_empty()||addresses.len()>16||!self.initialized||
-           self.used>self.total||self.used<addresses.len() as u64 {
+        if addresses.is_empty()||addresses.len()>16||
+           !self.single_frame_geometry_valid()||
+           self.used<addresses.len() as u64 {
             return false;
         }
         let mut bits=[0u64;16];
@@ -735,12 +737,12 @@ impl State{
     }
     /// 19. Validate allocator accounting against the actual bitmap.
     fn verify_frame_accounting(&self)->bool{
-        self.initialized&&self.used<=self.total&&
+        self.single_frame_geometry_valid()&&
         (0..self.total).filter(|i|self.allocated(*i)).count() as u64==self.used
     }
     /// 20. Publish a complete per-span occupancy snapshot or nothing.
     fn snapshot_span_usage(&self,out:&mut[FrameSpanUsage])->Option<usize>{
-        if !self.initialized||out.len()<self.count{return None;}
+        if !self.single_frame_geometry_valid()||out.len()<self.count{return None;}
         for (i,s) in self.spans[..self.count].iter().enumerate(){
             out[i]=FrameSpanUsage{
                 base:s.base,frames:s.count,
@@ -2066,4 +2068,40 @@ mod kernel_p0_batch29_w1 {
  #[test] fn kernel_p0_batch29_w1_723_corrupt_offset_no_release(){let mut s=state();assert!(s.claim_run(PAGE,1));s.spans[1].bit_offset=1;assert!(!s.release_run(PAGE,1));assert!(s.allocated(0));}
  #[test] fn kernel_p0_batch29_w1_724_cursor_corruption_no_claim(){let mut s=state();s.cursor=s.total;assert!(!s.claim_run(10*PAGE,1));assert_eq!(s.used,0);}
  #[test] fn kernel_p0_batch29_w1_725_atomic_release_no_double_free(){let mut s=state();assert!(s.claim_run(PAGE,2));assert!(!s.release_run(PAGE,3));assert_eq!(s.used,2);assert!(s.release_run(PAGE,2));assert!(!s.release_run(PAGE,2));}
+}
+
+#[cfg(test)]
+mod kernel_p0_batch30_w1 {
+    use super::*;
+    fn state()->State {
+        let mut s=State::empty();s.initialized=true;s.count=2;s.total=4;
+        s.spans[0]=Span{base:PAGE,count:2,bit_offset:0};
+        s.spans[1]=Span{base:10*PAGE,count:2,bit_offset:2};
+        s
+    }
+    #[test] fn kernel_p0_batch30_w1_746_valid_exact_set_is_one_transaction(){
+        let mut s=state();assert!(s.claim_exact_frame_set(&[PAGE,10*PAGE]));
+        assert_eq!(s.used,2);assert!(s.verify_frame_accounting());
+        assert!(s.release_exact_frame_set(&[PAGE,10*PAGE]));
+        assert_eq!(s.used,0);
+    }
+    #[test] fn kernel_p0_batch30_w1_747_overlap_rejects_exact_set_without_mutation(){
+        let mut s=state();s.spans[1].base=2*PAGE;
+        assert!(!s.claim_exact_frame_set(&[PAGE,2*PAGE]));
+        assert_eq!(s.used,0);assert_eq!(s.bitmap[0],0);
+    }
+    #[test] fn kernel_p0_batch30_w1_748_corrupt_offset_denies_release_of_live_frame(){
+        let mut s=state();assert!(s.claim_exact_frame_set(&[PAGE]));
+        s.spans[1].bit_offset=1;
+        assert!(!s.release_exact_frame_set(&[PAGE]));
+        assert!(s.allocated(0));assert_eq!(s.used,1);
+    }
+    #[test] fn kernel_p0_batch30_w1_749_corrupt_geometry_denies_snapshot_and_accounting(){
+        let mut s=state();s.cursor=s.total;
+        let sentinel=FrameSpanUsage{base:77,frames:7,busy:7,longest_free:7};
+        let mut out=[sentinel;2];
+        assert!(!s.verify_frame_accounting());
+        assert_eq!(s.snapshot_span_usage(&mut out),None);
+        assert_eq!(out,[sentinel;2]);
+    }
 }
