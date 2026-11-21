@@ -804,10 +804,18 @@ pub fn xapic_preemption_progress()->bool{
         x86_64_xapic_timer_irq_count(),x86_64_xapic_timer_preemption_count()
     )
 }
-/// An APIC timer interrupt may preempt only while the timer is armed.
+/// A running bit alone is insufficient after controller handover or session exhaustion.
+fn apic_preemption_ready(running:bool,source:u8,epoch:u64)->bool {
+    running && source==2 && epoch!=0 && epoch!=u64::MAX
+}
+/// An APIC timer interrupt may preempt only with live timer-source authority.
 #[no_mangle]
 pub extern "C" fn x86_64_xapic_timer_preemption_ready()->bool{
-    XAPIC_TIMER_RUNNING.load(Ordering::Acquire)
+    apic_preemption_ready(
+        XAPIC_TIMER_RUNNING.load(Ordering::Acquire),
+        MONOTONIC_SOURCE.load(Ordering::Acquire),
+        MONOTONIC_SESSION_EPOCH.load(Ordering::Acquire)
+    )
 }
 
 // R024: One dedicated, supervisor-only UC alias for the local xAPIC MMIO.
@@ -1509,5 +1517,24 @@ mod kernel_p0_batch31_w2 {
         assert!(!apic_preemption_receipt_valid(4,5,5,6,4,true,2,2));
         assert!(!apic_preemption_receipt_valid(4,4,5,6,4,false,2,2));
         assert!(!apic_preemption_receipt_valid(4,4,u64::MAX,u64::MAX,0,true,2,2));
+    }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch32_w2 {
+    use super::*;
+    #[test] fn kernel_p0_batch32_w2_790_running_xapic_live_epoch_is_ready(){
+        assert!(apic_preemption_ready(true,2,1));
+        assert!(apic_preemption_ready(true,2,42));
+    }
+    #[test] fn kernel_p0_batch32_w2_791_pic_handover_revokes_timer_ready(){
+        for source in [0,1,3,u8::MAX] {
+            assert!(!apic_preemption_ready(true,source,42));
+        }
+    }
+    #[test] fn kernel_p0_batch32_w2_792_stopped_or_exhausted_epoch_denied(){
+        assert!(!apic_preemption_ready(false,2,42));
+        assert!(!apic_preemption_ready(true,2,0));
+        assert!(!apic_preemption_ready(true,2,u64::MAX));
     }
 }

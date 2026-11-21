@@ -705,7 +705,7 @@ impl State{
     /// 17. Allocate a discontiguous exact frame set as one transaction.
     fn claim_exact_frame_set(&mut self,addresses:&[u64])->bool{
         if addresses.is_empty()||addresses.len()>16||
-           !self.single_frame_geometry_valid()||
+           !self.verify_frame_accounting()||
            addresses.len() as u64>self.total-self.used{
             return false;
         }
@@ -722,7 +722,7 @@ impl State{
     /// 18. Release a discontiguous exact set without partial free.
     fn release_exact_frame_set(&mut self,addresses:&[u64])->bool{
         if addresses.is_empty()||addresses.len()>16||
-           !self.single_frame_geometry_valid()||
+           !self.verify_frame_accounting()||
            self.used<addresses.len() as u64 {
             return false;
         }
@@ -1371,7 +1371,7 @@ impl State {
     }
     /// Validate all exact owner allocations before releasing a batch.
     fn can_release_frames(&self,addresses:&[u64])->bool{
-        if !self.single_frame_geometry_valid()||
+        if !self.verify_frame_accounting()||
            addresses.is_empty()||addresses.len()>16{return false;}
         for (i,&addr) in addresses.iter().enumerate(){
             if !self.is_busy_physical(addr)||addresses[..i].contains(&addr){return false;}
@@ -1380,7 +1380,7 @@ impl State {
     }
     /// Validate the whole atomic claim set; never claim managed RAM holes.
     fn can_claim_frames(&self,addresses:&[u64])->bool{
-        if !self.single_frame_geometry_valid()||
+        if !self.verify_frame_accounting()||
            addresses.is_empty()||addresses.len()>16{return false;}
         for (i,&addr) in addresses.iter().enumerate(){
             if !self.is_free_physical(addr)||addresses[..i].contains(&addr){return false;}
@@ -2144,5 +2144,43 @@ mod kernel_p0_batch31_w1 {
         s.used=0;let mut unchanged=[sentinel;2];
         assert_eq!(s.snapshot_span_usage(&mut unchanged),None);
         assert_eq!(unchanged,[sentinel;2]);
+    }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch32_w1 {
+    use super::*;
+    fn state()->State {
+        let mut s=State::empty();
+        s.initialized=true;s.count=1;s.total=4;
+        s.spans[0]=Span{base:PAGE,count:4,bit_offset:0};
+        s
+    }
+    #[test] fn kernel_p0_batch32_w1_786_valid_atomic_claim_is_releasable(){
+        let mut s=state();
+        assert!(s.claim_exact_frame_set(&[PAGE,3*PAGE]));
+        assert!(s.verify_frame_accounting());assert_eq!(s.used,2);
+        assert!(s.release_exact_frame_set(&[3*PAGE,PAGE]));
+        assert_eq!(s.used,0);assert!(s.verify_frame_accounting());
+    }
+    #[test] fn kernel_p0_batch32_w1_787_mismatched_used_denies_claim_without_bitmap_mutation(){
+        let mut s=state();s.used=1;
+        assert!(!s.claim_exact_frame_set(&[PAGE]));assert_eq!(s.bitmap[0],0);
+        assert_eq!(s.used,1);s.used=0;
+        assert!(s.claim_exact_frame_set(&[PAGE]));
+    }
+    #[test] fn kernel_p0_batch32_w1_788_mismatched_used_denies_release_of_owned_frame(){
+        let mut s=state();assert!(s.claim_exact_frame_set(&[PAGE]));
+        s.used=0;assert!(!s.release_exact_frame_set(&[PAGE]));
+        assert!(s.allocated(0));s.used=1;
+        assert!(s.release_exact_frame_set(&[PAGE]));
+    }
+    #[test] fn kernel_p0_batch32_w1_789_claim_and_release_preflight_refuse_corrupt_accounting(){
+        let mut s=state();assert!(s.claim_exact_frame_set(&[PAGE]));
+        s.used=2;
+        assert!(!s.can_claim_frames(&[2*PAGE]));
+        assert!(!s.can_release_frames(&[PAGE]));
+        s.used=1;assert!(s.can_claim_frames(&[2*PAGE]));
+        assert!(s.can_release_frames(&[PAGE]));
     }
 }

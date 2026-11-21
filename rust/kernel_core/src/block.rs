@@ -239,18 +239,22 @@ pub fn read_sectors<D: BlockDevice>(
 /// media generation, two consistent observations, and a final postflight.
 /// Legacy devices returning None stay usable through read_sectors, but do
 /// not qualify for this revision-pinned publication API.
+/// Read only when the caller's previously selected device revision still owns
+/// both observations. No caller bytes escape on stale media, torn data or I/O.
+pub fn read_expected_generation_sectors<D:BlockDevice>(
+    device:&mut D,start:u64,expected:u64,out:&mut[u8]
+)->Result<(),BlockError>{
+    let capacity=device.sector_count();
+    if !media_snapshot_matches(device,capacity,Some(expected)){
+        return Err(BlockError::Io);
+    }
+    read_stable_sectors_verified(device,start,out,Some((capacity,expected)))
+}
 pub fn read_generation_pinned_sectors<D:BlockDevice>(
     device:&mut D,start:u64,out:&mut[u8]
 )->Result<u64,BlockError>{
     let Some(generation)=device.media_generation()else{return Err(BlockError::Io)};
-    let capacity=device.sector_count();
-    if !media_snapshot_matches(device,capacity,Some(generation)){
-        return Err(BlockError::Io);
-    }
-    // The selected revision must remain valid THROUGH the final publication
-    // check; rejecting only after an ordinary read copies output can expose
-    // stale media bytes to the caller.
-    read_stable_sectors_verified(device,start,out,Some((capacity,generation)))?;
+    read_expected_generation_sectors(device,start,generation,out)?;
     Ok(generation)
 }
 
@@ -3334,5 +3338,41 @@ mod kernel_p0_batch31_w4 {
         let mut d=disk(0);let mut out=[0x31;SECTOR_BYTES];
         assert_eq!(read_generation_pinned_sectors(&mut d,3,&mut out),Err(BlockError::OutOfRange));
         assert_eq!(d.reads,0);assert_eq!(out,[0x31;SECTOR_BYTES]);
+    }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch32_w4 {
+    use super::*;
+    struct Disk{generation:u64,reads:u32,swap_at:u32}
+    impl BlockDevice for Disk {
+        fn sector_count(&self)->u64{4}
+        fn media_generation(&self)->Option<u64>{Some(self.generation)}
+        fn read_sector(&mut self,_:u64,out:&mut[u8;SECTOR_BYTES])
+            ->Result<(),BlockError>{
+            self.reads+=1;out.fill(0x42);
+            if self.reads==self.swap_at{self.generation+=1;}
+            Ok(())
+        }
+        fn write_sector(&mut self,_:u64,_:&[u8;SECTOR_BYTES])
+            ->Result<(),BlockError>{Err(BlockError::ReadOnly)}
+    }
+    fn disk(swap_at:u32)->Disk{Disk{generation:7,reads:0,swap_at}}
+    #[test] fn kernel_p0_batch32_w4_797_expected_generation_publishes_stable_bytes(){
+        let mut d=disk(0);let mut out=[0;SECTOR_BYTES];
+        assert_eq!(read_expected_generation_sectors(&mut d,0,7,&mut out),Ok(()));
+        assert_eq!(out,[0x42;SECTOR_BYTES]);assert_eq!(d.reads,2);
+    }
+    #[test] fn kernel_p0_batch32_w4_798_stale_expected_generation_denied_preflight(){
+        let mut d=disk(0);let mut out=[0x31;SECTOR_BYTES];
+        assert_eq!(read_expected_generation_sectors(&mut d,0,6,&mut out),
+            Err(BlockError::Io));
+        assert_eq!(d.reads,0);assert_eq!(out,[0x31;SECTOR_BYTES]);
+    }
+    #[test] fn kernel_p0_batch32_w4_799_swap_during_second_pass_preserves_bytes(){
+        let mut d=disk(2);let mut out=[0x31;SECTOR_BYTES];
+        assert_eq!(read_expected_generation_sectors(&mut d,0,7,&mut out),
+            Err(BlockError::Io));
+        assert_eq!(d.reads,2);assert_eq!(out,[0x31;SECTOR_BYTES]);
     }
 }

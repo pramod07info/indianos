@@ -55,6 +55,14 @@ fn limine_pointer_aligned<T>(p:*const T)->bool {
     buffer_span_ok(p as usize,core::mem::size_of::<T>() as u64,
                    core::mem::align_of::<T>())
 }
+/// Preflight every pointer-table slot before indexing Limine-owned arrays.
+/// This only validates numeric bounds; firmware still owns real mappings.
+fn limine_pointer_table_valid<T>(p:*const *const T,count:u64,max:u64)->bool {
+    count!=0 && count<=max &&
+    count.checked_mul(core::mem::size_of::<*const T>() as u64)
+        .is_some_and(|bytes|buffer_span_ok(
+            p as usize,bytes,core::mem::align_of::<*const T>()))
+}
 fn valid_region(r:&Region)->bool{
     r.length!=0 && r.base.checked_add(r.length).is_some()
 }
@@ -86,8 +94,7 @@ fn validate_ranges(regions:&[Region]) -> bool {
 /// Preflight the complete Limine memory map before exporting its count.
 /// An invalid late entry must never let the PMM consume a partial map.
 fn validated_map_count(map:&MemoryMap)->Option<u64>{
-    if !limine_pointer_aligned(map.entries) ||
-       !(1..=4096).contains(&map.count){return None;}
+    if !limine_pointer_table_valid(map.entries,map.count,4096){return None;}
     let mut usable=false;
     for i in 0..map.count as usize{
         let item=unsafe{ptr::read_volatile(map.entries.add(i))};
@@ -201,7 +208,7 @@ pub unsafe extern "C" fn boot_initramfs_file(
 )->bool {
     if path.is_null() || data.is_null() || size.is_null() {return false}
     let Some(modules)=(unsafe {limine_response(boot_limine_modules())}) else {return false};
-    if modules.count!=1 || !limine_pointer_aligned(modules.modules){return false}
+    if !limine_pointer_table_valid(modules.modules,modules.count,1){return false}
     let file=unsafe {ptr::read_volatile(modules.modules)};
     if !limine_pointer_aligned(file){return false;}
     let Some(file)=(unsafe {file.as_ref()}) else {return false};
@@ -281,7 +288,7 @@ pub unsafe extern "C" fn boot_draw_status(){
     let Some(resp)=(unsafe {limine_response(boot_limine_framebuffers())}) else {
         log(b"IndianOS: framebuffer unavailable (serial mode)\n\0");return
     };
-    if resp.count==0 || !limine_pointer_aligned(resp.framebuffers){
+    if !limine_pointer_table_valid(resp.framebuffers,resp.count,4096){
         log(b"IndianOS: framebuffer unavailable (serial mode)\n\0");return
     }
     let first=unsafe {ptr::read_volatile(resp.framebuffers)};
@@ -780,5 +787,29 @@ mod kernel_p0_batch31_w6 {
         assert!(!borrowed_ramfile_span_ok(usize::MAX-15,64,usize::MAX as *const u8,1));
         assert!(!borrowed_ramfile_span_ok(0x1000,64,0x1040usize as *const u8,1));
         assert!(!borrowed_ramfile_span_ok(0x1000,64,0x1008usize as *const u8,64));
+    }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch32_w6 {
+    use super::*;
+    #[test] fn kernel_p0_batch32_w6_803_canonical_pointer_tables_admitted(){
+        assert!(limine_pointer_table_valid(0x1000usize as *const *const Region,8,4096));
+        assert!(limine_pointer_table_valid(
+            0xffff_8000_0000_1000usize as *const *const Framebuffer,2,4096));
+    }
+    #[test] fn kernel_p0_batch32_w6_804_zero_excessive_and_null_tables_denied(){
+        let p=0x1000usize as *const *const Region;
+        assert!(!limine_pointer_table_valid(p,0,4096));
+        assert!(!limine_pointer_table_valid(p,4097,4096));
+        assert!(!limine_pointer_table_valid(core::ptr::null::<*const Region>(),1,4096));
+        assert!(!limine_pointer_table_valid(p,u64::MAX,u64::MAX));
+    }
+    #[test] fn kernel_p0_batch32_w6_805_full_table_cannot_cross_canonical_gap(){
+        let p=0x0000_7fff_ffff_fff8usize as *const *const Region;
+        assert!(limine_pointer_table_valid(p,1,4096));
+        assert!(!limine_pointer_table_valid(p,2,4096));
+        assert!(!limine_pointer_table_valid(
+            0x1001usize as *const *const Region,1,4096));
     }
 }

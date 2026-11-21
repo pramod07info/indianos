@@ -734,8 +734,11 @@ pub(crate) fn ring3_frame_strict_execution(
     return false; // shared pages cannot silently override NX/guard rights
    }
   }
-  if segment.executable{
-   if let Some(end)=segment.virtual_address.checked_add(segment.memory_size){
+  if segment.executable {
+   // The strict path requires *file-backed* code, not merely executable
+   // reserved/zero-filled pages from p_memsz beyond p_filesz.
+   if segment.file_size==0{return false;}
+   if let Some(end)=segment.virtual_address.checked_add(segment.file_size){
     if (segment.virtual_address..end).contains(&rip){rip_executable=true;}
     if (segment.virtual_address..end).contains(&plan.entry){
      entry_executable=true;
@@ -1178,5 +1181,55 @@ mod kernel_p0_batch31_w3 {
         assert!(ring3_instruction_span_valid(&p,USER_MIN+PAGE_BYTES+8));
         p.entry=USER_MIN+PAGE_BYTES+32;
         assert!(!ring3_instruction_span_valid(&p,USER_MIN+80));
+    }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch32_w3 {
+    use super::*;
+    fn plan()->ProgramPlan {
+        let mut segments=[ProgramSegment::empty();MAX_SEGMENTS];
+        segments[0]=ProgramSegment{
+            virtual_address:USER_MIN+64,file_offset:0,file_size:16,memory_size:128,
+            page_begin:USER_MIN,page_end:USER_MIN+PAGE_BYTES,
+            writable:false,executable:true
+        };
+        ProgramPlan{entry:USER_MIN+64,
+            stack_begin:USER_TOP-STACK_BYTES,stack_end:USER_TOP,
+            guard_begin:USER_TOP-STACK_BYTES-PAGE_BYTES,
+            segment_count:1,segments}
+    }
+    fn frame(plan:&ProgramPlan,rip:u64)->[u64;20] {
+        let mut f=[0u64;20];
+        f[15]=rip;f[16]=0x2b;f[17]=0x2;
+        f[18]=plan.stack_end-8;f[19]=0x33;f
+    }
+    #[test] fn kernel_p0_batch32_w3_793_file_backed_elf_entry_and_resume_admitted(){
+        let p=plan();assert!(ring3_frame_strict_execution(
+            &frame(&p,USER_MIN+79),&p,false));
+    }
+    #[test] fn kernel_p0_batch32_w3_794_bss_tail_is_not_executable_resume(){
+        let p=plan();let f=frame(&p,USER_MIN+80);
+        assert!(ring3_frame_valid(&f,&p,false)); // legacy numeric staging
+        assert!(!ring3_frame_strict_execution(&f,&p,false));
+    }
+    #[test] fn kernel_p0_batch32_w3_795_entry_in_zero_fill_tail_denied(){
+        let mut p=plan();p.entry=USER_MIN+80;
+        assert!(!ring3_frame_strict_execution(
+            &frame(&p,USER_MIN+64),&p,false));
+    }
+    #[test] fn kernel_p0_batch32_w3_796_disjoint_file_backed_executable_sections(){
+        let mut p=plan();p.segment_count=2;
+        p.segments[1]=ProgramSegment{
+            virtual_address:USER_MIN+PAGE_BYTES+64,file_offset:128,
+            file_size:8,memory_size:32,
+            page_begin:USER_MIN+PAGE_BYTES,page_end:USER_MIN+2*PAGE_BYTES,
+            writable:false,executable:true
+        };
+        assert!(ring3_frame_strict_execution(
+            &frame(&p,USER_MIN+PAGE_BYTES+65),&p,false));
+        p.segments[1].file_size=0;
+        assert!(!ring3_frame_strict_execution(
+            &frame(&p,USER_MIN+PAGE_BYTES+65),&p,false));
     }
 }

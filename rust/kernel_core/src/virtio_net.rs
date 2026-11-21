@@ -338,7 +338,7 @@ fn r028_destination_for_protocol(dest:&[u8],local:[u8;6],proto:u16)->bool{
      dest[2]==0x5e && dest[3]&0x80==0)
 }
 fn ethernet_destination_allowed(frame:&[u8],local:[u8;6])->bool{
-    if !(14..=1514).contains(&frame.len()) ||
+    if !ethernet_ingress_valid(frame) ||
        local[0]&1!=0 || local.iter().all(|&x|x==0){
         return false;
     }
@@ -366,7 +366,10 @@ fn ethernet_egress_valid(frame:&[u8],local_mac:[u8;6])->bool{
      (dst[0]&1==0 && dst.iter().any(|&byte|byte!=0)))
 }
 fn tx_completion_length_valid(reported:usize,frame_length:usize)->bool {
-    (14..=1514).contains(&frame_length) && reported<=frame_length+10
+    // Virtio legacy TX may report zero, or the entire submitted frame.
+    // A nonzero partial length is not an authenticated complete packet.
+    (14..=1514).contains(&frame_length) &&
+    (reported==0 || reported==frame_length+10)
 }
 impl EthernetDevice for VirtioNet{
     fn mac(&self)->[u8;6]{self.mac}
@@ -923,5 +926,38 @@ mod kernel_p0_batch31_w5 {
         assert!(!ethernet_destination_allowed(&peer,LOCAL));
         assert!(ethernet_egress_valid(&peer,LOCAL));
         assert!(ethernet_destination_allowed(&frame(0x0800,LOCAL),LOCAL));
+    }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch32_w5 {
+    use super::*;
+    const LOCAL:[u8;6]=[2,1,2,3,4,5];
+    fn packet(proto:u16,dest:[u8;6])->[u8;60]{
+        let mut f=[0u8;60];
+        f[..6].copy_from_slice(&dest);
+        f[6..12].copy_from_slice(&LOCAL);
+        f[12..14].copy_from_slice(&proto.to_be_bytes());f
+    }
+    #[test] fn kernel_p0_batch32_w5_800_destination_filter_checks_source_integrity(){
+        let mut f=packet(0x0800,LOCAL);
+        assert!(ethernet_destination_allowed(&f,LOCAL));
+        f[6..12].fill(0);
+        assert!(!ethernet_destination_allowed(&f,LOCAL));
+        f[6]=1;
+        assert!(!ethernet_destination_allowed(&f,LOCAL));
+    }
+    #[test] fn kernel_p0_batch32_w5_801_multicast_ipv4_not_arp(){
+        let dest=[1,0,0x5e,0,0,9];
+        assert!(ethernet_destination_allowed(&packet(0x0800,dest),LOCAL));
+        assert!(!ethernet_destination_allowed(&packet(0x0806,dest),LOCAL));
+        assert!(!ethernet_destination_allowed(&packet(0x8100,LOCAL),LOCAL));
+    }
+    #[test] fn kernel_p0_batch32_w5_802_partial_nonzero_tx_completion_rejected(){
+        assert!(tx_completion_length_valid(0,60));
+        assert!(tx_completion_length_valid(70,60));
+        assert!(!tx_completion_length_valid(10,60));
+        assert!(!tx_completion_length_valid(69,60));
+        assert!(!tx_completion_length_valid(71,60));
     }
 }
