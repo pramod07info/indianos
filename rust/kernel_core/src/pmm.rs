@@ -185,12 +185,16 @@ impl State {
             return false;
         }
         let mut offset=0u64;
-        for span in &self.spans[..self.count] {
+        for (index,span) in self.spans[..self.count].iter().enumerate() {
             if span.count==0 || span.bit_offset!=offset ||
-               span.base<PAGE || span.base%PAGE!=0 ||
-               span.count.checked_mul(PAGE)
-                   .and_then(|len|span.base.checked_add(len)).is_none() {
-                return false;
+               span.base<PAGE || span.base%PAGE!=0 {return false;}
+            let Some(physical_end)=span.count.checked_mul(PAGE)
+                .and_then(|len|span.base.checked_add(len))else{return false;};
+            // Separate bitmap bits must never alias the same physical frame.
+            for previous in &self.spans[..index]{
+                let Some(previous_end)=previous.count.checked_mul(PAGE)
+                    .and_then(|len|previous.base.checked_add(len))else{return false;};
+                if span.base<previous_end && previous.base<physical_end{return false;}
             }
             let Some(end)=offset.checked_add(span.count)else{return false;};
             if end>self.total{return false;}
@@ -2017,4 +2021,34 @@ mod kernel_p0_batch27_w1_tests {
         s.count=1;s.spans[0]=Span{base:PAGE,count:u64::MAX,bit_offset:0};
         assert_eq!(s.physical_at(u64::MAX),None);
     }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch28_w1 {
+ use super::*;
+ fn state()->State {
+  let mut s=State::empty();s.initialized=true;s.count=2;s.total=4;
+  s.spans[0]=Span{base:PAGE,count:2,bit_offset:0};
+  s.spans[1]=Span{base:10*PAGE,count:2,bit_offset:2};s
+ }
+ #[test]fn kernel_p0_batch28_w1_701_disjoint_spans_allocate_unique_pages(){
+  let mut s=state();assert_eq!(s.claim_single_frame(),Some(PAGE));
+  assert_eq!(s.claim_single_frame(),Some(2*PAGE));
+  assert_eq!(s.claim_single_frame(),Some(10*PAGE));assert_eq!(s.used,3);
+ }
+ #[test]fn kernel_p0_batch28_w1_702_overlap_rejected_without_allocation(){
+  let mut s=state();s.spans[1].base=2*PAGE;
+  assert!(!s.single_frame_geometry_valid());
+  assert_eq!(s.claim_single_frame(),None);assert_eq!(s.used,0);
+ }
+ #[test]fn kernel_p0_batch28_w1_703_adjacent_physical_spans_still_valid(){
+  let mut s=state();s.spans[1].base=3*PAGE;
+  assert!(s.single_frame_geometry_valid());
+  for page in 1..=4{assert_eq!(s.claim_single_frame(),Some(page*PAGE));}
+ }
+ #[test]fn kernel_p0_batch28_w1_704_reordered_overlap_keeps_bitmap_unchanged(){
+  let mut s=state();s.spans[0].base=10*PAGE;s.spans[1].base=11*PAGE;
+  assert_eq!(s.claim_single_frame(),None);
+  assert_eq!(s.bitmap[0],0);assert_eq!(s.cursor,0);
+ }
 }

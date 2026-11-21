@@ -755,12 +755,21 @@ mod r118_monotonic_hardware_tick_tests{
 fn preemption_capture_budget(delivered:u64,captured:u64,running:bool)->bool {
     running && captured<delivered
 }
+// Session fencing denies capture when a timer was stopped and rearmed,
+// even when its source ID remains the same.
+fn preemption_session_valid(before:u64,after:u64,
+    delivered:u64,captured:u64,running:bool)->bool {
+    before!=0 && before==after &&
+    preemption_capture_budget(delivered,captured,running)
+}
 pub fn xapic_record_preemption(){
-    // The APIC EOI is recorded before task capture. A software path may not
-    // mint more validated user preemptions than real delivered interrupts.
+    // APIC EOI is recorded before user frame capture; require both a live
+    // delivery budget and the same timer session at publication.
+    let epoch=MONOTONIC_SESSION_EPOCH.load(Ordering::Acquire);
     let delivered=XAPIC_IRQ_TICKS.load(Ordering::Acquire);
     XAPIC_PREEMPTIONS.fetch_update(Ordering::AcqRel,Ordering::Acquire,|v|{
-        if preemption_capture_budget(
+        if preemption_session_valid(epoch,
+            MONOTONIC_SESSION_EPOCH.load(Ordering::Acquire),
             delivered,v,XAPIC_TIMER_RUNNING.load(Ordering::Acquire)
         ){v.checked_add(1)}else{None}
     }).ok();
@@ -1418,4 +1427,23 @@ mod kernel_p0_batch27_w2_tests {
         assert!(xapic_preemption_evidence(3,3));
         assert!(!xapic_preemption_evidence(3,4));
     }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch28_w2 {
+ use super::*;
+ #[test]fn kernel_p0_batch28_w2_705_live_epoch_irq_budget_accepts_capture(){
+  assert!(preemption_session_valid(3,3,1,0,true));
+  assert!(preemption_session_valid(3,3,5,4,true));
+ }
+ #[test]fn kernel_p0_batch28_w2_706_rearm_aba_does_not_authorize_capture(){
+  assert!(!preemption_session_valid(3,4,10,0,true));
+  assert!(!preemption_session_valid(4,3,10,0,true));
+ }
+ #[test]fn kernel_p0_batch28_w2_707_stopped_zero_and_exhausted_denied(){
+  assert!(!preemption_session_valid(0,0,1,0,true));
+  assert!(!preemption_session_valid(1,1,1,0,false));
+  assert!(!preemption_session_valid(1,1,1,1,true));
+  assert!(!preemption_session_valid(1,1,0,0,true));
+ }
 }

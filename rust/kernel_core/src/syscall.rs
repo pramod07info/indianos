@@ -79,7 +79,14 @@ fn user_segment_layout_valid(plan:&ProgramPlan)->bool {
         if seg.page_begin<USER_MIN || seg.page_end>USER_TOP ||
            seg.page_begin>=seg.page_end ||
            seg.page_begin%PAGE_BYTES!=0 || seg.page_end%PAGE_BYTES!=0 ||
-           (seg.page_begin<plan.stack_end && plan.stack_begin<seg.page_end) {
+           (seg.page_begin<plan.stack_end && plan.stack_begin<seg.page_end) ||
+           // Loaded ELF bytes may not escape the segment's actual owned pages.
+           // Empty test descriptors retain legacy numeric ABI compatibility.
+           seg.file_size>seg.memory_size ||
+           (seg.memory_size!=0 &&
+             (seg.virtual_address<seg.page_begin ||
+              seg.virtual_address.checked_add(seg.memory_size)
+                .is_none_or(|end|end>seg.page_end))) {
             return false;
         }
         // An ELF descriptor may span a protected numeric guard while
@@ -1041,4 +1048,39 @@ mod kernel_p0_batch26_w3_tests {
         assert!(!ring3_instruction_span_valid(&p,p.guard_begin));
         assert!(user_range(&p,p.stack_begin,8,true));
     }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch28_w3 {
+ use super::*;
+ fn plan()->ProgramPlan{
+  let mut segments=[ProgramSegment::empty();MAX_SEGMENTS];
+  segments[0]=ProgramSegment{
+   virtual_address:USER_MIN+16,file_offset:0,file_size:16,memory_size:32,
+   page_begin:USER_MIN,page_end:USER_MIN+2*PAGE_BYTES,
+   writable:false,executable:true
+  };
+  ProgramPlan{entry:USER_MIN+16,
+   stack_begin:USER_TOP-STACK_BYTES,stack_end:USER_TOP,
+   guard_begin:USER_TOP-STACK_BYTES-PAGE_BYTES,segment_count:1,segments}
+ }
+ #[test]fn kernel_p0_batch28_w3_708_valid_elf_read_only_code_retained(){
+  let p=plan();assert!(user_segment_layout_valid(&p));
+  assert!(user_range(&p,USER_MIN+16,16,false));
+ }
+ #[test]fn kernel_p0_batch28_w3_709_file_bytes_exceed_memory_denied(){
+  let mut p=plan();p.segments[0].file_size=33;
+  assert!(!user_segment_layout_valid(&p));
+  assert!(!user_range(&p,USER_MIN+16,16,false));
+ }
+ #[test]fn kernel_p0_batch28_w3_710_virtual_address_below_owned_page_denied(){
+  let mut p=plan();p.segments[0].virtual_address=USER_MIN-16;
+  assert!(!user_segment_layout_valid(&p));
+ }
+ #[test]fn kernel_p0_batch28_w3_711_segment_memory_escaping_page_denied(){
+  let mut p=plan();
+  p.segments[0].virtual_address=USER_MIN+2*PAGE_BYTES-16;
+  p.segments[0].memory_size=32;
+  assert!(!user_segment_layout_valid(&p));
+ }
 }

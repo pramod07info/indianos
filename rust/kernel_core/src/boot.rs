@@ -323,10 +323,13 @@ pub(crate) struct ConsoleFramebuffer {
 }
 #[cfg(any(feature="test-irq-keyboard",feature="test-r029-desktop",feature="normal-desktop"))]
 pub(crate) fn console_framebuffer()->Option<ConsoleFramebuffer>{
-    let resp=unsafe{boot_limine_framebuffers().as_ref()}?;
-    if resp.count==0||resp.framebuffers.is_null(){return None;}
+    let response=unsafe{boot_limine_framebuffers()};
+    if !limine_pointer_aligned(response){return None;}
+    let resp=unsafe{&*response};
+    if resp.count==0||!limine_pointer_aligned(resp.framebuffers){return None;}
     let first=unsafe{ptr::read_volatile(resp.framebuffers)};
-    let f=unsafe{first.as_ref()}?;
+    if !limine_pointer_aligned(first){return None;}
+    let f=unsafe{&*first};
     if !framebuffer_ok(f){return None;}
     Some(ConsoleFramebuffer{
         address:f.address,
@@ -337,10 +340,13 @@ pub(crate) fn console_framebuffer()->Option<ConsoleFramebuffer>{
 
 #[cfg(any(feature="test-r029-desktop",feature="normal-desktop"))]
 pub(crate) fn desktop_rgb(r:u8,g:u8,b:u8)->Option<u32>{
-    let resp=unsafe{boot_limine_framebuffers().as_ref()}?;
-    if resp.count==0||resp.framebuffers.is_null(){return None;}
+    let response=unsafe{boot_limine_framebuffers()};
+    if !limine_pointer_aligned(response){return None;}
+    let resp=unsafe{&*response};
+    if resp.count==0||!limine_pointer_aligned(resp.framebuffers){return None;}
     let first=unsafe{ptr::read_volatile(resp.framebuffers)};
-    let framebuffer=unsafe{first.as_ref()}?;
+    if !limine_pointer_aligned(first){return None;}
+    let framebuffer=unsafe{&*first};
     if !framebuffer_ok(framebuffer){return None;}
     Some(pixel(framebuffer,r,g,b))
 }
@@ -707,4 +713,23 @@ mod kernel_p0_batch27_w6_tests {
         assert!(!two(Region{base:0x1000,length:0x1000,kind:0},
                      Region{base:(1u64<<52)-4096,length:4096,kind:0}));
     }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch28_w6 {
+ use super::*;
+ #[test]fn kernel_p0_batch28_w6_718_aligned_response_pointer_valid(){
+  let response=core::mem::MaybeUninit::<Framebuffers>::uninit();
+  assert!(limine_pointer_aligned(response.as_ptr()));
+ }
+ #[test]fn kernel_p0_batch28_w6_719_misaligned_descriptor_pointer_refused(){
+  let f=core::mem::MaybeUninit::<Framebuffer>::uninit();
+  let p=f.as_ptr().cast::<u8>().wrapping_add(1).cast::<Framebuffer>();
+  assert!(!limine_pointer_aligned(p));
+ }
+ #[test]fn kernel_p0_batch28_w6_720_null_response_table_frame_refused(){
+  assert!(!limine_pointer_aligned(core::ptr::null::<Framebuffers>()));
+  assert!(!limine_pointer_aligned(core::ptr::null::<*const Framebuffer>()));
+  assert!(!limine_pointer_aligned(core::ptr::null::<Framebuffer>()));
+ }
 }

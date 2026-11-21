@@ -709,3 +709,61 @@ jobs:
           test "$count" -eq "$EXPECTED_COUNT"
           cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$FILTER"
           cargo check --locked --offline --manifest-path rust/kernel_core/Cargo.toml --no-default-features --target x86_64-unknown-none --features "$FEATURES"
+
+  p0-batch28-implemented:
+    name: Batch28 P0-701..720 ${{ matrix.workstation }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - workstation: W1-PMM-physical-ownership
+            filter: kernel_p0_batch28_w1
+            expected: 4
+            features: normal-desktop
+          - workstation: W2-preemption-session
+            filter: kernel_p0_batch28_w2
+            expected: 3
+            features: normal-desktop
+          - workstation: W3-ELF-memory-ownership
+            filter: kernel_p0_batch28_w3
+            expected: 4
+            features: normal-desktop,preempt
+          - workstation: W4-read-buffer-failure-safety
+            filter: kernel_p0_batch28_w4
+            expected: 3
+            features: test-r031-vfs
+          - workstation: W5-Ethernet-recipient
+            filter: kernel_p0_batch28_w5
+            expected: 3
+            features: test-r028-network
+          - workstation: W6-framebuffer-pointer-admission
+            filter: kernel_p0_batch28_w6
+            expected: 3
+            features: normal-desktop
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify exact PR commit
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: python3 tools/verify_ci_sha.py --expected "$EXPECTED_SHA" --observed "$(git rev-parse HEAD)"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
+      - name: Run 20 Rust regressions and freestanding kernel check
+        env:
+          FILTER: ${{ matrix.filter }}
+          FEATURES: ${{ matrix.features }}
+          EXPECTED_COUNT: ${{ matrix.expected }}
+        run: |
+          set -euo pipefail
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$FILTER" -- --list > /tmp/batch28-tests.txt
+          count=$(grep -c "$FILTER" /tmp/batch28-tests.txt || true)
+          echo "Found $count; expected $EXPECTED_COUNT"
+          test "$count" -eq "$EXPECTED_COUNT"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$FILTER"
+          cargo check --locked --offline --manifest-path rust/kernel_core/Cargo.toml --no-default-features --target x86_64-unknown-none --features "$FEATURES"

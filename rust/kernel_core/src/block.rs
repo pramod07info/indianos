@@ -210,6 +210,8 @@ pub fn read_sectors<D: BlockDevice>(
     let count = (out.len() / SECTOR_BYTES) as u64;
     let capacity = device.sector_count();
     let generation=device.media_generation();
+    // Preserve caller bytes on preflight rejection; a mid-transfer device
+    // fault still scrubs all output to prevent mixed-media exposure.
     check_range(capacity, start, count)?;
     // Reject mid-transfer geometry changes instead of silently combining
     // data from different devices. A failed transfer clears all output.
@@ -3180,4 +3182,34 @@ mod kernel_p0_batch27_w4_tests {
         assert_eq!(write_sectors(&mut d,1,&data),Err(BlockError::OutOfRange));
         assert_eq!(d.writes,0);
     }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch28_w4 {
+ use super::*;
+ struct Disk{reads:u32}
+ impl BlockDevice for Disk {
+  fn sector_count(&self)->u64{1}
+  fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   check_range(1,lba,1)?;self.reads+=1;out.fill(0x5a);Ok(())
+  }
+  fn write_sector(&mut self,_:u64,_:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   Err(BlockError::ReadOnly)
+  }
+ }
+ #[test]fn kernel_p0_batch28_w4_712_bad_read_size_preserves_caller_buffer(){
+  let mut disk=Disk{reads:0};let mut out=[0xee;SECTOR_BYTES+1];
+  assert_eq!(read_sectors(&mut disk,0,&mut out),Err(BlockError::OutOfRange));
+  assert!(out.iter().all(|&v|v==0xee));assert_eq!(disk.reads,0);
+ }
+ #[test]fn kernel_p0_batch28_w4_713_out_of_range_read_preserves_caller_buffer(){
+  let mut disk=Disk{reads:0};let mut out=[0xee;SECTOR_BYTES];
+  assert_eq!(read_sectors(&mut disk,1,&mut out),Err(BlockError::OutOfRange));
+  assert!(out.iter().all(|&v|v==0xee));assert_eq!(disk.reads,0);
+ }
+ #[test]fn kernel_p0_batch28_w4_714_valid_read_returns_device_payload(){
+  let mut disk=Disk{reads:0};let mut out=[0xee;SECTOR_BYTES];
+  assert_eq!(read_sectors(&mut disk,0,&mut out),Ok(()));
+  assert!(out.iter().all(|&v|v==0x5a));assert_eq!(disk.reads,1);
+ }
 }

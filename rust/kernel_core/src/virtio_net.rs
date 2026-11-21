@@ -319,7 +319,9 @@ fn unsupported_vlan_tag(ethertype:u16)->bool {
 fn ethernet_ingress_valid(frame:&[u8])->bool{
     if !(14..=1514).contains(&frame.len()){return false;}
     let source=&frame[6..12];
-    if source[0]&1!=0 || source.iter().all(|&x|x==0){return false;}
+    // A null destination can never be an Ethernet-II recipient.
+    if frame[..6].iter().all(|&x|x==0) ||
+       source[0]&1!=0 || source.iter().all(|&x|x==0){return false;}
     let ethertype=u16::from_be_bytes([frame[12],frame[13]]);
     ethertype>=0x0600 && !unsupported_vlan_tag(ethertype)
 }
@@ -804,4 +806,31 @@ mod kernel_p0_batch27_w5_tests {
             assert!(!ethernet_egress_valid(&f,LOCAL));
         }
     }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch28_w5 {
+ use super::*;
+ fn frame()->[u8;60]{
+  let mut f=[0u8;60];f[..6].copy_from_slice(&[0x02,1,2,3,4,5]);
+  f[6..12].copy_from_slice(&[0x02,9,8,7,6,5]);
+  f[12..14].copy_from_slice(&[0x08,0x00]);f
+ }
+ #[test]fn kernel_p0_batch28_w5_715_null_destination_rejected_at_ingress(){
+  let mut f=frame();f[..6].fill(0);
+  assert!(!ethernet_ingress_valid(&f));
+  assert!(!ethernet_destination_allowed(&f,[0x02,1,2,3,4,5]));
+ }
+ #[test]fn kernel_p0_batch28_w5_716_local_unicast_and_broadcast_retained(){
+  let local=[0x02,1,2,3,4,5];let mut f=frame();
+  assert!(ethernet_ingress_valid(&f));
+  assert!(ethernet_destination_allowed(&f,local));
+  f[..6].fill(0xff);
+  assert!(ethernet_ingress_valid(&f));
+  assert!(ethernet_destination_allowed(&f,local));
+ }
+ #[test]fn kernel_p0_batch28_w5_717_foreign_unicast_dropped(){
+  let f=frame();assert!(ethernet_ingress_valid(&f));
+  assert!(!ethernet_destination_allowed(&f,[0x02,5,4,3,2,1]));
+ }
 }
