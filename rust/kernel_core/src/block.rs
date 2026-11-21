@@ -1454,15 +1454,16 @@ mod kernel_p0_next_w4_storage_tests{
 /// through a capacity-pinned immutable logical window; mismatch, transport
 /// failure or media resize retires this view even if geometry later returns.
 pub struct StableReadOnlyWindow<'a,D:BlockDevice>{
- device:&'a mut D,capacity:u64,invalidated:bool,
+ device:&'a mut D,capacity:u64,generation:Option<u64>,invalidated:bool,
 }
 impl<'a,D:BlockDevice> StableReadOnlyWindow<'a,D>{
  pub fn new(device:&'a mut D)->Result<Self,BlockError>{
   let capacity=device.sector_count();
-  if capacity==0||capacity!=device.sector_count(){
+  let generation=device.media_generation();
+  if capacity==0||!media_snapshot_matches(device,capacity,generation){
    return Err(BlockError::Io);
   }
-  Ok(Self{device,capacity,invalidated:false})
+  Ok(Self{device,capacity,generation,invalidated:false})
  }
  pub fn is_retired(&self)->bool{self.invalidated}
 }
@@ -1472,16 +1473,16 @@ impl<D:BlockDevice> BlockDevice for StableReadOnlyWindow<'_,D>{
   ->Result<(),BlockError>{
   if self.invalidated{return Err(BlockError::Io);}
   check_range(self.capacity,lba,1)?;
-  if self.device.sector_count()!=self.capacity{
+  if !media_snapshot_matches(self.device,self.capacity,self.generation){
    self.invalidated=true;return Err(BlockError::Io);
   }
   let mut first=[0u8;SECTOR_BYTES];
   let mut second=[0u8;SECTOR_BYTES];
   let observed=(||{
    self.device.read_sector(lba,&mut first)?;
-   if self.device.sector_count()!=self.capacity{return Err(BlockError::Io);}
+   if !media_snapshot_matches(self.device,self.capacity,self.generation){return Err(BlockError::Io);}
    self.device.read_sector(lba,&mut second)?;
-   if self.device.sector_count()!=self.capacity{return Err(BlockError::Io);}
+   if !media_snapshot_matches(self.device,self.capacity,self.generation){return Err(BlockError::Io);}
    if first!=second{return Err(BlockError::Io);}
    Ok(())
   })();
@@ -3212,4 +3213,23 @@ mod kernel_p0_batch28_w4 {
   assert_eq!(read_sectors(&mut disk,0,&mut out),Ok(()));
   assert!(out.iter().all(|&v|v==0x5a));assert_eq!(disk.reads,1);
  }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch29_w4{
+ use super::*;
+ struct Disk{generation:u64,reads:u32,swap_at:u32}
+ impl BlockDevice for Disk{
+  fn sector_count(&self)->u64{2}
+  fn media_generation(&self)->Option<u64>{Some(self.generation)}
+  fn read_sector(&mut self,_:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+   self.reads+=1;out.fill(0x5a);if self.reads==self.swap_at{self.generation+=1;}Ok(())
+  }
+  fn write_sector(&mut self,_:u64,_:&[u8;SECTOR_BYTES])->Result<(),BlockError>{Err(BlockError::ReadOnly)}
+ }
+ fn disk()->Disk{Disk{generation:7,reads:0,swap_at:0}}
+ #[test] fn kernel_p0_batch29_w4_734_stable_media_read(){let mut d=disk();let mut w=StableReadOnlyWindow::new(&mut d).unwrap();let mut out=[0xee;SECTOR_BYTES];assert_eq!(w.read_sector(0,&mut out),Ok(()));assert_eq!(out,[0x5a;SECTOR_BYTES]);assert_eq!(w.device.reads,2);}
+ #[test] fn kernel_p0_batch29_w4_735_swap_before_io_revokes(){let mut d=disk();let mut w=StableReadOnlyWindow::new(&mut d).unwrap();w.device.generation=8;let mut out=[0xee;SECTOR_BYTES];assert_eq!(w.read_sector(0,&mut out),Err(BlockError::Io));assert_eq!(out,[0xee;SECTOR_BYTES]);assert!(w.is_retired());assert_eq!(w.device.reads,0);}
+ #[test] fn kernel_p0_batch29_w4_736_mid_read_swap_revokes(){let mut d=disk();d.swap_at=1;let mut w=StableReadOnlyWindow::new(&mut d).unwrap();let mut out=[0xee;SECTOR_BYTES];assert_eq!(w.read_sector(0,&mut out),Err(BlockError::Io));assert_eq!(out,[0xee;SECTOR_BYTES]);assert!(w.is_retired());assert_eq!(w.device.reads,1);}
+ #[test] fn kernel_p0_batch29_w4_737_aba_does_not_unretire(){let mut d=disk();let mut w=StableReadOnlyWindow::new(&mut d).unwrap();w.device.generation=8;let mut out=[0xcc;SECTOR_BYTES];assert_eq!(w.read_sector(0,&mut out),Err(BlockError::Io));w.device.generation=7;assert_eq!(w.read_sector(0,&mut out),Err(BlockError::Io));assert_eq!(out,[0xcc;SECTOR_BYTES]);}
 }

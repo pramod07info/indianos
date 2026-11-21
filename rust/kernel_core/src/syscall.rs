@@ -83,6 +83,7 @@ fn user_segment_layout_valid(plan:&ProgramPlan)->bool {
            // Loaded ELF bytes may not escape the segment's actual owned pages.
            // Empty test descriptors retain legacy numeric ABI compatibility.
            seg.file_size>seg.memory_size ||
+           seg.file_offset.checked_add(seg.file_size).is_none() ||
            (seg.memory_size!=0 &&
              (seg.virtual_address<seg.page_begin ||
               seg.virtual_address.checked_add(seg.memory_size)
@@ -711,6 +712,7 @@ pub(crate) fn ring3_frame_strict_execution(
      segment.page_begin%PAGE_BYTES!=0||segment.page_end%PAGE_BYTES!=0||
      segment.virtual_address<segment.page_begin||
      segment.memory_size==0||segment.file_size>segment.memory_size||
+     segment.file_offset.checked_add(segment.file_size).is_none()||
      segment.virtual_address.checked_add(segment.memory_size)
         .is_none_or(|end|end>segment.page_end)||
      (segment.executable&&segment.writable)||
@@ -1083,4 +1085,20 @@ mod kernel_p0_batch28_w3 {
   p.segments[0].memory_size=32;
   assert!(!user_segment_layout_valid(&p));
  }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch29_w3{
+ use super::*;
+ fn plan()->ProgramPlan{
+  let mut segments=[ProgramSegment::empty();MAX_SEGMENTS];
+  segments[0]=ProgramSegment{virtual_address:USER_MIN+16,file_offset:32,file_size:16,memory_size:32,
+   page_begin:USER_MIN,page_end:USER_MIN+PAGE_BYTES,writable:false,executable:true};
+  ProgramPlan{entry:USER_MIN+16,stack_begin:USER_TOP-STACK_BYTES,stack_end:USER_TOP,
+   guard_begin:USER_TOP-STACK_BYTES-PAGE_BYTES,segment_count:1,segments}
+ }
+ #[test] fn kernel_p0_batch29_w3_730_valid_elf(){let p=plan();assert!(user_segment_layout_valid(&p));assert!(ring3_instruction_span_valid(&p,USER_MIN+16));}
+ #[test] fn kernel_p0_batch29_w3_731_elf_offset_overflow(){let mut p=plan();p.segments[0].file_offset=u64::MAX-15;assert!(!user_segment_layout_valid(&p));}
+ #[test] fn kernel_p0_batch29_w3_732_exact_arithmetic_boundary(){let mut p=plan();p.segments[0].file_offset=u64::MAX-16;assert!(user_segment_layout_valid(&p));}
+ #[test] fn kernel_p0_batch29_w3_733_malformed_elf_denies_user_read_iret(){let mut p=plan();p.segments[0].file_offset=u64::MAX;assert!(!user_range(&p,USER_MIN+16,1,false));assert!(!ring3_instruction_span_valid(&p,USER_MIN+16));}
 }

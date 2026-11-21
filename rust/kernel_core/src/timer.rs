@@ -762,15 +762,21 @@ fn preemption_session_valid(before:u64,after:u64,
     before!=0 && before==after &&
     preemption_capture_budget(delivered,captured,running)
 }
+// Reject IRQ count rewind while a live user preemption is published.
+fn preemption_delivery_receipt_valid(a:u64,b:u64,first:u64,last:u64,
+    captured:u64,running:bool)->bool{
+    last>=first && preemption_session_valid(a,b,first,captured,running)
+}
 pub fn xapic_record_preemption(){
     // APIC EOI is recorded before user frame capture; require both a live
     // delivery budget and the same timer session at publication.
     let epoch=MONOTONIC_SESSION_EPOCH.load(Ordering::Acquire);
     let delivered=XAPIC_IRQ_TICKS.load(Ordering::Acquire);
     XAPIC_PREEMPTIONS.fetch_update(Ordering::AcqRel,Ordering::Acquire,|v|{
-        if preemption_session_valid(epoch,
-            MONOTONIC_SESSION_EPOCH.load(Ordering::Acquire),
-            delivered,v,XAPIC_TIMER_RUNNING.load(Ordering::Acquire)
+        if preemption_delivery_receipt_valid(epoch,
+            MONOTONIC_SESSION_EPOCH.load(Ordering::Acquire),delivered,
+            XAPIC_IRQ_TICKS.load(Ordering::Acquire),v,
+            XAPIC_TIMER_RUNNING.load(Ordering::Acquire)
         ){v.checked_add(1)}else{None}
     }).ok();
 }
@@ -1445,5 +1451,18 @@ mod kernel_p0_batch28_w2 {
   assert!(!preemption_session_valid(1,1,1,0,false));
   assert!(!preemption_session_valid(1,1,1,1,true));
   assert!(!preemption_session_valid(1,1,0,0,true));
+ }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch29_w2{
+ use super::*;
+ #[test] fn kernel_p0_batch29_w2_726_valid_receipt(){assert!(preemption_delivery_receipt_valid(4,4,5,5,4,true));}
+ #[test] fn kernel_p0_batch29_w2_727_new_irq_keeps_receipt(){assert!(preemption_delivery_receipt_valid(4,4,5,6,4,true));}
+ #[test] fn kernel_p0_batch29_w2_728_counter_rewind_denied(){assert!(!preemption_delivery_receipt_valid(4,4,6,5,4,true));}
+ #[test] fn kernel_p0_batch29_w2_729_stale_or_exhausted_denied(){
+  assert!(!preemption_delivery_receipt_valid(4,5,5,5,0,true));
+  assert!(!preemption_delivery_receipt_valid(4,4,5,5,0,false));
+  assert!(!preemption_delivery_receipt_valid(4,4,5,5,5,true));
  }
 }

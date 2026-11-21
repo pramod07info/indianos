@@ -313,6 +313,8 @@ fn rx_offload_header_valid(header:&[u8])->bool {
 }
 /// The R028 stack accepts untagged Ethernet-II ingress only. An invalid
 /// source address or 802.3 length field must not reach higher-level parsers.
+// R028 implements Ethernet-II IPv4 and ARP; do not route other protocols.
+fn supported_r028_ethertype(p:u16)->bool{matches!(p,0x0800|0x0806)}
 fn unsupported_vlan_tag(ethertype:u16)->bool {
     matches!(ethertype,0x8100|0x88a8|0x9100)
 }
@@ -323,7 +325,7 @@ fn ethernet_ingress_valid(frame:&[u8])->bool{
     if frame[..6].iter().all(|&x|x==0) ||
        source[0]&1!=0 || source.iter().all(|&x|x==0){return false;}
     let ethertype=u16::from_be_bytes([frame[12],frame[13]]);
-    ethertype>=0x0600 && !unsupported_vlan_tag(ethertype)
+    supported_r028_ethertype(ethertype) && !unsupported_vlan_tag(ethertype)
 }
 /// Filter foreign unicast before returning a frame to the guest stack.
 /// Broadcast and multicast remain eligible for ARP/DHCP discovery; the
@@ -348,7 +350,7 @@ fn ethernet_egress_valid(frame:&[u8],local_mac:[u8;6])->bool{
     let dst=&frame[..6];
     let protocol=u16::from_be_bytes([frame[12],frame[13]]);
     src==local_mac.as_slice() && !dst.iter().all(|&x|x==0) &&
-    protocol>=0x0600 && !unsupported_vlan_tag(protocol)
+    supported_r028_ethertype(protocol) && !unsupported_vlan_tag(protocol)
 }
 fn tx_completion_length_valid(reported:usize,frame_length:usize)->bool {
     (14..=1514).contains(&frame_length) && reported<=frame_length+10
@@ -833,4 +835,15 @@ mod kernel_p0_batch28_w5 {
   let f=frame();assert!(ethernet_ingress_valid(&f));
   assert!(!ethernet_destination_allowed(&f,[0x02,5,4,3,2,1]));
  }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch29_w5{
+ use super::*;
+ const MAC:[u8;6]=[2,1,2,3,4,5];
+ fn frame(proto:u16)->[u8;60]{let mut f=[0u8;60];f[..6].copy_from_slice(&MAC);f[6..12].copy_from_slice(&MAC);f[12..14].copy_from_slice(&proto.to_be_bytes());f}
+ #[test] fn kernel_p0_batch29_w5_738_ipv4_arp_valid(){for p in [0x0800,0x0806]{let f=frame(p);assert!(ethernet_ingress_valid(&f));assert!(ethernet_egress_valid(&f,MAC));}}
+ #[test] fn kernel_p0_batch29_w5_739_ipv6_ingress_rejected(){assert!(!ethernet_ingress_valid(&frame(0x86dd)));}
+ #[test] fn kernel_p0_batch29_w5_740_unknown_egress_rejected(){for p in [0x86dd,0x88cc,0x88b5]{assert!(!ethernet_egress_valid(&frame(p),MAC));}}
+ #[test] fn kernel_p0_batch29_w5_741_vlan_8023_rejected(){for p in [1,0x05ff,0x8100,0x88a8,0x9100]{let f=frame(p);assert!(!ethernet_ingress_valid(&f));assert!(!ethernet_egress_valid(&f,MAC));}}
 }

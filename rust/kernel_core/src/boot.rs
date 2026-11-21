@@ -49,7 +49,9 @@ unsafe fn memory_map() -> Option<&'static MemoryMap> {
 /// Reject misaligned Limine pointers before constructing Rust references
 /// or issuing aligned volatile loads. Firmware must also guarantee validity.
 fn limine_pointer_aligned<T>(p:*const T)->bool {
-    !p.is_null() && (p as usize)%core::mem::align_of::<T>()==0
+    !p.is_null() &&
+    (((p as usize as u64)>>47)==0 || ((p as usize as u64)>>47)==0x1ffff) &&
+    (p as usize)%core::mem::align_of::<T>()==0
 }
 fn valid_region(r:&Region)->bool{
     r.length!=0 && r.base.checked_add(r.length).is_some()
@@ -733,3 +735,11 @@ mod kernel_p0_batch28_w6 {
   assert!(!limine_pointer_aligned(core::ptr::null::<Framebuffer>()));
  }
 }
+
+#[cfg(test)]
+mod kernel_p0_batch29_w6{
+ use super::*;
+ #[test] fn kernel_p0_batch29_w6_742_low_canonical_pointer(){assert!(limine_pointer_aligned(0x1000usize as *const Region));}
+ #[test] fn kernel_p0_batch29_w6_743_high_canonical_pointer(){assert!(limine_pointer_aligned(0xffff_8000_0000_1000usize as *const Region));}
+ #[test] fn kernel_p0_batch29_w6_744_noncanonical_pointer_denied(){assert!(!limine_pointer_aligned(0x0000_8000_0000_0000usize as *const Region));assert!(!limine_pointer_aligned(0xffff_7fff_ffff_f000usize as *const Region));}
+ #[test] fn kernel_p0_batch29_w6_745_null_misaligned_pointer_denied(){assert!(!limine_pointer_aligned(core::ptr::null::<Region>()));assert!(!limine_pointer_aligned(0x1001usize as *const Region));}

@@ -466,7 +466,7 @@ impl State {
     }
     /// Validate a run of exact contiguous frames in one physical RAM span.
     fn validate_run(&self,physical:u64,count:u32,expect_busy:bool)->Option<u64>{
-        if count==0||count>16{return None;}
+        if !self.single_frame_geometry_valid() || count==0||count>16{return None;}
         let first=self.bit_for_physical(physical)?;
         let end_physical=physical.checked_add((count as u64-1)*PAGE)?;
         let last=self.bit_for_physical(end_physical)?;
@@ -2051,4 +2051,19 @@ mod kernel_p0_batch28_w1 {
   assert_eq!(s.claim_single_frame(),None);
   assert_eq!(s.bitmap[0],0);assert_eq!(s.cursor,0);
  }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch29_w1 {
+ use super::*;
+ fn state()->State{
+  let mut s=State::empty();s.initialized=true;s.count=2;s.total=4;
+  s.spans[0]=Span{base:PAGE,count:2,bit_offset:0};
+  s.spans[1]=Span{base:10*PAGE,count:2,bit_offset:2};s
+ }
+ #[test] fn kernel_p0_batch29_w1_721_exact_run_claim(){let mut s=state();assert!(s.claim_run(PAGE,2));assert!(s.verify_frame_accounting());}
+ #[test] fn kernel_p0_batch29_w1_722_overlap_no_mutation(){let mut s=state();s.spans[1].base=2*PAGE;assert!(!s.claim_run(PAGE,2));assert_eq!(s.bitmap[0],0);}
+ #[test] fn kernel_p0_batch29_w1_723_corrupt_offset_no_release(){let mut s=state();assert!(s.claim_run(PAGE,1));s.spans[1].bit_offset=1;assert!(!s.release_run(PAGE,1));assert!(s.allocated(0));}
+ #[test] fn kernel_p0_batch29_w1_724_cursor_corruption_no_claim(){let mut s=state();s.cursor=s.total;assert!(!s.claim_run(10*PAGE,1));assert_eq!(s.used,0);}
+ #[test] fn kernel_p0_batch29_w1_725_atomic_release_no_double_free(){let mut s=state();assert!(s.claim_run(PAGE,2));assert!(!s.release_run(PAGE,3));assert_eq!(s.used,2);assert!(s.release_run(PAGE,2));assert!(!s.release_run(PAGE,2));}
 }
