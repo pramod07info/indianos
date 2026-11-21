@@ -123,8 +123,11 @@ fn usable_ram_page_aligned(region:&Region)->bool {
 }
 fn hhdm_usable_region_valid(region:&Region,offset:u64)->bool {
     const MAX_PHYSICAL_EXCLUSIVE:u64=1u64<<52;
+    // A firmware usable span may start at physical zero. HHDM validation
+    // verifies representable mapping only; PMM initialization separately
+    // excludes page zero from any allocatable physical frame.
     if region.kind!=0 || !valid_region(region) ||
-       region.base<4096 || !usable_ram_page_aligned(region) ||
+       !usable_ram_page_aligned(region) ||
        region.base>=MAX_PHYSICAL_EXCLUSIVE ||
        region.base.checked_add(region.length)
            .is_none_or(|end|end>MAX_PHYSICAL_EXCLUSIVE) ||
@@ -826,9 +829,14 @@ mod kernel_p0_batch33_w6 {
         assert!(hhdm_usable_region_valid(
             &Region{base:0x1_0000_0000,length:0x1000,kind:0},HHDM));
     }
-    #[test] fn kernel_p0_batch33_w6_824_zero_frame_reserved_or_excess_phys_denied(){
-        assert!(!hhdm_usable_region_valid(
-            &Region{base:0,length:0x2000,kind:0},HHDM));
+    #[test] fn kernel_p0_batch33_w6_824_zero_region_mapped_but_invalid_types_denied(){
+        // Limine may mark page zero usable. This does NOT authorize the PMM
+        // to allocate physical frame zero (that fence lives in initialize).
+        let zero=Region{base:0,length:0x2000,kind:0};
+        assert!(hhdm_usable_region_valid(&zero,HHDM));
+        let entries=[&zero as *const Region];
+        let map=MemoryMap{revision:0,count:1,entries:entries.as_ptr()};
+        assert!(hhdm_covers_usable_map(&map,HHDM));
         assert!(!hhdm_usable_region_valid(
             &Region{base:0x1000,length:0x1000,kind:1},HHDM));
         assert!(!hhdm_usable_region_valid(

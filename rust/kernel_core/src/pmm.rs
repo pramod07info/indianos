@@ -2221,3 +2221,28 @@ mod kernel_p0_batch33_w1 {
         assert_eq!(s.used,0);assert!(s.verify_frame_accounting());
     }
 }
+
+#[cfg(test)]
+mod p0_hhdm_zero_page_allocator_regression {
+    use super::*;
+    unsafe extern "C" fn read(index:u64,out:*mut Region,context:*mut c_void)->bool {
+        let map=unsafe{&*(context.cast::<Vec<Region>>())};
+        if let Some(region)=map.get(index as usize){
+            unsafe{out.write(*region)};true
+        }else{false}
+    }
+    #[test]
+    fn firmware_zero_origin_is_not_an_allocatable_pmm_frame(){
+        let mut s=State::empty();
+        let mut map=vec![Region{base:0,length:PAGE*4,kind:0}];
+        assert!(unsafe{initialize(&mut s,1,Some(read),
+            (&mut map as *mut Vec<Region>).cast())});
+        assert!(s.verify_frame_accounting());
+        assert_eq!(s.total,3);
+        assert_eq!(s.spans[0].base,PAGE);
+        assert_eq!(s.bit_for_physical(0),None);
+        assert!(!s.is_managed_frame(0));
+        assert_eq!(s.claim_single_frame(),Some(PAGE));
+        assert!(s.verify_frame_accounting());
+    }
+}

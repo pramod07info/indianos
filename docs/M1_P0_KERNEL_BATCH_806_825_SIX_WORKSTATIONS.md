@@ -41,3 +41,9 @@ CI job `p0-batch33-implemented` must discover **4+3+4+3+3+3=20 named test cases*
 ## Release safety
 
 Still **unqualified**: physical SMP/IPI/TLB shootdowns, physical NIC DMA/IOMMU, destructive power-loss recovery, TPM verified boot, complete usable desktop, independent protected review and hardware release. Preserve PR draft status; no merge before all exact-head mandatory checks and independent review pass.
+
+## CI regression repair — HHDM vs PMM physical zero
+
+The first Batch33 head `677bdeb5121ff2fa040a409d622238f9d87ee610` fails real QEMU boot with `IndianOS: invalid HHDM mapping`. The fault is the new HHDM region checker rejecting all firmware usable regions whose `base < 4096`, including a legal firmware descriptor starting at 0. Boot mapping validation must accept this descriptor if aligned and otherwise valid; **PMM must never allocate frame zero**. The PMM `initialize` implementation already rounds its first managed address up to at least one page and checks `span.base >= PAGE`.
+
+The repair removes **only** the erroneous `region.base<4096` HHDM rejection, revises Batch33 W6 regression 824 to require the HHDM acceptance of a zero-origin valid map, and adds a production-PMM initialization regression proving page zero is not allocatable. Arithmetic, page-alignment, reserved-region, 52-bit physical limits, and HHDM canonical address checks are preserved. Neither tests nor workflows are disabled. Exact-head QEMU and full CI must pass before merge.
