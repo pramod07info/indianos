@@ -186,6 +186,8 @@ pub unsafe extern "C" fn indianos_syscall_validate(
         #[cfg(feature="normal-desktop")]
         38 => request.arg0<=1 && request.arg1==0, // PID1 lifecycle; authority checked at trap
         #[cfg(feature="normal-desktop")]
+        39 => request.arg1==64 && user_range(plan,request.arg0,64,false), // app pixel transaction
+        #[cfg(feature="normal-desktop")]
         37 => request.arg0<=1 &&
               user_range(plan,request.arg1,64,request.arg0==0), // compositor state query/apply
         #[cfg(feature="test-r030-ondevice")]
@@ -350,6 +352,11 @@ mod tests {
         assert!(!check(38,2,0));
         assert!(!check(38,0,1));
         assert!(!check(38,1,u64::MAX));
+        assert!(check(39,plan.stack_begin,64));
+        assert!(!check(39,plan.stack_begin,63));
+        assert!(!check(39,plan.stack_end-63,64));
+        assert!(!check(39,plan.guard_begin,64));
+        assert!(!check(39,u64::MAX,64));
         for operation in [34,35,36,37]{
             assert!(check(33,operation,plan.stack_begin));
             assert!(!check(33,operation,plan.stack_end-63));

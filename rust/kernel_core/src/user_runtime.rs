@@ -44,6 +44,10 @@ struct Task{
  image:UserImage,root:CloneResult,pcb:*mut Process,
  frame:[u64;WORDS],saved:bool,attached:bool,timer_preemptions:u32,
  authority_live:bool,
+ #[cfg(feature="normal-desktop")]
+ pixel_scratch:[u64;3],
+ #[cfg(feature="normal-desktop")]
+ pixel_guard_frames:[u64;2],
  #[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
  file_generation:u64,
  #[cfg(any(feature="test-ipc",feature="normal-desktop"))]
@@ -53,6 +57,11 @@ struct Task{
 static mut THIRD_ELF:(*const u8,usize)=(ptr::null(),0);
 #[cfg(feature="normal-desktop")]
 static mut COMPOSITOR_ELF:(*const u8,usize)=(ptr::null(),0);
+/// Debugger-only ownership ledger: (owning CR3, lower guard, payload, upper).
+/// User VAs must be inspected under their own root, never PID4's unrelated VA.
+#[cfg(feature="normal-desktop")]
+#[no_mangle]
+pub(crate) static mut DESKTOP_APP_PIXEL_GUARDS:[(u64,u64,u64,u64);2]=[(0,0,0,0);2];
 static mut ACTIVE_USER:*mut UserImage=ptr::null_mut();
 // R013: tightly gated and single-core. Only PID 1 can request worker 1.
 #[cfg(any(feature="test-shell",feature="normal-desktop"))]
@@ -160,8 +169,9 @@ fn desktop_services_live()->bool{
       crate::batch5_session::Identity{pid:process.pid,generation:task.file_generation})}{
    return false;
   }
+  if matches!(slot,1|2)&&(task.pixel_scratch==[0;3]||!pixel_scratch_valid(task)){return false;}
  }
- true
+ crate::gui::pixel_clients_ready()
 }
 #[cfg(feature="normal-desktop")]
 fn take_desktop_restart_permission()->bool{
@@ -646,6 +656,8 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
   if !unsafe{DESKTOP_LIFECYCLE}.allows_input_request(request.number,pid){return BAD;}
  }
  match request.number{
+  #[cfg(feature="normal-desktop")]
+  39=>unsafe{desktop_pixel_request(request.arg0)},
   #[cfg(feature="normal-desktop")]
   38=>{
    if !authenticated_r026_init(){return BAD;}
@@ -1336,6 +1348,121 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
   _=>BAD
  }
 }
+#[cfg(feature="normal-desktop")]
+unsafe extern "C" fn pixel_table_access(frame:u64,context:*mut c_void)->*mut u64{
+ let backend=unsafe{&*context.cast::<VmmBackend>()};
+ let Some(access)=backend.access else{return ptr::null_mut();};
+ unsafe{access(frame,backend.context).cast()}
+}
+#[cfg(feature="normal-desktop")]
+unsafe extern "C" fn pixel_table_allocate(out:*mut u64,context:*mut c_void)->bool{
+ let backend=unsafe{&*context.cast::<VmmBackend>()};
+ backend.allocate.is_some_and(|allocate|unsafe{allocate(out,backend.context)})
+}
+#[cfg(feature="normal-desktop")]
+unsafe extern "C" fn pixel_table_release(frame:u64,context:*mut c_void)->bool{
+ let backend=unsafe{&*context.cast::<VmmBackend>()};
+ backend.release.is_some_and(|release|unsafe{release(frame,backend.context)})
+}
+#[cfg(feature="normal-desktop")]
+fn pixel_clone_backend(image:&UserImage)->CloneBackend{
+ CloneBackend{allocate:Some(pixel_table_allocate),release:Some(pixel_table_release),
+  access:Some(pixel_table_access),context:ptr::addr_of!(image.tables.backend).cast_mut().cast()}
+}
+#[cfg(feature="normal-desktop")]
+fn pixel_scratch_valid(task:&Task)->bool{
+ if task.image.page_count as usize>task.image.pages.len(){return false;}
+ let pages=&task.image.pages[..task.image.page_count as usize];
+ if task.pixel_scratch==[0;3]{
+  return task.pixel_guard_frames==[0;2]&&pages.iter().all(|p|p.virtual_address!=0);
+ }
+ let [lower,payload,upper]=task.pixel_scratch;
+ if !task.image.ready||task.root.root==0||lower==0||lower&(PAGE-1)!=0||
+    lower.checked_add(PAGE)!=Some(payload)||payload.checked_add(PAGE)!=Some(upper)||
+    task.pixel_guard_frames.contains(&0)||task.pixel_guard_frames[0]==task.pixel_guard_frames[1]{return false;}
+ if pages.iter().filter(|p|p.virtual_address==0).count()!=2{return false;}
+ for frame in task.pixel_guard_frames{
+  if pages.iter().filter(|p|p.virtual_address==0&&p.physical_address==frame).count()!=1{return false;}
+ }
+ let backend=pixel_clone_backend(&task.image);
+ for guard in [lower,upper]{
+  let mut mapping=Mapping{physical:0,permissions:Permissions{writable:false,executable:false,user:false}};
+  if unsafe{vmm_query_page(&task.image.tables,guard,&mut mapping)}||
+      lookup(&backend,task.root.root,guard).is_some(){return false;}
+ }
+ let mut mapping=Mapping{physical:0,permissions:Permissions{writable:false,executable:false,user:false}};
+ if !unsafe{vmm_query_page(&task.image.tables,payload,&mut mapping)}||
+    !mapping.permissions.user||!mapping.permissions.writable||mapping.permissions.executable||
+    !pages.iter().any(|p|p.virtual_address==payload&&p.physical_address==mapping.physical){return false;}
+ let Some((physical,flags))=lookup(&backend,task.root.root,payload)else{return false;};
+ physical==mapping.physical&&flags&7==7&&flags&(1u64<<63)!=0
+}
+#[cfg(feature="normal-desktop")]
+unsafe fn desktop_pixel_request(descriptor:u64)->u64{
+ use crate::pixel_protocol::{Request,REGISTER,BEGIN,TILE,COMMIT,ABORT,window_for_pid};
+ let Some(pid)=authenticated_gui_pid()else{return BAD;};
+ let Some(window)=window_for_pid(pid)else{return BAD;};
+ let raw=active_task();
+ let Some(task)=(unsafe{raw.as_mut()})else{return BAD;};
+ if !task.authority_live{return BAD;}
+ let mut wire=[0u8;64];
+ if !unsafe{indianos_user_copy_readonly(&task.image,descriptor,wire.as_mut_ptr().cast(),wire.len())}{return BAD;}
+ let Some(request)=Request::parse(&wire)else{return BAD;};
+ if request.window!=window||
+    (unsafe{DESKTOP_LIFECYCLE}.shutdown_armed&&request.operation!=ABORT){return BAD;}
+ if request.operation==REGISTER{
+  if task.pixel_scratch!=[0;3]||task.pixel_guard_frames!=[0;2]{return BAD;}
+  let result=unsafe{crate::user_image::install_pixel_scratch_guards(
+      &mut task.image,request.lower,request.address,request.upper)};
+  // Active cloned CR3 borrows these lower page-table children. Detached VMM
+  // edits alone do not revoke translations cached by the current CPU.
+  #[cfg(not(test))]
+  if !matches!(result,Err(crate::user_image::ScratchGuardError::Invalid)){
+   for guard in [request.lower,request.upper]{
+    unsafe{asm!("invlpg [{}]",in(reg)guard,options(nostack,preserves_flags));}
+   }
+  }
+  let frames=match result{
+   Ok(frames)=>frames,
+   Err(crate::user_image::ScratchGuardError::Invalid)=>return BAD,
+   Err(crate::user_image::ScratchGuardError::Partial)=>{
+    log(b"IndianOS normal desktop: partial app pixel guard registration retired\n\0");
+    unsafe{x86_64_user_exit_to_kernel(0x180)}
+   },
+  };
+  task.pixel_scratch=[request.lower,request.address,request.upper];
+  task.pixel_guard_frames=frames;
+  if !pixel_scratch_valid(task){unsafe{x86_64_user_exit_to_kernel(0x180)}}
+  unsafe{DESKTOP_APP_PIXEL_GUARDS[(pid-2) as usize]=
+      (task.root.root,request.lower,request.address,request.upper);}
+  pid_log(pid,b"PIXEL_GUARDS_READY\0");return 0;
+ }
+ if task.pixel_scratch==[0;3]||!pixel_scratch_valid(task){return BAD;}
+ match request.operation{
+  BEGIN=>crate::gui::pixel_begin(pid,window,[request.x,request.y,request.width,request.height]).unwrap_or(BAD),
+  TILE=>{
+   let payload=task.pixel_scratch[1];
+   if request.address<payload||request.address.checked_add(request.bytes)
+       .is_none_or(|end|end>payload+PAGE){return BAD;}
+   let mut bytes=[0u8;1024];let length=request.bytes as usize;
+   if length==0||length>bytes.len(){return BAD;}
+   for offset in (0..length).step_by(256){
+    let count=(length-offset).min(256);
+    if !unsafe{indianos_user_copy_readonly(&task.image,request.address+offset as u64,
+        bytes.as_mut_ptr().add(offset).cast(),count)}{return BAD;}
+   }
+   let mut pixels=[0u32;256];
+   for (pixel,bytes) in pixels.iter_mut().zip(bytes[..length].chunks_exact(4)){
+    *pixel=u32::from_le_bytes(bytes.try_into().unwrap());
+   }
+   if crate::gui::pixel_tile(pid,window,request.token,request.x,request.y,
+       &pixels[..request.width as usize]){0}else{BAD}
+  },
+  COMMIT=>if crate::gui::pixel_commit(pid,window,request.token){0}else{BAD},
+  ABORT=>if crate::gui::pixel_abort(pid,window,request.token){0}else{BAD},
+  _=>BAD,
+ }
+}
 fn allowed_frame(p:u64)->bool{
  if p==0||p&(PAGE-1)!=0||p.checked_add(PAGE).is_none(){return false;}
  let n=unsafe{boot_memory_region_count()};
@@ -1424,7 +1551,7 @@ pub(crate) static mut DESKTOP_SURFACE_LAYOUT:[(u64,u64,u64,u64);2]=[(0,0,0,0);2]
 #[no_mangle]
 pub(crate) static mut DESKTOP_PIXEL_SURFACE_LAYOUT:[(u64,u64,u64,u64);2]=[(0,0,0,0);2];
 #[cfg(feature="normal-desktop")]
-const PIXEL_SURFACE_PAGES:u64=594;
+const PIXEL_SURFACE_PAGES:u64=crate::gui::PIXEL_SURFACE_PAGES;
 #[cfg(feature="normal-desktop")]
 fn pixel_surface_layout_valid(layout:&[(u64,u64,u64,u64);2])->bool{
  for &(lower,begin,end,upper) in layout{
@@ -1537,10 +1664,26 @@ fn install_kernel_stack_guards(b:&CloneBackend,root:u64)->bool{
 fn image_mapped(b:&CloneBackend,root:u64,img:&UserImage)->bool{
  if !img.ready||img.page_count==0||img.page_count as usize>img.pages.len()||
     lookup(b,root,img.plan.guard_begin).is_some(){return false;}
+ #[cfg(feature="normal-desktop")]
+ let mut pixel_frames=[0u64;2];
+ #[cfg(feature="normal-desktop")]
+ for slot in 0..TASKS{
+  let raw=task_ptr(slot);
+  if ptr::eq(unsafe{ptr::addr_of!((*raw).image)},img){
+   let task=unsafe{&*raw};
+   if !pixel_scratch_valid(task){return false;}
+   pixel_frames=task.pixel_guard_frames;break;
+  }
+ }
  // Every staged user frame must appear in the cloned CR3 with its exact
  // owned physical address and expected W^X/NX rights, not just entry/stack.
  for page in img.pages.iter().take(img.page_count as usize){
   let va=page.virtual_address;
+  if va==0{
+   #[cfg(feature="normal-desktop")]
+   if page.physical_address!=0&&pixel_frames.contains(&page.physical_address){continue;}
+   return false;
+  }
   let stack=va>=img.plan.stack_begin&&va<img.plan.stack_end;
   let segment=img.plan.segments.iter()
     .take(img.plan.segment_count as usize)
@@ -1804,6 +1947,8 @@ fn saved_valid(t:&Task)->bool{
  if !t.saved||!ring3_frame_valid(&t.frame,&t.image.plan,USER_INTERRUPTS_ENABLED){
   return false;
  }
+ #[cfg(feature="normal-desktop")]
+ if !pixel_scratch_valid(t){return false;}
  let rip=t.frame[15];let rsp=t.frame[18];
  let mut map=Mapping{physical:0,permissions:Permissions{
   writable:false,executable:false,user:false}};
@@ -2043,6 +2188,10 @@ fn revoke_task_authority_with_kind(
  // This runs before any fallible release, including scheduler-abort rollback.
  // Clear the continuation even when no PCB was bound during preparation.
  task.saved=false;task.frame=[0;WORDS];task.image.ready=false;
+ #[cfg(feature="normal-desktop")]
+ for record in unsafe{&mut *ptr::addr_of_mut!(DESKTOP_APP_PIXEL_GUARDS)}{
+  if record.0==task.root.root&&record.1==task.pixel_scratch[0]{*record=(0,0,0,0);}
+ }
  #[cfg(any(feature="test-ipc",feature="normal-desktop"))]
  task.ipc_wait.cancel();
  if !task.authority_live{return;}
@@ -2222,6 +2371,8 @@ fn discard(t:*mut Task,b:&CloneBackend,terminal:bool)->bool{
  }
  if task.root.root!=0&&!unsafe{paging_clone_release(b,&mut task.root)}{return false;}
  if task.image.tables.initialized&&!unsafe{indianos_user_image_destroy(&mut task.image)}{return false;}
+ #[cfg(feature="normal-desktop")]
+ {task.pixel_scratch=[0;3];task.pixel_guard_frames=[0;2];}
  if terminal{
   if task.pcb.is_null()||!unsafe{indianos_process_reap(task.pcb)}{return false;}
   pid_log(unsafe{(*task.pcb).pid},b"REAPED\0");

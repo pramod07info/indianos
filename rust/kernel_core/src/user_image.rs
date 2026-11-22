@@ -331,6 +331,72 @@ pub(crate) unsafe fn indianos_user_copy_writable(
     true
 }
 
+/// A rejected request changes nothing. Partial means a mapping changed and
+/// the runtime must terminate the caller rather than resume ambiguous state.
+#[cfg(feature="normal-desktop")]
+#[derive(Clone,Copy,Debug,Eq,PartialEq)]
+pub(crate) enum ScratchGuardError{Invalid,Partial}
+
+/// Permanently reserve the two guards around one app-owned upload page.
+/// Data-frame ownership stays in UserImage until ordinary task destruction;
+/// zero VA is the existing "unmapped, awaiting release" ownership state.
+/// The caller must invalidate the active CR3 translations after this call.
+#[cfg(feature="normal-desktop")]
+pub(crate) unsafe fn install_pixel_scratch_guards(image:&mut UserImage,
+    lower:u64,payload:u64,upper:u64)->Result<[u64;2],ScratchGuardError>{
+    use ScratchGuardError::{Invalid,Partial};
+    let size=PAGE as u64;
+    let Some(end)=upper.checked_add(size)else{return Err(Invalid);};
+    if !image.ready||image.page_count as usize>MAX_IMAGE_PAGES||
+       image.plan.segment_count as usize>MAX_SEGMENTS||lower==0||
+       lower&(size-1)!=0||lower.checked_add(size)!=Some(payload)||
+       payload.checked_add(size)!=Some(upper)||lower>>39!=upper>>39||
+       !crate::syscall::user_range(&image.plan,lower,3*size,true){
+        return Err(Invalid);
+    }
+    // Restrict this API to complete, real writable/NX ELF storage. It cannot
+    // withdraw the current stack, code or loader's numerical page-tail slack.
+    if !image.plan.segments.iter().take(image.plan.segment_count as usize)
+        .any(|segment|segment.writable&&!segment.executable&&
+            segment.memory_size!=0&&lower>=segment.virtual_address&&
+            segment.virtual_address.checked_add(segment.memory_size)
+                .is_some_and(|limit|end<=limit)){
+        return Err(Invalid);
+    }
+    let mut indices=[0usize;3];let mut physical=[0u64;3];
+    for (slot,va) in [lower,payload,upper].into_iter().enumerate(){
+        let mut found=None;
+        for (index,page) in image.pages[..image.page_count as usize].iter().enumerate(){
+            if page.virtual_address==va{
+                if found.is_some(){return Err(Invalid);}
+                found=Some(index);
+            }
+        }
+        let Some(index)=found else{return Err(Invalid);};
+        let mut mapping=Mapping{physical:0,permissions:Permissions{
+            writable:false,executable:false,user:false}};
+        if !unsafe{vmm_query_page(&image.tables,va,&mut mapping)}||
+           !mapping.permissions.user||!mapping.permissions.writable||mapping.permissions.executable||
+           mapping.physical==0||mapping.physical!=image.pages[index].physical_address{
+            return Err(Invalid);
+        }
+        indices[slot]=index;physical[slot]=mapping.physical;
+    }
+    if physical[0]==physical[1]||physical[0]==physical[2]||physical[1]==physical[2]{return Err(Invalid);}
+    for frame in physical{
+        if image.pages[..image.page_count as usize].iter()
+            .filter(|page|page.physical_address==frame).count()!=1{return Err(Invalid);}
+    }
+    for (position,slot) in [0usize,2].into_iter().enumerate(){
+        let index=indices[slot];let va=image.pages[index].virtual_address;
+        if !unsafe{vmm_unmap_page(&mut image.tables,va)}{
+            return Err(if position==0{Invalid}else{Partial});
+        }
+        image.pages[index].virtual_address=0;
+    }
+    Ok([physical[0],physical[2]])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -338,11 +404,13 @@ mod tests {
     struct Ram {
         frames: Vec<Box<[u64;512]>>, used: [bool;16], released: [u8;16],
         refuse_release: u64, refuse_access: u64,
+        guard_leaf:usize,fail_after_guard_unmap:bool,
     }
     impl Ram {
         fn new()->Self {
             Self { frames:(0..16).map(|_|Box::new([0;512])).collect(),
-                used:[false;16],released:[0;16],refuse_release:0,refuse_access:0 }
+                used:[false;16],released:[0;16],refuse_release:0,refuse_access:0,
+                guard_leaf:usize::MAX,fail_after_guard_unmap:false }
         }
         fn index(physical:u64)->Option<usize> {
             if physical==0 || physical%PAGE as u64!=0 { return None; }
@@ -367,6 +435,8 @@ mod tests {
     }
     unsafe extern "C" fn ram_access(physical:u64,ctx:*mut c_void)->*mut c_void {
         let ram=unsafe { &mut *ctx.cast::<Ram>() };
+        if ram.fail_after_guard_unmap&&ram.guard_leaf<ram.frames.len()&&
+            ram.frames[ram.guard_leaf][0]==0{return ptr::null_mut();}
         if ram.refuse_access==physical {return ptr::null_mut();}
         let Some(index)=Ram::index(physical) else {return ptr::null_mut();};
         if !ram.used[index] {return ptr::null_mut();}
@@ -381,6 +451,73 @@ mod tests {
         for va in [0x400000,0x401000] {assert!(unsafe {stage(&mut img,va,perms)}.is_some());}
         img.plan.stack_begin=0x400000;img.plan.stack_end=0x402000;
         img.ready=true;img
+    }
+    #[cfg(feature="normal-desktop")]
+    fn pixel_staged(ram:&mut Ram)->UserImage{
+        let mut img=staged(ram);
+        let perms=Permissions{writable:true,executable:false,user:true};
+        assert!(unsafe{stage(&mut img,0x402000,perms)}.is_some());
+        // Numeric copy admission requires a valid stack layout even when
+        // this ownership fixture only stages ELF data pages. Keep it away
+        // from the scratch segment rather than disabling stack validation.
+        img.plan.stack_begin=0x500000;img.plan.stack_end=0x501000;
+        img.plan.segment_count=1;
+        img.plan.segments[0]=ProgramSegment{virtual_address:0x400000,file_offset:0,file_size:0,
+            memory_size:3*PAGE as u64,page_begin:0x400000,page_end:0x403000,
+            writable:true,executable:false};
+        img
+    }
+    #[cfg(feature="normal-desktop")]
+    #[test]fn private_pixel_guards_retain_frames_refuse_copies_and_release_exactly_once(){
+        let mut ram=Ram::new();let mut img=pixel_staged(&mut ram);
+        let owned=[img.pages[0].physical_address,img.pages[2].physical_address];
+        assert_eq!(unsafe{install_pixel_scratch_guards(&mut img,0x400000,0x401000,0x402000)},Ok(owned));
+        assert_eq!(img.pages[0].virtual_address,0);assert_eq!(img.pages[2].virtual_address,0);
+        for frame in owned{assert!(ram.used[Ram::index(frame).unwrap()]);}
+        let mut byte=[0xa5];
+        for guard in [0x400000,0x402000]{
+            assert!(!unsafe{indianos_user_copy_readonly(&img,guard,byte.as_mut_ptr().cast(),1)});
+            assert!(!unsafe{indianos_user_can_write(&img,guard,1)});
+            assert_eq!(byte,[0xa5]);
+        }
+        assert!(unsafe{indianos_user_copy_readonly(&img,0x401000,byte.as_mut_ptr().cast(),1)});
+        assert_eq!(unsafe{install_pixel_scratch_guards(&mut img,0x400000,0x401000,0x402000)},Err(ScratchGuardError::Invalid));
+        assert!(unsafe{indianos_user_image_destroy(&mut img)});
+        assert!(ram.used.iter().all(|&used|!used));
+        assert!(ram.released.iter().all(|&count|count<=1));
+    }
+    #[cfg(feature="normal-desktop")]
+    #[test]fn pixel_guard_admission_rejects_unowned_executable_and_outside_image_without_mutation(){
+        let mut ram=Ram::new();let mut img=pixel_staged(&mut ram);
+        for request in [(0x400001,0x401000,0x402000),(0x400000,0x402000,0x403000),
+                        (0x401000,0x402000,0x403000),(0,0x1000,0x2000)]{
+            assert_eq!(unsafe{install_pixel_scratch_guards(&mut img,request.0,request.1,request.2)},Err(ScratchGuardError::Invalid));
+            assert!(img.pages[..3].iter().all(|page|page.virtual_address!=0));
+        }
+        img.plan.segments[0].executable=true;
+        assert_eq!(unsafe{install_pixel_scratch_guards(&mut img,0x400000,0x401000,0x402000)},Err(ScratchGuardError::Invalid));
+        img.plan.segments[0].executable=false;
+        let physical=img.pages[2].physical_address;img.pages[2].physical_address=img.pages[0].physical_address;
+        assert_eq!(unsafe{install_pixel_scratch_guards(&mut img,0x400000,0x401000,0x402000)},Err(ScratchGuardError::Invalid));
+        img.pages[2].physical_address=physical;
+        assert!(unsafe{indianos_user_image_destroy(&mut img)});
+    }
+    #[cfg(feature="normal-desktop")]
+    #[test]fn partial_guard_failure_preserves_unmapped_frame_ownership_for_cleanup(){
+        let mut ram=Ram::new();let mut img=pixel_staged(&mut ram);
+        const MASK:u64=0x000f_ffff_ffff_f000;
+        ram.guard_leaf=ram.frames.iter().position(|table|
+            table[0]&MASK==img.pages[0].physical_address&&
+            table[1]&MASK==img.pages[1].physical_address&&
+            table[2]&MASK==img.pages[2].physical_address).unwrap();
+        ram.fail_after_guard_unmap=true;
+        assert_eq!(unsafe{install_pixel_scratch_guards(&mut img,0x400000,0x401000,0x402000)},Err(ScratchGuardError::Partial));
+        assert_eq!(img.pages[0].virtual_address,0);assert_eq!(img.pages[2].virtual_address,0x402000);
+        assert!(img.pages[..3].iter().all(|page|page.physical_address!=0));
+        ram.fail_after_guard_unmap=false;
+        assert!(unsafe{indianos_user_image_destroy(&mut img)});
+        assert!(ram.used.iter().all(|&used|!used));
+        assert!(ram.released.iter().all(|&count|count<=1));
     }
     #[test]
     fn failed_data_release_can_retry_without_reunmap_or_double_free() {

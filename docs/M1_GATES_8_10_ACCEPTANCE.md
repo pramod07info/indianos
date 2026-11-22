@@ -12,8 +12,11 @@ must both be considered. In particular, P9 explicitly requires **per-process
 private pixel surfaces**. The prior baseline's guarded command payloads and
 clipped raster backend establish a narrower isolation mechanism. The new
 [retained pixel-plane integration](M1_PIXEL_PLANES_AND_RANGE_LOCKS.md) adds real
-kernel-private app pixel storage, while app-mapped surfaces and complete
-userspace raster composition remain unfinished. Passing guard QEMU probes therefore
+kernel-private app pixel storage. The [native app-pixel extension](M1_APP_PIXEL_ACCEPTANCE.md)
+moves app rasterization into guarded, process-owned upload storage with atomic
+retained-plane publication; its final-head acceptance is pending. General
+app-mapped canvases and complete userspace desktop composition remain unfinished.
+Passing guard QEMU probes therefore
 cannot close the complete G4/GUI milestone. P9 also retains physical IRQ input,
 display qualification and the other listed desktop requirements.
 
@@ -70,7 +73,7 @@ as the new integration revision's merge evidence.
 | Position | Required behavior | Implementation and remaining acceptance |
 | --- | --- | --- |
 | 8 / G3 | Automatic normal boot to isolated PID1, Files, Terminal and compositor; recovery for missing/bad services or media | Trusted Desktop edition selection, native role/feature enforcement, strict service startup join, kernel readiness, bounded cooperative startup and one verified restart are implemented. Require final-head normal boot, invalid-service/media and withheld-readiness QEMU results. |
-| 9 / G4 | Independent ring-3 compositor/input broker, guarded per-app surfaces, event-driven lifecycle and negative isolation | PID4 owns window policy; PID1 brokers physical input through authenticated IPC. Private command payloads have source/cloned-root guard mappings. Input authority follows readiness/shutdown; stale drag capture and client grants are revoked. Require final-head mapping, forbidden-syscall and crash/restart evidence. General shared application pixel buffers remain unimplemented. |
+| 9 / G4 | Independent ring-3 compositor/input broker, guarded per-app surfaces, event-driven lifecycle and negative isolation | PID4 owns window policy; PID1 brokers physical input through authenticated IPC. Private command payloads have source/cloned-root guard mappings. Native apps now rasterize through guarded private upload pages and atomic retained pixel transactions; final-head mapping, graphical, forbidden-syscall and crash/restart evidence is pending. Input authority follows readiness/shutdown; stale drag capture and client grants are revoked. General shared application canvases and fully userspace desktop composition remain unfinished. |
 | 10 / G5 | Real keyboard/mouse actions, focus/capture, Terminal/Files changes and screenshots | Physical Set-1 and AUX ingress stay separate from UART. Overrun/loss cancels unsafe command fragments; pointer packets preserve button edges. Acceptance now requires actual PS/2 focus, drag, release, minimize/restore and exact file glyphs. Require final-head device-input QEMU artifacts; these are emulated devices, not physical-machine qualification. |
 | 11 / G6 | Power-loss-safe writes, flush ordering, directories, locking and per-user isolation | Checkpoint publication now validates all referenced payloads before/after metadata writes and after the final durable flush. Uncertain mounts retire. Corruption/transport/flush fault tests include explicit remount outcomes. General per-user ACLs, concurrent locking and physical power-loss qualification remain open; a bounded fault test does not close this gate. |
 | 12 / G7 | Independent processes use authenticated file syscalls and retain files across reboot | Existing PID1/PID2/PID3 file flows are supplemented with Enter-bound, one-request Terminal broker transactions and an actual unsolicited mutation denial. Authenticated cached seek/close no longer depend on device availability; closing a reader releases its writer exclusion without media I/O. Require exact-head syscall/reboot evidence. Stable public ABI versioning and crash-persistent request identifiers remain open. |

@@ -2,14 +2,20 @@
 //! Two independent window surfaces are drawn into Limine's mapped 32-bpp
 //! framebuffer; keyboard actions and physical PS/2 mouse packets change the
 //! actual pixels, z-order, position and visibility, not just a Rust model.
-//! Single BSP; no direct framebuffer access from IRQs, no arbitrary DMA,
-//! no general display-driver/GPU ABI or user-space isolation yet.
+//! Normal apps rasterize into private guarded user buffers and upload bounded
+//! pixel rows; PID4 owns window policy and presentation. Single BSP, no direct
+//! app/IRQ framebuffer access, arbitrary DMA or general GPU-driver ABI.
 use core::ptr;
 use crate::desktop::{App,Desktop,Rect};
 use crate::{boot,console,input,ps2_mouse::{Mouse,Packet}};
 #[cfg(feature="normal-desktop")]
 #[path="app_pixels.rs"]
 mod app_pixels;
+#[cfg(all(test,feature="normal-desktop"))]
+#[path="../../../userland/rust/src/desktop_pixels.rs"]
+mod test_client_pixels;
+#[cfg(feature="normal-desktop")]
+pub(crate) const PIXEL_SURFACE_PAGES:u64=app_pixels::PAYLOAD_PAGES;
 
 const WIDTH_MIN:usize=640;
 const HEIGHT_MIN:usize=480;
@@ -438,9 +444,8 @@ impl UserSurfaceService{
             if self.broker.owner(window.id).is_none(){continue;}
             #[cfg(feature="normal-desktop")]
             {
-                let rgb=out.rgb;
                 if !self.pixels.blit(slot,client_width as usize,client_height as usize,
-                    &self.commands[slot][..self.counts[slot]],rgb,|x,y,color|{
+                    |x,y,color|{
                         out.fill(origin_x+x as i32,origin_y+y as i32,1,1,color);
                     }){return false;}
             }
@@ -480,6 +485,37 @@ impl UserSurfaceService{
         #[cfg(not(any(feature="test-r029-frame-server",feature="normal-desktop")))]
         {self.submit_with(pid,bytes,Self::redraw)}
     }
+    #[cfg(feature="normal-desktop")]
+    fn pixel_slot(&self,pid:u32,window:u32)->Option<usize>{
+        if !matches!((pid,window),(2,1)|(3,2))||!self.broker.owns(pid,window){return None;}
+        Some(window as usize-1)
+    }
+    #[cfg(feature="normal-desktop")]
+    fn pixel_begin(&self,pid:u32,window:u32,rect:[u16;4])->Option<u64>{
+        let slot=self.pixel_slot(pid,window)?;
+        let (_,_,width,height)=self.client_bounds(window)?;
+        self.pixels.begin(slot,width as usize,height as usize,rect)
+    }
+    #[cfg(feature="normal-desktop")]
+    fn pixel_tile(&self,pid:u32,window:u32,token:u64,x:u16,y:u16,pixels:&[u32])->bool{
+        let Some(slot)=self.pixel_slot(pid,window)else{return false;};
+        self.pixels.tile(slot,token,x,y,pixels,boot::desktop_rgb)
+    }
+    #[cfg(feature="normal-desktop")]
+    fn pixel_commit(&self,pid:u32,window:u32,token:u64)->bool{
+        let Some(slot)=self.pixel_slot(pid,window)else{return false;};
+        self.pixels.commit(slot,token)
+    }
+    #[cfg(feature="normal-desktop")]
+    fn pixel_abort(&self,pid:u32,window:u32,token:u64)->bool{
+        let Some(slot)=self.pixel_slot(pid,window)else{return false;};
+        self.pixels.abort(slot,token)
+    }
+    #[cfg(feature="normal-desktop")]
+    fn pixel_clients_ready(&self)->bool{
+        self.broker.owns(2,1)&&self.broker.owns(3,2)&&self.counts[0]>=5&&self.counts[1]>=2&&
+            self.pixels.ready(0)&&self.pixels.ready(1)
+    }
     fn submit_with(&mut self,pid:u32,bytes:&[u8;64],paint:impl FnOnce(&Self)->bool)->bool{
         let Ok(mut cmd)=UserCommand::parse(bytes)else{return false;};
         if !self.broker.owns(pid,cmd.window){return false;}
@@ -498,7 +534,13 @@ impl UserSurfaceService{
         };
         let previous=self.commands[slot][index];
         self.commands[slot][index]=cmd;
-        if paint(self){true}else{
+        if paint(self){
+            #[cfg(feature="normal-desktop")]
+            if !self.pixels.metadata_changed(slot){
+                self.commands[slot][index]=previous;self.counts[slot]=before;return false;
+            }
+            true
+        }else{
             self.commands[slot][index]=previous;self.counts[slot]=before;false
         }
     }
@@ -693,6 +735,10 @@ pub(crate) fn user_surface_start()->bool{
     input::reset_physical_session();
     let Some(f)=Surface::from_boot()else{return false;};
     let Some(svc)=UserSurfaceService::new(f.width as u32,f.height as u32)else{return false;};
+    // A restarted session must never present the retired clients' backing,
+    // including the interval before new processes publish their first rows.
+    #[cfg(feature="normal-desktop")]
+    svc.pixels.clear();
     if !svc.redraw(){return false;}
     #[cfg(feature="normal-desktop")]
     unsafe{
@@ -712,6 +758,26 @@ pub(crate) fn surface_guard_layout()->Option<[(u64,u64,u64,u64);2]>{
 #[cfg(feature="normal-desktop")]
 pub(crate) fn pixel_surface_guard_layout()->[(u64,u64,u64,u64);2]{
     app_pixels::guard_layout()
+}
+#[cfg(feature="normal-desktop")]
+pub(crate) fn pixel_begin(pid:u32,window:u32,rect:[u16;4])->Option<u64>{
+    user_service()?.pixel_begin(pid,window,rect)
+}
+#[cfg(feature="normal-desktop")]
+pub(crate) fn pixel_tile(pid:u32,window:u32,token:u64,x:u16,y:u16,pixels:&[u32])->bool{
+    user_service().is_some_and(|service|service.pixel_tile(pid,window,token,x,y,pixels))
+}
+#[cfg(feature="normal-desktop")]
+pub(crate) fn pixel_commit(pid:u32,window:u32,token:u64)->bool{
+    user_service().is_some_and(|service|service.pixel_commit(pid,window,token))
+}
+#[cfg(feature="normal-desktop")]
+pub(crate) fn pixel_abort(pid:u32,window:u32,token:u64)->bool{
+    user_service().is_some_and(|service|service.pixel_abort(pid,window,token))
+}
+#[cfg(feature="normal-desktop")]
+pub(crate) fn pixel_clients_ready()->bool{
+    user_service().is_some_and(|service|service.pixel_clients_ready())
 }
 #[cfg(feature="normal-desktop")]
 pub(crate) fn desktop_window_query(pid:u32)->Option<[u8;64]>{
@@ -1002,6 +1068,27 @@ pub(crate) fn run()->bool{
 #[cfg(test)]
 mod tests{
     use super::*;
+    // Simulate the real userspace renderer explicitly in host composition
+    // fixtures. Production paint never reconstructs app pixels from commands.
+    #[cfg(feature="normal-desktop")]
+    fn upload_clients(svc:&UserSurfaceService,rgb:fn(u8,u8,u8)->Option<u32>){
+        for window in 1..=2{
+            let slot=window as usize-1;
+            if svc.counts[slot]==0||svc.broker.owner(window).is_none(){continue;}
+            let state=test_client_pixels::State::from_commands(window,&svc.commands[slot][..svc.counts[slot]]).unwrap();
+            let (_,_,width,height)=svc.client_bounds(window).unwrap();
+            let token=svc.pixels.begin(slot,width as usize,height as usize,[0,0,width as u16,height as u16]).unwrap();
+            for y in 0..height as u16{
+                let mut x=0u16;
+                while x<width as u16{
+                    let count=(width as usize-x as usize).min(256);let mut pixels=[0u32;256];
+                    assert!(state.row(x,y,&mut pixels[..count]));
+                    assert!(svc.pixels.tile(slot,token,x,y,&pixels[..count],rgb));x+=count as u16;
+                }
+            }
+            assert!(svc.pixels.commit(slot,token));
+        }
+    }
     #[cfg(feature="normal-desktop")]
     fn isolated_service()->UserSurfaceService{
         let mut broker=Broker::new();broker.grant(2,1).unwrap();broker.grant(3,2).unwrap();
@@ -1012,6 +1099,26 @@ mod tests{
             #[cfg(feature="test-r031-supervisor")]restart_count:0,
             // State-only fixture; no hardware initialization is invoked.
             mouse:unsafe{core::mem::zeroed()},}
+    }
+    #[cfg(feature="normal-desktop")]
+    #[test]fn pixel_transactions_require_current_app_grants_and_do_not_survive_restart(){
+        let mut service=isolated_service();
+        for (pid,window) in [(0,1),(1,1),(2,2),(3,1),(4,1),(99,2)]{
+            assert!(service.pixel_begin(pid,window,[0,0,1,1]).is_none());
+        }
+        let token=service.pixel_begin(2,1,[0,0,1,1]).unwrap();
+        assert!(!service.pixel_commit(3,1,token));
+        assert!(!service.pixel_abort(3,2,token));
+        assert!(!service.pixel_commit(2,1,token)); // no delivered row
+        assert!(service.pixels.tile(0,token,0,0,&[0xff123456],|r,g,b|Some((r as u32)<<16|(g as u32)<<8|b as u32)));
+        assert!(service.pixel_commit(2,1,token));
+        service.retire_client(2);
+        assert!(service.pixel_begin(2,1,[0,0,1,1]).is_none());
+        assert!(!service.pixel_commit(2,1,token));
+        service.reset_in_place(isolated_service());
+        let fresh=service.pixel_begin(2,1,[0,0,1,1]).unwrap();assert!(fresh>token);
+        assert!(!service.pixels.tile(0,token,0,0,&[0xff654321],|_,_,_|Some(0)));
+        assert!(service.pixel_abort(2,1,fresh));
     }
     #[cfg(feature="normal-desktop")]
     #[test]fn desktop_pointer_preserves_press_and_release_as_individual_events(){
@@ -1177,9 +1284,11 @@ mod tests{
         let mut pixels=std::vec![GUARD;PITCH*600+16];
         let mut out=Surface{ptr:pixels.as_mut_ptr().cast(),width:800,height:600,pitch:PITCH*4,
             palette:p,rgb:|r,g,b|Some(((r as u32)<<16)|((g as u32)<<8)|b as u32)};
+        #[cfg(feature="normal-desktop")]upload_clients(&svc,out.rgb);
         assert!(svc.paint(&mut out));let long=pixels.clone();
         for _ in 0..100{assert!(svc.submit(3,&replace));}
         assert_eq!(svc.counts,[0,1]);assert_eq!(svc.commands[1][0].operation,TEXT);
+        #[cfg(feature="normal-desktop")]upload_clients(&svc,out.rgb);
         assert!(svc.paint(&mut out));
         let (x,y,_,_)=svc.client_bounds(2).unwrap();
         // The old second-through-sixth glyphs disappear from actual pixels.
@@ -1266,6 +1375,7 @@ mod tests{
             pitch:PITCH*4,palette:p,
             rgb:|r,g,b|Some(((r as u32)<<16)|((g as u32)<<8)|b as u32)};
         let pixel=|data:&[u32],x:usize,y:usize|data[y*PITCH+x];
+        #[cfg(feature="normal-desktop")]upload_clients(&svc,out.rgb);
         assert!(present(&mut svc,presenter,2,&mut out));
         // Terminal content overlaps Files' titlebar while Terminal is in front.
         assert_eq!(pixel(&pixels,115,105),TERMINAL);

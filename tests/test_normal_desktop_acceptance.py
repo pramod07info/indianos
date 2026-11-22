@@ -17,6 +17,98 @@ finally:
 
 
 class NormalDesktopControls(unittest.TestCase):
+    def pixel_startup(self):
+        return b"\n".join(harness.PIXEL_APP_EVIDENCE +
+                           (harness.LIFECYCLE_READY.encode(),)) + b"\n"
+
+    def test_native_pixel_evidence_requires_both_fresh_apps_and_guard_before_commit(self):
+        trace = self.pixel_startup()
+        harness.verify_pixel_startup(trace)
+        for marker in harness.PIXEL_APP_EVIDENCE:
+            with self.subTest(marker=marker), self.assertRaises(AssertionError):
+                harness.verify_pixel_startup(trace.replace(marker + b"\n", b"", 1))
+            with self.subTest(duplicate=marker), self.assertRaises(AssertionError):
+                harness.verify_pixel_startup(trace + marker + b"\n")
+        for bad in (trace[:-1], b"prefix " + trace,
+                    harness.LIFECYCLE_READY.encode() + b"\n" +
+                    trace.replace(harness.LIFECYCLE_READY.encode() + b"\n", b"")):
+            with self.assertRaises(AssertionError):
+                harness.verify_pixel_startup(bad)
+        guard = b"IndianOS: PID 2 PIXEL_GUARDS_READY\n"
+        with self.assertRaises(AssertionError):
+            harness.verify_pixel_startup(trace.replace(guard, b"") + guard)
+
+    def test_app_scratch_ledger_requires_distinct_owners_not_distinct_virtual_addresses(self):
+        # Identical VAs in independent app CR3s are expected and must not be
+        # mistaken for shared app storage or queried through PID4's root.
+        rows = [(root, 0x410000, 0x411000, 0x412000) for root in (0x1000, 0x2000)]
+        raw = struct.pack("<8Q", *(word for row in rows for word in row))
+        self.assertEqual(harness.app_scratch_records(raw, 0x3000), rows)
+        invalid = [bytes(64), raw[:-1], raw[:32] + raw[:32]]
+        words = list(struct.unpack("<8Q", raw))
+        for index, value in ((0, 0x3000), (0, 0x1001), (1, 0xffff800000000000),
+                             (2, 0x411001), (3, 0x413000)):
+            changed = words.copy();changed[index] = value
+            invalid.append(struct.pack("<8Q", *changed))
+        for ledger in invalid:
+            with self.subTest(ledger=ledger), self.assertRaises(AssertionError):
+                harness.app_scratch_records(ledger, 0x3000)
+
+    def scratch_page_tables(self):
+        class PhysicalMemory:
+            def __init__(self):
+                self.words = {
+                    0x1000: 0x4007, 0x4000: 0x5007, 0x5010: 0x6007,
+                    0x6088: 0xa007 | (1 << 63),
+                    0x2000: 0x7007, 0x7000: 0x8007, 0x8010: 0x9007,
+                    0x9088: 0xb007 | (1 << 63),
+                }
+                self.reads = []
+            def hmp(self, command):
+                if not command.startswith("xp /1gx "):
+                    raise AssertionError("page-table proof issued a mutating monitor command")
+                address = int(command.rsplit(" ", 1)[1], 16)
+                self.reads.append(address)
+                return f"{address:016x}: 0x{self.words.get(address, 0):016x}\n(qemu) "
+        return PhysicalMemory()
+
+    def test_physical_scratch_walk_checks_ancestors_guards_and_private_payloads(self):
+        records = [(root, 0x410000, 0x411000, 0x412000) for root in (0x1000, 0x2000)]
+        session = self.scratch_page_tables();evidence = []
+        harness.verify_app_scratch_mappings(session, records, 0x3000, evidence)
+        self.assertEqual(len(evidence), 2)
+        self.assertTrue(session.reads)
+        mutations = (
+            (0x6088, 0),                       # missing payload
+            (0x6080, 0xc007 | (1 << 63)),       # mapped lower guard
+            (0x6090, 0xc007 | (1 << 63)),       # mapped upper guard
+            (0x1000, 0x4003),                  # supervisor ancestor
+            (0x4000, 0x5005),                  # read-only ancestor
+            (0x6088, 0xa007),                  # executable payload
+            (0x5010, 0x6087),                  # unexpected huge page
+            (0x9088, 0xa007 | (1 << 63)),       # peer aliases same payload
+            (0x3000, 0x4007),                  # compositor aliases app tables
+            (0x4000, 7),                       # physical frame zero
+        )
+        for address, value in mutations:
+            session = self.scratch_page_tables();session.words[address] = value
+            with self.subTest(address=address, value=value), self.assertRaises(AssertionError):
+                harness.verify_app_scratch_mappings(session, records, 0x3000, [])
+
+    def test_physical_word_response_requires_exact_complete_addressed_data(self):
+        session = Mock()
+        session.hmp.return_value = "0000000000001000: 0x0000000000004007\n(qemu) "
+        self.assertEqual(harness.physical_qword(session, 0x1000), 0x4007)
+        session.hmp.assert_called_once_with("xp /1gx 0x1000")
+        for bad in ("", "1008: 0x0000000000004007\n", "1000: 0x4007\n",
+                    "1000: 0x0000000000004007\n1000: 0x0000000000004007\n"):
+            session.hmp.return_value = bad
+            with self.subTest(response=bad), self.assertRaises(AssertionError):
+                harness.physical_qword(session, 0x1000)
+        for address in (-8, 1, 1 << 52):
+            with self.assertRaises(AssertionError):
+                harness.physical_qword(session, address)
+
     def test_boot_stack_evidence_is_boot_wide_not_a_service_restart_marker(self):
         trace = harness.BOOT_STACK + b"\r\n"
         harness.verify_boot_stack(trace)
@@ -25,16 +117,16 @@ class NormalDesktopControls(unittest.TestCase):
             with self.assertRaises(AssertionError):
                 harness.verify_boot_stack(bad)
     def test_pixel_ledger_requires_full_guarded_planes(self):
-        records = [(base, base + 4096, base + 595 * 4096, base + 595 * 4096)
+        records = [(base, base + 4096, base + 1189 * 4096, base + 1189 * 4096)
                    for base in (0xffff800010000000, 0xffff800020000000)]
         raw = struct.pack("<8Q", *(word for record in records for word in record))
-        self.assertEqual(harness.surface_guard_records(raw, 594), records)
+        self.assertEqual(harness.surface_guard_records(raw, 1188), records)
         with self.assertRaises(AssertionError):
             harness.surface_guard_records(raw)
         with self.assertRaises(AssertionError):
-            harness.surface_guard_records(raw, 593)
+            harness.surface_guard_records(raw, 594)
         with self.assertRaises(AssertionError):
-            harness.surface_guard_records(raw[:32] + raw[:32], 594)
+            harness.surface_guard_records(raw[:32] + raw[:32], 1188)
     def test_editor_authority_requires_fresh_denial_and_no_unsolicited_commit(self):
         broker = b"IndianOS user: desktop broker denied filesystem request outside submitted Enter\n"
         app = b"IndianOS user: desktop Terminal unsolicited filesystem mutation denied\n"
@@ -389,7 +481,9 @@ class NormalDesktopControls(unittest.TestCase):
                   for state in ("READY", "DISPATCHED")]
         lines += [harness.SURFACES_GUARDED,
                   "desktop compositor denied input and filesystem authority",
-                  harness.COMPOSITOR, harness.LIFECYCLE_READY, harness.READY]
+                  harness.COMPOSITOR]
+        lines += [marker.decode("ascii") for marker in harness.PIXEL_APP_EVIDENCE]
+        lines += [harness.LIFECYCLE_READY, harness.READY]
         return old + ("\n".join(lines) + "\n").encode(), len(old)
 
     def test_transient_restart_accepts_fresh_execution_and_later_clean_reap(self):
