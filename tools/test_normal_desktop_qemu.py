@@ -681,7 +681,8 @@ def write_failure_config(folder: Path) -> Path:
 def rejected_partitions(qemu: str, iso: Path, ovmf: Path, fixture_tool: Path,
                         folder: Path) -> None:
     fault = write_failure_config(folder)
-    for kind in ("overlap", "duplicate-id", "protective-overflow"):
+    for kind in ("overlap", "duplicate-id", "protective-overflow",
+                 "nil-disk-guid", "backup-disk-guid", "backup-table-mismatch"):
         disk = folder / f"partition-{kind}.raw"
         checked_run([str(fixture_tool), "--partition-fault", kind, "--output", str(disk)])
         # The protected backend prevents firmware from normalizing malformed

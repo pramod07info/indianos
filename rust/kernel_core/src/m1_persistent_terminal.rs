@@ -1708,18 +1708,29 @@ pub fn command_on_checked_partition<D:BlockDevice,const N:usize>(
  auth:&Access<N>,caller:Identity,now:u64,input:&[u8],out:&mut[u8],
 )->Result<usize,PartitionCommandError>{
  preflight_partition_caller(auth,caller,now)?;
+ // Geometry alone cannot identify a selected medium: the MBR boot record,
+ // GPT header CRC epochs or neighboring partition attributes can change
+ // while retaining the selected partition's index, start and length.
+ let receipt=crate::m1_partition::inspect_partition_receipt(disk,selected.index)
+  .map_err(|e|PartitionCommandError::Mount(
+   crate::m1_partition::MountError::Partition(e)))?;
+ if receipt.partition!=selected{
+  return Err(PartitionCommandError::Mount(
+   crate::m1_partition::MountError::Partition(
+    crate::m1_partition::Error::Invalid)));
+ }
  let result={
-  let mut volume=crate::m1_partition::mount_checked_healthy(disk,selected)
+  let mut volume=crate::m1_partition::mount_partition_receipt_healthy(disk,receipt)
    .map_err(PartitionCommandError::Mount)?;
   command(&mut volume,auth,caller,now,input,out)
  };
- // An equal-capacity replacement can preserve valid LBAs while changing
- // partition geometry. Never acknowledge a command on a stale selection.
- let after=crate::m1_partition::inspect(disk,selected.index)
+ // The command may already have written to disk. If the partition-table
+ // receipt changed, revoke the reply; do not claim a rollback.
+ let after=crate::m1_partition::inspect_partition_receipt(disk,selected.index)
   .map_err(|e|PartitionCommandError::Mount(
    crate::m1_partition::MountError::Partition(e)));
  match after{
-  Ok(actual) if actual==selected=>result.map_err(PartitionCommandError::Command),
+  Ok(actual) if actual==receipt=>result.map_err(PartitionCommandError::Command),
   Ok(_)=>{out.fill(0);Err(PartitionCommandError::Mount(
    crate::m1_partition::MountError::Partition(
     crate::m1_partition::Error::Invalid)))},
@@ -1731,53 +1742,73 @@ pub fn command_on_checked_partition<D:BlockDevice,const N:usize>(
 /// unique partition GUID. Every invocation revalidates both identifiers,
 /// complete primary/backup GPT metadata, geometry and COW redundancy before
 /// permitting authenticated read/write/mkdir/rename operations.
-pub fn command_on_gpt_selection<D:BlockDevice,const N:usize>(
- disk:&mut D,selected:crate::m1_partition::GptSelection,
+/// Execute an already-authenticated GPT selection against the EXACT
+/// receipt captured at selection/open time, including both GPT CRC epochs,
+/// protective MBR, adjacent partition records, and device capacity.
+fn command_on_pinned_gpt_receipt<D:BlockDevice,const N:usize>(
+ disk:&mut D,receipt:crate::m1_partition::PartitionReceipt,
  auth:&Access<N>,caller:Identity,now:u64,input:&[u8],out:&mut[u8],
 )->Result<usize,PartitionCommandError>{
  preflight_partition_caller(auth,caller,now)?;
+ if receipt.gpt.is_none(){
+  return Err(PartitionCommandError::Mount(
+   crate::m1_partition::MountError::Partition(
+    crate::m1_partition::Error::Unsupported)));
+ }
  let result={
-  let mut volume=crate::m1_partition::mount_gpt_selected_healthy(disk,selected)
+  let mut volume=crate::m1_partition::mount_partition_receipt_healthy(disk,receipt)
    .map_err(PartitionCommandError::Mount)?;
   command(&mut volume,auth,caller,now,input,out)
  };
- // Mounted file I/O may have happened after the last GUID validation.
- // Always recheck the complete primary+backup GPT identity after releasing
- // the filesystem borrow, including on an uncertain command error.
- let after=crate::m1_partition::inspect_gpt_selection(
-  disk,selected.partition.index)
+ let after=crate::m1_partition::inspect_partition_receipt(
+  disk,receipt.partition.index)
   .map_err(|e|PartitionCommandError::Mount(
    crate::m1_partition::MountError::Partition(e)));
  match after{
-  Ok(actual) if actual==selected=>result.map_err(PartitionCommandError::Command),
+  Ok(actual) if actual==receipt=>result.map_err(PartitionCommandError::Command),
   Ok(_)=>{out.fill(0);Err(PartitionCommandError::Mount(
    crate::m1_partition::MountError::Partition(
     crate::m1_partition::Error::Invalid)))},
   Err(e)=>{out.fill(0);Err(e)},
  }
 }
+pub fn command_on_gpt_selection<D:BlockDevice,const N:usize>(
+ disk:&mut D,selected:crate::m1_partition::GptSelection,
+ auth:&Access<N>,caller:Identity,now:u64,input:&[u8],out:&mut[u8],
+)->Result<usize,PartitionCommandError>{
+ preflight_partition_caller(auth,caller,now)?;
+ let receipt=crate::m1_partition::inspect_partition_receipt(
+  disk,selected.partition.index)
+  .map_err(|e|PartitionCommandError::Mount(
+   crate::m1_partition::MountError::Partition(e)))?;
+ if receipt.gpt!=Some(selected){
+  return Err(PartitionCommandError::Mount(
+   crate::m1_partition::MountError::Partition(
+    crate::m1_partition::Error::Invalid)));
+ }
+ command_on_pinned_gpt_receipt(disk,receipt,auth,caller,now,input,out)
+}
 pub fn command_on_partition<D:BlockDevice,const N:usize>(
  disk:&mut D,selected_index:u32,auth:&Access<N>,caller:Identity,
  now:u64,input:&[u8],out:&mut[u8],
 )->Result<usize,PartitionCommandError>{
- // Require an active owner/generation/expiry and filesystem scope before
- // any on-disk discovery. The command parser remains the final rights gate.
+ // Preserve the existing general (non-healthy-only) ordinal-command
+ // contract but pin the *whole* partition-table epoch before and after it.
  preflight_partition_caller(auth,caller,now)?;
- // Pin the exact full partition layout across the command, not only the
- // initial mount. No new disk is formatted or written by these inspections.
- let selected=crate::m1_partition::inspect(disk,selected_index)
+ let receipt=crate::m1_partition::inspect_partition_receipt(disk,selected_index)
   .map_err(|e|PartitionCommandError::Mount(
    crate::m1_partition::MountError::Partition(e)))?;
+ let selected=receipt.partition;
  let result={
   let mut volume=crate::m1_partition::mount_checked(disk,selected)
    .map_err(PartitionCommandError::Mount)?;
   command(&mut volume,auth,caller,now,input,out)
  };
- let after=crate::m1_partition::inspect(disk,selected_index)
+ let after=crate::m1_partition::inspect_partition_receipt(disk,selected_index)
   .map_err(|e|PartitionCommandError::Mount(
    crate::m1_partition::MountError::Partition(e)));
  match after{
-  Ok(actual) if actual==selected=>result.map_err(PartitionCommandError::Command),
+  Ok(actual) if actual==receipt=>result.map_err(PartitionCommandError::Command),
   Ok(_)=>{out.fill(0);Err(PartitionCommandError::Mount(
    crate::m1_partition::MountError::Partition(
     crate::m1_partition::Error::Invalid)))},
@@ -1793,6 +1824,7 @@ pub fn command_on_partition<D:BlockDevice,const N:usize>(
 pub struct GptTerminalSession{
  owner:Identity,
  selection:crate::m1_partition::GptSelection,
+ receipt:crate::m1_partition::PartitionReceipt,
  expires:u64,
  command_count:u64,
  active:bool,
@@ -1809,14 +1841,17 @@ impl GptTerminalSession{
  )->Result<Self,PartitionCommandError>{
   preflight_partition_caller(auth,caller,now)?;
   if expires<=now{return Err(PartitionCommandError::Command(Error::Denied));}
-  let selection=crate::m1_partition::inspect_gpt_selection(disk,index)
+  let receipt=crate::m1_partition::inspect_partition_receipt(disk,index)
    .map_err(|error|PartitionCommandError::Mount(
      crate::m1_partition::MountError::Partition(error)))?;
-  // Reject unformatted or degraded media, and revalidate the GPT identity
-  // before accepting a session. No format or automatic repair is allowed.
-  drop(crate::m1_partition::mount_gpt_selected_healthy(disk,selection)
+  let selection=receipt.gpt.ok_or(PartitionCommandError::Mount(
+   crate::m1_partition::MountError::Partition(
+    crate::m1_partition::Error::Unsupported)))?;
+  // Preserve the *full* validated table epoch for the session lifetime,
+  // not merely a GUID tuple. Neither open nor mount can format the disk.
+  drop(crate::m1_partition::mount_partition_receipt_healthy(disk,receipt)
    .map_err(PartitionCommandError::Mount)?);
-  Ok(Self{owner:caller,selection,expires,command_count:0,active:true})
+  Ok(Self{owner:caller,selection,receipt,expires,command_count:0,active:true})
  }
  /// Explicit operator recovery of the originally selected GPT volume.
  /// Both filesystem rights and a fresh deadline are required before any
@@ -1834,7 +1869,18 @@ impl GptTerminalSession{
   if expires<=now{return Err(PartitionCommandError::Command(Error::Denied));}
   let repaired=crate::m1_partition::repair_gpt_selected(disk,selection)
    .map_err(PartitionCommandError::Mount)?;
-  Ok((Self{owner:caller,selection,expires,command_count:0,active:true},repaired))
+  let receipt=crate::m1_partition::inspect_partition_receipt(
+   disk,selection.partition.index)
+   .map_err(|error|PartitionCommandError::Mount(
+     crate::m1_partition::MountError::Partition(error)))?;
+  if receipt.gpt!=Some(selection){
+   return Err(PartitionCommandError::Mount(
+    crate::m1_partition::MountError::Partition(
+     crate::m1_partition::Error::Invalid)));
+  }
+  drop(crate::m1_partition::mount_partition_receipt_healthy(disk,receipt)
+   .map_err(PartitionCommandError::Mount)?);
+  Ok((Self{owner:caller,selection,receipt,expires,command_count:0,active:true},repaired))
  }
  fn authorize<const N:usize>(&self,auth:&Access<N>,caller:Identity,now:u64)
   ->Result<(),PartitionCommandError>{
@@ -1852,7 +1898,7 @@ impl GptTerminalSession{
   input:&[u8],out:&mut[u8],
  )->Result<usize,PartitionCommandError>{
   self.authorize(auth,caller,now)?;
-  let result=command_on_gpt_selection(disk,self.selection,auth,caller,now,input,out);
+  let result=command_on_pinned_gpt_receipt(disk,self.receipt,auth,caller,now,input,out);
   if matches!(result,Err(PartitionCommandError::Mount(_))|
        Err(PartitionCommandError::Command(Error::Io(FsError::Io|FsError::InvalidVolume)))){
    // A failed or ambiguously acknowledged data/metadata write may have
@@ -2824,6 +2870,46 @@ mod m1_partition_terminal_integration_tests {
     Err(PartitionCommandError::Mount(MountError::Partition(PartError::Invalid))));
   assert!(d.swapped);
   assert_eq!(response,[0;32]);
+ }
+
+ #[test]
+ fn m1_g1_g2_mbr_metadata_epoch_change_rejects_ack_even_when_geometry_matches(){
+  // Change only boot-record metadata during the first COW data write.
+  // A post-command inspect() of partition geometry would accept this.
+  struct ChangedMbr{disk:Disk,changed:bool}
+  impl BlockDevice for ChangedMbr{
+   fn sector_count(&self)->u64{self.disk.sector_count()}
+   fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+    ->Result<(),BlockError>{self.disk.read_sector(lba,out)}
+   fn write_sector(&mut self,lba:u64,data:&[u8;SECTOR_BYTES])
+    ->Result<(),BlockError>{
+    self.disk.write_sector(lba,data)?;
+    if (FIRST_START..FIRST_START+LENGTH).contains(&lba)&&!self.changed{
+     self.disk.sectors[0][440]^=0x24;
+     self.changed=true;
+    }
+    Ok(())
+   }
+  }
+  for selected_api in [false,true]{
+   let mut device=ChangedMbr{disk:disk(),changed:false};
+   let selected=crate::m1_partition::inspect(&mut device,0).unwrap();
+   let before=device.disk.writes;
+   let mut reply=[0x7a;32];
+   let result=if selected_api{
+    command_on_checked_partition(&mut device,selected,&access(),owner(),1,
+      b"write /home/note staged",&mut reply)
+   }else{
+    command_on_partition(&mut device,0,&access(),owner(),1,
+      b"write /home/note staged",&mut reply)
+   };
+   assert_eq!(result,Err(PartitionCommandError::Mount(
+     MountError::Partition(PartError::Invalid))));
+   assert!(device.changed);
+   assert!(device.disk.writes>before); // This is NOT a write rollback.
+   assert_eq!(crate::m1_partition::inspect(&mut device,0),Ok(selected));
+   assert_eq!(reply,[0;32]); // No false success after a table switch.
+  }
  }
 
  #[test]
