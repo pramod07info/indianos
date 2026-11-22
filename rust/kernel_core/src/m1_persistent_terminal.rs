@@ -1737,6 +1737,37 @@ pub fn command_on_checked_partition<D:BlockDevice,const N:usize>(
   Err(e)=>{out.fill(0);Err(e)},
  }
 }
+/// Execute commands against a receipt captured at the original explicit
+/// selection, including an MBR table's exact sector 0 and device capacity.
+/// Unlike ordinal/geometry selection, callers retain the SAME receipt across
+/// multiple commands; valid same-LBA MBR changes cannot silently rebind it.
+/// This is a trusted kernel-service entrypoint, not a user-supplied syscall
+/// capability. No autoformat, repair, or physical-device identity attestation.
+pub fn command_on_partition_receipt<D:BlockDevice,const N:usize>(
+ disk:&mut D,receipt:crate::m1_partition::PartitionReceipt,
+ auth:&Access<N>,caller:Identity,now:u64,input:&[u8],out:&mut[u8],
+)->Result<usize,PartitionCommandError>{
+ // An unauthorized caller must not even read partition metadata.
+ preflight_partition_caller(auth,caller,now)?;
+ let result={
+  let mut volume=crate::m1_partition::mount_partition_receipt_healthy(disk,receipt)
+   .map_err(PartitionCommandError::Mount)?;
+  command(&mut volume,auth,caller,now,input,out)
+ };
+ // A completed COW write cannot be undone here. A changed receipt revokes
+ // the acknowledgment so the caller never treats uncertain media as saved.
+ let after=crate::m1_partition::inspect_partition_receipt(disk,receipt.partition.index)
+  .map_err(|e|PartitionCommandError::Mount(
+   crate::m1_partition::MountError::Partition(e)));
+ match after{
+  Ok(actual) if actual==receipt=>result.map_err(PartitionCommandError::Command),
+  Ok(_)=>{out.fill(0);Err(PartitionCommandError::Mount(
+   crate::m1_partition::MountError::Partition(
+    crate::m1_partition::Error::Invalid)))},
+  Err(error)=>{out.fill(0);Err(error)},
+ }
+}
+
 /// The preferred persistent developer workstation command entrypoint.
 /// A user explicitly selects a GPT partition and stores its disk GUID and
 /// unique partition GUID. Every invocation revalidates both identifiers,
@@ -1935,6 +1966,98 @@ impl GptTerminalSession{
    return Err(PartitionCommandError::Command(Error::Denied));
   }
   self.active=false;Ok(())
+ }
+ pub fn is_active(&self)->bool{self.active}
+}
+
+ 
+/// An explicitly selected MBR Terminal session that retains the ORIGINAL
+/// complete partition receipt across commands. The ordinary ordinal API
+/// starts a new selection per call; this type never silently rebinds it.
+/// MBR sector zero cannot uniquely identify physical media. The trusted
+/// block owner must serialize device access and handle device replacement.
+pub struct MbrTerminalSession {
+ owner:Identity,
+ receipt:crate::m1_partition::PartitionReceipt,
+ expires:u64,
+ command_count:u64,
+ active:bool,
+}
+impl MbrTerminalSession {
+ /// Verify a healthy existing MBR volume, never format it. Authorization and
+ /// deadline checks precede any disk read or partition information exposure.
+ pub fn open<D:BlockDevice,const N:usize>(
+  disk:&mut D,index:u32,auth:&Access<N>,caller:Identity,now:u64,expires:u64,
+ )->Result<Self,PartitionCommandError>{
+  preflight_partition_caller(auth,caller,now)?;
+  if expires<=now{return Err(PartitionCommandError::Command(Error::Denied));}
+  let receipt=crate::m1_partition::inspect_partition_receipt(disk,index)
+   .map_err(|e|PartitionCommandError::Mount(
+    crate::m1_partition::MountError::Partition(e)))?;
+  if receipt.partition.scheme!=crate::m1_partition::Scheme::Mbr ||
+     receipt.gpt.is_some(){
+   return Err(PartitionCommandError::Mount(
+    crate::m1_partition::MountError::Partition(
+     crate::m1_partition::Error::Unsupported)));
+  }
+  drop(crate::m1_partition::mount_partition_receipt_healthy(disk,receipt)
+   .map_err(PartitionCommandError::Mount)?);
+  Ok(Self{owner:caller,receipt,expires,command_count:0,active:true})
+ }
+ fn authorize<const N:usize>(
+  &self,auth:&Access<N>,caller:Identity,now:u64,
+ )->Result<(),PartitionCommandError>{
+  if !self.active||caller!=self.owner||now>=self.expires{
+   return Err(PartitionCommandError::Command(Error::Denied));
+  }
+  preflight_partition_caller(auth,caller,now)
+ }
+ /// Execute using the exact receipt from open. Post-command changes suppress
+ /// any success acknowledgment; uncertain I/O or mount errors retire this
+ /// session permanently. Already-issued writes cannot be rolled back.
+ pub fn execute<D:BlockDevice,const N:usize>(
+  &mut self,disk:&mut D,auth:&Access<N>,caller:Identity,now:u64,
+  input:&[u8],out:&mut[u8],
+ )->Result<usize,PartitionCommandError>{
+  self.authorize(auth,caller,now)?;
+  let result=command_on_partition_receipt(
+   disk,self.receipt,auth,caller,now,input,out);
+  if matches!(result,Err(PartitionCommandError::Mount(_))|
+       Err(PartitionCommandError::Command(
+        Error::Io(FsError::Io|FsError::InvalidVolume)))){
+   self.active=false;
+  }
+  if result.is_ok(){self.command_count=self.command_count.saturating_add(1);}
+  result
+ }
+ /// Owner-only state query never accesses the block device.
+ pub fn status<const N:usize>(
+  &self,auth:&Access<N>,caller:Identity,now:u64,
+ )->Result<TerminalSessionStatus,PartitionCommandError>{
+  self.authorize(auth,caller,now)?;
+  Ok(TerminalSessionStatus{
+   partition_index:self.receipt.partition.index,
+   commands:self.command_count,expires:self.expires,
+  })
+ }
+ /// Reduce the deadline without extending the originally authorized window.
+ pub fn shorten<const N:usize>(
+  &mut self,auth:&Access<N>,caller:Identity,now:u64,new_expiry:u64,
+ )->Result<(),PartitionCommandError>{
+  self.authorize(auth,caller,now)?;
+  if new_expiry<=now||new_expiry>self.expires{
+   return Err(PartitionCommandError::Command(Error::Denied));
+  }
+  self.expires=new_expiry;
+  Ok(())
+ }
+ /// Closing destroys the selection; a recycled PID cannot close it.
+ pub fn close(&mut self,caller:Identity)->Result<(),PartitionCommandError>{
+  if !self.active||caller!=self.owner{
+   return Err(PartitionCommandError::Command(Error::Denied));
+  }
+  self.active=false;
+  Ok(())
  }
  pub fn is_active(&self)->bool{self.active}
 }
@@ -2975,6 +3098,188 @@ mod m1_partition_terminal_integration_tests {
   assert_eq!(exec(&mut d,1,owner(),b"cat /home/note"),
    Err(PartitionCommandError::Command(Error::Io(FsError::NotFound))));
  }
+ #[test]
+ fn m1_g1_g2_pinned_mbr_receipt_rejects_same_geometry_epoch_between_commands(){
+  let mut d=disk();
+  let receipt=crate::m1_partition::inspect_partition_receipt(&mut d,0).unwrap();
+  assert!(receipt.gpt.is_none());
+  let original_mbr=d.sectors[0];
+  let mut reply=[0xa5;32];
+  assert_eq!(command_on_partition_receipt(&mut d,receipt,&access(),owner(),1,
+    b"write /home/note stable",&mut reply),Ok(5));
+  let n=command_on_partition_receipt(&mut d,receipt,&access(),owner(),1,
+    b"cat /home/note",&mut reply).unwrap();
+  assert_eq!(&reply[..n],b"stable");
+  // The selected LBA and length do not change. Old geometry-only command
+  // selection would accept this valid changed MBR on its next invocation.
+  d.sectors[0][440]^=0x51;
+  assert_eq!(crate::m1_partition::inspect(&mut d,0),Ok(receipt.partition));
+  let before=d.writes;
+  reply.fill(0x5a);
+  assert_eq!(command_on_partition_receipt(&mut d,receipt,&access(),owner(),1,
+    b"write /home/note wrong",&mut reply),
+    Err(PartitionCommandError::Mount(
+     MountError::Partition(PartError::Invalid))));
+  assert_eq!(d.writes,before);
+  assert_eq!(reply,[0x5a;32]);
+  d.sectors[0]=original_mbr;
+  let n=command_on_partition_receipt(&mut d,receipt,&access(),owner(),1,
+    b"cat /home/note",&mut reply).unwrap();
+  assert_eq!(&reply[..n],b"stable");
+ }
+
+ #[test]
+ fn m1_g1_g2_pinned_mbr_receipt_denies_stale_identity_before_disk_reads(){
+  struct CountingDisk{disk:Disk,reads:usize}
+  impl BlockDevice for CountingDisk{
+   fn sector_count(&self)->u64{self.disk.sector_count()}
+   fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+    ->Result<(),BlockError>{
+    self.reads+=1;self.disk.read_sector(lba,out)
+   }
+   fn write_sector(&mut self,lba:u64,data:&[u8;SECTOR_BYTES])
+    ->Result<(),BlockError>{self.disk.write_sector(lba,data)}
+  }
+  let mut d=CountingDisk{disk:disk(),reads:0};
+  let receipt=crate::m1_partition::inspect_partition_receipt(&mut d,0).unwrap();
+  d.reads=0;
+  let before=d.disk.writes;
+  let mut reply=[0x8a;32];
+  let stale=Identity{generation:owner().generation+1,..owner()};
+  assert_eq!(command_on_partition_receipt(&mut d,receipt,&access(),stale,1,
+    b"cat /home/note",&mut reply),
+    Err(PartitionCommandError::Command(Error::Denied)));
+  assert_eq!(d.reads,0);
+  assert_eq!(d.disk.writes,before);
+  assert_eq!(reply,[0x8a;32]);
+ }
+
+ #[test]
+ fn m1_g1_g2_pinned_mbr_receipt_scrubs_post_write_table_switch(){
+  struct ChangedMbr{disk:Disk,changed:bool}
+  impl BlockDevice for ChangedMbr{
+   fn sector_count(&self)->u64{self.disk.sector_count()}
+   fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+    ->Result<(),BlockError>{self.disk.read_sector(lba,out)}
+   fn write_sector(&mut self,lba:u64,data:&[u8;SECTOR_BYTES])
+    ->Result<(),BlockError>{
+    self.disk.write_sector(lba,data)?;
+    if (FIRST_START..FIRST_START+LENGTH).contains(&lba)&&!self.changed{
+     self.disk.sectors[0][440]^=0x13;
+     self.changed=true;
+    }
+    Ok(())
+   }
+  }
+  let mut d=ChangedMbr{disk:disk(),changed:false};
+  let receipt=crate::m1_partition::inspect_partition_receipt(&mut d,0).unwrap();
+  let before=d.disk.writes;
+  let mut reply=[0xab;32];
+  assert_eq!(command_on_partition_receipt(&mut d,receipt,&access(),owner(),1,
+    b"write /home/note staged",&mut reply),
+    Err(PartitionCommandError::Mount(
+     MountError::Partition(PartError::Invalid))));
+  assert!(d.changed);
+  assert!(d.disk.writes>before);
+  assert_eq!(reply,[0;32]);
+ }
+
+ #[test]
+ fn m1_g1_g2_mbr_session_pins_epoch_between_commands_and_stays_revoked(){
+  let mut d=disk();
+  let mut session=MbrTerminalSession::open(&mut d,0,&access(),owner(),1,50).unwrap();
+  let mut out=[0xb9;32];
+  assert_eq!(session.execute(&mut d,&access(),owner(),1,
+    b"write /home/note stable",&mut out),Ok(5));
+  let n=session.execute(&mut d,&access(),owner(),2,
+    b"cat /home/note",&mut out).unwrap();
+  assert_eq!(&out[..n],b"stable");
+  assert_eq!(session.status(&access(),owner(),2),
+    Ok(TerminalSessionStatus{partition_index:0,commands:2,expires:50}));
+  let prior=d.sectors[0];
+  let writes=d.writes;
+  // Same ordinal, exact bounds and fully parseable MBR, different epoch.
+  d.sectors[0][440]^=0x62;
+  out.fill(0xab);
+  assert_eq!(session.execute(&mut d,&access(),owner(),3,
+    b"write /home/note forbidden",&mut out),
+    Err(PartitionCommandError::Mount(
+     MountError::Partition(PartError::Invalid))));
+  assert_eq!(d.writes,writes);
+  assert_eq!(out,[0xab;32]);
+  assert!(!session.is_active());
+  d.sectors[0]=prior; // Restoring bytes never revives a retired session.
+  assert_eq!(session.execute(&mut d,&access(),owner(),3,
+    b"cat /home/note",&mut out),
+    Err(PartitionCommandError::Command(Error::Denied)));
+  let mut independent=MbrTerminalSession::open(&mut d,0,&access(),owner(),3,50)
+    .unwrap();
+  let n=independent.execute(&mut d,&access(),owner(),3,
+    b"cat /home/note",&mut out).unwrap();
+  assert_eq!(&out[..n],b"stable");
+ }
+
+ #[test]
+ fn m1_g1_g2_mbr_session_stale_identity_expiry_and_close_are_fail_closed(){
+  struct Reads{disk:Disk,reads:usize}
+  impl BlockDevice for Reads{
+   fn sector_count(&self)->u64{self.disk.sector_count()}
+   fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+    ->Result<(),BlockError>{
+    self.reads+=1;self.disk.read_sector(lba,out)
+   }
+   fn write_sector(&mut self,lba:u64,data:&[u8;SECTOR_BYTES])
+    ->Result<(),BlockError>{self.disk.write_sector(lba,data)}
+  }
+  let mut d=Reads{disk:disk(),reads:0};
+  let stale=Identity{generation:owner().generation+1,..owner()};
+  assert!(matches!(MbrTerminalSession::open(&mut d,0,&access(),stale,1,15),
+    Err(PartitionCommandError::Command(Error::Denied))));
+  assert_eq!(d.reads,0);
+  let mut session=MbrTerminalSession::open(&mut d,0,&access(),owner(),1,15).unwrap();
+  d.reads=0;
+  let writes=d.disk.writes;
+  let mut out=[0xa4;32];
+  assert_eq!(session.execute(&mut d,&access(),stale,2,
+    b"cat /home/note",&mut out),
+    Err(PartitionCommandError::Command(Error::Denied)));
+  assert_eq!(d.reads,0);
+  assert_eq!(d.disk.writes,writes);
+  assert!(session.is_active());
+  assert_eq!(session.shorten(&access(),owner(),3,4),Ok(()));
+  assert_eq!(session.shorten(&access(),owner(),3,15),
+    Err(PartitionCommandError::Command(Error::Denied)));
+  assert_eq!(session.execute(&mut d,&access(),owner(),4,
+    b"cat /home/note",&mut out),
+    Err(PartitionCommandError::Command(Error::Denied)));
+  assert_eq!(d.reads,0);
+  assert_eq!(out,[0xa4;32]);
+  assert_eq!(session.close(stale),Err(
+   PartitionCommandError::Command(Error::Denied)));
+  assert_eq!(session.close(owner()),Ok(()));
+  assert!(!session.is_active());
+  assert_eq!(session.close(owner()),Err(
+   PartitionCommandError::Command(Error::Denied)));
+ }
+
+ #[test]
+ fn m1_g1_g2_mbr_session_fails_closed_after_uncertain_cow_write(){
+  let mut d=disk();
+  let mut session=MbrTerminalSession::open(&mut d,0,&access(),owner(),1,50).unwrap();
+  d.fail_at=Some(d.writes);
+  let mut out=[0x2d;32];
+  let result=session.execute(&mut d,&access(),owner(),2,
+    b"write /home/note unstable",&mut out);
+  assert!(matches!(result,
+    Err(PartitionCommandError::Command(
+     Error::Io(FsError::Io|FsError::InvalidVolume)))));
+  assert!(!session.is_active());
+  d.fail_at=None;
+  assert_eq!(session.execute(&mut d,&access(),owner(),3,
+    b"write /home/note again",&mut out),
+    Err(PartitionCommandError::Command(Error::Denied)));
+ }
+
 }
 
 

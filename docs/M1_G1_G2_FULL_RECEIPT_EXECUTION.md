@@ -37,3 +37,48 @@ with a write-failing backend, rejects service startup, requires read-only
 recovery, and compares the entire disk after boot. This extends the
 configured QEMU matrix from 22 to 25 actual boots. **Configured does not
 mean passed** until the exact-head GitHub job finishes successfully.
+
+
+## Follow-up: pinned MBR command receipts after PR #790
+
+The existing ordinal and checked-MBR entrypoints validate a complete table
+within each command, but an MBR boot-record metadata change *between* two
+commands can preserve the ordinal and geometry. To support trusted callers
+that need stable selection over a multi-command operation, the new
+`command_on_partition_receipt` API accepts a retained
+`inspect_partition_receipt` result from the original explicit selection.
+
+Each call authenticates the scheduler identity before disk reads, requires a
+healthy mount of precisely that receipt, then rechecks the receipt after
+execution and scrubs acknowledgments on media changes. Three targeted Rust
+regressions cover a same-geometry MBR epoch switch between commands, stale
+identity with zero disk reads, and a post-write metadata change with no false
+success acknowledgment. The tests operate on disposable block-backed HierVfs.
+
+This is an opt-in trusted kernel service; callers must retain the original
+receipt rather than discover a new one for each command. MBR has no globally
+unique disk identity, and a collision with byte-for-byte identical MBR data on
+a replaced device cannot be excluded by software receipts alone. No format
+or disk repair is introduced. Exact-commit CI, independent review, and
+merged-main verification remain mandatory; no gate completion is asserted.
+
+
+## G1/G2 follow-up: automatic multi-command MBR session enforcement
+
+The opt-in MBR command receipt from the preceding section is now also
+retained internally by `MbrTerminalSession`. It requires a healthy existing
+MBR partition and valid scheduler-derived process rights before selection;
+there is no re-selection on each command. Every command validates the original
+MBR sector, all partition geometry, the device capacity and mounted COW data.
+Any changed receipt or uncertain disk I/O permanently retires the session.
+The same open/execute/status/shorten/close lifecycle and owner-generation
+restrictions as the existing GPT terminal session apply.
+
+Three additional disposable block-backed regressions check: real file writes
+and reads across independently remounted commands followed by revocation on a
+same-bounds MBR epoch change; stale identity, expiration and owner-only close
+with zero unauthorized disk reads; and failed COW writes that revoke the
+session until an explicit fresh open. This remains a trusted kernel-service
+API rather than proof of a new native ring-3 MBR desktop boot; no autoformat or
+physical disk modification. Required exact-head CI and independent review
+remain mandatory.
