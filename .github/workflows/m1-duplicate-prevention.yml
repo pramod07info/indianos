@@ -1,0 +1,72 @@
+name: M1 Duplicate Prevention
+
+on:
+  # The enforcement script is taken from trusted main, never PR head.
+  pull_request_target:
+    branches: [main]
+    types: [opened, reopened, synchronize, edited, ready_for_review]
+  # These tests run without write permissions or a persisted token.
+  pull_request:
+    branches: [main]
+    types: [opened, reopened, synchronize, edited, ready_for_review]
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/m1_dedup_guard.py'
+      - 'tests/test_m1_dedup_guard.py'
+      - 'docs/M1_TASK_REGISTRY.json'
+      - '.github/workflows/m1-duplicate-prevention.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  audit:
+    if: github.event_name == 'pull_request_target'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out trusted target revision only
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+      - name: Enforce existing-code audit for M1 production changes
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 scripts/m1_dedup_guard.py
+
+  audit-pr:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out trusted base revision for head-associated CI
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+      - name: Enforce audit using trusted base policy
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          if [ -f scripts/m1_dedup_guard.py ]; then
+            python3 scripts/m1_dedup_guard.py
+          else
+            echo "::notice::Policy bootstrap only: base does not contain the guard yet; policy-tests still run"
+          fi
+
+  policy-tests:
+    if: github.event_name != 'pull_request_target'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out policy candidate without token persistence
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify guard positive and negative controls offline
+        run: python3 -m unittest discover -s tests -p test_m1_dedup_guard.py -v

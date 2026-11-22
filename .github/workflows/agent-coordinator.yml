@@ -141,6 +141,22 @@ jobs:
                   core.info('#' + pr.number + ': exact-head SHA validation missing or failed');
                   continue;
                 }
+                // Duplicate prevention is a required exact-head PR check for
+                // agent merges, including non-M1 agent PRs (the policy returns
+                // success for unrelated changes). This must not be replaced
+                // by a label, old SHA result, or a workflow_run from main.
+                const auditRuns = checks.filter(run =>
+                  run.name === 'M1 Duplicate Prevention' &&
+                  run.event === 'pull_request' &&
+                  run.head_sha === pr.head.sha &&
+                  run.head_repository?.full_name === owner + '/' + repo
+                ).sort((a,b) => new Date(b.created_at) - new Date(a.created_at));
+                const latestAudit = auditRuns[0];
+                if (!latestAudit || latestAudit.status !== 'completed' ||
+                    latestAudit.conclusion !== 'success') {
+                  core.info('#' + pr.number + ': exact-head M1 duplicate-prevention CI missing or failed');
+                  continue;
+                }
                 const livePR = (await github.rest.pulls.get({
                   owner,repo,pull_number:pr.number
                 })).data;

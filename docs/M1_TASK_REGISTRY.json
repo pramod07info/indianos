@@ -1,0 +1,1022 @@
+{
+  "schema_version": 1,
+  "scope": "IndianOS M1",
+  "task_source_of_truth": "docs/M1_PHASE_SCOPE.md",
+  "gate_source_of_truth": "https://github.com/pramod07info/indianos/issues/616",
+  "status_semantics": {
+    "audit_required": "Not yet independently reviewed for this index. NOT proof of missing implementation.",
+    "implemented_acceptance_pending": "Merged implementation evidence exists but exact-SHA acceptance/review/merged-main verification remains pending."
+  },
+  "gates": [
+    {
+      "id": "G1",
+      "title": "Authenticated live Terminal and durable HierVfs",
+      "status": "implemented_acceptance_pending",
+      "source_paths": [
+        "rust/kernel_core/src/m1_persistent_terminal.rs",
+        "rust/kernel_core/src/m1_persistent_desktop.rs"
+      ],
+      "merged_prs": [
+        101,
+        618,
+        652,
+        654,
+        765,
+        790
+      ],
+      "acceptance": "docs/M1_GATES_6_7_ACCEPTANCE.md"
+    },
+    {
+      "id": "G2",
+      "title": "Defensive MBR/GPT selected partitions and recovery",
+      "status": "implemented_acceptance_pending",
+      "source_paths": [
+        "rust/kernel_core/src/m1_partition.rs",
+        "rust/kernel_core/src/block.rs"
+      ],
+      "merged_prs": [
+        195,
+        617,
+        632,
+        639,
+        778,
+        790
+      ],
+      "acceptance": "docs/M1_GATES_6_7_ACCEPTANCE.md"
+    },
+    {
+      "id": "G3",
+      "title": "Normal boot PID1 and independent services",
+      "status": "audit_required",
+      "source_paths": [
+        "rust/kernel_core/src/m1_persistent_desktop.rs"
+      ],
+      "merged_prs": [
+        667,
+        765
+      ],
+      "acceptance": "docs/M1_GATES_8_10_ACCEPTANCE.md"
+    },
+    {
+      "id": "G4",
+      "title": "Independent ring-3 compositor and input broker",
+      "status": "audit_required",
+      "source_paths": [
+        "rust/kernel_core/src/m1_persistent_desktop.rs"
+      ],
+      "merged_prs": [
+        765
+      ],
+      "acceptance": "docs/M1_GATES_8_10_ACCEPTANCE.md"
+    },
+    {
+      "id": "G5",
+      "title": "Real PS/2 keyboard and mouse event flow",
+      "status": "audit_required",
+      "source_paths": [
+        "rust/kernel_core/src/m1_input.rs",
+        "rust/kernel_core/src/ps2_mouse.rs"
+      ],
+      "merged_prs": [
+        631,
+        765
+      ],
+      "acceptance": "docs/M1_GATES_8_10_ACCEPTANCE.md"
+    },
+    {
+      "id": "G6",
+      "title": "Crash-safe persistent VFS and isolation",
+      "status": "audit_required",
+      "source_paths": [
+        "rust/kernel_core/src/hier_vfs.rs",
+        "rust/kernel_core/src/durablefs.rs"
+      ],
+      "merged_prs": [
+        506,
+        634,
+        738,
+        774
+      ],
+      "acceptance": "docs/M1_GATES_6_13_INTEGRATION.md"
+    },
+    {
+      "id": "G7",
+      "title": "Authenticated multi-process filesystem ABI",
+      "status": "audit_required",
+      "source_paths": [
+        "rust/kernel_core/src/m1_persistent_desktop.rs"
+      ],
+      "merged_prs": [
+        765,
+        773,
+        784
+      ],
+      "acceptance": "docs/M1_GATES_6_13_INTEGRATION.md"
+    },
+    {
+      "id": "G8",
+      "title": "Driver qualification and safe recovery",
+      "status": "audit_required",
+      "source_paths": [
+        "rust/kernel_core/src/ata_pio.rs"
+      ],
+      "merged_prs": [
+        775
+      ],
+      "acceptance": "docs/M1_GATES_6_13_INTEGRATION.md"
+    }
+  ],
+  "tasks": [
+    {
+      "id": "M1-P1-001",
+      "phase": "P1",
+      "title": "x86-64 UEFI boot protocol",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P1-002",
+      "phase": "P1",
+      "title": "Pinned Limine bootloader",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P1-003",
+      "phase": "P1",
+      "title": "Kernel ELF loading and entry validation",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P1-004",
+      "phase": "P1",
+      "title": "UEFI memory map validation",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P1-005",
+      "phase": "P1",
+      "title": "Serial logging/panic/framebuffer status",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P1-006",
+      "phase": "P1",
+      "title": "Kernel stack and boot options",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P1-007",
+      "phase": "P1",
+      "title": "Validated initramfs boot modules",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P1-008",
+      "phase": "P1",
+      "title": "Boot-failure/recovery mode",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P1-009",
+      "phase": "P1",
+      "title": "Verified/Secure Boot integration",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P1-010",
+      "phase": "P1",
+      "title": "Normal startup on selected physical UEFI PCs",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P2-001",
+      "phase": "P2",
+      "title": "GDT/IDT/TSS exception handling",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P2-002",
+      "phase": "P2",
+      "title": "Physical frame management and reclamation",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P2-003",
+      "phase": "P2",
+      "title": "Virtual memory and protected mappings",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P2-004",
+      "phase": "P2",
+      "title": "Kernel allocation/heap policies",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P2-005",
+      "phase": "P2",
+      "title": "NX/W^X/guard page policies",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P2-006",
+      "phase": "P2",
+      "title": "Demand paging/COW/page faults",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P2-007",
+      "phase": "P2",
+      "title": "High-resolution timer/APIC routing",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P2-008",
+      "phase": "P2",
+      "title": "Multicore/SMP scheduler",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P2-009",
+      "phase": "P2",
+      "title": "Interrupt-safe atomics/locks/deadlock qualification",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P2-010",
+      "phase": "P2",
+      "title": "FPU/SIMD and CPU topology context",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P2-011",
+      "phase": "P2",
+      "title": "Memory-pressure/OOM policies",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P2-012",
+      "phase": "P2",
+      "title": "Suspend/resume memory restoration",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P3-001",
+      "phase": "P3",
+      "title": "Process and thread control blocks",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P3-002",
+      "phase": "P3",
+      "title": "User-mode protected address spaces",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P3-003",
+      "phase": "P3",
+      "title": "Create/load/run/reap processes",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P3-004",
+      "phase": "P3",
+      "title": "Preemptive multicore fairness and priorities",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P3-005",
+      "phase": "P3",
+      "title": "Versioned syscall ABI and safe user-copy",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P3-006",
+      "phase": "P3",
+      "title": "Capabilities and authenticated handles",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P3-007",
+      "phase": "P3",
+      "title": "Blocking/asynchronous IPC and shared memory",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P3-008",
+      "phase": "P3",
+      "title": "Signals and cancellation",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P3-009",
+      "phase": "P3",
+      "title": "Wait queues and futex-like facilities",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P3-010",
+      "phase": "P3",
+      "title": "Resource limits and thread synchronization",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P3-011",
+      "phase": "P3",
+      "title": "Parent-child service ownership",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P3-012",
+      "phase": "P3",
+      "title": "Fault recovery and adversarial stress acceptance",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P4-001",
+      "phase": "P4",
+      "title": "Block-device abstraction",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P4-002",
+      "phase": "P4",
+      "title": "GPT/MBR partition discovery",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P4-003",
+      "phase": "P4",
+      "title": "Hierarchical on-disk file/directories",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P4-004",
+      "phase": "P4",
+      "title": "VFS/mount/descriptor integration",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P4-005",
+      "phase": "P4",
+      "title": "Create/read/write/rename/delete/truncate",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P4-006",
+      "phase": "P4",
+      "title": "Persistent user ownership/ACLs and timestamps",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P4-007",
+      "phase": "P4",
+      "title": "Metadata journaling/COW transaction",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P4-008",
+      "phase": "P4",
+      "title": "Page cache, fsync and flush semantics",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P4-009",
+      "phase": "P4",
+      "title": "Concurrent locking and file sharing",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P4-010",
+      "phase": "P4",
+      "title": "Quotas and general free-space allocation",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P4-011",
+      "phase": "P4",
+      "title": "Removable devices and filesystem encryption",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P4-012",
+      "phase": "P4",
+      "title": "Reboot/powercut/corrupt-metadata regression",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P5-001",
+      "phase": "P5",
+      "title": "ACPI tables and firmware inventory",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P5-002",
+      "phase": "P5",
+      "title": "PCI enumeration on selected QEMU devices",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P5-003",
+      "phase": "P5",
+      "title": "MMIO/PIO access validation",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P5-004",
+      "phase": "P5",
+      "title": "APIC/MSI interrupt resource routing",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P5-005",
+      "phase": "P5",
+      "title": "Bounce DMA and IOMMU enforcement",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P5-006",
+      "phase": "P5",
+      "title": "Driver probe/start/stop lifecycle",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P5-007",
+      "phase": "P5",
+      "title": "Driver crash isolation",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P5-008",
+      "phase": "P5",
+      "title": "Hotplug handling",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P5-009",
+      "phase": "P5",
+      "title": "Input/display/storage power and readiness",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P5-010",
+      "phase": "P5",
+      "title": "Diagnostic/error reporting",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P6-001",
+      "phase": "P6",
+      "title": "Serial UART/console",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P6-002",
+      "phase": "P6",
+      "title": "PS/2 keyboard and mouse",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P6-003",
+      "phase": "P6",
+      "title": "UEFI-provided linear framebuffer",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P6-004",
+      "phase": "P6",
+      "title": "Legacy ATA scratch disk driver",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P6-005",
+      "phase": "P6",
+      "title": "VirtIO network sample driver",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P6-006",
+      "phase": "P6",
+      "title": "AHCI/NVMe production driver",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P6-007",
+      "phase": "P6",
+      "title": "USB/xHCI keyboard/mouse stack",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P6-008",
+      "phase": "P6",
+      "title": "Modern display/GPU devices",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P6-009",
+      "phase": "P6",
+      "title": "Hardware inventory across selected physical PCs",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P8-001",
+      "phase": "P8",
+      "title": "Normal boot into userspace without opt-in test flag",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P8-002",
+      "phase": "P8",
+      "title": "Authenticated PID1 service supervision",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P8-003",
+      "phase": "P8",
+      "title": "Dependency-ordered startup",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P8-004",
+      "phase": "P8",
+      "title": "Watchdog, restart and failover",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P8-005",
+      "phase": "P8",
+      "title": "Logging/config/settings services",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P8-006",
+      "phase": "P8",
+      "title": "Users/groups/session auth",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P8-007",
+      "phase": "P8",
+      "title": "Clock/timezone/locale management",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P8-008",
+      "phase": "P8",
+      "title": "Background jobs and notifications",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P8-009",
+      "phase": "P8",
+      "title": "Storage/input/package/network service daemons",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P8-010",
+      "phase": "P8",
+      "title": "Shutdown/reboot/logout and suspend lifecycle",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P9-001",
+      "phase": "P9",
+      "title": "Ring-3 compositor separate from kernel",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P9-002",
+      "phase": "P9",
+      "title": "Per-process private pixel surfaces",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P9-003",
+      "phase": "P9",
+      "title": "Window operations and stacking",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P9-004",
+      "phase": "P9",
+      "title": "Keyboard focus/mouse delivery from physical IRQ",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P9-005",
+      "phase": "P9",
+      "title": "Desktop shell/taskbar/launcher",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P9-006",
+      "phase": "P9",
+      "title": "Unicode font/layout engine",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P9-007",
+      "phase": "P9",
+      "title": "Theme/icon/wallpaper controls",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P9-008",
+      "phase": "P9",
+      "title": "Graphics acceleration and software fallback",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P9-009",
+      "phase": "P9",
+      "title": "Multi-display/DPI scaling",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P9-010",
+      "phase": "P9",
+      "title": "Clipboard/drag-drop/notification UI",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P9-011",
+      "phase": "P9",
+      "title": "Compositor restart and sandbox isolation",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P9-012",
+      "phase": "P9",
+      "title": "QEMU image/input acceptance and hardware displays",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P10-001",
+      "phase": "P10",
+      "title": "Graphical login and lock",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P10-002",
+      "phase": "P10",
+      "title": "Functional GUI Files CRUD explorer",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P10-003",
+      "phase": "P10",
+      "title": "Interactive graphical Terminal commands",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P10-004",
+      "phase": "P10",
+      "title": "Settings application GUI",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P10-005",
+      "phase": "P10",
+      "title": "Task Manager/monitor",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P10-006",
+      "phase": "P10",
+      "title": "Signed app installer GUI",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P10-007",
+      "phase": "P10",
+      "title": "Browser/PWA runtime",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P10-008",
+      "phase": "P10",
+      "title": "Text editor/document viewer",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P10-009",
+      "phase": "P10",
+      "title": "Media/image/audio apps",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P10-010",
+      "phase": "P10",
+      "title": "Network/display/sound settings",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P10-011",
+      "phase": "P10",
+      "title": "Clock/calculator/screenshot utilities",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    },
+    {
+      "id": "M1-P10-012",
+      "phase": "P10",
+      "title": "Help, backup/recovery interface",
+      "status": "audit_required",
+      "source_document": "docs/M1_PHASE_SCOPE.md",
+      "source_paths": [],
+      "merged_prs": []
+    }
+  ]
+}
