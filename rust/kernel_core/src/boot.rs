@@ -37,13 +37,31 @@ unsafe extern "C" {
     fn serial_write(message:*const c_char);
 }
 fn log(s: &'static [u8]) { unsafe { serial_write(s.as_ptr().cast()) }; }
+/// # Safety: pointer references a live, mapped Limine-owned response of T.
+/// Alignment is checked *before* creating any Rust reference.
+unsafe fn limine_response<'a,T>(pointer:*const T)->Option<&'a T>{
+    if !limine_pointer_aligned(pointer){return None;}
+    unsafe{pointer.as_ref()}
+}
 unsafe fn memory_map() -> Option<&'static MemoryMap> {
-    unsafe { boot_limine_memmap().as_ref() }
+    unsafe { limine_response(boot_limine_memmap()) }
 }
 /// Reject misaligned Limine pointers before constructing Rust references
 /// or issuing aligned volatile loads. Firmware must also guarantee validity.
 fn limine_pointer_aligned<T>(p:*const T)->bool {
-    !p.is_null() && (p as usize)%core::mem::align_of::<T>()==0
+    // Validate the entire referenced descriptor, not only its start address:
+    // a canonical/aligned pointer near the 48-bit boundary can still straddle
+    // the noncanonical hole. Mapping/provenance remains Limine's obligation.
+    buffer_span_ok(p as usize,core::mem::size_of::<T>() as u64,
+                   core::mem::align_of::<T>())
+}
+/// Preflight every pointer-table slot before indexing Limine-owned arrays.
+/// This only validates numeric bounds; firmware still owns real mappings.
+fn limine_pointer_table_valid<T>(p:*const *const T,count:u64,max:u64)->bool {
+    count!=0 && count<=max &&
+    count.checked_mul(core::mem::size_of::<*const T>() as u64)
+        .is_some_and(|bytes|buffer_span_ok(
+            p as usize,bytes,core::mem::align_of::<*const T>()))
 }
 fn valid_region(r:&Region)->bool{
     r.length!=0 && r.base.checked_add(r.length).is_some()
@@ -76,8 +94,7 @@ fn validate_ranges(regions:&[Region]) -> bool {
 /// Preflight the complete Limine memory map before exporting its count.
 /// An invalid late entry must never let the PMM consume a partial map.
 fn validated_map_count(map:&MemoryMap)->Option<u64>{
-    if !limine_pointer_aligned(map.entries) ||
-       !(1..=4096).contains(&map.count){return None;}
+    if !limine_pointer_table_valid(map.entries,map.count,4096){return None;}
     let mut usable=false;
     for i in 0..map.count as usize{
         let item=unsafe{ptr::read_volatile(map.entries.add(i))};
@@ -101,6 +118,25 @@ fn validated_map_count(map:&MemoryMap)->Option<u64>{
 }
 /// Every usable physical span must fit within the chosen direct-map
 /// high-half range. This is an arithmetic preflight, not proof of PTE mapping.
+fn usable_ram_page_aligned(region:&Region)->bool {
+    (region.base|region.length)&0xfff==0
+}
+fn hhdm_usable_region_valid(region:&Region,offset:u64)->bool {
+    const MAX_PHYSICAL_EXCLUSIVE:u64=1u64<<52;
+    // A firmware usable span may start at physical zero. HHDM validation
+    // verifies representable mapping only; PMM initialization separately
+    // excludes page zero from any allocatable physical frame.
+    if region.kind!=0 || !valid_region(region) ||
+       !usable_ram_page_aligned(region) ||
+       region.base>=MAX_PHYSICAL_EXCLUSIVE ||
+       region.base.checked_add(region.length)
+           .is_none_or(|end|end>MAX_PHYSICAL_EXCLUSIVE) ||
+       !hhdm_offset_sane(offset) {return false;}
+    let Some(first)=offset.checked_add(region.base)else{return false;};
+    let Some(last)=region.base.checked_add(region.length-1)
+        .and_then(|p|offset.checked_add(p))else{return false;};
+    first>=0xffff_8000_0000_0000 && last>=first
+}
 fn hhdm_covers_usable_map(map:&MemoryMap,offset:u64)->bool{
     if !hhdm_offset_sane(offset) ||
         validated_map_count(map).is_none(){return false;}
@@ -109,11 +145,7 @@ fn hhdm_covers_usable_map(map:&MemoryMap,offset:u64)->bool{
         if !limine_pointer_aligned(region_pointer){return false;}
         let region=unsafe{&*region_pointer};
         if region.kind!=0{continue;}
-        let Some(end)=region.base.checked_add(region.length)
-            .and_then(|last|last.checked_sub(1))
-            .and_then(|last|offset.checked_add(last))else{return false;};
-        // Four-level 48-bit canonical high-half addresses only.
-        if end<0xffff_8000_0000_0000{return false;}
+        if !hhdm_usable_region_valid(region,offset){return false;}
     }
     true
 }
@@ -133,7 +165,7 @@ pub unsafe extern "C" fn boot_validate() -> bool {
     }
     // The allocator and ELF loader depend on this direct mapping. Refuse
     // boot *before* other initialization if the Limine handoff omitted it.
-    let Some(hhdm)=(unsafe {boot_limine_hhdm().as_ref()}) else {
+    let Some(hhdm)=(unsafe {limine_response(boot_limine_hhdm())}) else {
         log(b"IndianOS: missing HHDM handoff\n\0");return false;
     };
     if !hhdm_covers_usable_map(map,hhdm.offset){
@@ -166,8 +198,9 @@ pub unsafe extern "C" fn boot_memory_region_at(index:u64,out:*mut Region,_contex
 #[no_mangle]
 pub unsafe extern "C" fn boot_hhdm_offset(out:*mut u64)->bool {
     if out.is_null(){return false}
-    let Some(h)=(unsafe {boot_limine_hhdm().as_ref()}) else {return false};
-    if !hhdm_offset_sane(h.offset){return false;}
+    let Some(h)=(unsafe {limine_response(boot_limine_hhdm())}) else {return false};
+    let Some(map)=(unsafe{memory_map()})else{return false;};
+    if !hhdm_covers_usable_map(map,h.offset){return false;}
     unsafe {ptr::write(out,h.offset);}
     true
 }
@@ -179,9 +212,10 @@ pub unsafe extern "C" fn boot_initramfs_file(
     path:*const c_char,data:*mut *const u8,size:*mut usize
 )->bool {
     if path.is_null() || data.is_null() || size.is_null() {return false}
-    let Some(modules)=(unsafe {boot_limine_modules().as_ref()}) else {return false};
-    if modules.count!=1 || modules.modules.is_null(){return false}
+    let Some(modules)=(unsafe {limine_response(boot_limine_modules())}) else {return false};
+    if !limine_pointer_table_valid(modules.modules,modules.count,1){return false}
     let file=unsafe {ptr::read_volatile(modules.modules)};
+    if !limine_pointer_aligned(file){return false;}
     let Some(file)=(unsafe {file.as_ref()}) else {return false};
     if !(16..=32*1024*1024).contains(&file.size) ||
        !buffer_span_ok(file.address as usize,file.size,1){return false}
@@ -204,7 +238,8 @@ pub unsafe extern "C" fn boot_initramfs_file(
 /// mapped Limine module lifetime. Allows a zero-length file at archive end.
 fn borrowed_ramfile_span_ok(module:usize,size:usize,
     bytes:*const u8,length:usize)->bool {
-    if module==0 || size<16 || bytes.is_null(){return false;}
+    if module==0 || size<16 || bytes.is_null() ||
+       !buffer_span_ok(module,size as u64,1){return false;}
     let Some(limit)=module.checked_add(size)else{return false;};
     let start=bytes as usize;
     start>=module && start<=limit &&
@@ -229,6 +264,23 @@ fn buffer_span_ok(start:usize,length:u64,alignment:usize)->bool {
     let last_half=((end-1) as u64)>>47;
     (first_half==0 || first_half==0x1ffff) && first_half==last_half
 }
+fn limine_framebuffer_table_valid(resp:&Framebuffers)->bool{
+ if !limine_pointer_table_valid(resp.framebuffers,resp.count,4096){
+  return false;
+ }
+ for i in 0..resp.count as usize{
+  let entry=unsafe{ptr::read_volatile(resp.framebuffers.add(i))};
+  if !limine_pointer_aligned(entry){return false;}
+  // Multiple table slots may not impersonate distinct outputs with one
+  // borrowed descriptor; validate the whole table before any consumer runs.
+  for j in 0..i {
+   if unsafe{ptr::read_volatile(resp.framebuffers.add(j))}==entry{
+    return false;
+   }
+  }
+ }
+ true
+}
 fn framebuffer_ok(f:&Framebuffer)->bool {
     if f.width==0 || f.height==0 || f.model!=1 || f.bpp!=32 ||
        f.pitch%4!=0 || f.width>u64::MAX/4 || f.pitch<f.width*4 {
@@ -243,6 +295,19 @@ fn framebuffer_ok(f:&Framebuffer)->bool {
     let Some(b)=mask(f.blue_size,f.blue_shift) else {return false};
     (r&g)==0 && (r&b)==0 && (g&b)==0
 }
+fn framebuffer_status_rect_valid(
+    f:&Framebuffer,x:u64,y:u64,width:u64,height:u64
+)->bool {
+    if !framebuffer_ok(f)||width==0||height==0{return false;}
+    let Some(x_end)=x.checked_add(width)else{return false;};
+    let Some(y_end)=y.checked_add(height)else{return false;};
+    if x_end>f.width||y_end>f.height{return false;}
+    let Some(end)=y_end.checked_sub(1)
+        .and_then(|row|row.checked_mul(f.pitch))
+        .and_then(|at|x_end.checked_mul(4).and_then(|pix|at.checked_add(pix)))
+        else{return false;};
+    f.pitch.checked_mul(f.height).is_some_and(|size|end<=size)
+}
 fn chan(c:u8,bits:u8,shift:u8)->u32 {
     (((c as u32)*((1u32<<bits)-1)/255)<<shift)
 }
@@ -255,13 +320,16 @@ fn pixel(f:&Framebuffer,r:u8,g:u8,b:u8)->u32 {
 /// Called once at boot while framebuffer allocation is mapped and exclusive.
 #[no_mangle]
 pub unsafe extern "C" fn boot_draw_status(){
-    let Some(resp)=(unsafe {boot_limine_framebuffers().as_ref()}) else {
+    let Some(resp)=(unsafe {limine_response(boot_limine_framebuffers())}) else {
         log(b"IndianOS: framebuffer unavailable (serial mode)\n\0");return
     };
-    if resp.count==0 || resp.framebuffers.is_null(){
+    if !limine_framebuffer_table_valid(resp){
         log(b"IndianOS: framebuffer unavailable (serial mode)\n\0");return
     }
     let first=unsafe {ptr::read_volatile(resp.framebuffers)};
+    if !limine_pointer_aligned(first){
+        log(b"IndianOS: unsupported framebuffer (serial mode)\n\0");return
+    }
     let Some(f)=(unsafe {first.as_ref()}) else {
         log(b"IndianOS: unsupported framebuffer (serial mode)\n\0");return
     };
@@ -272,6 +340,10 @@ pub unsafe extern "C" fn boot_draw_status(){
     let h=f.height.min(120);
     let x0=(f.width-w)/2;
     let y0=(f.height-h)/2;
+    if !framebuffer_status_rect_valid(f,x0,y0,w,h){
+        log(b"IndianOS: framebuffer rectangle unsafe (serial mode)\n\0");
+        return;
+    }
     let saffron=pixel(f,255,153,51);
     let white=pixel(f,255,255,255);
     let green=pixel(f,19,136,8);
@@ -302,10 +374,13 @@ pub(crate) struct ConsoleFramebuffer {
 }
 #[cfg(any(feature="test-irq-keyboard",feature="test-r029-desktop",feature="normal-desktop"))]
 pub(crate) fn console_framebuffer()->Option<ConsoleFramebuffer>{
-    let resp=unsafe{boot_limine_framebuffers().as_ref()}?;
-    if resp.count==0||resp.framebuffers.is_null(){return None;}
+    let response=unsafe{boot_limine_framebuffers()};
+    if !limine_pointer_aligned(response){return None;}
+    let resp=unsafe{&*response};
+    if !limine_framebuffer_table_valid(resp){return None;}
     let first=unsafe{ptr::read_volatile(resp.framebuffers)};
-    let f=unsafe{first.as_ref()}?;
+    if !limine_pointer_aligned(first){return None;}
+    let f=unsafe{&*first};
     if !framebuffer_ok(f){return None;}
     Some(ConsoleFramebuffer{
         address:f.address,
@@ -316,10 +391,13 @@ pub(crate) fn console_framebuffer()->Option<ConsoleFramebuffer>{
 
 #[cfg(any(feature="test-r029-desktop",feature="normal-desktop"))]
 pub(crate) fn desktop_rgb(r:u8,g:u8,b:u8)->Option<u32>{
-    let resp=unsafe{boot_limine_framebuffers().as_ref()}?;
-    if resp.count==0||resp.framebuffers.is_null(){return None;}
+    let response=unsafe{boot_limine_framebuffers()};
+    if !limine_pointer_aligned(response){return None;}
+    let resp=unsafe{&*response};
+    if !limine_framebuffer_table_valid(resp){return None;}
     let first=unsafe{ptr::read_volatile(resp.framebuffers)};
-    let framebuffer=unsafe{first.as_ref()}?;
+    if !limine_pointer_aligned(first){return None;}
+    let framebuffer=unsafe{&*first};
     if !framebuffer_ok(framebuffer){return None;}
     Some(pixel(framebuffer,r,g,b))
 }
@@ -545,5 +623,354 @@ mod kernel_p0_batch22_w6_tests{
         let huge_entries:[*const Region;1]=[&huge];
         let huge_map=MemoryMap{revision:0,count:1,entries:huge_entries.as_ptr()};
         assert!(!hhdm_covers_usable_map(&huge_map,0xffff_ffff_0000_0000));
+    }
+}
+
+
+// Batch23 W6 P0-602..605: boot consumers share the validated HHDM and
+// Limine pointer alignment contract; no dereference of misaligned metadata.
+#[cfg(test)]
+mod kernel_p0_batch23_w6_tests{
+ use super::*;
+ #[test]fn kernel_p0_batch23_w6_602_hhdm_rejects_usable_overflow(){
+    let r=Region{base:0x2000,length:4096,kind:0};
+    let entries:[*const Region;1]=[&r];
+    let map=MemoryMap{revision:0,count:1,entries:entries.as_ptr()};
+    assert!(hhdm_covers_usable_map(&map,0xffff_8000_0000_0000));
+    assert!(!hhdm_covers_usable_map(&map,0xffff_ffff_ffff_e000));
+ }
+ #[test]fn kernel_p0_batch23_w6_603_module_table_alignment(){
+    let table:[*const u64;1]=[core::ptr::null()];
+    let valid=table.as_ptr();
+    assert!(limine_pointer_aligned(valid));
+    let misaligned=(valid as usize+1) as *const *const u64;
+    assert!(!limine_pointer_aligned(misaligned));
+ }
+ #[test]fn kernel_p0_batch23_w6_604_framebuffer_table_alignment(){
+    let table:[*const u32;1]=[core::ptr::null()];
+    assert!(limine_pointer_aligned(table.as_ptr()));
+    assert!(!limine_pointer_aligned(
+        (table.as_ptr() as usize+1) as *const *const u32));
+ }
+ #[test]fn kernel_p0_batch23_w6_605_file_ptr_alignment(){
+    let file=1234u64;
+    assert!(limine_pointer_aligned(&file as *const u64));
+    assert!(!limine_pointer_aligned(
+        (&file as *const u64 as usize+1) as *const u64));
+    assert!(!limine_pointer_aligned(core::ptr::null::<u64>()));
+ }
+}
+
+
+// Batch24 W6 P0-623..625: Limine response pointers are validated for
+// null and alignment BEFORE constructing borrowed supervisor references.
+// The trusted bootloader still supplies pointer validity and lifetime.
+#[cfg(test)]
+mod kernel_p0_batch24_w6_tests{
+    use super::*;
+    #[test]fn kernel_p0_batch24_w6_623_null_response_rejected(){
+        assert!(unsafe{limine_response::<MemoryMap>(ptr::null())}.is_none());
+        assert!(unsafe{limine_response::<Hhdm>(ptr::null())}.is_none());
+    }
+    #[test]fn kernel_p0_batch24_w6_624_misaligned_response_rejected(){
+        let h=Hhdm{revision:0,offset:0xffff_8000_0000_0000};
+        let forged=((&h as *const Hhdm as usize)+1) as *const Hhdm;
+        assert!(unsafe{limine_response(forged)}.is_none());
+    }
+    #[test]fn kernel_p0_batch24_w6_625_well_aligned_responses_retained(){
+        let h=Hhdm{revision:0,offset:0xffff_8000_0000_0000};
+        let borrowed=unsafe{limine_response(&h as *const Hhdm)}.unwrap();
+        assert_eq!(borrowed.offset,h.offset);
+        let map=MemoryMap{revision:0,count:0,entries:ptr::null()};
+        let found=unsafe{limine_response(&map as *const MemoryMap)}.unwrap();
+        assert_eq!(found.count,0);
+    }
+}
+
+// P0-651..655: reject unaddressable physical RAM before constructing HHDM.
+#[cfg(test)]
+mod kernel_p0_batch25_w6_tests {
+    use super::*;
+    const HHDM:u64=0xffff_8000_0000_0000;
+    fn check(region:Region,offset:u64)->bool{
+        let pointer=&region as *const Region;
+        let entries=[pointer];
+        let map=MemoryMap{revision:0,count:1,entries:entries.as_ptr()};
+        hhdm_covers_usable_map(&map,offset)
+    }
+    #[test]fn kernel_p0_batch25_w6_651_low_ram_hhdm_valid(){
+        assert!(check(Region{base:4096,length:8192,kind:0},HHDM));
+    }
+    #[test]fn kernel_p0_batch25_w6_652_unaddressable_start_denied(){
+        assert!(!check(Region{base:1u64<<52,length:4096,kind:0},HHDM));
+    }
+    #[test]fn kernel_p0_batch25_w6_653_crossing_physical_limit_denied(){
+        assert!(!check(Region{base:(1u64<<52)-4096,length:8192,kind:0},HHDM));
+    }
+    #[test]fn kernel_p0_batch25_w6_654_last_physical_page_requires_addressable_hhdm(){
+        // Physical MAXPHYADDR does not imply direct-map addressability:
+        // HHDM + (2^52 - 1) overflows the four-level high-half window.
+        assert!(!check(Region{base:(1u64<<52)-4096,length:4096,kind:0},HHDM));
+    }
+    #[test]fn kernel_p0_batch25_w6_655_invalid_direct_map_offset_denied(){
+        assert!(!check(Region{base:4096,length:4096,kind:0},0));
+        assert!(!check(Region{base:4096,length:4096,kind:0},HHDM+1));
+    }
+}
+
+// P0-673..675: PMM sees only page-aligned usable RAM from Limine.
+#[cfg(test)]
+mod kernel_p0_batch26_w6_tests {
+    use super::*;
+    const HHDM:u64=0xffff_8000_0000_0000;
+    fn check(region:Region)->bool {
+        let entries=[&region as *const Region];
+        let map=MemoryMap{revision:0,count:1,entries:entries.as_ptr()};
+        hhdm_covers_usable_map(&map,HHDM)
+    }
+    #[test]fn kernel_p0_batch26_w6_673_aligned_usable_ram_accepted(){
+        assert!(check(Region{base:0x2000,length:0x3000,kind:0}));
+    }
+    #[test]fn kernel_p0_batch26_w6_674_unaligned_usable_base_denied(){
+        assert!(!check(Region{base:0x2001,length:0x3000,kind:0}));
+    }
+    #[test]fn kernel_p0_batch26_w6_675_partial_last_page_denied(){
+        assert!(!check(Region{base:0x2000,length:0x3001,kind:0}));
+    }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch27_w6_tests {
+    use super::*;
+    const HHDM:u64=0xffff_8000_0000_0000;
+    fn two(a:Region,b:Region)->bool {
+        let pointers=[&a as *const Region,&b as *const Region];
+        let map=MemoryMap{revision:0,count:2,entries:pointers.as_ptr()};
+        hhdm_covers_usable_map(&map,HHDM)
+    }
+    #[test]fn kernel_p0_batch27_w6_697_two_disjoint_usable_spans(){
+        assert!(two(Region{base:0x1000,length:0x3000,kind:0},
+                    Region{base:0x9000,length:0x1000,kind:0}));
+    }
+    #[test]fn kernel_p0_batch27_w6_698_reserved_overlap_prevents_pmm_handoff(){
+        assert!(!two(Region{base:0x1000,length:0x3000,kind:0},
+                     Region{base:0x2000,length:0x1000,kind:1}));
+    }
+    #[test]fn kernel_p0_batch27_w6_699_malformed_reserved_tail_fails_closed(){
+        assert!(!two(Region{base:0x1000,length:0x1000,kind:0},
+                     Region{base:u64::MAX-1,length:0x1000,kind:1}));
+    }
+    #[test]fn kernel_p0_batch27_w6_700_unaddressable_high_ram_denied(){
+        assert!(!two(Region{base:0x1000,length:0x1000,kind:0},
+                     Region{base:(1u64<<52)-4096,length:4096,kind:0}));
+    }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch28_w6 {
+ use super::*;
+ #[test]fn kernel_p0_batch28_w6_718_aligned_response_pointer_valid(){
+  let response=core::mem::MaybeUninit::<Framebuffers>::uninit();
+  assert!(limine_pointer_aligned(response.as_ptr()));
+ }
+ #[test]fn kernel_p0_batch28_w6_719_misaligned_descriptor_pointer_refused(){
+  let f=core::mem::MaybeUninit::<Framebuffer>::uninit();
+  let p=f.as_ptr().cast::<u8>().wrapping_add(1).cast::<Framebuffer>();
+  assert!(!limine_pointer_aligned(p));
+ }
+ #[test]fn kernel_p0_batch28_w6_720_null_response_table_frame_refused(){
+  assert!(!limine_pointer_aligned(core::ptr::null::<Framebuffers>()));
+  assert!(!limine_pointer_aligned(core::ptr::null::<*const Framebuffer>()));
+  assert!(!limine_pointer_aligned(core::ptr::null::<Framebuffer>()));
+ }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch29_w6{
+ use super::*;
+ #[test] fn kernel_p0_batch29_w6_742_low_canonical_pointer(){assert!(limine_pointer_aligned(0x1000usize as *const Region));}
+ #[test] fn kernel_p0_batch29_w6_743_high_canonical_pointer(){assert!(limine_pointer_aligned(0xffff_8000_0000_1000usize as *const Region));}
+ #[test] fn kernel_p0_batch29_w6_744_noncanonical_pointer_denied(){assert!(!limine_pointer_aligned(0x0000_8000_0000_0000usize as *const Region));assert!(!limine_pointer_aligned(0xffff_7fff_ffff_f000usize as *const Region));}
+ #[test] fn kernel_p0_batch29_w6_745_null_misaligned_pointer_denied(){assert!(!limine_pointer_aligned(core::ptr::null::<Region>()));assert!(!limine_pointer_aligned(0x1001usize as *const Region));}
+}
+
+#[cfg(test)]
+mod kernel_p0_batch30_w6 {
+    use super::*;
+    #[test] fn kernel_p0_batch30_w6_763_normal_canonical_descriptor_allowed(){
+        assert!(limine_pointer_aligned(0x1000usize as *const Region));
+        assert!(limine_pointer_aligned(0xffff_8000_0000_1000usize as *const Region));
+    }
+    #[test] fn kernel_p0_batch30_w6_764_descriptor_crossing_canonical_gap_denied(){
+        assert!(!limine_pointer_aligned(0x0000_7fff_ffff_fff0usize as *const Region));
+    }
+    #[test] fn kernel_p0_batch30_w6_765_pointer_wrap_and_misalignment_denied(){
+        assert!(!limine_pointer_aligned(0xffff_ffff_ffff_fff8usize as *const Region));
+        assert!(!limine_pointer_aligned(0x1001usize as *const Region));
+        assert!(!limine_pointer_aligned(core::ptr::null::<Region>()));
+    }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch31_w6 {
+    use super::*;
+    #[test]fn kernel_p0_batch31_w6_783_canonical_module_subset_allowed(){
+        assert!(borrowed_ramfile_span_ok(0x1000,64,0x1010usize as *const u8,8));
+        assert!(borrowed_ramfile_span_ok(0x1000,64,0x1040usize as *const u8,0));
+    }
+    #[test]fn kernel_p0_batch31_w6_784_module_crossing_canonical_gap_denied(){
+        let base=0x0000_7fff_ffff_fff0usize;
+        assert!(!borrowed_ramfile_span_ok(base,64,(base+8) as *const u8,1));
+    }
+    #[test]fn kernel_p0_batch31_w6_785_module_wrap_and_outside_denied(){
+        assert!(!borrowed_ramfile_span_ok(usize::MAX-15,64,usize::MAX as *const u8,1));
+        assert!(!borrowed_ramfile_span_ok(0x1000,64,0x1040usize as *const u8,1));
+        assert!(!borrowed_ramfile_span_ok(0x1000,64,0x1008usize as *const u8,64));
+    }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch32_w6 {
+    use super::*;
+    #[test] fn kernel_p0_batch32_w6_803_canonical_pointer_tables_admitted(){
+        assert!(limine_pointer_table_valid(0x1000usize as *const *const Region,8,4096));
+        assert!(limine_pointer_table_valid(
+            0xffff_8000_0000_1000usize as *const *const Framebuffer,2,4096));
+    }
+    #[test] fn kernel_p0_batch32_w6_804_zero_excessive_and_null_tables_denied(){
+        let p=0x1000usize as *const *const Region;
+        assert!(!limine_pointer_table_valid(p,0,4096));
+        assert!(!limine_pointer_table_valid(p,4097,4096));
+        assert!(!limine_pointer_table_valid(core::ptr::null::<*const Region>(),1,4096));
+        assert!(!limine_pointer_table_valid(p,u64::MAX,u64::MAX));
+    }
+    #[test] fn kernel_p0_batch32_w6_805_full_table_cannot_cross_canonical_gap(){
+        let p=0x0000_7fff_ffff_fff8usize as *const *const Region;
+        assert!(limine_pointer_table_valid(p,1,4096));
+        assert!(!limine_pointer_table_valid(p,2,4096));
+        assert!(!limine_pointer_table_valid(
+            0x1001usize as *const *const Region,1,4096));
+    }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch33_w6 {
+    use super::*;
+    const HHDM:u64=0xffff_8000_0000_0000;
+    #[test] fn kernel_p0_batch33_w6_823_valid_usable_phys_region_maps_high_half(){
+        assert!(hhdm_usable_region_valid(
+            &Region{base:0x1000,length:0x2000,kind:0},HHDM));
+        assert!(hhdm_usable_region_valid(
+            &Region{base:0x1_0000_0000,length:0x1000,kind:0},HHDM));
+    }
+    #[test] fn kernel_p0_batch33_w6_824_zero_region_mapped_but_invalid_types_denied(){
+        // Limine may mark page zero usable. This does NOT authorize the PMM
+        // to allocate physical frame zero (that fence lives in initialize).
+        let zero=Region{base:0,length:0x2000,kind:0};
+        assert!(hhdm_usable_region_valid(&zero,HHDM));
+        let entries=[&zero as *const Region];
+        let map=MemoryMap{revision:0,count:1,entries:entries.as_ptr()};
+        assert!(hhdm_covers_usable_map(&map,HHDM));
+        assert!(!hhdm_usable_region_valid(
+            &Region{base:0x1000,length:0x1000,kind:1},HHDM));
+        assert!(!hhdm_usable_region_valid(
+            &Region{base:1u64<<52,length:0x1000,kind:0},HHDM));
+    }
+    #[test] fn kernel_p0_batch33_w6_825_misaligned_overflowing_hhdm_region_denied(){
+        assert!(!hhdm_usable_region_valid(
+            &Region{base:0x1001,length:0x1000,kind:0},HHDM));
+        assert!(!hhdm_usable_region_valid(
+            &Region{base:0x2000,length:0x1000,kind:0},0xffff_ffff_ffff_f000));
+        assert!(!hhdm_usable_region_valid(
+            &Region{base:u64::MAX-0xfff,length:0x1000,kind:0},HHDM));
+    }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch34_w6 {
+    use super::*;
+    fn fb()->Framebuffer {
+        Framebuffer{address:0x1000 as *mut u8,width:80,height:30,
+            pitch:80*4,bpp:32,model:1,
+            red_size:8,red_shift:16,green_size:8,green_shift:8,
+            blue_size:8,blue_shift:0}
+    }
+    #[test] fn kernel_p0_batch34_w6_843_center_and_full_frame_rects_fit(){
+        let f=fb();
+        assert!(framebuffer_status_rect_valid(&f,10,10,60,10));
+        assert!(framebuffer_status_rect_valid(&f,0,0,80,30));
+    }
+    #[test] fn kernel_p0_batch34_w6_844_outside_or_wrapping_rect_denied(){
+        let f=fb();
+        assert!(!framebuffer_status_rect_valid(&f,79,0,2,1));
+        assert!(!framebuffer_status_rect_valid(&f,0,29,1,2));
+        assert!(!framebuffer_status_rect_valid(&f,u64::MAX,0,2,1));
+        assert!(!framebuffer_status_rect_valid(&f,0,0,0,2));
+    }
+    #[test] fn kernel_p0_batch34_w6_845_invalid_pitch_or_mask_denies_render(){
+        let mut f=fb();f.pitch=79*4;
+        assert!(!framebuffer_status_rect_valid(&f,0,0,1,1));
+        f=fb();f.green_shift=16;
+        assert!(!framebuffer_status_rect_valid(&f,0,0,1,1));
+    }
+}
+
+#[cfg(test)] mod kernel_p0_batch35_w6 {
+ use super::*;
+ fn fb()->Framebuffer{
+  Framebuffer{address:0x1000 as *mut u8,width:80,height:30,
+   pitch:320,bpp:32,model:1,
+   red_size:8,red_shift:16,green_size:8,green_shift:8,
+   blue_size:8,blue_shift:0}
+ }
+ #[test] fn kernel_p0_batch35_w6_863_two_valid_limine_framebuffers(){
+  let a=fb();let b=fb();
+  let slots=[&a as *const Framebuffer,&b as *const Framebuffer];
+  let table=Framebuffers{revision:0,count:2,framebuffers:slots.as_ptr()};
+  assert!(limine_framebuffer_table_valid(&table));
+ }
+ #[test] fn kernel_p0_batch35_w6_864_late_misaligned_pointer_denied(){
+  let a=fb();
+  let slots=[&a as *const Framebuffer,0x1001usize as *const Framebuffer];
+  let table=Framebuffers{revision:0,count:2,framebuffers:slots.as_ptr()};
+  assert!(!limine_framebuffer_table_valid(&table));
+ }
+ #[test] fn kernel_p0_batch35_w6_865_empty_null_and_oversize_denied(){
+  let a=fb();let slots=[&a as *const Framebuffer];
+  let mut table=Framebuffers{revision:0,count:0,framebuffers:slots.as_ptr()};
+  assert!(!limine_framebuffer_table_valid(&table));
+  table.count=1;table.framebuffers=core::ptr::null();
+  assert!(!limine_framebuffer_table_valid(&table));
+  table.count=4097;table.framebuffers=slots.as_ptr();
+  assert!(!limine_framebuffer_table_valid(&table));
+ }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch36_w6 {
+    use super::*;
+    #[test] fn kernel_p0_batch36_w6_887_two_distinct_framebuffer_descriptors(){
+        let entries=[0x1000usize as *const Framebuffer,0x2000usize as *const Framebuffer];
+        let r=Framebuffers{revision:0,count:2,framebuffers:entries.as_ptr()};
+        assert!(limine_framebuffer_table_valid(&r));
+    }
+    #[test] fn kernel_p0_batch36_w6_888_duplicate_descriptor_rejected(){
+        let entries=[0x1000usize as *const Framebuffer,0x1000usize as *const Framebuffer];
+        let r=Framebuffers{revision:0,count:2,framebuffers:entries.as_ptr()};
+        assert!(!limine_framebuffer_table_valid(&r));
+    }
+    #[test] fn kernel_p0_batch36_w6_889_late_unaligned_descriptor_rejected(){
+        let entries=[0x1000usize as *const Framebuffer,0x2001usize as *const Framebuffer];
+        let r=Framebuffers{revision:0,count:2,framebuffers:entries.as_ptr()};
+        assert!(!limine_framebuffer_table_valid(&r));
+    }
+    #[test] fn kernel_p0_batch36_w6_890_missing_and_oversized_tables_denied(){
+        let entries=[0x1000usize as *const Framebuffer];
+        for count in [0,4097]{
+            let r=Framebuffers{revision:0,count,framebuffers:entries.as_ptr()};
+            assert!(!limine_framebuffer_table_valid(&r));
+        }
+        let r=Framebuffers{revision:0,count:1,framebuffers:core::ptr::null()};
+        assert!(!limine_framebuffer_table_valid(&r));
     }
 }

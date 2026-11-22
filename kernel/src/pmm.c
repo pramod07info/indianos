@@ -48,6 +48,10 @@ static void reset(void) {
 
 bool pmm_initialize(uint64_t region_count, pmm_region_reader read_region,
                     void *context) {
+    /* Preserve live frame ownership across a rejected reinitialization. */
+    if (initialized) {
+        return false;
+    }
     reset();
     if (read_region == NULL || region_count == 0 ||
         region_count > MAX_PMM_MEMMAP_ENTRIES) {

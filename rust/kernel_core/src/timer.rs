@@ -622,17 +622,37 @@ fn current_irq_session(start_epoch:u64,end_epoch:u64,
     (expected_source==1||expected_source==2)&&
        same_timer_session(start_epoch,end_epoch,expected_source,observed_source)
 }
+/// Only an actually armed interrupt controller can authenticate a receipt.
+/// The APIC wins over PIC if both remain configured during switchover.
+fn source_irq_ready(source:u8,pic_armed:bool,apic_running:bool)->bool{
+    (source==1 && pic_armed && !apic_running) ||
+    (source==2 && apic_running)
+}
+fn tick_session_authorized(epoch:u64,current_epoch:u64,
+    source:u8,current_source:u8,pic_armed:bool,apic_running:bool,
+    exhausted:bool)->bool{
+    epoch!=0 && !exhausted &&
+    current_irq_session(epoch,current_epoch,source,current_source) &&
+    source_irq_ready(source,pic_armed,apic_running)
+}
 fn record_kernel_monotonic_tick(source:u8){
     let epoch=MONOTONIC_SESSION_EPOCH.load(Ordering::Acquire);
-    if source!=1&&source!=2{return;}
-    if MONOTONIC_SOURCE.load(Ordering::Acquire)!=source {return;}
+    if !tick_session_authorized(epoch,
+        MONOTONIC_SESSION_EPOCH.load(Ordering::Acquire),source,
+        MONOTONIC_SOURCE.load(Ordering::Acquire),
+        CONFIGURED.load(Ordering::Acquire),
+        XAPIC_TIMER_RUNNING.load(Ordering::Acquire),
+        MONOTONIC_EXHAUSTED.load(Ordering::Acquire)){return;}
     if MONOTONIC_IRQ_TICKS.fetch_update(
         Ordering::AcqRel,Ordering::Acquire,|n|n.checked_add(1)
     ).is_err(){
         MONOTONIC_EXHAUSTED.store(true,Ordering::Release);
-    }else if current_irq_session(epoch,
+    }else if tick_session_authorized(epoch,
         MONOTONIC_SESSION_EPOCH.load(Ordering::Acquire),source,
-        MONOTONIC_SOURCE.load(Ordering::Acquire)){
+        MONOTONIC_SOURCE.load(Ordering::Acquire),
+        CONFIGURED.load(Ordering::Acquire),
+        XAPIC_TIMER_RUNNING.load(Ordering::Acquire),
+        MONOTONIC_EXHAUSTED.load(Ordering::Acquire)){
         // Stamp first, then publish: a callback that lost a reset race
         // carries the OLD stamp and cannot authorize the new session.
         MONOTONIC_PROGRESS_EPOCH.store(epoch,Ordering::Release);
@@ -660,12 +680,34 @@ pub fn kernel_monotonic_100hz() -> Option<u64> {
         XAPIC_TIMER_RUNNING.load(Ordering::Acquire),
         CONFIGURED.load(Ordering::Acquire),
     );
-    if !same_timer_session(epoch,
-        MONOTONIC_SESSION_EPOCH.load(Ordering::Acquire),source,
-        MONOTONIC_SOURCE.load(Ordering::Acquire)){return None;}
+    let end_epoch=MONOTONIC_SESSION_EPOCH.load(Ordering::Acquire);
+    let end_source=MONOTONIC_SOURCE.load(Ordering::Acquire);
+    let end_receipt=MONOTONIC_PROGRESS_EPOCH.load(Ordering::Acquire);
+    if !monotonic_final_authorized(epoch,end_epoch,source,end_source,
+        receipt,end_receipt,
+        MONOTONIC_SESSION_PROGRESS.load(Ordering::Acquire),
+        MONOTONIC_EXHAUSTED.load(Ordering::Acquire),
+        CONFIGURED.load(Ordering::Acquire),
+        XAPIC_TIMER_RUNNING.load(Ordering::Acquire)){return None;}
     sample
 }
 
+// The final receipt prevents stop/rearm races from publishing stale time.
+fn monotonic_snapshot_fenced(start:u64,end:u64,source:u8,end_source:u8,
+    receipt:u64,end_receipt:u64,progress:bool,exhausted:bool)->bool{
+    !exhausted && progress && same_timer_session(start,end,source,end_source) &&
+    irq_receipt_valid(start,receipt,progress) &&
+    irq_receipt_valid(end,end_receipt,progress)
+}
+/// Recheck timer-controller ownership after the final IRQ receipt; stopping a
+/// PIC or promoting an APIC must not publish a stale PIC sample.
+fn monotonic_final_authorized(start:u64,end:u64,source:u8,end_source:u8,
+    receipt:u64,end_receipt:u64,progress:bool,exhausted:bool,
+    pic_armed:bool,apic_running:bool)->bool {
+    monotonic_snapshot_fenced(start,end,source,end_source,receipt,end_receipt,
+        progress,exhausted) &&
+    source_irq_ready(source,pic_armed,apic_running)
+}
 /// Pure publication guard: no new IRQ in the current session, a stopped
 /// source, conflicting APIC/PIC authority or numeric overflow deny time.
 pub const fn authoritative_monotonic_sample(
@@ -710,10 +752,54 @@ mod r118_monotonic_hardware_tick_tests{
 
 /// Count successful ring-3 APIC preemptions independently of delivered IRQs.
 /// Called only after a validated user frame has been captured.
+fn preemption_capture_budget(delivered:u64,captured:u64,running:bool)->bool {
+    running && captured<delivered
+}
+// Session fencing denies capture when a timer was stopped and rearmed,
+// even when its source ID remains the same.
+fn preemption_session_valid(before:u64,after:u64,
+    delivered:u64,captured:u64,running:bool)->bool {
+    before!=0 && before!=u64::MAX && before==after &&
+    preemption_capture_budget(delivered,captured,running)
+}
+// Reject IRQ count rewind while a live user preemption is published.
+fn preemption_delivery_receipt_valid(a:u64,b:u64,first:u64,last:u64,
+    captured:u64,running:bool)->bool{
+    first!=u64::MAX && last!=u64::MAX && last>=first &&
+    preemption_session_valid(a,b,first,captured,running)
+}
+// A PIC takeover or timer-source revocation cannot mint APIC preemption
+// evidence from stale but still-readable hardware IRQ counters.
+fn apic_preemption_receipt_valid(before:u64,after:u64,first:u64,last:u64,
+    captured:u64,running:bool,source_before:u8,source_after:u8)->bool {
+    source_before==2 && source_after==2 &&
+    preemption_delivery_receipt_valid(before,after,first,last,captured,running)
+}
+fn apic_preemption_receipt_authorized(
+    before_epoch:u64,after_epoch:u64,first_irq:u64,last_irq:u64,
+    captured:u64,running:bool,source_before:u8,source_after:u8,
+    exhausted_before:bool,exhausted_after:bool
+)->bool {
+    !exhausted_before && !exhausted_after &&
+    apic_preemption_receipt_valid(before_epoch,after_epoch,first_irq,
+        last_irq,captured,running,source_before,source_after)
+}
 pub fn xapic_record_preemption(){
-    // Ignore late captures after a timer has been stopped or masked.
-    if !XAPIC_TIMER_RUNNING.load(Ordering::Acquire){return;}
-    XAPIC_PREEMPTIONS.fetch_update(Ordering::Relaxed,Ordering::Relaxed,|v|v.checked_add(1)).ok();
+    // Carry both exhaustion observations across the IRQ accounting
+    // transaction, not only the publication side.
+    let epoch=MONOTONIC_SESSION_EPOCH.load(Ordering::Acquire);
+    let source=MONOTONIC_SOURCE.load(Ordering::Acquire);
+    let exhausted=MONOTONIC_EXHAUSTED.load(Ordering::Acquire);
+    let delivered=XAPIC_IRQ_TICKS.load(Ordering::Acquire);
+    XAPIC_PREEMPTIONS.fetch_update(Ordering::AcqRel,Ordering::Acquire,|v|{
+        if apic_preemption_receipt_authorized(epoch,
+            MONOTONIC_SESSION_EPOCH.load(Ordering::Acquire),delivered,
+            XAPIC_IRQ_TICKS.load(Ordering::Acquire),v,
+            XAPIC_TIMER_RUNNING.load(Ordering::Acquire),
+            source,MONOTONIC_SOURCE.load(Ordering::Acquire),
+            exhausted,MONOTONIC_EXHAUSTED.load(Ordering::Acquire)
+        ){v.checked_add(1)}else{None}
+    }).ok();
 }
 #[no_mangle]
 pub extern "C" fn x86_64_xapic_timer_preemption_count()->u64{
@@ -724,15 +810,61 @@ pub extern "C" fn x86_64_xapic_timer_preemption_count()->u64{
 pub const fn xapic_preemption_evidence(irq:u64,preemptions:u64)->bool{
     irq>0 && preemptions>0 && preemptions<=irq
 }
+fn apic_live_progress_valid(
+ irq:u64,captured:u64,running:bool,source:u8,epoch:u64,exhausted:bool
+)->bool {
+ apic_preemption_authorized(running,source,epoch,exhausted) &&
+ xapic_preemption_evidence(irq,captured)
+}
+/// Fence diagnostic progress across both hardware and session observations.
+fn apic_progress_snapshot_authorized(
+    first_epoch:u64,last_epoch:u64,first_source:u8,last_source:u8,
+    first_irq:u64,last_irq:u64,first_capture:u64,last_capture:u64,
+    first_running:bool,last_running:bool,
+    first_exhausted:bool,last_exhausted:bool,
+)->bool{
+    first_epoch==last_epoch &&
+    apic_preemption_authorized(first_running,first_source,first_epoch,first_exhausted) &&
+    apic_preemption_authorized(last_running,last_source,last_epoch,last_exhausted) &&
+    first_irq!=u64::MAX && last_irq!=u64::MAX &&
+    first_capture!=u64::MAX && last_capture!=u64::MAX &&
+    last_irq>=first_irq && last_capture>=first_capture &&
+    xapic_preemption_evidence(first_irq,first_capture) &&
+    xapic_preemption_evidence(last_irq,last_capture)
+}
 pub fn xapic_preemption_progress()->bool{
-    xapic_preemption_evidence(
-        x86_64_xapic_timer_irq_count(),x86_64_xapic_timer_preemption_count()
+    let epoch=MONOTONIC_SESSION_EPOCH.load(Ordering::Acquire);
+    let source=MONOTONIC_SOURCE.load(Ordering::Acquire);
+    let running=XAPIC_TIMER_RUNNING.load(Ordering::Acquire);
+    let exhausted=MONOTONIC_EXHAUSTED.load(Ordering::Acquire);
+    let irq=x86_64_xapic_timer_irq_count();
+    let captured=x86_64_xapic_timer_preemption_count();
+    let last_irq=x86_64_xapic_timer_irq_count();
+    let last_captured=x86_64_xapic_timer_preemption_count();
+    apic_progress_snapshot_authorized(
+        epoch,MONOTONIC_SESSION_EPOCH.load(Ordering::Acquire),
+        source,MONOTONIC_SOURCE.load(Ordering::Acquire),
+        irq,last_irq,captured,last_captured,
+        running,XAPIC_TIMER_RUNNING.load(Ordering::Acquire),
+        exhausted,MONOTONIC_EXHAUSTED.load(Ordering::Acquire)
     )
 }
-/// An APIC timer interrupt may preempt only while the timer is armed.
+/// A running bit alone is insufficient after controller handover or session exhaustion.
+fn apic_preemption_ready(running:bool,source:u8,epoch:u64)->bool {
+    running && source==2 && epoch!=0 && epoch!=u64::MAX
+}
+/// An APIC timer interrupt may preempt only with live timer-source authority.
 #[no_mangle]
+fn apic_preemption_authorized(running:bool,source:u8,epoch:u64,exhausted:bool)->bool {
+    !exhausted && apic_preemption_ready(running,source,epoch)
+}
 pub extern "C" fn x86_64_xapic_timer_preemption_ready()->bool{
-    XAPIC_TIMER_RUNNING.load(Ordering::Acquire)
+    apic_preemption_authorized(
+        XAPIC_TIMER_RUNNING.load(Ordering::Acquire),
+        MONOTONIC_SOURCE.load(Ordering::Acquire),
+        MONOTONIC_SESSION_EPOCH.load(Ordering::Acquire),
+        MONOTONIC_EXHAUSTED.load(Ordering::Acquire)
+    )
 }
 
 // R024: One dedicated, supervisor-only UC alias for the local xAPIC MMIO.
@@ -1252,5 +1384,295 @@ mod kernel_p0_batch22_w2_tests{
             irq_receipt_valid(9,9,true),true,12,true,false),None);
         assert_eq!(authoritative_monotonic_sample(2,
             irq_receipt_valid(9,9,true),false,12,false,true),None);
+    }
+}
+
+
+// Batch23 W2 P0-585..588: actual IRQ tick receipt is authorized by
+// controller state, not merely by stale monotonic source metadata.
+#[cfg(test)]
+mod kernel_p0_batch23_w2_tests{
+ use super::*;
+ #[test]fn kernel_p0_batch23_w2_585_pic_needs_active_irq0(){
+   assert!(source_irq_ready(1,true,false));
+   assert!(!source_irq_ready(1,false,false));
+ }
+ #[test]fn kernel_p0_batch23_w2_586_pic_cannot_override_running_apic(){
+   assert!(!source_irq_ready(1,true,true));
+   assert!(source_irq_ready(2,true,true));
+ }
+ #[test]fn kernel_p0_batch23_w2_587_apic_requires_running_timer(){
+   assert!(!source_irq_ready(2,true,false));
+   assert!(!source_irq_ready(2,false,false));
+   assert!(source_irq_ready(2,false,true));
+ }
+ #[test]fn kernel_p0_batch23_w2_588_untrusted_source_ids_denied(){
+   for invalid in [0,3,127,255]{
+     assert!(!source_irq_ready(invalid,true,true));
+   }
+   assert!(!source_irq_ready(0,false,false));
+ }
+}
+
+
+// Batch24 W2 P0-610..612: the actual IRQ monotonic increment and progress
+// publication both require one live authorized session. This is a bounded
+// BSP-source check, not an SMP-calibrated high-resolution clock.
+#[cfg(test)]
+mod kernel_p0_batch24_w2_tests{
+    use super::*;
+    #[test]fn kernel_p0_batch24_w2_610_pic_epoch_switch_and_apic_priority(){
+        assert!(tick_session_authorized(10,10,1,1,true,false,false));
+        assert!(!tick_session_authorized(10,11,1,1,true,false,false));
+        assert!(!tick_session_authorized(10,10,1,1,true,true,false));
+        assert!(tick_session_authorized(11,11,2,2,true,true,false));
+    }
+    #[test]fn kernel_p0_batch24_w2_611_stopped_and_wrong_source_denied(){
+        assert!(!tick_session_authorized(4,4,1,1,false,false,false));
+        assert!(!tick_session_authorized(4,4,2,2,true,false,false));
+        assert!(!tick_session_authorized(4,4,2,1,true,true,false));
+        assert!(!tick_session_authorized(0,0,1,1,true,false,false));
+    }
+    #[test]fn kernel_p0_batch24_w2_612_saturated_clock_never_rearms(){
+        assert!(!tick_session_authorized(4,4,2,2,false,true,true));
+        assert!(!tick_session_authorized(u64::MAX,0,2,2,false,true,false));
+        assert!(tick_session_authorized(4,4,2,2,false,true,false));
+    }
+}
+
+// P0-631..635: source/epoch/receipt survive final time publication.
+#[cfg(test)]
+mod kernel_p0_batch25_w2_tests {
+    use super::*;
+    #[test]fn kernel_p0_batch25_w2_631_valid_pic_receipt(){
+        assert!(monotonic_snapshot_fenced(8,8,1,1,8,8,true,false));
+    }
+    #[test]fn kernel_p0_batch25_w2_632_missing_initial_receipt(){
+        assert!(!monotonic_snapshot_fenced(8,8,1,1,0,8,true,false));
+    }
+    #[test]fn kernel_p0_batch25_w2_633_invalidated_final_receipt(){
+        assert!(!monotonic_snapshot_fenced(8,8,2,2,8,0,true,false));
+    }
+    #[test]fn kernel_p0_batch25_w2_634_epoch_and_source_aba_denied(){
+        assert!(!monotonic_snapshot_fenced(8,9,2,2,8,9,true,false));
+        assert!(!monotonic_snapshot_fenced(8,8,1,2,8,8,true,false));
+    }
+    #[test]fn kernel_p0_batch25_w2_635_stopped_and_exhausted_denied(){
+        assert!(!monotonic_snapshot_fenced(8,8,2,2,8,8,false,false));
+        assert!(!monotonic_snapshot_fenced(8,8,2,2,8,8,true,true));
+    }
+}
+
+// P0-660..662: timer shutdown/switchover cannot publish stale time.
+#[cfg(test)]
+mod kernel_p0_batch26_w2_tests {
+    use super::*;
+    #[test]fn kernel_p0_batch26_w2_660_live_pic_final_receipt(){
+        assert!(monotonic_final_authorized(7,7,1,1,7,7,true,false,true,false));
+    }
+    #[test]fn kernel_p0_batch26_w2_661_disarmed_pic_denies_publication(){
+        assert!(!monotonic_final_authorized(7,7,1,1,7,7,true,false,false,false));
+    }
+    #[test]fn kernel_p0_batch26_w2_662_apic_takeover_revokes_pic(){
+        assert!(!monotonic_final_authorized(7,7,1,1,7,7,true,false,true,true));
+        assert!(monotonic_final_authorized(8,8,2,2,8,8,true,false,false,true));
+    }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch27_w2_tests {
+    use super::*;
+    #[test]fn kernel_p0_batch27_w2_680_first_delivered_irq_authorizes_capture(){
+        assert!(preemption_capture_budget(1,0,true));
+        assert!(preemption_capture_budget(20,19,true));
+    }
+    #[test]fn kernel_p0_batch27_w2_681_capture_cannot_exceed_irq_receipts(){
+        assert!(!preemption_capture_budget(1,1,true));
+        assert!(!preemption_capture_budget(1,2,true));
+    }
+    #[test]fn kernel_p0_batch27_w2_682_zero_delivery_never_mints_preemption(){
+        assert!(!preemption_capture_budget(0,0,true));
+        assert!(!xapic_preemption_evidence(0,0));
+    }
+    #[test]fn kernel_p0_batch27_w2_683_stopped_or_exhausted_cannot_mint(){
+        assert!(!preemption_capture_budget(3,0,false));
+        assert!(!preemption_capture_budget(u64::MAX,u64::MAX,true));
+        assert!(xapic_preemption_evidence(3,3));
+        assert!(!xapic_preemption_evidence(3,4));
+    }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch28_w2 {
+ use super::*;
+ #[test]fn kernel_p0_batch28_w2_705_live_epoch_irq_budget_accepts_capture(){
+  assert!(preemption_session_valid(3,3,1,0,true));
+  assert!(preemption_session_valid(3,3,5,4,true));
+ }
+ #[test]fn kernel_p0_batch28_w2_706_rearm_aba_does_not_authorize_capture(){
+  assert!(!preemption_session_valid(3,4,10,0,true));
+  assert!(!preemption_session_valid(4,3,10,0,true));
+ }
+ #[test]fn kernel_p0_batch28_w2_707_stopped_zero_and_exhausted_denied(){
+  assert!(!preemption_session_valid(0,0,1,0,true));
+  assert!(!preemption_session_valid(1,1,1,0,false));
+  assert!(!preemption_session_valid(1,1,1,1,true));
+  assert!(!preemption_session_valid(1,1,0,0,true));
+ }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch29_w2{
+ use super::*;
+ #[test] fn kernel_p0_batch29_w2_726_valid_receipt(){assert!(preemption_delivery_receipt_valid(4,4,5,5,4,true));}
+ #[test] fn kernel_p0_batch29_w2_727_new_irq_keeps_receipt(){assert!(preemption_delivery_receipt_valid(4,4,5,6,4,true));}
+ #[test] fn kernel_p0_batch29_w2_728_counter_rewind_denied(){assert!(!preemption_delivery_receipt_valid(4,4,6,5,4,true));}
+ #[test] fn kernel_p0_batch29_w2_729_stale_or_exhausted_denied(){
+  assert!(!preemption_delivery_receipt_valid(4,5,5,5,0,true));
+  assert!(!preemption_delivery_receipt_valid(4,4,5,5,0,false));
+  assert!(!preemption_delivery_receipt_valid(4,4,5,5,5,true));
+ }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch30_w2 {
+    use super::*;
+    #[test] fn kernel_p0_batch30_w2_750_live_delivery_window_preserved(){
+        assert!(preemption_delivery_receipt_valid(9,9,5,6,4,true));
+    }
+    #[test] fn kernel_p0_batch30_w2_751_saturated_irq_never_mints_capture(){
+        assert!(!preemption_delivery_receipt_valid(9,9,u64::MAX,u64::MAX,0,true));
+        assert!(!preemption_delivery_receipt_valid(9,9,u64::MAX-1,u64::MAX,0,true));
+    }
+    #[test] fn kernel_p0_batch30_w2_752_epoch_wrap_and_rewind_rejected(){
+        assert!(!preemption_delivery_receipt_valid(u64::MAX,u64::MAX,5,5,4,true));
+        assert!(!preemption_delivery_receipt_valid(9,9,6,5,4,true));
+        assert!(!preemption_delivery_receipt_valid(9,10,5,5,4,true));
+    }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch31_w2 {
+    use super::*;
+    #[test]fn kernel_p0_batch31_w2_770_live_apic_capture_preserves_irq_budget(){
+        assert!(apic_preemption_receipt_valid(4,4,5,6,4,true,2,2));
+    }
+    #[test]fn kernel_p0_batch31_w2_771_pic_or_ambiguous_source_denied(){
+        for (a,b) in [(0,2),(1,2),(2,1),(2,0),(1,1)]{
+            assert!(!apic_preemption_receipt_valid(4,4,5,6,4,true,a,b));
+        }
+    }
+    #[test]fn kernel_p0_batch31_w2_772_stopped_or_saturated_timer_denied(){
+        assert!(!apic_preemption_receipt_valid(4,5,5,6,4,true,2,2));
+        assert!(!apic_preemption_receipt_valid(4,4,5,6,4,false,2,2));
+        assert!(!apic_preemption_receipt_valid(4,4,u64::MAX,u64::MAX,0,true,2,2));
+    }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch32_w2 {
+    use super::*;
+    #[test] fn kernel_p0_batch32_w2_790_running_xapic_live_epoch_is_ready(){
+        assert!(apic_preemption_ready(true,2,1));
+        assert!(apic_preemption_ready(true,2,42));
+    }
+    #[test] fn kernel_p0_batch32_w2_791_pic_handover_revokes_timer_ready(){
+        for source in [0,1,3,u8::MAX] {
+            assert!(!apic_preemption_ready(true,source,42));
+        }
+    }
+    #[test] fn kernel_p0_batch32_w2_792_stopped_or_exhausted_epoch_denied(){
+        assert!(!apic_preemption_ready(false,2,42));
+        assert!(!apic_preemption_ready(true,2,0));
+        assert!(!apic_preemption_ready(true,2,u64::MAX));
+    }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch33_w2 {
+    use super::*;
+    #[test] fn kernel_p0_batch33_w2_810_active_xapic_session_admitted(){
+        assert!(apic_preemption_authorized(true,2,23,false));
+        assert!(apic_preemption_receipt_valid(23,23,3,4,2,true,2,2));
+    }
+    #[test] fn kernel_p0_batch33_w2_811_sticky_exhaustion_revokes_preemption(){
+        assert!(!apic_preemption_authorized(true,2,23,true));
+        assert!(!apic_preemption_authorized(true,2,u64::MAX,false));
+    }
+    #[test] fn kernel_p0_batch33_w2_812_foreign_source_and_exhausted_irq_budget_denied(){
+        for source in [0,1,3]{assert!(!apic_preemption_authorized(true,source,23,false));}
+        assert!(!apic_preemption_receipt_valid(23,23,3,4,3,true,2,2));
+        assert!(!apic_preemption_receipt_valid(23,24,3,4,2,true,2,2));
+    }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch34_w2 {
+    use super::*;
+    #[test] fn kernel_p0_batch34_w2_830_live_receipt_without_exhaustion_admitted(){
+        assert!(apic_preemption_receipt_authorized(
+            9,9,5,6,2,true,2,2,false,false));
+    }
+    #[test] fn kernel_p0_batch34_w2_831_early_or_late_exhaustion_denied(){
+        assert!(!apic_preemption_receipt_authorized(
+            9,9,5,6,2,true,2,2,true,false));
+        assert!(!apic_preemption_receipt_authorized(
+            9,9,5,6,2,true,2,2,false,true));
+    }
+    #[test] fn kernel_p0_batch34_w2_832_cross_epoch_and_apic_source_handover_denied(){
+        assert!(!apic_preemption_receipt_authorized(
+            9,10,5,6,2,true,2,2,false,false));
+        assert!(!apic_preemption_receipt_authorized(
+            9,9,5,6,2,true,2,1,false,false));
+        assert!(!apic_preemption_receipt_authorized(
+            9,9,5,6,2,false,2,2,false,false));
+    }
+}
+
+#[cfg(test)] mod kernel_p0_batch35_w2 {
+ use super::*;
+ #[test] fn kernel_p0_batch35_w2_850_live_apic_progress_admitted(){
+  assert!(apic_live_progress_valid(9,3,true,2,8,false));
+ }
+ #[test] fn kernel_p0_batch35_w2_851_source_stop_and_exhaustion_revoked(){
+  assert!(!apic_live_progress_valid(9,3,true,1,8,false));
+  assert!(!apic_live_progress_valid(9,3,true,2,8,true));
+  assert!(!apic_live_progress_valid(9,3,false,2,8,false));
+ }
+ #[test] fn kernel_p0_batch35_w2_852_bad_epoch_or_irq_evidence_denied(){
+  assert!(!apic_live_progress_valid(9,3,true,2,0,false));
+  assert!(!apic_live_progress_valid(9,3,true,2,u64::MAX,false));
+  assert!(!apic_live_progress_valid(3,4,true,2,8,false));
+  assert!(!apic_live_progress_valid(9,0,true,2,8,false));
+ }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch36_w2 {
+    use super::*;
+    fn receipt()->(u64,u64,u8,u8,u64,u64,u64,u64,bool,bool,bool,bool){
+        (7,7,2,2,9,10,3,4,true,true,false,false)
+    }
+    #[test] fn kernel_p0_batch36_w2_870_live_progress_has_two_sided_receipt(){
+        let (a,b,c,d,e,f,g,h,i,j,k,l)=receipt();
+        assert!(apic_progress_snapshot_authorized(a,b,c,d,e,f,g,h,i,j,k,l));
+    }
+    #[test] fn kernel_p0_batch36_w2_871_handover_or_rearm_denies_progress(){
+        let (a,b,c,d,e,f,g,h,i,j,k,l)=receipt();
+        assert!(!apic_progress_snapshot_authorized(a,b+1,c,d,e,f,g,h,i,j,k,l));
+        assert!(!apic_progress_snapshot_authorized(a,b,c,1,e,f,g,h,i,j,k,l));
+    }
+    #[test] fn kernel_p0_batch36_w2_872_rewinding_or_forged_irq_budget_denied(){
+        let (a,b,c,d,e,f,g,h,i,j,k,l)=receipt();
+        assert!(!apic_progress_snapshot_authorized(a,b,c,d,11,f,g,h,i,j,k,l));
+        assert!(!apic_progress_snapshot_authorized(a,b,c,d,e,f,10,h,i,j,k,l));
+        assert!(!apic_progress_snapshot_authorized(a,b,c,d,e,f,g,11,i,j,k,l));
+    }
+    #[test] fn kernel_p0_batch36_w2_873_stop_exhaustion_and_saturation_denied(){
+        let (a,b,c,d,e,f,g,h,i,j,k,l)=receipt();
+        assert!(!apic_progress_snapshot_authorized(a,b,c,d,e,f,g,h,i,false,k,l));
+        assert!(!apic_progress_snapshot_authorized(a,b,c,d,e,f,g,h,i,j,k,true));
+        assert!(!apic_progress_snapshot_authorized(a,b,c,d,e,u64::MAX,g,h,i,j,k,l));
+        assert!(!apic_progress_snapshot_authorized(a,b,c,d,e,f,0,h,i,j,k,l));
     }
 }

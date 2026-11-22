@@ -55,13 +55,61 @@ pub struct SyscallRequest {
     pub(crate) arg1: u64,
 }
 
+/// Pure user-memory layout preflight, before either syscall numeric policy
+/// or ring3 trap-frame admission. A malformed guard must not be bypassed.
+fn user_stack_layout_valid(plan:&ProgramPlan)->bool{
+    plan.stack_begin>=USER_MIN && plan.stack_end<=USER_TOP &&
+    plan.stack_begin<plan.stack_end &&
+    plan.stack_begin%PAGE_BYTES==0 &&
+    plan.stack_end%PAGE_BYTES==0 &&
+    // A zero guard means this plan is not yet given a numeric guard
+    // (e.g. staged test images); actual page-table validation remains
+    // mandatory. Once present, a guard must be aligned and non-overlapping.
+    (plan.guard_begin==0 ||
+      (plan.guard_begin>=USER_MIN && plan.guard_begin%PAGE_BYTES==0 &&
+       plan.guard_begin.checked_add(PAGE_BYTES)
+          .is_some_and(|end|end<=plan.stack_begin)))
+}
+/// Refuse ambiguous ELF page ownership before any numeric user-copy or IRET.
+/// The installed PTE user/supervisor and NX flags still require live checks.
+fn user_segment_layout_valid(plan:&ProgramPlan)->bool {
+    let count=plan.segment_count as usize;
+    if count>MAX_SEGMENTS{return false;}
+    for (i,seg) in plan.segments[..count].iter().enumerate() {
+        if seg.page_begin<USER_MIN || seg.page_end>USER_TOP ||
+           seg.page_begin>=seg.page_end ||
+           seg.page_begin%PAGE_BYTES!=0 || seg.page_end%PAGE_BYTES!=0 ||
+           (seg.page_begin<plan.stack_end && plan.stack_begin<seg.page_end) ||
+           // Loaded ELF bytes may not escape the segment's actual owned pages.
+           // Empty test descriptors retain legacy numeric ABI compatibility.
+           seg.file_size>seg.memory_size ||
+           // Installed ELF data must not be writable AND executable, even
+           // for read-only syscall copies. Empty staged descriptors keep
+           // their legacy numeric compatibility until real PTE admission.
+           (seg.memory_size!=0 && seg.writable && seg.executable) ||
+           seg.file_offset.checked_add(seg.file_size).is_none() ||
+           (seg.memory_size!=0 &&
+             (seg.virtual_address<seg.page_begin ||
+              seg.virtual_address.checked_add(seg.memory_size)
+                .is_none_or(|end|end>seg.page_end))) {
+            return false;
+        }
+        // An ELF descriptor may span a protected numeric guard while
+        // legitimate bytes on either side remain addressable. Guard checks
+        // apply to each requested span/RIP, not to the entire descriptor.
+        // Multiple ELF descriptors claiming the same page stay forbidden.
+        if plan.segments[..i].iter().any(|other|
+            seg.page_begin<other.page_end && other.page_begin<seg.page_end){
+            return false;
+        }
+    }
+    true
+}
 pub(crate) fn user_range(plan: &ProgramPlan, address: u64, length: u64, write: bool) -> bool {
     if length == 0 || address < USER_MIN || address >= USER_TOP ||
         length > USER_TOP - address ||
         plan.segment_count as usize > MAX_SEGMENTS ||
-        plan.stack_begin < USER_MIN ||
-        plan.stack_end > USER_TOP ||
-        plan.stack_begin >= plan.stack_end {
+        !user_stack_layout_valid(plan) || !user_segment_layout_valid(plan) {
         return false;
     }
     // A malformed overlapping segment cannot reauthorize the protected
@@ -78,7 +126,17 @@ pub(crate) fn user_range(plan: &ProgramPlan, address: u64, length: u64, write: b
     }
     for seg in plan.segments.iter().take((plan.segment_count as usize).min(MAX_SEGMENTS)) {
         if address >= seg.page_begin && address < seg.page_end &&
+            seg.page_begin>=USER_MIN && seg.page_end<=USER_TOP &&
+            seg.page_begin<seg.page_end &&
+            seg.page_begin%PAGE_BYTES==0 && seg.page_end%PAGE_BYTES==0 &&
+            !(seg.page_begin<plan.stack_end && plan.stack_begin<seg.page_end) &&
             seg.page_end.checked_sub(address).is_some_and(|available| length <= available) &&
+            // ELF p_memsz bounds user copies; no page-tail slack disclosure.
+            // Legacy zero-sized staged numeric ABI plans remain supported.
+            (seg.memory_size==0 ||
+             seg.virtual_address.checked_add(seg.memory_size)
+               .is_some_and(|memory_end|
+                   address>=seg.virtual_address && end<=memory_end)) &&
             (!write || (seg.writable && !seg.executable)) {
             return true;
         }
@@ -179,6 +237,45 @@ pub unsafe extern "C" fn indianos_syscall_validate(
 /// Validate the CPU-generated ring-3 IRET frame before honoring syscalls or
 /// saving user context. 15 saved GPRs are followed by RIP, CS, RFLAGS, RSP, SS.
 /// This is a numeric policy check: it never dereferences user addresses.
+/// Never authorize IRET directly into the user stack or guard, even
+/// when a stale PTE could otherwise still mark that page executable.
+/// The installed page table has an independent and mandatory NX check.
+fn ring3_instruction_span_valid(plan:&ProgramPlan,rip:u64)->bool {
+    if !(USER_MIN..USER_TOP).contains(&rip) ||
+       (plan.stack_begin..plan.stack_end).contains(&rip){return false;}
+    if plan.guard_begin>=USER_MIN &&
+       plan.guard_begin.checked_add(PAGE_BYTES)
+         .is_some_and(|end|(plan.guard_begin..end).contains(&rip)){
+        return false;
+    }
+    if !user_segment_layout_valid(plan){return false;}
+    // Staged ABI self-tests have no ELF segments. A loaded ELF cannot
+    // restore RIP into a writable, unmapped or non-executable segment.
+    if plan.segment_count!=0 {
+        let executable_at=|address:u64|plan.segments.iter().take(plan.segment_count as usize).any(|s|
+            s.executable && !s.writable &&
+            s.page_begin>=USER_MIN && s.page_end<=USER_TOP &&
+            s.page_begin<s.page_end &&
+            s.page_begin%PAGE_BYTES==0 && s.page_end%PAGE_BYTES==0 &&
+            (s.page_begin..s.page_end).contains(&address) &&
+            // Zero-size staged plans retain numeric ABI compatibility;
+            // actual installed PTE/NX protection remains separately required.
+            (s.memory_size==0 ||
+             s.virtual_address.checked_add(s.memory_size)
+               .is_some_and(|end|(s.virtual_address..end).contains(&address))));
+        // Both the original ELF entry and saved RIP must have an unambiguous
+        // executable owner; an entry in padding cannot authorize IRET.
+        return executable_at(plan.entry) && executable_at(rip);
+    }
+    true
+}
+/// CPU interrupts can supply the resume-flag bit in the stacked RFLAGS.
+/// It is not an authorization request from user mode. Clear only RF when
+/// saving a real timer-IRQ frame; raw syscall frames remain strictly checked.
+/// Do not clear TF, DF, AC, IOPL or any reserved bits.
+pub(crate) const fn canonical_hardware_irq_rflags(flags:u64)->u64{
+    flags & !(1u64<<16)
+}
 pub(crate) fn ring3_frame_valid(
     frame: &[u64; 20], plan: &ProgramPlan, irq_enabled: bool,
 ) -> bool {
@@ -199,9 +296,8 @@ pub(crate) fn ring3_frame_valid(
         flags & FIXED != 0 &&
         flags & (IOPL | NT | VM | RESERVED | UNSUPPORTED) == 0 &&
         (flags & IF != 0) == irq_enabled &&
-        (USER_MIN..USER_TOP).contains(&rip) &&
-        plan.stack_begin >= USER_MIN && plan.stack_end <= USER_TOP &&
-        plan.stack_begin < plan.stack_end &&
+        ring3_instruction_span_valid(plan,rip) &&
+        user_stack_layout_valid(plan) &&
         rsp >= plan.stack_begin && rsp <= plan.stack_end
 }
 
@@ -617,12 +713,21 @@ pub(crate) fn user_copy_batch_valid(plan:&ProgramPlan,spans:&[CopySpan])->bool{
 /// The live trap path still uses ring3_frame_valid and MUST be upgraded
 /// before this strict policy can count as a production NX/W^X guarantee.
 /// No hardware page tables are changed by this numeric check.
-pub(crate) fn ring3_frame_strict_execution(
+pub(crate) fn strict_file_backed_instruction(segment:&ProgramSegment,address:u64)->bool {
+ if !segment.executable || segment.writable ||
+    segment.file_size==0 || segment.file_size>segment.memory_size{
+  return false;
+ }
+ segment.virtual_address.checked_add(segment.file_size)
+   .is_some_and(|end|address>=segment.virtual_address && address<end)
+}
+fn ring3_frame_strict_execution(
  frame:&[u64;20],plan:&ProgramPlan,irq_enabled:bool)->bool{
  if !ring3_frame_valid(frame,plan,irq_enabled)||
     plan.segment_count==0||plan.segment_count as usize>MAX_SEGMENTS||
     plan.guard_begin.checked_add(PAGE_BYTES)!=Some(plan.stack_begin)||
-    frame[18]>=plan.stack_end{
+    plan.stack_end.checked_sub(plan.stack_begin)!=Some(STACK_BYTES)||
+    frame[18]>=plan.stack_end||frame[18]&7!=0{
   return false;
  }
  let rip=frame[15];
@@ -634,6 +739,7 @@ pub(crate) fn ring3_frame_strict_execution(
      segment.page_begin%PAGE_BYTES!=0||segment.page_end%PAGE_BYTES!=0||
      segment.virtual_address<segment.page_begin||
      segment.memory_size==0||segment.file_size>segment.memory_size||
+     segment.file_offset.checked_add(segment.file_size).is_none()||
      segment.virtual_address.checked_add(segment.memory_size)
         .is_none_or(|end|end>segment.page_end)||
      (segment.executable&&segment.writable)||
@@ -647,12 +753,13 @@ pub(crate) fn ring3_frame_strict_execution(
     return false; // shared pages cannot silently override NX/guard rights
    }
   }
-  if segment.executable{
-   if let Some(end)=segment.virtual_address.checked_add(segment.memory_size){
-    if (segment.virtual_address..end).contains(&rip){rip_executable=true;}
-    if (segment.virtual_address..end).contains(&plan.entry){
-     entry_executable=true;
-    }
+  if segment.executable {
+   // The strict path requires *file-backed* code, not merely executable
+   // reserved/zero-filled pages from p_memsz beyond p_filesz.
+   if segment.file_size==0{return false;}
+   if strict_file_backed_instruction(segment,rip){rip_executable=true;}
+   if strict_file_backed_instruction(segment,plan.entry){
+    entry_executable=true;
    }
   }
  }
@@ -815,5 +922,490 @@ mod kernel_p0_batch22_w3_tests{
         f[17]=0x202;
         assert!(ring3_frame_valid(&f,&p,true));
         assert!(!ring3_frame_valid(&f,&p,false));
+    }
+}
+
+
+// Batch23 W3 P0-589..592: live syscall and ring3 numeric gates reject
+// malformed user guard and segment layout before supervisor may copy bytes.
+#[cfg(test)]
+mod kernel_p0_batch23_w3_tests{
+ use super::*;
+ fn plan()->ProgramPlan{
+    let mut p=ProgramPlan{entry:USER_MIN,stack_begin:USER_TOP-STACK_BYTES,
+      stack_end:USER_TOP,guard_begin:USER_TOP-STACK_BYTES-PAGE_BYTES,
+      segment_count:1,segments:[ProgramSegment::empty();MAX_SEGMENTS]};
+    p.segments[0]=ProgramSegment{page_begin:USER_MIN,page_end:USER_MIN+PAGE_BYTES,
+      writable:true,..ProgramSegment::empty()};p
+ }
+ #[test]fn kernel_p0_batch23_w3_589_malformed_guard_denied_but_staged_compat(){
+    let mut p=plan();p.guard_begin=USER_MIN+1;
+    assert!(!user_stack_layout_valid(&p));
+    assert!(!user_range(&p,USER_MIN,8,true));
+    // Zero-guard staging is permitted; live PTE checks still gate copies.
+    p.guard_begin=0;
+    assert!(user_stack_layout_valid(&p));
+    assert!(user_range(&p,USER_MIN,8,true));
+ }
+ #[test]fn kernel_p0_batch23_w3_590_overlapping_guard_stack_denied(){
+    let mut p=plan();p.guard_begin=p.stack_begin;
+    assert!(!user_range(&p,p.stack_begin,8,true));
+    p=plan();p.guard_begin=p.stack_begin-PAGE_BYTES+1;
+    assert!(!user_range(&p,USER_MIN,8,false));
+ }
+ #[test]fn kernel_p0_batch23_w3_591_malformed_segment_denied(){
+    let mut p=plan();
+    assert!(user_range(&p,USER_MIN,8,true));
+    p.segments[0].page_begin=USER_MIN+1;
+    assert!(!user_range(&p,USER_MIN+1,8,true));
+    p=plan();p.segments[0].page_end=USER_MIN+PAGE_BYTES-1;
+    assert!(!user_range(&p,USER_MIN,8,true));
+ }
+ #[test]fn kernel_p0_batch23_w3_592_valid_stack_and_segment_preserved(){
+    let p=plan();
+    assert!(user_stack_layout_valid(&p));
+    assert!(user_range(&p,USER_MIN,16,true));
+    assert!(user_range(&p,p.stack_begin,16,true));
+    assert!(!user_range(&p,p.guard_begin,16,false));
+ }
+}
+
+
+// Batch24 W3 P0-613..615: numeric ring3 IRET never lands on stack or
+// guard and rejects unaligned stack top. Live installed PTE checks remain
+// required independently of this preflight.
+#[cfg(test)]
+mod kernel_p0_batch24_w3_tests {
+    use super::*;
+    fn plan()->ProgramPlan {
+       ProgramPlan{entry:USER_MIN,stack_begin:USER_TOP-STACK_BYTES,
+          stack_end:USER_TOP,guard_begin:USER_TOP-STACK_BYTES-PAGE_BYTES,
+          segment_count:0,segments:[ProgramSegment::empty();MAX_SEGMENTS]}
+    }
+    fn frame(p:&ProgramPlan)->[u64;20] {
+       let mut f=[0;20];f[15]=USER_MIN;f[16]=0x2b;
+       f[17]=2;f[18]=p.stack_end-16;f[19]=0x33;f
+    }
+    #[test]fn kernel_p0_batch24_w3_613_non_page_aligned_stack_top_denied(){
+       let mut p=plan();let f=frame(&p);
+       assert!(ring3_frame_valid(&f,&p,false));
+       p.stack_end-=8;
+       assert!(!ring3_frame_valid(&f,&p,false));
+    }
+    #[test]fn kernel_p0_batch24_w3_614_stack_rip_denied(){
+       let p=plan();let mut f=frame(&p);
+       f[15]=p.stack_begin+8;
+       assert!(!ring3_frame_valid(&f,&p,false));
+       f[15]=USER_MIN;assert!(ring3_frame_valid(&f,&p,false));
+    }
+    #[test]fn kernel_p0_batch24_w3_615_guard_rip_denied(){
+       let mut p=plan();let mut f=frame(&p);
+       f[15]=p.guard_begin;
+       assert!(!ring3_frame_valid(&f,&p,false));
+       p.guard_begin=0;
+       assert!(ring3_frame_valid(&f,&p,false));
+    }
+}
+
+// P0-636..640: live IRET RIP must belong to executable ELF pages.
+#[cfg(test)]
+mod kernel_p0_batch25_w3_tests {
+    use super::*;
+    fn plan()->ProgramPlan{
+        let mut p=ProgramPlan{entry:USER_MIN,stack_begin:USER_TOP-STACK_BYTES,
+            stack_end:USER_TOP,guard_begin:USER_TOP-STACK_BYTES-PAGE_BYTES,
+            segment_count:1,segments:[ProgramSegment::empty();MAX_SEGMENTS]};
+        p.segments[0].page_begin=USER_MIN;
+        p.segments[0].page_end=USER_MIN+PAGE_BYTES;
+        p.segments[0].executable=true;
+        p
+    }
+    #[test]fn kernel_p0_batch25_w3_636_valid_code_page(){
+        assert!(ring3_instruction_span_valid(&plan(),USER_MIN+16));
+    }
+    #[test]fn kernel_p0_batch25_w3_637_nonexecuting_segment_denied(){
+        let mut p=plan();p.segments[0].executable=false;
+        assert!(!ring3_instruction_span_valid(&p,USER_MIN+16));
+    }
+    #[test]fn kernel_p0_batch25_w3_638_writable_executable_denied(){
+        let mut p=plan();p.segments[0].writable=true;
+        assert!(!ring3_instruction_span_valid(&p,USER_MIN+16));
+    }
+    #[test]fn kernel_p0_batch25_w3_639_foreign_code_page_denied(){
+        let p=plan();assert!(!ring3_instruction_span_valid(&p,USER_MIN+PAGE_BYTES));
+        assert!(!ring3_instruction_span_valid(&p,p.stack_begin));
+    }
+    #[test]fn kernel_p0_batch25_w3_640_corrupt_segment_count_denied(){
+        let mut p=plan();p.segment_count=MAX_SEGMENTS as u32+1;
+        assert!(!ring3_instruction_span_valid(&p,USER_MIN));
+    }
+}
+
+// P0-663..665: user-space pages must have one unambiguous ELF owner.
+#[cfg(test)]
+mod kernel_p0_batch26_w3_tests {
+    use super::*;
+    fn plan()->ProgramPlan {
+        let mut p=ProgramPlan{entry:USER_MIN,stack_begin:USER_TOP-STACK_BYTES,
+            stack_end:USER_TOP,guard_begin:USER_TOP-STACK_BYTES-PAGE_BYTES,
+            segment_count:1,segments:[ProgramSegment::empty();MAX_SEGMENTS]};
+        p.segments[0].page_begin=USER_MIN;
+        p.segments[0].page_end=USER_MIN+PAGE_BYTES;
+        p.segments[0].executable=true;p
+    }
+    #[test]fn kernel_p0_batch26_w3_663_readonly_code_and_stack_survive(){
+        let p=plan();assert!(user_segment_layout_valid(&p));
+        assert!(ring3_instruction_span_valid(&p,USER_MIN+8));
+        assert!(user_range(&p,p.stack_begin,8,true));
+    }
+    #[test]fn kernel_p0_batch26_w3_664_overlapping_page_owners_denied(){
+        let mut p=plan();p.segment_count=2;p.segments[1].page_begin=USER_MIN;
+        p.segments[1].page_end=USER_MIN+PAGE_BYTES;p.segments[1].writable=true;
+        assert!(!user_segment_layout_valid(&p));
+        assert!(!user_range(&p,USER_MIN,8,false));
+        assert!(!ring3_instruction_span_valid(&p,USER_MIN));
+    }
+    #[test]fn kernel_p0_batch26_w3_665_guard_alias_denied(){
+        let mut p=plan();
+        p.segments[0].page_begin=p.guard_begin-PAGE_BYTES;
+        p.segments[0].page_end=p.guard_begin+PAGE_BYTES;
+        p.segments[0].executable=false;
+        p.segments[0].writable=true;
+        assert!(user_segment_layout_valid(&p));
+        assert!(user_range(&p,p.guard_begin-PAGE_BYTES,8,true));
+        assert!(!user_range(&p,p.guard_begin,8,true));
+        assert!(!user_range(&p,p.guard_begin-4,8,true));
+        assert!(!ring3_instruction_span_valid(&p,p.guard_begin));
+        assert!(user_range(&p,p.stack_begin,8,true));
+    }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch28_w3 {
+ use super::*;
+ fn plan()->ProgramPlan{
+  let mut segments=[ProgramSegment::empty();MAX_SEGMENTS];
+  segments[0]=ProgramSegment{
+   virtual_address:USER_MIN+16,file_offset:0,file_size:16,memory_size:32,
+   page_begin:USER_MIN,page_end:USER_MIN+2*PAGE_BYTES,
+   writable:false,executable:true
+  };
+  ProgramPlan{entry:USER_MIN+16,
+   stack_begin:USER_TOP-STACK_BYTES,stack_end:USER_TOP,
+   guard_begin:USER_TOP-STACK_BYTES-PAGE_BYTES,segment_count:1,segments}
+ }
+ #[test]fn kernel_p0_batch28_w3_708_valid_elf_read_only_code_retained(){
+  let p=plan();assert!(user_segment_layout_valid(&p));
+  assert!(user_range(&p,USER_MIN+16,16,false));
+ }
+ #[test]fn kernel_p0_batch28_w3_709_file_bytes_exceed_memory_denied(){
+  let mut p=plan();p.segments[0].file_size=33;
+  assert!(!user_segment_layout_valid(&p));
+  assert!(!user_range(&p,USER_MIN+16,16,false));
+ }
+ #[test]fn kernel_p0_batch28_w3_710_virtual_address_below_owned_page_denied(){
+  let mut p=plan();p.segments[0].virtual_address=USER_MIN-16;
+  assert!(!user_segment_layout_valid(&p));
+ }
+ #[test]fn kernel_p0_batch28_w3_711_segment_memory_escaping_page_denied(){
+  let mut p=plan();
+  p.segments[0].virtual_address=USER_MIN+2*PAGE_BYTES-16;
+  p.segments[0].memory_size=32;
+  assert!(!user_segment_layout_valid(&p));
+ }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch29_w3{
+ use super::*;
+ fn plan()->ProgramPlan{
+  let mut segments=[ProgramSegment::empty();MAX_SEGMENTS];
+  segments[0]=ProgramSegment{virtual_address:USER_MIN+16,file_offset:32,file_size:16,memory_size:32,
+   page_begin:USER_MIN,page_end:USER_MIN+PAGE_BYTES,writable:false,executable:true};
+  ProgramPlan{entry:USER_MIN+16,stack_begin:USER_TOP-STACK_BYTES,stack_end:USER_TOP,
+   guard_begin:USER_TOP-STACK_BYTES-PAGE_BYTES,segment_count:1,segments}
+ }
+ #[test] fn kernel_p0_batch29_w3_730_valid_elf(){let p=plan();assert!(user_segment_layout_valid(&p));assert!(ring3_instruction_span_valid(&p,USER_MIN+16));}
+ #[test] fn kernel_p0_batch29_w3_731_elf_offset_overflow(){let mut p=plan();p.segments[0].file_offset=u64::MAX-15;assert!(!user_segment_layout_valid(&p));}
+ #[test] fn kernel_p0_batch29_w3_732_exact_arithmetic_boundary(){let mut p=plan();p.segments[0].file_offset=u64::MAX-16;assert!(user_segment_layout_valid(&p));}
+ #[test] fn kernel_p0_batch29_w3_733_malformed_elf_denies_user_read_iret(){let mut p=plan();p.segments[0].file_offset=u64::MAX;assert!(!user_range(&p,USER_MIN+16,1,false));assert!(!ring3_instruction_span_valid(&p,USER_MIN+16));}
+}
+
+#[cfg(test)]
+mod kernel_p0_batch30_w3 {
+    use super::*;
+    fn plan()->ProgramPlan {
+        let mut segments=[ProgramSegment::empty();MAX_SEGMENTS];
+        segments[0]=ProgramSegment{
+            virtual_address:USER_MIN+64,file_offset:0,file_size:16,memory_size:32,
+            page_begin:USER_MIN,page_end:USER_MIN+PAGE_BYTES,
+            writable:false,executable:true};
+        ProgramPlan{entry:USER_MIN+64,
+            stack_begin:USER_TOP-STACK_BYTES,stack_end:USER_TOP,
+            guard_begin:USER_TOP-STACK_BYTES-PAGE_BYTES,
+            segment_count:1,segments}
+    }
+    #[test] fn kernel_p0_batch30_w3_753_elf_loaded_instruction_is_admitted(){
+        let p=plan();assert!(ring3_instruction_span_valid(&p,USER_MIN+64));
+    }
+    #[test] fn kernel_p0_batch30_w3_754_prefix_padding_is_not_executable(){
+        let p=plan();assert!(!ring3_instruction_span_valid(&p,USER_MIN+63));
+    }
+    #[test] fn kernel_p0_batch30_w3_755_suffix_padding_is_not_executable(){
+        let p=plan();assert!(ring3_instruction_span_valid(&p,USER_MIN+95));
+        assert!(!ring3_instruction_span_valid(&p,USER_MIN+96));
+    }
+    #[test] fn kernel_p0_batch30_w3_756_numeric_iret_cannot_restore_into_padding(){
+        let p=plan();let mut frame=[0u64;20];
+        frame[15]=USER_MIN+64;frame[16]=0x2b;frame[17]=0x2;
+        frame[18]=p.stack_end-8;frame[19]=0x33;
+        assert!(ring3_frame_valid(&frame,&p,false));
+        frame[15]=USER_MIN+96;assert!(!ring3_frame_valid(&frame,&p,false));
+    }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch31_w3 {
+    use super::*;
+    fn plan()->ProgramPlan{
+        let mut segments=[ProgramSegment::empty();MAX_SEGMENTS];
+        segments[0]=ProgramSegment{
+            virtual_address:USER_MIN+64,file_offset:0,file_size:32,memory_size:64,
+            page_begin:USER_MIN,page_end:USER_MIN+PAGE_BYTES,
+            writable:false,executable:true};
+        ProgramPlan{entry:USER_MIN+64,stack_begin:USER_TOP-STACK_BYTES,
+            stack_end:USER_TOP,guard_begin:USER_TOP-STACK_BYTES-PAGE_BYTES,
+            segment_count:1,segments}
+    }
+    #[test]fn kernel_p0_batch31_w3_773_valid_entry_and_resume_bytes(){
+        let p=plan();assert!(ring3_instruction_span_valid(&p,USER_MIN+80));
+    }
+    #[test]fn kernel_p0_batch31_w3_774_entry_in_page_padding_denied(){
+        let mut p=plan();p.entry=USER_MIN+128;
+        assert!(!ring3_instruction_span_valid(&p,USER_MIN+80));
+    }
+    #[test]fn kernel_p0_batch31_w3_775_entry_outside_all_segments_denied(){
+        let mut p=plan();p.entry=USER_MIN+2*PAGE_BYTES;
+        assert!(!ring3_instruction_span_valid(&p,USER_MIN+80));
+    }
+    #[test]fn kernel_p0_batch31_w3_776_disjoint_executable_sections_supported(){
+        let mut p=plan();p.segment_count=2;
+        p.segments[1]=ProgramSegment{
+            virtual_address:USER_MIN+PAGE_BYTES,file_offset:64,
+            file_size:8,memory_size:32,
+            page_begin:USER_MIN+PAGE_BYTES,page_end:USER_MIN+2*PAGE_BYTES,
+            executable:true,writable:false};
+        assert!(ring3_instruction_span_valid(&p,USER_MIN+PAGE_BYTES+8));
+        p.entry=USER_MIN+PAGE_BYTES+32;
+        assert!(!ring3_instruction_span_valid(&p,USER_MIN+80));
+    }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch32_w3 {
+    use super::*;
+    fn plan()->ProgramPlan {
+        let mut segments=[ProgramSegment::empty();MAX_SEGMENTS];
+        segments[0]=ProgramSegment{
+            virtual_address:USER_MIN+64,file_offset:0,file_size:16,memory_size:128,
+            page_begin:USER_MIN,page_end:USER_MIN+PAGE_BYTES,
+            writable:false,executable:true
+        };
+        ProgramPlan{entry:USER_MIN+64,
+            stack_begin:USER_TOP-STACK_BYTES,stack_end:USER_TOP,
+            guard_begin:USER_TOP-STACK_BYTES-PAGE_BYTES,
+            segment_count:1,segments}
+    }
+    fn frame(plan:&ProgramPlan,rip:u64)->[u64;20] {
+        let mut f=[0u64;20];
+        f[15]=rip;f[16]=0x2b;f[17]=0x2;
+        f[18]=plan.stack_end-8;f[19]=0x33;f
+    }
+    #[test] fn kernel_p0_batch32_w3_793_file_backed_elf_entry_and_resume_admitted(){
+        let p=plan();assert!(ring3_frame_strict_execution(
+            &frame(&p,USER_MIN+79),&p,false));
+    }
+    #[test] fn kernel_p0_batch32_w3_794_bss_tail_is_not_executable_resume(){
+        let p=plan();let f=frame(&p,USER_MIN+80);
+        assert!(ring3_frame_valid(&f,&p,false)); // legacy numeric staging
+        assert!(!ring3_frame_strict_execution(&f,&p,false));
+    }
+    #[test] fn kernel_p0_batch32_w3_795_entry_in_zero_fill_tail_denied(){
+        let mut p=plan();p.entry=USER_MIN+80;
+        assert!(!ring3_frame_strict_execution(
+            &frame(&p,USER_MIN+64),&p,false));
+    }
+    #[test] fn kernel_p0_batch32_w3_796_disjoint_file_backed_executable_sections(){
+        let mut p=plan();p.segment_count=2;
+        p.segments[1]=ProgramSegment{
+            virtual_address:USER_MIN+PAGE_BYTES+64,file_offset:128,
+            file_size:8,memory_size:32,
+            page_begin:USER_MIN+PAGE_BYTES,page_end:USER_MIN+2*PAGE_BYTES,
+            writable:false,executable:true
+        };
+        assert!(ring3_frame_strict_execution(
+            &frame(&p,USER_MIN+PAGE_BYTES+65),&p,false));
+        p.segments[1].file_size=0;
+        assert!(!ring3_frame_strict_execution(
+            &frame(&p,USER_MIN+PAGE_BYTES+65),&p,false));
+    }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch33_w3 {
+    use super::*;
+    fn plan()->ProgramPlan {
+        let mut segments=[ProgramSegment::empty();MAX_SEGMENTS];
+        segments[0]=ProgramSegment{virtual_address:USER_MIN+64,file_offset:0,
+            file_size:24,memory_size:128,page_begin:USER_MIN,
+            page_end:USER_MIN+PAGE_BYTES,writable:false,executable:true};
+        ProgramPlan{entry:USER_MIN+64,stack_begin:USER_TOP-STACK_BYTES,
+            stack_end:USER_TOP,guard_begin:USER_TOP-STACK_BYTES-PAGE_BYTES,
+            segment_count:1,segments}
+    }
+    fn saved(p:&ProgramPlan)->[u64;20]{
+        let mut f=[0;20];f[15]=p.entry;f[16]=0x2b;f[17]=0x2;
+        f[18]=p.stack_end-8;f[19]=0x33;f
+    }
+    #[test] fn kernel_p0_batch33_w3_813_strict_stack_valid_iret_frame(){
+        let p=plan();assert!(ring3_frame_strict_execution(&saved(&p),&p,false));
+    }
+    #[test] fn kernel_p0_batch33_w3_814_widened_or_shrunk_stack_denied(){
+        let mut p=plan();p.stack_begin-=PAGE_BYTES;
+        p.guard_begin-=PAGE_BYTES;
+        assert!(!ring3_frame_strict_execution(&saved(&p),&p,false));
+        p=plan();p.stack_begin+=PAGE_BYTES;
+        p.guard_begin+=PAGE_BYTES;
+        assert!(!ring3_frame_strict_execution(&saved(&p),&p,false));
+    }
+    #[test] fn kernel_p0_batch33_w3_815_unaligned_saved_stack_denied(){
+        let p=plan();let mut f=saved(&p);
+        f[18]-=1;
+        assert!(ring3_frame_valid(&f,&p,false)); // staged numeric ABI remains
+        assert!(!ring3_frame_strict_execution(&f,&p,false));
+    }
+    #[test] fn kernel_p0_batch33_w3_816_stack_lower_boundary_admitted_guard_denied(){
+        let mut p=plan();let mut f=saved(&p);
+        f[18]=p.stack_begin;
+        assert!(ring3_frame_strict_execution(&f,&p,false));
+        f[18]=p.stack_begin-8;
+        assert!(!ring3_frame_strict_execution(&f,&p,false));
+        p.guard_begin=0;
+        assert!(!ring3_frame_strict_execution(&saved(&p),&p,false));
+    }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch34_w3 {
+    use super::*;
+    fn code()->ProgramSegment{
+        ProgramSegment{virtual_address:USER_MIN+128,file_offset:4096,
+            file_size:16,memory_size:128,page_begin:USER_MIN,
+            page_end:USER_MIN+PAGE_BYTES,writable:false,executable:true}
+    }
+    #[test] fn kernel_p0_batch34_w3_833_start_and_last_real_code_byte_admitted(){
+        let c=code();
+        assert!(strict_file_backed_instruction(&c,USER_MIN+128));
+        assert!(strict_file_backed_instruction(&c,USER_MIN+143));
+    }
+    #[test] fn kernel_p0_batch34_w3_834_bss_and_presegment_bytes_denied(){
+        let c=code();
+        assert!(!strict_file_backed_instruction(&c,USER_MIN+144));
+        assert!(!strict_file_backed_instruction(&c,USER_MIN+127));
+    }
+    #[test] fn kernel_p0_batch34_w3_835_writable_or_nonexec_code_denied(){
+        let mut c=code();c.writable=true;
+        assert!(!strict_file_backed_instruction(&c,USER_MIN+128));
+        c.writable=false;c.executable=false;
+        assert!(!strict_file_backed_instruction(&c,USER_MIN+128));
+    }
+    #[test] fn kernel_p0_batch34_w3_836_elf_file_overflow_and_unbacked_code_denied(){
+        let mut c=code();c.virtual_address=u64::MAX-4;
+        assert!(!strict_file_backed_instruction(&c,u64::MAX-3));
+        c=code();c.file_size=0;
+        assert!(!strict_file_backed_instruction(&c,USER_MIN+128));
+        c=code();c.file_size=129;
+        assert!(!strict_file_backed_instruction(&c,USER_MIN+128));
+    }
+}
+
+#[cfg(test)] mod kernel_p0_batch35_w3 {
+ use super::*;
+ fn plan()->ProgramPlan{
+  let mut s=[ProgramSegment::empty();MAX_SEGMENTS];
+  s[0]=ProgramSegment{virtual_address:USER_MIN+32,file_offset:0,
+   file_size:16,memory_size:64,page_begin:USER_MIN,
+   page_end:USER_MIN+PAGE_BYTES,writable:true,executable:false};
+  ProgramPlan{entry:USER_MIN+32,stack_begin:USER_TOP-STACK_BYTES,
+   stack_end:USER_TOP,guard_begin:USER_TOP-STACK_BYTES-PAGE_BYTES,
+   segment_count:1,segments:s}
+ }
+ #[test] fn kernel_p0_batch35_w3_853_loaded_data_and_bss_admitted(){
+  let p=plan();
+  assert!(user_range(&p,USER_MIN+32,16,false));
+  assert!(user_range(&p,USER_MIN+64,32,true));
+ }
+ #[test] fn kernel_p0_batch35_w3_854_page_padding_outside_elf_denied(){
+  let p=plan();
+  assert!(!user_range(&p,USER_MIN,1,false));
+  assert!(!user_range(&p,USER_MIN+96,1,false));
+ }
+ #[test] fn kernel_p0_batch35_w3_855_cross_memory_end_denied(){
+  let p=plan();
+  assert!(user_range(&p,USER_MIN+88,8,true));
+  assert!(!user_range(&p,USER_MIN+88,9,true));
+  assert!(!user_range(&p,USER_MIN+32,u64::MAX,false));
+ }
+ #[test] fn kernel_p0_batch35_w3_856_legacy_empty_descriptor_compatible(){
+  let mut p=plan();
+  p.segments[0].memory_size=0;p.segments[0].file_size=0;
+  assert!(user_range(&p,USER_MIN,16,true));
+  p.segments[0].writable=false;
+  assert!(!user_range(&p,USER_MIN,16,true));
+ }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch36_w3 {
+    use super::*;
+    fn plan(writable:bool,executable:bool)->ProgramPlan {
+        let mut segments=[ProgramSegment::empty();MAX_SEGMENTS];
+        segments[0]=ProgramSegment{
+            virtual_address:USER_MIN+32,file_offset:0,file_size:32,
+            memory_size:128,page_begin:USER_MIN,page_end:USER_MIN+PAGE_BYTES,
+            writable,executable
+        };
+        ProgramPlan{entry:USER_MIN+32,stack_begin:USER_TOP-STACK_BYTES,
+            stack_end:USER_TOP,guard_begin:USER_TOP-STACK_BYTES-PAGE_BYTES,
+            segment_count:1,segments}
+    }
+    #[test] fn kernel_p0_batch36_w3_874_loaded_wx_segment_cannot_authorize_read(){
+        let p=plan(true,true);
+        assert!(!user_range(&p,USER_MIN+32,16,false));
+        assert!(!user_segment_layout_valid(&p));
+    }
+    #[test] fn kernel_p0_batch36_w3_875_loaded_wx_segment_cannot_authorize_write(){
+        let p=plan(true,true);
+        assert!(!user_range(&p,USER_MIN+32,16,true));
+        assert!(!user_range(&p,USER_MIN+96,32,true));
+    }
+    #[test] fn kernel_p0_batch36_w3_876_rx_code_readable_but_never_writable(){
+        let p=plan(false,true);
+        assert!(user_segment_layout_valid(&p));
+        assert!(user_range(&p,USER_MIN+32,16,false));
+        assert!(!user_range(&p,USER_MIN+32,16,true));
+    }
+    #[test] fn kernel_p0_batch36_w3_877_nonexecutable_data_read_write_preserved(){
+        let p=plan(true,false);
+        assert!(user_segment_layout_valid(&p));
+        assert!(user_range(&p,USER_MIN+64,64,false));
+        assert!(user_range(&p,USER_MIN+64,64,true));
+    }
+    #[test] fn kernel_p0_batch36_w3_878_empty_staged_descriptor_still_numeric(){
+        let mut p=plan(true,false);
+        p.segments[0].memory_size=0;p.segments[0].file_size=0;
+        assert!(user_range(&p,USER_MIN,16,true));
+        assert!(!user_range(&p,USER_MIN,0,true));
+        assert!(!user_range(&p,p.guard_begin,1,false));
     }
 }

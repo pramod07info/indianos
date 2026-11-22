@@ -433,6 +433,32 @@ static mut LAST_ERROR:u64=0;
 static mut LAST_ADDRESS:u64=0;
 #[cfg(feature="preempt")]
 static mut REPORTED_IF:bool=false;
+
+// R024: Evidence collected in the real APIC interrupt path, not synthetic
+// tick samples. Counters are monotone per QEMU test session and published
+// only after the timer has been quiesced. No failing IRQ becomes a preemption.
+#[cfg(feature="preempt")]
+static APIC_USER_IRQS:core::sync::atomic::AtomicU64=
+    core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature="preempt")]
+static APIC_KERNEL_IRQS:core::sync::atomic::AtomicU64=
+    core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature="preempt")]
+static APIC_UNREADY_IRQS:core::sync::atomic::AtomicU64=
+    core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature="preempt")]
+static APIC_REJECTED_USER_FRAMES:core::sync::atomic::AtomicU64=
+    core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature="preempt")]
+static APIC_REJECTED_RIP:core::sync::atomic::AtomicU64=
+    core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature="preempt")]
+static APIC_REJECTED_RFLAGS:core::sync::atomic::AtomicU64=
+    core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature="preempt")]
+static APIC_REJECTED_CS:core::sync::atomic::AtomicU64=
+    core::sync::atomic::AtomicU64::new(0);
+
 unsafe extern "C"{
  fn serial_write(s:*const c_char);
  fn boot_hhdm_offset(out:*mut u64)->bool;
@@ -483,10 +509,17 @@ fn capture(regs:*const u64,via_timer:bool)->bool{
 fn capture_frame(task:&mut Task,src:&[u64;WORDS],via_timer:bool)->bool{
  let Some(pcb)=(unsafe{task.pcb.as_ref()})else{return false};
  if pcb.state!=3{return false;}
+ // R024: a real hardware IRQ can stack RF=1 as a CPU resume hint.
+ // A raw user-supplied syscall/IRET frame cannot request RF. Normalize
+ // only the trusted CPU timer path and still reject every other unsafe flag.
+ let mut checked=*src;
+ if via_timer{
+  checked[17]=crate::syscall::canonical_hardware_irq_rflags(checked[17]);
+ }
  // User IF is a property of the runtime profile, including INT 0x80
  // continuations; it does not depend on whether this capture came from IRQ.
- if !ring3_frame_valid(src,&task.image.plan,USER_INTERRUPTS_ENABLED){return false;}
- task.frame.copy_from_slice(src);
+ if !ring3_frame_valid(&checked,&task.image.plan,USER_INTERRUPTS_ENABLED){return false;}
+ task.frame.copy_from_slice(&checked);
  if !via_timer{task.frame[14]=0;}
  task.saved=true;
  true
@@ -513,6 +546,24 @@ pub unsafe extern "C" fn x86_64_scheduler_timer_dispatch(regs:*const u64){
 pub unsafe extern "C" fn x86_64_scheduler_apic_timer_dispatch(regs:*const u64){
     let acknowledged=unsafe{crate::timer::x86_64_xapic_eoi()};
     if !acknowledged{return;}
+    #[cfg(feature="preempt")]
+    {
+        use core::sync::atomic::Ordering;
+        // A supervisor IRQ has a three-word CPU frame; never mistake it
+        // for a five-word user IRET frame or read nonexistent user SS/RSP.
+        if regs.is_null(){return;}
+        let cs=unsafe{*regs.add(16)};
+        if cs&3 !=3 {
+            APIC_KERNEL_IRQS.fetch_add(1,Ordering::Relaxed);
+            return;
+        }
+        APIC_USER_IRQS.fetch_add(1,Ordering::Relaxed);
+        if !crate::timer::x86_64_xapic_timer_preemption_ready(){
+            APIC_UNREADY_IRQS.fetch_add(1,Ordering::Relaxed);
+            return;
+        }
+    }
+    #[cfg(not(feature="preempt"))]
     if !crate::timer::x86_64_xapic_timer_preemption_ready(){return;}
     #[cfg(feature="preempt")]
     if capture(regs,true){
@@ -523,6 +574,18 @@ pub unsafe extern "C" fn x86_64_scheduler_apic_timer_dispatch(regs:*const u64){
             crate::timer::xapic_record_preemption();
             pid_log(unsafe{(*task.pcb).pid},b"APIC_TIMER_PREEMPTED\0");
             unsafe{x86_64_user_exit_to_kernel(YIELD)}
+        }
+    }
+    #[cfg(feature="preempt")]
+    {
+        use core::sync::atomic::Ordering;
+        APIC_REJECTED_USER_FRAMES.fetch_add(1,Ordering::Relaxed);
+        // Store only the first rejected user interrupt frame for exact
+        // QEMU evidence; capture must stay fail-closed.
+        if APIC_REJECTED_CS.load(Ordering::Relaxed)==0 && !regs.is_null(){
+            APIC_REJECTED_RIP.store(unsafe{*regs.add(15)},Ordering::Relaxed);
+            APIC_REJECTED_RFLAGS.store(unsafe{*regs.add(17)},Ordering::Relaxed);
+            APIC_REJECTED_CS.store(unsafe{*regs.add(16)},Ordering::Relaxed);
         }
     }
     #[cfg(not(feature="preempt"))]{let _=regs;}
@@ -2399,6 +2462,14 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
    log(b"IndianOS: R024 FATAL xAPIC/PIT2 calibration failed\n\0");
    return false;
   }
+  use core::sync::atomic::Ordering;
+  APIC_USER_IRQS.store(0,Ordering::Relaxed);
+  APIC_KERNEL_IRQS.store(0,Ordering::Relaxed);
+  APIC_UNREADY_IRQS.store(0,Ordering::Relaxed);
+  APIC_REJECTED_USER_FRAMES.store(0,Ordering::Relaxed);
+  APIC_REJECTED_RIP.store(0,Ordering::Relaxed);
+  APIC_REJECTED_RFLAGS.store(0,Ordering::Relaxed);
+  APIC_REJECTED_CS.store(0,Ordering::Relaxed);
   log(b"IndianOS: R024 calibrated periodic xAPIC IRQ at 100 Hz\n\0");
  }
  let mut ok=true;
@@ -2568,6 +2639,25 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
   if !stop_session_timer(){ok=false;}
   let irqs=crate::timer::x86_64_xapic_timer_irq_count();
   let captures=crate::timer::x86_64_xapic_timer_preemption_count();
+  use core::sync::atomic::Ordering;
+  fault_hex(b"IndianOS: R024 delivered APIC IRQs=0x\0",irqs);
+  fault_hex(b"IndianOS: R024 admitted captures=0x\0",captures);
+  fault_hex(b"IndianOS: R024 ring3 IRQ frames=0x\0",
+      APIC_USER_IRQS.load(Ordering::Relaxed));
+  fault_hex(b"IndianOS: R024 ring0 IRQ frames=0x\0",
+      APIC_KERNEL_IRQS.load(Ordering::Relaxed));
+  fault_hex(b"IndianOS: R024 unready ring3 IRQs=0x\0",
+      APIC_UNREADY_IRQS.load(Ordering::Relaxed));
+  fault_hex(b"IndianOS: R024 rejected ring3 frames=0x\0",
+      APIC_REJECTED_USER_FRAMES.load(Ordering::Relaxed));
+  if APIC_REJECTED_USER_FRAMES.load(Ordering::Relaxed)!=0 {
+      fault_hex(b"IndianOS: R024 first rejected RIP=0x\0",
+          APIC_REJECTED_RIP.load(Ordering::Relaxed));
+      fault_hex(b"IndianOS: R024 first rejected CS=0x\0",
+          APIC_REJECTED_CS.load(Ordering::Relaxed));
+      fault_hex(b"IndianOS: R024 first rejected RFLAGS=0x\0",
+          APIC_REJECTED_RFLAGS.load(Ordering::Relaxed));
+  }
   if irqs==0{log(b"IndianOS: R024 FATAL no xAPIC IRQs delivered\n\0");}
   if captures==0{log(b"IndianOS: R024 FATAL no ring-3 APIC captures\n\0");}
   if scheduler.yield_count<2 || scheduler.tick_count<2 ||
@@ -3180,6 +3270,9 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
   };
   task.image.plan.stack_begin=USER_TOP-STACK_BYTES;task.image.plan.stack_end=USER_TOP;
   task.image.plan.segment_count=1;
+  // A loaded executable has a real entry, unlike a zeroed staging task.
+  // The stricter IRET validator must check entry AND saved RIP ownership.
+  task.image.plan.entry=0x400000;
   task.image.plan.segments[0].virtual_address=0x400000;
   task.image.plan.segments[0].memory_size=PAGE;
   task.image.plan.segments[0].page_begin=0x400000;
@@ -3486,5 +3579,61 @@ mod r118_batched_real_scheduler_teardown_tests{
         assert!(coordinator.live_sockets_consistent(&sockets));
         assert_eq!(coordinator.active_udp_ports(),2);
         assert_eq!(notices.len(),0);
+    }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch27_w3_tests {
+    use super::*;
+    fn task(p:&mut Process)->Task {
+        p.pid=1;p.state=3;
+        let mut t:Task=unsafe{core::mem::zeroed()};
+        t.pcb=p;
+        t.image.plan.stack_begin=USER_TOP-STACK_BYTES;
+        t.image.plan.stack_end=USER_TOP;
+        t
+    }
+    fn frame()->[u64;WORDS] {
+        let mut f=[0u64;WORDS];
+        f[14]=42;f[15]=crate::syscall::USER_MIN+5;f[16]=0x2b;
+        f[17]=2|if USER_INTERRUPTS_ENABLED{0x200}else{0};
+        f[18]=USER_TOP-16;f[19]=0x33;f
+    }
+    #[test]fn kernel_p0_batch27_w3_684_real_timer_rf_capture_admitted(){
+        let mut p=Process::empty();let mut t=task(&mut p);
+        let mut f=frame();f[17]|=1<<16;
+        assert!(capture_frame(&mut t,&f,true));
+        assert!(t.saved);
+    }
+    #[test]fn kernel_p0_batch27_w3_685_cpu_rf_cleared_but_interrupt_policy_preserved(){
+        let mut p=Process::empty();let mut t=task(&mut p);
+        let mut f=frame();f[17]|=1<<16;
+        assert!(capture_frame(&mut t,&f,true));
+        assert_eq!(t.frame[17],f[17]&!(1<<16));
+        assert_eq!(t.frame[14],42);
+        assert_eq!(t.frame[17]&0x200,f[17]&0x200);
+    }
+    #[test]fn kernel_p0_batch27_w3_686_syscall_rf_injection_still_denied(){
+        let mut p=Process::empty();let mut t=task(&mut p);
+        let mut f=frame();f[17]|=1<<16;
+        assert!(!capture_frame(&mut t,&f,false));
+        assert!(!t.saved);
+    }
+    #[test]fn kernel_p0_batch27_w3_687_other_unsafe_flags_still_denied(){
+        let mut p=Process::empty();let mut t=task(&mut p);
+        for mask in [1u64<<8,1u64<<10,1u64<<18,3u64<<12] {
+            let mut f=frame();f[17]|=(1<<16)|mask;
+            assert!(!capture_frame(&mut t,&f,true));
+        }
+        assert!(!t.saved);
+    }
+    #[test]fn kernel_p0_batch27_w3_688_rejected_timer_frame_cannot_mutate_context(){
+        let mut p=Process::empty();let mut t=task(&mut p);
+        let mut good=frame();good[17]|=1<<16;
+        assert!(capture_frame(&mut t,&good,true));
+        let saved=t.frame;
+        let mut bad=good;bad[16]=0x08;
+        assert!(!capture_frame(&mut t,&bad,true));
+        assert_eq!(t.frame,saved);assert!(t.saved);
     }
 }

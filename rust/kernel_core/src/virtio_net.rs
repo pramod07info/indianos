@@ -309,27 +309,101 @@ fn receive_payload_len(used_len:usize,capacity:usize)->Result<usize,Error>{
 /// Without negotiated checksum/GSO features a legacy device must not
 /// inject offload metadata that would bypass the kernel's checksum checks.
 fn rx_offload_header_valid(header:&[u8])->bool {
-    header.len()>=10 && header[..10].iter().all(|&byte|byte==0)
+    header.len()==10 && header.iter().all(|&byte|byte==0)
 }
 /// The R028 stack accepts untagged Ethernet-II ingress only. An invalid
 /// source address or 802.3 length field must not reach higher-level parsers.
+// R028 implements Ethernet-II IPv4 and ARP; do not route other protocols.
+fn supported_r028_ethertype(p:u16)->bool{matches!(p,0x0800|0x0806)}
+fn unsupported_vlan_tag(ethertype:u16)->bool {
+    matches!(ethertype,0x8100|0x88a8|0x9100)
+}
 fn ethernet_ingress_valid(frame:&[u8])->bool{
-    if frame.len()<14{return false;}
+    if !(14..=1514).contains(&frame.len()){return false;}
     let source=&frame[6..12];
-    if source[0]&1!=0 || source.iter().all(|&x|x==0){return false;}
+    // A null destination can never be an Ethernet-II recipient.
+    if frame[..6].iter().all(|&x|x==0) ||
+       source[0]&1!=0 || source.iter().all(|&x|x==0){return false;}
     let ethertype=u16::from_be_bytes([frame[12],frame[13]]);
-    ethertype>=0x0600
+    supported_r028_ethertype(ethertype) && !unsupported_vlan_tag(ethertype)
+}
+/// Filter foreign unicast before returning a frame to the guest stack.
+/// Broadcast and multicast remain eligible for ARP/DHCP discovery; the
+/// upper network stack still validates protocol and destination IP.
+// IPv4 multicast MAC destinations are specific to IPv4. ARP must use
+// local unicast or the all-ones Ethernet broadcast destination.
+fn r028_destination_for_protocol(dest:&[u8],local:[u8;6],proto:u16)->bool{
+    dest==local.as_slice() || dest==[0xff;6].as_slice() ||
+    (proto==0x0800 && dest[0]==0x01 && dest[1]==0x00 &&
+     dest[2]==0x5e && dest[3]&0x80==0)
+}
+fn ethernet_destination_allowed(frame:&[u8],local:[u8;6])->bool{
+    if !ethernet_ingress_valid(frame) ||
+       local[0]&1!=0 || local.iter().all(|&x|x==0){
+        return false;
+    }
+    let dest=&frame[..6];
+    let protocol=u16::from_be_bytes([frame[12],frame[13]]);
+    supported_r028_ethertype(protocol) &&
+    r028_destination_for_protocol(dest,local,protocol)
 }
 /// The device owns the used-ring length. It cannot report bytes beyond
 /// the actual submitted header and Ethernet frame.
+/// In R028 the sole supported TX caller is the kernel's Ethernet stack.
+fn ethernet_egress_valid(frame:&[u8],local_mac:[u8;6])->bool{
+    if !(14..=1514).contains(&frame.len()) ||
+       local_mac[0]&1!=0 || local_mac.iter().all(|&x|x==0){
+        return false;
+    }
+    let src=&frame[6..12];
+    let dst=&frame[..6];
+    let protocol=u16::from_be_bytes([frame[12],frame[13]]);
+    src==local_mac.as_slice() &&
+    supported_r028_ethertype(protocol) && !unsupported_vlan_tag(protocol) &&
+    (r028_destination_for_protocol(dst,local_mac,protocol) ||
+     // Outbound peer-directed unicast is valid. Only RX must reject
+     // foreign unicast destinations; TX cannot require dst == local MAC.
+     (dst[0]&1==0 && dst.iter().any(|&byte|byte!=0)))
+}
+fn rx_ipv4_arp_header_valid(frame:&[u8])->bool{
+ if frame.len()<42{return false;}
+ frame[14..16]==[0,1] && frame[16..18]==[0x08,0x00] &&
+ frame[18]==6 && frame[19]==4 &&
+ matches!(u16::from_be_bytes([frame[20],frame[21]]),1|2) &&
+ // ARP sender hardware address must be the actual Ethernet sender;
+ // never publish a claimed layer-2 identity from another host.
+ frame[22..28]==frame[6..12] &&
+ frame[22]&1==0 && frame[22..28].iter().any(|&b|b!=0)
+}
+fn rx_l3_header_fits(frame:&[u8])->bool{
+    if frame.len()<14{return false;}
+    // IPv4 requires its fixed 20-byte header; Ethernet+ARP for IPv4
+    // requires 28 protocol bytes before the network stack can inspect it.
+    match u16::from_be_bytes([frame[12],frame[13]]){
+        0x0800=>frame.len()>=34,
+        0x0806=>rx_ipv4_arp_header_valid(frame),
+        _=>false,
+    }
+}
+fn rx_frame_authorized(used:usize,capacity:usize,header:&[u8],
+    frame:&[u8],local:[u8;6])->Result<usize,Error>{
+    let n=receive_payload_len(used,capacity)?;
+    if frame.len()!=n || !rx_offload_header_valid(header) ||
+       !rx_l3_header_fits(frame) || !ethernet_ingress_valid(frame) ||
+       !ethernet_destination_allowed(frame,local){return Err(Error::Invalid);}
+    Ok(n)
+}
 fn tx_completion_length_valid(reported:usize,frame_length:usize)->bool {
-    (14..=1514).contains(&frame_length) && reported<=frame_length+10
+    // Virtio legacy TX may report zero, or the entire submitted frame.
+    // A nonzero partial length is not an authenticated complete packet.
+    (14..=1514).contains(&frame_length) &&
+    (reported==0 || reported==frame_length+10)
 }
 impl EthernetDevice for VirtioNet{
     fn mac(&self)->[u8;6]{self.mac}
     fn send(&mut self,frame:&[u8])->Result<(),Error>{
         if self.faulted{return Err(Error::Device);}
-        if frame.len()<14 || frame.len()>1514{return Err(Error::Invalid);}
+        if !ethernet_egress_valid(frame,self.mac){return Err(Error::Invalid);}
         // A legacy virtio-net frame has a ten-byte header with all
         // segmentation/checksum offload fields clear.
         unsafe{
@@ -379,14 +453,8 @@ impl EthernetDevice for VirtioNet{
         // Drop rather than publish a frame if the NIC claims unsupported GSO
         // or checksum work. Return no caller bytes on rejection.
         let header=unsafe{core::slice::from_raw_parts(self.rx.buffer,10)};
-        if !rx_offload_header_valid(header){
-            self.rx.offer();
-            compiler_fence(Ordering::Release);
-            unsafe{outw(self.port+0x10,QUEUE_RX);}
-            return Err(Error::Invalid);
-        }
         let frame=unsafe{core::slice::from_raw_parts(self.rx.buffer.add(10),n)};
-        if !ethernet_ingress_valid(frame){
+        if rx_frame_authorized(length,out.len(),header,frame,self.mac).is_err(){
             self.rx.offer();
             compiler_fence(Ordering::Release);
             unsafe{outw(self.port+0x10,QUEUE_RX);}
@@ -595,5 +663,452 @@ mod kernel_p0_batch22_w5_tests{
         assert!(ethernet_ingress_valid(&f));
         f[12..14].copy_from_slice(&[0x08,0x00]);
         assert!(ethernet_ingress_valid(&f));
+    }
+}
+
+
+// Batch23 W5 P0-598..601: reject forged TX source addresses and unsupported
+// frame formats before handing any bytes to the live virtio DMA queue.
+#[cfg(test)]
+mod kernel_p0_batch23_w5_tests{
+ use super::*;
+ fn packet()->([u8;60],[u8;6]){
+    let mac=[0x52,0x54,0,0xaa,0xbb,0xcc];
+    let mut packet=[0u8;60];packet[..6].fill(0xff);
+    packet[6..12].copy_from_slice(&mac);
+    packet[12..14].copy_from_slice(&[0x08,0x06]);
+    (packet,mac)
+ }
+ #[test]fn kernel_p0_batch23_w5_598_valid_arp_ethernet_passes(){
+    let (packet,mac)=packet();
+    assert!(ethernet_egress_valid(&packet,mac));
+ }
+ #[test]fn kernel_p0_batch23_w5_599_spoofed_source_denied(){
+    let (mut packet,mac)=packet();packet[11]^=1;
+    assert!(!ethernet_egress_valid(&packet,mac));
+    assert!(!ethernet_egress_valid(&packet,[0;6]));
+ }
+ #[test]fn kernel_p0_batch23_w5_600_invalid_destination_denied(){
+    let (mut packet,mac)=packet();packet[..6].fill(0);
+    assert!(!ethernet_egress_valid(&packet,mac));
+    packet[..6].copy_from_slice(&[0x52,0x54,0,1,2,3]);
+    assert!(ethernet_egress_valid(&packet,mac));
+ }
+ #[test]fn kernel_p0_batch23_w5_601_length_coded_short_frame_denied(){
+    let (mut packet,mac)=packet();packet[12..14].copy_from_slice(&[5,0xdc]);
+    assert!(!ethernet_egress_valid(&packet,mac));
+    packet[12..14].copy_from_slice(&[0x08,0x00]);
+    assert!(ethernet_egress_valid(&packet,mac));
+    assert!(!ethernet_egress_valid(&packet[..13],mac));
+ }
+}
+
+
+// Batch24 W5 P0-620..622: actual R028 virtio receive ownership checks
+// reject foreign unicast before caller-visible bytes are copied.
+#[cfg(test)]
+mod kernel_p0_batch24_w5_tests{
+    use super::*;
+    const LOCAL:[u8;6]=[0x52,0x54,0,0x11,0x22,0x33];
+    fn frame()->[u8;60] {
+        let mut f=[0u8;60];
+        f[..6].copy_from_slice(&LOCAL);
+        f[6..12].copy_from_slice(&[0x52,0x54,0,0x44,0x55,0x66]);
+        f[12..14].copy_from_slice(&[0x08,0x06]);
+        f
+    }
+    #[test]fn kernel_p0_batch24_w5_620_local_unicast_retained(){
+        let f=frame();
+        assert!(ethernet_ingress_valid(&f));
+        assert!(ethernet_destination_allowed(&f,LOCAL));
+    }
+    #[test]fn kernel_p0_batch24_w5_621_foreign_unicast_rejected(){
+        let mut f=frame();
+        f[..6].copy_from_slice(&[0x52,0x54,0,0xaa,0xbb,0xcc]);
+        assert!(ethernet_ingress_valid(&f));
+        assert!(!ethernet_destination_allowed(&f,LOCAL));
+        assert!(!ethernet_destination_allowed(&f,[0;6]));
+    }
+    #[test]fn kernel_p0_batch24_w5_622_discovery_broadcast_and_multicast_retained(){
+        let mut f=frame();f[..6].fill(0xff);
+        assert!(ethernet_destination_allowed(&f,LOCAL));
+        // IPv4 multicast is valid; ARP multicast is not. Update this
+        // inherited fixture to describe an actual IPv4 discovery packet.
+        f[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+        f[..6].copy_from_slice(&[0x01,0x00,0x5e,0,0,1]);
+        assert!(ethernet_destination_allowed(&f,LOCAL));
+        assert!(!ethernet_destination_allowed(&f[..13],LOCAL));
+    }
+}
+
+// P0-646..650: bounded raw virtio input before guest-visible buffers.
+#[cfg(test)]
+mod kernel_p0_batch25_w5_tests {
+    use super::*;
+    const LOCAL:[u8;6]=[0x52,0x54,0,1,2,3];
+    fn frame()->[u8;60]{
+        let mut f=[0u8;60];
+        f[..6].copy_from_slice(&LOCAL);
+        f[6..12].copy_from_slice(&[0x52,0x54,0,4,5,6]);
+        f[12..14].copy_from_slice(&[8,6]);f
+    }
+    #[test]fn kernel_p0_batch25_w5_646_exact_virtio_header(){
+        assert!(rx_offload_header_valid(&[0;10]));
+        assert!(!rx_offload_header_valid(&[0;11]));
+        assert!(!rx_offload_header_valid(&[0;9]));
+    }
+    #[test]fn kernel_p0_batch25_w5_647_oversized_frame_denied(){
+        let mut packet=[0u8;1515];packet[..14].copy_from_slice(&frame()[..14]);
+        assert!(!ethernet_ingress_valid(&packet));
+        assert!(!ethernet_destination_allowed(&packet,LOCAL));
+    }
+    #[test]fn kernel_p0_batch25_w5_648_minimum_ethernet_frame(){
+        let sample=frame();
+        let short=&sample[..14];
+        assert!(ethernet_ingress_valid(short));
+        assert!(ethernet_destination_allowed(short,LOCAL));
+    }
+    #[test]fn kernel_p0_batch25_w5_649_multicast_source_denied(){
+        let mut f=frame();f[6]=0x01;
+        assert!(!ethernet_ingress_valid(&f));
+    }
+    #[test]fn kernel_p0_batch25_w5_650_tx_source_identity_enforced(){
+        let mut f=frame();
+        // TX must carry this NIC's source, not the foreign RX fixture source.
+        f[6..12].copy_from_slice(&LOCAL);
+        assert!(ethernet_egress_valid(&f,LOCAL));
+        f[6]=0x54;
+        assert!(!ethernet_egress_valid(&f,LOCAL));
+    }
+}
+
+// P0-670..672: no VLAN tag is admitted by the untagged-only R028 ABI.
+#[cfg(test)]
+mod kernel_p0_batch26_w5_tests {
+    use super::*;
+    const MAC:[u8;6]=[0x52,0x54,0,1,2,3];
+    fn frame(ethertype:u16)->[u8;60] {
+        let mut f=[0u8;60];f[..6].copy_from_slice(&MAC);
+        f[6..12].copy_from_slice(&MAC);
+        f[12..14].copy_from_slice(&ethertype.to_be_bytes());f
+    }
+    #[test]fn kernel_p0_batch26_w5_670_untagged_ipv4_arp_retained(){
+        for kind in [0x0800,0x0806] {
+            let f=frame(kind);
+            assert!(ethernet_ingress_valid(&f));
+            assert!(ethernet_egress_valid(&f,MAC));
+        }
+    }
+    #[test]fn kernel_p0_batch26_w5_671_vlan_encapsulation_denied_on_rx(){
+        for tag in [0x8100,0x88a8,0x9100] {
+            assert!(!ethernet_ingress_valid(&frame(tag)));
+        }
+    }
+    #[test]fn kernel_p0_batch26_w5_672_vlan_encapsulation_denied_on_tx(){
+        for tag in [0x8100,0x88a8,0x9100] {
+            assert!(!ethernet_egress_valid(&frame(tag),MAC));
+        }
+    }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch27_w5_tests {
+    use super::*;
+    const LOCAL:[u8;6]=[0x52,0x54,0,1,2,3];
+    const PEER:[u8;6]=[0x52,0x54,0,4,5,6];
+    fn frame(ethertype:u16)->[u8;60]{
+        let mut f=[0u8;60];f[..6].copy_from_slice(&LOCAL);
+        f[6..12].copy_from_slice(&PEER);
+        f[12..14].copy_from_slice(&ethertype.to_be_bytes());f
+    }
+    #[test]fn kernel_p0_batch27_w5_693_valid_ipv4_arp_still_ingress(){
+        for ethertype in [0x0800,0x0806] {
+            let f=frame(ethertype);
+            assert!(ethernet_ingress_valid(&f));
+            assert!(ethernet_destination_allowed(&f,LOCAL));
+        }
+    }
+    #[test]fn kernel_p0_batch27_w5_694_foreign_unicast_denied(){
+        let mut f=frame(0x0800);
+        f[..6].copy_from_slice(&PEER);
+        assert!(ethernet_ingress_valid(&f));
+        assert!(!ethernet_destination_allowed(&f,LOCAL));
+    }
+    #[test]fn kernel_p0_batch27_w5_695_multicast_and_zero_source_denied(){
+        let mut f=frame(0x0806);f[6]=1;
+        assert!(!ethernet_ingress_valid(&f));
+        f[6..12].fill(0);
+        assert!(!ethernet_ingress_valid(&f));
+    }
+    #[test]fn kernel_p0_batch27_w5_696_8023_and_vlan_bypass_denied(){
+        for proto in [0x0001,0x05ff,0x8100,0x88a8,0x9100] {
+            let mut f=frame(proto);
+            assert!(!ethernet_ingress_valid(&f));
+            f[6..12].copy_from_slice(&LOCAL);
+            assert!(!ethernet_egress_valid(&f,LOCAL));
+        }
+    }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch28_w5 {
+ use super::*;
+ fn frame()->[u8;60]{
+  let mut f=[0u8;60];f[..6].copy_from_slice(&[0x02,1,2,3,4,5]);
+  f[6..12].copy_from_slice(&[0x02,9,8,7,6,5]);
+  f[12..14].copy_from_slice(&[0x08,0x00]);f
+ }
+ #[test]fn kernel_p0_batch28_w5_715_null_destination_rejected_at_ingress(){
+  let mut f=frame();f[..6].fill(0);
+  assert!(!ethernet_ingress_valid(&f));
+  assert!(!ethernet_destination_allowed(&f,[0x02,1,2,3,4,5]));
+ }
+ #[test]fn kernel_p0_batch28_w5_716_local_unicast_and_broadcast_retained(){
+  let local=[0x02,1,2,3,4,5];let mut f=frame();
+  assert!(ethernet_ingress_valid(&f));
+  assert!(ethernet_destination_allowed(&f,local));
+  f[..6].fill(0xff);
+  assert!(ethernet_ingress_valid(&f));
+  assert!(ethernet_destination_allowed(&f,local));
+ }
+ #[test]fn kernel_p0_batch28_w5_717_foreign_unicast_dropped(){
+  let f=frame();assert!(ethernet_ingress_valid(&f));
+  assert!(!ethernet_destination_allowed(&f,[0x02,5,4,3,2,1]));
+ }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch29_w5{
+ use super::*;
+ const MAC:[u8;6]=[2,1,2,3,4,5];
+ fn frame(proto:u16)->[u8;60]{let mut f=[0u8;60];f[..6].copy_from_slice(&MAC);f[6..12].copy_from_slice(&MAC);f[12..14].copy_from_slice(&proto.to_be_bytes());f}
+ #[test] fn kernel_p0_batch29_w5_738_ipv4_arp_valid(){for p in [0x0800,0x0806]{let f=frame(p);assert!(ethernet_ingress_valid(&f));assert!(ethernet_egress_valid(&f,MAC));}}
+ #[test] fn kernel_p0_batch29_w5_739_ipv6_ingress_rejected(){assert!(!ethernet_ingress_valid(&frame(0x86dd)));}
+ #[test] fn kernel_p0_batch29_w5_740_unknown_egress_rejected(){for p in [0x86dd,0x88cc,0x88b5]{assert!(!ethernet_egress_valid(&frame(p),MAC));}}
+ #[test] fn kernel_p0_batch29_w5_741_vlan_8023_rejected(){for p in [1,0x05ff,0x8100,0x88a8,0x9100]{let f=frame(p);assert!(!ethernet_ingress_valid(&f));assert!(!ethernet_egress_valid(&f,MAC));}}
+}
+
+#[cfg(test)]
+mod kernel_p0_batch30_w5 {
+    use super::*;
+    const LOCAL:[u8;6]=[2,1,2,3,4,5];
+    fn packet(dest:[u8;6])->[u8;60]{
+        let mut f=[0u8;60];f[..6].copy_from_slice(&dest);
+        f[6..12].copy_from_slice(&LOCAL);f[12..14].copy_from_slice(&0x0800u16.to_be_bytes());f
+    }
+    #[test] fn kernel_p0_batch30_w5_760_ipv4_multicast_and_broadcast_allowed(){
+        for mac in [[1,0,0x5e,0,0,1],[0xff;6]]{
+            let f=packet(mac);assert!(ethernet_ingress_valid(&f));
+            assert!(ethernet_destination_allowed(&f,LOCAL));
+        }
+    }
+    #[test] fn kernel_p0_batch30_w5_761_arbitrary_multicast_prefix_rejected(){
+        for mac in [[3,0,0,0,0,1],[0x33,0x33,0,0,0,1],[0xff,0,0,0,0,1]]{
+            let f=packet(mac);assert!(!ethernet_destination_allowed(&f,LOCAL));
+        }
+    }
+    #[test] fn kernel_p0_batch30_w5_762_invalid_multicast_high_bit_and_foreign_unicast(){
+        for mac in [[1,0,0x5e,0x80,0,1],[2,9,9,9,9,9]]{
+            let f=packet(mac);assert!(!ethernet_destination_allowed(&f,LOCAL));
+        }
+    }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch31_w5 {
+    use super::*;
+    const LOCAL:[u8;6]=[2,1,2,3,4,5];
+    fn frame(proto:u16,dest:[u8;6])->[u8;60]{
+        let mut f=[0u8;60];f[..6].copy_from_slice(&dest);
+        f[6..12].copy_from_slice(&LOCAL);
+        f[12..14].copy_from_slice(&proto.to_be_bytes());f
+    }
+    #[test]fn kernel_p0_batch31_w5_780_ipv4_multicast_ingress_and_egress(){
+        let f=frame(0x0800,[1,0,0x5e,0,0,1]);
+        assert!(ethernet_ingress_valid(&f));
+        assert!(ethernet_destination_allowed(&f,LOCAL));
+        assert!(ethernet_egress_valid(&f,LOCAL));
+    }
+    #[test]fn kernel_p0_batch31_w5_781_arp_multicast_denied_broadcast_allowed(){
+        let multicast=frame(0x0806,[1,0,0x5e,0,0,1]);
+        assert!(!ethernet_destination_allowed(&multicast,LOCAL));
+        assert!(!ethernet_egress_valid(&multicast,LOCAL));
+        let broadcast=frame(0x0806,[0xff;6]);
+        assert!(ethernet_destination_allowed(&broadcast,LOCAL));
+        assert!(ethernet_egress_valid(&broadcast,LOCAL));
+    }
+    #[test]fn kernel_p0_batch31_w5_782_multicast_denied_but_peer_unicast_tx_valid(){
+        for dest in [[0x33,0x33,0,0,0,1],[1,0,0x5e,0x80,0,1]] {
+            let f=frame(0x0800,dest);
+            assert!(!ethernet_destination_allowed(&f,LOCAL));
+            assert!(!ethernet_egress_valid(&f,LOCAL));
+        }
+        let peer=frame(0x0800,[2,9,8,7,6,5]);
+        assert!(!ethernet_destination_allowed(&peer,LOCAL));
+        assert!(ethernet_egress_valid(&peer,LOCAL));
+        assert!(ethernet_destination_allowed(&frame(0x0800,LOCAL),LOCAL));
+    }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch32_w5 {
+    use super::*;
+    const LOCAL:[u8;6]=[2,1,2,3,4,5];
+    fn packet(proto:u16,dest:[u8;6])->[u8;60]{
+        let mut f=[0u8;60];
+        f[..6].copy_from_slice(&dest);
+        f[6..12].copy_from_slice(&LOCAL);
+        f[12..14].copy_from_slice(&proto.to_be_bytes());f
+    }
+    #[test] fn kernel_p0_batch32_w5_800_destination_filter_checks_source_integrity(){
+        let mut f=packet(0x0800,LOCAL);
+        assert!(ethernet_destination_allowed(&f,LOCAL));
+        f[6..12].fill(0);
+        assert!(!ethernet_destination_allowed(&f,LOCAL));
+        f[6]=1;
+        assert!(!ethernet_destination_allowed(&f,LOCAL));
+    }
+    #[test] fn kernel_p0_batch32_w5_801_multicast_ipv4_not_arp(){
+        let dest=[1,0,0x5e,0,0,9];
+        assert!(ethernet_destination_allowed(&packet(0x0800,dest),LOCAL));
+        assert!(!ethernet_destination_allowed(&packet(0x0806,dest),LOCAL));
+        assert!(!ethernet_destination_allowed(&packet(0x8100,LOCAL),LOCAL));
+    }
+    #[test] fn kernel_p0_batch32_w5_802_partial_nonzero_tx_completion_rejected(){
+        assert!(tx_completion_length_valid(0,60));
+        assert!(tx_completion_length_valid(70,60));
+        assert!(!tx_completion_length_valid(10,60));
+        assert!(!tx_completion_length_valid(69,60));
+        assert!(!tx_completion_length_valid(71,60));
+    }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch33_w5 {
+    use super::*;
+    const MAC:[u8;6]=[2,1,2,3,4,5];
+    fn frame()->[u8;60] {
+        let mut f=[0u8;60];f[..6].copy_from_slice(&MAC);
+        f[6..12].copy_from_slice(&MAC);
+        f[12..14].copy_from_slice(&0x0800u16.to_be_bytes());f
+    }
+    #[test] fn kernel_p0_batch33_w5_820_complete_no_offload_ipv4_frame_authorized(){
+        let f=frame();
+        assert_eq!(rx_frame_authorized(70,60,&[0;10],&f,MAC),Ok(60));
+    }
+    #[test] fn kernel_p0_batch33_w5_821_invalid_offload_or_reported_length_denied(){
+        let f=frame();let mut hdr=[0u8;10];hdr[2]=1;
+        assert_eq!(rx_frame_authorized(70,60,&hdr,&f,MAC),Err(Error::Invalid));
+        assert_eq!(rx_frame_authorized(69,60,&[0;10],&f,MAC),Err(Error::Invalid));
+        assert_eq!(rx_frame_authorized(70,59,&[0;10],&f,MAC),Err(Error::Invalid));
+    }
+    #[test] fn kernel_p0_batch33_w5_822_foreign_or_malformed_ingress_denied(){
+        let mut f=frame();
+        assert_eq!(rx_frame_authorized(70,60,&[0;10],&f,[2,9,8,7,6,5]),
+            Err(Error::Invalid));
+        f[6..12].fill(0);
+        assert_eq!(rx_frame_authorized(70,60,&[0;10],&f,MAC),
+            Err(Error::Invalid));
+    }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch34_w5 {
+    use super::*;
+    const LOCAL:[u8;6]=[2,3,4,5,6,7];
+    fn ethernet(proto:u16,n:usize)->[u8;60]{
+        let mut f=[0;60];f[..6].copy_from_slice(&LOCAL);
+        f[6..12].copy_from_slice(&[2,9,8,7,6,5]);
+        f[12..14].copy_from_slice(&proto.to_be_bytes());
+        assert!(n<=f.len());f
+    }
+    #[test] fn kernel_p0_batch34_w5_840_ipv4_minimum_header_required(){
+        let f=ethernet(0x0800,60);
+        assert!(!rx_l3_header_fits(&f[..33]));
+        assert!(rx_l3_header_fits(&f[..34]));
+        assert_eq!(rx_frame_authorized(70,60,&[0;10],&f,LOCAL),Ok(60));
+    }
+    #[test] fn kernel_p0_batch34_w5_841_arp_minimum_header_required(){
+        let mut f=ethernet(0x0806,60);
+        f[14..22].copy_from_slice(&[0,1,8,0,6,4,0,1]);
+        f[22..28].copy_from_slice(&[2,9,8,7,6,5]);
+        assert!(!rx_l3_header_fits(&f[..41]));
+        assert!(rx_l3_header_fits(&f[..42]));
+        assert_eq!(rx_frame_authorized(70,60,&[0;10],&f,LOCAL),Ok(60));
+    }
+    #[test] fn kernel_p0_batch34_w5_842_non_ip_arp_and_short_l2_denied(){
+        assert!(!rx_l3_header_fits(&[0;13]));
+        let f=ethernet(0x8100,60);
+        assert!(!rx_l3_header_fits(&f));
+        assert_eq!(rx_frame_authorized(70,60,&[0;10],&f,LOCAL),
+            Err(Error::Invalid));
+    }
+}
+
+#[cfg(test)] mod kernel_p0_batch35_w5 {
+ use super::*;
+ fn arp(op:u16)->[u8;60]{
+  let mut f=[0;60];f[..6].fill(0xff);
+  f[6..12].copy_from_slice(&[2,1,2,3,4,5]);
+  f[12..14].copy_from_slice(&0x0806u16.to_be_bytes());
+  f[14..22].copy_from_slice(&[0,1,8,0,6,4,(op>>8) as u8,op as u8]);
+  f[22..28].copy_from_slice(&[2,1,2,3,4,5]);f
+ }
+ const LOCAL:[u8;6]=[2,3,4,5,6,7];
+ #[test] fn kernel_p0_batch35_w5_860_request_reply_admitted(){
+  for op in [1,2]{
+   let f=arp(op);
+   assert!(rx_ipv4_arp_header_valid(&f));
+   assert_eq!(rx_frame_authorized(70,60,&[0;10],&f,LOCAL),Ok(60));
+  }
+ }
+ #[test] fn kernel_p0_batch35_w5_861_opcode_and_address_width_denied(){
+  let mut f=arp(3);assert!(!rx_ipv4_arp_header_valid(&f));
+  f=arp(1);f[18]=7;assert!(!rx_ipv4_arp_header_valid(&f));
+  f=arp(1);f[19]=16;assert!(!rx_ipv4_arp_header_valid(&f));
+ }
+ #[test] fn kernel_p0_batch35_w5_862_wrong_hardware_protocol_or_short_packet_denied(){
+  let mut f=arp(1);f[15]=2;assert!(!rx_ipv4_arp_header_valid(&f));
+  f=arp(1);f[17]=6;assert!(!rx_ipv4_arp_header_valid(&f));
+  f=arp(1);assert!(!rx_ipv4_arp_header_valid(&f[..41]));
+ }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch36_w5 {
+    use super::*;
+    const LOCAL:[u8;6]=[2,3,4,5,6,7];
+    fn arp(op:u16)->[u8;60]{
+        let mut f=[0u8;60];f[..6].fill(0xff);
+        f[6..12].copy_from_slice(&[2,1,2,3,4,5]);
+        f[12..14].copy_from_slice(&0x0806u16.to_be_bytes());
+        f[14..22].copy_from_slice(&[0,1,8,0,6,4,0,op as u8]);
+        f[22..28].copy_from_slice(&[2,1,2,3,4,5]);
+        f
+    }
+    #[test] fn kernel_p0_batch36_w5_883_consistent_arp_sender_request_reply_pass(){
+        for op in [1,2] {
+            let f=arp(op);
+            assert_eq!(rx_frame_authorized(70,60,&[0;10],&f,LOCAL),Ok(60));
+        }
+    }
+    #[test] fn kernel_p0_batch36_w5_884_spoofed_payload_sender_denied(){
+        let mut f=arp(1);f[27]^=1;
+        assert!(!rx_ipv4_arp_header_valid(&f));
+        assert_eq!(rx_frame_authorized(70,60,&[0;10],&f,LOCAL),
+            Err(Error::Invalid));
+    }
+    #[test] fn kernel_p0_batch36_w5_885_zero_and_multicast_sender_denied(){
+        let mut f=arp(2);f[22..28].fill(0);
+        assert!(!rx_ipv4_arp_header_valid(&f));
+        f=arp(1);f[22]|=1;
+        assert!(!rx_ipv4_arp_header_valid(&f));
+    }
+    #[test] fn kernel_p0_batch36_w5_886_ipv4_retained_but_truncated_arp_denied(){
+        let mut ipv4=arp(1);
+        ipv4[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+        assert_eq!(rx_frame_authorized(70,60,&[0;10],&ipv4,LOCAL),Ok(60));
+        let f=arp(1);
+        assert!(!rx_l3_header_fits(&f[..41]));
     }
 }

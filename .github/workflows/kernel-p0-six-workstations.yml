@@ -398,3 +398,692 @@ jobs:
           test "$count" -eq "$EXPECTED_COUNT"
           cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$FILTER"
           cargo check --locked --offline --manifest-path rust/kernel_core/Cargo.toml --no-default-features --target x86_64-unknown-none --features "$FEATURES"
+
+  p0-batch23-implemented:
+    name: Batch23 implemented ${{ matrix.workstation }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - workstation: W1-PMM-set-ownership
+            filter: kernel_p0_batch23_w1
+            expected: 4
+            features: normal-desktop
+          - workstation: W2-active-timer-IRQ
+            filter: kernel_p0_batch23_w2
+            expected: 4
+            features: normal-desktop
+          - workstation: W3-user-guard-layout
+            filter: kernel_p0_batch23_w3
+            expected: 4
+            features: normal-desktop
+          - workstation: W4-extent-media-revocation
+            filter: kernel_p0_batch23_w4
+            expected: 5
+            features: test-r031-vfs
+          - workstation: W5-virtio-TX-provenance
+            filter: kernel_p0_batch23_w5
+            expected: 4
+            features: test-r028-network
+          - workstation: W6-boot-handoff-alignment
+            filter: kernel_p0_batch23_w6
+            expected: 4
+            features: normal-desktop
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify exact PR head
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: python3 tools/verify_ci_sha.py --expected "$EXPECTED_SHA" --observed "$(git rev-parse HEAD)"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
+      - name: Verify all 25 source cases and freestanding kernel build
+        env:
+          FILTER: ${{ matrix.filter }}
+          FEATURES: ${{ matrix.features }}
+          EXPECTED_COUNT: ${{ matrix.expected }}
+        run: |
+          set -euo pipefail
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$FILTER" -- --list > /tmp/batch23-tests.txt
+          count=$(grep -c "$FILTER" /tmp/batch23-tests.txt || true)
+          echo "Found $count tests; expected $EXPECTED_COUNT"
+          test "$count" -eq "$EXPECTED_COUNT"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$FILTER"
+          cargo check --locked --offline --manifest-path rust/kernel_core/Cargo.toml --no-default-features --target x86_64-unknown-none --features "$FEATURES"
+
+  p0-batch24-implemented:
+    name: Batch24 implemented ${{ matrix.workstation }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - workstation: W1-PMM-one-shot-host
+            filter: kernel_p0_batch24_w1
+            expected: 4
+            features: normal-desktop
+          - workstation: W2-timer-session
+            filter: kernel_p0_batch24_w2
+            expected: 3
+            features: normal-desktop
+          - workstation: W3-ring3-stack-execute
+            filter: kernel_p0_batch24_w3
+            expected: 3
+            features: normal-desktop
+          - workstation: W4-revoked-media-token
+            filter: kernel_p0_batch24_w4
+            expected: 4
+            features: test-r031-vfs
+          - workstation: W5-virtio-rx-destination
+            filter: kernel_p0_batch24_w5
+            expected: 3
+            features: test-r028-network
+          - workstation: W6-Limine-response-pointers
+            filter: kernel_p0_batch24_w6
+            expected: 3
+            features: normal-desktop
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify exact PR head
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: python3 tools/verify_ci_sha.py --expected "$EXPECTED_SHA" --observed "$(git rev-parse HEAD)"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
+      - name: Verify 20 Rust cases and freestanding kernel target
+        env:
+          FILTER: ${{ matrix.filter }}
+          FEATURES: ${{ matrix.features }}
+          EXPECTED_COUNT: ${{ matrix.expected }}
+        run: |
+          set -euo pipefail
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$FILTER" -- --list > /tmp/batch24-tests.txt
+          count=$(grep -c "$FILTER" /tmp/batch24-tests.txt || true)
+          echo "Found $count; expected $EXPECTED_COUNT"
+          test "$count" -eq "$EXPECTED_COUNT"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$FILTER"
+          cargo check --locked --offline --manifest-path rust/kernel_core/Cargo.toml --no-default-features --target x86_64-unknown-none --features "$FEATURES"
+      - name: Verify host PMM C ABI preserves one-shot allocator ownership
+        if: matrix.workstation == 'W1-PMM-one-shot-host'
+        run: make test-rust-pmm-host
+
+  p0-batch25-implemented:
+    name: Batch25 implemented ${{ matrix.workstation }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - workstation: W1-PMM-geometry-and-C-host
+            filter: kernel_p0_batch25_w1
+            expected: 5
+            features: normal-desktop
+          - workstation: W2-IRQ-publication-fence
+            filter: kernel_p0_batch25_w2
+            expected: 5
+            features: normal-desktop
+          - workstation: W3-ring3-executable-pages
+            filter: kernel_p0_batch25_w3
+            expected: 5
+            features: normal-desktop
+          - workstation: W4-media-double-snapshot
+            filter: kernel_p0_batch25_w4
+            expected: 5
+            features: test-r031-vfs
+          - workstation: W5-virtio-frame-boundaries
+            filter: kernel_p0_batch25_w5
+            expected: 5
+            features: test-r028-network
+          - workstation: W6-52-bit-physical-RAM
+            filter: kernel_p0_batch25_w6
+            expected: 5
+            features: normal-desktop
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify exact PR head
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: python3 tools/verify_ci_sha.py --expected "$EXPECTED_SHA" --observed "$(git rev-parse HEAD)"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
+      - name: Verify 30 Rust cases and freestanding kernel target
+        env:
+          FILTER: ${{ matrix.filter }}
+          FEATURES: ${{ matrix.features }}
+          EXPECTED_COUNT: ${{ matrix.expected }}
+        run: |
+          set -euo pipefail
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$FILTER" -- --list > /tmp/batch25-tests.txt
+          count=$(grep -c "$FILTER" /tmp/batch25-tests.txt || true)
+          echo "Found $count; expected $EXPECTED_COUNT"
+          test "$count" -eq "$EXPECTED_COUNT"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$FILTER"
+          cargo check --locked --offline --manifest-path rust/kernel_core/Cargo.toml --no-default-features --target x86_64-unknown-none --features "$FEATURES"
+      - name: Verify host PMM C ABI preserves one-shot allocator ownership
+        if: matrix.workstation == 'W1-PMM-geometry-and-C-host'
+        run: |
+          set -euo pipefail
+          make test-rust-pmm-host
+          # Also test the C fallback allocator that broke the full boot job.
+          clang -std=c11 -O2 -g -Wall -Wextra -Werror -I kernel/include \
+            tests/test_pmm.c kernel/src/pmm.c -o /tmp/indianos-pmm-c-test
+          /tmp/indianos-pmm-c-test
+
+  p0-batch26-implemented:
+    name: Batch26 implemented ${{ matrix.workstation }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - workstation: W1-PMM-contiguous-geometry
+            filter: kernel_p0_batch26_w1
+            expected: 4
+            features: normal-desktop
+          - workstation: W2-timer-final-controller
+            filter: kernel_p0_batch26_w2
+            expected: 3
+            features: normal-desktop
+          - workstation: W3-ELF-page-ownership
+            filter: kernel_p0_batch26_w3
+            expected: 3
+            features: normal-desktop
+          - workstation: W4-readonly-media-probe
+            filter: kernel_p0_batch26_w4
+            expected: 4
+            features: test-r031-vfs
+          - workstation: W5-untagged-ethernet
+            filter: kernel_p0_batch26_w5
+            expected: 3
+            features: test-r028-network
+          - workstation: W6-boot-usable-RAM-alignment
+            filter: kernel_p0_batch26_w6
+            expected: 3
+            features: normal-desktop
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify exact PR head
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: python3 tools/verify_ci_sha.py --expected "$EXPECTED_SHA" --observed "$(git rev-parse HEAD)"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
+      - name: Verify 20 Rust cases and freestanding kernel target
+        env:
+          FILTER: ${{ matrix.filter }}
+          FEATURES: ${{ matrix.features }}
+          EXPECTED_COUNT: ${{ matrix.expected }}
+        run: |
+          set -euo pipefail
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$FILTER" -- --list > /tmp/batch26-tests.txt
+          count=$(grep -c "$FILTER" /tmp/batch26-tests.txt || true)
+          echo "Found $count; expected $EXPECTED_COUNT"
+          test "$count" -eq "$EXPECTED_COUNT"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$FILTER"
+          cargo check --locked --offline --manifest-path rust/kernel_core/Cargo.toml --no-default-features --target x86_64-unknown-none --features "$FEATURES"
+      - name: Verify inherited PMM host ABI
+        if: matrix.workstation == 'W1-PMM-geometry-and-C-host'
+        run: |
+          set -euo pipefail
+          make test-rust-pmm-host
+          # Also test the C fallback allocator that broke the full boot job.
+          clang -std=c11 -O2 -g -Wall -Wextra -Werror -I kernel/include \
+            tests/test_pmm.c kernel/src/pmm.c -o /tmp/indianos-pmm-c-test
+          /tmp/indianos-pmm-c-test
+
+  p0-batch27-implemented:
+    name: Batch27 P0-676..700 ${{ matrix.workstation }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - workstation: W1-PMM-bounds
+            filter: kernel_p0_batch27_w1
+            expected: 4
+            features: normal-desktop
+          - workstation: W2-APIC-capture-budget
+            filter: kernel_p0_batch27_w2
+            expected: 4
+            features: normal-desktop
+          - workstation: W3-R024-hardware-IRQ-frame
+            filter: kernel_p0_batch27_w3
+            expected: 5
+            features: normal-desktop,preempt
+          - workstation: W4-media-read-atomicity
+            filter: kernel_p0_batch27_w4
+            expected: 4
+            features: test-r031-vfs
+          - workstation: W5-ethernet-source-destination
+            filter: kernel_p0_batch27_w5
+            expected: 4
+            features: test-r028-network
+          - workstation: W6-Limine-memory-safety
+            filter: kernel_p0_batch27_w6
+            expected: 4
+            features: normal-desktop
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify exact PR head
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: python3 tools/verify_ci_sha.py --expected "$EXPECTED_SHA" --observed "$(git rev-parse HEAD)"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
+      - name: Verify 25 real Rust regressions and freestanding build
+        env:
+          FILTER: ${{ matrix.filter }}
+          FEATURES: ${{ matrix.features }}
+          EXPECTED_COUNT: ${{ matrix.expected }}
+        run: |
+          set -euo pipefail
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$FILTER" -- --list > /tmp/batch27-tests.txt
+          count=$(grep -c "$FILTER" /tmp/batch27-tests.txt || true)
+          echo "Found $count; expected $EXPECTED_COUNT"
+          test "$count" -eq "$EXPECTED_COUNT"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$FILTER"
+          cargo check --locked --offline --manifest-path rust/kernel_core/Cargo.toml --no-default-features --target x86_64-unknown-none --features "$FEATURES"
+
+  p0-batch28-implemented:
+    name: Batch28 P0-701..720 ${{ matrix.workstation }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - workstation: W1-PMM-physical-ownership
+            filter: kernel_p0_batch28_w1
+            expected: 4
+            features: normal-desktop
+          - workstation: W2-preemption-session
+            filter: kernel_p0_batch28_w2
+            expected: 3
+            features: normal-desktop
+          - workstation: W3-ELF-memory-ownership
+            filter: kernel_p0_batch28_w3
+            expected: 4
+            features: normal-desktop,preempt
+          - workstation: W4-read-buffer-failure-safety
+            filter: kernel_p0_batch28_w4
+            expected: 3
+            features: test-r031-vfs
+          - workstation: W5-Ethernet-recipient
+            filter: kernel_p0_batch28_w5
+            expected: 3
+            features: test-r028-network
+          - workstation: W6-framebuffer-pointer-admission
+            filter: kernel_p0_batch28_w6
+            expected: 3
+            features: normal-desktop
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify exact PR commit
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: python3 tools/verify_ci_sha.py --expected "$EXPECTED_SHA" --observed "$(git rev-parse HEAD)"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
+      - name: Run 20 Rust regressions and freestanding kernel check
+        env:
+          FILTER: ${{ matrix.filter }}
+          FEATURES: ${{ matrix.features }}
+          EXPECTED_COUNT: ${{ matrix.expected }}
+        run: |
+          set -euo pipefail
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$FILTER" -- --list > /tmp/batch28-tests.txt
+          count=$(grep -c "$FILTER" /tmp/batch28-tests.txt || true)
+          echo "Found $count; expected $EXPECTED_COUNT"
+          test "$count" -eq "$EXPECTED_COUNT"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$FILTER"
+          cargo check --locked --offline --manifest-path rust/kernel_core/Cargo.toml --no-default-features --target x86_64-unknown-none --features "$FEATURES"
+
+  p0-batch29-implemented:
+    name: Batch29 P0-721..745 ${{ matrix.workstation }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { workstation: W1-PMM-exact-run-ownership, filter: kernel_p0_batch29_w1, expected: 5, features: 'normal-desktop' }
+          - { workstation: W2-APIC-delivery-receipt, filter: kernel_p0_batch29_w2, expected: 4, features: 'normal-desktop' }
+          - { workstation: W3-ELF-file-offset-overflow, filter: kernel_p0_batch29_w3, expected: 4, features: 'normal-desktop,preempt' }
+          - { workstation: W4-readonly-media-generation, filter: kernel_p0_batch29_w4, expected: 4, features: 'test-r031-vfs' }
+          - { workstation: W5-R028-ethernet-allowed-protocols, filter: kernel_p0_batch29_w5, expected: 4, features: 'test-r028-network' }
+          - { workstation: W6-Limine-canonical-pointers, filter: kernel_p0_batch29_w6, expected: 4, features: 'normal-desktop' }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify exact PR SHA
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: python3 tools/verify_ci_sha.py --expected "$EXPECTED_SHA" --observed "$(git rev-parse HEAD)"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
+      - name: Verify 25 Rust cases and freestanding build
+        env:
+          FILTER: ${{ matrix.filter }}
+          FEATURES: ${{ matrix.features }}
+          EXPECTED_COUNT: ${{ matrix.expected }}
+        run: |
+          set -euo pipefail
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$FILTER" -- --list > /tmp/batch29-tests.txt
+          count=$(grep -c "$FILTER" /tmp/batch29-tests.txt || true)
+          echo "Found $count; expected $EXPECTED_COUNT"
+          test "$count" -eq "$EXPECTED_COUNT"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$FILTER"
+          cargo check --locked --offline --manifest-path rust/kernel_core/Cargo.toml --no-default-features --target x86_64-unknown-none --features "$FEATURES"
+
+  p0-batch30-implemented:
+    name: Batch30 P0-746..765 ${{ matrix.workstation }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { workstation: W1-PMM-exact-set-preflight, filter: kernel_p0_batch30_w1, expected: 4, features: 'normal-desktop' }
+          - { workstation: W2-APIC-counter-wrap, filter: kernel_p0_batch30_w2, expected: 3, features: 'normal-desktop' }
+          - { workstation: W3-ELF-executable-memory-bounds, filter: kernel_p0_batch30_w3, expected: 4, features: 'normal-desktop,preempt' }
+          - { workstation: W4-revision-pinned-block-read, filter: kernel_p0_batch30_w4, expected: 3, features: 'test-r031-vfs' }
+          - { workstation: W5-R028-multicast-ownership, filter: kernel_p0_batch30_w5, expected: 3, features: 'test-r028-network' }
+          - { workstation: W6-Limine-descriptor-span, filter: kernel_p0_batch30_w6, expected: 3, features: 'normal-desktop' }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify exact PR SHA
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: python3 tools/verify_ci_sha.py --expected "$EXPECTED_SHA" --observed "$(git rev-parse HEAD)"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
+      - name: Verify 20 named Rust cases and freestanding build
+        env:
+          FILTER: ${{ matrix.filter }}
+          FEATURES: ${{ matrix.features }}
+          EXPECTED_COUNT: ${{ matrix.expected }}
+        run: |
+          set -euo pipefail
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$FILTER" -- --list > /tmp/batch30-tests.txt
+          count=$(grep -c "$FILTER" /tmp/batch30-tests.txt || true)
+          echo "Found $count; expected $EXPECTED_COUNT"
+          test "$count" -eq "$EXPECTED_COUNT"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$FILTER"
+          cargo check --locked --offline --manifest-path rust/kernel_core/Cargo.toml --no-default-features --target x86_64-unknown-none --features "$FEATURES"
+
+  p0-batch31-implemented:
+    name: Batch31 P0-766..785 ${{ matrix.workstation }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { workstation: W1-PMM-accounting-ownership, filter: kernel_p0_batch31_w1, expected: 4, features: 'normal-desktop' }
+          - { workstation: W2-APIC-authority, filter: kernel_p0_batch31_w2, expected: 3, features: 'normal-desktop,preempt' }
+          - { workstation: W3-ELF-entry-resume, filter: kernel_p0_batch31_w3, expected: 4, features: 'normal-desktop,preempt' }
+          - { workstation: W4-media-atomic-read, filter: kernel_p0_batch31_w4, expected: 3, features: 'test-r031-vfs' }
+          - { workstation: W5-R028-protocol-MAC, filter: kernel_p0_batch31_w5, expected: 3, features: 'test-r028-network' }
+          - { workstation: W6-boot-module-span, filter: kernel_p0_batch31_w6, expected: 3, features: 'normal-desktop' }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify exact PR SHA
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: python3 tools/verify_ci_sha.py --expected "$EXPECTED_SHA" --observed "$(git rev-parse HEAD)"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
+      - name: Verify 20 Rust cases and freestanding build
+        env:
+          FILTER: ${{ matrix.filter }}
+          FEATURES: ${{ matrix.features }}
+          EXPECTED_COUNT: ${{ matrix.expected }}
+        run: |
+          set -euo pipefail
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$FILTER" -- --list > /tmp/batch31-tests.txt
+          count=$(grep -c "$FILTER" /tmp/batch31-tests.txt || true)
+          echo "Found $count; expected $EXPECTED_COUNT"
+          test "$count" -eq "$EXPECTED_COUNT"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$FILTER"
+          cargo check --locked --offline --manifest-path rust/kernel_core/Cargo.toml --no-default-features --target x86_64-unknown-none --features "$FEATURES"
+
+  p0-batch32-implemented:
+    name: Batch32 P0-786..805 ${{ matrix.workstation }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { workstation: W1-PMM-bitmap-transaction, filter: kernel_p0_batch32_w1, expected: 4, features: 'normal-desktop' }
+          - { workstation: W2-APIC-live-admission, filter: kernel_p0_batch32_w2, expected: 3, features: 'normal-desktop,preempt' }
+          - { workstation: W3-ELF-file-backed-exec, filter: kernel_p0_batch32_w3, expected: 4, features: 'normal-desktop,preempt' }
+          - { workstation: W4-expected-media-generation, filter: kernel_p0_batch32_w4, expected: 3, features: 'test-r031-vfs' }
+          - { workstation: W5-R028-validated-RX-TX, filter: kernel_p0_batch32_w5, expected: 3, features: 'test-r028-network' }
+          - { workstation: W6-Limine-table-bounds, filter: kernel_p0_batch32_w6, expected: 3, features: 'normal-desktop' }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify exact PR SHA
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: python3 tools/verify_ci_sha.py --expected "$EXPECTED_SHA" --observed "$(git rev-parse HEAD)"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
+      - name: Verify 20 Rust cases and freestanding build
+        env:
+          FILTER: ${{ matrix.filter }}
+          FEATURES: ${{ matrix.features }}
+          EXPECTED_COUNT: ${{ matrix.expected }}
+        run: |
+          set -euo pipefail
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$FILTER" -- --list > /tmp/batch32-tests.txt
+          count=$(grep -c "$FILTER" /tmp/batch32-tests.txt || true)
+          echo "Found $count; expected $EXPECTED_COUNT"
+          test "$count" -eq "$EXPECTED_COUNT"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$FILTER"
+          cargo check --locked --offline --manifest-path rust/kernel_core/Cargo.toml --no-default-features --target x86_64-unknown-none --features "$FEATURES"
+
+  p0-batch33-implemented:
+    name: Batch33 P0-806..825 ${{ matrix.workstation }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { workstation: W1-PMM-run-ownership, filter: kernel_p0_batch33_w1, expected: 4, features: 'normal-desktop' }
+          - { workstation: W2-APIC-exhaustion, filter: kernel_p0_batch33_w2, expected: 3, features: 'normal-desktop,preempt' }
+          - { workstation: W3-ring3-stack-integrity, filter: kernel_p0_batch33_w3, expected: 4, features: 'normal-desktop,preempt' }
+          - { workstation: W4-capacity-generation, filter: kernel_p0_batch33_w4, expected: 3, features: 'test-r031-vfs' }
+          - { workstation: W5-virtio-RX-admission, filter: kernel_p0_batch33_w5, expected: 3, features: 'test-r028-network' }
+          - { workstation: W6-HHDM-usable-RAM, filter: kernel_p0_batch33_w6, expected: 3, features: 'normal-desktop' }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify exact PR SHA
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: python3 tools/verify_ci_sha.py --expected "$EXPECTED_SHA" --observed "$(git rev-parse HEAD)"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
+      - name: Verify 20 Rust cases and freestanding build
+        env:
+          FILTER: ${{ matrix.filter }}
+          FEATURES: ${{ matrix.features }}
+          EXPECTED_COUNT: ${{ matrix.expected }}
+        run: |
+          set -euo pipefail
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$FILTER" -- --list > /tmp/batch33-tests.txt
+          count=$(grep -c "$FILTER" /tmp/batch33-tests.txt || true)
+          echo "Found $count; expected $EXPECTED_COUNT"
+          test "$count" -eq "$EXPECTED_COUNT"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$FILTER"
+          cargo check --locked --offline --manifest-path rust/kernel_core/Cargo.toml --no-default-features --target x86_64-unknown-none --features "$FEATURES"
+
+  p0-batch34-implemented:
+    name: Batch34 P0-826..845 ${{ matrix.workstation }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { workstation: W1-atomic-PMM-snapshot, filter: kernel_p0_batch34_w1, expected: 4, features: 'normal-desktop' }
+          - { workstation: W2-APIC-two-sided-exhaustion, filter: kernel_p0_batch34_w2, expected: 3, features: 'normal-desktop,preempt' }
+          - { workstation: W3-ELF-instruction-ownership, filter: kernel_p0_batch34_w3, expected: 4, features: 'normal-desktop,preempt' }
+          - { workstation: W4-pinned-media-write, filter: kernel_p0_batch34_w4, expected: 3, features: 'test-r031-vfs' }
+          - { workstation: W5-L3-minimum-ingress, filter: kernel_p0_batch34_w5, expected: 3, features: 'test-r028-network' }
+          - { workstation: W6-framebuffer-rectangle, filter: kernel_p0_batch34_w6, expected: 3, features: 'normal-desktop' }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify exact PR SHA
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: python3 tools/verify_ci_sha.py --expected "$EXPECTED_SHA" --observed "$(git rev-parse HEAD)"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
+      - name: Verify 20 Rust cases and freestanding build
+        env:
+          FILTER: ${{ matrix.filter }}
+          FEATURES: ${{ matrix.features }}
+          EXPECTED_COUNT: ${{ matrix.expected }}
+        run: |
+          set -euo pipefail
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$FILTER" -- --list > /tmp/batch34-tests.txt
+          count=$(grep -c "$FILTER" /tmp/batch34-tests.txt || true)
+          echo "Found $count; expected $EXPECTED_COUNT"
+          test "$count" -eq "$EXPECTED_COUNT"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$FILTER"
+          cargo check --locked --offline --manifest-path rust/kernel_core/Cargo.toml --no-default-features --target x86_64-unknown-none --features "$FEATURES"
+
+  p0-batch35-implemented:
+    name: Batch35 P0-846..865 ${{ matrix.workstation }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { workstation: W1-PMM-run-search-integrity, filter: kernel_p0_batch35_w1, expected: 4, features: 'normal-desktop' }
+          - { workstation: W2-live-APIC-progress, filter: kernel_p0_batch35_w2, expected: 3, features: 'normal-desktop,preempt' }
+          - { workstation: W3-ELF-pmemsz-usercopy, filter: kernel_p0_batch35_w3, expected: 4, features: 'normal-desktop,preempt' }
+          - { workstation: W4-pinned-write-progress, filter: kernel_p0_batch35_w4, expected: 3, features: 'test-r031-vfs' }
+          - { workstation: W5-IPv4-ARP-framing, filter: kernel_p0_batch35_w5, expected: 3, features: 'test-r028-network' }
+          - { workstation: W6-Limine-framebuffer-pointers, filter: kernel_p0_batch35_w6, expected: 3, features: 'normal-desktop' }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify exact PR SHA
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: python3 tools/verify_ci_sha.py --expected "$EXPECTED_SHA" --observed "$(git rev-parse HEAD)"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
+      - name: Verify 20 Rust cases and freestanding build
+        env:
+          FILTER: ${{ matrix.filter }}
+          FEATURES: ${{ matrix.features }}
+          EXPECTED_COUNT: ${{ matrix.expected }}
+        run: |
+          set -euo pipefail
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$FILTER" -- --list > /tmp/batch35-tests.txt
+          count=$(grep -c "$FILTER" /tmp/batch35-tests.txt || true)
+          echo "Found $count; expected $EXPECTED_COUNT"
+          test "$count" -eq "$EXPECTED_COUNT"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$FILTER"
+          cargo check --locked --offline --manifest-path rust/kernel_core/Cargo.toml --no-default-features --target x86_64-unknown-none --features "$FEATURES"
+
+  p0-batch36-implemented:
+    name: Batch36 P0-866..890 ${{ matrix.workstation }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { workstation: W1-PMM-trusted-free-count, filter: kernel_p0_batch36_w1, expected: 4, features: 'normal-desktop' }
+          - { workstation: W2-APIC-progress-snapshot, filter: kernel_p0_batch36_w2, expected: 4, features: 'normal-desktop,preempt' }
+          - { workstation: W3-ring3-WX-protection, filter: kernel_p0_batch36_w3, expected: 5, features: 'normal-desktop,preempt' }
+          - { workstation: W4-durable-barrier-reporting, filter: kernel_p0_batch36_w4, expected: 4, features: 'test-r031-vfs' }
+          - { workstation: W5-ARP-sender-binding, filter: kernel_p0_batch36_w5, expected: 4, features: 'test-r028-network' }
+          - { workstation: W6-Limine-descriptor-uniqueness, filter: kernel_p0_batch36_w6, expected: 4, features: 'normal-desktop' }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify exact PR SHA
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: python3 tools/verify_ci_sha.py --expected "$EXPECTED_SHA" --observed "$(git rev-parse HEAD)"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
+      - name: Verify 25 Rust cases and freestanding build
+        env:
+          FILTER: ${{ matrix.filter }}
+          FEATURES: ${{ matrix.features }}
+          EXPECTED_COUNT: ${{ matrix.expected }}
+        run: |
+          set -euo pipefail
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$FILTER" -- --list > /tmp/batch36-tests.txt
+          count=$(grep -c "$FILTER" /tmp/batch36-tests.txt || true)
+          echo "Found $count; expected $EXPECTED_COUNT"
+          test "$count" -eq "$EXPECTED_COUNT"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$FILTER"
+          cargo check --locked --offline --manifest-path rust/kernel_core/Cargo.toml --no-default-features --target x86_64-unknown-none --features "$FEATURES"

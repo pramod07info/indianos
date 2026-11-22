@@ -26,6 +26,14 @@ int main(void) {
         {0x9000, 0x3000, 0},            /* Three more frames. */
     };
     struct fake_map map = {entries, sizeof entries / sizeof entries[0]};
+    /* A failed first initialization leaves an uninitialized allocator;
+       only a successful first initialization permanently owns this PMM. */
+    struct indianos_memory_region invalid_first[] = {
+        {0x1000, 0x5000, 0}, {0x3000, 0x1000, 1},
+    };
+    struct fake_map invalid_map = {invalid_first, 2};
+    assert(!pmm_initialize(invalid_map.count, reader, &invalid_map));
+    assert(pmm_total_frames() == 0);
     assert(pmm_initialize(map.count, reader, &map));
     assert(pmm_total_frames() == 8);
     assert(pmm_free_frames() == 8);
@@ -61,23 +69,30 @@ int main(void) {
         {0x3000, 0x1000, 1},
     };
     struct fake_map bad = {conflicting, 2};
+    /* Reinitializing a live allocator must NOT discard owned frames,
+       including after a rejected/conflicting firmware map. */
     assert(!pmm_initialize(bad.count, reader, &bad));
-    assert(pmm_total_frames() == 0);
-    assert(!pmm_allocate_frame(&extra));
+    assert(pmm_total_frames() == 8);
+    assert(pmm_free_frames() == 8);
+    assert(pmm_allocate_frame(&extra));
+    assert(pmm_release_frame(extra));
 
     struct indianos_memory_region high[] = {
         {0x100000000ull, 0x3000, 0},
     };
     struct fake_map high_map = {high, 1};
-    assert(pmm_initialize(high_map.count, reader, &high_map));
-    assert(pmm_allocate_frame(&extra) && extra == 0x100000000ull);
-    assert(pmm_release_frame(extra));
+    /* A different valid map also cannot replace the active PMM.
+       High-address first-boot cases are tested in isolated Rust state. */
+    assert(!pmm_initialize(high_map.count, reader, &high_map));
+    assert(pmm_total_frames() == 8);
 
     struct indianos_memory_region zero[] = {
         {0, 0x1000, 0},
     };
     struct fake_map zero_map = {zero, 1};
     assert(!pmm_initialize(zero_map.count, reader, &zero_map));
+    assert(pmm_total_frames() == 8);
+    assert(pmm_free_frames() == 8);
     puts("IndianOS PMM host tests passed");
     return 0;
 }

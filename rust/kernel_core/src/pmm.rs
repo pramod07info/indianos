@@ -59,10 +59,20 @@ impl State {
         if !self.initialized {return 0;}
         self.total.checked_sub(self.used).unwrap_or(0)
     }
+    /// Diagnostic count must agree with the owned bitmap and span geometry.
+    /// This slower verification is for status/acceptance, never the hot
+    /// single-page allocation path.
+    fn trusted_free_count(&self)->u64 {
+        if self.verify_frame_accounting(){self.total-self.used}else{0}
+    }
     fn physical_at(&self, bit: u64) -> Option<u64> {
-        for span in &self.spans[..self.count] {
-            if bit >= span.bit_offset && bit - span.bit_offset < span.count {
-                return Some(span.base + (bit - span.bit_offset) * PAGE);
+        // Corrupt span metadata must never panic or wrap a physical frame
+        // address into another owner's page, even in recovery paths.
+        for span in self.spans.get(..self.count)? {
+            let Some(index) = bit.checked_sub(span.bit_offset) else { continue; };
+            if index < span.count {
+                return index.checked_mul(PAGE)
+                    .and_then(|distance| span.base.checked_add(distance));
             }
         }
         None
@@ -170,51 +180,93 @@ unsafe fn initialize(s: &mut State, region_count: u64, reader: RegionReader,
 
 /// # Safety
 /// \`physical\` is a valid writable pointer or null; single-CPU caller.
+// The C ABI and tests use one allocator path. Corrupt cursor/counters
+// fail before bitmap mutation. Global usage remains BSP+IRQs-disabled.
+impl State {
+    // Reject a corrupt span table before indexing the fixed-size bitmap.
+    fn single_frame_geometry_valid(&self)->bool{
+        if !self.initialized || self.total==0 ||
+           self.total>MAX_FRAMES as u64 || self.used>self.total ||
+           self.cursor>=self.total || self.count==0 || self.count>MAX_SPANS {
+            return false;
+        }
+        let mut offset=0u64;
+        for (index,span) in self.spans[..self.count].iter().enumerate() {
+            if span.count==0 || span.bit_offset!=offset ||
+               span.base<PAGE || span.base%PAGE!=0 {return false;}
+            let Some(physical_end)=span.count.checked_mul(PAGE)
+                .and_then(|len|span.base.checked_add(len))else{return false;};
+            // Separate bitmap bits must never alias the same physical frame.
+            for previous in &self.spans[..index]{
+                let Some(previous_end)=previous.count.checked_mul(PAGE)
+                    .and_then(|len|previous.base.checked_add(len))else{return false;};
+                if span.base<previous_end && previous.base<physical_end{return false;}
+            }
+            let Some(end)=offset.checked_add(span.count)else{return false;};
+            if end>self.total{return false;}
+            offset=end;
+        }
+        offset==self.total
+    }
+    fn claim_single_frame(&mut self)->Option<u64>{
+        if !self.single_frame_geometry_valid() ||
+           self.used>=self.total {return None;}
+        for scanned in 0..self.total{
+            let mut bit=self.cursor+scanned;
+            if bit>=self.total{bit-=self.total;}
+            if !self.allocated(bit){
+                let address=self.physical_at(bit)?;
+                self.set_bit(bit,true);
+                self.used+=1;
+                self.cursor=if bit+1==self.total{0}else{bit+1};
+                return Some(address);
+            }
+        }
+        None
+    }
+}
 #[no_mangle]
 pub unsafe extern "C" fn pmm_allocate_frame(physical: *mut u64) -> bool {
     if physical.is_null() { return false; }
     let s = unsafe { state() };
-    if !s.initialized || s.used >= s.total { return false; }
-    for scanned in 0..s.total {
-        let mut bit = s.cursor + scanned;
-        if bit >= s.total { bit -= s.total; }
-        if !s.allocated(bit) {
-            let Some(address) = s.physical_at(bit) else { return false; };
-            s.set_bit(bit, true);
-            s.used += 1;
-            s.cursor = if bit + 1 == s.total { 0 } else { bit + 1 };
-            unsafe { ptr::write(physical, address); }
-            return true;
-        }
-    }
-    false
+    let Some(address)=s.claim_single_frame()else{return false;};
+    unsafe{ptr::write(physical,address);}
+    true
 }
 
 /// Acquire N physically contiguous 4 KiB frames from ONE usable RAM span.
 /// Required for legacy virtio vrings which do not support scattered ring pages.
 /// # Safety
 /// Single BSP with interrupts disabled; out is exclusive, aligned and writable.
+impl State {
+    /// Only a verified span table may authorize multi-frame DMA runs.
+    fn claim_contiguous_run(&mut self,count:u32)->Option<u64>{
+        if !(1..=16).contains(&count) || !self.verify_frame_accounting(){return None;}
+        let want=count as u64;
+        if want>self.total-self.used{return None;}
+        for span_index in 0..self.count {
+            let span=self.spans[span_index];
+            if span.count<want{continue;}
+            for offset in 0..=span.count-want {
+                let first_bit=span.bit_offset+offset;
+                if (0..want).any(|i|self.allocated(first_bit+i)){continue;}
+                let first=span.base.checked_add(offset.checked_mul(PAGE)?)?;
+                for i in 0..want{self.set_bit(first_bit+i,true);}
+                self.used+=want;
+                self.cursor=(first_bit+want)%self.total;
+                return Some(first);
+            }
+        }
+        None
+    }
+}
 #[no_mangle]
 pub unsafe extern "C" fn pmm_allocate_contiguous_frames(count:u32,out:*mut u64)->bool{
-    if out.is_null() || count==0 || count>16{return false;}
+    if out.is_null(){return false;}
     let s=unsafe{state()};
-    let want=count as u64;
-    if !s.initialized || s.used>s.total || want>s.total-s.used{return false;}
-    for span_index in 0..s.count{
-        let span=s.spans[span_index];
-        if span.count<want{continue;}
-        for offset in 0..=span.count-want{
-            let first_bit=span.bit_offset+offset;
-            if (0..want).any(|i|s.allocated(first_bit+i)){continue;}
-            let Some(first)=span.base.checked_add(offset*PAGE)else{continue;};
-            for i in 0..want{s.set_bit(first_bit+i,true);}
-            s.used+=want;
-            s.cursor=(first_bit+want)%s.total;
-            unsafe{ptr::write(out,first);}
-            return true;
-        }
-    }
-    false
+    let Some(first)=s.claim_contiguous_run(count)else{return false;};
+    unsafe{ptr::write(out,first);}
+    true
 }
 
 /// # Safety
@@ -223,7 +275,7 @@ pub unsafe extern "C" fn pmm_allocate_contiguous_frames(count:u32,out:*mut u64)-
 #[no_mangle]
 pub unsafe extern "C" fn pmm_release_frame(physical: u64) -> bool {
     let s = unsafe { state() };
-    if !s.initialized || s.used>s.total || physical & (PAGE - 1) != 0 { return false; }
+    if !s.single_frame_geometry_valid() || physical & (PAGE - 1) != 0 { return false; }
     for i in 0..s.count {
         let span = s.spans[i];
         if physical < span.base { continue; }
@@ -246,7 +298,7 @@ pub extern "C" fn pmm_total_frames() -> u64 {
 #[no_mangle]
 pub extern "C" fn pmm_free_frames() -> u64 {
     let s = unsafe { state() };
-    s.checked_free()
+    s.trusted_free_count()
 }
 /// Allocate two distinct frames, recycle one and always attempt cleanup
 /// of live owners after an intermediate failure. The caller's allocation
@@ -420,7 +472,7 @@ impl State {
     }
     /// Validate a run of exact contiguous frames in one physical RAM span.
     fn validate_run(&self,physical:u64,count:u32,expect_busy:bool)->Option<u64>{
-        if count==0||count>16{return None;}
+        if !self.single_frame_geometry_valid() || count==0||count>16{return None;}
         let first=self.bit_for_physical(physical)?;
         let end_physical=physical.checked_add((count as u64-1)*PAGE)?;
         let last=self.bit_for_physical(end_physical)?;
@@ -438,7 +490,7 @@ impl State {
     }
     /// Reserve a specific frame run only when ALL frames are free.
     fn claim_run(&mut self,physical:u64,count:u32)->bool{
-        if !self.initialized||self.used>self.total||
+        if !self.verify_frame_accounting()||
             count as u64>self.total-self.used{return false;}
         let Some(first)=self.validate_run(physical,count,false)else{return false;};
         for i in 0..count as u64{self.set_bit(first+i,true);}
@@ -448,7 +500,7 @@ impl State {
     }
     /// Release a complete frame run atomically or none of its frames.
     fn release_run(&mut self,physical:u64,count:u32)->bool{
-        if !self.initialized||self.used>self.total||
+        if !self.verify_frame_accounting()||
             self.used<count as u64{return false;}
         let Some(first)=self.validate_run(physical,count,true)else{return false;};
         for i in 0..count as u64{self.set_bit(first+i,false);}
@@ -546,6 +598,7 @@ pub struct FrameSpanUsage{
 impl State{
     /// 1. Physical frame → owning usable firmware span.
     fn frame_span_index(&self,physical:u64)->Option<usize>{
+        if !self.single_frame_geometry_valid(){return None;}
         self.bit_for_physical(physical)?;
         self.spans[..self.count].iter().position(|s|
             physical>=s.base&&physical-s.base<s.count*PAGE)
@@ -619,7 +672,7 @@ impl State{
     fn find_aligned_run(&self,count:u32,align_frames:u32)->Option<u64>{
         if count==0||count>16||align_frames==0||
           !align_frames.is_power_of_two()||align_frames>4096{return None;}
-        if !self.initialized{return None;}
+        if !self.verify_frame_accounting(){return None;}
         for s in &self.spans[..self.count]{
             if s.count<count as u64{continue;}
             for i in 0..=s.count-count as u64{
@@ -637,7 +690,7 @@ impl State{
     }
     /// 15. Find the highest physical free run without crossing spans.
     fn highest_available_run(&self,count:u32)->Option<u64>{
-        if count==0||count>16||!self.initialized{return None;}
+        if count==0||count>16||!self.verify_frame_accounting(){return None;}
         let mut best=None;
         for s in &self.spans[..self.count]{
             if s.count<count as u64{continue;}
@@ -657,7 +710,11 @@ impl State{
     }
     /// 17. Allocate a discontiguous exact frame set as one transaction.
     fn claim_exact_frame_set(&mut self,addresses:&[u64])->bool{
-        if addresses.is_empty()||addresses.len()>16||!self.initialized{return false;}
+        if addresses.is_empty()||addresses.len()>16||
+           !self.verify_frame_accounting()||
+           addresses.len() as u64>self.total-self.used{
+            return false;
+        }
         let mut bits=[0u64;16];
         for (i,&physical) in addresses.iter().enumerate(){
             let Some(bit)=self.bit_for_physical(physical)else{return false;};
@@ -670,7 +727,11 @@ impl State{
     }
     /// 18. Release a discontiguous exact set without partial free.
     fn release_exact_frame_set(&mut self,addresses:&[u64])->bool{
-        if addresses.is_empty()||addresses.len()>16||!self.initialized{return false;}
+        if addresses.is_empty()||addresses.len()>16||
+           !self.verify_frame_accounting()||
+           self.used<addresses.len() as u64 {
+            return false;
+        }
         let mut bits=[0u64;16];
         for (i,&physical) in addresses.iter().enumerate(){
             let Some(bit)=self.bit_for_physical(physical)else{return false;};
@@ -683,19 +744,24 @@ impl State{
     }
     /// 19. Validate allocator accounting against the actual bitmap.
     fn verify_frame_accounting(&self)->bool{
-        self.initialized&&self.used<=self.total&&
+        self.single_frame_geometry_valid()&&
         (0..self.total).filter(|i|self.allocated(*i)).count() as u64==self.used
     }
     /// 20. Publish a complete per-span occupancy snapshot or nothing.
     fn snapshot_span_usage(&self,out:&mut[FrameSpanUsage])->Option<usize>{
-        if !self.initialized||out.len()<self.count{return None;}
+        if !self.verify_frame_accounting()||out.len()<self.count{return None;}
+        // Build the complete ownership snapshot before publishing even one
+        // descriptor. An invalid late span cannot leak a partial view.
+        let blank=FrameSpanUsage{base:0,frames:0,busy:0,longest_free:0};
+        let mut staged=[blank;MAX_SPANS];
         for (i,s) in self.spans[..self.count].iter().enumerate(){
-            out[i]=FrameSpanUsage{
+            staged[i]=FrameSpanUsage{
                 base:s.base,frames:s.count,
                 busy:self.busy_in_span(i)?,
                 longest_free:self.longest_free_in_span(i)?,
             };
         }
+        out[..self.count].copy_from_slice(&staged[..self.count]);
         Some(self.count)
     }
 }
@@ -1316,7 +1382,8 @@ impl State {
     }
     /// Validate all exact owner allocations before releasing a batch.
     fn can_release_frames(&self,addresses:&[u64])->bool{
-        if !self.initialized||addresses.is_empty()||addresses.len()>16{return false;}
+        if !self.verify_frame_accounting()||
+           addresses.is_empty()||addresses.len()>16{return false;}
         for (i,&addr) in addresses.iter().enumerate(){
             if !self.is_busy_physical(addr)||addresses[..i].contains(&addr){return false;}
         }
@@ -1324,7 +1391,8 @@ impl State {
     }
     /// Validate the whole atomic claim set; never claim managed RAM holes.
     fn can_claim_frames(&self,addresses:&[u64])->bool{
-        if !self.initialized||addresses.is_empty()||addresses.len()>16{return false;}
+        if !self.verify_frame_accounting()||
+           addresses.is_empty()||addresses.len()>16{return false;}
         for (i,&addr) in addresses.iter().enumerate(){
             if !self.is_free_physical(addr)||addresses[..i].contains(&addr){return false;}
         }
@@ -1775,5 +1843,524 @@ mod kernel_p0_batch22_w1_tests{
         assert_eq!(s.used,[false;3]);
         assert!(pmm_self_test_roundtrip(&mut s,alloc,free));
         assert_eq!(s.used,[false;3]);
+    }
+}
+
+
+// Batch23 W1 P0-581..584: real discontiguous PMM claim/release paths
+// cannot overrun or underflow the bitmap-owner accounting transaction.
+#[cfg(test)]
+mod kernel_p0_batch23_w1_tests{
+    use super::*;
+    unsafe extern "C" fn map(i:u64,out:*mut Region,ctx:*mut c_void)->bool{
+        if i!=0||out.is_null()||ctx.is_null(){return false;}
+        unsafe{out.write(*(ctx.cast::<Region>()));}true
+    }
+    fn state()->State{
+        let mut s=State::empty();
+        let mut r=Region{base:PAGE,length:PAGE*4,kind:0};
+        assert!(unsafe{initialize_once(&mut s,1,Some(map),(&mut r as *mut Region).cast())});
+        s
+    }
+    #[test]fn kernel_p0_batch23_w1_581_claim_fails_on_corrupt_used_overflow(){
+        let mut s=state();s.used=s.total+1;
+        assert!(!s.claim_exact_frame_set(&[PAGE]));
+        assert!(!s.allocated(0));assert_eq!(s.used,5);
+    }
+    #[test]fn kernel_p0_batch23_w1_582_claim_budget_has_no_partial_effect(){
+        let mut s=state();s.used=3;
+        assert!(!s.claim_exact_frame_set(&[PAGE,2*PAGE]));
+        assert!(!s.allocated(0));assert!(!s.allocated(1));
+    }
+    #[test]fn kernel_p0_batch23_w1_583_release_underflow_preserves_bitmap(){
+        let mut s=state();assert!(s.claim_exact_frame_set(&[PAGE,2*PAGE]));
+        s.used=1;
+        assert!(!s.release_exact_frame_set(&[PAGE,2*PAGE]));
+        assert!(s.allocated(0));assert!(s.allocated(1));
+    }
+    #[test]fn kernel_p0_batch23_w1_584_good_claim_release_reuses_frames(){
+        let mut s=state();
+        assert!(s.claim_exact_frame_set(&[PAGE,3*PAGE]));
+        assert!(!s.claim_exact_frame_set(&[PAGE]));
+        assert!(s.release_exact_frame_set(&[PAGE,3*PAGE]));
+        assert!(!s.release_exact_frame_set(&[PAGE,3*PAGE]));
+        assert_eq!(s.used,0);assert!(s.verify_frame_accounting());
+    }
+}
+
+
+// Batch24 W1 P0-606..609: one-shot C ABI compatibility and allocator
+// counter/cursor guards exercise State::claim_single_frame, not a mock.
+#[cfg(test)]
+mod kernel_p0_batch24_w1_tests{
+    use super::*;
+    unsafe extern "C" fn map(i:u64,out:*mut Region,ctx:*mut c_void)->bool{
+        if i!=0||out.is_null()||ctx.is_null(){return false;}
+        unsafe{out.write(*(ctx.cast::<Region>()));}true
+    }
+    fn fresh()->State{
+        let mut s=State::empty();let mut r=Region{base:PAGE,length:PAGE*3,kind:0};
+        assert!(unsafe{initialize_once(&mut s,1,Some(map),(&mut r as *mut Region).cast())});
+        s
+    }
+    #[test]fn kernel_p0_batch24_w1_606_one_shot_reinit_preserves_live_frames(){
+        let mut s=fresh();
+        let first=s.claim_single_frame().unwrap();
+        let mut alternate=Region{base:PAGE*100,length:PAGE,kind:0};
+        assert!(!unsafe{initialize_once(&mut s,1,Some(map),(&mut alternate as *mut Region).cast())});
+        assert_eq!(s.total,3);assert_eq!(s.used,1);
+        assert_eq!(s.is_frame_busy(first),Some(true));
+        assert!(s.release_run(first,1));assert!(s.verify_frame_accounting());
+    }
+    #[test]fn kernel_p0_batch24_w1_607_corrupt_cursor_refuses_allocation(){
+        let mut s=fresh();s.cursor=s.total;
+        assert_eq!(s.claim_single_frame(),None);
+        assert_eq!(s.used,0);assert!(!s.verify_frame_accounting());
+        s.cursor=0;assert!(s.verify_frame_accounting());
+    }
+    #[test]fn kernel_p0_batch24_w1_608_corrupt_count_refuses_allocation(){
+        let mut s=fresh();s.used=s.total+1;
+        assert_eq!(s.claim_single_frame(),None);
+        assert_eq!(s.used,4);assert!(!s.allocated(0));
+    }
+    #[test]fn kernel_p0_batch24_w1_609_exhaustion_recycle_is_one_owner(){
+        let mut s=fresh();
+        let a=s.claim_single_frame().unwrap();let b=s.claim_single_frame().unwrap();
+        let c=s.claim_single_frame().unwrap();
+        assert_ne!(a,b);assert_ne!(b,c);
+        assert_eq!(s.claim_single_frame(),None);
+        assert!(s.release_run(b,1));
+        assert_eq!(s.claim_single_frame(),Some(b));
+        assert!(s.verify_frame_accounting());
+    }
+}
+
+// P0-626..630: real bitmap geometry gates before any single-frame mutation.
+#[cfg(test)]
+mod kernel_p0_batch25_w1_tests {
+    use super::*;
+    unsafe extern "C" fn reader(i:u64,out:*mut Region,ctx:*mut c_void)->bool{
+        if i!=0||out.is_null()||ctx.is_null(){return false;}
+        unsafe{out.write(*(ctx.cast::<Region>()));}true
+    }
+    fn fresh()->State{
+        let mut s=State::empty();
+        let mut r=Region{base:PAGE,length:3*PAGE,kind:0};
+        assert!(unsafe{initialize_once(&mut s,1,Some(reader),(&mut r as *mut Region).cast())});
+        s
+    }
+    #[test]fn kernel_p0_batch25_w1_626_healthy_geometry_allocates_exact_owner(){
+        let mut s=fresh();assert!(s.single_frame_geometry_valid());
+        assert_eq!(s.claim_single_frame(),Some(PAGE));
+        assert_eq!(s.used,1);assert!(s.verify_frame_accounting());
+    }
+    #[test]fn kernel_p0_batch25_w1_627_oversized_total_never_indexes_bitmap(){
+        let mut s=fresh();s.total=MAX_FRAMES as u64+1;
+        assert!(!s.single_frame_geometry_valid());
+        assert_eq!(s.claim_single_frame(),None);assert_eq!(s.used,0);
+    }
+    #[test]fn kernel_p0_batch25_w1_628_span_count_overflow_denied(){
+        let mut s=fresh();s.count=MAX_SPANS+1;
+        assert_eq!(s.claim_single_frame(),None);
+        assert_eq!(s.used,0);assert_eq!(s.bitmap[0],0);
+    }
+    #[test]fn kernel_p0_batch25_w1_629_bit_offset_gap_denied_atomically(){
+        let mut s=fresh();s.spans[0].bit_offset=1;
+        assert_eq!(s.claim_single_frame(),None);
+        assert_eq!(s.used,0);assert_eq!(s.bitmap[0],0);
+    }
+    #[test]fn kernel_p0_batch25_w1_630_bad_alignment_and_overflow_denied(){
+        let mut s=fresh();s.spans[0].base=PAGE+1;
+        assert_eq!(s.claim_single_frame(),None);
+        s.spans[0].base=u64::MAX-PAGE+1;
+        assert_eq!(s.claim_single_frame(),None);assert_eq!(s.used,0);
+    }
+}
+
+// P0-656..659: contiguous PMM shares the one-frame geometry/ownership gate.
+#[cfg(test)]
+mod kernel_p0_batch26_w1_tests {
+    use super::*;
+    unsafe extern "C" fn reader(i:u64,out:*mut Region,ctx:*mut c_void)->bool {
+        if i!=0||out.is_null()||ctx.is_null(){return false;}
+        unsafe{out.write(*(ctx.cast::<Region>()));}true
+    }
+    fn fresh()->State {
+        let mut s=State::empty();
+        let mut r=Region{base:PAGE,length:4*PAGE,kind:0};
+        assert!(unsafe{initialize_once(&mut s,1,Some(reader),(&mut r as *mut Region).cast())});
+        s
+    }
+    #[test]fn kernel_p0_batch26_w1_656_contiguous_allocates_exact_run(){
+        let mut s=fresh();assert_eq!(s.claim_contiguous_run(2),Some(PAGE));
+        assert_eq!(s.used,2);assert!(s.verify_frame_accounting());
+    }
+    #[test]fn kernel_p0_batch26_w1_657_corrupt_span_never_mutates_bitmap(){
+        let mut s=fresh();s.spans[0].bit_offset=1;
+        assert_eq!(s.claim_contiguous_run(2),None);
+        assert_eq!(s.used,0);assert_eq!(s.bitmap[0],0);
+    }
+    #[test]fn kernel_p0_batch26_w1_658_impossible_accounting_denies_run(){
+        let mut s=fresh();s.used=s.total+1;
+        assert_eq!(s.claim_contiguous_run(2),None);
+        assert_eq!(s.bitmap[0],0);
+    }
+    #[test]fn kernel_p0_batch26_w1_659_occupied_page_skips_to_free_run(){
+        let mut s=fresh();assert_eq!(s.claim_single_frame(),Some(PAGE));
+        assert_eq!(s.claim_contiguous_run(2),Some(PAGE*2));
+        assert_eq!(s.used,3);assert!(s.verify_frame_accounting());
+    }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch27_w1_tests {
+    use super::*;
+    fn with_span()->State {
+        let mut state=State::empty();
+        state.count=1;
+        state.spans[0]=Span{base:PAGE,count:3,bit_offset:2};
+        state
+    }
+    #[test]fn kernel_p0_batch27_w1_676_valid_owned_first_frame(){
+        let s=with_span();assert_eq!(s.physical_at(2),Some(PAGE));
+    }
+    #[test]fn kernel_p0_batch27_w1_677_respects_span_end_and_offset(){
+        let s=with_span();assert_eq!(s.physical_at(4),Some(3*PAGE));
+        assert_eq!(s.physical_at(1),None);assert_eq!(s.physical_at(5),None);
+    }
+    #[test]fn kernel_p0_batch27_w1_678_rejects_physical_address_overflow(){
+        let mut s=with_span();s.spans[0].base=u64::MAX-PAGE+1;
+        assert_eq!(s.physical_at(3),None);
+    }
+    #[test]fn kernel_p0_batch27_w1_679_rejects_corrupt_metadata_without_panic(){
+        let mut s=with_span();s.count=MAX_SPANS+1;
+        assert_eq!(s.physical_at(2),None);
+        s.count=1;s.spans[0]=Span{base:PAGE,count:u64::MAX,bit_offset:0};
+        assert_eq!(s.physical_at(u64::MAX),None);
+    }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch28_w1 {
+ use super::*;
+ fn state()->State {
+  let mut s=State::empty();s.initialized=true;s.count=2;s.total=4;
+  s.spans[0]=Span{base:PAGE,count:2,bit_offset:0};
+  s.spans[1]=Span{base:10*PAGE,count:2,bit_offset:2};s
+ }
+ #[test]fn kernel_p0_batch28_w1_701_disjoint_spans_allocate_unique_pages(){
+  let mut s=state();assert_eq!(s.claim_single_frame(),Some(PAGE));
+  assert_eq!(s.claim_single_frame(),Some(2*PAGE));
+  assert_eq!(s.claim_single_frame(),Some(10*PAGE));assert_eq!(s.used,3);
+ }
+ #[test]fn kernel_p0_batch28_w1_702_overlap_rejected_without_allocation(){
+  let mut s=state();s.spans[1].base=2*PAGE;
+  assert!(!s.single_frame_geometry_valid());
+  assert_eq!(s.claim_single_frame(),None);assert_eq!(s.used,0);
+ }
+ #[test]fn kernel_p0_batch28_w1_703_adjacent_physical_spans_still_valid(){
+  let mut s=state();s.spans[1].base=3*PAGE;
+  assert!(s.single_frame_geometry_valid());
+  for page in 1..=4{assert_eq!(s.claim_single_frame(),Some(page*PAGE));}
+ }
+ #[test]fn kernel_p0_batch28_w1_704_reordered_overlap_keeps_bitmap_unchanged(){
+  let mut s=state();s.spans[0].base=10*PAGE;s.spans[1].base=11*PAGE;
+  assert_eq!(s.claim_single_frame(),None);
+  assert_eq!(s.bitmap[0],0);assert_eq!(s.cursor,0);
+ }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch29_w1 {
+ use super::*;
+ fn state()->State{
+  let mut s=State::empty();s.initialized=true;s.count=2;s.total=4;
+  s.spans[0]=Span{base:PAGE,count:2,bit_offset:0};
+  s.spans[1]=Span{base:10*PAGE,count:2,bit_offset:2};s
+ }
+ #[test] fn kernel_p0_batch29_w1_721_exact_run_claim(){let mut s=state();assert!(s.claim_run(PAGE,2));assert!(s.verify_frame_accounting());}
+ #[test] fn kernel_p0_batch29_w1_722_overlap_no_mutation(){let mut s=state();s.spans[1].base=2*PAGE;assert!(!s.claim_run(PAGE,2));assert_eq!(s.bitmap[0],0);}
+ #[test] fn kernel_p0_batch29_w1_723_corrupt_offset_no_release(){let mut s=state();assert!(s.claim_run(PAGE,1));s.spans[1].bit_offset=1;assert!(!s.release_run(PAGE,1));assert!(s.allocated(0));}
+ #[test] fn kernel_p0_batch29_w1_724_cursor_corruption_no_claim(){let mut s=state();s.cursor=s.total;assert!(!s.claim_run(10*PAGE,1));assert_eq!(s.used,0);}
+ #[test] fn kernel_p0_batch29_w1_725_atomic_release_no_double_free(){let mut s=state();assert!(s.claim_run(PAGE,2));assert!(!s.release_run(PAGE,3));assert_eq!(s.used,2);assert!(s.release_run(PAGE,2));assert!(!s.release_run(PAGE,2));}
+}
+
+#[cfg(test)]
+mod kernel_p0_batch30_w1 {
+    use super::*;
+    fn state()->State {
+        let mut s=State::empty();s.initialized=true;s.count=2;s.total=4;
+        s.spans[0]=Span{base:PAGE,count:2,bit_offset:0};
+        s.spans[1]=Span{base:10*PAGE,count:2,bit_offset:2};
+        s
+    }
+    #[test] fn kernel_p0_batch30_w1_746_valid_exact_set_is_one_transaction(){
+        let mut s=state();assert!(s.claim_exact_frame_set(&[PAGE,10*PAGE]));
+        assert_eq!(s.used,2);assert!(s.verify_frame_accounting());
+        assert!(s.release_exact_frame_set(&[PAGE,10*PAGE]));
+        assert_eq!(s.used,0);
+    }
+    #[test] fn kernel_p0_batch30_w1_747_overlap_rejects_exact_set_without_mutation(){
+        let mut s=state();s.spans[1].base=2*PAGE;
+        assert!(!s.claim_exact_frame_set(&[PAGE,2*PAGE]));
+        assert_eq!(s.used,0);assert_eq!(s.bitmap[0],0);
+    }
+    #[test] fn kernel_p0_batch30_w1_748_corrupt_offset_denies_release_of_live_frame(){
+        let mut s=state();assert!(s.claim_exact_frame_set(&[PAGE]));
+        s.spans[1].bit_offset=1;
+        assert!(!s.release_exact_frame_set(&[PAGE]));
+        assert!(s.allocated(0));assert_eq!(s.used,1);
+    }
+    #[test] fn kernel_p0_batch30_w1_749_corrupt_geometry_denies_snapshot_and_accounting(){
+        let mut s=state();s.cursor=s.total;
+        let sentinel=FrameSpanUsage{base:77,frames:7,busy:7,longest_free:7};
+        let mut out=[sentinel;2];
+        assert!(!s.verify_frame_accounting());
+        assert_eq!(s.snapshot_span_usage(&mut out),None);
+        assert_eq!(out,[sentinel;2]);
+    }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch31_w1 {
+    use super::*;
+    fn fresh()->State {
+        let mut s=State::empty();s.initialized=true;s.count=2;s.total=4;
+        s.spans[0]=Span{base:PAGE,count:2,bit_offset:0};
+        s.spans[1]=Span{base:10*PAGE,count:2,bit_offset:2};s
+    }
+    #[test]fn kernel_p0_batch31_w1_766_corrupt_cursor_fails_closed_and_recovers(){
+        let mut s=fresh();s.cursor=s.total;
+        assert_eq!(s.claim_single_frame(),None);
+        assert!(!s.verify_frame_accounting());assert_eq!(s.bitmap[0],0);
+        s.cursor=0;assert!(s.verify_frame_accounting());
+    }
+    #[test]fn kernel_p0_batch31_w1_767_claim_candidates_reject_aliased_spans(){
+        let mut s=fresh();assert!(s.can_claim_frames(&[PAGE,10*PAGE]));
+        s.spans[1].base=2*PAGE;
+        assert!(!s.can_claim_frames(&[PAGE,2*PAGE]));
+        assert_eq!(s.frame_span_index(PAGE),None);assert_eq!(s.bitmap[0],0);
+    }
+    #[test]fn kernel_p0_batch31_w1_768_release_candidates_reject_corrupt_offsets(){
+        let mut s=fresh();assert!(s.claim_exact_frame_set(&[PAGE]));
+        assert!(s.can_release_frames(&[PAGE]));s.spans[1].bit_offset=1;
+        assert!(!s.can_release_frames(&[PAGE]));
+        assert!(!s.release_selected(&[PAGE]));assert!(s.allocated(0));assert_eq!(s.used,1);
+    }
+    #[test]fn kernel_p0_batch31_w1_769_snapshot_requires_exact_accounting(){
+        let mut s=fresh();assert!(s.claim_exact_frame_set(&[PAGE]));
+        let sentinel=FrameSpanUsage{base:77,frames:7,busy:7,longest_free:7};
+        let mut out=[sentinel;2];
+        assert_eq!(s.snapshot_span_usage(&mut out),Some(2));assert_eq!(out[0].busy,1);
+        s.used=0;let mut unchanged=[sentinel;2];
+        assert_eq!(s.snapshot_span_usage(&mut unchanged),None);
+        assert_eq!(unchanged,[sentinel;2]);
+    }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch32_w1 {
+    use super::*;
+    fn state()->State {
+        let mut s=State::empty();
+        s.initialized=true;s.count=1;s.total=4;
+        s.spans[0]=Span{base:PAGE,count:4,bit_offset:0};
+        s
+    }
+    #[test] fn kernel_p0_batch32_w1_786_valid_atomic_claim_is_releasable(){
+        let mut s=state();
+        assert!(s.claim_exact_frame_set(&[PAGE,3*PAGE]));
+        assert!(s.verify_frame_accounting());assert_eq!(s.used,2);
+        assert!(s.release_exact_frame_set(&[3*PAGE,PAGE]));
+        assert_eq!(s.used,0);assert!(s.verify_frame_accounting());
+    }
+    #[test] fn kernel_p0_batch32_w1_787_mismatched_used_denies_claim_without_bitmap_mutation(){
+        let mut s=state();s.used=1;
+        assert!(!s.claim_exact_frame_set(&[PAGE]));assert_eq!(s.bitmap[0],0);
+        assert_eq!(s.used,1);s.used=0;
+        assert!(s.claim_exact_frame_set(&[PAGE]));
+    }
+    #[test] fn kernel_p0_batch32_w1_788_mismatched_used_denies_release_of_owned_frame(){
+        let mut s=state();assert!(s.claim_exact_frame_set(&[PAGE]));
+        s.used=0;assert!(!s.release_exact_frame_set(&[PAGE]));
+        assert!(s.allocated(0));s.used=1;
+        assert!(s.release_exact_frame_set(&[PAGE]));
+    }
+    #[test] fn kernel_p0_batch32_w1_789_claim_and_release_preflight_refuse_corrupt_accounting(){
+        let mut s=state();assert!(s.claim_exact_frame_set(&[PAGE]));
+        s.used=2;
+        assert!(!s.can_claim_frames(&[2*PAGE]));
+        assert!(!s.can_release_frames(&[PAGE]));
+        s.used=1;assert!(s.can_claim_frames(&[2*PAGE]));
+        assert!(s.can_release_frames(&[PAGE]));
+    }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch33_w1 {
+    use super::*;
+    fn state()->State{
+        let mut s=State::empty();
+        s.initialized=true;s.count=1;s.total=8;
+        s.spans[0]=Span{base:PAGE,count:8,bit_offset:0};s
+    }
+    #[test] fn kernel_p0_batch33_w1_806_corrupted_accounting_denies_exact_dma_claim(){
+        let mut s=state();s.used=1;
+        assert!(!s.claim_run(PAGE,2));assert_eq!(s.bitmap[0],0);
+        assert_eq!(s.used,1);
+    }
+    #[test] fn kernel_p0_batch33_w1_807_corrupted_accounting_denies_release(){
+        let mut s=state();assert!(s.claim_run(PAGE,2));
+        s.used=1;assert!(!s.release_run(PAGE,2));
+        assert!(s.allocated(0));assert!(s.allocated(1));assert_eq!(s.used,1);
+        s.used=2;assert!(s.release_run(PAGE,2));
+    }
+    #[test] fn kernel_p0_batch33_w1_808_corrupted_accounting_denies_contiguous_claim(){
+        let mut s=state();s.used=1;
+        assert_eq!(s.claim_contiguous_run(2),None);
+        assert_eq!(s.bitmap[0],0);
+    }
+    #[test] fn kernel_p0_batch33_w1_809_valid_aligned_highest_and_contiguous_runs(){
+        let mut s=state();
+        assert_eq!(s.claim_aligned_run(2,2),Some(2*PAGE));
+        assert_eq!(s.claim_highest_run(2),Some(7*PAGE));
+        assert_eq!(s.claim_contiguous_run(2),Some(4*PAGE));
+        assert_eq!(s.used,6);assert!(s.verify_frame_accounting());
+        assert!(s.release_run(2*PAGE,2));
+        assert!(s.release_run(7*PAGE,2));
+        assert!(s.release_run(4*PAGE,2));
+        assert_eq!(s.used,0);assert!(s.verify_frame_accounting());
+    }
+}
+
+#[cfg(test)]
+mod p0_hhdm_zero_page_allocator_regression {
+    use super::*;
+    unsafe extern "C" fn read(index:u64,out:*mut Region,context:*mut c_void)->bool {
+        let map=unsafe{&*(context.cast::<Vec<Region>>())};
+        if let Some(region)=map.get(index as usize){
+            unsafe{out.write(*region)};true
+        }else{false}
+    }
+    #[test]
+    fn firmware_zero_origin_is_not_an_allocatable_pmm_frame(){
+        let mut s=State::empty();
+        let mut map=vec![Region{base:0,length:PAGE*4,kind:0}];
+        assert!(unsafe{initialize(&mut s,1,Some(read),
+            (&mut map as *mut Vec<Region>).cast())});
+        assert!(s.verify_frame_accounting());
+        assert_eq!(s.total,3);
+        assert_eq!(s.spans[0].base,PAGE);
+        assert_eq!(s.bit_for_physical(0),None);
+        assert!(!s.is_managed_frame(0));
+        assert_eq!(s.claim_single_frame(),Some(PAGE));
+        assert!(s.verify_frame_accounting());
+    }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch34_w1 {
+    use super::*;
+    unsafe extern "C" fn read(i:u64,out:*mut Region,ctx:*mut c_void)->bool {
+        let regions=unsafe{&*(ctx.cast::<Vec<Region>>())};
+        if let Some(v)=regions.get(i as usize){unsafe{out.write(*v)};true}else{false}
+    }
+    fn setup()->State{
+        let mut s=State::empty();
+        let mut map=vec![Region{base:PAGE,length:4*PAGE,kind:0},
+            Region{base:20*PAGE,length:3*PAGE,kind:0}];
+        assert!(unsafe{initialize(&mut s,2,Some(read),
+            (&mut map as *mut Vec<Region>).cast())});
+        s
+    }
+    const SENTINEL:FrameSpanUsage=FrameSpanUsage{
+        base:0xfeed,frames:0xfeed,busy:0xfeed,longest_free:0xfeed,
+    };
+    #[test] fn kernel_p0_batch34_w1_826_two_span_snapshot_matches_ownership(){
+        let mut s=setup();assert!(s.claim_run(PAGE*2,2));
+        let mut out=[SENTINEL;3];
+        assert_eq!(s.snapshot_span_usage(&mut out),Some(2));
+        assert_eq!(out[0],FrameSpanUsage{base:PAGE,frames:4,busy:2,longest_free:1});
+        assert_eq!(out[1],FrameSpanUsage{base:20*PAGE,frames:3,busy:0,longest_free:3});
+        assert_eq!(out[2],SENTINEL);
+    }
+    #[test] fn kernel_p0_batch34_w1_827_short_snapshot_has_no_partial_publication(){
+        let s=setup();let mut out=[SENTINEL;1];
+        assert_eq!(s.snapshot_span_usage(&mut out),None);
+        assert_eq!(out,[SENTINEL;1]);
+    }
+    #[test] fn kernel_p0_batch34_w1_828_corrupt_bitmap_denies_snapshot_without_writes(){
+        let mut s=setup();s.set_bit(0,true); // bookkeeping still reports zero
+        let mut out=[SENTINEL;2];
+        assert_eq!(s.snapshot_span_usage(&mut out),None);
+        assert_eq!(out,[SENTINEL;2]);
+    }
+    #[test] fn kernel_p0_batch34_w1_829_release_updates_snapshot_without_losing_span(){
+        let mut s=setup();assert!(s.claim_run(20*PAGE,2));
+        assert!(s.release_run(20*PAGE,2));
+        let mut out=[SENTINEL;2];
+        assert_eq!(s.snapshot_span_usage(&mut out),Some(2));
+        assert_eq!(out[1].busy,0);assert_eq!(out[1].longest_free,3);
+    }
+}
+
+#[cfg(test)] mod kernel_p0_batch35_w1 {
+ use super::*;
+ fn state()->State {
+  let mut s=State::empty();s.initialized=true;s.count=1;s.total=8;
+  s.spans[0]=Span{base:PAGE,count:8,bit_offset:0};s
+ }
+ #[test] fn kernel_p0_batch35_w1_846_corrupt_accounting_rejects_aligned_search(){
+  let mut s=state();s.used=1;
+  assert_eq!(s.find_aligned_run(2,2),None);assert_eq!(s.bitmap[0],0);
+ }
+ #[test] fn kernel_p0_batch35_w1_847_corrupt_bitmap_rejects_highest_search(){
+  let mut s=state();s.set_bit(0,true);
+  assert_eq!(s.highest_available_run(2),None);assert_eq!(s.used,0);
+ }
+ #[test] fn kernel_p0_batch35_w1_848_valid_aligned_and_highest_disjoint(){
+  let mut s=state();assert_eq!(s.find_aligned_run(2,2),Some(2*PAGE));
+  assert!(s.claim_run(2*PAGE,2));
+  assert_eq!(s.highest_available_run(2),Some(7*PAGE));
+  assert!(s.claim_run(7*PAGE,2));assert_eq!(s.used,4);
+ }
+ #[test] fn kernel_p0_batch35_w1_849_release_makes_highest_run_available_again(){
+  let mut s=state();assert!(s.claim_run(7*PAGE,2));
+  assert_eq!(s.highest_available_run(2),Some(5*PAGE));
+  assert!(s.release_run(7*PAGE,2));
+  assert_eq!(s.highest_available_run(2),Some(7*PAGE));
+  assert!(s.verify_frame_accounting());
+ }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch36_w1 {
+    use super::*;
+    fn state()->State {
+        let mut s=State::empty();
+        s.initialized=true;s.count=1;s.total=4;
+        s.spans[0]=Span{base:PAGE,count:4,bit_offset:0};s
+    }
+    #[test] fn kernel_p0_batch36_w1_866_live_ownership_free_count_roundtrip(){
+        let mut s=state();assert_eq!(s.trusted_free_count(),4);
+        assert!(s.claim_run(PAGE,2));assert_eq!(s.trusted_free_count(),2);
+        assert!(s.release_run(PAGE,2));assert_eq!(s.trusted_free_count(),4);
+    }
+    #[test] fn kernel_p0_batch36_w1_867_forged_usage_count_never_published(){
+        let mut s=state();s.used=1;
+        assert_eq!(s.checked_free(),3);
+        assert_eq!(s.trusted_free_count(),0);
+    }
+    #[test] fn kernel_p0_batch36_w1_868_unaccounted_bitmap_occupancy_denied(){
+        let mut s=state();s.set_bit(3,true);
+        assert_eq!(s.trusted_free_count(),0);
+        s.used=1;assert_eq!(s.trusted_free_count(),3);
+    }
+    #[test] fn kernel_p0_batch36_w1_869_bad_cursor_span_and_uninitialized_denied(){
+        let mut s=state();s.cursor=s.total;
+        assert_eq!(s.trusted_free_count(),0);
+        s=state();s.spans[0].count=5;
+        assert_eq!(s.trusted_free_count(),0);
+        s=State::empty();assert_eq!(s.trusted_free_count(),0);
     }
 }
