@@ -799,6 +799,102 @@ mod m1_partition_tests{
    self.disk.write_sector(lba,input)
   }
  }
+ #[test]fn m1_g1_g2_gpt_metadata_epoch_change_retires_terminal_session(){
+  use crate::batch5_session::Identity;
+  use crate::batch6_security::{Access,FILE_READ,FILE_WRITE};
+  use crate::m1_persistent_terminal::{
+   GptTerminalSession,PartitionCommandError,Error as TerminalError
+  };
+  // A fully valid GPT epoch changes its selected entry attributes while
+  // retaining BOTH GUIDs and the same partition geometry after a write.
+  struct MutateGpt{disk:Disk,changed:bool}
+  impl BlockDevice for MutateGpt{
+   fn sector_count(&self)->u64{self.disk.sector_count()}
+   fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+    ->Result<(),BlockError>{self.disk.read_sector(lba,out)}
+   fn write_sector(&mut self,lba:u64,data:&[u8;SECTOR_BYTES])
+    ->Result<(),BlockError>{
+    self.disk.write_sector(lba,data)?;
+    if (40..140).contains(&lba)&&!self.changed{
+     self.disk.data[2][48]^=1; // GPT attributes, not selected identity.
+     let table_crc=crc(&self.disk.data[2]);
+     self.disk.data[1][88..92].copy_from_slice(&table_crc.to_le_bytes());
+     self.disk.data[1][16..20].fill(0);
+     let header_crc=crc(&self.disk.data[1][..92]);
+     self.disk.data[1][16..20].copy_from_slice(&header_crc.to_le_bytes());
+     sync_backup(&mut self.disk); // Fully CRC-valid secondary epoch.
+     self.changed=true;
+    }
+    Ok(())
+   }
+  }
+  let mut disk=gpt_disk();
+  {let window=BlockWindow::new(&mut disk,40,100).unwrap();
+   let mut fs=HierVfs::format_blank(window).unwrap();
+   fs.mkdir("/home").unwrap();
+  }
+  let old=inspect_partition_receipt(&mut disk,0).unwrap();
+  let user=Identity{pid:3,generation:7};
+  let mut access=Access::<1>::new();
+  access.grant(user,FILE_READ|FILE_WRITE,100).unwrap();
+  let mut device=MutateGpt{disk,changed:false};
+  let mut session=GptTerminalSession::open(&mut device,0,&access,user,1,90).unwrap();
+  let writes=device.disk.writes;
+  let mut reply=[0xa5;32];
+  assert_eq!(session.execute(&mut device,&access,user,1,
+    b"write /home/note committed",&mut reply),
+    Err(PartitionCommandError::Mount(MountError::Partition(Error::Invalid))));
+  assert!(device.changed);
+  assert!(device.disk.writes>writes);
+  assert_eq!(reply,[0;32]);
+  assert!(!session.is_active()); // No reuse of uncertain mounted media.
+  assert_eq!(inspect_gpt_selection(&mut device,0),Ok(old.gpt.unwrap()));
+  assert_ne!(inspect_partition_receipt(&mut device,0).unwrap(),old);
+  let mut second=[0xb5;32];
+  assert_eq!(session.execute(&mut device,&access,user,2,
+    b"cat /home/note",&mut second),
+    Err(PartitionCommandError::Command(TerminalError::Denied)));
+  assert_eq!(second,[0xb5;32]);
+ }
+
+ #[test]fn m1_g1_g2_session_rejects_valid_gpt_epoch_switch_between_commands(){
+  use crate::batch5_session::Identity;
+  use crate::batch6_security::{Access,FILE_READ,FILE_WRITE};
+  use crate::m1_persistent_terminal::{
+   GptTerminalSession,PartitionCommandError,Error as TerminalError
+  };
+  let mut disk=gpt_disk();
+  {let window=BlockWindow::new(&mut disk,40,100).unwrap();
+   let mut fs=HierVfs::format_blank(window).unwrap();
+   fs.mkdir("/home").unwrap();
+  }
+  let user=Identity{pid:3,generation:9};
+  let mut access=Access::<1>::new();
+  access.grant(user,FILE_READ|FILE_WRITE,100).unwrap();
+  let mut session=GptTerminalSession::open(&mut disk,0,&access,user,1,90).unwrap();
+  let original=inspect_partition_receipt(&mut disk,0).unwrap();
+  // Another actor modifies only checked GPT attributes BETWEEN commands.
+  disk.data[2][48]^=2;
+  let table_crc=crc(&disk.data[2]);
+  disk.data[1][88..92].copy_from_slice(&table_crc.to_le_bytes());
+  disk.data[1][16..20].fill(0);
+  let header_crc=crc(&disk.data[1][..92]);
+  disk.data[1][16..20].copy_from_slice(&header_crc.to_le_bytes());
+  sync_backup(&mut disk);
+  assert_eq!(inspect_gpt_selection(&mut disk,0),Ok(original.gpt.unwrap()));
+  assert_ne!(inspect_partition_receipt(&mut disk,0).unwrap(),original);
+  let before=disk.writes;
+  let mut output=[0x77u8;24];
+  assert_eq!(session.execute(&mut disk,&access,user,2,
+    b"write /home/forbidden stale",&mut output),
+    Err(PartitionCommandError::Mount(MountError::Partition(Error::Invalid))));
+  assert_eq!(disk.writes,before); // Denied before any COW mutation.
+  assert_eq!(output,[0x77;24]); // No command result was published.
+  assert!(!session.is_active());
+  assert_eq!(session.execute(&mut disk,&access,user,3,b"pwd",&mut output),
+    Err(PartitionCommandError::Command(TerminalError::Denied)));
+ }
+
  #[test]fn r101_mbr_selection_rejects_changed_sector_zero_without_writes(){
   let mut disk=mbr_disk();
   let selection=inspect_mbr_selection(&mut disk,0).unwrap();

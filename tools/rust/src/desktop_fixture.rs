@@ -122,13 +122,35 @@ fn refresh_partition_table(disk:&mut Image){
 }
 // Each case preserves the selected partition's filesystem and valid GPT
 // header/array checksums. The rejection must come from the named layout fault.
+fn recalc_header_crc(h:&mut[u8;SECTOR_BYTES]){
+    h[16..20].fill(0);
+    let sum=crc(&h[..92]);
+    h[16..20].copy_from_slice(&sum.to_le_bytes());
+}
 fn partition_fault(kind:&str)->Result<Image,String>{
-    if !matches!(kind,"overlap"|"duplicate-id"|"protective-overflow"){
-        return Err("unknown partition fault (overlap, duplicate-id, protective-overflow)".into());
+    if !matches!(kind,"overlap"|"duplicate-id"|"protective-overflow"|
+        "nil-disk-guid"|"backup-disk-guid"|"backup-table-mismatch"){
+        return Err("unknown partition fault (overlap, duplicate-id, protective-overflow, nil-disk-guid, backup-disk-guid, backup-table-mismatch)".into());
     }
     let mut disk=image()?;
     if kind=="protective-overflow"{
         disk.sectors[0][458..462].copy_from_slice(&(SECTORS as u32).to_le_bytes());
+    }else if kind=="nil-disk-guid"{
+        // Both GPT headers remain individually CRC valid, but disk GUID is nil.
+        for lba in [1usize,255]{
+            disk.sectors[lba][56..72].fill(0);
+            recalc_header_crc(&mut disk.sectors[lba]);
+        }
+    }else if kind=="backup-disk-guid"{
+        // Individually checksummed mirror advertises a different disk GUID.
+        disk.sectors[255][56..72].fill(0x53);
+        recalc_header_crc(&mut disk.sectors[255]);
+    }else if kind=="backup-table-mismatch"{
+        // Distinct, individually CRC-valid GPT entry epochs with same GUID/bounds.
+        disk.sectors[254][48]^=0x40; // backup-only GPT entry attributes
+        let sum=crc(&disk.sectors[254]);
+        disk.sectors[255][88..92].copy_from_slice(&sum.to_le_bytes());
+        recalc_header_crc(&mut disk.sectors[255]);
     }else{
         let entry=&mut disk.sectors[2][128..256];
         entry[..16].copy_from_slice(b"IndianOS-COW-VFS");
@@ -208,6 +230,53 @@ fn main(){
             assert_eq!(discover(&mut disk).unwrap().len(),if kind=="protective-overflow"{1}else{2});
         }
         assert!(partition_fault("unknown").is_err());
+    }
+    #[test]fn g2_crc_valid_gpt_identity_and_mirror_faults_fail_without_writes(){
+        use indianos_kernel_core::m1_partition::{discover,Error};
+        let original=image().unwrap();
+        for kind in ["nil-disk-guid","backup-disk-guid","backup-table-mismatch"]{
+            let mut disk=partition_fault(kind).unwrap();
+            for lba in 0..SECTORS{
+                if ![0,1,2,254,255].contains(&lba){
+                    assert_eq!(disk.sectors[lba],original.sectors[lba],"{kind}");
+                }
+            }
+            for (head,table) in [(1usize,2usize),(255,254)]{
+                let mut header=disk.sectors[head];
+                let saved=u32::from_le_bytes(header[16..20].try_into().unwrap());
+                header[16..20].fill(0);
+                assert_eq!(crc(&header[..92]),saved,"{kind}: header {head}");
+                let table_crc=u32::from_le_bytes(header[88..92].try_into().unwrap());
+                assert_eq!(crc(&disk.sectors[table]),table_crc,"{kind}: table {table}");
+            }
+            let mut volume=BlockWindow::new(&mut disk,START,COUNT).unwrap();
+            assert_eq!(DurableFs::inspect_health(&mut volume).unwrap().redundancy,
+                indianos_kernel_core::durablefs::Redundancy::Healthy);
+            drop(volume);
+            let prior=disk.sectors.clone();
+            assert_eq!(discover(&mut disk),Err(Error::Invalid),"{kind}");
+            assert_eq!(disk.sectors,prior,"{kind}: read-only discovery changed media");
+            // Repair only this named fault. All other data must already be healthy.
+            match kind{
+                "nil-disk-guid"=>{
+                    for lba in [1usize,255]{
+                        disk.sectors[lba][56..72].copy_from_slice(&DISK_GUID);
+                        recalc_header_crc(&mut disk.sectors[lba]);
+                    }
+                },
+                "backup-disk-guid"=>{
+                    disk.sectors[255][56..72].copy_from_slice(&DISK_GUID);
+                    recalc_header_crc(&mut disk.sectors[255]);
+                },
+                "backup-table-mismatch"=>{
+                    disk.sectors[254]=disk.sectors[2];
+                    let sum=crc(&disk.sectors[254]);
+                    disk.sectors[255]=header(255,1,254,sum);
+                },
+                _=>unreachable!(),
+            }
+            assert_eq!(discover(&mut disk).unwrap().len(),1,"{kind} fixed");
+        }
     }
     #[test]fn namespace_faults_keep_partition_and_cow_health_but_fail_strict_admission(){
         let original=image().unwrap();

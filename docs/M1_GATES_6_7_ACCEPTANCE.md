@@ -65,3 +65,16 @@ uploads the artifacts. A failed/skipped required check prevents gate acceptance.
 See PR765's exact head/checks for final CI status. Until those results and the
 repository review requirements are satisfied, the source checklist remains open
 despite completed implementation and local exit evidence.
+
+## G1/G2 consolidated exact-head candidate, 22 Nov 2026
+Existing G1 Terminal and G2 GPT/MBR functions have strong host/QEMU evidence.
+Focused PR #790 additionally protects complete receipt identity across
+commands and GPT sessions. Three more CRC-valid GPT identity/mirror rejection
+fixtures now run in the real QEMU partition-negative matrix (25 configured
+boots, not yet accepted on this revision). Host fixture tests check checksum
+correctness, unaffected filesystem data and zero writes on discovery failure.
+
+G1/G2 remain open until exact-head full normal-desktop QEMU, kernel boot,
+security, combined reliability, independent review, and merged-main
+confirmation all pass. Do not infer review or production physical-device
+qualification from source changes.
