@@ -1047,3 +1047,43 @@ jobs:
           test "$count" -eq "$EXPECTED_COUNT"
           cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$FILTER"
           cargo check --locked --offline --manifest-path rust/kernel_core/Cargo.toml --no-default-features --target x86_64-unknown-none --features "$FEATURES"
+
+  p0-batch36-implemented:
+    name: Batch36 P0-866..890 ${{ matrix.workstation }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { workstation: W1-PMM-trusted-free-count, filter: kernel_p0_batch36_w1, expected: 4, features: 'normal-desktop' }
+          - { workstation: W2-APIC-progress-snapshot, filter: kernel_p0_batch36_w2, expected: 4, features: 'normal-desktop,preempt' }
+          - { workstation: W3-ring3-WX-protection, filter: kernel_p0_batch36_w3, expected: 5, features: 'normal-desktop,preempt' }
+          - { workstation: W4-durable-barrier-reporting, filter: kernel_p0_batch36_w4, expected: 4, features: 'test-r031-vfs' }
+          - { workstation: W5-ARP-sender-binding, filter: kernel_p0_batch36_w5, expected: 4, features: 'test-r028-network' }
+          - { workstation: W6-Limine-descriptor-uniqueness, filter: kernel_p0_batch36_w6, expected: 4, features: 'normal-desktop' }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify exact PR SHA
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: python3 tools/verify_ci_sha.py --expected "$EXPECTED_SHA" --observed "$(git rev-parse HEAD)"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
+      - name: Verify 25 Rust cases and freestanding build
+        env:
+          FILTER: ${{ matrix.filter }}
+          FEATURES: ${{ matrix.features }}
+          EXPECTED_COUNT: ${{ matrix.expected }}
+        run: |
+          set -euo pipefail
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$FILTER" -- --list > /tmp/batch36-tests.txt
+          count=$(grep -c "$FILTER" /tmp/batch36-tests.txt || true)
+          echo "Found $count; expected $EXPECTED_COUNT"
+          test "$count" -eq "$EXPECTED_COUNT"
+          cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features "$FEATURES" "$FILTER"
+          cargo check --locked --offline --manifest-path rust/kernel_core/Cargo.toml --no-default-features --target x86_64-unknown-none --features "$FEATURES"

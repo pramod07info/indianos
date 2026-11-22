@@ -83,6 +83,10 @@ fn user_segment_layout_valid(plan:&ProgramPlan)->bool {
            // Loaded ELF bytes may not escape the segment's actual owned pages.
            // Empty test descriptors retain legacy numeric ABI compatibility.
            seg.file_size>seg.memory_size ||
+           // Installed ELF data must not be writable AND executable, even
+           // for read-only syscall copies. Empty staged descriptors keep
+           // their legacy numeric compatibility until real PTE admission.
+           (seg.memory_size!=0 && seg.writable && seg.executable) ||
            seg.file_offset.checked_add(seg.file_size).is_none() ||
            (seg.memory_size!=0 &&
              (seg.virtual_address<seg.page_begin ||
@@ -1359,4 +1363,49 @@ mod kernel_p0_batch34_w3 {
   p.segments[0].writable=false;
   assert!(!user_range(&p,USER_MIN,16,true));
  }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch36_w3 {
+    use super::*;
+    fn plan(writable:bool,executable:bool)->ProgramPlan {
+        let mut segments=[ProgramSegment::empty();MAX_SEGMENTS];
+        segments[0]=ProgramSegment{
+            virtual_address:USER_MIN+32,file_offset:0,file_size:32,
+            memory_size:128,page_begin:USER_MIN,page_end:USER_MIN+PAGE_BYTES,
+            writable,executable
+        };
+        ProgramPlan{entry:USER_MIN+32,stack_begin:USER_TOP-STACK_BYTES,
+            stack_end:USER_TOP,guard_begin:USER_TOP-STACK_BYTES-PAGE_BYTES,
+            segment_count:1,segments}
+    }
+    #[test] fn kernel_p0_batch36_w3_874_loaded_wx_segment_cannot_authorize_read(){
+        let p=plan(true,true);
+        assert!(!user_range(&p,USER_MIN+32,16,false));
+        assert!(!user_segment_layout_valid(&p));
+    }
+    #[test] fn kernel_p0_batch36_w3_875_loaded_wx_segment_cannot_authorize_write(){
+        let p=plan(true,true);
+        assert!(!user_range(&p,USER_MIN+32,16,true));
+        assert!(!user_range(&p,USER_MIN+96,32,true));
+    }
+    #[test] fn kernel_p0_batch36_w3_876_rx_code_readable_but_never_writable(){
+        let p=plan(false,true);
+        assert!(user_segment_layout_valid(&p));
+        assert!(user_range(&p,USER_MIN+32,16,false));
+        assert!(!user_range(&p,USER_MIN+32,16,true));
+    }
+    #[test] fn kernel_p0_batch36_w3_877_nonexecutable_data_read_write_preserved(){
+        let p=plan(true,false);
+        assert!(user_segment_layout_valid(&p));
+        assert!(user_range(&p,USER_MIN+64,64,false));
+        assert!(user_range(&p,USER_MIN+64,64,true));
+    }
+    #[test] fn kernel_p0_batch36_w3_878_empty_staged_descriptor_still_numeric(){
+        let mut p=plan(true,false);
+        p.segments[0].memory_size=0;p.segments[0].file_size=0;
+        assert!(user_range(&p,USER_MIN,16,true));
+        assert!(!user_range(&p,USER_MIN,0,true));
+        assert!(!user_range(&p,p.guard_begin,1,false));
+    }
 }

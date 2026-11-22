@@ -59,6 +59,12 @@ impl State {
         if !self.initialized {return 0;}
         self.total.checked_sub(self.used).unwrap_or(0)
     }
+    /// Diagnostic count must agree with the owned bitmap and span geometry.
+    /// This slower verification is for status/acceptance, never the hot
+    /// single-page allocation path.
+    fn trusted_free_count(&self)->u64 {
+        if self.verify_frame_accounting(){self.total-self.used}else{0}
+    }
     fn physical_at(&self, bit: u64) -> Option<u64> {
         // Corrupt span metadata must never panic or wrap a physical frame
         // address into another owner's page, even in recovery paths.
@@ -292,7 +298,7 @@ pub extern "C" fn pmm_total_frames() -> u64 {
 #[no_mangle]
 pub extern "C" fn pmm_free_frames() -> u64 {
     let s = unsafe { state() };
-    s.checked_free()
+    s.trusted_free_count()
 }
 /// Allocate two distinct frames, recycle one and always attempt cleanup
 /// of live owners after an intermediate failure. The caller's allocation
@@ -2325,4 +2331,36 @@ mod kernel_p0_batch34_w1 {
   assert_eq!(s.highest_available_run(2),Some(7*PAGE));
   assert!(s.verify_frame_accounting());
  }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch36_w1 {
+    use super::*;
+    fn state()->State {
+        let mut s=State::empty();
+        s.initialized=true;s.count=1;s.total=4;
+        s.spans[0]=Span{base:PAGE,count:4,bit_offset:0};s
+    }
+    #[test] fn kernel_p0_batch36_w1_866_live_ownership_free_count_roundtrip(){
+        let mut s=state();assert_eq!(s.trusted_free_count(),4);
+        assert!(s.claim_run(PAGE,2));assert_eq!(s.trusted_free_count(),2);
+        assert!(s.release_run(PAGE,2));assert_eq!(s.trusted_free_count(),4);
+    }
+    #[test] fn kernel_p0_batch36_w1_867_forged_usage_count_never_published(){
+        let mut s=state();s.used=1;
+        assert_eq!(s.checked_free(),3);
+        assert_eq!(s.trusted_free_count(),0);
+    }
+    #[test] fn kernel_p0_batch36_w1_868_unaccounted_bitmap_occupancy_denied(){
+        let mut s=state();s.set_bit(3,true);
+        assert_eq!(s.trusted_free_count(),0);
+        s.used=1;assert_eq!(s.trusted_free_count(),3);
+    }
+    #[test] fn kernel_p0_batch36_w1_869_bad_cursor_span_and_uninitialized_denied(){
+        let mut s=state();s.cursor=s.total;
+        assert_eq!(s.trusted_free_count(),0);
+        s=state();s.spans[0].count=5;
+        assert_eq!(s.trusted_free_count(),0);
+        s=State::empty();assert_eq!(s.trusted_free_count(),0);
+    }
 }

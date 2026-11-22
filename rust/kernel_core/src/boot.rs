@@ -271,6 +271,13 @@ fn limine_framebuffer_table_valid(resp:&Framebuffers)->bool{
  for i in 0..resp.count as usize{
   let entry=unsafe{ptr::read_volatile(resp.framebuffers.add(i))};
   if !limine_pointer_aligned(entry){return false;}
+  // Multiple table slots may not impersonate distinct outputs with one
+  // borrowed descriptor; validate the whole table before any consumer runs.
+  for j in 0..i {
+   if unsafe{ptr::read_volatile(resp.framebuffers.add(j))}==entry{
+    return false;
+   }
+  }
  }
  true
 }
@@ -937,4 +944,33 @@ mod kernel_p0_batch34_w6 {
   table.count=4097;table.framebuffers=slots.as_ptr();
   assert!(!limine_framebuffer_table_valid(&table));
  }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch36_w6 {
+    use super::*;
+    #[test] fn kernel_p0_batch36_w6_887_two_distinct_framebuffer_descriptors(){
+        let entries=[0x1000usize as *const Framebuffer,0x2000usize as *const Framebuffer];
+        let r=Framebuffers{revision:0,count:2,framebuffers:entries.as_ptr()};
+        assert!(limine_framebuffer_table_valid(&r));
+    }
+    #[test] fn kernel_p0_batch36_w6_888_duplicate_descriptor_rejected(){
+        let entries=[0x1000usize as *const Framebuffer,0x1000usize as *const Framebuffer];
+        let r=Framebuffers{revision:0,count:2,framebuffers:entries.as_ptr()};
+        assert!(!limine_framebuffer_table_valid(&r));
+    }
+    #[test] fn kernel_p0_batch36_w6_889_late_unaligned_descriptor_rejected(){
+        let entries=[0x1000usize as *const Framebuffer,0x2001usize as *const Framebuffer];
+        let r=Framebuffers{revision:0,count:2,framebuffers:entries.as_ptr()};
+        assert!(!limine_framebuffer_table_valid(&r));
+    }
+    #[test] fn kernel_p0_batch36_w6_890_missing_and_oversized_tables_denied(){
+        let entries=[0x1000usize as *const Framebuffer];
+        for count in [0,4097]{
+            let r=Framebuffers{revision:0,count,framebuffers:entries.as_ptr()};
+            assert!(!limine_framebuffer_table_valid(&r));
+        }
+        let r=Framebuffers{revision:0,count:1,framebuffers:core::ptr::null()};
+        assert!(!limine_framebuffer_table_valid(&r));
+    }
 }

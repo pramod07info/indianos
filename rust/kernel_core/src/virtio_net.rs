@@ -369,7 +369,11 @@ fn rx_ipv4_arp_header_valid(frame:&[u8])->bool{
  if frame.len()<42{return false;}
  frame[14..16]==[0,1] && frame[16..18]==[0x08,0x00] &&
  frame[18]==6 && frame[19]==4 &&
- matches!(u16::from_be_bytes([frame[20],frame[21]]),1|2)
+ matches!(u16::from_be_bytes([frame[20],frame[21]]),1|2) &&
+ // ARP sender hardware address must be the actual Ethernet sender;
+ // never publish a claimed layer-2 identity from another host.
+ frame[22..28]==frame[6..12] &&
+ frame[22]&1==0 && frame[22..28].iter().any(|&b|b!=0)
 }
 fn rx_l3_header_fits(frame:&[u8])->bool{
     if frame.len()<14{return false;}
@@ -1027,6 +1031,7 @@ mod kernel_p0_batch34_w5 {
     #[test] fn kernel_p0_batch34_w5_841_arp_minimum_header_required(){
         let mut f=ethernet(0x0806,60);
         f[14..22].copy_from_slice(&[0,1,8,0,6,4,0,1]);
+        f[22..28].copy_from_slice(&[2,9,8,7,6,5]);
         assert!(!rx_l3_header_fits(&f[..41]));
         assert!(rx_l3_header_fits(&f[..42]));
         assert_eq!(rx_frame_authorized(70,60,&[0;10],&f,LOCAL),Ok(60));
@@ -1046,7 +1051,8 @@ mod kernel_p0_batch34_w5 {
   let mut f=[0;60];f[..6].fill(0xff);
   f[6..12].copy_from_slice(&[2,1,2,3,4,5]);
   f[12..14].copy_from_slice(&0x0806u16.to_be_bytes());
-  f[14..22].copy_from_slice(&[0,1,8,0,6,4,(op>>8) as u8,op as u8]);f
+  f[14..22].copy_from_slice(&[0,1,8,0,6,4,(op>>8) as u8,op as u8]);
+  f[22..28].copy_from_slice(&[2,1,2,3,4,5]);f
  }
  const LOCAL:[u8;6]=[2,3,4,5,6,7];
  #[test] fn kernel_p0_batch35_w5_860_request_reply_admitted(){
@@ -1066,4 +1072,43 @@ mod kernel_p0_batch34_w5 {
   f=arp(1);f[17]=6;assert!(!rx_ipv4_arp_header_valid(&f));
   f=arp(1);assert!(!rx_ipv4_arp_header_valid(&f[..41]));
  }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch36_w5 {
+    use super::*;
+    const LOCAL:[u8;6]=[2,3,4,5,6,7];
+    fn arp(op:u16)->[u8;60]{
+        let mut f=[0u8;60];f[..6].fill(0xff);
+        f[6..12].copy_from_slice(&[2,1,2,3,4,5]);
+        f[12..14].copy_from_slice(&0x0806u16.to_be_bytes());
+        f[14..22].copy_from_slice(&[0,1,8,0,6,4,0,op as u8]);
+        f[22..28].copy_from_slice(&[2,1,2,3,4,5]);
+        f
+    }
+    #[test] fn kernel_p0_batch36_w5_883_consistent_arp_sender_request_reply_pass(){
+        for op in [1,2] {
+            let f=arp(op);
+            assert_eq!(rx_frame_authorized(70,60,&[0;10],&f,LOCAL),Ok(60));
+        }
+    }
+    #[test] fn kernel_p0_batch36_w5_884_spoofed_payload_sender_denied(){
+        let mut f=arp(1);f[27]^=1;
+        assert!(!rx_ipv4_arp_header_valid(&f));
+        assert_eq!(rx_frame_authorized(70,60,&[0;10],&f,LOCAL),
+            Err(Error::Invalid));
+    }
+    #[test] fn kernel_p0_batch36_w5_885_zero_and_multicast_sender_denied(){
+        let mut f=arp(2);f[22..28].fill(0);
+        assert!(!rx_ipv4_arp_header_valid(&f));
+        f=arp(1);f[22]|=1;
+        assert!(!rx_ipv4_arp_header_valid(&f));
+    }
+    #[test] fn kernel_p0_batch36_w5_886_ipv4_retained_but_truncated_arp_denied(){
+        let mut ipv4=arp(1);
+        ipv4[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+        assert_eq!(rx_frame_authorized(70,60,&[0;10],&ipv4,LOCAL),Ok(60));
+        let f=arp(1);
+        assert!(!rx_l3_header_fits(&f[..41]));
+    }
 }

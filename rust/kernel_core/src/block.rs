@@ -301,6 +301,27 @@ pub fn write_expected_media_snapshot_with_progress<D:BlockDevice>(
  }
  Ok(completed)
 }
+
+    /// A completed write is not a durability receipt until the driver
+    /// confirms an explicit barrier and the same selected media revision.
+    /// Failure reports sectors successfully transferred, NOT persisted bytes.
+    pub fn write_expected_media_snapshot_durable_with_progress<D:BlockDevice>(
+        device:&mut D,start:u64,capacity:u64,revision:u64,data:&[u8]
+    )->Result<usize,MediaWriteFailure>{
+        let completed=write_expected_media_snapshot_with_progress(
+            device,start,capacity,revision,data)?;
+        if !media_snapshot_matches(device,capacity,Some(revision)){
+            return Err(MediaWriteFailure{error:BlockError::Io,completed_sectors:completed});
+        }
+        device.sync().map_err(|error|MediaWriteFailure{
+            error,completed_sectors:completed
+        })?;
+        if !media_snapshot_matches(device,capacity,Some(revision)){
+            return Err(MediaWriteFailure{error:BlockError::Io,completed_sectors:completed});
+        }
+        Ok(completed)
+    }
+
 pub fn write_expected_media_snapshot_sectors<D:BlockDevice>(
  device:&mut D,start:u64,capacity:u64,revision:u64,data:&[u8]
 )->Result<(),BlockError>{
@@ -3539,4 +3560,69 @@ mod kernel_p0_batch34_w4 {
   assert_eq!(write_expected_media_snapshot_sectors(
    &mut d,1,5,3,&[0xaa;SECTOR_BYTES*2]),Err(BlockError::Io));
  }
+}
+
+#[cfg(test)]
+mod kernel_p0_batch36_w4 {
+    use super::*;
+    struct Disk{bytes:[[u8;SECTOR_BYTES];4],generation:u64,writes:usize,
+        syncs:usize,fail_sync:bool,swap_on_write:bool}
+    impl Disk {
+        fn new()->Self{Self{bytes:[[0;SECTOR_BYTES];4],generation:7,
+            writes:0,syncs:0,fail_sync:false,swap_on_write:false}}
+    }
+    impl BlockDevice for Disk{
+        fn sector_count(&self)->u64{4}
+        fn media_generation(&self)->Option<u64>{Some(self.generation)}
+        fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])
+            ->Result<(),BlockError>{
+            *out=*self.bytes.get(lba as usize).ok_or(BlockError::OutOfRange)?;
+            Ok(())
+        }
+        fn write_sector(&mut self,lba:u64,data:&[u8;SECTOR_BYTES])
+            ->Result<(),BlockError>{
+            let slot=self.bytes.get_mut(lba as usize)
+                .ok_or(BlockError::OutOfRange)?;
+            *slot=*data;self.writes+=1;
+            if self.swap_on_write{self.generation+=1;}
+            Ok(())
+        }
+        fn sync(&mut self)->Result<(),BlockError>{
+            self.syncs+=1;
+            if self.fail_sync{Err(BlockError::Io)}else{Ok(())}
+        }
+    }
+    #[test] fn kernel_p0_batch36_w4_879_two_sectors_require_real_flush(){
+        let mut d=Disk::new();let data=[0x42;2*SECTOR_BYTES];
+        assert_eq!(write_expected_media_snapshot_durable_with_progress(
+            &mut d,1,4,7,&data),Ok(2));
+        assert_eq!((d.writes,d.syncs),(2,1));
+        assert_eq!(d.bytes[1],[0x42;SECTOR_BYTES]);
+    }
+    #[test] fn kernel_p0_batch36_w4_880_flush_failure_cannot_claim_durability(){
+        let mut d=Disk::new();d.fail_sync=true;
+        let err=write_expected_media_snapshot_durable_with_progress(
+            &mut d,0,4,7,&[3;SECTOR_BYTES]).unwrap_err();
+        assert_eq!(err,MediaWriteFailure{
+            error:BlockError::Io,completed_sectors:1});
+        assert_eq!((d.writes,d.syncs),(1,1));
+    }
+    #[test] fn kernel_p0_batch36_w4_881_midwrite_swap_skips_barrier(){
+        let mut d=Disk::new();d.swap_on_write=true;
+        let err=write_expected_media_snapshot_durable_with_progress(
+            &mut d,0,4,7,&[3;2*SECTOR_BYTES]).unwrap_err();
+        assert_eq!(err,MediaWriteFailure{
+            error:BlockError::Io,completed_sectors:1});
+        assert_eq!((d.writes,d.syncs),(1,0));
+    }
+    #[test] fn kernel_p0_batch36_w4_882_stale_and_out_of_range_touch_no_disk(){
+        let mut d=Disk::new();
+        assert_eq!(write_expected_media_snapshot_durable_with_progress(
+            &mut d,0,4,8,&[3;SECTOR_BYTES]),Err(MediaWriteFailure{
+                error:BlockError::Io,completed_sectors:0}));
+        assert_eq!(write_expected_media_snapshot_durable_with_progress(
+            &mut d,4,4,7,&[3;SECTOR_BYTES]),Err(MediaWriteFailure{
+                error:BlockError::OutOfRange,completed_sectors:0}));
+        assert_eq!((d.writes,d.syncs),(0,0));
+    }
 }
