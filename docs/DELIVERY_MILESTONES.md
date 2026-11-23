@@ -17,6 +17,8 @@ never confuse a single commit with completing a multi-year milestone.
 
 **Integration policy:** substantial production code + regression tests + real QEMU acceptance per batch; one consolidated commit and PR; run impacted M1, kernel boot, security and M2 non-regression checks on exact SHA; merge only after required CI passes, then verify merged main. Never turn a checkbox green based on mock behavior, host-only unit tests, PR title, line count or agent count. Current baseline remains **5/13**, pending **8/13**, until exact-SHA acceptance evidence justifies changing it.
 
+**G1/G2 evidence reconciliation (22 Nov 2026):** Both production implementations and their exact-source/merged-main automated acceptance now have positive verification at [PR #790](https://github.com/pramod07info/indianos/pull/790) and [merged-main QEMU run 44984574278](https://github.com/pramod07info/indianos/actions/runs/44984574278), using merge SHA `f928b87aeffcefbc5772f054aa14a5fbda0c8436`. All three combined-reliability jobs passed (including normal four-service desktop/QEMU and two cold persistent-disk boots). [Kernel boot](https://github.com/pramod07info/indianos/actions/runs/44984574248), [security S0](https://github.com/pramod07info/indianos/actions/runs/44984574259), and [M1 Files/durable-VFS](https://github.com/pramod07info/indianos/actions/runs/44984574330) passed on that **same merged SHA**. [Detailed G1/G2 receipts and review blockers](M1_GATES_6_7_ACCEPTANCE.md). **G1/G2 checkboxes deliberately remain open** because PR #790 records no independent approving review and an explicit acceptance sign-off has not been recorded. The 5/13 accepted baseline therefore remains unchanged. This is **verification/reconciliation work**, not a claim of new kernel functionality.
+
 **First production slice:** harden GPT duplicate unique partition GUID rejection in `rust/kernel_core/src/m1_partition.rs`, with a fully checksummed nonoverlapping-partition regression. This does not by itself close the M1 partition gate; genuine QEMU partition selection, remount and corruption/failed-write acceptance are still required.
 
 ## M1 — Bootable, usable IndianOS desktop (current)
@@ -37,15 +39,19 @@ Files and Terminal, and integration/QA.
 - [ ] **M1.1 current slice**: authenticated Terminal commands connected to
       checksummed block-backed HierVfs with real read/write/mkdir/rename,
       UI damage and read-after-remount acceptance (Rust test); then
-      prove the same live ring-3 GUI commands on QEMU. Implementation and local
-      runtime exits are exercised by PR765's exact-glyph two-boot scenario;
-      final acceptance awaits its new exact-head CI/review. See
+      prove the same live ring-3 GUI commands on QEMU. The PR #790 exact-head
+      tests and post-merge main SHA f928b87a passed the real two-boot
+      selected-GPT/physical-input QEMU acceptance suite. Implementation and
+      automated acceptance evidence are complete; independent code review and
+      formal gate sign-off are still pending. See
       [positions 6–7 evidence](M1_GATES_6_7_ACCEPTANCE.md).
 - [ ] **M1 partition work**: defensive MBR/GPT header/entry checksum checks,
       bounds and overlap rejection, selected-partition read/write window,
-      actual HierVfs remount tests. The PR765 candidate includes semantic GPT
-      rejection and actual ATA write-failure acceptance; final exact-head
-      CI/review remains required. Physical qualification is tracked under G8.
+      actual HierVfs remount tests. The merged PR #790 exact-head and
+      merged-main QEMU runs confirm semantic GPT rejection, mirror/CRC
+      faults, neighboring-sector isolation and injected ATA write failure.
+      Independent code review and formal sign-off remain required; physical
+      qualification is tracked under G8.
 - [ ] Production normal boot starts PID1, user compositor, Files and Terminal
       without test-only kernel feature flags.
 - [ ] Move full compositor and input broker from ring0 to independent ring3
