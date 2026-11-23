@@ -45,7 +45,20 @@ NAMED_COMMIT = "desktop broker committed named selected-volume mutation and refr
 NAMED_READBACK = "IndianOS user: R051 Terminal readback: saved"
 G1_PAYLOAD = "violet"  # Visually distinct from the success status SAVED.
 G1_READBACK = "IndianOS user: R051 Terminal readback: " + G1_PAYLOAD
-TERMINAL_AUTHORITY = (
+PIXEL_APP_EVIDENCE = tuple(
+    marker
+    for pid, app in ((2, "Files"), (3, "Terminal"))
+    for marker in (
+        f"IndianOS: PID {pid} PIXEL_GUARDS_READY".encode(),
+        f"IndianOS user: desktop {app} private pixel scratch guards verified".encode(),
+        f"IndianOS user: desktop {app} pixel authority and transaction denials verified".encode(),
+        f"IndianOS user: desktop {app} ring3 raster pixels committed".encode(),
+    )
+) + (
+    b"IndianOS user: desktop broker denied app pixel authority",
+    b"IndianOS user: desktop compositor denied app pixel authority",
+)
+TERMINAL_AUTHORITY = PIXEL_APP_EVIDENCE + (
     b"IndianOS user: R117 QEMU PID2 stack guard and crossing descriptor pointers denied",
     b"IndianOS user: R114 PID2 ring3 invalid pointer, private path and denied write blocked",
     b"IndianOS user: R114 Terminal PID3 denied direct Files handles and directory syscall",
@@ -202,6 +215,7 @@ def verify_runtime(output: bytes, shutdown_at: int) -> None:
         raise AssertionError("kernel readiness preceded compositor readiness")
     if any(marker not in startup for marker in TERMINAL_AUTHORITY):
         raise AssertionError("Terminal startup lacks actual syscall authority negative controls")
+    verify_pixel_startup(startup)
     for pid in (1, 2, 3, 4):
         for state in ("READY", "DISPATCHED"):
             if f"IndianOS: PID {pid} {state}".encode() not in prefix:
@@ -968,7 +982,7 @@ def verify_debug_stack_guards(debugger: GuestDebugger, records: list[tuple[int, 
 
 
 def surface_guard_records(raw: bytes, payload_pages: int = 1) -> list[tuple[int, int, int, int]]:
-    if len(raw) != 64 or payload_pages not in (1, 594):
+    if len(raw) != 64 or payload_pages not in (1, 1188):
         raise AssertionError("surface guard ownership ledger is not 64 bytes")
     words = struct.unpack("<8Q", raw)
     records = [tuple(words[start:start + 4]) for start in (0, 4)]
@@ -981,6 +995,98 @@ def surface_guard_records(raw: bytes, payload_pages: int = 1) -> list[tuple[int,
     if ordered[0][3] + 4096 > ordered[1][0]:
         raise AssertionError("private surface guard objects overlap")
     return records
+
+
+def verify_pixel_startup(startup: bytes) -> None:
+    """Fresh native pixel execution must precede each incarnation's readiness.
+
+    These records complement actual glyph/pixel comparisons and mapping probes;
+    serial assertions alone do not establish framebuffer ownership or rollback.
+    """
+    lines = startup.replace(b"\r", b"").split(b"\n")[:-1]
+    for marker in PIXEL_APP_EVIDENCE:
+        if lines.count(marker) != 1:
+            raise AssertionError("pixel startup lacks fresh complete native app evidence")
+    if lines.count(LIFECYCLE_READY.encode()) != 1:
+        raise AssertionError("pixel startup lacks one complete lifecycle acknowledgment")
+    ready = startup.find(LIFECYCLE_READY.encode())
+    if ready < 0 or any(startup.find(marker) >= ready for marker in PIXEL_APP_EVIDENCE):
+        raise AssertionError("pixel startup was not verified before lifecycle readiness")
+    for pid, app in ((2, "Files"), (3, "Terminal")):
+        guard = startup.find(f"IndianOS: PID {pid} PIXEL_GUARDS_READY".encode())
+        scratch = startup.find(f"IndianOS user: desktop {app} private pixel scratch guards verified".encode())
+        committed = startup.find(f"IndianOS user: desktop {app} ring3 raster pixels committed".encode())
+        if not guard < scratch < committed < ready:
+            raise AssertionError("native app pixels preceded guard registration or readiness")
+
+
+def app_scratch_records(raw: bytes, compositor_root: int) -> list[tuple[int, int, int, int]]:
+    """Validate recorded owners, without reading app VAs through PID4's CR3."""
+    if len(raw) != 64:
+        raise AssertionError("app scratch ownership ledger is not 64 bytes")
+    words = struct.unpack("<8Q", raw)
+    records = [tuple(words[start:start + 4]) for start in (0, 4)]
+    for root, lower, payload, upper in records:
+        if (not 0 < root < 1 << 52 or root % 4096 or root == compositor_root or
+                not 0x400000 <= lower < 0x00007ffff0000000 or lower % 4096 or
+                payload != lower + 4096 or upper != payload + 4096 or
+                upper + 4096 > 0x00007ffff0000000):
+            raise AssertionError("invalid app-owned scratch geometry or root")
+    if records[0][0] == records[1][0]:
+        raise AssertionError("independent apps share a scratch address-space root")
+    return records
+
+
+def physical_qword(session: QemuSession, address: int) -> int:
+    """Read one actual guest-physical page-table entry without changing CR3."""
+    if not 0 <= address < 1 << 52 or address % 8:
+        raise AssertionError("invalid physical page-table address")
+    response = session.hmp(f"xp /1gx 0x{address:x}")
+    response = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", response)
+    words = re.findall(r"(?m)^\s*(?:0x)?([0-9a-fA-F]{1,16}):\s+0x([0-9a-fA-F]{16})(?:\s|$)", response)
+    if len(words) != 1 or int(words[0][0], 16) != address:
+        raise AssertionError("physical page-table read lacks one exact-address word")
+    return int(words[0][1], 16)
+
+
+def physical_mapping(session: QemuSession, root: int, address: int) -> tuple[int, bool, bool, bool] | None:
+    """Bounded four-level walk of the owner's real tables, including ancestors."""
+    if not 0 < root < 1 << 52 or root % 4096 or not 0 <= address < 0x00007ffff0000000:
+        raise AssertionError("invalid app page-table walk")
+    table, writable, user, nx = root, True, True, False
+    for level, shift in enumerate((39, 30, 21, 12)):
+        entry = physical_qword(session, table + ((address >> shift) & 511) * 8)
+        if entry & 1 == 0:
+            return None
+        writable = writable and bool(entry & 2)
+        user = user and bool(entry & 4)
+        nx = nx or bool(entry & (1 << 63))
+        if level < 3 and entry & 128:
+            raise AssertionError("app scratch unexpectedly uses a huge/reserved mapping")
+        table = entry & 0x000ffffffffff000
+        if table == 0:
+            raise AssertionError("app scratch walk references physical frame zero")
+    return table + (address & 4095), writable, user, nx
+
+
+def verify_app_scratch_mappings(session: QemuSession, records: list[tuple[int, int, int, int]],
+                                compositor_root: int, evidence: list[str]) -> None:
+    payloads = []
+    for pid, (root, lower, payload, upper) in zip((2, 3), records):
+        for guard in (lower, upper):
+            if physical_mapping(session, root, guard) is not None:
+                raise AssertionError("app scratch guard remains mapped in its own root")
+        mapping = physical_mapping(session, root, payload)
+        if mapping is None or mapping[1:] != (True, True, True):
+            raise AssertionError("app scratch payload lacks effective user RW/NX rights")
+        payloads.append(mapping[0])
+        for foreign in (compositor_root, *(record[0] for record in records if record[0] != root)):
+            other = physical_mapping(session, foreign, payload)
+            if other is not None and other[0] == mapping[0]:
+                raise AssertionError("another service maps an app's private scratch frame")
+        evidence.append(f"PID{pid} CR3={root:#x}: physical table walk confirms guards absent, user RW/NX payload PA={mapping[0]:#x}, no peer/compositor alias at registered payload VA")
+    if len(set(payloads)) != 2:
+        raise AssertionError("independent apps share the same scratch physical frame")
 
 
 def verify_debug_surface_guards(debugger: GuestDebugger, records: list[tuple[int, int, int, int]],
@@ -1022,6 +1128,7 @@ def verify_transient_restart(output: bytes, injection_at: int) -> None:
     # The first reap retires the faulted incarnation. A later normal shutdown
     # legitimately reaps its replacement; do not confuse these two lifetimes.
     fault_phase = tail[:ready + len(READY.encode())]
+    verify_pixel_startup(fault_phase[:fault_phase.find(READY.encode())])
     cursor = 0
     for marker in markers:
         evidence = fault_phase if marker == b"IndianOS: PID 4 REAPED" else tail
@@ -1166,6 +1273,7 @@ def transient_service_boot(qemu: str, iso: Path, ovmf: Path, disk: Path,
     expected = executable_bytes(compositor, target, 8)
     surface_ledger = unique_symbol(nm, kernel, ("DESKTOP_SURFACE_LAYOUT",))
     pixel_ledger = unique_symbol(nm, kernel, ("DESKTOP_PIXEL_SURFACE_LAYOUT",))
+    scratch_ledger = unique_symbol(nm, kernel, ("DESKTOP_APP_PIXEL_GUARDS",))
     symbols = subprocess.run([nm, "-S", "-n", "-C", str(kernel)], check=True,
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15)
     guards = stack_guard_records(symbols.stdout.decode("ascii"))
@@ -1229,9 +1337,11 @@ def transient_service_boot(qemu: str, iso: Path, ovmf: Path, disk: Path,
         surfaces = surface_guard_records(surface_layout)
         verify_debug_surface_guards(debugger, surfaces, evidence, "PID4 cloned root")
         pixel_layout = debugger.memory(pixel_ledger, 64)
-        pixel_surfaces = surface_guard_records(pixel_layout, 594)
+        pixel_surfaces = surface_guard_records(pixel_layout, 1188)
         verify_debug_surface_guards(debugger, pixel_surfaces, evidence, "PID4 retained pixels")
         cloned_root = stopped_root(session)
+        scratch = app_scratch_records(debugger.memory(scratch_ledger, 64), cloned_root)
+        verify_app_scratch_mappings(session, scratch, cloned_root, evidence)
         evidence.append(f"PID4 cloned CR3={cloned_root:#x}")
         if not debugger.command(f"m{unmapped:x},1").startswith("E"):
             raise AssertionError("fault injection address is unexpectedly mapped")
@@ -1304,6 +1414,8 @@ def transient_service_boot(qemu: str, iso: Path, ovmf: Path, disk: Path,
         if debugger.memory(pixel_ledger, 64) != pixel_layout:
             raise AssertionError("desktop restart relocated private pixel backing")
         verify_debug_surface_guards(debugger, pixel_surfaces, evidence, "reclaimed retained pixels")
+        if debugger.memory(scratch_ledger, 64) != bytes(64):
+            raise AssertionError("retired app scratch authority survived final cleanup")
         if debugger.command("D") != "OK":
             raise AssertionError("kernel guard debugger failed to detach")
         debugger.close()

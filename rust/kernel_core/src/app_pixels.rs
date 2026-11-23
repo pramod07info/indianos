@@ -1,188 +1,207 @@
-//! Private retained app raster planes. Window placement stays in PID4;
-//! this bounded kernel backend never gives a client framebuffer authority.
-use crate::gui_protocol::{Command,COMMAND_LIMIT,FILL,TEXT};
+//! Retained app pixels. Clients rasterize; this backend only validates rows,
+//! stages them privately and atomically publishes a complete transaction.
 const PAGE:usize=4096;
-pub(super) const MAX_WIDTH:usize=768;
-pub(super) const MAX_HEIGHT:usize=768;
+pub(super) const MAX_WIDTH:usize=crate::pixel_protocol::MAX_WIDTH as usize;
+pub(super) const MAX_HEIGHT:usize=crate::pixel_protocol::MAX_HEIGHT as usize;
+const TILE_PIXELS:usize=crate::pixel_protocol::TILE_PIXELS as usize;
 const PIXELS:usize=MAX_WIDTH*MAX_HEIGHT;
 const MASK_WORDS:usize=PIXELS/64;
-
-// These allocations are pinned for the boot and never copied or assigned
-// after guards are removed. The payload size is exactly 594 complete pages.
+pub(super) const PAYLOAD_PAGES:u64=((PIXELS*4+MASK_WORDS*8)*2/PAGE) as u64;
+const _:()=assert!((PIXELS*4+MASK_WORDS*8)*2%PAGE==0);
+#[repr(C)]
+struct Plane{pixels:[u32;PIXELS],coverage:[u64;MASK_WORDS]}
 #[cfg(not(test))]
+impl Plane{const fn new()->Self{Self{pixels:[0;PIXELS],coverage:[0;MASK_WORDS]}}}
 #[repr(C,align(4096))]
-struct GuardedPixels{
-    lower:[u8;PAGE],pixels:[u32;PIXELS],coverage:[u64;MASK_WORDS],upper:[u8;PAGE],
-}
+struct GuardedPixels{lower:[u8;PAGE],planes:[Plane;2],upper:[u8;PAGE]}
 #[cfg(not(test))]
-impl GuardedPixels{
-    const fn new()->Self{Self{lower:[0;PAGE],pixels:[0;PIXELS],
-        coverage:[0;MASK_WORDS],upper:[0;PAGE]}}
-}
+impl GuardedPixels{const fn new()->Self{Self{lower:[0;PAGE],planes:[Plane::new(),Plane::new()],upper:[0;PAGE]}}}
+#[derive(Clone,Copy)]
+struct Transaction{token:u64,rect:[u16;4],cursor:usize,revision:u64}
+#[derive(Clone,Copy)]
+struct State{width:usize,height:usize,active:usize,next:u64,metadata_revision:u64,published_revision:u64,transaction:Option<Transaction>}
+impl State{const fn new()->Self{Self{width:0,height:0,active:0,next:1,metadata_revision:0,published_revision:0,transaction:None}}}
 #[cfg(not(test))]
 static mut PLANES:[GuardedPixels;2]=[GuardedPixels::new(),GuardedPixels::new()];
-#[derive(Clone,Copy)]
-struct RasterIdentity{
-    valid:bool,width:usize,height:usize,count:usize,format:usize,
-    commands:[Command;COMMAND_LIMIT],
-}
-impl RasterIdentity{
-    const fn new()->Self{Self{valid:false,width:0,height:0,count:0,format:0,
-        commands:[Command::EMPTY;COMMAND_LIMIT]}}
-}
 #[cfg(not(test))]
-static mut IDENTITIES:[RasterIdentity;2]=[RasterIdentity::new();2];
+static mut STATES:[State;2]=[State::new();2];
 #[cfg(test)]
-struct TestPlane{pixels:std::vec::Vec<u32>,coverage:std::vec::Vec<u64>,identity:RasterIdentity}
+struct TestPlane{pixels:std::vec::Vec<u32>,coverage:std::vec::Vec<u64>}
 #[cfg(test)]
-impl TestPlane{
-    const fn new()->Self{Self{pixels:std::vec::Vec::new(),coverage:std::vec::Vec::new(),
-        identity:RasterIdentity::new()}}
-}
-/// Production is a handle to the two boot-pinned stores. Host fixtures own
-/// independent heap buffers, avoiding test races and megabyte stack copies.
+impl TestPlane{const fn new()->Self{Self{pixels:std::vec::Vec::new(),coverage:std::vec::Vec::new()}}}
+#[cfg(test)]
+struct TestSurface{planes:[TestPlane;2],state:State}
+#[cfg(test)]
+impl TestSurface{const fn new()->Self{Self{planes:[TestPlane::new(),TestPlane::new()],state:State::new()}}}
+/// A production handle to boot-pinned backing. Host fixtures own independent
+/// heap planes, never megabyte stack values or a shared test singleton.
 pub(super) struct PixelCache{
-    #[cfg(test)] planes:core::cell::RefCell<[TestPlane;2]>,
+    #[cfg(test)] surfaces:core::cell::RefCell<[TestSurface;2]>,
 }
 impl PixelCache{
     pub(super) const fn new()->Self{Self{
-        #[cfg(test)] planes:core::cell::RefCell::new([TestPlane::new(),TestPlane::new()]),
+        #[cfg(test)] surfaces:core::cell::RefCell::new([TestSurface::new(),TestSurface::new()]),
     }}
-    pub(super) fn clear_slot(&self,slot:usize){
-        if slot>=2{return;}
+    fn with<R>(&self,slot:usize,operation:impl FnOnce(&mut[u32],&mut[u64],&mut[u32],&mut[u64],&mut State)->R)->Option<R>{
+        if slot>=2{return None;}
         #[cfg(not(test))]
         unsafe{
-            let plane=&mut (*core::ptr::addr_of_mut!(PLANES))[slot];
-            plane.pixels.fill(0);plane.coverage.fill(0);
-            (*core::ptr::addr_of_mut!(IDENTITIES))[slot]=RasterIdentity::new();
+            // Single BSP, exclusive graphics syscall context. The guarded
+            // allocation is never assigned/copied after its guards unmap.
+            let [a,b]=&mut (*core::ptr::addr_of_mut!(PLANES))[slot].planes;
+            let state=&mut (*core::ptr::addr_of_mut!(STATES))[slot];
+            Some(operation(&mut a.pixels,&mut a.coverage,&mut b.pixels,&mut b.coverage,state))
         }
         #[cfg(test)]
         {
-            let mut planes=self.planes.borrow_mut();let plane=&mut planes[slot];
-            plane.pixels.fill(0);plane.coverage.fill(0);plane.identity=RasterIdentity::new();
+            let mut surfaces=self.surfaces.borrow_mut();let surface=&mut surfaces[slot];
+            for plane in &mut surface.planes{
+                if plane.pixels.is_empty(){plane.pixels.resize(PIXELS,0);plane.coverage.resize(MASK_WORDS,0);}
+            }
+            let [a,b]=&mut surface.planes;
+            Some(operation(&mut a.pixels,&mut a.coverage,&mut b.pixels,&mut b.coverage,&mut surface.state))
         }
+    }
+    pub(super) fn clear_slot(&self,slot:usize){
+        self.with(slot,|a,am,b,bm,state|{
+            a.fill(0);am.fill(0);b.fill(0);bm.fill(0);
+            let next=state.next;*state=State::new();state.next=next;
+        });
     }
     pub(super) fn clear(&self){for slot in 0..2{self.clear_slot(slot);}}
-    pub(super) fn blit(&self,slot:usize,width:usize,height:usize,commands:&[Command],
-        rgb:fn(u8,u8,u8)->Option<u32>,pixel:impl FnMut(usize,usize,u32))->bool{
-        if slot>=2||width==0||height==0||width>MAX_WIDTH||height>MAX_HEIGHT||
-           commands.len()>COMMAND_LIMIT{return false;}
-        #[cfg(not(test))]
-        unsafe{
-            let plane=&mut (*core::ptr::addr_of_mut!(PLANES))[slot];
-            let identity=&mut (*core::ptr::addr_of_mut!(IDENTITIES))[slot];
-            raster_and_blit(&mut plane.pixels,&mut plane.coverage,identity,
-                width,height,commands,rgb,pixel)
-        }
-        #[cfg(test)]
-        {
-            let mut planes=self.planes.borrow_mut();let plane=&mut planes[slot];
-            let count=width*height;
-            if plane.pixels.len()!=count{
-                plane.pixels.resize(count,0);plane.coverage.resize(count.div_ceil(64),0);
-                plane.identity.valid=false;
+    pub(super) fn metadata_changed(&self,slot:usize)->bool{
+        self.with(slot,|_,_,_,_,state|{
+            let Some(next)=state.metadata_revision.checked_add(1)else{return false;};
+            state.metadata_revision=next;true
+        }).unwrap_or(false)
+    }
+    pub(super) fn ready(&self,slot:usize)->bool{
+        self.with(slot,|_,_,_,_,state|state.width!=0&&state.height!=0&&
+            state.metadata_revision!=0&&state.metadata_revision==state.published_revision&&state.transaction.is_none()).unwrap_or(false)
+    }
+    pub(super) fn begin(&self,slot:usize,width:usize,height:usize,rect:[u16;4])->Option<u64>{
+        if width==0||height==0||width>MAX_WIDTH||height>MAX_HEIGHT||rect[2]==0||rect[3]==0||
+            rect[0] as usize+rect[2] as usize>width||rect[1] as usize+rect[3] as usize>height{return None;}
+        self.with(slot,|a,am,b,bm,state|{
+            if state.transaction.is_some()||(state.width!=0&&(state.width!=width||state.height!=height)){return None;}
+            let next=state.next.checked_add(1)?;let token=state.next;
+            if state.active==0{b.copy_from_slice(a);bm.copy_from_slice(am);}
+            else{a.copy_from_slice(b);am.copy_from_slice(bm);}
+            state.width=width;state.height=height;state.next=next;
+            state.transaction=Some(Transaction{token,rect,cursor:0,revision:state.metadata_revision});Some(token)
+        })?
+    }
+    pub(super) fn tile(&self,slot:usize,token:u64,x:u16,y:u16,pixels:&[u32],rgb:fn(u8,u8,u8)->Option<u32>)->bool{
+        self.with(slot,|a,am,b,bm,state|{
+            let Some(transaction)=state.transaction else{return false;};
+            if token==0||transaction.token!=token{return false;}
+            let [left,top,width,height]=transaction.rect;
+            let width=width as usize;let count=width*height as usize;
+            if transaction.cursor>=count{return false;}
+            let column=transaction.cursor%width;
+            let expected=(width-column).min(TILE_PIXELS);
+            if x as usize!=left as usize+column||y as usize!=top as usize+transaction.cursor/width||pixels.len()!=expected{return false;}
+            // Validate the ENTIRE row before changing staging data or cursor.
+            let mut encoded=[0u32;TILE_PIXELS];
+            for (index,&value) in pixels.iter().enumerate(){
+                if value==0{continue;}
+                if value>>24!=0xff{return false;}
+                let Some(color)=rgb((value>>16) as u8,(value>>8) as u8,value as u8)else{return false;};
+                encoded[index]=color;
             }
-            raster_and_blit(&mut plane.pixels,&mut plane.coverage,&mut plane.identity,
-                width,height,commands,rgb,pixel)
-        }
+            let (data,mask)=if state.active==0{(b,bm)}else{(a,am)};
+            let start=y as usize*state.width+x as usize;
+            for (index,&value) in pixels.iter().enumerate(){
+                let at=start+index;data[at]=encoded[index];
+                if value==0{mask[at/64]&=!(1u64<<(at%64));}else{mask[at/64]|=1u64<<(at%64);}
+            }
+            state.transaction=Some(Transaction{cursor:transaction.cursor+expected,..transaction});true
+        }).unwrap_or(false)
+    }
+    pub(super) fn commit(&self,slot:usize,token:u64)->bool{
+        self.with(slot,|_,_,_,_,state|{
+            let Some(transaction)=state.transaction else{return false;};
+            if token==0||transaction.token!=token||transaction.revision!=state.metadata_revision||
+                transaction.cursor!=transaction.rect[2] as usize*transaction.rect[3] as usize{return false;}
+            state.active=1-state.active;state.published_revision=transaction.revision;state.transaction=None;true
+        }).unwrap_or(false)
+    }
+    pub(super) fn abort(&self,slot:usize,token:u64)->bool{
+        self.with(slot,|a,am,b,bm,state|{
+            let Some(transaction)=state.transaction else{return false;};
+            if token==0||transaction.token!=token{return false;}
+            if state.active==0{b.fill(0);bm.fill(0);}else{a.fill(0);am.fill(0);}
+            state.transaction=None;true
+        }).unwrap_or(false)
+    }
+    pub(super) fn blit(&self,slot:usize,width:usize,height:usize,mut pixel:impl FnMut(usize,usize,u32))->bool{
+        if width==0||height==0||width>MAX_WIDTH||height>MAX_HEIGHT{return false;}
+        self.with(slot,|a,am,b,bm,state|{
+            if state.width==0{return true;}
+            if state.width!=width||state.height!=height{return false;}
+            let (data,mask)=if state.active==0{(a,am)}else{(b,bm)};
+            for (index,&color) in data[..width*height].iter().enumerate(){
+                if mask[index/64]&(1u64<<(index%64))!=0{pixel(index%width,index/width,color);}
+            }
+            true
+        }).unwrap_or(false)
     }
 }
-
 #[cfg(not(test))]
 pub(super) fn guard_layout()->[(u64,u64,u64,u64);2]{
     core::array::from_fn(|slot|unsafe{
         let plane=&(*core::ptr::addr_of!(PLANES))[slot];
-        (core::ptr::addr_of!(plane.lower) as u64,core::ptr::addr_of!(plane.pixels) as u64,
+        (core::ptr::addr_of!(plane.lower) as u64,core::ptr::addr_of!(plane.planes) as u64,
          core::ptr::addr_of!(plane.upper) as u64,core::ptr::addr_of!(plane.upper) as u64)
     })
 }
-// Host mapping tests use the runtime's geometry validator rather than a
-// hardware-backed singleton. No host address is presented as a real guard.
 #[cfg(test)]
 pub(super) fn guard_layout()->[(u64,u64,u64,u64);2]{[(0,0,0,0);2]}
-
-fn raster_and_blit(pixels:&mut[u32],coverage:&mut[u64],identity:&mut RasterIdentity,
-    width:usize,height:usize,commands:&[Command],rgb:fn(u8,u8,u8)->Option<u32>,
-    mut pixel:impl FnMut(usize,usize,u32))->bool{
-    let count=width*height;
-    if pixels.len()<count||coverage.len()<count.div_ceil(64){return false;}
-    let cached=identity.valid&&identity.width==width&&identity.height==height&&
-        identity.format==rgb as usize&&identity.count==commands.len()&&
-        identity.commands[..commands.len()]==*commands;
-    if !cached{
-        // Preflight the whole batch before changing a previously good plane.
-        let mut colors=[0;COMMAND_LIMIT];
-        for (index,command) in commands.iter().enumerate(){
-            if !command.within_client(width as u32,height as u32)||command.rgb>0xffffff||
-               !matches!(command.operation,FILL|TEXT)||command.text_len as usize>command.text.len(){return false;}
-            if command.operation==TEXT&&(command.text_len==0||
-                command.text_len as u32*12>command.width as u32||command.height<14){return false;}
-            let Some(color)=rgb((command.rgb>>16) as u8,(command.rgb>>8) as u8,command.rgb as u8)
-                else{return false;};
-            colors[index]=color;
-        }
-        pixels.fill(0);coverage.fill(0);
-        for (command,color) in commands.iter().zip(colors){
-            let x=command.x as usize;let y=command.y as usize;
-            if command.operation==FILL{
-                for cy in y..y+command.height as usize{
-                    for cx in x..x+command.width as usize{put(pixels,coverage,width,cx,cy,color);}
-                }
-            }else{
-                for (index,&ch) in command.text[..command.text_len as usize].iter().enumerate(){
-                    for (row,bits) in crate::console::glyph(ch).into_iter().enumerate(){
-                        for bit in 0..5{
-                            if bits&(1<<(4-bit))!=0{
-                                for dy in 0..2{for dx in 0..2{
-                                    put(pixels,coverage,width,x+index*12+bit*2+dx,y+row*2+dy,color);
-                                }}
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        identity.valid=true;identity.width=width;identity.height=height;
-        identity.count=commands.len();identity.format=rgb as usize;
-        identity.commands.fill(Command::EMPTY);
-        identity.commands[..commands.len()].copy_from_slice(commands);
-    }
-    for (index,&color) in pixels[..count].iter().enumerate(){
-        if coverage[index/64]&(1u64<<(index%64))!=0{pixel(index%width,index/width,color);}
-    }
-    true
-}
-fn put(pixels:&mut[u32],coverage:&mut[u64],width:usize,x:usize,y:usize,color:u32){
-    let index=y*width+x;pixels[index]=color;coverage[index/64]|=1u64<<(index%64);
-}
 
 #[cfg(test)]
 mod tests{
     use super::*;
     fn rgb(r:u8,g:u8,b:u8)->Option<u32>{Some((r as u32)<<16|(g as u32)<<8|b as u32)}
-    fn fill(color:u32)->Command{Command{window:1,operation:FILL,x:1,y:1,width:2,height:2,
-        rgb:color,text:[0;32],text_len:0}}
-    #[test]fn real_planes_isolate_pixels_and_preserve_transparent_chrome(){
-        let cache=PixelCache::new();let mut first=[9;16];let mut second=[9;16];
-        assert!(cache.blit(0,4,4,&[fill(0x123456)],rgb,|x,y,p|first[y*4+x]=p));
-        assert!(cache.blit(1,4,4,&[fill(0x654321)],rgb,|x,y,p|second[y*4+x]=p));
-        assert_eq!(first[0],9);assert_eq!(first[5],0x123456);assert_eq!(second[5],0x654321);
-        cache.clear_slot(0);
-        let planes=cache.planes.borrow();
-        assert!(planes[0].pixels.iter().all(|&p|p==0));
-        assert!(planes[0].coverage.iter().all(|&p|p==0));
-        assert_eq!(planes[1].pixels[5],0x654321);
+    fn visible(cache:&PixelCache,slot:usize)->[u32;16]{let mut out=[9;16];assert!(cache.blit(slot,4,4,|x,y,p|out[y*4+x]=p));out}
+    #[test]fn guarded_double_backing_has_exact_full_page_payload_geometry(){
+        assert_eq!(core::mem::offset_of!(GuardedPixels,planes),PAGE);
+        assert_eq!(core::mem::offset_of!(GuardedPixels,upper),PAGE+PAYLOAD_PAGES as usize*PAGE);
+        assert_eq!(core::mem::size_of::<GuardedPixels>(),(PAYLOAD_PAGES as usize+2)*PAGE);
+        assert_eq!(PAYLOAD_PAGES,1188);
     }
-    #[test]fn failed_batches_preserve_pixels_and_replacement_removes_stale_glyphs(){
-        let cache=PixelCache::new();let good=fill(7);
-        assert!(cache.blit(0,4,4,&[good],rgb,|_,_,_|{}));
-        let mut invalid=good;invalid.x=4;
-        assert!(!cache.blit(0,4,4,&[invalid],rgb,|_,_,_|panic!("invalid batch blitted")));
-        assert_eq!(cache.planes.borrow()[0].pixels[5],7);
-        assert!(!cache.blit(2,4,4,&[],rgb,|_,_,_|{}));
-        assert!(!cache.blit(0,MAX_WIDTH+1,4,&[],rgb,|_,_,_|{}));
-        assert!(cache.blit(0,4,4,&[],rgb,|_,_,_|panic!("old pixel survived replacement")));
-        assert!(cache.planes.borrow()[0].coverage.iter().all(|&p|p==0));
-        cache.clear();assert!(!cache.planes.borrow()[1].identity.valid);
+    #[test]fn partial_and_failed_uploads_cannot_replace_committed_pixels(){
+        let cache=PixelCache::new();let token=cache.begin(0,4,4,[1,1,2,2]).unwrap();
+        assert!(cache.tile(0,token,1,1,&[0xff123456;2],rgb));
+        assert!(!cache.commit(0,token));assert_eq!(visible(&cache,0),[9;16]);
+        assert!(!cache.tile(0,token,1,2,&[0x01123456;2],rgb));
+        assert!(!cache.tile(0,token,2,2,&[0xff123456;2],rgb));
+        assert!(cache.tile(0,token,1,2,&[0xff123456;2],rgb));assert!(cache.commit(0,token));
+        assert_eq!(visible(&cache,0)[5],0x123456);assert!(!cache.commit(0,token));
+        let next=cache.begin(0,4,4,[1,1,2,2]).unwrap();assert_ne!(next,token);
+        assert!(!cache.tile(0,token,1,1,&[0;2],rgb));assert!(cache.tile(0,next,1,1,&[0;2],rgb));
+        assert_eq!(visible(&cache,0)[5],0x123456);assert!(cache.abort(0,next));
+        assert_eq!(visible(&cache,0)[5],0x123456);
+    }
+    #[test]fn transparent_replacement_isolated_planes_and_epoch_reset(){
+        let cache=PixelCache::new();
+        let first=cache.begin(0,4,4,[0,0,1,1]).unwrap();assert!(cache.tile(0,first,0,0,&[0xff112233],rgb));assert!(cache.commit(0,first));
+        let peer=cache.begin(1,4,4,[0,0,1,1]).unwrap();assert!(cache.tile(1,peer,0,0,&[0xff445566],rgb));assert!(cache.commit(1,peer));
+        let replace=cache.begin(0,4,4,[0,0,1,1]).unwrap();assert!(cache.tile(0,replace,0,0,&[0],rgb));assert!(cache.commit(0,replace));
+        assert_eq!(visible(&cache,0)[0],9);assert_eq!(visible(&cache,1)[0],0x445566);
+        let stale=cache.begin(0,4,4,[0,0,1,1]).unwrap();cache.clear_slot(0);
+        let fresh=cache.begin(0,4,4,[0,0,1,1]).unwrap();assert!(fresh>stale);assert!(!cache.abort(0,stale));
+        assert!(cache.abort(0,fresh));assert_eq!(visible(&cache,1)[0],0x445566);
+        assert!(cache.begin(2,4,4,[0,0,1,1]).is_none());assert!(cache.begin(0,4,4,[3,3,2,2]).is_none());
+        cache.clear();assert_eq!(visible(&cache,1),[9;16]);
+    }
+    #[test]fn readiness_requires_a_complete_current_revision_and_no_pending_upload(){
+        let cache=PixelCache::new();assert!(!cache.ready(0));assert!(cache.metadata_changed(0));
+        let first=cache.begin(0,4,4,[0,0,1,1]).unwrap();assert!(!cache.ready(0));
+        assert!(cache.tile(0,first,0,0,&[0xff112233],rgb));assert!(cache.commit(0,first));assert!(cache.ready(0));
+        let pending=cache.begin(0,4,4,[0,0,1,1]).unwrap();assert!(!cache.ready(0));
+        assert!(cache.tile(0,pending,0,0,&[0xff445566],rgb));assert!(cache.metadata_changed(0));
+        assert!(!cache.commit(0,pending));assert!(cache.abort(0,pending));assert!(!cache.ready(0));
+        let fresh=cache.begin(0,4,4,[0,0,1,1]).unwrap();assert!(cache.tile(0,fresh,0,0,&[0xff778899],rgb));
+        assert!(cache.commit(0,fresh));assert!(cache.ready(0));cache.clear_slot(0);assert!(!cache.ready(0));
     }
 }

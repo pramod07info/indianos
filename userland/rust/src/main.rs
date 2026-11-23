@@ -23,6 +23,14 @@ mod terminal_broker;
 mod desktop_window;
 #[cfg(feature="desktop-init")]
 mod desktop_startup;
+#[cfg(any(feature="desktop-files",feature="desktop-terminal"))]
+#[path="../../../rust/kernel_core/src/gui_protocol.rs"]
+mod gui_protocol;
+#[cfg(any(feature="desktop-files",feature="desktop-terminal"))]
+mod desktop_pixels;
+#[cfg(any(feature="desktop-init",feature="desktop-compositor",feature="desktop-files",feature="desktop-terminal"))]
+#[path="../../../rust/kernel_core/src/pixel_protocol.rs"]
+mod pixel_protocol;
 
 #[panic_handler]
 fn panic(_info: &PanicInfo<'_>) -> ! { exit(125) }
@@ -269,6 +277,98 @@ fn r029_command(window:u32,kind:u32,x:u16,y:u16,width:u16,height:u16,
           feature="r031-supervisor-shell",feature="r031-supervisor-files",feature="r031-supervisor-terminal"))]
 fn r029_draw(cmd:&[u8;64]){
     if call(18,cmd.as_ptr() as u64,64)!=0{exit(91);}
+    #[cfg(any(feature="desktop-files",feature="desktop-terminal"))]
+    if !app_pixel_upload(cmd){exit(91);}
+}
+#[cfg(any(feature="desktop-files",feature="desktop-terminal"))]
+#[repr(C,align(4096))]
+struct AppPixelScratch{lower:[u8;4096],pixels:[u32;1024],upper:[u8;4096]}
+#[cfg(any(feature="desktop-files",feature="desktop-terminal"))]
+static mut APP_PIXEL_SCRATCH:AppPixelScratch=AppPixelScratch{
+    lower:[0;4096],pixels:[0;1024],upper:[0;4096],
+};
+#[cfg(any(feature="desktop-files",feature="desktop-terminal"))]
+static mut APP_PIXEL_STATE:desktop_pixels::State=desktop_pixels::State::new(0);
+#[cfg(any(feature="desktop-files",feature="desktop-terminal"))]
+static mut APP_PIXELS_REGISTERED:bool=false;
+#[cfg(any(feature="desktop-files",feature="desktop-terminal"))]
+static mut APP_PIXELS_COMMITTED:bool=false;
+#[cfg(any(feature="desktop-init",feature="desktop-compositor",feature="desktop-files",feature="desktop-terminal"))]
+fn app_pixel_call(request:pixel_protocol::Request)->u64{
+    let wire=request.wire();call(39,wire.as_ptr() as u64,64)
+}
+#[cfg(any(feature="desktop-files",feature="desktop-terminal"))]
+fn app_pixel_register(window:u32)->bool{
+    use pixel_protocol::{Request,REGISTER,BEGIN,TILE,COMMIT,ABORT};
+    let lower=unsafe{core::ptr::addr_of!(APP_PIXEL_SCRATCH.lower)} as u64;
+    let payload=unsafe{core::ptr::addr_of!(APP_PIXEL_SCRATCH.pixels)} as u64;
+    let upper=unsafe{core::ptr::addr_of!(APP_PIXEL_SCRATCH.upper)} as u64;
+    let mut request=Request::new(REGISTER,window);
+    request.lower=lower;request.address=payload;request.upper=upper;request.bytes=4096;
+    if app_pixel_call(request)!=0||call(1,lower,1)!=u64::MAX||call(1,upper,1)!=u64::MAX{return false;}
+    write(if window==1{b"desktop Files private pixel scratch guards verified"}
+          else{b"desktop Terminal private pixel scratch guards verified"});
+    // These are real well-shaped calls to the native ownership/copy boundary.
+    // They never touch another window or admit an incomplete transaction.
+    let mut foreign=Request::new(BEGIN,3-window);foreign.width=1;foreign.height=1;
+    if app_pixel_call(foreign)!=u64::MAX{return false;}
+    let mut begin=Request::new(BEGIN,window);begin.width=1;begin.height=1;
+    let token=app_pixel_call(begin);if token==0||token==u64::MAX{return false;}
+    let mut tile=Request::new(TILE,window);tile.width=1;tile.height=1;
+    tile.address=lower;tile.bytes=4;tile.token=token;
+    let mut finish=Request::new(COMMIT,window);finish.token=token;
+    if app_pixel_call(tile)!=u64::MAX||app_pixel_call(finish)!=u64::MAX{return false;}
+    let mut abort=Request::new(ABORT,window);abort.token=token;
+    if app_pixel_call(abort)!=0||app_pixel_call(finish)!=u64::MAX{return false;}
+    write(if window==1{b"desktop Files pixel authority and transaction denials verified"}
+          else{b"desktop Terminal pixel authority and transaction denials verified"});
+    unsafe{APP_PIXEL_STATE=desktop_pixels::State::new(window);APP_PIXELS_REGISTERED=true;}
+    true
+}
+#[cfg(any(feature="desktop-files",feature="desktop-terminal"))]
+fn app_pixel_upload(command:&[u8;64])->bool{
+    use pixel_protocol::{Request,BEGIN,TILE,COMMIT,ABORT};
+    let window=match call(4,0,0){2=>1,3=>2,_=>return false};
+    if !unsafe{APP_PIXELS_REGISTERED}&&!app_pixel_register(window){return false;}
+    let mut next=unsafe{APP_PIXEL_STATE};
+    let Some(dirty)=next.prepare(command)else{return false;};
+    let mut begin=Request::new(BEGIN,window);
+    begin.x=dirty.x;begin.y=dirty.y;begin.width=dirty.width;begin.height=dirty.height;
+    let token=app_pixel_call(begin);if token==0||token==u64::MAX{return false;}
+    for y in dirty.y..dirty.y+dirty.height{
+        let mut offset=0;
+        while offset<dirty.width{
+            let width=(dirty.width-offset).min(desktop_pixels::ROW_PIXELS as u16);
+            let x=dirty.x+offset;
+            // Only the owned payload is borrowed; guards stay unmapped.
+            let payload=unsafe{&mut *core::ptr::addr_of_mut!(APP_PIXEL_SCRATCH.pixels)};
+            let pixels=&mut payload[..width as usize];
+            if !next.row(x,y,pixels){
+                let mut abort=Request::new(ABORT,window);abort.token=token;
+                let _=app_pixel_call(abort);return false;
+            }
+            let mut tile=Request::new(TILE,window);tile.x=x;tile.y=y;
+            tile.width=width;tile.height=1;tile.address=pixels.as_ptr() as u64;
+            tile.bytes=width as u64*4;tile.token=token;
+            if app_pixel_call(tile)!=0{
+                let mut abort=Request::new(ABORT,window);abort.token=token;
+                let _=app_pixel_call(abort);return false;
+            }
+            offset+=width;
+        }
+    }
+    let mut commit=Request::new(COMMIT,window);commit.token=token;
+    if app_pixel_call(commit)!=0{
+        let mut abort=Request::new(ABORT,window);abort.token=token;
+        let _=app_pixel_call(abort);return false;
+    }
+    unsafe{APP_PIXEL_STATE=next;}
+    if !unsafe{APP_PIXELS_COMMITTED}{
+        write(if window==1{b"desktop Files ring3 raster pixels committed"}
+              else{b"desktop Terminal ring3 raster pixels committed"});
+        unsafe{APP_PIXELS_COMMITTED=true;}
+    }
+    true
 }
 #[cfg(any(feature="r029-client",feature="r029-files",feature="r029-terminal",
           feature="r029-frame-server",feature="r029-frame-client",
@@ -1133,6 +1233,10 @@ fn desktop_compositor()->!{
     if call(6,core::ptr::addr_of_mut!(byte) as u64,1)!=u64::MAX||
        call(32,4,denied.as_ptr() as u64)!=u64::MAX||call(33,1,denied.as_ptr() as u64)!=u64::MAX{exit(247);}
     write(b"desktop compositor denied input and filesystem authority");
+    let mut app_request=pixel_protocol::Request::new(pixel_protocol::BEGIN,1);
+    app_request.width=1;app_request.height=1;
+    if app_pixel_call(app_request)!=u64::MAX{exit(247);}
+    write(b"desktop compositor denied app pixel authority");
     let mut state=[0u8;64];
     if call(37,0,state.as_mut_ptr() as u64)!=0{exit(248);}
     let Some(mut manager)=desktop_window::Manager::new(&state)else{exit(249);};
@@ -1174,6 +1278,10 @@ fn r031_shell()->!{
         if call(37,0,state.as_mut_ptr() as u64)!=u64::MAX||
            call(37,1,state.as_ptr() as u64)!=u64::MAX{exit(252);}
         write(b"desktop PID1 denied compositor window authority");
+        let mut app_request=pixel_protocol::Request::new(pixel_protocol::BEGIN,1);
+        app_request.width=1;app_request.height=1;
+        if app_pixel_call(app_request)!=u64::MAX{exit(252);}
+        write(b"desktop broker denied app pixel authority");
         if call(38,1,0)!=u64::MAX||call(38,0,1)!=u64::MAX||
            call(38,2,0)!=u64::MAX{exit(254);}
         write(b"desktop PID1 denied premature and malformed lifecycle requests");
