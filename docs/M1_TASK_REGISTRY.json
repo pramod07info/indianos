@@ -126,15 +126,123 @@
     {
       "id": "G3",
       "title": "Normal boot PID1 and independent services",
-      "status": "audit_required",
+      "status": "implemented_acceptance_pending",
       "source_paths": [
-        "rust/kernel_core/src/m1_persistent_desktop.rs"
+        "rust/kernel_core/src/m1_persistent_desktop.rs",
+        "Makefile",
+        "boot/limine-desktop.conf",
+        "rust/kernel_core/src/boot.rs",
+        "rust/kernel_core/src/kernel_main.rs",
+        "rust/kernel_core/src/user_runtime.rs",
+        "tools/test_normal_desktop_qemu.py",
+        "rust/kernel_core/src/user_image.rs",
+        "rust/kernel_core/src/fs_handles.rs",
+        "userland/rust/src/main.rs",
+        "userland/rust/src/desktop_startup.rs",
+        "tests/test_normal_desktop_acceptance.py",
+        "tests/test_desktop_boot_profile.py",
+        "rust/kernel_core/src/m1_partition.rs",
+        "rust/kernel_core/src/m1_persistent_terminal.rs",
+        "rust/kernel_core/src/hier_vfs.rs",
+        "rust/kernel_core/src/syscall.rs",
+        ".github/workflows/m1-duplicate-prevention.yml"
       ],
       "merged_prs": [
         667,
-        765
+        765,
+        790,
+        794,
+        795,
+        797,
+        798,
+        801,
+        803
       ],
-      "acceptance": "docs/M1_GATES_8_10_ACCEPTANCE.md"
+      "acceptance": "docs/M1_GATES_8_10_ACCEPTANCE.md",
+      "evidence": {
+        "audited_sha": "11ffe7b9944938e96596fefdd207bb3a6c572ceb",
+        "verified_baseline_sha": "b51e5dbe8a5167d5f3007ef819d9c887a9fa7717",
+        "classification": "Existing bounded G3 production behavior and historical automated evidence; no demonstrated missing mandatory production code in scoped audit. Intermittent failure and final qualification remain open; not an exhaustive independent review.",
+        "latest_ci_urls": [
+          "https://github.com/pramod07info/indianos/actions/runs/45349640355",
+          "https://github.com/pramod07info/indianos/actions/runs/45349640311",
+          "https://github.com/pramod07info/indianos/actions/runs/45349640383",
+          "https://github.com/pramod07info/indianos/actions/runs/45349640314"
+        ],
+        "latest_full_matrix": "Run 45349640355 attempt 2 all three jobs success on b51e5dbe8a5167d5f3007ef819d9c887a9fa7717. Job 138325532048 actual log: 4215 kernel host tests passed, 0 failed; both normal cold boots, four ring3 services, physical input, transient PID4 fault/restart, premature/unready/repeated service failure, invalid service/config/media, guarded shutdown, persistent readback and read-only recovery passed. Attempt 1 failed recovery timeout; no production or assertion changes between attempts. Compare to audited main shows only canonical registry changed; do not transfer exact-SHA acceptance.",
+        "historical_normal_desktop_sha": "638ad434f4955596edf0853d7c676f662b462700",
+        "historical_normal_desktop_job": "https://github.com/pramod07info/indianos/actions/runs/42512759106/job/128829200749",
+        "artifacts": [
+          "https://github.com/pramod07info/indianos/actions/runs/45349640355/artifacts/14904158472",
+          "https://github.com/pramod07info/indianos/actions/runs/45349640355/artifacts/14901141842"
+        ],
+        "failed_job": "https://github.com/pramod07info/indianos/actions/runs/45349640355/job/138292568029",
+        "independent_review": "pending; no independent approvals returned for eight inspected PRs",
+        "remaining_blockers": [
+          "Independent correctness/security review of the actual G3 production source and explicit G3 sign-off (review lists for #765 #790 #794 #795 #797 #798 #801 #803 empty).",
+          "Exact candidate and final merged-main host/no_std, full normal Desktop QEMU, S0 and applicable non-regression evidence. Current main 11ffe7b9944938e96596fefdd207bb3a6c572ceb push S0, Duplicate Prevention and Roadmap SHA checks passed; full normal Desktop matrix did not trigger for registry-only change.",
+          "Investigate intermittent unready-compositor timeout: run 45349640355 attempt 1 job 138292568029 failed waiting 45s for recovery; last logged activity during PID2 startup (R117), root cause not established; attempt 2 passed without source changes. Retain strict assertions and budgets; repeat qualification and inspect failed artifact.",
+          "Complete remaining source/acceptance traceability and independent review, including shutdown dispatch exhaustion, stale authority cleanup and individual service negatives; do not claim broader phase completion or hardware qualification."
+        ],
+        "formal_acceptance": false,
+        "scope_limit": "256 cooperative dispatch startup/shutdown bounds do not bound wall clock or nontrapping tasks; broader preemption, physical hardware, general compositor and storage ABI obligations remain in their existing phase/gate records.",
+        "source_symbols": [
+          "desktop-image",
+          "boot_validate",
+          "tests/test_desktop_boot_profile.py::test_desktop_edition_has_a_distinct_automatic_boot_entry",
+          "boot_initramfs_file",
+          "desktop_service_images_valid",
+          "tests/test_desktop_boot_profile.py::test_native_desktop_packages_four_explicit_service_roles_without_test_features",
+          "recover_init",
+          "runtime_revalidate_desktop_restart",
+          "denied_boot",
+          "verify_unready_recovery",
+          "desktop_services_live",
+          "x86_64_desktop_session_run",
+          "verify_runtime",
+          "desktop_surface_guards_valid",
+          "desktop_pixel_guards_valid",
+          "verify_debug_stack_guards",
+          "verify_app_scratch_mappings",
+          "verify_transient_restart",
+          "retire_full_owner_batch",
+          "retire_process_batch_kernel",
+          "desktop_compositor",
+          "desktop_startup_handshakes",
+          "Startup::observe",
+          "desktop_receive",
+          "service_ipc_waiters",
+          "verify_bounded_restart",
+          "runtime_prepare_selected_volume",
+          "DesktopLifecycle::dispatch",
+          "DesktopLifecycle::complete_sync",
+          "DesktopLifecycle::allows_storage_request",
+          "DesktopLifecycle::unexpected_exit"
+        ],
+        "acceptance_tests": [
+          "tests/test_desktop_boot_profile.py",
+          "tests/test_normal_desktop_acceptance.py",
+          "userland/rust/tests/desktop_startup.rs",
+          "tools/test_normal_desktop_qemu.py",
+          "kernel_main::desktop_preflight_validates_all_four_services_before_admission",
+          "kernel_main::desktop_selection_requires_complete_canonical_explicit_identity",
+          "tests/test_normal_desktop_acceptance.py::test_unready_failure_retains_live_monitor_without_weakening_failure",
+          "tests/test_normal_desktop_acceptance.py::test_unready_monitor_diagnostic_write_failure_cannot_mask_acceptance"
+        ],
+        "latest_main_ci_urls": [
+          "https://github.com/pramod07info/indianos/actions/runs/45372146895",
+          "https://github.com/pramod07info/indianos/actions/runs/45372146885",
+          "https://github.com/pramod07info/indianos/actions/runs/45372147665"
+        ],
+        "failure_diagnostic_change": {
+          "scope": "Existing host acceptance harness only; no guest code or timeout changes. Failure-only read-only HMP status/register/block capture before teardown. New negative controls preserve the original failure and check diagnostics occur before close.",
+          "paths": [
+            "tools/test_normal_desktop_qemu.py",
+            "tests/test_normal_desktop_acceptance.py"
+          ],
+          "status": "new candidate CI pending; root cause not established"
+        }
+      }
     },
     {
       "id": "G4",
@@ -213,7 +321,47 @@
       "status": "audit_required",
       "source_document": "docs/M1_PHASE_SCOPE.md",
       "source_paths": [],
-      "merged_prs": []
+      "merged_prs": [],
+      "g3_scoped_evidence": {
+        "gates": [
+          "G3"
+        ],
+        "classification": "implemented_acceptance_pending",
+        "scope": "Only documented G3 bounded normal-desktop subset; wider phase requirement and any G1/G2 scoped evidence retain their existing statuses.",
+        "source_paths": [
+          "Makefile",
+          "boot/limine-desktop.conf",
+          "rust/kernel_core/src/boot.rs"
+        ],
+        "source_symbols_or_test_refs": [
+          "desktop-image",
+          "boot_validate",
+          "tests/test_desktop_boot_profile.py::test_desktop_edition_has_a_distinct_automatic_boot_entry"
+        ],
+        "related_merged_prs": [
+          765,
+          790,
+          797,
+          798,
+          801
+        ],
+        "verified_baseline_sha": "b51e5dbe8a5167d5f3007ef819d9c887a9fa7717",
+        "audited_sha": "11ffe7b9944938e96596fefdd207bb3a6c572ceb",
+        "ci_evidence_urls": [
+          "https://github.com/pramod07info/indianos/actions/runs/45349640355",
+          "https://github.com/pramod07info/indianos/actions/runs/45349640311",
+          "https://github.com/pramod07info/indianos/actions/runs/45349640383",
+          "https://github.com/pramod07info/indianos/actions/runs/45349640314"
+        ],
+        "independent_review": "pending",
+        "remaining_blockers": [
+          "Independent correctness/security review of the actual G3 production source and explicit G3 sign-off (review lists for #765 #790 #794 #795 #797 #798 #801 #803 empty).",
+          "Exact candidate and final merged-main host/no_std, normal Desktop QEMU, S0 and applicable non-regression evidence; current connector returned no PR-triggered runs or combined statuses for 11ffe7b9944938e96596fefdd207bb3a6c572ceb, which does not establish absence of push runs.",
+          "Investigate intermittent unready-compositor timeout: run 45349640355 attempt 1 job 138292568029 failed waiting 45s for recovery; last logged activity during PID2 startup (R117), root cause not established; attempt 2 passed without source changes. Retain strict assertions and budgets; repeat qualification and inspect failed artifact.",
+          "Complete remaining source/acceptance traceability and independent review, including shutdown dispatch exhaustion, stale authority cleanup and individual service negatives; do not claim broader phase completion or hardware qualification."
+        ],
+        "formal_acceptance": false
+      }
     },
     {
       "id": "M1-P1-002",
@@ -267,7 +415,47 @@
       "status": "audit_required",
       "source_document": "docs/M1_PHASE_SCOPE.md",
       "source_paths": [],
-      "merged_prs": []
+      "merged_prs": [],
+      "g3_scoped_evidence": {
+        "gates": [
+          "G3"
+        ],
+        "classification": "implemented_acceptance_pending",
+        "scope": "Only documented G3 bounded normal-desktop subset; wider phase requirement and any G1/G2 scoped evidence retain their existing statuses.",
+        "source_paths": [
+          "rust/kernel_core/src/boot.rs",
+          "rust/kernel_core/src/kernel_main.rs",
+          "Makefile"
+        ],
+        "source_symbols_or_test_refs": [
+          "boot_initramfs_file",
+          "desktop_service_images_valid",
+          "tests/test_desktop_boot_profile.py::test_native_desktop_packages_four_explicit_service_roles_without_test_features"
+        ],
+        "related_merged_prs": [
+          765,
+          790,
+          797,
+          798,
+          801
+        ],
+        "verified_baseline_sha": "b51e5dbe8a5167d5f3007ef819d9c887a9fa7717",
+        "audited_sha": "11ffe7b9944938e96596fefdd207bb3a6c572ceb",
+        "ci_evidence_urls": [
+          "https://github.com/pramod07info/indianos/actions/runs/45349640355",
+          "https://github.com/pramod07info/indianos/actions/runs/45349640311",
+          "https://github.com/pramod07info/indianos/actions/runs/45349640383",
+          "https://github.com/pramod07info/indianos/actions/runs/45349640314"
+        ],
+        "independent_review": "pending",
+        "remaining_blockers": [
+          "Independent correctness/security review of the actual G3 production source and explicit G3 sign-off (review lists for #765 #790 #794 #795 #797 #798 #801 #803 empty).",
+          "Exact candidate and final merged-main host/no_std, normal Desktop QEMU, S0 and applicable non-regression evidence; current connector returned no PR-triggered runs or combined statuses for 11ffe7b9944938e96596fefdd207bb3a6c572ceb, which does not establish absence of push runs.",
+          "Investigate intermittent unready-compositor timeout: run 45349640355 attempt 1 job 138292568029 failed waiting 45s for recovery; last logged activity during PID2 startup (R117), root cause not established; attempt 2 passed without source changes. Retain strict assertions and budgets; repeat qualification and inspect failed artifact.",
+          "Complete remaining source/acceptance traceability and independent review, including shutdown dispatch exhaustion, stale authority cleanup and individual service negatives; do not claim broader phase completion or hardware qualification."
+        ],
+        "formal_acceptance": false
+      }
     },
     {
       "id": "M1-P1-008",
@@ -276,7 +464,48 @@
       "status": "audit_required",
       "source_document": "docs/M1_PHASE_SCOPE.md",
       "source_paths": [],
-      "merged_prs": []
+      "merged_prs": [],
+      "g3_scoped_evidence": {
+        "gates": [
+          "G3"
+        ],
+        "classification": "implemented_acceptance_pending",
+        "scope": "Only documented G3 bounded normal-desktop subset; wider phase requirement and any G1/G2 scoped evidence retain their existing statuses.",
+        "source_paths": [
+          "rust/kernel_core/src/kernel_main.rs",
+          "rust/kernel_core/src/user_runtime.rs",
+          "tools/test_normal_desktop_qemu.py"
+        ],
+        "source_symbols_or_test_refs": [
+          "recover_init",
+          "runtime_revalidate_desktop_restart",
+          "denied_boot",
+          "verify_unready_recovery"
+        ],
+        "related_merged_prs": [
+          765,
+          790,
+          797,
+          798,
+          801
+        ],
+        "verified_baseline_sha": "b51e5dbe8a5167d5f3007ef819d9c887a9fa7717",
+        "audited_sha": "11ffe7b9944938e96596fefdd207bb3a6c572ceb",
+        "ci_evidence_urls": [
+          "https://github.com/pramod07info/indianos/actions/runs/45349640355",
+          "https://github.com/pramod07info/indianos/actions/runs/45349640311",
+          "https://github.com/pramod07info/indianos/actions/runs/45349640383",
+          "https://github.com/pramod07info/indianos/actions/runs/45349640314"
+        ],
+        "independent_review": "pending",
+        "remaining_blockers": [
+          "Independent correctness/security review of the actual G3 production source and explicit G3 sign-off (review lists for #765 #790 #794 #795 #797 #798 #801 #803 empty).",
+          "Exact candidate and final merged-main host/no_std, normal Desktop QEMU, S0 and applicable non-regression evidence; current connector returned no PR-triggered runs or combined statuses for 11ffe7b9944938e96596fefdd207bb3a6c572ceb, which does not establish absence of push runs.",
+          "Investigate intermittent unready-compositor timeout: run 45349640355 attempt 1 job 138292568029 failed waiting 45s for recovery; last logged activity during PID2 startup (R117), root cause not established; attempt 2 passed without source changes. Retain strict assertions and budgets; repeat qualification and inspect failed artifact.",
+          "Complete remaining source/acceptance traceability and independent review, including shutdown dispatch exhaustion, stale authority cleanup and individual service negatives; do not claim broader phase completion or hardware qualification."
+        ],
+        "formal_acceptance": false
+      }
     },
     {
       "id": "M1-P1-009",
@@ -411,7 +640,46 @@
       "status": "audit_required",
       "source_document": "docs/M1_PHASE_SCOPE.md",
       "source_paths": [],
-      "merged_prs": []
+      "merged_prs": [],
+      "g3_scoped_evidence": {
+        "gates": [
+          "G3"
+        ],
+        "classification": "implemented_acceptance_pending",
+        "scope": "Only documented G3 bounded normal-desktop subset; wider phase requirement and any G1/G2 scoped evidence retain their existing statuses.",
+        "source_paths": [
+          "rust/kernel_core/src/user_runtime.rs",
+          "tools/test_normal_desktop_qemu.py"
+        ],
+        "source_symbols_or_test_refs": [
+          "desktop_services_live",
+          "x86_64_desktop_session_run",
+          "verify_runtime"
+        ],
+        "related_merged_prs": [
+          765,
+          790,
+          797,
+          798,
+          801
+        ],
+        "verified_baseline_sha": "b51e5dbe8a5167d5f3007ef819d9c887a9fa7717",
+        "audited_sha": "11ffe7b9944938e96596fefdd207bb3a6c572ceb",
+        "ci_evidence_urls": [
+          "https://github.com/pramod07info/indianos/actions/runs/45349640355",
+          "https://github.com/pramod07info/indianos/actions/runs/45349640311",
+          "https://github.com/pramod07info/indianos/actions/runs/45349640383",
+          "https://github.com/pramod07info/indianos/actions/runs/45349640314"
+        ],
+        "independent_review": "pending",
+        "remaining_blockers": [
+          "Independent correctness/security review of the actual G3 production source and explicit G3 sign-off (review lists for #765 #790 #794 #795 #797 #798 #801 #803 empty).",
+          "Exact candidate and final merged-main host/no_std, normal Desktop QEMU, S0 and applicable non-regression evidence; current connector returned no PR-triggered runs or combined statuses for 11ffe7b9944938e96596fefdd207bb3a6c572ceb, which does not establish absence of push runs.",
+          "Investigate intermittent unready-compositor timeout: run 45349640355 attempt 1 job 138292568029 failed waiting 45s for recovery; last logged activity during PID2 startup (R117), root cause not established; attempt 2 passed without source changes. Retain strict assertions and budgets; repeat qualification and inspect failed artifact.",
+          "Complete remaining source/acceptance traceability and independent review, including shutdown dispatch exhaustion, stale authority cleanup and individual service negatives; do not claim broader phase completion or hardware qualification."
+        ],
+        "formal_acceptance": false
+      }
     },
     {
       "id": "M1-P3-002",
@@ -420,7 +688,48 @@
       "status": "audit_required",
       "source_document": "docs/M1_PHASE_SCOPE.md",
       "source_paths": [],
-      "merged_prs": []
+      "merged_prs": [],
+      "g3_scoped_evidence": {
+        "gates": [
+          "G3"
+        ],
+        "classification": "implemented_acceptance_pending",
+        "scope": "Only documented G3 bounded normal-desktop subset; wider phase requirement and any G1/G2 scoped evidence retain their existing statuses.",
+        "source_paths": [
+          "rust/kernel_core/src/user_runtime.rs",
+          "rust/kernel_core/src/user_image.rs",
+          "tools/test_normal_desktop_qemu.py"
+        ],
+        "source_symbols_or_test_refs": [
+          "desktop_surface_guards_valid",
+          "desktop_pixel_guards_valid",
+          "verify_debug_stack_guards",
+          "verify_app_scratch_mappings"
+        ],
+        "related_merged_prs": [
+          765,
+          790,
+          797,
+          798,
+          801
+        ],
+        "verified_baseline_sha": "b51e5dbe8a5167d5f3007ef819d9c887a9fa7717",
+        "audited_sha": "11ffe7b9944938e96596fefdd207bb3a6c572ceb",
+        "ci_evidence_urls": [
+          "https://github.com/pramod07info/indianos/actions/runs/45349640355",
+          "https://github.com/pramod07info/indianos/actions/runs/45349640311",
+          "https://github.com/pramod07info/indianos/actions/runs/45349640383",
+          "https://github.com/pramod07info/indianos/actions/runs/45349640314"
+        ],
+        "independent_review": "pending",
+        "remaining_blockers": [
+          "Independent correctness/security review of the actual G3 production source and explicit G3 sign-off (review lists for #765 #790 #794 #795 #797 #798 #801 #803 empty).",
+          "Exact candidate and final merged-main host/no_std, normal Desktop QEMU, S0 and applicable non-regression evidence; current connector returned no PR-triggered runs or combined statuses for 11ffe7b9944938e96596fefdd207bb3a6c572ceb, which does not establish absence of push runs.",
+          "Investigate intermittent unready-compositor timeout: run 45349640355 attempt 1 job 138292568029 failed waiting 45s for recovery; last logged activity during PID2 startup (R117), root cause not established; attempt 2 passed without source changes. Retain strict assertions and budgets; repeat qualification and inspect failed artifact.",
+          "Complete remaining source/acceptance traceability and independent review, including shutdown dispatch exhaustion, stale authority cleanup and individual service negatives; do not claim broader phase completion or hardware qualification."
+        ],
+        "formal_acceptance": false
+      }
     },
     {
       "id": "M1-P3-003",
@@ -429,7 +738,47 @@
       "status": "audit_required",
       "source_document": "docs/M1_PHASE_SCOPE.md",
       "source_paths": [],
-      "merged_prs": []
+      "merged_prs": [],
+      "g3_scoped_evidence": {
+        "gates": [
+          "G3"
+        ],
+        "classification": "implemented_acceptance_pending",
+        "scope": "Only documented G3 bounded normal-desktop subset; wider phase requirement and any G1/G2 scoped evidence retain their existing statuses.",
+        "source_paths": [
+          "rust/kernel_core/src/user_runtime.rs",
+          "tools/test_normal_desktop_qemu.py"
+        ],
+        "source_symbols_or_test_refs": [
+          "x86_64_desktop_session_run",
+          "desktop_services_live",
+          "verify_runtime",
+          "verify_transient_restart"
+        ],
+        "related_merged_prs": [
+          765,
+          790,
+          797,
+          798,
+          801
+        ],
+        "verified_baseline_sha": "b51e5dbe8a5167d5f3007ef819d9c887a9fa7717",
+        "audited_sha": "11ffe7b9944938e96596fefdd207bb3a6c572ceb",
+        "ci_evidence_urls": [
+          "https://github.com/pramod07info/indianos/actions/runs/45349640355",
+          "https://github.com/pramod07info/indianos/actions/runs/45349640311",
+          "https://github.com/pramod07info/indianos/actions/runs/45349640383",
+          "https://github.com/pramod07info/indianos/actions/runs/45349640314"
+        ],
+        "independent_review": "pending",
+        "remaining_blockers": [
+          "Independent correctness/security review of the actual G3 production source and explicit G3 sign-off (review lists for #765 #790 #794 #795 #797 #798 #801 #803 empty).",
+          "Exact candidate and final merged-main host/no_std, normal Desktop QEMU, S0 and applicable non-regression evidence; current connector returned no PR-triggered runs or combined statuses for 11ffe7b9944938e96596fefdd207bb3a6c572ceb, which does not establish absence of push runs.",
+          "Investigate intermittent unready-compositor timeout: run 45349640355 attempt 1 job 138292568029 failed waiting 45s for recovery; last logged activity during PID2 startup (R117), root cause not established; attempt 2 passed without source changes. Retain strict assertions and budgets; repeat qualification and inspect failed artifact.",
+          "Complete remaining source/acceptance traceability and independent review, including shutdown dispatch exhaustion, stale authority cleanup and individual service negatives; do not claim broader phase completion or hardware qualification."
+        ],
+        "formal_acceptance": false
+      }
     },
     {
       "id": "M1-P3-004",
@@ -489,6 +838,47 @@
           "Reviewed master checklist reconciliation",
           "Verify applicable CI on updated PR head and final merged-main SHA before acceptance"
         ]
+      },
+      "g3_scoped_evidence": {
+        "gates": [
+          "G3"
+        ],
+        "classification": "implemented_acceptance_pending",
+        "scope": "Only documented G3 bounded normal-desktop subset; wider phase requirement and any G1/G2 scoped evidence retain their existing statuses.",
+        "source_paths": [
+          "rust/kernel_core/src/user_runtime.rs",
+          "rust/kernel_core/src/fs_handles.rs",
+          "userland/rust/src/main.rs"
+        ],
+        "source_symbols_or_test_refs": [
+          "desktop_services_live",
+          "retire_full_owner_batch",
+          "retire_process_batch_kernel",
+          "desktop_compositor"
+        ],
+        "related_merged_prs": [
+          765,
+          790,
+          797,
+          798,
+          801
+        ],
+        "verified_baseline_sha": "b51e5dbe8a5167d5f3007ef819d9c887a9fa7717",
+        "audited_sha": "11ffe7b9944938e96596fefdd207bb3a6c572ceb",
+        "ci_evidence_urls": [
+          "https://github.com/pramod07info/indianos/actions/runs/45349640355",
+          "https://github.com/pramod07info/indianos/actions/runs/45349640311",
+          "https://github.com/pramod07info/indianos/actions/runs/45349640383",
+          "https://github.com/pramod07info/indianos/actions/runs/45349640314"
+        ],
+        "independent_review": "pending",
+        "remaining_blockers": [
+          "Independent correctness/security review of the actual G3 production source and explicit G3 sign-off (review lists for #765 #790 #794 #795 #797 #798 #801 #803 empty).",
+          "Exact candidate and final merged-main host/no_std, normal Desktop QEMU, S0 and applicable non-regression evidence; current connector returned no PR-triggered runs or combined statuses for 11ffe7b9944938e96596fefdd207bb3a6c572ceb, which does not establish absence of push runs.",
+          "Investigate intermittent unready-compositor timeout: run 45349640355 attempt 1 job 138292568029 failed waiting 45s for recovery; last logged activity during PID2 startup (R117), root cause not established; attempt 2 passed without source changes. Retain strict assertions and budgets; repeat qualification and inspect failed artifact.",
+          "Complete remaining source/acceptance traceability and independent review, including shutdown dispatch exhaustion, stale authority cleanup and individual service negatives; do not claim broader phase completion or hardware qualification."
+        ],
+        "formal_acceptance": false
       }
     },
     {
@@ -529,6 +919,47 @@
           "Reviewed master checklist reconciliation",
           "Verify applicable CI on updated PR head and final merged-main SHA before acceptance"
         ]
+      },
+      "g3_scoped_evidence": {
+        "gates": [
+          "G3"
+        ],
+        "classification": "implemented_acceptance_pending",
+        "scope": "Only documented G3 bounded normal-desktop subset; wider phase requirement and any G1/G2 scoped evidence retain their existing statuses.",
+        "source_paths": [
+          "rust/kernel_core/src/user_runtime.rs",
+          "userland/rust/src/main.rs",
+          "userland/rust/src/desktop_startup.rs"
+        ],
+        "source_symbols_or_test_refs": [
+          "desktop_startup_handshakes",
+          "Startup::observe",
+          "desktop_receive",
+          "service_ipc_waiters"
+        ],
+        "related_merged_prs": [
+          765,
+          790,
+          797,
+          798,
+          801
+        ],
+        "verified_baseline_sha": "b51e5dbe8a5167d5f3007ef819d9c887a9fa7717",
+        "audited_sha": "11ffe7b9944938e96596fefdd207bb3a6c572ceb",
+        "ci_evidence_urls": [
+          "https://github.com/pramod07info/indianos/actions/runs/45349640355",
+          "https://github.com/pramod07info/indianos/actions/runs/45349640311",
+          "https://github.com/pramod07info/indianos/actions/runs/45349640383",
+          "https://github.com/pramod07info/indianos/actions/runs/45349640314"
+        ],
+        "independent_review": "pending",
+        "remaining_blockers": [
+          "Independent correctness/security review of the actual G3 production source and explicit G3 sign-off (review lists for #765 #790 #794 #795 #797 #798 #801 #803 empty).",
+          "Exact candidate and final merged-main host/no_std, normal Desktop QEMU, S0 and applicable non-regression evidence; current connector returned no PR-triggered runs or combined statuses for 11ffe7b9944938e96596fefdd207bb3a6c572ceb, which does not establish absence of push runs.",
+          "Investigate intermittent unready-compositor timeout: run 45349640355 attempt 1 job 138292568029 failed waiting 45s for recovery; last logged activity during PID2 startup (R117), root cause not established; attempt 2 passed without source changes. Retain strict assertions and budgets; repeat qualification and inspect failed artifact.",
+          "Complete remaining source/acceptance traceability and independent review, including shutdown dispatch exhaustion, stale authority cleanup and individual service negatives; do not claim broader phase completion or hardware qualification."
+        ],
+        "formal_acceptance": false
       }
     },
     {
@@ -574,7 +1005,48 @@
       "status": "audit_required",
       "source_document": "docs/M1_PHASE_SCOPE.md",
       "source_paths": [],
-      "merged_prs": []
+      "merged_prs": [],
+      "g3_scoped_evidence": {
+        "gates": [
+          "G3"
+        ],
+        "classification": "implemented_acceptance_pending",
+        "scope": "Only documented G3 bounded normal-desktop subset; wider phase requirement and any G1/G2 scoped evidence retain their existing statuses.",
+        "source_paths": [
+          "rust/kernel_core/src/user_runtime.rs",
+          "tools/test_normal_desktop_qemu.py",
+          "tests/test_normal_desktop_acceptance.py"
+        ],
+        "source_symbols_or_test_refs": [
+          "runtime_revalidate_desktop_restart",
+          "verify_bounded_restart",
+          "verify_unready_recovery",
+          "verify_transient_restart"
+        ],
+        "related_merged_prs": [
+          765,
+          790,
+          797,
+          798,
+          801
+        ],
+        "verified_baseline_sha": "b51e5dbe8a5167d5f3007ef819d9c887a9fa7717",
+        "audited_sha": "11ffe7b9944938e96596fefdd207bb3a6c572ceb",
+        "ci_evidence_urls": [
+          "https://github.com/pramod07info/indianos/actions/runs/45349640355",
+          "https://github.com/pramod07info/indianos/actions/runs/45349640311",
+          "https://github.com/pramod07info/indianos/actions/runs/45349640383",
+          "https://github.com/pramod07info/indianos/actions/runs/45349640314"
+        ],
+        "independent_review": "pending",
+        "remaining_blockers": [
+          "Independent correctness/security review of the actual G3 production source and explicit G3 sign-off (review lists for #765 #790 #794 #795 #797 #798 #801 #803 empty).",
+          "Exact candidate and final merged-main host/no_std, normal Desktop QEMU, S0 and applicable non-regression evidence; current connector returned no PR-triggered runs or combined statuses for 11ffe7b9944938e96596fefdd207bb3a6c572ceb, which does not establish absence of push runs.",
+          "Investigate intermittent unready-compositor timeout: run 45349640355 attempt 1 job 138292568029 failed waiting 45s for recovery; last logged activity during PID2 startup (R117), root cause not established; attempt 2 passed without source changes. Retain strict assertions and budgets; repeat qualification and inspect failed artifact.",
+          "Complete remaining source/acceptance traceability and independent review, including shutdown dispatch exhaustion, stale authority cleanup and individual service negatives; do not claim broader phase completion or hardware qualification."
+        ],
+        "formal_acceptance": false
+      }
     },
     {
       "id": "M1-P4-001",
@@ -1089,7 +1561,49 @@
       "status": "audit_required",
       "source_document": "docs/M1_PHASE_SCOPE.md",
       "source_paths": [],
-      "merged_prs": []
+      "merged_prs": [],
+      "g3_scoped_evidence": {
+        "gates": [
+          "G3"
+        ],
+        "classification": "implemented_acceptance_pending",
+        "scope": "Only documented G3 bounded normal-desktop subset; wider phase requirement and any G1/G2 scoped evidence retain their existing statuses.",
+        "source_paths": [
+          "Makefile",
+          "boot/limine-desktop.conf",
+          "rust/kernel_core/src/kernel_main.rs",
+          "tests/test_desktop_boot_profile.py",
+          "tools/test_normal_desktop_qemu.py"
+        ],
+        "source_symbols_or_test_refs": [
+          "desktop-image",
+          "desktop_service_images_valid",
+          "verify_runtime"
+        ],
+        "related_merged_prs": [
+          765,
+          790,
+          797,
+          798,
+          801
+        ],
+        "verified_baseline_sha": "b51e5dbe8a5167d5f3007ef819d9c887a9fa7717",
+        "audited_sha": "11ffe7b9944938e96596fefdd207bb3a6c572ceb",
+        "ci_evidence_urls": [
+          "https://github.com/pramod07info/indianos/actions/runs/45349640355",
+          "https://github.com/pramod07info/indianos/actions/runs/45349640311",
+          "https://github.com/pramod07info/indianos/actions/runs/45349640383",
+          "https://github.com/pramod07info/indianos/actions/runs/45349640314"
+        ],
+        "independent_review": "pending",
+        "remaining_blockers": [
+          "Independent correctness/security review of the actual G3 production source and explicit G3 sign-off (review lists for #765 #790 #794 #795 #797 #798 #801 #803 empty).",
+          "Exact candidate and final merged-main host/no_std, normal Desktop QEMU, S0 and applicable non-regression evidence; current connector returned no PR-triggered runs or combined statuses for 11ffe7b9944938e96596fefdd207bb3a6c572ceb, which does not establish absence of push runs.",
+          "Investigate intermittent unready-compositor timeout: run 45349640355 attempt 1 job 138292568029 failed waiting 45s for recovery; last logged activity during PID2 startup (R117), root cause not established; attempt 2 passed without source changes. Retain strict assertions and budgets; repeat qualification and inspect failed artifact.",
+          "Complete remaining source/acceptance traceability and independent review, including shutdown dispatch exhaustion, stale authority cleanup and individual service negatives; do not claim broader phase completion or hardware qualification."
+        ],
+        "formal_acceptance": false
+      }
     },
     {
       "id": "M1-P8-002",
@@ -1098,7 +1612,49 @@
       "status": "audit_required",
       "source_document": "docs/M1_PHASE_SCOPE.md",
       "source_paths": [],
-      "merged_prs": []
+      "merged_prs": [],
+      "g3_scoped_evidence": {
+        "gates": [
+          "G3"
+        ],
+        "classification": "implemented_acceptance_pending",
+        "scope": "Only documented G3 bounded normal-desktop subset; wider phase requirement and any G1/G2 scoped evidence retain their existing statuses.",
+        "source_paths": [
+          "rust/kernel_core/src/user_runtime.rs",
+          "userland/rust/src/main.rs",
+          "userland/rust/src/desktop_startup.rs",
+          "tools/test_normal_desktop_qemu.py"
+        ],
+        "source_symbols_or_test_refs": [
+          "desktop_services_live",
+          "desktop_startup_handshakes",
+          "Startup::observe",
+          "verify_runtime"
+        ],
+        "related_merged_prs": [
+          765,
+          790,
+          797,
+          798,
+          801
+        ],
+        "verified_baseline_sha": "b51e5dbe8a5167d5f3007ef819d9c887a9fa7717",
+        "audited_sha": "11ffe7b9944938e96596fefdd207bb3a6c572ceb",
+        "ci_evidence_urls": [
+          "https://github.com/pramod07info/indianos/actions/runs/45349640355",
+          "https://github.com/pramod07info/indianos/actions/runs/45349640311",
+          "https://github.com/pramod07info/indianos/actions/runs/45349640383",
+          "https://github.com/pramod07info/indianos/actions/runs/45349640314"
+        ],
+        "independent_review": "pending",
+        "remaining_blockers": [
+          "Independent correctness/security review of the actual G3 production source and explicit G3 sign-off (review lists for #765 #790 #794 #795 #797 #798 #801 #803 empty).",
+          "Exact candidate and final merged-main host/no_std, normal Desktop QEMU, S0 and applicable non-regression evidence; current connector returned no PR-triggered runs or combined statuses for 11ffe7b9944938e96596fefdd207bb3a6c572ceb, which does not establish absence of push runs.",
+          "Investigate intermittent unready-compositor timeout: run 45349640355 attempt 1 job 138292568029 failed waiting 45s for recovery; last logged activity during PID2 startup (R117), root cause not established; attempt 2 passed without source changes. Retain strict assertions and budgets; repeat qualification and inspect failed artifact.",
+          "Complete remaining source/acceptance traceability and independent review, including shutdown dispatch exhaustion, stale authority cleanup and individual service negatives; do not claim broader phase completion or hardware qualification."
+        ],
+        "formal_acceptance": false
+      }
     },
     {
       "id": "M1-P8-003",
@@ -1107,7 +1663,47 @@
       "status": "audit_required",
       "source_document": "docs/M1_PHASE_SCOPE.md",
       "source_paths": [],
-      "merged_prs": []
+      "merged_prs": [],
+      "g3_scoped_evidence": {
+        "gates": [
+          "G3"
+        ],
+        "classification": "implemented_acceptance_pending",
+        "scope": "Only documented G3 bounded normal-desktop subset; wider phase requirement and any G1/G2 scoped evidence retain their existing statuses.",
+        "source_paths": [
+          "rust/kernel_core/src/kernel_main.rs",
+          "rust/kernel_core/src/user_runtime.rs",
+          "userland/rust/src/desktop_startup.rs"
+        ],
+        "source_symbols_or_test_refs": [
+          "desktop_service_images_valid",
+          "runtime_prepare_selected_volume",
+          "Startup::observe"
+        ],
+        "related_merged_prs": [
+          765,
+          790,
+          797,
+          798,
+          801
+        ],
+        "verified_baseline_sha": "b51e5dbe8a5167d5f3007ef819d9c887a9fa7717",
+        "audited_sha": "11ffe7b9944938e96596fefdd207bb3a6c572ceb",
+        "ci_evidence_urls": [
+          "https://github.com/pramod07info/indianos/actions/runs/45349640355",
+          "https://github.com/pramod07info/indianos/actions/runs/45349640311",
+          "https://github.com/pramod07info/indianos/actions/runs/45349640383",
+          "https://github.com/pramod07info/indianos/actions/runs/45349640314"
+        ],
+        "independent_review": "pending",
+        "remaining_blockers": [
+          "Independent correctness/security review of the actual G3 production source and explicit G3 sign-off (review lists for #765 #790 #794 #795 #797 #798 #801 #803 empty).",
+          "Exact candidate and final merged-main host/no_std, normal Desktop QEMU, S0 and applicable non-regression evidence; current connector returned no PR-triggered runs or combined statuses for 11ffe7b9944938e96596fefdd207bb3a6c572ceb, which does not establish absence of push runs.",
+          "Investigate intermittent unready-compositor timeout: run 45349640355 attempt 1 job 138292568029 failed waiting 45s for recovery; last logged activity during PID2 startup (R117), root cause not established; attempt 2 passed without source changes. Retain strict assertions and budgets; repeat qualification and inspect failed artifact.",
+          "Complete remaining source/acceptance traceability and independent review, including shutdown dispatch exhaustion, stale authority cleanup and individual service negatives; do not claim broader phase completion or hardware qualification."
+        ],
+        "formal_acceptance": false
+      }
     },
     {
       "id": "M1-P8-004",
@@ -1116,7 +1712,49 @@
       "status": "audit_required",
       "source_document": "docs/M1_PHASE_SCOPE.md",
       "source_paths": [],
-      "merged_prs": []
+      "merged_prs": [],
+      "g3_scoped_evidence": {
+        "gates": [
+          "G3"
+        ],
+        "classification": "implemented_acceptance_pending",
+        "scope": "Only documented G3 bounded normal-desktop subset; wider phase requirement and any G1/G2 scoped evidence retain their existing statuses.",
+        "source_paths": [
+          "rust/kernel_core/src/kernel_main.rs",
+          "rust/kernel_core/src/user_runtime.rs",
+          "tools/test_normal_desktop_qemu.py",
+          "tests/test_normal_desktop_acceptance.py"
+        ],
+        "source_symbols_or_test_refs": [
+          "DesktopLifecycle::dispatch",
+          "runtime_revalidate_desktop_restart",
+          "verify_bounded_restart",
+          "verify_unready_recovery"
+        ],
+        "related_merged_prs": [
+          765,
+          790,
+          797,
+          798,
+          801
+        ],
+        "verified_baseline_sha": "b51e5dbe8a5167d5f3007ef819d9c887a9fa7717",
+        "audited_sha": "11ffe7b9944938e96596fefdd207bb3a6c572ceb",
+        "ci_evidence_urls": [
+          "https://github.com/pramod07info/indianos/actions/runs/45349640355",
+          "https://github.com/pramod07info/indianos/actions/runs/45349640311",
+          "https://github.com/pramod07info/indianos/actions/runs/45349640383",
+          "https://github.com/pramod07info/indianos/actions/runs/45349640314"
+        ],
+        "independent_review": "pending",
+        "remaining_blockers": [
+          "Independent correctness/security review of the actual G3 production source and explicit G3 sign-off (review lists for #765 #790 #794 #795 #797 #798 #801 #803 empty).",
+          "Exact candidate and final merged-main host/no_std, normal Desktop QEMU, S0 and applicable non-regression evidence; current connector returned no PR-triggered runs or combined statuses for 11ffe7b9944938e96596fefdd207bb3a6c572ceb, which does not establish absence of push runs.",
+          "Investigate intermittent unready-compositor timeout: run 45349640355 attempt 1 job 138292568029 failed waiting 45s for recovery; last logged activity during PID2 startup (R117), root cause not established; attempt 2 passed without source changes. Retain strict assertions and budgets; repeat qualification and inspect failed artifact.",
+          "Complete remaining source/acceptance traceability and independent review, including shutdown dispatch exhaustion, stale authority cleanup and individual service negatives; do not claim broader phase completion or hardware qualification."
+        ],
+        "formal_acceptance": false
+      }
     },
     {
       "id": "M1-P8-005",
@@ -1170,7 +1808,48 @@
       "status": "audit_required",
       "source_document": "docs/M1_PHASE_SCOPE.md",
       "source_paths": [],
-      "merged_prs": []
+      "merged_prs": [],
+      "g3_scoped_evidence": {
+        "gates": [
+          "G3"
+        ],
+        "classification": "implemented_acceptance_pending",
+        "scope": "Only documented G3 bounded normal-desktop subset; wider phase requirement and any G1/G2 scoped evidence retain their existing statuses.",
+        "source_paths": [
+          "rust/kernel_core/src/user_runtime.rs",
+          "tools/test_normal_desktop_qemu.py",
+          "tests/test_normal_desktop_acceptance.py"
+        ],
+        "source_symbols_or_test_refs": [
+          "DesktopLifecycle::complete_sync",
+          "DesktopLifecycle::allows_storage_request",
+          "DesktopLifecycle::unexpected_exit",
+          "verify_runtime"
+        ],
+        "related_merged_prs": [
+          765,
+          790,
+          797,
+          798,
+          801
+        ],
+        "verified_baseline_sha": "b51e5dbe8a5167d5f3007ef819d9c887a9fa7717",
+        "audited_sha": "11ffe7b9944938e96596fefdd207bb3a6c572ceb",
+        "ci_evidence_urls": [
+          "https://github.com/pramod07info/indianos/actions/runs/45349640355",
+          "https://github.com/pramod07info/indianos/actions/runs/45349640311",
+          "https://github.com/pramod07info/indianos/actions/runs/45349640383",
+          "https://github.com/pramod07info/indianos/actions/runs/45349640314"
+        ],
+        "independent_review": "pending",
+        "remaining_blockers": [
+          "Independent correctness/security review of the actual G3 production source and explicit G3 sign-off (review lists for #765 #790 #794 #795 #797 #798 #801 #803 empty).",
+          "Exact candidate and final merged-main host/no_std, normal Desktop QEMU, S0 and applicable non-regression evidence; current connector returned no PR-triggered runs or combined statuses for 11ffe7b9944938e96596fefdd207bb3a6c572ceb, which does not establish absence of push runs.",
+          "Investigate intermittent unready-compositor timeout: run 45349640355 attempt 1 job 138292568029 failed waiting 45s for recovery; last logged activity during PID2 startup (R117), root cause not established; attempt 2 passed without source changes. Retain strict assertions and budgets; repeat qualification and inspect failed artifact.",
+          "Complete remaining source/acceptance traceability and independent review, including shutdown dispatch exhaustion, stale authority cleanup and individual service negatives; do not claim broader phase completion or hardware qualification."
+        ],
+        "formal_acceptance": false
+      }
     },
     {
       "id": "M1-P9-001",

@@ -1707,6 +1707,27 @@ def verify_unready_recovery(output: bytes, name: str) -> None:
         raise AssertionError("unready service was accepted or escaped controlled recovery")
 
 
+def capture_unready_failure(session: QemuSession, folder: Path, name: str,
+                            error: Exception) -> None:
+    # Failure-only evidence: a missing serial marker cannot distinguish a
+    # stalled guest, an emulator pause or a slow runner. Query the live HMP
+    # before close() terminates QEMU; never resume, pause or mutate the guest.
+    # These observations are diagnostic only and never enter acceptance output.
+    records = [f"Original failure: {error}", f"Serial bytes: {len(session.output)}"]
+    for command in ("info status", "info registers", "info block"):
+        try:
+            result = session.hmp(command)
+        except Exception as diagnostic_error:
+            result = f"Diagnostic unavailable: {diagnostic_error}"
+        records.append(f"\n--- {command} ---\n{result}")
+    try:
+        (folder / f"{name}.failure-monitor.log").write_text(
+            "\n".join(records) + "\n", encoding="utf-8", errors="replace")
+    except OSError as diagnostic_error:
+        # Do not replace the actual failed acceptance assertion.
+        print(f"Could not retain {name} monitor diagnostics: {diagnostic_error}", flush=True)
+
+
 def unready_service_boot(qemu: str, iso: Path, ovmf: Path, disk: Path,
                          folder: Path, name: str) -> None:
     before = disk.read_bytes()
@@ -1715,6 +1736,9 @@ def unready_service_boot(qemu: str, iso: Path, ovmf: Path, disk: Path,
         session.until("IndianOS recovery: reason=desktop-session-failed", 45)
         session.until("IndianOS recovery: read-only serial console ready", 10)
         verify_unready_recovery(bytes(session.output), name)
+    except Exception as error:
+        capture_unready_failure(session, folder, name, error)
+        raise
     finally:
         close(process, sock, session, folder / f"{name}.serial.log")
     if disk.read_bytes() != before:
