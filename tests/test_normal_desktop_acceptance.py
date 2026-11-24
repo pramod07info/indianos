@@ -471,6 +471,28 @@ class NormalDesktopControls(unittest.TestCase):
                 with self.assertRaises(AssertionError):
                     harness.verify_unready_recovery(trace + b"PID 4 FAULTED", name)
 
+    def test_premature_exit_oracle_requires_the_exact_failed_role(self):
+        verified = b"IndianOS normal desktop: retired session verified restart-safe\n"
+        restart = b"IndianOS normal desktop: restarting retired service session\n"
+        exhausted = b"IndianOS normal desktop: restart budget exhausted\n"
+        recovery = b"IndianOS recovery: reason=desktop-session-failed\n"
+        for role, pid in (("init", 1), ("files", 2), ("terminal", 3), ("compositor", 4)):
+            session = (b"IndianOS: R031 scheduler process exit=0x0000000000000000\n"
+                       + f"IndianOS: PID {pid} EXITED\nIndianOS: PID {pid} REAPED\n".encode()
+                       + b"IndianOS normal desktop: service exited before durable shutdown\n")
+            trace = session + verified + restart + session + verified + exhausted + recovery
+            with self.subTest(role=role):
+                harness.verify_unready_recovery(trace, f"premature-{role}")
+                for wrong_role in ("init", "files", "terminal", "compositor"):
+                    if wrong_role != role:
+                        with self.assertRaises(AssertionError):
+                            harness.verify_unready_recovery(trace, f"premature-{wrong_role}")
+                for bad in (trace.replace(f"PID {pid} REAPED".encode(), b"", 1),
+                            trace + b"IndianOS: PID 1 FAULTED\n",
+                            trace + harness.READY.encode()):
+                    with self.assertRaises(AssertionError):
+                        harness.verify_unready_recovery(bad, f"premature-{role}")
+
     def test_unready_failure_retains_live_monitor_without_weakening_failure(self):
         with tempfile.TemporaryDirectory() as temporary:
             folder = Path(temporary)

@@ -62,7 +62,15 @@
           "security_m1_terminal_protects_namespaces_across_all_mutators",
           "authenticated_keyboard_enters_persistent_commands",
           "tools/test_normal_desktop_qemu.py (two cold boots and exact graphical readback)"
-        ]
+        ],
+        "latest_verified_candidate": {
+          "sha": "e267acce14686e8ea73150ba7f7512db2b172601",
+          "combined_run": "https://github.com/pramod07info/indianos/actions/runs/45374573481",
+          "normal_desktop_job": "https://github.com/pramod07info/indianos/actions/runs/45374573481/job/138377222207",
+          "artifact": 14910669566,
+          "result": "All three jobs passed; 4215 kernel host tests, 57 normal-desktop harness tests, two cold boots, transient fault, premature and unready compositor recovery, GPT negatives, ATA failure and durable shutdown passed. Historical candidate evidence, not latest main acceptance."
+        },
+        "latest_checked_main_sha": "6416e42a59ccd2b07aeab804c9694b320ea76437"
       }
     },
     {
@@ -120,7 +128,15 @@
           "m1_mbr_partition_mount_and_reboot_guards",
           "m1_partition_failed_cow_commit_recovers_previous_file_after_reboot",
           "tools/test_normal_desktop_qemu.py (GPT semantic negatives and actual ATA write failure)"
-        ]
+        ],
+        "latest_verified_candidate": {
+          "sha": "e267acce14686e8ea73150ba7f7512db2b172601",
+          "combined_run": "https://github.com/pramod07info/indianos/actions/runs/45374573481",
+          "normal_desktop_job": "https://github.com/pramod07info/indianos/actions/runs/45374573481/job/138377222207",
+          "artifact": 14910669566,
+          "result": "All three jobs passed; 4215 kernel host tests, 57 normal-desktop harness tests, two cold boots, transient fault, premature and unready compositor recovery, GPT negatives, ATA failure and durable shutdown passed. Historical candidate evidence, not latest main acceptance."
+        },
+        "latest_checked_main_sha": "6416e42a59ccd2b07aeab804c9694b320ea76437"
       }
     },
     {
@@ -182,7 +198,8 @@
           "Independent correctness/security review of the actual G3 production source and explicit G3 sign-off (review lists for #765 #790 #794 #795 #797 #798 #801 #803 empty).",
           "Exact candidate and final merged-main host/no_std, full normal Desktop QEMU, S0 and applicable non-regression evidence. Current main 11ffe7b9944938e96596fefdd207bb3a6c572ceb push S0, Duplicate Prevention and Roadmap SHA checks passed; full normal Desktop matrix did not trigger for registry-only change.",
           "Investigate intermittent unready-compositor timeout: run 45349640355 attempt 1 job 138292568029 failed waiting 45s for recovery; last logged activity during PID2 startup (R117), root cause not established; attempt 2 passed without source changes. Retain strict assertions and budgets; repeat qualification and inspect failed artifact.",
-          "Complete remaining source/acceptance traceability and independent review, including shutdown dispatch exhaustion, stale authority cleanup and individual service negatives; do not claim broader phase completion or hardware qualification."
+          "Complete remaining source/acceptance traceability and independent review, including shutdown dispatch exhaustion, stale authority cleanup and individual service negatives; do not claim broader phase completion or hardware qualification.",
+          "Validate the frame-query performance correction against all G3 negative boots; do not declare the intermittent timeout resolved until evidence supports it."
         ],
         "formal_acceptance": false,
         "scope_limit": "256 cooperative dispatch startup/shutdown bounds do not bound wall clock or nontrapping tasks; broader preemption, physical hardware, general compositor and storage ABI obligations remain in their existing phase/gate records.",
@@ -240,7 +257,24 @@
             "tools/test_normal_desktop_qemu.py",
             "tests/test_normal_desktop_acceptance.py"
           ],
-          "status": "new candidate CI pending; root cause not established"
+          "status": "PR #804 merged; both diagnostic tests and complete candidate QEMU matrix passed. Intermittent timeout not reproduced; root cause remains unknown."
+        },
+        "latest_verified_candidate": {
+          "sha": "e267acce14686e8ea73150ba7f7512db2b172601",
+          "combined_run": "https://github.com/pramod07info/indianos/actions/runs/45374573481",
+          "normal_desktop_job": "https://github.com/pramod07info/indianos/actions/runs/45374573481/job/138377222207",
+          "artifact": 14910669566,
+          "result": "All three jobs passed; 4215 kernel host tests, 57 normal-desktop harness tests, two cold boots, transient fault, premature and unready compositor recovery, GPT negatives, ATA failure and durable shutdown passed. Historical candidate evidence, not latest main acceptance."
+        },
+        "latest_checked_main_sha": "6416e42a59ccd2b07aeab804c9694b320ea76437",
+        "individual_service_qualification": "Candidate extends existing real QEMU fixture to all four premature exits and Files/Terminal missing/invalid images; new role-specific host oracle negative controls. Exact candidate CI not yet run; no gate sign-off.",
+        "latest_failure_investigation": {
+          "run": 45377901348,
+          "job": 138388955004,
+          "artifact": 14913822725,
+          "failed_sha": "8b59c332f63a88aad4eae3cb8781f706fc4cb7f2",
+          "observed": "Premature PID3 clean exit and first retirement succeeded. Second startup stalled during PID2 Files after pixel denial checks. HMP reports running, CPL0 RIP ffffffff80021cba; addr2line against retained exact kernel ELF resolves to boot::validated_map_count. Repeated full-map validation inside each frame query is a concrete performance bottleneck and plausible contributor, not yet proven sole cause.",
+          "fix": "Reuse complete map validation once per live frame query, then locally validate individual entries; preserve kind, bounds, corruption checks and no cache. Add three host regression tests. Existing 45s timeout and acceptance criteria unchanged; exact-head QEMU pending."
         }
       }
     },

@@ -3,6 +3,13 @@ on:
   push:
     branches: [main, milestone/m1-desktop-storage]
     paths:
+      - "docs/M1_TASK_REGISTRY.json"
+      - "docs/DELIVERY_MILESTONES.md"
+      - "docs/M1_GATES_6_7_ACCEPTANCE.md"
+      - "docs/M1_GATES_8_10_ACCEPTANCE.md"
+      - ".github/workflows/agent-independent-reviewer.yml"
+      - "tools/test_normal_desktop_qemu.py"
+      - "tests/test_normal_desktop_acceptance.py"
       - 'rust/kernel_core/src/m1_*.rs'
       - 'rust/kernel_core/src/block.rs'
       - 'rust/kernel_core/src/durablefs.rs'
@@ -23,6 +30,13 @@ on:
       - '.github/workflows/m1-persistent-desktop.yml'
   pull_request:
     paths:
+      - "docs/M1_TASK_REGISTRY.json"
+      - "docs/DELIVERY_MILESTONES.md"
+      - "docs/M1_GATES_6_7_ACCEPTANCE.md"
+      - "docs/M1_GATES_8_10_ACCEPTANCE.md"
+      - ".github/workflows/agent-independent-reviewer.yml"
+      - "tools/test_normal_desktop_qemu.py"
+      - "tests/test_normal_desktop_acceptance.py"
       - 'rust/kernel_core/src/m1_*.rs'
       - 'rust/kernel_core/src/block.rs'
       - 'rust/kernel_core/src/durablefs.rs'
