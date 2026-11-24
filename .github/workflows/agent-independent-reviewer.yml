@@ -146,3 +146,192 @@ jobs:
                 core.notice('#'+pr.number+': independently reviewed by bot; coordinator may merge');
               }catch(e){core.warning('#'+pr.number+': failed closed: '+e.message);}
             }
+  m1-gate-evidence:
+    name: Read-only M1 G1-G3 acceptance evidence review
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Validate exact-revision evidence using trusted base policy
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            function newest(runs,path,sha,full,events,branch) {
+              return runs.filter(r=>r.path===path && r.head_sha===sha && r.head_repository?.full_name===full &&
+                events.includes(r.event) && r.head_branch===branch)
+                .sort((a,b)=>b.run_number-a.run_number||b.id-a.id)[0];
+            }
+            
+            function verifyJob(jobs,name,steps) {
+              const matches=jobs.filter(j=>j.name===name);
+              if(matches.length!==1) return false;
+              const j=matches[0];
+              return j.status==="completed"&&j.conclusion==="success"&&steps.every(step=>
+                j.steps?.filter(s=>s.name===step&&s.status==="completed"&&s.conclusion==="success").length===1);
+            }
+            
+            function verifyArtifact(artifacts,name,sha,job,runId) {
+              return artifacts.find(a=>a.name===name && a.expired===false && a.size_in_bytes>0 &&
+                a.workflow_run?.id===runId && a.workflow_run?.head_sha===sha &&
+                Date.parse(a.created_at)>=Date.parse(job?.started_at) &&
+                Date.parse(a.created_at)<=Date.parse(job?.completed_at));
+            }
+            
+            function selfTest() {
+              const assert=require("node:assert/strict");
+              const sha="a".repeat(40),full="owner/repo",path=".github/workflows/test.yml";
+              const run={id:1,run_number:1,path,head_sha:sha,head_branch:"main",head_repository:{full_name:full},event:"push",status:"completed",conclusion:"success"};
+              const query=runs=>newest(runs,path,sha,full,["push"],"main");
+              assert.equal(query([run]),run);
+              assert.equal(query([run,{...run,id:2,run_number:2,conclusion:"failure"}]).conclusion,"failure");
+              for(const bad of [{head_sha:"stale"},{event:"pull_request_target"},{head_branch:"other"},{path:"other"},{head_repository:{full_name:"fork/repo"}}])
+                assert.equal(query([{...run,...bad}]),undefined);
+              const job={name:"desktop",status:"completed",conclusion:"success",steps:[{name:"required",status:"completed",conclusion:"success"}],started_at:"2026-01-01T00:00:00Z",completed_at:"2026-01-01T00:10:00Z"};
+              assert.equal(verifyJob([job],"desktop",["required"]),true);
+              assert.equal(verifyJob([job,job],"desktop",["required"]),false);
+              assert.equal(verifyJob([job],"desktop",["missing"]),false);
+              assert.equal(verifyJob([{...job,steps:[{...job.steps[0],conclusion:"skipped"}]}],"desktop",["required"]),false);
+              const artifact={name:"normal-"+sha,expired:false,size_in_bytes:10,created_at:"2026-01-01T00:05:00Z",workflow_run:{id:1,head_sha:sha}};
+              assert.equal(verifyArtifact([artifact],artifact.name,sha,job,1),artifact);
+              for(const bad of [{expired:true},{size_in_bytes:0},{created_at:"2025-12-31T23:59:59Z"},{workflow_run:{id:2,head_sha:sha}},{workflow_run:{id:1,head_sha:"stale"}}])
+                assert.equal(verifyArtifact([{...artifact,...bad}],artifact.name,sha,job,1),undefined);
+            }
+            const specs=[
+              [
+                ".github/workflows/m1-reliability-integration.yml",
+                "Combined reliability",
+                [
+                  [
+                    "combined-regression",
+                    [
+                      "R118 assert exact integration head checkout",
+                      "All host tests with the impacted runtime modules enabled",
+                      "Freestanding combined runtime compilation"
+                    ]
+                  ],
+                  [
+                    "runtime-qemu",
+                    [
+                      "R118 assert exact integration head checkout",
+                      "Normal profile enters real PID1 and returns safely to recovery",
+                      "Real physical input, Terminal persistence and reboot readback",
+                      "Read-only boot recovery with damaged init media",
+                      "Native descriptor truncate and five-boot durable VFS recovery"
+                    ]
+                  ],
+                  [
+                    "normal-desktop-qemu",
+                    [
+                      "Verify exact source revision",
+                      "Normal desktop host, freestanding and harness regression checks",
+                      "Build the normal four-service desktop without experimental feature flags",
+                      "Actual physical input, selected GPT reboot, compositor and recovery evidence",
+                      "Retain real screenshots and serial evidence even on failure"
+                    ]
+                  ]
+                ]
+              ],
+              [
+                ".github/workflows/m1-persistent-desktop.yml",
+                "Durable Files",
+                [
+                  [
+                    "durable-files-desktop",
+                    [
+                      "R118 assert exact integration head checkout",
+                      "Real QEMU ring-3 graphical Files plus persistent scratch disk after reboot"
+                    ]
+                  ]
+                ]
+              ],
+              [
+                ".github/workflows/kernel-boot.yml",
+                "Full kernel boot",
+                [
+                  [
+                    "Build ELF + ISO and verify serial boot",
+                    [
+                      "R118 assert exact integration head checkout"
+                    ]
+                  ]
+                ]
+              ],
+              [
+                ".github/workflows/security-gate.yml",
+                "Security S0",
+                [
+                  [
+                    "Adversarial FS, signatures and no_std security regression",
+                    [
+                      "R118 assert exact integration head checkout",
+                      "Verify security implementation wiring cannot be bypassed"
+                    ]
+                  ]
+                ]
+              ],
+              [
+                ".github/workflows/roadmap-sha-validation.yml",
+                "Roadmap SHA",
+                []
+              ],
+              [
+                ".github/workflows/m1-duplicate-prevention.yml",
+                "Duplicate prevention",
+                []
+              ]
+            ];
+            async function report() {
+              selfTest();
+              const {owner,repo}=context.repo,full=owner+"/"+repo;
+              const getMain=async()=> (await github.rest.repos.getBranch({owner,repo,branch:"main"})).data.commit.sha;
+              const main=await getMain();
+              const prs=await github.paginate(github.rest.pulls.list,{owner,repo,state:"open",base:"main",per_page:100});
+              const subjects=[{label:"Current main",sha:main,branch:"main",events:["push","workflow_dispatch"]}];
+              for(const pr of prs){
+                if(pr.head.repo?.full_name!==full)continue;
+                const files=await github.paginate(github.rest.pulls.listFiles,{owner,repo,pull_number:pr.number,per_page:100});
+                if(!files.some(f=>/^(docs\/M1_(TASK_REGISTRY|GATES_6_7|GATES_8_10)|rust\/kernel_core\/src\/(m1_|user_runtime|user_image|hier_vfs|fs_handles|durablefs|ata_pio|block)|userland\/rust\/|tools\/test_normal_desktop_qemu\.py|tests\/test_normal_desktop_acceptance\.py)/.test(f.filename)))continue;
+                subjects.push({label:"PR #"+pr.number,sha:pr.head.sha,branch:pr.head.ref,events:["pull_request","workflow_dispatch"],number:pr.number});
+              }
+              await core.summary.addHeading("M1 G1–G3 automated evidence review").addRaw("Read-only evidence triage, not independent correctness/security code approval or formal sign-off. No gate or merge state is changed.").write();
+              for(const s of subjects){
+                const runs=await github.paginate(github.rest.actions.listWorkflowRunsForRepo,{owner,repo,head_sha:s.sha,per_page:100});
+                const rows=[[{data:"Required evidence",header:true},{data:"Result",header:true}]];
+                let ready=true;
+                for(const [path,label,requirements] of specs){
+                  const r=newest(runs,path,s.sha,full,s.events,s.branch);
+                  if(!r){ready=false;rows.push([label,"MISSING exact-revision run"]);continue;}
+                  let ok=r.status==="completed"&&r.conclusion==="success";
+                  let detail=r.status+"/"+(r.conclusion||"pending");
+                  if(ok&&requirements.length){
+                    const jobs=await github.paginate(github.rest.actions.listJobsForWorkflowRun,{owner,repo,run_id:r.id,filter:"latest",per_page:100});
+                    const missing=requirements.filter(([n,steps])=>!verifyJob(jobs,n,steps)).map(([n])=>n);
+                    if(missing.length){ok=false;detail+="; missing/failed required jobs or steps: "+missing.join(", ");}
+                    if(path.endsWith("m1-reliability-integration.yml")&&ok){
+                      const artifacts=await github.paginate(github.rest.actions.listWorkflowRunArtifacts,{owner,repo,run_id:r.id,per_page:100});
+                      const artifact=verifyArtifact(artifacts,"normal-desktop-acceptance-"+s.sha,s.sha,jobs.find(j=>j.name==="normal-desktop-qemu"),r.id);
+                      if(!artifact){ok=false;detail+="; missing/expired/stale desktop artifact";}
+                      else detail+="; artifact "+artifact.id;
+                    }
+                  }
+                  ready=ready&&ok;
+                  rows.push([label,(ok?"PASS: ":"BLOCKED: ")+detail+" (run "+r.id+")"]);
+                }
+                const live=s.number?(await github.rest.pulls.get({owner,repo,pull_number:s.number})).data.head.sha:await getMain();
+                if(live!==s.sha){ready=false;rows.push(["Revision stability","BLOCKED: revision changed during review"]);}
+                await core.summary.addHeading(s.label+" — "+s.sha,2).addTable(rows).addRaw(ready?
+                  "Automated evidence ready for independent code review. This is not gate acceptance.":
+                  "Automated evidence incomplete; do not sign off or merge based on this report.").write();
+              }
+              await core.summary.addHeading("Independent reviewer checklist",2).addTable([
+                [{data:"Gate",header:true},{data:"Required manual correctness/security assessment",header:true}],
+                ["G1","Authenticated Terminal → PID1 → selected HierVfs; named mutation permissions, false ACK prevention, durable reboot readback and GUI state."],
+                ["G2","MBR/GPT mirrors, CRC and identity, bounds/overlap, selected-volume receipts, ATA write failure and unchanged media in read-only recovery."],
+                ["G3","Normal four-service ring3 boot, W^X, authenticated readiness, full retirement, one restart, unready and invalid media recovery, intermittent timeout investigation and durable shutdown."]
+              ]).addRaw("Review actual source/diffs and retained serial/screenshots. Explicit independent review and gate sign-off remain mandatory. Reports never approve PRs, assign coordinator labels, or edit milestones.").write();
+            }
+            await report();

@@ -142,3 +142,20 @@ host mount contract, physical drive identity attestation/physical-media
 testing, G6 crash-atomicity, and G7 general public file ABI are different
 requirements. They must not delay G1/G2 acceptance by generating duplicate
 Terminal or partition APIs.
+
+## Automated G1–G3 evidence triage
+
+The existing `agent-independent-reviewer.yml` runs a separate read-only evidence
+job on its existing schedule (twice hourly), PR events, kernel workflow completion,
+and manual dispatch. It examines current main and relevant same-repository PRs,
+including drafts, checks the latest exact-SHA workflow/job/required-step results,
+and verifies that the retained desktop artifact was created by the successful
+job, not a previous failed attempt. Missing, skipped, stale or expired evidence
+blocks readiness. The Actions job summary lists each required workflow and run ID.
+
+This job is an automated evidence reviewer, **not** an independent code approval.
+It does not submit approvals, label PRs, merge, or modify gate counts. The existing
+bounded legacy approval policy is unchanged. A separate correctness/security
+review and explicit gate sign-off remain mandatory; the G3 intermittent recovery
+timeout also requires investigation. Workflow policy changes themselves require
+independent review before trusted-base activation.
