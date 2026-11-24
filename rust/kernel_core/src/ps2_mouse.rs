@@ -1,7 +1,5 @@
-//! R029 test-only polling PS/2 auxiliary mouse for one BSP, IRQs masked.
-//!
-//! We intentionally do NOT enable an IRQ12 handler or share the keyboard's
-//! interrupt-driven driver. No normal boot touches the PS/2 auxiliary port.
+//! Bounded single-BSP PS/2 mouse. Normal Desktop consumes complete packets
+//! queued by IRQ12; legacy experimental profiles retain their polling path.
 use core::arch::asm;
 const CTRL:u16=0x64;
 const DATA:u16=0x60;
@@ -105,6 +103,8 @@ pub(crate) struct Mouse {
 }
 impl Mouse{
     pub(crate) fn init()->Option<Self>{
+        #[cfg(feature="normal-desktop")]
+        if !crate::input::prepare_desktop_controller(){return None;}
         // Drain AUX firmware leftovers only. Never consume a pending
         // primary keyboard byte just to initialize a test-only mouse.
         // If keyboard output is waiting, leave it intact and abort init.
@@ -115,9 +115,14 @@ impl Mouse{
         let config=read_reply()?;
         if !command(0x60) || !payload((config&!0x22)|0x00){return None;}
         if !mouse_command(0xf6)||!mouse_command(0xf4){return None;}
+        #[cfg(feature="normal-desktop")]
+        if !crate::input::enable_desktop_irqs(){return None;}
         Some(Self{packet:[0;3],received:0,last_left:false})
     }
     pub(crate) fn poll(&mut self)->Option<Packet>{
+        #[cfg(feature="normal-desktop")]
+        {unsafe{(&mut *core::ptr::addr_of_mut!(IRQ_PACKETS)).pop()}}
+        #[cfg(not(feature="normal-desktop"))]
         self.poll_aux_with(||unsafe{input(CTRL)},||unsafe{input(DATA)})
     }
     /// Host-testable AUX ownership: primary keyboard bytes are never read.
@@ -155,11 +160,96 @@ impl Mouse{
         self.last_left=left;
         Some(Packet{dx,dy,left})
     }
-    pub(crate) fn disable(&self){let _=mouse_command(0xf5);}
+    pub(crate) fn disable(&self){
+        #[cfg(feature="normal-desktop")]
+        crate::input::disable_desktop_irqs();
+        let _=mouse_command(0xf5);
+    }
+}
+#[cfg(any(test,feature="normal-desktop"))]
+const PACKET_QUEUE:usize=32;
+#[cfg(any(test,feature="normal-desktop"))]
+struct PacketQueue{
+    packets:[Packet;PACKET_QUEUE],read:usize,write:usize,quarantined:bool,
+}
+#[cfg(any(test,feature="normal-desktop"))]
+impl PacketQueue{
+    const RELEASE:Packet=Packet{dx:0,dy:0,left:false};
+    const fn new()->Self{Self{packets:[Self::RELEASE;PACKET_QUEUE],read:0,write:0,quarantined:false}}
+    fn lost(&mut self){
+        self.packets.fill(Self::RELEASE);self.read=0;self.write=1;self.quarantined=true;
+    }
+    fn push(&mut self,packet:Packet){
+        if self.quarantined{
+            if packet.left{return;}
+            self.quarantined=false;
+            // lost() already queued a cancellation release. Do not replay
+            // motion or held button transitions from the discarded stream.
+            return;
+        }
+        let next=(self.write+1)%PACKET_QUEUE;
+        if next==self.read{self.lost();self.quarantined=packet.left;return;}
+        self.packets[self.write]=packet;self.write=next;
+    }
+    fn pop(&mut self)->Option<Packet>{
+        if self.read==self.write{return None;}
+        let packet=self.packets[self.read];self.packets[self.read]=Self::RELEASE;
+        self.read=(self.read+1)%PACKET_QUEUE;Some(packet)
+    }
+}
+#[cfg(feature="normal-desktop")]
+static mut IRQ_PACKETS:PacketQueue=PacketQueue::new();
+#[cfg(feature="normal-desktop")]
+static mut IRQ_DECODER:Mouse=Mouse{packet:[0;3],received:0,last_left:false};
+/// Called only with IF=0 on the BSP, before admission or after retirement.
+#[cfg(feature="normal-desktop")]
+pub(crate) fn reset_irq_session(){unsafe{
+    IRQ_PACKETS=PacketQueue::new();IRQ_DECODER=Mouse{packet:[0;3],received:0,last_left:false};
+}}
+#[cfg(feature="normal-desktop")]
+pub(crate) fn irq_transfer(status:u8,byte:u8)->bool{unsafe{
+    let decoder=&mut *core::ptr::addr_of_mut!(IRQ_DECODER);
+    let queue=&mut *core::ptr::addr_of_mut!(IRQ_PACKETS);
+    feed_irq_transfer(decoder,queue,status,byte)
+}}
+#[cfg(any(test,feature="normal-desktop"))]
+fn feed_irq_transfer(decoder:&mut Mouse,queue:&mut PacketQueue,status:u8,byte:u8)->bool{
+    if !valid_mouse_status(status){
+        *decoder=Mouse{packet:[0;3],received:0,last_left:false};queue.lost();return false;
+    }
+    let overflowing=decoder.received==2&&decoder.packet[0]&0xc0!=0;
+    if let Some(packet)=decoder.feed(byte){queue.push(packet);true}
+    else{if overflowing{queue.lost();}false}
 }
 #[cfg(test)]
 mod tests{
     use super::*;
+    #[test]fn irq_packets_preserve_press_release_and_overflow_cancels_capture(){
+        let mut queue=PacketQueue::new();
+        let press=Packet{dx:1,dy:-2,left:true};let release=Packet{dx:3,dy:4,left:false};
+        queue.push(press);queue.push(release);
+        assert_eq!(queue.pop(),Some(press));assert_eq!(queue.pop(),Some(release));
+        assert_eq!(queue.pop(),None);
+        for _ in 0..PACKET_QUEUE{queue.push(press);}
+        assert_eq!(queue.pop(),Some(PacketQueue::RELEASE));assert_eq!(queue.pop(),None);
+        queue.push(press);assert_eq!(queue.pop(),None);
+        queue.push(release);assert_eq!(queue.pop(),None);
+        queue.push(press);assert_eq!(queue.pop(),Some(press));
+    }
+    #[test]fn irq_lost_transfer_discards_queued_motion_and_waits_for_physical_release(){
+        let mut queue=PacketQueue::new();
+        let mut decoder=Mouse{packet:[0;3],received:0,last_left:false};
+        let held=Packet{dx:255,dy:-255,left:true};
+        queue.push(held);
+        assert!(!feed_irq_transfer(&mut decoder,&mut queue,0x21,0x09));
+        assert!(!feed_irq_transfer(&mut decoder,&mut queue,0x61,0xff));
+        assert_eq!(decoder.received,0);assert_eq!(decoder.packet,[0;3]);
+        queue.push(held);
+        assert_eq!(queue.pop(),Some(PacketQueue::RELEASE));assert_eq!(queue.pop(),None);
+        queue.push(held);assert_eq!(queue.pop(),None);
+        queue.push(PacketQueue::RELEASE);queue.push(held);
+        assert_eq!(queue.pop(),Some(held));
+    }
     #[test]fn g8_aux_drain_never_steals_keyboard_or_trusts_unbounded_firmware(){
         use core::cell::Cell;
         let consumed=Cell::new(0usize);

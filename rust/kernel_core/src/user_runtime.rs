@@ -619,7 +619,13 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
  let img=active_image();
  if img.is_null()||regs.is_null(){return BAD;}
  let r=unsafe{&*(regs as *const [u64; WORDS])};
- if !ring3_frame_valid(r,unsafe{&(*img).plan},USER_INTERRUPTS_ENABLED){return BAD;}
+ if !ring3_frame_valid(r,unsafe{&(*img).plan},USER_INTERRUPTS_ENABLED){
+  #[cfg(feature="normal-desktop")]
+  if r[14]==33&&r[9]==36{
+   fault_hex(b"IndianOS: Files unlock rejected CPU frame RFLAGS=0x\0",r[17]);
+  }
+  return BAD;
+ }
  // SYS_EXIT and SYS_WRITE must originate from a mapped user executable
  // instruction, not a writable or supervisor-only page.
  let mut source=Mapping{
@@ -643,7 +649,13 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
    return BAD;
   }
  }
- if !unsafe{indianos_syscall_validate(ptr::addr_of!((*img).plan),request)}{return BAD;}
+ if !unsafe{indianos_syscall_validate(ptr::addr_of!((*img).plan),request)}{
+  #[cfg(feature="normal-desktop")]
+  if request.number==33&&request.arg0==36{
+   log(b"IndianOS: Files unlock rejected syscall descriptor range\n\0");
+  }
+  return BAD;
+ }
  #[cfg(feature="normal-desktop")]
  if !unsafe{DESKTOP_LIFECYCLE}.allows_storage_request(request.number,request.arg0){
   // The single BSP cannot interleave this check with ARM_SHUTDOWN. Once
@@ -1142,19 +1154,25 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
   },
   #[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
   33=>{
+   let reject=|stage:&'static [u8]|->u64{
+    #[cfg(feature="normal-desktop")]
+    if request.arg0==36{log(stage);}
+    let _=stage;
+    BAD
+   };
    // Serialize real GUI-profile filesystem access with the same privileged
    // admission permit as generation-owned UDP and scheduler retirement.
    // A nested IRQ/core cannot remount or use a half-retired owner.
    #[cfg(any(feature="test-r031-files-gui",feature="normal-desktop"))]
-   let Ok(_filesystem_permit)=r120_enter()else{return BAD;};
-   let Some(owner)=authenticated_file_identity()else{return BAD;};
+   let Ok(_filesystem_permit)=r120_enter()else{return reject(b"IndianOS: Files unlock retirement permit rejected\n\0");};
+   let Some(owner)=authenticated_file_identity()else{return reject(b"IndianOS: Files unlock owner rejected\n\0");};
    // Descriptor: path[24], opaque handle u64, argument u64,
    // pointer u64, length u64, reserved u64. Never dereference an
    // untrusted ring3 pointer outside validated copy helpers.
    let mut desc=[0u8;64];
    if !unsafe{indianos_user_copy_readonly(img,request.arg1,
-                desc.as_mut_ptr().cast(),desc.len())}{return BAD;}
-   if desc[56..64].iter().any(|&b|b!=0){return BAD;}
+                desc.as_mut_ptr().cast(),desc.len())}{return reject(b"IndianOS: Files unlock descriptor copy rejected\n\0");}
+   if desc[56..64].iter().any(|&b|b!=0){return reject(b"IndianOS: Files unlock reserved bytes rejected\n\0");}
    let handle=u64::from_le_bytes(desc[24..32].try_into().unwrap());
    let argument=u64::from_le_bytes(desc[32..40].try_into().unwrap());
    let address=u64::from_le_bytes(desc[40..48].try_into().unwrap());
@@ -1166,7 +1184,7 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
     let Ok(s)=core::str::from_utf8(&desc[..end])else{return BAD;};
     s
    }else{
-    if desc[..24].iter().any(|&b|b!=0){return BAD;}
+    if desc[..24].iter().any(|&b|b!=0){return reject(b"IndianOS: Files unlock nonempty path rejected\n\0");}
     ""
    };
    // Validate every byte of requested writable destination before
@@ -1183,10 +1201,10 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
                     img,address,data.as_mut_ptr().cast(),n)}{return BAD;}
     n
    }else{
-    if address!=0||length!=0{return BAD;}
+    if address!=0||length!=0{return reject(b"IndianOS: Files unlock unexpected payload rejected\n\0");}
     0
    };
-   if matches!(request.arg0,2|3|5|36|37) && argument!=0{return BAD;}
+   if matches!(request.arg0,2|3|5|36|37) && argument!=0{return reject(b"IndianOS: Files unlock nonzero argument rejected\n\0");}
    if request.arg0==37&&handle!=0{return BAD;}
    if request.arg0==38&&argument>0o777{return BAD;}
    if matches!(request.arg0,4|6) && argument>crate::durablefs::MAX_FILE_BYTES as u64{
@@ -1207,7 +1225,22 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
     crate::fs_handles::operation_authenticated(handles,request.arg0,owner,
            handle,argument,path,&mut data[..size])
    };
-   let Ok(n)=res else{return BAD;};
+   let n=match res{
+    Ok(n)=>n,
+    Err(error)=>{
+     #[cfg(feature="normal-desktop")]
+     if request.arg0==36{
+      use crate::durablefs::FsError;
+      log(match error{
+       FsError::InvalidName=>b"IndianOS: Files unlock handle or namespace rejected\n\0",
+       FsError::InvalidVolume=>b"IndianOS: Files unlock volume rejected\n\0",
+       _=>b"IndianOS: Files unlock file service rejected\n\0",
+      });
+     }
+     let _=error;
+     return BAD;
+    }
+   };
    if request.arg0==2 && n>0{
     if n>size as u64|| !unsafe{indianos_user_copy_writable(
           &*img,address,data.as_ptr(),n as usize)}{return BAD;}
@@ -1516,6 +1549,20 @@ fn trap_mapped(b:&CloneBackend,original:u64,clone:u64)->bool{
  let mut trap=[0u64;5];
  if !unsafe{x86_64_user_trap_mapping_addresses(trap.as_mut_ptr())}{return false;}
  let mapped=trap.iter().all(|&p|kernel_mapped(b,original,clone,p));
+ #[cfg(all(feature="normal-desktop",not(test)))]
+ let mapped=mapped&&{
+  unsafe extern "C" {
+   fn x86_64_keyboard_interrupt();
+   fn x86_64_mouse_interrupt();
+  }
+  // Input interrupts can now arrive in every native service's CR3. Require
+  // the installed entry/dispatch code to retain its source-owned mapping.
+  [x86_64_keyboard_interrupt as *const () as u64,
+   x86_64_mouse_interrupt as *const () as u64,
+   crate::input::x86_64_keyboard_irq_dispatch as *const () as u64,
+   crate::input::x86_64_mouse_irq_dispatch as *const () as u64]
+   .iter().all(|&address|kernel_mapped(b,original,clone,address))
+ };
  #[cfg(feature="normal-desktop")]
  {mapped&&kernel_stack_guards_valid(b,original)&&kernel_stack_guards_valid(b,clone)&&
     desktop_surface_guards_valid(b,original)&&desktop_surface_guards_valid(b,clone)&&

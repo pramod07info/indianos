@@ -23,6 +23,8 @@ mod terminal_broker;
 mod desktop_window;
 #[cfg(feature="desktop-init")]
 mod desktop_startup;
+#[cfg(feature="desktop-files")]
+mod files_read_lease;
 #[cfg(any(feature="desktop-files",feature="desktop-terminal"))]
 #[path="../../../rust/kernel_core/src/gui_protocol.rs"]
 mod gui_protocol;
@@ -828,13 +830,22 @@ fn files_shared_content(data:&mut [u8;256])->usize{
         let abi=file_handle_call(37,b"",0,0,data,0);
         if abi&0xffff!=1||(abi>>16)&0xffff!=64||(abi>>32)&3!=3{exit(254);}
         if file_handle_call(34,b"",token,0,data,0)!=0||
-           file_handle_call(35,b"",token,0,data,0)!=u64::MAX||
-           file_handle_call(36,b"",token,0,data,0)!=0{exit(254);}
-        write(b"desktop Files verified filesystem ABI and owned range-lock lifecycle");
+           file_handle_call(35,b"",token,0,data,0)!=u64::MAX{exit(254);}
         if (abi>>32)&4==0||file_handle_call(38,b"",token,0o777,data,0)!=u64::MAX{exit(254);}
         write(b"desktop Files denied unauthorized permission mutation");
     }
     let count=file_handle_call(2,b"",token,0,data,72);
+    #[cfg(feature="desktop-files")]
+    {
+        // Keep the shared lease through the real content read, rather than
+        // testing lock acquisition and dropping it before protected I/O.
+        if file_handle_call(36,b"",token,0,data,0)!=0{
+            write(if count==u64::MAX{b"desktop Files content read failed before unlock"}
+                  else{b"desktop Files content read succeeded but unlock failed"});
+            exit(254);
+        }
+        write(b"desktop Files verified filesystem ABI and owned range-lock lifecycle");
+    }
     if file_handle_call(5,b"",token,0,data,0)!=0{exit(203);}
     #[cfg(feature="desktop-files")]
     if count==0{data[..10].copy_from_slice(b"EMPTY FILE");return 10;}
@@ -847,6 +858,74 @@ fn files_shared_content(data:&mut [u8;256])->usize{
         b"R031.9 Files displayed FILE UPDATED from persistent volume"
     }else{b"R051 Files rendered persisted Terminal content"});
     count as usize
+}
+#[cfg(feature="desktop-files")]
+static mut FILES_READ_LEASE:files_read_lease::ReadLease=files_read_lease::ReadLease::new();
+#[cfg(feature="desktop-files")]
+fn files_read_lease_status(operation:u32){
+    let lease=unsafe{FILES_READ_LEASE};let held=lease.held();
+    r029_draw(&r029_command(1,operation,18,211,240,14,0x00ffffff,
+        if held{b"READ LOCKED"}else{b"UNLOCKED"}));
+}
+#[cfg(feature="desktop-files")]
+fn files_close_read_lease(token:u64)->bool{
+    let mut data=[0u8;256];
+    let unlocked=file_handle_call(36,b"",token,0,&mut data,0)==0;
+    // CLOSE uses the cached capability path: it must not need a live disk.
+    let closed=file_handle_call(5,b"",token,0,&mut data,0)==0;
+    unlocked&&closed
+}
+#[cfg(feature="desktop-files")]
+fn files_acquire_read_lease()->bool{
+    let current=unsafe{FILES_READ_LEASE};
+    if current.held(){return false;}
+    let mut data=[0u8;256];
+    if !files_read_lease::ReadLease::supports_abi(
+        file_handle_call(37,b"",0,0,&mut data,0)){return false;}
+    let token=file_handle_call(1,b"/shared/readme",0,1,&mut data,0);
+    if token==0||token==u64::MAX{return false;}
+    if file_handle_call(34,b"",token,0,&mut data,0)!=0{
+        let _=file_handle_call(5,b"",token,0,&mut data,0);return false;
+    }
+    let length=file_handle_call(2,b"",token,0,&mut data,72);
+    let mut lease=files_read_lease::ReadLease::new();
+    if length>20||!lease.capture(token,&data[..length as usize]){
+        let _=files_close_read_lease(token);return false;
+    }
+    unsafe{FILES_READ_LEASE=lease;}
+    write(b"desktop Files read lease acquired");true
+}
+#[cfg(feature="desktop-files")]
+fn files_release_read_lease()->bool{
+    let token=files_take_read_lease();
+    if token==0{return false;}
+    let released=files_close_read_lease(token);
+    if released{write(b"desktop Files read lease released");}
+    else{write(b"desktop Files read lease authority lost");}
+    released
+}
+#[cfg(feature="desktop-files")]
+fn files_take_read_lease()->u64{
+    let mut lease=unsafe{FILES_READ_LEASE};let token=lease.clear();
+    unsafe{FILES_READ_LEASE=lease;}token
+}
+#[cfg(feature="desktop-files")]
+fn files_verify_read_lease()->bool{
+    let lease=unsafe{FILES_READ_LEASE};
+    if !lease.held(){return true;}
+    let mut data=[0u8;256];
+    let token=lease.token();
+    let read=if file_handle_call(4,b"",token,0,&mut data,0)==0{
+        file_handle_call(2,b"",token,0,&mut data,72)
+    }else{u64::MAX};
+    if read<=20&&lease.verifies(token,&data[..read as usize]){
+        write(b"desktop Files retained read lease verified after refresh");true
+    }else{
+        let _=files_take_read_lease();
+        let _=files_close_read_lease(token);
+        files_read_lease_status(3);
+        write(b"desktop Files read lease authority lost");false
+    }
 }
 #[cfg(feature="desktop-files")]
 fn files_directory_field(data:&[u8],operation:u32){
@@ -870,6 +949,8 @@ fn files_gui_initial(){
     #[cfg(not(feature="desktop-files"))]let _=listing;
     let len=files_shared_content(&mut data);
     r029_draw(&r029_command(1,2,18,190,240,14,0x00ffffff,&data[..len]));
+    #[cfg(feature="desktop-files")]
+    files_read_lease_status(2);
     write(b"R031.9 real file and directory contents rendered into Files window");
 }
 #[cfg(any(feature="r031-files-app",feature="desktop-files"))]
@@ -1119,7 +1200,11 @@ fn terminal_service(){
                         let size=terminal_receive(1,&mut response);
                         match &response[8..8+size]{
                             b"O"=>terminal_field(b"SAVED"),
-                            b"E"=>terminal_field(b"IO ERROR"),
+                            b"E"=>{
+                                terminal_field(b"IO ERROR");
+                                #[cfg(feature="desktop-terminal")]
+                                write(b"desktop Terminal filesystem request failed");
+                            },
                             data if (1..=21).contains(&data.len())&&data[0]==b'L'&&
                                 data[1..].iter().all(|b|(0x20..=0x7e).contains(b))=>{
                                 terminal_field(if data.len()==1{b"EMPTY DIRECTORY"}else{&data[1..]});
@@ -1399,6 +1484,19 @@ fn r031_shell()->!{
             continue;
         }
         match byte[0]{
+            #[cfg(feature="desktop-init")]
+            key @ (b'l'|b'u') if front==1=>{
+                suite_send(2,if key==b'l'{b"HOLD"}else{b"RELEASE"});
+                let mut response=[0u8;72];let n=terminal_receive(2,&mut response);
+                match &response[8..8+n]{
+                    b"LOCKED" if key==b'l'=>{},
+                    b"RELEASED" if key==b'u'=>{},
+                    b"LEASEERR"=>write(b"desktop Files read lease request denied"),
+                    _=>exit(255),
+                }
+                if desktop_present(1)!=0{exit(216);}
+                write(b"desktop Files read lease control acknowledged");
+            }
             b'a'=>{
                 if desktop_key(b'a')!=0{exit(176);}
                 launcher=!launcher;
@@ -1433,7 +1531,12 @@ fn r031_shell()->!{
             b'f'=>{
                 let mut data=[0u8;256];
                 data[..12].copy_from_slice(b"FILE UPDATED");
-                if vfs_call(5,b"/shared/readme",b"",&mut data,12)!=0{exit(211);}
+                if vfs_call(5,b"/shared/readme",b"",&mut data,12)!=0{
+                    #[cfg(feature="desktop-init")]
+                    {write(b"desktop Files update refused by file service");continue;}
+                    #[cfg(not(feature="desktop-init"))]
+                    exit(211);
+                }
                 suite_send(2,b"REFRESH");
                 yield_now();
                 suite_receive(2,b"UPDATED");
@@ -1545,10 +1648,30 @@ fn r031_files()->!{
             if n!=len as u64+8 {exit(214);}
             match &response[8..8+len]{
                 b"REFRESH"=>{
+                    #[cfg(feature="desktop-files")]
+                    if !files_verify_read_lease(){
+                        suite_send(1,b"LEASELOST");continue;
+                    }
                     files_gui_refresh();
                     suite_send(1,b"UPDATED");
                 }
-                b"EXIT"=>break,
+                #[cfg(feature="desktop-files")]
+                b"HOLD"=>{
+                    let acquired=files_acquire_read_lease();
+                    files_read_lease_status(3);
+                    suite_send(1,if acquired{b"LOCKED"}else{b"LEASEERR"});
+                }
+                #[cfg(feature="desktop-files")]
+                b"RELEASE"=>{
+                    let released=files_release_read_lease();
+                    files_read_lease_status(3);
+                    suite_send(1,if released{b"RELEASED"}else{b"LEASEERR"});
+                }
+                b"EXIT"=>{
+                    #[cfg(feature="desktop-files")]
+                    {let _=files_release_read_lease();}
+                    break;
+                },
                 _=>exit(215),
             }
         }

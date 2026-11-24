@@ -221,6 +221,10 @@ impl AtaPio {
         let error=if status&BSY==0 {unsafe{inb(ERROR)}} else {0xff};
         describe_failure(self.last_stage,status,error)
     }
+    // Keep the real task-file command boundary identifiable in native fault
+    // traces and external debugger inspections; no test mode changes I/O.
+    #[inline(never)]
+    #[export_name="indianos_ata_select_command"]
     fn select(&mut self,lba:u64,command:u8)->Result<(),BlockError>{
         validate_lba28_request(self.sectors,lba)?;
         // A preceding PIO read may have deasserted BSY before its final

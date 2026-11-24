@@ -132,8 +132,12 @@ unsafe extern "C" {
     fn x86_64_apic_timer_interrupt();
     #[cfg(all(feature="preempt",feature="user-runtime",feature="timer"))]
     fn x86_64_apic_spurious_interrupt();
-    #[cfg(feature="test-irq-keyboard")]
+    #[cfg(any(feature="test-irq-keyboard",feature="normal-desktop"))]
     fn x86_64_keyboard_interrupt();
+    #[cfg(feature="normal-desktop")]
+    fn x86_64_mouse_interrupt();
+    #[cfg(feature="normal-desktop")]
+    fn x86_64_input_spurious_interrupt();
     fn x86_64_user_fault_handle(vector:u64,cs:u64,error:u64,cr2:u64);
     fn serial_write(message:*const c_char);
 }
@@ -179,8 +183,12 @@ pub unsafe extern "C" fn x86_64_exceptions_init()->bool{
             install_gate(i,handler,if i==8 {1} else {0},INTERRUPT_GATE);
         }
         install_gate(0x80,x86_64_user_interrupt as usize,0,USER_GATE);
-        #[cfg(feature="test-irq-keyboard")]
+        #[cfg(any(feature="test-irq-keyboard",feature="normal-desktop"))]
         install_gate(0x21,x86_64_keyboard_interrupt as usize,0,INTERRUPT_GATE);
+        #[cfg(feature="normal-desktop")]
+        install_gate(0x2c,x86_64_mouse_interrupt as usize,0,INTERRUPT_GATE);
+        #[cfg(feature="normal-desktop")]
+        install_gate(0xff,x86_64_input_spurious_interrupt as usize,0,INTERRUPT_GATE);
         #[cfg(feature="preempt")]
         install_gate(0x20,x86_64_timer_interrupt as usize,0,INTERRUPT_GATE);
         #[cfg(all(feature="preempt",feature="user-runtime",feature="timer"))]

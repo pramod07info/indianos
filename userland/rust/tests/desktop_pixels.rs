@@ -4,6 +4,8 @@ mod gui_protocol;
 mod pixel_protocol;
 #[path="../src/desktop_pixels.rs"]
 mod raster;
+#[path="../src/files_read_lease.rs"]
+mod files_read_lease;
 use raster::State;
 use gui_protocol::{FILL,TEXT,REPLACE_TEXT};
 fn command(window:u32,operation:u32,x:u16,y:u16,w:u16,h:u16,color:u32,text:&[u8])->[u8;64]{
