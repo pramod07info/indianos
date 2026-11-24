@@ -190,7 +190,7 @@ pub fn check_range(capacity: u64, start: u64, count: u64) -> Result<(), BlockErr
 
 /// A driver that provides a generation token must retain the SAME media
 /// through a complete transfer; unchanged sector count alone is insufficient.
-fn media_snapshot_matches<D:BlockDevice>(device:&D,
+pub(crate) fn media_snapshot_matches<D:BlockDevice>(device:&D,
     capacity:u64,generation:Option<u64>)->bool{
     // Double-observe to reject a provider whose geometry or generation
     // changes while its identity is being validated.

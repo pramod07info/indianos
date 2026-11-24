@@ -4,7 +4,7 @@
 //! No untrusted byte is interpreted as an escape sequence.
 use core::arch::asm;
 use core::sync::atomic::{AtomicU64,Ordering};
-#[cfg(feature="test-irq-keyboard")]
+#[cfg(any(feature="test-irq-keyboard",feature="normal-desktop"))]
 unsafe extern "C" {fn serial_write(message:*const core::ffi::c_char);}
 
 #[inline(always)]
@@ -163,10 +163,13 @@ impl PhysicalDecoder{
 static mut PHYSICAL:PhysicalDecoder=PhysicalDecoder::new();
 /// Start a fresh trusted desktop input session with IF=0 on the single BSP.
 /// Discard software input from the old service without consuming AUX data or
-/// changing interrupt/controller configuration. Physical provenance stays live.
+/// changing AUX configuration. Normal Desktop first masks both input IRQs.
+/// Physical provenance stays live.
 pub(crate) fn reset_physical_session(){
+    #[cfg(feature="normal-desktop")]
+    disable_desktop_irqs();
     unsafe{PHYSICAL=PhysicalDecoder::new();}
-    #[cfg(feature="test-irq-keyboard")]
+    #[cfg(any(feature="test-irq-keyboard",feature="normal-desktop"))]
     unsafe{QUEUE=KeyboardQueue::new();}
 }
 /// Counts physical bytes AFTER a valid 8042 keyboard make-code has been
@@ -202,11 +205,11 @@ fn valid_keyboard_status(status:u8)->bool{
 fn lost_keyboard_transfer(status:u8,code:u8)->bool{
     status&0x21==0x01&&(!valid_keyboard_status(status)||matches!(code,0x00|0xff))
 }
-#[cfg(any(test,feature="test-irq-keyboard"))]
+#[cfg(any(test,feature="test-irq-keyboard",feature="normal-desktop"))]
 const QUEUE_SIZE:usize=128;
-#[cfg(any(test,feature="test-irq-keyboard"))]
+#[cfg(any(test,feature="test-irq-keyboard",feature="normal-desktop"))]
 struct KeyboardQueue{bytes:[u8;QUEUE_SIZE],read:usize,write:usize,quarantined:bool}
-#[cfg(any(test,feature="test-irq-keyboard"))]
+#[cfg(any(test,feature="test-irq-keyboard",feature="normal-desktop"))]
 impl KeyboardQueue{
     const fn new()->Self{Self{bytes:[0;QUEUE_SIZE],read:0,write:0,quarantined:false}}
     fn push(&mut self,byte:u8){
@@ -233,35 +236,35 @@ impl KeyboardQueue{
         self.read=(self.read+1)%QUEUE_SIZE;Some(byte)
     }
 }
-#[cfg(feature="test-irq-keyboard")]
+#[cfg(any(feature="test-irq-keyboard",feature="normal-desktop"))]
 static mut QUEUE:KeyboardQueue=KeyboardQueue::new();
-#[cfg(feature="test-irq-keyboard")]
+#[cfg(any(feature="test-irq-keyboard",feature="normal-desktop"))]
 static IRQ_EVENTS:AtomicU64=AtomicU64::new(0);
-#[cfg(feature="test-irq-keyboard")]
+#[cfg(any(feature="test-irq-keyboard",feature="normal-desktop"))]
 static mut IRQ_ACTIVE:bool=false;
-#[cfg(feature="test-irq-keyboard")]
+#[cfg(any(feature="test-irq-keyboard",feature="normal-desktop"))]
 static mut REPORTED_PS2_PENDING:bool=false;
 
 /// Caller runs with IF=0 (IDT interrupt gate, single BSP). Queue producer
 /// is IRQ1, queue consumer is the READ syscall's synchronous trap handler.
-#[cfg(feature="test-irq-keyboard")]
+#[cfg(any(feature="test-irq-keyboard",feature="normal-desktop"))]
 fn enqueue(ch:u8) {
     unsafe{(&mut *core::ptr::addr_of_mut!(QUEUE)).push(ch);}
 }
-#[cfg(feature="test-irq-keyboard")]
+#[cfg(any(feature="test-irq-keyboard",feature="normal-desktop"))]
 fn dequeue()->Option<u8>{
     unsafe{(&mut *core::ptr::addr_of_mut!(QUEUE)).pop()}
 }
-#[cfg(feature="test-irq-keyboard")]
+#[cfg(any(feature="test-irq-keyboard",feature="normal-desktop"))]
 fn io_wait(){unsafe{outb(0x80,0)}}
-#[cfg(feature="test-irq-keyboard")]
+#[cfg(any(feature="test-irq-keyboard",feature="normal-desktop"))]
 fn wait_input()->bool{
     for _ in 0..100_000{
         if unsafe{inb(PS2_STATUS)}&2==0{return true;}
     }
     false
 }
-#[cfg(feature="test-irq-keyboard")]
+#[cfg(any(feature="test-irq-keyboard",feature="normal-desktop"))]
 fn wait_output()->Option<u8>{
     for _ in 0..100_000{
         if unsafe{inb(PS2_STATUS)}&1!=0{
@@ -274,7 +277,7 @@ fn wait_output()->Option<u8>{
 // HHDM need not map reserved device memory (0xFEE00000), so directly
 // dereferencing APIC_BASE + HHDM can fault. Page-table frames themselves
 // are ordinary PMM RAM and are reachable through the HHDM.
-#[cfg(feature="test-irq-keyboard")]
+#[cfg(any(feature="test-irq-keyboard",feature="normal-desktop"))]
 unsafe fn map_local_apic(physical:u64)->Option<*mut u32>{
     const MASK:u64=0x000f_ffff_ffff_f000;
     const VA:u64=0xffff_fe00_0000_0000;
@@ -316,7 +319,7 @@ unsafe fn map_local_apic(physical:u64)->Option<*mut u32>{
 }
 /// Legacy PIC/PS2 initialization is opt-in, uniprocessor and must occur
 /// after IDT 0x21 is ready, with IF masked. Other PIC IRQs stay masked.
-#[cfg(feature="test-irq-keyboard")]
+#[cfg(any(feature="test-irq-keyboard",feature="normal-desktop"))]
 pub(crate) fn enable_irq1()->bool{
     // The PIC-only QEMU CPU profile has no IA32_APIC_BASE MSR; probing
     // the APIC CPUID bit avoids #GP from unconditional RDMSR.
@@ -335,7 +338,18 @@ pub(crate) fn enable_irq1()->bool{
             let Some(apic)=(unsafe{map_local_apic(base)})else{return false;};
             unsafe{
                 let svr=core::ptr::read_volatile(apic.add(0xf0/4));
+                let svr=if cfg!(feature="normal-desktop"){(svr&!0xff)|0xff}else{svr};
                 core::ptr::write_volatile(apic.add(0xf0/4),svr|0x100);
+                #[cfg(feature="normal-desktop")]
+                {
+                    let max_lvt=(core::ptr::read_volatile(apic.add(0x30/4))>>16)&0xff;
+                    for (index,register) in [(0u32,0x320),(1,0x330),(2,0x340),(4,0x360),(5,0x370)]{
+                        if index<=max_lvt{
+                            let value=core::ptr::read_volatile(apic.add(register/4));
+                            core::ptr::write_volatile(apic.add(register/4),value|(1<<16));
+                        }
+                    }
+                }
                 // LINT0 ExtINT, physical destination, unmasked.
                 core::ptr::write_volatile(apic.add(0x350/4),0x700);
             }
@@ -346,16 +360,24 @@ pub(crate) fn enable_irq1()->bool{
         outb(0x21,0x20);io_wait();outb(0xa1,0x28);io_wait();
         outb(0x21,0x04);io_wait();outb(0xa1,0x02);io_wait();
         outb(0x21,0x01);io_wait();outb(0xa1,0x01);io_wait();
-        outb(0x21,0xfd);outb(0xa1,0xff);
+        let (master,slave)=pic_input_masks(cfg!(feature="normal-desktop"));
+        outb(0x21,master);outb(0xa1,slave);
         // Complete any stale in-service state carried across firmware boot.
         // During single-core setup IF is disabled; no handler is active.
-        for _ in 0..8{outb(0x20,0x20);io_wait();}
+        for _ in 0..8{outb(0xa0,0x20);outb(0x20,0x20);io_wait();}
         outb(0x22,0x70);io_wait();outb(0x23,0);io_wait();
     }
     // Firmware may leave an unread scan code. If a stale byte holds OBF
     // high, later QEMU sendkey events cannot assert a new IRQ1 edge.
     // Disable port 1 before reading the controller configuration.
     if !wait_input(){return false;}
+    #[cfg(feature="normal-desktop")]
+    {
+        // F4 was acknowledged before IRQ arming. Pause AUX clock while the
+        // controller command-byte reply uses the same shared output port.
+        unsafe{outb(PS2_STATUS,0xa7);}
+        if !wait_input(){return false;}
+    }
     unsafe{outb(PS2_STATUS,0xad);}
     for _ in 0..32 {
         if unsafe{inb(PS2_STATUS)}&1==0{break;}
@@ -368,7 +390,8 @@ pub(crate) fn enable_irq1()->bool{
     unsafe{outb(PS2_STATUS,0x60);}
     if !wait_input(){return false;}
     // IRQ1 on, translation to set-1 on, PS/2 port 1 clock enabled.
-    unsafe{outb(PS2_DATA,(conf|0x41)&!0x10);}
+    let config=if cfg!(feature="normal-desktop"){(conf|0x43)&!0x30}else{(conf|0x41)&!0x10};
+    unsafe{outb(PS2_DATA,config);}
     if !wait_input(){return false;}
     unsafe{outb(PS2_STATUS,0xae);}
     if !wait_input(){return false;}
@@ -382,15 +405,22 @@ pub(crate) fn enable_irq1()->bool{
     IRQ_EVENTS.store(0,Ordering::Relaxed);
     true
 }
-#[cfg(feature="test-irq-keyboard")]
+#[cfg(any(feature="test-irq-keyboard",feature="normal-desktop"))]
 pub(crate) fn irq_count()->u64{IRQ_EVENTS.load(Ordering::Relaxed)}
-#[cfg(feature="test-irq-keyboard")]
+#[cfg(any(feature="test-irq-keyboard",feature="normal-desktop"))]
 #[no_mangle]
 pub extern "C" fn x86_64_keyboard_irq_dispatch(){
     let before=IRQ_EVENTS.fetch_add(1,Ordering::Relaxed);
     if before==0 {
-        unsafe {serial_write(b"IndianOS: R014.2 IRQ1 first interrupt delivered\n\0".as_ptr().cast());}
+        let message:&[u8]=if cfg!(feature="normal-desktop"){
+            b"IndianOS: G5 normal IRQ1 delivered\n\0"
+        }else{b"IndianOS: R014.2 IRQ1 first interrupt delivered\n\0"};
+        unsafe {serial_write(message.as_ptr().cast());}
     }
+    #[cfg(feature="normal-desktop")]
+    drain_desktop_controller();
+    #[cfg(not(feature="normal-desktop"))]
+    {
     let status=unsafe{inb(PS2_STATUS)};
     if status&1!=0&&status&0x20==0 {
         let code=unsafe{inb(PS2_DATA)};
@@ -398,7 +428,86 @@ pub extern "C" fn x86_64_keyboard_irq_dispatch(){
             enqueue(ch);
         }
     }
+    }
     unsafe{outb(0x20,0x20);} // specific master PIC EOI
+}
+/// Only keyboard IRQ1, slave cascade IRQ2 and mouse IRQ12 are admitted.
+#[cfg(any(test,feature="test-irq-keyboard",feature="normal-desktop"))]
+fn pic_input_masks(mouse:bool)->(u8,u8){if mouse{(0xf9,0xef)}else{(0xfd,0xff)}}
+#[cfg(feature="normal-desktop")]
+pub(crate) fn enable_desktop_irqs()->bool{
+    crate::ps2_mouse::reset_irq_session();
+    MOUSE_IRQ_EVENTS.store(0,Ordering::Relaxed);
+    KEY_IRQ_BYTES.store(0,Ordering::Relaxed);MOUSE_IRQ_PACKETS.store(0,Ordering::Relaxed);
+    if !enable_irq1(){disable_desktop_irqs();return false;}
+    true
+}
+/// Caller holds IF=0. Recovery must never leave input IRQs targeting retired
+/// service state, or let the polling controller command path race an ISR.
+#[cfg(feature="normal-desktop")]
+pub(crate) fn disable_desktop_irqs(){
+    unsafe{outb(0x21,0xff);outb(0xa1,0xff);IRQ_ACTIVE=false;QUEUE=KeyboardQueue::new();}
+    crate::ps2_mouse::reset_irq_session();
+}
+#[cfg(feature="normal-desktop")]
+pub(crate) fn prepare_desktop_controller()->bool{
+    disable_desktop_irqs();
+    // Quiesce both device clocks before discarding the retired incarnation's
+    // bytes. No live process owns input yet; recovery cannot splice a stale
+    // modifier break, mouse press or command suffix into a replacement app.
+    for command in [0xadu8,0xa7]{
+        if !wait_input(){return false;}
+        unsafe{outb(PS2_STATUS,command);}
+    }
+    if !wait_input(){return false;}
+    for _ in 0..64{
+        if unsafe{inb(PS2_STATUS)}&1==0{return true;}
+        let _=unsafe{inb(PS2_DATA)};
+    }
+    (unsafe{inb(PS2_STATUS)})&1==0
+}
+#[cfg(feature="normal-desktop")]
+fn drain_desktop_controller(){
+    // IRQ1/12 share the controller's one output register. Route by AUX status
+    // rather than assuming the interrupt vector owns the head byte. Otherwise
+    // a mouse byte ahead of a keyboard byte can strand the keyboard's edge.
+    drain_controller_with(||unsafe{inb(PS2_STATUS)},||unsafe{inb(PS2_DATA)},|status,byte|{
+        if let Some(ch)=unsafe{(&mut *core::ptr::addr_of_mut!(PHYSICAL)).feed_transfer(status,byte)}{
+            enqueue(ch);
+            if ch!=INPUT_LOST&&KEY_IRQ_BYTES.fetch_add(1,Ordering::Relaxed)==0{
+                unsafe{serial_write(b"IndianOS: G5 normal IRQ keyboard data queued\n\0".as_ptr().cast());}
+            }
+        }
+    },|status,byte|{
+            if crate::ps2_mouse::irq_transfer(status,byte)&&MOUSE_IRQ_PACKETS.fetch_add(1,Ordering::Relaxed)==0{
+                unsafe{serial_write(b"IndianOS: G5 normal IRQ mouse packet queued\n\0".as_ptr().cast());}
+            }
+    });
+}
+#[cfg(any(test,feature="normal-desktop"))]
+fn drain_controller_with<S,R,K,M>(mut status:S,mut read:R,mut keyboard:K,mut mouse:M)
+where S:FnMut()->u8,R:FnMut()->u8,K:FnMut(u8,u8),M:FnMut(u8,u8){
+    for _ in 0..32{
+        let state=status();if state&1==0{break;}
+        let byte=read();
+        if state&0x20!=0{mouse(state,byte);}else{keyboard(state,byte);}
+    }
+}
+#[cfg(feature="normal-desktop")]
+static MOUSE_IRQ_EVENTS:AtomicU64=AtomicU64::new(0);
+#[cfg(feature="normal-desktop")]
+static KEY_IRQ_BYTES:AtomicU64=AtomicU64::new(0);
+#[cfg(feature="normal-desktop")]
+static MOUSE_IRQ_PACKETS:AtomicU64=AtomicU64::new(0);
+#[cfg(feature="normal-desktop")]
+#[no_mangle]
+pub extern "C" fn x86_64_mouse_irq_dispatch(){
+    if MOUSE_IRQ_EVENTS.fetch_add(1,Ordering::Relaxed)==0{
+        unsafe{serial_write(b"IndianOS: G5 normal IRQ12 delivered\n\0".as_ptr().cast());}
+    }
+    drain_desktop_controller();
+    // Slave EOI must precede the master's cascade EOI.
+    unsafe{outb(0xa0,0x20);outb(0x20,0x20);}
 }
 /// Production bootstrap UART ingress preserves every byte. Error transfers
 /// become a nonprinting poison byte so corruption cannot splice a command.
@@ -414,7 +523,7 @@ fn normal_uart_transfer(status:u8,byte:u8)->u8{
     if status&0x1e!=0{0}else{byte}
 }
 pub(crate) fn poll_byte()->Option<u8>{
-    #[cfg(feature="test-irq-keyboard")]
+    #[cfg(any(feature="test-irq-keyboard",feature="normal-desktop"))]
     if let Some(byte)=dequeue(){return Some(physical_delivery(byte));}
 
     // Bounded non-blocking UART polling; the shell performs its own wait.
@@ -431,10 +540,14 @@ fn physical_delivery(byte:u8)->u8{
 /// Normal desktop ingress never inspects COM1. Both sources retain their own
 /// byte ownership: AUX remains for Mouse, and an armed IRQ1 owns keyboard reads.
 pub(crate) fn poll_physical_byte()->Option<u8>{
-    #[cfg(feature="test-irq-keyboard")]
+    #[cfg(feature="normal-desktop")]
+    if unsafe{!IRQ_ACTIVE}{return None;}
+    #[cfg(any(feature="test-irq-keyboard",feature="normal-desktop"))]
     if let Some(byte)=dequeue(){return Some(physical_delivery(byte));}
-    #[cfg(feature="test-irq-keyboard")]
+    #[cfg(any(feature="test-irq-keyboard",feature="normal-desktop"))]
     if unsafe{IRQ_ACTIVE}{
+        #[cfg(not(feature="normal-desktop"))]
+        {
         let status=unsafe{inb(PS2_STATUS)};
         if status&1!=0&&status&0x20==0&&unsafe{!REPORTED_PS2_PENDING}{
             unsafe{
@@ -463,6 +576,7 @@ pub(crate) fn poll_physical_byte()->Option<u8>{
                 }
             }
         }
+        }
         return None; // only IRQ1 may drain the keyboard data register
     }
     let status=unsafe{inb(PS2_STATUS)};
@@ -477,7 +591,7 @@ pub(crate) fn poll_physical_byte()->Option<u8>{
     None
 }
 pub(crate) fn echo(byte:u8){
-    #[cfg(feature="test-irq-keyboard")]
+    #[cfg(any(feature="test-irq-keyboard",feature="normal-desktop"))]
     crate::console::echo(byte);
     fn send(ch:u8){
         for _ in 0..100_000 {
@@ -497,6 +611,20 @@ pub(crate) fn echo(byte:u8){
 #[cfg(test)]
 mod tests{
     use super::*;
+    #[test]fn normal_irq_controller_routes_mixed_bytes_once_and_bounds_a_stuck_stream(){
+        let mut states=[0x21,0x01,0x61,0x81,0x00].into_iter();
+        let mut bytes=[8,0x1e,0xff,0x30].into_iter();
+        let mut keys=std::vec::Vec::new();let mut mouse=std::vec::Vec::new();
+        drain_controller_with(||states.next().unwrap(),||bytes.next().unwrap(),
+            |state,byte|keys.push((state,byte)),|state,byte|mouse.push((state,byte)));
+        assert_eq!(keys,[(0x01,0x1e),(0x81,0x30)]);
+        assert_eq!(mouse,[(0x21,8),(0x61,0xff)]);
+        let mut reads=0;let mut routed=0;
+        drain_controller_with(||0x21,||{reads+=1;8},|_,_|panic!("AUX stolen by keyboard"),|_,_|routed+=1);
+        assert_eq!((reads,routed),(32,32));
+        assert_eq!(pic_input_masks(true),(0xf9,0xef));
+        assert_eq!(pic_input_masks(false),(0xfd,0xff));
+    }
     #[test]
     fn ps2_set1_letters_case_and_release(){
         let mut keys=ScanDecoder::default();

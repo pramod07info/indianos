@@ -6,6 +6,9 @@ The 20 entries below are independently reviewable assignments. **This
 integration used one coordinator, not 20 independently launched coding agents.**
 A code commit, an authored test, or a merged PR does **not** complete a gate.
 Physical power-loss and multicore/hardware certification remain open.
+This is a historical assignment list: an Open row is not proof of missing
+production code. Apply the current `M1_DUPLICATE_PREVENTION.md` source audit
+before assigning any implementation from these rows.
 
 ## G6 — persistent volume, transaction durability, isolation
 
@@ -16,8 +19,8 @@ Physical power-loss and multicore/hardware certification remain open.
 | G6-03 | Quarantine the mounted session on any post-publication verification failure; remount before retry | Source merged via PR #770; full G6 acceptance still open |
 | G6-04 | Inject torn metadata-head writes during a real QEMU guest power interruption; recover old or new valid state | Open |
 | G6-05 | Inject data-write loss and stale-sector readback; require checksum rejection and no user-visible success | Open |
-| G6-06 | Validate interrupted rename, unlink and directory COW transactions on two consecutive cold boots | Open |
-| G6-07 | Implement actual blocking or conflict-safe concurrent file locks beyond current cooperative selected leases | Open |
+| G6-06 | Validate interrupted rename, unlink and directory COW transactions on two consecutive cold boots | PR #798 adds pre/post-publication guest cuts for rename, unlink and mkdir, each followed by two cold reboots. Cloud Python controls pass; exact-head QEMU acceptance pending. |
+| G6-07 | Implement actual blocking or conflict-safe concurrent file locks beyond current cooperative selected leases | PR #798 adds exact range admission and verified unrelated-reader preservation for serialized selected-path mutations. Descriptor writers remain conservative; blocking/SMP locking is open. |
 | G6-08 | Finish persistent owner/group/mode permissions across create, edit, rename, remount and PID recycle | Open |
 | G6-09 | Prove bounded recovery without automatic format or repair after corruption and media replacement | Open |
 | G6-10 | Qualify flush/ordering and unsafe power-loss recovery on deliberately selected physical test hardware | Open — requires hardware |
@@ -33,7 +36,7 @@ Physical power-loss and multicore/hardware certification remain open.
 | G7-15 | Verify foreign-reader lease prevents cross-process mutations before device probe, then releases on close | Open |
 | G7-16 | Enforce write grant and quota across every descriptor edit/rename/truncate, including failures | Open |
 | G7-17 | Enforce ancestor-search, target owner and destination-directory authorization without TOCTOU bypass | Private-file and directory ACL enforcement candidate in PR #773; broader acceptance open |
-| G7-18 | Run independent actual ring-3 clients through syscall create/read/write/rename in QEMU (no host adapter substitute) | Open |
+| G7-18 | Run independent actual ring-3 clients through syscall create/read/write/rename in QEMU (no host adapter substitute) | PR #798 adds a native Files-held lease while PID1 creates/edits/renames an unrelated file, same-file denial/release and cold readback. Exact-head guest evidence pending. |
 | G7-19 | Stress concurrent process exit, reuse, open handle close, permission revocation and namespace changes | Open |
 | G7-20 | Verify two-process persistent disk round-trip across two real QEMU cold boots at the exact merged SHA | Open |
 

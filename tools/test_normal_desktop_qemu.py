@@ -37,11 +37,20 @@ LIFECYCLE_READY = "IndianOS normal desktop: lifecycle READY verified"
 DURABLE_SHUTDOWN = "IndianOS normal desktop: durable shutdown armed"
 SURFACES_GUARDED = "IndianOS: desktop private surface guards verified"
 BOOT_STACK = b"IndianOS normal desktop: explicit 256 KiB boot stack acknowledged"
+IRQ_INGRESS = (b"IndianOS: G5 normal IRQ1 delivered",
+               b"IndianOS: G5 normal IRQ12 delivered",
+               b"IndianOS: G5 normal IRQ keyboard data queued",
+               b"IndianOS: G5 normal IRQ mouse packet queued")
 RECOVERY = "IndianOS recovery: reason=desktop-storage-unavailable"
 FORBIDDEN = (b"PID1 provisioned", b"R027 blank disk", b"normal PID1 ready:")
 UART_ACTIONS = (PHYSICAL.encode(), SHUTDOWN.encode(), b"application launcher",
                 b"user switched to", b"Terminal physical input acknowledged")
 NAMED_COMMIT = "desktop broker committed named selected-volume mutation and refreshed Files"
+LEASE_ACQUIRED = b"IndianOS user: desktop Files read lease acquired"
+LEASE_REFRESH = b"IndianOS user: desktop Files retained read lease verified after refresh"
+LEASE_RELEASED = b"IndianOS user: desktop Files read lease released"
+LEASE_DENIED = b"IndianOS user: desktop Terminal filesystem request failed"
+LEASE_CONTROL_ACK = "desktop Files read lease control acknowledged"
 NAMED_READBACK = "IndianOS user: R051 Terminal readback: saved"
 G1_PAYLOAD = "violet"  # Visually distinct from the success status SAVED.
 G1_READBACK = "IndianOS user: R051 Terminal readback: " + G1_PAYLOAD
@@ -110,6 +119,8 @@ def text_field_bounds(image: tuple[int, int, bytes], field: str) -> tuple[int, i
         x, y, count = 45 + 9 + 18, 75 + 44 + 163, 264
     elif field == "files-note":
         x, y, count = 45 + 9 + 18, 75 + 44 + 190, 240
+    elif field == "files-lock":
+        x, y, count = 45 + 9 + 18, 75 + 44 + 211, 240
     else:
         raise AssertionError("unknown graphical text field")
     if x < 0 or y < 0 or x + count > width or y + 14 > height:
@@ -184,6 +195,18 @@ def verify_boot_stack(output: bytes) -> None:
     lines = output.replace(b"\r", b"").split(b"\n")[:-1]
     if lines.count(BOOT_STACK) != 1:
         raise AssertionError("boot lacks one complete stack-request acknowledgment")
+
+
+def verify_irq_ingress(output: bytes, since: int) -> None:
+    if not 0 <= since < len(output):
+        raise AssertionError("invalid fresh physical ingress boundary")
+    lines = output[since:].replace(b"\r", b"").split(b"\n")[:-1]
+    if any(lines.count(marker) != 1 for marker in IRQ_INGRESS):
+        raise AssertionError("physical desktop lacks fresh IRQ1/IRQ12 queued-input evidence")
+    for delivered, queued in ((IRQ_INGRESS[0], IRQ_INGRESS[2]),
+                              (IRQ_INGRESS[1], IRQ_INGRESS[3])):
+        if lines.index(delivered) >= lines.index(queued):
+            raise AssertionError("decoded physical input preceded its real interrupt")
 
 
 def verify_runtime(output: bytes, shutdown_at: int) -> None:
@@ -511,6 +534,7 @@ def boot(qemu: str, iso: Path, ovmf: Path, disk: Path, folder: Path, index: int)
         session.drain_serial(0.5)
         serial_frame = session.shot(folder / f"desktop-{index}-uart-negative.ppm")
         verify_uart_ignored(frame, serial_frame, bytes(session.output), serial_at)
+        input_at = len(session.output)
         pointer_window_acceptance(session, folder, index, frame)
         # The window lifecycle scenario leaves Terminal active. Restore Files
         # so each existing keyboard transition has an observable focus change.
@@ -523,6 +547,7 @@ def boot(qemu: str, iso: Path, ovmf: Path, disk: Path, folder: Path, index: int)
                    ("2", "R031.1 user switched to Terminal app")]
         for step, (key, marker) in enumerate(actions):
             frame = physical_key(session, key, marker, folder, index, step, frame, False)
+        verify_irq_ingress(bytes(session.output), input_at)
         acknowledged_key(session, "1", "R031.1 user switched to Files app")
         frame = session.shot(folder / f"desktop-{index}-files-focus.ppm")
         frame = physical_key(session, "2", "R031.1 user switched to Terminal app",
@@ -603,6 +628,164 @@ def boot(qemu: str, iso: Path, ovmf: Path, disk: Path, folder: Path, index: int)
     print(f"Normal desktop boot {index + 1}/2: four ring3 services, physical input, selected GPT readback and cleanup PASS")
 
 
+def lease_records(output: bytes, since: int) -> list[bytes]:
+    if not 0 <= since < len(output):
+        raise AssertionError("invalid fresh native lease evidence boundary")
+    lines = output[since:].replace(b"\r", b"").split(b"\n")[:-1]
+    # The physical f shortcut is denied synchronously, so its single UART
+    # echo precedes PID1's record without an intervening scheduler log.
+    # Normalize only that exact known record, never arbitrary log prefixes.
+    refused = b"IndianOS user: desktop Files update refused by file service"
+    return [line[1:] if line == b"f" + refused else line for line in lines]
+
+
+def verify_lease_commit(output: bytes, since: int) -> None:
+    lines = lease_records(output, since)
+    commit = b"IndianOS user: " + NAMED_COMMIT.encode()
+    if (lines.count(LEASE_REFRESH) != 1 or lines.count(commit) != 1 or
+            lines.index(LEASE_REFRESH) >= lines.index(commit) or
+            any(marker in lines for marker in (LEASE_ACQUIRED, LEASE_RELEASED, LEASE_DENIED))):
+        raise AssertionError("unrelated write lacks fresh original-token verification before commit")
+
+
+def verify_lease_denial(before: bytes, after: bytes, output: bytes, since: int,
+                       marker: bytes = LEASE_DENIED) -> None:
+    lines = lease_records(output, since)
+    denials = (LEASE_DENIED, b"IndianOS user: desktop Files update refused by file service")
+    if marker not in denials:
+        raise AssertionError("unknown native read-lease denial evidence")
+    if before != after:
+        raise AssertionError("protected-file denial changed persistent media")
+    if lines.count(marker) != 1 or sum(lines.count(x) for x in denials) != 1:
+        raise AssertionError("protected-file denial lacks one exact native error record")
+    forbidden = (NAMED_COMMIT.encode(), COMMITTED.encode(), PERSISTED.encode(),
+                 LEASE_ACQUIRED, LEASE_REFRESH, LEASE_RELEASED,
+                 SHUTDOWN.encode(), STOPPED.encode(),
+                 b"selected volume sync failed", b"IndianOS recovery:", b"FATAL",
+                 b"restarting retired service session")
+    if any(marker in output[since:] for marker in forbidden):
+        raise AssertionError("read-lease contention committed, replaced authority or retired the session")
+
+
+def verify_released_lease_write(output: bytes, since: int) -> None:
+    lines = lease_records(output, since)
+    commit = b"IndianOS user: " + NAMED_COMMIT.encode()
+    if (lines.count(LEASE_RELEASED) != 1 or lines.count(commit) != 1 or
+            lines.index(LEASE_RELEASED) >= lines.index(commit) or
+            any(marker in lines for marker in (LEASE_ACQUIRED, LEASE_REFRESH, LEASE_DENIED))):
+        raise AssertionError("protected-file write did not follow release of the original lease")
+
+
+def shared_read_lease_boots(qemu: str, iso: Path, ovmf: Path, disk: Path, folder: Path) -> None:
+    """Actual PID2 open/read lock survives unrelated PID1 native mutations.
+
+    User input selects the Files lock action; it never mints a test handle.
+    Same-file contention is nondestructive, and release permits a durable edit.
+    """
+    original = disk.read_bytes()
+    process, sock, session = spawn(qemu, iso, ovmf, disk, folder, "shared-read-lease")
+    try:
+        session.until(READY, 45)
+        acknowledged_key(session, "1", "R031.1 user switched to Files app")
+        acquired = acknowledged_key(session, "l", LEASE_ACQUIRED.decode())
+        session.until(LEASE_CONTROL_ACK, 20, since=acquired)
+        session.drain_serial(0.1)
+        if lease_records(bytes(session.output), acquired).count(LEASE_ACQUIRED) != 1:
+            raise AssertionError("Files did not acquire exactly one native read lease")
+        verify_text_pixels(settled_frame(session, folder / "lease-acquired.ppm"),
+                           "files-lock", "READ LOCKED")
+        # The Files shortcut uses the same protected path API. Ordinary
+        # contention must not terminate PID1 or silently release the reader.
+        before = disk.read_bytes()
+        refused = acknowledged_key(session, "f", "desktop Files update refused by file service")
+        session.drain_serial(0.1)
+        verify_lease_denial(before, disk.read_bytes(), bytes(session.output), refused,
+                           b"IndianOS user: desktop Files update refused by file service")
+        verify_text_pixels(session.shot(folder / "lease-files-update-denied.ppm"),
+                           "files-lock", "READ LOCKED")
+        acknowledged_key(session, "2", "R031.1 user switched to Terminal app")
+        acknowledged_key(session, "ret")
+        for step, (command, listing) in enumerate((
+                ("touch peer", "f:readme f:peer "),
+                ("put peer=violet", "f:readme f:peer "),
+                ("mv peer other", "f:readme f:other "))):
+            type_named_command(session, command)
+            submitted = acknowledged_key(session, "ret")
+            session.until(NAMED_COMMIT, 20, since=submitted)
+            session.drain_serial(0.1)
+            verify_lease_commit(bytes(session.output), submitted)
+            frame = session.shot(folder / f"lease-unrelated-{step}.ppm")
+            verify_text_pixels(frame, "terminal", "SAVED")
+            verify_text_pixels(frame, "files-directory", listing)
+            verify_text_pixels(frame, "files-note", "HELLO INDIANOS")
+            verify_text_pixels(frame, "files-lock", "READ LOCKED")
+        type_named_command(session, "put readme=blocked")
+        before = disk.read_bytes()
+        denied = acknowledged_key(session, "ret")
+        session.until(LEASE_DENIED.decode(), 20, since=denied)
+        session.drain_serial(0.1)
+        verify_lease_denial(before, disk.read_bytes(), bytes(session.output), denied)
+        verify_text_pixels(session.shot(folder / "lease-same-file-denied.ppm"), "terminal", "IO ERROR")
+        type_named_command(session, "cat readme")
+        read = acknowledged_key(session, "ret")
+        marker = "IndianOS user: R051 Terminal readback: HELLO INDIANOS"
+        session.until(marker, 20, since=read)
+        session.drain_serial(0.1)
+        exact_terminal_line(bytes(session.output), read, marker)
+        verify_text_pixels(session.shot(folder / "lease-protected-readback.ppm"), "terminal", "HELLO INDIANOS")
+        if disk.read_bytes() != before:
+            raise AssertionError("readback after lease contention modified persistent media")
+        acknowledged_key(session, "tab")
+        acknowledged_key(session, "1", "R031.1 user switched to Files app")
+        released = acknowledged_key(session, "u", LEASE_RELEASED.decode())
+        session.until(LEASE_CONTROL_ACK, 20, since=released)
+        verify_text_pixels(settled_frame(session, folder / "lease-released.ppm"), "files-lock", "UNLOCKED")
+        acknowledged_key(session, "2", "R031.1 user switched to Terminal app")
+        acknowledged_key(session, "ret")
+        type_named_command(session, "put readme=permitted")
+        submitted = acknowledged_key(session, "ret")
+        session.until(NAMED_COMMIT, 20, since=submitted)
+        session.drain_serial(0.1)
+        verify_released_lease_write(bytes(session.output), released)
+        frame = session.shot(folder / "lease-released-write.ppm")
+        verify_text_pixels(frame, "files-note", "permitted")
+        verify_text_pixels(frame, "terminal", "SAVED")
+        acknowledged_key(session, "tab")
+        shutdown_at = acknowledged_key(session, "q", SHUTDOWN)
+        session.until(STOPPED, 20, since=shutdown_at)
+        session.drain_serial(0.1)
+        verify_runtime(bytes(session.output), shutdown_at)
+    finally:
+        close(process, sock, session, folder / "shared-read-lease.serial.log")
+    verify_guard(original, disk.read_bytes())
+    persisted = disk.read_bytes()
+    process, sock, session = spawn(qemu, iso, ovmf, disk, folder, "shared-read-lease-reboot")
+    try:
+        session.until(READY, 45)
+        verify_text_pixels(session.shot(folder / "lease-reboot-initial.ppm"), "files-note", "permitted")
+        acknowledged_key(session, "2", "R031.1 user switched to Terminal app")
+        acknowledged_key(session, "ret")
+        for name, value in (("readme", "permitted"), ("other", "violet")):
+            type_named_command(session, "cat " + name)
+            submitted = acknowledged_key(session, "ret")
+            marker = "IndianOS user: R051 Terminal readback: " + value
+            session.until(marker, 20, since=submitted)
+            session.drain_serial(0.1)
+            exact_terminal_line(bytes(session.output), submitted, marker)
+            verify_text_pixels(session.shot(folder / f"lease-reboot-{name}.ppm"), "terminal", value)
+        acknowledged_key(session, "tab")
+        shutdown_at = acknowledged_key(session, "q", SHUTDOWN)
+        session.until(STOPPED, 20, since=shutdown_at)
+        session.drain_serial(0.1)
+        verify_runtime(bytes(session.output), shutdown_at)
+    finally:
+        close(process, sock, session, folder / "shared-read-lease-reboot.serial.log")
+    if disk.read_bytes() != persisted:
+        raise AssertionError("shared-file cold readback or synchronized shutdown changed media")
+    verify_guard(original, persisted)
+    print("Normal desktop native PID2 read lease: unrelated PID1 commits, same-file denial, release and cold reboot PASS")
+
+
 def rotate_guid(raw: bytes) -> bytes:
     result = bytearray(raw)
     for lba in (1, 255):
@@ -652,6 +835,291 @@ def abrupt_reboot(qemu: str, iso: Path, ovmf: Path, disk: Path, folder: Path) ->
         if attempt == 1 and disk.read_bytes() != before:
             raise AssertionError("unclean reboot readback changed persistent storage")
     print("Normal desktop abrupt guest loss: committed named file survives SIGKILL/reboot PASS")
+
+
+class PublicationCut:
+    """Fail-closed oracle for one four-sector COW replacement, not a guest mock.
+
+    Observations come from actual native ATA command-entry stops. A cut before
+    the second data command leaves one flushed orphan sector; the two metadata
+    cuts bracket checkpoint publication, before any application acknowledgement.
+    """
+    def __init__(self, phase: str, data_sectors: int = 4):
+        if phase not in ("data", "metadata-before", "metadata-after"):
+            raise AssertionError("unknown guest publication cut")
+        if data_sectors not in (0, 4) or (phase == "data" and data_sectors == 0):
+            raise AssertionError("unsupported publication data geometry")
+        self.phase = phase
+        self.data_sectors = data_sectors
+        self.data: list[int] = []
+        self.head: int | None = None
+
+    def observe(self, command: int, lba: int) -> bool:
+        if command not in (0x20, 0x30) or not 0 <= lba < TOTAL:
+            raise AssertionError("native ATA arguments do not match qualified command ABI")
+        if command == 0x20:
+            return self.phase == "metadata-after" and self.head == lba
+        if not START <= lba < START + COUNT:
+            raise AssertionError("publication attempted a write outside selected volume")
+        if lba < START + 2:
+            if len(self.data) != self.data_sectors or self.head is not None:
+                raise AssertionError("checkpoint preceded one complete new data bank")
+            self.head = lba
+            return self.phase == "metadata-before"
+        if self.head is not None or len(self.data) >= self.data_sectors or (
+                self.data and lba != self.data[-1] + 1):
+            raise AssertionError("replacement is not one bounded sequential COW bank")
+        self.data.append(lba)
+        return self.phase == "data" and len(self.data) == 2
+
+
+def verify_publication_cut(before: bytes, after: bytes, phase: str,
+                           output: bytes, submitted: int, *, data_sectors: int = 4) -> None:
+    PublicationCut(phase, data_sectors)  # Reject unsupported evidence contracts.
+    verify_guard(before, after)
+    if not 0 < submitted <= len(output) or any(marker in output[submitted:] for marker in
+            (NAMED_COMMIT.encode(), ACK.encode(), DURABLE_SHUTDOWN.encode(), STOPPED.encode())):
+        raise AssertionError("publication cut lacks a fresh pre-acknowledgement boundary")
+    old_heads = before[START * 512:(START + 2) * 512]
+    new_heads = after[START * 512:(START + 2) * 512]
+    if data_sectors == 0 and before[(START + 2) * 512:] != after[(START + 2) * 512:]:
+        raise AssertionError("metadata-only operation changed a data sector")
+    if before == after and not (data_sectors == 0 and phase == "metadata-before"):
+        raise AssertionError("guest was killed before any actual storage mutation")
+    if phase in ("data", "metadata-before"):
+        if old_heads != new_heads:
+            raise AssertionError("pre-publication cut changed a committed metadata head")
+    elif phase == "metadata-after":
+        changed = [i for i in (0, 1) if old_heads[i*512:(i+1)*512] != new_heads[i*512:(i+1)*512]]
+        if len(changed) != 1:
+            raise AssertionError("post-publication cut did not replace exactly one checkpoint")
+        old_generation = max(struct.unpack_from("<Q", old_heads, i*512+16)[0] for i in (0, 1))
+        head = bytearray(new_heads[changed[0]*512:(changed[0]+1)*512])
+        saved = struct.unpack_from("<I", head, 24)[0]
+        head[24:28] = bytes(4)
+        if (head[:8] != b"INDR027!" or zlib.crc32(head) != saved or
+                struct.unpack_from("<Q", head, 16)[0] != old_generation + 1):
+            raise AssertionError("post-publication cut lacks a valid next COW checkpoint")
+    else:
+        raise AssertionError("unknown publication cut evidence")
+
+
+def cut_submitted_publication(process, session: QemuSession, disk: Path, folder: Path,
+                              name: str, target: int, active: int, expected: bytes,
+                              phase: str, data_sectors: int = 4) -> None:
+    """Submit the already typed physical command and stop its native I/O.
+
+    File replacement and namespace cases use the same debugger contract.
+    No caller may manufacture a cut by modifying the disk or guest state.
+    """
+    before = disk.read_bytes()
+    submitted = len(session.output)
+    debugger = None
+    evidence = []
+    try:
+        session.hmp("stop")
+        debugger = GuestDebugger(session.debugger_path)
+        if not debugger.command("?").startswith(("S", "T")):
+            raise AssertionError("publication debugger did not attach to stopped guest")
+        debugger.command("qSupported:xmlRegisters=i386")
+        debugger.command("qXfer:features:read:target.xml:0,fff")
+        if debugger.memory(target, 8) != expected:
+            raise AssertionError("ATA command code differs from this exact source ISO")
+        if debugger.command(f"Z1,{target:x},1") != "OK":
+            raise AssertionError("cannot identify real ATA command execution")
+        cut = PublicationCut(phase, data_sectors)
+        for attempt in range(1024):
+            debugger.send("c")
+            if attempt == 0:
+                if "running" not in session.hmp("info status"):
+                    session.hmp("cont")
+                session.hmp("sendkey ret 80")
+            if not debugger.response().startswith(("S", "T")):
+                raise AssertionError("guest did not reach a native ATA command")
+            current = int.from_bytes(debugger.memory(active, 8), "little")
+            pid = int.from_bytes(debugger.memory(current, 4), "little") if current else 0
+            if debugger.register(16) != target or debugger.register(18) & 3 or pid != 1:
+                raise AssertionError("publication breakpoint lacks native kernel/PID1 ownership")
+            # Qualified native Rust x86-64 select entry argument registers.
+            # The diagnostic export stabilizes its name, not the Rust ABI.
+            command, lba = debugger.register(3) & 255, debugger.register(4)
+            evidence.append(f"PID={pid} RIP={target:#x} command={command:#x} LBA={lba}")
+            if cut.observe(command, lba):
+                session.drain_serial(0.1)
+                # Remain stopped before this command; no detach/resume race.
+                process.kill()
+                process.wait(timeout=5)
+                verify_publication_cut(before, disk.read_bytes(), phase,
+                                       bytes(session.output), submitted,
+                                       data_sectors=data_sectors)
+                return
+            if debugger.command(f"z1,{target:x},1") != "OK":
+                raise AssertionError("failed to advance unchanged ATA instruction")
+            if not debugger.command("s").startswith(("S", "T")):
+                raise AssertionError("failed to single-step unchanged ATA code")
+            if debugger.command(f"Z1,{target:x},1") != "OK":
+                raise AssertionError("failed to restore ATA execution breakpoint")
+        raise AssertionError("publication cut was not reached within command budget")
+    finally:
+        if debugger is not None:
+            debugger.close()
+        (folder / f"{name}.debugger.log").write_text("\n".join(evidence) + "\n")
+
+
+def interrupted_publication(qemu: str, iso: Path, ovmf: Path, disk: Path,
+                            folder: Path, xorriso: str, nm: str) -> None:
+    """Cut actual guest writes between sectors and before their native reply.
+
+    This uses only external execution breakpoints and SIGKILL. It does not
+    synthesize torn sectors, patch kernel code or claim physical power safety.
+    """
+    sources = folder / "publication-sources"
+    sources.mkdir()
+    kernel = sources / "kernel.elf"
+    checked_run([xorriso, "-osirrox", "on", "-indev", str(iso),
+                 "-extract", "/boot/indianos.elf", str(kernel)])
+    target = unique_symbol(nm, kernel, ("indianos_ata_select_command",))
+    active = unique_symbol(nm, kernel, ("user_runtime::ACTIVE_PROCESS",))
+    expected = executable_bytes(kernel.read_bytes(), target, 8)
+    golden = disk.read_bytes()
+    for phase in ("data", "metadata-before", "metadata-after"):
+        disk.write_bytes(golden)
+        name = "publication-" + phase
+        process, sock, session = spawn(qemu, iso, ovmf, disk, folder, name, debugger=True)
+        try:
+            session.until(READY, 45)
+            acknowledged_key(session, "2", "R031.1 user switched to Terminal app")
+            acknowledged_key(session, "ret")
+            for command in ("touch cut", "put cut=saved"):
+                type_named_command(session, command)
+                sent = acknowledged_key(session, "ret")
+                session.until(NAMED_COMMIT, 20, since=sent)
+            type_named_command(session, "put cut=violet")
+            cut_submitted_publication(process, session, disk, folder, name,
+                                      target, active, expected, phase)
+        finally:
+            close(process, sock, session, folder / f"{name}.serial.log")
+        recovered = disk.read_bytes()
+        process, sock, session = spawn(qemu, iso, ovmf, disk, folder, name + "-reboot")
+        try:
+            session.until(READY, 45)
+            acknowledged_key(session, "2", "R031.1 user switched to Terminal app")
+            acknowledged_key(session, "ret")
+            type_named_command(session, "cat cut")
+            sent = acknowledged_key(session, "ret")
+            value = "violet" if phase == "metadata-after" else "saved"
+            marker = "IndianOS user: R051 Terminal readback: " + value
+            session.until(marker, 20, since=sent)
+            session.drain_serial(0.1)
+            exact_terminal_line(bytes(session.output), sent, marker)
+            verify_text_pixels(session.shot(folder / f"{name}-reboot.ppm"), "terminal", value)
+            acknowledged_key(session, "tab")
+            shutdown_at = acknowledged_key(session, "q", SHUTDOWN)
+            session.until(STOPPED, 20, since=shutdown_at)
+            session.drain_serial(0.1)
+            verify_runtime(bytes(session.output), shutdown_at)
+        finally:
+            close(process, sock, session, folder / f"{name}-reboot.serial.log")
+        if disk.read_bytes() != recovered:
+            raise AssertionError("publication recovery/readback changed persistent media")
+        verify_guard(golden, recovered)
+        print(f"Normal desktop pre-ack {phase} guest cut: exact {value} survives real reboot PASS")
+    interrupted_namespace_publication(qemu, iso, ovmf, disk, folder,
+                                      golden, target, active, expected)
+
+
+def namespace_cut_contract(operation: str, phase: str) -> tuple[str, int, tuple[str, ...], tuple[tuple[str, str], ...]]:
+    """Exact old/new namespace and unchanged-file oracle for each operation."""
+    if phase not in ("metadata-before", "metadata-after"):
+        raise AssertionError("namespace cuts must bracket metadata publication")
+    committed = phase == "metadata-after"
+    labels = ("f:readme", "f:cut")
+    reads = (("readme", "HELLO INDIANOS"), ("cut", "saved"))
+    if operation == "rename":
+        if committed:
+            labels = ("f:readme", "f:moved")
+            reads = (("readme", "HELLO INDIANOS"), ("moved", "saved"))
+        return "mv cut moved", 0, labels, reads
+    if operation == "unlink":
+        if committed:
+            labels, reads = ("f:readme",), (("readme", "HELLO INDIANOS"),)
+        return "rm cut", 0, labels, reads
+    if operation == "mkdir":
+        if committed:
+            labels += ("d:d",)
+        return "mkdir d", 4, labels, reads
+    raise AssertionError("unknown namespace publication operation")
+
+
+def verify_namespace_listing(output: bytes, since: int, expected: tuple[str, ...]) -> None:
+    prefix = b"IndianOS user: R055 Terminal directory: "
+    if not 0 <= since < len(output) or not expected or len(set(expected)) != len(expected):
+        raise AssertionError("invalid exact namespace evidence contract")
+    lines = output[since:].replace(b"\r", b"").split(b"\n")[:-1]
+    listings = [line[len(prefix):] for line in lines if line.startswith(prefix)]
+    if len(listings) != 1 or listings[0] != " ".join(expected).encode("ascii"):
+        raise AssertionError("fresh namespace is missing, duplicated or differs from exact old/new state")
+
+
+def interrupted_namespace_publication(qemu: str, iso: Path, ovmf: Path, disk: Path,
+                                      folder: Path, golden: bytes, target: int,
+                                      active: int, expected_code: bytes) -> None:
+    """Six live namespace cuts, each verified on two consecutive cold boots."""
+    for operation in ("rename", "unlink", "mkdir"):
+        for phase in ("metadata-before", "metadata-after"):
+            command, data_sectors, labels, reads = namespace_cut_contract(operation, phase)
+            disk.write_bytes(golden)
+            name = f"namespace-publication-{operation}-{phase}"
+            process, sock, session = spawn(qemu, iso, ovmf, disk, folder, name, debugger=True)
+            try:
+                session.until(READY, 45)
+                acknowledged_key(session, "2", "R031.1 user switched to Terminal app")
+                acknowledged_key(session, "ret")
+                for seed in ("touch cut", "put cut=saved"):
+                    type_named_command(session, seed)
+                    sent = acknowledged_key(session, "ret")
+                    session.until(NAMED_COMMIT, 20, since=sent)
+                type_named_command(session, command)
+                cut_submitted_publication(process, session, disk, folder, name,
+                                          target, active, expected_code, phase, data_sectors)
+            finally:
+                close(process, sock, session, folder / f"{name}.serial.log")
+            recovered = disk.read_bytes()
+            verify_guard(golden, recovered)
+            for reboot in (1, 2):
+                boot_name = f"{name}-reboot-{reboot}"
+                process, sock, session = spawn(qemu, iso, ovmf, disk, folder, boot_name)
+                try:
+                    session.until(READY, 45)
+                    acknowledged_key(session, "2", "R031.1 user switched to Terminal app")
+                    acknowledged_key(session, "ret")
+                    type_named_command(session, "ls")
+                    sent = acknowledged_key(session, "ret")
+                    session.until("IndianOS user: R055 Terminal directory: ", 20, since=sent)
+                    session.drain_serial(0.1)
+                    verify_namespace_listing(bytes(session.output), sent, labels)
+                    verify_text_pixels(session.shot(folder / f"{boot_name}-listing.ppm"),
+                                       "files-directory", " ".join(labels) + " ")
+                    for path, value in reads:
+                        type_named_command(session, "cat " + path)
+                        sent = acknowledged_key(session, "ret")
+                        marker = "IndianOS user: R051 Terminal readback: " + value
+                        session.until(marker, 20, since=sent)
+                        session.drain_serial(0.1)
+                        exact_terminal_line(bytes(session.output), sent, marker)
+                        verify_text_pixels(session.shot(folder / f"{boot_name}-{path}.ppm"),
+                                           "terminal", value)
+                    acknowledged_key(session, "tab")
+                    shutdown_at = acknowledged_key(session, "q", SHUTDOWN)
+                    session.until(STOPPED, 20, since=shutdown_at)
+                    session.drain_serial(0.1)
+                    verify_runtime(bytes(session.output), shutdown_at)
+                finally:
+                    close(process, sock, session, folder / f"{boot_name}.serial.log")
+                if disk.read_bytes() != recovered:
+                    raise AssertionError("namespace recovery/readback or shutdown modified persistent media")
+                verify_guard(golden, disk.read_bytes())
+            print(f"Normal desktop pre-ack {operation} {phase}: exact namespace and payloads survive TWO cold reboots PASS")
 
 
 def denied_boot(qemu: str, iso: Path, ovmf: Path, disk: Path, folder: Path, name: str,
@@ -1495,8 +1963,21 @@ def main() -> None:
             verify_guard(original, disk.read_bytes())
             if index == 1 and disk.read_bytes() != before:
                 raise AssertionError("read-only reboot commands changed persistent storage")
+        # Replay the healthy native preview/update sequence on a fresh copy.
+        # A guest-only read/unlock retirement escaped host model tests; keep
+        # this independent repeat and its artifacts rather than retry failures.
+        disk.write_bytes(original)
+        repeated = artifacts / "native-preview-repeat"
+        repeated.mkdir()
+        boot(args.qemu, args.iso.resolve(), args.ovmf.resolve(), disk, repeated, 0)
+        verify_guard(original, disk.read_bytes())
         disk.write_bytes(original)
         abrupt_reboot(args.qemu, args.iso.resolve(), args.ovmf.resolve(), disk, artifacts)
+        disk.write_bytes(original)
+        interrupted_publication(args.qemu, args.iso.resolve(), args.ovmf.resolve(), disk,
+                                artifacts, args.xorriso, args.nm)
+        disk.write_bytes(original)
+        shared_read_lease_boots(args.qemu, args.iso.resolve(), args.ovmf.resolve(), disk, artifacts)
         disk.write_bytes(original)
         transient_service_boot(args.qemu, args.iso.resolve(), args.ovmf.resolve(), disk,
                                artifacts, args.xorriso, args.nm)

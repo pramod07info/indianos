@@ -16,23 +16,24 @@ global_asm!(
     options(att_syntax),
 );
 
-#[cfg(any(feature = "preempt", feature = "test-irq-keyboard"))]
+#[cfg(any(feature = "preempt", feature = "test-irq-keyboard", feature = "normal-desktop"))]
 global_asm!(
     include_str!("arch/x86_64/user_entry.S"),
     rflags = const 0x202,
     options(att_syntax),
 );
 
-#[cfg(not(any(feature = "preempt", feature = "test-irq-keyboard")))]
+#[cfg(not(any(feature = "preempt", feature = "test-irq-keyboard", feature = "normal-desktop")))]
 global_asm!(
     include_str!("arch/x86_64/user_entry.S"),
     rflags = const 0x02,
     options(att_syntax),
 );
 
-#[cfg(feature="test-irq-keyboard")]
+#[cfg(any(feature="test-irq-keyboard",feature="normal-desktop"))]
 global_asm!(
     include_str!("arch/x86_64/keyboard_entry.S"),
+    mouse_irq = const if cfg!(feature="normal-desktop"){1}else{0},
     options(att_syntax),
 );
 

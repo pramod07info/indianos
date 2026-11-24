@@ -129,3 +129,26 @@ is established by a screenshot or a successful compilation. See
 Storage details: [checkpoint admission](M1_CHECKPOINT_PAYLOAD_ADMISSION.md) and
 [broker transactions](M1_TERMINAL_BROKER_TRANSACTIONS.md), plus
 [descriptor release](SELECTED_DESCRIPTOR_RELEASE.md).
+
+## G5/G6/G7 integration — 23 Nov 2026
+
+Audited source base: `7b2184749db056bf4d19e3f1c3d162179fc71440`.
+PRs #767, #773, #774, #784 and #797 already implement persistent discretionary
+permissions, versioned descriptor queries, range locks, checked native service
+operations and the existing reboot matrix. Those implementations are reused.
+
+| Gate | Concrete gap addressed | Required acceptance / current state |
+| --- | --- | --- |
+| G5 | Normal input now uses bounded IRQ1/IRQ12 ingress, shared controller routing, loss cancellation and explicit lifecycle cleanup instead of desktop polling. | Fresh interrupt and decoded-event evidence, existing focus/capture/screenshots and restart cases must pass at the integrated SHA. IN PROGRESS. |
+| G6 | Direct mounts now pin driver media identity; bounded descriptor operations check their actual lock range before media access; Files retains its read lock through I/O. | Identity-change and lock regressions plus guest cuts inside unacknowledged COW publication must pass. Physical flush/cache-loss qualification and broader concurrent-writer support remain unverified. IN PROGRESS. |
+| G7 | Existing authenticated descriptor ABI and permissions are reused; native Files reads remain under their process-owned shared lock. | Independent process authority, denied operations, exact persisted content and same-disk reboot evidence remain mandatory. Full release acceptance and review are pending. IN PROGRESS. |
+
+The [input and publication acceptance extension](M1_G567_INTERRUPT_AND_PUBLICATION_ACCEPTANCE.md)
+adds three genuine transaction interruptions and reboots to the existing matrix.
+It does not simulate an in-sector torn write or a physical drive losing power.
+See [IRQ input](M1_G5_NORMAL_IRQ_INPUT.md),
+[lock admission](M1_DESCRIPTOR_LOCK_ADMISSION.md), and
+[mount identity](M1_G6_MEDIA_IDENTITY.md) for production behavior and limitations.
+No local build, project test or QEMU execution was performed while authoring
+this batch. Exact-head CI and independent review are required; none of these
+changes alone mark a complete gate 100% or change the accepted milestone count.

@@ -12,7 +12,7 @@ const MAX_WRITE: u64 = 256;
 /// Must match cpu_entry's initial ring-3 RFLAGS profile. Dispatch, syscall
 /// capture and resume validation share this policy, including IRQ keyboard.
 pub(crate) const USER_INTERRUPTS_ENABLED:bool=
-    cfg!(any(feature="preempt",feature="test-irq-keyboard"));
+    cfg!(any(feature="preempt",feature="test-irq-keyboard",feature="normal-desktop"));
 pub(crate) const MAX_SEGMENTS: usize = 8;
 
 #[repr(C)]

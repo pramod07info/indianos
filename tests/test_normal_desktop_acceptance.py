@@ -17,6 +17,213 @@ finally:
 
 
 class NormalDesktopControls(unittest.TestCase):
+    def test_shared_lease_commit_requires_original_token_and_fresh_verified_read(self):
+        commit = b"IndianOS user: " + harness.NAMED_COMMIT.encode()
+        good = harness.LEASE_REFRESH + b"\n" + commit + b"\n"
+        harness.verify_lease_commit(good, 0)
+        for bad in (good[:-1], commit + b"\n", good + good,
+                    commit + b"\n" + harness.LEASE_REFRESH + b"\n",
+                    b"prefix " + good, good + harness.LEASE_ACQUIRED + b"\n",
+                    good + harness.LEASE_RELEASED + b"\n",
+                    good + harness.LEASE_DENIED + b"\n"):
+            with self.subTest(trace=bad), self.assertRaises(AssertionError):
+                harness.verify_lease_commit(bad, 0)
+        with self.assertRaises(AssertionError):
+            harness.verify_lease_commit(good, len(good))
+        with self.assertRaises(AssertionError):
+            harness.verify_lease_commit(good, 1)
+
+    def test_shared_lease_contention_is_nondestructive_without_retiring_authority(self):
+        media = b"unchanged admitted media"
+        trace = harness.LEASE_DENIED + b"\n" + harness.ACK.encode() + b"\n"
+        harness.verify_lease_denial(media, media, trace, 0)
+        for bad in (trace[:-len(harness.ACK)-2], harness.ACK.encode() + b"\n",
+                    trace + harness.LEASE_DENIED + b"\n",
+                    trace + harness.NAMED_COMMIT.encode() + b"\n",
+                    trace + harness.LEASE_RELEASED + b"\n",
+                    trace + b"selected volume sync failed\n",
+                    trace + b"IndianOS recovery: read-only console\n",
+                    trace + harness.STOPPED.encode() + b"\n"):
+            with self.subTest(trace=bad), self.assertRaises(AssertionError):
+                harness.verify_lease_denial(media, media, bad, 0)
+        with self.assertRaises(AssertionError):
+            harness.verify_lease_denial(media, media + b"changed", trace, 0)
+
+    def test_files_shortcut_denial_requires_its_own_fresh_nondestructive_record(self):
+        marker = b"IndianOS user: desktop Files update refused by file service"
+        trace = marker + b"\n"
+        harness.verify_lease_denial(b"disk", b"disk", trace, 0, marker)
+        harness.verify_lease_denial(b"disk", b"disk", b"f" + trace, 0, marker)
+        for bad in (trace + harness.LEASE_DENIED + b"\n", trace + trace,
+                    b"stale " + trace, b"ff" + trace, trace[:-1]):
+            with self.assertRaises(AssertionError):
+                harness.verify_lease_denial(b"disk", b"disk", bad, 0, marker)
+        with self.assertRaises(AssertionError):
+            harness.verify_lease_denial(b"disk", b"disk", trace, 0)
+        with self.assertRaises(AssertionError):
+            harness.verify_lease_denial(b"disk", b"changed", trace, 0, marker)
+
+    def test_same_file_write_requires_prior_release_without_reacquisition(self):
+        commit = b"IndianOS user: " + harness.NAMED_COMMIT.encode()
+        good = harness.LEASE_RELEASED + b"\n" + commit + b"\n"
+        harness.verify_released_lease_write(good, 0)
+        for bad in (good[:-1], commit + b"\n", good + good,
+                    commit + b"\n" + harness.LEASE_RELEASED + b"\n",
+                    good + harness.LEASE_ACQUIRED + b"\n",
+                    good + harness.LEASE_REFRESH + b"\n",
+                    good + harness.LEASE_DENIED + b"\n"):
+            with self.subTest(trace=bad), self.assertRaises(AssertionError):
+                harness.verify_released_lease_write(bad, 0)
+
+    def test_irq_acceptance_requires_fresh_complete_delivery_and_decoded_queue_records(self):
+        trace = b"\n".join(harness.IRQ_INGRESS) + b"\n"
+        harness.verify_irq_ingress(trace, 0)
+        for marker in harness.IRQ_INGRESS:
+            for bad in (trace.replace(marker + b"\n", b""), trace + marker + b"\n"):
+                with self.assertRaises(AssertionError):
+                    harness.verify_irq_ingress(bad, 0)
+        with self.assertRaises(AssertionError):
+            harness.verify_irq_ingress(trace, 1)
+        with self.assertRaises(AssertionError):
+            harness.verify_irq_ingress(trace[:-1], 0)
+        with self.assertRaises(AssertionError):
+            harness.verify_irq_ingress(b"\n".join(reversed(harness.IRQ_INGRESS)) + b"\n", 0)
+
+    def test_publication_cut_tracks_real_data_and_checkpoint_command_order(self):
+        for phase in ("data", "metadata-before", "metadata-after"):
+            cut = harness.PublicationCut(phase)
+            self.assertFalse(cut.observe(0x20, 0))
+            for index in range(4):
+                stop = cut.observe(0x30, harness.START + 10 + index)
+                self.assertEqual(stop, phase == "data" and index == 1)
+                if stop:
+                    break
+            if phase != "data":
+                self.assertEqual(cut.observe(0x30, harness.START), phase == "metadata-before")
+                if phase == "metadata-after":
+                    self.assertFalse(cut.observe(0x20, harness.START + 1))
+                    self.assertTrue(cut.observe(0x20, harness.START))
+        for command, lba in ((0x40, harness.START), (0x30, harness.START - 1),
+                             (0x30, harness.START + harness.COUNT), (0x20, harness.TOTAL)):
+            with self.assertRaises(AssertionError):
+                harness.PublicationCut("data").observe(command, lba)
+        cut = harness.PublicationCut("metadata-before")
+        with self.assertRaises(AssertionError):
+            cut.observe(0x30, harness.START)
+        cut.observe(0x30, harness.START + 8)
+        with self.assertRaises(AssertionError):
+            cut.observe(0x30, harness.START + 10)
+
+    def test_pre_ack_cut_requires_actual_mutation_and_valid_old_or_new_checkpoint(self):
+        before = bytearray(harness.TOTAL * 512)
+        for index, generation in enumerate((8, 9)):
+            at = (harness.START + index) * 512
+            before[at:at+8] = b"INDR027!"
+            struct.pack_into("<Q", before, at+16, generation)
+        after = bytearray(before)
+        after[(harness.START + 12) * 512] = 1
+        output = b"native command pending\n"
+        for phase in ("data", "metadata-before"):
+            harness.verify_publication_cut(bytes(before), bytes(after), phase, output, 1)
+        with self.assertRaises(AssertionError):
+            harness.verify_publication_cut(bytes(before), bytes(before), "data", output, 1)
+        with self.assertRaises(AssertionError):
+            harness.verify_publication_cut(bytes(before), bytes(after), "data",
+                output + harness.NAMED_COMMIT.encode(), 1)
+        at = harness.START * 512
+        struct.pack_into("<Q", after, at+16, 10)
+        head = after[at:at+512]
+        struct.pack_into("<I", after, at+24, zlib.crc32(head))
+        harness.verify_publication_cut(bytes(before), bytes(after), "metadata-after", output, 1)
+        for phase in ("data", "metadata-before"):
+            with self.assertRaises(AssertionError):
+                harness.verify_publication_cut(bytes(before), bytes(after), phase, output, 1)
+        after[at+24] ^= 1
+        with self.assertRaises(AssertionError):
+            harness.verify_publication_cut(bytes(before), bytes(after), "metadata-after", output, 1)
+
+    def test_namespace_publication_requires_exact_zero_or_four_data_sector_geometry(self):
+        for phase in ("metadata-before", "metadata-after"):
+            cut = harness.PublicationCut(phase, 0)
+            self.assertEqual(cut.observe(0x30, harness.START), phase == "metadata-before")
+            if phase == "metadata-after":
+                self.assertTrue(cut.observe(0x20, harness.START))
+            with self.assertRaises(AssertionError):
+                harness.PublicationCut(phase, 0).observe(0x30, harness.START + 2)
+        for phase, count in (("data", 0), ("metadata-before", 1),
+                             ("metadata-after", -1), ("metadata-after", 8)):
+            with self.assertRaises(AssertionError):
+                harness.PublicationCut(phase, count)
+        partial = harness.PublicationCut("metadata-before", 4)
+        for index in range(3):
+            self.assertFalse(partial.observe(0x30, harness.START + 2 + index))
+        with self.assertRaises(AssertionError):
+            partial.observe(0x30, harness.START)
+
+    def test_namespace_contract_has_exclusive_names_and_preserves_unrelated_readback(self):
+        old = ("f:readme", "f:cut")
+        for operation, count in (("rename", 0), ("unlink", 0), ("mkdir", 4)):
+            before = harness.namespace_cut_contract(operation, "metadata-before")
+            self.assertEqual(before[1], count)
+            self.assertEqual(before[2], old)
+            self.assertEqual(before[3], (("readme", "HELLO INDIANOS"), ("cut", "saved")))
+            after = harness.namespace_cut_contract(operation, "metadata-after")
+            # Native Terminal listing replies contain at most 20 text bytes.
+            self.assertLessEqual(len(" ".join(after[2])), 20)
+            self.assertIn(("readme", "HELLO INDIANOS"), after[3])
+            if operation == "rename":
+                self.assertEqual(after[2], ("f:readme", "f:moved"))
+                self.assertIn(("moved", "saved"), after[3])
+            elif operation == "unlink":
+                self.assertEqual(after[2], ("f:readme",))
+                self.assertEqual(after[3], (("readme", "HELLO INDIANOS"),))
+            else:
+                self.assertEqual(after[2], old + ("d:d",))
+        for operation, phase in (("rename", "data"), ("unlink", "unknown"),
+                                  ("format", "metadata-after")):
+            with self.assertRaises(AssertionError):
+                harness.namespace_cut_contract(operation, phase)
+
+    def test_exact_namespace_listing_refuses_leaks_dual_names_and_stale_evidence(self):
+        prefix = b"IndianOS user: R055 Terminal directory: "
+        expected = ("f:readme", "f:moved")
+        good = prefix + b"f:readme f:moved\n"
+        harness.verify_namespace_listing(good, 0, expected)
+        for bad in (prefix + b"f:readme f:cut f:moved\n", prefix + b"f:readme\n",
+                    prefix + b"f:readme f:moved f:secret\n", good + good,
+                    prefix + b"f:readme f:moved f:moved\n", good[:-1]):
+            with self.assertRaises(AssertionError):
+                harness.verify_namespace_listing(bad, 0, expected)
+        with self.assertRaises(AssertionError):
+            harness.verify_namespace_listing(good, len(good), expected)
+        with self.assertRaises(AssertionError):
+            harness.verify_namespace_listing(good, 1, expected)
+
+    def test_only_metadata_only_prepublication_may_leave_unchanged_media(self):
+        before = bytearray(harness.TOTAL * 512)
+        for index, generation in enumerate((8, 9)):
+            at = (harness.START + index) * 512
+            before[at:at+8] = b"INDR027!"
+            struct.pack_into("<Q", before, at+16, generation)
+        original = bytes(before)
+        output = b"native namespace operation pending\n"
+        harness.verify_publication_cut(original, original, "metadata-before", output, 1, data_sectors=0)
+        for phase, sectors in (("metadata-before", 4), ("metadata-after", 0), ("data", 4)):
+            with self.assertRaises(AssertionError):
+                harness.verify_publication_cut(original, original, phase, output, 1, data_sectors=sectors)
+        corrupt = bytearray(original)
+        corrupt[(harness.START + 8) * 512] ^= 1
+        for phase in ("metadata-before", "metadata-after"):
+            with self.assertRaises(AssertionError):
+                harness.verify_publication_cut(original, bytes(corrupt), phase, output, 1, data_sectors=0)
+        at = harness.START * 512
+        struct.pack_into("<Q", before, at+16, 10)
+        struct.pack_into("<I", before, at+24, zlib.crc32(before[at:at+512]))
+        harness.verify_publication_cut(original, bytes(before), "metadata-after", output, 1, data_sectors=0)
+        before[(harness.START + 10) * 512] ^= 1
+        with self.assertRaises(AssertionError):
+            harness.verify_publication_cut(original, bytes(before), "metadata-after", output, 1, data_sectors=0)
+
     def pixel_startup(self):
         return b"\n".join(harness.PIXEL_APP_EVIDENCE +
                            (harness.LIFECYCLE_READY.encode(),)) + b"\n"

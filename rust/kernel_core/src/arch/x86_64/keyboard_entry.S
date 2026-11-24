@@ -1,10 +1,11 @@
-/* R014.2 IRQ1 entry, included only with feature test-irq-keyboard. */
+/* Single-BSP input entry. Hardware primitives only; no scheduler dispatch. */
 .text
 /* R014.2 legacy keyboard IRQ1 at IDT 0x21. Save every GPR so the
  * interrupted CPL3 code resumes intact after the Rust IRQ handler. */
-.global x86_64_keyboard_interrupt
-.type x86_64_keyboard_interrupt,@function
-x86_64_keyboard_interrupt:
+.macro INPUT_IRQ_ENTRY entry, dispatcher
+.global \entry
+.type \entry,@function
+\entry:
     cld
     pushq %rax
     pushq %rbx
@@ -21,7 +22,7 @@ x86_64_keyboard_interrupt:
     pushq %r13
     pushq %r14
     pushq %r15
-    call x86_64_keyboard_irq_dispatch
+    call \dispatcher
     popq %r15
     popq %r14
     popq %r13
@@ -37,7 +38,27 @@ x86_64_keyboard_interrupt:
     popq %rcx
     popq %rbx
     popq %rax
+    /* A real hardware interrupt may carry CPU-generated RF. The native
+     * ring-3 ABI disallows debug-resume state; normalize only that trusted
+     * bit, as the timer capture path does. Keep IF, DF and every GPR intact.
+     * At this point RIP/CS/RFLAGS are at offsets 0/8/16. Never alter a
+     * supervisor return frame or relax the INT 0x80 validation policy. */
+    testb $3, 8(%rsp)
+    jz 1f
+    btrq $16, 16(%rsp)
+1:
     iretq
-.size x86_64_keyboard_interrupt, .-x86_64_keyboard_interrupt
+.size \entry, .-\entry
+.endm
+INPUT_IRQ_ENTRY x86_64_keyboard_interrupt, x86_64_keyboard_irq_dispatch
+.if {mouse_irq}
+INPUT_IRQ_ENTRY x86_64_mouse_interrupt, x86_64_mouse_irq_dispatch
+/* Architectural local-APIC spurious vector: no EOI is required. */
+.global x86_64_input_spurious_interrupt
+.type x86_64_input_spurious_interrupt,@function
+x86_64_input_spurious_interrupt:
+    iretq
+.size x86_64_input_spurious_interrupt, .-x86_64_input_spurious_interrupt
+.endif
 
 .section .note.GNU-stack,"",@progbits

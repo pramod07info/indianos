@@ -11,16 +11,29 @@ use crate::batch5_session::Identity;
 use crate::fs_write_guard::{WriteGuard,Statistics};
 use core::marker::PhantomData;
 
+#[cfg(feature="normal-desktop")]
+fn storage_failure_log(message:&[u8]){
+    #[cfg(not(test))]
+    unsafe{
+        unsafe extern "C"{fn serial_write(message:*const core::ffi::c_char);}
+        serial_write(message.as_ptr().cast());
+    }
+    #[cfg(test)]
+    let _=message;
+}
+
 pub const READ:u64=1;
 pub const WRITE:u64=2;
 /// Versioned descriptor ABI query, returned by filesystem operation 37.
 pub const FS_ABI_VERSION:u16=1;
 pub const FS_ABI_DESCRIPTOR_BYTES:u16=64;
-pub const FS_ABI_FEATURES:u32=7; // descriptors, range locks, persistent mode permissions
+/// Selected path mutations can preserve verified unrelated foreign readers.
+pub const FS_ABI_UNRELATED_READERS:u32=8;
+pub const FS_ABI_FEATURES:u32=7|FS_ABI_UNRELATED_READERS;
 pub const FS_ABI_INFO:u64=FS_ABI_VERSION as u64|
     ((FS_ABI_DESCRIPTOR_BYTES as u64)<<16)|((FS_ABI_FEATURES as u64)<<32);
 const SLOTS:usize=4;
-#[derive(Clone,Copy)]
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
 struct Handle {
     token:u64, pid:u32, generation:u64, mode:u64, offset:u64,
     // Durable metadata generation at last validated I/O. A path by itself
@@ -398,12 +411,20 @@ impl FileHandles{
            WriteGuard::allow_path(target).is_err(){return Err(FsError::InvalidName);}
         Ok(target)
     }
-    // The current COW identity is volume-wide. Every mutation changes its
-    // generation, including descriptor edits to an unrelated file. Preserve
-    // foreign open descriptors rather than turning them into stale tokens.
+    // Descriptor-mutation routes retain conservative volume-wide leases.
+    // Selected path mutations instead use the exact untouched-reader witness
+    // below to coordinate their own global-generation change safely.
     fn has_foreign_descriptors(&self,owner:Identity)->bool{
         self.entries.iter().any(|handle|handle.token!=0 &&
             (handle.pid!=owner.pid||handle.generation!=owner.generation))
+    }
+    /// Conservative namespace footprint for selected path mutations. Prefix
+    /// comparisons are component-aware: /shared/a must not protect /shared/ab.
+    fn foreign_path_conflicts(&self,owner:Identity,path:&str)->bool{
+        self.entries.iter().any(|handle|handle.token!=0&&
+            (handle.pid!=owner.pid||handle.generation!=owner.generation)&&
+            (crate::vfs_path::is_within_tree(handle.pathname(),path)==Ok(true)||
+             crate::vfs_path::is_within_tree(path,handle.pathname())==Ok(true)))
     }
     fn descriptor_action_mutates(action:u64)->bool{
         matches!(action,3|6..=13|16|24|26|28..=32|38)
@@ -416,10 +437,59 @@ impl FileHandles{
         Ok((start,end))
     }
     fn conflicting_lock(&self,owner:Identity,path:&str,start:u64,end:u64,write:bool)->bool{
+        if start==end{return false;}
         self.entries.iter().any(|peer|peer.token!=0&&peer.lock_kind!=0&&
             (peer.pid!=owner.pid||peer.generation!=owner.generation)&&
             peer.pathname()==path&&start<peer.lock_end&&peer.lock_start<end&&
             (write||peer.lock_kind==2))
+    }
+    /// Admit the logical bytes observed/changed by a descriptor operation.
+    /// Uses only kernel-owned handle metadata, so callers can reject overlap
+    /// before GPT probing, payload checksums or ACL lookup touch the device.
+    /// Whole-file searches and structural edits remain conservative: their
+    /// affected suffix/EOF cannot be inferred safely from a cached cursor.
+    fn descriptor_lock_preflight(&self,action:u64,owner:Identity,token:u64,
+        argument:u64,path:&str,bytes:usize)->Result<(),FsError>{
+        let read=matches!(action,2|14|15|17..=23|25);
+        let write=matches!(action,3|6..=13|16|24|26|28|30|31);
+        if !read&&!write{return Ok(());}
+        let h=self.entries[self.index(owner,token)?];
+        if !self.root_allows(owner,h.pathname())||
+            (read&&h.mode&READ==0)||(write&&h.mode&WRITE==0){
+            return Err(FsError::InvalidName);
+        }
+        match action{
+            2|22|25 if bytes==0||bytes>72=>return Err(FsError::TooLarge),
+            3|26|28 if bytes==0||bytes>256=>return Err(FsError::TooLarge),
+            20 if bytes>256=>return Err(FsError::TooLarge),
+            10=>{
+                if bytes!=1{return Err(FsError::InvalidName);}
+                if argument==0||argument>256{return Err(FsError::TooLarge);}
+            },
+            _=>{},
+        }
+        // A source token does not authorize mutation of a separately locked
+        // destination, especially when swapping two existing file objects.
+        if matches!(action,13|16|31){
+            let mut canonical=[0u8;24];
+            let target=self.write_destination(owner,path,&mut canonical)?;
+            if self.conflicting_lock(owner,target,0,MAX_FILE_BYTES as u64,true){
+                return Err(FsError::Full);
+            }
+        }
+        let bounded=match action{
+            2|3|28=>Some((h.offset,bytes as u64)),
+            25|26=>Some((argument,bytes as u64)),
+            10=>Some((h.offset,argument)),
+            20|22=>Some((0,bytes as u64)),
+            _=>None,
+        };
+        let (start,end)=if let Some((start,length))=bounded{
+            (start,start.checked_add(length).ok_or(FsError::TooLarge)?)
+        }else{(0,MAX_FILE_BYTES as u64)};
+        if self.conflicting_lock(owner,h.pathname(),start,end,write){
+            Err(FsError::Full)
+        }else{Ok(())}
     }
     /// Locks are cached capabilities, owned by the descriptor's authenticated
     /// process incarnation. Closing/revoking a handle removes its lock too.
@@ -553,7 +623,7 @@ impl FileHandles{
            self.has_foreign_descriptors(owner){
             return Err(FsError::InvalidName);
         }
-        Ok(())
+        self.descriptor_lock_preflight(action,owner,token,argument,path,buffer.len())
     }
     pub fn open<D:BlockDevice>(&mut self,pid:u32,path:&str,mode:u64,
                                fs:&mut HierVfs<D>)->Result<u64,FsError>{
@@ -615,9 +685,9 @@ impl FileHandles{
         let h=self.entries[slot];
         if h.mode&READ==0 || h.filesystem_generation!=fs.generation(){
             // Never let a stale path handle acquire a newly created object.
-            // In the bounded COW implementation this is a conservative
-            // volume generation check: an unrelated mutation also requires
-            // closing and reopening the handle.
+            // Only coordinated selected-path commits may advance an untouched
+            // reader's generation. Any remaining mismatch requires closing
+            // and reopening rather than inferring identity from the path.
             return Err(FsError::InvalidName);
         }
         let end=h.offset.checked_add(out.len() as u64).ok_or(FsError::TooLarge)?;
@@ -633,6 +703,10 @@ impl FileHandles{
                 // uncertain. The caller must explicitly reopen on verified
                 // storage; a subsequent read cannot replay a stale token.
                 if matches!(error,FsError::Io|FsError::InvalidVolume){
+                    #[cfg(feature="normal-desktop")]
+                    storage_failure_log(if error==FsError::Io{
+                        b"IndianOS: selected descriptor payload read IO failure\n\0"
+                    }else{b"IndianOS: selected descriptor payload integrity failure\n\0"});
                     self.entries[slot]=Handle::EMPTY;
                 }
                 return Err(error);
@@ -1210,6 +1284,11 @@ impl FileHandles{
         if matches!(action,34..=37){
             return self.descriptor_control(action,owner,token,argument,path,buffer);
         }
+        // Recheck even for callers supplying an already mounted filesystem.
+        // Preserve the selected volume-wide generation lease before locks.
+        if self.selected_volume.is_some()&&Self::descriptor_action_mutates(action)&&
+           self.has_foreign_descriptors(owner){return Err(FsError::InvalidName);}
+        self.descriptor_lock_preflight(action,owner,token,argument,path,buffer.len())?;
         if owner.generation!=0{
             let credentials=self.credentials_for(owner)?;
             // Check immutable namespace and S0 destination policy before
@@ -1247,25 +1326,10 @@ impl FileHandles{
             self.entries.fill(Handle::EMPTY);
             return Ok(0);
         }
-        if !matches!(action,1..=5){
-            if let Ok(slot)=self.index(owner,token){
-                let h=self.entries[slot];
-                let read=matches!(action,2|14|15|17..=23|25);
-                if (read||Self::descriptor_action_mutates(action))&&
-                    self.conflicting_lock(owner,h.pathname(),0,MAX_FILE_BYTES as u64,!read){
-                    return Err(FsError::Full);
-                }
-            }
-        }
         if self.selected_volume.is_some()&&matches!(action,4|5){
             return self.cached_selected_descriptor_operation(
                 action,owner,token,argument,path,buffer);
         }
-        // Repeat admission at execution as well: kernel callers using an
-        // already mounted selected volume cannot bypass the physical adapter.
-        // Unselected legacy volumes retain their established behavior.
-        if self.selected_volume.is_some()&&Self::descriptor_action_mutates(action)&&
-           self.has_foreign_descriptors(owner){return Err(FsError::InvalidName);}
         match action{
             1=>self.open_for(owner,path,argument,fs),
             2=>self.read_for(owner,token,buffer,fs).map(|n|n as u64),
@@ -1351,8 +1415,15 @@ fn operation_for(table:&mut FileHandles,action:u64,owner:Identity,
                 action,owner,token,argument,path,buffer);
         }
         let mut disk=probe_selected_ata(table)?;
-        return operation_on_selected_volume(table,action,owner,token,argument,
+        let outcome=operation_on_selected_volume(table,action,owner,token,argument,
             path,buffer,&mut disk,receipt);
+        #[cfg(all(feature="normal-desktop",not(test)))]
+        if matches!(outcome,Err(FsError::Io|FsError::InvalidVolume)){
+            // Preserve the actual task-file stage when a read/health probe
+            // retires authority. No reset, retry or error conversion occurs.
+            storage_failure_log(&disk.failure_diagnostic());
+        }
+        return outcome;
     }
     // Ordinary desktop file calls must never inherit the scratch-volume
     // compatibility route used by the old opt-in acceptance profiles.
@@ -1375,6 +1446,8 @@ fn probe_selected_ata(table:&mut FileHandles)->Result<AtaPio,FsError>{
     match unsafe{AtaPio::probe()}{
         Ok(disk)=>Ok(disk),
         Err(_)=>{
+            #[cfg(feature="normal-desktop")]
+            storage_failure_log(b"IndianOS: selected descriptor ATA probe failed\n\0");
             table.selected_quarantined=true;table.entries.fill(Handle::EMPTY);
             Err(FsError::Io)
         }
@@ -1423,12 +1496,10 @@ fn selected_path_preflight(table:&FileHandles,owner:Identity,action:u64,
     if mutating&&(owner.pid!=1||WriteGuard::allow_path(canonical).is_err()){
         return Err(FsError::InvalidName);
     }
-    // This COW service versions the entire volume, not individual inodes.
-    // A successful path mutation revokes cached descriptors, so another
-    // process's active descriptor is a read lease on that volume. Reject
-    // before probing media rather than silently revoke its authority. A
-    // close, root revocation or process retirement releases the lease.
-    if mutating && table.has_foreign_descriptors(owner) {
+    // Protect the mutation's namespace footprint before probing the device.
+    // Unrelated readers may survive only after the mounted-generation and
+    // exact cached-authority witness below has also been verified.
+    if mutating && table.foreign_path_conflicts(owner,canonical) {
         return Err(FsError::InvalidName);
     }
     if matches!(action,7|9){
@@ -1439,6 +1510,7 @@ fn selected_path_preflight(table:&FileHandles,owner:Identity,action:u64,
         if !table.root_allows(owner,second)||WriteGuard::allow_path(second).is_err(){
             return Err(FsError::InvalidName);
         }
+        if table.foreign_path_conflicts(owner,second){return Err(FsError::InvalidName);}
         // Action 9 moves an entire directory subtree. Deny self/root and
         // descendant cycles before physical ATA discovery or I/O. The live
         // HierVfs repeats this guard after mount as a second trust boundary.
@@ -1449,6 +1521,23 @@ fn selected_path_preflight(table:&FileHandles,owner:Identity,action:u64,
     if !matches!(action,3|5|11)&&used!=0{return Err(FsError::InvalidName);}
     if action==11&&used==0{return Err(FsError::TooLarge);}
     Ok(guard)
+}
+
+/// No persistent object identity is inferred from a pathname/checksum. The
+/// serialized service may carry only an unchanged, live foreign read lease
+/// across its OWN verified mutation of an unrelated namespace footprint.
+/// An intervening external generation, PID/namespace change or handle edit
+/// invalidates this proof. It must never repair an already stale descriptor.
+fn selected_foreign_leases_current(table:&FileHandles,owner:Identity,
+    prior:&[Handle;SLOTS],namespaces:&[Option<NamespaceReceipt>;SLOTS],generation:u64)->bool{
+    prior.iter().enumerate().all(|(slot,handle)|{
+        if handle.token==0||(handle.pid==owner.pid&&handle.generation==owner.generation){return true;}
+        let identity=Identity{pid:handle.pid,generation:handle.generation};
+        table.entries[slot]==*handle&&handle.mode==READ&&
+            handle.filesystem_generation==generation&&table.owns(identity)&&
+            table.root_allows(identity,handle.pathname())&&
+            namespaces[slot].is_some()&&table.namespace_receipt(identity).ok()==namespaces[slot]
+    })
 }
 
 /// Existing syscall32 path ABI on the admitted volume. Authentication and
@@ -1464,6 +1553,13 @@ pub fn selected_path_operation_on_device<D:BlockDevice>(
     if mutating&&table.write_guard.preflight(path,charge).is_err(){
         return Err(FsError::InvalidName);
     }
+    let prior_leases=table.entries;
+    let prior_namespaces:[Option<NamespaceReceipt>;SLOTS]=core::array::from_fn(|slot|{
+        let handle=prior_leases[slot];
+        if handle.token!=0&&(handle.pid!=owner.pid||handle.generation!=owner.generation){
+            table.namespace_receipt(Identity{pid:handle.pid,generation:handle.generation}).ok()
+        }else{None}
+    });
     let mut volume=match crate::m1_partition::mount_partition_receipt_healthy(disk,receipt){
         Ok(volume)=>volume,
         Err(_)=>{
@@ -1472,6 +1568,11 @@ pub fn selected_path_operation_on_device<D:BlockDevice>(
         }
     };
     if !table.selected_operation_guard_is_current(guard){return Err(FsError::InvalidName);}
+    let prior_generation=volume.generation();
+    if mutating&&!selected_foreign_leases_current(
+        table,owner,&prior_leases,&prior_namespaces,prior_generation){
+        return Err(FsError::InvalidName);
+    }
     let credentials=table.credentials_for(owner)?;
     // Authorization can itself perform metadata and directory reads on the
     // selected device. A transport failure or corrupt mount at this stage
@@ -1518,10 +1619,22 @@ pub fn selected_path_operation_on_device<D:BlockDevice>(
                 if size>buffer.len(){return Err(FsError::TooLarge);}
                 buffer[..size].copy_from_slice(&scratch[..size]);
             }else{
+                if !table.selected_operation_guard_is_current(guard)||
+                   !selected_foreign_leases_current(table,owner,&prior_leases,
+                       &prior_namespaces,prior_generation){
+                    table.selected_quarantined=true;table.entries.fill(Handle::EMPTY);
+                    return Err(FsError::InvalidVolume);
+                }
                 table.write_guard.completed(charge);
-                // A path mutation may rename/unlink an open file. Do not
-                // allow an old descriptor to follow a replacement pathname.
-                table.entries.fill(Handle::EMPTY);
+                // Calling-owner descriptors retain the established revocation
+                // behavior. Verified unrelated foreign readers retain every
+                // capability field except the coordinated volume generation.
+                let generation=volume.generation();
+                for handle in &mut table.entries{
+                    if handle.pid==owner.pid&&handle.generation==owner.generation{
+                        *handle=Handle::EMPTY;
+                    }else if handle.token!=0{handle.filesystem_generation=generation;}
+                }
             }
             table.last_syscall_namespace=Some(guard.namespace);
             Ok(size)
@@ -2526,12 +2639,72 @@ mod r094_authenticated_cow_ops {
   let mut table=FileHandles::new();let owner=table.bind_process(1).unwrap();
   assert_eq!(operation_authenticated(&mut table,37,owner,0,0,"",&mut[]),Ok(FS_ABI_INFO));
   assert_eq!(FS_ABI_INFO&0xffff,1);assert_eq!((FS_ABI_INFO>>16)&0xffff,64);
+  assert_eq!((FS_ABI_INFO>>32) as u32&FS_ABI_UNRELATED_READERS,FS_ABI_UNRELATED_READERS);
   assert_eq!(operation_authenticated(&mut table,37,owner,1,0,"",&mut[]),Err(FsError::InvalidName));
   assert_eq!(operation_authenticated(&mut table,37,owner,0,1,"",&mut[]),Err(FsError::InvalidName));
   assert_eq!(FileHandles::lock_range(u64::MAX),Err(FsError::TooLarge));
   assert_eq!(FileHandles::lock_range(MAX_FILE_BYTES as u64),Err(FsError::TooLarge));
   let replacement=table.bind_process(1).unwrap();assert_ne!(owner,replacement);
   assert_eq!(operation_authenticated(&mut table,37,owner,0,0,"",&mut[]),Err(FsError::InvalidName));
+ }
+ #[test]fn g67_bounded_dispatched_reads_do_not_observe_a_foreign_locked_range(){
+  let mut fs=volume();let mut table=FileHandles::new();
+  let writer=table.bind_process(1).unwrap();let reader=table.bind_process(2).unwrap();
+  let fd=table.dispatch_authenticated(1,writer,0,READ|WRITE,"/shared/note",&mut[],&mut fs).unwrap();
+  let other=table.dispatch_authenticated(1,reader,0,READ,"/shared/note",&mut[],&mut fs).unwrap();
+  assert_eq!(table.dispatch_authenticated(35,writer,fd,1|(1u64<<32),"",&mut[],&mut fs),Ok(0));
+  let mut byte=[0xa5];
+  for action in [25,22]{
+   assert_eq!(table.dispatch_authenticated(action,reader,other,0,"",&mut byte,&mut fs),Ok(1));
+   assert_eq!(byte,[b'a']);
+  }
+  assert_eq!(table.dispatch_authenticated(20,reader,other,0,"",&mut [b'a'],&mut fs),Ok(1));
+  byte=[0xa5];
+  assert_eq!(table.dispatch_authenticated(25,reader,other,1,"",&mut byte,&mut fs),Err(FsError::Full));
+  assert_eq!(byte,[0xa5]);
+  assert_eq!(table.entries[table.index(reader,other).unwrap()].offset,0);
+  // CRC and arbitrary search expose the whole file, so remain excluded.
+  assert_eq!(table.dispatch_authenticated(14,reader,other,0,"",&mut[],&mut fs),Err(FsError::Full));
+  assert_eq!(table.dispatch_authenticated(17,reader,other,0,"",&mut [b'a'],&mut fs),Err(FsError::Full));
+  assert!(table.retire_process(writer));
+  assert_eq!(table.dispatch_authenticated(25,reader,other,1,"",&mut byte,&mut fs),Ok(1));
+  assert_eq!(byte,[b'b']);
+ }
+ #[test]fn g67_positioned_write_conflict_preserves_budget_cursor_and_checkpoint(){
+  let mut fs=volume();let mut table=FileHandles::new();
+  let writer=table.bind_process(1).unwrap();let reader=table.bind_process(2).unwrap();
+  let fd=table.dispatch_authenticated(1,writer,0,WRITE,"/shared/note",&mut[],&mut fs).unwrap();
+  let other=table.dispatch_authenticated(1,reader,0,READ,"/shared/note",&mut[],&mut fs).unwrap();
+  assert_eq!(table.dispatch_authenticated(34,reader,other,1|(1u64<<32),"",&mut[],&mut fs),Ok(0));
+  let generation=fs.generation();let writes=table.security_statistics().completed_writes;
+  for action in [26,10]{
+   table.seek_for(writer,fd,1).unwrap();
+   assert_eq!(table.dispatch_authenticated(action,writer,fd,1,"",&mut [b'X'],&mut fs),Err(FsError::Full));
+   assert_eq!(table.entries[table.index(writer,fd).unwrap()].offset,1);
+   assert_eq!(fs.generation(),generation);
+   assert_eq!(table.security_statistics().completed_writes,writes);
+  }
+  assert_eq!(table.dispatch_authenticated(26,writer,fd,0,"",&mut [b'X'],&mut fs),Ok(1));
+  assert_eq!(table.entries[table.index(writer,fd).unwrap()].offset,1);
+  assert_eq!(read(&mut fs,"/shared/note"),b"Xbc");
+ }
+ #[test]fn g67_file_swap_respects_the_destination_lock_as_well_as_source(){
+  let mut fs=volume();let mut table=FileHandles::new();
+  let writer=table.bind_process(1).unwrap();let reader=table.bind_process(2).unwrap();
+  let source=table.dispatch_authenticated(1,writer,0,WRITE,"/shared/note",&mut[],&mut fs).unwrap();
+  let target=table.dispatch_authenticated(1,reader,0,READ,"/shared/other",&mut[],&mut fs).unwrap();
+  assert_eq!(table.dispatch_authenticated(34,reader,target,1u64<<32,"",&mut[],&mut fs),Ok(0));
+  let generation=fs.generation();
+  assert_eq!(table.dispatch_authenticated(16,writer,source,0,"/shared/other",&mut[],&mut fs),Err(FsError::Full));
+  assert_eq!(fs.generation(),generation);
+  assert_eq!(read(&mut fs,"/shared/note"),b"abc");
+  assert_eq!(read(&mut fs,"/shared/other"),b"xyz");
+  assert_eq!(table.security_statistics().completed_writes,0);
+  assert!(table.index(writer,source).is_ok());
+  assert_eq!(table.dispatch_authenticated(5,reader,target,0,"",&mut[],&mut fs),Ok(0));
+  assert_eq!(table.dispatch_authenticated(16,writer,source,0,"/shared/other",&mut[],&mut fs),Ok(1));
+  assert_eq!(read(&mut fs,"/shared/note"),b"xyz");
+  assert_eq!(read(&mut fs,"/shared/other"),b"abc");
  }
  #[test]fn persistent_permissions_enforce_kernel_credentials_and_native_chmod(){
   struct FlushDisk(Disk);
@@ -3219,6 +3392,38 @@ mod r106_checked_partition_authenticated_file_api_tests{
   assert_eq!(volume.generation(),before);
   drop(volume);assert_eq!(disk.writes,writes);
  }
+ #[test]fn g67_selected_positioned_read_admits_disjoint_bytes_before_media_and_releases_on_close(){
+  let (mut disk,receipt)=disk();let mut table=FileHandles::new();
+  prepare_selected_volume_kernel(&mut table,&mut disk,receipt).unwrap();
+  let writer=table.bind_process(1).unwrap();let reader=table.bind_process(2).unwrap();
+  let fd=operation_on_selected_volume(&mut table,1,writer,0,WRITE,
+    "/shared/note",&mut[],&mut disk,receipt).unwrap();
+  let other=operation_on_selected_volume(&mut table,1,reader,0,READ,
+    "/shared/note",&mut[],&mut disk,receipt).unwrap();
+  assert_eq!(operation_on_selected_volume(&mut table,35,writer,fd,1|(1u64<<32),"",
+    &mut[],&mut OfflineDescriptorDevice,receipt),Ok(0));
+  let mut byte=[0xa5];let writes=disk.writes;
+  // A conflicting request must not even inspect device capacity, GPT or ACLs.
+  assert_eq!(operation_on_selected_volume(&mut table,25,reader,other,1,"",
+    &mut byte,&mut OfflineDescriptorDevice,receipt),Err(FsError::Full));
+  assert_eq!(byte,[0xa5]);
+  assert_eq!(operation_on_selected_volume(&mut table,25,writer,other,1,"",
+    &mut byte,&mut OfflineDescriptorDevice,receipt),Err(FsError::InvalidName));
+  assert_eq!(operation_on_selected_volume(&mut table,25,reader,other,0,"",
+    &mut byte,&mut disk,receipt),Ok(1));
+  assert_eq!(byte,[b'p']);assert_eq!(disk.writes,writes);
+  assert_eq!(table.entries[table.index(reader,other).unwrap()].offset,0);
+  // Range precision does not weaken the selected volume's generation lease.
+  assert_eq!(operation_on_selected_volume(&mut table,26,writer,fd,0,"",
+    &mut [b'X'],&mut OfflineDescriptorDevice,receipt),Err(FsError::InvalidName));
+  assert_eq!(operation_on_selected_volume(&mut table,5,writer,fd,0,"",
+    &mut[],&mut OfflineDescriptorDevice,receipt),Ok(0));
+  assert_eq!(operation_on_selected_volume(&mut table,25,reader,other,1,"",
+    &mut byte,&mut disk,receipt),Ok(1));
+  assert_eq!(byte,[b'e']);
+  assert_eq!(table.entries[table.index(reader,other).unwrap()].offset,0);
+  assert_eq!(disk.writes,writes);
+ }
 
  #[test]fn selected_descriptor_lease_is_released_by_process_and_namespace_retirement(){
   for mode in 0..3{
@@ -3407,10 +3612,12 @@ mod r106_checked_partition_authenticated_file_api_tests{
   let before=(disk.reads,disk.writes);
   let stats=table.security_statistics();
   for (action,path,target,used) in [
-    (1,"/shared/new","",0),(2,"/shared/dir","",0),
-    (3,"/shared/new","",1),(5,"/shared/note","",1),
+    (1,"/shared/note","",0),(2,"/shared","",0),
+    (3,"/shared/note","",1),(5,"/shared/note","",1),
     (6,"/shared/note","",0),(7,"/shared/note","/shared/new",0),
-    (9,"/shared/dir","/shared/renamed",0),(11,"/shared/note","",1)]{
+    (7,"/shared/new","/shared/note",0),
+    (9,"/shared","/renamed",0),(9,"/shared/new","/shared/note",0),
+    (11,"/shared/note","",1)]{
     let mut data=[b'X';16];
     assert_eq!(selected_path_operation_on_device(&mut table,admin,action,path,
       target,0,&mut data,used,&mut disk),Err(FsError::InvalidName));
@@ -3433,6 +3640,177 @@ mod r106_checked_partition_authenticated_file_api_tests{
     &mut[],&mut disk,receipt),Ok(0));
   assert_eq!(selected_path_operation_on_device(&mut table,admin,7,
     "/shared/note","/shared/new",0,&mut[],0,&mut disk),Ok(0));
+ }
+
+ #[test]fn selected_unrelated_path_commits_preserve_exact_foreign_read_capability(){
+  let (mut disk,receipt)=disk();let mut table=FileHandles::new();
+  prepare_selected_volume_kernel(&mut table,&mut disk,receipt).unwrap();
+  let admin=table.bind_process(1).unwrap();let guest=table.bind_process(2).unwrap();
+  let own=operation_on_selected_volume(&mut table,1,admin,0,READ,
+    "/shared/note",&mut[],&mut disk,receipt).unwrap();
+  let reader=operation_on_selected_volume(&mut table,1,guest,0,READ,
+    "/shared/note",&mut[],&mut disk,receipt).unwrap();
+  assert_eq!(operation_on_selected_volume(&mut table,4,guest,reader,3,"",
+    &mut[],&mut disk,receipt),Ok(3));
+  assert_eq!(operation_on_selected_volume(&mut table,34,guest,reader,(3u64<<32)|4,"",
+    &mut[],&mut disk,receipt),Ok(0));
+  let slot=table.index(guest,reader).unwrap();let original=table.entries[slot];
+  for (action,path,target,payload) in [
+    (3,"/shared/note2","",b"other".as_slice()),
+    (5,"/shared/note2","",b"new".as_slice()),
+    (7,"/shared/note2","/shared/renamed",b"".as_slice()),
+    (1,"/shared/dir","",b"".as_slice()),
+    (3,"/shared/dir/a","",b"a".as_slice()),
+    (9,"/shared/dir","/shared/moved",b"".as_slice()),
+    (6,"/shared/moved/a","",b"".as_slice()),
+    (2,"/shared/moved","",b"".as_slice())]{
+   let generation=table.entries[slot].filesystem_generation;
+   assert_eq!(selected_path_operation_on_device(&mut table,admin,action,path,target,
+       0,&mut payload.to_vec(),payload.len(),&mut disk),Ok(0));
+   let mut expected=original;expected.filesystem_generation=generation+1;
+   assert_eq!(table.entries[slot],expected);
+   // Positioned read retains the existing token, held lock and cursor.
+   let mut read=[0u8;9];
+   assert_eq!(operation_on_selected_volume(&mut table,25,guest,reader,0,"",
+       &mut read,&mut disk,receipt),Ok(9));
+   assert_eq!(&read,b"persisted");assert_eq!(table.entries[slot],expected);
+  }
+  assert_eq!(table.security_statistics().completed_writes,8);
+  assert_eq!(operation_on_selected_volume(&mut table,2,admin,own,0,"",
+    &mut[0;9],&mut OfflineDescriptorDevice,receipt),Err(FsError::InvalidName));
+  // Protected content is still excluded until the real foreign close.
+  assert_eq!(selected_path_operation_on_device(&mut table,admin,6,"/shared/note",
+    "",0,&mut[],0,&mut OfflineDescriptorDevice),Err(FsError::InvalidName));
+  assert_eq!(operation_on_selected_volume(&mut table,5,guest,reader,0,"",
+    &mut[],&mut OfflineDescriptorDevice,receipt),Ok(0));
+  assert_eq!(selected_path_operation_on_device(&mut table,admin,6,"/shared/note",
+    "",0,&mut[],0,&mut disk),Ok(0));
+ }
+
+ #[test]fn selected_transient_files_preview_survives_unrelated_path_refreshes(){
+  let (mut disk,receipt)=disk();let mut table=FileHandles::new();
+  prepare_selected_volume_kernel(&mut table,&mut disk,receipt).unwrap();
+  let admin=table.bind_process(1).unwrap();let guest=table.bind_process(2).unwrap();
+  for step in 0..5{
+   if step!=0{
+    let (action,path,target,payload)=match step{
+     1=>(3,"/shared/tmp","",b"".as_slice()),
+     2=>(5,"/shared/tmp","",b"violet".as_slice()),
+     3=>(7,"/shared/tmp","/shared/renamed",b"".as_slice()),
+     _=>(6,"/shared/renamed","",b"".as_slice()),
+    };
+    assert_eq!(selected_path_operation_on_device(&mut table,admin,action,path,target,
+       0,&mut payload.to_vec(),payload.len(),&mut disk),Ok(0));
+   }
+   let alias=table.mount_alias_for_current_root_kernel(guest).unwrap();
+   assert!(table.mount_alias_allows(alias,guest,"/shared/note"));
+   let token=operation_on_selected_volume(&mut table,1,guest,0,READ,
+      "/shared/note",&mut[],&mut disk,receipt).unwrap();
+   assert_eq!(operation_on_selected_volume(&mut table,37,guest,0,0,"",
+      &mut[],&mut OfflineDescriptorDevice,receipt),Ok(FS_ABI_INFO));
+   assert_eq!(operation_on_selected_volume(&mut table,34,guest,token,0,"",
+      &mut[],&mut OfflineDescriptorDevice,receipt),Ok(0));
+   assert_eq!(operation_on_selected_volume(&mut table,35,guest,token,0,"",
+      &mut[],&mut OfflineDescriptorDevice,receipt),Err(FsError::InvalidName));
+   assert_eq!(operation_on_selected_volume(&mut table,38,guest,token,0o777,"",
+      &mut[],&mut OfflineDescriptorDevice,receipt),Err(FsError::InvalidName));
+   let mut out=[0xa5;72];
+   assert_eq!(operation_on_selected_volume(&mut table,2,guest,token,0,"",
+      &mut out,&mut disk,receipt),Ok(9));
+   assert_eq!(&out[..9],b"persisted");
+   // A live unrelated commit between read and unlock must preserve the
+   // original token, process incarnation, range and cursor.
+   assert_eq!(selected_path_operation_on_device(&mut table,admin,3,
+      "/shared/leaseprobe","",0,&mut[],0,&mut disk),Ok(0));
+   let slot=table.index(guest,token).unwrap();
+   assert_eq!(table.entries[slot].lock_kind,1);
+   assert_eq!(table.entries[slot].offset,9);
+   assert_eq!(selected_path_operation_on_device(&mut table,admin,6,
+      "/shared/leaseprobe","",0,&mut[],0,&mut disk),Ok(0));
+   assert_eq!(table.index(guest,token),Ok(slot));
+   assert_eq!(operation_on_selected_volume(&mut table,36,guest,token,0,"",
+      &mut[],&mut OfflineDescriptorDevice,receipt),Ok(0));
+   assert_eq!(operation_on_selected_volume(&mut table,5,guest,token,0,"",
+      &mut[],&mut OfflineDescriptorDevice,receipt),Ok(0));
+   assert!(table.entries.iter().all(|h|h.token==0));
+  }
+ }
+
+ #[test]fn selected_unrelated_write_cannot_refresh_a_foreign_external_generation(){
+  let (mut disk,receipt)=disk();let mut table=FileHandles::new();
+  prepare_selected_volume_kernel(&mut table,&mut disk,receipt).unwrap();
+  let admin=table.bind_process(1).unwrap();let guest=table.bind_process(2).unwrap();
+  let reader=operation_on_selected_volume(&mut table,1,guest,0,READ,
+    "/shared/note",&mut[],&mut disk,receipt).unwrap();
+  let original=table.entries;let stats=table.security_statistics();
+  // A privileged write outside this service is not a coordinated mutation.
+  {
+   let mut fs=crate::m1_partition::mount_partition_receipt_healthy(&mut disk,receipt).unwrap();
+   fs.create("/shared/external",b"outside").unwrap();
+  }
+  let writes=disk.writes;
+  assert_eq!(selected_path_operation_on_device(&mut table,admin,3,"/shared/new",
+    "",0,&mut b"X".to_vec(),1,&mut disk),Err(FsError::InvalidName));
+  assert_eq!(disk.writes,writes);assert_eq!(table.entries,original);
+  assert_eq!(table.security_statistics(),stats);assert!(!table.selected_quarantined);
+  assert_eq!(operation_on_selected_volume(&mut table,5,guest,reader,0,"",
+    &mut[],&mut OfflineDescriptorDevice,receipt),Ok(0));
+  assert_eq!(selected_path_operation_on_device(&mut table,admin,3,"/shared/new",
+    "",0,&mut b"X".to_vec(),1,&mut disk),Ok(0));
+ }
+
+ #[test]fn selected_reader_namespace_and_quota_failures_do_not_refresh_leases(){
+  let (mut disk,receipt)=disk();let mut table=FileHandles::new();
+  prepare_selected_volume_kernel(&mut table,&mut disk,receipt).unwrap();
+  let admin=table.bind_process(1).unwrap();let guest=table.bind_process(2).unwrap();
+  let reader=operation_on_selected_volume(&mut table,1,guest,0,READ,
+    "/shared/note",&mut[],&mut disk,receipt).unwrap();
+  let prior=table.entries;
+  let namespaces=core::array::from_fn(|slot|{
+   let h=prior[slot];if h.token!=0&&h.pid==guest.pid{
+    table.namespace_receipt(guest).ok()
+   }else{None}
+  });
+  let generation=table.entries[table.index(guest,reader).unwrap()].filesystem_generation;
+  assert!(selected_foreign_leases_current(&table,admin,&prior,&namespaces,generation));
+  assert!(table.narrow_service_write_budget(admin,0,0));
+  assert_eq!(selected_path_operation_on_device(&mut table,admin,3,"/shared/new",
+    "",0,&mut b"X".to_vec(),1,&mut OfflineDescriptorDevice),Err(FsError::InvalidName));
+  assert_eq!(table.entries,prior);assert_eq!(table.security_statistics().completed_writes,0);
+  assert_eq!(table.security_statistics().changed_bytes,0);
+  table.narrow_root_kernel(guest,"/shared").unwrap();
+  assert!(!selected_foreign_leases_current(&table,admin,&prior,&namespaces,generation));
+  let replacement=table.bind_process(2).unwrap();assert_ne!(replacement,guest);
+  assert!(!selected_foreign_leases_current(&table,admin,&prior,&namespaces,generation));
+ }
+
+ #[test]fn selected_unrelated_write_failure_revokes_readers_without_token_revival(){
+  struct RefuseWrite<'a>{disk:&'a mut Disk,attempts:&'a mut usize}
+  impl BlockDevice for RefuseWrite<'_>{
+   fn sector_count(&self)->u64{self.disk.sector_count()}
+   fn read_sector(&mut self,l:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{self.disk.read_sector(l,out)}
+   fn write_sector(&mut self,_:u64,_:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+    *self.attempts+=1;Err(BlockError::Io)
+   }
+  }
+  let (mut disk,receipt)=disk();let mut table=FileHandles::new();
+  prepare_selected_volume_kernel(&mut table,&mut disk,receipt).unwrap();
+  let admin=table.bind_process(1).unwrap();let guest=table.bind_process(2).unwrap();
+  let reader=operation_on_selected_volume(&mut table,1,guest,0,READ,
+    "/shared/note",&mut[],&mut disk,receipt).unwrap();
+  let stats=table.security_statistics();let mut attempts=0;
+  assert_eq!(selected_path_operation_on_device(&mut table,admin,3,"/shared/new",
+    "",0,&mut b"X".to_vec(),1,&mut RefuseWrite{disk:&mut disk,attempts:&mut attempts}),Err(FsError::Io));
+  assert_eq!(attempts,1);
+  assert!(table.selected_quarantined);assert_eq!(table.entries,[Handle::EMPTY;SLOTS]);
+  assert_eq!(table.security_statistics(),stats);
+  assert_eq!(operation_on_selected_volume(&mut table,2,guest,reader,0,"",
+    &mut[0;9],&mut OfflineDescriptorDevice,receipt),Err(FsError::InvalidName));
+  revalidate_quarantined_selected_volume(&mut table,admin,&mut disk,receipt).unwrap();
+  assert_eq!(operation_on_selected_volume(&mut table,2,guest,reader,0,"",
+    &mut[0;9],&mut OfflineDescriptorDevice,receipt),Err(FsError::InvalidName));
+  let fresh=operation_on_selected_volume(&mut table,1,guest,0,READ,
+    "/shared/note",&mut[],&mut disk,receipt).unwrap();assert!(fresh>reader);
  }
 
  #[test]fn desktop_selected_path_revocation_and_pid_reuse_release_lease(){

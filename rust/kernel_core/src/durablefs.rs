@@ -205,9 +205,9 @@ pub struct VolumeHealth{
  pub previous_generation:Option<u64>,
 }
 pub struct DurableFs<D:BlockDevice>{
-    // Geometry belongs to the validated mount. Reinterpreting cached heads
-    // with a later device size could silently discard their bank ownership.
-    disk:D,sectors:u64,meta:Metadata,active:u64,previous:Option<Metadata>,
+    // Geometry and optional driver identity belong to the validated mount.
+    // A same-capacity reset must not retain cached head/bank authority.
+    disk:D,sectors:u64,media_generation:Option<u64>,meta:Metadata,active:u64,previous:Option<Metadata>,
     // Exact observed heads, including an invalid/degraded copy. A stale
     // mount must not choose a COW bank using obsolete extent ownership.
     heads:[[u8;SECTOR_BYTES];2],
@@ -229,57 +229,61 @@ impl<D:BlockDevice> DurableFs<D>{
     /// Never auto-format from mount on corrupt or unexpected metadata.
     pub fn format_blank(mut disk:D)->Result<Self,FsError>{
         let sectors=disk.sector_count();
+        let media_generation=disk.media_generation();
         if sectors<MIN_SECTORS || sectors>u32::MAX as u64 {
             return Err(FsError::InvalidVolume);
         }
+        if !crate::block::media_snapshot_matches(&disk,sectors,media_generation){return Err(FsError::InvalidVolume);}
         // Formatting must not erase a disk whose two metadata sectors
         // happen to be zero while another sector contains existing data.
         // The selected window must be EXPLICITLY empty in its entirety.
         for lba in 0..sectors{
             // Recheck around every read: a removable device can change
-            // geometry partway through a long blankness scan.
-            if disk.sector_count()!=sectors{return Err(FsError::InvalidVolume);}
+            // geometry or identity partway through a long blankness scan.
+            if !crate::block::media_snapshot_matches(&disk,sectors,media_generation){return Err(FsError::InvalidVolume);}
             let mut sector=[0u8;SECTOR_BYTES];
             disk.read_sector(lba,&mut sector)?;
-            if disk.sector_count()!=sectors{return Err(FsError::InvalidVolume);}
+            if !crate::block::media_snapshot_matches(&disk,sectors,media_generation){return Err(FsError::InvalidVolume);}
             if sector.iter().any(|&b|b!=0){return Err(FsError::InvalidVolume);}
         }
-        if disk.sector_count()!=sectors{return Err(FsError::InvalidVolume);}
+        if !crate::block::media_snapshot_matches(&disk,sectors,media_generation){return Err(FsError::InvalidVolume);}
         let meta=Metadata::empty();
         let data=encode(&meta,sectors);
         disk.write_sector(0,&data)?;
-        if disk.sector_count()!=sectors{return Err(FsError::InvalidVolume);}
+        if !crate::block::media_snapshot_matches(&disk,sectors,media_generation){return Err(FsError::InvalidVolume);}
         disk.write_sector(1,&data)?;
-        if disk.sector_count()!=sectors{return Err(FsError::InvalidVolume);}
+        if !crate::block::media_snapshot_matches(&disk,sectors,media_generation){return Err(FsError::InvalidVolume);}
         // Formatting is explicitly opt-in, but it must still fail closed if
         // the selected device acknowledges a dropped or torn superblock.
         for lba in 0..2{
-            if disk.sector_count()!=sectors{return Err(FsError::InvalidVolume);}
+            if !crate::block::media_snapshot_matches(&disk,sectors,media_generation){return Err(FsError::InvalidVolume);}
             let mut observed=[0u8;SECTOR_BYTES];
             disk.read_sector(lba,&mut observed)?;
-            if disk.sector_count()!=sectors{return Err(FsError::InvalidVolume);}
+            if !crate::block::media_snapshot_matches(&disk,sectors,media_generation){return Err(FsError::InvalidVolume);}
             if observed!=data{return Err(FsError::InvalidVolume);}
         }
-        if disk.sector_count()!=sectors{return Err(FsError::InvalidVolume);}
-        Ok(Self{disk,sectors,meta,active:0,previous:Some(meta),heads:[data;2],retired:core::cell::Cell::new(false)})
+        if !crate::block::media_snapshot_matches(&disk,sectors,media_generation){return Err(FsError::InvalidVolume);}
+        Ok(Self{disk,sectors,media_generation,meta,active:0,previous:Some(meta),heads:[data;2],retired:core::cell::Cell::new(false)})
     }
     pub fn mount(mut disk:D)->Result<Self,FsError>{
         let sectors=disk.sector_count();
+        let media_generation=disk.media_generation();
         if sectors<MIN_SECTORS || sectors>u32::MAX as u64{
             return Err(FsError::InvalidVolume);
         }
+        if !crate::block::media_snapshot_matches(&disk,sectors,media_generation){return Err(FsError::InvalidVolume);}
         let mut candidates:[Option<Metadata>;2]=[None,None];
         let mut heads=[[0u8;SECTOR_BYTES];2];
         for (n,slot) in candidates.iter_mut().enumerate(){
             let mut bytes=[0u8;SECTOR_BYTES];
             disk.read_sector(n as u64,&mut bytes)?;
-            if disk.sector_count()!=sectors{return Err(FsError::InvalidVolume);}
+            if !crate::block::media_snapshot_matches(&disk,sectors,media_generation){return Err(FsError::InvalidVolume);}
             heads[n]=bytes;
             if let Some(meta)=decode(&bytes,sectors){
                 if verify_metadata(&mut disk,&meta)?{*slot=Some(meta);}
             }
         }
-        if disk.sector_count()!=sectors{return Err(FsError::InvalidVolume);}
+        if !crate::block::media_snapshot_matches(&disk,sectors,media_generation){return Err(FsError::InvalidVolume);}
         // Two independently valid copies with the same generation must
         // describe exactly the same state. Picking one arbitrarily would
         // hide a split-brain/corrupted checkpoint and risk silent data loss.
@@ -305,29 +309,33 @@ impl<D:BlockDevice> DurableFs<D>{
             (None,None)=>return Err(FsError::InvalidVolume),
         };
         recheck_heads(&mut disk,sectors,&heads)?;
-        Ok(Self{disk,sectors,meta,active,previous,heads,retired:core::cell::Cell::new(false)})
+        if !crate::block::media_snapshot_matches(&disk,sectors,media_generation){return Err(FsError::InvalidVolume);}
+        Ok(Self{disk,sectors,media_generation,meta,active,previous,heads,retired:core::cell::Cell::new(false)})
     }
     /// Verify both superblocks and all referenced COW payload checksums
     /// without modifying the device or choosing a destructive recovery path.
     /// Fail closed on two valid same-generation but divergent checkpoints.
     pub fn inspect_health(disk:&mut D)->Result<VolumeHealth,FsError>{
         let sectors=disk.sector_count();
+        let media_generation=disk.media_generation();
         if sectors<MIN_SECTORS||sectors>u32::MAX as u64{
             return Err(FsError::InvalidVolume);
         }
+        if !crate::block::media_snapshot_matches(disk,sectors,media_generation){return Err(FsError::InvalidVolume);}
         let mut copies=[None,None];
         let mut heads=[[0u8;SECTOR_BYTES];2];
         for index in 0..2{
             let mut header=[0u8;SECTOR_BYTES];
             disk.read_sector(index as u64,&mut header)?;
-            if disk.sector_count()!=sectors{return Err(FsError::InvalidVolume);}
+            if !crate::block::media_snapshot_matches(disk,sectors,media_generation){return Err(FsError::InvalidVolume);}
             heads[index]=header;
             if let Some(meta)=decode(&header,sectors){
                 if verify_metadata(disk,&meta)?{copies[index]=Some(meta);}
             }
         }
-        if disk.sector_count()!=sectors{return Err(FsError::InvalidVolume);}
+        if !crate::block::media_snapshot_matches(disk,sectors,media_generation){return Err(FsError::InvalidVolume);}
         recheck_heads(disk,sectors,&heads)?;
+        if !crate::block::media_snapshot_matches(disk,sectors,media_generation){return Err(FsError::InvalidVolume);}
         let (latest,previous,valid_copies)=match (copies[0],copies[1]){
             (Some(a),Some(b))=>{
                 if a.generation.abs_diff(b.generation)>1 ||
@@ -597,7 +605,7 @@ impl<D:BlockDevice> DurableFs<D>{
     }
     fn check_geometry(&self)->Result<(),FsError>{
         if self.retired.get(){return Err(FsError::InvalidVolume);}
-        if self.disk.sector_count()!=self.sectors{
+        if !crate::block::media_snapshot_matches(&self.disk,self.sectors,self.media_generation){
             self.retired.set(true);
             return Err(FsError::InvalidVolume);
         }
@@ -1786,6 +1794,108 @@ mod tests{
     fn blank()->Disk{
         Disk{sectors:[[0;SECTOR_BYTES];MIN_SECTORS as usize],fail_at:None,
             ignore_at:None,fail_read_lba:None,writes:0}
+    }
+    struct GenerationDisk{
+        disk:Disk,generation:std::rc::Rc<std::cell::Cell<Option<u64>>>,
+        io:std::rc::Rc<std::cell::Cell<usize>>,
+        switch_read:Option<u64>,switch_write:bool,switch_sync:bool,
+    }
+    impl GenerationDisk{
+        fn new(disk:Disk)->Self{Self{
+            disk,generation:std::rc::Rc::new(std::cell::Cell::new(Some(1))),
+            io:std::rc::Rc::new(std::cell::Cell::new(0)),
+            switch_read:None,switch_write:false,switch_sync:false,
+        }}
+    }
+    impl BlockDevice for GenerationDisk{
+        fn sector_count(&self)->u64{self.disk.sector_count()}
+        fn media_generation(&self)->Option<u64>{self.generation.get()}
+        fn read_sector(&mut self,lba:u64,out:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{
+            self.io.set(self.io.get()+1);self.disk.read_sector(lba,out)?;
+            if self.switch_read==Some(lba){self.generation.set(Some(2));}
+            Ok(())
+        }
+        fn write_sector(&mut self,lba:u64,data:&[u8;SECTOR_BYTES])->Result<(),BlockError>{
+            self.io.set(self.io.get()+1);self.disk.write_sector(lba,data)?;
+            if self.switch_write{self.generation.set(Some(2));}
+            Ok(())
+        }
+        fn sync(&mut self)->Result<(),BlockError>{
+            self.io.set(self.io.get()+1);
+            if self.switch_sync{self.generation.set(Some(2));}
+            Ok(())
+        }
+    }
+    #[test]fn g6_same_geometry_media_reset_revokes_mount_without_io_or_output(){
+        for (initial,changed) in [(Some(1),Some(2)),(Some(1),None),(None,Some(1))]{
+            let disk=GenerationDisk::new(blank());disk.generation.set(initial);
+            let mut fs=DurableFs::format_blank(disk).unwrap();
+            fs.create_path("/note",b"committed").unwrap();
+            let io=fs.disk.io.get();let writes=fs.disk.disk.writes;
+            fs.disk.generation.set(changed);
+            let mut out=[0xa5;32];
+            assert_eq!(fs.read_path("/note",&mut out),Err(FsError::InvalidVolume));
+            assert_eq!(out,[0xa5;32]);assert_eq!(fs.disk.io.get(),io);
+            // Even an untrustworthy provider restoring the old token cannot
+            // revive a mount that already observed identity revocation.
+            fs.disk.generation.set(initial);
+            assert_eq!(fs.overwrite_path("/note",b"wrong medium"),Err(FsError::InvalidVolume));
+            assert_eq!(fs.rename_path("/note","/renamed"),Err(FsError::InvalidVolume));
+            assert_eq!(fs.sync(),Err(FsError::InvalidVolume));
+            assert_eq!(fs.disk.disk.writes,writes);assert_eq!(fs.disk.io.get(),io);
+            let mut fresh=DurableFs::mount(fs.into_device()).unwrap();
+            let size=fresh.read_path("/note",&mut out).unwrap();
+            assert_eq!(&out[..size],b"committed");
+        }
+    }
+    #[test]fn g6_mount_health_and_blank_format_reject_same_capacity_identity_change(){
+        let mut seed=DurableFs::format_blank(blank()).unwrap();
+        seed.create_path("/note",b"committed").unwrap();
+        let disk=seed.into_device();
+        let mut mount=GenerationDisk::new(disk.clone());mount.switch_read=Some(1);
+        let io=mount.io.clone();
+        assert!(matches!(DurableFs::mount(mount),Err(FsError::InvalidVolume)));
+        assert!(io.get()>0);
+        let mut health=GenerationDisk::new(disk);health.switch_read=Some(1);
+        let writes=health.disk.writes;
+        assert_eq!(DurableFs::inspect_health(&mut health),Err(FsError::InvalidVolume));
+        assert_eq!(health.disk.writes,writes);
+        let mut format=GenerationDisk::new(blank());format.switch_read=Some(1);
+        let io=format.io.clone();
+        assert!(matches!(DurableFs::format_blank(format),Err(FsError::InvalidVolume)));
+        assert_eq!(io.get(),2); // Only two blankness reads; no format write.
+    }
+    #[test]fn g6_identity_change_during_payload_read_preserves_output_and_retires(){
+        let mut fs=DurableFs::format_blank(GenerationDisk::new(blank())).unwrap();
+        fs.create_path("/note",b"committed").unwrap();
+        fs.disk.switch_read=Some(block_start(0,fs.meta.entries[0].bank));
+        let mut out=[0xa5;32];
+        assert_eq!(fs.read_path("/note",&mut out),Err(FsError::InvalidVolume));
+        assert_eq!(out,[0xa5;32]);
+        let io=fs.disk.io.get();
+        assert_eq!(fs.delete_path("/note"),Err(FsError::InvalidVolume));
+        assert_eq!(fs.disk.io.get(),io);
+    }
+    #[test]fn g6_identity_change_during_data_write_or_flush_requires_fresh_mount(){
+        for during_sync in [false,true]{
+            let mut fs=DurableFs::format_blank(GenerationDisk::new(blank())).unwrap();
+            fs.create_path("/note",b"committed").unwrap();
+            if during_sync{
+                fs.disk.switch_sync=true;
+                assert_eq!(fs.sync(),Err(FsError::InvalidVolume));
+            }else{
+                fs.disk.switch_write=true;
+                assert_eq!(fs.overwrite_path("/note",b"unpublished"),Err(FsError::InvalidVolume));
+            }
+            let io=fs.disk.io.get();let writes=fs.disk.disk.writes;
+            assert_eq!(fs.rename_path("/note","/renamed"),Err(FsError::InvalidVolume));
+            assert_eq!(fs.disk.io.get(),io);assert_eq!(fs.disk.disk.writes,writes);
+            let mut disk=fs.into_device();disk.switch_write=false;disk.switch_sync=false;
+            let mut fresh=DurableFs::mount(disk).unwrap();
+            let mut out=[0u8;32];let size=fresh.read_path("/note",&mut out).unwrap();
+            assert_eq!(&out[..size],b"committed");
+            fresh.overwrite_path("/note",b"fresh mount").unwrap();
+        }
     }
     /// A crash between sector transfers does not tear a later metadata
     /// sector: it simply prevents that transfer and all subsequent writes.
