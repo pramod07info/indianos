@@ -159,3 +159,103 @@ bounded legacy approval policy is unchanged. A separate correctness/security
 review and explicit gate sign-off remain mandatory; the G3 intermittent recovery
 timeout also requires investigation. Workflow policy changes themselves require
 independent review before trusted-base activation.
+
+## G1–G3 independent source review and explicit sign-off — 24 Nov 2026
+
+**Review target (merged production baseline):** `5b6ace8a6e5d91c217744e5ad0b8ca7f02ace1d7` (PR #806).
+This packet is a request for a separate reviewer to inspect production source,
+not an acceptance decision. G1, G2 and G3 remain open and M1 remains 5/13.
+The same approval must not be inferred from a merge, a green workflow, an
+implementation author's self-review, a bot report, or this packet.
+
+### Revision-bound evidence
+
+PR #806 candidate `2e06fcc5a7f371d41b068c01ac58f86ac304ce24` passed the
+[combined reliability run 45382847991](https://github.com/pramod07info/indianos/actions/runs/45382847991)
+(all three jobs). The [normal desktop log](https://github.com/pramod07info/indianos/actions/runs/45382847991/job/138406054114)
+reports 4,218 kernel tests, zero failures, all four premature-exit cases,
+missing/invalid Files and Terminal, unready compositor, bounded restart,
+read-only GPT/ATA error recovery and two cold boots. The three new live-map
+tests passed. [Retained candidate artifact 14914758401](https://github.com/pramod07info/indianos/actions/runs/45382847991/artifacts/14914758401)
+contains the acceptance evidence. Candidate evidence is not a substitute for
+merged-main verification.
+
+Latest main CI at packet creation (snapshot only; reviewer must refresh the
+live run, job, step and artifact results before signing):
+
+| Required workflow | Exact-main run | Observed status |
+| --- | --- | --- |
+| Combined reliability | [45395190978](https://github.com/pramod07info/indianos/actions/runs/45395190978) | in_progress |
+| Durable Files/VFS | [45395191443](https://github.com/pramod07info/indianos/actions/runs/45395191443) | success |
+| Kernel boot | [45395191063](https://github.com/pramod07info/indianos/actions/runs/45395191063) | in_progress |
+| Security S0 | [45395191360](https://github.com/pramod07info/indianos/actions/runs/45395191360) | success |
+| Roadmap SHA | [45395191179](https://github.com/pramod07info/indianos/actions/runs/45395191179) | success |
+| Duplicate prevention | [45395190913](https://github.com/pramod07info/indianos/actions/runs/45395190913) | success |
+
+The failed [run 45377901348](https://github.com/pramod07info/indianos/actions/runs/45377901348)
+and [artifact 14913822725](https://github.com/pramod07info/indianos/actions/runs/45377901348/artifacts/14913822725)
+must also be considered. The subsequent successful QEMU run is evidence that
+the failure did not recur after the frame-query performance correction, not
+proof that every intermittent timeout cause was eliminated. Do not reduce the
+45-second deadline or ignore a failed recovery case.
+
+### Independent review assignment (all required per gate)
+
+Reviewers must be authorized repository collaborators with independent
+judgment, not the author/implementer of the reviewed changes. A single
+qualified independent person may cover several gates if competent in those
+areas; no fictitious reviewer or workstation is required. The existing
+Actions evidence reviewer assists, but does not grant source approval.
+
+| Gate | Review scope at the exact target | Required observations |
+| --- | --- | --- |
+| G1 | [rust/kernel_core/src/m1_persistent_terminal.rs](https://github.com/pramod07info/indianos/blob/5b6ace8a6e5d91c217744e5ad0b8ca7f02ace1d7/rust/kernel_core/src/m1_persistent_terminal.rs), [rust/kernel_core/src/m1_persistent_desktop.rs](https://github.com/pramod07info/indianos/blob/5b6ace8a6e5d91c217744e5ad0b8ca7f02ace1d7/rust/kernel_core/src/m1_persistent_desktop.rs), [rust/kernel_core/src/hier_vfs.rs](https://github.com/pramod07info/indianos/blob/5b6ace8a6e5d91c217744e5ad0b8ca7f02ace1d7/rust/kernel_core/src/hier_vfs.rs), [rust/kernel_core/src/fs_handles.rs](https://github.com/pramod07info/indianos/blob/5b6ace8a6e5d91c217744e5ad0b8ca7f02ace1d7/rust/kernel_core/src/fs_handles.rs), [userland/rust/src/main.rs](https://github.com/pramod07info/indianos/blob/5b6ace8a6e5d91c217744e5ad0b8ca7f02ace1d7/userland/rust/src/main.rs) | Authenticated sender/incarnation, selected-volume identity, mutation and namespace permissions, no false success/ACK, durable reboot readback, visible Files state and negative authority controls. |
+| G2 | [rust/kernel_core/src/m1_partition.rs](https://github.com/pramod07info/indianos/blob/5b6ace8a6e5d91c217744e5ad0b8ca7f02ace1d7/rust/kernel_core/src/m1_partition.rs), [rust/kernel_core/src/block.rs](https://github.com/pramod07info/indianos/blob/5b6ace8a6e5d91c217744e5ad0b8ca7f02ace1d7/rust/kernel_core/src/block.rs), [rust/kernel_core/src/durablefs.rs](https://github.com/pramod07info/indianos/blob/5b6ace8a6e5d91c217744e5ad0b8ca7f02ace1d7/rust/kernel_core/src/durablefs.rs), [rust/kernel_core/src/ata_pio.rs](https://github.com/pramod07info/indianos/blob/5b6ace8a6e5d91c217744e5ad0b8ca7f02ace1d7/rust/kernel_core/src/ata_pio.rs) | MBR/GPT bounds and mirrors, CRC/identity/overlap rejection, complete receipt revalidation, no neighbor writes, fail-closed mount retirement, ATA EIO and unchanged media, no autoformat. |
+| G3 | [rust/kernel_core/src/kernel_main.rs](https://github.com/pramod07info/indianos/blob/5b6ace8a6e5d91c217744e5ad0b8ca7f02ace1d7/rust/kernel_core/src/kernel_main.rs), [rust/kernel_core/src/boot.rs](https://github.com/pramod07info/indianos/blob/5b6ace8a6e5d91c217744e5ad0b8ca7f02ace1d7/rust/kernel_core/src/boot.rs), [rust/kernel_core/src/user_runtime.rs](https://github.com/pramod07info/indianos/blob/5b6ace8a6e5d91c217744e5ad0b8ca7f02ace1d7/rust/kernel_core/src/user_runtime.rs), [rust/kernel_core/src/user_image.rs](https://github.com/pramod07info/indianos/blob/5b6ace8a6e5d91c217744e5ad0b8ca7f02ace1d7/rust/kernel_core/src/user_image.rs), [userland/rust/src/desktop_startup.rs](https://github.com/pramod07info/indianos/blob/5b6ace8a6e5d91c217744e5ad0b8ca7f02ace1d7/userland/rust/src/desktop_startup.rs), [userland/rust/src/main.rs](https://github.com/pramod07info/indianos/blob/5b6ace8a6e5d91c217744e5ad0b8ca7f02ace1d7/userland/rust/src/main.rs), [tools/test_normal_desktop_qemu.py](https://github.com/pramod07info/indianos/blob/5b6ace8a6e5d91c217744e5ad0b8ca7f02ace1d7/tools/test_normal_desktop_qemu.py) | Normal desktop entry and four actual ring-3 services; ELF W^X, authenticated readiness, complete stale authority and frame retirement, one restart, shutdown dispatch exhaustion, durable shutdown, individual negative boots and live-map validation without weakening safety. |
+
+Inspect actual diffs and source as well as serial, monitor and screenshot evidence.
+Record concrete findings and their disposition. If review discovers a defect,
+open a focused fix with a regression; do not add duplicate production features.
+If a reviewer cannot verify a requirement, report BLOCKED rather than approve.
+
+### Review and acceptance protocol
+
+1. The coordinator identifies an actual independent authorized reviewer for each
+   scope and requests a GitHub review of this packet. No review is recorded
+   merely by assigning a role. Source links above refer to the fixed production
+   revision, not the documentation-only packet.
+2. The reviewer checks the latest exact-main required CI and retained artifacts,
+   and performs the source/security review against the pinned baseline. If
+   production source or required test/policy changes, refresh the packet and
+   repeat impacted verification. An approval of unrelated PR content is not
+   source approval for these gates.
+3. Record a submitted GitHub approval on the current review-packet head, with
+   an explicit gate decision in the review body. Use the following format,
+   replacing every placeholder with actual findings and receipts. Approve only
+   independently inspected gates; unreviewed gates stay pending.
+
+   ```text
+   Reviewed production SHA: 5b6ace8a6e5d91c217744e5ad0b8ca7f02ace1d7
+   Gate: G1 | G2 | G3 (one entry per gate)
+   Decision: ACCEPT | BLOCKED
+   Source/security findings: <paths, symbols, findings and disposition>
+   Exact-main CI: <required run/job IDs and verified conclusions>
+   Retained evidence: <artifact IDs and checked serial/screenshot cases>
+   Remaining mandatory blockers: <none for ACCEPT, otherwise specific blockers>
+   ```
+
+4. After an eligible independent approval and explicit ACCEPT decision exist,
+   the coordinator reconciles the canonical registry, the corresponding
+   acceptance document, master milestone positions 6–8 and tracker #616 in
+   a separately reviewed acceptance change. Record reviewer identity, GitHub
+   review URL/ID, reviewed SHA, exact-main CI/artifact receipts and decision
+   for each gate. Verify that acceptance-change CI is green and production
+   scope is unchanged before publishing the count. Do not let the review
+   packet itself advance a checkbox. G1 = 6/13, both G1/G2 = 7/13, all three
+   = 8/13 only after their respective formal acceptance changes.
+
+No independent review has been recorded for PR #806 at packet creation.
+The repository owner and GitHub Actions bot appear in recent commit history;
+a distinct eligible reviewer has not yet been confirmed. Reviewer assignment,
+live merged-main validation and acceptance decisions remain open. This section
+does not weaken branch protection or existing review requirements.

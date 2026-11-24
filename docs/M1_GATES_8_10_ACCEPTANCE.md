@@ -152,3 +152,7 @@ See [IRQ input](M1_G5_NORMAL_IRQ_INPUT.md),
 No local build, project test or QEMU execution was performed while authoring
 this batch. Exact-head CI and independent review are required; none of these
 changes alone mark a complete gate 100% or change the accepted milestone count.
+
+## G3 independent sign-off packet
+
+Use the shared [G1–G3 independent source review and explicit sign-off protocol](M1_GATES_6_7_ACCEPTANCE.md#g1g3-independent-source-review-and-explicit-sign-off--24-nov-2026) for the pinned PR #806 production baseline, actual QEMU evidence, mandatory source review and explicit gate decision. This reference does not accept G3 or any later gate.
