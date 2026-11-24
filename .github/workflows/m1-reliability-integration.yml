@@ -4,6 +4,11 @@ on:
   pull_request:
     branches: [main]
     paths:
+      - "docs/M1_TASK_REGISTRY.json"
+      - "docs/DELIVERY_MILESTONES.md"
+      - "docs/M1_GATES_6_7_ACCEPTANCE.md"
+      - "docs/M1_GATES_8_10_ACCEPTANCE.md"
+      - ".github/workflows/agent-independent-reviewer.yml"
       - "rust/kernel_core/**"
       - "userland/rust/**"
       - "tools/rust/**"
@@ -15,6 +20,11 @@ on:
   push:
     branches: [main]
     paths:
+      - "docs/M1_TASK_REGISTRY.json"
+      - "docs/DELIVERY_MILESTONES.md"
+      - "docs/M1_GATES_6_7_ACCEPTANCE.md"
+      - "docs/M1_GATES_8_10_ACCEPTANCE.md"
+      - ".github/workflows/agent-independent-reviewer.yml"
       - "rust/kernel_core/**"
       - "userland/rust/**"
       - "tools/rust/**"
@@ -110,7 +120,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: m1-runtime-acceptance-${{ github.sha }}
+          name: m1-runtime-acceptance-${{ github.event.pull_request.head.sha || github.sha }}
           path: build/acceptance-logs/
           if-no-files-found: error
           retention-days: 14

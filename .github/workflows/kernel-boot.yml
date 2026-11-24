@@ -4,6 +4,11 @@ on:
   push:
     branches: [main]
     paths:
+      - "docs/M1_TASK_REGISTRY.json"
+      - "docs/DELIVERY_MILESTONES.md"
+      - "docs/M1_GATES_6_7_ACCEPTANCE.md"
+      - "docs/M1_GATES_8_10_ACCEPTANCE.md"
+      - ".github/workflows/agent-independent-reviewer.yml"
       - "kernel/**"
       - "rust/**"
       - "boot/**"

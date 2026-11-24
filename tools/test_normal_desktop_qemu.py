@@ -1672,15 +1672,20 @@ def crashed_service_boot(qemu: str, iso: Path, ovmf: Path, disk: Path,
     print("Normal desktop compositor #UD: two actual faults, one bounded restart and read-only recovery PASS")
 
 
+DESKTOP_SERVICE_PIDS = {"init": 1, "files": 2, "terminal": 3, "compositor": 4}
+
+
 def verify_unready_recovery(output: bytes, name: str) -> None:
-    if name == "premature-compositor":
+    premature_pid = DESKTOP_SERVICE_PIDS.get(name.removeprefix("premature-")) if name.startswith("premature-") else None
+    if premature_pid is not None:
         failure = b"IndianOS normal desktop: service exited before durable shutdown"
         session = (b"IndianOS: R031 scheduler process exit=0x0000000000000000",
-                   b"IndianOS: PID 4 EXITED", b"IndianOS: PID 4 REAPED", failure)
+                   f"IndianOS: PID {premature_pid} EXITED".encode(),
+                   f"IndianOS: PID {premature_pid} REAPED".encode(), failure)
         for marker in session:
             if output.count(marker) != 2:
                 raise AssertionError("premature clean-exit scenario lacks exact actual lifecycle")
-        if b"PID 4 FAULTED" in output:
+        if any(f"PID {pid} FAULTED".encode() in output for pid in DESKTOP_SERVICE_PIDS.values()):
             raise AssertionError("premature exit returned to UD2 instead of exiting")
     elif name == "unready-compositor":
         failure = b"IndianOS normal desktop: startup dispatch budget exhausted"
@@ -1941,15 +1946,24 @@ def bad_service_images(iso: Path, folder: Path, xorriso: str):
     destination = tree / "boot/initramfs.img"
     original = destination.read_bytes()
     destination.chmod(destination.stat().st_mode | 0o200)
-    cases = (("missing-compositor", b"/bin/compositor", None, "desktop-service-unavailable"),
-             ("invalid-compositor", b"/bin/compositor", b"not an ELF", "desktop-service-invalid"),
-             ("invalid-selection", b"/etc/desktop-volume", bytes(64), "desktop-volume-selection-invalid"),
-             ("crashed-compositor", b"/bin/compositor", faulting_service(original, b"/bin/compositor"),
-              "desktop-session-failed"),
-             ("premature-compositor", b"/bin/compositor", service_entry_code(original, b"/bin/compositor", PREMATURE_EXIT),
-              "desktop-session-failed"),
-             ("unready-compositor", b"/bin/compositor", service_entry_code(original, b"/bin/compositor", UNREADY_YIELD),
-              "desktop-session-failed"))
+    cases = []
+    # Init admission has its own normal-init recovery matrix. The other
+    # three native Desktop roles must each fail closed before service launch.
+    for role in ("files", "terminal", "compositor"):
+        target = f"/bin/{role}".encode()
+        cases.extend(((f"missing-{role}", target, None, "desktop-service-unavailable"),
+                      (f"invalid-{role}", target, b"not an ELF", "desktop-service-invalid")))
+    cases.extend((("invalid-selection", b"/etc/desktop-volume", bytes(64), "desktop-volume-selection-invalid"),
+                  ("crashed-compositor", b"/bin/compositor", faulting_service(original, b"/bin/compositor"),
+                   "desktop-session-failed")))
+    # Every indispensable service exiting cleanly before readiness is a
+    # failure, including PID1. Use the same actual ELF mutation and oracle.
+    for role in DESKTOP_SERVICE_PIDS:
+        target = f"/bin/{role}".encode()
+        cases.append((f"premature-{role}", target, service_entry_code(original, target, PREMATURE_EXIT),
+                      "desktop-session-failed"))
+    cases.append(("unready-compositor", b"/bin/compositor",
+                  service_entry_code(original, b"/bin/compositor", UNREADY_YIELD), "desktop-session-failed"))
     for name, target, payload, reason in cases:
         modified = folder / f"{name}.iso"
         try:
@@ -2041,7 +2055,7 @@ def main() -> None:
         for name, modified, reason in bad_service_images(args.iso.resolve(), Path(temporary), args.xorriso):
             if name == "crashed-compositor":
                 crashed_service_boot(args.qemu, modified, args.ovmf.resolve(), disk, artifacts)
-            elif name in ("premature-compositor", "unready-compositor"):
+            elif name.startswith("premature-") or name == "unready-compositor":
                 unready_service_boot(args.qemu, modified, args.ovmf.resolve(), disk, artifacts, name)
             else:
                 denied_boot(args.qemu, modified, args.ovmf.resolve(), disk, artifacts, name, reason)

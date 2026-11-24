@@ -18,7 +18,7 @@ use crate::user_image::{UserImage,indianos_user_image_load,
  indianos_user_image_destroy,indianos_user_copy_readonly};
 use crate::syscall::{SyscallRequest,indianos_syscall_validate,ring3_frame_valid,USER_INTERRUPTS_ENABLED,USER_TOP,STACK_BYTES,PAGE_BYTES};
 use crate::program::indianos_program_user_range;
-use crate::boot::Region;
+use crate::boot::runtime_frame_allowed;
 use crate::user_image::{indianos_user_can_write,indianos_user_copy_writable};
 #[cfg(any(any(feature="test-interactive",feature="normal-desktop"),feature="normal-init"))]
 use crate::input;
@@ -472,8 +472,6 @@ static APIC_REJECTED_CS:core::sync::atomic::AtomicU64=
 unsafe extern "C"{
  fn serial_write(s:*const c_char);
  fn boot_hhdm_offset(out:*mut u64)->bool;
- fn boot_memory_region_count()->u64;
- fn boot_memory_region_at(i:u64,out:*mut Region,context:*mut c_void)->bool;
  fn pmm_allocate_frame(frame:*mut u64)->bool;
  fn pmm_release_frame(frame:u64)->bool;
  fn pmm_free_frames()->u64;
@@ -1493,25 +1491,11 @@ unsafe fn desktop_pixel_request(descriptor:u64)->u64{
   _=>BAD,
  }
 }
-fn allowed_frame(p:u64)->bool{
- if p==0||p&(PAGE-1)!=0||p.checked_add(PAGE).is_none(){return false;}
- let n=unsafe{boot_memory_region_count()};
- if n==0||n>4096{return false;}
- for i in 0..n{
-  let mut r=Region{base:0,length:0,kind:0};
-  if !unsafe{boot_memory_region_at(i,&mut r,ptr::null_mut())}{return false;}
-  let Some(end)=r.base.checked_add(r.length)else{return false};
-  if p>=r.base&&p.checked_add(PAGE).is_some_and(|e|e<=end){
-   return matches!(r.kind,0|5|6|8);
-  }
- }
- false
-}
 unsafe extern "C" fn allocate(p:*mut u64,_:*mut c_void)->bool{unsafe{pmm_allocate_frame(p)}}
 unsafe extern "C" fn release(p:u64,_:*mut c_void)->bool{unsafe{pmm_release_frame(p)}}
 unsafe extern "C" fn access(p:u64,context:*mut c_void)->*mut c_void{
  let Some(m)=(unsafe{(context as *const DirectMap).as_ref()})else{return ptr::null_mut()};
- if !allowed_frame(p){return ptr::null_mut();}
+ if !runtime_frame_allowed(p){return ptr::null_mut();}
  let Some(addr)=p.checked_add(m.offset)else{return ptr::null_mut()};
  if addr>>48!=0xffff||addr&(1u64<<47)==0{return ptr::null_mut();}
  addr as usize as *mut c_void

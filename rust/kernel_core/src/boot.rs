@@ -116,6 +116,41 @@ fn validated_map_count(map:&MemoryMap)->Option<u64>{
     }
     if usable{Some(map.count)}else{None}
 }
+/// Read a single region after the entire pointer table has been validated.
+/// Keep the same local pointer, bounds and region checks as the public
+/// iterator, without re-running the quadratic overlap scan per entry.
+fn validated_region_at(map:&MemoryMap,index:u64)->Option<Region>{
+    if index>=map.count{return None;}
+    let item=unsafe{ptr::read_volatile(map.entries.add(index as usize))};
+    if !limine_pointer_aligned(item){return None;}
+    let region=unsafe{item.as_ref()}?;
+    valid_region(region).then_some(*region)
+}
+/// Runtime page-table and image access checks use the live boot map. Validate
+/// its entire contents once per query (including a corrupt late entry), then
+/// scan for the first containing region exactly as the former runtime caller
+/// did. No persistent cache, weakened kind checks, or unchecked map entries.
+fn runtime_frame_in_map(map:&MemoryMap,frame:u64)->bool{
+    const PAGE:u64=4096;
+    let Some(end)=frame.checked_add(PAGE)else{return false;};
+    if frame==0||frame&(PAGE-1)!=0{return false;}
+    let Some(count)=validated_map_count(map)else{return false;};
+    for i in 0..count{
+        let Some(region)=validated_region_at(map,i)else{return false;};
+        let Some(region_end)=region.base.checked_add(region.length)else{return false;};
+        if frame>=region.base&&end<=region_end{
+            return matches!(region.kind,0|5|6|8);
+        }
+    }
+    false
+}
+/// Limine responses must remain valid, mapped, and immutable during the call,
+/// as for boot_memory_region_count/at.
+pub(crate) fn runtime_frame_allowed(frame:u64)->bool{
+    let Some(map)=(unsafe{memory_map()})else{return false;};
+    runtime_frame_in_map(map,frame)
+}
+
 /// Every usable physical span must fit within the chosen direct-map
 /// high-half range. This is an arithmetic preflight, not proof of PTE mapping.
 fn usable_ram_page_aligned(region:&Region)->bool {
@@ -185,12 +220,9 @@ pub unsafe extern "C" fn boot_memory_region_count() -> u64 {
 pub unsafe extern "C" fn boot_memory_region_at(index:u64,out:*mut Region,_context:*mut c_void)->bool {
     if out.is_null(){return false}
     let Some(m)=(unsafe {memory_map()}) else {return false};
-    if validated_map_count(m).is_none() || index>=m.count {return false}
-    let item=unsafe {ptr::read_volatile(m.entries.add(index as usize))};
-    if !limine_pointer_aligned(item){return false;}
-    let Some(region)=(unsafe {item.as_ref()}) else {return false};
-    if !valid_region(region) {return false;}
-    unsafe {ptr::write(out,*region);}
+    if validated_map_count(m).is_none(){return false;}
+    let Some(region)=validated_region_at(m,index)else{return false;};
+    unsafe {ptr::write(out,region);}
     true
 }
 /// # Safety
@@ -972,5 +1004,52 @@ mod kernel_p0_batch36_w6 {
         }
         let r=Framebuffers{revision:0,count:1,framebuffers:core::ptr::null()};
         assert!(!limine_framebuffer_table_valid(&r));
+    }
+}
+
+#[cfg(test)]
+mod g3_runtime_frame_query_tests{
+    use super::*;
+    fn query(regions:&[Region],frame:u64)->bool{
+        let pointers:std::vec::Vec<*const Region>=regions.iter().map(|r|r as *const Region).collect();
+        let map=MemoryMap{revision:0,count:pointers.len() as u64,entries:pointers.as_ptr()};
+        runtime_frame_in_map(&map,frame)
+    }
+    #[test]
+    fn runtime_frame_query_preserves_bounds_and_kind_policy(){
+        let regions=[
+            Region{base:0x1000,length:0x2000,kind:0},
+            Region{base:0x4000,length:0x1000,kind:5},
+            Region{base:0x6000,length:0x1000,kind:6},
+            Region{base:0x8000,length:0x1000,kind:8},
+            Region{base:0xa000,length:0x1000,kind:1},
+            Region{base:0xc000,length:0x800,kind:5},
+        ];
+        for frame in [0x1000,0x2000,0x4000,0x6000,0x8000]{assert!(query(&regions,frame));}
+        for frame in [0,0x1001,0x3000,0x5000,0xa000,0xc000,u64::MAX-4095]{
+            assert!(!query(&regions,frame));
+        }
+    }
+    #[test]
+    fn runtime_frame_query_denies_late_corruption_overlap_and_missing_usable_ram(){
+        let usable=Region{base:0x1000,length:0x2000,kind:0};
+        assert!(query(&[usable],0x1000));
+        for bad in [
+            Region{base:u64::MAX,length:2,kind:1},
+            Region{base:0x8000,length:0,kind:1},
+            Region{base:0x2000,length:0x1000,kind:1},
+        ]{assert!(!query(&[usable,bad],0x1000));}
+        assert!(!query(&[Region{base:0x1000,length:0x1000,kind:5}],0x1000));
+        let entries=[&usable as *const Region,ptr::null()];
+        let map=MemoryMap{revision:0,count:2,entries:entries.as_ptr()};
+        assert!(!runtime_frame_in_map(&map,0x1000));
+    }
+    #[test]
+    fn runtime_frame_query_does_not_cache_a_previous_valid_map(){
+        let good=Region{base:0x1000,length:0x1000,kind:0};
+        let mut late=Region{base:0x4000,length:0x1000,kind:1};
+        assert!(query(&[good,late],0x1000));
+        late.length=0;
+        assert!(!query(&[good,late],0x1000));
     }
 }

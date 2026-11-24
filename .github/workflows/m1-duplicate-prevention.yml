@@ -12,6 +12,10 @@ on:
   push:
     branches: [main]
     paths:
+      - "docs/DELIVERY_MILESTONES.md"
+      - "docs/M1_GATES_6_7_ACCEPTANCE.md"
+      - "docs/M1_GATES_8_10_ACCEPTANCE.md"
+      - ".github/workflows/agent-independent-reviewer.yml"
       - 'scripts/m1_dedup_guard.py'
       - 'tests/test_m1_dedup_guard.py'
       - 'docs/M1_TASK_REGISTRY.json'
