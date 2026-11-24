@@ -471,6 +471,47 @@ class NormalDesktopControls(unittest.TestCase):
                 with self.assertRaises(AssertionError):
                     harness.verify_unready_recovery(trace + b"PID 4 FAULTED", name)
 
+    def test_unready_failure_retains_live_monitor_without_weakening_failure(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            disk = folder / "disk.raw"
+            disk.write_bytes(b"unchanged")
+            session = Mock()
+            session.output = bytearray(b"partial PID2 serial")
+            session.until.side_effect = AssertionError("missing recovery marker")
+            session.hmp.side_effect = ["VM status: running",
+                                       OSError("monitor register query failed"),
+                                       "disk backend"]
+            process, sock = Mock(), Mock()
+            def closed(*args):
+                # Diagnostics must be available before the guest is killed.
+                self.assertTrue((folder / "unready-compositor.failure-monitor.log").is_file())
+            with (patch.object(harness, "spawn", return_value=(process, sock, session)),
+                  patch.object(harness, "close", side_effect=closed) as close):
+                with self.assertRaisesRegex(AssertionError, "missing recovery marker"):
+                    harness.unready_service_boot("qemu", Path("system.iso"),
+                        Path("OVMF.fd"), disk, folder, "unready-compositor")
+            session.until.assert_called_once_with(
+                "IndianOS recovery: reason=desktop-session-failed", 45)
+            self.assertEqual([c.args[0] for c in session.hmp.call_args_list],
+                             ["info status", "info registers", "info block"])
+            diagnostic = (folder / "unready-compositor.failure-monitor.log").read_text()
+            for marker in ("missing recovery marker", "VM status: running",
+                           "monitor register query failed", "disk backend"):
+                self.assertIn(marker, diagnostic)
+            close.assert_called_once()
+            self.assertEqual(disk.read_bytes(), b"unchanged")
+
+    def test_unready_monitor_diagnostic_write_failure_cannot_mask_acceptance(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            session = Mock()
+            session.output = bytearray()
+            session.hmp.return_value = "VM status: running"
+            with patch("builtins.print"):
+                harness.capture_unready_failure(session, Path(temporary) / "absent",
+                    "unready-compositor", AssertionError("missing recovery"))
+            self.assertEqual(session.hmp.call_count, 3)
+
     def test_valid_unready_elf_fixtures_preserve_all_other_bytes(self):
         elf = bytearray(4160)
         elf[:7] = b"\x7fELF\x02\x01\x01"
