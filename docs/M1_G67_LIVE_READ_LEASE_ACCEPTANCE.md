@@ -39,8 +39,15 @@ Four new host negative-control tests reject missing/stale/duplicate or
 out-of-order lease evidence, token reacquisition, destructive contention,
 session retirement and a write preceding lease release. The focused cloud
 Python suite passed **53 tests**, and the full cloud Python suite passed
-**196 tests**, with zero failures. Actual guest execution of the enlarged
-matrix remains pending exact-head GitHub Actions evidence.
+**196 tests**, with zero failures. The complete matrix subsequently passed on merged main
+`06bed767889a8fe05aa31c9f7ee468710d027049`: [combined reliability run
+45335772189](https://github.com/pramod07info/indianos/actions/runs/45335772189),
+normal-desktop job 138247362816. Its actual log records all three data cuts,
+all six namespace cuts with two cold reboots, native PID2 lease continuity
+and the final desktop acceptance PASS. The same job passed 4,210 kernel
+tests, 53 harness controls and the freestanding check. Security S0 run
+45335772074 also passed on that merged SHA. These receipts qualify that
+source only; subsequent positioned-I/O changes require a fresh exact-head run.
 
 This qualifies the bounded, serialized two-process path-sharing contract.
 It does not establish SMP locking, arbitrary concurrent descriptor writers,

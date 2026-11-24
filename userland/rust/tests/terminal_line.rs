@@ -204,3 +204,45 @@ fn enter(line:&mut Line,bytes:&[u8])->Action{
   assert_eq!(out,[0;MAX_NOTE]);
  }
 }
+#[test]fn positioned_patch_is_canonical_bounded_and_preserves_exact_payload(){
+ use terminal_fs::Command;
+ for (text,offset,expected) in [(b"patch peer 2=xy".as_slice(),2,b"xy".as_slice()),
+   (b"patch peer 0=a=b  ",0,b"a=b  "),(b"patch peer 19=x",19,b"x")]{
+  let mut line=Line::new();
+  let Action::Filesystem(command)=enter(&mut line,text)else{panic!("patch rejected")};
+  let Command::Patch{offset:actual,bytes,len,..}=command else{panic!("wrong operation")};
+  assert_eq!(actual,offset);assert_eq!(&bytes[..len as usize],expected);
+  let mut wire=[0xff;64];assert_eq!(terminal_fs::encode(command,&mut wire),Some(64));
+  assert_eq!(wire[1],7);assert_eq!(u16::from_le_bytes([wire[5],wire[6]]),offset);
+  assert_eq!(terminal_fs::decode(&wire),Some(command));
+ }
+ for invalid in [b"patch peer 20=x".as_slice(),b"patch peer 19=xx",b"patch peer 2=",
+   b"patch peer -1=x",b"patch peer 01=x",b"patch peer 65535=x",b"patch peer =x",
+   b"patch peer x=x",b"patch peer 2=\n",b"patch ../key 2=x",b"patch peer  2=x"]{
+  assert_eq!(terminal_fs::parse(invalid),None,"{invalid:?}");
+ }
+}
+#[test]fn positioned_patch_broker_rechecks_offset_padding_and_payload(){
+ let command=terminal_fs::parse(b"patch peer 2=xy").unwrap();
+ let mut wire=[0;64];terminal_fs::encode(command,&mut wire).unwrap();
+ for index in [3,6,7,12,23,40,57,58,63]{
+  let mut bad=wire;bad[index]=255;assert_eq!(terminal_fs::decode(&bad),None,"byte {index}");
+ }
+ for offset in 0..=255u8{
+  let mut input=wire;input[5]=offset;
+  assert_eq!(terminal_fs::decode(&input).is_some(),offset<=18);
+ }
+ for byte in (0..=255u8).filter(|b|!(0x20..=0x7e).contains(b)){
+  let mut bad=wire;bad[38]=byte;assert_eq!(terminal_fs::decode(&bad),None);
+ }
+ for (offset,len) in [(20,1),(u16::MAX,1),(0,0),(0,21),(0,255)]{
+  let terminal_fs::Command::Patch{name,..}=command else{unreachable!()};
+  let bad=terminal_fs::Command::Patch{name,offset,bytes:[b'x';20],len};
+  let mut out=[255;64];assert_eq!(terminal_fs::encode(bad,&mut out),None);assert_eq!(out,[0;64]);
+ }
+ // Offset bytes remain reserved for every older operation.
+ for command in [b"put peer=xy".as_slice(),b"touch peer",b"mv peer other"]{
+  let mut old=[0;64];terminal_fs::encode(terminal_fs::parse(command).unwrap(),&mut old).unwrap();
+  old[5]=1;assert_eq!(terminal_fs::decode(&old),None);
+ }
+}

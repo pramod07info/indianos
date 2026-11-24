@@ -138,7 +138,7 @@ impl DesktopLifecycle{
    32=>matches!(operation,4|8|10|12),
    // Existing descriptors may read, seek and close. OPEN can create/truncate
    // and is deliberately refused even when its user flags claim read-only.
-   33=>matches!(operation,2|4|5|36|37),
+   33=>matches!(operation,2|4|5|25|36|37),
    _=>true,
   }
  }
@@ -1190,12 +1190,9 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
    // Validate every byte of requested writable destination before
    // changing cursor state; cannot expose kernel contents on bad pages.
    let mut data=[0u8;256];
-   let size=if matches!(request.arg0,2|3){
-    if length==0||length>if request.arg0==2{72}else{256} {
-     return BAD;
-    }
-    let n=length as usize;
-    if request.arg0==2{
+   let size=if matches!(request.arg0,2|3|25|26){
+    let Some(n)=native_file_payload_size(request.arg0,argument,length)else{return BAD;};
+    if matches!(request.arg0,2|25){
      if !unsafe{indianos_user_can_write(&*img,address,n)}{return BAD;}
     }else if !unsafe{indianos_user_copy_readonly(
                     img,address,data.as_mut_ptr().cast(),n)}{return BAD;}
@@ -1207,7 +1204,7 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
    if matches!(request.arg0,2|3|5|36|37) && argument!=0{return reject(b"IndianOS: Files unlock nonzero argument rejected\n\0");}
    if request.arg0==37&&handle!=0{return BAD;}
    if request.arg0==38&&argument>0o777{return BAD;}
-   if matches!(request.arg0,4|6) && argument>crate::durablefs::MAX_FILE_BYTES as u64{
+   if matches!(request.arg0,4|6|25|26) && argument>crate::durablefs::MAX_FILE_BYTES as u64{
     return BAD;
    }
    let handles=unsafe{&mut *ptr::addr_of_mut!(R031_HANDLES)};
@@ -1241,7 +1238,7 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
      return BAD;
     }
    };
-   if request.arg0==2 && n>0{
+   if matches!(request.arg0,2|25) && n>0{
     if n>size as u64|| !unsafe{indianos_user_copy_writable(
           &*img,address,data.as_ptr(),n as usize)}{return BAD;}
    }
@@ -2986,9 +2983,39 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
  }
  ok&&reclaimed
 }
+/// Native positioned IO keeps the version-1 descriptor layout. Validate the
+/// complete bounded payload before copying user memory or touching a handle.
+#[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
+fn native_file_payload_size(action:u64,offset:u64,length:u64)->Option<usize>{
+ if !matches!(action,2|3|25|26)||length==0||
+    length>if matches!(action,2|25){72}else{256}{return None;}
+ if matches!(action,25|26)&&offset>crate::durablefs::MAX_FILE_BYTES as u64{return None;}
+ if action==26&&offset.checked_add(length)
+    .map_or(true,|end|end>crate::durablefs::MAX_FILE_BYTES as u64){return None;}
+ Some(length as usize)
+}
 #[cfg(test)]mod tests{
  use super::*;
  static LOCK:std::sync::Mutex<()>=std::sync::Mutex::new(());
+ #[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
+ #[test]fn positioned_native_payload_rejects_overflow_and_out_of_file_writes(){
+  for action in [2,25]{
+   assert_eq!(native_file_payload_size(action,0,72),Some(72));
+   for length in [0,73,256,u64::MAX]{assert_eq!(native_file_payload_size(action,0,length),None);}
+  }
+  for action in [3,26]{
+   assert_eq!(native_file_payload_size(action,0,256),Some(256));
+   for length in [0,257,u64::MAX]{assert_eq!(native_file_payload_size(action,0,length),None);}
+  }
+  assert_eq!(native_file_payload_size(25,2048,1),Some(1)); // EOF reads are valid.
+  assert_eq!(native_file_payload_size(26,2047,1),Some(1));
+  assert_eq!(native_file_payload_size(26,1792,256),Some(256));
+  for offset in [2048,2049,u64::MAX]{assert_eq!(native_file_payload_size(26,offset,1),None);}
+  for offset in [2049,u64::MAX]{assert_eq!(native_file_payload_size(25,offset,1),None);}
+  assert_eq!(native_file_payload_size(26,1793,256),None);
+  for action in [0,1,4,6,24,27,u64::MAX]{assert_eq!(native_file_payload_size(action,0,1),None);}
+ }
+
  #[cfg(feature="normal-desktop")]
  #[test]fn desktop_startup_budget_is_cooperative_and_readiness_is_one_shot(){
   let mut state=DesktopLifecycle::new();
@@ -3042,7 +3069,7 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
   assert!(state.complete_sync(true));
   for operation in 0..=40{
    assert_eq!(state.allows_storage_request(32,operation),matches!(operation,4|8|10|12));
-   assert_eq!(state.allows_storage_request(33,operation),matches!(operation,2|4|5|36|37));
+   assert_eq!(state.allows_storage_request(33,operation),matches!(operation,2|4|5|25|36|37));
   }
   assert!(!state.allows_storage_request(32,u64::MAX));
   assert!(!state.allows_storage_request(33,u64::MAX));

@@ -19,7 +19,7 @@ before assigning any implementation from these rows.
 | G6-03 | Quarantine the mounted session on any post-publication verification failure; remount before retry | Source merged via PR #770; full G6 acceptance still open |
 | G6-04 | Inject torn metadata-head writes during a real QEMU guest power interruption; recover old or new valid state | Open |
 | G6-05 | Inject data-write loss and stale-sector readback; require checksum rejection and no user-visible success | Open |
-| G6-06 | Validate interrupted rename, unlink and directory COW transactions on two consecutive cold boots | PR #798 adds pre/post-publication guest cuts for rename, unlink and mkdir, each followed by two cold reboots. Cloud Python controls pass; exact-head QEMU acceptance pending. |
+| G6-06 | Validate interrupted rename, unlink and directory COW transactions on two consecutive cold boots | PR #798 adds pre/post-publication guest cuts for rename, unlink and mkdir, each followed by two cold reboots. The merged-main normal-desktop job passed at `06bed767889a8fe05aa31c9f7ee468710d027049` (run 45335772189). This covers these bounded publication cuts, not physical power loss. |
 | G6-07 | Implement actual blocking or conflict-safe concurrent file locks beyond current cooperative selected leases | PR #798 adds exact range admission and verified unrelated-reader preservation for serialized selected-path mutations. Descriptor writers remain conservative; blocking/SMP locking is open. |
 | G6-08 | Finish persistent owner/group/mode permissions across create, edit, rename, remount and PID recycle | Open |
 | G6-09 | Prove bounded recovery without automatic format or repair after corruption and media replacement | Open |
@@ -36,7 +36,7 @@ before assigning any implementation from these rows.
 | G7-15 | Verify foreign-reader lease prevents cross-process mutations before device probe, then releases on close | Open |
 | G7-16 | Enforce write grant and quota across every descriptor edit/rename/truncate, including failures | Open |
 | G7-17 | Enforce ancestor-search, target owner and destination-directory authorization without TOCTOU bypass | Private-file and directory ACL enforcement candidate in PR #773; broader acceptance open |
-| G7-18 | Run independent actual ring-3 clients through syscall create/read/write/rename in QEMU (no host adapter substitute) | PR #798 adds a native Files-held lease while PID1 creates/edits/renames an unrelated file, same-file denial/release and cold readback. Exact-head guest evidence pending. |
+| G7-18 | Run independent actual ring-3 clients through syscall create/read/write/rename in QEMU (no host adapter substitute) | PR #798 adds a native Files-held lease while PID1 creates/edits/renames an unrelated file, same-file denial/release and cold readback. Merged-main guest evidence passed at `06bed767889a8fe05aa31c9f7ee468710d027049` (run 45335772189); general multiwriter/SMP qualification remains open. |
 | G7-19 | Stress concurrent process exit, reuse, open handle close, permission revocation and namespace changes | Open |
 | G7-20 | Verify two-process persistent disk round-trip across two real QEMU cold boots at the exact merged SHA | Open |
 

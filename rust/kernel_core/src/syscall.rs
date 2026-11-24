@@ -199,7 +199,7 @@ pub unsafe extern "C" fn indianos_syscall_validate(
         32 => (1..=if cfg!(feature="normal-desktop"){12}else{11}).contains(&request.arg0) &&
               user_range(plan,request.arg1,64,false), // installed native app
         #[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
-        33 => (matches!(request.arg0,1..=6|34..=38)) &&
+        33 => (matches!(request.arg0,1..=6|25|26|34..=38)) &&
               user_range(plan,request.arg1,64,false), // versioned handles/range locks
         #[cfg(feature="test-r031-files-gui")]
         36 => (1..=4).contains(&request.arg0) &&
@@ -393,7 +393,9 @@ mod tests {
             segment_count:0,segments:[ProgramSegment::empty();MAX_SEGMENTS]};
         let check=|action,address|unsafe{indianos_syscall_validate(&plan,
             SyscallRequest{number:33,arg0:action,arg1:address})};
-        for action in 1..=6{assert!(check(action,plan.stack_begin));}
+        for action in (1..=6).chain([25,26]){assert!(check(action,plan.stack_begin));
+            for address in [plan.guard_begin,plan.stack_end-63,USER_TOP,u64::MAX]{assert!(!check(action,address));}
+        }
         for action in [0,7,u64::MAX]{assert!(!check(action,plan.stack_begin));}
         for address in [plan.guard_begin,plan.stack_end-63,USER_TOP,u64::MAX]{
             assert!(!check(6,address));

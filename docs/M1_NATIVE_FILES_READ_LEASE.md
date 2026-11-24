@@ -12,9 +12,10 @@ the resulting state through PID4 after the Files response. Terminal focus and
 pending editor input retain their existing routing rules. Legacy experimental
 profiles do not gain the commands or change behavior.
 
-Every Files refresh while the lease is active seeks and reads the original
-descriptor again, compares its contents with the captured preview, and only
-then acknowledges refresh. It does not reopen a replacement descriptor to
+Every Files refresh while the lease is active uses positioned read on the
+original descriptor, compares its contents with the captured preview, and checks
+that a sequential first-byte read still begins at offset zero. It then restores
+the cursor and acknowledges refresh. It does not reopen a replacement descriptor to
 claim continuity. The existing ordinary preview rendering may independently
 use its normal short-lived reader. This lets the selected path API's qualified
 unrelated-file sharing preserve a real PID2 read capability across PID1 commits.
@@ -35,7 +36,7 @@ syscall33 and the kernel-authenticated process incarnation. The new Terminal
 failure diagnostic is emitted only after an authenticated broker error reply.
 
 The client negotiates ABI version 1, the 64-byte descriptor layout and the
-unrelated-reader feature bit before acquiring the long-lived lease. Unsupported
+unrelated-reader flag `0x08` and positioned-I/O flag `0x10` before acquiring the long-lived lease. Unsupported
 kernels return a normal control failure rather than enabling a volume-wide lock.
 
 Cloud verification for this client change: ten standalone renderer/protocol/
