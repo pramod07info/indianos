@@ -39,6 +39,7 @@ pub enum Command {
     Mkdir(Name),
     Move { from: Name, to: Name },
     Put { name: Name, bytes: [u8; MAX_DATA], len: u8 },
+    Patch { name: Name, offset: u16, bytes: [u8; MAX_DATA], len: u8 },
 }
 
 /// Preserve exact payload bytes, including trailing spaces and additional '='.
@@ -60,6 +61,21 @@ pub fn parse(line: &[u8]) -> Option<Command> {
             from: Name::parse(&tail[..separator])?,
             to: Name::parse(&tail[separator + 1..])?,
         });
+    }
+    if let Some(tail) = line.strip_prefix(b"patch ") {
+        let space = tail.iter().position(|b| *b == b' ')?;
+        let name = Name::parse(&tail[..space])?;
+        let argument = &tail[space + 1..];
+        let equal = argument.iter().position(|b| *b == b'=')?;
+        let digits = &argument[..equal];
+        if digits.is_empty() || digits.len() > 2 || digits.iter().any(|b| !b.is_ascii_digit())
+            || (digits.len() > 1 && digits[0] == b'0') { return None; }
+        let offset = digits.iter().fold(0u16, |n, b| n * 10 + (b - b'0') as u16);
+        let payload = &argument[equal + 1..];
+        if payload.is_empty() || offset as usize + payload.len() > MAX_DATA
+            || payload.iter().any(|b| !(0x20..=0x7e).contains(b)) { return None; }
+        let mut bytes = [0; MAX_DATA]; bytes[..payload.len()].copy_from_slice(payload);
+        return Some(Command::Patch { name, offset, bytes, len: payload.len() as u8 });
     }
     if let Some(tail) = line.strip_prefix(b"put ") {
         let separator = tail.iter().position(|b| *b == b'=')?;
@@ -87,6 +103,13 @@ pub fn encode(command: Command, out: &mut [u8; WIRE_BYTES]) -> Option<usize> {
         Command::Remove(name) => (3, *name, None, &[]),
         Command::Mkdir(name) => (4, *name, None, &[]),
         Command::Move { from, to } => (5, *from, Some(*to), &[]),
+        Command::Patch { name, offset, bytes, len } => {
+            if *len == 0 || *len as usize > MAX_DATA || *offset as usize + *len as usize > MAX_DATA { return None; }
+            let data = &bytes[..*len as usize];
+            if data.iter().any(|b| !(0x20..=0x7e).contains(b)) { return None; }
+            out[5..7].copy_from_slice(&offset.to_le_bytes());
+            (7, *name, None, data)
+        },
         Command::Put { name, bytes, len } => {
             if *len == 0 || *len as usize > MAX_DATA { return None; }
             let data = &bytes[..*len as usize];
@@ -109,7 +132,8 @@ pub fn encode(command: Command, out: &mut [u8; WIRE_BYTES]) -> Option<usize> {
 /// parse is never trusted as admission for a request from another process.
 pub fn decode(wire: &[u8]) -> Option<Command> {
     if wire.len() != WIRE_BYTES || wire[0] != b'F'
-        || wire[5..8].iter().chain(&wire[58..]).any(|b| *b != 0)
+        || wire[7..8].iter().chain(&wire[58..]).any(|b| *b != 0)
+        || (wire[1] != 7 && wire[5..7].iter().any(|b| *b != 0))
     {
         return None;
     }
@@ -129,12 +153,16 @@ pub fn decode(wire: &[u8]) -> Option<Command> {
         5 if n == 0 => Some(Command::Move {
             from: name, to: Name::parse(&wire[23..23 + b])?,
         }),
-        6 if b == 0 && n != 0 && wire[38..38 + n].iter()
+        6 | 7 if b == 0 && n != 0 && wire[38..38 + n].iter()
             .all(|byte| (0x20..=0x7e).contains(byte)) =>
         {
             let mut bytes = [0; MAX_DATA];
             bytes[..n].copy_from_slice(&wire[38..38 + n]);
-            Some(Command::Put { name, bytes, len: n as u8 })
+            if wire[1] == 7 {
+                let offset = u16::from_le_bytes([wire[5], wire[6]]);
+                if offset as usize + n > MAX_DATA { return None; }
+                Some(Command::Patch { name, offset, bytes, len: n as u8 })
+            } else { Some(Command::Put { name, bytes, len: n as u8 }) }
         },
         _ => None,
     }

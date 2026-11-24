@@ -887,7 +887,7 @@ fn files_acquire_read_lease()->bool{
     if file_handle_call(34,b"",token,0,&mut data,0)!=0{
         let _=file_handle_call(5,b"",token,0,&mut data,0);return false;
     }
-    let length=file_handle_call(2,b"",token,0,&mut data,72);
+    let length=file_handle_call(25,b"",token,0,&mut data,72);
     let mut lease=files_read_lease::ReadLease::new();
     if length>20||!lease.capture(token,&data[..length as usize]){
         let _=files_close_read_lease(token);return false;
@@ -915,10 +915,13 @@ fn files_verify_read_lease()->bool{
     if !lease.held(){return true;}
     let mut data=[0u8;256];
     let token=lease.token();
-    let read=if file_handle_call(4,b"",token,0,&mut data,0)==0{
-        file_handle_call(2,b"",token,0,&mut data,72)
-    }else{u64::MAX};
-    if read<=20&&lease.verifies(token,&data[..read as usize]){
+    let read=file_handle_call(25,b"",token,0,&mut data,72);
+    let snapshot_ok=read<=20&&lease.verifies(token,&data[..read as usize]);
+    let first=if snapshot_ok{file_handle_call(2,b"",token,0,&mut data,1)}else{u64::MAX};
+    let cursor_ok=first<=1&&lease.verifies_cursor(token,&data[..first as usize]);
+    let restored=cursor_ok&&file_handle_call(4,b"",token,0,&mut data,0)==0;
+    if snapshot_ok&&cursor_ok&&restored{
+        write(b"desktop Files positioned read preserved cursor");
         write(b"desktop Files retained read lease verified after refresh");true
     }else{
         let _=files_take_read_lease();
@@ -1029,6 +1032,23 @@ fn desktop_named_command(command:terminal_fs::Command){
             let Some(kind)=desktop_child_kind(&from)else{suite_send(3,b"E");return;};
             let len=from.path(&mut path);let target_len=to.path(&mut target);
             vfs_call(if kind==b'd'{9}else{7},&path[..len],&target[..target_len],&mut data,0)
+        },
+        Command::Patch{name,offset,bytes,len}=>{
+            let abi=file_handle_call(37,b"",0,0,&mut data,0);
+            // Feature discovery is additive; never emulate this request by
+            // replacing the file or changing its descriptor cursor.
+            if abi&0xffff!=1||(abi>>16)&0xffff!=64||(abi>>32)&48!=48{
+                suite_send(3,b"E");return;
+            }
+            let path_len=name.path(&mut path);
+            let token=file_handle_call(1,&path[..path_len],0,3,&mut data,0);
+            if token==0||token==u64::MAX{suite_send(3,b"E");return;}
+            data[..len as usize].copy_from_slice(&bytes[..len as usize]);
+            let count=file_handle_call(26,b"",token,offset as u64,&mut data,len as usize);
+            // Even a rejected write must release its cached descriptor.
+            let closed=file_handle_call(5,b"",token,0,&mut data,0);
+            if count!=len as u64||closed!=0{suite_send(3,b"E");return;}
+            write(b"desktop broker positioned write committed");0
         },
         Command::Put{name,bytes,len}=>{
             let path_len=name.path(&mut path);data[..len as usize].copy_from_slice(&bytes[..len as usize]);
@@ -1747,6 +1767,19 @@ fn r031_terminal()->!{
         directory[56..64].copy_from_slice(&72u64.to_le_bytes());
         if call(34,1,directory.as_ptr() as u64)!=u64::MAX{exit(228);}
         write(b"R114 Terminal PID3 denied direct Files handles and directory syscall");
+        #[cfg(feature="desktop-terminal")]
+        {
+            let mut positioned=[0u8;64];
+            // QUERY has no handle to invalidate: this independently proves
+            // absence of file-service authority, rather than a stale token.
+            if call(33,37,positioned.as_ptr() as u64)!=u64::MAX{exit(227);}
+            positioned[24..32].copy_from_slice(&1u64.to_le_bytes());
+            positioned[40..48].copy_from_slice(&(data.as_mut_ptr() as u64).to_le_bytes());
+            positioned[48..56].copy_from_slice(&1u64.to_le_bytes());
+            if call(33,25,positioned.as_ptr() as u64)!=u64::MAX||
+               call(33,26,positioned.as_ptr() as u64)!=u64::MAX{exit(227);}
+            write(b"desktop Terminal denied direct positioned filesystem IO");
+        }
         if local_udp(1,3,5502,0,0,0)!=u64::MAX{exit(237);}
         write(b"R114 Terminal PID3 denied UDP socket admission");
     }
@@ -1802,7 +1835,7 @@ fn vfs_call_at(action:u64,path:&[u8],offset:u64,
     call(32,action,desc.as_ptr() as u64)
 }
 // R031.6-8: 64-byte descriptor-based native file manager API.
-#[cfg(any(feature="r031-vfs-init",any(feature="r031-files-app",feature="desktop-files")))]
+#[cfg(any(feature="r031-vfs-init",feature="desktop-init",feature="r031-files-app",feature="desktop-files"))]
 fn file_handle_call(action:u64,path:&[u8],handle:u64,argument:u64,
                     data:&mut [u8;256],size:usize)->u64{
     if path.len()>23 || size>256{exit(205);}
@@ -1810,7 +1843,7 @@ fn file_handle_call(action:u64,path:&[u8],handle:u64,argument:u64,
     desc[..path.len()].copy_from_slice(path);
     desc[24..32].copy_from_slice(&handle.to_le_bytes());
     desc[32..40].copy_from_slice(&argument.to_le_bytes());
-    if matches!(action,2|3){
+    if matches!(action,2|3|25|26){
         desc[40..48].copy_from_slice(&(data.as_mut_ptr() as u64).to_le_bytes());
         desc[48..56].copy_from_slice(&(size as u64).to_le_bytes());
     }

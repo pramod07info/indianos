@@ -48,6 +48,9 @@ UART_ACTIONS = (PHYSICAL.encode(), SHUTDOWN.encode(), b"application launcher",
 NAMED_COMMIT = "desktop broker committed named selected-volume mutation and refreshed Files"
 LEASE_ACQUIRED = b"IndianOS user: desktop Files read lease acquired"
 LEASE_REFRESH = b"IndianOS user: desktop Files retained read lease verified after refresh"
+LEASE_CURSOR = b"IndianOS user: desktop Files positioned read preserved cursor"
+POSITIONED_WRITE = b"IndianOS user: desktop broker positioned write committed"
+POSITIONED_DENIED = b"IndianOS user: desktop Terminal denied direct positioned filesystem IO"
 LEASE_RELEASED = b"IndianOS user: desktop Files read lease released"
 LEASE_DENIED = b"IndianOS user: desktop Terminal filesystem request failed"
 LEASE_CONTROL_ACK = "desktop Files read lease control acknowledged"
@@ -68,6 +71,7 @@ PIXEL_APP_EVIDENCE = tuple(
     b"IndianOS user: desktop compositor denied app pixel authority",
 )
 TERMINAL_AUTHORITY = PIXEL_APP_EVIDENCE + (
+    POSITIONED_DENIED,
     b"IndianOS user: R117 QEMU PID2 stack guard and crossing descriptor pointers denied",
     b"IndianOS user: R114 PID2 ring3 invalid pointer, private path and denied write blocked",
     b"IndianOS user: R114 Terminal PID3 denied direct Files handles and directory syscall",
@@ -159,12 +163,12 @@ def verify_text_pixels(image: tuple[int, int, bytes], field: str, expected: str,
 def type_named_command(session: QemuSession, command: str) -> None:
     # Every HMP token comes from this fixed map; reject the entire string
     # before injecting anything. '=' is needed by the bounded put command.
-    if not command or any(c not in "abcdefghijklmnopqrstuvwxyz =" for c in command):
+    if not command or any(c not in "abcdefghijklmnopqrstuvwxyz0123456789 =" for c in command):
         raise AssertionError("unsupported physical named-file command")
     for char in command:
-        if char == "=":
+        if char in "=0123456789":
             start = len(session.output)
-            session.hmp("sendkey equal 80")
+            session.hmp(f"sendkey {'equal' if char == '=' else char} 80")
             session.until(ACK, 20, since=start)
             if SHUTDOWN.encode() in session.output[start:]:
                 raise AssertionError("named editor input escaped into shutdown")
@@ -639,11 +643,14 @@ def lease_records(output: bytes, since: int) -> list[bytes]:
     return [line[1:] if line == b"f" + refused else line for line in lines]
 
 
-def verify_lease_commit(output: bytes, since: int) -> None:
+def verify_lease_commit(output: bytes, since: int, positioned: bool = False) -> None:
     lines = lease_records(output, since)
     commit = b"IndianOS user: " + NAMED_COMMIT.encode()
-    if (lines.count(LEASE_REFRESH) != 1 or lines.count(commit) != 1 or
+    if (lines.count(LEASE_CURSOR) != 1 or lines.count(LEASE_REFRESH) != 1 or
+            lines.count(POSITIONED_WRITE) != int(positioned) or lines.count(commit) != 1 or
+            lines.index(LEASE_CURSOR) >= lines.index(LEASE_REFRESH) or
             lines.index(LEASE_REFRESH) >= lines.index(commit) or
+            (positioned and lines.index(POSITIONED_WRITE) >= lines.index(LEASE_CURSOR)) or
             any(marker in lines for marker in (LEASE_ACQUIRED, LEASE_RELEASED, LEASE_DENIED))):
         raise AssertionError("unrelated write lacks fresh original-token verification before commit")
 
@@ -659,7 +666,7 @@ def verify_lease_denial(before: bytes, after: bytes, output: bytes, since: int,
     if lines.count(marker) != 1 or sum(lines.count(x) for x in denials) != 1:
         raise AssertionError("protected-file denial lacks one exact native error record")
     forbidden = (NAMED_COMMIT.encode(), COMMITTED.encode(), PERSISTED.encode(),
-                 LEASE_ACQUIRED, LEASE_REFRESH, LEASE_RELEASED,
+                 LEASE_ACQUIRED, LEASE_CURSOR, LEASE_REFRESH, LEASE_RELEASED, POSITIONED_WRITE,
                  SHUTDOWN.encode(), STOPPED.encode(),
                  b"selected volume sync failed", b"IndianOS recovery:", b"FATAL",
                  b"restarting retired service session")
@@ -672,7 +679,7 @@ def verify_released_lease_write(output: bytes, since: int) -> None:
     commit = b"IndianOS user: " + NAMED_COMMIT.encode()
     if (lines.count(LEASE_RELEASED) != 1 or lines.count(commit) != 1 or
             lines.index(LEASE_RELEASED) >= lines.index(commit) or
-            any(marker in lines for marker in (LEASE_ACQUIRED, LEASE_REFRESH, LEASE_DENIED))):
+            any(marker in lines for marker in (LEASE_ACQUIRED, LEASE_CURSOR, LEASE_REFRESH, POSITIONED_WRITE, LEASE_DENIED))):
         raise AssertionError("protected-file write did not follow release of the original lease")
 
 
@@ -708,24 +715,28 @@ def shared_read_lease_boots(qemu: str, iso: Path, ovmf: Path, disk: Path, folder
         for step, (command, listing) in enumerate((
                 ("touch peer", "f:readme f:peer "),
                 ("put peer=violet", "f:readme f:peer "),
+                ("patch peer 2=xy", "f:readme f:peer "),
                 ("mv peer other", "f:readme f:other "))):
             type_named_command(session, command)
             submitted = acknowledged_key(session, "ret")
             session.until(NAMED_COMMIT, 20, since=submitted)
             session.drain_serial(0.1)
-            verify_lease_commit(bytes(session.output), submitted)
+            verify_lease_commit(bytes(session.output), submitted, positioned=command.startswith("patch "))
             frame = session.shot(folder / f"lease-unrelated-{step}.ppm")
             verify_text_pixels(frame, "terminal", "SAVED")
             verify_text_pixels(frame, "files-directory", listing)
             verify_text_pixels(frame, "files-note", "HELLO INDIANOS")
             verify_text_pixels(frame, "files-lock", "READ LOCKED")
-        type_named_command(session, "put readme=blocked")
-        before = disk.read_bytes()
-        denied = acknowledged_key(session, "ret")
-        session.until(LEASE_DENIED.decode(), 20, since=denied)
-        session.drain_serial(0.1)
-        verify_lease_denial(before, disk.read_bytes(), bytes(session.output), denied)
-        verify_text_pixels(session.shot(folder / "lease-same-file-denied.ppm"), "terminal", "IO ERROR")
+        for command, label in (("patch readme 1=x", "positioned"), ("put readme=blocked", "replace")):
+            type_named_command(session, command)
+            before = disk.read_bytes()
+            denied = acknowledged_key(session, "ret")
+            session.until(LEASE_DENIED.decode(), 20, since=denied)
+            session.drain_serial(0.1)
+            verify_lease_denial(before, disk.read_bytes(), bytes(session.output), denied)
+            frame = session.shot(folder / f"lease-same-file-{label}-denied.ppm")
+            verify_text_pixels(frame, "terminal", "IO ERROR")
+            verify_text_pixels(frame, "files-lock", "READ LOCKED")
         type_named_command(session, "cat readme")
         read = acknowledged_key(session, "ret")
         marker = "IndianOS user: R051 Terminal readback: HELLO INDIANOS"
@@ -765,7 +776,7 @@ def shared_read_lease_boots(qemu: str, iso: Path, ovmf: Path, disk: Path, folder
         verify_text_pixels(session.shot(folder / "lease-reboot-initial.ppm"), "files-note", "permitted")
         acknowledged_key(session, "2", "R031.1 user switched to Terminal app")
         acknowledged_key(session, "ret")
-        for name, value in (("readme", "permitted"), ("other", "violet")):
+        for name, value in (("readme", "permitted"), ("other", "vixyet")):
             type_named_command(session, "cat " + name)
             submitted = acknowledged_key(session, "ret")
             marker = "IndianOS user: R051 Terminal readback: " + value

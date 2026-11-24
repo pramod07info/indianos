@@ -30,6 +30,8 @@ additional operations are authenticated through the current PCB incarnation:
 
 | Operation | Behavior |
 | --- | --- |
+| 25 | Positioned read: bounded destination, explicit byte offset, cursor unchanged. |
+| 26 | Positioned write: bounded source, explicit byte offset, cursor unchanged. |
 | 34 | Acquire/replace a shared byte-range lock on a readable handle. |
 | 35 | Acquire/replace an exclusive range lock on a writable handle. |
 | 36 | Release this handle's lock; argument must be zero. |
@@ -42,7 +44,10 @@ Acquisition returns 0 on success, 1 on contention without changing the prior
 lock, and `u64::MAX` for invalid/unauthorized requests. ABI query requires
 handle/argument/path/data zero; it reports version1, 64 bytes, feature bits0
 (basic descriptors),1 (range locks) and, in the following permissions batch,
-2 (persistent mode permissions). Unknown operation numbers reject.
+2 (persistent mode permissions). The current implementation additionally reports
+flags `0x08` (verified unrelated selected-path readers), `0x10` (positioned native
+I/O) and `0x20` (verified unrelated descriptor readers), for feature mask `0x3f`.
+Unknown operation numbers reject.
 
 Locks belong to descriptor tokens and kernel-issued process generations.
 Close, retirement, root revocation and I/O token invalidation remove them.
@@ -54,8 +59,11 @@ on its real read-only native handle before displaying file contents.
 
 This is bounded nonblocking locking on the existing single-BSP file service.
 It does not add POSIX blocking/fair waits or SMP synchronization. The existing
-conservative volume-generation writer exclusion remains: range locks do not
-permit mutation behind another process's live snapshot. Named-user extended
+volume-generation exclusion remains for overlapping files, stale readers and
+structural descriptor edits. WRITE/TRUNCATE/PWRITE can preserve exact current
+READ descriptors of unrelated files through the existing serialized witness;
+see [descriptor sharing](M1_G6_DESCRIPTOR_READER_SHARING.md). Range locks alone
+do not authorize mutation behind another process's live snapshot. Named-user extended
 ACLs and a general multiwriter filesystem remain unfinished.
 The follow-up [persistent permissions](M1_PERSISTENT_PERMISSIONS.md) adds
 kernel-issued credentials, stored owner/group/other bits and native chmod38.

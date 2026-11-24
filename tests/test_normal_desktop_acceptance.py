@@ -19,7 +19,7 @@ finally:
 class NormalDesktopControls(unittest.TestCase):
     def test_shared_lease_commit_requires_original_token_and_fresh_verified_read(self):
         commit = b"IndianOS user: " + harness.NAMED_COMMIT.encode()
-        good = harness.LEASE_REFRESH + b"\n" + commit + b"\n"
+        good = harness.LEASE_CURSOR + b"\n" + harness.LEASE_REFRESH + b"\n" + commit + b"\n"
         harness.verify_lease_commit(good, 0)
         for bad in (good[:-1], commit + b"\n", good + good,
                     commit + b"\n" + harness.LEASE_REFRESH + b"\n",
@@ -32,6 +32,29 @@ class NormalDesktopControls(unittest.TestCase):
             harness.verify_lease_commit(good, len(good))
         with self.assertRaises(AssertionError):
             harness.verify_lease_commit(good, 1)
+
+    def test_positioned_commit_requires_one_fresh_ordered_native_write_and_cursor_proof(self):
+        records = (harness.POSITIONED_WRITE, harness.LEASE_CURSOR,
+                   harness.LEASE_REFRESH, b"IndianOS user: " + harness.NAMED_COMMIT.encode())
+        good = b"\n".join(records) + b"\n"
+        harness.verify_lease_commit(good, 0, positioned=True)
+        for marker in records:
+            for bad in (good.replace(marker + b"\n", b""), good + marker + b"\n",
+                        good.replace(marker, b"stale " + marker), good[:-1]):
+                with self.subTest(marker=marker, trace=bad), self.assertRaises(AssertionError):
+                    harness.verify_lease_commit(bad, 0, positioned=True)
+        for order in ((1, 0, 2, 3), (0, 2, 1, 3), (0, 1, 3, 2)):
+            with self.assertRaises(AssertionError):
+                harness.verify_lease_commit(b"\n".join(records[i] for i in order) + b"\n",
+                                           0, positioned=True)
+        with self.assertRaises(AssertionError):
+            harness.verify_lease_commit(good, len(records[0]) + 1, positioned=True)
+        with self.assertRaises(AssertionError):
+            harness.verify_lease_commit(good, 0)
+        denial = harness.LEASE_DENIED + b"\n"
+        for marker in (harness.POSITIONED_WRITE, harness.LEASE_CURSOR):
+            with self.assertRaises(AssertionError):
+                harness.verify_lease_denial(b"disk", b"disk", denial + marker + b"\n", 0)
 
     def test_shared_lease_contention_is_nondestructive_without_retiring_authority(self):
         media = b"unchanged admitted media"
@@ -806,6 +829,19 @@ class NormalDesktopControls(unittest.TestCase):
                               (line.replace(b"d:docs", b"f:a"), 0)):
             with self.assertRaises(AssertionError):
                 harness.verify_listing(output, since, {"f:readme", "f:a", "d:docs"})
+
+    def test_positioned_offsets_use_only_fixed_physical_digit_tokens(self):
+        class Session:
+            output = bytearray()
+            tokens = []
+            def hmp(self, command):
+                self.tokens.append(command)
+            def until(self, marker, timeout, since):
+                self.output.extend(marker.encode() + b"\n")
+        session = Session()
+        harness.type_named_command(session, "0123456789=")
+        self.assertEqual(session.tokens, [f"sendkey {digit} 80" for digit in "0123456789"] +
+                         ["sendkey equal 80"])
 
     def test_named_input_rejects_unsafe_tokens_before_any_injection(self):
         class Session:

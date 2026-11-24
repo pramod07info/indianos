@@ -95,6 +95,31 @@ This batch adds source and positive/negative acceptance tests without local
 execution, as requested. Exact-head GitHub Actions, actual QEMU evidence and
 review are still required; no additional high-level M1 gate is accepted here.
 
+## G5–G7 follow-up qualification — 24 Nov 2026
+
+PR #798 is merged. At main SHA
+`06bed767889a8fe05aa31c9f7ee468710d027049`, [combined reliability
+45335772189](https://github.com/pramod07info/indianos/actions/runs/45335772189)
+passed all three jobs, including the normal desktop matrix with native
+Files-held read leases, interruption before acknowledgment, namespace cuts
+and cold reboots. [Security S0
+45335772074](https://github.com/pramod07info/indianos/actions/runs/45335772074)
+passed at the same SHA. These are receipts for the merged baseline, not
+qualification of later changes. The final source also normalizes CPU-generated
+RF on user-mode input-IRQ returns while preserving supervisor frames and
+strict syscall frame validation.
+
+The next slice extends existing descriptor operations rather than introducing
+a second filesystem: native positioned I/O, generation-verified unrelated
+reader preservation for bounded descriptor writers, and compiled-production
+IRQ-return regression coverage. Its [positioned-I/O guest acceptance
+contract](M1_POSITIONED_IO_QEMU_ACCEPTANCE.md) requires actual keyboard
+commands, original reader-token/cursor continuity, denied protected-file writes
+and cold readback. Fresh exact-head cloud CI and review are required before
+accepting this slice. G5/G6/G7 remain **IN PROGRESS**; broader concurrency,
+physical-device qualification and full phase-scope acceptance remain separate
+obligations. No completion percentage or accepted-gate count changes here.
+
 ## M2 — Developer Alpha
 
 **Current M2 integrated workstream:** [M2 developer-alpha engineering
