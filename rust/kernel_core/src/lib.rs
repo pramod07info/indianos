@@ -300,6 +300,8 @@ pub mod desktop;
 #[cfg(any(feature="test-r029-userspace",feature="normal-desktop"))]
 pub mod gui_protocol;
 pub mod pixel_protocol;
+#[cfg(feature="normal-desktop")]
+mod compositor_pixels;
 /// R029.1 authenticated per-process window grants and bounded event queue.
 pub mod gui_broker;
 #[cfg(feature="test-r031-supervisor")]

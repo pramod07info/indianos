@@ -153,6 +153,21 @@ No local build, project test or QEMU execution was performed while authoring
 this batch. Exact-head CI and independent review are required; none of these
 changes alone mark a complete gate 100% or change the accepted milestone count.
 
+## G4 compositor readback — M1-P9-001
+
+The normal PID4 compositor can query a live app window's committed surface
+dimensions and generation, then copy a bounded row span for that generation.
+The reply carries framebuffer-native color and an explicit coverage bit.
+Readbacks never expose an app mapping, staging pixels, or framebuffer memory.
+Stale generations, retired grants, invalid coordinates and non-compositor
+callers are denied. A new app commit invalidates previous row-read requests.
+
+The first normal present checks both app surfaces from PID4 after their
+initial commits. The normal QEMU oracle requires fresh readback evidence
+before readiness, including on restarted sessions. Use the exact candidate
+and merged-main Actions logs and retained artifact for acceptance. This
+interface supplies an input to later userspace composition.
+
 ## G3 independent sign-off packet
 
 Use the shared [G1–G3 independent source review and explicit sign-off protocol](M1_GATES_6_7_ACCEPTANCE.md#g1g3-independent-source-review-and-explicit-sign-off--24-nov-2026) for the pinned PR #806 production baseline, actual QEMU evidence, mandatory source review and explicit gate decision. This reference does not accept G3 or any later gate.

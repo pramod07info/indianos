@@ -268,6 +268,12 @@ class NormalDesktopControls(unittest.TestCase):
         with self.assertRaises(AssertionError):
             harness.verify_pixel_startup(trace.replace(guard, b"") + guard)
 
+    def test_compositor_snapshot_evidence_must_follow_both_app_commits(self):
+        trace = self.pixel_startup()
+        snapshot = harness.COMPOSITOR_SNAPSHOT + b"\n"
+        with self.assertRaises(AssertionError):
+            harness.verify_pixel_startup(snapshot + trace.replace(snapshot, b""))
+
     def test_app_scratch_ledger_requires_distinct_owners_not_distinct_virtual_addresses(self):
         # Identical VAs in independent app CR3s are expected and must not be
         # mistaken for shared app storage or queried through PID4's root.

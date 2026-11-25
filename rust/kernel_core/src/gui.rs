@@ -787,6 +787,19 @@ pub(crate) fn desktop_window_query(pid:u32)->Option<[u8;64]>{
 pub(crate) fn desktop_window_apply(pid:u32,bytes:&[u8;64])->bool{
     user_service().is_some_and(|svc|svc.apply_window_frame(pid,bytes,UserSurfaceService::redraw))
 }
+#[cfg(feature="normal-desktop")]
+pub(crate) fn desktop_pixel_snapshot(
+    pid: u32, request: crate::compositor_pixels::Request,
+) -> Option<[u8; crate::compositor_pixels::REPLY_BYTES]> {
+    if pid != 4 {
+        return None;
+    }
+    let service = user_service()?;
+    let window = u32::from(request.window);
+    let owner = service.broker.owner(window)?;
+    let slot = service.pixel_slot(owner, window)?;
+    service.pixels.snapshot(slot, request)
+}
 #[cfg(any(feature="test-r029-userspace",feature="normal-desktop"))]
 pub(crate) fn user_surface_submit(pid:u32,bytes:&[u8;64])->bool{
     user_service().is_some_and(|svc|svc.submit(pid,bytes))
