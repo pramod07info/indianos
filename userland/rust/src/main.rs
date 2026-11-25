@@ -1357,38 +1357,44 @@ fn compositor_read_denied() -> bool {
 }
 
 #[cfg(feature="desktop-compositor")]
-fn compose_desktop_strip(
-    manager: &desktop_window::Manager, screen: (u16, u16), strip: &mut [u32],
+fn compose_desktop_row(
+    manager: &desktop_window::Manager, screen: (u16, u16), row: &mut [u32], scratch: &mut [u32],
 ) -> Option<()> {
     use compositor_pixels::{Request, HEADER_BYTES, OPAQUE, ROW_PIXELS};
-    if strip.is_empty() || strip.len() > ROW_PIXELS { return None; }
-    let mut layers = [[None; ROW_PIXELS]; 2];
-    let mut destinations = [0; 2];
-    for (slot, pixels) in layers.iter_mut().enumerate() {
+    let mut snapshots = [None; 2];
+    for (slot, snapshot) in snapshots.iter_mut().enumerate() {
         if manager.client_origin(slot).is_none() { continue; }
         let query = Request { window: slot as u16 + 1, x: 0, y: 0, count: 0, generation: 0 };
         let info = compositor_read(query)?;
         let generation = u64::from_le_bytes(info[..8].try_into().ok()?);
         let width = u16::from_le_bytes(info[8..10].try_into().ok()?);
         let height = u16::from_le_bytes(info[10..12].try_into().ok()?);
-        let Some(span) = manager.client_read_span(slot, screen, strip.len() as u16, (width, height))
-            else { continue; };
-        let request = Request { x: span.x, y: span.y, count: span.count, generation, ..query };
-        let reply = compositor_read(request)?;
-        if reply[..HEADER_BYTES] != info[..HEADER_BYTES] { return None; }
-        destinations[slot] = i32::from(span.destination);
-        for (out, bytes) in pixels.iter_mut().zip(reply[HEADER_BYTES..].chunks_exact(8))
-            .take(usize::from(span.count)) {
-            let value = u64::from_le_bytes(bytes.try_into().ok()?);
-            *out = match value {
-                0 => None,
-                value if value >> 32 == OPAQUE >> 32 => Some(value as u32),
-                _ => return None,
-            };
-        }
+        *snapshot = Some((query, info, generation, (width, height)));
     }
-    manager.compose_screen_strip(screen, destinations, &mut layers, strip);
-    Some(())
+    manager.compose_row::<ROW_PIXELS>(screen, row, scratch, |screen, strip| {
+        let mut layers = [[None; ROW_PIXELS]; 2];
+        let mut destinations = [0; 2];
+        for (slot, pixels) in layers.iter_mut().enumerate() {
+            let Some((query, info, generation, dimensions)) = &snapshots[slot] else { continue; };
+            let Some(span) = manager.client_read_span(slot, screen, strip.len() as u16, *dimensions)
+                else { continue; };
+            let request = Request { x: span.x, y: span.y, count: span.count, generation: *generation, ..*query };
+            let reply = compositor_read(request)?;
+            if reply[..HEADER_BYTES] != info[..HEADER_BYTES] { return None; }
+            destinations[slot] = i32::from(span.destination);
+            for (out, bytes) in pixels.iter_mut().zip(reply[HEADER_BYTES..].chunks_exact(8))
+                .take(usize::from(span.count)) {
+                let value = u64::from_le_bytes(bytes.try_into().ok()?);
+                *out = match value {
+                    0 => None,
+                    value if value >> 32 == OPAQUE >> 32 => Some(value as u32),
+                    _ => return None,
+                };
+            }
+        }
+        manager.compose_screen_strip(screen, destinations, &mut layers, strip);
+        Some(())
+    })
 }
 
 #[cfg(feature="desktop-compositor")]
@@ -1420,9 +1426,11 @@ fn verify_client_snapshots(manager: &desktop_window::Manager) -> bool {
     // Exercise real desktop coordinates in addition to the overlap probe.
     for (slot, x, y) in [(0, 15, 102), (1, 20, 175)] {
         let Some((left, top)) = manager.client_origin(slot) else { return false; };
-        let mut pixel = [0];
-        if compose_desktop_strip(manager, (left + x, top + y), &mut pixel).is_none() ||
-           pixel[0] != colors[slot] { return false; }
+        const PROBE_PIXELS: usize = compositor_pixels::ROW_PIXELS * 2 + 1;
+        let mut row = [0; PROBE_PIXELS];
+        let mut scratch = [0; PROBE_PIXELS];
+        if compose_desktop_row(manager, (left + x, top + y), &mut row, &mut scratch).is_none() ||
+           row.iter().any(|&pixel| pixel != colors[slot]) { return false; }
     }
     let terminal_front = manager.front() == 2;
     let front = usize::from(terminal_front);

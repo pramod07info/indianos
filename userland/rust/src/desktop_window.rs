@@ -31,6 +31,24 @@ impl Manager{
   Some(RowRead { x: start - window_x, y, count: (end - u32::from(start)) as u16,
                  destination: start - screen_x })
  }
+ /// Stage a row in bounded chunks before exposing any of its pixels.
+ pub fn compose_row<const Chunk: usize>(
+  &self, screen: (u16, u16), row: &mut [u32], scratch: &mut [u32],
+  mut compose: impl FnMut((u16, u16), &mut [u32]) -> Option<()>,
+ ) -> Option<()> {
+  let (x, y) = screen;
+  if Chunk == 0 || row.is_empty() || row.len() != scratch.len() ||
+     y >= self.frame.height || row.len() > usize::from(self.frame.width.checked_sub(x)?) {
+   return None;
+  }
+  scratch.copy_from_slice(row);
+  for (index, chunk) in scratch.chunks_mut(Chunk).enumerate() {
+   compose((x + (index * Chunk) as u16, y), chunk)?;
+  }
+  row.copy_from_slice(scratch);
+  Some(())
+ }
+
  /// Composite client samples over an existing background/chrome strip.
  /// The front window body is opaque, including where its client has no pixel.
  pub fn compose_screen_strip<const N: usize>(

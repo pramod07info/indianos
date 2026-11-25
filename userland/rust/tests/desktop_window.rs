@@ -100,3 +100,25 @@ fn front_window_body_occludes_rear_client_under_transparent_pixels() {
                                  &mut [pixels[0], [None; 4]], &mut strip);
     assert_eq!(strip, [1; 4]);
 }
+
+#[test]
+fn wide_row_commits_only_after_all_chunks_succeed() {
+    let manager = Manager::new(&initial()).unwrap();
+    let mut row = [1; 5];
+    let mut scratch = [0; 5];
+    assert_eq!(manager.compose_row::<2>((795, 599), &mut row, &mut scratch, |(x, y), chunk| {
+        assert_eq!(y, 599);
+        chunk.fill(u32::from(x));
+        (x != 799).then_some(())
+    }), None);
+    assert_eq!(row, [1; 5]);
+
+    assert_eq!(manager.compose_row::<2>((795, 599), &mut row, &mut scratch, |(x, _), chunk| {
+        chunk.fill(u32::from(x));
+        Some(())
+    }), Some(()));
+    assert_eq!(row, [795, 795, 797, 797, 799]);
+    assert_eq!(manager.compose_row::<2>((796, 599), &mut row, &mut scratch, |_, _| {
+        panic!("off-screen row reached the compositor callback")
+    }), None);
+}

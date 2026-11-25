@@ -52,3 +52,13 @@ through G8 to positions 6–13.
   is named for that candidate SHA. The production merge is `ec046484`,
   with separate [kernel boot evidence](https://github.com/pramod07info/indianos/actions/runs/45607495759).
   Record fresh candidate and merged-main reliability receipts for final acceptance.
+
+### G3 shutdown exhaustion evidence
+
+Candidate `bd74b98978ee452aacd6a023967750a584ef6b31` passed the new
+[live QEMU shutdown exhaustion scenario](https://github.com/pramod07info/indianos/actions/runs/45616480940/job/139213083624).
+The oracle requires two armed shutdown attempts, one restart, read-only
+recovery and unchanged selected media.
+[Artifact 15022933098](https://github.com/pramod07info/indianos/actions/runs/45616480940/artifacts/15022933098)
+retains the exact-candidate evidence. Formal reconciliation and merged-main
+qualification are still pending.
