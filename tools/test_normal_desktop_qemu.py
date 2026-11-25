@@ -629,6 +629,9 @@ def boot(qemu: str, iso: Path, ovmf: Path, disk: Path, folder: Path, index: int)
         session.until(STOPPED, 30, since=shutdown_at)
         session.drain_serial(0.1)
         verify_runtime(bytes(session.output), shutdown_at)
+    except Exception as error:
+        capture_boot_failure(session, folder, f"desktop-{index}", error)
+        raise
     finally:
         close(process, sock, session, folder / f"desktop-{index}.serial.log")
     print(f"Normal desktop boot {index + 1}/2: four ring3 services, physical input, selected GPT readback and cleanup PASS")
@@ -1719,7 +1722,7 @@ def verify_unready_recovery(output: bytes, name: str) -> None:
         raise AssertionError("unready service was accepted or escaped controlled recovery")
 
 
-def capture_unready_failure(session: QemuSession, folder: Path, name: str,
+def capture_boot_failure(session: QemuSession, folder: Path, name: str,
                             error: Exception) -> None:
     # Failure-only evidence: a missing serial marker cannot distinguish a
     # stalled guest, an emulator pause or a slow runner. Query the live HMP
@@ -1749,7 +1752,7 @@ def unready_service_boot(qemu: str, iso: Path, ovmf: Path, disk: Path,
         session.until("IndianOS recovery: read-only serial console ready", 10)
         verify_unready_recovery(bytes(session.output), name)
     except Exception as error:
-        capture_unready_failure(session, folder, name, error)
+        capture_boot_failure(session, folder, name, error)
         raise
     finally:
         close(process, sock, session, folder / f"{name}.serial.log")

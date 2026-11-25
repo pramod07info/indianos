@@ -542,13 +542,35 @@ class NormalDesktopControls(unittest.TestCase):
             close.assert_called_once()
             self.assertEqual(disk.read_bytes(), b"unchanged")
 
+    def test_normal_boot_timeout_retains_monitor_before_teardown(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            session = Mock()
+            session.output = bytearray(b"partial compositor startup")
+            session.until.side_effect = [None, None, AssertionError("missing desktop READY")]
+            session.hmp.return_value = "VM status: running"
+            diagnostic = folder / "desktop-1.failure-monitor.log"
+
+            def closed(*args):
+                self.assertIn("missing desktop READY", diagnostic.read_text())
+
+            with (patch.object(harness, "spawn", return_value=(Mock(), Mock(), session)),
+                  patch.object(harness, "close", side_effect=closed) as close):
+                with self.assertRaisesRegex(AssertionError, "missing desktop READY"):
+                    harness.boot("qemu", Path("system.iso"), Path("OVMF.fd"),
+                                 folder / "disk.raw", folder, 1)
+            session.until.assert_called_with(harness.READY, 20)
+            self.assertEqual([call.args[0] for call in session.hmp.call_args_list],
+                             ["info status", "info registers", "info block"])
+            close.assert_called_once()
+
     def test_unready_monitor_diagnostic_write_failure_cannot_mask_acceptance(self):
         with tempfile.TemporaryDirectory() as temporary:
             session = Mock()
             session.output = bytearray()
             session.hmp.return_value = "VM status: running"
             with patch("builtins.print"):
-                harness.capture_unready_failure(session, Path(temporary) / "absent",
+                harness.capture_boot_failure(session, Path(temporary) / "absent",
                     "unready-compositor", AssertionError("missing recovery"))
             self.assertEqual(session.hmp.call_count, 3)
 
