@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 from pathlib import Path
 import re
 import socket
@@ -17,6 +18,7 @@ import shutil
 import subprocess
 import struct
 import tempfile
+import time
 import zlib
 
 from test_r029_desktop_qemu import QemuSession, open_monitor, check_two_windows, differences
@@ -58,6 +60,12 @@ NAMED_READBACK = "IndianOS user: R051 Terminal readback: saved"
 G1_PAYLOAD = "violet"  # Visually distinct from the success status SAVED.
 G1_READBACK = "IndianOS user: R051 Terminal readback: " + G1_PAYLOAD
 COMPOSITOR_SNAPSHOT = b"IndianOS user: desktop PID4 composed a private row from committed client snapshots"
+FRAME_PRESENTED = b"IndianOS: G4 complete PID4 frame presented"
+FRAME_PUBLISHED = b"IndianOS user: desktop PID4 full frame published"
+FRAME_METRICS = b"IndianOS user: desktop PID4 frame metrics "
+COMPOSITOR_PREPARED = b"IndianOS: G4 compositor-only replacement prepared"
+COMPOSITOR_REPLACED = b"IndianOS: G4 compositor-only replacement ready"
+STALE_COMPOSITOR_DENIED = b"IndianOS user: desktop PID4 stale frame authority denied"
 PIXEL_APP_EVIDENCE = tuple(
     marker
     for pid, app in ((2, "Files"), (3, "Terminal"))
@@ -71,6 +79,7 @@ PIXEL_APP_EVIDENCE = tuple(
     b"IndianOS user: desktop broker denied app pixel authority",
     b"IndianOS user: desktop compositor denied app pixel authority",
     COMPOSITOR_SNAPSHOT,
+    FRAME_PRESENTED, FRAME_PUBLISHED,
 )
 TERMINAL_AUTHORITY = PIXEL_APP_EVIDENCE + (
     POSITIONED_DENIED,
@@ -215,6 +224,59 @@ def verify_irq_ingress(output: bytes, since: int) -> None:
             raise AssertionError("decoded physical input preceded its real interrupt")
 
 
+def verify_frame_publication(output: bytes, since: int = 0,
+                             geometry: tuple[int, int] | None = None) -> list[dict[str, int]]:
+    """Require ordered native commit, measured work and ring-3 publication.
+
+    These records are mandatory alongside independent screenshot oracles. They
+    do not substitute for pixels, and a containing diagnostic is never evidence.
+    """
+    if not 0 <= since < len(output):
+        raise AssertionError("invalid frame publication boundary")
+    lines = output[since:].replace(b"\r", b"").split(b"\n")[:-1]
+    state = 0
+    measurements = []
+    metric = re.compile(rb"IndianOS user: desktop PID4 frame metrics cycles=0x([0-9a-f]{16}) "
+                        rb"calls=0x([0-9a-f]{16}) pixels=0x([0-9a-f]{16})")
+    for line in lines:
+        if FRAME_PRESENTED in line:
+            if line != FRAME_PRESENTED or state != 0:
+                raise AssertionError("frame presentation is prefixed, duplicated or out of order")
+            state = 1
+        elif FRAME_METRICS in line:
+            match = metric.fullmatch(line)
+            if match is None or state != 1:
+                raise AssertionError("frame cost lacks exact fresh native measurements")
+            cycles, calls, pixels = (int(value, 16) for value in match.groups())
+            if (cycles == 0 or calls == 0 or not 640 * 480 <= pixels <= 1600 * 1600
+                    or calls > 1600 * 32 + 128):
+                raise AssertionError("frame cost has impossible work or unbounded call count")
+            if geometry is not None:
+                width, height = geometry
+                if not 640 <= width <= 1600 or not 480 <= height <= 1600 or pixels != width * height:
+                    raise AssertionError("frame cost does not cover the actual framebuffer")
+                if calls > height * 32 + 128:
+                    raise AssertionError("frame transport exceeded its bounded per-row cost")
+            measurements.append(dict(cycles=cycles, calls=calls, pixels=pixels))
+            state = 2
+        elif FRAME_PUBLISHED in line:
+            if line != FRAME_PUBLISHED or state != 2:
+                raise AssertionError("ring-3 publication preceded complete measured presentation")
+            state = 0
+    if not measurements or state != 0:
+        raise AssertionError("frame publication is missing, stale or incomplete")
+    return measurements
+
+
+def retain_frame_cost(session: QemuSession, path: Path,
+                      geometry: tuple[int, int]) -> None:
+    records = verify_frame_publication(bytes(session.output), 0, geometry)
+    seconds = session.ready_observed - session.boot_started
+    if seconds <= 0:
+        raise AssertionError("startup wall-clock sample is invalid")
+    path.write_text(json.dumps(dict(startup_seconds=seconds, frames=records), indent=2) + "\n")
+
+
 def verify_runtime(output: bytes, shutdown_at: int) -> None:
     if not 0 < shutdown_at < len(output):
         raise AssertionError("invalid normal-desktop shutdown evidence boundary")
@@ -235,6 +297,7 @@ def verify_runtime(output: bytes, shutdown_at: int) -> None:
     if COMPOSITOR.encode() not in output or READY.encode() not in output:
         raise AssertionError("normal desktop did not start four independent services")
     prefix = output[:shutdown_at]
+    verify_frame_publication(prefix)
     if (COMPOSITOR.encode() not in prefix or READY.encode() not in prefix or
             prefix.find(COMPOSITOR.encode()) > prefix.find(READY.encode())):
         raise AssertionError("desktop advertised ready before compositor service")
@@ -475,11 +538,13 @@ def spawn(qemu: str, iso: Path, ovmf: Path, disk: Path, folder: Path, name: str,
     process = None
     sock = None
     try:
+        started = time.monotonic()
         process = subprocess.Popen(command, stdin=subprocess.PIPE,
                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0)
         sock = open_monitor(monitor, process)
         session = QemuSession(process, sock)
         session.socket_directory = socket_directory
+        session.boot_started = started
         session.debugger_path = debugger_path
         return process, sock, session
     except BaseException as error:
@@ -525,10 +590,12 @@ def boot(qemu: str, iso: Path, ovmf: Path, disk: Path, folder: Path, index: int)
         session.until("IndianOS normal desktop: selected storage admitted", 45)
         session.until(COMPOSITOR, 20)
         session.until(READY, 20)
+        session.ready_observed = time.monotonic()
         verify_boot_stack(bytes(session.output))
         session.until("R031.9 real file and directory contents rendered into Files window", 20)
         frame = session.shot(folder / f"desktop-{index}-initial.ppm")
         check_two_windows(frame)
+        retain_frame_cost(session, folder / f"desktop-{index}-startup-cost.json", frame[:2])
         verify_text_pixels(frame, "files-directory",
                            "f:readme " if index == 0 else "f:readme f:a d:docs ")
         verify_text_pixels(frame, "files-note", "HELLO INDIANOS" if index == 0 else PAYLOAD)
@@ -1496,6 +1563,7 @@ def verify_pixel_startup(startup: bytes) -> None:
     ready = startup.find(LIFECYCLE_READY.encode())
     if ready < 0 or any(startup.find(marker) >= ready for marker in PIXEL_APP_EVIDENCE):
         raise AssertionError("pixel startup was not verified before lifecycle readiness")
+    verify_frame_publication(startup)
     snapshot = startup.find(COMPOSITOR_SNAPSHOT)
     for pid, app in ((2, "Files"), (3, "Terminal")):
         guard = startup.find(f"IndianOS: PID {pid} PIXEL_GUARDS_READY".encode())
@@ -1599,49 +1667,97 @@ def stopped_root(session: QemuSession) -> int:
     return root
 
 
+def client_incarnation_records(raw: bytes) -> tuple[tuple[int, int, int], ...]:
+    if len(raw) != 72:
+        raise AssertionError("client incarnation receipt is not 72 bytes")
+    words = struct.unpack("<9Q", raw)
+    records = tuple(tuple(words[at:at + 3]) for at in (0, 3, 6))
+    for index, (generation, root, files) in enumerate(records):
+        if (generation == 0 or root == 0 or root >= 1 << 52 or root % 4096
+                or (index < 2 and files == 0) or (index == 2 and files != 0)):
+            raise AssertionError("invalid live client incarnation receipt")
+    if len({record[1] for record in records}) != 3:
+        raise AssertionError("independent clients share an address space")
+    return records
+
+
+def verify_preserved_clients(before: bytes, after: bytes, old_roles: bytes, new_roles: bytes) -> None:
+    client_incarnation_records(before)
+    client_incarnation_records(after)
+    if before != after or len(old_roles) != 32 or len(new_roles) != 32:
+        raise AssertionError("PID4 recovery replaced or changed a live client")
+    old = struct.unpack("<4Q", old_roles)
+    new = struct.unpack("<4Q", new_roles)
+    if any(value == 0 for value in old) or old[:3] != new[:3] or new[3] <= old[3]:
+        raise AssertionError("PID4 recovery lacks one fresh compositor incarnation")
+    if tuple(record[0] for record in client_incarnation_records(before)) != old[:3]:
+        raise AssertionError("client and role generation receipts disagree")
+
+
 def verify_transient_restart(output: bytes, injection_at: int) -> None:
-    if not 0 <= injection_at <= len(output):
-        raise AssertionError("invalid transient injection evidence boundary")
+    """Only PID4 may be replaced; original clients and readiness must survive."""
+    if not 0 < injection_at < len(output) or output[:injection_at].count(READY.encode()) != 1:
+        raise AssertionError("invalid live compositor injection boundary")
     tail = output[injection_at:]
     markers = (b"IndianOS: fault vector=0x000000000000000e",
                b"IndianOS: fault CR2=0x0000000060000000",
                b"IndianOS: PID 4 FAULTED", b"IndianOS: PID 4 REAPED",
-               b"IndianOS normal desktop: retired session verified restart-safe",
-               b"IndianOS normal desktop: restarting retired service session",
-               SURFACES_GUARDED.encode(),
-               b"desktop compositor denied input and filesystem authority",
-               COMPOSITOR.encode(), LIFECYCLE_READY.encode(), READY.encode())
-    ready = tail.find(READY.encode())
-    if ready < 0:
-        raise AssertionError("transient restart lacks fresh desktop readiness")
-    # The first reap retires the faulted incarnation. A later normal shutdown
-    # legitimately reaps its replacement; do not confuse these two lifetimes.
-    fault_phase = tail[:ready + len(READY.encode())]
-    verify_pixel_startup(fault_phase[:fault_phase.find(READY.encode())])
+               COMPOSITOR_PREPARED, COMPOSITOR.encode(), STALE_COMPOSITOR_DENIED,
+               FRAME_PRESENTED, FRAME_PUBLISHED, COMPOSITOR_REPLACED)
+    complete = tail.replace(b"\r", b"").split(b"\n")[:-1]
+    if any(marker in line and line != marker for marker in markers for line in complete):
+        raise AssertionError("PID4 recovery record has an untrusted prefix")
+    restored = tail.find(COMPOSITOR_REPLACED)
+    if restored < 0 or complete.count(COMPOSITOR_REPLACED) != 1:
+        raise AssertionError("live compositor replacement did not become ready")
+    phase = tail[:restored + len(COMPOSITOR_REPLACED)]
+    phase_records = (phase + b"\n").replace(b"\r", b"").split(b"\n")[:-1]
     cursor = 0
     for marker in markers:
-        evidence = fault_phase if marker == b"IndianOS: PID 4 REAPED" else tail
-        if evidence.count(marker) != 1:
-            raise AssertionError("transient restart lacks fresh exact lifecycle evidence")
-        position = fault_phase.find(marker, cursor)
+        if phase.count(marker) != 1 or phase_records.count(marker) != 1:
+            raise AssertionError("PID4 recovery lacks exact fresh replacement evidence")
+        position = phase.find(marker, cursor)
         if position < 0:
-            raise AssertionError("transient restart lifecycle is out of order")
+            raise AssertionError("PID4 recovery evidence is out of order")
         cursor = position + len(marker)
+    verify_frame_publication(phase + b"\n")
+    forbidden = (READY.encode(), LIFECYCLE_READY.encode(), SURFACES_GUARDED.encode(),
+                 b"restarting retired service session", b"retired session verified restart-safe",
+                 b"restart budget exhausted", b"reason=desktop-session-failed", b"FATAL",
+                 LEASE_ACQUIRED)
+    if any(marker in tail for marker in forbidden):
+        raise AssertionError("PID4-only recovery restarted clients or fell back to full-session recovery")
+    for pid in (1, 2, 3):
+        for state in ("READY", "EXITED", "FAULTED", "REAPED"):
+            marker = f"IndianOS: PID {pid} {state}".encode()
+            if marker in phase:
+                raise AssertionError("live client was retired or recreated during PID4 recovery")
+    if tail.count(b"IndianOS: PID 4 FAULTED") != 1:
+        raise AssertionError("unexpected repeated compositor fault")
     stopped = tail.find(STOPPED.encode())
-    if stopped >= 0 and stopped < ready:
-        raise AssertionError("transient session stopped before becoming ready")
+    if stopped >= 0 and stopped < restored:
+        raise AssertionError("recovered session stopped before compositor readiness")
     if tail.count(b"IndianOS: PID 4 REAPED") != (2 if stopped >= 0 else 1):
-        raise AssertionError("transient restart has unexpected process retirement")
-    if (b"FATAL" in output or b"restart budget exhausted" in output or
-            b"reason=desktop-session-failed" in output):
-        raise AssertionError("transient fault did not recover an interactive session")
-    # A fresh four-process session must actually execute after the retry, not
-    # reuse the first desktop's logs or advertise a kernel-generated success.
-    restart_at = tail.find(markers[5])
+        raise AssertionError("PID4 recovery has unexpected process retirements")
+
+
+def verify_recovered_shutdown(output: bytes, injection_at: int, shutdown_at: int) -> None:
+    verify_transient_restart(output, injection_at)
+    if not injection_at < shutdown_at < len(output):
+        raise AssertionError("invalid recovered shutdown boundary")
+    startup = output[:output.find(READY.encode())]
+    verify_pixel_startup(startup)
+    tail = output[shutdown_at:]
+    markers = (DURABLE_SHUTDOWN.encode(), b"desktop selected volume synchronized", SHUTDOWN.encode())
+    at = [tail.find(marker) for marker in markers]
+    if min(at) < 0 or at != sorted(at) or tail.count(STOPPED.encode()) != 1:
+        raise AssertionError("recovered session lacks one durable shutdown barrier")
     for pid in (1, 2, 3, 4):
-        for state in ("READY", "DISPATCHED"):
-            if f"IndianOS: PID {pid} {state}".encode() not in tail[restart_at:]:
-                raise AssertionError("transient restart lacks fresh process execution")
+        exited = f"IndianOS: PID {pid} EXITED".encode()
+        reaped = f"IndianOS: PID {pid} REAPED".encode()
+        if (tail.count(exited) != 1 or tail.count(reaped) != 1 or
+                not at[0] < tail.find(exited) < tail.find(reaped) < tail.find(STOPPED.encode())):
+            raise AssertionError("recovered session did not retire all original clients cleanly")
 
 
 def verify_bounded_restart(output: bytes) -> None:
@@ -1761,9 +1877,79 @@ def unready_service_boot(qemu: str, iso: Path, ovmf: Path, disk: Path,
     print(f"Normal desktop {name}: bounded actual failure, complete retirement and unchanged recovery PASS")
 
 
+def pending_frame_record(packet: bytes, geometry: tuple[int, int]) -> tuple[int, int, int, int]:
+    if len(packet) != 128 or packet[:4] != b"IFR1":
+        raise AssertionError("stopped compositor is not uploading a frame row")
+    width, height, y, count, pixel_format = struct.unpack_from("<4HI", packet, 4)
+    token, epoch, pointer, size, sequence = struct.unpack_from("<5Q", packet, 16)
+    if ((width, height) != geometry or count != width or not 0 <= y < height
+            or pixel_format != 1 or not token or not epoch or not sequence
+            or pointer < 0x400000 or pointer >= 0x00007ffff0000000
+            or size != width * 4 or packet[56:] != bytes(72)):
+        raise AssertionError("stopped compositor lacks a genuine bounded pending frame")
+    return y, token, epoch, sequence
+
+
+def replacement_patch(original: bytes, replacement: bytes, failure: str) -> tuple[int, bytes]:
+    """Only mutate future ELF input in an isolated debugger-controlled guest."""
+    if len(original) < 64 or len(replacement) != len(original):
+        raise AssertionError("replacement fixture changed ELF size")
+    if failure == "load":
+        if original[:4] != b"\x7fELF":
+            raise AssertionError("replacement load fixture lacks a genuine ELF")
+        return 0, b"\x00"
+    if failure not in ("unready", "repeat"):
+        raise AssertionError("invalid replacement source fixture")
+    changed = [index for index, (old, new) in enumerate(zip(original, replacement)) if old != new]
+    if not changed or changed[0] < 64 or changed[-1] - changed[0] >= 32:
+        raise AssertionError("replacement fixture changed more than bounded entry instructions")
+    return changed[0], replacement[changed[0]:changed[-1] + 1]
+
+
+def verify_replacement_failure(output: bytes, injection_at: int, failure: str) -> None:
+    if failure not in ("load", "unready", "repeat") or not 0 < injection_at < len(output):
+        raise AssertionError("invalid failed replacement evidence boundary")
+    if output[:injection_at].count(READY.encode()) != 1:
+        raise AssertionError("replacement failure was not injected into a live session")
+    tail = output[injection_at:]
+    fault = b"IndianOS: PID 4 FAULTED"
+    reap = b"IndianOS: PID 4 REAPED"
+    recovery = b"IndianOS recovery: read-only serial console ready"
+    ordered = (b"IndianOS: fault vector=0x000000000000000e",
+               b"IndianOS: fault CR2=0x0000000060000000", fault, reap)
+    complete = tail.replace(b"\r", b"").split(b"\n")[:-1]
+    if any(marker in line and line != marker for marker in ordered + (recovery,) for line in complete):
+        raise AssertionError("replacement failure record has an untrusted prefix")
+    cursor = 0
+    for marker in ordered:
+        cursor = tail.find(marker, cursor)
+        if cursor < 0 or complete.count(marker) < 1:
+            raise AssertionError("replacement failure lacks the original controlled compositor fault")
+        cursor += len(marker)
+    if (READY.encode() in tail or COMPOSITOR_REPLACED in tail or
+            complete.count(recovery) != 1 or not cursor < tail.find(recovery) or
+            tail.count(RESTARTING_SESSION.encode()) > 1 or tail.count(fault) > 3):
+        raise AssertionError("replacement failure escaped bounded read-only fallback")
+    if any(f"IndianOS: PID {pid} FAULTED".encode() in tail for pid in (1, 2, 3)):
+        raise AssertionError("compositor failure faulted an original client")
+    prepared = tail.count(COMPOSITOR_PREPARED)
+    if prepared != (0 if failure == "load" else 1):
+        raise AssertionError("replacement failure used an unexpected local retry count")
+    if failure == "load" and b"G4 compositor-only replacement failed; full-session recovery required" not in tail:
+        raise AssertionError("replacement load failure did not enter the documented fallback")
+    if failure == "unready" and b"compositor readiness budget exhausted" not in tail:
+        raise AssertionError("withheld compositor readiness was not bounded")
+    if failure == "repeat" and tail.count(fault) < 2:
+        raise AssertionError("replacement fault was not actually exercised")
+
+
 def transient_service_boot(qemu: str, iso: Path, ovmf: Path, disk: Path,
-                           folder: Path, xorriso: str, nm: str = "nm") -> None:
-    sources = folder / "transient-sources"
+                           folder: Path, xorriso: str, nm: str = "nm",
+                           failure: str | None = None) -> None:
+    if failure not in (None, "load", "unready", "repeat"):
+        raise AssertionError("unknown compositor replacement failure")
+    name = "transient-compositor" + ("-" + failure if failure else "")
+    sources = folder / (name + "-sources")
     sources.mkdir()
     kernel = sources / "kernel.elf"
     archive = sources / "initramfs.img"
@@ -1787,26 +1973,50 @@ def transient_service_boot(qemu: str, iso: Path, ovmf: Path, disk: Path,
     service = sources / "compositor.elf"
     service.write_bytes(compositor)
     active = unique_symbol(nm, kernel, ("user_runtime::ACTIVE_PROCESS",))
-    target = unique_symbol(nm, service, ("desktop_window::Manager", "::wire"))
+    target = unique_symbol(nm, service, ("indianos_desktop_frame_row",))
     expected = executable_bytes(compositor, target, 8)
     surface_ledger = unique_symbol(nm, kernel, ("DESKTOP_SURFACE_LAYOUT",))
     pixel_ledger = unique_symbol(nm, kernel, ("DESKTOP_PIXEL_SURFACE_LAYOUT",))
     scratch_ledger = unique_symbol(nm, kernel, ("DESKTOP_APP_PIXEL_GUARDS",))
+    clients_ledger = unique_symbol(nm, kernel, ("DESKTOP_CLIENT_INCARNATIONS",))
+    roles_ledger = unique_symbol(nm, kernel, ("DESKTOP_PROCESS_GENERATIONS",))
+    source_ledger = unique_symbol(nm, kernel, ("user_runtime::COMPOSITOR_ELF",))
     symbols = subprocess.run([nm, "-S", "-n", "-C", str(kernel)], check=True,
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15)
     guards = stack_guard_records(symbols.stdout.decode("ascii"))
     unmapped = 0x60000000
     original = disk.read_bytes()
-    process, sock, session = spawn(qemu, iso, ovmf, disk, folder, "transient-compositor", debugger=True)
+    process, sock, session = spawn(qemu, iso, ovmf, disk, folder, name, debugger=True)
     path = session.debugger_path
     debugger = None
-    evidence = [f"kernel ACTIVE_PROCESS={active:#x}; compositor wire={target:#x}",
+    evidence = [f"kernel ACTIVE_PROCESS={active:#x}; compositor ROW={target:#x}",
                 f"expected code={expected.hex()}; injection RIP={unmapped:#x}"]
     try:
         session.until(READY, 45)
         verify_boot_stack(bytes(session.output))
-        initial = session.shot(folder / "transient-initial.ppm")
+        initial = session.shot(folder / (name + "-initial.ppm"))
         check_two_windows(initial)
+        # Keep a genuine PID2 read capability and PID3 committed state alive
+        # across replacement. A new Files process cannot fake this token.
+        held = len(session.output)
+        acknowledged_key(session, "l", LEASE_CONTROL_ACK)
+        session.until(LEASE_ACQUIRED.decode(), 20, since=held)
+        acknowledged_key(session, "2", "R031.1 user switched to Terminal app")
+        acknowledged_key(session, "ret")
+        for command in ("touch revived", "put revived=saved", "cat revived"):
+            type_named_command(session, command)
+            submitted = acknowledged_key(session, "ret")
+            marker = NAMED_READBACK if command.startswith("cat ") else NAMED_COMMIT
+            session.until(marker, 20, since=submitted)
+        acknowledged_key(session, "tab")
+        width, height = initial[:2]
+        physical_focus(session, (width // 2, height // 2), (100, 90), "Files")
+        held_at = len(session.output)
+        session.hmp("mouse_button 1")
+        session.until(FRAME_PUBLISHED.decode(), 20, since=held_at)
+        before_fault = settled_frame(session, folder / (name + "-before-fault.ppm"))
+        verify_text_pixels(before_fault, "files-lock", "READ LOCKED")
+        fault_media = disk.read_bytes()
         injection_at = len(session.output)
         session.hmp("stop")
         debugger = GuestDebugger(path)
@@ -1839,7 +2049,11 @@ def transient_service_boot(qemu: str, iso: Path, ovmf: Path, disk: Path,
             if pid == 4 and cs & 3 == 3 and rip == target:
                 if debugger.memory(target, 8) != expected:
                     raise AssertionError("current compositor code differs from source ISO")
-                break
+                packet = debugger.memory(debugger.register(5), 128)
+                y, token, epoch, sequence = pending_frame_record(packet, initial[:2])
+                evidence.append(f"pending y={y} token={token:#x} epoch={epoch:#x} sequence={sequence:#x}")
+                if y == 1:
+                    break
             # A virtual breakpoint may also match another process's code.
             # Advance that instruction unchanged, never inject into its context.
             if debugger.command(f"z1,{target:x},1") != "OK":
@@ -1850,6 +2064,27 @@ def transient_service_boot(qemu: str, iso: Path, ovmf: Path, disk: Path,
                 raise AssertionError("failed to restore target breakpoint")
         else:
             raise AssertionError("bounded debugger search did not find ring3 PID4")
+        staged = session.shot(folder / (name + "-private-staging.ppm"))
+        if staged != before_fault:
+            raise AssertionError("incomplete PID4 frame changed the visible framebuffer")
+        clients_before = debugger.memory(clients_ledger, 72)
+        roles_before = debugger.memory(roles_ledger, 32)
+        client_incarnation_records(clients_before)
+        if failure is not None:
+            pointer, length = struct.unpack("<QQ", debugger.memory(source_ledger, 16))
+            if length != len(compositor) or debugger.memory(pointer, 64) != compositor[:64]:
+                raise AssertionError("replacement source is not the current compositor ELF")
+            replacement = (bytes(len(compositor)) if failure == "load" else
+                           service_entry_code(raw, b"/bin/compositor",
+                                              UNREADY_YIELD if failure == "unready" else b"\x0f\x0b"))
+            start, payload = replacement_patch(compositor, replacement, failure)
+            if debugger.memory(pointer + start, len(payload)) != compositor[start:start + len(payload)]:
+                raise AssertionError("replacement mutation source changed before injection")
+            if debugger.command(f"M{pointer + start:x},{len(payload):x}:{payload.hex()}") != "OK":
+                raise AssertionError("debugger refused isolated replacement source mutation")
+            if debugger.memory(pointer + start, len(payload)) != payload:
+                raise AssertionError("replacement source mutation was not installed")
+            evidence.append(f"future replacement {failure}: source offset {start:#x}, bytes {payload.hex()}")
         verify_debug_stack_guards(debugger, guards, evidence, "PID4 cloned root")
         surface_layout = debugger.memory(surface_ledger, 64)
         surfaces = surface_guard_records(surface_layout)
@@ -1876,17 +2111,58 @@ def transient_service_boot(qemu: str, iso: Path, ovmf: Path, disk: Path,
         debugger = None
         session.hmp("cont")
         session.until("IndianOS: PID 4 FAULTED", 20, since=injection_at)
-        session.until(READY, 30, since=injection_at)
+        if failure is not None:
+            session.until("IndianOS recovery: read-only serial console ready", 45, since=injection_at)
+            verify_replacement_failure(bytes(session.output), injection_at, failure)
+            if disk.read_bytes() != fault_media:
+                raise AssertionError("failed compositor replacement modified committed storage")
+            verify_guard(original, disk.read_bytes())
+            print(f"Normal desktop PID4-only replacement {failure}: controlled live fault, bounded fallback and unchanged media PASS")
+            return
+        session.until(COMPOSITOR_REPLACED.decode(), 30, since=injection_at)
+        session.until("R031.1 application launcher OPEN", 20, since=injection_at)
         verify_transient_restart(bytes(session.output), injection_at)
-        fresh = session.shot(folder / "transient-restarted.ppm")
+        # Check genuine privileged generation/root receipts, not just a READY
+        # line or an unchanged application VA (which a reload could reuse).
+        session.hmp("stop")
+        debugger = GuestDebugger(path)
+        if not debugger.command("?").startswith(("S", "T")):
+            raise AssertionError("replacement receipt inspection did not stop the guest")
+        debugger.command("qSupported:xmlRegisters=i386")
+        debugger.command("qXfer:features:read:target.xml:0,fff")
+        verify_preserved_clients(clients_before, debugger.memory(clients_ledger, 72),
+                                 roles_before, debugger.memory(roles_ledger, 32))
+        if debugger.memory(scratch_ledger, 64) != struct.pack("<8Q", *(word for row in scratch for word in row)):
+            raise AssertionError("PID4-only restart recreated a client canvas")
+        if debugger.command("D") != "OK":
+            raise AssertionError("replacement receipt debugger failed to detach")
+        debugger.close(); debugger = None
+        session.hmp("cont")
+        fresh = session.shot(folder / (name + "-restarted.ppm"))
         check_two_windows(fresh)
-        # Exercise fresh app authority, IPC and physical input. No old launcher
-        # request may complete the restarted session's command handshake.
+        # The titlebar was captured with the button held when PID4 faulted.
+        # Two held motions distinguish latch quarantine from a spurious new
+        # capture at the first motion. Only a release can rearm capture.
+        for movement in range(2):
+            moved_at = len(session.output)
+            session.hmp("mouse_move 20 5")
+            session.until(FRAME_PUBLISHED.decode(), 20, since=moved_at)
+        verify_text_pixels(session.shot(folder / (name + "-capture-cancelled.ppm")),
+                           "files-note", "HELLO INDIANOS")
+        released_at = len(session.output)
+        session.hmp("mouse_button 0")
+        session.until(FRAME_PUBLISHED.decode(), 20, since=released_at)
+        moved_at = len(session.output)
+        session.hmp(f"mouse_move {width // 2 - 140} {height // 2 - 100}")
+        session.until(FRAME_PUBLISHED.decode(), 20, since=moved_at)
+        # The interrupted toggle completes once: the first fresh toggle must
+        # close it. Duplicate replay would instead open it and fail this oracle.
+        acknowledged_key(session, "a", "R031.1 application launcher CLOSED")
         acknowledged_key(session, "a", "R031.1 application launcher OPEN")
         acknowledged_key(session, "a", "R031.1 application launcher CLOSED")
         acknowledged_key(session, "2", "R031.1 user switched to Terminal app")
         acknowledged_key(session, "ret")
-        for command in ("touch revived", "put revived=saved", "cat revived"):
+        for command in ("put revived=saved", "cat revived"):
             type_named_command(session, command)
             submitted = acknowledged_key(session, "ret")
             marker = NAMED_READBACK if command.startswith("cat ") else NAMED_COMMIT
@@ -1894,23 +2170,21 @@ def transient_service_boot(qemu: str, iso: Path, ovmf: Path, disk: Path,
             if command.startswith("cat "):
                 session.drain_serial(0.1)
                 exact_terminal_line(bytes(session.output), submitted, marker)
-        readback = session.shot(folder / "transient-saved-readback.ppm")
+            else:
+                verify_lease_commit(bytes(session.output), submitted)
+        readback = session.shot(folder / (name + "-saved-readback.ppm"))
         verify_text_pixels(readback, "terminal", "saved")
         verify_text_pixels(readback, "files-directory", "f:readme f:revived ")
         acknowledged_key(session, "tab")
+        acknowledged_key(session, "1", "R031.1 user switched to Files app")
+        released = len(session.output)
+        acknowledged_key(session, "u", LEASE_CONTROL_ACK)
+        session.until(LEASE_RELEASED.decode(), 20, since=released)
         shutdown_at = len(session.output)
         acknowledged_key(session, "q", SHUTDOWN)
         session.until(STOPPED, 30, since=shutdown_at)
         session.drain_serial(0.1)
-        # The generic healthy-session verifier deliberately rejects restarts.
-        # Apply it only to the fresh session beginning at its new READY records.
-        restart = bytes(session.output).find(
-            b"IndianOS normal desktop: restarting retired service session", injection_at)
-        verify_runtime(bytes(session.output[restart + len(
-            b"IndianOS normal desktop: restarting retired service session"):]),
-                       shutdown_at - restart - len(
-                           b"IndianOS normal desktop: restarting retired service session"))
-        verify_transient_restart(bytes(session.output), injection_at)
+        verify_recovered_shutdown(bytes(session.output), injection_at, shutdown_at)
         # After all four mappings/PCBs were reclaimed, inspect the running
         # recovery kernel as well as the earlier actual user-process root.
         session.hmp("stop")
@@ -1942,10 +2216,10 @@ def transient_service_boot(qemu: str, iso: Path, ovmf: Path, disk: Path,
     finally:
         if debugger is not None:
             debugger.close()
-        close(process, sock, session, folder / "transient-compositor.serial.log")
-        (folder / "transient-debugger.log").write_text("\n".join(evidence) + "\n")
+        close(process, sock, session, folder / (name + ".serial.log"))
+        (folder / (name + "-debugger.log")).write_text("\n".join(evidence) + "\n")
     verify_guard(original, disk.read_bytes())
-    print("Normal desktop transient PID4 page fault: fresh ring3 desktop, physical input, durable file and clean shutdown PASS")
+    print("Normal desktop PID4-only page fault: original client incarnations/canvases/read lease, private staging, fresh compositor, physical input and durable shutdown PASS")
 
 
 SHUTDOWN_STALL = "IndianOS user: desktop shutdown fixture withholding STOPPED"
@@ -2103,6 +2377,10 @@ def main() -> None:
         disk.write_bytes(original)
         transient_service_boot(args.qemu, args.iso.resolve(), args.ovmf.resolve(), disk,
                                artifacts, args.xorriso, args.nm)
+        for failure in ("load", "unready", "repeat"):
+            disk.write_bytes(original)
+            transient_service_boot(args.qemu, args.iso.resolve(), args.ovmf.resolve(), disk,
+                                   artifacts, args.xorriso, args.nm, failure)
         rejected_namespaces(args.qemu, args.iso.resolve(), args.ovmf.resolve(),
                             args.fixture_tool.resolve(), original, artifacts)
         rejected_partitions(args.qemu, args.iso.resolve(), args.ovmf.resolve(),
