@@ -57,6 +57,7 @@ LEASE_CONTROL_ACK = "desktop Files read lease control acknowledged"
 NAMED_READBACK = "IndianOS user: R051 Terminal readback: saved"
 G1_PAYLOAD = "violet"  # Visually distinct from the success status SAVED.
 G1_READBACK = "IndianOS user: R051 Terminal readback: " + G1_PAYLOAD
+COMPOSITOR_SNAPSHOT = b"IndianOS user: desktop PID4 composed a private row from committed client snapshots"
 PIXEL_APP_EVIDENCE = tuple(
     marker
     for pid, app in ((2, "Files"), (3, "Terminal"))
@@ -69,6 +70,7 @@ PIXEL_APP_EVIDENCE = tuple(
 ) + (
     b"IndianOS user: desktop broker denied app pixel authority",
     b"IndianOS user: desktop compositor denied app pixel authority",
+    COMPOSITOR_SNAPSHOT,
 )
 TERMINAL_AUTHORITY = PIXEL_APP_EVIDENCE + (
     POSITIONED_DENIED,
@@ -1491,12 +1493,13 @@ def verify_pixel_startup(startup: bytes) -> None:
     ready = startup.find(LIFECYCLE_READY.encode())
     if ready < 0 or any(startup.find(marker) >= ready for marker in PIXEL_APP_EVIDENCE):
         raise AssertionError("pixel startup was not verified before lifecycle readiness")
+    snapshot = startup.find(COMPOSITOR_SNAPSHOT)
     for pid, app in ((2, "Files"), (3, "Terminal")):
         guard = startup.find(f"IndianOS: PID {pid} PIXEL_GUARDS_READY".encode())
         scratch = startup.find(f"IndianOS user: desktop {app} private pixel scratch guards verified".encode())
         committed = startup.find(f"IndianOS user: desktop {app} ring3 raster pixels committed".encode())
-        if not guard < scratch < committed < ready:
-            raise AssertionError("native app pixels preceded guard registration or readiness")
+        if not guard < scratch < committed < snapshot < ready:
+            raise AssertionError("native app guards, pixel commits and compositor snapshots are out of order")
 
 
 def app_scratch_records(raw: bytes, compositor_root: int, pages: int = 1) -> list[tuple[int, int, int, int]]:

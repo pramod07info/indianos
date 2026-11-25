@@ -188,8 +188,12 @@ pub unsafe extern "C" fn indianos_syscall_validate(
         #[cfg(feature="normal-desktop")]
         39 => request.arg1==64 && user_range(plan,request.arg0,64,false), // app pixel transaction
         #[cfg(feature="normal-desktop")]
-        37 => request.arg0<=1 &&
-              user_range(plan,request.arg1,64,request.arg0==0), // compositor state query/apply
+        37 => match request.arg0 {
+            0 | 1 => user_range(plan, request.arg1, 64, request.arg0 == 0),
+            crate::compositor_pixels::OPERATION => user_range(
+                plan, request.arg1, crate::compositor_pixels::REPLY_BYTES as u64, true),
+            _ => false,
+        },
         #[cfg(feature="test-r030-ondevice")]
         30 => (1..=4).contains(&request.arg0) &&
               user_range(plan,request.arg1,48,false), // filesystem descriptor
@@ -344,7 +348,10 @@ mod tests {
         assert!(check(37,0,plan.stack_end-64));
         assert!(check(37,1,USER_MIN));
         assert!(!check(37,0,USER_MIN));
-        assert!(!check(37,2,plan.stack_begin));
+        assert!(check(37,2,plan.stack_begin));
+        assert!(!check(37,2,plan.stack_end-(crate::compositor_pixels::REPLY_BYTES as u64-1)));
+        assert!(!check(37,2,USER_MIN));
+        assert!(!check(37,3,plan.stack_begin));
         assert!(!check(37,0,plan.stack_end-63));
         assert!(!check(37,1,plan.guard_begin));
         assert!(check(38,0,0));

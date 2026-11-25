@@ -19,8 +19,8 @@ impl GuardedPixels{const fn new()->Self{Self{lower:[0;PAGE],planes:[Plane::new()
 #[derive(Clone,Copy)]
 struct Transaction{token:u64,rect:[u16;4],cursor:usize,revision:u64}
 #[derive(Clone,Copy)]
-struct State{width:usize,height:usize,active:usize,next:u64,metadata_revision:u64,published_revision:u64,transaction:Option<Transaction>}
-impl State{const fn new()->Self{Self{width:0,height:0,active:0,next:1,metadata_revision:0,published_revision:0,transaction:None}}}
+struct State{width:usize,height:usize,active:usize,next:u64,metadata_revision:u64,published_revision:u64,published_generation:u64,transaction:Option<Transaction>}
+impl State{const fn new()->Self{Self{width:0,height:0,active:0,next:1,metadata_revision:0,published_revision:0,published_generation:0,transaction:None}}}
 #[cfg(not(test))]
 static mut PLANES:[GuardedPixels;2]=[GuardedPixels::new(),GuardedPixels::new()];
 #[cfg(not(test))]
@@ -123,7 +123,10 @@ impl PixelCache{
             let Some(transaction)=state.transaction else{return false;};
             if token==0||transaction.token!=token||transaction.revision!=state.metadata_revision||
                 transaction.cursor!=transaction.rect[2] as usize*transaction.rect[3] as usize{return false;}
-            state.active=1-state.active;state.published_revision=transaction.revision;state.transaction=None;true
+            state.active=1-state.active;
+            state.published_revision=transaction.revision;
+            state.published_generation=transaction.token;
+            state.transaction=None;true
         }).unwrap_or(false)
     }
     pub(super) fn abort(&self,slot:usize,token:u64)->bool{
@@ -133,6 +136,41 @@ impl PixelCache{
             if state.active==0{b.fill(0);bm.fill(0);}else{a.fill(0);am.fill(0);}
             state.transaction=None;true
         }).unwrap_or(false)
+    }
+    pub(super) fn snapshot(
+        &self, slot: usize, request: crate::compositor_pixels::Request,
+    ) -> Option<[u8; crate::compositor_pixels::REPLY_BYTES]> {
+        use crate::compositor_pixels::{HEADER_BYTES, OPAQUE, REPLY_BYTES, ROW_PIXELS};
+        self.with(slot, |a, am, b, bm, state| {
+            let generation = state.published_generation;
+            if generation == 0 {
+                return None;
+            }
+            let x = usize::from(request.x);
+            let y = usize::from(request.y);
+            let count = usize::from(request.count);
+            if count != 0 && (count > ROW_PIXELS || request.generation != generation ||
+                              y >= state.height || x + count > state.width) {
+                return None;
+            }
+            let mut out = [0; REPLY_BYTES];
+            out[..8].copy_from_slice(&generation.to_le_bytes());
+            out[8..10].copy_from_slice(&(state.width as u16).to_le_bytes());
+            out[10..12].copy_from_slice(&(state.height as u16).to_le_bytes());
+            if count != 0 {
+                let (pixels, mask) = if state.active == 0 { (a, am) } else { (b, bm) };
+                let row = y * state.width + x;
+                for offset in 0..count {
+                    let at = row + offset;
+                    if mask[at / 64] & (1 << (at % 64)) != 0 {
+                        let start = HEADER_BYTES + 8 * offset;
+                        let pixel = OPAQUE | u64::from(pixels[at]);
+                        out[start..start + 8].copy_from_slice(&pixel.to_le_bytes());
+                    }
+                }
+            }
+            Some(out)
+        })?
     }
     pub(super) fn blit(&self,slot:usize,width:usize,height:usize,mut pixel:impl FnMut(usize,usize,u32))->bool{
         if width==0||height==0||width>MAX_WIDTH||height>MAX_HEIGHT{return false;}
@@ -193,6 +231,35 @@ mod tests{
         assert!(cache.abort(0,fresh));assert_eq!(visible(&cache,1)[0],0x445566);
         assert!(cache.begin(2,4,4,[0,0,1,1]).is_none());assert!(cache.begin(0,4,4,[3,3,2,2]).is_none());
         cache.clear();assert_eq!(visible(&cache,1),[9;16]);
+    }
+    #[test]
+    fn compositor_reads_only_committed_generation_and_distinguishes_opaque_black() {
+        use crate::compositor_pixels::{Request, HEADER_BYTES, OPAQUE};
+        let cache = PixelCache::new();
+        let query = Request { window: 1, x: 0, y: 0, count: 0, generation: 0 };
+        assert!(cache.snapshot(0, query).is_none());
+        let generation = cache.begin(0, 4, 4, [0, 0, 2, 1]).unwrap();
+        assert!(cache.tile(0, generation, 0, 0, &[0, 0xff000000], rgb));
+        assert!(cache.snapshot(0, query).is_none());
+        assert!(cache.commit(0, generation));
+
+        let read = Request { count: 2, generation, ..query };
+        let before = cache.snapshot(0, read).unwrap();
+        let covered = HEADER_BYTES + 8;
+        assert_eq!(&before[HEADER_BYTES..covered], &[0; 8]);
+        assert_eq!(&before[covered..covered + 8], &OPAQUE.to_le_bytes());
+        assert!(before[covered + 8..].iter().all(|&byte| byte == 0));
+        assert!(cache.snapshot(1, query).is_none());
+        assert!(cache.snapshot(0, Request { x: 3, ..read }).is_none());
+
+        let next = cache.begin(0, 4, 4, [0, 0, 2, 1]).unwrap();
+        assert!(cache.tile(0, next, 0, 0, &[0xff112233; 2], rgb));
+        assert_eq!(cache.snapshot(0, read), Some(before));
+        assert!(cache.commit(0, next));
+        assert!(cache.snapshot(0, read).is_none());
+        assert!(cache.snapshot(0, Request { generation: next, ..read }).is_some());
+        cache.clear_slot(0);
+        assert!(cache.snapshot(0, query).is_none());
     }
     #[test]fn readiness_requires_a_complete_current_revision_and_no_pending_upload(){
         let cache=PixelCache::new();assert!(!cache.ready(0));assert!(cache.metadata_changed(0));

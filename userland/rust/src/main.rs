@@ -33,6 +33,9 @@ mod desktop_pixels;
 #[cfg(any(feature="desktop-init",feature="desktop-compositor",feature="desktop-files",feature="desktop-terminal"))]
 #[path="../../../rust/kernel_core/src/pixel_protocol.rs"]
 mod pixel_protocol;
+#[cfg(any(feature="desktop-init",feature="desktop-compositor",feature="desktop-files",feature="desktop-terminal"))]
+#[path="../../../rust/kernel_core/src/compositor_pixels.rs"]
+mod compositor_pixels;
 
 #[panic_handler]
 fn panic(_info: &PanicInfo<'_>) -> ! { exit(125) }
@@ -1340,6 +1343,104 @@ fn desktop_key(key:u8)->u64{
     #[cfg(feature="desktop-init")]{desktop_control(&[b'K',key]);0}
     #[cfg(not(feature="desktop-init"))]{let action=match key{b'1'=>1,b'2'=>2,b'h'=>3,b'm'=>4,b'r'=>5,b'a'=>6,_=>return u64::MAX};call(24,action,0)}
 }
+#[cfg(any(feature="desktop-init",feature="desktop-compositor",feature="desktop-files",feature="desktop-terminal"))]
+fn compositor_read(request: compositor_pixels::Request) -> Option<[u8; compositor_pixels::REPLY_BYTES]> {
+    let mut wire = request.wire();
+    (call(37, compositor_pixels::OPERATION, wire.as_mut_ptr() as u64) == 0).then_some(wire)
+}
+
+#[cfg(any(feature="desktop-init",feature="desktop-files",feature="desktop-terminal"))]
+fn compositor_read_denied() -> bool {
+    compositor_read(compositor_pixels::Request {
+        window: 1, x: 0, y: 0, count: 0, generation: 0,
+    }).is_none()
+}
+
+#[cfg(feature="desktop-compositor")]
+fn compose_desktop_strip(
+    manager: &desktop_window::Manager, screen: (u16, u16), strip: &mut [u32],
+) -> Option<()> {
+    use compositor_pixels::{Request, HEADER_BYTES, OPAQUE, ROW_PIXELS};
+    use desktop_window::{compose_client_row, ClientSpan};
+    if strip.is_empty() || strip.len() > ROW_PIXELS { return None; }
+    let mut layers = [[None; ROW_PIXELS]; 2];
+    let mut destinations = [0; 2];
+    for (slot, pixels) in layers.iter_mut().enumerate() {
+        if manager.client_origin(slot).is_none() { continue; }
+        let query = Request { window: slot as u16 + 1, x: 0, y: 0, count: 0, generation: 0 };
+        let info = compositor_read(query)?;
+        let generation = u64::from_le_bytes(info[..8].try_into().ok()?);
+        let width = u16::from_le_bytes(info[8..10].try_into().ok()?);
+        let height = u16::from_le_bytes(info[10..12].try_into().ok()?);
+        let Some(span) = manager.client_read_span(slot, screen, strip.len() as u16, (width, height))
+            else { continue; };
+        let request = Request { x: span.x, y: span.y, count: span.count, generation, ..query };
+        let reply = compositor_read(request)?;
+        if reply[..HEADER_BYTES] != info[..HEADER_BYTES] { return None; }
+        destinations[slot] = i32::from(span.destination);
+        for (out, bytes) in pixels.iter_mut().zip(reply[HEADER_BYTES..].chunks_exact(8))
+            .take(usize::from(span.count)) {
+            let value = u64::from_le_bytes(bytes.try_into().ok()?);
+            *out = match value {
+                0 => None,
+                value if value >> 32 == OPAQUE >> 32 => Some(value as u32),
+                _ => return None,
+            };
+        }
+    }
+    compose_client_row(manager.front() == 2, [
+        ClientSpan { x: destinations[0], pixels: &layers[0] },
+        ClientSpan { x: destinations[1], pixels: &layers[1] },
+    ], strip);
+    Some(())
+}
+
+#[cfg(feature="desktop-compositor")]
+fn verify_client_snapshots(manager: &desktop_window::Manager) -> bool {
+    use compositor_pixels::{Request, HEADER_BYTES, OPAQUE};
+    use desktop_window::{compose_client_row, ClientSpan};
+    let mut colors = [0; 2];
+    for (window, x, y) in [(1, 14, 102), (2, 19, 175)] {
+        let query = Request { window, x: 0, y: 0, count: 0, generation: 0 };
+        let Some(info) = compositor_read(query) else { return false; };
+        let generation = u64::from_le_bytes(info[..8].try_into().unwrap());
+        let width = u16::from_le_bytes(info[8..10].try_into().unwrap());
+        let height = u16::from_le_bytes(info[10..12].try_into().unwrap());
+        if generation == 0 || width <= x + 1 || height <= y { return false; }
+        let read = Request { window, x, y, count: 2, generation };
+        let Some(row) = compositor_read(read) else { return false; };
+        let transparent = u64::from_le_bytes(row[HEADER_BYTES..HEADER_BYTES + 8].try_into().unwrap());
+        let opaque = u64::from_le_bytes(row[HEADER_BYTES + 8..HEADER_BYTES + 16].try_into().unwrap());
+        if row[..HEADER_BYTES] != info[..HEADER_BYTES] || transparent != 0 ||
+           opaque >> 32 != OPAQUE >> 32 || opaque as u32 == 0 ||
+           compositor_read(Request { generation: generation ^ (1 << 63), ..read }).is_some() ||
+           compositor_read(Request { x: width - 1, ..read }).is_some() {
+            return false;
+        }
+        colors[usize::from(window) - 1] = opaque as u32;
+    }
+    // Compose a private strip using actual app pixels arranged to exercise
+    // both front-window precedence and a transparent pixel over the rear.
+    // Exercise real desktop coordinates in addition to the overlap probe.
+    for (slot, x, y) in [(0, 15, 102), (1, 20, 175)] {
+        let Some((left, top)) = manager.client_origin(slot) else { return false; };
+        let mut pixel = [0];
+        if compose_desktop_strip(manager, (left + x, top + y), &mut pixel).is_none() ||
+           pixel[0] != colors[slot] { return false; }
+    }
+    let terminal_front = manager.front() == 2;
+    let front = usize::from(terminal_front);
+    let rear = 1 - front;
+    let mut layers = [[None, Some(colors[0]), None], [None, Some(colors[1]), None]];
+    layers[rear][0] = Some(colors[rear]);
+    let [files, terminal] = &layers;
+    let mut strip = [0; 3];
+    compose_client_row(terminal_front, [
+        ClientSpan { x: 0, pixels: files },
+        ClientSpan { x: 0, pixels: terminal },
+    ], &mut strip);
+    colors[0] != colors[1] && strip == [colors[rear], colors[front], 0]
+}
 #[cfg(feature="desktop-compositor")]
 fn desktop_compositor()->!{
     if call(4,0,0)!=4||call(6,0,1)!=u64::MAX||call(22,0,0)!=u64::MAX||
@@ -1358,6 +1459,7 @@ fn desktop_compositor()->!{
     if call(37,0,state.as_mut_ptr() as u64)!=0{exit(248);}
     let Some(mut manager)=desktop_window::Manager::new(&state)else{exit(249);};
     suite_send(1,b"COMPOSITOR");write(b"desktop compositor PID4 ready");
+    let mut snapshots_verified = false;
     loop{
         let mut request=[0u8;72];let len=desktop_receive(1,&mut request);
         if &request[8..8+len]==b"EXIT"{
@@ -1367,6 +1469,11 @@ fn desktop_compositor()->!{
             yield_now();write(b"desktop compositor PID4 stopped");exit(0);
         }
         if manager.control(&request[8..8+len]).is_none(){exit(250);}
+        if !snapshots_verified {
+            if !verify_client_snapshots(&manager) { exit(251); }
+            snapshots_verified = true;
+            write(b"desktop PID4 composed a private row from committed client snapshots");
+        }
         let state=manager.wire();
         if call(37,1,state.as_ptr() as u64)!=0{exit(251);}
         suite_send(1,&[b'A',manager.front()]);
@@ -1393,7 +1500,7 @@ fn r031_shell()->!{
     {
         let mut state=[0u8;64];
         if call(37,0,state.as_mut_ptr() as u64)!=u64::MAX||
-           call(37,1,state.as_ptr() as u64)!=u64::MAX{exit(252);}
+           call(37,1,state.as_ptr() as u64)!=u64::MAX||!compositor_read_denied(){exit(252);}
         write(b"desktop PID1 denied compositor window authority");
         let mut app_request=pixel_protocol::Request::new(pixel_protocol::BEGIN,1);
         app_request.width=1;app_request.height=1;
@@ -1624,7 +1731,7 @@ fn r031_files()->!{
         if call(37,0,state.as_mut_ptr() as u64)!=u64::MAX||
            call(37,1,state.as_ptr() as u64)!=u64::MAX||
            call(6,core::ptr::addr_of_mut!(byte) as u64,1)!=u64::MAX||
-           call(38,0,0)!=u64::MAX||call(38,1,0)!=u64::MAX{exit(253);}
+           call(38,0,0)!=u64::MAX||call(38,1,0)!=u64::MAX||!compositor_read_denied(){exit(253);}
         write(b"desktop app denied compositor and physical input authority");
     }
     let foreign=r029_command(2,1,20,80,200,32,0x00ff0000,&[]);
@@ -1740,7 +1847,7 @@ fn r031_terminal()->!{
         if call(37,0,state.as_mut_ptr() as u64)!=u64::MAX||
            call(37,1,state.as_ptr() as u64)!=u64::MAX||
            call(6,core::ptr::addr_of_mut!(byte) as u64,1)!=u64::MAX||
-           call(38,0,0)!=u64::MAX||call(38,1,0)!=u64::MAX{exit(253);}
+           call(38,0,0)!=u64::MAX||call(38,1,0)!=u64::MAX||!compositor_read_denied(){exit(253);}
         write(b"desktop app denied compositor and physical input authority");
     }
     let foreign=r029_command(1,1,20,80,200,32,0x00ff0000,&[]);

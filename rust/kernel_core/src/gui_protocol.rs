@@ -2,6 +2,8 @@
 //!
 //! Kernel owns the framebuffer; userspace may submit only a bounded drawing
 //! command, never a pixel pointer or a physical MMIO address.
+pub const CLIENT_LEFT: u16 = 9;
+pub const CLIENT_TOP: u16 = 44;
 pub const WIRE_BYTES:usize=64;
 pub const COMMAND_LIMIT:usize=8;
 pub const FILL:u32=1;

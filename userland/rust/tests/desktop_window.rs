@@ -50,3 +50,31 @@ fn pointer(x:u16,y:u16,left:bool)->[u8;6]{[b'M',x as u8,(x>>8) as u8,y as u8,(y>
  assert_eq!(u16::from_le_bytes([moved[32],moved[33]]),390);
  assert_eq!(u16::from_le_bytes([moved[34],moved[35]]),290);
 }
+
+#[test]
+fn client_rows_clip_and_preserve_rear_pixels_through_transparency() {
+    use policy::{compose_client_row, ClientSpan};
+    let left = [Some(99), Some(1), Some(2), None];
+    let right = [None, Some(0), Some(3), Some(99)];
+    let spans = || [ClientSpan { x: -1, pixels: &left }, ClientSpan { x: 0, pixels: &right }];
+    let mut row = [7; 3];
+    compose_client_row(true, spans(), &mut row);
+    assert_eq!(row, [1, 0, 3]);
+    row.fill(7);
+    compose_client_row(false, spans(), &mut row);
+    assert_eq!(row, [1, 2, 3]);
+}
+
+#[test]
+fn desktop_strip_translation_clips_and_ignores_minimized_client() {
+    use policy::RowRead;
+    let mut manager = Manager::new(&initial()).unwrap();
+    assert_eq!(manager.client_origin(0), Some((54, 119)));
+    assert_eq!(manager.client_read_span(0, (52, 119), 5, (302, 186)),
+               Some(RowRead { x: 0, y: 0, count: 3, destination: 2 }));
+    assert_eq!(manager.client_read_span(0, (354, 304), 7, (302, 186)),
+               Some(RowRead { x: 300, y: 185, count: 2, destination: 0 }));
+    assert_eq!(manager.client_read_span(0, (54, 305), 2, (302, 186)), None);
+    assert_eq!(manager.control(b"Km"), Some(1));
+    assert_eq!(manager.client_read_span(1, (369, 304), 3, (302, 186)), None);
+}

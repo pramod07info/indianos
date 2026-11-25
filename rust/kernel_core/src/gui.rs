@@ -409,7 +409,8 @@ impl UserSurfaceService{
         let w=self.window(id)?;
         let inner_w=w.bounds.width.checked_sub(18)?;
         let inner_h=w.bounds.height.checked_sub(54)?;
-        Some((w.bounds.x+9,w.bounds.y+44,inner_w,inner_h))
+        Some((w.bounds.x+i32::from(crate::gui_protocol::CLIENT_LEFT),
+              w.bounds.y+i32::from(crate::gui_protocol::CLIENT_TOP),inner_w,inner_h))
     }
     fn redraw(&self)->bool{
         let Some(mut out)=Surface::from_boot()else{return false;};
@@ -792,6 +793,19 @@ pub(crate) fn desktop_window_query(pid:u32)->Option<[u8;64]>{
 #[cfg(feature="normal-desktop")]
 pub(crate) fn desktop_window_apply(pid:u32,bytes:&[u8;64])->bool{
     user_service().is_some_and(|svc|svc.apply_window_frame(pid,bytes,UserSurfaceService::redraw))
+}
+#[cfg(feature="normal-desktop")]
+pub(crate) fn desktop_pixel_snapshot(
+    pid: u32, request: crate::compositor_pixels::Request,
+) -> Option<[u8; crate::compositor_pixels::REPLY_BYTES]> {
+    if pid != 4 {
+        return None;
+    }
+    let service = user_service()?;
+    let window = u32::from(request.window);
+    let owner = service.broker.owner(window)?;
+    let slot = service.pixel_slot(owner, window)?;
+    service.pixels.snapshot(slot, request)
 }
 #[cfg(any(feature="test-r029-userspace",feature="normal-desktop"))]
 pub(crate) fn user_surface_submit(pid:u32,bytes:&[u8;64])->bool{

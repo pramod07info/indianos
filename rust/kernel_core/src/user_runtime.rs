@@ -947,6 +947,22 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
      }
      if crate::gui::desktop_window_apply(pid,&state){0}else{BAD}
     },
+    crate::compositor_pixels::OPERATION => {
+     use crate::compositor_pixels::{Request, REQUEST_BYTES, REPLY_BYTES};
+     const _: () = assert!(REPLY_BYTES <= crate::user_image::MAX_USER_COPY_OUT);
+     if !unsafe { indianos_user_can_write(&*img, request.arg1, REPLY_BYTES) } {
+      return BAD;
+     }
+     let mut wire = [0; REQUEST_BYTES];
+     if !unsafe { indianos_user_copy_readonly(img, request.arg1, wire.as_mut_ptr().cast(), wire.len()) } {
+      return BAD;
+     }
+     let Some(read) = Request::parse(&wire) else { return BAD; };
+     let Some(reply) = crate::gui::desktop_pixel_snapshot(pid, read) else { return BAD; };
+     if unsafe { indianos_user_copy_writable(&*img, request.arg1, reply.as_ptr(), reply.len()) } {
+      0
+     } else { BAD }
+    },
     _=>BAD,
    }
   },

@@ -8,6 +8,29 @@ impl Manager{
  pub fn new(bytes:&[u8;64])->Option<Self>{Some(Self{frame:DesktopFrame::parse(bytes)?,drag:None,down:false})}
  pub fn wire(&self)->[u8;64]{self.frame.wire()}
  pub fn front(&self)->u8{self.frame.front}
+ pub fn client_origin(&self, slot: usize) -> Option<(u16, u16)> {
+  let window = self.frame.windows.get(slot)?;
+  if window.minimized { return None; }
+  Some((window.x.checked_add(wire::CLIENT_LEFT)?, window.y.checked_add(wire::CLIENT_TOP)?))
+ }
+
+ /// Translate one desktop strip into the covered portion of a live client row.
+ /// Surface dimensions come from the generation-pinned snapshot.
+ pub fn client_read_span(
+  &self, slot: usize, screen: (u16, u16), count: u16, surface: (u16, u16),
+ ) -> Option<RowRead> {
+  let (window_x, window_y) = self.client_origin(slot)?;
+  let (screen_x, screen_y) = screen;
+  let y = screen_y.checked_sub(window_y)?;
+  if y >= surface.1 || screen_y >= self.frame.height { return None; }
+  let start = screen_x.max(window_x);
+  let end = (u32::from(screen_x) + u32::from(count))
+      .min(u32::from(window_x) + u32::from(surface.0))
+      .min(u32::from(self.frame.width));
+  if u32::from(start) >= end { return None; }
+  Some(RowRead { x: start - window_x, y, count: (end - u32::from(start)) as u16,
+                 destination: start - screen_x })
+ }
  pub fn control(&mut self,request:&[u8])->Option<u8>{
   let mut next=self.clone();
   match request{
@@ -56,4 +79,40 @@ impl Manager{
   DesktopFrame::parse(&next.wire())?;
   let front=next.front();*self=next;Some(front)
  }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RowRead {
+    pub x: u16,
+    pub y: u16,
+    pub count: u16,
+    pub destination: u16,
+}
+
+/// A visible span of a client surface in screen coordinates. Transparent
+/// pixels preserve the destination, including pixels from a rear window.
+pub struct ClientSpan<'a> {
+    pub x: i32,
+    pub pixels: &'a [Option<u32>],
+}
+
+/// Draw client spans in desktop stacking order into a caller-owned row.
+/// The caller provides any background or window chrome already in the row.
+pub fn compose_client_row(terminal_front: bool, spans: [ClientSpan<'_>; 2], row: &mut [u32]) {
+    let front = usize::from(terminal_front);
+    for index in [1 - front, front] {
+        let span = &spans[index];
+        let left = i64::from(span.x);
+        let start = left.max(0).min(row.len() as i64);
+        let end = (left + span.pixels.len() as i64).min(row.len() as i64);
+        if start >= end {
+            continue;
+        }
+        let pixels = &span.pixels[(start - left) as usize..(end - left) as usize];
+        for (out, pixel) in row[start as usize..end as usize].iter_mut().zip(pixels) {
+            if let Some(color) = pixel {
+                *out = *color;
+            }
+        }
+    }
 }

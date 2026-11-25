@@ -16,6 +16,7 @@ use crate::vmm::{
 const PAGE: usize = 4096;
 const MAX_IMAGE_PAGES: usize = 128;
 const MAX_WRITE: usize = 256;
+pub(crate) const MAX_USER_COPY_OUT: usize = 72;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -292,7 +293,7 @@ pub(crate) unsafe fn indianos_user_can_write(
 )->bool{
     // R025 IPC wire reply is 72 bytes; the dedicated syscall still validates
     // the complete writable range before consuming the queue.
-    img.ready && (1..=72).contains(&length) &&
+    img.ready && (1..=MAX_USER_COPY_OUT).contains(&length) &&
         crate::syscall::user_range(&img.plan,address,length as u64,true) &&
         unsafe{copy_preflight(img,address,length,true)}
 }
