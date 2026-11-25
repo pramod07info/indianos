@@ -963,6 +963,45 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
       0
      } else { BAD }
     },
+    crate::compositor_pixels::BULK_OPERATION=>{
+     use crate::compositor_pixels::{Request,REQUEST_BYTES,BULK_REPLY_BYTES,BULK_PIXELS};
+     if !unsafe{crate::user_image::compositor_can_write(&*img,request.arg1,BULK_REPLY_BYTES)}{return BAD;}
+     let mut wire=[0;REQUEST_BYTES];
+     if !unsafe{indianos_user_copy_readonly(img,request.arg1,wire.as_mut_ptr().cast(),wire.len())}{return BAD;}
+     let Some(read)=Request::parse_limit(&wire,BULK_PIXELS)else{return BAD;};
+     let Some(reply)=crate::gui::desktop_pixel_snapshot_bulk(pid,read)else{return BAD;};
+     if unsafe{crate::user_image::compositor_copy_out(&*img,request.arg1,reply.as_ptr(),reply.len())}{0}else{BAD}
+    },
+    crate::compositor_pixels::FRAME_INFO=>{
+     if !unsafe{indianos_user_can_write(&*img,request.arg1,64)}{return BAD;}
+     let Some(info)=crate::gui::compositor_info(pid)else{return BAD;};
+     if unsafe{indianos_user_copy_writable(&*img,request.arg1,info.as_ptr(),info.len())}{0}else{BAD}
+    },
+    4..=7=>{
+     use crate::compositor_pixels::{FrameRequest,FRAME_BYTES,FRAME_LIMIT,FRAME_BEGIN,FRAME_ROW,FRAME_COMMIT};
+     // BEGIN returns its token through this validated descriptor, before any
+     // staging allocation changes. Other operations have no user copyout.
+     if request.arg0==FRAME_BEGIN&&
+        !unsafe{crate::user_image::compositor_can_write(&*img,request.arg1,FRAME_BYTES)}{return BAD;}
+     let mut wire=[0;FRAME_BYTES];
+     if !unsafe{indianos_user_copy_readonly(img,request.arg1,wire.as_mut_ptr().cast(),wire.len())}{return BAD;}
+     let Some(frame)=FrameRequest::parse(&wire)else{return BAD;};
+     match request.arg0{
+      FRAME_BEGIN=>{
+       let Some(token)=crate::gui::compositor_begin(pid,frame)else{return BAD;};
+       wire[16..24].copy_from_slice(&token.to_le_bytes());
+       if unsafe{crate::user_image::compositor_copy_out(&*img,request.arg1,wire.as_ptr(),wire.len())}{0}else{BAD}
+      },
+      FRAME_ROW=>{
+       if frame.bytes!=u64::from(frame.width)*4||frame.count!=frame.width{return BAD;}
+       let mut row=[0u32;FRAME_LIMIT];
+       if !unsafe{crate::user_image::compositor_copy_in(img,frame.pixels,row.as_mut_ptr().cast(),frame.bytes as usize)}{return BAD;}
+       if crate::gui::compositor_row(pid,frame,&row[..usize::from(frame.width)]){0}else{BAD}
+      },
+      FRAME_COMMIT=>if crate::gui::compositor_commit(pid,frame){0}else{BAD},
+      _=>if crate::gui::compositor_abort(pid,frame){0}else{BAD},
+     }
+    },
     _=>BAD,
    }
   },

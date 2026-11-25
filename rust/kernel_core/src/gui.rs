@@ -282,6 +282,18 @@ struct UserSurfaceService{
     retired_streams:u8,
     #[cfg(feature="normal-desktop")]
     pixels:app_pixels::PixelCache,
+    #[cfg(feature="normal-desktop")]
+    compositor_epoch:u64,
+    #[cfg(feature="normal-desktop")]
+    compositor_next_token:u64,
+    #[cfg(feature="normal-desktop")]
+    compositor_sequence:u64,
+    #[cfg(feature="normal-desktop")]
+    compositor_retired:(u64,u64),
+    #[cfg(feature="normal-desktop")]
+    compositor_presented_epoch:u64,
+    #[cfg(feature="normal-desktop")]
+    compositor_pending:Option<FrameTransaction>,
     #[cfg(any(feature="test-r029-desktop-suite",feature="normal-desktop"))]
     launcher_visible:bool,
     #[cfg(any(feature="test-r029-desktop-suite",feature="normal-desktop"))]
@@ -319,25 +331,7 @@ impl UserSurfaceService{
     #[cfg(feature="normal-desktop")]
     fn apply_window_frame(&mut self,pid:u32,bytes:&[u8;64],
         paint:impl FnOnce(&Self)->bool)->bool{
-        if pid!=4||!self.broker.owns(2,1)||!self.broker.owns(3,2){return false;}
-        let Some(state)=crate::gui_protocol::DesktopFrame::parse(bytes)else{return false;};
-        if state.width as u32!=self.session.desktop.width||state.height as u32!=self.session.desktop.height{
-            return false;
-        }
-        let Ok(mut layout)=Desktop::new(state.width as u32,state.height as u32)else{return false;};
-        for (index,window) in state.windows.iter().enumerate(){
-            let Some(old)=self.window(index as u32+1)else{return false;};
-            // Retained app streams remain attached to immutable client extents.
-            if window.width as u32!=old.bounds.width||window.height as u32!=old.bounds.height{
-                return false;
-            }
-            if layout.open(old.app,Rect::new(window.x as i32,window.y as i32,
-                window.width as u32,window.height as u32)).ok()!=Some(index as u32+1){return false;}
-        }
-        for (index,window) in state.windows.iter().enumerate(){
-            if window.minimized&&layout.minimize(index as u32+1).is_err(){return false;}
-        }
-        if layout.focus(state.front as u32).is_err(){return false;}
+        let Some((state,layout))=self.validated_window_layout(pid,bytes)else{return false;};
         let old=core::mem::replace(&mut self.session.desktop,layout);
         let launcher=self.launcher_visible;
         let pointer=(self.session.mouse_x,self.session.mouse_y);
@@ -351,8 +345,31 @@ impl UserSurfaceService{
         self.frames_presented=self.frames_presented.saturating_add(1);
         true
     }
+    #[cfg(feature="normal-desktop")]
+    fn validated_window_layout(&self,pid:u32,bytes:&[u8;64])->Option<(crate::gui_protocol::DesktopFrame,Desktop)>{
+        if pid!=4||!self.broker.owns(2,1)||!self.broker.owns(3,2){return None;}
+        let Some(state)=crate::gui_protocol::DesktopFrame::parse(bytes)else{return None;};
+        if state.width as u32!=self.session.desktop.width||state.height as u32!=self.session.desktop.height{
+            return None;
+        }
+        let Ok(mut layout)=Desktop::new(state.width as u32,state.height as u32)else{return None;};
+        for (index,window) in state.windows.iter().enumerate(){
+            let Some(old)=self.window(index as u32+1)else{return None;};
+            // Retained app streams remain attached to immutable client extents.
+            if window.width as u32!=old.bounds.width||window.height as u32!=old.bounds.height{
+                return None;
+            }
+            if layout.open(old.app,Rect::new(window.x as i32,window.y as i32,
+                window.width as u32,window.height as u32)).ok()!=Some(index as u32+1){return None;}
+        }
+        for (index,window) in state.windows.iter().enumerate(){
+            if window.minimized&&layout.minimize(index as u32+1).is_err(){return None;}
+        }
+        if layout.focus(state.front as u32).is_err(){return None;}
+        Some((state,layout))
+    }
     fn new(w:u32,h:u32)->Option<Self>{
-        let session=Session::new(w,h)?;
+        let session=Session::new(w,h).or_else(||{log(b"IndianOS: G4 desktop layout initialization failed\n\0");None})?;
         if session.files!=1||session.terminal!=2{return None;}
         let mut broker=Broker::new();
         #[cfg(any(feature="test-r029-desktop-suite",feature="normal-desktop"))]
@@ -369,7 +386,7 @@ impl UserSurfaceService{
             broker.grant(1,session.terminal).ok()?;
         }
         #[cfg(any(feature="test-r029-physical-events",feature="normal-desktop"))]
-        let mouse=Mouse::init()?;
+        let mouse=Mouse::init().or_else(||{log(b"IndianOS: G4 mouse initialization failed\n\0");None})?;
         Some(Self{session,
             commands:CommandStore::new(),
             counts:[0,0],focused:0,broker,
@@ -379,6 +396,18 @@ impl UserSurfaceService{
             retired_streams:0,
             #[cfg(feature="normal-desktop")]
             pixels:app_pixels::PixelCache::new(),
+            #[cfg(feature="normal-desktop")]
+            compositor_epoch:1,
+            #[cfg(feature="normal-desktop")]
+            compositor_next_token:1,
+            #[cfg(feature="normal-desktop")]
+            compositor_sequence:0,
+            #[cfg(feature="normal-desktop")]
+            compositor_retired:(0,0),
+            #[cfg(feature="normal-desktop")]
+            compositor_pending:None,
+            #[cfg(feature="normal-desktop")]
+            compositor_presented_epoch:0,
             #[cfg(any(feature="test-r029-desktop-suite",feature="normal-desktop"))]
             launcher_visible:false,
             #[cfg(any(feature="test-r029-desktop-suite",feature="normal-desktop"))]
@@ -389,7 +418,8 @@ impl UserSurfaceService{
             mouse})
     }
     #[cfg(feature="normal-desktop")]
-    fn reset_in_place(&mut self,next:Self){
+    fn reset_in_place(&mut self,next:Self)->bool{
+        let Some(next_epoch)=self.compositor_epoch.checked_add(1)else{return false;};
         // The existing guard pages are already unmapped. Move live metadata
         // field-by-field and clear only the payload, never copy/drop guards.
         self.commands.clear();
@@ -398,9 +428,16 @@ impl UserSurfaceService{
         self.focused=next.focused;self.broker=next.broker;
         self.frames_presented=next.frames_presented;
         self.retired_streams=0;
+        self.compositor_pending=None;
+        self.compositor_epoch=next_epoch;
+        // Tokens never recycle across a full-session replacement.
+        self.compositor_sequence=next.compositor_sequence;
+        self.compositor_retired=next.compositor_retired;
+        self.compositor_presented_epoch=0;
         self.launcher_visible=next.launcher_visible;
         self.desktop_actions=next.desktop_actions;
         self.mouse=next.mouse;
+        true
     }
     fn window(&self,id:u32)->Option<crate::desktop::Window>{
         self.session.desktop.windows().find(|w|w.id==id).copied()
@@ -413,8 +450,10 @@ impl UserSurfaceService{
               w.bounds.y+i32::from(crate::gui_protocol::CLIENT_TOP),inner_w,inner_h))
     }
     fn redraw(&self)->bool{
-        let Some(mut out)=Surface::from_boot()else{return false;};
-        self.paint(&mut out)
+        #[cfg(feature="normal-desktop")]
+        {true} // PID4 alone assembles normal-desktop scenes; retain last frame.
+        #[cfg(not(feature="normal-desktop"))]
+        {let Some(mut out)=Surface::from_boot()else{return false;};self.paint(&mut out)}
     }
     // The boot framebuffer and memory-backed tests share this exact raster path.
     fn paint(&self,out:&mut Surface)->bool{
@@ -734,7 +773,7 @@ fn user_service()->Option<&'static mut UserSurfaceService>{
 pub(crate) fn user_surface_start()->bool{
     #[cfg(feature="normal-desktop")]
     input::reset_physical_session();
-    let Some(f)=Surface::from_boot()else{return false;};
+    let Some(f)=Surface::from_boot()else{log(b"IndianOS: G4 framebuffer admission failed\n\0");return false;};
     let Some(svc)=UserSurfaceService::new(f.width as u32,f.height as u32)else{return false;};
     // A restarted session must never present the retired clients' backing,
     // including the interval before new processes publish their first rows.
@@ -744,7 +783,7 @@ pub(crate) fn user_surface_start()->bool{
     #[cfg(feature="normal-desktop")]
     unsafe{
         let service=&mut *ptr::addr_of_mut!(USER_SURFACE_SERVICE);
-        if let Some(current)=service.as_mut(){current.reset_in_place(svc);}
+        if let Some(current)=service.as_mut(){if current.compositor_epoch==u64::MAX{log(b"IndianOS: G4 compositor epoch exhausted\n\0");return false;}if !current.reset_in_place(svc){return false;}}
         else{*service=Some(svc);}
     }
     #[cfg(not(feature="normal-desktop"))]
@@ -792,7 +831,7 @@ pub(crate) fn desktop_window_query(pid:u32)->Option<[u8;64]>{
 }
 #[cfg(feature="normal-desktop")]
 pub(crate) fn desktop_window_apply(pid:u32,bytes:&[u8;64])->bool{
-    user_service().is_some_and(|svc|svc.apply_window_frame(pid,bytes,UserSurfaceService::redraw))
+    let _=(pid,bytes);false
 }
 #[cfg(feature="normal-desktop")]
 pub(crate) fn desktop_pixel_snapshot(
@@ -807,6 +846,157 @@ pub(crate) fn desktop_pixel_snapshot(
     let slot = service.pixel_slot(owner, window)?;
     service.pixels.snapshot(slot, request)
 }
+#[cfg(feature="normal-desktop")]
+#[derive(Clone,Copy)]
+struct FrameTransaction{
+ token:u64,epoch:u64,sequence:u64,width:u16,height:u16,next_y:u16,
+ before:[u8;64],desired:[u8;64],clients:[[u8;16];2],mask:u32,button_down:bool,
+}
+#[cfg(all(feature="normal-desktop",not(test)))]
+static mut COMPOSITOR_FRAME_PIXELS:[u32;1600*1600]=[0;1600*1600];
+#[cfg(all(feature="normal-desktop",test))]
+std::thread_local!{static COMPOSITOR_TEST_PIXELS:core::cell::RefCell<std::vec::Vec<u32>>=
+ core::cell::RefCell::new(std::vec![0;1600*1600]);}
+#[cfg(feature="normal-desktop")]
+fn with_frame_pixels<R>(f:impl FnOnce(&mut[u32])->R)->R{
+ #[cfg(not(test))]
+ {unsafe{f(&mut *core::ptr::addr_of_mut!(COMPOSITOR_FRAME_PIXELS))}}
+ #[cfg(test)]
+ {COMPOSITOR_TEST_PIXELS.with(|pixels|f(&mut pixels.borrow_mut()))}
+}
+#[cfg(feature="normal-desktop")]
+impl UserSurfaceService{
+ fn frame_client_snapshots(&self)->Option<[[u8;16];2]>{
+  let mut headers=[[0;16];2];
+  for (slot,header) in headers.iter_mut().enumerate(){
+   let window=slot as u32+1;let owner=self.broker.owner(window)?;
+   if self.pixel_slot(owner,window)!=Some(slot){return None;}
+   let reply=self.pixels.snapshot(slot,crate::compositor_pixels::Request{
+    window:window as u16,x:0,y:0,count:0,generation:0})?;
+   header.copy_from_slice(&reply[..16]);
+  }
+  Some(headers)
+ }
+ fn frame_is_current(&self,t:FrameTransaction)->bool{
+  t.epoch==self.compositor_epoch&&
+   (t.sequence>self.compositor_sequence||(t.sequence==self.compositor_sequence&&
+    t.epoch>1&&self.compositor_presented_epoch!=t.epoch&&t.desired==t.before))&&
+   t.button_down==self.session.was_down&&
+   self.window_frame(4).map(|s|s.wire())==Some(t.before)&&
+   self.frame_client_snapshots()==Some(t.clients)
+ }
+ fn frame_begin(&mut self,pid:u32,r:crate::compositor_pixels::FrameRequest,mask:u32)->Option<u64>{
+  if pid!=4||r.epoch!=self.compositor_epoch||r.token!=0||r.sequence<self.compositor_sequence||
+     r.y!=0||r.count!=0||r.pixels!=0||r.bytes!=0||mask==0{return None;}
+  let (desired,_)=self.validated_window_layout(pid,&r.state)?;
+  if (desired.width,desired.height)!=(r.width,r.height){return None;}
+  let before=self.window_frame(pid)?.wire();let clients=self.frame_client_snapshots()?;
+  if r.sequence==self.compositor_sequence&&
+     !(self.compositor_epoch>1&&self.compositor_presented_epoch!=self.compositor_epoch&&r.state==before){return None;}
+  let token=self.compositor_next_token;
+  self.compositor_next_token=token.checked_add(1)?;
+  self.compositor_pending=Some(FrameTransaction{token,epoch:r.epoch,sequence:r.sequence,
+   width:r.width,height:r.height,next_y:0,before,desired:r.state,clients,mask,button_down:self.session.was_down});
+  Some(token)
+ }
+ fn frame_request_matches(&self,r:crate::compositor_pixels::FrameRequest)->Option<FrameTransaction>{
+  let t=self.compositor_pending?;
+  if r.token==0||r.token!=t.token||r.epoch!=t.epoch||r.sequence!=t.sequence||
+     (r.width,r.height)!=(t.width,t.height)||!self.frame_is_current(t){return None;}
+  Some(t)
+ }
+ fn frame_row(&mut self,pid:u32,r:crate::compositor_pixels::FrameRequest,pixels:&[u32])->bool{
+  if pid!=4||r.state!=[0;64]{return false;}
+  let Some(mut t)=self.frame_request_matches(r)else{return false;};
+  if r.y!=t.next_y||r.y>=t.height||r.count!=t.width||pixels.len()!=usize::from(t.width)||
+     r.bytes!=u64::from(t.width)*4||pixels.iter().any(|pixel|pixel&!t.mask!=0){return false;}
+  let begin=usize::from(r.y)*usize::from(t.width);
+  with_frame_pixels(|out|out[begin..begin+pixels.len()].copy_from_slice(pixels));
+  t.next_y+=1;self.compositor_pending=Some(t);true
+ }
+ fn frame_commit_with(&mut self,pid:u32,r:crate::compositor_pixels::FrameRequest,
+   present:impl FnOnce(&[u32],usize,usize)->bool)->bool{
+  if pid!=4||r.state!=[0;64]||r.y!=0||r.count!=0||r.pixels!=0||r.bytes!=0{return false;}
+  let Some(t)=self.frame_request_matches(r)else{return false;};
+  if t.next_y!=t.height{return false;}
+  let ok=self.apply_window_frame(pid,&t.desired,|_|with_frame_pixels(|pixels|
+   present(&pixels[..usize::from(t.width)*usize::from(t.height)],usize::from(t.width),usize::from(t.height))));
+  if ok{self.compositor_sequence=t.sequence;self.compositor_presented_epoch=t.epoch;self.compositor_pending=None;}
+  ok
+ }
+ fn frame_abort(&mut self,pid:u32,r:crate::compositor_pixels::FrameRequest)->bool{
+  if pid!=4||r.state!=[0;64]||r.y!=0||r.count!=0||r.pixels!=0||r.bytes!=0{return false;}
+  let Some(t)=self.compositor_pending else{return false;};
+  if r.token!=t.token||r.epoch!=t.epoch||r.sequence!=t.sequence||
+     (r.width,r.height)!=(t.width,t.height){return false;}
+  self.compositor_pending=None;true
+ }
+}
+#[cfg(feature="normal-desktop")]
+pub(crate) fn compositor_epoch()->Option<u64>{Some(user_service()?.compositor_epoch)}
+#[cfg(feature="normal-desktop")]
+pub(crate) fn compositor_presentation_ready(epoch:u64)->bool{
+ user_service().is_some_and(|s|epoch!=0&&s.compositor_epoch==epoch&&s.compositor_presented_epoch==epoch)
+}
+#[cfg(feature="normal-desktop")]
+pub(crate) fn compositor_retire()->bool{
+ let Some(service)=user_service()else{return false;};
+ let Some(epoch)=service.compositor_epoch.checked_add(1)else{return false;};
+ service.compositor_retired=(service.compositor_next_token.saturating_sub(1),service.compositor_epoch);
+ service.compositor_pending=None;service.compositor_epoch=epoch;
+ service.session.dragging=None;
+ true
+}
+#[cfg(feature="normal-desktop")]
+pub(crate) fn compositor_info(pid:u32)->Option<[u8;64]>{
+ if pid!=4{return None;}
+ let service=user_service()?;let state=service.window_frame(pid)?;
+ let mut out=[0u8;64];out[..2].copy_from_slice(&state.width.to_le_bytes());
+ out[2..4].copy_from_slice(&state.height.to_le_bytes());out[4..8].copy_from_slice(&1u32.to_le_bytes());
+ for (at,color) in [(8,boot::desktop_rgb(255,0,0)?),(12,boot::desktop_rgb(0,255,0)?),
+    (16,boot::desktop_rgb(0,0,255)?)]{out[at..at+4].copy_from_slice(&color.to_le_bytes());}
+ out[20..24].copy_from_slice(&(service.session.was_down as u32).to_le_bytes());
+ out[24..32].copy_from_slice(&service.compositor_epoch.to_le_bytes());
+ out[32..40].copy_from_slice(&service.compositor_sequence.to_le_bytes());
+ out[40..48].copy_from_slice(&service.compositor_retired.0.to_le_bytes());
+ out[48..56].copy_from_slice(&service.compositor_retired.1.to_le_bytes());Some(out)
+}
+#[cfg(feature="normal-desktop")]
+pub(crate) fn compositor_begin(pid:u32,r:crate::compositor_pixels::FrameRequest)->Option<u64>{
+ let mask=boot::desktop_rgb(255,255,255)?;user_service()?.frame_begin(pid,r,mask)
+}
+#[cfg(feature="normal-desktop")]
+pub(crate) fn compositor_row(pid:u32,r:crate::compositor_pixels::FrameRequest,pixels:&[u32])->bool{
+ user_service().is_some_and(|s|s.frame_row(pid,r,pixels))
+}
+#[cfg(feature="normal-desktop")]
+pub(crate) fn compositor_abort(pid:u32,r:crate::compositor_pixels::FrameRequest)->bool{
+ user_service().is_some_and(|s|s.frame_abort(pid,r))
+}
+#[cfg(feature="normal-desktop")]
+pub(crate) fn compositor_commit(pid:u32,r:crate::compositor_pixels::FrameRequest)->bool{
+ let Some(mut surface)=Surface::from_boot()else{return false;};
+ let ok=user_service().is_some_and(|service|service.frame_commit_with(pid,r,|pixels,width,height|{
+  if (width,height)!=(surface.width,surface.height){return false;}
+  for (y,row) in pixels.chunks_exact(width).enumerate(){
+   for (x,&pixel) in row.iter().enumerate(){
+    // Only the validated hardware copy lives in ring0. PID4 assembled every pixel.
+    unsafe{ptr::write_volatile(surface.ptr.add(y*surface.pitch+x*4).cast::<u32>(),pixel);}
+   }
+  }
+  true
+ }));
+ if ok{log(b"\nIndianOS: G4 complete PID4 frame presented\n\0");}ok
+}
+#[cfg(feature="normal-desktop")]
+pub(crate) fn desktop_pixel_snapshot_bulk(pid:u32,request:crate::compositor_pixels::Request)
+ ->Option<[u8;crate::compositor_pixels::BULK_REPLY_BYTES]>{
+ if pid!=4{return None;}
+ let service=user_service()?;let owner=service.broker.owner(u32::from(request.window))?;
+ let slot=service.pixel_slot(owner,u32::from(request.window))?;
+ service.pixels.snapshot_sized(slot,request)
+}
+
 #[cfg(any(feature="test-r029-userspace",feature="normal-desktop"))]
 pub(crate) fn user_surface_submit(pid:u32,bytes:&[u8;64])->bool{
     user_service().is_some_and(|svc|svc.submit(pid,bytes))
@@ -1116,10 +1306,149 @@ mod tests{
             commands:CommandStore::new(),counts:[0,0],focused:0,broker,
             frames_presented:0,launcher_visible:false,desktop_actions:0,
             retired_streams:0,pixels:app_pixels::PixelCache::new(),
+
+            #[cfg(feature="normal-desktop")]
+            compositor_epoch:1,
+            #[cfg(feature="normal-desktop")]
+            compositor_next_token:1,
+            #[cfg(feature="normal-desktop")]
+            compositor_sequence:0,
+            #[cfg(feature="normal-desktop")]
+            compositor_retired:(0,0),
+            #[cfg(feature="normal-desktop")]
+            compositor_pending:None,
+            #[cfg(feature="normal-desktop")]
+            compositor_presented_epoch:0,
             #[cfg(feature="test-r031-supervisor")]restart_count:0,
             // State-only fixture; no hardware initialization is invoked.
             mouse:unsafe{core::mem::zeroed()},}
     }
+    #[cfg(feature="normal-desktop")]
+    fn frame_service()->UserSurfaceService{
+        let svc=isolated_service();
+        for (pid,window) in [(2,1),(3,2)]{
+            let token=svc.pixel_begin(pid,window,[0,0,1,1]).unwrap();
+            assert!(svc.pixels.tile(window as usize-1,token,0,0,&[0xff123456],|r,g,b|Some((r as u32)<<16|(g as u32)<<8|b as u32)));
+            assert!(svc.pixel_commit(pid,window,token));
+        }
+        svc
+    }
+    #[cfg(feature="normal-desktop")]
+    fn frame_request(svc:&UserSurfaceService,sequence:u64)->crate::compositor_pixels::FrameRequest{
+        let state=svc.window_frame(4).unwrap();
+        crate::compositor_pixels::FrameRequest{width:state.width,height:state.height,
+            y:0,count:0,token:0,epoch:svc.compositor_epoch,pixels:0,bytes:0,sequence,state:state.wire()}
+    }
+    #[cfg(feature="normal-desktop")]
+    fn stage_complete_frame(svc:&mut UserSurfaceService,begin:crate::compositor_pixels::FrameRequest)
+        ->crate::compositor_pixels::FrameRequest{
+        let token=svc.frame_begin(4,begin,0xffffff).unwrap();
+        let row=std::vec![0x123456;usize::from(begin.width)];
+        let mut request=crate::compositor_pixels::FrameRequest{token,state:[0;64],..begin};
+        for y in 0..begin.height{
+            let span=crate::compositor_pixels::FrameRequest{y,count:begin.width,
+                pixels:0x400000,bytes:u64::from(begin.width)*4,..request};
+            assert!(svc.frame_row(4,span,&row));
+        }
+        request.y=0;request
+    }
+    #[cfg(feature="normal-desktop")]
+    #[test]fn g4_complete_frame_is_private_until_successful_atomic_commit(){
+        let mut svc=frame_service();let begin=frame_request(&svc,1);
+        let before=svc.window_frame(4).unwrap().wire();
+        let mut visible=std::vec![0xfedcba;800*600];
+        let token=svc.frame_begin(4,begin,0xffffff).unwrap();
+        let request=crate::compositor_pixels::FrameRequest{token,state:[0;64],..begin};
+        assert!(!svc.frame_commit_with(4,request,|_,_,_|panic!("incomplete frame exposed")));
+        let row=std::vec![0x123456;800];
+        for y in 0..600{
+            let span=crate::compositor_pixels::FrameRequest{y,count:800,pixels:0x400000,bytes:3200,..request};
+            assert!(svc.frame_row(4,span,&row));
+            assert_eq!(visible[0],0xfedcba);
+        }
+        assert!(!svc.frame_commit_with(3,request,|_,_,_|panic!("foreign presentation")));
+        assert!(!svc.frame_commit_with(4,request,|_,_,_|false));
+        assert_eq!(svc.window_frame(4).unwrap().wire(),before);
+        assert_eq!(svc.compositor_sequence,0);assert_eq!(svc.frames_presented,0);
+        assert!(svc.frame_commit_with(4,request,|pixels,width,height|{
+            assert_eq!((width,height),(800,600));visible.copy_from_slice(pixels);true
+        }));
+        assert!(visible.iter().all(|p|*p==0x123456));
+        assert_eq!(svc.compositor_sequence,1);assert_eq!(svc.frames_presented,1);
+        assert!(!svc.frame_commit_with(4,request,|_,_,_|panic!("replayed frame")));
+        assert!(svc.frame_begin(4,begin,0xffffff).is_none());
+    }
+    #[cfg(feature="normal-desktop")]
+    #[test]fn g4_frame_rejects_malformed_rows_and_foreign_or_changed_snapshot(){
+        for changed in 0..3{
+            let mut svc=frame_service();let begin=frame_request(&svc,1);
+            assert!(svc.frame_begin(1,begin,0xffffff).is_none());
+            let token=svc.frame_begin(4,begin,0xffffff).unwrap();
+            let row=std::vec![0x123456;800];
+            let request=crate::compositor_pixels::FrameRequest{token,count:800,pixels:0x400000,bytes:3200,state:[0;64],..begin};
+            for bad in [crate::compositor_pixels::FrameRequest{y:1,..request},
+                crate::compositor_pixels::FrameRequest{count:799,..request},
+                crate::compositor_pixels::FrameRequest{token:token+1,..request},
+                crate::compositor_pixels::FrameRequest{epoch:begin.epoch+1,..request},
+                crate::compositor_pixels::FrameRequest{bytes:3199,..request}]{
+                assert!(!svc.frame_row(4,bad,&row));
+            }
+            assert!(!svc.frame_row(2,request,&row));
+            assert!(!svc.frame_row(4,request,&std::vec![0xff123456;800]));
+            assert!(svc.frame_row(4,request,&row));
+            match changed{
+                0=>{let token=svc.pixel_begin(2,1,[0,0,1,1]).unwrap();
+                    assert!(svc.pixels.tile(0,token,0,0,&[0xff654321],|r,g,b|Some((r as u32)<<16|(g as u32)<<8|b as u32)));assert!(svc.pixel_commit(2,1,token));},
+                1=>svc.session.was_down=!svc.session.was_down,
+                _=>svc.session.mouse_x+=1,
+            }
+            assert!(!svc.frame_row(4,crate::compositor_pixels::FrameRequest{y:1,..request},&row));
+            assert!(!svc.frame_commit_with(4,crate::compositor_pixels::FrameRequest{
+                count:0,pixels:0,bytes:0,..request},|_,_,_|panic!("changed snapshot exposed")));
+            assert_eq!(svc.compositor_sequence,0);assert_eq!(svc.frames_presented,0);
+        }
+    }
+    #[cfg(feature="normal-desktop")]
+    #[test]fn g4_new_compositor_epoch_replays_only_identical_committed_state(){
+        let mut svc=frame_service();let begin=frame_request(&svc,1);
+        let old=stage_complete_frame(&mut svc,begin);
+        assert!(svc.frame_commit_with(4,old,|_,_,_|true));
+        let grants=(svc.broker.owner(1),svc.broker.owner(2));
+        let clients=svc.frame_client_snapshots().unwrap();
+        svc.compositor_epoch+=1;svc.compositor_presented_epoch=1;svc.compositor_pending=None;
+        assert!(!svc.frame_commit_with(4,old,|_,_,_|panic!("stale epoch")));
+        let mut replay=frame_request(&svc,1);
+        let mut changed=svc.window_frame(4).unwrap();changed.launcher=!changed.launcher;
+        replay.state=changed.wire();assert!(svc.frame_begin(4,replay,0xffffff).is_none());
+        replay.state=svc.window_frame(4).unwrap().wire();
+        let fresh=stage_complete_frame(&mut svc,replay);assert!(fresh.token>old.token);
+        assert!(svc.frame_commit_with(4,fresh,|_,_,_|true));
+        assert_eq!(svc.compositor_sequence,1);assert_eq!(svc.compositor_presented_epoch,2);
+        assert!(svc.frame_begin(4,replay,0xffffff).is_none());
+        assert_eq!((svc.broker.owner(1),svc.broker.owner(2)),grants);
+        assert_eq!(svc.frame_client_snapshots(),Some(clients));
+        let next=svc.compositor_next_token;let epoch=svc.compositor_epoch;
+        svc.reset_in_place(isolated_service());assert_eq!(svc.compositor_next_token,next);
+        assert!(svc.compositor_epoch>epoch);assert!(svc.compositor_pending.is_none());
+        svc.compositor_epoch=u64::MAX;let next=svc.compositor_next_token;
+        assert!(!svc.reset_in_place(isolated_service()));
+        assert_eq!(svc.compositor_epoch,u64::MAX);assert_eq!(svc.compositor_next_token,next);
+    }
+    #[cfg(feature="normal-desktop")]
+    #[test]fn g4_bulk_snapshot_is_the_same_generation_bound_covered_client_data(){
+        let svc=frame_service();let query=crate::compositor_pixels::Request{window:1,x:0,y:0,count:0,generation:0};
+        let info=svc.pixels.snapshot(0,query).unwrap();
+        let generation=u64::from_le_bytes(info[..8].try_into().unwrap());
+        let read=crate::compositor_pixels::Request{count:256,generation,..query};
+        let bulk=svc.pixels.snapshot_sized::<{crate::compositor_pixels::BULK_REPLY_BYTES}>(0,read).unwrap();
+        assert_eq!(bulk[..16],info[..16]);
+        assert_eq!(u64::from_le_bytes(bulk[16..24].try_into().unwrap()),crate::compositor_pixels::OPAQUE|0x123456);
+        assert!(bulk[24..].iter().all(|byte|*byte==0));
+        assert!(svc.pixels.snapshot_sized::<{crate::compositor_pixels::BULK_REPLY_BYTES}>(0,
+            crate::compositor_pixels::Request{generation:generation+1,..read}).is_none());
+        assert!(svc.pixels.snapshot(0,read).is_none());
+    }
+
     #[cfg(feature="normal-desktop")]
     #[test]fn pixel_transactions_require_current_app_grants_and_do_not_survive_restart(){
         let mut service=isolated_service();
@@ -1246,6 +1575,19 @@ mod tests{
             commands:CommandStore::new(),counts:[0,0],
             focused:0,broker,frames_presented:0,launcher_visible:false,desktop_actions:0,
             retired_streams:0,pixels:app_pixels::PixelCache::new(),
+
+            #[cfg(feature="normal-desktop")]
+            compositor_epoch:1,
+            #[cfg(feature="normal-desktop")]
+            compositor_next_token:1,
+            #[cfg(feature="normal-desktop")]
+            compositor_sequence:0,
+            #[cfg(feature="normal-desktop")]
+            compositor_retired:(0,0),
+            #[cfg(feature="normal-desktop")]
+            compositor_pending:None,
+            #[cfg(feature="normal-desktop")]
+            compositor_presented_epoch:0,
             #[cfg(feature="test-r031-supervisor")]restart_count:0,
             mouse:unsafe{core::mem::zeroed()},};
         let before=svc.window_frame(4).unwrap().wire();
@@ -1274,6 +1616,19 @@ mod tests{
             focused:0,broker,frames_presented:0,launcher_visible:false,desktop_actions:0,
             #[cfg(feature="normal-desktop")]retired_streams:0,
             #[cfg(feature="normal-desktop")]pixels:app_pixels::PixelCache::new(),
+
+            #[cfg(feature="normal-desktop")]
+            compositor_epoch:1,
+            #[cfg(feature="normal-desktop")]
+            compositor_next_token:1,
+            #[cfg(feature="normal-desktop")]
+            compositor_sequence:0,
+            #[cfg(feature="normal-desktop")]
+            compositor_retired:(0,0),
+            #[cfg(feature="normal-desktop")]
+            compositor_pending:None,
+            #[cfg(feature="normal-desktop")]
+            compositor_presented_epoch:0,
             #[cfg(feature="test-r031-supervisor")]
             restart_count:0,
             mouse:unsafe{core::mem::zeroed()},
@@ -1342,6 +1697,19 @@ mod tests{
             focused:0,broker,frames_presented:0,launcher_visible:false,
             #[cfg(feature="normal-desktop")]retired_streams:0,
             #[cfg(feature="normal-desktop")]pixels:app_pixels::PixelCache::new(),
+
+            #[cfg(feature="normal-desktop")]
+            compositor_epoch:1,
+            #[cfg(feature="normal-desktop")]
+            compositor_next_token:1,
+            #[cfg(feature="normal-desktop")]
+            compositor_sequence:0,
+            #[cfg(feature="normal-desktop")]
+            compositor_retired:(0,0),
+            #[cfg(feature="normal-desktop")]
+            compositor_pending:None,
+            #[cfg(feature="normal-desktop")]
+            compositor_presented_epoch:0,
             desktop_actions:0,
             #[cfg(feature="test-r031-supervisor")]
             restart_count:0,
