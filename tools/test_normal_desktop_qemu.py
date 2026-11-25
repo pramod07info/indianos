@@ -359,16 +359,55 @@ def verify_editor_authority(output: bytes, since: int) -> None:
         raise AssertionError("unsolicited editor startup mutation was committed")
 
 
+def verify_pointer_ack(output: bytes, since: int, x: int, y: int, buttons: int) -> None:
+    if (not all(isinstance(value, int) for value in (x, y, buttons)) or
+            not 0 <= x < 1600 or not 0 <= y < 1600 or buttons not in range(4) or
+            not 0 <= since < len(output)):
+        raise AssertionError("invalid physical pointer acknowledgment boundary")
+    expected = (f"IndianOS user: desktop physical pointer x=0x{x:08x} "
+                f"y=0x{y:08x} buttons=0x{buttons:08x}").encode()
+    lines = output[since:].replace(b"\r", b"").split(b"\n")[:-1]
+    if lines.count(expected) != 1 or any(expected in line and line != expected for line in lines):
+        raise AssertionError("physical pointer lacks one fresh exact presented state")
+    before = b"\n".join(lines[:lines.index(expected)]) + b"\n"
+    verify_frame_publication(before)
+
+
+def await_pointer(session: QemuSession, x: int, y: int, buttons: int, since: int) -> None:
+    # This is the production broker's post-presentation input observation,
+    # not a timing estimate. Wait for the exact final packet before another
+    # button transition or screendump can race it.
+    expected = (f"IndianOS user: desktop physical pointer x=0x{x:08x} "
+                f"y=0x{y:08x} buttons=0x{buttons:08x}")
+    session.until(expected, 20, since=since)
+    end = bytes(session.output).find(expected.encode(), since) + len(expected)
+    session.until("\n", 20, since=end)
+    verify_pointer_ack(bytes(session.output), since, x, y, buttons)
+
+
+def move_pointer(session: QemuSession, previous: tuple[int, int], target: tuple[int, int],
+                 buttons: int = 0) -> None:
+    if previous == target:
+        return
+    since = len(session.output)
+    session.hmp(f"mouse_move {target[0] - previous[0]} {target[1] - previous[1]}")
+    await_pointer(session, target[0], target[1], buttons, since)
+
+
+def pointer_button(session: QemuSession, position: tuple[int, int], buttons: int) -> None:
+    since = len(session.output)
+    session.hmp(f"mouse_button {buttons}")
+    await_pointer(session, position[0], position[1], buttons, since)
+
+
 def physical_focus(session: QemuSession, previous: tuple[int, int], target: tuple[int, int],
                    app: str) -> tuple[int, int]:
     # HMP relative motion enters the emulated 8042 auxiliary port. The guest
     # must route it through PID1 IPC and PID4's hit testing before acknowledging.
     start = len(session.output)
-    session.hmp(f"mouse_move {target[0] - previous[0]} {target[1] - previous[1]}")
-    session.drain_serial(0.2)
-    session.hmp("mouse_button 1")
-    session.drain_serial(0.2)
-    session.hmp("mouse_button 0")
+    move_pointer(session, previous, target)
+    pointer_button(session, target, 1)
+    pointer_button(session, target, 0)
     session.until("IndianOS user: desktop physical focus: " + app, 20, since=start)
     return target
 
@@ -407,54 +446,39 @@ def pointer_window_acceptance(session: QemuSession, folder: Path, index: int,
     # Exact translated file glyphs prove window movement rather than cursor
     # repaint; their stable position after release proves capture ended.
     physical_focus(session, (width // 2, height // 2), (100, 90), "Files")
-    session.hmp("mouse_button 1")
-    session.drain_serial(0.2)
-    session.hmp("mouse_move 40 20")
-    session.drain_serial(0.3)
-    session.hmp("mouse_button 0")
-    session.drain_serial(0.2)
+    pointer_button(session, (100, 90), 1)
+    move_pointer(session, (100, 90), (140, 110), 1)
+    pointer_button(session, (140, 110), 0)
     moved = session.shot(folder / f"desktop-{index}-pointer-drag.ppm")
     verify_text_pixels(moved, "files-note", expected, (40, 20))
-    session.hmp("mouse_move 40 40")
-    session.drain_serial(0.3)
+    move_pointer(session, (140, 110), (180, 150))
     released = session.shot(folder / f"desktop-{index}-pointer-release.ppm")
     verify_text_pixels(released, "files-note", expected, (40, 20))
-    session.hmp("mouse_move -40 -40")
-    session.drain_serial(0.2)
-    session.hmp("mouse_button 1")
-    session.drain_serial(0.2)
-    session.hmp("mouse_move -40 -20")
-    session.drain_serial(0.3)
-    session.hmp("mouse_button 0")
-    session.drain_serial(0.2)
-    # Restore the initial pointer so subsequent focus tests have one known
-    # relative-coordinate origin, without bypassing the real mouse device.
-    session.hmp(f"mouse_move {width // 2 - 100} {height // 2 - 90}")
-    session.drain_serial(0.3)
+    move_pointer(session, (180, 150), (140, 110))
+    pointer_button(session, (140, 110), 1)
+    move_pointer(session, (140, 110), (100, 90), 1)
+    pointer_button(session, (100, 90), 0)
+    center = (width // 2, height // 2)
+    move_pointer(session, (100, 90), center)
     restored = session.shot(folder / f"desktop-{index}-pointer-drag-restored.ppm")
     verify_text_pixels(restored, "files-note", expected)
     acknowledged_key(session, "2", "R031.1 user switched to Terminal app")
     visible = session.shot(folder / f"desktop-{index}-before-minimize.ppm")
     terminal_height = min(max(height * 50 // 100, 240), height - 110)
     title = (width - 100, height - terminal_height - 50)
-    session.hmp(f"mouse_move {title[0] - width // 2} {title[1] - height // 2}")
-    session.drain_serial(0.2)
-    session.hmp("mouse_button 1")
-    session.drain_serial(0.2)
+    move_pointer(session, center, title)
+    pointer_button(session, title, 1)
     acknowledged_key(session, "m", "R031.1 Terminal minimized")
-    # Minimize cancels the captured title drag. A still-held motion cannot
-    # transfer that capture to Files or restore/move the hidden Terminal.
-    session.hmp("mouse_move 40 20")
-    session.drain_serial(0.3)
+    # Minimize cancels the captured title drag, even with the button held.
+    displaced = (title[0] + 40, title[1] + 20)
+    move_pointer(session, title, displaced, 1)
     minimized = session.shot(folder / f"desktop-{index}-minimized.ppm")
     verify_text_pixels(minimized, "files-note", expected)
-    session.hmp("mouse_button 0")
-    session.drain_serial(0.2)
+    pointer_button(session, displaced, 0)
     acknowledged_key(session, "r", "R031.1 Terminal restored")
     restored = session.shot(folder / f"desktop-{index}-restored.ppm")
     verify_minimize_restore(visible, minimized, restored)
-    session.hmp(f"mouse_move {width // 2 - title[0] - 40} {height // 2 - title[1] - 20}")
-    session.drain_serial(0.3)
+    move_pointer(session, displaced, center)
 
 
 def pointer_focus_acceptance(session: QemuSession, folder: Path, index: int,
@@ -1401,7 +1425,9 @@ class GuestDebugger:
 
     This is host fault injection, never a production kernel test hook. The
     caller verifies the actual current process and privilege level before
-    changing a register. No code, disk, page table or kernel memory is written.
+    changing a register. Replacement-negative cases explicitly mutate bounded
+    future ELF input; the staging-privacy case changes one PID4-private pixel.
+    No disk or page table is written and production code remains unchanged.
     """
     def __init__(self, path: Path):
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -1877,6 +1903,21 @@ def unready_service_boot(qemu: str, iso: Path, ovmf: Path, disk: Path,
     print(f"Normal desktop {name}: bounded actual failure, complete retirement and unchanged recovery PASS")
 
 
+def bounded_debugger_read(debugger: GuestDebugger, address: int, count: int) -> bytes:
+    if address <= 0 or not 1 <= count <= 128:
+        raise AssertionError("debugger receipt exceeds bounded source inventory")
+    return b"".join(debugger.memory(address + offset, min(64, count - offset))
+                    for offset in range(0, count, 64))
+
+
+def private_stage_pixel(value: int) -> int:
+    # Clearing a set color bit yields a different pixel that remains within
+    # the same validated native RGB mask, regardless of channel ordering.
+    if not 0 < value <= 0xffffffff:
+        raise AssertionError("private row fixture lacks a nonblack native pixel")
+    return value & (value - 1)
+
+
 def pending_frame_record(packet: bytes, geometry: tuple[int, int]) -> tuple[int, int, int, int]:
     if len(packet) != 128 or packet[:4] != b"IFR1":
         raise AssertionError("stopped compositor is not uploading a frame row")
@@ -2011,9 +2052,7 @@ def transient_service_boot(qemu: str, iso: Path, ovmf: Path, disk: Path,
         acknowledged_key(session, "tab")
         width, height = initial[:2]
         physical_focus(session, (width // 2, height // 2), (100, 90), "Files")
-        held_at = len(session.output)
-        session.hmp("mouse_button 1")
-        session.until(FRAME_PUBLISHED.decode(), 20, since=held_at)
+        pointer_button(session, (100, 90), 1)
         before_fault = settled_frame(session, folder / (name + "-before-fault.ppm"))
         verify_text_pixels(before_fault, "files-lock", "READ LOCKED")
         fault_media = disk.read_bytes()
@@ -2029,6 +2068,7 @@ def transient_service_boot(qemu: str, iso: Path, ovmf: Path, disk: Path,
             raise AssertionError("QEMU refused temporary compositor execution breakpoint")
         # Input still enters through the emulated physical keyboard. Its
         # compositor reply is interrupted by a real page fault, not faked IPC.
+        staged_identity = None
         for attempt in range(24):
             debugger.send("c")
             if attempt == 0:
@@ -2049,10 +2089,28 @@ def transient_service_boot(qemu: str, iso: Path, ovmf: Path, disk: Path,
             if pid == 4 and cs & 3 == 3 and rip == target:
                 if debugger.memory(target, 8) != expected:
                     raise AssertionError("current compositor code differs from source ISO")
-                packet = debugger.memory(debugger.register(5), 128)
+                packet = bounded_debugger_read(debugger, debugger.register(5), 128)
                 y, token, epoch, sequence = pending_frame_record(packet, initial[:2])
                 evidence.append(f"pending y={y} token={token:#x} epoch={epoch:#x} sequence={sequence:#x}")
+                if y == 0:
+                    pointer = struct.unpack_from("<Q", packet, 32)[0]
+                    owner_root = stopped_root(session)
+                    mapping = physical_mapping(session, owner_root, pointer)
+                    if mapping is None or mapping[1:] != (True, True, True):
+                        raise AssertionError("staging fixture is not a PID4 user RW/NX row")
+                    for _, root, _ in client_incarnation_records(bounded_debugger_read(debugger, clients_ledger, 72)):
+                        peer = physical_mapping(session, root, pointer)
+                        if peer is not None and peer[0] == mapping[0]:
+                            raise AssertionError("staging fixture aliases another client's page")
+                    pixel = int.from_bytes(debugger.memory(pointer, 4), "little")
+                    fixture = struct.pack("<I", private_stage_pixel(pixel))
+                    if debugger.command(f"M{pointer:x},4:{fixture.hex()}") != "OK" or debugger.memory(pointer, 4) != fixture:
+                        raise AssertionError("debugger could not alter the isolated private row fixture")
+                    staged_identity = token, epoch, sequence
+                    evidence.append(f"private row0 native pixel {pixel:#x}->{int.from_bytes(fixture, 'little'):#x}")
                 if y == 1:
+                    if staged_identity != (token, epoch, sequence):
+                        raise AssertionError("row1 does not follow the altered private row0 transaction")
                     break
             # A virtual breakpoint may also match another process's code.
             # Advance that instruction unchanged, never inject into its context.
@@ -2067,7 +2125,7 @@ def transient_service_boot(qemu: str, iso: Path, ovmf: Path, disk: Path,
         staged = session.shot(folder / (name + "-private-staging.ppm"))
         if staged != before_fault:
             raise AssertionError("incomplete PID4 frame changed the visible framebuffer")
-        clients_before = debugger.memory(clients_ledger, 72)
+        clients_before = bounded_debugger_read(debugger, clients_ledger, 72)
         roles_before = debugger.memory(roles_ledger, 32)
         client_incarnation_records(clients_before)
         if failure is not None:
@@ -2130,7 +2188,7 @@ def transient_service_boot(qemu: str, iso: Path, ovmf: Path, disk: Path,
             raise AssertionError("replacement receipt inspection did not stop the guest")
         debugger.command("qSupported:xmlRegisters=i386")
         debugger.command("qXfer:features:read:target.xml:0,fff")
-        verify_preserved_clients(clients_before, debugger.memory(clients_ledger, 72),
+        verify_preserved_clients(clients_before, bounded_debugger_read(debugger, clients_ledger, 72),
                                  roles_before, debugger.memory(roles_ledger, 32))
         if debugger.memory(scratch_ledger, 64) != struct.pack("<8Q", *(word for row in scratch for word in row)):
             raise AssertionError("PID4-only restart recreated a client canvas")
@@ -2146,18 +2204,12 @@ def transient_service_boot(qemu: str, iso: Path, ovmf: Path, disk: Path,
         # The titlebar was captured with the button held when PID4 faulted.
         # Two held motions distinguish latch quarantine from a spurious new
         # capture at the first motion. Only a release can rearm capture.
-        for movement in range(2):
-            moved_at = len(session.output)
-            session.hmp("mouse_move 20 5")
-            session.until(FRAME_PUBLISHED.decode(), 20, since=moved_at)
+        move_pointer(session, (100, 90), (120, 95), 1)
+        move_pointer(session, (120, 95), (140, 100), 1)
         verify_text_pixels(session.shot(folder / (name + "-capture-cancelled.ppm")),
                            "files-note", "HELLO INDIANOS")
-        released_at = len(session.output)
-        session.hmp("mouse_button 0")
-        session.until(FRAME_PUBLISHED.decode(), 20, since=released_at)
-        moved_at = len(session.output)
-        session.hmp(f"mouse_move {width // 2 - 140} {height // 2 - 100}")
-        session.until(FRAME_PUBLISHED.decode(), 20, since=moved_at)
+        pointer_button(session, (140, 100), 0)
+        move_pointer(session, (140, 100), (width // 2, height // 2))
         # Continue normal physical launcher control after capture quarantine.
         acknowledged_key(session, "a", "R031.1 application launcher OPEN")
         acknowledged_key(session, "a", "R031.1 application launcher CLOSED")

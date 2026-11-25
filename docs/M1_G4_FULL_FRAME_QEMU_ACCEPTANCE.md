@@ -16,6 +16,11 @@ actual screendump dimensions and retain `desktop-N-startup-cost.json`.
 The JSON separates host wall time from QEMU launch to observed READY from
 guest frame cycles; the first frame is not treated as the entire boot cost.
 
+Physical pointer helpers wait for the production broker's exact fresh
+post-presentation x/y/button record before the next movement, press, release
+or screenshot. They retain the original glyph/drag expectations and 20-second
+deadlines. Fixed sleeps cannot stand in for completion of a rendered frame.
+
 Existing independent raster/glyph, focus, drag, minimize/restore, partition,
 cold-reboot and shutdown oracles remain active. A publication marker cannot
 replace actual framebuffer comparisons. The kernel marker must originate
@@ -28,8 +33,12 @@ commits `revived=saved` through Terminal before fault injection. It captures
 a Files titlebar with the physical mouse button held. An external debugger
 stops the production `indianos_desktop_frame_row` entry only in verified
 ring-3 PID4, at row 1 of a bounded frame with a nonzero token, owner epoch and
-request sequence. The first row has already been submitted. The screendump
-must still equal the pre-frame visible image, proving staging stayed private.
+request sequence. The first row has already been submitted. Before upload, the debugger changes
+one nonblack pixel only in PID4's verified private user RW/NX row, clearing a
+set native RGB bit. Peer roots must not alias that physical page. This produces
+a valid pixel distinct from the visible frame without changing production
+code, storage or page tables. The screendump must still equal the pre-frame
+visible image, proving the changed staged pixel stayed private.
 The debugger checks source-ISO executable bytes, page ownership and guards
 before injecting a real page fault at an unmapped address.
 
@@ -60,8 +69,8 @@ fault. Existing startup-fault and whole-session retry oracles are unchanged.
 
 ## Evidence and limitations
 
-The edited harness has 69 focused host tests and the full repository Python
-suite has 216 passing tests. They check the oracles and fixture boundaries,
+The edited harness has 72 focused host tests and the full repository Python
+suite has 219 passing tests. They check the oracles and fixture boundaries,
 not guest success. Live QEMU, freestanding, kernel, security, durable-VFS and
 exact-head CI remain coordinator integration responsibilities. Retain the
 candidate SHA, job URL, serial/debugger logs, images, cost JSON and artifact

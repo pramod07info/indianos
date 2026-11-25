@@ -874,6 +874,66 @@ class NormalDesktopControls(unittest.TestCase):
         with self.assertRaises(AssertionError):
             harness.verify_transient_restart(trace[:since] + harness.STOPPED.encode() + trace[since:], since)
 
+    def test_pointer_ack_requires_fresh_complete_target_state_after_presented_frame(self):
+        frame = b"\n".join((harness.FRAME_PRESENTED, self.frame_cost(), harness.FRAME_PUBLISHED)) + b"\n"
+        marker = b"IndianOS user: desktop physical pointer x=0x00000064 y=0x0000005a buttons=0x00000001"
+        good = frame + marker + b"\n"
+        harness.verify_pointer_ack(good, 0, 100, 90, 1)
+        for bad in (good[:-1], marker + b"\n", good + marker + b"\n",
+                    good.replace(marker, b"prefix " + marker),
+                    good.replace(b"x=0x00000064", b"x=0x00000065"),
+                    good.replace(b"y=0x0000005a", b"y=0x0000005b"),
+                    good.replace(b"buttons=0x00000001", b"buttons=0x00000000"),
+                    marker + b"\n" + frame):
+            with self.assertRaises(AssertionError):
+                harness.verify_pointer_ack(bad, 0, 100, 90, 1)
+        for since in (1, len(frame), len(good), -1):
+            with self.assertRaises(AssertionError):
+                harness.verify_pointer_ack(good, since, 100, 90, 1)
+
+    def test_physical_pointer_helpers_await_move_press_and_release_without_fixed_delays(self):
+        frame = b"\n".join((harness.FRAME_PRESENTED, self.frame_cost(), harness.FRAME_PUBLISHED)) + b"\n"
+        class Session:
+            def __init__(self):
+                self.output = bytearray(); self.position = [200, 200]; self.buttons = 0; self.commands = []
+            def hmp(self, command):
+                self.commands.append(command); fields = command.split()
+                if fields[0] == "mouse_move":
+                    self.position[0] += int(fields[1]); self.position[1] += int(fields[2])
+                else:
+                    self.buttons = int(fields[1])
+                x, y = self.position
+                self.output.extend(frame + (f"IndianOS user: desktop physical pointer x=0x{x:08x} "
+                                           f"y=0x{y:08x} buttons=0x{self.buttons:08x}\n").encode())
+                if self.buttons == 1:
+                    self.output.extend(b"IndianOS user: desktop physical focus: Files\n")
+            def until(self, marker, timeout, since=0):
+                if marker.encode() not in self.output[since:]:
+                    raise AssertionError("helper waited for a state that was never presented")
+        session = Session()
+        self.assertEqual(harness.physical_focus(session, (200, 200), (100, 90), "Files"), (100, 90))
+        self.assertEqual(session.commands, ["mouse_move -100 -110", "mouse_button 1", "mouse_button 0"])
+        self.assertEqual(session.buttons, 0)
+
+    def test_debugger_large_receipts_use_bounded_reads_and_private_pixel_fixture_changes_color(self):
+        class Debugger:
+            def __init__(self): self.calls = []
+            def memory(self, address, count):
+                self.calls.append((address, count))
+                if count > 64: raise AssertionError("unbounded debugger read")
+                return bytes(count)
+        debugger = Debugger()
+        self.assertEqual(harness.bounded_debugger_read(debugger, 0x400000, 72), bytes(72))
+        self.assertEqual(debugger.calls, [(0x400000, 64), (0x400040, 8)])
+        self.assertEqual(harness.bounded_debugger_read(debugger, 0x400000, 128), bytes(128))
+        for count in (0, 129, -1):
+            with self.assertRaises(AssertionError): harness.bounded_debugger_read(debugger, 0x400000, count)
+        for value in (1, 0x0c142b, 0xff000000, 0xffffffff):
+            replacement = harness.private_stage_pixel(value)
+            self.assertNotEqual(replacement, value); self.assertEqual(replacement & ~value, 0)
+        for value in (0, -1, 1 << 32):
+            with self.assertRaises(AssertionError): harness.private_stage_pixel(value)
+
     def test_full_frame_publication_requires_fresh_ordered_measured_native_work(self):
         good = b"\n".join((harness.FRAME_PRESENTED, self.frame_cost(), harness.FRAME_PUBLISHED)) + b"\n"
         self.assertEqual(harness.verify_frame_publication(good, geometry=(640, 480)),
