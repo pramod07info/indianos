@@ -48,6 +48,8 @@ struct Task{
  pixel_scratch:[u64;3],
  #[cfg(feature="normal-desktop")]
  pixel_guard_frames:[u64;2],
+ #[cfg(feature="normal-desktop")]
+ pixel_canvas:Option<(u32,u64,crate::pixel_protocol::CanvasLayout)>,
  #[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
  file_generation:u64,
  #[cfg(any(feature="test-ipc",feature="normal-desktop"))]
@@ -1406,7 +1408,7 @@ fn pixel_scratch_valid(task:&Task)->bool{
  }
  let [lower,payload,upper]=task.pixel_scratch;
  if !task.image.ready||task.root.root==0||lower==0||lower&(PAGE-1)!=0||
-    lower.checked_add(PAGE)!=Some(payload)||payload.checked_add(PAGE)!=Some(upper)||
+    lower.checked_add(PAGE)!=Some(payload)||upper<=payload||upper%PAGE!=0||upper-payload>crate::pixel_protocol::MAX_CANVAS_BYTES||
     task.pixel_guard_frames.contains(&0)||task.pixel_guard_frames[0]==task.pixel_guard_frames[1]{return false;}
  if pages.iter().filter(|p|p.virtual_address==0).count()!=2{return false;}
  for frame in task.pixel_guard_frames{
@@ -1427,19 +1429,30 @@ fn pixel_scratch_valid(task:&Task)->bool{
 }
 #[cfg(feature="normal-desktop")]
 unsafe fn desktop_pixel_request(descriptor:u64)->u64{
- use crate::pixel_protocol::{Request,REGISTER,BEGIN,TILE,COMMIT,ABORT,window_for_pid};
+ use crate::pixel_protocol::{Request,REGISTER,BEGIN,TILE,COMMIT,ABORT,REGISTER_CANVAS,PUBLISH_CANVAS,window_for_pid};
  let Some(pid)=authenticated_gui_pid()else{return BAD;};
- let Some(window)=window_for_pid(pid)else{return BAD;};
  let raw=active_task();
  let Some(task)=(unsafe{raw.as_mut()})else{return BAD;};
  if !task.authority_live{return BAD;}
  let mut wire=[0u8;64];
  if !unsafe{indianos_user_copy_readonly(&task.image,descriptor,wire.as_mut_ptr().cast(),wire.len())}{return BAD;}
  let Some(request)=Request::parse(&wire)else{return BAD;};
- if request.window!=window||
-    (unsafe{DESKTOP_LIFECYCLE}.shutdown_armed&&request.operation!=ABORT){return BAD;}
- if request.operation==REGISTER{
+ let window = request.window;
+ let canvas_operation = matches!(request.operation, REGISTER_CANVAS | PUBLISH_CANVAS);
+ let grant_epoch = if canvas_operation {
+  let Some(epoch) = crate::gui::pixel_grant_epoch(pid, window) else { return BAD; };
+  epoch
+ } else { 0 };
+ if (unsafe{DESKTOP_LIFECYCLE}.shutdown_armed&&request.operation!=ABORT) ||
+    (!canvas_operation && window_for_pid(pid) != Some(window)) {
+  return BAD;
+ }
+ if matches!(request.operation, REGISTER | REGISTER_CANVAS) {
   if task.pixel_scratch!=[0;3]||task.pixel_guard_frames!=[0;2]{return BAD;}
+  let canvas = if request.operation == REGISTER_CANVAS {
+   let Some(layout) = request.canvas_layout() else { return BAD; };
+   Some((window, grant_epoch, layout))
+  } else { None };
   let result=unsafe{crate::user_image::install_pixel_scratch_guards(
       &mut task.image,request.lower,request.address,request.upper)};
   // Active cloned CR3 borrows these lower page-table children. Detached VMM
@@ -1460,36 +1473,67 @@ unsafe fn desktop_pixel_request(descriptor:u64)->u64{
   };
   task.pixel_scratch=[request.lower,request.address,request.upper];
   task.pixel_guard_frames=frames;
+  task.pixel_canvas=canvas;
   if !pixel_scratch_valid(task){unsafe{x86_64_user_exit_to_kernel(0x180)}}
-  unsafe{DESKTOP_APP_PIXEL_GUARDS[(pid-2) as usize]=
+  unsafe{DESKTOP_APP_PIXEL_GUARDS[(window-1) as usize]=
       (task.root.root,request.lower,request.address,request.upper);}
   pid_log(pid,b"PIXEL_GUARDS_READY\0");return 0;
  }
  if task.pixel_scratch==[0;3]||!pixel_scratch_valid(task){return BAD;}
+ if request.operation == PUBLISH_CANVAS {
+  let Some((registered_window, registered_epoch, layout)) = task.pixel_canvas else { return BAD; };
+  if registered_window != window || registered_epoch != grant_epoch ||
+     !layout.contains(request.x, request.y, request.width, request.height) {
+   return BAD;
+  }
+  let rect = [request.x, request.y, request.width, request.height];
+  let Some(token) = crate::gui::pixel_begin(pid, window, rect) else { return BAD; };
+  // The normal desktop runs on one BSP with IRQs masked during this copy.
+  // The caller cannot change the canvas between copying and publication.
+  let copied = (request.y .. request.y + request.height).all(|y| {
+   (request.x .. request.x + request.width)
+    .step_by(crate::pixel_protocol::TILE_PIXELS as usize)
+    .all(|x| {
+     let width = (request.x + request.width - x).min(crate::pixel_protocol::TILE_PIXELS as u16);
+     let address = task.pixel_scratch[1] + layout.pixel_offset(x, y);
+     copy_pixel_tile(task, pid, window, token, x, y, address, width)
+    })
+  });
+  if copied && crate::gui::pixel_commit(pid, window, token) { return 0; }
+  let _ = crate::gui::pixel_abort(pid, window, token);
+  return BAD;
+ }
+ if task.pixel_canvas.is_some() { return BAD; }
  match request.operation{
   BEGIN=>crate::gui::pixel_begin(pid,window,[request.x,request.y,request.width,request.height]).unwrap_or(BAD),
   TILE=>{
    let payload=task.pixel_scratch[1];
    if request.address<payload||request.address.checked_add(request.bytes)
        .is_none_or(|end|end>payload+PAGE){return BAD;}
-   let mut bytes=[0u8;1024];let length=request.bytes as usize;
-   if length==0||length>bytes.len(){return BAD;}
-   for offset in (0..length).step_by(256){
-    let count=(length-offset).min(256);
-    if !unsafe{indianos_user_copy_readonly(&task.image,request.address+offset as u64,
-        bytes.as_mut_ptr().add(offset).cast(),count)}{return BAD;}
-   }
-   let mut pixels=[0u32;256];
-   for (pixel,bytes) in pixels.iter_mut().zip(bytes[..length].chunks_exact(4)){
-    *pixel=u32::from_le_bytes(bytes.try_into().unwrap());
-   }
-   if crate::gui::pixel_tile(pid,window,request.token,request.x,request.y,
-       &pixels[..request.width as usize]){0}else{BAD}
+   if copy_pixel_tile(task, pid, window, request.token, request.x, request.y,
+                      request.address, request.width) { 0 } else { BAD }
   },
   COMMIT=>if crate::gui::pixel_commit(pid,window,request.token){0}else{BAD},
   ABORT=>if crate::gui::pixel_abort(pid,window,request.token){0}else{BAD},
   _=>BAD,
  }
+}
+#[cfg(feature="normal-desktop")]
+fn copy_pixel_tile(task: &Task, pid: u32, window: u32, token: u64,
+                   x: u16, y: u16, address: u64, width: u16) -> bool {
+ let mut bytes = [0u8;1024];
+ let length = usize::from(width) * 4;
+ for (index, chunk) in bytes[..length].chunks_mut(256).enumerate() {
+  if !unsafe { indianos_user_copy_readonly(&task.image, address + (index * 256) as u64,
+                                           chunk.as_mut_ptr().cast(), chunk.len()) } {
+   return false;
+  }
+ }
+ let mut pixels = [0u32;256];
+ for (pixel, chunk) in pixels.iter_mut().zip(bytes[..length].chunks_exact(4)) {
+  *pixel = u32::from_le_bytes(chunk.try_into().unwrap());
+ }
+ crate::gui::pixel_tile(pid, window, token, x, y, &pixels[..usize::from(width)])
 }
 unsafe extern "C" fn allocate(p:*mut u64,_:*mut c_void)->bool{unsafe{pmm_allocate_frame(p)}}
 unsafe extern "C" fn release(p:u64,_:*mut c_void)->bool{unsafe{pmm_release_frame(p)}}
@@ -2400,7 +2444,7 @@ fn discard(t:*mut Task,b:&CloneBackend,terminal:bool)->bool{
  if task.root.root!=0&&!unsafe{paging_clone_release(b,&mut task.root)}{return false;}
  if task.image.tables.initialized&&!unsafe{indianos_user_image_destroy(&mut task.image)}{return false;}
  #[cfg(feature="normal-desktop")]
- {task.pixel_scratch=[0;3];task.pixel_guard_frames=[0;2];}
+ {task.pixel_scratch=[0;3];task.pixel_guard_frames=[0;2];task.pixel_canvas=None;}
  if terminal{
   if task.pcb.is_null()||!unsafe{indianos_process_reap(task.pcb)}{return false;}
   pid_log(unsafe{(*task.pcb).pid},b"REAPED\0");

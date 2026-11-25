@@ -337,7 +337,7 @@ pub(crate) unsafe fn indianos_user_copy_writable(
 #[derive(Clone,Copy,Debug,Eq,PartialEq)]
 pub(crate) enum ScratchGuardError{Invalid,Partial}
 
-/// Permanently reserve the two guards around one app-owned upload page.
+/// Permanently reserve the two guards around app-owned pixel storage.
 /// Data-frame ownership stays in UserImage until ordinary task destruction;
 /// zero VA is the existing "unmapped, awaiting release" ownership state.
 /// The caller must invalidate the active CR3 translations after this call.
@@ -350,8 +350,9 @@ pub(crate) unsafe fn install_pixel_scratch_guards(image:&mut UserImage,
     if !image.ready||image.page_count as usize>MAX_IMAGE_PAGES||
        image.plan.segment_count as usize>MAX_SEGMENTS||lower==0||
        lower&(size-1)!=0||lower.checked_add(size)!=Some(payload)||
-       payload.checked_add(size)!=Some(upper)||lower>>39!=upper>>39||
-       !crate::syscall::user_range(&image.plan,lower,3*size,true){
+       upper<=payload||upper%size!=0||
+       upper-payload>crate::pixel_protocol::MAX_CANVAS_BYTES||lower>>39!=upper>>39||
+       !crate::syscall::user_range(&image.plan,lower,end-lower,true){
         return Err(Invalid);
     }
     // Restrict this API to complete, real writable/NX ELF storage. It cannot
@@ -363,8 +364,8 @@ pub(crate) unsafe fn install_pixel_scratch_guards(image:&mut UserImage,
                 .is_some_and(|limit|end<=limit)){
         return Err(Invalid);
     }
-    let mut indices=[0usize;3];let mut physical=[0u64;3];
-    for (slot,va) in [lower,payload,upper].into_iter().enumerate(){
+    let mut guards=[(0usize,0u64);2];
+    for va in (lower..end).step_by(PAGE) {
         let mut found=None;
         for (index,page) in image.pages[..image.page_count as usize].iter().enumerate(){
             if page.virtual_address==va{
@@ -380,21 +381,21 @@ pub(crate) unsafe fn install_pixel_scratch_guards(image:&mut UserImage,
            mapping.physical==0||mapping.physical!=image.pages[index].physical_address{
             return Err(Invalid);
         }
-        indices[slot]=index;physical[slot]=mapping.physical;
-    }
-    if physical[0]==physical[1]||physical[0]==physical[2]||physical[1]==physical[2]{return Err(Invalid);}
-    for frame in physical{
         if image.pages[..image.page_count as usize].iter()
-            .filter(|page|page.physical_address==frame).count()!=1{return Err(Invalid);}
+            .filter(|page|page.physical_address==mapping.physical).count()!=1 {
+            return Err(Invalid);
+        }
+        if va == lower { guards[0] = (index, mapping.physical); }
+        if va == upper { guards[1] = (index, mapping.physical); }
     }
-    for (position,slot) in [0usize,2].into_iter().enumerate(){
-        let index=indices[slot];let va=image.pages[index].virtual_address;
+    for (position, &(index, _)) in guards.iter().enumerate() {
+        let va=image.pages[index].virtual_address;
         if !unsafe{vmm_unmap_page(&mut image.tables,va)}{
             return Err(if position==0{Invalid}else{Partial});
         }
         image.pages[index].virtual_address=0;
     }
-    Ok([physical[0],physical[2]])
+    Ok([guards[0].1,guards[1].1])
 }
 
 #[cfg(test)]
@@ -485,6 +486,34 @@ mod tests {
         assert!(unsafe{indianos_user_image_destroy(&mut img)});
         assert!(ram.used.iter().all(|&used|!used));
         assert!(ram.released.iter().all(|&count|count<=1));
+    }
+    #[cfg(feature="normal-desktop")]
+    #[test]
+    fn multi_page_canvas_requires_owned_middle_pages_before_revoking_guards() {
+        let mut ram = Ram::new();
+        let mut image = pixel_staged(&mut ram);
+        let perms = Permissions { writable:true, executable:false, user:true };
+        assert!(unsafe { stage(&mut image, 0x403000, perms) }.is_some());
+        image.plan.segments[0].memory_size += PAGE as u64;
+        image.plan.segments[0].page_end += PAGE as u64;
+
+        let middle_frame = image.pages[2].physical_address;
+        image.pages[2].physical_address = image.pages[1].physical_address;
+        let register = |img: &mut UserImage| unsafe {
+            install_pixel_scratch_guards(img, 0x400000, 0x401000, 0x403000)
+        };
+        assert_eq!(register(&mut image), Err(ScratchGuardError::Invalid));
+        assert!(image.pages[..4].iter().all(|page| page.virtual_address != 0));
+        image.pages[2].physical_address = middle_frame;
+        assert!(register(&mut image).is_ok());
+        let mut pixels = [0xa5u8; 8];
+        assert!(unsafe {
+            indianos_user_copy_readonly(&image, 0x401ffc, pixels.as_mut_ptr().cast(), pixels.len())
+        });
+        assert_eq!(pixels, [0; 8]);
+        assert!(unsafe { indianos_user_image_destroy(&mut image) });
+        assert!(ram.used.iter().all(|&used| !used));
+        assert!(ram.released.iter().all(|&count| count <= 1));
     }
     #[cfg(feature="normal-desktop")]
     #[test]fn pixel_guard_admission_rejects_unowned_executable_and_outside_image_without_mutation(){

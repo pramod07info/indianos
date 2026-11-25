@@ -5,6 +5,11 @@ pub const BEGIN:u32=1;
 pub const TILE:u32=2;
 pub const COMMIT:u32=3;
 pub const ABORT:u32=4;
+pub const REGISTER_CANVAS: u32 = 5;
+pub const PUBLISH_CANVAS: u32 = 6;
+pub const MAX_CANVAS_BYTES: u64 = 80 * 4096;
+pub const NATIVE_CANVAS_WIDTH: usize = 320;
+pub const NATIVE_CANVAS_HEIGHT: usize = 240;
 pub const MAX_WIDTH:u32=768;
 pub const MAX_HEIGHT:u32=768;
 pub const TILE_PIXELS:u32=256;
@@ -38,6 +43,15 @@ impl Request{
     self.lower!=0&&self.lower.checked_add(SCRATCH_BYTES)==Some(self.address)&&
     self.bytes==SCRATCH_BYTES&&self.address.checked_add(SCRATCH_BYTES)==Some(self.upper)&&
     self.upper.checked_add(SCRATCH_BYTES).is_some(),
+   REGISTER_CANVAS => self.x == 0 && self.y == 0 && self.lower != 0 &&
+    self.address % SCRATCH_BYTES == 0 &&
+    self.lower.checked_add(SCRATCH_BYTES) == Some(self.address) &&
+    self.canvas_layout().is_some() &&
+    self.address.checked_add(self.bytes) == Some(self.upper) &&
+    self.upper.checked_add(SCRATCH_BYTES).is_some(),
+   PUBLISH_CANVAS => empty_data && self.token == 0 && self.width != 0 && self.height != 0 &&
+    self.x as u32 + self.width as u32 <= MAX_WIDTH &&
+    self.y as u32 + self.height as u32 <= MAX_HEIGHT,
    BEGIN=>empty_data&&self.token==0&&self.width!=0&&self.height!=0&&
     self.x as u32+self.width as u32<=MAX_WIDTH&&
     self.y as u32+self.height as u32<=MAX_HEIGHT,
@@ -48,6 +62,21 @@ impl Request{
    COMMIT|ABORT=>empty_rect&&empty_data&&self.token!=0,
    _=>false,
   }
+ }
+ /// Canvas registration uses the token field for stride in bytes.
+ pub fn canvas_layout(self) -> Option<CanvasLayout> {
+  let stride = self.token;
+  if self.width == 0 || self.height == 0 || u32::from(self.width) > MAX_WIDTH ||
+     u32::from(self.height) > MAX_HEIGHT || stride % 4 != 0 ||
+     stride < u64::from(self.width) * 4 {
+   return None;
+  }
+  let used = stride.checked_mul(u64::from(self.height))?;
+  let rounded = used.checked_add(SCRATCH_BYTES - 1)? / SCRATCH_BYTES * SCRATCH_BYTES;
+  if rounded != self.bytes || rounded > MAX_CANVAS_BYTES {
+   return None;
+  }
+  Some(CanvasLayout { width: self.width, height: self.height, stride })
  }
  pub fn wire(self)->[u8;64]{
   let mut bytes=[0u8;64];bytes[..4].copy_from_slice(b"IPX1");
@@ -63,6 +92,24 @@ impl Request{
   bytes
  }
 }
+#[derive(Clone, Copy)]
+pub struct CanvasLayout {
+ pub width: u16,
+ pub height: u16,
+ pub stride: u64,
+}
+impl CanvasLayout {
+ pub fn contains(self, x: u16, y: u16, width: u16, height: u16) -> bool {
+  width != 0 && height != 0 &&
+   u32::from(x) + u32::from(width) <= u32::from(self.width) &&
+   u32::from(y) + u32::from(height) <= u32::from(self.height)
+ }
+
+ pub fn pixel_offset(self, x: u16, y: u16) -> u64 {
+  u64::from(y) * self.stride + u64::from(x) * 4
+ }
+}
+
 pub const fn window_for_pid(pid:u32)->Option<u32>{match pid{2=>Some(1),3=>Some(2),_=>None}}
 #[cfg(test)]mod tests{
  use super::*;
@@ -84,6 +131,34 @@ pub const fn window_for_pid(pid:u32)->Option<u32>{match pid{2=>Some(1),3=>Some(2
   begin.x=1;assert!(Request::parse(&begin.wire()).is_none());
   register.upper+=4096;assert!(Request::parse(&register.wire()).is_none());
   commit.bytes=4;assert!(Request::parse(&commit.wire()).is_none());
+ }
+ #[test]
+ fn canvas_layout_checks_stride_extent_and_publication_bounds() {
+  let mut register = Request::new(REGISTER_CANVAS, 1);
+  register.width = 300;
+  register.height = 240;
+  register.token = 1280;
+  register.lower = 0x401000;
+  register.address = register.lower + SCRATCH_BYTES;
+  register.bytes = 75 * SCRATCH_BYTES;
+  register.upper = register.address + register.bytes;
+  let layout = Request::parse(&register.wire()).unwrap().canvas_layout().unwrap();
+  assert_eq!(layout.pixel_offset(290, 3), 5000);
+  assert!(layout.contains(299, 239, 1, 1));
+  assert!(!layout.contains(299, 239, 2, 1));
+  for stride in [1196, 1201, u64::MAX - 3] {
+   let mut bad = register;
+   bad.token = stride;
+   assert!(Request::parse(&bad.wire()).is_none());
+  }
+  register.bytes -= SCRATCH_BYTES;
+  assert!(Request::parse(&register.wire()).is_none());
+  let mut publish = Request::new(PUBLISH_CANVAS, 1);
+  publish.width = 1;
+  publish.height = 1;
+  assert_eq!(Request::parse(&publish.wire()), Some(publish));
+  publish.token = 1;
+  assert!(Request::parse(&publish.wire()).is_none());
  }
  #[test]fn pid_mapping_has_no_broker_or_compositor_surface(){
   for pid in [0,1,4,u32::MAX]{assert_eq!(window_for_pid(pid),None);}

@@ -41,3 +41,26 @@ fn command(window:u32,operation:u32,x:u16,y:u16,w:u16,h:u16,color:u32,text:&[u8]
  assert!(!first.row(768,0,&mut [0]));assert!(!first.row(0,768,&mut [0]));
  assert!(!first.row(0,0,&mut [0;257]));assert!(!first.row(0,0,&mut []));
 }
+
+#[test]
+fn canvas_raster_crosses_pages_preserving_padding_and_undamaged_pixels() {
+ let mut state = State::new(1);
+ let dirty = state.prepare(&command(1,FILL,15,2,270,4,0x123456,b"")).unwrap();
+ let stride = 320;
+ let mut canvas = vec![0xdecafbad; stride * 8];
+ assert!(state.raster_canvas(dirty, &mut canvas, stride));
+ for (y, row) in canvas.chunks_exact(stride).enumerate() {
+  for (x, &pixel) in row.iter().enumerate() {
+   let expected = if (2..6).contains(&y) && (15..285).contains(&x) {
+    0xff12_3456
+   } else {
+    0xdecafbad
+   };
+   assert_eq!(pixel, expected, "at ({x}, {y})");
+  }
+ }
+ let before = canvas.clone();
+ assert!(!state.raster_canvas(dirty, &mut canvas, 284));
+ assert!(!state.raster_canvas(dirty, &mut canvas[..stride * 5], stride));
+ assert_eq!(canvas, before);
+}

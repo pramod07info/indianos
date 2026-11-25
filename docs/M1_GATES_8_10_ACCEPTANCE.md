@@ -156,3 +156,23 @@ changes alone mark a complete gate 100% or change the accepted milestone count.
 ## G3 independent sign-off packet
 
 Use the shared [G1–G3 independent source review and explicit sign-off protocol](M1_GATES_6_7_ACCEPTANCE.md#g1g3-independent-source-review-and-explicit-sign-off--24-nov-2026) for the pinned PR #806 production baseline, actual QEMU evidence, mandatory source review and explicit gate decision. This reference does not accept G3 or any later gate.
+
+
+## G4 mapped app canvases — M1-P9-002
+
+Normal Files and Terminal register private 320×240 canvases backed by
+75 writable, non-executable ELF pages each. Registration proves page ownership
+and withdraws the two surrounding guard mappings. The canvas is bound to the
+task and current broker grant epoch. A bounded damage request copies canonical
+pixels into the existing staging plane and commits once all tiles validate.
+An abort preserves the last published frame, including when rejection occurs
+after some tiles have been staged.
+
+The normal desktop oracle checks every registered canvas page in the owning
+CR3 and probes the corresponding addresses in the peer app and PID4 roots.
+Startup exercises malformed stride, missing or duplicate registration,
+foreign grants, out-of-bounds damage and failed publication after a valid row.
+Recovery must show fresh registration and commits from both reloaded clients.
+Record exact candidate and merged production SHA, normal desktop run and
+artifact, and independent approval before acceptance. Full userspace
+composition and client-preserving PID4 replacement remain separate.

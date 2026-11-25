@@ -1499,7 +1499,7 @@ def verify_pixel_startup(startup: bytes) -> None:
             raise AssertionError("native app pixels preceded guard registration or readiness")
 
 
-def app_scratch_records(raw: bytes, compositor_root: int) -> list[tuple[int, int, int, int]]:
+def app_scratch_records(raw: bytes, compositor_root: int, pages: int = 1) -> list[tuple[int, int, int, int]]:
     """Validate recorded owners, without reading app VAs through PID4's CR3."""
     if len(raw) != 64:
         raise AssertionError("app scratch ownership ledger is not 64 bytes")
@@ -1508,7 +1508,7 @@ def app_scratch_records(raw: bytes, compositor_root: int) -> list[tuple[int, int
     for root, lower, payload, upper in records:
         if (not 0 < root < 1 << 52 or root % 4096 or root == compositor_root or
                 not 0x400000 <= lower < 0x00007ffff0000000 or lower % 4096 or
-                payload != lower + 4096 or upper != payload + 4096 or
+                payload != lower + 4096 or upper != payload + pages * 4096 or
                 upper + 4096 > 0x00007ffff0000000):
             raise AssertionError("invalid app-owned scratch geometry or root")
     if records[0][0] == records[1][0]:
@@ -1550,22 +1550,26 @@ def physical_mapping(session: QemuSession, root: int, address: int) -> tuple[int
 
 def verify_app_scratch_mappings(session: QemuSession, records: list[tuple[int, int, int, int]],
                                 compositor_root: int, evidence: list[str]) -> None:
-    payloads = []
+    payload_frames = set()
     for pid, (root, lower, payload, upper) in zip((2, 3), records):
         for guard in (lower, upper):
             if physical_mapping(session, root, guard) is not None:
-                raise AssertionError("app scratch guard remains mapped in its own root")
-        mapping = physical_mapping(session, root, payload)
-        if mapping is None or mapping[1:] != (True, True, True):
-            raise AssertionError("app scratch payload lacks effective user RW/NX rights")
-        payloads.append(mapping[0])
-        for foreign in (compositor_root, *(record[0] for record in records if record[0] != root)):
-            other = physical_mapping(session, foreign, payload)
-            if other is not None and other[0] == mapping[0]:
-                raise AssertionError("another service maps an app's private scratch frame")
-        evidence.append(f"PID{pid} CR3={root:#x}: physical table walk confirms guards absent, user RW/NX payload PA={mapping[0]:#x}, no peer/compositor alias at registered payload VA")
-    if len(set(payloads)) != 2:
-        raise AssertionError("independent apps share the same scratch physical frame")
+                raise AssertionError("app canvas guard remains mapped in its own root")
+        foreign_roots = (compositor_root, *(record[0] for record in records if record[0] != root))
+        for address in range(payload, upper, 4096):
+            mapping = physical_mapping(session, root, address)
+            if mapping is None or mapping[1:] != (True, True, True):
+                raise AssertionError("app canvas page lacks effective user RW/NX rights")
+            frame = mapping[0]
+            if frame in payload_frames:
+                raise AssertionError("app canvas pages share a physical frame")
+            payload_frames.add(frame)
+            for foreign in foreign_roots:
+                other = physical_mapping(session, foreign, address)
+                if other is not None and other[0] == frame:
+                    raise AssertionError("another service maps an app's private canvas frame")
+        evidence.append(f"PID{pid} CR3={root:#x}: {(upper-payload)//4096} private canvas pages "
+                        "are user RW/NX, with absent guards and no peer/compositor alias at canvas VAs")
 
 
 def verify_debug_surface_guards(debugger: GuestDebugger, records: list[tuple[int, int, int, int]],
@@ -1848,7 +1852,7 @@ def transient_service_boot(qemu: str, iso: Path, ovmf: Path, disk: Path,
         pixel_surfaces = surface_guard_records(pixel_layout, 1188)
         verify_debug_surface_guards(debugger, pixel_surfaces, evidence, "PID4 retained pixels")
         cloned_root = stopped_root(session)
-        scratch = app_scratch_records(debugger.memory(scratch_ledger, 64), cloned_root)
+        scratch = app_scratch_records(debugger.memory(scratch_ledger, 64), cloned_root, pages=75)
         verify_app_scratch_mappings(session, scratch, cloned_root, evidence)
         evidence.append(f"PID4 cloned CR3={cloned_root:#x}")
         if not debugger.command(f"m{unmapped:x},1").startswith("E"):

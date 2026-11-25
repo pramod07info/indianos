@@ -35,6 +35,27 @@ impl State{
   if index==self.count{self.count+=1;}
   Some(Dirty{x:command.x,y:command.y,width:command.width,height:command.height})
  }
+ /// Render only the damaged region, retaining all other mapped pixels.
+ pub fn raster_canvas(&self, dirty: Dirty, canvas: &mut [u32], stride: usize) -> bool {
+  let x = usize::from(dirty.x);
+  let y = usize::from(dirty.y);
+  let end_x = x + usize::from(dirty.width);
+  let end_y = y + usize::from(dirty.height);
+  if dirty.width == 0 || dirty.height == 0 || end_x > stride ||
+     end_x > usize::from(MAX_EXTENT) || end_y > crate::pixel_protocol::MAX_HEIGHT as usize ||
+     end_y.checked_mul(stride).is_none_or(|end| end > canvas.len()) {
+   return false;
+  }
+  for row in y..end_y {
+   let start = row * stride;
+   for (column, pixels) in canvas[start + x..start + end_x].chunks_mut(ROW_PIXELS).enumerate() {
+    if !self.row((x + column * ROW_PIXELS) as u16, row as u16, pixels) {
+     return false;
+    }
+   }
+  }
+  true
+ }
  /// Emit canonical RGBA: zero means uncovered, ffRRGGBB means an app pixel.
  /// Replaying all retained commands in the dirty rectangle restores underlying
  /// fills after shorter text, instead of leaving old glyphs on the surface.
