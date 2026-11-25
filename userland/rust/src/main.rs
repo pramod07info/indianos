@@ -1345,8 +1345,10 @@ fn compositor_read_denied() -> bool {
 }
 
 #[cfg(feature="desktop-compositor")]
-fn verify_client_snapshots() -> bool {
+fn verify_client_snapshots(front: u8) -> bool {
     use compositor_pixels::{Request, HEADER_BYTES, OPAQUE};
+    use desktop_window::{compose_client_row, ClientSpan};
+    let mut colors = [0; 2];
     for (window, x, y) in [(1, 14, 102), (2, 19, 175)] {
         let query = Request { window, x: 0, y: 0, count: 0, generation: 0 };
         let Some(info) = compositor_read(query) else { return false; };
@@ -1364,8 +1366,22 @@ fn verify_client_snapshots() -> bool {
            compositor_read(Request { x: width - 1, ..read }).is_some() {
             return false;
         }
+        colors[usize::from(window) - 1] = opaque as u32;
     }
-    true
+    // Compose a private strip using actual app pixels arranged to exercise
+    // both front-window precedence and a transparent pixel over the rear.
+    let terminal_front = front == 2;
+    let front = usize::from(terminal_front);
+    let rear = 1 - front;
+    let mut layers = [[None, Some(colors[0]), None], [None, Some(colors[1]), None]];
+    layers[rear][0] = Some(colors[rear]);
+    let [files, terminal] = &layers;
+    let mut strip = [0; 3];
+    compose_client_row(terminal_front, [
+        ClientSpan { x: 0, pixels: files },
+        ClientSpan { x: 0, pixels: terminal },
+    ], &mut strip);
+    colors[0] != colors[1] && strip == [colors[rear], colors[front], 0]
 }
 #[cfg(feature="desktop-compositor")]
 fn desktop_compositor()->!{
@@ -1396,9 +1412,9 @@ fn desktop_compositor()->!{
         }
         if manager.control(&request[8..8+len]).is_none(){exit(250);}
         if !snapshots_verified {
-            if !verify_client_snapshots() { exit(251); }
+            if !verify_client_snapshots(manager.front()) { exit(251); }
             snapshots_verified = true;
-            write(b"desktop PID4 verified committed client snapshots");
+            write(b"desktop PID4 composed a private row from committed client snapshots");
         }
         let state=manager.wire();
         if call(37,1,state.as_ptr() as u64)!=0{exit(251);}

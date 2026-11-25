@@ -57,3 +57,31 @@ impl Manager{
   let front=next.front();*self=next;Some(front)
  }
 }
+
+/// A visible span of a client surface in screen coordinates. Transparent
+/// pixels preserve the destination, including pixels from a rear window.
+pub struct ClientSpan<'a> {
+    pub x: i32,
+    pub pixels: &'a [Option<u32>],
+}
+
+/// Draw client spans in desktop stacking order into a caller-owned row.
+/// The caller provides any background or window chrome already in the row.
+pub fn compose_client_row(terminal_front: bool, spans: [ClientSpan<'_>; 2], row: &mut [u32]) {
+    let front = usize::from(terminal_front);
+    for index in [1 - front, front] {
+        let span = &spans[index];
+        let left = i64::from(span.x);
+        let start = left.max(0).min(row.len() as i64);
+        let end = (left + span.pixels.len() as i64).min(row.len() as i64);
+        if start >= end {
+            continue;
+        }
+        let pixels = &span.pixels[(start - left) as usize..(end - left) as usize];
+        for (out, pixel) in row[start as usize..end as usize].iter_mut().zip(pixels) {
+            if let Some(color) = pixel {
+                *out = *color;
+            }
+        }
+    }
+}

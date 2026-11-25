@@ -57,7 +57,7 @@ LEASE_CONTROL_ACK = "desktop Files read lease control acknowledged"
 NAMED_READBACK = "IndianOS user: R051 Terminal readback: saved"
 G1_PAYLOAD = "violet"  # Visually distinct from the success status SAVED.
 G1_READBACK = "IndianOS user: R051 Terminal readback: " + G1_PAYLOAD
-COMPOSITOR_SNAPSHOT = b"IndianOS user: desktop PID4 verified committed client snapshots"
+COMPOSITOR_SNAPSHOT = b"IndianOS user: desktop PID4 composed a private row from committed client snapshots"
 PIXEL_APP_EVIDENCE = tuple(
     marker
     for pid, app in ((2, "Files"), (3, "Terminal"))
