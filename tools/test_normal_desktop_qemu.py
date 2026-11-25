@@ -1948,7 +1948,63 @@ def transient_service_boot(qemu: str, iso: Path, ovmf: Path, disk: Path,
     print("Normal desktop transient PID4 page fault: fresh ring3 desktop, physical input, durable file and clean shutdown PASS")
 
 
-def bad_service_images(iso: Path, folder: Path, xorriso: str):
+SHUTDOWN_STALL = "IndianOS user: desktop shutdown fixture withholding STOPPED"
+SHUTDOWN_EXHAUSTED = "IndianOS normal desktop: shutdown dispatch budget exhausted"
+RESTART_SAFE = "IndianOS normal desktop: retired session verified restart-safe"
+RESTARTING_SESSION = "IndianOS normal desktop: restarting retired service session"
+RESTART_EXHAUSTED = "IndianOS normal desktop: restart budget exhausted"
+FAILED_SESSION = "IndianOS recovery: reason=desktop-session-failed"
+
+
+def verify_shutdown_exhaustion(output: bytes) -> None:
+    attempt = (READY, DURABLE_SHUTDOWN, SHUTDOWN_STALL, SHUTDOWN_EXHAUSTED, RESTART_SAFE)
+    sequence = (*attempt, RESTARTING_SESSION, *attempt, RESTART_EXHAUSTED, FAILED_SESSION)
+    for marker in set(sequence):
+        if output.count(marker.encode()) != sequence.count(marker):
+            raise AssertionError(f"unexpected shutdown exhaustion marker count: {marker}")
+    cursor = 0
+    for marker in sequence:
+        position = output.find(marker.encode(), cursor)
+        if position < 0:
+            raise AssertionError(f"shutdown exhaustion markers out of order: {marker}")
+        cursor = position + len(marker)
+    for forbidden in (STOPPED.encode(), b"startup dispatch budget exhausted",
+                      b"desktop compositor PID4 stopped", b"FAULTED", b"FATAL"):
+        if forbidden in output:
+            raise AssertionError(f"shutdown exhaustion took a different path: {forbidden!r}")
+
+
+def shutdown_exhaustion_boot(qemu: str, iso: Path, ovmf: Path, disk: Path,
+                             folder: Path) -> None:
+    name = "shutdown-exhaustion"
+    before = disk.read_bytes()
+    process, sock, session = spawn(qemu, iso, ovmf, disk, folder, name)
+    try:
+        session.until(READY, 45)
+        first_shutdown = len(session.output)
+        session.hmp("sendkey q 80")
+        session.until(RESTARTING_SESSION, 45, since=first_shutdown)
+        restart_at = session.output.index(RESTARTING_SESSION.encode(), first_shutdown)
+        session.until(READY, 45, since=restart_at)
+        # Allow the first emulated key release to reach the fresh session.
+        session.drain_serial(0.15)
+        second_shutdown = len(session.output)
+        session.hmp("sendkey q 80")
+        session.until(FAILED_SESSION, 45, since=second_shutdown)
+        session.until("IndianOS recovery: read-only serial console ready", 10, since=second_shutdown)
+        verify_shutdown_exhaustion(bytes(session.output))
+    except Exception as error:
+        capture_boot_failure(session, folder, name, error)
+        raise
+    finally:
+        close(process, sock, session, folder / f"{name}.serial.log")
+    if disk.read_bytes() != before:
+        raise AssertionError("shutdown exhaustion modified the selected storage")
+    print("Normal desktop shutdown exhaustion: two durable shutdown attempts, one restart and read-only recovery PASS")
+
+
+def bad_service_images(iso: Path, folder: Path, xorriso: str,
+                       shutdown_fixture: Path | None = None):
     tree = folder / "fault-iso-tree"
     checked_run([xorriso, "-osirrox", "on", "-indev", str(iso), "-extract", "/", str(tree)])
     for directory in [tree, *(p for p in tree.rglob("*") if p.is_dir())]:
@@ -1974,6 +2030,9 @@ def bad_service_images(iso: Path, folder: Path, xorriso: str):
                       "desktop-session-failed"))
     cases.append(("unready-compositor", b"/bin/compositor",
                   service_entry_code(original, b"/bin/compositor", UNREADY_YIELD), "desktop-session-failed"))
+    if shutdown_fixture is not None:
+        cases.append(("shutdown-exhaustion", b"/bin/compositor",
+                      shutdown_fixture.read_bytes(), "desktop-session-failed"))
     for name, target, payload, reason in cases:
         modified = folder / f"{name}.iso"
         try:
@@ -2002,7 +2061,11 @@ def main() -> None:
     parser.add_argument("--fixture-tool", type=Path,
                         default=Path("tools/rust/target/release/indianos-desktop-fixture"),
                         help="actual COW writer for checksummed namespace rejection media")
+    parser.add_argument("--shutdown-fixture", type=Path,
+                        help="compositor ELF that withholds STOPPED after a durable shutdown")
     args = parser.parse_args()
+    if args.shutdown_fixture is not None and not args.shutdown_fixture.is_file():
+        parser.error(f"missing artifact {args.shutdown_fixture}")
     for path in (args.iso, args.disk, args.ovmf, args.fixture_tool):
         if not path.is_file():
             parser.error(f"missing artifact {path}")
@@ -2062,8 +2125,12 @@ def main() -> None:
             denied_boot(args.qemu, args.iso.resolve(), args.ovmf.resolve(), disk,
                         artifacts, name)
         disk.write_bytes(original)
-        for name, modified, reason in bad_service_images(args.iso.resolve(), Path(temporary), args.xorriso):
-            if name == "crashed-compositor":
+        for name, modified, reason in bad_service_images(
+            args.iso.resolve(), Path(temporary), args.xorriso, args.shutdown_fixture
+        ):
+            if name == "shutdown-exhaustion":
+                shutdown_exhaustion_boot(args.qemu, modified, args.ovmf.resolve(), disk, artifacts)
+            elif name == "crashed-compositor":
                 crashed_service_boot(args.qemu, modified, args.ovmf.resolve(), disk, artifacts)
             elif name.startswith("premature-") or name == "unready-compositor":
                 unready_service_boot(args.qemu, modified, args.ovmf.resolve(), disk, artifacts, name)

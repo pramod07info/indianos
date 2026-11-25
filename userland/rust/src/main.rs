@@ -1459,10 +1459,17 @@ fn desktop_compositor()->!{
     loop{
         let mut request=[0u8;72];let len=desktop_receive(1,&mut request);
         if &request[8..8+len]==b"EXIT"{
-            suite_send(1,b"STOPPED");
-            // Let the waiting broker receive its acknowledgement before the
-            // router revokes all outbound messages on process termination.
-            yield_now();write(b"desktop compositor PID4 stopped");exit(0);
+            #[cfg(feature="test-desktop-shutdown-stall")]
+            {
+                write(b"desktop shutdown fixture withholding STOPPED");
+                loop { yield_now(); }
+            }
+            #[cfg(not(feature="test-desktop-shutdown-stall"))]
+            {
+                suite_send(1,b"STOPPED");
+                // Give the broker a dispatch before termination revokes IPC.
+                yield_now();write(b"desktop compositor PID4 stopped");exit(0);
+            }
         }
         if manager.control(&request[8..8+len]).is_none(){exit(250);}
         if !snapshots_verified {

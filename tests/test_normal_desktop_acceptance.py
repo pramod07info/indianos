@@ -542,6 +542,22 @@ class NormalDesktopControls(unittest.TestCase):
             close.assert_called_once()
             self.assertEqual(disk.read_bytes(), b"unchanged")
 
+    def test_shutdown_exhaustion_requires_two_armed_attempts_and_one_restart(self):
+        attempt = [harness.READY, harness.DURABLE_SHUTDOWN, harness.SHUTDOWN_STALL,
+                   harness.SHUTDOWN_EXHAUSTED, harness.RESTART_SAFE]
+        sequence = [*attempt, harness.RESTARTING_SESSION, *attempt,
+                    harness.RESTART_EXHAUSTED, harness.FAILED_SESSION]
+        wire = lambda trace: "\n".join(trace).encode()
+        harness.verify_shutdown_exhaustion(wire(sequence))
+        for bad in (sequence[1:],
+                    [*sequence, harness.RESTARTING_SESSION],
+                    [*sequence, harness.STOPPED],
+                    [sequence[1], sequence[0], *sequence[2:]],
+                    [marker.replace(harness.SHUTDOWN_EXHAUSTED, "startup dispatch budget exhausted")
+                     for marker in sequence]):
+            with self.assertRaises(AssertionError):
+                harness.verify_shutdown_exhaustion(wire(bad))
+
     def test_normal_boot_timeout_retains_monitor_before_teardown(self):
         with tempfile.TemporaryDirectory() as temporary:
             folder = Path(temporary)
