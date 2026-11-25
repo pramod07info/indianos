@@ -409,7 +409,8 @@ impl UserSurfaceService{
         let w=self.window(id)?;
         let inner_w=w.bounds.width.checked_sub(18)?;
         let inner_h=w.bounds.height.checked_sub(54)?;
-        Some((w.bounds.x+9,w.bounds.y+44,inner_w,inner_h))
+        Some((w.bounds.x+i32::from(crate::gui_protocol::CLIENT_LEFT),
+              w.bounds.y+i32::from(crate::gui_protocol::CLIENT_TOP),inner_w,inner_h))
     }
     fn redraw(&self)->bool{
         let Some(mut out)=Surface::from_boot()else{return false;};

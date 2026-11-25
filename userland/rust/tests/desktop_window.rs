@@ -64,3 +64,17 @@ fn client_rows_clip_and_preserve_rear_pixels_through_transparency() {
     compose_client_row(false, spans(), &mut row);
     assert_eq!(row, [1, 2, 3]);
 }
+
+#[test]
+fn desktop_strip_translation_clips_and_ignores_minimized_client() {
+    use policy::RowRead;
+    let mut manager = Manager::new(&initial()).unwrap();
+    assert_eq!(manager.client_origin(0), Some((54, 119)));
+    assert_eq!(manager.client_read_span(0, (52, 119), 5, (302, 186)),
+               Some(RowRead { x: 0, y: 0, count: 3, destination: 2 }));
+    assert_eq!(manager.client_read_span(0, (354, 304), 7, (302, 186)),
+               Some(RowRead { x: 300, y: 185, count: 2, destination: 0 }));
+    assert_eq!(manager.client_read_span(0, (54, 305), 2, (302, 186)), None);
+    assert_eq!(manager.control(b"Km"), Some(1));
+    assert_eq!(manager.client_read_span(1, (369, 304), 3, (302, 186)), None);
+}

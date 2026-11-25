@@ -1345,7 +1345,46 @@ fn compositor_read_denied() -> bool {
 }
 
 #[cfg(feature="desktop-compositor")]
-fn verify_client_snapshots(front: u8) -> bool {
+fn compose_desktop_strip(
+    manager: &desktop_window::Manager, screen: (u16, u16), strip: &mut [u32],
+) -> Option<()> {
+    use compositor_pixels::{Request, HEADER_BYTES, OPAQUE, ROW_PIXELS};
+    use desktop_window::{compose_client_row, ClientSpan};
+    if strip.is_empty() || strip.len() > ROW_PIXELS { return None; }
+    let mut layers = [[None; ROW_PIXELS]; 2];
+    let mut destinations = [0; 2];
+    for (slot, pixels) in layers.iter_mut().enumerate() {
+        if manager.client_origin(slot).is_none() { continue; }
+        let query = Request { window: slot as u16 + 1, x: 0, y: 0, count: 0, generation: 0 };
+        let info = compositor_read(query)?;
+        let generation = u64::from_le_bytes(info[..8].try_into().ok()?);
+        let width = u16::from_le_bytes(info[8..10].try_into().ok()?);
+        let height = u16::from_le_bytes(info[10..12].try_into().ok()?);
+        let Some(span) = manager.client_read_span(slot, screen, strip.len() as u16, (width, height))
+            else { continue; };
+        let request = Request { x: span.x, y: span.y, count: span.count, generation, ..query };
+        let reply = compositor_read(request)?;
+        if reply[..HEADER_BYTES] != info[..HEADER_BYTES] { return None; }
+        destinations[slot] = i32::from(span.destination);
+        for (out, bytes) in pixels.iter_mut().zip(reply[HEADER_BYTES..].chunks_exact(8))
+            .take(usize::from(span.count)) {
+            let value = u64::from_le_bytes(bytes.try_into().ok()?);
+            *out = match value {
+                0 => None,
+                value if value >> 32 == OPAQUE >> 32 => Some(value as u32),
+                _ => return None,
+            };
+        }
+    }
+    compose_client_row(manager.front() == 2, [
+        ClientSpan { x: destinations[0], pixels: &layers[0] },
+        ClientSpan { x: destinations[1], pixels: &layers[1] },
+    ], strip);
+    Some(())
+}
+
+#[cfg(feature="desktop-compositor")]
+fn verify_client_snapshots(manager: &desktop_window::Manager) -> bool {
     use compositor_pixels::{Request, HEADER_BYTES, OPAQUE};
     use desktop_window::{compose_client_row, ClientSpan};
     let mut colors = [0; 2];
@@ -1370,7 +1409,14 @@ fn verify_client_snapshots(front: u8) -> bool {
     }
     // Compose a private strip using actual app pixels arranged to exercise
     // both front-window precedence and a transparent pixel over the rear.
-    let terminal_front = front == 2;
+    // Exercise real desktop coordinates in addition to the overlap probe.
+    for (slot, x, y) in [(0, 15, 102), (1, 20, 175)] {
+        let Some((left, top)) = manager.client_origin(slot) else { return false; };
+        let mut pixel = [0];
+        if compose_desktop_strip(manager, (left + x, top + y), &mut pixel).is_none() ||
+           pixel[0] != colors[slot] { return false; }
+    }
+    let terminal_front = manager.front() == 2;
     let front = usize::from(terminal_front);
     let rear = 1 - front;
     let mut layers = [[None, Some(colors[0]), None], [None, Some(colors[1]), None]];
@@ -1412,7 +1458,7 @@ fn desktop_compositor()->!{
         }
         if manager.control(&request[8..8+len]).is_none(){exit(250);}
         if !snapshots_verified {
-            if !verify_client_snapshots(manager.front()) { exit(251); }
+            if !verify_client_snapshots(&manager) { exit(251); }
             snapshots_verified = true;
             write(b"desktop PID4 composed a private row from committed client snapshots");
         }
