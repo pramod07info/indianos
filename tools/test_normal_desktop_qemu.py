@@ -2140,6 +2140,9 @@ def transient_service_boot(qemu: str, iso: Path, ovmf: Path, disk: Path,
         session.hmp("cont")
         fresh = session.shot(folder / (name + "-restarted.ppm"))
         check_two_windows(fresh)
+        # The interrupted toggle completes once. Close its popup before exact
+        # glyph comparisons, including at the supported 640x480 geometry.
+        acknowledged_key(session, "a", "R031.1 application launcher CLOSED")
         # The titlebar was captured with the button held when PID4 faulted.
         # Two held motions distinguish latch quarantine from a spurious new
         # capture at the first motion. Only a release can rearm capture.
@@ -2155,9 +2158,7 @@ def transient_service_boot(qemu: str, iso: Path, ovmf: Path, disk: Path,
         moved_at = len(session.output)
         session.hmp(f"mouse_move {width // 2 - 140} {height // 2 - 100}")
         session.until(FRAME_PUBLISHED.decode(), 20, since=moved_at)
-        # The interrupted toggle completes once: the first fresh toggle must
-        # close it. Duplicate replay would instead open it and fail this oracle.
-        acknowledged_key(session, "a", "R031.1 application launcher CLOSED")
+        # Continue normal physical launcher control after capture quarantine.
         acknowledged_key(session, "a", "R031.1 application launcher OPEN")
         acknowledged_key(session, "a", "R031.1 application launcher CLOSED")
         acknowledged_key(session, "2", "R031.1 user switched to Terminal app")
