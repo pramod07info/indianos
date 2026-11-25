@@ -349,7 +349,7 @@ mod tests {
         assert!(check(37,1,USER_MIN));
         assert!(!check(37,0,USER_MIN));
         assert!(check(37,2,plan.stack_begin));
-        assert!(!check(37,2,plan.stack_end-255));
+        assert!(!check(37,2,plan.stack_end-(crate::compositor_pixels::REPLY_BYTES as u64-1)));
         assert!(!check(37,2,USER_MIN));
         assert!(!check(37,3,plan.stack_begin));
         assert!(!check(37,0,plan.stack_end-63));

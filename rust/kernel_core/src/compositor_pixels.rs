@@ -3,7 +3,7 @@
 //! bit. Zero is transparent, and opaque black is representable.
 pub const OPERATION: u64 = 2;
 pub const REQUEST_BYTES: usize = 24;
-pub const REPLY_BYTES: usize = 256;
+pub const REPLY_BYTES: usize = 72;
 pub const HEADER_BYTES: usize = 16;
 pub const ROW_PIXELS: usize = (REPLY_BYTES - HEADER_BYTES) / 8;
 pub const OPAQUE: u64 = 1 << 32;

@@ -947,6 +947,7 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
     },
     crate::compositor_pixels::OPERATION => {
      use crate::compositor_pixels::{Request, REQUEST_BYTES, REPLY_BYTES};
+     const _: () = assert!(REPLY_BYTES <= crate::user_image::MAX_USER_COPY_OUT);
      if !unsafe { indianos_user_can_write(&*img, request.arg1, REPLY_BYTES) } {
       return BAD;
      }
