@@ -325,6 +325,18 @@ class NormalDesktopControls(unittest.TestCase):
             with self.subTest(address=address, value=value), self.assertRaises(AssertionError):
                 harness.verify_app_scratch_mappings(session, records, 0x3000, [])
 
+    def test_canvas_walk_checks_every_payload_page(self):
+        rows = [(root, 0x410000, 0x411000, 0x413000) for root in (0x1000, 0x2000)]
+        ledger = struct.pack("<8Q", *(word for row in rows for word in row))
+        records = harness.app_scratch_records(ledger, 0x3000, pages=2)
+        memory = self.scratch_page_tables()
+        nx = 1 << 63
+        memory.words.update({0x6090: 0xc007 | nx, 0x9090: 0xd007 | nx})
+        harness.verify_app_scratch_mappings(memory, records, 0x3000, [])
+        memory.words[0x9090] = 0xc007 | nx
+        with self.assertRaises(AssertionError):
+            harness.verify_app_scratch_mappings(memory, records, 0x3000, [])
+
     def test_physical_word_response_requires_exact_complete_addressed_data(self):
         session = Mock()
         session.hmp.return_value = "0000000000001000: 0x0000000000004007\n(qemu) "

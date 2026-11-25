@@ -487,7 +487,7 @@ impl UserSurfaceService{
     }
     #[cfg(feature="normal-desktop")]
     fn pixel_slot(&self,pid:u32,window:u32)->Option<usize>{
-        if !matches!((pid,window),(2,1)|(3,2))||!self.broker.owns(pid,window){return None;}
+        if !matches!(window,1|2)||!self.broker.owns(pid,window){return None;}
         Some(window as usize-1)
     }
     #[cfg(feature="normal-desktop")]
@@ -758,6 +758,12 @@ pub(crate) fn surface_guard_layout()->Option<[(u64,u64,u64,u64);2]>{
 #[cfg(feature="normal-desktop")]
 pub(crate) fn pixel_surface_guard_layout()->[(u64,u64,u64,u64);2]{
     app_pixels::guard_layout()
+}
+#[cfg(feature="normal-desktop")]
+pub(crate) fn pixel_grant_epoch(pid: u32, window: u32) -> Option<u64> {
+    let svc = user_service()?;
+    svc.pixel_slot(pid, window)?;
+    svc.broker.grant_epoch_for(pid, window).ok()
 }
 #[cfg(feature="normal-desktop")]
 pub(crate) fn pixel_begin(pid:u32,window:u32,rect:[u16;4])->Option<u64>{

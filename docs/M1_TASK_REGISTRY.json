@@ -1918,8 +1918,16 @@
       "title": "Keyboard focus/mouse delivery from physical IRQ",
       "status": "audit_required",
       "source_document": "docs/M1_PHASE_SCOPE.md",
-      "source_paths": [],
-      "merged_prs": [],
+      "source_paths": [
+        "rust/kernel_core/src/pixel_protocol.rs",
+        "rust/kernel_core/src/user_image.rs",
+        "rust/kernel_core/src/user_runtime.rs",
+        "rust/kernel_core/src/gui.rs",
+        "rust/kernel_core/src/app_pixels.rs",
+        "userland/rust/src/desktop_pixels.rs",
+        "userland/rust/src/main.rs"
+      ],
+      "merged_prs": [797],
       "g1_g2_scoped_evidence": {
         "gates": [
           "G1"
