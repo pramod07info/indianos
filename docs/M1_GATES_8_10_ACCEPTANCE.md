@@ -166,7 +166,9 @@ The first normal present checks both app surfaces from PID4 after their
 initial commits. The normal QEMU oracle requires fresh readback evidence
 before readiness, including on restarted sessions. Use the exact candidate
 and merged-main Actions logs and retained artifact for acceptance. This
-interface supplies an input to later userspace composition.
+interface supplies an input to later userspace composition. See the
+[M1 integration audit](M1_INTEGRATION_AUDIT.md) for the candidate run,
+artifact and outstanding gate criteria.
 
 ## G3 independent sign-off packet
 

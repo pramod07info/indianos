@@ -1361,7 +1361,6 @@ fn compose_desktop_strip(
     manager: &desktop_window::Manager, screen: (u16, u16), strip: &mut [u32],
 ) -> Option<()> {
     use compositor_pixels::{Request, HEADER_BYTES, OPAQUE, ROW_PIXELS};
-    use desktop_window::{compose_client_row, ClientSpan};
     if strip.is_empty() || strip.len() > ROW_PIXELS { return None; }
     let mut layers = [[None; ROW_PIXELS]; 2];
     let mut destinations = [0; 2];
@@ -1388,10 +1387,7 @@ fn compose_desktop_strip(
             };
         }
     }
-    compose_client_row(manager.front() == 2, [
-        ClientSpan { x: destinations[0], pixels: &layers[0] },
-        ClientSpan { x: destinations[1], pixels: &layers[1] },
-    ], strip);
+    manager.compose_screen_strip(screen, destinations, &mut layers, strip);
     Some(())
 }
 

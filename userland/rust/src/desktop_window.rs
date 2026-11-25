@@ -31,6 +31,31 @@ impl Manager{
   Some(RowRead { x: start - window_x, y, count: (end - u32::from(start)) as u16,
                  destination: start - screen_x })
  }
+ /// Composite client samples over an existing background/chrome strip.
+ /// The front window body is opaque, including where its client has no pixel.
+ pub fn compose_screen_strip<const N: usize>(
+  &self, screen: (u16, u16), destinations: [i32; 2],
+  layers: &mut [[Option<u32>; N]; 2], strip: &mut [u32],
+ ) {
+  let front = usize::from(self.frame.front - 1);
+  let window = self.frame.windows[front];
+  let (screen_x, screen_y) = (i32::from(screen.0), i32::from(screen.1));
+  let left = i32::from(window.x);
+  let top = i32::from(window.y);
+  if !window.minimized && (top..top + i32::from(window.height)).contains(&screen_y) {
+   let rear = 1 - front;
+   let start = screen_x + destinations[rear];
+   for (offset, pixel) in layers[rear].iter_mut().enumerate() {
+    if (left..left + i32::from(window.width)).contains(&(start + offset as i32)) {
+     *pixel = None;
+    }
+   }
+  }
+  compose_client_row(front == 1, [
+   ClientSpan { x: destinations[0], pixels: &layers[0] },
+   ClientSpan { x: destinations[1], pixels: &layers[1] },
+  ], strip);
+ }
  pub fn control(&mut self,request:&[u8])->Option<u8>{
   let mut next=self.clone();
   match request{

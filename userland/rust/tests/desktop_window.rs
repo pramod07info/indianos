@@ -78,3 +78,25 @@ fn desktop_strip_translation_clips_and_ignores_minimized_client() {
     assert_eq!(manager.control(b"Km"), Some(1));
     assert_eq!(manager.client_read_span(1, (369, 304), 3, (302, 186)), None);
 }
+
+#[test]
+fn front_window_body_occludes_rear_client_under_transparent_pixels() {
+    let mut frame = initial();
+    // Shift Terminal into Files and make Terminal the front window.
+    frame[12] = 2;
+    frame[32..34].copy_from_slice(&100u16.to_le_bytes());
+    frame[34..36].copy_from_slice(&100u16.to_le_bytes());
+    let mut manager = Manager::new(&frame).unwrap();
+    let pixels = [[Some(1); 4], [None, None, Some(2), None]];
+    let mut strip = [7; 4];
+    let mut overlapping = pixels;
+    manager.compose_screen_strip((98, 160), [0, 0], &mut overlapping, &mut strip);
+    assert_eq!(strip, [1, 1, 2, 7]);
+
+    // Minimize Terminal. The rear client is visible across the same strip.
+    assert_eq!(manager.control(b"Km"), Some(1));
+    strip.fill(7);
+    manager.compose_screen_strip((98, 160), [0, 0],
+                                 &mut [pixels[0], [None; 4]], &mut strip);
+    assert_eq!(strip, [1; 4]);
+}
