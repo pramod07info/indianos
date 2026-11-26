@@ -849,6 +849,7 @@ fn files_shared_content(data:&mut [u8;256])->usize{
         if file_handle_call(34,b"",token,0,data,0)!=0||
            file_handle_call(35,b"",token,0,data,0)!=u64::MAX{exit(254);}
         if (abi>>32)&4==0||file_handle_call(38,b"",token,0o777,data,0)!=u64::MAX{exit(254);}
+        if (abi>>32)&64==0||file_handle_call(27,b"",token,0,data,0)!=u64::MAX{exit(254);}
         write(b"desktop Files denied unauthorized permission mutation");
     }
     let count=file_handle_call(2,b"",token,0,data,72);
@@ -1054,7 +1055,7 @@ fn desktop_named_command(command:terminal_fs::Command){
             let abi=file_handle_call(37,b"",0,0,&mut data,0);
             // Feature discovery is additive; never emulate this request by
             // replacing the file or changing its descriptor cursor.
-            if abi&0xffff!=1||(abi>>16)&0xffff!=64||(abi>>32)&48!=48{
+            if abi&0xffff!=1||(abi>>16)&0xffff!=64||(abi>>32)&112!=112{
                 suite_send(3,b"E");return;
             }
             let path_len=name.path(&mut path);
@@ -1062,9 +1063,14 @@ fn desktop_named_command(command:terminal_fs::Command){
             if token==0||token==u64::MAX{suite_send(3,b"E");return;}
             data[..len as usize].copy_from_slice(&bytes[..len as usize]);
             let count=file_handle_call(26,b"",token,offset as u64,&mut data,len as usize);
+            // fsync is descriptor-bound; success requires the real device
+            // barrier, not merely CLOSE or a successful metadata write.
+            let synced=count==len as u64&&
+                file_handle_call(27,b"",token,0,&mut data,0)!=u64::MAX;
             // Even a rejected write must release its cached descriptor.
             let closed=file_handle_call(5,b"",token,0,&mut data,0);
-            if count!=len as u64||closed!=0{suite_send(3,b"E");return;}
+            if !synced||closed!=0{suite_send(3,b"E");return;}
+            write(b"desktop broker native descriptor fsync completed");
             write(b"desktop broker positioned write committed");0
         },
         Command::Put{name,bytes,len}=>{

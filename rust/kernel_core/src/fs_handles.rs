@@ -31,8 +31,9 @@ pub const FS_ABI_DESCRIPTOR_BYTES:u16=64;
 pub const FS_ABI_UNRELATED_READERS:u32=8;
 pub const FS_ABI_POSITIONED_IO:u32=16;
 pub const FS_ABI_UNRELATED_DESCRIPTOR_READERS:u32=32;
+pub const FS_ABI_DESCRIPTOR_FSYNC:u32=64;
 pub const FS_ABI_FEATURES:u32=7|FS_ABI_UNRELATED_READERS|FS_ABI_POSITIONED_IO|
-    FS_ABI_UNRELATED_DESCRIPTOR_READERS;
+    FS_ABI_UNRELATED_DESCRIPTOR_READERS|FS_ABI_DESCRIPTOR_FSYNC;
 pub const FS_ABI_INFO:u64=FS_ABI_VERSION as u64|
     ((FS_ABI_DESCRIPTOR_BYTES as u64)<<16)|((FS_ABI_FEATURES as u64)<<32);
 const SLOTS:usize=4;
@@ -2691,6 +2692,7 @@ mod r094_authenticated_cow_ops {
   assert_eq!(operation_authenticated(&mut table,37,owner,0,0,"",&mut[]),Ok(FS_ABI_INFO));
   assert_eq!(FS_ABI_INFO&0xffff,1);assert_eq!((FS_ABI_INFO>>16)&0xffff,64);
   assert_eq!((FS_ABI_INFO>>32) as u32&FS_ABI_UNRELATED_READERS,FS_ABI_UNRELATED_READERS);
+  assert_eq!((FS_ABI_INFO>>32) as u32&FS_ABI_DESCRIPTOR_FSYNC,FS_ABI_DESCRIPTOR_FSYNC);
   assert_eq!(operation_authenticated(&mut table,37,owner,1,0,"",&mut[]),Err(FsError::InvalidName));
   assert_eq!(operation_authenticated(&mut table,37,owner,0,1,"",&mut[]),Err(FsError::InvalidName));
   assert_eq!(FileHandles::lock_range(u64::MAX),Err(FsError::TooLarge));
@@ -2997,6 +2999,15 @@ mod r102_authenticated_fsync_tests{
             Err(FsError::InvalidName));
   assert_eq!(h.dispatch_authenticated(27,admin,writer,0,"/other",&mut[],&mut fs),
             Err(FsError::InvalidName));
+ }
+ #[test]fn failed_descriptor_barrier_retires_writer_without_charging_a_write(){
+  let (fs,mut handles,owner,_,writer,_)=fixture();
+  let mut disk=fs.into_device();disk.fail=true;
+  let mut fs=HierVfs::mount(disk).unwrap();
+  let before=handles.security_statistics();
+  assert_eq!(handles.dispatch_authenticated(27,owner,writer,0,"",&mut[],&mut fs),Err(FsError::Io));
+  assert_eq!(handles.security_statistics(),before);
+  assert_eq!(handles.dispatch_authenticated(27,owner,writer,0,"",&mut[],&mut fs),Err(FsError::InvalidName));
  }
 }
 

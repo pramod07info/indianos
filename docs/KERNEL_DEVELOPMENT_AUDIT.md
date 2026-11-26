@@ -216,7 +216,7 @@ allocator, scheduler, VFS, supervisor or controller models.
 | FPU/SIMD context | `fpu_context.rs`, `cpu_entry.rs`, `arch/x86_64/*entry.S`, `user_runtime.rs`; P2-010 | This slice implements eager BSP x87/MMX/SSE context boundaries. Exact-head guest evidence, preemptive register retention, AVX/XSAVE and migration remain unaccepted. |
 | Threads, futexes and signals | `ipc.rs`, `user_runtime.rs`; P3-001/009 | General thread ownership, wait/wake/timeout/cancellation races and signal delivery. |
 | Spawn/exec/wait and supervision | `user_image.rs`, `user_runtime.rs`, `service_supervisor.rs`; P3-003/011/012 | Arbitrary approved-image lifecycle and parent/wait semantics beyond fixed desktop roles. |
-| Native fsync, blocking locks, ACLs/quotas | `fs_handles.rs`, `syscall.rs`, `durablefs.rs`; P4-006/008/009/010 | Native durability ABI, interrupt-safe blocking lock queues and persistent named-user administration/accounting. |
+| Native fsync, blocking locks, ACLs/quotas | `fs_handles.rs`, `syscall.rs`, `durablefs.rs`; P4-006/008/009/010 | Descriptor fsync now wired below; interrupted durability acceptance, blocking lock queues and persistent named-user administration/accounting remain. |
 | Normal networking and DMA ownership | `network.rs`, process retirement and PCI inventory; P5-004/005/006, P6-005 | Normal driver binding, IRQ/DMA/IOMMU lifetime and reset/error acceptance. |
 | AHCI/NVMe and USB/xHCI | `batch3_ahci.rs`, `batch3_nvme.rs`, hardware inventory; P6-006/007 | Existing descriptor/queue models must become real initialized controllers; DMA, interrupts, completion, reset, flush and devices. |
 | Verified boot, ACPI and physical qualification | boot handoff, hardware inventory and power primitives; P1-009/010, P5-001/009, P6-009 | Firmware trust/revocation/recovery chain and selected physical-machine power/device receipts. |
@@ -253,3 +253,26 @@ The fixture is cooperative scheduling evidence, not proof of preemption, AVX,
 physical devices, general threads or migration. Two host evidence-oracle cases
 reject missing/duplicate/late receipts. GitHub runs all builds/tests; none was
 executed locally. All formal gate counts and completion estimates are unchanged.
+
+### Native descriptor fsync integration (P4-008)
+
+Native syscall 33 now admits descriptor operation 27 and advertises additive
+feature bit 64 through the existing version-1, 64-byte ABI query. The descriptor
+must contain only a live handle: path, argument, pointer, length and reserved
+bytes are zero. The existing authenticated fsync backend enforces current
+process incarnation, namespace, selected volume and write authority, verifies
+metadata and invokes the actual driver barrier. It returns the verified durable
+generation, or the existing BAD result on failure. CLOSE remains cleanup rather
+than an implicit durability guarantee. Shutdown may repeat a nonmutating fsync
+but continues refusing new opens and writes.
+
+Desktop broker positioned writes now require fsync before reporting success;
+Files proves a read-only handle cannot issue it. The normal QEMU oracle requires
+exactly one fresh flush receipt before the positioned-write receipt, preserved
+reader/cursor evidence and successful graphical commit. Negative controls reject
+missing, duplicate or reordered flush evidence. Native ingress guard/crossing
+checks now cover operation 27. Existing backend fsync success/argument/permission
+and selected shared-reader tests are reused; a new failed-barrier case proves
+writer revocation without charging a mutation. No local tests/builds were run.
+Exact-head GitHub/QEMU results and interruption/power-loss qualification remain
+necessary; this does not complete blocking locks, ACL administration or quotas.

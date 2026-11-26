@@ -181,7 +181,7 @@ impl DesktopLifecycle{
    32=>matches!(operation,4|8|10|12),
    // Existing descriptors may read, seek and close. OPEN can create/truncate
    // and is deliberately refused even when its user flags claim read-only.
-   33=>matches!(operation,2|4|5|25|36|37),
+   33=>matches!(operation,2|4|5|25|27|36|37),
    _=>true,
   }
  }
@@ -1323,7 +1323,7 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
     if address!=0||length!=0{return reject(b"IndianOS: Files unlock unexpected payload rejected\n\0");}
     0
    };
-   if matches!(request.arg0,2|3|5|36|37) && argument!=0{return reject(b"IndianOS: Files unlock nonzero argument rejected\n\0");}
+   if matches!(request.arg0,2|3|5|27|36|37) && argument!=0{return reject(b"IndianOS: Files unlock nonzero argument rejected\n\0");}
    if request.arg0==37&&handle!=0{return BAD;}
    if request.arg0==38&&argument>0o777{return BAD;}
    if matches!(request.arg0,4|6|25|26) && argument>crate::durablefs::MAX_FILE_BYTES as u64{
@@ -3368,7 +3368,7 @@ fn native_file_payload_size(action:u64,offset:u64,length:u64)->Option<usize>{
   assert!(state.complete_sync(true));
   for operation in 0..=40{
    assert_eq!(state.allows_storage_request(32,operation),matches!(operation,4|8|10|12));
-   assert_eq!(state.allows_storage_request(33,operation),matches!(operation,2|4|5|25|36|37));
+   assert_eq!(state.allows_storage_request(33,operation),matches!(operation,2|4|5|25|27|36|37));
   }
   assert!(!state.allows_storage_request(32,u64::MAX));
   assert!(!state.allows_storage_request(33,u64::MAX));
