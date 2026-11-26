@@ -5,6 +5,16 @@
 
 **Single commit is a review/change packaging policy, not a promise that an entire OS can be implemented and independently hardware-tested in one commit.**
 
+## Current kernel-focused audit
+
+The [26 Nov source/evidence audit](KERNEL_DEVELOPMENT_AUDIT.md) maps the existing
+65 P1–P6 rows to working bounded paths, partial implementations, unverified live
+paths and missing hardware receipts. Their pending deltas and exit tests are
+stored on those same IDs under `development_audit` in `M1_TASK_REGISTRY.json`.
+This adds no task IDs, changes no acceptance checkbox and does not equate
+emulator evidence coverage with total kernel code completion. P8–P10 and the
+full architecture/release obligations remain binding.
+
 ## Existing evidence that must not be discarded
 - Rust-first kernel, Limine/OVMF, process and syscall/IPC experiments and QEMU APIC tests are already in main.
 - QEMU opt-in R031.1 verifies automatically started **three** actual ring-3 desktop processes.

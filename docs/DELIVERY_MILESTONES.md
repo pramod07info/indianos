@@ -132,6 +132,20 @@ formal acceptance status or checkbox changes. Verified M1 acceptance remains
 process records the decision. See [integration evidence](M1_INTEGRATION_AUDIT.md)
 for actual results and outstanding failures.
 
+## Kernel development measurement — 26 Nov 2026
+
+Use the [kernel source/evidence audit](KERNEL_DEVELOPMENT_AUDIT.md) for current
+pending implementation and qualification tasks. It covers the existing 65
+kernel-focused P1–P6 rows: 30 bounded guest-evidenced paths, 20 partial paths,
+13 unverified live integrations and two hardware-evidence rows. The resulting
+30/65 (46.15%) is **bounded emulator evidence coverage**, not total kernel
+completion or an effort-weighted estimate. All rows retain work or release
+qualification. The earlier approximately 40% kernel estimate was subjective;
+this audit supplies evidence classifications rather than a replacement claim
+of a measured total code percentage. Original formal statuses and the broader
+99-task scope remain unchanged. Owner G4 approval is recorded separately from
+canonical acceptance reconciliation and any independent GitHub review.
+
 ## M2 — Developer Alpha
 
 **Current M2 integrated workstream:** [M2 developer-alpha engineering
