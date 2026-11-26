@@ -1,6 +1,32 @@
 # Fallible compositor frame allocation
 
-Implementation task: M1-P2-004 (missing-code), first allocation-policy slice.
+Implementation task: M1-P2-004; related pressure/quotas: M1-P2-011.
+
+## Current completion boundary
+
+Source status below is not an exact-head CI pass or formal gate acceptance.
+PR #825 contains the current follow-up; its required checks must pass before merge.
+
+| Requirement | Current implementation |
+| --- | --- |
+| Fallible owned frame/scratch allocation, physical quota and stale-handle protection | Implemented; merged foundations in #819/#821 |
+| Scratch small-object allocation and adjacent-hole coalescing | Implemented in merged #823 |
+| Bounded quarantine reclamation/retry and pressure diagnostics | Implemented in #825; current-head acceptance pending |
+| Enforced BSP, IRQ and non-reentrant metadata admission | Implemented in #825; rejects AP allocation, does not provide SMP allocation |
+| Heap extent/backing integrity before unsafe operations | Implemented in #825; current-head acceptance pending |
+| User-image data/stack admission budgets and retained failed rollback ownership | Implemented in #825, including existing legacy C parity; not total RSS |
+| Noncontiguous physical backing behind contiguous virtual arenas | Not implemented |
+| Broader kernel consumers/global Rust allocator integration | Not implemented |
+| Allocator operation across multiple CPUs and corresponding PMM synchronization | Not implemented |
+| Total process RSS accounting/quotas including page tables, sharing and growth | Not implemented |
+| System-wide OOM victim/recovery policy | Not implemented |
+| Current-head guest pressure injection, multicore/hardware pressure acceptance | Not verified |
+
+**The first allocation/OOM item is not 100% complete.** A passing host test or
+commit cannot close the unimplemented or unverified requirements above. Subsequent
+sections document implementation details and historical changes; this table is
+the current remaining-work summary. No milestone checkbox or percentage changes.
+
 
 The normal desktop previously reserved 10,240,000 bytes of permanent kernel BSS
 for frame staging. `kernel_buffer::Buffer` now allocates only the requested
@@ -40,7 +66,7 @@ No local build, test binary or QEMU execution was performed for this change,
 per the owner's request. Exact-head GitHub results must be checked before merge;
 adding tests alone does not establish a pass or gate acceptance.
 
-## Remaining allocation work
+## Initial PR #819 limitations (historical)
 
 M1-P2-004 remains incomplete: general-purpose allocation, multiple independent
 kernel consumers, noncontiguous virtual arenas, allocation observability and SMP
