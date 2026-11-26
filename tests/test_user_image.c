@@ -15,6 +15,7 @@ struct ram {
     bool used[CAPACITY];
     unsigned used_count;
     unsigned allocation_calls;
+    uint64_t refuse_access, refuse_release;
     int fail_after;
 };
 static bool alloc(uint64_t *addr, void *ctx) {
@@ -33,6 +34,7 @@ static bool alloc(uint64_t *addr, void *ctx) {
 }
 static bool release(uint64_t addr, void *ctx) {
     struct ram *r = ctx;
+    if (r->refuse_release == addr) return false;
     if (addr == 0 || addr % PAGE || addr / PAGE > CAPACITY) return false;
     unsigned i = (unsigned)(addr / PAGE - 1);
     if (!r->used[i]) return false;
@@ -42,6 +44,7 @@ static bool release(uint64_t addr, void *ctx) {
 }
 static void *access_frame(uint64_t addr, void *ctx) {
     struct ram *r = ctx;
+    if (r->refuse_access == addr) return NULL;
     if (addr == 0 || addr % PAGE || addr / PAGE > CAPACITY) return NULL;
     unsigned i = (unsigned)(addr / PAGE - 1);
     return r->used[i] ? r->frames[i] : NULL;
@@ -160,6 +163,18 @@ int main(void) {
         assert(r.used_count == 0);
     }
     r.fail_after = -1;
+    struct indianos_user_image retained = {0};
+    r.refuse_access = 2 * PAGE;
+    r.refuse_release = 2 * PAGE;
+    assert(!indianos_user_image_load(&retained, &backend, file.bytes, file.length));
+    assert(retained.tables.initialized && !retained.ready && retained.page_count == 1);
+    assert(retained.pages[0].virtual_address == 0 && retained.pages[0].physical_address == 2 * PAGE);
+    assert(r.used_count == 2);
+    r.refuse_access = 0;
+    assert(!indianos_user_image_destroy(&retained));
+    assert(r.used_count == 2);
+    r.refuse_release = 0;
+    assert(indianos_user_image_destroy(&retained) && r.used_count == 0);
     struct indianos_user_image invalid = {0};
     elf[4] = 1;
     assert(!indianos_user_image_load(&invalid, &backend, elf, sizeof elf));

@@ -20,35 +20,51 @@ static bool stage_page(struct indianos_user_image *image, uint64_t va,
     const struct vmm_backend *b = &image->tables.backend;
     uint64_t physical = 0;
     if (!b->allocate(&physical, b->context)) return false;
+    const uint16_t index = image->page_count++;
+    image->pages[index] = (struct indianos_user_page) {
+        .virtual_address = 0, .physical_address = physical,
+    };
     void *mapped_frame = b->access(physical, b->context);
     if (mapped_frame == NULL) {
-        (void)b->release(physical, b->context);
+        if (b->release(physical, b->context)) {
+            image->pages[index] = (struct indianos_user_page) {0};
+            image->page_count = index;
+        }
         return false;
     }
     zero_frame(mapped_frame);
     if (!vmm_map_page(&image->tables, va, physical, permissions)) {
-        (void)b->release(physical, b->context);
+        if (b->release(physical, b->context)) {
+            image->pages[index] = (struct indianos_user_page) {0};
+            image->page_count = index;
+        }
         return false;
     }
-    image->pages[image->page_count++] = (struct indianos_user_page) {
-        .virtual_address = va, .physical_address = physical,
-    };
+    image->pages[index].virtual_address = va;
     *physical_out = physical;
     return true;
 }
 
 bool indianos_user_image_destroy(struct indianos_user_image *image) {
     if (image == NULL || !image->tables.initialized) return false;
+    image->ready = false;
+    if (image->page_count > INDIANOS_USER_MAX_PAGES) return false;
     bool ok = true;
     for (size_t i = image->page_count; i > 0; --i) {
-        const struct indianos_user_page page = image->pages[i - 1];
-        if (!vmm_unmap_page(&image->tables, page.virtual_address)) {
-            ok = false;
-            continue;
+        struct indianos_user_page *page = &image->pages[i - 1];
+        if (page->physical_address == 0) continue;
+        if (page->virtual_address != 0) {
+            if (!vmm_unmap_page(&image->tables, page->virtual_address)) {
+                ok = false;
+                continue;
+            }
+            page->virtual_address = 0;
         }
-        if (!image->tables.backend.release(page.physical_address,
+        if (!image->tables.backend.release(page->physical_address,
                                            image->tables.backend.context)) {
             ok = false;
+        } else {
+            page->physical_address = 0;
         }
     }
     if (!ok) return false; /* Keep state for diagnosis; do not free live root. */
@@ -62,16 +78,30 @@ bool indianos_user_image_destroy(struct indianos_user_image *image) {
 bool indianos_user_image_load(struct indianos_user_image *image,
                               const struct vmm_backend *backend,
                               const uint8_t *elf, size_t size) {
+    return indianos_user_image_load_with_limit(image, backend, elf, size,
+                                               INDIANOS_USER_MAX_PAGES);
+}
+
+bool indianos_user_image_load_with_limit(struct indianos_user_image *image,
+                              const struct vmm_backend *backend,
+                              const uint8_t *elf, size_t size, uint16_t page_limit) {
+    if (page_limit == 0 || page_limit > INDIANOS_USER_MAX_PAGES) return false;
     if (image == NULL || backend == NULL || image->tables.initialized ||
         image->ready) return false;
     struct indianos_program_plan plan = {0};
     if (!indianos_program_plan_elf64(elf, size, &plan)) return false;
 
-    uint64_t requested = INDIANOS_USER_STACK_BYTES / PAGE_BYTES;
+    if (plan.segment_count == 0 || plan.segment_count > INDIANOS_MAX_PROGRAM_SEGMENTS ||
+        plan.stack_end <= plan.stack_begin ||
+        ((plan.stack_begin | plan.stack_end) % PAGE_BYTES) != 0) return false;
+    uint64_t requested = (plan.stack_end - plan.stack_begin) / PAGE_BYTES;
+    if (requested > page_limit) return false;
     for (uint32_t i = 0; i < plan.segment_count; ++i) {
         const struct indianos_program_segment *s = &plan.segments[i];
+        if (s->page_end <= s->page_begin ||
+            ((s->page_begin | s->page_end) % PAGE_BYTES) != 0) return false;
         uint64_t page_count = (s->page_end - s->page_begin) / PAGE_BYTES;
-        if (page_count > INDIANOS_USER_MAX_PAGES - requested) return false;
+        if (page_count > (uint64_t)page_limit - requested) return false;
         requested += page_count;
     }
     if (!vmm_create(&image->tables, backend)) return false;

@@ -268,3 +268,10 @@ continues to work. The desktop role policy has a separate negative-control test.
 This admission policy covers image data/BSS and stack frames, not page tables,
 shared mappings, kernel service buffers, runtime growth or total RSS. It does not
 replace the still-pending process RSS/system-wide OOM requirements.
+
+The legacy C loader is still built by existing parity/host checks. Its existing
+implementation now exposes the same budgeted entry point and preserves staging
+rollback ownership with retryable teardown, rather than leaving the additive
+header unresolved in C builds. The shared C integration fixture also injects a
+refused access/release and verifies retained ownership followed by clean retry;
+it exercises both Rust and legacy C implementations in their existing CI targets.
