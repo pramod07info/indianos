@@ -196,12 +196,13 @@ pub extern "C" fn kmain()->!{
         // R126: genuine AP enters Rust, confirms its own CPUID and parks.
         // The BSP immediately halts BEFORE PMM, user programs or recovery.
         need(crate::limine_requests::launch_one_parked_qemu_ap(),
-            b"IndianOS: FATAL R126 QEMU AP arrival/CPUID mismatch\n\0");
+            b"IndianOS: FATAL R126/R132 QEMU AP admission or TLB acknowledgement failed\n\0");
         log(b"IndianOS: R126 QEMU secondary AP executed Rust and acknowledged BSP\n\0");
         log(b"IndianOS: R127 QEMU real AP denied BSP retirement gate 8192 times\n\0");
         log(b"IndianOS: R131 QEMU 64 ordered cross-CPU lifecycle receipts acknowledged\n\0");
         log(b"IndianOS: R121 QEMU all 64 AP lifecycle receipt replays denied\n\0");
         log(b"IndianOS: R122 QEMU AP proof completed before lifecycle acknowledgement\n\0");
+        log(b"IndianOS: R132 QEMU AP invalidated 64 remapped pages before acknowledgement\n\0");
         halt();
     }
     // Issue #124 HD1: each x86-64 boot enumerates CPU and PCI-PCI bridge

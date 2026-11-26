@@ -320,3 +320,42 @@ This does not implement demand-mapped ELF segments, arbitrary heap/mmap growth,
 copy-on-write/shared-page refcounts, remote TLB invalidation or general fork.
 P2-006 and requested points 3, 5, 6, 8, 9 and 10 remain unfinished. No formal
 milestone or percentage changes.
+
+### Exact-root invalidation and two-CPU remap qualification (P2-008/009)
+
+The native demand-fault return now uses a shared local invalidation primitive
+that checks an aligned canonical page address, an exact current CR3 root and
+masked interrupts before INVLPG. It invalidates the current CPU/PCID only; it
+cannot authorize remote frame reuse or replace an IPI acknowledgement.
+
+The existing isolated two-vCPU Limine test now performs actual remapped-page
+readback before its lifecycle acknowledgements. BSP validates translations of
+three page-aligned static page tables and two distinct static data pages, then
+publishes a supervisor/RW/NX alias in an unused high-half PML4 slot. AP must
+match the source CR3 and prime a real cached translation. BSP alternates that
+leaf between the two physical pages for 64 generations. The real AP invalidates
+locally and reads the new page before the existing release/acquire fence may
+acknowledge. BSP waits for that exact receipt before issuing the next remap.
+No table/data backing is released: it remains kernel-owned until both CPUs
+halt, before PMM, tasks, devices or filesystems start.
+
+An explicit stale-translation fixture omits AP INVLPG after priming. A read of
+the prior physical page must refuse acknowledgement, leave the fence pending,
+and prevent BSP success. Its oracle requires the real prime/read-refusal/fatal
+ordering and forbids successful 64-generation receipts. A generic startup error
+cannot pass this negative case. Positive acceptance requires all exact ordered
+receipts without duplicates or refusal. Both guest transcripts are retained
+as exact-head GitHub artifacts, including on failure.
+
+Four Rust host cases cover invalidation admission and proof backing geometry;
+three host oracle cases cover positive/negative receipt requirements. Existing
+lifecycle-fence stale/failed-local-work tests are reused. Actual QEMU positive
+and stale-control execution is required in the existing AP workflow. No local
+build/test/QEMU execution was performed. Until exact-head runs pass, these are
+implemented paths and pending qualification, not verified remote-TLB acceptance.
+
+This advances point 3 but does not complete it. Normal boot still parks APs.
+Per-CPU IDT/TSS, IPI routing, run queues, scheduler migration, concurrent PMM
+ownership and production multi-CPU shootdown/reclamation remain unfinished.
+Points 5, 6, 8, 9 and 10 remain in the pending ledger; no formal gate or completion
+percentage changes.

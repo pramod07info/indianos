@@ -327,7 +327,7 @@ extern "C" fn r126_secondary_cpu_entry(info:*mut MpInfo)->!{
                 denied+=1;
             }
             R127_AP_DENIALS.store(denied,Ordering::Release);
-            if denied==8192 {
+            if denied==8192 && unsafe{crate::tlb_probe::prime()} {
                 R126_AP_CPUID.store(actual,Ordering::Release);
                 R126_AP_ACK.store(1,Ordering::Release);
                 // Exact APID1 cross-CPU lifecycle protocol: no interrupt
@@ -343,7 +343,8 @@ extern "C" fn r126_secondary_cpu_entry(info:*mut MpInfo)->!{
                         match R131_FENCE.observe_and_ack_after(
                             actual,seen,|receipt|{
                                 receipt.sequence==seq &&
-                                receipt.generation==seq*2
+                                receipt.generation==seq*2 &&
+                                unsafe{crate::tlb_probe::observe(seq)}
                             }
                         ){
                             Ok(Some(receipt)) => {
@@ -390,6 +391,7 @@ pub(crate) fn launch_one_parked_qemu_ap()->bool{
     }
     if secondary.is_null(){return false;}
     if R127_GATE.register_bsp(0,true).is_err(){return false;}
+    if !unsafe{crate::tlb_probe::prepare()}{return false;}
     R126_AP_ACK.store(0,Ordering::Release);
     R126_AP_CPUID.store(u32::MAX,Ordering::Release);
     R127_AP_DENIALS.store(0,Ordering::Release);
@@ -419,7 +421,10 @@ pub(crate) fn launch_one_parked_qemu_ap()->bool{
         core::hint::spin_loop();
     }
     if !arrived{return false;}
+    unsafe extern "C" {fn serial_write(message:*const core::ffi::c_char);}
+    unsafe{serial_write(b"IndianOS: R132 QEMU AP primed shared page translation\n\0".as_ptr().cast())};
     for seq in 1..=64u64{
+        if !unsafe{crate::tlb_probe::remap(seq)}{return false;}
         let receipt=match R131_FENCE.publish(0,seq*2){
             Ok(receipt)=>receipt,
             Err(_)=>return false,
@@ -427,6 +432,9 @@ pub(crate) fn launch_one_parked_qemu_ap()->bool{
         // Use the actual bounded BSP receipt primitive. Failure leaves
         // the old publication outstanding; no scheduler state is freed.
         if R131_FENCE.poll_ack_bounded(0,receipt,50_000_000).is_err(){
+            if crate::tlb_probe::stale_observed(){
+                unsafe{serial_write(b"IndianOS: R132 QEMU stale page refused acknowledgement\n\0".as_ptr().cast())};
+            }
             return false;
         }
     }

@@ -661,7 +661,7 @@ pub extern "C" fn x86_64_user_page_fault_recover(vector:u64,cs:u64,error:u64,add
  let current:u64;unsafe{asm!("mov {}, cr3",out(reg)current,options(nostack,nomem,preserves_flags));}
  if current&PHYS!=task.root.root||!task.attached{return false;}
  if !unsafe{crate::user_image::resolve_stack_fault(&mut task.image,address,error,&mut task.fault_retained[0])}{return false;}
- unsafe{asm!("invlpg [{}]",in(reg)(address&!4095),options(nostack,preserves_flags));}
+ if !unsafe{crate::tlb::invalidate_page(task.root.root,address&!4095)}{return false;}
  pid_log(unsafe{(*process).pid},b"DEMAND_STACK_PAGE_READY\0");
  true
 }

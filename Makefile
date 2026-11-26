@@ -244,6 +244,7 @@ RUST_LIB := $(BUILD)/libindianos_kernel_core.a
 RUST_FEATURES := $(if $(filter 1,$(PREEMPT_SELFTEST)),--features preempt,) $(if $(filter 1,$(RUST_VMM)),--features vmm,) $(if $(filter 1,$(RUST_PMM)),--features pmm,) $(if $(filter 1,$(RUST_USER_IMAGE)),--features user-image,) $(if $(filter 1,$(RUST_PAGING)),--features paging,) $(if $(filter 1,$(RUST_PAGING_CPU)),--features paging-cpu,) $(if $(filter 1,$(RUST_USER_RUNTIME)),--features user-runtime,) $(if $(filter 1,$(RUST_CPU_ENTRY)),--features cpu-entry,) $(if $(filter 1,$(RUST_RUNTIME)),--features runtime,) $(if $(filter 1,$(RUST_BOOT_STAGING)),--features boot-staging,) $(if $(filter 1,$(RUST_BOOT)),--features boot,) $(if $(filter 1,$(RUST_BOOT_PROTOCOL)),--features limine-requests,) $(if $(filter 1,$(RUST_INTERRUPTS)),--features interrupts,) $(if $(filter 1,$(RUST_TIMER)),--features timer,) $(if $(filter 1,$(RUST_MAIN)),--features kernel-main,)
 ifeq ($(RUST_MAIN),1)
 RUST_FEATURES += $(if $(filter 1,$(R118_AP_ACK_TEST)),--features test-r118-ap-ack,)
+RUST_FEATURES += $(if $(filter 1,$(R132_TLB_STALE_TEST)),--features test-r132-tlb-stale,)
 RUST_FEATURES += $(if $(filter 1,$(EXCEPTION_SELFTEST)),--features test-ud2,) \
  $(if $(filter 1,$(PAGEFAULT_SELFTEST)),--features test-pagefault,) \
  $(if $(filter 1,$(PAGING_SWITCH_SELFTEST)),--features test-shadow,) \
@@ -1336,4 +1337,4 @@ test-r114-epoch-qemu:
 # Disposable read-only UEFI QEMU; no host disk and no production AP activation.
 test-r118-ap-qemu:
 	$(MAKE) image BUILD=build/r118-ap-qemu RUST_CORE=1 R118_AP_ACK_TEST=1
-	python3 tools/test_r118_ap_qemu.py --iso build/r118-ap-qemu/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)"
+	python3 tools/test_r118_ap_qemu.py --iso build/r118-ap-qemu/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)" --serial-log build/r118-ap-qemu/ap.serial.log

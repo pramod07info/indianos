@@ -134,6 +134,10 @@ pub mod retirement_gate;
 pub mod nic_rx_fence;
 /// R131 exact-generation one-AP release/acquire rendezvous (not APIC IPI).
 pub mod smp_lifecycle_fence;
+#[cfg(any(feature="normal-desktop",feature="test-r118-ap-ack"))]
+mod tlb;
+#[cfg(feature="test-r118-ap-ack")]
+mod tlb_probe;
 // M1: authenticated ring3-service policy using the already implemented
 // checksummed, sector-backed HierVfs; host remount integration acceptance.
 // Does not enable formatting or physical-device access in ordinary boot.
