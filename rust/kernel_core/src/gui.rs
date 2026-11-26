@@ -959,7 +959,12 @@ pub(crate) fn compositor_info(pid:u32)->Option<[u8;64]>{
  out[24..32].copy_from_slice(&service.compositor_epoch.to_le_bytes());
  out[32..40].copy_from_slice(&service.compositor_sequence.to_le_bytes());
  out[40..48].copy_from_slice(&service.compositor_retired.0.to_le_bytes());
- out[48..56].copy_from_slice(&service.compositor_retired.1.to_le_bytes());Some(out)
+ out[48..56].copy_from_slice(&service.compositor_retired.1.to_le_bytes());
+ // Counter access stays privileged: inherited CR4.TSD must not fault PID4
+ // merely because the compositor records its actual guest frame cost.
+ let low:u32;let high:u32;
+ unsafe{core::arch::asm!("lfence","rdtsc",out("eax")low,out("edx")high,options(nomem,nostack));}
+ out[56..64].copy_from_slice(&((u64::from(high)<<32)|u64::from(low)).to_le_bytes());Some(out)
 }
 #[cfg(feature="normal-desktop")]
 pub(crate) fn compositor_begin(pid:u32,r:crate::compositor_pixels::FrameRequest)->Option<u64>{
@@ -1111,6 +1116,14 @@ impl Session{
         let (files_rect,terminal_rect)={
             let ww=(w*49/100).max(320).min(w-80);
             let wh=(h*50/100).max(240).min(h-110);
+            // The normal edition's fixed private canvases must fit even at
+            // the minimum mode; large modes cannot exceed retained-plane bounds.
+            #[cfg(feature="normal-desktop")]
+            let ww=ww.max(crate::pixel_protocol::NATIVE_CANVAS_WIDTH as u32+18)
+                .min(crate::pixel_protocol::MAX_WIDTH+18).min(w-80);
+            #[cfg(feature="normal-desktop")]
+            let wh=wh.max(crate::pixel_protocol::NATIVE_CANVAS_HEIGHT as u32+54)
+                .min(crate::pixel_protocol::MAX_HEIGHT+54).min(h-110);
             (Rect::new(45,75,ww,wh),
              Rect::new((w-ww-36) as i32,(h-wh-65) as i32,ww,wh))
         };
@@ -1351,6 +1364,21 @@ mod tests{
             assert!(svc.frame_row(4,span,&row));
         }
         request.y=0;request
+    }
+    #[cfg(feature="normal-desktop")]
+    #[test]fn g4_normal_modes_preserve_fixed_canvas_and_bounded_surface_extents(){
+        for (width,height) in [(640,480),(800,600),(1280,800),(1600,900),(1600,1600)]{
+            let session=Session::new(width,height).unwrap();
+            for w in session.desktop.windows(){
+                let cw=w.bounds.width-18;let ch=w.bounds.height-54;
+                assert!(cw>=crate::pixel_protocol::NATIVE_CANVAS_WIDTH as u32);
+                assert!(ch>=crate::pixel_protocol::NATIVE_CANVAS_HEIGHT as u32);
+                assert!(cw<=crate::pixel_protocol::MAX_WIDTH&&ch<=crate::pixel_protocol::MAX_HEIGHT);
+                assert!(w.bounds.x>=0&&w.bounds.y>=48);
+                assert!(w.bounds.x as u32+w.bounds.width<=width);
+                assert!(w.bounds.y as u32+w.bounds.height<=height-42);
+            }
+        }
     }
     #[cfg(feature="normal-desktop")]
     #[test]fn g4_complete_frame_is_private_until_successful_atomic_commit(){

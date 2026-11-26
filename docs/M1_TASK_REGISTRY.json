@@ -1892,7 +1892,26 @@
       "status": "audit_required",
       "source_document": "docs/M1_PHASE_SCOPE.md",
       "source_paths": [],
-      "merged_prs": []
+      "merged_prs": [],
+      "g4_scoped_evidence": {
+        "classification": "implementation_candidate_acceptance_pending",
+        "candidate_pr": 816,
+        "intake_sha": "e7f06b750f4ccdd075bf9f778c9c11c082af02ed",
+        "source_paths": [
+          "rust/kernel_core/src/gui.rs",
+          "rust/kernel_core/src/compositor_pixels.rs",
+          "rust/kernel_core/src/user_runtime.rs",
+          "rust/kernel_core/src/user_image.rs",
+          "userland/rust/src/main.rs",
+          "userland/rust/src/desktop_window.rs",
+          "tools/test_normal_desktop_qemu.py"
+        ],
+        "audit_document": "docs/M1_G4_FULL_FRAME_AUDIT.md",
+        "acceptance_document": "docs/M1_G4_FULL_FRAME_QEMU_ACCEPTANCE.md",
+        "scope": "Only the explicit G4 compositor/isolation requirement; broader P9 and G5/G8 dependencies remain binding.",
+        "independent_review": "pending",
+        "merged_main_verification": "pending"
+      }
     },
     {
       "id": "M1-P9-002",
@@ -1901,7 +1920,26 @@
       "status": "audit_required",
       "source_document": "docs/M1_PHASE_SCOPE.md",
       "source_paths": [],
-      "merged_prs": []
+      "merged_prs": [],
+      "g4_scoped_evidence": {
+        "classification": "implementation_candidate_acceptance_pending",
+        "candidate_pr": 816,
+        "intake_sha": "e7f06b750f4ccdd075bf9f778c9c11c082af02ed",
+        "source_paths": [
+          "rust/kernel_core/src/gui.rs",
+          "rust/kernel_core/src/compositor_pixels.rs",
+          "rust/kernel_core/src/user_runtime.rs",
+          "rust/kernel_core/src/user_image.rs",
+          "userland/rust/src/main.rs",
+          "userland/rust/src/desktop_window.rs",
+          "tools/test_normal_desktop_qemu.py"
+        ],
+        "audit_document": "docs/M1_G4_FULL_FRAME_AUDIT.md",
+        "acceptance_document": "docs/M1_G4_FULL_FRAME_QEMU_ACCEPTANCE.md",
+        "scope": "Only the explicit G4 compositor/isolation requirement; broader P9 and G5/G8 dependencies remain binding.",
+        "independent_review": "pending",
+        "merged_main_verification": "pending"
+      }
     },
     {
       "id": "M1-P9-003",
@@ -1910,7 +1948,26 @@
       "status": "audit_required",
       "source_document": "docs/M1_PHASE_SCOPE.md",
       "source_paths": [],
-      "merged_prs": []
+      "merged_prs": [],
+      "g4_scoped_evidence": {
+        "classification": "implementation_candidate_acceptance_pending",
+        "candidate_pr": 816,
+        "intake_sha": "e7f06b750f4ccdd075bf9f778c9c11c082af02ed",
+        "source_paths": [
+          "rust/kernel_core/src/gui.rs",
+          "rust/kernel_core/src/compositor_pixels.rs",
+          "rust/kernel_core/src/user_runtime.rs",
+          "rust/kernel_core/src/user_image.rs",
+          "userland/rust/src/main.rs",
+          "userland/rust/src/desktop_window.rs",
+          "tools/test_normal_desktop_qemu.py"
+        ],
+        "audit_document": "docs/M1_G4_FULL_FRAME_AUDIT.md",
+        "acceptance_document": "docs/M1_G4_FULL_FRAME_QEMU_ACCEPTANCE.md",
+        "scope": "Only the explicit G4 compositor/isolation requirement; broader P9 and G5/G8 dependencies remain binding.",
+        "independent_review": "pending",
+        "merged_main_verification": "pending"
+      }
     },
     {
       "id": "M1-P9-004",
@@ -1927,7 +1984,9 @@
         "userland/rust/src/desktop_pixels.rs",
         "userland/rust/src/main.rs"
       ],
-      "merged_prs": [797],
+      "merged_prs": [
+        797
+      ],
       "g1_g2_scoped_evidence": {
         "gates": [
           "G1"
@@ -1957,6 +2016,25 @@
           "Reviewed master checklist reconciliation",
           "Verify applicable CI on updated PR head and final merged-main SHA before acceptance"
         ]
+      },
+      "g4_scoped_evidence": {
+        "classification": "implementation_candidate_acceptance_pending",
+        "candidate_pr": 816,
+        "intake_sha": "e7f06b750f4ccdd075bf9f778c9c11c082af02ed",
+        "source_paths": [
+          "rust/kernel_core/src/gui.rs",
+          "rust/kernel_core/src/compositor_pixels.rs",
+          "rust/kernel_core/src/user_runtime.rs",
+          "rust/kernel_core/src/user_image.rs",
+          "userland/rust/src/main.rs",
+          "userland/rust/src/desktop_window.rs",
+          "tools/test_normal_desktop_qemu.py"
+        ],
+        "audit_document": "docs/M1_G4_FULL_FRAME_AUDIT.md",
+        "acceptance_document": "docs/M1_G4_FULL_FRAME_QEMU_ACCEPTANCE.md",
+        "scope": "Only the explicit G4 compositor/isolation requirement; broader P9 and G5/G8 dependencies remain binding.",
+        "independent_review": "pending",
+        "merged_main_verification": "pending"
       }
     },
     {
@@ -1966,7 +2044,26 @@
       "status": "audit_required",
       "source_document": "docs/M1_PHASE_SCOPE.md",
       "source_paths": [],
-      "merged_prs": []
+      "merged_prs": [],
+      "g4_scoped_evidence": {
+        "classification": "implementation_candidate_acceptance_pending",
+        "candidate_pr": 816,
+        "intake_sha": "e7f06b750f4ccdd075bf9f778c9c11c082af02ed",
+        "source_paths": [
+          "rust/kernel_core/src/gui.rs",
+          "rust/kernel_core/src/compositor_pixels.rs",
+          "rust/kernel_core/src/user_runtime.rs",
+          "rust/kernel_core/src/user_image.rs",
+          "userland/rust/src/main.rs",
+          "userland/rust/src/desktop_window.rs",
+          "tools/test_normal_desktop_qemu.py"
+        ],
+        "audit_document": "docs/M1_G4_FULL_FRAME_AUDIT.md",
+        "acceptance_document": "docs/M1_G4_FULL_FRAME_QEMU_ACCEPTANCE.md",
+        "scope": "Only the explicit G4 compositor/isolation requirement; broader P9 and G5/G8 dependencies remain binding.",
+        "independent_review": "pending",
+        "merged_main_verification": "pending"
+      }
     },
     {
       "id": "M1-P9-006",
@@ -1993,7 +2090,26 @@
       "status": "audit_required",
       "source_document": "docs/M1_PHASE_SCOPE.md",
       "source_paths": [],
-      "merged_prs": []
+      "merged_prs": [],
+      "g4_scoped_evidence": {
+        "classification": "implementation_candidate_acceptance_pending",
+        "candidate_pr": 816,
+        "intake_sha": "e7f06b750f4ccdd075bf9f778c9c11c082af02ed",
+        "source_paths": [
+          "rust/kernel_core/src/gui.rs",
+          "rust/kernel_core/src/compositor_pixels.rs",
+          "rust/kernel_core/src/user_runtime.rs",
+          "rust/kernel_core/src/user_image.rs",
+          "userland/rust/src/main.rs",
+          "userland/rust/src/desktop_window.rs",
+          "tools/test_normal_desktop_qemu.py"
+        ],
+        "audit_document": "docs/M1_G4_FULL_FRAME_AUDIT.md",
+        "acceptance_document": "docs/M1_G4_FULL_FRAME_QEMU_ACCEPTANCE.md",
+        "scope": "Only the explicit G4 compositor/isolation requirement; broader P9 and G5/G8 dependencies remain binding.",
+        "independent_review": "pending",
+        "merged_main_verification": "pending"
+      }
     },
     {
       "id": "M1-P9-009",
@@ -2020,7 +2136,26 @@
       "status": "audit_required",
       "source_document": "docs/M1_PHASE_SCOPE.md",
       "source_paths": [],
-      "merged_prs": []
+      "merged_prs": [],
+      "g4_scoped_evidence": {
+        "classification": "implementation_candidate_acceptance_pending",
+        "candidate_pr": 816,
+        "intake_sha": "e7f06b750f4ccdd075bf9f778c9c11c082af02ed",
+        "source_paths": [
+          "rust/kernel_core/src/gui.rs",
+          "rust/kernel_core/src/compositor_pixels.rs",
+          "rust/kernel_core/src/user_runtime.rs",
+          "rust/kernel_core/src/user_image.rs",
+          "userland/rust/src/main.rs",
+          "userland/rust/src/desktop_window.rs",
+          "tools/test_normal_desktop_qemu.py"
+        ],
+        "audit_document": "docs/M1_G4_FULL_FRAME_AUDIT.md",
+        "acceptance_document": "docs/M1_G4_FULL_FRAME_QEMU_ACCEPTANCE.md",
+        "scope": "Only the explicit G4 compositor/isolation requirement; broader P9 and G5/G8 dependencies remain binding.",
+        "independent_review": "pending",
+        "merged_main_verification": "pending"
+      }
     },
     {
       "id": "M1-P9-012",
@@ -2029,7 +2164,26 @@
       "status": "audit_required",
       "source_document": "docs/M1_PHASE_SCOPE.md",
       "source_paths": [],
-      "merged_prs": []
+      "merged_prs": [],
+      "g4_scoped_evidence": {
+        "classification": "implementation_candidate_acceptance_pending",
+        "candidate_pr": 816,
+        "intake_sha": "e7f06b750f4ccdd075bf9f778c9c11c082af02ed",
+        "source_paths": [
+          "rust/kernel_core/src/gui.rs",
+          "rust/kernel_core/src/compositor_pixels.rs",
+          "rust/kernel_core/src/user_runtime.rs",
+          "rust/kernel_core/src/user_image.rs",
+          "userland/rust/src/main.rs",
+          "userland/rust/src/desktop_window.rs",
+          "tools/test_normal_desktop_qemu.py"
+        ],
+        "audit_document": "docs/M1_G4_FULL_FRAME_AUDIT.md",
+        "acceptance_document": "docs/M1_G4_FULL_FRAME_QEMU_ACCEPTANCE.md",
+        "scope": "Only the explicit G4 compositor/isolation requirement; broader P9 and G5/G8 dependencies remain binding.",
+        "independent_review": "pending",
+        "merged_main_verification": "pending"
+      }
     },
     {
       "id": "M1-P10-001",

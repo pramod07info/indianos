@@ -120,6 +120,18 @@ accepting this slice. G5/G6/G7 remain **IN PROGRESS**; broader concurrency,
 physical-device qualification and full phase-scope acceptance remain separate
 obligations. No completion percentage or accepted-gate count changes here.
 
+## G4 full-frame candidate — 26 Nov 2026
+
+PR #816 implements complete ring-3 scene assembly, bounded complete-frame
+presentation and one client-preserving PID4 replacement. The
+[G4 audit and dependency map](M1_G4_FULL_FRAME_AUDIT.md) covers all twelve P9
+rows and separates this implementation from full-ledger and physical-device
+requirements. Scoped candidate references are proposed in the registry; no
+formal acceptance status or checkbox changes. Verified M1 acceptance remains
+**5/13** until the repository's review, exact-head and merged-main evidence
+process records the decision. See [integration evidence](M1_INTEGRATION_AUDIT.md)
+for actual results and outstanding failures.
+
 ## M2 — Developer Alpha
 
 **Current M2 integrated workstream:** [M2 developer-alpha engineering

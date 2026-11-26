@@ -81,7 +81,7 @@ mod tests {
 
 /// Extended transport shares the existing generation-bound snapshot format.
 pub const BULK_OPERATION:u64=3;
-pub const BULK_PIXELS:usize=256;
+pub const BULK_PIXELS:usize=768;
 pub const BULK_REPLY_BYTES:usize=HEADER_BYTES+BULK_PIXELS*8;
 pub const FRAME_BEGIN:u64=4;
 pub const FRAME_ROW:u64=5;

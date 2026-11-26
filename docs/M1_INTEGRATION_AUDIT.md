@@ -62,3 +62,30 @@ recovery and unchanged selected media.
 [Artifact 15022933098](https://github.com/pramod07info/indianos/actions/runs/45616480940/artifacts/15022933098)
 retains the exact-candidate evidence. Formal reconciliation and merged-main
 qualification are still pending.
+
+## G4 full-frame implementation candidate — 26 Nov 2026
+
+PR #816 now extends the existing guarded client snapshots to complete PID4
+frames and compositor-only recovery. The [P9 audit](M1_G4_FULL_FRAME_AUDIT.md)
+maps every row to production symbols, missing behavior and acceptance cases.
+The [frame transport](M1_G4_FRAME_HANDOFF.md) and
+[recovery policy](M1_PID4_ONLY_RECOVERY.md) document the security boundaries.
+The normal compositor renders all background/chrome, clients, stacking,
+launcher and pointer; ring0 validates and copies a complete frame. A failed or
+stale transaction retains the previous visible frame. Replacement readiness
+requires a complete new-epoch frame and preserves the three client incarnations.
+
+Cloud workspace testing passed the normal boot's real PS/2 focus, drag,
+minimize/restore, exact Files/Terminal pixels, persistent operations and cleanup.
+This exploratory image was built from the integration working tree; it is not an
+exact-commit acceptance receipt. Fresh candidate CI/artifacts and recovery/fault
+qualification must be recorded before the implementation is accepted. The
+intake e7f06b7 reliability run 45620230115 failed shutdown exhaustion in job
+139226081725: the second session returned desktop-display-unavailable instead
+of READY. Artifact 15025301831 retains that failure. The original acceptance
+oracle remains active; the failure must be resolved and rerun.
+
+The canonical registry now carries scoped audit references, without changing
+any formal status or broad P9 checkbox. Formal M1 acceptance stays **5/13**;
+independent source approval, exact-head evidence and merged-main verification
+remain required. Candidate success does not imply hardware qualification.

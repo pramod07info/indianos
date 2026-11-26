@@ -69,8 +69,8 @@ fault. Existing startup-fault and whole-session retry oracles are unchanged.
 
 ## Evidence and limitations
 
-The edited harness has 72 focused host tests and the full repository Python
-suite has 219 passing tests. They check the oracles and fixture boundaries,
+The edited harness has 73 focused host tests and the full repository Python
+suite has 220 passing tests. They check the oracles and fixture boundaries,
 not guest success. Live QEMU, freestanding, kernel, security, durable-VFS and
 exact-head CI remain coordinator integration responsibilities. Retain the
 candidate SHA, job URL, serial/debugger logs, images, cost JSON and artifact
@@ -82,3 +82,9 @@ exhaustion case when the retry entered `desktop-display-unavailable` before
 its second READY. Artifact 15025301831 retains that failure. This change
 preserves the existing shutdown exhaustion assertion; a new integrated run
 must prove the production fix and the two real armed shutdown attempts.
+
+Local cloud integration found and resolved two acceptance-transport assumptions:
+physical motion is now sent in at most 100-unit transfers with exact presented
+coordinate/button acknowledgments, and the debugger validates either contiguous
+or compiler-split storage for the existing compositor ELF tuple. These changes
+retain the original glyph, capture, authority and media assertions.

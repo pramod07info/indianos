@@ -126,8 +126,8 @@ def text_field_bounds(image: tuple[int, int, bytes], field: str) -> tuple[int, i
     width, height, pixels = image
     if width < 640 or height < 480 or len(pixels) != width * height * 3:
         raise AssertionError("invalid qualified framebuffer geometry")
-    window_width = min(max(width * 49 // 100, 320), width - 80)
-    window_height = min(max(height * 50 // 100, 240), height - 110)
+    window_width = min(max(width * 49 // 100, 338), 786, width - 80)
+    window_height = min(max(height * 50 // 100, 294), 822, height - 110)
     if field == "terminal":
         x, y, count = width - window_width - 36 + 9 + 24, height - window_height - 65 + 44 + 181, 270
     elif field == "files-directory":
@@ -387,11 +387,17 @@ def await_pointer(session: QemuSession, x: int, y: int, buttons: int, since: int
 
 def move_pointer(session: QemuSession, previous: tuple[int, int], target: tuple[int, int],
                  buttons: int = 0) -> None:
-    if previous == target:
-        return
-    since = len(session.output)
-    session.hmp(f"mouse_move {target[0] - previous[0]} {target[1] - previous[1]}")
-    await_pointer(session, target[0], target[1], buttons, since)
+    # Keep each emulated physical transfer within a signed Set-1 mouse
+    # packet's range. Large HMP batches can exhaust the device queue before
+    # the guest has presented all intermediate packets.
+    x, y = previous
+    while (x, y) != target:
+        dx = max(-100, min(100, target[0] - x))
+        dy = max(-100, min(100, target[1] - y))
+        since = len(session.output)
+        session.hmp(f"mouse_move {dx} {dy}")
+        x, y = x + dx, y + dy
+        await_pointer(session, x, y, buttons, since)
 
 
 def pointer_button(session: QemuSession, position: tuple[int, int], buttons: int) -> None:
@@ -464,7 +470,7 @@ def pointer_window_acceptance(session: QemuSession, folder: Path, index: int,
     verify_text_pixels(restored, "files-note", expected)
     acknowledged_key(session, "2", "R031.1 user switched to Terminal app")
     visible = session.shot(folder / f"desktop-{index}-before-minimize.ppm")
-    terminal_height = min(max(height * 50 // 100, 240), height - 110)
+    terminal_height = min(max(height * 50 // 100, 294), 822, height - 110)
     title = (width - 100, height - terminal_height - 50)
     move_pointer(session, center, title)
     pointer_button(session, title, 1)
@@ -1527,6 +1533,32 @@ def unique_symbol(nm: str, elf: Path, parts: tuple[str, ...]) -> int:
     return int(matches[0], 16)
 
 
+def compositor_source_words(symbols: str) -> tuple[int, int]:
+    # LLVM may split the private Rust tuple into two scalar globals with
+    # the same demangled name. Inspect actual symbol sizes, never choose
+    # an arbitrary match or assume which scalar contains the pointer.
+    matches = []
+    for line in symbols.splitlines():
+        if "user_runtime::COMPOSITOR_ELF" in line:
+            fields = line.split()
+            if len(fields) < 4:
+                raise AssertionError("malformed compositor source symbol")
+            matches.append((int(fields[0], 16), int(fields[1], 16)))
+    if len(matches) == 1 and matches[0][1] == 16:
+        return matches[0][0], matches[0][0] + 8
+    if len(matches) == 2 and all(size == 8 for _, size in matches) and matches[0][0] != matches[1][0]:
+        return tuple(address for address, _ in matches)
+    raise AssertionError("ambiguous compositor source storage")
+
+
+def compositor_source_extent(debugger: GuestDebugger, words: tuple[int, int], length: int) -> tuple[int, int]:
+    values = [struct.unpack("<Q", debugger.memory(address, 8))[0] for address in words]
+    pointers = [value for value in values if value != length]
+    if values.count(length) != 1 or len(pointers) != 1 or not 0xffff800000000000 <= pointers[0] <= (1 << 64) - length:
+        raise AssertionError("invalid compositor source extent")
+    return pointers[0], length
+
+
 def stack_guard_records(symbols: str) -> list[tuple[int, int, int]]:
     records = []
     for name, count in (("interrupts::DF_STACK", 1), ("interrupts::USER_STACKS", 4)):
@@ -2021,10 +2053,10 @@ def transient_service_boot(qemu: str, iso: Path, ovmf: Path, disk: Path,
     scratch_ledger = unique_symbol(nm, kernel, ("DESKTOP_APP_PIXEL_GUARDS",))
     clients_ledger = unique_symbol(nm, kernel, ("DESKTOP_CLIENT_INCARNATIONS",))
     roles_ledger = unique_symbol(nm, kernel, ("DESKTOP_PROCESS_GENERATIONS",))
-    source_ledger = unique_symbol(nm, kernel, ("user_runtime::COMPOSITOR_ELF",))
     symbols = subprocess.run([nm, "-S", "-n", "-C", str(kernel)], check=True,
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15)
     guards = stack_guard_records(symbols.stdout.decode("ascii"))
+    source_words = compositor_source_words(symbols.stdout.decode("ascii")) if failure else None
     unmapped = 0x60000000
     original = disk.read_bytes()
     process, sock, session = spawn(qemu, iso, ovmf, disk, folder, name, debugger=True)
@@ -2129,7 +2161,7 @@ def transient_service_boot(qemu: str, iso: Path, ovmf: Path, disk: Path,
         roles_before = debugger.memory(roles_ledger, 32)
         client_incarnation_records(clients_before)
         if failure is not None:
-            pointer, length = struct.unpack("<QQ", debugger.memory(source_ledger, 16))
+            pointer, length = compositor_source_extent(debugger, source_words, len(compositor))
             if length != len(compositor) or debugger.memory(pointer, 64) != compositor[:64]:
                 raise AssertionError("replacement source is not the current compositor ELF")
             replacement = (bytes(len(compositor)) if failure == "load" else

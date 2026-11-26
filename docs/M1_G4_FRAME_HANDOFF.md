@@ -11,7 +11,7 @@ fixtures retain that implementation.
 
 Operations 0 and 2 retain the existing state and seven-pixel snapshot ABI.
 Operation3 uses the same IPR1 request and sixteen-byte snapshot header with up to
-256 covered pixel samples (2,064 bytes). A dedicated compositor copy path validates
+768 covered pixel samples (6,160 bytes). A dedicated compositor copy path validates
 every page's mapping, image ownership and permissions before copying. The generic
 256-byte input and 72-byte output limits remain unchanged. Uncommitted app pixels
 remain inaccessible, and published generations must match exactly.
@@ -35,7 +35,8 @@ publication, not a claim of display-vblank synchronization or tear-free GPU scan
 
 INFO operation8 returns geometry0–3, format4–7, native red/green/blue masks8–19,
 physical button bit20–23, owner epoch24–31, committed sequence32–39, retired
-last-issued token40–47 and retired epoch48–55, with56–63 zero. Only authenticated
+last-issued token40–47 and retired epoch48–55, and a kernel-sampled guest TSC at56–63. Counter sampling stays privileged,
+so inherited CR4.TSD cannot fault a compositor merely for recording frame cost. Only authenticated
 PID4 may inspect it. Retirement cancels pending work and capture, advances epoch
 without wrapping, and preserves client grants, canvases and the physical button
 latch. A replacement may re-present the exact last committed policy at the same

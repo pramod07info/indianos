@@ -912,8 +912,31 @@ class NormalDesktopControls(unittest.TestCase):
                     raise AssertionError("helper waited for a state that was never presented")
         session = Session()
         self.assertEqual(harness.physical_focus(session, (200, 200), (100, 90), "Files"), (100, 90))
-        self.assertEqual(session.commands, ["mouse_move -100 -110", "mouse_button 1", "mouse_button 0"])
+        self.assertEqual(session.commands, ["mouse_move -100 -100", "mouse_move 0 -10", "mouse_button 1", "mouse_button 0"])
         self.assertEqual(session.buttons, 0)
+        session.commands.clear()
+        harness.move_pointer(session, (100, 90), (1180, 650))
+        self.assertEqual(session.position, [1180, 650])
+        self.assertEqual(len(session.commands), 11)
+        for command in session.commands:
+            _, x, y = command.split()
+            self.assertLessEqual(abs(int(x)), 100)
+            self.assertLessEqual(abs(int(y)), 100)
+
+    def test_compositor_source_storage_handles_verified_scalar_split_without_guessing(self):
+        pointer = 0xffff800000400000
+        class Debugger:
+            def memory(self, address, count):
+                self_outer.assertEqual(count, 8)
+                return struct.pack("<Q", {0x1000: 40000, 0x2000: pointer}[address])
+        self_outer = self
+        split = "1000 8 b indianos_kernel_core::user_runtime::COMPOSITOR_ELF\n2000 8 b indianos_kernel_core::user_runtime::COMPOSITOR_ELF\n"
+        self.assertEqual(harness.compositor_source_words(split), (0x1000, 0x2000))
+        self.assertEqual(harness.compositor_source_extent(Debugger(), (0x1000, 0x2000), 40000), (pointer, 40000))
+        self.assertEqual(harness.compositor_source_words("1000 10 b indianos_kernel_core::user_runtime::COMPOSITOR_ELF"), (0x1000, 0x1008))
+        for bad in ["", split + split, split.replace("2000 8", "1000 8"), split.replace("1000 8", "1000 4")]:
+            with self.assertRaises(AssertionError): harness.compositor_source_words(bad)
+        with self.assertRaises(AssertionError): harness.compositor_source_extent(Debugger(), (0x1000, 0x2000), 30000)
 
     def test_debugger_large_receipts_use_bounded_reads_and_private_pixel_fixture_changes_color(self):
         class Debugger:

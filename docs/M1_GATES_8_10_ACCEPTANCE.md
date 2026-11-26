@@ -193,3 +193,22 @@ Recovery must show fresh registration and commits from both reloaded clients.
 Record exact candidate and merged production SHA, normal desktop run and
 artifact, and independent approval before acceptance. Full userspace
 composition and client-preserving PID4 replacement remain separate.
+
+## G4 full-frame and client-preserving recovery candidate
+
+The implementation on PR #816 uses the existing compositor ABI for bounded
+whole-frame transactions and larger generation-bound client reads. PID4 owns
+scene assembly; the kernel validates geometry, native pixel masks, complete
+rows, both client snapshots, pointer/button state, request sequence and owner
+epoch before presentation. Failed and interrupted frames remain private.
+A replacement PID4 restores the committed frame before readiness, with original
+Files/Terminal canvases, file state and process incarnations retained. Sequenced
+broker requests distinguish an interrupted command from one published before
+its acknowledgment; replay cannot apply a launcher toggle twice.
+
+Use the [mandatory P9 map](M1_G4_FULL_FRAME_AUDIT.md) and
+[live graphical/recovery acceptance](M1_G4_FULL_FRAME_QEMU_ACCEPTANCE.md).
+Normal display geometry keeps the fixed app canvases within their validated
+client extents, including the minimum mode. Only exact-candidate and merged-main
+receipts plus the required independent decision can accept G4. This candidate
+changes no checkbox and leaves the verified M1 gate count at **5/13**.

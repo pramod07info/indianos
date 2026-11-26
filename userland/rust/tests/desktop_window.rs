@@ -122,3 +122,48 @@ fn wide_row_commits_only_after_all_chunks_succeed() {
         panic!("off-screen row reached the compositor callback")
     }), None);
 }
+
+#[test]fn replacement_waits_for_physical_release_before_fresh_capture(){
+ let mut m=Manager::new(&initial()).unwrap();m.quarantine_pointer();
+ let before=m.wire();m.control(&pointer(60,85,true)).unwrap();
+ m.control(&[b'P',1]).unwrap();m.control(&pointer(180,120,true)).unwrap();
+ assert_eq!(&m.wire()[16..24],&before[16..24]);
+ m.control(&pointer(60,85,false)).unwrap();m.control(&pointer(60,85,true)).unwrap();
+ m.control(&pointer(180,120,true)).unwrap();assert_ne!(&m.wire()[16..24],&before[16..24]);
+}
+#[test]fn full_scene_opaque_front_and_minimize_restore_reveal_exact_rear_pixels(){
+ let mut initial=initial();initial[32..34].copy_from_slice(&60u16.to_le_bytes());
+ initial[34..36].copy_from_slice(&90u16.to_le_bytes());
+ let mut m=Manager::new(&initial).unwrap();m.control(&[b'P',2]).unwrap();
+ let mut row=[0u32;800];let masks=[0xff0000,0xff00,0xff];
+ m.render_row(150,&mut row,masks,|slot,_,out|{if slot==0{out[80..100].fill(0x123456);}Some(())}).unwrap();
+ assert_eq!(row[85],0x1f3249); // Transparent Terminal client retains its own dark body.
+ m.control(b"Km").unwrap();
+ m.render_row(150,&mut row,masks,|slot,_,out|{if slot==0{out[80..100].fill(0x123456);}Some(())}).unwrap();
+ assert_eq!(row[85],0x123456);
+ m.control(b"Kr").unwrap();
+ m.render_row(150,&mut row,masks,|_,_,_|Some(())).unwrap();assert_eq!(row[85],0x1f3249);
+}
+#[test]fn full_scene_checks_geometry_native_format_and_clips_pointer(){
+ let mut m=Manager::new(&initial()).unwrap();let mut row=[0u32;800];let masks=[0xff0000,0xff00,0xff];
+ assert!(m.render_row(600,&mut row,masks,|_,_,_|Some(())).is_none());
+ assert!(m.render_row(0,&mut row[..799],masks,|_,_,_|Some(())).is_none());
+ for bad in [[0,0xff00,0xff],[0xff0000,0xff0000,0xff],[0xffff00,0xff00,0xff]]{
+  assert!(m.render_row(0,&mut row,bad,|_,_,_|Some(())).is_none());
+ }
+ m.control(&pointer(0,0,false)).unwrap();
+ m.render_row(0,&mut row,masks,|_,_,_|Some(())).unwrap();assert_eq!(row[0],0xffffff);
+ assert_eq!(row[799],0x0c142b);
+}
+#[test]fn replayed_controls_do_not_advance_or_apply_before_frame_commit(){
+ use policy::{FrameOrder,Delivery};
+ let mut order=FrameOrder::new(8);
+ assert_eq!(order.classify(8),Some(Delivery::Duplicate));
+ for invalid in [0,7,10,u64::MAX]{assert_eq!(order.classify(invalid),None);}
+ assert_eq!(order.classify(9),Some(Delivery::Next));
+ // A failed frame leaves the same next control eligible, not committed.
+ assert_eq!(order.classify(9),Some(Delivery::Next));assert!(!order.publish(8));
+ assert!(order.publish(9));assert_eq!(order.classify(9),Some(Delivery::Duplicate));
+ assert!(!order.publish(9));assert_eq!(order.classify(8),None);
+ let full=FrameOrder::new(u64::MAX);assert_eq!(full.classify(1),None);
+}
