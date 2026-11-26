@@ -41,6 +41,8 @@ const BAD:u64=u64::MAX;
 struct DirectMap{offset:u64}
 #[repr(C,align(16))]
 struct Task{
+ #[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
+ supervision:crate::process_wait::OwnerState,
  #[cfg(feature="normal-desktop")]
  fpu:crate::fpu_context::Context,
  image:UserImage,root:CloneResult,pcb:*mut Process,
@@ -84,6 +86,8 @@ pub extern "C" fn indianos_r013_take_worker_request()->bool {
  unsafe {let requested=PENDING_WORKER;PENDING_WORKER=false;requested}
 }
 static mut ACTIVE_TASK:*mut Task=ptr::null_mut();
+#[cfg(all(feature="test-r031-vfs",not(feature="normal-desktop")))]
+static mut NEXT_PROCESS_INCARNATION:u64=1;
 static mut ACTIVE_PROCESS:*mut Process=ptr::null_mut();
 #[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
 static mut R031_HANDLES:crate::fs_handles::FileHandles=
@@ -261,10 +265,10 @@ static mut R115_UDP_OWNERS:crate::udp_owner_epoch::Registry<2>=
 #[cfg(any(feature="test-r031-files-gui",feature="normal-desktop"))]
 static mut R120_RETIREMENT:crate::process_retirement_txn::ProcessRetirement<2,2,16>=
     crate::process_retirement_txn::ProcessRetirement::new();
-#[cfg(any(feature="test-r031-files-gui",feature="normal-desktop"))]
+#[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
 static R120_GATE:crate::retirement_gate::RetirementGate=
     crate::retirement_gate::RetirementGate::new();
-#[cfg(any(feature="test-r031-files-gui",feature="normal-desktop"))]
+#[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
 pub(crate) fn r120_cpu_id()->u32{
     // A host test thread can migrate; tests use a stable synthetic BSP ID
     // and separately verify wrong-core rejection with explicit IDs.
@@ -285,7 +289,7 @@ pub(crate) fn r120_cpu_id()->u32{
         (unsafe{__cpuid(1)}.ebx>>24)&255
     }
 }
-#[cfg(any(feature="test-r031-files-gui",feature="normal-desktop"))]
+#[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
 fn r120_masked()->bool{
     #[cfg(test)]{true}
     #[cfg(not(test))]{
@@ -294,11 +298,11 @@ fn r120_masked()->bool{
         flags&(1<<9)==0
     }
 }
-#[cfg(any(feature="test-r031-files-gui",feature="normal-desktop"))]
+#[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
 fn r120_setup()->bool{
     R120_GATE.register_bsp(r120_cpu_id(),r120_masked()).is_ok()
 }
-#[cfg(any(feature="test-r031-files-gui",feature="normal-desktop"))]
+#[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
 fn r120_enter()->Result<crate::retirement_gate::Permit<'static>,
                        crate::retirement_gate::GateError>{
     #[cfg(test)]{let _=r120_setup();}
@@ -1187,6 +1191,8 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
     _=>BAD
    }
   },
+  #[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
+  40=>native_process_wait(img,request.arg0,request.arg1,regs),
   #[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
   32=>{
    if !authenticated_r026_init(){return BAD;}
@@ -2088,6 +2094,8 @@ fn prepare(t:*mut Task,p:*mut Process,elf:*const u8,size:usize,original:u64,
  let task=unsafe{&mut *t};
  if p.is_null(){return false;}
  task.pcb=p;task.authority_live=true;
+ #[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
+ {task.supervision=crate::process_wait::OwnerState::new();}
  #[cfg(feature="normal-desktop")]
  {task.fpu=crate::fpu_context::Context::new();}
  #[cfg(feature="normal-desktop")]
@@ -2188,12 +2196,94 @@ fn prepare(t:*mut Task,p:*mut Process,elf:*const u8,size:usize,original:u64,
   let generations=unsafe{&mut *ptr::addr_of_mut!(DESKTOP_PROCESS_GENERATIONS)};
   let Some(next)=generations[slot].checked_add(1)else{return false;};
   generations[slot]=next;
+  task.supervision.incarnation=next;
   if slot<3{
    unsafe{(&mut *ptr::addr_of_mut!(DESKTOP_CLIENT_INCARNATIONS))[slot]=
       (next,task.root.root,task.file_generation);}
   }
  }
+ #[cfg(all(feature="test-r031-vfs",not(feature="normal-desktop")))]
+ unsafe{
+  let Some(next)=NEXT_PROCESS_INCARNATION.checked_add(1)else{return false;};
+  task.supervision.incarnation=NEXT_PROCESS_INCARNATION;NEXT_PROCESS_INCARNATION=next;
+ }
  pid_log(unsafe{(*p).pid},b"READY\0");true
+}
+#[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
+fn supervised_status(pid:u32)->Result<crate::process_wait::Status,crate::process_wait::Error>{
+ if !(2..=TASKS as u32).contains(&pid){return Err(crate::process_wait::Error::Invalid);}
+ let task=unsafe{&*task_ptr((pid-1) as usize)};
+ let Some(process)=(unsafe{task.pcb.as_ref()})else{return Err(crate::process_wait::Error::Invalid);};
+ if process.pid!=pid{return Err(crate::process_wait::Error::Invalid);}
+ crate::process_wait::Status::capture(process,task.supervision.incarnation,task.supervision.consumed)
+}
+#[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
+fn native_process_wait(img:*mut UserImage,operation:u64,descriptor:u64,regs:*const u64)->u64{
+ use crate::process_wait::{Request,Wait,BYTES};
+ let Ok(permit)=r120_enter()else{return BAD;};
+ let Some(parent)=authenticated_file_identity()else{return BAD;};
+ if parent.pid!=1{return BAD;}
+ let mut bytes=[0u8;BYTES];
+ if !unsafe{indianos_user_copy_readonly(img,descriptor,bytes.as_mut_ptr().cast(),BYTES)}{return BAD;}
+ let Ok(request)=Request::decode(operation,&bytes)else{return BAD;};
+ if !unsafe{indianos_user_can_write(&*img,request.address,BYTES)}{return BAD;}
+ let Ok(status)=supervised_status(request.pid)else{return BAD;};
+ if request.generation!=0&&request.generation!=status.generation{return BAD;}
+ if operation==0{
+  return if unsafe{indianos_user_copy_writable(&*img,request.address,status.wire().as_ptr(),BYTES)}{BYTES as u64}else{BAD};
+ }
+ match status.available(){
+  Err(_)=>return BAD,
+  Ok(true)=>{
+   if !unsafe{indianos_user_copy_writable(&*img,request.address,status.wire().as_ptr(),BYTES)}{return BAD;}
+   unsafe{(*task_ptr((request.pid-1) as usize)).supervision.consumed=true;}
+   return BYTES as u64;
+  },
+  Ok(false)=>{},
+ }
+ let raw=active_task();if raw.is_null(){return BAD;}
+ let Ok(wait)=Wait::begin(unsafe{(*raw).supervision.incarnation},request)else{return BAD;};
+ // A noreturn transition cannot run Drop. Release the exact gate before
+ // capturing/yielding; IRQs remain masked and only this BSP owns Task state.
+ drop(permit);
+ if !capture(regs,false){return BAD;}
+ unsafe{(*raw).supervision.wait=wait;x86_64_user_exit_to_kernel(YIELD)}
+}
+#[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
+fn service_process_waiters()->bool{
+ use crate::process_wait::{Error,Poll,BYTES};
+ if (0..TASKS).all(|slot|!unsafe{(*task_ptr(slot)).supervision.wait.active()}){return true;}
+ let Ok(_permit)=r120_enter()else{return false;};
+ for slot in 0..TASKS{
+  let raw=task_ptr(slot);
+  if !unsafe{(*raw).supervision.wait.active()}{continue;}
+  if slot!=0{return false;}
+  let target=unsafe{(*raw).supervision.wait.target()};
+  let snapshot=supervised_status(target);
+  let result={
+   let task=unsafe{&mut *raw};
+   let Some(process)=(unsafe{task.pcb.as_ref()})else{return false;};
+   let owner=crate::batch5_session::Identity{pid:1,generation:task.file_generation};
+   if process.pid!=1||process.state!=2||!task.saved||!task.image.ready||
+      !unsafe{(&*ptr::addr_of!(R031_HANDLES)).owns(owner)}{return false;}
+   let address=task.supervision.wait.address();let image=&task.image;
+   task.supervision.wait.poll(task.supervision.incarnation,snapshot,|bytes|unsafe{
+    indianos_user_can_write(image,address,BYTES)&&
+    indianos_user_copy_writable(image,address,bytes.as_ptr(),BYTES)
+   })
+  };
+  let answer=match result{
+   Poll::Pending=>continue,
+   Poll::TimedOut=>0,
+   Poll::Delivered=>{
+    unsafe{(*task_ptr((target-1) as usize)).supervision.consumed=true;}
+    crate::process_wait::BYTES as u64
+   },
+   Poll::Failed(Error::Invalid|Error::Stale|Error::Consumed|Error::Copy)=>BAD,
+  };
+  unsafe{(*raw).frame[14]=answer;}
+ }
+ true
 }
 #[cfg(any(feature="test-ipc",feature="normal-desktop"))]
 fn service_ipc_waiters()->bool{
@@ -2224,17 +2314,23 @@ fn service_ipc_waiters()->bool{
  }
  true
 }
-#[cfg(any(feature="test-ipc",feature="normal-desktop"))]
+#[cfg(any(feature="test-ipc",feature="test-r031-vfs",feature="normal-desktop"))]
 fn next_ipc_ready(scheduler:&mut Scheduler)->*mut Process{
  // Each pass is one cooperative selection round, not an IRQ or clock tick.
  // If every task sleeps, bounded empty passes expire all deadlines without
  // dispatching user code or fabricating scheduler/hardware accounting.
  for _ in 0..=crate::ipc::MAX_WAIT_ROUNDS as usize{
+  #[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
+  if !service_process_waiters(){return ptr::null_mut();}
+  #[cfg(any(feature="test-ipc",feature="normal-desktop"))]
   if !service_ipc_waiters(){return ptr::null_mut();}
   let mut waiting=[0u32;TASKS];
   for (slot,pid) in waiting.iter_mut().enumerate(){
    let task=unsafe{&*task_ptr(slot)};
+   #[cfg(any(feature="test-ipc",feature="normal-desktop"))]
    if task.ipc_wait.active(){*pid=task.ipc_wait.receiver();}
+   #[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
+   if task.supervision.wait.active(){*pid=(slot+1) as u32;}
   }
   let process=unsafe{crate::scheduler_next_matching(scheduler,
       |p|!waiting.contains(&p.pid))};
@@ -2487,6 +2583,8 @@ fn revoke_task_authority_with_kind(
  // This runs before any fallible release, including scheduler-abort rollback.
  // Clear the continuation even when no PCB was bound during preparation.
  task.saved=false;task.frame=[0;WORDS];task.image.ready=false;
+ #[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
+ task.supervision.wait.cancel();
  #[cfg(feature="normal-desktop")]
  for record in unsafe{&mut *ptr::addr_of_mut!(DESKTOP_APP_PIXEL_GUARDS)}{
   if record.0==task.root.root&&record.1==task.pixel_scratch[0]{*record=(0,0,0,0);}
@@ -2797,7 +2895,7 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
  if first.is_null()||second.is_null()||!active_image().is_null()||
     !active_task().is_null(){return false;}
  let Some((cpu,offset))=preflight()else{return false;};
- #[cfg(any(feature="test-r031-files-gui",feature="normal-desktop"))]
+ #[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
  if !r120_setup(){log(b"IndianOS: R120 denied unsafe CPU/IRQ scheduler entry\n\0");return false;}
  #[cfg(all(feature="normal-desktop",not(any(test,feature="std"))))]
  if !unsafe{crate::fpu_context::configure()}{
@@ -2982,9 +3080,9 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
    }
    user_service_failed=true;ok=false;break;
   }
-  #[cfg(any(feature="test-ipc",feature="normal-desktop"))]
+  #[cfg(any(feature="test-ipc",feature="test-r031-vfs",feature="normal-desktop"))]
   let pcb=next_ipc_ready(&mut scheduler);
-  #[cfg(not(any(feature="test-ipc",feature="normal-desktop")))]
+  #[cfg(not(any(feature="test-ipc",feature="test-r031-vfs",feature="normal-desktop")))]
   let pcb=unsafe{indianos_scheduler_next(&mut scheduler)};
   if pcb.is_null(){ok=false;break;}
   let pid=unsafe{(*pcb).pid};

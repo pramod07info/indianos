@@ -2342,9 +2342,7 @@ fn vfs_guest()->!{
         }
         _=>exit(253)
     }
-    if call(5,1,0)!=0{exit(254);}
-    write(b"R031.3 allowlisted worker started without VFS privileges");
-    yield_now();
+    native_child_wait();
     if call(17,2,0)!=1{exit(255);}
     if stage==4{
         if call(31,4,0)!=0{exit(213);}
@@ -2352,6 +2350,39 @@ fn vfs_guest()->!{
     }
     write(b"R031.3 verified persistent hierarchical storage and ring3 isolation");
     exit(0);
+}
+#[cfg(feature="r031-vfs-init")]
+fn native_child_wait(){
+    let mut status=[0xa5u8;64];let mut request=[0u8;64];
+    request[..4].copy_from_slice(&[1,0,64,0]);request[4..8].copy_from_slice(&2u32.to_le_bytes());
+    request[24..32].copy_from_slice(&(status.as_mut_ptr() as u64).to_le_bytes());
+    if call(40,0,request.as_ptr() as u64)!=64||status[..4]!=[1,0,64,0]{exit(252);}
+    let generation=u64::from_le_bytes(status[8..16].try_into().unwrap());
+    let Some(stale)=generation.checked_add(1)else{exit(252);};
+    let original=status;request[8..16].copy_from_slice(&stale.to_le_bytes());
+    if call(40,0,request.as_ptr() as u64)!=u64::MAX||status!=original{exit(252);}
+    request[8..16].copy_from_slice(&generation.to_le_bytes());
+    request[16..24].copy_from_slice(&1u64.to_le_bytes());
+    if call(40,1,request.as_ptr() as u64)!=0||status!=original{exit(252);}
+    write(b"native PID1 child wait timed out before launch without consuming status");
+    if call(5,1,0)!=0{exit(254);}
+    write(b"R031.3 allowlisted worker started without VFS privileges");
+    request[16..24].copy_from_slice(&32u64.to_le_bytes());
+    let destination=status.as_mut_ptr() as u64;
+    // USER_TOP - 64 KiB stack - one guard page, never a mapped stack slot.
+    request[24..32].copy_from_slice(&0x0000_7fff_effe_f000u64.to_le_bytes());
+    if call(40,1,request.as_ptr() as u64)!=u64::MAX||status!=original{exit(252);}
+    request[24..32].copy_from_slice(&destination.to_le_bytes());
+    request[63]=1;
+    if call(40,1,request.as_ptr() as u64)!=u64::MAX||status!=original{exit(252);}
+    request[63]=0;
+    if call(40,1,request.as_ptr() as u64)!=64||
+       status[4..8]!=2u32.to_le_bytes()||status[8..16]!=generation.to_le_bytes()||
+       status[16..20]!=4i32.to_le_bytes()||status[20..24]!=1u32.to_le_bytes()||
+       status[24..].iter().any(|&b|b!=0){exit(252);}
+    let completed=status;
+    if call(40,1,request.as_ptr() as u64)!=u64::MAX||status!=completed{exit(252);}
+    write(b"native PID1 generation-bound child wait completed after cleanup; replay denied");
 }
 #[no_mangle]
 pub extern "C" fn _start()->!{
@@ -2381,6 +2412,11 @@ pub extern "C" fn _start()->!{
             d[32..40].copy_from_slice(&1u64.to_le_bytes());
             if call(33,1,d.as_ptr() as u64)!=u64::MAX{exit(219);}
             write(b"R031.7 PID2 denied private VFS file via handle syscall");
+            let mut status=[0xa5u8;64];d.fill(0);d[..4].copy_from_slice(&[1,0,64,0]);
+            d[4..8].copy_from_slice(&2u32.to_le_bytes());
+            d[24..32].copy_from_slice(&(status.as_mut_ptr() as u64).to_le_bytes());
+            if call(40,0,d.as_ptr() as u64)!=u64::MAX||status!=[0xa5;64]{exit(219);}
+            write(b"native PID2 denied supervisor process query");
         }
         write(b"R030.2 installed native ELF ran in isolated PID2 ring3");
         exit(0);

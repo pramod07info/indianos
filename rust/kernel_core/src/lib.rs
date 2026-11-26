@@ -126,6 +126,8 @@ pub mod capability;
 pub mod vfs_path;
 /// Allocation-free process event FIFO and teardown cleanup.
 pub mod process_events;
+#[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
+mod process_wait;
 /// Bounded atomic exit/fault retirement across three kernel-local policy tables.
 /// Scheduler, socket table, IRQ and SMP integration remain separately gated.
 pub mod process_retirement_txn;

@@ -359,3 +359,61 @@ Per-CPU IDT/TSS, IPI routing, run queues, scheduler migration, concurrent PMM
 ownership and production multi-CPU shootdown/reclamation remain unfinished.
 Points 5, 6, 8, 9 and 10 remain in the pending ledger; no formal gate or completion
 percentage changes.
+
+### Native supervised-child query/wait (P3-003/011/012)
+
+Syscall 40 now exposes QUERY (operation 0) and bounded WAIT (operation 1) for
+PID1's kernel-configured service children. Parent authority comes from the real
+active PCB/Task and current filesystem identity, never a descriptor-supplied
+caller. Child PID and a nonzero process incarnation bind a wait to one loaded
+image; a compositor replacement cannot satisfy an old wait. Normal desktop uses
+its existing monotonic incarnation receipts; legacy VFS profiles receive a
+checked monotonic runtime incarnation. The existing fixed role membership is
+retained; this does not invent an arbitrary parent/child process tree.
+
+Input descriptor (64 bytes, little endian):
+
+| Offset | Value |
+| --- | --- |
+| 0 | u16 version 1; u16 size 64 |
+| 4 | u32 target PID, restricted to configured children 2..TASKS |
+| 8 | u64 incarnation; QUERY may use 0 to discover the current incarnation |
+| 16 | u64 selection-round deadline; QUERY 0, WAIT 1..32 |
+| 24 | u64 writable output address for exactly 64 bytes |
+| 32 | 32 reserved zero bytes |
+
+Output: version/size/PID at offsets 0/2/4, incarnation at 8, i32 process state
+at 16, u32 flags at 20 (bit 0 resources reclaimed, bit 1 wait consumed), u64
+exit status at 24 and fault vector at 32; offsets 40..64 are zero. CR3, kernel
+pointers and fault addresses are never exposed. Status/fault values are zero
+until terminal cleanup completes. Return 64 means a complete status copy, 0
+means a wait timeout with unchanged output, and BAD is the existing u64::MAX
+failure result. Unknown versions/operations, reserved bytes, source guard or
+crossing ranges, invalid destinations, stale incarnations and repeated WAITs
+are refused. QUERY remains nondestructive.
+
+WAIT captures a private ring-3 continuation and excludes that caller from
+scheduler selection while eligible peers run. Deadlines count cooperative
+selection rounds, not elapsed time or fabricated hardware ticks. A complete
+exit/fault wins at the deadline. Successful copy-out consumes the completion
+once; copy failure, timeout and stale identity cannot consume it. The exact
+BSP admission permit is explicitly dropped before the noreturn yield transition.
+Parent retirement cancels its continuation before releasing image state. This
+adds a real scheduler wait facility, not general threads, futexes or signals.
+
+Seven module tests cover request geometry, cleanup gating, timeout/peer chance,
+parent/child reuse, consumption, copy failure and fault-data isolation. Native
+ingress tests cover complete descriptors and guard/crossing addresses. The
+existing five-boot durable VFS guest now first times out while its child is
+parked, then launches it, blocks until real exit/reclamation, verifies status,
+and rejects replay. The child proves it cannot query supervisor status. Parent
+also tests stale generation, reserved fields and an unmapped output guard.
+The existing reboot/persistence harness requires these ordered live receipts.
+No local build, test or QEMU execution was performed; exact-head cloud results
+remain required before acceptance.
+
+This advances point 6 and the bounded wait prerequisite for point 5. General
+spawn/exec, arbitrary parentage, service restart policy beyond existing roles,
+threads/futexes/signals, normal IRQ/DMA/IOMMU networking, AHCI/NVMe/xHCI drivers,
+verified boot and physical power/device qualification remain unfinished. No
+formal gate or completion percentage changes.
