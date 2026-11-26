@@ -55,6 +55,16 @@ are not physical-machine, SMP scheduler, general TLS or arbitrary-driver proof.
 No new kernel build, QEMU run or hardware test was needed or claimed for this
 documentation audit; the linked existing logs were inspected.
 
+## Allocation follow-up after the pinned audit
+
+PR #819 merged as `01bbdec9207bb87ad86ad2006cdfb04d5c72a19b` adds the
+fallible compositor-specific buffer. The next owned-page-heap slice extends
+that production path with aggregate kernel-owner quotas and separate syscall
+scratch ownership; see [allocation behavior and remaining work](KERNEL_FRAME_ALLOCATION.md).
+P2-004/P2-011 remain unfinished. The classifications/counts above describe the
+original pinned audit; this follow-up does not retroactively change its evidence,
+formal task/gate statuses or completion percentage.
+
 ## Next implementation/qualification priorities
 
 Keep M1 completion first. Reinspect the cited source before each coding task;

@@ -832,14 +832,15 @@ class NormalDesktopControls(unittest.TestCase):
         lines = [b"IndianOS: fault vector=0x000000000000000e",
                  b"IndianOS: fault CR2=0x0000000060000000",
                  b"IndianOS: PID 4 FAULTED", b"IndianOS: PID 4 REAPED",
-                 harness.FRAME_RELEASED, harness.COMPOSITOR_PREPARED, harness.COMPOSITOR.encode(),
-                 harness.FRAME_ALLOCATED, harness.STALE_COMPOSITOR_DENIED, harness.FRAME_PRESENTED,
+                 harness.FRAME_RELEASED, harness.SCRATCH_RELEASED, harness.COMPOSITOR_PREPARED, harness.COMPOSITOR.encode(),
+                 harness.FRAME_ALLOCATED, harness.STALE_COMPOSITOR_DENIED, harness.SCRATCH_ALLOCATED, harness.FRAME_PRESENTED,
                  self.frame_cost(), harness.FRAME_PUBLISHED, harness.COMPOSITOR_REPLACED]
         return old + b"\n".join(lines) + b"\n", len(old)
 
     def test_transient_restart_requires_frame_reclamation_and_reallocation(self):
         trace, since = self.transient_trace()
-        for marker in (harness.FRAME_RELEASED, harness.FRAME_ALLOCATED):
+        for marker in (harness.FRAME_RELEASED, harness.FRAME_ALLOCATED,
+                       harness.SCRATCH_RELEASED, harness.SCRATCH_ALLOCATED):
             for bad in (trace.replace(marker + b"\n", b""),
                         trace.replace(marker, marker + b"\n" + marker)):
                 with self.subTest(marker=marker), self.assertRaises(AssertionError):

@@ -1032,7 +1032,7 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
      if unsafe{indianos_user_copy_writable(&*img,request.arg1,info.as_ptr(),info.len())}{0}else{BAD}
     },
     4..=7=>{
-     use crate::compositor_pixels::{FrameRequest,FRAME_BYTES,FRAME_LIMIT,FRAME_BEGIN,FRAME_ROW,FRAME_COMMIT};
+     use crate::compositor_pixels::{FrameRequest,FRAME_BYTES,FRAME_BEGIN,FRAME_ROW,FRAME_COMMIT};
      // BEGIN returns its token through this validated descriptor, before any
      // staging allocation changes. Other operations have no user copyout.
      if request.arg0==FRAME_BEGIN&&
@@ -1048,9 +1048,11 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
       },
       FRAME_ROW=>{
        if frame.bytes!=u64::from(frame.width)*4||frame.count!=frame.width{return BAD;}
-       let mut row=[0u32;FRAME_LIMIT];
-       if !unsafe{crate::user_image::compositor_copy_in(img,frame.pixels,row.as_mut_ptr().cast(),frame.bytes as usize)}{return BAD;}
-       if crate::gui::compositor_row(pid,frame,&row[..usize::from(frame.width)]){0}else{BAD}
+       if crate::gui::compositor_epoch()!=Some(frame.epoch){return BAD;}
+       crate::kernel_buffer::with_row(frame.epoch,|row|{
+        if !unsafe{crate::user_image::compositor_copy_in(img,frame.pixels,row.as_mut_ptr().cast(),frame.bytes as usize)}{return BAD;}
+        if crate::gui::compositor_row(pid,frame,&row[..usize::from(frame.width)]){0}else{BAD}
+       }).unwrap_or(BAD)
       },
       FRAME_COMMIT=>if crate::gui::compositor_commit(pid,frame){0}else{BAD},
       _=>if crate::gui::compositor_abort(pid,frame){0}else{BAD},
