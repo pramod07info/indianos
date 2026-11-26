@@ -16,6 +16,7 @@ PR #825 contains the current follow-up; its required checks must pass before mer
 | Failed normal-desktop clone construction ownership | Implemented in #825: bounded caller-owned frame ledger with retirement retry; guest failure injection pending |
 | Heap extent/backing integrity before unsafe operations | Implemented in #825; current-head acceptance pending |
 | User-image data/stack admission budgets and retained failed rollback ownership | Implemented in #825, including existing legacy C parity; not total RSS |
+| Shared supervisor direct-map ownership across normal desktop roots | Implemented in #825: excluded from private cloning, attached with receipt and detached before retirement; guest acceptance pending |
 | Noncontiguous physical backing behind contiguous virtual arenas | Not implemented |
 | Image/page-table backend integration | Implemented in #825: BSP admission and bounded physical-pressure recovery; guest acceptance pending |
 | Other kernel consumers/global Rust allocator integration | Not fully implemented |
@@ -390,3 +391,34 @@ private-frame-budget and recovery harnesses exercise the real callback path when
 run in GitHub Actions. No live pressure fault injection or physical pass is
 claimed. This is a bounded reclaim/reject policy for current image/table/heap
 callers, not a general OOM killer, shared-memory RSS policy or SMP allocator.
+
+
+## Shared supervisor direct-map ownership
+
+Normal desktop process roots now borrow the original kernel root's direct-map
+PML4 subtree instead of deep-cloning that subtree. The slot comes from the
+validated boot HHDM offset. The existing clone walker and private-table preflight
+both exclude the borrowed slot; other upper mappings remain privately cloned.
+Attachment requires an empty destination slot and a valid non-huge source table,
+forces PML4 supervisor privilege, refuses self/owned-root aliases, and records
+the exact borrowed entry in Task. No lower user mappings are shared.
+
+Retirement detaches the borrowed entry before recursive clone release. The
+receipt comparison tolerates only the hardware Accessed bit; a changed address
+or privilege/attribute flag fails closed. Failed later private-table release can
+retry without traversing or freeing the original kernel's borrowed subtree.
+Only private tables contribute to the process launch frame budget. CloneResult
+and legacy C ABI remain unchanged; this is the normal Rust desktop path.
+
+Host tests prove shared lookup visibility after a source-leaf change, supervisor
+PML4 privilege, reduced private table count, preservation of source tables after
+clone release, occupied-slot refusal and receipt mismatch rejection. The live
+normal-desktop harness requires the PID1 shared-map receipt and forbids repeating
+it during compositor-only recovery. These are pending exact-head guest checks;
+host lookup tests do not prove TLB invalidation behavior for live mapping updates.
+
+This removes the privately copied direct-map obstacle to a future contiguous
+virtual arena backed by scattered PMM frames. It does not itself implement that
+arena, scatter allocation, multi-CPU shootdowns or global allocator integration.
+The current buffer backend still requires physically contiguous runs. Single-BSP
+admission and inactive-root attach/detach remain mandatory.

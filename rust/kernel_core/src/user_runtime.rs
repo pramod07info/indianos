@@ -56,6 +56,8 @@ struct Task{
  ipc_wait:crate::ipc::ReceiveWait,
  #[cfg(feature="normal-desktop")]
  clone_retained:[u64;512],
+ #[cfg(feature="normal-desktop")]
+ shared_direct_map:(u16,u64),
 }
 #[cfg(any(feature="test-r029-desktop-suite",feature="normal-desktop"))]
 static mut THIRD_ELF:(*const u8,usize)=(ptr::null(),0);
@@ -2064,10 +2066,16 @@ fn prepare(t:*mut Task,p:*mut Process,elf:*const u8,size:usize,original:u64,
  if p.is_null(){return false;}
  task.pcb=p;task.authority_live=true;
  #[cfg(feature="normal-desktop")]
+ let direct_map_slot={
+  let mut offset=0;
+  if !unsafe{boot_hhdm_offset(&mut offset)}{return false;}
+  let slot=((offset>>39)&511) as usize;if slot<256{return false;}slot
+ };
+ #[cfg(feature="normal-desktop")]
  let private_budget={
   let Some(limit)=desktop_image_page_limit(unsafe{(*p).pid})else{return false;};
   let Some(image)= (unsafe{crate::user_image::required_private_frames(elf,size,limit)})else{return false;};
-  let Some(kernel)= (unsafe{crate::paging::required_table_frames(b,original,true)})else{return false;};
+  let Some(kernel)= (unsafe{crate::paging::required_table_frames_excluding(b,original,true,Some(direct_map_slot))})else{return false;};
   if !private_budget_admits(image,kernel){return false;}
   (image,kernel)
  };
@@ -2083,10 +2091,16 @@ fn prepare(t:*mut Task,p:*mut Process,elf:*const u8,size:usize,original:u64,
  #[cfg(feature="normal-desktop")]
  if unsafe{(*p).pid}==1{log(b"IndianOS: desktop broker image limit 64 pages enforced\n\0");}
  #[cfg(feature="normal-desktop")]
- let cloned=unsafe{crate::paging::clone_kernel_half_retained(b,original,&mut task.root,&mut task.clone_retained)};
+ let cloned=unsafe{crate::paging::clone_kernel_half_with_shared_slot(b,original,&mut task.root,&mut task.clone_retained,Some(direct_map_slot))};
  #[cfg(not(feature="normal-desktop"))]
  let cloned=unsafe{paging_clone_kernel_half(b,original,&mut task.root)};
- if !cloned||!unsafe{paging_attach_user_half(b,task.root.root,task.image.tables.root_physical)}{return false;}
+ if !cloned{return false;}
+ #[cfg(feature="normal-desktop")]
+ {
+  let Some(receipt)=(unsafe{crate::paging::attach_shared_upper(b,original,task.root.root,direct_map_slot)})else{return false;};
+  task.shared_direct_map=(direct_map_slot as u16,receipt);
+ }
+ if !unsafe{paging_attach_user_half(b,task.root.root,task.image.tables.root_physical)}{return false;}
  task.attached=true;
  #[cfg(feature="normal-desktop")]
  {
@@ -2094,7 +2108,10 @@ fn prepare(t:*mut Task,p:*mut Process,elf:*const u8,size:usize,original:u64,
   let actual=u64::from(task.image.page_count)+u64::from(image_tables);
   if actual!=private_budget.0||task.root.table_count!=private_budget.1||
      !private_budget_admits(actual,task.root.table_count){return false;}
-  if unsafe{(*p).pid}==1{log(b"IndianOS: desktop private frame budget 512 enforced\n\0");}
+  if unsafe{(*p).pid}==1{
+   log(b"IndianOS: desktop private frame budget 512 enforced\n\0");
+   log(b"IndianOS: desktop supervisor direct map shared with ownership receipt\n\0");
+  }
  }
  let addresses=[
   x86_64_enter_user as usize as u64,
@@ -2651,6 +2668,12 @@ fn discard(t:*mut Task,b:&CloneBackend,terminal:bool)->bool{
  }
  #[cfg(feature="normal-desktop")]
  if !unsafe{crate::paging::release_retained_frames(b,&mut task.clone_retained)}{return false;}
+ #[cfg(feature="normal-desktop")]
+ if task.shared_direct_map.1!=0{
+  if !unsafe{crate::paging::detach_shared_upper(b,task.root.root,
+     usize::from(task.shared_direct_map.0),task.shared_direct_map.1)}{return false;}
+  task.shared_direct_map=(0,0);
+ }
  if task.root.root!=0&&!unsafe{paging_clone_release(b,&mut task.root)}{return false;}
  if task.image.tables.initialized&&!unsafe{indianos_user_image_destroy(&mut task.image)}{return false;}
  #[cfg(feature="normal-desktop")]
