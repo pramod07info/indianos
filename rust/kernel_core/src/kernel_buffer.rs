@@ -79,10 +79,9 @@ unsafe impl Backend for Physical {
         if unsafe { MAPPING_QUARANTINE.1 } != 0 { return Err(Error::Mapping); }
         let mut offset = 0;
         if !unsafe { crate::boot::boot_hhdm_offset(&mut offset) } { return Err(Error::Mapping); }
-        let mut physical = 0;
-        if !unsafe { crate::pmm::pmm_allocate_contiguous_frames(pages, &mut physical) } {
+        let Some(physical) = (unsafe { crate::pmm::allocate_buffer_frames(pages) }) else {
             return Err(Error::OutOfMemory);
-        }
+        };
         // PMM returns only managed physical RAM. The validated boot direct map
         // covers its usable ranges; checked addition prevents alias wrapping.
         let pointer = physical.checked_add(offset).and_then(|start| {
@@ -95,13 +94,13 @@ unsafe impl Backend for Physical {
         }
         // Validated HHDM and managed frames make this unreachable, but undo a
         // failed mapping preflight rather than publishing an unusable buffer.
-        if !unsafe { crate::pmm::pmm_release_contiguous_frames(physical, pages) } {
+        if !unsafe { crate::pmm::release_buffer_frames(physical, pages) } {
             unsafe { MAPPING_QUARANTINE = (physical, pages); }
         }
         Err(Error::Mapping)
     }
     fn release(&mut self, physical: u64, pages: u32) -> bool {
-        let released = unsafe { crate::pmm::pmm_release_contiguous_frames(physical, pages) };
+        let released = unsafe { crate::pmm::release_buffer_frames(physical, pages) };
         if released { memory_log(b"IndianOS: kernel frame buffer released\n\0"); }
         released
     }

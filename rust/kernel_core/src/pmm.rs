@@ -241,19 +241,24 @@ pub unsafe extern "C" fn pmm_allocate_frame(physical: *mut u64) -> bool {
 impl State {
     /// Only a verified span table may authorize multi-frame DMA runs.
     fn claim_contiguous_run(&mut self,count:u32)->Option<u64>{
-        if !(1..=16).contains(&count) || !self.verify_frame_accounting(){return None;}
-        let want=count as u64;
+        self.claim_contiguous_run_bounded(count,16)
+    }
+    /// Kernel-buffer allocation shares the bitmap and first-fit policy, but
+    /// has its own hard ceiling. Legacy DMA callers retain the 16-page ABI.
+    fn claim_contiguous_run_bounded(&mut self,count:u32,limit:u32)->Option<u64>{
+        if count==0||count>limit||limit>2500||!self.verify_frame_accounting(){return None;}
+        let want=u64::from(count);
         if want>self.total-self.used{return None;}
         for span_index in 0..self.count {
-            let span=self.spans[span_index];
-            if span.count<want{continue;}
-            for offset in 0..=span.count-want {
-                let first_bit=span.bit_offset+offset;
-                if (0..want).any(|i|self.allocated(first_bit+i)){continue;}
-                let first=span.base.checked_add(offset.checked_mul(PAGE)?)?;
+            let span=self.spans[span_index];let mut free=0;
+            for offset in 0..span.count {
+                if self.allocated(span.bit_offset+offset){free=0;continue;}
+                free+=1;
+                if free!=want{continue;}
+                let start=offset+1-want;let first_bit=span.bit_offset+start;
+                let first=span.base.checked_add(start.checked_mul(PAGE)?)?;
                 for i in 0..want{self.set_bit(first_bit+i,true);}
-                self.used+=want;
-                self.cursor=(first_bit+want)%self.total;
+                self.used+=want;self.cursor=(first_bit+want)%self.total;
                 return Some(first);
             }
         }
@@ -472,7 +477,10 @@ impl State {
     }
     /// Validate a run of exact contiguous frames in one physical RAM span.
     fn validate_run(&self,physical:u64,count:u32,expect_busy:bool)->Option<u64>{
-        if !self.single_frame_geometry_valid() || count==0||count>16{return None;}
+        self.validate_run_bounded(physical,count,expect_busy,16)
+    }
+    fn validate_run_bounded(&self,physical:u64,count:u32,expect_busy:bool,limit:u32)->Option<u64>{
+        if !self.single_frame_geometry_valid() || count==0||count>limit||limit>2500{return None;}
         let first=self.bit_for_physical(physical)?;
         let end_physical=physical.checked_add((count as u64-1)*PAGE)?;
         let last=self.bit_for_physical(end_physical)?;
@@ -500,9 +508,12 @@ impl State {
     }
     /// Release a complete frame run atomically or none of its frames.
     fn release_run(&mut self,physical:u64,count:u32)->bool{
+        self.release_run_bounded(physical,count,16)
+    }
+    fn release_run_bounded(&mut self,physical:u64,count:u32,limit:u32)->bool{
         if !self.verify_frame_accounting()||
             self.used<count as u64{return false;}
-        let Some(first)=self.validate_run(physical,count,true)else{return false;};
+        let Some(first)=self.validate_run_bounded(physical,count,true,limit)else{return false;};
         for i in 0..count as u64{self.set_bit(first+i,false);}
         self.used-=count as u64;self.cursor=first;
         true
@@ -2362,5 +2373,49 @@ mod kernel_p0_batch36_w1 {
         s=state();s.spans[0].count=5;
         assert_eq!(s.trusted_free_count(),0);
         s=State::empty();assert_eq!(s.trusted_free_count(),0);
+    }
+}
+
+/// Allocate a page-rounded compositor buffer (at most 10,240,000 bytes).
+/// # Safety: serialized BSP, IRQs disabled; returned frames exclusively owned.
+pub(crate) unsafe fn allocate_buffer_frames(count:u32)->Option<u64>{
+    unsafe{state()}.claim_contiguous_run_bounded(count,2500)
+}
+/// # Safety: same allocator admission; all users of this owned run stopped.
+pub(crate) unsafe fn release_buffer_frames(physical:u64,count:u32)->bool{
+    unsafe{state()}.release_run_bounded(physical,count,2500)
+}
+#[cfg(test)]
+mod kernel_buffer_run_tests{
+    use super::*;
+    unsafe extern "C" fn read(index:u64,out:*mut Region,_:*mut c_void)->bool{
+        if index!=0||out.is_null(){return false;}
+        unsafe{out.write(Region{base:PAGE,length:PAGE*3000,kind:0});}true
+    }
+    #[test]fn desktop_sized_runs_use_real_bitmap_without_widening_dma_abi(){
+        let mut s=State::empty();
+        assert!(unsafe{initialize(&mut s,1,Some(read),ptr::null_mut())});
+        assert!(s.claim_contiguous_run(17).is_none());
+        let start=s.claim_contiguous_run_bounded(2500,2500).unwrap();
+        assert_eq!(start,PAGE);assert_eq!(s.used,2500);
+        assert!(s.claim_contiguous_run_bounded(501,2500).is_none());
+        assert!(!s.release_run(start,2500));assert_eq!(s.used,2500);
+        assert!(s.release_run_bounded(start,2500,2500));assert_eq!(s.used,0);
+        assert!(!s.release_run_bounded(start,2500,2500));
+        assert!(s.claim_contiguous_run_bounded(2501,2500).is_none());
+        assert!(s.claim_contiguous_run_bounded(0,2500).is_none());
+        assert!(s.verify_frame_accounting());
+    }
+    #[test]fn buffer_fragmentation_and_partial_release_are_atomic(){
+        let mut s=State::empty();
+        assert!(unsafe{initialize(&mut s,1,Some(read),ptr::null_mut())});
+        assert!(s.claim_run(PAGE*1500,1));
+        assert!(s.claim_contiguous_run_bounded(2500,2500).is_none());
+        assert_eq!(s.used,1);
+        let first=s.claim_contiguous_run_bounded(1000,2500).unwrap();
+        assert!(!s.release_run_bounded(first,1001,2500));assert_eq!(s.used,1001);
+        assert!(s.release_run_bounded(first,1000,2500));
+        assert!(s.release_run(PAGE*1500,1));assert_eq!(s.used,0);
+        assert!(s.claim_contiguous_run_bounded(2500,2500).is_some());
     }
 }
