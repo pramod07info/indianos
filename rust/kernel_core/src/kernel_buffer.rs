@@ -5,7 +5,7 @@ const PAGE: usize = 4096;
 pub(crate) const FRAME_QUOTA: usize = 1600 * 1600 * 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Error { Geometry, Quota, OutOfMemory, Mapping, Release, Owner, Metadata, Alignment, Stale }
+pub(crate) enum Error { Geometry, Quota, OutOfMemory, Mapping, Release, Owner, Metadata, Alignment, Stale, Integrity }
 
 pub(crate) fn allocation_size(bytes: usize, quota: usize) -> Result<(usize, u32), Error> {
     if bytes == 0 { return Err(Error::Geometry); }
@@ -32,6 +32,7 @@ pub(crate) struct Buffer {
 impl Buffer {
     pub(crate) fn charged(&self) -> usize { self.pages as usize * PAGE }
     pub(crate) fn pointer(&self) -> *mut u8 { self.pointer }
+    pub(crate) fn physical(&self) -> u64 { self.physical }
     pub(crate) const fn new() -> Self {
         Self { physical: 0, pointer: core::ptr::null_mut(), pages: 0, length: 0, owner: 0 }
     }

@@ -222,3 +222,20 @@ and image-capacity rejection before another allocation. They verify eventual
 release without double frees using the existing host backend. This is ownership
 conservation on staging failure, not general process RSS quotas, demand paging
 or a system-wide OOM killer.
+
+## Extent and backing integrity before unsafe operations
+
+Heap operations now verify their bounded external metadata before allocation,
+release, sharing receipts or quarantine reclamation. Checks include valid owner
+charges and generations; aligned, nonempty in-bounds extents; disjoint live
+leases; disjoint physical and virtual backing ranges; and absence of live leases
+in quarantine. Invalid metadata returns `Integrity` (diagnostic reason 10) before
+scrub or backend allocation/release. It is never treated as retryable pressure.
+Diagnostic summation of invalid live extents saturates rather than overflowing.
+
+Corruption regressions deliberately inject overflowing offsets, invalid region
+indices/generations, overlapping leases/backings and live quarantine. They verify
+that allocator/backend calls and neighboring bytes remain untouched, then restore
+metadata to verify ordinary cleanup. This bounds checks allocator metadata; it
+is not a claim that arbitrary kernel memory corruption is recoverable. Unsupported
+corruption stays fail-closed instead of guessing which physical pages are owned.

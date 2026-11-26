@@ -48,11 +48,56 @@ impl Heap {
     fn charge(&self, owner: Owner) -> usize {
         self.regions.iter().filter(|r|r.owner==Some(owner)).map(|r|r.buffer.charged()).sum()
     }
+    /// Validate all external extent metadata before pointer arithmetic, scrub
+    /// or physical release. Corruption fails closed without guessing ownership.
+    fn integrity_ok(&self)->bool{
+        if self.next_generation==0{return false;}
+        for (index,region) in self.regions.iter().enumerate(){
+            let charge=region.buffer.charged();
+            if charge==0{
+                if region.owner.is_some()||region.quarantined||region.sharing_logged||
+                   !region.buffer.pointer().is_null()||region.buffer.physical()!=0{return false;}
+                continue;
+            }
+            let Some(owner)=region.owner else{return false;};
+            if owner.epoch()==0||charge>owner.quota()||charge%4096!=0||
+               region.buffer.pointer().is_null()||region.buffer.pointer() as usize%4096!=0||
+               region.buffer.physical()==0||region.buffer.physical()%4096!=0||
+               self.charge(owner)>owner.quota(){return false;}
+            if matches!(owner,Owner::Scratch(_))&&charge!=8192{return false;}
+            let Some(physical_end)=region.buffer.physical().checked_add(charge as u64)else{return false;};
+            let virtual_start=region.buffer.pointer() as usize;
+            let Some(virtual_end)=virtual_start.checked_add(charge)else{return false;};
+            for other in self.regions.iter().skip(index+1).filter(|r|r.buffer.charged()!=0){
+                let Some(other_physical_end)=other.buffer.physical().checked_add(other.buffer.charged() as u64)else{return false;};
+                let other_start=other.buffer.pointer() as usize;
+                let Some(other_end)=other_start.checked_add(other.buffer.charged())else{return false;};
+                if (region.buffer.physical()<other_physical_end&&other.buffer.physical()<physical_end)||
+                   (virtual_start<other_end&&other_start<virtual_end){return false;}
+            }
+            let live=self.slots.iter().any(|slot|slot.live&&slot.region==index);
+            if region.quarantined==live{return false;}
+        }
+        for (index,slot) in self.slots.iter().enumerate().filter(|(_,slot)|slot.live){
+            let Some(region)=self.regions.get(slot.region)else{return false;};
+            let Some(end)=slot.offset.checked_add(slot.extent)else{return false;};
+            if slot.extent==0||slot.offset%8!=0||slot.extent%8!=0||
+               slot.generation==0||slot.generation>=self.next_generation||
+               region.owner.is_none()||region.quarantined||end>region.buffer.charged(){return false;}
+            if matches!(region.owner,Some(Owner::Frame(_)))&&
+               (slot.offset%4096!=0||slot.extent%4096!=0){return false;}
+            for other in self.slots.iter().skip(index+1).filter(|s|s.live&&s.region==slot.region){
+                let Some(other_end)=other.offset.checked_add(other.extent)else{return false;};
+                if slot.offset<other_end&&other.offset<end{return false;}
+            }
+        }
+        true
+    }
     fn snapshot(&self,owner:Owner)->Snapshot{
         Snapshot{pressure:self.pressure,
             reserved:self.regions.iter().map(|r|r.buffer.charged() as u64).sum(),
             quarantined:self.regions.iter().filter(|r|r.quarantined).map(|r|r.buffer.charged() as u64).sum(),
-            live_bytes:self.slots.iter().filter(|s|s.live).map(|s|s.extent as u64).sum(),
+            live_bytes:self.slots.iter().filter(|s|s.live).fold(0u64,|sum,s|sum.saturating_add(s.extent as u64)),
             live_allocations:self.slots.iter().filter(|s|s.live).count() as u64,
             owner_reserved:self.charge(owner) as u64,owner_kind:match owner{Owner::Frame(_)=>1,Owner::Scratch(_)=>2},owner_epoch:owner.epoch()}
     }
@@ -80,7 +125,7 @@ impl Heap {
         }
         if let Err(error)=result{
             self.pressure.failures=self.pressure.failures.saturating_add(1);
-            // At most nine first-class reports plus logarithmic repeats,
+            // At most one first report per class plus logarithmic repeats,
             // including when the caller alternates failure classes.
             let class=1u16<<error_code(error);
             self.report_due=self.reported_classes&class==0||self.pressure.failures.is_power_of_two();
@@ -106,6 +151,7 @@ impl Heap {
     }
     fn allocate(&mut self, owner: Owner, layout: Layout, backend: &mut (impl Backend + ?Sized))
         -> Result<(Token, *mut u8), Error> {
+        if !self.integrity_ok(){return Err(Error::Integrity);}
         if owner.epoch()==0{return Err(Error::Owner);}
         if layout.align()>4096{return Err(Error::Alignment);}
         let extent=owner.extent(layout.size())?;
@@ -141,6 +187,7 @@ impl Heap {
         Ok((Token{slot:index,generation},pointer))
     }
     fn release(&mut self, token: Token, backend: &mut (impl Backend + ?Sized)) -> Result<(), Error> {
+        if !self.integrity_ok(){return Err(Error::Integrity);}
         let slot=self.slots.get_mut(token.slot).ok_or(Error::Stale)?;
         if !slot.live||slot.generation!=token.generation{return Err(Error::Stale);}
         let region=slot.region;
@@ -153,6 +200,7 @@ impl Heap {
         Ok(())
     }
     fn reclaim_count(&mut self,backend:&mut(impl Backend+?Sized))->(usize,usize){
+        if !self.integrity_ok(){return (0,1);}
         let mut released=0;let mut remaining=0;
         for region in &mut self.regions{
             if region.quarantined{
@@ -170,6 +218,7 @@ impl Heap {
         self.reclaim_count(backend).1==0
     }
     fn note_sharing(&mut self, token: Token) -> bool {
+        if !self.integrity_ok(){return false;}
         let Some(slot)=self.slots.get(token.slot)else{return false;};
         if !slot.live||slot.generation!=token.generation{return false;}
         let region=slot.region;
@@ -292,7 +341,7 @@ pub(crate) fn try_allocate(owner: Owner, layout: Layout) -> Result<Allocation, E
 fn error_code(error:Error)->u8{
     match error{Error::Geometry=>1,Error::Quota=>2,Error::OutOfMemory=>3,
         Error::Mapping=>4,Error::Release=>5,Error::Owner=>6,Error::Metadata=>7,
-        Error::Alignment=>8,Error::Stale=>9}
+        Error::Alignment=>8,Error::Stale=>9,Error::Integrity=>10}
 }
 #[cfg(not(test))]
 fn report_pressure(snapshot:Snapshot){
@@ -575,6 +624,58 @@ mod tests {
         });
         assert_eq!(nested,Ok(Err::<(),_>(Error::Owner)));
         assert!(admission_available());
+    }
+    #[test] fn corrupt_extent_refuses_scrub_allocation_and_reclamation_without_backend_calls(){
+        let mut heap=Heap::new();let mut memory=fixture::Memory::new();let owner=Owner::Scratch(40);
+        let (token,pointer)=heap.allocate(owner,layout(128),&mut memory).unwrap();
+        unsafe{pointer.write(0x5a);}let offset=heap.slots[token.slot].offset;
+        heap.slots[token.slot].offset=usize::MAX;
+        let calls=(memory.allocations,memory.releases);
+        assert_eq!(heap.release(token,&mut memory),Err(Error::Integrity));
+        assert_eq!(heap.allocate_recovering(owner,layout(16),&mut memory),Err(Error::Integrity));
+        assert!(!heap.reclaim(&mut memory));assert!(!heap.note_sharing(token));
+        assert_eq!((memory.allocations,memory.releases),calls);assert_eq!(unsafe{pointer.read()},0x5a);
+        heap.slots[token.slot].offset=offset;
+        assert!(heap.integrity_ok());heap.release(token,&mut memory).unwrap();
+    }
+    #[test] fn overlapping_leases_and_live_quarantine_are_rejected_before_free(){
+        let mut heap=Heap::new();let mut memory=fixture::Memory::new();let owner=Owner::Scratch(41);
+        let (a,_)=heap.allocate(owner,layout(128),&mut memory).unwrap();
+        let (b,pointer)=heap.allocate(owner,layout(128),&mut memory).unwrap();
+        unsafe{pointer.write(0x33);}let offset=heap.slots[b.slot].offset;
+        heap.slots[b.slot].offset=heap.slots[a.slot].offset;
+        assert_eq!(heap.release(a,&mut memory),Err(Error::Integrity));
+        heap.slots[b.slot].offset=offset;
+        let region=heap.slots[a.slot].region;heap.regions[region].quarantined=true;
+        assert!(!heap.reclaim(&mut memory));assert_eq!(unsafe{pointer.read()},0x33);
+        heap.regions[region].quarantined=false;
+        assert!(heap.integrity_ok());for token in [a,b]{heap.release(token,&mut memory).unwrap();}
+    }
+    #[test] fn invalid_region_and_generation_metadata_cannot_free_another_allocation(){
+        let mut heap=Heap::new();let mut memory=fixture::Memory::new();
+        let (token,_)=heap.allocate(Owner::Scratch(42),layout(128),&mut memory).unwrap();
+        let region=heap.slots[token.slot].region;heap.slots[token.slot].region=SLOTS;
+        assert_eq!(heap.release(token,&mut memory),Err(Error::Integrity));
+        heap.slots[token.slot].region=region;let generation=heap.slots[token.slot].generation;
+        heap.slots[token.slot].generation=heap.next_generation;
+        assert_eq!(heap.release(token,&mut memory),Err(Error::Integrity));
+        heap.slots[token.slot].generation=generation;heap.release(token,&mut memory).unwrap();
+        assert!(heap.integrity_ok());assert_eq!(memory.count(),0);
+    }
+    #[test] fn overlapping_backing_regions_cannot_authorize_double_free(){
+        let mut heap=Heap::new();let mut memory=fixture::Memory::new();
+        let (a,_)=heap.allocate(Owner::Scratch(43),layout(128),&mut memory).unwrap();
+        let (b,_)=heap.allocate(Owner::Scratch(44),layout(128),&mut memory).unwrap();
+        let ar=heap.slots[a.slot].region;let br=heap.slots[b.slot].region;
+        // Deliberately corrupt external metadata; Buffer has no automatic free.
+        let duplicate=unsafe{core::ptr::read(&heap.regions[ar].buffer)};
+        let original=core::mem::replace(&mut heap.regions[br].buffer,duplicate);
+        let releases=memory.releases;
+        assert_eq!(heap.release(a,&mut memory),Err(Error::Integrity));
+        assert_eq!(heap.release(b,&mut memory),Err(Error::Integrity));
+        assert_eq!(memory.releases,releases);
+        heap.regions[br].buffer=original;
+        assert!(heap.integrity_ok());for token in [a,b]{heap.release(token,&mut memory).unwrap();}
     }
     #[test] fn byte_sized_layout_cannot_resize_over_a_shared_neighbor() {
         let mut tiny = try_allocate(Owner::Scratch(76), Layout::from_size_align(1,1).unwrap()).unwrap();
