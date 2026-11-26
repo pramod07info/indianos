@@ -420,6 +420,8 @@ impl UserSurfaceService{
     #[cfg(feature="normal-desktop")]
     fn reset_in_place(&mut self,next:Self)->bool{
         let Some(next_epoch)=self.compositor_epoch.checked_add(1)else{return false;};
+        self.compositor_pending=None;
+        if !crate::kernel_buffer::release_frame(){return false;}
         // The existing guard pages are already unmapped. Move live metadata
         // field-by-field and clear only the payload, never copy/drop guards.
         self.commands.clear();
@@ -852,17 +854,9 @@ struct FrameTransaction{
  token:u64,epoch:u64,sequence:u64,width:u16,height:u16,next_y:u16,
  before:[u8;64],desired:[u8;64],clients:[[u8;16];2],mask:u32,button_down:bool,
 }
-#[cfg(all(feature="normal-desktop",not(test)))]
-static mut COMPOSITOR_FRAME_PIXELS:[u32;1600*1600]=[0;1600*1600];
-#[cfg(all(feature="normal-desktop",test))]
-std::thread_local!{static COMPOSITOR_TEST_PIXELS:core::cell::RefCell<std::vec::Vec<u32>>=
- core::cell::RefCell::new(std::vec![0;1600*1600]);}
 #[cfg(feature="normal-desktop")]
 fn with_frame_pixels<R>(f:impl FnOnce(&mut[u32])->R)->R{
- #[cfg(not(test))]
- {unsafe{f(&mut *core::ptr::addr_of_mut!(COMPOSITOR_FRAME_PIXELS))}}
- #[cfg(test)]
- {COMPOSITOR_TEST_PIXELS.with(|pixels|f(&mut pixels.borrow_mut()))}
+ crate::kernel_buffer::with_frame(f)
 }
 #[cfg(feature="normal-desktop")]
 impl UserSurfaceService{
@@ -894,7 +888,13 @@ impl UserSurfaceService{
   if r.sequence==self.compositor_sequence&&
      !(self.compositor_epoch>1&&self.compositor_presented_epoch!=self.compositor_epoch&&r.state==before){return None;}
   let token=self.compositor_next_token;
-  self.compositor_next_token=token.checked_add(1)?;
+  let next_token=token.checked_add(1)?;
+  if !crate::kernel_buffer::prepare_frame(r.epoch,r.width,r.height){
+   // Resizing may discard staging; the previously presented framebuffer is
+   // unchanged, and no earlier transaction may keep using discarded storage.
+   self.compositor_pending=None;return None;
+  }
+  self.compositor_next_token=next_token;
   self.compositor_pending=Some(FrameTransaction{token,epoch:r.epoch,sequence:r.sequence,
    width:r.width,height:r.height,next_y:0,before,desired:r.state,clients,mask,button_down:self.session.was_down});
   Some(token)
@@ -943,9 +943,11 @@ pub(crate) fn compositor_retire()->bool{
  let Some(service)=user_service()else{return false;};
  let Some(epoch)=service.compositor_epoch.checked_add(1)else{return false;};
  service.compositor_retired=(service.compositor_next_token.saturating_sub(1),service.compositor_epoch);
- service.compositor_pending=None;service.compositor_epoch=epoch;
+ service.compositor_pending=None;
+ let released=crate::kernel_buffer::release_frame();
+ service.compositor_epoch=epoch;
  service.session.dragging=None;
- true
+ released
 }
 #[cfg(feature="normal-desktop")]
 pub(crate) fn compositor_info(pid:u32)->Option<[u8;64]>{
@@ -1338,6 +1340,8 @@ mod tests{
     }
     #[cfg(feature="normal-desktop")]
     fn frame_service()->UserSurfaceService{
+        assert!(crate::kernel_buffer::release_frame());
+        crate::kernel_buffer::fail_allocation(false);
         let svc=isolated_service();
         for (pid,window) in [(2,1),(3,2)]{
             let token=svc.pixel_begin(pid,window,[0,0,1,1]).unwrap();
@@ -1443,6 +1447,8 @@ mod tests{
         assert!(svc.frame_commit_with(4,old,|_,_,_|true));
         let grants=(svc.broker.owner(1),svc.broker.owner(2));
         let clients=svc.frame_client_snapshots().unwrap();
+        // Model the production retirement path, including backing release.
+        assert!(crate::kernel_buffer::release_frame());
         svc.compositor_epoch+=1;svc.compositor_presented_epoch=1;svc.compositor_pending=None;
         assert!(!svc.frame_commit_with(4,old,|_,_,_|panic!("stale epoch")));
         let mut replay=frame_request(&svc,1);
@@ -1462,6 +1468,27 @@ mod tests{
         assert!(!svc.reset_in_place(isolated_service()));
         assert_eq!(svc.compositor_epoch,u64::MAX);assert_eq!(svc.compositor_next_token,next);
     }
+    #[cfg(feature="normal-desktop")]
+    #[test]fn frame_allocation_failure_preserves_visible_content_and_token() {
+        let mut svc=frame_service();let begin=frame_request(&svc,1);
+        let complete=stage_complete_frame(&mut svc,begin);
+        let mut visible=std::vec![0;800*600];
+        assert!(svc.frame_commit_with(4,complete,|pixels,_,_|{visible.copy_from_slice(pixels);true}));
+        let previous=visible.clone();let before=svc.window_frame(4).unwrap().wire();
+        let next=svc.compositor_next_token;
+        assert!(crate::kernel_buffer::release_frame());
+        crate::kernel_buffer::fail_allocation(true);
+        let request=frame_request(&svc,2);
+        assert!(svc.frame_begin(4,request,0xffffff).is_none());
+        assert!(svc.compositor_pending.is_none());
+        assert_eq!(svc.compositor_next_token,next);
+        assert_eq!(svc.window_frame(4).unwrap().wire(),before);
+        assert_eq!(visible,previous);assert_eq!(svc.compositor_sequence,1);
+        assert!(!svc.frame_commit_with(4,complete,|_,_,_|panic!("freed staging presented")));
+        crate::kernel_buffer::fail_allocation(false);
+        assert_eq!(svc.frame_begin(4,request,0xffffff),Some(next));
+    }
+
     #[cfg(feature="normal-desktop")]
     #[test]fn g4_bulk_snapshot_is_the_same_generation_bound_covered_client_data(){
         let svc=frame_service();let query=crate::compositor_pixels::Request{window:1,x:0,y:0,count:0,generation:0};

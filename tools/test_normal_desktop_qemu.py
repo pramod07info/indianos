@@ -60,6 +60,8 @@ NAMED_READBACK = "IndianOS user: R051 Terminal readback: saved"
 G1_PAYLOAD = "violet"  # Visually distinct from the success status SAVED.
 G1_READBACK = "IndianOS user: R051 Terminal readback: " + G1_PAYLOAD
 COMPOSITOR_SNAPSHOT = b"IndianOS user: desktop PID4 composed a private row from committed client snapshots"
+FRAME_ALLOCATED = b"IndianOS: kernel frame buffer allocated"
+FRAME_RELEASED = b"IndianOS: kernel frame buffer released"
 FRAME_PRESENTED = b"IndianOS: G4 complete PID4 frame presented"
 FRAME_PUBLISHED = b"IndianOS user: desktop PID4 full frame published"
 FRAME_METRICS = b"IndianOS user: desktop PID4 frame metrics "
@@ -79,6 +81,7 @@ PIXEL_APP_EVIDENCE = tuple(
     b"IndianOS user: desktop broker denied app pixel authority",
     b"IndianOS user: desktop compositor denied app pixel authority",
     COMPOSITOR_SNAPSHOT,
+    FRAME_ALLOCATED,
     FRAME_PRESENTED, FRAME_PUBLISHED,
 )
 TERMINAL_AUTHORITY = PIXEL_APP_EVIDENCE + (
@@ -1760,8 +1763,8 @@ def verify_transient_restart(output: bytes, injection_at: int) -> None:
     markers = (b"IndianOS: fault vector=0x000000000000000e",
                b"IndianOS: fault CR2=0x0000000060000000",
                b"IndianOS: PID 4 FAULTED", b"IndianOS: PID 4 REAPED",
-               COMPOSITOR_PREPARED, COMPOSITOR.encode(), STALE_COMPOSITOR_DENIED,
-               FRAME_PRESENTED, FRAME_PUBLISHED, COMPOSITOR_REPLACED)
+               COMPOSITOR_PREPARED, COMPOSITOR.encode(), FRAME_ALLOCATED,
+               STALE_COMPOSITOR_DENIED, FRAME_PRESENTED, FRAME_PUBLISHED, COMPOSITOR_REPLACED)
     complete = tail.replace(b"\r", b"").split(b"\n")[:-1]
     if any(marker in line and line != marker for marker in markers for line in complete):
         raise AssertionError("PID4 recovery record has an untrusted prefix")
@@ -1778,6 +1781,8 @@ def verify_transient_restart(output: bytes, injection_at: int) -> None:
         if position < 0:
             raise AssertionError("PID4 recovery evidence is out of order")
         cursor = position + len(marker)
+    if phase_records.count(FRAME_RELEASED) != 1 or phase.find(FRAME_RELEASED) > phase.find(COMPOSITOR_PREPARED):
+        raise AssertionError("PID4 replacement lacks prior staging buffer release")
     verify_frame_publication(phase + b"\n")
     forbidden = (READY.encode(), LIFECYCLE_READY.encode(), SURFACES_GUARDED.encode(),
                  b"restarting retired service session", b"retired session verified restart-safe",
