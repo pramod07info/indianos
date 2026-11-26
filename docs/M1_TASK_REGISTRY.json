@@ -395,6 +395,23 @@
           "Complete remaining source/acceptance traceability and independent review, including shutdown dispatch exhaustion, stale authority cleanup and individual service negatives; do not claim broader phase completion or hardware qualification."
         ],
         "formal_acceptance": false
+      },
+      "development_audit": {
+        "audited_main_sha": "1ccffb103d36d372edb0a2dba03636c92885caf8",
+        "classification": "bounded_guest_evidence",
+        "source_paths": [
+          "rust/kernel_core/src/boot.rs",
+          "rust/kernel_core/src/limine_requests.rs",
+          "rust/kernel_core/src/kernel_main.rs"
+        ],
+        "source_symbols": [
+          "boot_validate"
+        ],
+        "observed": "UEFI/Limine normal and recovery boot execute in QEMU.",
+        "remaining": "Qualify the documented supported firmware/platform set.",
+        "exit_case": "Normal and serial recovery boot on exact source plus selected UEFI PCs.",
+        "evidence_ref": "docs/KERNEL_DEVELOPMENT_AUDIT.md",
+        "formal_acceptance_changed": false
       }
     },
     {
@@ -404,7 +421,23 @@
       "status": "audit_required",
       "source_document": "docs/M1_PHASE_SCOPE.md",
       "source_paths": [],
-      "merged_prs": []
+      "merged_prs": [],
+      "development_audit": {
+        "audited_main_sha": "1ccffb103d36d372edb0a2dba03636c92885caf8",
+        "classification": "bounded_guest_evidence",
+        "source_paths": [
+          "rust/kernel_core/src/boot.rs",
+          "Makefile"
+        ],
+        "source_symbols": [
+          "boot_validate"
+        ],
+        "observed": "Makefile pins and checks the Limine archive SHA256.",
+        "remaining": "Preserve reproducible bootloader input and qualify updates.",
+        "exit_case": "Checksum rejection and exact-image boot; Makefile LIMINE_SHA256 is the pin.",
+        "evidence_ref": "docs/KERNEL_DEVELOPMENT_AUDIT.md",
+        "formal_acceptance_changed": false
+      }
     },
     {
       "id": "M1-P1-003",
@@ -413,7 +446,24 @@
       "status": "audit_required",
       "source_document": "docs/M1_PHASE_SCOPE.md",
       "source_paths": [],
-      "merged_prs": []
+      "merged_prs": [],
+      "development_audit": {
+        "audited_main_sha": "1ccffb103d36d372edb0a2dba03636c92885caf8",
+        "classification": "bounded_guest_evidence",
+        "source_paths": [
+          "rust/kernel_core/src/program.rs",
+          "rust/kernel_core/src/user_image.rs"
+        ],
+        "source_symbols": [
+          "plan_elf64",
+          "indianos_user_image_load"
+        ],
+        "observed": "Bounded ELF plans and real isolated service images load.",
+        "remaining": "Broader application loading/exec and malformed-image stress.",
+        "exit_case": "Reject malformed/overlapping/W+X ELF; real image load and reclamation.",
+        "evidence_ref": "docs/KERNEL_DEVELOPMENT_AUDIT.md",
+        "formal_acceptance_changed": false
+      }
     },
     {
       "id": "M1-P1-004",
@@ -422,7 +472,24 @@
       "status": "audit_required",
       "source_document": "docs/M1_PHASE_SCOPE.md",
       "source_paths": [],
-      "merged_prs": []
+      "merged_prs": [],
+      "development_audit": {
+        "audited_main_sha": "1ccffb103d36d372edb0a2dba03636c92885caf8",
+        "classification": "bounded_guest_evidence",
+        "source_paths": [
+          "rust/kernel_core/src/boot.rs",
+          "rust/kernel_core/src/pmm.rs"
+        ],
+        "source_symbols": [
+          "boot_memory_region_at",
+          "pmm_initialize"
+        ],
+        "observed": "Boot validates memory spans; allocator excludes reserved frames.",
+        "remaining": "Platform-specific MMIO/DMA and firmware-map qualification.",
+        "exit_case": "Bad map/span rejection and reserved-region/physical boot checks.",
+        "evidence_ref": "docs/KERNEL_DEVELOPMENT_AUDIT.md",
+        "formal_acceptance_changed": false
+      }
     },
     {
       "id": "M1-P1-005",
@@ -431,7 +498,24 @@
       "status": "audit_required",
       "source_document": "docs/M1_PHASE_SCOPE.md",
       "source_paths": [],
-      "merged_prs": []
+      "merged_prs": [],
+      "development_audit": {
+        "audited_main_sha": "1ccffb103d36d372edb0a2dba03636c92885caf8",
+        "classification": "bounded_guest_evidence",
+        "source_paths": [
+          "rust/kernel_core/src/boot.rs",
+          "rust/kernel_core/src/interrupts.rs"
+        ],
+        "source_symbols": [
+          "boot_draw_status",
+          "x86_64_exception_dispatch"
+        ],
+        "observed": "Serial diagnostics, panic/exception context and framebuffer status exist.",
+        "remaining": "Persistent crash records and physical failure diagnostics.",
+        "exit_case": "Real exception/CR2 log and serial-only recovery when graphics fails.",
+        "evidence_ref": "docs/KERNEL_DEVELOPMENT_AUDIT.md",
+        "formal_acceptance_changed": false
+      }
     },
     {
       "id": "M1-P1-006",
@@ -440,7 +524,23 @@
       "status": "audit_required",
       "source_document": "docs/M1_PHASE_SCOPE.md",
       "source_paths": [],
-      "merged_prs": []
+      "merged_prs": [],
+      "development_audit": {
+        "audited_main_sha": "1ccffb103d36d372edb0a2dba03636c92885caf8",
+        "classification": "partial_runtime_or_model",
+        "source_paths": [
+          "rust/kernel_core/src/interrupts.rs",
+          "rust/kernel_core/src/user_runtime.rs"
+        ],
+        "source_symbols": [
+          "kernel_stack_layout"
+        ],
+        "observed": "Guarded kernel/trap stacks and bounded startup/shutdown budgets exist.",
+        "remaining": "Complete boot-option policy and stack-pressure qualification across supported profiles.",
+        "exit_case": "Bad option rejection, nested fault and worst-case stack acceptance.",
+        "evidence_ref": "docs/KERNEL_DEVELOPMENT_AUDIT.md",
+        "formal_acceptance_changed": false
+      }
     },
     {
       "id": "M1-P1-007",
@@ -489,6 +589,23 @@
           "Complete remaining source/acceptance traceability and independent review, including shutdown dispatch exhaustion, stale authority cleanup and individual service negatives; do not claim broader phase completion or hardware qualification."
         ],
         "formal_acceptance": false
+      },
+      "development_audit": {
+        "audited_main_sha": "1ccffb103d36d372edb0a2dba03636c92885caf8",
+        "classification": "bounded_guest_evidence",
+        "source_paths": [
+          "rust/kernel_core/src/initramfs.rs",
+          "rust/kernel_core/src/boot.rs"
+        ],
+        "source_symbols": [
+          "indianos_initramfs_validate",
+          "boot_initramfs_file"
+        ],
+        "observed": "Validated archive supplies actual normal service images.",
+        "remaining": "Preserve ownership/lifetime and malformed-media coverage.",
+        "exit_case": "Missing/truncated/bad service archive refuses startup without media writes.",
+        "evidence_ref": "docs/KERNEL_DEVELOPMENT_AUDIT.md",
+        "formal_acceptance_changed": false
       }
     },
     {
@@ -539,6 +656,22 @@
           "Complete remaining source/acceptance traceability and independent review, including shutdown dispatch exhaustion, stale authority cleanup and individual service negatives; do not claim broader phase completion or hardware qualification."
         ],
         "formal_acceptance": false
+      },
+      "development_audit": {
+        "audited_main_sha": "1ccffb103d36d372edb0a2dba03636c92885caf8",
+        "classification": "bounded_guest_evidence",
+        "source_paths": [
+          "rust/kernel_core/src/kernel_main.rs",
+          "rust/kernel_core/src/user_runtime.rs"
+        ],
+        "source_symbols": [
+          "kmain"
+        ],
+        "observed": "Missing/unready/crashed services enter bounded read-only recovery.",
+        "remaining": "Broader platform recovery and formal release review.",
+        "exit_case": "Startup, replacement load/unready/repeat and shutdown-exhaustion negatives.",
+        "evidence_ref": "docs/KERNEL_DEVELOPMENT_AUDIT.md",
+        "formal_acceptance_changed": false
       }
     },
     {
@@ -548,7 +681,23 @@
       "status": "audit_required",
       "source_document": "docs/M1_PHASE_SCOPE.md",
       "source_paths": [],
-      "merged_prs": []
+      "merged_prs": [],
+      "development_audit": {
+        "audited_main_sha": "1ccffb103d36d372edb0a2dba03636c92885caf8",
+        "classification": "runtime_path_not_verified",
+        "source_paths": [
+          "rust/kernel_core/src/kernel_main.rs",
+          "rust/kernel_core/src/limine_requests.rs"
+        ],
+        "source_symbols": [
+          "kmain"
+        ],
+        "observed": "Signed-package and boot-epoch fixtures are not firmware verified boot.",
+        "remaining": "Integrate an actual UEFI trust chain and trusted recovery/key lifecycle.",
+        "exit_case": "Reject an altered kernel/archive using real enrolled firmware trust.",
+        "evidence_ref": "docs/KERNEL_DEVELOPMENT_AUDIT.md",
+        "formal_acceptance_changed": false
+      }
     },
     {
       "id": "M1-P1-010",
@@ -557,7 +706,23 @@
       "status": "audit_required",
       "source_document": "docs/M1_PHASE_SCOPE.md",
       "source_paths": [],
-      "merged_prs": []
+      "merged_prs": [],
+      "development_audit": {
+        "audited_main_sha": "1ccffb103d36d372edb0a2dba03636c92885caf8",
+        "classification": "physical_qualification_pending",
+        "source_paths": [
+          "rust/kernel_core/src/kernel_main.rs",
+          "rust/kernel_core/src/boot.rs"
+        ],
+        "source_symbols": [
+          "kmain"
+        ],
+        "observed": "Emulator receipts exist; selected-PC acceptance receipts were not supplied.",
+        "remaining": "Inventory and qualify explicitly supported physical UEFI machines.",
+        "exit_case": "Recorded firmware/CPU/display/storage boot and recovery matrix per machine.",
+        "evidence_ref": "docs/KERNEL_DEVELOPMENT_AUDIT.md",
+        "formal_acceptance_changed": false
+      }
     },
     {
       "id": "M1-P2-001",
@@ -566,7 +731,22 @@
       "status": "audit_required",
       "source_document": "docs/M1_PHASE_SCOPE.md",
       "source_paths": [],
-      "merged_prs": []
+      "merged_prs": [],
+      "development_audit": {
+        "audited_main_sha": "1ccffb103d36d372edb0a2dba03636c92885caf8",
+        "classification": "bounded_guest_evidence",
+        "source_paths": [
+          "rust/kernel_core/src/interrupts.rs"
+        ],
+        "source_symbols": [
+          "x86_64_exceptions_init"
+        ],
+        "observed": "Real GDT/IDT/TSS and protected trap-stack paths execute.",
+        "remaining": "Physical and sustained nested-fault qualification.",
+        "exit_case": "Actual #UD/#PF/user fault containment with intact guards.",
+        "evidence_ref": "docs/KERNEL_DEVELOPMENT_AUDIT.md",
+        "formal_acceptance_changed": false
+      }
     },
     {
       "id": "M1-P2-002",
@@ -575,7 +755,24 @@
       "status": "audit_required",
       "source_document": "docs/M1_PHASE_SCOPE.md",
       "source_paths": [],
-      "merged_prs": []
+      "merged_prs": [],
+      "development_audit": {
+        "audited_main_sha": "1ccffb103d36d372edb0a2dba03636c92885caf8",
+        "classification": "bounded_guest_evidence",
+        "source_paths": [
+          "rust/kernel_core/src/pmm.rs",
+          "rust/kernel_core/src/user_image.rs"
+        ],
+        "source_symbols": [
+          "pmm_allocate_frame",
+          "pmm_release_frame"
+        ],
+        "observed": "PMM-backed images allocate and reclaim real frames.",
+        "remaining": "Memory-pressure/fragmentation soak and cross-core ownership.",
+        "exit_case": "Repeated load/fault/reap with frame conservation; physical stress.",
+        "evidence_ref": "docs/KERNEL_DEVELOPMENT_AUDIT.md",
+        "formal_acceptance_changed": false
+      }
     },
     {
       "id": "M1-P2-003",
@@ -584,7 +781,25 @@
       "status": "audit_required",
       "source_document": "docs/M1_PHASE_SCOPE.md",
       "source_paths": [],
-      "merged_prs": []
+      "merged_prs": [],
+      "development_audit": {
+        "audited_main_sha": "1ccffb103d36d372edb0a2dba03636c92885caf8",
+        "classification": "bounded_guest_evidence",
+        "source_paths": [
+          "rust/kernel_core/src/vmm.rs",
+          "rust/kernel_core/src/paging.rs",
+          "rust/kernel_core/src/user_runtime.rs"
+        ],
+        "source_symbols": [
+          "vmm_map_page",
+          "paging_clone_release"
+        ],
+        "observed": "Owned mappings, CR3 switching, teardown and protected peer roots exist.",
+        "remaining": "SMP TLB shootdown, broader mapping lifecycle and shared-memory policy.",
+        "exit_case": "No stale/foreign mappings after real teardown, plus cross-CPU invalidation.",
+        "evidence_ref": "docs/KERNEL_DEVELOPMENT_AUDIT.md",
+        "formal_acceptance_changed": false
+      }
     },
     {
       "id": "M1-P2-004",
@@ -593,7 +808,23 @@
       "status": "audit_required",
       "source_document": "docs/M1_PHASE_SCOPE.md",
       "source_paths": [],
-      "merged_prs": []
+      "merged_prs": [],
+      "development_audit": {
+        "audited_main_sha": "1ccffb103d36d372edb0a2dba03636c92885caf8",
+        "classification": "runtime_path_not_verified",
+        "source_paths": [
+          "rust/kernel_core/src/lib.rs",
+          "rust/kernel_core/src/pmm.rs"
+        ],
+        "source_symbols": [
+          "pmm_allocate_frame"
+        ],
+        "observed": "Core identifies itself as allocation-free; frame allocation is not a general heap.",
+        "remaining": "Integrate a bounded kernel heap with allocation failure and ownership policy.",
+        "exit_case": "Allocate/free/coalesce under pressure without leaks, deadlock or unsafe recovery.",
+        "evidence_ref": "docs/KERNEL_DEVELOPMENT_AUDIT.md",
+        "formal_acceptance_changed": false
+      }
     },
     {
       "id": "M1-P2-005",
@@ -602,7 +833,24 @@
       "status": "audit_required",
       "source_document": "docs/M1_PHASE_SCOPE.md",
       "source_paths": [],
-      "merged_prs": []
+      "merged_prs": [],
+      "development_audit": {
+        "audited_main_sha": "1ccffb103d36d372edb0a2dba03636c92885caf8",
+        "classification": "bounded_guest_evidence",
+        "source_paths": [
+          "rust/kernel_core/src/user_image.rs",
+          "rust/kernel_core/src/syscall.rs",
+          "rust/kernel_core/src/gui.rs"
+        ],
+        "source_symbols": [
+          "indianos_user_copy_writable"
+        ],
+        "observed": "W^X/NX and real guard/peer page checks protect service mappings and canvases.",
+        "remaining": "Broader hostile-app and platform security qualification.",
+        "exit_case": "Execute/write/guard/foreign-root negatives in actual guest address spaces.",
+        "evidence_ref": "docs/KERNEL_DEVELOPMENT_AUDIT.md",
+        "formal_acceptance_changed": false
+      }
     },
     {
       "id": "M1-P2-006",
@@ -611,7 +859,23 @@
       "status": "audit_required",
       "source_document": "docs/M1_PHASE_SCOPE.md",
       "source_paths": [],
-      "merged_prs": []
+      "merged_prs": [],
+      "development_audit": {
+        "audited_main_sha": "1ccffb103d36d372edb0a2dba03636c92885caf8",
+        "classification": "runtime_path_not_verified",
+        "source_paths": [
+          "rust/kernel_core/src/paging.rs",
+          "rust/kernel_core/src/user_runtime.rs"
+        ],
+        "source_symbols": [
+          "x86_64_user_syscall_dispatch"
+        ],
+        "observed": "Address-space cloning and fault retirement do not prove fault-driven COW.",
+        "remaining": "Integrate demand faults, COW refcounts, permissions and failure rollback.",
+        "exit_case": "Fork/shared-page write splits correctly; allocation failure cannot leak aliases.",
+        "evidence_ref": "docs/KERNEL_DEVELOPMENT_AUDIT.md",
+        "formal_acceptance_changed": false
+      }
     },
     {
       "id": "M1-P2-007",
@@ -620,7 +884,23 @@
       "status": "audit_required",
       "source_document": "docs/M1_PHASE_SCOPE.md",
       "source_paths": [],
-      "merged_prs": []
+      "merged_prs": [],
+      "development_audit": {
+        "audited_main_sha": "1ccffb103d36d372edb0a2dba03636c92885caf8",
+        "classification": "bounded_guest_evidence",
+        "source_paths": [
+          "rust/kernel_core/src/timer.rs",
+          "rust/kernel_core/src/user_runtime.rs"
+        ],
+        "source_symbols": [
+          "x86_64_scheduler_apic_timer_dispatch"
+        ],
+        "observed": "R024 proves bounded single-core APIC timer preemption.",
+        "remaining": "General timer API/deadline and multicore clock/interrupt qualification.",
+        "exit_case": "Sustained preemption, monotonic accounting and timer failure tests.",
+        "evidence_ref": "docs/KERNEL_DEVELOPMENT_AUDIT.md",
+        "formal_acceptance_changed": false
+      }
     },
     {
       "id": "M1-P2-008",
@@ -629,7 +909,23 @@
       "status": "audit_required",
       "source_document": "docs/M1_PHASE_SCOPE.md",
       "source_paths": [],
-      "merged_prs": []
+      "merged_prs": [],
+      "development_audit": {
+        "audited_main_sha": "1ccffb103d36d372edb0a2dba03636c92885caf8",
+        "classification": "runtime_path_not_verified",
+        "source_paths": [
+          "rust/kernel_core/src/limine_requests.rs",
+          "rust/kernel_core/src/user_runtime.rs"
+        ],
+        "source_symbols": [
+          "launch_one_parked_qemu_ap"
+        ],
+        "observed": "AP entry/CPUID acknowledgment exists; the test halts before PMM/user tasks.",
+        "remaining": "AP run queues, per-CPU state, IPIs and synchronized scheduling.",
+        "exit_case": "At least two CPUs execute isolated user tasks with correct cross-core teardown.",
+        "evidence_ref": "docs/KERNEL_DEVELOPMENT_AUDIT.md",
+        "formal_acceptance_changed": false
+      }
     },
     {
       "id": "M1-P2-009",
@@ -638,7 +934,23 @@
       "status": "audit_required",
       "source_document": "docs/M1_PHASE_SCOPE.md",
       "source_paths": [],
-      "merged_prs": []
+      "merged_prs": [],
+      "development_audit": {
+        "audited_main_sha": "1ccffb103d36d372edb0a2dba03636c92885caf8",
+        "classification": "partial_runtime_or_model",
+        "source_paths": [
+          "rust/kernel_core/src/retirement_gate.rs",
+          "rust/kernel_core/src/smp_lifecycle_fence.rs"
+        ],
+        "source_symbols": [
+          "RetirementGate"
+        ],
+        "observed": "Single-BSP non-reentrant admission and lifecycle fences exist.",
+        "remaining": "General IRQ-safe lock ordering/deadlock and SMP integration.",
+        "exit_case": "Contention/interrupt/reentry/cross-CPU stress with no owner spinning on itself.",
+        "evidence_ref": "docs/KERNEL_DEVELOPMENT_AUDIT.md",
+        "formal_acceptance_changed": false
+      }
     },
     {
       "id": "M1-P2-010",
@@ -647,7 +959,24 @@
       "status": "audit_required",
       "source_document": "docs/M1_PHASE_SCOPE.md",
       "source_paths": [],
-      "merged_prs": []
+      "merged_prs": [],
+      "development_audit": {
+        "audited_main_sha": "1ccffb103d36d372edb0a2dba03636c92885caf8",
+        "classification": "runtime_path_not_verified",
+        "source_paths": [
+          "rust/kernel_core/src/user_runtime.rs",
+          "rust/kernel_core/src/hardware_inventory.rs"
+        ],
+        "source_symbols": [
+          "Task",
+          "inspect_cpu"
+        ],
+        "observed": "GPR context and CPU feature discovery exist; SIMD save/restore path not verified.",
+        "remaining": "FPU/SIMD context ownership, enabled-state management and affinity.",
+        "exit_case": "Two preempted users retain distinct SIMD/FPU states on supported CPUs.",
+        "evidence_ref": "docs/KERNEL_DEVELOPMENT_AUDIT.md",
+        "formal_acceptance_changed": false
+      }
     },
     {
       "id": "M1-P2-011",
@@ -656,7 +985,23 @@
       "status": "audit_required",
       "source_document": "docs/M1_PHASE_SCOPE.md",
       "source_paths": [],
-      "merged_prs": []
+      "merged_prs": [],
+      "development_audit": {
+        "audited_main_sha": "1ccffb103d36d372edb0a2dba03636c92885caf8",
+        "classification": "partial_runtime_or_model",
+        "source_paths": [
+          "rust/kernel_core/src/pmm.rs",
+          "rust/kernel_core/src/user_image.rs"
+        ],
+        "source_symbols": [
+          "pmm_allocate_frame"
+        ],
+        "observed": "Bounded allocation failure cleanup exists.",
+        "remaining": "System-wide OOM, per-process memory quotas and pressure recovery.",
+        "exit_case": "Quota isolation and repeatable exhaustion/recovery with frame conservation.",
+        "evidence_ref": "docs/KERNEL_DEVELOPMENT_AUDIT.md",
+        "formal_acceptance_changed": false
+      }
     },
     {
       "id": "M1-P2-012",
@@ -665,7 +1010,23 @@
       "status": "audit_required",
       "source_document": "docs/M1_PHASE_SCOPE.md",
       "source_paths": [],
-      "merged_prs": []
+      "merged_prs": [],
+      "development_audit": {
+        "audited_main_sha": "1ccffb103d36d372edb0a2dba03636c92885caf8",
+        "classification": "runtime_path_not_verified",
+        "source_paths": [
+          "rust/kernel_core/src/paging.rs",
+          "rust/kernel_core/src/kernel_main.rs"
+        ],
+        "source_symbols": [
+          "paging_clone_release"
+        ],
+        "observed": "Normal teardown/recovery is not suspend/resume restoration.",
+        "remaining": "Define and implement firmware sleep, CPU/device and memory resume lifecycle.",
+        "exit_case": "Resume preserves mappings and devices after failed and successful sleep.",
+        "evidence_ref": "docs/KERNEL_DEVELOPMENT_AUDIT.md",
+        "formal_acceptance_changed": false
+      }
     },
     {
       "id": "M1-P3-001",
@@ -713,6 +1074,23 @@
           "Complete remaining source/acceptance traceability and independent review, including shutdown dispatch exhaustion, stale authority cleanup and individual service negatives; do not claim broader phase completion or hardware qualification."
         ],
         "formal_acceptance": false
+      },
+      "development_audit": {
+        "audited_main_sha": "1ccffb103d36d372edb0a2dba03636c92885caf8",
+        "classification": "partial_runtime_or_model",
+        "source_paths": [
+          "rust/kernel_core/src/lib.rs",
+          "rust/kernel_core/src/user_runtime.rs"
+        ],
+        "source_symbols": [
+          "Process",
+          "Task"
+        ],
+        "observed": "Fixed process PCBs and service tasks execute.",
+        "remaining": "Independent thread objects, thread groups and general thread lifecycle.",
+        "exit_case": "Create/schedule/join/terminate threads without resource or identity leakage.",
+        "evidence_ref": "docs/KERNEL_DEVELOPMENT_AUDIT.md",
+        "formal_acceptance_changed": false
       }
     },
     {
@@ -763,6 +1141,22 @@
           "Complete remaining source/acceptance traceability and independent review, including shutdown dispatch exhaustion, stale authority cleanup and individual service negatives; do not claim broader phase completion or hardware qualification."
         ],
         "formal_acceptance": false
+      },
+      "development_audit": {
+        "audited_main_sha": "1ccffb103d36d372edb0a2dba03636c92885caf8",
+        "classification": "bounded_guest_evidence",
+        "source_paths": [
+          "rust/kernel_core/src/user_image.rs",
+          "rust/kernel_core/src/paging.rs"
+        ],
+        "source_symbols": [
+          "indianos_user_image_load"
+        ],
+        "observed": "Services have separate CR3s, owned pages and guard mappings.",
+        "remaining": "General dynamic address spaces and broader hostile-user soak.",
+        "exit_case": "Foreign/kernel memory access fails while peers continue.",
+        "evidence_ref": "docs/KERNEL_DEVELOPMENT_AUDIT.md",
+        "formal_acceptance_changed": false
       }
     },
     {
@@ -812,6 +1206,23 @@
           "Complete remaining source/acceptance traceability and independent review, including shutdown dispatch exhaustion, stale authority cleanup and individual service negatives; do not claim broader phase completion or hardware qualification."
         ],
         "formal_acceptance": false
+      },
+      "development_audit": {
+        "audited_main_sha": "1ccffb103d36d372edb0a2dba03636c92885caf8",
+        "classification": "bounded_guest_evidence",
+        "source_paths": [
+          "rust/kernel_core/src/lib.rs",
+          "rust/kernel_core/src/user_runtime.rs"
+        ],
+        "source_symbols": [
+          "indianos_process_create",
+          "discard"
+        ],
+        "observed": "Actual service create/load/run/exit/reap and PID4 replacement are tested.",
+        "remaining": "General spawn/exec/wait rather than fixed-role bootstrap only.",
+        "exit_case": "Repeated arbitrary image lifecycle with bounded cleanup and no zombies.",
+        "evidence_ref": "docs/KERNEL_DEVELOPMENT_AUDIT.md",
+        "formal_acceptance_changed": false
       }
     },
     {
@@ -821,7 +1232,24 @@
       "status": "audit_required",
       "source_document": "docs/M1_PHASE_SCOPE.md",
       "source_paths": [],
-      "merged_prs": []
+      "merged_prs": [],
+      "development_audit": {
+        "audited_main_sha": "1ccffb103d36d372edb0a2dba03636c92885caf8",
+        "classification": "partial_runtime_or_model",
+        "source_paths": [
+          "rust/kernel_core/src/lib.rs",
+          "rust/kernel_core/src/user_runtime.rs"
+        ],
+        "source_symbols": [
+          "Scheduler",
+          "indianos_scheduler_next"
+        ],
+        "observed": "Round-robin and opt-in single-core preemption exist.",
+        "remaining": "Production priorities/fairness, SMP and per-CPU run queues.",
+        "exit_case": "CPU-bound and blocking tasks meet documented fairness under multicore load.",
+        "evidence_ref": "docs/KERNEL_DEVELOPMENT_AUDIT.md",
+        "formal_acceptance_changed": false
+      }
     },
     {
       "id": "M1-P3-005",
@@ -830,7 +1258,24 @@
       "status": "audit_required",
       "source_document": "docs/M1_PHASE_SCOPE.md",
       "source_paths": [],
-      "merged_prs": []
+      "merged_prs": [],
+      "development_audit": {
+        "audited_main_sha": "1ccffb103d36d372edb0a2dba03636c92885caf8",
+        "classification": "bounded_guest_evidence",
+        "source_paths": [
+          "rust/kernel_core/src/syscall.rs",
+          "rust/kernel_core/src/user_runtime.rs",
+          "rust/kernel_core/src/user_image.rs"
+        ],
+        "source_symbols": [
+          "indianos_syscall_validate"
+        ],
+        "observed": "Versioned bounded descriptors and safe owned user-copy paths execute.",
+        "remaining": "Stable complete native ABI coverage, migration/version and interruption semantics.",
+        "exit_case": "Bad pointers/versions/ranges reject before side effects across supported operations.",
+        "evidence_ref": "docs/KERNEL_DEVELOPMENT_AUDIT.md",
+        "formal_acceptance_changed": false
+      }
     },
     {
       "id": "M1-P3-006",
@@ -913,6 +1358,24 @@
           "Complete remaining source/acceptance traceability and independent review, including shutdown dispatch exhaustion, stale authority cleanup and individual service negatives; do not claim broader phase completion or hardware qualification."
         ],
         "formal_acceptance": false
+      },
+      "development_audit": {
+        "audited_main_sha": "1ccffb103d36d372edb0a2dba03636c92885caf8",
+        "classification": "bounded_guest_evidence",
+        "source_paths": [
+          "rust/kernel_core/src/fs_handles.rs",
+          "rust/kernel_core/src/capability.rs",
+          "rust/kernel_core/src/user_runtime.rs"
+        ],
+        "source_symbols": [
+          "FileHandles",
+          "authenticated_file_identity"
+        ],
+        "observed": "Real file/IPC operations use kernel-authenticated process epochs and handles.",
+        "remaining": "Broader delegation/revocation stress across dynamic process/service lifecycle.",
+        "exit_case": "Stale/foreign rights fail after exit, rebind and namespace changes.",
+        "evidence_ref": "docs/KERNEL_DEVELOPMENT_AUDIT.md",
+        "formal_acceptance_changed": false
       }
     },
     {
@@ -994,6 +1457,22 @@
           "Complete remaining source/acceptance traceability and independent review, including shutdown dispatch exhaustion, stale authority cleanup and individual service negatives; do not claim broader phase completion or hardware qualification."
         ],
         "formal_acceptance": false
+      },
+      "development_audit": {
+        "audited_main_sha": "1ccffb103d36d372edb0a2dba03636c92885caf8",
+        "classification": "partial_runtime_or_model",
+        "source_paths": [
+          "rust/kernel_core/src/ipc.rs",
+          "rust/kernel_core/src/user_runtime.rs"
+        ],
+        "source_symbols": [
+          "IpcRouter"
+        ],
+        "observed": "Bounded mailbox send/receive, waits and service IPC are live.",
+        "remaining": "General shared memory, pipe/event and asynchronous cancellation lifecycle.",
+        "exit_case": "Cross-process backpressure, shared-page revocation and interrupted waits.",
+        "evidence_ref": "docs/KERNEL_DEVELOPMENT_AUDIT.md",
+        "formal_acceptance_changed": false
       }
     },
     {
@@ -1003,7 +1482,23 @@
       "status": "audit_required",
       "source_document": "docs/M1_PHASE_SCOPE.md",
       "source_paths": [],
-      "merged_prs": []
+      "merged_prs": [],
+      "development_audit": {
+        "audited_main_sha": "1ccffb103d36d372edb0a2dba03636c92885caf8",
+        "classification": "runtime_path_not_verified",
+        "source_paths": [
+          "rust/kernel_core/src/process_events.rs",
+          "rust/kernel_core/src/user_runtime.rs"
+        ],
+        "source_symbols": [
+          "ProcessEvent"
+        ],
+        "observed": "Lifecycle event queues exist; a general signal/cancellation delivery route is unverified.",
+        "remaining": "Native signals or explicit equivalent with safe interrupted-operation semantics.",
+        "exit_case": "Delivery/masking/cancel/exit races cannot corrupt process or storage state.",
+        "evidence_ref": "docs/KERNEL_DEVELOPMENT_AUDIT.md",
+        "formal_acceptance_changed": false
+      }
     },
     {
       "id": "M1-P3-009",
@@ -1012,7 +1507,23 @@
       "status": "audit_required",
       "source_document": "docs/M1_PHASE_SCOPE.md",
       "source_paths": [],
-      "merged_prs": []
+      "merged_prs": [],
+      "development_audit": {
+        "audited_main_sha": "1ccffb103d36d372edb0a2dba03636c92885caf8",
+        "classification": "partial_runtime_or_model",
+        "source_paths": [
+          "rust/kernel_core/src/ipc.rs",
+          "rust/kernel_core/src/user_runtime.rs"
+        ],
+        "source_symbols": [
+          "IpcRouter"
+        ],
+        "observed": "Cooperative IPC receive continuations and timeout waits execute.",
+        "remaining": "General scheduler wait queues and futex-like thread synchronization.",
+        "exit_case": "Lost wakeup, timeout, exit and cross-CPU wakeup race acceptance.",
+        "evidence_ref": "docs/KERNEL_DEVELOPMENT_AUDIT.md",
+        "formal_acceptance_changed": false
+      }
     },
     {
       "id": "M1-P3-010",
@@ -1021,7 +1532,23 @@
       "status": "audit_required",
       "source_document": "docs/M1_PHASE_SCOPE.md",
       "source_paths": [],
-      "merged_prs": []
+      "merged_prs": [],
+      "development_audit": {
+        "audited_main_sha": "1ccffb103d36d372edb0a2dba03636c92885caf8",
+        "classification": "partial_runtime_or_model",
+        "source_paths": [
+          "rust/kernel_core/src/fs_handles.rs",
+          "rust/kernel_core/src/pmm.rs"
+        ],
+        "source_symbols": [
+          "FileHandles"
+        ],
+        "observed": "Fixed slot/transfer budgets and service write limits exist.",
+        "remaining": "Per-process resource limits and full thread synchronization.",
+        "exit_case": "Independent exhaustion does not starve or corrupt peers; synchronized teardown.",
+        "evidence_ref": "docs/KERNEL_DEVELOPMENT_AUDIT.md",
+        "formal_acceptance_changed": false
+      }
     },
     {
       "id": "M1-P3-011",
@@ -1030,7 +1557,24 @@
       "status": "audit_required",
       "source_document": "docs/M1_PHASE_SCOPE.md",
       "source_paths": [],
-      "merged_prs": []
+      "merged_prs": [],
+      "development_audit": {
+        "audited_main_sha": "1ccffb103d36d372edb0a2dba03636c92885caf8",
+        "classification": "partial_runtime_or_model",
+        "source_paths": [
+          "rust/kernel_core/src/service_supervisor.rs",
+          "rust/kernel_core/src/user_runtime.rs"
+        ],
+        "source_symbols": [
+          "ServiceTable",
+          "DesktopLifecycle"
+        ],
+        "observed": "Fixed desktop/service ownership and bounded restarts exist.",
+        "remaining": "General parent-child hierarchy, orphan adoption and dynamic supervision.",
+        "exit_case": "Parent crash/exit and child restart preserve authority and reap resources.",
+        "evidence_ref": "docs/KERNEL_DEVELOPMENT_AUDIT.md",
+        "formal_acceptance_changed": false
+      }
     },
     {
       "id": "M1-P3-012",
@@ -1080,6 +1624,23 @@
           "Complete remaining source/acceptance traceability and independent review, including shutdown dispatch exhaustion, stale authority cleanup and individual service negatives; do not claim broader phase completion or hardware qualification."
         ],
         "formal_acceptance": false
+      },
+      "development_audit": {
+        "audited_main_sha": "1ccffb103d36d372edb0a2dba03636c92885caf8",
+        "classification": "partial_runtime_or_model",
+        "source_paths": [
+          "rust/kernel_core/src/user_runtime.rs",
+          "rust/kernel_core/src/process_events.rs"
+        ],
+        "source_symbols": [
+          "discard",
+          "DesktopLifecycle"
+        ],
+        "observed": "Guest fault/recovery and bounded crash cases pass.",
+        "remaining": "Sustained adversarial lifecycle concurrency and resource-pressure soak.",
+        "exit_case": "Long-run mixed fault/exit/restart/revoke tests with conserved resources.",
+        "evidence_ref": "docs/KERNEL_DEVELOPMENT_AUDIT.md",
+        "formal_acceptance_changed": false
       }
     },
     {
@@ -1119,6 +1680,22 @@
           "Reviewed master checklist reconciliation",
           "Verify applicable CI on updated PR head and final merged-main SHA before acceptance"
         ]
+      },
+      "development_audit": {
+        "audited_main_sha": "1ccffb103d36d372edb0a2dba03636c92885caf8",
+        "classification": "bounded_guest_evidence",
+        "source_paths": [
+          "rust/kernel_core/src/block.rs",
+          "rust/kernel_core/src/ata_pio.rs"
+        ],
+        "source_symbols": [
+          "BlockDevice"
+        ],
+        "observed": "Bounded block/window abstraction and real ATA errors/flush forwarding exist.",
+        "remaining": "Asynchronous completion/cancellation and additional device transports.",
+        "exit_case": "Timeout/reset/cancel and buffer ownership acceptance on actual block I/O.",
+        "evidence_ref": "docs/KERNEL_DEVELOPMENT_AUDIT.md",
+        "formal_acceptance_changed": false
       }
     },
     {
@@ -1162,6 +1739,22 @@
           "Reviewed master checklist reconciliation",
           "Verify applicable CI on updated PR head and final merged-main SHA before acceptance"
         ]
+      },
+      "development_audit": {
+        "audited_main_sha": "1ccffb103d36d372edb0a2dba03636c92885caf8",
+        "classification": "bounded_guest_evidence",
+        "source_paths": [
+          "rust/kernel_core/src/m1_partition.rs"
+        ],
+        "source_symbols": [
+          "discover",
+          "inspect_partition_receipt"
+        ],
+        "observed": "MBR/GPT discovery, mirrors, checksums and selected partition isolation execute.",
+        "remaining": "Selected physical-media and broader mount lifecycle qualification.",
+        "exit_case": "Corrupt/overlap/duplicate IDs fail closed and neighboring sectors remain unchanged.",
+        "evidence_ref": "docs/KERNEL_DEVELOPMENT_AUDIT.md",
+        "formal_acceptance_changed": false
       }
     },
     {
@@ -1204,6 +1797,23 @@
           "Reviewed master checklist reconciliation",
           "Verify applicable CI on updated PR head and final merged-main SHA before acceptance"
         ]
+      },
+      "development_audit": {
+        "audited_main_sha": "1ccffb103d36d372edb0a2dba03636c92885caf8",
+        "classification": "bounded_guest_evidence",
+        "source_paths": [
+          "rust/kernel_core/src/hier_vfs.rs",
+          "rust/kernel_core/src/durablefs.rs"
+        ],
+        "source_symbols": [
+          "HierVfs",
+          "DurableFs"
+        ],
+        "observed": "Bounded hierarchical names/directories persist across cold boots.",
+        "remaining": "General filesystem capacity, stress and metadata semantics.",
+        "exit_case": "Deep/bounded traversal, remount and corrupt namespace recovery.",
+        "evidence_ref": "docs/KERNEL_DEVELOPMENT_AUDIT.md",
+        "formal_acceptance_changed": false
       }
     },
     {
@@ -1246,6 +1856,23 @@
           "Reviewed master checklist reconciliation",
           "Verify applicable CI on updated PR head and final merged-main SHA before acceptance"
         ]
+      },
+      "development_audit": {
+        "audited_main_sha": "1ccffb103d36d372edb0a2dba03636c92885caf8",
+        "classification": "bounded_guest_evidence",
+        "source_paths": [
+          "rust/kernel_core/src/fs_handles.rs",
+          "rust/kernel_core/src/hier_vfs.rs"
+        ],
+        "source_symbols": [
+          "FileHandles",
+          "selected_path_operation_on_device"
+        ],
+        "observed": "Live selected mounts, namespaces, descriptors and generation checks execute.",
+        "remaining": "Dynamic multi-mount and broad process namespace lifecycle.",
+        "exit_case": "Cross-process permissions, stale mount/revision and remount/revoke tests.",
+        "evidence_ref": "docs/KERNEL_DEVELOPMENT_AUDIT.md",
+        "formal_acceptance_changed": false
       }
     },
     {
@@ -1288,6 +1915,23 @@
           "Reviewed master checklist reconciliation",
           "Verify applicable CI on updated PR head and final merged-main SHA before acceptance"
         ]
+      },
+      "development_audit": {
+        "audited_main_sha": "1ccffb103d36d372edb0a2dba03636c92885caf8",
+        "classification": "bounded_guest_evidence",
+        "source_paths": [
+          "rust/kernel_core/src/fs_handles.rs",
+          "rust/kernel_core/src/hier_vfs.rs"
+        ],
+        "source_symbols": [
+          "dispatch_mounted",
+          "create"
+        ],
+        "observed": "Native/path CRUD, truncate and positioned operations are live.",
+        "remaining": "General capacity/concurrency/error/interruption matrix for the complete API.",
+        "exit_case": "Real independent clients perform operations and verify bytes after reboot.",
+        "evidence_ref": "docs/KERNEL_DEVELOPMENT_AUDIT.md",
+        "formal_acceptance_changed": false
       }
     },
     {
@@ -1297,7 +1941,24 @@
       "status": "audit_required",
       "source_document": "docs/M1_PHASE_SCOPE.md",
       "source_paths": [],
-      "merged_prs": []
+      "merged_prs": [],
+      "development_audit": {
+        "audited_main_sha": "1ccffb103d36d372edb0a2dba03636c92885caf8",
+        "classification": "partial_runtime_or_model",
+        "source_paths": [
+          "rust/kernel_core/src/fs_permissions.rs",
+          "rust/kernel_core/src/hier_vfs.rs"
+        ],
+        "source_symbols": [
+          "Permissions",
+          "chmod_as"
+        ],
+        "observed": "Persisted owner/group/mode permissions and revocation exist.",
+        "remaining": "Named-user ACL administration, timestamps and broader per-user acceptance.",
+        "exit_case": "Persist/revoke/search/destination denial across rename, remount and process reuse.",
+        "evidence_ref": "docs/KERNEL_DEVELOPMENT_AUDIT.md",
+        "formal_acceptance_changed": false
+      }
     },
     {
       "id": "M1-P4-007",
@@ -1306,7 +1967,22 @@
       "status": "audit_required",
       "source_document": "docs/M1_PHASE_SCOPE.md",
       "source_paths": [],
-      "merged_prs": []
+      "merged_prs": [],
+      "development_audit": {
+        "audited_main_sha": "1ccffb103d36d372edb0a2dba03636c92885caf8",
+        "classification": "bounded_guest_evidence",
+        "source_paths": [
+          "rust/kernel_core/src/durablefs.rs"
+        ],
+        "source_symbols": [
+          "DurableFs"
+        ],
+        "observed": "Checksummed COW data/metadata publication and recovery execute.",
+        "remaining": "In-sector tears, controller-cache behavior and real hardware qualification.",
+        "exit_case": "Interrupt each publication boundary; recover only valid old/new state.",
+        "evidence_ref": "docs/KERNEL_DEVELOPMENT_AUDIT.md",
+        "formal_acceptance_changed": false
+      }
     },
     {
       "id": "M1-P4-008",
@@ -1315,7 +1991,25 @@
       "status": "audit_required",
       "source_document": "docs/M1_PHASE_SCOPE.md",
       "source_paths": [],
-      "merged_prs": []
+      "merged_prs": [],
+      "development_audit": {
+        "audited_main_sha": "1ccffb103d36d372edb0a2dba03636c92885caf8",
+        "classification": "partial_runtime_or_model",
+        "source_paths": [
+          "rust/kernel_core/src/block.rs",
+          "rust/kernel_core/src/hier_vfs.rs",
+          "rust/kernel_core/src/fs_handles.rs"
+        ],
+        "source_symbols": [
+          "BlockDevice::sync",
+          "HierVfs::sync"
+        ],
+        "observed": "Durable flush/barrier and descriptor fsync implementation exist.",
+        "remaining": "General page cache and native fsync routing/cancellation semantics.",
+        "exit_case": "Dirty cache ordering and native sync errors survive crashes without false success.",
+        "evidence_ref": "docs/KERNEL_DEVELOPMENT_AUDIT.md",
+        "formal_acceptance_changed": false
+      }
     },
     {
       "id": "M1-P4-009",
@@ -1324,7 +2018,23 @@
       "status": "audit_required",
       "source_document": "docs/M1_PHASE_SCOPE.md",
       "source_paths": [],
-      "merged_prs": []
+      "merged_prs": [],
+      "development_audit": {
+        "audited_main_sha": "1ccffb103d36d372edb0a2dba03636c92885caf8",
+        "classification": "partial_runtime_or_model",
+        "source_paths": [
+          "rust/kernel_core/src/fs_handles.rs"
+        ],
+        "source_symbols": [
+          "selected_foreign_leases_current",
+          "FileHandles"
+        ],
+        "observed": "Range locks and verified unrelated-reader sharing exist; service is serialized.",
+        "remaining": "Blocking/fair locks and broader concurrent writers with stable file identity.",
+        "exit_case": "Lock/cancel/exit and overlapping/disjoint writers under actual concurrency.",
+        "evidence_ref": "docs/KERNEL_DEVELOPMENT_AUDIT.md",
+        "formal_acceptance_changed": false
+      }
     },
     {
       "id": "M1-P4-010",
@@ -1333,7 +2043,24 @@
       "status": "audit_required",
       "source_document": "docs/M1_PHASE_SCOPE.md",
       "source_paths": [],
-      "merged_prs": []
+      "merged_prs": [],
+      "development_audit": {
+        "audited_main_sha": "1ccffb103d36d372edb0a2dba03636c92885caf8",
+        "classification": "partial_runtime_or_model",
+        "source_paths": [
+          "rust/kernel_core/src/durablefs.rs",
+          "rust/kernel_core/src/fs_handles.rs"
+        ],
+        "source_symbols": [
+          "DurableFs",
+          "FileHandles"
+        ],
+        "observed": "Fixed file extents/slots and service-wide write budgets exist.",
+        "remaining": "General free-space allocator and persistent per-user quotas.",
+        "exit_case": "Fragment/full/reclaim and per-user denial under crashes and remount.",
+        "evidence_ref": "docs/KERNEL_DEVELOPMENT_AUDIT.md",
+        "formal_acceptance_changed": false
+      }
     },
     {
       "id": "M1-P4-011",
@@ -1342,7 +2069,23 @@
       "status": "audit_required",
       "source_document": "docs/M1_PHASE_SCOPE.md",
       "source_paths": [],
-      "merged_prs": []
+      "merged_prs": [],
+      "development_audit": {
+        "audited_main_sha": "1ccffb103d36d372edb0a2dba03636c92885caf8",
+        "classification": "runtime_path_not_verified",
+        "source_paths": [
+          "rust/kernel_core/src/block.rs",
+          "rust/kernel_core/src/m1_partition.rs"
+        ],
+        "source_symbols": [
+          "BlockWindow"
+        ],
+        "observed": "Media identity retirement and safe mounts do not supply encryption/hotplug.",
+        "remaining": "Removable-device lifecycle and actual encrypted filesystem/key handling.",
+        "exit_case": "Removal during I/O, reinsert/stale handles, authenticated encrypted-data recovery.",
+        "evidence_ref": "docs/KERNEL_DEVELOPMENT_AUDIT.md",
+        "formal_acceptance_changed": false
+      }
     },
     {
       "id": "M1-P4-012",
@@ -1385,6 +2128,22 @@
           "Reviewed master checklist reconciliation",
           "Verify applicable CI on updated PR head and final merged-main SHA before acceptance"
         ]
+      },
+      "development_audit": {
+        "audited_main_sha": "1ccffb103d36d372edb0a2dba03636c92885caf8",
+        "classification": "bounded_guest_evidence",
+        "source_paths": [
+          "rust/kernel_core/src/durablefs.rs",
+          "rust/kernel_core/src/fs_handles.rs"
+        ],
+        "source_symbols": [
+          "mount_recovery_readonly"
+        ],
+        "observed": "Real QEMU command-boundary power cuts, namespace corruption and cold readbacks pass.",
+        "remaining": "In-sector torn writes and controlled physical power/cache-loss evidence.",
+        "exit_case": "Old/new-only recovery through repeated cold boots and unchanged partition guards.",
+        "evidence_ref": "docs/KERNEL_DEVELOPMENT_AUDIT.md",
+        "formal_acceptance_changed": false
       }
     },
     {
@@ -1394,7 +2153,24 @@
       "status": "audit_required",
       "source_document": "docs/M1_PHASE_SCOPE.md",
       "source_paths": [],
-      "merged_prs": []
+      "merged_prs": [],
+      "development_audit": {
+        "audited_main_sha": "1ccffb103d36d372edb0a2dba03636c92885caf8",
+        "classification": "partial_runtime_or_model",
+        "source_paths": [
+          "rust/kernel_core/src/batch3_acpi.rs",
+          "rust/kernel_core/src/hardware_inventory.rs"
+        ],
+        "source_symbols": [
+          "parse_rsdp",
+          "parse_sdt"
+        ],
+        "observed": "Bounded ACPI/topology parsers and CPU/PCI discovery exist.",
+        "remaining": "Live firmware table mapping, complete inventory and power-management integration.",
+        "exit_case": "Real validated firmware inventory and safe shutdown/restart on selected machines.",
+        "evidence_ref": "docs/KERNEL_DEVELOPMENT_AUDIT.md",
+        "formal_acceptance_changed": false
+      }
     },
     {
       "id": "M1-P5-002",
@@ -1403,7 +2179,24 @@
       "status": "audit_required",
       "source_document": "docs/M1_PHASE_SCOPE.md",
       "source_paths": [],
-      "merged_prs": []
+      "merged_prs": [],
+      "development_audit": {
+        "audited_main_sha": "1ccffb103d36d372edb0a2dba03636c92885caf8",
+        "classification": "bounded_guest_evidence",
+        "source_paths": [
+          "rust/kernel_core/src/hardware_pcie.rs",
+          "rust/kernel_core/src/hardware_inventory.rs"
+        ],
+        "source_symbols": [
+          "scan",
+          "discover"
+        ],
+        "observed": "Real bounded read-only PCI bridge/device enumeration executes.",
+        "remaining": "Active ECAM/other segments, device lifecycle and broader hardware set.",
+        "exit_case": "Guest root-port topology and supported physical enumeration without unsafe writes.",
+        "evidence_ref": "docs/KERNEL_DEVELOPMENT_AUDIT.md",
+        "formal_acceptance_changed": false
+      }
     },
     {
       "id": "M1-P5-003",
@@ -1412,7 +2205,24 @@
       "status": "audit_required",
       "source_document": "docs/M1_PHASE_SCOPE.md",
       "source_paths": [],
-      "merged_prs": []
+      "merged_prs": [],
+      "development_audit": {
+        "audited_main_sha": "1ccffb103d36d372edb0a2dba03636c92885caf8",
+        "classification": "bounded_guest_evidence",
+        "source_paths": [
+          "rust/kernel_core/src/boot.rs",
+          "rust/kernel_core/src/hardware_pcie.rs"
+        ],
+        "source_symbols": [
+          "console_framebuffer",
+          "scan"
+        ],
+        "observed": "Framebuffer spans and actual PCI/PIO transports validate bounded resource addresses.",
+        "remaining": "General per-driver resource claims and malicious-device isolation.",
+        "exit_case": "Bad/overlapping MMIO/PIO and resource revoke tests on activated drivers.",
+        "evidence_ref": "docs/KERNEL_DEVELOPMENT_AUDIT.md",
+        "formal_acceptance_changed": false
+      }
     },
     {
       "id": "M1-P5-004",
@@ -1421,7 +2231,26 @@
       "status": "audit_required",
       "source_document": "docs/M1_PHASE_SCOPE.md",
       "source_paths": [],
-      "merged_prs": []
+      "merged_prs": [],
+      "development_audit": {
+        "audited_main_sha": "1ccffb103d36d372edb0a2dba03636c92885caf8",
+        "classification": "partial_runtime_or_model",
+        "source_paths": [
+          "rust/kernel_core/src/timer.rs",
+          "rust/kernel_core/src/input.rs",
+          "rust/kernel_core/src/hardware_pcie.rs",
+          "rust/kernel_core/src/user_runtime.rs"
+        ],
+        "source_symbols": [
+          "x86_64_scheduler_apic_timer_dispatch",
+          "enable_desktop_irqs"
+        ],
+        "observed": "Live APIC timer and PIC input routing exist.",
+        "remaining": "General MSI/MSI-X/shared IRQ resource ownership and interrupt-driven NIC integration.",
+        "exit_case": "Reset/unregister/stale IRQ tests and supported-device interrupt delivery.",
+        "evidence_ref": "docs/KERNEL_DEVELOPMENT_AUDIT.md",
+        "formal_acceptance_changed": false
+      }
     },
     {
       "id": "M1-P5-005",
@@ -1430,7 +2259,24 @@
       "status": "audit_required",
       "source_document": "docs/M1_PHASE_SCOPE.md",
       "source_paths": [],
-      "merged_prs": []
+      "merged_prs": [],
+      "development_audit": {
+        "audited_main_sha": "1ccffb103d36d372edb0a2dba03636c92885caf8",
+        "classification": "partial_runtime_or_model",
+        "source_paths": [
+          "rust/kernel_core/src/virtio_net.rs",
+          "rust/kernel_core/src/block.rs"
+        ],
+        "source_symbols": [
+          "probe",
+          "BlockDevice"
+        ],
+        "observed": "Legacy QEMU NIC has bounded DMA buffers; validated helper models exist.",
+        "remaining": "Actual IOMMU mapping/enforcement, IRQ/DMA reset and cross-device ownership.",
+        "exit_case": "Unauthorized/stale DMA cannot access peer frames; reset waits for completion.",
+        "evidence_ref": "docs/KERNEL_DEVELOPMENT_AUDIT.md",
+        "formal_acceptance_changed": false
+      }
     },
     {
       "id": "M1-P5-006",
@@ -1439,7 +2285,25 @@
       "status": "audit_required",
       "source_document": "docs/M1_PHASE_SCOPE.md",
       "source_paths": [],
-      "merged_prs": []
+      "merged_prs": [],
+      "development_audit": {
+        "audited_main_sha": "1ccffb103d36d372edb0a2dba03636c92885caf8",
+        "classification": "partial_runtime_or_model",
+        "source_paths": [
+          "rust/kernel_core/src/hardware_pcie.rs",
+          "rust/kernel_core/src/virtio_net.rs",
+          "rust/kernel_core/src/ata_pio.rs"
+        ],
+        "source_symbols": [
+          "scan",
+          "AtaPio"
+        ],
+        "observed": "Selected drivers probe and stop/retire individually.",
+        "remaining": "Unified scoped driver start/quiesce/reset/release lifecycle.",
+        "exit_case": "Failed/partial probe and reset revoke IRQ/DMA/MMIO without leaked ownership.",
+        "evidence_ref": "docs/KERNEL_DEVELOPMENT_AUDIT.md",
+        "formal_acceptance_changed": false
+      }
     },
     {
       "id": "M1-P5-007",
@@ -1448,7 +2312,23 @@
       "status": "audit_required",
       "source_document": "docs/M1_PHASE_SCOPE.md",
       "source_paths": [],
-      "merged_prs": []
+      "merged_prs": [],
+      "development_audit": {
+        "audited_main_sha": "1ccffb103d36d372edb0a2dba03636c92885caf8",
+        "classification": "runtime_path_not_verified",
+        "source_paths": [
+          "rust/kernel_core/src/user_runtime.rs",
+          "rust/kernel_core/src/virtio_net.rs"
+        ],
+        "source_symbols": [
+          "Task"
+        ],
+        "observed": "User-process isolation is not driver isolation; current hardware drivers run privileged.",
+        "remaining": "Real driver fault containment and resource-safe recovery.",
+        "exit_case": "Faulting driver cannot corrupt kernel/peers or leave DMA/IRQ authority active.",
+        "evidence_ref": "docs/KERNEL_DEVELOPMENT_AUDIT.md",
+        "formal_acceptance_changed": false
+      }
     },
     {
       "id": "M1-P5-008",
@@ -1457,7 +2337,24 @@
       "status": "audit_required",
       "source_document": "docs/M1_PHASE_SCOPE.md",
       "source_paths": [],
-      "merged_prs": []
+      "merged_prs": [],
+      "development_audit": {
+        "audited_main_sha": "1ccffb103d36d372edb0a2dba03636c92885caf8",
+        "classification": "runtime_path_not_verified",
+        "source_paths": [
+          "rust/kernel_core/src/hardware_pcie.rs",
+          "rust/kernel_core/src/block.rs"
+        ],
+        "source_symbols": [
+          "scan",
+          "BlockDevice"
+        ],
+        "observed": "Static enumeration and stale-media rejection exist.",
+        "remaining": "Live bus/device hotplug, removal and safe re-probe lifecycle.",
+        "exit_case": "Concurrent unplug during I/O revokes resources and rejects late completions.",
+        "evidence_ref": "docs/KERNEL_DEVELOPMENT_AUDIT.md",
+        "formal_acceptance_changed": false
+      }
     },
     {
       "id": "M1-P5-009",
@@ -1466,7 +2363,25 @@
       "status": "audit_required",
       "source_document": "docs/M1_PHASE_SCOPE.md",
       "source_paths": [],
-      "merged_prs": []
+      "merged_prs": [],
+      "development_audit": {
+        "audited_main_sha": "1ccffb103d36d372edb0a2dba03636c92885caf8",
+        "classification": "partial_runtime_or_model",
+        "source_paths": [
+          "rust/kernel_core/src/input.rs",
+          "rust/kernel_core/src/ps2_mouse.rs",
+          "rust/kernel_core/src/ata_pio.rs"
+        ],
+        "source_symbols": [
+          "prepare_desktop_controller",
+          "AtaPio"
+        ],
+        "observed": "Readiness, session reinitialization and bounded I/O retirement exist.",
+        "remaining": "ACPI/device power state and physical shutdown/resume qualification.",
+        "exit_case": "Repeated actual shutdown/restart and input/storage recovery on supported PCs.",
+        "evidence_ref": "docs/KERNEL_DEVELOPMENT_AUDIT.md",
+        "formal_acceptance_changed": false
+      }
     },
     {
       "id": "M1-P5-010",
@@ -1475,7 +2390,24 @@
       "status": "audit_required",
       "source_document": "docs/M1_PHASE_SCOPE.md",
       "source_paths": [],
-      "merged_prs": []
+      "merged_prs": [],
+      "development_audit": {
+        "audited_main_sha": "1ccffb103d36d372edb0a2dba03636c92885caf8",
+        "classification": "partial_runtime_or_model",
+        "source_paths": [
+          "rust/kernel_core/src/kernel_main.rs",
+          "rust/kernel_core/src/ata_pio.rs"
+        ],
+        "source_symbols": [
+          "kmain",
+          "AtaPio"
+        ],
+        "observed": "Serial stage/fault/ATA diagnostics and CI artifacts exist.",
+        "remaining": "General persistent crash/audit records and system observability.",
+        "exit_case": "Retained diagnosable failures without log corruption, secret leakage or unbounded growth.",
+        "evidence_ref": "docs/KERNEL_DEVELOPMENT_AUDIT.md",
+        "formal_acceptance_changed": false
+      }
     },
     {
       "id": "M1-P6-001",
@@ -1484,7 +2416,23 @@
       "status": "audit_required",
       "source_document": "docs/M1_PHASE_SCOPE.md",
       "source_paths": [],
-      "merged_prs": []
+      "merged_prs": [],
+      "development_audit": {
+        "audited_main_sha": "1ccffb103d36d372edb0a2dba03636c92885caf8",
+        "classification": "bounded_guest_evidence",
+        "source_paths": [
+          "rust/kernel_core/src/console.rs",
+          "rust/kernel_core/src/input.rs"
+        ],
+        "source_symbols": [
+          "poll_physical_byte"
+        ],
+        "observed": "Actual serial console and read-only recovery execute.",
+        "remaining": "Supported physical UART and sustained error handling.",
+        "exit_case": "Normal/recovery logging and UART-negative desktop control acceptance.",
+        "evidence_ref": "docs/KERNEL_DEVELOPMENT_AUDIT.md",
+        "formal_acceptance_changed": false
+      }
     },
     {
       "id": "M1-P6-002",
@@ -1523,6 +2471,23 @@
           "Reviewed master checklist reconciliation",
           "Verify applicable CI on updated PR head and final merged-main SHA before acceptance"
         ]
+      },
+      "development_audit": {
+        "audited_main_sha": "1ccffb103d36d372edb0a2dba03636c92885caf8",
+        "classification": "bounded_guest_evidence",
+        "source_paths": [
+          "rust/kernel_core/src/input.rs",
+          "rust/kernel_core/src/ps2_mouse.rs"
+        ],
+        "source_symbols": [
+          "ScanDecoder",
+          "Mouse"
+        ],
+        "observed": "Actual PS/2 IRQ input, focus/capture and loss handling execute.",
+        "remaining": "Supported physical keyboard/mouse and broader transport qualification.",
+        "exit_case": "Real device input, held-button recovery, decoder loss and no stale editor input.",
+        "evidence_ref": "docs/KERNEL_DEVELOPMENT_AUDIT.md",
+        "formal_acceptance_changed": false
       }
     },
     {
@@ -1532,7 +2497,24 @@
       "status": "audit_required",
       "source_document": "docs/M1_PHASE_SCOPE.md",
       "source_paths": [],
-      "merged_prs": []
+      "merged_prs": [],
+      "development_audit": {
+        "audited_main_sha": "1ccffb103d36d372edb0a2dba03636c92885caf8",
+        "classification": "bounded_guest_evidence",
+        "source_paths": [
+          "rust/kernel_core/src/gui.rs",
+          "rust/kernel_core/src/boot.rs"
+        ],
+        "source_symbols": [
+          "compositor_commit",
+          "console_framebuffer"
+        ],
+        "observed": "UEFI framebuffer and validated complete PID4 frame copy execute.",
+        "remaining": "Supported display modes/formats and physical framebuffer qualification.",
+        "exit_case": "Exact pixel, clipping, stale/incomplete frame and real-display acceptance.",
+        "evidence_ref": "docs/KERNEL_DEVELOPMENT_AUDIT.md",
+        "formal_acceptance_changed": false
+      }
     },
     {
       "id": "M1-P6-004",
@@ -1541,7 +2523,22 @@
       "status": "audit_required",
       "source_document": "docs/M1_PHASE_SCOPE.md",
       "source_paths": [],
-      "merged_prs": []
+      "merged_prs": [],
+      "development_audit": {
+        "audited_main_sha": "1ccffb103d36d372edb0a2dba03636c92885caf8",
+        "classification": "bounded_guest_evidence",
+        "source_paths": [
+          "rust/kernel_core/src/ata_pio.rs"
+        ],
+        "source_symbols": [
+          "AtaPio"
+        ],
+        "observed": "Bounded legacy ATA PIO, IDENTIFY and flush/error handling execute.",
+        "remaining": "Selected physical disks and real cache/power loss; never autoformat.",
+        "exit_case": "Transport fault, corruption, flush and controlled reboot/power recovery.",
+        "evidence_ref": "docs/KERNEL_DEVELOPMENT_AUDIT.md",
+        "formal_acceptance_changed": false
+      }
     },
     {
       "id": "M1-P6-005",
@@ -1550,7 +2547,24 @@
       "status": "audit_required",
       "source_document": "docs/M1_PHASE_SCOPE.md",
       "source_paths": [],
-      "merged_prs": []
+      "merged_prs": [],
+      "development_audit": {
+        "audited_main_sha": "1ccffb103d36d372edb0a2dba03636c92885caf8",
+        "classification": "bounded_guest_evidence",
+        "source_paths": [
+          "rust/kernel_core/src/virtio_net.rs",
+          "rust/kernel_core/src/network.rs"
+        ],
+        "source_symbols": [
+          "probe",
+          "run_demo"
+        ],
+        "observed": "R028 legacy QEMU PCI ARP/ICMP/UDP/DNS/TCP exchange exists.",
+        "remaining": "Normal-boot network service and modern IRQ/DMA, sockets and interface lifecycle.",
+        "exit_case": "Actual multi-connection/timeouts/IRQ/reset tests; do not enable legacy sample on real PCs.",
+        "evidence_ref": "docs/KERNEL_DEVELOPMENT_AUDIT.md",
+        "formal_acceptance_changed": false
+      }
     },
     {
       "id": "M1-P6-006",
@@ -1559,7 +2573,24 @@
       "status": "audit_required",
       "source_document": "docs/M1_PHASE_SCOPE.md",
       "source_paths": [],
-      "merged_prs": []
+      "merged_prs": [],
+      "development_audit": {
+        "audited_main_sha": "1ccffb103d36d372edb0a2dba03636c92885caf8",
+        "classification": "runtime_path_not_verified",
+        "source_paths": [
+          "rust/kernel_core/src/batch3_ahci.rs",
+          "rust/kernel_core/src/batch3_nvme.rs"
+        ],
+        "source_symbols": [
+          "validate_command",
+          "Queue"
+        ],
+        "observed": "AHCI descriptor preflight and NVMe queue models are not live controller drivers.",
+        "remaining": "Hardware initialization, DMA ownership, interrupts, flush and recovery.",
+        "exit_case": "Real emulated then supported physical AHCI/NVMe reads/writes/reset/durability.",
+        "evidence_ref": "docs/KERNEL_DEVELOPMENT_AUDIT.md",
+        "formal_acceptance_changed": false
+      }
     },
     {
       "id": "M1-P6-007",
@@ -1568,7 +2599,24 @@
       "status": "audit_required",
       "source_document": "docs/M1_PHASE_SCOPE.md",
       "source_paths": [],
-      "merged_prs": []
+      "merged_prs": [],
+      "development_audit": {
+        "audited_main_sha": "1ccffb103d36d372edb0a2dba03636c92885caf8",
+        "classification": "runtime_path_not_verified",
+        "source_paths": [
+          "rust/kernel_core/src/input.rs",
+          "rust/kernel_core/src/ps2_mouse.rs"
+        ],
+        "source_symbols": [
+          "ScanDecoder",
+          "Mouse"
+        ],
+        "observed": "PS/2 paths do not establish USB/xHCI support.",
+        "remaining": "Host controller, enumeration, rings and HID report delivery.",
+        "exit_case": "Real xHCI keyboard/mouse, disconnect/reset and hostile descriptor tests.",
+        "evidence_ref": "docs/KERNEL_DEVELOPMENT_AUDIT.md",
+        "formal_acceptance_changed": false
+      }
     },
     {
       "id": "M1-P6-008",
@@ -1577,7 +2625,24 @@
       "status": "audit_required",
       "source_document": "docs/M1_PHASE_SCOPE.md",
       "source_paths": [],
-      "merged_prs": []
+      "merged_prs": [],
+      "development_audit": {
+        "audited_main_sha": "1ccffb103d36d372edb0a2dba03636c92885caf8",
+        "classification": "runtime_path_not_verified",
+        "source_paths": [
+          "rust/kernel_core/src/hardware_pcie.rs",
+          "rust/kernel_core/src/gui.rs"
+        ],
+        "source_symbols": [
+          "scan",
+          "compositor_commit"
+        ],
+        "observed": "GPU discovery plus CPU framebuffer presentation is not GPU acceleration.",
+        "remaining": "Validated device commands, memory/resource isolation and reset.",
+        "exit_case": "Actual supported GPU backend plus preserved software fallback.",
+        "evidence_ref": "docs/KERNEL_DEVELOPMENT_AUDIT.md",
+        "formal_acceptance_changed": false
+      }
     },
     {
       "id": "M1-P6-009",
@@ -1586,7 +2651,24 @@
       "status": "audit_required",
       "source_document": "docs/M1_PHASE_SCOPE.md",
       "source_paths": [],
-      "merged_prs": []
+      "merged_prs": [],
+      "development_audit": {
+        "audited_main_sha": "1ccffb103d36d372edb0a2dba03636c92885caf8",
+        "classification": "physical_qualification_pending",
+        "source_paths": [
+          "rust/kernel_core/src/hardware_inventory.rs",
+          "rust/kernel_core/src/hardware_pcie.rs"
+        ],
+        "source_symbols": [
+          "inspect_cpu",
+          "scan"
+        ],
+        "observed": "Emulated discovery exists; selected-PC driver receipts were not supplied.",
+        "remaining": "Publish and qualify a physical CPU/IRQ/input/display/storage/NIC matrix.",
+        "exit_case": "Exact machine/firmware/device IDs and independent negative/recovery receipts.",
+        "evidence_ref": "docs/KERNEL_DEVELOPMENT_AUDIT.md",
+        "formal_acceptance_changed": false
+      }
     },
     {
       "id": "M1-P8-001",
