@@ -292,6 +292,8 @@ pub mod network;
 // kernel boot/PMM externs. R028 QEMU enables it explicitly.
 #[cfg(all(target_arch="x86_64", feature="test-r028-network"))]
 pub mod virtio_net;
+#[cfg(feature="test-r136-nic-irq")]
+mod nic_interrupt;
 /// Authenticated process IPC and bounded RAM filesystem service (R025).
 pub mod r025_services;
 pub mod quantum;

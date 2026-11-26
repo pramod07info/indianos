@@ -42,6 +42,7 @@ test-r028-network = []
 # NOT a real SMP scheduler, IPI/TLB shootdown, hardware NIC or production boot.
 test-r118-ap-ack = ["kernel-main", "limine-requests", "paging-cpu"]
 test-r132-tlb-stale = ["test-r118-ap-ack"]
+test-r136-nic-irq = ["test-r028-network","cpu-entry","interrupts","timer"]
 # Isolated, deliberately provisioned 64-sector QEMU boot-epoch evidence;
 # never enabled in normal boot and not a trusted firmware root.
 test-r114-epoch = ["kernel-main"]

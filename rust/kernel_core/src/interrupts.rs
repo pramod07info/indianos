@@ -185,6 +185,11 @@ pub unsafe extern "C" fn x86_64_exceptions_init()->bool{
             install_gate(i,handler,if i==8 {1} else {0},INTERRUPT_GATE);
         }
         install_gate(0x80,x86_64_user_interrupt as usize,0,USER_GATE);
+        #[cfg(feature="test-r136-nic-irq")]
+        {
+            unsafe extern "C" {fn x86_64_nic_irq11();}
+            install_gate(0x2b,x86_64_nic_irq11 as *const () as usize,0,INTERRUPT_GATE);
+        }
         #[cfg(any(feature="test-irq-keyboard",feature="normal-desktop"))]
         install_gate(0x21,x86_64_keyboard_interrupt as usize,0,INTERRUPT_GATE);
         #[cfg(feature="normal-desktop")]

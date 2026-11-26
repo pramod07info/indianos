@@ -417,3 +417,42 @@ spawn/exec, arbitrary parentage, service restart policy beyond existing roles,
 threads/futexes/signals, normal IRQ/DMA/IOMMU networking, AHCI/NVMe/xHCI drivers,
 verified boot and physical power/device qualification remain unfinished. No
 formal gate or completion percentage changes.
+
+### Legacy NIC interrupt notifications and DMA retirement (P6-005)
+
+The existing QEMU virtio-net driver now has an explicit exclusive-IRQ11
+qualification profile (`R136_NIC_IRQ_TEST=1`, Cargo `test-r136-nic-irq`). The
+ordinary polled network profile and normal desktop are separate. Normal Desktop
+cannot combine this experimental personality through its existing build gate.
+
+The driver validates the real PCI interrupt line/pin and COMMAND readback before
+arming notifications. Its DPL0 IDT stub preserves all GPRs and arbitrary kernel
+stack alignment. The ISR masks IRQ11 before acknowledging the device ISR and
+slave/master PIC, counts genuine queue notifications, and never dereferences a
+DMA ring, packet, process, scheduler or heap. Removed-device/config-change ISR
+values fail closed. Only the exclusive pre-user BSP profile may remap the PIC
+and select legacy interrupt routing; this is not a generic platform IRQ router.
+
+Bounded one-shot STI/NOP/CLI windows let actual device interrupts run while the
+queue consumer retains exclusive DMA ownership. Polling windows are rate-limited;
+completed RX/TX descriptors force a notification window before consumption. The
+ISR masks its source before EOI so a stuck shared line cannot indefinitely
+starve CLI. Shared devices/IRQs remain unsupported. Driver close masks and revokes
+IRQ notification admission before the existing verified reset, PCI bus-master
+disable and PMM ring release. If quiescence/reset/identity is uncertain, DMA
+backing remains retained. No interrupt handler can touch released ring storage.
+
+Two host admission/status cases and one negative receipt-oracle case were added.
+The existing network workflow preserves its original polled guest test, then
+builds a separate IRQ image and requires real ARP/ICMP/UDP/DNS/TCP packets,
+IRQ arming, a nonzero real interrupt count and verified masking/reset before
+success. It retains the guest serial transcript as an exact-head artifact.
+Host-side packet validation still runs through QEMU's isolated socket backend;
+no host physical NIC, public network or disk is attached. No local build/test/
+QEMU execution was performed; exact-head GitHub results remain pending.
+
+This advances point 8 without completing normal networking, interrupt-driven
+multiqueue processing, MSI/MSI-X, IOMMU mappings or physical device qualification.
+Points 5 (general threads/futexes/signals), 6 (general spawn/exec/parentage),
+9 (actual AHCI/NVMe/xHCI controllers) and 10 (firmware trust and physical power/
+device acceptance) remain unfinished. No formal gate or percentage changes.

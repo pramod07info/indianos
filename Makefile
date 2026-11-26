@@ -245,6 +245,7 @@ RUST_FEATURES := $(if $(filter 1,$(PREEMPT_SELFTEST)),--features preempt,) $(if 
 ifeq ($(RUST_MAIN),1)
 RUST_FEATURES += $(if $(filter 1,$(R118_AP_ACK_TEST)),--features test-r118-ap-ack,)
 RUST_FEATURES += $(if $(filter 1,$(R132_TLB_STALE_TEST)),--features test-r132-tlb-stale,)
+RUST_FEATURES += $(if $(filter 1,$(R136_NIC_IRQ_TEST)),--features test-r136-nic-irq,)
 RUST_FEATURES += $(if $(filter 1,$(EXCEPTION_SELFTEST)),--features test-ud2,) \
  $(if $(filter 1,$(PAGEFAULT_SELFTEST)),--features test-pagefault,) \
  $(if $(filter 1,$(PAGING_SWITCH_SELFTEST)),--features test-shadow,) \

@@ -670,14 +670,32 @@ pub extern "C" fn kmain()->!{
                 halt()
             });
         log(b"IndianOS: R028 legacy virtio-net DMA queues initialized\n\0");
+        #[cfg(feature="test-r136-nic-irq")]
+        {
+            if !unsafe{nic.enable_irq_notifications()}{
+                let _=nic.close();
+                need(false,b"IndianOS: FATAL R136 exclusive NIC IRQ admission failed\n\0");
+                halt();
+            }
+            log(b"IndianOS: R136 exclusive legacy NIC IRQ11 notifications armed\n\0");
+        }
         let result=crate::network::run_demo(&mut nic,log);
+        #[cfg(feature="test-r136-nic-irq")]
+        let irq_proved=crate::nic_interrupt::notifications()>0;
         // Even failed protocol probes must reset the NIC before any PMM DMA
         // frame can be returned. Never report network PASS after an uncertain
         // reset or silently release pages while the device may still DMA.
         need(nic.close(),b"IndianOS: FATAL R114 virtio-net DMA stop readback failed\n\0");
         log(b"IndianOS: R114 virtio-net reset and PCI bus-master shutdown verified PASSED\n\0");
+        #[cfg(feature="test-r136-nic-irq")]
+        {
+            need(irq_proved,b"IndianOS: FATAL R136 no actual NIC IRQ notification\n\0");
+            log(b"IndianOS: R136 actual NIC IRQ observed and masked before DMA release PASSED\n\0");
+        }
         need(result.is_ok(),b"IndianOS: FATAL R028 ARP ICMP UDP DNS or TCP exchange\n\0");
         log(b"IndianOS: R028 QEMU virtio-net end-to-end network client PASSED\n\0");
+        #[cfg(feature="test-r136-nic-irq")]
+        halt();
     }
 
     #[cfg(feature="test-ud2")]

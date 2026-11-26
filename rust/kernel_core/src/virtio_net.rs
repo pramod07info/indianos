@@ -5,6 +5,8 @@
 //! buffers, checksum offload, or modern virtio PCI capability negotiation.
 //! The device MUST be an emulated 0x1af4:0x1000 virtio-net legacy PCI card.
 //! Never enable this experimental DMA driver in ordinary machine boot.
+//! A separate opt-in profile adds exclusive IRQ11 queue notifications while
+//! retaining serialized polled DMA consumption; shared IRQs/IOMMU are absent.
 use core::{arch::asm,ptr,sync::atomic::{compiler_fence,Ordering}};
 use crate::network::{EthernetDevice,Error};
 
@@ -211,6 +213,26 @@ pub struct VirtioNet{
     faulted:bool,
 }
 impl VirtioNet{
+    /// QEMU-exclusive legacy IRQ11; call after probe, before user execution.
+    /// DMA ownership remains with the normal serialized queue consumer.
+    #[cfg(feature="test-r136-nic-irq")]
+    pub unsafe fn enable_irq_notifications(&mut self)->bool{
+        let route=pciread(self.bus,self.slot,self.function,0x3c);
+        let irq=route as u8;let pin=((route>>8)&255) as u8;
+        if irq!=11||!(1..=4).contains(&pin)||self.faulted{return false;}
+        let command=pciread(self.bus,self.slot,self.function,4)&0xffff;
+        if command&5!=5{return false;}
+        pciwrite(self.bus,self.slot,self.function,4,command&!0x400);
+        if pciread(self.bus,self.slot,self.function,0)!=legacy_nic_identity()||
+           pciread(self.bus,self.slot,self.function,4)&0x405!=5{return false;}
+        unsafe{crate::nic_interrupt::enable(self.port,irq)}
+    }
+    #[cfg(feature="test-r136-nic-irq")]
+    fn irq_window(&mut self,force:bool)->bool{
+        if !crate::nic_interrupt::active(self.port){return true;}
+        if !unsafe{crate::nic_interrupt::pulse(self.port,force)}{self.faulted=true;return false;}
+        true
+    }
     /// # Safety
     /// QEMU legacy virtio-net, BSP with IRQs disabled and PMM initialized.
     /// No other I/O master may own the PCI device, DMA frames or virtqueues.
@@ -268,6 +290,8 @@ impl VirtioNet{
     /// stable PCI I/O-port mapping; no IOMMU or real hardware qualification.
     #[must_use]
     pub fn close(self)->bool{
+        #[cfg(feature="test-r136-nic-irq")]
+        if crate::nic_interrupt::active(self.port)&&!unsafe{crate::nic_interrupt::disable(self.port)}{return false;}
         unsafe{outb(self.port+0x12,0);}
         compiler_fence(Ordering::SeqCst);
         // A removed/replaced device may return all-ones PCI identity,
@@ -415,7 +439,11 @@ impl EthernetDevice for VirtioNet{
         compiler_fence(Ordering::SeqCst);
         unsafe{outw(self.port+0x10,QUEUE_TX);}
         for _ in 0..TIMEOUT{
+            #[cfg(feature="test-r136-nic-irq")]
+            if !self.irq_window(false){return Err(Error::Device);}
             if self.tx.complete(){
+                #[cfg(feature="test-r136-nic-irq")]
+                if !self.irq_window(true){return Err(Error::Device);}
                 if !matches!(self.tx.consume(),Ok(Some(n))
                     if tx_completion_length_valid(n,frame.len())){
                     self.faulted=true;
@@ -431,7 +459,11 @@ impl EthernetDevice for VirtioNet{
     }
     fn poll(&mut self,out:&mut [u8])->Result<Option<usize>,Error>{
         if self.faulted{return Err(Error::Device);}
+        #[cfg(feature="test-r136-nic-irq")]
+        if !self.irq_window(false){return Err(Error::Device);}
         if !self.rx.complete(){return Ok(None);}
+        #[cfg(feature="test-r136-nic-irq")]
+        if !self.irq_window(true){return Err(Error::Device);}
         let length=match self.rx.consume(){
             Ok(Some(length))=>length,
             Ok(None)=>return Ok(None),

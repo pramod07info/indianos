@@ -75,6 +75,18 @@ fn select_legacy_pic()->bool{
     }
     true
 }
+/// Isolated pre-user QEMU NIC profile only. Reuses legacy PIC/APIC routing;
+/// every source stays masked until its one-shot IRQ11 notification window.
+#[cfg(feature="test-r136-nic-irq")]
+pub(crate) unsafe fn prepare_exclusive_nic_pic()->bool{
+ if !select_legacy_pic(){return false;}
+ outb(PIC1_DATA,0xff);outb(PIC2_DATA,0xff);
+ outb(PIC1_CMD,0x11);io_wait();outb(PIC2_CMD,0x11);io_wait();
+ outb(PIC1_DATA,0x20);io_wait();outb(PIC2_DATA,0x28);io_wait();
+ outb(PIC1_DATA,0x04);io_wait();outb(PIC2_DATA,0x02);io_wait();
+ outb(PIC1_DATA,0x01);io_wait();outb(PIC2_DATA,0x01);io_wait();
+ outb(PIC1_DATA,0xfb);outb(PIC2_DATA,0xff);true
+}
 #[no_mangle]
 pub extern "C" fn x86_64_timer_start_100hz()->bool{
     if CONFIGURED.load(Ordering::Relaxed){return false}

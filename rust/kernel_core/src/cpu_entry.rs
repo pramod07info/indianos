@@ -7,6 +7,8 @@
 //! [vector, error] ahead of the CPU-pushed frame. CPU state transitions
 //! must remain raw assembly, not ordinary Rust functions.
 use core::arch::global_asm;
+#[cfg(feature="test-r136-nic-irq")]
+global_asm!(include_str!("arch/x86_64/nic_entry.S"),options(att_syntax));
 
 // x86 assembler must use AT&T syntax: the reference files use %register,
 // $immediate and RIP-relative addressing. This is intentionally assembled
