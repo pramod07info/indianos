@@ -28,6 +28,11 @@ struct indianos_user_image {
 bool indianos_user_image_load(struct indianos_user_image *image,
                               const struct vmm_backend *backend,
                               const uint8_t *elf, size_t size);
+/* Trusted-kernel admission before any backend allocation. The 1..128 page
+ * limit covers data/BSS and stack; it is not a total process RSS quota. */
+bool indianos_user_image_load_with_limit(struct indianos_user_image *image,
+                              const struct vmm_backend *backend,
+                              const uint8_t *elf, size_t size, uint16_t page_limit);
 /* Caller must destroy images before switching active CR3; destroy does NOT
  * unmap pages from the current CPU's active address space or flush the TLB. */
 bool indianos_user_image_destroy(struct indianos_user_image *image);

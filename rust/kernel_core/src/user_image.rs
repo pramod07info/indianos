@@ -139,6 +139,24 @@ pub unsafe extern "C" fn indianos_user_image_destroy(
     true
 }
 
+fn planned_pages(plan:&ProgramPlan,limit:u16)->Option<u64>{
+    if limit==0||limit as usize>MAX_IMAGE_PAGES||plan.segment_count==0||
+       plan.segment_count as usize>MAX_SEGMENTS{return None;}
+    if (plan.stack_begin|plan.stack_end)%PAGE as u64!=0{return None;}
+    let stack=plan.stack_end.checked_sub(plan.stack_begin)?;
+    if stack==0{return None;}
+    let mut requested=stack/PAGE as u64;
+    if requested>u64::from(limit){return None;}
+    for segment in &plan.segments[..plan.segment_count as usize]{
+        if (segment.page_begin|segment.page_end)%PAGE as u64!=0{return None;}
+        let bytes=segment.page_end.checked_sub(segment.page_begin)?;
+        if bytes==0{return None;}
+        requested=requested.checked_add(bytes/PAGE as u64)?;
+        if requested>u64::from(limit){return None;}
+    }
+    Some(requested)
+}
+
 /// # Safety
 /// \`image\` points to initialized, exclusively owned kernel memory;
 /// \`backend\` contains trusted C function pointers, \`elf\` is readable
@@ -147,6 +165,16 @@ pub unsafe extern "C" fn indianos_user_image_destroy(
 pub unsafe extern "C" fn indianos_user_image_load(
     image: *mut UserImage, backend: *const Backend, elf: *const u8, size: usize,
 ) -> bool {
+    unsafe{indianos_user_image_load_with_limit(image,backend,elf,size,MAX_IMAGE_PAGES as u16)}
+}
+/// Trusted-kernel image admission. Limit covers ELF data/BSS and stack pages;
+/// page tables, kernel buffers and shared mappings are separate resources.
+/// # Safety: same exclusive pointer/backend contract as the legacy loader.
+#[no_mangle]
+pub unsafe extern "C" fn indianos_user_image_load_with_limit(
+    image:*mut UserImage,backend:*const Backend,elf:*const u8,size:usize,page_limit:u16,
+)->bool{
+    if page_limit==0||page_limit as usize>MAX_IMAGE_PAGES{return false;}
     if image.is_null() || backend.is_null() || elf.is_null() { return false; }
     let img = unsafe { &mut *image };
     if img.tables.initialized || img.ready { return false; }
@@ -158,12 +186,7 @@ pub unsafe extern "C" fn indianos_user_image_load(
     if !unsafe { indianos_program_plan_elf64(elf, size, &mut plan) } {
         return false;
     }
-    let mut requested = (plan.stack_end - plan.stack_begin) / PAGE as u64;
-    for seg in &plan.segments[..plan.segment_count as usize] {
-        let count = (seg.page_end - seg.page_begin) / PAGE as u64;
-        if count > MAX_IMAGE_PAGES as u64 - requested { return false; }
-        requested += count;
-    }
+    if planned_pages(&plan,page_limit).is_none(){return false;}
     if !unsafe { vmm_create(&mut img.tables, backend) } { return false; }
     img.plan = plan;
     img.page_count = 0;
@@ -662,6 +685,18 @@ mod tests {
         assert!(unsafe{stage(&mut image,0x402000,Permissions{writable:true,executable:false,user:true})}.is_none());
         assert_eq!(ram.used,before);image.page_count=count;
         assert!(unsafe{indianos_user_image_destroy(&mut image)});
+    }
+    #[test]fn image_budget_preflight_counts_stack_and_segments_without_underflow(){
+        let mut plan=ProgramPlan{entry:0x400000,stack_begin:0x500000,stack_end:0x510000,
+            guard_begin:0x4ff000,segment_count:1,segments:[ProgramSegment::empty();MAX_SEGMENTS]};
+        plan.segments[0].page_begin=0x400000;plan.segments[0].page_end=0x404000;
+        assert_eq!(planned_pages(&plan,20),Some(20));assert_eq!(planned_pages(&plan,19),None);
+        assert_eq!(planned_pages(&plan,0),None);assert_eq!(planned_pages(&plan,129),None);
+        plan.stack_end=0x600000;assert_eq!(planned_pages(&plan,128),None);
+        plan.stack_end=0x4ff000;assert_eq!(planned_pages(&plan,128),None);
+        plan.stack_end=0x510000;plan.segments[0].page_end=0x3ff000;
+        assert_eq!(planned_pages(&plan,128),None);
+        plan.segment_count=MAX_SEGMENTS as u32+1;assert_eq!(planned_pages(&plan,128),None);
     }
     #[test]
     fn c_abi_and_user_copy_bounds() {

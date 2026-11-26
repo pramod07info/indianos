@@ -239,3 +239,32 @@ that allocator/backend calls and neighboring bytes remain untouched, then restor
 metadata to verify ordinary cleanup. This bounds checks allocator metadata; it
 is not a claim that arbitrary kernel memory corruption is recoverable. Unsupported
 corruption stays fail-closed instead of guessing which physical pages are owned.
+
+## Image data/stack admission budgets
+
+`indianos_user_image_load_with_limit` is an additive trusted-kernel C API. It
+accepts a 1..128 data-page limit and checks ELF/BSS plus stack requirements with
+checked arithmetic before creating the root or invoking allocation callbacks.
+The existing loader delegates with its original 128-page ceiling; UserImage
+layout and existing ABI signatures remain unchanged. Failed preflight leaves
+image/backend ownership untouched, and refused staging rollback still counts
+against the image's fixed ownership capacity.
+
+Normal desktop now applies an explicit 64-page data/stack admission limit to
+PID1, which has no app pixel canvas; Files, Terminal and compositor retain 128.
+Unknown desktop roles are refused. Existing read-only inspection of the earlier
+unchanged desktop-init ELF showed seven segment pages; with its 16-page stack
+this fits the 64-page limit. No image was rebuilt or executed locally. Fresh
+exact-head guest acceptance remains required. The normal-desktop harness requires
+`IndianOS: desktop broker image limit 64 pages enforced` and rejects repeating
+it during compositor-only recovery, where PID1 must remain alive.
+
+Rust preflight tests cover exact/exceeded budgets, invalid limits, reversed
+ranges and excessive segment counts. Existing C loader integration now checks
+that over-budget rejection invokes zero allocation callbacks, exact-limit loading
+succeeds, live-image reload refuses, cleanup frees ownership, and the legacy API
+continues to work. The desktop role policy has a separate negative-control test.
+
+This admission policy covers image data/BSS and stack frames, not page tables,
+shared mappings, kernel service buffers, runtime growth or total RSS. It does not
+replace the still-pending process RSS/system-wide OOM requirements.

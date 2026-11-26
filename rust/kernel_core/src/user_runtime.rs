@@ -2035,13 +2035,27 @@ pub unsafe extern "C" fn x86_64_user_demo_run(elf:*const u8,size:usize)->bool{
 fn task_ptr(i:usize)->*mut Task{
  unsafe{ptr::addr_of_mut!(M009_TASKS).cast::<Task>().add(i)}
 }
+#[cfg(feature="normal-desktop")]
+fn desktop_image_page_limit(pid:u32)->Option<u16>{
+    // PID1 is the broker/supervisor and has no application pixel canvas.
+    match pid{1=>Some(64),2|3|4=>Some(128),_=>None}
+}
 fn prepare(t:*mut Task,p:*mut Process,elf:*const u8,size:usize,original:u64,
  vmm:&VmmBackend,b:&CloneBackend,slot:usize)->bool{
  let task=unsafe{&mut *t};
  if p.is_null(){return false;}
  task.pcb=p;task.authority_live=true;
- if !unsafe{x86_64_user_interrupt_stack_select(slot as u32)} ||
-    !unsafe{indianos_user_image_load(&mut task.image,vmm,elf,size)}{return false;}
+ if !unsafe{x86_64_user_interrupt_stack_select(slot as u32)}{return false;}
+ #[cfg(feature="normal-desktop")]
+ let loaded={
+  let Some(limit)=desktop_image_page_limit(unsafe{(*p).pid})else{return false;};
+  unsafe{crate::user_image::indianos_user_image_load_with_limit(&mut task.image,vmm,elf,size,limit)}
+ };
+ #[cfg(not(feature="normal-desktop"))]
+ let loaded=unsafe{indianos_user_image_load(&mut task.image,vmm,elf,size)};
+ if !loaded{return false;}
+ #[cfg(feature="normal-desktop")]
+ if unsafe{(*p).pid}==1{log(b"IndianOS: desktop broker image limit 64 pages enforced\n\0");}
  if !unsafe{paging_clone_kernel_half(b,original,&mut task.root)} ||
     !unsafe{paging_attach_user_half(b,task.root.root,task.image.tables.root_physical)}{return false;}
  task.attached=true;
@@ -4174,5 +4188,14 @@ mod kernel_p0_batch27_w3_tests {
         let mut bad=good;bad[16]=0x08;
         assert!(!capture_frame(&mut t,&bad,true));
         assert_eq!(t.frame,saved);assert!(t.saved);
+    }
+}
+
+#[cfg(all(test,feature="normal-desktop"))]
+mod desktop_image_budget_tests{
+    #[test]fn broker_budget_is_bounded_and_unknown_roles_are_not_admitted(){
+        assert_eq!(super::desktop_image_page_limit(1),Some(64));
+        for pid in 2..=4{assert_eq!(super::desktop_image_page_limit(pid),Some(128));}
+        for pid in [0,5,u32::MAX]{assert_eq!(super::desktop_image_page_limit(pid),None);}
     }
 }

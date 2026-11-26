@@ -85,6 +85,7 @@ PIXEL_APP_EVIDENCE = tuple(
     b"IndianOS user: desktop compositor denied app pixel authority",
     COMPOSITOR_SNAPSHOT,
     b"IndianOS: kernel heap BSP admission ready",
+    b"IndianOS: desktop broker image limit 64 pages enforced",
     FRAME_ALLOCATED, SCRATCH_ALLOCATED, SCRATCH_SHARED,
     FRAME_PRESENTED, FRAME_PUBLISHED,
 )
@@ -1789,7 +1790,8 @@ def verify_transient_restart(output: bytes, injection_at: int) -> None:
         if phase_records.count(released) != 1 or phase.find(released) > phase.find(COMPOSITOR_PREPARED):
             raise AssertionError("PID4 replacement lacks prior owned-buffer release")
     verify_frame_publication(phase + b"\n")
-    forbidden = (b"IndianOS: kernel heap BSP admission ready",
+    forbidden = (b"IndianOS: desktop broker image limit 64 pages enforced",
+                 b"IndianOS: kernel heap BSP admission ready",
                  READY.encode(), LIFECYCLE_READY.encode(), SURFACES_GUARDED.encode(),
                  b"restarting retired service session", b"retired session verified restart-safe",
                  b"restart budget exhausted", b"reason=desktop-session-failed", b"FATAL",

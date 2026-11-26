@@ -14,10 +14,12 @@ struct ram {
     _Alignas(4096) uint8_t frames[CAPACITY][4096];
     bool used[CAPACITY];
     unsigned used_count;
+    unsigned allocation_calls;
     int fail_after;
 };
 static bool alloc(uint64_t *addr, void *ctx) {
     struct ram *r = ctx;
+    ++r->allocation_calls;
     if (r->fail_after == 0) return false;
     if (r->fail_after > 0) --r->fail_after;
     for (unsigned i = 0; i < CAPACITY; ++i) if (!r->used[i]) {
@@ -106,6 +108,16 @@ int main(void) {
         .allocate = alloc, .release = release, .access = access_frame,
         .context = &r
     };
+    struct indianos_user_image limited = {0};
+    const unsigned calls_before_limit = r.allocation_calls;
+    assert(!indianos_user_image_load_with_limit(&limited, &backend, file.bytes, file.length, 0));
+    assert(!indianos_user_image_load_with_limit(&limited, &backend, file.bytes, file.length, 129));
+    assert(!indianos_user_image_load_with_limit(&limited, &backend, file.bytes, file.length, 19));
+    assert(r.allocation_calls == calls_before_limit && r.used_count == 0 && !limited.tables.initialized);
+    assert(indianos_user_image_load_with_limit(&limited, &backend, file.bytes, file.length, 20));
+    assert(limited.ready && limited.page_count == 20);
+    assert(!indianos_user_image_load_with_limit(&limited, &backend, file.bytes, file.length, 20));
+    assert(indianos_user_image_destroy(&limited) && r.used_count == 0);
     struct indianos_user_image image = {0};
     assert(indianos_user_image_load(&image, &backend, file.bytes, file.length));
     assert(image.ready && image.page_count == 20 && r.used_count > 20);
