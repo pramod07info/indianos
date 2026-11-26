@@ -42,7 +42,7 @@ impl Pressure {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Snapshot { pressure:Pressure, reserved:u64, quarantined:u64, live_bytes:u64,
-    live_allocations:u64, owner_reserved:u64, owner_kind:u64, owner_epoch:u64 }
+    live_allocations:u64, owner_reserved:u64, owner_kind:u64, owner_epoch:u64,backend_pending:u64 }
 struct Heap { slots: [Slot; SLOTS], regions: [Region; SLOTS], next_generation: u64, pressure:Pressure, report_due:bool, reported_classes:u16 }
 impl Heap {
     const fn new() -> Self { Self { slots: [const { Slot::new() }; SLOTS],
@@ -58,13 +58,13 @@ impl Heap {
             let charge=region.buffer.charged();
             if charge==0{
                 if region.owner.is_some()||region.quarantined||region.sharing_logged||
-                   !region.buffer.pointer().is_null()||region.buffer.physical()!=0{return false;}
+                   !region.buffer.pointer().is_null()||region.buffer.physical()!=0||region.buffer.backing()!=0{return false;}
                 continue;
             }
             let Some(owner)=region.owner else{return false;};
             if owner.epoch()==0||charge>owner.quota()||charge%4096!=0||
                region.buffer.pointer().is_null()||region.buffer.pointer() as usize%4096!=0||
-               region.buffer.physical()==0||region.buffer.physical()%4096!=0||
+               region.buffer.backing()==0||region.buffer.physical()%4096!=0||
                self.charge(owner)>owner.quota(){return false;}
             if matches!(owner,Owner::Scratch(_))&&charge!=8192{return false;}
             let Some(physical_end)=region.buffer.physical().checked_add(charge as u64)else{return false;};
@@ -74,7 +74,9 @@ impl Heap {
                 let Some(other_physical_end)=other.buffer.physical().checked_add(other.buffer.charged() as u64)else{return false;};
                 let other_start=other.buffer.pointer() as usize;
                 let Some(other_end)=other_start.checked_add(other.buffer.charged())else{return false;};
-                if (region.buffer.physical()<other_physical_end&&other.buffer.physical()<physical_end)||
+                if region.buffer.backing()==other.buffer.backing()||
+                   (region.buffer.physical()!=0&&other.buffer.physical()!=0&&
+                    region.buffer.physical()<other_physical_end&&other.buffer.physical()<physical_end)||
                    (virtual_start<other_end&&other_start<virtual_end){return false;}
             }
             let live=self.slots.iter().any(|slot|slot.live&&slot.region==index);
@@ -101,7 +103,7 @@ impl Heap {
             quarantined:self.regions.iter().filter(|r|r.quarantined).map(|r|r.buffer.charged() as u64).sum(),
             live_bytes:self.slots.iter().filter(|s|s.live).fold(0u64,|sum,s|sum.saturating_add(s.extent as u64)),
             live_allocations:self.slots.iter().filter(|s|s.live).count() as u64,
-            owner_reserved:self.charge(owner) as u64,owner_kind:match owner{Owner::Frame(_)=>1,Owner::Scratch(_)=>2},owner_epoch:owner.epoch()}
+            owner_reserved:self.charge(owner) as u64,owner_kind:match owner{Owner::Frame(_)=>1,Owner::Scratch(_)=>2},owner_epoch:owner.epoch(),backend_pending:0}
     }
     fn observe_peak(&mut self){
         let reserved:u64=self.regions.iter().map(|r|r.buffer.charged() as u64).sum();
@@ -115,7 +117,7 @@ impl Heap {
         self.pressure.attempts=self.pressure.attempts.saturating_add(1);
         let mut result=self.allocate(owner,layout,backend);self.observe_peak();
         if matches!(result,Err(Error::Quota|Error::Metadata|Error::OutOfMemory))&&
-           self.regions.iter().any(|r|r.quarantined){
+           (self.regions.iter().any(|r|r.quarantined)||backend.has_pending()){
             self.pressure.reclamation_passes=self.pressure.reclamation_passes.saturating_add(1);
             let (released,_)=self.reclaim_count(backend);
             if released>0{
@@ -145,7 +147,7 @@ impl Heap {
             self.pressure.frame_attempts=self.pressure.frame_attempts.saturating_add(1);
             allocate().ok_or(Error::OutOfMemory)
         };
-        if matches!(result,Err(Error::OutOfMemory))&&self.regions.iter().any(|r|r.quarantined){
+        if matches!(result,Err(Error::OutOfMemory))&&(self.regions.iter().any(|r|r.quarantined)||backend.has_pending()){
             self.pressure.reclamation_passes=self.pressure.reclamation_passes.saturating_add(1);
             if self.reclaim_count(backend).0>0{
                 self.pressure.frame_retries=self.pressure.frame_retries.saturating_add(1);
@@ -241,6 +243,9 @@ impl Heap {
                 }else{remaining+=1;}
             }
         }
+        let orphan_bytes=backend.reclaim_pending();
+        if orphan_bytes>0{released+=1;self.pressure.reclaimed_bytes=self.pressure.reclaimed_bytes.saturating_add(orphan_bytes);}
+        if backend.has_pending(){remaining+=1;}
         (released,remaining)
     }
     fn reclaim(&mut self, backend: &mut (impl Backend + ?Sized)) -> bool {
@@ -278,7 +283,8 @@ fn guarded<R>(gate:&crate::retirement_gate::RetirementGate,cpu:u32,masked:bool,
 /// A later caller cannot rebind the allocator to an application processor.
 pub(crate) fn initialize()->bool{
     #[cfg(not(test))]
-    {HEAP_GATE.register_bsp(crate::user_runtime::r120_cpu_id(),crate::kernel_buffer::masked()).is_ok()}
+    {HEAP_GATE.register_bsp(crate::user_runtime::r120_cpu_id(),crate::kernel_buffer::masked()).is_ok()&&
+     guarded(&HEAP_GATE,crate::user_runtime::r120_cpu_id(),crate::kernel_buffer::masked(),crate::kernel_arena::initialize).unwrap_or(false)}
     #[cfg(test)]
     {HEAP_GATE.with(|gate|gate.register_bsp(0,true).is_ok())}
 }
@@ -353,7 +359,8 @@ pub(crate) fn try_allocate(owner: Owner, layout: Layout) -> Result<Allocation, E
         let before=heap.pressure.recovered;
         let result=heap.allocate_recovering(owner,layout,backend)
             .map(|(token,pointer)|(token,pointer,heap.slots[token.slot].extent));
-        (result,heap.snapshot(owner),heap.report_due,heap.pressure.recovered>before)
+        let mut snapshot=heap.snapshot(owner);snapshot.backend_pending=backend.pending_bytes();
+        (result,snapshot,heap.report_due,heap.pressure.recovered>before)
     })?;
     if report{report_pressure(snapshot);}
     if recovered{
@@ -380,6 +387,7 @@ fn report_pressure(snapshot:Snapshot){
         (&b"IndianOS: heap failure reason=0x\0"[..],reason),
         (&b"IndianOS: heap reserved bytes=0x\0"[..],snapshot.reserved),
         (&b"IndianOS: heap quarantined bytes=0x\0"[..],snapshot.quarantined),
+        (&b"IndianOS: heap backend pending bytes=0x\0"[..],snapshot.backend_pending),
         (&b"IndianOS: heap owner reserved bytes=0x\0"[..],snapshot.owner_reserved),
         (&b"IndianOS: heap live extents bytes=0x\0"[..],snapshot.live_bytes),
         (&b"IndianOS: heap live allocations=0x\0"[..],snapshot.live_allocations),
@@ -406,7 +414,8 @@ pub(crate) unsafe fn allocate_process_frame(out:*mut u64)->bool{
             let mut frame=0;
             unsafe{crate::pmm::pmm_allocate_frame(&mut frame)}.then_some(frame)
         });
-        (result,heap.snapshot(Owner::Frame(0)),heap.report_due)
+        let mut snapshot=heap.snapshot(Owner::Frame(0));snapshot.backend_pending=backend.pending_bytes();
+        (result,snapshot,heap.report_due)
     })else{return false;};
     #[cfg(not(test))]
     if report{
@@ -416,6 +425,7 @@ pub(crate) unsafe fn allocate_process_frame(out:*mut u64)->bool{
         crate::user_runtime::fault_hex(b"IndianOS: physical pressure retries=0x\0",snapshot.pressure.frame_retries);
         crate::user_runtime::fault_hex(b"IndianOS: physical recovered requests=0x\0",snapshot.pressure.frame_recovered);
         crate::user_runtime::fault_hex(b"IndianOS: physical heap quarantine bytes=0x\0",snapshot.quarantined);
+        crate::user_runtime::fault_hex(b"IndianOS: physical backend pending bytes=0x\0",snapshot.backend_pending);
     }
     #[cfg(test)]let _=(snapshot,report);
     if let Ok(frame)=result{unsafe{out.write(frame)};true}else{false}
@@ -443,13 +453,13 @@ mod fixture {
         pub fn count(&self) -> usize { self.runs.len() }
     }
     unsafe impl Backend for Memory {
-        fn allocate(&mut self, pages: u32) -> Result<(u64, *mut u8), Error> {
+        fn allocate(&mut self, pages: u32) -> Result<crate::kernel_buffer::Backing, Error> {
             self.allocations+=1;
             if self.oom||self.block_until_release { return Err(Error::OutOfMemory); }
             let physical = self.next; self.next += u64::from(pages) * 4096;
             let mut bytes = std::vec![Page([0xdeadbeef;1024]); pages as usize];
             let pointer = bytes.as_mut_ptr().cast(); self.runs.push((physical, bytes));
-            Ok((physical, pointer))
+            Ok(crate::kernel_buffer::Backing{key:physical,physical:Some(physical),pointer})
         }
         fn release(&mut self, physical: u64, _: u32) -> bool {
             self.releases+=1;

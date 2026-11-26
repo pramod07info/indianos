@@ -534,6 +534,7 @@ pub extern "C" fn kmain()->!{
         need(crate::kernel_heap::initialize(),
             b"IndianOS: FATAL kernel heap CPU admission failed\n\0");
         log(b"IndianOS: kernel heap BSP admission ready\n\0");
+        log(b"IndianOS: kernel noncontiguous virtual arena ready\n\0");
     }
     #[cfg(feature="test-r114-epoch")]
     {

@@ -17,7 +17,7 @@ PR #825 contains the current follow-up; its required checks must pass before mer
 | Heap extent/backing integrity before unsafe operations | Implemented in #825; current-head acceptance pending |
 | User-image data/stack admission budgets and retained failed rollback ownership | Implemented in #825, including existing legacy C parity; not total RSS |
 | Shared supervisor direct-map ownership across normal desktop roots | Implemented in #825: excluded from private cloning, attached with receipt and detached before retirement; guest acceptance pending |
-| Noncontiguous physical backing behind contiguous virtual arenas | Not implemented |
+| Noncontiguous physical backing behind contiguous virtual arenas | Implemented in #825 normal heap; exact-head guest acceptance pending |
 | Image/page-table backend integration | Implemented in #825: BSP admission and bounded physical-pressure recovery; guest acceptance pending |
 | Other kernel consumers/global Rust allocator integration | Not fully implemented |
 | Allocator operation across multiple CPUs and corresponding PMM synchronization | Not implemented |
@@ -422,3 +422,30 @@ virtual arena backed by scattered PMM frames. It does not itself implement that
 arena, scatter allocation, multi-CPU shootdowns or global allocator integration.
 The current buffer backend still requires physically contiguous runs. Single-BSP
 admission and inactive-root attach/detach remain mandatory.
+
+## Noncontiguous normal-heap backing
+
+The normal Rust heap now uses a contiguous virtual arena backed by separately
+allocated PMM frames. This supersedes the historical contiguous-backend status
+above. Boot reserves one unused directory in the shared direct-map subtree,
+constructs its supervisor, writable, NX, non-global tables privately, and publishes
+only after initialization completes. Sixteen slots have a 16 MiB virtual stride;
+each admits at most 2,500 data pages. The 129 infrastructure frames remain owned
+for the boot lifetime and are reserved before desktop session leak baselines.
+Opaque backing keys are distinct from physical addresses; scattered buffers
+must not be passed as contiguous DMA runs. Existing PMM contiguous APIs remain.
+
+Allocation records each frame before mapping it. Failed construction retains
+unreleased frames for bounded reclamation. Retirement validates owned mappings,
+scrubs through the direct map, unmaps with local invalidation, and retains exact
+ownership on a refused PMM release. A retry never dereferences the unmapped
+buffer address. Pending backend pages have a separate pressure counter.
+
+Six host cases cover fragmented backing, partial allocation rollback, refused
+release retry, foreign mappings and pointers, unpublished initialization failure,
+and bounds/stale keys/access failures. The normal-desktop QEMU harness requires
+the new arena startup receipt. No local build, host test or QEMU run was performed;
+GitHub exact-head results are required before acceptance. This remains a BSP-only
+allocator under the existing heap admission gate. Cross-CPU shootdowns, PCID
+no-flush reuse, broader kernel consumers, total process RSS quotas and system-wide
+OOM policy remain outside this implementation. No milestone is newly accepted.

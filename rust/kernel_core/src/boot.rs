@@ -151,6 +151,16 @@ pub(crate) fn runtime_frame_allowed(frame:u64)->bool{
     runtime_frame_in_map(map,frame)
 }
 
+/// Numeric and immutable boot-map admission for one HHDM frame. The caller's
+/// validated boot handoff must still supply the actual supervisor mapping.
+pub(crate) fn direct_map_frame(offset:u64,physical:u64)->Option<*mut u8>{
+    if !hhdm_offset_sane(offset)||!runtime_frame_allowed(physical){return None;}
+    let address=physical.checked_add(offset)?;
+    let last=address.checked_add(4095)?;
+    if address>>48!=0xffff||address&(1<<47)==0||last>>48!=0xffff||last&(1<<47)==0{return None;}
+    Some(address as *mut u8)
+}
+
 /// Every usable physical span must fit within the chosen direct-map
 /// high-half range. This is an arithmetic preflight, not proof of PTE mapping.
 fn usable_ram_page_aligned(region:&Region)->bool {

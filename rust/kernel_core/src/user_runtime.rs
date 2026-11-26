@@ -1669,10 +1669,7 @@ unsafe extern "C" fn release(p:u64,_:*mut c_void)->bool{
 }
 unsafe extern "C" fn access(p:u64,context:*mut c_void)->*mut c_void{
  let Some(m)=(unsafe{(context as *const DirectMap).as_ref()})else{return ptr::null_mut()};
- if !runtime_frame_allowed(p){return ptr::null_mut();}
- let Some(addr)=p.checked_add(m.offset)else{return ptr::null_mut()};
- if addr>>48!=0xffff||addr&(1u64<<47)==0{return ptr::null_mut();}
- addr as usize as *mut c_void
+ crate::boot::direct_map_frame(m.offset,p).unwrap_or(ptr::null_mut()).cast()
 }
 unsafe extern "C" fn table_access(p:u64,context:*mut c_void)->*mut u64{
  unsafe{access(p,context)}.cast()
