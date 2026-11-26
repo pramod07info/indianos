@@ -833,7 +833,7 @@ class NormalDesktopControls(unittest.TestCase):
                  b"IndianOS: fault CR2=0x0000000060000000",
                  b"IndianOS: PID 4 FAULTED", b"IndianOS: PID 4 REAPED",
                  harness.FRAME_RELEASED, harness.COMPOSITOR_PREPARED, harness.COMPOSITOR.encode(),
-                 harness.STALE_COMPOSITOR_DENIED, harness.FRAME_ALLOCATED, harness.FRAME_PRESENTED,
+                 harness.FRAME_ALLOCATED, harness.STALE_COMPOSITOR_DENIED, harness.FRAME_PRESENTED,
                  self.frame_cost(), harness.FRAME_PUBLISHED, harness.COMPOSITOR_REPLACED]
         return old + b"\n".join(lines) + b"\n", len(old)
 
@@ -844,6 +844,16 @@ class NormalDesktopControls(unittest.TestCase):
                         trace.replace(marker, marker + b"\n" + marker)):
                 with self.subTest(marker=marker), self.assertRaises(AssertionError):
                     harness.verify_transient_restart(bad, since)
+
+    def test_transient_restart_allocation_precedes_stale_token_probe_receipt(self):
+        trace, since = self.transient_trace()
+        allocation = harness.FRAME_ALLOCATED + b"\n"
+        stale = harness.STALE_COMPOSITOR_DENIED + b"\n"
+        # Startup obtains/aborts a fresh token before reporting stale-token
+        # rejection. It must already own staging at that point.
+        late = trace.replace(allocation, b"").replace(stale, stale + allocation)
+        with self.assertRaises(AssertionError):
+            harness.verify_transient_restart(late, since)
 
     def test_transient_restart_accepts_fresh_execution_and_later_clean_reap(self):
         trace, since = self.transient_trace()

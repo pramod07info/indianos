@@ -1763,8 +1763,8 @@ def verify_transient_restart(output: bytes, injection_at: int) -> None:
     markers = (b"IndianOS: fault vector=0x000000000000000e",
                b"IndianOS: fault CR2=0x0000000060000000",
                b"IndianOS: PID 4 FAULTED", b"IndianOS: PID 4 REAPED",
-               COMPOSITOR_PREPARED, COMPOSITOR.encode(), STALE_COMPOSITOR_DENIED,
-               FRAME_ALLOCATED, FRAME_PRESENTED, FRAME_PUBLISHED, COMPOSITOR_REPLACED)
+               COMPOSITOR_PREPARED, COMPOSITOR.encode(), FRAME_ALLOCATED,
+               STALE_COMPOSITOR_DENIED, FRAME_PRESENTED, FRAME_PUBLISHED, COMPOSITOR_REPLACED)
     complete = tail.replace(b"\r", b"").split(b"\n")[:-1]
     if any(marker in line and line != marker for marker in markers for line in complete):
         raise AssertionError("PID4 recovery record has an untrusted prefix")
