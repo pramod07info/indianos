@@ -17,7 +17,8 @@ PR #825 contains the current follow-up; its required checks must pass before mer
 | Heap extent/backing integrity before unsafe operations | Implemented in #825; current-head acceptance pending |
 | User-image data/stack admission budgets and retained failed rollback ownership | Implemented in #825, including existing legacy C parity; not total RSS |
 | Noncontiguous physical backing behind contiguous virtual arenas | Not implemented |
-| Broader kernel consumers/global Rust allocator integration | Not implemented |
+| Image/page-table backend integration | Implemented in #825: BSP admission and bounded physical-pressure recovery; guest acceptance pending |
+| Other kernel consumers/global Rust allocator integration | Not fully implemented |
 | Allocator operation across multiple CPUs and corresponding PMM synchronization | Not implemented |
 | Private launch footprint including image and kernel-clone tables | Implemented in #825: 512-frame admission and post-load consistency checks; guest acceptance pending |
 | Total process RSS accounting/quotas including sharing and growth | Not implemented |
@@ -362,3 +363,30 @@ insufficient ledger capacity before allocation, successful ownership transfer
 and eventual cleanup while preserving source tables. No host assertion is live
 PMM fault-injection or physical acceptance; current-head GitHub verification and
 that broader acceptance remain pending.
+
+
+## Normal-desktop image/table PMM pressure policy
+
+The normal desktop's existing VMM/clone allocation callbacks now acquire the
+heap's exact BSP/IRQ/non-reentrant admission before touching PMM. Their first
+failed physical-frame allocation may reclaim quarantined heap backing, followed
+by at most one retry only after an actual release. No reclaimable backing means
+one attempt; persistent refusal is returned to the existing image/clone startup
+and service recovery policy. Live heap leases are never evicted. Caller output
+storage is written only on successful allocation, and release callbacks use the
+same admission gate. Other experimental profiles retain their existing path.
+
+Physical frame requests have separate saturating request, attempt, failure,
+retry and recovered-request counters so they are not misreported as heap-arena
+allocations. Bounded diagnostics report their failure class and heap quarantine
+charge. Invalid heap metadata prevents a PMM request, rather than attempting
+reclamation through corrupt ownership. The existing backend remains PMM; host
+fault closures exercise retry control flow without substituting for guest PMM.
+
+Added regressions cover recovered image-frame pressure, no-quarantine refusal
+with exactly one attempt, preservation of a live neighboring payload and rejection
+of corrupt heap state before a PMM attempt. The existing normal desktop boot,
+private-frame-budget and recovery harnesses exercise the real callback path when
+run in GitHub Actions. No live pressure fault injection or physical pass is
+claimed. This is a bounded reclaim/reject policy for current image/table/heap
+callers, not a general OOM killer, shared-memory RSS policy or SMP allocator.

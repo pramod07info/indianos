@@ -32,11 +32,13 @@ impl Slot {
 struct Pressure {
     requests:u64, attempts:u64, failures:u64, reclamation_passes:u64,
     retries:u64, recovered:u64, reclaimed_bytes:u64, peak_reserved:u64,
-    last_error:Option<Error>,
+    last_error:Option<Error>,frame_requests:u64,frame_attempts:u64,frame_failures:u64,
+    frame_retries:u64,frame_recovered:u64,frame_last_error:Option<Error>,
 }
 impl Pressure {
     const fn new()->Self{Self{requests:0,attempts:0,failures:0,reclamation_passes:0,
-        retries:0,recovered:0,reclaimed_bytes:0,peak_reserved:0,last_error:None}}
+        retries:0,recovered:0,reclaimed_bytes:0,peak_reserved:0,last_error:None,frame_requests:0,frame_attempts:0,frame_failures:0,
+        frame_retries:0,frame_recovered:0,frame_last_error:None}}
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Snapshot { pressure:Pressure, reserved:u64, quarantined:u64, live_bytes:u64,
@@ -131,6 +133,33 @@ impl Heap {
             self.report_due=self.reported_classes&class==0||self.pressure.failures.is_power_of_two();
             self.reported_classes|=class;
             self.pressure.last_error=Some(error);
+        }
+        result
+    }
+    /// Image/table frame requests use the same bounded quarantine recovery,
+    /// but successful frames transfer directly to the caller's ownership list.
+    fn allocate_frame_recovering(&mut self,backend:&mut(impl Backend+?Sized),
+        mut allocate:impl FnMut()->Option<u64>)->Result<u64,Error>{
+        self.pressure.frame_requests=self.pressure.frame_requests.saturating_add(1);self.report_due=false;
+        let mut result=if !self.integrity_ok(){Err(Error::Integrity)}else{
+            self.pressure.frame_attempts=self.pressure.frame_attempts.saturating_add(1);
+            allocate().ok_or(Error::OutOfMemory)
+        };
+        if matches!(result,Err(Error::OutOfMemory))&&self.regions.iter().any(|r|r.quarantined){
+            self.pressure.reclamation_passes=self.pressure.reclamation_passes.saturating_add(1);
+            if self.reclaim_count(backend).0>0{
+                self.pressure.frame_retries=self.pressure.frame_retries.saturating_add(1);
+                self.pressure.frame_attempts=self.pressure.frame_attempts.saturating_add(1);
+                result=allocate().ok_or(Error::OutOfMemory);
+                if result.is_ok(){self.pressure.frame_recovered=self.pressure.frame_recovered.saturating_add(1);}
+            }
+        }
+        if let Err(error)=result{
+            self.pressure.frame_failures=self.pressure.frame_failures.saturating_add(1);
+            self.pressure.frame_last_error=Some(error);
+            let class=1u16<<error_code(error);
+            self.report_due=self.reported_classes&class==0||self.pressure.frame_failures.is_power_of_two();
+            self.reported_classes|=class;
         }
         result
     }
@@ -367,6 +396,34 @@ fn report_pressure(snapshot:Snapshot){
 #[cfg(test)]
 fn report_pressure(_:Snapshot){}
 
+/// Normal-desktop PMM admission for image and page-table backends. Failure
+/// leaves out unchanged. No caller state is discarded and no task is killed.
+/// # Safety: out is exclusive kernel storage for one u64 physical frame.
+pub(crate) unsafe fn allocate_process_frame(out:*mut u64)->bool{
+    if out.is_null(){return false;}
+    let Ok((result,snapshot,report))=with_heap(|heap,backend|{
+        let result=heap.allocate_frame_recovering(backend,||{
+            let mut frame=0;
+            unsafe{crate::pmm::pmm_allocate_frame(&mut frame)}.then_some(frame)
+        });
+        (result,heap.snapshot(Owner::Frame(0)),heap.report_due)
+    })else{return false;};
+    #[cfg(not(test))]
+    if report{
+        crate::user_runtime::fault_hex(b"IndianOS: physical request failure reason=0x\0",
+            snapshot.pressure.frame_last_error.map_or(0,|error|u64::from(error_code(error))));
+        crate::user_runtime::fault_hex(b"IndianOS: physical failed requests=0x\0",snapshot.pressure.frame_failures);
+        crate::user_runtime::fault_hex(b"IndianOS: physical pressure retries=0x\0",snapshot.pressure.frame_retries);
+        crate::user_runtime::fault_hex(b"IndianOS: physical recovered requests=0x\0",snapshot.pressure.frame_recovered);
+        crate::user_runtime::fault_hex(b"IndianOS: physical heap quarantine bytes=0x\0",snapshot.quarantined);
+    }
+    #[cfg(test)]let _=(snapshot,report);
+    if let Ok(frame)=result{unsafe{out.write(frame)};true}else{false}
+}
+/// # Safety: frame is exclusively owned by the inactive image/table caller.
+pub(crate) unsafe fn release_process_frame(frame:u64)->bool{
+    with_heap(|_,_|unsafe{crate::pmm::pmm_release_frame(frame)}).unwrap_or(false)
+}
 pub(crate) fn reclaim_retired() -> bool {
     with_heap(|heap, backend| heap.reclaim(backend)).unwrap_or(false)
 }
@@ -676,6 +733,29 @@ mod tests {
         assert_eq!(memory.releases,releases);
         heap.regions[br].buffer=original;
         assert!(heap.integrity_ok());for token in [a,b]{heap.release(token,&mut memory).unwrap();}
+    }
+    #[test]fn image_frame_oom_reclaims_only_retired_heap_backing_and_retries_once(){
+        let mut heap=Heap::new();let mut memory=fixture::Memory::new();let owner=Owner::Scratch(50);
+        let (live,pointer)=heap.allocate(owner,layout(128),&mut memory).unwrap();unsafe{pointer.write(0x55);}
+        let (retired,_)=heap.allocate(Owner::Scratch(51),layout(128),&mut memory).unwrap();
+        memory.fail_release=true;assert_eq!(heap.release(retired,&mut memory),Err(Error::Release));
+        memory.fail_release=false;let mut calls=0;
+        let result=heap.allocate_frame_recovering(&mut memory,||{calls+=1;if calls==2{Some(0x10000)}else{None}});
+        assert_eq!(result,Ok(0x10000));assert_eq!(calls,2);assert_eq!(unsafe{pointer.read()},0x55);
+        assert_eq!(heap.pressure.frame_recovered,1);assert_eq!(heap.pressure.frame_failures,0);
+        heap.release(live,&mut memory).unwrap();assert_eq!(memory.count(),0);
+    }
+    #[test]fn image_frame_pressure_without_reclaimable_memory_is_one_attempt(){
+        let mut heap=Heap::new();let mut memory=fixture::Memory::new();let mut calls=0;
+        assert_eq!(heap.allocate_frame_recovering(&mut memory,||{calls+=1;None}),Err(Error::OutOfMemory));
+        assert_eq!(calls,1);assert_eq!(heap.pressure.frame_retries,0);
+        assert_eq!(heap.pressure.frame_failures,1);assert_eq!(memory.releases,0);
+    }
+    #[test]fn image_frame_requests_refuse_corrupt_heap_before_pmm_access(){
+        let mut heap=Heap::new();let mut memory=fixture::Memory::new();let mut calls=0;
+        heap.next_generation=0;
+        assert_eq!(heap.allocate_frame_recovering(&mut memory,||{calls+=1;Some(0x10000)}),Err(Error::Integrity));
+        assert_eq!(calls,0);assert_eq!(heap.pressure.frame_attempts,0);
     }
     #[test] fn byte_sized_layout_cannot_resize_over_a_shared_neighbor() {
         let mut tiny = try_allocate(Owner::Scratch(76), Layout::from_size_align(1,1).unwrap()).unwrap();

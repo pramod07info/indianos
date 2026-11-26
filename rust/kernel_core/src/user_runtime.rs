@@ -1653,8 +1653,18 @@ fn copy_pixel_tile(task: &Task, pid: u32, window: u32, token: u64,
  }
  crate::gui::pixel_tile(pid, window, token, x, y, &pixels[..usize::from(width)])
 }
-unsafe extern "C" fn allocate(p:*mut u64,_:*mut c_void)->bool{unsafe{pmm_allocate_frame(p)}}
-unsafe extern "C" fn release(p:u64,_:*mut c_void)->bool{unsafe{pmm_release_frame(p)}}
+unsafe extern "C" fn allocate(p:*mut u64,_:*mut c_void)->bool{
+ #[cfg(feature="normal-desktop")]
+ {unsafe{crate::kernel_heap::allocate_process_frame(p)}}
+ #[cfg(not(feature="normal-desktop"))]
+ {unsafe{pmm_allocate_frame(p)}}
+}
+unsafe extern "C" fn release(p:u64,_:*mut c_void)->bool{
+ #[cfg(feature="normal-desktop")]
+ {unsafe{crate::kernel_heap::release_process_frame(p)}}
+ #[cfg(not(feature="normal-desktop"))]
+ {unsafe{pmm_release_frame(p)}}
+}
 unsafe extern "C" fn access(p:u64,context:*mut c_void)->*mut c_void{
  let Some(m)=(unsafe{(context as *const DirectMap).as_ref()})else{return ptr::null_mut()};
  if !runtime_frame_allowed(p){return ptr::null_mut();}
