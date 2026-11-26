@@ -1037,10 +1037,13 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
      // staging allocation changes. Other operations have no user copyout.
      if request.arg0==FRAME_BEGIN&&
         !unsafe{crate::user_image::compositor_can_write(&*img,request.arg1,FRAME_BYTES)}{return BAD;}
-     let mut wire=[0;FRAME_BYTES];
+     let Some(epoch)=crate::gui::compositor_epoch()else{return BAD;};
+     let Ok(layout)=core::alloc::Layout::from_size_align(FRAME_BYTES,8)else{return BAD;};
+     let Ok(mut descriptor)=crate::kernel_heap::try_allocate(crate::kernel_heap::Owner::Scratch(epoch),layout)else{return BAD;};
+     let Ok(wire)=<&mut [u8;FRAME_BYTES]>::try_from(descriptor.bytes())else{return BAD;};
      if !unsafe{indianos_user_copy_readonly(img,request.arg1,wire.as_mut_ptr().cast(),wire.len())}{return BAD;}
-     let Some(frame)=FrameRequest::parse(&wire)else{return BAD;};
-     match request.arg0{
+     let Some(frame)=FrameRequest::parse(wire)else{return BAD;};
+     let result=match request.arg0{
       FRAME_BEGIN=>{
        let Some(token)=crate::gui::compositor_begin(pid,frame)else{return BAD;};
        wire[16..24].copy_from_slice(&token.to_le_bytes());
@@ -1056,7 +1059,9 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
       },
       FRAME_COMMIT=>if crate::gui::compositor_commit(pid,frame){0}else{BAD},
       _=>if crate::gui::compositor_abort(pid,frame){0}else{BAD},
-     }
+     };
+     if request.arg0==FRAME_ROW&&result==0{descriptor.note_shared_backing();}
+     result
     },
     _=>BAD,
    }

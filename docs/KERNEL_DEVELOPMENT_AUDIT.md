@@ -61,6 +61,9 @@ PR #819 merged as `01bbdec9207bb87ad86ad2006cdfb04d5c72a19b` adds the
 fallible compositor-specific buffer. The next owned-page-heap slice extends
 that production path with aggregate kernel-owner quotas and separate syscall
 scratch ownership; see [allocation behavior and remaining work](KERNEL_FRAME_ALLOCATION.md).
+PR #821 merged as `3fac00e5b4f3e3790b27ba007ac4154971e5bc01` adds owned
+page allocations and per-owner quota accounting. The next slice adds shared
+small-object scratch arenas, coalescing and production descriptor/row reuse.
 P2-004/P2-011 remain unfinished. The classifications/counts above describe the
 original pinned audit; this follow-up does not retroactively change its evidence,
 formal task/gate statuses or completion percentage.
