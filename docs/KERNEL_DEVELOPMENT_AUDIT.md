@@ -456,3 +456,44 @@ multiqueue processing, MSI/MSI-X, IOMMU mappings or physical device qualificatio
 Points 5 (general threads/futexes/signals), 6 (general spawn/exec/parentage),
 9 (actual AHCI/NVMe/xHCI controllers) and 10 (firmware trust and physical power/
 device acceptance) remain unfinished. No formal gate or percentage changes.
+
+### Demand-zero stack COW (P2-006)
+
+Normal boot now reserves one zero-filled PMM frame under the existing heap BSP/
+IRQ admission before desktop memory-conservation baselines. Ownership is retained
+for the entire boot. Failed mapping/initialization retains the allocation and
+fails boot admission; no user mapping can observe an unpublished page. This
+adds 4096 bytes of fixed kernel backing, separate from the 129 arena table pages.
+
+A not-present stack read maps this shared frame user/read-only/NX without a
+private data allocation. A write to that exact owned shared-zero leaf (page
+fault error 7) allocates and zeroes a private page, then replaces only the
+expected present/user/read-only/NX PTE. The VMM replacement allocates no tables,
+accepts only hardware A/D changes in the expected leaf, and cannot widen an
+executable or foreign mapping. Only after successful replacement does metadata
+publish private ownership and the active-root TLB invalidate. Initial write
+faults still allocate private pages directly. Existing stack reservations and
+launch admission remain charged; these logical quotas are not measured RSS.
+
+OOM or failed preparation leaves the old shared leaf unchanged. A refused new
+frame rollback stays in the Task's existing retained-frame receipt until
+retirement cleanup succeeds. Image teardown unmaps shared leaves but cannot
+release the boot-owned zero frame; peer images remain valid. Boot-lifetime
+ownership intentionally avoids a recyclable shared-page refcount contract.
+There is no general fork, arbitrary file/data COW or multi-CPU page reclamation.
+
+Three zero-page initialization/ownership tests, two exact VMM replacement cases,
+and two image COW cases cover shared reads without extra allocation, private
+write isolation, peer survival after teardown, NX/permissions, OOM and retained
+rollback. The guest proof gives all four processes different bytes on their
+COW-split page and checks those bytes after peers run, while another zero alias
+remains zero. Required kernel receipts distinguish shared admission and the
+actual protection-fault private split. A host oracle rejects missing or reversed
+sharing/split evidence. The ordinary desktop harness also requires the one-time
+zero-page startup receipt and forbids it during compositor-only replacement.
+
+No local builds/tests/QEMU were run. Exact-head GitHub checks and the opt-in
+four-process guest proof remain necessary. This implements demand-zero COW,
+not full P2-006 acceptance; general sharing/refcounts, fork and remote TLB
+reclamation remain unfinished. Other pending workstreams and formal gate counts
+remain unchanged.

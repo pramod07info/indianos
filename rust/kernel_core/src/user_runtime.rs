@@ -656,7 +656,7 @@ pub unsafe extern "C" fn x86_64_scheduler_apic_timer_dispatch(regs:*const u64){
 #[no_mangle]
 #[cfg(feature="normal-desktop")]
 pub extern "C" fn x86_64_user_page_fault_recover(vector:u64,cs:u64,error:u64,address:u64)->bool{
- if vector!=14||cs!=0x2b||!matches!(error,4|6){return false;}
+ if vector!=14||cs!=0x2b||!matches!(error,4|6|7){return false;}
  let Ok(_permit)=r120_enter()else{return false;};
  let raw=active_task();let image=active_image();
  if raw.is_null()||image.is_null()||!ptr::eq(unsafe{ptr::addr_of!((*raw).image)},image){return false;}
@@ -666,6 +666,10 @@ pub extern "C" fn x86_64_user_page_fault_recover(vector:u64,cs:u64,error:u64,add
  if current&PHYS!=task.root.root||!task.attached{return false;}
  if !unsafe{crate::user_image::resolve_stack_fault(&mut task.image,address,error,&mut task.fault_retained[0])}{return false;}
  if !unsafe{crate::tlb::invalidate_page(task.root.root,address&!4095)}{return false;}
+ if error==4&&crate::user_image::cow_stack_page(&task.image,address&!4095){
+  pid_log(unsafe{(*process).pid},b"COW_STACK_ZERO_SHARED_READY\0");
+ }
+ if error==7{pid_log(unsafe{(*process).pid},b"COW_STACK_PRIVATE_READY\0");}
  pid_log(unsafe{(*process).pid},b"DEMAND_STACK_PAGE_READY\0");
  true
 }
@@ -1919,7 +1923,13 @@ fn image_mapped(b:&CloneBackend,root:u64,img:&UserImage)->bool{
   let segment=img.plan.segments.iter()
     .take(img.plan.segment_count as usize)
     .find(|s|va>=s.page_begin&&va<s.page_end);
-  let (write,execute)=if stack{(true,false)}
+  let (write,execute)=if stack{
+   #[cfg(feature="normal-desktop")]
+   let writable=!crate::user_image::cow_stack_page(img,va);
+   #[cfg(not(feature="normal-desktop"))]
+   let writable=true;
+   (writable,false)
+  }
   else if let Some(s)=segment{(s.writable,s.executable)}
   else{return false;};
   if write&&execute{return false;}

@@ -317,6 +317,8 @@ mod kernel_heap;
 #[cfg(feature="normal-desktop")]
 mod kernel_arena;
 #[cfg(feature="normal-desktop")]
+mod zero_page;
+#[cfg(feature="normal-desktop")]
 mod fpu_context;
 /// R029.1 authenticated per-process window grants and bounded event queue.
 pub mod gui_broker;

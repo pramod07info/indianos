@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Run the opt-in x87/SSE desktop fixture on disposable selected GPT media.
 
-This proves cooperative ring-3 state retention, not multicore or AVX support.
+This exercises demand-zero COW and cooperative ring-3 state retention, not
+general fork/shared-page reclamation, multicore or AVX support.
 The ordinary normal-desktop image and its full acceptance remain separate.
 """
 import argparse
@@ -23,6 +24,12 @@ def verify_context_proof(output: bytes) -> None:
         demand = f"IndianOS: PID {pid} DEMAND_STACK_PAGE_READY".encode()
         if output[:ready].count(demand) < 2:
             raise AssertionError(f"PID{pid} lacks actual read/write stack fault recovery")
+        shared=f"IndianOS: PID {pid} COW_STACK_ZERO_SHARED_READY".encode()
+        private=f"IndianOS: PID {pid} COW_STACK_PRIVATE_READY".encode()
+        if output[:ready].count(shared)<2 or output[:ready].count(private)<1:
+            raise AssertionError(f"PID{pid} lacks shared-zero and private COW write fault recovery")
+        if not output.find(shared)<output.find(private)<ready:
+            raise AssertionError(f"PID{pid} private COW receipt precedes shared-page admission")
 
 
 def main() -> None:
@@ -48,7 +55,7 @@ def main() -> None:
                 process.kill()
             process.wait(timeout=10)
             sock.close()
-    print("PASS: four ring-3 x87/SSE contexts retained across demand faults and four yields each")
+    print("PASS: four ring-3 contexts retain private COW bytes and immutable shared zeros across faults and yields")
 
 
 if __name__ == "__main__":

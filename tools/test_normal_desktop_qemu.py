@@ -87,6 +87,7 @@ PIXEL_APP_EVIDENCE = tuple(
     COMPOSITOR_SNAPSHOT,
     b"IndianOS: kernel heap BSP admission ready",
     b"IndianOS: kernel noncontiguous virtual arena ready",
+    b"IndianOS: kernel shared zero page ready",
     b"IndianOS: desktop broker image limit 64 pages enforced",
     b"IndianOS: desktop private frame budget 512 enforced",
     b"IndianOS: desktop supervisor direct map shared with ownership receipt",
@@ -1796,7 +1797,8 @@ def verify_transient_restart(output: bytes, injection_at: int) -> None:
         if phase_records.count(released) != 1 or phase.find(released) > phase.find(COMPOSITOR_PREPARED):
             raise AssertionError("PID4 replacement lacks prior owned-buffer release")
     verify_frame_publication(phase + b"\n")
-    forbidden = (b"IndianOS: kernel noncontiguous virtual arena ready",
+    forbidden = (b"IndianOS: kernel shared zero page ready",
+                 b"IndianOS: kernel noncontiguous virtual arena ready",
                  b"IndianOS: desktop supervisor direct map shared with ownership receipt",
                  b"IndianOS: desktop private frame budget 512 enforced",
                  b"IndianOS: desktop broker image limit 64 pages enforced",

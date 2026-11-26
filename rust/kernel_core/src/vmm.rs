@@ -135,6 +135,27 @@ unsafe fn undo(s: &Space, slots: &[*mut u64; 3],
     }
 }
 
+/// Replace an exact read-only user/NX leaf after a COW allocation succeeds.
+/// No table allocation or old data-frame release occurs. Caller serializes
+/// the active address space and invalidates its local TLB before returning.
+#[cfg(feature="normal-desktop")]
+pub(crate) unsafe fn replace_readonly_user_page(space:&mut Space,va:u64,expected:u64,new:u64)->bool{
+    if !ready(space)||!valid_va(va)||va&(1<<47)!=0||
+       !physical_page(expected)||!physical_page(new)||expected==new{return false;}
+    let mut next=space.root_physical;
+    for level in 0..3{
+        let table=unsafe{at(space,next)};if table.is_null(){return false;}
+        let value=unsafe{entry(table,index(va,level))};
+        if value&(PRESENT|WRITE|USER)!=(PRESENT|WRITE|USER)||value&HUGE!=0||
+           !physical_page(value&ADDRESS){return false;}
+        next=value&ADDRESS;
+    }
+    let table=unsafe{at(space,next)};if table.is_null(){return false;}
+    let slot=unsafe{table.add(index(va,3))};let value=unsafe{ptr::read_volatile(slot)};
+    if (value&!((1<<5)|(1<<6)))!=(expected|PRESENT|USER|NX){return false;}
+    unsafe{ptr::write_volatile(slot,new|PRESENT|WRITE|USER|NX)};true
+}
+
 /// # Safety
 /// \`space\` is a valid exclusively writable Space, initialized via
 /// vmm_create. Callbacks provide distinct mapped tables, not user pointers.
@@ -381,6 +402,36 @@ mod tests {
         count
     }
     const DATA:Permissions=Permissions{writable:true,executable:false,user:true};
+    #[cfg(feature="normal-desktop")]
+    #[test]fn cow_replacement_requires_exact_readonly_user_nx_leaf_without_allocating(){
+        let mut pool=Pool::new();let mut s=create(&mut pool);
+        let ro=Permissions{writable:false,executable:false,user:true};
+        assert!(unsafe{vmm_map_page(&mut s,0x400000,0x1000000,ro)});
+        let live=pool.live();
+        assert!(!unsafe{replace_readonly_user_page(&mut s,0x400000,0x2000000,0x1001000)});
+        assert!(unsafe{replace_readonly_user_page(&mut s,0x400000,0x1000000,0x1001000)});
+        let mut mapping=Mapping{physical:0,permissions:ro};
+        assert!(unsafe{vmm_query_page(&s,0x400000,&mut mapping)});
+        assert_eq!(mapping.physical,0x1001000);
+        assert!(mapping.permissions.user&&mapping.permissions.writable&&!mapping.permissions.executable);
+        assert_eq!(pool.live(),live);
+        assert!(!unsafe{replace_readonly_user_page(&mut s,0x400000,0x1001000,0x1002000)});
+        assert!(unsafe{vmm_unmap_page(&mut s,0x400000)});
+        assert!(unsafe{vmm_destroy_empty(&mut s)});
+        assert!(!pool.released.contains(&0x1000000));assert!(!pool.released.contains(&0x1001000));
+    }
+    #[cfg(feature="normal-desktop")]
+    #[test]fn executable_or_unaligned_cow_replacement_cannot_widen_permissions(){
+        let mut pool=Pool::new();let mut s=create(&mut pool);
+        let rx=Permissions{writable:false,executable:true,user:true};
+        assert!(unsafe{vmm_map_page(&mut s,0x400000,0x1000000,rx)});
+        assert!(!unsafe{replace_readonly_user_page(&mut s,0x400000,0x1000000,0x1001000)});
+        assert!(!unsafe{replace_readonly_user_page(&mut s,0x400001,0x1000000,0x1001000)});
+        let mut mapping=Mapping{physical:0,permissions:DATA};
+        assert!(unsafe{vmm_query_page(&s,0x400000,&mut mapping)});
+        assert!(!mapping.permissions.writable&&mapping.permissions.executable);
+        assert!(unsafe{vmm_unmap_page(&mut s,0x400000)});assert!(unsafe{vmm_destroy_empty(&mut s)});
+    }
     #[test]fn unmap_refused_table_release_retains_reachable_ownership(){
         for frame in [0x4000,0x3000,0x2000]{
             let mut pool=Pool::new();let mut s=create(&mut pool);

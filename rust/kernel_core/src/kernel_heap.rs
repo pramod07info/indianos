@@ -284,7 +284,8 @@ fn guarded<R>(gate:&crate::retirement_gate::RetirementGate,cpu:u32,masked:bool,
 pub(crate) fn initialize()->bool{
     #[cfg(not(test))]
     {HEAP_GATE.register_bsp(crate::user_runtime::r120_cpu_id(),crate::kernel_buffer::masked()).is_ok()&&
-     guarded(&HEAP_GATE,crate::user_runtime::r120_cpu_id(),crate::kernel_buffer::masked(),crate::kernel_arena::initialize).unwrap_or(false)}
+     guarded(&HEAP_GATE,crate::user_runtime::r120_cpu_id(),crate::kernel_buffer::masked(),
+      ||crate::kernel_arena::initialize()&&crate::zero_page::initialize()).unwrap_or(false)}
     #[cfg(test)]
     {HEAP_GATE.with(|gate|gate.register_bsp(0,true).is_ok())}
 }

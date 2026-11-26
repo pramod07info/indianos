@@ -42,6 +42,8 @@ unsafe fn allocate(image: &UserImage) -> Option<u64> {
     Some(frame)
 }
 unsafe fn release(image: &UserImage, physical: u64) -> bool {
+    #[cfg(feature="normal-desktop")]
+    if crate::zero_page::physical()==Some(physical){return true;}
     let b = &image.tables.backend;
     let Some(release) = b.release else { return false; };
     unsafe { release(physical, b.context) }
@@ -98,7 +100,7 @@ unsafe fn rollback_unmapped_stage(image:&mut UserImage,index:usize){
 /// Keeping the top leaf resident pins every table on this 2-MiB path, so
 /// faults never need to replace a PML4 child borrowed by the active root.
 #[cfg(feature="normal-desktop")]
-pub(crate) fn deferred_stack_page(image:&UserImage,va:u64)->bool{
+fn reserved_stack_slot(image:&UserImage,va:u64,physical:u64)->bool{
  let begin=image.plan.stack_begin;let end=image.plan.stack_end;
  let Some(top)=end.checked_sub(PAGE as u64)else{return false;};
  image.ready&&image.page_count as usize<=MAX_IMAGE_PAGES&&
@@ -109,7 +111,13 @@ pub(crate) fn deferred_stack_page(image:&UserImage,va:u64)->bool{
   image.pages[..image.page_count as usize].iter()
    .filter(|p|p.virtual_address==va).count()==1&&
   image.pages[..image.page_count as usize].iter()
-   .any(|p|p.virtual_address==va&&p.physical_address==0)
+   .any(|p|p.virtual_address==va&&p.physical_address==physical)
+}
+#[cfg(feature="normal-desktop")]
+pub(crate) fn deferred_stack_page(image:&UserImage,va:u64)->bool{reserved_stack_slot(image,va,0)}
+#[cfg(feature="normal-desktop")]
+pub(crate) fn cow_stack_page(image:&UserImage,va:u64)->bool{
+ crate::zero_page::physical().is_some_and(|physical|reserved_stack_slot(image,va,physical))
 }
 
 #[cfg(feature="normal-desktop")]
@@ -148,28 +156,41 @@ pub(crate) unsafe fn defer_stack_pages(image:&mut UserImage)->bool{
  true
 }
 
-/// Serialized active-image fault only. Protection/NX/guard/kernel faults are
-/// never repaired. The caller invalidates the active CPU TLB after success.
+/// Serialized active-image fault only. The sole repaired protection fault is
+/// an exact write to an owned shared-zero RO/NX stack leaf. Invalidate the
+/// active CPU TLB after success; every other protection/guard fault is terminal.
 /// A refused rollback remains in caller-owned retained storage; the process
 /// must retire and retry its release before image/PCB reclamation completes.
 #[cfg(feature="normal-desktop")]
 pub(crate) unsafe fn resolve_stack_fault(image:&mut UserImage,address:u64,error:u64,retained:&mut u64)->bool{
  let va=address&!(PAGE as u64-1);
- if *retained!=0||!matches!(error,4|6)||!deferred_stack_page(image,va){return false;}
+ let cow=cow_stack_page(image,va);
+ if *retained!=0||!(matches!(error,4|6)&&deferred_stack_page(image,va)||error==7&&cow){return false;}
  let mut top=stack_mapping();
  let top_va=image.plan.stack_end-PAGE as u64;
  if !unsafe{vmm_query_page(&image.tables,top_va,&mut top)}||
     !top.permissions.user||!top.permissions.writable||top.permissions.executable||
     !page_owned(image,top_va,top.physical){return false;}
  let mut existing=stack_mapping();
- if unsafe{vmm_query_page(&image.tables,va,&mut existing)}{return false;}
+ let mapped=unsafe{vmm_query_page(&image.tables,va,&mut existing)};
+ if cow{
+  if !mapped||Some(existing.physical)!=crate::zero_page::physical()||
+     !existing.permissions.user||existing.permissions.writable||existing.permissions.executable{return false;}
+ }else if mapped{return false;}
  let Some(index)=image.pages[..image.page_count as usize].iter().position(|p|p.virtual_address==va)else{return false;};
+ if error==4{
+  if let Some(zero)=crate::zero_page::physical(){
+   if !unsafe{vmm_map_page(&mut image.tables,va,zero,Permissions{writable:false,executable:false,user:true})}{return false;}
+   image.pages[index].physical_address=zero;return true;
+  }
+ }
  let Some(physical)=(unsafe{allocate(image)})else{return false;};
  *retained=physical;
  let data=unsafe{access(image,physical)};
  let mapped=if data.is_null(){false}else{
   for byte in 0..PAGE{unsafe{ptr::write_volatile(data.add(byte),0)}}
-  unsafe{vmm_map_page(&mut image.tables,va,physical,Permissions{writable:true,executable:false,user:true})}
+  if cow{unsafe{crate::vmm::replace_readonly_user_page(&mut image.tables,va,existing.physical,physical)}}
+  else{unsafe{vmm_map_page(&mut image.tables,va,physical,Permissions{writable:true,executable:false,user:true})}}
  };
  if mapped{image.pages[index].physical_address=physical;*retained=0;return true;}
  if unsafe{release(image,physical)}{*retained=0;}
@@ -615,6 +636,59 @@ mod tests {
     #[cfg(feature="normal-desktop")]
     fn demand_staged(ram:&mut Ram)->UserImage{
         let mut image=staged(ram);image.plan.guard_begin=image.plan.stack_begin-PAGE as u64;image
+    }
+    #[cfg(feature="normal-desktop")]
+    #[test]fn two_images_share_zero_reads_and_cow_write_does_not_change_peer(){
+        let mut ram=Ram::new();let mut zero=0;
+        assert!(unsafe{ram_alloc(&mut zero,(&mut ram as *mut Ram).cast())});
+        crate::zero_page::with_test_frame(zero,||{
+            let mut first=demand_staged(&mut ram);let mut second=demand_staged(&mut ram);
+            let va=first.plan.stack_begin;let quota=(first.page_count,second.page_count);
+            assert!(unsafe{defer_stack_pages(&mut first)&&defer_stack_pages(&mut second)});
+            let before=ram.used.iter().filter(|&&v|v).count();let mut retained=0;
+            assert!(unsafe{resolve_stack_fault(&mut first,va,4,&mut retained)});
+            assert!(unsafe{resolve_stack_fault(&mut second,va,4,&mut retained)});
+            assert_eq!(ram.used.iter().filter(|&&v|v).count(),before);
+            let mut a=stack_mapping();let mut b=stack_mapping();
+            assert!(unsafe{vmm_query_page(&first.tables,va,&mut a)&&vmm_query_page(&second.tables,va,&mut b)});
+            assert_eq!((a.physical,b.physical),(zero,zero));assert!(!a.permissions.writable&&!b.permissions.writable);
+            assert!(unsafe{resolve_stack_fault(&mut first,va,7,&mut retained)});
+            assert!(unsafe{vmm_query_page(&first.tables,va,&mut a)});
+            assert_ne!(a.physical,zero);assert!(a.permissions.writable&&!a.permissions.executable);
+            ram.frames[Ram::index(a.physical).unwrap()][0]=0xfeed;
+            assert!(ram.frames[Ram::index(zero).unwrap()].iter().all(|&v|v==0));
+            assert_eq!((first.page_count,second.page_count),quota);
+            assert!(unsafe{indianos_user_image_destroy(&mut first)});
+            assert!(ram.used[Ram::index(zero).unwrap()]);
+            assert!(unsafe{vmm_query_page(&second.tables,va,&mut b)});assert_eq!(b.physical,zero);
+            assert!(unsafe{indianos_user_image_destroy(&mut second)});
+            assert_eq!(ram.used.iter().filter(|&&v|v).count(),1);
+        });
+        assert!(unsafe{ram_release(zero,(&mut ram as *mut Ram).cast())});assert!(ram.used.iter().all(|&v|!v));
+    }
+    #[cfg(feature="normal-desktop")]
+    #[test]fn cow_oom_and_refused_rollback_leave_shared_leaf_unchanged(){
+        let mut ram=Ram::new();let mut zero=0;
+        assert!(unsafe{ram_alloc(&mut zero,(&mut ram as *mut Ram).cast())});
+        crate::zero_page::with_test_frame(zero,||{
+            let mut image=demand_staged(&mut ram);let va=image.plan.stack_begin;let mut retained=0;
+            assert!(unsafe{defer_stack_pages(&mut image)&&resolve_stack_fault(&mut image,va,4,&mut retained)});
+            let used=ram.used;ram.used.fill(true);
+            assert!(!unsafe{resolve_stack_fault(&mut image,va,7,&mut retained)});
+            assert_eq!(retained,0);ram.used=used;
+            let free=ram.used.iter().position(|&v|!v).unwrap();let frame=(free as u64+1)*PAGE as u64;
+            ram.refuse_access=frame;ram.refuse_release=frame;
+            assert!(!unsafe{resolve_stack_fault(&mut image,va,7,&mut retained)});
+            assert_eq!(retained,frame);
+            let mut mapping=stack_mapping();assert!(unsafe{vmm_query_page(&image.tables,va,&mut mapping)});
+            assert_eq!(mapping.physical,zero);assert!(!mapping.permissions.writable);
+            ram.refuse_access=0;ram.refuse_release=0;
+            assert!(unsafe{ram_release(retained,(&mut ram as *mut Ram).cast())});retained=0;
+            assert!(unsafe{resolve_stack_fault(&mut image,va,7,&mut retained)});
+            assert!(unsafe{indianos_user_image_destroy(&mut image)});
+            assert!(ram.used[Ram::index(zero).unwrap()]);
+        });
+        assert!(unsafe{ram_release(zero,(&mut ram as *mut Ram).cast())});assert!(ram.used.iter().all(|&v|!v));
     }
     #[cfg(feature="normal-desktop")]
     #[test]fn demand_stack_fault_restores_zero_nx_page_without_growing_quota(){

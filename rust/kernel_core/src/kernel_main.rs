@@ -533,9 +533,10 @@ pub extern "C" fn kmain()->!{
     #[cfg(feature="normal-desktop")]
     {
         need(crate::kernel_heap::initialize(),
-            b"IndianOS: FATAL kernel heap CPU admission failed\n\0");
+            b"IndianOS: FATAL kernel heap, arena or shared-zero initialization failed\n\0");
         log(b"IndianOS: kernel heap BSP admission ready\n\0");
         log(b"IndianOS: kernel noncontiguous virtual arena ready\n\0");
+        log(b"IndianOS: kernel shared zero page ready\n\0");
     }
     #[cfg(feature="test-r114-epoch")]
     {

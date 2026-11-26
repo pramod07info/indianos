@@ -29,6 +29,11 @@ desktop_fpu_probe:
     movabsq $0x00007fffefff0000, %rax
     cmpq $0, 4096(%rax)
     jne 4f
+    movq %rdi, 4096(%rax)  /* protection fault must split the shared zero */
+    cmpq %rdi, 4096(%rax)
+    jne 4f
+    cmpq $0, 8192(%rax)    /* another shared alias must remain immutable */
+    jne 4f
     movq %rdi, (%rax)
     cmpq %rdi, (%rax)
     jne 4f
@@ -40,6 +45,12 @@ desktop_fpu_probe:
     int $0x80
     testq %rax, %rax
     jnz 4f
+    movabsq $0x00007fffefff0000, %rax
+    movq 8(%rsp), %rcx
+    cmpq %rcx, 4096(%rax)
+    jne 4f
+    cmpq $0, 8192(%rax)
+    jne 4f
     movq %xmm0, %rax
     cmpq 8(%rsp), %rax
     jne 4f
