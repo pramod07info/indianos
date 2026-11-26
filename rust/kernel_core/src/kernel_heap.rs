@@ -28,12 +28,66 @@ struct Slot { region: usize, offset: usize, extent: usize, generation: u64, live
 impl Slot {
     const fn new() -> Self { Self { region: 0, offset: 0, extent: 0, generation: 0, live: false } }
 }
-struct Heap { slots: [Slot; SLOTS], regions: [Region; SLOTS], next_generation: u64 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Pressure {
+    requests:u64, attempts:u64, failures:u64, reclamation_passes:u64,
+    retries:u64, recovered:u64, reclaimed_bytes:u64, peak_reserved:u64,
+    last_error:Option<Error>,
+}
+impl Pressure {
+    const fn new()->Self{Self{requests:0,attempts:0,failures:0,reclamation_passes:0,
+        retries:0,recovered:0,reclaimed_bytes:0,peak_reserved:0,last_error:None}}
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Snapshot { pressure:Pressure, reserved:u64, quarantined:u64, live_bytes:u64,
+    live_allocations:u64, owner_reserved:u64, owner_kind:u64, owner_epoch:u64 }
+struct Heap { slots: [Slot; SLOTS], regions: [Region; SLOTS], next_generation: u64, pressure:Pressure, report_due:bool, reported_classes:u16 }
 impl Heap {
     const fn new() -> Self { Self { slots: [const { Slot::new() }; SLOTS],
-        regions: [const { Region::new() }; SLOTS], next_generation: 1 } }
+        regions: [const { Region::new() }; SLOTS], next_generation: 1, pressure:Pressure::new(), report_due:false, reported_classes:0 } }
     fn charge(&self, owner: Owner) -> usize {
         self.regions.iter().filter(|r|r.owner==Some(owner)).map(|r|r.buffer.charged()).sum()
+    }
+    fn snapshot(&self,owner:Owner)->Snapshot{
+        Snapshot{pressure:self.pressure,
+            reserved:self.regions.iter().map(|r|r.buffer.charged() as u64).sum(),
+            quarantined:self.regions.iter().filter(|r|r.quarantined).map(|r|r.buffer.charged() as u64).sum(),
+            live_bytes:self.slots.iter().filter(|s|s.live).map(|s|s.extent as u64).sum(),
+            live_allocations:self.slots.iter().filter(|s|s.live).count() as u64,
+            owner_reserved:self.charge(owner) as u64,owner_kind:match owner{Owner::Frame(_)=>1,Owner::Scratch(_)=>2},owner_epoch:owner.epoch()}
+    }
+    fn observe_peak(&mut self){
+        let reserved:u64=self.regions.iter().map(|r|r.buffer.charged() as u64).sum();
+        self.pressure.peak_reserved=self.pressure.peak_reserved.max(reserved);
+    }
+    /// At most one bounded reclamation pass and one allocation retry. A live
+    /// lease is never revoked; retry requires a successful physical release.
+    fn allocate_recovering(&mut self,owner:Owner,layout:Layout,backend:&mut(impl Backend+?Sized))
+        ->Result<(Token,*mut u8),Error>{
+        self.pressure.requests=self.pressure.requests.saturating_add(1);self.report_due=false;
+        self.pressure.attempts=self.pressure.attempts.saturating_add(1);
+        let mut result=self.allocate(owner,layout,backend);self.observe_peak();
+        if matches!(result,Err(Error::Quota|Error::Metadata|Error::OutOfMemory))&&
+           self.regions.iter().any(|r|r.quarantined){
+            self.pressure.reclamation_passes=self.pressure.reclamation_passes.saturating_add(1);
+            let (released,_)=self.reclaim_count(backend);
+            if released>0{
+                self.pressure.retries=self.pressure.retries.saturating_add(1);
+                self.pressure.attempts=self.pressure.attempts.saturating_add(1);
+                result=self.allocate(owner,layout,backend);self.observe_peak();
+                if result.is_ok(){self.pressure.recovered=self.pressure.recovered.saturating_add(1);}
+            }
+        }
+        if let Err(error)=result{
+            self.pressure.failures=self.pressure.failures.saturating_add(1);
+            // At most nine first-class reports plus logarithmic repeats,
+            // including when the caller alternates failure classes.
+            let class=1u16<<error_code(error);
+            self.report_due=self.reported_classes&class==0||self.pressure.failures.is_power_of_two();
+            self.reported_classes|=class;
+            self.pressure.last_error=Some(error);
+        }
+        result
     }
     /// Out-of-band live extents are the free-space authority. Removing adjacent
     /// extents coalesces their holes automatically, without mutable free links.
@@ -98,16 +152,22 @@ impl Heap {
         entry.owner=None;entry.quarantined=false;entry.sharing_logged=false;
         Ok(())
     }
-    fn reclaim(&mut self, backend: &mut (impl Backend + ?Sized)) -> bool {
-        let mut clean=true;
-        for region in &mut self.regions {
-            if region.quarantined {
+    fn reclaim_count(&mut self,backend:&mut(impl Backend+?Sized))->(usize,usize){
+        let mut released=0;let mut remaining=0;
+        for region in &mut self.regions{
+            if region.quarantined{
+                let bytes=region.buffer.charged() as u64;
                 if region.buffer.clear(backend).is_ok(){
                     region.owner=None;region.quarantined=false;region.sharing_logged=false;
-                }else{clean=false;}
+                    self.pressure.reclaimed_bytes=self.pressure.reclaimed_bytes.saturating_add(bytes);
+                    released+=1;
+                }else{remaining+=1;}
             }
         }
-        clean
+        (released,remaining)
+    }
+    fn reclaim(&mut self, backend: &mut (impl Backend + ?Sized)) -> bool {
+        self.reclaim_count(backend).1==0
     }
     fn note_sharing(&mut self, token: Token) -> bool {
         let Some(slot)=self.slots.get(token.slot)else{return false;};
@@ -185,11 +245,53 @@ impl Drop for Allocation {
 }
 pub(crate) fn try_allocate(owner: Owner, layout: Layout) -> Result<Allocation, Error> {
     if !crate::kernel_buffer::masked() { return Err(Error::Owner); }
-    let capacity=owner.extent(layout.size())?;
-    let (token, pointer) = with_heap(|heap, backend| heap.allocate(owner, layout, backend))?;
+    let (result,snapshot,report,recovered)=with_heap(|heap,backend|{
+        let before=heap.pressure.recovered;
+        let result=heap.allocate_recovering(owner,layout,backend)
+            .map(|(token,pointer)|(token,pointer,heap.slots[token.slot].extent));
+        (result,heap.snapshot(owner),heap.report_due,heap.pressure.recovered>before)
+    });
+    if report{report_pressure(snapshot);}
+    if recovered{
+        #[cfg(not(test))]
+        unsafe{
+            unsafe extern "C"{fn serial_write(message:*const core::ffi::c_char);}
+            serial_write(b"IndianOS: heap allocation recovered after quarantine reclaim\n\0".as_ptr().cast());
+        }
+    }
+    let (token,pointer,capacity)=result?;
     Ok(Allocation { token: Some(token), pointer, length: layout.size(), capacity,
         owner, _single_cpu: PhantomData })
 }
+fn error_code(error:Error)->u8{
+    match error{Error::Geometry=>1,Error::Quota=>2,Error::OutOfMemory=>3,
+        Error::Mapping=>4,Error::Release=>5,Error::Owner=>6,Error::Metadata=>7,
+        Error::Alignment=>8,Error::Stale=>9}
+}
+#[cfg(not(test))]
+fn report_pressure(snapshot:Snapshot){
+    // Reuse the runtime's bounded, allocation-free hexadecimal diagnostic writer.
+    let reason=snapshot.pressure.last_error.map_or(0,|error|u64::from(error_code(error)));
+    for (label,value) in [
+        (&b"IndianOS: heap failure reason=0x\0"[..],reason),
+        (&b"IndianOS: heap reserved bytes=0x\0"[..],snapshot.reserved),
+        (&b"IndianOS: heap quarantined bytes=0x\0"[..],snapshot.quarantined),
+        (&b"IndianOS: heap owner reserved bytes=0x\0"[..],snapshot.owner_reserved),
+        (&b"IndianOS: heap live extents bytes=0x\0"[..],snapshot.live_bytes),
+        (&b"IndianOS: heap live allocations=0x\0"[..],snapshot.live_allocations),
+        (&b"IndianOS: heap peak reserved bytes=0x\0"[..],snapshot.pressure.peak_reserved),
+        (&b"IndianOS: heap failed requests=0x\0"[..],snapshot.pressure.failures),
+        (&b"IndianOS: heap owner kind=0x\0"[..],snapshot.owner_kind),
+        (&b"IndianOS: heap owner epoch=0x\0"[..],snapshot.owner_epoch),
+        (&b"IndianOS: heap allocation attempts=0x\0"[..],snapshot.pressure.attempts),
+        (&b"IndianOS: heap pressure retries=0x\0"[..],snapshot.pressure.retries),
+        (&b"IndianOS: heap recovered requests=0x\0"[..],snapshot.pressure.recovered),
+        (&b"IndianOS: heap reclaimed bytes=0x\0"[..],snapshot.pressure.reclaimed_bytes),
+    ]{crate::user_runtime::fault_hex(label,value);}
+}
+#[cfg(test)]
+fn report_pressure(_:Snapshot){}
+
 pub(crate) fn reclaim_retired() -> bool {
     crate::kernel_buffer::masked() && with_heap(|heap, backend| heap.reclaim(backend))
 }
@@ -203,24 +305,26 @@ mod fixture {
     #[derive(Clone)]
     struct Page([u32;1024]);
     pub(super) struct Memory { runs: std::vec::Vec<(u64, std::vec::Vec<Page>)>,
-        next: u64, pub oom: bool, pub fail_release: bool }
+        next: u64, pub oom: bool, pub fail_release: bool, pub block_until_release:bool, pub allocations:usize, pub releases:usize }
     impl Memory {
-        pub const fn new() -> Self { Self { runs: std::vec::Vec::new(), next: 4096, oom: false, fail_release: false } }
+        pub const fn new() -> Self { Self { runs: std::vec::Vec::new(), next: 4096, oom: false, fail_release: false, block_until_release:false, allocations:0, releases:0 } }
         pub fn count(&self) -> usize { self.runs.len() }
     }
     unsafe impl Backend for Memory {
         fn allocate(&mut self, pages: u32) -> Result<(u64, *mut u8), Error> {
-            if self.oom { return Err(Error::OutOfMemory); }
+            self.allocations+=1;
+            if self.oom||self.block_until_release { return Err(Error::OutOfMemory); }
             let physical = self.next; self.next += u64::from(pages) * 4096;
             let mut bytes = std::vec![Page([0xdeadbeef;1024]); pages as usize];
             let pointer = bytes.as_mut_ptr().cast(); self.runs.push((physical, bytes));
             Ok((physical, pointer))
         }
         fn release(&mut self, physical: u64, _: u32) -> bool {
+            self.releases+=1;
             if self.fail_release { return false; }
             let Some(index) = self.runs.iter().position(|r| r.0 == physical) else { return false; };
             assert!(self.runs[index].1.iter().all(|page| page.0.iter().all(|p| *p == 0)));
-            self.runs.remove(index); true
+            self.runs.remove(index);self.block_until_release=false; true
         }
     }
 }
@@ -351,6 +455,78 @@ mod tests {
         let (d,_)=heap.allocate(owner,layout(6400),&mut memory).unwrap();
         assert!(heap.note_sharing(c));
         for token in [c,d]{heap.release(token,&mut memory).unwrap();}
+    }
+    #[test] fn pressure_reclaims_quarantined_owner_quota_then_retries_once() {
+        let mut heap=Heap::new();let mut memory=fixture::Memory::new();let owner=Owner::Scratch(20);
+        let (old,_)=heap.allocate(owner,layout(8192),&mut memory).unwrap();
+        memory.fail_release=true;assert_eq!(heap.release(old,&mut memory),Err(Error::Release));
+        memory.fail_release=false;
+        let (new,_)=heap.allocate_recovering(owner,layout(6400),&mut memory).unwrap();
+        let snapshot=heap.snapshot(owner);
+        assert_eq!((snapshot.reserved,snapshot.quarantined,snapshot.owner_reserved),(8192,0,8192));
+        assert_eq!((snapshot.live_bytes,snapshot.live_allocations),(6400,1));
+        assert_eq!((snapshot.pressure.requests,snapshot.pressure.attempts,snapshot.pressure.failures),(1,2,0));
+        assert_eq!((snapshot.pressure.retries,snapshot.pressure.recovered,snapshot.pressure.reclaimed_bytes),(1,1,8192));
+        assert_eq!(heap.release(old,&mut memory),Err(Error::Stale));
+        heap.release(new,&mut memory).unwrap();assert_eq!(memory.count(),0);
+    }
+    #[test] fn global_oom_can_recover_from_another_owners_retired_region() {
+        let mut heap=Heap::new();let mut memory=fixture::Memory::new();
+        let (old,_)=heap.allocate(Owner::Scratch(21),layout(128),&mut memory).unwrap();
+        memory.fail_release=true;assert_eq!(heap.release(old,&mut memory),Err(Error::Release));
+        memory.fail_release=false;memory.block_until_release=true;
+        let attempts=memory.allocations;
+        let (new,_)=heap.allocate_recovering(Owner::Scratch(22),layout(128),&mut memory).unwrap();
+        assert_eq!(memory.allocations-attempts,2);assert_eq!(heap.charge(Owner::Scratch(21)),0);
+        assert_eq!(heap.pressure.recovered,1);heap.release(new,&mut memory).unwrap();
+    }
+    #[test] fn persistent_oom_has_one_retry_and_preserves_a_live_neighbors_bytes() {
+        let mut heap=Heap::new();let mut memory=fixture::Memory::new();
+        let (live,pointer)=heap.allocate(Owner::Scratch(23),layout(128),&mut memory).unwrap();
+        unsafe{pointer.write(0xab);}
+        let (retired,_)=heap.allocate(Owner::Scratch(24),layout(128),&mut memory).unwrap();
+        memory.fail_release=true;assert_eq!(heap.release(retired,&mut memory),Err(Error::Release));
+        memory.fail_release=false;memory.oom=true;
+        let attempts=memory.allocations;
+        assert_eq!(heap.allocate_recovering(Owner::Scratch(25),layout(128),&mut memory),Err(Error::OutOfMemory));
+        assert_eq!(memory.allocations-attempts,2);assert_eq!(heap.pressure.retries,1);
+        assert_eq!(heap.pressure.failures,1);assert_eq!(heap.pressure.recovered,0);
+        assert_eq!(unsafe{pointer.read()},0xab);assert_eq!(memory.count(),1);
+        heap.release(live,&mut memory).unwrap();
+    }
+    #[test] fn failed_cleanup_is_one_pass_and_cannot_reset_quota_or_tokens() {
+        let mut heap=Heap::new();let mut memory=fixture::Memory::new();
+        for epoch in 1..=SLOTS as u64{
+            memory.fail_release=false;
+            let (token,_)=heap.allocate(Owner::Scratch(epoch),layout(128),&mut memory).unwrap();
+            memory.fail_release=true;assert_eq!(heap.release(token,&mut memory),Err(Error::Release));
+        }
+        let releases=memory.releases;let next=heap.next_generation;
+        assert_eq!(heap.allocate_recovering(Owner::Frame(99),layout(128),&mut memory),Err(Error::Metadata));
+        assert_eq!(memory.releases-releases,SLOTS);assert_eq!(heap.next_generation,next);
+        assert_eq!(heap.pressure.retries,0);assert_eq!(heap.pressure.reclamation_passes,1);
+        assert_eq!(heap.snapshot(Owner::Scratch(1)).quarantined,8192*SLOTS as u64);
+        memory.fail_release=false;assert!(heap.reclaim(&mut memory));assert_eq!(memory.count(),0);
+    }
+    #[test] fn validation_errors_and_oom_without_quarantine_do_not_retry() {
+        let mut heap=Heap::new();let mut memory=fixture::Memory::new();memory.oom=true;
+        assert_eq!(heap.allocate_recovering(Owner::Scratch(30),layout(128),&mut memory),Err(Error::OutOfMemory));
+        assert_eq!(memory.allocations,1);assert_eq!(memory.releases,0);
+        assert_eq!(heap.allocate_recovering(Owner::Scratch(30),layout(0),&mut memory),Err(Error::Geometry));
+        assert_eq!(memory.allocations,1);assert_eq!(heap.pressure.reclamation_passes,0);
+        assert_eq!(heap.pressure.attempts,2);assert_eq!(heap.pressure.failures,2);
+    }
+    #[test] fn diagnostic_reports_are_bounded_across_alternating_failure_classes() {
+        let mut heap=Heap::new();let mut memory=fixture::Memory::new();memory.oom=true;let mut reports=0;
+        for i in 0..100{
+            let size=if i%2==0{0}else{128};
+            assert!(heap.allocate_recovering(Owner::Scratch(31),layout(size),&mut memory).is_err());
+            if heap.report_due{reports+=1;}
+        }
+        assert!(reports<=9);assert_eq!(heap.pressure.failures,100);
+        heap.pressure.requests=u64::MAX;heap.pressure.attempts=u64::MAX;heap.pressure.failures=u64::MAX;
+        assert!(heap.allocate_recovering(Owner::Scratch(31),layout(0),&mut memory).is_err());
+        assert_eq!((heap.pressure.requests,heap.pressure.attempts,heap.pressure.failures),(u64::MAX,u64::MAX,u64::MAX));
     }
     #[test] fn byte_sized_layout_cannot_resize_over_a_shared_neighbor() {
         let mut tiny = try_allocate(Owner::Scratch(76), Layout::from_size_align(1,1).unwrap()).unwrap();

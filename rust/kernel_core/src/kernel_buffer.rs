@@ -4,7 +4,7 @@
 const PAGE: usize = 4096;
 pub(crate) const FRAME_QUOTA: usize = 1600 * 1600 * 4;
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Error { Geometry, Quota, OutOfMemory, Mapping, Release, Owner, Metadata, Alignment, Stale }
 
 pub(crate) fn allocation_size(bytes: usize, quota: usize) -> Result<(usize, u32), Error> {

@@ -147,3 +147,35 @@ owners/global allocator integration, allocation-pressure diagnostics, SMP-safe
 admission, process RSS quotas and system-wide OOM/recovery policy still require
 implementation and end-to-end acceptance. This change addresses small-object
 allocation/coalescing only; it does not advance a gate or completion percentage.
+
+## Bounded quarantine recovery and pressure diagnostics
+
+`try_allocate` uses `Heap::allocate_recovering`: a quota, metadata or physical OOM
+refusal can trigger one pass over at most 16 quarantined regions. A successful
+physical release authorizes at most one retry. No quarantine means no pass;
+no successful release means no retry. Validation, ownership, mapping and release
+errors do not trigger pressure retry. Live leases are never revoked or scrubbed.
+Persistent refusal still reaches the existing caller's bounded fallback policy.
+
+Retirement and pressure recovery share reclamation. Physical quota remains
+charged until release succeeds. Saturating counters record requests, attempts,
+final failures, cleanup passes, retries, recovered requests, reclaimed bytes and
+peak physical backing. Snapshots distinguish live reserved extents, live leases,
+total/quarantined backing and the requesting owner's backing charge. A recovered
+first attempt counts as two attempts and zero failed requests.
+
+Failure diagnostics reuse the runtime's allocation-free hexadecimal writer.
+They report owner kind/epoch and memory counters without raw memory addresses.
+Reason codes: 1 geometry, 2 quota, 3 physical OOM, 4 mapping, 5 release,
+6 ownership/admission, 7 metadata/generation capacity, 8 alignment, 9 stale lease.
+Each class is reported once, followed by reports at power-of-two failure counts;
+alternating classes cannot cause one report per request indefinitely. Successful
+recovery emits `IndianOS: heap allocation recovered after quarantine reclaim`.
+These are heap counters, not total PMM or process memory statistics.
+
+Host regressions cover recovered quota and global OOM, persistent OOM with one
+retry, a single refused cleanup pass, validation rejection, live-neighbor bytes,
+stale-token rejection, counter saturation and alternating-error report bounds.
+They use a separate host failure backend and do not prove live guest OOM or
+physical memory-pressure acceptance. No local builds/tests/QEMU run; exact-head
+GitHub checks remain required before owner merge.

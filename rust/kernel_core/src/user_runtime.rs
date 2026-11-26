@@ -537,7 +537,7 @@ fn pid_log(pid:u32,event:&'static [u8]){
 }
 fn active_image()->*mut UserImage{unsafe{ptr::read(ptr::addr_of!(ACTIVE_USER))}}
 fn active_task()->*mut Task{unsafe{ptr::read(ptr::addr_of!(ACTIVE_TASK))}}
-fn fault_hex(label:&'static [u8],value:u64){
+pub(crate) fn fault_hex(label:&'static [u8],value:u64){
  log(label);
  let mut digits=[0u8;17];
  for i in 0..16{

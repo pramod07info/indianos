@@ -194,3 +194,9 @@ points and their limits; existing helper modules/tests must be reused where vali
 | M1-P6-007 — USB/xHCI keyboard/mouse stack | `input.rs`, `ps2_mouse.rs`; `ScanDecoder`, `Mouse` | PS/2 paths do not establish USB/xHCI support. | Host controller, enumeration, rings and HID report delivery. **Exit:** Real xHCI keyboard/mouse, disconnect/reset and hostile descriptor tests. | R |
 | M1-P6-008 — Modern display/GPU devices | `hardware_pcie.rs`, `gui.rs`; `scan`, `compositor_commit` | GPU discovery plus CPU framebuffer presentation is not GPU acceleration. | Validated device commands, memory/resource isolation and reset. **Exit:** Actual supported GPU backend plus preserved software fallback. | R |
 | M1-P6-009 — Hardware inventory across selected physical PCs | `hardware_inventory.rs`, `hardware_pcie.rs`; `inspect_cpu`, `scan` | Emulated discovery exists; selected-PC driver receipts were not supplied. | Publish and qualify a physical CPU/IRQ/input/display/storage/NIC matrix. **Exit:** Exact machine/firmware/device IDs and independent negative/recovery receipts. | H |
+
+PR #823 merged as `cfdcfab34a2178785360fcbabc64ecf0edba9c57`, adding shared
+small-object scratch arenas. The next allocation slice adds bounded quarantine
+recovery and classified pressure diagnostics. P2-004/P2-011 remain open pending
+the remaining implementation and end-to-end acceptance requirements described in
+[KERNEL_FRAME_ALLOCATION.md](KERNEL_FRAME_ALLOCATION.md).
