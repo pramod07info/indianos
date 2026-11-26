@@ -204,3 +204,21 @@ Nested entry through the real heap adapter is refused before touching the host
 RefCell. The normal-desktop QEMU harness requires the boot admission receipt and
 rejects reinitializing it during compositor-only recovery. Physical multicore
 qualification and broader concurrent PMM use remain separate requirements.
+
+## User-image staging rollback ownership
+
+`user_image::stage` now records each newly allocated data frame before calling
+fallible access/mapping callbacks. An unmapped frame whose rollback release
+fails remains in the existing ownership list with virtual address zero. The
+retryable image destructor already understands that representation. Successful
+rollback clears the reserved entry and restores the previous page count. A
+failed rollback stays charged against the fixed 128-data-page image capacity.
+No UserImage layout or public C ABI changes are needed.
+
+The previous error paths ignored a refused release and lost the only record of
+the data frame. Regressions cover access failure plus refused release, conflicting
+mapping plus refused release, successful rollback with no extra metadata charge,
+and image-capacity rejection before another allocation. They verify eventual
+release without double frees using the existing host backend. This is ownership
+conservation on staging failure, not general process RSS quotas, demand paging
+or a system-wide OOM killer.

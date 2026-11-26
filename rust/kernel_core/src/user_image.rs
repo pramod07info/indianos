@@ -61,9 +61,15 @@ unsafe fn stage(
         return None;
     }
     let phys = unsafe { allocate(image) }?;
+    // Record ownership before any mapping/access callback can fail. Zero VA
+    // means an unmapped allocation awaiting release, already understood by
+    // the retryable image destructor. Failed rollback must never forget RAM.
+    let index=image.page_count as usize;
+    image.pages[index]=UserPage{virtual_address:0,physical_address:phys};
+    image.page_count+=1;
     let frame = unsafe { access(image, phys) };
     if frame.is_null() {
-        let _ = unsafe { release(image, phys) };
+        unsafe{rollback_unmapped_stage(image,index)};
         return None;
     }
     // SAFETY: backend promises a full 4K mapped physical frame.
@@ -71,13 +77,21 @@ unsafe fn stage(
         unsafe { ptr::write_volatile(frame.add(i), 0); }
     }
     if !unsafe { vmm_map_page(&mut image.tables, va, phys, perms) } {
-        let _ = unsafe { release(image, phys) };
+        unsafe{rollback_unmapped_stage(image,index)};
         return None;
     }
-    let index = image.page_count as usize;
-    image.pages[index] = UserPage { virtual_address: va, physical_address: phys };
-    image.page_count += 1;
+    image.pages[index].virtual_address=va;
     Some(phys)
+}
+
+/// The reserved slot is the last staging entry and has never been mapped.
+/// Keep it charged against MAX_IMAGE_PAGES when physical release refuses.
+unsafe fn rollback_unmapped_stage(image:&mut UserImage,index:usize){
+    let physical=image.pages[index].physical_address;
+    if unsafe{release(image,physical)}{
+        image.pages[index]=UserPage{virtual_address:0,physical_address:0};
+        image.page_count=index as u16;
+    }
 }
 
 /// # Safety
@@ -605,6 +619,49 @@ mod tests {
         assert!(!img.ready);assert_eq!(ram.used,before);
         img.page_count=2;
         assert!(unsafe {indianos_user_image_destroy(&mut img)});
+    }
+    #[test]fn staging_access_failure_retains_a_refused_release_for_teardown_retry(){
+        let mut ram=Ram::new();let mut image=staged(&mut ram);
+        let before=image.page_count as usize;
+        let next=ram.used.iter().position(|used|!*used).unwrap();let physical=(next as u64+1)*PAGE as u64;
+        ram.refuse_access=physical;ram.refuse_release=physical;
+        assert!(unsafe{stage(&mut image,0x402000,Permissions{writable:true,executable:false,user:true})}.is_none());
+        assert_eq!(image.page_count as usize,before+1);
+        assert_eq!((image.pages[before].virtual_address,image.pages[before].physical_address),(0,physical));
+        assert!(ram.used[next]);ram.refuse_access=0;
+        assert!(!unsafe{indianos_user_image_destroy(&mut image)});
+        assert_eq!(image.pages[before].physical_address,physical);assert!(ram.used[next]);
+        ram.refuse_release=0;assert!(unsafe{indianos_user_image_destroy(&mut image)});
+        assert!(ram.used.iter().all(|used|!*used));assert!(ram.released.iter().all(|count|*count<=1));
+    }
+    #[test]fn conflicting_mapping_failure_preserves_existing_page_and_new_frame_ownership(){
+        let mut ram=Ram::new();let mut image=staged(&mut ram);
+        let before=image.page_count as usize;let original=image.pages[0].physical_address;
+        let next=ram.used.iter().position(|used|!*used).unwrap();let physical=(next as u64+1)*PAGE as u64;
+        ram.refuse_release=physical;
+        assert!(unsafe{stage(&mut image,0x400000,Permissions{writable:true,executable:false,user:true})}.is_none());
+        assert_eq!(image.pages[0].physical_address,original);
+        assert_eq!((image.pages[before].virtual_address,image.pages[before].physical_address),(0,physical));
+        assert!(ram.used[next]);assert_eq!(image.page_count as usize,before+1);
+        ram.refuse_release=0;assert!(unsafe{indianos_user_image_destroy(&mut image)});
+        assert!(ram.used.iter().all(|used|!*used));assert!(ram.released.iter().all(|count|*count<=1));
+    }
+    #[test]fn successful_staging_rollback_does_not_charge_an_unused_metadata_slot(){
+        let mut ram=Ram::new();let mut image=staged(&mut ram);let count=image.page_count;
+        let next=ram.used.iter().position(|used|!*used).unwrap();let physical=(next as u64+1)*PAGE as u64;
+        ram.refuse_access=physical;
+        assert!(unsafe{stage(&mut image,0x402000,Permissions{writable:true,executable:false,user:true})}.is_none());
+        assert_eq!(image.page_count,count);assert!(!ram.used[next]);
+        assert_eq!((image.pages[count as usize].virtual_address,image.pages[count as usize].physical_address),(0,0));
+        ram.refuse_access=0;assert!(unsafe{indianos_user_image_destroy(&mut image)});
+        assert!(ram.used.iter().all(|used|!*used));
+    }
+    #[test]fn retained_staging_frames_count_against_image_capacity_before_allocating(){
+        let mut ram=Ram::new();let mut image=staged(&mut ram);let before=ram.used;
+        let count=image.page_count;image.page_count=MAX_IMAGE_PAGES as u16;
+        assert!(unsafe{stage(&mut image,0x402000,Permissions{writable:true,executable:false,user:true})}.is_none());
+        assert_eq!(ram.used,before);image.page_count=count;
+        assert!(unsafe{indianos_user_image_destroy(&mut image)});
     }
     #[test]
     fn c_abi_and_user_copy_bounds() {
