@@ -95,12 +95,14 @@ unsafe fn discard_tree(b: &Backend, frame: u64, level: u8) -> bool {
 }
 unsafe fn clone_level(
     b: &Backend, source: u64, level: u8, allocated: &mut u32,
-    kernel_only: bool,
+    kernel_only: bool, mut ledger:Option<&mut [u64]>,
 ) -> Option<u64> {
     if !valid_frame(source) || !(1..=4).contains(&level) ||
         *allocated >= CLONE_LIMIT { return None; }
     let src = unsafe { at(b, source) };
     if src.is_null() { return None; }
+    let record=ledger.as_ref().and_then(|frames|frames.iter().position(|&frame|frame==0));
+    if ledger.is_some()&&record.is_none(){return None;}
     let mut phys = 0;
     if !unsafe { (b.allocate.unwrap())(&mut phys, b.context) } {
         return None;
@@ -111,9 +113,13 @@ unsafe fn clone_level(
         }
         return None;
     }
+    if let (Some(frames),Some(index))=(ledger.as_deref_mut(),record){
+        if frames.contains(&phys){return None;}
+        frames[index]=phys;
+    }
     let dst = unsafe { at(b, phys) };
     if !unsafe { table_clear(dst) } {
-        let _ = unsafe { release(b, phys) };
+        if ledger.is_none(){let _ = unsafe { release(b, phys) };}
         return None;
     }
     *allocated += 1;
@@ -121,14 +127,14 @@ unsafe fn clone_level(
         if kernel_only && level == 4 && i < 256 { continue; }
         let entry = unsafe { ptr::read(src.add(i)) };
         if level == 4 && entry & (PRESENT | HUGE) == (PRESENT | HUGE) {
-            let _ = unsafe { discard_tree(b, phys, level) };
+            if ledger.is_none(){let _ = unsafe { discard_tree(b, phys, level) };}
             return None;
         }
         let mut result = if child(entry, level) {
             let Some(child_phys) = (unsafe {
-                clone_level(b, entry & PHYS, level - 1, allocated, kernel_only)
+                clone_level(b, entry & PHYS, level - 1, allocated, kernel_only,ledger.as_deref_mut())
             }) else {
-                let _ = unsafe { discard_tree(b, phys, level) };
+                if ledger.is_none(){let _ = unsafe { discard_tree(b, phys, level) };}
                 return None;
             };
             (entry & !PHYS) | child_phys
@@ -170,12 +176,45 @@ unsafe fn clone_root(
         return false;
     }
     let mut count = 0u32;
-    let Some(root) = (unsafe { clone_level(b, original, 4, &mut count, kernel_only) })
+    let Some(root) = (unsafe { clone_level(b, original, 4, &mut count, kernel_only,None) })
     else { return false; };
     result.root = root;
     result.table_count = count;
     true
 }
+/// Release only a failed construction's explicitly owned table frames. Tables
+/// were never activated, so even an uninitialized/unreadable page can be freed
+/// without interpreting its contents. Refusals retain their ownership entries.
+/// # Safety: entries are unique frames from this trusted backend allocation.
+pub(crate) unsafe fn release_retained_frames(b:&Backend,frames:&mut [u64])->bool{
+    if !backend_valid(b)||frames.len()>CLONE_LIMIT as usize{return false;}
+    for (index,&frame) in frames.iter().enumerate().filter(|(_,frame)|**frame!=0){
+        if !valid_frame(frame)||frames[..index].contains(&frame){return false;}
+    }
+    let mut complete=true;
+    for frame in frames.iter_mut().rev().filter(|frame|**frame!=0){
+        if unsafe{release(b,*frame)}{*frame=0;}else{complete=false;}
+    }
+    complete
+}
+/// Normal desktop construction with caller-owned failure storage. The ordinary
+/// CloneResult ABI stays unchanged. On success ownership transfers to the tree;
+/// on failure the inactive result stays empty and failed releases stay in frames.
+/// # Safety: as paging_clone_kernel_half; frames/result/backend do not alias.
+pub(crate) unsafe fn clone_kernel_half_retained(b:&Backend,source:u64,result:&mut CloneResult,
+    frames:&mut [u64])->bool{
+    if result.root!=0||result.table_count!=0||frames.is_empty()||frames.len()>CLONE_LIMIT as usize||
+       frames.iter().any(|&frame|frame!=0){return false;}
+    let Some(required)=(unsafe{required_table_frames(b,source,true)})else{return false;};
+    if required as usize>frames.len(){return false;}
+    let mut count=0;
+    if let Some(root)=unsafe{clone_level(b,source,4,&mut count,true,Some(&mut *frames))}{
+        result.root=root;result.table_count=count;frames.fill(0);true
+    }else{
+        let _=unsafe{release_retained_frames(b,frames)};false
+    }
+}
+
 /// # Safety
 /// Caller supplies non-overlapping valid C backend/result pointers and holds
 /// all source frames live. No concurrent page-table access is permitted.
@@ -525,6 +564,38 @@ mod kernel_guard_tests{
   assert_eq!(unsafe{required_table_frames(&backend,0x1000,true)},Some(2));
   assert_eq!(unsafe{required_table_frames(&backend,0x1000,false)},None);
   assert_eq!((memory.allocations,memory.releases),(0,0));
+ }
+ #[test]fn construction_retains_every_refused_frame_and_refuses_overwrite(){
+  let mut memory=Memory::huge(2,2|NX);let original=memory.tables;
+  memory.fail_allocation=3;memory.fail_release=true;let backend=memory.backend();
+  let mut result=CloneResult{root:0,table_count:0};let mut retained=[0;12];
+  assert!(!unsafe{clone_kernel_half_retained(&backend,0x1000,&mut result,&mut retained)});
+  assert_eq!((result.root,result.table_count),(0,0));assert_eq!(retained.iter().filter(|&&f|f!=0).count(),2);
+  let calls=memory.allocations;
+  assert!(!unsafe{clone_kernel_half_retained(&backend,0x1000,&mut result,&mut retained)});
+  assert_eq!(memory.allocations,calls);assert!(!unsafe{release_retained_frames(&backend,&mut retained)});
+  memory.fail_release=false;assert!(unsafe{release_retained_frames(&backend,&mut retained)});
+  assert!(retained.iter().all(|&f|f==0));assert!(memory.live[..3].iter().all(|&live|live));
+  assert!(memory.live[3..].iter().all(|&live|!live));assert_eq!(&memory.tables[..3],&original[..3]);
+ }
+ #[test]fn uninitialized_destination_frame_is_reclaimed_without_table_access(){
+  let mut memory=Memory::huge(2,2|NX);memory.deny_access=0x4000;memory.fail_release=true;
+  let backend=memory.backend();let mut result=CloneResult{root:0,table_count:0};let mut retained=[0;12];
+  assert!(!unsafe{clone_kernel_half_retained(&backend,0x1000,&mut result,&mut retained)});
+  assert_eq!(retained[0],0x4000);assert!(memory.live[3]);
+  memory.fail_release=false;
+  assert!(unsafe{release_retained_frames(&backend,&mut retained)});assert!(!memory.live[3]);
+  assert!(memory.live[..3].iter().all(|&live|live));
+ }
+ #[test]fn tracked_clone_checks_budget_and_transfers_successful_tree_ownership(){
+  let mut memory=Memory::huge(2,2|NX);let backend=memory.backend();
+  let mut result=CloneResult{root:0,table_count:0};let mut short=[0;2];
+  assert!(!unsafe{clone_kernel_half_retained(&backend,0x1000,&mut result,&mut short)});
+  assert_eq!(memory.allocations,0);
+  let mut retained=[0;12];assert!(unsafe{clone_kernel_half_retained(&backend,0x1000,&mut result,&mut retained)});
+  assert_eq!(result.table_count,3);assert!(retained.iter().all(|&f|f==0));
+  let releases=memory.releases;assert!(unsafe{release_retained_frames(&backend,&mut retained)});
+  assert_eq!(memory.releases,releases);assert!(unsafe{paging_clone_release(&backend,&mut result)});
  }
  #[test]fn kernel_stack_effective_rw_rejects_readonly_pml4_pdpt_pd_and_pt(){
   for (table,index) in [(0,256),(1,0),(2,1),(3,5)]{

@@ -13,6 +13,7 @@ PR #825 contains the current follow-up; its required checks must pass before mer
 | Scratch small-object allocation and adjacent-hole coalescing | Implemented in merged #823 |
 | Bounded quarantine reclamation/retry and pressure diagnostics | Implemented in #825; current-head acceptance pending |
 | Enforced BSP, IRQ and non-reentrant metadata admission | Implemented in #825; rejects AP allocation, does not provide SMP allocation |
+| Failed normal-desktop clone construction ownership | Implemented in #825: bounded caller-owned frame ledger with retirement retry; guest failure injection pending |
 | Heap extent/backing integrity before unsafe operations | Implemented in #825; current-head acceptance pending |
 | User-image data/stack admission budgets and retained failed rollback ownership | Implemented in #825, including existing legacy C parity; not total RSS |
 | Noncontiguous physical backing behind contiguous virtual arenas | Not implemented |
@@ -335,3 +336,29 @@ separate resource domains. There is no general memory-growth syscall or shared
 memory lifecycle here; future implementations must charge those resources under
 an explicit policy. Noncontiguous backing, cross-CPU allocation and system-wide
 OOM/victim recovery remain unfinished requirements.
+
+
+## Failed clone construction retains raw frame ownership
+
+The normal desktop clone path now uses a caller-owned 512-entry ledger, matching
+its private-frame admission ceiling. The existing recursive clone routine records
+each allocated table frame before access/initialization can fail. On success the
+ledger clears and normal CloneResult tree ownership applies. On failure the
+inactive result remains empty; cleanup releases explicitly recorded frames
+without walking partial or uninitialized tables. Refused releases remain in the
+Task ledger and prevent another construction from overwriting that ownership.
+
+Task retirement retries these entries before releasing the image or reporting
+reclaimed resources. Cleanup receives the current trusted backend, avoiding a
+saved pointer to a previous invocation's DirectMap stack context. Source/borrowed
+data frames are never part of the construction ledger. The CloneResult/public C
+ABI is unchanged; historical clone entry points keep their existing behavior.
+The tracked path is the normal Rust desktop path, not a claim of upgraded legacy
+C clone-failure behavior.
+
+Host regressions cover multiple refused construction releases, refused ledger
+overwrite, unreadable/uninitialized destination cleanup without table access,
+insufficient ledger capacity before allocation, successful ownership transfer
+and eventual cleanup while preserving source tables. No host assertion is live
+PMM fault-injection or physical acceptance; current-head GitHub verification and
+that broader acceptance remain pending.

@@ -54,6 +54,8 @@ struct Task{
  file_generation:u64,
  #[cfg(any(feature="test-ipc",feature="normal-desktop"))]
  ipc_wait:crate::ipc::ReceiveWait,
+ #[cfg(feature="normal-desktop")]
+ clone_retained:[u64;512],
 }
 #[cfg(any(feature="test-r029-desktop-suite",feature="normal-desktop"))]
 static mut THIRD_ELF:(*const u8,usize)=(ptr::null(),0);
@@ -2070,8 +2072,11 @@ fn prepare(t:*mut Task,p:*mut Process,elf:*const u8,size:usize,original:u64,
  if !loaded{return false;}
  #[cfg(feature="normal-desktop")]
  if unsafe{(*p).pid}==1{log(b"IndianOS: desktop broker image limit 64 pages enforced\n\0");}
- if !unsafe{paging_clone_kernel_half(b,original,&mut task.root)} ||
-    !unsafe{paging_attach_user_half(b,task.root.root,task.image.tables.root_physical)}{return false;}
+ #[cfg(feature="normal-desktop")]
+ let cloned=unsafe{crate::paging::clone_kernel_half_retained(b,original,&mut task.root,&mut task.clone_retained)};
+ #[cfg(not(feature="normal-desktop"))]
+ let cloned=unsafe{paging_clone_kernel_half(b,original,&mut task.root)};
+ if !cloned||!unsafe{paging_attach_user_half(b,task.root.root,task.image.tables.root_physical)}{return false;}
  task.attached=true;
  #[cfg(feature="normal-desktop")]
  {
@@ -2634,6 +2639,8 @@ fn discard(t:*mut Task,b:&CloneBackend,terminal:bool)->bool{
   if !unsafe{paging_detach_user_half(b,task.root.root,task.image.tables.root_physical)}{return false;}
   task.attached=false;
  }
+ #[cfg(feature="normal-desktop")]
+ if !unsafe{crate::paging::release_retained_frames(b,&mut task.clone_retained)}{return false;}
  if task.root.root!=0&&!unsafe{paging_clone_release(b,&mut task.root)}{return false;}
  if task.image.tables.initialized&&!unsafe{indianos_user_image_destroy(&mut task.image)}{return false;}
  #[cfg(feature="normal-desktop")]
