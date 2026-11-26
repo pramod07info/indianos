@@ -140,7 +140,13 @@ impl PixelCache{
     pub(super) fn snapshot(
         &self, slot: usize, request: crate::compositor_pixels::Request,
     ) -> Option<[u8; crate::compositor_pixels::REPLY_BYTES]> {
-        use crate::compositor_pixels::{HEADER_BYTES, OPAQUE, REPLY_BYTES, ROW_PIXELS};
+        self.snapshot_sized::<{crate::compositor_pixels::REPLY_BYTES}>(slot,request)
+    }
+    pub(super) fn snapshot_sized<const BYTES:usize>(
+        &self, slot:usize, request:crate::compositor_pixels::Request,
+    )->Option<[u8;BYTES]>{
+        use crate::compositor_pixels::{HEADER_BYTES,OPAQUE};
+        if BYTES<HEADER_BYTES{return None;}
         self.with(slot, |a, am, b, bm, state| {
             let generation = state.published_generation;
             if generation == 0 {
@@ -149,11 +155,11 @@ impl PixelCache{
             let x = usize::from(request.x);
             let y = usize::from(request.y);
             let count = usize::from(request.count);
-            if count != 0 && (count > ROW_PIXELS || request.generation != generation ||
+            if count != 0 && (count > (BYTES-HEADER_BYTES)/8 || request.generation != generation ||
                               y >= state.height || x + count > state.width) {
                 return None;
             }
-            let mut out = [0; REPLY_BYTES];
+            let mut out = [0; BYTES];
             out[..8].copy_from_slice(&generation.to_le_bytes());
             out[8..10].copy_from_slice(&(state.width as u16).to_le_bytes());
             out[10..12].copy_from_slice(&(state.height as u16).to_le_bytes());

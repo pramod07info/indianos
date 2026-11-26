@@ -177,6 +177,14 @@ jobs:
           set -euo pipefail
           make desktop-image DESKTOP_BUILD=build/normal-desktop RUST_CORE=1 \
             DESKTOP_VOLUME_CONFIG="$PWD/build/normal-desktop-fixture/volume.bin" 2>&1 | tee build/normal-desktop-logs/image.log
+      - name: Build the shutdown exhaustion compositor fixture
+        run: |
+          set -euo pipefail
+          CARGO_TARGET_DIR="$PWD/build/desktop-shutdown-fixture" \
+            RUSTFLAGS="-C relocation-model=static -C link-arg=-T$PWD/userland/demo/linker.ld -C link-arg=--no-pie -C link-arg=-z -C link-arg=max-page-size=0x1000" \
+            cargo build --locked --offline --manifest-path userland/rust/Cargo.toml \
+              --target x86_64-unknown-none --release --no-default-features \
+              --features test-desktop-shutdown-stall
       - name: Actual physical input, selected GPT reboot, compositor and recovery evidence
         run: |
           set -euo pipefail
@@ -188,6 +196,7 @@ jobs:
           python3 tools/test_normal_desktop_qemu.py --iso build/normal-desktop/indianos.iso \
             --disk build/normal-desktop-fixture/volume.raw --qemu qemu-system-x86_64 \
             --ovmf "$OVMF_PATH" --artifact-dir build/normal-desktop-artifacts \
+            --shutdown-fixture build/desktop-shutdown-fixture/x86_64-unknown-none/release/indianos-user \
             2>&1 | tee build/normal-desktop-logs/qemu.log
       - name: Retain real screenshots and serial evidence even on failure
         if: always()

@@ -184,7 +184,7 @@ pub unsafe extern "C" fn indianos_syscall_validate(
         #[cfg(all(feature="test-r029-frame-server",not(feature="normal-desktop")))]
         23 => (1..=2).contains(&request.arg0) && request.arg1==0, // FRAME_PRESENT
         #[cfg(feature="normal-desktop")]
-        38 => request.arg0<=1 && request.arg1==0, // PID1 lifecycle; authority checked at trap
+        38 => (request.arg0<=1 && request.arg1==0)||(request.arg0==2&&request.arg1!=0), // PID1 lifecycle; authority checked at trap
         #[cfg(feature="normal-desktop")]
         39 => request.arg1==64 && user_range(plan,request.arg0,64,false), // app pixel transaction
         #[cfg(feature="normal-desktop")]
@@ -192,6 +192,11 @@ pub unsafe extern "C" fn indianos_syscall_validate(
             0 | 1 => user_range(plan, request.arg1, 64, request.arg0 == 0),
             crate::compositor_pixels::OPERATION => user_range(
                 plan, request.arg1, crate::compositor_pixels::REPLY_BYTES as u64, true),
+            crate::compositor_pixels::BULK_OPERATION => user_range(plan,request.arg1,
+                crate::compositor_pixels::BULK_REPLY_BYTES as u64,true),
+            4..=7 => user_range(plan,request.arg1,crate::compositor_pixels::FRAME_BYTES as u64,
+                request.arg0==crate::compositor_pixels::FRAME_BEGIN),
+            crate::compositor_pixels::FRAME_INFO => user_range(plan,request.arg1,64,true),
             _ => false,
         },
         #[cfg(feature="test-r030-ondevice")]
@@ -351,7 +356,9 @@ mod tests {
         assert!(check(37,2,plan.stack_begin));
         assert!(!check(37,2,plan.stack_end-(crate::compositor_pixels::REPLY_BYTES as u64-1)));
         assert!(!check(37,2,USER_MIN));
-        assert!(!check(37,3,plan.stack_begin));
+        assert!(check(37,3,plan.stack_begin));
+        assert!(!check(37,3,plan.stack_end-crate::compositor_pixels::BULK_REPLY_BYTES as u64+1));
+        for operation in 4..=8{assert!(check(37,operation,plan.stack_begin));}
         assert!(!check(37,0,plan.stack_end-63));
         assert!(!check(37,1,plan.guard_begin));
         assert!(check(38,0,0));

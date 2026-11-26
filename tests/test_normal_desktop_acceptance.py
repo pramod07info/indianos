@@ -247,9 +247,17 @@ class NormalDesktopControls(unittest.TestCase):
         with self.assertRaises(AssertionError):
             harness.verify_publication_cut(original, bytes(before), "metadata-after", output, 1, data_sectors=0)
 
+    def frame_cost(self, cycles=1000, calls=500, pixels=640 * 480):
+        return (harness.FRAME_METRICS +
+                f"cycles=0x{cycles:016x} calls=0x{calls:016x} pixels=0x{pixels:016x}".encode())
+
+    def measured(self, trace):
+        return trace.replace(harness.FRAME_PUBLISHED + b"\n",
+                             self.frame_cost() + b"\n" + harness.FRAME_PUBLISHED + b"\n")
+
     def pixel_startup(self):
-        return b"\n".join(harness.PIXEL_APP_EVIDENCE +
-                           (harness.LIFECYCLE_READY.encode(),)) + b"\n"
+        return self.measured(b"\n".join(harness.PIXEL_APP_EVIDENCE +
+                           (harness.LIFECYCLE_READY.encode(),)) + b"\n")
 
     def test_native_pixel_evidence_requires_both_fresh_apps_and_guard_before_commit(self):
         trace = self.pixel_startup()
@@ -542,13 +550,51 @@ class NormalDesktopControls(unittest.TestCase):
             close.assert_called_once()
             self.assertEqual(disk.read_bytes(), b"unchanged")
 
+    def test_shutdown_exhaustion_requires_two_armed_attempts_and_one_restart(self):
+        attempt = [harness.READY, harness.DURABLE_SHUTDOWN, harness.SHUTDOWN_STALL,
+                   harness.SHUTDOWN_EXHAUSTED, harness.RESTART_SAFE]
+        sequence = [*attempt, harness.RESTARTING_SESSION, *attempt,
+                    harness.RESTART_EXHAUSTED, harness.FAILED_SESSION]
+        wire = lambda trace: "\n".join(trace).encode()
+        harness.verify_shutdown_exhaustion(wire(sequence))
+        for bad in (sequence[1:],
+                    [*sequence, harness.RESTARTING_SESSION],
+                    [*sequence, harness.STOPPED],
+                    [sequence[1], sequence[0], *sequence[2:]],
+                    [marker.replace(harness.SHUTDOWN_EXHAUSTED, "startup dispatch budget exhausted")
+                     for marker in sequence]):
+            with self.assertRaises(AssertionError):
+                harness.verify_shutdown_exhaustion(wire(bad))
+
+    def test_normal_boot_timeout_retains_monitor_before_teardown(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            session = Mock()
+            session.output = bytearray(b"partial compositor startup")
+            session.until.side_effect = [None, None, AssertionError("missing desktop READY")]
+            session.hmp.return_value = "VM status: running"
+            diagnostic = folder / "desktop-1.failure-monitor.log"
+
+            def closed(*args):
+                self.assertIn("missing desktop READY", diagnostic.read_text())
+
+            with (patch.object(harness, "spawn", return_value=(Mock(), Mock(), session)),
+                  patch.object(harness, "close", side_effect=closed) as close):
+                with self.assertRaisesRegex(AssertionError, "missing desktop READY"):
+                    harness.boot("qemu", Path("system.iso"), Path("OVMF.fd"),
+                                 folder / "disk.raw", folder, 1)
+            session.until.assert_called_with(harness.READY, 20)
+            self.assertEqual([call.args[0] for call in session.hmp.call_args_list],
+                             ["info status", "info registers", "info block"])
+            close.assert_called_once()
+
     def test_unready_monitor_diagnostic_write_failure_cannot_mask_acceptance(self):
         with tempfile.TemporaryDirectory() as temporary:
             session = Mock()
             session.output = bytearray()
             session.hmp.return_value = "VM status: running"
             with patch("builtins.print"):
-                harness.capture_unready_failure(session, Path(temporary) / "absent",
+                harness.capture_boot_failure(session, Path(temporary) / "absent",
                     "unready-compositor", AssertionError("missing recovery"))
             self.assertEqual(session.hmp.call_count, 3)
 
@@ -783,19 +829,13 @@ class NormalDesktopControls(unittest.TestCase):
 
     def transient_trace(self):
         old = harness.READY.encode() + b"\n"
-        lines = ["IndianOS: fault vector=0x000000000000000e",
-                 "IndianOS: fault CR2=0x0000000060000000",
-                 "IndianOS: PID 4 FAULTED", "IndianOS: PID 4 REAPED",
-                 "IndianOS normal desktop: retired session verified restart-safe",
-                 "IndianOS normal desktop: restarting retired service session"]
-        lines += [f"IndianOS: PID {pid} {state}" for pid in (1, 2, 3, 4)
-                  for state in ("READY", "DISPATCHED")]
-        lines += [harness.SURFACES_GUARDED,
-                  "desktop compositor denied input and filesystem authority",
-                  harness.COMPOSITOR]
-        lines += [marker.decode("ascii") for marker in harness.PIXEL_APP_EVIDENCE]
-        lines += [harness.LIFECYCLE_READY, harness.READY]
-        return old + ("\n".join(lines) + "\n").encode(), len(old)
+        lines = [b"IndianOS: fault vector=0x000000000000000e",
+                 b"IndianOS: fault CR2=0x0000000060000000",
+                 b"IndianOS: PID 4 FAULTED", b"IndianOS: PID 4 REAPED",
+                 harness.COMPOSITOR_PREPARED, harness.COMPOSITOR.encode(),
+                 harness.STALE_COMPOSITOR_DENIED, harness.FRAME_PRESENTED,
+                 self.frame_cost(), harness.FRAME_PUBLISHED, harness.COMPOSITOR_REPLACED]
+        return old + b"\n".join(lines) + b"\n", len(old)
 
     def test_transient_restart_accepts_fresh_execution_and_later_clean_reap(self):
         trace, since = self.transient_trace()
@@ -809,14 +849,16 @@ class NormalDesktopControls(unittest.TestCase):
                     trace.replace(b"fault vector=0x000000000000000e", b"fault vector=0x0000000000000006"),
                     trace.replace(b"PID 4 FAULTED", b"PID 3 FAULTED"),
                     trace.replace(b"PID 4 REAPED", b"PID 3 REAPED"),
-                    trace.replace(b"retired session verified restart-safe", b"unverified"),
-                    trace.replace(b"PID 2 DISPATCHED", b"PID 2 waiting"),
+                    trace.replace(harness.COMPOSITOR_PREPARED, b"unverified"),
                     trace.replace(harness.COMPOSITOR.encode(), b""),
                     trace + b"IndianOS: PID 4 FAULTED\n",
                     trace + harness.READY.encode(), trace + b"FATAL",
                     trace + b"restart budget exhausted", trace + b"reason=desktop-session-failed",
+                    trace[:-1], trace.replace(harness.COMPOSITOR_REPLACED, b"prefix " + harness.COMPOSITOR_REPLACED),
                     trace + b"IndianOS: PID 4 REAPED\n",
-                    trace + b"IndianOS: PID 4 REAPED\nIndianOS: PID 4 REAPED\n" + harness.STOPPED.encode()):
+                    trace + b"IndianOS: PID 4 REAPED\nIndianOS: PID 4 REAPED\n" + harness.STOPPED.encode(),
+                    trace.replace(harness.COMPOSITOR_PREPARED, b"IndianOS: PID 2 READY\n" + harness.COMPOSITOR_PREPARED),
+                    trace.replace(harness.COMPOSITOR_PREPARED, b"IndianOS normal desktop: restarting retired service session\n" + harness.COMPOSITOR_PREPARED)):
             with self.subTest(trace=bad), self.assertRaises(AssertionError):
                 harness.verify_transient_restart(bad, since)
         for stale in (0, len(trace), len(trace) + 1, -1):
@@ -825,12 +867,209 @@ class NormalDesktopControls(unittest.TestCase):
 
     def test_transient_restart_rejects_reordered_fault_and_readiness(self):
         trace, since = self.transient_trace()
-        restart = b"IndianOS normal desktop: restarting retired service session\n"
-        wrong = trace[:since] + restart + trace[since:].replace(restart, b"")
+        marker = harness.COMPOSITOR_PREPARED + b"\n"
+        wrong = trace[:since] + marker + trace[since:].replace(marker, b"")
         with self.assertRaises(AssertionError):
             harness.verify_transient_restart(wrong, since)
         with self.assertRaises(AssertionError):
             harness.verify_transient_restart(trace[:since] + harness.STOPPED.encode() + trace[since:], since)
+
+    def test_pointer_ack_requires_fresh_complete_target_state_after_presented_frame(self):
+        frame = b"\n".join((harness.FRAME_PRESENTED, self.frame_cost(), harness.FRAME_PUBLISHED)) + b"\n"
+        marker = b"IndianOS user: desktop physical pointer x=0x00000064 y=0x0000005a buttons=0x00000001"
+        good = frame + marker + b"\n"
+        harness.verify_pointer_ack(good, 0, 100, 90, 1)
+        for bad in (good[:-1], marker + b"\n", good + marker + b"\n",
+                    good.replace(marker, b"prefix " + marker),
+                    good.replace(b"x=0x00000064", b"x=0x00000065"),
+                    good.replace(b"y=0x0000005a", b"y=0x0000005b"),
+                    good.replace(b"buttons=0x00000001", b"buttons=0x00000000"),
+                    marker + b"\n" + frame):
+            with self.assertRaises(AssertionError):
+                harness.verify_pointer_ack(bad, 0, 100, 90, 1)
+        for since in (1, len(frame), len(good), -1):
+            with self.assertRaises(AssertionError):
+                harness.verify_pointer_ack(good, since, 100, 90, 1)
+
+    def test_physical_pointer_helpers_await_move_press_and_release_without_fixed_delays(self):
+        frame = b"\n".join((harness.FRAME_PRESENTED, self.frame_cost(), harness.FRAME_PUBLISHED)) + b"\n"
+        class Session:
+            def __init__(self):
+                self.output = bytearray(); self.position = [200, 200]; self.buttons = 0; self.commands = []
+            def hmp(self, command):
+                self.commands.append(command); fields = command.split()
+                if fields[0] == "mouse_move":
+                    self.position[0] += int(fields[1]); self.position[1] += int(fields[2])
+                else:
+                    self.buttons = int(fields[1])
+                x, y = self.position
+                self.output.extend(frame + (f"IndianOS user: desktop physical pointer x=0x{x:08x} "
+                                           f"y=0x{y:08x} buttons=0x{self.buttons:08x}\n").encode())
+                if self.buttons == 1:
+                    self.output.extend(b"IndianOS user: desktop physical focus: Files\n")
+            def until(self, marker, timeout, since=0):
+                if marker.encode() not in self.output[since:]:
+                    raise AssertionError("helper waited for a state that was never presented")
+        session = Session()
+        self.assertEqual(harness.physical_focus(session, (200, 200), (100, 90), "Files"), (100, 90))
+        self.assertEqual(session.commands, ["mouse_move -100 -100", "mouse_move 0 -10", "mouse_button 1", "mouse_button 0"])
+        self.assertEqual(session.buttons, 0)
+        session.commands.clear()
+        harness.move_pointer(session, (100, 90), (1180, 650))
+        self.assertEqual(session.position, [1180, 650])
+        self.assertEqual(len(session.commands), 11)
+        for command in session.commands:
+            _, x, y = command.split()
+            self.assertLessEqual(abs(int(x)), 100)
+            self.assertLessEqual(abs(int(y)), 100)
+
+    def test_compositor_source_storage_handles_verified_scalar_split_without_guessing(self):
+        pointer = 0xffff800000400000
+        class Debugger:
+            def memory(self, address, count):
+                self_outer.assertEqual(count, 8)
+                return struct.pack("<Q", {0x1000: 40000, 0x2000: pointer}[address])
+        self_outer = self
+        split = "1000 8 b indianos_kernel_core::user_runtime::COMPOSITOR_ELF\n2000 8 b indianos_kernel_core::user_runtime::COMPOSITOR_ELF\n"
+        self.assertEqual(harness.compositor_source_words(split), (0x1000, 0x2000))
+        self.assertEqual(harness.compositor_source_extent(Debugger(), (0x1000, 0x2000), 40000), (pointer, 40000))
+        self.assertEqual(harness.compositor_source_words("1000 10 b indianos_kernel_core::user_runtime::COMPOSITOR_ELF"), (0x1000, 0x1008))
+        for bad in ["", split + split, split.replace("2000 8", "1000 8"), split.replace("1000 8", "1000 4")]:
+            with self.assertRaises(AssertionError): harness.compositor_source_words(bad)
+        with self.assertRaises(AssertionError): harness.compositor_source_extent(Debugger(), (0x1000, 0x2000), 30000)
+
+    def test_debugger_large_receipts_use_bounded_reads_and_private_pixel_fixture_changes_color(self):
+        class Debugger:
+            def __init__(self): self.calls = []
+            def memory(self, address, count):
+                self.calls.append((address, count))
+                if count > 64: raise AssertionError("unbounded debugger read")
+                return bytes(count)
+        debugger = Debugger()
+        self.assertEqual(harness.bounded_debugger_read(debugger, 0x400000, 72), bytes(72))
+        self.assertEqual(debugger.calls, [(0x400000, 64), (0x400040, 8)])
+        self.assertEqual(harness.bounded_debugger_read(debugger, 0x400000, 128), bytes(128))
+        for count in (0, 129, -1):
+            with self.assertRaises(AssertionError): harness.bounded_debugger_read(debugger, 0x400000, count)
+        for value in (1, 0x0c142b, 0xff000000, 0xffffffff):
+            replacement = harness.private_stage_pixel(value)
+            self.assertNotEqual(replacement, value); self.assertEqual(replacement & ~value, 0)
+        for value in (0, -1, 1 << 32):
+            with self.assertRaises(AssertionError): harness.private_stage_pixel(value)
+
+    def test_full_frame_publication_requires_fresh_ordered_measured_native_work(self):
+        good = b"\n".join((harness.FRAME_PRESENTED, self.frame_cost(), harness.FRAME_PUBLISHED)) + b"\n"
+        self.assertEqual(harness.verify_frame_publication(good, geometry=(640, 480)),
+                         [dict(cycles=1000, calls=500, pixels=640 * 480)])
+        for marker in (harness.FRAME_PRESENTED, self.frame_cost(), harness.FRAME_PUBLISHED):
+            for bad in (good.replace(marker + b"\n", b""), good + marker + b"\n",
+                        good.replace(marker, b"prefix " + marker), good[:-1]):
+                with self.subTest(trace=bad), self.assertRaises(AssertionError):
+                    harness.verify_frame_publication(bad)
+        for cost in (self.frame_cost(cycles=0), self.frame_cost(calls=0),
+                     self.frame_cost(calls=999999), self.frame_cost(pixels=1),
+                     self.frame_cost(pixels=1600 * 1600 + 1)):
+            with self.assertRaises(AssertionError):
+                harness.verify_frame_publication(good.replace(self.frame_cost(), cost))
+        with self.assertRaises(AssertionError):
+            harness.verify_frame_publication(good, geometry=(800, 600))
+        for since in (1, len(harness.FRAME_PRESENTED) + 1, len(good), -1):
+            with self.assertRaises(AssertionError):
+                harness.verify_frame_publication(good, since)
+        with self.assertRaises(AssertionError):
+            harness.verify_frame_publication(b"\n".join((self.frame_cost(), harness.FRAME_PRESENTED,
+                                                        harness.FRAME_PUBLISHED)) + b"\n")
+
+    def test_pending_row_receipt_pins_real_geometry_token_epoch_and_sequence(self):
+        packet = bytearray(128); packet[:4] = b"IFR1"
+        struct.pack_into("<4HI5Q", packet, 4, 640, 480, 1, 640, 1, 7, 2, 0x410000, 2560, 3)
+        self.assertEqual(harness.pending_frame_record(bytes(packet), (640, 480)), (1, 7, 2, 3))
+        for offset in (0, 4, 6, 10, 12, 40, 56, 64, 127):
+            bad = packet.copy(); bad[offset] ^= 0xff
+            with self.subTest(offset=offset), self.assertRaises(AssertionError):
+                harness.pending_frame_record(bytes(bad), (640, 480))
+        for offset in (16, 24, 32, 48):
+            bad = packet.copy(); bad[offset:offset + 8] = bytes(8)
+            with self.assertRaises(AssertionError):
+                harness.pending_frame_record(bytes(bad), (640, 480))
+        with self.assertRaises(AssertionError):
+            harness.pending_frame_record(bytes(packet[:-1]), (640, 480))
+
+    def test_recovery_receipts_require_same_live_clients_and_one_fresh_pid4(self):
+        clients = struct.pack("<9Q", 1, 0x1000, 7, 2, 0x2000, 8, 3, 0x3000, 0)
+        roles = struct.pack("<4Q", 1, 2, 3, 4)
+        fresh = struct.pack("<4Q", 1, 2, 3, 5)
+        harness.verify_preserved_clients(clients, clients, roles, fresh)
+        for index in range(9):
+            words = list(struct.unpack("<9Q", clients)); words[index] += 1
+            with self.subTest(word=index), self.assertRaises(AssertionError):
+                harness.verify_preserved_clients(clients, struct.pack("<9Q", *words), roles, fresh)
+        for other in (roles, struct.pack("<4Q", 1, 9, 3, 5), bytes(32), fresh[:-1]):
+            with self.assertRaises(AssertionError):
+                harness.verify_preserved_clients(clients, clients, roles, other)
+        with self.assertRaises(AssertionError):
+            harness.client_incarnation_records(clients[:-1])
+
+    def test_replacement_patch_changes_only_bounded_future_image_bytes(self):
+        elf = b"\x7fELF" + bytes(124)
+        self.assertEqual(harness.replacement_patch(elf, bytes(128), "load"), (0, b"\x00"))
+        changed = elf[:80] + b"\x0f\x0b" + elf[82:]
+        self.assertEqual(harness.replacement_patch(elf, changed, "repeat"), (80, b"\x0f\x0b"))
+        for replacement in (elf, bytes(127), b"changed" + bytes(121)):
+            with self.assertRaises(AssertionError):
+                harness.replacement_patch(elf, replacement, "repeat")
+        with self.assertRaises(AssertionError):
+            harness.replacement_patch(elf, changed, "unknown")
+
+    def test_live_replacement_failures_require_bounded_actual_failure_and_readonly_fallback(self):
+        for failure in ("load", "unready", "repeat"):
+            old = harness.READY.encode() + b"\n"
+            records = [b"IndianOS: fault vector=0x000000000000000e",
+                       b"IndianOS: fault CR2=0x0000000060000000",
+                       b"IndianOS: PID 4 FAULTED", b"IndianOS: PID 4 REAPED"]
+            records += ([b"IndianOS: G4 compositor-only replacement failed; full-session recovery required"]
+                        if failure == "load" else [harness.COMPOSITOR_PREPARED])
+            if failure == "unready": records += [b"IndianOS normal desktop: compositor readiness budget exhausted"]
+            if failure == "repeat": records += [b"IndianOS: PID 4 FAULTED", b"IndianOS: PID 4 REAPED"]
+            records += [b"IndianOS recovery: read-only serial console ready"]
+            trace = old + b"\n".join(records) + b"\n"
+            harness.verify_replacement_failure(trace, len(old), failure)
+            for bad in (trace[:-1], trace.replace(records[-1], b"prefix " + records[-1]),
+                        trace + harness.READY.encode(), trace + harness.COMPOSITOR_REPLACED,
+                        trace.replace(b"fault CR2=0x0000000060000000", b"wrong fault"),
+                        trace.replace(records[-1], b"no recovery"),
+                        trace + b"IndianOS: PID 2 FAULTED\n", trace + harness.COMPOSITOR_PREPARED):
+                with self.subTest(failure=failure), self.assertRaises(AssertionError):
+                    harness.verify_replacement_failure(bad, len(old), failure)
+
+    def test_recovered_original_clients_must_complete_durable_shutdown(self):
+        healthy, shutdown = self.trace()
+        replacement, since = self.transient_trace()
+        restored = replacement[since:]
+        trace = healthy[:shutdown] + restored + healthy[shutdown:]
+        final_shutdown = shutdown + len(restored)
+        harness.verify_recovered_shutdown(trace, shutdown, final_shutdown)
+        for bad in (trace.replace(b"desktop selected volume synchronized", b"missing barrier"),
+                    trace.replace(b"IndianOS: PID 2 EXITED", b"missing exit"),
+                    trace.replace(b"IndianOS: PID 3 REAPED", b"missing reap"),
+                    trace.replace(harness.STOPPED.encode(), b"not stopped")):
+            with self.assertRaises(AssertionError):
+                harness.verify_recovered_shutdown(bad, shutdown, final_shutdown)
+        with self.assertRaises(AssertionError):
+            harness.verify_recovered_shutdown(trace, shutdown, shutdown)
+
+    def test_startup_wall_measurement_is_separate_from_guest_frame_cycles(self):
+        frame = b"\n".join((harness.FRAME_PRESENTED, self.frame_cost(), harness.FRAME_PUBLISHED)) + b"\n"
+        session = SimpleNamespace(output=frame, boot_started=12.5, ready_observed=15.75)
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "cost.json"
+            harness.retain_frame_cost(session, path, (640, 480))
+            result = __import__("json").loads(path.read_text())
+            self.assertEqual(result["startup_seconds"], 3.25)
+            self.assertEqual(result["frames"][0]["cycles"], 1000)
+            session.ready_observed = 12.5
+            with self.assertRaises(AssertionError):
+                harness.retain_frame_cost(session, path, (640, 480))
 
     def test_debugger_inspects_only_file_backed_executable_bytes(self):
         elf = bytearray(4098)
@@ -942,6 +1181,7 @@ class NormalDesktopControls(unittest.TestCase):
                 "\n".join(f"IndianOS: PID {pid} {state}" for pid in (1, 2, 3, 4)
                           for state in ("EXITED", "REAPED")) +
                 "\n" + harness.STOPPED + "\n").encode()
+        prefix = self.measured(prefix)
         return prefix + tail, len(prefix)
 
     def test_actual_four_process_execution_sync_and_reaping_are_required(self):

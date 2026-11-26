@@ -254,8 +254,12 @@ pub unsafe extern "C" fn indianos_user_copy_readonly(
     image: *const UserImage, address: u64,
     destination: *mut c_void, length: usize,
 ) -> bool {
+    unsafe{copy_read_bounded(image,address,destination,length,MAX_WRITE)}
+}
+unsafe fn copy_read_bounded(image:*const UserImage,address:u64,destination:*mut c_void,
+ length:usize,limit:usize)->bool{
     let Some(img) = (unsafe { image.as_ref() }) else { return false; };
-    if !img.ready || destination.is_null() || !(1..=MAX_WRITE).contains(&length) ||
+    if !img.ready || destination.is_null() || !(1..=limit).contains(&length) ||
         !unsafe { indianos_program_user_range(&img.plan, address, length as u64, false) } ||
         !unsafe { copy_preflight(img, address, length, false) } {
         return false;
@@ -293,7 +297,10 @@ pub(crate) unsafe fn indianos_user_can_write(
 )->bool{
     // R025 IPC wire reply is 72 bytes; the dedicated syscall still validates
     // the complete writable range before consuming the queue.
-    img.ready && (1..=MAX_USER_COPY_OUT).contains(&length) &&
+    unsafe{can_write_bounded(img,address,length,MAX_USER_COPY_OUT)}
+}
+unsafe fn can_write_bounded(img:&UserImage,address:u64,length:usize,limit:usize)->bool{
+    img.ready && (1..=limit).contains(&length) &&
         crate::syscall::user_range(&img.plan,address,length as u64,true) &&
         unsafe{copy_preflight(img,address,length,true)}
 }
@@ -304,7 +311,10 @@ pub(crate) unsafe fn indianos_user_can_write(
 pub(crate) unsafe fn indianos_user_copy_writable(
     img:&UserImage,address:u64,source:*const u8,length:usize,
 )->bool{
-    if source.is_null() || !unsafe{indianos_user_can_write(img,address,length)}{
+    unsafe{copy_write_bounded(img,address,source,length,MAX_USER_COPY_OUT)}
+}
+unsafe fn copy_write_bounded(img:&UserImage,address:u64,source:*const u8,length:usize,limit:usize)->bool{
+    if source.is_null() || !unsafe{can_write_bounded(img,address,length,limit)}{
         return false;
     }
     let mut done=0usize;
@@ -621,6 +631,34 @@ mod tests {
         assert!(!page_owned(&img, 0x400000, 0x1000));
     }
 
+    #[cfg(feature="normal-desktop")]
+    #[test]fn g4_compositor_copy_extends_only_scoped_transport_and_checks_all_pages(){
+        let mut ram=Ram::new();let mut img=staged(&mut ram);
+        let address=0x400f80;let input=[0x73;512];let mut out=[0xab;512];
+        assert!(!unsafe{indianos_user_can_write(&img,address,input.len())});
+        assert!(!unsafe{indianos_user_copy_readonly(&img,address,out.as_mut_ptr().cast(),out.len())});
+        assert_eq!(out,[0xab;512]);
+        assert!(unsafe{compositor_can_write(&img,address,input.len())});
+        assert!(unsafe{compositor_copy_out(&img,address,input.as_ptr(),input.len())});
+        assert!(unsafe{compositor_copy_in(&img,address,out.as_mut_ptr(),out.len())});
+        assert_eq!(out,input);
+        for length in [0,crate::compositor_pixels::FRAME_COPY_LIMIT+1,usize::MAX]{
+            assert!(!unsafe{compositor_can_write(&img,address,length)});
+            assert!(!unsafe{compositor_copy_in(&img,address,out.as_mut_ptr(),length)});
+        }
+        let physical=img.pages[1].physical_address;
+        assert!(unsafe{vmm_unmap_page(&mut img.tables,0x401000)});
+        let first=Ram::index(img.pages[0].physical_address).unwrap();
+        let prior=ram.frames[first].clone();let replacement=[0xaa;512];out.fill(0xcd);
+        assert!(!unsafe{compositor_copy_in(&img,address,out.as_mut_ptr(),out.len())});
+        assert_eq!(out,[0xcd;512]);
+        assert!(!unsafe{compositor_copy_out(&img,address,replacement.as_ptr(),replacement.len())});
+        assert_eq!(ram.frames[first],prior);
+        assert!(unsafe{vmm_map_page(&mut img.tables,0x401000,physical,
+            Permissions{writable:true,executable:false,user:true})});
+        assert!(unsafe{indianos_user_image_destroy(&mut img)});
+    }
+
     // R117: user pointers for syscall 33 are copied through the same
     // preflight as every live ring-3 descriptor. Crossing an unmapped page
     // must fail before the first byte of kernel output is modified.
@@ -696,4 +734,19 @@ mod tests {
         assert!(unsafe{indianos_user_image_destroy(&mut img)});
     }
 
+}
+
+/// Only authenticated compositor syscalls may use this larger, still bounded
+/// transport. Generic file/IPC copies retain their original limits.
+#[cfg(feature="normal-desktop")]
+pub(crate) unsafe fn compositor_copy_in(img:*const UserImage,address:u64,out:*mut u8,n:usize)->bool{
+ unsafe{copy_read_bounded(img,address,out.cast(),n,crate::compositor_pixels::FRAME_COPY_LIMIT)}
+}
+#[cfg(feature="normal-desktop")]
+pub(crate) unsafe fn compositor_can_write(img:&UserImage,address:u64,n:usize)->bool{
+ unsafe{can_write_bounded(img,address,n,crate::compositor_pixels::FRAME_COPY_LIMIT)}
+}
+#[cfg(feature="normal-desktop")]
+pub(crate) unsafe fn compositor_copy_out(img:&UserImage,address:u64,source:*const u8,n:usize)->bool{
+ unsafe{copy_write_bounded(img,address,source,n,crate::compositor_pixels::FRAME_COPY_LIMIT)}
 }

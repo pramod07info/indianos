@@ -103,16 +103,34 @@ const DESKTOP_STARTUP_DISPATCH_LIMIT:u32=256;
 #[cfg(feature="normal-desktop")]
 const DESKTOP_SHUTDOWN_DISPATCH_LIMIT:u32=256;
 #[cfg(feature="normal-desktop")]
+const COMPOSITOR_READY_DISPATCH_LIMIT:u32=256;
+/// Last successfully loaded process image, not an authority grant. These
+/// monotonic receipts let live diagnostics distinguish process reuse even
+/// when a physical frame or PCB address is subsequently allocated again.
+#[cfg(feature="normal-desktop")]
+#[no_mangle]
+pub(crate) static mut DESKTOP_PROCESS_GENERATIONS:[u64;4]=[0;4];
+#[cfg(feature="normal-desktop")]
+#[no_mangle]
+pub(crate) static mut DESKTOP_CLIENT_INCARNATIONS:[(u64,u64,u64);3]=[(0,0,0);3];
+#[cfg(feature="normal-desktop")]
 #[derive(Clone,Copy)]
 struct DesktopLifecycle{
  ready:bool,shutdown_armed:bool,startup_dispatches:u32,shutdown_dispatches:u32,
+ compositor_epoch:u64,compositor_restarts:u8,compositor_pending:bool,
+ compositor_dispatches:u32,
 }
 #[cfg(feature="normal-desktop")]
 impl DesktopLifecycle{
  const fn new()->Self{
-  Self{ready:false,shutdown_armed:false,startup_dispatches:0,shutdown_dispatches:0}
+  Self{ready:false,shutdown_armed:false,startup_dispatches:0,shutdown_dispatches:0,
+   compositor_epoch:0,compositor_restarts:0,compositor_pending:false,compositor_dispatches:0}
  }
  fn dispatch(&mut self)->bool{
+  if self.compositor_pending{
+   if self.compositor_dispatches>=COMPOSITOR_READY_DISPATCH_LIMIT{return false;}
+   self.compositor_dispatches+=1;
+  }
   if self.shutdown_armed{
    if self.shutdown_dispatches>=DESKTOP_SHUTDOWN_DISPATCH_LIMIT{return false;}
    self.shutdown_dispatches+=1;return true;
@@ -122,10 +140,27 @@ impl DesktopLifecycle{
   self.startup_dispatches+=1;true
  }
  fn ready(&mut self,live:bool)->bool{
-  if !live||self.ready||self.shutdown_armed{return false;}
+  if !live||self.ready||self.shutdown_armed||self.compositor_epoch==0||self.compositor_pending{return false;}
   self.ready=true;true
  }
- fn may_arm(&self)->bool{self.ready&&!self.shutdown_armed}
+ fn compositor_may_restart(&self)->bool{
+  self.ready&&!self.shutdown_armed&&!self.compositor_pending&&self.compositor_restarts==0
+ }
+ fn replace_compositor(&mut self,epoch:u64)->bool{
+  if !self.compositor_may_restart()||epoch<=self.compositor_epoch{return false;}
+  self.compositor_epoch=epoch;self.compositor_restarts=1;
+  self.compositor_pending=true;self.compositor_dispatches=0;true
+ }
+ fn compositor_ready(&mut self,epoch:u64)->bool{
+  if epoch==0||self.shutdown_armed{return false;}
+  if self.compositor_pending{
+   if epoch!=self.compositor_epoch{return false;}
+   self.compositor_pending=false;true
+  }else if !self.ready&&self.compositor_epoch==0{
+   self.compositor_epoch=epoch;true
+  }else{false}
+ }
+ fn may_arm(&self)->bool{self.ready&&!self.shutdown_armed&&!self.compositor_pending}
  fn complete_sync(&mut self,succeeded:bool)->bool{
   if !succeeded||!self.may_arm(){return false;}
   self.shutdown_armed=true;true
@@ -144,11 +179,17 @@ impl DesktopLifecycle{
    _=>true,
   }
  }
+ /// A ready broker pauses without consuming input while its renderer is
+ /// replaced. Returning a captured zero-result continuation, rather than BAD,
+ /// keeps the broker alive and gives the replacement a scheduler turn.
+ fn defer_input_request(&self,number:u64,pid:u32)->bool{
+  self.compositor_pending&&self.ready&&!self.shutdown_armed&&pid==1&&matches!(number,6|25)
+ }
  fn allows_input_request(&self,number:u64,pid:u32)->bool{
   match number{
    // Hardware consumption belongs to the live ready broker only. Refuse
    // before touching controller ports, software queues or user buffers.
-   6|25=>pid==1&&self.ready&&!self.shutdown_armed,
+   6|25=>pid==1&&self.ready&&!self.shutdown_armed&&!self.compositor_pending,
    // App event queues may be used during startup, but neither the broker
    // nor the compositor owns a client queue. Shutdown withdraws delivery.
    21=>matches!(pid,2|3)&&!self.shutdown_armed,
@@ -665,6 +706,10 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
  #[cfg(feature="normal-desktop")]
  if matches!(request.number,6|21|25){
   let Some(pid)=authenticated_gui_pid()else{return BAD;};
+  if unsafe{DESKTOP_LIFECYCLE}.defer_input_request(request.number,pid){
+   if !capture(regs,false){return BAD;}
+   unsafe{x86_64_user_exit_to_kernel(YIELD)}
+  }
   if !unsafe{DESKTOP_LIFECYCLE}.allows_input_request(request.number,pid){return BAD;}
  }
  match request.number{
@@ -672,6 +717,15 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
   39=>unsafe{desktop_pixel_request(request.arg0)},
   #[cfg(feature="normal-desktop")]
   38=>{
+   if request.arg0==2{
+    if authenticated_gui_pid()!=Some(4)||crate::gui::compositor_epoch()!=Some(request.arg1)||
+       !crate::gui::compositor_presentation_ready(request.arg1){return BAD;}
+    let lifecycle=unsafe{&mut *ptr::addr_of_mut!(DESKTOP_LIFECYCLE)};
+    let replacement=lifecycle.compositor_pending;
+    if !lifecycle.compositor_ready(request.arg1){return BAD;}
+    if replacement{log(b"IndianOS: G4 compositor-only replacement ready\n\0");}
+    return 0;
+   }
    if !authenticated_r026_init(){return BAD;}
    let Ok(_permit)=r120_enter()else{return BAD;};
    let Some(owner)=authenticated_file_identity()else{return BAD;};
@@ -962,6 +1016,45 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
      if unsafe { indianos_user_copy_writable(&*img, request.arg1, reply.as_ptr(), reply.len()) } {
       0
      } else { BAD }
+    },
+    crate::compositor_pixels::BULK_OPERATION=>{
+     use crate::compositor_pixels::{Request,REQUEST_BYTES,BULK_REPLY_BYTES,BULK_PIXELS};
+     if !unsafe{crate::user_image::compositor_can_write(&*img,request.arg1,BULK_REPLY_BYTES)}{return BAD;}
+     let mut wire=[0;REQUEST_BYTES];
+     if !unsafe{indianos_user_copy_readonly(img,request.arg1,wire.as_mut_ptr().cast(),wire.len())}{return BAD;}
+     let Some(read)=Request::parse_limit(&wire,BULK_PIXELS)else{return BAD;};
+     let Some(reply)=crate::gui::desktop_pixel_snapshot_bulk(pid,read)else{return BAD;};
+     if unsafe{crate::user_image::compositor_copy_out(&*img,request.arg1,reply.as_ptr(),reply.len())}{0}else{BAD}
+    },
+    crate::compositor_pixels::FRAME_INFO=>{
+     if !unsafe{indianos_user_can_write(&*img,request.arg1,64)}{return BAD;}
+     let Some(info)=crate::gui::compositor_info(pid)else{return BAD;};
+     if unsafe{indianos_user_copy_writable(&*img,request.arg1,info.as_ptr(),info.len())}{0}else{BAD}
+    },
+    4..=7=>{
+     use crate::compositor_pixels::{FrameRequest,FRAME_BYTES,FRAME_LIMIT,FRAME_BEGIN,FRAME_ROW,FRAME_COMMIT};
+     // BEGIN returns its token through this validated descriptor, before any
+     // staging allocation changes. Other operations have no user copyout.
+     if request.arg0==FRAME_BEGIN&&
+        !unsafe{crate::user_image::compositor_can_write(&*img,request.arg1,FRAME_BYTES)}{return BAD;}
+     let mut wire=[0;FRAME_BYTES];
+     if !unsafe{indianos_user_copy_readonly(img,request.arg1,wire.as_mut_ptr().cast(),wire.len())}{return BAD;}
+     let Some(frame)=FrameRequest::parse(&wire)else{return BAD;};
+     match request.arg0{
+      FRAME_BEGIN=>{
+       let Some(token)=crate::gui::compositor_begin(pid,frame)else{return BAD;};
+       wire[16..24].copy_from_slice(&token.to_le_bytes());
+       if unsafe{crate::user_image::compositor_copy_out(&*img,request.arg1,wire.as_ptr(),wire.len())}{0}else{BAD}
+      },
+      FRAME_ROW=>{
+       if frame.bytes!=u64::from(frame.width)*4||frame.count!=frame.width{return BAD;}
+       let mut row=[0u32;FRAME_LIMIT];
+       if !unsafe{crate::user_image::compositor_copy_in(img,frame.pixels,row.as_mut_ptr().cast(),frame.bytes as usize)}{return BAD;}
+       if crate::gui::compositor_row(pid,frame,&row[..usize::from(frame.width)]){0}else{BAD}
+      },
+      FRAME_COMMIT=>if crate::gui::compositor_commit(pid,frame){0}else{BAD},
+      _=>if crate::gui::compositor_abort(pid,frame){0}else{BAD},
+     }
     },
     _=>BAD,
    }
@@ -1982,6 +2075,16 @@ fn prepare(t:*mut Task,p:*mut Process,elf:*const u8,size:usize,original:u64,
    }
   }
  }
+ #[cfg(feature="normal-desktop")]
+ {
+  let generations=unsafe{&mut *ptr::addr_of_mut!(DESKTOP_PROCESS_GENERATIONS)};
+  let Some(next)=generations[slot].checked_add(1)else{return false;};
+  generations[slot]=next;
+  if slot<3{
+   unsafe{(&mut *ptr::addr_of_mut!(DESKTOP_CLIENT_INCARNATIONS))[slot]=
+      (next,task.root.root,task.file_generation);}
+  }
+ }
  pid_log(unsafe{(*p).pid},b"READY\0");true
 }
 #[cfg(any(feature="test-ipc",feature="normal-desktop"))]
@@ -2287,6 +2390,13 @@ fn revoke_task_authority_with_kind(
  if let Some(process)=unsafe{task.pcb.as_ref()}{
   let pid=process.pid;
   cleanup_quantum_jobs(pid);
+  #[cfg(feature="normal-desktop")]
+  if pid==4&&!crate::gui::compositor_retire(){
+   // No replacement may inherit a token if checked epoch rotation failed.
+   // Runtime authority is already withdrawn; the recovery gate below also
+   // requires a strictly newer epoch before preparing a replacement image.
+   log(b"IndianOS: G4 compositor frame authority retirement failed\n\0");
+  }
   #[cfg(any(feature="test-r029-multiprocess",feature="normal-desktop"))]
   crate::gui::user_surface_terminate(pid);
   #[cfg(any(feature="test-ipc",feature="normal-desktop"))]
@@ -2449,6 +2559,30 @@ fn revoke_task_authority_with_kind(
   }
   task.file_generation=0;
  }
+}
+/// Only the fixed compositor role may reuse its terminal PCB, after page
+/// tables and image frames are released and every old authority is withdrawn.
+#[cfg(feature="normal-desktop")]
+fn restart_reaped_compositor(process:&mut Process)->bool{
+ if process.pid!=4||!matches!(process.state,4|5)||!process.resources_reclaimed||
+    process.address_space_root!=0{return false;}
+ *process=Process{pid:4,state:1,..Process::empty()};true
+}
+#[cfg(feature="normal-desktop")]
+fn desktop_client_receipts()->Option<[(u64,u64,u64);3]>{
+ let recorded=unsafe{ptr::read(ptr::addr_of!(DESKTOP_CLIENT_INCARNATIONS))};
+ for (slot,&(generation,root,file)) in recorded.iter().enumerate(){
+  let task=unsafe{&*task_ptr(slot)};
+  let process=unsafe{task.pcb.as_ref()}?;
+  if generation==0||process.pid!=slot as u32+1||!matches!(process.state,2|3)||
+     !task.authority_live||!task.image.ready||!task.attached||
+     task.root.root!=root||process.address_space_root!=root||task.file_generation!=file{
+   return None;
+  }
+  if slot<2&&!unsafe{(&*ptr::addr_of!(R031_HANDLES)).owns(
+       crate::batch5_session::Identity{pid:process.pid,generation:file})}{return None;}
+ }
+ Some(recorded)
 }
 fn discard(t:*mut Task,b:&CloneBackend,terminal:bool)->bool{
  let task=unsafe{&mut *t};
@@ -2719,6 +2853,8 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
   if !unsafe{(&mut *ptr::addr_of_mut!(DESKTOP_LIFECYCLE)).dispatch()}{
    if unsafe{DESKTOP_LIFECYCLE}.shutdown_armed{
     log(b"IndianOS normal desktop: shutdown dispatch budget exhausted\n\0");
+   }else if unsafe{DESKTOP_LIFECYCLE}.compositor_pending{
+    log(b"IndianOS normal desktop: compositor readiness budget exhausted\n\0");
    }else{
     log(b"IndianOS normal desktop: startup dispatch budget exhausted\n\0");
    }
@@ -2803,6 +2939,23 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
    if !discard(task as *mut Task,&backend,true){ok=false;break;}
    #[cfg(feature="normal-desktop")]
    if unsafe{DESKTOP_LIFECYCLE}.unexpected_exit(v,status){
+    if pid==4&&unsafe{DESKTOP_LIFECYCLE}.compositor_may_restart(){
+     let clients=desktop_client_receipts();
+     if let Some(epoch)=crate::gui::compositor_epoch(){
+      if unsafe{(&mut *ptr::addr_of_mut!(DESKTOP_LIFECYCLE)).replace_compositor(epoch)}&&
+         restart_reaped_compositor(unsafe{&mut *pcb}){
+       task.saved=false;task.frame=[0;WORDS];task.timer_preemptions=0;
+       let (elf,len)=unsafe{COMPOSITOR_ELF};
+       if prepare(task_ptr(3),pcb,elf,len,cpu.cr3&PHYS,&vmm,&backend,3)&&
+          router().is_some_and(|boxes|boxes.register(4).is_ok())&&
+          clients.is_some()&&desktop_client_receipts()==clients{
+        log(b"IndianOS: G4 compositor-only replacement prepared\n\0");
+        continue;
+       }
+      }
+     }
+     log(b"IndianOS: G4 compositor-only replacement failed; full-session recovery required\n\0");
+    }
     if !unsafe{DESKTOP_LIFECYCLE}.shutdown_armed{
      log(b"IndianOS normal desktop: service exited before durable shutdown\n\0");
     }
@@ -3068,6 +3221,7 @@ fn native_file_payload_size(action:u64,offset:u64,length:u64)->Option<usize>{
   for _ in 0..DESKTOP_STARTUP_DISPATCH_LIMIT{assert!(state.dispatch());}
   assert!(!state.dispatch());
   assert_eq!(state.startup_dispatches,DESKTOP_STARTUP_DISPATCH_LIMIT);
+  assert!(state.compositor_ready(1));
   assert!(state.ready(true));
   assert!(!state.ready(true));
   for _ in 0..1024{assert!(state.dispatch());}
@@ -3077,6 +3231,7 @@ fn native_file_payload_size(action:u64,offset:u64,length:u64)->Option<usize>{
  #[test]fn desktop_zero_exit_requires_successful_durable_shutdown(){
   let mut state=DesktopLifecycle::new();
   assert!(state.unexpected_exit(0,0));
+  assert!(state.compositor_ready(1));
   assert!(state.ready(true));
   assert!(!state.complete_sync(false));
   assert!(!state.shutdown_armed);
@@ -3090,6 +3245,7 @@ fn native_file_payload_size(action:u64,offset:u64,length:u64)->Option<usize>{
  #[cfg(feature="normal-desktop")]
  #[test]fn desktop_shutdown_dispatches_are_bounded_only_after_successful_sync(){
   let mut state=DesktopLifecycle::new();
+  assert!(state.compositor_ready(1));
   assert!(state.ready(true));
   assert!(!state.complete_sync(false));
   for _ in 0..1024{assert!(state.dispatch());}
@@ -3106,6 +3262,7 @@ fn native_file_payload_size(action:u64,offset:u64,length:u64)->Option<usize>{
   for number in [32,33]{
    for operation in 0..=40{assert!(state.allows_storage_request(number,operation));}
   }
+  assert!(state.compositor_ready(1));
   assert!(state.ready(true));
   assert!(!state.complete_sync(false));
   assert!(state.allows_storage_request(32,11));
@@ -3131,6 +3288,7 @@ fn native_file_payload_size(action:u64,offset:u64,length:u64)->Option<usize>{
   for pid in 0..=5{
    assert_eq!(state.allows_input_request(21,pid),matches!(pid,2|3));
   }
+  assert!(state.compositor_ready(1));
   assert!(state.ready(true));
   for number in [6,25]{
    for pid in 0..=5{assert_eq!(state.allows_input_request(number,pid),pid==1);}
@@ -3147,6 +3305,111 @@ fn native_file_payload_size(action:u64,offset:u64,length:u64)->Option<usize>{
   for number in [1,2,3,9,18,34,35,37]{
    assert!(state.allows_input_request(number,1));
   }
+ }
+ #[cfg(feature="normal-desktop")]
+ #[test]fn g4_compositor_replacement_readiness_is_epoch_bound_and_one_shot(){
+  let mut state=DesktopLifecycle::new();
+  assert!(!state.ready(true));assert!(!state.compositor_ready(0));
+  assert!(!state.compositor_may_restart());assert!(!state.replace_compositor(1));
+  assert!(state.compositor_ready(7));assert!(!state.compositor_ready(7));
+  assert!(state.ready(true));assert!(state.compositor_may_restart());
+  assert!(!state.replace_compositor(7));assert!(!state.replace_compositor(6));
+  assert!(state.replace_compositor(8));assert!(!state.may_arm());
+  assert!(!state.complete_sync(true));assert!(!state.compositor_may_restart());
+  for number in 0..=40{
+   for pid in 0..=5{
+    assert_eq!(state.defer_input_request(number,pid),pid==1&&matches!(number,6|25));
+   }
+  }
+  for number in [6,25]{assert!(!state.allows_input_request(number,1));}
+  assert!(state.allows_input_request(21,2));
+  assert!(state.allows_input_request(21,3));
+  assert!(!state.compositor_ready(7));assert!(!state.compositor_ready(9));
+  assert!(state.compositor_ready(8));assert!(!state.compositor_ready(8));
+  assert!(state.may_arm());assert!(!state.compositor_may_restart());
+  assert!(!state.replace_compositor(9));
+  for number in [6,25]{
+   assert!(state.allows_input_request(number,1));assert!(!state.defer_input_request(number,1));
+  }
+ }
+ #[cfg(feature="normal-desktop")]
+ #[test]fn g4_compositor_replacement_readiness_budget_and_shutdown_policy_are_bounded(){
+  let mut state=DesktopLifecycle::new();
+  assert!(state.compositor_ready(1));assert!(state.ready(true));
+  assert!(state.replace_compositor(2));
+  for _ in 0..COMPOSITOR_READY_DISPATCH_LIMIT{assert!(state.dispatch());}
+  for _ in 0..3{assert!(!state.dispatch());}
+  assert!(state.ready);assert!(state.compositor_pending);
+  assert_eq!(state.compositor_dispatches,COMPOSITOR_READY_DISPATCH_LIMIT);
+  assert!(!state.replace_compositor(3));
+  let mut shutdown=DesktopLifecycle::new();
+  assert!(shutdown.compositor_ready(1));assert!(shutdown.ready(true));
+  assert!(shutdown.complete_sync(true));
+  assert!(!shutdown.compositor_may_restart());assert!(!shutdown.replace_compositor(2));
+  assert!(!shutdown.compositor_ready(1));
+  for number in [6,25]{assert!(!shutdown.defer_input_request(number,1));}
+ }
+ #[cfg(feature="normal-desktop")]
+ #[test]fn g4_only_a_fully_reaped_compositor_pcb_can_be_reused(){
+  let fingerprint=|p:Process|(p.pid,p.state,p.address_space_root,p.exit_status,
+     p.fault_vector,p.fault_error,p.fault_address,p.resources_reclaimed);
+  for pid in [0,1,2,3,5,u32::MAX]{
+   let mut p=Process{pid,state:5,resources_reclaimed:true,..Process::empty()};
+   let before=fingerprint(p);assert!(!restart_reaped_compositor(&mut p));
+   assert_eq!(fingerprint(p),before);
+  }
+  for state in [-1,0,1,2,3,6,i32::MAX]{
+   let mut p=Process{pid:4,state,resources_reclaimed:true,..Process::empty()};
+   let before=fingerprint(p);assert!(!restart_reaped_compositor(&mut p));
+   assert_eq!(fingerprint(p),before);
+  }
+  for state in [4,5]{
+   for (root,reclaimed) in [(0,false),(0x4000,false),(0x4000,true)]{
+    let mut p=Process{pid:4,state,address_space_root:root,resources_reclaimed:reclaimed,..Process::empty()};
+    let before=fingerprint(p);assert!(!restart_reaped_compositor(&mut p));
+    assert_eq!(fingerprint(p),before);
+   }
+  }
+  let mut table=ProcessTable::empty();
+  for pid in 1..=4{
+   let p=unsafe{indianos_process_create(&mut table)};
+   assert!(!p.is_null());assert_eq!(unsafe{(*p).pid},pid);
+   assert!(unsafe{indianos_process_ready(p)});
+   assert!(unsafe{indianos_process_bind(p,pid as u64*PAGE)});
+   assert!(unsafe{indianos_process_start(p,pid as u64*PAGE)});
+  }
+  let before=table.slots[..3].iter().copied().map(fingerprint).collect::<std::vec::Vec<_>>();
+  let compositor=&mut table.slots[3];
+  assert!(unsafe{indianos_process_fault(compositor,270,14,4,0xdead)});
+  assert!(!restart_reaped_compositor(compositor));
+  assert!(unsafe{indianos_process_reap(compositor)});
+  assert!(restart_reaped_compositor(compositor));
+  assert_eq!(fingerprint(*compositor),(4,1,0,0,0,0,0,false));
+  assert_eq!(table.slots[..3].iter().copied().map(fingerprint).collect::<std::vec::Vec<_>>(),before);
+  assert_eq!((table.count,table.next_pid),(4,5));
+  assert!(unsafe{indianos_process_ready(&mut table.slots[3])});
+  assert!(unsafe{indianos_process_bind(&mut table.slots[3],0x8000)});
+  assert!(unsafe{indianos_process_start(&mut table.slots[3],0x8000)});
+  assert_eq!(table.slots[3].address_space_root,0x8000);
+ }
+ #[cfg(feature="normal-desktop")]
+ #[test]fn g4_compositor_mailbox_replacement_discards_old_requests_and_responses(){
+  use crate::ipc::{ReceiveWait,WaitPoll};
+  let mut boxes=IpcRouter::<4,8>::new().unwrap();
+  for pid in 1..=4{boxes.register(pid).unwrap();}
+  boxes.send(1,4,b"old-request").unwrap();
+  boxes.send(4,1,b"old-ack").unwrap();
+  boxes.send(2,1,b"files-state").unwrap();
+  boxes.send(3,1,b"terminal-state").unwrap();
+  let mut old_wait=ReceiveWait::begin(&boxes,4,0x400000,32).unwrap();
+  boxes.unregister(4).unwrap();boxes.register(4).unwrap();
+  assert_eq!(old_wait.poll(&mut boxes,|_|true),WaitPoll::Failed(crate::ipc::IpcError::UnknownReceiver));
+  assert_eq!(boxes.pending(4),Ok(0));assert_eq!(boxes.pending(1),Ok(2));
+  let first=boxes.receive(1).unwrap();let second=boxes.receive(1).unwrap();
+  assert_eq!((first.sender(),first.payload()),(2,b"files-state".as_slice()));
+  assert_eq!((second.sender(),second.payload()),(3,b"terminal-state".as_slice()));
+  boxes.send(4,1,b"fresh-ready").unwrap();
+  assert_eq!(boxes.receive(1).unwrap().payload(),b"fresh-ready");
  }
  #[cfg(feature="normal-desktop")]
  #[test]fn retained_pixel_geometry_requires_complete_bounded_nonoverlapping_planes(){

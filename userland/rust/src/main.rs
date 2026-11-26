@@ -1327,11 +1327,41 @@ fn desktop_receive(sender:u32,out:&mut[u8;72])->usize{
     }
 }
 #[cfg(feature="desktop-init")]
+fn desktop_pointer_ack(pointer:u64){
+    let mut line=*b"desktop physical pointer x=0x00000000 y=0x00000000 buttons=0x00000000";
+    for (offset,value) in [(29,pointer&0xffff),(42,(pointer>>16)&0xffff),(61,(pointer>>32)&1)]{
+        for i in 0..8{line[offset+i]=b"0123456789abcdef"[((value>>((7-i)*4))&15) as usize];}
+    }
+    write(&line);
+}
+#[cfg(feature="desktop-init")]
+static mut DESKTOP_REQUEST_SEQUENCE:u64=0;
+#[cfg(feature="desktop-init")]
 fn desktop_control(request:&[u8])->u32{
-    suite_send(4,request);
-    let mut reply=[0u8;72];let n=desktop_receive(4,&mut reply);
-    if n!=2||reply[8]!=b'A'||!matches!(reply[9],1|2){exit(246);}
-    reply[9] as u32
+    if request.len()>6{exit(246);}
+    let sequence=unsafe{
+        let Some(next)=DESKTOP_REQUEST_SEQUENCE.checked_add(1)else{exit(246);};
+        DESKTOP_REQUEST_SEQUENCE=next;next
+    };
+    let mut command=[0u8;15];command[0]=b'S';command[1..9].copy_from_slice(&sequence.to_le_bytes());
+    command[9..9+request.len()].copy_from_slice(request);suite_send(4,&command[..9+request.len()]);
+    let mut replayed=false;
+    for _ in 0..16{
+        let mut reply=[0u8;72];let n=desktop_receive(4,&mut reply);let message=&reply[8..8+n];
+        if n==19&&&message[..10]==b"COMPOSITOR"{
+            let committed=u64::from_le_bytes(message[10..18].try_into().unwrap());
+            if committed>sequence||!matches!(message[18],1|2)||replayed{exit(246);}
+            replayed=true;
+            if committed==sequence{return message[18] as u32;}
+            if committed.checked_add(1)!=Some(sequence){exit(246);}
+            suite_send(4,&command[..9+request.len()]);continue;
+        }
+        if n!=10||message[0]!=b'A'||!matches!(message[9],1|2){exit(246);}
+        let acknowledged=u64::from_le_bytes(message[1..9].try_into().unwrap());
+        if acknowledged==sequence{return message[9] as u32;}
+        if acknowledged>sequence{exit(246);}
+    }
+    exit(246)
 }
 #[cfg(any(feature="r031-shell",feature="r031-supervisor-shell",feature="r031-files-shell",feature="desktop-init"))]
 fn desktop_present(front:u32)->u64{
@@ -1351,48 +1381,54 @@ fn compositor_read(request: compositor_pixels::Request) -> Option<[u8; composito
 
 #[cfg(any(feature="desktop-init",feature="desktop-files",feature="desktop-terminal"))]
 fn compositor_read_denied() -> bool {
+    // INFO has no token or geometry to invalidate: a valid owned destination
+    // distinguishes lack of compositor authority from a malformed request.
+    let mut info=[0u8;64];
+    if call(37,8,info.as_mut_ptr() as u64)!=u64::MAX{return false;}
     compositor_read(compositor_pixels::Request {
         window: 1, x: 0, y: 0, count: 0, generation: 0,
     }).is_none()
 }
 
 #[cfg(feature="desktop-compositor")]
-fn compose_desktop_strip(
-    manager: &desktop_window::Manager, screen: (u16, u16), strip: &mut [u32],
+fn compose_desktop_row(
+    manager: &desktop_window::Manager, screen: (u16, u16), row: &mut [u32], scratch: &mut [u32],
 ) -> Option<()> {
     use compositor_pixels::{Request, HEADER_BYTES, OPAQUE, ROW_PIXELS};
-    use desktop_window::{compose_client_row, ClientSpan};
-    if strip.is_empty() || strip.len() > ROW_PIXELS { return None; }
-    let mut layers = [[None; ROW_PIXELS]; 2];
-    let mut destinations = [0; 2];
-    for (slot, pixels) in layers.iter_mut().enumerate() {
+    let mut snapshots = [None; 2];
+    for (slot, snapshot) in snapshots.iter_mut().enumerate() {
         if manager.client_origin(slot).is_none() { continue; }
         let query = Request { window: slot as u16 + 1, x: 0, y: 0, count: 0, generation: 0 };
         let info = compositor_read(query)?;
         let generation = u64::from_le_bytes(info[..8].try_into().ok()?);
         let width = u16::from_le_bytes(info[8..10].try_into().ok()?);
         let height = u16::from_le_bytes(info[10..12].try_into().ok()?);
-        let Some(span) = manager.client_read_span(slot, screen, strip.len() as u16, (width, height))
-            else { continue; };
-        let request = Request { x: span.x, y: span.y, count: span.count, generation, ..query };
-        let reply = compositor_read(request)?;
-        if reply[..HEADER_BYTES] != info[..HEADER_BYTES] { return None; }
-        destinations[slot] = i32::from(span.destination);
-        for (out, bytes) in pixels.iter_mut().zip(reply[HEADER_BYTES..].chunks_exact(8))
-            .take(usize::from(span.count)) {
-            let value = u64::from_le_bytes(bytes.try_into().ok()?);
-            *out = match value {
-                0 => None,
-                value if value >> 32 == OPAQUE >> 32 => Some(value as u32),
-                _ => return None,
-            };
-        }
+        *snapshot = Some((query, info, generation, (width, height)));
     }
-    compose_client_row(manager.front() == 2, [
-        ClientSpan { x: destinations[0], pixels: &layers[0] },
-        ClientSpan { x: destinations[1], pixels: &layers[1] },
-    ], strip);
-    Some(())
+    manager.compose_row::<ROW_PIXELS>(screen, row, scratch, |screen, strip| {
+        let mut layers = [[None; ROW_PIXELS]; 2];
+        let mut destinations = [0; 2];
+        for (slot, pixels) in layers.iter_mut().enumerate() {
+            let Some((query, info, generation, dimensions)) = &snapshots[slot] else { continue; };
+            let Some(span) = manager.client_read_span(slot, screen, strip.len() as u16, *dimensions)
+                else { continue; };
+            let request = Request { x: span.x, y: span.y, count: span.count, generation: *generation, ..*query };
+            let reply = compositor_read(request)?;
+            if reply[..HEADER_BYTES] != info[..HEADER_BYTES] { return None; }
+            destinations[slot] = i32::from(span.destination);
+            for (out, bytes) in pixels.iter_mut().zip(reply[HEADER_BYTES..].chunks_exact(8))
+                .take(usize::from(span.count)) {
+                let value = u64::from_le_bytes(bytes.try_into().ok()?);
+                *out = match value {
+                    0 => None,
+                    value if value >> 32 == OPAQUE >> 32 => Some(value as u32),
+                    _ => return None,
+                };
+            }
+        }
+        manager.compose_screen_strip(screen, destinations, &mut layers, strip);
+        Some(())
+    })
 }
 
 #[cfg(feature="desktop-compositor")]
@@ -1424,9 +1460,11 @@ fn verify_client_snapshots(manager: &desktop_window::Manager) -> bool {
     // Exercise real desktop coordinates in addition to the overlap probe.
     for (slot, x, y) in [(0, 15, 102), (1, 20, 175)] {
         let Some((left, top)) = manager.client_origin(slot) else { return false; };
-        let mut pixel = [0];
-        if compose_desktop_strip(manager, (left + x, top + y), &mut pixel).is_none() ||
-           pixel[0] != colors[slot] { return false; }
+        const PROBE_PIXELS: usize = compositor_pixels::ROW_PIXELS * 2 + 1;
+        let mut row = [0; PROBE_PIXELS];
+        let mut scratch = [0; PROBE_PIXELS];
+        if compose_desktop_row(manager, (left + x, top + y), &mut row, &mut scratch).is_none() ||
+           row.iter().any(|&pixel| pixel != colors[slot]) { return false; }
     }
     let terminal_front = manager.front() == 2;
     let front = usize::from(terminal_front);
@@ -1442,6 +1480,104 @@ fn verify_client_snapshots(manager: &desktop_window::Manager) -> bool {
     colors[0] != colors[1] && strip == [colors[rear], colors[front], 0]
 }
 #[cfg(feature="desktop-compositor")]
+static mut DESKTOP_FRAME_ROW:[u32;1600]=[0;1600];
+#[cfg(feature="desktop-compositor")]
+fn frame_packet(width:u16,height:u16,token:u64,epoch:u64,sequence:u64)->[u8;128]{
+    let mut wire=[0u8;128];wire[..4].copy_from_slice(b"IFR1");
+    wire[4..6].copy_from_slice(&width.to_le_bytes());wire[6..8].copy_from_slice(&height.to_le_bytes());
+    wire[12..16].copy_from_slice(&1u32.to_le_bytes());
+    wire[16..24].copy_from_slice(&token.to_le_bytes());wire[24..32].copy_from_slice(&epoch.to_le_bytes());
+    wire[48..56].copy_from_slice(&sequence.to_le_bytes());wire
+}
+#[cfg(feature="desktop-compositor")]
+fn frame_info()->Option<[u8;64]>{
+    let mut info=[0u8;64];
+    (call(37,8,info.as_mut_ptr() as u64)==0).then_some(info)
+}
+/// Production row uploader. Its stable symbol also permits an external
+/// debugger to interrupt a real in-progress frame without a guest fault API.
+#[cfg(feature="desktop-compositor")]
+#[no_mangle]
+#[inline(never)]
+pub extern "C" fn indianos_desktop_frame_row(packet:*mut u8)->u64{
+    call(37,5,packet as u64)
+}
+#[cfg(feature="desktop-compositor")]
+fn frame_clock()->Option<u64>{
+    let info=frame_info()?;Some(u64::from_le_bytes(info[56..64].try_into().ok()?))
+}
+#[cfg(feature="desktop-compositor")]
+fn frame_metrics(cycles:u64,calls:u64,pixels:u64){
+    let mut message=*b"desktop PID4 frame metrics cycles=0x0000000000000000 calls=0x0000000000000000 pixels=0x0000000000000000";
+    for (offset,value) in [(36,cycles),(61,calls),(87,pixels)]{
+        for i in 0..16{message[offset+i]=b"0123456789abcdef"[((value>>((15-i)*4))&15) as usize];}
+    }
+    write(&message);
+}
+#[cfg(feature="desktop-compositor")]
+fn present_desktop_frame(manager:&desktop_window::Manager,epoch:u64,sequence:u64,masks:[u32;3])->bool{
+    use compositor_pixels::{Request,HEADER_BYTES,OPAQUE};
+    let (width,height)=manager.dimensions();
+    let Some(started)=frame_clock()else{return false;};
+    let mut calls=1u64;
+    for _ in 0..3{
+       let mut snapshots=[None;2];
+        for (slot,snapshot) in snapshots.iter_mut().enumerate(){
+            let q=Request{window:slot as u16+1,x:0,y:0,count:0,generation:0};
+            calls+=1;let Some(reply)=compositor_read(q)else{return false;};
+            *snapshot=Some((q,reply,u64::from_le_bytes(reply[..8].try_into().unwrap()),
+                (u16::from_le_bytes(reply[8..10].try_into().unwrap()),u16::from_le_bytes(reply[10..12].try_into().unwrap()))));
+        }
+        let mut begin=frame_packet(width,height,0,epoch,sequence);
+        begin[64..].copy_from_slice(&manager.wire());calls+=1;
+        if call(37,4,begin.as_mut_ptr() as u64)!=0{continue;}
+        let token=u64::from_le_bytes(begin[16..24].try_into().unwrap());
+        if token==0{return false;}
+        let mut succeeded=true;
+        for y in 0..height{
+            let row=unsafe{&mut *core::ptr::addr_of_mut!(DESKTOP_FRAME_ROW)};
+            let row=&mut row[..usize::from(width)];
+            let rendered=manager.render_row(y,row,masks,|slot,screen,out|{
+                let (query,info,generation,dimensions)=snapshots[slot]?;
+                let Some(span)=manager.client_read_span(slot,screen,out.len() as u16,dimensions)else{return Some(());};
+                let mut done=0u16;
+                while done<span.count{
+                    let count=(span.count-done).min(compositor_pixels::BULK_PIXELS as u16);
+                    let mut wire=[0u8;compositor_pixels::BULK_REPLY_BYTES];
+                    let request=Request{x:span.x+done,y:span.y,count,generation,..query};
+                    wire[..24].copy_from_slice(&request.wire()[..24]);calls+=1;
+                    if call(37,3,wire.as_mut_ptr() as u64)!=0||wire[..HEADER_BYTES]!=info[..HEADER_BYTES]{return None;}
+                    for (i,bytes) in wire[HEADER_BYTES..].chunks_exact(8).take(usize::from(count)).enumerate(){
+                        let pixel=u64::from_le_bytes(bytes.try_into().ok()?);
+                        match pixel{
+                            0=>{},value if value>>32==OPAQUE>>32=>out[usize::from(span.destination+done)+i]=value as u32,
+                            _=>return None,
+                        }
+                    }
+                    done+=count;
+                }
+                Some(())
+            });
+            if rendered.is_none(){succeeded=false;break;}
+            let mut packet=frame_packet(width,height,token,epoch,sequence);
+            packet[8..10].copy_from_slice(&y.to_le_bytes());packet[10..12].copy_from_slice(&width.to_le_bytes());
+            packet[32..40].copy_from_slice(&(row.as_ptr() as u64).to_le_bytes());
+            packet[40..48].copy_from_slice(&(u64::from(width)*4).to_le_bytes());calls+=1;
+            if indianos_desktop_frame_row(packet.as_mut_ptr())!=0{succeeded=false;break;}
+        }
+        let mut packet=frame_packet(width,height,token,epoch,sequence);
+        let committed=if succeeded{calls+=1;call(37,6,packet.as_mut_ptr() as u64)}else{u64::MAX};
+        if committed==0{
+            calls+=1;let Some(finished)=frame_clock()else{return false;};
+            frame_metrics(finished.wrapping_sub(started),calls,u64::from(width)*u64::from(height));
+            write(b"desktop PID4 full frame published");return true;
+        }
+        calls+=1;let _=call(37,7,packet.as_mut_ptr() as u64);
+    }
+    false
+}
+
+#[cfg(feature="desktop-compositor")]
 fn desktop_compositor()->!{
     if call(4,0,0)!=4||call(6,0,1)!=u64::MAX||call(22,0,0)!=u64::MAX||
        call(23,1,0)!=u64::MAX||call(24,1,0)!=u64::MAX||
@@ -1455,30 +1591,77 @@ fn desktop_compositor()->!{
     app_request.width=1;app_request.height=1;
     if app_pixel_call(app_request)!=u64::MAX{exit(247);}
     write(b"desktop compositor denied app pixel authority");
+    let Some(info)=frame_info()else{exit(248);};
+    let epoch=u64::from_le_bytes(info[24..32].try_into().unwrap());
+    let sequence=u64::from_le_bytes(info[32..40].try_into().unwrap());
+    let old_token=u64::from_le_bytes(info[40..48].try_into().unwrap());
+    let old_epoch=u64::from_le_bytes(info[48..56].try_into().unwrap());
+    let masks=[8,12,16].map(|at|u32::from_le_bytes(info[at..at+4].try_into().unwrap()));
     let mut state=[0u8;64];
-    if call(37,0,state.as_mut_ptr() as u64)!=0{exit(248);}
+    if epoch==0||call(37,0,state.as_mut_ptr() as u64)!=0{exit(248);}
     let Some(mut manager)=desktop_window::Manager::new(&state)else{exit(249);};
-    suite_send(1,b"COMPOSITOR");write(b"desktop compositor PID4 ready");
-    let mut snapshots_verified = false;
+    if info[..4]!=state[8..12]{exit(249);}
+    write(b"desktop compositor PID4 ready");
+    let mut snapshots_verified=false;let mut ready=false;
+    if old_epoch!=0{
+        if info[20]&1!=0{manager.quarantine_pointer();}
+        let (width,height)=manager.dimensions();
+        let mut stale=frame_packet(width,height,old_token,old_epoch,sequence);
+        if old_token==0||call(37,6,stale.as_mut_ptr() as u64)!=u64::MAX||
+           call(37,7,stale.as_mut_ptr() as u64)!=u64::MAX{exit(251);}
+        // The interrupted request may have been the next uncommitted
+        // sequence. Replay its real token/epoch with that sequence too.
+        let Some(pending_sequence)=sequence.checked_add(1)else{exit(251);};
+        stale[48..56].copy_from_slice(&pending_sequence.to_le_bytes());
+        if call(37,7,stale.as_mut_ptr() as u64)!=u64::MAX{exit(251);}
+        // A genuinely current token with an old epoch must fail, while the
+        // same abort with the current epoch succeeds. This distinguishes
+        // generation rejection from an intrinsically invalid request.
+        let mut fresh=frame_packet(width,height,0,epoch,sequence);
+        fresh[64..].copy_from_slice(&manager.wire());
+        if call(37,4,fresh.as_mut_ptr() as u64)!=0{exit(251);}
+        let fresh_token=u64::from_le_bytes(fresh[16..24].try_into().unwrap());
+        let mut wrong=frame_packet(width,height,fresh_token,old_epoch,sequence);
+        if call(37,7,wrong.as_mut_ptr() as u64)!=u64::MAX{exit(251);}
+        wrong[24..32].copy_from_slice(&epoch.to_le_bytes());
+        if call(37,7,wrong.as_mut_ptr() as u64)!=0{exit(251);}
+        write(b"desktop PID4 stale frame authority denied");
+        if !verify_client_snapshots(&manager){exit(251);}
+        snapshots_verified=true;
+        write(b"desktop PID4 composed a private row from committed client snapshots");
+        if !present_desktop_frame(&manager,epoch,sequence,masks)||call(38,2,epoch)!=0{exit(251);}
+        ready=true;
+        let mut hello=[0u8;19];hello[..10].copy_from_slice(b"COMPOSITOR");
+        hello[10..18].copy_from_slice(&sequence.to_le_bytes());hello[18]=manager.front();suite_send(1,&hello);
+    }else{suite_send(1,b"COMPOSITOR");}
+    let mut order=desktop_window::FrameOrder::new(sequence);
     loop{
-        let mut request=[0u8;72];let len=desktop_receive(1,&mut request);
-        if &request[8..8+len]==b"EXIT"{
-            suite_send(1,b"STOPPED");
-            // Let the waiting broker receive its acknowledgement before the
-            // router revokes all outbound messages on process termination.
-            yield_now();write(b"desktop compositor PID4 stopped");exit(0);
+        let mut request=[0u8;72];let len=desktop_receive(1,&mut request);let message=&request[8..8+len];
+        if message==b"EXIT"{
+            #[cfg(feature="test-desktop-shutdown-stall")]
+            {write(b"desktop shutdown fixture withholding STOPPED");loop{yield_now();}}
+            #[cfg(not(feature="test-desktop-shutdown-stall"))]
+            {suite_send(1,b"STOPPED");yield_now();write(b"desktop compositor PID4 stopped");exit(0);}
         }
-        if manager.control(&request[8..8+len]).is_none(){exit(250);}
-        if !snapshots_verified {
-            if !verify_client_snapshots(&manager) { exit(251); }
-            snapshots_verified = true;
-            write(b"desktop PID4 composed a private row from committed client snapshots");
+        if !(11..=15).contains(&len)||message[0]!=b'S'{exit(250);}
+        let next=u64::from_le_bytes(message[1..9].try_into().unwrap());
+        let Some(delivery)=order.classify(next)else{exit(250);};
+        if delivery==desktop_window::Delivery::Next{
+            let mut desired=manager.clone();if desired.control(&message[9..]).is_none(){exit(250);}
+            if !snapshots_verified{
+                if !verify_client_snapshots(&desired){exit(251);}
+                snapshots_verified=true;write(b"desktop PID4 composed a private row from committed client snapshots");
+            }
+            if !present_desktop_frame(&desired,epoch,next,masks){exit(251);}
+            if !order.publish(next){exit(251);}
+            manager=desired;
+            if !ready{if call(38,2,epoch)!=0{exit(251);}ready=true;}
         }
-        let state=manager.wire();
-        if call(37,1,state.as_ptr() as u64)!=0{exit(251);}
-        suite_send(1,&[b'A',manager.front()]);
+        let mut ack=[0u8;10];ack[0]=b'A';ack[1..9].copy_from_slice(&next.to_le_bytes());ack[9]=manager.front();
+        suite_send(1,&ack);
     }
 }
+
 // R031.1: automatic boot-to-desktop QEMU session, real ring-3 PID1
 // system-service policy. PID2 Files and PID3 Terminal are independent ELF
 // images, never framebuffer-mapped; all chrome changes are capability checked.
@@ -1573,6 +1756,7 @@ fn r031_shell()->!{
             let previous=front;
             front=desktop_control(&[b'M',pointer as u8,(pointer>>8) as u8,
                 (pointer>>16) as u8,(pointer>>24) as u8,(pointer>>32) as u8]);
+            desktop_pointer_ack(pointer);
             if front!=previous{
                 write(if front==1{b"desktop physical focus: Files"}
                       else{b"desktop physical focus: Terminal"});
