@@ -186,15 +186,41 @@ std::thread_local! {
     static HOST: core::cell::RefCell<(Heap, fixture::Memory)> =
         const { core::cell::RefCell::new((Heap::new(), fixture::Memory::new())) };
 }
-fn with_heap<R>(f: impl FnOnce(&mut Heap, &mut dyn Backend) -> R) -> R {
+#[cfg(not(test))]
+static HEAP_GATE:crate::retirement_gate::RetirementGate=crate::retirement_gate::RetirementGate::new();
+#[cfg(test)]
+std::thread_local!{static HEAP_GATE:crate::retirement_gate::RetirementGate=
+    const{crate::retirement_gate::RetirementGate::new()};}
+fn guarded<R>(gate:&crate::retirement_gate::RetirementGate,cpu:u32,masked:bool,
+    f:impl FnOnce()->R)->Result<R,Error>{
+    let _permit=gate.try_enter(cpu,masked).map_err(|_|Error::Owner)?;
+    Ok(f())
+}
+/// Bind once during normal boot, before any GUI or user image can allocate.
+/// A later caller cannot rebind the allocator to an application processor.
+pub(crate) fn initialize()->bool{
     #[cfg(not(test))]
-    { let mut physical = crate::kernel_buffer::Physical;
-      unsafe { f(&mut *core::ptr::addr_of_mut!(HEAP), &mut physical) } }
+    {HEAP_GATE.register_bsp(crate::user_runtime::r120_cpu_id(),crate::kernel_buffer::masked()).is_ok()}
     #[cfg(test)]
-    { HOST.with(|state| {
-        let mut state = state.borrow_mut(); let (heap, memory) = &mut *state;
-        f(heap, memory)
-    }) }
+    {HEAP_GATE.with(|gate|gate.register_bsp(0,true).is_ok())}
+}
+pub(crate) fn admission_available()->bool{
+    #[cfg(not(test))]
+    {guarded(&HEAP_GATE,crate::user_runtime::r120_cpu_id(),crate::kernel_buffer::masked(),||()).is_ok()}
+    #[cfg(test)]
+    {initialize()&&HEAP_GATE.with(|gate|guarded(gate,0,true,||()).is_ok())}
+}
+fn with_heap<R>(f: impl FnOnce(&mut Heap, &mut dyn Backend) -> R) -> Result<R,Error> {
+    #[cfg(not(test))]
+    {guarded(&HEAP_GATE,crate::user_runtime::r120_cpu_id(),crate::kernel_buffer::masked(),||{
+        let mut physical=crate::kernel_buffer::Physical;
+        // The exact live heap gate permit precedes creation of this reference.
+        unsafe{f(&mut *core::ptr::addr_of_mut!(HEAP),&mut physical)}
+    })}
+    #[cfg(test)]
+    {initialize();HEAP_GATE.with(|gate|guarded(gate,0,true,||HOST.with(|state|{
+        let mut state=state.borrow_mut();let(heap,memory)=&mut *state;f(heap,memory)
+    })))}
 }
 
 /// Unique allocation lease. Raw-pointer marker prevents cross-thread transfer;
@@ -212,7 +238,7 @@ impl Allocation {
     }
     pub(crate) fn note_shared_backing(&self) {
         if !crate::kernel_buffer::masked(){return;}
-        if self.token.is_some_and(|token|with_heap(|heap,_|heap.note_sharing(token))) {
+        if self.token.is_some_and(|token|with_heap(|heap,_|heap.note_sharing(token)).unwrap_or(false)) {
             #[cfg(not(test))]
             unsafe {
                 unsafe extern "C" {fn serial_write(message:*const core::ffi::c_char);}
@@ -230,7 +256,7 @@ impl Allocation {
     pub(crate) fn release(mut self) -> Result<(), Error> {
         if !crate::kernel_buffer::masked() { return Err(Error::Owner); }
         let token = self.token.take().ok_or(Error::Stale)?;
-        with_heap(|heap, backend| heap.release(token, backend))
+        with_heap(|heap, backend| heap.release(token, backend))?
     }
 }
 impl Drop for Allocation {
@@ -250,7 +276,7 @@ pub(crate) fn try_allocate(owner: Owner, layout: Layout) -> Result<Allocation, E
         let result=heap.allocate_recovering(owner,layout,backend)
             .map(|(token,pointer)|(token,pointer,heap.slots[token.slot].extent));
         (result,heap.snapshot(owner),heap.report_due,heap.pressure.recovered>before)
-    });
+    })?;
     if report{report_pressure(snapshot);}
     if recovered{
         #[cfg(not(test))]
@@ -293,7 +319,7 @@ fn report_pressure(snapshot:Snapshot){
 fn report_pressure(_:Snapshot){}
 
 pub(crate) fn reclaim_retired() -> bool {
-    crate::kernel_buffer::masked() && with_heap(|heap, backend| heap.reclaim(backend))
+    with_heap(|heap, backend| heap.reclaim(backend)).unwrap_or(false)
 }
 #[cfg(test)]
 pub(crate) fn fail_allocation(fail: bool) { HOST.with(|state| state.borrow_mut().1.oom = fail); }
@@ -527,6 +553,28 @@ mod tests {
         heap.pressure.requests=u64::MAX;heap.pressure.attempts=u64::MAX;heap.pressure.failures=u64::MAX;
         assert!(heap.allocate_recovering(Owner::Scratch(31),layout(0),&mut memory).is_err());
         assert_eq!((heap.pressure.requests,heap.pressure.attempts,heap.pressure.failures),(u64::MAX,u64::MAX,u64::MAX));
+    }
+    #[test] fn admission_denial_never_executes_heap_or_backend_access() {
+        use crate::retirement_gate::RetirementGate;
+        let gate=RetirementGate::new();let called=core::cell::Cell::new(false);
+        assert_eq!(guarded(&gate,5,true,||called.set(true)),Err(Error::Owner));
+        gate.register_bsp(5,true).unwrap();
+        for (cpu,masked) in [(6,true),(5,false)]{
+            assert_eq!(guarded(&gate,cpu,masked,||called.set(true)),Err(Error::Owner));
+        }
+        let held=gate.try_enter(5,true).unwrap();
+        assert_eq!(guarded(&gate,5,true,||called.set(true)),Err(Error::Owner));
+        assert!(!called.get());drop(held);
+        assert_eq!(guarded(&gate,5,true,||called.set(true)),Ok(()));assert!(called.get());
+    }
+    #[test] fn nested_production_heap_entry_is_rejected_before_refcell_borrow() {
+        let nested=with_heap(|heap,_|{
+            let before=heap.pressure;
+            let denied=with_heap(|_,_|panic!("reentrant heap access"));
+            assert_eq!(heap.pressure,before);denied
+        });
+        assert_eq!(nested,Ok(Err::<(),_>(Error::Owner)));
+        assert!(admission_available());
     }
     #[test] fn byte_sized_layout_cannot_resize_over_a_shared_neighbor() {
         let mut tiny = try_allocate(Owner::Scratch(76), Layout::from_size_align(1,1).unwrap()).unwrap();

@@ -864,6 +864,13 @@ class NormalDesktopControls(unittest.TestCase):
         with self.assertRaises(AssertionError):
             harness.verify_transient_restart(premature, since)
 
+    def test_compositor_recovery_cannot_reinitialize_heap_cpu_admission(self):
+        trace, since = self.transient_trace()
+        marker = harness.COMPOSITOR_PREPARED + b"\n"
+        restarted = trace.replace(marker, b"IndianOS: kernel heap BSP admission ready\n" + marker)
+        with self.assertRaises(AssertionError):
+            harness.verify_transient_restart(restarted, since)
+
     def test_transient_restart_accepts_fresh_execution_and_later_clean_reap(self):
         trace, since = self.transient_trace()
         harness.verify_transient_restart(trace, since)

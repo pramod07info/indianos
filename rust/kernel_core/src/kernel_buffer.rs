@@ -147,7 +147,7 @@ fn with_slot<R>(row: bool, f: impl FnOnce(&mut Option<crate::kernel_heap::Alloca
         else { FRAME.with(|slot| f(&mut **slot.borrow_mut())) } }
 }
 pub(crate) fn prepare_frame(owner: u64, width: u16, height: u16) -> bool {
-    if !masked() { return false; }
+    if !crate::kernel_heap::admission_available() { return false; }
     let Some(bytes) = frame_bytes(width, height) else { return false; };
     with_slot(false, |slot| {
         let owner = crate::kernel_heap::Owner::Frame(owner);
@@ -169,7 +169,7 @@ pub(crate) fn with_frame<R>(f: impl FnOnce(&mut [u32]) -> R) -> R {
 /// Private syscall-copy scratch is a distinct owner and never aliases staging.
 /// Reused across rows; both allocations retire with the compositor epoch.
 pub(crate) fn with_row<R>(epoch: u64, f: impl FnOnce(&mut [u32]) -> R) -> Option<R> {
-    if !masked() { return None; }
+    if !crate::kernel_heap::admission_available() { return None; }
     with_slot(true, |slot| {
         let owner = crate::kernel_heap::Owner::Scratch(epoch);
         if slot.as_ref().is_some_and(|buffer| buffer.owner() != owner) { return None; }
@@ -182,7 +182,7 @@ pub(crate) fn with_row<R>(epoch: u64, f: impl FnOnce(&mut [u32]) -> R) -> Option
     })
 }
 pub(crate) fn release_frame() -> bool {
-    if !masked() { return false; }
+    if !crate::kernel_heap::admission_available() { return false; }
     let frame = with_slot(false, |slot| match slot.take() {
         Some(buffer) => {
             let ok = buffer.release().is_ok();

@@ -179,3 +179,28 @@ stale-token rejection, counter saturation and alternating-error report bounds.
 They use a separate host failure backend and do not prove live guest OOM or
 physical memory-pressure acceptance. No local builds/tests/QEMU run; exact-head
 GitHub checks remain required before owner merge.
+
+## Enforced heap CPU admission
+
+Normal boot binds an independent heap instance of the existing non-spinning
+`RetirementGate` immediately after PMM self-test. It reuses the existing x2APIC/
+CPUID identity helper; no second CPU discovery or locking implementation exists.
+Every production heap metadata/backend access acquires that exact gate before
+creating its mutable reference. Unbound, wrong-CPU, IRQ-enabled and nested entry
+are rejected. The permit releases on return; there is no spin while an interrupted
+owner holds the gate. Rebinding to another CPU is refused. Frame/scratch creation
+and retirement check admission before accessing their retained lease cells.
+
+Admissions rejected before table access cannot safely increment heap counters or
+read a diagnostic snapshot; they return an ownership/admission error directly.
+A lease released outside its supported admission context keeps tracked ownership
+rather than touching PMM unsafely. Supported allocation/free callers stay on the
+registered BSP with IRQs masked; this is enforced serialization, not an SMP
+allocator, per-CPU cache or support for allocating in an IRQ handler.
+
+Host negative controls use the same guard wrapper to prove that wrong-core,
+IRQ-enabled, unbound and reentrant calls do not execute their protected closure.
+Nested entry through the real heap adapter is refused before touching the host
+RefCell. The normal-desktop QEMU harness requires the boot admission receipt and
+rejects reinitializing it during compositor-only recovery. Physical multicore
+qualification and broader concurrent PMM use remain separate requirements.

@@ -529,6 +529,12 @@ pub extern "C" fn kmain()->!{
     need(unsafe{pmm_self_test()},
          b"IndianOS: FATAL physical memory self-test failed\n\0");
     log(b"IndianOS: physical memory manager ready\n\0");
+    #[cfg(feature="normal-desktop")]
+    {
+        need(crate::kernel_heap::initialize(),
+            b"IndianOS: FATAL kernel heap CPU admission failed\n\0");
+        log(b"IndianOS: kernel heap BSP admission ready\n\0");
+    }
     #[cfg(feature="test-r114-epoch")]
     {
         // QEMU-exclusive disposable 64-sector primary-master image, seeded

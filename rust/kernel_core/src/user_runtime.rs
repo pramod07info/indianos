@@ -257,7 +257,7 @@ static mut R120_RETIREMENT:crate::process_retirement_txn::ProcessRetirement<2,2,
 static R120_GATE:crate::retirement_gate::RetirementGate=
     crate::retirement_gate::RetirementGate::new();
 #[cfg(any(feature="test-r031-files-gui",feature="normal-desktop"))]
-fn r120_cpu_id()->u32{
+pub(crate) fn r120_cpu_id()->u32{
     // A host test thread can migrate; tests use a stable synthetic BSP ID
     // and separately verify wrong-core rejection with explicit IDs.
     #[cfg(test)]{0}
