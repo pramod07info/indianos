@@ -304,6 +304,8 @@ pub mod pixel_protocol;
 mod compositor_pixels;
 #[cfg(feature="normal-desktop")]
 mod kernel_buffer;
+#[cfg(feature="normal-desktop")]
+mod kernel_heap;
 /// R029.1 authenticated per-process window grants and bounded event queue.
 pub mod gui_broker;
 #[cfg(feature="test-r031-supervisor")]

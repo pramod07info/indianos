@@ -5,9 +5,9 @@ const PAGE: usize = 4096;
 pub(crate) const FRAME_QUOTA: usize = 1600 * 1600 * 4;
 
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Error { Geometry, Quota, OutOfMemory, Mapping, Release, Owner }
+pub(crate) enum Error { Geometry, Quota, OutOfMemory, Mapping, Release, Owner, Metadata, Alignment, Stale }
 
-fn allocation_size(bytes: usize, quota: usize) -> Result<(usize, u32), Error> {
+pub(crate) fn allocation_size(bytes: usize, quota: usize) -> Result<(usize, u32), Error> {
     if bytes == 0 { return Err(Error::Geometry); }
     let rounded = bytes.checked_add(PAGE - 1).ok_or(Error::Geometry)? & !(PAGE - 1);
     if rounded > quota { return Err(Error::Quota); }
@@ -17,12 +17,12 @@ fn allocation_size(bytes: usize, quota: usize) -> Result<(usize, u32), Error> {
 
 /// Backend owns the mapping until release succeeds. Allocation must return
 /// exclusive, u32-aligned, writable RAM covering every requested page.
-unsafe trait Backend {
+pub(crate) unsafe trait Backend {
     fn allocate(&mut self, pages: u32) -> Result<(u64, *mut u8), Error>;
     fn release(&mut self, physical: u64, pages: u32) -> bool;
 }
 
-struct Buffer {
+pub(crate) struct Buffer {
     physical: u64,
     pointer: *mut u8,
     pages: u32,
@@ -30,11 +30,13 @@ struct Buffer {
     owner: u64,
 }
 impl Buffer {
-    const fn new() -> Self {
+    pub(crate) fn charged(&self) -> usize { self.pages as usize * PAGE }
+    pub(crate) fn pointer(&self) -> *mut u8 { self.pointer }
+    pub(crate) const fn new() -> Self {
         Self { physical: 0, pointer: core::ptr::null_mut(), pages: 0, length: 0, owner: 0 }
     }
-    fn prepare(&mut self, owner: u64, bytes: usize, quota: usize,
-        backend: &mut impl Backend) -> Result<(), Error> {
+    pub(crate) fn prepare(&mut self, owner: u64, bytes: usize, quota: usize,
+        backend: &mut (impl Backend + ?Sized)) -> Result<(), Error> {
         if owner == 0 { return Err(Error::Owner); }
         let (_, pages) = allocation_size(bytes, quota)?;
         if self.pages != 0 {
@@ -51,7 +53,7 @@ impl Buffer {
         self.length = bytes; self.owner = owner;
         Ok(())
     }
-    fn clear(&mut self, backend: &mut impl Backend) -> Result<(), Error> {
+    pub(crate) fn clear(&mut self, backend: &mut (impl Backend + ?Sized)) -> Result<(), Error> {
         if self.pages == 0 { return Ok(()); }
         // Scrub before return to PMM. Retain ownership metadata on failure,
         // preventing a leak, double allocation or silent quota reset.
@@ -72,7 +74,7 @@ fn memory_log(message: &'static [u8]) {
 #[cfg(not(test))]
 static mut MAPPING_QUARANTINE: (u64, u32) = (0, 0);
 #[cfg(not(test))]
-struct Physical;
+pub(crate) struct Physical;
 #[cfg(not(test))]
 unsafe impl Backend for Physical {
     fn allocate(&mut self, pages: u32) -> Result<(u64, *mut u8), Error> {
@@ -89,7 +91,7 @@ unsafe impl Backend for Physical {
             Some(start as *mut u8)
         });
         if let Some(pointer) = pointer {
-            memory_log(b"IndianOS: kernel frame buffer allocated\n\0");
+            memory_log(b"IndianOS: kernel owned buffer pages allocated\n\0");
             return Ok((physical, pointer));
         }
         // Validated HHDM and managed frames make this unreachable, but undo a
@@ -101,45 +103,104 @@ unsafe impl Backend for Physical {
     }
     fn release(&mut self, physical: u64, pages: u32) -> bool {
         let released = unsafe { crate::pmm::release_buffer_frames(physical, pages) };
-        if released { memory_log(b"IndianOS: kernel frame buffer released\n\0"); }
+        if released { memory_log(b"IndianOS: kernel owned buffer pages released\n\0"); }
         released
     }
 }
 
-#[cfg(not(test))]
-static mut FRAME: Buffer = Buffer::new();
-/// All three entry points are confined to the serialized GUI broker. No raw
-/// reference escapes; retirement cannot free a buffer while it is borrowed.
 fn frame_bytes(width: u16, height: u16) -> Option<usize> {
     if width == 0 || height == 0 || width > 1600 || height > 1600 { return None; }
     Some(usize::from(width) * usize::from(height) * 4)
 }
 #[cfg(not(test))]
-fn masked() -> bool {
+pub(crate) fn masked() -> bool {
     let flags: u64;
     unsafe { core::arch::asm!("pushfq; pop {}", out(reg) flags, options(preserves_flags)); }
     flags & (1 << 9) == 0
 }
+#[cfg(test)]
+pub(crate) fn masked() -> bool { true }
+#[cfg(test)]
+fn memory_log(_: &'static [u8]) {}
+
 #[cfg(not(test))]
+static mut FRAME: Option<crate::kernel_heap::Allocation> = None;
+#[cfg(not(test))]
+static mut ROW: Option<crate::kernel_heap::Allocation> = None;
+#[cfg(test)]
+std::thread_local! {
+    // Test service fixtures may intentionally leave a live session. HOST owns
+    // all fixture RAM; suppress cross-TLS Drop ordering, not explicit release.
+    static FRAME: core::cell::RefCell<core::mem::ManuallyDrop<Option<crate::kernel_heap::Allocation>>> =
+        const { core::cell::RefCell::new(core::mem::ManuallyDrop::new(None)) };
+    static ROW: core::cell::RefCell<core::mem::ManuallyDrop<Option<crate::kernel_heap::Allocation>>> =
+        const { core::cell::RefCell::new(core::mem::ManuallyDrop::new(None)) };
+}
+// Separate cells permit copying a scratch row into staging without aliasing
+// either allocation's exclusive borrow. Neither callback borrows heap metadata.
+fn with_slot<R>(row: bool, f: impl FnOnce(&mut Option<crate::kernel_heap::Allocation>) -> R) -> R {
+    #[cfg(not(test))]
+    unsafe { if row { f(&mut *core::ptr::addr_of_mut!(ROW)) }
+        else { f(&mut *core::ptr::addr_of_mut!(FRAME)) } }
+    #[cfg(test)]
+    { if row { ROW.with(|slot| f(&mut **slot.borrow_mut())) }
+        else { FRAME.with(|slot| f(&mut **slot.borrow_mut())) } }
+}
 pub(crate) fn prepare_frame(owner: u64, width: u16, height: u16) -> bool {
     if !masked() { return false; }
     let Some(bytes) = frame_bytes(width, height) else { return false; };
-    unsafe { (&mut *core::ptr::addr_of_mut!(FRAME)).prepare(owner, bytes, FRAME_QUOTA, &mut Physical).is_ok() }
+    with_slot(false, |slot| {
+        let owner = crate::kernel_heap::Owner::Frame(owner);
+        if let Some(buffer) = slot.as_mut() {
+            if buffer.owner() != owner { return false; }
+            if buffer.resize_within_pages(bytes) { return true; }
+        }
+        if let Some(buffer) = slot.take() { if buffer.release().is_err() { return false; } }
+        let Ok(layout) = core::alloc::Layout::from_size_align(bytes, 4) else { return false; };
+        let Ok(buffer) = crate::kernel_heap::try_allocate(owner, layout) else { return false; };
+        *slot = Some(buffer);
+        memory_log(b"IndianOS: kernel frame buffer allocated\n\0");
+        true
+    })
 }
-#[cfg(not(test))]
 pub(crate) fn with_frame<R>(f: impl FnOnce(&mut [u32]) -> R) -> R {
-    unsafe {
-        let buffer = &mut *core::ptr::addr_of_mut!(FRAME);
-        // Only called after a successful prepare_frame, while a transaction
-        // owns the buffer. The service clears pending before releasing it.
-        f(core::slice::from_raw_parts_mut(buffer.pointer.cast(), buffer.length / 4))
-    }
+    with_slot(false, |slot| f(slot.as_mut().expect("active frame owns staging").words()))
 }
-#[cfg(not(test))]
+/// Private syscall-copy scratch is a distinct owner and never aliases staging.
+/// Reused across rows; both allocations retire with the compositor epoch.
+pub(crate) fn with_row<R>(epoch: u64, f: impl FnOnce(&mut [u32]) -> R) -> Option<R> {
+    if !masked() { return None; }
+    with_slot(true, |slot| {
+        let owner = crate::kernel_heap::Owner::Scratch(epoch);
+        if slot.as_ref().is_some_and(|buffer| buffer.owner() != owner) { return None; }
+        if slot.is_none() {
+            *slot = Some(crate::kernel_heap::try_allocate(owner,
+                core::alloc::Layout::from_size_align(1600 * 4, 4).ok()?).ok()?);
+            memory_log(b"IndianOS: kernel compositor scratch allocated\n\0");
+        }
+        Some(f(slot.as_mut()?.words()))
+    })
+}
 pub(crate) fn release_frame() -> bool {
     if !masked() { return false; }
-    unsafe { (&mut *core::ptr::addr_of_mut!(FRAME)).clear(&mut Physical).is_ok() }
+    let frame = with_slot(false, |slot| match slot.take() {
+        Some(buffer) => {
+            let ok = buffer.release().is_ok();
+            if ok { memory_log(b"IndianOS: kernel frame buffer released\n\0"); }
+            ok
+        }, None => true,
+    });
+    let row = with_slot(true, |slot| match slot.take() {
+        Some(buffer) => {
+            let ok = buffer.release().is_ok();
+            if ok { memory_log(b"IndianOS: kernel compositor scratch released\n\0"); }
+            ok
+        }, None => true,
+    });
+    crate::kernel_heap::reclaim_retired() && frame && row
 }
+#[cfg(test)]
+pub(crate) fn fail_allocation(fail: bool) { crate::kernel_heap::fail_allocation(fail); }
 
 #[cfg(test)]
 mod tests {
@@ -205,43 +266,37 @@ mod tests {
     }
 }
 
-// Host-only physical-memory fixture. The same Buffer ownership, quota,
-// allocation failure and release code runs under the GUI protocol tests.
+
 #[cfg(test)]
-std::thread_local! {
-    static HOST: core::cell::RefCell<(Buffer, tests::Memory)> = {
-        let mut memory = tests::Memory::new();
-        memory.bytes.resize(FRAME_QUOTA / 8, 0);
-        core::cell::RefCell::new((Buffer::new(), memory))
-    };
-}
-#[cfg(test)]
-pub(crate) fn prepare_frame(owner: u64, width: u16, height: u16) -> bool {
-    let Some(bytes) = frame_bytes(width, height) else { return false; };
-    HOST.with(|state| {
-        let mut state = state.borrow_mut();
-        let (buffer, memory) = &mut *state;
-        buffer.prepare(owner, bytes, FRAME_QUOTA, memory).is_ok()
-    })
-}
-#[cfg(test)]
-pub(crate) fn with_frame<R>(f: impl FnOnce(&mut [u32]) -> R) -> R {
-    HOST.with(|state| {
-        let mut state = state.borrow_mut();
-        let buffer = &mut state.0;
-        assert!(buffer.pages != 0);
-        unsafe { f(core::slice::from_raw_parts_mut(buffer.pointer.cast(), buffer.length / 4)) }
-    })
-}
-#[cfg(test)]
-pub(crate) fn release_frame() -> bool {
-    HOST.with(|state| {
-        let mut state = state.borrow_mut();
-        let (buffer, memory) = &mut *state;
-        buffer.clear(memory).is_ok()
-    })
-}
-#[cfg(test)]
-pub(crate) fn fail_allocation(fail: bool) {
-    HOST.with(|state| state.borrow_mut().1.oom = fail);
+mod heap_consumer_tests {
+    use super::*;
+    #[test] fn maximum_frame_and_scratch_have_separate_quotas_and_storage() {
+        assert!(release_frame()); fail_allocation(false);
+        assert!(prepare_frame(41,1600,1600));
+        with_frame(|frame| { frame[0]=0x123456; frame[1600*1600-1]=0x654321; });
+        assert_eq!(with_row(41,|row| {
+            assert_eq!(row.len(),1600); assert!(row.iter().all(|p| *p==0));
+            row.fill(0xabcdef);
+            with_frame(|frame| assert_eq!((frame[0],frame[1600*1600-1]),(0x123456,0x654321)));
+            row[0]
+        }),Some(0xabcdef));
+        assert!(with_row(42,|_|()).is_none());
+        assert!(!prepare_frame(42,1600,1600));
+        assert!(release_frame());
+        assert!(prepare_frame(42,640,480));
+        assert_eq!(with_row(42,|row|row[0]),Some(0));
+        assert!(release_frame());
+    }
+    #[test] fn scratch_oom_preserves_committed_staging_and_allows_later_retry() {
+        assert!(release_frame()); fail_allocation(false);
+        assert!(prepare_frame(5,640,480)); with_frame(|pixels|pixels[0]=0x123456);
+        fail_allocation(true);
+        assert!(with_row(5,|_|panic!("OOM exposed scratch")).is_none());
+        with_frame(|pixels|assert_eq!(pixels[0],0x123456));
+        fail_allocation(false);
+        assert!(with_row(5,|row|row[0]=0xff).is_some());
+        fail_allocation(true); // Subsequent rows reuse the owned allocation.
+        assert_eq!(with_row(5,|row|row[0]),Some(0xff));
+        fail_allocation(false); assert!(release_frame());
+    }
 }
