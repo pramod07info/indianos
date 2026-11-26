@@ -35,6 +35,7 @@ pub(crate) unsafe trait Backend {
 }
 
 pub(crate) struct Buffer {
+    retiring:bool,
     backing:u64,
     physical: u64,
     pointer: *mut u8,
@@ -48,7 +49,7 @@ impl Buffer {
     pub(crate) fn physical(&self) -> u64 { self.physical }
     pub(crate) fn backing(&self) -> u64 { self.backing }
     pub(crate) const fn new() -> Self {
-        Self { backing:0,physical: 0, pointer: core::ptr::null_mut(), pages: 0, length: 0, owner: 0 }
+        Self { retiring:false,backing:0,physical: 0, pointer: core::ptr::null_mut(), pages: 0, length: 0, owner: 0 }
     }
     pub(crate) fn prepare(&mut self, owner: u64, bytes: usize, quota: usize,
         backend: &mut (impl Backend + ?Sized)) -> Result<(), Error> {
@@ -56,7 +57,7 @@ impl Buffer {
         let (_, pages) = allocation_size(bytes, quota)?;
         if self.pages != 0 {
             if self.owner != owner { return Err(Error::Owner); }
-            if self.pages == pages { self.length = bytes; return Ok(()); }
+            if self.pages == pages && !self.retiring { self.length = bytes; return Ok(()); }
             // Staging is unpublished. Release it before resizing so the owner
             // can never exceed quota through simultaneous old/new buffers.
             self.clear(backend)?;
@@ -72,6 +73,9 @@ impl Buffer {
         if self.pages == 0 { return Ok(()); }
         // Scrub before return to PMM. Retain ownership metadata on failure,
         // preventing a leak, double allocation or silent quota reset.
+        // A backend may already have unmapped the span when release fails.
+        // Keep ownership for cleanup, but never authorize reuse of that span.
+        self.retiring=true;
         if !unsafe{backend.discard(self.backing,self.pages,self.pointer)}{return Err(Error::Release);}
         *self = Self::new();
         Ok(())
@@ -256,6 +260,20 @@ mod tests {
         memory.oom = true;
         assert_eq!(buffer.prepare(1, PAGE * 2, PAGE * 4, &mut memory), Err(Error::OutOfMemory));
         assert_eq!(buffer.pages, 0); assert!(!memory.busy);
+    }
+    #[test] fn pending_release_cannot_be_reused_by_same_size_prepare() {
+        let mut memory=Memory::new();let mut buffer=Buffer::new();
+        buffer.prepare(7,PAGE,PAGE,&mut memory).unwrap();
+        memory.fail_release=true;
+        assert_eq!(buffer.clear(&mut memory),Err(Error::Release));
+        assert!(buffer.retiring);
+        assert_eq!(buffer.prepare(7,PAGE,PAGE,&mut memory),Err(Error::Release));
+        assert_eq!(buffer.owner,7);assert!(memory.busy);
+        assert_eq!(buffer.prepare(8,PAGE,PAGE,&mut memory),Err(Error::Owner));
+        memory.fail_release=false;
+        buffer.prepare(7,PAGE,PAGE,&mut memory).unwrap();
+        assert!(!buffer.retiring);assert!(memory.bytes.iter().all(|&v|v==0));
+        buffer.clear(&mut memory).unwrap();
     }
 }
 

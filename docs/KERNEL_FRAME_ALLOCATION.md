@@ -449,3 +449,13 @@ GitHub exact-head results are required before acceptance. This remains a BSP-onl
 allocator under the existing heap admission gate. Cross-CPU shootdowns, PCID
 no-flush reuse, broader kernel consumers, total process RSS quotas and system-wide
 OOM policy remain outside this implementation. No milestone is newly accepted.
+
+### Retiring buffers cannot be reused
+
+Buffer marks retirement before invoking the backend discard operation. If the
+backend unmaps a span and then refuses a physical release, the old owner and
+charge remain for cleanup, but even a same-size prepare must first finish that
+cleanup. Successful cleanup resets the state before a fresh allocation. Foreign
+owners remain rejected. A host regression covers refusal, same-size and foreign
+owner requests, then successful cleanup and reallocation. It is added for GitHub
+execution; no local build or test was run.
