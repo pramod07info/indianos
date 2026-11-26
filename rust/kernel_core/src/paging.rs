@@ -140,6 +140,26 @@ unsafe fn clone_level(
     }
     Some(phys)
 }
+/// Read-only preflight matching clone_level's table ownership, including the
+/// fresh root but excluding borrowed huge/data leaves. No allocation callback.
+/// # Safety: backend access maps immutable source tables for this bounded walk.
+pub(crate) unsafe fn required_table_frames(b:&Backend,source:u64,kernel_only:bool)->Option<u32>{
+    unsafe fn walk(b:&Backend,source:u64,level:u8,kernel_only:bool,count:&mut u32)->Option<()>{
+        if !valid_frame(source)||!(1..=4).contains(&level){return None;}
+        *count=count.checked_add(1)?;if *count>CLONE_LIMIT{return None;}
+        let table=unsafe{at(b,source)};if table.is_null(){return None;}
+        for index in 0..TABLE_ENTRIES{
+            if kernel_only&&level==4&&index<256{continue;}
+            let entry=unsafe{ptr::read(table.add(index))};
+            if level==4&&entry&(PRESENT|HUGE)==(PRESENT|HUGE){return None;}
+            if child(entry,level){unsafe{walk(b,entry&PHYS,level-1,kernel_only,count)}?;}
+        }
+        Some(())
+    }
+    if !backend_valid(b){return None;}
+    let mut count=0;unsafe{walk(b,source,4,kernel_only,&mut count)}?;Some(count)
+}
+
 unsafe fn clone_root(
     backend: *const Backend, original: u64, result: *mut CloneResult,
     kernel_only: bool,
@@ -486,6 +506,25 @@ mod kernel_guard_tests{
   let(mut physical,mut flags)=(0,0);
   unsafe{paging_lookup(b,0x1000,va,&mut physical,&mut flags)}
     .then_some((physical,flags))
+ }
+ #[test]fn table_budget_preflight_matches_clone_without_consuming_frames(){
+  let mut memory=Memory::huge(2,2|NX);let backend=memory.backend();
+  assert_eq!(unsafe{required_table_frames(&backend,0x1000,true)},Some(3));
+  assert_eq!((memory.allocations,memory.releases),(0,0));
+  let mut cloned=CloneResult{root:0,table_count:0};
+  assert!(unsafe{paging_clone_kernel_half(&backend,0x1000,&mut cloned)});
+  assert_eq!(cloned.table_count,3);
+  assert!(unsafe{paging_clone_release(&backend,&mut cloned)});
+ }
+ #[test]fn table_budget_rejects_unreadable_or_malformed_kernel_tables_without_allocating(){
+  let mut memory=Memory::huge(3,2|NX);memory.deny_access=0x2000;let backend=memory.backend();
+  assert_eq!(unsafe{required_table_frames(&backend,0x1000,true)},None);
+  memory.deny_access=0;memory.tables[0][256]|=HUGE;
+  assert_eq!(unsafe{required_table_frames(&backend,0x1000,true)},None);
+  memory.tables[0][256]&=!HUGE;memory.tables[0][0]=PRESENT|HUGE;
+  assert_eq!(unsafe{required_table_frames(&backend,0x1000,true)},Some(2));
+  assert_eq!(unsafe{required_table_frames(&backend,0x1000,false)},None);
+  assert_eq!((memory.allocations,memory.releases),(0,0));
  }
  #[test]fn kernel_stack_effective_rw_rejects_readonly_pml4_pdpt_pd_and_pt(){
   for (table,index) in [(0,256),(1,0),(2,1),(3,5)]{

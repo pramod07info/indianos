@@ -18,7 +18,8 @@ PR #825 contains the current follow-up; its required checks must pass before mer
 | Noncontiguous physical backing behind contiguous virtual arenas | Not implemented |
 | Broader kernel consumers/global Rust allocator integration | Not implemented |
 | Allocator operation across multiple CPUs and corresponding PMM synchronization | Not implemented |
-| Total process RSS accounting/quotas including page tables, sharing and growth | Not implemented |
+| Private launch footprint including image and kernel-clone tables | Implemented in #825: 512-frame admission and post-load consistency checks; guest acceptance pending |
+| Total process RSS accounting/quotas including sharing and growth | Not implemented |
 | System-wide OOM victim/recovery policy | Not implemented |
 | Current-head guest pressure injection, multicore/hardware pressure acceptance | Not verified |
 
@@ -301,3 +302,36 @@ rollback ownership with retryable teardown, rather than leaving the additive
 header unresolved in C builds. The shared C integration fixture also injects a
 refused access/release and verifies retained ownership followed by clean retry;
 it exercises both Rust and legacy C implementations in their existing CI targets.
+
+
+## Private process launch footprint, including page tables
+
+The normal desktop admits each process against a 512-frame private footprint
+before loader/clone allocation. `required_private_frames` reuses the ELF planner
+and counts data/BSS/stack frames plus the detached root and distinct PML4/PDPT/PD
+prefixes needed by its 4-KiB mappings. Pages sharing table prefixes are counted
+once; unmapped guard holes allocate no extra data. The existing 64/128 data-page
+policy is independently enforced.
+
+`paging::required_table_frames` performs a bounded read-only walk matching the
+existing kernel-half clone traversal, including its private root and child tables,
+but excluding borrowed data and huge leaves. It does not allocate, map, release,
+switch CR3 or change the clone ownership policy. Malformed/unreadable tables or
+excessive traversal fail admission. Checked addition combines this clone count
+with the detached-image footprint; over-budget processes are refused before any
+new image/clone frames are requested. After staging and cloning, actual image
+page count and table traversal plus CloneResult.table_count must match the
+preflight and fit the same budget before process readiness.
+
+The normal-desktop QEMU harness requires the PID1 receipt `IndianOS: desktop
+private frame budget 512 enforced` and forbids repeating it during compositor-only
+recovery. Host regressions check table-count/clone parity without allocation,
+unreadable/invalid entries, shared prefixes, guard-hole exclusion, exact budget
+bounds and overflow. No local build/test execution or guest pass is claimed.
+
+This is private launch-resource admission, not total RSS enforcement. Borrowed
+kernel data, shared mappings, service-owned heap arenas and runtime growth are
+separate resource domains. There is no general memory-growth syscall or shared
+memory lifecycle here; future implementations must charge those resources under
+an explicit policy. Noncontiguous backing, cross-CPU allocation and system-wide
+OOM/victim recovery remain unfinished requirements.

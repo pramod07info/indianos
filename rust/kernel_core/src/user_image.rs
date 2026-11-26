@@ -157,6 +157,35 @@ fn planned_pages(plan:&ProgramPlan,limit:u16)->Option<u64>{
     Some(requested)
 }
 
+/// Exact successful detached-image footprint: data/BSS/stack plus private
+/// four-level tables. Guard holes and ELF source bytes allocate no data pages.
+fn planned_private_frames(plan:&ProgramPlan,limit:u16)->Option<u64>{
+    let data=planned_pages(plan,limit)?;let mut frames=data.checked_add(1)?;
+    for shift in [21,30,39]{
+        let mut prefixes=[0u64;MAX_IMAGE_PAGES];let mut count=0;
+        for index in 0..=plan.segment_count as usize{
+            let (mut address,end)=if index==plan.segment_count as usize{(plan.stack_begin,plan.stack_end)}
+                else{(plan.segments[index].page_begin,plan.segments[index].page_end)};
+            while address<end{
+                let prefix=address>>shift;
+                if !prefixes[..count].contains(&prefix){
+                    if count==prefixes.len(){return None;}
+                    prefixes[count]=prefix;count+=1;frames=frames.checked_add(1)?;
+                }
+                address=address.checked_add(PAGE as u64)?;
+            }
+        }
+    }
+    Some(frames)
+}
+/// # Safety: ELF bytes obey the same readable bounds as the image loader.
+pub(crate) unsafe fn required_private_frames(elf:*const u8,size:usize,limit:u16)->Option<u64>{
+    let mut plan=ProgramPlan{entry:0,stack_begin:0,stack_end:0,guard_begin:0,
+        segment_count:0,segments:[ProgramSegment::empty();MAX_SEGMENTS]};
+    if !unsafe{indianos_program_plan_elf64(elf,size,&mut plan)}{return None;}
+    planned_private_frames(&plan,limit)
+}
+
 /// # Safety
 /// \`image\` points to initialized, exclusively owned kernel memory;
 /// \`backend\` contains trusted C function pointers, \`elf\` is readable
@@ -697,6 +726,18 @@ mod tests {
         plan.stack_end=0x510000;plan.segments[0].page_end=0x3ff000;
         assert_eq!(planned_pages(&plan,128),None);
         plan.segment_count=MAX_SEGMENTS as u32+1;assert_eq!(planned_pages(&plan,128),None);
+    }
+    #[test]fn private_frame_budget_counts_shared_prefixes_once_and_excludes_guard_holes(){
+        let mut plan=ProgramPlan{entry:0x400000,stack_begin:0x500000,stack_end:0x510000,
+            guard_begin:0x4ff000,segment_count:1,segments:[ProgramSegment::empty();MAX_SEGMENTS]};
+        plan.segments[0].page_begin=0x400000;plan.segments[0].page_end=0x404000;
+        // Twenty data pages; root plus one table at each child level.
+        assert_eq!(planned_private_frames(&plan,20),Some(24));
+        plan.stack_begin=0x800000;plan.stack_end=0x810000;plan.guard_begin=0x7ff000;
+        assert_eq!(planned_private_frames(&plan,20),Some(25));
+        plan.stack_begin=0x80000000;plan.stack_end=0x80010000;
+        assert_eq!(planned_private_frames(&plan,20),Some(26));
+        assert_eq!(planned_private_frames(&plan,19),None);
     }
     #[test]
     fn c_abi_and_user_copy_bounds() {

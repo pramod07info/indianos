@@ -2036,6 +2036,12 @@ fn task_ptr(i:usize)->*mut Task{
  unsafe{ptr::addr_of_mut!(M009_TASKS).cast::<Task>().add(i)}
 }
 #[cfg(feature="normal-desktop")]
+const DESKTOP_PRIVATE_FRAME_LIMIT:u64=512;
+#[cfg(feature="normal-desktop")]
+fn private_budget_admits(image:u64,kernel_tables:u32)->bool{
+    image.checked_add(u64::from(kernel_tables)).is_some_and(|total|total<=DESKTOP_PRIVATE_FRAME_LIMIT)
+}
+#[cfg(feature="normal-desktop")]
 fn desktop_image_page_limit(pid:u32)->Option<u16>{
     // PID1 is the broker/supervisor and has no application pixel canvas.
     match pid{1=>Some(64),2|3|4=>Some(128),_=>None}
@@ -2045,6 +2051,14 @@ fn prepare(t:*mut Task,p:*mut Process,elf:*const u8,size:usize,original:u64,
  let task=unsafe{&mut *t};
  if p.is_null(){return false;}
  task.pcb=p;task.authority_live=true;
+ #[cfg(feature="normal-desktop")]
+ let private_budget={
+  let Some(limit)=desktop_image_page_limit(unsafe{(*p).pid})else{return false;};
+  let Some(image)= (unsafe{crate::user_image::required_private_frames(elf,size,limit)})else{return false;};
+  let Some(kernel)= (unsafe{crate::paging::required_table_frames(b,original,true)})else{return false;};
+  if !private_budget_admits(image,kernel){return false;}
+  (image,kernel)
+ };
  if !unsafe{x86_64_user_interrupt_stack_select(slot as u32)}{return false;}
  #[cfg(feature="normal-desktop")]
  let loaded={
@@ -2059,6 +2073,14 @@ fn prepare(t:*mut Task,p:*mut Process,elf:*const u8,size:usize,original:u64,
  if !unsafe{paging_clone_kernel_half(b,original,&mut task.root)} ||
     !unsafe{paging_attach_user_half(b,task.root.root,task.image.tables.root_physical)}{return false;}
  task.attached=true;
+ #[cfg(feature="normal-desktop")]
+ {
+  let Some(image_tables)= (unsafe{crate::paging::required_table_frames(b,task.image.tables.root_physical,false)})else{return false;};
+  let actual=u64::from(task.image.page_count)+u64::from(image_tables);
+  if actual!=private_budget.0||task.root.table_count!=private_budget.1||
+     !private_budget_admits(actual,task.root.table_count){return false;}
+  if unsafe{(*p).pid}==1{log(b"IndianOS: desktop private frame budget 512 enforced\n\0");}
+ }
  let addresses=[
   x86_64_enter_user as usize as u64,
   x86_64_resume_user as usize as u64,
@@ -4193,6 +4215,11 @@ mod kernel_p0_batch27_w3_tests {
 
 #[cfg(all(test,feature="normal-desktop"))]
 mod desktop_image_budget_tests{
+    #[test]fn private_frame_budget_includes_tables_and_handles_overflow(){
+        assert!(super::private_budget_admits(384,128));
+        assert!(!super::private_budget_admits(384,129));
+        assert!(!super::private_budget_admits(u64::MAX,1));
+    }
     #[test]fn broker_budget_is_bounded_and_unknown_roles_are_not_admitted(){
         assert_eq!(super::desktop_image_page_limit(1),Some(64));
         for pid in 2..=4{assert_eq!(super::desktop_image_page_limit(pid),Some(128));}
