@@ -276,3 +276,47 @@ and selected shared-reader tests are reused; a new failed-barrier case proves
 writer revocation without charging a mutation. No local tests/builds were run.
 Exact-head GitHub/QEMU results and interruption/power-loss qualification remain
 necessary; this does not complete blocking locks, ACL administration or quotas.
+
+### Reserved-stack demand paging (P2-006)
+
+Normal desktop preparation now retains the top stack page and defers the other
+reserved stack leaves after the existing full-footprint quota check. Deferred
+slots retain their virtual addresses and remain charged in page_count and the
+original image/private-launch budget. They are reservations, not resident RSS.
+The stack must fit in one 2-MiB leaf-table span; its top resident leaf pins every
+intermediate table borrowed by the running process root. No active PML4 child
+can disappear during this conversion or during demand allocation.
+
+A recoverable user page fault must be vector 14, CS 0x2b, and exactly a user
+not-present read/write error (4 or 6). The active Task, running PCB, image pointer,
+authority and CR3 must agree under BSP/IRQ-disabled retirement admission. Only
+an owned deferred stack slot is eligible. A fresh PMM page is recorded before
+access, zeroed, installed user/RW/NX, then invalidated in the active CPU TLB.
+Protection, NX, guard, reserved-bit, foreign mapping and kernel faults retain
+termination behavior. Failed allocation never publishes a mapping. A refused
+rollback remains in a Task-owned physical frame receipt, retried before image
+or PCB reclamation; it cannot be mistaken for an app pixel guard.
+
+The raw exception entry now saves all 15 GPRs, supplies the unchanged vector/
+error/RIP/CS/RFLAGS context with ABI stack alignment, and restores registers and
+x87/SSE state only after successful recovery. It discards vector/error and clears
+only CPU-generated RF before IRET. Every unrecovered exception still takes the
+existing Rust terminal/fault isolation path. The legacy C implementation is
+unchanged; this is the normal Rust desktop path.
+
+Four image tests cover zeroed NX demand allocation and conserved quota/frames,
+guard/protection/foreign mapping refusal, OOM/failed rollback ownership, and
+failed initial deferral cleanup. Four host assembly oracles exercise the actual
+return stub with CLI/IRET substituted, including pointer/register/RF mutations.
+Those oracles do not claim hardware exception execution. The separate opt-in
+guest fixture explicitly reads one absent stack page and writes another for
+each of the four PIDs while x87/XMM state is live, then yields four times. Its
+harness requires actual kernel fault-recovery receipts before readiness plus
+the existing per-PID state-retention receipts. Existing normal desktop, guard,
+exception, reboot, persistence, input and recovery checks remain required.
+
+No local builds/tests/QEMU were run. Exact-head GitHub results are pending.
+This does not implement demand-mapped ELF segments, arbitrary heap/mmap growth,
+copy-on-write/shared-page refcounts, remote TLB invalidation or general fork.
+P2-006 and requested points 3, 5, 6, 8, 9 and 10 remain unfinished. No formal
+milestone or percentage changes.

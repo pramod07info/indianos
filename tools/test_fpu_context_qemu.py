@@ -20,6 +20,9 @@ def verify_context_proof(output: bytes) -> None:
         marker = f"IndianOS user: desktop PID{pid} x87 SSE context retained across yields".encode()
         if output.count(marker) != 1 or output.find(marker) >= ready:
             raise AssertionError(f"missing, duplicate or late PID{pid} FPU proof")
+        demand = f"IndianOS: PID {pid} DEMAND_STACK_PAGE_READY".encode()
+        if output[:ready].count(demand) < 2:
+            raise AssertionError(f"PID{pid} lacks actual read/write stack fault recovery")
 
 
 def main() -> None:
@@ -45,7 +48,7 @@ def main() -> None:
                 process.kill()
             process.wait(timeout=10)
             sock.close()
-    print("PASS: four distinct ring-3 x87/SSE contexts retained across four yields each")
+    print("PASS: four ring-3 x87/SSE contexts retained across demand faults and four yields each")
 
 
 if __name__ == "__main__":

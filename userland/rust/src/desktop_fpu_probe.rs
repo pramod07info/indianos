@@ -25,6 +25,13 @@ desktop_fpu_probe:
     fildq 8(%rsp)
     movq %rdi, %xmm0
     movq %rdi, %xmm15
+    /* Two actual absent-stack faults while x87/XMM state is live. */
+    movabsq $0x00007fffefff0000, %rax
+    cmpq $0, 4096(%rax)
+    jne 4f
+    movq %rdi, (%rax)
+    cmpq %rdi, (%rax)
+    jne 4f
     movl $4, 32(%rsp)
 2:
     movl $3, %eax

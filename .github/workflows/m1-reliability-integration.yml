@@ -154,6 +154,7 @@ jobs:
           cargo test --locked --offline --manifest-path rust/kernel_core/Cargo.toml --lib --features normal-desktop 2>&1 | tee build/normal-desktop-logs/host.log
           cargo check --locked --offline --manifest-path rust/kernel_core/Cargo.toml --no-default-features --target x86_64-unknown-none --features normal-desktop 2>&1 | tee build/normal-desktop-logs/no-std.log
           python3 -m unittest discover -s tests -p 'test_input_irq_return.py' -v 2>&1 | tee build/normal-desktop-logs/input-irq-return.log
+          python3 -m unittest discover -s tests -p 'test_demand_stack_return.py' -v 2>&1 | tee build/normal-desktop-logs/demand-stack-return.log
           python3 -m unittest discover -s tests -p 'test_normal_desktop_acceptance.py' -v 2>&1 | tee build/normal-desktop-logs/harness.log
           python3 -m unittest discover -s tests -p 'test_desktop_boot_profile.py' -v 2>&1 | tee build/normal-desktop-logs/profile.log
           rustc --edition=2021 --test userland/rust/tests/desktop_window.rs -o build/normal-desktop-logs/desktop-window-tests

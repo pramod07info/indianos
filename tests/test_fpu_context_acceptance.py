@@ -8,7 +8,11 @@ from test_fpu_context_qemu import READY, verify_context_proof
 
 class ContextEvidenceTests(unittest.TestCase):
     def proof(self):
-        return b"\n".join(
+        demand = b"\n".join(
+            f"IndianOS: PID {pid} DEMAND_STACK_PAGE_READY".encode()
+            for pid in range(1, 5) for _ in range(2)
+        ) + b"\n"
+        return demand + b"\n".join(
             f"IndianOS user: desktop PID{pid} x87 SSE context retained across yields".encode()
             for pid in range(1, 5)
         ) + b"\n" + READY.encode()
@@ -18,8 +22,9 @@ class ContextEvidenceTests(unittest.TestCase):
 
     def test_missing_duplicate_or_post_ready_proof_is_rejected(self):
         lines = self.proof().splitlines()
-        for payload in (b"\n".join(lines[1:]), self.proof() + b"\n" + lines[0],
-                        b"\n".join(lines[1:] + lines[:1]), b"\n".join(lines[:4])):
+        for payload in (b"\n".join(lines[1:]), self.proof() + b"\n" + lines[8],
+                        b"\n".join(lines[:8] + lines[9:] + lines[8:9]),
+                        b"\n".join(lines[:4])):
             with self.assertRaises(AssertionError):
                 verify_context_proof(payload)
 

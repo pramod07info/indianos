@@ -59,6 +59,8 @@ struct Task{
  #[cfg(feature="normal-desktop")]
  clone_retained:[u64;512],
  #[cfg(feature="normal-desktop")]
+ fault_retained:[u64;1],
+ #[cfg(feature="normal-desktop")]
  shared_direct_map:(u16,u64),
 }
 #[cfg(any(feature="test-r029-desktop-suite",feature="normal-desktop"))]
@@ -646,6 +648,22 @@ pub unsafe extern "C" fn x86_64_scheduler_apic_timer_dispatch(regs:*const u64){
         }
     }
     #[cfg(not(feature="preempt"))]{let _=regs;}
+}
+#[no_mangle]
+#[cfg(feature="normal-desktop")]
+pub extern "C" fn x86_64_user_page_fault_recover(vector:u64,cs:u64,error:u64,address:u64)->bool{
+ if vector!=14||cs!=0x2b||!matches!(error,4|6){return false;}
+ let Ok(_permit)=r120_enter()else{return false;};
+ let raw=active_task();let image=active_image();
+ if raw.is_null()||image.is_null()||!ptr::eq(unsafe{ptr::addr_of!((*raw).image)},image){return false;}
+ let task=unsafe{&mut *raw};let process=unsafe{ACTIVE_PROCESS};
+ if process.is_null()||task.pcb!=process||unsafe{(*process).state}!=3||!task.authority_live{return false;}
+ let current:u64;unsafe{asm!("mov {}, cr3",out(reg)current,options(nostack,nomem,preserves_flags));}
+ if current&PHYS!=task.root.root||!task.attached{return false;}
+ if !unsafe{crate::user_image::resolve_stack_fault(&mut task.image,address,error,&mut task.fault_retained[0])}{return false;}
+ unsafe{asm!("invlpg [{}]",in(reg)(address&!4095),options(nostack,preserves_flags));}
+ pid_log(unsafe{(*process).pid},b"DEMAND_STACK_PAGE_READY\0");
+ true
 }
 #[no_mangle]
 pub extern "C" fn x86_64_user_fault_handle(vector:u64,cs:u64,error:u64,cr2:u64){
@@ -1886,6 +1904,12 @@ fn image_mapped(b:&CloneBackend,root:u64,img:&UserImage)->bool{
    return false;
   }
   let stack=va>=img.plan.stack_begin&&va<img.plan.stack_end;
+  #[cfg(feature="normal-desktop")]
+  if page.physical_address==0&&crate::user_image::deferred_stack_page(img,va){
+   let mut query=Mapping{physical:0,permissions:Permissions{user:false,writable:false,executable:false}};
+   if lookup(b,root,va).is_some()||unsafe{vmm_query_page(&img.tables,va,&mut query)}{return false;}
+   continue;
+  }
   let segment=img.plan.segments.iter()
     .take(img.plan.segment_count as usize)
     .find(|s|va>=s.page_begin&&va<s.page_end);
@@ -2114,6 +2138,8 @@ fn prepare(t:*mut Task,p:*mut Process,elf:*const u8,size:usize,original:u64,
    log(b"IndianOS: desktop supervisor direct map shared with ownership receipt\n\0");
   }
  }
+ #[cfg(feature="normal-desktop")]
+ if !unsafe{crate::user_image::defer_stack_pages(&mut task.image)}{return false;}
  let addresses=[
   x86_64_enter_user as usize as u64,
   x86_64_resume_user as usize as u64,
@@ -2675,6 +2701,8 @@ fn discard(t:*mut Task,b:&CloneBackend,terminal:bool)->bool{
  }
  #[cfg(feature="normal-desktop")]
  if !unsafe{crate::paging::release_retained_frames(b,&mut task.clone_retained)}{return false;}
+ #[cfg(feature="normal-desktop")]
+ if !unsafe{crate::paging::release_retained_frames(b,&mut task.fault_retained)}{return false;}
  #[cfg(feature="normal-desktop")]
  if task.shared_direct_map.1!=0{
   if !unsafe{crate::paging::detach_shared_upper(b,task.root.root,

@@ -94,6 +94,88 @@ unsafe fn rollback_unmapped_stage(image:&mut UserImage,index:usize){
     }
 }
 
+/// Reserved stack slots remain charged in page_count and the launch budget.
+/// Keeping the top leaf resident pins every table on this 2-MiB path, so
+/// faults never need to replace a PML4 child borrowed by the active root.
+#[cfg(feature="normal-desktop")]
+pub(crate) fn deferred_stack_page(image:&UserImage,va:u64)->bool{
+ let begin=image.plan.stack_begin;let end=image.plan.stack_end;
+ let Some(top)=end.checked_sub(PAGE as u64)else{return false;};
+ image.ready&&image.page_count as usize<=MAX_IMAGE_PAGES&&
+  (begin|end|va)&(PAGE as u64-1)==0&&begin<top&&
+  end-begin<=crate::syscall::STACK_BYTES&&
+  image.plan.guard_begin.checked_add(PAGE as u64)==Some(begin)&&
+  begin>>21==top>>21&&va>=begin&&va<top&&
+  image.pages[..image.page_count as usize].iter()
+   .filter(|p|p.virtual_address==va).count()==1&&
+  image.pages[..image.page_count as usize].iter()
+   .any(|p|p.virtual_address==va&&p.physical_address==0)
+}
+
+#[cfg(feature="normal-desktop")]
+fn stack_mapping()->Mapping{Mapping{physical:0,permissions:Permissions{
+ writable:false,executable:false,user:false}}}
+
+/// Inactive image only, after successful full-footprint quota admission.
+/// No table is freed: the last stack page keeps the shared path populated.
+#[cfg(feature="normal-desktop")]
+pub(crate) unsafe fn defer_stack_pages(image:&mut UserImage)->bool{
+ let begin=image.plan.stack_begin;let end=image.plan.stack_end;
+ let Some(top)=end.checked_sub(PAGE as u64)else{return false;};
+ if !image.ready||image.page_count as usize>MAX_IMAGE_PAGES||
+    (begin|end)&4095!=0||begin>=top||end-begin>crate::syscall::STACK_BYTES||
+    begin>>21!=top>>21||image.plan.guard_begin.checked_add(PAGE as u64)!=Some(begin){return false;}
+ // Validate the entire requested conversion before altering its first leaf.
+ for va in (begin..end).step_by(PAGE){
+  let mut records=image.pages[..image.page_count as usize].iter().filter(|p|p.virtual_address==va);
+  let Some(page)=records.next()else{return false;};
+  let mut mapping=stack_mapping();
+  if records.next().is_some()||page.physical_address==0||
+     !unsafe{vmm_query_page(&image.tables,va,&mut mapping)}||
+     mapping.physical!=page.physical_address||!mapping.permissions.user||
+     !mapping.permissions.writable||mapping.permissions.executable{return false;}
+ }
+ for index in 0..image.page_count as usize{
+  let page=image.pages[index];
+  if page.virtual_address<begin||page.virtual_address>=top{continue;}
+  let data=unsafe{access(image,page.physical_address)};if data.is_null(){return false;}
+  for byte in 0..PAGE{unsafe{ptr::write_volatile(data.add(byte),0)}}
+  if !unsafe{vmm_unmap_page(&mut image.tables,page.virtual_address)}{return false;}
+  image.pages[index].virtual_address=0;
+  if !unsafe{release(image,page.physical_address)}{return false;}
+  image.pages[index]=UserPage{virtual_address:page.virtual_address,physical_address:0};
+ }
+ true
+}
+
+/// Serialized active-image fault only. Protection/NX/guard/kernel faults are
+/// never repaired. The caller invalidates the active CPU TLB after success.
+/// A refused rollback remains in caller-owned retained storage; the process
+/// must retire and retry its release before image/PCB reclamation completes.
+#[cfg(feature="normal-desktop")]
+pub(crate) unsafe fn resolve_stack_fault(image:&mut UserImage,address:u64,error:u64,retained:&mut u64)->bool{
+ let va=address&!(PAGE as u64-1);
+ if *retained!=0||!matches!(error,4|6)||!deferred_stack_page(image,va){return false;}
+ let mut top=stack_mapping();
+ let top_va=image.plan.stack_end-PAGE as u64;
+ if !unsafe{vmm_query_page(&image.tables,top_va,&mut top)}||
+    !top.permissions.user||!top.permissions.writable||top.permissions.executable||
+    !page_owned(image,top_va,top.physical){return false;}
+ let mut existing=stack_mapping();
+ if unsafe{vmm_query_page(&image.tables,va,&mut existing)}{return false;}
+ let Some(index)=image.pages[..image.page_count as usize].iter().position(|p|p.virtual_address==va)else{return false;};
+ let Some(physical)=(unsafe{allocate(image)})else{return false;};
+ *retained=physical;
+ let data=unsafe{access(image,physical)};
+ let mapped=if data.is_null(){false}else{
+  for byte in 0..PAGE{unsafe{ptr::write_volatile(data.add(byte),0)}}
+  unsafe{vmm_map_page(&mut image.tables,va,physical,Permissions{writable:true,executable:false,user:true})}
+ };
+ if mapped{image.pages[index].physical_address=physical;*retained=0;return true;}
+ if unsafe{release(image,physical)}{*retained=0;}
+ false
+}
+
 /// # Safety
 /// \`image\` is an exclusive, initialized user-image pointer. CR3 must have
 /// been restored and any kernel PML4 borrowing of user children detached.
@@ -529,6 +611,71 @@ mod tests {
         for va in [0x400000,0x401000] {assert!(unsafe {stage(&mut img,va,perms)}.is_some());}
         img.plan.stack_begin=0x400000;img.plan.stack_end=0x402000;
         img.ready=true;img
+    }
+    #[cfg(feature="normal-desktop")]
+    fn demand_staged(ram:&mut Ram)->UserImage{
+        let mut image=staged(ram);image.plan.guard_begin=image.plan.stack_begin-PAGE as u64;image
+    }
+    #[cfg(feature="normal-desktop")]
+    #[test]fn demand_stack_fault_restores_zero_nx_page_without_growing_quota(){
+        let mut ram=Ram::new();let mut image=demand_staged(&mut ram);
+        let count=image.page_count;let used=ram.used.iter().filter(|&&v|v).count();
+        let va=image.plan.stack_begin;let top=image.plan.stack_end-PAGE as u64;
+        assert!(unsafe{defer_stack_pages(&mut image)});
+        assert!(deferred_stack_page(&image,va));assert_eq!(image.page_count,count);
+        assert_eq!(ram.used.iter().filter(|&&v|v).count(),used-1);
+        let mut mapping=stack_mapping();assert!(unsafe{vmm_query_page(&image.tables,top,&mut mapping)});
+        let mut retained=0;
+        assert!(unsafe{resolve_stack_fault(&mut image,va+17,6,&mut retained)});
+        assert_eq!(retained,0);assert_eq!(image.page_count,count);
+        assert!(unsafe{vmm_query_page(&image.tables,va,&mut mapping)});
+        assert!(mapping.permissions.user&&mapping.permissions.writable&&!mapping.permissions.executable);
+        let index=Ram::index(mapping.physical).unwrap();assert!(ram.frames[index].iter().all(|&v|v==0));
+        assert_eq!(ram.used.iter().filter(|&&v|v).count(),used);
+        assert!(!unsafe{resolve_stack_fault(&mut image,va,6,&mut retained)});
+        assert!(unsafe{indianos_user_image_destroy(&mut image)});assert!(ram.used.iter().all(|&v|!v));
+    }
+    #[cfg(feature="normal-desktop")]
+    #[test]fn demand_stack_rejects_guard_nx_protection_and_foreign_mapping(){
+        let mut ram=Ram::new();let mut image=demand_staged(&mut ram);
+        assert!(unsafe{defer_stack_pages(&mut image)});let va=image.plan.stack_begin;
+        let before=ram.used;let mut retained=0;
+        for error in [0,1,2,3,5,7,12,20,36]{assert!(!unsafe{resolve_stack_fault(&mut image,va,error,&mut retained)});}
+        for address in [0,image.plan.guard_begin,image.plan.stack_end,image.plan.stack_end-PAGE as u64]{
+            assert!(!unsafe{resolve_stack_fault(&mut image,address,6,&mut retained)});
+        }
+        let physical=image.pages[1].physical_address;
+        assert!(unsafe{vmm_map_page(&mut image.tables,va,physical,Permissions{user:true,writable:true,executable:false})});
+        assert!(!unsafe{resolve_stack_fault(&mut image,va,6,&mut retained)});
+        assert_eq!(ram.used,before);assert_eq!(retained,0);
+        assert!(unsafe{vmm_unmap_page(&mut image.tables,va)});
+        assert!(unsafe{resolve_stack_fault(&mut image,va,4,&mut retained)});
+        assert!(unsafe{indianos_user_image_destroy(&mut image)});assert!(ram.used.iter().all(|&v|!v));
+    }
+    #[cfg(feature="normal-desktop")]
+    #[test]fn demand_fault_oom_and_failed_rollback_keep_exact_ownership(){
+        let mut ram=Ram::new();let mut image=demand_staged(&mut ram);
+        assert!(unsafe{defer_stack_pages(&mut image)});let va=image.plan.stack_begin;
+        let used=ram.used;ram.used.fill(true);let mut retained=0;
+        assert!(!unsafe{resolve_stack_fault(&mut image,va,6,&mut retained)});
+        assert_eq!(retained,0);assert!(deferred_stack_page(&image,va));ram.used=used;
+        let free=ram.used.iter().position(|&v|!v).unwrap();let frame=(free as u64+1)*PAGE as u64;
+        ram.refuse_access=frame;ram.refuse_release=frame;
+        assert!(!unsafe{resolve_stack_fault(&mut image,va,6,&mut retained)});
+        assert_eq!(retained,frame);assert!(ram.used[free]);assert!(deferred_stack_page(&image,va));
+        assert!(!unsafe{resolve_stack_fault(&mut image,va,6,&mut retained)});
+        ram.refuse_access=0;ram.refuse_release=0;
+        assert!(unsafe{ram_release(retained,(&mut ram as *mut Ram).cast())});
+        assert!(unsafe{indianos_user_image_destroy(&mut image)});assert!(ram.used.iter().all(|&v|!v));
+    }
+    #[cfg(feature="normal-desktop")]
+    #[test]fn failed_stack_deferral_retains_unmapped_frame_for_image_teardown(){
+        let mut ram=Ram::new();let mut image=demand_staged(&mut ram);
+        let frame=image.pages[0].physical_address;ram.refuse_release=frame;
+        assert!(!unsafe{defer_stack_pages(&mut image)});
+        assert_eq!(image.pages[0].virtual_address,0);assert_eq!(image.pages[0].physical_address,frame);
+        ram.refuse_release=0;assert!(unsafe{indianos_user_image_destroy(&mut image)});
+        assert!(ram.used.iter().all(|&v|!v));
     }
     #[cfg(feature="normal-desktop")]
     fn pixel_staged(ram:&mut Ram)->UserImage{
