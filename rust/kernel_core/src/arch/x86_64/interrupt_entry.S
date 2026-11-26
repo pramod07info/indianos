@@ -27,6 +27,7 @@ x86_64_isr_common:
     cli
     movq %rsp, %rdi
     andq $-16, %rsp
+    call indianos_fx_enter_kernel
     call x86_64_exception_dispatch
 2:
     cli

@@ -41,6 +41,8 @@ const BAD:u64=u64::MAX;
 struct DirectMap{offset:u64}
 #[repr(C,align(16))]
 struct Task{
+ #[cfg(feature="normal-desktop")]
+ fpu:crate::fpu_context::Context,
  image:UserImage,root:CloneResult,pcb:*mut Process,
  frame:[u64;WORDS],saved:bool,attached:bool,timer_preemptions:u32,
  authority_live:bool,
@@ -2063,6 +2065,8 @@ fn prepare(t:*mut Task,p:*mut Process,elf:*const u8,size:usize,original:u64,
  if p.is_null(){return false;}
  task.pcb=p;task.authority_live=true;
  #[cfg(feature="normal-desktop")]
+ {task.fpu=crate::fpu_context::Context::new();}
+ #[cfg(feature="normal-desktop")]
  let direct_map_slot={
   let mut offset=0;
   if !unsafe{boot_hhdm_offset(&mut offset)}{return false;}
@@ -2122,6 +2126,12 @@ fn prepare(t:*mut Task,p:*mut Process,elf:*const u8,size:usize,original:u64,
  let safe=trap_mapped(b,original,task.root.root)&&
   addresses.iter().all(|&a|kernel_mapped(b,original,task.root.root,a))&&
   image_mapped(b,task.root.root,&task.image);
+ #[cfg(all(feature="normal-desktop",not(any(test,feature="std"))))]
+ let safe=safe&&{
+  let start=ptr::addr_of!(task.fpu) as u64;
+  crate::fpu_context::mapping_addresses().iter().copied().chain([start,start+511])
+   .all(|address|kernel_mapped(b,original,task.root.root,address))
+ };
  if !safe||!unsafe{indianos_process_ready(p)} ||
     !unsafe{indianos_process_bind(p,task.root.root)}{return false;}
  #[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
@@ -2761,6 +2771,10 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
  let Some((cpu,offset))=preflight()else{return false;};
  #[cfg(any(feature="test-r031-files-gui",feature="normal-desktop"))]
  if !r120_setup(){log(b"IndianOS: R120 denied unsafe CPU/IRQ scheduler entry\n\0");return false;}
+ #[cfg(all(feature="normal-desktop",not(any(test,feature="std"))))]
+ if !unsafe{crate::fpu_context::configure()}{
+  log(b"IndianOS: desktop FPU context prerequisites rejected\n\0");return false;
+ }
  let mut direct=DirectMap{offset};
  let vmm=vmm_backend(&mut direct);
  let backend=clone_backend(&mut direct);
@@ -2956,6 +2970,8 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
    if !saved_valid(task)||!unsafe{indianos_process_resume(pcb)}{ok=false;break;}
   }else if !unsafe{indianos_process_start(pcb,task.root.root)}{ok=false;break;}
   pid_log(pid,b"DISPATCHED\0");clear_faults();
+  #[cfg(all(feature="normal-desktop",not(any(test,feature="std"))))]
+  if !unsafe{crate::fpu_context::bind(ptr::addr_of_mut!(task.fpu))}{ok=false;break;}
   unsafe{ACTIVE_USER=&mut task.image;ACTIVE_TASK=task as *mut Task;ACTIVE_PROCESS=pcb;}
   #[cfg(any(any(feature="test-r026",feature="normal-desktop"),any(feature="test-r029-multiprocess",feature="normal-desktop")))]
   unsafe{ACTIVE_PID=pid;}
@@ -2965,6 +2981,8 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
    unsafe{x86_64_enter_user(task.image.plan.entry,
                              task.image.plan.stack_end-16,task.root.root)}
   };
+  #[cfg(all(feature="normal-desktop",not(any(test,feature="std"))))]
+  unsafe{crate::fpu_context::unbind()};
   unsafe{ACTIVE_TASK=ptr::null_mut();ACTIVE_USER=ptr::null_mut();ACTIVE_PROCESS=ptr::null_mut();}
   #[cfg(any(any(feature="test-r026",feature="normal-desktop"),any(feature="test-r029-multiprocess",feature="normal-desktop")))]
   unsafe{ACTIVE_PID=0;}

@@ -198,6 +198,23 @@ jobs:
             --ovmf "$OVMF_PATH" --artifact-dir build/normal-desktop-artifacts \
             --shutdown-fixture build/desktop-shutdown-fixture/x86_64-unknown-none/release/indianos-user \
             2>&1 | tee build/normal-desktop-logs/qemu.log
+      - name: Build a separate opt-in x87 SSE guest fixture
+        run: |
+          set -euo pipefail
+          make desktop-image DESKTOP_BUILD=build/fpu-desktop RUST_CORE=1 DESKTOP_FPU_ACCEPTANCE=1 \
+            DESKTOP_VOLUME_CONFIG="$PWD/build/normal-desktop-fixture/volume.bin" 2>&1 | tee build/normal-desktop-logs/fpu-image.log
+      - name: Verify four real user x87 SSE contexts across scheduling yields
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s tests -p test_fpu_context_acceptance.py
+          OVMF_PATH=""
+          for path in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/edk2/ovmf/OVMF_CODE_4M.fd /usr/share/edk2/ovmf/OVMF_CODE.fd; do
+            if test -f "$path"; then OVMF_PATH="$path"; break; fi
+          done
+          test -n "$OVMF_PATH"
+          python3 tools/test_fpu_context_qemu.py --iso build/fpu-desktop/indianos.iso \
+            --disk build/normal-desktop-fixture/volume.raw --ovmf "$OVMF_PATH" \
+            --artifact-dir build/normal-desktop-artifacts 2>&1 | tee build/normal-desktop-logs/fpu-qemu.log
       - name: Retain real screenshots and serial evidence even on failure
         if: always()
         uses: actions/upload-artifact@v4

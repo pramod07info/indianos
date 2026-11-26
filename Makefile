@@ -900,13 +900,15 @@ endif
 endif
 endif
 RUST_APP_FLAGS := -C relocation-model=static -C link-arg=-T$(CURDIR)/userland/demo/linker.ld -C link-arg=--no-pie -C link-arg=-z -C link-arg=max-page-size=0x1000
+DESKTOP_FPU_ACCEPTANCE ?= 0
+DESKTOP_FPU_FEATURE = $(if $(filter 11,$(DESKTOP_SESSION)$(DESKTOP_FPU_ACCEPTANCE)),--features test-fpu-context)
 $(USER_ELF): $(wildcard userland/rust/src/*.rs) userland/rust/Cargo.toml userland/rust/Cargo.lock userland/demo/linker.ld Makefile
 	@mkdir -p $(@D)
 	CARGO_TARGET_DIR=$(BUILD)/rust-user-init-target \
 	    RUSTFLAGS="$(RUST_APP_FLAGS)" \
 	    $(CARGO) build --manifest-path userland/rust/Cargo.toml \
 	    --target x86_64-unknown-none --release --offline --no-default-features \
-	    $(if $(RUST_INIT_FEATURE),--features $(RUST_INIT_FEATURE),)
+	    $(if $(RUST_INIT_FEATURE),--features $(RUST_INIT_FEATURE),) $(DESKTOP_FPU_FEATURE)
 	cp $(BUILD)/rust-user-init-target/x86_64-unknown-none/release/indianos-user $@
 	@readelf -h $@ | grep -q 'Type:.*EXEC'
 
@@ -917,7 +919,7 @@ $(THIRD_ELF): $(wildcard userland/rust/src/*.rs) userland/rust/Cargo.toml userla
 	    RUSTFLAGS="$(RUST_APP_FLAGS)" \
 	    $(CARGO) build --manifest-path userland/rust/Cargo.toml \
 	    --target x86_64-unknown-none --release --offline --no-default-features \
-	    --features $(RUST_THIRD_FEATURE)
+	    --features $(RUST_THIRD_FEATURE) $(DESKTOP_FPU_FEATURE)
 	cp $(BUILD)/rust-user-third-target/x86_64-unknown-none/release/indianos-user $@
 	@readelf -h $@ | grep -q 'Type:.*EXEC'
 endif
@@ -929,7 +931,7 @@ $(FOURTH_ELF): $(wildcard userland/rust/src/*.rs) userland/rust/Cargo.toml userl
 	    RUSTFLAGS="$(RUST_APP_FLAGS)" \
 	    $(CARGO) build --manifest-path userland/rust/Cargo.toml \
 	    --target x86_64-unknown-none --release --offline --no-default-features \
-	    --features desktop-compositor
+	    --features desktop-compositor $(DESKTOP_FPU_FEATURE)
 	cp $(BUILD)/rust-user-compositor-target/x86_64-unknown-none/release/indianos-user $@
 	@readelf -h $@ | grep -q 'Type:.*EXEC'
 endif
@@ -940,7 +942,7 @@ $(WORKER_ELF): $(wildcard userland/rust/src/*.rs) userland/rust/Cargo.toml userl
 	    RUSTFLAGS="$(RUST_APP_FLAGS)" \
 	    $(CARGO) build --manifest-path userland/rust/Cargo.toml \
 	    --target x86_64-unknown-none --release --offline --no-default-features \
-	    --features $(RUST_WORKER_FEATURE)
+	    --features $(RUST_WORKER_FEATURE) $(DESKTOP_FPU_FEATURE)
 	cp $(BUILD)/rust-user-worker-target/x86_64-unknown-none/release/indianos-user $@
 	@readelf -h $@ | grep -q 'Type:.*EXEC'
 

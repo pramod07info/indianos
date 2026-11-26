@@ -63,7 +63,12 @@ x86_64_apic_timer_interrupt:
     pushq %r14
     pushq %r15
     movq %rsp, %rdi
+    call indianos_fx_enter_kernel
     call x86_64_scheduler_apic_timer_dispatch
+    testb $3, 128(%rsp)
+    jz 1f
+    call indianos_fx_enter_user
+1:
     popq %r15
     popq %r14
     popq %r13

@@ -200,3 +200,56 @@ small-object scratch arenas. The next allocation slice adds bounded quarantine
 recovery and classified pressure diagnostics. P2-004/P2-011 remain open pending
 the remaining implementation and end-to-end acceptance requirements described in
 [KERNEL_FRAME_ALLOCATION.md](KERNEL_FRAME_ALLOCATION.md).
+
+## PR #825 expanded implementation boundary — 26 Nov 2026
+
+The owner requested the following ten workstreams in the same open integration
+PR. This is a pending-work ledger, not ten completed features or new acceptance.
+Reuse the canonical task IDs and implementations above; do not create duplicate
+allocator, scheduler, VFS, supervisor or controller models.
+
+| Requested workstream | Existing implementation to extend | Remaining implementation/acceptance |
+| --- | --- | --- |
+| Heap, OOM and memory quotas | `kernel_heap.rs`, `kernel_arena.rs`, `user_image.rs`; P2-004/011 | Noncontiguous heap backing and bounded pressure recovery now implemented in #825. Broader consumers, total/shared RSS, global OOM and SMP admission remain. |
+| Demand paging and COW | `paging.rs`, `vmm.rs`, `user_runtime.rs`; P2-006 | Fault-driven mappings, reference ownership, atomic write splitting and rollback with real user faults. |
+| Multicore scheduling, IPIs/TLB | `smp_lifecycle_fence.rs`, `timer.rs`, `user_runtime.rs`; P2-008/009 | Actual AP run queues, remote wakeup/shootdown acknowledgements, race and teardown acceptance. |
+| FPU/SIMD context | `fpu_context.rs`, `cpu_entry.rs`, `arch/x86_64/*entry.S`, `user_runtime.rs`; P2-010 | This slice implements eager BSP x87/MMX/SSE context boundaries. Exact-head guest evidence, preemptive register retention, AVX/XSAVE and migration remain unaccepted. |
+| Threads, futexes and signals | `ipc.rs`, `user_runtime.rs`; P3-001/009 | General thread ownership, wait/wake/timeout/cancellation races and signal delivery. |
+| Spawn/exec/wait and supervision | `user_image.rs`, `user_runtime.rs`, `service_supervisor.rs`; P3-003/011/012 | Arbitrary approved-image lifecycle and parent/wait semantics beyond fixed desktop roles. |
+| Native fsync, blocking locks, ACLs/quotas | `fs_handles.rs`, `syscall.rs`, `durablefs.rs`; P4-006/008/009/010 | Native durability ABI, interrupt-safe blocking lock queues and persistent named-user administration/accounting. |
+| Normal networking and DMA ownership | `network.rs`, process retirement and PCI inventory; P5-004/005/006, P6-005 | Normal driver binding, IRQ/DMA/IOMMU lifetime and reset/error acceptance. |
+| AHCI/NVMe and USB/xHCI | `batch3_ahci.rs`, `batch3_nvme.rs`, hardware inventory; P6-006/007 | Existing descriptor/queue models must become real initialized controllers; DMA, interrupts, completion, reset, flush and devices. |
+| Verified boot, ACPI and physical qualification | boot handoff, hardware inventory and power primitives; P1-009/010, P5-001/009, P6-009 | Firmware trust/revocation/recovery chain and selected physical-machine power/device receipts. |
+
+### Eager x87/SSE ownership implementation
+
+Each normal desktop Task owns a 16-byte-aligned 512-byte FXSAVE64 context.
+Preparation initializes empty x87/MMX registers, zero SSE payloads and masked
+architectural control defaults, including on compositor replacement. Client
+contexts remain in their existing Tasks during compositor-only recovery.
+
+The admitted BSP configures CR0.MP/NE and CR4.OSFXSR/OSXMMEXCPT, clearing EM/TS.
+Missing x87/FXSR/SSE/SSE2, enabled OSXSAVE, enabled AMD FFXSR or enabled interrupts
+refuse admission. No AVX state is advertised or discarded silently. All context
+and helper/global addresses must preserve their supervisor mapping in each
+process root before readiness.
+
+Raw entry/resume saves kernel state and restores that Task. Syscall, PIT/APIC
+timer, keyboard/mouse and terminal fault entry save live user state and restore
+kernel state before Rust executes. Direct interrupt returns restore user state
+only for a CPL3 frame; an IRQ interrupting kernel code must not acquire user
+state. Scheduling/exit paths retain the already saved Task context. Historical
+profiles leave the context pointer null and keep their existing behavior.
+This remains single-BSP ownership, not per-CPU storage or multicore scheduling.
+
+Three host cases cover size/alignment/defaults, CPU-state admission and fresh
+process payloads. Existing IRQ assembly tests link the real production helpers.
+A separate `DESKTOP_FPU_ACCEPTANCE=1` image enables the user fixture feature,
+which gives each PID distinct x87 values, XMM0/XMM15 and rounding controls, then
+checks them across four yields. The additional QEMU harness requires all four
+receipts before desktop readiness and retains serial/screenshot artifacts.
+Ordinary normal-desktop acceptance still runs against the fixture-free image.
+The fixture is cooperative scheduling evidence, not proof of preemption, AVX,
+physical devices, general threads or migration. Two host evidence-oracle cases
+reject missing/duplicate/late receipts. GitHub runs all builds/tests; none was
+executed locally. All formal gate counts and completion estimates are unchanged.

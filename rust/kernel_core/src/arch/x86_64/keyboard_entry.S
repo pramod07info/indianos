@@ -22,7 +22,12 @@
     pushq %r13
     pushq %r14
     pushq %r15
+    call indianos_fx_enter_kernel
     call \dispatcher
+    testb $3, 128(%rsp)
+    jz 2f
+    call indianos_fx_enter_user
+2:
     popq %r15
     popq %r14
     popq %r13

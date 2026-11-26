@@ -9,6 +9,8 @@
 
 use core::arch::asm;
 use core::panic::PanicInfo;
+#[cfg(feature="test-fpu-context")]
+mod desktop_fpu_probe;
 #[cfg(feature="normal-init")]
 mod bootstrap;
 #[cfg(any(feature="shell",feature="interactive",feature="r026-shell"))]
@@ -2347,6 +2349,8 @@ fn vfs_guest()->!{
 }
 #[no_mangle]
 pub extern "C" fn _start()->!{
+    #[cfg(feature="test-fpu-context")]
+    desktop_fpu_probe::verify();
     #[cfg(feature="desktop-compositor")]
     desktop_compositor();
     #[cfg(feature="r031-vfs-init")]

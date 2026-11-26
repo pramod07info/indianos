@@ -308,6 +308,8 @@ mod kernel_buffer;
 mod kernel_heap;
 #[cfg(feature="normal-desktop")]
 mod kernel_arena;
+#[cfg(feature="normal-desktop")]
+mod fpu_context;
 /// R029.1 authenticated per-process window grants and bounded event queue.
 pub mod gui_broker;
 #[cfg(feature="test-r031-supervisor")]
