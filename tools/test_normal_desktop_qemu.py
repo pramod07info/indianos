@@ -64,6 +64,7 @@ FRAME_ALLOCATED = b"IndianOS: kernel frame buffer allocated"
 FRAME_RELEASED = b"IndianOS: kernel frame buffer released"
 SCRATCH_ALLOCATED = b"IndianOS: kernel compositor scratch allocated"
 SCRATCH_RELEASED = b"IndianOS: kernel compositor scratch released"
+SCRATCH_SHARED = b"IndianOS: kernel heap descriptor shares scratch arena"
 FRAME_PRESENTED = b"IndianOS: G4 complete PID4 frame presented"
 FRAME_PUBLISHED = b"IndianOS user: desktop PID4 full frame published"
 FRAME_METRICS = b"IndianOS user: desktop PID4 frame metrics "
@@ -83,7 +84,7 @@ PIXEL_APP_EVIDENCE = tuple(
     b"IndianOS user: desktop broker denied app pixel authority",
     b"IndianOS user: desktop compositor denied app pixel authority",
     COMPOSITOR_SNAPSHOT,
-    FRAME_ALLOCATED, SCRATCH_ALLOCATED,
+    FRAME_ALLOCATED, SCRATCH_ALLOCATED, SCRATCH_SHARED,
     FRAME_PRESENTED, FRAME_PUBLISHED,
 )
 TERMINAL_AUTHORITY = PIXEL_APP_EVIDENCE + (
@@ -1766,7 +1767,7 @@ def verify_transient_restart(output: bytes, injection_at: int) -> None:
                b"IndianOS: fault CR2=0x0000000060000000",
                b"IndianOS: PID 4 FAULTED", b"IndianOS: PID 4 REAPED",
                COMPOSITOR_PREPARED, COMPOSITOR.encode(), FRAME_ALLOCATED,
-               STALE_COMPOSITOR_DENIED, SCRATCH_ALLOCATED, FRAME_PRESENTED, FRAME_PUBLISHED, COMPOSITOR_REPLACED)
+               STALE_COMPOSITOR_DENIED, SCRATCH_ALLOCATED, SCRATCH_SHARED, FRAME_PRESENTED, FRAME_PUBLISHED, COMPOSITOR_REPLACED)
     complete = tail.replace(b"\r", b"").split(b"\n")[:-1]
     if any(marker in line and line != marker for marker in markers for line in complete):
         raise AssertionError("PID4 recovery record has an untrusted prefix")

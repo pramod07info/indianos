@@ -61,7 +61,7 @@ buffer, exhaustion, fragmentation, duplicate release and failure atomicity.
 Subsequent exact-head GitHub results are required; the failed candidate is not
 acceptance evidence.
 
-## Owned page heap follow-up (M1-P2-004)
+## Initial owned page heap: merged PR #821 (M1-P2-004)
 
 `kernel_heap::try_allocate` adds a fallible, page-backed kernel allocation API
 using the same PMM/Buffer backend. It accepts nonzero `Layout`s with alignment up
@@ -99,3 +99,51 @@ production consumers, not a global Rust allocator or small-object arena. Remaini
 sub-page allocation/coalescing, noncontiguous virtual backing, additional kernel
 owners, allocation-pressure diagnostics, SMP-safe admission, process RSS quotas
 and system-wide OOM/recovery policy. No gate or percentage is advanced.
+
+
+## Shared small-object scratch arenas (next M1-P2-004 slice)
+
+The current allocator extends the PR #821 engine rather than adding another
+physical allocator. `Owner::Frame` retains page-granular capacity and alignment.
+`Owner::Scratch` now owns an 8192-byte arena and packs individual leases at
+8-byte granularity, respecting requested alignments up to 4096. Physical quota
+counts each backing arena exactly once, including quarantined arenas. A small
+lease cannot resize beyond its own reserved extent into a neighbor's bytes.
+
+There are at most 16 live leases and 16 backing regions. Metadata is external to
+the payload. A bounded first-fit search uses live extents as its authority;
+removing adjacent extents merges their holes implicitly. No in-band free-list
+links or allocations for allocator metadata are needed. Allocation zeroes the
+reserved extent. Free scrubs only that extent while neighbors remain alive;
+only the final lease releases the arena. Failed final release quarantines the
+entire region and keeps its physical quota charge until bounded reclamation
+succeeds. Existing generation checks still reject stale/double frees.
+
+Production use: native compositor BEGIN/ROW/COMMIT/ABORT descriptors use a
+128-byte owned scratch lease. ROW's retained 6400-byte buffer shares that same
+owner arena. After the first row, descriptor allocation/free reuses arena holes
+without allocating physical pages. All user-pointer validation, frame generation
+checks and complete-frame publication rules remain in force. Descriptors drop
+before syscall return; the retained row lease retires with the compositor.
+
+The serial receipt `IndianOS: kernel heap descriptor shares scratch arena` is
+emitted once per arena after a successful ROW and only if its descriptor and
+another lease are simultaneously live in that actual backing region. The live
+normal-desktop and PID4-recovery harnesses require this receipt in addition to
+frame/scratch allocation, publication and retirement evidence. Host negative
+controls reject absent, duplicated or premature sharing receipts. This is an
+allocation-path witness, not proof of general hardware or complete OOM policy.
+
+New host regressions cover adjacent-hole coalescing without additional physical
+allocation, nonadjacent fragmentation, alignment-padding reuse, live-neighbor
+preservation on release, quarantine retry, metadata exhaustion without extra
+backing, and once-per-arena sharing receipts. Existing quota, alignment, stale
+handle, OOM, byte access, private payload and Drop tests remain applicable and
+are updated for arena-based charging. No local builds/tests/QEMU are executed;
+GitHub Actions results on the exact candidate are required before merge.
+
+The first item remains unfinished: noncontiguous virtual backing, broader kernel
+owners/global allocator integration, allocation-pressure diagnostics, SMP-safe
+admission, process RSS quotas and system-wide OOM/recovery policy still require
+implementation and end-to-end acceptance. This change addresses small-object
+allocation/coalescing only; it does not advance a gate or completion percentage.
