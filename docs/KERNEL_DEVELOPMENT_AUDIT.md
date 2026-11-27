@@ -650,3 +650,32 @@ owner's request. Exact candidate GitHub results remain required.
 No gate is newly accepted and no completion percentage is increased by these
 changes. Prior-head CI is not evidence for the consolidated candidate. Required
 checks, merged-main evidence and hardware/sign-off policy continue to apply.
+
+
+### Live ring-3 ownership grant/revocation acceptance candidate
+
+The existing opt-in blocking-lock desktop image now precedes its lock test with
+actual PID1/PID2 ownership operations through syscall 33. PID1 restricts the
+fixture readme, transfers it to uid1000, revokes that owner, enables gid1000 read,
+revokes group read, then restores root:root/0777. PID2 must alternate denied OPEN
+with actual reads of the exact committed `HELLO INDIANOS` payload. Each reader
+closes before acknowledgement; metadata administration never bypasses the
+existing foreign-descriptor exclusion. Every successful administration must
+invalidate PID1's old descriptor. PID3/PID4 remain waiting until this test and
+the original contended lock timeout/handoff complete, then normal desktop starts.
+
+The QEMU oracle requires all six ordered ownership receipts before lock waits,
+normal readiness, eight CRC-valid metadata publications, restored catalog and
+permissions, unchanged payload banks and unchanged bytes outside the selected
+metadata sectors. The inactive checkpoint must retain the conservative root-
+owned 0600 state immediately preceding final restoration. Four additional host
+oracle tests reject missing/duplicate/reordered/stale receipts, bad CRC, wrong
+generations, altered data/catalog and unrestored owner/mode. Serial logs and a
+ready screenshot use the existing retained artifact path.
+
+This fixture is absent from ordinary product images; production ABI is reused
+without added privilege bypasses or test-only kernel grants. It assumes the
+explicitly generated disposable legacy-root-owned GPT fixture, never a physical
+user disk. No local builds/tests/QEMU ran. GitHub must establish exact-head
+results; no gate pass or completion percentage is claimed before that evidence.
+The ten-point remaining-work table above continues to apply.

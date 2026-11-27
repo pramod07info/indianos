@@ -216,7 +216,7 @@ jobs:
           python3 tools/test_fpu_context_qemu.py --iso build/fpu-desktop/indianos.iso \
             --disk build/normal-desktop-fixture/volume.raw --ovmf "$OVMF_PATH" \
             --artifact-dir build/normal-desktop-artifacts 2>&1 | tee build/normal-desktop-logs/fpu-qemu.log
-      - name: Build and verify separate cross-process blocking lock guest fixture
+      - name: Build and verify separate ownership revocation and blocking lock guest fixture
         run: |
           set -euo pipefail
           python3 -m unittest discover -s tests -p test_blocking_lock_acceptance.py -v
