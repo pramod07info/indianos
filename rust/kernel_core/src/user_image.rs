@@ -33,6 +33,120 @@ pub struct UserImage {
     pub ready: bool,
 }
 
+/// Checked accounting for one detached image, not its active kernel-root clone.
+/// Shared-zero aliases consume virtual/logical slots but never private RSS; the
+/// boot-owned immutable zero frame must be counted once by the system caller.
+#[derive(Clone,Copy,Debug,Default,Eq,PartialEq)]
+pub(crate) struct ImageMemoryUsage {
+    pub logical_slots:u64,
+    pub mapped_private_pages:u64,
+    pub shared_zero_mappings:u64,
+    pub deferred_pages:u64,
+    pub unmapped_private_pages:u64,
+    pub released_slots:u64,
+    pub table_pages:u64,
+    pub retained_fault_pages:u64,
+}
+impl ImageMemoryUsage {
+    pub(crate) fn private_frames(self)->Option<u64>{
+        self.mapped_private_pages.checked_add(self.unmapped_private_pages)?
+            .checked_add(self.table_pages)?.checked_add(self.retained_fault_pages)
+    }
+    pub(crate) fn private_bytes(self)->Option<u64>{self.private_frames()?.checked_mul(PAGE as u64)}
+    pub(crate) fn logical_bytes(self)->Option<u64>{self.logical_slots.checked_mul(PAGE as u64)}
+}
+const FRAME_MASK:u64=0x000f_ffff_ffff_f000;
+const MAX_IMAGE_TABLES:usize=1+3*MAX_IMAGE_PAGES;
+fn account_frame(frame:u64)->bool{frame!=0&&frame&4095==0&&frame&!FRAME_MASK==0}
+fn account_va(va:u64)->bool{va!=0&&va&4095==0&&va<(1u64<<47)}
+fn shared_zero()->Option<u64>{
+    #[cfg(feature="normal-desktop")]
+    {crate::zero_page::physical()}
+    #[cfg(not(feature="normal-desktop"))]
+    {None}
+}
+fn deferred_address(image:&UserImage,va:u64)->bool{
+    let begin=image.plan.stack_begin;let end=image.plan.stack_end;
+    let Some(top)=end.checked_sub(PAGE as u64)else{return false;};
+    (begin|end)&4095==0&&begin<top&&end-begin<=crate::syscall::STACK_BYTES&&
+        image.plan.guard_begin.checked_add(PAGE as u64)==Some(begin)&&
+        begin>>21==top>>21&&va>=begin&&va<top
+}
+/// No allocation, mutation or user-memory dereference. Tables are reached only
+/// through the image's trusted backend. Bounded visited sets reject duplicate
+/// table ownership/cycles and private-frame aliases before reporting a charge.
+/// Empty linked tables and unmapped retained data stay charged during teardown.
+/// `retained` is the caller-owned failed-fault rollback frame, or zero; it must
+/// not also be owned by any table, image record, or the global zero frame.
+/// # Safety: image/backend metadata and mappings are stable and exclusively
+/// serialized against mutation for the complete bounded snapshot operation.
+pub(crate) unsafe fn memory_usage(image:&UserImage,retained:u64)->Option<ImageMemoryUsage>{
+    let count=image.page_count as usize;if count>MAX_IMAGE_PAGES||
+        image.pages[count..].iter().any(|p|p.virtual_address!=0||p.physical_address!=0){return None;}
+    let pages=&image.pages[..count];let zero=shared_zero();
+    if retained!=0&&(!account_frame(retained)||Some(retained)==zero){return None;}
+    let mut usage=ImageMemoryUsage{logical_slots:count as u64,
+        retained_fault_pages:u64::from(retained!=0),..ImageMemoryUsage::default()};
+    for (index,page) in pages.iter().enumerate(){
+        let va=page.virtual_address;let frame=page.physical_address;
+        if va!=0&&(!account_va(va)||pages[..index].iter().any(|p|p.virtual_address==va)){return None;}
+        if frame==0{
+            if va==0{usage.released_slots+=1;}
+            else if deferred_address(image,va){usage.deferred_pages+=1;}else{return None;}
+        }else{
+            if !account_frame(frame)||frame==retained{return None;}
+            if Some(frame)==zero{
+                if !deferred_address(image,va){return None;}usage.shared_zero_mappings+=1;
+            }else{
+                if pages[..index].iter().any(|p|p.physical_address==frame){return None;}
+                if va==0{usage.unmapped_private_pages+=1;}else{usage.mapped_private_pages+=1;}
+            }
+        }
+    }
+    if !image.tables.initialized{
+        return (image.tables.root_physical==0&&!image.ready&&count==0).then_some(usage);
+    }
+    if !account_frame(image.tables.root_physical)||image.tables.backend.access.is_none(){return None;}
+    let mut tables=[0u64;MAX_IMAGE_TABLES];let mut table_count=0usize;
+    let mut mapped=[false;MAX_IMAGE_PAGES];
+    if !unsafe{account_tables(image,image.tables.root_physical,0,0,retained,
+        &mut tables,&mut table_count,&mut mapped)}{return None;}
+    for (index,page) in pages.iter().enumerate(){
+        if mapped[index]!=(page.virtual_address!=0&&page.physical_address!=0){return None;}
+    }
+    usage.table_pages=table_count as u64;
+    // Keep byte-unit conversion checked at the same authority boundary.
+    usage.private_bytes()?;usage.logical_bytes()?;Some(usage)
+}
+unsafe fn account_tables(image:&UserImage,frame:u64,level:usize,prefix:u64,retained:u64,
+    tables:&mut[u64;MAX_IMAGE_TABLES],count:&mut usize,mapped:&mut[bool;MAX_IMAGE_PAGES])->bool{
+    if !account_frame(frame)||frame==retained||Some(frame)==shared_zero()||
+        *count==tables.len()||tables[..*count].contains(&frame)||
+        image.pages[..image.page_count as usize].iter().any(|p|p.physical_address==frame){return false;}
+    tables[*count]=frame;*count+=1;
+    let table=unsafe{access(image,frame)}.cast::<u64>();if table.is_null(){return false;}
+    for index in 0..512{
+        let value=unsafe{ptr::read_volatile(table.add(index))};if value==0{continue;}
+        // Only user four-level tables/4KiB leaves produced by this loader.
+        // Hardware A/D updates are permitted; huge, global and reserved bits
+        // cannot be laundered into a resident-memory accounting receipt.
+        if value&!((FRAME_MASK)|(1<<63)|7|(1<<5)|(1<<6))!=0||value&5!=5||
+            (level<3&&value&2==0)||(level==0&&index>=256){return false;}
+        let next=value&FRAME_MASK;if !account_frame(next){return false;}
+        let va=prefix|((index as u64)<<(39-level*9));
+        if level<3{
+            if !unsafe{account_tables(image,next,level+1,va,retained,tables,count,mapped)}{return false;}
+        }else{
+            if !account_va(va)||(value&2!=0&&value&(1<<63)==0){return false;}
+            let Some(slot)=image.pages[..image.page_count as usize].iter()
+                .position(|p|p.virtual_address==va&&p.physical_address==next)else{return false;};
+            if mapped[slot]||Some(next)==shared_zero()&&(value&2!=0||value&(1<<63)==0){return false;}
+            mapped[slot]=true;
+        }
+    }
+    true
+}
+
 unsafe fn allocate(image: &UserImage) -> Option<u64> {
     let backend = &image.tables.backend;
     let mut frame = 0u64;
@@ -379,6 +493,9 @@ pub unsafe extern "C" fn indianos_user_image_load_with_limit(
         let _ = unsafe { indianos_user_image_destroy(image) };
         return false;
     }
+    if unsafe{memory_usage(img,0)}.is_none(){
+        let _=unsafe{indianos_user_image_destroy(image)};return false;
+    }
     img.ready = true;
     true
 }
@@ -633,6 +750,48 @@ mod tests {
         img.plan.stack_begin=0x400000;img.plan.stack_end=0x402000;
         img.ready=true;img
     }
+    #[test]fn resident_accounting_matches_owned_frames_and_rejects_duplicate_metadata(){
+        let mut ram=Ram::new();let mut image=staged(&mut ram);let before=ram.used;
+        let usage=unsafe{memory_usage(&image,0)}.unwrap();
+        assert_eq!((usage.logical_slots,usage.mapped_private_pages,usage.table_pages),(2,2,4));
+        assert_eq!(usage.private_frames(),Some(ram.used.iter().filter(|&&v|v).count() as u64));
+        assert_eq!(usage.logical_bytes(),Some(2*PAGE as u64));
+        let saved=image.pages[1];
+        image.pages[1].physical_address=image.pages[0].physical_address;
+        assert!(unsafe{memory_usage(&image,0)}.is_none());
+        image.pages[1]=saved;image.pages[1].virtual_address=image.pages[0].virtual_address;
+        assert!(unsafe{memory_usage(&image,0)}.is_none());image.pages[1]=saved;
+        image.pages[2]=saved;assert!(unsafe{memory_usage(&image,0)}.is_none());
+        image.pages[2]=UserPage{virtual_address:0,physical_address:0};
+        assert!(unsafe{memory_usage(&image,image.pages[0].physical_address)}.is_none());
+        assert!(unsafe{memory_usage(&image,image.tables.root_physical)}.is_none());
+        assert!(unsafe{memory_usage(&image,3)}.is_none());assert_eq!(ram.used,before);
+        let mut orphan=0;assert!(unsafe{ram_alloc(&mut orphan,(&mut ram as *mut Ram).cast())});
+        let with_orphan=unsafe{memory_usage(&image,orphan)}.unwrap();
+        assert_eq!(with_orphan.retained_fault_pages,1);
+        assert_eq!(with_orphan.private_frames(),usage.private_frames().map(|n|n+1));
+        let empty:UserImage=unsafe{core::mem::zeroed()};
+        let orphan_only=unsafe{memory_usage(&empty,orphan)}.unwrap();
+        assert_eq!((orphan_only.table_pages,orphan_only.retained_fault_pages,orphan_only.private_frames()),(0,1,Some(1)));
+        assert!(unsafe{ram_release(orphan,(&mut ram as *mut Ram).cast())});
+        assert!(unsafe{indianos_user_image_destroy(&mut image)});
+        assert_eq!(unsafe{memory_usage(&image,0)},Some(ImageMemoryUsage::default()));
+    }
+    #[test]fn resident_accounting_refuses_cycles_foreign_leaves_and_inaccessible_tables(){
+        let mut ram=Ram::new();let mut image=staged(&mut ram);
+        let root=Ram::index(image.tables.root_physical).unwrap();let child=ram.frames[root][0];
+        ram.frames[root][0]=image.tables.root_physical|7;
+        assert!(unsafe{memory_usage(&image,0)}.is_none());ram.frames[root][0]=child;
+        ram.refuse_access=child&FRAME_MASK;assert!(unsafe{memory_usage(&image,0)}.is_none());ram.refuse_access=0;
+        let mut foreign=0;assert!(unsafe{ram_alloc(&mut foreign,(&mut ram as *mut Ram).cast())});
+        assert!(unsafe{vmm_map_page(&mut image.tables,0x402000,foreign,
+            Permissions{user:true,writable:true,executable:false})});
+        assert!(unsafe{memory_usage(&image,0)}.is_none());
+        assert!(unsafe{vmm_unmap_page(&mut image.tables,0x402000)});
+        assert!(unsafe{ram_release(foreign,(&mut ram as *mut Ram).cast())});
+        assert!(unsafe{memory_usage(&image,0)}.is_some());
+        assert!(unsafe{indianos_user_image_destroy(&mut image)});assert!(ram.used.iter().all(|&v|!v));
+    }
     #[cfg(feature="normal-desktop")]
     fn demand_staged(ram:&mut Ram)->UserImage{
         let mut image=staged(ram);image.plan.guard_begin=image.plan.stack_begin-PAGE as u64;image
@@ -645,6 +804,8 @@ mod tests {
             let mut first=demand_staged(&mut ram);let mut second=demand_staged(&mut ram);
             let va=first.plan.stack_begin;let quota=(first.page_count,second.page_count);
             assert!(unsafe{defer_stack_pages(&mut first)&&defer_stack_pages(&mut second)});
+            let deferred=unsafe{memory_usage(&first,0)}.unwrap();
+            assert_eq!((deferred.deferred_pages,deferred.mapped_private_pages,deferred.shared_zero_mappings),(1,1,0));
             let before=ram.used.iter().filter(|&&v|v).count();let mut retained=0;
             assert!(unsafe{resolve_stack_fault(&mut first,va,4,&mut retained)});
             assert!(unsafe{resolve_stack_fault(&mut second,va,4,&mut retained)});
@@ -652,9 +813,24 @@ mod tests {
             let mut a=stack_mapping();let mut b=stack_mapping();
             assert!(unsafe{vmm_query_page(&first.tables,va,&mut a)&&vmm_query_page(&second.tables,va,&mut b)});
             assert_eq!((a.physical,b.physical),(zero,zero));assert!(!a.permissions.writable&&!b.permissions.writable);
+            let first_usage=unsafe{memory_usage(&first,0)}.unwrap();let second_usage=unsafe{memory_usage(&second,0)}.unwrap();
+            assert_eq!((first_usage.shared_zero_mappings,second_usage.shared_zero_mappings),(1,1));
+            let mut leaf=first.tables.root_physical;
+            for shift in [39,30,21]{leaf=ram.frames[Ram::index(leaf).unwrap()][((va>>shift)&511) as usize]&FRAME_MASK;}
+            let leaf=Ram::index(leaf).unwrap();let slot=((va>>12)&511) as usize;
+            let value=ram.frames[leaf][slot];ram.frames[leaf][slot]|=2;
+            assert!(unsafe{memory_usage(&first,0)}.is_none());
+            ram.frames[leaf][slot]=value|(1<<5)|(1<<6);
+            assert_eq!(unsafe{memory_usage(&first,0)},Some(first_usage));
+            ram.frames[leaf][slot]=value;
+            assert_eq!(first_usage.private_frames().unwrap()+second_usage.private_frames().unwrap(),
+                ram.used.iter().filter(|&&v|v).count() as u64-1);
             assert!(unsafe{resolve_stack_fault(&mut first,va,7,&mut retained)});
             assert!(unsafe{vmm_query_page(&first.tables,va,&mut a)});
             assert_ne!(a.physical,zero);assert!(a.permissions.writable&&!a.permissions.executable);
+            let split=unsafe{memory_usage(&first,0)}.unwrap();
+            assert_eq!((split.shared_zero_mappings,split.deferred_pages,split.mapped_private_pages),(0,0,2));
+            assert_eq!(split.private_frames(),first_usage.private_frames().map(|n|n+1));
             ram.frames[Ram::index(a.physical).unwrap()][0]=0xfeed;
             assert!(ram.frames[Ram::index(zero).unwrap()].iter().all(|&v|v==0));
             assert_eq!((first.page_count,second.page_count),quota);
@@ -856,6 +1032,9 @@ mod tests {
         assert_eq!(img.pages[0].physical_address,0);
         assert_eq!(img.pages[1].virtual_address,0);
         assert_eq!(img.pages[1].physical_address,refused);
+        let usage=unsafe{memory_usage(&img,0)}.unwrap();
+        assert_eq!((usage.mapped_private_pages,usage.unmapped_private_pages,usage.released_slots),(0,1,1));
+        assert_eq!(usage.private_frames(),Some(ram.used.iter().filter(|&&v|v).count() as u64));
         assert!(!unsafe {indianos_user_can_write(&img,0x400000,1)});
         let mut out=[0xaa;4];
         assert!(!unsafe {indianos_user_copy_readonly(&img,0x400000,out.as_mut_ptr().cast(),4)});
@@ -879,6 +1058,8 @@ mod tests {
         assert!(!unsafe {indianos_user_image_destroy(&mut img)});
         assert!(img.pages[..2].iter().all(|p|p.physical_address==0));
         assert_eq!(img.tables.root_physical,root);
+        let usage=unsafe{memory_usage(&img,0)}.unwrap();
+        assert_eq!((usage.table_pages,usage.released_slots,usage.private_frames()),(1,2,Some(1)));
         ram.refuse_release=0;
         assert!(unsafe {indianos_user_image_destroy(&mut img)});
         assert!(ram.used.iter().all(|&used|!used));
@@ -902,6 +1083,9 @@ mod tests {
         assert_eq!(image.page_count as usize,before+1);
         assert_eq!((image.pages[before].virtual_address,image.pages[before].physical_address),(0,physical));
         assert!(ram.used[next]);ram.refuse_access=0;
+        let usage=unsafe{memory_usage(&image,0)}.unwrap();
+        assert_eq!((usage.mapped_private_pages,usage.unmapped_private_pages),(2,1));
+        assert_eq!(usage.private_frames(),Some(ram.used.iter().filter(|&&v|v).count() as u64));
         assert!(!unsafe{indianos_user_image_destroy(&mut image)});
         assert_eq!(image.pages[before].physical_address,physical);assert!(ram.used[next]);
         ram.refuse_release=0;assert!(unsafe{indianos_user_image_destroy(&mut image)});

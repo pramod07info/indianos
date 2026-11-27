@@ -2153,8 +2153,11 @@ fn prepare(t:*mut Task,p:*mut Process,elf:*const u8,size:usize,original:u64,
  task.attached=true;
  #[cfg(feature="normal-desktop")]
  {
-  let Some(image_tables)= (unsafe{crate::paging::required_table_frames(b,task.image.tables.root_physical,false)})else{return false;};
-  let actual=u64::from(task.image.page_count)+u64::from(image_tables);
+  let Some(usage)=(unsafe{crate::user_image::memory_usage(&task.image,task.fault_retained[0])})else{return false;};
+  let Some(actual)=usage.private_frames()else{return false;};
+  if usage.logical_slots!=u64::from(task.image.page_count)||
+     usage.shared_zero_mappings!=0||usage.deferred_pages!=0||
+     usage.unmapped_private_pages!=0||usage.retained_fault_pages!=0{return false;}
   if actual!=private_budget.0||task.root.table_count!=private_budget.1||
      !private_budget_admits(actual,task.root.table_count){return false;}
   if unsafe{(*p).pid}==1{
@@ -2164,6 +2167,17 @@ fn prepare(t:*mut Task,p:*mut Process,elf:*const u8,size:usize,original:u64,
  }
  #[cfg(feature="normal-desktop")]
  if !unsafe{crate::user_image::defer_stack_pages(&mut task.image)}{return false;}
+ #[cfg(feature="normal-desktop")]
+ {
+  let Some(usage)=(unsafe{crate::user_image::memory_usage(&task.image,task.fault_retained[0])})else{return false;};
+  let Some(resident)=usage.private_frames().and_then(|n|n.checked_add(u64::from(task.root.table_count)))else{return false;};
+  let Some(reserved)=usage.logical_slots.checked_add(usage.table_pages)
+   .and_then(|n|n.checked_add(u64::from(task.root.table_count)))else{return false;};
+  if resident>reserved||reserved>DESKTOP_PRIVATE_FRAME_LIMIT{return false;}
+  pid_log(unsafe{(*p).pid},b"MEMORY_ACCOUNTING_VALIDATED\0");
+  fault_hex(b"IndianOS: image private resident frames=0x\0",resident);
+  fault_hex(b"IndianOS: image reserved private frames=0x\0",reserved);
+ }
  let addresses=[
   x86_64_enter_user as usize as u64,
   x86_64_resume_user as usize as u64,

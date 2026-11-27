@@ -739,3 +739,37 @@ status252 before the prelaunch wait-timeout receipt. Request/admission/output/
 lifecycle diagnostics and precise guest failure labels now identify that path
 without changing its validation or exit conditions. Exact corrected-head logs
 are required to diagnose any remaining failure before acceptance or merge.
+
+
+### Point 1 — checked resident and shared image accounting
+
+`user_image::memory_usage` now audits the actual detached page-table tree and
+owned page records before publishing a loaded image. Its bounded, read-only
+snapshot separates logical quota slots, mapped private data, shared immutable
+zero aliases, deferred stack reservations, unmapped retained pages, released
+slots, owned page tables and caller-retained fault rollback frames. Private
+frame/byte and logical-byte conversions use checked arithmetic. Cycles, duplicate
+private/table ownership, hidden records, unexpected leaves, malformed permissions,
+inaccessible tables and retained-frame overlap reject rather than undercharge.
+Shared-zero aliases do not each charge a physical frame; the global boot-owned
+zero frame is a system allocation, outside individual private RSS.
+
+Normal desktop preparation uses this snapshot instead of deriving resident
+memory from logical page_count. It compares pre-deferral private ownership to
+the preflight reservation, then validates and reports separate resident and
+reserved private frame counts after stack deferral, including the separately
+owned kernel-root clone tables. It rejects residency above reservation or the
+existing 512-frame private ceiling. Borrowed HHDM/kernel mappings are excluded;
+this is not a claim that all kernel/system memory is per-process RSS.
+
+Two new host tests and four extended image tests compare accounting with actual
+backend ownership, shared-zero/COW changes, deferred slots, malformed trees,
+retained staging/fault frames and partial teardown. Teardown and its retry path
+are unchanged. No local build or test ran. Exact-head GitHub compilation and
+QEMU remain required before accepting this accounting change.
+
+Remaining point-1 work: full-system attribution/unique shared-frame accounting,
+global pressure/OOM victim policy with end-to-end conservation tests, and SMP
+quota reservations across heap/VMM/process lifecycle. The PMM admission guard
+alone does not remove higher-level BSP ownership constraints; no 100% completion
+or milestone acceptance is asserted.
