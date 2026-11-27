@@ -693,3 +693,30 @@ transition. The negative now checks vector32; a separate real C lifecycle
 exercises vector0 through fault and reap without reporting normal success.
 No tests were removed or disabled; no local build/test ran. Exact corrected-
 head GitHub checks must validate these repairs before acceptance or merge.
+
+
+### Point 1 — serialized physical-memory admission
+
+The production PMM no longer returns an unguarded static mutable reference.
+All exported allocation, release, initialization and accounting entrypoints,
+including the kernel-buffer run adapters, acquire one atomic guard around the
+bitmap and counters. Acquire/release ordering publishes ownership transitions
+across CPUs. The guard cannot migrate between threads/CPUs; returning, failure
+or host-test unwinding releases admission. A contended or nested call never
+spins: allocations/releases fail without changing output or transferring
+ownership; numeric diagnostics conservatively return zero. Existing callers
+must retain failed-release ownership and retry under their existing lifecycle.
+Boot initialization callbacks cannot recursively alias allocator state.
+
+Three host tests cover nested exclusion, guard unwinding without forgotten
+ownership, and four real host threads claiming all 128 frames exactly once,
+then exhausting and reclaiming them with verified bitmap conservation. The
+existing host/freestanding/QEMU workflows exercise the changed entrypoints.
+No local compilation or execution ran; exact candidate GitHub results remain
+required. The prior CI failures are separately repaired above.
+
+This closes the PMM's unsynchronized global-state gap; it does not claim the
+entire memory task complete. Higher-level heap/VMM/DMA owners retain BSP-only
+contracts. Per-process shared RSS accounting, full system-wide OOM policy and
+SMP-safe end-to-end quota reservation/reclamation still require implementation
+and guest acceptance. No new M1 gate or percentage is accepted.

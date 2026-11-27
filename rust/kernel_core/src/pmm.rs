@@ -3,10 +3,12 @@
 //! Owns ONLY frames from non-overlapping usable boot memory-map regions,
 //! capped at 8 GiB worth of frames. The bitmap describes frame ownership;
 //! it never dereferences arbitrary physical addresses. A tiny unsafe
-//! single-CPU cell is necessary for C ABI statics: no SMP or interrupt-side
-//! allocator access is allowed in this boot-stage kernel.
+//! guarded C ABI cell serializes bitmap/quota admission across CPUs. Contended
+//! or reentrant calls fail closed without spinning; higher-level VMM, DMA and
+//! heap ownership protocols still retain their existing BSP restrictions.
 
-use core::{cell::UnsafeCell, ffi::c_void, ptr};
+use core::{cell::UnsafeCell, ffi::c_void, ptr, marker::PhantomData,
+    ops::{Deref,DerefMut},sync::atomic::{AtomicBool,Ordering}};
 
 const PAGE: u64 = 4096;
 const MAX_SPANS: usize = 128;
@@ -78,16 +80,31 @@ impl State {
         None
     }
 }
-struct SingleCpuCell(UnsafeCell<State>);
-// SAFETY: The boot kernel uses one CPU, with interrupts disabled on all
-// calls into PMM. No concurrent/reentrant calls; migration CI enforces this
-// invariant only operationally, not with a locking primitive.
-unsafe impl Sync for SingleCpuCell {}
-static PMM: SingleCpuCell = SingleCpuCell(UnsafeCell::new(State::empty()));
-unsafe fn state() -> &'static mut State {
-    // SAFETY: Single CPU, caller has exclusive use of allocator until return.
-    unsafe { &mut *PMM.0.get() }
+/// A single acquire operation protects bitmap ownership and accounting. Never
+/// spin in an IRQ or nested allocation: a busy allocator fails closed and the
+/// caller retains its output/ownership for a later retry.
+struct AllocatorCell { locked:AtomicBool, state:UnsafeCell<State> }
+// SAFETY: state is accessed only through an exclusive acquire/release guard.
+unsafe impl Sync for AllocatorCell {}
+impl AllocatorCell {
+    const fn new()->Self{Self{locked:AtomicBool::new(false),state:UnsafeCell::new(State::empty())}}
+    fn try_lock(&self)->Option<StateGuard<'_>>{
+        self.locked.compare_exchange(false,true,Ordering::Acquire,Ordering::Relaxed)
+            .ok().map(|_|StateGuard{cell:self,_local:PhantomData})
+    }
 }
+struct StateGuard<'a>{cell:&'a AllocatorCell,_local:PhantomData<*mut ()>}
+impl Deref for StateGuard<'_>{
+    type Target=State;
+    fn deref(&self)->&State{unsafe{&*self.cell.state.get()}}
+}
+impl DerefMut for StateGuard<'_>{
+    fn deref_mut(&mut self)->&mut State{unsafe{&mut *self.cell.state.get()}}
+}
+impl Drop for StateGuard<'_>{
+    fn drop(&mut self){self.cell.locked.store(false,Ordering::Release);}
+}
+static PMM:AllocatorCell=AllocatorCell::new();
 fn overlap(a0: u64, a1: u64, b0: u64, b1: u64) -> bool {
     a0 < b1 && b0 < a1
 }
@@ -111,8 +128,8 @@ unsafe fn read_region(
 pub unsafe extern "C" fn pmm_initialize(
     region_count: u64, reader: RegionReader, context: *mut c_void,
 ) -> bool {
-    let s = unsafe { state() };
-    unsafe { initialize_once(s, region_count, reader, context) }
+    let Some(mut s)=PMM.try_lock()else{return false;};
+    unsafe { initialize_once(&mut s, region_count, reader, context) }
 }
 
 /// Never reset a live PMM while callers may own allocated frames.
@@ -228,7 +245,7 @@ impl State {
 #[no_mangle]
 pub unsafe extern "C" fn pmm_allocate_frame(physical: *mut u64) -> bool {
     if physical.is_null() { return false; }
-    let s = unsafe { state() };
+    let Some(mut s)=PMM.try_lock()else{return false;};
     let Some(address)=s.claim_single_frame()else{return false;};
     unsafe{ptr::write(physical,address);}
     true
@@ -268,7 +285,7 @@ impl State {
 #[no_mangle]
 pub unsafe extern "C" fn pmm_allocate_contiguous_frames(count:u32,out:*mut u64)->bool{
     if out.is_null(){return false;}
-    let s=unsafe{state()};
+    let Some(mut s)=PMM.try_lock()else{return false;};
     let Some(first)=s.claim_contiguous_run(count)else{return false;};
     unsafe{ptr::write(out,first);}
     true
@@ -279,7 +296,7 @@ pub unsafe extern "C" fn pmm_allocate_contiguous_frames(count:u32,out:*mut u64)-
 /// one CPU. Duplicate frees, unaligned frames and reserved RAM are rejected.
 #[no_mangle]
 pub unsafe extern "C" fn pmm_release_frame(physical: u64) -> bool {
-    let s = unsafe { state() };
+    let Some(mut s)=PMM.try_lock()else{return false;};
     if !s.single_frame_geometry_valid() || physical & (PAGE - 1) != 0 { return false; }
     for i in 0..s.count {
         let span = s.spans[i];
@@ -297,12 +314,12 @@ pub unsafe extern "C" fn pmm_release_frame(physical: u64) -> bool {
 }
 #[no_mangle]
 pub extern "C" fn pmm_total_frames() -> u64 {
-    let s = unsafe { state() };
+    let Some(s)=PMM.try_lock()else{return 0;};
     if s.initialized { s.total } else { 0 }
 }
 #[no_mangle]
 pub extern "C" fn pmm_free_frames() -> u64 {
-    let s = unsafe { state() };
+    let Some(s)=PMM.try_lock()else{return 0;};
     s.trusted_free_count()
 }
 /// Allocate two distinct frames, recycle one and always attempt cleanup
@@ -524,22 +541,22 @@ impl State {
 /// # Safety: BSP-only, IRQ-disabled kernel caller; no other allocator user.
 #[no_mangle]
 pub unsafe extern "C" fn pmm_claim_specific_frames(physical:u64,count:u32)->bool{
-    let s=unsafe{state()};s.claim_run(physical,count)
+    let Some(mut s)=PMM.try_lock()else{return false;};s.claim_run(physical,count)
 }
 /// Undo exactly one kernel-owned contiguous frame range atomically.
 /// # Safety: Caller has stopped all DMA/CPU users of the frames; BSP-only.
 #[no_mangle]
 pub unsafe extern "C" fn pmm_release_contiguous_frames(physical:u64,count:u32)->bool{
-    let s=unsafe{state()};s.release_run(physical,count)
+    let Some(mut s)=PMM.try_lock()else{return false;};s.release_run(physical,count)
 }
 /// Read-only fragmentation metrics of the live physical frame bitmap.
 #[no_mangle]
 pub extern "C" fn pmm_largest_contiguous_free_run()->u64{
-    let s=unsafe{state()};s.longest_free_run()
+    let Some(s)=PMM.try_lock()else{return 0;};s.longest_free_run()
 }
 #[no_mangle]
 pub extern "C" fn pmm_number_of_free_runs()->u64{
-    let s=unsafe{state()};s.count_free_runs()
+    let Some(s)=PMM.try_lock()else{return 0;};s.count_free_runs()
 }
 #[cfg(test)]
 mod r084_checked_physical_runs_tests{
@@ -782,7 +799,7 @@ impl State{
 pub unsafe extern "C" fn pmm_allocate_aligned_frames(
     count:u32,align_frames:u32,out:*mut u64)->bool{
     if out.is_null(){return false;}
-    let s=unsafe{state()};
+    let Some(mut s)=PMM.try_lock()else{return false;};
     if let Some(physical)=s.claim_aligned_run(count,align_frames){
         unsafe{ptr::write(out,physical)};true
     }else{false}
@@ -792,7 +809,7 @@ pub unsafe extern "C" fn pmm_allocate_aligned_frames(
 pub unsafe extern "C" fn pmm_allocate_highest_frames(
     count:u32,out:*mut u64)->bool{
     if out.is_null(){return false;}
-    let s=unsafe{state()};
+    let Some(mut s)=PMM.try_lock()else{return false;};
     if let Some(physical)=s.claim_highest_run(count){
         unsafe{ptr::write(out,physical)};true
     }else{false}
@@ -2379,11 +2396,11 @@ mod kernel_p0_batch36_w1 {
 /// Allocate a page-rounded compositor buffer (at most 10,240,000 bytes).
 /// # Safety: serialized BSP, IRQs disabled; returned frames exclusively owned.
 pub(crate) unsafe fn allocate_buffer_frames(count:u32)->Option<u64>{
-    unsafe{state()}.claim_contiguous_run_bounded(count,2500)
+    let mut s=PMM.try_lock()?;s.claim_contiguous_run_bounded(count,2500)
 }
 /// # Safety: same allocator admission; all users of this owned run stopped.
 pub(crate) unsafe fn release_buffer_frames(physical:u64,count:u32)->bool{
-    unsafe{state()}.release_run_bounded(physical,count,2500)
+    let Some(mut s)=PMM.try_lock()else{return false;};s.release_run_bounded(physical,count,2500)
 }
 #[cfg(test)]
 mod kernel_buffer_run_tests{
@@ -2418,4 +2435,55 @@ mod kernel_buffer_run_tests{
         assert!(s.release_run(PAGE*1500,1));assert_eq!(s.used,0);
         assert!(s.claim_contiguous_run_bounded(2500,2500).is_some());
     }
+}
+
+
+#[cfg(test)]
+mod allocator_admission_tests {
+ use super::*;
+ fn cell()->AllocatorCell{
+  let cell=AllocatorCell::new();
+  {let mut s=cell.try_lock().unwrap();s.initialized=true;s.count=1;
+   s.total=128;s.spans[0]=Span{base:PAGE,count:128,bit_offset:0};}
+  cell
+ }
+ #[test]fn contended_and_reentrant_admission_never_alias_mutable_state(){
+  let cell=cell();let mut owner=cell.try_lock().unwrap();
+  assert_eq!(owner.claim_single_frame(),Some(PAGE));
+  assert!(cell.try_lock().is_none());assert_eq!(owner.used,1);
+  drop(owner);let owner=cell.try_lock().unwrap();assert_eq!(owner.used,1);
+  assert_eq!(owner.trusted_free_count(),127);
+ }
+ #[test]fn guard_drop_after_unwind_releases_admission_without_resetting_ownership(){
+  let cell=cell();
+  let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||{
+   let mut owner=cell.try_lock().unwrap();assert_eq!(owner.claim_single_frame(),Some(PAGE));
+   panic!("host-only unwind exercises guard release");
+  }));
+  assert!(result.is_err());let owner=cell.try_lock().unwrap();
+  assert_eq!(owner.used,1);assert!(owner.allocated(0));
+ }
+ #[test]fn concurrent_claims_are_unique_and_exhaustion_keeps_accounting_conserved(){
+  let cell=std::sync::Arc::new(cell());let mut threads=std::vec::Vec::new();
+  for _ in 0..4{
+   let cell=cell.clone();threads.push(std::thread::spawn(move||{
+    let mut frames=std::vec::Vec::new();
+    for _ in 0..32{loop{
+     if let Some(mut owner)=cell.try_lock(){
+      frames.push(owner.claim_single_frame().unwrap());break;
+     }
+     std::thread::yield_now();
+    }}frames
+   }));
+  }
+  let mut frames=std::vec::Vec::new();
+  for thread in threads{frames.extend(thread.join().unwrap());}
+  frames.sort_unstable();frames.dedup();assert_eq!(frames.len(),128);
+  let mut owner=cell.try_lock().unwrap();assert_eq!(owner.used,128);
+  let cursor=owner.cursor;assert_eq!(owner.claim_single_frame(),None);
+  assert_eq!(owner.used,128);assert_eq!(owner.cursor,cursor);
+  assert_eq!(owner.trusted_free_count(),0);
+  for physical in frames{assert!(owner.release_run(physical,1));}
+  assert_eq!(owner.trusted_free_count(),128);assert!(owner.verify_frame_accounting());
+ }
 }
