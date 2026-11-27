@@ -34,7 +34,7 @@ int main(void) {
 
     assert(indianos_process_ready(second));
     assert(indianos_process_start(second, 0x2000));
-    assert(!indianos_process_fault(second, 0x10e, 0, 4, 0xdead));
+    assert(!indianos_process_fault(second, 0x10e, 32, 4, 0xdead));
     assert(indianos_process_fault(second, 0x10e, 14, 4, 0xdead));
     assert(second->state == INDIANOS_PROCESS_FAULTED);
     assert(second->fault_address == 0xdead);
@@ -48,6 +48,14 @@ int main(void) {
     struct indianos_process *fourth = indianos_process_create(&table);
     assert(third != NULL && fourth != NULL);
     assert(third->pid == 3 && fourth->pid == 4);
+    /* Architectural #DE is exception zero, not an absent fault record. */
+    assert(indianos_process_ready(third));
+    assert(indianos_process_start(third, 0x3000));
+    assert(indianos_process_fault(third, 0x100, 0, 0, 0));
+    assert(third->state == INDIANOS_PROCESS_FAULTED);
+    assert(third->fault_vector == 0 && third->exit_status == 0x100);
+    assert(indianos_process_reap(third));
+    assert(!indianos_process_success(third));
     assert(indianos_process_create(&table) == NULL);
     assert(table.count == INDIANOS_MAX_PROCESSES);
     table.next_pid = UINT32_MAX;

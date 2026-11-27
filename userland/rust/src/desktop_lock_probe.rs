@@ -42,8 +42,8 @@ fn owner_probe(pid:u64){
   if !allowed{if token!=u64::MAX{exit(123);}return;}
   if token==0||token==u64::MAX{exit(123);}
   let mut bytes=[0u8;256];
-  if super::file_handle_call(2,b"",token,0,&mut bytes,13)!=13||
-     &bytes[..13]!=b"HELLO INDIANOS"||handle(5,b"",token,0)!=0{exit(123);}
+  if super::file_handle_call(2,b"",token,0,&mut bytes,14)!=14||
+     &bytes[..14]!=b"HELLO INDIANOS"||handle(5,b"",token,0)!=0{exit(123);}
  }
  if pid==1{
   if handle(37,b"",0,0)>>32&256==0{exit(123);}

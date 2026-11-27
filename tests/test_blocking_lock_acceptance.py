@@ -26,14 +26,14 @@ class OwnershipEvidenceTests(unittest.TestCase):
         head=bytearray(512);head[:8]=b"INDR027!"
         struct.pack_into("<IIQ",head,8,2,COUNT,generation)
         name=b"~fshared~readme";head[32:32+len(name)]=name
-        struct.pack_into("<II",head,56,13,binascii.crc32(b"HELLO INDIANOS"))
+        struct.pack_into("<II",head,56,14,binascii.crc32(b"HELLO INDIANOS"))
         head[65]=1;struct.pack_into("<HHH",head,66,owner,0,mode)
         struct.pack_into("<I",head,24,binascii.crc32(head));return head
     def media(self):
         before=bytearray(256*512)
         before[START*512:(START+1)*512]=self.head(1)
         before[(START+1)*512:(START+2)*512]=self.head(2)
-        before[(START+2)*512:(START+2)*512+13]=b"HELLO INDIANOS"
+        before[(START+2)*512:(START+2)*512+14]=b"HELLO INDIANOS"
         after=bytearray(before)
         after[START*512:(START+1)*512]=self.head(9,0o600)
         after[(START+1)*512:(START+2)*512]=self.head(10)
@@ -63,7 +63,7 @@ class OwnershipEvidenceTests(unittest.TestCase):
             with self.assertRaises(AssertionError):verify_owner_media(before,bad)
         # A data descriptor edit with a correct metadata CRC still changes the
         # catalog; metadata-only writes cannot launder payload substitutions.
-        bad=bytearray(after);head=self.head(10);head[56]=14
+        bad=bytearray(after);head=self.head(10);head[56]=15
         head[24:28]=bytes(4);struct.pack_into("<I",head,24,binascii.crc32(head))
         bad[(START+1)*512:(START+2)*512]=head
         with self.assertRaises(AssertionError):verify_owner_media(before,bad)

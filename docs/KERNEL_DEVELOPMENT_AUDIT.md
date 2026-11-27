@@ -679,3 +679,17 @@ explicitly generated disposable legacy-root-owned GPT fixture, never a physical
 user disk. No local builds/tests/QEMU ran. GitHub must establish exact-head
 results; no gate pass or completion percentage is claimed before that evidence.
 The ten-point remaining-work table above continues to apply.
+
+
+### Exact-head CI repair before further memory work
+
+Head 8ebf844 failed Offline app planner checks job 140452995962 because the new
+ownership oracle fixture inserted the 14-byte `HELLO INDIANOS` value into a
+13-byte slice, enlarging its synthetic disk. The guest probe also requested 13
+bytes. Both now use the actual 14-byte payload and the corrupt-length negative
+control remains distinct. Orbit job 140452996074 failed the C ABI process test:
+its old vector-zero denial conflicts with the corrected architectural #DE
+transition. The negative now checks vector32; a separate real C lifecycle
+exercises vector0 through fault and reap without reporting normal success.
+No tests were removed or disabled; no local build/test ran. Exact corrected-
+head GitHub checks must validate these repairs before acceptance or merge.
