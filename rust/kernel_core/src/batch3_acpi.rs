@@ -356,17 +356,25 @@ pub fn hpet_mmio_address(bytes:&[u8])->Result<u64,AcpiError>{
  Ok(address)
 }
 /// WS109: Validate ACPI FADT reset GAS before exposing a numeric reset
-/// register. The caller must validate privileges and perform the actual write.
+/// System-I/O port. The caller must validate privileges and perform the actual
+/// write. Memory-mapped reset registers require a separate mapped-MMIO path;
+/// never truncate a firmware physical address into an x86 port number.
 pub fn fadt_reset_io(bytes:&[u8])->Result<(u64,u8),AcpiError>{
  let table=parse_sdt(bytes)?;
  if table.signature!=*b"FACP"{return Err(AcpiError::Signature);}
- if table.length<129||!matches!(bytes[116],0|1)||
+ if table.length<129{return Err(AcpiError::Malformed);}
+ let flags=u32::from_le_bytes(bytes[112..116].try_into()
+   .map_err(|_|AcpiError::Malformed)?);
+ // ACPI RESET_REG_SUP is bit 10. A populated but unsupported GAS is not a
+ // grant to write a reset port; register space 0 is MMIO, not System I/O.
+ if flags&(1<<10)==0||bytes[116]!=1||
     bytes[117]!=8||bytes[118]!=0||!matches!(bytes[119],0|1){
   return Err(AcpiError::Malformed);
  }
  let address=u64::from_le_bytes(bytes[120..128].try_into()
    .map_err(|_|AcpiError::Malformed)?);
- if address==0||bytes[128]==0{return Err(AcpiError::Malformed);}
+ if address==0||address>u16::MAX as u64{return Err(AcpiError::Malformed);}
+ // ResetValue is an opaque firmware byte, including zero.
  Ok((address,bytes[128]))
 }
 /// WS110: A MADT may carry one LAPIC address override, never two or an
@@ -428,11 +436,19 @@ mod pr782_ws106_110_tests{
  }
  #[test]fn ws109_fadt_reset_io_is_structurally_checked(){
   let mut t=std::vec![0u8;129];t[..4].copy_from_slice(b"FACP");
-  t[116]=1;t[117]=8;t[119]=1;t[120..128].copy_from_slice(&0xcf9u64.to_le_bytes());
+  t[113]=4;t[116]=1;t[117]=8;t[119]=1;t[120..128].copy_from_slice(&0xcf9u64.to_le_bytes());
   t[128]=6;let t=fixed(t);
   assert_eq!(fadt_reset_io(&t),Ok((0xcf9,6)));
-  let mut bad=t.clone();bad[128]=0;
-  assert_eq!(fadt_reset_io(&fixed(bad)),Err(AcpiError::Malformed));
+  let mut zero=t.clone();zero[128]=0;
+  assert_eq!(fadt_reset_io(&fixed(zero)),Ok((0xcf9,0)));
+  for field in [113,116,117,119]{
+   let mut bad=t.clone();bad[field]=if field==119{2}else{0};
+   assert_eq!(fadt_reset_io(&fixed(bad)),Err(AcpiError::Malformed));
+  }
+  for address in [0,0x1_0cf9,u64::MAX]{
+   let mut bad=t.clone();bad[120..128].copy_from_slice(&address.to_le_bytes());
+   assert_eq!(fadt_reset_io(&fixed(bad)),Err(AcpiError::Malformed));
+  }
  }
  #[test]fn ws110_duplicate_or_invalid_lapic_override_is_rejected(){
   let single=madt(&[5,12,0,0,0,0,0xe0,0xfe,0,0,0,0]);

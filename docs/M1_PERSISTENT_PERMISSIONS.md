@@ -42,3 +42,31 @@ native chmod, stale handles, credential replacement and rebinding. They have
 not been run locally; exact-head GitHub compilation/tests and QEMU remain
 required. These are bounded POSIX-style discretionary permissions, not named-user
 extended ACLs, a general multiuser filesystem or verified hardware durability.
+
+
+## Native ownership administration
+
+Syscall 33 operations **39 (change owner)** and **40 (change group)** reuse the
+same 64-byte descriptor as mode operation 38. The existing ABI query operation
+37 advertises the additive ownership-administration bit **256**; version 1 and
+size 64 are unchanged. The handle is at bytes 24..32 and the new u16 owner/group
+ID is encoded as a u64 at 32..40. IDs above 65535 reject rather than truncate.
+Path, data pointer, data length and reserved fields must be zero.
+
+Only the current PID1 broker may invoke these operations. Owner transfer
+requires a kernel-issued root credential before probing media. Group changes
+require root or the persisted file owner selecting its own kernel-issued group.
+The selected mount receipt, namespace, current file generation, S0 policy and
+write budget remain mandatory. Outstanding foreign descriptors reject before
+I/O; root cannot override this snapshot exclusion. A successful change flushes
+and revokes cached descriptors; failed I/O retires selected volume authority
+without charging a successful write. Durable-shutdown arming rejects both
+operations. Userspace cannot use the target ID as caller credentials.
+
+The trusted VFS entrypoints also support directory and symlink metadata without
+following links. Native operations remain descriptor-based file administration;
+no directory-handle or login/account-management API is added. Named-user ACL
+entries, supplementary groups, persistent quotas and general multiuser
+administration remain unfinished. Host tests cover admission without device
+access, persisted publication, token revocation and failed flush. Exact-head
+GitHub validation is required; no local tests or hardware qualification ran.

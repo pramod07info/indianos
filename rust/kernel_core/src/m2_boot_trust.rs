@@ -39,18 +39,30 @@ pub enum Error{
 /// policy, provide trust roots, or skip the verified boot transition.
 pub struct BootTrust<H:HardwareTrust,S:PolicySlots>{
  platform:H,slots:S,registry:Registry<MAX_PUBLISHERS>,
- active_slot:Option<usize>,active_sequence:u64,
+ active_slot:Option<usize>,active_sequence:u64,active_root:Option<[u8;32]>,
 }
 impl<H:HardwareTrust,S:PolicySlots> BootTrust<H,S>{
  pub const fn new(platform:H,slots:S)->Self{
   Self{platform,slots,registry:Registry::new(),
-   active_slot:None,active_sequence:0}
+   active_slot:None,active_sequence:0,active_root:None}
+ }
+ /// Check platform continuity before exposing a cached policy. The provider
+ /// is still a trusted hardware boundary, not caller-supplied state. A real
+ /// platform adapter must serialize trust changes with policy consumers.
+ fn active_is_current(&self)->bool{
+  self.active_slot.is_some()&&self.active_root.is_some_and(|root|
+   self.platform.read_authenticated_boot_root()==Ok(root)&&
+   self.platform.read_protected_sequence()==Ok(self.active_sequence))
+ }
+ fn invalidate_active(&mut self){
+  self.active_slot=None;self.active_sequence=0;self.active_root=None;
+  self.registry=Registry::new();
  }
  pub fn registry(&self)->Option<&Registry<MAX_PUBLISHERS>>{
-  self.active_slot.map(|_|&self.registry)
+  self.active_is_current().then_some(&self.registry)
  }
  pub fn current_sequence(&self)->Option<u64>{
-  self.active_slot.map(|_|self.active_sequence)
+  self.active_is_current().then_some(self.active_sequence)
  }
  pub fn platform(&self)->&H{&self.platform}
  pub fn slots(&self)->&S{&self.slots}
@@ -78,8 +90,7 @@ impl<H:HardwareTrust,S:PolicySlots> BootTrust<H,S>{
  pub fn boot_recover<const N:usize>(
   &mut self,auth:&Access<N>,administrator:Identity,now:u64
  )->Result<u64,Error>{
-  self.active_slot=None;self.active_sequence=0;
-  self.registry=Registry::new(); // fail closed on *any* recovery failure
+  self.invalidate_active(); // fail closed on *any* recovery failure
   auth.require(administrator,INSTALL,now)
    .map_err(|_|Error::Unauthenticated)?;
   let root=self.platform.read_authenticated_boot_root()
@@ -125,6 +136,7 @@ impl<H:HardwareTrust,S:PolicySlots> BootTrust<H,S>{
   self.registry=registry;
   self.active_slot=Some(slot);
   self.active_sequence=snapshot.sequence;
+  self.active_root=Some(root);
   Ok(snapshot.sequence)
  }
  /// Stage a higher sequence to the INACTIVE durable slot only. No key
@@ -135,13 +147,26 @@ impl<H:HardwareTrust,S:PolicySlots> BootTrust<H,S>{
   auth:&Access<N>,administrator:Identity,now:u64
  )->Result<usize,Error>{
   let old_slot=self.active_slot.ok_or(Error::NotReady)?;
-  let floor=self.platform.read_protected_sequence()
-    .map_err(|_|Error::PlatformUnavailable)?;
+  let floor=match self.platform.read_protected_sequence(){
+   Ok(floor)=>floor,
+   Err(())=>{self.invalidate_active();return Err(Error::PlatformUnavailable);}
+  };
+  let root=match self.platform.read_authenticated_boot_root(){
+   Ok(root)=>root,
+   Err(())=>{self.invalidate_active();return Err(Error::PlatformUnavailable);}
+  };
+  // Another boot owner, firmware reset, or counter update invalidates the
+  // cached registry. Re-establish it only by signed durable-slot recovery;
+  // staging an unrelated newer signature cannot bridge this trust change.
+  if self.active_root!=Some(root){
+   self.invalidate_active();return Err(Error::Unauthenticated);
+  }
+  if floor!=self.active_sequence{
+   self.invalidate_active();return Err(Error::Rollback);
+  }
   if update.sequence<=floor||update.sequence<=self.active_sequence{
    return Err(Error::Rollback);
   }
-  let root=self.platform.read_authenticated_boot_root()
-    .map_err(|_|Error::PlatformUnavailable)?;
   let proposed=Self::verify_snapshot(update,&root,auth,administrator,now)?;
   // Never accept signer-epoch rollback, or implicit reactivation of a
   // locally revoked signer at the same epoch.
@@ -241,6 +266,41 @@ mod m2_tests{
   assert_eq!(b.boot_recover(&access(),who(),1),Ok(3));
   assert_eq!(b.registry().unwrap().public_key(7,2),Ok(PUBLISHER));
   b
+ }
+ #[test]fn m2_boottrust_counter_change_retires_cached_policy_before_staging(){
+  for floor in [2,4]{
+   let mut b=bootstrapped();let slots=b.slots.slots;
+   b.platform.floor=floor;
+   assert!(b.registry().is_none());assert_eq!(b.current_sequence(),None);
+   assert_eq!(b.stage_signed_update(&policy(5,4,true),&access(),who(),1),Err(Error::Rollback));
+   assert_eq!(b.slots.slots,slots);assert!(b.active_slot.is_none());
+   b.platform.floor=3;
+   assert!(b.registry().is_none()); // only recovery can grant authority again
+   assert_eq!(b.boot_recover(&access(),who(),1),Ok(3));
+  }
+ }
+ #[test]fn m2_boottrust_changed_root_cannot_bridge_old_registry_to_update(){
+  for root in [[0;32],[0xff;32],[9;32]]{
+   let mut b=bootstrapped();let slots=b.slots.slots;b.platform.boot_root=root;
+   assert!(b.registry().is_none());assert_eq!(b.current_sequence(),None);
+   assert_eq!(b.stage_signed_update(&policy(4,3,true),&access(),who(),1),
+      Err(Error::Unauthenticated));
+   assert_eq!(b.slots.slots,slots);assert!(b.active_slot.is_none());
+   b.platform.boot_root=BOOT;assert!(b.registry().is_none());
+   assert_eq!(b.boot_recover(&access(),who(),1),Ok(3));
+  }
+ }
+ #[test]fn m2_boottrust_platform_read_failure_revokes_authorization_without_slot_write(){
+  for root_failure in [false,true]{
+   let mut b=bootstrapped();let slots=b.slots.slots;
+   b.platform.fail_read=!root_failure;b.platform.fail_root=root_failure;
+   assert!(b.registry().is_none());assert_eq!(b.current_sequence(),None);
+   assert_eq!(b.stage_signed_update(&policy(4,3,true),&access(),who(),1),
+      Err(Error::PlatformUnavailable));
+   assert_eq!(b.slots.slots,slots);assert!(b.active_slot.is_none());
+   b.platform.fail_read=false;b.platform.fail_root=false;
+   assert!(b.registry().is_none());
+  }
  }
  #[test]fn m2_boottrust_signed_ab_update_then_reboot_and_same_floor_recovers(){
   let mut b=bootstrapped();

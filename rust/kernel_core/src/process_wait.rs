@@ -39,8 +39,19 @@ pub(crate) struct Status{pub pid:u32,pub generation:u64,state:i32,reclaimed:bool
 impl Status{
  pub fn capture(process:&Process,generation:u64,consumed:bool)->Result<Self,Error>{
   let terminal=matches!(process.state,4|5);
+  // Fail closed on a contradictory PCB instead of turning a lost root into
+  // an indefinitely pending child, or publishing a fabricated completion.
+  // NEW/READY may still be unbound; a running/terminal process cannot lose
+  // its owned root before the explicit reclamation transition.
+  let root=process.address_space_root;
+  let fault=process.fault_vector!=0||process.fault_error!=0||process.fault_address!=0;
   if process.pid==0||generation==0||!(1..=5).contains(&process.state)||
-     (process.resources_reclaimed&&(!terminal||process.address_space_root!=0))||
+     (root!=0&&root&4095!=0)||
+     (process.state==1&&root!=0)||(process.state==3&&root==0)||
+     (terminal&&((root==0)!=process.resources_reclaimed))||
+     (process.resources_reclaimed&&!terminal)||
+     (!terminal&&(process.exit_status!=0||fault))||
+     (process.state==4&&fault)||(process.state==5&&process.fault_vector>31)||
      (consumed&&!process.resources_reclaimed){return Err(Error::Invalid);}
   Ok(Self{pid:process.pid,generation,state:process.state,reclaimed:process.resources_reclaimed,
    consumed,status:if terminal&&process.resources_reclaimed{process.exit_status}else{0},
@@ -98,7 +109,7 @@ impl Wait{
  fn request()->Request{Request{pid:2,generation:9,rounds:1,address:0x400000}}
  fn status(reclaimed:bool)->Status{
   Status::capture(&Process{pid:2,state:if reclaimed{4}else{2},
-   address_space_root:if reclaimed{0}else{0x1000},exit_status:7,
+   address_space_root:if reclaimed{0}else{0x1000},exit_status:if reclaimed{7}else{0},
    resources_reclaimed:reclaimed,..Process::empty()},9,false).unwrap()
  }
  #[test]fn completion_waits_for_reclamation_and_copies_no_kernel_addresses(){
@@ -150,5 +161,79 @@ impl Wait{
   let status=Status::capture(&process,9,false).unwrap();assert!(status.complete());
   let bytes=status.wire();assert_eq!(&bytes[24..32],&0x10eu64.to_le_bytes());
   assert_eq!(&bytes[32..40],&14u64.to_le_bytes());assert!(bytes[40..].iter().all(|&v|v==0));
+ }
+}
+
+#[cfg(test)]mod lifecycle_integrity_tests{
+ use super::*;
+ #[test]fn live_pcb_transitions_capture_only_after_real_ownership_changes(){
+  let mut process=Process{pid:2,state:1,..Process::empty()};
+  assert!(Status::capture(&process,9,false).is_ok());
+  assert!(unsafe{crate::indianos_process_ready(&mut process)});
+  assert!(Status::capture(&process,9,false).is_ok());
+  assert!(unsafe{crate::indianos_process_bind(&mut process,0x1000)});
+  assert!(Status::capture(&process,9,false).is_ok());
+  assert!(unsafe{crate::indianos_process_start(&mut process,0x1000)});
+  assert!(Status::capture(&process,9,false).is_ok());
+  assert!(unsafe{crate::indianos_process_exit(&mut process,7)});
+  assert!(!Status::capture(&process,9,false).unwrap().complete());
+  assert!(unsafe{crate::indianos_process_reap(&mut process)});
+  let status=Status::capture(&process,9,false).unwrap();
+  assert!(status.complete());assert_eq!(status.available(),Ok(true));
+  assert_eq!(Status::capture(&process,9,true).unwrap().available(),Err(Error::Consumed));
+ }
+ #[test]fn lost_unaligned_or_premature_roots_never_become_waitable_status(){
+  for (state,root,reclaimed) in [(1,0x1000,false),(2,0x1001,false),
+     (3,0,false),(3,0x1001,false),(4,0,false),(5,0,false),
+     (2,0,true),(4,0x1000,true),(5,0x1000,true)]{
+   let process=Process{pid:2,state,address_space_root:root,resources_reclaimed:reclaimed,
+    fault_vector:if state==5{14}else{0},..Process::empty()};
+   assert_eq!(Status::capture(&process,9,false),Err(Error::Invalid));
+  }
+ }
+ #[test]fn stale_exit_and_fault_payloads_cannot_hide_in_nonterminal_or_normal_exit(){
+  for state in 1..=4{
+   for field in 0..4{
+    let mut process=Process{pid:2,state,address_space_root:if state==1{0}else{0x1000},
+      ..Process::empty()};
+    match field{0=>process.exit_status=7,1=>process.fault_vector=14,
+      2=>process.fault_error=6,_=>process.fault_address=0xffff800000001000}
+    if state==4&&field==0{assert!(Status::capture(&process,9,false).is_ok());}
+    else{assert_eq!(Status::capture(&process,9,false),Err(Error::Invalid));}
+   }
+  }
+  let fault=Process{pid:2,state:5,address_space_root:0x1000,fault_vector:32,..Process::empty()};
+  assert_eq!(Status::capture(&fault,9,false),Err(Error::Invalid));
+ }
+ #[test]fn divide_error_is_a_real_fault_and_interrupt_vector_cannot_retire_process(){
+  let mut process=Process{pid:2,state:1,..Process::empty()};
+  assert!(unsafe{crate::indianos_process_ready(&mut process)});
+  assert!(unsafe{crate::indianos_process_bind(&mut process,0x1000)});
+  assert!(unsafe{crate::indianos_process_start(&mut process,0x1000)});
+  assert!(!unsafe{crate::indianos_process_fault(&mut process,0x120,32,0,0)});
+  assert_eq!((process.state,process.address_space_root,process.exit_status),(3,0x1000,0));
+  assert_eq!((process.fault_vector,process.fault_error,process.fault_address),(0,0,0));
+  assert!(unsafe{crate::indianos_process_fault(&mut process,0x100,0,0,0)});
+  let pending=Status::capture(&process,9,false).unwrap();
+  assert!(!pending.complete());
+  assert!(unsafe{crate::indianos_process_reap(&mut process)});
+  let status=Status::capture(&process,9,false).unwrap();assert!(status.complete());
+  let bytes=status.wire();assert_eq!(&bytes[16..20],&5i32.to_le_bytes());
+  assert_eq!(&bytes[24..32],&0x100u64.to_le_bytes());
+  assert_eq!(&bytes[32..40],&0u64.to_le_bytes());
+  assert!(!unsafe{crate::indianos_process_success(&process)});
+ }
+ #[test]fn invalid_snapshot_retires_wait_without_copy_or_completion_consumption(){
+  let request=Request{pid:2,generation:9,rounds:32,address:0x400000};
+  let mut wait=Wait::begin(4,request).unwrap();
+  let lost=Process{pid:2,state:4,exit_status:7,..Process::empty()};
+  assert_eq!(wait.poll(4,Status::capture(&lost,9,false),|_|panic!("invalid PCB copied")),
+     Poll::Failed(Error::Invalid));
+  assert!(!wait.active());
+  // Repairing the kernel-owned lifecycle snapshot permits a fresh wait;
+  // the rejected continuation never consumes the child's eventual status.
+  let cleaned=Process{resources_reclaimed:true,..lost};
+  let mut retry=Wait::begin(4,request).unwrap();
+  assert_eq!(retry.poll(4,Status::capture(&cleaned,9,false),|_|true),Poll::Delivered);
  }
 }

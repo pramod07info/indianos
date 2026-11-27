@@ -9,11 +9,14 @@ pub enum NvmeError{Invalid,OutOfBounds,Duplicate,Full,NotFound,Stale}
 pub struct Queue<const N:usize>{active:[Option<Request>;N],epoch:u64}
 impl<const N:usize> Queue<N>{
     pub const fn new(epoch:u64)->Self{Self{active:[None;N],epoch}}
-    pub fn submit(&mut self,epoch:u64,req:Request,namespace_blocks:u64)
-        ->Result<(),NvmeError>{
+    /// Validate structural/controller admission without invoking DMA ownership
+    /// callbacks or changing the active table. Broadcast NSID is reserved for
+    /// commands whose specification permits it, never namespace block I/O.
+    fn submission_slot(&self,epoch:u64,req:Request,namespace_blocks:u64)
+        ->Result<usize,NvmeError>{
         if epoch==0||epoch!=self.epoch{return Err(NvmeError::Stale);}
-        if N>MAX_QUEUE_DEPTH||req.namespace_id==0||req.blocks==0||
-            req.dma_address==0||req.dma_address%4096!=0||
+        if N>MAX_QUEUE_DEPTH||req.namespace_id==0||req.namespace_id==u32::MAX||
+            req.blocks==0||req.dma_address==0||req.dma_address%4096!=0||
             req.dma_address.checked_add(u64::from(req.blocks)*512).is_none(){
             return Err(NvmeError::Invalid);
         }
@@ -24,8 +27,12 @@ impl<const N:usize> Queue<N>{
         if self.active.iter().flatten().any(|r|r.command_id==req.command_id){
             return Err(NvmeError::Duplicate);
         }
-        let free=self.active.iter_mut().find(|s|s.is_none()).ok_or(NvmeError::Full)?;
-        *free=Some(req);Ok(())
+        self.active.iter().position(|s|s.is_none()).ok_or(NvmeError::Full)
+    }
+    pub fn submit(&mut self,epoch:u64,req:Request,namespace_blocks:u64)
+        ->Result<(),NvmeError>{
+        let slot=self.submission_slot(epoch,req,namespace_blocks)?;
+        self.active[slot]=Some(req);Ok(())
     }
     pub fn complete(&mut self,epoch:u64,id:u16)->Result<Request,NvmeError>{
         if epoch==0||epoch!=self.epoch{return Err(NvmeError::Stale);}
@@ -126,24 +133,15 @@ impl<const N:usize> Queue<N>{
  /// WS35: Verify all DMA pages before mutating the command-id table.
  pub fn submit_owned<F>(&mut self,epoch:u64,req:Request,namespace_blocks:u64,
   mut owns_page:F)->Result<(),NvmeError> where F:FnMut(u64,u64)->bool{
-  if epoch==0||epoch!=self.epoch{return Err(NvmeError::Stale);}
-  if N>MAX_QUEUE_DEPTH||req.namespace_id==0||req.blocks==0||
-    req.dma_address==0||req.dma_address%4096!=0 {
-   return Err(NvmeError::Invalid);
-  }
-  if req.lba>=namespace_blocks||
-   u64::from(req.blocks)>namespace_blocks-req.lba{
-   return Err(NvmeError::OutOfBounds);
-  }
+  let slot=self.submission_slot(epoch,req,namespace_blocks)?;
   let bytes=u64::from(req.blocks)*512;
-  req.dma_address.checked_add(bytes).ok_or(NvmeError::Invalid)?;
   let mut off=0u64;
   while off<bytes{
    let addr=req.dma_address.checked_add(off).ok_or(NvmeError::Invalid)?;
    if !owns_page(addr,4096){return Err(NvmeError::Invalid);}
    off=off.checked_add(4096).ok_or(NvmeError::Invalid)?;
   }
-  self.submit(epoch,req,namespace_blocks)
+  self.active[slot]=Some(req);Ok(())
  }
  /// WS36: Exact request identity includes block count (previous exact helper
  /// checked only controller epoch, CID, namespace, LBA and DMA address).
@@ -311,5 +309,43 @@ mod pr782_ws96_100_tests{
   assert_eq!(q.reset_drained(5,false),Err(NvmeError::Stale));
   assert_eq!(q.reset_drained(5,true),Ok(()));
   assert_eq!(q.outstanding(5),Ok(0));
+ }
+}
+
+#[cfg(test)]
+mod namespace_submission_admission_tests {
+ use super::*;
+ fn request(id:u16)->Request{Request{command_id:id,namespace_id:1,lba:0,
+  blocks:8,dma_address:0x4000}}
+ #[test]fn block_io_never_accepts_broadcast_namespace_or_invokes_its_mapper(){
+  let mut queue=Queue::<2>::new(7);let broadcast=Request{namespace_id:u32::MAX,..request(1)};
+  assert_eq!(queue.submit(7,broadcast,100),Err(NvmeError::Invalid));
+  let mut calls=0;
+  assert_eq!(queue.submit_owned(7,broadcast,100,|_,_|{calls+=1;true}),
+   Err(NvmeError::Invalid));assert_eq!(calls,0);
+  assert_eq!(queue.submit_batch(7,&[(request(1),100),(broadcast,100)]),
+   Err(NvmeError::Invalid));assert_eq!(queue.outstanding(7),Ok(0));
+ }
+ #[test]fn duplicate_full_and_stale_requests_do_not_consult_dma_owner(){
+  let mut queue=Queue::<1>::new(7);queue.submit(7,request(1),100).unwrap();
+  let mut calls=0;
+  assert_eq!(queue.submit_owned(7,request(1),100,|_,_|{calls+=1;true}),
+   Err(NvmeError::Duplicate));
+  assert_eq!(queue.submit_owned(7,request(2),100,|_,_|{calls+=1;true}),
+   Err(NvmeError::Full));
+  assert_eq!(queue.submit_owned(6,request(2),100,|_,_|{calls+=1;true}),
+   Err(NvmeError::Stale));
+  assert_eq!(calls,0);assert_eq!(queue.outstanding(7),Ok(1));
+  assert_eq!(queue.complete_request(7,request(1)),Ok(request(1)));
+ }
+ #[test]fn failed_page_ownership_preserves_admitted_slot_for_retry(){
+  let mut queue=Queue::<1>::new(7);let req=Request{blocks:16,..request(1)};
+  let mut pages=0;
+  assert_eq!(queue.submit_owned(7,req,100,|address,_|{
+   pages+=1;address==0x4000
+  }),Err(NvmeError::Invalid));assert_eq!(pages,2);
+  assert_eq!(queue.outstanding(7),Ok(0));
+  assert_eq!(queue.submit_owned(7,req,100,|_,_|true),Ok(()));
+  assert_eq!(queue.complete_request(7,req),Ok(req));
  }
 }

@@ -72,8 +72,10 @@ fn discover()->Option<(u8,u8,u8,u16)>{
                 let port=(bar&!3) as u16;
                 if port<0x1000 || (port as u32)+0x20>0x10000{return None;}
                 let command=pciread(bus,slot,function,0x04);
-                pciwrite(bus,slot,function,0x04,command|0x0005);
-                if pciread(bus,slot,function,0x04)&0x0005!=0x0005{return None;}
+                // Decode registers without enabling inherited DMA queues.
+                // COMMAND shares a dword with W1C status: never echo status.
+                pciwrite(bus,slot,function,0x04,(command&0xffff&!0x0004)|1);
+                if pciread(bus,slot,function,0x04)&0x0005!=1{return None;}
                 return Some((bus,slot,function,port));
             }
         }
@@ -199,7 +201,38 @@ fn configure_queue(port:u16,queue:u16,q:&Queue)->bool{
         return false;
     }
     unsafe{outl(port+0x08,(q.ring_phys/PAGE as u64) as u32);}
-    true
+    let observed=unsafe{inl(port+0x08)};
+    observed==(q.ring_phys/PAGE as u64) as u32
+}
+/// Both normal close and partially published queue setup must establish the
+/// same DMA retirement barrier before returning pages to the allocator.
+/// The trait keeps failure sequencing testable without executing port I/O.
+trait DeviceControl{
+    fn reset(&mut self);
+    fn status(&mut self)->u8;
+    fn identity(&mut self)->u32;
+    fn command(&mut self)->u32;
+    fn set_command(&mut self,command:u32);
+}
+struct LegacyControl{port:u16,bus:u8,slot:u8,function:u8}
+impl DeviceControl for LegacyControl{
+    fn reset(&mut self){unsafe{outb(self.port+0x12,0);}}
+    fn status(&mut self)->u8{unsafe{inb(self.port+0x12)}}
+    fn identity(&mut self)->u32{pciread(self.bus,self.slot,self.function,0)}
+    fn command(&mut self)->u32{pciread(self.bus,self.slot,self.function,4)}
+    fn set_command(&mut self,command:u32){pciwrite(self.bus,self.slot,self.function,4,command);}
+}
+fn quiesce_device(control:&mut impl DeviceControl)->bool{
+    control.reset();compiler_fence(Ordering::SeqCst);
+    let reset=control.status();let before=control.identity();
+    if reset!=0||before!=legacy_nic_identity(){return false;}
+    let disabled=(control.command()&0xffff)&!4;
+    control.set_command(disabled);compiler_fence(Ordering::SeqCst);
+    let command=control.command();let after=control.identity();
+    // Recheck reset after disabling bus mastering: do not release pages if
+    // the device re-entered a running state during the PCI transaction.
+    let final_reset=control.status();
+    nic_dma_retired(reset,before,after,command)&&final_reset==0
 }
 pub struct VirtioNet{
     port:u16,
@@ -238,10 +271,18 @@ impl VirtioNet{
     /// No other I/O master may own the PCI device, DMA frames or virtqueues.
     pub unsafe fn probe()->Result<Self,Error>{
         let Some((bus,slot,function,port))=discover()else{return Err(Error::Device);};
-        unsafe{outb(port+0x12,0);outb(port+0x12,DEVICE_ACK|DRIVER);}
+        let mut control=LegacyControl{port,bus,slot,function};
+        if !quiesce_device(&mut control){return Err(Error::Device);}
+        // Enable DMA only after inherited state has been demonstrably reset.
+        let command=(control.command()&0xffff)|5;
+        control.set_command(command);
+        if control.identity()!=legacy_nic_identity()||control.command()&5!=5{
+            return Err(Error::Device);
+        }
+        unsafe{outb(port+0x12,DEVICE_ACK|DRIVER);}
         let offered=unsafe{inl(port)};
         if offered&VIRTIO_MAC_FEATURE==0{
-            unsafe{outb(port+0x12,0);}
+            let _=quiesce_device(&mut control);
             return Err(Error::Device);
         }
         // Refuse checksum offloads, mergeable buffers, TSO and any feature
@@ -252,34 +293,43 @@ impl VirtioNet{
             *byte=unsafe{inb(port+0x14+i as u16)};
         }
         if mac==[0;6] || mac==[0xff;6] || mac[0]&1!=0{
-            unsafe{outb(port+0x12,0);}
+            let _=quiesce_device(&mut control);
             return Err(Error::Device);
         }
         let mut hhdm=0u64;
-        if !unsafe{boot_hhdm_offset(&mut hhdm)}{return Err(Error::Device);}
+        if !unsafe{boot_hhdm_offset(&mut hhdm)}{
+            let _=quiesce_device(&mut control);return Err(Error::Device);
+        }
         // Legacy devices expose a fixed size rather than accepting our
         // preferred size. QEMU revisions use both 256 and 1024 RX entries.
         let (Some(rx_layout),Some(tx_layout))=(queue_layout(port,QUEUE_RX),
             queue_layout(port,QUEUE_TX))else{
-            unsafe{outb(port+0x12,0);}return Err(Error::Device);
+            let _=quiesce_device(&mut control);return Err(Error::Device);
         };
-        let mut rx=Queue::allocate(hhdm,rx_layout)?;
+        let mut rx=match Queue::allocate(hhdm,rx_layout){
+            Ok(v)=>v,Err(e)=>{let _=quiesce_device(&mut control);return Err(e);}
+        };
         let mut tx=match Queue::allocate(hhdm,tx_layout){
             Ok(v)=>v,
-            Err(e)=>{rx.release();return Err(e);}
+            Err(e)=>{let _=quiesce_device(&mut control);rx.release();return Err(e);}
         };
         let rings_ready=
             configure_queue(port,QUEUE_RX,&rx) &&
             configure_queue(port,QUEUE_TX,&tx);
         if !rings_ready {
-            unsafe{outb(port+0x12,0);}
-            rx.release();tx.release();
+            // A PFN may already be device-visible. Failed/unacknowledged
+            // reset deliberately retains pages, matching uncertain close.
+            if quiesce_device(&mut control){rx.release();tx.release();}
             return Err(Error::Device);
         }
         rx.descriptor(FRAME_CAP as u32,true);
         rx.offer();
         unsafe{outb(port+0x12,DEVICE_ACK|DRIVER|DRIVER_OK);}
         compiler_fence(Ordering::SeqCst);
+        if unsafe{inb(port+0x12)}!=(DEVICE_ACK|DRIVER|DRIVER_OK){
+            if quiesce_device(&mut control){rx.release();tx.release();}
+            return Err(Error::Device);
+        }
         unsafe{outw(port+0x10,QUEUE_RX);}
         Ok(Self{port,bus,slot,function,mac,rx,tx,faulted:false})
     }
@@ -292,23 +342,8 @@ impl VirtioNet{
     pub fn close(self)->bool{
         #[cfg(feature="test-r136-nic-irq")]
         if crate::nic_interrupt::active(self.port)&&!unsafe{crate::nic_interrupt::disable(self.port)}{return false;}
-        unsafe{outb(self.port+0x12,0);}
-        compiler_fence(Ordering::SeqCst);
-        // A removed/replaced device may return all-ones PCI identity,
-        // and a device may change after we disable bus mastering.
-        let reset=unsafe{inb(self.port+0x12)};
-        let identity_before=pciread(self.bus,self.slot,self.function,0);
-        if reset!=0 || identity_before!=legacy_nic_identity(){return false;}
-        let command=pciread(self.bus,self.slot,self.function,0x04);
-        // Preserve status W1C bits by writing only COMMAND[15:0].
-        let disabled=(command & 0xffff) & !0x0004;
-        pciwrite(self.bus,self.slot,self.function,0x04,disabled);
-        compiler_fence(Ordering::SeqCst);
-        let observed=pciread(self.bus,self.slot,self.function,0x04);
-        let identity_after=pciread(self.bus,self.slot,self.function,0);
-        if !nic_dma_retired(reset,identity_before,identity_after,observed){
-            return false;
-        }
+        let mut control=LegacyControl{port:self.port,bus:self.bus,slot:self.slot,function:self.function};
+        if !quiesce_device(&mut control){return false;}
         self.rx.release();self.tx.release();
         true
     }
@@ -502,6 +537,58 @@ impl EthernetDevice for VirtioNet{
 #[cfg(test)]
 mod tests{
     use super::*;
+    /// Host-only transport: production uses actual legacy PCI and port I/O.
+    struct Control{
+        statuses:[u8;2],identities:[u32;2],commands:[u32;2],
+        status_index:usize,identity_index:usize,command_index:usize,
+        written:Option<u32>,events:std::vec::Vec<&'static str>,
+    }
+    impl Control{
+        fn healthy()->Self{Self{
+            statuses:[0,0],identities:[legacy_nic_identity();2],
+            commands:[0xa5a5_0405,0x0401],status_index:0,identity_index:0,
+            command_index:0,written:None,events:std::vec::Vec::new(),
+        }}
+    }
+    impl DeviceControl for Control{
+        fn reset(&mut self){self.events.push("reset");}
+        fn status(&mut self)->u8{
+            self.events.push("status");let i=self.status_index;self.status_index+=1;self.statuses[i]
+        }
+        fn identity(&mut self)->u32{
+            self.events.push("identity");let i=self.identity_index;self.identity_index+=1;self.identities[i]
+        }
+        fn command(&mut self)->u32{
+            self.events.push("command");let i=self.command_index;self.command_index+=1;self.commands[i]
+        }
+        fn set_command(&mut self,command:u32){self.events.push("disable");self.written=Some(command);}
+    }
+    #[test]fn dma_retirement_orders_reset_disable_and_final_verification(){
+        let mut control=Control::healthy();assert!(quiesce_device(&mut control));
+        assert_eq!(control.written,Some(0x0401)); // no W1C status writeback
+        assert_eq!(control.events,["reset","status","identity","command","disable",
+            "command","identity","status"]);
+    }
+    #[test]fn withheld_reset_or_missing_device_never_reaches_disable_or_release_barrier(){
+        for (reset,identity) in [(0xff,legacy_nic_identity()),(7,legacy_nic_identity()),(0,u32::MAX)]{
+            let mut control=Control::healthy();control.statuses[0]=reset;control.identities[0]=identity;
+            assert!(!quiesce_device(&mut control));assert_eq!(control.written,None);
+            assert_eq!(control.events,["reset","status","identity"]);
+        }
+    }
+    #[test]fn dma_retirement_rejects_running_replaced_or_bus_mastering_device(){
+        for case in 0..4{
+            let mut control=Control::healthy();
+            match case{
+                0=>control.commands[1]|=4,
+                1=>control.identities[1]=u32::MAX,
+                2=>control.statuses[1]=7,
+                _=>control.commands[1]=0,
+            }
+            assert!(!quiesce_device(&mut control),"case {case}");
+            assert_eq!(control.written,Some(0x0401));
+        }
+    }
     fn mock_queue(ring:&mut [u64;1536],buffer:&mut [u64;512])->Queue{
         Queue{ring_phys:0x1000,ring:ring.as_mut_ptr().cast(),
             buffer_phys:0x4000,buffer:buffer.as_mut_ptr().cast(),queued:0,used:0,

@@ -539,7 +539,9 @@ pub unsafe extern "C" fn indianos_process_fault(
     p: *mut Process, status: u64, vector: u64, error: u64, address: u64
 ) -> bool {
     let Some(p) = (unsafe { p.as_mut() }) else { return false; };
-    if p.state != RUNNING || p.address_space_root == 0 || vector == 0 { return false; }
+    // Exception vector zero is the architectural divide error (#DE), not an
+    // absent fault. Vectors 32 and above belong to interrupt dispatch instead.
+    if p.state != RUNNING || p.address_space_root == 0 || vector > 31 { return false; }
     p.state = FAULTED;
     p.exit_status = status;
     p.fault_vector = vector;

@@ -33,8 +33,9 @@ pub const FS_ABI_POSITIONED_IO:u32=16;
 pub const FS_ABI_UNRELATED_DESCRIPTOR_READERS:u32=32;
 pub const FS_ABI_DESCRIPTOR_FSYNC:u32=64;
 pub const FS_ABI_BLOCKING_LOCKS:u32=128;
+pub const FS_ABI_OWNERSHIP_ADMIN:u32=256;
 pub const FS_ABI_FEATURES:u32=7|FS_ABI_UNRELATED_READERS|FS_ABI_POSITIONED_IO|
-    FS_ABI_UNRELATED_DESCRIPTOR_READERS|FS_ABI_DESCRIPTOR_FSYNC|FS_ABI_BLOCKING_LOCKS;
+    FS_ABI_UNRELATED_DESCRIPTOR_READERS|FS_ABI_DESCRIPTOR_FSYNC|FS_ABI_BLOCKING_LOCKS|FS_ABI_OWNERSHIP_ADMIN;
 pub const FS_ABI_INFO:u64=FS_ABI_VERSION as u64|
     ((FS_ABI_DESCRIPTOR_BYTES as u64)<<16)|((FS_ABI_FEATURES as u64)<<32);
 const SLOTS:usize=4;
@@ -441,7 +442,7 @@ impl FileHandles{
              crate::vfs_path::is_within_tree(path,handle.pathname())==Ok(true)))
     }
     fn descriptor_action_mutates(action:u64)->bool{
-        matches!(action,3|6..=13|16|24|26|28..=32|38)
+        matches!(action,3|6..=13|16|24|26|28..=32|38..=40)
     }
     fn lock_range(argument:u64)->Result<(u64,u64),FsError>{
         let start=argument&0xffff_ffff;let length=argument>>32;
@@ -563,13 +564,17 @@ impl FileHandles{
                           argument:u64,path:&str,buffer:&[u8])
                           ->Result<(),FsError>{
         if !self.owns(owner){return Err(FsError::InvalidName);}
-        if action==38{
+        if matches!(action,38..=40){
             let handle=self.entries[self.index(owner,token)?];
-            if owner.pid!=1||!path.is_empty()||!buffer.is_empty()||argument>0o777||
+            if owner.pid!=1||!path.is_empty()||!buffer.is_empty()||argument>(if action==38{0o777}else{u16::MAX as u64})||
                !self.root_allows(owner,handle.pathname())||
                WriteGuard::allow_path(handle.pathname()).is_err()||self.has_foreign_descriptors(owner){
                 return Err(FsError::InvalidName);
             }
+            // A transfer requires root before any media probe. Group changes
+            // still validate the persisted owner after the volume mounts.
+            let credentials=self.credentials_for(owner)?;
+            if action==39&&credentials.uid()!=0{return Err(FsError::InvalidName);}
             return Ok(());
         }
         if matches!(action,34..=37){
@@ -1385,19 +1390,25 @@ impl FileHandles{
             }else if !matches!(action,4|5){
                 let handle=self.entries[self.index(owner,token)?];
                 let access=if Self::descriptor_action_mutates(action){2}else{4};
-                fs.authorize_access(credentials,handle.pathname(),if matches!(action,27|38){0}else{access})?;
+                fs.authorize_access(credentials,handle.pathname(),if matches!(action,27|38..=40){0}else{access})?;
                 if matches!(action,13|16|30|31){
                     fs.authorize_parent(credentials,handle.pathname())?;
                     if matches!(action,13|16|31){fs.authorize_parent(credentials,path)?;}
                 }
             }
         }
-        if action==38{
+        if matches!(action,38..=40){
             self.preflight_selected(action,owner,token,argument,path,buffer)?;
             let handle=self.entries[self.index(owner,token)?];
             if handle.filesystem_generation!=fs.generation(){return Err(FsError::InvalidName);}
             self.write_guard.preflight(handle.pathname(),1).map_err(|_|FsError::InvalidName)?;
-            fs.chmod_as(self.credentials_for(owner)?,handle.pathname(),argument as u16)?;
+            let credentials=self.credentials_for(owner)?;
+            match action{
+                38=>fs.chmod_as(credentials,handle.pathname(),argument as u16)?,
+                39=>fs.chown_as(credentials,handle.pathname(),argument as u16)?,
+                40=>fs.chgrp_as(credentials,handle.pathname(),argument as u16)?,
+                _=>return Err(FsError::InvalidName),
+            }
             fs.sync()?;
             self.write_guard.completed(1);
             self.entries.fill(Handle::EMPTY);
@@ -1870,7 +1881,7 @@ pub fn operation_on_selected_volume<D:BlockDevice>(
          // Existing selected volume failed verification on a write: media
          // may be uncertain; revoke cached handles before the next syscall.
          if prior==Some(receipt)&&
-            matches!(action,3|6|7..=13|16|24|26|27|28..=32|38){
+            matches!(action,3|6|7..=13|16|24|26|27|28..=32|38..=40){
              table.selected_quarantined=true;
              table.entries.fill(Handle::EMPTY);
          }
@@ -1902,7 +1913,7 @@ pub fn operation_on_selected_volume<D:BlockDevice>(
     // explicitly reprobes the exact same receipt with two healthy heads.
     // Closing a handle, process rebinding, or reopening never resets this.
     if matches!(outcome,Err(FsError::Io|FsError::InvalidVolume)) &&
-       matches!(action,3|6|7..=13|16|24|26|27|28..=32|38){
+       matches!(action,3|6|7..=13|16|24|26|27|28..=32|38..=40){
         table.selected_quarantined=true;
         table.entries.fill(Handle::EMPTY);
     }
@@ -2724,6 +2735,7 @@ mod r094_authenticated_cow_ops {
   assert_eq!((FS_ABI_INFO>>32) as u32&FS_ABI_UNRELATED_READERS,FS_ABI_UNRELATED_READERS);
   assert_eq!((FS_ABI_INFO>>32) as u32&FS_ABI_DESCRIPTOR_FSYNC,FS_ABI_DESCRIPTOR_FSYNC);
   assert_eq!((FS_ABI_INFO>>32) as u32&FS_ABI_BLOCKING_LOCKS,FS_ABI_BLOCKING_LOCKS);
+  assert_eq!((FS_ABI_INFO>>32) as u32&FS_ABI_OWNERSHIP_ADMIN,FS_ABI_OWNERSHIP_ADMIN);
   assert_eq!(operation_authenticated(&mut table,37,owner,1,0,"",&mut[]),Err(FsError::InvalidName));
   assert_eq!(operation_authenticated(&mut table,37,owner,0,1,"",&mut[]),Err(FsError::InvalidName));
   assert_eq!(FileHandles::lock_range(u64::MAX),Err(FsError::TooLarge));
@@ -3554,6 +3566,90 @@ mod r106_checked_partition_authenticated_file_api_tests{
   assert_eq!(table.security_statistics(),stats);
  }
 
+ // The selected-volume entrypoint exercises admission before any media I/O,
+ // actual COW publication, flush and authority retirement as one operation.
+ struct OwnershipDisk<'a>{disk:&'a mut Disk,flushes:u32,fail_flush:bool}
+ impl BlockDevice for OwnershipDisk<'_>{
+  fn sector_count(&self)->u64{self.disk.sector_count()}
+  fn read_sector(&mut self,l:u64,b:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{self.disk.read_sector(l,b)}
+  fn write_sector(&mut self,l:u64,b:&[u8;SECTOR_BYTES])->Result<(),BlockError>{self.disk.write_sector(l,b)}
+  fn sync(&mut self)->Result<(),BlockError>{
+   self.flushes+=1;if self.fail_flush{Err(BlockError::Io)}else{Ok(())}
+  }
+ }
+ #[test]fn selected_owner_group_changes_flush_revoke_and_remount(){
+  let (mut disk,receipt)=disk();let mut table=FileHandles::new();
+  prepare_selected_volume_kernel(&mut table,&mut disk,receipt).unwrap();
+  let admin=table.bind_process(1).unwrap();
+  table.set_credentials_kernel(admin,0,0).unwrap();
+  let mut device=OwnershipDisk{disk:&mut disk,flushes:0,fail_flush:false};
+  let token=operation_on_selected_volume(&mut table,1,admin,0,READ,
+   "/shared/note",&mut[],&mut device,receipt).unwrap();
+  assert_eq!(operation_on_selected_volume(&mut table,39,admin,token,1000,"",
+   &mut[],&mut device,receipt),Ok(0));
+  assert_eq!(device.flushes,1);assert!(table.index(admin,token).is_err());
+  // Credential changes are trusted and revoke all old tokens too.
+  table.set_credentials_kernel(admin,1000,42).unwrap();
+  let token=operation_on_selected_volume(&mut table,1,admin,0,READ,
+   "/shared/note",&mut[],&mut device,receipt).unwrap();
+  let writes=device.disk.writes;
+  assert_eq!(operation_on_selected_volume(&mut table,40,admin,token,7,"",
+   &mut[],&mut device,receipt),Err(FsError::InvalidName));
+  assert_eq!(device.disk.writes,writes);assert_eq!(device.flushes,1);
+  assert!(table.index(admin,token).is_ok());
+  assert_eq!(operation_on_selected_volume(&mut table,40,admin,token,42,"",
+   &mut[],&mut device,receipt),Ok(0));
+  assert_eq!(device.flushes,2);assert!(table.index(admin,token).is_err());
+  let mut fs=crate::m1_partition::mount_partition_receipt_healthy(&mut device,receipt).unwrap();
+  let permission=fs.permissions("/shared/note").unwrap();
+  assert_eq!((permission.owner,permission.group),(1000,42));
+  let mut bytes=[0;9];assert_eq!(fs.read("/shared/note",&mut bytes),Ok(9));
+  assert_eq!(&bytes,b"persisted");
+ }
+ #[test]fn selected_ownership_bad_authority_is_rejected_before_device_access(){
+  let (mut disk,receipt)=disk();let mut table=FileHandles::new();
+  prepare_selected_volume_kernel(&mut table,&mut disk,receipt).unwrap();
+  let admin=table.bind_process(1).unwrap();let guest=table.bind_process(2).unwrap();
+  table.set_credentials_kernel(admin,1000,1000).unwrap();
+  let token=operation_on_selected_volume(&mut table,1,admin,0,READ,
+   "/shared/note",&mut[],&mut disk,receipt).unwrap();
+  let stale=Identity{generation:admin.generation+1,..admin};
+  for (who,action,value,path,payload) in [
+   (admin,39,1000,"",false), // ordinary UID cannot transfer an owner
+   (admin,39,65536,"",false),(admin,40,65536,"",false),
+   (guest,40,1000,"",false),(stale,40,1000,"",false),
+   (admin,40,1000,"/shared/note",false),(admin,40,1000,"",true),
+  ]{
+   let mut bytes=[0];let payload=if payload{&mut bytes[..]}else{&mut bytes[..0]};
+   assert_eq!(operation_on_selected_volume(&mut table,action,who,token,value,path,
+    payload,&mut OfflineDescriptorDevice,receipt),Err(FsError::InvalidName));
+  }
+  table.set_credentials_kernel(admin,0,0).unwrap();
+  let token=operation_on_selected_volume(&mut table,1,admin,0,READ,
+   "/shared/note",&mut[],&mut disk,receipt).unwrap();
+  operation_on_selected_volume(&mut table,1,guest,0,READ,
+   "/shared/note",&mut[],&mut disk,receipt).unwrap();
+  for action in [39,40]{
+   assert_eq!(operation_on_selected_volume(&mut table,action,admin,token,7,"",
+    &mut[],&mut OfflineDescriptorDevice,receipt),Err(FsError::InvalidName));
+  }
+ }
+ #[test]fn selected_ownership_failed_flush_quarantines_without_success_charge(){
+  for action in [39,40]{
+   let (mut disk,receipt)=disk();let mut table=FileHandles::new();
+   prepare_selected_volume_kernel(&mut table,&mut disk,receipt).unwrap();
+   let admin=table.bind_process(1).unwrap();table.set_credentials_kernel(admin,0,0).unwrap();
+   let token=operation_on_selected_volume(&mut table,1,admin,0,READ,
+    "/shared/note",&mut[],&mut disk,receipt).unwrap();
+   let before=table.security_statistics();
+   let mut device=OwnershipDisk{disk:&mut disk,flushes:0,fail_flush:true};
+   assert_eq!(operation_on_selected_volume(&mut table,action,admin,token,7,"",
+    &mut[],&mut device,receipt),Err(FsError::Io));
+   assert_eq!(device.flushes,1);assert!(table.selected_quarantined);
+   assert_eq!(table.entries,[Handle::EMPTY;SLOTS]);
+   assert_eq!(table.security_statistics(),before);
+  }
+ }
  #[test]fn selected_fsync_with_shared_readers_preserves_their_generation_and_cursor(){
   struct FlushDisk<'a>{disk:&'a mut Disk,flushes:u32}
   impl BlockDevice for FlushDisk<'_>{

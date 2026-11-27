@@ -1,9 +1,15 @@
 //! Fallible owner-scoped heap. Frame allocations retain page granularity;
 //! scratch allocations share bounded arenas with implicit free-hole coalescing.
 //! Physical quota includes whole live/quarantined arenas, not requested bytes.
+//! Aggregate backing admission also charges unpublished backend orphan pages;
+//! separate owner epochs cannot multiply the kernel heap budget indefinitely.
 use core::{alloc::Layout, marker::PhantomData};
 use crate::kernel_buffer::{allocation_size, Backend, Buffer, Error, FRAME_QUOTA};
 const SLOTS: usize = 16;
+// Allow a visible frame and its replacement epoch to coexist, plus the maximum
+// scratch-slot footprint. This is a heap reservation ceiling, not total RAM/RSS
+// accounting or a license to evict a live allocation under memory pressure.
+const RESERVED_QUOTA: u64 = (2 * FRAME_QUOTA + SLOTS * 8192) as u64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Owner { Frame(u64), Scratch(u64) }
@@ -50,10 +56,18 @@ impl Heap {
     fn charge(&self, owner: Owner) -> usize {
         self.regions.iter().filter(|r|r.owner==Some(owner)).map(|r|r.buffer.charged()).sum()
     }
+    fn backing_admitted(&self,capacity:usize,backend:&(impl Backend+?Sized))->bool{
+        self.regions.iter().try_fold(backend.pending_bytes(),|total,region|
+            total.checked_add(region.buffer.charged() as u64))
+            .and_then(|total|total.checked_add(capacity as u64))
+            .is_some_and(|total|total<=RESERVED_QUOTA)
+    }
     /// Validate all external extent metadata before pointer arithmetic, scrub
     /// or physical release. Corruption fails closed without guessing ownership.
     fn integrity_ok(&self)->bool{
-        if self.next_generation==0{return false;}
+        if self.next_generation==0||self.regions.iter()
+            .try_fold(0u64,|total,region|total.checked_add(region.buffer.charged() as u64))
+            .is_none_or(|total|total>RESERVED_QUOTA){return false;}
         for (index,region) in self.regions.iter().enumerate(){
             let charge=region.buffer.charged();
             if charge==0{
@@ -197,7 +211,7 @@ impl Heap {
         let (region,offset)=if let Some(found)=existing {found} else {
             let capacity=match owner{Owner::Frame(_)=>extent,Owner::Scratch(_)=>8192};
             let available=owner.quota().checked_sub(self.charge(owner)).ok_or(Error::Quota)?;
-            if capacity>available{return Err(Error::Quota);}
+            if capacity>available||!self.backing_admitted(capacity,backend){return Err(Error::Quota);}
             let region=self.regions.iter().position(|r|r.buffer.charged()==0).ok_or(Error::Metadata)?;
             let entry=&mut self.regions[region];
             entry.buffer.prepare(owner.epoch(),capacity,available,backend)?;
@@ -448,12 +462,18 @@ mod fixture {
     #[derive(Clone)]
     struct Page([u32;1024]);
     pub(super) struct Memory { runs: std::vec::Vec<(u64, std::vec::Vec<Page>)>,
-        next: u64, pub oom: bool, pub fail_release: bool, pub block_until_release:bool, pub allocations:usize, pub releases:usize }
+        next: u64, pub oom: bool, pub fail_release: bool, pub block_until_release:bool, pub allocations:usize, pub releases:usize,
+        pub pending:u64, pub reclaim_orphans:bool }
     impl Memory {
-        pub const fn new() -> Self { Self { runs: std::vec::Vec::new(), next: 4096, oom: false, fail_release: false, block_until_release:false, allocations:0, releases:0 } }
+        pub const fn new() -> Self { Self { runs: std::vec::Vec::new(), next: 4096, oom: false, fail_release: false, block_until_release:false, allocations:0, releases:0, pending:0, reclaim_orphans:false } }
         pub fn count(&self) -> usize { self.runs.len() }
     }
     unsafe impl Backend for Memory {
+        fn has_pending(&self)->bool{self.pending!=0}
+        fn pending_bytes(&self)->u64{self.pending}
+        fn reclaim_pending(&mut self)->u64{
+            if self.reclaim_orphans{core::mem::take(&mut self.pending)}else{0}
+        }
         fn allocate(&mut self, pages: u32) -> Result<crate::kernel_buffer::Backing, Error> {
             self.allocations+=1;
             if self.oom||self.block_until_release { return Err(Error::OutOfMemory); }
@@ -486,6 +506,50 @@ mod tests {
         assert_eq!(memory.count(), 2);
         for token in [a,b,c] { heap.release(token, &mut memory).unwrap(); }
         assert_eq!(memory.count(), 0);
+    }
+    #[test] fn aggregate_backing_budget_bounds_distinct_owner_epochs_before_backend_access(){
+        let mut heap=Heap::new();let mut memory=fixture::Memory::new();
+        let first=heap.allocate(Owner::Frame(1),layout(FRAME_QUOTA),&mut memory).unwrap().0;
+        let second=heap.allocate(Owner::Frame(2),layout(FRAME_QUOTA),&mut memory).unwrap().0;
+        let tail=heap.allocate(Owner::Frame(3),layout(SLOTS*8192),&mut memory).unwrap().0;
+        let calls=memory.allocations;let generation=heap.next_generation;
+        assert_eq!(heap.allocate(Owner::Scratch(4),layout(8),&mut memory),Err(Error::Quota));
+        assert_eq!(memory.allocations,calls);assert_eq!(heap.next_generation,generation);
+        assert_eq!(heap.snapshot(Owner::Frame(1)).reserved,RESERVED_QUOTA);
+        // Failed physical release remains charged, even across owner epochs.
+        memory.fail_release=true;assert_eq!(heap.release(first,&mut memory),Err(Error::Release));
+        assert_eq!(heap.allocate_recovering(Owner::Scratch(4),layout(8),&mut memory),Err(Error::Quota));
+        assert_eq!(memory.allocations,calls);assert_eq!(heap.pressure.retries,0);
+        memory.fail_release=false;
+        let scratch=heap.allocate_recovering(Owner::Scratch(4),layout(8),&mut memory).unwrap().0;
+        assert_eq!(heap.pressure.retries,1);assert_eq!(heap.pressure.recovered,1);
+        for token in [second,tail,scratch]{heap.release(token,&mut memory).unwrap();}
+        assert_eq!(memory.count(),0);
+    }
+    #[test] fn pending_backend_pages_are_charged_and_overflow_cannot_authorize_backing(){
+        let mut heap=Heap::new();let mut memory=fixture::Memory::new();
+        for pending in [RESERVED_QUOTA, u64::MAX]{
+            memory.pending=pending;let calls=memory.allocations;
+            assert_eq!(heap.allocate(Owner::Scratch(1),layout(8),&mut memory),Err(Error::Quota));
+            assert_eq!(memory.allocations,calls);assert_eq!(heap.next_generation,1);
+        }
+        memory.pending=RESERVED_QUOTA;memory.reclaim_orphans=true;
+        let token=heap.allocate_recovering(Owner::Scratch(1),layout(8),&mut memory).unwrap().0;
+        assert_eq!(heap.pressure.retries,1);assert_eq!(heap.pressure.recovered,1);
+        assert_eq!(heap.pressure.reclaimed_bytes,RESERVED_QUOTA);assert_eq!(memory.pending,0);
+        heap.release(token,&mut memory).unwrap();assert_eq!(memory.count(),0);
+    }
+    #[test] fn an_existing_scratch_gap_needs_no_new_global_backing_budget(){
+        let mut heap=Heap::new();let mut memory=fixture::Memory::new();let owner=Owner::Scratch(1);
+        let first=heap.allocate(owner,layout(8),&mut memory).unwrap().0;
+        // Another owner's retained backend pages block expansion but cannot
+        // revoke or inflate the charge for a gap already exclusively owned.
+        memory.pending=RESERVED_QUOTA-8192;let calls=memory.allocations;
+        let second=heap.allocate(owner,layout(8),&mut memory).unwrap().0;
+        assert_eq!(memory.allocations,calls);
+        assert_eq!(heap.allocate(Owner::Scratch(2),layout(8),&mut memory),Err(Error::Quota));
+        heap.release(first,&mut memory).unwrap();heap.release(second,&mut memory).unwrap();
+        assert_eq!(memory.count(),0);
     }
     #[test] fn generation_blocks_double_free_after_slot_reuse() {
         let mut heap = Heap::new(); let mut memory = fixture::Memory::new();

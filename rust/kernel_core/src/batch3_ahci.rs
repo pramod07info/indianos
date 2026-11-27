@@ -3,16 +3,24 @@
 pub const SECTOR_BYTES:u64=512;
 pub const MAX_PRDT:usize=8;
 pub const MAX_TRANSFER_BYTES:u64=128*1024;
+/// READ/WRITE DMA EXT command FISes carry exactly 48 LBA bits.
+pub const LBA48_SECTORS:u64=1u64<<48;
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 pub struct Region{pub dma_address:u64,pub byte_count:u32}
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 pub enum AhciError{InvalidRange,InvalidBuffer,TooMany,WrongSize,Overlap,Overflow}
+fn validate_media_range(lba:u64,sectors:u64,disk_sectors:u64)->Result<(),AhciError>{
+    if sectors==0||lba>=disk_sectors||sectors>disk_sectors-lba||
+        lba>=LBA48_SECTORS||sectors>LBA48_SECTORS-lba{
+        return Err(AhciError::InvalidRange);
+    }
+    Ok(())
+}
 /// Only accepts page-aligned DMA buffers owned/mapped by an external IOMMU
 /// allocator; callers must never treat an unchecked guest physical address as safe.
 pub fn validate_command(lba:u64,sectors:u16,disk_sectors:u64,
     regions:&[Region])->Result<u64,AhciError>{
-    if sectors==0||lba>=disk_sectors||
-        u64::from(sectors)>disk_sectors-lba{return Err(AhciError::InvalidRange);}
+    validate_media_range(lba,u64::from(sectors),disk_sectors)?;
     if regions.is_empty()||regions.len()>MAX_PRDT{return Err(AhciError::TooMany);}
     let bytes=u64::from(sectors)*SECTOR_BYTES;
     if bytes>MAX_TRANSFER_BYTES{return Err(AhciError::WrongSize);}
@@ -172,8 +180,10 @@ impl WriteFlushFence {
  pub const fn new(epoch:u64)->Self {
   Self{epoch,ticket:0,state:FlushState::Idle}
  }
+ /// Tickets are strictly increasing through every entrypoint. Reusing an old
+ /// ticket would let a delayed prior FLUSH acknowledgement satisfy new work.
  pub fn begin(&mut self,epoch:u64,ticket:u64)->Result<(),AhciError>{
-  if epoch==0||epoch!=self.epoch||ticket==0||
+  if epoch==0||epoch!=self.epoch||ticket==0||ticket<=self.ticket||
    !matches!(self.state,FlushState::Idle|FlushState::Durable){
    return Err(AhciError::InvalidRange);
   }
@@ -253,9 +263,7 @@ pub struct TransferChunk{pub lba:u64,pub sectors:u16}
 /// output mutation until full disk bounds and capacity are verified.
 pub fn plan_transfer(lba:u64,sectors:u64,disk_sectors:u64,
  out:&mut[TransferChunk])->Result<usize,AhciError>{
- if sectors==0||lba>=disk_sectors||sectors>disk_sectors-lba{
-  return Err(AhciError::InvalidRange);
- }
+ validate_media_range(lba,sectors,disk_sectors)?;
  const MAX_SECTORS:u64=MAX_TRANSFER_BYTES/SECTOR_BYTES;
  let count=sectors/MAX_SECTORS+u64::from(sectors%MAX_SECTORS!=0);
  if count>out.len() as u64{return Err(AhciError::TooMany);}
@@ -296,7 +304,8 @@ pub struct CompletionProof{pub epoch:u64,pub ticket:u64,pub lba:u64,
 pub fn verify_completion(lease:MediaLease,expected_ticket:u64,lba:u64,
  sectors:u16,proof:CompletionProof)->Result<(),AhciError>{
  if lease.issued_epoch==0||lease.issued_epoch!=lease.live_epoch||
-  expected_ticket==0||sectors==0||!proof.status_ok||
+  expected_ticket==0||u64::from(sectors)*SECTOR_BYTES>MAX_TRANSFER_BYTES||
+  validate_media_range(lba,u64::from(sectors),LBA48_SECTORS).is_err()||!proof.status_ok||
   proof.epoch!=lease.live_epoch||proof.ticket!=expected_ticket||
   proof.lba!=lba||proof.sectors!=sectors||
   proof.bytes!=u64::from(sectors)*SECTOR_BYTES{
@@ -308,7 +317,6 @@ impl WriteFlushFence{
  /// WS95: Forbid reuse of a completed flush ticket in one media epoch.
  /// A fresh ticket must be strictly greater than the previous issuance.
  pub fn begin_next(&mut self,epoch:u64,ticket:u64)->Result<(),AhciError>{
-  if ticket<=self.ticket{return Err(AhciError::InvalidRange);}
   self.begin(epoch,ticket)
  }
 }
@@ -356,5 +364,51 @@ mod pr782_ws91_95_tests{
   assert_eq!(f.begin_next(3,7),Err(AhciError::InvalidRange));
   f.begin_next(3,8).unwrap();
   assert!(!f.durable(3,8));
+ }
+}
+
+#[cfg(test)]
+mod command_representation_tests {
+ use super::*;
+ #[test]fn dma_ext_rejects_unrepresentable_lba_before_ownership_checks(){
+  let regions=[Region{dma_address:0x4000,byte_count:512}];
+  let mut calls=0;
+  assert_eq!(validate_mapped_command(LBA48_SECTORS,1,u64::MAX,&regions,|_,_|{
+   calls+=1;true
+  }),Err(AhciError::InvalidRange));
+  assert_eq!(calls,0);
+  assert_eq!(validate_command(LBA48_SECTORS-1,1,u64::MAX,&regions),Ok(512));
+  let crossing=[Region{dma_address:0x4000,byte_count:1024}];
+  assert_eq!(validate_command(LBA48_SECTORS-1,2,u64::MAX,&crossing),
+   Err(AhciError::InvalidRange));
+  let sentinel=TransferChunk{lba:9,sectors:9};let mut out=[sentinel;2];
+  assert_eq!(plan_transfer(LBA48_SECTORS-128,256,u64::MAX,&mut out),
+   Err(AhciError::InvalidRange));assert_eq!(out,[sentinel;2]);
+  assert_eq!(plan_transfer(LBA48_SECTORS-256,256,u64::MAX,&mut out),Ok(1));
+  assert_eq!(out[0],TransferChunk{lba:LBA48_SECTORS-256,sectors:256});
+ }
+ #[test]fn completion_cannot_authorize_an_unencodable_or_oversized_command(){
+  let lease=MediaLease{issued_epoch:1,live_epoch:1,read_only:false};
+  for (lba,sectors) in [(LBA48_SECTORS,1),(LBA48_SECTORS-1,2),(0,257)]{
+   let proof=CompletionProof{epoch:1,ticket:1,lba,sectors,
+    bytes:u64::from(sectors)*SECTOR_BYTES,status_ok:true};
+   assert_eq!(verify_completion(lease,1,lba,sectors,proof),Err(AhciError::InvalidRange));
+  }
+ }
+ #[test]fn every_flush_entrypoint_rejects_reused_or_decreasing_tickets(){
+  let mut fence=WriteFlushFence::new(1);
+  fence.begin(1,2).unwrap();fence.submitted_flush(1,2).unwrap();
+  fence.acknowledge_flush(1,2).unwrap();let durable=fence;
+  for ticket in [0,1,2]{
+   assert_eq!(fence.begin(1,ticket),Err(AhciError::InvalidRange));
+   assert_eq!(fence.begin_next(1,ticket),Err(AhciError::InvalidRange));
+   assert_eq!(fence,durable);
+  }
+  fence.begin(1,3).unwrap();
+  assert_eq!(fence.submitted_flush(1,2),Err(AhciError::InvalidRange));
+  assert_eq!(fence.acknowledge_flush(1,2),Err(AhciError::InvalidRange));
+  assert!(!fence.durable(1,3));
+  fence.submitted_flush(1,3).unwrap();fence.acknowledge_flush(1,3).unwrap();
+  assert!(fence.durable(1,3));
  }
 }

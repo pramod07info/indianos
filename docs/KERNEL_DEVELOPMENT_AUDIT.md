@@ -577,3 +577,76 @@ group administration still needs capability policy, ABI wiring and descriptor
 revocation acceptance. Named-user ACL entries, persistent per-user quotas and
 general inode allocation remain pending. All ten broad workstreams still have
 unfinished implementation or qualification; no gate or percentage is advanced.
+
+
+### Consolidated remaining-work reliability batch (five coding agents)
+
+This batch makes the following source changes, without asserting that the ten
+requested workstreams are complete. Five independent coding agents handled
+memory, process waits, networking, controller models and boot/power parsing;
+the coordinator integrated native filesystem ownership operations and reviewed
+each diff. No local build, host test or guest execution was performed at the
+owner's request. Exact candidate GitHub results remain required.
+
+* Heap admission now bounds aggregate backing across owner epochs, charging live,
+  quarantined and unpublished backend orphan pages. The ceiling permits two
+  maximum framebuffer reservations plus the bounded scratch-slot footprint.
+  Checked arithmetic, conservation on failed release and reuse of existing
+  arena gaps are covered by three added host tests. This is not a system-wide
+  RAM OOM killer or total/shared RSS accounting.
+* Native syscall 33 extends its existing 64-byte descriptor with operation 39
+  (change owner) and 40 (change group), advertised by additive ABI feature bit
+  256. Descriptor layout/version remain unchanged. Argument is an exact u16 ID;
+  path/payload/reserved bytes must be empty, and the existing token identifies
+  the target. PID1 service/namespace policy remains mandatory; owner transfer
+  additionally requires a root kernel-issued credential before device I/O.
+  VFS validates the persisted owner/group policy. No supplied UID becomes caller
+  authority. Foreign outstanding descriptors block administration, success
+  flushes before acknowledgement and revokes all cached descriptors, while
+  uncertain writes/flushes quarantine the volume without charging success.
+  Three selected-volume tests cover real publication/remount, pre-I/O denial,
+  revocation and failed flush; syscall guard-page tests cover both operations.
+* Process wait snapshots reject contradictory state/root/reclamation metadata
+  and stale exit/fault payloads before exposing completion. The process fault
+  transition accepts genuine exception vector zero (#DE) and rejects values
+  outside the exception-vector range; terminal state distinguishes a divide
+  error from normal exit. Tests cover the actual lifecycle and invalid snapshots.
+* Legacy virtio-net setup now verifies reset before enabling inherited DMA,
+  checks queue PFN and DRIVER_OK readbacks, and shares the verified reset/device
+  identity/bus-master retirement barrier between close and partial setup
+  rollback. An uncertain barrier retains published DMA pages. Three host tests
+  check sequencing and failure conditions; existing network QEMU suites must
+  verify the actual success path on the exact head. IOMMU remains unsupported.
+* Existing AHCI descriptor models reject LBA48 truncation/crossing and oversized
+  completion claims. Both flush entrypoints enforce increasing tickets against
+  delayed acknowledgement replay. NVMe block requests reject broadcast NSID,
+  and shared queue admission rejects duplicate/full/stale work before DMA-owner
+  callbacks. Six tests cover these cases. **These remain controller models:**
+  the batch does not add operational AHCI, NVMe or xHCI hardware drivers.
+* BootTrust policy authorization checks continuity of the authenticated root and
+  protected sequence; changed/unavailable platform state blocks cached policy
+  and staging before slot writes. Three added tests cover these failures and
+  signed recovery. The ACPI reset-I/O decoder requires firmware reset support,
+  System I/O and a byte-sized 16-bit port, rejects MMIO truncation, and permits
+  a zero reset byte. The existing test covers malformed firmware variants.
+  Audited platform trust providers, actual ACPI power integration and physical
+  device qualification remain absent; firmware trust changes must be serialized.
+
+#### Ten-point disposition after this batch
+
+| Point | Still required for completion |
+| --- | --- |
+| 1 | Broader heap adoption, total/shared RSS, system-wide OOM recovery and SMP-safe admission. |
+| 2 | General fork/shared-memory COW, recyclable reference ownership and rollback beyond demand-zero stack mappings. |
+| 3 | Normal AP run queues, actual IPIs, migration and acknowledged shootdown before reclaim; existing AP proof is polled. |
+| 4 | AVX/XSAVE, preemptive register retention acceptance and cross-CPU migration beyond BSP x87/SSE. |
+| 5 | General threads, futexes, signals and cancellation race acceptance. Wait-state integrity does not implement these APIs. |
+| 6 | Arbitrary approved-image spawn/exec, general parentage/wait and service policies beyond configured roles. |
+| 7 | Administrative userland integration and acceptance, named-user ACLs, persistent user quotas, general inode/free-space allocation and broader lock fairness/interrupted-durability acceptance. |
+| 8 | Normal desktop network binding, IOMMU, broader interrupt/reset ownership and physical NIC qualification. |
+| 9 | Operational AHCI/NVMe/xHCI initialization, MMIO, DMA, IRQ, completion, reset, flush and hardware acceptance. |
+| 10 | Audited firmware/TPM trust provider, revocation/recovery chain, actual ACPI shutdown/restart and physical-device receipts. |
+
+No gate is newly accepted and no completion percentage is increased by these
+changes. Prior-head CI is not evidence for the consolidated candidate. Required
+checks, merged-main evidence and hardware/sign-off policy continue to apply.
