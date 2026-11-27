@@ -720,3 +720,22 @@ entire memory task complete. Higher-level heap/VMM/DMA owners retain BSP-only
 contracts. Per-process shared RSS accounting, full system-wide OOM policy and
 SMP-safe end-to-end quota reservation/reclamation still require implementation
 and guest acceptance. No new M1 gate or percentage is accepted.
+
+
+### Memory follow-up: verified baseline and remaining integration failures
+
+On head 4607220, pmm-map-validation succeeded, as did combined-regression job
+140455826172 and normal-desktop-qemu job140455826642. The latter includes real
+ownership/group revocation, eight-checkpoint restoration, lock timeout/handoff,
+normal input/recovery and the separate FPU fixture. This is exact-head QEMU
+proof for those bounded scenarios, not full memory-task acceptance.
+
+Kernel boot run45984293291 still failed its host C fallback lifecycle stage:
+`kernel/src/process.c` retained the vector-zero rejection already corrected in
+Rust. Its exception-vector guard is now identical to Rust (0..31 accepted),
+covered by the existing shared C ABI tests rather than weakened assertions.
+Runtime job140455826618 failed the standalone five-boot VFS scenario with PID1
+status252 before the prelaunch wait-timeout receipt. Request/admission/output/
+lifecycle diagnostics and precise guest failure labels now identify that path
+without changing its validation or exit conditions. Exact corrected-head logs
+are required to diagnose any remaining failure before acceptance or merge.

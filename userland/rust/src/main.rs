@@ -2358,14 +2358,14 @@ fn native_child_wait(){
     let mut status=[0xa5u8;64];let mut request=[0u8;64];
     request[..4].copy_from_slice(&[1,0,64,0]);request[4..8].copy_from_slice(&2u32.to_le_bytes());
     request[24..32].copy_from_slice(&(status.as_mut_ptr() as u64).to_le_bytes());
-    if call(40,0,request.as_ptr() as u64)!=64||status[..4]!=[1,0,64,0]{exit(252);}
+    if call(40,0,request.as_ptr() as u64)!=64||status[..4]!=[1,0,64,0]{write(b"native child wait initial query rejected");exit(252);}
     let generation=u64::from_le_bytes(status[8..16].try_into().unwrap());
     let Some(stale)=generation.checked_add(1)else{exit(252);};
     let original=status;request[8..16].copy_from_slice(&stale.to_le_bytes());
-    if call(40,0,request.as_ptr() as u64)!=u64::MAX||status!=original{exit(252);}
+    if call(40,0,request.as_ptr() as u64)!=u64::MAX||status!=original{write(b"native child wait stale query changed output");exit(252);}
     request[8..16].copy_from_slice(&generation.to_le_bytes());
     request[16..24].copy_from_slice(&1u64.to_le_bytes());
-    if call(40,1,request.as_ptr() as u64)!=0||status!=original{exit(252);}
+    if call(40,1,request.as_ptr() as u64)!=0||status!=original{write(b"native child wait prelaunch timeout rejected or changed output");exit(252);}
     write(b"native PID1 child wait timed out before launch without consuming status");
     if call(5,1,0)!=0{exit(254);}
     write(b"R031.3 allowlisted worker started without VFS privileges");

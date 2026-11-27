@@ -69,7 +69,7 @@ bool indianos_process_exit(struct indianos_process *p, uint64_t status) {
 bool indianos_process_fault(struct indianos_process *p, uint64_t status,
                            uint64_t vector, uint64_t error, uint64_t address) {
     if (p == NULL || p->state != INDIANOS_PROCESS_RUNNING ||
-        p->address_space_root == 0 || vector == 0) return false;
+        p->address_space_root == 0 || vector > 31) return false;
     p->state = INDIANOS_PROCESS_FAULTED;
     p->exit_status = status;
     p->fault_vector = vector;

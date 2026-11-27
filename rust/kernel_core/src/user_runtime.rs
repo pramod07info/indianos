@@ -2277,14 +2277,14 @@ fn service_file_waiters()->bool{
 #[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
 fn native_process_wait(img:*mut UserImage,operation:u64,descriptor:u64,regs:*const u64)->u64{
  use crate::process_wait::{Request,Wait,BYTES};
- let Ok(permit)=r120_enter()else{return BAD;};
- let Some(parent)=authenticated_file_identity()else{return BAD;};
+ let Ok(permit)=r120_enter()else{log(b"IndianOS: child wait admission denied\n\0");return BAD;};
+ let Some(parent)=authenticated_file_identity()else{log(b"IndianOS: child wait parent identity denied\n\0");return BAD;};
  if parent.pid!=1{return BAD;}
  let mut bytes=[0u8;BYTES];
- if !unsafe{indianos_user_copy_readonly(img,descriptor,bytes.as_mut_ptr().cast(),BYTES)}{return BAD;}
- let Ok(request)=Request::decode(operation,&bytes)else{return BAD;};
- if !unsafe{indianos_user_can_write(&*img,request.address,BYTES)}{return BAD;}
- let Ok(status)=supervised_status(request.pid)else{return BAD;};
+ if !unsafe{indianos_user_copy_readonly(img,descriptor,bytes.as_mut_ptr().cast(),BYTES)}{log(b"IndianOS: child wait request copy denied\n\0");return BAD;}
+ let Ok(request)=Request::decode(operation,&bytes)else{log(b"IndianOS: child wait request format denied\n\0");return BAD;};
+ if !unsafe{indianos_user_can_write(&*img,request.address,BYTES)}{log(b"IndianOS: child wait output span denied\n\0");return BAD;}
+ let Ok(status)=supervised_status(request.pid)else{log(b"IndianOS: child wait lifecycle snapshot denied\n\0");return BAD;};
  if request.generation!=0&&request.generation!=status.generation{return BAD;}
  if operation==0{
   return if unsafe{indianos_user_copy_writable(&*img,request.address,status.wire().as_ptr(),BYTES)}{BYTES as u64}else{BAD};
