@@ -480,15 +480,25 @@ impl<D:BlockDevice> DurableFs<D>{
     }
     pub(crate) fn chmod_path(&mut self,path:&str,credentials:Credentials,
         mode:u16)->Result<(),FsError>{
+        self.update_permissions_path(path,|previous|previous.with_mode(credentials,mode))
+    }
+    /// Ownership policy is shared with the credential model; publication uses
+    /// the same verified COW metadata transaction as chmod, never data rewrite.
+    pub(crate) fn chown_path(&mut self,path:&str,credentials:Credentials,
+        owner:u16)->Result<(),FsError>{
+        self.update_permissions_path(path,|previous|previous.with_owner(credentials,owner))
+    }
+    pub(crate) fn chgrp_path(&mut self,path:&str,credentials:Credentials,
+        group:u16)->Result<(),FsError>{
+        self.update_permissions_path(path,|previous|previous.with_group(credentials,group))
+    }
+    fn update_permissions_path(&mut self,path:&str,
+        update:impl FnOnce(Permissions)->Option<Permissions>)->Result<(),FsError>{
         self.check_heads()?;
         let name=canonical_path(path)?;
         let slot=self.find(name).ok_or(FsError::NotFound)?;
         let previous=self.meta.entries[slot].permissions;
-        if credentials.uid()!=0&&credentials.uid()!=previous.owner{
-            return Err(FsError::InvalidName);
-        }
-        let permissions=Permissions::new(previous.owner,previous.group,mode)
-            .ok_or(FsError::InvalidName)?;
+        let permissions=update(previous).ok_or(FsError::InvalidName)?;
         if permissions==previous&&self.meta.format==PERMISSION_VERSION{return Ok(());}
         let mut next=self.meta;next.format=PERMISSION_VERSION;
         next.entries[slot].permissions=permissions;

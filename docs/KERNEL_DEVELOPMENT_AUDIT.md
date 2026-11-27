@@ -211,12 +211,12 @@ allocator, scheduler, VFS, supervisor or controller models.
 | Requested workstream | Existing implementation to extend | Remaining implementation/acceptance |
 | --- | --- | --- |
 | Heap, OOM and memory quotas | `kernel_heap.rs`, `kernel_arena.rs`, `user_image.rs`; P2-004/011 | Noncontiguous heap backing and bounded pressure recovery now implemented in #825. Broader consumers, total/shared RSS, global OOM and SMP admission remain. |
-| Demand paging and COW | `paging.rs`, `vmm.rs`, `user_runtime.rs`; P2-006 | Fault-driven mappings, reference ownership, atomic write splitting and rollback with real user faults. |
+| Demand paging and COW | `paging.rs`, `vmm.rs`, `user_runtime.rs`; P2-006 | Demand-zero stack faults and shared-zero write splitting are implemented below. General fork/shared-page reference ownership, rollback and recyclable COW still remain. |
 | Multicore scheduling, IPIs/TLB | `smp_lifecycle_fence.rs`, `timer.rs`, `user_runtime.rs`; P2-008/009 | Actual AP run queues, remote wakeup/shootdown acknowledgements, race and teardown acceptance. |
 | FPU/SIMD context | `fpu_context.rs`, `cpu_entry.rs`, `arch/x86_64/*entry.S`, `user_runtime.rs`; P2-010 | This slice implements eager BSP x87/MMX/SSE context boundaries. Exact-head guest evidence, preemptive register retention, AVX/XSAVE and migration remain unaccepted. |
 | Threads, futexes and signals | `ipc.rs`, `user_runtime.rs`; P3-001/009 | General thread ownership, wait/wake/timeout/cancellation races and signal delivery. |
 | Spawn/exec/wait and supervision | `user_image.rs`, `user_runtime.rs`, `service_supervisor.rs`; P3-003/011/012 | Arbitrary approved-image lifecycle and parent/wait semantics beyond fixed desktop roles. |
-| Native fsync, blocking locks, ACLs/quotas | `fs_handles.rs`, `syscall.rs`, `durablefs.rs`; P4-006/008/009/010 | Descriptor fsync now wired below; interrupted durability acceptance, blocking lock queues and persistent named-user administration/accounting remain. |
+| Native fsync, blocking locks, ACLs/quotas | `fs_handles.rs`, `syscall.rs`, `durablefs.rs`; P4-006/008/009/010 | Descriptor fsync and bounded scheduler-backed range-lock waits are implemented below. Trusted VFS owner/group changes now share COW metadata publication. General lock fairness, interrupted durability acceptance, native ownership administration, named-user ACLs and persistent user accounting remain. |
 | Normal networking and DMA ownership | `network.rs`, process retirement and PCI inventory; P5-004/005/006, P6-005 | Normal driver binding, IRQ/DMA/IOMMU lifetime and reset/error acceptance. |
 | AHCI/NVMe and USB/xHCI | `batch3_ahci.rs`, `batch3_nvme.rs`, hardware inventory; P6-006/007 | Existing descriptor/queue models must become real initialized controllers; DMA, interrupts, completion, reset, flush and devices. |
 | Verified boot, ACPI and physical qualification | boot handoff, hardware inventory and power primitives; P1-009/010, P5-001/009, P6-009 | Firmware trust/revocation/recovery chain and selected physical-machine power/device receipts. |
@@ -547,3 +547,33 @@ implemented within the current bounded native service/descriptor model. General
 ACL administration, persistent per-user quotas, arbitrary process/thread/futex/
 signal facilities, SMP scheduling, IOMMU, new storage/USB controllers, firmware
 trust and physical device/power qualification remain pending.
+
+
+### Persistent VFS owner/group administration — next point 7 slice
+
+`HierVfs::chown_as` and `chgrp_as` now connect the existing trusted
+`Permissions::with_owner` / `with_group` policy to durable metadata. Only root
+may transfer an owner; root may select any group, while an ordinary owner may
+select only its own kernel-issued group. Ancestor search is mandatory and
+symlink targets are never followed. Files, directories and symlink metadata use
+the same lookup as chmod, with no new filesystem format or permission table.
+
+Chmod, chown and chgrp share one verified COW metadata publication helper;
+permission changes do not rewrite file data. Authorized unchanged values do not
+advance the generation. Denied requests cannot publish metadata. A successful
+change advances the existing filesystem generation, so existing descriptor and
+queued-lock generation validation remains applicable; trusted callers must use
+that existing invalidation contract and fsync before acknowledging durability.
+
+Three added host tests cover persisted owner transfer and old-owner read denial,
+group restrictions/no-op and denial generations, directory search, directory
+ownership, symlink target isolation, and torn owner/group checkpoint recovery
+with preserved data. Existing GitHub kernel host suites discover these tests.
+No local compilation, test or QEMU execution was performed. Exact-head CI must
+supply compilation/runtime evidence; this patch alone is not acceptance.
+
+This is a trusted VFS API, not a newly exposed native syscall: user-facing owner/
+group administration still needs capability policy, ABI wiring and descriptor
+revocation acceptance. Named-user ACL entries, persistent per-user quotas and
+general inode allocation remain pending. All ten broad workstreams still have
+unfinished implementation or qualification; no gate or percentage is advanced.
