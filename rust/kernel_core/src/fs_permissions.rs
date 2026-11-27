@@ -244,3 +244,134 @@ mod m1_gate20_w3_acl_tests {
    parent,&[],parent,owner));
  }
 }
+
+/// Two bounded, persisted named-user exceptions. The existing mode's group
+/// bits are the named-entry mask; matching named users do not fall through to
+/// group/other rights. This convention is intentionally narrower than POSIX
+/// extended ACLs (no named groups, default inheritance or independent mask).
+/// UID zero is reserved for an unused slot; root uses its existing override.
+#[derive(Clone,Copy,Debug,Eq,PartialEq)]
+pub struct NamedUsers{entries:[(u16,u16);2]}
+impl NamedUsers{
+ pub const EMPTY:Self=Self{entries:[(0,0);2]};
+ /// Canonical storage has increasing, nonzero UIDs followed by empty slots.
+ /// Reject malformed input instead of sorting away duplicate/ambiguous grants.
+ pub fn from_entries(entries:[(u16,u16);2])->Option<Self>{
+  let result=Self{entries};result.validate().then_some(result)
+ }
+ pub const fn entries(self)->[(u16,u16);2]{self.entries}
+ pub fn validate(self)->bool{
+  let mut previous=0;let mut ended=false;
+  for (uid,rights) in self.entries{
+   if rights&!7!=0{return false;}
+   if uid==0{if rights!=0{return false;}ended=true;}
+   else{
+    if ended||uid<=previous{return false;}previous=uid;
+   }
+  }
+  true
+ }
+ pub fn allows(self,permissions:Permissions,caller:Credentials,access:u16)->bool{
+  // Validate persisted ACL and mode before root or owner precedence, so
+  // corrupt metadata cannot regain authority through the privileged branch.
+  if !self.validate()||permissions.mode&!0o777!=0||access&!7!=0{return false;}
+  if caller.uid()==0||caller.uid()==permissions.owner{
+   return permissions.allows(caller,access);
+  }
+  if let Some((_,rights))=self.entries.iter().find(|(uid,_)|*uid==caller.uid()){
+   let effective=rights&((permissions.mode>>3)&7);
+   return effective&access==access;
+  }
+  permissions.allows(caller,access)
+ }
+ /// Caller identity must be kernel-issued. Only root or the current owner
+ /// may set/remove an entry; explicit rights=0 denies matching-user access.
+ /// Removing an absent UID is idempotent, while a full table rejects additions.
+ pub fn update(self,permissions:Permissions,caller:Credentials,uid:u16,
+  rights:Option<u16>)->Option<Self>{
+  if !self.validate()||permissions.mode&!0o777!=0||uid==0||
+   (caller.uid()!=0&&caller.uid()!=permissions.owner)||
+   rights.is_some_and(|value|value&!7!=0){return None;}
+  let mut entries=self.entries;
+  let found=entries.iter().position(|(entry,_)|*entry==uid);
+  match (found,rights){
+   (Some(index),Some(value))=>entries[index].1=value,
+   (Some(index),None)=>{
+    for i in index..entries.len()-1{entries[i]=entries[i+1];}
+    entries[1]=(0,0);
+   },
+   (None,None)=>return Some(self),
+   (None,Some(value))=>{
+    let index=entries.iter().position(|(entry,_)|*entry==0)?;
+    entries[index]=(uid,value);
+    if index==1&&entries[0].0>uid{entries.swap(0,1);}
+   },
+  }
+  Self::from_entries(entries)
+ }
+}
+
+#[cfg(test)]
+mod named_user_acl_tests{
+ use super::*;
+ #[test]fn empty_acl_preserves_owner_group_other_and_root_semantics(){
+  let permissions=Permissions::new(100,7,0o640).unwrap();
+  for caller in [Credentials::kernel(0,0),Credentials::kernel(100,9),
+   Credentials::kernel(200,7),Credentials::kernel(200,9)]{
+   for access in 0..16{
+    assert_eq!(NamedUsers::EMPTY.allows(permissions,caller,access),permissions.allows(caller,access));
+   }
+  }
+ }
+ #[test]fn matching_user_uses_mask_without_group_or_other_fallback(){
+  let permissions=Permissions::new(100,7,0o647).unwrap();
+  let acl=NamedUsers::from_entries([(200,READ|WRITE),(300,0)]).unwrap();
+  assert!(acl.allows(permissions,Credentials::kernel(200,9),READ));
+  assert!(!acl.allows(permissions,Credentials::kernel(200,7),WRITE));
+  assert!(!acl.allows(permissions,Credentials::kernel(200,9),SEARCH));
+  assert!(!acl.allows(permissions,Credentials::kernel(300,7),READ));
+  assert!(acl.allows(permissions,Credentials::kernel(300,7),0));
+  assert!(acl.allows(permissions,Credentials::kernel(400,9),READ|WRITE|SEARCH));
+  assert!(acl.allows(permissions,Credentials::kernel(0,0),READ|WRITE|SEARCH));
+  let owner_entry=NamedUsers::from_entries([(100,0),(200,0)]).unwrap();
+  assert!(owner_entry.allows(permissions,Credentials::kernel(100,9),READ|WRITE));
+ }
+ #[test]fn owner_admin_is_bounded_canonical_and_removal_is_idempotent(){
+  let permissions=Permissions::new(100,7,0o660).unwrap();let owner=Credentials::kernel(100,9);
+  let first=NamedUsers::EMPTY.update(permissions,owner,300,Some(READ)).unwrap();
+  let full=first.update(permissions,owner,200,Some(WRITE)).unwrap();
+  assert_eq!(full.entries(),[(200,WRITE),(300,READ)]);
+  assert!(full.update(permissions,owner,400,Some(READ)).is_none());
+  assert_eq!(full.update(permissions,owner,400,None),Some(full));
+  assert_eq!(full.update(permissions,owner,200,None).unwrap().entries(),[(300,READ),(0,0)]);
+  let updated=full.update(permissions,owner,300,Some(0)).unwrap();
+  assert_eq!(updated.entries(),[(200,WRITE),(300,0)]);
+  assert!(full.update(permissions,Credentials::kernel(200,7),300,None).is_none());
+  assert!(full.update(permissions,owner,0,None).is_none());
+  assert!(full.update(permissions,owner,200,Some(8)).is_none());
+  assert!(full.update(permissions,Credentials::kernel(0,0),200,None).is_some());
+ }
+ #[test]fn corrupt_acl_or_mode_cannot_be_laundered_even_by_root(){
+  let permissions=Permissions::new(100,7,0o777).unwrap();let root=Credentials::kernel(0,0);
+  for entries in [[(1,4),(1,2)],[(2,4),(1,2)],[(0,0),(1,4)],[(0,4),(0,0)],[(1,8),(0,0)]]{
+   assert!(NamedUsers::from_entries(entries).is_none());
+   let corrupt=NamedUsers{entries};assert!(!corrupt.validate());
+   assert!(!corrupt.allows(permissions,root,READ));
+   assert!(corrupt.update(permissions,root,1,None).is_none());
+  }
+  let corrupt=Permissions{mode:0o1777,..permissions};
+  assert!(!NamedUsers::EMPTY.allows(corrupt,root,0));
+  assert!(NamedUsers::EMPTY.update(corrupt,root,1,Some(READ)).is_none());
+ }
+ #[test]fn chmod_masks_retained_grant_and_owner_transfer_has_owner_precedence(){
+  let owner=Credentials::kernel(100,7);let user=Credentials::kernel(200,9);
+  let permissions=Permissions::new(100,7,0o660).unwrap();
+  let acl=NamedUsers::EMPTY.update(permissions,owner,200,Some(READ|WRITE)).unwrap();
+  assert!(acl.allows(permissions,user,READ|WRITE));
+  let restricted=permissions.with_mode(owner,0o600).unwrap();
+  assert!(!acl.allows(restricted,user,READ));
+  let transferred=restricted.with_owner(Credentials::kernel(0,0),200).unwrap();
+  assert!(acl.allows(transferred,user,READ|WRITE));
+  assert!(acl.update(transferred,owner,300,Some(READ)).is_none());
+ }
+}

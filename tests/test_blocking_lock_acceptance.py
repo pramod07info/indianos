@@ -24,7 +24,7 @@ class OwnershipEvidenceTests(unittest.TestCase):
     def proof(self):return b"\n".join(OWNER_MARKERS+(QUEUED,))+b"\n"
     def head(self,generation,mode=0o777,owner=0):
         head=bytearray(512);head[:8]=b"INDR027!"
-        struct.pack_into("<IIQ",head,8,2,COUNT,generation)
+        struct.pack_into("<IIQ",head,8,3,COUNT,generation)
         name=b"~fshared~readme";head[32:32+len(name)]=name
         struct.pack_into("<II",head,56,14,binascii.crc32(b"HELLO INDIANOS"))
         head[65]=1;struct.pack_into("<HHH",head,66,owner,0,mode)
@@ -35,8 +35,8 @@ class OwnershipEvidenceTests(unittest.TestCase):
         before[(START+1)*512:(START+2)*512]=self.head(2)
         before[(START+2)*512:(START+2)*512+14]=b"HELLO INDIANOS"
         after=bytearray(before)
-        after[START*512:(START+1)*512]=self.head(9,0o600)
-        after[(START+1)*512:(START+2)*512]=self.head(10)
+        after[START*512:(START+1)*512]=self.head(13,0o640)
+        after[(START+1)*512:(START+2)*512]=self.head(14)
         return before,after
     def test_live_ownership_receipts_require_each_grant_and_revocation_in_order(self):
         proof=self.proof();verify_owner_proof(proof)
@@ -47,7 +47,7 @@ class OwnershipEvidenceTests(unittest.TestCase):
         for bad in (b"\n".join(tuple(reversed(OWNER_MARKERS))+(QUEUED,)),
                     proof.replace(QUEUED,b"not queued"),proof+b"IndianOS: FATAL"):
             with self.assertRaises(AssertionError):verify_owner_proof(bad)
-    def test_only_eight_metadata_checkpoints_restore_original_catalog_and_permissions(self):
+    def test_only_twelve_metadata_checkpoints_restore_original_catalog_and_permissions(self):
         before,after=self.media();verify_owner_media(before,after)
     def test_modified_data_partition_geometry_or_checksum_cannot_pass(self):
         before,after=self.media()
@@ -58,12 +58,12 @@ class OwnershipEvidenceTests(unittest.TestCase):
         with self.assertRaises(AssertionError):verify_owner_media(before,before)
     def test_valid_crc_does_not_hide_wrong_generation_or_unrestored_owner_or_mode(self):
         before,after=self.media()
-        for head in (self.head(9),self.head(10,0o600),self.head(10,0o777,1000)):
+        for head in (self.head(13),self.head(14,0o600),self.head(14,0o777,1000)):
             bad=bytearray(after);bad[(START+1)*512:(START+2)*512]=head
             with self.assertRaises(AssertionError):verify_owner_media(before,bad)
         # A data descriptor edit with a correct metadata CRC still changes the
         # catalog; metadata-only writes cannot launder payload substitutions.
-        bad=bytearray(after);head=self.head(10);head[56]=15
+        bad=bytearray(after);head=self.head(14);head[56]=15
         head[24:28]=bytes(4);struct.pack_into("<I",head,24,binascii.crc32(head))
         bad[(START+1)*512:(START+2)*512]=head
         with self.assertRaises(AssertionError):verify_owner_media(before,bad)

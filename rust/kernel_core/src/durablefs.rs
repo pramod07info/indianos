@@ -10,11 +10,14 @@
 //! Normal boot must never format arbitrary, existing host disks.
 use crate::block::{BlockDevice,BlockError,SECTOR_BYTES};
 use crate::vfs_path::normalize_absolute;
-use crate::fs_permissions::{Credentials,Permissions};
+use crate::fs_permissions::{Credentials,Permissions,NamedUsers};
 
 const MAGIC:&[u8;8]=b"INDR027!";
 const FORMAT_VERSION:u32=1;
 const PERMISSION_VERSION:u32=2;
+const ACL_VERSION:u32=3;
+const ACL_OFFSET:usize=HEADER_SIZE+ENTRIES*ENTRY_SIZE;
+const ACL_BYTES:usize=8;
 const ENTRIES:usize=8;
 const ENTRY_SIZE:usize=40;
 const HEADER_SIZE:usize=32;
@@ -37,9 +40,10 @@ struct Entry{
     bank:u8,
     used:bool,
     permissions:Permissions,
+    named_users:NamedUsers,
 }
 impl Entry{
-    const EMPTY:Self=Self{name:[0;NAME_BYTES],len:0,checksum:0,bank:0,used:false,permissions:Permissions::LEGACY};
+    const EMPTY:Self=Self{name:[0;NAME_BYTES],len:0,checksum:0,bank:0,used:false,permissions:Permissions::LEGACY,named_users:NamedUsers::EMPTY};
 }
 #[derive(Clone,Copy)]
 struct Metadata{generation:u64,entries:[Entry;ENTRIES],format:u32}
@@ -72,10 +76,20 @@ fn encode(meta:&Metadata,sectors:u64)->[u8;SECTOR_BYTES]{
         output[offset+28..offset+32].copy_from_slice(&e.checksum.to_le_bytes());
         output[offset+32]=e.bank;
         output[offset+33]=1;
-        if meta.format==PERMISSION_VERSION{
+        if meta.format>=PERMISSION_VERSION{
             output[offset+34..offset+36].copy_from_slice(&e.permissions.owner.to_le_bytes());
             output[offset+36..offset+38].copy_from_slice(&e.permissions.group.to_le_bytes());
             output[offset+38..offset+40].copy_from_slice(&e.permissions.mode.to_le_bytes());
+        }
+    }
+    if meta.format==ACL_VERSION{
+        for (index,entry) in meta.entries.iter().enumerate(){
+            if !entry.used{continue;}
+            for (slot,(uid,rights)) in entry.named_users.entries().iter().enumerate(){
+                let offset=ACL_OFFSET+index*ACL_BYTES+slot*4;
+                output[offset..offset+2].copy_from_slice(&uid.to_le_bytes());
+                output[offset+2..offset+4].copy_from_slice(&rights.to_le_bytes());
+            }
         }
     }
     // CRC field is zero while computing checksum of the whole metadata sector.
@@ -85,9 +99,9 @@ fn encode(meta:&Metadata,sectors:u64)->[u8;SECTOR_BYTES]{
 }
 fn decode(sector:&[u8;SECTOR_BYTES],capacity:u64)->Option<Metadata>{
     let format=read_u32(&sector[8..12]);
-    if &sector[..8]!=MAGIC || !matches!(format,FORMAT_VERSION|PERMISSION_VERSION) ||
+    if &sector[..8]!=MAGIC || !matches!(format,FORMAT_VERSION|PERMISSION_VERSION|ACL_VERSION) ||
        read_u32(&sector[12..16]) as u64!=capacity ||
-       sector[28..32]!=[0;4] || sector[HEADER_SIZE+ENTRIES*ENTRY_SIZE..].iter().any(|&b|b!=0){
+       sector[28..32]!=[0;4] || sector[if format==ACL_VERSION{ACL_OFFSET+ENTRIES*ACL_BYTES}else{ACL_OFFSET}..].iter().any(|&b|b!=0){
        return None;
     }
     let generation=read_u64(&sector[16..24]);
@@ -100,7 +114,12 @@ fn decode(sector:&[u8;SECTOR_BYTES],capacity:u64)->Option<Metadata>{
     for index in 0..ENTRIES{
         let offset=HEADER_SIZE+index*ENTRY_SIZE;
         let entry=&sector[offset..offset+ENTRY_SIZE];
-        if entry.iter().all(|&b|b==0){continue;}
+        let acl_offset=ACL_OFFSET+index*ACL_BYTES;
+        let acl=&sector[acl_offset..acl_offset+ACL_BYTES];
+        if entry.iter().all(|&b|b==0){
+            if format==ACL_VERSION&&acl.iter().any(|&b|b!=0){return None;}
+            continue;
+        }
         if entry[33]!=1 || (format==FORMAT_VERSION&&entry[34..].iter().any(|&b|b!=0)) ||
            entry[32]>=BANK_COUNT{return None;}
         let name_len=entry[..NAME_BYTES].iter().position(|&b|b==0)?;
@@ -122,7 +141,13 @@ fn decode(sector:&[u8;SECTOR_BYTES],capacity:u64)->Option<Metadata>{
         };
         result.entries[index]=Entry{
             name,len,checksum:read_u32(&entry[28..32]),
-            bank:entry[32],used:true,permissions
+            bank:entry[32],used:true,permissions,
+            named_users:if format==ACL_VERSION{
+                NamedUsers::from_entries([
+                    (u16::from_le_bytes(acl[0..2].try_into().ok()?),u16::from_le_bytes(acl[2..4].try_into().ok()?)),
+                    (u16::from_le_bytes(acl[4..6].try_into().ok()?),u16::from_le_bytes(acl[6..8].try_into().ok()?)),
+                ])?
+            }else{NamedUsers::EMPTY}
         };
     }
     Some(result)
@@ -470,6 +495,24 @@ impl<D:BlockDevice> DurableFs<D>{
         let slot=self.find(name).ok_or(FsError::NotFound)?;
         Ok(self.meta.entries[slot].permissions)
     }
+    /// Evaluate mode and named-user metadata from one verified checkpoint.
+    pub(crate) fn access_path(&mut self,path:&str,credentials:Credentials,access:u16)
+        ->Result<bool,FsError>{
+        self.check_heads()?;let name=canonical_path(path)?;
+        let entry=self.meta.entries[self.find(name).ok_or(FsError::NotFound)?];
+        Ok(entry.named_users.allows(entry.permissions,credentials,access))
+    }
+    pub(crate) fn set_named_user_path(&mut self,path:&str,credentials:Credentials,
+        uid:u16,rights:Option<u16>)->Result<(),FsError>{
+        self.check_heads()?;let name=canonical_path(path)?;
+        let slot=self.find(name).ok_or(FsError::NotFound)?;
+        let previous=self.meta.entries[slot];
+        let acl=previous.named_users.update(previous.permissions,credentials,uid,rights)
+            .ok_or(FsError::InvalidName)?;
+        if acl==previous.named_users{return Ok(());}
+        let mut next=self.meta;next.format=ACL_VERSION;
+        next.entries[slot].named_users=acl;self.publish(next)
+    }
     /// Create data and its credentials in one COW checkpoint, never a window
     /// with an unrestricted newly created object followed by chmod.
     pub(crate) fn create_owned_path(&mut self,path:&str,data:&[u8],
@@ -499,8 +542,8 @@ impl<D:BlockDevice> DurableFs<D>{
         let slot=self.find(name).ok_or(FsError::NotFound)?;
         let previous=self.meta.entries[slot].permissions;
         let permissions=update(previous).ok_or(FsError::InvalidName)?;
-        if permissions==previous&&self.meta.format==PERMISSION_VERSION{return Ok(());}
-        let mut next=self.meta;next.format=PERMISSION_VERSION;
+        if permissions==previous&&self.meta.format>=PERMISSION_VERSION{return Ok(());}
+        let mut next=self.meta;next.format=next.format.max(PERMISSION_VERSION);
         next.entries[slot].permissions=permissions;
         self.publish(next)
     }
@@ -716,9 +759,10 @@ impl<D:BlockDevice> DurableFs<D>{
         let permissions=permissions.unwrap_or(if replace{
             self.meta.entries[index].permissions
         }else{Permissions::LEGACY});
-        if permissions!=Permissions::LEGACY{next.format=PERMISSION_VERSION;}
+        if permissions!=Permissions::LEGACY{next.format=next.format.max(PERMISSION_VERSION);}
         next.entries[index]=Entry{
-            name,len:data.len() as u32,checksum:crc(data),bank,used:true,permissions
+            name,len:data.len() as u32,checksum:crc(data),bank,used:true,permissions,
+            named_users:if replace{self.meta.entries[index].named_users}else{NamedUsers::EMPTY}
         };
         // A data bank has been written even when the following metadata
         // publication fails before touching either header. A transient
@@ -777,7 +821,9 @@ impl<D:BlockDevice> DurableFs<D>{
         next.entries[index]=Entry{name,len:data.len() as u32,
              checksum:crc(data),bank,used:true,permissions:if replace{
                  self.meta.entries[index].permissions
-             }else{Permissions::LEGACY}};
+             }else{Permissions::LEGACY},named_users:if replace{
+                 self.meta.entries[index].named_users
+             }else{NamedUsers::EMPTY}};
         // The new data bank has already been modified. Even if checkpoint
         // publication fails before it changes a metadata head, its outcome
         // is not safe to retry through this mount without revalidation.
@@ -1508,6 +1554,44 @@ mod tests{
                 assert_eq!(recovery.read_path("/note",&mut out),Ok(9));
                 assert_eq!(&out[..9],b"committed");
             }
+        }
+    }
+    #[test]fn named_users_upgrade_persist_preserve_and_revoke_through_existing_metadata(){
+        let root=Credentials::kernel(0,0);let guest=Credentials::kernel(200,9);
+        let mut fs=DurableFs::format_blank(blank()).unwrap();fs.create_path("/note",b"saved").unwrap();
+        fs.chmod_path("/note",root,0o640).unwrap();
+        assert!(!fs.access_path("/note",guest,4).unwrap());
+        fs.set_named_user_path("/note",root,200,Some(4)).unwrap();assert_eq!(fs.meta.format,ACL_VERSION);
+        fs.overwrite_path("/note",b"updated").unwrap();fs.rename_path("/note","/renamed").unwrap();
+        fs.chmod_path("/renamed",root,0o640).unwrap();assert_eq!(fs.meta.format,ACL_VERSION);
+        let mut fs=DurableFs::mount(fs.into_device()).unwrap();
+        assert!(fs.access_path("/renamed",guest,4).unwrap());assert!(!fs.access_path("/renamed",guest,2).unwrap());
+        let generation=fs.generation();
+        assert_eq!(fs.set_named_user_path("/renamed",guest,201,Some(4)),Err(FsError::InvalidName));
+        assert_eq!(fs.generation(),generation);
+        fs.set_named_user_path("/renamed",root,200,None).unwrap();
+        let mut fs=DurableFs::mount(fs.into_device()).unwrap();assert_eq!(fs.meta.format,ACL_VERSION);
+        assert!(!fs.access_path("/renamed",guest,4).unwrap());
+        let mut out=[0;7];assert_eq!(fs.read_path("/renamed",&mut out),Ok(7));assert_eq!(&out,b"updated");
+    }
+    #[test]fn valid_crc_cannot_launder_duplicate_rights_or_orphan_named_user_records(){
+        let root=Credentials::kernel(0,0);let mut fs=DurableFs::format_blank(blank()).unwrap();
+        fs.create_path("/note",b"saved").unwrap();fs.set_named_user_path("/note",root,200,Some(4)).unwrap();
+        let original=fs.into_device();
+        for case in 0..4{
+            let mut disk=original.clone();
+            for head in 0..2{
+                let sector=&mut disk.sectors[head];
+                sector[8..12].copy_from_slice(&ACL_VERSION.to_le_bytes());
+                match case{
+                    0=>{sector[ACL_OFFSET..ACL_OFFSET+4].copy_from_slice(&[200,0,8,0]);},
+                    1=>{sector[ACL_OFFSET..ACL_OFFSET+8].copy_from_slice(&[200,0,4,0,200,0,4,0]);},
+                    2=>{sector[ACL_OFFSET+7*ACL_BYTES]=1;},
+                    _=>{sector[ACL_OFFSET+ENTRIES*ACL_BYTES]=1;},
+                }
+                sector[24..28].fill(0);let sum=crc(sector);sector[24..28].copy_from_slice(&sum.to_le_bytes());
+            }
+            assert!(matches!(DurableFs::mount(disk),Err(FsError::InvalidVolume)));
         }
     }
     #[test]fn permission_metadata_survives_overwrite_and_rejects_invalid_modes_with_valid_crc(){

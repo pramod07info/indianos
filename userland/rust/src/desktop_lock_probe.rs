@@ -46,14 +46,18 @@ fn owner_probe(pid:u64){
      &bytes[..14]!=b"HELLO INDIANOS"||handle(5,b"",token,0)!=0{exit(123);}
  }
  if pid==1{
-  if handle(37,b"",0,0)>>32&256==0{exit(123);}
+  if handle(37,b"",0,0)>>32&768!=768{exit(123);}
   change(38,0o600);send(2,b"OWNERDENY");receive(2,b"OWNERDENIED");
   change(39,1000);send(2,b"OWNERALLOW");receive(2,b"OWNERREAD");
   change(39,0);send(2,b"OWNERREVOKE");receive(2,b"OWNERREVOKED");
   change(40,1000);change(38,0o640);
   send(2,b"GROUPALLOW");receive(2,b"GROUPREAD");
   change(38,0o600);send(2,b"GROUPREVOKE");receive(2,b"GROUPREVOKED");
-  change(40,0);change(38,0o777);
+  change(40,0);change(38,0o640);
+  change(41,1000|(4<<16));send(2,b"ACLALLOW");receive(2,b"ACLREAD");
+  change(41,1000);send(2,b"ACLDENY");receive(2,b"ACLDENIED");
+  change(42,1000);send(2,b"ACLREMOVE");receive(2,b"ACLREMOVED");
+  change(38,0o777);
   write(b"desktop ownership probe original owner group mode restored; stale tokens rejected");
  }else if pid==2{
   receive(1,b"OWNERDENY");reader(false);
@@ -66,6 +70,12 @@ fn owner_probe(pid:u64){
   write(b"desktop ownership probe new group read exact committed bytes");send(1,b"GROUPREAD");
   receive(1,b"GROUPREVOKE");reader(false);
   write(b"desktop ownership probe revoked group denied");send(1,b"GROUPREVOKED");
+  receive(1,b"ACLALLOW");reader(true);
+  write(b"desktop ownership probe named user read exact committed bytes");send(1,b"ACLREAD");
+  receive(1,b"ACLDENY");reader(false);
+  write(b"desktop ownership probe explicit named user deny enforced");send(1,b"ACLDENIED");
+  receive(1,b"ACLREMOVE");reader(false);
+  write(b"desktop ownership probe removed named user grant denied");send(1,b"ACLREMOVED");
  }
 }
 pub(super) fn verify(){

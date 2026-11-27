@@ -787,3 +787,37 @@ and times out without making it runnable, then separately authorizes launch,
 exits/reaps and delivers completion. No deadline or copyout/security check is
 weakened. Exact-head standalone five-boot QEMU must confirm the fix; local
 build/test execution remains disabled at the owner's request.
+
+
+### Point 7 — persistent bounded named-user ACL implementation
+
+The existing permission policy, COW metadata, hierarchical VFS and native
+administration now support two persistent named users per storage object.
+`NamedUsers` canonicalizes checked grants/removals, preserves root/owner mode
+precedence, clips named grants to group mode bits and makes zero rights an
+explicit deny without group/other fallback. V3 checksummed metadata adds a
+64-byte tail for the eight existing objects. V1/v2 mounts use empty ACLs;
+updates preserve grants and v3 across data writes, rename and ownership/mode
+changes. Invalid/orphan/duplicate records reject even with a valid CRC.
+
+VFS applies ACLs to the leaf and each searchable ancestor. Native syscall33
+operations41/42 expose guarded set/remove under existing PID1 credential,
+namespace, foreign-descriptor, write-budget, flush, revocation and quarantine
+rules. Feature bit512 is additive; no native descriptor/version change or
+caller-selected credential identity is introduced. The separate ring-3 fixture
+adds actual named-user grant/read, explicit denial and removal denial before
+restoring metadata and running its prior lock and desktop tests. Its oracle
+requires twelve CRC-valid publications with final empty ACLs and unchanged
+data/guard sectors. See M1_PERSISTENT_PERMISSIONS.md for layout and limits.
+
+Eleven new host tests cover policy, on-disk corruption/preservation, VFS search/
+remount/torn writes and native admission/revocation/flush failure; existing
+syscall/shutdown and guest-oracle tests are extended. No local build, test or
+QEMU ran. GitHub must verify exact candidate behavior before acceptance.
+
+This advances point7, not completion of points2–10. Full POSIX named/default
+ACLs, persistent per-user quotas, free-space allocation and broader lock and
+interrupted-durability acceptance remain. General fork/COW, SMP/IPIs/migration,
+XSAVE, threads/signals, spawn/exec, normal networking/IOMMU, real AHCI/NVMe/xHCI,
+firmware trust providers and physical-device qualification retain their prior
+pending status. No gate or completion percentage is newly accepted.

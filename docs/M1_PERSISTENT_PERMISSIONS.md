@@ -70,3 +70,45 @@ entries, supplementary groups, persistent quotas and general multiuser
 administration remain unfinished. Host tests cover admission without device
 access, persisted publication, token revocation and failed flush. Exact-head
 GitHub validation is required; no local tests or hardware qualification ran.
+
+
+## Bounded named-user ACLs (metadata v3)
+
+Version 3 retains the eight existing 40-byte file entries and places two
+`(u16 uid, u16 rights)` records per object in bytes 352..416 of each checksummed
+metadata sector. Remaining tail bytes must be zero. Active UIDs are nonzero,
+unique and ascending, followed by zero records. Rights use READ=4, WRITE=2,
+SEARCH=1; a zero-rights active record is an explicit deny. Orphan records on an
+unused object, duplicate UIDs, unknown rights and noncanonical padding reject
+the volume even when its CRC is correct. Versions 1 and 2 remain readable with
+empty named ACLs. Setting the first real ACL publishes v3 atomically; ordinary
+writes, durable writes, rename and chmod/chown/chgrp preserve ACLs and never
+downgrade the format. Older kernels cannot mount v3: downgrade is unsupported.
+
+After validating all metadata, root and the owner retain their existing mode
+semantics. A matching named user receives its named rights intersected with
+the mode's group bits, with no fallback to group/other on denial. Nonmatching
+users keep the existing group/other policy. This bounded mask convention is
+not a full POSIX ACL: there are no named groups, default/inherited ACLs or
+supplementary groups. Directory ancestors require SEARCH through this same
+policy; no ACL grants a wider namespace or implicit symlink traversal.
+
+Syscall33 operation **41** sets a named user: argument bits0..15 hold UID,
+bits16..31 hold rights (0..7), and upper bits must be zero. Operation **42**
+removes a nonzero u16 UID. Both reuse the existing zero-path/zero-payload native
+64-byte descriptor and advertise feature bit **512**. These are operation
+numbers within syscall33; the separate syscall41 remains the blocking-lock
+ABI. PID1's broker role is mandatory, and VFS permits ACL changes only to a
+kernel-authenticated root or current owner. Foreign descriptors block metadata
+administration before device access. Success flushes and revokes cached
+handles; uncertain I/O quarantines the volume. Shutdown arming rejects changes.
+
+Host tests cover canonical policy, mask/deny precedence, remount/write/rename
+preservation, ancestor search, CRC-valid malformed records, torn publication,
+pre-I/O denial, descriptor revocation and failed flush. The separate guest
+ownership fixture additionally grants a named uid1000 read, verifies exact
+committed bytes, applies explicit deny, removes the grant and verifies denial
+again. Its oracle requires twelve real metadata publications, final empty ACLs,
+restored root:root/0777 and unchanged payload/guard sectors. Product images do
+not include that fixture. No local builds/tests ran; exact-head GitHub evidence
+is required. Persistent quotas and general multiwriter locking remain pending.

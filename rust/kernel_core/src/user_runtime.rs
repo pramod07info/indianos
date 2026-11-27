@@ -1359,7 +1359,9 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
    if matches!(request.arg0,2|3|5|27|36|37) && argument!=0{return reject(b"IndianOS: Files unlock nonzero argument rejected\n\0");}
    if request.arg0==37&&handle!=0{return BAD;}
    if request.arg0==38&&argument>0o777{return BAD;}
-   if matches!(request.arg0,39|40)&&argument>u16::MAX as u64{return BAD;}
+   if matches!(request.arg0,39|40|42)&&argument>u16::MAX as u64{return BAD;}
+   if request.arg0==41&&(argument>>32!=0||argument as u16==0||((argument>>16)&0xffff)>7){return BAD;}
+   if request.arg0==42&&argument==0{return BAD;}
    if matches!(request.arg0,4|6|25|26) && argument>crate::durablefs::MAX_FILE_BYTES as u64{
     return BAD;
    }
@@ -3561,7 +3563,7 @@ fn native_file_payload_size(action:u64,offset:u64,length:u64)->Option<usize>{
  #[test]fn desktop_durable_shutdown_fences_all_storage_mutations(){
   let mut state=DesktopLifecycle::new();
   for number in [32,33]{
-   for operation in 0..=40{assert!(state.allows_storage_request(number,operation));}
+   for operation in 0..=42{assert!(state.allows_storage_request(number,operation));}
   }
   assert!(state.compositor_ready(1));
   assert!(state.ready(true));
@@ -3570,7 +3572,7 @@ fn native_file_payload_size(action:u64,offset:u64,length:u64)->Option<usize>{
   assert!(state.allows_storage_request(33,3));
   assert!(state.allows_storage_request(41,35));
   assert!(state.complete_sync(true));
-  for operation in 0..=40{
+  for operation in 0..=42{
    assert_eq!(state.allows_storage_request(32,operation),matches!(operation,4|8|10|12));
    assert_eq!(state.allows_storage_request(33,operation),matches!(operation,2|4|5|25|27|36|37));
    assert!(!state.allows_storage_request(41,operation));
