@@ -41,13 +41,16 @@ impl Status{
   let terminal=matches!(process.state,4|5);
   // Fail closed on a contradictory PCB instead of turning a lost root into
   // an indefinitely pending child, or publishing a fabricated completion.
-  // NEW/READY may still be unbound; a running/terminal process cannot lose
-  // its owned root before the explicit reclamation transition.
+  // NEW/READY may be unbound OR own prepared mappings: the R026 launch
+  // gate deliberately holds a fully staged worker in NEW until PID1 starts
+  // it. State controls dispatch eligibility, not whether those pages exist.
+  // A running/terminal process cannot lose its owned root before the
+  // explicit reclamation transition; every retained root stays aligned.
   let root=process.address_space_root;
   let fault=process.fault_vector!=0||process.fault_error!=0||process.fault_address!=0;
   if process.pid==0||generation==0||!(1..=5).contains(&process.state)||
      (root!=0&&root&4095!=0)||
-     (process.state==1&&root!=0)||(process.state==3&&root==0)||
+     (process.state==3&&root==0)||
      (terminal&&((root==0)!=process.resources_reclaimed))||
      (process.resources_reclaimed&&!terminal)||
      (!terminal&&(process.exit_status!=0||fault))||
@@ -182,8 +185,33 @@ impl Wait{
   assert!(status.complete());assert_eq!(status.available(),Ok(true));
   assert_eq!(Status::capture(&process,9,true).unwrap().available(),Err(Error::Consumed));
  }
+ #[test]fn staged_new_worker_can_be_queried_and_waited_without_launch_authority(){
+  let mut process=Process{pid:2,state:1,..Process::empty()};
+  assert!(unsafe{crate::indianos_process_ready(&mut process)});
+  assert!(unsafe{crate::indianos_process_bind(&mut process,0x1000)});
+  // Match the actual R026/test-r031-vfs hold after image preparation: it
+  // retains its CR3 while NEW prevents scheduler_next_matching dispatch.
+  process.state=1;
+  let staged=Status::capture(&process,9,false).unwrap();
+  assert!(!staged.complete());assert_eq!(staged.available(),Ok(false));
+  let request=Request{pid:2,generation:9,rounds:1,address:0x400000};
+  let mut wait=Wait::begin(4,request).unwrap();
+  assert_eq!(wait.poll(4,Ok(staged),|_|panic!("staged worker delivered")),Poll::Pending);
+  assert_eq!(wait.poll(4,Ok(staged),|_|panic!("staged worker delivered")),Poll::TimedOut);
+  assert_eq!(process.state,1);assert_eq!(process.address_space_root,0x1000);
+  // PID1's separate authenticated launch changes eligibility. A wait alone
+  // must neither perform that transition nor consume an eventual completion.
+  assert!(unsafe{crate::indianos_process_ready(&mut process)});
+  assert!(Status::capture(&process,9,false).is_ok());
+  assert!(unsafe{crate::indianos_process_start(&mut process,0x1000)});
+  assert!(Status::capture(&process,9,false).is_ok());
+  assert!(unsafe{crate::indianos_process_exit(&mut process,0)});
+  assert!(unsafe{crate::indianos_process_reap(&mut process)});
+  let mut wait=Wait::begin(4,request).unwrap();
+  assert_eq!(wait.poll(4,Status::capture(&process,9,false),|_|true),Poll::Delivered);
+ }
  #[test]fn lost_unaligned_or_premature_roots_never_become_waitable_status(){
-  for (state,root,reclaimed) in [(1,0x1000,false),(2,0x1001,false),
+  for (state,root,reclaimed) in [(1,0x1001,false),(2,0x1001,false),
      (3,0,false),(3,0x1001,false),(4,0,false),(5,0,false),
      (2,0,true),(4,0x1000,true),(5,0x1000,true)]{
    let process=Process{pid:2,state,address_space_root:root,resources_reclaimed:reclaimed,

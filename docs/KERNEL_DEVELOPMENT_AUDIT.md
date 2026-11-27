@@ -773,3 +773,17 @@ global pressure/OOM victim policy with end-to-end conservation tests, and SMP
 quota reservations across heap/VMM/process lifecycle. The PMM admission guard
 alone does not remove higher-level BSP ownership constraints; no 100% completion
 or milestone acceptance is asserted.
+
+
+### Standalone VFS wait regression root cause and correction
+
+The standalone R026-derived scheduler intentionally binds the worker root and
+then changes READY to NEW to withhold launch authority until PID1 requests it.
+The new status validator incorrectly treated NEW with a bound root as corrupt.
+It now accepts that real staged state while retaining root alignment, RUNNING
+ownership, terminal/reclamation consistency and fault-payload checks. A new
+regression uses actual ready/bind transitions, holds the worker in NEW, queries
+and times out without making it runnable, then separately authorizes launch,
+exits/reaps and delivers completion. No deadline or copyout/security check is
+weakened. Exact-head standalone five-boot QEMU must confirm the fix; local
+build/test execution remains disabled at the owner's request.
