@@ -189,6 +189,8 @@ pub unsafe extern "C" fn indianos_syscall_validate(
         39 => request.arg1==64 && user_range(plan,request.arg0,64,false), // app pixel transaction
         #[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
         40 => request.arg0<=1 && user_range(plan,request.arg1,64,false), // versioned supervised process query/wait
+        #[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
+        41 => matches!(request.arg0,34|35) && user_range(plan,request.arg1,64,false), // bounded range lock wait
         #[cfg(feature="normal-desktop")]
         37 => match request.arg0 {
             0 | 1 => user_range(plan, request.arg1, 64, request.arg0 == 0),
@@ -430,6 +432,17 @@ mod tests {
             for address in [0,plan.guard_begin,USER_TOP-63,USER_TOP,u64::MAX]{assert!(!check(operation,address));}
         }
         assert!(!check(2,plan.stack_begin));assert!(!check(u64::MAX,plan.stack_begin));
+    }
+    #[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
+    #[test]fn blocking_lock_ingress_accepts_only_lock_operations_and_full_descriptors(){
+        let plan=ProgramPlan{entry:USER_MIN,stack_begin:USER_TOP-STACK_BYTES,stack_end:USER_TOP,
+            guard_begin:USER_TOP-STACK_BYTES-PAGE_BYTES,segment_count:0,segments:[ProgramSegment::empty();MAX_SEGMENTS]};
+        let check=|op,address|unsafe{indianos_syscall_validate(&plan,SyscallRequest{number:41,arg0:op,arg1:address})};
+        for op in [34,35]{
+            assert!(check(op,plan.stack_begin));
+            for address in [0,plan.guard_begin,USER_TOP-63,u64::MAX]{assert!(!check(op,address));}
+        }
+        for op in [0,33,36,u64::MAX]{assert!(!check(op,plan.stack_begin));}
     }
 
     #[test]

@@ -43,6 +43,8 @@ struct DirectMap{offset:u64}
 struct Task{
  #[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
  supervision:crate::process_wait::OwnerState,
+ #[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
+ file_wait:crate::lock_wait::Wait,
  #[cfg(feature="normal-desktop")]
  fpu:crate::fpu_context::Context,
  image:UserImage,root:CloneResult,pcb:*mut Process,
@@ -188,6 +190,7 @@ impl DesktopLifecycle{
    // Existing descriptors may read, seek and close. OPEN can create/truncate
    // and is deliberately refused even when its user flags claim read-only.
    33=>matches!(operation,2|4|5|25|27|36|37),
+   41=>false,
    _=>true,
   }
  }
@@ -1198,6 +1201,8 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
   #[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
   40=>native_process_wait(img,request.arg0,request.arg1,regs),
   #[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
+  41=>native_file_lock_wait(img,request.arg0,request.arg1,regs),
+  #[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
   32=>{
    if !authenticated_r026_init(){return BAD;}
    // Descriptor: path[24], new_path[24], user_buffer u64, bytes u64.
@@ -2105,7 +2110,7 @@ fn prepare(t:*mut Task,p:*mut Process,elf:*const u8,size:usize,original:u64,
  if p.is_null(){return false;}
  task.pcb=p;task.authority_live=true;
  #[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
- {task.supervision=crate::process_wait::OwnerState::new();}
+ {task.supervision=crate::process_wait::OwnerState::new();task.file_wait=crate::lock_wait::Wait::empty();}
  #[cfg(feature="normal-desktop")]
  {task.fpu=crate::fpu_context::Context::new();}
  #[cfg(feature="normal-desktop")]
@@ -2228,6 +2233,47 @@ fn supervised_status(pid:u32)->Result<crate::process_wait::Status,crate::process
  crate::process_wait::Status::capture(process,task.supervision.incarnation,task.supervision.consumed)
 }
 #[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
+fn native_file_lock_wait(img:*mut UserImage,operation:u64,descriptor:u64,regs:*const u64)->u64{
+ use crate::lock_wait::{Request,Wait,BYTES};
+ let Ok(permit)=r120_enter()else{return BAD;};
+ let Some(owner)=authenticated_file_identity()else{return BAD;};
+ let mut bytes=[0u8;BYTES];
+ if !unsafe{indianos_user_copy_readonly(img,descriptor,bytes.as_mut_ptr().cast(),BYTES)}{return BAD;}
+ let Some(request)=Request::decode(operation,&bytes)else{return BAD;};
+ let files=unsafe{&mut *ptr::addr_of_mut!(R031_HANDLES)};
+ let Ok(receipt)=files.lock_wait_receipt(owner,request.handle,operation,request.range)else{return BAD;};
+ match crate::fs_handles::operation_authenticated(files,operation,owner,request.handle,request.range,"",&mut[]){
+  Ok(0)=>return 0,Ok(1)=>{},_=>return BAD,
+ }
+ let Some(wait)=Wait::begin(owner,receipt,request.rounds)else{return BAD;};
+ let task=active_task();if task.is_null(){return BAD;}
+ drop(permit);
+ if !capture(regs,false){return BAD;}
+ pid_log(owner.pid,b"FILE_LOCK_WAIT_QUEUED\0");
+ unsafe{(*task).file_wait=wait;x86_64_user_exit_to_kernel(YIELD)}
+}
+#[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
+fn service_file_waiters()->bool{
+ use crate::lock_wait::Poll;
+ if (0..TASKS).all(|slot|!unsafe{(*task_ptr(slot)).file_wait.active()}){return true;}
+ let Ok(_permit)=r120_enter()else{return false;};
+ let files=unsafe{&mut *ptr::addr_of_mut!(R031_HANDLES)};
+ for slot in 0..TASKS{
+  let task=unsafe{&mut *task_ptr(slot)};if !task.file_wait.active(){continue;}
+  #[cfg(feature="normal-desktop")]
+  if unsafe{DESKTOP_LIFECYCLE.shutdown_armed}{task.file_wait.cancel();task.frame[14]=BAD;continue;}
+  let Some(process)=(unsafe{task.pcb.as_ref()})else{return false;};
+  let owner=crate::batch5_session::Identity{pid:process.pid,generation:task.file_generation};
+  if process.pid!=(slot+1) as u32||process.state!=2||!task.saved||!task.image.ready{return false;}
+  task.frame[14]=match task.file_wait.poll(owner,files){
+   Poll::Pending=>continue,
+   Poll::Acquired=>{pid_log(owner.pid,b"FILE_LOCK_WAIT_ACQUIRED\0");0},
+   Poll::TimedOut=>{pid_log(owner.pid,b"FILE_LOCK_WAIT_TIMEOUT\0");1},Poll::Failed(_)=>BAD,
+  };
+ }
+ true
+}
+#[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
 fn native_process_wait(img:*mut UserImage,operation:u64,descriptor:u64,regs:*const u64)->u64{
  use crate::process_wait::{Request,Wait,BYTES};
  let Ok(permit)=r120_enter()else{return BAD;};
@@ -2332,6 +2378,8 @@ fn next_ipc_ready(scheduler:&mut Scheduler)->*mut Process{
  for _ in 0..=crate::ipc::MAX_WAIT_ROUNDS as usize{
   #[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
   if !service_process_waiters(){return ptr::null_mut();}
+  #[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
+  if !service_file_waiters(){return ptr::null_mut();}
   #[cfg(any(feature="test-ipc",feature="normal-desktop"))]
   if !service_ipc_waiters(){return ptr::null_mut();}
   let mut waiting=[0u32;TASKS];
@@ -2341,6 +2389,8 @@ fn next_ipc_ready(scheduler:&mut Scheduler)->*mut Process{
    if task.ipc_wait.active(){*pid=task.ipc_wait.receiver();}
    #[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
    if task.supervision.wait.active(){*pid=(slot+1) as u32;}
+   #[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
+   if task.file_wait.active(){*pid=(slot+1) as u32;}
   }
   let process=unsafe{crate::scheduler_next_matching(scheduler,
       |p|!waiting.contains(&p.pid))};
@@ -2595,6 +2645,8 @@ fn revoke_task_authority_with_kind(
  task.saved=false;task.frame=[0;WORDS];task.image.ready=false;
  #[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
  task.supervision.wait.cancel();
+ #[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
+ task.file_wait.cancel();
  #[cfg(feature="normal-desktop")]
  for record in unsafe{&mut *ptr::addr_of_mut!(DESKTOP_APP_PIXEL_GUARDS)}{
   if record.0==task.root.root&&record.1==task.pixel_scratch[0]{*record=(0,0,0,0);}
@@ -3501,10 +3553,12 @@ fn native_file_payload_size(action:u64,offset:u64,length:u64)->Option<usize>{
   assert!(!state.complete_sync(false));
   assert!(state.allows_storage_request(32,11));
   assert!(state.allows_storage_request(33,3));
+  assert!(state.allows_storage_request(41,35));
   assert!(state.complete_sync(true));
   for operation in 0..=40{
    assert_eq!(state.allows_storage_request(32,operation),matches!(operation,4|8|10|12));
    assert_eq!(state.allows_storage_request(33,operation),matches!(operation,2|4|5|25|27|36|37));
+   assert!(!state.allows_storage_request(41,operation));
   }
   assert!(!state.allows_storage_request(32,u64::MAX));
   assert!(!state.allows_storage_request(33,u64::MAX));

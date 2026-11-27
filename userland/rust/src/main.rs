@@ -11,6 +11,8 @@ use core::arch::asm;
 use core::panic::PanicInfo;
 #[cfg(feature="test-fpu-context")]
 mod desktop_fpu_probe;
+#[cfg(feature="test-blocking-lock")]
+mod desktop_lock_probe;
 #[cfg(feature="normal-init")]
 mod bootstrap;
 #[cfg(any(feature="shell",feature="interactive",feature="r026-shell"))]
@@ -2386,6 +2388,8 @@ fn native_child_wait(){
 }
 #[no_mangle]
 pub extern "C" fn _start()->!{
+    #[cfg(feature="test-blocking-lock")]
+    desktop_lock_probe::verify();
     #[cfg(feature="test-fpu-context")]
     desktop_fpu_probe::verify();
     #[cfg(feature="desktop-compositor")]

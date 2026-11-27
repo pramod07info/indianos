@@ -32,8 +32,9 @@ pub const FS_ABI_UNRELATED_READERS:u32=8;
 pub const FS_ABI_POSITIONED_IO:u32=16;
 pub const FS_ABI_UNRELATED_DESCRIPTOR_READERS:u32=32;
 pub const FS_ABI_DESCRIPTOR_FSYNC:u32=64;
+pub const FS_ABI_BLOCKING_LOCKS:u32=128;
 pub const FS_ABI_FEATURES:u32=7|FS_ABI_UNRELATED_READERS|FS_ABI_POSITIONED_IO|
-    FS_ABI_UNRELATED_DESCRIPTOR_READERS|FS_ABI_DESCRIPTOR_FSYNC;
+    FS_ABI_UNRELATED_DESCRIPTOR_READERS|FS_ABI_DESCRIPTOR_FSYNC|FS_ABI_BLOCKING_LOCKS;
 pub const FS_ABI_INFO:u64=FS_ABI_VERSION as u64|
     ((FS_ABI_DESCRIPTOR_BYTES as u64)<<16)|((FS_ABI_FEATURES as u64)<<32);
 const SLOTS:usize=4;
@@ -47,6 +48,15 @@ struct Handle {
     path:[u8;24], len:usize,
     lock_kind:u8,lock_start:u64,lock_end:u64,
 }
+/// BSP-only wait authority: exact descriptor, namespace and volume lifetime.
+/// A pathname or recycled numeric handle is never sufficient to resume a wait.
+#[derive(Clone,Copy)]
+pub(crate) struct LockReceipt{
+ owner:Identity,token:u64,operation:u64,range:u64,handle:Handle,
+ namespace:NamespaceReceipt,volume:Option<crate::m1_partition::PartitionReceipt>,revision:u64,
+ _single_bsp:PhantomData<*mut ()>,
+}
+impl LockReceipt{pub(crate) fn owned_by(&self,owner:Identity)->bool{self.owner==owner}}
 impl Handle{
     const EMPTY:Self=Self{token:0,pid:0,generation:0,mode:0,offset:0,
         filesystem_generation:0,path:[0;24],len:0,
@@ -497,6 +507,26 @@ impl FileHandles{
     }
     /// Locks are cached capabilities, owned by the descriptor's authenticated
     /// process incarnation. Closing/revoking a handle removes its lock too.
+    pub(crate) fn lock_wait_receipt(&self,owner:Identity,token:u64,operation:u64,range:u64)
+        ->Result<LockReceipt,FsError>{
+        if !matches!(operation,34|35){return Err(FsError::InvalidName);}
+        self.preflight_selected(operation,owner,token,range,"",&[])?;
+        if self.selected_volume.is_some(){self.selected_operation_guard(owner)?;}
+        let handle=self.entries[self.index(owner,token)?];
+        Ok(LockReceipt{owner,token,operation,range,handle,
+            namespace:self.namespace_receipt(owner)?,volume:self.selected_volume,
+            revision:self.volume_revision,_single_bsp:PhantomData})
+    }
+    pub(crate) fn lock_wait_is_current(&self,receipt:LockReceipt)->bool{
+        if self.namespace_receipt(receipt.owner)!=Ok(receipt.namespace)||
+           self.selected_volume!=receipt.volume||self.volume_revision!=receipt.revision||
+           self.selected_quarantined{return false;}
+        self.index(receipt.owner,receipt.token).is_ok_and(|slot|self.entries[slot]==receipt.handle)
+    }
+    pub(crate) fn retry_lock_wait(&mut self,receipt:LockReceipt)->Result<u64,FsError>{
+        if !self.lock_wait_is_current(receipt){return Err(FsError::InvalidName);}
+        operation_authenticated(self,receipt.operation,receipt.owner,receipt.token,receipt.range,"",&mut[])
+    }
     fn descriptor_control(&mut self,action:u64,owner:Identity,token:u64,
         argument:u64,path:&str,buffer:&[u8])->Result<u64,FsError>{
         if !self.owns(owner)||!path.is_empty()||!buffer.is_empty(){
@@ -2693,6 +2723,7 @@ mod r094_authenticated_cow_ops {
   assert_eq!(FS_ABI_INFO&0xffff,1);assert_eq!((FS_ABI_INFO>>16)&0xffff,64);
   assert_eq!((FS_ABI_INFO>>32) as u32&FS_ABI_UNRELATED_READERS,FS_ABI_UNRELATED_READERS);
   assert_eq!((FS_ABI_INFO>>32) as u32&FS_ABI_DESCRIPTOR_FSYNC,FS_ABI_DESCRIPTOR_FSYNC);
+  assert_eq!((FS_ABI_INFO>>32) as u32&FS_ABI_BLOCKING_LOCKS,FS_ABI_BLOCKING_LOCKS);
   assert_eq!(operation_authenticated(&mut table,37,owner,1,0,"",&mut[]),Err(FsError::InvalidName));
   assert_eq!(operation_authenticated(&mut table,37,owner,0,1,"",&mut[]),Err(FsError::InvalidName));
   assert_eq!(FileHandles::lock_range(u64::MAX),Err(FsError::TooLarge));

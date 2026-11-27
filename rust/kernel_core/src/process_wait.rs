@@ -3,6 +3,20 @@
 use crate::Process;
 pub(crate) const BYTES:usize=64;
 pub(crate) const MAX_ROUNDS:u8=32;
+/// Shared cooperative deadline. Completion is checked before charging a
+/// pending round; the first pass always leaves a peer a chance to execute.
+#[derive(Clone,Copy)]
+pub(crate) struct RoundBudget{remaining:u8,fresh:bool}
+impl RoundBudget{
+ pub const fn empty()->Self{Self{remaining:0,fresh:false}}
+ pub fn new(rounds:u64)->Option<Self>{
+  (1..=MAX_ROUNDS as u64).contains(&rounds).then_some(Self{remaining:rounds as u8,fresh:true})
+ }
+ pub fn expired_after_pending(&mut self)->bool{
+  if self.fresh{self.fresh=false;}else{self.remaining=self.remaining.saturating_sub(1);}
+  self.remaining==0
+ }
+}
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 pub(crate) enum Error{Invalid,Stale,Consumed,Copy}
 #[derive(Clone,Copy)]
@@ -44,7 +58,7 @@ impl Status{
  }
 }
 #[derive(Clone,Copy)]
-pub(crate) struct Wait{owner:u64,pid:u32,generation:u64,address:u64,remaining:u8,fresh:bool}
+pub(crate) struct Wait{owner:u64,pid:u32,generation:u64,address:u64,budget:RoundBudget}
 pub(crate) struct OwnerState{pub incarnation:u64,pub wait:Wait,pub consumed:bool}
 impl OwnerState{
  pub const fn new()->Self{Self{incarnation:0,wait:Wait::empty(),consumed:false}}
@@ -52,12 +66,12 @@ impl OwnerState{
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 pub(crate) enum Poll{Pending,TimedOut,Delivered,Failed(Error)}
 impl Wait{
- pub const fn empty()->Self{Self{owner:0,pid:0,generation:0,address:0,remaining:0,fresh:false}}
+ pub const fn empty()->Self{Self{owner:0,pid:0,generation:0,address:0,budget:RoundBudget::empty()}}
  pub fn begin(owner:u64,request:Request)->Result<Self,Error>{
   if owner==0||request.pid==0||request.generation==0||request.address==0||
      !(1..=MAX_ROUNDS as u64).contains(&request.rounds){return Err(Error::Invalid);}
-  Ok(Self{owner,pid:request.pid,generation:request.generation,address:request.address,
-   remaining:request.rounds as u8,fresh:true})
+  let Some(budget)=RoundBudget::new(request.rounds)else{return Err(Error::Invalid);};
+  Ok(Self{owner,pid:request.pid,generation:request.generation,address:request.address,budget})
  }
  pub fn active(&self)->bool{self.owner!=0}
  pub fn target(&self)->u32{self.pid}
@@ -72,8 +86,7 @@ impl Wait{
     Err(e)=>Poll::Failed(e),
     Ok(true)=>if deliver(&status.wire()){Poll::Delivered}else{Poll::Failed(Error::Copy)},
     Ok(false)=>{
-     if self.fresh{self.fresh=false;}else{self.remaining=self.remaining.saturating_sub(1);}
-     if self.remaining==0{Poll::TimedOut}else{Poll::Pending}
+     if self.budget.expired_after_pending(){Poll::TimedOut}else{Poll::Pending}
     }
    }
   })();

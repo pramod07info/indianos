@@ -497,3 +497,53 @@ four-process guest proof remain necessary. This implements demand-zero COW,
 not full P2-006 acceptance; general sharing/refcounts, fork and remote TLB
 reclamation remain unfinished. Other pending workstreams and formal gate counts
 remain unchanged.
+
+### Bounded native blocking range locks (P4-009)
+
+Syscall 41 adds READ/WRITE range-lock waits using the existing authenticated
+nonblocking lock operations 34/35. ABI discovery advertises additive feature
+bit 128 through version-1 filesystem QUERY. It does not add another lock table
+or probe a disk during scheduler wakeup. Input is a 64-byte little-endian record:
+version u16=1/size u16=64 at 0, reserved u32=0 at 4, opaque handle u64 at 8,
+existing packed range u64 at 16, timeout u64=1..32 at 24, and 32 reserved zero
+bytes at 32. The syscall operation is 34 or 35. Return 0 means acquired, 1 means
+timeout, and BAD means invalid/revoked authority. A zero range retains the
+existing whole-file meaning and fixed extent bounds.
+
+Contended requests capture a private scheduler continuation and stop dispatching
+the blocked caller while peers run. A kernel-only receipt binds the full handle
+state, process incarnation, namespace revision and selected volume/revision.
+Every retry revalidates that receipt before invoking the existing lock control.
+Close, namespace narrowing, volume replacement/quarantine or PID reuse cannot
+retarget a queued wait. Unrelated metadata changes conservatively fail the wait
+rather than silently widening object identity. Receipt types remain BSP-local.
+
+The shared cooperative deadline implementation is reused by child waits and
+lock waits. Completion wins at the deadline; the first pending pass gives peers
+an execution opportunity. Deadlines are selection rounds, not wall-clock time.
+Timeout or cancellation preserves prior lock state, including a pending upgrade.
+Retirement cancels the continuation before freeing process resources; durable
+shutdown rejects new lock waits and cancels pending ones before acquisition.
+The exact admission permit is dropped before the noreturn yield transition.
+FIFO fairness, unbounded waits, multiple locks per descriptor, cross-CPU lock
+queues and a general stable inode/free-space implementation remain unfinished.
+
+Five lock-engine/receipt cases, one native ingress case and two guest-evidence
+oracle cases cover unlock handoff, timeout state preservation, closed handles,
+namespace/owner reuse, cancellation, reserved fields and malformed pointers.
+Existing child-wait tests exercise the shared deadline refactor. An opt-in
+DESKTOP_LOCK_ACCEPTANCE=1 image coordinates actual PID1/PID2 against the selected
+/shared/readme: PID2 acquires READ, PID1 queues/times out, PID1 queues again,
+PID2 unlocks/closes its original handle, and PID1 must acquire and resume.
+It also rejects a WRITE request through PID2's read-only handle. PID3/PID4 wait
+until fixture completion, then ordinary four-service startup runs. Kernel queue,
+timeout and acquisition receipts must be fresh and ordered before readiness;
+the copied golden disk must remain unchanged. Serial/screenshot artifacts are
+retained. Ordinary desktop and COW/FPU images remain separate and mandatory.
+
+No local build, test or QEMU execution was performed. Exact-head GitHub results
+are required; no new gate or percentage is accepted. Blocking range waits are
+implemented within the current bounded native service/descriptor model. General
+ACL administration, persistent per-user quotas, arbitrary process/thread/futex/
+signal facilities, SMP scheduling, IOMMU, new storage/USB controllers, firmware
+trust and physical device/power qualification remain pending.
