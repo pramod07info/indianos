@@ -274,15 +274,20 @@
     {
       "id": "G4",
       "title": "Independent ring-3 compositor and input broker",
-      "status": "audit_required",
-      "acceptance_mode": "test-based; mandatory evidence incomplete; see gate policy and exact-main report",
+      "status": "automated_acceptance",
+      "acceptance_mode": "exact-main automated evidence; G4 retained run and M2 non-regression both required",
       "source_paths": [
-        "rust/kernel_core/src/m1_persistent_desktop.rs"
+        "userland/rust/src/main.rs",
+        "rust/kernel_core/src/user_runtime.rs",
+        "rust/kernel_core/src/gui.rs"
       ],
       "merged_prs": [
-        765
+        765,
+        812,
+        813,
+        816
       ],
-      "acceptance": "docs/M1_GATES_8_10_ACCEPTANCE.md"
+      "acceptance": "docs/M1_G4_FULL_FRAME_QEMU_ACCEPTANCE.md"
     },
     {
       "id": "G5",

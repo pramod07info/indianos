@@ -1754,6 +1754,14 @@ def client_incarnation_records(raw: bytes) -> tuple[tuple[int, int, int], ...]:
     return records
 
 
+def compositor_role_roots(compositor: int, clients: bytes) -> tuple[int, ...]:
+    """Actual stopped ring-3 PID4 CR3 must not alias PID1 or either app."""
+    roots = tuple(root for _, root, _ in client_incarnation_records(clients))
+    if not 0 < compositor < 1 << 52 or compositor % 4096 or compositor in roots:
+        raise AssertionError("PID4 does not own a separate valid address space")
+    return (*roots, compositor)
+
+
 def verify_preserved_clients(before: bytes, after: bytes, old_roles: bytes, new_roles: bytes) -> None:
     client_incarnation_records(before)
     client_incarnation_records(after)
@@ -2113,6 +2121,7 @@ def transient_service_boot(qemu: str, iso: Path, ovmf: Path, disk: Path,
         verify_text_pixels(before_fault, "files-lock", "READ LOCKED")
         fault_media = disk.read_bytes()
         injection_at = len(session.output)
+        evidence.append(f"G4 fault serial boundary: {injection_at}")
         session.hmp("stop")
         debugger = GuestDebugger(path)
         if not debugger.command("?").startswith(("S", "T")):
@@ -2183,7 +2192,9 @@ def transient_service_boot(qemu: str, iso: Path, ovmf: Path, disk: Path,
             raise AssertionError("incomplete PID4 frame changed the visible framebuffer")
         clients_before = bounded_debugger_read(debugger, clients_ledger, 72)
         roles_before = debugger.memory(roles_ledger, 32)
-        client_incarnation_records(clients_before)
+        role_roots = compositor_role_roots(stopped_root(session), clients_before)
+        evidence.append("G4 process roots PID1 PID2 PID3 PID4: "
+                        + " ".join(f"{root:#x}" for root in role_roots))
         if failure is not None:
             pointer, length = compositor_source_extent(debugger, source_words, len(compositor))
             if length != len(compositor) or debugger.memory(pointer, 64) != compositor[:64]:
@@ -2444,6 +2455,78 @@ def unready_compositor_diagnostic(qemu: str, iso: Path, ovmf: Path, disk: Path,
     if name != target:
         raise AssertionError("unexpected recovery fixture")
     unready_service_boot(qemu, modified, ovmf, disk, artifacts, target)
+
+
+G4_ROLE_DENIALS = (
+    b"IndianOS user: desktop PID1 denied compositor window authority",
+    b"IndianOS user: desktop app denied compositor and physical input authority",
+    b"IndianOS user: desktop compositor denied input and filesystem authority",
+)
+
+
+def verify_g4_retained_evidence(artifact_root: Path, revision: str) -> Path:
+    """Require evidence from the completed real QEMU cases, not a green job alone."""
+    if not re.fullmatch(r"[0-9a-f]{40}", revision):
+        raise AssertionError("G4 requires the exact checkout revision")
+    runs = [path for path in artifact_root.glob("run-*") if path.is_dir()]
+    if len(runs) != 1:
+        raise AssertionError("G4 requires one fresh full desktop matrix output directory")
+    run, = runs
+    receipt = run / "g4-acceptance.json"
+    if receipt.exists():
+        raise AssertionError("G4 receipt already exists")
+    filenames = []
+
+    def retained(filename: str) -> bytes:
+        content = (run / filename).read_bytes()
+        if not content:
+            raise AssertionError(f"empty G4 evidence: {filename}")
+        filenames.append(filename)
+        return content
+
+    for boot_index in range(2):
+        prefix = f"desktop-{boot_index}"
+        output = retained(f"{prefix}.serial.log")
+        lines = output.replace(b"\r", b"").split(b"\n")[:-1]
+        if lines.count(READY.encode()) != 1:
+            raise AssertionError("G4 boot is missing its distinct-role readiness")
+        startup = lines[:lines.index(READY.encode())]
+        if any(startup.count(marker) != count for marker, count in zip(G4_ROLE_DENIALS, (1, 2, 1))):
+            raise AssertionError("G4 boot is missing a distinct-role authority denial")
+        verify_pixel_startup(b"\n".join(startup) + b"\n")
+        cost = json.loads(retained(f"{prefix}-startup-cost.json"))
+        if cost["startup_seconds"] <= 0 or not cost["frames"]:
+            raise AssertionError("G4 boot is missing measured full-frame presentation")
+        retained(f"{prefix}-initial.ppm")
+
+    def recovery_case(name: str) -> tuple[bytes, str, int]:
+        output = retained(f"{name}.serial.log")
+        debug = retained(f"{name}-debugger.log").decode("utf-8")
+        boundaries = re.findall(r"^G4 fault serial boundary: ([1-9][0-9]*)$", debug, re.MULTILINE)
+        if len(boundaries) != 1:
+            raise AssertionError("G4 recovery lacks a unique observed serial boundary")
+        return output, debug, int(boundaries[0])
+
+    prefix = "transient-compositor"
+    output, debug, boundary = recovery_case(prefix)
+    verify_transient_restart(output, boundary)
+    identities = re.findall(r"^G4 process roots PID1 PID2 PID3 PID4: (0x[0-9a-f]+) (0x[0-9a-f]+) (0x[0-9a-f]+) (0x[0-9a-f]+)$",
+                            debug, re.MULTILINE)
+    if len(identities) != 1:
+        raise AssertionError("G4 requires one stopped-guest address-space separation receipt")
+    roots = tuple(int(root, 16) for root in identities[0])
+    if len(set(roots)) != 4 or any(not 0 < root < 1 << 52 or root % 4096 for root in roots):
+        raise AssertionError("G4 receipt has invalid or shared address-space roots")
+    for image in ("private-staging", "restarted", "capture-cancelled", "saved-readback"):
+        retained(f"{prefix}-{image}.ppm")
+
+    for mode in ("load", "unready", "repeat"):
+        output, _, boundary = recovery_case(f"{prefix}-{mode}")
+        verify_replacement_failure(output, boundary, mode)
+
+    receipt.write_text(json.dumps({"schema": 1, "gate": "G4", "revision": revision,
+                                   "evidence": filenames}, indent=2) + "\n", encoding="utf-8")
+    return receipt
 
 
 def main() -> None:

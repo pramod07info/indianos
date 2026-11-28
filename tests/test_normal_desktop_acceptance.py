@@ -1,4 +1,5 @@
 """Negative controls for actual normal desktop QEMU evidence, not a guest mock."""
+import json
 from pathlib import Path
 import struct
 import sys
@@ -847,6 +848,63 @@ class NormalDesktopControls(unittest.TestCase):
                  harness.FRAME_ALLOCATED, harness.STALE_COMPOSITOR_DENIED, harness.SCRATCH_ALLOCATED, harness.SCRATCH_SHARED, harness.FRAME_PRESENTED,
                  self.frame_cost(), harness.FRAME_PUBLISHED, harness.COMPOSITOR_REPLACED]
         return old + b"\n".join(lines) + b"\n", len(old)
+
+    def test_g4_compositor_cr3_must_not_alias_the_broker_or_either_app(self):
+        clients = struct.pack("<9Q", 1, 0x1000, 1, 2, 0x2000, 2, 3, 0x3000, 0)
+        self.assertEqual(harness.compositor_role_roots(0x4000, clients),
+                         (0x1000, 0x2000, 0x3000, 0x4000))
+        for bad in (0, 0x1000, 0x2000, 0x3000, 0x4001, 1 << 52):
+            with self.subTest(bad=bad), self.assertRaises(AssertionError):
+                harness.compositor_role_roots(bad, clients)
+
+    def test_g4_receipt_requires_both_boots_and_all_recovery_modes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run = root / "run-fresh"
+            run.mkdir()
+            denied = b"\n".join(marker for marker, count in zip(harness.G4_ROLE_DENIALS, (1, 2, 1))
+                                for _ in range(count)) + b"\n"
+            cold = self.pixel_startup() + denied + harness.READY.encode() + b"\n"
+            for index in range(2):
+                (run / f"desktop-{index}.serial.log").write_bytes(cold)
+                (run / f"desktop-{index}-startup-cost.json").write_text(
+                    '{"startup_seconds":1,"frames":[{"pixels":307200}]}')
+                (run / f"desktop-{index}-initial.ppm").write_bytes(b"retained fixture")
+            prefix = "transient-compositor"
+            trace, offset = self.transient_trace()
+            diag = f"G4 fault serial boundary: {offset}\n"
+            distinct = "G4 process roots PID1 PID2 PID3 PID4: 0x1000 0x2000 0x3000 0x4000\n"
+            (run / f"{prefix}.serial.log").write_bytes(trace)
+            debugger = run / f"{prefix}-debugger.log"
+            debugger.write_text(diag)
+            for image in ("private-staging", "restarted", "capture-cancelled", "saved-readback"):
+                (run / f"{prefix}-{image}.ppm").write_bytes(b"retained fixture")
+            for mode in ("load", "unready", "repeat"):
+                (run / f"{prefix}-{mode}.serial.log").write_bytes(trace)
+                (run / f"{prefix}-{mode}-debugger.log").write_text(diag)
+            with patch.object(harness, "verify_replacement_failure") as fallback:
+                with self.assertRaisesRegex(AssertionError, "separation receipt"):
+                    harness.verify_g4_retained_evidence(root, "a" * 40)
+                debugger.write_text(diag + distinct.replace("0x4000", "0x1000"))
+                with self.assertRaisesRegex(AssertionError, "shared address-space"):
+                    harness.verify_g4_retained_evidence(root, "a" * 40)
+                debugger.write_text(diag + distinct)
+                bad = run / "desktop-1.serial.log"
+                bad.write_bytes(cold.replace(harness.G4_ROLE_DENIALS[1] + b"\n", b"", 1))
+                with self.assertRaisesRegex(AssertionError, "authority denial"):
+                    harness.verify_g4_retained_evidence(root, "a" * 40)
+                bad.write_bytes(cold)
+                repeat = run / f"{prefix}-repeat.serial.log"
+                repeat.unlink()
+                with self.assertRaises(FileNotFoundError):
+                    harness.verify_g4_retained_evidence(root, "a" * 40)
+                repeat.write_bytes(trace)
+                fallback.reset_mock()
+                receipt = harness.verify_g4_retained_evidence(root, "a" * 40)
+                self.assertEqual(json.loads(receipt.read_text())["revision"], "a" * 40)
+                self.assertEqual([call.args[2] for call in fallback.call_args_list], ["load", "unready", "repeat"])
+                with self.assertRaisesRegex(AssertionError, "already exists"):
+                    harness.verify_g4_retained_evidence(root, "a" * 40)
 
     def test_transient_restart_requires_frame_reclamation_and_reallocation(self):
         trace, since = self.transient_trace()

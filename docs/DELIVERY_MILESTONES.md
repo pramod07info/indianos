@@ -49,8 +49,10 @@ Files and Terminal, and integration/QA.
 - **G3 (position 8), automated:** Normal isolated PID1, Files, Terminal and
   user compositor, bounded recovery, and the repeated strict unready-service
   check. See the [G3 automated evidence contract](M1_G1_G8_AUTOMATED_ACCEPTANCE.md).
-- [ ] Move full compositor and input broker from ring0 to independent ring3
-      services; per-app surfaces and processes.
+- **G4 (position 9), automated:** Distinct ring-3 PID4 compositor and PID1
+  input broker, guarded app surfaces and client-preserving lifecycle. Count
+  only after the [dedicated G4 evidence](M1_G4_FULL_FRAME_QEMU_ACCEPTANCE.md)
+  and exact-revision non-regressions pass on main.
 - [ ] Implement keyboard, pointer and graphical Terminal/Files actions from
       physical/simulated devices, not serial control.
 - [ ] Production persistent VFS with power-loss-safe file writes, fsync,

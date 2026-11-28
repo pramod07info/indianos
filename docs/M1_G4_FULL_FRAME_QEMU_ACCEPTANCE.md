@@ -1,5 +1,7 @@
 # G4 full-frame and compositor-only recovery acceptance
 
+Current formal decision: [automated G4 gate](M1_G1_G8_AUTOMATED_ACCEPTANCE.md) on the exact merged revision. The implementation and historical evidence below do not by themselves mark the gate accepted.
+
 This extends the existing normal-desktop QEMU matrix on PR #816. Source
 baseline is `e7f06b750f4ccdd075bf9f778c9c11c082af02ed`; none of the host
 oracles below establishes guest behavior without the integrated live run.
@@ -88,3 +90,19 @@ physical motion is now sent in at most 100-unit transfers with exact presented
 coordinate/button acknowledgments, and the debugger validates either contiguous
 or compiler-split storage for the existing compositor ELF tuple. These changes
 retain the original glyph, capture, authority and media assertions.
+
+## Automated G4 qualification
+
+The existing complete desktop matrix is still mandatory. During the live
+compositor fault oracle, the actual stopped ring-3 PID4 address space must
+differ from PID1 and both app roots. A separate CI step validates the two
+fresh normal boots, both apps' authority denials, guarded surfaces, actual
+full-frame timing and framebuffer evidence, PID4-only recovery (including
+stale-authority denial), and all three replacement failure cases. It emits
+one revision-labelled G4 receipt in the normal desktop artifact. Failure
+omits the G4 success marker without removing valid proof for G1–G3. The
+read-only report additionally requires exact-revision M2 non-regression.
+
+This closes the focused G4 evidence path, not all broader P9 tasks.
+Standalone physical display-driver qualification belongs to G8; broader
+Unicode/layout work is not a requirement for this scoped G4 gate.
