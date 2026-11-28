@@ -375,3 +375,118 @@ mod named_user_acl_tests{
   assert!(acl.update(transferred,owner,300,Some(READ)).is_none());
  }
 }
+
+/// Four canonical, persisted logical storage quotas. Usage is derived from the
+/// same COW metadata checkpoint by the filesystem, never a caller-provided UID
+/// or a volatile counter. Root is deliberately unquotaed; UID zero marks an
+/// unused record. An active (uid,0,0) entry denies any owned storage objects.
+#[derive(Clone,Copy,Debug,Eq,PartialEq)]
+pub struct UserQuotas{entries:[(u16,u16,u32);4]}
+impl UserQuotas{
+ pub const EMPTY:Self=Self{entries:[(0,0,0);4]};
+ pub const MAX_OBJECTS:u16=8;
+ pub const MAX_BYTES:u32=16384;
+ pub fn from_entries(entries:[(u16,u16,u32);4])->Option<Self>{
+  let result=Self{entries};result.validate().then_some(result)
+ }
+ pub const fn entries(self)->[(u16,u16,u32);4]{self.entries}
+ /// Reject duplicate/unsorted users and malformed padding before any bypass.
+ pub fn validate(self)->bool{
+  let mut previous=0;let mut ended=false;
+  for (uid,objects,bytes) in self.entries{
+   if objects>Self::MAX_OBJECTS||bytes>Self::MAX_BYTES{return false;}
+   if uid==0{
+    if objects!=0||bytes!=0{return false;}ended=true;
+   }else{
+    if ended||uid<=previous{return false;}previous=uid;
+   }
+  }
+  true
+ }
+ /// The filesystem supplies checked totals for the proposed checkpoint. An
+ /// unlisted user has no policy cap; global object/extent bounds still apply.
+ pub fn allows(self,uid:u16,objects:u64,bytes:u64)->bool{
+  if !self.validate(){return false;}
+  if uid==0{return true;}
+  match self.entries.iter().find(|entry|entry.0==uid){
+   Some((_,object_limit,byte_limit))=>objects<=u64::from(*object_limit)&&bytes<=u64::from(*byte_limit),
+   None=>true,
+  }
+ }
+ /// Root-only configuration. Lowering a quota must separately validate actual
+ /// ownership in the proposed COW metadata before the filesystem publishes it.
+ pub fn update(self,caller:Credentials,uid:u16,limit:Option<(u16,u32)>)->Option<Self>{
+  if !self.validate()||caller.uid()!=0||uid==0||
+   limit.is_some_and(|(objects,bytes)|objects>Self::MAX_OBJECTS||bytes>Self::MAX_BYTES){return None;}
+  let mut entries=self.entries;
+  match (entries.iter().position(|entry|entry.0==uid),limit){
+   (Some(index),Some((objects,bytes)))=>entries[index]=(uid,objects,bytes),
+   (Some(index),None)=>{
+    for i in index..entries.len()-1{entries[i]=entries[i+1];}
+    entries[3]=(0,0,0);
+   },
+   (None,None)=>return Some(self),
+   (None,Some((objects,bytes)))=>{
+    let mut index=entries.iter().position(|entry|entry.0==0)?;
+    entries[index]=(uid,objects,bytes);
+    while index>0&&entries[index-1].0>uid{entries.swap(index-1,index);index-=1;}
+   },
+  }
+  Self::from_entries(entries)
+ }
+}
+
+#[cfg(test)]
+mod persistent_user_quota_policy_tests{
+ use super::*;
+ fn root()->Credentials{Credentials::kernel(0,0)}
+ #[test]fn root_only_administration_checks_all_limits_and_reserved_uid(){
+  let empty=UserQuotas::EMPTY;
+  assert!(empty.update(Credentials::kernel(100,7),100,Some((1,1))).is_none());
+  assert!(empty.update(Credentials::kernel(100,0),100,None).is_none());
+  assert!(empty.update(root(),0,Some((1,1))).is_none());
+  assert!(empty.update(root(),0,None).is_none());
+  assert!(empty.update(root(),100,Some((9,1))).is_none());
+  assert!(empty.update(root(),100,Some((1,16385))).is_none());
+  let quota=empty.update(root(),u16::MAX,Some((8,16384))).unwrap();
+  assert!(quota.allows(u16::MAX,8,16384));
+  assert!(!quota.allows(u16::MAX,9,16384));assert!(!quota.allows(u16::MAX,8,16385));
+ }
+ #[test]fn insertion_is_canonical_and_full_tables_allow_replacement_and_removal(){
+  let mut quota=UserQuotas::EMPTY;
+  for uid in [400,100,300,200]{quota=quota.update(root(),uid,Some((1,10))).unwrap();}
+  assert_eq!(quota.entries(),[(100,1,10),(200,1,10),(300,1,10),(400,1,10)]);
+  assert!(quota.update(root(),500,Some((1,10))).is_none());
+  assert_eq!(quota.update(root(),500,None),Some(quota));
+  let replacement=quota.update(root(),200,Some((0,0))).unwrap();
+  assert_eq!(replacement.entries()[1],(200,0,0));
+  let removed=replacement.update(root(),100,None).unwrap();
+  assert_eq!(removed.entries(),[(200,0,0),(300,1,10),(400,1,10),(0,0,0)]);
+  assert_eq!(removed.update(root(),100,None),Some(removed));
+ }
+ #[test]fn zero_limits_and_large_usage_never_wrap_into_admission(){
+  let quota=UserQuotas::EMPTY.update(root(),100,Some((0,0))).unwrap();
+  assert!(quota.allows(100,0,0));
+  for (objects,bytes) in [(1,0),(0,1),(u64::MAX,0),(0,u64::MAX),(u64::MAX,u64::MAX)]{
+   assert!(!quota.allows(100,objects,bytes));
+  }
+  assert!(quota.allows(0,u64::MAX,u64::MAX));
+  assert!(quota.allows(200,u64::MAX,u64::MAX)); // no configured cap
+ }
+ #[test]fn corrupt_policy_fails_closed_even_for_root_and_cannot_be_updated(){
+  for entries in [
+   [(100,1,1),(100,2,2),(0,0,0),(0,0,0)],
+   [(200,1,1),(100,1,1),(0,0,0),(0,0,0)],
+   [(0,0,0),(100,1,1),(0,0,0),(0,0,0)],
+   [(0,1,0),(0,0,0),(0,0,0),(0,0,0)],
+   [(0,0,1),(0,0,0),(0,0,0),(0,0,0)],
+   [(100,9,1),(0,0,0),(0,0,0),(0,0,0)],
+   [(100,1,16385),(0,0,0),(0,0,0),(0,0,0)],
+  ]{
+   assert!(UserQuotas::from_entries(entries).is_none());
+   let corrupt=UserQuotas{entries};assert!(!corrupt.validate());
+   assert!(!corrupt.allows(0,0,0));assert!(!corrupt.allows(500,0,0));
+   assert!(corrupt.update(root(),100,None).is_none());
+  }
+ }
+}

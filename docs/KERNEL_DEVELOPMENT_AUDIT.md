@@ -821,3 +821,40 @@ interrupted-durability acceptance remain. General fork/COW, SMP/IPIs/migration,
 XSAVE, threads/signals, spawn/exec, normal networking/IOMMU, real AHCI/NVMe/xHCI,
 firmware trust providers and physical-device qualification retain their prior
 pending status. No gate or completion percentage is newly accepted.
+
+
+### Point7 follow-up — persistent owner quotas and ordered locking
+
+The previous ACL candidate e1628e0 returned22 successful GitHub workflows,
+including combined reliability and actual named-user grant/deny/removal guest
+acceptance. This follow-up extends the same production storage path.
+
+Metadata v4 persists four root-administered per-owner object/byte limits beside
+existing ACLs. Usage is recomputed from committed entries, including directory
+and symlink payloads. Both write paths reject over-quota candidates before
+writing a bank; every metadata publication checks ownership/accounting as well.
+Create/grow/chown cannot exceed a limit, delete/shrink reclaim usage, and
+limits below current usage reject. Canonical CRC-valid corruption or persisted
+undercharging refuses mount. Native syscall33 operations43/44 require PID1 root
+and the full namespace, and retain flush/revocation/quarantine policy.
+
+Contended locks now have monotonic coordinator tickets. The same cached range/
+volume receipts prevent younger conflicting acquisitions through both native
+ABIs, with disjoint/shared requests independent and stale receipts excluded.
+Blocked waits retain their original lock and use the existing bounded deadline.
+No second lock table, unbounded spin or weaker caller validation is introduced.
+
+Fifteen new host tests cover quota policy, persistence, pre-data-write denial,
+reclaim, ownership transfer, torn removal, corrupt metadata, admin admission,
+ordered waits and oracle integrity. Existing ingress/shutdown/evidence tests
+are extended. The actual guest sets/removes a zero user quota around a refused
+ownership transfer, then proves nonblocking reader no-barging and a younger
+blocking-reader timeout before releasing its original lock and waking PID1.
+The oracle requires fourteen metadata publications with v4 quota checkpoint/
+removal, unchanged data, restored permissions and all ordered execution receipts.
+
+No local build/test/QEMU ran. Exact-head GitHub compilation and guest results
+are pending. This is bounded functionality within the existing eight-object,
+fixed-extent, BSP filesystem. General free-space allocation, arbitrary threads/
+SMP locking, physical power-loss qualification and full POSIX/inherited ACLs
+remain outside this implementation. No new formal gate or percentage is accepted.

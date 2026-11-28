@@ -1362,6 +1362,8 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
    if matches!(request.arg0,39|40|42)&&argument>u16::MAX as u64{return BAD;}
    if request.arg0==41&&(argument>>32!=0||argument as u16==0||((argument>>16)&0xffff)>7){return BAD;}
    if request.arg0==42&&argument==0{return BAD;}
+   if request.arg0==43&&(argument as u16==0||((argument>>16)&0xffff)>8||argument>>32>16384){return BAD;}
+   if request.arg0==44&&(argument==0||argument>u16::MAX as u64){return BAD;}
    if matches!(request.arg0,4|6|25|26) && argument>crate::durablefs::MAX_FILE_BYTES as u64{
     return BAD;
    }
@@ -1370,6 +1372,10 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
    // from the CURRENT kernel process namespace. The user cannot provide
    // an alias or choose a wider root; all other operations still authenticate
    // their existing descriptor and incarnation before touching the device.
+   if matches!(request.arg0,34|35){
+    let Ok(receipt)=handles.lock_wait_receipt(owner,handle,request.arg0,argument)else{return BAD;};
+    if earlier_lock_wait(handles,receipt,None){return 1;}
+   }
    let res=if request.arg0==1 && owner.pid==2 {
     match handles.mount_alias_for_current_root_kernel(owner) {
      Ok(alias)=>crate::fs_handles::operation_authenticated_mount_alias(
@@ -2250,6 +2256,19 @@ fn supervised_status(pid:u32)->Result<crate::process_wait::Status,crate::process
  crate::process_wait::Status::capture(process,task.supervision.incarnation,task.supervision.consumed)
 }
 #[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
+static mut NEXT_LOCK_WAIT_TICKET:u64=1;
+#[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
+fn earlier_lock_wait(files:&crate::fs_handles::FileHandles,candidate:crate::fs_handles::LockReceipt,
+ ticket:Option<u64>)->bool{
+ // Exact BSP filesystem permit is held by each caller. No references to a
+ // mutable Task may overlap this read-only scan of the current bounded queue.
+ (0..TASKS).any(|slot|{
+  let wait=unsafe{&(*task_ptr(slot)).file_wait};
+  let (Some(older),Some(receipt))=(wait.ticket(),wait.receipt())else{return false;};
+  ticket.is_none_or(|ticket|older<ticket)&&files.lock_wait_is_current(receipt)&&receipt.conflicts(candidate)
+ })
+}
+#[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
 fn native_file_lock_wait(img:*mut UserImage,operation:u64,descriptor:u64,regs:*const u64)->u64{
  use crate::lock_wait::{Request,Wait,BYTES};
  let Ok(permit)=r120_enter()else{return BAD;};
@@ -2259,10 +2278,14 @@ fn native_file_lock_wait(img:*mut UserImage,operation:u64,descriptor:u64,regs:*c
  let Some(request)=Request::decode(operation,&bytes)else{return BAD;};
  let files=unsafe{&mut *ptr::addr_of_mut!(R031_HANDLES)};
  let Ok(receipt)=files.lock_wait_receipt(owner,request.handle,operation,request.range)else{return BAD;};
- match crate::fs_handles::operation_authenticated(files,operation,owner,request.handle,request.range,"",&mut[]){
-  Ok(0)=>return 0,Ok(1)=>{},_=>return BAD,
+ if !earlier_lock_wait(files,receipt,None){
+  match crate::fs_handles::operation_authenticated(files,operation,owner,request.handle,request.range,"",&mut[]){
+   Ok(0)=>return 0,Ok(1)=>{},_=>return BAD,
+  }
  }
- let Some(wait)=Wait::begin(owner,receipt,request.rounds)else{return BAD;};
+ let ticket=unsafe{NEXT_LOCK_WAIT_TICKET};let Some(next)=ticket.checked_add(1)else{return BAD;};
+ let Some(wait)=Wait::begin_ordered(owner,receipt,request.rounds,ticket)else{return BAD;};
+ unsafe{NEXT_LOCK_WAIT_TICKET=next;}
  let task=active_task();if task.is_null(){return BAD;}
  drop(permit);
  if !capture(regs,false){return BAD;}
@@ -2276,13 +2299,18 @@ fn service_file_waiters()->bool{
  let Ok(_permit)=r120_enter()else{return false;};
  let files=unsafe{&mut *ptr::addr_of_mut!(R031_HANDLES)};
  for slot in 0..TASKS{
-  let task=unsafe{&mut *task_ptr(slot)};if !task.file_wait.active(){continue;}
+  let behind={
+   let wait=unsafe{&(*task_ptr(slot)).file_wait};
+   let Some(receipt)=wait.receipt()else{continue;};
+   earlier_lock_wait(files,receipt,wait.ticket())
+  };
+  let task=unsafe{&mut *task_ptr(slot)};
   #[cfg(feature="normal-desktop")]
   if unsafe{DESKTOP_LIFECYCLE.shutdown_armed}{task.file_wait.cancel();task.frame[14]=BAD;continue;}
   let Some(process)=(unsafe{task.pcb.as_ref()})else{return false;};
   let owner=crate::batch5_session::Identity{pid:process.pid,generation:task.file_generation};
   if process.pid!=(slot+1) as u32||process.state!=2||!task.saved||!task.image.ready{return false;}
-  task.frame[14]=match task.file_wait.poll(owner,files){
+  task.frame[14]=match task.file_wait.poll_behind(owner,files,behind){
    Poll::Pending=>continue,
    Poll::Acquired=>{pid_log(owner.pid,b"FILE_LOCK_WAIT_ACQUIRED\0");0},
    Poll::TimedOut=>{pid_log(owner.pid,b"FILE_LOCK_WAIT_TIMEOUT\0");1},Poll::Failed(_)=>BAD,
@@ -3563,7 +3591,7 @@ fn native_file_payload_size(action:u64,offset:u64,length:u64)->Option<usize>{
  #[test]fn desktop_durable_shutdown_fences_all_storage_mutations(){
   let mut state=DesktopLifecycle::new();
   for number in [32,33]{
-   for operation in 0..=42{assert!(state.allows_storage_request(number,operation));}
+   for operation in 0..=44{assert!(state.allows_storage_request(number,operation));}
   }
   assert!(state.compositor_ready(1));
   assert!(state.ready(true));
@@ -3572,7 +3600,7 @@ fn native_file_payload_size(action:u64,offset:u64,length:u64)->Option<usize>{
   assert!(state.allows_storage_request(33,3));
   assert!(state.allows_storage_request(41,35));
   assert!(state.complete_sync(true));
-  for operation in 0..=42{
+  for operation in 0..=44{
    assert_eq!(state.allows_storage_request(32,operation),matches!(operation,4|8|10|12));
    assert_eq!(state.allows_storage_request(33,operation),matches!(operation,2|4|5|25|27|36|37));
    assert!(!state.allows_storage_request(41,operation));

@@ -179,6 +179,10 @@ impl<D:BlockDevice> HierVfs<D>{
   ->Result<(),FsError>{
   self.update_permissions_as(credentials,path,|fs,key|fs.set_named_user_path(key,credentials,uid,rights))
  }
+ /// Volume-wide limits require a trusted root credential. Usage is derived
+ /// from committed owned objects, including directory/symlink payloads.
+ pub fn set_user_quota_as(&mut self,credentials:Credentials,uid:u16,limit:Option<(u16,u32)>)
+  ->Result<(),FsError>{self.fs.set_user_quota(credentials,uid,limit)}
  fn update_permissions_as(&mut self,credentials:Credentials,path:&str,
   update:impl FnOnce(&mut DurableFs<D>,&str)->Result<(),FsError>)->Result<(),FsError>{
   self.authorize_access(credentials,path,0)?;
@@ -674,6 +678,38 @@ mod tests{
  }
  fn fresh()->HierVfs<Disk>{
   HierVfs::format_blank(Disk{blocks:[[0;SECTOR_BYTES];COUNT],writes:0,tear:None}).unwrap()
+ }
+ #[test]fn persistent_owner_quota_rejects_growth_before_data_writes_and_reclaims_on_delete(){
+  let root=Credentials::kernel(0,0);let owner=Credentials::kernel(1000,1000);
+  let mut fs=fresh();fs.mkdir_as(root,"/shared",0o777).unwrap();
+  fs.set_user_quota_as(root,1000,Some((1,5))).unwrap();
+  fs.create_as(owner,"/shared/n",b"saved",0o600).unwrap();
+  let before=fs.generation();
+  assert_eq!(fs.create_as(owner,"/shared/x",b"x",0o600),Err(FsError::Full));
+  assert_eq!(fs.write_at_as(owner,"/shared/n",5,b"x"),Err(FsError::Full));
+  assert_eq!(fs.set_user_quota_as(owner,1000,None),Err(FsError::InvalidName));
+  assert_eq!(fs.set_user_quota_as(root,1000,Some((1,4))),Err(FsError::Full));
+  assert_eq!(fs.generation(),before);
+  fs.rename_file_as(owner,"/shared/n","/shared/m").unwrap();
+  let mut fs=HierVfs::mount_consistent_recovery(fs.into_device()).unwrap();
+  assert_eq!(fs.write_at_as(owner,"/shared/m",5,b"x"),Err(FsError::Full));
+  let mut out=[0;5];assert_eq!(fs.read_as(owner,"/shared/m",&mut out),Ok(5));assert_eq!(&out,b"saved");
+  fs.unlink_as(owner,"/shared/m").unwrap();fs.create_as(owner,"/shared/x",b"again",0o600).unwrap();
+  fs.set_user_quota_as(root,2000,Some((0,0))).unwrap();let before=fs.generation();
+  assert_eq!(fs.chown_as(root,"/shared/x",2000),Err(FsError::Full));assert_eq!(fs.generation(),before);
+  fs.set_user_quota_as(root,1000,None).unwrap();
+  fs.create_as(owner,"/shared/y",b"allowed",0o600).unwrap();
+ }
+ #[test]fn torn_quota_removal_cannot_acknowledge_a_limit_reset(){
+  let root=Credentials::kernel(0,0);let owner=Credentials::kernel(1000,1000);
+  let mut fs=fresh();fs.create_as(root,"/n",b"saved",0o600).unwrap();
+  fs.chown_as(root,"/n",1000).unwrap();fs.set_user_quota_as(root,1000,Some((1,5))).unwrap();
+  let mut disk=fs.into_device();disk.tear=Some(disk.writes);let data=disk.blocks;
+  let mut fs=HierVfs::mount(disk).unwrap();assert_eq!(fs.set_user_quota_as(root,1000,None),Err(FsError::Io));
+  let mut disk=fs.into_device();disk.tear=None;assert_eq!(disk.blocks[2..],data[2..]);
+  let mut fs=HierVfs::mount_consistent_recovery(disk).unwrap();
+  assert_eq!(fs.write_at_as(owner,"/n",5,b"x"),Err(FsError::Full));
+  let mut out=[0;5];assert_eq!(fs.read_as(owner,"/n",&mut out),Ok(5));assert_eq!(&out,b"saved");
  }
  #[test]fn named_user_directory_search_leaf_mask_and_revocation_survive_remount(){
   let root=Credentials::kernel(0,0);let guest=Credentials::kernel(200,9);

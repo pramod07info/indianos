@@ -10,12 +10,15 @@
 //! Normal boot must never format arbitrary, existing host disks.
 use crate::block::{BlockDevice,BlockError,SECTOR_BYTES};
 use crate::vfs_path::normalize_absolute;
-use crate::fs_permissions::{Credentials,Permissions,NamedUsers};
+use crate::fs_permissions::{Credentials,Permissions,NamedUsers,UserQuotas};
 
 const MAGIC:&[u8;8]=b"INDR027!";
 const FORMAT_VERSION:u32=1;
 const PERMISSION_VERSION:u32=2;
 const ACL_VERSION:u32=3;
+const QUOTA_VERSION:u32=4;
+const QUOTA_OFFSET:usize=416;
+const QUOTA_BYTES:usize=32;
 const ACL_OFFSET:usize=HEADER_SIZE+ENTRIES*ENTRY_SIZE;
 const ACL_BYTES:usize=8;
 const ENTRIES:usize=8;
@@ -46,8 +49,20 @@ impl Entry{
     const EMPTY:Self=Self{name:[0;NAME_BYTES],len:0,checksum:0,bank:0,used:false,permissions:Permissions::LEGACY,named_users:NamedUsers::EMPTY};
 }
 #[derive(Clone,Copy)]
-struct Metadata{generation:u64,entries:[Entry;ENTRIES],format:u32}
-impl Metadata{fn empty()->Self{Self{generation:1,entries:[Entry::EMPTY;ENTRIES],format:FORMAT_VERSION}}}
+struct Metadata{generation:u64,entries:[Entry;ENTRIES],format:u32,quotas:UserQuotas}
+impl Metadata{fn empty()->Self{Self{generation:1,entries:[Entry::EMPTY;ENTRIES],format:FORMAT_VERSION,quotas:UserQuotas::EMPTY}}}
+
+impl Metadata{
+    fn user_usage(&self,uid:u16)->Option<(u64,u64)>{
+        self.entries.iter().filter(|entry|entry.used&&entry.permissions.owner==uid)
+            .try_fold((0u64,0u64),|(objects,bytes),entry|
+                Some((objects.checked_add(1)?,bytes.checked_add(u64::from(entry.len))?)))
+    }
+    fn quotas_valid(&self)->bool{
+        self.quotas.validate()&&self.quotas.entries().iter().filter(|(uid,_,_)|*uid!=0)
+            .all(|&(uid,_,_)|self.user_usage(uid).is_some_and(|(objects,bytes)|self.quotas.allows(uid,objects,bytes)))
+    }
+}
 
 fn crc_state(mut crc:u32,data:&[u8])->u32{
     for &byte in data{
@@ -82,7 +97,7 @@ fn encode(meta:&Metadata,sectors:u64)->[u8;SECTOR_BYTES]{
             output[offset+38..offset+40].copy_from_slice(&e.permissions.mode.to_le_bytes());
         }
     }
-    if meta.format==ACL_VERSION{
+    if meta.format>=ACL_VERSION{
         for (index,entry) in meta.entries.iter().enumerate(){
             if !entry.used{continue;}
             for (slot,(uid,rights)) in entry.named_users.entries().iter().enumerate(){
@@ -92,6 +107,14 @@ fn encode(meta:&Metadata,sectors:u64)->[u8;SECTOR_BYTES]{
             }
         }
     }
+    if meta.format==QUOTA_VERSION{
+        for (index,(uid,objects,bytes)) in meta.quotas.entries().iter().enumerate(){
+            let offset=QUOTA_OFFSET+index*8;
+            output[offset..offset+2].copy_from_slice(&uid.to_le_bytes());
+            output[offset+2..offset+4].copy_from_slice(&objects.to_le_bytes());
+            output[offset+4..offset+8].copy_from_slice(&bytes.to_le_bytes());
+        }
+    }
     // CRC field is zero while computing checksum of the whole metadata sector.
     let sum=crc(&output);
     output[24..28].copy_from_slice(&sum.to_le_bytes());
@@ -99,9 +122,9 @@ fn encode(meta:&Metadata,sectors:u64)->[u8;SECTOR_BYTES]{
 }
 fn decode(sector:&[u8;SECTOR_BYTES],capacity:u64)->Option<Metadata>{
     let format=read_u32(&sector[8..12]);
-    if &sector[..8]!=MAGIC || !matches!(format,FORMAT_VERSION|PERMISSION_VERSION|ACL_VERSION) ||
+    if &sector[..8]!=MAGIC || !matches!(format,FORMAT_VERSION|PERMISSION_VERSION|ACL_VERSION|QUOTA_VERSION) ||
        read_u32(&sector[12..16]) as u64!=capacity ||
-       sector[28..32]!=[0;4] || sector[if format==ACL_VERSION{ACL_OFFSET+ENTRIES*ACL_BYTES}else{ACL_OFFSET}..].iter().any(|&b|b!=0){
+       sector[28..32]!=[0;4] || sector[(if format==QUOTA_VERSION{QUOTA_OFFSET+QUOTA_BYTES}else if format==ACL_VERSION{ACL_OFFSET+ENTRIES*ACL_BYTES}else{ACL_OFFSET})..].iter().any(|&b|b!=0){
        return None;
     }
     let generation=read_u64(&sector[16..24]);
@@ -110,14 +133,23 @@ fn decode(sector:&[u8;SECTOR_BYTES],capacity:u64)->Option<Metadata>{
     let mut copy=*sector;
     copy[24..28].fill(0);
     if crc(&copy)!=saved{return None;}
-    let mut result=Metadata{generation,entries:[Entry::EMPTY;ENTRIES],format};
+    let quotas=if format==QUOTA_VERSION{
+        let mut entries=[(0,0,0);4];
+        for (index,entry) in entries.iter_mut().enumerate(){
+            let offset=QUOTA_OFFSET+index*8;
+            *entry=(u16::from_le_bytes(sector[offset..offset+2].try_into().ok()?),
+                u16::from_le_bytes(sector[offset+2..offset+4].try_into().ok()?),
+                u32::from_le_bytes(sector[offset+4..offset+8].try_into().ok()?));
+        }UserQuotas::from_entries(entries)?
+    }else{UserQuotas::EMPTY};
+    let mut result=Metadata{generation,entries:[Entry::EMPTY;ENTRIES],format,quotas};
     for index in 0..ENTRIES{
         let offset=HEADER_SIZE+index*ENTRY_SIZE;
         let entry=&sector[offset..offset+ENTRY_SIZE];
         let acl_offset=ACL_OFFSET+index*ACL_BYTES;
         let acl=&sector[acl_offset..acl_offset+ACL_BYTES];
         if entry.iter().all(|&b|b==0){
-            if format==ACL_VERSION&&acl.iter().any(|&b|b!=0){return None;}
+            if format>=ACL_VERSION&&acl.iter().any(|&b|b!=0){return None;}
             continue;
         }
         if entry[33]!=1 || (format==FORMAT_VERSION&&entry[34..].iter().any(|&b|b!=0)) ||
@@ -142,7 +174,7 @@ fn decode(sector:&[u8;SECTOR_BYTES],capacity:u64)->Option<Metadata>{
         result.entries[index]=Entry{
             name,len,checksum:read_u32(&entry[28..32]),
             bank:entry[32],used:true,permissions,
-            named_users:if format==ACL_VERSION{
+            named_users:if format>=ACL_VERSION{
                 NamedUsers::from_entries([
                     (u16::from_le_bytes(acl[0..2].try_into().ok()?),u16::from_le_bytes(acl[2..4].try_into().ok()?)),
                     (u16::from_le_bytes(acl[4..6].try_into().ok()?),u16::from_le_bytes(acl[6..8].try_into().ok()?)),
@@ -150,7 +182,7 @@ fn decode(sector:&[u8;SECTOR_BYTES],capacity:u64)->Option<Metadata>{
             }else{NamedUsers::EMPTY}
         };
     }
-    Some(result)
+    result.quotas_valid().then_some(result)
 }
 
 fn block_start(slot:usize,bank:u8)->u64{
@@ -510,8 +542,17 @@ impl<D:BlockDevice> DurableFs<D>{
         let acl=previous.named_users.update(previous.permissions,credentials,uid,rights)
             .ok_or(FsError::InvalidName)?;
         if acl==previous.named_users{return Ok(());}
-        let mut next=self.meta;next.format=ACL_VERSION;
+        let mut next=self.meta;next.format=next.format.max(ACL_VERSION);
         next.entries[slot].named_users=acl;self.publish(next)
+    }
+    pub(crate) fn set_user_quota(&mut self,credentials:Credentials,uid:u16,limit:Option<(u16,u32)>)
+        ->Result<(),FsError>{
+        self.check_heads()?;
+        let quotas=self.meta.quotas.update(credentials,uid,limit).ok_or(FsError::InvalidName)?;
+        if quotas==self.meta.quotas{return Ok(());}
+        let mut next=self.meta;next.quotas=quotas;next.format=QUOTA_VERSION;
+        if !next.quotas_valid(){return Err(FsError::Full);}
+        self.publish(next)
     }
     /// Create data and its credentials in one COW checkpoint, never a window
     /// with an unrestricted newly created object followed by chmod.
@@ -680,6 +721,7 @@ impl<D:BlockDevice> DurableFs<D>{
     }
     fn publish(&mut self,mut proposed:Metadata)->Result<(),FsError>{
         self.check_heads()?;
+        if !proposed.quotas_valid(){return Err(FsError::Full);}
         proposed.generation=self.meta.generation.checked_add(1)
             .ok_or(FsError::InvalidVolume)?;
         self.check_payloads(proposed)?;
@@ -754,7 +796,6 @@ impl<D:BlockDevice> DurableFs<D>{
         // another mount may now reference our apparently-unused bank.
         self.check_heads()?;
         let bank=self.available_bank(index).ok_or(FsError::Full)?;
-        self.write_bank(index,bank,data)?;
         let mut next=self.meta;
         let permissions=permissions.unwrap_or(if replace{
             self.meta.entries[index].permissions
@@ -764,6 +805,8 @@ impl<D:BlockDevice> DurableFs<D>{
             name,len:data.len() as u32,checksum:crc(data),bank,used:true,permissions,
             named_users:if replace{self.meta.entries[index].named_users}else{NamedUsers::EMPTY}
         };
+        if !next.quotas_valid(){return Err(FsError::Full);}
+        self.write_bank(index,bank,data)?;
         // A data bank has been written even when the following metadata
         // publication fails before touching either header. A transient
         // header-read failure is therefore NOT safe to retry through the
@@ -789,6 +832,14 @@ impl<D:BlockDevice> DurableFs<D>{
         };
         self.check_heads()?;
         let bank=self.available_bank(index).ok_or(FsError::Full)?;
+        let mut next=self.meta;
+        next.entries[index]=Entry{name,len:data.len() as u32,
+             checksum:crc(data),bank,used:true,permissions:if replace{
+                 self.meta.entries[index].permissions
+             }else{Permissions::LEGACY},named_users:if replace{
+                 self.meta.entries[index].named_users
+             }else{NamedUsers::EMPTY}};
+        if !next.quotas_valid(){return Err(FsError::Full);}
         self.write_bank(index,bank,data)?;
         if let Err(e)=self.disk.sync(){
             self.retired.set(true);return Err(e.into());
@@ -817,13 +868,6 @@ impl<D:BlockDevice> DurableFs<D>{
             }
         }
         self.check_heads()?;
-        let mut next=self.meta;
-        next.entries[index]=Entry{name,len:data.len() as u32,
-             checksum:crc(data),bank,used:true,permissions:if replace{
-                 self.meta.entries[index].permissions
-             }else{Permissions::LEGACY},named_users:if replace{
-                 self.meta.entries[index].named_users
-             }else{NamedUsers::EMPTY}};
         // The new data bank has already been modified. Even if checkpoint
         // publication fails before it changes a metadata head, its outcome
         // is not safe to retry through this mount without revalidation.
@@ -1554,6 +1598,39 @@ mod tests{
                 assert_eq!(recovery.read_path("/note",&mut out),Ok(9));
                 assert_eq!(&out[..9],b"committed");
             }
+        }
+    }
+    #[test]fn quota_admission_precedes_both_legacy_and_durable_data_mutation(){
+        let root=Credentials::kernel(0,0);let owner=Credentials::kernel(1000,1000);
+        let mut fs=DurableFs::format_blank(blank()).unwrap();
+        fs.create_owned_path("/n",b"saved",owner,0o640).unwrap();
+        fs.set_user_quota(root,1000,Some((1,5))).unwrap();assert_eq!(fs.meta.format,QUOTA_VERSION);
+        let disk=fs.into_device();let before=disk.clone();let mut fs=DurableFs::mount(disk).unwrap();
+        assert_eq!(fs.overwrite_path("/n",b"longer"),Err(FsError::Full));
+        assert_eq!(fs.overwrite_durable_path("/n",b"longer"),Err(FsError::Full));
+        let disk=fs.into_device();assert_eq!(disk.writes,before.writes);assert_eq!(disk.sectors,before.sectors);
+        let mut fs=DurableFs::mount(disk).unwrap();
+        fs.set_named_user_path("/n",root,2000,Some(4)).unwrap();fs.chmod_path("/n",root,0o640).unwrap();
+        fs.overwrite_path("/n",b"again").unwrap();assert_eq!(fs.meta.format,QUOTA_VERSION);
+        let mut fs=DurableFs::mount(fs.into_device()).unwrap();
+        assert!(fs.access_path("/n",Credentials::kernel(2000,9),4).unwrap());
+        assert_eq!(fs.overwrite_path("/n",b"longer"),Err(FsError::Full));
+    }
+    #[test]fn checksum_valid_quota_corruption_or_undercharged_usage_refuses_mount(){
+        let root=Credentials::kernel(0,0);let owner=Credentials::kernel(1000,1000);
+        let mut fs=DurableFs::format_blank(blank()).unwrap();fs.create_owned_path("/n",b"saved",owner,0o600).unwrap();
+        fs.set_user_quota(root,1000,Some((1,5))).unwrap();let original=fs.into_device();
+        for case in 0..4{
+            let mut disk=original.clone();
+            for head in 0..2{
+                let sector=&mut disk.sectors[head];sector[8..12].copy_from_slice(&QUOTA_VERSION.to_le_bytes());
+                let record=match case{0=>(1000u16,0u16,0u32),1=>(0,0,1),2=>(1000,9,5),_=>(1000,1,16385)};
+                sector[QUOTA_OFFSET..QUOTA_OFFSET+2].copy_from_slice(&record.0.to_le_bytes());
+                sector[QUOTA_OFFSET+2..QUOTA_OFFSET+4].copy_from_slice(&record.1.to_le_bytes());
+                sector[QUOTA_OFFSET+4..QUOTA_OFFSET+8].copy_from_slice(&record.2.to_le_bytes());
+                sector[24..28].fill(0);let sum=crc(sector);sector[24..28].copy_from_slice(&sum.to_le_bytes());
+            }
+            assert!(matches!(DurableFs::mount(disk),Err(FsError::InvalidVolume)));
         }
     }
     #[test]fn named_users_upgrade_persist_preserve_and_revoke_through_existing_metadata(){

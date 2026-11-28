@@ -46,7 +46,7 @@ fn owner_probe(pid:u64){
      &bytes[..14]!=b"HELLO INDIANOS"||handle(5,b"",token,0)!=0{exit(123);}
  }
  if pid==1{
-  if handle(37,b"",0,0)>>32&768!=768{exit(123);}
+  if handle(37,b"",0,0)>>32&1792!=1792{exit(123);}
   change(38,0o600);send(2,b"OWNERDENY");receive(2,b"OWNERDENIED");
   change(39,1000);send(2,b"OWNERALLOW");receive(2,b"OWNERREAD");
   change(39,0);send(2,b"OWNERREVOKE");receive(2,b"OWNERREVOKED");
@@ -58,6 +58,11 @@ fn owner_probe(pid:u64){
   change(41,1000);send(2,b"ACLDENY");receive(2,b"ACLDENIED");
   change(42,1000);send(2,b"ACLREMOVE");receive(2,b"ACLREMOVED");
   change(38,0o777);
+  change(43,1000);
+  let token=open();
+  if handle(39,b"",token,1000)!=u64::MAX||handle(5,b"",token,0)!=0{exit(123);}
+  change(44,1000);
+  write(b"desktop ownership probe zero user quota refused ownership transfer; limits removed");
   write(b"desktop ownership probe original owner group mode restored; stale tokens rejected");
  }else if pid==2{
   receive(1,b"OWNERDENY");reader(false);
@@ -101,6 +106,8 @@ pub(super) fn verify(){
    let reader=handle(1,b"/shared/readme",0,1);if reader==0||reader==u64::MAX{exit(122);}
    if lock(34,reader,1)!=0||lock(35,reader,1)!=u64::MAX{exit(122);}
    send(1,b"LOCKHELD");receive(1,b"LOCKRELEASE");
+   if handle(34,b"",reader,0)!=1||lock(34,reader,1)!=1{exit(122);}
+   write(b"desktop lock probe younger reader timed out behind older writer; nonblocking barging denied");
    if handle(36,b"",reader,0)!=0||handle(5,b"",reader,0)!=0{exit(122);}
    write(b"desktop lock probe reader released original lock");
    send(1,b"LOCKRELEASED");receive(1,b"LOCKNORMAL");

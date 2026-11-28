@@ -1,5 +1,7 @@
 //! Bounded scheduler continuation for existing authenticated range locks.
 //! No separate lock table, file lookup, device probe or user pointer is stored.
+//! The serialized coordinator supplies ticket order and conflicting-predecessor
+//! admission. Deadlines keep advancing while queued; current locks are preserved.
 use core::mem::MaybeUninit;
 use crate::{batch5_session::Identity,durablefs::FsError,
  fs_handles::{FileHandles,LockReceipt},process_wait::RoundBudget};
@@ -17,7 +19,7 @@ impl Request{
  }
 }
 #[derive(Clone,Copy)]
-struct Pending{owner:Identity,receipt:LockReceipt,budget:RoundBudget}
+struct Pending{owner:Identity,receipt:LockReceipt,budget:RoundBudget,ticket:u64}
 #[derive(Clone,Copy)]
 pub(crate) struct Wait{active:bool,pending:MaybeUninit<Pending>}
 #[derive(Clone,Copy,Debug,Eq,PartialEq)]
@@ -25,17 +27,36 @@ pub(crate) enum Poll{Pending,Acquired,TimedOut,Failed(FsError)}
 impl Wait{
  pub const fn empty()->Self{Self{active:false,pending:MaybeUninit::uninit()}}
  pub fn begin(owner:Identity,receipt:LockReceipt,rounds:u64)->Option<Self>{
-  if owner.pid==0||owner.generation==0||!receipt.owned_by(owner){return None;}
+  Self::begin_ordered(owner,receipt,rounds,1)
+ }
+ /// The BSP coordinator issues monotonically increasing nonzero tickets.
+ /// The continuation does not mint authority or own a second lock table.
+ pub fn begin_ordered(owner:Identity,receipt:LockReceipt,rounds:u64,ticket:u64)->Option<Self>{
+  if owner.pid==0||owner.generation==0||ticket==0||!receipt.owned_by(owner){return None;}
   let budget=RoundBudget::new(rounds)?;
-  Some(Self{active:true,pending:MaybeUninit::new(Pending{owner,receipt,budget})})
+  Some(Self{active:true,pending:MaybeUninit::new(Pending{owner,receipt,budget,ticket})})
  }
  pub fn active(&self)->bool{self.active}
+ pub fn ticket(&self)->Option<u64>{
+  self.active.then(||unsafe{self.pending.assume_init_ref().ticket})
+ }
+ pub fn receipt(&self)->Option<LockReceipt>{
+  self.active.then(||unsafe{self.pending.assume_init_ref().receipt})
+ }
  pub fn cancel(&mut self){*self=Self::empty();}
  pub fn poll(&mut self,owner:Identity,files:&mut FileHandles)->Poll{
+  self.poll_behind(owner,files,false)
+ }
+ /// A current older conflicting waiter prevents acquisition, not validation
+ /// or deadline expiry. Retired receipts cannot retain a place in the queue.
+ pub fn poll_behind(&mut self,owner:Identity,files:&mut FileHandles,behind:bool)->Poll{
   if !self.active{return Poll::Failed(FsError::InvalidName);}
   let pending=unsafe{self.pending.assume_init_mut()};
   let result=if pending.owner!=owner{Poll::Failed(FsError::InvalidName)}else{
-   match files.retry_lock_wait(pending.receipt){
+   let attempt=if behind{
+    if files.lock_wait_is_current(pending.receipt){Ok(1)}else{Err(FsError::InvalidName)}
+   }else{files.retry_lock_wait(pending.receipt)};
+   match attempt{
     Ok(0)=>Poll::Acquired,
     Ok(1)=>if pending.budget.expired_after_pending(){Poll::TimedOut}else{Poll::Pending},
     Ok(_)=>Poll::Failed(FsError::InvalidName),Err(error)=>Poll::Failed(error),
@@ -106,6 +127,57 @@ impl Wait{
   assert_eq!(files.dispatch_authenticated(35,a,writer,0,"",&mut[],&mut fs),Ok(1));
   let mut wait=Wait::begin(a,receipt,2).unwrap();let replacement=files.bind_process(1).unwrap();
   assert!(matches!(wait.poll(replacement,&mut files),Poll::Failed(_)));
+ }
+ #[test]fn ordered_receipts_require_nonzero_tickets_and_cancel_without_stale_queue_state(){
+  let (files,_,a,_,writer,_)=fixture();let receipt=files.lock_wait_receipt(a,writer,35,0).unwrap();
+  assert!(Wait::begin_ordered(a,receipt,1,0).is_none());
+  let mut wait=Wait::begin_ordered(a,receipt,1,u64::MAX).unwrap();
+  assert_eq!(wait.ticket(),Some(u64::MAX));assert!(wait.receipt().unwrap().owned_by(a));
+  wait.cancel();assert_eq!(wait.ticket(),None);assert!(wait.receipt().is_none());
+ }
+ #[test]fn younger_reader_cannot_barge_or_replace_its_prior_lock_while_writer_waits(){
+  let (mut files,mut fs,a,b,writer,reader)=fixture();
+  let older=files.lock_wait_receipt(a,writer,35,0).unwrap();
+  let receipt=files.lock_wait_receipt(b,reader,34,0).unwrap();
+  assert!(older.conflicts(receipt));assert!(receipt.conflicts(older));
+  let mut writer_wait=Wait::begin_ordered(a,older,32,1).unwrap();
+  let mut reader_wait=Wait::begin_ordered(b,receipt,1,2).unwrap();
+  assert!(writer_wait.ticket()<reader_wait.ticket());
+  assert_eq!(reader_wait.poll_behind(b,&mut files,true),Poll::Pending);
+  assert_eq!(reader_wait.poll_behind(b,&mut files,true),Poll::TimedOut);
+  assert!(files.lock_wait_is_current(receipt));assert!(files.lock_wait_is_current(older));
+  assert_eq!(writer_wait.poll(a,&mut files),Poll::Pending);
+  files.dispatch_authenticated(36,b,reader,0,"",&mut[],&mut fs).unwrap();
+  assert_eq!(writer_wait.poll(a,&mut files),Poll::Acquired);
+ }
+ #[test]fn blocked_stale_or_foreign_receipt_fails_without_waiting_out_its_deadline(){
+  let (mut files,mut fs,a,b,writer,reader)=fixture();
+  let receipt=files.lock_wait_receipt(b,reader,34,0).unwrap();
+  let mut wait=Wait::begin_ordered(b,receipt,32,2).unwrap();
+  files.dispatch_authenticated(5,b,reader,0,"",&mut[],&mut fs).unwrap();
+  assert_eq!(wait.poll_behind(b,&mut files,true),Poll::Failed(FsError::InvalidName));
+  assert!(!wait.active());assert_eq!(wait.ticket(),None);
+  let receipt=files.lock_wait_receipt(a,writer,35,0).unwrap();
+  let mut wait=Wait::begin_ordered(a,receipt,32,3).unwrap();
+  assert_eq!(wait.poll_behind(b,&mut files,true),Poll::Failed(FsError::InvalidName));
+  assert!(!wait.active());
+ }
+ #[test]fn ordered_waiter_handoff_never_acquires_while_predecessor_is_pending_or_holding(){
+  let (mut files,mut fs,a,b,writer,reader)=fixture();
+  let candidate=files.dispatch_authenticated(1,b,0,READ,"/shared/note",&mut[],&mut fs).unwrap();
+  let older=files.lock_wait_receipt(a,writer,35,0).unwrap();
+  let younger=files.lock_wait_receipt(b,candidate,34,0).unwrap();
+  assert!(older.conflicts(younger));
+  let mut first=Wait::begin_ordered(a,older,32,1).unwrap();
+  let mut second=Wait::begin_ordered(b,younger,32,2).unwrap();
+  assert_eq!(first.poll(a,&mut files),Poll::Pending);
+  files.dispatch_authenticated(36,b,reader,0,"",&mut[],&mut fs).unwrap();
+  assert_eq!(second.poll_behind(b,&mut files,true),Poll::Pending);
+  assert!(files.lock_wait_is_current(younger));
+  assert_eq!(first.poll(a,&mut files),Poll::Acquired);
+  assert_eq!(second.poll(b,&mut files),Poll::Pending);
+  files.dispatch_authenticated(36,a,writer,0,"",&mut[],&mut fs).unwrap();
+  assert_eq!(second.poll(b,&mut files),Poll::Acquired);
  }
  #[test]fn descriptor_version_reserved_fields_deadline_and_zero_handle_are_checked(){
   let mut bytes=[0u8;64];bytes[..4].copy_from_slice(&[1,0,64,0]);bytes[8]=7;bytes[24]=1;

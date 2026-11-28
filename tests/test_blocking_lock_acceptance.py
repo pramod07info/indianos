@@ -4,30 +4,31 @@ import binascii
 import unittest
 from pathlib import Path
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/"tools"))
-from test_blocking_locks_qemu import QUEUED,TIMEOUT,ACQUIRED,HELD,RELEASED,RESUMED,READY,verify_lock_proof,OWNER_MARKERS,verify_owner_proof,verify_owner_media,START,COUNT
+from test_blocking_locks_qemu import QUEUED,TIMEOUT,ACQUIRED,HELD,RELEASED,RESUMED,READY,READ_QUEUED,READ_TIMEOUT,BARGING,verify_lock_proof,OWNER_MARKERS,verify_owner_proof,verify_owner_media,START,COUNT
 
 class BlockingLockEvidenceTests(unittest.TestCase):
-    def good(self):return b"\n".join((QUEUED,TIMEOUT,HELD,QUEUED,RELEASED,ACQUIRED,RESUMED,READY.encode()))+b"\n"
+    def good(self):return b"\n".join((QUEUED,TIMEOUT,HELD,QUEUED,READ_QUEUED,READ_TIMEOUT,BARGING,RELEASED,ACQUIRED,RESUMED,READY.encode()))+b"\n"
     def test_requires_two_actual_queues_timeout_and_success_after_peer_release(self):
         verify_lock_proof(self.good())
     def test_missing_duplicate_reordered_and_stale_receipts_are_rejected(self):
         good=self.good()
-        for marker in (QUEUED,TIMEOUT,ACQUIRED,HELD,RELEASED,RESUMED):
+        for marker in (QUEUED,TIMEOUT,ACQUIRED,HELD,READ_QUEUED,READ_TIMEOUT,BARGING,RELEASED,RESUMED):
             for bad in (good.replace(marker+b"\n",b"",1),good+marker+b"\n",good.replace(marker,b"stale "+marker)):
                 with self.assertRaises(AssertionError):verify_lock_proof(bad)
-        wrong_order=b"\n".join((QUEUED,TIMEOUT,HELD,QUEUED,ACQUIRED,RELEASED,RESUMED,READY.encode()))
+        wrong_order=b"\n".join((QUEUED,TIMEOUT,HELD,QUEUED,READ_QUEUED,READ_TIMEOUT,BARGING,ACQUIRED,RELEASED,RESUMED,READY.encode()))
         for bad in (wrong_order,
                     good.replace(READY.encode(),b"not ready"),good+b"IndianOS: FATAL"):
             with self.assertRaises(AssertionError):verify_lock_proof(bad)
 
 class OwnershipEvidenceTests(unittest.TestCase):
     def proof(self):return b"\n".join(OWNER_MARKERS+(QUEUED,))+b"\n"
-    def head(self,generation,mode=0o777,owner=0):
+    def head(self,generation,mode=0o777,owner=0,quota=False):
         head=bytearray(512);head[:8]=b"INDR027!"
-        struct.pack_into("<IIQ",head,8,3,COUNT,generation)
+        struct.pack_into("<IIQ",head,8,4,COUNT,generation)
         name=b"~fshared~readme";head[32:32+len(name)]=name
         struct.pack_into("<II",head,56,14,binascii.crc32(b"HELLO INDIANOS"))
         head[65]=1;struct.pack_into("<HHH",head,66,owner,0,mode)
+        if quota:struct.pack_into("<HHI",head,416,1000,0,0)
         struct.pack_into("<I",head,24,binascii.crc32(head));return head
     def media(self):
         before=bytearray(256*512)
@@ -35,8 +36,8 @@ class OwnershipEvidenceTests(unittest.TestCase):
         before[(START+1)*512:(START+2)*512]=self.head(2)
         before[(START+2)*512:(START+2)*512+14]=b"HELLO INDIANOS"
         after=bytearray(before)
-        after[START*512:(START+1)*512]=self.head(13,0o640)
-        after[(START+1)*512:(START+2)*512]=self.head(14)
+        after[START*512:(START+1)*512]=self.head(15,quota=True)
+        after[(START+1)*512:(START+2)*512]=self.head(16)
         return before,after
     def test_live_ownership_receipts_require_each_grant_and_revocation_in_order(self):
         proof=self.proof();verify_owner_proof(proof)
@@ -47,7 +48,7 @@ class OwnershipEvidenceTests(unittest.TestCase):
         for bad in (b"\n".join(tuple(reversed(OWNER_MARKERS))+(QUEUED,)),
                     proof.replace(QUEUED,b"not queued"),proof+b"IndianOS: FATAL"):
             with self.assertRaises(AssertionError):verify_owner_proof(bad)
-    def test_only_twelve_metadata_checkpoints_restore_original_catalog_and_permissions(self):
+    def test_only_fourteen_metadata_checkpoints_restore_original_catalog_and_permissions(self):
         before,after=self.media();verify_owner_media(before,after)
     def test_modified_data_partition_geometry_or_checksum_cannot_pass(self):
         before,after=self.media()
@@ -58,14 +59,24 @@ class OwnershipEvidenceTests(unittest.TestCase):
         with self.assertRaises(AssertionError):verify_owner_media(before,before)
     def test_valid_crc_does_not_hide_wrong_generation_or_unrestored_owner_or_mode(self):
         before,after=self.media()
-        for head in (self.head(13),self.head(14,0o600),self.head(14,0o777,1000)):
+        for head in (self.head(15),self.head(16,0o600),self.head(16,0o777,1000)):
             bad=bytearray(after);bad[(START+1)*512:(START+2)*512]=head
             with self.assertRaises(AssertionError):verify_owner_media(before,bad)
         # A data descriptor edit with a correct metadata CRC still changes the
         # catalog; metadata-only writes cannot launder payload substitutions.
-        bad=bytearray(after);head=self.head(14);head[56]=15
+        bad=bytearray(after);head=self.head(16);head[56]=15
         head[24:28]=bytes(4);struct.pack_into("<I",head,24,binascii.crc32(head))
         bad[(START+1)*512:(START+2)*512]=head
+        with self.assertRaises(AssertionError):verify_owner_media(before,bad)
+
+    def test_quota_checkpoint_and_removal_cannot_be_missing_or_forged(self):
+        before,after=self.media()
+        for offset,head in ((START,self.head(15)),(START+1,self.head(16,quota=True))):
+            bad=bytearray(after);bad[offset*512:(offset+1)*512]=head
+            with self.assertRaises(AssertionError):verify_owner_media(before,bad)
+        head=self.head(15,quota=True);struct.pack_into("<HHI",head,424,1000,0,0)
+        head[24:28]=bytes(4);struct.pack_into("<I",head,24,binascii.crc32(head))
+        bad=bytearray(after);bad[START*512:(START+1)*512]=head
         with self.assertRaises(AssertionError):verify_owner_media(before,bad)
 
 if __name__=="__main__":unittest.main()

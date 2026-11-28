@@ -112,3 +112,56 @@ again. Its oracle requires twelve real metadata publications, final empty ACLs,
 restored root:root/0777 and unchanged payload/guard sectors. Product images do
 not include that fixture. No local builds/tests ran; exact-head GitHub evidence
 is required. Persistent quotas and general multiwriter locking remain pending.
+
+
+## Persistent owner quotas (metadata v4)
+
+Version 4 keeps the v3 ACLs and adds four quota records in bytes416..448 of
+each checksummed metadata sector: u16 UID, u16 maximum object count, u32 maximum
+logical payload bytes. Active UIDs are nonzero, unique and ascending, followed
+by zero records; unused tail bytes remain zero. Limits are bounded by the
+existing eight objects and 16384 total logical bytes. A nonzero UID with zero
+limits is a real deny-all quota. UID0 remains unquotaed; only a trusted root
+credential may set/remove limits. V1/v2/v3 mount without quota records. Setting
+a limit publishes v4; subsequent ACL/mode/data operations preserve that version.
+Downgrading v4 to older kernels is unsupported.
+
+Usage is derived from each committed object's owner, counting each object and
+its stored length exactly once. Directories and symlinks count as objects and
+charge their marker/target bytes. Quotas are per owner, not per writer, and do
+not measure physical bank reservation or page cache. Growth/create validation
+precedes data-bank writes in both ordinary and flush-ordered paths. The shared
+metadata publication barrier also checks quota on ownership transfer and every
+other mutation. Shrink/delete reclaim derived usage atomically; a failed or
+interrupted mutation never resets a separate cached counter. Limits below
+current committed usage reject. CRC-valid malformed or over-quota metadata
+refuses mount rather than fabricating accounting.
+
+Native syscall33 operations43/44 set/remove a volume quota through a current
+selected descriptor, advertised by featurebit1024. SET argument has UID in
+bits0..15, object limit in16..31 and byte limit in32..63; REMOVE uses only a
+nonzero u16 UID. Only PID1 with root credentials and an unrestricted `/`
+namespace may administer a volume quota. Existing foreign-reader exclusion,
+write budget, flush-before-acknowledgement, token revocation, quarantine and
+shutdown policy remain in force. No user-supplied ID becomes caller identity.
+
+## Ordered range-lock admission
+
+The live BSP coordinator now issues monotonic nonzero tickets for contended
+waits. Current older conflicting receipts take precedence over younger blocking
+and nonblocking acquisitions. Disjoint ranges and shared/shared requests remain
+independent. Stale/revoked namespace, handle and volume receipts are excluded
+from ordering. Cancellation/timeout does not acquire a lock or discard an old
+held lock; ticket exhaustion rejects new waits without reusing old authority.
+The existing deadline, range checks and lock table are reused, not duplicated.
+This remains bounded cooperative locking for the current trusted roles, not
+arbitrary threads, POSIX lock queues or SMP synchronization.
+
+Host tests cover quota persistence, zero limits, data-write preflight, owner
+transfer, reclaim, corrupted metadata, torn removal and guarded native admin;
+lock tests cover ordered handoff, blocked deadlines and stale receipts. The
+separate guest proves a persisted zero quota rejects ownership transfer before
+removal, plus younger-reader timeout and nonblocking no-barging before writer
+handoff. Its oracle checks fourteen COW publications, final empty ACL/quotas,
+restored root permissions and unchanged payload/guard sectors. No local build
+or test ran; exact-head GitHub evidence remains required.
