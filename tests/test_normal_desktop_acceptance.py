@@ -18,6 +18,23 @@ finally:
 
 
 class NormalDesktopControls(unittest.TestCase):
+    def test_g5_i8042_status_is_a_unique_byte_read(self):
+        self.assertEqual(harness.i8042_status("echo\r\nportb[0x0064] = 0x21\r\n(qemu) "), 0x21)
+        for malformed in ("", "portb[0x0060] = 0x21\n", "portb[0x0064] = 0x221\n",
+                          "portb[0x0064] = 0x21\nportb[0x0064] = 0x00\n"):
+            with self.subTest(reply=malformed), self.assertRaises(AssertionError):
+                harness.i8042_status(malformed)
+
+    def test_g5_suppression_rejects_forwarded_input_and_invalid_boundaries(self):
+        marker = b"desktop physical pointer"
+        good = marker + b"\n" + b"live barrier\n"
+        start = len(marker) + 1
+        harness.verify_g5_suppression(good, start, len(good), (marker,))
+        for begin, end in ((0, len(good)), (start, start), (-1, len(good)),
+                           (start, len(good) + 1)):
+            with self.subTest(begin=begin, end=end), self.assertRaises(AssertionError):
+                harness.verify_g5_suppression(good, begin, end, (marker,))
+
     def test_shared_lease_commit_requires_original_token_and_fresh_verified_read(self):
         commit = b"IndianOS user: " + harness.NAMED_COMMIT.encode()
         good = harness.LEASE_CURSOR + b"\n" + harness.LEASE_REFRESH + b"\n" + commit + b"\n"

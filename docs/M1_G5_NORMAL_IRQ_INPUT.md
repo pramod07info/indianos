@@ -48,3 +48,21 @@ packet-edge preservation and cancellation/quarantine after overflow or a bad
 transfer. They were authored without local execution, as requested; exact-head
 GitHub host/no_std and real QEMU evidence are required before acceptance.
 Physical-machine qualification and hostile CPU availability remain separate.
+
+## Automated loss and recovery qualification
+
+The separate G5 CI diagnostic boots the unmodified normal desktop image with
+its own disposable GPT copy. It uses the same QEMU PS/2 input, fresh serial
+observations, and independent framebuffer checks as the existing desktop
+matrix. The QEMU monitor delivers controlled overflow and overrun fixtures
+through the emulated i8042's AUX and keyboard output buffers, respectively.
+Neither input path writes guest memory or sends a COM1 command.
+
+The guest must cancel an active Files titlebar drag despite the left button
+remaining held, suppress subsequent held movement, and accept a fresh drag
+after release. A keyboard overrun must discard an unfinished Terminal write
+and its stale suffix, then accept fresh physical input and render the original
+note in Terminal and Files. The diagnostic also checks that the disposable
+disk is unchanged. Its exact-revision receipt, screenshots and serial
+transcript stay in the shared desktop artifact. Only the distinct successful
+G5 marker and the required evidence on main count toward acceptance.

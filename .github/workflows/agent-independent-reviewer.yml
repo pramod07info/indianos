@@ -185,7 +185,6 @@ jobs:
             // QEMU job and same-job artifact, not a generic green workflow.
             // Each unresolved later gate has a distinct fail-closed exit.
             const gateHold={
-              G5:"Complete and bind the live PS/2 focus/capture, IRQ loss/recovery and visible Files/Terminal effects matrix; host-only or serial-injected results are insufficient.",
               G6:"Complete full concurrent-writer, per-user and flush-order qualification, plus required physical cache-loss evidence; emulated publication cuts alone are insufficient.",
               G7:"Complete the native independent-process create/read/edit/rename, denied-access and exact same-disk reboot matrix; broker-only paths or host models are insufficient.",
               G8:"Supply exact-revision selected physical-device/firmware and safe shutdown/restart evidence alongside QEMU recovery and negative security tests."
@@ -193,7 +192,8 @@ jobs:
             const gateSteps={
               G2:"Verify G2 retained partition recovery and reboot receipts",
               G3:"Verify G3 retained normal boot and repeated unready recovery receipts",
-              G4:"Verify G4 retained ring-3 compositor and recovery evidence"
+              G4:"Verify G4 retained ring-3 compositor and recovery evidence",
+              G5:"Verify G5 retained live PS/2 input and loss recovery"
             };
             function decideGates(subject, ready, proof) {
               const rows=[];
@@ -202,7 +202,8 @@ jobs:
                 ["G1","Authenticated Terminal, durable reboot readback and required regressions."],
                 ["G2","Defensive MBR/GPT selection, mirror/CRC/identity negatives, ATA write failure, unchanged-media recovery and reboot/remount."],
                 ["G3","Normal isolated four-service boot, invalid/unready service/media and shutdown exhaustion, plus two strict unready-compositor boots with retained diagnostics on failure."],
-                ["G4","Distinct ring-3 PID1 broker and PID4 compositor, guarded per-app surfaces, full-frame publication, stale authority denied, client-preserving replacement and strict fallback; requires retained exact-revision QEMU and M2 regression evidence."]
+                ["G4","Distinct ring-3 PID1 broker and PID4 compositor, guarded per-app surfaces, full-frame publication, stale authority denied, client-preserving replacement and strict fallback; requires retained exact-revision QEMU and M2 regression evidence."],
+                ["G5","Live production PS/2 keyboard and mouse IRQ delivery, focus and capture, independent keyboard overrun and AUX overflow recovery, and visible Files and Terminal responses."]
               ]) {
                 const complete=ready && (gate==="G1" || proof[gate]===true && (gate!=="G4" || proof.M2===true));
                 rows.push([gate,complete?(countable?"ACCEPTED":"CANDIDATE PASS"):"NOT VERIFIED",detail]);
@@ -224,6 +225,15 @@ jobs:
               assert.match(decideGates({},true,{G2:true,G3:true,G4:true}).summary,/8\/13 .*61\.54%/);
               const g4ready={G2:true,G3:true,G4:true,M2:true};
               assert.match(decideGates({},true,g4ready).summary,/9\/13 .*69\.23%/);
+              const g5ready={...g4ready,G5:true};
+              assert.match(decideGates({},true,g5ready).summary,/10\/13 .*76\.92%/);
+              for(const [subject,common,proof,expected] of [
+                [{},true,{...g4ready,G5:false},"NOT VERIFIED"],
+                [{},false,g5ready,"NOT VERIFIED"],
+                [{number:1},true,g5ready,"CANDIDATE PASS"]
+              ]){
+                assert.equal(decideGates(subject,common,proof).rows.find(r=>r[0]==="G5")[1],expected);
+              }
               assert.equal(decideGates({},true,{M2:true}).rows.find(r=>r[0]==="G4")[1],"NOT VERIFIED");
               assert.equal(decideGates({number:1},true,g4ready).rows.find(r=>r[0]==="G4")[1],"CANDIDATE PASS");
               assert.equal(decideGates({},false,g4ready).rows.find(r=>r[0]==="G4")[1],"NOT VERIFIED");

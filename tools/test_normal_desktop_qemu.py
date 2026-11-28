@@ -2525,6 +2525,149 @@ def verify_g4_retained_evidence(artifact_root: Path, revision: str) -> Path:
     return receipt
 
 
+G5_KEYBOARD_LOSS = "IndianOS user: desktop input loss invalidated pending Terminal command"
+G5_FRESH_READ = "IndianOS user: R051 Terminal readback: HELLO INDIANOS"
+
+
+def i8042_status(response: str) -> int:
+    hits = re.findall(r"^portb\[0x0064\] = 0x([0-9a-fA-F]{2})\s*$",
+                      response.replace("\r", ""), re.MULTILINE)
+    if len(hits) != 1:
+        raise AssertionError("cannot establish QEMU i8042 status: " + repr(response[-400:]))
+    return int(hits[0], 16)
+
+
+def wait_i8042_idle(session: QemuSession) -> None:
+    deadline = time.monotonic() + 5
+    while i8042_status(session.hmp("i /b 0x64")) & 3:
+        if time.monotonic() >= deadline:
+            raise AssertionError("QEMU i8042 did not drain its controller buffers")
+        session.drain_serial(0.08)
+
+
+def i8042_loss_fixture(session: QemuSession, aux: bool) -> None:
+    # D2/D3 enqueue test bytes on the emulated controller's keyboard/AUX
+    # output buffer. The production ISR still owns the read and receives the
+    # normal status/routing; do not write guest memory or use guest COM1.
+    command, payload = (0xd3, (0x49, 0, 0)) if aux else (0xd2, (0xff,))
+    wait_i8042_idle(session)
+    for byte in payload:
+        session.hmp(f"o /b 0x64 {command:#x}")
+        session.hmp(f"o /b 0x60 {byte:#x}")
+        wait_i8042_idle(session)
+
+
+def verify_g5_suppression(output: bytes, start: int, end: int, forbidden: tuple[bytes, ...]) -> None:
+    if not 0 <= start < end <= len(output):
+        raise AssertionError("missing bounded live G5 suppression interval")
+    if any(marker in output[start:end] for marker in forbidden):
+        raise AssertionError("discarded PS/2 input reached the desktop")
+
+
+def g5_irq_recovery_boot(qemu: str, iso: Path, ovmf: Path, disk: Path,
+                         folder: Path, revision: str) -> None:
+    name = "g5-irq-recovery"
+    original = disk.read_bytes()
+    process, sock, session = spawn(qemu, iso, ovmf, disk, folder, name)
+    try:
+        session.until(READY, 65)
+        session.until("R031.9 real file and directory contents rendered into Files window", 20)
+        initial = session.shot(folder / "g5-initial.ppm")
+        check_two_windows(initial)
+        verify_text_pixels(initial, "files-note", "HELLO INDIANOS")
+        width, height = initial[:2]
+        # Prove the titlebar is genuinely captured before inducing loss.
+        origin, held = (100, 90), (130, 106)
+        ingress = len(session.output)
+        acknowledged_key(session, "2", "R031.1 user switched to Terminal app")
+        physical_focus(session, (width // 2, height // 2), origin, "Files")
+        pointer_button(session, origin, 1)
+        move_pointer(session, origin, held, 1)
+        before = session.shot(folder / "g5-mouse-captured.ppm")
+        verify_text_pixels(before, "files-note", "HELLO INDIANOS", (30, 16))
+        verify_irq_ingress(bytes(session.output), ingress)
+
+        # No mouse-up was sent. The reject-on-overflow path must publish a
+        # zero-motion release from the real auxiliary ingress instead.
+        mouse_fault = len(session.output)
+        i8042_loss_fixture(session, aux=True)
+        await_pointer(session, *held, 0, mouse_fault)
+        released = session.shot(folder / "g5-mouse-cancelled.ppm")
+        verify_text_pixels(released, "files-note", "HELLO INDIANOS", (30, 16))
+
+        # The physical left button is still held. Deliver separate movements,
+        # wait for the controller to drain, and fence with live keyboard UI
+        # responses. Neither movement may be forwarded as a pointer event.
+        quarantine = len(session.output)
+        for dx, dy in ((20, 8), (17, 9)):
+            session.hmp(f"mouse_move {dx} {dy}")
+            session.drain_serial(0.2)
+            wait_i8042_idle(session)
+        acknowledged_key(session, "a", "R031.1 application launcher OPEN")
+        acknowledged_key(session, "a", "R031.1 application launcher CLOSED")
+        ignored = settled_frame(session, folder / "g5-mouse-quarantined.ppm")
+        verify_g5_suppression(bytes(session.output), quarantine, len(session.output),
+                              (b"desktop physical pointer",))
+        verify_text_pixels(ignored, "files-note", "HELLO INDIANOS", (30, 16))
+
+        session.hmp("mouse_button 0")  # recovery delimiter; discarded, not replayed
+        session.drain_serial(0.2)
+        wait_i8042_idle(session)
+        pointer_button(session, held, 1)
+        move_pointer(session, held, origin, 1)
+        pointer_button(session, origin, 0)
+        fresh = session.shot(folder / "g5-mouse-fresh-files.ppm")
+        verify_text_pixels(fresh, "files-note", "HELLO INDIANOS")
+        physical_focus(session, origin, (width - 100, height - 150), "Terminal")
+
+        # An interrupted write would change a visible persisted note if its
+        # suffix slipped through. Enter ends keyboard quarantine; then a
+        # newly typed command must present the original bytes in both apps.
+        acknowledged_key(session, "ret")
+        type_command(session, "write bad")
+        key_fault = len(session.output)
+        i8042_loss_fixture(session, aux=False)
+        session.until(G5_KEYBOARD_LOSS, 20, since=key_fault)
+        session.drain_serial(0.1)
+        exact_terminal_line(bytes(session.output), key_fault, G5_KEYBOARD_LOSS)
+        stale = len(session.output)
+        session.hmp("sendkey z 80")
+        session.drain_serial(0.2)
+        wait_i8042_idle(session)
+        delimiter = acknowledged_key(session, "ret")
+        verify_g5_suppression(bytes(session.output), stale, delimiter, (ACK.encode(),))
+        if COMMITTED.encode() in session.output[key_fault:]:
+            raise AssertionError("the interrupted command mutated the Files note")
+        cancelled = session.shot(folder / "g5-key-cancelled.ppm")
+        verify_text_pixels(cancelled, "files-note", "HELLO INDIANOS")
+        type_command(session, "cat")
+        submitted = acknowledged_key(session, "ret")
+        session.until(G5_FRESH_READ, 20, since=submitted)
+        session.drain_serial(0.1)
+        exact_terminal_line(bytes(session.output), submitted, G5_FRESH_READ)
+        recovered = session.shot(folder / "g5-key-fresh-readback.ppm")
+        verify_text_pixels(recovered, "terminal", "HELLO INDIANOS")
+        verify_text_pixels(recovered, "files-note", "HELLO INDIANOS")
+    finally:
+        close(process, sock, session, folder / f"{name}.serial.log")
+
+    if disk.read_bytes() != original:
+        raise AssertionError("G5 read-only qualification changed disposable media")
+    # Write only after every live assertion and artifact capture succeeded.
+    names = (f"{name}.serial.log", "g5-mouse-captured.ppm", "g5-mouse-cancelled.ppm",
+             "g5-mouse-quarantined.ppm", "g5-mouse-fresh-files.ppm",
+             "g5-key-cancelled.ppm", "g5-key-fresh-readback.ppm")
+    contents = {filename: (folder / filename).read_bytes() for filename in names}
+    if not all(contents.values()):
+        raise AssertionError("missing retained G5 evidence")
+    (folder / "g5-receipt.json").write_text(json.dumps({
+        "schema": 1, "gate": "G5", "revision": revision,
+        "faults": ["i8042-aux-overflow", "i8042-keyboard-overrun"],
+        "sha256": {filename: hashlib.sha256(data).hexdigest() for filename, data in contents.items()},
+    }, indent=2) + "\n")
+    print("G5 PASS: live production PS/2 mouse and keyboard loss, quarantine and visible recovery", flush=True)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--iso", type=Path, required=True)
@@ -2541,11 +2684,17 @@ def main() -> None:
                         help="compositor ELF that withholds STOPPED after a durable shutdown")
     parser.add_argument("--unready-compositor-only", action="store_true",
                         help="run the standalone strict G3 unready-compositor diagnostic")
+    parser.add_argument("--g5-irq-recovery-revision",
+                        help="run only G5 loss/recovery on the exact checkout revision")
     args = parser.parse_args()
+    revision = args.g5_irq_recovery_revision
+    if revision is not None and (args.unready_compositor_only or not re.fullmatch(r"[0-9a-f]{40}", revision)
+                                 or subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip() != revision):
+        parser.error("G5 requires an exclusive diagnostic at the exact checkout revision")
     if args.shutdown_fixture is not None and not args.shutdown_fixture.is_file():
         parser.error(f"missing artifact {args.shutdown_fixture}")
     required = (args.iso, args.disk, args.ovmf)
-    if not args.unready_compositor_only:
+    if not args.unready_compositor_only and revision is None:
         required += (args.fixture_tool,)
     for path in required:
         if not path.is_file():
@@ -2563,6 +2712,9 @@ def main() -> None:
         if args.unready_compositor_only:
             unready_compositor_diagnostic(args.qemu, args.iso.resolve(), args.ovmf.resolve(),
                                           disk, artifacts, Path(temporary), args.xorriso)
+            return
+        if revision is not None:
+            g5_irq_recovery_boot(args.qemu, args.iso.resolve(), args.ovmf.resolve(), disk, artifacts, revision)
             return
         for index in (0, 1):
             before = disk.read_bytes()
