@@ -254,13 +254,31 @@ jobs:
       - name: Verify G4 retained ring-3 compositor and recovery evidence
         if: steps.g4_receipts.outcome == 'success'
         run: echo "G4 evidence present"
+      - name: Collect G5 live PS/2 interrupt and loss recovery receipts
+        id: g5_receipts
+        continue-on-error: true
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          python3 tools/verify_ci_sha.py --expected "$EXPECTED_SHA" --observed "$(git rev-parse HEAD)"
+          receipt_dir=build/normal-desktop-artifacts/g5-irq-recovery
+          python3 tools/test_normal_desktop_qemu.py --g5-irq-recovery-revision "$EXPECTED_SHA" \
+            --iso build/normal-desktop/indianos.iso --disk build/normal-desktop-fixture/volume.raw \
+            --qemu qemu-system-x86_64 --ovmf "$NORMAL_DESKTOP_OVMF" \
+            --artifact-dir "$receipt_dir" 2>&1 | tee build/normal-desktop-logs/g5-irq-recovery.log
+          test -n "$(find "$receipt_dir" -name g5-receipt.json -size +0c -print -quit)"
+      - name: Verify G5 retained live PS/2 input and loss recovery
+        if: steps.g5_receipts.outcome == 'success'
+        run: echo "G5 evidence present"
       - name: Explain gate-specific qualification failures
-        if: success() && (steps.g2_receipts.outcome != 'success' || steps.g3_receipts.outcome != 'success' || steps.g4_receipts.outcome != 'success')
+        if: success() && (steps.g2_receipts.outcome != 'success' || steps.g3_receipts.outcome != 'success' || steps.g4_receipts.outcome != 'success' || steps.g5_receipts.outcome != 'success')
         env:
           G2_OUTCOME: ${{ steps.g2_receipts.outcome }}
           G3_OUTCOME: ${{ steps.g3_receipts.outcome }}
           G4_OUTCOME: ${{ steps.g4_receipts.outcome }}
-        run: echo "::warning::Gate qualification did not pass for at least one gate (G2=$G2_OUTCOME, G3=$G3_OUTCOME, G4=$G4_OUTCOME). See distinct gate steps and retained QEMU diagnostics."
+          G5_OUTCOME: ${{ steps.g5_receipts.outcome }}
+        run: echo "::warning::Gate qualification did not pass for at least one gate (G2=$G2_OUTCOME, G3=$G3_OUTCOME, G4=$G4_OUTCOME, G5=$G5_OUTCOME). See distinct gate steps and retained QEMU diagnostics."
       - name: Build a separate opt-in x87 SSE guest fixture
         run: |
           set -euo pipefail
