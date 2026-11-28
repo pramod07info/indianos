@@ -200,7 +200,7 @@ jobs:
             --ovmf "$OVMF_PATH" --artifact-dir build/normal-desktop-artifacts \
             --shutdown-fixture build/desktop-shutdown-fixture/x86_64-unknown-none/release/indianos-user \
             2>&1 | tee build/normal-desktop-logs/qemu.log
-      # These two diagnostics gate milestone acceptance individually, not the
+      # These diagnostics gate milestone acceptance individually, not the
       # pre-existing shared PR regression. GitHub exposes continued failures as
       # successful conclusions, so only separate outcome markers authorize PASS.
       - name: Collect G2 partition recovery and reboot receipts
@@ -237,12 +237,30 @@ jobs:
       - name: Verify G3 retained normal boot and repeated unready recovery receipts
         if: steps.g3_receipts.outcome == 'success'
         run: echo "G3 evidence present"
+      - name: Collect G4 ring-3 isolation, full-frame and recovery receipts
+        id: g4_receipts
+        continue-on-error: true
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          python3 tools/verify_ci_sha.py --expected "$EXPECTED_SHA" --observed "$(git rev-parse HEAD)"
+          PYTHONPATH=tools python3 - "$EXPECTED_SHA" <<'PYTHON'
+          import sys
+          from pathlib import Path
+          from test_normal_desktop_qemu import verify_g4_retained_evidence
+          print(verify_g4_retained_evidence(Path("build/normal-desktop-artifacts"), sys.argv[1]))
+          PYTHON
+      - name: Verify G4 retained ring-3 compositor and recovery evidence
+        if: steps.g4_receipts.outcome == 'success'
+        run: echo "G4 evidence present"
       - name: Explain gate-specific qualification failures
-        if: success() && (steps.g2_receipts.outcome != 'success' || steps.g3_receipts.outcome != 'success')
+        if: success() && (steps.g2_receipts.outcome != 'success' || steps.g3_receipts.outcome != 'success' || steps.g4_receipts.outcome != 'success')
         env:
           G2_OUTCOME: ${{ steps.g2_receipts.outcome }}
           G3_OUTCOME: ${{ steps.g3_receipts.outcome }}
-        run: echo "::warning::Gate qualification did not pass for at least one gate (G2=$G2_OUTCOME, G3=$G3_OUTCOME). See distinct gate steps and retained QEMU diagnostics."
+          G4_OUTCOME: ${{ steps.g4_receipts.outcome }}
+        run: echo "::warning::Gate qualification did not pass for at least one gate (G2=$G2_OUTCOME, G3=$G3_OUTCOME, G4=$G4_OUTCOME). See distinct gate steps and retained QEMU diagnostics."
       - name: Build a separate opt-in x87 SSE guest fixture
         run: |
           set -euo pipefail

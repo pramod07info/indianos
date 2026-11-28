@@ -12,6 +12,9 @@ on:
       - 'tools/test_m2_phase5c_vectors.py'
       - 'Makefile'
       - 'tools/test_m2_disk_exec_qemu.py'
+      - 'docs/M1_G4_FULL_FRAME_QEMU_ACCEPTANCE.md'
+      - 'tools/test_normal_desktop_qemu.py'
+      - '.github/workflows/m1-reliability-integration.yml'
       - 'tools/ci/install-qemu-deps.sh'
       - '.github/workflows/m2-developer-alpha.yml'
   pull_request:
@@ -26,6 +29,9 @@ on:
       - 'tools/test_m2_phase5c_vectors.py'
       - 'Makefile'
       - 'tools/test_m2_disk_exec_qemu.py'
+      - 'docs/M1_G4_FULL_FRAME_QEMU_ACCEPTANCE.md'
+      - 'tools/test_normal_desktop_qemu.py'
+      - '.github/workflows/m1-reliability-integration.yml'
       - 'tools/ci/install-qemu-deps.sh'
       - '.github/workflows/m2-developer-alpha.yml'
   workflow_dispatch:

@@ -185,7 +185,6 @@ jobs:
             // QEMU job and same-job artifact, not a generic green workflow.
             // Each unresolved later gate has a distinct fail-closed exit.
             const gateHold={
-              G4:"Complete exact-revision proof for an independent ring-3 input broker and compositor, per-app isolation and client-preserving replacement; bind those assertions to the retained QEMU results.",
               G5:"Complete and bind the live PS/2 focus/capture, IRQ loss/recovery and visible Files/Terminal effects matrix; host-only or serial-injected results are insufficient.",
               G6:"Complete full concurrent-writer, per-user and flush-order qualification, plus required physical cache-loss evidence; emulated publication cuts alone are insufficient.",
               G7:"Complete the native independent-process create/read/edit/rename, denied-access and exact same-disk reboot matrix; broker-only paths or host models are insufficient.",
@@ -193,7 +192,8 @@ jobs:
             };
             const gateSteps={
               G2:"Verify G2 retained partition recovery and reboot receipts",
-              G3:"Verify G3 retained normal boot and repeated unready recovery receipts"
+              G3:"Verify G3 retained normal boot and repeated unready recovery receipts",
+              G4:"Verify G4 retained ring-3 compositor and recovery evidence"
             };
             function decideGates(subject, ready, proof) {
               const rows=[];
@@ -201,9 +201,10 @@ jobs:
               for(const [gate,detail] of [
                 ["G1","Authenticated Terminal, durable reboot readback and required regressions."],
                 ["G2","Defensive MBR/GPT selection, mirror/CRC/identity negatives, ATA write failure, unchanged-media recovery and reboot/remount."],
-                ["G3","Normal isolated four-service boot, invalid/unready service/media and shutdown exhaustion, plus two strict unready-compositor boots with retained diagnostics on failure."]
+                ["G3","Normal isolated four-service boot, invalid/unready service/media and shutdown exhaustion, plus two strict unready-compositor boots with retained diagnostics on failure."],
+                ["G4","Distinct ring-3 PID1 broker and PID4 compositor, guarded per-app surfaces, full-frame publication, stale authority denied, client-preserving replacement and strict fallback; requires retained exact-revision QEMU and M2 regression evidence."]
               ]) {
-                const complete=ready && (gate==="G1" || proof[gate]===true);
+                const complete=ready && (gate==="G1" || proof[gate]===true && (gate!=="G4" || proof.M2===true));
                 rows.push([gate,complete?(countable?"ACCEPTED":"CANDIDATE PASS"):"NOT VERIFIED",detail]);
               }
               for(const [gate,detail] of Object.entries(gateHold))
@@ -220,6 +221,12 @@ jobs:
               const accepted=decideGates({},true,{G2:true,G3:true});
               assert.deepEqual(accepted.rows.filter(r=>r[1]==="ACCEPTED").map(r=>r[0]),["G1","G2","G3"]);
               assert.match(accepted.summary,/8\/13 .*61\.54%/);
+              assert.match(decideGates({},true,{G2:true,G3:true,G4:true}).summary,/8\/13 .*61\.54%/);
+              const g4ready={G2:true,G3:true,G4:true,M2:true};
+              assert.match(decideGates({},true,g4ready).summary,/9\/13 .*69\.23%/);
+              assert.equal(decideGates({},true,{M2:true}).rows.find(r=>r[0]==="G4")[1],"NOT VERIFIED");
+              assert.equal(decideGates({number:1},true,g4ready).rows.find(r=>r[0]==="G4")[1],"CANDIDATE PASS");
+              assert.equal(decideGates({},false,g4ready).rows.find(r=>r[0]==="G4")[1],"NOT VERIFIED");
               assert.match(decideGates({},true,{}).summary,/6\/13 .*46\.15%/);
               assert.match(decideGates({},true,{G2:true}).summary,/7\/13 .*53\.85%/);
               for(const [passing,blocked] of [["G2","G3"],["G3","G2"]]){
@@ -232,7 +239,7 @@ jobs:
                 const decision=decideGates(subject,ready,{G2:true,G3:true});
                 assert.equal(decision.rows.length,8);
                 assert.ok(decision.rows.every(r=>r[1]!=="ACCEPTED"));
-                assert.equal(decision.rows.filter(r=>r[1]==="BLOCKED").length,5);
+                assert.equal(decision.rows.filter(r=>r[1]==="BLOCKED").length,4);
               }
               const sha="a".repeat(40),full="owner/repo",path=".github/workflows/test.yml";
               const run={id:1,run_number:1,path,head_sha:sha,head_branch:"main",head_repository:{full_name:full},event:"push",status:"completed",conclusion:"success"};
@@ -377,6 +384,17 @@ jobs:
                   ready=ready&&ok;
                   rows.push([label,(ok?"PASS: ":"BLOCKED: ")+detail+" (run "+r.id+")"]);
                 }
+                const m2=newest(runs,".github/workflows/m2-developer-alpha.yml",s.sha,full,s.events,s.branch);
+                if(m2?.status==="completed"&&m2.conclusion==="success"){
+                  const jobs=await github.paginate(github.rest.actions.listJobsForWorkflowRun,{owner,repo,run_id:m2.id,filter:"latest",per_page:100});
+                  proof.M2=verifyJob(jobs,"m2-native-and-guest",["R118 assert exact integration head checkout",
+                    "M2 native SDK package inventory app-store and network tests",
+                    "M2 no_std compilation of integrated guest modules",
+                    "Verified native ELF signed-install update and rollback in QEMU",
+                    "M2 Phase 5C real 32KiB and 64KiB ring3 signed A/B install upgrade rollback in QEMU"]);
+                }
+                rows.push(["G4 only: M2 non-regression",proof.M2?"PASS (run "+m2.id+")":
+                  "NOT VERIFIED"+(m2?" ("+m2.status+"/"+(m2.conclusion||"pending")+", run "+m2.id+")":" (missing exact revision)")]);
                 const live=s.number?(await github.rest.pulls.get({owner,repo,pull_number:s.number})).data.head.sha:await getMain();
                 if(live!==s.sha){ready=false;rows.push(["Revision stability","BLOCKED: revision changed during review"]);}
                 const decision=decideGates(s,ready,proof);
