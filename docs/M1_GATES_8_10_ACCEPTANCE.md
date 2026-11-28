@@ -1,5 +1,7 @@
 # Checklist positions 8–13: boot, isolation, input and persistence
 
+> **Current rule:** See [G1–G8 automated acceptance](M1_G1_G8_AUTOMATED_ACCEPTANCE.md). The gate behavior and historical receipts below are preserved; older gate-level review and sign-off instructions are superseded. GitHub merge rules are unchanged.
+
 These are issue #616 gates G3 through G8. The existing filename is retained
 for published links. All six remain **IN PROGRESS** until required checks, exact-revision QEMU
 artifacts and review satisfy their exit criteria. Source changes alone do not

@@ -2,9 +2,10 @@
   "schema_version": 1,
   "scope": "IndianOS M1",
   "task_source_of_truth": "docs/M1_PHASE_SCOPE.md",
+  "gate_acceptance_policy": "docs/M1_G1_G8_AUTOMATED_ACCEPTANCE.md",
   "gate_source_of_truth": "https://github.com/pramod07info/indianos/issues/616",
   "status_semantics": {
-    "automated_acceptance": "For G1, the exact-main evidence report is authoritative; a static registry entry does not mark a revision accepted.",
+    "automated_acceptance": "For G1–G8, the exact-main evidence report is authoritative; a static registry entry does not mark a revision accepted.",
     "audit_required": "Not yet independently reviewed for this index. NOT proof of missing implementation.",
     "implemented_acceptance_pending": "Merged implementation evidence exists but exact-SHA acceptance/review/merged-main verification remains pending."
   },
@@ -75,7 +76,7 @@
     {
       "id": "G2",
       "title": "Defensive MBR/GPT selected partitions and recovery",
-      "status": "implemented_acceptance_pending",
+      "status": "automated_acceptance",
       "source_paths": [
         "rust/kernel_core/src/m1_partition.rs",
         "rust/kernel_core/src/block.rs"
@@ -105,13 +106,11 @@
           "https://github.com/pramod07info/indianos/actions/runs/45349640311"
         ],
         "latest_full_matrix": "passed: M1 combined reliability run 45349640355 attempt 2 on b51e5dbe8a5167d5f3007ef819d9c887a9fa7717; all three jobs successful; normal-desktop-qemu job 138325532048 log confirms two cold boots, GPT semantic negatives, read-only recovery, actual ATA write failure with retired mount/refused sync/unchanged media, and unready-compositor recovery. Attempt 1 timed out at unready-service marker; rerun passed without source changes. Artifact 14904158472.",
-        "independent_review": "pending; PR #790 and #795 review lists empty; no approval inferred from automated workflow",
+        "acceptance_mode": "exact-main automated evidence; no separate source approval or manual sign-off",
+        "formal_acceptance_report": "https://github.com/pramod07info/indianos/actions/workflows/agent-independent-reviewer.yml",
         "remaining_blockers": [
-          "Independent correctness/security review and explicit gate sign-off",
-          "Reviewed master checklist reconciliation",
-          "Verify applicable CI on updated PR head and final merged-main SHA before acceptance"
+          "Verify exact-main partition/reboot receipt and same-job artifact, plus the shared required CI, on the acceptance revision"
         ],
-        "formal_acceptance": false,
         "source_symbols": [
           "rust/kernel_core/src/m1_partition.rs::discover",
           "rust/kernel_core/src/m1_partition.rs::inspect_partition_receipt",
@@ -141,7 +140,7 @@
     {
       "id": "G3",
       "title": "Normal boot PID1 and independent services",
-      "status": "implemented_acceptance_pending",
+      "status": "automated_acceptance",
       "source_paths": [
         "rust/kernel_core/src/m1_persistent_desktop.rs",
         "Makefile",
@@ -192,16 +191,11 @@
           "https://github.com/pramod07info/indianos/actions/runs/45349640355/artifacts/14901141842"
         ],
         "failed_job": "https://github.com/pramod07info/indianos/actions/runs/45349640355/job/138292568029",
-        "independent_review": "pending; no independent approvals returned for eight inspected PRs",
+        "acceptance_mode": "exact-main automated evidence; no separate source approval or manual sign-off",
+        "formal_acceptance_report": "https://github.com/pramod07info/indianos/actions/workflows/agent-independent-reviewer.yml",
         "remaining_blockers": [
-          "Independent correctness/security review of the actual G3 production source and explicit G3 sign-off (review lists for #765 #790 #794 #795 #797 #798 #801 #803 empty).",
-          "Exact candidate and final merged-main host/no_std, full normal Desktop QEMU, S0 and applicable non-regression evidence. Current main 11ffe7b9944938e96596fefdd207bb3a6c572ceb push S0, Duplicate Prevention and Roadmap SHA checks passed; full normal Desktop matrix did not trigger for registry-only change.",
-          "Investigate intermittent unready-compositor timeout: run 45349640355 attempt 1 job 138292568029 failed waiting 45s for recovery; last logged activity during PID2 startup (R117), root cause not established; attempt 2 passed without source changes. Retain strict assertions and budgets; repeat qualification and inspect failed artifact.",
-          "Complete remaining source/acceptance traceability and independent review, including shutdown dispatch exhaustion, stale authority cleanup and individual service negatives; do not claim broader phase completion or hardware qualification.",
-          "Validate the frame-query performance correction against all G3 negative boots; do not declare the intermittent timeout resolved until evidence supports it."
+          "Verify exact-main normal-boot receipts and two strict unready-compositor boots with failure diagnostics, plus the shared required CI, on the acceptance revision"
         ],
-        "formal_acceptance": false,
-        "scope_limit": "256 cooperative dispatch startup/shutdown bounds do not bound wall clock or nontrapping tasks; broader preemption, physical hardware, general compositor and storage ABI obligations remain in their existing phase/gate records.",
         "source_symbols": [
           "desktop-image",
           "boot_validate",
@@ -281,6 +275,7 @@
       "id": "G4",
       "title": "Independent ring-3 compositor and input broker",
       "status": "audit_required",
+      "acceptance_mode": "test-based; mandatory evidence incomplete; see gate policy and exact-main report",
       "source_paths": [
         "rust/kernel_core/src/m1_persistent_desktop.rs"
       ],
@@ -293,6 +288,7 @@
       "id": "G5",
       "title": "Real PS/2 keyboard and mouse event flow",
       "status": "audit_required",
+      "acceptance_mode": "test-based; mandatory evidence incomplete; see gate policy and exact-main report",
       "source_paths": [
         "rust/kernel_core/src/m1_input.rs",
         "rust/kernel_core/src/ps2_mouse.rs"
@@ -307,6 +303,7 @@
       "id": "G6",
       "title": "Crash-safe persistent VFS and isolation",
       "status": "audit_required",
+      "acceptance_mode": "test-based; mandatory evidence incomplete; see gate policy and exact-main report",
       "source_paths": [
         "rust/kernel_core/src/hier_vfs.rs",
         "rust/kernel_core/src/durablefs.rs"
@@ -323,6 +320,7 @@
       "id": "G7",
       "title": "Authenticated multi-process filesystem ABI",
       "status": "audit_required",
+      "acceptance_mode": "test-based; mandatory evidence incomplete; see gate policy and exact-main report",
       "source_paths": [
         "rust/kernel_core/src/m1_persistent_desktop.rs"
       ],
@@ -337,6 +335,7 @@
       "id": "G8",
       "title": "Driver qualification and safe recovery",
       "status": "audit_required",
+      "acceptance_mode": "test-based; mandatory evidence incomplete; see gate policy and exact-main report",
       "source_paths": [
         "rust/kernel_core/src/ata_pio.rs"
       ],

@@ -2387,7 +2387,7 @@ def shutdown_exhaustion_boot(qemu: str, iso: Path, ovmf: Path, disk: Path,
 
 
 def bad_service_images(iso: Path, folder: Path, xorriso: str,
-                       shutdown_fixture: Path | None = None):
+                       shutdown_fixture: Path | None = None, *, only: str | None = None):
     tree = folder / "fault-iso-tree"
     checked_run([xorriso, "-osirrox", "on", "-indev", str(iso), "-extract", "/", str(tree)])
     for directory in [tree, *(p for p in tree.rglob("*") if p.is_dir())]:
@@ -2417,6 +2417,8 @@ def bad_service_images(iso: Path, folder: Path, xorriso: str,
         cases.append(("shutdown-exhaustion", b"/bin/compositor",
                       shutdown_fixture.read_bytes(), "desktop-session-failed"))
     for name, target, payload, reason in cases:
+        if only is not None and name != only:
+            continue
         modified = folder / f"{name}.iso"
         try:
             destination.write_bytes(rewrite_initramfs(original, target, payload))
@@ -2430,6 +2432,18 @@ def bad_service_images(iso: Path, folder: Path, xorriso: str,
         finally:
             destination.write_bytes(original)
         yield name, modified, "IndianOS recovery: reason=" + reason
+
+
+def unready_compositor_diagnostic(qemu: str, iso: Path, ovmf: Path, disk: Path,
+                                   artifacts: Path, scratch: Path, xorriso: str) -> None:
+    # A second, independent run of the same strict oracle. A failure leaves
+    # the existing serial/monitor receipts and is never retried in this step.
+    target = "unready-compositor"
+    cases = bad_service_images(iso, scratch, xorriso, only=target)
+    (name, modified, _), = cases
+    if name != target:
+        raise AssertionError("unexpected recovery fixture")
+    unready_service_boot(qemu, modified, ovmf, disk, artifacts, target)
 
 
 def main() -> None:
@@ -2446,10 +2460,15 @@ def main() -> None:
                         help="actual COW writer for checksummed namespace rejection media")
     parser.add_argument("--shutdown-fixture", type=Path,
                         help="compositor ELF that withholds STOPPED after a durable shutdown")
+    parser.add_argument("--unready-compositor-only", action="store_true",
+                        help="run the standalone strict G3 unready-compositor diagnostic")
     args = parser.parse_args()
     if args.shutdown_fixture is not None and not args.shutdown_fixture.is_file():
         parser.error(f"missing artifact {args.shutdown_fixture}")
-    for path in (args.iso, args.disk, args.ovmf, args.fixture_tool):
+    required = (args.iso, args.disk, args.ovmf)
+    if not args.unready_compositor_only:
+        required += (args.fixture_tool,)
+    for path in required:
         if not path.is_file():
             parser.error(f"missing artifact {path}")
     args.artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -2462,6 +2481,10 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix="normal-desktop-disk-") as temporary:
         disk = Path(temporary) / "selected.raw"
         shutil.copyfile(args.disk, disk)
+        if args.unready_compositor_only:
+            unready_compositor_diagnostic(args.qemu, args.iso.resolve(), args.ovmf.resolve(),
+                                          disk, artifacts, Path(temporary), args.xorriso)
+            return
         for index in (0, 1):
             before = disk.read_bytes()
             boot(args.qemu, args.iso.resolve(), args.ovmf.resolve(), disk, artifacts, index)

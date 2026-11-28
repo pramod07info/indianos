@@ -588,6 +588,17 @@ class NormalDesktopControls(unittest.TestCase):
                              ["info status", "info registers", "info block"])
             close.assert_called_once()
 
+    def test_standalone_unready_diagnostic_reuses_the_strict_oracle(self):
+        qemu, iso, ovmf, disk = "qemu", Path("desktop.iso"), Path("ovmf.fd"), Path("scratch.raw")
+        artifacts, scratch, modified = Path("report"), Path("work"), Path("fault.iso")
+        fixture = [("unready-compositor", modified, "desktop-session-failed")]
+        with patch.object(harness, "bad_service_images", return_value=fixture) as images:
+            with patch.object(harness, "unready_service_boot", side_effect=TimeoutError("strict")) as boot:
+                with self.assertRaises(TimeoutError):
+                    harness.unready_compositor_diagnostic(qemu, iso, ovmf, disk, artifacts, scratch, "xorriso")
+                images.assert_called_once_with(iso, scratch, "xorriso", only="unready-compositor")
+                boot.assert_called_once_with(qemu, modified, ovmf, disk, artifacts, "unready-compositor")
+
     def test_unready_monitor_diagnostic_write_failure_cannot_mask_acceptance(self):
         with tempfile.TemporaryDirectory() as temporary:
             session = Mock()

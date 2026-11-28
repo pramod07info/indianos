@@ -1,17 +1,18 @@
 # Checklist positions 6 and 7: Terminal and partition acceptance
 
+> **Current rule:** See [G1–G8 automated acceptance](M1_G1_G8_AUTOMATED_ACCEPTANCE.md). The gate behavior and historical receipts below are preserved; older gate-level review and sign-off instructions are superseded. GitHub merge rules are unchanged.
+
 These are issue #616 **G1** and **G2**, not the later G6 persistent-VFS and G7
 cross-process API gates. The implementation and local runtime matrix below
 have positive exact-source **and merged-main** QEMU/host evidence from PR #790,
-verified 22 Nov 2026 (details below). G1 uses the current test-based policy
-below; G2 still requires review and sign-off. Do not add duplicate kernel
+verified 22 Nov 2026 (details below). G1 and G2 use the current test-based policy linked above. Do not add duplicate kernel
 code solely because acceptance evidence is pending.
 
-## G1 test-based acceptance
+## G1 test-based acceptance (PR #827 historical baseline)
 
 This section activates the G1 portion of the proposal in PR #810 and
-supersedes older G1/G2/G3 joint review language for **G1 only**. G2, G3
-and all other gates keep their existing rules. GitHub branch protection
+supersedes older G1/G2/G3 joint review language for **G1 only**. At the time of PR #827, G2, G3
+and all other gates kept their then-existing rules. GitHub branch protection
 and required merge settings remain unchanged, including any review they
 require for the policy PR itself.
 
