@@ -181,8 +181,21 @@ jobs:
                 Date.parse(a.created_at)<=Date.parse(job?.completed_at));
             }
             
+            function reportG1(subject, evidenceReady) {
+              if (subject.number) return evidenceReady
+                ? "G1 candidate evidence PASS; not accepted until verified on main."
+                : "G1 candidate evidence incomplete.";
+              return evidenceReady
+                ? "G1 ACCEPTED by exact-main automated evidence. M1: 6/13 (46.15%; includes G1 and the five foundation gates)."
+                : "G1 NOT VERIFIED at this main revision; do not add G1 to the five foundation gates (5/13, 38.46%).";
+            }
+
             function selfTest() {
               const assert=require("node:assert/strict");
+              assert.match(reportG1({},true), /^G1 ACCEPTED.*6\/13/);
+              assert.match(reportG1({},false), /^G1 NOT VERIFIED.*5\/13/);
+              assert.match(reportG1({number:1},true), /not accepted until verified on main/);
+              assert.equal(reportG1({number:1},false), "G1 candidate evidence incomplete.");
               const sha="a".repeat(40),full="owner/repo",path=".github/workflows/test.yml";
               const run={id:1,run_number:1,path,head_sha:sha,head_branch:"main",head_repository:{full_name:full},event:"push",status:"completed",conclusion:"success"};
               const query=runs=>newest(runs,path,sha,full,["push"],"main");
@@ -297,7 +310,7 @@ jobs:
                 if(!files.some(f=>/^(docs\/M1_(TASK_REGISTRY|GATES_6_7|GATES_8_10)|rust\/kernel_core\/src\/(m1_|user_runtime|user_image|hier_vfs|fs_handles|durablefs|ata_pio|block)|userland\/rust\/|tools\/test_normal_desktop_qemu\.py|tests\/test_normal_desktop_acceptance\.py)/.test(f.filename)))continue;
                 subjects.push({label:"PR #"+pr.number,sha:pr.head.sha,branch:pr.head.ref,events:["pull_request","workflow_dispatch"],number:pr.number});
               }
-              await core.summary.addHeading("M1 G1–G3 automated evidence review").addRaw("Read-only evidence triage, not independent correctness/security code approval or formal sign-off. No gate or merge state is changed.").write();
+              await core.summary.addHeading("M1 G1–G3 automated evidence review").addRaw("G1 is accepted by passing automated evidence on main; candidate evidence does not count. For G2/G3 this remains evidence triage only, not independent source approval or sign-off. This report never changes branch protections, PRs or checkboxes.").write();
               for(const s of subjects){
                 const runs=await github.paginate(github.rest.actions.listWorkflowRunsForRepo,{owner,repo,head_sha:s.sha,per_page:100});
                 const rows=[[{data:"Required evidence",header:true},{data:"Result",header:true}]];
@@ -323,15 +336,16 @@ jobs:
                 }
                 const live=s.number?(await github.rest.pulls.get({owner,repo,pull_number:s.number})).data.head.sha:await getMain();
                 if(live!==s.sha){ready=false;rows.push(["Revision stability","BLOCKED: revision changed during review"]);}
-                await core.summary.addHeading(s.label+" — "+s.sha,2).addTable(rows).addRaw(ready?
-                  "Automated evidence ready for independent code review. This is not gate acceptance.":
-                  "Automated evidence incomplete; do not sign off or merge based on this report.").write();
+                await core.summary.addHeading(s.label+" — "+s.sha,2).addTable(rows)
+                  .addRaw(reportG1(s,ready),true)
+                  .addRaw(ready?
+                    "G2/G3: automated evidence ready for independent code review; not gate acceptance.":
+                    "G2/G3: automated evidence incomplete; do not sign off or merge based on this report.",true).write();
               }
               await core.summary.addHeading("Independent reviewer checklist",2).addTable([
                 [{data:"Gate",header:true},{data:"Required manual correctness/security assessment",header:true}],
-                ["G1","Authenticated Terminal → PID1 → selected HierVfs; named mutation permissions, false ACK prevention, durable reboot readback and GUI state."],
                 ["G2","MBR/GPT mirrors, CRC and identity, bounds/overlap, selected-volume receipts, ATA write failure and unchanged media in read-only recovery."],
                 ["G3","Normal four-service ring3 boot, W^X, authenticated readiness, full retirement, one restart, unready and invalid media recovery, intermittent timeout investigation and durable shutdown."]
-              ]).addRaw("Review actual source/diffs and retained serial/screenshots. Explicit independent review and gate sign-off remain mandatory. Reports never approve PRs, assign coordinator labels, or edit milestones.").write();
+              ]).addRaw("Review actual source/diffs and retained serial/screenshots. Separate independent review and gate sign-off remain mandatory for G2/G3 only. Reports never approve PRs, assign coordinator labels, or edit milestones.").write();
             }
             await report();

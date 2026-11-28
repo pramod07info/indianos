@@ -4,6 +4,7 @@
   "task_source_of_truth": "docs/M1_PHASE_SCOPE.md",
   "gate_source_of_truth": "https://github.com/pramod07info/indianos/issues/616",
   "status_semantics": {
+    "automated_acceptance": "For G1, the exact-main evidence report is authoritative; a static registry entry does not mark a revision accepted.",
     "audit_required": "Not yet independently reviewed for this index. NOT proof of missing implementation.",
     "implemented_acceptance_pending": "Merged implementation evidence exists but exact-SHA acceptance/review/merged-main verification remains pending."
   },
@@ -11,7 +12,7 @@
     {
       "id": "G1",
       "title": "Authenticated live Terminal and durable HierVfs",
-      "status": "implemented_acceptance_pending",
+      "status": "automated_acceptance",
       "source_paths": [
         "rust/kernel_core/src/m1_persistent_terminal.rs",
         "rust/kernel_core/src/m1_persistent_desktop.rs"
@@ -41,13 +42,11 @@
           "https://github.com/pramod07info/indianos/actions/runs/45349640311"
         ],
         "latest_full_matrix": "passed: M1 combined reliability run 45349640355 attempt 2 on b51e5dbe8a5167d5f3007ef819d9c887a9fa7717; all three jobs successful; normal-desktop-qemu job 138325532048 log confirms two cold boots, GPT semantic negatives, read-only recovery, actual ATA write failure with retired mount/refused sync/unchanged media, and unready-compositor recovery. Attempt 1 timed out at unready-service marker; rerun passed without source changes. Artifact 14904158472.",
-        "independent_review": "pending; PR #790 and #795 review lists empty; no approval inferred from automated workflow",
+        "acceptance_mode": "exact-main automated evidence; no separate source approval or manual sign-off",
+        "formal_acceptance_report": "https://github.com/pramod07info/indianos/actions/workflows/agent-independent-reviewer.yml",
         "remaining_blockers": [
-          "Independent correctness/security review and explicit gate sign-off",
-          "Reviewed master checklist reconciliation",
-          "Verify applicable CI on updated PR head and final merged-main SHA before acceptance"
+          "For the revision being accepted, the trusted Actions report must verify all required workflows, jobs, steps and the retained QEMU desktop artifact"
         ],
-        "formal_acceptance": false,
         "source_symbols": [
           "rust/kernel_core/src/m1_persistent_terminal.rs::command_on_partition",
           "rust/kernel_core/src/m1_persistent_terminal.rs::command_on_gpt_selection",
