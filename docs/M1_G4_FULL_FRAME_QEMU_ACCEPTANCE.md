@@ -94,8 +94,10 @@ retain the original glyph, capture, authority and media assertions.
 ## Automated G4 qualification
 
 The existing complete desktop matrix is still mandatory. During the live
-compositor fault oracle, the actual stopped ring-3 PID4 address space must
-differ from PID1 and both app roots. A separate CI step validates the two
+compositor fault oracle, the harness records the actual stopped ring-3 PID4
+address space and the three existing client roots without weakening shared
+isolation checks. The dedicated G4 CI step requires that these four address
+spaces are distinct. It also validates the two
 fresh normal boots, both apps' authority denials, guarded surfaces, actual
 full-frame timing and framebuffer evidence, PID4-only recovery (including
 stale-authority denial), and all three replacement failure cases. It emits

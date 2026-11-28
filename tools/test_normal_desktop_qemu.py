@@ -1754,14 +1754,6 @@ def client_incarnation_records(raw: bytes) -> tuple[tuple[int, int, int], ...]:
     return records
 
 
-def compositor_role_roots(compositor: int, clients: bytes) -> tuple[int, ...]:
-    """Actual stopped ring-3 PID4 CR3 must not alias PID1 or either app."""
-    roots = tuple(root for _, root, _ in client_incarnation_records(clients))
-    if not 0 < compositor < 1 << 52 or compositor % 4096 or compositor in roots:
-        raise AssertionError("PID4 does not own a separate valid address space")
-    return (*roots, compositor)
-
-
 def verify_preserved_clients(before: bytes, after: bytes, old_roles: bytes, new_roles: bytes) -> None:
     client_incarnation_records(before)
     client_incarnation_records(after)
@@ -2192,9 +2184,7 @@ def transient_service_boot(qemu: str, iso: Path, ovmf: Path, disk: Path,
             raise AssertionError("incomplete PID4 frame changed the visible framebuffer")
         clients_before = bounded_debugger_read(debugger, clients_ledger, 72)
         roles_before = debugger.memory(roles_ledger, 32)
-        role_roots = compositor_role_roots(stopped_root(session), clients_before)
-        evidence.append("G4 process roots PID1 PID2 PID3 PID4: "
-                        + " ".join(f"{root:#x}" for root in role_roots))
+        clients = client_incarnation_records(clients_before)
         if failure is not None:
             pointer, length = compositor_source_extent(debugger, source_words, len(compositor))
             if length != len(compositor) or debugger.memory(pointer, 64) != compositor[:64]:
@@ -2218,6 +2208,12 @@ def transient_service_boot(qemu: str, iso: Path, ovmf: Path, disk: Path,
         pixel_surfaces = surface_guard_records(pixel_layout, 1188)
         verify_debug_surface_guards(debugger, pixel_surfaces, evidence, "PID4 retained pixels")
         cloned_root = stopped_root(session)
+        # Reuse the existing checked client ledger and stopped PID4 CR3.
+        # G4's dedicated receipt verifier owns the additional cross-role
+        # condition; the existing shared isolation assertions stay strict.
+        role_roots = (*(root for _, root, _ in clients), cloned_root)
+        evidence.append("G4 process roots PID1 PID2 PID3 PID4: "
+                        + " ".join(f"{root:#x}" for root in role_roots))
         scratch = app_scratch_records(debugger.memory(scratch_ledger, 64), cloned_root, pages=75)
         verify_app_scratch_mappings(session, scratch, cloned_root, evidence)
         evidence.append(f"PID4 cloned CR3={cloned_root:#x}")

@@ -849,14 +849,6 @@ class NormalDesktopControls(unittest.TestCase):
                  self.frame_cost(), harness.FRAME_PUBLISHED, harness.COMPOSITOR_REPLACED]
         return old + b"\n".join(lines) + b"\n", len(old)
 
-    def test_g4_compositor_cr3_must_not_alias_the_broker_or_either_app(self):
-        clients = struct.pack("<9Q", 1, 0x1000, 1, 2, 0x2000, 2, 3, 0x3000, 0)
-        self.assertEqual(harness.compositor_role_roots(0x4000, clients),
-                         (0x1000, 0x2000, 0x3000, 0x4000))
-        for bad in (0, 0x1000, 0x2000, 0x3000, 0x4001, 1 << 52):
-            with self.subTest(bad=bad), self.assertRaises(AssertionError):
-                harness.compositor_role_roots(bad, clients)
-
     def test_g4_receipt_requires_both_boots_and_all_recovery_modes(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -885,9 +877,10 @@ class NormalDesktopControls(unittest.TestCase):
             with patch.object(harness, "verify_replacement_failure") as fallback:
                 with self.assertRaisesRegex(AssertionError, "separation receipt"):
                     harness.verify_g4_retained_evidence(root, "a" * 40)
-                debugger.write_text(diag + distinct.replace("0x4000", "0x1000"))
-                with self.assertRaisesRegex(AssertionError, "shared address-space"):
-                    harness.verify_g4_retained_evidence(root, "a" * 40)
+                for bad_root in ("0x0", "0x1000", "0x2000", "0x3000", "0x4001", "0x10000000000000"):
+                    debugger.write_text(diag + distinct.replace("0x4000", bad_root))
+                    with self.subTest(bad_root=bad_root), self.assertRaisesRegex(AssertionError, "shared address-space"):
+                        harness.verify_g4_retained_evidence(root, "a" * 40)
                 debugger.write_text(diag + distinct)
                 bad = run / "desktop-1.serial.log"
                 bad.write_bytes(cold.replace(harness.G4_ROLE_DENIALS[1] + b"\n", b"", 1))
