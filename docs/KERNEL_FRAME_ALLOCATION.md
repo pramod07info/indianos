@@ -1,6 +1,36 @@
 # Fallible compositor frame allocation
 
-Implementation task: M1-P2-004 (missing-code), first allocation-policy slice.
+Implementation task: M1-P2-004; related pressure/quotas: M1-P2-011.
+
+## Current completion boundary
+
+Source status below is not an exact-head CI pass or formal gate acceptance.
+PR #825 contains the current follow-up; its required checks must pass before merge.
+
+| Requirement | Current implementation |
+| --- | --- |
+| Fallible owned frame/scratch allocation, physical quota and stale-handle protection | Implemented; merged foundations in #819/#821 |
+| Scratch small-object allocation and adjacent-hole coalescing | Implemented in merged #823 |
+| Bounded quarantine reclamation/retry and pressure diagnostics | Implemented in #825; current-head acceptance pending |
+| Enforced BSP, IRQ and non-reentrant metadata admission | Implemented in #825; rejects AP allocation, does not provide SMP allocation |
+| Failed normal-desktop clone construction ownership | Implemented in #825: bounded caller-owned frame ledger with retirement retry; guest failure injection pending |
+| Heap extent/backing integrity before unsafe operations | Implemented in #825; current-head acceptance pending |
+| User-image data/stack admission budgets and retained failed rollback ownership | Implemented in #825, including existing legacy C parity; not total RSS |
+| Shared supervisor direct-map ownership across normal desktop roots | Implemented in #825: excluded from private cloning, attached with receipt and detached before retirement; guest acceptance pending |
+| Noncontiguous physical backing behind contiguous virtual arenas | Implemented in #825 normal heap; exact-head guest acceptance pending |
+| Image/page-table backend integration | Implemented in #825: BSP admission and bounded physical-pressure recovery; guest acceptance pending |
+| Other kernel consumers/global Rust allocator integration | Not fully implemented |
+| Allocator operation across multiple CPUs and corresponding PMM synchronization | Not implemented |
+| Private launch footprint including image and kernel-clone tables | Implemented in #825: 512-frame admission and post-load consistency checks; guest acceptance pending |
+| Total process RSS accounting/quotas including sharing and growth | Not implemented |
+| System-wide OOM victim/recovery policy | Not implemented |
+| Current-head guest pressure injection, multicore/hardware pressure acceptance | Not verified |
+
+**The first allocation/OOM item is not 100% complete.** A passing host test or
+commit cannot close the unimplemented or unverified requirements above. Subsequent
+sections document implementation details and historical changes; this table is
+the current remaining-work summary. No milestone checkbox or percentage changes.
+
 
 The normal desktop previously reserved 10,240,000 bytes of permanent kernel BSS
 for frame staging. `kernel_buffer::Buffer` now allocates only the requested
@@ -40,7 +70,7 @@ No local build, test binary or QEMU execution was performed for this change,
 per the owner's request. Exact-head GitHub results must be checked before merge;
 adding tests alone does not establish a pass or gate acceptance.
 
-## Remaining allocation work
+## Initial PR #819 limitations (historical)
 
 M1-P2-004 remains incomplete: general-purpose allocation, multiple independent
 kernel consumers, noncontiguous virtual arenas, allocation observability and SMP
@@ -147,3 +177,285 @@ owners/global allocator integration, allocation-pressure diagnostics, SMP-safe
 admission, process RSS quotas and system-wide OOM/recovery policy still require
 implementation and end-to-end acceptance. This change addresses small-object
 allocation/coalescing only; it does not advance a gate or completion percentage.
+
+## Bounded quarantine recovery and pressure diagnostics
+
+`try_allocate` uses `Heap::allocate_recovering`: a quota, metadata or physical OOM
+refusal can trigger one pass over at most 16 quarantined regions. A successful
+physical release authorizes at most one retry. No quarantine means no pass;
+no successful release means no retry. Validation, ownership, mapping and release
+errors do not trigger pressure retry. Live leases are never revoked or scrubbed.
+Persistent refusal still reaches the existing caller's bounded fallback policy.
+
+Retirement and pressure recovery share reclamation. Physical quota remains
+charged until release succeeds. Saturating counters record requests, attempts,
+final failures, cleanup passes, retries, recovered requests, reclaimed bytes and
+peak physical backing. Snapshots distinguish live reserved extents, live leases,
+total/quarantined backing and the requesting owner's backing charge. A recovered
+first attempt counts as two attempts and zero failed requests.
+
+Failure diagnostics reuse the runtime's allocation-free hexadecimal writer.
+They report owner kind/epoch and memory counters without raw memory addresses.
+Reason codes: 1 geometry, 2 quota, 3 physical OOM, 4 mapping, 5 release,
+6 ownership/admission, 7 metadata/generation capacity, 8 alignment, 9 stale lease.
+Each class is reported once, followed by reports at power-of-two failure counts;
+alternating classes cannot cause one report per request indefinitely. Successful
+recovery emits `IndianOS: heap allocation recovered after quarantine reclaim`.
+These are heap counters, not total PMM or process memory statistics.
+
+Host regressions cover recovered quota and global OOM, persistent OOM with one
+retry, a single refused cleanup pass, validation rejection, live-neighbor bytes,
+stale-token rejection, counter saturation and alternating-error report bounds.
+They use a separate host failure backend and do not prove live guest OOM or
+physical memory-pressure acceptance. No local builds/tests/QEMU run; exact-head
+GitHub checks remain required before owner merge.
+
+## Enforced heap CPU admission
+
+Normal boot binds an independent heap instance of the existing non-spinning
+`RetirementGate` immediately after PMM self-test. It reuses the existing x2APIC/
+CPUID identity helper; no second CPU discovery or locking implementation exists.
+Every production heap metadata/backend access acquires that exact gate before
+creating its mutable reference. Unbound, wrong-CPU, IRQ-enabled and nested entry
+are rejected. The permit releases on return; there is no spin while an interrupted
+owner holds the gate. Rebinding to another CPU is refused. Frame/scratch creation
+and retirement check admission before accessing their retained lease cells.
+
+Admissions rejected before table access cannot safely increment heap counters or
+read a diagnostic snapshot; they return an ownership/admission error directly.
+A lease released outside its supported admission context keeps tracked ownership
+rather than touching PMM unsafely. Supported allocation/free callers stay on the
+registered BSP with IRQs masked; this is enforced serialization, not an SMP
+allocator, per-CPU cache or support for allocating in an IRQ handler.
+
+Host negative controls use the same guard wrapper to prove that wrong-core,
+IRQ-enabled, unbound and reentrant calls do not execute their protected closure.
+Nested entry through the real heap adapter is refused before touching the host
+RefCell. The normal-desktop QEMU harness requires the boot admission receipt and
+rejects reinitializing it during compositor-only recovery. Physical multicore
+qualification and broader concurrent PMM use remain separate requirements.
+
+## User-image staging rollback ownership
+
+`user_image::stage` now records each newly allocated data frame before calling
+fallible access/mapping callbacks. An unmapped frame whose rollback release
+fails remains in the existing ownership list with virtual address zero. The
+retryable image destructor already understands that representation. Successful
+rollback clears the reserved entry and restores the previous page count. A
+failed rollback stays charged against the fixed 128-data-page image capacity.
+No UserImage layout or public C ABI changes are needed.
+
+The previous error paths ignored a refused release and lost the only record of
+the data frame. Regressions cover access failure plus refused release, conflicting
+mapping plus refused release, successful rollback with no extra metadata charge,
+and image-capacity rejection before another allocation. They verify eventual
+release without double frees using the existing host backend. This is ownership
+conservation on staging failure, not general process RSS quotas, demand paging
+or a system-wide OOM killer.
+
+## Extent and backing integrity before unsafe operations
+
+Heap operations now verify their bounded external metadata before allocation,
+release, sharing receipts or quarantine reclamation. Checks include valid owner
+charges and generations; aligned, nonempty in-bounds extents; disjoint live
+leases; disjoint physical and virtual backing ranges; and absence of live leases
+in quarantine. Invalid metadata returns `Integrity` (diagnostic reason 10) before
+scrub or backend allocation/release. It is never treated as retryable pressure.
+Diagnostic summation of invalid live extents saturates rather than overflowing.
+
+Corruption regressions deliberately inject overflowing offsets, invalid region
+indices/generations, overlapping leases/backings and live quarantine. They verify
+that allocator/backend calls and neighboring bytes remain untouched, then restore
+metadata to verify ordinary cleanup. This bounds checks allocator metadata; it
+is not a claim that arbitrary kernel memory corruption is recoverable. Unsupported
+corruption stays fail-closed instead of guessing which physical pages are owned.
+
+## Image data/stack admission budgets
+
+`indianos_user_image_load_with_limit` is an additive trusted-kernel C API. It
+accepts a 1..128 data-page limit and checks ELF/BSS plus stack requirements with
+checked arithmetic before creating the root or invoking allocation callbacks.
+The existing loader delegates with its original 128-page ceiling; UserImage
+layout and existing ABI signatures remain unchanged. Failed preflight leaves
+image/backend ownership untouched, and refused staging rollback still counts
+against the image's fixed ownership capacity.
+
+Normal desktop now applies an explicit 64-page data/stack admission limit to
+PID1, which has no app pixel canvas; Files, Terminal and compositor retain 128.
+Unknown desktop roles are refused. Existing read-only inspection of the earlier
+unchanged desktop-init ELF showed seven segment pages; with its 16-page stack
+this fits the 64-page limit. No image was rebuilt or executed locally. Fresh
+exact-head guest acceptance remains required. The normal-desktop harness requires
+`IndianOS: desktop broker image limit 64 pages enforced` and rejects repeating
+it during compositor-only recovery, where PID1 must remain alive.
+
+Rust preflight tests cover exact/exceeded budgets, invalid limits, reversed
+ranges and excessive segment counts. Existing C loader integration now checks
+that over-budget rejection invokes zero allocation callbacks, exact-limit loading
+succeeds, live-image reload refuses, cleanup frees ownership, and the legacy API
+continues to work. The desktop role policy has a separate negative-control test.
+
+This admission policy covers image data/BSS and stack frames, not page tables,
+shared mappings, kernel service buffers, runtime growth or total RSS. It does not
+replace the still-pending process RSS/system-wide OOM requirements.
+
+The legacy C loader is still built by existing parity/host checks. Its existing
+implementation now exposes the same budgeted entry point and preserves staging
+rollback ownership with retryable teardown, rather than leaving the additive
+header unresolved in C builds. The shared C integration fixture also injects a
+refused access/release and verifies retained ownership followed by clean retry;
+it exercises both Rust and legacy C implementations in their existing CI targets.
+
+
+## Private process launch footprint, including page tables
+
+The normal desktop admits each process against a 512-frame private footprint
+before loader/clone allocation. `required_private_frames` reuses the ELF planner
+and counts data/BSS/stack frames plus the detached root and distinct PML4/PDPT/PD
+prefixes needed by its 4-KiB mappings. Pages sharing table prefixes are counted
+once; unmapped guard holes allocate no extra data. The existing 64/128 data-page
+policy is independently enforced.
+
+`paging::required_table_frames` performs a bounded read-only walk matching the
+existing kernel-half clone traversal, including its private root and child tables,
+but excluding borrowed data and huge leaves. It does not allocate, map, release,
+switch CR3 or change the clone ownership policy. Malformed/unreadable tables or
+excessive traversal fail admission. Checked addition combines this clone count
+with the detached-image footprint; over-budget processes are refused before any
+new image/clone frames are requested. After staging and cloning, actual image
+page count and table traversal plus CloneResult.table_count must match the
+preflight and fit the same budget before process readiness.
+
+The normal-desktop QEMU harness requires the PID1 receipt `IndianOS: desktop
+private frame budget 512 enforced` and forbids repeating it during compositor-only
+recovery. Host regressions check table-count/clone parity without allocation,
+unreadable/invalid entries, shared prefixes, guard-hole exclusion, exact budget
+bounds and overflow. No local build/test execution or guest pass is claimed.
+
+This is private launch-resource admission, not total RSS enforcement. Borrowed
+kernel data, shared mappings, service-owned heap arenas and runtime growth are
+separate resource domains. There is no general memory-growth syscall or shared
+memory lifecycle here; future implementations must charge those resources under
+an explicit policy. Noncontiguous backing, cross-CPU allocation and system-wide
+OOM/victim recovery remain unfinished requirements.
+
+
+## Failed clone construction retains raw frame ownership
+
+The normal desktop clone path now uses a caller-owned 512-entry ledger, matching
+its private-frame admission ceiling. The existing recursive clone routine records
+each allocated table frame before access/initialization can fail. On success the
+ledger clears and normal CloneResult tree ownership applies. On failure the
+inactive result remains empty; cleanup releases explicitly recorded frames
+without walking partial or uninitialized tables. Refused releases remain in the
+Task ledger and prevent another construction from overwriting that ownership.
+
+Task retirement retries these entries before releasing the image or reporting
+reclaimed resources. Cleanup receives the current trusted backend, avoiding a
+saved pointer to a previous invocation's DirectMap stack context. Source/borrowed
+data frames are never part of the construction ledger. The CloneResult/public C
+ABI is unchanged; historical clone entry points keep their existing behavior.
+The tracked path is the normal Rust desktop path, not a claim of upgraded legacy
+C clone-failure behavior.
+
+Host regressions cover multiple refused construction releases, refused ledger
+overwrite, unreadable/uninitialized destination cleanup without table access,
+insufficient ledger capacity before allocation, successful ownership transfer
+and eventual cleanup while preserving source tables. No host assertion is live
+PMM fault-injection or physical acceptance; current-head GitHub verification and
+that broader acceptance remain pending.
+
+
+## Normal-desktop image/table PMM pressure policy
+
+The normal desktop's existing VMM/clone allocation callbacks now acquire the
+heap's exact BSP/IRQ/non-reentrant admission before touching PMM. Their first
+failed physical-frame allocation may reclaim quarantined heap backing, followed
+by at most one retry only after an actual release. No reclaimable backing means
+one attempt; persistent refusal is returned to the existing image/clone startup
+and service recovery policy. Live heap leases are never evicted. Caller output
+storage is written only on successful allocation, and release callbacks use the
+same admission gate. Other experimental profiles retain their existing path.
+
+Physical frame requests have separate saturating request, attempt, failure,
+retry and recovered-request counters so they are not misreported as heap-arena
+allocations. Bounded diagnostics report their failure class and heap quarantine
+charge. Invalid heap metadata prevents a PMM request, rather than attempting
+reclamation through corrupt ownership. The existing backend remains PMM; host
+fault closures exercise retry control flow without substituting for guest PMM.
+
+Added regressions cover recovered image-frame pressure, no-quarantine refusal
+with exactly one attempt, preservation of a live neighboring payload and rejection
+of corrupt heap state before a PMM attempt. The existing normal desktop boot,
+private-frame-budget and recovery harnesses exercise the real callback path when
+run in GitHub Actions. No live pressure fault injection or physical pass is
+claimed. This is a bounded reclaim/reject policy for current image/table/heap
+callers, not a general OOM killer, shared-memory RSS policy or SMP allocator.
+
+
+## Shared supervisor direct-map ownership
+
+Normal desktop process roots now borrow the original kernel root's direct-map
+PML4 subtree instead of deep-cloning that subtree. The slot comes from the
+validated boot HHDM offset. The existing clone walker and private-table preflight
+both exclude the borrowed slot; other upper mappings remain privately cloned.
+Attachment requires an empty destination slot and a valid non-huge source table,
+forces PML4 supervisor privilege, refuses self/owned-root aliases, and records
+the exact borrowed entry in Task. No lower user mappings are shared.
+
+Retirement detaches the borrowed entry before recursive clone release. The
+receipt comparison tolerates only the hardware Accessed bit; a changed address
+or privilege/attribute flag fails closed. Failed later private-table release can
+retry without traversing or freeing the original kernel's borrowed subtree.
+Only private tables contribute to the process launch frame budget. CloneResult
+and legacy C ABI remain unchanged; this is the normal Rust desktop path.
+
+Host tests prove shared lookup visibility after a source-leaf change, supervisor
+PML4 privilege, reduced private table count, preservation of source tables after
+clone release, occupied-slot refusal and receipt mismatch rejection. The live
+normal-desktop harness requires the PID1 shared-map receipt and forbids repeating
+it during compositor-only recovery. These are pending exact-head guest checks;
+host lookup tests do not prove TLB invalidation behavior for live mapping updates.
+
+This removes the privately copied direct-map obstacle to a future contiguous
+virtual arena backed by scattered PMM frames. It does not itself implement that
+arena, scatter allocation, multi-CPU shootdowns or global allocator integration.
+The current buffer backend still requires physically contiguous runs. Single-BSP
+admission and inactive-root attach/detach remain mandatory.
+
+## Noncontiguous normal-heap backing
+
+The normal Rust heap now uses a contiguous virtual arena backed by separately
+allocated PMM frames. This supersedes the historical contiguous-backend status
+above. Boot reserves one unused directory in the shared direct-map subtree,
+constructs its supervisor, writable, NX, non-global tables privately, and publishes
+only after initialization completes. Sixteen slots have a 16 MiB virtual stride;
+each admits at most 2,500 data pages. The 129 infrastructure frames remain owned
+for the boot lifetime and are reserved before desktop session leak baselines.
+Opaque backing keys are distinct from physical addresses; scattered buffers
+must not be passed as contiguous DMA runs. Existing PMM contiguous APIs remain.
+
+Allocation records each frame before mapping it. Failed construction retains
+unreleased frames for bounded reclamation. Retirement validates owned mappings,
+scrubs through the direct map, unmaps with local invalidation, and retains exact
+ownership on a refused PMM release. A retry never dereferences the unmapped
+buffer address. Pending backend pages have a separate pressure counter.
+
+Six host cases cover fragmented backing, partial allocation rollback, refused
+release retry, foreign mappings and pointers, unpublished initialization failure,
+and bounds/stale keys/access failures. The normal-desktop QEMU harness requires
+the new arena startup receipt. No local build, host test or QEMU run was performed;
+GitHub exact-head results are required before acceptance. This remains a BSP-only
+allocator under the existing heap admission gate. Cross-CPU shootdowns, PCID
+no-flush reuse, broader kernel consumers, total process RSS quotas and system-wide
+OOM policy remain outside this implementation. No milestone is newly accepted.
+
+### Retiring buffers cannot be reused
+
+Buffer marks retirement before invoking the backend discard operation. If the
+backend unmaps a span and then refuses a physical release, the old owner and
+charge remain for cleanup, but even a same-size prepare must first finish that
+cleanup. Successful cleanup resets the state before a fresh allocation. Foreign
+owners remain rejected. A host regression covers refusal, same-size and foreign
+owner requests, then successful cleanup and reallocation. It is added for GitHub
+execution; no local build or test was run.

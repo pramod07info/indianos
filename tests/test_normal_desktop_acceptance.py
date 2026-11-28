@@ -34,7 +34,7 @@ class NormalDesktopControls(unittest.TestCase):
             harness.verify_lease_commit(good, 1)
 
     def test_positioned_commit_requires_one_fresh_ordered_native_write_and_cursor_proof(self):
-        records = (harness.POSITIONED_WRITE, harness.LEASE_CURSOR,
+        records = (harness.DESCRIPTOR_SYNC, harness.POSITIONED_WRITE, harness.LEASE_CURSOR,
                    harness.LEASE_REFRESH, b"IndianOS user: " + harness.NAMED_COMMIT.encode())
         good = b"\n".join(records) + b"\n"
         harness.verify_lease_commit(good, 0, positioned=True)
@@ -43,7 +43,7 @@ class NormalDesktopControls(unittest.TestCase):
                         good.replace(marker, b"stale " + marker), good[:-1]):
                 with self.subTest(marker=marker, trace=bad), self.assertRaises(AssertionError):
                     harness.verify_lease_commit(bad, 0, positioned=True)
-        for order in ((1, 0, 2, 3), (0, 2, 1, 3), (0, 1, 3, 2)):
+        for order in ((1, 0, 2, 3, 4), (0, 2, 1, 3, 4), (0, 1, 3, 2, 4), (0, 1, 2, 4, 3)):
             with self.assertRaises(AssertionError):
                 harness.verify_lease_commit(b"\n".join(records[i] for i in order) + b"\n",
                                            0, positioned=True)
@@ -52,7 +52,7 @@ class NormalDesktopControls(unittest.TestCase):
         with self.assertRaises(AssertionError):
             harness.verify_lease_commit(good, 0)
         denial = harness.LEASE_DENIED + b"\n"
-        for marker in (harness.POSITIONED_WRITE, harness.LEASE_CURSOR):
+        for marker in (harness.DESCRIPTOR_SYNC, harness.POSITIONED_WRITE, harness.LEASE_CURSOR):
             with self.assertRaises(AssertionError):
                 harness.verify_lease_denial(b"disk", b"disk", denial + marker + b"\n", 0)
 
@@ -863,6 +863,13 @@ class NormalDesktopControls(unittest.TestCase):
         premature = trace.replace(shared, b"").replace(allocation, shared + allocation)
         with self.assertRaises(AssertionError):
             harness.verify_transient_restart(premature, since)
+
+    def test_compositor_recovery_cannot_reinitialize_heap_cpu_admission(self):
+        trace, since = self.transient_trace()
+        marker = harness.COMPOSITOR_PREPARED + b"\n"
+        restarted = trace.replace(marker, b"IndianOS: kernel heap BSP admission ready\n" + marker)
+        with self.assertRaises(AssertionError):
+            harness.verify_transient_restart(restarted, since)
 
     def test_transient_restart_accepts_fresh_execution_and_later_clean_reap(self):
         trace, since = self.transient_trace()

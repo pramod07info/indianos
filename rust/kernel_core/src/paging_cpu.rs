@@ -93,6 +93,17 @@ fn same(b:&Backend,old:u64,new:u64,va:u64)->bool{
  unsafe{paging_lookup(b,old,va,&mut a,&mut af)&&
  paging_lookup(b,new,va,&mut z,&mut zf)&&a==z&&af==zf}
 }
+/// Read-only translation through the validated boot direct map. No allocation
+/// callback is invoked. Used before PMM startup by the isolated AP test.
+#[cfg(feature="test-r118-ap-ack")]
+pub(crate) unsafe fn mapped_physical(root:u64,address:u64)->Option<(u64,u64)>{
+ let mut offset=0;if !unsafe{boot_hhdm_offset(&mut offset)}{return None;}
+ let mut map=DirectMap{offset};
+ let backend=Backend{allocate:Some(allocate),release:Some(release),access:Some(access),
+  context:(&mut map as *mut DirectMap).cast()};
+ let (mut physical,mut flags)=(0,0);
+ unsafe{paging_lookup(&backend,root,address,&mut physical,&mut flags)}.then_some((physical,flags))
+}
 /// # Safety
 /// QEMU-only: BSP ring0, masked IRQs, no SMP CR3 users; caller keeps
 /// Limine root/HHDM alive. Original CR3 restored before freeing clone.

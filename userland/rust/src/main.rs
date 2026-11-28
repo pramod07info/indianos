@@ -9,6 +9,10 @@
 
 use core::arch::asm;
 use core::panic::PanicInfo;
+#[cfg(feature="test-fpu-context")]
+mod desktop_fpu_probe;
+#[cfg(feature="test-blocking-lock")]
+mod desktop_lock_probe;
 #[cfg(feature="normal-init")]
 mod bootstrap;
 #[cfg(any(feature="shell",feature="interactive",feature="r026-shell"))]
@@ -62,20 +66,83 @@ fn exit(status:u64)->! {
     let _=call(2,status,0);
     loop{unsafe{asm!("pause", options(nomem,nostack,preserves_flags))}}
 }
-#[inline(never)]
-fn spin_cpu_bound(){
-    // Not a Rust loop: rustc must not optimize away a test that relies on
-    // actual interrupted CPU work. Same work count as prior assembly app.
-    let mut counter:u64=400_000_000;
-    unsafe{
-        asm!(
-            "2:", "dec {counter}", "jnz 2b",
-            counter=inout(reg) counter,
-            options(nostack,nomem)
-        );
+// Separate CPU-bound timer fixture. No yield/syscall occurs while seeded
+// x87/XMM/control state is live; only the hardware timer can switch tasks.
+#[cfg(all(feature="test-preempt-fpu",any(feature="preempt-a",feature="preempt-b")))]
+core::arch::global_asm!(r#"
+.text
+.global indianos_preempt_fpu_spin
+.type indianos_preempt_fpu_spin,@function
+indianos_preempt_fpu_spin:
+    subq $64, %rsp
+    fnstcw 0(%rsp)
+    stmxcsr 4(%rsp)
+    movq %rdi, 8(%rsp)
+    movl %edi, %eax
+    andl $3, %eax
+    shll $10, %eax
+    orl $0x37f, %eax
+    movw %ax, 48(%rsp)
+    movl %edi, %eax
+    andl $3, %eax
+    shll $13, %eax
+    orl $0x1f80, %eax
+    movl %eax, 52(%rsp)
+    fninit
+    fldcw 48(%rsp)
+    ldmxcsr 52(%rsp)
+    fildq 8(%rsp)
+    movq 8(%rsp), %xmm0
+    movq 8(%rsp), %xmm15
+    movl $400000000, %ecx
+.global indianos_preempt_fpu_busy_begin
+indianos_preempt_fpu_busy_begin:
+2:  decq %rcx
+    jnz 2b
+.global indianos_preempt_fpu_busy_end
+indianos_preempt_fpu_busy_end:
+    fistpq 16(%rsp)
+    movq %xmm0, 24(%rsp)
+    movq %xmm15, 32(%rsp)
+    fnstcw 40(%rsp)
+    stmxcsr 44(%rsp)
+    movq 8(%rsp), %rax
+    cmpq %rax, 16(%rsp)
+    jne 4f
+    cmpq %rax, 24(%rsp)
+    jne 4f
+    cmpq %rax, 32(%rsp)
+    jne 4f
+    movzwl 48(%rsp), %eax
+    cmpw %ax, 40(%rsp)
+    jne 4f
+    movl 52(%rsp), %eax
+    cmpl %eax, 44(%rsp)
+    jne 4f
+    movl $1, %eax
+    jmp 5f
+4:  xorl %eax, %eax
+5:  fninit
+    fldcw 0(%rsp)
+    ldmxcsr 4(%rsp)
+    addq $64, %rsp
+    retq
+.size indianos_preempt_fpu_spin, .-indianos_preempt_fpu_spin
+"#,options(att_syntax));
+#[cfg(all(feature="test-preempt-fpu",any(feature="preempt-a",feature="preempt-b")))]
+unsafe extern "C"{fn indianos_preempt_fpu_spin(seed:u64)->u64;}
+#[cfg(any(feature="preempt-a",feature="preempt-b"))]
+fn spin_cpu_bound(seed:u64)->bool{
+    #[cfg(feature="test-preempt-fpu")]
+    {unsafe{indianos_preempt_fpu_spin(seed)==1}}
+    #[cfg(not(feature="test-preempt-fpu"))]
+    {
+        let _=seed;let mut counter:u64=400_000_000;
+        unsafe{asm!("2:","dec {counter}","jnz 2b",counter=inout(reg)counter,options(nostack,nomem));}
+        let _=counter;true
     }
-    let _=counter;
 }
+
 
 
 #[cfg(any(feature="ipc-a",feature="ipc-b"))]
@@ -847,6 +914,7 @@ fn files_shared_content(data:&mut [u8;256])->usize{
         if file_handle_call(34,b"",token,0,data,0)!=0||
            file_handle_call(35,b"",token,0,data,0)!=u64::MAX{exit(254);}
         if (abi>>32)&4==0||file_handle_call(38,b"",token,0o777,data,0)!=u64::MAX{exit(254);}
+        if (abi>>32)&64==0||file_handle_call(27,b"",token,0,data,0)!=u64::MAX{exit(254);}
         write(b"desktop Files denied unauthorized permission mutation");
     }
     let count=file_handle_call(2,b"",token,0,data,72);
@@ -1052,7 +1120,7 @@ fn desktop_named_command(command:terminal_fs::Command){
             let abi=file_handle_call(37,b"",0,0,&mut data,0);
             // Feature discovery is additive; never emulate this request by
             // replacing the file or changing its descriptor cursor.
-            if abi&0xffff!=1||(abi>>16)&0xffff!=64||(abi>>32)&48!=48{
+            if abi&0xffff!=1||(abi>>16)&0xffff!=64||(abi>>32)&112!=112{
                 suite_send(3,b"E");return;
             }
             let path_len=name.path(&mut path);
@@ -1060,9 +1128,14 @@ fn desktop_named_command(command:terminal_fs::Command){
             if token==0||token==u64::MAX{suite_send(3,b"E");return;}
             data[..len as usize].copy_from_slice(&bytes[..len as usize]);
             let count=file_handle_call(26,b"",token,offset as u64,&mut data,len as usize);
+            // fsync is descriptor-bound; success requires the real device
+            // barrier, not merely CLOSE or a successful metadata write.
+            let synced=count==len as u64&&
+                file_handle_call(27,b"",token,0,&mut data,0)!=u64::MAX;
             // Even a rejected write must release its cached descriptor.
             let closed=file_handle_call(5,b"",token,0,&mut data,0);
-            if count!=len as u64||closed!=0{suite_send(3,b"E");return;}
+            if !synced||closed!=0{suite_send(3,b"E");return;}
+            write(b"desktop broker native descriptor fsync completed");
             write(b"desktop broker positioned write committed");0
         },
         Command::Put{name,bytes,len}=>{
@@ -2334,9 +2407,7 @@ fn vfs_guest()->!{
         }
         _=>exit(253)
     }
-    if call(5,1,0)!=0{exit(254);}
-    write(b"R031.3 allowlisted worker started without VFS privileges");
-    yield_now();
+    native_child_wait();
     if call(17,2,0)!=1{exit(255);}
     if stage==4{
         if call(31,4,0)!=0{exit(213);}
@@ -2345,8 +2416,45 @@ fn vfs_guest()->!{
     write(b"R031.3 verified persistent hierarchical storage and ring3 isolation");
     exit(0);
 }
+#[cfg(feature="r031-vfs-init")]
+fn native_child_wait(){
+    let mut status=[0xa5u8;64];let mut request=[0u8;64];
+    request[..4].copy_from_slice(&[1,0,64,0]);request[4..8].copy_from_slice(&2u32.to_le_bytes());
+    request[24..32].copy_from_slice(&(status.as_mut_ptr() as u64).to_le_bytes());
+    if call(40,0,request.as_ptr() as u64)!=64||status[..4]!=[1,0,64,0]{write(b"native child wait initial query rejected");exit(252);}
+    let generation=u64::from_le_bytes(status[8..16].try_into().unwrap());
+    let Some(stale)=generation.checked_add(1)else{exit(252);};
+    let original=status;request[8..16].copy_from_slice(&stale.to_le_bytes());
+    if call(40,0,request.as_ptr() as u64)!=u64::MAX||status!=original{write(b"native child wait stale query changed output");exit(252);}
+    request[8..16].copy_from_slice(&generation.to_le_bytes());
+    request[16..24].copy_from_slice(&1u64.to_le_bytes());
+    if call(40,1,request.as_ptr() as u64)!=0||status!=original{write(b"native child wait prelaunch timeout rejected or changed output");exit(252);}
+    write(b"native PID1 child wait timed out before launch without consuming status");
+    if call(5,1,0)!=0{exit(254);}
+    write(b"R031.3 allowlisted worker started without VFS privileges");
+    request[16..24].copy_from_slice(&32u64.to_le_bytes());
+    let destination=status.as_mut_ptr() as u64;
+    // USER_TOP - 64 KiB stack - one guard page, never a mapped stack slot.
+    request[24..32].copy_from_slice(&0x0000_7fff_effe_f000u64.to_le_bytes());
+    if call(40,1,request.as_ptr() as u64)!=u64::MAX||status!=original{exit(252);}
+    request[24..32].copy_from_slice(&destination.to_le_bytes());
+    request[63]=1;
+    if call(40,1,request.as_ptr() as u64)!=u64::MAX||status!=original{exit(252);}
+    request[63]=0;
+    if call(40,1,request.as_ptr() as u64)!=64||
+       status[4..8]!=2u32.to_le_bytes()||status[8..16]!=generation.to_le_bytes()||
+       status[16..20]!=4i32.to_le_bytes()||status[20..24]!=1u32.to_le_bytes()||
+       status[24..].iter().any(|&b|b!=0){exit(252);}
+    let completed=status;
+    if call(40,1,request.as_ptr() as u64)!=u64::MAX||status!=completed{exit(252);}
+    write(b"native PID1 generation-bound child wait completed after cleanup; replay denied");
+}
 #[no_mangle]
 pub extern "C" fn _start()->!{
+    #[cfg(feature="test-blocking-lock")]
+    desktop_lock_probe::verify();
+    #[cfg(feature="test-fpu-context")]
+    desktop_fpu_probe::verify();
     #[cfg(feature="desktop-compositor")]
     desktop_compositor();
     #[cfg(feature="r031-vfs-init")]
@@ -2371,6 +2479,11 @@ pub extern "C" fn _start()->!{
             d[32..40].copy_from_slice(&1u64.to_le_bytes());
             if call(33,1,d.as_ptr() as u64)!=u64::MAX{exit(219);}
             write(b"R031.7 PID2 denied private VFS file via handle syscall");
+            let mut status=[0xa5u8;64];d.fill(0);d[..4].copy_from_slice(&[1,0,64,0]);
+            d[4..8].copy_from_slice(&2u32.to_le_bytes());
+            d[24..32].copy_from_slice(&(status.as_mut_ptr() as u64).to_le_bytes());
+            if call(40,0,d.as_ptr() as u64)!=u64::MAX||status!=[0xa5;64]{exit(219);}
+            write(b"native PID2 denied supervisor process query");
         }
         write(b"R030.2 installed native ELF ran in isolated PID2 ring3");
         exit(0);
@@ -2587,14 +2700,18 @@ pub extern "C" fn _start()->!{
     #[cfg(feature="preempt-a")]
     {
         write(b"M009 timer task A started");
-        spin_cpu_bound();
+        if !spin_cpu_bound(1){exit(126);}
+        #[cfg(feature="test-preempt-fpu")]
+        write(b"R024 timer task A x87 SSE control and registers retained");
         write(b"M009 timer task A finished");
         exit(0);
     }
     #[cfg(feature="preempt-b")]
     {
         write(b"M009 timer task B started");
-        spin_cpu_bound();
+        if !spin_cpu_bound(2){exit(126);}
+        #[cfg(feature="test-preempt-fpu")]
+        write(b"R024 timer task B x87 SSE control and registers retained");
         write(b"M009 timer task B finished");
         exit(0);
     }

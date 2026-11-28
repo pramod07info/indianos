@@ -139,6 +139,8 @@ unsafe extern "C" {
     #[cfg(feature="normal-desktop")]
     fn x86_64_input_spurious_interrupt();
     fn x86_64_user_fault_handle(vector:u64,cs:u64,error:u64,cr2:u64);
+    #[cfg(feature="normal-desktop")]
+    fn x86_64_user_page_fault_recover(vector:u64,cs:u64,error:u64,cr2:u64)->bool;
     fn serial_write(message:*const c_char);
 }
 fn log(message:&'static [u8]){unsafe{serial_write(message.as_ptr().cast())}}
@@ -183,6 +185,11 @@ pub unsafe extern "C" fn x86_64_exceptions_init()->bool{
             install_gate(i,handler,if i==8 {1} else {0},INTERRUPT_GATE);
         }
         install_gate(0x80,x86_64_user_interrupt as usize,0,USER_GATE);
+        #[cfg(feature="test-r136-nic-irq")]
+        {
+            unsafe extern "C" {fn x86_64_nic_irq11();}
+            install_gate(0x2b,x86_64_nic_irq11 as *const () as usize,0,INTERRUPT_GATE);
+        }
         #[cfg(any(feature="test-irq-keyboard",feature="normal-desktop"))]
         install_gate(0x21,x86_64_keyboard_interrupt as usize,0,INTERRUPT_GATE);
         #[cfg(feature="normal-desktop")]
@@ -267,11 +274,13 @@ fn halt()->!{loop{unsafe{asm!("cli; hlt",options(nostack,nomem))}}}
 /// Entry assembly provides a readable CPU exception frame and only calls
 /// this function from the trusted kernel exception stub (never from user).
 #[no_mangle]
-pub unsafe extern "C" fn x86_64_exception_dispatch(context:*const ExceptionContext)->! {
+pub unsafe extern "C" fn x86_64_exception_dispatch(context:*const ExceptionContext) {
     let Some(ctx)=(unsafe{context.as_ref()}) else {halt()};
     let cr2=if ctx.vector==14 {
         let value:u64;unsafe{asm!("mov {}, cr2",out(reg)value,options(nomem,nostack))};value
     } else {0};
+    #[cfg(feature="normal-desktop")]
+    if unsafe{x86_64_user_page_fault_recover(ctx.vector,ctx.cs,ctx.error_code,cr2)}{return;}
     unsafe{x86_64_user_fault_handle(ctx.vector,ctx.cs,ctx.error_code,cr2);}
     log(b"IndianOS: FATAL CPU exception vector=\0");hex(ctx.vector);
     log(b" error=\0");hex(ctx.error_code);

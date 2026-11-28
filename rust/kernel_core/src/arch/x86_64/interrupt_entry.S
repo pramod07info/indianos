@@ -25,13 +25,49 @@ x86_64_load_gdt:
 .type x86_64_isr_common, @function
 x86_64_isr_common:
     cli
-    movq %rsp, %rdi
+    cld
+    pushq %rax
+    pushq %rbx
+    pushq %rcx
+    pushq %rdx
+    pushq %rsi
+    pushq %rdi
+    pushq %rbp
+    pushq %r8
+    pushq %r9
+    pushq %r10
+    pushq %r11
+    pushq %r12
+    pushq %r13
+    pushq %r14
+    pushq %r15
+    leaq 120(%rsp), %rdi
+    movq %rsp, %r12
     andq $-16, %rsp
+    call indianos_fx_enter_kernel
     call x86_64_exception_dispatch
-2:
-    cli
-    hlt
-    jmp 2b
+    /* Only a recovered CPL3 demand fault returns. Terminal exceptions
+     * retain Rust's existing fault retirement/halt path. */
+    movq %r12, %rsp
+    call indianos_fx_enter_user
+    popq %r15
+    popq %r14
+    popq %r13
+    popq %r12
+    popq %r11
+    popq %r10
+    popq %r9
+    popq %r8
+    popq %rbp
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    popq %rcx
+    popq %rbx
+    popq %rax
+    btrq $16, 32(%rsp)  /* normalize CPU-generated RF only */
+    addq $16, %rsp      /* vector + error */
+    iretq
 .size x86_64_isr_common, . - x86_64_isr_common
 
 .global x86_64_isr_0

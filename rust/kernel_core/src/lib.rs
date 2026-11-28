@@ -126,6 +126,10 @@ pub mod capability;
 pub mod vfs_path;
 /// Allocation-free process event FIFO and teardown cleanup.
 pub mod process_events;
+#[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
+mod process_wait;
+#[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
+mod lock_wait;
 /// Bounded atomic exit/fault retirement across three kernel-local policy tables.
 /// Scheduler, socket table, IRQ and SMP integration remain separately gated.
 pub mod process_retirement_txn;
@@ -134,6 +138,10 @@ pub mod retirement_gate;
 pub mod nic_rx_fence;
 /// R131 exact-generation one-AP release/acquire rendezvous (not APIC IPI).
 pub mod smp_lifecycle_fence;
+#[cfg(any(feature="normal-desktop",feature="test-r118-ap-ack"))]
+mod tlb;
+#[cfg(feature="test-r118-ap-ack")]
+mod tlb_probe;
 // M1: authenticated ring3-service policy using the already implemented
 // checksummed, sector-backed HierVfs; host remount integration acceptance.
 // Does not enable formatting or physical-device access in ordinary boot.
@@ -286,6 +294,8 @@ pub mod network;
 // kernel boot/PMM externs. R028 QEMU enables it explicitly.
 #[cfg(all(target_arch="x86_64", feature="test-r028-network"))]
 pub mod virtio_net;
+#[cfg(feature="test-r136-nic-irq")]
+mod nic_interrupt;
 /// Authenticated process IPC and bounded RAM filesystem service (R025).
 pub mod r025_services;
 pub mod quantum;
@@ -306,6 +316,12 @@ mod compositor_pixels;
 mod kernel_buffer;
 #[cfg(feature="normal-desktop")]
 mod kernel_heap;
+#[cfg(feature="normal-desktop")]
+mod kernel_arena;
+#[cfg(feature="normal-desktop")]
+mod zero_page;
+#[cfg(any(feature="normal-desktop",all(feature="preempt",feature="cpu-entry")))]
+mod fpu_context;
 /// R029.1 authenticated per-process window grants and bounded event queue.
 pub mod gui_broker;
 #[cfg(feature="test-r031-supervisor")]
@@ -523,7 +539,9 @@ pub unsafe extern "C" fn indianos_process_fault(
     p: *mut Process, status: u64, vector: u64, error: u64, address: u64
 ) -> bool {
     let Some(p) = (unsafe { p.as_mut() }) else { return false; };
-    if p.state != RUNNING || p.address_space_root == 0 || vector == 0 { return false; }
+    // Exception vector zero is the architectural divide error (#DE), not an
+    // absent fault. Vectors 32 and above belong to interrupt dispatch instead.
+    if p.state != RUNNING || p.address_space_root == 0 || vector > 31 { return false; }
     p.state = FAULTED;
     p.exit_status = status;
     p.fault_vector = vector;

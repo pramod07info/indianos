@@ -4,8 +4,8 @@
 const PAGE: usize = 4096;
 pub(crate) const FRAME_QUOTA: usize = 1600 * 1600 * 4;
 
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Error { Geometry, Quota, OutOfMemory, Mapping, Release, Owner, Metadata, Alignment, Stale }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Error { Geometry, Quota, OutOfMemory, Mapping, Release, Owner, Metadata, Alignment, Stale, Integrity }
 
 pub(crate) fn allocation_size(bytes: usize, quota: usize) -> Result<(usize, u32), Error> {
     if bytes == 0 { return Err(Error::Geometry); }
@@ -15,14 +15,28 @@ pub(crate) fn allocation_size(bytes: usize, quota: usize) -> Result<(usize, u32)
     Ok((rounded, pages))
 }
 
-/// Backend owns the mapping until release succeeds. Allocation must return
-/// exclusive, u32-aligned, writable RAM covering every requested page.
+/// Opaque backing key is distinct from an optional contiguous physical span.
+/// A scattered virtual arena must never be treated as one physical DMA run.
+#[derive(Debug,PartialEq,Eq)]
+pub(crate) struct Backing{pub key:u64,pub physical:Option<u64>,pub pointer:*mut u8}
+/// # Safety: allocate returns exclusive mapped writable bytes. A false release
+/// keeps mappings valid unless discard is overridden to own partial unmapping.
 pub(crate) unsafe trait Backend {
-    fn allocate(&mut self, pages: u32) -> Result<(u64, *mut u8), Error>;
-    fn release(&mut self, physical: u64, pages: u32) -> bool;
+    fn allocate(&mut self,pages:u32)->Result<Backing,Error>;
+    fn release(&mut self,key:u64,pages:u32)->bool;
+    /// # Safety: tuple is from a still-owned allocation of this backend.
+    unsafe fn discard(&mut self,key:u64,pages:u32,pointer:*mut u8)->bool{
+        unsafe{core::ptr::write_bytes(pointer,0,pages as usize*PAGE)};
+        self.release(key,pages)
+    }
+    fn has_pending(&self)->bool{false}
+    fn pending_bytes(&self)->u64{0}
+    fn reclaim_pending(&mut self)->u64{0}
 }
 
 pub(crate) struct Buffer {
+    retiring:bool,
+    backing:u64,
     physical: u64,
     pointer: *mut u8,
     pages: u32,
@@ -32,8 +46,10 @@ pub(crate) struct Buffer {
 impl Buffer {
     pub(crate) fn charged(&self) -> usize { self.pages as usize * PAGE }
     pub(crate) fn pointer(&self) -> *mut u8 { self.pointer }
+    pub(crate) fn physical(&self) -> u64 { self.physical }
+    pub(crate) fn backing(&self) -> u64 { self.backing }
     pub(crate) const fn new() -> Self {
-        Self { physical: 0, pointer: core::ptr::null_mut(), pages: 0, length: 0, owner: 0 }
+        Self { retiring:false,backing:0,physical: 0, pointer: core::ptr::null_mut(), pages: 0, length: 0, owner: 0 }
     }
     pub(crate) fn prepare(&mut self, owner: u64, bytes: usize, quota: usize,
         backend: &mut (impl Backend + ?Sized)) -> Result<(), Error> {
@@ -41,15 +57,15 @@ impl Buffer {
         let (_, pages) = allocation_size(bytes, quota)?;
         if self.pages != 0 {
             if self.owner != owner { return Err(Error::Owner); }
-            if self.pages == pages { self.length = bytes; return Ok(()); }
+            if self.pages == pages && !self.retiring { self.length = bytes; return Ok(()); }
             // Staging is unpublished. Release it before resizing so the owner
             // can never exceed quota through simultaneous old/new buffers.
             self.clear(backend)?;
         }
-        let (physical, pointer) = backend.allocate(pages)?;
+        let backing=backend.allocate(pages)?;let pointer=backing.pointer;
         // Backend guarantees exclusive mapped RAM; zero padding as well.
         unsafe { core::ptr::write_bytes(pointer, 0, pages as usize * PAGE); }
-        self.physical = physical; self.pointer = pointer; self.pages = pages;
+        self.backing=backing.key;self.physical=backing.physical.unwrap_or(0); self.pointer = pointer; self.pages = pages;
         self.length = bytes; self.owner = owner;
         Ok(())
     }
@@ -57,8 +73,10 @@ impl Buffer {
         if self.pages == 0 { return Ok(()); }
         // Scrub before return to PMM. Retain ownership metadata on failure,
         // preventing a leak, double allocation or silent quota reset.
-        unsafe { core::ptr::write_bytes(self.pointer, 0, self.pages as usize * PAGE); }
-        if !backend.release(self.physical, self.pages) { return Err(Error::Release); }
+        // A backend may already have unmapped the span when release fails.
+        // Keep ownership for cleanup, but never authorize reuse of that span.
+        self.retiring=true;
+        if !unsafe{backend.discard(self.backing,self.pages,self.pointer)}{return Err(Error::Release);}
         *self = Self::new();
         Ok(())
     }
@@ -69,43 +87,22 @@ fn memory_log(message: &'static [u8]) {
     unsafe extern "C" { fn serial_write(message: *const core::ffi::c_char); }
     unsafe { serial_write(message.as_ptr().cast()); }
 }
-// A failed rollback is never forgotten or reused. The normal validated map
-// makes this path unreachable; retain its exact PMM ownership until reboot.
-#[cfg(not(test))]
-static mut MAPPING_QUARANTINE: (u64, u32) = (0, 0);
 #[cfg(not(test))]
 pub(crate) struct Physical;
 #[cfg(not(test))]
-unsafe impl Backend for Physical {
-    fn allocate(&mut self, pages: u32) -> Result<(u64, *mut u8), Error> {
-        if unsafe { MAPPING_QUARANTINE.1 } != 0 { return Err(Error::Mapping); }
-        let mut offset = 0;
-        if !unsafe { crate::boot::boot_hhdm_offset(&mut offset) } { return Err(Error::Mapping); }
-        let Some(physical) = (unsafe { crate::pmm::allocate_buffer_frames(pages) }) else {
-            return Err(Error::OutOfMemory);
-        };
-        // PMM returns only managed physical RAM. The validated boot direct map
-        // covers its usable ranges; checked addition prevents alias wrapping.
-        let pointer = physical.checked_add(offset).and_then(|start| {
-            start.checked_add(u64::from(pages) * PAGE as u64 - 1)?;
-            Some(start as *mut u8)
-        });
-        if let Some(pointer) = pointer {
-            memory_log(b"IndianOS: kernel owned buffer pages allocated\n\0");
-            return Ok((physical, pointer));
-        }
-        // Validated HHDM and managed frames make this unreachable, but undo a
-        // failed mapping preflight rather than publishing an unusable buffer.
-        if !unsafe { crate::pmm::release_buffer_frames(physical, pages) } {
-            unsafe { MAPPING_QUARANTINE = (physical, pages); }
-        }
-        Err(Error::Mapping)
-    }
-    fn release(&mut self, physical: u64, pages: u32) -> bool {
-        let released = unsafe { crate::pmm::release_buffer_frames(physical, pages) };
-        if released { memory_log(b"IndianOS: kernel owned buffer pages released\n\0"); }
-        released
-    }
+unsafe impl Backend for Physical{
+ fn allocate(&mut self,pages:u32)->Result<Backing,Error>{
+  let backing=crate::kernel_arena::allocate(pages)?;
+  memory_log(b"IndianOS: kernel owned buffer pages allocated\n\0");Ok(backing)
+ }
+ fn release(&mut self,key:u64,pages:u32)->bool{crate::kernel_arena::release(key,pages)}
+ unsafe fn discard(&mut self,key:u64,pages:u32,pointer:*mut u8)->bool{
+  let released=crate::kernel_arena::discard(key,pages,pointer);
+  if released{memory_log(b"IndianOS: kernel owned buffer pages released\n\0");}released
+ }
+ fn has_pending(&self)->bool{crate::kernel_arena::pending()}
+ fn pending_bytes(&self)->u64{crate::kernel_arena::pending_bytes()}
+ fn reclaim_pending(&mut self)->u64{crate::kernel_arena::reclaim()}
 }
 
 fn frame_bytes(width: u16, height: u16) -> Option<usize> {
@@ -147,7 +144,7 @@ fn with_slot<R>(row: bool, f: impl FnOnce(&mut Option<crate::kernel_heap::Alloca
         else { FRAME.with(|slot| f(&mut **slot.borrow_mut())) } }
 }
 pub(crate) fn prepare_frame(owner: u64, width: u16, height: u16) -> bool {
-    if !masked() { return false; }
+    if !crate::kernel_heap::admission_available() { return false; }
     let Some(bytes) = frame_bytes(width, height) else { return false; };
     with_slot(false, |slot| {
         let owner = crate::kernel_heap::Owner::Frame(owner);
@@ -169,7 +166,7 @@ pub(crate) fn with_frame<R>(f: impl FnOnce(&mut [u32]) -> R) -> R {
 /// Private syscall-copy scratch is a distinct owner and never aliases staging.
 /// Reused across rows; both allocations retire with the compositor epoch.
 pub(crate) fn with_row<R>(epoch: u64, f: impl FnOnce(&mut [u32]) -> R) -> Option<R> {
-    if !masked() { return None; }
+    if !crate::kernel_heap::admission_available() { return None; }
     with_slot(true, |slot| {
         let owner = crate::kernel_heap::Owner::Scratch(epoch);
         if slot.as_ref().is_some_and(|buffer| buffer.owner() != owner) { return None; }
@@ -182,7 +179,7 @@ pub(crate) fn with_row<R>(epoch: u64, f: impl FnOnce(&mut [u32]) -> R) -> Option
     })
 }
 pub(crate) fn release_frame() -> bool {
-    if !masked() { return false; }
+    if !crate::kernel_heap::admission_available() { return false; }
     let frame = with_slot(false, |slot| match slot.take() {
         Some(buffer) => {
             let ok = buffer.release().is_ok();
@@ -210,10 +207,10 @@ mod tests {
         pub(super) fn new() -> Self { Self { bytes: std::vec![0; PAGE / 8 * 4], busy: false, oom: false, fail_release: false } }
     }
     unsafe impl Backend for Memory {
-        fn allocate(&mut self, pages: u32) -> Result<(u64, *mut u8), Error> {
+        fn allocate(&mut self, pages: u32) -> Result<Backing, Error> {
             if self.oom || self.busy || pages as usize > self.bytes.len() * 8 / PAGE { return Err(Error::OutOfMemory); }
             self.busy = true;
-            Ok((PAGE as u64, self.bytes.as_mut_ptr().cast()))
+            Ok(Backing{key:PAGE as u64,physical:Some(PAGE as u64),pointer:self.bytes.as_mut_ptr().cast()})
         }
         fn release(&mut self, _: u64, _: u32) -> bool {
             if self.fail_release { return false; }
@@ -263,6 +260,20 @@ mod tests {
         memory.oom = true;
         assert_eq!(buffer.prepare(1, PAGE * 2, PAGE * 4, &mut memory), Err(Error::OutOfMemory));
         assert_eq!(buffer.pages, 0); assert!(!memory.busy);
+    }
+    #[test] fn pending_release_cannot_be_reused_by_same_size_prepare() {
+        let mut memory=Memory::new();let mut buffer=Buffer::new();
+        buffer.prepare(7,PAGE,PAGE,&mut memory).unwrap();
+        memory.fail_release=true;
+        assert_eq!(buffer.clear(&mut memory),Err(Error::Release));
+        assert!(buffer.retiring);
+        assert_eq!(buffer.prepare(7,PAGE,PAGE,&mut memory),Err(Error::Release));
+        assert_eq!(buffer.owner,7);assert!(memory.busy);
+        assert_eq!(buffer.prepare(8,PAGE,PAGE,&mut memory),Err(Error::Owner));
+        memory.fail_release=false;
+        buffer.prepare(7,PAGE,PAGE,&mut memory).unwrap();
+        assert!(!buffer.retiring);assert!(memory.bytes.iter().all(|&v|v==0));
+        buffer.clear(&mut memory).unwrap();
     }
 }
 

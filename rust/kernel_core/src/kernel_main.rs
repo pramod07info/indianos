@@ -196,12 +196,13 @@ pub extern "C" fn kmain()->!{
         // R126: genuine AP enters Rust, confirms its own CPUID and parks.
         // The BSP immediately halts BEFORE PMM, user programs or recovery.
         need(crate::limine_requests::launch_one_parked_qemu_ap(),
-            b"IndianOS: FATAL R126 QEMU AP arrival/CPUID mismatch\n\0");
+            b"IndianOS: FATAL R126/R132 QEMU AP admission or TLB acknowledgement failed\n\0");
         log(b"IndianOS: R126 QEMU secondary AP executed Rust and acknowledged BSP\n\0");
         log(b"IndianOS: R127 QEMU real AP denied BSP retirement gate 8192 times\n\0");
         log(b"IndianOS: R131 QEMU 64 ordered cross-CPU lifecycle receipts acknowledged\n\0");
         log(b"IndianOS: R121 QEMU all 64 AP lifecycle receipt replays denied\n\0");
         log(b"IndianOS: R122 QEMU AP proof completed before lifecycle acknowledgement\n\0");
+        log(b"IndianOS: R132 QEMU AP invalidated 64 remapped pages before acknowledgement\n\0");
         halt();
     }
     // Issue #124 HD1: each x86-64 boot enumerates CPU and PCI-PCI bridge
@@ -529,6 +530,14 @@ pub extern "C" fn kmain()->!{
     need(unsafe{pmm_self_test()},
          b"IndianOS: FATAL physical memory self-test failed\n\0");
     log(b"IndianOS: physical memory manager ready\n\0");
+    #[cfg(feature="normal-desktop")]
+    {
+        need(crate::kernel_heap::initialize(),
+            b"IndianOS: FATAL kernel heap, arena or shared-zero initialization failed\n\0");
+        log(b"IndianOS: kernel heap BSP admission ready\n\0");
+        log(b"IndianOS: kernel noncontiguous virtual arena ready\n\0");
+        log(b"IndianOS: kernel shared zero page ready\n\0");
+    }
     #[cfg(feature="test-r114-epoch")]
     {
         // QEMU-exclusive disposable 64-sector primary-master image, seeded
@@ -662,14 +671,32 @@ pub extern "C" fn kmain()->!{
                 halt()
             });
         log(b"IndianOS: R028 legacy virtio-net DMA queues initialized\n\0");
+        #[cfg(feature="test-r136-nic-irq")]
+        {
+            if !unsafe{nic.enable_irq_notifications()}{
+                let _=nic.close();
+                need(false,b"IndianOS: FATAL R136 exclusive NIC IRQ admission failed\n\0");
+                halt();
+            }
+            log(b"IndianOS: R136 exclusive legacy NIC IRQ11 notifications armed\n\0");
+        }
         let result=crate::network::run_demo(&mut nic,log);
+        #[cfg(feature="test-r136-nic-irq")]
+        let irq_proved=crate::nic_interrupt::notifications()>0;
         // Even failed protocol probes must reset the NIC before any PMM DMA
         // frame can be returned. Never report network PASS after an uncertain
         // reset or silently release pages while the device may still DMA.
         need(nic.close(),b"IndianOS: FATAL R114 virtio-net DMA stop readback failed\n\0");
         log(b"IndianOS: R114 virtio-net reset and PCI bus-master shutdown verified PASSED\n\0");
+        #[cfg(feature="test-r136-nic-irq")]
+        {
+            need(irq_proved,b"IndianOS: FATAL R136 no actual NIC IRQ notification\n\0");
+            log(b"IndianOS: R136 actual NIC IRQ observed and masked before DMA release PASSED\n\0");
+        }
         need(result.is_ok(),b"IndianOS: FATAL R028 ARP ICMP UDP DNS or TCP exchange\n\0");
         log(b"IndianOS: R028 QEMU virtio-net end-to-end network client PASSED\n\0");
+        #[cfg(feature="test-r136-nic-irq")]
+        halt();
     }
 
     #[cfg(feature="test-ud2")]

@@ -244,6 +244,8 @@ RUST_LIB := $(BUILD)/libindianos_kernel_core.a
 RUST_FEATURES := $(if $(filter 1,$(PREEMPT_SELFTEST)),--features preempt,) $(if $(filter 1,$(RUST_VMM)),--features vmm,) $(if $(filter 1,$(RUST_PMM)),--features pmm,) $(if $(filter 1,$(RUST_USER_IMAGE)),--features user-image,) $(if $(filter 1,$(RUST_PAGING)),--features paging,) $(if $(filter 1,$(RUST_PAGING_CPU)),--features paging-cpu,) $(if $(filter 1,$(RUST_USER_RUNTIME)),--features user-runtime,) $(if $(filter 1,$(RUST_CPU_ENTRY)),--features cpu-entry,) $(if $(filter 1,$(RUST_RUNTIME)),--features runtime,) $(if $(filter 1,$(RUST_BOOT_STAGING)),--features boot-staging,) $(if $(filter 1,$(RUST_BOOT)),--features boot,) $(if $(filter 1,$(RUST_BOOT_PROTOCOL)),--features limine-requests,) $(if $(filter 1,$(RUST_INTERRUPTS)),--features interrupts,) $(if $(filter 1,$(RUST_TIMER)),--features timer,) $(if $(filter 1,$(RUST_MAIN)),--features kernel-main,)
 ifeq ($(RUST_MAIN),1)
 RUST_FEATURES += $(if $(filter 1,$(R118_AP_ACK_TEST)),--features test-r118-ap-ack,)
+RUST_FEATURES += $(if $(filter 1,$(R132_TLB_STALE_TEST)),--features test-r132-tlb-stale,)
+RUST_FEATURES += $(if $(filter 1,$(R136_NIC_IRQ_TEST)),--features test-r136-nic-irq,)
 RUST_FEATURES += $(if $(filter 1,$(EXCEPTION_SELFTEST)),--features test-ud2,) \
  $(if $(filter 1,$(PAGEFAULT_SELFTEST)),--features test-pagefault,) \
  $(if $(filter 1,$(PAGING_SWITCH_SELFTEST)),--features test-shadow,) \
@@ -900,13 +902,19 @@ endif
 endif
 endif
 RUST_APP_FLAGS := -C relocation-model=static -C link-arg=-T$(CURDIR)/userland/demo/linker.ld -C link-arg=--no-pie -C link-arg=-z -C link-arg=max-page-size=0x1000
+PREEMPT_FPU_ACCEPTANCE ?= 0
+PREEMPT_FPU_FEATURE = $(if $(filter 11,$(PREEMPT_SELFTEST)$(PREEMPT_FPU_ACCEPTANCE)),--features test-preempt-fpu)
+DESKTOP_FPU_ACCEPTANCE ?= 0
+DESKTOP_FPU_FEATURE = $(if $(filter 11,$(DESKTOP_SESSION)$(DESKTOP_FPU_ACCEPTANCE)),--features test-fpu-context)
+DESKTOP_LOCK_ACCEPTANCE ?= 0
+DESKTOP_LOCK_FEATURE = $(if $(filter 11,$(DESKTOP_SESSION)$(DESKTOP_LOCK_ACCEPTANCE)),--features test-blocking-lock)
 $(USER_ELF): $(wildcard userland/rust/src/*.rs) userland/rust/Cargo.toml userland/rust/Cargo.lock userland/demo/linker.ld Makefile
 	@mkdir -p $(@D)
 	CARGO_TARGET_DIR=$(BUILD)/rust-user-init-target \
 	    RUSTFLAGS="$(RUST_APP_FLAGS)" \
 	    $(CARGO) build --manifest-path userland/rust/Cargo.toml \
 	    --target x86_64-unknown-none --release --offline --no-default-features \
-	    $(if $(RUST_INIT_FEATURE),--features $(RUST_INIT_FEATURE),)
+	    $(if $(RUST_INIT_FEATURE),--features $(RUST_INIT_FEATURE),) $(DESKTOP_FPU_FEATURE) $(DESKTOP_LOCK_FEATURE) $(PREEMPT_FPU_FEATURE)
 	cp $(BUILD)/rust-user-init-target/x86_64-unknown-none/release/indianos-user $@
 	@readelf -h $@ | grep -q 'Type:.*EXEC'
 
@@ -917,7 +925,7 @@ $(THIRD_ELF): $(wildcard userland/rust/src/*.rs) userland/rust/Cargo.toml userla
 	    RUSTFLAGS="$(RUST_APP_FLAGS)" \
 	    $(CARGO) build --manifest-path userland/rust/Cargo.toml \
 	    --target x86_64-unknown-none --release --offline --no-default-features \
-	    --features $(RUST_THIRD_FEATURE)
+	    --features $(RUST_THIRD_FEATURE) $(DESKTOP_FPU_FEATURE) $(DESKTOP_LOCK_FEATURE)
 	cp $(BUILD)/rust-user-third-target/x86_64-unknown-none/release/indianos-user $@
 	@readelf -h $@ | grep -q 'Type:.*EXEC'
 endif
@@ -929,7 +937,7 @@ $(FOURTH_ELF): $(wildcard userland/rust/src/*.rs) userland/rust/Cargo.toml userl
 	    RUSTFLAGS="$(RUST_APP_FLAGS)" \
 	    $(CARGO) build --manifest-path userland/rust/Cargo.toml \
 	    --target x86_64-unknown-none --release --offline --no-default-features \
-	    --features desktop-compositor
+	    --features desktop-compositor $(DESKTOP_FPU_FEATURE) $(DESKTOP_LOCK_FEATURE)
 	cp $(BUILD)/rust-user-compositor-target/x86_64-unknown-none/release/indianos-user $@
 	@readelf -h $@ | grep -q 'Type:.*EXEC'
 endif
@@ -940,7 +948,7 @@ $(WORKER_ELF): $(wildcard userland/rust/src/*.rs) userland/rust/Cargo.toml userl
 	    RUSTFLAGS="$(RUST_APP_FLAGS)" \
 	    $(CARGO) build --manifest-path userland/rust/Cargo.toml \
 	    --target x86_64-unknown-none --release --offline --no-default-features \
-	    --features $(RUST_WORKER_FEATURE)
+	    --features $(RUST_WORKER_FEATURE) $(DESKTOP_FPU_FEATURE) $(DESKTOP_LOCK_FEATURE) $(PREEMPT_FPU_FEATURE)
 	cp $(BUILD)/rust-user-worker-target/x86_64-unknown-none/release/indianos-user $@
 	@readelf -h $@ | grep -q 'Type:.*EXEC'
 
@@ -1334,4 +1342,4 @@ test-r114-epoch-qemu:
 # Disposable read-only UEFI QEMU; no host disk and no production AP activation.
 test-r118-ap-qemu:
 	$(MAKE) image BUILD=build/r118-ap-qemu RUST_CORE=1 R118_AP_ACK_TEST=1
-	python3 tools/test_r118_ap_qemu.py --iso build/r118-ap-qemu/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)"
+	python3 tools/test_r118_ap_qemu.py --iso build/r118-ap-qemu/indianos.iso --qemu $(QEMU) --ovmf "$(OVMF_CODE)" --serial-log build/r118-ap-qemu/ap.serial.log

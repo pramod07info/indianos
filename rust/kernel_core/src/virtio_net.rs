@@ -5,6 +5,8 @@
 //! buffers, checksum offload, or modern virtio PCI capability negotiation.
 //! The device MUST be an emulated 0x1af4:0x1000 virtio-net legacy PCI card.
 //! Never enable this experimental DMA driver in ordinary machine boot.
+//! A separate opt-in profile adds exclusive IRQ11 queue notifications while
+//! retaining serialized polled DMA consumption; shared IRQs/IOMMU are absent.
 use core::{arch::asm,ptr,sync::atomic::{compiler_fence,Ordering}};
 use crate::network::{EthernetDevice,Error};
 
@@ -70,8 +72,10 @@ fn discover()->Option<(u8,u8,u8,u16)>{
                 let port=(bar&!3) as u16;
                 if port<0x1000 || (port as u32)+0x20>0x10000{return None;}
                 let command=pciread(bus,slot,function,0x04);
-                pciwrite(bus,slot,function,0x04,command|0x0005);
-                if pciread(bus,slot,function,0x04)&0x0005!=0x0005{return None;}
+                // Decode registers without enabling inherited DMA queues.
+                // COMMAND shares a dword with W1C status: never echo status.
+                pciwrite(bus,slot,function,0x04,(command&0xffff&!0x0004)|1);
+                if pciread(bus,slot,function,0x04)&0x0005!=1{return None;}
                 return Some((bus,slot,function,port));
             }
         }
@@ -102,6 +106,46 @@ fn queue_layout(port:u16,queue:u16)->Option<QueueLayout>{
     unsafe{outw(port+0x0e,queue);}
     QueueLayout::new(unsafe{inw(port+0x0c)})
 }
+// At most two legacy queues can own DMA at once. A size-1024 ring uses
+// seven pages plus one packet page; leave headroom while retaining every
+// rejected PMM release. No new probe is admitted until this ledger drains.
+const RETIRED_CAPACITY:usize=32;
+struct RetiredPages{frames:[u64;RETIRED_CAPACITY],poisoned:bool}
+impl RetiredPages{
+    const fn new()->Self{Self{frames:[0;RETIRED_CAPACITY],poisoned:false}}
+    fn pending(&self)->bool{self.poisoned||self.frames.iter().any(|&frame|frame!=0)}
+    /// Record ownership before attempting release. Only pages which were
+    /// never published to a device, or whose DMA retirement was verified,
+    /// may enter this ledger. It is not a substitute for NIC reset.
+    fn retire(&mut self,frame:u64,release:&mut impl FnMut(u64)->bool)->bool{
+        if self.poisoned||frame==0||frame&4095!=0||self.frames.contains(&frame){
+            self.poisoned=true;return false;
+        }
+        let Some(slot)=self.frames.iter_mut().find(|entry|**entry==0)else{
+            // An impossible capacity/ownership violation forbids further
+            // probes; never authorize reuse by forgetting a rejected frame.
+            self.poisoned=true;return false;
+        };
+        *slot=frame;
+        if release(frame){*slot=0;true}else{false}
+    }
+    fn retry(&mut self,mut release:impl FnMut(u64)->bool)->bool{
+        if self.poisoned{return false;}
+        for frame in &mut self.frames{
+            if *frame!=0&&release(*frame){*frame=0;}
+        }
+        !self.pending()
+    }
+}
+// All accesses satisfy probe's exclusive BSP/CLI contract. VirtioNet contains
+// raw owned pointers and is neither Send nor Sync; there is no IRQ-side PMM.
+static mut RETIRED:RetiredPages=RetiredPages::new();
+fn release_retired(frame:u64)->bool{
+    unsafe{(&mut *ptr::addr_of_mut!(RETIRED)).retire(frame,&mut |physical|pmm_release_frame(physical))}
+}
+fn retry_retired()->bool{
+    unsafe{(&mut *ptr::addr_of_mut!(RETIRED)).retry(|physical|pmm_release_frame(physical))}
+}
 struct Queue{
     ring_phys:u64,
     ring:*mut u8,
@@ -120,7 +164,7 @@ impl Queue {
         let mut bufphys=0u64;
         if !unsafe{pmm_allocate_frame(&mut bufphys)}{
             for n in 0..layout.frames{
-                let _=unsafe{pmm_release_frame(ring_phys+n as u64*PAGE as u64)};
+                let _=release_retired(ring_phys+n as u64*PAGE as u64);
             }
             return Err(Error::Device);
         }
@@ -129,9 +173,9 @@ impl Queue {
         let (Some(ring),Some(buffer),true)=(direct_map(hhdm,ring_phys),
             direct_map(hhdm,bufphys),ring_end_valid)
         else{
-            let _=unsafe{pmm_release_frame(bufphys)};
+            let _=release_retired(bufphys);
             for n in 0..layout.frames{
-                let _=unsafe{pmm_release_frame(ring_phys+n as u64*PAGE as u64)};
+                let _=release_retired(ring_phys+n as u64*PAGE as u64);
             }
             return Err(Error::Device);
         };
@@ -183,11 +227,12 @@ impl Queue {
         self.used=self.used.wrapping_add(1);
         Ok(Some(size as usize))
     }
-    fn release(self){
-        let _=unsafe{pmm_release_frame(self.buffer_phys)};
+    fn release(self)->bool{
+        let mut complete=release_retired(self.buffer_phys);
         for n in 0..self.layout.frames{
-            let _=unsafe{pmm_release_frame(self.ring_phys+n as u64*PAGE as u64)};
+            if !release_retired(self.ring_phys+n as u64*PAGE as u64){complete=false;}
         }
+        complete
     }
 }
 fn configure_queue(port:u16,queue:u16,q:&Queue)->bool{
@@ -197,7 +242,38 @@ fn configure_queue(port:u16,queue:u16,q:&Queue)->bool{
         return false;
     }
     unsafe{outl(port+0x08,(q.ring_phys/PAGE as u64) as u32);}
-    true
+    let observed=unsafe{inl(port+0x08)};
+    observed==(q.ring_phys/PAGE as u64) as u32
+}
+/// Both normal close and partially published queue setup must establish the
+/// same DMA retirement barrier before returning pages to the allocator.
+/// The trait keeps failure sequencing testable without executing port I/O.
+trait DeviceControl{
+    fn reset(&mut self);
+    fn status(&mut self)->u8;
+    fn identity(&mut self)->u32;
+    fn command(&mut self)->u32;
+    fn set_command(&mut self,command:u32);
+}
+struct LegacyControl{port:u16,bus:u8,slot:u8,function:u8}
+impl DeviceControl for LegacyControl{
+    fn reset(&mut self){unsafe{outb(self.port+0x12,0);}}
+    fn status(&mut self)->u8{unsafe{inb(self.port+0x12)}}
+    fn identity(&mut self)->u32{pciread(self.bus,self.slot,self.function,0)}
+    fn command(&mut self)->u32{pciread(self.bus,self.slot,self.function,4)}
+    fn set_command(&mut self,command:u32){pciwrite(self.bus,self.slot,self.function,4,command);}
+}
+fn quiesce_device(control:&mut impl DeviceControl)->bool{
+    control.reset();compiler_fence(Ordering::SeqCst);
+    let reset=control.status();let before=control.identity();
+    if reset!=0||before!=legacy_nic_identity(){return false;}
+    let disabled=(control.command()&0xffff)&!4;
+    control.set_command(disabled);compiler_fence(Ordering::SeqCst);
+    let command=control.command();let after=control.identity();
+    // Recheck reset after disabling bus mastering: do not release pages if
+    // the device re-entered a running state during the PCI transaction.
+    let final_reset=control.status();
+    nic_dma_retired(reset,before,after,command)&&final_reset==0
 }
 pub struct VirtioNet{
     port:u16,
@@ -211,15 +287,46 @@ pub struct VirtioNet{
     faulted:bool,
 }
 impl VirtioNet{
+    /// QEMU-exclusive legacy IRQ11; call after probe, before user execution.
+    /// DMA ownership remains with the normal serialized queue consumer.
+    #[cfg(feature="test-r136-nic-irq")]
+    pub unsafe fn enable_irq_notifications(&mut self)->bool{
+        let route=pciread(self.bus,self.slot,self.function,0x3c);
+        let irq=route as u8;let pin=((route>>8)&255) as u8;
+        if irq!=11||!(1..=4).contains(&pin)||self.faulted{return false;}
+        let command=pciread(self.bus,self.slot,self.function,4)&0xffff;
+        if command&5!=5{return false;}
+        pciwrite(self.bus,self.slot,self.function,4,command&!0x400);
+        if pciread(self.bus,self.slot,self.function,0)!=legacy_nic_identity()||
+           pciread(self.bus,self.slot,self.function,4)&0x405!=5{return false;}
+        unsafe{crate::nic_interrupt::enable(self.port,irq)}
+    }
+    #[cfg(feature="test-r136-nic-irq")]
+    fn irq_window(&mut self,force:bool)->bool{
+        if !crate::nic_interrupt::active(self.port){return true;}
+        if !unsafe{crate::nic_interrupt::pulse(self.port,force)}{self.faulted=true;return false;}
+        true
+    }
     /// # Safety
     /// QEMU legacy virtio-net, BSP with IRQs disabled and PMM initialized.
     /// No other I/O master may own the PCI device, DMA frames or virtqueues.
     pub unsafe fn probe()->Result<Self,Error>{
+        // Retry only already-retired ownership, before device discovery can
+        // allocate or publish a new queue. A busy PMM cannot reset this debt.
+        if !retry_retired(){return Err(Error::Device);}
         let Some((bus,slot,function,port))=discover()else{return Err(Error::Device);};
-        unsafe{outb(port+0x12,0);outb(port+0x12,DEVICE_ACK|DRIVER);}
+        let mut control=LegacyControl{port,bus,slot,function};
+        if !quiesce_device(&mut control){return Err(Error::Device);}
+        // Enable DMA only after inherited state has been demonstrably reset.
+        let command=(control.command()&0xffff)|5;
+        control.set_command(command);
+        if control.identity()!=legacy_nic_identity()||control.command()&5!=5{
+            return Err(Error::Device);
+        }
+        unsafe{outb(port+0x12,DEVICE_ACK|DRIVER);}
         let offered=unsafe{inl(port)};
         if offered&VIRTIO_MAC_FEATURE==0{
-            unsafe{outb(port+0x12,0);}
+            let _=quiesce_device(&mut control);
             return Err(Error::Device);
         }
         // Refuse checksum offloads, mergeable buffers, TSO and any feature
@@ -230,34 +337,43 @@ impl VirtioNet{
             *byte=unsafe{inb(port+0x14+i as u16)};
         }
         if mac==[0;6] || mac==[0xff;6] || mac[0]&1!=0{
-            unsafe{outb(port+0x12,0);}
+            let _=quiesce_device(&mut control);
             return Err(Error::Device);
         }
         let mut hhdm=0u64;
-        if !unsafe{boot_hhdm_offset(&mut hhdm)}{return Err(Error::Device);}
+        if !unsafe{boot_hhdm_offset(&mut hhdm)}{
+            let _=quiesce_device(&mut control);return Err(Error::Device);
+        }
         // Legacy devices expose a fixed size rather than accepting our
         // preferred size. QEMU revisions use both 256 and 1024 RX entries.
         let (Some(rx_layout),Some(tx_layout))=(queue_layout(port,QUEUE_RX),
             queue_layout(port,QUEUE_TX))else{
-            unsafe{outb(port+0x12,0);}return Err(Error::Device);
+            let _=quiesce_device(&mut control);return Err(Error::Device);
         };
-        let mut rx=Queue::allocate(hhdm,rx_layout)?;
+        let mut rx=match Queue::allocate(hhdm,rx_layout){
+            Ok(v)=>v,Err(e)=>{let _=quiesce_device(&mut control);return Err(e);}
+        };
         let mut tx=match Queue::allocate(hhdm,tx_layout){
             Ok(v)=>v,
-            Err(e)=>{rx.release();return Err(e);}
+            Err(e)=>{let _=quiesce_device(&mut control);rx.release();return Err(e);}
         };
         let rings_ready=
             configure_queue(port,QUEUE_RX,&rx) &&
             configure_queue(port,QUEUE_TX,&tx);
         if !rings_ready {
-            unsafe{outb(port+0x12,0);}
-            rx.release();tx.release();
+            // A PFN may already be device-visible. Failed/unacknowledged
+            // reset deliberately retains pages, matching uncertain close.
+            if quiesce_device(&mut control){rx.release();tx.release();}
             return Err(Error::Device);
         }
         rx.descriptor(FRAME_CAP as u32,true);
         rx.offer();
         unsafe{outb(port+0x12,DEVICE_ACK|DRIVER|DRIVER_OK);}
         compiler_fence(Ordering::SeqCst);
+        if unsafe{inb(port+0x12)}!=(DEVICE_ACK|DRIVER|DRIVER_OK){
+            if quiesce_device(&mut control){rx.release();tx.release();}
+            return Err(Error::Device);
+        }
         unsafe{outw(port+0x10,QUEUE_RX);}
         Ok(Self{port,bus,slot,function,mac,rx,tx,faulted:false})
     }
@@ -266,27 +382,17 @@ impl VirtioNet{
     /// device may return 0xff, so an uncertain reset must retain all DMA
     /// frames rather than risk a use-after-free. Requires BSP+CLI and a
     /// stable PCI I/O-port mapping; no IOMMU or real hardware qualification.
+    /// A rejected PMM release is retained and causes false; the next probe
+    /// retries those proven-retired pages before admitting any new DMA.
     #[must_use]
     pub fn close(self)->bool{
-        unsafe{outb(self.port+0x12,0);}
-        compiler_fence(Ordering::SeqCst);
-        // A removed/replaced device may return all-ones PCI identity,
-        // and a device may change after we disable bus mastering.
-        let reset=unsafe{inb(self.port+0x12)};
-        let identity_before=pciread(self.bus,self.slot,self.function,0);
-        if reset!=0 || identity_before!=legacy_nic_identity(){return false;}
-        let command=pciread(self.bus,self.slot,self.function,0x04);
-        // Preserve status W1C bits by writing only COMMAND[15:0].
-        let disabled=(command & 0xffff) & !0x0004;
-        pciwrite(self.bus,self.slot,self.function,0x04,disabled);
-        compiler_fence(Ordering::SeqCst);
-        let observed=pciread(self.bus,self.slot,self.function,0x04);
-        let identity_after=pciread(self.bus,self.slot,self.function,0);
-        if !nic_dma_retired(reset,identity_before,identity_after,observed){
-            return false;
-        }
-        self.rx.release();self.tx.release();
-        true
+        #[cfg(feature="test-r136-nic-irq")]
+        if crate::nic_interrupt::active(self.port)&&!unsafe{crate::nic_interrupt::disable(self.port)}{return false;}
+        let mut control=LegacyControl{port:self.port,bus:self.bus,slot:self.slot,function:self.function};
+        if !quiesce_device(&mut control){return false;}
+        // Attempt both releases even if one is rejected. Rejected frames
+        // stay charged in the ledger and close must not claim reclamation.
+        let rx=self.rx.release();let tx=self.tx.release();rx&&tx
     }
 }
 /// Exact expected PCI device ID, not an arbitrary substituted controller.
@@ -415,7 +521,11 @@ impl EthernetDevice for VirtioNet{
         compiler_fence(Ordering::SeqCst);
         unsafe{outw(self.port+0x10,QUEUE_TX);}
         for _ in 0..TIMEOUT{
+            #[cfg(feature="test-r136-nic-irq")]
+            if !self.irq_window(false){return Err(Error::Device);}
             if self.tx.complete(){
+                #[cfg(feature="test-r136-nic-irq")]
+                if !self.irq_window(true){return Err(Error::Device);}
                 if !matches!(self.tx.consume(),Ok(Some(n))
                     if tx_completion_length_valid(n,frame.len())){
                     self.faulted=true;
@@ -431,7 +541,11 @@ impl EthernetDevice for VirtioNet{
     }
     fn poll(&mut self,out:&mut [u8])->Result<Option<usize>,Error>{
         if self.faulted{return Err(Error::Device);}
+        #[cfg(feature="test-r136-nic-irq")]
+        if !self.irq_window(false){return Err(Error::Device);}
         if !self.rx.complete(){return Ok(None);}
+        #[cfg(feature="test-r136-nic-irq")]
+        if !self.irq_window(true){return Err(Error::Device);}
         let length=match self.rx.consume(){
             Ok(Some(length))=>length,
             Ok(None)=>return Ok(None),
@@ -470,6 +584,89 @@ impl EthernetDevice for VirtioNet{
 #[cfg(test)]
 mod tests{
     use super::*;
+    #[test]fn retired_dma_pages_keep_failed_ownership_until_exact_retry_succeeds(){
+        let mut debt=RetiredPages::new();
+        assert!(!debt.retire(0x1000,&mut |_|false));
+        assert!(!debt.retire(0x2000,&mut |_|false));assert!(debt.pending());
+        let mut released=std::vec::Vec::new();
+        assert!(!debt.retry(|frame|{released.push(frame);frame==0x1000}));
+        assert_eq!(released,[0x1000,0x2000]);released.clear();
+        assert!(debt.retry(|frame|{released.push(frame);true}));
+        assert_eq!(released,[0x2000]);assert!(!debt.pending());
+        assert!(debt.retry(|_|panic!("already returned DMA frame released twice")));
+    }
+    #[test]fn successful_retirement_leaves_capacity_for_a_later_fresh_owner(){
+        let mut debt=RetiredPages::new();let mut count=0;
+        for _ in 0..64{assert!(debt.retire(0x1000,&mut |_|{count+=1;true}));}
+        assert_eq!(count,64);assert!(!debt.pending());
+        assert!(debt.frames.iter().all(|&frame|frame==0));
+    }
+    #[test]fn invalid_duplicate_or_overflowed_dma_debt_stops_reprobe_without_release(){
+        for invalid in [0,1]{
+            let mut debt=RetiredPages::new();
+            assert!(!debt.retire(invalid,&mut |_|panic!("invalid ownership reached PMM")));
+            assert!(!debt.retry(|_|panic!("poisoned ownership was released")));
+        }
+        let mut debt=RetiredPages::new();assert!(!debt.retire(0x1000,&mut |_|false));
+        assert!(!debt.retire(0x1000,&mut |_|panic!("duplicate was released")));
+        assert!(!debt.retry(|_|panic!("duplicate authority bypassed poison")));
+        let mut debt=RetiredPages::new();
+        for index in 1..=RETIRED_CAPACITY{assert!(!debt.retire(index as u64*4096,&mut |_|false));}
+        assert!(!debt.retire((RETIRED_CAPACITY as u64+1)*4096,&mut |_|panic!("overflow was released")));
+        assert!(debt.pending());assert!(debt.poisoned);
+    }
+    /// Host-only transport: production uses actual legacy PCI and port I/O.
+    struct Control{
+        statuses:[u8;2],identities:[u32;2],commands:[u32;2],
+        status_index:usize,identity_index:usize,command_index:usize,
+        written:Option<u32>,events:std::vec::Vec<&'static str>,
+    }
+    impl Control{
+        fn healthy()->Self{Self{
+            statuses:[0,0],identities:[legacy_nic_identity();2],
+            commands:[0xa5a5_0405,0x0401],status_index:0,identity_index:0,
+            command_index:0,written:None,events:std::vec::Vec::new(),
+        }}
+    }
+    impl DeviceControl for Control{
+        fn reset(&mut self){self.events.push("reset");}
+        fn status(&mut self)->u8{
+            self.events.push("status");let i=self.status_index;self.status_index+=1;self.statuses[i]
+        }
+        fn identity(&mut self)->u32{
+            self.events.push("identity");let i=self.identity_index;self.identity_index+=1;self.identities[i]
+        }
+        fn command(&mut self)->u32{
+            self.events.push("command");let i=self.command_index;self.command_index+=1;self.commands[i]
+        }
+        fn set_command(&mut self,command:u32){self.events.push("disable");self.written=Some(command);}
+    }
+    #[test]fn dma_retirement_orders_reset_disable_and_final_verification(){
+        let mut control=Control::healthy();assert!(quiesce_device(&mut control));
+        assert_eq!(control.written,Some(0x0401)); // no W1C status writeback
+        assert_eq!(control.events,["reset","status","identity","command","disable",
+            "command","identity","status"]);
+    }
+    #[test]fn withheld_reset_or_missing_device_never_reaches_disable_or_release_barrier(){
+        for (reset,identity) in [(0xff,legacy_nic_identity()),(7,legacy_nic_identity()),(0,u32::MAX)]{
+            let mut control=Control::healthy();control.statuses[0]=reset;control.identities[0]=identity;
+            assert!(!quiesce_device(&mut control));assert_eq!(control.written,None);
+            assert_eq!(control.events,["reset","status","identity"]);
+        }
+    }
+    #[test]fn dma_retirement_rejects_running_replaced_or_bus_mastering_device(){
+        for case in 0..4{
+            let mut control=Control::healthy();
+            match case{
+                0=>control.commands[1]|=4,
+                1=>control.identities[1]=u32::MAX,
+                2=>control.statuses[1]=7,
+                _=>control.commands[1]=0,
+            }
+            assert!(!quiesce_device(&mut control),"case {case}");
+            assert_eq!(control.written,Some(0x0401));
+        }
+    }
     fn mock_queue(ring:&mut [u64;1536],buffer:&mut [u64;512])->Queue{
         Queue{ring_phys:0x1000,ring:ring.as_mut_ptr().cast(),
             buffer_phys:0x4000,buffer:buffer.as_mut_ptr().cast(),queued:0,used:0,

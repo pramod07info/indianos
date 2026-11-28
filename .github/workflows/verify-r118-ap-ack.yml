@@ -7,6 +7,9 @@ on:
     paths:
       - 'rust/kernel_core/src/limine_requests.rs'
       - 'rust/kernel_core/src/kernel_main.rs'
+      - 'rust/kernel_core/src/tlb.rs'
+      - 'rust/kernel_core/src/tlb_probe.rs'
+      - 'rust/kernel_core/src/paging_cpu.rs'
       - 'rust/kernel_core/Cargo.toml'
       - 'Makefile'
       - 'tools/test_r118_ap_qemu.py'
@@ -39,6 +42,10 @@ jobs:
           targets: x86_64-unknown-none
       - name: R125 validate Limine MP layout and fail-closed inventory
         run: cargo test --offline --manifest-path rust/kernel_core/Cargo.toml --features limine-requests r125_
+      - name: Local TLB admission and polled proof backing regressions
+        run: |
+          cargo test --offline --manifest-path rust/kernel_core/Cargo.toml --features test-r118-ap-ack tlb
+          python3 -m unittest discover -s tests -p test_tlb_ack_acceptance.py -v
       - name: R126 freestanding AP-ack profile and real two-vCPU QEMU execution
         shell: bash
         run: |
@@ -49,3 +56,17 @@ jobs:
           done
           test -n "$OVMF_PATH"
           make test-r118-ap-qemu OVMF_CODE="$OVMF_PATH"
+          make image BUILD=build/r132-tlb-negative RUST_CORE=1 R118_AP_ACK_TEST=1 R132_TLB_STALE_TEST=1
+          python3 tools/test_r118_ap_qemu.py --iso build/r132-tlb-negative/indianos.iso \
+            --qemu qemu-system-x86_64 --ovmf "$OVMF_PATH" --expect-stale-tlb \
+            --serial-log build/r132-tlb-negative/ap-stale.serial.log
+      - name: Retain exact-head positive and stale-translation guest receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: r132-ap-tlb-${{ github.event.pull_request.head.sha || github.sha }}
+          path: |
+            build/r118-ap-qemu/ap.serial.log
+            build/r132-tlb-negative/ap-stale.serial.log
+          if-no-files-found: error
+          retention-days: 14

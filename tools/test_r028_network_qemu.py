@@ -43,6 +43,14 @@ MARKERS=(
     "IndianOS: R114 virtio-net reset and PCI bus-master shutdown verified PASSED",
     "IndianOS: R028 QEMU virtio-net end-to-end network client PASSED",
 )
+IRQ_ARMED="IndianOS: R136 exclusive legacy NIC IRQ11 notifications armed"
+IRQ_STOPPED="IndianOS: R136 actual NIC IRQ observed and masked before DMA release PASSED"
+def verify_irq_trace(text):
+    required=(MARKERS[1],IRQ_ARMED,MARKERS[2],MARKERS[-2],IRQ_STOPPED,MARKERS[-1])
+    if (any(text.count(marker)!=1 for marker in required) or
+        [text.index(marker) for marker in required]!=sorted(text.index(marker) for marker in required) or
+        "IndianOS: FATAL" in text):
+        raise AssertionError("missing, duplicate or unordered real NIC IRQ/DMA retirement receipts")
 def u16(b:bytes)->int:return int.from_bytes(b,"big")
 def u32(b:bytes)->int:return int.from_bytes(b,"big")
 def be16(value:int)->bytes:return value.to_bytes(2,"big")
@@ -172,7 +180,7 @@ class Protocol:
             raise AssertionError(f"unexpected TCP phase={self.phase} flags={flags}")
         raise AssertionError(f"unexpected IPv4 protocol {protocol}")
 
-def run(qemu:str,iso:pathlib.Path,ovmf:pathlib.Path)->None:
+def run(qemu:str,iso:pathlib.Path,ovmf:pathlib.Path,require_irq:bool=False,serial_log:pathlib.Path|None=None)->None:
     protocol=Protocol()
     listener=socket.socket(socket.AF_INET,socket.SOCK_STREAM)
     listener.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
@@ -229,6 +237,7 @@ def run(qemu:str,iso:pathlib.Path,ovmf:pathlib.Path)->None:
             if "IndianOS: FATAL" in text:
                 raise AssertionError("kernel network fatal:\n"+text[-8000:])
             if all(s in text for s in MARKERS) and protocol.phase>=7:
+                if require_irq:verify_irq_trace(text)
                 position=0
                 for marker in MARKERS:
                     at=text.find(marker,position)
@@ -247,6 +256,9 @@ def run(qemu:str,iso:pathlib.Path,ovmf:pathlib.Path)->None:
                 break
         raise AssertionError("QEMU networking timeout:\n"+output[-8000:].decode("utf-8","replace"))
     finally:
+        if serial_log is not None:
+            serial_log.parent.mkdir(parents=True,exist_ok=True)
+            serial_log.write_bytes(output)
         selector.close()
         if connection is not None:connection.close()
         listener.close()
@@ -260,8 +272,10 @@ def main():
     parser.add_argument("--iso",type=pathlib.Path,required=True)
     parser.add_argument("--qemu",required=True)
     parser.add_argument("--ovmf",type=pathlib.Path,required=True)
+    parser.add_argument("--require-nic-irq",action="store_true")
+    parser.add_argument("--serial-log",type=pathlib.Path)
     args=parser.parse_args()
     if not args.iso.is_file() or not args.ovmf.is_file():
         parser.error("QEMU ISO or firmware not found")
-    run(args.qemu,args.iso.resolve(),args.ovmf.resolve())
+    run(args.qemu,args.iso.resolve(),args.ovmf.resolve(),args.require_nic_irq,args.serial_log)
 if __name__=="__main__":main()

@@ -244,3 +244,249 @@ mod m1_gate20_w3_acl_tests {
    parent,&[],parent,owner));
  }
 }
+
+/// Two bounded, persisted named-user exceptions. The existing mode's group
+/// bits are the named-entry mask; matching named users do not fall through to
+/// group/other rights. This convention is intentionally narrower than POSIX
+/// extended ACLs (no named groups, default inheritance or independent mask).
+/// UID zero is reserved for an unused slot; root uses its existing override.
+#[derive(Clone,Copy,Debug,Eq,PartialEq)]
+pub struct NamedUsers{entries:[(u16,u16);2]}
+impl NamedUsers{
+ pub const EMPTY:Self=Self{entries:[(0,0);2]};
+ /// Canonical storage has increasing, nonzero UIDs followed by empty slots.
+ /// Reject malformed input instead of sorting away duplicate/ambiguous grants.
+ pub fn from_entries(entries:[(u16,u16);2])->Option<Self>{
+  let result=Self{entries};result.validate().then_some(result)
+ }
+ pub const fn entries(self)->[(u16,u16);2]{self.entries}
+ pub fn validate(self)->bool{
+  let mut previous=0;let mut ended=false;
+  for (uid,rights) in self.entries{
+   if rights&!7!=0{return false;}
+   if uid==0{if rights!=0{return false;}ended=true;}
+   else{
+    if ended||uid<=previous{return false;}previous=uid;
+   }
+  }
+  true
+ }
+ pub fn allows(self,permissions:Permissions,caller:Credentials,access:u16)->bool{
+  // Validate persisted ACL and mode before root or owner precedence, so
+  // corrupt metadata cannot regain authority through the privileged branch.
+  if !self.validate()||permissions.mode&!0o777!=0||access&!7!=0{return false;}
+  if caller.uid()==0||caller.uid()==permissions.owner{
+   return permissions.allows(caller,access);
+  }
+  if let Some((_,rights))=self.entries.iter().find(|(uid,_)|*uid==caller.uid()){
+   let effective=rights&((permissions.mode>>3)&7);
+   return effective&access==access;
+  }
+  permissions.allows(caller,access)
+ }
+ /// Caller identity must be kernel-issued. Only root or the current owner
+ /// may set/remove an entry; explicit rights=0 denies matching-user access.
+ /// Removing an absent UID is idempotent, while a full table rejects additions.
+ pub fn update(self,permissions:Permissions,caller:Credentials,uid:u16,
+  rights:Option<u16>)->Option<Self>{
+  if !self.validate()||permissions.mode&!0o777!=0||uid==0||
+   (caller.uid()!=0&&caller.uid()!=permissions.owner)||
+   rights.is_some_and(|value|value&!7!=0){return None;}
+  let mut entries=self.entries;
+  let found=entries.iter().position(|(entry,_)|*entry==uid);
+  match (found,rights){
+   (Some(index),Some(value))=>entries[index].1=value,
+   (Some(index),None)=>{
+    for i in index..entries.len()-1{entries[i]=entries[i+1];}
+    entries[1]=(0,0);
+   },
+   (None,None)=>return Some(self),
+   (None,Some(value))=>{
+    let index=entries.iter().position(|(entry,_)|*entry==0)?;
+    entries[index]=(uid,value);
+    if index==1&&entries[0].0>uid{entries.swap(0,1);}
+   },
+  }
+  Self::from_entries(entries)
+ }
+}
+
+#[cfg(test)]
+mod named_user_acl_tests{
+ use super::*;
+ #[test]fn empty_acl_preserves_owner_group_other_and_root_semantics(){
+  let permissions=Permissions::new(100,7,0o640).unwrap();
+  for caller in [Credentials::kernel(0,0),Credentials::kernel(100,9),
+   Credentials::kernel(200,7),Credentials::kernel(200,9)]{
+   for access in 0..16{
+    assert_eq!(NamedUsers::EMPTY.allows(permissions,caller,access),permissions.allows(caller,access));
+   }
+  }
+ }
+ #[test]fn matching_user_uses_mask_without_group_or_other_fallback(){
+  let permissions=Permissions::new(100,7,0o647).unwrap();
+  let acl=NamedUsers::from_entries([(200,READ|WRITE),(300,0)]).unwrap();
+  assert!(acl.allows(permissions,Credentials::kernel(200,9),READ));
+  assert!(!acl.allows(permissions,Credentials::kernel(200,7),WRITE));
+  assert!(!acl.allows(permissions,Credentials::kernel(200,9),SEARCH));
+  assert!(!acl.allows(permissions,Credentials::kernel(300,7),READ));
+  assert!(acl.allows(permissions,Credentials::kernel(300,7),0));
+  assert!(acl.allows(permissions,Credentials::kernel(400,9),READ|WRITE|SEARCH));
+  assert!(acl.allows(permissions,Credentials::kernel(0,0),READ|WRITE|SEARCH));
+  let owner_entry=NamedUsers::from_entries([(100,0),(200,0)]).unwrap();
+  assert!(owner_entry.allows(permissions,Credentials::kernel(100,9),READ|WRITE));
+ }
+ #[test]fn owner_admin_is_bounded_canonical_and_removal_is_idempotent(){
+  let permissions=Permissions::new(100,7,0o660).unwrap();let owner=Credentials::kernel(100,9);
+  let first=NamedUsers::EMPTY.update(permissions,owner,300,Some(READ)).unwrap();
+  let full=first.update(permissions,owner,200,Some(WRITE)).unwrap();
+  assert_eq!(full.entries(),[(200,WRITE),(300,READ)]);
+  assert!(full.update(permissions,owner,400,Some(READ)).is_none());
+  assert_eq!(full.update(permissions,owner,400,None),Some(full));
+  assert_eq!(full.update(permissions,owner,200,None).unwrap().entries(),[(300,READ),(0,0)]);
+  let updated=full.update(permissions,owner,300,Some(0)).unwrap();
+  assert_eq!(updated.entries(),[(200,WRITE),(300,0)]);
+  assert!(full.update(permissions,Credentials::kernel(200,7),300,None).is_none());
+  assert!(full.update(permissions,owner,0,None).is_none());
+  assert!(full.update(permissions,owner,200,Some(8)).is_none());
+  assert!(full.update(permissions,Credentials::kernel(0,0),200,None).is_some());
+ }
+ #[test]fn corrupt_acl_or_mode_cannot_be_laundered_even_by_root(){
+  let permissions=Permissions::new(100,7,0o777).unwrap();let root=Credentials::kernel(0,0);
+  for entries in [[(1,4),(1,2)],[(2,4),(1,2)],[(0,0),(1,4)],[(0,4),(0,0)],[(1,8),(0,0)]]{
+   assert!(NamedUsers::from_entries(entries).is_none());
+   let corrupt=NamedUsers{entries};assert!(!corrupt.validate());
+   assert!(!corrupt.allows(permissions,root,READ));
+   assert!(corrupt.update(permissions,root,1,None).is_none());
+  }
+  let corrupt=Permissions{mode:0o1777,..permissions};
+  assert!(!NamedUsers::EMPTY.allows(corrupt,root,0));
+  assert!(NamedUsers::EMPTY.update(corrupt,root,1,Some(READ)).is_none());
+ }
+ #[test]fn chmod_masks_retained_grant_and_owner_transfer_has_owner_precedence(){
+  let owner=Credentials::kernel(100,7);let user=Credentials::kernel(200,9);
+  let permissions=Permissions::new(100,7,0o660).unwrap();
+  let acl=NamedUsers::EMPTY.update(permissions,owner,200,Some(READ|WRITE)).unwrap();
+  assert!(acl.allows(permissions,user,READ|WRITE));
+  let restricted=permissions.with_mode(owner,0o600).unwrap();
+  assert!(!acl.allows(restricted,user,READ));
+  let transferred=restricted.with_owner(Credentials::kernel(0,0),200).unwrap();
+  assert!(acl.allows(transferred,user,READ|WRITE));
+  assert!(acl.update(transferred,owner,300,Some(READ)).is_none());
+ }
+}
+
+/// Four canonical, persisted logical storage quotas. Usage is derived from the
+/// same COW metadata checkpoint by the filesystem, never a caller-provided UID
+/// or a volatile counter. Root is deliberately unquotaed; UID zero marks an
+/// unused record. An active (uid,0,0) entry denies any owned storage objects.
+#[derive(Clone,Copy,Debug,Eq,PartialEq)]
+pub struct UserQuotas{entries:[(u16,u16,u32);4]}
+impl UserQuotas{
+ pub const EMPTY:Self=Self{entries:[(0,0,0);4]};
+ pub const MAX_OBJECTS:u16=8;
+ pub const MAX_BYTES:u32=16384;
+ pub fn from_entries(entries:[(u16,u16,u32);4])->Option<Self>{
+  let result=Self{entries};result.validate().then_some(result)
+ }
+ pub const fn entries(self)->[(u16,u16,u32);4]{self.entries}
+ /// Reject duplicate/unsorted users and malformed padding before any bypass.
+ pub fn validate(self)->bool{
+  let mut previous=0;let mut ended=false;
+  for (uid,objects,bytes) in self.entries{
+   if objects>Self::MAX_OBJECTS||bytes>Self::MAX_BYTES{return false;}
+   if uid==0{
+    if objects!=0||bytes!=0{return false;}ended=true;
+   }else{
+    if ended||uid<=previous{return false;}previous=uid;
+   }
+  }
+  true
+ }
+ /// The filesystem supplies checked totals for the proposed checkpoint. An
+ /// unlisted user has no policy cap; global object/extent bounds still apply.
+ pub fn allows(self,uid:u16,objects:u64,bytes:u64)->bool{
+  if !self.validate(){return false;}
+  if uid==0{return true;}
+  match self.entries.iter().find(|entry|entry.0==uid){
+   Some((_,object_limit,byte_limit))=>objects<=u64::from(*object_limit)&&bytes<=u64::from(*byte_limit),
+   None=>true,
+  }
+ }
+ /// Root-only configuration. Lowering a quota must separately validate actual
+ /// ownership in the proposed COW metadata before the filesystem publishes it.
+ pub fn update(self,caller:Credentials,uid:u16,limit:Option<(u16,u32)>)->Option<Self>{
+  if !self.validate()||caller.uid()!=0||uid==0||
+   limit.is_some_and(|(objects,bytes)|objects>Self::MAX_OBJECTS||bytes>Self::MAX_BYTES){return None;}
+  let mut entries=self.entries;
+  match (entries.iter().position(|entry|entry.0==uid),limit){
+   (Some(index),Some((objects,bytes)))=>entries[index]=(uid,objects,bytes),
+   (Some(index),None)=>{
+    for i in index..entries.len()-1{entries[i]=entries[i+1];}
+    entries[3]=(0,0,0);
+   },
+   (None,None)=>return Some(self),
+   (None,Some((objects,bytes)))=>{
+    let mut index=entries.iter().position(|entry|entry.0==0)?;
+    entries[index]=(uid,objects,bytes);
+    while index>0&&entries[index-1].0>uid{entries.swap(index-1,index);index-=1;}
+   },
+  }
+  Self::from_entries(entries)
+ }
+}
+
+#[cfg(test)]
+mod persistent_user_quota_policy_tests{
+ use super::*;
+ fn root()->Credentials{Credentials::kernel(0,0)}
+ #[test]fn root_only_administration_checks_all_limits_and_reserved_uid(){
+  let empty=UserQuotas::EMPTY;
+  assert!(empty.update(Credentials::kernel(100,7),100,Some((1,1))).is_none());
+  assert!(empty.update(Credentials::kernel(100,0),100,None).is_none());
+  assert!(empty.update(root(),0,Some((1,1))).is_none());
+  assert!(empty.update(root(),0,None).is_none());
+  assert!(empty.update(root(),100,Some((9,1))).is_none());
+  assert!(empty.update(root(),100,Some((1,16385))).is_none());
+  let quota=empty.update(root(),u16::MAX,Some((8,16384))).unwrap();
+  assert!(quota.allows(u16::MAX,8,16384));
+  assert!(!quota.allows(u16::MAX,9,16384));assert!(!quota.allows(u16::MAX,8,16385));
+ }
+ #[test]fn insertion_is_canonical_and_full_tables_allow_replacement_and_removal(){
+  let mut quota=UserQuotas::EMPTY;
+  for uid in [400,100,300,200]{quota=quota.update(root(),uid,Some((1,10))).unwrap();}
+  assert_eq!(quota.entries(),[(100,1,10),(200,1,10),(300,1,10),(400,1,10)]);
+  assert!(quota.update(root(),500,Some((1,10))).is_none());
+  assert_eq!(quota.update(root(),500,None),Some(quota));
+  let replacement=quota.update(root(),200,Some((0,0))).unwrap();
+  assert_eq!(replacement.entries()[1],(200,0,0));
+  let removed=replacement.update(root(),100,None).unwrap();
+  assert_eq!(removed.entries(),[(200,0,0),(300,1,10),(400,1,10),(0,0,0)]);
+  assert_eq!(removed.update(root(),100,None),Some(removed));
+ }
+ #[test]fn zero_limits_and_large_usage_never_wrap_into_admission(){
+  let quota=UserQuotas::EMPTY.update(root(),100,Some((0,0))).unwrap();
+  assert!(quota.allows(100,0,0));
+  for (objects,bytes) in [(1,0),(0,1),(u64::MAX,0),(0,u64::MAX),(u64::MAX,u64::MAX)]{
+   assert!(!quota.allows(100,objects,bytes));
+  }
+  assert!(quota.allows(0,u64::MAX,u64::MAX));
+  assert!(quota.allows(200,u64::MAX,u64::MAX)); // no configured cap
+ }
+ #[test]fn corrupt_policy_fails_closed_even_for_root_and_cannot_be_updated(){
+  for entries in [
+   [(100,1,1),(100,2,2),(0,0,0),(0,0,0)],
+   [(200,1,1),(100,1,1),(0,0,0),(0,0,0)],
+   [(0,0,0),(100,1,1),(0,0,0),(0,0,0)],
+   [(0,1,0),(0,0,0),(0,0,0),(0,0,0)],
+   [(0,0,1),(0,0,0),(0,0,0),(0,0,0)],
+   [(100,9,1),(0,0,0),(0,0,0),(0,0,0)],
+   [(100,1,16385),(0,0,0),(0,0,0),(0,0,0)],
+  ]{
+   assert!(UserQuotas::from_entries(entries).is_none());
+   let corrupt=UserQuotas{entries};assert!(!corrupt.validate());
+   assert!(!corrupt.allows(0,0,0));assert!(!corrupt.allows(500,0,0));
+   assert!(corrupt.update(root(),100,None).is_none());
+  }
+ }
+}

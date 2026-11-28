@@ -9,6 +9,44 @@
 indianos_user_return_rsp: .quad 0
 .global indianos_user_return_cr3
 indianos_user_return_cr3: .quad 0
+.balign 16
+.global indianos_kernel_fxstate
+indianos_kernel_fxstate: .skip 512
+.global indianos_user_fxstate
+indianos_user_fxstate: .quad 0
+.global indianos_user_fx_live
+indianos_user_fx_live: .byte 0
+
+/* Eager extended-state boundary. Only RAX and flags are scratch; preserve
+ * RAX so these helpers may run before GPR restoration or with fault RDI live.
+ * A null context leaves historical profiles unchanged. BSP + IRQ-off only. */
+.text
+.global indianos_fx_enter_user
+.type indianos_fx_enter_user,@function
+indianos_fx_enter_user:
+    pushq %rax
+    movq indianos_user_fxstate(%rip), %rax
+    testq %rax, %rax
+    jz 1f
+    fxsave64 indianos_kernel_fxstate(%rip)
+    fxrstor64 (%rax)
+    movb $1, indianos_user_fx_live(%rip)
+1:  popq %rax
+    retq
+.size indianos_fx_enter_user, .-indianos_fx_enter_user
+.global indianos_fx_enter_kernel
+.type indianos_fx_enter_kernel,@function
+indianos_fx_enter_kernel:
+    pushq %rax
+    cmpb $0, indianos_user_fx_live(%rip)
+    je 1f
+    movq indianos_user_fxstate(%rip), %rax
+    fxsave64 (%rax)
+    movb $0, indianos_user_fx_live(%rip)
+    fxrstor64 indianos_kernel_fxstate(%rip)
+1:  popq %rax
+    retq
+.size indianos_fx_enter_kernel, .-indianos_fx_enter_kernel
 
 .text
 .global x86_64_enter_user
@@ -26,6 +64,7 @@ x86_64_enter_user:
     movq %cr3, %rax
     movq %rax, indianos_user_return_cr3(%rip)
     movq %rdx, %cr3
+    call indianos_fx_enter_user
     movw $0x33, %ax
     movw %ax, %ds
     movw %ax, %es
@@ -54,6 +93,7 @@ x86_64_resume_user:
     movq %cr3, %rax
     movq %rax, indianos_user_return_cr3(%rip)
     movq %rsi, %cr3
+    call indianos_fx_enter_user
     movw $0x33, %ax
     movw %ax, %ds
     movw %ax, %es
@@ -100,8 +140,10 @@ x86_64_user_interrupt:
     pushq %r14
     pushq %r15
     movq %rsp, %rdi
+    call indianos_fx_enter_kernel
     call x86_64_user_syscall_dispatch
     movq %rax, 112(%rsp)
+    call indianos_fx_enter_user
     popq %r15
     popq %r14
     popq %r13
@@ -164,7 +206,12 @@ x86_64_timer_interrupt:
     pushq %r14
     pushq %r15
     movq %rsp, %rdi
+    call indianos_fx_enter_kernel
     call x86_64_scheduler_timer_dispatch
+    testb $3, 128(%rsp)
+    jz 1f
+    call indianos_fx_enter_user
+1:
     popq %r15
     popq %r14
     popq %r13

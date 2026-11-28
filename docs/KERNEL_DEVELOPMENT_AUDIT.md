@@ -194,3 +194,748 @@ points and their limits; existing helper modules/tests must be reused where vali
 | M1-P6-007 — USB/xHCI keyboard/mouse stack | `input.rs`, `ps2_mouse.rs`; `ScanDecoder`, `Mouse` | PS/2 paths do not establish USB/xHCI support. | Host controller, enumeration, rings and HID report delivery. **Exit:** Real xHCI keyboard/mouse, disconnect/reset and hostile descriptor tests. | R |
 | M1-P6-008 — Modern display/GPU devices | `hardware_pcie.rs`, `gui.rs`; `scan`, `compositor_commit` | GPU discovery plus CPU framebuffer presentation is not GPU acceleration. | Validated device commands, memory/resource isolation and reset. **Exit:** Actual supported GPU backend plus preserved software fallback. | R |
 | M1-P6-009 — Hardware inventory across selected physical PCs | `hardware_inventory.rs`, `hardware_pcie.rs`; `inspect_cpu`, `scan` | Emulated discovery exists; selected-PC driver receipts were not supplied. | Publish and qualify a physical CPU/IRQ/input/display/storage/NIC matrix. **Exit:** Exact machine/firmware/device IDs and independent negative/recovery receipts. | H |
+
+PR #823 merged as `cfdcfab34a2178785360fcbabc64ecf0edba9c57`, adding shared
+small-object scratch arenas. The next allocation slice adds bounded quarantine
+recovery and classified pressure diagnostics. P2-004/P2-011 remain open pending
+the remaining implementation and end-to-end acceptance requirements described in
+[KERNEL_FRAME_ALLOCATION.md](KERNEL_FRAME_ALLOCATION.md).
+
+## PR #825 expanded implementation boundary — 26 Nov 2026
+
+The owner requested the following ten workstreams in the same open integration
+PR. This is a pending-work ledger, not ten completed features or new acceptance.
+Reuse the canonical task IDs and implementations above; do not create duplicate
+allocator, scheduler, VFS, supervisor or controller models.
+
+| Requested workstream | Existing implementation to extend | Remaining implementation/acceptance |
+| --- | --- | --- |
+| Heap, OOM and memory quotas | `kernel_heap.rs`, `kernel_arena.rs`, `user_image.rs`; P2-004/011 | Noncontiguous heap backing and bounded pressure recovery now implemented in #825. Broader consumers, total/shared RSS, global OOM and SMP admission remain. |
+| Demand paging and COW | `paging.rs`, `vmm.rs`, `user_runtime.rs`; P2-006 | Demand-zero stack faults and shared-zero write splitting are implemented below. General fork/shared-page reference ownership, rollback and recyclable COW still remain. |
+| Multicore scheduling, IPIs/TLB | `smp_lifecycle_fence.rs`, `timer.rs`, `user_runtime.rs`; P2-008/009 | Actual AP run queues, remote wakeup/shootdown acknowledgements, race and teardown acceptance. |
+| FPU/SIMD context | `fpu_context.rs`, `cpu_entry.rs`, `arch/x86_64/*entry.S`, `user_runtime.rs`; P2-010 | This slice implements eager BSP x87/MMX/SSE context boundaries. Exact-head guest evidence, preemptive register retention, AVX/XSAVE and migration remain unaccepted. |
+| Threads, futexes and signals | `ipc.rs`, `user_runtime.rs`; P3-001/009 | General thread ownership, wait/wake/timeout/cancellation races and signal delivery. |
+| Spawn/exec/wait and supervision | `user_image.rs`, `user_runtime.rs`, `service_supervisor.rs`; P3-003/011/012 | Arbitrary approved-image lifecycle and parent/wait semantics beyond fixed desktop roles. |
+| Native fsync, blocking locks, ACLs/quotas | `fs_handles.rs`, `syscall.rs`, `durablefs.rs`; P4-006/008/009/010 | Descriptor fsync and bounded scheduler-backed range-lock waits are implemented below. Trusted VFS owner/group changes now share COW metadata publication. General lock fairness, interrupted durability acceptance, native ownership administration, named-user ACLs and persistent user accounting remain. |
+| Normal networking and DMA ownership | `network.rs`, process retirement and PCI inventory; P5-004/005/006, P6-005 | Normal driver binding, IRQ/DMA/IOMMU lifetime and reset/error acceptance. |
+| AHCI/NVMe and USB/xHCI | `batch3_ahci.rs`, `batch3_nvme.rs`, hardware inventory; P6-006/007 | Existing descriptor/queue models must become real initialized controllers; DMA, interrupts, completion, reset, flush and devices. |
+| Verified boot, ACPI and physical qualification | boot handoff, hardware inventory and power primitives; P1-009/010, P5-001/009, P6-009 | Firmware trust/revocation/recovery chain and selected physical-machine power/device receipts. |
+
+### Eager x87/SSE ownership implementation
+
+Each normal desktop Task owns a 16-byte-aligned 512-byte FXSAVE64 context.
+Preparation initializes empty x87/MMX registers, zero SSE payloads and masked
+architectural control defaults, including on compositor replacement. Client
+contexts remain in their existing Tasks during compositor-only recovery.
+
+The admitted BSP configures CR0.MP/NE and CR4.OSFXSR/OSXMMEXCPT, clearing EM/TS.
+Missing x87/FXSR/SSE/SSE2, enabled OSXSAVE, enabled AMD FFXSR or enabled interrupts
+refuse admission. No AVX state is advertised or discarded silently. All context
+and helper/global addresses must preserve their supervisor mapping in each
+process root before readiness.
+
+Raw entry/resume saves kernel state and restores that Task. Syscall, PIT/APIC
+timer, keyboard/mouse and terminal fault entry save live user state and restore
+kernel state before Rust executes. Direct interrupt returns restore user state
+only for a CPL3 frame; an IRQ interrupting kernel code must not acquire user
+state. Scheduling/exit paths retain the already saved Task context. Historical
+profiles leave the context pointer null and keep their existing behavior.
+This remains single-BSP ownership, not per-CPU storage or multicore scheduling.
+
+Three host cases cover size/alignment/defaults, CPU-state admission and fresh
+process payloads. Existing IRQ assembly tests link the real production helpers.
+A separate `DESKTOP_FPU_ACCEPTANCE=1` image enables the user fixture feature,
+which gives each PID distinct x87 values, XMM0/XMM15 and rounding controls, then
+checks them across four yields. The additional QEMU harness requires all four
+receipts before desktop readiness and retains serial/screenshot artifacts.
+Ordinary normal-desktop acceptance still runs against the fixture-free image.
+The fixture is cooperative scheduling evidence, not proof of preemption, AVX,
+physical devices, general threads or migration. Two host evidence-oracle cases
+reject missing/duplicate/late receipts. GitHub runs all builds/tests; none was
+executed locally. All formal gate counts and completion estimates are unchanged.
+
+### Native descriptor fsync integration (P4-008)
+
+Native syscall 33 now admits descriptor operation 27 and advertises additive
+feature bit 64 through the existing version-1, 64-byte ABI query. The descriptor
+must contain only a live handle: path, argument, pointer, length and reserved
+bytes are zero. The existing authenticated fsync backend enforces current
+process incarnation, namespace, selected volume and write authority, verifies
+metadata and invokes the actual driver barrier. It returns the verified durable
+generation, or the existing BAD result on failure. CLOSE remains cleanup rather
+than an implicit durability guarantee. Shutdown may repeat a nonmutating fsync
+but continues refusing new opens and writes.
+
+Desktop broker positioned writes now require fsync before reporting success;
+Files proves a read-only handle cannot issue it. The normal QEMU oracle requires
+exactly one fresh flush receipt before the positioned-write receipt, preserved
+reader/cursor evidence and successful graphical commit. Negative controls reject
+missing, duplicate or reordered flush evidence. Native ingress guard/crossing
+checks now cover operation 27. Existing backend fsync success/argument/permission
+and selected shared-reader tests are reused; a new failed-barrier case proves
+writer revocation without charging a mutation. No local tests/builds were run.
+Exact-head GitHub/QEMU results and interruption/power-loss qualification remain
+necessary; this does not complete blocking locks, ACL administration or quotas.
+
+### Reserved-stack demand paging (P2-006)
+
+Normal desktop preparation now retains the top stack page and defers the other
+reserved stack leaves after the existing full-footprint quota check. Deferred
+slots retain their virtual addresses and remain charged in page_count and the
+original image/private-launch budget. They are reservations, not resident RSS.
+The stack must fit in one 2-MiB leaf-table span; its top resident leaf pins every
+intermediate table borrowed by the running process root. No active PML4 child
+can disappear during this conversion or during demand allocation.
+
+A recoverable user page fault must be vector 14, CS 0x2b, and exactly a user
+not-present read/write error (4 or 6). The active Task, running PCB, image pointer,
+authority and CR3 must agree under BSP/IRQ-disabled retirement admission. Only
+an owned deferred stack slot is eligible. A fresh PMM page is recorded before
+access, zeroed, installed user/RW/NX, then invalidated in the active CPU TLB.
+Protection, NX, guard, reserved-bit, foreign mapping and kernel faults retain
+termination behavior. Failed allocation never publishes a mapping. A refused
+rollback remains in a Task-owned physical frame receipt, retried before image
+or PCB reclamation; it cannot be mistaken for an app pixel guard.
+
+The raw exception entry now saves all 15 GPRs, supplies the unchanged vector/
+error/RIP/CS/RFLAGS context with ABI stack alignment, and restores registers and
+x87/SSE state only after successful recovery. It discards vector/error and clears
+only CPU-generated RF before IRET. Every unrecovered exception still takes the
+existing Rust terminal/fault isolation path. The legacy C implementation is
+unchanged; this is the normal Rust desktop path.
+
+Four image tests cover zeroed NX demand allocation and conserved quota/frames,
+guard/protection/foreign mapping refusal, OOM/failed rollback ownership, and
+failed initial deferral cleanup. Four host assembly oracles exercise the actual
+return stub with CLI/IRET substituted, including pointer/register/RF mutations.
+Those oracles do not claim hardware exception execution. The separate opt-in
+guest fixture explicitly reads one absent stack page and writes another for
+each of the four PIDs while x87/XMM state is live, then yields four times. Its
+harness requires actual kernel fault-recovery receipts before readiness plus
+the existing per-PID state-retention receipts. Existing normal desktop, guard,
+exception, reboot, persistence, input and recovery checks remain required.
+
+No local builds/tests/QEMU were run. Exact-head GitHub results are pending.
+This does not implement demand-mapped ELF segments, arbitrary heap/mmap growth,
+copy-on-write/shared-page refcounts, remote TLB invalidation or general fork.
+P2-006 and requested points 3, 5, 6, 8, 9 and 10 remain unfinished. No formal
+milestone or percentage changes.
+
+### Exact-root invalidation and two-CPU remap qualification (P2-008/009)
+
+The native demand-fault return now uses a shared local invalidation primitive
+that checks an aligned canonical page address, an exact current CR3 root and
+masked interrupts before INVLPG. It invalidates the current CPU/PCID only; it
+cannot authorize remote frame reuse or replace an IPI acknowledgement.
+
+The existing isolated two-vCPU Limine test now performs actual remapped-page
+readback before its lifecycle acknowledgements. BSP validates translations of
+three page-aligned static page tables and two distinct static data pages, then
+publishes a supervisor/RW/NX alias in an unused high-half PML4 slot. AP must
+match the source CR3 and prime a real cached translation. BSP alternates that
+leaf between the two physical pages for 64 generations. The real AP invalidates
+locally and reads the new page before the existing release/acquire fence may
+acknowledge. BSP waits for that exact receipt before issuing the next remap.
+No table/data backing is released: it remains kernel-owned until both CPUs
+halt, before PMM, tasks, devices or filesystems start.
+
+An explicit stale-translation fixture omits AP INVLPG after priming. A read of
+the prior physical page must refuse acknowledgement, leave the fence pending,
+and prevent BSP success. Its oracle requires the real prime/read-refusal/fatal
+ordering and forbids successful 64-generation receipts. A generic startup error
+cannot pass this negative case. Positive acceptance requires all exact ordered
+receipts without duplicates or refusal. Both guest transcripts are retained
+as exact-head GitHub artifacts, including on failure.
+
+Four Rust host cases cover invalidation admission and proof backing geometry;
+three host oracle cases cover positive/negative receipt requirements. Existing
+lifecycle-fence stale/failed-local-work tests are reused. Actual QEMU positive
+and stale-control execution is required in the existing AP workflow. No local
+build/test/QEMU execution was performed. Until exact-head runs pass, these are
+implemented paths and pending qualification, not verified remote-TLB acceptance.
+
+This advances point 3 but does not complete it. Normal boot still parks APs.
+Per-CPU IDT/TSS, IPI routing, run queues, scheduler migration, concurrent PMM
+ownership and production multi-CPU shootdown/reclamation remain unfinished.
+Points 5, 6, 8, 9 and 10 remain in the pending ledger; no formal gate or completion
+percentage changes.
+
+### Native supervised-child query/wait (P3-003/011/012)
+
+Syscall 40 now exposes QUERY (operation 0) and bounded WAIT (operation 1) for
+PID1's kernel-configured service children. Parent authority comes from the real
+active PCB/Task and current filesystem identity, never a descriptor-supplied
+caller. Child PID and a nonzero process incarnation bind a wait to one loaded
+image; a compositor replacement cannot satisfy an old wait. Normal desktop uses
+its existing monotonic incarnation receipts; legacy VFS profiles receive a
+checked monotonic runtime incarnation. The existing fixed role membership is
+retained; this does not invent an arbitrary parent/child process tree.
+
+Input descriptor (64 bytes, little endian):
+
+| Offset | Value |
+| --- | --- |
+| 0 | u16 version 1; u16 size 64 |
+| 4 | u32 target PID, restricted to configured children 2..TASKS |
+| 8 | u64 incarnation; QUERY may use 0 to discover the current incarnation |
+| 16 | u64 selection-round deadline; QUERY 0, WAIT 1..32 |
+| 24 | u64 writable output address for exactly 64 bytes |
+| 32 | 32 reserved zero bytes |
+
+Output: version/size/PID at offsets 0/2/4, incarnation at 8, i32 process state
+at 16, u32 flags at 20 (bit 0 resources reclaimed, bit 1 wait consumed), u64
+exit status at 24 and fault vector at 32; offsets 40..64 are zero. CR3, kernel
+pointers and fault addresses are never exposed. Status/fault values are zero
+until terminal cleanup completes. Return 64 means a complete status copy, 0
+means a wait timeout with unchanged output, and BAD is the existing u64::MAX
+failure result. Unknown versions/operations, reserved bytes, source guard or
+crossing ranges, invalid destinations, stale incarnations and repeated WAITs
+are refused. QUERY remains nondestructive.
+
+WAIT captures a private ring-3 continuation and excludes that caller from
+scheduler selection while eligible peers run. Deadlines count cooperative
+selection rounds, not elapsed time or fabricated hardware ticks. A complete
+exit/fault wins at the deadline. Successful copy-out consumes the completion
+once; copy failure, timeout and stale identity cannot consume it. The exact
+BSP admission permit is explicitly dropped before the noreturn yield transition.
+Parent retirement cancels its continuation before releasing image state. This
+adds a real scheduler wait facility, not general threads, futexes or signals.
+
+Seven module tests cover request geometry, cleanup gating, timeout/peer chance,
+parent/child reuse, consumption, copy failure and fault-data isolation. Native
+ingress tests cover complete descriptors and guard/crossing addresses. The
+existing five-boot durable VFS guest now first times out while its child is
+parked, then launches it, blocks until real exit/reclamation, verifies status,
+and rejects replay. The child proves it cannot query supervisor status. Parent
+also tests stale generation, reserved fields and an unmapped output guard.
+The existing reboot/persistence harness requires these ordered live receipts.
+No local build, test or QEMU execution was performed; exact-head cloud results
+remain required before acceptance.
+
+This advances point 6 and the bounded wait prerequisite for point 5. General
+spawn/exec, arbitrary parentage, service restart policy beyond existing roles,
+threads/futexes/signals, normal IRQ/DMA/IOMMU networking, AHCI/NVMe/xHCI drivers,
+verified boot and physical power/device qualification remain unfinished. No
+formal gate or completion percentage changes.
+
+### Legacy NIC interrupt notifications and DMA retirement (P6-005)
+
+The existing QEMU virtio-net driver now has an explicit exclusive-IRQ11
+qualification profile (`R136_NIC_IRQ_TEST=1`, Cargo `test-r136-nic-irq`). The
+ordinary polled network profile and normal desktop are separate. Normal Desktop
+cannot combine this experimental personality through its existing build gate.
+
+The driver validates the real PCI interrupt line/pin and COMMAND readback before
+arming notifications. Its DPL0 IDT stub preserves all GPRs and arbitrary kernel
+stack alignment. The ISR masks IRQ11 before acknowledging the device ISR and
+slave/master PIC, counts genuine queue notifications, and never dereferences a
+DMA ring, packet, process, scheduler or heap. Removed-device/config-change ISR
+values fail closed. Only the exclusive pre-user BSP profile may remap the PIC
+and select legacy interrupt routing; this is not a generic platform IRQ router.
+
+Bounded one-shot STI/NOP/CLI windows let actual device interrupts run while the
+queue consumer retains exclusive DMA ownership. Polling windows are rate-limited;
+completed RX/TX descriptors force a notification window before consumption. The
+ISR masks its source before EOI so a stuck shared line cannot indefinitely
+starve CLI. Shared devices/IRQs remain unsupported. Driver close masks and revokes
+IRQ notification admission before the existing verified reset, PCI bus-master
+disable and PMM ring release. If quiescence/reset/identity is uncertain, DMA
+backing remains retained. No interrupt handler can touch released ring storage.
+
+Two host admission/status cases and one negative receipt-oracle case were added.
+The existing network workflow preserves its original polled guest test, then
+builds a separate IRQ image and requires real ARP/ICMP/UDP/DNS/TCP packets,
+IRQ arming, a nonzero real interrupt count and verified masking/reset before
+success. It retains the guest serial transcript as an exact-head artifact.
+Host-side packet validation still runs through QEMU's isolated socket backend;
+no host physical NIC, public network or disk is attached. No local build/test/
+QEMU execution was performed; exact-head GitHub results remain pending.
+
+This advances point 8 without completing normal networking, interrupt-driven
+multiqueue processing, MSI/MSI-X, IOMMU mappings or physical device qualification.
+Points 5 (general threads/futexes/signals), 6 (general spawn/exec/parentage),
+9 (actual AHCI/NVMe/xHCI controllers) and 10 (firmware trust and physical power/
+device acceptance) remain unfinished. No formal gate or percentage changes.
+
+### Demand-zero stack COW (P2-006)
+
+Normal boot now reserves one zero-filled PMM frame under the existing heap BSP/
+IRQ admission before desktop memory-conservation baselines. Ownership is retained
+for the entire boot. Failed mapping/initialization retains the allocation and
+fails boot admission; no user mapping can observe an unpublished page. This
+adds 4096 bytes of fixed kernel backing, separate from the 129 arena table pages.
+
+A not-present stack read maps this shared frame user/read-only/NX without a
+private data allocation. A write to that exact owned shared-zero leaf (page
+fault error 7) allocates and zeroes a private page, then replaces only the
+expected present/user/read-only/NX PTE. The VMM replacement allocates no tables,
+accepts only hardware A/D changes in the expected leaf, and cannot widen an
+executable or foreign mapping. Only after successful replacement does metadata
+publish private ownership and the active-root TLB invalidate. Initial write
+faults still allocate private pages directly. Existing stack reservations and
+launch admission remain charged; these logical quotas are not measured RSS.
+
+OOM or failed preparation leaves the old shared leaf unchanged. A refused new
+frame rollback stays in the Task's existing retained-frame receipt until
+retirement cleanup succeeds. Image teardown unmaps shared leaves but cannot
+release the boot-owned zero frame; peer images remain valid. Boot-lifetime
+ownership intentionally avoids a recyclable shared-page refcount contract.
+There is no general fork, arbitrary file/data COW or multi-CPU page reclamation.
+
+Three zero-page initialization/ownership tests, two exact VMM replacement cases,
+and two image COW cases cover shared reads without extra allocation, private
+write isolation, peer survival after teardown, NX/permissions, OOM and retained
+rollback. The guest proof gives all four processes different bytes on their
+COW-split page and checks those bytes after peers run, while another zero alias
+remains zero. Required kernel receipts distinguish shared admission and the
+actual protection-fault private split. A host oracle rejects missing or reversed
+sharing/split evidence. The ordinary desktop harness also requires the one-time
+zero-page startup receipt and forbids it during compositor-only replacement.
+
+No local builds/tests/QEMU were run. Exact-head GitHub checks and the opt-in
+four-process guest proof remain necessary. This implements demand-zero COW,
+not full P2-006 acceptance; general sharing/refcounts, fork and remote TLB
+reclamation remain unfinished. Other pending workstreams and formal gate counts
+remain unchanged.
+
+### Bounded native blocking range locks (P4-009)
+
+Syscall 41 adds READ/WRITE range-lock waits using the existing authenticated
+nonblocking lock operations 34/35. ABI discovery advertises additive feature
+bit 128 through version-1 filesystem QUERY. It does not add another lock table
+or probe a disk during scheduler wakeup. Input is a 64-byte little-endian record:
+version u16=1/size u16=64 at 0, reserved u32=0 at 4, opaque handle u64 at 8,
+existing packed range u64 at 16, timeout u64=1..32 at 24, and 32 reserved zero
+bytes at 32. The syscall operation is 34 or 35. Return 0 means acquired, 1 means
+timeout, and BAD means invalid/revoked authority. A zero range retains the
+existing whole-file meaning and fixed extent bounds.
+
+Contended requests capture a private scheduler continuation and stop dispatching
+the blocked caller while peers run. A kernel-only receipt binds the full handle
+state, process incarnation, namespace revision and selected volume/revision.
+Every retry revalidates that receipt before invoking the existing lock control.
+Close, namespace narrowing, volume replacement/quarantine or PID reuse cannot
+retarget a queued wait. Unrelated metadata changes conservatively fail the wait
+rather than silently widening object identity. Receipt types remain BSP-local.
+
+The shared cooperative deadline implementation is reused by child waits and
+lock waits. Completion wins at the deadline; the first pending pass gives peers
+an execution opportunity. Deadlines are selection rounds, not wall-clock time.
+Timeout or cancellation preserves prior lock state, including a pending upgrade.
+Retirement cancels the continuation before freeing process resources; durable
+shutdown rejects new lock waits and cancels pending ones before acquisition.
+The exact admission permit is dropped before the noreturn yield transition.
+FIFO fairness, unbounded waits, multiple locks per descriptor, cross-CPU lock
+queues and a general stable inode/free-space implementation remain unfinished.
+
+Five lock-engine/receipt cases, one native ingress case and two guest-evidence
+oracle cases cover unlock handoff, timeout state preservation, closed handles,
+namespace/owner reuse, cancellation, reserved fields and malformed pointers.
+Existing child-wait tests exercise the shared deadline refactor. An opt-in
+DESKTOP_LOCK_ACCEPTANCE=1 image coordinates actual PID1/PID2 against the selected
+/shared/readme: PID2 acquires READ, PID1 queues/times out, PID1 queues again,
+PID2 unlocks/closes its original handle, and PID1 must acquire and resume.
+It also rejects a WRITE request through PID2's read-only handle. PID3/PID4 wait
+until fixture completion, then ordinary four-service startup runs. Kernel queue,
+timeout and acquisition receipts must be fresh and ordered before readiness;
+the copied golden disk must remain unchanged. Serial/screenshot artifacts are
+retained. Ordinary desktop and COW/FPU images remain separate and mandatory.
+
+No local build, test or QEMU execution was performed. Exact-head GitHub results
+are required; no new gate or percentage is accepted. Blocking range waits are
+implemented within the current bounded native service/descriptor model. General
+ACL administration, persistent per-user quotas, arbitrary process/thread/futex/
+signal facilities, SMP scheduling, IOMMU, new storage/USB controllers, firmware
+trust and physical device/power qualification remain pending.
+
+
+### Persistent VFS owner/group administration — next point 7 slice
+
+`HierVfs::chown_as` and `chgrp_as` now connect the existing trusted
+`Permissions::with_owner` / `with_group` policy to durable metadata. Only root
+may transfer an owner; root may select any group, while an ordinary owner may
+select only its own kernel-issued group. Ancestor search is mandatory and
+symlink targets are never followed. Files, directories and symlink metadata use
+the same lookup as chmod, with no new filesystem format or permission table.
+
+Chmod, chown and chgrp share one verified COW metadata publication helper;
+permission changes do not rewrite file data. Authorized unchanged values do not
+advance the generation. Denied requests cannot publish metadata. A successful
+change advances the existing filesystem generation, so existing descriptor and
+queued-lock generation validation remains applicable; trusted callers must use
+that existing invalidation contract and fsync before acknowledging durability.
+
+Three added host tests cover persisted owner transfer and old-owner read denial,
+group restrictions/no-op and denial generations, directory search, directory
+ownership, symlink target isolation, and torn owner/group checkpoint recovery
+with preserved data. Existing GitHub kernel host suites discover these tests.
+No local compilation, test or QEMU execution was performed. Exact-head CI must
+supply compilation/runtime evidence; this patch alone is not acceptance.
+
+This is a trusted VFS API, not a newly exposed native syscall: user-facing owner/
+group administration still needs capability policy, ABI wiring and descriptor
+revocation acceptance. Named-user ACL entries, persistent per-user quotas and
+general inode allocation remain pending. All ten broad workstreams still have
+unfinished implementation or qualification; no gate or percentage is advanced.
+
+
+### Consolidated remaining-work reliability batch (five coding agents)
+
+This batch makes the following source changes, without asserting that the ten
+requested workstreams are complete. Five independent coding agents handled
+memory, process waits, networking, controller models and boot/power parsing;
+the coordinator integrated native filesystem ownership operations and reviewed
+each diff. No local build, host test or guest execution was performed at the
+owner's request. Exact candidate GitHub results remain required.
+
+* Heap admission now bounds aggregate backing across owner epochs, charging live,
+  quarantined and unpublished backend orphan pages. The ceiling permits two
+  maximum framebuffer reservations plus the bounded scratch-slot footprint.
+  Checked arithmetic, conservation on failed release and reuse of existing
+  arena gaps are covered by three added host tests. This is not a system-wide
+  RAM OOM killer or total/shared RSS accounting.
+* Native syscall 33 extends its existing 64-byte descriptor with operation 39
+  (change owner) and 40 (change group), advertised by additive ABI feature bit
+  256. Descriptor layout/version remain unchanged. Argument is an exact u16 ID;
+  path/payload/reserved bytes must be empty, and the existing token identifies
+  the target. PID1 service/namespace policy remains mandatory; owner transfer
+  additionally requires a root kernel-issued credential before device I/O.
+  VFS validates the persisted owner/group policy. No supplied UID becomes caller
+  authority. Foreign outstanding descriptors block administration, success
+  flushes before acknowledgement and revokes all cached descriptors, while
+  uncertain writes/flushes quarantine the volume without charging success.
+  Three selected-volume tests cover real publication/remount, pre-I/O denial,
+  revocation and failed flush; syscall guard-page tests cover both operations.
+* Process wait snapshots reject contradictory state/root/reclamation metadata
+  and stale exit/fault payloads before exposing completion. The process fault
+  transition accepts genuine exception vector zero (#DE) and rejects values
+  outside the exception-vector range; terminal state distinguishes a divide
+  error from normal exit. Tests cover the actual lifecycle and invalid snapshots.
+* Legacy virtio-net setup now verifies reset before enabling inherited DMA,
+  checks queue PFN and DRIVER_OK readbacks, and shares the verified reset/device
+  identity/bus-master retirement barrier between close and partial setup
+  rollback. An uncertain barrier retains published DMA pages. Three host tests
+  check sequencing and failure conditions; existing network QEMU suites must
+  verify the actual success path on the exact head. IOMMU remains unsupported.
+* Existing AHCI descriptor models reject LBA48 truncation/crossing and oversized
+  completion claims. Both flush entrypoints enforce increasing tickets against
+  delayed acknowledgement replay. NVMe block requests reject broadcast NSID,
+  and shared queue admission rejects duplicate/full/stale work before DMA-owner
+  callbacks. Six tests cover these cases. **These remain controller models:**
+  the batch does not add operational AHCI, NVMe or xHCI hardware drivers.
+* BootTrust policy authorization checks continuity of the authenticated root and
+  protected sequence; changed/unavailable platform state blocks cached policy
+  and staging before slot writes. Three added tests cover these failures and
+  signed recovery. The ACPI reset-I/O decoder requires firmware reset support,
+  System I/O and a byte-sized 16-bit port, rejects MMIO truncation, and permits
+  a zero reset byte. The existing test covers malformed firmware variants.
+  Audited platform trust providers, actual ACPI power integration and physical
+  device qualification remain absent; firmware trust changes must be serialized.
+
+#### Ten-point disposition after this batch
+
+| Point | Still required for completion |
+| --- | --- |
+| 1 | Broader heap adoption, total/shared RSS, system-wide OOM recovery and SMP-safe admission. |
+| 2 | General fork/shared-memory COW, recyclable reference ownership and rollback beyond demand-zero stack mappings. |
+| 3 | Normal AP run queues, actual IPIs, migration and acknowledged shootdown before reclaim; existing AP proof is polled. |
+| 4 | AVX/XSAVE, preemptive register retention acceptance and cross-CPU migration beyond BSP x87/SSE. |
+| 5 | General threads, futexes, signals and cancellation race acceptance. Wait-state integrity does not implement these APIs. |
+| 6 | Arbitrary approved-image spawn/exec, general parentage/wait and service policies beyond configured roles. |
+| 7 | Administrative userland integration and acceptance, named-user ACLs, persistent user quotas, general inode/free-space allocation and broader lock fairness/interrupted-durability acceptance. |
+| 8 | Normal desktop network binding, IOMMU, broader interrupt/reset ownership and physical NIC qualification. |
+| 9 | Operational AHCI/NVMe/xHCI initialization, MMIO, DMA, IRQ, completion, reset, flush and hardware acceptance. |
+| 10 | Audited firmware/TPM trust provider, revocation/recovery chain, actual ACPI shutdown/restart and physical-device receipts. |
+
+No gate is newly accepted and no completion percentage is increased by these
+changes. Prior-head CI is not evidence for the consolidated candidate. Required
+checks, merged-main evidence and hardware/sign-off policy continue to apply.
+
+
+### Live ring-3 ownership grant/revocation acceptance candidate
+
+The existing opt-in blocking-lock desktop image now precedes its lock test with
+actual PID1/PID2 ownership operations through syscall 33. PID1 restricts the
+fixture readme, transfers it to uid1000, revokes that owner, enables gid1000 read,
+revokes group read, then restores root:root/0777. PID2 must alternate denied OPEN
+with actual reads of the exact committed `HELLO INDIANOS` payload. Each reader
+closes before acknowledgement; metadata administration never bypasses the
+existing foreign-descriptor exclusion. Every successful administration must
+invalidate PID1's old descriptor. PID3/PID4 remain waiting until this test and
+the original contended lock timeout/handoff complete, then normal desktop starts.
+
+The QEMU oracle requires all six ordered ownership receipts before lock waits,
+normal readiness, eight CRC-valid metadata publications, restored catalog and
+permissions, unchanged payload banks and unchanged bytes outside the selected
+metadata sectors. The inactive checkpoint must retain the conservative root-
+owned 0600 state immediately preceding final restoration. Four additional host
+oracle tests reject missing/duplicate/reordered/stale receipts, bad CRC, wrong
+generations, altered data/catalog and unrestored owner/mode. Serial logs and a
+ready screenshot use the existing retained artifact path.
+
+This fixture is absent from ordinary product images; production ABI is reused
+without added privilege bypasses or test-only kernel grants. It assumes the
+explicitly generated disposable legacy-root-owned GPT fixture, never a physical
+user disk. No local builds/tests/QEMU ran. GitHub must establish exact-head
+results; no gate pass or completion percentage is claimed before that evidence.
+The ten-point remaining-work table above continues to apply.
+
+
+### Exact-head CI repair before further memory work
+
+Head 8ebf844 failed Offline app planner checks job 140452995962 because the new
+ownership oracle fixture inserted the 14-byte `HELLO INDIANOS` value into a
+13-byte slice, enlarging its synthetic disk. The guest probe also requested 13
+bytes. Both now use the actual 14-byte payload and the corrupt-length negative
+control remains distinct. Orbit job 140452996074 failed the C ABI process test:
+its old vector-zero denial conflicts with the corrected architectural #DE
+transition. The negative now checks vector32; a separate real C lifecycle
+exercises vector0 through fault and reap without reporting normal success.
+No tests were removed or disabled; no local build/test ran. Exact corrected-
+head GitHub checks must validate these repairs before acceptance or merge.
+
+
+### Point 1 — serialized physical-memory admission
+
+The production PMM no longer returns an unguarded static mutable reference.
+All exported allocation, release, initialization and accounting entrypoints,
+including the kernel-buffer run adapters, acquire one atomic guard around the
+bitmap and counters. Acquire/release ordering publishes ownership transitions
+across CPUs. The guard cannot migrate between threads/CPUs; returning, failure
+or host-test unwinding releases admission. A contended or nested call never
+spins: allocations/releases fail without changing output or transferring
+ownership; numeric diagnostics conservatively return zero. Existing callers
+must retain failed-release ownership and retry under their existing lifecycle.
+Boot initialization callbacks cannot recursively alias allocator state.
+
+Three host tests cover nested exclusion, guard unwinding without forgotten
+ownership, and four real host threads claiming all 128 frames exactly once,
+then exhausting and reclaiming them with verified bitmap conservation. The
+existing host/freestanding/QEMU workflows exercise the changed entrypoints.
+No local compilation or execution ran; exact candidate GitHub results remain
+required. The prior CI failures are separately repaired above.
+
+This closes the PMM's unsynchronized global-state gap; it does not claim the
+entire memory task complete. Higher-level heap/VMM/DMA owners retain BSP-only
+contracts. Per-process shared RSS accounting, full system-wide OOM policy and
+SMP-safe end-to-end quota reservation/reclamation still require implementation
+and guest acceptance. No new M1 gate or percentage is accepted.
+
+
+### Memory follow-up: verified baseline and remaining integration failures
+
+On head 4607220, pmm-map-validation succeeded, as did combined-regression job
+140455826172 and normal-desktop-qemu job140455826642. The latter includes real
+ownership/group revocation, eight-checkpoint restoration, lock timeout/handoff,
+normal input/recovery and the separate FPU fixture. This is exact-head QEMU
+proof for those bounded scenarios, not full memory-task acceptance.
+
+Kernel boot run45984293291 still failed its host C fallback lifecycle stage:
+`kernel/src/process.c` retained the vector-zero rejection already corrected in
+Rust. Its exception-vector guard is now identical to Rust (0..31 accepted),
+covered by the existing shared C ABI tests rather than weakened assertions.
+Runtime job140455826618 failed the standalone five-boot VFS scenario with PID1
+status252 before the prelaunch wait-timeout receipt. Request/admission/output/
+lifecycle diagnostics and precise guest failure labels now identify that path
+without changing its validation or exit conditions. Exact corrected-head logs
+are required to diagnose any remaining failure before acceptance or merge.
+
+
+### Point 1 — checked resident and shared image accounting
+
+`user_image::memory_usage` now audits the actual detached page-table tree and
+owned page records before publishing a loaded image. Its bounded, read-only
+snapshot separates logical quota slots, mapped private data, shared immutable
+zero aliases, deferred stack reservations, unmapped retained pages, released
+slots, owned page tables and caller-retained fault rollback frames. Private
+frame/byte and logical-byte conversions use checked arithmetic. Cycles, duplicate
+private/table ownership, hidden records, unexpected leaves, malformed permissions,
+inaccessible tables and retained-frame overlap reject rather than undercharge.
+Shared-zero aliases do not each charge a physical frame; the global boot-owned
+zero frame is a system allocation, outside individual private RSS.
+
+Normal desktop preparation uses this snapshot instead of deriving resident
+memory from logical page_count. It compares pre-deferral private ownership to
+the preflight reservation, then validates and reports separate resident and
+reserved private frame counts after stack deferral, including the separately
+owned kernel-root clone tables. It rejects residency above reservation or the
+existing 512-frame private ceiling. Borrowed HHDM/kernel mappings are excluded;
+this is not a claim that all kernel/system memory is per-process RSS.
+
+Two new host tests and four extended image tests compare accounting with actual
+backend ownership, shared-zero/COW changes, deferred slots, malformed trees,
+retained staging/fault frames and partial teardown. Teardown and its retry path
+are unchanged. No local build or test ran. Exact-head GitHub compilation and
+QEMU remain required before accepting this accounting change.
+
+Remaining point-1 work: full-system attribution/unique shared-frame accounting,
+global pressure/OOM victim policy with end-to-end conservation tests, and SMP
+quota reservations across heap/VMM/process lifecycle. The PMM admission guard
+alone does not remove higher-level BSP ownership constraints; no 100% completion
+or milestone acceptance is asserted.
+
+
+### Standalone VFS wait regression root cause and correction
+
+The standalone R026-derived scheduler intentionally binds the worker root and
+then changes READY to NEW to withhold launch authority until PID1 requests it.
+The new status validator incorrectly treated NEW with a bound root as corrupt.
+It now accepts that real staged state while retaining root alignment, RUNNING
+ownership, terminal/reclamation consistency and fault-payload checks. A new
+regression uses actual ready/bind transitions, holds the worker in NEW, queries
+and times out without making it runnable, then separately authorizes launch,
+exits/reaps and delivers completion. No deadline or copyout/security check is
+weakened. Exact-head standalone five-boot QEMU must confirm the fix; local
+build/test execution remains disabled at the owner's request.
+
+
+### Point 7 — persistent bounded named-user ACL implementation
+
+The existing permission policy, COW metadata, hierarchical VFS and native
+administration now support two persistent named users per storage object.
+`NamedUsers` canonicalizes checked grants/removals, preserves root/owner mode
+precedence, clips named grants to group mode bits and makes zero rights an
+explicit deny without group/other fallback. V3 checksummed metadata adds a
+64-byte tail for the eight existing objects. V1/v2 mounts use empty ACLs;
+updates preserve grants and v3 across data writes, rename and ownership/mode
+changes. Invalid/orphan/duplicate records reject even with a valid CRC.
+
+VFS applies ACLs to the leaf and each searchable ancestor. Native syscall33
+operations41/42 expose guarded set/remove under existing PID1 credential,
+namespace, foreign-descriptor, write-budget, flush, revocation and quarantine
+rules. Feature bit512 is additive; no native descriptor/version change or
+caller-selected credential identity is introduced. The separate ring-3 fixture
+adds actual named-user grant/read, explicit denial and removal denial before
+restoring metadata and running its prior lock and desktop tests. Its oracle
+requires twelve CRC-valid publications with final empty ACLs and unchanged
+data/guard sectors. See M1_PERSISTENT_PERMISSIONS.md for layout and limits.
+
+Eleven new host tests cover policy, on-disk corruption/preservation, VFS search/
+remount/torn writes and native admission/revocation/flush failure; existing
+syscall/shutdown and guest-oracle tests are extended. No local build, test or
+QEMU ran. GitHub must verify exact candidate behavior before acceptance.
+
+This advances point7, not completion of points2–10. Full POSIX named/default
+ACLs, persistent per-user quotas, free-space allocation and broader lock and
+interrupted-durability acceptance remain. General fork/COW, SMP/IPIs/migration,
+XSAVE, threads/signals, spawn/exec, normal networking/IOMMU, real AHCI/NVMe/xHCI,
+firmware trust providers and physical-device qualification retain their prior
+pending status. No gate or completion percentage is newly accepted.
+
+
+### Point7 follow-up — persistent owner quotas and ordered locking
+
+The previous ACL candidate e1628e0 returned22 successful GitHub workflows,
+including combined reliability and actual named-user grant/deny/removal guest
+acceptance. This follow-up extends the same production storage path.
+
+Metadata v4 persists four root-administered per-owner object/byte limits beside
+existing ACLs. Usage is recomputed from committed entries, including directory
+and symlink payloads. Both write paths reject over-quota candidates before
+writing a bank; every metadata publication checks ownership/accounting as well.
+Create/grow/chown cannot exceed a limit, delete/shrink reclaim usage, and
+limits below current usage reject. Canonical CRC-valid corruption or persisted
+undercharging refuses mount. Native syscall33 operations43/44 require PID1 root
+and the full namespace, and retain flush/revocation/quarantine policy.
+
+Contended locks now have monotonic coordinator tickets. The same cached range/
+volume receipts prevent younger conflicting acquisitions through both native
+ABIs, with disjoint/shared requests independent and stale receipts excluded.
+Blocked waits retain their original lock and use the existing bounded deadline.
+No second lock table, unbounded spin or weaker caller validation is introduced.
+
+Fifteen new host tests cover quota policy, persistence, pre-data-write denial,
+reclaim, ownership transfer, torn removal, corrupt metadata, admin admission,
+ordered waits and oracle integrity. Existing ingress/shutdown/evidence tests
+are extended. The actual guest sets/removes a zero user quota around a refused
+ownership transfer, then proves nonblocking reader no-barging and a younger
+blocking-reader timeout before releasing its original lock and waking PID1.
+The oracle requires fourteen metadata publications with v4 quota checkpoint/
+removal, unchanged data, restored permissions and all ordered execution receipts.
+
+No local build/test/QEMU ran. Exact-head GitHub compilation and guest results
+are pending. This is bounded functionality within the existing eight-object,
+fixed-extent, BSP filesystem. General free-space allocation, arbitrary threads/
+SMP locking, physical power-loss qualification and full POSIX/inherited ACLs
+remain outside this implementation. No new formal gate or percentage is accepted.
+
+
+### Point4 — eager x87/SSE retention under actual timer preemption
+
+The existing native desktop FPU owner now also protects the Rust CPU-entry
+preemptive scheduler profile. Every prepared task gets a clean aligned context;
+configure/bind/unbind and supervisor mapping checks cover timer-dispatched tasks
+as well. Raw syscall/timer/fault assembly already saves user FPU state before
+Rust executes and restores the selected task before IRET. The C/assembly entry
+fallback retains its existing profile; new preemptive FPU ownership requires
+Rust CPU entry. No AVX/XSAVE or cross-CPU migration is enabled.
+
+The R024 required QEMU step now explicitly builds Rust entry/userland with an
+opt-in FPU fixture. Both CPU-bound tasks seed distinct x87 data/control, XMM0,
+XMM15 and MXCSR, spin without any syscall/yield while that state is live, then
+check exact retention before exit. Each APIC preemption logs the actual saved
+user RIP. An added verifier reads the two actual ELF symbol tables and requires
+a timer sample inside each task's exported seeded-loop bounds, followed by its
+unique successful register/control receipt. It also preserves the existing
+requirement that both live tasks are interrupted before either exits. Merely
+printing a timer event or interrupting outside the seeded window cannot pass.
+
+Four host oracle tests reject missing/duplicate/stale/late receipts, wrong/
+out-of-window PCs, missing RIPs, and malformed/undefined/duplicate ELF bounds.
+The required preemption step retains RIP samples, resolved ELF bounds and the
+verifier result in its existing artifact log. Ordinary desktop/FPU/COW fixtures
+and legacy unseeded preemption entrypoints stay separate. No local build/test/
+QEMU ran; exact-head GitHub results are required before accepting this change.
+XSAVE/AVX, migration, production SMP and other ten-point gaps remain pending;
+no gate or completion percentage is newly accepted.
+
+
+### Cross-workstream integration — saved isolated agent contributions
+
+Five genuine coding sessions started in separate worktrees based on the
+preemptive-FPU candidate c580cc9. After execution-environment restart the
+sessions were no longer active; their saved source diffs were reviewed and
+integrated by the coordinator. No local build, test or QEMU ran. The prior
+c580cc9 head returned22 successful GitHub workflows, including the required
+preemptive FPU PC-window verifier. That does not validate this new candidate.
+
+* Points1/2: shared-zero PTE aliases now retain/release an atomic mapping count
+  on publication rollback, successful private split and teardown. Physical zero
+  reservation remains boot-owned and never recycled. Image accounting detects
+  insufficient alias ownership; completed session cleanup refuses leaked
+  references. Four new/extended image/reference tests cover conservation,
+  overflow/underflow, failed map/split/unmap and accounting. This is not general
+  fork or reclaimable shared-private-page reference ownership.
+* Points3/4: actual xAPIC timer programming verifies mask/divisor/count and
+  final LVT readbacks before granting running/clock authority. Stop verifies
+  mask and zero count; uncertain programming revokes clock authority while
+  retaining controller ownership for retry. Four injected register-loss tests
+  cover sequencing/readback. This is not IPIs, AP run queues or migration.
+* Points5/6: blocking receive continuations now pin a boot-unique router
+  incarnation as well as mailbox epoch. Recreated routers cannot inherit stale
+  receives even with identical PID/epoch; moves preserve authority. Four tests
+  cover replacement, move, monotonic exhaustion and concurrent minting. General
+  thread/futex/signal/spawn/exec APIs still require implementation.
+* Points8/9: proven-retired NIC DMA pages whose PMM release fails remain in a
+  bounded debt ledger. Close reports incomplete reclaim; reprobe retries debt
+  before new queue allocation. Invalid/duplicate/capacity violations poison
+  reprobe rather than claim release. Three fault-injection tests cover retained
+  debt, exact retries and failure quarantine. Uncertain device reset still
+  retains DMA pages; no operational AHCI/NVMe/xHCI or IOMMU is introduced.
+* Point10: boot policy recovery rereads selected signed bytes before advancing
+  the protected counter. Platform-root/counter continuity is revalidated across
+  storage callbacks and counter commit; staging retires cached authority on
+  callback changes, including simultaneous I/O failure. Four tests mutate
+  callbacks around these phases. Separate reads are not an atomic TPM
+  transaction; an audited provider and physical qualification remain absent.
+* Point7 (coordinator): read-only quota usage/limit operations45/46 retain
+  selected-volume, root namespace and credential authority while permitting
+  existing foreign readers. Two tests cover no writes/flush/revocation and
+  pre-I/O denial; the real guest compares active-zero and removed policies.
+
+Twenty-one new host tests plus extended existing image/guest/syscall/shutdown
+cases accompany these changes. Exact candidate GitHub host/freestanding,
+security, QEMU and regression results must pass before merge or acceptance.
+All workstreams have executable work started, but their broader generic APIs,
+normal multi-core/device integration and physical acceptance are not complete.
+No completion percentage or formal M1 gate is newly accepted.

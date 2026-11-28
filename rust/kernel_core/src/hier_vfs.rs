@@ -118,8 +118,7 @@ impl<D:BlockDevice> HierVfs<D>{
   for (offset,&byte) in name.as_bytes().iter().enumerate().skip(1){
    if byte!=b'/'{continue;}
    let ancestor=checked(&name[..offset],Kind::Directory)?;
-   let permission=self.fs.permissions_path(ancestor.name())?;
-   if !permission.allows(credentials,SEARCH){return Err(FsError::InvalidName);}
+   if !self.fs.access_path(ancestor.name(),credentials,SEARCH)?{return Err(FsError::InvalidName);}
    self.directory(ancestor.path())?;
   }
   self.access_object(credentials,p.path(),access)
@@ -129,15 +128,15 @@ impl<D:BlockDevice> HierVfs<D>{
   let mut found=None;
   for kind in [Kind::File,Kind::Directory,Kind::Symlink]{
    let key=checked(path,kind)?;
-   match self.fs.permissions_path(key.name()){
-    Ok(permission)=>{
+   match self.fs.access_path(key.name(),credentials,access){
+    Ok(allowed)=>{
      if found.is_some(){return Err(FsError::InvalidVolume);}
-     found=Some(permission);
+     found=Some(allowed);
     },Err(FsError::NotFound)=>{},Err(error)=>return Err(error),
    }
   }
-  let permission=found.ok_or(FsError::NotFound)?;
-  if permission.allows(credentials,access){Ok(())}else{Err(FsError::InvalidName)}
+  let allowed=found.ok_or(FsError::NotFound)?;
+  if allowed{Ok(())}else{Err(FsError::InvalidName)}
  }
  /// Creating, removing and renaming names requires parent write+search,
  /// independently of permission on the existing file's data.
@@ -162,11 +161,37 @@ impl<D:BlockDevice> HierVfs<D>{
  }
  pub fn chmod_as(&mut self,credentials:Credentials,path:&str,mode:u16)
   ->Result<(),FsError>{
+  self.update_permissions_as(credentials,path,|fs,key|fs.chmod_path(key,credentials,mode))
+ }
+ /// Trusted credential entrypoints. Symlink metadata is changed without
+ /// following its target; ancestors still require SEARCH, including for no-ops.
+ pub fn chown_as(&mut self,credentials:Credentials,path:&str,owner:u16)
+  ->Result<(),FsError>{
+  self.update_permissions_as(credentials,path,|fs,key|fs.chown_path(key,credentials,owner))
+ }
+ pub fn chgrp_as(&mut self,credentials:Credentials,path:&str,group:u16)
+  ->Result<(),FsError>{
+  self.update_permissions_as(credentials,path,|fs,key|fs.chgrp_path(key,credentials,group))
+ }
+ /// Bounded named-user permissions; mode group bits are the grant mask.
+ /// No symlink traversal or caller-selected credential identity is introduced.
+ pub fn set_named_user_as(&mut self,credentials:Credentials,path:&str,uid:u16,rights:Option<u16>)
+  ->Result<(),FsError>{
+  self.update_permissions_as(credentials,path,|fs,key|fs.set_named_user_path(key,credentials,uid,rights))
+ }
+ /// Volume-wide limits require a trusted root credential. Usage is derived
+ /// from committed owned objects, including directory/symlink payloads.
+ pub fn user_quota_view_as(&mut self,credentials:Credentials,uid:u16)
+  ->Result<(u64,u64,Option<(u16,u32)>),FsError>{self.fs.user_quota_view(credentials,uid)}
+ pub fn set_user_quota_as(&mut self,credentials:Credentials,uid:u16,limit:Option<(u16,u32)>)
+  ->Result<(),FsError>{self.fs.set_user_quota(credentials,uid,limit)}
+ fn update_permissions_as(&mut self,credentials:Credentials,path:&str,
+  update:impl FnOnce(&mut DurableFs<D>,&str)->Result<(),FsError>)->Result<(),FsError>{
   self.authorize_access(credentials,path,0)?;
   for kind in [Kind::File,Kind::Directory,Kind::Symlink]{
    let p=checked(path,kind)?;
    match self.fs.permissions_path(p.name()){
-    Ok(_)=>return self.fs.chmod_path(p.name(),credentials,mode),
+    Ok(_)=>return update(&mut self.fs,p.name()),
     Err(FsError::NotFound)=>{},Err(error)=>return Err(error),
    }
   }
@@ -655,6 +680,124 @@ mod tests{
  }
  fn fresh()->HierVfs<Disk>{
   HierVfs::format_blank(Disk{blocks:[[0;SECTOR_BYTES];COUNT],writes:0,tear:None}).unwrap()
+ }
+ #[test]fn persistent_owner_quota_rejects_growth_before_data_writes_and_reclaims_on_delete(){
+  let root=Credentials::kernel(0,0);let owner=Credentials::kernel(1000,1000);
+  let mut fs=fresh();fs.mkdir_as(root,"/shared",0o777).unwrap();
+  fs.set_user_quota_as(root,1000,Some((1,5))).unwrap();
+  fs.create_as(owner,"/shared/n",b"saved",0o600).unwrap();
+  let before=fs.generation();
+  assert_eq!(fs.create_as(owner,"/shared/x",b"x",0o600),Err(FsError::Full));
+  assert_eq!(fs.write_at_as(owner,"/shared/n",5,b"x"),Err(FsError::Full));
+  assert_eq!(fs.set_user_quota_as(owner,1000,None),Err(FsError::InvalidName));
+  assert_eq!(fs.set_user_quota_as(root,1000,Some((1,4))),Err(FsError::Full));
+  assert_eq!(fs.generation(),before);
+  fs.rename_file_as(owner,"/shared/n","/shared/m").unwrap();
+  let mut fs=HierVfs::mount_consistent_recovery(fs.into_device()).unwrap();
+  assert_eq!(fs.write_at_as(owner,"/shared/m",5,b"x"),Err(FsError::Full));
+  let mut out=[0;5];assert_eq!(fs.read_as(owner,"/shared/m",&mut out),Ok(5));assert_eq!(&out,b"saved");
+  fs.unlink_as(owner,"/shared/m").unwrap();fs.create_as(owner,"/shared/x",b"again",0o600).unwrap();
+  fs.set_user_quota_as(root,2000,Some((0,0))).unwrap();let before=fs.generation();
+  assert_eq!(fs.chown_as(root,"/shared/x",2000),Err(FsError::Full));assert_eq!(fs.generation(),before);
+  fs.set_user_quota_as(root,1000,None).unwrap();
+  fs.create_as(owner,"/shared/y",b"allowed",0o600).unwrap();
+ }
+ #[test]fn torn_quota_removal_cannot_acknowledge_a_limit_reset(){
+  let root=Credentials::kernel(0,0);let owner=Credentials::kernel(1000,1000);
+  let mut fs=fresh();fs.create_as(root,"/n",b"saved",0o600).unwrap();
+  fs.chown_as(root,"/n",1000).unwrap();fs.set_user_quota_as(root,1000,Some((1,5))).unwrap();
+  let mut disk=fs.into_device();disk.tear=Some(disk.writes);let data=disk.blocks;
+  let mut fs=HierVfs::mount(disk).unwrap();assert_eq!(fs.set_user_quota_as(root,1000,None),Err(FsError::Io));
+  let mut disk=fs.into_device();disk.tear=None;assert_eq!(disk.blocks[2..],data[2..]);
+  let mut fs=HierVfs::mount_consistent_recovery(disk).unwrap();
+  assert_eq!(fs.write_at_as(owner,"/n",5,b"x"),Err(FsError::Full));
+  let mut out=[0;5];assert_eq!(fs.read_as(owner,"/n",&mut out),Ok(5));assert_eq!(&out,b"saved");
+ }
+ #[test]fn named_user_directory_search_leaf_mask_and_revocation_survive_remount(){
+  let root=Credentials::kernel(0,0);let guest=Credentials::kernel(200,9);
+  let mut fs=fresh();fs.mkdir_as(root,"/private",0o710).unwrap();
+  fs.create_as(root,"/private/n",b"saved",0o640).unwrap();
+  fs.set_named_user_as(root,"/private/n",200,Some(4)).unwrap();
+  let mut out=[0xa5;5];
+  assert_eq!(fs.read_as(guest,"/private/n",&mut out),Err(FsError::InvalidName));
+  assert_eq!(out,[0xa5;5]);fs.set_named_user_as(root,"/private",200,Some(1)).unwrap();
+  let mut fs=HierVfs::mount_consistent_recovery(fs.into_device()).unwrap();
+  assert_eq!(fs.read_as(guest,"/private/n",&mut out),Ok(5));assert_eq!(&out,b"saved");
+  assert_eq!(fs.write_at_as(guest,"/private/n",0,b"x"),Err(FsError::InvalidName));
+  assert_eq!(fs.set_named_user_as(guest,"/private/n",201,Some(4)),Err(FsError::InvalidName));
+  fs.set_named_user_as(root,"/private/n",200,Some(0)).unwrap();
+  // Explicit deny must not fall back to group/other permissions.
+  fs.chmod_as(root,"/private/n",0o644).unwrap();
+  let mut fs=HierVfs::mount_consistent_recovery(fs.into_device()).unwrap();
+  assert_eq!(fs.read_as(guest,"/private/n",&mut out),Err(FsError::InvalidName));
+  fs.set_named_user_as(root,"/private/n",200,None).unwrap();
+  assert_eq!(fs.read_as(guest,"/private/n",&mut out),Ok(5));
+ }
+ #[test]fn torn_named_user_publication_recovers_old_access_without_data_rewrite(){
+  let root=Credentials::kernel(0,0);let guest=Credentials::kernel(200,9);
+  let mut fs=fresh();fs.create_as(root,"/note",b"saved",0o640).unwrap();
+  let mut device=fs.into_device();let data=device.blocks;device.tear=Some(device.writes);
+  let mut fs=HierVfs::mount(device).unwrap();
+  assert_eq!(fs.set_named_user_as(root,"/note",200,Some(4)),Err(FsError::Io));
+  let mut device=fs.into_device();device.tear=None;
+  assert_eq!(device.blocks[2..],data[2..]);
+  let mut fs=HierVfs::mount_consistent_recovery(device).unwrap();let mut out=[0xa5;5];
+  assert_eq!(fs.read_as(guest,"/note",&mut out),Err(FsError::InvalidName));
+  assert_eq!(out,[0xa5;5]);assert_eq!(fs.read_as(root,"/note",&mut out),Ok(5));
+ }
+ #[test]fn ownership_changes_persist_and_revoke_old_owner_access(){
+  let root=Credentials::kernel(0,0);let alice=Credentials::kernel(100,7);
+  let bob=Credentials::kernel(200,8);let mut fs=fresh();
+  fs.create_as(root,"/note",b"saved",0o600).unwrap();
+  let before=fs.generation();fs.chown_as(root,"/note",100).unwrap();
+  assert_eq!(fs.generation(),before+1);
+  fs.chgrp_as(alice,"/note",7).unwrap();
+  let before=fs.generation();fs.chgrp_as(alice,"/note",7).unwrap();
+  assert_eq!(fs.generation(),before);
+  assert_eq!(fs.chown_as(alice,"/note",200),Err(FsError::InvalidName));
+  assert_eq!(fs.chgrp_as(alice,"/note",8),Err(FsError::InvalidName));
+  assert_eq!(fs.chgrp_as(bob,"/note",8),Err(FsError::InvalidName));
+  assert_eq!(fs.generation(),before);
+  fs.chown_as(root,"/note",200).unwrap();
+  let mut fs=HierVfs::mount_consistent_recovery(fs.into_device()).unwrap();
+  assert_eq!(fs.permissions("/note"),Ok(Permissions::new(200,7,0o600).unwrap()));
+  let mut out=[0xa5;5];
+  assert_eq!(fs.read_as(alice,"/note",&mut out),Err(FsError::InvalidName));
+  assert_eq!(out,[0xa5;5]);assert_eq!(fs.read_as(bob,"/note",&mut out),Ok(5));
+  assert_eq!(&out,b"saved");
+ }
+ #[test]fn ownership_updates_require_search_and_never_follow_symlinks(){
+  let root=Credentials::kernel(0,0);let alice=Credentials::kernel(100,7);
+  let mut fs=fresh();fs.mkdir_as(root,"/private",0o700).unwrap();
+  fs.create_as(root,"/private/n",b"secret",0o600).unwrap();
+  fs.symlink_as(root,"/link","/private/n").unwrap();
+  fs.chown_as(root,"/link",100).unwrap();fs.chgrp_as(alice,"/link",7).unwrap();
+  let before=fs.generation();
+  assert_eq!(fs.chgrp_as(alice,"/private/n",7),Err(FsError::InvalidName));
+  assert_eq!(fs.chown_as(root,"/absent",100),Err(FsError::NotFound));
+  assert_eq!(fs.generation(),before);
+  fs.chown_as(root,"/private",100).unwrap();
+  let mut fs=HierVfs::mount_consistent_recovery(fs.into_device()).unwrap();
+  assert_eq!(fs.permissions("/link").unwrap().owner,100);
+  assert_eq!(fs.permissions("/link").unwrap().group,7);
+  assert_eq!(fs.permissions("/private").unwrap().owner,100);
+  assert_eq!(fs.permissions("/private/n").unwrap().owner,0);
+  let mut out=[0;16];let n=fs.readlink_as(alice,"/link",&mut out).unwrap();
+  assert_eq!(&out[..n],b"/private/n");
+ }
+ #[test]fn torn_ownership_checkpoint_recovers_previous_permissions_and_data(){
+  let root=Credentials::kernel(0,0);let mut fs=fresh();
+  fs.create_as(root,"/note",b"saved",0o600).unwrap();let disk=fs.into_device();
+  for group in [false,true]{
+   let mut device=disk.clone();device.tear=Some(device.writes);
+   let mut fs=HierVfs::mount(device).unwrap();
+   let result=if group{fs.chgrp_as(root,"/note",7)}else{fs.chown_as(root,"/note",100)};
+   assert_eq!(result,Err(FsError::Io));
+   let mut device=fs.into_device();device.tear=None;
+   let mut fs=HierVfs::mount_consistent_recovery(device).unwrap();
+   assert_eq!(fs.permissions("/note").unwrap(),Permissions::new(0,0,0o600).unwrap());
+   let mut out=[0;5];assert_eq!(fs.read_as(root,"/note",&mut out),Ok(5));assert_eq!(&out,b"saved");
+  }
  }
  #[test]fn m1_gate20_w3_next_quota_enforced_before_metadata_mutation(){
   let root=Credentials::kernel(0,0);

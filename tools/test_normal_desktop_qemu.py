@@ -52,6 +52,7 @@ LEASE_ACQUIRED = b"IndianOS user: desktop Files read lease acquired"
 LEASE_REFRESH = b"IndianOS user: desktop Files retained read lease verified after refresh"
 LEASE_CURSOR = b"IndianOS user: desktop Files positioned read preserved cursor"
 POSITIONED_WRITE = b"IndianOS user: desktop broker positioned write committed"
+DESCRIPTOR_SYNC = b"IndianOS user: desktop broker native descriptor fsync completed"
 POSITIONED_DENIED = b"IndianOS user: desktop Terminal denied direct positioned filesystem IO"
 LEASE_RELEASED = b"IndianOS user: desktop Files read lease released"
 LEASE_DENIED = b"IndianOS user: desktop Terminal filesystem request failed"
@@ -84,6 +85,12 @@ PIXEL_APP_EVIDENCE = tuple(
     b"IndianOS user: desktop broker denied app pixel authority",
     b"IndianOS user: desktop compositor denied app pixel authority",
     COMPOSITOR_SNAPSHOT,
+    b"IndianOS: kernel heap BSP admission ready",
+    b"IndianOS: kernel noncontiguous virtual arena ready",
+    b"IndianOS: kernel shared zero page ready",
+    b"IndianOS: desktop broker image limit 64 pages enforced",
+    b"IndianOS: desktop private frame budget 512 enforced",
+    b"IndianOS: desktop supervisor direct map shared with ownership receipt",
     FRAME_ALLOCATED, SCRATCH_ALLOCATED, SCRATCH_SHARED,
     FRAME_PRESENTED, FRAME_PUBLISHED,
 )
@@ -755,10 +762,12 @@ def verify_lease_commit(output: bytes, since: int, positioned: bool = False) -> 
     lines = lease_records(output, since)
     commit = b"IndianOS user: " + NAMED_COMMIT.encode()
     if (lines.count(LEASE_CURSOR) != 1 or lines.count(LEASE_REFRESH) != 1 or
-            lines.count(POSITIONED_WRITE) != int(positioned) or lines.count(commit) != 1 or
+            lines.count(POSITIONED_WRITE) != int(positioned) or
+            lines.count(DESCRIPTOR_SYNC) != int(positioned) or lines.count(commit) != 1 or
             lines.index(LEASE_CURSOR) >= lines.index(LEASE_REFRESH) or
             lines.index(LEASE_REFRESH) >= lines.index(commit) or
-            (positioned and lines.index(POSITIONED_WRITE) >= lines.index(LEASE_CURSOR)) or
+            (positioned and (lines.index(DESCRIPTOR_SYNC) >= lines.index(POSITIONED_WRITE) or
+                             lines.index(POSITIONED_WRITE) >= lines.index(LEASE_CURSOR))) or
             any(marker in lines for marker in (LEASE_ACQUIRED, LEASE_RELEASED, LEASE_DENIED))):
         raise AssertionError("unrelated write lacks fresh original-token verification before commit")
 
@@ -774,7 +783,7 @@ def verify_lease_denial(before: bytes, after: bytes, output: bytes, since: int,
     if lines.count(marker) != 1 or sum(lines.count(x) for x in denials) != 1:
         raise AssertionError("protected-file denial lacks one exact native error record")
     forbidden = (NAMED_COMMIT.encode(), COMMITTED.encode(), PERSISTED.encode(),
-                 LEASE_ACQUIRED, LEASE_CURSOR, LEASE_REFRESH, LEASE_RELEASED, POSITIONED_WRITE,
+                 LEASE_ACQUIRED, LEASE_CURSOR, LEASE_REFRESH, LEASE_RELEASED, POSITIONED_WRITE, DESCRIPTOR_SYNC,
                  SHUTDOWN.encode(), STOPPED.encode(),
                  b"selected volume sync failed", b"IndianOS recovery:", b"FATAL",
                  b"restarting retired service session")
@@ -787,7 +796,7 @@ def verify_released_lease_write(output: bytes, since: int) -> None:
     commit = b"IndianOS user: " + NAMED_COMMIT.encode()
     if (lines.count(LEASE_RELEASED) != 1 or lines.count(commit) != 1 or
             lines.index(LEASE_RELEASED) >= lines.index(commit) or
-            any(marker in lines for marker in (LEASE_ACQUIRED, LEASE_CURSOR, LEASE_REFRESH, POSITIONED_WRITE, LEASE_DENIED))):
+            any(marker in lines for marker in (LEASE_ACQUIRED, LEASE_CURSOR, LEASE_REFRESH, POSITIONED_WRITE, DESCRIPTOR_SYNC, LEASE_DENIED))):
         raise AssertionError("protected-file write did not follow release of the original lease")
 
 
@@ -1788,7 +1797,13 @@ def verify_transient_restart(output: bytes, injection_at: int) -> None:
         if phase_records.count(released) != 1 or phase.find(released) > phase.find(COMPOSITOR_PREPARED):
             raise AssertionError("PID4 replacement lacks prior owned-buffer release")
     verify_frame_publication(phase + b"\n")
-    forbidden = (READY.encode(), LIFECYCLE_READY.encode(), SURFACES_GUARDED.encode(),
+    forbidden = (b"IndianOS: kernel shared zero page ready",
+                 b"IndianOS: kernel noncontiguous virtual arena ready",
+                 b"IndianOS: desktop supervisor direct map shared with ownership receipt",
+                 b"IndianOS: desktop private frame budget 512 enforced",
+                 b"IndianOS: desktop broker image limit 64 pages enforced",
+                 b"IndianOS: kernel heap BSP admission ready",
+                 READY.encode(), LIFECYCLE_READY.encode(), SURFACES_GUARDED.encode(),
                  b"restarting retired service session", b"retired session verified restart-safe",
                  b"restart budget exhausted", b"reason=desktop-session-failed", b"FATAL",
                  LEASE_ACQUIRED)

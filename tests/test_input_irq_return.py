@@ -11,6 +11,7 @@ import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "rust/kernel_core/src/arch/x86_64/keyboard_entry.S"
+USER_ENTRY = ROOT / "rust/kernel_core/src/arch/x86_64/user_entry.S"
 REGISTERS = "rax rbx rcx rdx rsi rdi rbp r8 r9 r10 r11 r12 r13 r14 r15".split()
 
 
@@ -19,7 +20,12 @@ def fixture(source):
     source, count = re.subn(r"(?m)^    iretq$", "    jmp test_irq_return", source)
     if count != 2:
         raise AssertionError("unexpected production IRET layout")
-    asm = [source, ".text"]
+    # Link the actual production helpers and zero-initialized ownership globals.
+    # This IRQ fixture has no active user FPU lease; do not replace the helpers
+    # with empty test functions to make the assembly link.
+    user_entry = USER_ENTRY.read_text()
+    helpers = user_entry[user_entry.index(".bss"):user_entry.index(".global x86_64_enter_user")]
+    asm = [helpers, source, ".text"]
     for name, target in (("keyboard", "x86_64_keyboard_interrupt"),
                          ("mouse", "x86_64_mouse_interrupt")):
         asm += [f".global run_{name}", f"run_{name}:",

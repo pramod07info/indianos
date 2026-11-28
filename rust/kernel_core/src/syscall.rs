@@ -187,6 +187,10 @@ pub unsafe extern "C" fn indianos_syscall_validate(
         38 => (request.arg0<=1 && request.arg1==0)||(request.arg0==2&&request.arg1!=0), // PID1 lifecycle; authority checked at trap
         #[cfg(feature="normal-desktop")]
         39 => request.arg1==64 && user_range(plan,request.arg0,64,false), // app pixel transaction
+        #[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
+        40 => request.arg0<=1 && user_range(plan,request.arg1,64,false), // versioned supervised process query/wait
+        #[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
+        41 => matches!(request.arg0,34|35) && user_range(plan,request.arg1,64,false), // bounded range lock wait
         #[cfg(feature="normal-desktop")]
         37 => match request.arg0 {
             0 | 1 => user_range(plan, request.arg1, 64, request.arg0 == 0),
@@ -208,7 +212,7 @@ pub unsafe extern "C" fn indianos_syscall_validate(
         32 => (1..=if cfg!(feature="normal-desktop"){12}else{11}).contains(&request.arg0) &&
               user_range(plan,request.arg1,64,false), // installed native app
         #[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
-        33 => (matches!(request.arg0,1..=6|25|26|34..=38)) &&
+        33 => (matches!(request.arg0,1..=6|25..=27|34..=46)) &&
               user_range(plan,request.arg1,64,false), // versioned handles/range locks
         #[cfg(feature="test-r031-files-gui")]
         36 => (1..=4).contains(&request.arg0) &&
@@ -377,7 +381,13 @@ mod tests {
         }
         assert!(!check(33,33,plan.stack_begin));
         assert!(check(33,38,plan.stack_begin));
-        assert!(!check(33,39,plan.stack_begin));
+        for operation in [39,40,41,42,43,44,45,46]{
+            assert!(check(33,operation,plan.stack_begin));
+            for pointer in [plan.guard_begin,plan.stack_end-63,u64::MAX]{
+                assert!(!check(33,operation,pointer));
+            }
+        }
+        assert!(!check(33,47,plan.stack_begin));
         // Hardware input preflights every destination before the runtime can
         // consume a physical byte; guard/kernel/overflow addresses cannot
         // drain the trusted broker's input stream.
@@ -407,13 +417,38 @@ mod tests {
             segment_count:0,segments:[ProgramSegment::empty();MAX_SEGMENTS]};
         let check=|action,address|unsafe{indianos_syscall_validate(&plan,
             SyscallRequest{number:33,arg0:action,arg1:address})};
-        for action in (1..=6).chain([25,26]){assert!(check(action,plan.stack_begin));
+        for action in (1..=6).chain([25,26,27]){assert!(check(action,plan.stack_begin));
             for address in [plan.guard_begin,plan.stack_end-63,USER_TOP,u64::MAX]{assert!(!check(action,address));}
         }
         for action in [0,7,u64::MAX]{assert!(!check(action,plan.stack_begin));}
         for address in [plan.guard_begin,plan.stack_end-63,USER_TOP,u64::MAX]{
             assert!(!check(6,address));
         }
+    }
+
+    #[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
+    #[test]fn native_process_wait_ingress_rejects_unknown_operations_and_partial_descriptors(){
+        let plan=ProgramPlan{entry:USER_MIN,stack_begin:USER_TOP-STACK_BYTES,
+            stack_end:USER_TOP,guard_begin:USER_TOP-STACK_BYTES-PAGE_BYTES,
+            segment_count:0,segments:[ProgramSegment::empty();MAX_SEGMENTS]};
+        let check=|operation,address|unsafe{indianos_syscall_validate(&plan,
+            SyscallRequest{number:40,arg0:operation,arg1:address})};
+        for operation in [0,1]{
+            assert!(check(operation,plan.stack_begin));
+            for address in [0,plan.guard_begin,USER_TOP-63,USER_TOP,u64::MAX]{assert!(!check(operation,address));}
+        }
+        assert!(!check(2,plan.stack_begin));assert!(!check(u64::MAX,plan.stack_begin));
+    }
+    #[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
+    #[test]fn blocking_lock_ingress_accepts_only_lock_operations_and_full_descriptors(){
+        let plan=ProgramPlan{entry:USER_MIN,stack_begin:USER_TOP-STACK_BYTES,stack_end:USER_TOP,
+            guard_begin:USER_TOP-STACK_BYTES-PAGE_BYTES,segment_count:0,segments:[ProgramSegment::empty();MAX_SEGMENTS]};
+        let check=|op,address|unsafe{indianos_syscall_validate(&plan,SyscallRequest{number:41,arg0:op,arg1:address})};
+        for op in [34,35]{
+            assert!(check(op,plan.stack_begin));
+            for address in [0,plan.guard_begin,USER_TOP-63,u64::MAX]{assert!(!check(op,address));}
+        }
+        for op in [0,33,36,u64::MAX]{assert!(!check(op,plan.stack_begin));}
     }
 
     #[test]

@@ -39,14 +39,19 @@ def boot(qemu,iso,ovmf,disk,marker):
                 else:selector.unregister(key.fileobj)
             if "IndianOS: FATAL" in output:
                 raise AssertionError("guest failure\n"+output[-7000:])
-            requirements=[marker,
-              "R030.2 installed native ELF ran in isolated PID2 ring3",
-              "R031.3 verified persistent hierarchical storage and ring3 isolation",
-              PASSED]
+            requirements=[marker]
             if marker.startswith("R031.5 boot5"):
-                requirements.insert(1,"R031.6-8 PID1 native filesystem handles, rights and close verified")
-                requirements.insert(2,"M1 native truncate: prefix, zero extension, cursor and denied capabilities verified")
-                requirements.insert(3,"R031.7 PID2 denied private VFS file via handle syscall")
+                requirements.extend([
+                  "R031.6-8 PID1 native filesystem handles, rights and close verified",
+                  "M1 native truncate: prefix, zero extension, cursor and denied capabilities verified"])
+            requirements.extend([
+              "native PID1 child wait timed out before launch without consuming status",
+              "R031.7 PID2 denied private VFS file via handle syscall",
+              "native PID2 denied supervisor process query",
+              "R030.2 installed native ELF ran in isolated PID2 ring3",
+              "native PID1 generation-bound child wait completed after cleanup; replay denied",
+              "R031.3 verified persistent hierarchical storage and ring3 isolation",
+              PASSED])
             if all(x in output for x in requirements):
                 if not all(output.index(x)<output.index(y) for x,y in zip(requirements,requirements[1:])):
                     raise AssertionError("invalid guest milestones\n"+output[-7000:])
