@@ -1,5 +1,7 @@
 # M1 integration evidence
 
+> **Current rule:** See [G1–G8 automated acceptance](M1_G1_G8_AUTOMATED_ACCEPTANCE.md). The gate behavior and historical receipts below are preserved; older gate-level review and sign-off instructions are superseded. GitHub merge rules are unchanged.
+
 Baseline main: `b637ce5df22df5c9e05b5d55f0d0442bcf312bbf`. Its
 production parent chain includes #812 and #813. The two subsequent commits
 archive screenshots. Issue [#616](https://github.com/pramod07info/indianos/issues/616),

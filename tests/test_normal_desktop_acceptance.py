@@ -588,6 +588,23 @@ class NormalDesktopControls(unittest.TestCase):
                              ["info status", "info registers", "info block"])
             close.assert_called_once()
 
+    def test_repeated_unready_compositor_boot_requires_two_distinct_passes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            arguments = ("qemu", Path("desktop.iso"), Path("ovmf.fd"), Path("scratch.raw"))
+            with patch.object(harness, "unready_service_boot") as boot:
+                harness.repeat_unready_compositor_boot(*arguments, folder)
+                self.assertEqual(boot.call_count, 2)
+                self.assertEqual(boot.call_args_list[0].args, (*arguments, folder, "unready-compositor"))
+                self.assertEqual(boot.call_args_list[1].args,
+                                 (*arguments, folder / "g3-unready-compositor-repeat", "unready-compositor"))
+        for outcomes, expected_calls in (([TimeoutError("first")], 1), ([None, TimeoutError("second")], 2)):
+            with tempfile.TemporaryDirectory() as tmp:
+                with patch.object(harness, "unready_service_boot", side_effect=outcomes) as boot:
+                    with self.assertRaises(TimeoutError):
+                        harness.repeat_unready_compositor_boot(*arguments, Path(tmp))
+                    self.assertEqual(boot.call_count, expected_calls)
+
     def test_unready_monitor_diagnostic_write_failure_cannot_mask_acceptance(self):
         with tempfile.TemporaryDirectory() as temporary:
             session = Mock()

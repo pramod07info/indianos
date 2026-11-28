@@ -1,5 +1,7 @@
 # G1–G3 test-based acceptance proposal — 24 Nov 2026
 
+> **Current rule:** See [G1–G8 automated acceptance](M1_G1_G8_AUTOMATED_ACCEPTANCE.md). The gate behavior and historical receipts below are preserved; older gate-level review and sign-off instructions are superseded. GitHub merge rules are unchanged.
+
 The project owner explicitly authorized replacing independent source review with test-based acceptance for G1–G3 only. This is a proposed scoped policy exception, not an independent approval. Existing branch protections and required CI remain unchanged. This proposal does not activate the exception or change the canonical gate count until reconciled with the existing acceptance policy and merged.
 
 Production evidence baseline: `5b6ace8a6e5d91c217744e5ad0b8ca7f02ace1d7` (PR #806). See [existing evidence packet](M1_GATES_6_7_ACCEPTANCE.md).

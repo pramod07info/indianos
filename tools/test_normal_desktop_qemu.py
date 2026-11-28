@@ -1959,6 +1959,17 @@ def unready_service_boot(qemu: str, iso: Path, ovmf: Path, disk: Path,
     print(f"Normal desktop {name}: bounded actual failure, complete retirement and unchanged recovery PASS")
 
 
+def repeat_unready_compositor_boot(qemu: str, iso: Path, ovmf: Path,
+                                  disk: Path, folder: Path) -> None:
+    # Both runs use the original strict deadlines and diagnostics. A first
+    # failure propagates immediately, never triggering a retry-to-green.
+    name = "unready-compositor"
+    unready_service_boot(qemu, iso, ovmf, disk, folder, name)
+    repeat = folder / "g3-unready-compositor-repeat"
+    repeat.mkdir()
+    unready_service_boot(qemu, iso, ovmf, disk, repeat, name)
+
+
 def bounded_debugger_read(debugger: GuestDebugger, address: int, count: int) -> bytes:
     if address <= 0 or not 1 <= count <= 128:
         raise AssertionError("debugger receipt exceeds bounded source inventory")
@@ -2519,7 +2530,9 @@ def main() -> None:
                 shutdown_exhaustion_boot(args.qemu, modified, args.ovmf.resolve(), disk, artifacts)
             elif name == "crashed-compositor":
                 crashed_service_boot(args.qemu, modified, args.ovmf.resolve(), disk, artifacts)
-            elif name.startswith("premature-") or name == "unready-compositor":
+            elif name == "unready-compositor":
+                repeat_unready_compositor_boot(args.qemu, modified, args.ovmf.resolve(), disk, artifacts)
+            elif name.startswith("premature-"):
                 unready_service_boot(args.qemu, modified, args.ovmf.resolve(), disk, artifacts, name)
             else:
                 denied_boot(args.qemu, modified, args.ovmf.resolve(), disk, artifacts, name, reason)
