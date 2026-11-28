@@ -2564,6 +2564,19 @@ def verify_g5_suppression(output: bytes, start: int, end: int, forbidden: tuple[
         raise AssertionError("discarded PS/2 input reached the desktop")
 
 
+def verify_g5_keyboard_rearm(output: bytes, stale: int, delimiter: int) -> None:
+    # A correctly discarded suffix can leave no serial bytes at all before
+    # Enter. Use the fresh Enter acknowledgement as the positive end fence.
+    if not 0 <= stale <= delimiter < len(output):
+        raise AssertionError("missing bounded live G5 keyboard rearm interval")
+    ack = ("IndianOS user: " + ACK).encode()
+    matches = tuple(re.finditer(rb"^" + re.escape(ack) + rb"\r?\n",
+                                output[stale:], re.MULTILINE))
+    if (len(matches) != 1 or stale + matches[0].start() < delimiter or
+            output[stale:].count(ACK.encode()) != 1):
+        raise AssertionError("stale keyboard input leaked or Enter failed to rearm input")
+
+
 def g5_irq_recovery_boot(qemu: str, iso: Path, ovmf: Path, disk: Path,
                          folder: Path, revision: str) -> None:
     name = "g5-irq-recovery"
@@ -2635,10 +2648,12 @@ def g5_irq_recovery_boot(qemu: str, iso: Path, ovmf: Path, disk: Path,
         session.drain_serial(0.2)
         wait_i8042_idle(session)
         delimiter = acknowledged_key(session, "ret")
-        verify_g5_suppression(bytes(session.output), stale, delimiter, (ACK.encode(),))
+        session.drain_serial(0.1)
+        verify_g5_keyboard_rearm(bytes(session.output), stale, delimiter)
         if COMMITTED.encode() in session.output[key_fault:]:
             raise AssertionError("the interrupted command mutated the Files note")
         cancelled = session.shot(folder / "g5-key-cancelled.ppm")
+        verify_text_pixels(cancelled, "terminal", "INVALID COMMAND")
         verify_text_pixels(cancelled, "files-note", "HELLO INDIANOS")
         type_command(session, "cat")
         submitted = acknowledged_key(session, "ret")

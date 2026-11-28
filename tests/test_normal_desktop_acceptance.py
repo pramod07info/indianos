@@ -35,6 +35,19 @@ class NormalDesktopControls(unittest.TestCase):
             with self.subTest(begin=begin, end=end), self.assertRaises(AssertionError):
                 harness.verify_g5_suppression(good, begin, end, (marker,))
 
+    def test_g5_keyboard_rearm_accepts_silent_suffix_but_requires_one_fresh_enter_ack(self):
+        ack = ("IndianOS user: " + harness.ACK + "\n").encode()
+        old = b"prior data\n"
+        boundary = len(old)
+        harness.verify_g5_keyboard_rearm(old + ack, boundary, boundary)
+        running = b"unrelated live output\n"
+        harness.verify_g5_keyboard_rearm(old + running + ack, boundary, boundary + len(running))
+        for trace, delimiter in ((old, boundary), (old + ack, boundary + 1),
+                                 (old + ack * 2, boundary), (old + b"prefix " + ack, boundary),
+                                 (old + ack[:-1], boundary)):
+            with self.subTest(trace=trace), self.assertRaises(AssertionError):
+                harness.verify_g5_keyboard_rearm(trace, boundary, delimiter)
+
     def test_shared_lease_commit_requires_original_token_and_fresh_verified_read(self):
         commit = b"IndianOS user: " + harness.NAMED_COMMIT.encode()
         good = harness.LEASE_CURSOR + b"\n" + harness.LEASE_REFRESH + b"\n" + commit + b"\n"

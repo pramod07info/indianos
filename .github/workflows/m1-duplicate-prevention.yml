@@ -16,6 +16,9 @@ on:
       - "docs/M1_GATES_6_7_ACCEPTANCE.md"
       - "docs/M1_GATES_8_10_ACCEPTANCE.md"
       - ".github/workflows/agent-independent-reviewer.yml"
+      # The exact-main milestone report also requires this workflow for harness-only changes.
+      - "tools/test_normal_desktop_qemu.py"
+      - "tests/test_normal_desktop_acceptance.py"
       - 'scripts/m1_dedup_guard.py'
       - 'tests/test_m1_dedup_guard.py'
       - 'docs/M1_TASK_REGISTRY.json'
