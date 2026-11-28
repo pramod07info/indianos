@@ -858,3 +858,33 @@ are pending. This is bounded functionality within the existing eight-object,
 fixed-extent, BSP filesystem. General free-space allocation, arbitrary threads/
 SMP locking, physical power-loss qualification and full POSIX/inherited ACLs
 remain outside this implementation. No new formal gate or percentage is accepted.
+
+
+### Point4 — eager x87/SSE retention under actual timer preemption
+
+The existing native desktop FPU owner now also protects the Rust CPU-entry
+preemptive scheduler profile. Every prepared task gets a clean aligned context;
+configure/bind/unbind and supervisor mapping checks cover timer-dispatched tasks
+as well. Raw syscall/timer/fault assembly already saves user FPU state before
+Rust executes and restores the selected task before IRET. The C/assembly entry
+fallback retains its existing profile; new preemptive FPU ownership requires
+Rust CPU entry. No AVX/XSAVE or cross-CPU migration is enabled.
+
+The R024 required QEMU step now explicitly builds Rust entry/userland with an
+opt-in FPU fixture. Both CPU-bound tasks seed distinct x87 data/control, XMM0,
+XMM15 and MXCSR, spin without any syscall/yield while that state is live, then
+check exact retention before exit. Each APIC preemption logs the actual saved
+user RIP. An added verifier reads the two actual ELF symbol tables and requires
+a timer sample inside each task's exported seeded-loop bounds, followed by its
+unique successful register/control receipt. It also preserves the existing
+requirement that both live tasks are interrupted before either exits. Merely
+printing a timer event or interrupting outside the seeded window cannot pass.
+
+Four host oracle tests reject missing/duplicate/stale/late receipts, wrong/
+out-of-window PCs, missing RIPs, and malformed/undefined/duplicate ELF bounds.
+The required preemption step retains RIP samples, resolved ELF bounds and the
+verifier result in its existing artifact log. Ordinary desktop/FPU/COW fixtures
+and legacy unseeded preemption entrypoints stay separate. No local build/test/
+QEMU ran; exact-head GitHub results are required before accepting this change.
+XSAVE/AVX, migration, production SMP and other ten-point gaps remain pending;
+no gate or completion percentage is newly accepted.

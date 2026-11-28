@@ -320,7 +320,7 @@ mod kernel_heap;
 mod kernel_arena;
 #[cfg(feature="normal-desktop")]
 mod zero_page;
-#[cfg(feature="normal-desktop")]
+#[cfg(any(feature="normal-desktop",all(feature="preempt",feature="cpu-entry")))]
 mod fpu_context;
 /// R029.1 authenticated per-process window grants and bounded event queue.
 pub mod gui_broker;

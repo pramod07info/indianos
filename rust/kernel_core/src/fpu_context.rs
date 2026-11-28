@@ -1,4 +1,4 @@
-//! Eager BSP x87/MMX/SSE context ownership for the native desktop.
+//! Eager BSP x87/MMX/SSE ownership for desktop and timer-preempted tasks.
 //! AVX/XSAVE and cross-CPU migration are deliberately not enabled here.
 #[repr(C,align(16))]
 pub(crate) struct Context { bytes:[u8;512] }

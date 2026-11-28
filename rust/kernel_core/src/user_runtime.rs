@@ -45,7 +45,7 @@ struct Task{
  supervision:crate::process_wait::OwnerState,
  #[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
  file_wait:crate::lock_wait::Wait,
- #[cfg(feature="normal-desktop")]
+ #[cfg(any(feature="normal-desktop",all(feature="preempt",feature="cpu-entry")))]
  fpu:crate::fpu_context::Context,
  image:UserImage,root:CloneResult,pcb:*mut Process,
  frame:[u64;WORDS],saved:bool,attached:bool,timer_preemptions:u32,
@@ -639,6 +639,7 @@ pub unsafe extern "C" fn x86_64_scheduler_apic_timer_dispatch(regs:*const u64){
             task.timer_preemptions=task.timer_preemptions.saturating_add(1);
             crate::timer::xapic_record_preemption();
             pid_log(unsafe{(*task.pcb).pid},b"APIC_TIMER_PREEMPTED\0");
+            fault_hex(b"IndianOS: R024 timer interrupted user RIP=0x\0",task.frame[15]);
             unsafe{x86_64_user_exit_to_kernel(YIELD)}
         }
     }
@@ -2120,7 +2121,7 @@ fn prepare(t:*mut Task,p:*mut Process,elf:*const u8,size:usize,original:u64,
  task.pcb=p;task.authority_live=true;
  #[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
  {task.supervision=crate::process_wait::OwnerState::new();task.file_wait=crate::lock_wait::Wait::empty();}
- #[cfg(feature="normal-desktop")]
+ #[cfg(any(feature="normal-desktop",all(feature="preempt",feature="cpu-entry")))]
  {task.fpu=crate::fpu_context::Context::new();}
  #[cfg(feature="normal-desktop")]
  let direct_map_slot={
@@ -2198,7 +2199,7 @@ fn prepare(t:*mut Task,p:*mut Process,elf:*const u8,size:usize,original:u64,
  let safe=trap_mapped(b,original,task.root.root)&&
   addresses.iter().all(|&a|kernel_mapped(b,original,task.root.root,a))&&
   image_mapped(b,task.root.root,&task.image);
- #[cfg(all(feature="normal-desktop",not(any(test,feature="std"))))]
+ #[cfg(all(any(feature="normal-desktop",all(feature="preempt",feature="cpu-entry")),not(any(test,feature="std"))))]
  let safe=safe&&{
   let start=ptr::addr_of!(task.fpu) as u64;
   crate::fpu_context::mapping_addresses().iter().copied().chain([start,start+511])
@@ -3004,10 +3005,12 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
  let Some((cpu,offset))=preflight()else{return false;};
  #[cfg(any(feature="test-r031-vfs",feature="normal-desktop"))]
  if !r120_setup(){log(b"IndianOS: R120 denied unsafe CPU/IRQ scheduler entry\n\0");return false;}
- #[cfg(all(feature="normal-desktop",not(any(test,feature="std"))))]
+ #[cfg(all(any(feature="normal-desktop",all(feature="preempt",feature="cpu-entry")),not(any(test,feature="std"))))]
  if !unsafe{crate::fpu_context::configure()}{
-  log(b"IndianOS: desktop FPU context prerequisites rejected\n\0");return false;
+  log(b"IndianOS: eager FPU context prerequisites rejected\n\0");return false;
  }
+ #[cfg(all(feature="preempt",feature="cpu-entry",not(any(test,feature="std"))))]
+ log(b"IndianOS: R024 eager x87 SSE contexts configured\n\0");
  let mut direct=DirectMap{offset};
  let vmm=vmm_backend(&mut direct);
  let backend=clone_backend(&mut direct);
@@ -3203,7 +3206,7 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
    if !saved_valid(task)||!unsafe{indianos_process_resume(pcb)}{ok=false;break;}
   }else if !unsafe{indianos_process_start(pcb,task.root.root)}{ok=false;break;}
   pid_log(pid,b"DISPATCHED\0");clear_faults();
-  #[cfg(all(feature="normal-desktop",not(any(test,feature="std"))))]
+  #[cfg(all(any(feature="normal-desktop",all(feature="preempt",feature="cpu-entry")),not(any(test,feature="std"))))]
   if !unsafe{crate::fpu_context::bind(ptr::addr_of_mut!(task.fpu))}{ok=false;break;}
   unsafe{ACTIVE_USER=&mut task.image;ACTIVE_TASK=task as *mut Task;ACTIVE_PROCESS=pcb;}
   #[cfg(any(any(feature="test-r026",feature="normal-desktop"),any(feature="test-r029-multiprocess",feature="normal-desktop")))]
@@ -3214,7 +3217,7 @@ pub unsafe extern "C" fn x86_64_m009_schedule_run(
    unsafe{x86_64_enter_user(task.image.plan.entry,
                              task.image.plan.stack_end-16,task.root.root)}
   };
-  #[cfg(all(feature="normal-desktop",not(any(test,feature="std"))))]
+  #[cfg(all(any(feature="normal-desktop",all(feature="preempt",feature="cpu-entry")),not(any(test,feature="std"))))]
   unsafe{crate::fpu_context::unbind()};
   unsafe{ACTIVE_TASK=ptr::null_mut();ACTIVE_USER=ptr::null_mut();ACTIVE_PROCESS=ptr::null_mut();}
   #[cfg(any(any(feature="test-r026",feature="normal-desktop"),any(feature="test-r029-multiprocess",feature="normal-desktop")))]

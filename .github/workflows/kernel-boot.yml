@@ -1165,7 +1165,10 @@ jobs:
             if test -f "$candidate"; then OVMF_PATH="$candidate"; break; fi
           done
           test -n "$OVMF_PATH"
-          make test-preempt OVMF_CODE="$OVMF_PATH" 2>&1 | tee build/preempt-smoke.log
+          python3 -m unittest discover -s tests -p test_preempt_fpu_acceptance.py -v
+          make test-preempt RUST_CORE=1 RUST_CPU_ENTRY=1 RUST_USERLAND=1 PREEMPT_FPU_ACCEPTANCE=1 OVMF_CODE="$OVMF_PATH" 2>&1 | tee build/preempt-smoke.log
+          python3 tools/test_preempt_fpu_qemu.py --log build/preempt-smoke.log \
+            --init-elf build/preempt/userland/demo.elf --worker-elf build/preempt/userland/worker.elf 2>&1 | tee -a build/preempt-smoke.log
       - name: Publish R024 xAPIC preemption CI status
         if: always()
         env:

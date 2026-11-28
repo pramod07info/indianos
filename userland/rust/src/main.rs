@@ -66,20 +66,83 @@ fn exit(status:u64)->! {
     let _=call(2,status,0);
     loop{unsafe{asm!("pause", options(nomem,nostack,preserves_flags))}}
 }
-#[inline(never)]
-fn spin_cpu_bound(){
-    // Not a Rust loop: rustc must not optimize away a test that relies on
-    // actual interrupted CPU work. Same work count as prior assembly app.
-    let mut counter:u64=400_000_000;
-    unsafe{
-        asm!(
-            "2:", "dec {counter}", "jnz 2b",
-            counter=inout(reg) counter,
-            options(nostack,nomem)
-        );
+// Separate CPU-bound timer fixture. No yield/syscall occurs while seeded
+// x87/XMM/control state is live; only the hardware timer can switch tasks.
+#[cfg(all(feature="test-preempt-fpu",any(feature="preempt-a",feature="preempt-b")))]
+core::arch::global_asm!(r#"
+.text
+.global indianos_preempt_fpu_spin
+.type indianos_preempt_fpu_spin,@function
+indianos_preempt_fpu_spin:
+    subq $64, %rsp
+    fnstcw 0(%rsp)
+    stmxcsr 4(%rsp)
+    movq %rdi, 8(%rsp)
+    movl %edi, %eax
+    andl $3, %eax
+    shll $10, %eax
+    orl $0x37f, %eax
+    movw %ax, 48(%rsp)
+    movl %edi, %eax
+    andl $3, %eax
+    shll $13, %eax
+    orl $0x1f80, %eax
+    movl %eax, 52(%rsp)
+    fninit
+    fldcw 48(%rsp)
+    ldmxcsr 52(%rsp)
+    fildq 8(%rsp)
+    movq 8(%rsp), %xmm0
+    movq 8(%rsp), %xmm15
+    movl $400000000, %ecx
+.global indianos_preempt_fpu_busy_begin
+indianos_preempt_fpu_busy_begin:
+2:  decq %rcx
+    jnz 2b
+.global indianos_preempt_fpu_busy_end
+indianos_preempt_fpu_busy_end:
+    fistpq 16(%rsp)
+    movq %xmm0, 24(%rsp)
+    movq %xmm15, 32(%rsp)
+    fnstcw 40(%rsp)
+    stmxcsr 44(%rsp)
+    movq 8(%rsp), %rax
+    cmpq %rax, 16(%rsp)
+    jne 4f
+    cmpq %rax, 24(%rsp)
+    jne 4f
+    cmpq %rax, 32(%rsp)
+    jne 4f
+    movzwl 48(%rsp), %eax
+    cmpw %ax, 40(%rsp)
+    jne 4f
+    movl 52(%rsp), %eax
+    cmpl %eax, 44(%rsp)
+    jne 4f
+    movl $1, %eax
+    jmp 5f
+4:  xorl %eax, %eax
+5:  fninit
+    fldcw 0(%rsp)
+    ldmxcsr 4(%rsp)
+    addq $64, %rsp
+    retq
+.size indianos_preempt_fpu_spin, .-indianos_preempt_fpu_spin
+"#,options(att_syntax));
+#[cfg(all(feature="test-preempt-fpu",any(feature="preempt-a",feature="preempt-b")))]
+unsafe extern "C"{fn indianos_preempt_fpu_spin(seed:u64)->u64;}
+#[cfg(any(feature="preempt-a",feature="preempt-b"))]
+fn spin_cpu_bound(seed:u64)->bool{
+    #[cfg(feature="test-preempt-fpu")]
+    {unsafe{indianos_preempt_fpu_spin(seed)==1}}
+    #[cfg(not(feature="test-preempt-fpu"))]
+    {
+        let _=seed;let mut counter:u64=400_000_000;
+        unsafe{asm!("2:","dec {counter}","jnz 2b",counter=inout(reg)counter,options(nostack,nomem));}
+        let _=counter;true
     }
-    let _=counter;
 }
+
 
 
 #[cfg(any(feature="ipc-a",feature="ipc-b"))]
@@ -2637,14 +2700,18 @@ pub extern "C" fn _start()->!{
     #[cfg(feature="preempt-a")]
     {
         write(b"M009 timer task A started");
-        spin_cpu_bound();
+        if !spin_cpu_bound(1){exit(126);}
+        #[cfg(feature="test-preempt-fpu")]
+        write(b"R024 timer task A x87 SSE control and registers retained");
         write(b"M009 timer task A finished");
         exit(0);
     }
     #[cfg(feature="preempt-b")]
     {
         write(b"M009 timer task B started");
-        spin_cpu_bound();
+        if !spin_cpu_bound(2){exit(126);}
+        #[cfg(feature="test-preempt-fpu")]
+        write(b"R024 timer task B x87 SSE control and registers retained");
         write(b"M009 timer task B finished");
         exit(0);
     }
