@@ -15,9 +15,9 @@ never confuse a single commit with completing a multi-year milestone.
 
 **Dependency-based execution:** (1) authenticated Terminal + block-backed VFS, defensive MBR/GPT partition mounts and power-loss-safe remount/reboot; (2) normal boot to PID1, truly independent ring-3 compositor and physical/simulated keyboard+mouse event handling; (3) independent process file syscalls, security/isolation, driver and recovery verification. These are overlapping engineering tracks, but only run parallel workers actually available.
 
-**Integration policy:** substantial production code + regression tests + real QEMU acceptance per batch; one consolidated commit and PR; run impacted M1, kernel boot, security and M2 non-regression checks on exact SHA; merge only after required CI passes, then verify merged main. Never turn a checkbox green based on mock behavior, host-only unit tests, PR title, line count or agent count. Current baseline remains **5/13**, pending **8/13**, until exact-SHA acceptance evidence justifies changing it.
+**Integration policy:** substantial production code + regression tests + real QEMU acceptance per batch; one consolidated commit and PR; run impacted M1, kernel boot, security and M2 non-regression checks on exact SHA; merge only after required CI passes, then verify merged main. Never turn a checkbox green based on mock behavior, host-only unit tests, PR title, line count or agent count. The five accepted foundation gates are the **5/13 (38.46%)** baseline. Add G1 to that count only when the [automated exact-main report](https://github.com/pramod07info/indianos/actions/workflows/agent-independent-reviewer.yml) records G1 accepted under the [G1 test-based policy](M1_GATES_6_7_ACCEPTANCE.md#g1-test-based-acceptance).
 
-**G1/G2 evidence reconciliation (22 Nov 2026):** Both production implementations and their exact-source/merged-main automated acceptance now have positive verification at [PR #790](https://github.com/pramod07info/indianos/pull/790) and [merged-main QEMU run 44984574278](https://github.com/pramod07info/indianos/actions/runs/44984574278), using merge SHA `f928b87aeffcefbc5772f054aa14a5fbda0c8436`. All three combined-reliability jobs passed (including normal four-service desktop/QEMU and two cold persistent-disk boots). [Kernel boot](https://github.com/pramod07info/indianos/actions/runs/44984574248), [security S0](https://github.com/pramod07info/indianos/actions/runs/44984574259), and [M1 Files/durable-VFS](https://github.com/pramod07info/indianos/actions/runs/44984574330) passed on that **same merged SHA**. [Detailed G1/G2 receipts and review blockers](M1_GATES_6_7_ACCEPTANCE.md). **G1/G2 checkboxes deliberately remain open** because PR #790 records no independent approving review and an explicit acceptance sign-off has not been recorded. The 5/13 accepted baseline therefore remains unchanged. This is **verification/reconciliation work**, not a claim of new kernel functionality.
+**G1/G2 evidence reconciliation (22 Nov 2026):** Both production implementations and their exact-source/merged-main automated acceptance now have positive verification at [PR #790](https://github.com/pramod07info/indianos/pull/790) and [merged-main QEMU run 44984574278](https://github.com/pramod07info/indianos/actions/runs/44984574278), using merge SHA `f928b87aeffcefbc5772f054aa14a5fbda0c8436`. All three combined-reliability jobs passed (including normal four-service desktop/QEMU and two cold persistent-disk boots). [Kernel boot](https://github.com/pramod07info/indianos/actions/runs/44984574248), [security S0](https://github.com/pramod07info/indianos/actions/runs/44984574259), and [M1 Files/durable-VFS](https://github.com/pramod07info/indianos/actions/runs/44984574330) passed on that **same merged SHA**. [Detailed G1/G2 receipts and review blockers](M1_GATES_6_7_ACCEPTANCE.md). These are historical test receipts, not acceptance at a later revision. G1 now follows the automated rule below; G2 still requires independent review and separate sign-off. This is **verification/reconciliation work**, not a claim of new kernel functionality.
 
 **First production slice:** harden GPT duplicate unique partition GUID rejection in `rust/kernel_core/src/m1_partition.rs`, with a fully checksummed nonoverlapping-partition regression. This does not by itself close the M1 partition gate; genuine QEMU partition selection, remount and corruption/failed-write acceptance are still required.
 
@@ -36,15 +36,13 @@ Files and Terminal, and integration/QA.
 - [x] QEMU-tested bounded hierarchical durable VFS and GUI Files reading
       persistent data on a disposable ATA test disk (R031.9).
 - [x] Batch 7 real RAM-only command interpreter and file store (R041).
-- [ ] **M1.1 current slice**: authenticated Terminal commands connected to
-      checksummed block-backed HierVfs with real read/write/mkdir/rename,
-      UI damage and read-after-remount acceptance (Rust test); then
-      prove the same live ring-3 GUI commands on QEMU. The PR #790 exact-head
-      tests and post-merge main SHA f928b87a passed the real two-boot
-      selected-GPT/physical-input QEMU acceptance suite. Implementation and
-      automated acceptance evidence are complete; independent code review and
-      formal gate sign-off are still pending. See
-      [positions 6–7 evidence](M1_GATES_6_7_ACCEPTANCE.md).
+- **G1 (position 6), automated:** Authenticated ring-3 Terminal commands use
+  durable block-backed HierVfs. Exact-main CI must prove actual keyboard input,
+  permission and stale-success controls, GUI updates and two cold boots with
+  exact remount readback. The [G1 report](https://github.com/pramod07info/indianos/actions/workflows/agent-independent-reviewer.yml)
+  is the status, not a manual checkbox. PASS on the accepted main revision
+  raises the foundation count to **6/13 (46.15%)**; no gate-level reviewer or
+  separate manual sign-off is needed.
 - [ ] **M1 partition work**: defensive MBR/GPT header/entry checksum checks,
       bounds and overlap rejection, selected-partition read/write window,
       actual HierVfs remount tests. The merged PR #790 exact-head and

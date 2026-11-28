@@ -3,9 +3,35 @@
 These are issue #616 **G1** and **G2**, not the later G6 persistent-VFS and G7
 cross-process API gates. The implementation and local runtime matrix below
 have positive exact-source **and merged-main** QEMU/host evidence from PR #790,
-verified 22 Nov 2026 (details below). The formal gate acceptance still
-requires independent review and sign-off. Do not count these gates as accepted
-or add duplicate kernel code solely because the milestone checkboxes are open.
+verified 22 Nov 2026 (details below). G1 uses the current test-based policy
+below; G2 still requires review and sign-off. Do not add duplicate kernel
+code solely because acceptance evidence is pending.
+
+## G1 test-based acceptance
+
+This section activates the G1 portion of the proposal in PR #810 and
+supersedes older G1/G2/G3 joint review language for **G1 only**. G2, G3
+and all other gates keep their existing rules. GitHub branch protection
+and required merge settings remain unchanged, including any review they
+require for the policy PR itself.
+
+For G1, the [existing Actions evidence job](https://github.com/pramod07info/indianos/actions/workflows/agent-independent-reviewer.yml)
+makes the acceptance decision on main. It reuses the existing exact-SHA
+checks: combined host/freestanding and real normal-desktop/runtime QEMU,
+Durable Files, kernel boot, Security S0, Roadmap SHA and Duplicate
+Prevention; the same-revision desktop artifact must be retained from the
+successful job. The real keyboard, authenticated permissions, visible
+Files results and two cold boots with exact remount readback remain
+mandatory. Missing, failed, skipped, stale or expired required evidence
+cannot produce PASS. A PR-head or pre-policy report cannot accept G1.
+
+The Actions summary records the revision, required results, run IDs and
+artifact ID. A G1 ACCEPTED result on main running this policy is the
+acceptance record and raises the foundation count from 5/13 to 6/13
+(46.15%). No separate independent source approval, explicit human
+sign-off or manual checklist edit is a condition. Any issue or checklist
+display is informational for G1. Results are revision-bound: later
+changes do not inherit verification from this revision.
 
 ## Position 6 / G1: live authenticated durable Terminal
 
