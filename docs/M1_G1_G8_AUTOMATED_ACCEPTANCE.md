@@ -16,7 +16,7 @@ checks trusted exact-main evidence, including required job and step results
 and the same-job retained QEMU artifact. Missing, failed, skipped, stale
 or expired mandatory evidence cannot establish a new pass. Pull-request
 results are candidate evidence only. G2 and G3 additionally require their
-named gate-specific receipt checks; the existing QEMU assertions still run.
+named gate-specific receipt checks; the existing QEMU assertions still run. A failure in an added gate receipt or the standalone G3 repeat prevents that gate from counting, without negating a valid result for the other gate. The existing shared regression remains mandatory for both.
 The report must be read for individual outcomes: a successful evaluation
 job alone is not a gate pass.
 
@@ -32,7 +32,7 @@ manually set acceptance checkbox is required.
 | --- | --- | --- |
 | G1 | Normal Terminal input, authenticated durable writes, selected-volume reboot and graphical readback; shared regression matrix | Existing exact-main rule from PR #827. |
 | G2 | MBR parser/mount tests, mirrored GPT negative cases, selected-volume bounds and unchanged media, ATA write failure, cold remount | Require the separately named G2 receipt step, green shared checks and retained QEMU evidence. Native MBR desktop boot and physical hardware are not extra G2 conditions. |
-| G3 | Production four-service desktop, per-role negatives, missing/invalid media, live restart, bounded retirement and shutdown exhaustion | Require two independent unready-compositor boots with the unchanged deadlines, plus the named G3 receipt step. The first failure stops the run, and existing diagnostics are retained. This qualifies the case but does not assert a root cause for the historical timing failure. |
+| G3 | Production four-service desktop, per-role negatives, missing/invalid media, live restart, bounded retirement and shutdown exhaustion | Require two independent unready-compositor boots with the unchanged deadlines, plus the named G3 receipt step. A failure in either boot prevents G3 acceptance, and existing diagnostics are retained. The second boot is a separate CI assessment, not a retry-to-green. This qualifies the case but does not assert a root cause for the historical timing failure. |
 | G4 | Existing full-frame QEMU and PID4-only recovery in PR #816 | Block until gate-specific CI verifies independent ring-3 compositor and input broker, app isolation, fresh authority, complete presentation and client-preserving recovery together on the acceptance revision. |
 | G5 | Existing PS/2 keyboard, pointer, focus/capture and physical-input desktop oracles | Block until a complete live matrix ties production IRQ delivery/loss recovery and focus/capture to visible Files and Terminal effects. UART injection and host tests alone cannot count. |
 | G6 | Existing COW publication cuts, identity checks, live leases and file-lock regressions | Block until scoped concurrent-writer, per-user and flush-order qualification is complete and the required physical cache-loss evidence is available. Ordinary reboot or a simulated publication cut cannot substitute for required physical proof. |
@@ -48,5 +48,5 @@ weakening the original [gate scope](https://github.com/pramod07info/indianos/iss
 Prior verified baseline under PR #827: G1 accepted at
 `42dc173421fd5e1d2ab0fbd1c2f3b0f77c262d44` (6/13, 46.15%),
 [normal desktop QEMU](https://github.com/pramod07info/indianos/actions/runs/46151671023/job/140999439531).
-G2 adds 1 gate (7/13, 53.85%); G2 and G3 add 2 (8/13, 61.54%)
+Either G2 or G3 adds 1 gate (7/13, 53.85%); both add 2 (8/13, 61.54%)
 only after the active policy is merged and required evidence passes.

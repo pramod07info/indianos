@@ -222,6 +222,12 @@ jobs:
               assert.match(accepted.summary,/8\/13 .*61\.54%/);
               assert.match(decideGates({},true,{}).summary,/6\/13 .*46\.15%/);
               assert.match(decideGates({},true,{G2:true}).summary,/7\/13 .*53\.85%/);
+              for(const [passing,blocked] of [["G2","G3"],["G3","G2"]]){
+                const decision=decideGates({},true,{[passing]:true,[blocked]:false});
+                assert.match(decision.summary,/7\/13 .*53\.85%/);
+                assert.equal(decision.rows.find(r=>r[0]===passing)[1],"ACCEPTED");
+                assert.equal(decision.rows.find(r=>r[0]===blocked)[1],"NOT VERIFIED");
+              }
               for(const [subject,ready] of [[{},false],[{number:1},true],[{number:1},false]]){
                 const decision=decideGates(subject,ready,{G2:true,G3:true});
                 assert.equal(decision.rows.length,8);
