@@ -249,7 +249,8 @@ jobs:
                 const decision=decideGates(subject,ready,{G2:true,G3:true});
                 assert.equal(decision.rows.length,8);
                 assert.ok(decision.rows.every(r=>r[1]!=="ACCEPTED"));
-                assert.equal(decision.rows.filter(r=>r[1]==="BLOCKED").length,4);
+                assert.deepEqual(decision.rows.filter(r=>r[1]==="BLOCKED").map(r=>r[0]),["G6","G7","G8"]);
+                assert.equal(decision.rows.find(r=>r[0]==="G5")[1],"NOT VERIFIED");
               }
               const sha="a".repeat(40),full="owner/repo",path=".github/workflows/test.yml";
               const run={id:1,run_number:1,path,head_sha:sha,head_branch:"main",head_repository:{full_name:full},event:"push",status:"completed",conclusion:"success"};
