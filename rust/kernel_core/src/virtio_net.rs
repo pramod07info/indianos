@@ -106,6 +106,46 @@ fn queue_layout(port:u16,queue:u16)->Option<QueueLayout>{
     unsafe{outw(port+0x0e,queue);}
     QueueLayout::new(unsafe{inw(port+0x0c)})
 }
+// At most two legacy queues can own DMA at once. A size-1024 ring uses
+// seven pages plus one packet page; leave headroom while retaining every
+// rejected PMM release. No new probe is admitted until this ledger drains.
+const RETIRED_CAPACITY:usize=32;
+struct RetiredPages{frames:[u64;RETIRED_CAPACITY],poisoned:bool}
+impl RetiredPages{
+    const fn new()->Self{Self{frames:[0;RETIRED_CAPACITY],poisoned:false}}
+    fn pending(&self)->bool{self.poisoned||self.frames.iter().any(|&frame|frame!=0)}
+    /// Record ownership before attempting release. Only pages which were
+    /// never published to a device, or whose DMA retirement was verified,
+    /// may enter this ledger. It is not a substitute for NIC reset.
+    fn retire(&mut self,frame:u64,release:&mut impl FnMut(u64)->bool)->bool{
+        if self.poisoned||frame==0||frame&4095!=0||self.frames.contains(&frame){
+            self.poisoned=true;return false;
+        }
+        let Some(slot)=self.frames.iter_mut().find(|entry|**entry==0)else{
+            // An impossible capacity/ownership violation forbids further
+            // probes; never authorize reuse by forgetting a rejected frame.
+            self.poisoned=true;return false;
+        };
+        *slot=frame;
+        if release(frame){*slot=0;true}else{false}
+    }
+    fn retry(&mut self,mut release:impl FnMut(u64)->bool)->bool{
+        if self.poisoned{return false;}
+        for frame in &mut self.frames{
+            if *frame!=0&&release(*frame){*frame=0;}
+        }
+        !self.pending()
+    }
+}
+// All accesses satisfy probe's exclusive BSP/CLI contract. VirtioNet contains
+// raw owned pointers and is neither Send nor Sync; there is no IRQ-side PMM.
+static mut RETIRED:RetiredPages=RetiredPages::new();
+fn release_retired(frame:u64)->bool{
+    unsafe{(&mut *ptr::addr_of_mut!(RETIRED)).retire(frame,&mut |physical|pmm_release_frame(physical))}
+}
+fn retry_retired()->bool{
+    unsafe{(&mut *ptr::addr_of_mut!(RETIRED)).retry(|physical|pmm_release_frame(physical))}
+}
 struct Queue{
     ring_phys:u64,
     ring:*mut u8,
@@ -124,7 +164,7 @@ impl Queue {
         let mut bufphys=0u64;
         if !unsafe{pmm_allocate_frame(&mut bufphys)}{
             for n in 0..layout.frames{
-                let _=unsafe{pmm_release_frame(ring_phys+n as u64*PAGE as u64)};
+                let _=release_retired(ring_phys+n as u64*PAGE as u64);
             }
             return Err(Error::Device);
         }
@@ -133,9 +173,9 @@ impl Queue {
         let (Some(ring),Some(buffer),true)=(direct_map(hhdm,ring_phys),
             direct_map(hhdm,bufphys),ring_end_valid)
         else{
-            let _=unsafe{pmm_release_frame(bufphys)};
+            let _=release_retired(bufphys);
             for n in 0..layout.frames{
-                let _=unsafe{pmm_release_frame(ring_phys+n as u64*PAGE as u64)};
+                let _=release_retired(ring_phys+n as u64*PAGE as u64);
             }
             return Err(Error::Device);
         };
@@ -187,11 +227,12 @@ impl Queue {
         self.used=self.used.wrapping_add(1);
         Ok(Some(size as usize))
     }
-    fn release(self){
-        let _=unsafe{pmm_release_frame(self.buffer_phys)};
+    fn release(self)->bool{
+        let mut complete=release_retired(self.buffer_phys);
         for n in 0..self.layout.frames{
-            let _=unsafe{pmm_release_frame(self.ring_phys+n as u64*PAGE as u64)};
+            if !release_retired(self.ring_phys+n as u64*PAGE as u64){complete=false;}
         }
+        complete
     }
 }
 fn configure_queue(port:u16,queue:u16,q:&Queue)->bool{
@@ -270,6 +311,9 @@ impl VirtioNet{
     /// QEMU legacy virtio-net, BSP with IRQs disabled and PMM initialized.
     /// No other I/O master may own the PCI device, DMA frames or virtqueues.
     pub unsafe fn probe()->Result<Self,Error>{
+        // Retry only already-retired ownership, before device discovery can
+        // allocate or publish a new queue. A busy PMM cannot reset this debt.
+        if !retry_retired(){return Err(Error::Device);}
         let Some((bus,slot,function,port))=discover()else{return Err(Error::Device);};
         let mut control=LegacyControl{port,bus,slot,function};
         if !quiesce_device(&mut control){return Err(Error::Device);}
@@ -338,14 +382,17 @@ impl VirtioNet{
     /// device may return 0xff, so an uncertain reset must retain all DMA
     /// frames rather than risk a use-after-free. Requires BSP+CLI and a
     /// stable PCI I/O-port mapping; no IOMMU or real hardware qualification.
+    /// A rejected PMM release is retained and causes false; the next probe
+    /// retries those proven-retired pages before admitting any new DMA.
     #[must_use]
     pub fn close(self)->bool{
         #[cfg(feature="test-r136-nic-irq")]
         if crate::nic_interrupt::active(self.port)&&!unsafe{crate::nic_interrupt::disable(self.port)}{return false;}
         let mut control=LegacyControl{port:self.port,bus:self.bus,slot:self.slot,function:self.function};
         if !quiesce_device(&mut control){return false;}
-        self.rx.release();self.tx.release();
-        true
+        // Attempt both releases even if one is rejected. Rejected frames
+        // stay charged in the ledger and close must not claim reclamation.
+        let rx=self.rx.release();let tx=self.tx.release();rx&&tx
     }
 }
 /// Exact expected PCI device ID, not an arbitrary substituted controller.
@@ -537,6 +584,37 @@ impl EthernetDevice for VirtioNet{
 #[cfg(test)]
 mod tests{
     use super::*;
+    #[test]fn retired_dma_pages_keep_failed_ownership_until_exact_retry_succeeds(){
+        let mut debt=RetiredPages::new();
+        assert!(!debt.retire(0x1000,&mut |_|false));
+        assert!(!debt.retire(0x2000,&mut |_|false));assert!(debt.pending());
+        let mut released=std::vec::Vec::new();
+        assert!(!debt.retry(|frame|{released.push(frame);frame==0x1000}));
+        assert_eq!(released,[0x1000,0x2000]);released.clear();
+        assert!(debt.retry(|frame|{released.push(frame);true}));
+        assert_eq!(released,[0x2000]);assert!(!debt.pending());
+        assert!(debt.retry(|_|panic!("already returned DMA frame released twice")));
+    }
+    #[test]fn successful_retirement_leaves_capacity_for_a_later_fresh_owner(){
+        let mut debt=RetiredPages::new();let mut count=0;
+        for _ in 0..64{assert!(debt.retire(0x1000,&mut |_|{count+=1;true}));}
+        assert_eq!(count,64);assert!(!debt.pending());
+        assert!(debt.frames.iter().all(|&frame|frame==0));
+    }
+    #[test]fn invalid_duplicate_or_overflowed_dma_debt_stops_reprobe_without_release(){
+        for invalid in [0,1]{
+            let mut debt=RetiredPages::new();
+            assert!(!debt.retire(invalid,&mut |_|panic!("invalid ownership reached PMM")));
+            assert!(!debt.retry(|_|panic!("poisoned ownership was released")));
+        }
+        let mut debt=RetiredPages::new();assert!(!debt.retire(0x1000,&mut |_|false));
+        assert!(!debt.retire(0x1000,&mut |_|panic!("duplicate was released")));
+        assert!(!debt.retry(|_|panic!("duplicate authority bypassed poison")));
+        let mut debt=RetiredPages::new();
+        for index in 1..=RETIRED_CAPACITY{assert!(!debt.retire(index as u64*4096,&mut |_|false));}
+        assert!(!debt.retire((RETIRED_CAPACITY as u64+1)*4096,&mut |_|panic!("overflow was released")));
+        assert!(debt.pending());assert!(debt.poisoned);
+    }
     /// Host-only transport: production uses actual legacy PCI and port I/O.
     struct Control{
         statuses:[u8;2],identities:[u32;2],commands:[u32;2],

@@ -6,6 +6,19 @@
 //! Each mailbox has a fixed receiver PID. Teardown discards its received
 //! messages and any pending messages it sent to peers.
 
+use core::sync::atomic::{AtomicU64,Ordering};
+
+// Router replacement is a separate ownership transition from recycling one
+// mailbox. A boot-lifetime incarnation prevents retained continuations from
+// authenticating a new router whose first mailbox epoch is again one. This
+// allocator does not make mutable mailbox operations safe for concurrent use.
+static NEXT_ROUTER_INCARNATION:AtomicU64=AtomicU64::new(1);
+fn allocate_router_incarnation(counter:&AtomicU64)->Result<u64,IpcError>{
+    counter.fetch_update(Ordering::AcqRel,Ordering::Acquire,|value|
+        if value==0{None}else{value.checked_add(1)})
+        .map_err(|_|IpcError::NoFreeMailbox)
+}
+
 pub const MAX_PAYLOAD: usize = 64;
 pub const MAX_MAILBOX_DEPTH: usize = 32;
 
@@ -142,6 +155,7 @@ impl<const DEPTH: usize> Mailbox<DEPTH> {
 pub struct IpcRouter<const MAILBOXES: usize, const DEPTH: usize> {
     mailboxes: [Option<Mailbox<DEPTH>>; MAILBOXES],
     next_epoch:u64,
+    incarnation:u64,
 }
 
 impl<const MAILBOXES: usize, const DEPTH: usize> IpcRouter<MAILBOXES, DEPTH> {
@@ -149,7 +163,8 @@ impl<const MAILBOXES: usize, const DEPTH: usize> IpcRouter<MAILBOXES, DEPTH> {
         if MAILBOXES == 0 || DEPTH == 0 || DEPTH > MAX_MAILBOX_DEPTH {
             return Err(IpcError::InvalidConfiguration);
         }
-        Ok(Self { mailboxes: core::array::from_fn(|_| None),next_epoch:1 })
+        let incarnation=allocate_router_incarnation(&NEXT_ROUTER_INCARNATION)?;
+        Ok(Self { mailboxes: core::array::from_fn(|_| None),next_epoch:1,incarnation })
     }
 
     pub fn register(&mut self, pid: u32) -> Result<(), IpcError> {
@@ -271,18 +286,20 @@ impl Message{
     }
 }
 
-/// A private kernel continuation, bound to one mailbox registration. Rounds
+/// A private kernel continuation, bound to one router lifetime AND mailbox
+/// registration. Moving a router preserves identity; recreating it cannot
+/// inherit a pending receive even if PID and local mailbox epoch match. Rounds
 /// count scheduler selection passes, never hardware ticks or wall-clock time.
 /// All-zero is inactive so a zero-initialized private Task remains valid.
 #[derive(Clone,Copy)]
 pub struct ReceiveWait{
-    receiver:u32,epoch:u64,address:u64,remaining:u8,fresh:bool,
+    receiver:u32,epoch:u64,router_incarnation:u64,address:u64,remaining:u8,fresh:bool,
 }
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 pub enum WaitPoll{Pending,Delivered(usize),TimedOut,Failed(IpcError)}
 impl ReceiveWait{
     pub const fn empty()->Self{
-        Self{receiver:0,epoch:0,address:0,remaining:0,fresh:false}
+        Self{receiver:0,epoch:0,router_incarnation:0,address:0,remaining:0,fresh:false}
     }
     pub fn begin<const M:usize,const D:usize>(router:&IpcRouter<M,D>,
         receiver:u32,address:u64,rounds:u64)->Result<Self,IpcError>{
@@ -290,7 +307,7 @@ impl ReceiveWait{
             return Err(IpcError::InvalidConfiguration);
         }
         let epoch=router.epoch(receiver)?;
-        Ok(Self{receiver,epoch,address,remaining:rounds as u8,fresh:true})
+        Ok(Self{receiver,epoch,router_incarnation:router.incarnation,address,remaining:rounds as u8,fresh:true})
     }
     pub fn active(&self)->bool{self.receiver!=0}
     pub fn receiver(&self)->u32{self.receiver}
@@ -299,7 +316,7 @@ impl ReceiveWait{
     pub fn poll<const M:usize,const D:usize>(&mut self,router:&mut IpcRouter<M,D>,
         deliver:impl FnOnce(&Message)->bool)->WaitPoll{
         if !self.active(){return WaitPoll::Failed(IpcError::UnknownReceiver);}
-        let result=if router.epoch(self.receiver)!=Ok(self.epoch){
+        let result=if router.incarnation!=self.router_incarnation||router.epoch(self.receiver)!=Ok(self.epoch){
             WaitPoll::Failed(IpcError::UnknownReceiver)
         }else{
             match router.receive_with(self.receiver,deliver){
@@ -576,6 +593,59 @@ mod tests {
         assert_eq!(current.poll(&mut router,|_|false),WaitPoll::TimedOut);
         let mut cancelled=ReceiveWait::begin(&router,2,0x400000,1).unwrap();
         cancelled.cancel();assert!(!cancelled.active());
+    }
+    #[test]
+    fn ipc_wait_rejects_recreated_router_with_identical_pid_and_local_epoch(){
+        let mut original=IpcRouter::<2,2>::new().unwrap();
+        original.register(1).unwrap();original.register(2).unwrap();
+        let mut wait=ReceiveWait::begin(&original,2,0x400000,32).unwrap();
+        let mut replacement=IpcRouter::<2,2>::new().unwrap();
+        replacement.register(1).unwrap();replacement.register(2).unwrap();
+        assert_eq!(original.epoch(2),replacement.epoch(2));
+        assert_ne!(original.incarnation,replacement.incarnation);
+        replacement.send(1,2,b"replacement incarnation").unwrap();
+        assert_eq!(wait.poll(&mut replacement,|_|panic!("retired router copied replacement data")),
+            WaitPoll::Failed(IpcError::UnknownReceiver));
+        assert!(!wait.active());assert_eq!(replacement.pending(2),Ok(1));
+        let mut current=ReceiveWait::begin(&replacement,2,0x400000,1).unwrap();
+        assert_eq!(current.poll(&mut replacement,|message|message.payload()==b"replacement incarnation"),
+            WaitPoll::Delivered(31));
+        assert_eq!(replacement.pending(2),Ok(0));
+    }
+    #[test]
+    fn ipc_wait_remains_bound_when_router_moves_to_runtime_storage(){
+        let mut staging=IpcRouter::<2,1>::new().unwrap();
+        staging.register(1).unwrap();staging.register(2).unwrap();
+        let mut wait=ReceiveWait::begin(&staging,2,0x400000,1).unwrap();
+        let mut runtime=Some(staging);
+        let router=runtime.as_mut().unwrap();router.send(1,2,b"same lifetime").unwrap();
+        assert_eq!(wait.poll(router,|message|message.payload()==b"same lifetime"),WaitPoll::Delivered(21));
+        assert!(!wait.active());assert_eq!(router.pending(2),Ok(0));
+    }
+    #[test]
+    fn router_incarnation_exhaustion_never_wraps_into_prior_authority(){
+        let counter=AtomicU64::new(u64::MAX-1);
+        assert_eq!(allocate_router_incarnation(&counter),Ok(u64::MAX-1));
+        assert_eq!(allocate_router_incarnation(&counter),Err(IpcError::NoFreeMailbox));
+        assert_eq!(counter.load(Ordering::Acquire),u64::MAX);
+        let corrupt=AtomicU64::new(0);
+        assert_eq!(allocate_router_incarnation(&corrupt),Err(IpcError::NoFreeMailbox));
+        assert_eq!(corrupt.load(Ordering::Acquire),0);
+    }
+    #[test]
+    fn concurrent_router_creation_never_reissues_an_incarnation(){
+        let counter=std::sync::Arc::new(AtomicU64::new(1));
+        let mut workers=std::vec::Vec::new();
+        for _ in 0..4{
+            let counter=counter.clone();workers.push(std::thread::spawn(move||{
+                let mut minted=std::vec::Vec::new();
+                for _ in 0..64{minted.push(allocate_router_incarnation(&counter).unwrap());}minted
+            }));
+        }
+        let mut minted=std::vec::Vec::new();
+        for worker in workers{minted.extend(worker.join().unwrap());}
+        minted.sort_unstable();assert_eq!(minted,(1..=256).collect::<std::vec::Vec<u64>>());
+        assert_eq!(counter.load(Ordering::Acquire),257);
     }
     #[test]
     fn ipc_wait_rejects_bad_budget_and_epoch_exhaustion_without_registration(){

@@ -189,7 +189,7 @@ impl DesktopLifecycle{
    32=>matches!(operation,4|8|10|12),
    // Existing descriptors may read, seek and close. OPEN can create/truncate
    // and is deliberately refused even when its user flags claim read-only.
-   33=>matches!(operation,2|4|5|25|27|36|37),
+   33=>matches!(operation,2|4|5|25|27|36|37|45|46),
    41=>false,
    _=>true,
   }
@@ -1365,6 +1365,7 @@ pub unsafe extern "C" fn x86_64_user_syscall_dispatch(regs:*const u64)->u64{
    if request.arg0==42&&argument==0{return BAD;}
    if request.arg0==43&&(argument as u16==0||((argument>>16)&0xffff)>8||argument>>32>16384){return BAD;}
    if request.arg0==44&&(argument==0||argument>u16::MAX as u64){return BAD;}
+   if matches!(request.arg0,45|46)&&argument>u16::MAX as u64{return BAD;}
    if matches!(request.arg0,4|6|25|26) && argument>crate::durablefs::MAX_FILE_BYTES as u64{
     return BAD;
    }
@@ -2952,6 +2953,10 @@ fn cleanup_session(backend:&CloneBackend,reclaim:bool)->bool{
          R115_UDP_OWNERS=crate::udp_owner_epoch::Registry::new();
          R116_SHARED_LEASES=crate::agent_03_cap_epoch::LeaseTable::new();}
  }
+ #[cfg(feature="normal-desktop")]
+ if complete&&crate::zero_page::mapping_references()!=0{
+  log(b"IndianOS: shared-zero mapping references not drained\n\0");complete=false;
+ }
  unsafe{SESSION_DIRTY=!complete;}
  complete
 }
@@ -3594,7 +3599,7 @@ fn native_file_payload_size(action:u64,offset:u64,length:u64)->Option<usize>{
  #[test]fn desktop_durable_shutdown_fences_all_storage_mutations(){
   let mut state=DesktopLifecycle::new();
   for number in [32,33]{
-   for operation in 0..=44{assert!(state.allows_storage_request(number,operation));}
+   for operation in 0..=46{assert!(state.allows_storage_request(number,operation));}
   }
   assert!(state.compositor_ready(1));
   assert!(state.ready(true));
@@ -3603,9 +3608,9 @@ fn native_file_payload_size(action:u64,offset:u64,length:u64)->Option<usize>{
   assert!(state.allows_storage_request(33,3));
   assert!(state.allows_storage_request(41,35));
   assert!(state.complete_sync(true));
-  for operation in 0..=44{
+  for operation in 0..=46{
    assert_eq!(state.allows_storage_request(32,operation),matches!(operation,4|8|10|12));
-   assert_eq!(state.allows_storage_request(33,operation),matches!(operation,2|4|5|25|27|36|37));
+   assert_eq!(state.allows_storage_request(33,operation),matches!(operation,2|4|5|25|27|36|37|45|46));
    assert!(!state.allows_storage_request(41,operation));
   }
   assert!(!state.allows_storage_request(32,u64::MAX));

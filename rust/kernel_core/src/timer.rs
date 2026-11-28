@@ -401,6 +401,69 @@ fn xapic_reg(offset:usize)->Option<*mut u32>{
     if base==0{return None;}
     Some((base as usize+offset) as *mut u32)
 }
+/// The timer LVT has a read-only delivery-status bit; compare writable
+/// vector/mask/mode bits only. The divisor has writable bits 0, 1 and 3.
+const TIMER_LVT_WRITABLE:u32=0x0007_00ff;
+const TIMER_DIVIDE_WRITABLE:u32=0x0b;
+trait TimerIo{
+    fn read(&mut self,offset:usize)->u32;
+    fn write(&mut self,offset:usize,value:u32);
+}
+struct TimerMmio;
+impl TimerIo for TimerMmio{
+    fn read(&mut self,offset:usize)->u32{
+        // Every caller preflights the fixed register set before construction.
+        unsafe{core::ptr::read_volatile(xapic_reg(offset).unwrap())}
+    }
+    fn write(&mut self,offset:usize,value:u32){
+        unsafe{core::ptr::write_volatile(xapic_reg(offset).unwrap(),value)}
+    }
+}
+fn timer_registers_bound()->bool{
+    [XAPIC_LVT_TIMER_OFFSET,XAPIC_TIMER_INITIAL_OFFSET,XAPIC_TIMER_DIVIDE_OFFSET]
+        .iter().all(|&offset|xapic_reg(offset).is_some())
+}
+fn stop_timer_verified(io:&mut impl TimerIo)->bool{
+    let old=io.read(XAPIC_LVT_TIMER_OFFSET);
+    io.write(XAPIC_LVT_TIMER_OFFSET,old|(1<<16));
+    io.write(XAPIC_TIMER_INITIAL_OFFSET,0);
+    core::sync::atomic::compiler_fence(Ordering::SeqCst);
+    io.read(XAPIC_LVT_TIMER_OFFSET)&(1<<16)!=0&&
+        io.read(XAPIC_TIMER_INITIAL_OFFSET)==0
+}
+fn timer_registers_match(io:&mut impl TimerIo,lvt:u32,divide:u32,count:u32)->bool{
+    io.read(XAPIC_LVT_TIMER_OFFSET)&TIMER_LVT_WRITABLE==lvt&TIMER_LVT_WRITABLE&&
+        io.read(XAPIC_TIMER_DIVIDE_OFFSET)&TIMER_DIVIDE_WRITABLE==divide&TIMER_DIVIDE_WRITABLE&&
+        io.read(XAPIC_TIMER_INITIAL_OFFSET)==count
+}
+/// Program while masked, verify the mask/divisor/zero count before publishing
+/// a count, then verify the final unmask. A failed write never becomes timer
+/// authority. Best-effort quiescence retains ARMED ownership for stop retry.
+fn program_timer_verified(io:&mut impl TimerIo,lvt:u32,divide:u32,count:u32)->bool{
+    let masked=lvt|(1<<16);
+    io.write(XAPIC_LVT_TIMER_OFFSET,masked);
+    io.write(XAPIC_TIMER_INITIAL_OFFSET,0);
+    io.write(XAPIC_TIMER_DIVIDE_OFFSET,divide);
+    core::sync::atomic::compiler_fence(Ordering::SeqCst);
+    let configured=timer_registers_match(io,masked,divide,0);
+    if configured{
+        io.write(XAPIC_TIMER_INITIAL_OFFSET,count);
+        core::sync::atomic::compiler_fence(Ordering::SeqCst);
+        if timer_registers_match(io,masked,divide,count){
+            io.write(XAPIC_LVT_TIMER_OFFSET,lvt);
+            core::sync::atomic::compiler_fence(Ordering::SeqCst);
+            if timer_registers_match(io,lvt,divide,count){return true;}
+        }
+    }
+    let _=stop_timer_verified(io);false
+}
+fn revoke_apic_clock(){
+    XAPIC_CALIBRATING.store(false,Ordering::Release);
+    XAPIC_TIMER_RUNNING.store(false,Ordering::Release);
+    if MONOTONIC_SOURCE.compare_exchange(2,0,Ordering::AcqRel,Ordering::Acquire).is_ok(){
+        invalidate_monotonic_session();
+    }
+}
 /// # Safety
 /// The registered UC page must remain mapped, on the BSP, with interrupts
 /// disabled. Leaves the timer masked until a separate calibrated IRQ path
@@ -409,17 +472,13 @@ fn xapic_reg(offset:usize)->Option<*mut u32>{
 pub unsafe extern "C" fn x86_64_xapic_timer_prepare_masked(vector:u8)->bool{
     if vector!=0x40 || XAPIC_TIMER_ARMED.load(Ordering::Acquire){return false;}
     let Some(lvt)=xapic_timer_lvt(vector,true,true)else{return false;};
-    let (Some(divide),Some(initial),Some(lvt_reg))=(
-        xapic_reg(XAPIC_TIMER_DIVIDE_OFFSET),
-        xapic_reg(XAPIC_TIMER_INITIAL_OFFSET),
-        xapic_reg(XAPIC_LVT_TIMER_OFFSET)
-    )else{return false;};
-    unsafe{
-        core::ptr::write_volatile(lvt_reg,lvt);
-        core::ptr::write_volatile(initial,0);
-        core::ptr::write_volatile(divide,xapic_timer_divide(16).unwrap());
-    }
+    if !timer_registers_bound(){return false;}
+    // Once hardware is touched, quiescence owns this source even if readback
+    // fails. Do not let shutdown skip a possibly live timer as "unarmed".
     XAPIC_TIMER_ARMED.store(true,Ordering::Release);
+    if !program_timer_verified(&mut TimerMmio,lvt,xapic_timer_divide(16).unwrap(),0){
+        revoke_apic_clock();return false;
+    }
     true
 }
 /// R019.3: install a calibrated periodic timer while interrupts are disabled.
@@ -437,23 +496,13 @@ pub unsafe extern "C" fn x86_64_xapic_timer_start_calibrated(
     // IRQs cannot be counted as progress for the next calibration session.
     if !XAPIC_TIMER_ARMED.load(Ordering::Acquire) ||
        XAPIC_TIMER_RUNNING.load(Ordering::Acquire){return false;}
-    let (Some(lvt),Some(divide),Some(initial))=(
-        xapic_reg(XAPIC_LVT_TIMER_OFFSET),
-        xapic_reg(XAPIC_TIMER_DIVIDE_OFFSET),
-        xapic_reg(XAPIC_TIMER_INITIAL_OFFSET),
-    )else{return false;};
-    unsafe{
-        // Mask before reprogramming, then start only with a validated count.
-        core::ptr::write_volatile(lvt,cfg.lvt|(1<<16));
-        core::ptr::write_volatile(initial,0);
-        core::ptr::write_volatile(divide,cfg.divide);
-        // A fresh timer session must not inherit old IRQ/preemption evidence.
-        // BSP interrupts are disabled throughout this critical section.
-        XAPIC_IRQ_TICKS.store(0,Ordering::Release);
-        XAPIC_PREEMPTIONS.store(0,Ordering::Release);
-        core::ptr::write_volatile(lvt,cfg.lvt);
-        core::ptr::write_volatile(initial,cfg.initial_count);
-    }
+    if !timer_registers_bound(){return false;}
+    revoke_apic_clock();
+    if !program_timer_verified(&mut TimerMmio,cfg.lvt,cfg.divide,cfg.initial_count){return false;}
+    // IRQs are disabled. Publish fresh software/clock state only after all
+    // hardware readbacks established the new periodic session.
+    XAPIC_IRQ_TICKS.store(0,Ordering::Release);
+    XAPIC_PREEMPTIONS.store(0,Ordering::Release);
     XAPIC_CALIBRATING.store(false,Ordering::Release);
     XAPIC_TIMER_RUNNING.store(true,Ordering::Release);
     invalidate_monotonic_session();
@@ -473,19 +522,11 @@ pub unsafe extern "C" fn x86_64_xapic_calibration_begin(initial_count:u32)->bool
     if XAPIC_TIMER_RUNNING.load(Ordering::Acquire) ||
        XAPIC_CALIBRATING.load(Ordering::Acquire){return false;}
     if initial_count==0 || !XAPIC_TIMER_ARMED.load(Ordering::Acquire){return false;}
-    let (Some(lvt),Some(divide),Some(initial))=(
-        xapic_reg(XAPIC_LVT_TIMER_OFFSET),
-        xapic_reg(XAPIC_TIMER_DIVIDE_OFFSET),
-        xapic_reg(XAPIC_TIMER_INITIAL_OFFSET)
-    )else{return false;};
+    if !timer_registers_bound(){return false;}
     let Some(lvt_value)=xapic_timer_lvt(0x40,false,true)else{return false;};
     let Some(divide_value)=xapic_timer_divide(16)else{return false;};
-    unsafe{
-        core::ptr::write_volatile(lvt,lvt_value);
-        core::ptr::write_volatile(initial,0);
-        core::ptr::write_volatile(divide,divide_value);
-        core::ptr::write_volatile(initial,initial_count);
-    }
+    revoke_apic_clock();
+    if !program_timer_verified(&mut TimerMmio,lvt_value,divide_value,initial_count){return false;}
     XAPIC_CALIBRATING.store(true,Ordering::Release);
     true
 }
@@ -510,22 +551,11 @@ pub unsafe extern "C" fn x86_64_xapic_timer_sample_masked()->u32{
 #[no_mangle]
 pub unsafe extern "C" fn x86_64_xapic_timer_stop()->bool{
     if !XAPIC_TIMER_ARMED.load(Ordering::Acquire){return false;}
-    let (Some(lvt),Some(initial))=(
-        xapic_reg(XAPIC_LVT_TIMER_OFFSET),
-        xapic_reg(XAPIC_TIMER_INITIAL_OFFSET),
-    )else{return false;};
-    unsafe{
-        let old=core::ptr::read_volatile(lvt);
-        core::ptr::write_volatile(lvt,old|(1<<16));
-        core::ptr::write_volatile(initial,0);
-    }
-    XAPIC_CALIBRATING.store(false,Ordering::Release);
-    XAPIC_TIMER_RUNNING.store(false,Ordering::Release);
-    if MONOTONIC_SOURCE.compare_exchange(
-        2,0,Ordering::AcqRel,Ordering::Acquire).is_ok(){
-        invalidate_monotonic_session();
-    }
-    true
+    // Software time/preemption authority ends even if hardware refuses mask
+    // or zero-count writes. Keep ARMED and the UC mapping for an explicit retry.
+    revoke_apic_clock();
+    if !timer_registers_bound(){return false;}
+    stop_timer_verified(&mut TimerMmio)
 }
 /// Quiesce every timer source owned by this single-BSP experimental
 /// kernel before returning to the read-only recovery console. The caller
@@ -1686,5 +1716,76 @@ mod kernel_p0_batch36_w2 {
         assert!(!apic_progress_snapshot_authorized(a,b,c,d,e,f,g,h,i,j,k,true));
         assert!(!apic_progress_snapshot_authorized(a,b,c,d,e,u64::MAX,g,h,i,j,k,l));
         assert!(!apic_progress_snapshot_authorized(a,b,c,d,e,f,0,h,i,j,k,l));
+    }
+}
+
+#[cfg(test)]
+mod verified_timer_programming_tests{
+    use super::*;
+    struct Registers{
+        lvt:u32,divide:u32,initial:u32,
+        dropped:Option<usize>,writes:std::vec::Vec<(usize,u32)>,
+        delivery_status:bool,
+    }
+    impl Registers{
+        fn new(dropped:Option<usize>)->Self{Self{lvt:0x40,divide:0,initial:33,
+            dropped,writes:std::vec::Vec::new(),delivery_status:false}}
+    }
+    impl TimerIo for Registers{
+        fn read(&mut self,offset:usize)->u32{match offset{
+            XAPIC_LVT_TIMER_OFFSET=>self.lvt|if self.delivery_status{1<<12}else{0},
+            XAPIC_TIMER_DIVIDE_OFFSET=>self.divide,
+            XAPIC_TIMER_INITIAL_OFFSET=>self.initial,
+            _=>panic!("unexpected timer register"),
+        }}
+        fn write(&mut self,offset:usize,value:u32){
+            let index=self.writes.len();self.writes.push((offset,value));
+            if self.dropped==Some(index){return;}
+            match offset{
+                XAPIC_LVT_TIMER_OFFSET=>self.lvt=value&!(1<<12),
+                XAPIC_TIMER_DIVIDE_OFFSET=>self.divide=value,
+                XAPIC_TIMER_INITIAL_OFFSET=>self.initial=value,
+                _=>panic!("unexpected timer register"),
+            }
+        }
+    }
+    #[test]fn periodic_count_is_published_while_masked_before_final_verified_unmask(){
+        let mut registers=Registers::new(None);registers.delivery_status=true;
+        let cfg=xapic_periodic_config(0x40,16,50).unwrap();
+        assert!(program_timer_verified(&mut registers,cfg.lvt,cfg.divide,cfg.initial_count));
+        assert_eq!(registers.writes,[(XAPIC_LVT_TIMER_OFFSET,cfg.lvt|(1<<16)),
+            (XAPIC_TIMER_INITIAL_OFFSET,0),(XAPIC_TIMER_DIVIDE_OFFSET,cfg.divide),
+            (XAPIC_TIMER_INITIAL_OFFSET,50),(XAPIC_LVT_TIMER_OFFSET,cfg.lvt)]);
+        assert_eq!(registers.lvt&(1<<16),0);assert_eq!(registers.initial,50);
+        // Read-only delivery status is permitted, never confused with mode.
+        assert!(timer_registers_match(&mut registers,cfg.lvt,cfg.divide,50));
+    }
+    #[test]fn lost_mask_or_divisor_prevents_nonzero_count_and_rolls_back_to_quiescence(){
+        let cfg=xapic_periodic_config(0x40,16,50).unwrap();
+        for dropped in [0,2]{
+            let mut registers=Registers::new(Some(dropped));
+            assert!(!program_timer_verified(&mut registers,cfg.lvt,cfg.divide,50));
+            assert!(!registers.writes.contains(&(XAPIC_TIMER_INITIAL_OFFSET,50)));
+            assert_ne!(registers.lvt&(1<<16),0);assert_eq!(registers.initial,0);
+        }
+    }
+    #[test]fn lost_count_or_final_unmask_never_reports_a_running_session(){
+        let cfg=xapic_periodic_config(0x40,16,50).unwrap();
+        for dropped in [3,4]{
+            let mut registers=Registers::new(Some(dropped));
+            assert!(!program_timer_verified(&mut registers,cfg.lvt,cfg.divide,50));
+            assert_ne!(registers.lvt&(1<<16),0);assert_eq!(registers.initial,0);
+            assert!(stop_timer_verified(&mut registers));
+        }
+    }
+    #[test]fn stop_requires_both_mask_and_zero_count_readbacks(){
+        for dropped in [0,1]{
+            let mut registers=Registers::new(Some(dropped));
+            assert!(!stop_timer_verified(&mut registers));
+            // A new explicit attempt can establish quiescence; an earlier
+            // failed write does not authorize discarding controller ownership.
+            assert!(stop_timer_verified(&mut registers));
+            assert_ne!(registers.lvt&(1<<16),0);assert_eq!(registers.initial,0);
+        }
     }
 }

@@ -46,7 +46,7 @@ fn owner_probe(pid:u64){
      &bytes[..14]!=b"HELLO INDIANOS"||handle(5,b"",token,0)!=0{exit(123);}
  }
  if pid==1{
-  if handle(37,b"",0,0)>>32&1792!=1792{exit(123);}
+  if handle(37,b"",0,0)>>32&3840!=3840{exit(123);}
   change(38,0o600);send(2,b"OWNERDENY");receive(2,b"OWNERDENIED");
   change(39,1000);send(2,b"OWNERALLOW");receive(2,b"OWNERREAD");
   change(39,0);send(2,b"OWNERREVOKE");receive(2,b"OWNERREVOKED");
@@ -60,8 +60,12 @@ fn owner_probe(pid:u64){
   change(38,0o777);
   change(43,1000);
   let token=open();
+  if handle(45,b"",token,1000)!=0||handle(46,b"",token,1000)!=(1u64<<63){exit(123);}
   if handle(39,b"",token,1000)!=u64::MAX||handle(5,b"",token,0)!=0{exit(123);}
   change(44,1000);
+  let token=open();
+  if handle(45,b"",token,1000)!=0||handle(46,b"",token,1000)!=0||handle(5,b"",token,0)!=0{exit(123);}
+  write(b"desktop ownership probe quota views matched persisted limits and kept handle live");
   write(b"desktop ownership probe zero user quota refused ownership transfer; limits removed");
   write(b"desktop ownership probe original owner group mode restored; stale tokens rejected");
  }else if pid==2{

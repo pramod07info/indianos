@@ -545,6 +545,18 @@ impl<D:BlockDevice> DurableFs<D>{
         let mut next=self.meta;next.format=next.format.max(ACL_VERSION);
         next.entries[slot].named_users=acl;self.publish(next)
     }
+    /// Read usage and optional limits from the same verified checkpoint.
+    /// This does not publish metadata, flush, reserve quota or expose file data.
+    pub(crate) fn user_quota_view(&mut self,credentials:Credentials,uid:u16)
+        ->Result<(u64,u64,Option<(u16,u32)>),FsError>{
+        if credentials.uid()!=0{return Err(FsError::InvalidName);}
+        self.check_heads()?;
+        let (objects,bytes)=self.meta.user_usage(uid).ok_or(FsError::InvalidVolume)?;
+        if objects>ENTRIES as u64||bytes>(ENTRIES*MAX_FILE_BYTES) as u64{return Err(FsError::InvalidVolume);}
+        let limit=self.meta.quotas.entries().iter().find(|(owner,_,_)|*owner!=0&&*owner==uid)
+            .map(|&(_,objects,bytes)|(objects,bytes));
+        Ok((objects,bytes,limit))
+    }
     pub(crate) fn set_user_quota(&mut self,credentials:Credentials,uid:u16,limit:Option<(u16,u32)>)
         ->Result<(),FsError>{
         self.check_heads()?;

@@ -58,6 +58,20 @@ impl<H:HardwareTrust,S:PolicySlots> BootTrust<H,S>{
   self.active_slot=None;self.active_sequence=0;self.active_root=None;
   self.registry=Registry::new();
  }
+ /// Check continuity across storage/verification callbacks as well as method
+ /// entry. Hardware adapters still must serialize trust changes with users;
+ /// this bounded revalidation does not turn separate reads into an atomic TPM
+ /// transaction or establish a firmware root by itself.
+ fn require_platform(&mut self,root:[u8;32],sequence:u64)->Result<(),Error>{
+  let observed=(||{
+   let floor=self.platform.read_protected_sequence().map_err(|_|Error::PlatformUnavailable)?;
+   let live_root=self.platform.read_authenticated_boot_root().map_err(|_|Error::PlatformUnavailable)?;
+   if live_root!=root{return Err(Error::Unauthenticated);}
+   if floor!=sequence{return Err(Error::Rollback);}
+   Ok(())
+  })();
+  if observed.is_err(){self.invalidate_active();}observed
+ }
  pub fn registry(&self)->Option<&Registry<MAX_PUBLISHERS>>{
   self.active_is_current().then_some(&self.registry)
  }
@@ -125,6 +139,13 @@ impl<H:HardwareTrust,S:PolicySlots> BootTrust<H,S>{
   let Some((slot,snapshot,registry))=selected else{
    return Err(Error::NoValidPolicy);
   };
+  // Selection reads more than one slot. Re-pin the selected durable bytes
+  // before making an irreversible protected-counter update: a replaced or
+  // removed selected slot must not strand the counter above all valid media.
+  let mut pinned=[0u8;SNAPSHOT_BYTES];
+  if !self.slots.read(slot,&mut pinned).map_err(|_|Error::StorageUnavailable)?||
+     pinned!=snapshot.to_bytes(){return Err(Error::StorageUnavailable);}
+  self.require_platform(root,floor)?;
   if snapshot.sequence>floor{
    self.platform.advance_protected_sequence(snapshot.sequence)
     .map_err(|_|Error::PlatformUnavailable)?;
@@ -133,6 +154,7 @@ impl<H:HardwareTrust,S:PolicySlots> BootTrust<H,S>{
     .map_err(|_|Error::PlatformUnavailable)?;
    if now_floor!=snapshot.sequence{return Err(Error::PlatformUnavailable);}
   }
+  self.require_platform(root,snapshot.sequence)?;
   self.registry=registry;
   self.active_slot=Some(slot);
   self.active_sequence=snapshot.sequence;
@@ -147,23 +169,9 @@ impl<H:HardwareTrust,S:PolicySlots> BootTrust<H,S>{
   auth:&Access<N>,administrator:Identity,now:u64
  )->Result<usize,Error>{
   let old_slot=self.active_slot.ok_or(Error::NotReady)?;
-  let floor=match self.platform.read_protected_sequence(){
-   Ok(floor)=>floor,
-   Err(())=>{self.invalidate_active();return Err(Error::PlatformUnavailable);}
-  };
-  let root=match self.platform.read_authenticated_boot_root(){
-   Ok(root)=>root,
-   Err(())=>{self.invalidate_active();return Err(Error::PlatformUnavailable);}
-  };
-  // Another boot owner, firmware reset, or counter update invalidates the
-  // cached registry. Re-establish it only by signed durable-slot recovery;
-  // staging an unrelated newer signature cannot bridge this trust change.
-  if self.active_root!=Some(root){
-   self.invalidate_active();return Err(Error::Unauthenticated);
-  }
-  if floor!=self.active_sequence{
-   self.invalidate_active();return Err(Error::Rollback);
-  }
+  let floor=self.active_sequence;
+  let root=self.active_root.ok_or(Error::NotReady)?;
+  self.require_platform(root,floor)?;
   if update.sequence<=floor||update.sequence<=self.active_sequence{
    return Err(Error::Rollback);
   }
@@ -184,13 +192,19 @@ impl<H:HardwareTrust,S:PolicySlots> BootTrust<H,S>{
   drop(proposed);
   let slot=1-old_slot;
   let bytes=update.to_bytes();
-  self.slots.replace_durably(slot,&bytes)
-    .map_err(|_|Error::StorageUnavailable)?;
-  // Reread must match precisely; torn/lying storage is rejected now.
-  let mut reread=[0u8;SNAPSHOT_BYTES];
-  if !self.slots.read(slot,&mut reread)
-      .map_err(|_|Error::StorageUnavailable)?||
+  self.require_platform(root,floor)?;
+  let stored=(||{
+   self.slots.replace_durably(slot,&bytes).map_err(|_|Error::StorageUnavailable)?;
+   // Reread must match precisely; torn/lying storage is rejected now.
+   let mut reread=[0u8;SNAPSHOT_BYTES];
+   if !self.slots.read(slot,&mut reread).map_err(|_|Error::StorageUnavailable)?||
       reread!=bytes{return Err(Error::StorageUnavailable);}
+   Ok(())
+  })();
+  // Also run on I/O failure: a provider failure must not hide simultaneous
+  // root/counter change and leave cached authorization able to revive.
+  self.require_platform(root,floor)?;
+  stored?;
   Ok(slot)
  }
 }
@@ -266,6 +280,92 @@ mod m2_tests{
   assert_eq!(b.boot_recover(&access(),who(),1),Ok(3));
   assert_eq!(b.registry().unwrap().public_key(7,2),Ok(PUBLISHER));
   b
+ }
+ // Test-only providers model changes at external I/O/firmware boundaries;
+ // production must supply audited, serialized hardware and independent slots.
+ #[derive(Clone,Copy)]enum Mutation{Root,Floor,Unavailable,RemoveSelected}
+ struct ChangingHardware{
+  inner:std::rc::Rc<core::cell::RefCell<EmulatedHardware>>,
+  advances:std::rc::Rc<core::cell::Cell<u32>>,change_on_advance:bool,
+ }
+ impl HardwareTrust for ChangingHardware{
+  fn read_authenticated_boot_root(&self)->Result<[u8;32],()>{self.inner.borrow().read_authenticated_boot_root()}
+  fn read_protected_sequence(&self)->Result<u64,()>{self.inner.borrow().read_protected_sequence()}
+  fn advance_protected_sequence(&mut self,sequence:u64)->Result<(),()>{
+   self.advances.set(self.advances.get()+1);
+   self.inner.borrow_mut().advance_protected_sequence(sequence)?;
+   if self.change_on_advance{self.inner.borrow_mut().boot_root=[9;32];}Ok(())
+  }
+ }
+ struct ChangingSlots{
+  inner:EmulatedSlots,hardware:std::rc::Rc<core::cell::RefCell<EmulatedHardware>>,
+  reads:usize,on_read:Option<(usize,Mutation)>,on_write:Option<Mutation>,
+ }
+ impl ChangingSlots{
+  fn change(&mut self,mutation:Mutation){
+   match mutation{
+    Mutation::Root=>self.hardware.borrow_mut().boot_root=[9;32],
+    Mutation::Floor=>self.hardware.borrow_mut().floor=4,
+    Mutation::Unavailable=>self.hardware.borrow_mut().fail_read=true,
+    Mutation::RemoveSelected=>self.inner.slots[0]=None,
+   }
+  }
+ }
+ impl PolicySlots for ChangingSlots{
+  fn read(&mut self,slot:usize,out:&mut[u8;SNAPSHOT_BYTES])->Result<bool,()>{
+   self.reads+=1;
+   if let Some((read,mutation))=self.on_read{
+    if read==self.reads{self.on_read=None;self.change(mutation);}
+   }
+   self.inner.read(slot,out)
+  }
+  fn replace_durably(&mut self,slot:usize,bytes:&[u8;SNAPSHOT_BYTES])->Result<(),()>{
+   if let Some(mutation)=self.on_write.take(){self.change(mutation);}
+   self.inner.replace_durably(slot,bytes)
+  }
+ }
+ fn changing()->BootTrust<ChangingHardware,ChangingSlots>{
+  let hardware=std::rc::Rc::new(core::cell::RefCell::new(EmulatedHardware::new()));
+  let mut inner=EmulatedSlots::new();inner.slots[0]=Some(policy(3,2,true).to_bytes());
+  BootTrust::new(ChangingHardware{inner:hardware.clone(),advances:std::rc::Rc::new(core::cell::Cell::new(0)),change_on_advance:false},
+   ChangingSlots{inner,hardware,reads:0,on_read:None,on_write:None})
+ }
+ #[test]fn m2_boottrust_slot_callback_cannot_change_platform_before_counter_commit(){
+  for (mutation,expected) in [(Mutation::Root,Error::Unauthenticated),
+    (Mutation::Floor,Error::Rollback),(Mutation::Unavailable,Error::PlatformUnavailable)]{
+   let mut boot=changing();boot.slots.on_read=Some((2,mutation));
+   assert_eq!(boot.boot_recover(&access(),who(),1),Err(expected));
+   assert_eq!(boot.platform.advances.get(),0);assert!(boot.registry().is_none());
+  }
+ }
+ #[test]fn m2_boottrust_removed_selected_slot_never_advances_the_protected_floor(){
+  let mut boot=changing();boot.slots.on_read=Some((2,Mutation::RemoveSelected));
+  assert_eq!(boot.boot_recover(&access(),who(),1),Err(Error::StorageUnavailable));
+  assert_eq!(boot.platform.advances.get(),0);assert_eq!(boot.platform.inner.borrow().floor,0);
+  assert!(boot.active_slot.is_none());
+ }
+ #[test]fn m2_boottrust_root_change_during_hardware_commit_never_publishes_registry(){
+  let mut boot=changing();boot.platform.change_on_advance=true;
+  assert_eq!(boot.boot_recover(&access(),who(),1),Err(Error::Unauthenticated));
+  assert_eq!(boot.platform.advances.get(),1);assert_eq!(boot.platform.inner.borrow().floor,3);
+  assert!(boot.active_slot.is_none());assert!(boot.registry().is_none());
+ }
+ #[test]fn m2_boottrust_staging_io_changes_retire_authority_even_when_io_fails(){
+  for readback in [false,true]{for fail_write in [false,true]{
+   if readback&&fail_write{continue;} // failing write cannot reach readback
+   let mut boot=changing();assert_eq!(boot.boot_recover(&access(),who(),1),Ok(3));
+   let original=boot.slots.inner.slots[0];
+   if readback{boot.slots.on_read=Some((boot.slots.reads+1,Mutation::Floor));}
+   else{boot.slots.on_write=Some(Mutation::Root);}
+   boot.slots.inner.fail_write=fail_write;
+   assert_eq!(boot.stage_signed_update(&policy(4,3,true),&access(),who(),1),
+    Err(if readback{Error::Rollback}else{Error::Unauthenticated}));
+   assert_eq!(boot.slots.inner.slots[0],original);assert!(boot.active_slot.is_none());
+   boot.platform.inner.borrow_mut().boot_root=BOOT;boot.platform.inner.borrow_mut().floor=3;
+   assert!(boot.registry().is_none()); // restored values cannot revive retired authority
+   boot.slots.inner.fail_write=false;
+   assert!(boot.boot_recover(&access(),who(),1).is_ok());
+  }}
  }
  #[test]fn m2_boottrust_counter_change_retires_cached_policy_before_staging(){
   for floor in [2,4]{

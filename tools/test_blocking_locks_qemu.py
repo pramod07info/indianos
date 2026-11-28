@@ -23,6 +23,7 @@ OWNER_MARKERS=tuple(b"IndianOS user: desktop ownership probe "+suffix for suffix
     b"retired owner denied",b"new group read exact committed bytes",
     b"revoked group denied",b"named user read exact committed bytes",
     b"explicit named user deny enforced",b"removed named user grant denied",
+    b"quota views matched persisted limits and kept handle live",
     b"zero user quota refused ownership transfer; limits removed",b"original owner group mode restored; stale tokens rejected"))
 
 def verify_owner_proof(output:bytes)->None:

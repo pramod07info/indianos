@@ -36,8 +36,9 @@ pub const FS_ABI_BLOCKING_LOCKS:u32=128;
 pub const FS_ABI_OWNERSHIP_ADMIN:u32=256;
 pub const FS_ABI_NAMED_USERS:u32=512;
 pub const FS_ABI_USER_QUOTAS:u32=1024;
+pub const FS_ABI_QUOTA_QUERY:u32=2048;
 pub const FS_ABI_FEATURES:u32=7|FS_ABI_UNRELATED_READERS|FS_ABI_POSITIONED_IO|
-    FS_ABI_UNRELATED_DESCRIPTOR_READERS|FS_ABI_DESCRIPTOR_FSYNC|FS_ABI_BLOCKING_LOCKS|FS_ABI_OWNERSHIP_ADMIN|FS_ABI_NAMED_USERS|FS_ABI_USER_QUOTAS;
+    FS_ABI_UNRELATED_DESCRIPTOR_READERS|FS_ABI_DESCRIPTOR_FSYNC|FS_ABI_BLOCKING_LOCKS|FS_ABI_OWNERSHIP_ADMIN|FS_ABI_NAMED_USERS|FS_ABI_USER_QUOTAS|FS_ABI_QUOTA_QUERY;
 pub const FS_ABI_INFO:u64=FS_ABI_VERSION as u64|
     ((FS_ABI_DESCRIPTOR_BYTES as u64)<<16)|((FS_ABI_FEATURES as u64)<<32);
 const SLOTS:usize=4;
@@ -576,6 +577,13 @@ impl FileHandles{
                           argument:u64,path:&str,buffer:&[u8])
                           ->Result<(),FsError>{
         if !self.owns(owner){return Err(FsError::InvalidName);}
+        if matches!(action,45|46){
+            let handle=self.entries[self.index(owner,token)?];
+            if owner.pid!=1||self.credentials_for(owner)?.uid()!=0||argument>u16::MAX as u64||
+               !path.is_empty()||!buffer.is_empty()||!self.root_allows(owner,"/")||
+               !self.root_allows(owner,handle.pathname()){return Err(FsError::InvalidName);}
+            return Ok(());
+        }
         if matches!(action,38..=44){
             let handle=self.entries[self.index(owner,token)?];
             if owner.pid!=1||!path.is_empty()||!buffer.is_empty()||argument>(if action==38{0o777}else if action==43{u64::MAX}else if action==41{u32::MAX as u64}else{u16::MAX as u64})||
@@ -1407,12 +1415,21 @@ impl FileHandles{
             }else if !matches!(action,4|5){
                 let handle=self.entries[self.index(owner,token)?];
                 let access=if Self::descriptor_action_mutates(action){2}else{4};
-                fs.authorize_access(credentials,handle.pathname(),if matches!(action,27|38..=44){0}else{access})?;
+                fs.authorize_access(credentials,handle.pathname(),if matches!(action,27|38..=46){0}else{access})?;
                 if matches!(action,13|16|30|31){
                     fs.authorize_parent(credentials,handle.pathname())?;
                     if matches!(action,13|16|31){fs.authorize_parent(credentials,path)?;}
                 }
             }
+        }
+        if matches!(action,45|46){
+            self.preflight_selected(action,owner,token,argument,path,buffer)?;
+            let handle=self.entries[self.index(owner,token)?];
+            if handle.filesystem_generation!=fs.generation(){return Err(FsError::InvalidName);}
+            let (objects,bytes,limit)=fs.user_quota_view_as(self.credentials_for(owner)?,argument as u16)?;
+            return Ok(if action==45{(objects<<32)|bytes}else{
+                limit.map_or(0,|(objects,bytes)|(1u64<<63)|(u64::from(objects)<<32)|u64::from(bytes))
+            });
         }
         if matches!(action,38..=44){
             self.preflight_selected(action,owner,token,argument,path,buffer)?;
@@ -2759,6 +2776,7 @@ mod r094_authenticated_cow_ops {
   assert_eq!((FS_ABI_INFO>>32) as u32&FS_ABI_OWNERSHIP_ADMIN,FS_ABI_OWNERSHIP_ADMIN);
   assert_eq!((FS_ABI_INFO>>32) as u32&FS_ABI_NAMED_USERS,FS_ABI_NAMED_USERS);
   assert_eq!((FS_ABI_INFO>>32) as u32&FS_ABI_USER_QUOTAS,FS_ABI_USER_QUOTAS);
+  assert_eq!((FS_ABI_INFO>>32) as u32&FS_ABI_QUOTA_QUERY,FS_ABI_QUOTA_QUERY);
   assert_eq!(operation_authenticated(&mut table,37,owner,1,0,"",&mut[]),Err(FsError::InvalidName));
   assert_eq!(operation_authenticated(&mut table,37,owner,0,1,"",&mut[]),Err(FsError::InvalidName));
   assert_eq!(FileHandles::lock_range(u64::MAX),Err(FsError::TooLarge));
@@ -3599,6 +3617,43 @@ mod r106_checked_partition_authenticated_file_api_tests{
   fn sync(&mut self)->Result<(),BlockError>{
    self.flushes+=1;if self.fail_flush{Err(BlockError::Io)}else{Ok(())}
   }
+ }
+ #[test]fn quota_queries_read_persisted_policy_with_foreign_reader_and_no_writes_or_revocation(){
+  struct ReadOnly<'a>(&'a mut Disk);
+  impl BlockDevice for ReadOnly<'_>{
+   fn sector_count(&self)->u64{self.0.sector_count()}
+   fn read_sector(&mut self,l:u64,b:&mut[u8;SECTOR_BYTES])->Result<(),BlockError>{self.0.read_sector(l,b)}
+   fn write_sector(&mut self,_:u64,_:&[u8;SECTOR_BYTES])->Result<(),BlockError>{panic!("quota query wrote metadata")}
+   fn sync(&mut self)->Result<(),BlockError>{panic!("quota query flushed")}
+  }
+  let (mut disk,receipt)=disk();let mut table=FileHandles::new();
+  prepare_selected_volume_kernel(&mut table,&mut disk,receipt).unwrap();
+  let admin=table.bind_process(1).unwrap();let guest=table.bind_process(2).unwrap();
+  {let mut device=OwnershipDisk{disk:&mut disk,flushes:0,fail_flush:false};
+   let token=operation_on_selected_volume(&mut table,1,admin,0,READ,"/shared/note",&mut[],&mut device,receipt).unwrap();
+   assert_eq!(operation_on_selected_volume(&mut table,43,admin,token,1000|(2<<16)|(256<<32),"",&mut[],&mut device,receipt),Ok(0));}
+  let token=operation_on_selected_volume(&mut table,1,admin,0,READ,"/shared/note",&mut[],&mut disk,receipt).unwrap();
+  let reader=operation_on_selected_volume(&mut table,1,guest,0,READ,"/shared/note",&mut[],&mut disk,receipt).unwrap();
+  let entries=table.entries;let stats=table.security_statistics();
+  assert_eq!(operation_on_selected_volume(&mut table,45,admin,token,0,"",&mut[],&mut ReadOnly(&mut disk),receipt),Ok((2u64<<32)|17));
+  assert_eq!(operation_on_selected_volume(&mut table,45,admin,token,1000,"",&mut[],&mut ReadOnly(&mut disk),receipt),Ok(0));
+  assert_eq!(operation_on_selected_volume(&mut table,46,admin,token,1000,"",&mut[],&mut ReadOnly(&mut disk),receipt),Ok((1u64<<63)|(2<<32)|256));
+  assert_eq!(operation_on_selected_volume(&mut table,46,admin,token,2000,"",&mut[],&mut ReadOnly(&mut disk),receipt),Ok(0));
+  assert_eq!(table.entries,entries);assert_eq!(table.security_statistics(),stats);
+  assert_eq!(operation_on_selected_volume(&mut table,5,guest,reader,0,"",&mut[],&mut OfflineDescriptorDevice,receipt),Ok(0));
+ }
+ #[test]fn quota_query_authority_bounds_and_stale_tokens_reject_before_device_access(){
+  let (mut disk,receipt)=disk();let mut table=FileHandles::new();
+  prepare_selected_volume_kernel(&mut table,&mut disk,receipt).unwrap();
+  let admin=table.bind_process(1).unwrap();let guest=table.bind_process(2).unwrap();
+  let token=operation_on_selected_volume(&mut table,1,admin,0,READ,"/shared/note",&mut[],&mut disk,receipt).unwrap();
+  for (owner,argument) in [(admin,65536),(guest,1000)]{
+   for operation in [45,46]{assert_eq!(operation_on_selected_volume(&mut table,operation,owner,token,argument,"",&mut[],&mut OfflineDescriptorDevice,receipt),Err(FsError::InvalidName));}
+  }
+  table.narrow_root_kernel(admin,"/shared").unwrap();
+  for operation in [45,46]{assert_eq!(operation_on_selected_volume(&mut table,operation,admin,token,1000,"",&mut[],&mut OfflineDescriptorDevice,receipt),Err(FsError::InvalidName));}
+  let token=operation_on_selected_volume(&mut table,1,admin,0,READ,"/shared/note",&mut[],&mut disk,receipt).unwrap();
+  assert_eq!(operation_on_selected_volume(&mut table,46,admin,token,1000,"",&mut[],&mut OfflineDescriptorDevice,receipt),Err(FsError::InvalidName));
  }
  #[test]fn selected_volume_quota_survives_remount_and_denies_unfunded_ownership(){
   let (mut disk,receipt)=disk();let mut table=FileHandles::new();

@@ -181,6 +181,8 @@ impl<D:BlockDevice> HierVfs<D>{
  }
  /// Volume-wide limits require a trusted root credential. Usage is derived
  /// from committed owned objects, including directory/symlink payloads.
+ pub fn user_quota_view_as(&mut self,credentials:Credentials,uid:u16)
+  ->Result<(u64,u64,Option<(u16,u32)>),FsError>{self.fs.user_quota_view(credentials,uid)}
  pub fn set_user_quota_as(&mut self,credentials:Credentials,uid:u16,limit:Option<(u16,u32)>)
   ->Result<(),FsError>{self.fs.set_user_quota(credentials,uid,limit)}
  fn update_permissions_as(&mut self,credentials:Credentials,path:&str,

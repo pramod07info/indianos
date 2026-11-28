@@ -115,6 +115,8 @@ pub(crate) unsafe fn memory_usage(image:&UserImage,retained:u64)->Option<ImageMe
         if mapped[index]!=(page.virtual_address!=0&&page.physical_address!=0){return None;}
     }
     usage.table_pages=table_count as u64;
+    #[cfg(feature="normal-desktop")]
+    if usage.shared_zero_mappings>crate::zero_page::mapping_references(){return None;}
     // Keep byte-unit conversion checked at the same authority boundary.
     usage.private_bytes()?;usage.logical_bytes()?;Some(usage)
 }
@@ -157,7 +159,7 @@ unsafe fn allocate(image: &UserImage) -> Option<u64> {
 }
 unsafe fn release(image: &UserImage, physical: u64) -> bool {
     #[cfg(feature="normal-desktop")]
-    if crate::zero_page::physical()==Some(physical){return true;}
+    if crate::zero_page::physical()==Some(physical){return crate::zero_page::release_mapping(physical);}
     let b = &image.tables.backend;
     let Some(release) = b.release else { return false; };
     unsafe { release(physical, b.context) }
@@ -294,7 +296,10 @@ pub(crate) unsafe fn resolve_stack_fault(image:&mut UserImage,address:u64,error:
  let Some(index)=image.pages[..image.page_count as usize].iter().position(|p|p.virtual_address==va)else{return false;};
  if error==4{
   if let Some(zero)=crate::zero_page::physical(){
-   if !unsafe{vmm_map_page(&mut image.tables,va,zero,Permissions{writable:false,executable:false,user:true})}{return false;}
+   if !crate::zero_page::retain_mapping(zero){return false;}
+   if !unsafe{vmm_map_page(&mut image.tables,va,zero,Permissions{writable:false,executable:false,user:true})}{
+    let _=crate::zero_page::release_mapping(zero);return false;
+   }
    image.pages[index].physical_address=zero;return true;
   }
  }
@@ -306,7 +311,12 @@ pub(crate) unsafe fn resolve_stack_fault(image:&mut UserImage,address:u64,error:
   if cow{unsafe{crate::vmm::replace_readonly_user_page(&mut image.tables,va,existing.physical,physical)}}
   else{unsafe{vmm_map_page(&mut image.tables,va,physical,Permissions{writable:true,executable:false,user:true})}}
  };
- if mapped{image.pages[index].physical_address=physical;*retained=0;return true;}
+ if mapped{
+  // Commit private ownership before dropping the old shared alias. Even a
+  // detected corrupt reference count must leave teardown able to free RAM.
+  image.pages[index].physical_address=physical;*retained=0;
+  return !cow||crate::zero_page::release_mapping(existing.physical);
+ }
  if unsafe{release(image,physical)}{*retained=0;}
  false
 }
@@ -809,6 +819,7 @@ mod tests {
             let before=ram.used.iter().filter(|&&v|v).count();let mut retained=0;
             assert!(unsafe{resolve_stack_fault(&mut first,va,4,&mut retained)});
             assert!(unsafe{resolve_stack_fault(&mut second,va,4,&mut retained)});
+            assert_eq!(crate::zero_page::mapping_references(),2);
             assert_eq!(ram.used.iter().filter(|&&v|v).count(),before);
             let mut a=stack_mapping();let mut b=stack_mapping();
             assert!(unsafe{vmm_query_page(&first.tables,va,&mut a)&&vmm_query_page(&second.tables,va,&mut b)});
@@ -826,6 +837,7 @@ mod tests {
             assert_eq!(first_usage.private_frames().unwrap()+second_usage.private_frames().unwrap(),
                 ram.used.iter().filter(|&&v|v).count() as u64-1);
             assert!(unsafe{resolve_stack_fault(&mut first,va,7,&mut retained)});
+            assert_eq!(crate::zero_page::mapping_references(),1);
             assert!(unsafe{vmm_query_page(&first.tables,va,&mut a)});
             assert_ne!(a.physical,zero);assert!(a.permissions.writable&&!a.permissions.executable);
             let split=unsafe{memory_usage(&first,0)}.unwrap();
@@ -838,6 +850,7 @@ mod tests {
             assert!(ram.used[Ram::index(zero).unwrap()]);
             assert!(unsafe{vmm_query_page(&second.tables,va,&mut b)});assert_eq!(b.physical,zero);
             assert!(unsafe{indianos_user_image_destroy(&mut second)});
+            assert_eq!(crate::zero_page::mapping_references(),0);
             assert_eq!(ram.used.iter().filter(|&&v|v).count(),1);
         });
         assert!(unsafe{ram_release(zero,(&mut ram as *mut Ram).cast())});assert!(ram.used.iter().all(|&v|!v));
@@ -851,11 +864,13 @@ mod tests {
             assert!(unsafe{defer_stack_pages(&mut image)&&resolve_stack_fault(&mut image,va,4,&mut retained)});
             let used=ram.used;ram.used.fill(true);
             assert!(!unsafe{resolve_stack_fault(&mut image,va,7,&mut retained)});
+            assert_eq!(crate::zero_page::mapping_references(),1);
             assert_eq!(retained,0);ram.used=used;
             let free=ram.used.iter().position(|&v|!v).unwrap();let frame=(free as u64+1)*PAGE as u64;
             ram.refuse_access=frame;ram.refuse_release=frame;
             assert!(!unsafe{resolve_stack_fault(&mut image,va,7,&mut retained)});
             assert_eq!(retained,frame);
+            assert_eq!(crate::zero_page::mapping_references(),1);
             let mut mapping=stack_mapping();assert!(unsafe{vmm_query_page(&image.tables,va,&mut mapping)});
             assert_eq!(mapping.physical,zero);assert!(!mapping.permissions.writable);
             ram.refuse_access=0;ram.refuse_release=0;
@@ -865,6 +880,52 @@ mod tests {
             assert!(ram.used[Ram::index(zero).unwrap()]);
         });
         assert!(unsafe{ram_release(zero,(&mut ram as *mut Ram).cast())});assert!(ram.used.iter().all(|&v|!v));
+    }
+    #[cfg(feature="normal-desktop")]
+    #[test]fn failed_zero_leaf_publication_and_unmap_preserve_exact_alias_ownership(){
+        let mut ram=Ram::new();let mut zero=0;
+        assert!(unsafe{ram_alloc(&mut zero,(&mut ram as *mut Ram).cast())});
+        crate::zero_page::with_test_frame(zero,||{
+            let mut image=demand_staged(&mut ram);let va=image.plan.stack_begin;let mut retained=0;
+            assert!(unsafe{defer_stack_pages(&mut image)});
+            let mut table=image.tables.root_physical;
+            for shift in [39,30,21]{table=ram.frames[Ram::index(table).unwrap()][((va>>shift)&511) as usize]&FRAME_MASK;}
+            let table=Ram::index(table).unwrap();let slot=((va>>12)&511) as usize;
+            // Query sees no present leaf; map rejects the nonzero invalid slot.
+            ram.frames[table][slot]=2;let used=ram.used;
+            assert!(!unsafe{resolve_stack_fault(&mut image,va,4,&mut retained)});
+            assert_eq!(crate::zero_page::mapping_references(),0);assert_eq!(ram.used,used);
+            assert!(deferred_stack_page(&image,va));
+            ram.frames[table][slot]=0;
+            assert!(unsafe{resolve_stack_fault(&mut image,va,4,&mut retained)});
+            assert_eq!(crate::zero_page::mapping_references(),1);
+            ram.refuse_access=image.tables.root_physical;
+            assert!(!unsafe{indianos_user_image_destroy(&mut image)});
+            assert_eq!(crate::zero_page::mapping_references(),1);
+            assert!(ram.used[Ram::index(zero).unwrap()]);
+            ram.refuse_access=0;assert!(unsafe{indianos_user_image_destroy(&mut image)});
+            assert_eq!(crate::zero_page::mapping_references(),0);
+            assert_eq!(ram.used.iter().filter(|&&v|v).count(),1);
+        });
+        assert!(unsafe{ram_release(zero,(&mut ram as *mut Ram).cast())});
+        assert!(ram.used.iter().all(|&v|!v));
+    }
+    #[cfg(feature="normal-desktop")]
+    #[test]fn image_accounting_rejects_unowned_shared_alias_without_private_frame_loss(){
+        let mut ram=Ram::new();let mut zero=0;
+        assert!(unsafe{ram_alloc(&mut zero,(&mut ram as *mut Ram).cast())});
+        crate::zero_page::with_test_frame(zero,||{
+            let mut image=demand_staged(&mut ram);let va=image.plan.stack_begin;let mut retained=0;
+            assert!(unsafe{defer_stack_pages(&mut image)&&resolve_stack_fault(&mut image,va,4,&mut retained)});
+            assert!(unsafe{memory_usage(&image,0)}.is_some());
+            // Host-only corruption: remove ownership without removing its PTE.
+            assert!(crate::zero_page::release_mapping(zero));let used=ram.used;
+            assert!(unsafe{memory_usage(&image,0)}.is_none());assert_eq!(ram.used,used);
+            assert!(crate::zero_page::retain_mapping(zero));
+            assert!(unsafe{indianos_user_image_destroy(&mut image)});
+            assert_eq!(crate::zero_page::mapping_references(),0);
+        });
+        assert!(unsafe{ram_release(zero,(&mut ram as *mut Ram).cast())});
     }
     #[cfg(feature="normal-desktop")]
     #[test]fn demand_stack_fault_restores_zero_nx_page_without_growing_quota(){

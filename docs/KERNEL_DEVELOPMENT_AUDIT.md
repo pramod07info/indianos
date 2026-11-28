@@ -888,3 +888,54 @@ and legacy unseeded preemption entrypoints stay separate. No local build/test/
 QEMU ran; exact-head GitHub results are required before accepting this change.
 XSAVE/AVX, migration, production SMP and other ten-point gaps remain pending;
 no gate or completion percentage is newly accepted.
+
+
+### Cross-workstream integration — saved isolated agent contributions
+
+Five genuine coding sessions started in separate worktrees based on the
+preemptive-FPU candidate c580cc9. After execution-environment restart the
+sessions were no longer active; their saved source diffs were reviewed and
+integrated by the coordinator. No local build, test or QEMU ran. The prior
+c580cc9 head returned22 successful GitHub workflows, including the required
+preemptive FPU PC-window verifier. That does not validate this new candidate.
+
+* Points1/2: shared-zero PTE aliases now retain/release an atomic mapping count
+  on publication rollback, successful private split and teardown. Physical zero
+  reservation remains boot-owned and never recycled. Image accounting detects
+  insufficient alias ownership; completed session cleanup refuses leaked
+  references. Four new/extended image/reference tests cover conservation,
+  overflow/underflow, failed map/split/unmap and accounting. This is not general
+  fork or reclaimable shared-private-page reference ownership.
+* Points3/4: actual xAPIC timer programming verifies mask/divisor/count and
+  final LVT readbacks before granting running/clock authority. Stop verifies
+  mask and zero count; uncertain programming revokes clock authority while
+  retaining controller ownership for retry. Four injected register-loss tests
+  cover sequencing/readback. This is not IPIs, AP run queues or migration.
+* Points5/6: blocking receive continuations now pin a boot-unique router
+  incarnation as well as mailbox epoch. Recreated routers cannot inherit stale
+  receives even with identical PID/epoch; moves preserve authority. Four tests
+  cover replacement, move, monotonic exhaustion and concurrent minting. General
+  thread/futex/signal/spawn/exec APIs still require implementation.
+* Points8/9: proven-retired NIC DMA pages whose PMM release fails remain in a
+  bounded debt ledger. Close reports incomplete reclaim; reprobe retries debt
+  before new queue allocation. Invalid/duplicate/capacity violations poison
+  reprobe rather than claim release. Three fault-injection tests cover retained
+  debt, exact retries and failure quarantine. Uncertain device reset still
+  retains DMA pages; no operational AHCI/NVMe/xHCI or IOMMU is introduced.
+* Point10: boot policy recovery rereads selected signed bytes before advancing
+  the protected counter. Platform-root/counter continuity is revalidated across
+  storage callbacks and counter commit; staging retires cached authority on
+  callback changes, including simultaneous I/O failure. Four tests mutate
+  callbacks around these phases. Separate reads are not an atomic TPM
+  transaction; an audited provider and physical qualification remain absent.
+* Point7 (coordinator): read-only quota usage/limit operations45/46 retain
+  selected-volume, root namespace and credential authority while permitting
+  existing foreign readers. Two tests cover no writes/flush/revocation and
+  pre-I/O denial; the real guest compares active-zero and removed policies.
+
+Twenty-one new host tests plus extended existing image/guest/syscall/shutdown
+cases accompany these changes. Exact candidate GitHub host/freestanding,
+security, QEMU and regression results must pass before merge or acceptance.
+All workstreams have executable work started, but their broader generic APIs,
+normal multi-core/device integration and physical acceptance are not complete.
+No completion percentage or formal M1 gate is newly accepted.

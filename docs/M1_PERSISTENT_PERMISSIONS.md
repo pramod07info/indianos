@@ -165,3 +165,23 @@ removal, plus younger-reader timeout and nonblocking no-barging before writer
 handoff. Its oracle checks fourteen COW publications, final empty ACL/quotas,
 restored root permissions and unchanged payload/guard sectors. No local build
 or test ran; exact-head GitHub evidence remains required.
+
+
+## Read-only quota inspection
+
+Native syscall33 operation45 returns committed usage as `(objects << 32) | bytes`.
+Operation46 returns zero for unlimited, otherwise `(1 << 63) | (object_limit <<
+32) | byte_limit`; an active zero quota therefore remains distinguishable from
+no quota. Both take a u16 target UID in the existing argument field, are
+advertised by featurebit2048 and require a current PID1 root descriptor with an
+unrestricted namespace. They read one verified checkpoint and do not publish,
+flush, charge a write budget or revoke handles. Current foreign readers are
+permitted. Out-of-range IDs, stale tokens and narrowed/foreign authority reject
+before device probing. Query-only operations remain available during durable
+shutdown arming. No native descriptor size or version changes.
+
+Host tests use a device that panics on write/sync to verify read-only queries
+with a live foreign reader and unchanged descriptors/accounting. The separate
+guest checks active-zero versus removed limits and proves its original handle
+remains usable. Quota/ACL publication counts and disk contents are unchanged by
+inspection. Exact-head CI and guest evidence remain required.
